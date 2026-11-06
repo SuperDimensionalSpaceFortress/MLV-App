@@ -154,8 +154,38 @@ inline bool playbackReducedHnyquistPresentRefused(bool reducedTexture,
     return playbackReducedHnyquistWanted(reducedTexture, hnyquistOn) && !hnyquistSymbolAvailable;
 }
 
+/* CPU-S1-RECON-UNDER-LOOK-PACE-LEVER-1 (Part C): where R, G and B sit inside one pixel of an
+ * 8-bit interleaved playback buffer. RGB888 is R,G,B. QImage::Format_RGB32 is the uint32
+ * 0xFFRRGGBB in host byte order, so on a little-endian host its bytes are B,G,R,0xFF. The
+ * magenta-band and zebra passes read through this so an RGB32 prepared frame gets the
+ * same decisions and writes as the RGB888 one. */
+struct PlaybackRgb8Layout
+{
+    int bytesPerPixel;
+    int r;
+    int g;
+    int b;
+};
+constexpr PlaybackRgb8Layout kPlaybackLayoutRgb888 { 3, 0, 1, 2 };
+#if Q_BYTE_ORDER == Q_LITTLE_ENDIAN
+constexpr PlaybackRgb8Layout kPlaybackLayoutRgb32 { 4, 2, 1, 0 };
+constexpr int kPlaybackRgb32AlphaByte = 3;
+#else
+constexpr PlaybackRgb8Layout kPlaybackLayoutRgb32 { 4, 1, 2, 3 };
+constexpr int kPlaybackRgb32AlphaByte = 0;
+#endif
+
+inline uint32_t playbackPackRgb32(uint8_t r, uint8_t g, uint8_t b)
+{
+    return 0xFF000000u
+         | ( static_cast<uint32_t>( r ) << 16 )
+         | ( static_cast<uint32_t>( g ) << 8 )
+         | static_cast<uint32_t>( b );
+}
+
 inline bool playbackRgb8RowLooksLikeUniformTopMagentaBand(const uint8_t *row,
-                                                          int width)
+                                                          int width,
+                                                          const PlaybackRgb8Layout &layout = kPlaybackLayoutRgb888)
 {
     if( !row || width <= 0 )
     {
@@ -171,10 +201,10 @@ inline bool playbackRgb8RowLooksLikeUniformTopMagentaBand(const uint8_t *row,
 
     for( int x = 0; x < width; x += sampleStep )
     {
-        const uint8_t *pixel = row + static_cast<size_t>( x ) * 3u;
-        const int r = pixel[0];
-        const int g = pixel[1];
-        const int b = pixel[2];
+        const uint8_t *pixel = row + static_cast<size_t>( x ) * static_cast<size_t>( layout.bytesPerPixel );
+        const int r = pixel[layout.r];
+        const int g = pixel[layout.g];
+        const int b = pixel[layout.b];
         ++samples;
         sumR += static_cast<uint64_t>( r );
         sumG += static_cast<uint64_t>( g );
@@ -220,7 +250,8 @@ inline bool playbackRgb8RowLooksLikeUniformTopMagentaBand(const uint8_t *row,
 }
 
 inline bool playbackRgb8RowLooksNearBlack(const uint8_t *row,
-                                          int width)
+                                          int width,
+                                          const PlaybackRgb8Layout &layout = kPlaybackLayoutRgb888)
 {
     if( !row || width <= 0 )
     {
@@ -234,10 +265,10 @@ inline bool playbackRgb8RowLooksNearBlack(const uint8_t *row,
 
     for( int x = 0; x < width; x += sampleStep )
     {
-        const uint8_t *pixel = row + static_cast<size_t>( x ) * 3u;
-        const int r = pixel[0];
-        const int g = pixel[1];
-        const int b = pixel[2];
+        const uint8_t *pixel = row + static_cast<size_t>( x ) * static_cast<size_t>( layout.bytesPerPixel );
+        const int r = pixel[layout.r];
+        const int g = pixel[layout.g];
+        const int b = pixel[layout.b];
         ++samples;
         sumR += static_cast<uint64_t>( r );
         sumG += static_cast<uint64_t>( g );
@@ -260,7 +291,8 @@ inline bool playbackRgb8RowLooksNearBlack(const uint8_t *row,
 }
 
 inline bool playbackRgb8RowLooksLikeUniformTopMagentaTransition(const uint8_t *row,
-                                                                int width)
+                                                                int width,
+                                                                const PlaybackRgb8Layout &layout = kPlaybackLayoutRgb888)
 {
     if( !row || width <= 0 )
     {
@@ -276,10 +308,10 @@ inline bool playbackRgb8RowLooksLikeUniformTopMagentaTransition(const uint8_t *r
 
     for( int x = 0; x < width; x += sampleStep )
     {
-        const uint8_t *pixel = row + static_cast<size_t>( x ) * 3u;
-        const int r = pixel[0];
-        const int g = pixel[1];
-        const int b = pixel[2];
+        const uint8_t *pixel = row + static_cast<size_t>( x ) * static_cast<size_t>( layout.bytesPerPixel );
+        const int r = pixel[layout.r];
+        const int g = pixel[layout.g];
+        const int b = pixel[layout.b];
         ++samples;
         sumR += static_cast<uint64_t>( r );
         sumG += static_cast<uint64_t>( g );
@@ -326,7 +358,8 @@ inline bool playbackRgb8RowLooksLikeUniformTopMagentaTransition(const uint8_t *r
 }
 
 inline bool playbackRgb8RowLooksLikeTopMagentaEdgeAfterLetterbox(const uint8_t *row,
-                                                                 int width)
+                                                                 int width,
+                                                                 const PlaybackRgb8Layout &layout = kPlaybackLayoutRgb888)
 {
     if( !row || width <= 0 )
     {
@@ -341,10 +374,10 @@ inline bool playbackRgb8RowLooksLikeTopMagentaEdgeAfterLetterbox(const uint8_t *
 
     for( int x = 0; x < width; x += sampleStep )
     {
-        const uint8_t *pixel = row + static_cast<size_t>( x ) * 3u;
-        const int r = pixel[0];
-        const int g = pixel[1];
-        const int b = pixel[2];
+        const uint8_t *pixel = row + static_cast<size_t>( x ) * static_cast<size_t>( layout.bytesPerPixel );
+        const int r = pixel[layout.r];
+        const int g = pixel[layout.g];
+        const int b = pixel[layout.b];
         ++samples;
         sumR += static_cast<uint64_t>( r );
         sumG += static_cast<uint64_t>( g );
@@ -386,17 +419,42 @@ inline bool playbackRgb8RowLooksLikeTopMagentaEdgeAfterLetterbox(const uint8_t *
     return magentaAverage && enoughContent && enoughMagentaEdge;
 }
 
+/* Blacks one suppressed row: zero bytes for RGB888 (as before), opaque black (0xFF000000)
+ * per pixel for RGB32, so both formats present the same black row. */
+inline void playbackBlackenRgb8Row(uint8_t *row,
+                                   int width,
+                                   int stride,
+                                   const PlaybackRgb8Layout &layout)
+{
+    if( layout.bytesPerPixel != 4 )
+    {
+        std::memset( row, 0, static_cast<size_t>( stride ) );
+        return;
+    }
+    const uint32_t black = playbackPackRgb32( 0, 0, 0 );
+    for( int x = 0; x < width; ++x )
+    {
+        std::memcpy( row + static_cast<size_t>( x ) * 4u, &black, 4u );
+    }
+    const size_t contentBytes = static_cast<size_t>( width ) * 4u;
+    if( static_cast<size_t>( stride ) > contentBytes )
+    {
+        std::memset( row + contentBytes, 0, static_cast<size_t>( stride ) - contentBytes );
+    }
+}
+
 inline int playbackSuppressUniformTopMagentaBandRgb8(uint8_t *data,
                                                      int width,
                                                      int height,
-                                                     int bytesPerLine = 0)
+                                                     int bytesPerLine = 0,
+                                                     const PlaybackRgb8Layout &layout = kPlaybackLayoutRgb888)
 {
     if( !data || width <= 0 || height <= 0 )
     {
         return 0;
     }
 
-    const int rowBytes = width * 3;
+    const int rowBytes = width * layout.bytesPerPixel;
     const int stride = (bytesPerLine > 0) ? bytesPerLine : rowBytes;
     if( stride < rowBytes )
     {
@@ -410,7 +468,7 @@ inline int playbackSuppressUniformTopMagentaBandRgb8(uint8_t *data,
     {
         const uint8_t *row =
             data + static_cast<size_t>( probeStartRow ) * static_cast<size_t>( stride );
-        if( !playbackRgb8RowLooksNearBlack( row, width ) )
+        if( !playbackRgb8RowLooksNearBlack( row, width, layout ) )
         {
             break;
         }
@@ -425,7 +483,7 @@ inline int playbackSuppressUniformTopMagentaBandRgb8(uint8_t *data,
     {
         const uint8_t *row =
             data + static_cast<size_t>( y ) * static_cast<size_t>( stride );
-        if( !playbackRgb8RowLooksLikeUniformTopMagentaBand( row, width ) )
+        if( !playbackRgb8RowLooksLikeUniformTopMagentaBand( row, width, layout ) )
         {
             break;
         }
@@ -443,7 +501,7 @@ inline int playbackSuppressUniformTopMagentaBandRgb8(uint8_t *data,
             {
                 const uint8_t *row =
                     data + static_cast<size_t>( y ) * static_cast<size_t>( stride );
-                if( !playbackRgb8RowLooksLikeTopMagentaEdgeAfterLetterbox( row, width ) )
+                if( !playbackRgb8RowLooksLikeTopMagentaEdgeAfterLetterbox( row, width, layout ) )
                 {
                     break;
                 }
@@ -454,7 +512,7 @@ inline int playbackSuppressUniformTopMagentaBandRgb8(uint8_t *data,
             {
                 uint8_t *row =
                     data + static_cast<size_t>( y ) * static_cast<size_t>( stride );
-                std::memset( row, 0, static_cast<size_t>( stride ) );
+                playbackBlackenRgb8Row( row, width, stride, layout );
             }
 
             return edgeRows;
@@ -469,7 +527,7 @@ inline int playbackSuppressUniformTopMagentaBandRgb8(uint8_t *data,
     {
         const uint8_t *row =
             data + static_cast<size_t>( y ) * static_cast<size_t>( stride );
-        if( !playbackRgb8RowLooksLikeUniformTopMagentaTransition( row, width ) )
+        if( !playbackRgb8RowLooksLikeUniformTopMagentaTransition( row, width, layout ) )
         {
             break;
         }
@@ -480,7 +538,7 @@ inline int playbackSuppressUniformTopMagentaBandRgb8(uint8_t *data,
     {
         uint8_t *row =
             data + static_cast<size_t>( y ) * static_cast<size_t>( stride );
-        std::memset( row, 0, static_cast<size_t>( stride ) );
+        playbackBlackenRgb8Row( row, width, stride, layout );
     }
 
     return suppressRows;
@@ -626,6 +684,85 @@ inline bool playbackBuildFastScaledRgb8(const uint8_t *source,
         if( dstBytesPerLine > rowBytes )
         {
             std::fill( dstRow + rowBytes, dstRow + dstBytesPerLine, 0u );
+        }
+    }
+
+    return true;
+}
+
+/* CPU-S1-RECON-UNDER-LOOK-PACE-LEVER-1 (Part C): the same nearest-neighbour scale as
+ * playbackBuildFastScaledRgb8 (same cache, same source sample per output pixel), written as
+ * QImage::Format_RGB32 (0xFFRRGGBB, width*4 bytes per row) instead of packed RGB888. On the
+ * raster backend QPixmap::fromImage shares an RGB32 image with no conversion, so the GUI
+ * thread no longer converts every playback frame (measured 7.85 ms -> 0.009 ms at
+ * 3840x1605, RUN r1 fromimage-bench.txt). The R, G and B values are the RGB888 writer's. */
+inline bool playbackBuildFastScaledRgb32(const uint8_t *source,
+                                         int sourceWidth,
+                                         int sourceHeight,
+                                         int targetWidth,
+                                         int targetHeight,
+                                         std::vector<uint8_t> &scaledBuffer,
+                                         FastPlaybackScaleCache &cache)
+{
+    if( !source
+     || sourceWidth <= 0
+     || sourceHeight <= 0
+     || targetWidth <= 0
+     || targetHeight <= 0 )
+    {
+        scaledBuffer.clear();
+        return false;
+    }
+
+    const size_t dstBytesPerLine = static_cast<size_t>( targetWidth ) * 4u;
+    const size_t targetPixels =
+        static_cast<size_t>( targetWidth ) * static_cast<size_t>( targetHeight );
+    scaledBuffer.resize( dstBytesPerLine * static_cast<size_t>( targetHeight ) );
+
+    if( cache.sourceWidth != sourceWidth
+     || cache.sourceHeight != sourceHeight
+     || cache.targetWidth != targetWidth
+     || cache.targetHeight != targetHeight )
+    {
+        cache.sourceWidth = sourceWidth;
+        cache.sourceHeight = sourceHeight;
+        cache.targetWidth = targetWidth;
+        cache.targetHeight = targetHeight;
+        cache.xOffsets.resize( static_cast<size_t>( targetWidth ) );
+        cache.yOffsets.resize( static_cast<size_t>( targetHeight ) );
+
+        for( int x = 0; x < targetWidth; ++x )
+        {
+            const int srcX = std::min( sourceWidth - 1,
+                                       static_cast<int>(
+                                           ( static_cast<uint64_t>( x ) * static_cast<uint64_t>( sourceWidth ) )
+                                           / static_cast<uint64_t>( targetWidth ) ) );
+            cache.xOffsets[static_cast<size_t>( x )] = srcX * 3;
+        }
+
+        for( int y = 0; y < targetHeight; ++y )
+        {
+            const int srcY = std::min( sourceHeight - 1,
+                                       static_cast<int>(
+                                           ( static_cast<uint64_t>( y ) * static_cast<uint64_t>( sourceHeight ) )
+                                           / static_cast<uint64_t>( targetHeight ) ) );
+            cache.yOffsets[static_cast<size_t>( y )] = srcY * sourceWidth * 3;
+        }
+    }
+
+    #pragma omp parallel for if(targetPixels >= 262144u)
+    for( int y = 0; y < targetHeight; ++y )
+    {
+        const uint8_t *srcRow =
+            source + static_cast<size_t>( cache.yOffsets[static_cast<size_t>( y )] );
+        uint8_t *dstRow =
+            scaledBuffer.data() + static_cast<size_t>( y ) * dstBytesPerLine;
+        for( int x = 0; x < targetWidth; ++x )
+        {
+            const uint8_t *srcPixel =
+                srcRow + static_cast<size_t>( cache.xOffsets[static_cast<size_t>( x )] );
+            const uint32_t packed = playbackPackRgb32( srcPixel[0], srcPixel[1], srcPixel[2] );
+            std::memcpy( dstRow + static_cast<size_t>( x ) * 4u, &packed, 4u );
         }
     }
 
@@ -991,6 +1128,78 @@ inline QImage playbackBuildFastScaledImage(const uint8_t *source,
                                   targetWidth,
                                   targetHeight,
                                   targetBytesPerLine );
+}
+
+/* CPU-S1-RECON-UNDER-LOOK-PACE-LEVER-1 (Part C): an RGB32 (0xFFRRGGBB) buffer as a QImage.
+ * bytesPerLine 0 = width*4 (always 4-byte aligned). */
+inline QImage playbackWrapRgb32Image(uint8_t *data, int width, int height, int bytesPerLine = 0)
+{
+    if( !data || width <= 0 || height <= 0 ) return QImage();
+    const int bpl = (bytesPerLine > 0) ? bytesPerLine : (width * 4);
+    return QImage( data, width, height, bpl, QImage::Format_RGB32 );
+}
+
+inline QImage playbackBuildFastScaledImageRgb32(const uint8_t *source,
+                                                int sourceWidth,
+                                                int sourceHeight,
+                                                int targetWidth,
+                                                int targetHeight,
+                                                std::vector<uint8_t> &scaledBuffer,
+                                                FastPlaybackScaleCache &cache)
+{
+    if( !playbackBuildFastScaledRgb32( source,
+                                       sourceWidth,
+                                       sourceHeight,
+                                       targetWidth,
+                                       targetHeight,
+                                       scaledBuffer,
+                                       cache ) )
+    {
+        return QImage();
+    }
+
+    return playbackWrapRgb32Image( scaledBuffer.data(), targetWidth, targetHeight );
+}
+
+/* The prepared playback frame is RGB888 or, from the CPU route's fast branch, RGB32.
+ * These read the format so every consumer handles both and refuses anything else. */
+inline int playbackPreparedBytesPerPixel(QImage::Format format)
+{
+    return format == QImage::Format_RGB32 ? 4 : 3;
+}
+
+inline QImage playbackWrapPreparedImage(uint8_t *data,
+                                        int width,
+                                        int height,
+                                        int bytesPerLine,
+                                        bool rgb32)
+{
+    return rgb32 ? playbackWrapRgb32Image( data, width, height, bytesPerLine )
+                 : playbackWrapRgb8Image( data, width, height, bytesPerLine );
+}
+
+/* The top magenta-band suppression on a prepared image of either format; 0 rows (untouched)
+ * for any other format, as the RGB888-only gate did before. */
+inline int playbackSuppressUniformTopMagentaBandImage(QImage &image)
+{
+    if( image.isNull() ) return 0;
+    if( image.format() == QImage::Format_RGB888 )
+    {
+        return playbackSuppressUniformTopMagentaBandRgb8( image.bits(),
+                                                          image.width(),
+                                                          image.height(),
+                                                          image.bytesPerLine(),
+                                                          kPlaybackLayoutRgb888 );
+    }
+    if( image.format() == QImage::Format_RGB32 )
+    {
+        return playbackSuppressUniformTopMagentaBandRgb8( image.bits(),
+                                                          image.width(),
+                                                          image.height(),
+                                                          image.bytesPerLine(),
+                                                          kPlaybackLayoutRgb32 );
+    }
+    return 0;
 }
 
 #endif // PLAYBACKSCALING_H

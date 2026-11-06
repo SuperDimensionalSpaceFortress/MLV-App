@@ -802,6 +802,9 @@ private:
         // by up to one row inside qt_convert_rgb888_to_rgb32_ssse3 and
         // segfaults — see the 2026-04-24 crash investigation).
         int preparedBytesPerLine = 0;
+        // CPU-S1-RECON-UNDER-LOOK-PACE-LEVER-1 (Part C): preparedImage / preparedBorrowedImage
+        // hold QImage::Format_RGB32 (4 B/px) when true, Format_RGB888 (3 B/px) when false.
+        bool preparedRgb32 = false;
         // Dims of the developed 8-bit frame (scopeSourceImage). Equal to the
         // task's source dims unless the CPU route processed a reduced frame
         // (CPU-PLAYBACK-PREP-WORKER-BUILD-1 tier 2); 0 = the source dims.
@@ -1516,6 +1519,8 @@ private:
         QString downscaleBranchLast;
         QMap<QString, quint64> refusalCounts;
         QMap<QString, quint64> downscaleBranchCounts;
+        // CPU-S1-RECON-UNDER-LOOK-PACE-LEVER-1 (Part C): prepared frame format per frame.
+        QMap<QString, quint64> preparedFormatCounts;
         // CPU-LOOKASSIST-PLAYBACK-COST-1: the pointwise fast path (empty refusal = it ran).
         quint64 pointwiseFastFrames = 0;
         double pointwiseOmpThreadsSum = 0.0;

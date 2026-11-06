@@ -42,10 +42,14 @@
 
 #include "../../platform/qt/PlaybackScaling.h"
 
+#include <QPixmap>
+
 #include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
+#include <cstring>
+#include <iostream>
 #include <omp.h>
 #include <vector>
 
@@ -1112,4 +1116,211 @@ TEST(PlaybackScaling, BilinearPerformance)
     std::cout << "PlaybackScaling.BilinearPerformance median_ms="
               << medianMs
               << " nearest_median_ms=" << nearestMedianMs << "\n";
+}
+
+/* CPU-S1-RECON-UNDER-LOOK-PACE-LEVER-1 (Part C): the CPU route's fast branch now writes the
+ * prepared frame as QImage::Format_RGB32 (0xFFRRGGBB) instead of RGB888, so the GUI thread's
+ * QPixmap::fromImage is a no-convert wrap. These pin that the presented picture is unchanged:
+ * the RGB32 writer's R, G, B equal the RGB888 writer's, fromImage of both is pixel-equal
+ * (including after the top magenta-band suppression), and the RGB32 fromImage is cheaper. */
+namespace {
+
+/* A developed 16-bit frame (gradient plus deterministic noise) reduced to 8 bits the way
+ * convert_rgb16_to_rgb8 does (>> 8), so the 8-bit source is what the prep worker scales. */
+std::vector<uint8_t> make_rgb8_from_synthetic_rgb16(int width, int height)
+{
+    std::vector<uint8_t> out(static_cast<size_t>(width) * static_cast<size_t>(height) * 3u);
+    uint32_t state = 0x9E3779B9u;
+    for( int y = 0; y < height; ++y )
+    {
+        for( int x = 0; x < width; ++x )
+        {
+            for( int c = 0; c < 3; ++c )
+            {
+                state = state * 1664525u + 1013904223u;
+                const uint32_t gradient =
+                    static_cast<uint32_t>( ( static_cast<uint64_t>( x + y * (c + 1) ) * 65535u )
+                                           / static_cast<uint64_t>( width + height * 3 ) );
+                const uint32_t noise = (state >> 20) & 0x0FFFu;
+                const uint16_t value16 = static_cast<uint16_t>( std::min<uint32_t>( 65535u, gradient + noise ) );
+                out[(static_cast<size_t>(y) * static_cast<size_t>(width) + static_cast<size_t>(x)) * 3u
+                    + static_cast<size_t>(c)] = static_cast<uint8_t>( value16 >> 8 );
+            }
+        }
+    }
+    return out;
+}
+
+struct FastRgbPair
+{
+    std::vector<uint8_t> rgb888;
+    std::vector<uint8_t> rgb32;
+    int width = 0;
+    int height = 0;
+    int rgb888BytesPerLine = 0;
+    QImage image888() { return playbackWrapRgb8Image( rgb888.data(), width, height, rgb888BytesPerLine ); }
+    QImage image32() { return playbackWrapRgb32Image( rgb32.data(), width, height ); }
+};
+
+/* Both writers, exactly as the fast branch calls them (RGB888 with the 4-byte aligned stride). */
+FastRgbPair build_fast_pair(const std::vector<uint8_t> &source,
+                            int sourceWidth, int sourceHeight,
+                            int targetWidth, int targetHeight)
+{
+    FastRgbPair pair;
+    pair.width = targetWidth;
+    pair.height = targetHeight;
+    pair.rgb888BytesPerLine = ((targetWidth * 3) + 3) & ~3;
+    FastPlaybackScaleCache cache888;
+    FastPlaybackScaleCache cache32;
+    const bool ok888 = playbackBuildFastScaledRgb8( source.data(), sourceWidth, sourceHeight,
+                                                    targetWidth, targetHeight,
+                                                    pair.rgb888, cache888, pair.rgb888BytesPerLine );
+    const bool ok32 = playbackBuildFastScaledRgb32( source.data(), sourceWidth, sourceHeight,
+                                                    targetWidth, targetHeight,
+                                                    pair.rgb32, cache32 );
+    if( !ok888 || !ok32 ) { pair.rgb888.clear(); pair.rgb32.clear(); }
+    return pair;
+}
+
+QImage pixmap_image(const QImage &image)
+{
+    return QPixmap::fromImage( image ).toImage().convertToFormat( QImage::Format_RGB32 );
+}
+
+} // namespace
+
+TEST(PlaybackScaling, FastRgb32WriterMatchesRgb888WriterBytes)
+{
+    struct Case { int sw, sh, tw, th; };
+    // The fs-s1 shape (downscale to 3840x1605), an odd-width downscale, and an upscale.
+    const Case cases[] = { { 4096, 1716, 3840, 1605 }, { 1931, 803, 1283, 535 }, { 640, 360, 1283, 721 } };
+    for( const Case &c : cases )
+    {
+        const std::vector<uint8_t> source = make_rgb8_from_synthetic_rgb16( c.sw, c.sh );
+        FastRgbPair pair = build_fast_pair( source, c.sw, c.sh, c.tw, c.th );
+        ASSERT_FALSE(pair.rgb888.empty());
+        ASSERT_EQ(static_cast<size_t>(c.tw) * 4u * static_cast<size_t>(c.th), pair.rgb32.size());
+        size_t mismatches = 0;
+        for( int y = 0; y < c.th; ++y )
+        {
+            const uint8_t *row888 = pair.rgb888.data() + static_cast<size_t>(y) * static_cast<size_t>(pair.rgb888BytesPerLine);
+            const uint8_t *row32 = pair.rgb32.data() + static_cast<size_t>(y) * static_cast<size_t>(c.tw) * 4u;
+            for( int x = 0; x < c.tw; ++x )
+            {
+                uint32_t v = 0;
+                std::memcpy( &v, row32 + static_cast<size_t>(x) * 4u, 4u );
+                const uint8_t *p = row888 + static_cast<size_t>(x) * 3u;
+                if( ( v >> 24 ) != 0xFFu
+                 || ( ( v >> 16 ) & 0xFFu ) != p[0]
+                 || ( ( v >> 8 ) & 0xFFu ) != p[1]
+                 || ( v & 0xFFu ) != p[2] )
+                    ++mismatches;
+            }
+        }
+        ASSERT_EQ(static_cast<size_t>(0), mismatches);
+        // The byte layout the magenta/zebra passes read through.
+        ASSERT_EQ(static_cast<int>(pair.rgb888[0]), static_cast<int>(pair.rgb32[kPlaybackLayoutRgb32.r]));
+        ASSERT_EQ(static_cast<int>(pair.rgb888[1]), static_cast<int>(pair.rgb32[kPlaybackLayoutRgb32.g]));
+        ASSERT_EQ(static_cast<int>(pair.rgb888[2]), static_cast<int>(pair.rgb32[kPlaybackLayoutRgb32.b]));
+        ASSERT_EQ(0xFF, static_cast<int>(pair.rgb32[kPlaybackRgb32AlphaByte]));
+    }
+}
+
+TEST(PlaybackScaling, FastRgb32FromImageEqualsRgb888AndCostsLess)
+{
+    for( const int width : { 3840, 3841 } )
+    {
+        const int height = 1605;
+        const std::vector<uint8_t> source = make_rgb8_from_synthetic_rgb16( width, height );
+        FastRgbPair pair = build_fast_pair( source, width, height, width, height );
+        ASSERT_FALSE(pair.rgb888.empty());
+        const QImage img888 = pair.image888();
+        const QImage img32 = pair.image32();
+        ASSERT_TRUE(img888.format() == QImage::Format_RGB888);
+        ASSERT_TRUE(img32.format() == QImage::Format_RGB32);
+        ASSERT_TRUE(pixmap_image( img888 ) == pixmap_image( img32 ));
+
+        std::vector<double> ms888;
+        std::vector<double> ms32;
+        for( int i = 0; i < 9; ++i )
+        {
+            auto t0 = std::chrono::steady_clock::now();
+            QPixmap a = QPixmap::fromImage( img888 );
+            auto t1 = std::chrono::steady_clock::now();
+            QPixmap b = QPixmap::fromImage( img32 );
+            auto t2 = std::chrono::steady_clock::now();
+            ASSERT_FALSE(a.isNull());
+            ASSERT_FALSE(b.isNull());
+            ms888.push_back( std::chrono::duration<double, std::milli>( t1 - t0 ).count() );
+            ms32.push_back( std::chrono::duration<double, std::milli>( t2 - t1 ).count() );
+        }
+        const double median888 = median_milliseconds( ms888 );
+        const double median32 = median_milliseconds( ms32 );
+        std::cout << "PlaybackScaling.FastRgb32FromImage width=" << width
+                  << " rgb888_median_ms=" << median888
+                  << " rgb32_median_ms=" << median32 << "\n";
+        ASSERT_TRUE(median32 < median888);
+    }
+}
+
+namespace {
+
+enum class TopBandShape { UniformBand, EdgeAfterLetterbox };
+
+/* A frame with 6 black letterbox rows, then either 5 uniform magenta band rows or 2 magenta
+ * edge rows, then picture. */
+std::vector<uint8_t> make_top_band_source(int width, int height, TopBandShape shape)
+{
+    std::vector<uint8_t> out = make_rgb8_from_synthetic_rgb16( width, height );
+    for( int y = 0; y < height; ++y )
+    {
+        for( int x = 0; x < width; ++x )
+        {
+            uint8_t *p = out.data() + (static_cast<size_t>(y) * static_cast<size_t>(width) + static_cast<size_t>(x)) * 3u;
+            if( y < 6 )
+            {
+                p[0] = 0; p[1] = 0; p[2] = 0;
+            }
+            else if( shape == TopBandShape::UniformBand && y < 11 )
+            {
+                p[0] = 203; p[1] = static_cast<uint8_t>( 88 + (x % 5) ); p[2] = 180;
+            }
+            else if( shape == TopBandShape::EdgeAfterLetterbox && y < 8 )
+            {
+                p[0] = 120; p[1] = 60; p[2] = 100;
+            }
+        }
+    }
+    return out;
+}
+
+} // namespace
+
+TEST(PlaybackScaling, FastRgb32MagentaBandSuppressionMatchesRgb888)
+{
+    for( const TopBandShape shape : { TopBandShape::UniformBand, TopBandShape::EdgeAfterLetterbox } )
+    {
+        const int width = 1283;
+        const int height = 535;
+        const std::vector<uint8_t> source = make_top_band_source( width, height, shape );
+        FastRgbPair pair = build_fast_pair( source, width, height, width, height );
+        ASSERT_FALSE(pair.rgb888.empty());
+        QImage img888 = pair.image888();
+        QImage img32 = pair.image32();
+        const QImage before32 = img32.copy();
+
+        const int rows888 = playbackSuppressUniformTopMagentaBandImage( img888 );
+        const int rows32 = playbackSuppressUniformTopMagentaBandImage( img32 );
+        ASSERT_EQ(shape == TopBandShape::UniformBand ? 5 : 2, rows888);
+        ASSERT_EQ(rows888, rows32);
+        ASSERT_TRUE(pixmap_image( img888 ) == pixmap_image( img32 ));
+        // The suppressed rows are opaque black in the RGB32 frame.
+        ASSERT_TRUE(img32.pixel( 0, 6 ) == 0xFF000000u);
+        ASSERT_TRUE(img32.pixel( width - 1, 6 + rows32 - 1 ) == 0xFF000000u);
+
+        // RED on the base code: its RGB888-only gate skipped an RGB32 frame, so the band stayed
+        // and the picture differed from the RGB888 frame's.
+        ASSERT_FALSE(pixmap_image( before32 ) == pixmap_image( img888 ));
+    }
 }

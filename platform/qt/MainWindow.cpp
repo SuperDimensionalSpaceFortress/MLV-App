@@ -2044,6 +2044,34 @@ static QImage build_fast_playback_scaled_image(const uint8_t * source,
                                          targetBytesPerLine );
 }
 
+/* CPU-S1-RECON-UNDER-LOOK-PACE-LEVER-1 (Part C): the fast branch's RGB32 writer (same samples,
+ * 0xFFRRGGBB). MLVAPP_DISABLE_PLAYBACK_PREP_RGB32 (any value but 0) restores RGB888. */
+static QImage build_fast_playback_scaled_image_rgb32(const uint8_t * source,
+                                                     int sourceWidth,
+                                                     int sourceHeight,
+                                                     int targetWidth,
+                                                     int targetHeight,
+                                                     std::vector<uint8_t> & scaledBuffer)
+{
+    static thread_local FastPlaybackScaleCache cache;
+    return playbackBuildFastScaledImageRgb32( source,
+                                              sourceWidth,
+                                              sourceHeight,
+                                              targetWidth,
+                                              targetHeight,
+                                              scaledBuffer,
+                                              cache );
+}
+
+static bool playbackPrepRgb32FastBranchEnabled()
+{
+    static const bool enabled =
+        !( qEnvironmentVariableIsSet( "MLVAPP_DISABLE_PLAYBACK_PREP_RGB32" )
+           && qEnvironmentVariable( "MLVAPP_DISABLE_PLAYBACK_PREP_RGB32" ).trimmed()
+                != QStringLiteral("0") );
+    return enabled;
+}
+
 static const char * playback_profile_scope_name(MainWindow::PlaybackProfileScope scope)
 {
     switch( scope )
@@ -4320,6 +4348,9 @@ MainWindow::PlaybackPrepResult MainWindow::buildPlaybackPrepResult( const Playba
     // rgb8DisplaySource uses these.
     int displaySourceWidth = sourceWidth;
     int displaySourceHeight = sourceHeight;
+    // CPU-S1-RECON-UNDER-LOOK-PACE-LEVER-1 (Part C): the CPU prep route ran for this frame
+    // (only then does the fast branch write RGB32; every other route stays RGB888).
+    bool cpuPrepRouteRan = false;
 
     if( gpu16PreviewActive && rgb16DisplaySource )
     {
@@ -4417,6 +4448,7 @@ MainWindow::PlaybackPrepResult MainWindow::buildPlaybackPrepResult( const Playba
         result.task.scopeSourceImageSize = processedBytes;
         rgb8DisplaySource = result.task.scopeSourceImage;
 
+        cpuPrepRouteRan = true;
         QJsonObject &spanTelemetry = result.task.readyFrame.stageTimingTelemetry;
         spanTelemetry.insert( QStringLiteral("playback_prep_cpu_route_active"), true );
         spanTelemetry.insert( QStringLiteral("playback_prep_alloc_ms"), cpuRoute.allocMs );
@@ -4577,14 +4609,28 @@ MainWindow::PlaybackPrepResult MainWindow::buildPlaybackPrepResult( const Playba
                 std::max( 1, qRound( sceneWidth * devicePixelRatio ) );
             const int scaledHeight =
                 std::max( 1, qRound( sceneHeight * devicePixelRatio ) );
-            const int scaledBytesPerLine = ((scaledWidth * 3) + 3) & ~3;
-            displayImage = build_fast_playback_scaled_image( rgb8DisplaySource,
-                                                             displaySourceWidth,
-                                                             displaySourceHeight,
-                                                             scaledWidth,
-                                                             scaledHeight,
-                                                             displayImageBacking,
-                                                             scaledBytesPerLine );
+            if( cpuPrepRouteRan && playbackPrepRgb32FastBranchEnabled() )
+            {
+                // CPU-S1-RECON-UNDER-LOOK-PACE-LEVER-1 (Part C): the same pixels as
+                // RGB32 so QPixmap::fromImage on the GUI thread is a no-convert wrap.
+                displayImage = build_fast_playback_scaled_image_rgb32( rgb8DisplaySource,
+                                                                       displaySourceWidth,
+                                                                       displaySourceHeight,
+                                                                       scaledWidth,
+                                                                       scaledHeight,
+                                                                       displayImageBacking );
+            }
+            else
+            {
+                const int scaledBytesPerLine = ((scaledWidth * 3) + 3) & ~3;
+                displayImage = build_fast_playback_scaled_image( rgb8DisplaySource,
+                                                                 displaySourceWidth,
+                                                                 displaySourceHeight,
+                                                                 scaledWidth,
+                                                                 scaledHeight,
+                                                                 displayImageBacking,
+                                                                 scaledBytesPerLine );
+            }
             displayImageOwnsData = false;
         }
         else if( zoomFitEnabled )
@@ -4647,15 +4693,11 @@ MainWindow::PlaybackPrepResult MainWindow::buildPlaybackPrepResult( const Playba
     const qint64 postStartNs = prepSpanClock.nsecsElapsed();
     int suppressedTopMagentaBandRows = 0;
     if( playbackPolicyActive
-     && !displayImage.isNull()
-     && displayImage.format() == QImage::Format_RGB888 )
+     && !displayImage.isNull() )
     {
+        // RGB888 or RGB32 (Part C); any other format is left untouched, as before.
         suppressedTopMagentaBandRows =
-            playbackSuppressUniformTopMagentaBandRgb8(
-                displayImage.bits(),
-                displayImage.width(),
-                displayImage.height(),
-                displayImage.bytesPerLine() );
+            playbackSuppressUniformTopMagentaBandImage( displayImage );
     }
     result.task.readyFrame.stageTimingTelemetry.insert(
         QStringLiteral("draw_frame_ready_top_magenta_band_rows"),
@@ -4681,7 +4723,11 @@ MainWindow::PlaybackPrepResult MainWindow::buildPlaybackPrepResult( const Playba
     {
         result.preparedWidth = displayImage.width();
         result.preparedHeight = displayImage.height();
-        const int rowContentBytes = result.preparedWidth * 3;
+        // CPU-S1-RECON-UNDER-LOOK-PACE-LEVER-1 (Part C): the fast CPU-route branch hands over
+        // RGB32 (4 B/px, rows already 4-byte aligned); every other branch RGB888 (3 B/px).
+        result.preparedRgb32 = displayImage.format() == QImage::Format_RGB32;
+        const int rowContentBytes =
+            result.preparedWidth * playbackPreparedBytesPerPixel( displayImage.format() );
         // Pad each row up to a 4-byte boundary so the GUI side can wrap
         // this buffer with a Format_RGB888 QImage without overshooting
         // (Qt requires 32-bit-aligned scanlines; for odd widths,
@@ -4759,6 +4805,12 @@ MainWindow::PlaybackPrepResult MainWindow::buildPlaybackPrepResult( const Playba
         spanTelemetry.insert( QStringLiteral("playback_prep_downscale_ms"), downscaleMs );
         spanTelemetry.insert( QStringLiteral("playback_prep_downscale_branch"),
                               QString::fromLatin1( downscaleBranch ) );
+        // CPU-S1-RECON-UNDER-LOOK-PACE-LEVER-1 (Part C): the prepared frame's format, per frame.
+        spanTelemetry.insert( QStringLiteral("playback_prep_prepared_format"),
+                              displayImage.isNull()
+                                  ? QStringLiteral("none")
+                                  : ( result.preparedRgb32 ? QStringLiteral("rgb32")
+                                                           : QStringLiteral("rgb888") ) );
         spanTelemetry.insert( QStringLiteral("playback_prep_post_ms"), postMs );
         spanTelemetry.insert( QStringLiteral("playback_prep_span_build_ms"),
                               prepSpanMs( 0 ) );
@@ -6421,10 +6473,11 @@ void MainWindow::presentPlaybackPreparedFrame( const PlaybackPrepResult &result 
 
         if( preparedImageData )
         {
-            displayImage = playbackWrapRgb8Image( const_cast<uint8_t *>( preparedImageData ),
-                                                result.preparedWidth,
-                                                result.preparedHeight,
-                                                result.preparedBytesPerLine );
+            displayImage = playbackWrapPreparedImage( const_cast<uint8_t *>( preparedImageData ),
+                                                      result.preparedWidth,
+                                                      result.preparedHeight,
+                                                      result.preparedBytesPerLine,
+                                                      result.preparedRgb32 );
             displayImageOwnsData = false;
         }
     }
@@ -6466,15 +6519,11 @@ void MainWindow::presentPlaybackPreparedFrame( const PlaybackPrepResult &result 
     int suppressedPresentedTopMagentaBandRows = 0;
     if( !framePresentedByViewport
      && playbackPolicyActive()
-     && !displayImage.isNull()
-     && displayImage.format() == QImage::Format_RGB888 )
+     && !displayImage.isNull() )
     {
+        // RGB888 or RGB32 (Part C); any other format is left untouched, as before.
         suppressedPresentedTopMagentaBandRows =
-            playbackSuppressUniformTopMagentaBandRgb8(
-                displayImage.bits(),
-                displayImage.width(),
-                displayImage.height(),
-                displayImage.bytesPerLine() );
+            playbackSuppressUniformTopMagentaBandImage( displayImage );
     }
     readyFrame.stageTimingTelemetry.insert(
         QStringLiteral("draw_frame_ready_present_top_magenta_band_rows"),
@@ -6496,13 +6545,21 @@ void MainWindow::presentPlaybackPreparedFrame( const PlaybackPrepResult &result 
             static_cast<size_t>( displayImage.bytesPerLine() )
             * static_cast<size_t>( displayImage.height() );
         uint64_t contentHash = 1469598103934665603ull;
+        // CPU-S1-RECON-UNDER-LOOK-PACE-LEVER-1 (Part C): an RGB32 frame's 4th byte is the
+        // constant 0xFF; a sample landing on it takes the pixel's previous (colour) byte, so
+        // the hash still follows the picture.
+        const bool contentRgb32 = displayImage.format() == QImage::Format_RGB32;
         if( contentBits && contentBytes > 0 )
         {
             const size_t contentStep =
                 std::max( static_cast<size_t>( 1 ), contentBytes / 8192 );
             for( size_t i = 0; i < contentBytes; i += contentStep )
             {
-                contentHash ^= contentBits[i];
+                const size_t at =
+                    ( contentRgb32 && ( i & 3u ) == static_cast<size_t>( kPlaybackRgb32AlphaByte ) )
+                        ? ( kPlaybackRgb32AlphaByte == 3 ? i - 1u : i + 1u )
+                        : i;
+                contentHash ^= contentBits[at];
                 contentHash *= 1099511628211ull;
             }
         }
@@ -6555,14 +6612,20 @@ void MainWindow::presentPlaybackPreparedFrame( const PlaybackPrepResult &result 
          && !displayImage.isNull()
          && mlv_pipeline_capture_should_capture_frame( display_frame ) )
         {
+            // CPU-S1-RECON-UNDER-LOOK-PACE-LEVER-1 (Part C): the capture stays RGB888 (3 B/px);
+            // an RGB32 frame is converted for the capture only (the same R, G, B bytes).
+            const QImage captureImage =
+                displayImage.format() == QImage::Format_RGB32
+                    ? displayImage.convertToFormat( QImage::Format_RGB888 )
+                    : displayImage;
             mlv_pipeline_capture_meta_t meta;
             memset( &meta, 0, sizeof meta );
             meta.stage = MLV_PIPELINE_STAGE_S6_DISPLAYIMAGE;
             meta.format = MLV_PIPELINE_FORMAT_UINT8_RGB;
             meta.format_label = "uint8_rgb_displayImage_pre_pixmap";
-            meta.width = displayImage.width();
-            meta.height = displayImage.height();
-            meta.bytes_per_line = (int)displayImage.bytesPerLine();
+            meta.width = captureImage.width();
+            meta.height = captureImage.height();
+            meta.bytes_per_line = (int)captureImage.bytesPerLine();
             meta.bytes_per_pixel = 3;
             meta.channels = 3;
             meta.bit_depth = 8;
@@ -6572,7 +6635,7 @@ void MainWindow::presentPlaybackPreparedFrame( const PlaybackPrepResult &result 
                 task.gpuPresentationOptions.previewProcessing.enabled ? 1 : 0;
             meta.settings_hash = (uint64_t)display_signature;
             mlv_pipeline_capture( display_frame,
-                                  displayImage.constBits(),
+                                  captureImage.constBits(),
                                   &meta );
         }
 
@@ -19738,31 +19801,38 @@ static uint8_t applyZebrasToImage( QImage *image, bool enableZebras )
 
     if( !image ) return underOver;
 
+    // CPU-S1-RECON-UNDER-LOOK-PACE-LEVER-1 (Part C): a playback frame may be RGB32 (B,G,R,0xFF);
+    // every other caller hands RGB888 (R,G,B).
+    const PlaybackRgb8Layout layout =
+        image->format() == QImage::Format_RGB32 ? kPlaybackLayoutRgb32 : kPlaybackLayoutRgb888;
     for( int y = 0; y < image->height(); y++ )
     {
         uchar * line = image->scanLine( y );
         for( int x = 0; x < image->width(); x++ )
         {
-            uchar * pixel = line + (x * 3);
-            const int maxChannel = qMax(pixel[0], qMax(pixel[1], pixel[2]));
-            const int minChannel = qMin(pixel[0], qMin(pixel[1], pixel[2]));
+            uchar * pixel = line + (x * layout.bytesPerPixel);
+            uchar &r = pixel[layout.r];
+            uchar &g = pixel[layout.g];
+            uchar &b = pixel[layout.b];
+            const int maxChannel = qMax(r, qMax(g, b));
+            const int minChannel = qMin(r, qMin(g, b));
             const int lightness = (maxChannel + minChannel) / 2;
             //Overexposed
             if( lightness >= preview_zebra::kOverThreshold8Bit )
             {
                 //Set color red
-                pixel[0] = 255;
-                pixel[1] = 0;
-                pixel[2] = 0;
+                r = 255;
+                g = 0;
+                b = 0;
                 underOver |= 0x02;
             }
             //Underexposed
             if( lightness <= preview_zebra::kUnderThreshold8Bit )
             {
                 //Set color blue
-                pixel[0] = 0;
-                pixel[1] = 0;
-                pixel[2] = 255;
+                r = 0;
+                g = 0;
+                b = 255;
                 underOver |= 0x01;
             }
         }
@@ -27160,6 +27230,8 @@ void MainWindow::notePlaybackSmokePresentedFrame(
                 telemetryStringValue( timing, "playback_prep_downscale_branch" );
             ++spans.downscaleBranchCounts[spans.downscaleBranchLast];
         }
+        if( timing.contains( QStringLiteral("playback_prep_prepared_format") ) )
+            ++spans.preparedFormatCounts[telemetryStringValue( timing, "playback_prep_prepared_format" )];
         if( telemetryBoolValue( timing, "playback_prep_cpu_route_active" ) )
         {
             ++spans.cpuRouteFrames;
@@ -30362,7 +30434,8 @@ void MainWindow::finishPlaybackSmokeTelemetry( const char *reason )
                    "avg_playback_prep_region_present_ms=%33 avg_playback_prep_region_finish_ms=%34 "
                    "avg_playback_prep_region_total_ms=%35 avg_playback_prep_region_unattributed_ms=%36 "
                    "avg_playback_prep_region_image_from_image_ms=%37 "
-                   "avg_playback_prep_region_image_viewport_ms=%38" )
+                   "avg_playback_prep_region_image_viewport_ms=%38 "
+                   "prepared_format_counts=%39" )
                    .arg( static_cast<qulonglong>( m_playbackSmokeSessionId ) )
                    .arg( m_playbackSmokePresentedFrames )
                    .arg( spans.cpuRouteFrames )
@@ -30402,7 +30475,8 @@ void MainWindow::finishPlaybackSmokeTelemetry( const char *reason )
                    .arg( avgCpuRouteMs( spans.regionTotalMs ), 0, 'f', 3 )
                    .arg( avgCpuRouteMs( spans.regionUnattributedMs ), 0, 'f', 3 )
                    .arg( avgCpuRouteMs( spans.regionImageFromImageMs ), 0, 'f', 3 )
-                   .arg( avgCpuRouteMs( spans.regionImageViewportMs ), 0, 'f', 3 );
+                   .arg( avgCpuRouteMs( spans.regionImageViewportMs ), 0, 'f', 3 )
+                   .arg( joinCounts( spans.preparedFormatCounts ) );
     }
 
     /* CPU-S2-WINDOWED-GUI-PRESENT-TELEMETRY-1: GUI-thread present-side cost. The preview viewport

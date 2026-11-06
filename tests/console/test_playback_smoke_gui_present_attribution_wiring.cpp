@@ -733,5 +733,83 @@ TEST(GuiPresentAttributionWiring, RegionImageSplitsIntoFromImageAndViewport)
     ASSERT_TRUE(format.indexOf(QStringLiteral("avg_playback_prep_region_unattributed_ms=%36 "))
                 < format.indexOf(QStringLiteral("avg_playback_prep_region_image_from_image_ms=%37 ")));
     ASSERT_EQ(1, format.count(QStringLiteral("avg_playback_prep_region_image_viewport_ms=%38")));
-    ASSERT_TRUE(finishSmokeBody().contains(QStringLiteral(".arg( avgCpuRouteMs( spans.regionImageViewportMs ), 0, 'f', 3 );")));
+    ASSERT_TRUE(finishSmokeBody().contains(QStringLiteral(".arg( avgCpuRouteMs( spans.regionImageViewportMs ), 0, 'f', 3 )")));
+}
+
+// CPU-S1-RECON-UNDER-LOOK-PACE-LEVER-1 (Part C): the CPU route's fast branch hands over RGB32 so
+// QPixmap::fromImage is a no-convert wrap, and every consumer of the prepared frame reads its
+// format (the pixel equality itself is pinned by pipeline_tests PlaybackScaling.FastRgb32*).
+namespace
+{
+QString buildPrepResultBody()
+{
+    return functionBody(mainWindowSource(),
+                        QStringLiteral("MainWindow::PlaybackPrepResult MainWindow::buildPlaybackPrepResult( const PlaybackPrepTask &task,"),
+                        QStringLiteral("void MainWindow::playbackPrepThreadLoop( void )"));
+}
+} // namespace
+
+TEST(PreparedRgb32Wiring, FastBranchWritesRgb32OnlyOnTheCpuRoute)
+{
+    const QString body = buildPrepResultBody();
+    ASSERT_FALSE(body.isEmpty());
+    // Set only inside the CPU prep route block.
+    ASSERT_EQ(1, body.count(QStringLiteral("bool cpuPrepRouteRan = false;")));
+    ASSERT_EQ(1, body.count(QStringLiteral("cpuPrepRouteRan = true;")));
+    const QString cpuRoute = bracedBlockAfter(body, QStringLiteral("else if( cpuPreviewProcessingActive && playbackProcessingSubsetActive )"));
+    ASSERT_TRUE(cpuRoute.contains(QStringLiteral("cpuPrepRouteRan = true;")));
+    // The fast branch: RGB32 behind the route + kill switch, RGB888 otherwise.
+    const QString fast = bracedBlockAfter(body, QStringLiteral("else if( zoomFitEnabled && playbackFastScalingActive )"));
+    ASSERT_FALSE(fast.isEmpty());
+    ASSERT_TRUE(fast.contains(QStringLiteral("downscaleBranch = \"fast\";")));
+    const QString rgb32 = bracedBlockAfter(fast, QStringLiteral("if( cpuPrepRouteRan && playbackPrepRgb32FastBranchEnabled() )"));
+    ASSERT_TRUE(rgb32.contains(QStringLiteral("build_fast_playback_scaled_image_rgb32(")));
+    ASSERT_EQ(1, fast.count(QStringLiteral("build_fast_playback_scaled_image( rgb8DisplaySource,")));
+    ASSERT_EQ(1, body.count(QStringLiteral("build_fast_playback_scaled_image_rgb32(")));
+    ASSERT_TRUE(mainWindowSource().contains(QStringLiteral("\"MLVAPP_DISABLE_PLAYBACK_PREP_RGB32\"")));
+}
+
+TEST(PreparedRgb32Wiring, WorkerConsumersReadTheFormat)
+{
+    const QString body = buildPrepResultBody();
+    ASSERT_FALSE(body.isEmpty());
+    // Magenta band: both formats, through the format-reading helper (the RGB888-only gate is gone).
+    ASSERT_EQ(1, body.count(QStringLiteral("playbackSuppressUniformTopMagentaBandImage( displayImage )")));
+    ASSERT_FALSE(body.contains(QStringLiteral("displayImage.format() == QImage::Format_RGB888 )")));
+    // Hand-off: bytes per pixel from the format; the flag travels with the result.
+    ASSERT_TRUE(body.contains(QStringLiteral("result.preparedRgb32 = displayImage.format() == QImage::Format_RGB32;")));
+    ASSERT_TRUE(body.contains(QStringLiteral("result.preparedWidth * playbackPreparedBytesPerPixel( displayImage.format() );")));
+    ASSERT_FALSE(body.contains(QStringLiteral("const int rowContentBytes = result.preparedWidth * 3;")));
+    // Per-frame label, summed on prep_summary (appended after the last field).
+    ASSERT_EQ(1, body.count(QStringLiteral("QStringLiteral(\"playback_prep_prepared_format\")")));
+    ASSERT_TRUE(notePresentedFrameBody().contains(QStringLiteral("++spans.preparedFormatCounts[telemetryStringValue( timing, \"playback_prep_prepared_format\" )];")));
+    const QString format = summaryFormat(finishSmokeBody(), QStringLiteral("playback_smoke.prep_summary session=%1"));
+    ASSERT_TRUE(format.indexOf(QStringLiteral("avg_playback_prep_region_image_viewport_ms=%38 "))
+                < format.indexOf(QStringLiteral("prepared_format_counts=%39")));
+    ASSERT_TRUE(finishSmokeBody().contains(QStringLiteral(".arg( joinCounts( spans.preparedFormatCounts ) );")));
+}
+
+TEST(PreparedRgb32Wiring, GuiConsumersReadTheFormat)
+{
+    const QString body = presentPreparedBody();
+    ASSERT_FALSE(body.isEmpty());
+    // The prepared buffer is wrapped in its own format.
+    ASSERT_TRUE(body.contains(QStringLiteral("displayImage = playbackWrapPreparedImage( const_cast<uint8_t *>( preparedImageData ),")));
+    ASSERT_TRUE(body.contains(QStringLiteral("result.preparedRgb32 );")));
+    ASSERT_FALSE(body.contains(QStringLiteral("displayImage = playbackWrapRgb8Image( const_cast<uint8_t *>( preparedImageData ),")));
+    // GUI magenta band: both formats.
+    ASSERT_EQ(1, body.count(QStringLiteral("playbackSuppressUniformTopMagentaBandImage( displayImage )")));
+    ASSERT_FALSE(body.contains(QStringLiteral("displayImage.format() == QImage::Format_RGB888 )")));
+    // Content hash skips the constant alpha byte; the S6 capture stays 3 B/px RGB888.
+    ASSERT_TRUE(body.contains(QStringLiteral("const bool contentRgb32 = displayImage.format() == QImage::Format_RGB32;")));
+    ASSERT_TRUE(body.contains(QStringLiteral("? displayImage.convertToFormat( QImage::Format_RGB888 )")));
+    ASSERT_TRUE(body.contains(QStringLiteral("captureImage.constBits(),")));
+    ASSERT_TRUE(body.contains(QStringLiteral("meta.bytes_per_line = (int)captureImage.bytesPerLine();")));
+    // Zebras read the layout from the format.
+    const QString zebras = functionBody(mainWindowSource(),
+                                        QStringLiteral("static uint8_t applyZebrasToImage( QImage *image, bool enableZebras )\n{"),
+                                        QStringLiteral("void MainWindow::invalidateDisplayPreviewCache( void )"));
+    ASSERT_FALSE(zebras.isEmpty());
+    ASSERT_TRUE(zebras.contains(QStringLiteral("image->format() == QImage::Format_RGB32 ? kPlaybackLayoutRgb32 : kPlaybackLayoutRgb888;")));
+    ASSERT_TRUE(zebras.contains(QStringLiteral("uchar * pixel = line + (x * layout.bytesPerPixel);")));
 }
