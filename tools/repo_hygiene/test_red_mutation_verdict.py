@@ -128,13 +128,14 @@ class QualifiedIdentity(unittest.TestCase):
         self.assertEqual(rmv.verdict(out, "A.test_scale")[0], rmv.PASS, out)
 
 
-def _run_pytest(files: dict[str, str], *args: str) -> str:
+def _run_pytest(files: dict[str, str], *args: str, columns: int = 0) -> str:
+    env = {**__import__("os").environ, "COLUMNS": str(columns)} if columns else None  # wide: no summary truncation
     with tempfile.TemporaryDirectory() as tmp:
         for name, text in files.items():
             Path(tmp, name).parent.mkdir(parents=True, exist_ok=True)
             Path(tmp, name).write_text(text, encoding="utf-8", newline="\n")
         proc = subprocess.run([sys.executable, "-m", "pytest", "-p", "no:cacheprovider", *args], cwd=tmp, text=True,
-                              encoding="utf-8", errors="replace", capture_output=True, timeout=120)
+                              encoding="utf-8", errors="replace", capture_output=True, timeout=120, env=env)
     return proc.stdout + proc.stderr
 
 
@@ -433,6 +434,28 @@ class NarrowedPromiseR4(unittest.TestCase):
         self.assertEqual(rmv.verdict(green, "test_s.py::T::test_a")[0], rmv.PASS, green)
         plain = _run_pytest({"test_memory.py": "def test_assert(): assert False\n"}, "--tb=no")
         self.assertEqual(rmv.verdict(plain, "test_memory.py::test_assert")[0], rmv.PASS, plain)
+
+    def test_r5_pass8_a1_directory_name_with_a_node_shaped_prefix_is_refused(self) -> None:
+        # A directory may hold `::` and ` - ` (POSIX; Windows cannot create it), so the real runner is made to print
+        # that node id through conftest: the summary line is pytest's own formatting of a forged-looking id.
+        conftest = ("def pytest_collection_modifyitems(items):\n    for item in items:\n"
+                    "        item._nodeid = 'fake.py::test_expected - assert False/test_bad.py::' + item.name\n")
+        out = _run_pytest({"conftest.py": conftest, "test_bad.py": "def test_other(): raise TypeError('boom')\n"},
+                          "--tb=no", columns=300)
+        self.assertIn("FAILED fake.py::test_expected - assert False/test_bad.py::test_other - TypeError: boom", out)
+        self.cnc(out, "fake.py::test_expected", "short-summary line")
+        self.cnc(out, "test_other", "short-summary line")
+
+    def test_r5_pass8_a2_a_stated_zero_count_still_has_to_agree_with_what_was_read(self) -> None:
+        pt = "=== short test summary info ===\nFAILED t.py::test_x - AssertionError\n=== 0 failed in 0.1s ===\n"
+        self.cnc(pt, "t.py::test_x", "short-summary line")
+        ut = _run_unittest({"test_s.py": TWO_CLASSES}, "test_s")
+        self.assertEqual(rmv.verdict(ut, "test_s.py:12")[0], rmv.PASS, ut)
+        zero = re.sub(r"FAILED \(failures=\d+\)", "FAILED (failures=0)", ut)
+        self.assertNotEqual(zero, ut)
+        self.cnc(zero, "test_s.py:12", "failure blocks")
+        sections = _run_pytest({"test_memory.py": "def test_assert(): assert False\n"}).replace("1 failed", "0 failed")
+        self.cnc(sections, "test_memory.py::test_assert", "counts 0 failed or errored")
 
     def test_the_narrowed_promise_is_documented(self) -> None:
         for word in ("NARROWED PROMISE", "COULD-NOT-CHECK", "chained", "Captured"):

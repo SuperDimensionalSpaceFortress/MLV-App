@@ -37,13 +37,13 @@ REFUSED with a reason that starts ``COULD-NOT-CHECK (<typed reason>)``. That is 
   not split into exactly its own segments.
 * ``line number``: a ``file:line`` expectation or a traceback frame whose line number has more than 9 digits.
 * ``failure blocks`` / ``sections``: the runner's own failed-or-errored count (``FAILED (failures=1, errors=1)``,
-  ``2 failed``) disagrees with the unittest failure blocks or the pytest failure sections that could be read. A
+  ``2 failed``; a stated ``0`` is a count too) disagrees with the unittest failure blocks or the pytest failure sections that could be read. A
   header this parser cannot read (a test name holding a newline) would otherwise drop its failure, an ImportError
   included.
 * ``short-summary line`` (r5 CLASS RULE, hub ruling; replaces the one-by-one repairs of passes 6 and 7): ANY pytest
   run in which a short-summary ``FAILED``/``ERROR`` line does not split into exactly ``<file.ext>::<name> -
   <message>`` with a non-empty message (a multi-line or over-long node id, a `` - `` inside a directory name, a
-  message cut to ``...`` before its exception type shows; a module-level ``ERROR <file.ext> - <message>`` is the one
+  message cut to ``...`` before its exception type shows, a message that itself holds a ``<file>::<name>``; a module-level ``ERROR <file.ext> - <message>`` is the one
   allowed shape without ``::name``), or whose number of such lines differs from the runner's own failed+errored
   count, or that holds a summary line starting with no summary word. A test name can forge many shapes; none of them
   is parsed, they all fail this one test.
@@ -391,6 +391,10 @@ def _summary_problem(word: str, node: str, msg: str) -> str:
         return f"{word} {node[:60]!r} has no message after the ' - ' (a multi-line or over-long node id?)"
     if msg.endswith("...") and not _ASSERT_HEAD.match(msg):
         return f"{word} {node[:60]!r} has a message cut to '...' before its exception type shows"
+    if re.search(r"\.\w+::", msg):
+        # A directory name holding `<x>.ext::<y> - ` makes the first ' - ' look like the end of the node, and the
+        # real `file.ext::name` then sits in the "message". A message that holds a node of its own cannot be split.
+        return f"{word} {node[:60]!r} has a message that holds another <file>::<name> (the id may end later)"
     return ""
 
 
@@ -555,13 +559,13 @@ def _count_mismatch(text: str, ut_blocks: int, stats: dict) -> str:
         return ""
     if last.startswith("FAILED (") and _UT_RAN.search(text):
         want = sum(int(n) for _kind, n in _UT_COUNTS.findall(last))
-        if want and want != ut_blocks:
+        if want != ut_blocks:  # a stated 0 counts too: `FAILED (failures=0)` over a readable block is a contradiction
             return f"the runner counts {want} failing unittest tests but {ut_blocks} failure blocks were readable"
     elif last.startswith("="):
         want = sum(int(n) for n in re.findall(r"\b(\d+) (?:failed|errors?)\b", last))
-        if want and stats["sections"] and stats["sections"] != want:
+        if stats["sections"] and stats["sections"] != want:
             return f"the runner counts {want} failed or errored tests but {stats['sections']} sections were readable"
-        if want and stats["has_summary"] and stats["summary"] != want:
+        if stats["has_summary"] and stats["summary"] != want:
             return (f"short-summary line: the runner counts {want} failed or errored tests but "
                     f"{stats['summary']} FAILED/ERROR lines were readable")
     return ""
