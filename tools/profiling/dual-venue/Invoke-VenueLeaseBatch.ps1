@@ -1606,11 +1606,14 @@ function Write-RunSummary {
 if ($DeadlineUtc) {
     L "START_CAP source=explicit capUtc=$($deadline.ToString('yyyy-MM-dd''T''HH:mm:ss''Z''')) legs=$($plan.Count) (the caller's -DeadlineUtc is kept)"
 } else {
-    $capSecs = @($plan | ForEach-Object { Get-VenueLegPlaySeconds -SpecPath ([string]$_.spec) } | Where-Object { $null -ne $_ })
-    $capPlay = $(if ($capSecs.Count -gt 0) { [int][Math]::Ceiling(($capSecs | Measure-Object -Average).Average) } else { 25 })
-    $startCap = Get-VenueRunStartCap -NowUtc $t0 -LegCount ([Math]::Max(1, $plan.Count)) -PlaySeconds $capPlay -Leases @($leases) -CapSec $LeaseCapSec -CooldownSec $LeaseCooldownSec -WindowSec $LeaseBudgetWindowSec -BudgetSec $LeaseBudgetSec -LegBudgetSec $LegBudgetSec -LeaseMarginSec $LeaseMarginSec
-    foreach ($capLine in $startCap.lines) { L $capLine }
-    if ($startCap.capUtc -gt $deadline) { $deadline = $startCap.capUtc; L "START_CAP_DEADLINE deadline=$($deadline.ToString('o')) (sized from $($plan.Count) planned legs; the legacy 6 h window would have ended earlier)" }
+    # a sizing failure (a lease that holds no leg, a value outside the DateTime range) never stops the run: it is said on a typed line and the legacy 6 h window stands
+    try {
+        $capPlan = Get-VenuePlanPlaySeconds -SpecPaths @($plan | ForEach-Object { [string]$_.spec })
+        if ($capPlan.line) { L $capPlan.line }
+        $startCap = Get-VenueRunStartCap -NowUtc $t0 -LegCount ([Math]::Max(1, $plan.Count)) -PlaySeconds $capPlan.playSeconds -LegCooldownSec $CooldownSec -Leases @($leases) -CapSec $LeaseCapSec -CooldownSec $LeaseCooldownSec -WindowSec $LeaseBudgetWindowSec -BudgetSec $LeaseBudgetSec -LegBudgetSec $LegBudgetSec -LeaseMarginSec $LeaseMarginSec
+        foreach ($capLine in $startCap.lines) { L $capLine }
+        if ($startCap.capUtc -gt $deadline) { $deadline = $startCap.capUtc; L "START_CAP_DEADLINE deadline=$($deadline.ToString('o')) (sized from $($plan.Count) planned legs; the legacy 6 h window would have ended earlier)" }
+    } catch { L "START_CAP source=legacy legs=$($plan.Count) deadline=$($deadline.ToString('o')) reason=$("$($_.Exception.Message)" -replace '\s+', ' ')" }
 }
 L "BATCH_RUN_START venue=$Venue legs=$($plan.Count) runDir=$RunDir agentShare=$AgentShare deadline=$($deadline.ToString('o')) threshold=$ThresholdPercent legBudgetSec=$LegBudgetSec leaseMarginSec=$LeaseMarginSec recheckSec=$RecheckSec cooldownSec=$CooldownSec pid=$PID quietScript=$QuietScript legScript=$LegScript umRunScript=$UmRunScript$(if ($ReceiptRoot) { " receiptRoot=$ReceiptRoot" })$(if ($legPlanMode) { " legPlan=$($planRecord.legPlan) planOrder=$PlanOrder arms=$($planRecord.arms -join ',') builds=$(@($planRecord.builds).Count)" })"
 

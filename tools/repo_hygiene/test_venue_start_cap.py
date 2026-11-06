@@ -53,7 +53,7 @@ def call(args: str, now: str = NOW, extra_setup: str = "") -> dict:
         f"Import-Module '{CHAIN}' -Force -DisableNameChecking; {extra_setup} "
         f"$r = Get-VenueRunStartCap -NowUtc '{now}' {args}; "
         "$o = [ordered]@{ capUtc = $r.capUtc.ToString('yyyy-MM-ddTHH:mm:ssZ'); source = $r.source; "
-        "computedCapUtc = $r.computedCapUtc.ToString('yyyy-MM-ddTHH:mm:ssZ'); projectedEndUtc = $r.projectedEndUtc.ToString('yyyy-MM-ddTHH:mm:ssZ'); "
+        "computedCapUtc = $(if ($null -ne $r.computedCapUtc) { $r.computedCapUtc.ToString('yyyy-MM-ddTHH:mm:ssZ') } else { $null }); projectedEndUtc = $r.projectedEndUtc.ToString('yyyy-MM-ddTHH:mm:ssZ'); "
         "spanSec = $r.spanSec; batches = $r.batches; legWallSec = $r.legWallSec; waitSec = $r.waitSec; marginSec = $r.marginSec; clamped = $r.clamped; "
         "projectedPastBound = $r.projectedPastBound; lines = @($r.lines) }; $o | ConvertTo-Json -Compress"
     )
@@ -174,6 +174,116 @@ class StartCapFromLegCountTests(unittest.TestCase):
         self.assertEqual(p.returncode, 2)
 
 
+def run_ps(script: str) -> subprocess.CompletedProcess:
+    return subprocess.run([PWSH, "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, timeout=120)
+
+
+@requires_windows_pwsh
+class StartCapAdversaryTests(unittest.TestCase):
+    """The adversary pass on 9c80cfab (A1-A6): each finding's input, fed to the helper, the CLI or the runner's pin."""
+
+    def test_a1_the_runners_own_intra_lease_cooldown_is_inside_the_projection(self):
+        # the runner sleeps -CooldownSec after every completed leg while work remains (Invoke-VenueLeaseBatch.ps1): 12 legs at 3600 s are >= 11 x 3600 s of sleeping
+        plain = call(f"-LegCount 12 {LIVE_CAPS}")
+        r = call(f"-LegCount 12 -LegCooldownSec 600 {LIVE_CAPS}")
+        self.assertGreater(r["spanSec"], plain["spanSec"] + 11 * 600 - 1200, "11 sleeps of 600 s (less what the lease cap absorbs) lengthen the span")
+        self.assertGreater(parse(r["capUtc"]), parse(plain["capUtc"]))
+        self.assertEqual(r["legWallSec"], LEG_WALL + 600)
+        self.assertIn("legCooldownSec=600", r["lines"][0])
+        # the sleep after a leg is not part of the room a leg needs to START: 3600 s sleeps give one leg per lease, not a refusal
+        big = call(f"-LegCount 12 -LegCooldownSec 3600 {LIVE_CAPS}")
+        self.assertGreaterEqual(big["batches"], 12)
+        self.assertGreaterEqual(big["spanSec"], 11 * 2700)
+        src = BATCH.read_text(encoding="utf-8")
+        self.assertIn("-LegCooldownSec $CooldownSec", src, "the runner hands its own -CooldownSec to the projection")
+
+    def test_a2_a_lease_that_holds_no_leg_is_unsizable_never_forced_to_progress(self):
+        p = run_ps(f"Import-Module '{CHAIN}' -Force -DisableNameChecking; Get-VenueRunStartCap -NowUtc '{NOW}' -LegCount 1 -CapSec 60")
+        self.assertNotEqual(p.returncode, 0)
+        self.assertIn("START_CAP_UNSIZABLE", p.stderr + p.stdout)
+        # the same through the CLI: a typed line and exit 3, no StartCapUtc
+        c = subprocess.run([PWSH, "-NoProfile", "-NonInteractive", "-File", str(CLI), "-LegCount", "1", "-NowUtc", NOW, "-CapSec", "60"], capture_output=True, text=True, timeout=120)
+        self.assertEqual(c.returncode, 3, c.stdout + c.stderr)
+        self.assertIn("START_CAP_UNSIZABLE", c.stdout)
+        self.assertNotIn("StartCapUtc=", c.stdout)
+        # a budget with no room is the same refusal (zero or negative room)
+        p2 = run_ps(f"Import-Module '{CHAIN}' -Force -DisableNameChecking; Get-VenueRunStartCap -NowUtc '{NOW}' -LegCount 1 -BudgetSec 0")
+        self.assertNotEqual(p2.returncode, 0)
+        self.assertIn("START_CAP_UNSIZABLE", p2.stderr + p2.stdout)
+        # a leg longer than the lease: one leg's cost is the floor of the leg budget, so a 3000 s leg in a 2700 s lease is unsizable too
+        p3 = run_ps(f"Import-Module '{CHAIN}' -Force -DisableNameChecking; Get-VenueRunStartCap -NowUtc '{NOW}' -LegCount 1 -PlaySeconds 2800")
+        self.assertNotEqual(p3.returncode, 0)
+        self.assertIn("START_CAP_UNSIZABLE", p3.stderr + p3.stdout)
+
+    def test_a2_an_explicit_cap_is_not_stopped_by_an_unsizable_projection(self):
+        r = call(f"-LegCount 1 -CapSec 60 -ExplicitCapUtc '2026-10-30T09:40:00Z'")
+        self.assertEqual(r["capUtc"], "2026-10-30T09:40:00Z")
+        self.assertEqual(r["source"], "explicit")
+        self.assertIn("projection=UNSIZABLE", r["lines"][0])
+        self.assertIsNone(r["computedCapUtc"])
+
+    def test_a3_a_numeric_string_play_seconds_counts_like_the_runner_casts_it(self):
+        with tempfile.TemporaryDirectory() as d:
+            spec = json.loads(LEG_SPEC.read_text(encoding="utf-8"))
+            spec["playSeconds"] = "120"
+            s = Path(d) / "str-seconds.json"
+            s.write_text(json.dumps(spec), encoding="utf-8")
+            p = run_ps(f"Import-Module '{CHAIN}' -Force -DisableNameChecking; Write-Output (Get-VenueLegPlaySeconds -SpecPath '{s}')")
+            self.assertEqual(p.stdout.strip(), "120", p.stderr)
+
+    def test_a3_an_unreadable_spec_counts_at_the_longest_readable_leg_and_is_said(self):
+        with tempfile.TemporaryDirectory() as d:
+            spec = json.loads(LEG_SPEC.read_text(encoding="utf-8"))
+            spec["playSeconds"] = 120
+            good = Path(d) / "good.json"
+            good.write_text(json.dumps(spec), encoding="utf-8")
+            missing = Path(d) / "missing.json"
+            p = run_ps(f"Import-Module '{CHAIN}' -Force -DisableNameChecking; $r = Get-VenuePlanPlaySeconds -SpecPaths @('{good}','{missing}'); "
+                       "Write-Output \"$($r.playSeconds)|$($r.unknown)|$($r.known)|$($r.line)\"")
+            self.assertEqual(p.returncode, 0, p.stderr)
+            secs, unknown, known, line = p.stdout.strip().split("|", 3)
+            self.assertEqual((secs, unknown, known), ("120", "1", "1"))
+            self.assertTrue(line.startswith("START_CAP_PLAYSECONDS_UNKNOWN "), line)
+            # no readable spec at all: the default stands, and it is said
+            p2 = run_ps(f"Import-Module '{CHAIN}' -Force -DisableNameChecking; $r = Get-VenuePlanPlaySeconds -SpecPaths @('{missing}'); Write-Output \"$($r.playSeconds)|$($r.line)\"")
+            self.assertTrue(p2.stdout.strip().startswith("25|START_CAP_PLAYSECONDS_UNKNOWN "), p2.stdout + p2.stderr)
+        src = BATCH.read_text(encoding="utf-8")
+        self.assertIn("Get-VenuePlanPlaySeconds", src)
+        self.assertIn("Get-VenuePlanPlaySeconds", CLI.read_text(encoding="utf-8"))
+
+    def test_a4_huge_lease_settings_never_throw_an_int32_conversion(self):
+        for extra in ("-CooldownSec 2147483647", "-CooldownSec 1000000000 -MarginPct 500"):
+            p = run_ps(f"Import-Module '{CHAIN}' -Force -DisableNameChecking; $r = Get-VenueRunStartCap -NowUtc '{NOW}' -LegCount 12 {extra}; Write-Output $r.line")
+            self.assertEqual(p.returncode, 0, f"{extra}: {p.stderr}")
+            self.assertTrue(p.stdout.startswith("START_CAP source=computed "), p.stdout)
+        # a projection that leaves the DateTime range is START_CAP_UNSIZABLE, and an explicit cap still stands
+        p = run_ps(f"Import-Module '{CHAIN}' -Force -DisableNameChecking; Get-VenueRunStartCap -NowUtc '{NOW}' -LegCount 10000 -CooldownSec 2147483647")
+        self.assertNotEqual(p.returncode, 0)
+        self.assertIn("START_CAP_UNSIZABLE", p.stderr + p.stdout)
+        r = call("-LegCount 10000 -CooldownSec 2147483647 -ExplicitCapUtc '2026-10-30T12:00:00Z'")
+        self.assertEqual((r["capUtc"], r["source"]), ("2026-10-30T12:00:00Z", "explicit"))
+        # the runner catches a sizing failure and keeps the legacy window
+        src = BATCH.read_text(encoding="utf-8")
+        self.assertRegex(src, r'\} catch \{ L "START_CAP source=legacy ')
+
+    def test_a5_a_leg_spec_path_with_a_comma_is_one_leg(self):
+        with tempfile.TemporaryDirectory() as d:
+            spec = json.loads(LEG_SPEC.read_text(encoding="utf-8"))
+            spec["playSeconds"] = 1200
+            s = Path(d) / "a,b.json"
+            s.write_text(json.dumps(spec), encoding="utf-8")
+            c = subprocess.run([PWSH, "-NoProfile", "-NonInteractive", "-File", str(CLI), "-LegSpec", str(s), "-NowUtc", NOW], capture_output=True, text=True, timeout=120)
+            self.assertEqual(c.returncode, 0, c.stdout + c.stderr)
+            self.assertIn("legs=1 playSec=1200 ", c.stdout.splitlines()[0])
+
+    def test_a6_projected_past_bound_means_the_last_leg_starts_after_the_bound(self):
+        # one leg starts at +40 s; a bound at +200 s is not passed by its START (its end, +275 s, is)
+        r = call(f"-LegCount 1 -HardBoundUtc '2026-10-30T09:23:36Z'")
+        self.assertTrue(r["clamped"])
+        self.assertFalse(r["projectedPastBound"])
+        self.assertIn("projectedPastBound=0", r["lines"][1])
+
+
 class LeaseBatchWiringTests(unittest.TestCase):
     """Source pins on the tracked runner: the default deadline is sized from the plan, an explicit one is kept."""
 
@@ -188,7 +298,7 @@ class LeaseBatchWiringTests(unittest.TestCase):
         body = m.group(1)
         self.assertIn("Get-VenueRunStartCap", body)
         self.assertIn("-LegCount ([Math]::Max(1, $plan.Count))", body)
-        self.assertIn("Get-VenueLegPlaySeconds", body, "the per-leg seconds come from the leg specs")
+        self.assertIn("Get-VenuePlanPlaySeconds", body, "the per-leg seconds come from the leg specs")
         for caps in ("-CapSec $LeaseCapSec", "-CooldownSec $LeaseCooldownSec", "-BudgetSec $LeaseBudgetSec", "-Leases @($leases)"):
             self.assertIn(caps, body, f"the run's resolved lease caps feed the projection: {caps}")
         self.assertIn("if ($startCap.capUtc -gt $deadline)", body, "the computed cap only ever extends the legacy window")
@@ -198,7 +308,7 @@ class LeaseBatchWiringTests(unittest.TestCase):
 
     def test_module_exports_and_the_cli_exist(self):
         chain = CHAIN.read_text(encoding="utf-8")
-        self.assertIn("Get-VenueRunStartCap, Get-VenueLegPlaySeconds", chain[chain.index("Export-ModuleMember"):])
+        self.assertIn("Get-VenueRunStartCap, Get-VenueLegPlaySeconds, Get-VenuePlanPlaySeconds", chain[chain.index("Export-ModuleMember"):])
         self.assertTrue(CLI.is_file())
 
 
