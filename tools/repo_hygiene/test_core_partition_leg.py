@@ -2520,6 +2520,8 @@ R14B_UNIDENTIFIED_DRIVER = _r14b_unidentified_driver()
 # start after enumeration 1 on the unstepped clock.
 # r3 addition. stepFrom: the enumeration count from which stepMs applies (default 1). The pass that reaches it samples the clock gap at its top, before its
 # enumeration counts, so a step from enumeration 2 is one the helper has not sampled when that pass decides (adversary A2 on 6180c3e7).
+# handleFail: opening the process's handle fails, as for a process this user cannot open (csrss gives $null; this double throws). Otherwise each double has a
+# handle, and its HasExited (goneAt) is what that held handle reports, which on a real process is exact for that process and never for its pid's successor.
 _APP ={"id": 5000, "from": 1, "to": 6, "goneAt": 6, "startSec": 1}
 _Q = {"from": 1, "to": 99, "goneAt": 999}
 # Opus key3's pid 300: P1 is tracked and read at once. P2 takes the pid in the pass that sees P1 gone (enumeration 4), Path empty, its start readable and new.
@@ -2533,6 +2535,10 @@ _P1_UNREAD = {"id": 300, "from": 1, "to": 2, "goneAt": 999, "startSec": 1, "path
 _P1_BOTH_UNREAD_ONE_PASS = {"id": 300, "from": 1, "to": 1, "goneAt": 999, "startSec": 1, "pathFail": -1, "pathMode": "empty", "startFail": -1}
 _P2_A1 = {"id": 300, "from": 2, "to": 99, "goneAt": 999, "startBeforeFirstPollMs": 400}
 _P2_A2 = {**_P2_A1, "startBeforeFirstPollMs": 300}
+# Adversary A1 and A2 on 203a5bb1 (pass 4): P1's Path is unread at first sight and the start read there is also its successor's: the pid passed to P2 between
+# the Path and StartTime reads (A1), or P2 got the very same start after a backward clock step (A2). P1 has exited by enumeration 2, where P2 is listed.
+_P1_PATH_UNREAD_EXITS = {"id": 300, "from": 1, "to": 1, "goneAt": 2, "startBeforeFirstPollMs": 400, "pathFail": -1, "pathMode": "empty"}
+_P2_SAME_START = {"id": 300, "from": 2, "to": 99, "goneAt": 999, "startBeforeFirstPollMs": 400}
 # Sol's input: the process started 50 ms before enumeration 1, whose stamp is stepMs earlier. One failed read at first sight, then every read succeeds.
 _CLOCK_APP = {**_APP, "startBeforeFirstPollMs": 50}
 CLOCK_STEPS_MS = (100, 500, 1000)
@@ -2581,6 +2587,10 @@ LATE_READ_SCENARIOS = {
     "a1-recycled-before-stamp-same-path": {"procs": [_APP, _P1_BOTH_UNREAD_ONE_PASS, _P2_A1]},
     "a2-step-after-gap-sample-other-path": {"stepMs": 500, "stepFrom": 2, "procs": [_APP, _P1_BOTH_UNREAD_ONE_PASS, {**_P2_A2, "to": 4, "exe": "other"}]},
     "a2-step-after-gap-sample-same-path": {"stepMs": 500, "stepFrom": 2, "procs": [_APP, _P1_BOTH_UNREAD_ONE_PASS, _P2_A2]},
+    "p4a1-same-start-other-path": {"procs": [_APP, _P1_PATH_UNREAD_EXITS, {**_P2_SAME_START, "to": 4, "exe": "other"}]},
+    "p4a1-same-start-same-path": {"procs": [_APP, _P1_PATH_UNREAD_EXITS, _P2_SAME_START]},
+    "p4a2-same-start-after-step-same-path": {"stepMs": 200, "stepFrom": 2, "procs": [_APP, _P1_PATH_UNREAD_EXITS, _P2_SAME_START]},
+    "path-late-handle-unopened": {"procs": [{**_APP, "pathFail": 3, "pathMode": "empty", "handleFail": 1}]},
     **{f"clock-back-path-{ms}": {"stepMs": ms, "procs": [{**_CLOCK_APP, "pathFail": 1, "pathMode": "empty"}]} for ms in CLOCK_STEPS_MS},
     **{f"clock-back-start-{ms}": {"stepMs": ms, "procs": [{**_CLOCK_APP, "startFail": 1}]} for ms in CLOCK_START_UNREAD_STEPS_MS},
 }
@@ -2602,6 +2612,7 @@ $global:cpDoubles = @(foreach ($s in @($global:cpSpec.procs)) {
     $d | Add-Member -MemberType ScriptMethod -Name Refresh -Value { }
     $d | Add-Member -MemberType ScriptProperty -Name HasExited -Value { if ($null -ne $this.cpS.exitedNullAt -and $global:cpPoll -ge $this.cpS.exitedNullAt -and ($null -eq $this.cpS.exitedNullTo -or $global:cpPoll -le $this.cpS.exitedNullTo)) { return $null }; $global:cpPoll -ge $this.cpS.goneAt }
     $d | Add-Member -MemberType ScriptMethod -Name Refresh -Force -Value { if ($global:cpPoll -eq $this.cpS.exitedThrowAt) { throw [ComponentModel.Win32Exception]::new(5) } }
+    $d | Add-Member -MemberType ScriptProperty -Name Handle -Value { if ($this.cpS.handleFail) { throw [ComponentModel.Win32Exception]::new(5) }; [IntPtr]1 }
     $d | Add-Member -MemberType ScriptProperty -Name Path -Value {
         $s = $this.cpS
         if ((Test-CpFails $s.pathFail $s.pathFailFrom) -or $global:cpPoll -eq $s.pathFailAt) { if ($s.pathMode -eq 'throw') { throw [ComponentModel.Win32Exception]::new(5) }; return '' }
@@ -3063,6 +3074,25 @@ class CorePartitionR10Tests(unittest.TestCase):
         self.assertGreaterEqual(a1["by"]["300"]["first"], a1["polls"][1], f"the successor inherited the unread process's first sight: {a1}")
         # the step is applied after the deciding pass sampled the gap, and is seen later
         self.assertGreaterEqual(self.late_read("a2-step-after-gap-sample-other-path")["skew"], 250, "the clock double did not reach the helper")
+
+    def test_handover_a_recovery_needs_the_first_listed_process_alive_on_its_held_handle(self) -> None:
+        """Adversary A1 and A2 on 203a5bb1 (pass 4): an equal start is no identity. The start read at first sight can be the successor's (the pid passed between
+        the Path and StartTime reads, A1), or a successor can get the same start after a backward clock step (A2). Either way P2 erased P1 (another path) or inherited
+        its first sight (the app's path), and P1 left no record. The handle is now opened before the first-sight reads and kept with the pending entry, and a later
+        read recovers only while that held process has not exited: alive, it held the pid from before its first reads until now, so the later read is its own.
+        P1 has exited here, so it refuses, as on the base, and P2 is held to its own handle and first sight. With no handle (a process this user cannot open)
+        nothing recovers: it is recorded once at first sight and never tracked, exactly as on the base."""
+        for mode, instances in (("p4a1-same-start-other-path", [5000]), ("p4a1-same-start-same-path", [5000, 300]), ("p4a2-same-start-after-step-same-path", [5000, 300])):
+            with self.subTest(mode=mode):
+                case = self.late_read(mode)
+                self.assertEqual(case["unidentified"], [300], f"a successor with the same start erased or inherited an unread process: {case}")
+                self.assertEqual(case["instances"], instances, case)
+                self.assertEqual(case["vwhy"], "same-path-instance-unidentified", case)
+        same = self.late_read("p4a1-same-start-same-path")
+        self.assertGreaterEqual(same["by"]["300"]["first"], same["polls"][1], f"the successor inherited the unread process's first sight: {same}")
+        unopened = self.late_read("path-late-handle-unopened")
+        self.assertEqual([unopened["instances"], unopened["unidentified"]], [[], [5000]], unopened)
+        self.assertFalse(unopened["bench"], unopened)
 
     def test_handover_a_start_unread_at_first_sight_refuses_even_when_it_reads_later(self) -> None:
         """The cost of that ruling, stated: a process whose StartTime fails at first sight and reads later cannot be told from a successor on its pid, so it refuses

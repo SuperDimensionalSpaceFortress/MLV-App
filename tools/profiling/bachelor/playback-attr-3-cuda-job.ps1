@@ -5564,6 +5564,9 @@ public sealed class MlvCorePartitionLoad {
             $me = $cw.ElapsedMilliseconds
             $ps = @(Get-Process -Name $appName -ea 0)
             foreach ($p in $ps) {
+                # The handle is opened before the reads and kept with a pending entry ($pe.o). While the process it holds has not exited, that process holds the pid,
+                # so every read on the pid since the handle opened is its own (adversary pass 4 on 203a5bb1: an equal start is no identity). No handle, no recovery.
+                $h = try { $p.Handle } catch { }
                 $pp = $null; try { $pp = [string]$p.Path } catch { }
                 $pst = $null; try { $pst = $p.StartTime.ToUniversalTime() } catch { }
                 $k = "$($p.Id),$($pst.Ticks)"
@@ -5573,11 +5576,12 @@ public sealed class MlvCorePartitionLoad {
                 # The start read at first sight ($pe.s) is a pending pid's identity, whatever the clock did since: any other start on that pid is a process on a recycled
                 # pid, and the one first listed ended unread. With no start read at first sight nothing can prove identity (r3, HUB RULING 2026-11-06, adversary A1/A2 on
                 # 6180c3e7): a successor can start between the enumeration and any stamp taken after it, and the clock can step after the last gap sample. So any start
-                # read later on that pid refuses, as on the base; only a Path read late, with the start read at first sight, recovers.
-                if ($pe -and $pst -and $pst.Ticks -ne $pe.s) { & $un $p.Id; $pe = $null }
-                # A read that fails settles nothing, on a pid being tracked too: HasExited opens by pid, so a tracked process can hand its pid over unnoticed, and both reads
-                # failing cannot be told from that process exiting. A read at another path with no start cannot say which process it read, so it clears nothing.
-                if (!$pp -or ($pp -ieq $exe -and !$pst)) { if (!$pe) { $pn[$p.Id] = @{ s = $pst.Ticks; f = & $clk; m = $cw.ElapsedMilliseconds } } }
+                # read later on that pid refuses, as on the base; only a Path read late, with the start read at first sight, recovers, and only while the process
+                # held since then has not exited (checked after this pass's reads; HasExited on a held handle is that process's, never the pid's next one).
+                if ($pe -and $pst -and ($pst.Ticks -ne $pe.s -or $pe.o.HasExited -ne $false)) { & $un $p.Id; $pe = $null }
+                # A read that fails settles nothing, on a pid being tracked too: both reads failing cannot be told from that process exiting. A read at another path
+                # with no start cannot say which process it read, so it clears nothing. With no handle nothing can recover, so it is recorded at once, as on the base.
+                if (!$pp -or ($pp -ieq $exe -and !$pst)) { if ($pe) { } elseif ($h) { $pn[$p.Id] = @{ s = $pst.Ticks; o = $p; f = & $clk; m = $cw.ElapsedMilliseconds } } else { & $un $p.Id; $seen[$k] = 1 } }
                 elseif ($pst) { $pn.Remove($p.Id) }
                 if ($pp -ieq $exe -and $pst) {
                     # firstSeenUtcTicks and firstMs are the real first sight, also for a process classed late; aliveMs is this poll's, the first it can vouch for.
