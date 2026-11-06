@@ -1989,13 +1989,17 @@ function Add-CodexLaneRuntimePath {
         # Fully qualified only (X:\... or \\server\...): a relative PATH entry is searched from the CHILD's working directory, not the launcher's
         # where Test-Path would judge it, so a relative candidate would be validated in one place and searched in another (adversary A2 on 6372cc4e).
         if ($dir.Trim() -notmatch '^([A-Za-z]:[\\/]|\\\\)') { continue }
-        $key = $dir.Trim().TrimEnd('\').ToLowerInvariant()
+        # A name PATH cannot carry intact is skipped: ';' would serialize as two entries (C:\toolchains;child\bin -> C:\toolchains plus a relative
+        # child\bin, adversary A1 on e284b182) and '"' is PATH's own quoting. '/' is respelled '\' so one directory is added once, in one spelling.
+        if ($dir.Contains(';') -or $dir.Contains('"')) { continue }
+        $dir = $dir.Trim().Replace('/', '\')
+        $key = $dir.TrimEnd('\').ToLowerInvariant()
         if ($seen.ContainsKey($key)) { continue }
         $exists = $false
         try { $exists = Test-Path -LiteralPath $dir -PathType Container } catch { $exists = $false }
         if (-not $exists) { continue }
         $seen[$key] = $true
-        $added += $dir.Trim()
+        $added += $dir
     }
     if ($added.Count -gt 0) {
         $Psi.Environment['PATH'] = if ($current.Trim(';')) { '{0};{1}' -f $current.TrimEnd(';'), ($added -join ';') } else { $added -join ';' }

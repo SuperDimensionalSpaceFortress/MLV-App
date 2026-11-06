@@ -1083,7 +1083,10 @@ def test_invoke_lane_error_mode_pin_catches_each_launch_ahead_of_the_block(tmp_p
 # mode cannot be the only defence. The lane's environment now also ends in the MinGW bin directory, so a MinGW-built exe finds its DLLs and never reaches the
 # loader failure that raises the box. The seam is Add-CodexLaneRuntimePath, extracted from the script text; nothing here starts codex or an exe without DLLs.
 _CODEX_RUNTIME_PATH_PWSH = shutil.which("pwsh")
-codex_runtime_path_only = pytest.mark.skipif(_CODEX_RUNTIME_PATH_PWSH is None, reason="needs pwsh to run the extracted function")
+codex_runtime_path_only = pytest.mark.skipif(
+    sys.platform != "win32" or _CODEX_RUNTIME_PATH_PWSH is None,
+    reason="the function admits only Windows fully qualified directories (X:\\... or \\\\server\\...) and needs pwsh to run",
+)
 
 
 def _ps_quote(value):
@@ -1212,6 +1215,34 @@ def test_codex_lane_runtime_path_never_adds_a_relative_directory(tmp_path):
     )
     path = _codex_runtime_path_field(done, "PATH")
     assert "mingw" not in path.replace("mingw1310_64", ""), path
+
+
+@codex_runtime_path_only
+def test_codex_lane_runtime_path_never_adds_a_directory_that_would_split_into_two_entries(tmp_path):
+    # Adversary A1 on e284b182: a directory whose own name holds ';' (C:\toolchains;child\bin) was accepted, then serialized into PATH as
+    # C:\toolchains plus a relative child\bin. A name PATH cannot carry intact is skipped.
+    odd = tmp_path / "tool;chains" / "bin"
+    odd.mkdir(parents=True)
+    done = _codex_runtime_path_run(
+        tmp_path,
+        "$psi.Environment['PATH'] = 'C:\\first'\n"
+        f"[void](Add-CodexLaneRuntimePath -Psi $psi -Candidates @('{_ps_quote(odd)}'))",
+    )
+    assert _codex_runtime_path_field(done, "PATH") == "C:\\first"
+
+
+@codex_runtime_path_only
+def test_codex_lane_runtime_path_treats_slash_spellings_as_one_directory(tmp_path):
+    # Adversary A2 (advisory) on e284b182: C:/x/bin and C:\x\bin were both appended. The same directory is added once, and in its backslash spelling.
+    present = tmp_path / "bin"
+    present.mkdir()
+    forward = str(present).replace("\\", "/")
+    done = _codex_runtime_path_run(
+        tmp_path,
+        "$psi.Environment['PATH'] = 'C:\\first'\n"
+        f"[void](Add-CodexLaneRuntimePath -Psi $psi -Candidates @('{_ps_quote(forward)}', '{_ps_quote(present)}'))",
+    )
+    assert _codex_runtime_path_field(done, "PATH") == f"C:\\first;{present}"
 
 
 def test_codex_lane_runtime_path_is_wired_into_the_codex_child_only():
