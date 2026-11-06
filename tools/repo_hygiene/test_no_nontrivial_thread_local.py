@@ -14,6 +14,8 @@ does not cover is listed under Limits below:
 - The files come from an os.scandir walk that catches nothing (product_files). A scanned directory that is
   missing, a directory that cannot be listed, an entry that vanishes mid-scan and a file that cannot be read all
   raise, so ProductTreeTests errors; none of them reads clean (sol r3 B1: Path.rglob swallowed the listing error).
+  An entry whose cached type answers are both False is typed by a fresh stat, and that answer is used: a regular
+  file is read, a directory is walked, anything else (socket, FIFO, device) raises (sol r4 B1).
 - Speed: decoding every file cost about 13 s on the real tree, 12 s of it in the .zip/.xz archives (r3
   measurement). So a file is decoded only when its raw bytes may hold the token in either view (may_hold_token).
   That gate is a superset of what the decoded search can find: the token and every continuation are ASCII, and
@@ -53,6 +55,7 @@ import errno
 import os
 from pathlib import Path
 import re
+import stat
 import tempfile
 import unittest
 from unittest import mock
@@ -127,10 +130,18 @@ def product_files(root):
                 elif entry.is_file():
                     files.append(entry.path)
                 else:
-                    # DirEntry.is_dir and is_file answer False on FileNotFoundError (an entry removed after the
-                    # listing, a dangling symlink); os.stat raises it. What passes is a directory symlink (a stated
-                    # limit) or a socket, FIFO or device, which holds no source.
-                    os.stat(entry.path)
+                    # DirEntry.is_dir and is_file cache their answer and answer False on FileNotFoundError (an entry
+                    # removed after the listing, a dangling symlink). The fresh stat decides, and every answer it
+                    # gives is used (sol r4 B1: a file symlink whose target came back was stat-ed, then dropped).
+                    fresh = os.stat(entry.path).st_mode
+                    if stat.S_ISREG(fresh):
+                        files.append(entry.path)
+                    elif stat.S_ISDIR(fresh):
+                        if not stat.S_ISLNK(os.lstat(entry.path).st_mode):
+                            pending.append(entry.path)
+                        # else a directory symlink: the stated limit THREAD-LOCAL-GUARD-SYMLINK-DIR-1.
+                    else:
+                        raise OSError("neither a regular file nor a directory (mode %o): %s" % (fresh, entry.path))
     return sorted(Path(path) for path in files)
 
 
@@ -151,6 +162,10 @@ def offenders(root):
 
 RAW_PREFIXES = ("", "u8", "u", "U", "L")
 LINE_ENDS = ("\n", "\r\n")
+
+
+# Sol r3 B1's probe declaration: non-trivial, so it registers a destructor.
+GUARD_PROBE = "struct GuardProbe { ~GuardProbe() {} }; static thread_local GuardProbe hidden;\n"
 
 
 def raw_string_splice(prefix, eol):
@@ -194,11 +209,11 @@ HIDDEN_SHAPES = (
         ("cache.icns", "static thread_local std::vector<int> hidden;\n"),
         ("cache.blend", "static thread_local std::vector<int> hidden;\n"),
         ("cache.ttf", "static thread_local std::vector<int> hidden;\n"),
+        # Sol r4 B1: the source of a file symlink whose target was absent at is_file() and back at the fresh stat.
+        # test_an_entry_that_reappears_is_scanned serves every shape through that path too.
+        ("reappeared-symlink-target.cpp", GUARD_PROBE),
     ]
 )
-
-# Sol r3 B1's probe declaration: non-trivial, so it registers a destructor.
-GUARD_PROBE = "struct GuardProbe { ~GuardProbe() {} }; static thread_local GuardProbe hidden;\n"
 
 
 def write_allow_listed_tree(root):
@@ -282,6 +297,21 @@ class _GhostEntry:
 
     def __fspath__(self):
         return self.path
+
+
+def scandir_ghosting(ghost_path):
+    """os.scandir, except that the real entry for ghost_path answers False to is_dir and is_file (sol r4 B1's race:
+    a file symlink whose target was absent when is_file() followed it), while os.stat on it stays real."""
+    real_scandir = os.scandir
+    target = os.path.normcase(os.path.abspath(ghost_path))
+
+    def scandir(path="."):
+        entries = list(real_scandir(path))
+        return _Listing([_GhostEntry(os.fspath(path), entry.name)
+                         if os.path.normcase(os.path.abspath(entry.path)) == target else entry
+                         for entry in entries])
+
+    return scandir
 
 
 class ThreadLocalGrammarTests(unittest.TestCase):
@@ -408,6 +438,55 @@ class ThreadLocalGrammarTests(unittest.TestCase):
             with mock.patch("os.scandir", scandir):
                 with self.assertRaises(FileNotFoundError):
                     scan(root)
+
+    def test_an_entry_that_reappears_is_scanned(self):
+        # Sol r4 B1: both cached answers False, then a fresh stat that succeeds. Its answer was dropped, so a regular
+        # file (a file symlink whose target came back) or a real directory was never read and ProductTreeTests passed.
+        for subtree in ("src/processing/rbfilter", "platform/qt/avir"):
+            for kind in ("file", "directory"):
+                with self.subTest(subtree=subtree, kind=kind), tempfile.TemporaryDirectory() as tmp:
+                    root = Path(tmp)
+                    write_allow_listed_tree(root)
+                    (root / subtree).mkdir(parents=True, exist_ok=True)
+                    ghost = root / subtree / ("hidden.cpp" if kind == "file" else "reappeared")
+                    source = ghost if kind == "file" else ghost / "hidden.cpp"
+                    source.parent.mkdir(parents=True, exist_ok=True)
+                    source.write_text(GUARD_PROBE, encoding="utf-8")
+                    expected = (source.relative_to(root).as_posix(), GUARD_PROBE.strip())
+                    with mock.patch("os.scandir", scandir_ghosting(ghost)):
+                        self.assertIn(expected, offenders(root))
+                        self.assertFalse(product_tree_result(root).wasSuccessful(), "a reappeared entry read clean")
+        for name, source in HIDDEN_SHAPES:
+            with self.subTest(shape=name), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                (root / "src" / "processing").mkdir(parents=True)
+                (root / "platform").mkdir()
+                ghost = root / "src" / "processing" / name
+                ghost.write_bytes(source.encode("utf-8"))
+                with mock.patch("os.scandir", scandir_ghosting(ghost)):
+                    self.assertTrue(offenders(root), name)
+
+    def test_an_entry_that_reappears_as_neither_file_nor_directory_is_raised(self):
+        # A fresh stat that is a socket, FIFO or device is an error, never a silent skip.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "src").mkdir()
+            (root / "platform").mkdir()
+            ghost = root / "src" / "hidden.cpp"
+            ghost.write_text(GUARD_PROBE, encoding="utf-8")
+            real_stat = os.stat
+            target = os.path.normcase(os.path.abspath(ghost))
+
+            def fifo_stat(path, *args, **kwargs):
+                result = real_stat(path, *args, **kwargs)
+                if os.path.normcase(os.path.abspath(path)) == target:
+                    return os.stat_result((stat.S_IFIFO | 0o644,) + tuple(result)[1:])
+                return result
+
+            with mock.patch("os.scandir", scandir_ghosting(ghost)), mock.patch("os.stat", fifo_stat):
+                with self.assertRaises(OSError):
+                    scan(root)
+                self.assertFalse(product_tree_result(root).wasSuccessful())
 
     def test_a_lone_carriage_return_ends_a_continuation(self):
         self.assertEqual(["thread_local Foo g;"], thread_local_lines("thread_\\\rlocal Foo g;\r"))
