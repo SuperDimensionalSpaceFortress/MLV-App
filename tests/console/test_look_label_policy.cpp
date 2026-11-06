@@ -392,6 +392,14 @@ TEST(LookLabelWiring, A1r14EveryAsyncLandingMovesTheLabelKeyToItsReceipt)
     const int guard = apply.indexOf(QStringLiteral("if( !receiptOwnedByLoadedClip( \"look-assist-async-apply\" ) )"));
     const int helper = apply.indexOf(QStringLiteral("const auto labelFollowsLanding = [this, activeReceipt]()"));
     ASSERT_TRUE(guard >= 0 && helper > guard);
+    // Adversary r14 (2c5a92ed) A1: an export clone Q's result (A active, A's switch off) graded A and the re-keyed label read
+    // "Look: Off" over it. The result now grades only the receipt it analysed, so the landing, the grade and the label key are one
+    // receipt; a mismatch is dropped (marker cleared) before anything is applied.
+    const int analysed = apply.indexOf(QStringLiteral("if( receipt != activeReceipt )"), guard);
+    const int dropped = apply.indexOf(QStringLiteral("reason=analysed_receipt_not_active"), analysed);
+    ASSERT_TRUE(analysed > guard && helper > analysed && dropped > analysed && helper > dropped);
+    ASSERT_TRUE(apply.mid(analysed, dropped - analysed).contains(QStringLiteral("m_lookAssistApplied.clearIf( receipt );")));
+    ASSERT_TRUE(apply.indexOf(QStringLiteral("m_lookAssistFlavorOutcome.landed( activeReceipt, "), guard) > helper);
     ASSERT_EQ(1, apply.count(QStringLiteral("const auto labelFollowsLanding = ")));
     const int keyAt = apply.indexOf(QStringLiteral("m_lookLabelAppliedReceipt = activeReceipt;"), helper);
     const int swAt = apply.indexOf(QStringLiteral("m_lookLabelAppliedCloneLookAssist = false;"), helper);

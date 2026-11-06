@@ -17862,6 +17862,16 @@ void MainWindow::applyLookAssistToReceipt( ReceiptSettings *receipt,
                     m_lookAssistApplied.clearIf( receipt );
                     return;
                 }
+                // LOOK-FULLSCREEN-PARITY-1 r14 (adversary r14 2c5a92ed A1): the result grades only the receipt it analysed. An export
+                // clone's analysis landing here would grade the active row's receipt, whose own switch may be off, and the label
+                // could name neither. Dropped like a stale generation: the marker is cleared so the next trigger analyses again.
+                if( receipt != activeReceipt )
+                {
+                    m_lookAssistApplied.clearIf( receipt );
+                    logInteractionEvent( QStringLiteral("look_assist.apply.async_dropped"),
+                                         QStringLiteral("reason=analysed_receipt_not_active generation=%1").arg( dispatchGeneration ) );
+                    return;
+                }
                 // LOOK-FULLSCREEN-PARITY-1 r14 (adversary r14 0d87c82e A1): this result lands on activeReceipt and grades its sliders, so
                 // the label reads it there -- not under an export clone the job recorded as the key (the clone's own landings are the
                 // synchronous path's, on the receipt it analysed). Label only: nothing here changes the grade.
