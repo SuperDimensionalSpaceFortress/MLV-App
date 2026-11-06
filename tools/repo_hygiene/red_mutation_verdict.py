@@ -23,6 +23,25 @@ CLI (exit 0 = PASS, 1 = REFUSED, 2 = bad usage or an unreadable --output file)::
     py -3 tools/repo_hygiene/red_mutation_verdict.py verdict --output red.txt --expect tools/x/test_y.py:123
     py -3 tools/repo_hygiene/red_mutation_verdict.py probe --bug 3 --fix 3 --window 3 3
 
+NARROWED PROMISE (r4 hub ruling; three adversary passes found 8, 9 and 6 new forged-text cases, so more
+instance parsing does not converge): for any input it cannot classify with certainty the checker answers
+REFUSED with a reason that starts ``COULD-NOT-CHECK (<typed reason>)``. That is the existing non-zero refusal
+(exit 1): a COULD-NOT-CHECK is NOT a pass, and it is never turned into a guessed classification. It refuses:
+
+* ``chained``: output holding a chained-exception marker (``During handling of the above exception`` /
+  ``The above exception was the direct cause``). Which exception a chain "is" is not decided here.
+* ``captured``: output holding a Captured block (pytest ``--- Captured stdout call ---`` and its relatives,
+  unittest ``-b`` ``Stdout:``/``Stderr:``). What follows is the test's own text, which can say anything.
+* ``separator`` / ``empty``: a unittest method name holding ``.`` ``/`` ``\\`` ``:``, an identity (run or
+  expectation) with an empty segment (``test_s..T.test_a``, a trailing ``.`` or ``::``), or any id that does
+  not split into exactly its own segments.
+* ``line number``: a ``file:line`` expectation or a traceback frame whose line number has more than 9 digits.
+* ``number``: a probe reading or window bound no float can hold (``--bug 1e400`` written as an integer).
+* ``internal-error``: any other exception while reading the text. Never an uncaught traceback.
+
+A refusal is checked BEFORE the older reasons and the older reason is appended (``; also: ...``), so a
+refusal that was already a refusal stays one. Only a PASS can be changed by this section, and only to REFUSED.
+
 NON-PROMISES:
 - It reads text. It cannot tell that the saved output came from a run of the mutated
   tree, or that the mutation was reverted afterwards; the restore proof is a separate
@@ -76,9 +95,9 @@ NON-PROMISES:
 - It does not know whether the assertion is the RIGHT one: choosing the expected site is
   the author's claim, and this check only binds the run to it.
 - INNERMOST FRAME (follow-up card RMV-INNERMOST-FRAME, not promised here): a ``file:line``
-  match on ANY frame means an ``assert`` inside production code reached from the test, or a
-  chained pytest exception whose earlier frame is the expected site, can read as PASS. The
-  checker does not require the expected site to be the frame that raised.
+  match on ANY frame means an ``assert`` inside production code reached from the test can read
+  as PASS (a chained exception is refused, see NARROWED PROMISE). The checker does not require
+  the expected site to be the frame that raised.
 - ``probe_discriminates`` compares two numbers against a closed window. It does not model
   how the code under test rounds; the caller computes the readings and writes the
   arithmetic next to the probe.
@@ -120,6 +139,38 @@ _GREEN_MARK = re.compile(r"^OK\b|\b\d+ passed\b", re.M)
 _RESULT_LINE = re.compile(r"^(?:OK\b.*|FAILED \(.*\)|=+ .*\bin \d[\d.]*s\b.*=+)\s*$", re.M)
 
 
+_CAPTURED_ANY = re.compile(r"^\s*-{2,}\s*Captured\b|^(?:Stdout|Stderr):\s*$", re.M)
+_INT_TEXT = re.compile(r"\s*[+-]?\d+\s*")
+_MAX_LINE_DIGITS = 9
+
+
+class _Unclassifiable(Exception):
+    """The text holds something this checker will not classify; verdict() turns it into COULD-NOT-CHECK."""
+
+
+def _line_no(digits: str) -> int:
+    if len(digits) > _MAX_LINE_DIGITS:
+        raise _Unclassifiable(f"line number of {len(digits)} digits is not a line of a real file")
+    return int(digits)
+
+
+def _empty_segment(text: str) -> bool:
+    """True when an id has an empty segment (`a..b`, `a.`, `a::`, `::a`, `a//b`): nothing real prints one, so an
+    id with one is never matched, only refused. A leading `/` (an absolute path) is not an empty segment."""
+    j = text.find("[")
+    head = text if j < 0 else text[:j]
+    dotted = "::" not in head  # `file.py::Class::name` names are not dotted; a unittest `module.Class.name` is
+    if not dotted:
+        parts = head.split("::")
+        if any(not p for p in parts):
+            return True
+        head = parts[0]
+    if "/" in head or "\\" in head:
+        segs = head.replace("\\", "/").split("/")
+        return any(not p for p in (segs[1:] if segs and not segs[0] else segs))
+    return dotted and any(not p for p in head.split("."))
+
+
 @dataclass
 class Failure:
     ids: list[str]
@@ -127,6 +178,7 @@ class Failure:
     assertion: bool
     collection: bool = False
     note: str = ""
+    odd: str = ""  # set when the identity cannot be told with certainty: verdict() refuses the whole run
 
 
 @dataclass
@@ -240,7 +292,7 @@ def _ut_walk(block: list[str]) -> tuple[list[tuple[str, int]], str]:
         if ln[:1].isspace():
             m = _FRAME.match(ln)
             if m:
-                frames.append((m["file"], int(m["line"])))
+                frames.append((m["file"], _line_no(m["line"])))
             continue
         exc, in_tb = ln, False
     return frames, exc
@@ -282,11 +334,16 @@ def _parse_unittest(text: str) -> list[Failure]:
             name = head["rest"][:pick.start()] if pick else head["rest"]
             full = f"{pick.group(1)}.{name}" if pick else name
         ids = [] if "unittest.loader" in full else [full]
+        odd = ""
+        if ids and any(ch in name for ch in "./\\:"):
+            odd = f"separator in the method name {name[:40]!r}: its identity would split into invented segments"
+        elif ids and (_empty_segment(full) or any(tok in full for tok in ("/", "\\", "::"))):
+            odd = f"empty or foreign segment in the test identity {full[:60]!r}"
         # FAIL is only unittest's word for "failureException was raised", and a test may set that to any
         # class: the assertion claim rests on the exception actually printed.
         is_assertion = bool(re.match(r"AssertionError(?::|\s*$)", exc_line))
         out.append(Failure(ids, frames, assertion=head["kind"] == "FAIL" and is_assertion and not collection,
-                           collection=collection, note=body[0].strip()))
+                           collection=collection, note=body[0].strip(), odd=odd))
     return out
 
 
@@ -309,6 +366,7 @@ def _parse_pytest(text: str) -> list[Failure]:
     out: list[Failure] = []
     nodes: list[tuple[str, str]] = []
     summary_blockers: list[str] = []
+    odd_notes: list[str] = []
     top = ""
     cur: dict | None = None
     captured = False
@@ -345,6 +403,8 @@ def _parse_pytest(text: str) -> list[Failure]:
                 node, msg, ambiguous = got
                 if word == "FAILED":
                     nodes.append((node, msg))
+                    if _empty_segment(node):
+                        odd_notes.append(f"empty segment in the test identity {node[:60]!r}")
                 if ambiguous:
                     summary_blockers.append(f"ambiguous summary line {word} {node[:60]}")
                 elif _IMPORT_ANYWHERE.search(msg) or _EXC_GROUP.match(msg):
@@ -385,7 +445,7 @@ def _parse_pytest(text: str) -> list[Failure]:
             continue
         m_loc = _PT_LOC.match(line)
         if m_loc:
-            cur["frames"].append((m_loc["file"], int(m_loc["line"])))
+            cur["frames"].append((m_loc["file"], _line_no(m_loc["line"])))
     close()
     msgs = dict(nodes)
     for f in out:
@@ -410,6 +470,8 @@ def _parse_pytest(text: str) -> list[Failure]:
             out.append(Failure([node], [], bool(_ASSERT_HEAD.match(msg)), note=msg))
     for note in summary_blockers:
         out.append(Failure([], [], False, True, note))
+    for note in odd_notes:
+        out.append(Failure([], [], False, note=note, odd=note))
     return out
 
 
@@ -434,21 +496,55 @@ def parse_run(text: str) -> Parsed:
 def _matches(failure: Failure, expected: str) -> bool:
     site = _EXPECT_SITE.match(expected)
     if site:
-        want_file, want_line = _norm_path(site["file"]), int(site["line"])
+        want_file, want_line = _norm_path(site["file"]), _line_no(site["line"])
         return any(line == want_line and _ends_with(_norm_path(file), want_file)
                    for file, line in failure.frames)
     want = _segs(expected)
     return any(_ends_with(_segs(i), want) for i in failure.ids)
 
 
+def _precheck(output: str, expected: str) -> str:
+    """The typed reason this text will not be classified, or "" (see NARROWED PROMISE in the module docstring)."""
+    if not isinstance(output, str) or not isinstance(expected, str) or not expected.strip():
+        return ""  # the plain checks below refuse these with their own reasons
+    if any(ln.strip() in _CHAIN for ln in output.splitlines()):
+        return "chained exception in the output: which exception the run reports is not decided here"
+    if _CAPTURED_ANY.search(output):
+        return "captured output in the run: the test's own text follows the divider and can say anything"
+    site = _EXPECT_SITE.match(expected)
+    if site:
+        _line_no(site["line"])
+    elif _empty_segment(expected):
+        return "empty segment in the expected test identity (`..`, a trailing `.` or `::`): no such id exists"
+    return ""
+
+
 def verdict(output: str, expected: str) -> tuple[str, str]:
-    """Return (PASS|REFUSED, reason). PASS only when `expected` is an assertion that failed."""
+    """Return (PASS|REFUSED, reason). PASS only when `expected` is an assertion that failed. Text it cannot classify
+    with certainty is REFUSED with a reason that starts ``COULD-NOT-CHECK`` (NARROWED PROMISE, module docstring)."""
+    pre, status, reason = "", REFUSED, ""
+    try:
+        pre = _precheck(output, expected)
+        status, reason = _verdict(output, expected)
+    except _Unclassifiable as exc:
+        return REFUSED, f"COULD-NOT-CHECK ({exc})"
+    except Exception as exc:  # noqa: BLE001 - the promise is a refusal, never an uncaught traceback
+        return REFUSED, f"COULD-NOT-CHECK (internal-error {type(exc).__name__} while reading the text)"
+    if pre:
+        return REFUSED, f"COULD-NOT-CHECK ({pre})" + (f"; also: {reason}" if status == REFUSED else "")
+    return status, reason
+
+
+def _verdict(output: str, expected: str) -> tuple[str, str]:
     if not expected or not expected.strip():
         return REFUSED, "no expected assertion given (file:line or test id): a red suite proves nothing alone"
     if _final_green(output):
         return REFUSED, ("the run is green (final result line): failure-looking text above it was test output, "
                          "so no assertion failed")
     run = parse_run(output)
+    for f in run.failures:
+        if f.odd:
+            raise _Unclassifiable(f.odd)
     if not run.failures and not run.red:
         if run.green:
             return REFUSED, "the run is green: the mutation was not detected by any assertion"
@@ -479,10 +575,21 @@ def _num(v: object) -> int | float:
         try:
             v = int(v)  # type: ignore[arg-type]
         except (TypeError, ValueError):
+            if isinstance(v, str) and _INT_TEXT.fullmatch(v):
+                raise OverflowError("integer text beyond the int() digit limit") from None
             v = float(v)  # type: ignore[arg-type]
     if isinstance(v, int):
         float(v)  # OverflowError for an int no double can hold: not a real reading (callers refuse it)
     return v
+
+
+def _cli_num(v: str) -> object:
+    """argparse type: a number, or (for an integer no double can hold) the text itself, so that
+    probe_discriminates refuses it by name instead of argparse raising OverflowError."""
+    try:
+        return _num(v)
+    except OverflowError:
+        return v
 
 
 def probe_discriminates(bug_value: float, fix_value: float, window: tuple[float, float]) -> tuple[bool, str]:
@@ -491,7 +598,7 @@ def probe_discriminates(bug_value: float, fix_value: float, window: tuple[float,
         lo, hi = window
         bug_value, fix_value, lo, hi = _num(bug_value), _num(fix_value), _num(lo), _num(hi)
     except (TypeError, ValueError, OverflowError):
-        return False, "probe readings and window must be numbers"
+        return False, "COULD-NOT-CHECK (number: probe readings and window must be numbers a float can hold)"
     if any(isinstance(v, float) and math.isnan(v) for v in (bug_value, fix_value, lo, hi)):
         return False, "NaN reading or window bound"
     if lo > hi:
@@ -513,9 +620,9 @@ def main(argv: list[str] | None = None) -> int:
     v.add_argument("--output", required=True, help="saved unittest or pytest output of the mutation run")
     v.add_argument("--expect", required=True, help="file:line or test id of the intended assertion")
     p = sub.add_parser("probe")
-    p.add_argument("--bug", type=_num, required=True)
-    p.add_argument("--fix", type=_num, required=True)
-    p.add_argument("--window", type=_num, nargs=2, required=True, metavar=("LO", "HI"))
+    p.add_argument("--bug", type=_cli_num, required=True)
+    p.add_argument("--fix", type=_cli_num, required=True)
+    p.add_argument("--window", type=_cli_num, nargs=2, required=True, metavar=("LO", "HI"))
     args = ap.parse_args(argv)
     for stream in (sys.stdout, sys.stderr):  # an expected id with a non-cp1252 letter must not crash the print
         try:

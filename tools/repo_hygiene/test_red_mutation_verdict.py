@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 import subprocess
 import sys
 import tempfile
@@ -282,6 +283,93 @@ class AdversaryR3Pass2(unittest.TestCase):
                 env={**__import__("os").environ, "PYTHONIOENCODING": "cp1252"})
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertIn(b"PASS", proc.stdout)
+
+
+class NarrowedPromiseR4(unittest.TestCase):
+    """r4 (HUB RULING): the checker refuses what it cannot classify with certainty. Adversary pass 3 on be145244
+    (A1-A6), each fed REAL runner output; the answer is COULD-NOT-CHECK, never a PASS and never a guess."""
+
+    def cnc(self, out: str, want: str, word: str) -> None:
+        status, reason = rmv.verdict(out, want)
+        self.assertEqual(status, rmv.REFUSED, f"{want}: {reason}\n{out}")
+        self.assertIn("COULD-NOT-CHECK", reason, out)
+        self.assertIn(word, reason, out)
+
+    def test_a1_pytest_chained_exception_is_refused_not_parsed(self) -> None:
+        fwd = "def test_x():\n    try:\n        assert False\n    except AssertionError:\n        raise TypeError('boom')\n"
+        rev = "def test_x():\n    try:\n        raise ValueError('first')\n    except ValueError:\n        assert False\n"
+        for src in (fwd, rev):
+            out = _run_pytest({"test_memory.py": src})
+            self.assertIn("During handling of the above exception", out)
+            self.cnc(out, "test_memory.py::test_x", "chained")
+            self.cnc(out, "test_memory.py:3", "chained")
+
+    def test_a1_unittest_chained_exception_is_refused_too(self) -> None:
+        src = ("import unittest\nclass T(unittest.TestCase):\n def test_x(self):\n  try: self.assertEqual(1, 2)\n"
+               "  except AssertionError: raise TypeError('boom')\n")
+        out = _run_unittest({"test_chain.py": src}, "test_chain")
+        self.cnc(out, "test_chain.T.test_x", "chained")
+
+    def test_a2_captured_output_is_refused_not_parsed(self) -> None:
+        for printed in ("ImportError: printed for debugging", "just a note"):
+            out = _run_pytest({"test_memory.py": f"def test_x():\n    print({printed!r})\n    assert False\n"})
+            self.assertIn("Captured stdout call", out)
+            self.cnc(out, "test_memory.py::test_x", "captured")
+        src = "import unittest\nclass T(unittest.TestCase):\n def test_x(self):\n  print('hello')\n  self.assertEqual(1, 2)\n"
+        with tempfile.TemporaryDirectory() as tmp:
+            Path(tmp, "test_buf.py").write_text(src, encoding="utf-8")
+            proc = subprocess.run([sys.executable, "-m", "unittest", "-b", "test_buf"], cwd=tmp, text=True,
+                                  capture_output=True, timeout=120)
+        self.assertIn("Stdout:", proc.stderr)
+        self.cnc(proc.stdout + proc.stderr, "test_buf.T.test_x", "captured")
+
+    def test_a3_oversize_cli_number_is_a_typed_refusal_in_every_position(self) -> None:
+        big = str(10 ** 400)
+        for bug, fix, lo, hi in ((big, "1", "1", "1"), ("0", big, "1", "1"), ("0", "1", big, "9"), ("0", "1", "1", big),
+                                 ("9" * 5000, "1", "1", "1")):
+            self.assertEqual(rmv.main(["probe", "--bug", bug, "--fix", fix, "--window", lo, hi]), 1,
+                             (bug[:5], fix[:5], lo[:5], hi[:5]))
+        proc = subprocess.run([sys.executable, str(Path(rmv.__file__)), "probe", "--bug", big, "--fix", "1", "--window", "1", "1"],
+                              text=True, capture_output=True, timeout=60)
+        self.assertEqual(proc.returncode, 1, proc.stderr)
+        self.assertNotIn("Traceback", proc.stderr)
+        self.assertIn("COULD-NOT-CHECK", proc.stdout)
+        self.assertEqual(len(proc.stdout.strip().splitlines()), 1)
+
+    def test_a4_empty_identity_segments_are_refused(self) -> None:
+        ut = _run_unittest({"test_s.py": TWO_CLASSES}, "test_s")
+        for want in ("test_s..B.test_scale", "test_s.B.test_scale.", ".test_s.B.test_scale", "test_s.B..test_scale"):
+            self.cnc(ut, want, "empty")
+        out = "=== short test summary info ===\nFAILED test_s.py::T::test_a - AssertionError\n=== 1 failed in 0.1s ===\n"
+        for want in ("test_s.py::::T::test_a", "test_s.py::T::test_a::", "::test_s.py::T::test_a"):
+            self.cnc(out, want, "empty")
+        pt = _run_pytest({"test_memory.py": "class TestA:\n    def test_x(self): assert False\n"})
+        self.assertEqual(rmv.verdict(pt, "test_memory.py::TestA::test_x")[0], rmv.PASS, pt)
+        self.cnc(pt, "test_memory.py::::TestA::test_x", "empty")
+
+    def test_a5_separator_inside_a_unittest_method_name_is_refused(self) -> None:
+        for lit in ("test_scale/a", "test_scale\\a", "test_scale::a", "test_scale.a"):
+            src = ("import unittest\nclass T(unittest.TestCase):\n def f(self): self.assertEqual(1, 2)\n"
+                   f"setattr(T, {lit!r}, T.f)\ndel T.f\n")
+            out = _run_unittest({"test_s.py": src}, "test_s")
+            self.cnc(out, "a", "separator")
+            self.cnc(out, "test_s.T." + lit, "separator")
+
+    def test_a6_absurd_line_number_is_a_typed_refusal(self) -> None:
+        out = _run_unittest({"test_s.py": TWO_CLASSES}, "test_s")
+        self.assertEqual(rmv.verdict(out, "test_s.py:12")[0], rmv.PASS, out)
+        self.cnc(out, "test_s.py:" + "9" * 4301, "line number")
+        huge = re.sub(r'(File "[^"]*test_s\.py", line )\d+', lambda m: m.group(1) + "9" * 4301, out)
+        self.assertNotEqual(huge, out)
+        self.cnc(huge, "test_s.py:12", "line number")
+        with tempfile.TemporaryDirectory() as tmp:
+            red = Path(tmp, "red.txt")
+            red.write_text(out, encoding="utf-8")
+            self.assertEqual(rmv.main(["verdict", "--output", str(red), "--expect", "test_s.py:" + "9" * 4301]), 1)
+
+    def test_the_narrowed_promise_is_documented(self) -> None:
+        for word in ("NARROWED PROMISE", "COULD-NOT-CHECK", "chained", "Captured"):
+            self.assertIn(word, rmv.__doc__)
 
 
 class VerdictOnText(unittest.TestCase):
