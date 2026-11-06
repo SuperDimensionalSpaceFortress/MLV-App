@@ -170,11 +170,17 @@ def log(**k):
     finally:
         os.close(fd)
 def read_flag():
-    try:
-        with open(flag, encoding="utf-8") as f:
-            return json.load(f)
-    except (OSError, ValueError):
-        return None
+    # A read that collides with a replace (PermissionError) is retried, never taken for "no flag": a wrapper that read None skipped its delete and
+    # left the flag for `lease release` to poll out (adversary r2 A4).
+    for i in range(100):
+        try:
+            with open(flag, encoding="utf-8") as f:
+                return json.load(f)
+        except PermissionError:
+            time.sleep(0.01)
+        except (OSError, ValueError):
+            return None
+    return None
 # CI-FLAKE-QUIET-LEASE-LIVENESS-PENDING-END-BOUND-1 (the ~10.1 s end): on Windows a replace or delete of the flag fails with PermissionError
 # (WinError 32) while ANY other handle has it open (release's own 0.1 s poll, an AV scan, an indexer). The wrapper then died with the flag
 # left behind and `lease release` spun out its whole 10 s wait for the flag to go: the test saw the pending job end ~10.1 s after expiry
@@ -826,7 +832,7 @@ try {
         'lease-heat-trace-async-retry', 'lease-heat-trace-grant-coverage', 'queuedjob-lease-coverage-at-launch', 'lease-heat-trace-nonlocal-feed',
         'lease-heat-trace-checked-python', 'lease-heat-trace-probe-watchdog',
         'lease-snapshot-bound-straddle', 'lease-probe-watchdog-add-type-failure', 'lease-probe-watchdog-ctor-failure', 'lease-probe-watchdog-arm-paths',
-        'lease-seam-pid-cleanup', 'lease-start-post-start-failure', 'lease-start-post-start-cleanup-throws')
+        'lapse-end-timing-pure', 'lease-seam-pid-cleanup', 'lease-start-post-start-failure', 'lease-start-post-start-cleanup-throws')
     foreach ($o in $Only) { Assert-True ($notAfterCases -contains $o) "-Only names a known case: '$o' (known: $($notAfterCases -join ', '))" }
     function Test-Case([string]$Name) { return ($Only.Count -eq 0 -or $Only -contains $Name) }
     # Hang guard: an agent that ignores notAfterUtc would wait these cases out; the queue ceiling then ends them queue-expired
@@ -897,7 +903,7 @@ try {
             $vOut = & $script:RealVerdict -Metadata $Metadata -NowUtc $NowUtc -Sidecar $Sidecar
             # The first verdict that CALLS a sidecar passed, stamped after it returned: the real verdict read its clock inside, so this stamp
             # is never earlier than the sidecar's aliveUntilUtc (a >= 0 lag by construction, and a negative one would be a verdict called early).
-            if ($null -ne $Sidecar -and $null -ne $vOut -and $vOut.state -ceq 'passed' -and -not $script:VerdictPassedAt.ContainsKey([string]$Sidecar.jobId)) { $script:VerdictPassedAt[[string]$Sidecar.jobId] = [DateTime]::UtcNow }
+            if ($null -ne $Sidecar -and $null -ne $vOut -and $vOut.state -ceq 'passed' -and $vOut.livenessState -ceq 'lapsed' -and -not $script:VerdictPassedAt.ContainsKey([string]$Sidecar.jobId)) { $script:VerdictPassedAt[[string]$Sidecar.jobId] = [DateTime]::UtcNow }
             return $vOut
         }
     }
@@ -1785,6 +1791,34 @@ function Exit-HeavySlot {
     # Each case keeps the queue-age hang guard, so an agent that ignores the sidecar ends queue-expired (a FAIL), never a hang.
     function Get-LivenessSuffix([string]$Until) { return " source=sidecar livenessUntilUtc=$Until; NOT run, no lease kept" }
 
+    # lapse-end-timing-pure (CI-FLAKE-QUIET-LEASE-LIVENESS-PENDING-END-BOUND-1): Get-LapseEndTiming over in-memory events (defined below; the case runs after it).
+    # Each row is a schedule of (detection, release call, end line) offsets in seconds from the expiry: the per-event bounds AND the case's total bound hold.
+    function Test-LapseEndTimingPure {
+        $rows = @(
+            @{ n = 'on-time';                  det = 0.1;  rel = 0.4;  end = 0.9;  total = 5;  want = '' }
+            @{ n = 'composed-bounds-A1';       det = 0.1;  rel = 5.5;  end = 10.0; total = 5;  want = 'TOTAL' }   # each part inside its own bound, the sum 10 s after expiry
+            @{ n = 'delayed-detection';        det = 2.0;  rel = 2.3;  end = 2.8;  total = 5;  want = 'DETECTION' }
+            @{ n = 'detected-before-expiry';   det = -0.2; rel = 0.4;  end = 0.9;  total = 5;  want = 'DETECTION' }
+            @{ n = 'slow-release-10s';         det = 0.1;  rel = 0.4;  end = 10.5; total = 10; want = 'END' }      # the hosted shape: the release poll ran its full 10 s
+            @{ n = 'release-before-expiry';    det = 0.1;  rel = -0.5; end = 0.9;  total = 5;  want = 'RELEASE' }
+            @{ n = 'never-detected';           det = $null; rel = 0.4; end = 0.9;  total = 5;  want = 'DETECTION' }
+        )
+        $bad = [System.Collections.Generic.List[string]]::new()
+        foreach ($r in $rows) {
+            Reset-Case @{ request = 'hang' }
+            $e = [DateTime]::UtcNow
+            if ($null -ne $r.det) { $script:VerdictPassedAt['jPure'] = $e.AddSeconds($r.det) }
+            $relTs = ([DateTimeOffset]$e.AddSeconds($r.rel)).ToUnixTimeMilliseconds() / 1000.0
+            [IO.File]::WriteAllText((Join-Path $fx 'calls.jsonl'), ((@{ cmd = 'release'; ts = $relTs } | ConvertTo-Json -Compress) + "`n"))
+            $script:EvLog.Add([pscustomobject]@{ utc = $e.AddSeconds($r.end); msg = 'quiet-lease: expired-not-after job=jPure phase=pending' })
+            $t = Get-LapseEndTiming -ExpiryUtc $e -JobId 'jPure' -TotalBoundSec $r.total
+            $got = (@($t.failures | ForEach-Object { ($_ -split ':')[0] }) | Select-Object -Unique) -join ','
+            $ok = if ($r.want -eq '') { $t.failures.Count -eq 0 } else { $got -split ',' -contains $r.want }
+            if (-not $ok) { $bad.Add("$($r.n): want [$($r.want)] got [$got]") }
+        }
+        return $bad
+    }
+
     # ---- CI-FLAKE-QUIET-LEASE-LIVENESS-PENDING-END-BOUND-1: the end of a lapsed PENDING wait, bounded by EVENTS, never by a late sample.
     # Two hosted failures (merge_group 41167580702: liveness-lapses-while-pending `$ended -lt 10` = 10.13 s; PR #754 run 42093700873:
     # batch-runner-killed-liveness `$lagK -le 5` = 10.1 s) read the test's own clock after Wait-QuietLeaseAdmission returned, so the one number
@@ -1802,7 +1836,10 @@ function Exit-HeavySlot {
     Assert-True $graceM.Success "Stop-QuietLease waits for its wrapper with a literal WaitForExit(<ms>) (the end-bound grace is read from it)"
     $script:LapseEndGraceSec = [double]$graceM.Groups[1].Value / 1000.0
     function Get-LapseEndTiming {
-        param([Parameter(Mandatory = $true)][DateTime]$ExpiryUtc, [Parameter(Mandatory = $true)][string]$JobId)
+        # TotalBoundSec: the case's own end-to-end promise measured from the same expiry on the agent's own end event (the old 10 s of
+        # liveness-lapses-while-pending, the #663 5 s of batch-runner-killed-liveness): the three event bounds below compose to more than either
+        # (adversary r2 A1), so the total is checked as well and no composition of them can end a wait later than the case promised.
+        param([Parameter(Mandatory = $true)][DateTime]$ExpiryUtc, [Parameter(Mandatory = $true)][string]$JobId, [Parameter(Mandatory = $true)][double]$TotalBoundSec)
         $f = [System.Collections.Generic.List[string]]::new()
         $detect = if ($script:VerdictPassedAt.ContainsKey($JobId)) { [Nullable[DateTime]]$script:VerdictPassedAt[$JobId] } else { $null }
         $rel = @(Get-Calls | Where-Object { $_.cmd -eq 'release' } | Select-Object -First 1)
@@ -1816,7 +1853,9 @@ function Exit-HeavySlot {
         if ($null -eq $detectLag -or $detectLag -lt 0 -or $detectLag -gt $detectBound) { $f.Add("DETECTION: the lapse is called $(if ($null -eq $detectLag) { 'never' } else { "$([Math]::Round($detectLag, 2)) s after aliveUntilUtc" }), want 0..$detectBound s (gate loop $($script:LapseLoopSec) s + $($script:LapseDetectSlackSec) s)") }
         if ($null -eq $relLag -or $relLag -lt 0 -or $relLag -gt ($detectBound + $script:LapseReleaseSpawnSec)) { $f.Add("RELEASE: the pending request is released $(if ($null -eq $relLag) { 'never' } else { "$([Math]::Round($relLag, 2)) s after aliveUntilUtc" }), want 0..$($detectBound + $script:LapseReleaseSpawnSec) s (detection bound + $($script:LapseReleaseSpawnSec) s python start)") }
         if ($null -eq $endAfterRel -or $endAfterRel -lt 0 -or $endAfterRel -gt $script:LapseEndGraceSec) { $f.Add("END: the wait ends $(if ($null -eq $endAfterRel) { 'never (no release call or no typed end line)' } else { "$([Math]::Round($endAfterRel, 2)) s after its release call" }), want 0..$($script:LapseEndGraceSec) s (Stop-QuietLease's own wrapper-exit grace)") }
-        return [pscustomobject]@{ failures = @($f.ToArray()); detectLagSec = $detectLag; releaseLagSec = $relLag; endAfterReleaseSec = $endAfterRel; detectBoundSec = $detectBound }
+        $totalLag = if ($null -ne $endUtc) { ($endUtc - $ExpiryUtc).TotalSeconds } else { $null }
+        if ($null -eq $totalLag -or $totalLag -lt 0 -or $totalLag -gt $TotalBoundSec) { $f.Add("TOTAL: the wait ends $(if ($null -eq $totalLag) { 'never' } else { "$([Math]::Round($totalLag, 2)) s after aliveUntilUtc" }), want 0..$TotalBoundSec s (this case's end-to-end bound)") }
+        return [pscustomobject]@{ failures = @($f.ToArray()); detectLagSec = $detectLag; releaseLagSec = $relLag; endAfterReleaseSec = $endAfterRel; totalLagSec = $totalLag; detectBoundSec = $detectBound }
     }
     # QL_TEST_LAPSE_FAULT (the regression controls' hand-set fault; CI leaves it unset): none | delay-beat:<sec> | skip-beat | late-observe:<sec> | flag-reader.
     #   delay-beat / skip-beat act on the first gate-wait beat within 0.2 s of expiry; late-observe pauses the test before it reads its own clock;
@@ -1831,11 +1870,19 @@ function Exit-HeavySlot {
         return [pscustomobject]@{ kind = $p[0]; sec = $v }
     }
     function Start-FlagReader {
-        $code = "import os,sys,time`np=sys.argv[1]; t=time.time()+60`nwhile time.time()<t:`n    try:`n        with open(p,'rb') as f:`n            f.read(); time.sleep(0.02)`n    except OSError:`n        pass`n    time.sleep(0.005)"
+        # Pins the collision: the moment the release file appears (the wrapper is about to delete the flag) this opens the flag and holds the handle for 1 s,
+        # like a scan or an indexer that has just got to it. A fixture that deletes once dies on it; one that retries waits it out.
+        $code = "import glob,os,sys,time`np=sys.argv[1]; d=os.path.dirname(p); t=time.time()+60`nwhile time.time()<t:`n    if glob.glob(os.path.join(d,'release-*')):`n        try:`n            with open(p,'rb') as f:`n                f.read(); time.sleep(1.0)`n        except OSError:`n            pass`n        break`n    time.sleep(0.002)"
         $psiR = [Diagnostics.ProcessStartInfo]::new($Python)
         foreach ($a in @('-c', $code, (Join-Path $fx 'quiet-lease.json'))) { [void]$psiR.ArgumentList.Add($a) }
         $psiR.UseShellExecute = $false; $psiR.CreateNoWindow = $true
         return [Diagnostics.Process]::Start($psiR)
+    }
+
+    if (Test-Case 'lapse-end-timing-pure') {
+        $badP = @(Test-LapseEndTimingPure)
+        Assert-True ($badP.Count -eq 0) "lapse-end-timing-pure: the event bounds and the total bound classify every schedule: $($badP -join ' ; ')"
+        $results.lapseEndTimingPure = 'ok'
     }
 
     # ------------------------------------------------------------ liveness-dead-before-request: a lapsed runner gets no request
@@ -1896,7 +1943,7 @@ function Exit-HeavySlot {
         Assert-True ($adm.notAfterSource -ceq 'sidecar' -and $adm.notAfterState -ceq 'passed' -and $adm.livenessUntilUtc -ceq $until) "liveness-lapses-while-pending: typed source=sidecar: $($adm | Select-Object notAfterSource, notAfterState, livenessUntilUtc | ConvertTo-Json -Compress)"
         # The last gate-wait beat is a PRE-expiry value (the iteration that calls the lapse returns before it beats), so it is reported, never asserted.
         $seen = if ($null -ne $script:LastWaitBeat) { ($script:LastWaitBeat - $aliveAt).TotalSeconds } else { $null }
-        $timing = Get-LapseEndTiming -ExpiryUtc $aliveAt -JobId 'jLp'
+        $timing = Get-LapseEndTiming -ExpiryUtc $aliveAt -JobId 'jLp' -TotalBoundSec 10
         # The cleanup asserts run whatever the timing says (a failed bound used to throw before them), and both verdicts are thrown together.
         $cleanupErr = $null
         try {
@@ -2495,7 +2542,7 @@ function Exit-HeavySlot {
             Assert-True ($admK.label -eq 'expired-not-after' -and $admK.phase -ceq 'pending' -and $admK.notAfterSource -ceq 'sidecar' -and $admK.livenessState -ceq 'lapsed') "batch-runner-killed-liveness: the open ends expired-not-after from the lapsed sidecar, still pending: label=$($admK.label) phase=$($admK.phase) source=$($admK.notAfterSource) liveness=$($admK.livenessState)"
             # The #663 bound (LEASE-BATCH-OPEN-RUNNER-LIVENESS-1): the open ends within the liveness window plus ONE GATE LOOP of the last aliveUntilUtc.
             # Measured by events from that expiry (detection, the release call, the typed end line), not by the test's clock after the return.
-            $timingK = Get-LapseEndTiming -ExpiryUtc $lastUntil -JobId $openK
+            $timingK = Get-LapseEndTiming -ExpiryUtc $lastUntil -JobId $openK -TotalBoundSec 5
             $reqsK = @(Get-Calls | Where-Object { $_.cmd -eq 'request' })
             $cleanupErrK = $null
             try { Assert-True ($reqsK.Count -eq 1 -and (Get-Released).Count -eq 1 -and [string]$admK.leaseRelease.releaseRc -ceq '0' -and (Wait-Until { -not (Test-PidAlive ([int]$reqsK[0].pid)) } 5) -and $null -eq $script:QuietLease -and $null -eq $script:QuietLeaseWaiting -and $null -eq $script:LeaseBatch -and @(Get-ChildItem -LiteralPath $fx -Filter '*.lease.json' -File).Count -eq 0) "batch-runner-killed-liveness: the pending request released once, its wrapper gone, no lease or batch kept: $($admK.leaseRelease | ConvertTo-Json -Compress)" }
@@ -3320,35 +3367,62 @@ try { $out = @(Add-LeaseSlotSnapshot -JobId 'jB4a' -Phase 'request') } catch { $
     #   status   - Invoke-HeavySlotStatus, its deadline after the start: ok=$false naming postStartStop=stopped.
     # AGENT-LEASE-QUIET-LEASE-SEAM-PID-CLEANUP-1: the seam's child registry. Invoke-PsSeam clears the CURRENT list per subcase; every subcase's children are
     # also added to the accumulating list, and the case's final cleanup stops all of them and reports any still alive.
-    function Add-PsSeamAll($All, $Current) { foreach ($k in @($Current)) { if (-not $All.Contains($k)) { $All.Add($k) } } }
-    function Stop-PsSeamAll($All, $Current) {
-        foreach ($k in @($All) + @($Current)) { Stop-Process -Id $k -Force -ErrorAction SilentlyContinue }
-        $null = Wait-Until { @(@($All) + @($Current) | Where-Object { Test-PidAlive $_ }).Count -eq 0 } 5
-        return @(@($All) + @($Current) | Where-Object { Test-PidAlive $_ })
+    # A child is registered with its process START TIME (taken while it was alive); a later stop only touches a pid whose start time still matches,
+    # so a pid the OS has since given to an unrelated process is never stopped (adversary r2 A2). No recorded start time = identity unknown = not stopped.
+    function Test-SeamChildAlive([int]$ChildId, [long]$StartTicks) {
+        if ($StartTicks -eq 0) { return $false }
+        $pr = Get-Process -Id $ChildId -ErrorAction SilentlyContinue
+        if ($null -eq $pr) { return $false }
+        try { return ($pr.StartTime.Ticks -eq $StartTicks) } catch { return $false }
+    }
+    function Add-PsSeamAll($All, $Current, $Starts) {
+        foreach ($k in @($Current)) { if (-not $All.ContainsKey([int]$k)) { $All[[int]$k] = $(if ($Starts.ContainsKey([int]$k)) { [long]$Starts[[int]$k] } else { [long]0 }) } }
+    }
+    function Stop-PsSeamAll($All, $Current, $Starts) {
+        $ids = @(@($All.Keys) + @($Current) | ForEach-Object { [int]$_ } | Select-Object -Unique)
+        $ticks = @{}
+        foreach ($k in $ids) { $ticks[$k] = $(if ($All.ContainsKey($k)) { [long]$All[$k] } elseif ($Starts.ContainsKey($k)) { [long]$Starts[$k] } else { [long]0 }) }
+        foreach ($k in $ids) { if (Test-SeamChildAlive $k $ticks[$k]) { Stop-Process -Id $k -Force -ErrorAction SilentlyContinue } }
+        $null = Wait-Until { @($ids | Where-Object { Test-SeamChildAlive $_ $ticks[$_] }).Count -eq 0 } 5
+        return @($ids | Where-Object { Test-SeamChildAlive $_ $ticks[$_] })
     }
     # lease-seam-pid-cleanup: three subcases each leave a real 300 s child (what an earlier RED subcase's probe is), the current list is cleared between
     # them exactly as Invoke-PsSeam does, and the final cleanup must leave none alive. RED on the old cleanup (only the LAST subcase's list): the first two
     # children outlive it.
     if (Test-Case 'lease-seam-pid-cleanup') {
-        $spAll = [System.Collections.Generic.List[int]]::new()
+        $spAll = @{}
+        $spStarts = @{}
         $spCur = [System.Collections.Generic.List[int]]::new()
         $spKids = [System.Collections.Generic.List[int]]::new()
+        $spBystander = $null
+        function Start-SeamKid([string]$Tag) {
+            $psiS = [Diagnostics.ProcessStartInfo]::new($Python)
+            foreach ($a in @('-c', 'import time; time.sleep(300)', (Join-Path $fx "seam-child-$Tag"))) { [void]$psiS.ArgumentList.Add($a) }
+            $psiS.UseShellExecute = $false; $psiS.CreateNoWindow = $true
+            return [Diagnostics.Process]::Start($psiS)
+        }
         try {
             foreach ($n in 1..3) {
                 $spCur.Clear()
-                $psiS = [Diagnostics.ProcessStartInfo]::new($Python)
-                foreach ($a in @('-c', 'import time; time.sleep(300)', (Join-Path $fx "seam-child-$n"))) { [void]$psiS.ArgumentList.Add($a) }
-                $psiS.UseShellExecute = $false; $psiS.CreateNoWindow = $true
-                $kid = [Diagnostics.Process]::Start($psiS)
-                $spKids.Add($kid.Id); $spCur.Add($kid.Id)
-                Add-PsSeamAll $spAll $spCur
+                $kid = Start-SeamKid $n
+                $spKids.Add($kid.Id); $spCur.Add($kid.Id); $spStarts[[int]$kid.Id] = $kid.StartTime.Ticks
+                Add-PsSeamAll $spAll $spCur $spStarts
             }
+            # A2 (adversary r2): a registered pid that is now an UNRELATED process (start time differs) must survive the cleanup.
+            $spBystander = Start-SeamKid 'bystander'
+            $spAll[[int]$spBystander.Id] = [long]($spBystander.StartTime.Ticks + 1)
             Assert-True (@($spKids | Where-Object { Test-PidAlive $_ }).Count -eq 3) "lease-seam-pid-cleanup: three subcases left three live children before the final cleanup: alive=$(@($spKids | Where-Object { Test-PidAlive $_ }).Count)"
-            $left = @(Stop-PsSeamAll $spAll $spCur)
+            $left = @(Stop-PsSeamAll $spAll $spCur $spStarts)
+            # judged over the test's OWN children, not over what the registry knows (a child nothing registered is the leak this case exists for)
+            $left = @(@($left) + @($spKids | Where-Object { Test-PidAlive $_ }) | Select-Object -Unique)
             Assert-True ($left.Count -eq 0) "lease-seam-pid-cleanup: no fixture child survives the final cleanup: survivors=[$($left -join ',')] of [$($spKids -join ',')]"
-            $results.leaseSeamPidCleanup = [ordered]@{ children = $spKids.Count; survivors = $left.Count }
+            Assert-True (Test-PidAlive $spBystander.Id) "lease-seam-pid-cleanup: a registered pid whose process start time no longer matches (pid reuse) is NOT stopped: bystander $($spBystander.Id) alive=$(Test-PidAlive $spBystander.Id)"
+            $results.leaseSeamPidCleanup = [ordered]@{ children = $spKids.Count; survivors = $left.Count; bystanderSurvived = (Test-PidAlive $spBystander.Id) }
         }
-        finally { foreach ($k in $spKids) { Stop-Process -Id $k -Force -ErrorAction SilentlyContinue } }
+        finally {
+            foreach ($k in $spKids) { Stop-Process -Id $k -Force -ErrorAction SilentlyContinue }
+            if ($null -ne $spBystander) { Stop-Process -Id $spBystander.Id -Force -ErrorAction SilentlyContinue }
+        }
     }
     if (Test-Case 'lease-start-post-start-failure') {
         $psFails =[System.Collections.Generic.List[string]]::new()
@@ -3356,7 +3430,8 @@ try { $out = @(Add-LeaseSlotSnapshot -JobId 'jB4a' -Phase 'request') } catch { $
         $script:PsSeamPids = [System.Collections.Generic.List[int]]::new()
         # AGENT-LEASE-QUIET-LEASE-SEAM-PID-CLEANUP-1: PsSeamPids is the CURRENT subcase's children (cleared per subcase); PsSeamAll accumulates every
         # child of every subcase, so the final cleanup reaches the 300 s fake probes of an earlier RED subcase too (it used to see only the last one).
-        $script:PsSeamAll = [System.Collections.Generic.List[int]]::new()
+        $script:PsSeamAll = @{}      # pid -> process start ticks (identity), every subcase
+        $script:PsSeamStart = @{}    # pid -> start ticks, filled by the seam while the child is alive
         $script:PsStops = 0
         $script:PsStopCliReal = ${function:Stop-HeavySlotCli}
         $script:PsStopAfterReal = ${function:Stop-ProcessAfterStartFailure}   # $null on a base agent
@@ -3374,14 +3449,14 @@ try { $out = @(Add-LeaseSlotSnapshot -JobId 'jB4a' -Phase 'request') } catch { $
                 if ($null -eq $f) { return [DateTime]::Now }
                 $v = $null
                 try { $v = $f.GetFrameVariables()['p'] } catch { }
-                if ($null -ne $v -and $v.Value -is [System.Diagnostics.Process]) { try { if (-not $script:PsSeamPids.Contains($v.Value.Id)) { $script:PsSeamPids.Add($v.Value.Id) } } catch { } }
+                if ($null -ne $v -and $v.Value -is [System.Diagnostics.Process]) { try { if (-not $script:PsSeamPids.Contains($v.Value.Id)) { $script:PsSeamPids.Add($v.Value.Id); try { $script:PsSeamStart[[int]$v.Value.Id] = $v.Value.StartTime.Ticks } catch { } } } catch { } }
                 'not-a-date'
             }
             $WarningPreference = 'Stop'
             try { $out = & $Body 3>$null } catch { $threw = $_.Exception.Message }   # 3>$null: the seam's warning still throws (Stop), unprinted (the -UnitOnly caller parses stdout)
             finally { $PSDefaultParameterValues.Remove('Get-Date:Date'); $WarningPreference = $psSavedWarn; $script:PsSeamFn = '' }
             $pids = @($script:PsSeamPids)
-            Add-PsSeamAll $script:PsSeamAll $pids
+            Add-PsSeamAll $script:PsSeamAll $pids $script:PsSeamStart
             $null = Wait-Until { @($pids | Where-Object { Test-PidAlive $_ }).Count -eq 0 } 3
             return [pscustomobject]@{ out = $out; threw = $threw; pids = $pids; alive = @($pids | Where-Object { Test-PidAlive $_ }); stops = $script:PsStops }
         }
@@ -3454,7 +3529,7 @@ try { $out = @(Add-LeaseSlotSnapshot -JobId 'jB4a' -Phase 'request') } catch { $
             Set-Item -LiteralPath Function:\Stop-HeavySlotCli -Value $script:PsStopCliReal
             if ($null -ne $script:PsStopAfterReal) { Set-Item -LiteralPath Function:\Stop-ProcessAfterStartFailure -Value $script:PsStopAfterReal }
             if ($null -ne $psStatusReal) { Set-Item -LiteralPath Function:\Invoke-HeavySlotStatus -Value $psStatusReal }
-            $null = Stop-PsSeamAll $script:PsSeamAll $script:PsSeamPids
+            $null = Stop-PsSeamAll $script:PsSeamAll $script:PsSeamPids $script:PsSeamStart
             $script:StatusDelaySec = 0
             Update-LeaseSlotSnapshots -Abandon 'test case end'
         }
@@ -3565,7 +3640,7 @@ finally {
     Remove-Item -LiteralPath $fx -Recurse -Force -ErrorAction SilentlyContinue
 }
 Assert-True ($script:FixtureLeak.Count -eq 0) "no fixture child process survives the suite: pids=$($script:FixtureLeak -join ',')"
-$results.fixtureChildrenSurviving = $script:FixtureLeak.Count
-if ($null -ne $script:FixtureLeakProbeError) { $results.fixtureChildrenProbeError = $script:FixtureLeakProbeError }   # a probe that could not run is reported, never a failure of its own
+$results.fixtureChildrenSurviving = $(if ($null -ne $script:FixtureLeakProbeError) { 'unknown' } else { $script:FixtureLeak.Count })
+if ($null -ne $script:FixtureLeakProbeError) { $results.fixtureChildrenProbeError = $script:FixtureLeakProbeError }   # a probe that could not run is reported as 'unknown', never as 0 and never a failure of its own
 
 [pscustomobject]@{ status = 'PASS'; agent = $agentScript; agentSha256 = (Get-FileHash -LiteralPath $agentScript -Algorithm SHA256).Hash; results = $results } | ConvertTo-Json -Depth 8
