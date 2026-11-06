@@ -437,13 +437,18 @@ struct L08Async
     const void *target = nullptr;
     int presetWrites = 0;
     lookassist::LookAssistFlavorOutcome outcome;
+    lookassist::LookAssistAppliedMarker marker;   // the de-dupe: set once the dispatch returns (setSliders / frame-ready)
 
     int dispatch(const L08Receipt *receipt)
     {
         outcome.begin();
         target = receipt;
-        return ++generation;
+        const int dispatched = ++generation;
+        marker.markApplied(receipt);
+        return dispatched;
     }
+    // A toggle-on's frame-ready step analyses again only when the marker does not name the receipt (dedup_skip otherwise).
+    bool toggleOnAnalyses(const L08Receipt *receipt) const { return !marker.isApplied(receipt); }
     void disable(L08Receipt *receipt, L08Disable how, bool invalidating)
     {
         receipt->on = false;
@@ -453,13 +458,20 @@ struct L08Async
         {
             ++generation;
             target = nullptr;
+            marker.clearIf(receipt);   // adversary r15 A1: the worker's early-out queues nothing, so the marker is released here
         }
     }
+    // The worker's pre-render early-out (MainWindow.cpp: generation changed before the render): it returns, queuing nothing.
+    bool workerRuns(int dispatchGeneration) const { return generation == dispatchGeneration; }
     void deliver(int dispatchGeneration, L08Receipt *analysed, L08Receipt *active, int presetExposure, const QString &flavor)
     {
-        if( generation != dispatchGeneration ) return;                       // stale generation
-        if( analysed != active ) return;                                       // r14: grades only what it analysed
-        if( !look_label::asyncResultLands(analysed, active, active->on) ) return;   // r15: Look Assist off at delivery
+        if( generation != dispatchGeneration ) { marker.clearIf(analysed); return; }   // stale generation
+        if( analysed != active ) { marker.clearIf(analysed); return; }                  // r14: grades only what it analysed
+        if( !look_label::asyncResultLands(analysed, active, active->on) )              // r15: Look Assist off at delivery
+        {
+            marker.clearIf(analysed);
+            return;
+        }
         active->exposure = presetExposure;
         ++presetWrites;
         outcome.landed(active, flavor, false);
@@ -497,11 +509,38 @@ TEST(LookLabelPolicy, L08AnAsyncResultDeliveredAfterLookAssistWasTurnedOffNeverG
                 ASSERT_EQ(0, async.presetWrites);
                 ASSERT_EQ(0, a.exposure);                                  // the baseline stays on screen
                 ASSERT_EQ(std::string("Look: Off"), async.label(&a));
-                // Turned back on later, nothing stale has landed: the label reads the baseline until a new analysis lands.
+                // Turned back on later, nothing stale has landed: the label reads the baseline until a new analysis lands, and
+                // the de-dupe marker no longer names A, so the toggle's frame-ready step analyses it again.
                 a.on = true;
                 ASSERT_EQ(std::string("Look: Baseline"), async.label(&a));
+                ASSERT_TRUE(async.toggleOnAnalyses(&a));
             }
         }
+    }
+}
+
+// Adversary r15 (2b8e79d8) A1. MLVAPP_LOOK_ASSIST_ASYNC=1; A enabled with a valid baseline; dispatch marks A applied. Before the
+// worker reaches its pre-render check, a paste with Look Assist off (Raw Correction Enable selected) invalidates it; the worker
+// takes the early-out and queues nothing. Tick Look Assist on. RED on 2b8e79d8: the marker still named A, so the frame-ready step
+// dedup_skipped and A was never analysed again (no worker left to land or to clear it).
+TEST(LookLabelPolicy, A1r15AnInvalidatedAnalysisReleasesTheMarkerSoTurningItBackOnAnalysesAgain)
+{
+    for( const L08Disable how : { L08Disable::Toggle, L08Disable::DisabledPaste, L08Disable::DisabledDefaultReset } )
+    {
+        L08Async async;
+        L08Receipt a;
+        const int generation = async.dispatch(&a);
+        ASSERT_FALSE(async.toggleOnAnalyses(&a));          // dispatched: a second trigger is a dedup_skip
+        async.disable(&a, how, true);
+        ASSERT_FALSE(async.workerRuns(generation));         // the early-out: no callback is queued
+        a.on = true;
+        printf("[A1r15] path=%d analyses_again=%d\n", static_cast<int>(how), async.toggleOnAnalyses(&a) ? 1 : 0);
+        ASSERT_TRUE(async.toggleOnAnalyses(&a));
+        // ... and that analysis lands as normal.
+        const int again = async.dispatch(&a);
+        async.deliver(again, &a, &a, 37, QStringLiteral("film"));
+        ASSERT_EQ(1, async.presetWrites);
+        ASSERT_EQ(std::string("Look: Film grade"), async.label(&a));
     }
 }
 
@@ -574,7 +613,11 @@ TEST(LookLabelWiring, L08TheDeliveryCheckPrecedesEveryPresetWriteAndEveryDisable
     // Invalidation: the one helper, keyed on the dispatched receipt, bumps the generation.
     const QString inval = functionBody(mw, QStringLiteral("void MainWindow::invalidateLookAssistAsyncOnDisable( const ReceiptSettings *receipt, const char *reason )"));
     ASSERT_TRUE(inval.contains(QStringLiteral("look_label::disableInvalidatesAsync( receipt, receipt && receipt->lookAssistEnabled(), m_lookAssistAsyncTarget )")));
-    ASSERT_TRUE(inval.contains(QStringLiteral("++m_lookAssistAsyncGeneration;")));
+    const int bump = inval.indexOf(QStringLiteral("++m_lookAssistAsyncGeneration;"));
+    // Adversary r15 A1: the invalidated worker's early-out queues nothing, so the helper itself releases the marker.
+    const int release = inval.indexOf(QStringLiteral("m_lookAssistApplied.clearIf( receipt );"));
+    printf("[L08w] bump=%d release=%d\n", bump, release);
+    ASSERT_TRUE(bump >= 0 && release > bump);
     // ... called right after each of the three disable writes: the switch, a paste, a reset to the default.
     const char *sites[][2] = {
         { "    ACTIVE_RECEIPT->setLookAssistEnabled( checked );\n", "    invalidateLookAssistAsyncOnDisable( ACTIVE_RECEIPT, \"toggle_off\" );" },

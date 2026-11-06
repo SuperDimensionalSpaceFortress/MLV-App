@@ -17054,6 +17054,10 @@ void MainWindow::invalidateLookAssistAsyncOnDisable( const ReceiptSettings *rece
         return;
     const int generation = ++m_lookAssistAsyncGeneration;
     m_lookAssistAsyncTarget = nullptr;
+    // Adversary r15 (2b8e79d8) A1: the invalidated worker may take its pre-render early-out, which queues nothing, so no
+    // dropped callback would clear the de-dupe marker set at dispatch; a later toggle-on then dedup_skipped and the receipt was
+    // never analysed again. Nothing landed, so the marker is released here, for every disable path.
+    m_lookAssistApplied.clearIf( receipt );
     logInteractionEvent( QStringLiteral("look_assist.async_invalidated"),
                          QStringLiteral("reason=%1 generation=%2").arg( QString::fromLatin1( reason ) ).arg( generation ) );
 }
