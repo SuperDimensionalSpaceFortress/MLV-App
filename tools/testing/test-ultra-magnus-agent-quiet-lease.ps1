@@ -181,7 +181,11 @@ def read_flag():
     for i in range(n):
         try:
             with open(flag, encoding="utf-8") as f:
-                return json.load(f)
+                o = json.load(f)
+            # r4 pass-5 A3: a flag that exists but is not a JSON object (null, [], 1, "x", true) is unreadable, never absence: null used to become None.
+            if not isinstance(o, dict):
+                raise FlagUnreadable("flag is not a JSON object: %s" % type(o).__name__)
+            return o
         except FileNotFoundError:
             return None
         except PermissionError:
@@ -494,16 +498,23 @@ function Split-WindowsCommandLine([string]$CommandLine) {
     }
     return , $out.ToArray()
 }
+# r4 pass-5 A1: a value that starts with the fixture dir but climbs out of it ("<fixture>\..\unrelated\log.txt") is not inside it, so the value is
+# resolved first ([IO.Path]::GetFullPath folds '.', '..' and '/'), and only a resolved path equal to the dir or under it counts. A4: Windows paths
+# are case-insensitive, so the pre-filter and the comparison ignore case (the same dir in other case is still the fixture).
 function Test-NamesFixture([string]$CommandLine, [string]$Fx) {
     if ([string]::IsNullOrEmpty($CommandLine) -or [string]::IsNullOrEmpty($Fx)) { return $false }
     $root = $Fx.TrimEnd([char]'\', [char]'/')
-    if ($CommandLine.IndexOf($root, [StringComparison]::Ordinal) -lt 0) { return $false }   # cheap pre-filter: most of the census never names it
+    if ($CommandLine.IndexOf($root, [StringComparison]::OrdinalIgnoreCase) -lt 0) { return $false }   # cheap pre-filter: most of the census never names it
+    try { $rootFull = [IO.Path]::GetFullPath($root).TrimEnd([char]'\') } catch { return $false }
     foreach ($t in (Split-WindowsCommandLine $CommandLine)) {
         $vals = @($t)
         $q = $t.IndexOf([char]'=')
         if ($q -ge 0) { $vals += $t.Substring($q + 1) }
         foreach ($v in $vals) {
-            if ($v -ceq $root -or $v.StartsWith($root + '\', [StringComparison]::Ordinal) -or $v.StartsWith($root + '/', [StringComparison]::Ordinal)) { return $true }
+            if (-not ($v.Equals($root, [StringComparison]::OrdinalIgnoreCase) -or $v.StartsWith($root + '\', [StringComparison]::OrdinalIgnoreCase) -or $v.StartsWith($root + '/', [StringComparison]::OrdinalIgnoreCase))) { continue }
+            $full = $null
+            try { $full = [IO.Path]::GetFullPath($v).TrimEnd([char]'\') } catch { continue }   # an unresolvable value names nothing
+            if ($full.Equals($rootFull, [StringComparison]::OrdinalIgnoreCase) -or $full.StartsWith($rootFull + '\', [StringComparison]::OrdinalIgnoreCase)) { return $true }
         }
     }
     return $false
@@ -512,18 +523,22 @@ function Get-FixtureChildPids([string]$Fx) { return @(Get-CimInstance -ClassName
 # r3 (adversary r3 A1): an identity check and the kill must act on ONE pinned process. The process is opened by pid and its handle held first
 # (Windows never gives a pid to a new process while a handle to the old one is open), the identity check runs against that pinned process, and
 # the kill goes through the same handle. A pid reused BEFORE the pin fails the check; none can be reused between the check and the kill.
-function Stop-PinnedProcess([int]$ProcessId, [scriptblock]$IsOurs) {
-    $pr = Get-Process -Id $ProcessId -ErrorAction SilentlyContinue
+# r4 pass-5 A2: PowerShell turns an exception thrown by a property GETTER into $null without entering catch (even under
+# ErrorActionPreference=Stop), so `$null = $pr.Handle` could fail to pin and the stop went on unpinned. The pin and the exit check are METHOD
+# calls (get_Handle / get_HasExited), whose exceptions always propagate, and a zero handle is no pin. -Open is the test seam for the process.
+function Stop-PinnedProcess([int]$ProcessId, [scriptblock]$IsOurs, [scriptblock]$Open = { param($i) Get-Process -Id $i -ErrorAction SilentlyContinue }) {
+    $pr = & $Open $ProcessId
     if ($null -eq $pr) { return $false }
     try {
-        $null = $pr.Handle
-        if ($pr.HasExited) { return $false }
+        $h = $pr.get_Handle()
+        if ($null -eq $h -or [IntPtr]$h -eq [IntPtr]::Zero) { return $false }
+        if ($pr.get_HasExited()) { return $false }
         if (-not [bool](& $IsOurs $pr)) { return $false }
         $pr.Kill()
         return $true
     }
     catch { return $false }
-    finally { $pr.Dispose() }
+    finally { try { $pr.Dispose() } catch { } }
 }
 function Stop-FixtureLeftovers([string]$Fx, [int[]]$Candidates) {
     # The command line is read AFTER the pin, so it describes the pinned process (an exited one is no longer listed and is not killed).
@@ -3619,6 +3634,14 @@ try { $out = @(Add-LeaseSlotSnapshot -JobId 'jB4a' -Phase 'request') } catch { $
                 @{ cl = '"C:\Python\python.exe" "C:\Temp\um-agent-quiet-lease-1234-abcd1234\heavy-slot-fake.py" lease release'; want = $true }
                 @{ cl = 'python.exe C:\Temp\um-agent-quiet-lease-1234-abcd1234\heavy-slot-fake.py status'; want = $true }
                 @{ cl = 'python.exe -c "import x; y = \"C:\Temp\um-agent-quiet-lease-1234-abcd1234 other\"" C:\Temp\elsewhere\f.json'; want = $false }
+                # r4 pass-5 A1 (verbatim) and its kin: a value that climbs out of the fixture is not in it; one that stays inside still is.
+                @{ cl = 'python.exe -c "import time; time.sleep(300)" "C:\Temp\um-agent-quiet-lease-1234-abcd1234\..\unrelated\log.txt"'; want = $false }
+                @{ cl = 'python.exe --log=C:\Temp\um-agent-quiet-lease-1234-abcd1234/../unrelated/log.txt'; want = $false }
+                @{ cl = 'python.exe C:\Temp\um-agent-quiet-lease-1234-abcd1234\sub\..\..\um-agent-quiet-lease-1234-abcd1234-other\x'; want = $false }
+                @{ cl = 'python.exe C:\Temp\um-agent-quiet-lease-1234-abcd1234\sub\..\heavy-slot-fake.py'; want = $true }
+                @{ cl = 'python.exe C:\Temp\um-agent-quiet-lease-1234-abcd1234\.\heavy-slot-fake.py'; want = $true }
+                # r4 pass-5 A4 (verbatim): the same dir in other case is the fixture (Windows paths ignore case).
+                @{ cl = 'python.exe "C:\TEMP\UM-AGENT-QUIET-LEASE-1234-ABCD1234\heavy-slot-fake.py"'; want = $true }
             )
             $b1Bad = [System.Collections.Generic.List[string]]::new()
             foreach ($r in $b1Rows) { $g = [bool](Test-NamesFixture $r.cl $b1Fx); if ($g -ne $r.want) { $b1Bad.Add("[$($r.cl)] names the fixture=$g want $($r.want)") } }
@@ -3630,6 +3653,35 @@ try { $out = @(Add-LeaseSlotSnapshot -JobId 'jB4a' -Phase 'request') } catch { $
             $optStopped = @(Stop-FixtureLeftovers $fx @($spOpt.Id))
             if ($optListed -or $optStopped.Count -ne 0 -or $spOpt.HasExited) { $b1Bad.Add("real quoted option [$($optCl -join '')] listed=$optListed stopped=[$($optStopped -join ',')] alive=$(-not $spOpt.HasExited)") }
             Assert-True ($b1Bad.Count -eq 0) "lease-seam-pid-cleanup: a quoted option argument naming a sibling dir is not the fixture (sol r3 B1): $($b1Bad -join ' ; ')"
+            # r4 pass-5 A2 (verbatim shape): pid 42424 is a process whose Handle getter fails (no pin) while every other query answers and the identity
+            # check accepts it. A stop that goes on without the pin may kill whatever holds 42424 by then: it must refuse, and never call Kill().
+            $script:A2Kills = 0
+            $a2Open = {
+                param($i)
+                $m = [pscustomobject]@{ Id = $i }
+                $m | Add-Member -MemberType ScriptProperty -Name Handle -Value { throw 'Access is denied' }
+                $m | Add-Member -MemberType ScriptMethod -Name get_Handle -Value { throw 'Access is denied' }
+                $m | Add-Member -MemberType ScriptProperty -Name HasExited -Value { $false }
+                $m | Add-Member -MemberType ScriptMethod -Name get_HasExited -Value { $false }
+                $m | Add-Member -MemberType ScriptMethod -Name Kill -Value { $script:A2Kills++ }
+                $m | Add-Member -MemberType ScriptMethod -Name Dispose -Value { }
+                return $m
+            }
+            $a2Stopped = Stop-PinnedProcess 42424 { param($p) $true } -Open $a2Open
+            # and the same seam with a pin that succeeds still stops (the refusal above is the missing pin, not the mock)
+            $a2OpenOk = {
+                param($i)
+                $m = [pscustomobject]@{ Id = $i }
+                $m | Add-Member -MemberType ScriptProperty -Name Handle -Value { [IntPtr]1 }
+                $m | Add-Member -MemberType ScriptMethod -Name get_Handle -Value { [IntPtr]1 }
+                $m | Add-Member -MemberType ScriptProperty -Name HasExited -Value { $false }
+                $m | Add-Member -MemberType ScriptMethod -Name get_HasExited -Value { $false }
+                $m | Add-Member -MemberType ScriptMethod -Name Kill -Value { $script:A2Kills += 100 }
+                $m | Add-Member -MemberType ScriptMethod -Name Dispose -Value { }
+                return $m
+            }
+            $a2OkStopped = Stop-PinnedProcess 42425 { param($p) $true } -Open $a2OpenOk
+            Assert-True (-not $a2Stopped -and $a2OkStopped -and $script:A2Kills -eq 100) "lease-seam-pid-cleanup: a stop whose pin failed (Handle getter threw) refuses and never calls Kill (pass-5 A2): unpinnedStopped=$a2Stopped pinnedStopped=$a2OkStopped kills=$($script:A2Kills) (want 100: only the pinned one)"
             # r4 (sol r3 hardening): the leak line names a stop that threw as NOT stopped, never "stopped now".
             $leakLine = Format-FixtureLeakLine @(4100, 4200) @(4100)
             Assert-True ($leakLine -like '*stopped now=`[4100`]*' -and $leakLine -like '*NOT stopped (stop refused or threw)=`[4200`]*') "lease-seam-pid-cleanup: the leak line separates stopped from not-stopped pids: $leakLine"
@@ -3722,6 +3774,19 @@ try { $out = @(Add-LeaseSlotSnapshot -JobId 'jB4a' -Phase 'request') } catch { $
             $r = Wait-FakeCall $h
             if ($null -ne $fuLock) { $fuLock.Dispose(); $fuLock = $null }
             $null = Test-Unreadable 'request-refused' $r 4 $false ''
+            # r4 pass-5 A3: a flag that exists but is not a JSON object (null verbatim, then [1]) is unreadable too: release exits 3 without a marker,
+            # renew exits 3 typed (null used to read as "no flag": state=none, exit 0; [1] an untyped AttributeError).
+            foreach ($bodyA3 in @('null', '[1]')) {
+                Reset-Case @{ request = 'hang'; read_attempts = 30; release_wait_s = 2 }
+                [IO.File]::WriteAllText($fuFlag, $bodyA3)
+                $r = Wait-FakeCall (Start-FakeCall @('lease', 'release', '--label', $script:QuietLeaseLabel))
+                $null = Test-Unreadable "release-json-$bodyA3" $r 3 $true ''
+                if (@(Get-ChildItem -LiteralPath $fx -Filter 'release-*' -File).Count -ne 0) { $fuFails.Add("(release-json-$bodyA3) a release marker was written for a flag that is not an object") }
+                Reset-Case @{ request = 'hang'; read_attempts = 30; release_wait_s = 2 }
+                [IO.File]::WriteAllText($fuFlag, $bodyA3)
+                $r = Wait-FakeCall (Start-FakeCall @('lease', 'renew', '--label', $script:QuietLeaseLabel))
+                $null = Test-Unreadable "renew-json-$bodyA3" $r 3 $true ''
+            }
             Assert-True ($fuFails.Count -eq 0) "fake-flag-unreadable: an existing flag that stays unreadable is a typed non-zero failure, never absence (sol r3 B3): $($fuFails -join ' ;; ')"
             $results.fakeFlagUnreadable = $fuRows
         }
