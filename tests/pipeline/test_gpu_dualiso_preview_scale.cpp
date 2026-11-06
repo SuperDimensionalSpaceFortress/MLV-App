@@ -51,6 +51,7 @@
 #include <QTemporaryDir>
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -1670,6 +1671,7 @@ struct H2cPhase
 {
     double ref = 0.0;
     double route = 0.0;
+    double bil = 0.0; // r10 control: r8's x4 (bilinear at x2, chroma-only h121, 2x2 box) on the same Bayer
 };
 
 bool h2cRunPhase(mlvObject_t * video, const mlvDualIsoPreviewScaleRecon_t & plan, int scale, int hq, int shift,
@@ -1698,6 +1700,7 @@ bool h2cRunPhase(mlvObject_t * video, const mlvDualIsoPreviewScaleRecon_t & plan
                                           nullptr) != 1)
         return false;
     std::vector<uint16_t> rgb(static_cast<size_t>(outW) * static_cast<size_t>(outH) * 3u, 0u);
+    std::vector<uint16_t> reducedCopy(reduced); // the entry bit-shifts its Bayer in place
     int w = 0, h = 0;
     if (getMlvRawFrameDebayeredFromReducedReconnedRaw16(video, 1, reduced.data(), bw, bh, scale, rgb.data(), hq, &w,
                                                         &h) != 1)
@@ -1705,6 +1708,17 @@ bool h2cRunPhase(mlvObject_t * video, const mlvDualIsoPreviewScaleRecon_t & plan
     const int rows = plan.reducedHeight;
     out->ref = h2cMetricF(ref.data(), outW, outW, rows, scale, sc.edges, kr, kb);
     out->route = h2cMetricF(rgb.data(), outW, outW, rows, scale, sc.edges, kr, kb);
+    out->bil = 0.0;
+    if (bw == 2 * outW && bh >= 4 && (bh & 1) == 0)
+    {
+        std::vector<uint16_t> deb(static_cast<size_t>(bw) * static_cast<size_t>(bh) * 3u, 0u);
+        std::vector<uint16_t> filt(deb.size(), 0u);
+        debayerBasicU16(deb.data(), reducedCopy.data(), bw, bh, 4, shift);
+        debayer_reduced_hchroma121_rgb16(filt.data(), deb.data(), bw, bh, 4);
+        std::vector<uint16_t> bil(rgb.size(), 0u);
+        if (!processingRgbU16BoxDownsample(filt.data(), bil.data(), bw, bh, 2, 4)) return false;
+        out->bil = h2cMetricF(bil.data(), outW, outW, rows, scale, sc.edges, kr, kb);
+    }
     return true;
 }
 
@@ -1776,6 +1790,106 @@ TEST(GpuDualIsoPreviewScale, CpuReducedX4PlayingFringeStaysNearFullRecon)
         pass = pass && ok;
     }
     ASSERT_TRUE(pass);
+}
+
+// H2C-PORT-1 r10 RED: x4 edge chroma below the full recon's. r9 failed V-FRINGE-OWN at s4
+// (slot 150: H/C 0.949 > 0.90) on r8's x4, whose x2 debayer is bilinear. The same gained
+// scenes as above (high-contrast step, lines 1/2/3 reduced px wide, bars; every sub-phase)
+// through the real entry: per scene, the phase mean of F(route)/F(ref) <= 1.00, with r8's
+// composition on the same reduced Bayer as the control, which must read above 1.00 on every
+// scene (r8 hosted CI: means 1.064-1.192). Model (run dir sim_r10c.py, black offset 0, as
+// here): r10 means 0.73-0.86, r8 1.06-1.19. Mutations: x4 back on the bilinear chroma (fails
+// every scene); the HA G output instead of the bilinear G; no balance (a = 1, c = 0).
+TEST(GpuDualIsoPreviewScale, CpuReducedX4PlayingEdgeChromaBelowFullRecon)
+{
+    GpuReconEnv env(false);
+    MlvPipelineFixture fixture;
+    ASSERT_TRUE(openGpuEligibleFixture(fixture));
+    ASSERT_FALSE(fixture.renderFrame8(0).empty());
+    mlvObject_t * video = fixture.video();
+    setMlvDontAlwaysUseAmaze(video);
+    const int hq = llrpHQDualIso(video) ? 1 : 0;
+    const int shift = hq ? 0 : 16 - video->RAWI.raw_info.bits_per_pixel;
+    const int scale = 4;
+    mlvDualIsoPreviewScaleRecon_t plan;
+    ASSERT_EQ(1, mlvDualIsoPreviewScaleReconPlan(video, scale, &plan));
+    ASSERT_EQ(2, plan.bayerScale);
+    bool pass = true, controlFails = true;
+    for (const H2cSceneSpec & spec : h2cGainedScenes(fixture.width(), scale))
+    {
+        double sumRoute = 0.0, sumBil = 0.0;
+        for (const H2cScene & sc : spec.phases)
+        {
+            H2cPhase ph;
+            ASSERT_TRUE(h2cRunPhase(video, plan, scale, hq, shift, sc, kH2cKr, kH2cKb, &ph));
+            ASSERT_TRUE(ph.ref > 0.0);
+            ASSERT_TRUE(ph.bil > 0.0);
+            sumRoute += ph.route / ph.ref;
+            sumBil += ph.bil / ph.ref;
+        }
+        const double n = static_cast<double>(spec.phases.size());
+        const double meanRoute = sumRoute / n, meanBil = sumBil / n;
+        const bool ok = meanRoute <= 1.00;
+        const bool ctl = meanBil > 1.00;
+        std::printf("[h2c-x4-edge-chroma] %-12s phase mean F/F(ref): route %.3f (<= 1.00) %s | r8 bilinear %.3f "
+                    "(control, > 1.00) %s\n",
+                    spec.name.c_str(), meanRoute, ok ? "ok" : "FAIL", meanBil, ctl ? "ok" : "CONTROL_FAILED");
+        pass = pass && ok;
+        controlFails = controlFails && ctl;
+    }
+    ASSERT_TRUE(controlFails);
+    ASSERT_TRUE(pass);
+}
+
+// H2C-PORT-1 r10: debayer_reduced_hacd_chroma_rgb16 leaves G as debayerBasicU16 wrote it, keeps a
+// gained neutral ramp neutral (R and B back on G within 3 after the gain and black offset are
+// taken out: the fit recovers both), gives the same bytes for 1 and 4 threads, and refuses a
+// Bayer under 4 x 4 with the RGB untouched. Mutations: G rewritten, no fit (a = 1, c = 0) on a
+// black offset, threads racing on the planes, a missing size guard.
+TEST(GpuDualIsoPreviewScale, HacdChromaKeepsGAndANeutralRampNeutral)
+{
+    const int w = 40, h = 24;
+    const double kr = 0.40, kb = 0.65, blk = 2048.0;
+    std::vector<uint16_t> bayer(static_cast<size_t>(w) * h);
+    for (int y = 0; y < h; ++y)
+        for (int x = 0; x < w; ++x)
+        {
+            const double s = 3000.0 + 150.0 * x + 220.0 * y;
+            const bool ye = (y % 2) == 0, xe = (x % 2) == 0;
+            const double k = (ye && xe) ? kr : (!ye && !xe) ? kb : 1.0;
+            bayer[static_cast<size_t>(y) * w + x] = static_cast<uint16_t>(std::lround(blk + k * s));
+        }
+    std::vector<uint16_t> work(bayer);
+    std::vector<uint16_t> rgb(static_cast<size_t>(w) * h * 3u, 0u);
+    debayerBasicU16(rgb.data(), work.data(), w, h, 1, 0);
+    const std::vector<uint16_t> bil(rgb);
+    std::vector<float> scratch(static_cast<size_t>(2) * w * h);
+    ASSERT_EQ(1, debayer_reduced_hacd_chroma_rgb16(rgb.data(), work.data(), w, h, 1, scratch.data()));
+    double worst = 0.0;
+    for (int y = 0; y < h; ++y)
+        for (int x = 0; x < w; ++x)
+        {
+            const size_t i = (static_cast<size_t>(y) * w + x) * 3u;
+            ASSERT_EQ(static_cast<int>(bil[i + 1]), static_cast<int>(rgb[i + 1]));
+            if (x < 2 || y < 2 || x >= w - 2 || y >= h - 2) continue;
+            const double g = rgb[i + 1] - blk;
+            worst = std::max(worst, std::fabs((rgb[i] - blk) / kr - g));
+            worst = std::max(worst, std::fabs((rgb[i + 2] - blk) / kb - g));
+        }
+    std::printf("[hacd-unit] neutral ramp: worst |R/kR - G|, |B/kB - G| = %.3f (<= 3)\n", worst);
+    ASSERT_TRUE(worst <= 3.0);
+
+    std::vector<uint16_t> rgb4(bil);
+    std::vector<float> scratch4(scratch.size());
+    ASSERT_EQ(1, debayer_reduced_hacd_chroma_rgb16(rgb4.data(), work.data(), w, h, 4, scratch4.data()));
+    ASSERT_TRUE(rgb4 == rgb);
+
+    std::vector<uint16_t> small(static_cast<size_t>(3) * 8u * 3u, 0xBEEFu);
+    const std::vector<uint16_t> smallBayer(static_cast<size_t>(3) * 8u, 1000u);
+    ASSERT_EQ(0, debayer_reduced_hacd_chroma_rgb16(small.data(), smallBayer.data(), 8, 3, 1, scratch.data()));
+    ASSERT_EQ(0, debayer_reduced_hacd_chroma_rgb16(small.data(), smallBayer.data(), 3, 8, 1, scratch.data()));
+    ASSERT_EQ(0, debayer_reduced_hacd_chroma_rgb16(small.data(), smallBayer.data(), 8, 3, 1, nullptr));
+    ASSERT_TRUE(std::all_of(small.begin(), small.end(), [](uint16_t v) { return v == 0xBEEFu; }));
 }
 
 // H2C-PORT-1 RED 3: the route. At x4 the CPU plan's Bayer is at x2 (fullWidth / 2 x
@@ -1947,8 +2061,10 @@ TEST(GpuDualIsoPreviewScale, CpuReducedX2PlayingIsTheBaseBilinearDebayer)
 
 // H2C-PORT-1 r8: x4 keeps H2c, byte for byte, on the real entry: bilinear at the x2 Bayer,
 // the chroma-only horizontal [1 2 1], the 2x2 box over whole row pairs, then the last-row pad.
-// Passes on 5ae70e21 and on the r8 head (holding x2 at base must not move x4).
-// Mutations: x4 on the plain branch, the filter dropped or moved after the box, odd-row box.
+// r10 (fix row 2, forced by fix row 1): between the bilinear and the [1 2 1], R and B are
+// rebuilt by debayer_reduced_hacd_chroma_rgb16 (G stays the bilinear's).
+// Mutations: x4 on the plain branch, the HA-CD step or the filter dropped or moved after the
+// box, odd-row box.
 TEST(GpuDualIsoPreviewScale, CpuReducedX4PlayingIsH2cByteForByte)
 {
     GpuReconEnv env(false);
@@ -1982,6 +2098,8 @@ TEST(GpuDualIsoPreviewScale, CpuReducedX4PlayingIsH2cByteForByte)
         std::vector<uint16_t> deb(static_cast<size_t>(bw) * static_cast<size_t>(bh) * 3u, 0u);
         std::vector<uint16_t> filt(deb.size(), 0u);
         debayerBasicU16(deb.data(), work.data(), bw, bh, threads, shift);
+        std::vector<float> scratch(static_cast<size_t>(2) * static_cast<size_t>(bw) * static_cast<size_t>(bh));
+        ASSERT_EQ(1, debayer_reduced_hacd_chroma_rgb16(deb.data(), work.data(), bw, bh, threads, scratch.data()));
         debayer_reduced_hchroma121_rgb16(filt.data(), deb.data(), bw, bh, threads);
         const int boxH = bh & ~1;
         ASSERT_EQ(1, processingRgbU16BoxDownsample(filt.data(), expected.data(), bw, boxH, 2, threads));
@@ -1997,8 +2115,41 @@ TEST(GpuDualIsoPreviewScale, CpuReducedX4PlayingIsH2cByteForByte)
     size_t differ = 0;
     for (size_t i = 0; i < routed.size(); ++i) differ += routed[i] != expected[i];
     std::printf("[h2c-x4-pin] debayered16 entry x4 bayer x2 %dx%d out %dx%d: %zu of %zu words differ from H2c "
-                "(want 0)\n", bw, bh, outW, outH, differ, routed.size());
+                "+ r10 HA-CD chroma (want 0)\n", bw, bh, outW, outH, differ, routed.size());
     ASSERT_EQ(static_cast<size_t>(0), differ);
+}
+
+// H2C-PORT-1 r10: the per-frame cost of the new step (debayer_reduced_hacd_chroma_rgb16), timed
+// here and never from local playback, at the fixture's x2 Bayer and at a 2880 x 1620 x2 Bayer (a
+// 5760-wide clip at x4), median of 15 runs with getMlvCpuCores threads. Printed, not gated:
+// V-SPEED and HEADROOM are venue bars.
+TEST(GpuDualIsoPreviewScale, HacdChromaStepCostIsPrinted)
+{
+    MlvPipelineFixture fixture;
+    ASSERT_TRUE(openGpuEligibleFixture(fixture));
+    const int threads = getMlvCpuCores(fixture.video());
+    const int sizes[2][2] = { { fixture.width() / 2, (fixture.height() / 2) & ~1 }, { 2880, 1620 } };
+    for (const auto & sz : sizes)
+    {
+        const int w = sz[0], h = sz[1];
+        std::vector<uint16_t> bayer(static_cast<size_t>(w) * static_cast<size_t>(h));
+        for (size_t i = 0; i < bayer.size(); ++i) bayer[i] = static_cast<uint16_t>(2048u + (i * 2654435761u >> 20) % 9000u);
+        std::vector<uint16_t> rgb(bayer.size() * 3u, 0u);
+        std::vector<uint16_t> work(bayer);
+        debayerBasicU16(rgb.data(), work.data(), w, h, threads, 0);
+        std::vector<float> scratch(bayer.size() * 2u);
+        std::vector<double> ms;
+        for (int run = 0; run < 15; ++run)
+        {
+            std::vector<uint16_t> r(rgb);
+            const auto t0 = std::chrono::steady_clock::now();
+            ASSERT_EQ(1, debayer_reduced_hacd_chroma_rgb16(r.data(), work.data(), w, h, threads, scratch.data()));
+            ms.push_back(std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
+        }
+        std::sort(ms.begin(), ms.end());
+        std::printf("[h2c-x4-hacd-ms] x2 Bayer %dx%d threads %d: median %.3f ms min %.3f max %.3f (15 runs)\n", w, h,
+                    threads, ms[ms.size() / 2], ms.front(), ms.back());
+    }
 }
 
 // H2C-PORT-1: debayer_reduced_hchroma121_rgb16 leaves G alone, lowpasses R-G and B-G with

@@ -32,6 +32,20 @@ void debayer_reduced_hnyquist121_rgb16(uint16_t *out, const uint16_t *in, int w,
  * rounds ((s + 2) >> 2, floor), clamped to [0, 65535]. Rows are independent
  * (threads > 1: OpenMP over rows). out and in must not alias. */
 void debayer_reduced_hchroma121_rgb16(uint16_t *out, const uint16_t *in, int w, int h, int threads);
+/* CPU-DUALISO-REDUCED-RECON-H2C-PORT-1 r10: the x4 route's edge chroma. rgb holds
+ * debayerBasicU16's output for bayer (RGGB, R at (even row, even col), bayer already
+ * bit-shifted by that call). G is left as it is. R and B are rebuilt from a
+ * gradient-directed Hamilton-Adams G and a bilinear colour-difference interpolation,
+ * both in a balanced domain where R ~ aR * G + cR and B ~ aB * G + cB (a least-squares
+ * fit per frame against the 4 G neighbours of every second R or B row; a degenerate
+ * fit falls back to a = 1, c = 0), and the colour difference is laid on the bilinear G:
+ * R = aR * (G + (R' - Gha)) + cR, rounded and clamped to [0, 65535]. Border sites
+ * mirror (x - 1 -> x + 1, x - 2 -> x + 2). scratch holds 2 * w * h floats.
+ * Returns 1 when R and B were rebuilt, 0 (rgb untouched) when w or h < 4 or a
+ * pointer is NULL. Deterministic for any thread count (OpenMP over rows; the fit is
+ * serial). */
+int debayer_reduced_hacd_chroma_rgb16(uint16_t *rgb, const uint16_t *bayer, int w, int h, int threads,
+                                      float *scratch);
 /* Quite quick bilinear debayer, floating point sadly; threads argument is unused */
 void debayerBasic(uint16_t * __restrict debayerto, float * __restrict bayerdata, int width, int height, int threads);
 /* More useable amaze, threads number should be the number of cores(or threads if >= i7) your cpu has */
