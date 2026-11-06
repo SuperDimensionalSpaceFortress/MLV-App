@@ -1202,6 +1202,81 @@ function Get-VenueLeaseBudgetWait {
     [pscustomobject]@{ reason = $reason; waitSec = [int][Math]::Ceiling(($t - $now).TotalSeconds); openUtc = $t; usedSec = $u; budgetRoomSec = [int][Math]::Min($CapSec, $BudgetSec - $u); lastEndUtc = $lastEnd }
 }
 
+# BENCH-START-CAP-FROM-LEG-COUNT-1: the two measured constants behind a venue run's start cap. Evidence (Bachelor, PLAYBACK-PRESENT-TAIL-TIMING-1 r1b batch-01..03 and
+# PLAYBACK-CUDA-FULLSCREEN-BLUR-UPLOAD-STALL-POST-502-1 r3 B01, legs of playSeconds 25): consecutive LEG RAN lines are 225-236 s apart (median ~232 s; r3 228 s per leg over
+# an 8-leg batch), so a leg costs its playSeconds plus ~207 s of quiet probe, preload, launch and receipt: 210 s. A lease open or close costs ~35-40 s (batch-01 opens
+# 35 s after BATCH_START and ends 5 s after the last leg).
+$script:VenueLegOverheadSec = 210
+$script:VenueBatchOpenCloseSec = 40
+
+function Get-VenueRunStartCap {
+    <#
+    .SYNOPSIS
+    BENCH-START-CAP-FROM-LEG-COUNT-1: the START CAP of a venue run (the instant after which the driver starts no further batch), sized from the PLANNED LEG COUNT and
+    the per-leg duration instead of a hand-typed window (the 38 min / 29 min windows that cut BLUR r3 after one batch and PRESENT-TAIL #720 at 8 of 12 cells).
+    cap = the projected end of the last planned leg + a margin (-MarginPct of the span, at least -MinMarginSec). The projection replays the lease rules the batch runner
+    lives by with the pure Get-VenueLeaseBudgetWait: a lease is at most -CapSec, a leg starts only while the lease has -LegBudgetSec + -LeaseMarginSec of room, the next
+    lease waits out the cooldown and the 3 h budget (so the budget waits are inside the projection, not a surprise at the cap).
+    A leg costs -PlaySeconds + -LegOverheadSec (the leg spec's seconds plus the measured per-leg overhead, $script:VenueLegOverheadSec by default).
+    -ExplicitCapUtc: the caller's own cap is kept exactly (source explicit); the computed value is reported beside it and never replaces it.
+    -HardBoundUtc: an existing safety bound (the run's hard end, a lease notAfterUtc). The computed cap never extends past it: it is clamped and the typed line
+    START_CAP_CLAMPED_TO_HARD_BOUND says so (with projectedPastBound=1 when the legs would not all start before the bound).
+    Pure: -NowUtc and -Leases (earlier leases, @{ startUtc; endUtc }) are passed in.
+    .OUTPUTS
+    [pscustomobject]@{ capUtc; source (computed | clamped | explicit); computedCapUtc; projectedEndUtc; spanSec; batches; legWallSec; waitSec; marginSec; clamped; lines (typed log lines); line (the START_CAP line) }
+    #>
+    param([Parameter(Mandatory)]$NowUtc, [Parameter(Mandatory)][ValidateRange(1, 100000)][int]$LegCount,
+        [ValidateRange(1, 36000)][int]$PlaySeconds = 25, [ValidateRange(0, 36000)][int]$LegOverheadSec = $script:VenueLegOverheadSec,
+        [ValidateRange(0, 3600)][int]$BatchOpenCloseSec = $script:VenueBatchOpenCloseSec,
+        [object[]]$Leases = @(), [int]$CapSec = 2700, [int]$CooldownSec = 1800, [int]$WindowSec = 10800, [int]$BudgetSec = 5400,
+        [ValidateRange(60, 2700)][int]$LegBudgetSec = 360, [ValidateRange(0, 900)][int]$LeaseMarginSec = 120,
+        [ValidateRange(0, 500)][int]$MarginPct = 20, [ValidateRange(0, 86400)][int]$MinMarginSec = 600,
+        $HardBoundUtc = $null, $ExplicitCapUtc = $null)
+    $now = ConvertTo-VenueUtc $NowUtc
+    $fmt = { param($d) $d.ToUniversalTime().ToString("yyyy-MM-dd'T'HH:mm:ss'Z'", [Globalization.CultureInfo]::InvariantCulture) }
+    $legWall = $PlaySeconds + $LegOverheadSec
+    $leaseRows = [System.Collections.Generic.List[object]]::new(); foreach ($l in @($Leases)) { if ($null -ne $l) { $leaseRows.Add($l) } }
+    $t = $now; $left = $LegCount; $batches = 0; $waitTotal = 0
+    while ($left -gt 0 -and $batches -lt $LegCount) {
+        $w = Get-VenueLeaseBudgetWait -Leases @($leaseRows) -NowUtc $t -CapSec $CapSec -CooldownSec $CooldownSec -WindowSec $WindowSec -BudgetSec $BudgetSec
+        $room = [Math]::Max(1, [int][Math]::Min($CapSec, $w.budgetRoomSec))
+        # leg i (0-based) of a lease starts at open + OpenClose + i*legWall and needs LegBudgetSec + LeaseMarginSec of the lease still ahead of it
+        $fit = [int][Math]::Floor(($room - $LeaseMarginSec - $LegBudgetSec - $BatchOpenCloseSec) / [double]$legWall) + 1
+        $fit = [Math]::Min($left, [Math]::Max(1, $fit))
+        $end = $w.openUtc.AddSeconds($BatchOpenCloseSec + $fit * $legWall)
+        $leaseRows.Add([pscustomobject]@{ startUtc = $w.openUtc; endUtc = $end })
+        $waitTotal += $w.waitSec; $left -= $fit; $batches++; $t = $end
+    }
+    $span = [int][Math]::Ceiling(($t - $now).TotalSeconds)
+    $margin = [Math]::Max($MinMarginSec, [int][Math]::Ceiling($span * $MarginPct / 100.0))
+    $computed = $t.AddSeconds($margin)
+    $hard = $(if ($null -ne $HardBoundUtc -and "$HardBoundUtc" -ne '') { ConvertTo-VenueUtc $HardBoundUtc } else { $null })
+    $cap = $computed; $source = 'computed'; $clamped = $false; $lines = [System.Collections.Generic.List[string]]::new()
+    $pastBound = $false
+    if ($null -ne $hard -and $computed -gt $hard) {
+        $cap = $hard; $source = 'clamped'; $clamped = $true; $pastBound = ($t -gt $hard)
+        $lines.Add("START_CAP_CLAMPED_TO_HARD_BOUND computedCapUtc=$(& $fmt $computed) hardBoundUtc=$(& $fmt $hard) projectedEndUtc=$(& $fmt $t) projectedPastBound=$([int]$pastBound) (the existing bound wins; the cap is not extended past it)")
+    }
+    if ($null -ne $ExplicitCapUtc -and "$ExplicitCapUtc" -ne '') { $cap = ConvertTo-VenueUtc $ExplicitCapUtc; $source = 'explicit' }
+    $line = "START_CAP source=$source capUtc=$(& $fmt $cap) legs=$LegCount playSec=$PlaySeconds legOverheadSec=$LegOverheadSec legWallSec=$legWall batches=$batches waitSec=$waitTotal projectedEndUtc=$(& $fmt $t) spanSec=$span marginSec=$margin computedCapUtc=$(& $fmt $computed)$(if ($null -ne $hard) { " hardBoundUtc=$(& $fmt $hard)" })"
+    $lines.Insert(0, $line)
+    [pscustomobject]@{ capUtc = $cap; source = $source; computedCapUtc = $computed; projectedEndUtc = $t; spanSec = $span; batches = $batches; legWallSec = $legWall; waitSec = $waitTotal; marginSec = $margin
+        clamped = $clamped; projectedPastBound = $pastBound; lines = @($lines); line = $line }
+}
+
+function Get-VenueLegPlaySeconds {
+    <#
+    .SYNOPSIS
+    The playSeconds of a dual-venue leg spec (the leg spec's own seconds, the first input of the start cap). $null when the file is missing, not JSON or has no positive number.
+    #>
+    param([string]$SpecPath)
+    if (-not $SpecPath -or -not (Test-Path -LiteralPath $SpecPath -PathType Leaf)) { return $null }
+    try { $j = Get-Content -LiteralPath $SpecPath -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop } catch { return $null }
+    $v = $null; if ($null -ne $j -and $j.PSObject.Properties['playSeconds']) { $v = $j.playSeconds }
+    if ($v -is [int] -or $v -is [long] -or $v -is [double]) { if ($v -gt 0 -and $v -le 36000) { return [int][Math]::Ceiling([double]$v) } }
+    $null
+}
+
 function Get-VenueLeaseCaps {
     <#
     .SYNOPSIS
@@ -1315,5 +1390,5 @@ Export-ModuleMember -Function New-VenueCapsProbeId, Get-VenueDriverScriptMissing
     Get-VenueTicketDir, New-VenueTicket, Get-VenueTickets, Get-VenueTicketStaleReason, Get-VenueTicketProbeStaleSec, Update-VenueTicket, Remove-VenueTicket, Get-VenueClaimStatus, Format-VenueClaimStatus, Format-VenueTicketQueue,
     ConvertFrom-VenueGateLog, Get-VenueQuietRateTable, Format-VenueQuietRateTable, Select-VenueQuietWindow,
     Get-VenueSupplementarySpecSkip, Get-VenueSupplementaryIdle, Get-VenueStagedBuildManifest, Get-VenueStagedArtifactNames, Get-VenueRemoteJobIds, Get-VenueRemoteJobState, Invoke-VenueBoundedProcess, Complete-VenueProcess,
-    Get-VenueJobResult, Request-VenueJobCancel, Read-VenueLeaseBatchReceipt, Get-VenueInterleavedLegPlan, Get-VenueLegPreLoadMean, Get-VenueLeaseLedgerPath, Read-VenueLeaseLedger, Add-VenueLeaseLedger, Get-VenueLeaseBudgetWait, Get-VenueLeaseCaps, Resolve-VenueLeaseCaps,
+    Get-VenueJobResult, Request-VenueJobCancel, Read-VenueLeaseBatchReceipt, Get-VenueInterleavedLegPlan, Get-VenueLegPreLoadMean, Get-VenueLeaseLedgerPath, Read-VenueLeaseLedger, Add-VenueLeaseLedger, Get-VenueLeaseBudgetWait, Get-VenueRunStartCap, Get-VenueLegPlaySeconds, Get-VenueLeaseCaps, Resolve-VenueLeaseCaps,
     Update-VenueClaim, Start-VenueKeeper, Stop-VenueKeeper, Start-VenueClaimKeeper, Get-VenueClaimKeeperLoss, New-VenueJobLivenessWrite, Write-VenueJobLiveness, Test-VenueJobLivenessReadback, Start-VenueJobLiveness, Stop-VenueJobLiveness

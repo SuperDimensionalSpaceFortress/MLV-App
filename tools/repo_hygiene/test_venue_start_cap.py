@@ -1,0 +1,206 @@
+"""Tests for BENCH-START-CAP-FROM-LEG-COUNT-1: a venue run's START CAP is sized from its planned leg count and leg duration, not from a hand-typed window.
+
+WHY. The lane-local venue drivers (bench-ab.ps1, never committed) took a mandatory, hand-typed -StartCapUtc and refused to start another batch past it. BLUR r3
+(PLAYBACK-CUDA-FULLSCREEN-BLUR-UPLOAD-STALL-POST-502-1) was given a 29 min window for a plan whose batches take ~34 min each, and PRESENT-TAIL #720 stopped at 8 of 12
+cells (START_CAP 12:30Z, stopReason=START_CAP legsLaunched=32). The tracked runner had the same shape: Invoke-VenueLeaseBatch.ps1 defaulted its deadline to a fixed
+6 h whatever the plan size.
+
+WHAT IS PINNED (tools/profiling/dual-venue/VenueChain.psm1 Get-VenueRunStartCap, Get-VenueLegPlaySeconds; Get-VenueStartCap.ps1; Invoke-VenueLeaseBatch.ps1)
+  * RED on fork/master (the helper does not exist there): a 12-leg plan at the measured 235 s per leg (playSeconds 25 + 210 s overhead, PRESENT-TAIL r1b batch-01..03
+    gaps 225-236 s) cannot finish inside the fixed 38 min / 29 min windows that cut those runs, and the computed cap covers the last leg's end plus a margin;
+  * the cap grows with the leg count and with the leg duration (and the lease cooldown / budget waits are inside the projection);
+  * an explicit caller cap is kept exactly (source=explicit), even when it is shorter than the computed one or later than the hard bound;
+  * a computed cap past the existing hard bound is clamped to it and says so on the typed line START_CAP_CLAMPED_TO_HARD_BOUND;
+  * the per-leg seconds come from the leg spec (playSeconds), and the CLI prints the START_CAP line and `StartCapUtc=<iso>`;
+  * Invoke-VenueLeaseBatch.ps1 sizes its default deadline from the plan, never below the legacy 6 h, and keeps an explicit -DeadlineUtc.
+
+Offline only: pure functions plus the CLI. Nothing reaches a venue. Windows-only (PowerShell tools).
+"""
+
+from __future__ import annotations
+
+import json
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import unittest
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[2]
+DV = ROOT / "tools" / "profiling" / "dual-venue"
+CHAIN = DV / "VenueChain.psm1"
+CLI = DV / "Get-VenueStartCap.ps1"
+BATCH = DV / "Invoke-VenueLeaseBatch.ps1"
+LEG_SPEC = DV / "legs" / "m16-1243-display-windowed-s1.json"
+PWSH = shutil.which("pwsh")
+requires_windows_pwsh = unittest.skipIf(PWSH is None or sys.platform != "win32", "needs pwsh on Windows")
+
+NOW = "2026-10-30T09:20:16Z"
+LEG_WALL = 235            # playSeconds 25 + the measured 210 s per-leg overhead
+LIVE_CAPS = "-CapSec 2700 -CooldownSec 300 -BudgetSec 9720 -WindowSec 10800"   # Bachelor's live caps, as the CAPS line of the cut runs read them
+
+
+def parse(ts: str) -> datetime:
+    return datetime.strptime(ts, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+
+
+def call(args: str, now: str = NOW, extra_setup: str = "") -> dict:
+    """Run Get-VenueRunStartCap with -NowUtc and return the result as a dict (times as Z text)."""
+    script = (
+        f"Import-Module '{CHAIN}' -Force -DisableNameChecking; {extra_setup} "
+        f"$r = Get-VenueRunStartCap -NowUtc '{now}' {args}; "
+        "$o = [ordered]@{ capUtc = $r.capUtc.ToString('yyyy-MM-ddTHH:mm:ssZ'); source = $r.source; "
+        "computedCapUtc = $r.computedCapUtc.ToString('yyyy-MM-ddTHH:mm:ssZ'); projectedEndUtc = $r.projectedEndUtc.ToString('yyyy-MM-ddTHH:mm:ssZ'); "
+        "spanSec = $r.spanSec; batches = $r.batches; legWallSec = $r.legWallSec; waitSec = $r.waitSec; marginSec = $r.marginSec; clamped = $r.clamped; "
+        "projectedPastBound = $r.projectedPastBound; lines = @($r.lines) }; $o | ConvertTo-Json -Compress"
+    )
+    p = subprocess.run([PWSH, "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, timeout=120)
+    if p.returncode != 0:
+        raise AssertionError(f"pwsh failed rc={p.returncode}\nstdout={p.stdout}\nstderr={p.stderr}")
+    return json.loads(p.stdout.strip().splitlines()[-1])
+
+
+@requires_windows_pwsh
+class StartCapFromLegCountTests(unittest.TestCase):
+    def test_twelve_leg_plan_is_not_cut_before_leg_12_by_the_fixed_windows(self):
+        # RED on fork/master: Get-VenueRunStartCap does not exist there. The semantics it pins are the incident's: under the 38 min (BLUR r3 successor text) and
+        # 29 min (r3 window) fixed caps, 12 legs at 235 s each cannot all start; the computed cap reaches past the last leg's end.
+        r = call(f"-LegCount 12 {LIVE_CAPS}")
+        start = parse(NOW)
+        twelve_legs_sec = 12 * LEG_WALL
+        for fixed_window_min in (29, 38):
+            self.assertLess(fixed_window_min * 60, twelve_legs_sec, "the fixed window is shorter than the 12 legs: it would cut before leg 12")
+        self.assertEqual(r["legWallSec"], LEG_WALL)
+        self.assertGreaterEqual((parse(r["projectedEndUtc"]) - start).total_seconds(), twelve_legs_sec)
+        self.assertGreater(parse(r["capUtc"]), parse(r["projectedEndUtc"]), "the cap carries a margin past the last leg")
+        self.assertEqual(r["source"], "computed")
+        self.assertTrue(r["lines"][0].startswith("START_CAP source=computed "), r["lines"][0])
+        # 12 legs of 235 s do not fit one 2700 s lease: the second lease waits out the 300 s cooldown, and that wait is inside the projection
+        self.assertEqual(r["batches"], 2)
+        self.assertGreaterEqual(r["waitSec"], 300)
+
+    def test_cap_grows_with_leg_count_and_leg_duration(self):
+        small = call(f"-LegCount 4 {LIVE_CAPS}")
+        big = call(f"-LegCount 24 {LIVE_CAPS}")
+        self.assertGreater(parse(big["capUtc"]), parse(small["capUtc"]))
+        short_legs = call(f"-LegCount 12 -PlaySeconds 25 {LIVE_CAPS}")
+        long_legs = call(f"-LegCount 12 -PlaySeconds 120 {LIVE_CAPS}")
+        self.assertGreater(parse(long_legs["capUtc"]), parse(short_legs["capUtc"]))
+        self.assertEqual(long_legs["legWallSec"], 120 + 210)
+
+    def test_lease_budget_wait_from_earlier_leases_is_inside_the_projection(self):
+        # PRESENT-TAIL r1b: B04 sat behind an 83 min BUDGET wait. Earlier leases that fill the 3 h budget push the whole run later; the cap must follow.
+        n = parse(NOW)
+        leases = ", ".join(
+            f"[pscustomobject]@{{ startUtc = '{(n - timedelta(minutes=m)).strftime('%Y-%m-%dT%H:%M:%SZ')}'; endUtc = '{(n - timedelta(minutes=m - 45)).strftime('%Y-%m-%dT%H:%M:%SZ')}' }}"
+            for m in (165, 110, 60)
+        )
+        tight = "-CapSec 2700 -CooldownSec 300 -BudgetSec 5400 -WindowSec 10800"   # the old mirrored budget: two earlier 45 min leases in the window leave no room
+        free = call(f"-LegCount 12 {tight}")
+        busy = call(f"-LegCount 12 {tight} -Leases @({leases})")
+        self.assertGreater(busy["waitSec"], free["waitSec"])
+        self.assertGreater(parse(busy["capUtc"]), parse(free["capUtc"]))
+
+    def test_explicit_caller_cap_is_kept(self):
+        short = "2026-10-30T09:30:00Z"   # far shorter than 12 legs need
+        r = call(f"-LegCount 12 {LIVE_CAPS} -ExplicitCapUtc '{short}'")
+        self.assertEqual(r["capUtc"], short)
+        self.assertEqual(r["source"], "explicit")
+        self.assertTrue(r["lines"][0].startswith("START_CAP source=explicit "), r["lines"][0])
+        self.assertGreater(parse(r["computedCapUtc"]), parse(short), "the computed value is reported beside it, never substituted")
+        # an explicit cap later than the hard bound is the caller's call and is kept too
+        late = "2026-10-30T23:00:00Z"
+        r2 = call(f"-LegCount 12 {LIVE_CAPS} -ExplicitCapUtc '{late}' -HardBoundUtc '2026-10-30T10:00:00Z'")
+        self.assertEqual(r2["capUtc"], late)
+        self.assertEqual(r2["source"], "explicit")
+
+    def test_computed_cap_is_clamped_to_the_hard_bound_with_the_typed_line(self):
+        bound = "2026-10-30T10:00:00Z"   # 40 min after NOW: 12 legs (2 leases + cooldown) end at ~10:13Z
+        r = call(f"-LegCount 12 {LIVE_CAPS} -HardBoundUtc '{bound}'")
+        self.assertEqual(r["capUtc"], bound)
+        self.assertEqual(r["source"], "clamped")
+        self.assertTrue(r["clamped"])
+        self.assertTrue(r["projectedPastBound"], "the legs do not all start before the bound: said, not hidden")
+        typed = [ln for ln in r["lines"] if ln.startswith("START_CAP_CLAMPED_TO_HARD_BOUND ")]
+        self.assertEqual(len(typed), 1, r["lines"])
+        self.assertIn(f"hardBoundUtc={bound}", typed[0])
+        self.assertIn("projectedPastBound=1", typed[0])
+        self.assertLessEqual(parse(r["capUtc"]), parse(bound))
+
+    def test_a_bound_beyond_the_computed_cap_leaves_it_alone(self):
+        r = call(f"-LegCount 12 {LIVE_CAPS} -HardBoundUtc '2026-10-31T09:00:00Z'")
+        self.assertEqual(r["source"], "computed")
+        self.assertFalse(r["clamped"])
+        self.assertEqual(r["capUtc"], r["computedCapUtc"])
+        self.assertFalse([ln for ln in r["lines"] if ln.startswith("START_CAP_CLAMPED")])
+
+    def test_leg_play_seconds_come_from_the_leg_spec(self):
+        script = (
+            f"Import-Module '{CHAIN}' -Force -DisableNameChecking; "
+            f"Write-Output (Get-VenueLegPlaySeconds -SpecPath '{LEG_SPEC}'); "
+            "Write-Output ([string]::IsNullOrEmpty([string](Get-VenueLegPlaySeconds -SpecPath 'C:\\no\\such\\spec.json')))"
+        )
+        p = subprocess.run([PWSH, "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, timeout=120)
+        self.assertEqual(p.returncode, 0, p.stderr)
+        out = p.stdout.split()
+        self.assertEqual(out[0], str(json.loads(LEG_SPEC.read_text(encoding="utf-8"))["playSeconds"]))
+        self.assertEqual(out[1], "True")
+
+    def test_cli_prints_the_typed_line_and_the_cap(self):
+        p = subprocess.run(
+            [PWSH, "-NoProfile", "-NonInteractive", "-File", str(CLI), "-LegCount", "12", "-NowUtc", NOW, "-CooldownSec", "300", "-BudgetSec", "9720",
+             "-HardEndUtc", "2026-10-30T10:00:00Z"],
+            capture_output=True, text=True, timeout=120)
+        self.assertEqual(p.returncode, 0, p.stderr)
+        lines = p.stdout.strip().splitlines()
+        self.assertTrue(lines[0].startswith("START_CAP source=clamped "), lines[0])
+        self.assertTrue(any(ln.startswith("START_CAP_CLAMPED_TO_HARD_BOUND ") for ln in lines))
+        self.assertEqual(lines[-1], "StartCapUtc=2026-10-30T10:00:00Z")
+
+    def test_cli_derives_legs_and_seconds_from_leg_specs(self):
+        specs = [str(LEG_SPEC)] * 12
+        p = subprocess.run([PWSH, "-NoProfile", "-NonInteractive", "-File", str(CLI), "-LegSpec", ",".join(specs), "-NowUtc", NOW, "-CooldownSec", "300", "-BudgetSec", "9720"],
+                           capture_output=True, text=True, timeout=120)
+        self.assertEqual(p.returncode, 0, p.stderr)
+        first = p.stdout.strip().splitlines()[0]
+        self.assertIn("legs=12 ", first)
+        self.assertIn(f"playSec={json.loads(LEG_SPEC.read_text(encoding='utf-8'))['playSeconds']} ", first)
+
+    def test_cli_without_a_plan_is_a_usage_error(self):
+        p = subprocess.run([PWSH, "-NoProfile", "-NonInteractive", "-File", str(CLI)], capture_output=True, text=True, timeout=120)
+        self.assertEqual(p.returncode, 2)
+
+
+class LeaseBatchWiringTests(unittest.TestCase):
+    """Source pins on the tracked runner: the default deadline is sized from the plan, an explicit one is kept."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.src = BATCH.read_text(encoding="utf-8")
+
+    def test_default_deadline_is_sized_from_the_plan_and_never_below_the_legacy_window(self):
+        self.assertIn("$t0.AddHours(6)", self.src, "the legacy 6 h window stays as the floor")
+        m = re.search(r"if \(\$DeadlineUtc\) \{\s*\n\s*L \"START_CAP source=explicit.*?\n\} else \{(.*?)\n\}\nL \"BATCH_RUN_START", self.src, re.S)
+        self.assertIsNotNone(m, "the START_CAP block sits right before BATCH_RUN_START")
+        body = m.group(1)
+        self.assertIn("Get-VenueRunStartCap", body)
+        self.assertIn("-LegCount ([Math]::Max(1, $plan.Count))", body)
+        self.assertIn("Get-VenueLegPlaySeconds", body, "the per-leg seconds come from the leg specs")
+        for caps in ("-CapSec $LeaseCapSec", "-CooldownSec $LeaseCooldownSec", "-BudgetSec $LeaseBudgetSec", "-Leases @($leases)"):
+            self.assertIn(caps, body, f"the run's resolved lease caps feed the projection: {caps}")
+        self.assertIn("if ($startCap.capUtc -gt $deadline)", body, "the computed cap only ever extends the legacy window")
+
+    def test_explicit_deadline_is_logged_and_kept(self):
+        self.assertRegex(self.src, r'if \(\$DeadlineUtc\) \{\s*\n\s*L "START_CAP source=explicit capUtc=')
+
+    def test_module_exports_and_the_cli_exist(self):
+        chain = CHAIN.read_text(encoding="utf-8")
+        self.assertIn("Get-VenueRunStartCap, Get-VenueLegPlaySeconds", chain[chain.index("Export-ModuleMember"):])
+        self.assertTrue(CLI.is_file())
+
+
+if __name__ == "__main__":
+    unittest.main()

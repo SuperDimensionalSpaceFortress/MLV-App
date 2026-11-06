@@ -1601,6 +1601,17 @@ function Write-RunSummary {
     Write-Output $resultLine
 }
 
+# BENCH-START-CAP-FROM-LEG-COUNT-1: with no -DeadlineUtc the run's deadline is sized from the planned leg count and the legs' own seconds (Get-VenueRunStartCap, which replays the lease
+# cap, cooldown and budget this run just resolved), never shorter than the legacy fixed 6 h window; a caller's -DeadlineUtc is kept as given. One START_CAP line records the inputs.
+if ($DeadlineUtc) {
+    L "START_CAP source=explicit capUtc=$($deadline.ToString('yyyy-MM-dd''T''HH:mm:ss''Z''')) legs=$($plan.Count) (the caller's -DeadlineUtc is kept)"
+} else {
+    $capSecs = @($plan | ForEach-Object { Get-VenueLegPlaySeconds -SpecPath ([string]$_.spec) } | Where-Object { $null -ne $_ })
+    $capPlay = $(if ($capSecs.Count -gt 0) { [int][Math]::Ceiling(($capSecs | Measure-Object -Average).Average) } else { 25 })
+    $startCap = Get-VenueRunStartCap -NowUtc $t0 -LegCount ([Math]::Max(1, $plan.Count)) -PlaySeconds $capPlay -Leases @($leases) -CapSec $LeaseCapSec -CooldownSec $LeaseCooldownSec -WindowSec $LeaseBudgetWindowSec -BudgetSec $LeaseBudgetSec -LegBudgetSec $LegBudgetSec -LeaseMarginSec $LeaseMarginSec
+    foreach ($capLine in $startCap.lines) { L $capLine }
+    if ($startCap.capUtc -gt $deadline) { $deadline = $startCap.capUtc; L "START_CAP_DEADLINE deadline=$($deadline.ToString('o')) (sized from $($plan.Count) planned legs; the legacy 6 h window would have ended earlier)" }
+}
 L "BATCH_RUN_START venue=$Venue legs=$($plan.Count) runDir=$RunDir agentShare=$AgentShare deadline=$($deadline.ToString('o')) threshold=$ThresholdPercent legBudgetSec=$LegBudgetSec leaseMarginSec=$LeaseMarginSec recheckSec=$RecheckSec cooldownSec=$CooldownSec pid=$PID quietScript=$QuietScript legScript=$LegScript umRunScript=$UmRunScript$(if ($ReceiptRoot) { " receiptRoot=$ReceiptRoot" })$(if ($legPlanMode) { " legPlan=$($planRecord.legPlan) planOrder=$PlanOrder arms=$($planRecord.arms -join ',') builds=$(@($planRecord.builds).Count)" })"
 
 while ($pending.Count -gt 0 -and $null -eq $stopReason) {
