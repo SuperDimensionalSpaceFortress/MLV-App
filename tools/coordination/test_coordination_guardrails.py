@@ -1077,6 +1077,113 @@ def test_invoke_lane_error_mode_pin_catches_each_launch_ahead_of_the_block(tmp_p
     assert false_alarms == {}, "a comment, a string or a function definition is not a launch"
 
 
+# --- LANE-CHILD-LOADER-DIALOG-CODEX-SANDBOX-1: the codex lane's children must find the MinGW runtime DLLs ----------
+# MEASURED 2026-11-06 (System log, source 'Application Popup'): green2.exe 09:56:51Z and red.exe 09:57:28Z raised "libstdc++-6.dll / libgcc_s_seh-1.dll was
+# not found" on the owner's desktop AFTER the error-mode fix above merged. The codex sandbox's spawn does not carry that mode to the commands it runs, so the
+# mode cannot be the only defence. The lane's environment now also ends in the MinGW bin directory, so a MinGW-built exe finds its DLLs and never reaches the
+# loader failure that raises the box. The seam is Add-CodexLaneRuntimePath, extracted from the script text; nothing here starts codex or an exe without DLLs.
+_CODEX_RUNTIME_PATH_PWSH = shutil.which("pwsh")
+codex_runtime_path_only = pytest.mark.skipif(_CODEX_RUNTIME_PATH_PWSH is None, reason="needs pwsh to run the extracted function")
+
+
+def _codex_runtime_path_run(tmp_path, call, env=None):
+    """Extract Add-CodexLaneRuntimePath from Invoke-Lane.ps1 by AST, run `call` against a fresh ProcessStartInfo, print PATH= and ADDED= lines."""
+    driver = tmp_path / "driver.ps1"
+    driver.write_text(
+        "param([string]$Script)\n"
+        "$ErrorActionPreference = 'Stop'\n"
+        "$tokens = $null; $errors = $null\n"
+        "$ast = [System.Management.Automation.Language.Parser]::ParseFile($Script, [ref]$tokens, [ref]$errors)\n"
+        "$fn = @($ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq 'Add-CodexLaneRuntimePath' }, $true))\n"
+        "if ($fn.Count -ne 1) { Write-Output 'MISSING-FUNCTION'; exit 3 }\n"
+        ". ([scriptblock]::Create($fn[0].Extent.Text))\n"
+        "$psi = [System.Diagnostics.ProcessStartInfo]::new()\n"
+        + call
+        + "\n'PATH=' + [string]$psi.Environment['PATH']\n",
+        encoding="ascii",
+    )
+    return subprocess.run(
+        [_CODEX_RUNTIME_PATH_PWSH, "-NoProfile", "-NonInteractive", "-File", str(driver), str(LANE_RUNNER)],
+        text=True, capture_output=True, timeout=120, env=env,
+    )
+
+
+def _codex_runtime_path_field(done, name):
+    assert done.returncode == 0, f"probe failed: {done.stdout!r} {done.stderr!r}"
+    m = re.search(rf"^{name}=(.*)$", done.stdout, re.M)
+    assert m, f"no {name}= line: {done.stdout!r}"
+    return m.group(1).strip()
+
+
+@codex_runtime_path_only
+def test_codex_lane_environment_ends_in_the_mingw_bin_directory(tmp_path):
+    mingw = tmp_path / "mingw" / "bin"
+    mingw.mkdir(parents=True)
+    done = _codex_runtime_path_run(
+        tmp_path,
+        "$psi.Environment['PATH'] = 'C:\\first;C:\\second'\n"
+        f"[void](Add-CodexLaneRuntimePath -Psi $psi -Candidates @('{mingw}'))",
+    )
+    path = _codex_runtime_path_field(done, "PATH")
+    # APPENDED: tools already on PATH (git, python, pwsh) keep resolving to what they resolved to before.
+    assert path == f"C:\\first;C:\\second;{mingw}", path
+
+
+@codex_runtime_path_only
+def test_codex_lane_runtime_path_skips_a_missing_directory_and_never_duplicates(tmp_path):
+    present = tmp_path / "bin"
+    present.mkdir()
+    absent = tmp_path / "no-such-dir"
+    done = _codex_runtime_path_run(
+        tmp_path,
+        f"$psi.Environment['PATH'] = 'C:\\first;' + '{str(present).upper()}' + '\\'\n"
+        f"[void](Add-CodexLaneRuntimePath -Psi $psi -Candidates @('{absent}', '{present}', '{present}'))",
+    )
+    path = _codex_runtime_path_field(done, "PATH")
+    # `present` is already there under another case and a trailing backslash: not added again. `absent` does not exist: not added.
+    assert path == f"C:\\first;{str(present).upper()}\\", path
+
+
+@codex_runtime_path_only
+def test_codex_lane_runtime_path_builds_a_path_when_the_environment_has_none(tmp_path):
+    present = tmp_path / "bin"
+    present.mkdir()
+    done = _codex_runtime_path_run(
+        tmp_path,
+        "[void]$psi.Environment.Remove('PATH')\n"
+        f"[void](Add-CodexLaneRuntimePath -Psi $psi -Candidates @('{present}'))",
+    )
+    assert _codex_runtime_path_field(done, "PATH") == str(present)
+
+
+@codex_runtime_path_only
+def test_codex_lane_runtime_path_default_candidates_include_mingw_root_bin(tmp_path):
+    root = tmp_path / "toolchain"
+    (root / "bin").mkdir(parents=True)
+    env = {**os.environ, "MINGW_ROOT": str(root)}
+    done = _codex_runtime_path_run(
+        tmp_path,
+        "$psi.Environment['PATH'] = 'C:\\first'\n[void](Add-CodexLaneRuntimePath -Psi $psi)",
+        env=env,
+    )
+    path = _codex_runtime_path_field(done, "PATH")
+    assert path.split(";")[:2] == ["C:\\first", str(root / "bin")], path
+
+
+def test_codex_lane_runtime_path_is_wired_into_the_codex_child_only():
+    body = LANE_RUNNER.read_text(encoding="utf-8").replace("\r\n", "\n")
+    assert "function Add-CodexLaneRuntimePath" in body, "Invoke-Lane lacks Add-CodexLaneRuntimePath"
+    calls = [m.start() for m in re.finditer(r"^\s*\$\w+ = @\(Add-CodexLaneRuntimePath -Psi \$psi\)", body, re.M)]
+    assert len(calls) == 1, f"expected exactly one call on the lane child's $psi, found {len(calls)}"
+    guard = "if ($cfg.engine -eq 'codex') {"
+    window = body[max(0, calls[0] - 200):calls[0]]
+    assert guard in window, "the call must sit inside `if ($cfg.engine -eq 'codex')`: the claude lane's environment is unchanged"
+    # After the child's $psi exists and before its streams are redirected, i.e. before anything can start it.
+    created = body.index("$psi = [System.Diagnostics.ProcessStartInfo]::new()\n$psi.WorkingDirectory")
+    redirected = body.index("$psi.RedirectStandardInput  = $true")
+    assert created < calls[0] < redirected, "the call must run between the lane child's $psi creation and its stream redirection"
+
+
 def test_invoke_lane_marks_only_the_claude_child_as_a_fleet_lane():
     # KEY-VERDICT-OVERWRITTEN-BY-ROTATION-CHECKPOINT-1. The user-level Stop hook usage-guard.py skips
     # its rotation-checkpoint block when MLV_FLEET_LANE is set; without it a headless lane takes one more

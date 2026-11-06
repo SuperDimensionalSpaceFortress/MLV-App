@@ -1955,6 +1955,46 @@ function Set-CodexLaunchStartInfo {
     foreach ($a in (@($Launch.PrefixArgs) + @($Argv))) { [void]$Psi.ArgumentList.Add([string]$a) }
 }
 # END Assert-CodexCommandLineFits
+# LANE-CHILD-LOADER-DIALOG-CODEX-SANDBOX-1: the error mode set above reaches a claude lane's children but NOT what the codex sandbox starts for the model
+# (measured 2026-11-06, System log 'Application Popup': green2.exe 09:56:51Z and red.exe 09:57:28Z, "libstdc++-6.dll / libgcc_s_seh-1.dll was not found", on the
+# owner's desktop, after the error-mode fix merged). Mechanism chosen: (a), the MinGW bin directory on the codex child's PATH, so a MinGW-built exe the model
+# runs finds its runtime DLLs and the loader failure that raises the box never happens. Why (a) and not (b): codex's shell_environment_policy inherits the
+# launcher's environment by default (config.toml sets only NODE_REPL_*), so PATH is the one channel known to cross the sandbox spawn, while an error mode is
+# per-process state the sandbox's spawn does not carry; a wrapper or config that sets a mode inside the sandbox is codex-version-specific and cannot be
+# tested without starting codex. The directory is APPENDED, so every tool already on PATH resolves exactly as before. Existing directories only; one already
+# present (any case, with or without a trailing backslash) is not added twice. Returns the directories added. Candidates: $env:MINGW_ROOT\bin (the build
+# docs' name for the toolchain, docs/02-developer-guide.md), then the default Qt-installer toolchain C:\Qt\Tools\mingw1310_64\bin that build-guard and
+# tools\testing\run-windows-test.ps1 use.
+function Add-CodexLaneRuntimePath {
+    param(
+        [Parameter(Mandatory = $true)]$Psi,
+        [string[]]$Candidates = $null
+    )
+    if ($null -eq $Candidates) {
+        $Candidates = @()
+        if (-not [string]::IsNullOrWhiteSpace($env:MINGW_ROOT)) { $Candidates += (Join-Path $env:MINGW_ROOT 'bin') }
+        $Candidates += 'C:\Qt\Tools\mingw1310_64\bin'
+    }
+    $current = if ($Psi.Environment.ContainsKey('PATH')) { [string]$Psi.Environment['PATH'] } else { '' }
+    $seen = @{}
+    foreach ($entry in ($current -split ';')) {
+        $key = $entry.Trim().Trim('"').TrimEnd('\').ToLowerInvariant()
+        if ($key) { $seen[$key] = $true }
+    }
+    $added = @()
+    foreach ($dir in $Candidates) {
+        if ([string]::IsNullOrWhiteSpace($dir)) { continue }
+        $key = $dir.Trim().TrimEnd('\').ToLowerInvariant()
+        if ($seen.ContainsKey($key)) { continue }
+        if (-not (Test-Path -LiteralPath $dir -PathType Container)) { continue }
+        $seen[$key] = $true
+        $added += $dir.Trim()
+    }
+    if ($added.Count -gt 0) {
+        $Psi.Environment['PATH'] = if ($current.Trim(';')) { '{0};{1}' -f $current.TrimEnd(';'), ($added -join ';') } else { $added -join ';' }
+    }
+    return $added
+}
 # (b) An editing lane's tool grant must be an explicit, auditable list. 'ALL' is
 # never accepted - that is the exact grant this whole patch exists to narrow.
 if ($AllowEdits -and ([string]::IsNullOrWhiteSpace($AllowedTools) -or $AllowedTools -eq 'ALL')) {
@@ -2726,6 +2766,11 @@ if ($cfg.engine -eq 'claude' -and $cfg.effort) {
 # name (NA-3). The contained host inherits it from $psi and starts the provider without an override.
 if ($cfg.engine -eq 'claude') {
     $psi.Environment['MLV_FLEET_LANE'] = '1'
+}
+# LANE-CHILD-LOADER-DIALOG-CODEX-SANDBOX-1: codex lanes only; the claude lane's environment is unchanged. See Add-CodexLaneRuntimePath.
+if ($cfg.engine -eq 'codex') {
+    $codexRuntimePathAdded = @(Add-CodexLaneRuntimePath -Psi $psi)
+    if ($codexRuntimePathAdded.Count -gt 0) { Write-Host ("[codex-runtime-path] appended to the lane PATH: {0}" -f ($codexRuntimePathAdded -join ';')) }
 }
 # LANE-NO-BACKGROUND-END-TURN-1 round 2 (hub ruling): a CLAUDE_CODE_DISABLE_BACKGROUND_TASKS
 # child-environment flag was here through round 1. docs/never-authorized.json NA-3 prohibits
