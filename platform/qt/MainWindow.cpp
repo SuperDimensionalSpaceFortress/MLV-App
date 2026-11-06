@@ -2050,16 +2050,15 @@ static QImage build_fast_playback_scaled_image_rgb32(const uint8_t * source,
                                                      int sourceWidth,
                                                      int sourceHeight,
                                                      int targetWidth,
-                                                     int targetHeight,
-                                                     std::vector<uint8_t> & scaledBuffer)
+                                                     int targetHeight)
 {
     static thread_local FastPlaybackScaleCache cache;
+    // r2 (adversary A1): an image that OWNS its pixels (fromImage shares RGB32 data).
     return playbackBuildFastScaledImageRgb32( source,
                                               sourceWidth,
                                               sourceHeight,
                                               targetWidth,
                                               targetHeight,
-                                              scaledBuffer,
                                               cache );
 }
 
@@ -4613,12 +4612,14 @@ MainWindow::PlaybackPrepResult MainWindow::buildPlaybackPrepResult( const Playba
             {
                 // CPU-S1-RECON-UNDER-LOOK-PACE-LEVER-1 (Part C): the same pixels as
                 // RGB32 so QPixmap::fromImage on the GUI thread is a no-convert wrap.
+                // r2 (adversary A1): the image owns its pixels and is handed over as
+                // preparedOwnedImage, so the GUI's pixmap shares a buffer that lives as long as it does.
                 displayImage = build_fast_playback_scaled_image_rgb32( rgb8DisplaySource,
                                                                        displaySourceWidth,
                                                                        displaySourceHeight,
                                                                        scaledWidth,
-                                                                       scaledHeight,
-                                                                       displayImageBacking );
+                                                                       scaledHeight );
+                displayImageOwnsData = true;
             }
             else
             {
@@ -4630,8 +4631,8 @@ MainWindow::PlaybackPrepResult MainWindow::buildPlaybackPrepResult( const Playba
                                                                  scaledHeight,
                                                                  displayImageBacking,
                                                                  scaledBytesPerLine );
+                displayImageOwnsData = false;
             }
-            displayImageOwnsData = false;
         }
         else if( zoomFitEnabled )
         {
@@ -4753,6 +4754,12 @@ MainWindow::PlaybackPrepResult MainWindow::buildPlaybackPrepResult( const Playba
         else if( displayImageOwnsData )
         {
             result.preparedOwnedImage = displayImage;
+        }
+        else if( result.preparedRgb32 )
+        {
+            // r2 (adversary A1): an RGB32 frame is never handed over as a borrowed or moved byte
+            // buffer: QPixmap::fromImage would share it past the result's lifetime.
+            result.preparedOwnedImage = displayImage.copy();
         }
         else if( !displayImageBacking.empty()
               && displayImageBacking.size() == preparedSize
@@ -6479,6 +6486,13 @@ void MainWindow::presentPlaybackPreparedFrame( const PlaybackPrepResult &result 
                                                       result.preparedBytesPerLine,
                                                       result.preparedRgb32 );
             displayImageOwnsData = false;
+            if( result.preparedRgb32 )
+            {
+                // r2 (adversary A1): the worker hands RGB32 over as preparedOwnedImage; should a
+                // byte buffer ever carry it, own a copy, because fromImage would share these bytes.
+                displayImage = displayImage.copy();
+                displayImageOwnsData = true;
+            }
         }
     }
 
@@ -6544,25 +6558,12 @@ void MainWindow::presentPlaybackPreparedFrame( const PlaybackPrepResult &result 
         const size_t contentBytes =
             static_cast<size_t>( displayImage.bytesPerLine() )
             * static_cast<size_t>( displayImage.height() );
-        uint64_t contentHash = 1469598103934665603ull;
-        // CPU-S1-RECON-UNDER-LOOK-PACE-LEVER-1 (Part C): an RGB32 frame's 4th byte is the
-        // constant 0xFF; a sample landing on it takes the pixel's previous (colour) byte, so
-        // the hash still follows the picture.
-        const bool contentRgb32 = displayImage.format() == QImage::Format_RGB32;
-        if( contentBits && contentBytes > 0 )
-        {
-            const size_t contentStep =
-                std::max( static_cast<size_t>( 1 ), contentBytes / 8192 );
-            for( size_t i = 0; i < contentBytes; i += contentStep )
-            {
-                const size_t at =
-                    ( contentRgb32 && ( i & 3u ) == static_cast<size_t>( kPlaybackRgb32AlphaByte ) )
-                        ? ( kPlaybackRgb32AlphaByte == 3 ? i - 1u : i + 1u )
-                        : i;
-                contentHash ^= contentBits[at];
-                contentHash *= 1099511628211ull;
-            }
-        }
+        // CPU-S1-RECON-UNDER-LOOK-PACE-LEVER-1 r2 (adversary A2): every byte of each sampled pixel
+        // is mixed, so the step cannot lock onto one channel of an RGB32 (or RGB888) frame.
+        const uint64_t contentHash =
+            playbackPresentedContentHash( contentBits,
+                                          contentBytes,
+                                          playbackPreparedBytesPerPixel( displayImage.format() ) );
         logInteractionEvent(
             QStringLiteral("draw_frame_ready.present_content"),
             QStringLiteral("display_frame=%1 play_checked=%2 position=%3 hash=%4")

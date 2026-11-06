@@ -764,6 +764,13 @@ TEST(PreparedRgb32Wiring, FastBranchWritesRgb32OnlyOnTheCpuRoute)
     ASSERT_TRUE(fast.contains(QStringLiteral("downscaleBranch = \"fast\";")));
     const QString rgb32 = bracedBlockAfter(fast, QStringLiteral("if( cpuPrepRouteRan && playbackPrepRgb32FastBranchEnabled() )"));
     ASSERT_TRUE(rgb32.contains(QStringLiteral("build_fast_playback_scaled_image_rgb32(")));
+    // r2 adversary A1: the RGB32 image owns its pixels (fromImage shares RGB32 data), never the backing vector.
+    ASSERT_TRUE(rgb32.contains(QStringLiteral("displayImageOwnsData = true;")));
+    ASSERT_FALSE(rgb32.contains(QStringLiteral("displayImageBacking")));
+    ASSERT_TRUE(body.contains(QStringLiteral("else if( result.preparedRgb32 )\n        {")));
+    ASSERT_TRUE(body.contains(QStringLiteral("result.preparedOwnedImage = displayImage.copy();")));
+    ASSERT_TRUE(readRepoFile(QStringLiteral("platform/qt/PlaybackScaling.h"))
+                    .contains(QStringLiteral("QImage image( targetWidth, targetHeight, QImage::Format_RGB32 );")));
     ASSERT_EQ(1, fast.count(QStringLiteral("build_fast_playback_scaled_image( rgb8DisplaySource,")));
     ASSERT_EQ(1, body.count(QStringLiteral("build_fast_playback_scaled_image_rgb32(")));
     ASSERT_TRUE(mainWindowSource().contains(QStringLiteral("\"MLVAPP_DISABLE_PLAYBACK_PREP_RGB32\"")));
@@ -797,11 +804,16 @@ TEST(PreparedRgb32Wiring, GuiConsumersReadTheFormat)
     ASSERT_TRUE(body.contains(QStringLiteral("displayImage = playbackWrapPreparedImage( const_cast<uint8_t *>( preparedImageData ),")));
     ASSERT_TRUE(body.contains(QStringLiteral("result.preparedRgb32 );")));
     ASSERT_FALSE(body.contains(QStringLiteral("displayImage = playbackWrapRgb8Image( const_cast<uint8_t *>( preparedImageData ),")));
+    // r2 adversary A1: an RGB32 byte buffer is never shown borrowed.
+    const QString wrapped = bracedBlockAfter(body, QStringLiteral("if( result.preparedRgb32 )"));
+    ASSERT_TRUE(wrapped.contains(QStringLiteral("displayImage = displayImage.copy();")));
     // GUI magenta band: both formats.
     ASSERT_EQ(1, body.count(QStringLiteral("playbackSuppressUniformTopMagentaBandImage( displayImage )")));
     ASSERT_FALSE(body.contains(QStringLiteral("displayImage.format() == QImage::Format_RGB888 )")));
     // Content hash skips the constant alpha byte; the S6 capture stays 3 B/px RGB888.
-    ASSERT_TRUE(body.contains(QStringLiteral("const bool contentRgb32 = displayImage.format() == QImage::Format_RGB32;")));
+    // r2 adversary A2: every byte of each sampled pixel (shared helper, pinned by pipeline_tests).
+    ASSERT_TRUE(body.contains(QStringLiteral("playbackPresentedContentHash( contentBits,")));
+    ASSERT_FALSE(body.contains(QStringLiteral("contentHash ^= contentBits[")));
     ASSERT_TRUE(body.contains(QStringLiteral("? displayImage.convertToFormat( QImage::Format_RGB888 )")));
     ASSERT_TRUE(body.contains(QStringLiteral("captureImage.constBits(),")));
     ASSERT_TRUE(body.contains(QStringLiteral("meta.bytes_per_line = (int)captureImage.bytesPerLine();")));

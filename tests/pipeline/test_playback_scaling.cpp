@@ -1324,3 +1324,79 @@ TEST(PlaybackScaling, FastRgb32MagentaBandSuppressionMatchesRgb888)
         ASSERT_FALSE(pixmap_image( before32 ) == pixmap_image( img888 ));
     }
 }
+
+/* r2 adversary A1 (introduced, major): QPixmap::fromImage SHARES an RGB32 image's pixels instead of
+ * converting them, so the pixmap of an image that only wrapped the prep result's byte vector pointed
+ * into that vector after onPlaybackPrepResultReady returned. Input: 640x360 source, 1280x720 fitted
+ * fast preview. The fast branch's RGB32 image must own its pixels. */
+TEST(PlaybackScaling, FastRgb32ImageOwnsItsPixelsPastTheBuilder)
+{
+    const std::vector<uint8_t> source = make_rgb8_from_synthetic_rgb16( 640, 360 );
+    FastPlaybackScaleCache cache;
+    QPixmap pixmap;
+    QImage expected;
+    {
+        const QImage built = playbackBuildFastScaledImageRgb32( source.data(), 640, 360, 1280, 720, cache );
+        ASSERT_FALSE(built.isNull());
+        ASSERT_TRUE(built.format() == QImage::Format_RGB32);
+        expected = built.copy();
+        pixmap = QPixmap::fromImage( built );
+    }   // the builder's image (and anything it could have borrowed) is gone
+    ASSERT_TRUE(pixmap_image( pixmap.toImage() ) == pixmap_image( expected ));
+    // Same pixels as the RGB888 writer.
+    FastRgbPair pair = build_fast_pair( source, 640, 360, 1280, 720 );
+    ASSERT_TRUE(pixmap_image( pair.image888() ) == pixmap_image( expected ));
+
+    // RED on f3b419ea: the hand-off wrapped a byte vector; fromImage shared it, so the pixmap
+    // followed the vector's bytes (here overwritten instead of freed, to stay defined).
+    std::vector<uint8_t> borrowed = pair.rgb32;
+    const QPixmap shared = QPixmap::fromImage( playbackWrapRgb32Image( borrowed.data(), 1280, 720 ) );
+    std::fill( borrowed.begin(), borrowed.end(), static_cast<uint8_t>( 0 ) );
+    ASSERT_FALSE(pixmap_image( shared ) == pixmap_image( expected ));
+}
+
+/* r2 adversary A2 (introduced, major): the presented-content hash sampled one byte every
+ * bytes/8192; at 3840x1600 RGB32 the step is 3000, a multiple of 4, so it read only blue and a
+ * picture changing only in red hashed the same every frame (frozen-content FAIL). The RGB888 arm
+ * had the same aliasing (step 2250, a multiple of 3: red only). Input: eleven frames, RGB=(20+i,0,0);
+ * and for RGB888 eleven frames RGB=(0,20+i,0). */
+TEST(PlaybackScaling, PresentedContentHashFollowsEveryChannel)
+{
+    const int width = 3840;
+    const int height = 1600;
+    // f3b419ea's sampler, for the RED half: one byte per sample (alpha skipped to the byte before).
+    const auto oldHash = []( const uint8_t *bits, size_t bytes, bool rgb32 ) -> uint64_t
+    {
+        uint64_t h = 1469598103934665603ull;
+        const size_t step = std::max( static_cast<size_t>( 1 ), bytes / 8192 );
+        for( size_t i = 0; i < bytes; i += step )
+        {
+            const size_t at = ( rgb32 && ( i & 3u ) == 3u ) ? i - 1u : i;
+            h ^= bits[at];
+            h *= 1099511628211ull;
+        }
+        return h;
+    };
+    for( const bool rgb32 : { true, false } )
+    {
+        std::vector<uint64_t> fresh;
+        std::vector<uint64_t> old;
+        for( int i = 0; i <= 10; ++i )
+        {
+            QImage frame( width, height, rgb32 ? QImage::Format_RGB32 : QImage::Format_RGB888 );
+            frame.fill( rgb32 ? QColor( 20 + i, 0, 0 ) : QColor( 0, 20 + i, 0 ) );
+            const size_t bytes = static_cast<size_t>( frame.bytesPerLine() ) * static_cast<size_t>( frame.height() );
+            fresh.push_back( playbackPresentedContentHash( frame.constBits(), bytes,
+                                                           playbackPreparedBytesPerPixel( frame.format() ) ) );
+            old.push_back( oldHash( frame.constBits(), bytes, rgb32 ) );
+        }
+        std::vector<uint64_t> distinct = fresh;
+        std::sort( distinct.begin(), distinct.end() );
+        ASSERT_EQ(fresh.size(), static_cast<size_t>( std::unique( distinct.begin(), distinct.end() ) - distinct.begin() ));
+        // RED: the one-byte sampler hashed all eleven frames the same.
+        ASSERT_TRUE(std::all_of( old.begin(), old.end(), [&]( uint64_t v ) { return v == old.front(); } ));
+    }
+    ASSERT_EQ(4, playbackPreparedBytesPerPixel( QImage::Format_RGB32 ));
+    ASSERT_EQ(3, playbackPreparedBytesPerPixel( QImage::Format_RGB888 ));
+    ASSERT_EQ(4, playbackPreparedBytesPerPixel( QImage::Format_ARGB32 ));
+}
