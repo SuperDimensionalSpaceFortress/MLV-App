@@ -333,6 +333,164 @@ class StartCapAdversaryPass2Tests(unittest.TestCase):
             self.assertEqual(p.stdout.strip(), "True", p.stderr)
 
 
+def runner_admission(plays, now, cap=2700, cooldown=86400, overhead=210, margin=120, openclose=40, leg_budget_floor=360):
+    """Independent replay of the batch runner's admission arithmetic (Invoke-VenueLeaseBatch.ps1: a leg starts only while the lease has legBudget + leaseMargin of room;
+    the leg budget grows to the longest leg of the plan, up to 2700 s). Valid where the 3 h lease budget does not bind (cooldown >= window), so a lease opens one cooldown
+    after the previous one ends. Returns (batches, last_leg_start)."""
+    runs = [p + overhead for p in plays]
+    budget = min(2700, max(leg_budget_floor, max(runs)))
+    t, i, batches, last_start = now, 0, 0, now
+    while i < len(plays):
+        open_at = t if batches == 0 else t + timedelta(seconds=cooldown)
+        s, first = openclose, True
+        while i < len(plays):
+            if not first and s > cap - margin - budget:
+                break
+            last_start = open_at + timedelta(seconds=s)
+            s += runs[i]
+            i += 1
+            first = False
+        t = open_at + timedelta(seconds=s)
+        batches += 1
+    return batches, last_start
+
+
+def write_spec(d: Path, name: str, play) -> str:
+    spec = json.loads(LEG_SPEC.read_text(encoding="utf-8"))
+    spec["playSeconds"] = play
+    p = d / name
+    p.write_text(json.dumps(spec), encoding="utf-8")
+    return str(p)
+
+
+def cli(*args: str) -> subprocess.CompletedProcess:
+    return subprocess.run([PWSH, "-NoProfile", "-NonInteractive", "-File", str(CLI), *args], capture_output=True, text=True, timeout=180)
+
+
+def cli_cap(p: subprocess.CompletedProcess) -> str:
+    return [ln for ln in p.stdout.splitlines() if ln.startswith("StartCapUtc=")][0].split("=", 1)[1]
+
+
+@requires_windows_pwsh
+class StartCapAdversaryR2Tests(unittest.TestCase):
+    """The adversary pass on 26531966 (r1 pass 3: A1-A4), BENCH-START-CAP-FROM-LEG-COUNT-1 r2. Each test feeds the finding's input."""
+
+    def test_r2a1_the_stride_follows_each_legs_own_duration_not_the_plan_mean(self):
+        # 63 legs of 1290 s then 37 of 25 s: the mean (822 s) strides the long legs at 1032 s, so the helper projected 50 batches where the runner's admission needs 71
+        with tempfile.TemporaryDirectory() as d:
+            long_spec = write_spec(Path(d), "long.json", 1290)
+            short_spec = write_spec(Path(d), "short.json", 25)
+            plays = [1290] * 63 + [25] * 37
+            c = cli("-LegSpec", ",".join([long_spec] * 63 + [short_spec] * 37), "-NowUtc", NOW, "-CapSec", "2700", "-CooldownSec", "86400", "-WindowSec", "10800", "-BudgetSec", "5400")
+            self.assertEqual(c.returncode, 0, c.stdout + c.stderr)
+            first = c.stdout.splitlines()[0]
+            batches = int(re.search(r" batches=(\d+) ", first).group(1))
+            want_batches, want_last_start = runner_admission(plays, parse(NOW))
+            self.assertEqual(want_batches, 71, "the replay reproduces the adversary's runner figure")
+            self.assertGreaterEqual(batches, want_batches, first)
+            self.assertGreaterEqual(parse(cli_cap(c)), want_last_start, first)
+
+    def test_r2a1_equal_legs_project_exactly_as_the_scalar_plan_does(self):
+        # the per-leg list changes nothing when every leg is the same length
+        with tempfile.TemporaryDirectory() as d:
+            spec = write_spec(Path(d), "s25.json", 25)
+            a = cli("-LegSpec", ",".join([spec] * 12), "-NowUtc", NOW, "-CooldownSec", "300", "-BudgetSec", "9720")
+            b = cli("-LegCount", "12", "-PlaySeconds", "25", "-NowUtc", NOW, "-CooldownSec", "300", "-BudgetSec", "9720")
+            self.assertEqual(a.returncode, 0, a.stdout + a.stderr)
+            self.assertEqual(cli_cap(a), cli_cap(b))
+            self.assertEqual(re.search(r" batches=(\d+) ", a.stdout.splitlines()[0]).group(1), re.search(r" batches=(\d+) ", b.stdout.splitlines()[0]).group(1))
+
+    def test_r2a1_the_runner_hands_the_per_leg_list_to_the_projection(self):
+        src = BATCH.read_text(encoding="utf-8")
+        self.assertIn("-LegPlaySeconds $capPlan.legSeconds", src)
+        cli_src = CLI.read_text(encoding="utf-8")
+        self.assertIn("$legSeconds = @($planSecs.legSeconds)", cli_src)
+        self.assertIn("$args2.LegPlaySeconds = $legSeconds", cli_src)
+
+    def test_r2a1_a_bad_per_leg_value_or_count_is_a_typed_refusal(self):
+        for extra in ("-LegCount 2 -LegPlaySeconds @(25, 36001)", "-LegCount 2 -LegPlaySeconds @(25, 0)", "-LegCount 2 -LegPlaySeconds @(25, [double]::NaN)", "-LegCount 3 -LegPlaySeconds @(25, 30)"):
+            p = run_ps(f"Import-Module '{CHAIN}' -Force -DisableNameChecking; Get-VenueRunStartCap -NowUtc '{NOW}' {extra}")
+            self.assertNotEqual(p.returncode, 0, extra)
+            self.assertIn("START_CAP_", p.stderr + p.stdout, extra)
+
+    def test_r2a2_an_unparseable_hard_end_is_a_typed_refusal_never_an_unclamped_cap(self):
+        c = cli("-LegCount", "1", "-NowUtc", NOW, "-HardEndUtc", "not-a-time")
+        self.assertNotEqual(c.returncode, 0, c.stdout + c.stderr)
+        self.assertIn("START_CAP_BAD_TIME", c.stdout)
+        self.assertIn("HardEndUtc", c.stdout)
+        self.assertNotIn("StartCapUtc=", c.stdout)
+
+    def test_r2a2_every_other_time_input_is_refused_the_same_way(self):
+        for flag in ("-ExplicitCapUtc", "-NowUtc"):
+            args = ["-LegCount", "1", "-NowUtc", NOW] if flag != "-NowUtc" else ["-LegCount", "1"]
+            c = cli(*args, flag, "garbage")
+            self.assertNotEqual(c.returncode, 0, f"{flag}: {c.stdout}{c.stderr}")
+            self.assertIn("START_CAP_BAD_TIME", c.stdout, flag)
+            self.assertNotIn("StartCapUtc=", c.stdout, flag)
+        # a bad bound is refused even when a valid explicit cap would have been kept
+        c = cli("-LegCount", "1", "-NowUtc", NOW, "-HardEndUtc", "not-a-time", "-ExplicitCapUtc", "2026-10-30T10:00:00Z")
+        self.assertNotEqual(c.returncode, 0)
+        self.assertIn("START_CAP_BAD_TIME", c.stdout)
+        # the helper itself throws, so the runner's sizing catch keeps the legacy window and says why
+        p = run_ps(f"Import-Module '{CHAIN}' -Force -DisableNameChecking; Get-VenueRunStartCap -NowUtc '{NOW}' -LegCount 1 -HardBoundUtc 'not-a-time'")
+        self.assertNotEqual(p.returncode, 0)
+        self.assertIn("START_CAP_BAD_TIME", p.stderr + p.stdout)
+
+    def test_r2a3_a_zoneless_now_is_utc_in_the_cli_exactly_as_in_the_helper(self):
+        # the CLI read a zoneless -NowUtc as HOST-LOCAL time (a Central host: 6 h later) while the helper read it as UTC. One parser: zoneless = UTC, and an explicit offset
+        # (the non-UTC offsets below do not depend on the host zone) is honoured by both
+        cases = {
+            "2026-11-01T01:30:00": "2026-11-01T01:30:00Z",
+            "2026-11-01T01:30:00Z": "2026-11-01T01:30:00Z",
+            "2026-11-01T01:30:00-06:00": "2026-11-01T07:30:00Z",
+            "2026-11-01T01:30:00+05:30": "2026-10-31T20:00:00Z",
+        }
+        for given, as_utc in cases.items():
+            c = cli("-LegCount", "1", "-NowUtc", given)
+            self.assertEqual(c.returncode, 0, f"{given}: {c.stdout}{c.stderr}")
+            h = call("-LegCount 1", now=as_utc)
+            self.assertEqual(cli_cap(c), h["capUtc"], f"-NowUtc {given!r} must read as {as_utc} in the CLI as in the helper")
+
+    def test_r2a3_the_cli_has_no_parser_of_its_own(self):
+        src = CLI.read_text(encoding="utf-8")
+        code = "\n".join(ln for ln in src.splitlines() if not ln.lstrip().startswith("#"))
+        self.assertNotIn("DateTimeOffset]::Parse", code)
+        self.assertNotIn("DateTime]::Parse", code)
+        self.assertIn("ConvertTo-VenueStartCapTime", code)
+        self.assertRegex(src, r"zoneless[^\n]*UTC", "the help text says a zoneless time is UTC")
+
+    def test_r2a4_a_play_seconds_just_over_int32_is_unreadable_not_a_crash(self):
+        with tempfile.TemporaryDirectory() as d:
+            huge = write_spec(Path(d), "huge.json", 2147483647.1)
+            p = run_ps(f"Import-Module '{CHAIN}' -Force -DisableNameChecking; Write-Output ([string]::IsNullOrEmpty([string](Get-VenueLegPlaySeconds -SpecPath '{huge}')))")
+            self.assertEqual((p.returncode, p.stdout.strip()), (0, "True"), p.stderr)
+            self.assertEqual(p.stderr.strip(), "")
+            # the CLI keeps a supplied explicit cap for that spec
+            c = cli("-LegSpec", huge, "-NowUtc", NOW, "-ExplicitCapUtc", "2026-10-30T10:00:00Z")
+            self.assertEqual(c.returncode, 0, c.stdout + c.stderr)
+            self.assertEqual(cli_cap(c), "2026-10-30T10:00:00Z")
+            self.assertIn("START_CAP_PLAYSECONDS_UNKNOWN", c.stdout)
+
+    def test_r2a4_the_whole_number_range_is_checked_in_double_before_any_int_cast(self):
+        with tempfile.TemporaryDirectory() as d:
+            want = {"36000": 36000, "35999.2": 36000, "36000.5": None, "1e300": None, "-5": None, "0": None, "0.4": 1, "99999999999999999999": None,
+                    "2147483647": None, "2147483648": None, "2147483647.1": None, "2147483646.5": None, "1200": 1200}
+            specs = {k: write_spec(Path(d), f"s{i}.json", json.loads(k)) for i, k in enumerate(want)}
+            lines = "; ".join(f"Write-Output ('{k}=' + [string](Get-VenueLegPlaySeconds -SpecPath '{p}'))" for k, p in specs.items())
+            p = run_ps(f"Import-Module '{CHAIN}' -Force -DisableNameChecking; {lines}")
+            self.assertEqual(p.returncode, 0, p.stderr)
+            self.assertEqual(p.stderr.strip(), "")
+            got = dict(ln.split("=", 1) for ln in p.stdout.strip().splitlines())
+            for k, v in want.items():
+                self.assertEqual(got[k], "" if v is None else str(v), f"playSeconds {k}")
+
+    def test_r2a4_the_cli_reads_specs_inside_its_try_catch(self):
+        src = CLI.read_text(encoding="utf-8")
+        code = "\n".join(ln for ln in src.splitlines() if not ln.lstrip().startswith("#"))
+        self.assertLess(code.index("try {"), code.index("Get-VenuePlanPlaySeconds"), "the spec read sits inside the try")
+        self.assertLess(code.index("Get-VenuePlanPlaySeconds"), code.index("catch {"))
+
+
 class LeaseBatchWiringTests(unittest.TestCase):
     """Source pins on the tracked runner: the default deadline is sized from the plan, an explicit one is kept."""
 

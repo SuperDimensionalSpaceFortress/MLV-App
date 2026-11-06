@@ -1202,6 +1202,19 @@ function Get-VenueLeaseBudgetWait {
     [pscustomobject]@{ reason = $reason; waitSec = [int][Math]::Ceiling(($t - $now).TotalSeconds); openUtc = $t; usedSec = $u; budgetRoomSec = [int][Math]::Min($CapSec, $BudgetSec - $u); lastEndUtc = $lastEnd }
 }
 
+function ConvertTo-VenueStartCapTime {
+    <#
+    .SYNOPSIS
+    BENCH-START-CAP-FROM-LEG-COUNT-1 r2 (adversary A2/A3): THE one time parser of the start cap, shared by Get-VenueRunStartCap and Get-VenueStartCap.ps1. It is ConvertTo-VenueUtc
+    (a DateTime, a DateTimeOffset or text), with one rule: a time WITHOUT a zone is UTC, on every host (a text with an offset keeps it). Text that is not a time is a typed refusal,
+    START_CAP_BAD_TIME name=<which input>, never a silent $null that would skip a safety bound.
+    #>
+    param($Value, [string]$Name = 'time')
+    $u = ConvertTo-VenueUtc $Value
+    if ($null -eq $u) { throw "START_CAP_BAD_TIME name=$Name value='$("$Value" -replace '\s+', ' ')' (not a date and time; a time without a zone is read as UTC)" }
+    $u
+}
+
 # BENCH-START-CAP-FROM-LEG-COUNT-1: the two measured constants behind a venue run's start cap. Evidence (Bachelor, PLAYBACK-PRESENT-TAIL-TIMING-1 r1b batch-01..03 and
 # PLAYBACK-CUDA-FULLSCREEN-BLUR-UPLOAD-STALL-POST-502-1 r3 B01, legs of playSeconds 25): consecutive LEG RAN lines are 225-236 s apart (median ~232 s; r3 228 s per leg over
 # an 8-leg batch), so a leg costs its playSeconds plus ~207 s of quiet probe, preload, launch and receipt: 210 s. A lease open or close costs ~35-40 s (batch-01 opens
@@ -1221,6 +1234,11 @@ function Get-VenueRunStartCap {
     own -CooldownSec, slept inside the lease after every completed leg while work remains). The leg budget the start test uses is the larger of -LegBudgetSec and one leg's cost.
     A lease that cannot hold even one leg (a cap or budget room too small) is not forced to make progress: the function throws START_CAP_UNSIZABLE with the numbers, and so
     does arithmetic that leaves the DateTime range. A caller that passed -ExplicitCapUtc is not stopped by that: its cap is kept and the line says projection=UNSIZABLE.
+    -LegPlaySeconds (r2, adversary A1): the PER-LEG play seconds in plan order (one per leg, each 1..36000, in double before any integer cast). With it each leg strides by ITS OWN
+    seconds + overhead + cooldown, so a plan of long legs then short ones is not spread at its mean (the mean strode long legs too tightly and projected fewer batches than the
+    runner's admission needs). Without it every leg is -PlaySeconds. The start test keeps the static budget of the LONGEST leg (>= the runner's, which grows to it), so the
+    projected batch count is never below the runner's. A bad value or a count that is not -LegCount is START_CAP_BAD_LEG / START_CAP_USAGE.
+    Times (-NowUtc, -HardBoundUtc, -ExplicitCapUtc) all go through ConvertTo-VenueStartCapTime: a zoneless time is UTC, an unparseable one is START_CAP_BAD_TIME (r2, A2/A3).
     -ExplicitCapUtc: the caller's own cap is kept exactly (source explicit); the computed value is reported beside it and never replaces it.
     -HardBoundUtc: an existing safety bound (the run's hard end, a lease notAfterUtc). The computed cap never extends past it: it is clamped and the typed line
     START_CAP_CLAMPED_TO_HARD_BOUND says so (projectedPastBound=1 when the last planned leg would START after the bound).
@@ -1235,38 +1253,55 @@ function Get-VenueRunStartCap {
         [object[]]$Leases = @(), [int]$CapSec = 2700, [int]$CooldownSec = 1800, [int]$WindowSec = 10800, [int]$BudgetSec = 5400,
         [ValidateRange(60, 2700)][int]$LegBudgetSec = 360, [ValidateRange(0, 900)][int]$LeaseMarginSec = 120,
         [ValidateRange(0, 500)][int]$MarginPct = 20, [ValidateRange(0, 86400)][int]$MinMarginSec = 600,
-        $HardBoundUtc = $null, $ExplicitCapUtc = $null)
-    $now = ConvertTo-VenueUtc $NowUtc
+        $HardBoundUtc = $null, $ExplicitCapUtc = $null, [object[]]$LegPlaySeconds = @())
+    $now = ConvertTo-VenueStartCapTime $NowUtc 'NowUtc'
     # whole seconds read as yyyy-MM-ddTHH:mm:ssZ; an instant with sub-second ticks (a caller's explicit cap) keeps them, so the line never moves it
     $fmt = { param($d) $u = $d.ToUniversalTime(); $u.ToString($(if (($u.Ticks % 10000000) -ne 0) { "yyyy-MM-dd'T'HH:mm:ss.FFFFFFF'Z'" } else { "yyyy-MM-dd'T'HH:mm:ss'Z'" }), [Globalization.CultureInfo]::InvariantCulture) }
     [long]$legWall = [long]$PlaySeconds + $LegOverheadSec + $LegCooldownSec
-    $hard = $(if ($null -ne $HardBoundUtc -and "$HardBoundUtc" -ne '') { ConvertTo-VenueUtc $HardBoundUtc } else { $null })
+    # a bound or cap that is not a time is a typed refusal (A2): never a $null that silently skips the clamp, and refused even when a valid explicit cap would stand
+    $hard = $(if ($null -ne $HardBoundUtc -and "$HardBoundUtc" -ne '') { ConvertTo-VenueStartCapTime $HardBoundUtc 'HardBoundUtc' } else { $null })
     $hasExplicit = ($null -ne $ExplicitCapUtc -and "$ExplicitCapUtc" -ne '')
-    $explicit = $(if ($hasExplicit) { ConvertTo-VenueUtc $ExplicitCapUtc } else { $null })
+    $explicit = $(if ($hasExplicit) { ConvertTo-VenueStartCapTime $ExplicitCapUtc 'ExplicitCapUtc' } else { $null })
+    # the per-leg seconds (A1/A4): each is range-checked in [double] before it is rounded up into a whole second
+    [long[]]$legSecs = @()
+    if (@($LegPlaySeconds).Count -gt 0) {
+        if (@($LegPlaySeconds).Count -ne $LegCount) { throw "START_CAP_USAGE -LegPlaySeconds names $(@($LegPlaySeconds).Count) legs but -LegCount is $LegCount" }
+        $legSecs = @(foreach ($x in $LegPlaySeconds) {
+                $d = [double]::NaN
+                try { $d = [double]$x } catch { $d = [double]::NaN }
+                if (-not ($d -ge 1 -and $d -le 36000)) { throw "START_CAP_BAD_LEG a leg's play seconds '$x' is not a number from 1 to 36000" }
+                [long][Math]::Ceiling($d)
+            })
+        [long]$legWall = [long][Math]::Ceiling(($legSecs | Measure-Object -Average).Average) + $LegOverheadSec + $LegCooldownSec
+    }
     $t = $now; $batches = 0; [long]$waitTotal = 0; $span = [long]0; $margin = [long]0; $computed = $null; $lastLegStart = $now; $projErr = $null
     try {
         $leaseRows = [System.Collections.Generic.List[object]]::new(); foreach ($l in @($Leases)) { if ($null -ne $l) { $leaseRows.Add($l) } }
-        $left = $LegCount
-        # a leg starts only with its leg budget + the lease margin still ahead of it; the budget grows to the longest leg seen, so one leg's cost is the floor
-        [long]$legRun = [long]$PlaySeconds + $LegOverheadSec
-        # the runner's leg budget grows to the LONGEST leg seen (Invoke-VenueLeaseBatch.ps1, up to 2700 s), so the start test uses the longest planned leg, not the mean
-        [long]$longestRun = [Math]::Max($legRun, $(if ($MaxPlaySeconds -gt 0) { [long]$MaxPlaySeconds + $LegOverheadSec } else { 0 }))
+        # each leg's own run time (its play seconds + the measured overhead), in plan order: the per-leg list when the caller has one (A1), else every leg is -PlaySeconds
+        [long[]]$runs = $(if ($legSecs.Count -gt 0) { @($legSecs | ForEach-Object { [long]$_ + $LegOverheadSec }) } else { @(1..$LegCount | ForEach-Object { [long]$PlaySeconds + $LegOverheadSec }) })
+        # a leg starts only with its leg budget + the lease margin still ahead of it. The runner's leg budget grows to the LONGEST leg seen (Invoke-VenueLeaseBatch.ps1, up to 2700 s),
+        # so the start test uses the longest planned leg (a static budget, never below the runner's), not the mean
+        [long]$longestRun = [Math]::Max(([long[]]$runs | Measure-Object -Maximum).Maximum, $(if ($MaxPlaySeconds -gt 0) { [long]$MaxPlaySeconds + $LegOverheadSec } else { 0 }))
         [long]$legBudget = [Math]::Min(2700, [Math]::Max([long]$LegBudgetSec, $longestRun))
-        if ($longestRun -gt 2700) { throw "the longest planned leg needs $longestRun s (playSeconds $MaxPlaySeconds + overhead $LegOverheadSec), more than the 2700 s a lease can hold" }
-        while ($left -gt 0) {
+        if ($longestRun -gt 2700) { throw "the longest planned leg needs $longestRun s (playSeconds $([long]$longestRun - $LegOverheadSec) + overhead $LegOverheadSec), more than the 2700 s a lease can hold" }
+        [int]$next = 0
+        while ($next -lt $LegCount) {
             $w = Get-VenueLeaseBudgetWait -Leases @($leaseRows) -NowUtc $t -CapSec $CapSec -CooldownSec $CooldownSec -WindowSec $WindowSec -BudgetSec $BudgetSec
             [long]$room = [Math]::Min([long]$CapSec, [long]$w.budgetRoomSec)
             [long]$need = $LeaseMarginSec + $legBudget + $BatchOpenCloseSec
             if ($room -lt $need) { throw "a lease holds at most roomSec=$room (capSec=$CapSec, budgetRoomSec=$($w.budgetRoomSec)) and one leg needs $need s (leaseMarginSec=$LeaseMarginSec + legBudgetSec=$legBudget + openCloseSec=$BatchOpenCloseSec): no leg fits a lease" }
-            # leg i (0-based) of a lease starts at open + OpenClose + i*legWall
-            [long]$fit = [Math]::Min([long]$left, [long][Math]::Floor(($room - $LeaseMarginSec - $legBudget - $BatchOpenCloseSec) / [double]$legWall) + 1)
-            $lastLegStart = $w.openUtc.AddSeconds($BatchOpenCloseSec + ($fit - 1) * $legWall)
+            # leg k of a lease starts at open + OpenClose + the walls (run + the runner's sleep) of the legs before it, and is admitted while that start is within room - margin - leg budget
+            [long]$lastStartOff = $BatchOpenCloseSec; [long]$off = $BatchOpenCloseSec; $first = $true
+            while ($next -lt $LegCount -and ($first -or $off -le ($room - $LeaseMarginSec - $legBudget))) {
+                $lastStartOff = $off; $off += $runs[$next] + $LegCooldownSec; $next++; $first = $false
+            }
+            $lastLegStart = $w.openUtc.AddSeconds($lastStartOff)
             # the lease ends after its last leg (the runner's own sleep follows a leg only while work remains, and the lease never outlasts its room)
-            [long]$inLease = $BatchOpenCloseSec + ($fit - 1) * $legWall + $legRun + $(if ($left - $fit -gt 0) { $LegCooldownSec } else { 0 })
+            [long]$inLease = $lastStartOff + $runs[$next - 1] + $(if ($next -lt $LegCount) { $LegCooldownSec } else { 0 })
             # the runner's sleep after a leg is not cut short by the lease and it records the close it made after the sleep, so the ledger row (what the cooldown and the budget count)
             # and the time cursor both run to the end of the whole in-lease time, even past the lease's room
             $leaseRows.Add([pscustomobject]@{ startUtc = $w.openUtc; endUtc = $w.openUtc.AddSeconds($inLease) })
-            $waitTotal += $w.waitSec; $left -= $fit; $batches++; $t = $w.openUtc.AddSeconds($inLease)
+            $waitTotal += $w.waitSec; $batches++; $t = $w.openUtc.AddSeconds($inLease)
         }
         $span = [long][Math]::Ceiling(($t - $now).TotalSeconds)
         $margin = [Math]::Max([long]$MinMarginSec, [long][Math]::Ceiling($span * $MarginPct / 100.0))
@@ -1294,17 +1329,27 @@ function Get-VenueLegPlaySeconds {
     preflight cast it with [int], so a JSON number or a numeric string both count. $null when the file is missing, not JSON, or has no positive value up to 36000.
     #>
     param([string]$SpecPath)
-    if (-not $SpecPath -or -not (Test-Path -LiteralPath $SpecPath -PathType Leaf)) { return $null }
-    # -NoEnumerate, as the runner's preflight reads a spec: a one-element array root stays an array and is not a leg spec
-    try { $j = Get-Content -LiteralPath $SpecPath -Raw -ErrorAction Stop | ConvertFrom-Json -NoEnumerate -ErrorAction Stop } catch { return $null }
-    if ($null -eq $j -or $j -isnot [System.Management.Automation.PSCustomObject] -or -not $j.PSObject.Properties['playSeconds']) { return $null }
-    # the runner's own cast, [int]$spec.playSeconds (Invoke-VenueLeg, the plan preflight): "0x4b0" and "1,200" are 1200 there, so they are here; a number is rounded up
-    $v = $j.playSeconds
-    if ($null -eq $v -or $v -is [bool]) { return $null }
-    try { $n = [int]$v } catch { return $null }
-    if ($v -is [double] -or $v -is [decimal]) { $n = [Math]::Max($n, [int][Math]::Ceiling([double]$v)) }
-    if ($n -le 0 -or $n -gt 36000) { return $null }
-    $n
+    try {
+        if (-not $SpecPath -or -not (Test-Path -LiteralPath $SpecPath -PathType Leaf)) { return $null }
+        # -NoEnumerate, as the runner's preflight reads a spec: a one-element array root stays an array and is not a leg spec
+        try { $j = Get-Content -LiteralPath $SpecPath -Raw -ErrorAction Stop | ConvertFrom-Json -NoEnumerate -ErrorAction Stop } catch { return $null }
+        if ($null -eq $j -or $j -isnot [System.Management.Automation.PSCustomObject] -or -not $j.PSObject.Properties['playSeconds']) { return $null }
+        $v = $j.playSeconds
+        if ($null -eq $v -or $v -is [bool]) { return $null }
+        # r2 (adversary A4): the value is read as a [double] and range-checked BEFORE any integer cast, so 2147483647.1 (an Int32 cast that works, a Ceiling that does not) is
+        # unreadable, not an exception. A number is that double; a string is parsed as a double (so "1,200" is 1200), and only text that is no decimal number ("0x4b0") falls back
+        # to the runner's own [int] cast (Invoke-VenueLeg, the plan preflight), whose result is range-checked as well. A number is rounded up to a whole second.
+        $d = [double]::NaN
+        if ($v -is [double] -or $v -is [decimal] -or $v -is [int] -or $v -is [long] -or $v -is [single] -or $v -is [System.Numerics.BigInteger]) { $d = [double]$v }
+        elseif ($v -is [string]) {
+            $parsed = [double]::NaN
+            if ([double]::TryParse($v, [Globalization.NumberStyles]'Float, AllowThousands', [Globalization.CultureInfo]::InvariantCulture, [ref]$parsed)) { $d = $parsed }
+            else { try { $d = [double][int]$v } catch { return $null } }
+        }
+        else { return $null }
+        if (-not ($d -gt 0 -and $d -le 36000)) { return $null }
+        [int][Math]::Ceiling($d)
+    } catch { return $null }
 }
 
 function Get-VenuePlanPlaySeconds {
@@ -1321,13 +1366,15 @@ function Get-VenuePlanPlaySeconds {
     $unknown = @($SpecPaths).Count - $known.Count
     if ($known.Count -eq 0) {
         $line = $(if (@($SpecPaths).Count -gt 0) { "START_CAP_PLAYSECONDS_UNKNOWN unknown=$unknown known=0 usedSec=$Default (no leg spec could be read: the default stands)" } else { $null })
-        return [pscustomobject]@{ playSeconds = $Default; maxPlaySeconds = $Default; unknown = $unknown; known = 0; line = $line }
+        return [pscustomobject]@{ playSeconds = $Default; maxPlaySeconds = $Default; unknown = $unknown; known = 0; line = $line; legSeconds = @() }
     }
     $max = [int](($known | Measure-Object -Maximum).Maximum)
     $sum = [double](($known | Measure-Object -Sum).Sum) + [double]$unknown * $max
     $mean = [int][Math]::Ceiling($sum / [double]@($SpecPaths).Count)
     $line = $(if ($unknown -gt 0) { "START_CAP_PLAYSECONDS_UNKNOWN unknown=$unknown known=$($known.Count) usedForUnknownSec=$max (an unreadable spec counts at the longest readable leg)" } else { $null })
-    [pscustomobject]@{ playSeconds = $mean; maxPlaySeconds = $max; unknown = $unknown; known = $known.Count; line = $line }
+    # r2 (A1): the per-leg seconds in plan order, an unreadable leg at the longest readable one; the start cap strides each leg by its own, not by the mean
+    $legSeconds = @(foreach ($x in $vals) { if ($null -ne $x) { [int]$x } else { $max } })
+    [pscustomobject]@{ playSeconds = $mean; maxPlaySeconds = $max; unknown = $unknown; known = $known.Count; line = $line; legSeconds = $legSeconds }
 }
 
 function Get-VenueLeaseCaps {
@@ -1443,5 +1490,5 @@ Export-ModuleMember -Function New-VenueCapsProbeId, Get-VenueDriverScriptMissing
     Get-VenueTicketDir, New-VenueTicket, Get-VenueTickets, Get-VenueTicketStaleReason, Get-VenueTicketProbeStaleSec, Update-VenueTicket, Remove-VenueTicket, Get-VenueClaimStatus, Format-VenueClaimStatus, Format-VenueTicketQueue,
     ConvertFrom-VenueGateLog, Get-VenueQuietRateTable, Format-VenueQuietRateTable, Select-VenueQuietWindow,
     Get-VenueSupplementarySpecSkip, Get-VenueSupplementaryIdle, Get-VenueStagedBuildManifest, Get-VenueStagedArtifactNames, Get-VenueRemoteJobIds, Get-VenueRemoteJobState, Invoke-VenueBoundedProcess, Complete-VenueProcess,
-    Get-VenueJobResult, Request-VenueJobCancel, Read-VenueLeaseBatchReceipt, Get-VenueInterleavedLegPlan, Get-VenueLegPreLoadMean, Get-VenueLeaseLedgerPath, Read-VenueLeaseLedger, Add-VenueLeaseLedger, Get-VenueLeaseBudgetWait, Get-VenueRunStartCap, Get-VenueLegPlaySeconds, Get-VenuePlanPlaySeconds, Get-VenueLeaseCaps, Resolve-VenueLeaseCaps,
+    Get-VenueJobResult, Request-VenueJobCancel, Read-VenueLeaseBatchReceipt, Get-VenueInterleavedLegPlan, Get-VenueLegPreLoadMean, Get-VenueLeaseLedgerPath, Read-VenueLeaseLedger, Add-VenueLeaseLedger, Get-VenueLeaseBudgetWait, Get-VenueRunStartCap, Get-VenueLegPlaySeconds, Get-VenuePlanPlaySeconds, ConvertTo-VenueStartCapTime,Get-VenueLeaseCaps, Resolve-VenueLeaseCaps,
     Update-VenueClaim, Start-VenueKeeper, Stop-VenueKeeper, Start-VenueClaimKeeper, Get-VenueClaimKeeperLoss, New-VenueJobLivenessWrite, Write-VenueJobLiveness, Test-VenueJobLivenessReadback, Start-VenueJobLiveness, Stop-VenueJobLiveness

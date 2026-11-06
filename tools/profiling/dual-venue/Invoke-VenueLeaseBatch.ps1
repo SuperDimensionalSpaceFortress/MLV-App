@@ -1610,7 +1610,7 @@ if ($DeadlineUtc) {
     try {
         $capPlan = Get-VenuePlanPlaySeconds -SpecPaths @($plan | ForEach-Object { [string]$_.spec })
         if ($capPlan.line) { L $capPlan.line }
-        $startCap = Get-VenueRunStartCap -NowUtc $t0 -LegCount ([Math]::Max(1, $plan.Count)) -PlaySeconds $capPlan.playSeconds -MaxPlaySeconds $capPlan.maxPlaySeconds -LegCooldownSec $CooldownSec -Leases @($leases) -CapSec $LeaseCapSec -CooldownSec $LeaseCooldownSec -WindowSec $LeaseBudgetWindowSec -BudgetSec $LeaseBudgetSec -LegBudgetSec $LegBudgetSec -LeaseMarginSec $LeaseMarginSec
+        $startCap = Get-VenueRunStartCap -NowUtc $t0 -LegCount ([Math]::Max(1, $plan.Count)) -PlaySeconds $capPlan.playSeconds -MaxPlaySeconds $capPlan.maxPlaySeconds -LegPlaySeconds $capPlan.legSeconds -LegCooldownSec $CooldownSec -Leases @($leases) -CapSec $LeaseCapSec -CooldownSec $LeaseCooldownSec -WindowSec $LeaseBudgetWindowSec -BudgetSec $LeaseBudgetSec -LegBudgetSec $LegBudgetSec -LeaseMarginSec $LeaseMarginSec
         foreach ($capLine in $startCap.lines) { L $capLine }
         if ($startCap.capUtc -gt $deadline) { $deadline = $startCap.capUtc; L "START_CAP_DEADLINE deadline=$($deadline.ToString('o')) (sized from $($plan.Count) planned legs; the legacy 6 h window would have ended earlier)" }
     } catch { L "START_CAP source=legacy legs=$($plan.Count) deadline=$($deadline.ToString('o')) reason=$("$($_.Exception.Message)" -replace '\s+', ' ')" }
