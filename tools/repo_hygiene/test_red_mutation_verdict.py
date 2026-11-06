@@ -127,6 +127,84 @@ class QualifiedIdentity(unittest.TestCase):
         self.assertEqual(rmv.verdict(out, "A.test_scale")[0], rmv.PASS, out)
 
 
+def _run_pytest(files: dict[str, str], *args: str) -> str:
+    with tempfile.TemporaryDirectory() as tmp:
+        for name, text in files.items():
+            Path(tmp, name).write_text(text, encoding="utf-8", newline="\n")
+        proc = subprocess.run([sys.executable, "-m", "pytest", "-p", "no:cacheprovider", *args], cwd=tmp, text=True,
+                              encoding="utf-8", errors="replace", capture_output=True, timeout=120)
+    return proc.stdout + proc.stderr
+
+
+class AdversaryR3(unittest.TestCase):
+    """Adversary pass r3 on ddbcb1a7: eight forged-output classes, each fed REAL runner output."""
+
+    def refused(self, out: str, want: str, *, word: str = "") -> None:
+        status, reason = rmv.verdict(out, want)
+        self.assertEqual(status, rmv.REFUSED, f"{want}: {reason}\n{out}")
+        if word:
+            self.assertIn(word, reason)
+
+    def test_a1_exception_group_import_error_blocks_pass(self) -> None:
+        ut = ("import unittest\nclass T(unittest.TestCase):\n def test_assert(self): self.assertEqual(1,2)\n"
+              " def test_import(self): raise ExceptionGroup('deps', [ImportError('missing')])\n")
+        self.refused(_run_unittest({"test_group.py": ut}, "test_group"), "test_group.T.test_assert", word="import")
+        pt = ("def test_x(): assert False\n"
+              "def test_imp(): raise ExceptionGroup('dep',[ImportError('missing'),ValueError('bad')])\n")
+        self.refused(_run_pytest({"test_memory.py": pt}), "test_memory.py::test_x", word="import")
+        # --tb=no hides the nested error: an ExceptionGroup summary message cannot be read, so it blocks.
+        self.refused(_run_pytest({"test_memory.py": pt}, "--tb=no"), "test_memory.py::test_x")
+
+    def test_a2_custom_failure_exception_is_not_an_assertion(self) -> None:
+        src = ("import unittest\nclass T(unittest.TestCase):\n failureException = ValueError\n"
+               " def test_parse(self): int('invalid')\n")
+        self.refused(_run_unittest({"test_custom.py": src}, "test_custom"), "test_custom.T.test_parse", word="non-assertion")
+
+    def test_a3_assertion_error_lookalike_is_not_an_assertion(self) -> None:
+        src = ("class AssertionErrorImpostor(ValueError): __module__='builtins'\n"
+               "def test_x(): raise AssertionErrorImpostor('bad')\n")
+        for extra in ((), ("--tb=no",)):
+            self.refused(_run_pytest({"test_memory.py": src}, *extra), "test_memory.py::test_x")
+
+    def test_a4_brackets_in_a_parameter_id_do_not_move_identity_boundaries(self) -> None:
+        src = ("import pytest\n"
+               "@pytest.mark.parametrize('v',[1],ids=[']::test_z['])\ndef test_x(v): assert False\n"
+               "@pytest.mark.parametrize('v',[2],ids=[''])\ndef test_z(v): assert True\n")
+        out = _run_pytest({"test_memory.py": src})
+        self.refused(out, "test_z[]")
+        src2 = ("import pytest\n@pytest.mark.parametrize('v',[1],ids=['['])\ndef test_x(v): assert False\n")
+        out2 = _run_pytest({"test_memory.py": src2})
+        self.assertEqual(rmv.verdict(out2, "test_memory.py::test_x[[]")[0], rmv.PASS, out2)
+
+    def test_a5_whitespace_in_the_expectation_is_significant(self) -> None:
+        out = _run_unittest({"test_s.py": TWO_CLASSES}, "test_s")
+        for want in (" test_s.py:12", "test_s.py:12 ", "test_s.py:12\n", " test_s.B.test_scale", "test_s.B.test_scale "):
+            self.refused(out, want)
+        self.assertEqual(rmv.verdict(out, "test_s.py:12")[0], rmv.PASS, out)
+
+    def test_a6_dash_inside_a_test_name_is_not_a_message_boundary(self) -> None:
+        src = ("def test_expected(): pass\ndef fail(): raise TypeError('boom')\n"
+               "globals()['test_expected - AssertionError'] = fail\n")
+        self.refused(_run_pytest({"test_memory.py": src}, "--tb=no"), "test_memory.py::test_expected")
+        err = ("===================== short test summary info =====================\n"
+               "FAILED t.py::test_x - AssertionError\nERROR t.py::test_imp - harmless - ImportError: missing\n"
+               "===================== 1 failed, 1 error in 0.1s =====================\n")
+        self.refused(err, "t.py::test_x", word="import")
+
+    def test_a7_equals_rule_inside_a_message_does_not_start_a_block(self) -> None:
+        src = ("import unittest\nclass T(unittest.TestCase):\n def test_x(self): self.assertEqual(1,2)\n"
+               " def test_imp(self):\n  try: raise ValueError('bad\\n'+'='*70+'\\nnot-a-header')\n"
+               "  except ValueError: raise ImportError('missing')\n")
+        self.refused(_run_unittest({"test_delimiter.py": src}, "test_delimiter"), "test_delimiter.T.test_x", word="import")
+
+    def test_a8_parentheses_in_a_method_name_do_not_invent_an_identity(self) -> None:
+        src = ("import unittest\nclass T(unittest.TestCase):\n def f(self): self.assertEqual(1,2)\n"
+               "setattr(T,'test_x (bogus)',T.f)\ndel T.f\n")
+        out = _run_unittest({"test_parens.py": src}, "test_parens")
+        self.refused(out, "bogus.test_x")
+        self.assertEqual(rmv.verdict(out, "test_parens.T.test_x (bogus)")[0], rmv.PASS, out)
+
+
 class VerdictOnText(unittest.TestCase):
     def test_red_without_a_named_assertion_is_refused(self) -> None:
         status, reason = rmv.verdict("Ran 3 tests in 0.1s\n\nFAILED (failures=1)\n", "a.py:1")

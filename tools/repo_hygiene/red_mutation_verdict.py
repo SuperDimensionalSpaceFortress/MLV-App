@@ -50,7 +50,17 @@ NON-PROMISES:
   without guessing (a parameter id holding ``] - ``).
 - The runner's FINAL result line decides green: unittest ``OK`` or a pytest bar with no
   failed/error count means no assertion failed, whatever failure-looking text a test printed above it.
-- Whitespace inside an id is significant (`` a/t.py`` is not ``a/t.py``; ``test one`` is not ``test``).
+- Whitespace inside an id is significant (`` a/t.py`` is not ``a/t.py``; ``test one`` is not ``test``), and the
+  expectation is never stripped: `` a/t.py:5`` and ``a/t.py:5\\n`` match nothing.
+- It reads text, so text can be forged. Not defended: an exception message that itself prints a complete
+  unittest block header (rule of ``=``, ``FAIL:``/``ERROR:`` line, rule of ``-``); a pytest test whose
+  FUNCTION NAME holds `` - `` (set through ``globals()``), which a ``--tb=no`` summary line cannot tell from a
+  message; a directory name holding ``[`` (read as the start of a parameter id). An ``ImportError`` named
+  anywhere in a ``FAILED``/``ERROR`` summary message, or a ``FAILED`` message that is an ``ExceptionGroup``
+  (its nested errors are not shown with ``--tb=no``), blocks PASS even when an assertion message only quotes it.
+- unittest says ``FAIL`` for any ``failureException``, so an assertion is credited only when the exception
+  printed for the LAST traceback is ``AssertionError``; pytest ``E`` lines and summary messages must start with
+  ``assert`` or ``AssertionError`` on a word boundary.
 - A pytest failure section is tied to its node id by test name AND by the file in its
   traceback frames. With no ``FAILED`` summary line (``-rN``) the section has no identity,
   so only ``file:line`` can match it.
@@ -82,11 +92,19 @@ REFUSED = "REFUSED"
 _EQ_RULE = re.compile(r"^={20,}\s*$")
 _FRAME = re.compile(r'^\s*File "(?P<file>.+)", line (?P<line>\d+)')
 _UT_HEAD = re.compile(r"^(?P<kind>FAIL|ERROR): (?P<name>.+?)(?: \((?P<ident>[^()]*)\))?(?: \(.*\))?\s*$")
+_UT_KIND = re.compile(r"^(?P<kind>FAIL|ERROR): (?P<rest>.+?)\s*$")
+_DASHES = re.compile(r"^-{70}\s*$")
 _PT_SECTION = re.compile(r"^_{2,} (?P<name>.+?) _{2,}\s*$")
 _PT_TOP = re.compile(r"^={3,} (?P<title>.+?) ={3,}\s*$")
 _PT_LOC = re.compile(r"^(?P<file>[^\s:][^\n]*?\.py):(?P<line>\d+):(?: (?P<rest>.*))?$")
-_IMPORT_ERR = re.compile(r"^(?:[\w.]+\.)?(?:ModuleNotFoundError|ImportError)\b", re.M)
-_EXPECT_SITE = re.compile(r"^(?P<file>.+\.\w+):(?P<line>\d+)$")
+# A leading "| " / "+-" run is the gutter an ExceptionGroup traceback puts in front of nested errors.
+_IMPORT_ERR = re.compile(r"^[\s|+\-]*(?:[\w.]+\.)?(?:ModuleNotFoundError|ImportError)\b", re.M)
+_IMPORT_ANYWHERE = re.compile(r"(?:^|[^\w])(?:[\w.]+\.)?(?:ModuleNotFoundError|ImportError)\b")
+_EXC_GROUP = re.compile(r"^(?:[\w.]+\.)?(?:Base)?ExceptionGroup\b")
+# An assertion message starts with `assert`, or is exactly the AssertionError class (word-bounded: a class
+# named AssertionErrorImpostor is not one), or pytest's `Failed:`.
+_ASSERT_HEAD = re.compile(r"(?:assert\b|AssertionError(?::|\s*$)|Failed:)")
+_EXPECT_SITE = re.compile(r"^(?P<file>.+\.\w+):(?P<line>\d+)\Z")
 _RED_MARK = re.compile(r"^FAILED \(|^FAILED |\b\d+ (?:failed|errors?)\b|^Interrupted:", re.M)
 _GREEN_MARK = re.compile(r"^OK\b|\b\d+ passed\b", re.M)
 _RESULT_LINE = re.compile(r"^(?:OK\b.*|FAILED \(.*\)|=+ .*\bin \d[\d.]*s\b.*=+)\s*$", re.M)
@@ -113,22 +131,13 @@ def _norm_path(text: str) -> list[str]:
 
 
 def _split_top(text: str, sep: str) -> list[str]:
-    """Split on `sep` outside square brackets (a pytest parameter id may hold any character)."""
-    parts: list[str] = []
-    depth = start = i = 0
-    while i < len(text):
-        c = text[i]
-        if c == "[":
-            depth += 1
-        elif c == "]" and depth:
-            depth -= 1
-        elif depth == 0 and text.startswith(sep, i):
-            parts.append(text[start:i])
-            i += len(sep)
-            start = i
-            continue
-        i += 1
-    parts.append(text[start:])
+    """Split on `sep` before the pytest parameter id. A node's names are identifiers, so the FIRST `[`
+    starts the parameter id and it runs to the end of the text; whatever it holds (`]`, `::`, `/`, `.`,
+    unbalanced brackets) stays inside the last part. No bracket counting: user text cannot move a boundary."""
+    j = text.find("[")
+    head, tail = (text, "") if j < 0 else (text[:j], text[j:])
+    parts = head.split(sep)
+    parts[-1] += tail
     return [p for p in parts if p]
 
 
@@ -154,22 +163,23 @@ def _segs(text: str) -> list[str]:
 
 
 def _parse_summary_line(line: str, word: str) -> tuple[str, str, bool] | None:
-    """`FAILED <node> - <msg>` / `ERROR <node> - <msg>` -> (node, msg, ambiguous). The node ends at the
-    first ' - ' outside brackets; when the node holds a parameter id and the message holds '] - ' the
-    split cannot be told from a parameter id that contains it, so the line is flagged ambiguous."""
+    """`FAILED <node> - <msg>` / `ERROR <node> - <msg>` -> (node, msg, ambiguous). Without a parameter id the
+    node ends at the first ' - '. With one, the node ends at a ' - ' that follows a `]`; when more than one
+    such separator exists the split cannot be told from a parameter id that contains it, so the line is
+    flagged ambiguous."""
     if not line.startswith(word + " "):
         return None
     rest = line[len(word) + 1:].rstrip()
-    depth = 0
-    for i, c in enumerate(rest):
-        if c == "[":
-            depth += 1
-        elif c == "]" and depth:
-            depth -= 1
-        elif depth == 0 and rest.startswith(" - ", i):
-            node, msg = rest[:i], rest[i + 3:]
-            return node, msg, "[" in node and "] - " in msg
-    return rest, "", False
+    seps = [i for i in range(len(rest)) if rest.startswith(" - ", i)]
+    if not seps:
+        return rest, "", False
+    param = rest.find("[")
+    if param < 0 or seps[0] < param:
+        return rest[:seps[0]], rest[seps[0] + 3:], False
+    after = [i for i in seps if i > param and rest[i - 1] == "]"]
+    if not after:
+        return rest, "", False
+    return rest[:after[0]], rest[after[0] + 3:], len(after) > 1
 
 
 def _ends_with(whole: list[str], tail: list[str]) -> bool:
@@ -178,12 +188,44 @@ def _ends_with(whole: list[str], tail: list[str]) -> bool:
     return bool(whole) and bool(tail) and len(tail) <= len(whole) and whole[-len(tail):] == tail
 
 
+def _ut_identity(rest: str) -> tuple[str, str] | None:
+    """`name (module.Class.name)` (3.11+) with an optional ` (k=v)` subtest suffix -> (name, full id).
+    The identity is the parenthesised group that ENDS WITH `.name`, so parentheses inside a method name
+    cannot be read as the module part. Older Pythons print `name (module.Class)`, handled by the caller."""
+    for i in (m.start() for m in re.finditer(r" \(", rest)):
+        name, tail = rest[:i], rest[i + 2:]
+        for j in (m.start() for m in re.finditer(r"\)", tail)):
+            ident, after = tail[:j], tail[j + 1:]
+            if ident.endswith("." + name) and (after == "" or re.fullmatch(r" \(.*\)", after)):
+                return name, ident
+    return None
+
+
+def _ut_exception_line(block: list[str]) -> str:
+    """The exception line of the LAST traceback in a unittest block: the first unindented, non-empty line
+    after the last `File "...", line N` frame and its indented source/caret lines."""
+    last = -1
+    for n, ln in enumerate(block):
+        if _FRAME.match(ln):
+            last = n
+    if last < 0:
+        return ""
+    for ln in block[last + 1:]:
+        if ln.strip() and not ln[:1].isspace():
+            return ln
+    return ""
+
+
 def _parse_unittest(text: str) -> list[Failure]:
     out: list[Failure] = []
     blocks: list[list[str]] = []
     current: list[str] | None = None
-    for line in text.splitlines():
-        if _EQ_RULE.match(line):
+    lines = text.splitlines()
+    for n, line in enumerate(lines):
+        # A block starts only at the full three-line header unittest prints: a rule of `=`, `FAIL:`/`ERROR:`,
+        # a rule of `-`. A bare `====` inside an exception message is message text, not a block boundary.
+        if (_EQ_RULE.match(line) and n + 2 < len(lines) and _UT_KIND.match(lines[n + 1])
+                and _DASHES.match(lines[n + 2])):
             current = []
             blocks.append(current)
         elif current is not None:
@@ -192,18 +234,26 @@ def _parse_unittest(text: str) -> list[Failure]:
         body = [ln for ln in block if ln.strip()]
         if not body:
             continue
-        head = _UT_HEAD.match(body[0])
+        head = _UT_KIND.match(body[0])
         if not head:
             continue
         frames = [(m["file"], int(m["line"])) for m in map(_FRAME.match, block) if m]
         joined = "\n".join(block)
         collection = ("_FailedTest" in body[0] or "unittest/loader.py" in joined.replace("\\", "/")
                       or bool(_IMPORT_ERR.search(joined)))
-        ident, name = head["ident"] or "", head["name"]
-        # 3.11+ prints the full id in the parentheses; older Pythons print module.Class only.
-        full = ident if ident.rsplit(".", 1)[-1] == name else (f"{ident}.{name}" if ident else name)
+        got = _ut_identity(head["rest"])
+        if got:
+            name, full = got
+        else:  # older Pythons: `name (module.Class)`
+            old = _UT_HEAD.match(body[0])
+            name = old["name"] if old else head["rest"]
+            ident = (old["ident"] or "") if old else ""
+            full = f"{ident}.{name}" if ident else name
         ids = [] if "unittest.loader" in full else [full]
-        out.append(Failure(ids, frames, assertion=head["kind"] == "FAIL" and not collection,
+        # FAIL is only unittest's word for "failureException was raised", and a test may set that to any
+        # class: the assertion claim rests on the exception actually printed.
+        is_assertion = bool(re.match(r"AssertionError(?::|\s*$)", _ut_exception_line(block)))
+        out.append(Failure(ids, frames, assertion=head["kind"] == "FAIL" and is_assertion and not collection,
                            collection=collection, note=body[0].strip()))
     return out
 
@@ -252,7 +302,9 @@ def _parse_pytest(text: str) -> list[Failure]:
                     nodes.append((node, msg))
                 if ambiguous:
                     summary_blockers.append(f"ambiguous summary line {word} {node[:60]}")
-                elif _IMPORT_ERR.match(msg):
+                elif _IMPORT_ANYWHERE.search(msg) or _EXC_GROUP.match(msg):
+                    # An import error named anywhere in the message, or an ExceptionGroup whose nested
+                    # errors a --tb=no line does not show, blocks like a collection error.
                     summary_blockers.append(f"{word} {node[:60]} - {msg[:40]}")
                 elif word == "ERROR" and "::" not in node:
                     summary_blockers.append(f"ERROR {node}")
@@ -271,7 +323,7 @@ def _parse_pytest(text: str) -> list[Failure]:
         if line.startswith("E") and line[1:2] in (" ", "\t"):
             first = line[1:].strip()
             if cur["assertion"] is None:
-                cur["assertion"] = first.startswith(("assert ", "assert\t", "AssertionError", "Failed:")) or first == "assert"
+                cur["assertion"] = bool(_ASSERT_HEAD.match(first))
             if _IMPORT_ERR.match(first):  # any E line: a chained exception counts too
                 cur["collection"] = True
             continue
@@ -292,7 +344,7 @@ def _parse_pytest(text: str) -> list[Failure]:
         f.ids = _pair_nodes(_segs(bare), f.frames, [n for n, _msg in nodes])
     if not out:
         for node, msg in nodes:
-            out.append(Failure([node], [], bool(re.match(r"(assert\b|AssertionError)", msg)), note=msg))
+            out.append(Failure([node], [], bool(_ASSERT_HEAD.match(msg)), note=msg))
     for note in summary_blockers:
         out.append(Failure([], [], False, True, note))
     return out
@@ -330,7 +382,6 @@ def verdict(output: str, expected: str) -> tuple[str, str]:
     """Return (PASS|REFUSED, reason). PASS only when `expected` is an assertion that failed."""
     if not expected or not expected.strip():
         return REFUSED, "no expected assertion given (file:line or test id): a red suite proves nothing alone"
-    expected = expected.strip()
     if _final_green(output):
         return REFUSED, ("the run is green (final result line): failure-looking text above it was test output, "
                          "so no assertion failed")
