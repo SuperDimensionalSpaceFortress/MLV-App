@@ -124,10 +124,14 @@ inline bool restoreMarksBaseline( const void *restoredReceipt, const void *appli
  *  addFileToSession's event pump B is active and A is still loaded, and a paste onto B runs setSliders(B). The key stayed A and
  *  the label named A's Cinematic over B's disabled baseline. A scratch receipt (Reset Sliders' defaults, the no-session receipt)
  *  and an export clone are never the active row's receipt, and an opener records its row before applying it, so the key is
- *  already that receipt. The caller records the receipt's switch with it, as the export site records its clone's. */
-inline bool slidersMoveAppliedKey( const void *slidersReceipt, const void *activeReceipt, const void *appliedReceipt )
+ *  already that receipt. The caller records the receipt's switch with it, as the export site records its clone's.
+ *  r16 (adversary r16 2200ebe1 A1): on EVERY such apply, also when it is the key already. A second paste onto B (Look Assist on
+ *  after an off one) left the switch recorded by the first, so B's enabled, marked baseline read "Look: Off". `appliedReceipt` is
+ *  not read: the first r16 rule (only when it was not the key) is the defect; it is named so a side tree can reinstate it. */
+inline bool slidersSetAppliedKey( const void *slidersReceipt, const void *activeReceipt, const void *appliedReceipt )
 {
-    return slidersReceipt != nullptr && slidersReceipt == activeReceipt && slidersReceipt != appliedReceipt;
+    Q_UNUSED( appliedReceipt );
+    return slidersReceipt != nullptr && slidersReceipt == activeReceipt;
 }
 
 /*! \brief r15 (sol r14 B1, catalogue L-08): whether a delivered async Look Assist result may grade. Only the receipt it

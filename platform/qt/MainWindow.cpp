@@ -16140,9 +16140,10 @@ void MainWindow::setSliders(ReceiptSettings *receipt, bool paste)
     m_setSliders = true;
     ++m_lookLabelSlidersApplied;   // r16 (adversary r15 1834b72e A1): a regrade, so a kept look label re-derives (sameGrade)
     // r16 (adversary r16 39d1a995 A1): the active row's receipt applied to the attached sliders grades the loaded clip, even
-    // while another row owns it (a paste onto B in addFileToSession's pump), so the label reads it, with its switch recorded.
+    // while another row owns it (a paste onto B in addFileToSession's pump), so the label reads it, with its switch recorded --
+    // on every apply (adversary r16 2200ebe1 A1: a second paste onto the key kept the first paste's switch).
     if( m_fileLoaded && SESSION_CLIP_COUNT > 0 && SESSION_ACTIVE_CLIP_ROW >= 0
-     && look_label::slidersMoveAppliedKey( receipt, ACTIVE_RECEIPT, m_lookLabelAppliedReceipt ) )
+     && look_label::slidersSetAppliedKey( receipt, ACTIVE_RECEIPT, m_lookLabelAppliedReceipt ) )
     {
         m_lookLabelAppliedReceipt = receipt;
         m_lookLabelAppliedCloneLookAssist = receipt->lookAssistEnabled();

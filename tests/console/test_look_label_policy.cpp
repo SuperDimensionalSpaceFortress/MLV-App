@@ -369,11 +369,15 @@ TEST(LookLabelPolicy, A1r16APasteOntoTheActiveRowInAnotherOwnersPumpIsLabelledUn
     const QString cinematic = QStringLiteral("cinematic");
     lookassist::LookAssistFlavorOutcome outcome;
     outcome.landed(&receiptA, cinematic, false);
-    const bool switchA = true, switchB = false;   // B's switch after the paste
+    const bool switchA = true;
+    bool switchB = false;   // B's switch after the paste
     // setSliders(B): the key follows the active row's receipt, with B's switch recorded (MainWindow::setSliders).
     const void *applied = &receiptA;
     bool recorded = false;
-    if( look_label::slidersMoveAppliedKey(&receiptB, &receiptB, applied) ) { applied = &receiptB; recorded = switchB; }
+    const auto setSlidersB = [&]() {
+        if( look_label::slidersSetAppliedKey(&receiptB, &receiptB, applied) ) { applied = &receiptB; recorded = switchB; }
+    };
+    setSlidersB();
     ASSERT_EQ(static_cast<const void *>(&receiptB), applied);
     // B's baseline goes back with Look Assist off: the else-if restore, no mark (restoreMarksBaseline is the enabled branch's).
     // updateLookLabel for the owner A (B is active, so the selector does not describe A).
@@ -386,17 +390,28 @@ TEST(LookLabelPolicy, A1r16APasteOntoTheActiveRowInAnotherOwnersPumpIsLabelledUn
     ASSERT_EQ(std::string("Look: Off"), derive());
     // The freeze never keeps A's text over it: the key is not the owner's.
     ASSERT_FALSE(look_label::keepsTextForInactiveOwner(true, applied, &receiptA, false, true, true, true));
-    // The same paste with Look Assist ON: B's baseline is marked under B, so "Look: Baseline", never A's Cinematic.
+    // Adversary r16 (2200ebe1) A1: a second paste onto B, now with Look Assist ON (baseline valid, exposure 0). B is the key
+    // already; setSliders(B) records its switch again and marks B's baseline: "Look: Baseline". RED on 2200ebe1: the switch
+    // recorded by the first paste (off) stayed, so the label read "Look: Off" over B's enabled baseline.
+    switchB = true;
+    setSlidersB();
     outcome.baselineRestored(&receiptB);
-    recorded = true;
+    printf("[A1r16p2] label=\"%s\"\n", derive().c_str());
     ASSERT_EQ(std::string("Look: Baseline"), derive());
-    // The literal rule: only the active row's receipt, and only when it is not the key already.
-    ASSERT_TRUE(look_label::slidersMoveAppliedKey(&receiptB, &receiptB, &receiptA));
-    ASSERT_FALSE(look_label::slidersMoveAppliedKey(&receiptA, &receiptA, &receiptA));   // the opener recorded it
-    ASSERT_FALSE(look_label::slidersMoveAppliedKey(&receiptA, &receiptB, &receiptA));   // A applied while B is active (A1r16 open)
-    ASSERT_FALSE(look_label::slidersMoveAppliedKey(&scratch, &receiptB, &receiptA));    // Reset Sliders' defaults
-    ASSERT_FALSE(look_label::slidersMoveAppliedKey(&cloneQ, &receiptB, &cloneQ));       // the export's clone
-    ASSERT_FALSE(look_label::slidersMoveAppliedKey(nullptr, nullptr, &receiptA));
+    // The reverse order: on, then off.
+    switchB = false;
+    setSlidersB();
+    ASSERT_EQ(std::string("Look: Off"), derive());
+    // The literal rule: the active row's receipt, whether or not it is the key already.
+    ASSERT_TRUE(look_label::slidersSetAppliedKey(&receiptB, &receiptB, &receiptA));
+    ASSERT_TRUE(look_label::slidersSetAppliedKey(&receiptB, &receiptB, &receiptB));    // the key already: its switch again
+    ASSERT_TRUE(look_label::slidersSetAppliedKey(&receiptA, &receiptA, &receiptA));    // the opener recorded it (owner: live switch)
+    ASSERT_FALSE(look_label::slidersSetAppliedKey(&receiptA, &receiptB, &receiptA));   // A applied while B is active (A1r16 open)
+    ASSERT_FALSE(look_label::slidersSetAppliedKey(&scratch, &receiptB, &receiptA));    // Reset Sliders' defaults
+    ASSERT_FALSE(look_label::slidersSetAppliedKey(&cloneQ, &receiptB, &cloneQ));       // the export's clone
+    ASSERT_FALSE(look_label::slidersSetAppliedKey(nullptr, nullptr, &receiptA));
+    // The owner's own apply records a switch nobody reads: an owner key reads its live switch.
+    ASSERT_TRUE(look_label::appliedLookSwitch(&receiptA, &receiptA, true, false));
 }
 
 TEST(LookLabelWiring, A1r16SetSlidersOfTheActiveRowMovesTheKeyBeforeAnySlider)
@@ -406,7 +421,7 @@ TEST(LookLabelWiring, A1r16SetSlidersOfTheActiveRowMovesTheKeyBeforeAnySlider)
     const int detached = sliders.indexOf(QStringLiteral("if( m_slidersDetachedFromReceipt )"));
     const int rule = sliders.indexOf(QStringLiteral(
         "if( m_fileLoaded && SESSION_CLIP_COUNT > 0 && SESSION_ACTIVE_CLIP_ROW >= 0\n"
-        "     && look_label::slidersMoveAppliedKey( receipt, ACTIVE_RECEIPT, m_lookLabelAppliedReceipt ) )"));
+        "     && look_label::slidersSetAppliedKey( receipt, ACTIVE_RECEIPT, m_lookLabelAppliedReceipt ) )"));
     const int key = sliders.indexOf(QStringLiteral("m_lookLabelAppliedReceipt = receipt;"), rule);
     const int sw = sliders.indexOf(QStringLiteral("m_lookLabelAppliedCloneLookAssist = receipt->lookAssistEnabled();"), key);
     const int first = sliders.indexOf(QStringLiteral("ui->horizontalSliderExposure->setValue( receipt->exposure() );"));
@@ -1164,7 +1179,7 @@ TEST(LookLabelWiring, EveryLabelDerivationGoesThroughTheOnePendingAwareHelper)
         const QString markCall = QStringLiteral("look_label::restoreMarksBaseline( receipt, m_lookLabelAppliedReceipt, activeReceiptAtLoad )");
         body.remove(markCall);
         // r16 (adversary r16 39d1a995 A1): and the key-move predicate (it derives no text either).
-        body.remove(QStringLiteral("look_label::slidersMoveAppliedKey( receipt, ACTIVE_RECEIPT, m_lookLabelAppliedReceipt )"));
+        body.remove(QStringLiteral("look_label::slidersSetAppliedKey( receipt, ACTIVE_RECEIPT, m_lookLabelAppliedReceipt )"));
         ASSERT_FALSE(body.contains(QStringLiteral("look_label::")));
     }
     // The helper reads the outcome ON SCREEN (the last landed one while pending), not the reported one.
