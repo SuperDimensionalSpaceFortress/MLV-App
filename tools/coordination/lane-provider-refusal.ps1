@@ -79,8 +79,8 @@ function Find-ClaudeResultEnvelope {
 # Incident 2026-09-14 (fleet-runs\ws-PLAY-COUNTERS-CPU-20260914T151951Z): exitCode 1, envelope
 # is_error=true subtype=error_max_turns terminal_reason=max_turns -- and the receipt said
 # state=complete, complete=true, because both fields only recorded that the child had exited.
-# workCompleted is $true only when: exit code 0 AND (codex: nothing more is observable) or
-# (claude: a result envelope exists with is_error=false, subtype=success and terminal_reason
+# workCompleted is $true only when: exit code 0 AND (codex: a non-blank answer; reason
+# codex-empty-answer otherwise) or (claude: a result envelope exists with is_error=false, subtype=success and terminal_reason
 # absent or 'completed'). A missing envelope on the claude engine is NOT evidence of completion.
 function Get-LaneWorkEvidence {
     param(
@@ -106,6 +106,15 @@ function Get-LaneWorkEvidence {
         if ($rec.subtype -ne 'success') { $rec.reason = "subtype-$($rec.subtype)"; return $rec }
         if ($rec.terminalReason -and $rec.terminalReason -ne 'completed') { $rec.reason = "terminal-reason-$($rec.terminalReason)"; return $rec }
     }
+    # KERNEL-K4-CODEX-SILENT-EXIT0-COMPLETED-1: codex has no envelope, so its positive evidence is
+    # the answer itself. Exit 0 with an empty or whitespace-only answer is a lane that said nothing,
+    # not a lane that finished (a key that answered nothing must not read as a key that gave no
+    # verdict). The floor is "non-blank after trim" and nothing stronger: 1121 real complete codex
+    # receipts (2026-11-06) all carried a non-blank answer, shortest 518 chars, so this rejects 0 of
+    # them; real answers share no terminal marker, so a stricter shape would reject real ones. An
+    # unrelated but non-blank answer is a documented non-goal (that is the consumer's verdict parse).
+    # The state this yields is 'ended-incomplete', the same one a claude 'no-result-envelope' gets.
+    if ($Engine -eq 'codex' -and [string]::IsNullOrWhiteSpace($Answer)) { $rec.reason = 'codex-empty-answer'; return $rec }
     $rec.workCompleted = $true
     return $rec
 }

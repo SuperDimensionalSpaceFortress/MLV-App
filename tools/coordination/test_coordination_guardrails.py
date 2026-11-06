@@ -1725,6 +1725,44 @@ def test_work_evidence_requires_every_success_signal(tmp_path):
     assert _work_evidence(tmp_path, "codex", "answer", 1)["workCompleted"] is False
 
 
+# KERNEL-K4-CODEX-SILENT-EXIT0-COMPLETED-1: a codex lane that exits 0 and answers nothing is not a
+# finished lane. Kernel K4 needs POSITIVE completion evidence; "the process exited 0" is not it.
+# Sampled 2026-11-06: 1121 real codex receipts with state=complete and exitCode=0 all carried a
+# non-blank .last.txt AND a non-blank .out.txt (shortest 518 trimmed chars), so the floor below
+# (non-blank after trim) rejects 0 of 1121 real answers.
+def test_codex_exit_0_with_an_empty_answer_is_not_complete(tmp_path):
+    r = _work_evidence(tmp_path, "codex", "", 0)
+    assert r["workCompleted"] is False, r
+    assert r["reason"] == "codex-empty-answer", r
+
+
+def test_codex_exit_0_with_a_whitespace_only_answer_is_not_complete(tmp_path):
+    for blank in ("   ", "\n", "\r\n\r\n", "\t \n  \t", "  \n"):
+        r = _work_evidence(tmp_path, "codex", blank, 0)
+        assert r["workCompleted"] is False, (blank, r)
+        assert r["reason"] == "codex-empty-answer", (blank, r)
+
+
+def test_codex_exit_0_with_a_real_answer_stays_complete(tmp_path):
+    assert _work_evidence(tmp_path, "codex", "APPROVE\n\nLooks right.\n", 0)["workCompleted"] is True
+    # Surrounding whitespace never hides a real answer; only an answer that is ALL whitespace is empty.
+    assert _work_evidence(tmp_path, "codex", "\n\n  ok  \n", 0)["workCompleted"] is True
+
+
+def test_codex_nonzero_exit_keeps_its_exit_code_reason_over_the_empty_answer_reason(tmp_path):
+    # The exit code is checked first so an existing receipt reader still sees exit-code-N.
+    assert _work_evidence(tmp_path, "codex", "", 1)["reason"] == "exit-code-1"
+
+
+def test_codex_unrelated_answer_is_a_documented_non_goal(tmp_path):
+    # NON-GOAL, pinned so a later change is deliberate: a non-blank answer that does not address the
+    # prompt cannot be told apart from a real one by shape. Real codex answers carry no common
+    # terminal marker (reviews, recon notes and producer summaries differ), so any stronger shape
+    # rule would reject real answers, which is worse than this bug. That check belongs to the
+    # verdict parser of the consumer (the key watcher), not to the lane runner.
+    assert _work_evidence(tmp_path, "codex", "Sure, here is a poem about spring.", 0)["workCompleted"] is True
+
+
 def test_invoke_lane_receipt_separates_process_ended_from_complete():
     body = LANE_RUNNER.read_text(encoding="utf-8")
     assert "processEnded = $processEnded" in body
