@@ -68,7 +68,7 @@ function Find-ClaudeResultEnvelope {
         $cand = $null
         try { $cand = $t | ConvertFrom-Json -ErrorAction Stop } catch { continue }
         if ($null -eq $cand -or $cand -isnot [System.Management.Automation.PSCustomObject]) { continue }
-        $candNames = @($cand.PSObject.Properties.Name)
+        $candNames = @($cand.PSObject.Properties | ForEach-Object { $_.Name })
         if (-not ($candNames -contains 'type') -or [string]$cand.type -ne 'result') { continue }
         return $cand
     }
@@ -92,8 +92,8 @@ function Get-CodexLaneAnswer {
         [AllowEmptyString()][AllowNull()][string]$LastMessage = '',
         [AllowEmptyString()][AllowNull()][string]$Stdout = ''
     )
-    if (-not [string]::IsNullOrWhiteSpace($LastMessage)) { return $LastMessage }
-    if (-not [string]::IsNullOrWhiteSpace($Stdout)) { return $Stdout }
+    if (Test-LaneAnswerHasSubstance -Answer $LastMessage) { return $LastMessage }
+    if (Test-LaneAnswerHasSubstance -Answer $Stdout) { return $Stdout }
     return ''
 }
 
@@ -110,11 +110,29 @@ $script:CODEX_ANSWER_FLOOR_CHARS = 120
 $script:CODEX_PROBE_PROMPT_CHARS = 400
 
 # Characters that count toward the floor: whitespace and Unicode category Cf (U+200B zero-width space,
-# U+FEFF, U+2060, ...) are removed first, because .NET IsNullOrWhiteSpace does not treat Cf as blank.
+# U+FEFF, U+2060, and the supplementary-plane tag characters U+E0001..U+E007F) are removed first, because
+# .NET IsNullOrWhiteSpace does not treat Cf as blank. Counted by code point (a surrogate pair is one
+# character, and a Cf pair is none) and capped: callers only need "0", "under the floor" or "enough".
 function Get-LaneAnswerSubstanceLength {
-    param([AllowEmptyString()][AllowNull()][string]$Answer)
+    param([AllowEmptyString()][AllowNull()][string]$Answer, [int]$Cap = 2147483647)
     if ([string]::IsNullOrEmpty($Answer)) { return 0 }
-    return ([regex]::Replace($Answer, '[\s\p{Cf}]', '')).Length
+    $rest = [regex]::Replace($Answer, '[\s\p{Cf}]', '')
+    if ($rest.Length -eq 0) { return 0 }
+    if (-not [regex]::IsMatch($rest, '[\uD800-\uDFFF]')) { return [Math]::Min($rest.Length, $Cap) }
+    $n = 0
+    foreach ($r in $rest.EnumerateRunes()) {
+        $cat = [System.Text.Rune]::GetUnicodeCategory($r)
+        if ($cat -eq [System.Globalization.UnicodeCategory]::Format -or [System.Text.Rune]::IsWhiteSpace($r)) { continue }
+        $n++
+        if ($n -ge $Cap) { break }
+    }
+    return $n
+}
+
+# True when the answer has any substance (a blank, whitespace-only or Cf-only answer has none).
+function Test-LaneAnswerHasSubstance {
+    param([AllowEmptyString()][AllowNull()][string]$Answer)
+    return ((Get-LaneAnswerSubstanceLength -Answer $Answer -Cap 1) -gt 0)
 }
 
 # A prompt that spells out a {"verdict": ...} json object is a review key (or an adversary pass): the
@@ -126,12 +144,13 @@ function Test-PromptDemandsVerdict {
     return [regex]::IsMatch($Prompt, '"verdict"\s*:')
 }
 
-# The FINAL json object of an answer: the last fenced block, else the last line-start '{' that parses to
-# the end of the answer. Returns the object, or $null.
+# The FINAL json object of an answer: the LAST fenced block (an unterminated last fence runs to the end of
+# the answer), else the last line-start '{' that parses to the end. A malformed or non-object final block
+# is $null: an earlier provisional block never stands in for it. Returns the object, or $null.
 function Get-LaneFinalJsonObject {
     param([AllowEmptyString()][AllowNull()][string]$Answer)
     if ([string]::IsNullOrWhiteSpace($Answer)) { return $null }
-    $fenced = [regex]::Matches($Answer, '(?s)```[A-Za-z]*\s*(\{.*?\})\s*```')
+    $fenced = [regex]::Matches($Answer, '(?ms)^[ \t]*```[A-Za-z]*[ \t]*\r?\n(.*?)(?:^[ \t]*```[ \t]*\r?$|\z)')
     if ($fenced.Count -gt 0) {
         try { $o = $fenced[$fenced.Count - 1].Groups[1].Value | ConvertFrom-Json -ErrorAction Stop } catch { return $null }
         if ($o -is [System.Management.Automation.PSCustomObject]) { return $o }
@@ -185,14 +204,15 @@ function Get-LaneWorkEvidence {
     # parse. The floor and the verdict shape are evidence-bound (sample above), not a relevance judgement.
     # The state this yields is 'ended-incomplete', the same one a claude 'no-result-envelope' gets.
     if ($Engine -eq 'codex') {
-        $substance = Get-LaneAnswerSubstanceLength -Answer $Answer
+        $substance = Get-LaneAnswerSubstanceLength -Answer $Answer -Cap $script:CODEX_ANSWER_FLOOR_CHARS
         if ($substance -eq 0) { $rec.reason = 'codex-empty-answer'; return $rec }
         if ($substance -lt $script:CODEX_ANSWER_FLOOR_CHARS -and ($PromptChars -lt 0 -or $PromptChars -ge $script:CODEX_PROBE_PROMPT_CHARS)) {
             $rec.reason = 'codex-answer-too-short'; return $rec
         }
         if ($RequireVerdict) {
             $fin = Get-LaneFinalJsonObject -Answer $Answer
-            $v = if ($null -ne $fin -and @($fin.PSObject.Properties.Name) -contains 'verdict') { [string]$fin.verdict } else { '' }
+            $vp = if ($null -ne $fin) { $fin.PSObject.Properties['verdict'] } else { $null }
+            $v = if ($null -ne $vp -and $null -ne $vp.Value) { [string]$vp.Value } else { '' }
             if ([string]::IsNullOrWhiteSpace($v)) { $rec.reason = 'codex-no-verdict'; return $rec }
         }
     }
@@ -236,19 +256,11 @@ function Get-ProviderRefusal {
         if ($null -eq $kind) { return $null }
         return New-RefusalRecord -Kind $kind -Engine $Engine -Match ("api_error_status=$status " + $msg)
     }
-    if (-not [string]::IsNullOrWhiteSpace($Answer)) {
-        # It answered: not refused, and stderr narration (a recovered 429, say) never overturns that.
-        # K4 r2: the one exception is an answer made ONLY of ERROR-framed lines, i.e. the refusal text
-        # itself delivered as the answer. Anything with a non-ERROR line is a real answer.
-        $answerLines = @(($Answer -split "`r?`n") | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
-        $allFramed = ($answerLines.Count -gt 0) -and (@($answerLines | Where-Object { $_ -notmatch '^\s*ERROR\b' }).Count -eq 0)
-        if (-not $allFramed) { return $null }
-        foreach ($line in $answerLines) {
-            $kind = Get-RefusalKind -Line $line
-            if ($null -ne $kind) { return New-RefusalRecord -Kind $kind -Engine $Engine -Match $line }
-        }
-        return $null
-    }
+    # It answered: not refused, and stderr narration (a recovered 429, say) never overturns that. "Answered"
+    # uses the same emptiness test as the completion evidence (K4 r2: a Cf-only answer is not an answer).
+    # Residual, named: a refusal whose text arrives AS the answer is not detected here, as before K4; an
+    # answer made only of ERROR lines may be exactly what the prompt asked for (adversary A3).
+    if (Test-LaneAnswerHasSubstance -Answer $Answer) { return $null }
     if ([string]::IsNullOrWhiteSpace($Text)) { return $null }
     $scan = $Text
     if (-not [string]::IsNullOrEmpty($Prompt)) {

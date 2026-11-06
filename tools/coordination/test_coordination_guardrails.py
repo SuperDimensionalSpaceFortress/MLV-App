@@ -1945,9 +1945,9 @@ def test_invoke_lane_wiring_genuine_refusals_are_still_detected(tmp_path):
     w = _run_invoke_lane_codex_wiring(tmp_path, None, "", "ERROR: you've hit your usage limit. try again at Nov 9th\n", "Review this change")
     assert w["refusal"] is not None and w["refusal"]["kind"] == "provider-usage-limit", w
     assert w["evidence"]["workCompleted"] is False, w
-    # the refusal text IS the answer (nothing else was said)
-    w = _run_invoke_lane_codex_wiring(tmp_path, "ERROR: you've hit your usage limit.\n", "", "", "Review this change")
-    assert w["refusal"] is not None and w["refusal"]["kind"] == "provider-usage-limit", w
+    # A refusal that only reached the last-message file with a blank stdout and the ERROR line on stderr
+    w = _run_invoke_lane_codex_wiring(tmp_path, "\u200b", "", "ERROR: authentication failed\n", "Review this change")
+    assert w["refusal"] is not None and w["refusal"]["kind"] == "provider-auth", w
     # a real answer that merely QUOTES refusal vocabulary is not a refusal
     w = _run_invoke_lane_codex_wiring(tmp_path, REAL_SIZED_CODEX_ANSWER + "\nERROR: you've hit your usage limit (quoted)\n", "", "", "Review this change")
     assert w["refusal"] is None, w
@@ -1976,6 +1976,50 @@ def test_invoke_lane_wiring_judges_the_selected_answer_for_completion_floor_and_
     # stderr narration alone is never an answer
     w = _run_invoke_lane_codex_wiring(tmp_path, None, "", "working... " * 40, "Reply with exactly: OK")
     assert w["evidence"]["reason"] == "codex-empty-answer", w
+
+
+def test_codex_answer_of_supplementary_plane_format_characters_is_empty(tmp_path):
+    # adversary A1: Unicode tag characters (U+E0061, category Cf) are surrogate pairs in UTF-16; a
+    # code-unit regex leaves the halves behind and 60 of them read as 120 characters of substance.
+    tags = "".join(chr(0xE0061) for _ in range(60))
+    r = _work_evidence(tmp_path, "codex", tags, 0, prompt_chars=600)
+    assert r["workCompleted"] is False and r["reason"] == "codex-empty-answer", r
+    r = _work_evidence(tmp_path, "codex", tags + "ok", 0, prompt_chars=600)
+    assert r["workCompleted"] is False and r["reason"] == "codex-answer-too-short", r
+    # real supplementary-plane text still counts (an emoji is a character)
+    assert _work_evidence(tmp_path, "codex", "\U0001F600" * 120, 0, prompt_chars=600)["workCompleted"] is True
+
+
+def test_codex_final_fence_decides_even_when_it_is_malformed_or_not_an_object(tmp_path):
+    # adversary A2: an earlier provisional block with a verdict must not rescue a broken final block.
+    body = "x" * 120 + "\n```json\n" + '{"verdict":"APPROVE"}' + "\n```\n"
+    for tail in ('```json\n{"verdict":null\n```', "```json\n[]\n```", '```json\n{"verdict":"APPROVE"', "```json\n```"):
+        r = _work_evidence(tmp_path, "codex", body + tail, 0, prompt_chars=600, require_verdict=True)
+        assert r["workCompleted"] is False and r["reason"] == "codex-no-verdict", (tail, r)
+    # control: a well-formed final block after the provisional one is the verdict
+    ok = body + '```json\n{"verdict":"CHANGES_REQUESTED"}\n```\n'
+    assert _work_evidence(tmp_path, "codex", ok, 0, prompt_chars=600, require_verdict=True)["workCompleted"] is True
+
+
+def test_invoke_lane_wiring_successful_answer_that_quotes_refusal_vocabulary_is_not_refused(tmp_path):
+    # adversary A3: the prompt asked for the literal text; the run answered it. Base said not refused.
+    for text in ("ERROR: authentication failed", "ERROR: you've hit your usage limit"):
+        w = _run_invoke_lane_codex_wiring(tmp_path, text, text, "", "Reply with exactly: " + text)
+        assert w["refusal"] is None, (text, w)
+        assert w["evidence"]["workCompleted"] is True, (text, w)
+
+
+def test_invoke_lane_wiring_zero_width_last_message_falls_back_to_stdout(tmp_path):
+    # adversary A4: a last-message file holding only U+200B is blank, so stdout is the answer.
+    w = _run_invoke_lane_codex_wiring(tmp_path, "\u200b", "x" * 120, "", "Review this change " + "p" * 400)
+    assert w["evidence"]["workCompleted"] is True and w["refusal"] is None, w
+
+
+def test_invoke_lane_wiring_final_json_without_properties_is_no_verdict_not_a_throw(tmp_path):
+    # adversary A5 (strict mode): '{}' has no properties; reading .PSObject.Properties.Name threw.
+    key_prompt = 'Review.\nFinal json: {"verdict":"APPROVE|CHANGES_REQUESTED"}\n' + "x" * 600
+    w = _run_invoke_lane_codex_wiring(tmp_path, "x" * 120 + "\n{}", "", "", key_prompt)
+    assert w["evidence"]["reason"] == "codex-no-verdict", w
 
 
 def test_invoke_lane_assigns_the_codex_answer_evidence_exactly_once():
