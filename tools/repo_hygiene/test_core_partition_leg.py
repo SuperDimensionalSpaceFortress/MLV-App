@@ -2591,6 +2591,8 @@ LATE_READ_SCENARIOS = {
     "p4a1-same-start-same-path": {"procs": [_APP, _P1_PATH_UNREAD_EXITS, _P2_SAME_START]},
     "p4a2-same-start-after-step-same-path": {"stepMs": 200, "stepFrom": 2, "procs": [_APP, _P1_PATH_UNREAD_EXITS, _P2_SAME_START]},
     "path-late-handle-unopened": {"procs": [{**_APP, "pathFail": 3, "pathMode": "empty", "handleFail": 1}]},
+    # adversary pass 5 A2 on 8ad00092: the first Processor Information read throws, before the pending state exists
+    "counter-read-throws": {"catThrow": 1, "procs": [_APP]},
     **{f"clock-back-path-{ms}": {"stepMs": ms, "procs": [{**_CLOCK_APP, "pathFail": 1, "pathMode": "empty"}]} for ms in CLOCK_STEPS_MS},
     **{f"clock-back-start-{ms}": {"stepMs": ms, "procs": [{**_CLOCK_APP, "startFail": 1}]} for ms in CLOCK_START_UNREAD_STEPS_MS},
 }
@@ -2601,7 +2603,7 @@ $hb = $hb.Replace($cat, '$cpFakeCat')
 # Every wall clock read of the helper's goes through the double. A helper whose reads this no longer finds fails the skew assertion, so the step cannot go missing unnoticed.
 $hb = $hb -replace '\[DateTime\]::UtcNow|\$dt::UtcNow', '(Get-CpNow)'
 $prelude = @'
-$cpFakeCat = [pscustomobject]@{}; $cpFakeCat | Add-Member -MemberType ScriptMethod -Name ReadCategory -Value { @{} }
+$cpFakeCat = [pscustomobject]@{}; $cpFakeCat | Add-Member -MemberType ScriptMethod -Name ReadCategory -Value { if ($global:cpSpec.catThrow) { throw [InvalidOperationException]::new('Category does not exist.') }; @{} }
 $global:cpPoll = 0
 $global:cpSpec = $env:CP_SPEC | ConvertFrom-Json
 $global:cpLaunch = [DateTime]::new([int64]$env:CP_LAUNCH_TICKS, [DateTimeKind]::Utc)
@@ -2659,7 +2661,10 @@ for ($b = 0; $b -lt $names.Count; $b += 4) {
     foreach ($run in $runs) {
         if (-not $run.h.WaitForExit(120000)) { $run.h.Kill(); throw "the $($run.mode) helper did not end" }
         $end = [DateTime]::UtcNow.Ticks
-        $rec = [IO.File]::ReadAllText((Join-Path $run.dir 'helper.json')) | ConvertFrom-Json
+        # a helper that published no record is reported as such, so one scenario cannot take the others down with it
+        $rec = $(try { [IO.File]::ReadAllText((Join-Path $run.dir 'helper.json')) | ConvertFrom-Json } catch { $null })
+        if ($null -eq $rec) { $out[$run.mode] = [ordered]@{ exit = $run.h.ExitCode; record = $false }; continue }
+        if ($scenarios.($run.mode).catThrow) { $out[$run.mode] = [ordered]@{ exit = $run.h.ExitCode; record = $true; errors = @($rec.errors) }; continue }
         $start = ([DateTime]::new($run.launch, [DateTimeKind]::Utc)).AddSeconds(1).Ticks
         $v = Test-CorePartitionMeasuredApp $rec 5000 ($start - 5000000) $end 0
         $s = Get-CorePartitionScalars $rec ([ordered]@{ reasons = [ordered]@{} }) 4095 ([int64]$rec.helperAffinityObserved) $run.threads @{ value = 1; why = $null } $null $false -MeasuredPid 5000 -MeasuredStartTicks ($start - 5000000) -MeasuredEndTicks $end
@@ -3093,6 +3098,15 @@ class CorePartitionR10Tests(unittest.TestCase):
         unopened = self.late_read("path-late-handle-unopened")
         self.assertEqual([unopened["instances"], unopened["unidentified"]], [[], [5000]], unopened)
         self.assertFalse(unopened["bench"], unopened)
+
+    def test_handover_a_failure_before_the_first_poll_still_publishes_the_record(self) -> None:
+        """Adversary pass 5 A2 on 8ad00092: the first Processor Information read throws before the pending state exists. The stop-time sweep of pending pids ran
+        on that missing state and threw inside finally, so no record was published; the base publishes the caught error. It is published again."""
+        if type(self)._late_read_result is None:
+            self.late_read("control")
+        case = type(self)._late_read_result["counter-read-throws"]
+        self.assertTrue(case["record"], f"a failure before the first poll left no helper record: {case}")
+        self.assertTrue([e for e in case["errors"] if str(e).startswith("helper:")], case)
 
     def test_handover_a_start_unread_at_first_sight_refuses_even_when_it_reads_later(self) -> None:
         """The cost of that ruling, stated: a process whose StartTime fails at first sight and reads later cannot be told from a successor on its pid, so it refuses

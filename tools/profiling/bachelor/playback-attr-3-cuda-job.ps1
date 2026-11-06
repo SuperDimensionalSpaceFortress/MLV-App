@@ -5478,6 +5478,9 @@ $c0 = $dt::UtcNow.Ticks; $rec.monoBaseMs = [Diagnostics.Stopwatch]::GetTimestamp
 $clk = { $t = $dt::UtcNow.Ticks; $g = [math]::Abs(($t - $c0) / 1e4 - $cw.Elapsed.TotalMilliseconds); if ($g -gt $rec.clockSkewMaxMs) { $rec.clockSkewMaxMs = $g }; $t }
 $errs = [Collections.Generic.List[string]]::new()
 $lo = [Collections.Generic.List[object]]; $sm = $lo::new(); $ins = $lo::new()
+# adversary pass 5 A2 (8ad00092): what finally reads exists before anything that can throw, so a failure before the first poll still publishes its error
+$others = $lo::new(); $pn = @{}
+$un = { param($i) $others.Add(@{ pid = $i; unidentified = 1 }); $pn.Remove($i) }
 $loadOn = $false; $ls0 = 0; $lb = 0
 # r9 (Dot 4 = adversary r8 aeacec83 A4): the owner's load seconds and bytes are clipped to its last poll that saw it alive (aliveMs, and the byte
 # count read at that poll, $lb), so load that ran after it exited, before the next poll saw it gone, is not its own.
@@ -5526,8 +5529,7 @@ public sealed class MlvCorePartitionLoad {
     # yet (Path goes through MainModule, which cannot read a process whose loader has not run; StartTime can fail on its own) with its real first sight,
     # and every later poll reads it again. Only a Path read late recovers; a start unread at first sight never does (r3). One still unread when it leaves
     # the enumeration or when the helper stops is recorded unidentified ($un).
-    $live = @{}; $seen = @{}; $own = $null; $others = $lo::new(); $pn = @{}
-    $un = { param($i) $others.Add(@{ pid = $i; unidentified = 1 }); $pn.Remove($i) }
+    $live = @{}; $seen = @{}; $own = $null
     $ns = $dt::UtcNow.AddSeconds(1)
     $t0 = $dt::UtcNow
     # r9 (Dot 1 = adversary r8 aeacec83 A1): each pass polls every tracked process BEFORE it looks for the stop file, so the job's stop (written
