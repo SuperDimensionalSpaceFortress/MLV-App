@@ -1098,6 +1098,31 @@ class TimingsTests(unittest.TestCase):
         )
         self.assertEqual(timings.class_seconds(log), {"tools.repo_hygiene.test_x.A": 9.0})
 
+    def test_unittests_ran_line_and_dash_separator_inside_the_block_do_not_end_it(self) -> None:
+        # adversary r4 A1: the rest of unittest's stderr summary (the 70-dash separator and the
+        # "Ran N tests in Xs" line) can sit between the header and the rows too. The block is read.
+        log = (
+            "2026-10-04T00:00:00.0000000Z started\n"
+            "2026-10-04T00:00:05.0000000Z test_a (tools.repo_hygiene.test_x.A.test_a) ... ok\n"
+            "2026-10-04T00:00:09.0000000Z SHARD_SLOWEST profile=windows shard=1/7 total=9.0s\n"
+            "2026-10-04T00:00:09.0000000Z Ran 1 test in 9.000s\n"
+            "2026-10-04T00:00:09.0000000Z \n"
+            "2026-10-04T00:00:09.0000000Z OK\n"
+            "2026-10-04T00:00:09.0000000Z    9.0s tools.repo_hygiene.test_x.A\n"
+        )
+        self.assertEqual(timings.class_seconds(log), {"tools.repo_hygiene.test_x.A": 9.0})
+        dashed = log.replace(
+            "Ran 1 test in 9.000s\n", "----------------------------------------------------------------------\n"
+            "2026-10-04T00:00:09.0000000Z Ran 1 test in 9.000s\n"
+        )
+        self.assertEqual(timings.class_seconds(dashed), {"tools.repo_hygiene.test_x.A": 9.0})
+        # ... and a class named twice across such a line still makes the block unusable (gap-only 5.0).
+        twice = log + (
+            "2026-10-04T00:00:09.0000000Z Ran 2 tests in 9.000s\n"
+            "2026-10-04T00:00:09.0000000Z    1.0s tools.repo_hygiene.test_x.A\n"
+        )
+        self.assertEqual(timings.class_seconds(twice), {"tools.repo_hygiene.test_x.A": 5.0})
+
     def test_a_malformed_row_between_rows_neither_ends_the_block_nor_hides_a_repeated_class(self) -> None:
         # adversary r3 pass 6 A1: "1.2.3s" is not a measurement but it is a row, so the scan goes on
         # and sees class A named twice, which makes the block unusable (gap-only A = 5.0).

@@ -43,7 +43,9 @@ SLOWEST_ROW = re.compile(r"^\s+([0-9]{1,7}(?:\.[0-9]{1,3})?)s ([A-Za-z0-9_.]+)$"
 # A row's shape with the figure unchecked (``1.2.3s name``), and the unittest summary lines that can be
 # interleaved with a block on the log's other stream.
 SLOWEST_ROW_SHAPE = re.compile(r"^\s+\S+s ([A-Za-z0-9_.]+)$")
-SUMMARY_NOISE = re.compile(r"^(?:OK(?: \(.*\))?|FAILED \(.*\))?$")
+SUMMARY_NOISE = re.compile(
+    r"^(?:OK(?: \(.*\))?|FAILED \(.*\)|-{10,}|Ran [0-9]+ tests? in [0-9.]+s)?$"
+)
 
 
 def _seconds(stamp: re.Match[str]) -> float:
@@ -114,7 +116,8 @@ def class_seconds(log_text: str) -> dict[str, float]:
     # class named twice is concatenated or foreign output whose figures are not this job's, so the gaps
     # stand alone and no SHARD_SLOWEST figure replaces or caps anything.
     # Inside a block, unittest's stderr summary (blank line, ``OK``) can reach the log between the header and
-    # its rows (hosted run 41960424018, heavy part 4) and does not end it; a row of the right shape whose
+    # its rows (hosted run 41960424018, heavy part 4) and does not end it (blank line, the dash separator, the
+    # ``Ran N tests in Xs`` line, ``OK`` / ``FAILED (...)``); a row of the right shape whose
     # figure is unreadable is not a measurement but names a top-ten class, so the scan goes on and that
     # class is exempt from the ceiling; any other line ends the block.
     blocks: list[tuple[list[tuple[str, float]], list[str]]] = []
