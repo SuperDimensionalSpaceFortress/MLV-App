@@ -5522,9 +5522,10 @@ public sealed class MlvCorePartitionLoad {
     # (goneUtcTicks): started after the launch in instances, before it in others (adversary r5 A1), so a second process alive beside the measured app
     # across a poll is on the record. One whose whole lifetime falls between two polls is not (LIMIT A3, CORE-PARTITION-PROCESS-START-EVENTS-1).
     # The load runs for the instance that owns it ($own), the first found while none does.
-    # CORE-PARTITION-SAME-PATH-HANDOVER-RACE-1: a failed read at first sight settles nothing. $pn holds, by pid, each same-name process not readable
+    # CORE-PARTITION-SAME-PATH-HANDOVER-RACE-1: a failed read at first sight settles nothing at once. $pn holds, by pid, each same-name process not readable
     # yet (Path goes through MainModule, which cannot read a process whose loader has not run; StartTime can fail on its own) with its real first sight,
-    # and every later poll reads it again. Only one still unread when it leaves the enumeration or when the helper stops is recorded unidentified ($un).
+    # and every later poll reads it again. Only a Path read late recovers; a start unread at first sight never does (r3). One still unread when it leaves
+    # the enumeration or when the helper stops is recorded unidentified ($un).
     $live = @{}; $seen = @{}; $own = $null; $others = $lo::new(); $pn = @{}
     $un = { param($i) $others.Add(@{ pid = $i; unidentified = 1 }); $pn.Remove($i) }
     $ns = $dt::UtcNow.AddSeconds(1)
@@ -5561,7 +5562,7 @@ public sealed class MlvCorePartitionLoad {
             # 8cf7e883 A3): firstMs, the monotonic time after that enumeration, and the wall first-seen stamp through $clk (which samples the clock
             # gap), so the job can order each process's start, first sight and exit and prove concurrency on the monotonic clock alone.
             $me = $cw.ElapsedMilliseconds
-            $ps = @(Get-Process -Name $appName -ea 0); $lt = $dt::UtcNow.Ticks
+            $ps = @(Get-Process -Name $appName -ea 0)
             foreach ($p in $ps) {
                 $pp = $null; try { $pp = [string]$p.Path } catch { }
                 $pst = $null; try { $pst = $p.StartTime.ToUniversalTime() } catch { }
@@ -5569,14 +5570,14 @@ public sealed class MlvCorePartitionLoad {
                 # A seen key is a process already tracked and still on this pid, so anything pending on the pid was that process failing its reads, and it has read again.
                 if ($seen[$k]) { $pn.Remove($p.Id); continue }
                 $pe = $pn[$p.Id]
-                # The first start read for a pending pid ($pe.s) is its identity, whatever the clock did since: any other start on that pid is a process on a recycled pid,
-                # and the one first listed ended unread. With none read yet, only the stamp of the enumeration that first listed the pid ($pe.t) is left. Only one process holds a
-                # pid at a time, so its own start is earlier than that stamp, but both are wall clock and a clock gap moves them, so a start must be earlier by more than the
-                # job's $slack, twice the largest gap, to be called the same process. Doubt refuses: a backward step can cost a run here, and it can never drop a process.
-                if ($pe -and $pst) { if ($pst.Ticks -ne $pe.s -and ($pe.s -or $pst.Ticks + 2e4 * $rec.clockSkewMaxMs -gt $pe.t)) { & $un $p.Id; $pe = $null } else { $pe.s = $pst.Ticks } }
+                # The start read at first sight ($pe.s) is a pending pid's identity, whatever the clock did since: any other start on that pid is a process on a recycled
+                # pid, and the one first listed ended unread. With no start read at first sight nothing can prove identity (r3, HUB RULING 2026-11-06, adversary A1/A2 on
+                # 6180c3e7): a successor can start between the enumeration and any stamp taken after it, and the clock can step after the last gap sample. So any start
+                # read later on that pid refuses, as on the base; only a Path read late, with the start read at first sight, recovers.
+                if ($pe -and $pst -and $pst.Ticks -ne $pe.s) { & $un $p.Id; $pe = $null }
                 # A read that fails settles nothing, on a pid being tracked too: HasExited opens by pid, so a tracked process can hand its pid over unnoticed, and both reads
                 # failing cannot be told from that process exiting. A read at another path with no start cannot say which process it read, so it clears nothing.
-                if (!$pp -or ($pp -ieq $exe -and !$pst)) { if (!$pe) { $pn[$p.Id] = @{ t = $lt; s = $pst.Ticks; f = & $clk; m = $cw.ElapsedMilliseconds } } }
+                if (!$pp -or ($pp -ieq $exe -and !$pst)) { if (!$pe) { $pn[$p.Id] = @{ s = $pst.Ticks; f = & $clk; m = $cw.ElapsedMilliseconds } } }
                 elseif ($pst) { $pn.Remove($p.Id) }
                 if ($pp -ieq $exe -and $pst) {
                     # firstSeenUtcTicks and firstMs are the real first sight, also for a process classed late; aliveMs is this poll's, the first it can vouch for.

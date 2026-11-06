@@ -2518,18 +2518,25 @@ R14B_UNIDENTIFIED_DRIVER = _r14b_unidentified_driver()
 # the pid belongs to a process this user cannot open (measured on csrss, wininit and smss from an unelevated pwsh 7.6: Path '', StartTime null, HasExited null, no throw).
 # exitedThrowAt: Refresh throws at that one enumeration count. pathFailAt/startFailAt: that read fails at that one enumeration. A negative startBeforeFirstPollMs is a
 # start after enumeration 1 on the unstepped clock.
-_APP = {"id": 5000, "from": 1, "to": 6, "goneAt": 6, "startSec": 1}
+# r3 addition. stepFrom: the enumeration count from which stepMs applies (default 1). The pass that reaches it samples the clock gap at its top, before its
+# enumeration counts, so a step from enumeration 2 is one the helper has not sampled when that pass decides (adversary A2 on 6180c3e7).
+_APP ={"id": 5000, "from": 1, "to": 6, "goneAt": 6, "startSec": 1}
 _Q = {"from": 1, "to": 99, "goneAt": 999}
 # Opus key3's pid 300: P1 is tracked and read at once. P2 takes the pid in the pass that sees P1 gone (enumeration 4), Path empty, its start readable and new.
 _P1_TRACKED = {"id": 300, "from": 1, "to": 3, "goneAt": 3, "startSec": 1}
 _P2_PATH_UNREAD = {"id": 300, "from": 4, "goneAt": 999, "startSec": 2, "pathMode": "empty"}
 # P1 unread on enumerations 1-2, its pid then held by P2.
 _P1_UNREAD = {"id": 300, "from": 1, "to": 2, "goneAt": 999, "startSec": 1, "pathFail": -1, "pathMode": "empty"}
+# Adversary A1 and A2 on 6180c3e7: P1 unread both ways in enumeration 1 only, then P2 on its pid with a readable start earlier than enumeration 1's stamp:
+# 400 ms earlier (A1, a start that came between the enumeration and its stamp, skew 0), and 300 ms earlier with the clock stepped back 500 ms after the deciding
+# pass sampled the gap (A2, a stale gap).
+_P1_BOTH_UNREAD_ONE_PASS = {"id": 300, "from": 1, "to": 1, "goneAt": 999, "startSec": 1, "pathFail": -1, "pathMode": "empty", "startFail": -1}
+_P2_A1 = {"id": 300, "from": 2, "to": 99, "goneAt": 999, "startBeforeFirstPollMs": 400}
+_P2_A2 = {**_P2_A1, "startBeforeFirstPollMs": 300}
 # Sol's input: the process started 50 ms before enumeration 1, whose stamp is stepMs earlier. One failed read at first sight, then every read succeeds.
 _CLOCK_APP = {**_APP, "startBeforeFirstPollMs": 50}
 CLOCK_STEPS_MS = (100, 500, 1000)
-# With the start unread at first sight only the listing's stamp is left to compare, so the gap the helper sampled decides it. These steps keep that gap
-# well above what a stall between the helper's two clock zeros can take off it.
+# With the start unread at first sight the process refuses whatever the clock did (r3); these steps check that a backward step does not change that.
 CLOCK_START_UNREAD_STEPS_MS = (400, 700, 1000)
 LATE_READ_SCENARIOS = {
     "control": {"procs": [_APP]},
@@ -2570,6 +2577,10 @@ LATE_READ_SCENARIOS = {
     "recycled-other-path-start-unread": {"procs": [_APP, _P1_UNREAD, {"id": 300, "from": 3, "to": 4, "goneAt": 999, "startSec": 2, "exe": "other", "startFail": -1}]},
     "recycled-start-not-later": {"procs": [_APP, _P1_UNREAD, {"id": 300, "from": 3, "to": 99, "goneAt": 999, "startSec": 2}]},
     "other-path-start-unread-from-the-first": {"procs": [_APP, {**_Q, "id": 400, "startSec": 1, "exe": "other", "startFail": -1}]},
+    "a1-recycled-before-stamp-other-path": {"procs": [_APP, _P1_BOTH_UNREAD_ONE_PASS, {**_P2_A1, "to": 4, "exe": "other"}]},
+    "a1-recycled-before-stamp-same-path": {"procs": [_APP, _P1_BOTH_UNREAD_ONE_PASS, _P2_A1]},
+    "a2-step-after-gap-sample-other-path": {"stepMs": 500, "stepFrom": 2, "procs": [_APP, _P1_BOTH_UNREAD_ONE_PASS, {**_P2_A2, "to": 4, "exe": "other"}]},
+    "a2-step-after-gap-sample-same-path": {"stepMs": 500, "stepFrom": 2, "procs": [_APP, _P1_BOTH_UNREAD_ONE_PASS, _P2_A2]},
     **{f"clock-back-path-{ms}": {"stepMs": ms, "procs": [{**_CLOCK_APP, "pathFail": 1, "pathMode": "empty"}]} for ms in CLOCK_STEPS_MS},
     **{f"clock-back-start-{ms}": {"stepMs": ms, "procs": [{**_CLOCK_APP, "startFail": 1}]} for ms in CLOCK_START_UNREAD_STEPS_MS},
 }
@@ -2584,7 +2595,7 @@ $cpFakeCat = [pscustomobject]@{}; $cpFakeCat | Add-Member -MemberType ScriptMeth
 $global:cpPoll = 0
 $global:cpSpec = $env:CP_SPEC | ConvertFrom-Json
 $global:cpLaunch = [DateTime]::new([int64]$env:CP_LAUNCH_TICKS, [DateTimeKind]::Utc)
-function Get-CpNow { $n = [DateTime]::UtcNow; if ($global:cpPoll -ge 1 -and $global:cpSpec.stepMs) { $n.AddMilliseconds(-$global:cpSpec.stepMs) } else { $n } }
+function Get-CpNow { $n = [DateTime]::UtcNow; if ($global:cpPoll -ge [math]::Max(1, [int]$global:cpSpec.stepFrom) -and $global:cpSpec.stepMs) { $n.AddMilliseconds(-$global:cpSpec.stepMs) } else { $n } }
 function Test-CpFails($Up, $From) { ($Up -eq -1) -or ($null -ne $Up -and $global:cpPoll -le $Up) -or ($null -ne $From -and $global:cpPoll -ge $From) }
 $global:cpDoubles = @(foreach ($s in @($global:cpSpec.procs)) {
     $d = [pscustomobject]@{ Id = [int]$s.id; cpS = $s; PriorityClass = 'Normal'; ProcessorAffinity = [int64]4095 }
@@ -2829,9 +2840,10 @@ class CorePartitionR10Tests(unittest.TestCase):
         return case
 
     def test_handover_a_failed_read_at_first_sight_does_not_settle_the_process(self) -> None:
-        """A failed Path read, in the shape a real process before its loader has run gives (empty) and as a throw; a failed StartTime read; both. Each
-        fails for the first three enumerations and then reads: the app is classed as the instance it is, and the run is not refused for it."""
-        for mode in ("path-empty-late", "path-throw-late", "start-late", "both-late"):
+        """A failed Path read, in the shape a real process before its loader has run gives (empty) and as a throw, with its start read at first sight. It fails
+        for the first three enumerations and then reads: the app is classed as the instance it is, and the run is not refused for it. A start unread at first
+        sight refuses instead (r3, test_handover_a_start_unread_at_first_sight_refuses_even_when_it_reads_later)."""
+        for mode in ("path-empty-late", "path-throw-late"):
             with self.subTest(mode=mode):
                 case = self.late_read(mode)
                 self.assertEqual(case["unidentified"], [], f"a read that later succeeded left the process on the record as unidentified: {case}")
@@ -2842,7 +2854,7 @@ class CorePartitionR10Tests(unittest.TestCase):
     def test_handover_a_late_classed_process_keeps_its_real_first_sight(self) -> None:
         """The job orders start, first sight and exit from these. The first sight is the enumeration that first listed the process, which is before the
         one that could read it, and its last-alive stamp comes from the poll that classed it or a later one. Control: a process read at once."""
-        for mode in ("path-empty-late", "path-throw-late", "start-late", "both-late"):
+        for mode in ("path-empty-late", "path-throw-late"):
             with self.subTest(mode=mode):
                 case = self.late_read(mode)
                 rec, polls = case["by"]["5000"], case["polls"]
@@ -2871,8 +2883,8 @@ class CorePartitionR10Tests(unittest.TestCase):
 
     def test_handover_a_pre_launch_process_read_late_lands_in_others_by_its_real_start(self) -> None:
         """The launch-instant rule: classed late, a process that started before the launch is still in others, is never an instance and starts no load
-        session, and being alive beside the app refuses the overlap."""
-        for mode in ("prelaunch-late", "prelaunch-start-late"):
+        session, and being alive beside the app refuses the overlap. With its start unread at first sight it refuses unidentified instead (r3)."""
+        for mode in ("prelaunch-late",):
             with self.subTest(mode=mode):
                 case = self.late_read(mode)
                 self.assertEqual(case["unidentified"], [], case)
@@ -2988,14 +3000,15 @@ class CorePartitionR10Tests(unittest.TestCase):
         self.assertEqual(case["instances"], [5000, 300], case)
         self.assertGreaterEqual(case["by"]["300"]["first"], case["polls"][2], case)
 
-    def test_handover_a_start_recovered_after_first_sight_is_kept_as_the_identity(self) -> None:
-        """Adversary A2 on 6b63c057: P1 is unread both ways at first sight, and its start reads on the next enumeration with its Path still empty. That start is the
-        identity from then on. P2 then takes the pid with a start that is also before the listing's stamp (a clock stepped back makes that possible), so only the saved
-        start tells them apart: at another path it must not erase P1, and at the app's path it must not inherit P1's first sight."""
+    def test_handover_a_start_read_after_first_sight_refuses_and_then_holds_its_pid(self) -> None:
+        """Adversary A2 on 6b63c057, kept under the r3 ruling: P1 is unread both ways at first sight, and its start reads on the next enumeration with its Path still
+        empty. A start unread at first sight is never recovered, so that read refuses the entry (r3), and the pid goes pending again with the start it just read. P2
+        then takes the pid with a start also before the first listing, and that saved start refuses it too: at another path P2 erases nothing, and at the app's path
+        it does not inherit P1's first sight. Two records, one per refusal; the verdict is the same."""
         for mode, instances in (("start-recovered-then-recycled-other-path", [5000]), ("start-recovered-then-recycled-same-path", [5000, 300])):
             with self.subTest(mode=mode):
                 case = self.late_read(mode)
-                self.assertEqual(case["unidentified"], [300], f"a successor erased or inherited an unread process whose start had been read: {case}")
+                self.assertEqual(case["unidentified"], [300, 300], f"a successor erased or inherited an unread process: {case}")
                 self.assertEqual(case["instances"], instances, case)
                 self.assertEqual(case["vwhy"], "same-path-instance-unidentified", case)
         same = self.late_read("start-recovered-then-recycled-same-path")
@@ -3017,9 +3030,8 @@ class CorePartitionR10Tests(unittest.TestCase):
                 self.assertIn(case["vwhy"], self.ACCEPTED + (("clock-discontinuity",) if ms == 1000 else ()), case)
 
     def test_handover_with_no_start_read_a_clock_gap_is_doubt_and_doubt_refuses(self) -> None:
-        """Adversary A1 on c49e90b6. With the start unread at first sight only the listing's stamp is left, and a sampled clock gap moves it either way, so a start that is
-        not earlier than the stamp by more than the job's slack cannot be called the same process. A successor inside that gap must not erase or inherit P1. The price
-        is the same-process input, which cannot be told from it and also refuses: a stated limit, never a dropped process."""
+        """Adversary A1 on c49e90b6. With the start unread at first sight nothing can prove identity, so a successor inside a sampled clock gap must not erase or
+        inherit P1. Since r3 any later start on that pid refuses, whatever the clock did; the same-process input refuses too, as on the base."""
         for mode, instances in (("recycled-inside-gap-other-path", [5000]), ("recycled-inside-gap-same-path", [5000, 300])):
             with self.subTest(mode=mode):
                 case = self.late_read(mode)
@@ -3032,6 +3044,39 @@ class CorePartitionR10Tests(unittest.TestCase):
                 case = self.late_read(f"clock-back-start-{ms}")
                 self.assertEqual([case["app"], case["instances"], case["unidentified"]], [5000, [5000], [5000]], case)
                 self.assertIn(case["vwhy"], ("same-path-instance-unidentified", "clock-discontinuity") if ms == 1000 else ("same-path-instance-unidentified",), case)
+
+    def test_handover_a_start_unread_at_first_sight_is_never_recovered(self) -> None:
+        """Adversary A1 and A2 on 6180c3e7, closed by HUB RULING 2026-11-06 (r3). With P1's start unread at first sight, only the listing's stamp was left to tell
+        P1 from a successor, and a start earlier than that stamp is no proof: P2 can start between the enumeration and its stamp (A1), or the clock can step back after
+        the pass sampled the gap (A2). P2 then erased P1 (another path) or inherited P1's first sight (the app's path), and P1 left no record. Any later start read on
+        that pid now refuses, as on the base."""
+        for mode, instances in (("a1-recycled-before-stamp-other-path", [5000]), ("a1-recycled-before-stamp-same-path", [5000, 300]),
+                                ("a2-step-after-gap-sample-other-path", [5000]), ("a2-step-after-gap-sample-same-path", [5000, 300])):
+            with self.subTest(mode=mode):
+                case = self.late_read(mode)
+                self.assertEqual(case["unidentified"], [300], f"a successor erased or inherited a process whose start was unread at first sight: {case}")
+                self.assertEqual(case["instances"], instances, case)
+                self.assertEqual(case["vwhy"], "same-path-instance-unidentified", case)
+                self.assertFalse(case["bench"], case)
+        a1 = self.late_read("a1-recycled-before-stamp-same-path")
+        self.assertLess(a1["by"]["300"]["start"], a1["polls"][0], f"the input no longer has the successor's start before the first listing: {a1}")
+        self.assertGreaterEqual(a1["by"]["300"]["first"], a1["polls"][1], f"the successor inherited the unread process's first sight: {a1}")
+        # the step is applied after the deciding pass sampled the gap, and is seen later
+        self.assertGreaterEqual(self.late_read("a2-step-after-gap-sample-other-path")["skew"], 250, "the clock double did not reach the helper")
+
+    def test_handover_a_start_unread_at_first_sight_refuses_even_when_it_reads_later(self) -> None:
+        """The cost of that ruling, stated: a process whose StartTime fails at first sight and reads later cannot be told from a successor on its pid, so it refuses
+        same-path-instance-unidentified, as on the base, whether or not its Path read too (r1's start-late, both-late and prelaunch-start-late, which recovered
+        on e048ccc6 to 6180c3e7). Only a Path failure with the start read at first sight recovers, the one shape measured on a real process (CREATE_SUSPENDED)."""
+        for mode in ("start-late", "both-late"):
+            with self.subTest(mode=mode):
+                case = self.late_read(mode)
+                self.assertEqual([case["app"], case["instances"], case["unidentified"]], [5000, [5000], [5000]], case)
+                self.assertEqual(case["vwhy"], "same-path-instance-unidentified", case)
+                self.assertFalse(case["bench"], case)
+        pre = self.late_read("prelaunch-start-late")
+        self.assertEqual([pre["instances"], pre["others"], pre["unidentified"]], [[5000], [200], [200]], pre)
+        self.assertEqual(pre["vwhy"], "same-path-instance-unidentified", pre)
 
     def test_handover_a_real_process_caught_before_its_loader_ran_is_classed_after_it_resumes(self) -> None:
         """Nothing doubled but the counter category: a real stand-in process held suspended through two whole enumerations. Its Path really is unreadable
