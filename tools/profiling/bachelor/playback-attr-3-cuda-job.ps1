@@ -5572,8 +5572,9 @@ public sealed class MlvCorePartitionLoad {
                 $pp = $null; try { $pp = [string]$p.Path } catch { }
                 $pst = $null; try { $pst = $p.StartTime.ToUniversalTime() } catch { }
                 $k = "$($p.Id),$($pst.Ticks)"
-                # A seen key is a process already tracked and still on this pid, so anything pending on the pid was that process failing its reads, and it has read again.
-                if ($seen[$k]) { $pn.Remove($p.Id); continue }
+                # A seen key settles nothing pending on its pid (r4, adversary pass 6 A1 on 0a40778b): an entry pends only with its start unread or another key, and a
+                # successor can get a gone process's exact start, so the entry refuses, as on the base. A tracked process whose reads fail once refuses too (hub ruling).
+                if ($seen[$k]) { if ($pn[$p.Id]) { & $un $p.Id }; continue }
                 $pe = $pn[$p.Id]
                 # The start read at first sight ($pe.s) is a pending pid's identity, whatever the clock did since: any other start on that pid is a process on a recycled
                 # pid, and the one first listed ended unread. With no start read at first sight nothing can prove identity (r3, HUB RULING 2026-11-06, adversary A1/A2 on

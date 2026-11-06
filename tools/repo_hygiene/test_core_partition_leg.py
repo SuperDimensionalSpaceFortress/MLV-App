@@ -2576,6 +2576,10 @@ LATE_READ_SCENARIOS = {
     "recycled-inside-gap-other-path": {"stepMs": 500, "procs": [_APP, {**_P1_UNREAD, "startFail": -1}, {"id": 300, "from": 3, "to": 4, "goneAt": 999, "startBeforeFirstPollMs": 300, "exe": "other"}]},
     "recycled-inside-gap-same-path": {"stepMs": 500, "procs": [_APP, {**_P1_UNREAD, "startFail": -1}, {"id": 300, "from": 3, "to": 99, "goneAt": 999, "startBeforeFirstPollMs": 300}]},
     "recycled-over-alive-both-unread": {"procs": [_APP, {**_P1_TRACKED, "goneAt": 4}, {**_P2_PATH_UNREAD, "to": 4, "pathFail": -1, "startFail": -1}]},
+    # adversary pass 6 A1 on 0a40778b: P0 is tracked on pid 300 and gone; its successor gets P0's exact start (a clock step during creation), is unread at first
+    # sight (both reads, or the start alone at the app's path), and reads P0's seen key on the next enumeration
+    "successor-on-gone-key-both-unread": {"procs": [_APP, _P1_TRACKED, {"id": 300, "from": 4, "to": 99, "goneAt": 999, "startSec": 1, "pathFailAt": 4, "pathMode": "empty", "startFailAt": 4}]},
+    "successor-on-gone-key-start-unread": {"procs": [_APP, _P1_TRACKED, {"id": 300, "from": 4, "to": 99, "goneAt": 999, "startSec": 1, "startFailAt": 4}]},
     "reads-fail-once-while-tracked": {"procs": [{**_APP, "pathFailAt": 5, "pathMode": "empty", "startFailAt": 5}]},
     "reads-and-liveness-fail-once-while-tracked": {"procs": [{**_APP, "pathFailAt": 5, "pathMode": "empty", "startFailAt": 5, "exitedNullAt": 4, "exitedNullTo": 4}]},
     "liveness-null-once": {"procs": [{**_APP, "exitedNullAt": 2, "exitedNullTo": 2}]},
@@ -2928,20 +2932,32 @@ class CorePartitionR10Tests(unittest.TestCase):
 
     def test_handover_a_tracked_process_whose_reads_fail_is_still_the_tracked_process(self) -> None:
         """Both reads failing on a tracked pid cannot be told from a successor that took the pid, whichever way the pass's liveness query went, so nothing settles it there
-        (adversary A1 on 6b63c057, A2 on c49e90b6). If the tracked process's own start reads again, it was that process all along and nothing is left on the record. If it
-        never does, the pid refuses, as on the base. A successor unread both ways in a pass that saw the old process alive is the input that rules out a guard."""
+        (adversary A1 on 6b63c057, A2 on c49e90b6). Since r4 (hub ruling 1 of HUB-TICK 20261106T0752Z, adversary pass 6 A1 on 0a40778b) the tracked process's own key
+        reading again recovers nothing either: a successor can get that exact key, so the pid refuses, as on the base, even when the reads fail only once. A successor
+        unread both ways in a pass that saw the old process alive is the input that rules out a guard."""
         for mode in ("reads-fail-once-while-tracked", "reads-and-liveness-fail-once-while-tracked"):
             with self.subTest(mode=mode):
                 case = self.late_read(mode)
-                self.assertEqual(case["unidentified"], [], f"a recovered read left a tracked process on the record as unidentified: {case}")
+                self.assertEqual(case["unidentified"], [5000], f"a read of a seen key resolved a pid whose reads had failed: {case}")
                 self.assertEqual([case["app"], case["instances"]], [5000, [5000]], case)
-                self.assertIn(case["vwhy"], self.ACCEPTED, case)
+                self.assertEqual(case["vwhy"], "same-path-instance-unidentified", case)
         for mode in ("reads-fail-while-tracked", "reads-fail-as-seen-gone"):
             with self.subTest(mode=mode):
                 case = self.late_read(mode)
                 self.assertEqual([case["app"], case["instances"], case["unidentified"], case["vwhy"]], [5000, [5000], [5000], "same-path-instance-unidentified"], case)
         successor = self.late_read("recycled-over-alive-both-unread")
         self.assertEqual([successor["unidentified"], successor["vwhy"]], [[300], "same-path-instance-unidentified"], f"a successor unread both ways left no record: {successor}")
+
+    def test_handover_a_successor_reading_a_gone_tracked_key_never_resolves_its_unread_first_sight(self) -> None:
+        """Adversary pass 6 A1 on 0a40778b, closed by hub ruling 1 of HUB-TICK 20261106T0752Z. P0 on pid 300 is tracked and gone, and a successor on that pid gets P0's
+        exact start. Unread at first sight, it went pending; its next read gave P0's seen key, which cleared the entry, so it left no record. A seen key now refuses the
+        pending entry on its pid: a start unread at first sight is never resolved by a later read on that pid."""
+        for mode in ("successor-on-gone-key-both-unread", "successor-on-gone-key-start-unread"):
+            with self.subTest(mode=mode):
+                case = self.late_read(mode)
+                self.assertEqual(case["unidentified"], [300], f"a successor unread at first sight was cleared by a gone process's seen key: {case}")
+                self.assertEqual(case["vwhy"], "same-path-instance-unidentified", case)
+                self.assertFalse(case["bench"], case)
 
     def test_handover_a_process_identified_at_another_path_is_dropped_once_readable(self) -> None:
         """Identified is identified: readable at another path, it is no competing instance, so it is off the record and refuses nothing."""
