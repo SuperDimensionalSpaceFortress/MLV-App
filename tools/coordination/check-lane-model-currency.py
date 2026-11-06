@@ -328,7 +328,7 @@ def newest_per_family(receipts, overrides):
 def is_live_running(receipt, now):
     """True only for a receipt that is a live CANDIDATE: its own start time and timeout allow a run in progress.
     This is an age window, not a process probe; it does not prove anything is running (see the docstring)."""
-    if receipt["state"] != "running" or receipt["ended"]:
+    if receipt["state"] != "running" or receipt["ended"] is not None:      # any non-null endedUtc, falsey or not, ended it
         return False
     # startedUtc is already in the one readable shape: a receipt with any other stamp is unreadable and never gets
     # here. timeoutSec counts only when its RAW token has at most 15 significant digits (exact_timeout; json.load

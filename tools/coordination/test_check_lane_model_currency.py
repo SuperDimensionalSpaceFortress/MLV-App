@@ -549,6 +549,32 @@ class InFlightTests(CurrencyFixture):
         path.write_text(json.dumps(body), encoding="utf-8")
         self.assertEqual(self.evaluate()["lanes"]["opus"]["verdict"], "NO-DATA")
 
+    def test_a_running_receipt_with_any_non_null_end_field_is_not_live(self):
+        # adversary r10 A1: a falsey non-null endedUtc ([], {}, false, 0, "") is not "no endedUtc" and gets no live exemption
+        for ended in ([], {}, False, 0, ""):
+            with self.subTest(ended=ended):
+                shutil.rmtree(self.runs, ignore_errors=True)
+                self.runs.mkdir()
+                self.receipt("opus", "claude-opus-5-5", 10)
+                self.running("opus", 1)
+                path = next(p for p in self.runs.glob("*/opus-001.receipt.json") if "running" in p.read_text())
+                body = json.loads(path.read_text())
+                body["endedUtc"] = ended
+                path.write_text(json.dumps(body), encoding="utf-8")
+                result = self.evaluate()
+                self.assertEqual(result["lanes"]["opus"]["verdict"], "NO-DATA")
+                self.assertEqual(result["inFlightLanes"], [])
+                self.assertEqual(result["verdict"], "INCOMPLETE")
+
+    def test_a_running_receipt_with_a_null_end_field_is_still_a_live_candidate(self):
+        self.receipt("opus", "claude-opus-5-5", 10)
+        self.running("opus", 1)
+        path = next(p for p in self.runs.glob("*/opus-001.receipt.json") if "running" in p.read_text())
+        body = json.loads(path.read_text())
+        body["endedUtc"] = None
+        path.write_text(json.dumps(body), encoding="utf-8")
+        self.assertEqual(self.evaluate()["lanes"]["opus"]["verdict"], "IN-FLIGHT")
+
     def test_a_failed_newest_run_still_reads_no_data(self):
         self.receipt("opus", "claude-opus-5-5", 10)
         self.receipt("opus", None, 2, state="failed")
