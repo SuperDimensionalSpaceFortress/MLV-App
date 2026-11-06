@@ -800,6 +800,8 @@ function Invoke-ClaimRetryRelease([DateTime]$DeadlineUtc, [string]$Nonce) {
     # Invoke-VenueBoundedRead, whose -TimeoutSec starts at 1 s), with the fraction of a second kept.
     # r7 pass 2 (adversary r7 A1): a release given up on (or never started) turns the write suppression on before it returns: the claim share did not answer, -RunDir may sit on the
     # same share, and the refusal or log line that follows must not probe batch.log there unbounded (Stop-PlanRefused, L via Test-RunDirWrite). Said on stderr only from then on.
+    # r8 (sol r7 blocker): a release that THREW (the claim share's read or delete raising through EndInvoke, or the worker not created) returned NO_ANSWER with it still off. Now every
+    # exit turns it on in ONE place, the outer finally, unless the worker's answer was read back ($answered): no room, no answer in the wait, a throw, and any exit added later.
     $suppress = {
         param([string]$Why)
         if (-not $script:RunOutputAliased) {
@@ -808,25 +810,28 @@ function Invoke-ClaimRetryRelease([DateTime]$DeadlineUtc, [string]$Nonce) {
                 why = "the release of a claim granted on a retry $Why, so nothing more is written into -RunDir (it may be on that share)" } }
         }
     }
-    $sec = [Math]::Min([double](($DeadlineUtc - [DateTime]::UtcNow).TotalSeconds - $script:ClaimRetryRefusalTailSec), [double]$script:ClaimRetryRequestReserveSec)
-    if ($sec -le 0) { & (Get-Module VenueChain) { $script:VenueAbandonedReads++ }; . $suppress 'had no time left before -DeadlineUtc'; return "NO_ROOM (no time was left before -DeadlineUtc to release it; the claim still names this process, so it is broken as dead-pid once the process exits)" }
-    $ps = $null; $abandoned = $false
+    $answered = $false; $why = 'ended before it answered'
     try {
-        $ps = [powershell]::Create()
-        [void]$ps.AddScript($script:ClaimRetryReleaseWorker.ToString())
-        [void]$ps.AddArgument(@{ chainModule = (Join-Path $here 'VenueChain.psm1'); venue = $Venue; nonce = $Nonce; claimDir = $ClaimDir })
-        $async = $ps.BeginInvoke()
-        if (-not $async.AsyncWaitHandle.WaitOne([TimeSpan]::FromSeconds($sec))) {
-            # a worker still running is a live thread the host would wait for at exit: counted, asked to stop, never joined or disposed (Dispose() would wait for it)
-            $abandoned = $true
-            & (Get-Module VenueChain) { $script:VenueAbandonedReads++ }
-            try { [void]$ps.BeginStop($null, $null) } catch { }
-            . $suppress "did not answer in $([Math]::Round($sec, 2)) s"
-            return "NO_ANSWER (no answer in $([Math]::Round($sec, 2)) s)"
-        }
-        [string]@($ps.EndInvoke($async))[-1]
-    } catch { "NO_ANSWER ($($_.Exception.Message -replace '\s+', ' '))" }
-    finally { if ($null -ne $ps -and -not $abandoned) { $ps.Dispose() } }
+        $sec = [Math]::Min([double](($DeadlineUtc - [DateTime]::UtcNow).TotalSeconds - $script:ClaimRetryRefusalTailSec), [double]$script:ClaimRetryRequestReserveSec)
+        if ($sec -le 0) { & (Get-Module VenueChain) { $script:VenueAbandonedReads++ }; $why = 'had no time left before -DeadlineUtc'; return "NO_ROOM (no time was left before -DeadlineUtc to release it; the claim still names this process, so it is broken as dead-pid once the process exits)" }
+        $ps = $null; $abandoned = $false
+        try {
+            $ps = [powershell]::Create()
+            [void]$ps.AddScript($script:ClaimRetryReleaseWorker.ToString())
+            [void]$ps.AddArgument(@{ chainModule = (Join-Path $here 'VenueChain.psm1'); venue = $Venue; nonce = $Nonce; claimDir = $ClaimDir })
+            $async = $ps.BeginInvoke()
+            if (-not $async.AsyncWaitHandle.WaitOne([TimeSpan]::FromSeconds($sec))) {
+                # a worker still running is a live thread the host would wait for at exit: counted, asked to stop, never joined or disposed (Dispose() would wait for it)
+                $abandoned = $true
+                & (Get-Module VenueChain) { $script:VenueAbandonedReads++ }
+                try { [void]$ps.BeginStop($null, $null) } catch { }
+                $why = "did not answer in $([Math]::Round($sec, 2)) s"
+                return "NO_ANSWER (no answer in $([Math]::Round($sec, 2)) s)"
+            }
+            $answer = [string]@($ps.EndInvoke($async))[-1]; $answered = $true; $answer
+        } catch { $thrown = $_.Exception.Message -replace '\s+', ' '; $why = "threw ($thrown)"; "NO_ANSWER ($thrown)" }
+        finally { if ($null -ne $ps -and -not $abandoned) { $ps.Dispose() } }
+    } finally { if (-not $answered) { . $suppress $why } }
 }
 
 function Get-ClaimWaitUnfinishedText([int]$Unfinished, [int]$NoAnswers) {

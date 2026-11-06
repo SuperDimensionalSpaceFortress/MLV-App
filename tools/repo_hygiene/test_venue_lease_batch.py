@@ -5193,7 +5193,15 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
         # r7: less 1 s for the guard's own end, now that its reads get the exact remainder
         grant = text.index("$script:guardBudget = $(if ($req.granted) { New-GuardBudget $claimGuardSec ")
         self.assertIn("$claimGuardSec = [double]($ClaimTtlSec - $ClaimRenewSec - 1);", text)
-        self.assertLess(text.rindex("$grantReadUtc = [DateTime]::UtcNow", 0, grant), grant)
+        # r8 (LEASE-BATCH-ADV-A2-GRANT-STAMP-PIN-1, sol r7): a bounded window again, not "anywhere before". The stamp is the one assignment of $grantReadUtc in the file, and the
+        # first statement after the request's try/catch: after its REQUEST_THREW stand-in and before the first read of the grant, at most 200 characters on, in the same loop as the guard.
+        self.assertEqual(text.count("$grantReadUtc = "), 1)
+        request_end = text.rindex("state = 'REQUEST_THREW' }", 0, grant) + len("state = 'REQUEST_THREW' }")
+        stamp = text.index("$grantReadUtc = [DateTime]::UtcNow", request_end)
+        first_read = text.index("if (-not $req.granted) { if ($script:claimWait.denied -eq 0)", request_end)
+        self.assertLess(stamp, first_read)
+        self.assertLessEqual(first_read - request_end, 200, "the grant-stamp window grew: the stamp must stay right after the claim request")
+        self.assertLess(first_read, grant)
         # r4 (sol r3 B1): the whole guard runs under that budget (Invoke-InputGuard), not only its manifest and artifact reads
         call, clear = text.index("try { $hit = Invoke-InputGuard }", grant), text.index("$script:guardBudget = $null", grant)
         self.assertLess(grant, call)
@@ -6048,7 +6056,7 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
                   f"$w = @(if (Test-Path '{log}\\requests.log') {{ [IO.File]::ReadAllLines('{log}\\requests.log') }}); $rel = @(if (Test-Path '{log}\\releases.log') {{ [IO.File]::ReadAllLines('{log}\\releases.log') }})\n"
                   "[Console]::Out.WriteLine(([pscustomobject]@{ requests = $script:requests + $w.Count; workerRequests = $w.Count; guards = $script:guards; refused = $script:refused; refusedAt = $script:refusedAt; ended = $ended; deadlineSec = "
                   f"{deadline_sec}; thrown = $script:thrown; claim = $(if ($claim) {{ [string]$claim.nonce }}); releases = $rel; abandoned = (& (Get-Module VenueChain) {{ $script:VenueAbandonedReads }})\n"
-                  "    budgets = @($script:budgets); budgetRooms = @($script:budgetRooms); aliasedAtRefusal = [bool]$script:aliasedAtRefusal } | ConvertTo-Json -Compress)); [Console]::Out.Flush()\n"
+                  "    budgets = @($script:budgets); budgetRooms = @($script:budgetRooms); aliasedAtRefusal = [bool]$script:aliasedAtRefusal; probes = [int]$script:probes } | ConvertTo-Json -Compress)); [Console]::Out.Flush()\n"
                   "[Environment]::Exit(0)\n")
         try:
             r = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, timeout=60)
@@ -6203,6 +6211,52 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
         # adversary r7 A1: a release given up on (or never started) turns the write suppression on
         self.assertEqual((past["aliased"], short["aliased"]), (True, True), got)
         self.assertIn("start:ok-n", got["log"], got)
+
+    # r8 (sol r7 blocker): a retry grant's release that THROWS (the claim share's ReadToEnd or Delete raising IOException, through EndInvoke) returned NO_ANSWER with the write
+    # suppression still off, so the refusal or log line after it probed -RunDir unbounded (Stop-PlanRefused's batch.log look and write guard, L's write guard). The runner's own
+    # Stop-InputIsOutput, Get-HitRefusal, Stop-PlanRefused (its exit made a throw), L and Test-RunDirWrite are lifted; every -RunDir probe they make (Wait-RunDirReadSeam, the write
+    # guard's Get-WriteDestinationHit) stalls 5 s, as a -RunDir on the share that just failed would. One row per caller of Invoke-ClaimRetryRelease.
+    RELEASE_PROBE_MS = 5000
+
+    def _retry_release_throws(self, site: str) -> dict:
+        stub = Path(tempfile.mkdtemp(prefix="retry-rel-throw-", dir=self.case))
+        lift = ("foreach ($n in 'Stop-InputIsOutput', 'Get-HitRefusal', 'L', 'Test-RunDirWrite') { . ([scriptblock]::Create($ast.Find({ param($x) $x -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $x.Name -eq $n }, $true).Extent.Text)) }\n"
+                "$sp = $ast.Find({ param($x) $x -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $x.Name -eq 'Stop-PlanRefused' }, $true).Extent.Text\n"
+                "if ([regex]::Matches($sp, '(?m)^\\s*exit 2\\s*$').Count -ne 1) { throw 'the refusal exit anchor moved' }\n"
+                "$m = [regex]::Match($sp, '(?m)^\\s*exit 2\\s*$'); . ([scriptblock]::Create($sp.Remove($m.Index, $m.Length).Insert($m.Index, ' $script:refusedAt = $clock.Elapsed.TotalSeconds; $script:refused = $line; $script:aliasedAtRefusal = [bool]$script:RunOutputAliased; throw ''REFUSED''')))\n"
+                "function Complete-VenueProcess { param($ExitCode) }\n"
+                "function Wait-RunDirReadSeam { $script:probes++; [Threading.Thread]::Sleep(" + str(self.RELEASE_PROBE_MS) + ") }\n"
+                "function Get-WriteDestinationHit { param($Path, [switch]$Directory) $script:probes++; [Threading.Thread]::Sleep(" + str(self.RELEASE_PROBE_MS) + "); $null }\n"
+                "$script:RunOutputAliased = $false; $script:suppressionHit = $null; $script:summaryBeforeExit = $null; $script:probes = 0; $legPlanMode = $false; $batchLog = '" + psq(stub) + "\\batch.log'\n")
+        retry_guard = "function Invoke-InputGuard { $script:guards++; if (-not $req.granted) { return [pscustomobject]@{ kind = 'content'; item = 1; code = 'SHARE_UNREACHABLE'; noAnswer = $true; readAbandoned = $true; locationUnknown = $true; why = 'WHY' } }; "
+        granted = {
+            # :1925 -- the granted guard ANSWERS a failure (no location unknown, no suppression of its own); the refusal is Stop-InputIsOutput's
+            "answered": (retry_guard + "[pscustomobject]@{ kind = 'content'; item = 1; code = 'LEG_SPEC_INVALID'; why = 'WHY' } }\n", 6),
+            # :1898 -- the granted guard throws; the refusal is Stop-PlanRefused LEG_PLAN_INVALID
+            "threw": (retry_guard + "throw 'the guard went' }\n", 6),
+            # :1943 -- the granted guard answers clean but outlasts -ClaimTtlSec less -ClaimRenewSec (4 less 1 here): the claim is let go and CLAIM_LAPSED_IN_GUARD is logged (L)
+            "lapsed": (retry_guard + "[Threading.Thread]::Sleep(3100); $null }\n$ClaimTtlSec = 4; $ClaimRenewSec = 1\n"
+                       "function LogBest { param($m) if ($m -clike 'CLAIM_LAPSED_IN_GUARD*') { L $m | Out-Null; $script:refusedAt = $clock.Elapsed.TotalSeconds; $script:refused = $m; $script:aliasedAtRefusal = [bool]$script:RunOutputAliased; throw 'REFUSED' } }\n", 8),
+        }[site]
+        d = self._retry_request_loop("[pscustomobject]@{ granted = $true; broken = @(); claim = [pscustomobject]@{ nonce = 'throw-n' }; state = 'TAKEN' }", granted[1],
+                                     extra=lift + granted[0],
+                                     release="throw [IO.IOException]::new('the claim share went'); ")
+        return d
+
+    def test_artifact_preflight_claim_wait_r8_a_retry_release_that_throws_turns_the_suppression_on_at_every_caller(self) -> None:
+        # sol r7 blocker, at each of Invoke-ClaimRetryRelease's three callers: the retry is granted at once, the release throws IOException through EndInvoke, and what follows
+        # (the typed refusal, or CLAIM_LAPSED_IN_GUARD's log line) must make no -RunDir probe and print before -DeadlineUtc. Before r8 each made 1-2 probes (5 s each here), past
+        # the deadline. ~3 s, ~3 s and ~6 s green.
+        for site, start in (("answered", "LEG_PLAN_REFUSED reason=LEG_SPEC_INVALID item=1 WHY"), ("threw", "LEG_PLAN_REFUSED reason=LEG_PLAN_INVALID the plan could not be re-validated once the claim was held: the guard went"),
+                            ("lapsed", "CLAIM_LAPSED_IN_GUARD batch=1 ")):
+            with self.subTest(site=site):
+                d = self._retry_release_throws(site)
+                self.assertEqual((d["requests"], d["workerRequests"], d["guards"], d["claim"], d["thrown"]), (2, 1, 2, None, ""), d)
+                self.assertTrue(d["refused"].startswith(start), d)
+                self.assertEqual((d["abandoned"], d["releases"]), (0, []), f"the release threw (it answered, with an exception): nothing was given up on: {d}")
+                self.assertTrue(d["aliasedAtRefusal"], f"a release that threw left the write suppression off: {d}")
+                self.assertEqual(d["probes"], 0, f"the refusal after a release that threw probed -RunDir: {d}")
+                self.assertLess(d["refusedAt"], d["deadlineSec"], f"the refusal after a release that threw printed past the deadline: {d}")
 
     def test_artifact_preflight_claim_wait_r6_a_fast_retry_request_is_unchanged(self) -> None:
         # INV-1 controls: a retry request that is denied at once still loops (three unfinished passes, then the refusal, as in r5); one that grants at once with room proceeds, its guard
