@@ -547,6 +547,7 @@ TEST(LookLabelPolicy, A1r15AnInvalidatedAnalysisReleasesTheMarkerSoTurningItBack
 namespace
 {
 // updateLookLabel's derivation (MainWindow.cpp), for the owner row's receipt `owner` and the applied key `applied`.
+// r16: the grade is the one `previous` was derived for (no setSliders, landing or new key since), as in the paste case.
 std::string derivedLabel(const QString &previous, const lookassist::LookAssistFlavorOutcome &outcome, const void *applied,
                          const void *owner, bool ownerSwitch, bool ownerIsActive, bool slidersAttached, bool checkbox,
                          bool recordedCloneSwitch = false)
@@ -556,10 +557,134 @@ std::string derivedLabel(const QString &previous, const lookassist::LookAssistFl
                                                    look_label::selectorDescribesOwner(ownerIsActive, slidersAttached), checkbox);
     const void *key = lookOn ? look_label::outcomeKey(applied, owner) : nullptr;
     const bool keepText = look_label::keepsTextWithoutOwner(true, owner ? 0 : -1)
-                       || look_label::keepsTextForInactiveOwner(true, applied, owner, ownerIsActive, slidersAttached, !previous.isEmpty());
+                       || look_label::keepsTextForInactiveOwner(true, applied, owner, ownerIsActive, slidersAttached, !previous.isEmpty(),
+                                                                true);
     return (keepText ? previous : look_label::shownText(lookOn, outcome, key, QString())).toStdString();
 }
+
+// r16 (adversary r15 1834b72e A1): updateLookLabel with its state -- the text, the grade it was derived for and setSliders'
+// count (MainWindow::setSliders bumps it before it touches a slider). Same calls, same order as MainWindow.cpp.
+struct LabelModel
+{
+    QString text;
+    look_label::LabelGrade derived;
+    quint64 slidersApplied = 0;
+
+    std::string update(const lookassist::LookAssistFlavorOutcome &outcome, const void *applied, const void *owner, bool ownerSwitch,
+                       bool ownerIsActive, bool slidersAttached, bool checkbox)
+    {
+        const bool lookSwitch = look_label::appliedLookSwitch(applied, owner, ownerSwitch, false);
+        const bool lookOn = look_label::lookOnForOwner(owner != nullptr, lookSwitch,
+                                                       look_label::selectorDescribesOwner(ownerIsActive, slidersAttached), checkbox);
+        const void *key = lookOn ? look_label::outcomeKey(applied, owner) : nullptr;
+        const look_label::LabelGrade grade = look_label::labelGrade(look_label::outcomeKey(applied, owner), slidersApplied, outcome);
+        const bool keepText = look_label::keepsTextWithoutOwner(true, owner ? 0 : -1)
+                           || look_label::keepsTextForInactiveOwner(true, applied, owner, ownerIsActive, slidersAttached, !text.isEmpty(),
+                                                                    look_label::sameGrade(grade, derived));
+        if (!keepText) derived = grade;
+        if (!keepText) text = look_label::shownText(lookOn, outcome, key, QString());
+        return text.toStdString();
+    }
+};
 } // namespace
+
+// Adversary r15 (1834b72e) A1, introduced by r15's keepsTextForInactiveOwner. Rows A=0 and B=1 share C:\clips\P.mlv. A has Look
+// Assist on, a valid baseline (exposure 0), a prior landed flavor and the applied marker; B is off. showFileInEditor(0) receives a
+// same-path FileOpen during its open event pump that opens the last row, B (B derives "Look: Off"); the duplicate-file dialog is
+// dismissed; the outer opener records A and setSliders(A) restores and marks A's baseline, and the marker skips the analysis.
+// RED on 1834b72e: A is not the active row, so the freeze kept "Look: Off" over A's enabled baseline (sol r13 B1 / B1r14 broke).
+TEST(LookLabelPolicy, A1r16AnOpenRegradingAnInactiveOwnerReDerivesItsLabel)
+{
+    int receiptA = 0, receiptB = 0;
+    const void *receipts[] = { &receiptA, &receiptB };
+    const int rowA = 0, rowB = 1, rows = 2, activeAfterPump = rowB;
+    const auto bothHoldPath = [](int) { return true; };
+    const char *flavors[] = { "cinematic", "film", "vision50d" };
+    for( const char *flavorName : flavors )
+    {
+        const QString flavor = QString::fromLatin1(flavorName);
+        lookassist::LookAssistFlavorOutcome outcome;
+        lookassist::LookAssistAppliedMarker marker;
+        outcome.landed(&receiptA, flavor, false);   // A was graded before
+        marker.markApplied(&receiptA);              // ... and the de-dupe marker names it
+        LabelModel label;
+        // The nested open of B: B is recorded (active, attached), setSliders(B) takes the disabled branch, the label derives Off.
+        ++label.slidersApplied;
+        ASSERT_EQ(std::string("Look: Off"), label.update(outcome, &receiptB, &receiptB, false, true, true, false));
+        // The dialog is dismissed; the outer opener records the row it applies (r13), then setSliders(A).
+        const int recorded = look_label::loadedClipOwnerRow(look_label::openRecordRow(rowA, activeAfterPump), rows, bothHoldPath);
+        ASSERT_EQ(rowA, recorded);
+        const void *applied = receipts[recorded];
+        ++label.slidersApplied;
+        label.update(outcome, applied, &receiptA, true, false, true, true);   // setSliders' "both signals were blocked" relabel
+        if( look_label::restoreMarksBaseline(&receiptA, applied, receipts[activeAfterPump]) ) outcome.baselineRestored(&receiptA);
+        ASSERT_TRUE(marker.isApplied(&receiptA));   // the analysis is skipped: nothing lands to correct the label
+        const std::string shown = label.update(outcome, applied, &receiptA, true, false, true, true);   // "the baseline is back"
+        printf("[A1r16] flavor=%s label=\"%s\"\n", flavorName, shown.c_str());
+        ASSERT_EQ(std::string("Look: Baseline"), shown);
+        // A later re-derivation with nothing regraded (F11) keeps it.
+        ASSERT_EQ(std::string("Look: Baseline"), label.update(outcome, applied, &receiptA, true, false, true, true));
+    }
+}
+
+// The siblings of A1r16: every regrade of an inactive owner re-derives, and the r15 paste case still keeps its text.
+TEST(LookLabelPolicy, A1r16EveryRegradeOfAnInactiveOwnerReDerivesAndAPasteStillKeeps)
+{
+    int receiptA = 0, receiptB = 0;
+    const QString cinematic = QStringLiteral("cinematic");
+    {
+        // The mirror: A is OFF and B (on, Cinematic landed) is opened in A's pump. The outer setSliders(A) restores A's
+        // baseline with Look Assist off: "Look: Off", not B's Cinematic.
+        lookassist::LookAssistFlavorOutcome outcome;
+        outcome.landed(&receiptB, cinematic, false);
+        LabelModel label;
+        ++label.slidersApplied;
+        ASSERT_EQ(std::string("Look: Cinematic"), label.update(outcome, &receiptB, &receiptB, true, true, true, true));
+        ++label.slidersApplied;
+        ASSERT_EQ(std::string("Look: Off"), label.update(outcome, &receiptA, &receiptA, false, false, true, false));
+    }
+    {
+        // The same key: A (Cinematic) was labelled while active; B became active with no setSliders; then a reopen of A applies
+        // A again with B active (B's open never relabelled). The baseline mark re-derives; so does a later landing on A.
+        lookassist::LookAssistFlavorOutcome outcome;
+        outcome.landed(&receiptA, cinematic, false);
+        LabelModel label;
+        ++label.slidersApplied;
+        ASSERT_EQ(std::string("Look: Cinematic"), label.update(outcome, &receiptA, &receiptA, true, true, true, true));
+        ++label.slidersApplied;
+        outcome.baselineRestored(&receiptA);
+        ASSERT_EQ(std::string("Look: Baseline"), label.update(outcome, &receiptA, &receiptA, true, false, true, true));
+        outcome.landed(&receiptA, QStringLiteral("film"), false);
+        ASSERT_EQ(std::string("Look: Film grade"), label.update(outcome, &receiptA, &receiptA, true, false, true, true));
+        // A setSliders of A after a disabled paste onto it (A off now) is a regrade too: "Look: Off".
+        ++label.slidersApplied;
+        ASSERT_EQ(std::string("Look: Off"), label.update(outcome, &receiptA, &receiptA, false, false, true, false));
+    }
+    {
+        // The r15 paste case (adversary r15 f2588355 A1) stays kept: no setSliders, no landing, the same key.
+        lookassist::LookAssistFlavorOutcome outcome;
+        outcome.landed(&receiptA, cinematic, false);
+        LabelModel label;
+        ++label.slidersApplied;
+        ASSERT_EQ(std::string("Look: Cinematic"), label.update(outcome, &receiptA, &receiptA, true, true, true, true));
+        for( const bool attached : { true, false } )
+            ASSERT_EQ(std::string("Look: Cinematic"), label.update(outcome, &receiptA, &receiptA, false, false, attached, true));
+    }
+    // The literal grade rule.
+    lookassist::LookAssistFlavorOutcome outcome;
+    outcome.landed(&receiptA, cinematic, false);
+    const look_label::LabelGrade g = look_label::labelGrade(&receiptA, 3, outcome);
+    ASSERT_TRUE(look_label::sameGrade(g, look_label::labelGrade(&receiptA, 3, outcome)));
+    ASSERT_FALSE(look_label::sameGrade(g, look_label::LabelGrade()));                          // never derived
+    ASSERT_FALSE(look_label::sameGrade(look_label::LabelGrade(), look_label::LabelGrade()));
+    ASSERT_FALSE(look_label::sameGrade(look_label::labelGrade(&receiptB, 3, outcome), g));     // a new key
+    ASSERT_FALSE(look_label::sameGrade(look_label::labelGrade(&receiptA, 4, outcome), g));     // a setSliders
+    outcome.baselineRestored(&receiptA);
+    ASSERT_FALSE(look_label::sameGrade(look_label::labelGrade(&receiptA, 3, outcome), g));     // a baseline mark
+    outcome.landed(&receiptA, cinematic, true);
+    ASSERT_FALSE(look_label::sameGrade(look_label::labelGrade(&receiptA, 3, outcome), g));     // a fallback landing
+    ASSERT_FALSE(look_label::keepsTextForInactiveOwner(true, &receiptA, &receiptA, false, true, true, false));
+}
 
 // Adversary r15 (f2588355) A1. Rows A=0 and B=1 share one path; A owns the loaded clip and is the applied key, with Cinematic
 // landed; B is active. A paste with Look Assist off (Raw Correction Enable selected) onto A writes A's switch, but A is not the
@@ -590,14 +715,16 @@ TEST(LookLabelPolicy, A1r15APasteOntoAnInactiveOwnerNeverRelabelsItsUnchangedGra
     // Never derived yet (empty): derived.
     ASSERT_EQ(std::string("Look: Off"), derivedLabel(QString(), outcome, &receiptA, &receiptA, false, false, true, true));
     // The literal rule.
-    ASSERT_TRUE(look_label::keepsTextForInactiveOwner(true, &receiptA, &receiptA, false, true, true));
-    ASSERT_TRUE(look_label::keepsTextForInactiveOwner(true, nullptr, &receiptA, false, true, true));
-    ASSERT_TRUE(look_label::keepsTextForInactiveOwner(true, &receiptA, &receiptA, true, false, true));   // detached active owner
-    ASSERT_FALSE(look_label::keepsTextForInactiveOwner(true, &receiptA, &receiptA, true, true, true));
-    ASSERT_FALSE(look_label::keepsTextForInactiveOwner(true, &cloneQ, &receiptA, false, true, true));
-    ASSERT_FALSE(look_label::keepsTextForInactiveOwner(true, &receiptA, nullptr, false, true, true));
-    ASSERT_FALSE(look_label::keepsTextForInactiveOwner(false, &receiptA, &receiptA, false, true, true));
-    ASSERT_FALSE(look_label::keepsTextForInactiveOwner(true, &receiptA, &receiptA, false, true, false));
+    // r16: the seventh argument is sameGrade (true here: nothing regraded since the text was derived).
+    ASSERT_TRUE(look_label::keepsTextForInactiveOwner(true, &receiptA, &receiptA, false, true, true, true));
+    ASSERT_TRUE(look_label::keepsTextForInactiveOwner(true, nullptr, &receiptA, false, true, true, true));
+    ASSERT_TRUE(look_label::keepsTextForInactiveOwner(true, &receiptA, &receiptA, true, false, true, true));   // detached active owner
+    ASSERT_FALSE(look_label::keepsTextForInactiveOwner(true, &receiptA, &receiptA, true, true, true, true));
+    ASSERT_FALSE(look_label::keepsTextForInactiveOwner(true, &cloneQ, &receiptA, false, true, true, true));
+    ASSERT_FALSE(look_label::keepsTextForInactiveOwner(true, &receiptA, nullptr, false, true, true, true));
+    ASSERT_FALSE(look_label::keepsTextForInactiveOwner(false, &receiptA, &receiptA, false, true, true, true));
+    ASSERT_FALSE(look_label::keepsTextForInactiveOwner(true, &receiptA, &receiptA, false, true, false, true));
+    ASSERT_FALSE(look_label::keepsTextForInactiveOwner(true, &receiptA, &receiptA, false, true, true, false));   // regraded
 }
 
 // The controls: Look Assist still on at delivery lands as before, and a disabled paste onto ANOTHER row (multi-select paste,
@@ -929,7 +1056,21 @@ TEST(LookLabelWiring, A1UpdateLookLabelDerivesFromTheOwnerNeverTheActiveReceipt)
     ASSERT_TRUE(update.contains(QStringLiteral(
         "|| look_label::keepsTextForInactiveOwner( m_fileLoaded, m_lookLabelAppliedReceipt, owner,\n"
         "                                                                 owner && ownerRow == SESSION_ACTIVE_CLIP_ROW,\n"
-        "                                                                 !m_slidersDetachedFromReceipt, !m_lookLabelText.isEmpty() );")));
+        "                                                                 !m_slidersDetachedFromReceipt, !m_lookLabelText.isEmpty(),\n"
+        "                                                                 look_label::sameGrade( grade, m_lookLabelDerivedGrade ) );")));
+    // r16 (adversary r15 1834b72e A1): only while the grade is the one the text was derived for. The grade is keyed like the
+    // outcome, a derivation records it before the no-change return, and every setSliders that touches a slider counts.
+    ASSERT_TRUE(update.contains(QStringLiteral(
+        "look_label::labelGrade( look_label::outcomeKey( m_lookLabelAppliedReceipt, owner ),\n"
+        "                                                                 m_lookLabelSlidersApplied, m_lookAssistFlavorOutcome );")));
+    const int recorded = update.indexOf(QStringLiteral("if( !keepText ) m_lookLabelDerivedGrade = grade;"));
+    ASSERT_TRUE(recorded >= 0 && recorded < update.indexOf(QStringLiteral("if( text == m_lookLabelText && fullscreenShown == m_lookLabelFullscreenShown ) return;")));
+    ASSERT_EQ(1, mw.count(QStringLiteral("m_lookLabelDerivedGrade = ")));
+    const QString sliders = functionBody(mw, QStringLiteral("void MainWindow::setSliders(ReceiptSettings *receipt, bool paste)"));
+    const int bump = sliders.indexOf(QStringLiteral("++m_lookLabelSlidersApplied;"));
+    ASSERT_TRUE(bump > sliders.indexOf(QStringLiteral("if( m_slidersDetachedFromReceipt )"))
+                && bump < sliders.indexOf(QStringLiteral("ui->horizontalSliderExposure->setValue( receipt->exposure() );")));
+    ASSERT_EQ(2, mw.count(QStringLiteral("m_lookLabelSlidersApplied")));   // the bump, and the grade read in updateLookLabel
     // Called from settings loading before the session model exists: the model is read only once a clip is loaded.
     ASSERT_TRUE(update.contains(QStringLiteral("const int ownerRow = !m_fileLoaded ? -1 : look_label::loadedClipOwnerRow(")));
     // The pump A1 used still sits between the activation and the loader.

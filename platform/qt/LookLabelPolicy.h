@@ -179,16 +179,49 @@ inline bool keepsTextWithoutOwner( bool clipLoaded, int ownerRow )
     return clipLoaded && ownerRow < 0;
 }
 
-/*! \brief r15 (adversary r15 f2588355 A1): the label also keeps its text while the receipt applied to the loaded clip is the
- *  owner's own and the owner is not the active row with attached sliders. Nothing can regrade that clip then: the switch, the
- *  flavor, Reset Receipt and the async landing all refuse at receiptOwnedByLoadedClip, and a paste reaches setSliders only for
- *  the active row. A paste onto the owner's row still writes its switch, though, so reading it relabelled an unchanged Cinematic
- *  grade "Look: Off". An export clone's key (applied is not the owner) and a new open (it records a row) still re-derive, and a
- *  label never derived yet (empty) is derived. */
-inline bool keepsTextForInactiveOwner( bool clipLoaded, const void *appliedReceipt, const void *ownerReceipt, bool ownerIsActiveRow,
-                                       bool slidersAttached, bool hasText )
+/*! \brief r16 (adversary r15 1834b72e A1): the grade a label text was derived for. It is the outcome key (the receipt applied to the
+ *  loaded clip, else the owner), the count of setSliders applications to the sliders (every one regrades the loaded clip: a new
+ *  open's apply, a baseline restore, a disabled receipt's restore) and the text the outcome names for that key when the look is
+ *  on (it changes when an analysis lands or a baseline is marked). The switch is deliberately not part of it: it is the one input
+ *  a paste can change on an inactive owner without regrading. */
+struct LabelGrade
 {
-    return clipLoaded && hasText && ownerReceipt != nullptr
+    const void *key = nullptr;
+    quint64 slidersApplied = 0;
+    QString onText;
+    bool valid = false;
+};
+
+inline LabelGrade labelGrade( const void *key, quint64 slidersApplied, const lookassist::LookAssistFlavorOutcome &outcome )
+{
+    LabelGrade grade;
+    grade.key = key;
+    grade.slidersApplied = slidersApplied;
+    grade.onText = shownText( true, outcome, key, QString() );
+    grade.valid = true;
+    return grade;
+}
+
+/*! \brief r16: the grade on screen is still the one the kept text was derived for. A label never derived (invalid) never is. */
+inline bool sameGrade( const LabelGrade &now, const LabelGrade &derived )
+{
+    return now.valid && derived.valid && now.key == derived.key && now.slidersApplied == derived.slidersApplied
+        && now.onText == derived.onText;
+}
+
+/*! \brief r15 (adversary r15 f2588355 A1): the label also keeps its text while the receipt applied to the loaded clip is the
+ *  owner's own and the owner is not the active row with attached sliders. The switch, the flavor, Reset Receipt and the async
+ *  landing all refuse at receiptOwnedByLoadedClip then, and a paste reaches setSliders only for the active row. A paste onto the
+ *  owner's row still writes its switch, though, so reading it relabelled an unchanged Cinematic grade "Look: Off". An export
+ *  clone's key (applied is not the owner) still re-derives, and a label never derived yet (empty) is derived.
+ *  r16 (adversary r15 1834b72e A1): only while the grade is the one the text was derived for (`sameGradeAsDerived`, sameGrade).
+ *  An inactive owner IS regraded by an open: showFileInEditor(A) whose event pump opened a same-path row B (B derives "Look: Off")
+ *  then records A and setSliders(A) restores and marks A's baseline while B is active. Keeping "Look: Off" over that broke
+ *  sol r13 B1; a new key, a setSliders application or a landing (or a baseline mark) on the key re-derives. */
+inline bool keepsTextForInactiveOwner( bool clipLoaded, const void *appliedReceipt, const void *ownerReceipt, bool ownerIsActiveRow,
+                                       bool slidersAttached, bool hasText, bool sameGradeAsDerived )
+{
+    return clipLoaded && hasText && sameGradeAsDerived && ownerReceipt != nullptr
         && ( appliedReceipt == nullptr || appliedReceipt == ownerReceipt )
         && !( ownerIsActiveRow && slidersAttached );
 }

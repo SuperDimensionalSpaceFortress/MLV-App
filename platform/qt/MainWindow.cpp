@@ -16138,6 +16138,7 @@ void MainWindow::setSliders(ReceiptSettings *receipt, bool paste)
     }
     invalidateGpuPreviewProcessingConfigCache();
     m_setSliders = true;
+    ++m_lookLabelSlidersApplied;   // r16 (adversary r15 1834b72e A1): a regrade, so a kept look label re-derives (sameGrade)
     ui->horizontalSliderExposure->setValue( receipt->exposure() );
     ui->horizontalSliderContrast->setValue( receipt->contrast() );
     ui->horizontalSliderPivot->setValue( receipt->pivot() );
@@ -31792,12 +31793,17 @@ void MainWindow::updateLookLabel( void )
     // r12b (adversary r12 A1): the outcome is read under the receipt applied to this clip. An export job grades a clone of
     // the row's receipt, and a failed final reopen leaves that job's clip and grade loaded.
     const void *lookReceipt = lookOn ? look_label::outcomeKey( m_lookLabelAppliedReceipt, owner ) : nullptr;
-    // r15 (adversary r15 f2588355 A1): an owner that is not the active row with attached sliders cannot be regraded, but a paste
-    // onto its row still writes its switch; its text is kept, so an unchanged grade is never relabelled "Look: Off".
+    // r15 (adversary r15 f2588355 A1): a paste onto an inactive owner's row writes its switch without regrading; its text is
+    // kept, so an unchanged grade is never relabelled "Look: Off". r16 (adversary r15 1834b72e A1): only while the grade is the
+    // one the text was derived for -- an open's setSliders, a landing or a baseline mark on the key re-derives.
+    const look_label::LabelGrade grade = look_label::labelGrade( look_label::outcomeKey( m_lookLabelAppliedReceipt, owner ),
+                                                                 m_lookLabelSlidersApplied, m_lookAssistFlavorOutcome );
     const bool keepText = look_label::keepsTextWithoutOwner( m_fileLoaded, ownerRow )
                        || look_label::keepsTextForInactiveOwner( m_fileLoaded, m_lookLabelAppliedReceipt, owner,
                                                                  owner && ownerRow == SESSION_ACTIVE_CLIP_ROW,
-                                                                 !m_slidersDetachedFromReceipt, !m_lookLabelText.isEmpty() );
+                                                                 !m_slidersDetachedFromReceipt, !m_lookLabelText.isEmpty(),
+                                                                 look_label::sameGrade( grade, m_lookLabelDerivedGrade ) );
+    if( !keepText ) m_lookLabelDerivedGrade = grade;
     const QString text = keepText ? m_lookLabelText : look_label::shownText(
         lookOn, m_lookAssistFlavorOutcome, lookReceipt, lookAssistFlavorName( currentLookAssistFlavor() ) );
     const bool fullscreenShown =

@@ -30,6 +30,7 @@
 #include <QItemSelectionModel>
 #include <QToolButton>
 #include "../../src/batch/LookAssistAnalysis.h"   // LookAssistFlavor, and the LookAssistAppliedMarker member below
+#include "LookLabelPolicy.h"                        // look_label::LabelGrade member below (r16)
 #include "SessionModel.h"
 #include "PlaybackFrameRange.h"
 #include "PlaybackNativePaceGuard.h"
@@ -919,6 +920,10 @@ private:
     const void *m_lookLabelAppliedReceipt = nullptr;
     // r13: the export clone's Look Assist switch, recorded with the clone as the key (look_label::appliedLookSwitch).
     bool m_lookLabelAppliedCloneLookAssist = false;
+    // r16 (adversary r15 1834b72e A1): setSliders applications so far, and the grade the label text was last derived for. An
+    // inactive owner's text is kept only while the grade is unchanged (look_label::sameGrade).
+    quint64 m_lookLabelSlidersApplied = 0;
+    look_label::LabelGrade m_lookLabelDerivedGrade;
     unsigned long long m_receiptWriteSkipLoggedGeneration = ~0ull;
     bool m_exportInProgress = false;
     // r4 (adversary A3): bumped at each export batch start; a retry timer of an earlier batch is a no-op.
