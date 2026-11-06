@@ -6218,7 +6218,7 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
     # guard's Get-WriteDestinationHit) stalls 5 s, as a -RunDir on the share that just failed would. One row per caller of Invoke-ClaimRetryRelease.
     RELEASE_PROBE_MS = 5000
 
-    def _retry_release_throws(self, site: str) -> dict:
+    def _retry_release_throws(self, site: str, release: str = "throw [IO.IOException]::new('the claim share went'); ") -> dict:
         stub = Path(tempfile.mkdtemp(prefix="retry-rel-throw-", dir=self.case))
         lift = ("foreach ($n in 'Stop-InputIsOutput', 'Get-HitRefusal', 'L', 'Test-RunDirWrite') { . ([scriptblock]::Create($ast.Find({ param($x) $x -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $x.Name -eq $n }, $true).Extent.Text)) }\n"
                 "$sp = $ast.Find({ param($x) $x -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $x.Name -eq 'Stop-PlanRefused' }, $true).Extent.Text\n"
@@ -6240,7 +6240,7 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
         }[site]
         d = self._retry_request_loop("[pscustomobject]@{ granted = $true; broken = @(); claim = [pscustomobject]@{ nonce = 'throw-n' }; state = 'TAKEN' }", granted[1],
                                      extra=lift + granted[0],
-                                     release="throw [IO.IOException]::new('the claim share went'); ")
+                                     release=release)
         return d
 
     def test_artifact_preflight_claim_wait_r8_a_retry_release_that_throws_turns_the_suppression_on_at_every_caller(self) -> None:
@@ -6257,6 +6257,14 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
                 self.assertTrue(d["aliasedAtRefusal"], f"a release that threw left the write suppression off: {d}")
                 self.assertEqual(d["probes"], 0, f"the refusal after a release that threw probed -RunDir: {d}")
                 self.assertLess(d["refusedAt"], d["deadlineSec"], f"the refusal after a release that threw printed past the deadline: {d}")
+        # r8 pass 1 (adversary r8 A1): a release that ANSWERS but releases nothing (BUSY: the claim is still there, five opens of it refused, in 750 ms here) is not a release
+        # either: only RELEASED, NOT_OURS or ABSENT leave the suppression off. ~3 s.
+        d = self._retry_release_throws("answered", release="[Threading.Thread]::Sleep(750); return 'BUSY'; ")
+        self.assertEqual((d["guards"], d["claim"], d["thrown"], d["abandoned"], d["releases"]), (2, None, "", 0, []), d)
+        self.assertTrue(d["refused"].startswith("LEG_PLAN_REFUSED reason=LEG_SPEC_INVALID item=1 WHY"), d)
+        self.assertTrue(d["aliasedAtRefusal"], f"a release that answered BUSY left the write suppression off: {d}")
+        self.assertEqual(d["probes"], 0, f"the refusal after a release that answered BUSY probed -RunDir: {d}")
+        self.assertLess(d["refusedAt"], d["deadlineSec"], d)
 
     def test_artifact_preflight_claim_wait_r6_a_fast_retry_request_is_unchanged(self) -> None:
         # INV-1 controls: a retry request that is denied at once still loops (three unfinished passes, then the refusal, as in r5); one that grants at once with room proceeds, its guard

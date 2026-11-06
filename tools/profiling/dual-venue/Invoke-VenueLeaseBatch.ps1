@@ -801,7 +801,8 @@ function Invoke-ClaimRetryRelease([DateTime]$DeadlineUtc, [string]$Nonce) {
     # r7 pass 2 (adversary r7 A1): a release given up on (or never started) turns the write suppression on before it returns: the claim share did not answer, -RunDir may sit on the
     # same share, and the refusal or log line that follows must not probe batch.log there unbounded (Stop-PlanRefused, L via Test-RunDirWrite). Said on stderr only from then on.
     # r8 (sol r7 blocker): a release that THREW (the claim share's read or delete raising through EndInvoke, or the worker not created) returned NO_ANSWER with it still off. Now every
-    # exit turns it on in ONE place, the outer finally, unless the worker's answer was read back ($answered): no room, no answer in the wait, a throw, and any exit added later.
+    # exit turns it on in ONE place, the outer finally, unless the worker's answer was read back and is a release ($answered): no room, no answer in the wait, a throw, an answer
+    # that released nothing (BUSY), and any exit added later.
     $suppress = {
         param([string]$Why)
         if (-not $script:RunOutputAliased) {
@@ -828,7 +829,12 @@ function Invoke-ClaimRetryRelease([DateTime]$DeadlineUtc, [string]$Nonce) {
                 $why = "did not answer in $([Math]::Round($sec, 2)) s"
                 return "NO_ANSWER (no answer in $([Math]::Round($sec, 2)) s)"
             }
-            $answer = [string]@($ps.EndInvoke($async))[-1]; $answered = $true; $answer
+            # r8 pass 1 (adversary r8 A1): an answer that released nothing (BUSY: the claim is still there and its opens were refused) is no release either; only one that leaves
+            # no claim of this nonce behind (Release-VenueClaim's RELEASED, NOT_OURS or ABSENT) keeps the suppression off
+            $answer = [string]@($ps.EndInvoke($async))[-1]
+            $answered = $answer -cin @('RELEASED', 'NOT_OURS', 'ABSENT')
+            if (-not $answered) { $why = "answered '$answer', which released nothing" }
+            $answer
         } catch { $thrown = $_.Exception.Message -replace '\s+', ' '; $why = "threw ($thrown)"; "NO_ANSWER ($thrown)" }
         finally { if ($null -ne $ps -and -not $abandoned) { $ps.Dispose() } }
     } finally { if (-not $answered) { . $suppress $why } }
