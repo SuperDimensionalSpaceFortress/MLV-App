@@ -7,6 +7,7 @@
 #include "../../platform/qt/LookAssistAnalysisPump.h"
 
 #include <QCoreApplication>
+#include <QDir>
 #include <QEvent>
 #include <QFile>
 #include <QString>
@@ -612,6 +613,46 @@ TEST(LookAssistAnalysisPumpWiring, AQt5BuildAnalysesInlineAndNeverClonesAnEvent)
     const int otherwise = header.indexOf( QStringLiteral( "#else" ), guard );
     ASSERT_TRUE( guard >= 0 && guard < clone && clone < otherwise );
     ASSERT_TRUE( look_assist_pump::kWorkerRouteAvailable == ( QT_VERSION >= QT_VERSION_CHECK( 6, 0, 0 ) ) );
+}
+
+// Adversary A1 on bc612c7c (r4): a resize is not user input, so a pump turn delivers it. Curves and HueVsDiagram wrote their
+// active curve into the live processing object on every resize (processingSetHueVsCurves clears its used flag first) while the
+// worker read that object. A resize now only redraws. The class: every platform/qt widget whose resizeEvent shares a file with
+// a processingSet call is one of these two, and MainWindow's own resize is held for the session instead.
+TEST(LookAssistAnalysisPumpWiring, ACurveWidgetResizeOnlyRedrawsAndNeverWritesTheProcessingObject)
+{
+    const QString qtPath = repo_file_path( QStringLiteral( "platform/qt" ) );
+    const QDir qtDir( qtPath );
+    ASSERT_TRUE( !qtPath.isEmpty() && qtDir.exists() );
+    int widgets = 0;
+    for( const QString &name : qtDir.entryList( QStringList() << QStringLiteral( "*.cpp" ), QDir::Files, QDir::Name ) )
+    {
+        if( name == QStringLiteral( "MainWindow.cpp" ) ) continue;
+        QFile file( qtDir.filePath( name ) );
+        ASSERT_TRUE( file.open( QIODevice::ReadOnly | QIODevice::Text ) );
+        QTextStream in( &file );
+        const QString source = in.readAll();
+        if( !source.contains( QStringLiteral( "::resizeEvent(" ) ) || !source.contains( QStringLiteral( "processingSet" ) ) ) continue;
+        ++widgets;
+        ASSERT_TRUE( name == QStringLiteral( "Curves.cpp" ) || name == QStringLiteral( "HueVsDiagram.cpp" ) );
+        const QString className = name.left( name.size() - 4 );
+        const QString resize = functionBody( source, QStringLiteral( "void %1::resizeEvent(" ).arg( className ) );
+        ASSERT_TRUE( !resize.isEmpty() );
+        ASSERT_EQ( 1, static_cast<int>( resize.count( QStringLiteral( "paintElement();" ) ) ) );
+        const int on = resize.indexOf( QStringLiteral( "m_drawOnly = true;" ) );
+        const int paint = resize.indexOf( QStringLiteral( "paintElement();" ) );
+        const int off = resize.indexOf( QStringLiteral( "m_drawOnly = false;" ) );
+        ASSERT_TRUE( on >= 0 && on < paint && paint < off );
+        // paintLine's one write of the processing object is closed while drawing only.
+        ASSERT_EQ( 0, static_cast<int>( source.count( QStringLiteral( "if( active || m_LoadAll )" ) ) ) );
+        ASSERT_EQ( 1, static_cast<int>( source.count( QStringLiteral( "if( !m_drawOnly && ( active || m_LoadAll ) )" ) ) ) );
+    }
+    ASSERT_EQ( 2, widgets );
+    // MainWindow's resize waits for the landing.
+    const QString mainResize = functionBody( mainWindowSource(), QStringLiteral( "void MainWindow::resizeEvent(" ) );
+    const int held = mainResize.indexOf( QStringLiteral( "if( m_lookAssistPump.sessionOpen() )" ) );
+    ASSERT_TRUE( held >= 0 );
+    ASSERT_TRUE( held < mainResize.indexOf( QStringLiteral( "drawFrame();" ) ) );
 }
 
 // Hazard 5: a close that reaches the window during the analysis waits for the landing and does not wait on the barrier.
