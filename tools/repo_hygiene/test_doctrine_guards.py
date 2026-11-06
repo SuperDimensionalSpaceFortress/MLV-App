@@ -683,6 +683,11 @@ def is_red_mutation_corpus(rel: str) -> bool:
 def check_red_mutation_verdict(root: Path, rel_paths: list[str]) -> list[Violation]:
     """Fail when the checker's answer for any pinned corpus case differs from the recorded one."""
     out: list[Violation] = []
+    if not rel_paths:
+        # The corpus is one tracked file that every real tree holds. Selecting nothing means it was
+        # deleted or renamed, and a guard that checks no input must not answer "no violation".
+        raise CouldNotCheck(f"{RED_MUTATION_CORPUS} is not in the selection: the corpus was deleted or "
+                            f"renamed, so no case was checked")
     for rel in rel_paths:
         try:
             cases = json.loads((root / rel).read_text(encoding="utf-8"))["cases"]
@@ -1186,6 +1191,19 @@ class GuardFixtureTests(_PwshMixin, unittest.TestCase):
                 rels = _write_tree(root, {RED_MUTATION_CORPUS: text})
                 with self.assertRaises(CouldNotCheck, msg=text):
                     run_guard(guard, root, rels)
+
+    def test_red_mutation_verdict_empty_selection_is_could_not_check(self) -> None:
+        # A deleted or renamed corpus selects no file; the guard must refuse to answer, not return [].
+        guard = GUARDS["DG-RED-MUTATION-VERDICT"]
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            with self.assertRaises(CouldNotCheck):
+                run_guard(guard, root, [])
+            subprocess.run(["git", "init", "-q", str(root)], check=True)
+            (root / "unrelated.txt").write_text("x", encoding="utf-8")
+            subprocess.run(["git", "-C", str(root), "add", "unrelated.txt"], check=True)
+            with self.assertRaises(CouldNotCheck):
+                run_guard(guard, root)
 
     def test_red_mutation_verdict_null_or_non_string_fields_are_could_not_check(self) -> None:
         # A corpus case with `output: null` or a non-string expected_assertion is a malformed
