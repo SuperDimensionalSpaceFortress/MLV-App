@@ -627,9 +627,10 @@ namespace
 {
 // updateLookLabel's derivation (MainWindow.cpp), for the owner row's receipt `owner` and the applied key `applied`.
 // r16: the grade is the one `previous` was derived for (no setSliders, landing or new key since), as in the paste case.
+// r18 (adversary r17 dc21c1c9 A1): `regraded` is a regrade since then (the switch handler's or setSliders' count): sameGrade fails.
 std::string derivedLabel(const QString &previous, const lookassist::LookAssistFlavorOutcome &outcome, const void *applied,
                          const void *owner, bool ownerSwitch, bool ownerIsActive, bool slidersAttached, bool checkbox,
-                         bool recordedCloneSwitch = false)
+                         bool recordedCloneSwitch = false, bool regraded = false)
 {
     const bool lookSwitch = look_label::appliedLookSwitch(applied, owner, ownerSwitch, recordedCloneSwitch);
     const bool lookOn = look_label::lookOnForOwner(owner != nullptr, lookSwitch,
@@ -637,7 +638,7 @@ std::string derivedLabel(const QString &previous, const lookassist::LookAssistFl
     const void *key = lookOn ? look_label::outcomeKey(applied, owner) : nullptr;
     const bool keepText = look_label::keepsTextWithoutOwner(true, owner ? 0 : -1)
                        || look_label::keepsTextForInactiveOwner(true, applied, owner, ownerIsActive, slidersAttached, !previous.isEmpty(),
-                                                                true);
+                                                                !regraded);
     return (keepText ? previous : look_label::shownText(lookOn, outcome, key, QString())).toStdString();
 }
 
@@ -787,7 +788,10 @@ TEST(LookLabelPolicy, A1r15APasteOntoAnInactiveOwnerNeverRelabelsItsUnchangedGra
         ASSERT_EQ(std::string("Look: Cinematic"), after);
     }
     // The cases that still re-derive. The owner active with attached sliders: the switch regrades, so it is read ("Look: Off").
-    ASSERT_EQ(std::string("Look: Off"), derivedLabel(before, outcome, &receiptA, &receiptA, false, true, true, false));
+    // r18 (adversary r17 dc21c1c9 A1): the click is read because the handler counts a regrade, not because the owner is active.
+    ASSERT_EQ(std::string("Look: Off"), derivedLabel(before, outcome, &receiptA, &receiptA, false, true, true, false, false, true));
+    // ... and with no regrade (the owner made active again without setSliders), the unchanged Cinematic grade keeps its text.
+    ASSERT_EQ(std::string("Look: Cinematic"), derivedLabel(before, outcome, &receiptA, &receiptA, false, true, true, true));
     // An export clone Q as the key: its own outcome and its recorded switch decide.
     int cloneQ = 0;
     outcome.landed(&cloneQ, QStringLiteral("film"), false);
@@ -799,7 +803,9 @@ TEST(LookLabelPolicy, A1r15APasteOntoAnInactiveOwnerNeverRelabelsItsUnchangedGra
     ASSERT_TRUE(look_label::keepsTextForInactiveOwner(true, &receiptA, &receiptA, false, true, true, true));
     ASSERT_TRUE(look_label::keepsTextForInactiveOwner(true, nullptr, &receiptA, false, true, true, true));
     ASSERT_TRUE(look_label::keepsTextForInactiveOwner(true, &receiptA, &receiptA, true, false, true, true));   // detached active owner
-    ASSERT_FALSE(look_label::keepsTextForInactiveOwner(true, &receiptA, &receiptA, true, true, true, true));
+    // r18 (adversary r17 dc21c1c9 A1): the active owner with attached sliders keeps it too while nothing regraded.
+    ASSERT_TRUE(look_label::keepsTextForInactiveOwner(true, &receiptA, &receiptA, true, true, true, true));
+    ASSERT_FALSE(look_label::keepsTextForInactiveOwner(true, &receiptA, &receiptA, true, true, true, false));   // the click regraded
     ASSERT_FALSE(look_label::keepsTextForInactiveOwner(true, &cloneQ, &receiptA, false, true, true, true));
     ASSERT_FALSE(look_label::keepsTextForInactiveOwner(true, &receiptA, nullptr, false, true, true, true));
     ASSERT_FALSE(look_label::keepsTextForInactiveOwner(false, &receiptA, &receiptA, false, true, true, true));
@@ -823,6 +829,7 @@ struct R17Window
     bool checkbox = false;                // checkBoxLookAssistEnable
     lookassist::LookAssistFlavorOutcome outcome;
     LabelModel label;
+    bool countsSelectorWrite = true;      // r18: setSliders counts its selector write (false = the mutant without it)
 
     std::string relabel()
     {
@@ -847,6 +854,7 @@ struct R17Window
         pump();   // the modal work
         if( look_label::slidersReassertsKeyAfterModal(receipt, keyAfterEarlyWrite, active) ) { key = receipt; recorded = receipt->on; }
         checkbox = receipt->on;
+        if( countsSelectorWrite ) ++label.slidersApplied;   // r18: the selector write is a regrade
         relabel();
         // The enabled branch restores (or captures) the baseline and marks it under the key; the de-dupe marker skips the analysis.
         const bool marked = receipt->on && look_label::restoreMarksBaseline(receipt, key, active);
@@ -859,6 +867,7 @@ struct R17Window
     std::string switchOn(R17Receipt *row, bool attached = true)
     {
         row->on = true;
+        ++label.slidersApplied;   // r18 (adversary r17 dc21c1c9 A1): the switch handler counts a regrade
         if( look_label::activeGradeMovesKey(row, active, attached) ) { key = row; recorded = row->on; }
         checkbox = true;
         relabel();
@@ -1131,6 +1140,193 @@ TEST(LookLabelWiring, A1r17bEveryGradeOfTheActiveSlidersMovesTheKeyFirst)
     ASSERT_TRUE(write > 0 && moved > write && relabel > moved);
     // The definition and three calls, nothing else.
     ASSERT_EQ(4, mw.count(QStringLiteral("labelFollowsActiveSliders(")));
+}
+
+// Adversary r17 (dc21c1c9) A1, introduced by r15's freeze exception for an active owner with attached sliders. Rows A=0 (active,
+// loaded, attached, Look Assist on, the key, Cinematic landed) and a distinct clip B imported as row 1. addFileToSession activates
+// B and pumps events before B's loader runs; there a paste with Look Assist off (Raw Correction Enable selected) lands on A, which
+// is not the active row, so setSliders is skipped and Cinematic stays on screen. B's preparation drain refuses the open
+// (clipOpenAbortedForPrep); the import removes B and restores A with SET_ACTIVE_CLIP_IDX( refusedImportActiveRow(...) ), no
+// setSliders, and the retained clip keeps the sliders attached. The warning is dismissed and fullscreen toggled.
+// RED on dc21c1c9: A was active and attached again, so the freeze stopped and the label read A's pasted switch: "Look: Off".
+TEST(LookLabelPolicy, A1r18APasteThenARefusedImportRestoringTheOwnerNeverRelabelsItsUnchangedGrade)
+{
+    const char *flavors[] = { "cinematic", "film", "vision50d" };
+    for( const char *flavorName : flavors )
+    {
+        const std::string named = std::string("Look: ") + look_label::flavorDisplayName(QString::fromLatin1(flavorName)).toStdString();
+        R17Receipt receiptA, receiptB;
+        receiptA.on = true;
+        R17Window w;
+        w.active = w.owner = &receiptA;
+        w.key = &receiptA;
+        w.recorded = true;
+        w.checkbox = true;
+        w.outcome.landed(&receiptA, QString::fromLatin1(flavorName), false);
+        ASSERT_EQ(named, w.relabel());
+        // addFileToSession: B is active, nothing of B is loaded or applied; a relabel in its pump (F11) keeps A's text.
+        w.active = &receiptB;
+        ASSERT_EQ(named, w.relabel());
+        // The paste onto the inactive A writes A's switch only (the r15 shape).
+        receiptA.on = false;
+        ASSERT_EQ(named, w.relabel());
+        // The refused import: B's row 1 is removed and the previous row 0 is active again, with no setSliders.
+        const int restored = refusedImportActiveRow(0, 1, 1, 1);
+        ASSERT_EQ(0, restored);
+        w.active = &receiptA;
+        const std::string shown = w.relabel();   // the warning dismissed, then F11
+        printf("[A1r18] flavor=%s label=\"%s\"\n", flavorName, shown.c_str());
+        ASSERT_EQ(named, shown);
+        ASSERT_EQ(named, w.relabel());
+        // The switch is still read: a click off (the handler writes A's switch, counts a regrade) reads "Look: Off".
+        receiptA.on = false;
+        w.checkbox = false;
+        ++w.label.slidersApplied;   // on_checkBoxLookAssistEnable_clicked
+        ASSERT_EQ(std::string("Look: Off"), w.relabel());
+    }
+    // A click on instead, from the restored state: the handler regrades and the baseline goes back, "Look: Baseline".
+    R17Receipt receiptA, receiptB;
+    receiptA.on = true;
+    R17Window w;
+    w.active = w.owner = &receiptA;
+    w.key = &receiptA;
+    w.checkbox = true;
+    w.outcome.landed(&receiptA, QStringLiteral("cinematic"), false);
+    ASSERT_EQ(std::string("Look: Cinematic"), w.relabel());
+    w.active = &receiptB;
+    receiptA.on = false;
+    w.active = &receiptA;
+    ASSERT_EQ(std::string("Look: Cinematic"), w.relabel());
+    w.checkbox = false;   // the stale box unchecked first: a regrade, read as Off
+    receiptA.on = false;
+    ++w.label.slidersApplied;
+    ASSERT_EQ(std::string("Look: Off"), w.relabel());
+    ASSERT_EQ(std::string("Look: Baseline"), w.switchOn(&receiptA));
+}
+
+// The class of A1r18: every path that makes the owner's row active again without setSliders (the refused import above, Open
+// Session's restoreLastOpened, showFileOpenFailurePlan's restoreOldActive) keeps the text of the unchanged grade, whatever was
+// written to the owner's switch while it was inactive. This is the case that would have caught r17: its tests only looked while
+// the owner was inactive. And the regrades that still re-derive for an active, attached owner: setSliders (its selector write
+// counts, so a relabel in its modal pump never pins the old selector), the switch, a landing, the smoke run's forced Off.
+TEST(LookLabelPolicy, A1r18EveryReactivationWithoutSetSlidersKeepsTheTextAndEveryRegradeIsRead)
+{
+    const QString cinematic = QStringLiteral("cinematic");
+    {
+        // Open Session: A (the last opened row) is loaded and labelled; a later row C is activated for its open, a paste turns A
+        // off in that open's pump, C's open is refused and plan.restoreLastOpened makes A active again. Detached or attached.
+        for( const bool attached : { true, false } )
+        {
+            R17Receipt receiptA, receiptC;
+            receiptA.on = true;
+            R17Window w;
+            w.active = w.owner = &receiptA;
+            w.key = &receiptA;
+            w.checkbox = true;
+            w.outcome.landed(&receiptA, cinematic, false);
+            ASSERT_EQ(std::string("Look: Cinematic"), w.relabel());
+            w.active = &receiptC;
+            receiptA.on = false;
+            w.active = &receiptA;   // m_pModel->setActiveRow( lastOpenedRow )
+            const std::string shown = w.label.update(w.outcome, w.key, w.owner, receiptA.on, true, attached, w.checkbox, w.recorded);
+            printf("[A1r18c] attached=%d label=\"%s\"\n", attached ? 1 : 0, shown.c_str());
+            ASSERT_EQ(std::string("Look: Cinematic"), shown);
+        }
+    }
+    {
+        // The reverse paste: A is off ("Look: Off" over its baseline) and a paste turns it on while inactive; the box was left
+        // checked by another row. Reactivated with no regrade, the baseline on screen keeps "Look: Off".
+        R17Receipt receiptA, receiptC;
+        R17Window w;
+        w.active = w.owner = &receiptA;
+        w.key = &receiptA;
+        ASSERT_EQ(std::string("Look: Off"), w.relabel());
+        w.active = &receiptC;
+        w.checkbox = true;
+        receiptA.on = true;
+        w.active = &receiptA;
+        ASSERT_EQ(std::string("Look: Off"), w.relabel());
+    }
+    {
+        // setSliders of a receipt that is not the key (Reset Sliders' scratch defaults, Look Assist off) on the active owner B,
+        // with a relabel inside its modal pump (it read the old, checked selector at setSliders' first count). Its selector write
+        // counts, so the label reads the unchecked box: "Look: Off". Without that count the pump's "Look: Baseline" was pinned.
+        for( const bool counts : { true, false } )
+        {
+            R17Receipt receiptB, scratch;
+            receiptB.on = true;
+            R17Window w;
+            w.active = w.owner = &receiptB;
+            w.key = &receiptB;
+            w.recorded = true;
+            w.checkbox = true;
+            w.countsSelectorWrite = counts;
+            ASSERT_EQ(std::string("Look: Baseline"), w.relabel());
+            const std::string shown = w.setSliders(&scratch, [&] { w.relabel(); });
+            printf("[A1r18s] counts=%d label=\"%s\"\n", counts ? 1 : 0, shown.c_str());
+            ASSERT_EQ(std::string(counts ? "Look: Off" : "Look: Baseline"), shown);
+        }
+    }
+    {
+        // A landing on the active owner changes the grade it names: read.
+        R17Receipt receiptA;
+        receiptA.on = true;
+        R17Window w;
+        w.active = w.owner = &receiptA;
+        w.key = &receiptA;
+        w.checkbox = true;
+        w.outcome.landed(&receiptA, cinematic, false);
+        ASSERT_EQ(std::string("Look: Cinematic"), w.relabel());
+        ASSERT_EQ(std::string("Look: Film grade"), w.syncLanding(&receiptA, "film", false));
+    }
+    {
+        // The smoke run's forced Off (forceLookAssistOffForSmoke): switch and box off, outcome cleared, a regrade. With nothing
+        // landed before, the outcome alone does not change, so only the count makes it read "Look: Off".
+        R17Receipt receiptA;
+        receiptA.on = true;
+        R17Window w;
+        w.active = w.owner = &receiptA;
+        w.key = &receiptA;
+        w.checkbox = true;
+        ASSERT_EQ(std::string("Look: Baseline"), w.relabel());
+        receiptA.on = false;
+        w.checkbox = false;
+        w.outcome.clear();
+        ASSERT_EQ(std::string("Look: Baseline"), w.relabel());   // no regrade counted: kept (why the smoke path counts one)
+        ++w.label.slidersApplied;
+        ASSERT_EQ(std::string("Look: Off"), w.relabel());
+    }
+}
+
+TEST(LookLabelWiring, A1r18TheSwitchAndTheSelectorWriteEachCountARegrade)
+{
+    const QString mw = readRepoFile(QStringLiteral("platform/qt/MainWindow.cpp"));
+    const QString bump = QStringLiteral("++m_lookLabelSlidersApplied;");
+    // The switch handler: after the ownership guard and its write, before its first relabel.
+    const QString toggle = functionBody(mw, QStringLiteral("void MainWindow::on_checkBoxLookAssistEnable_clicked( bool checked )"));
+    const int guard = toggle.indexOf(QStringLiteral("receiptOwnedByLoadedClip( \"look-assist-toggle\" ) ) return;"));
+    const int write = toggle.indexOf(QStringLiteral("ACTIVE_RECEIPT->setLookAssistEnabled( checked );"));
+    const int counted = toggle.indexOf(bump);
+    const int relabel = toggle.indexOf(QStringLiteral("updateLookLabel();"));
+    printf("[A1r18W] guard=%d write=%d counted=%d relabel=%d\n", guard, write, counted, relabel);
+    ASSERT_TRUE(guard > 0 && write > guard && counted > write && relabel > counted);
+    ASSERT_EQ(1, toggle.count(bump));
+    // setSliders: its first bump before any slider, and a second right after the selector write, before the blocked relabel.
+    const QString sliders = functionBody(mw, QStringLiteral("void MainWindow::setSliders(ReceiptSettings *receipt, bool paste)"));
+    const int selector = sliders.indexOf(QStringLiteral("ui->checkBoxLookAssistEnable->setChecked( lookAssistEnabled );"));
+    const int second = sliders.indexOf(bump, selector);
+    const int blocked = sliders.indexOf(QStringLiteral("updateLookLabel();   // both signals were blocked above"));
+    ASSERT_TRUE(selector > 0 && second > selector && blocked > second);
+    ASSERT_EQ(2, sliders.count(bump));
+    ASSERT_EQ(1, sliders.count(QStringLiteral("ui->checkBoxLookAssistEnable->setChecked(")));
+    // The smoke run's forced Off counts one before its relabel.
+    ASSERT_TRUE(mw.contains(QStringLiteral("m_lookAssistFlavorOutcome.clear();\n        ++m_lookLabelSlidersApplied;")));
+    ASSERT_EQ(4, mw.count(bump));
+    // The reactivations this keeps the text across still apply no sliders (the refused import's restore).
+    const int restore = mw.indexOf(QStringLiteral("if( restoredActive >= 0 ) SET_ACTIVE_CLIP_IDX( restoredActive );"));
+    const int warning = mw.indexOf(QStringLiteral("QMessageBox::warning( this, tr( \"Import MLV\" ),"), restore);
+    ASSERT_TRUE(restore > 0 && warning > restore);
+    ASSERT_FALSE(mw.mid(restore, warning - restore).contains(QStringLiteral("setSliders(")));
 }
 
 // The controls: Look Assist still on at delivery lands as before, and a disabled paste onto ANOTHER row (multi-select paste,
@@ -1480,7 +1676,8 @@ TEST(LookLabelWiring, A1UpdateLookLabelDerivesFromTheOwnerNeverTheActiveReceipt)
     const int bump = sliders.indexOf(QStringLiteral("++m_lookLabelSlidersApplied;"));
     ASSERT_TRUE(bump > sliders.indexOf(QStringLiteral("if( m_slidersDetachedFromReceipt )"))
                 && bump < sliders.indexOf(QStringLiteral("ui->horizontalSliderExposure->setValue( receipt->exposure() );")));
-    ASSERT_EQ(2, mw.count(QStringLiteral("m_lookLabelSlidersApplied")));   // the bump, and the grade read in updateLookLabel
+    // The setSliders bump, the grade read in updateLookLabel, and r18's three regrade writers (A1r18TheSwitchAndTheSelectorWrite...).
+    ASSERT_EQ(5, mw.count(QStringLiteral("m_lookLabelSlidersApplied")));
     // Called from settings loading before the session model exists: the model is read only once a clip is loaded.
     ASSERT_TRUE(update.contains(QStringLiteral("const int ownerRow = !m_fileLoaded ? -1 : look_label::loadedClipOwnerRow(")));
     // The pump A1 used still sits between the activation and the loader.

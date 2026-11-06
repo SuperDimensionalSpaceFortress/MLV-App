@@ -226,7 +226,8 @@ inline bool keepsTextWithoutOwner( bool clipLoaded, int ownerRow )
  *  loaded clip, else the owner), the count of setSliders applications to the sliders (every one regrades the loaded clip: a new
  *  open's apply, a baseline restore, a disabled receipt's restore) and the text the outcome names for that key when the look is
  *  on (it changes when an analysis lands or a baseline is marked). The switch is deliberately not part of it: it is the one input
- *  a paste can change on an inactive owner without regrading. */
+ *  a paste can change on an inactive owner without regrading. r18: the count also takes the active row's switch and selector writes
+ *  that regrade (the switch handler, setSliders' selector write, the smoke run's forced Off), so those are read. */
 struct LabelGrade
 {
     const void *key = nullptr;
@@ -260,13 +261,21 @@ inline bool sameGrade( const LabelGrade &now, const LabelGrade &derived )
  *  r16 (adversary r15 1834b72e A1): only while the grade is the one the text was derived for (`sameGradeAsDerived`, sameGrade).
  *  An inactive owner IS regraded by an open: showFileInEditor(A) whose event pump opened a same-path row B (B derives "Look: Off")
  *  then records A and setSliders(A) restores and marks A's baseline while B is active. Keeping "Look: Off" over that broke
- *  sol r13 B1; a new key, a setSliders application or a landing (or a baseline mark) on the key re-derives. */
+ *  sol r13 B1; a new key, a setSliders application or a landing (or a baseline mark) on the key re-derives.
+ *  r18 (adversary r17 dc21c1c9 A1): also while the owner is the active row with attached sliders. A row becomes active again
+ *  without setSliders (a refused import restores the previous row, MainWindow.cpp clipOpenAbortedForPrep / refusedImportActiveRow;
+ *  Open Session's restoreLastOpened), so a paste that wrote the owner's switch while it was inactive was read the moment it was
+ *  active again: "Look: Off" over the unchanged Cinematic grade. What the active row's switch and selector do to the screen goes
+ *  through a regrade instead, which ends sameGrade: the switch handler and setSliders' selector write each count one
+ *  (m_lookLabelSlidersApplied), so a click is still read. `ownerIsActiveRow` and `slidersAttached` are not read: the r15 exception
+ *  for them is the defect; they are named so a side tree can reinstate it. */
 inline bool keepsTextForInactiveOwner( bool clipLoaded, const void *appliedReceipt, const void *ownerReceipt, bool ownerIsActiveRow,
                                        bool slidersAttached, bool hasText, bool sameGradeAsDerived )
 {
+    Q_UNUSED( ownerIsActiveRow );
+    Q_UNUSED( slidersAttached );
     return clipLoaded && hasText && sameGradeAsDerived && ownerReceipt != nullptr
-        && ( appliedReceipt == nullptr || appliedReceipt == ownerReceipt )
-        && !( ownerIsActiveRow && slidersAttached );
+        && ( appliedReceipt == nullptr || appliedReceipt == ownerReceipt );
 }
 
 /*! \brief The corner label is drawn only in fullscreen, and only while the setting shows it. */

@@ -9148,6 +9148,7 @@ int MainWindow::runGuiPlaybackSmoke(const GuiPlaybackSmokeOptions & options)
         m_lastLookAssistDiagnosticsValid = false;
         m_lookAssistApplied.clear();
         m_lookAssistFlavorOutcome.clear();
+        ++m_lookLabelSlidersApplied;   // r18 (adversary r17 dc21c1c9 A1): forced Off is a regrade, so the kept label is re-derived
         updateLookLabel();
     };
 
@@ -16616,6 +16617,9 @@ void MainWindow::setSliders(ReceiptSettings *receipt, bool paste)
         QSignalBlocker lookAssistBlocker( ui->checkBoxLookAssistEnable );
         ui->checkBoxLookAssistEnable->setEnabled( m_fileLoaded );
         ui->checkBoxLookAssistEnable->setChecked( lookAssistEnabled );
+        // r18 (adversary r17 dc21c1c9 A1): the selector now shows this receipt's switch. A relabel inside the work above (a nested
+        // open in a dialog's pump) read the old selector at the same count, so this write is a regrade too.
+        ++m_lookLabelSlidersApplied;
         {
             // The receipt's element through the one shared rule: an unknown value is Classic plus a warning (never the
             // selector's previous value, which could be Cinematic), and the receipt is corrected to what is applied.
@@ -31927,6 +31931,7 @@ void MainWindow::on_checkBoxLookAssistEnable_clicked( bool checked )
 
     ACTIVE_RECEIPT->setLookAssistEnabled( checked );
     invalidateLookAssistAsyncOnDisable( ACTIVE_RECEIPT, "toggle_off" );   // r15 (sol r14 B1): no-op when checked
+    ++m_lookLabelSlidersApplied;   // r18 (adversary r17 dc21c1c9 A1): the switch regrades, so the kept label reads the click (sameGrade)
     labelFollowsActiveSliders( ACTIVE_RECEIPT );   // r17 (adversary r17 4fcae002 A1): the switch regrades this receipt's sliders
     updateLookLabel();
 
