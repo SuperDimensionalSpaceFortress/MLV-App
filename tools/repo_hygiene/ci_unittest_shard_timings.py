@@ -35,6 +35,17 @@ KEY_PREFIX = "tools.repo_hygiene.test_"
 # ``<first docstring line> ... ok`` on the next, so TEST_LINE alone never sees it.
 DOC_HEAD = re.compile(r"^(\S+) \(([A-Za-z0-9_.]+)\)$")
 DOC_RESULT = re.compile(rf"^.* \.\.\. {RESULT}$")
+# The shard tool's own per-class figure, printed after every job's `SHARD_SLOWEST profile=... total=...s`
+# header (its TOP_CLASSES slowest classes, setUpClass included): `  316.2s tools.repo_hygiene.test_x.Cls`.
+SLOWEST_HEAD = re.compile(r"^SHARD_SLOWEST profile=\S+ shard=\S+ total=[0-9]+(?:\.[0-9]+)?s$")
+# The runner prints one decimal; a bounded digit count keeps float() finite (400 digits is inf).
+SLOWEST_ROW = re.compile(r"^\s+([0-9]{1,7}(?:\.[0-9]{1,3})?)s ([A-Za-z0-9_.]+)$")
+# A row's shape with the figure unchecked (``1.2.3s name``), and the unittest summary lines that can be
+# interleaved with a block on the log's other stream.
+SLOWEST_ROW_SHAPE = re.compile(r"^\s+\S+s ([A-Za-z0-9_.]+)$")
+SUMMARY_NOISE = re.compile(
+    r"^(?:OK(?: \(.*\))?|FAILED \(.*\)|-{10,}|Ran [0-9]+ tests? in [0-9.]+s)?$"
+)
 
 
 def _seconds(stamp: re.Match[str]) -> float:
@@ -72,7 +83,16 @@ def class_seconds(log_text: str) -> dict[str, float]:
             # its result, so it keeps head -> this line and the plain test is not charged.
             name, pending = (pending or test.group(1)), None
         elif doc_head:
+            # unittest -v prints a docstring test's id line when the test STARTS, so the gap from the
+            # previous stamped line to it is the class's setUpClass (and the previous test's teardown),
+            # which a plain one-line test is charged too. The clock therefore stays on the previous
+            # line and the result line is charged previous -> result. An id line that replaces a
+            # still-pending one abandons it (its interval is not separable) and restarts the clock;
+            # so does an id line with no earlier stamped line or one stamped before the previous line.
+            if pending is not None or previous is None or now < previous:
+                previous = now
             name, pending = None, doc_head
+            continue
         elif pending is not None and DOC_RESULT.match(text):
             name, pending = pending, None
         elif pending is not None:
@@ -84,6 +104,54 @@ def class_seconds(log_text: str) -> dict[str, float]:
         if name and previous is not None and name.startswith(KEY_PREFIX):
             totals[name.rsplit(".", 1)[0]] += max(0.0, now - previous)
         previous = now
+    # The tool's own figure for a class it names REPLACES the gap estimate, in both directions. The gap
+    # estimate is low where a class logs lines without a result (git warnings; CandidateAcceptanceTests
+    # read 8.8 s here against 62.7 s in its own job's SHARD_SLOWEST) and high where a silent
+    # tearDownClass of the previous class lands in the gap before a docstring test (that gap is charged
+    # to the next class as its setUpClass, so the teardown is counted twice). A class the block does not
+    # name was outside the job's top ten, so it ran no longer than the block's smallest figure: that is
+    # the ceiling for its gap estimate (a truncated block only loosens it, because rows are sorted slowest
+    # first). Below the ceiling the estimate stands.
+    # A job log holds exactly one block (all 130 hosted windows logs do); a log with none, several, or a
+    # class named twice is concatenated or foreign output whose figures are not this job's, so the gaps
+    # stand alone and no SHARD_SLOWEST figure replaces or caps anything.
+    # Inside a block, unittest's stderr summary (blank line, ``OK``) can reach the log between the header and
+    # its rows (hosted run 41960424018, heavy part 4) and does not end it (blank line, the dash separator, the
+    # ``Ran N tests in Xs`` line, ``OK`` / ``FAILED (...)``); a row of the right shape whose
+    # figure is unreadable is not a measurement but names a top-ten class, so the scan goes on and that
+    # class is exempt from the ceiling; any other line ends the block.
+    blocks: list[tuple[list[tuple[str, float]], list[str]]] = []
+    in_slowest = False
+    for raw in log_text.splitlines():
+        stamp = STAMP.match(raw)
+        if not stamp:
+            continue
+        text = stamp.group(3)
+        if SLOWEST_HEAD.match(text):
+            in_slowest = True
+            blocks.append(([], []))
+            continue
+        if not in_slowest:
+            continue
+        row = SLOWEST_ROW.match(text)
+        if row:
+            blocks[-1][0].append((row.group(2), float(row.group(1))))
+            continue
+        loose = SLOWEST_ROW_SHAPE.match(text)
+        if loose:
+            blocks[-1][1].append(loose.group(1))
+        elif not SUMMARY_NOISE.match(text.strip()):
+            in_slowest = False
+    if len(blocks) == 1 and blocks[0][0]:
+        rows, unreadable = blocks[0]
+        names = [name for name, _ in rows] + unreadable
+        if len(set(names)) == len(names):
+            ceiling = min(value for _, value in rows)
+            named = {name: value for name, value in rows if name.startswith(KEY_PREFIX)}
+            for name in totals:
+                if name not in named and name not in unreadable:
+                    totals[name] = min(totals[name], ceiling)
+            totals.update(named)
     return dict(totals)
 
 

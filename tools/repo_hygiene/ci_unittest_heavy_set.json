@@ -1,9 +1,9 @@
 {
   "schema": 1,
-  "why": "CI-WINDOWS-UNITTEST-SHARD-8-1: the heaviest measured windows classes run in the job repo-hygiene-python-windows-unittest-heavy, split into `parts` legs; the windows 7-way partition excludes exactly these. CI-WINDOWS-UNITTEST-HEAVY-PARTS-3-1: re-derived from hosted master logs the windows suite weighs 12047 s, more than the 9666 s that 7 shards and 2 parts hold at the 85 % limit, so parts went 2 -> 6 (5 cannot hold the open #705 and #709 additions) and the set was re-balanced so every shard and part is expected under that limit. LEASE-BATCH-PLAN-ARTIFACT-PREFLIGHT-1 r14: #705's 69 test_artifact_preflight_* cases (545.9 s hosted, run 40861273862) left VenueLeaseBatchLegPlanTests at 1131 s, past one part, so they run in their own class VenueLeaseBatchArtifactPreflightTests, which joins this set. CI-FLAKE-HEAVY-SLOT-GATE-UNIT-HOSTED-HANG-1 r16: BoundedCaptureIoTests (67 s hosted windows) joins, because the card's own growth took every shard to 1225.7 s against the 1224 s limit; it now sits at 1216.1 s and the heaviest part at 1206.7 s. HFR-NATIVE-60FPS-FULLRES-1 r20: this PR's three conform classes (59.8 s hosted windows) join, because they took the heaviest shard to 1229.8 s against the 1224 s limit; it now sits at 1221.2 s and the heaviest part is still 1206.7 s. test_ci_unittest_shard.HeavySetTests and ShardDurationBudgetTests pin both sides.",
+  "why": "CI-WINDOWS-UNITTEST-SHARD-8-1: the heaviest measured windows classes run in the job repo-hygiene-python-windows-unittest-heavy, split into `parts` legs; the windows 7-way partition excludes exactly these. CI-WINDOWS-UNITTEST-HEAVY-PARTS-3-1: re-derived from hosted master logs the windows suite weighs 12047 s, more than the 9666 s that 7 shards and 2 parts hold at the 85 % limit, so parts went 2 -> 6 (5 cannot hold the open #705 and #709 additions) and the set was re-balanced so every shard and part is expected under that limit. LEASE-BATCH-PLAN-ARTIFACT-PREFLIGHT-1 r14: #705's 69 test_artifact_preflight_* cases (545.9 s hosted, run 40861273862) left VenueLeaseBatchLegPlanTests at 1131 s, past one part, so they run in their own class VenueLeaseBatchArtifactPreflightTests, which joins this set. CI-FLAKE-HEAVY-SLOT-GATE-UNIT-HOSTED-HANG-1 r16: BoundedCaptureIoTests (67 s hosted windows) joins, because the card's own growth took every shard to 1225.7 s against the 1224 s limit; it now sits at 1216.1 s and the heaviest part at 1206.7 s. test_ci_unittest_shard.HeavySetTests and ShardDurationBudgetTests pin both sides. HFR-NATIVE-60FPS-FULLRES-1 r20/r22: this PR's three conform classes (59.8 s hosted windows) are in this set; r22 re-added them on top of the HEADROOM-2 re-balance at the merge. CI-WINDOWS-UNITTEST-SHARD-HEADROOM-2: re-derived from seven green merge_group master runs (41906235113 .. 42029941982), with a class's row set to its largest per-run time rounded up to 0.1 s, the windows suite weighs 17510 s, past the 13962 s that 7 shards plus 6 parts hold at the 85 % limit (and past 1074 s per job with 60 s of headroom), so 17 more classes joined this set and parts went 6 -> 11; every shard now sits near 1008 s of weight and the heaviest part near 994 s. The timing tool now charges the gap before a docstring test (setUpClass) to its class and takes the shard tool's own SHARD_SLOWEST figure for every class that figure names, in place of the gap estimate.",
   "profiles": {
     "windows": {
-      "parts": 6,
+      "parts": 11,
       "classes": [
         "tools.repo_hygiene.test_attr3_spliced_body_scan.SplicedBodyScanOnRealSourcesTests",
         "tools.repo_hygiene.test_bachelor_agent_heavy_slot_gate.BachelorAgentHeavySlotGateUnit",
@@ -11,16 +11,30 @@
         "tools.repo_hygiene.test_brokered_closeout.BrokeredCloseoutTests",
         "tools.repo_hygiene.test_core_partition_leg.CorePartitionGeneratorTests",
         "tools.repo_hygiene.test_core_partition_leg.PlaybackMaxThreadsGeneratorTests",
+        "tools.repo_hygiene.test_cpu_look_leg_pace_abort.CpuPaceGeneratedJobs",
         "tools.repo_hygiene.test_dual_venue_evidence.ConformArmIsHonouredTests",
         "tools.repo_hygiene.test_dual_venue_evidence.ConformMeasuredFieldsAreJudgedTests",
         "tools.repo_hygiene.test_dual_venue_evidence.ConformStatusParenthesisSurvivesTheLogReaderTests",
         "tools.repo_hygiene.test_dual_venue_evidence.EvidenceBoundReceiptTests",
+        "tools.repo_hygiene.test_dual_venue_evidence.GeneratorByteIdentityAndVariantTests",
+        "tools.repo_hygiene.test_dual_venue_evidence.LineEndingsCannotHideACommittedFileTests",
+        "tools.repo_hygiene.test_dual_venue_evidence.NarrowedProductionReceiptsAndBoundBackendTests",
         "tools.repo_hygiene.test_dual_venue_evidence.ProductFailureTerminalsAreReceiptableTests",
         "tools.repo_hygiene.test_dual_venue_evidence.VenueProbeIdentityNoArgumentTextR5Tests",
         "tools.repo_hygiene.test_dual_venue_evidence.VenueQuietAttributionTests",
+        "tools.repo_hygiene.test_dual_venue_evidence.VenueQuietForeignFloorTests",
+        "tools.repo_hygiene.test_dual_venue_evidence.VisualCaptureRunnerModuleTests",
+        "tools.repo_hygiene.test_dual_venue_paired_seek.PairedSeekImageContentTests",
+        "tools.repo_hygiene.test_heavy_arm_frame_log.CpuReceiptLegRunsProcessed8",
+        "tools.repo_hygiene.test_heavy_arm_frame_log.HeavyArmKeepsFrameRows",
         "tools.repo_hygiene.test_hub_vm_no_local_playback.PromptLintTests",
+        "tools.repo_hygiene.test_playback_attr_3_cuda_behaviour.SmokeRunnerStageJobTests",
+        "tools.repo_hygiene.test_playback_attr_3_cuda_contact_sheet.ContactSheetSwitchTests",
+        "tools.repo_hygiene.test_playback_clip_length_gate.AppPlayGateStaticClassTests",
         "tools.repo_hygiene.test_playback_clip_length_gate.RuntimeBackstopBehaviourTests",
+        "tools.repo_hygiene.test_um_presentmon_orphan_sweep.ModuleFunctionTests",
         "tools.repo_hygiene.test_um_presentmon_orphan_sweep.SweepExecutedTests",
+        "tools.repo_hygiene.test_um_ssh_stdin_bound.UmSshStdinBoundTests",
         "tools.repo_hygiene.test_util_sample_leg.UtilSampleGeneratorTests",
         "tools.repo_hygiene.test_venue_baseline.VenueBaselineTests",
         "tools.repo_hygiene.test_venue_chain_runner.VenueChainRunnerTests",
@@ -29,8 +43,11 @@
         "tools.repo_hygiene.test_venue_lease_batch.VenueLeaseBatchArtifactPreflightTests",
         "tools.repo_hygiene.test_venue_lease_batch.VenueLeaseBatchLegPlanEarlyRoundTests",
         "tools.repo_hygiene.test_venue_lease_batch.VenueLeaseBatchLegPlanTests",
+        "tools.repo_hygiene.test_venue_lease_batch.VenueLeaseBatchReceiptRootTests",
         "tools.repo_hygiene.test_venue_lease_batch.VenueLeaseBatchRunnerTests",
-        "tools.repo_hygiene.test_venue_stage_nightly.VenueStageNightlyTests"
+        "tools.repo_hygiene.test_venue_stage_nightly.VenueStageNightlyTests",
+        "tools.repo_hygiene.test_venue_thermal_gate.ThermalGateModuleTests",
+        "tools.repo_hygiene.test_venue_thermal_gate.ThermalGateRunnerTests"
       ]
     }
   }
