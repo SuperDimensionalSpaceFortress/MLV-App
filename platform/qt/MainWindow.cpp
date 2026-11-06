@@ -2896,6 +2896,7 @@ static int mlvappStartPlaybackTimer( QObject *owner, double framerate )
 
 void MainWindow::timerFrameEvent( bool predictivePlaybackAdvance )
 {
+    const GuiOtherBusyScope otherBusySpan( this, gui_present_gap::OtherBusySpan::TimerFrame );
     // No render starts during a Look Assist analysis. m_frameChanged stays set, so the first tick after landing draws.
     if( m_lookAssistPump.sessionOpen() ) return;
 
@@ -5019,7 +5020,36 @@ void MainWindow::openGuiPresentGap( void )
     if( !m_playbackSmokeActive || !m_guiPresentIdleProbeConnected ) return;
     m_guiPresentGapRunnerSleepNs = 0;
     m_guiPresentGapPaintStartMs = ui->graphicsView->paintTiming().sumMs;
+    ++m_guiPresentGapSerial;
+    m_guiOtherBusySpans.openGap();
     m_guiPresentGapStartNs = m_guiPresentGapClock.nsecsElapsed();
+}
+
+// CPU-S1-RECON-UNDER-LOOK-PACE-LEVER-1 (Part B): the clock a GUI handler span reads at its start and
+// end. gapSerial 0 = no gap open, so a span outside a gap (or across a gap's open or close) is dropped.
+gui_present_gap::SpanClock MainWindow::guiOtherBusySpanClock( void ) const
+{
+    gui_present_gap::SpanClock clock;
+    clock.gapSerial = m_guiPresentGapStartNs >= 0 ? m_guiPresentGapSerial : 0;
+    clock.nowNs = m_guiPresentGapClock.nsecsElapsed();
+    clock.idleNs = m_guiPresentGapIdle.idleNs;
+    clock.runnerSleepNs = m_guiPresentGapRunnerSleepNs;
+    clock.paintMs = ui->graphicsView->paintTiming().sumMs;
+    return clock;
+}
+
+// Only inside a smoke session whose idle probe is connected (the gap is never open otherwise): one
+// branch per handler call when off.
+MainWindow::GuiOtherBusyScope::GuiOtherBusyScope( MainWindow *window, gui_present_gap::OtherBusySpan span )
+    : m_window( ( window->m_playbackSmokeActive && window->m_guiPresentIdleProbeConnected ) ? window : nullptr )
+    , m_span( span )
+{
+    if( m_window ) m_window->m_guiOtherBusySpans.begin( m_window->guiOtherBusySpanClock() );
+}
+
+MainWindow::GuiOtherBusyScope::~GuiOtherBusyScope()
+{
+    if( m_window ) m_window->m_guiOtherBusySpans.end( m_span, m_window->guiOtherBusySpanClock() );
 }
 
 void MainWindow::closeGuiPresentGap( void )
@@ -5042,6 +5072,7 @@ void MainWindow::closeGuiPresentGap( void )
     gaps.busyMaxMs = qMax( gaps.busyMaxMs, split.busyMs );
     gaps.otherBusySumMs += split.otherBusyMs;
     gaps.otherBusyMaxMs = qMax( gaps.otherBusyMaxMs, split.otherBusyMs );
+    m_guiOtherBusySpans.closeGap( split.otherBusyMs );
     m_guiPresentGapStartNs = -1;
     m_guiPresentGapIdle = gui_present_gap::IdleWaits();
 }
@@ -6561,16 +6592,21 @@ void MainWindow::presentPlaybackPreparedFrame( const PlaybackPrepResult &result 
     }
 
     bool imagePresentedByViewport = false;
+    // CPU-S1-RECON-UNDER-LOOK-PACE-LEVER-1 (Part B): region_image split into its two calls.
+    double prepRegionImageViewportMs = 0.0;
+    double prepRegionImageFromImageMs = 0.0;
     if( !framePresentedByViewport )
     {
         // Threaded through so GpuDisplayWindow can record which requestSerial it actually
         // swapped in -- see GpuDisplayWindow::grabPresentedFramebufferIfActive.
         GpuDisplayViewport::PresentationOptions presentationOptions = task.gpuPresentationOptions;
         presentationOptions.presentationSerial = task.requestSerial;
+        const qint64 prepRegionImageViewportStartNs = prepRegionClock.nsecsElapsed();
         imagePresentedByViewport = GpuDisplayViewport::presentImage( ui->graphicsView,
                                                                       m_pGraphicsItem,
                                                                       displayImage,
                                                                       presentationOptions );
+        prepRegionImageViewportMs = prepRegionElapsedMs( prepRegionImageViewportStartNs );
     }
 
     if( !framePresentedByViewport && !imagePresentedByViewport )
@@ -6615,7 +6651,17 @@ void MainWindow::presentPlaybackPreparedFrame( const PlaybackPrepResult &result 
                                   &meta );
         }
 
-        QPixmap pic = cachedPixmapAvailable ? cachedPixmap : QPixmap::fromImage( displayImage );
+        QPixmap pic;
+        if( cachedPixmapAvailable )
+        {
+            pic = cachedPixmap;
+        }
+        else
+        {
+            const qint64 prepRegionImageFromImageStartNs = prepRegionClock.nsecsElapsed();
+            pic = QPixmap::fromImage( displayImage );
+            prepRegionImageFromImageMs = prepRegionElapsedMs( prepRegionImageFromImageStartNs );
+        }
         if( zoomFitEnabled && pic.devicePixelRatio() == 1.0 )
         {
             pic.setDevicePixelRatio( devicePixelRatioF() );
@@ -6642,6 +6688,12 @@ void MainWindow::presentPlaybackPreparedFrame( const PlaybackPrepResult &result 
     readyFrame.stageTimingTelemetry.insert(
         QStringLiteral("playback_prep_region_image_ms"),
         prepRegionImageMs );
+    readyFrame.stageTimingTelemetry.insert(
+        QStringLiteral("playback_prep_region_image_from_image_ms"),
+        prepRegionImageFromImageMs );
+    readyFrame.stageTimingTelemetry.insert(
+        QStringLiteral("playback_prep_region_image_viewport_ms"),
+        prepRegionImageViewportMs );
     m_lastDrawFrameReadyImageMs = prepRegionImageMs;
     mlv_stage_timing_note_elapsed("drawFrameReady.image", display_frame, m_lastDrawFrameReadyImageMs);
 
@@ -6836,6 +6888,7 @@ void MainWindow::computeDisplaySceneGeometry( int sourceWidth,
 //Draw a raw picture to the gui -> start render thread
 void MainWindow::drawFrame( bool updateTimecodeLabel )
 {
+    const GuiOtherBusyScope otherBusySpan( this, gui_present_gap::OtherBusySpan::DrawFrame );
     if( !m_clipLifecycleBarrier.acceptingRequests() )
     {
         m_frameStillDrawing = false;
@@ -12113,6 +12166,7 @@ int MainWindow::openMlv( QString fileName )
 //Handles the playback and must be triggered from timer
 void MainWindow::playbackHandling(int timeDiff)
 {
+    const GuiOtherBusyScope otherBusySpan( this, gui_present_gap::OtherBusySpan::PlaybackHandling );
     if( ui->actionPlay->isChecked() )
     {
         if( m_fileLoaded && m_pMlvObject )
@@ -20918,6 +20972,7 @@ void MainWindow::on_actionAboutQt_triggered()
 //Position Slider
 void MainWindow::on_horizontalSliderPosition_valueChanged(int position)
 {
+    const GuiOtherBusyScope otherBusySpan( this, gui_present_gap::OtherBusySpan::SliderPosition );
     if( !m_playbackInternalSliderAdvance )
     {
         invalidatePlaybackPrepForDisplayChange( "playback-position-change" );
@@ -26382,6 +26437,8 @@ void MainWindow::beginPlaybackSmokeTelemetry( void )
     m_guiPresentGaps = GuiPresentGapTotals();
     m_guiPresentGapStartNs = -1;
     m_guiPresentGapIdle = gui_present_gap::IdleWaits();
+    m_guiOtherBusySpans.resetSession();
+    m_playbackSmokeReconWorkerSplit.reset();
     ui->graphicsView->resetPaintTiming();
     m_playbackSmokePrepWorkerTotalSumMs = 0.0;
     m_playbackSmokePrepResultQueueSumMs = 0.0;
@@ -27582,8 +27639,16 @@ void MainWindow::notePlaybackSmokePresentedFrame(
             spans.regionTotalMs += telemetryDoubleValue( timing, "playback_prep_region_total_ms" );
             spans.regionUnattributedMs +=
                 telemetryDoubleValue( timing, "playback_prep_region_unattributed_ms" );
+            // CPU-S1-RECON-UNDER-LOOK-PACE-LEVER-1 (Part B): region_image's two calls.
+            spans.regionImageFromImageMs +=
+                telemetryDoubleValue( timing, "playback_prep_region_image_from_image_ms" );
+            spans.regionImageViewportMs +=
+                telemetryDoubleValue( timing, "playback_prep_region_image_viewport_ms" );
         }
     }
+    // CPU-S1-RECON-UNDER-LOOK-PACE-LEVER-1 (Part A): frames whose render consumed the phase-3 recon
+    // carry the worker's sub-spans under recon_worker_ (RenderFrameThread drawFrame).
+    m_playbackSmokeReconWorkerSplit.add( timing );
     m_playbackSmokePrepWorkerTotalSumMs += prepWorkerTotalMs;
     m_playbackSmokePrepResultQueueSumMs += prepResultQueueMs;
     m_playbackSmokePrepTotalBeforeFinishSumMs += prepTotalBeforeFinishMs;
@@ -30768,7 +30833,9 @@ void MainWindow::finishPlaybackSmokeTelemetry( const char *reason )
                    "pointwise_fast_refusal_counts=%30 "
                    "avg_playback_prep_region_setup_ms=%31 avg_playback_prep_region_image_ms=%32 "
                    "avg_playback_prep_region_present_ms=%33 avg_playback_prep_region_finish_ms=%34 "
-                   "avg_playback_prep_region_total_ms=%35 avg_playback_prep_region_unattributed_ms=%36" )
+                   "avg_playback_prep_region_total_ms=%35 avg_playback_prep_region_unattributed_ms=%36 "
+                   "avg_playback_prep_region_image_from_image_ms=%37 "
+                   "avg_playback_prep_region_image_viewport_ms=%38" )
                    .arg( static_cast<qulonglong>( m_playbackSmokeSessionId ) )
                    .arg( m_playbackSmokePresentedFrames )
                    .arg( spans.cpuRouteFrames )
@@ -30806,7 +30873,9 @@ void MainWindow::finishPlaybackSmokeTelemetry( const char *reason )
                    .arg( avgCpuRouteMs( spans.regionPresentMs ), 0, 'f', 3 )
                    .arg( avgCpuRouteMs( spans.regionFinishMs ), 0, 'f', 3 )
                    .arg( avgCpuRouteMs( spans.regionTotalMs ), 0, 'f', 3 )
-                   .arg( avgCpuRouteMs( spans.regionUnattributedMs ), 0, 'f', 3 );
+                   .arg( avgCpuRouteMs( spans.regionUnattributedMs ), 0, 'f', 3 )
+                   .arg( avgCpuRouteMs( spans.regionImageFromImageMs ), 0, 'f', 3 )
+                   .arg( avgCpuRouteMs( spans.regionImageViewportMs ), 0, 'f', 3 );
     }
 
     /* CPU-S2-WINDOWED-GUI-PRESENT-TELEMETRY-1: GUI-thread present-side cost. The preview viewport
@@ -30823,6 +30892,18 @@ void MainWindow::finishPlaybackSmokeTelemetry( const char *reason )
         {
             return count > 0 ? sum / static_cast<double>( count ) : 0.0;
         };
+        // CPU-S1-RECON-UNDER-LOOK-PACE-LEVER-1 (Part B): other busy by GUI handler (exclusive time
+        // inside the gap), appended after every existing field; per gap, like avg_gui_other_busy_ms.
+        QString otherBusySplit;
+        for( int i = 0; i < gui_present_gap::OtherBusySpans::kCount; ++i )
+        {
+            otherBusySplit += QStringLiteral( " avg_gui_other_busy_%1_ms=%2" )
+                                  .arg( QLatin1String( gui_present_gap::otherBusySpanName(
+                                            static_cast<gui_present_gap::OtherBusySpan>( i ) ) ) )
+                                  .arg( avgOver( m_guiOtherBusySpans.sumMs[i], gaps.gaps ), 0, 'f', 3 );
+        }
+        otherBusySplit += QStringLiteral( " avg_gui_other_busy_unattributed_ms=%1" )
+                              .arg( avgOver( m_guiOtherBusySpans.unattributedSumMs, gaps.gaps ), 0, 'f', 3 );
         qInfo().noquote()
             << QStringLiteral(
                    "playback_smoke.gui_present_summary session=%1 frames=%2 "
@@ -30846,8 +30927,20 @@ void MainWindow::finishPlaybackSmokeTelemetry( const char *reason )
                    .arg( avgOver( gaps.otherBusySumMs, gaps.gaps ), 0, 'f', 3 )
                    .arg( gaps.otherBusyMaxMs, 0, 'f', 3 )
                    .arg( m_guiPresentIdleProbeConnected ? QStringLiteral("dispatcher")
-                                                        : QStringLiteral("none") );
+                                                        : QStringLiteral("none") )
+               + otherBusySplit;
     }
+
+    /* CPU-S1-RECON-UNDER-LOOK-PACE-LEVER-1 (Part A): the phase-3 recon WORKER's own llrawproc /
+     * dual_iso_full20 sub-spans on presented frames whose render consumed its recon (the render
+     * thread's llrawproc_* keys are its own, zero on those frames). Fields: ReconWorkerSplit.h. */
+    qInfo().noquote()
+        << QStringLiteral( "playback_smoke.recon_worker_split_summary session=%1 frames=%2 "
+                           "full20_valid_frames=%3" )
+               .arg( static_cast<qulonglong>( m_playbackSmokeSessionId ) )
+               .arg( static_cast<qulonglong>( m_playbackSmokeReconWorkerSplit.frames ) )
+               .arg( static_cast<qulonglong>( m_playbackSmokeReconWorkerSplit.full20ValidFrames ) )
+           + m_playbackSmokeReconWorkerSplit.fieldsText();
 
     /* CPU-DEBAYERED16-REUSE-PHASE3-RECON-1: debayered-16 frames whose render
      * consumed the phase-3 recon (one recon per frame) versus ran its own decode
@@ -33705,6 +33798,7 @@ void MainWindow::finishPresentedFrame( uint64_t displayFrame,
 //Draw the frame when render thread is ready
 void MainWindow::drawFrameReady()
 {
+    const GuiOtherBusyScope otherBusySpan( this, gui_present_gap::OtherBusySpan::DrawFrameReady );
     // A frame that outlasted the drain bound presents on landing, never under the analysis.
     if( m_lookAssistPump.holdsPresentation() )
     {
