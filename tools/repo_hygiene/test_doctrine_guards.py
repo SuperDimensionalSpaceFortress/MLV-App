@@ -71,6 +71,14 @@ NON-PROMISES:
   hand-written recursion (os.scandir in a loop, a recursive function), a `grep -r`/`find`/`git
   ls-files` subprocess, a shell hook (.sh, .cmd), and a hook script that lives outside tools/hooks/
   (user-scope hooks are never tracked; prove those by a receipt).
+- DG-RED-MUTATION-VERDICT checks the CHECKER, not any mutation run: the tracked corpus
+  tools/repo_hygiene/red_mutation_verdict_corpus.json pins what red_mutation_verdict.verdict() and
+  probe_discriminates() must answer for 21 cases (the PR #705 2.8 s probe among them), and the guard fails when
+  one answer drifts or the corpus holds no PASS or no REFUSED case of a kind. Saved mutation output lives in
+  untracked .claude-state run dirs, so there is no live-tree evidence to scan; a lane runs
+  `py -3 tools/repo_hygiene/red_mutation_verdict.py verdict --output red.txt --expect <file:line>` on its own
+  red.txt. The checker's own limits are its module docstring NON-PROMISES (text only, default unittest and
+  pytest layouts, no proof the mutation was restored).
 
 If pwsh is not on PATH the AST guards SKIP with a reason; on a GitHub Actions
 runner (whose images carry pwsh) a missing pwsh FAILS instead.
@@ -90,6 +98,8 @@ import unittest
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Callable
+
+from . import red_mutation_verdict
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 PWSH_TIMEOUT_S = 300
@@ -663,6 +673,50 @@ def check_hook_walk_bound(root: Path, rel_paths: list[str]) -> list[Violation]:
             if not any(v.path == path and func == allowed for path, allowed, _why in HOOK_WALK_ALLOW)]
 
 
+RED_MUTATION_CORPUS = "tools/repo_hygiene/red_mutation_verdict_corpus.json"
+
+
+def is_red_mutation_corpus(rel: str) -> bool:
+    return rel == RED_MUTATION_CORPUS
+
+
+def check_red_mutation_verdict(root: Path, rel_paths: list[str]) -> list[Violation]:
+    """Fail when the checker's answer for any pinned corpus case differs from the recorded one."""
+    out: list[Violation] = []
+    for rel in rel_paths:
+        try:
+            cases = json.loads((root / rel).read_text(encoding="utf-8"))["cases"]
+            if not isinstance(cases, list) or not cases:
+                raise ValueError("cases is empty or not a list")
+        except (OSError, ValueError, KeyError, TypeError) as exc:
+            raise CouldNotCheck(f"{rel} is not a readable corpus: {exc}") from exc
+        seen: set[tuple[str, str]] = set()
+        for index, case in enumerate(cases, start=1):
+            try:
+                kind, want = case["kind"], case["expect"]
+                if kind == "verdict":
+                    got, why = red_mutation_verdict.verdict(case["output"], case["expected_assertion"])
+                elif kind == "probe":
+                    ok, why = red_mutation_verdict.probe_discriminates(
+                        case["bug_value"], case["fix_value"], tuple(case["window"]))
+                    got = red_mutation_verdict.PASS if ok else red_mutation_verdict.REFUSED
+                else:
+                    raise ValueError(f"unknown kind {kind!r}")
+            except (KeyError, TypeError, ValueError) as exc:
+                raise CouldNotCheck(f"{rel} case {index} is malformed: {exc!r}") from exc
+            seen.add((kind, want))
+            if got != want:
+                out.append(Violation("DG-RED-MUTATION-VERDICT", rel, index,
+                                     f"case {case.get('id')!r}: expected {want}, checker said {got} ({why})"))
+        for kind in ("verdict", "probe"):
+            for want in (red_mutation_verdict.PASS, red_mutation_verdict.REFUSED):
+                if (kind, want) not in seen:
+                    out.append(Violation("DG-RED-MUTATION-VERDICT", rel, 1,
+                                         f"corpus holds no {kind} case expecting {want}, so a checker that "
+                                         f"always answers the other way would pass"))
+    return out
+
+
 @dataclass(frozen=True)
 class Guard:
     id: str
@@ -690,6 +744,10 @@ REGISTRY: tuple[Guard, ...] = (
           "a per-turn hook script that walks a growing run-archive tree recursively (rglob, os.walk, -Recurse) "
           "saturates the machine, and the PreToolUse scan-guard never sees a hook's own process",
           is_hook_walk_scanned, check_hook_walk_bound, True),
+    Guard("DG-RED-MUTATION-VERDICT", "7cf7477",
+          "a test whose probe value cannot distinguish the bug from the fix passes under both, and a red-mutation "
+          "proof that only shows the suite went red does not show it failed AT the intended assertion",
+          is_red_mutation_corpus, check_red_mutation_verdict, False),
 )
 GUARDS = {g.id: g for g in REGISTRY}
 
@@ -912,6 +970,35 @@ FIXTURES: dict[str, dict[str, dict[str, str]]] = {
                                  "$b = Get-Content $f -Raw -Receipt 1\n",
         },
     },
+    "DG-RED-MUTATION-VERDICT": {
+        "red": {
+            # Two cases whose recorded answer is wrong: a red run with no named assertion is not a PASS, and
+            # the PR #705 probe (bug and fix both read 3) does not discriminate. No REFUSED case of either
+            # kind, so the "always answers PASS" checker would also go unnoticed: line 1 reports that too.
+            RED_MUTATION_CORPUS: json.dumps({"cases": [
+                {"id": "red-no-assertion", "kind": "verdict", "expect": "PASS",
+                 "output": "Ran 1 test in 0.001s\n\nFAILED (failures=1)\n", "expected_assertion": "t.py:1"},
+                {"id": "probe-705", "kind": "probe", "expect": "PASS",
+                 "bug_value": 3, "fix_value": 3, "window": [3, 3]},
+            ]}),
+        },
+        "green": {
+            RED_MUTATION_CORPUS: json.dumps({"cases": [
+                {"id": "fails-at-expected-line", "kind": "verdict", "expect": "PASS",
+                 "output": ("=" * 70 + "\nFAIL: test_a (t.T.test_a)\n" + "-" * 70 + "\n"
+                            "Traceback (most recent call last):\n  File \"t.py\", line 8, in test_a\n"
+                            "    self.assertEqual(3, 4)\nAssertionError: 3 != 4\n\n" + "-" * 70
+                            + "\nRan 1 test in 0.001s\n\nFAILED (failures=1)\n"),
+                 "expected_assertion": "t.py:8"},
+                {"id": "red-no-assertion", "kind": "verdict", "expect": "REFUSED",
+                 "output": "Ran 1 test in 0.001s\n\nFAILED (failures=1)\n", "expected_assertion": "t.py:8"},
+                {"id": "probe-705-2.8s", "kind": "probe", "expect": "REFUSED",
+                 "bug_value": 3, "fix_value": 3, "window": [3, 3]},
+                {"id": "probe-705-2.2s", "kind": "probe", "expect": "PASS",
+                 "bug_value": 3, "fix_value": 2.2, "window": [2.0, 2.5]},
+            ]}),
+        },
+    },
 }
 
 _LIVE: dict[str, tuple[list[Violation], float]] = {}
@@ -963,6 +1050,8 @@ class RegistryTests(unittest.TestCase):
         self.assertFalse(is_hook_walk_scanned("tools/other/session-checkpoint.py"))
         self.assertFalse(is_hook_walk_scanned("tools/hooks/README.md"))
         self.assertFalse(is_hook_walk_scanned("tools/coordination/x.py"))
+        self.assertTrue(is_red_mutation_corpus("tools/repo_hygiene/red_mutation_verdict_corpus.json"))
+        self.assertFalse(is_red_mutation_corpus("x/tools/repo_hygiene/red_mutation_verdict_corpus.json"))
 
     def test_untracked_files_are_not_checked(self) -> None:
         if shutil.which("git") is None:
@@ -1078,6 +1167,22 @@ class GuardFixtureTests(_PwshMixin, unittest.TestCase):
             both = walk + "TOP = list(os.walk('.'))\n"
             self.assertEqual(len(check_hook_walk_bound(root, _write_tree(root, {path: both}))), 1)
 
+    def test_red_mutation_verdict_red_fails(self) -> None:
+        self._assert_red("DG-RED-MUTATION-VERDICT", {(RED_MUTATION_CORPUS, 1), (RED_MUTATION_CORPUS, 2)})
+
+    def test_red_mutation_verdict_green_passes(self) -> None:
+        self._assert_green("DG-RED-MUTATION-VERDICT")
+
+    def test_red_mutation_verdict_malformed_corpus_is_could_not_check(self) -> None:
+        guard = GUARDS["DG-RED-MUTATION-VERDICT"]
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            for text in ("{not json", json.dumps({"cases": []}),
+                         json.dumps({"cases": [{"kind": "verdict", "expect": "PASS"}]})):
+                rels = _write_tree(root, {RED_MUTATION_CORPUS: text})
+                with self.assertRaises(CouldNotCheck, msg=text):
+                    run_guard(guard, root, rels)
+
     def test_ps_one_trap_red_fails(self) -> None:
         self._assert_red("PS-ONE-TRAP", {("a.ps1", 3), ("b.ps1", 3), ("c.ps1", 4),
                                           ("d.ps1", 3), ("e.ps1", 4), ("e.ps1", 8),
@@ -1132,6 +1237,10 @@ class LiveTreeTests(_PwshMixin, unittest.TestCase):
 
     def test_live_tree_hook_walk_bound(self) -> None:
         self._assert_live_green("DG-HOOK-WALK-BOUND")
+
+    def test_live_tree_red_mutation_verdict(self) -> None:
+        # The live input is the tracked corpus; saved mutation runs sit in untracked run dirs (see NON-PROMISES).
+        self._assert_live_green("DG-RED-MUTATION-VERDICT")
 
     def test_hook_walk_allowlist_has_no_stale_entries(self) -> None:
         rels = [p for p in tracked_files(REPO_ROOT) if is_hook_walk_scanned(p)]

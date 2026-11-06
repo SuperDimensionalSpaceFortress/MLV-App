@@ -1,0 +1,198 @@
+{
+ "schema": "red-mutation-verdict-corpus.v1",
+ "note": "Pinned cases for tools/repo_hygiene/red_mutation_verdict.py. Each case records the verdict the checker must return; DG-RED-MUTATION-VERDICT fails when any case disagrees.",
+ "cases": [
+  {
+   "id": "ut-fails-at-expected-line",
+   "kind": "verdict",
+   "why": "unittest FAIL block whose frame is the expected file:line",
+   "output": "test_a (test_s.T.test_a) ... FAIL\ntest_b (test_s.T.test_b) ... ok\ntest_c (test_s.T.test_c) ... FAIL\ntest_d (test_s.T.test_d) ... ERROR\n\n======================================================================\nERROR: test_d (test_s.T.test_d)\n----------------------------------------------------------------------\nTraceback (most recent call last):\n  File \"C:\\work\\test_s.py\", line 17, in test_d\n    raise TypeError(\"boom\")\nTypeError: boom\n\n======================================================================\nFAIL: test_a (test_s.T.test_a)\n----------------------------------------------------------------------\nTraceback (most recent call last):\n  File \"C:\\work\\test_s.py\", line 8, in test_a\n    self.assertEqual(3, 4)\n    ~~~~~~~~~~~~~~~~^^^^^^\nAssertionError: 3 != 4\n\n======================================================================\nFAIL: test_c (test_s.T.test_c)\n----------------------------------------------------------------------\nTraceback (most recent call last):\n  File \"C:\\work\\test_s.py\", line 14, in test_c\n    helper(2)\n    ~~~~~~^^^\n  File \"C:\\work\\test_s.py\", line 4, in helper\n    assert x == 1, \"helper\"\n           ^^^^^^\nAssertionError: helper\n\n----------------------------------------------------------------------\nRan 4 tests in 0.001s\n\nFAILED (failures=2, errors=1)\n",
+   "expected_assertion": "test_s.py:8",
+   "expect": "PASS"
+  },
+  {
+   "id": "ut-fails-at-expected-test-id",
+   "kind": "verdict",
+   "why": "unittest FAIL block whose id is the expected test",
+   "output": "test_a (test_s.T.test_a) ... FAIL\ntest_b (test_s.T.test_b) ... ok\ntest_c (test_s.T.test_c) ... FAIL\ntest_d (test_s.T.test_d) ... ERROR\n\n======================================================================\nERROR: test_d (test_s.T.test_d)\n----------------------------------------------------------------------\nTraceback (most recent call last):\n  File \"C:\\work\\test_s.py\", line 17, in test_d\n    raise TypeError(\"boom\")\nTypeError: boom\n\n======================================================================\nFAIL: test_a (test_s.T.test_a)\n----------------------------------------------------------------------\nTraceback (most recent call last):\n  File \"C:\\work\\test_s.py\", line 8, in test_a\n    self.assertEqual(3, 4)\n    ~~~~~~~~~~~~~~~~^^^^^^\nAssertionError: 3 != 4\n\n======================================================================\nFAIL: test_c (test_s.T.test_c)\n----------------------------------------------------------------------\nTraceback (most recent call last):\n  File \"C:\\work\\test_s.py\", line 14, in test_c\n    helper(2)\n    ~~~~~~^^^\n  File \"C:\\work\\test_s.py\", line 4, in helper\n    assert x == 1, \"helper\"\n           ^^^^^^\nAssertionError: helper\n\n----------------------------------------------------------------------\nRan 4 tests in 0.001s\n\nFAILED (failures=2, errors=1)\n",
+   "expected_assertion": "test_s.T.test_a",
+   "expect": "PASS"
+  },
+  {
+   "id": "ut-fails-through-helper-frame",
+   "kind": "verdict",
+   "why": "the expected line is the caller frame of a helper that raised",
+   "output": "test_a (test_s.T.test_a) ... FAIL\ntest_b (test_s.T.test_b) ... ok\ntest_c (test_s.T.test_c) ... FAIL\ntest_d (test_s.T.test_d) ... ERROR\n\n======================================================================\nERROR: test_d (test_s.T.test_d)\n----------------------------------------------------------------------\nTraceback (most recent call last):\n  File \"C:\\work\\test_s.py\", line 17, in test_d\n    raise TypeError(\"boom\")\nTypeError: boom\n\n======================================================================\nFAIL: test_a (test_s.T.test_a)\n----------------------------------------------------------------------\nTraceback (most recent call last):\n  File \"C:\\work\\test_s.py\", line 8, in test_a\n    self.assertEqual(3, 4)\n    ~~~~~~~~~~~~~~~~^^^^^^\nAssertionError: 3 != 4\n\n======================================================================\nFAIL: test_c (test_s.T.test_c)\n----------------------------------------------------------------------\nTraceback (most recent call last):\n  File \"C:\\work\\test_s.py\", line 14, in test_c\n    helper(2)\n    ~~~~~~^^^\n  File \"C:\\work\\test_s.py\", line 4, in helper\n    assert x == 1, \"helper\"\n           ^^^^^^\nAssertionError: helper\n\n----------------------------------------------------------------------\nRan 4 tests in 0.001s\n\nFAILED (failures=2, errors=1)\n",
+   "expected_assertion": "test_s.py:14",
+   "expect": "PASS"
+  },
+  {
+   "id": "ut-expected-test-passed",
+   "kind": "verdict",
+   "why": "test_b passed, so a red run elsewhere does not name it",
+   "output": "test_a (test_s.T.test_a) ... FAIL\ntest_b (test_s.T.test_b) ... ok\ntest_c (test_s.T.test_c) ... FAIL\ntest_d (test_s.T.test_d) ... ERROR\n\n======================================================================\nERROR: test_d (test_s.T.test_d)\n----------------------------------------------------------------------\nTraceback (most recent call last):\n  File \"C:\\work\\test_s.py\", line 17, in test_d\n    raise TypeError(\"boom\")\nTypeError: boom\n\n======================================================================\nFAIL: test_a (test_s.T.test_a)\n----------------------------------------------------------------------\nTraceback (most recent call last):\n  File \"C:\\work\\test_s.py\", line 8, in test_a\n    self.assertEqual(3, 4)\n    ~~~~~~~~~~~~~~~~^^^^^^\nAssertionError: 3 != 4\n\n======================================================================\nFAIL: test_c (test_s.T.test_c)\n----------------------------------------------------------------------\nTraceback (most recent call last):\n  File \"C:\\work\\test_s.py\", line 14, in test_c\n    helper(2)\n    ~~~~~~^^^\n  File \"C:\\work\\test_s.py\", line 4, in helper\n    assert x == 1, \"helper\"\n           ^^^^^^\nAssertionError: helper\n\n----------------------------------------------------------------------\nRan 4 tests in 0.001s\n\nFAILED (failures=2, errors=1)\n",
+   "expected_assertion": "test_s.py:11",
+   "expect": "REFUSED"
+  },
+  {
+   "id": "ut-expected-site-raised-non-assertion",
+   "kind": "verdict",
+   "why": "TypeError at the expected line is an ERROR block, not an assertion",
+   "output": "test_a (test_s.T.test_a) ... FAIL\ntest_b (test_s.T.test_b) ... ok\ntest_c (test_s.T.test_c) ... FAIL\ntest_d (test_s.T.test_d) ... ERROR\n\n======================================================================\nERROR: test_d (test_s.T.test_d)\n----------------------------------------------------------------------\nTraceback (most recent call last):\n  File \"C:\\work\\test_s.py\", line 17, in test_d\n    raise TypeError(\"boom\")\nTypeError: boom\n\n======================================================================\nFAIL: test_a (test_s.T.test_a)\n----------------------------------------------------------------------\nTraceback (most recent call last):\n  File \"C:\\work\\test_s.py\", line 8, in test_a\n    self.assertEqual(3, 4)\n    ~~~~~~~~~~~~~~~~^^^^^^\nAssertionError: 3 != 4\n\n======================================================================\nFAIL: test_c (test_s.T.test_c)\n----------------------------------------------------------------------\nTraceback (most recent call last):\n  File \"C:\\work\\test_s.py\", line 14, in test_c\n    helper(2)\n    ~~~~~~^^^\n  File \"C:\\work\\test_s.py\", line 4, in helper\n    assert x == 1, \"helper\"\n           ^^^^^^\nAssertionError: helper\n\n----------------------------------------------------------------------\nRan 4 tests in 0.001s\n\nFAILED (failures=2, errors=1)\n",
+   "expected_assertion": "test_s.py:17",
+   "expect": "REFUSED"
+  },
+  {
+   "id": "ut-import-error-is-not-the-assertion",
+   "kind": "verdict",
+   "why": "red from a failed import (collection) names no assertion",
+   "output": "E\n======================================================================\nERROR: test_bad (unittest.loader._FailedTest.test_bad)\n----------------------------------------------------------------------\nImportError: Failed to import test module: test_bad\nTraceback (most recent call last):\n  File \"C:\\py\\Lib\\unittest\\loader.py\", line 137, in loadTestsFromName\n    module = __import__(module_name)\n  File \"C:\\work\\test_bad.py\", line 1, in <module>\n    import nonexistent_mod_zz\nModuleNotFoundError: No module named 'nonexistent_mod_zz'\n\n\n----------------------------------------------------------------------\nRan 1 test in 0.000s\n\nFAILED (errors=1)\n",
+   "expected_assertion": "test_bad.py:1",
+   "expect": "REFUSED"
+  },
+  {
+   "id": "ut-green-run",
+   "kind": "verdict",
+   "why": "a mutation no assertion saw",
+   "output": "Ran 4 tests in 0.001s\n\nOK\n",
+   "expected_assertion": "test_s.py:8",
+   "expect": "REFUSED"
+  },
+  {
+   "id": "ut-red-names-no-assertion",
+   "kind": "verdict",
+   "why": "bare FAILED trailer with no block",
+   "output": "Ran 1 test in 0.000s\n\nFAILED (failures=1)\n",
+   "expected_assertion": "test_s.py:8",
+   "expect": "REFUSED"
+  },
+  {
+   "id": "unrecognized-output",
+   "kind": "verdict",
+   "why": "nothing parseable is never a pass",
+   "output": "hello world\n",
+   "expected_assertion": "test_s.py:8",
+   "expect": "REFUSED"
+  },
+  {
+   "id": "no-expected-assertion-given",
+   "kind": "verdict",
+   "why": "a red suite with no claimed site proves nothing",
+   "output": "test_a (test_s.T.test_a) ... FAIL\ntest_b (test_s.T.test_b) ... ok\ntest_c (test_s.T.test_c) ... FAIL\ntest_d (test_s.T.test_d) ... ERROR\n\n======================================================================\nERROR: test_d (test_s.T.test_d)\n----------------------------------------------------------------------\nTraceback (most recent call last):\n  File \"C:\\work\\test_s.py\", line 17, in test_d\n    raise TypeError(\"boom\")\nTypeError: boom\n\n======================================================================\nFAIL: test_a (test_s.T.test_a)\n----------------------------------------------------------------------\nTraceback (most recent call last):\n  File \"C:\\work\\test_s.py\", line 8, in test_a\n    self.assertEqual(3, 4)\n    ~~~~~~~~~~~~~~~~^^^^^^\nAssertionError: 3 != 4\n\n======================================================================\nFAIL: test_c (test_s.T.test_c)\n----------------------------------------------------------------------\nTraceback (most recent call last):\n  File \"C:\\work\\test_s.py\", line 14, in test_c\n    helper(2)\n    ~~~~~~^^^\n  File \"C:\\work\\test_s.py\", line 4, in helper\n    assert x == 1, \"helper\"\n           ^^^^^^\nAssertionError: helper\n\n----------------------------------------------------------------------\nRan 4 tests in 0.001s\n\nFAILED (failures=2, errors=1)\n",
+   "expected_assertion": "",
+   "expect": "REFUSED"
+  },
+  {
+   "id": "pt-fails-at-expected-line",
+   "kind": "verdict",
+   "why": "pytest section with the file:line location",
+   "output": "============================= test session starts =============================\ncollected 4 items\n\ntest_s.py F.FF                                                           [100%]\n\n================================== FAILURES ===================================\n__________________________________ T.test_a ___________________________________\n\nself = <test_s.T testMethod=test_a>\n\n    def test_a(self):\n>       self.assertEqual(3, 4)\nE       AssertionError: 3 != 4\n\ntest_s.py:8: AssertionError\n__________________________________ T.test_c ___________________________________\n\nself = <test_s.T testMethod=test_c>\n\n    def test_c(self):\n>       helper(2)\n\ntest_s.py:14: \n_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _\n\nx = 2\n\n    def helper(x):\n>       assert x == 1, \"helper\"\nE       AssertionError: helper\nE       assert 2 == 1\n\ntest_s.py:4: AssertionError\n__________________________________ T.test_d ___________________________________\n\nself = <test_s.T testMethod=test_d>\n\n    def test_d(self):\n>       raise TypeError(\"boom\")\nE       TypeError: boom\n\ntest_s.py:17: TypeError\n=========================== short test summary info ===========================\nFAILED test_s.py::T::test_a - AssertionError: 3 != 4\nFAILED test_s.py::T::test_c - AssertionError: helper\nFAILED test_s.py::T::test_d - TypeError: boom\n========================= 3 failed, 1 passed in 0.33s =========================\n",
+   "expected_assertion": "test_s.py:8",
+   "expect": "PASS"
+  },
+  {
+   "id": "pt-fails-at-expected-node-id",
+   "kind": "verdict",
+   "why": "pytest node id from the FAILED summary",
+   "output": "============================= test session starts =============================\ncollected 4 items\n\ntest_s.py F.FF                                                           [100%]\n\n================================== FAILURES ===================================\n__________________________________ T.test_a ___________________________________\n\nself = <test_s.T testMethod=test_a>\n\n    def test_a(self):\n>       self.assertEqual(3, 4)\nE       AssertionError: 3 != 4\n\ntest_s.py:8: AssertionError\n__________________________________ T.test_c ___________________________________\n\nself = <test_s.T testMethod=test_c>\n\n    def test_c(self):\n>       helper(2)\n\ntest_s.py:14: \n_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _\n\nx = 2\n\n    def helper(x):\n>       assert x == 1, \"helper\"\nE       AssertionError: helper\nE       assert 2 == 1\n\ntest_s.py:4: AssertionError\n__________________________________ T.test_d ___________________________________\n\nself = <test_s.T testMethod=test_d>\n\n    def test_d(self):\n>       raise TypeError(\"boom\")\nE       TypeError: boom\n\ntest_s.py:17: TypeError\n=========================== short test summary info ===========================\nFAILED test_s.py::T::test_a - AssertionError: 3 != 4\nFAILED test_s.py::T::test_c - AssertionError: helper\nFAILED test_s.py::T::test_d - TypeError: boom\n========================= 3 failed, 1 passed in 0.33s =========================\n",
+   "expected_assertion": "test_s.py::T::test_a",
+   "expect": "PASS"
+  },
+  {
+   "id": "pt-expected-site-raised-non-assertion",
+   "kind": "verdict",
+   "why": "E TypeError at the expected line",
+   "output": "============================= test session starts =============================\ncollected 4 items\n\ntest_s.py F.FF                                                           [100%]\n\n================================== FAILURES ===================================\n__________________________________ T.test_a ___________________________________\n\nself = <test_s.T testMethod=test_a>\n\n    def test_a(self):\n>       self.assertEqual(3, 4)\nE       AssertionError: 3 != 4\n\ntest_s.py:8: AssertionError\n__________________________________ T.test_c ___________________________________\n\nself = <test_s.T testMethod=test_c>\n\n    def test_c(self):\n>       helper(2)\n\ntest_s.py:14: \n_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _\n\nx = 2\n\n    def helper(x):\n>       assert x == 1, \"helper\"\nE       AssertionError: helper\nE       assert 2 == 1\n\ntest_s.py:4: AssertionError\n__________________________________ T.test_d ___________________________________\n\nself = <test_s.T testMethod=test_d>\n\n    def test_d(self):\n>       raise TypeError(\"boom\")\nE       TypeError: boom\n\ntest_s.py:17: TypeError\n=========================== short test summary info ===========================\nFAILED test_s.py::T::test_a - AssertionError: 3 != 4\nFAILED test_s.py::T::test_c - AssertionError: helper\nFAILED test_s.py::T::test_d - TypeError: boom\n========================= 3 failed, 1 passed in 0.33s =========================\n",
+   "expected_assertion": "test_s.py:17",
+   "expect": "REFUSED"
+  },
+  {
+   "id": "pt-collection-error",
+   "kind": "verdict",
+   "why": "pytest collecting error",
+   "output": "============================= test session starts =============================\ncollected 0 items / 1 error\n\n=================================== ERRORS ====================================\n________________________ ERROR collecting test_bad.py _________________________\nImportError while importing test module 'C:\\work\\test_bad.py'.\nHint: make sure your test modules/packages have valid Python names.\nTraceback:\nC:\\py\\Lib\\importlib\\__init__.py:88: in import_module\n    return _bootstrap._gcd_import(name[level:], package, level)\n           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\ntest_bad.py:1: in <module>\n    import nonexistent_mod_zz\nE   ModuleNotFoundError: No module named 'nonexistent_mod_zz'\n!!!!!!!!!!!!!!!!!!! Interrupted: 1 error during collection !!!!!!!!!!!!!!!!!!!!\n============================== 1 error in 0.40s ===============================\n",
+   "expected_assertion": "test_bad.py:1",
+   "expect": "REFUSED"
+  },
+  {
+   "id": "pt-green-run",
+   "kind": "verdict",
+   "why": "pytest all passed",
+   "output": "=========== 4 passed in 0.10s ===========\n",
+   "expected_assertion": "test_s.py:8",
+   "expect": "REFUSED"
+  },
+  {
+   "id": "probe-705-2.8s-rounds-to-3-both-ways",
+   "kind": "probe",
+   "why": "PR #705 B1: probe 2.8 s; Int32 overload ceil(2.8)=3, fixed double overload round(2.8)=3; window [3,3]",
+   "bug_value": 3,
+   "fix_value": 3,
+   "window": [
+    3,
+    3
+   ],
+   "expect": "REFUSED"
+  },
+  {
+   "id": "probe-705-2.2s-separates",
+   "kind": "probe",
+   "why": "probe 2.2 s: bug reads ceil(2.2)=3, fix reads 2.2; window [2.0, 2.5]",
+   "bug_value": 3,
+   "fix_value": 2.2,
+   "window": [
+    2.0,
+    2.5
+   ],
+   "expect": "PASS"
+  },
+  {
+   "id": "probe-minutes-vs-seconds-30-passes-both",
+   "kind": "probe",
+   "why": "bus trap probe 30: seconds left on the timeout is 30 s (bug, read as seconds) or 1800 s (fix, read as minutes); 'not expired at 2 s' needs >= 2 s, so both pass",
+   "bug_value": 30,
+   "fix_value": 1800,
+   "window": [
+    2,
+    1000000000
+   ],
+   "expect": "REFUSED"
+  },
+  {
+   "id": "probe-minutes-vs-seconds-0.05-separates",
+   "kind": "probe",
+   "why": "probe 0.05: 0.05 minutes = 3 s (fix), 0.05 s (bug); the assertion window on the reading is [1, 5] s",
+   "bug_value": 0.05,
+   "fix_value": 3,
+   "window": [
+    1,
+    5
+   ],
+   "expect": "PASS"
+  },
+  {
+   "id": "probe-bug-inside-fix-outside",
+   "kind": "probe",
+   "why": "passes under the bug, fails under the fix",
+   "bug_value": 3,
+   "fix_value": 9,
+   "window": [
+    0,
+    5
+   ],
+   "expect": "REFUSED"
+  },
+  {
+   "id": "probe-empty-window",
+   "kind": "probe",
+   "why": "lo > hi",
+   "bug_value": 1,
+   "fix_value": 2,
+   "window": [
+    5,
+    1
+   ],
+   "expect": "REFUSED"
+  }
+ ]
+}
