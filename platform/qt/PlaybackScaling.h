@@ -1256,21 +1256,33 @@ inline int playbackSuppressUniformTopMagentaBandImage(QImage &image)
     return rows;
 }
 
-/* r2 (adversary A2): the presented-content hash (draw_frame_ready.present_content). A sampled FNV-1a
- * that mixes EVERY byte of each sampled pixel, so a sample step that is a multiple of the pixel size
- * cannot lock onto one channel (RGB32 step 3000 read only blue; RGB888 step 2250 only red).
- * bytesPerPixel <= 1 hashes the one sampled byte, as before. */
-inline uint64_t playbackPresentedContentHash(const uint8_t *bits, size_t bytes, int bytesPerPixel)
+/* r2 (adversary A2, pass-2 A1): the presented-content hash (draw_frame_ready.present_content). A
+ * sampled FNV-1a over every byte of the PIXEL each sample lands in: the sample is snapped to the start
+ * of its pixel in its row (a sample in the row padding takes the row's last pixel), so the step can
+ * neither lock onto one channel (RGB32 step 3000 read only blue; RGB888 step 2250 only red) nor
+ * straddle two pixels and miss a channel (step 3009 read bytes 6018..6021 and missed pixel 1504's
+ * blue at 6016). bytesPerPixel <= 1 hashes the one sampled byte. */
+inline uint64_t playbackPresentedContentHash(const uint8_t *bits,
+                                             int width,
+                                             int height,
+                                             int bytesPerLine,
+                                             int bytesPerPixel)
 {
     uint64_t hash = 1469598103934665603ull;
-    if( !bits || bytes == 0 ) return hash;
+    if( !bits || width <= 0 || height <= 0 || bytesPerLine <= 0 ) return hash;
+    const size_t bpl = static_cast<size_t>( bytesPerLine );
+    const size_t bytes = bpl * static_cast<size_t>( height );
     const size_t pixelBytes = bytesPerPixel > 1 ? static_cast<size_t>( bytesPerPixel ) : 1u;
+    const size_t lastPixel = static_cast<size_t>( width ) - 1u;
     const size_t step = std::max( static_cast<size_t>( 1 ), bytes / 8192 );
     for( size_t i = 0; i < bytes; i += step )
     {
-        for( size_t k = 0; k < pixelBytes && i + k < bytes; ++k )
+        const size_t rowStart = ( i / bpl ) * bpl;
+        const size_t pixel = std::min( ( i - rowStart ) / pixelBytes, lastPixel );
+        const size_t at = rowStart + pixel * pixelBytes;
+        for( size_t k = 0; k < pixelBytes && at + k < bytes; ++k )
         {
-            hash ^= bits[i + k];
+            hash ^= bits[at + k];
             hash *= 1099511628211ull;
         }
     }

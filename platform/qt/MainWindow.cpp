@@ -6555,14 +6555,14 @@ void MainWindow::presentPlaybackPreparedFrame( const PlaybackPrepResult &result 
     if( interactiveTraceEnabled() && !displayImage.isNull() )
     {
         const uchar *contentBits = displayImage.constBits();
-        const size_t contentBytes =
-            static_cast<size_t>( displayImage.bytesPerLine() )
-            * static_cast<size_t>( displayImage.height() );
-        // CPU-S1-RECON-UNDER-LOOK-PACE-LEVER-1 r2 (adversary A2): every byte of each sampled pixel
-        // is mixed, so the step cannot lock onto one channel of an RGB32 (or RGB888) frame.
+        // CPU-S1-RECON-UNDER-LOOK-PACE-LEVER-1 r2 (adversary A2, pass-2 A1): every byte of the pixel
+        // each sample lands in is mixed, so the step can neither lock onto one channel nor straddle
+        // two pixels of an RGB32 (or RGB888) frame.
         const uint64_t contentHash =
             playbackPresentedContentHash( contentBits,
-                                          contentBytes,
+                                          displayImage.width(),
+                                          displayImage.height(),
+                                          static_cast<int>( displayImage.bytesPerLine() ),
                                           playbackPreparedBytesPerPixel( displayImage.format() ) );
         logInteractionEvent(
             QStringLiteral("draw_frame_ready.present_content"),

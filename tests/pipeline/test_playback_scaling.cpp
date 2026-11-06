@@ -1352,7 +1352,7 @@ TEST(PlaybackScaling, FastRgb32ImageOwnsItsPixelsPastTheBuilder)
     std::vector<uint8_t> borrowed = pair.rgb32;
     const QPixmap shared = QPixmap::fromImage( playbackWrapRgb32Image( borrowed.data(), 1280, 720 ) );
     std::fill( borrowed.begin(), borrowed.end(), static_cast<uint8_t>( 0 ) );
-    ASSERT_FALSE(pixmap_image( shared ) == pixmap_image( expected ));
+    ASSERT_FALSE(pixmap_image( shared.toImage() ) == pixmap_image( expected ));
 }
 
 /* r2 adversary A2 (introduced, major): the presented-content hash sampled one byte every
@@ -1386,7 +1386,8 @@ TEST(PlaybackScaling, PresentedContentHashFollowsEveryChannel)
             QImage frame( width, height, rgb32 ? QImage::Format_RGB32 : QImage::Format_RGB888 );
             frame.fill( rgb32 ? QColor( 20 + i, 0, 0 ) : QColor( 0, 20 + i, 0 ) );
             const size_t bytes = static_cast<size_t>( frame.bytesPerLine() ) * static_cast<size_t>( frame.height() );
-            fresh.push_back( playbackPresentedContentHash( frame.constBits(), bytes,
+            fresh.push_back( playbackPresentedContentHash( frame.constBits(), frame.width(), frame.height(),
+                                                           static_cast<int>( frame.bytesPerLine() ),
                                                            playbackPreparedBytesPerPixel( frame.format() ) ) );
             old.push_back( oldHash( frame.constBits(), bytes, rgb32 ) );
         }
@@ -1395,6 +1396,41 @@ TEST(PlaybackScaling, PresentedContentHashFollowsEveryChannel)
         ASSERT_EQ(fresh.size(), static_cast<size_t>( std::unique( distinct.begin(), distinct.end() ) - distinct.begin() ));
         // RED: the one-byte sampler hashed all eleven frames the same.
         ASSERT_TRUE(std::all_of( old.begin(), old.end(), [&]( uint64_t v ) { return v == old.front(); } ));
+    }
+
+    /* r2 adversary pass-2 A1 (introduced, major): a146e9a9 hashed bytesPerPixel bytes from the
+     * UNALIGNED sample offset. At 3840x1605 RGB32 the step is 3009: the sample at 6018 read bytes
+     * 6018..6021 and missed pixel 1504's blue byte (6016). Input: opaque black frames except pixel
+     * (1504,0) = (0,0,20+f), f=0..10. The RGB888 arm (step 2257, sample 4514 in pixel 1504 at
+     * 4512..4514) missed its red byte the same way: pixel (1504,0) = (20+f,0,0). */
+    const auto unalignedHash = []( const uint8_t *bits, size_t bytes, size_t pixelBytes ) -> uint64_t
+    {
+        uint64_t h = 1469598103934665603ull;
+        const size_t step = std::max( static_cast<size_t>( 1 ), bytes / 8192 );
+        for( size_t i = 0; i < bytes; i += step )
+            for( size_t k = 0; k < pixelBytes && i + k < bytes; ++k ) { h ^= bits[i + k]; h *= 1099511628211ull; }
+        return h;
+    };
+    for( const bool rgb32 : { true, false } )
+    {
+        std::vector<uint64_t> fresh;
+        std::vector<uint64_t> unaligned;
+        for( int f = 0; f <= 10; ++f )
+        {
+            QImage frame( 3840, 1605, rgb32 ? QImage::Format_RGB32 : QImage::Format_RGB888 );
+            frame.fill( QColor( 0, 0, 0 ) );
+            frame.setPixelColor( 1504, 0, rgb32 ? QColor( 0, 0, 20 + f ) : QColor( 20 + f, 0, 0 ) );
+            const size_t bytes = static_cast<size_t>( frame.bytesPerLine() ) * static_cast<size_t>( frame.height() );
+            const int bpp = playbackPreparedBytesPerPixel( frame.format() );
+            fresh.push_back( playbackPresentedContentHash( frame.constBits(), frame.width(), frame.height(),
+                                                           static_cast<int>( frame.bytesPerLine() ), bpp ) );
+            unaligned.push_back( unalignedHash( frame.constBits(), bytes, static_cast<size_t>( bpp ) ) );
+        }
+        std::vector<uint64_t> distinct = fresh;
+        std::sort( distinct.begin(), distinct.end() );
+        ASSERT_EQ(fresh.size(), static_cast<size_t>( std::unique( distinct.begin(), distinct.end() ) - distinct.begin() ));
+        // RED: the unaligned a146e9a9 sampler hashed all eleven frames the same.
+        ASSERT_TRUE(std::all_of( unaligned.begin(), unaligned.end(), [&]( uint64_t v ) { return v == unaligned.front(); } ));
     }
     ASSERT_EQ(4, playbackPreparedBytesPerPixel( QImage::Format_RGB32 ));
     ASSERT_EQ(3, playbackPreparedBytesPerPixel( QImage::Format_RGB888 ));
