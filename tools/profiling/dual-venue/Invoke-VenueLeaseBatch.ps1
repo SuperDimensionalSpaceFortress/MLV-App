@@ -1601,6 +1601,23 @@ function Write-RunSummary {
     Write-Output $resultLine
 }
 
+# BENCH-START-CAP-FROM-LEG-COUNT-1: with no -DeadlineUtc the run's deadline is sized from the planned leg count and the legs' own seconds (Get-VenueRunStartCap, which replays the lease
+# cap, cooldown and budget this run just resolved), never shorter than the legacy fixed 6 h window; a caller's -DeadlineUtc is kept as given. One START_CAP line records the inputs.
+if ($DeadlineUtc) {
+    LogBest "START_CAP source=explicit capUtc=$($deadline.ToString('o')) legs=$($plan.Count) (the caller's -DeadlineUtc is kept)"
+} else {
+    # a sizing failure (a lease that holds no leg, a value outside the DateTime range) never stops the run: it is said on a typed line and the legacy 6 h window stands.
+    # r3 (adversary pass 2 A4): every line of this block is LogBest, not L. A batch.log that cannot be written threw out of L inside the try, the catch's own L threw again, and the
+    # run died before BATCH_RUN_START and the summary; now a log failure is counted and said, and the sizing still stands.
+    try {
+        $capPlan = Get-VenuePlanPlaySeconds -SpecPaths @($plan | ForEach-Object { [string]$_.spec })
+        if ($capPlan.line) { LogBest $capPlan.line }
+        $startCap = Get-VenueRunStartCap -NowUtc $t0 -LegCount ([Math]::Max(1, $plan.Count)) -PlaySeconds $capPlan.playSeconds -MaxPlaySeconds $capPlan.maxPlaySeconds -LegPlaySeconds $capPlan.legSeconds -LegCooldownSec $CooldownSec -Leases @($leases) -CapSec $LeaseCapSec -CooldownSec $LeaseCooldownSec -WindowSec $LeaseBudgetWindowSec -BudgetSec $LeaseBudgetSec -LegBudgetSec $LegBudgetSec -LeaseMarginSec $LeaseMarginSec
+        if ($startCap.capUtc -gt $deadline) { $deadline = $startCap.capUtc; $capDeadlineLine = "START_CAP_DEADLINE deadline=$($deadline.ToString('o')) (sized from $($plan.Count) planned legs; the legacy 6 h window would have ended earlier)" } else { $capDeadlineLine = $null }
+        foreach ($capLine in $startCap.lines) { LogBest $capLine }
+        if ($capDeadlineLine) { LogBest $capDeadlineLine }
+    } catch { LogBest "START_CAP source=legacy legs=$($plan.Count) deadline=$($deadline.ToString('o')) reason=$("$($_.Exception.Message)" -replace '\s+', ' ')" }
+}
 L "BATCH_RUN_START venue=$Venue legs=$($plan.Count) runDir=$RunDir agentShare=$AgentShare deadline=$($deadline.ToString('o')) threshold=$ThresholdPercent legBudgetSec=$LegBudgetSec leaseMarginSec=$LeaseMarginSec recheckSec=$RecheckSec cooldownSec=$CooldownSec pid=$PID quietScript=$QuietScript legScript=$LegScript umRunScript=$UmRunScript$(if ($ReceiptRoot) { " receiptRoot=$ReceiptRoot" })$(if ($legPlanMode) { " legPlan=$($planRecord.legPlan) planOrder=$PlanOrder arms=$($planRecord.arms -join ',') builds=$(@($planRecord.builds).Count)" })"
 
 while ($pending.Count -gt 0 -and $null -eq $stopReason) {
