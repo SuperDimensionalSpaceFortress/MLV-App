@@ -43,9 +43,14 @@ NON-PROMISES:
 - An id is compared segment by segment, never flattened to a string: ``/`` and ``.`` inside a
   pytest parameter id (``test_x[a/b]``, ``test_x[a.b]``) stay inside it, ``a.py/t.py`` is not
   ``a/t.py``, and a node id may hold spaces.
-- An ``ImportError``/``ModuleNotFoundError`` raised by a test at run time, and a collection
-  error that appears only as an ``ERROR <file>`` summary line (``--tb=no``), block PASS like
-  any other collection error.
+- An ``ImportError``/``ModuleNotFoundError`` anywhere in the run blocks PASS like a collection
+  error: in an ERROR or FAIL block, in any ``E`` line of a pytest section (chained exceptions
+  included), or in a ``FAILED``/``ERROR`` summary line (``--tb=no``). So does an ``ERROR <file>``
+  summary line, and a ``FAILED`` summary line that cannot be split into node id and message
+  without guessing (a parameter id holding ``] - ``).
+- The runner's FINAL result line decides green: unittest ``OK`` or a pytest bar with no
+  failed/error count means no assertion failed, whatever failure-looking text a test printed above it.
+- Whitespace inside an id is significant (`` a/t.py`` is not ``a/t.py``; ``test one`` is not ``test``).
 - A pytest failure section is tied to its node id by test name AND by the file in its
   traceback frames. With no ``FAILED`` summary line (``-rN``) the section has no identity,
   so only ``file:line`` can match it.
@@ -76,7 +81,7 @@ REFUSED = "REFUSED"
 
 _EQ_RULE = re.compile(r"^={20,}\s*$")
 _FRAME = re.compile(r'^\s*File "(?P<file>.+)", line (?P<line>\d+)')
-_UT_HEAD = re.compile(r"^(?P<kind>FAIL|ERROR): (?P<name>\S+)(?: \((?P<ident>[^)]*)\))?")
+_UT_HEAD = re.compile(r"^(?P<kind>FAIL|ERROR): (?P<name>.+?)(?: \((?P<ident>[^()]*)\))?(?: \(.*\))?\s*$")
 _PT_SECTION = re.compile(r"^_{2,} (?P<name>.+?) _{2,}\s*$")
 _PT_TOP = re.compile(r"^={3,} (?P<title>.+?) ={3,}\s*$")
 _PT_LOC = re.compile(r"^(?P<file>[^\s:][^\n]*?\.py):(?P<line>\d+):(?: (?P<rest>.*))?$")
@@ -84,6 +89,7 @@ _IMPORT_ERR = re.compile(r"^(?:[\w.]+\.)?(?:ModuleNotFoundError|ImportError)\b",
 _EXPECT_SITE = re.compile(r"^(?P<file>.+\.\w+):(?P<line>\d+)$")
 _RED_MARK = re.compile(r"^FAILED \(|^FAILED |\b\d+ (?:failed|errors?)\b|^Interrupted:", re.M)
 _GREEN_MARK = re.compile(r"^OK\b|\b\d+ passed\b", re.M)
+_RESULT_LINE = re.compile(r"^(?:OK\b.*|FAILED \(.*\)|=+ .*\bin \d[\d.]*s\b.*=+)\s*$", re.M)
 
 
 @dataclass
@@ -130,9 +136,11 @@ def _segs(text: str) -> list[str]:
     """Segments of a test id, lossless for its own syntax: pytest `dir/file.py::Class::name[param]`
     gives path parts (the .py suffix dropped) then the names; unittest `module.Class.method` gives
     its dotted parts. Separators inside `[...]` never split."""
-    text = text.strip()
     if "::" in text:
-        head, *names = _split_top(text, "::")
+        parts = _split_top(text, "::")
+        if not parts:
+            return []
+        head, names = parts[0], parts[1:]
         path = _norm_path(head)
         if path and path[-1].endswith(".py") and len(path[-1]) > 3:
             path[-1] = path[-1][:-3]
@@ -145,8 +153,10 @@ def _segs(text: str) -> list[str]:
     return _split_top(text, ".")
 
 
-def _parse_summary_line(line: str, word: str) -> tuple[str, str] | None:
-    """`FAILED <node> - <msg>` / `ERROR <node> - <msg>`: the node ends at the first ' - ' outside brackets."""
+def _parse_summary_line(line: str, word: str) -> tuple[str, str, bool] | None:
+    """`FAILED <node> - <msg>` / `ERROR <node> - <msg>` -> (node, msg, ambiguous). The node ends at the
+    first ' - ' outside brackets; when the node holds a parameter id and the message holds '] - ' the
+    split cannot be told from a parameter id that contains it, so the line is flagged ambiguous."""
     if not line.startswith(word + " "):
         return None
     rest = line[len(word) + 1:].rstrip()
@@ -157,8 +167,9 @@ def _parse_summary_line(line: str, word: str) -> tuple[str, str] | None:
         elif c == "]" and depth:
             depth -= 1
         elif depth == 0 and rest.startswith(" - ", i):
-            return rest[:i], rest[i + 3:]
-    return rest, ""
+            node, msg = rest[:i], rest[i + 3:]
+            return node, msg, "[" in node and "] - " in msg
+    return rest, "", False
 
 
 def _ends_with(whole: list[str], tail: list[str]) -> bool:
@@ -187,7 +198,7 @@ def _parse_unittest(text: str) -> list[Failure]:
         frames = [(m["file"], int(m["line"])) for m in map(_FRAME.match, block) if m]
         joined = "\n".join(block)
         collection = ("_FailedTest" in body[0] or "unittest/loader.py" in joined.replace("\\", "/")
-                      or (head["kind"] == "ERROR" and bool(_IMPORT_ERR.search(joined))))
+                      or bool(_IMPORT_ERR.search(joined)))
         ident, name = head["ident"] or "", head["name"]
         # 3.11+ prints the full id in the parentheses; older Pythons print module.Class only.
         full = ident if ident.rsplit(".", 1)[-1] == name else (f"{ident}.{name}" if ident else name)
@@ -204,15 +215,18 @@ def _same_file(a: list[str], b: list[str]) -> bool:
 def _pair_nodes(want: list[str], frames: list[tuple[str, int]], nodes: list[str]) -> list[str]:
     cands = [n for n in nodes if _ends_with(_segs(n), want)]
     if frames:
-        files = [_norm_path(file) for file, _line in frames]
-        return [n for n in cands if any(_same_file(_norm_path(_split_top(n, "::")[0]), fp) for fp in files)]
+        def in_file(n: str, file: str) -> bool:
+            return _same_file(_norm_path(_split_top(n, "::")[0]), _norm_path(file))
+
+        first = [n for n in cands if in_file(n, frames[0][0])]  # the test function's own file
+        return first or [n for n in cands if any(in_file(n, file) for file, _line in frames)]
     return cands if len(cands) == 1 else []
 
 
 def _parse_pytest(text: str) -> list[Failure]:
     out: list[Failure] = []
     nodes: list[tuple[str, str]] = []
-    summary_collection: list[tuple[str, str]] = []
+    summary_blockers: list[str] = []
     top = ""
     cur: dict | None = None
 
@@ -229,12 +243,19 @@ def _parse_pytest(text: str) -> list[Failure]:
             top = m_top["title"].strip()
             continue
         if top.startswith("short test summary"):
-            failed = _parse_summary_line(line, "FAILED")
-            if failed:
-                nodes.append(failed)
-            errored = _parse_summary_line(line, "ERROR")
-            if errored and "::" not in errored[0]:
-                summary_collection.append(errored)
+            for word in ("FAILED", "ERROR"):
+                got = _parse_summary_line(line, word)
+                if not got:
+                    continue
+                node, msg, ambiguous = got
+                if word == "FAILED":
+                    nodes.append((node, msg))
+                if ambiguous:
+                    summary_blockers.append(f"ambiguous summary line {word} {node[:60]}")
+                elif _IMPORT_ERR.match(msg):
+                    summary_blockers.append(f"{word} {node[:60]} - {msg[:40]}")
+                elif word == "ERROR" and "::" not in node:
+                    summary_blockers.append(f"ERROR {node}")
             continue
         if top not in ("FAILURES", "ERRORS"):
             continue
@@ -247,10 +268,11 @@ def _parse_pytest(text: str) -> list[Failure]:
             continue
         if cur is None:
             continue
-        if line.startswith("E") and cur["assertion"] is None and line[1:2] in (" ", "\t"):
+        if line.startswith("E") and line[1:2] in (" ", "\t"):
             first = line[1:].strip()
-            cur["assertion"] = first.startswith(("assert ", "assert\t", "AssertionError", "Failed:")) or first == "assert"
-            if first.startswith(("ModuleNotFoundError", "ImportError")):
+            if cur["assertion"] is None:
+                cur["assertion"] = first.startswith(("assert ", "assert\t", "AssertionError", "Failed:")) or first == "assert"
+            if _IMPORT_ERR.match(first):  # any E line: a chained exception counts too
                 cur["collection"] = True
             continue
         m_loc = _PT_LOC.match(line)
@@ -259,7 +281,11 @@ def _parse_pytest(text: str) -> list[Failure]:
     close()
     for f in out:
         f.assertion = bool(f.assertion) and not f.collection
-        bare = f.ids[0].replace("ERROR at setup of ", "").replace("ERROR at teardown of ", "")
+        bare = f.ids[0]
+        for prefix in ("ERROR at setup of ", "ERROR at teardown of "):
+            if bare.startswith(prefix):  # a prefix only: a parameter id may hold this text
+                bare = bare[len(prefix):]
+                break
         # The section header is a bare name (`T.test_a`, or just `test_x` for a module-level
         # function), so it is not an identity. Its identity is the FAILED-summary node id whose
         # tail is that name and whose file appears in the section's own traceback frames.
@@ -267,9 +293,21 @@ def _parse_pytest(text: str) -> list[Failure]:
     if not out:
         for node, msg in nodes:
             out.append(Failure([node], [], bool(re.match(r"(assert\b|AssertionError)", msg)), note=msg))
-    for node, msg in summary_collection:
-        out.append(Failure([], [], False, True, f"ERROR {node}" + (f" - {msg}" if msg else "")))
+    for note in summary_blockers:
+        out.append(Failure([], [], False, True, note))
     return out
+
+
+def _final_green(text: str) -> bool:
+    """True when the LAST runner result line is green (unittest OK, or a pytest bar with no failed/error)."""
+    last = None
+    for m in _RESULT_LINE.finditer(text):
+        last = m.group(0).strip()
+    if last is None:
+        return False
+    if last.startswith("OK"):
+        return True
+    return last.startswith("=") and not re.search(r"\b(?:failed|errors?)\b", last)
 
 
 def parse_run(text: str) -> Parsed:
@@ -279,7 +317,7 @@ def parse_run(text: str) -> Parsed:
 
 
 def _matches(failure: Failure, expected: str) -> bool:
-    site = _EXPECT_SITE.match(expected.strip())
+    site = _EXPECT_SITE.match(expected)
     if site:
         want_file, want_line = _norm_path(site["file"]), int(site["line"])
         return any(line == want_line and _ends_with(_norm_path(file), want_file)
@@ -292,6 +330,10 @@ def verdict(output: str, expected: str) -> tuple[str, str]:
     """Return (PASS|REFUSED, reason). PASS only when `expected` is an assertion that failed."""
     if not expected or not expected.strip():
         return REFUSED, "no expected assertion given (file:line or test id): a red suite proves nothing alone"
+    expected = expected.strip()
+    if _final_green(output):
+        return REFUSED, ("the run is green (final result line): failure-looking text above it was test output, "
+                         "so no assertion failed")
     run = parse_run(output)
     if not run.failures and not run.red:
         if run.green:
@@ -304,7 +346,7 @@ def verdict(output: str, expected: str) -> tuple[str, str]:
         return REFUSED, ("collection or import error in the run (" + broken[0].note[:80]
                          + "): red for a reason that is not the assertion")
     hit = [f for f in run.failures if _matches(f, expected)]
-    if not _EXPECT_SITE.match(expected.strip()):
+    if not _EXPECT_SITE.match(expected):
         named = sorted({i for f in hit for i in f.ids})
         if len(named) > 1:
             return REFUSED, (f"{expected} is ambiguous: it matches {len(named)} failing tests ("

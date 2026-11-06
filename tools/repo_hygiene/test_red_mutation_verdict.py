@@ -145,6 +145,13 @@ class VerdictOnText(unittest.TestCase):
         self.assertEqual(rmv.verdict(block, "est_x.py:5")[0], rmv.REFUSED)
         self.assertEqual(rmv.verdict(block, "pkg.test_x.T.test_a")[0], rmv.PASS)
 
+    def test_degenerate_expectations_are_refused_not_raised(self) -> None:
+        # adversary pass 2 A5: an id made only of separators once raised ValueError out of the unpack.
+        out = ("=" * 70 + "\nFAIL: test_a (test_x.T.test_a)\n" + "-" * 70
+               + "\nAssertionError: 1 != 2\n\nFAILED (failures=1)\n")
+        for want in ("::", "[", "]::[", "...", "/"):
+            self.assertEqual(rmv.verdict(out, want)[0], rmv.REFUSED, want)
+
     def test_expectation_longer_than_the_failure_is_never_a_match(self) -> None:
         relative = ("=" * 70 + "\nFAIL: test_a (test_x.T.test_a)\n" + "-" * 70
                     + '\nTraceback (most recent call last):\n  File "test_x.py", line 5, in test_a\n'

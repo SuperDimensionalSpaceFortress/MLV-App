@@ -373,6 +373,94 @@
    "output": "============================= test session starts =============================\nplatform win32 -- Python 3.14.3, pytest-9.0.3, pluggy-1.6.0\nrootdir: C:\\wk\nplugins: anyio-4.13.0, hypothesis-6.152.4\ncollected 1 item / 1 error\n\ntest_s.py F                                                              [100%]\n\n=========================== short test summary info ===========================\nFAILED test_s.py::test_x - assert 1 == 2\nERROR test_bad.py\n========================= 1 failed, 1 error in 1.11s ==========================\n",
    "expected_assertion": "test_s.py::test_x",
    "expect": "REFUSED"
+  },
+  {
+   "id": "pt-summary-only-runtime-import-error",
+   "kind": "verdict",
+   "why": "--tb=no: FAILED t.py::test_imp - ModuleNotFoundError beside the asserted failure (adversary A1)",
+   "output": "===================== short test summary info =====================\nFAILED t.py::test_x - assert 1 == 2\nFAILED t.py::test_imp - ModuleNotFoundError: No module named missing\n===================== 2 failed in 0.1s =====================\n",
+   "expected_assertion": "t.py::test_x",
+   "expect": "REFUSED"
+  },
+  {
+   "id": "pt-summary-only-error-node-import",
+   "kind": "verdict",
+   "why": "--tb=no: ERROR t.py::test_imp - ImportError beside the asserted failure (adversary A1)",
+   "output": "===================== short test summary info =====================\nFAILED t.py::test_x - assert 1 == 2\nERROR t.py::test_imp - ImportError: missing\n===================== 1 failed, 1 error in 0.1s =====================\n",
+   "expected_assertion": "t.py::test_x",
+   "expect": "REFUSED"
+  },
+  {
+   "id": "pt-chained-import-error-after-assertion",
+   "kind": "verdict",
+   "why": "the first E line is an assertion, a later chained E line is ModuleNotFoundError (adversary A1)",
+   "output": "===================== FAILURES =====================\n____________________ test_x ____________________\nE assert 1 == 2\nt.py:2: AssertionError\nE ModuleNotFoundError: No module named missing\n===================== short test summary info =====================\nFAILED t.py::test_x - assert 1 == 2\n===================== 1 failed in 0.1s =====================\n",
+   "expected_assertion": "t.py:2",
+   "expect": "REFUSED"
+  },
+  {
+   "id": "ut-fail-block-holding-an-import-error",
+   "kind": "verdict",
+   "why": "a FAIL (not ERROR) block whose exception is ImportError (failureException=ImportError) (adversary A1)",
+   "output": "======================================================================\nFAIL: test_a (test_s.T.test_a)\n----------------------------------------------------------------------\nTraceback (most recent call last):\n  File \"test_s.py\", line 8, in test_a\n    self.assertEqual(1, 2)\nAssertionError: 1 != 2\n\n======================================================================\nFAIL: test_imp (test_s.U.test_imp)\n----------------------------------------------------------------------\nTraceback (most recent call last):\n  File \"test_s.py\", line 20, in test_imp\n    raise ImportError(\"missing\")\nImportError: missing\n\n----------------------------------------------------------------------\nRan 2 tests in 0.001s\n\nFAILED (failures=2)\n",
+   "expected_assertion": "test_s.py:8",
+   "expect": "REFUSED"
+  },
+  {
+   "id": "pt-param-id-holding-dash-bracket",
+   "kind": "verdict",
+   "why": "legal parameter id '] - AssertionError' makes the FAILED line ambiguous; REFUSED, never guessed (adversary A2)",
+   "output": "===================== short test summary info =====================\nFAILED test_s.py::test_x[] - AssertionError] - TypeError: boom\n===================== 1 failed, 1 passed in 0.1s =====================\n",
+   "expected_assertion": "test_s.py::test_x[]",
+   "expect": "REFUSED"
+  },
+  {
+   "id": "pt-param-id-containing-error-at-setup-of",
+   "kind": "verdict",
+   "why": "parameter text 'ERROR at setup of ' must not be stripped out of the section name (adversary A2)",
+   "output": "===================== FAILURES =====================\n____________________ test_x[] ____________________\nE TypeError: boom\nt.py:3: TypeError\n____________________ test_x[ERROR at setup of ] ____________________\nE assert False\nt.py:4: AssertionError\n===================== short test summary info =====================\nFAILED t.py::test_x[] - TypeError: boom\nFAILED t.py::test_x[ERROR at setup of ] - assert False\n===================== 2 failed in 0.1s =====================\n",
+   "expected_assertion": "t.py::test_x[]",
+   "expect": "REFUSED"
+  },
+  {
+   "id": "ut-green-run-whose-test-printed-a-failure-block",
+   "kind": "verdict",
+   "why": "the runner's own result line is OK; a failure-looking block was just test output (adversary A4)",
+   "output": "======================================================================\nFAIL: test_a (test_s.T.test_a)\n----------------------------------------------------------------------\nTraceback (most recent call last):\n  File \"test_s.py\", line 8, in test_a\n    self.assertEqual(1, 2)\nAssertionError: 1 != 2\n\n.\n----------------------------------------------------------------------\nRan 1 test in 0.000s\n\nOK\n",
+   "expected_assertion": "test_s.py:8",
+   "expect": "REFUSED"
+  },
+  {
+   "id": "pt-directory-with-leading-space",
+   "kind": "verdict",
+   "why": "the failing directory is ' a' (leading space); 'a' is a different directory (adversary A6)",
+   "output": "===================== FAILURES =====================\n____________________ test_x ____________________\nE assert False\n a/test_s.py:2: AssertionError\n===================== short test summary info =====================\nFAILED  a/test_s.py::test_x - assert False\n===================== 1 failed in 0.1s =====================\n",
+   "expected_assertion": "a/test_s.py::test_x",
+   "expect": "REFUSED"
+  },
+  {
+   "id": "ut-method-name-with-a-space-bare-prefix",
+   "kind": "verdict",
+   "why": "setattr(T, 'test one', ...) fails: 'test' is not that method (adversary A6)",
+   "output": "======================================================================\nFAIL: test one (__main__.T.test one)\n----------------------------------------------------------------------\nTraceback (most recent call last):\n  File \"t.py\", line 3, in f\n    self.assertEqual(1, 2)\nAssertionError: 1 != 2\n\n----------------------------------------------------------------------\nRan 1 test in 0.000s\n\nFAILED (failures=1)\n",
+   "expected_assertion": "test",
+   "expect": "REFUSED"
+  },
+  {
+   "id": "ut-method-name-with-a-space-full-id",
+   "kind": "verdict",
+   "why": "control: the full id of the spaced method names the failure",
+   "output": "======================================================================\nFAIL: test one (__main__.T.test one)\n----------------------------------------------------------------------\nTraceback (most recent call last):\n  File \"t.py\", line 3, in f\n    self.assertEqual(1, 2)\nAssertionError: 1 != 2\n\n----------------------------------------------------------------------\nRan 1 test in 0.000s\n\nFAILED (failures=1)\n",
+   "expected_assertion": "T.test one",
+   "expect": "PASS"
+  },
+  {
+   "id": "pt-helper-frame-in-the-other-file",
+   "kind": "verdict",
+   "why": "test_x in a/ calls a helper in b/test_s.py; test_x in b/ also failed; naming a/ must still be PASS (adversary A3)",
+   "output": "===================== FAILURES =====================\n____________________ test_x ____________________\nE assert False\na/test_s.py:2: \nE assert False\nb/test_s.py:5: AssertionError\n____________________ test_x ____________________\nE assert False\nb/test_s.py:2: AssertionError\n===================== short test summary info =====================\nFAILED a/test_s.py::test_x - assert False\nFAILED b/test_s.py::test_x - assert False\n===================== 2 failed in 0.1s =====================\n",
+   "expected_assertion": "a/test_s.py::test_x",
+   "expect": "PASS"
   }
  ]
 }
