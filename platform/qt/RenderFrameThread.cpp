@@ -16,6 +16,7 @@
 #include "PlaybackQualityPolicy.h"
 #include "PlaybackSlotRelease.h"
 #include "ReconWorker.h"
+#include "ReconWorkerSplit.h"
 
 #include "../../src/batch/WorkerThreadCount.h"
 #include "../../src/debayer/debayer.h"
@@ -465,6 +466,16 @@ void insertLlrawprocReconTimingTelemetry( QJsonObject &target )
                    dualIsoFull20.mix_ev_lut_ms );
     target.insert( QStringLiteral("dual_iso_full20_mix_halfres_ms"),
                    dualIsoFull20.mix_halfres_ms );
+    /* CPU-S1-RECON-UNDER-LOOK-PACE-LEVER-1: the worker's mix_chroma split, carried to the
+     * presented frame as recon_worker_* (ReconWorkerSplit.h). */
+    target.insert( QStringLiteral("dual_iso_full20_mix_chroma_ms"),
+                   dualIsoFull20.mix_chroma_ms );
+    target.insert( QStringLiteral("dual_iso_full20_mix_chroma_copy_ms"),
+                   dualIsoFull20.mix_chroma_copy_ms );
+    target.insert( QStringLiteral("dual_iso_full20_mix_chroma_fullres_ms"),
+                   dualIsoFull20.mix_chroma_fullres_ms );
+    target.insert( QStringLiteral("dual_iso_full20_mix_chroma_halfres_ms"),
+                   dualIsoFull20.mix_chroma_halfres_ms );
     target.insert( QStringLiteral("dual_iso_full20_mix_alias_map_ms"),
                    dualIsoFull20.mix_alias_map_ms );
     target.insert( QStringLiteral("dual_iso_full20_mix_overexposed_ms"),
@@ -7186,6 +7197,15 @@ void RenderFrameThread::drawFrame( int slotIndex,
         restoreGpuPlaybackReconTimingTelemetry(
             slot.stageTimingTelemetry,
             preservedGpuPlaybackReconTextureTelemetry );
+    }
+    /* CPU-S1-RECON-UNDER-LOOK-PACE-LEVER-1 (Part A): a render that consumed the phase-3 recon
+     * wrote its own (zero) llrawproc_* / dual_iso_full20_* values over the worker's above; the
+     * worker's, captured before resetMetadata, are kept under recon_worker_ (no writer here
+     * touches that prefix). The render thread's own keys are left as they are. */
+    if( decodedRawFrameAlreadyReconned )
+    {
+        recon_worker_split::copyWorkerSplit( preservedGpuPlaybackReconTextureTelemetry,
+                                             slot.stageTimingTelemetry );
     }
 
     slot.processedFrame8Active =

@@ -43,6 +43,7 @@
 #include "PlaybackRoutePrewarmPolicy.h"
 #include "PlaybackReconWarmRunPolicy.h"
 #include "GuiPresentGapIdle.h"
+#include "ReconWorkerSplit.h"
 #include "../../src/mlv_include.h"
 #include "InfoDialog.h"
 #include "StatusDialog.h"
@@ -1529,8 +1530,14 @@ private:
         double regionFinishMs = 0.0;
         double regionTotalMs = 0.0;
         double regionUnattributedMs = 0.0;
+        // CPU-S1-RECON-UNDER-LOOK-PACE-LEVER-1 (Part B): region_image's QPixmap::fromImage and
+        // GpuDisplayViewport::presentImage calls.
+        double regionImageFromImageMs = 0.0;
+        double regionImageViewportMs = 0.0;
     };
     PlaybackSmokePrepSpanTotals m_playbackSmokePrepSpans;
+    // CPU-S1-RECON-UNDER-LOOK-PACE-LEVER-1 (Part A): the recon worker's sub-spans on presented frames.
+    recon_worker_split::Totals m_playbackSmokeReconWorkerSplit;
     // CPU-S2-WINDOWED-GUI-PRESENT-TELEMETRY-1: GUI-thread wall time from one prep present's exit to
     // the next prep result's entry, less the event loop's blocked (idle) time in between, and less
     // the preview viewport paint inside it for "other busy" (playback_smoke.gui_present_summary).
@@ -1553,6 +1560,22 @@ private:
     qint64 m_guiPresentGapRunnerSleepNs = 0;
     double m_guiPresentGapPaintStartMs = 0.0;
     bool m_guiPresentIdleProbeConnected = false;
+    // CPU-S1-RECON-UNDER-LOOK-PACE-LEVER-1 (Part B): other busy split by GUI handler (GuiPresentGapIdle.h).
+    // The serial names the open gap (0 = none), so a span counts only inside one gap.
+    quint64 m_guiPresentGapSerial = 0;
+    gui_present_gap::OtherBusySpans m_guiOtherBusySpans;
+    gui_present_gap::SpanClock guiOtherBusySpanClock( void ) const;
+    class GuiOtherBusyScope
+    {
+    public:
+        GuiOtherBusyScope( MainWindow *window, gui_present_gap::OtherBusySpan span );
+        ~GuiOtherBusyScope();
+        GuiOtherBusyScope( const GuiOtherBusyScope & ) = delete;
+        GuiOtherBusyScope &operator=( const GuiOtherBusyScope & ) = delete;
+    private:
+        MainWindow *m_window;
+        gui_present_gap::OtherBusySpan m_span;
+    };
     double m_playbackSmokePrepWorkerTotalSumMs = 0.0;
     double m_playbackSmokePrepResultQueueSumMs = 0.0;
     double m_playbackSmokePrepTotalBeforeFinishSumMs = 0.0;
