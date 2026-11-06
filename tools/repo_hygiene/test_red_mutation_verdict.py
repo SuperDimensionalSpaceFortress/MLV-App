@@ -62,6 +62,16 @@ class VerdictOnRealRuns(unittest.TestCase):
         self.assertEqual(status, rmv.REFUSED, out)
         self.assertIn("green", reason)
 
+    def test_runtime_import_error_in_another_test_is_refused(self) -> None:
+        # test_import dies with ModuleNotFoundError at run time, test_assert fails at line 4: the run is
+        # red for a reason that is not (only) the assertion, exactly like a collection error.
+        src = ("import unittest\nclass T(unittest.TestCase):\n def test_assert(self):\n  self.assertEqual(1, 2)\n"
+               " def test_import(self):\n  import no_such_mod_rmv_attack\n")
+        out = _run_unittest({"test_attack.py": src}, "test_attack")
+        status, reason = rmv.verdict(out, "test_attack.py:4")
+        self.assertEqual(status, rmv.REFUSED, out)
+        self.assertIn("import", reason)
+
     def test_non_assertion_error_at_the_site_is_refused(self) -> None:
         out = _run_unittest({"test_m.py": SUITE.replace("x * 60", "x // 'a'")}, "test_m")
         status, reason = rmv.verdict(out, "test_m.py:8")
@@ -197,6 +207,7 @@ class ProbeDiscriminates(unittest.TestCase):
         self.assertIn("empty window", rmv.probe_discriminates(1, 2, (5, 1))[1])
         self.assertIn("NaN", rmv.probe_discriminates(float("nan"), 2, (0, 5))[1])
         self.assertIn("numbers", rmv.probe_discriminates("a", 2, (0, 5))[1])
+        self.assertIn("numbers", rmv.probe_discriminates(10 ** 400, 2, (0, 5))[1])  # adversary A5: OverflowError
 
     def test_window_bounds_are_inclusive(self) -> None:
         self.assertTrue(rmv.probe_discriminates(3, 2.5, (2.0, 2.5))[0])

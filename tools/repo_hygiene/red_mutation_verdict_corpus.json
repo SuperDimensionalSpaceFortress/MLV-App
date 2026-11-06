@@ -317,6 +317,62 @@
     2.9
    ],
    "expect": "PASS"
+  },
+  {
+   "id": "pt-dir-name-with-dot-py-is-another-directory",
+   "kind": "verdict",
+   "why": "a/test_s.py failed; a.py/test_s.py is a different directory (A1)",
+   "output": "============================= test session starts =============================\nplatform win32 -- Python 3.14.3, pytest-9.0.3, pluggy-1.6.0\nrootdir: C:\\wk\nplugins: anyio-4.13.0, hypothesis-6.152.4\ncollected 2 items\n\na\\test_s.py F                                                            [ 50%]\nb\\test_s.py .                                                            [100%]\n\n================================== FAILURES ===================================\n___________________________________ test_x ____________________________________\n\n    def test_x():\n>       assert 1 == 2\nE       assert 1 == 2\n\na\\test_s.py:2: AssertionError\n=========================== short test summary info ===========================\nFAILED a/test_s.py::test_x - assert 1 == 2\n========================= 1 failed, 1 passed in 0.52s =========================\n",
+   "expected_assertion": "a.py/test_s.py::test_x",
+   "expect": "REFUSED"
+  },
+  {
+   "id": "pt-param-id-with-dot-did-not-fail",
+   "kind": "verdict",
+   "why": "test_x[a/b] and test_x[a b] failed, test_x[a.b] passed; '/' and '.' in an id are not interchangeable (A1)",
+   "output": "============================= test session starts =============================\nplatform win32 -- Python 3.14.3, pytest-9.0.3, pluggy-1.6.0\nrootdir: C:\\wk\nplugins: anyio-4.13.0, hypothesis-6.152.4\ncollected 3 items\n\ntest_s.py F.F                                                            [100%]\n\n================================== FAILURES ===================================\n_________________________________ test_x[a/b] _________________________________\n\nv = 'a/b'\n\n    @pytest.mark.parametrize('v', ['a/b', 'a.b', 'a b'])\n    def test_x(v):\n>       assert v == 'a.b'\nE       AssertionError: assert 'a/b' == 'a.b'\nE         \nE         - a.b\nE         + a/b\n\ntest_s.py:5: AssertionError\n_________________________________ test_x[a b] _________________________________\n\nv = 'a b'\n\n    @pytest.mark.parametrize('v', ['a/b', 'a.b', 'a b'])\n    def test_x(v):\n>       assert v == 'a.b'\nE       AssertionError: assert 'a b' == 'a.b'\nE         \nE         - a.b\nE         + a b\n\ntest_s.py:5: AssertionError\n=========================== short test summary info ===========================\nFAILED test_s.py::test_x[a/b] - AssertionError: assert 'a/b' == 'a.b'\nFAILED test_s.py::test_x[a b] - AssertionError: assert 'a b' == 'a.b'\n========================= 2 failed, 1 passed in 1.51s =========================\n",
+   "expected_assertion": "test_s.py::test_x[a.b]",
+   "expect": "REFUSED"
+  },
+  {
+   "id": "pt-param-id-with-slash-failed",
+   "kind": "verdict",
+   "why": "control: test_x[a/b] is a failing parameter",
+   "output": "============================= test session starts =============================\nplatform win32 -- Python 3.14.3, pytest-9.0.3, pluggy-1.6.0\nrootdir: C:\\wk\nplugins: anyio-4.13.0, hypothesis-6.152.4\ncollected 3 items\n\ntest_s.py F.F                                                            [100%]\n\n================================== FAILURES ===================================\n_________________________________ test_x[a/b] _________________________________\n\nv = 'a/b'\n\n    @pytest.mark.parametrize('v', ['a/b', 'a.b', 'a b'])\n    def test_x(v):\n>       assert v == 'a.b'\nE       AssertionError: assert 'a/b' == 'a.b'\nE         \nE         - a.b\nE         + a/b\n\ntest_s.py:5: AssertionError\n_________________________________ test_x[a b] _________________________________\n\nv = 'a b'\n\n    @pytest.mark.parametrize('v', ['a/b', 'a.b', 'a b'])\n    def test_x(v):\n>       assert v == 'a.b'\nE       AssertionError: assert 'a b' == 'a.b'\nE         \nE         - a.b\nE         + a b\n\ntest_s.py:5: AssertionError\n=========================== short test summary info ===========================\nFAILED test_s.py::test_x[a/b] - AssertionError: assert 'a/b' == 'a.b'\nFAILED test_s.py::test_x[a b] - AssertionError: assert 'a b' == 'a.b'\n========================= 2 failed, 1 passed in 1.51s =========================\n",
+   "expected_assertion": "test_s.py::test_x[a/b]",
+   "expect": "PASS"
+  },
+  {
+   "id": "pt-param-id-with-space-failed",
+   "kind": "verdict",
+   "why": "FAILED summary line whose node id holds a space: test_x[a b] (A3)",
+   "output": "============================= test session starts =============================\nplatform win32 -- Python 3.14.3, pytest-9.0.3, pluggy-1.6.0\nrootdir: C:\\wk\nplugins: anyio-4.13.0, hypothesis-6.152.4\ncollected 3 items\n\ntest_s.py F.F                                                            [100%]\n\n================================== FAILURES ===================================\n_________________________________ test_x[a/b] _________________________________\n\nv = 'a/b'\n\n    @pytest.mark.parametrize('v', ['a/b', 'a.b', 'a b'])\n    def test_x(v):\n>       assert v == 'a.b'\nE       AssertionError: assert 'a/b' == 'a.b'\nE         \nE         - a.b\nE         + a/b\n\ntest_s.py:5: AssertionError\n_________________________________ test_x[a b] _________________________________\n\nv = 'a b'\n\n    @pytest.mark.parametrize('v', ['a/b', 'a.b', 'a b'])\n    def test_x(v):\n>       assert v == 'a.b'\nE       AssertionError: assert 'a b' == 'a.b'\nE         \nE         - a.b\nE         + a b\n\ntest_s.py:5: AssertionError\n=========================== short test summary info ===========================\nFAILED test_s.py::test_x[a/b] - AssertionError: assert 'a/b' == 'a.b'\nFAILED test_s.py::test_x[a b] - AssertionError: assert 'a b' == 'a.b'\n========================= 2 failed, 1 passed in 1.51s =========================\n",
+   "expected_assertion": "test_s.py::test_x[a b]",
+   "expect": "PASS"
+  },
+  {
+   "id": "ut-runtime-import-error-in-another-test",
+   "kind": "verdict",
+   "why": "test_import died with ModuleNotFoundError while test_assert failed at line 4 (A2)",
+   "output": "test_assert (test_attack.T.test_assert) ... FAIL\ntest_import (test_attack.T.test_import) ... ERROR\n\n======================================================================\nERROR: test_import (test_attack.T.test_import)\n----------------------------------------------------------------------\nTraceback (most recent call last):\n  File \"C:\\wk\\test_attack.py\", line 6, in test_import\n    import no_such_mod_rmv_attack\nModuleNotFoundError: No module named 'no_such_mod_rmv_attack'\n\n======================================================================\nFAIL: test_assert (test_attack.T.test_assert)\n----------------------------------------------------------------------\nTraceback (most recent call last):\n  File \"C:\\wk\\test_attack.py\", line 4, in test_assert\n    self.assertEqual(1, 2)\n    ~~~~~~~~~~~~~~~~^^^^^^\nAssertionError: 1 != 2\n\n----------------------------------------------------------------------\nRan 2 tests in 0.004s\n\nFAILED (failures=1, errors=1)\n",
+   "expected_assertion": "test_attack.py:4",
+   "expect": "REFUSED"
+  },
+  {
+   "id": "pt-runtime-import-error-in-another-test",
+   "kind": "verdict",
+   "why": "test_imp died with ModuleNotFoundError while test_x failed its assertion (A2)",
+   "output": "============================= test session starts =============================\nplatform win32 -- Python 3.14.3, pytest-9.0.3, pluggy-1.6.0\nrootdir: C:\\wk\nplugins: anyio-4.13.0, hypothesis-6.152.4\ncollected 2 items\n\ntest_s.py FF                                                             [100%]\n\n================================== FAILURES ===================================\n___________________________________ test_x ____________________________________\n\n    def test_x():\n>       assert 1 == 2\nE       assert 1 == 2\n\ntest_s.py:2: AssertionError\n__________________________________ test_imp ___________________________________\n\n    def test_imp():\n>       import no_such_mod_rmv_attack\nE       ModuleNotFoundError: No module named 'no_such_mod_rmv_attack'\n\ntest_s.py:5: ModuleNotFoundError\n=========================== short test summary info ===========================\nFAILED test_s.py::test_x - assert 1 == 2\nFAILED test_s.py::test_imp - ModuleNotFoundError: No module named 'no_such_mo...\n============================== 2 failed in 0.52s ==============================\n",
+   "expected_assertion": "test_s.py:2",
+   "expect": "REFUSED"
+  },
+  {
+   "id": "pt-summary-only-collection-error",
+   "kind": "verdict",
+   "why": "--tb=no run: FAILED test_s.py::test_x plus 'ERROR test_bad.py' (collection) in the summary (A2)",
+   "output": "============================= test session starts =============================\nplatform win32 -- Python 3.14.3, pytest-9.0.3, pluggy-1.6.0\nrootdir: C:\\wk\nplugins: anyio-4.13.0, hypothesis-6.152.4\ncollected 1 item / 1 error\n\ntest_s.py F                                                              [100%]\n\n=========================== short test summary info ===========================\nFAILED test_s.py::test_x - assert 1 == 2\nERROR test_bad.py\n========================= 1 failed, 1 error in 1.11s ==========================\n",
+   "expected_assertion": "test_s.py::test_x",
+   "expect": "REFUSED"
   }
  ]
 }
