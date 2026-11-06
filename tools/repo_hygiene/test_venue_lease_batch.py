@@ -6012,7 +6012,7 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
 
     DENIED = "[pscustomobject]@{ granted = $false; broken = @(); claim = $null; state = 'held' }"
 
-    def _retry_request_loop(self, retry: str, deadline_sec: float, extra: str = "", settle_sec: float = 0.0) -> dict:
+    def _retry_request_loop(self, retry: str, deadline_sec: float, extra: str = "", settle_sec: float = 0.0, release: str = "") -> dict:
         # r6 (sol r5 blocker): the runner's own claim loop, in memory. The first request is master's (in this runspace, denied at once); every RETRY request answers with `retry`. The
         # retry's request runs on a worker that imports VenueChain.psm1 from $here, so the same `retry` is a stub module there; on a head that still calls it inline, the in-runspace stub
         # answers it the same way. The first guard pass does not finish (noAnswer), so the loop retries; a granted attempt's guard answers. `settle_sec` waits after the refusal for a
@@ -6021,17 +6021,17 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
         log = psq(stub)
         (stub / "VenueChain.psm1").write_text(
             "function Request-VenueClaim { param($Venue, $RunDir, $Purpose, $TtlSec, $ClaimDir) [IO.File]::AppendAllText('" + log + "\\requests.log', \"w`n\"); " + retry + " }\n"
-            "function Release-VenueClaim { param($Venue, $Nonce, $ClaimDir) [IO.File]::AppendAllText('" + log + "\\releases.log', \"worker:$Nonce`n\"); 'RELEASED' }\n", encoding="utf-8")
+            "function Release-VenueClaim { param($Venue, $Nonce, $ClaimDir) " + release + "[IO.File]::AppendAllText('" + log + "\\releases.log', \"worker:$Nonce`n\"); 'RELEASED' }\n", encoding="utf-8")
         script = (f"$ast = [System.Management.Automation.Language.Parser]::ParseFile('{psq(RUNNER)}', [ref]$null, [ref]$null)\n"
                   "$loop = $ast.FindAll({ param($x) $x -is [System.Management.Automation.Language.WhileStatementAst] -and $x.Body.Extent.Text.Contains('Request-VenueClaim') }, $true) | Select-Object -Last 1\n"
-                  "foreach ($n in 'Test-ClaimWaitRetryRoom', 'Get-ClaimWaitUnfinishedText', 'Invoke-ClaimRetryRequest') { $f = $ast.Find({ param($x) $x -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $x.Name -eq $n }, $true); if ($f) { . ([scriptblock]::Create($f.Extent.Text)) } }\n"
+                  "foreach ($n in 'Test-ClaimWaitRetryRoom', 'Get-ClaimWaitUnfinishedText', 'Invoke-ClaimRetryRequest', 'Invoke-ClaimRetryRelease') { $f = $ast.Find({ param($x) $x -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $x.Name -eq $n }, $true); if ($f) { . ([scriptblock]::Create($f.Extent.Text)) } }\n"
                   "foreach ($a in $ast.EndBlock.Statements) { if ($a -is [System.Management.Automation.Language.AssignmentStatementAst] -and $a.Left.Extent.Text -clike '$script:ClaimRetryRequest*') { . ([scriptblock]::Create($a.Extent.Text)) } }\n"
                   "Import-Module ([IO.Path]::Combine('" + psq(RUNNER.parent) + "', 'VenueChain.psm1')) -Force -DisableNameChecking\n"
                   f"$here = '{log}'\n"
                   "$script:requests = 0; $script:guards = 0; $script:refused = ''; $script:refusedAt = -1.0; $script:thrown = ''; $script:ClaimWaitUnfinishedMax = 3; $script:ClaimWaitGuardSec = 0; $script:receiptGuardHit = $null; $script:claimWait = @{ denied = 0; startUtc = $null; endUtc = $null }\n"
                   "$claim = $null; $lastHolder = ''; $unfinished = 0; $noAnswers = 0; $batchNo = 1; $Venue = 'bachelor'; $RunDir = 'r'; $Purpose = 'p'; $ClaimDir = 'c'; $ClaimTtlSec = 60; $ClaimRenewSec = 15; $ClaimPollSec = 1; $batches = @()\n"
                   "function Request-VenueClaim { $script:requests++; if ($script:requests -eq 1) { " + self.DENIED + " } else { " + retry + " } }\n"
-                  "function Release-VenueClaim { param($Venue, $Nonce, $ClaimDir) [IO.File]::AppendAllText('" + log + "\\releases.log', \"main:$Nonce`n\"); 'RELEASED' }\n"
+                  "function Release-VenueClaim { param($Venue, $Nonce, $ClaimDir) " + release + "[IO.File]::AppendAllText('" + log + "\\releases.log', \"main:$Nonce`n\"); 'RELEASED' }\n"
                   "function New-GuardBudget { param($a, $b, $c, $d, $e, $f) [pscustomobject]@{} }\n"
                   "function Invoke-InputGuard { $script:guards++; if ($req.granted) { $null } else { [pscustomobject]@{ kind = 'content'; item = 1; code = 'SHARE_UNREACHABLE'; noAnswer = $true; readAbandoned = $true; locationUnknown = $true; why = 'WHY' } } }\n"
                   "function Test-AliasHit { param($h) $false }\n"
@@ -6111,6 +6111,16 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
         edge = json.loads(r.stdout.strip().splitlines()[-1])
         self.assertEqual((edge["granted"], edge["state"], edge["releases"]), (False, "REQUEST_LATE_GRANT", ["worker:edge-n"]), edge)
+
+    def test_artifact_preflight_claim_wait_r6_a_retry_grant_let_go_on_a_stalled_claim_share_still_refuses_by_the_deadline(self) -> None:
+        # adversary r6 pass 2 A1: the retry is granted at once, its guard refuses, and the claim share then stops answering: the release (inline, unbounded, before the refusal
+        # printed) held the refusal past the deadline. A claim granted on a retry is let go through Invoke-VenueBoundedRead, given up on at the room less 1 s and counted. ~4 s.
+        d = self._retry_request_loop("[pscustomobject]@{ granted = $true; broken = @(); claim = [pscustomobject]@{ nonce = 'stuck-n' }; state = 'TAKEN' }", 4,
+                                     extra="function Invoke-InputGuard { $script:guards++; [pscustomobject]@{ kind = 'content'; item = 1; code = 'SHARE_UNREACHABLE'; noAnswer = $true; readAbandoned = $true; locationUnknown = $true; why = 'WHY' } }",
+                                     release="[Threading.Thread]::Sleep(600000); ")
+        self.assertEqual((d["requests"], d["guards"], d["claim"], d["thrown"], d["refused"]), (2, 2, None, "", "WHY"), d)
+        self.assertLess(d["refusedAt"], d["deadlineSec"], f"the refusal waited on the release past the deadline: {d}")
+        self.assertEqual(d["abandoned"], 1, f"the release given up on is an abandoned read: {d}")
 
     def test_artifact_preflight_claim_wait_r6_a_fast_retry_request_is_unchanged(self) -> None:
         # INV-1 controls: a retry request that is denied at once still loops (three unfinished passes, then the refusal, as in r5); one that grants at once with room proceeds, its guard

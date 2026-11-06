@@ -800,6 +800,17 @@ function Invoke-ClaimRetryRequest {
     $state.result
 }
 
+function Invoke-ClaimRetryRelease([DateTime]$DeadlineUtc, [string]$Nonce) {
+    # r6 pass 3 (adversary r6 pass 2 A1): a claim granted on a RETRY is let go (its guard refused, threw, or outlasted the claim) through VenueChain's own Invoke-VenueBoundedRead,
+    # so a claim share that stops answering cannot hold the refusal that follows past the deadline. The bound is the room left less the reserve, at least 1 s (a healthy release
+    # takes milliseconds, and is still tried when the room is gone) and at most $script:ClaimRetryRequestMaxSec. One not answered is abandoned and counted (Complete-VenueProcess
+    # exits at once); the claim, still naming this process, is broken as dead-pid once it exits. A claim granted on a run's first request is let go inline, as master does.
+    $sec = [Math]::Min([Math]::Max(($DeadlineUtc - [DateTime]::UtcNow).TotalSeconds - $script:ClaimRetryRequestReserveSec, 1.0), [double]$script:ClaimRetryRequestMaxSec)
+    $arg = @{ m = (Join-Path $here 'VenueChain.psm1'); v = $Venue; n = $Nonce; d = $ClaimDir }
+    $r = & (Get-Module VenueChain) { param($a, $s) Invoke-VenueBoundedRead -ScriptText 'param($a) Import-Module $a.m -Force -DisableNameChecking; Release-VenueClaim -Venue $a.v -Nonce $a.n -ClaimDir $a.d' -Argument $a -TimeoutSec $s } $arg $sec
+    $(if ($r.answered) { [string]@($r.value)[-1] } else { "NO_ANSWER ($($r.error))" })
+}
+
 function Get-ClaimWaitUnfinishedText([int]$Unfinished, [int]$NoAnswers) {
     # r3 (fable r2): what the refusal says of the passes that did not finish: 'no answer' only for reads really given up on
     $passes = "$Unfinished guard pass$(if ($Unfinished -ne 1) { 'es' }) in a row"
@@ -1792,7 +1803,8 @@ while ($pending.Count -gt 0 -and $null -eq $stopReason) {
         # pass that did not finish; otherwise it stays the throw it always was, once the process cannot wait on such a read.
         $requestThrew = ''
         # r6 (sol r5 blocker): a retry's request (a pass before it did not finish) is bounded by the room left before -DeadlineUtc; one not answered in it, not started for want of it, or
-        # granted too late is the saved refusal below, no lease and no leg. The first request of a run is master's inline call.
+        # granted too late is the saved refusal below, no lease and no leg. The first request of a run is master's inline call. r6 pass 3: a claim granted on a retry is let go bounded too.
+        $grantedOnRetry = $unfinished -gt 0
         try {
             $req = $(if ($unfinished -gt 0) { Invoke-ClaimRetryRequest -DeadlineUtc $deadline -RequestArgs @{ Venue = $Venue; RunDir = $RunDir; Purpose = "$Purpose batch $batchNo"; TtlSec = $ClaimTtlSec; ClaimDir = $ClaimDir } }
                 else { Request-VenueClaim -Venue $Venue -RunDir $RunDir -Purpose "$Purpose batch $batchNo" -TtlSec $ClaimTtlSec -ClaimDir $ClaimDir })
@@ -1830,7 +1842,7 @@ while ($pending.Count -gt 0 -and $null -eq $stopReason) {
             # r4 (key3 H3): this runs before the batch try below, so a throw here once the claim is granted releases the claim and ends typed (exit 2), never an exit 1 with the claim held to its TTL
             try { $hit = Invoke-InputGuard }
             catch {
-                if ($req.granted) { try { [void](Release-VenueClaim -Venue $Venue -Nonce $req.claim.nonce -ClaimDir $ClaimDir) } catch { } }
+                if ($req.granted) { try { [void]$(if ($grantedOnRetry) { Invoke-ClaimRetryRelease $deadline $req.claim.nonce } else { Release-VenueClaim -Venue $Venue -Nonce $req.claim.nonce -ClaimDir $ClaimDir }) } catch { } }
                 Stop-PlanRefused 'LEG_PLAN_INVALID' 0 "the plan could not be re-validated once the claim was held: $($_.Exception.Message -replace '\s+', ' ')"
             }
             $script:guardBudget = $null
@@ -1857,7 +1869,7 @@ while ($pending.Count -gt 0 -and $null -eq $stopReason) {
             $unfinished = 0; $noAnswers = 0
         }
         if ($hit) {
-            if ($req.granted) { try { [void](Release-VenueClaim -Venue $Venue -Nonce $req.claim.nonce -ClaimDir $ClaimDir) } catch { } }
+            if ($req.granted) { try { [void]$(if ($grantedOnRetry) { Invoke-ClaimRetryRelease $deadline $req.claim.nonce } else { Release-VenueClaim -Venue $Venue -Nonce $req.claim.nonce -ClaimDir $ClaimDir }) } catch { } }
             # r3 (opus r2b H3): once a batch receipt exists, this refusal ends the run like any other stop: the summary (receiptPersistFailures included) is printed before the typed
             # exit 2. A location hit turns the write suppression on first (Test-OpenOutputAlias's rule): the refused input may be batch.log itself, so nothing more goes into -RunDir.
             # r3 pass 3 (adversary r3 A1): the summary runs inside the refusal, AFTER its own log line, so the logWriteFailures it reports counts that line too.
@@ -1875,7 +1887,7 @@ while ($pending.Count -gt 0 -and $null -eq $stopReason) {
         # (and be taken by another claimant) before the keeper's first renewal, so it is let go and asked for again, never carried into an open.
         $guardSec = ([DateTime]::UtcNow - $grantReadUtc).TotalSeconds
         if ($req.granted -and $guardSec -ge ($ClaimTtlSec - $ClaimRenewSec)) {
-            try { [void](Release-VenueClaim -Venue $Venue -Nonce $req.claim.nonce -ClaimDir $ClaimDir) } catch { }
+            try { [void]$(if ($grantedOnRetry) { Invoke-ClaimRetryRelease $deadline $req.claim.nonce } else { Release-VenueClaim -Venue $Venue -Nonce $req.claim.nonce -ClaimDir $ClaimDir }) } catch { }
             LogBest "CLAIM_LAPSED_IN_GUARD batch=$batchNo guardSec=$([int]$guardSec) ttlSec=$ClaimTtlSec renewSec=$ClaimRenewSec (the claim was let go before the keeper started; asked for again)"
             if ([DateTime]::UtcNow.AddSeconds($ClaimPollSec) -ge $deadline) { break }
             continue
