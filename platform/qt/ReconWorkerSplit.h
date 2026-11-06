@@ -55,11 +55,16 @@ struct Field
     const char *key;
 };
 
-// Order is the line's order. The nesting (dualiso.c dualiso_debug_finish_full20bit_timing and the
-// mix stage timers) is: llrawproc_total > { the seven llrawproc stages }, llrawproc_dual_iso >
-// full20_total > { pattern, noise, scratch, convert20, match, interp, fullres, mix, final_blend,
-// convert16, other }, mix > { mix_halfres, mix_chroma, mix_alias_map, mix_overexposed }, mix_chroma >
-// { copy, fullres, halfres }.
+// Order is the line's order. Fixed nesting, used for the residues below: llrawproc_total > { the
+// seven llrawproc stages }, llrawproc_dual_iso > full20_total, and full20_total > { pattern, noise,
+// scratch, convert20, match, interp, fullres, mix, final_blend, convert16 } with the rest in other
+// (dualiso.c dualiso_debug_finish_full20bit_timing, its known_ms).
+// PATH-DEPENDENT nesting, so NO residue is computed under mix or mix_chroma (r1 adversary A1): in
+// mix_images (dualiso.c:5303-5323) the chroma split runs inside mix; on the CPU full20 path the chroma
+// smoothing runs after interp, outside mix and outside the ten parts (dualiso.c:6988
+// smooth_matched_source_planes, so it lands in full20 other), its copy is timed outside mix_chroma
+// (dualiso.c:4708-4711), and mix_chroma_fullres also takes the post-mix fullres_reconstruction
+// (dualiso.c:7059-7069). The mix and mix_chroma fields are reported as measured, leaves only.
 enum FieldIndex
 {
     LlrawprocTotal = 0, LlrawprocDarkFrame, LlrawprocVerticalStripes, LlrawprocFocusPixels,
@@ -106,15 +111,13 @@ inline const std::array<Field, FieldCount> &fields()
     return table;
 }
 
-// The residue at each level of the nesting above (never below 0).
+// The residue at each level of the FIXED nesting above (never below 0); none under mix or mix_chroma.
 struct Unattributed
 {
     double llrawprocMs = 0.0;      // llrawproc_total less its seven stages
     double dualIsoOutsideFull20Ms = 0.0;   // llrawproc_dual_iso less full20_total
     double full20Ms = 0.0;         // full20_total less its ten named parts (dualiso.c's other_ms)
-    double mixMs = 0.0;            // mix less halfres, chroma, alias map, overexposed
-    double mixChromaMs = 0.0;      // mix_chroma less copy, fullres, halfres
-    double totalMs = 0.0;          // llrawproc_total less every named leaf (the six non-dual-iso stages and full20's ten parts)
+    double totalMs = 0.0;          // llrawproc_total less the six non-dual-iso stages and full20's ten parts
 };
 
 inline Unattributed unattributed( const std::array<double, FieldCount> &v )
@@ -128,8 +131,6 @@ inline Unattributed unattributed( const std::array<double, FieldCount> &v )
     u.llrawprocMs = pos( v[LlrawprocTotal] - nonDualIsoStages - v[LlrawprocDualIso] );
     u.dualIsoOutsideFull20Ms = pos( v[LlrawprocDualIso] - v[Full20Total] );
     u.full20Ms = pos( v[Full20Total] - full20Parts );
-    u.mixMs = pos( v[Full20Mix] - v[Full20MixHalfres] - v[Full20MixChroma] - v[Full20MixAliasMap] - v[Full20MixOverexposed] );
-    u.mixChromaMs = pos( v[Full20MixChroma] - v[Full20MixChromaCopy] - v[Full20MixChromaFullres] - v[Full20MixChromaHalfres] );
     u.totalMs = pos( v[LlrawprocTotal] - nonDualIsoStages - full20Parts );
     return u;
 }
@@ -163,7 +164,7 @@ struct Totals
         return avg;
     }
 
-    // " avg_<name>_ms=<v>" for every field, then the six unattributed residues, %.3f, no spaces in values.
+    // " avg_<name>_ms=<v>" for every field, then the four unattributed residues, %.3f, no spaces in values.
     QString fieldsText() const
     {
         const std::array<double, FieldCount> avg = averages();
@@ -174,8 +175,6 @@ struct Totals
         text += QStringLiteral( " avg_llrawproc_unattributed_ms=%1" ).arg( u.llrawprocMs, 0, 'f', 3 );
         text += QStringLiteral( " avg_dual_iso_outside_full20_ms=%1" ).arg( u.dualIsoOutsideFull20Ms, 0, 'f', 3 );
         text += QStringLiteral( " avg_full20_unattributed_ms=%1" ).arg( u.full20Ms, 0, 'f', 3 );
-        text += QStringLiteral( " avg_full20_mix_unattributed_ms=%1" ).arg( u.mixMs, 0, 'f', 3 );
-        text += QStringLiteral( " avg_full20_mix_chroma_unattributed_ms=%1" ).arg( u.mixChromaMs, 0, 'f', 3 );
         text += QStringLiteral( " avg_unattributed_ms=%1" ).arg( u.totalMs, 0, 'f', 3 );
         return text;
     }
