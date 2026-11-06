@@ -425,11 +425,13 @@ class NarrowedPromiseR4(unittest.TestCase):
                 ("FAILED test_s.py::T::test_a\n", "=== 1 failed in 0.1s ==="),  # no message
                 ("FAILED test_s.py::T::test_a - \n", "=== 1 failed in 0.1s ==="),  # empty message
                 ("FAILED test_s - AssertionError\n", "=== 1 failed in 0.1s ==="),  # no file::name
-                ("FAILED test_s.py::T::test_a - Assertio...\n", "=== 1 failed in 0.1s ==="),  # type cut off
                 (ok + "ERROR test_s.py::T::test_b\n", "=== 1 failed, 1 error in 0.1s ==="),  # error without message
                 (ok, "=== 2 failed in 0.1s ==="),  # fewer lines than the runner counts
                 (ok + ok.replace("test_a", "test_b"), "=== 1 failed in 0.1s ===")):  # more lines than it counts
             self.cnc(top + lines + bar + "\n", "test_s.py::T::test_a", "short-summary line")
+        cut = top + "FAILED test_s.py::T::test_a - Assertio...\n=== 1 failed in 0.1s ===\n"  # type cut off
+        self.assertEqual(rmv.verdict(cut, "test_s.py::T::test_a")[0], rmv.REFUSED)
+        self.assertIn("COULD-NOT-CHECK", rmv.verdict(cut, "test_s.py::T::test_a")[1])
         green = top + ok + "=== 1 failed in 0.1s ===\n"
         self.assertEqual(rmv.verdict(green, "test_s.py::T::test_a")[0], rmv.PASS, green)
         plain = _run_pytest({"test_memory.py": "def test_assert(): assert False\n"}, "--tb=no")
@@ -456,6 +458,53 @@ class NarrowedPromiseR4(unittest.TestCase):
         self.cnc(zero, "test_s.py:12", "failure blocks")
         sections = _run_pytest({"test_memory.py": "def test_assert(): assert False\n"}).replace("1 failed", "0 failed")
         self.cnc(sections, "test_memory.py::test_assert", "counts 0 failed or errored")
+
+    def test_r5_pass9_a1_summary_word_continuation_of_a_multi_line_id_is_refused_by_the_count(self) -> None:
+        # The first physical line is a complete, valid FAILED line; the continuation starts with a summary word and
+        # carries the real exception. Only the runner's own passed/skipped/xfailed/xpassed count tells them apart.
+        for word in ("PASSED", "SKIPPED", "XFAIL", "XPASS"):
+            conftest = ("def pytest_collection_modifyitems(items):\n    for item in items:\n"
+                        f"        item._nodeid = 'fake.py::test_expected - AssertionError\\n{word} bad/test_real.py::test_other'\n")
+            out = _run_pytest({"conftest.py": conftest, "test_real.py": "def test_other(): raise TypeError('boom')\n"},
+                              "--tb=no", columns=300)
+            self.assertIn(f"{word} bad/test_real.py::test_other - TypeError: boom", out)
+            self.cnc(out, "fake.py::test_expected", "short-summary line")
+
+    def test_r5_pass9_a1_real_summary_words_still_reconcile(self) -> None:
+        src = ("import pytest\ndef test_assert(): assert False\ndef test_ok(): pass\n"
+               "@pytest.mark.skip(reason='r')\ndef test_skip(): pass\n"
+               "@pytest.mark.xfail(reason='r')\ndef test_xf(): assert False\n"
+               "@pytest.mark.xfail(reason='r')\ndef test_xp(): pass\n")
+        out = _run_pytest({"test_memory.py": src}, "-rA", "--tb=no", columns=200)
+        for word in ("PASSED ", "SKIPPED ", "XFAIL ", "XPASS "):
+            self.assertIn(word, out)
+        self.assertEqual(rmv.verdict(out, "test_memory.py::test_assert")[0], rmv.PASS, out)
+
+    def test_r5_pass9_a2_a_number_that_underflows_to_zero_is_refused_not_read_as_zero(self) -> None:
+        for bug, fix, lo, hi in (("1", "1e-400", "0", "0"), ("1e-400", "0", "0", "0"), ("1", "0", "1e-400", "1e-400"),
+                                 ("1", "0", "-1e-400", "0")):
+            self.assertEqual(rmv.main(["probe", "--bug", bug, "--fix", fix, "--window", lo, hi]), 1, (bug, fix, lo, hi))
+        ok, why = rmv.probe_discriminates(1, 0, ("1e-400", "1e-400"))
+        self.assertFalse(ok)
+        self.assertIn("COULD-NOT-CHECK", why)
+        self.assertTrue(rmv.probe_discriminates(1, 0, ("0.0", "0e-400"))[0])  # a real zero is still a zero
+        self.assertTrue(rmv.probe_discriminates(1, 5e-324, (5e-324, 1e-300))[0])  # a real subnormal is a number
+
+    def test_r5_pass9_a3_an_exception_type_that_may_subclass_importerror_is_refused(self) -> None:
+        ut = ("import unittest\nclass MissingDependency(ImportError): pass\nclass T(unittest.TestCase):\n"
+              " def test_expected(self): self.assertEqual(1, 2)\n def test_import(self): raise MissingDependency('missing')\n")
+        self.cnc(_run_unittest({"test_s.py": ut}, "test_s"), "test_s.T.test_expected", "exception type")
+        pt = ("class MissingDependency(ImportError): pass\ndef test_expected(): assert False\n"
+              "def test_import(): raise MissingDependency('missing')\n")
+        for extra in ((), ("--tb=no",), ("-rN",)):
+            out = _run_pytest({"test_memory.py": pt}, *extra)
+            self.cnc(out, "test_memory.py::test_expected" if "-rN" not in extra else "test_memory.py:2", "exception type")
+        grp = ("class DependencyFailures(ExceptionGroup): pass\ndef test_expected(): assert False\n"
+               "def test_import(): raise DependencyFailures('dependencies', [ImportError('missing'), ValueError('bad')])\n")
+        self.cnc(_run_pytest({"test_memory.py": grp}, "--tb=no"), "test_memory.py::test_expected", "exception type")
+        builtin = ("def test_expected(): assert False\ndef test_other(): raise TypeError('boom')\n")
+        out = _run_pytest({"test_memory.py": builtin})
+        self.assertEqual(rmv.verdict(out, "test_memory.py::test_expected")[0], rmv.PASS, out)
 
     def test_the_narrowed_promise_is_documented(self) -> None:
         for word in ("NARROWED PROMISE", "COULD-NOT-CHECK", "chained", "Captured"):

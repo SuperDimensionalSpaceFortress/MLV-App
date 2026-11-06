@@ -45,10 +45,17 @@ REFUSED with a reason that starts ``COULD-NOT-CHECK (<typed reason>)``. That is 
   <message>`` with a non-empty message (a multi-line or over-long node id, a `` - `` inside a directory name, a
   message cut to ``...`` before its exception type shows, a message that itself holds a ``<file>::<name>``; a module-level ``ERROR <file.ext> - <message>`` is the one
   allowed shape without ``::name``), or whose number of such lines differs from the runner's own failed+errored
-  count, or that holds a summary line starting with no summary word. A test name can forge many shapes; none of them
-  is parsed, they all fail this one test.
-* ``number``: a probe reading or window bound no float can hold (an integer or ``1e400`` spelled out), or an
-  infinite reading. A spelled ``inf`` window bound is a real unbounded window and is accepted.
+  count, or that holds a summary line starting with no summary word, or whose ``PASSED``/``SKIPPED``/``XFAIL``/
+  ``XPASS`` lines do not add up to the runner's own passed/skipped/xfailed/xpassed count (a continuation line of a
+  multi-line id can start with any of those words). A test name can forge many shapes; none of them is parsed, they
+  all fail this one test.
+* ``exception type``: a failing test (any, not only the expected one) whose printed exception class is not a builtin
+  exception, an assertion or pytest's ``Failed:``. A run prints only the class NAME, and a class of any name may
+  subclass ``ImportError`` (or hold one in an ``ExceptionGroup``), so a custom type cannot be called "not an import
+  failure". Run the mutation so the only failures are assertions and builtin exceptions, or confirm by hand.
+* ``number``: a probe reading or window bound no float can hold (an integer or ``1e400`` spelled out, or ``1e-400``
+  which a float would read as ``0.0``), or an infinite reading. The corpus guard keeps each number's spelling
+  (``json.loads(parse_float=str)``) so a recorded ``1e-400`` is not read as ``0.0`` before this check sees it. A spelled ``inf`` window bound is a real unbounded window and is accepted.
 * ``internal-error``: any other exception while reading the text. Never an uncaught traceback.
 
 A refusal is checked BEFORE the older reasons and the older reason is appended (``; also: ...``), so a
@@ -118,6 +125,7 @@ NON-PROMISES:
 from __future__ import annotations
 
 import argparse
+import builtins
 import math
 import re
 import sys
@@ -192,6 +200,7 @@ class Failure:
     collection: bool = False
     note: str = ""
     odd: str = ""  # set when the identity cannot be told with certainty: verdict() refuses the whole run
+    exc: str = ""  # the exception line the runner printed for this failure ("TypeError: boom"), "" when none was read
 
 
 @dataclass
@@ -357,7 +366,7 @@ def _parse_unittest(text: str) -> list[Failure]:
         # class: the assertion claim rests on the exception actually printed.
         is_assertion = bool(re.match(r"AssertionError(?::|\s*$)", exc_line))
         out.append(Failure(ids, frames, assertion=head["kind"] == "FAIL" and is_assertion and not collection,
-                           collection=collection, note=body[0].strip(), odd=odd))
+                           collection=collection, note=body[0].strip(), odd=odd, exc=exc_line.strip()))
     return out
 
 
@@ -404,7 +413,8 @@ def _parse_pytest(text: str, stats: dict | None = None) -> list[Failure]:
     section exists), `bad` (the first line that fails the class rule, see _summary_problem), `stray` (a summary-section
     line that starts with no known summary word, e.g. the continuation of a multi-line node id)."""
     stats = stats if stats is not None else {}
-    stats.update(sections=0, summary=0, stray=0, has_summary=False, bad="")
+    stats.update(sections=0, summary=0, stray=0, has_summary=False, bad="",
+                 words={"PASSED": 0, "XFAIL": 0, "XPASS": 0, "SKIPPED": 0})
     out: list[Failure] = []
     nodes: list[tuple[str, str]] = []
     summary_blockers: list[str] = []
@@ -419,7 +429,8 @@ def _parse_pytest(text: str, stats: dict | None = None) -> list[Failure]:
         nonlocal cur
         if cur is not None:
             stats["sections"] += 1
-            out.append(Failure([cur["name"]], cur["frames"], cur["assertion"], cur["collection"], cur["name"]))
+            out.append(Failure([cur["name"]], cur["frames"], cur["assertion"], cur["collection"], cur["name"],
+                               exc=cur["first"]))
         cur = None
 
     # Width is checked only INSIDE a captured block, the one place a test can print: there a real rule has the
@@ -443,6 +454,12 @@ def _parse_pytest(text: str, stats: dict | None = None) -> list[Failure]:
             if line.strip() and not line.startswith(tuple(w + " " for w in _PT_SUMMARY_WORDS)) \
                     and line.strip() not in _PT_SUMMARY_WORDS:
                 stats["stray"] += 1
+            for word in stats["words"]:
+                if line.startswith(word + " "):  # tallied; _count_mismatch reconciles each with the runner's own count
+                    skipped = re.match(r"SKIPPED \[(\d+)\]", line)
+                    stats["words"][word] += int(skipped[1]) if skipped else 1
+                    if word == "SKIPPED" and not skipped:
+                        stats["stray"] += 1
             for word in ("FAILED", "ERROR"):
                 got = _parse_summary_line(line, word)
                 if not got:
@@ -473,7 +490,7 @@ def _parse_pytest(text: str, stats: dict | None = None) -> list[Failure]:
             close()
             captured = False
             name = m_sec["name"]
-            cur = {"name": name, "frames": [], "assertion": None,
+            cur = {"name": name, "frames": [], "assertion": None, "first": "",
                    "collection": name.startswith("ERROR collecting")}
             continue
         if cur is None:
@@ -489,6 +506,7 @@ def _parse_pytest(text: str, stats: dict | None = None) -> list[Failure]:
             first = line[1:].strip()
             if cur["assertion"] is None:
                 cur["assertion"] = bool(_ASSERT_HEAD.match(first))
+                cur["first"] = first
             if _IMPORT_ERR.match(first):  # any E line: a chained exception counts too
                 cur["collection"] = True
             continue
@@ -509,6 +527,8 @@ def _parse_pytest(text: str, stats: dict | None = None) -> list[Failure]:
         # tail is that name and whose file appears in the section's own traceback frames.
         f.ids = _pair_nodes(_segs(bare), f.frames, [n for n, _msg in nodes])
         known = [msgs[i] for i in f.ids if msgs.get(i)]
+        if known:
+            f.exc = known[0]
         if known and len(known) == len(f.ids):
             # The summary line is pytest's own account of the exception TYPE; test output printed inside a
             # section cannot change it.
@@ -516,12 +536,28 @@ def _parse_pytest(text: str, stats: dict | None = None) -> list[Failure]:
     paired = {i for f in out for i in f.ids}
     for node, msg in nodes:  # a failing node no section could be tied to still counts, by its summary line
         if node not in paired:
-            out.append(Failure([node], [], bool(_ASSERT_HEAD.match(msg)), note=msg))
+            out.append(Failure([node], [], bool(_ASSERT_HEAD.match(msg)), note=msg, exc=msg))
     for note in summary_blockers:
         out.append(Failure([], [], False, True, note))
     for note in odd_notes:
         out.append(Failure([], [], False, note=note, odd=note))
     return out
+
+
+def _foreign_type(failure: Failure) -> str:
+    """The reason a failure's exception type cannot be classified, or "". A run prints only the CLASS NAME, and a
+    class of any name may subclass ImportError (or an ExceptionGroup holding one), so only a builtin exception that
+    is not an ImportError, an assertion, or pytest's ``Failed:`` is known not to be an import failure."""
+    text = failure.exc.strip()
+    if not text or _ASSERT_HEAD.match(text):
+        return ""
+    token = re.match(r"[\w.]+", text)
+    name = token.group(0) if token else text[:40]
+    cls = getattr(builtins, name, None) if re.fullmatch(r"\w+", name) else None
+    if isinstance(cls, type) and issubclass(cls, BaseException):
+        return ""  # a builtin: ImportError and its builtin subclasses are caught by their own name elsewhere
+    return (f"exception type {name[:40]!r} of a failing test is not a builtin: its class may subclass ImportError, "
+            "which the run does not say")
 
 
 def _final_green(text: str) -> bool:
@@ -568,6 +604,14 @@ def _count_mismatch(text: str, ut_blocks: int, stats: dict) -> str:
         if stats["has_summary"] and stats["summary"] != want:
             return (f"short-summary line: the runner counts {want} failed or errored tests but "
                     f"{stats['summary']} FAILED/ERROR lines were readable")
+        for word, label in (("PASSED", "passed"), ("XFAIL", "xfailed"), ("XPASS", "xpassed"), ("SKIPPED", "skipped")):
+            # A multi-line test id can start a continuation line with any summary word. Real lines of that word
+            # add up to the runner's own count; a forged one makes them differ.
+            stated = re.search(rf"\b(\d+) {label}\b", last)
+            shown = int(stated[1]) if stated else 0
+            if stats["words"][word] and stats["words"][word] != shown:
+                return (f"short-summary line: {stats['words'][word]} {word} lines were read but the runner counts "
+                        f"{shown} {label} (a multi-line test id?)")
     return ""
 
 
@@ -641,6 +685,10 @@ def _verdict(output: str, expected: str) -> tuple[str, str]:
     if broken:
         return REFUSED, ("collection or import error in the run (" + broken[0].note[:80]
                          + "): red for a reason that is not the assertion")
+    for f in run.failures:
+        why = _foreign_type(f)
+        if why:
+            raise _Unclassifiable(why)
     hit = [f for f in run.failures if _matches(f, expected)]
     if not _EXPECT_SITE.match(expected):
         named = sorted({i for f in hit for i in f.ids})
@@ -659,7 +707,8 @@ def _num(v: object) -> int | float:
     """An int stays an int: Python compares int and float exactly, while float(2**53 + 1) would round it."""
     if not isinstance(v, (int, float)):
         try:
-            v = int(v)  # type: ignore[arg-type]
+            # Only text is parsed as an integer: int(Decimal('0.9')) or int(Fraction(9, 10)) would truncate to 0.
+            v = int(v) if isinstance(v, str) else float(v)  # type: ignore[arg-type]
         except (TypeError, ValueError):
             if isinstance(v, str) and _INT_TEXT.fullmatch(v):
                 raise OverflowError("integer text beyond the int() digit limit") from None
@@ -667,6 +716,12 @@ def _num(v: object) -> int | float:
             v = float(v)  # type: ignore[arg-type]
             if math.isinf(v) and not _INF_TEXT.fullmatch(str(text)):
                 raise OverflowError("a number spelled out beyond what a float can hold (read as inf)")
+        else:
+            text = v
+        if isinstance(v, float) and v == 0.0 and re.search(r"[1-9]", re.split(r"[eE]", str(text))[0]):
+            raise OverflowError("a nonzero number spelled out beyond what a float can hold (read as 0.0)")
+        if isinstance(v, float) and math.isinf(v) and not isinstance(text, float) and not _INF_TEXT.fullmatch(str(text)):
+            raise OverflowError("a number spelled out beyond what a float can hold (read as inf)")
     if isinstance(v, int):
         float(v)  # OverflowError for an int no double can hold: not a real reading (callers refuse it)
     return v

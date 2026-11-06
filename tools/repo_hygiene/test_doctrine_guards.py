@@ -690,7 +690,8 @@ def check_red_mutation_verdict(root: Path, rel_paths: list[str]) -> list[Violati
                             f"renamed, so no case was checked")
     for rel in rel_paths:
         try:
-            cases = json.loads((root / rel).read_text(encoding="utf-8"))["cases"]
+            # parse_float=str keeps a number's spelling: json would read 1e-400 as 0.0 and 1e400 as inf, silently.
+            cases = json.loads((root / rel).read_text(encoding="utf-8"), parse_float=str)["cases"]
             if not isinstance(cases, list) or not cases:
                 raise ValueError("cases is empty or not a list")
         except (OSError, ValueError, KeyError, TypeError) as exc:
@@ -1218,6 +1219,29 @@ class GuardFixtureTests(_PwshMixin, unittest.TestCase):
                 rels = _write_tree(root, {RED_MUTATION_CORPUS: json.dumps({"cases": [case]})})
                 with self.assertRaises(CouldNotCheck, msg=repr(case)):
                     run_guard(guard, root, rels)
+
+    def test_red_mutation_verdict_corpus_number_spelling_is_not_lost_by_json(self) -> None:
+        # adversary r5 pass 9 A2: json.loads turns 1e-400 into 0.0 and 1e400 into inf before the checker sees them,
+        # so a probe recorded as PASS on a number no float can hold used to satisfy the guard.
+        guard = GUARDS["DG-RED-MUTATION-VERDICT"]
+        verdicts = [{"kind": "verdict", "expect": "REFUSED", "output": "Ran 1 test\n\nOK\n", "expected_assertion": "a.py:1"},
+                    {"kind": "verdict", "expect": "PASS", "expected_assertion": "t.py::test_x",
+                     "output": "=== short test summary info ===\nFAILED t.py::test_x - assert False\n=== 1 failed in 0.1s ===\n"}]
+        refused = {"kind": "probe", "expect": "REFUSED", "bug_value": 1, "fix_value": 1, "window": [1, 1]}
+
+        def corpus(spelled_probe: str) -> str:
+            return json.dumps({"cases": verdicts + [refused]})[:-2] + ", " + spelled_probe + "]}"
+
+        control = '{"kind": "probe", "expect": "PASS", "bug_value": 0, "fix_value": 1, "window": [1, 1]}'
+        underflow = '{"kind": "probe", "expect": "PASS", "bug_value": 1, "fix_value": 1e-400, "window": [0, 0]}'
+        overflow = '{"kind": "probe", "expect": "PASS", "bug_value": 0, "fix_value": 1, "window": [1, 1e400]}'
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            rels = _write_tree(root, {RED_MUTATION_CORPUS: corpus(control)})
+            self.assertEqual(run_guard(guard, root, rels), [])  # a clean PASS probe is still accepted
+            for spelled in (underflow, overflow):
+                rels = _write_tree(root, {RED_MUTATION_CORPUS: corpus(spelled)})
+                self.assertTrue(run_guard(guard, root, rels), spelled)
 
     def test_ps_one_trap_red_fails(self) -> None:
         self._assert_red("PS-ONE-TRAP", {("a.ps1", 3), ("b.ps1", 3), ("c.ps1", 4),
