@@ -1355,12 +1355,159 @@ TEST(PlaybackScaling, FastRgb32ImageOwnsItsPixelsPastTheBuilder)
     ASSERT_FALSE(pixmap_image( shared.toImage() ) == pixmap_image( expected ));
 }
 
+/* fork/master's presented-content sampler (MainWindow.cpp, draw_frame_ready.present_content),
+ * transcribed verbatim: one byte every contentBytes/8192 of the RGB888 prepared frame. */
+static uint64_t base_present_content_hash(const uint8_t *contentBits, size_t contentBytes)
+{
+    uint64_t contentHash = 1469598103934665603ull;
+    if( contentBits && contentBytes > 0 )
+    {
+        const size_t contentStep =
+            std::max( static_cast<size_t>( 1 ), contentBytes / 8192 );
+        for( size_t i = 0; i < contentBytes; i += contentStep )
+        {
+            contentHash ^= contentBits[i];
+            contentHash *= 1099511628211ull;
+        }
+    }
+    return contentHash;
+}
+
+/* An RGB32 frame and its base RGB888 twin: the twin is the base hand-off buffer, rows of
+ * (width*3 + 3) & ~3 bytes from a zero-filled vector (fork/master's resize + per-row copy), so its
+ * row padding is 0. */
+struct PresentTwin
+{
+    int width = 0;
+    int height = 0;
+    int bpl888 = 0;
+    QImage rgb32;
+    std::vector<uint8_t> rgb888;
+
+    PresentTwin(int w, int h) : width( w ), height( h ), bpl888( ( w * 3 + 3 ) & ~3 ),
+        rgb32( w, h, QImage::Format_RGB32 ),
+        rgb888( static_cast<size_t>( ( w * 3 + 3 ) & ~3 ) * static_cast<size_t>( h ), 0 )
+    {
+        rgb32.fill( QColor( 0, 0, 0 ) );
+    }
+    void set(int x, int y, int r, int g, int b)
+    {
+        reinterpret_cast<QRgb *>( rgb32.scanLine( y ) )[x] = qRgb( r, g, b );
+        uint8_t *p = rgb888.data() + static_cast<size_t>( y ) * static_cast<size_t>( bpl888 ) + static_cast<size_t>( x ) * 3u;
+        p[0] = static_cast<uint8_t>( r );
+        p[1] = static_cast<uint8_t>( g );
+        p[2] = static_cast<uint8_t>( b );
+    }
+    uint64_t headHash() const { return playbackPresentedContentHash( rgb32 ); }
+    uint64_t baseHash() const { return base_present_content_hash( rgb888.data(), rgb888.size() ); }
+    QImage rgb888Image() const
+    {
+        return QImage( rgb888.data(), width, height, bpl888, QImage::Format_RGB888 );
+    }
+};
+
+/* r3 (adversary r2 pass-3 A1, introduced, major): ee42f7ab hashed the RGB32 frame on its OWN byte
+ * grid (step = 4*width*height/8192 snapped to a pixel), so it visited other pixels than the base's
+ * RGB888 grid. Input: 3840x1605 opaque black, pixel (2257,0) = (20+f,0,0), f=0..10. The base
+ * (step 2257) reads byte 6771 = pixel 2257's red: 11 distinct hashes. ee42f7ab (step 3009) lands on
+ * pixel 2256 and hashes all 11 the same. Invariant: for pixel-equal frames the RGB32 hash is
+ * BIT-IDENTICAL to the base hash of the RGB888 twin, so every change the base saw survives. Sizes:
+ * 3840x1605, 3841x1605 (row padding) and 3840x1600; random and adversarial frames. */
+TEST(PlaybackScaling, PresentedContentHashFollowsEveryChannel)
+{
+    uint64_t rng = 0x9E3779B97F4A7C15ull;
+    const auto next = [&]() -> uint32_t
+    {
+        rng ^= rng << 13; rng ^= rng >> 7; rng ^= rng << 17;
+        return static_cast<uint32_t>( rng >> 16 );
+    };
+    const int sizes[3][2] = { { 3840, 1605 }, { 3841, 1605 }, { 3840, 1600 } };
+    for( const auto &size : sizes )
+    {
+        const int w = size[0];
+        const int h = size[1];
+        // Random frames: every pixel random.
+        for( int seed = 0; seed < 2; ++seed )
+        {
+            PresentTwin twin( w, h );
+            for( int y = 0; y < h; ++y )
+                for( int x = 0; x < w; ++x )
+                {
+                    const uint32_t v = next();
+                    twin.set( x, y, static_cast<int>( v & 0xFF ), static_cast<int>( ( v >> 8 ) & 0xFF ),
+                              static_cast<int>( ( v >> 16 ) & 0xFF ) );
+                }
+            ASSERT_EQ(twin.baseHash(), twin.headHash());
+            ASSERT_EQ(twin.baseHash(), playbackPresentedContentHash( twin.rgb888Image() ));
+        }
+        // Adversarial frames: black, then a one-pixel ramp in one channel. Ramps at (2257,0) red and
+        // (1504,0) red/green/blue, and at the exact pixel and channel of base samples 0, 1, 2, 3,
+        // 4097, 8190 and the last one (so the base sees every ramp step there).
+        PresentTwin twin( w, h );
+        const size_t virtualBytes = static_cast<size_t>( twin.bpl888 ) * static_cast<size_t>( h );
+        const size_t step = std::max( static_cast<size_t>( 1 ), virtualBytes / 8192 );
+        struct Ramp { int x; int y; int channel; bool baseSees; };
+        std::vector<Ramp> ramps = { { 2257, 0, 0, false }, { 1504, 0, 0, false }, { 1504, 0, 1, false },
+                                    { 1504, 0, 2, false } };
+        for( const size_t k : { size_t( 0 ), size_t( 1 ), size_t( 2 ), size_t( 3 ), size_t( 4097 ), size_t( 8190 ),
+                                ( virtualBytes - 1 ) / step } )
+        {
+            const size_t i = k * step;
+            const size_t row = i / static_cast<size_t>( twin.bpl888 );
+            const size_t off = i % static_cast<size_t>( twin.bpl888 );
+            if( off >= static_cast<size_t>( w ) * 3u ) continue;   // a padding sample: no pixel to ramp
+            ramps.push_back( { static_cast<int>( off / 3u ), static_cast<int>( row ), static_cast<int>( off % 3u ), true } );
+        }
+        for( const Ramp &ramp : ramps )
+        {
+            std::vector<uint64_t> head;
+            std::vector<uint64_t> base;
+            for( int f = 0; f <= 10; ++f )
+            {
+                const int v = 20 + f;
+                twin.set( ramp.x, ramp.y, ramp.channel == 0 ? v : 0, ramp.channel == 1 ? v : 0, ramp.channel == 2 ? v : 0 );
+                head.push_back( twin.headHash() );
+                base.push_back( twin.baseHash() );
+                ASSERT_EQ(base.back(), head.back());
+                ASSERT_EQ(base.back(), playbackPresentedContentHash( twin.rgb888Image() ));
+            }
+            twin.set( ramp.x, ramp.y, 0, 0, 0 );
+            std::vector<uint64_t> distinct = head;
+            std::sort( distinct.begin(), distinct.end() );
+            const size_t unique = static_cast<size_t>( std::unique( distinct.begin(), distinct.end() ) - distinct.begin() );
+            if( ramp.baseSees ) ASSERT_EQ(static_cast<size_t>( 11 ), unique);
+        }
+        // The pass-3 A1 input and the pass-2 A1 input: the base sees both at 3840x1605, so must the head.
+        if( w == 3840 && h == 1605 )
+        {
+            for( const Ramp ramp : { Ramp{ 2257, 0, 0, true }, Ramp{ 1504, 0, 2, true } } )
+            {
+                std::vector<uint64_t> head;
+                for( int f = 0; f <= 10; ++f )
+                {
+                    const int v = 20 + f;
+                    twin.set( ramp.x, ramp.y, ramp.channel == 0 ? v : 0, 0, ramp.channel == 2 ? v : 0 );
+                    head.push_back( twin.headHash() );
+                }
+                twin.set( ramp.x, ramp.y, 0, 0, 0 );
+                std::sort( head.begin(), head.end() );
+                ASSERT_EQ(static_cast<size_t>( 11 ), static_cast<size_t>( std::unique( head.begin(), head.end() ) - head.begin() ));
+            }
+        }
+    }
+    // An RGB32 frame's padding samples (3841 wide) hash the constant 0, which is the base's zero fill;
+    // an RGB888 frame hashes its own padding byte, exactly as the base did.
+    ASSERT_TRUE(playbackPresentedContentHashLayout( QImage::Format_RGB32 ) == &kPlaybackLayoutRgb32);
+    ASSERT_TRUE(playbackPresentedContentHashLayout( QImage::Format_RGB888 ) == &kPlaybackLayoutRgb888);
+    ASSERT_TRUE(playbackPresentedContentHashLayout( QImage::Format_Grayscale8 ) == nullptr);
+}
+
 /* r2 adversary A2 (introduced, major): the presented-content hash sampled one byte every
  * bytes/8192; at 3840x1600 RGB32 the step is 3000, a multiple of 4, so it read only blue and a
- * picture changing only in red hashed the same every frame (frozen-content FAIL). The RGB888 arm
- * had the same aliasing (step 2250, a multiple of 3: red only). Input: eleven frames, RGB=(20+i,0,0);
- * and for RGB888 eleven frames RGB=(0,20+i,0). */
-TEST(PlaybackScaling, PresentedContentHashFollowsEveryChannel)
+ * picture changing only in red hashed the same every frame (frozen-content FAIL). Input: eleven
+ * frames, RGB=(20+i,0,0). r3: the RGB888 arm is now hashed exactly as the base (the base's own
+ * RGB888 sampler reads red only at this size: pre-existing, and pinned as base parity above). */
+TEST(PlaybackScaling, PresentedContentHashRgb32KeepsTheSamplersRedHalves)
 {
     const int width = 3840;
     const int height = 1600;
@@ -1377,18 +1524,16 @@ TEST(PlaybackScaling, PresentedContentHashFollowsEveryChannel)
         }
         return h;
     };
-    for( const bool rgb32 : { true, false } )
+    for( const bool rgb32 : { true } )
     {
         std::vector<uint64_t> fresh;
         std::vector<uint64_t> old;
         for( int i = 0; i <= 10; ++i )
         {
-            QImage frame( width, height, rgb32 ? QImage::Format_RGB32 : QImage::Format_RGB888 );
-            frame.fill( rgb32 ? QColor( 20 + i, 0, 0 ) : QColor( 0, 20 + i, 0 ) );
+            QImage frame( width, height, QImage::Format_RGB32 );
+            frame.fill( QColor( 20 + i, 0, 0 ) );
             const size_t bytes = static_cast<size_t>( frame.bytesPerLine() ) * static_cast<size_t>( frame.height() );
-            fresh.push_back( playbackPresentedContentHash( frame.constBits(), frame.width(), frame.height(),
-                                                           static_cast<int>( frame.bytesPerLine() ),
-                                                           playbackPreparedBytesPerPixel( frame.format() ) ) );
+            fresh.push_back( playbackPresentedContentHash( frame ) );
             old.push_back( oldHash( frame.constBits(), bytes, rgb32 ) );
         }
         std::vector<uint64_t> distinct = fresh;
@@ -1401,8 +1546,8 @@ TEST(PlaybackScaling, PresentedContentHashFollowsEveryChannel)
     /* r2 adversary pass-2 A1 (introduced, major): a146e9a9 hashed bytesPerPixel bytes from the
      * UNALIGNED sample offset. At 3840x1605 RGB32 the step is 3009: the sample at 6018 read bytes
      * 6018..6021 and missed pixel 1504's blue byte (6016). Input: opaque black frames except pixel
-     * (1504,0) = (0,0,20+f), f=0..10. The RGB888 arm (step 2257, sample 4514 in pixel 1504 at
-     * 4512..4514) missed its red byte the same way: pixel (1504,0) = (20+f,0,0). */
+     * (1504,0) = (0,0,20+f), f=0..10. (r3: the RGB888 arm now hashes exactly as the base, whose
+     * step 2257 reads pixel 1504's blue, not its red: pre-existing, pinned as base parity above.) */
     const auto unalignedHash = []( const uint8_t *bits, size_t bytes, size_t pixelBytes ) -> uint64_t
     {
         uint64_t h = 1469598103934665603ull;
@@ -1411,19 +1556,19 @@ TEST(PlaybackScaling, PresentedContentHashFollowsEveryChannel)
             for( size_t k = 0; k < pixelBytes && i + k < bytes; ++k ) { h ^= bits[i + k]; h *= 1099511628211ull; }
         return h;
     };
-    for( const bool rgb32 : { true, false } )
+    for( const bool rgb32 : { true } )
     {
+        (void)rgb32;
         std::vector<uint64_t> fresh;
         std::vector<uint64_t> unaligned;
         for( int f = 0; f <= 10; ++f )
         {
-            QImage frame( 3840, 1605, rgb32 ? QImage::Format_RGB32 : QImage::Format_RGB888 );
+            QImage frame( 3840, 1605, QImage::Format_RGB32 );
             frame.fill( QColor( 0, 0, 0 ) );
-            frame.setPixelColor( 1504, 0, rgb32 ? QColor( 0, 0, 20 + f ) : QColor( 20 + f, 0, 0 ) );
+            frame.setPixelColor( 1504, 0, QColor( 0, 0, 20 + f ) );
             const size_t bytes = static_cast<size_t>( frame.bytesPerLine() ) * static_cast<size_t>( frame.height() );
             const int bpp = playbackPreparedBytesPerPixel( frame.format() );
-            fresh.push_back( playbackPresentedContentHash( frame.constBits(), frame.width(), frame.height(),
-                                                           static_cast<int>( frame.bytesPerLine() ), bpp ) );
+            fresh.push_back( playbackPresentedContentHash( frame ) );
             unaligned.push_back( unalignedHash( frame.constBits(), bytes, static_cast<size_t>( bpp ) ) );
         }
         std::vector<uint64_t> distinct = fresh;

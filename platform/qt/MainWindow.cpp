@@ -6554,16 +6554,10 @@ void MainWindow::presentPlaybackPreparedFrame( const PlaybackPrepResult &result 
      * hashed. */
     if( interactiveTraceEnabled() && !displayImage.isNull() )
     {
-        const uchar *contentBits = displayImage.constBits();
-        // CPU-S1-RECON-UNDER-LOOK-PACE-LEVER-1 r2 (adversary A2, pass-2 A1): every byte of the pixel
-        // each sample lands in is mixed, so the step can neither lock onto one channel nor straddle
-        // two pixels of an RGB32 (or RGB888) frame.
-        const uint64_t contentHash =
-            playbackPresentedContentHash( contentBits,
-                                          displayImage.width(),
-                                          displayImage.height(),
-                                          static_cast<int>( displayImage.bytesPerLine() ),
-                                          playbackPreparedBytesPerPixel( displayImage.format() ) );
+        // CPU-S1-RECON-UNDER-LOOK-PACE-LEVER-1 r3 (adversary r2 pass-3 A1): the shared helper samples
+        // the base's RGB888 grid and reads each channel through the frame's layout, so an RGB32 frame
+        // hashes bit-identically to the base hash of its RGB888 twin (pinned by pipeline_tests).
+        const uint64_t contentHash = playbackPresentedContentHash( displayImage );
         logInteractionEvent(
             QStringLiteral("draw_frame_ready.present_content"),
             QStringLiteral("display_frame=%1 play_checked=%2 position=%3 hash=%4")

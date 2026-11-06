@@ -811,8 +811,10 @@ TEST(PreparedRgb32Wiring, GuiConsumersReadTheFormat)
     ASSERT_EQ(1, body.count(QStringLiteral("playbackSuppressUniformTopMagentaBandImage( displayImage )")));
     ASSERT_FALSE(body.contains(QStringLiteral("displayImage.format() == QImage::Format_RGB888 )")));
     // Content hash skips the constant alpha byte; the S6 capture stays 3 B/px RGB888.
-    // r2 adversary A2: every byte of each sampled pixel (shared helper, pinned by pipeline_tests).
-    ASSERT_TRUE(body.contains(QStringLiteral("playbackPresentedContentHash( contentBits,")));
+    // r3 adversary r2 pass-3 A1: the shared helper hashes the frame on the base's RGB888 grid through
+    // its own layout (bit-identity to the base pinned by pipeline_tests); no inline byte sampler.
+    ASSERT_TRUE(body.contains(QStringLiteral("const uint64_t contentHash = playbackPresentedContentHash( displayImage );")));
+    ASSERT_FALSE(body.contains(QStringLiteral("playbackPresentedContentHash( contentBits,")));
     ASSERT_FALSE(body.contains(QStringLiteral("contentHash ^= contentBits[")));
     ASSERT_TRUE(body.contains(QStringLiteral("? displayImage.convertToFormat( QImage::Format_RGB888 )")));
     ASSERT_TRUE(body.contains(QStringLiteral("captureImage.constBits(),")));

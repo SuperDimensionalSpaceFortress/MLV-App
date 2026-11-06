@@ -1256,37 +1256,89 @@ inline int playbackSuppressUniformTopMagentaBandImage(QImage &image)
     return rows;
 }
 
-/* r2 (adversary A2, pass-2 A1): the presented-content hash (draw_frame_ready.present_content). A
- * sampled FNV-1a over every byte of the PIXEL each sample lands in: the sample is snapped to the start
- * of its pixel in its row (a sample in the row padding takes the row's last pixel), so the step can
- * neither lock onto one channel (RGB32 step 3000 read only blue; RGB888 step 2250 only red) nor
- * straddle two pixels and miss a channel (step 3009 read bytes 6018..6021 and missed pixel 1504's
- * blue at 6016). bytesPerPixel <= 1 hashes the one sampled byte. */
+/* The channel layout the presented-content hash reads a frame through: RGB888 for Format_RGB888, the
+ * RGB32 byte order for the 32-bit RGB formats, nullptr (raw bytes) for any other format. */
+inline const PlaybackRgb8Layout *playbackPresentedContentHashLayout(QImage::Format format)
+{
+    switch( format )
+    {
+    case QImage::Format_RGB888:
+        return &kPlaybackLayoutRgb888;
+    case QImage::Format_RGB32:
+    case QImage::Format_ARGB32:
+    case QImage::Format_ARGB32_Premultiplied:
+        return &kPlaybackLayoutRgb32;
+    default:
+        return nullptr;
+    }
+}
+
+/* The presented-content hash (draw_frame_ready.present_content), parsed by
+ * tools/profiling/detect-playback-artifacts.ps1 (frozen-content check).
+ *
+ * r3 (adversary r2 pass-3 A1): it samples the base's RGB888 grid whatever the frame's format, so
+ * an RGB32 frame hashes BIT-IDENTICALLY to the base hash of its RGB888 twin and every content
+ * change the base hash saw survives the move to RGB32. The base sampled one byte every
+ * (bytesPerLine*height)/8192 of the RGB888 prepared buffer, whose rows the prep hand-off pads to
+ * (width*3 + 3) & ~3 bytes. Here each sample index i on that virtual buffer is decoded to
+ * (row, pixel, channel) and that ONE channel byte is read through the frame's own layout. A sample
+ * in the virtual row padding hashes the frame's padding byte for an RGB888 frame (the byte the base
+ * read) and the constant 0 for an RGB32 frame (it has no such byte; the base's own padding was the
+ * zero fill of the hand-off vector). Without a layout (any other format) it is the base sampler
+ * over the frame's raw bytes. An RGB888 frame is therefore sampled exactly as the base did. */
 inline uint64_t playbackPresentedContentHash(const uint8_t *bits,
                                              int width,
                                              int height,
                                              int bytesPerLine,
-                                             int bytesPerPixel)
+                                             const PlaybackRgb8Layout *layout)
 {
     uint64_t hash = 1469598103934665603ull;
     if( !bits || width <= 0 || height <= 0 || bytesPerLine <= 0 ) return hash;
     const size_t bpl = static_cast<size_t>( bytesPerLine );
-    const size_t bytes = bpl * static_cast<size_t>( height );
-    const size_t pixelBytes = bytesPerPixel > 1 ? static_cast<size_t>( bytesPerPixel ) : 1u;
-    const size_t lastPixel = static_cast<size_t>( width ) - 1u;
-    const size_t step = std::max( static_cast<size_t>( 1 ), bytes / 8192 );
-    for( size_t i = 0; i < bytes; i += step )
+    const size_t rows = static_cast<size_t>( height );
+    const size_t rowContent = static_cast<size_t>( width ) * 3u;
+    const bool rawBytes = !layout || layout->bytesPerPixel == 3;
+    // RGB888 (or raw): the frame's own stride, as the base. RGB32: the base hand-off's RGB888 stride.
+    const size_t virtualBpl = rawBytes ? bpl : ( ( rowContent + 3u ) & ~static_cast<size_t>( 3 ) );
+    if( !rawBytes && bpl < static_cast<size_t>( width ) * static_cast<size_t>( layout->bytesPerPixel ) )
+        return hash;
+    const size_t virtualBytes = virtualBpl * rows;
+    const size_t step = std::max( static_cast<size_t>( 1 ), virtualBytes / 8192 );
+    for( size_t i = 0; i < virtualBytes; i += step )
     {
-        const size_t rowStart = ( i / bpl ) * bpl;
-        const size_t pixel = std::min( ( i - rowStart ) / pixelBytes, lastPixel );
-        const size_t at = rowStart + pixel * pixelBytes;
-        for( size_t k = 0; k < pixelBytes && at + k < bytes; ++k )
+        uint8_t value = 0;
+        if( rawBytes )
         {
-            hash ^= bits[at + k];
-            hash *= 1099511628211ull;
+            value = bits[i];
         }
+        else
+        {
+            const size_t row = i / virtualBpl;
+            const size_t off = i - row * virtualBpl;
+            if( off < rowContent )
+            {
+                const size_t pixel = off / 3u;
+                const size_t channel = off - pixel * 3u;
+                const int byteInPixel = channel == 0 ? layout->r : ( channel == 1 ? layout->g : layout->b );
+                value = bits[row * bpl
+                             + pixel * static_cast<size_t>( layout->bytesPerPixel )
+                             + static_cast<size_t>( byteInPixel )];
+            }
+        }
+        hash ^= value;
+        hash *= 1099511628211ull;
     }
     return hash;
+}
+
+inline uint64_t playbackPresentedContentHash(const QImage &image)
+{
+    if( image.isNull() ) return 1469598103934665603ull;
+    return playbackPresentedContentHash( image.constBits(),
+                                         image.width(),
+                                         image.height(),
+                                         static_cast<int>( image.bytesPerLine() ),
+                                         playbackPresentedContentHashLayout( image.format() ) );
 }
 
 #endif // PLAYBACKSCALING_H
