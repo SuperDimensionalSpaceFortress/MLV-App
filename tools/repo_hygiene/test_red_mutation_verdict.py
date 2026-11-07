@@ -1674,6 +1674,38 @@ class SummarySplitR11(unittest.TestCase):
         self.assertEqual(rmv.classify(one.replace("t.py:3:", "u.py:3:"), "t.py::TestA::test_target").code,
                          "cnc-summary-split")
 
+    def test_r12_pass1_a1_a_section_tells_by_its_first_frame_and_one_line_only(self) -> None:
+        # adversary r12 pass 1 A1 (d1ff9699): u.py's section also held a helper frame in t.py, and "any frame in the file"
+        # let it tell t.py's invented reading. The test's own frame is the FIRST; and an inherited test (its first frame
+        # the base class in t.py) is the account of u.py's own FAILED line, so a name another line prints tells nothing.
+        head = ("=== FAILURES ===\n___ TestA::test_target - AssertionError: x::part.test_x ___\nE TypeError: boom\n"
+                "t.py:2: TypeError\n___ TestA.test_target ___\nE AssertionError\n")
+        tail = ("=== short test summary info ===\n"
+                "FAILED t.py::TestA::test_target - AssertionError: x::part::test_x - TypeError: boom\n"
+                "FAILED u.py::TestA::test_target - AssertionError\n=== 2 failed in 0.04s ===\n")
+        for frames in ("u.py:3:\nt.py:8: AssertionError\n", "t.py:8: AssertionError\n"):
+            with self.subTest(frames=frames):
+                v = rmv.classify(head + frames + tail, "t.py::TestA::test_target")
+                self.assertEqual((v.status, v.code), (rmv.REFUSED, "cnc-summary-split"), v)
+        # controls: one line told by its own section stays readable, and so does a second line of another test name
+        one = ("=== FAILURES ===\n___ TestA.test_target ___\nE AssertionError: x - y\nt.py:3: AssertionError\n"
+               "___ test_b ___\nE assert False\nt.py:9: AssertionError\n=== short test summary info ===\n"
+               "FAILED t.py::TestA::test_target - AssertionError: x - y\nFAILED t.py::test_b - assert False\n"
+               "=== 2 failed in 0.04s ===\n")
+        self.assertEqual(rmv.classify(one, "t.py::TestA::test_target").status, rmv.PASS)
+        self.assertEqual(rmv.classify(one, "t.py::test_b").status, rmv.PASS)
+
+    def test_r12_pass1_a2_bare_failed_is_an_assertion_head(self) -> None:
+        # adversary r12 pass 1 A2 (d1ff9699, minor): pytest.fail() with no message prints a bare `Failed`
+        for msg in ("Failed", "Failed: why"):
+            with self.subTest(msg=msg):
+                v = rmv.classify(self._run(f"FAILED t.py::test_x - {msg}"), "t.py::test_x")
+                self.assertEqual((v.status, v.code), (rmv.PASS, "assertion-failed"), v)
+        for msg in ("Failed:x", "Failed::x", "FailedX", "Failed.Name: boom"):  # the delimiter rule still holds
+            with self.subTest(msg=msg):
+                self.assertEqual(rmv.classify(self._run(f"FAILED t.py::test_x - {msg}"), "t.py::test_x").status,
+                                 rmv.REFUSED)
+
 
 class ReasonCodeR11(unittest.TestCase):
     """r11, r10 adversary A2: every verdict carries a reason CODE the checker sets where it writes the reason."""

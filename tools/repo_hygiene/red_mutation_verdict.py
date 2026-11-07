@@ -271,7 +271,9 @@ _EXC_GROUP = re.compile(r"^(?:[\w.]+\.)?(?:Base)?ExceptionGroup\b")
 # r11: each head needs the runner's own delimiter after it: `assert` then whitespace or the end, the class name then `: `
 # or the end. A word boundary is not one: `assert.MissingDependency` (a class in a module named `assert`, r11 pass 1 A2)
 # and `AssertionError::test_x` / `AssertionError:x` (forged class names, r10 A1) are not assertions.
-_ASSERT_HEAD = re.compile(r"(?:assert(?:\s|$)|AssertionError(?::[ \t]|:?\s*$)|Failed:(?:[ \t]|\s*$))")
+# r12 (adversary r12 pass 1 A2): `Failed` takes the same delimiter as the class name, so the bare `Failed` that
+# pytest.fail() with no message prints is the head the docstring names (it was refused as a foreign type).
+_ASSERT_HEAD = re.compile(r"(?:assert(?:\s|$)|AssertionError(?::[ \t]|:?\s*$)|Failed(?::[ \t]|:?\s*$))")
 _UT_ASSERT = re.compile(r"AssertionError(?::[ \t]|:?\s*$)")
 _EXPECT_SITE = re.compile(r"^(?P<file>.+\.\w+):(?P<line>[0-9]+)\Z")
 # Every pattern below reads ONE framed line (see _frame): none is compiled multi-line, none searches the raw text.
@@ -762,18 +764,21 @@ def _bare_section_name(name: str) -> str:
     return name
 
 
+def _node_name(node: str) -> str:
+    """The test name a pytest section header prints for `node` (`t.py::A::b[p]` -> `A.b[p]`), or "" for a module id."""
+    return ".".join(_split_top(node, "::")[1:])
+
+
 def _section_tells(section: Failure, node: str) -> bool:
-    """True when a failure section is the account of the summary reading `node`: its header prints exactly that node's
-    test name (`Class.name`, `name[param]`) AND one of its traceback frames sits in that node's file (r12, r11 pass 3 A1:
-    u.py's `TestA.test_target` section named t.py's invented reading by its name alone). A section with no frame tells
-    nothing."""
-    parts = _split_top(node, "::")
-    if len(parts) < 2 or not section.ids or not section.frames:
+    """True when a failure section may be the account of the summary reading `node`: its header prints exactly that
+    node's test name (`Class.name`, `name[param]`) AND its FIRST frame, the test function's own, sits in that node's file
+    (r12, r11 pass 3 A1: u.py's `TestA.test_target` section named t.py's invented reading by its name alone; r12 pass 1
+    A1: a helper frame in t.py lower in that section is not the test's file). A section with no frame tells nothing. The
+    caller also refuses a section whose name another FAILED line prints (see _parse_pytest)."""
+    name = _node_name(node)
+    if not name or not section.ids or not section.frames or name != _bare_section_name(section.ids[0]):
         return False
-    if ".".join(parts[1:]) != _bare_section_name(section.ids[0]):
-        return False
-    path = _norm_path(parts[0])
-    return any(_same_file(path, _norm_path(file)) for file, _line in section.frames)
+    return _same_file(_norm_path(_split_top(node, "::")[0]), _norm_path(section.frames[0][0]))
 
 
 def _other_line(word: str, line: str) -> tuple[int, str]:
@@ -839,6 +844,8 @@ def _parse_pytest(lines: list[str], stats: dict | None = None) -> list[Failure]:
     nodes: list[tuple[str, str]] = []
     summary_blockers: list[str] = []
     odd_notes: list[str] = []
+    reading_names: list[tuple[int, str]] = []  # (summary line number, the test name of one of its readings)
+    told: list[tuple[int, str, str]] = []  # (summary line number, the name of the reading a section told, the line)
     top = ""
     cur: dict | None = None
     captured = False
@@ -900,12 +907,16 @@ def _parse_pytest(lines: list[str], stats: dict | None = None) -> list[Failure]:
                     continue
                 stats["summary"] += 1
                 stats["bad"] = stats["bad"] or _unreadable_reading(word, line, readings)
+                line_no = stats["summary"]
+                reading_names.extend((line_no, _node_name(r[0])) for r in readings)
                 if len(readings) > 1:
                     # r11: the run's own failure sections (they precede the summary, so `out` holds them) name their
                     # tests; a reading is told only when EXACTLY ONE of them is the account of a section, by its test
                     # name AND its file (r12, r11 pass 3 A1: a name alone may belong to another file's section).
-                    named = [r for r in readings if any(_section_tells(f, r[0]) for f in out)]
-                    readings = named if len(named) == 1 else readings
+                    tells = [(r, f) for r in readings for f in out if _section_tells(f, r[0])]
+                    if len({r for r, _f in tells}) == 1:
+                        told.append((line_no, _node_name(tells[0][0][0]), line))
+                        readings = [tells[0][0]]
                 node, msg = readings[0]
                 ambiguous = len(readings) > 1
                 stats["bad"] = stats["bad"] or _summary_problem(word, node, msg)
@@ -973,6 +984,14 @@ def _parse_pytest(lines: list[str], stats: dict | None = None) -> list[Failure]:
             raise _Unclassifiable("cnc-frame", f"location line {line.strip()[:60]!r}: its line number is not ASCII digits "
                                   "followed by the runner's own `:` delimiter")
     close()
+    for line_no, name, line in told:
+        # r12 pass 1 A1: the section that told a split may be another line's account (an inherited test of u.py whose
+        # first frame is the base class in t.py). A section is the account of ONE line, so a name that another FAILED or
+        # ERROR line also prints (in any of its readings) tells nothing, and the split stays COULD-NOT-CHECK.
+        if any(other != line_no and other_name == name for other, other_name in reading_names):
+            odd_notes.append(_Reason("cnc-summary-split", f"summary split: the line {line[:70]!r} was told by a failure "
+                                     f"section named {name[:40]!r}, a name another summary line prints too: which line "
+                                     "that section is the account of cannot be told"))
     if stats["has_summary"] and not after_result:
         # The summary is closed by the runner's own result bar; without it the counts cannot be reconciled at all.
         stats["bad"] = stats["bad"] or "the short summary is not closed by a final result bar (a cut-off or forged log?)"
