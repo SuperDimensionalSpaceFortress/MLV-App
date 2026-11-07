@@ -763,6 +763,8 @@ $scaleNote = "requested scale $($scale.requestedScale) [$(Get-DvScaleLabel -Fact
 # The display mode the app RAN in and the window it presented in, from its own gui_smoke.window_placement line (never from the spec): the receipt carries the requested and the observed mode.
 $display = Get-DvDisplayEvidence -Spec $spec -LogText $runLogText
 $receipt.display = $display
+# LOOK-FULLSCREEN-PARITY-1: the look label the app showed (fullscreen corner or windowed status bar), from its own gui_smoke.look_label line. Informational.
+$receipt.lookLabel = Get-DvLookLabelEvidence -LogText $runLogText
 $smokeRefusalReason = $(if ($null -ne $summary -and $summary.PSObject.Properties['smokeRefusalReason']) { [string]$summary.smokeRefusalReason } else { '' })
 $resolved = Resolve-DvJobOutcome -ResultToken $token -ExitCode $exitCode -SmokeRefusalReason $smokeRefusalReason
 # A consumer of an evidence launcher ACTS on its exit code (master's consumer scan pins this statement): a job that prints a
@@ -967,11 +969,11 @@ if ($outcome -in @('PASS', 'FAIL') -and $unpacedVerdict.blocks) {
     $outcome = 'INVALID'
 }
 # VENUE-LEG-PLAYBACK-MAX-THREADS-ARG-1, FAIL CLOSED: a leg that asks for a worker-thread cap of n counts only when the measured session's own worker count and the
-# job's proof fields all say n; a mismatch or an unreadable count is a typed INVALID, never a PASS or FAIL. A leg that does not ask for it is unchanged.
+# job's proof fields all say n; a mismatch or an unreadable count is a typed INVALID, never a PASS or FAIL. A leg that does not ask for it is INVALID only under an inherited thread-count variable.
 $workerThreadsVerdict = Get-DvWorkerThreadsEvidence -Spec $spec -LogText $runLogText -Summary $summary
 if ($workerThreadsVerdict.requested) { $receipt['workerThreads'] = [ordered]@{ requested = $workerThreadsVerdict.requested; observed = $workerThreadsVerdict.observed; verdict = $workerThreadsVerdict.verdict } }
 if ($outcome -in @('PASS', 'FAIL') -and $workerThreadsVerdict.blocks) {
-    $detail = "INVALID: the job result was $outcome ($detail) but WORKER_THREADS_NOT_HONOURED: $($workerThreadsVerdict.reason). A run at another worker count is no measurement under the cap this leg names"
+    $detail = "INVALID: the job result was $outcome ($detail) but WORKER_THREADS_NOT_HONOURED: $($workerThreadsVerdict.reason). A run at another worker count is no measurement of the worker count this leg specifies"
     $outcome = 'INVALID'
 }
 # PLAYBACK-PREP-CONFLATED-MOVE-FR1B-AB-1, FAIL CLOSED: a leg that asks for the #397 prep-conflated-move switch counts only when the measured session's own

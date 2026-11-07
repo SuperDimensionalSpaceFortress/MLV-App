@@ -34,6 +34,7 @@ SOURCES += \
     $$REPO_ROOT/tests/console/test_frame_compare.cpp \
     $$REPO_ROOT/tests/console/test_phase3_quality_policy.cpp \
     $$REPO_ROOT/tests/console/test_clip_lifecycle_barrier.cpp \
+    $$REPO_ROOT/tests/console/test_look_assist_analysis_pump.cpp \
     $$REPO_ROOT/tests/console/test_playback_stop_lifetime.cpp \
     $$REPO_ROOT/tests/console/test_playback_prep_inflight_gate.cpp \
     $$REPO_ROOT/tests/console/test_clip_open_abort_callers.cpp \
@@ -96,6 +97,7 @@ SOURCES += \
     $$REPO_ROOT/tests/console/test_playback_warm_output_reuse_policy.cpp \
     $$REPO_ROOT/tests/console/test_playback_decode_render_overlap.cpp \
     $$REPO_ROOT/tests/console/test_playback_swap_interval.cpp \
+    $$REPO_ROOT/tests/console/test_look_label_policy.cpp \
     $$REPO_ROOT/tests/console/test_cuda_launch_timing.cpp \
     $$REPO_ROOT/tests/console/test_gpu_field_telemetry.cpp \
     $$REPO_ROOT/tests/console/test_gpu_device_loss_breaker.cpp \
@@ -149,6 +151,7 @@ HEADERS += \
     $$REPO_ROOT/platform/qt/PlaybackDueWakeSamples.h \
     $$REPO_ROOT/platform/qt/PlaybackPresentTrace.h \
     $$REPO_ROOT/platform/qt/PlaybackSwapInterval.h \
+    $$REPO_ROOT/platform/qt/LookLabelPolicy.h \
     $$REPO_ROOT/platform/qt/PlaybackScopesDuringPlayback.h \
     $$REPO_ROOT/platform/qt/PlaybackSlipHistogram.h \
     $$REPO_ROOT/platform/qt/PlaybackStartupSplit.h \

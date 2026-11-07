@@ -203,6 +203,7 @@ SOURCES += \
     GpuDebayer.cpp \
     GpuDisplayViewport.cpp \
     GpuDisplayWindow.cpp \
+    LookLabelOverlay.cpp \
     GpuFieldTelemetry.cpp \
     GpuDeviceLossBreaker.cpp \
         main.cpp \
@@ -375,6 +376,7 @@ macx: SOURCES += ../cocoa/avf_lib/avf_lib.m
 
 HEADERS += MainWindow.h \
            ClipLifecycleBarrier.h \
+           LookAssistAnalysisPump.h \
            CrashForensics.h \
            AutomationSettings.h \
            HubHostPlaybackGuard.h \
@@ -403,6 +405,8 @@ HEADERS += MainWindow.h \
            PlaybackPresentTrace.h \
            PlaybackSlotRelease.h \
            PlaybackSwapInterval.h \
+           LookLabelPolicy.h \
+           LookLabelOverlay.h \
            PlaybackScopesDuringPlayback.h \
            DisplayDeviceMapping.h \
            PlaybackGatePolicy.h \

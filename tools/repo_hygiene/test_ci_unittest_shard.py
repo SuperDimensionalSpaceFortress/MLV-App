@@ -478,7 +478,10 @@ class HeavySetTests(unittest.TestCase):
 
     def test_the_heavy_job_has_the_shard_jobs_setup(self) -> None:
         def setup_steps(job: str, first_own_step: str) -> str:
-            return job[job.index("      - uses: actions/checkout@") : job.index(first_own_step)]
+            span = job[job.index("      - uses: actions/checkout@") : job.index(first_own_step)]
+            # Comment lines directly above the job's own first step explain that step, not the setup
+            # (the heavy step's "/6" label is stale on purpose, see the comment above it in tests.yml).
+            return re.sub(r"(?:      #[^\n]*\n)+\Z", "", span)
 
         self.assertEqual(
             setup_steps(_workflow_job(WINDOWS_HEAVY_JOB), "      - name: Run repo hygiene heavy unittest part"),
@@ -961,13 +964,276 @@ class TimingsTests(unittest.TestCase):
         )
         self.assertEqual(
             timings.class_seconds(log),
-            {"tools.repo_hygiene.test_x.AlphaTests": 3.5, "tools.repo_hygiene.test_x.BetaTests": 0.5},
+            {"tools.repo_hygiene.test_x.AlphaTests": 4.5, "tools.repo_hygiene.test_x.BetaTests": 0.5},
         )
+
+    def test_the_time_before_a_classs_first_docstring_test_is_its_own(self) -> None:
+        # adversary r2 A1 on CI-WINDOWS-UNITTEST-SHARD-HEADROOM-2: unittest -v prints a docstring
+        # test's id line when the test STARTS, so the gap from the previous stamped line to it is
+        # the class's setUpClass (187.5 s for CorePartitionGeneratorTests, run 42021571373: the
+        # class weighed 128.2 s here and 316.2 s in the job's own SHARD_SLOWEST). That gap is
+        # charged to the class, as for a plain one-line test.
+        log = (
+            "2026-10-04T00:00:00.0000000Z test_z (tools.repo_hygiene.test_x.PriorTests.test_z) ... ok\n"
+            "2026-10-04T00:03:08.0000000Z test_a (tools.repo_hygiene.test_x.FixtureTests.test_a)\n"
+            "2026-10-04T00:03:29.0000000Z the docstring first line ... ok\n"
+            "2026-10-04T00:03:30.0000000Z test_b (tools.repo_hygiene.test_x.FixtureTests.test_b)\n"
+            "2026-10-04T00:03:31.0000000Z another docstring ... ok\n"
+        )
+        self.assertEqual(timings.class_seconds(log), {"tools.repo_hygiene.test_x.FixtureTests": 211.0})
+
+    def test_the_tools_own_slowest_figure_replaces_the_gap_estimate(self) -> None:
+        # adversary r2 A1 sibling: lines a class logs without a result hide its time from the gaps
+        # (CandidateAcceptanceTests: 8.8 s here, 62.7 s in its job's SHARD_SLOWEST). The tool's own
+        # per-class figure is exact, so it replaces the gap estimate in both directions (r3: a floor
+        # kept a gap that charged a neighbour's teardown to the class, see the next test).
+        log = (
+            "2026-10-04T00:00:00.0000000Z started\n"
+            "2026-10-04T00:00:09.0000000Z test_a (tools.repo_hygiene.test_x.Quiet.test_a) ... ok\n"
+            "2026-10-04T00:00:10.0000000Z test_b (tools.repo_hygiene.test_x.Loud.test_b) ... ok\n"
+            "2026-10-04T00:00:11.0000000Z OK\n"
+            "2026-10-04T00:00:11.0000000Z SHARD_SLOWEST profile=windows shard=1/7 total=70.0s\n"
+            "2026-10-04T00:00:11.0000000Z   62.7s tools.repo_hygiene.test_x.Loud\n"
+            "2026-10-04T00:00:11.0000000Z   3.0s tools.repo_hygiene.test_x.Quiet\n"
+            "2026-10-04T00:00:11.0000000Z   2.0s somewhere.else.Tests\n"
+            "2026-10-04T00:00:12.0000000Z the block ended\n"
+            "2026-10-04T00:00:12.0000000Z   99.0s tools.repo_hygiene.test_x.NotInTheBlock\n"
+        )
+        self.assertEqual(
+            timings.class_seconds(log),
+            {"tools.repo_hygiene.test_x.Quiet": 3.0, "tools.repo_hygiene.test_x.Loud": 62.7},
+        )
+
+    def test_a_classs_teardown_is_not_charged_to_the_next_docstring_class(self) -> None:
+        # adversary r2 pass 3 A1 on CI-WINDOWS-UNITTEST-SHARD-HEADROOM-2: A = a 1 s test then a 100 s
+        # tearDownClass (silent), B = a 1 s docstring test. The gap estimate gives B the 100 s as its
+        # setUpClass (B = 101.0, A's teardown counted twice); both classes are in the job's own
+        # SHARD_SLOWEST, whose figure is exact: A = 101.0, B = 1.0.
+        log = (
+            "2026-10-04T00:00:00.0000000Z started\n"
+            "2026-10-04T00:00:01.0000000Z test_a (tools.repo_hygiene.test_x.A.test_a) ... ok\n"
+            "2026-10-04T00:01:41.0000000Z test_b (tools.repo_hygiene.test_x.B.test_b)\n"
+            "2026-10-04T00:01:42.0000000Z the docstring first line ... ok\n"
+            "2026-10-04T00:01:42.0000000Z OK\n"
+            "2026-10-04T00:01:42.0000000Z SHARD_SLOWEST profile=windows shard=1/7 total=102.0s\n"
+            "2026-10-04T00:01:42.0000000Z  101.0s tools.repo_hygiene.test_x.A\n"
+            "2026-10-04T00:01:42.0000000Z    1.0s tools.repo_hygiene.test_x.B\n"
+        )
+        self.assertEqual(
+            timings.class_seconds(log),
+            {"tools.repo_hygiene.test_x.A": 101.0, "tools.repo_hygiene.test_x.B": 1.0},
+        )
+
+    def test_an_unnamed_class_is_capped_at_the_slowest_blocks_smallest_figure(self) -> None:
+        # adversary r3 pass 4 A1 on CI-WINDOWS-UNITTEST-SHARD-HEADROOM-2: A = a 1 s test then a silent
+        # 100 s tearDownClass, B = a 1 s docstring test that the block omits (nine C classes of 2 s
+        # fill the top ten with A). B's gap estimate is 101.0 (A's teardown charged again as B's
+        # setUpClass), yet a class outside the top ten cannot have run longer than the block's
+        # smallest figure (2.0 s), so that is B's ceiling and the job no longer sums to 220 s.
+        lines = [
+            "2026-10-04T00:00:00.0000000Z started",
+            "2026-10-04T00:00:01.0000000Z test_a (tools.repo_hygiene.test_x.A.test_a) ... ok",
+            "2026-10-04T00:01:41.0000000Z test_b (tools.repo_hygiene.test_x.B.test_b)",
+            "2026-10-04T00:01:42.0000000Z the docstring first line ... ok",
+        ]
+        for i in range(9):
+            at = 104 + 2 * i
+            lines.append(f"2026-10-04T00:{at // 60:02d}:{at % 60:02d}.0000000Z test_c (tools.repo_hygiene.test_x.C{i}.test_c) ... ok")
+        lines.append("2026-10-04T00:02:00.0000000Z SHARD_SLOWEST profile=windows shard=1/7 total=120.0s")
+        lines.append("2026-10-04T00:02:00.0000000Z  101.0s tools.repo_hygiene.test_x.A")
+        lines.extend(f"2026-10-04T00:02:00.0000000Z    2.0s tools.repo_hygiene.test_x.C{i}" for i in range(9))
+        got = timings.class_seconds("\n".join(lines) + "\n")
+        self.assertEqual(got["tools.repo_hygiene.test_x.B"], 2.0)
+        self.assertEqual(got["tools.repo_hygiene.test_x.A"], 101.0)
+        self.assertLessEqual(sum(got.values()), 101.0 + 2.0 * 10)
+
+    def test_a_log_with_two_slowest_blocks_is_read_by_its_gaps_alone(self) -> None:
+        # adversary r3 pass 5 A1: the sums are per job log and a job log holds one SHARD_SLOWEST block (all
+        # 130 hosted windows logs do). Two blocks mean concatenated or foreign output, whose figures
+        # are neither this job's nor each other's, so none is used: the last block's A = 1.0 must not
+        # replace the 101.0 the gaps accumulated.
+        log = (
+            "2026-10-04T00:00:00.0000000Z started\n"
+            "2026-10-04T00:01:40.0000000Z test_a (tools.repo_hygiene.test_x.A.test_a) ... ok\n"
+            "2026-10-04T00:01:40.0000000Z SHARD_SLOWEST profile=windows shard=1/7 total=100.0s\n"
+            "2026-10-04T00:01:40.0000000Z   100.0s tools.repo_hygiene.test_x.A\n"
+            "2026-10-04T00:01:40.0000000Z started\n"
+            "2026-10-04T00:01:41.0000000Z test_a (tools.repo_hygiene.test_x.A.test_a) ... ok\n"
+            "2026-10-04T00:01:41.0000000Z SHARD_SLOWEST profile=windows shard=1/7 total=1.0s\n"
+            "2026-10-04T00:01:41.0000000Z   1.0s tools.repo_hygiene.test_x.A\n"
+        )
+        self.assertEqual(timings.class_seconds(log), {"tools.repo_hygiene.test_x.A": 101.0})
+
+    def test_an_empty_slowest_block_gives_another_block_no_ceiling_over_its_classes(self) -> None:
+        # adversary r3 pass 5 A2: the second block is empty, so the first block's 1.0 s minimum must
+        # not cap B (100 s by the gaps). Two blocks: no SHARD_SLOWEST figure is used at all.
+        log = (
+            "2026-10-04T00:00:00.0000000Z started\n"
+            "2026-10-04T00:00:01.0000000Z test_a (tools.repo_hygiene.test_x.A.test_a) ... ok\n"
+            "2026-10-04T00:00:01.0000000Z SHARD_SLOWEST profile=windows shard=1/7 total=1.0s\n"
+            "2026-10-04T00:00:01.0000000Z   1.0s tools.repo_hygiene.test_x.A\n"
+            "2026-10-04T00:00:01.0000000Z started\n"
+            "2026-10-04T00:01:41.0000000Z test_b (tools.repo_hygiene.test_x.B.test_b) ... ok\n"
+            "2026-10-04T00:01:41.0000000Z SHARD_SLOWEST profile=windows shard=2/7 total=100.0s\n"
+        )
+        self.assertEqual(
+            timings.class_seconds(log),
+            {"tools.repo_hygiene.test_x.A": 1.0, "tools.repo_hygiene.test_x.B": 100.0},
+        )
+
+    def test_unittests_stderr_summary_between_the_header_and_the_rows_does_not_end_the_block(self) -> None:
+        # adversary r3 pass 6 A1: hosted run 41960424018, heavy part 4: the stderr summary lines reach
+        # the log between the stdout header and its rows (blank line, "OK"). The block is still read.
+        log = (
+            "2026-10-04T00:00:00.0000000Z started\n"
+            "2026-10-04T00:00:05.0000000Z test_a (tools.repo_hygiene.test_x.A.test_a) ... ok\n"
+            "2026-10-04T00:00:05.0000000Z Ran 1 test in 5.000s\n"
+            "2026-10-04T00:00:05.0000000Z SHARD_SLOWEST profile=windows shard=4/6 total=5.0s\n"
+            "2026-10-04T00:00:05.0000000Z \n"
+            "2026-10-04T00:00:05.0000000Z OK\n"
+            "2026-10-04T00:00:05.0000000Z   9.0s tools.repo_hygiene.test_x.A\n"
+            "2026-10-04T00:00:05.0000000Z OK (skipped=1)\n"
+            "2026-10-04T00:00:05.0000000Z   2.0s somewhere.else.Tests\n"
+            "2026-10-04T00:00:06.0000000Z Post job cleanup.\n"
+        )
+        self.assertEqual(timings.class_seconds(log), {"tools.repo_hygiene.test_x.A": 9.0})
+
+    def test_unittests_ran_line_and_dash_separator_inside_the_block_do_not_end_it(self) -> None:
+        # adversary r4 A1: the rest of unittest's stderr summary (the 70-dash separator and the
+        # "Ran N tests in Xs" line) can sit between the header and the rows too. The block is read.
+        log = (
+            "2026-10-04T00:00:00.0000000Z started\n"
+            "2026-10-04T00:00:05.0000000Z test_a (tools.repo_hygiene.test_x.A.test_a) ... ok\n"
+            "2026-10-04T00:00:09.0000000Z SHARD_SLOWEST profile=windows shard=1/7 total=9.0s\n"
+            "2026-10-04T00:00:09.0000000Z Ran 1 test in 9.000s\n"
+            "2026-10-04T00:00:09.0000000Z \n"
+            "2026-10-04T00:00:09.0000000Z OK\n"
+            "2026-10-04T00:00:09.0000000Z    9.0s tools.repo_hygiene.test_x.A\n"
+        )
+        self.assertEqual(timings.class_seconds(log), {"tools.repo_hygiene.test_x.A": 9.0})
+        dashed = log.replace(
+            "Ran 1 test in 9.000s\n", "----------------------------------------------------------------------\n"
+            "2026-10-04T00:00:09.0000000Z Ran 1 test in 9.000s\n"
+        )
+        self.assertEqual(timings.class_seconds(dashed), {"tools.repo_hygiene.test_x.A": 9.0})
+        # ... and a class named twice across such a line still makes the block unusable (gap-only 5.0).
+        twice = log + (
+            "2026-10-04T00:00:09.0000000Z Ran 2 tests in 9.000s\n"
+            "2026-10-04T00:00:09.0000000Z    1.0s tools.repo_hygiene.test_x.A\n"
+        )
+        self.assertEqual(timings.class_seconds(twice), {"tools.repo_hygiene.test_x.A": 5.0})
+
+    def test_a_malformed_row_between_rows_neither_ends_the_block_nor_hides_a_repeated_class(self) -> None:
+        # adversary r3 pass 6 A1: "1.2.3s" is not a measurement but it is a row, so the scan goes on
+        # and sees class A named twice, which makes the block unusable (gap-only A = 5.0).
+        log = (
+            "2026-10-04T00:00:00.0000000Z started\n"
+            "2026-10-04T00:00:05.0000000Z test_a (tools.repo_hygiene.test_x.A.test_a) ... ok\n"
+            "2026-10-04T00:00:05.0000000Z SHARD_SLOWEST profile=windows shard=1/7 total=5.0s\n"
+            "2026-10-04T00:00:05.0000000Z   9.0s tools.repo_hygiene.test_x.A\n"
+            "2026-10-04T00:00:05.0000000Z   1.2.3s ignored.Row\n"
+            "2026-10-04T00:00:05.0000000Z   1.0s tools.repo_hygiene.test_x.A\n"
+        )
+        self.assertEqual(timings.class_seconds(log), {"tools.repo_hygiene.test_x.A": 5.0})
+
+    def test_a_class_with_an_unreadable_row_is_not_capped_at_the_blocks_smallest_figure(self) -> None:
+        # The unreadable row names a top-ten class, which a ceiling for classes OUTSIDE the top ten
+        # must not lower: its gap estimate (50 s) stands, the readable row of C is exact.
+        log = (
+            "2026-10-04T00:00:00.0000000Z started\n"
+            "2026-10-04T00:00:50.0000000Z test_u (tools.repo_hygiene.test_x.U.test_u) ... ok\n"
+            "2026-10-04T00:00:52.0000000Z test_c (tools.repo_hygiene.test_x.C.test_c) ... ok\n"
+            "2026-10-04T00:00:52.0000000Z SHARD_SLOWEST profile=windows shard=1/7 total=52.0s\n"
+            "2026-10-04T00:00:52.0000000Z   2.0s tools.repo_hygiene.test_x.C\n"
+            "2026-10-04T00:00:52.0000000Z   1.2.3s tools.repo_hygiene.test_x.U\n"
+        )
+        self.assertEqual(
+            timings.class_seconds(log),
+            {"tools.repo_hygiene.test_x.U": 50.0, "tools.repo_hygiene.test_x.C": 2.0},
+        )
+
+    def test_a_class_named_twice_in_the_slowest_block_makes_the_block_unusable(self) -> None:
+        log = (
+            "2026-10-04T00:00:00.0000000Z started\n"
+            "2026-10-04T00:00:05.0000000Z test_a (tools.repo_hygiene.test_x.A.test_a) ... ok\n"
+            "2026-10-04T00:00:05.0000000Z SHARD_SLOWEST profile=windows shard=1/7 total=5.0s\n"
+            "2026-10-04T00:00:05.0000000Z   9.0s tools.repo_hygiene.test_x.A\n"
+            "2026-10-04T00:00:05.0000000Z   1.0s tools.repo_hygiene.test_x.A\n"
+        )
+        self.assertEqual(timings.class_seconds(log), {"tools.repo_hygiene.test_x.A": 5.0})
+
+    def test_an_unnamed_class_below_the_ceiling_keeps_its_gap_estimate(self) -> None:
+        log = (
+            "2026-10-04T00:00:00.0000000Z started\n"
+            "2026-10-04T00:00:01.0000000Z test_a (tools.repo_hygiene.test_x.Quiet.test_a) ... ok\n"
+            "2026-10-04T00:00:11.0000000Z test_b (tools.repo_hygiene.test_x.Named.test_b) ... ok\n"
+            "2026-10-04T00:00:11.0000000Z SHARD_SLOWEST profile=windows shard=1/7 total=11.0s\n"
+            "2026-10-04T00:00:11.0000000Z   10.0s tools.repo_hygiene.test_x.Named\n"
+        )
+        self.assertEqual(
+            timings.class_seconds(log),
+            {"tools.repo_hygiene.test_x.Quiet": 1.0, "tools.repo_hygiene.test_x.Named": 10.0},
+        )
+
+    def test_a_class_outside_the_slowest_block_keeps_its_gap_estimate(self) -> None:
+        log = (
+            "2026-10-04T00:00:00.0000000Z started\n"
+            "2026-10-04T00:00:04.0000000Z test_a (tools.repo_hygiene.test_x.A.test_a) ... ok\n"
+            "2026-10-04T00:00:09.0000000Z test_b (tools.repo_hygiene.test_x.B.test_b) ... ok\n"
+            "2026-10-04T00:00:09.0000000Z SHARD_SLOWEST profile=windows shard=1/7 total=9.0s\n"
+            "2026-10-04T00:00:09.0000000Z    5.0s tools.repo_hygiene.test_x.B\n"
+        )
+        self.assertEqual(
+            timings.class_seconds(log),
+            {"tools.repo_hygiene.test_x.A": 4.0, "tools.repo_hygiene.test_x.B": 5.0},
+        )
+
+    def test_a_slowest_row_of_hundreds_of_digits_is_not_a_measurement(self) -> None:
+        # adversary r2 pass 3 A2: float("9" * 400) is inf, which would poison the class's table row.
+        # The runner prints one decimal, so a row is at most 7 integer digits; anything longer is
+        # ignored and the gap estimate stands.
+        log = (
+            "2026-10-04T00:00:00.0000000Z started\n"
+            "2026-10-04T00:00:02.0000000Z test_a (tools.repo_hygiene.test_x.A.test_a) ... ok\n"
+            "2026-10-04T00:00:02.0000000Z SHARD_SLOWEST profile=windows shard=1/7 total=2.0s\n"
+            + "2026-10-04T00:00:02.0000000Z   " + "9" * 400 + "s tools.repo_hygiene.test_x.A\n"
+        )
+        self.assertEqual(timings.class_seconds(log), {"tools.repo_hygiene.test_x.A": 2.0})
+        for value in timings.class_seconds(log).values():
+            self.assertLess(value, float("inf"))
+
+    def test_a_docstring_id_line_with_no_earlier_stamped_line_starts_the_clock(self) -> None:
+        # adversary r2 pass 2 A1: the id line is the first stamped line (a log cut after the setup
+        # steps), so there is no previous line to charge from; the test keeps head -> result.
+        log = (
+            "2026-10-04T00:00:01.0000000Z test_a (tools.repo_hygiene.test_x.A.test_a)\n"
+            "2026-10-04T00:00:04.0000000Z doc ... ok\n"
+        )
+        self.assertEqual(timings.class_seconds(log), {"tools.repo_hygiene.test_x.A": 3.0})
+
+    def test_a_docstring_id_line_stamped_before_the_previous_line_keeps_head_to_result(self) -> None:
+        # adversary r2 pass 2 A1: stamps out of order (interleaved job output); a negative gap is not
+        # a setUpClass, so the clock restarts at the id line instead of clamping the test to 0 s.
+        log = (
+            "2026-10-04T00:00:03.0000000Z test_p (tools.repo_hygiene.test_x.P.test_p) ... ok\n"
+            "2026-10-04T00:00:01.0000000Z test_a (tools.repo_hygiene.test_x.A.test_a)\n"
+            "2026-10-04T00:00:02.0000000Z doc ... ok\n"
+        )
+        self.assertEqual(timings.class_seconds(log), {"tools.repo_hygiene.test_x.A": 1.0})
+
+    def test_a_malformed_slowest_row_is_not_a_measurement(self) -> None:
+        # adversary r2 pass 2 A2: "1.2.3s" matched the row pattern and raised ValueError in float().
+        log = (
+            "2026-10-04T00:00:00.0000000Z SHARD_SLOWEST profile=windows shard=1/7 total=1.0s\n"
+            "2026-10-04T00:00:00.0000000Z   1.2.3s tools.repo_hygiene.test_x.A\n"
+        )
+        self.assertEqual(timings.class_seconds(log), {})
 
     def test_a_docstring_test_that_logs_a_line_keeps_its_whole_runtime(self) -> None:
         # CoS on #449: a stamped line between the id line and "<docstring> ... ok" (a logged
         # warning) cleared the pending test, so its result line was never counted. The test
-        # keeps head -> result, the warning's line included; only a new id line replaces it.
+        # keeps previous line -> result, the warning's line included; only a new id line replaces it
+        # (and that replacement restarts the clock at the new id line).
         log = (
             "2026-10-04T00:00:00.0000000Z started\n"
             "2026-10-04T00:00:01.0000000Z test_a (tools.repo_hygiene.test_x.AlphaTests.test_a)\n"
@@ -980,7 +1246,7 @@ class TimingsTests(unittest.TestCase):
         )
         self.assertEqual(
             timings.class_seconds(log),
-            {"tools.repo_hygiene.test_x.AlphaTests": 5.0, "tools.repo_hygiene.test_x.GammaTests": 1.5},
+            {"tools.repo_hygiene.test_x.AlphaTests": 6.0, "tools.repo_hygiene.test_x.GammaTests": 1.5},
         )
 
     def test_an_unexpected_success_docstring_test_clears_pending(self) -> None:
@@ -995,7 +1261,7 @@ class TimingsTests(unittest.TestCase):
         )
         self.assertEqual(
             timings.class_seconds(log),
-            {"tools.repo_hygiene.test_x.A": 2.0, "tools.repo_hygiene.test_x.B": 1.0},
+            {"tools.repo_hygiene.test_x.A": 3.0, "tools.repo_hygiene.test_x.B": 2.0},
         )
 
     def test_a_one_line_unexpected_success_is_counted_to_its_class(self) -> None:
@@ -1012,7 +1278,7 @@ class TimingsTests(unittest.TestCase):
     def test_a_pending_test_that_never_printed_a_result_keeps_its_interval(self) -> None:
         # fable on #629: a docstring id line, then a plain "... ok" line with no result line
         # for the first test (crash, interleaved output). The plain line closes the pending
-        # test: head -> plain line is charged to the PENDING class, as for a result line, and
+        # test: previous line -> plain line is charged to the PENDING class, as for a result line, and
         # the plain test is not charged (its own time is not separable from the pending one's).
         log = (
             "2026-10-04T00:00:00.0000000Z started\n"
@@ -1022,7 +1288,7 @@ class TimingsTests(unittest.TestCase):
         )
         self.assertEqual(
             timings.class_seconds(log),
-            {"tools.repo_hygiene.test_x.A": 4.0, "tools.repo_hygiene.test_x.C": 1.0},
+            {"tools.repo_hygiene.test_x.A": 5.0, "tools.repo_hygiene.test_x.C": 1.0},
         )
 
     def test_a_logged_line_shaped_like_an_id_head_is_not_a_pending_test(self) -> None:
@@ -1048,7 +1314,7 @@ class TimingsTests(unittest.TestCase):
             "2026-10-04T00:00:03.0000000Z Running (1.2)\n"
             "2026-10-04T00:00:06.0000000Z the docstring first line ... ok\n"
         )
-        self.assertEqual(timings.class_seconds(log), {"tools.repo_hygiene.test_x.A": 5.0})
+        self.assertEqual(timings.class_seconds(log), {"tools.repo_hygiene.test_x.A": 6.0})
 
     def test_a_docstring_head_outside_the_key_prefix_is_still_pending(self) -> None:
         # The displayed name equals the id's last component, so this is a real test whose

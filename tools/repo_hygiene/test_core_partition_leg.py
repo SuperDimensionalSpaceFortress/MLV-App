@@ -812,7 +812,8 @@ class CorePartitionGeneratorTests(unittest.TestCase):
         self.assertEqual(proc.returncode, 0, proc.stdout[-2000:] + proc.stderr[-2000:])
         got = json.loads(proc.stdout.strip().splitlines()[-1])
         self.assertEqual(len({got["prePid"], got["midPid"], got["postPid"]}), 3)
-        self.assertEqual(got["seen"], got["postPid"], f"the helper bound a same-path process that started before the measured launch: {got}")
+        why = "the helper never classed the measured launch as an instance" if got["seen"] is None else "the helper bound a same-path process that started before the measured launch"
+        self.assertEqual(got["seen"], got["postPid"], f"{why}: {got}")
         self.assertEqual(got["instances"], [got["postPid"]], got)
 
     def test_a_short_same_exe_probe_after_the_launch_is_not_the_measured_apps_evidence(self) -> None:
@@ -846,7 +847,8 @@ class CorePartitionGeneratorTests(unittest.TestCase):
         proc = run_pwsh(["-File", str(driver)], env_extra={"CP_DIR": str(work), "CP_ENCODED": m.group(1), "CP_GEN": str(GENERATOR)})
         self.assertEqual(proc.returncode, 0, proc.stdout[-2000:] + proc.stderr[-2000:])
         got = json.loads(proc.stdout.strip().splitlines()[-1])
-        self.assertEqual(got["app"], got["measuredPid"], f"the helper bound another same-path instance as the measured app: {got}")
+        why = "the helper never classed the measured launch as an instance" if got["app"] is None else "the helper bound another same-path instance as the measured app"
+        self.assertEqual(got["app"], got["measuredPid"], f"{why}: {got}")
         self.assertEqual(got["recordedMeasuredPid"], got["measuredPid"], got)
         self.assertEqual(sorted(got["instances"]), sorted([got["otherPid"], got["measuredPid"]]), f"the concurrent instance is not on the record: {got}")
         self.assertEqual(got["others"], [got["prePid"]], f"adversary r5 A1: a same-path process alive from before the launch is not on the record: {got}")
@@ -2501,6 +2503,295 @@ def _r14b_unidentified_driver() -> str:
 
 R14B_UNIDENTIFIED_DRIVER = _r14b_unidentified_driver()
 
+# CORE-PARTITION-SAME-PATH-HANDOVER-RACE-1: the real helper body against process doubles whose reads fail on a schedule counted in the helper's own
+# enumerations, never in time, so a failed first-sight read is forced with no timing dependence. Each double: id; from/to, the enumerations that list
+# it; goneAt, the enumeration count from which it has exited; startSec, its start relative to the launch; pathFail/startFail, the enumerations up to
+# which that read fails (-1: always); pathFailFrom/startFailFrom, the enumeration from which it fails; pathMode, how a failed Path read looks (empty
+# is what MainModule gives a real process before its loader has run; throw is an access-denied read); exe 'other', readable at another path;
+# recycleAt, the enumeration from which the pid belongs to a process whose start is stamped 3 s after that read, well past any gap the helper's own
+# clock sampling can record on a loaded host. The measured pid and the stop file arrive at enumeration 8.
+# Every enumeration stamps the wall clock, so a test can place the record's first sight among the helper's polls.
+# r2 additions. Two doubles may share an id: the pid passes from one to the other, and which one is listed is decided by from/to alone. stepMs: every wall
+# clock read the helper makes is that much earlier from enumeration 1 on (a backward step, which its own clock sampling then sees); startBeforeFirstPollMs:
+# the start is that long before enumeration 1 on the unstepped clock, so the process really did start before the first listing that stamps a later time.
+# exitedNullAt (to exitedNullTo, when set): from that enumeration count HasExited gives nothing, which is what PowerShell makes of the getter's access-denied throw once
+# the pid belongs to a process this user cannot open (measured on csrss, wininit and smss from an unelevated pwsh 7.6: Path '', StartTime null, HasExited null, no throw).
+# exitedThrowAt: Refresh throws at that one enumeration count. pathFailAt/startFailAt: that read fails at that one enumeration. A negative startBeforeFirstPollMs is a
+# start after enumeration 1 on the unstepped clock.
+# r3 addition. stepFrom: the enumeration count from which stepMs applies (default 1). The pass that reaches it samples the clock gap at its top, before its
+# enumeration counts, so a step from enumeration 2 is one the helper has not sampled when that pass decides (adversary A2 on 6180c3e7).
+# handleFail: opening the process's handle fails, as for a process this user cannot open (csrss gives $null; this double throws). Otherwise each double has a
+# handle, and its HasExited (goneAt) is what that held handle reports, which on a real process is exact for that process and never for its pid's successor.
+_APP ={"id": 5000, "from": 1, "to": 6, "goneAt": 6, "startSec": 1}
+_Q = {"from": 1, "to": 99, "goneAt": 999}
+# Opus key3's pid 300: P1 is tracked and read at once. P2 takes the pid in the pass that sees P1 gone (enumeration 4), Path empty, its start readable and new.
+_P1_TRACKED = {"id": 300, "from": 1, "to": 3, "goneAt": 3, "startSec": 1}
+_P2_PATH_UNREAD = {"id": 300, "from": 4, "goneAt": 999, "startSec": 2, "pathMode": "empty"}
+# P1 unread on enumerations 1-2, its pid then held by P2.
+_P1_UNREAD = {"id": 300, "from": 1, "to": 2, "goneAt": 999, "startSec": 1, "pathFail": -1, "pathMode": "empty"}
+# Adversary A1 and A2 on 6180c3e7: P1 unread both ways in enumeration 1 only, then P2 on its pid with a readable start earlier than enumeration 1's stamp:
+# 400 ms earlier (A1, a start that came between the enumeration and its stamp, skew 0), and 300 ms earlier with the clock stepped back 500 ms after the deciding
+# pass sampled the gap (A2, a stale gap).
+_P1_BOTH_UNREAD_ONE_PASS = {"id": 300, "from": 1, "to": 1, "goneAt": 999, "startSec": 1, "pathFail": -1, "pathMode": "empty", "startFail": -1}
+_P2_A1 = {"id": 300, "from": 2, "to": 99, "goneAt": 999, "startBeforeFirstPollMs": 400}
+_P2_A2 = {**_P2_A1, "startBeforeFirstPollMs": 300}
+# Adversary A1 and A2 on 203a5bb1 (pass 4): P1's Path is unread at first sight and the start read there is also its successor's: the pid passed to P2 between
+# the Path and StartTime reads (A1), or P2 got the very same start after a backward clock step (A2). P1 has exited by enumeration 2, where P2 is listed.
+_P1_PATH_UNREAD_EXITS = {"id": 300, "from": 1, "to": 1, "goneAt": 2, "startBeforeFirstPollMs": 400, "pathFail": -1, "pathMode": "empty"}
+_P2_SAME_START = {"id": 300, "from": 2, "to": 99, "goneAt": 999, "startBeforeFirstPollMs": 400}
+# Sol's input: the process started 50 ms before enumeration 1, whose stamp is stepMs earlier. One failed read at first sight, then every read succeeds.
+_CLOCK_APP = {**_APP, "startBeforeFirstPollMs": 50}
+CLOCK_STEPS_MS = (100, 500, 1000)
+# With the start unread at first sight the process refuses whatever the clock did (r3); these steps check that a backward step does not change that.
+CLOCK_START_UNREAD_STEPS_MS = (400, 700, 1000)
+LATE_READ_SCENARIOS = {
+    "control": {"procs": [_APP]},
+    "path-empty-late": {"procs": [{**_APP, "pathFail": 3, "pathMode": "empty"}]},
+    "path-throw-late": {"procs": [{**_APP, "pathFail": 3, "pathMode": "throw"}]},
+    "start-late": {"procs": [{**_APP, "startFail": 3}]},
+    "both-late": {"procs": [{**_APP, "pathFail": 3, "pathMode": "empty", "startFail": 3}]},
+    "lifelong-path-exits": {"procs": [_APP, {**_Q, "id": 200, "to": 3, "startSec": 1, "pathFail": -1, "pathMode": "empty"}]},
+    "lifelong-start-exits": {"procs": [_APP, {**_Q, "id": 200, "to": 3, "startSec": 1, "startFail": -1}]},
+    "lifelong-both-exits": {"procs": [_APP, {**_Q, "id": 200, "to": 3, "startSec": 1, "pathFail": -1, "pathMode": "throw", "startFail": -1}]},
+    "lifelong-path-to-stop": {"procs": [_APP, {**_Q, "id": 200, "startSec": 1, "pathFail": -1, "pathMode": "empty"}]},
+    "lifelong-start-to-stop": {"procs": [_APP, {**_Q, "id": 200, "startSec": 1, "startFail": -1}]},
+    "prelaunch-late": {"threads": 1, "procs": [_APP, {**_Q, "id": 200, "startSec": -5, "pathFail": 3, "pathMode": "empty"}]},
+    "prelaunch-start-late": {"procs": [_APP, {**_Q, "id": 200, "startSec": -5, "startFail": 3}]},
+    "owner-keeps-its-load": {"threads": 1, "procs": [_APP, {**_Q, "id": 300, "startSec": 1, "pathFail": 3, "pathMode": "empty"}]},
+    "late-app-owns-from-its-classing": {"threads": 1, "procs": [{**_APP, "pathFail": 3, "pathMode": "empty"}]},
+    "reads-fail-while-tracked": {"procs": [{**_APP, "to": 7, "goneAt": 7, "pathFailFrom": 5, "pathMode": "empty", "startFailFrom": 5}]},
+    "reads-fail-as-seen-gone": {"procs": [{**_APP, "to": 7, "goneAt": 6, "pathFailFrom": 6, "pathMode": "empty", "startFailFrom": 6}]},
+    "other-path-once-readable": {"procs": [_APP, {**_Q, "id": 400, "startSec": 1, "exe": "other", "pathFail": 3, "pathMode": "empty"}]},
+    "recycled-start-unread": {"procs": [_APP, {**_Q, "id": 300, "startSec": 1, "startFail": 2, "recycleAt": 3}]},
+    "recycled-path-unread": {"procs": [_APP, {**_Q, "id": 300, "startSec": 1, "pathFail": 2, "pathMode": "empty", "recycleAt": 3}]},
+    "recycled-over-tracked-gone-next-pass": {"procs": [_APP, _P1_TRACKED, {**_P2_PATH_UNREAD, "to": 4, "pathFail": -1}]},
+    "recycled-over-tracked-read-later": {"procs": [_APP, _P1_TRACKED, {**_P2_PATH_UNREAD, "to": 6, "pathFail": 5}]},
+    "recycled-over-tracked-never-seen-gone": {"procs": [_APP, {**_P1_TRACKED, "goneAt": 999}, {**_P2_PATH_UNREAD, "to": 5, "pathFail": -1}]},
+    "recycled-over-tracked-unopenable": {"procs": [_APP, {**_P1_TRACKED, "goneAt": 999, "exitedNullAt": 3}, {**_P2_PATH_UNREAD, "to": 6, "pathFail": -1, "pathMode": "throw", "startFail": -1}]},
+    "recycled-over-tracked-both-unread-one-pass": {"procs": [_APP, _P1_TRACKED, {**_P2_PATH_UNREAD, "to": 4, "pathFail": -1, "startFail": -1}]},
+    "start-recovered-then-recycled-other-path": {"procs": [_APP, {"id": 300, "from": 1, "to": 2, "goneAt": 999, "startBeforeFirstPollMs": 3000, "pathFail": -1, "pathMode": "empty", "startFail": 1},
+                                                           {"id": 300, "from": 3, "to": 4, "goneAt": 999, "startBeforeFirstPollMs": 2000, "exe": "other"}]},
+    "start-recovered-then-recycled-same-path": {"procs": [_APP, {"id": 300, "from": 1, "to": 2, "goneAt": 999, "startBeforeFirstPollMs": 3000, "pathFail": -1, "pathMode": "empty", "startFail": 1},
+                                                          {"id": 300, "from": 3, "to": 99, "goneAt": 999, "startBeforeFirstPollMs": 2000}]},
+    "recycled-inside-gap-other-path": {"stepMs": 500, "procs": [_APP, {**_P1_UNREAD, "startFail": -1}, {"id": 300, "from": 3, "to": 4, "goneAt": 999, "startBeforeFirstPollMs": 300, "exe": "other"}]},
+    "recycled-inside-gap-same-path": {"stepMs": 500, "procs": [_APP, {**_P1_UNREAD, "startFail": -1}, {"id": 300, "from": 3, "to": 99, "goneAt": 999, "startBeforeFirstPollMs": 300}]},
+    "recycled-over-alive-both-unread": {"procs": [_APP, {**_P1_TRACKED, "goneAt": 4}, {**_P2_PATH_UNREAD, "to": 4, "pathFail": -1, "startFail": -1}]},
+    # adversary pass 6 A1 on 0a40778b: P0 is tracked on pid 300 and gone; its successor gets P0's exact start (a clock step during creation), is unread at first
+    # sight (both reads, or the start alone at the app's path), and reads P0's seen key on the next enumeration
+    "successor-on-gone-key-both-unread": {"procs": [_APP, _P1_TRACKED, {"id": 300, "from": 4, "to": 99, "goneAt": 999, "startSec": 1, "pathFailAt": 4, "pathMode": "empty", "startFailAt": 4}]},
+    "successor-on-gone-key-start-unread": {"procs": [_APP, _P1_TRACKED, {"id": 300, "from": 4, "to": 99, "goneAt": 999, "startSec": 1, "startFailAt": 4}]},
+    "reads-fail-once-while-tracked": {"procs": [{**_APP, "pathFailAt": 5, "pathMode": "empty", "startFailAt": 5}]},
+    "reads-and-liveness-fail-once-while-tracked": {"procs": [{**_APP, "pathFailAt": 5, "pathMode": "empty", "startFailAt": 5, "exitedNullAt": 4, "exitedNullTo": 4}]},
+    # r5 (sol r4 blocker = adversary pass 7 A1 on 00e5f732): P0 is tracked on pid 300 and gone; its successor's FIRST read gives P0's exact start and an unread
+    # Path, so nothing is pending on the pid when it meets P0's seen key. Unread for good (sol's literal row: Path '', start T), unread once, as a throw, and unopenable.
+    "successor-on-gone-key-path-unread": {"procs": [_APP, _P1_TRACKED, {"id": 300, "from": 4, "to": 99, "goneAt": 999, "startSec": 1, "pathFail": -1, "pathMode": "empty"}]},
+    "successor-on-gone-key-path-unread-once": {"procs": [_APP, _P1_TRACKED, {"id": 300, "from": 4, "to": 99, "goneAt": 999, "startSec": 1, "pathFailAt": 4, "pathMode": "empty"}]},
+    "successor-on-gone-key-path-throws": {"procs": [_APP, _P1_TRACKED, {"id": 300, "from": 4, "to": 99, "goneAt": 999, "startSec": 1, "pathFail": -1, "pathMode": "throw"}]},
+    "successor-on-gone-key-path-unread-unopenable": {"procs": [_APP, _P1_TRACKED, {"id": 300, "from": 4, "to": 99, "goneAt": 999, "startSec": 1, "pathFail": -1, "pathMode": "empty", "handleFail": 1}]},
+    # its control: the tracked process itself, still live, with its Path unread on a later poll and its start readable
+    "path-unread-once-while-tracked": {"procs": [{**_APP, "pathFailAt": 5, "pathMode": "empty"}]},
+    "liveness-null-once": {"procs": [{**_APP, "exitedNullAt": 2, "exitedNullTo": 2}]},
+    "liveness-throw-once": {"procs": [{**_APP, "exitedThrowAt": 2}]},
+    "recycled-other-path-start-unread": {"procs": [_APP, _P1_UNREAD, {"id": 300, "from": 3, "to": 4, "goneAt": 999, "startSec": 2, "exe": "other", "startFail": -1}]},
+    "recycled-start-not-later": {"procs": [_APP, _P1_UNREAD, {"id": 300, "from": 3, "to": 99, "goneAt": 999, "startSec": 2}]},
+    "other-path-start-unread-from-the-first": {"procs": [_APP, {**_Q, "id": 400, "startSec": 1, "exe": "other", "startFail": -1}]},
+    "a1-recycled-before-stamp-other-path": {"procs": [_APP, _P1_BOTH_UNREAD_ONE_PASS, {**_P2_A1, "to": 4, "exe": "other"}]},
+    "a1-recycled-before-stamp-same-path": {"procs": [_APP, _P1_BOTH_UNREAD_ONE_PASS, _P2_A1]},
+    "a2-step-after-gap-sample-other-path": {"stepMs": 500, "stepFrom": 2, "procs": [_APP, _P1_BOTH_UNREAD_ONE_PASS, {**_P2_A2, "to": 4, "exe": "other"}]},
+    "a2-step-after-gap-sample-same-path": {"stepMs": 500, "stepFrom": 2, "procs": [_APP, _P1_BOTH_UNREAD_ONE_PASS, _P2_A2]},
+    "p4a1-same-start-other-path": {"procs": [_APP, _P1_PATH_UNREAD_EXITS, {**_P2_SAME_START, "to": 4, "exe": "other"}]},
+    "p4a1-same-start-same-path": {"procs": [_APP, _P1_PATH_UNREAD_EXITS, _P2_SAME_START]},
+    "p4a2-same-start-after-step-same-path": {"stepMs": 200, "stepFrom": 2, "procs": [_APP, _P1_PATH_UNREAD_EXITS, _P2_SAME_START]},
+    "path-late-handle-unopened": {"procs": [{**_APP, "pathFail": 3, "pathMode": "empty", "handleFail": 1}]},
+    # adversary pass 5 A2 on 8ad00092: the first Processor Information read throws, before the pending state exists
+    "counter-read-throws": {"catThrow": 1, "procs": [_APP]},
+    **{f"clock-back-path-{ms}": {"stepMs": ms, "procs": [{**_CLOCK_APP, "pathFail": 1, "pathMode": "empty"}]} for ms in CLOCK_STEPS_MS},
+    **{f"clock-back-start-{ms}": {"stepMs": ms, "procs": [{**_CLOCK_APP, "startFail": 1}]} for ms in CLOCK_START_UNREAD_STEPS_MS},
+}
+_LATE_READ_DRIVER_BODY = HELPER_SOURCE + r"""
+$cat = "[Diagnostics.PerformanceCounterCategory]::new('Processor Information')"
+if (-not $hb.Contains($cat)) { throw 'the helper no longer reads the Processor Information category (the stub anchor)' }
+$hb = $hb.Replace($cat, '$cpFakeCat')
+# Every wall clock read of the helper's goes through the double. A helper whose reads this no longer finds fails the skew assertion, so the step cannot go missing unnoticed.
+$hb = $hb -replace '\[DateTime\]::UtcNow|\$dt::UtcNow', '(Get-CpNow)'
+$prelude = @'
+$cpFakeCat = [pscustomobject]@{}; $cpFakeCat | Add-Member -MemberType ScriptMethod -Name ReadCategory -Value { if ($global:cpSpec.catThrow) { throw [InvalidOperationException]::new('Category does not exist.') }; @{} }
+$global:cpPoll = 0
+$global:cpSpec = $env:CP_SPEC | ConvertFrom-Json
+$global:cpLaunch = [DateTime]::new([int64]$env:CP_LAUNCH_TICKS, [DateTimeKind]::Utc)
+function Get-CpNow { $n = [DateTime]::UtcNow; if ($global:cpPoll -ge [math]::Max(1, [int]$global:cpSpec.stepFrom) -and $global:cpSpec.stepMs) { $n.AddMilliseconds(-$global:cpSpec.stepMs) } else { $n } }
+function Test-CpFails($Up, $From) { ($Up -eq -1) -or ($null -ne $Up -and $global:cpPoll -le $Up) -or ($null -ne $From -and $global:cpPoll -ge $From) }
+$global:cpDoubles = @(foreach ($s in @($global:cpSpec.procs)) {
+    $d = [pscustomobject]@{ Id = [int]$s.id; cpS = $s; PriorityClass = 'Normal'; ProcessorAffinity = [int64]4095 }
+    $d | Add-Member -MemberType ScriptMethod -Name Refresh -Value { }
+    $d | Add-Member -MemberType ScriptProperty -Name HasExited -Value { if ($null -ne $this.cpS.exitedNullAt -and $global:cpPoll -ge $this.cpS.exitedNullAt -and ($null -eq $this.cpS.exitedNullTo -or $global:cpPoll -le $this.cpS.exitedNullTo)) { return $null }; $global:cpPoll -ge $this.cpS.goneAt }
+    $d | Add-Member -MemberType ScriptMethod -Name Refresh -Force -Value { if ($global:cpPoll -eq $this.cpS.exitedThrowAt) { throw [ComponentModel.Win32Exception]::new(5) } }
+    $d | Add-Member -MemberType ScriptProperty -Name Handle -Value { if ($this.cpS.handleFail) { throw [ComponentModel.Win32Exception]::new(5) }; [IntPtr]1 }
+    $d | Add-Member -MemberType ScriptProperty -Name Path -Value {
+        $s = $this.cpS
+        if ((Test-CpFails $s.pathFail $s.pathFailFrom) -or $global:cpPoll -eq $s.pathFailAt) { if ($s.pathMode -eq 'throw') { throw [ComponentModel.Win32Exception]::new(5) }; return '' }
+        if ($s.exe -eq 'other') { 'C:\elsewhere\mlvfake.exe' } else { $env:MLV_CP_EXE } }
+    $d | Add-Member -MemberType ScriptProperty -Name StartTime -Value {
+        $s = $this.cpS
+        if ((Test-CpFails $s.startFail $s.startFailFrom) -or $global:cpPoll -eq $s.startFailAt) { throw [ComponentModel.Win32Exception]::new(5) }
+        if ($null -ne $s.recycleAt -and $global:cpPoll -ge $s.recycleAt) { if ($null -eq $global:cpNew) { $global:cpNew = [DateTime]::UtcNow.AddSeconds(3) }; return $global:cpNew }
+        if ($null -ne $s.startBeforeFirstPollMs) { return $global:cpT1.AddMilliseconds(-$s.startBeforeFirstPollMs) }
+        $global:cpLaunch.AddSeconds($s.startSec) }
+    $d })
+function Get-Process { [CmdletBinding()] param([string]$Name)
+    $global:cpPoll++
+    if ($global:cpPoll -eq 1) { $global:cpT1 = [DateTime]::UtcNow }
+    [IO.File]::AppendAllText($env:CP_POLLS, "$([DateTime]::UtcNow.Ticks)`n")
+    if ($global:cpPoll -eq 8) { [IO.File]::WriteAllText($env:MLV_CP_MEASURED, '5000'); [IO.File]::WriteAllText($env:MLV_CP_STOP, 'stop') }
+    $global:cpDoubles | Where-Object { $global:cpPoll -ge $_.cpS.from -and $global:cpPoll -le $_.cpS.to } }
+function Start-Sleep { param([int]$Milliseconds) [Threading.Thread]::Sleep(20) }
+'@
+$src = $prelude + "`n" + ((@('Format-CorePartitionMask', 'Get-CorePartitionTopology', 'Test-CorePartitionMaskClass') | ForEach-Object { $fn[$_] }) -join "`n") + "`n" + $hb
+$out = [ordered]@{}
+$names = @($scenarios.PSObject.Properties.Name)
+for ($b = 0; $b -lt $names.Count; $b += 4) {
+    $runs = @(foreach ($mode in @($names[$b..([math]::Min($b + 3, $names.Count - 1))])) {
+        $spec = $scenarios.$mode
+        $dir = Join-Path $env:CP_DIR $mode
+        [void](New-Item -ItemType Directory -Path $dir)
+        $hp = Join-Path $dir 'helper.ps1'; [IO.File]::WriteAllText($hp, $src)
+        $launch = [DateTime]::UtcNow.AddSeconds(-30).Ticks
+        [IO.File]::WriteAllText((Join-Path $dir 'launch'), [string]$launch)
+        $threads = $(if ($null -ne $spec.threads) { [int]$spec.threads } else { 0 })
+        $psi = [Diagnostics.ProcessStartInfo]::new("$env:ProgramFiles\PowerShell\7\pwsh.exe", "-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File `"$hp`"")
+        $psi.UseShellExecute = $false; $psi.CreateNoWindow = $true
+        $psi.Environment['CP_SPEC'] = ($spec | ConvertTo-Json -Compress -Depth 6); $psi.Environment['CP_LAUNCH_TICKS'] = [string]$launch; $psi.Environment['CP_POLLS'] = Join-Path $dir 'polls'
+        $psi.Environment['MLV_CP_EXE'] = Join-Path $dir 'mlvfake.exe'
+        $psi.Environment['MLV_CP_STOP'] = Join-Path $dir 'stop'
+        $psi.Environment['MLV_CP_READY'] = Join-Path $dir 'ready'
+        $psi.Environment['MLV_CP_OUT'] = Join-Path $dir 'helper.json'
+        $psi.Environment['MLV_CP_LAUNCH'] = Join-Path $dir 'launch'
+        $psi.Environment['MLV_CP_MEASURED'] = Join-Path $dir 'measured'
+        $psi.Environment['MLV_CP_BENCH'] = '4095'; $psi.Environment['MLV_CP_LOAD'] = '0'; $psi.Environment['MLV_CP_HELPER'] = '1'; $psi.Environment['MLV_CP_THREADS'] = [string]$threads
+        $psi.Environment['MLV_CP_NONCE'] = 'late-read'; $psi.Environment['MLV_CP_DEADLINE_MS'] = '60000'
+        @{ mode = $mode; dir = $dir; launch = $launch; threads = $threads; h = [Diagnostics.Process]::Start($psi) } })
+    foreach ($run in $runs) {
+        if (-not $run.h.WaitForExit(120000)) { $run.h.Kill(); throw "the $($run.mode) helper did not end" }
+        $end = [DateTime]::UtcNow.Ticks
+        # a helper that published no record is reported as such, so one scenario cannot take the others down with it
+        $rec = $(try { [IO.File]::ReadAllText((Join-Path $run.dir 'helper.json')) | ConvertFrom-Json } catch { $null })
+        if ($null -eq $rec) { $out[$run.mode] = [ordered]@{ exit = $run.h.ExitCode; record = $false }; continue }
+        if ($scenarios.($run.mode).catThrow) { $out[$run.mode] = [ordered]@{ exit = $run.h.ExitCode; record = $true; errors = @($rec.errors) }; continue }
+        $start = ([DateTime]::new($run.launch, [DateTimeKind]::Utc)).AddSeconds(1).Ticks
+        $v = Test-CorePartitionMeasuredApp $rec 5000 ($start - 5000000) $end 0
+        $s = Get-CorePartitionScalars $rec ([ordered]@{ reasons = [ordered]@{} }) 4095 ([int64]$rec.helperAffinityObserved) $run.threads @{ value = 1; why = $null } $null $false -MeasuredPid 5000 -MeasuredStartTicks ($start - 5000000) -MeasuredEndTicks $end
+        $named = @(@($rec.instances) + @($rec.others) | Where-Object { $null -ne $_ -and $null -eq $_.unidentified })
+        $by = [ordered]@{}
+        foreach ($i in $named) { $by[[string]$i.pid] = [ordered]@{ start = [int64]$i.startUtcTicks; first = [int64]$i.firstSeenUtcTicks; last = [int64]$i.lastSeenUtcTicks; firstMs = $i.firstMs; aliveMs = $i.aliveMs; goneMs = $i.goneMs; loadSec = $i.loadSec; loadJoined = $i.loadJoined } }
+        $out[$run.mode] = [ordered]@{ exit = $run.h.ExitCode; endedBy = $rec.endedBy; app = $rec.app.pid; launch = $run.launch
+            instances = @(@($rec.instances) | Where-Object { $null -ne $_ } | ForEach-Object { $_.pid })
+            others = @(@($rec.others) | Where-Object { $null -ne $_ -and $null -eq $_.unidentified } | ForEach-Object { $_.pid })
+            unidentified = @(@($rec.others) | Where-Object { $null -ne $_ -and $null -ne $_.unidentified } | ForEach-Object { $_.pid })
+            by = $by; sessions = $rec.load.sessions; loadSec = $rec.load.seconds; vwhy = [string]$v.why; bench = $s.benchAffinityApplied; why = [string]$s.corePartitionNullReasons; skew = $rec.clockSkewMaxMs
+            polls = @([IO.File]::ReadAllLines((Join-Path $run.dir 'polls')) | ForEach-Object { [int64]$_ }) }
+    }
+}
+$out | ConvertTo-Json -Compress -Depth 6
+"""
+LATE_READ_DRIVER = "$scenarios = @'\n" + json.dumps(LATE_READ_SCENARIOS) + "\n'@ | ConvertFrom-Json\n" + _LATE_READ_DRIVER_BODY
+
+# The same defect with nothing doubled but the counter category: a real process (a copy of PING.EXE, never MLVApp) held by CREATE_SUSPENDED, so its
+# loader has not run and MainModule cannot read it, exactly the state a poll can catch a just-launched process in. The driver orders itself on the
+# helper's enumeration count, not on time: the process is resumed only after two whole enumerations listed it suspended.
+REAL_SUSPENDED_DRIVER = HELPER_SOURCE + r"""
+$cat = "[Diagnostics.PerformanceCounterCategory]::new('Processor Information')"
+if (-not $hb.Contains($cat)) { throw 'the helper no longer reads the Processor Information category (the stub anchor)' }
+$hb = $hb.Replace($cat, '$cpFakeCat')
+$prelude = @'
+$cpFakeCat = [pscustomobject]@{}; $cpFakeCat | Add-Member -MemberType ScriptMethod -Name ReadCategory -Value { @{} }
+$global:cpPoll = 0
+function Get-Process { [CmdletBinding()] param([string]$Name)
+    $global:cpPoll++
+    [IO.File]::WriteAllText($env:CP_POLLS, [string]$global:cpPoll)
+    Microsoft.PowerShell.Management\Get-Process -Name $Name -ErrorAction SilentlyContinue }
+'@
+$src = $prelude + "`n" + ((@('Format-CorePartitionMask', 'Get-CorePartitionTopology', 'Test-CorePartitionMaskClass') | ForEach-Object { $fn[$_] }) -join "`n") + "`n" + $hb
+Add-Type -TypeDefinition @"
+using System;
+using System.Runtime.InteropServices;
+public static class CpSuspended {
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+    public struct SI { public int cb; public string r; public string d; public string t; public int x, y, xs, ys, xc, yc, fa, fl; public short sw, c2; public IntPtr r2, i, o, e; }
+    [StructLayout(LayoutKind.Sequential)]
+    public struct PI { public IntPtr hp, ht; public int pid, tid; }
+    [DllImport("kernel32", CharSet = CharSet.Unicode, SetLastError = true)]
+    static extern bool CreateProcessW(string app, System.Text.StringBuilder cmd, IntPtr pa, IntPtr ta, bool inherit, uint flags, IntPtr env, string cwd, ref SI si, out PI pi);
+    [DllImport("kernel32", SetLastError = true)] public static extern uint ResumeThread(IntPtr t);
+    public static PI Start(string exe, string args) {
+        SI si = new SI(); si.cb = Marshal.SizeOf(si); PI pi;
+        if (!CreateProcessW(exe, new System.Text.StringBuilder("\"" + exe + "\" " + args), IntPtr.Zero, IntPtr.Zero, false, 0x08000004u, IntPtr.Zero, null, ref si, out pi)) { throw new System.ComponentModel.Win32Exception(); }
+        return pi;
+    }
+}
+"@
+$dir = $env:CP_DIR
+$exe = Join-Path $dir 'mlvfake.exe'
+Copy-Item -LiteralPath 'C:\Windows\System32\PING.EXE' -Destination $exe
+$hp = Join-Path $dir 'helper.ps1'; [IO.File]::WriteAllText($hp, $src)
+$pf = Join-Path $dir 'polls'
+$launch = [DateTime]::UtcNow.Ticks
+[IO.File]::WriteAllText((Join-Path $dir 'launch'), [string]$launch)
+$psi = [Diagnostics.ProcessStartInfo]::new("$env:ProgramFiles\PowerShell\7\pwsh.exe", "-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File `"$hp`"")
+$psi.UseShellExecute = $false; $psi.CreateNoWindow = $true
+$psi.Environment['CP_POLLS'] = $pf
+$psi.Environment['MLV_CP_EXE'] = $exe
+$psi.Environment['MLV_CP_STOP'] = Join-Path $dir 'stop'
+$psi.Environment['MLV_CP_READY'] = Join-Path $dir 'ready'
+$psi.Environment['MLV_CP_OUT'] = Join-Path $dir 'helper.json'
+$psi.Environment['MLV_CP_LAUNCH'] = Join-Path $dir 'launch'
+$psi.Environment['MLV_CP_MEASURED'] = Join-Path $dir 'measured'
+$psi.Environment['MLV_CP_BENCH'] = '4095'; $psi.Environment['MLV_CP_LOAD'] = '0'; $psi.Environment['MLV_CP_HELPER'] = '1'; $psi.Environment['MLV_CP_THREADS'] = '0'
+$psi.Environment['MLV_CP_NONCE'] = 'real-suspended'; $psi.Environment['MLV_CP_DEADLINE_MS'] = '180000'
+$h = [Diagnostics.Process]::Start($psi)
+# Opened shared for writing: a plain ReadAllText here makes the helper's WriteAllText throw a sharing violation inside its loop, which ends the helper early. A read that
+# still fails gives the last count, never 0, so 'the next N enumerations' cannot be satisfied at once.
+$global:cpLastPolls = 0
+function Get-CpPolls {
+    try {
+        $s = [IO.FileStream]::new($pf, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete)
+        try { $t = [IO.StreamReader]::new($s).ReadToEnd() } finally { $s.Dispose() }
+        if ($t) { $global:cpLastPolls = [int]$t }
+    } catch { }
+    $global:cpLastPolls
+}
+function Wait-CpPolls([int]$N) {
+    $sw = [Diagnostics.Stopwatch]::StartNew()
+    while ((Get-CpPolls) -lt $N) { if ($h.HasExited -or $sw.ElapsedMilliseconds -gt 120000) { throw "the helper reached only enumeration $(Get-CpPolls) of $N (exited=$($h.HasExited))" }; Start-Sleep -Milliseconds 20 }
+}
+$held = $null
+try {
+    Wait-CpPolls 1
+    $info = [CpSuspended]::Start($exe, '-n 3 127.0.0.1')
+    $held = [Diagnostics.Process]::GetProcessById($info.pid)
+    # the first enumeration counted after the process exists lists it; the helper starts the next one only after it has read that one, and so on
+    Wait-CpPolls ((Get-CpPolls) + 3)
+    $pathWhileSuspended = [string](Microsoft.PowerShell.Management\Get-Process -Id $info.pid).Path
+    $resumeTicks = [DateTime]::UtcNow.Ticks
+    [void][CpSuspended]::ResumeThread($info.ht)
+    [void]$held.WaitForExit(60000)
+    $end = [DateTime]::UtcNow.Ticks
+    # two more enumerations, so a pass has seen it gone before the stop arrives
+    Wait-CpPolls ((Get-CpPolls) + 2)
+    [IO.File]::WriteAllText((Join-Path $dir 'measured'), [string]$info.pid)
+    [IO.File]::WriteAllText((Join-Path $dir 'stop'), 'stop')
+    if (-not $h.WaitForExit(60000)) { $h.Kill(); throw 'the helper did not end' }
+    $rec = [IO.File]::ReadAllText((Join-Path $dir 'helper.json')) | ConvertFrom-Json
+    $app = $rec.app
+    $v = $(if ($null -ne $app) { Test-CorePartitionMeasuredApp $rec $info.pid ([int64]$app.startUtcTicks - 5000000) $end 0 } else { Test-CorePartitionMeasuredApp $rec $info.pid ($launch - 5000000) $end 0 })
+    [ordered]@{ measuredPid = $info.pid; pathWhileSuspended = $pathWhileSuspended; app = $app.pid; instances = @(@($rec.instances) | Where-Object { $null -ne $_ } | ForEach-Object { $_.pid })
+        unidentified = @(@($rec.others) | Where-Object { $null -ne $_ -and $null -ne $_.unidentified } | ForEach-Object { $_.pid }); vwhy = [string]$v.why; endedBy = $rec.endedBy
+        launch = $launch; resume = $resumeTicks; start = $app.startUtcTicks; first = $app.firstSeenUtcTicks; last = $app.lastSeenUtcTicks; firstMs = $app.firstMs; aliveMs = $app.aliveMs; goneMs = $app.goneMs } | ConvertTo-Json -Compress
+} finally {
+    if ($null -ne $held -and -not $held.HasExited) { $held.Kill() }
+    if (-not $h.HasExited) { $h.Kill() }
+}
+"""
+
 
 @requires_windows_pwsh
 class CorePartitionR10Tests(unittest.TestCase):
@@ -2561,6 +2852,330 @@ class CorePartitionR10Tests(unittest.TestCase):
                 self.assertIn("appAffinityObserved=same-path-instance-unidentified", case["why"])
         tight = got["tight"]
         self.assertEqual([tight["unidentified"], tight["vwhy"], tight["bench"], tight["load"]], [0, "", True, True], f"the control was refused: {tight}")
+
+    # CORE-PARTITION-SAME-PATH-HANDOVER-RACE-1. Merge_group run 42007264913 and #755 run 41985844336, and Bachelor receipts 695cf45e and b3937729: the
+    # measured process itself was recorded unidentified, because one failed read at first sight settled it for the whole run.
+    _late_read_result: dict | None = None
+    # A scheduler stall over 1000 ms between the app's last two polls refuses on coverage-endpoint-gap. That rule is not under test here; identity is.
+    ACCEPTED = ("", "coverage-endpoint-gap")
+
+    def late_read(self, mode: str) -> dict:
+        cls = type(self)
+        if cls._late_read_result is None:
+            cls._late_read_result = self.drive("late-read", LATE_READ_DRIVER, True)
+        case = cls._late_read_result[mode]
+        self.assertEqual([case["endedBy"], case["exit"]], ["stop-file", 0], case)
+        return case
+
+    def test_handover_a_failed_read_at_first_sight_does_not_settle_the_process(self) -> None:
+        """A failed Path read, in the shape a real process before its loader has run gives (empty) and as a throw, with its start read at first sight. It fails
+        for the first three enumerations and then reads: the app is classed as the instance it is, and the run is not refused for it. A start unread at first
+        sight refuses instead (r3, test_handover_a_start_unread_at_first_sight_refuses_even_when_it_reads_later)."""
+        for mode in ("path-empty-late", "path-throw-late"):
+            with self.subTest(mode=mode):
+                case = self.late_read(mode)
+                self.assertEqual(case["unidentified"], [], f"a read that later succeeded left the process on the record as unidentified: {case}")
+                self.assertEqual(case["instances"], [5000], f"the process was never classed: {case}")
+                self.assertEqual(case["app"], 5000, case)
+                self.assertIn(case["vwhy"], self.ACCEPTED, case)
+
+    def test_handover_a_late_classed_process_keeps_its_real_first_sight(self) -> None:
+        """The job orders start, first sight and exit from these. The first sight is the enumeration that first listed the process, which is before the
+        one that could read it, and its last-alive stamp comes from the poll that classed it or a later one. Control: a process read at once."""
+        for mode in ("path-empty-late", "path-throw-late"):
+            with self.subTest(mode=mode):
+                case = self.late_read(mode)
+                rec, polls = case["by"]["5000"], case["polls"]
+                self.assertGreaterEqual(rec["first"], polls[0], case)
+                self.assertLess(rec["first"], polls[1], f"the first sight was moved to a later poll: {case}")
+                self.assertGreaterEqual(rec["last"], polls[3], f"the alive stamp is older than the poll that classed the process: {case}")
+                self.assertLessEqual(rec["start"], rec["first"], case)
+                self.assertLessEqual(rec["firstMs"], rec["aliveMs"], case)
+                self.assertLessEqual(rec["aliveMs"], rec["goneMs"], case)
+        control = self.late_read("control")
+        self.assertEqual([control["app"], control["unidentified"], control["instances"]], [5000, [], [5000]], control)
+        self.assertIn(control["vwhy"], self.ACCEPTED, control)
+        self.assertLess(control["by"]["5000"]["first"], control["polls"][1], control)
+
+    def test_handover_a_process_never_identified_is_still_refused_whenever_it_ends(self) -> None:
+        """The fail-closed rule, for the case the retry creates: unreadable for its whole life, it stays on the record as unidentified and refuses the
+        verdict, whether it exits between two polls or is still there when the helper stops."""
+        for mode in ("lifelong-path-exits", "lifelong-start-exits", "lifelong-both-exits", "lifelong-path-to-stop", "lifelong-start-to-stop"):
+            with self.subTest(mode=mode):
+                case = self.late_read(mode)
+                self.assertEqual(case["unidentified"], [200], f"the helper dropped a process it never identified: {case}")
+                self.assertEqual(case["vwhy"], "same-path-instance-unidentified", case)
+                self.assertFalse(case["bench"], f"an unidentified same-name process escaped the refusal: {case}")
+                self.assertIn("appAffinityObserved=same-path-instance-unidentified", case["why"])
+                self.assertEqual(case["app"], 5000, case)
+
+    def test_handover_a_pre_launch_process_read_late_lands_in_others_by_its_real_start(self) -> None:
+        """The launch-instant rule: classed late, a process that started before the launch is still in others, is never an instance and starts no load
+        session, and being alive beside the app refuses the overlap. With its start unread at first sight it refuses unidentified instead (r3)."""
+        for mode in ("prelaunch-late",):
+            with self.subTest(mode=mode):
+                case = self.late_read(mode)
+                self.assertEqual(case["unidentified"], [], case)
+                self.assertEqual(case["instances"], [5000], f"a pre-launch process read late was classed as an instance: {case}")
+                self.assertEqual(case["others"], [200], case)
+                self.assertLess(case["by"]["200"]["start"], case["launch"], case)
+                self.assertEqual(case["vwhy"], "same-path-instance-overlap", case)
+        self.assertEqual(self.late_read("prelaunch-late")["sessions"], 1, "a pre-launch process read late started a load session")
+        self.assertEqual(self.late_read("prelaunch-late")["by"]["200"]["loadSec"], 0.0)
+
+    def test_handover_a_late_read_does_not_move_the_load_session(self) -> None:
+        """The instance that owns the load keeps it when another is classed late; a late-classed app that does own it is charged only from its classing."""
+        kept = self.late_read("owner-keeps-its-load")
+        self.assertEqual(kept["instances"], [5000, 300], f"the late process was not classed beside the owner: {kept}")
+        self.assertEqual(kept["sessions"], 1, f"a late read started a second load session: {kept}")
+        self.assertEqual(kept["by"]["300"]["loadSec"], 0.0, f"a late read moved the load onto another process: {kept}")
+        self.assertIsNone(kept["by"]["300"]["loadJoined"], kept)
+        self.assertTrue(kept["by"]["5000"]["loadJoined"], kept)
+        self.assertEqual(kept["vwhy"], "same-path-instance-overlap", kept)
+        late = self.late_read("late-app-owns-from-its-classing")
+        self.assertEqual([late["app"], late["sessions"], late["unidentified"]], [5000, 1, []], late)
+        span = late["by"]["5000"]["aliveMs"] - late["by"]["5000"]["firstMs"]
+        self.assertLessEqual(late["loadSec"] * 1000, span, f"load seconds were charged from before the process was classed: {late}")
+        self.assertTrue(late["by"]["5000"]["loadJoined"], late)
+
+    def test_handover_a_tracked_process_whose_reads_fail_is_still_the_tracked_process(self) -> None:
+        """Both reads failing on a tracked pid cannot be told from a successor that took the pid, whichever way the pass's liveness query went, so nothing settles it there
+        (adversary A1 on 6b63c057, A2 on c49e90b6). Since r4 (hub ruling 1 of HUB-TICK 20261106T0752Z, adversary pass 6 A1 on 0a40778b) the tracked process's own key
+        reading again recovers nothing either: a successor can get that exact key, so the pid refuses, as on the base, even when the reads fail only once. A successor
+        unread both ways in a pass that saw the old process alive is the input that rules out a guard."""
+        for mode in ("reads-fail-once-while-tracked", "reads-and-liveness-fail-once-while-tracked"):
+            with self.subTest(mode=mode):
+                case = self.late_read(mode)
+                self.assertEqual(case["unidentified"], [5000], f"a read of a seen key resolved a pid whose reads had failed: {case}")
+                self.assertEqual([case["app"], case["instances"]], [5000, [5000]], case)
+                self.assertEqual(case["vwhy"], "same-path-instance-unidentified", case)
+        for mode in ("reads-fail-while-tracked", "reads-fail-as-seen-gone"):
+            with self.subTest(mode=mode):
+                case = self.late_read(mode)
+                self.assertEqual([case["app"], case["instances"], case["unidentified"], case["vwhy"]], [5000, [5000], [5000], "same-path-instance-unidentified"], case)
+        successor = self.late_read("recycled-over-alive-both-unread")
+        self.assertEqual([successor["unidentified"], successor["vwhy"]], [[300], "same-path-instance-unidentified"], f"a successor unread both ways left no record: {successor}")
+
+    def test_handover_a_successor_reading_a_gone_tracked_key_never_resolves_its_unread_first_sight(self) -> None:
+        """Adversary pass 6 A1 on 0a40778b, closed by hub ruling 1 of HUB-TICK 20261106T0752Z. P0 on pid 300 is tracked and gone, and a successor on that pid gets P0's
+        exact start. Unread at first sight, it went pending; its next read gave P0's seen key, which cleared the entry, so it left no record. A seen key now refuses the
+        pending entry on its pid: a start unread at first sight is never resolved by a later read on that pid."""
+        for mode in ("successor-on-gone-key-both-unread", "successor-on-gone-key-start-unread"):
+            with self.subTest(mode=mode):
+                case = self.late_read(mode)
+                self.assertEqual(case["unidentified"], [300], f"a successor unread at first sight was cleared by a gone process's seen key: {case}")
+                self.assertEqual(case["vwhy"], "same-path-instance-unidentified", case)
+                self.assertFalse(case["bench"], case)
+
+    def test_handover_a_successor_first_read_on_a_gone_tracked_key_with_its_path_unread_is_recorded(self) -> None:
+        """r5 (sol r4 blocker, adversary pass 7 A1 on 00e5f732, hub ruling 1 of HUB-TICK 20261106T1439Z). P0 on pid 300 is tracked and gone; a successor's first read
+        gives P0's exact start and no Path, with nothing pending on the pid. It was skipped at the seen key and never recorded, so the run passed. It is now recorded
+        unidentified, once however many polls list it. Control: the tracked process itself, still live, with its Path unread once, is not newly unidentified."""
+        for mode in ("successor-on-gone-key-path-unread", "successor-on-gone-key-path-unread-once", "successor-on-gone-key-path-throws",
+                     "successor-on-gone-key-path-unread-unopenable"):
+            with self.subTest(mode=mode):
+                case = self.late_read(mode)
+                self.assertEqual(case["unidentified"], [300], f"a successor unread on a gone tracked key was dropped, or recorded more than once: {case}")
+                self.assertEqual([case["app"], case["instances"]], [5000, [5000, 300]], f"the tracked P0 or the app left the instances: {case}")
+                self.assertEqual(case["vwhy"], "same-path-instance-unidentified", case)
+                self.assertFalse(case["bench"], case)
+        live =self.late_read("path-unread-once-while-tracked")
+        self.assertEqual([live["app"], live["instances"], live["unidentified"]], [5000, [5000], []], f"a live tracked process with an unread Path became unidentified: {live}")
+        self.assertIn(live["vwhy"], self.ACCEPTED, live)
+
+    def test_handover_a_process_identified_at_another_path_is_dropped_once_readable(self) -> None:
+        """Identified is identified: readable at another path, it is no competing instance, so it is off the record and refuses nothing."""
+        case = self.late_read("other-path-once-readable")
+        self.assertEqual([case["unidentified"], case["others"], case["instances"]], [[], [], [5000]], case)
+        self.assertIn(case["vwhy"], self.ACCEPTED, case)
+
+    def test_handover_a_recycled_pid_does_not_inherit_the_unread_process(self) -> None:
+        """A start read later than the enumeration that first listed the pid is another process on a recycled pid. The one first listed ended unread, so
+        it refuses; the new one is classed with its own first sight, never the earlier one's."""
+        for mode in ("recycled-start-unread", "recycled-path-unread"):
+            with self.subTest(mode=mode):
+                case = self.late_read(mode)
+                self.assertEqual(case["unidentified"], [300], case)
+                self.assertEqual(case["vwhy"], "same-path-instance-unidentified", case)
+                self.assertEqual(case["instances"], [5000, 300], case)
+                self.assertGreaterEqual(case["by"]["300"]["first"], case["polls"][2], f"the recycled pid inherited the earlier first sight: {case}")
+
+    def test_handover_a_process_on_a_recycled_tracked_pid_is_never_dropped(self) -> None:
+        """Opus key3 on e048ccc6: P1 on pid 300 is tracked, and P2 is listed on that pid with Path empty and a readable new start. A readable start that no
+        process has held is not P1 exiting, so a pid-only guard must not swallow it. P2 unread for its whole life is recorded and refuses the run: when it is gone by
+        the next pass, and when P1 is never seen gone because HasExited, which opens by pid, reads P2 (master refuses in both). When this user cannot open P2 at all,
+        both reads fail and HasExited gives nothing, which proves neither that P1 is alive nor that it is gone: P1 is held to no pid, its exit stays unobserved, and P2 is
+        on the record. Adversary A1 on 6b63c057: a pass that saw P1 gone holds nothing either, so P2 unread both ways and listed only in that pass still refuses."""
+        for mode in ("recycled-over-tracked-gone-next-pass", "recycled-over-tracked-never-seen-gone", "recycled-over-tracked-unopenable", "recycled-over-tracked-both-unread-one-pass"):
+            with self.subTest(mode=mode):
+                case = self.late_read(mode)
+                self.assertEqual(case["unidentified"], [300], f"a process on a recycled pid that was never identified left no record: {case}")
+                self.assertEqual(case["vwhy"], "same-path-instance-unidentified", case)
+                self.assertFalse(case["bench"], case)
+        p1 = self.late_read("recycled-over-tracked-unopenable")["by"]["300"]
+        self.assertIsNone(p1["goneMs"], f"a HasExited that gave nothing was recorded as an observed exit: {p1}")
+        self.assertLess(p1["aliveMs"], self.late_read("recycled-over-tracked-unopenable")["by"]["5000"]["aliveMs"], f"a HasExited that gave nothing stamped the process alive: {p1}")
+
+    def test_handover_a_failed_liveness_query_is_no_observed_exit(self) -> None:
+        """Adversary A3 on 6b63c057, and its sibling at the catch: a liveness query that fails once on the measured app, alive throughout, records no exit. The seen
+        key stops a later enumeration from tracking it again, so a false exit would stand and end its coverage early, and it would be accepted."""
+        for mode in ("liveness-null-once", "liveness-throw-once"):
+            with self.subTest(mode=mode):
+                case = self.late_read(mode)
+                rec, polls = case["by"]["5000"], case["polls"]
+                self.assertEqual([case["app"], case["instances"], case["unidentified"]], [5000, [5000], []], case)
+                self.assertGreaterEqual(rec["last"], polls[4], f"a failed liveness query ended the tracking of a live process: {case}")
+                self.assertIsNotNone(rec["goneMs"], case)
+                self.assertIn(case["vwhy"], self.ACCEPTED, case)
+
+    def test_handover_a_process_on_a_recycled_tracked_pid_keeps_its_real_first_sight(self) -> None:
+        """The same P2 alive and readable from enumeration 6: its first sight is enumeration 4, the pass that first listed it, not one pass late."""
+        case = self.late_read("recycled-over-tracked-read-later")
+        self.assertEqual(case["unidentified"], [], case)
+        self.assertEqual(case["instances"], [5000, 300, 300], f"P1 and P2 are two instances: {case}")
+        rec, polls = case["by"]["300"], case["polls"]
+        self.assertGreaterEqual(rec["first"], polls[3], case)
+        self.assertLess(rec["first"], polls[4], f"the first sight of a process on a recycled tracked pid is a pass late: {case}")
+
+    def test_handover_an_unread_process_is_not_dropped_on_a_read_that_cannot_tell_it_from_its_successor(self) -> None:
+        """Sibling at the pending removal: P1 is unread, and the pid then reads at another path with its start unread. The recycle check cannot run without a start, so
+        that read cannot say P1 was identified and its entry stays: refused when nothing ever tells them apart. Control: with no unread process on that
+        pid, another-path with a failed start read refuses nothing, as on master."""
+        case = self.late_read("recycled-other-path-start-unread")
+        self.assertEqual(case["unidentified"], [300], f"an unread process was removed by a read that could not identify it: {case}")
+        self.assertEqual(case["vwhy"], "same-path-instance-unidentified", case)
+        control = self.late_read("other-path-start-unread-from-the-first")
+        self.assertEqual([control["unidentified"], control["others"], control["instances"]], [[], [], [5000]], control)
+        self.assertIn(control["vwhy"], self.ACCEPTED, control)
+
+    def test_handover_a_start_read_at_first_sight_is_the_identity_the_later_read_is_held_to(self) -> None:
+        """P1's start was read at first sight, so a different start on that pid is another process even when it is no later than the listing's stamp (a clock
+        stepped back between them makes that possible). P1 refuses, and P2 gets its own first sight, never P1's."""
+        case = self.late_read("recycled-start-not-later")
+        self.assertEqual(case["unidentified"], [300], f"P2 inherited an unread P1 and P1 left no record: {case}")
+        self.assertEqual(case["instances"], [5000, 300], case)
+        self.assertGreaterEqual(case["by"]["300"]["first"], case["polls"][2], case)
+
+    def test_handover_a_start_read_after_first_sight_refuses_and_then_holds_its_pid(self) -> None:
+        """Adversary A2 on 6b63c057, kept under the r3 ruling: P1 is unread both ways at first sight, and its start reads on the next enumeration with its Path still
+        empty. A start unread at first sight is never recovered, so that read refuses the entry (r3), and the pid goes pending again with the start it just read. P2
+        then takes the pid with a start also before the first listing, and that saved start refuses it too: at another path P2 erases nothing, and at the app's path
+        it does not inherit P1's first sight. Two records, one per refusal; the verdict is the same."""
+        for mode, instances in (("start-recovered-then-recycled-other-path", [5000]), ("start-recovered-then-recycled-same-path", [5000, 300])):
+            with self.subTest(mode=mode):
+                case = self.late_read(mode)
+                self.assertEqual(case["unidentified"], [300, 300], f"a successor erased or inherited an unread process: {case}")
+                self.assertEqual(case["instances"], instances, case)
+                self.assertEqual(case["vwhy"], "same-path-instance-unidentified", case)
+        same = self.late_read("start-recovered-then-recycled-same-path")
+        self.assertGreaterEqual(same["by"]["300"]["first"], same["polls"][2], f"the successor inherited the earlier first sight: {same}")
+
+    def test_handover_a_backward_clock_step_within_tolerance_is_not_a_recycled_pid(self) -> None:
+        """Sol on e048ccc6, catalogue row CP-CLOCK-REUSE: the process started before its first listing, but a backward step within the supported 1000 ms makes the
+        listing's stamp the earlier one. Its start was read at first sight, so that start identifies it and no predecessor is invented. A step of 1000 ms plus the
+        sampling noise can be past the job's tolerance, which is its own refusal and is not under test at that size."""
+        for ms in CLOCK_STEPS_MS:
+            with self.subTest(step=ms):
+                case = self.late_read(f"clock-back-path-{ms}")
+                # The gap reads short by the time between the helper's two clock zeros, which a loaded host can stretch, so only the larger steps are held to it.
+                if ms >= 400:
+                    self.assertGreaterEqual(case["skew"], ms * 0.5, f"the clock double did not reach the helper: {case}")
+                self.assertGreater(case["by"]["5000"]["start"], case["polls"][0] - ms * 10000, f"the input no longer has the listing's stamp before the start: {case}")
+                self.assertEqual(case["unidentified"], [], f"a backward step within tolerance invented an unidentified predecessor: {case}")
+                self.assertEqual([case["app"], case["instances"]], [5000, [5000]], case)
+                self.assertIn(case["vwhy"], self.ACCEPTED + (("clock-discontinuity",) if ms == 1000 else ()), case)
+
+    def test_handover_with_no_start_read_a_clock_gap_is_doubt_and_doubt_refuses(self) -> None:
+        """Adversary A1 on c49e90b6. With the start unread at first sight nothing can prove identity, so a successor inside a sampled clock gap must not erase or
+        inherit P1. Since r3 any later start on that pid refuses, whatever the clock did; the same-process input refuses too, as on the base."""
+        for mode, instances in (("recycled-inside-gap-other-path", [5000]), ("recycled-inside-gap-same-path", [5000, 300])):
+            with self.subTest(mode=mode):
+                case = self.late_read(mode)
+                self.assertGreaterEqual(case["skew"], 250, f"the clock double did not reach the helper: {case}")
+                self.assertEqual(case["unidentified"], [300], f"a successor inside the clock gap erased or inherited an unread process: {case}")
+                self.assertEqual(case["instances"], instances, case)
+                self.assertEqual(case["vwhy"], "same-path-instance-unidentified", case)
+        for ms in CLOCK_START_UNREAD_STEPS_MS:
+            with self.subTest(step=ms):
+                case = self.late_read(f"clock-back-start-{ms}")
+                self.assertEqual([case["app"], case["instances"], case["unidentified"]], [5000, [5000], [5000]], case)
+                self.assertIn(case["vwhy"], ("same-path-instance-unidentified", "clock-discontinuity") if ms == 1000 else ("same-path-instance-unidentified",), case)
+
+    def test_handover_a_start_unread_at_first_sight_is_never_recovered(self) -> None:
+        """Adversary A1 and A2 on 6180c3e7, closed by HUB RULING 2026-11-06 (r3). With P1's start unread at first sight, only the listing's stamp was left to tell
+        P1 from a successor, and a start earlier than that stamp is no proof: P2 can start between the enumeration and its stamp (A1), or the clock can step back after
+        the pass sampled the gap (A2). P2 then erased P1 (another path) or inherited P1's first sight (the app's path), and P1 left no record. Any later start read on
+        that pid now refuses, as on the base."""
+        for mode, instances in (("a1-recycled-before-stamp-other-path", [5000]), ("a1-recycled-before-stamp-same-path", [5000, 300]),
+                                ("a2-step-after-gap-sample-other-path", [5000]), ("a2-step-after-gap-sample-same-path", [5000, 300])):
+            with self.subTest(mode=mode):
+                case = self.late_read(mode)
+                self.assertEqual(case["unidentified"], [300], f"a successor erased or inherited a process whose start was unread at first sight: {case}")
+                self.assertEqual(case["instances"], instances, case)
+                self.assertEqual(case["vwhy"], "same-path-instance-unidentified", case)
+                self.assertFalse(case["bench"], case)
+        a1 = self.late_read("a1-recycled-before-stamp-same-path")
+        self.assertLess(a1["by"]["300"]["start"], a1["polls"][0], f"the input no longer has the successor's start before the first listing: {a1}")
+        self.assertGreaterEqual(a1["by"]["300"]["first"], a1["polls"][1], f"the successor inherited the unread process's first sight: {a1}")
+        # the step is applied after the deciding pass sampled the gap, and is seen later
+        self.assertGreaterEqual(self.late_read("a2-step-after-gap-sample-other-path")["skew"], 250, "the clock double did not reach the helper")
+
+    def test_handover_a_recovery_needs_the_first_listed_process_alive_on_its_held_handle(self) -> None:
+        """Adversary A1 and A2 on 203a5bb1 (pass 4): an equal start is no identity. The start read at first sight can be the successor's (the pid passed between
+        the Path and StartTime reads, A1), or a successor can get the same start after a backward clock step (A2). Either way P2 erased P1 (another path) or inherited
+        its first sight (the app's path), and P1 left no record. The handle is now opened before the first-sight reads and kept with the pending entry, and a later
+        read recovers only while that held process has not exited: alive, it held the pid from before its first reads until now, so the later read is its own.
+        P1 has exited here, so it refuses, as on the base, and P2 is held to its own handle and first sight. With no handle (a process this user cannot open)
+        nothing recovers: it is recorded once at first sight and never tracked, exactly as on the base."""
+        for mode, instances in (("p4a1-same-start-other-path", [5000]), ("p4a1-same-start-same-path", [5000, 300]), ("p4a2-same-start-after-step-same-path", [5000, 300])):
+            with self.subTest(mode=mode):
+                case = self.late_read(mode)
+                self.assertEqual(case["unidentified"], [300], f"a successor with the same start erased or inherited an unread process: {case}")
+                self.assertEqual(case["instances"], instances, case)
+                self.assertEqual(case["vwhy"], "same-path-instance-unidentified", case)
+        same = self.late_read("p4a1-same-start-same-path")
+        self.assertGreaterEqual(same["by"]["300"]["first"], same["polls"][1], f"the successor inherited the unread process's first sight: {same}")
+        unopened = self.late_read("path-late-handle-unopened")
+        self.assertEqual([unopened["instances"], unopened["unidentified"]], [[], [5000]], unopened)
+        self.assertFalse(unopened["bench"], unopened)
+
+    def test_handover_a_failure_before_the_first_poll_still_publishes_the_record(self) -> None:
+        """Adversary pass 5 A2 on 8ad00092: the first Processor Information read throws before the pending state exists. The stop-time sweep of pending pids ran
+        on that missing state and threw inside finally, so no record was published; the base publishes the caught error. It is published again."""
+        if type(self)._late_read_result is None:
+            self.late_read("control")
+        case = type(self)._late_read_result["counter-read-throws"]
+        self.assertTrue(case["record"], f"a failure before the first poll left no helper record: {case}")
+        self.assertTrue([e for e in case["errors"] if str(e).startswith("helper:")], case)
+
+    def test_handover_a_start_unread_at_first_sight_refuses_even_when_it_reads_later(self) -> None:
+        """The cost of that ruling, stated: a process whose StartTime fails at first sight and reads later cannot be told from a successor on its pid, so it refuses
+        same-path-instance-unidentified, as on the base, whether or not its Path read too (r1's start-late, both-late and prelaunch-start-late, which recovered
+        on e048ccc6 to 6180c3e7). Only a Path failure with the start read at first sight recovers, the one shape measured on a real process (CREATE_SUSPENDED)."""
+        for mode in ("start-late", "both-late"):
+            with self.subTest(mode=mode):
+                case = self.late_read(mode)
+                self.assertEqual([case["app"], case["instances"], case["unidentified"]], [5000, [5000], [5000]], case)
+                self.assertEqual(case["vwhy"], "same-path-instance-unidentified", case)
+                self.assertFalse(case["bench"], case)
+        pre = self.late_read("prelaunch-start-late")
+        self.assertEqual([pre["instances"], pre["others"], pre["unidentified"]], [[5000], [200], [200]], pre)
+        self.assertEqual(pre["vwhy"], "same-path-instance-unidentified", pre)
+
+    def test_handover_a_real_process_caught_before_its_loader_ran_is_classed_after_it_resumes(self) -> None:
+        """Nothing doubled but the counter category: a real stand-in process held suspended through two whole enumerations. Its Path really is unreadable
+        then (the driver checks), and StartTime is not. Once it runs it is the measured app, with its real first sight from before the resume. On the
+        base this is the hosted failure: seen None, instances [], the measured pid unidentified."""
+        got = self.drive("real-suspended", REAL_SUSPENDED_DRIVER, True)
+        self.assertEqual(got["pathWhileSuspended"], "", f"this OS reads Path before the loader runs, so the test no longer reproduces the failed read: {got}")
+        self.assertEqual(got["endedBy"], "stop-file", got)
+        self.assertEqual(got["unidentified"], [], f"the measured process was settled unidentified by a failed first read: {got}")
+        self.assertEqual(got["instances"], [got["measuredPid"]], got)
+        self.assertEqual(got["app"], got["measuredPid"], got)
+        self.assertIn(got["vwhy"], self.ACCEPTED, got)
+        self.assertLess(got["first"], got["resume"], f"the first sight is not the real one, from before the process ran: {got}")
+        self.assertGreater(got["last"], got["resume"], got)
+        self.assertGreaterEqual(got["start"], got["launch"], f"the launch-instant rule: {got}")
 
     def test_b2_a_feed_read_completed_after_the_window_publishes_no_row(self) -> None:
         """B2 (sol r9 B2 = adversary r9 8cf7e883 A2, literal): an end read that completed 120 s (or 40 s) after the smoke end may hold rows written
@@ -3615,8 +4230,10 @@ class PlaybackWorkerThreadsEvidenceTests(unittest.TestCase):
         return "\n".join(["playback_smoke.measured_session id=3", *start, "playback_smoke.summary session=3 reason=reached presented_frames=600"]) + "\n"
 
     @staticmethod
-    def start(workers: str, session: int = 3) -> str:
-        return f"playback_smoke.start session={session} position=0 scale_request=1 quality_mode=0 worker_threads={workers} start_serial=2 env_force_threads=0"
+    def start(workers: str, session: int = 3, env: str | None = None) -> str:
+        # env: what the app's start line says of the venue's MLVAPP_PLAYBACK_MAX_THREADS ("unset" when unset or empty); None = a line from a build without the field
+        tail = "" if env is None else f" env_playback_max_threads={env}"
+        return f"playback_smoke.start session={session} position=0 scale_request=1 quality_mode=0 worker_threads={workers} start_serial=2 env_force_threads=0{tail}"
 
     def test_honoured_only_when_the_log_and_every_proof_field_say_n(self) -> None:
         v = self.verdict(self.CAPPED, self.log(self.start("12")), self.PROOF)
@@ -3704,6 +4321,173 @@ class PlaybackWorkerThreadsEvidenceTests(unittest.TestCase):
             v = self.verdict(spec, self.log(self.start("16")), {"result": "MEASUREMENT_CAPTURED"})
             self.assertEqual((v["verdict"], v["blocks"]), ("NOT_REQUESTED", False), spec)
 
+    UNCAPPED = {"generatorArgs": {"telemetryArm": "LIGHT"}}
+    DONE = {"result": "MEASUREMENT_CAPTURED"}
+
+    @classmethod
+    def start_with(cls, workers: str, **env: str) -> str:
+        # a start line whose env_<name>= fields say what the app saw of the venue's worker-count variables (every one not named is "unset")
+        line = cls.start(workers, env="unset").replace(" env_force_threads=0", " env_force_threads=unset")
+        line += " env_force_singlethread=unset env_disable_playback_thread_cap=unset env_omp_num_threads=unset env_disable_raw_uint16_prefetch=unset env_raw_uint16_prefetch_decoders=unset"
+        for key, value in env.items():
+            marker = f" env_{key}=unset"
+            assert marker in line, key
+            line = line.replace(marker, f" env_{key}={value}")
+        return line
+
+    WORKER_ENV = (("playback_max_threads", "MLVAPP_PLAYBACK_MAX_THREADS"), ("force_threads", "MLVAPP_FORCE_THREADS"),
+                  ("force_singlethread", "MLVAPP_FORCE_SINGLETHREAD"), ("disable_playback_thread_cap", "MLVAPP_DISABLE_PLAYBACK_THREAD_CAP"),
+                  ("omp_num_threads", "OMP_NUM_THREADS"), ("disable_raw_uint16_prefetch", "MLVAPP_DISABLE_RAW_UINT16_PREFETCH"))
+
+    # The start lines of two recorded legs of this card, byte for byte (Bachelor, build 4f480f19): C dda2ea51, automatic at 16; T12 392add3b, capped at 12.
+    REAL_TAIL = ("env_disable_playback_thread_cap=unset env_playback_scale=1 env_hq_mean23=unset env_playback_smoke_telemetry=1 env_playback_scope_interval_ms=unset "
+                 "env_omp_num_threads=unset env_disable_raw_uint16_prefetch=unset env_disable_play_start_preroll=unset preview_mode=sharp_smooth env_aggressive_preview=0 "
+                 "env_preview_mode=sharp_smooth env_quality_mode=phase3_hq env_gpu_playback_recon=unset env_gpu_playback_recon_texture_present=unset auto_target_fps=30 "
+                 "auto_reason_start=warmup_hq env_raw_uint16_prefetch_decoders=unset")
+    REAL_HEAD = ("[2026-11-05T06:25:09.095Z] [INFO] [0x1373c] playback_smoke.start session=3 position=0 cut_in=1 cut_out=937 scale_request=1 quality_mode=4 worker_threads={workers} "
+                 "start_serial=6 frame_telemetry=1 drop_frame=1 audio=1 scopes=0 zebras=0 file_loaded=1 env_force_threads=unset env_force_singlethread=unset env_playback_max_threads={cap} ")
+    REAL_C = REAL_HEAD.format(workers=16, cap="unset") + REAL_TAIL
+    REAL_T12 = REAL_HEAD.format(workers=12, cap=12) + REAL_TAIL
+
+    def test_inherited_openmp_count_on_the_unchanged_control_is_refused(self) -> None:
+        # CPU-S1-RECON-CHAIN-ATTRIBUTION-1 r4 B1 (opus and fable on 70d55f42). Catalogue row: an unchanged control spec with venue OMP_NUM_THREADS=12 gives INVALID, never
+        # PASS. The worker count stays 16 (WorkerThreadCount.h does not read the variable), but libgomp starts at it and :93-94 keeps the smaller, so only the env field shows it.
+        for value in ("12", "1", "8"):
+            with self.subTest(inherited=value):
+                line = self.REAL_C.replace("env_omp_num_threads=unset", f"env_omp_num_threads={value}")
+                v = self.verdict(self.UNCAPPED, self.log(line), self.DONE)
+                self.assertEqual((v["verdict"], v["blocks"], v["requested"], v["observed"], v["inheritedOverrides"]),
+                                 ("INHERITED_WORKER_OVERRIDE", True, None, 16, f"OMP_NUM_THREADS={value}"), v)
+
+    def test_literal_unset_singlethread_is_caught_by_the_openmp_field_it_writes(self) -> None:
+        # r4 B2 (sol, opus; the producer's OPEN A1). MLVAPP_FORCE_SINGLETHREAD=unset is true to envTruthy (ForceSingleThread.cpp:15-24), so :55 writes OMP_NUM_THREADS=1 at
+        # main.cpp:1868, before any session; the start line logs its own field as the same "unset" an absent variable gets (LogLineField.h:70) and env_omp_num_threads=1.
+        # The chain _putenv_s -> qEnvironmentVariable was executed on the toolchain's Qt6Core and msvcrt (r4 probe-qt-env.txt), inherited OMP_NUM_THREADS=12 included.
+        line = self.REAL_C.replace("env_omp_num_threads=unset", "env_omp_num_threads=1")
+        self.assertIn(" env_force_singlethread=unset ", line)
+        v = self.verdict(self.UNCAPPED, self.log(line), self.DONE)
+        self.assertEqual((v["verdict"], v["blocks"], v["inheritedOverrides"]), ("INHERITED_WORKER_OVERRIDE", True, "OMP_NUM_THREADS=1"), v)
+        # the same value on a capped arm: its worker count honours the cap, and only this field shows OpenMP was forced
+        v = self.verdict(self.CAPPED, self.log(self.REAL_T12.replace("env_omp_num_threads=unset", "env_omp_num_threads=1")), self.PROOF)
+        self.assertEqual((v["verdict"], v["blocks"], v["observed"], v["inheritedOverrides"]), ("NOT_HONOURED", True, 12, "OMP_NUM_THREADS=1"), v)
+        self.assertIn("INHERITED_WORKER_OVERRIDE", v["reason"])
+
+    def test_a_capped_arm_under_an_inherited_openmp_count_is_not_honoured(self) -> None:
+        # opus's T12 row: workers 12, OpenMP 8. Reading worker_threads alone, this read HONOURED.
+        for value in ("8", "12", "abc"):
+            with self.subTest(inherited=value):
+                v = self.verdict(self.CAPPED, self.log(self.REAL_T12.replace("env_omp_num_threads=unset", f"env_omp_num_threads={value}")), self.PROOF)
+                self.assertEqual((v["verdict"], v["blocks"], v["observed"], v["inheritedOverrides"]), ("NOT_HONOURED", True, 12, f"OMP_NUM_THREADS={value}"), v)
+        v = self.verdict(self.CAPPED, self.log(self.REAL_T12.replace("env_omp_num_threads=unset", "env_omp_num_threads=unset env_omp_num_threads=8")), self.PROOF)
+        self.assertEqual((v["verdict"], v["blocks"]), ("NOT_HONOURED", True), v)
+        self.assertIn("more than once", v["reason"])
+        v = self.verdict(self.CAPPED, self.log(self.REAL_T12.replace("env_omp_num_threads=unset", "env_omp_num_threads=8")), {"result": "CPU_FALLBACK_DETECTED"})
+        self.assertEqual((v["verdict"], v["blocks"]), ("NOT_HONOURED", True), "a failure terminal is no way around it")
+
+    def test_the_recorded_control_and_capped_arm_stay_clean(self) -> None:
+        control = self.verdict(self.UNCAPPED, self.log(self.REAL_C), self.DONE)
+        self.assertEqual((control["verdict"], control["blocks"], control["observed"], control["inheritedOverrides"]), ("NOT_REQUESTED", False, None, None), control)
+        arm = self.verdict(self.CAPPED, self.log(self.REAL_T12), self.PROOF)
+        self.assertEqual((arm["verdict"], arm["blocks"], arm["observed"], arm["inheritedOverrides"]), ("HONOURED", False, 12, None), arm)
+        # OMP_NUM_THREADS=0 and =unset: libgomp refuses both and keeps its default (executed, r4 probe-libgomp.txt)
+        for value in ("0", "unset"):
+            with self.subTest(omp=value):
+                line = self.REAL_C.replace("env_omp_num_threads=unset", f"env_omp_num_threads={value}")
+                self.assertEqual(self.verdict(self.UNCAPPED, self.log(line), self.DONE)["verdict"], "NOT_REQUESTED")
+                line = self.REAL_T12.replace("env_omp_num_threads=unset", f"env_omp_num_threads={value}")
+                self.assertEqual(self.verdict(self.CAPPED, self.log(line), self.PROOF)["verdict"], "HONOURED")
+
+    def test_the_prefetch_decoder_count_must_be_the_one_the_spec_names(self) -> None:
+        # r4 class census: the third thread count on the start line. The job passes -PreserveExperimentalEnvironment (playback-attr-3-cuda-job.ps1:3001), so the smoke runner's
+        # clear does not apply and an inherited value reaches the app. 0 is NOT inert here: video_mlv.c:1356 reads it as one decoder.
+        dec = "raw_uint16_prefetch_decoders"
+        off = "disable_raw_uint16_prefetch"
+        name = "MLVAPP_RAW_UINT16_PREFETCH_DECODERS"
+        one = {"generatorArgs": {"rawPrefetchDecoders": 1}}
+        none = {"generatorArgs": {"rawPrefetchDecoders": 0}}
+        refused = ((self.UNCAPPED, {dec: "1"}, f"{name}=1"), (self.UNCAPPED, {dec: "0"}, f"{name}=0"), (self.UNCAPPED, {dec: "4"}, f"{name}=4"),
+                   (self.UNCAPPED, {off: "1"}, "MLVAPP_DISABLE_RAW_UINT16_PREFETCH=1"),
+                   (one, {dec: "2"}, f"{name}=2"), (one, {}, f"{name}=unset"), (one, {dec: "1", off: "1"}, "MLVAPP_DISABLE_RAW_UINT16_PREFETCH=1"),
+                   (none, {}, "MLVAPP_DISABLE_RAW_UINT16_PREFETCH=unset"), (none, {off: "1", dec: "2"}, f"{name}=2"))
+        for spec, env, expected in refused:
+            with self.subTest(spec=spec, env=env):
+                v = self.verdict(spec, self.log(self.start_with("16", **env)), self.DONE)
+                self.assertEqual((v["verdict"], v["blocks"], v["inheritedOverrides"]), ("INHERITED_WORKER_OVERRIDE", True, expected), v)
+        for spec, env in ((self.UNCAPPED, {}), (self.UNCAPPED, {off: "0"}), (one, {dec: "1"}), (one, {dec: "1", off: "0"}), (none, {off: "1"})):
+            with self.subTest(spec=spec, env=env):
+                v = self.verdict(spec, self.log(self.start_with("16", **env)), self.DONE)
+                self.assertEqual((v["verdict"], v["blocks"]), ("NOT_REQUESTED", False), v)
+        # a build before the fields is not refused, and a capped arm is held to the same rule
+        self.assertEqual(self.verdict(one, self.log(self.start("16")), self.DONE)["verdict"], "NOT_REQUESTED")
+        v = self.verdict(self.CAPPED, self.log(self.REAL_T12.replace("env_raw_uint16_prefetch_decoders=unset", "env_raw_uint16_prefetch_decoders=1")), self.PROOF)
+        self.assertEqual((v["verdict"], v["blocks"], v["inheritedOverrides"]), ("NOT_HONOURED", True, f"{name}=1"), v)
+        for key in (dec, off):
+            v = self.verdict(self.UNCAPPED, self.log(self.start_with("16") + f" env_{key}=unset"), self.DONE)
+            self.assertEqual((v["verdict"], v["blocks"]), ("INHERITED_WORKER_OVERRIDE", True), v)
+            self.assertIn("more than once", v["reason"])
+
+    def test_an_inherited_worker_override_on_a_leg_that_names_no_cap_blocks(self) -> None:
+        # CPU-S1-RECON-CHAIN-ATTRIBUTION-1 r3 (sol A2 on #754; adversary A1 on 6ffe18f8): a venue MLVAPP_PLAYBACK_MAX_THREADS=12 caps the control exactly as the T12
+        # arm's own cap does, and MLVAPP_FORCE_THREADS=12 forces it (bypassing the cap). Before r3 both read NOT_REQUESTED / blocks=false, so the C-versus-T12 pair
+        # compared two arms at 12 workers and could stay CLEAN. Every variable src/batch/WorkerThreadCount.h reads for the count is covered, one at a time.
+        for key, name in self.WORKER_ENV:
+            for value in ("12", "8", "1", "16", "abc"):
+                with self.subTest(variable=name, inherited=value):
+                    v = self.verdict(self.UNCAPPED, self.log(self.start_with("12" if value == "12" else "8", **{key: value})), self.DONE)
+                    self.assertEqual((v["verdict"], v["blocks"], v["requested"], v["inheritedOverrides"]), ("INHERITED_WORKER_OVERRIDE", True, None, f"{name}={value}"), v)
+                    self.assertIn(f"{name}={value}", v["reason"])
+        v = self.verdict(self.UNCAPPED, self.log(self.start_with("1", force_singlethread="1")), self.DONE)
+        self.assertEqual((v["verdict"], v["blocks"], v["observed"]), ("INHERITED_WORKER_OVERRIDE", True, 1), "a forced single thread is no automatic-default arm either")
+        v = self.verdict(self.UNCAPPED, self.log(self.start_with("12", playback_max_threads="12", force_threads="12")), self.DONE)
+        self.assertEqual(v["inheritedOverrides"], "MLVAPP_PLAYBACK_MAX_THREADS=12 MLVAPP_FORCE_THREADS=12", "every override is named, not the first")
+
+    def test_a_zero_like_value_is_not_trusted_as_inert(self) -> None:
+        # adversary A1 on 165d4a30: ForceSingleThread.cpp's envTruthy treats "00", "+0" and "-0" as ON (only 0, false, off, no and empty are off), so a numeric-zero
+        # pattern exempted an active override. Only the exact token 0 is inert, for every variable; anything else is named and refused.
+        for key, name in self.WORKER_ENV:
+            for value in ("00", "+0", "-0", "false", "off", "no", "000"):
+                with self.subTest(variable=name, inherited=value):
+                    v = self.verdict(self.UNCAPPED, self.log(self.start_with("16", **{key: value})), self.DONE)
+                    self.assertEqual((v["verdict"], v["blocks"], v["inheritedOverrides"]), ("INHERITED_WORKER_OVERRIDE", True, f"{name}={value}"), v)
+
+    def test_the_control_and_the_capped_arm_at_the_same_inherited_count_do_not_both_pass(self) -> None:
+        # sol's literal cases: unchanged C and T12 specs; venue MLVAPP_PLAYBACK_MAX_THREADS=12 (A2) or MLVAPP_FORCE_THREADS=12 (adversary A1). T12 honours its own
+        # cap at 12; the control must not read as the uncapped arm it is meant to be.
+        for key in ("playback_max_threads", "force_threads"):
+            with self.subTest(variable=key):
+                control = self.verdict(self.UNCAPPED, self.log(self.start_with("12", **{key: "12"})), self.DONE)
+                arm = self.verdict(self.CAPPED, self.log(self.start_with("12", **{"playback_max_threads": "12", key: "12"})), self.PROOF)
+                self.assertEqual((arm["verdict"], arm["blocks"], arm["observed"]), ("HONOURED", False, 12), arm)
+                self.assertEqual((control["verdict"], control["blocks"], control["observed"]), ("INHERITED_WORKER_OVERRIDE", True, 12), control)
+
+    def test_the_recorded_pair_shape_stays_clean(self) -> None:
+        # the recorded r1/r2 arms (read from the receipts' smoke-run.log): C, P and L auto at worker_threads=16 with the variable unset, T12 at 12 with 12 (its own -Threads 12)
+        control = self.verdict(self.UNCAPPED, self.log(self.start("16", env="unset")), self.DONE)
+        arm = self.verdict(self.CAPPED, self.log(self.start("12", env="12")), self.PROOF)
+        self.assertEqual((control["verdict"], control["blocks"], control["observed"], control["inheritedOverrides"]), ("NOT_REQUESTED", False, None, None), control)
+        self.assertEqual((arm["verdict"], arm["blocks"], arm["observed"]), ("HONOURED", False, 12), arm)
+
+    def test_a_leg_that_requested_no_cap_and_saw_none_is_unchanged(self) -> None:
+        # no start line, a start line from a build without the fields, every field unset, and every field the exact token 0 (inert under all four of the app's
+        # parsers): none of them blocks
+        zeros = [self.start_with("16", **{key: "0"}) for key, _ in self.WORKER_ENV]
+        for name, log in (("fields unset", self.log(self.start_with("16"))), ("build without the fields", self.log(self.start("16"))),
+                          ("no start line", self.log()), ("no log", ""), *((f"zero {i}", self.log(line)) for i, line in enumerate(zeros))):
+            with self.subTest(case=name):
+                v = self.verdict(self.UNCAPPED, log, self.DONE)
+                self.assertEqual((v["verdict"], v["blocks"], v["observed"], v["inheritedOverrides"]), ("NOT_REQUESTED", False, None, None), v)
+        v = self.verdict(self.UNCAPPED, self.log(self.start_with("16", playback_max_threads="12").replace("session=3", "session=2")), self.DONE)
+        self.assertEqual((v["verdict"], v["blocks"]), ("NOT_REQUESTED", False), "another session's start line is not the measured session's")
+
+    def test_a_duplicated_worker_env_field_on_an_uncapped_leg_is_refused(self) -> None:
+        for key, name in self.WORKER_ENV:
+            for case, tail in (("same value twice", f" env_{key}=unset"), ("forged after", f" env_{key}=12"), ("empty after", f" env_{key}=")):
+                with self.subTest(variable=name, case=case):
+                    v = self.verdict(self.UNCAPPED, self.log(self.start_with("16") + tail), self.DONE)
+                    self.assertEqual((v["verdict"], v["blocks"]), ("INHERITED_WORKER_OVERRIDE", True), v)
+                    self.assertIn("more than once", v["reason"])
+                    self.assertIn(name, v["reason"])
+
     def test_the_runner_and_the_validator_both_gate_on_it(self) -> None:
         module = (DV / "DualVenueRunner.psm1").read_text(encoding="utf-8")
         self.assertIn("$workerThreadsVerdict = Get-DvWorkerThreadsEvidence -Spec $spec -LogText $ev.logText -Summary $ev.summary", module)
@@ -3735,8 +4519,8 @@ class PlaybackMaxThreadsRunnerTests(RunnerHarness, unittest.TestCase):
         path.write_text(json.dumps(spec), encoding="utf-8")
         return path
 
-    def leg(self, args: dict | None, leg_id: str, workers: str | None, summary: dict | None) -> dict:
-        start = [PlaybackWorkerThreadsEvidenceTests.start(workers)] if workers is not None else []
+    def leg(self, args: dict | None, leg_id: str, workers: str | None, summary: dict | None, env: str | None = None) -> dict:
+        start = [PlaybackWorkerThreadsEvidenceTests.start(workers, env=env)] if workers is not None else []
         self.write_artifacts(summary=summary, extra_log_lines=start)
         proc, receipt, _ = self.run_leg("ultra-magnus", self.spec_with(args, leg_id), extra=["-Backend", "cpu"])
         self.assertIsNotNone(receipt, proc.stdout[-2000:] + proc.stderr[-2000:])
@@ -3768,6 +4552,36 @@ class PlaybackMaxThreadsRunnerTests(RunnerHarness, unittest.TestCase):
         receipt = self.leg(None, "mt-legacy", "16", None)
         self.assertEqual(receipt["outcome"], "PASS", receipt["outcomeDetail"])
         self.assertNotIn("workerThreads", receipt)
+        receipt = self.leg(None, "mt-legacy-unset", "16", None, env="unset")
+        self.assertEqual(receipt["outcome"], "PASS", receipt["outcomeDetail"])
+        self.assertNotIn("workerThreads", receipt)
+
+    def test_a_leg_without_the_key_that_ran_under_an_inherited_cap_is_invalid(self) -> None:
+        # CPU-S1-RECON-CHAIN-ATTRIBUTION-1 r3 (sol A2 on #754): the control that inherited the venue's cap is a typed INVALID naming it, never a PASS.
+        for env in ("12", "8"):
+            with self.subTest(inherited=env):
+                receipt = self.leg(None, f"mt-inherited-{env}", env, None, env=env)
+                self.assertEqual(receipt["outcome"], "INVALID", receipt["outcomeDetail"])
+                self.assertIn("INHERITED_WORKER_OVERRIDE", receipt["outcomeDetail"])
+                self.assertIn(f"MLVAPP_PLAYBACK_MAX_THREADS={env}", receipt["outcomeDetail"])
+                self.assertNotIn("workerThreads", receipt, "the block exists only for a leg whose spec names a cap")
+        receipt = self.leg({"playbackMaxThreads": 12}, "mt-capped-with-env", "12", self.PROOF, env="12")
+        self.assertEqual(receipt["outcome"], "PASS", receipt["outcomeDetail"])
+
+    def test_the_openmp_count_gates_the_runner_too(self) -> None:
+        # r4 B1 and B2 through Invoke-VenueLeg:973-975: PASS becomes a typed INVALID naming the variable. The literal-unset input is the row whose own field reads "unset".
+        evidence = PlaybackWorkerThreadsEvidenceTests
+        for name, value in (("omp12", "12"), ("omp1", "1")):
+            with self.subTest(case=name):
+                self.write_artifacts(summary=None, extra_log_lines=[evidence.REAL_C.replace("env_omp_num_threads=unset", f"env_omp_num_threads={value}")])
+                proc, receipt, _ = self.run_leg("ultra-magnus", self.spec_with(None, f"mt-{name}"), extra=["-Backend", "cpu"])
+                self.assertIsNotNone(receipt, proc.stdout[-2000:] + proc.stderr[-2000:])
+                self.assertEqual(receipt["outcome"], "INVALID", receipt["outcomeDetail"])
+                self.assertIn("INHERITED_WORKER_OVERRIDE", receipt["outcomeDetail"])
+                self.assertIn(f"OMP_NUM_THREADS={value}", receipt["outcomeDetail"])
+        self.write_artifacts(summary=None, extra_log_lines=[evidence.REAL_C])
+        proc, receipt, _ = self.run_leg("ultra-magnus", self.spec_with(None, "mt-real-c"), extra=["-Backend", "cpu"])
+        self.assertEqual(receipt["outcome"], "PASS", receipt["outcomeDetail"])
 
 
 class PlaybackMaxThreadsSpecTests(unittest.TestCase):
