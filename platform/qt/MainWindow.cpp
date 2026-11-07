@@ -3205,6 +3205,9 @@ void MainWindow::resizeEvent(QResizeEvent *event)
             m_pRenderThread->unlock();
         }
         waitForResizeStillDrawing( QStringLiteral("resize") );
+        // The first request at the new geometry is drawFrame()'s; an older request still in flight must not consume the
+        // gradient re-anchor armed below (adversary r2 A2).
+        const uint64_t gradientReanchorSerialFloor = m_nextRenderRequestSerial;
         drawFrame();
         if( ui->checkBoxGradientEnable->isChecked() && ui->groupBoxLinearGradient->isChecked() )
         {
@@ -3223,6 +3226,7 @@ void MainWindow::resizeEvent(QResizeEvent *event)
             // change the scene (adversary r1 pass 3 A1). Armed after the wait, so a frame landing inside a pump cannot
             // consume it early; a spare redraw on an unchanged scene places the overlay where it already is.
             m_zoomModeChanged = true;
+            m_gradientReanchorSerialFloor = gradientReanchorSerialFloor;
         }
     }
     event->accept();
@@ -22313,6 +22317,7 @@ void MainWindow::on_actionZoomFit_triggered(bool on)
         m_frameChanged = true;
     }
     m_zoomModeChanged = true;
+    m_gradientReanchorSerialFloor = m_nextRenderRequestSerial; // only a frame requested from here re-anchors (adversary r2 A2)
 }
 
 //Click on Zoom: 100%
@@ -33300,7 +33305,10 @@ void MainWindow::finishPresentedFrame( uint64_t displayFrame,
         ui->graphicsView->verticalScrollBar()->setValue( ( getMlvHeight(m_pMlvObject) * getVerticalStretchFactor(false) - ui->graphicsView->height() ) / 2 );
     }
 
-    if( m_zoomModeChanged )
+    // adversary r2 A2: an older request still in flight when the re-anchor was armed lands on the old geometry and must
+    // not consume it. Serial 0 is a frame with no request serial (kept as before: it consumes).
+    if( m_zoomModeChanged
+     && ( readyFrame.requestSerial == 0 || readyFrame.requestSerial >= m_gradientReanchorSerialFloor ) )
     {
         m_zoomModeChanged = false;
         m_pGradientElement->redrawGradientElement( m_pScene->width(),
@@ -35292,6 +35300,7 @@ void MainWindow::on_comboBoxHStretch_currentIndexChanged(int index)
     if( !m_inOpeningProcess && !m_setSliders ) on_horizontalSliderVignetteRadius_valueChanged( ui->horizontalSliderVignetteRadius->value() );
     resultingResolution();
     m_zoomModeChanged = true;
+    m_gradientReanchorSerialFloor = m_nextRenderRequestSerial; // only a frame requested from here re-anchors (adversary r2 A2)
     m_frameChanged = true;
 }
 
@@ -35303,6 +35312,7 @@ void MainWindow::on_comboBoxVStretch_currentIndexChanged(int index)
     if( !m_inOpeningProcess && !m_setSliders ) on_horizontalSliderVignetteRadius_valueChanged( ui->horizontalSliderVignetteRadius->value() );
     resultingResolution();
     m_zoomModeChanged = true;
+    m_gradientReanchorSerialFloor = m_nextRenderRequestSerial; // only a frame requested from here re-anchors (adversary r2 A2)
     m_frameChanged = true;
 }
 

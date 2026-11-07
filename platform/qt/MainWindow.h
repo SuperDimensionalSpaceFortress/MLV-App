@@ -933,6 +933,9 @@ private:
     bool m_inClipReopenRetry = false;
     bool m_zoomTo100Center;
     bool m_zoomModeChanged;
+    // The first request serial allowed to consume m_zoomModeChanged (finishPresentedFrame): set wherever it is armed, so a
+    // request already in flight at the old geometry cannot re-anchor the gradient early (GUI-SMOKE-FOREGROUND-HANG-NOLA-1).
+    uint64_t m_gradientReanchorSerialFloor = 0;
     bool m_playbackStopped;
     bool m_dualIsoPlaybackPreviewActive;
     /* Phase 4E: Playback Quality state. m_playbackQualityMode reflects the
