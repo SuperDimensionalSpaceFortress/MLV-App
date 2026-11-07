@@ -1024,7 +1024,7 @@ class VerdictOnText(unittest.TestCase):
     # Structure 1: the text is framed ONCE at entry; a line boundary other than LF / CRLF is COULD-NOT-CHECK.
     UT_GREEN = ("=" * 70 + "\nFAIL: test_x (t.T.test_x)\n" + "-" * 70 + "\nTraceback (most recent call last):\n"
                 '  File "t.py", line 2, in test_x\nAssertionError: no\n\nRan 1 test in 0.0s\n\nOK\n')
-    FOREIGN = ("\x0b", "\x0c", "\x1c", "\x1d", "\x1e", "\x85", " ", " ", "\r")
+    FOREIGN = ("\x0b", "\x0c", "\x1c", "\x1d", "\x1e", "\x85", "\u2028", "\u2029", "\r")
 
     def test_r9_a3_a_foreign_line_boundary_is_could_not_check(self) -> None:
         zero = self.UT_GREEN.replace("OK\n", "FAILED (failures=0)\n")
@@ -1065,12 +1065,18 @@ class VerdictOnText(unittest.TestCase):
 
     def test_r9_every_reader_uses_the_one_framing(self) -> None:
         # No reader may split or anchor on the raw text again: one helper frames it, and every check reads its lines.
-        src = Path(rmv.__file__).read_text(encoding="utf-8")
-        code = src.split('"""', 2)[2]  # past the module docstring
-        self.assertNotIn(".splitlines(", code)
-        self.assertNotIn("re.M", code)
-        self.assertNotIn("re.MULTILINE", code)
-        self.assertEqual(code.count('.split("\\n")'), 1, "only _frame splits the text into lines")
+        import tokenize
+        with open(rmv.__file__, encoding="utf-8") as fh:  # code tokens only: comments and docstrings may name them
+            toks = [(t.type, t.string) for t in tokenize.generate_tokens(fh.readline)
+                    if t.type not in (tokenize.COMMENT, tokenize.NL, tokenize.NEWLINE, tokenize.INDENT, tokenize.DEDENT)]
+        names = [s for k, s in toks if k == tokenize.NAME]
+        self.assertNotIn("splitlines", names)
+        self.assertNotIn("MULTILINE", names)
+        self.assertFalse(any(toks[i:i + 3] == [(tokenize.NAME, "re"), (tokenize.OP, "."), (tokenize.NAME, flag)]
+                             for i in range(len(toks)) for flag in ("M", "S", "DOTALL")), "no multi-line regex flag")
+        splits = [i for i in range(len(toks) - 3) if toks[i][1] == "split" and toks[i + 1][1] == "("
+                  and toks[i + 2][0] == tokenize.STRING and toks[i + 2][1] in ('"\\n"', "'\\n'")]
+        self.assertEqual(len(splits), 1, "only _frame splits the text into lines")
 
     def test_r9_the_cli_refuses_a_saved_file_with_a_vertical_tab(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
