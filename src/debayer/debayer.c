@@ -701,6 +701,42 @@ static inline void debayer_hacd_px(uint16_t *out, const float *dif, size_t ro, s
     if (!(keep & 2)) p[2] = debayer_hacd_round16(aB * (gb + db) + cB);
 }
 
+/* r11 (adversary pass 2 A1): each rebuilt R / B is clamped to [min, max] of that channel's own Bayer
+ * samples in the pixel's 5x5 window (mirrored; a mirror keeps the CFA parity). With a valid fit, a G-only
+ * edge under a constant R or B imprinted the G edge onto it where the bilinear is exact (run dir
+ * sim_r11f.py: R(48,23) 10000 -> 8383); a channel constant over the window is now exact, and a neutral
+ * edge's true value stays inside the range (modelled false colour falls further, e.g. diagonal step
+ * 0.500 -> 0.343 of the bilinear). Rows are independent; a kept (bilinear) channel is not touched. */
+static void debayer_hacd_range_row(uint16_t *out, const uint16_t *bayer, int w, int h, int y, int keep)
+{
+    const uint16_t *rows[5];
+    for (int k = 0; k < 5; ++k)
+        rows[k] = bayer + (size_t)debayer_hacd_reflect(y - 2 + k, h) * (size_t)w;
+    for (int ch = 0; ch < 2; ++ch)
+    {
+        if (keep & (1 << ch)) continue;
+        const int k0 = ((y & 1) == ch) ? 0 : 1; /* R (ch 0) on even rows and columns, B (ch 1) on odd */
+        for (int x = 0; x < w; ++x)
+        {
+            const int x0 = ((x & 1) == ch) ? x - 2 : x - 1;
+            int lo = 65535, hi = 0;
+            for (int k = k0; k < 5; k += 2)
+            {
+                const uint16_t *r = rows[k];
+                for (int xx = x0; xx <= x + 2; xx += 2)
+                {
+                    const int v = r[(xx >= 0 && xx < w) ? xx : debayer_hacd_reflect(xx, w)];
+                    if (v < lo) lo = v;
+                    if (v > hi) hi = v;
+                }
+            }
+            uint16_t *p = out + (size_t)x * 3u + (ch ? 2u : 0u);
+            if ((int)*p < lo) *p = (uint16_t)lo;
+            else if ((int)*p > hi) *p = (uint16_t)hi;
+        }
+    }
+}
+
 int debayer_reduced_hacd_chroma_rgb16(uint16_t *rgb, const uint16_t *bayer, int w, int h, int threads,
                                       float *scratch)
 {
@@ -760,6 +796,7 @@ int debayer_reduced_hacd_chroma_rgb16(uint16_t *rgb, const uint16_t *bayer, int 
             debayer_hacd_px(out, dif, ro, uo, dof, x, x - 1, x + 1, ye, (x & 1) == 0, aR, cR, aB, cB, keep);
         debayer_hacd_px(out, dif, ro, uo, dof, w - 1, w - 2, debayer_hacd_reflect(w, w), ye, ((w - 1) & 1) == 0, aR, cR,
                         aB, cB, keep);
+        debayer_hacd_range_row(out, bayer, w, h, y, keep);
     }
     return 1;
 }

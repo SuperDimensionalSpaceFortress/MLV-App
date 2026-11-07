@@ -41,7 +41,8 @@ void debayer_reduced_hchroma121_rgb16(uint16_t *out, const uint16_t *in, int w, 
  * fit per frame against the 4 G neighbours of every second R or B row; r11: a degenerate
  * fit leaves that channel exactly as debayerBasicU16 wrote it), and the colour difference
  * is laid on the bilinear G:
- * R = aR * (G + (R' - Gha)) + cR, rounded and clamped to [0, 65535]. Border sites
+ * R = aR * (G + (R' - Gha)) + cR, rounded and clamped to [0, 65535], then (r11) to
+ * [min, max] of that channel's own Bayer samples in the pixel's 5x5 window. Border sites
  * mirror (x - 1 -> x + 1, x - 2 -> x + 2). scratch holds w * h floats.
  * Returns 1 when R and B were rebuilt, 0 (rgb untouched) when w or h < 4 or a
  * pointer is NULL. Deterministic for any thread count (OpenMP over rows; the fit is
