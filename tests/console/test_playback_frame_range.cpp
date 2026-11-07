@@ -3379,8 +3379,13 @@ namespace
 // target the engine moves past before then is pruned and never presented (prunePlaybackLookaheadOutsideForwardWindow,
 // drawFrameReady's drop_lookahead). The conformed tick is told whether its current target has been presented
 // (MainWindow: m_lastPresentedPlaybackFrame, set when drawFrameReady accepts a frame). Frame 0 is presented at Play.
+// r27 fix iteration 1 (adversary A1 on d98be193): \a invalidateAt is the tick on which the app invalidates the presentation
+// (invalidatePlaybackPrepForDisplayChange: Drop Frame toggle, display change). It clears the last presented frame to -1 and the
+// renderer is left idle: timerFrameEvent's duplicate-draw suppression never re-requests the current target, so its present
+// never comes. Only a NEW target is rendered and presented. \a maxPresentGapMs is the longest wall time between two presents.
 ConformPlayResult playConformedTicksWithRenderer( const std::function<double( int )> & tickAt, double presentLatencyMs,
-                                                  int cutOut, double * maxDebt = nullptr )
+                                                  int cutOut, double * maxDebt = nullptr, int invalidateAt = -1,
+                                                  double * maxPresentGapMs = nullptr )
 {
     playback_native_pace::NativePaceGuard guard;
     guard.reset();
@@ -3388,26 +3393,34 @@ ConformPlayResult playConformedTicksWithRenderer( const std::function<double( in
     playback_frame_range::SourceFrameAdvanceCounter counter;
     counter.begin( 0 );
     tracker.notePresented( 0.0, 0, 0, 0, 2859 );
-    double position = 0.0, nowMs = 0.0, debt = 0.0, targetSinceMs = 0.0;
+    double position = 0.0, nowMs = 0.0, debt = 0.0, targetSinceMs = 0.0, lastPresentMs = 0.0;
     int target = 0, lastPresented = 0;
+    bool presentCancelled = false;
     if( maxDebt ) *maxDebt = 0.0;
+    if( maxPresentGapMs ) *maxPresentGapMs = 0.0;
+    const auto present = [&]( int frame )
+    {
+        tracker.notePresented( nowMs / 1000.0, frame, 0, 0, 2859 );
+        lastPresented = frame;
+        if( maxPresentGapMs && nowMs - lastPresentMs > *maxPresentGapMs ) *maxPresentGapMs = nowMs - lastPresentMs;
+        lastPresentMs = nowMs;
+    };
     ConformPlayResult r;
     for( int t = 1; t < 100000 && r.reachedMs < 0.0; ++t )
     {
         const double tickMs = tickAt( t );
         nowMs += tickMs;
-        if( target != lastPresented && nowMs - targetSinceMs >= presentLatencyMs )
-        {
-            tracker.notePresented( nowMs / 1000.0, target, 0, 0, 2859 );
-            lastPresented = target;
-        }
+        if( t == invalidateAt ) { lastPresented = -1; presentCancelled = true; }
+        if( !presentCancelled && target != lastPresented && nowMs - targetSinceMs >= presentLatencyMs ) present( target );
         const double granted = guard.grant( 24.0 * tickMs / 1000.0, nowMs, 24.0 );
         if( t == 1 ) guard.notePresent( nowMs, 24.0 );
         const double before = position;
+        const bool presentOutstanding = !presentCancelled && target != lastPresented;
         const playback_frame_range::DropFrameTickResult tick = playback_frame_range::advanceDropFrameTick(
             position,
-            playback_frame_range::conformDropFrameDelta( position, granted, true, debt,
-                                                         lastPresented == static_cast<int>( position ) ),
+            playback_frame_range::conformDropFrameDelta(
+                position, granted, true, debt,
+                playback_frame_range::conformTargetPresented( lastPresented, position, presentOutstanding ) ),
             1, cutOut, false );
         position = tick.position;
         if( maxDebt && debt > *maxDebt ) *maxDebt = debt;
@@ -3417,11 +3430,8 @@ ConformPlayResult playConformedTicksWithRenderer( const std::function<double( in
         {
             target = static_cast<int>( position );
             targetSinceMs = nowMs;
-            if( presentLatencyMs <= 0.0 )
-            {
-                tracker.notePresented( nowMs / 1000.0, target, 0, 0, 2859 );
-                lastPresented = target;
-            }
+            presentCancelled = false;
+            if( presentLatencyMs <= 0.0 ) present( target );
         }
         if( position >= 1498.0 ) r.reachedMs = nowMs;
     }
@@ -3492,6 +3502,32 @@ TEST( PlaybackConformDropFrame, R27A1ACarriedDebtIsRepaidOnlyAsTheRendererPresen
     ASSERT_TRUE( slow.maxJump > 1 );
     ASSERT_TRUE( slow.consumedAt64998 >= int64_t( 1499 ) );
     ASSERT_TRUE( slowDebt <= playback_frame_range::kConformMaxDebtFrames + 1e-9 );
+}
+
+TEST( PlaybackConformDropFrame, R27A1bAnInvalidatedPresentWithAnIdleRendererNeverHoldsTheEngine )
+{
+    // adversary A1 on d98be193, its literal input: a 59.94 clip conformed to 24, Loop off, cut 1..1667, at frame 100 with frame
+    // 100 presented and the renderer idle. Drop Frame Mode is switched on: invalidatePlaybackPrepForDisplayChange clears
+    // m_lastPresentedPlaybackFrame to -1, and timerFrameEvent never re-draws 100 (lastDrawnPlaybackPosition is still 100).
+    // d98be193's gate (presented == target) then held target 100 with no present coming: the first new draw came 376 ms later
+    // at 101.024 with a debt of 8. The engine holds only while a present of its target is outstanding.
+    ASSERT_TRUE( playback_frame_range::conformTargetPresented( -1, 100.4, false ) );   // nothing coming: never held
+    ASSERT_FALSE( playback_frame_range::conformTargetPresented( -1, 100.4, true ) );   // its present is coming: held
+    ASSERT_TRUE( playback_frame_range::conformTargetPresented( 100, 100.4, true ) );    // presented
+    ASSERT_FALSE( playback_frame_range::conformTargetPresented( 100, 101.2, true ) );   // r27 A1 on be20bc59: 101 is queued
+    // the whole play: the invalidation lands near frame 100 (tick 521, 0.192 a tick), renderer latency 10 ms
+    for( const int at : { 2, 521, 524, 700, 3505 } )
+        for( const double latency : { 0.0, 10.0, 20.0 } )
+        {
+            double maxDebt = 0.0, maxGap = 0.0;
+            const ConformPlayResult r = playConformedTicksWithRenderer(
+                []( int ) { return 8.0; }, latency, 1667, &maxDebt, at, &maxGap );
+            ASSERT_EQ( 1, r.maxJump );
+            ASSERT_TRUE( maxDebt < 1.0 );          // d98be193: the cap, 8
+            ASSERT_TRUE( maxGap <= 70.0 );         // one 41.7 ms period, a tick and the latency; d98be193: about 376 ms
+            ASSERT_TRUE( r.consumedAt64998 >= int64_t( 1499 ) );
+            ASSERT_TRUE( r.sourceFps >= 23.28 && r.sourceFps <= 24.72 );
+        }
 }
 
 TEST( PlaybackConformDropFrame, R24A1TheCarriedDebtIsBoundedAndClearedWithoutConform )

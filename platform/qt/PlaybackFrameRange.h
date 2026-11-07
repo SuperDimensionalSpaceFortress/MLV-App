@@ -388,6 +388,15 @@ inline double conformDropFrameDelta( double currentPosition, double grantedFrame
     return delta;
 }
 
+// r27 fix iteration 1 (adversary A1 on d98be193): the targetPresented input of conformDropFrameDelta. \a lastPresentedFrame
+// is m_lastPresentedPlaybackFrame, \a position is m_newPosDropMode, and \a presentOutstanding says whether a present of the
+// current target is still coming (a render in flight for it, or a lookahead request or slot for it in the active generation).
+inline bool conformTargetPresented( long long lastPresentedFrame, double position, bool presentOutstanding )
+{
+    (void)presentOutstanding;
+    return lastPresentedFrame == static_cast<long long>( position );
+}
+
 // The single-tick form (no debt carried in or out): the same delta for a tick that carries no debt.
 inline double conformDropFrameDelta( double currentPosition, double grantedFrames, bool conformActive )
 {
