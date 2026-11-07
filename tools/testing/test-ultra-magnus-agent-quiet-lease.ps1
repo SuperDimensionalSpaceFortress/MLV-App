@@ -532,7 +532,9 @@ function Get-FixtureMatch([string]$CommandLine, [string]$Fx, [bool]$Ours = $fals
         $tn = $t.Replace([char]'/', [char]'\')
         $vals = @($tn)
         $q = $tn.IndexOf([char]'=')
-        if ($q -ge 0) { $vals += $tn.Substring($q + 1) }
+        # r5 pass-9 A1: the value after the first '=' is a whole value only when what precedes it is an option NAME (--output=, x=). A '='
+        # inside script text ('Start-Sleep 300 # =<dir>') is not an option, so that occurrence is judged as embedded below (descent required).
+        if ($q -gt 0 -and $tn.Substring(0, $q) -cmatch '^[-\\]{0,2}[A-Za-z0-9_][A-Za-z0-9_.\-]*$') { $vals += $tn.Substring($q + 1) }
         foreach ($v in $vals) {
             if (-not ($v.Equals($root, [StringComparison]::OrdinalIgnoreCase) -or $v.StartsWith($root + '\', [StringComparison]::OrdinalIgnoreCase))) { continue }
             $full = $null
@@ -3763,7 +3765,10 @@ try { $out = @(Add-LeaseSlotSnapshot -JobId 'jB4a' -Phase 'request') } catch { $
                 @{ cl = 'pwsh.exe -Command "Start-VenueJobLiveness -AgentShare C:\Temp\fx -JobId j"'; want = 'unknown'; ours = 'fixture' }   # a bare script token
                 @{ cl = 'pwsh.exe -Command "& { Get-Item ''C:/Temp/fx/x.json'' }"'; want = 'unknown'; ours = 'fixture' }  # embedded, forward slashes, under the dir
                 @{ cl = 'python.exe -c "open(\"C:\Temp\fx\calls.jsonl\")"'; want = 'unknown'; ours = 'fixture' }        # embedded in a double-quoted script string
-                @{ cl = 'pwsh.exe -Command "x -AgentShare=C:\Temp\fx"'; want = 'fixture'; ours = 'fixture' }             # the value after the first '=' (r4's rule)
+                @{ cl = 'pwsh.exe -Command "x -AgentShare=C:\Temp\fx"'; want = 'unknown'; ours = 'fixture' }             # '=' inside script text: embedded (pass-9 A1)
+                @{ cl = 'pwsh.exe -Command "Start-Sleep -Seconds 300 # =C:\Temp\fx"'; want = 'unknown'; ours = 'fixture' }   # pass-9 A1 shape
+                @{ cl = 'pwsh.exe -Command "Start-Sleep -Seconds 300 # =C:\Temp\fx\sub\..\x"'; want = 'unknown'; ours = 'unknown' }   # pass-9 A1 variant: a later '..'
+                @{ cl = 'python.exe --share=C:\Temp\fx'; want = 'fixture'; ours = 'fixture' }                            # an option's value (r4's rule, kept)
                 @{ cl = 'python.exe "C:\Temp\fx other\log.txt"'; want = 'unknown'; ours = 'unknown' }                    # r4 B1 sibling: never a kill match
                 @{ cl = 'python.exe C:\Temp\fx2\log.txt'; want = 'unknown'; ours = 'unknown' }                           # hub ruling sibling
                 @{ cl = 'pwsh.exe -Command "x -AgentShare ''C:\Temp\fx other''"'; want = 'unknown'; ours = 'unknown' }  # embedded sibling with a space
@@ -3784,6 +3789,9 @@ try { $out = @(Add-LeaseSlotSnapshot -JobId 'jB4a' -Phase 'request') } catch { $
             }
             # pass-8 A1 verbatim: '' (an escaped apostrophe) then ..\.. climbs out of the dir: never a kill match, ours or not, and still counted
             foreach ($o in @($false, $true)) { $g = Get-FixtureMatch $c5A1 $c5A1Fx $o; if ($g -cne 'unknown') { $c5Bad.Add("[pass-8 A1] ours=$o match=$g want unknown") } }
+            # pass-9 A1 verbatim: a '=' inside script text is no option, so an unrelated process (parent 4) is counted unknown and never killed
+            $c5A9 = Get-FixtureCensus $c5A1Fx -Rows @([pscustomobject]@{ ProcessId = 24680; CommandLine = 'pwsh.exe -Command "Start-Sleep -Seconds 300 # =C:\Temp\um-agent-quiet-lease-1234-abcd1234"'; ParentProcessId = 4; CreationDate = [DateTime]::UtcNow })
+            if (-not (@($c5A9.survivors).Count -eq 0 -and (@($c5A9.unknown) -join ',') -ceq '24680')) { $c5Bad.Add("[pass-9 A1] survivors=[$(@($c5A9.survivors) -join ',')] unknown=[$(@($c5A9.unknown) -join ',')] want survivors=[] unknown=[24680]") }
             # The census through the -Rows seam: descent is decided from the rows' parents and start times.
             $c5Now = [DateTime]::UtcNow
             $c5SelfStart = (Get-Process -Id $PID).get_StartTime().ToUniversalTime()
@@ -3903,6 +3911,7 @@ try { $out = @(Add-LeaseSlotSnapshot -JobId 'jB4a' -Phase 'request') } catch { $
             return [pscustomobject]@{ p = $pF; out = $pF.StandardOutput.ReadToEndAsync(); err = $pF.StandardError.ReadToEndAsync() }
         }
         function Wait-FakeCall($H, [int]$Ms = 30000) {
+            $Ms = [Math]::Max(0, [Math]::Min($Ms, 600000))   # r5 pass-9 A2 (advisory): -1 would be WaitForExit's infinite wait
             $done = $H.p.WaitForExit($Ms)
             if (-not $done) { try { $H.p.Kill() } catch { }; $null = $H.p.WaitForExit(5000) }
             # r5 (sol r4 H2): a call that did not exit and whose Kill threw still holds its pipes open, so .Result would block forever. Each read is
