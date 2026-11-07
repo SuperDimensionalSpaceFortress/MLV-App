@@ -7223,9 +7223,10 @@ static int mlv_reduced_bayer_to_display_rgb16(uint16_t * out,
     {
         /* r12 (adversary pass 9 A2 and r12 pass 1 A2, pre-existing): debayerBasicU16 reconstructs whole row pairs
          * from row 1, so under 4 rows it writes none (one row also read the row before out) and at an odd height
-         * row h - 2 is never written. The plain branch refuses what the filtered branch refuses; the planners
-         * only produce even heights of at least 4. */
-        if (bw != out_w || bh < 4 || (bh & 1) != 0 || bh > out_h) return 0;
+         * row h - 2 is never written; under 4 columns (r12 pass 2 A2) its row loop writes nothing either. The
+         * plain branch refuses what the filtered branch refuses; the planners only produce even heights of at
+         * least 4 and widths of at least 4. */
+        if (bw != out_w || bw < 4 || bh < 4 || (bh & 1) != 0 || bh > out_h) return 0;
         debayerBasicU16RecordingKernelMilliseconds(out, bayer, bw, bh, threads, bit_shift);
         rows = bh;
     }
