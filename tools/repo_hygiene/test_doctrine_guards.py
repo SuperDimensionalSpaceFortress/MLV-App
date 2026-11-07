@@ -1234,6 +1234,81 @@ class GuardFixtureTests(_PwshMixin, unittest.TestCase):
                 with self.assertRaises(CouldNotCheck, msg=repr(window)):
                     run_guard(guard, root, rels)
 
+
+    # ---- r8: the PR #705 readings in every fixture are the MEASURED ones (sol r7 blocker; opus RMV-GUARD-FIXTURE-705-READING-1)
+    # powershell.exe 5.1.19041.6456, sol r1 (PR comment 6680026607): the Int32 overload reads 2 for the 2.2 s probe and 3 for
+    # the 2.8 s probe; the double overload reads the probe itself. "display-rounded" is the shape the bus trap records (the
+    # test rounded both readings to 3). Matched in this order, so "2.8s-raw" is not read as the rounded shape.
+    PR705_READINGS = (("2.2s", (2, 2.2, [2.0, 2.5], "REFUSED")),
+                      ("2.8s-raw", (3, 2.8, [2.7, 2.9], "PASS")),
+                      ("rounds-to-3", (3, 3, [3, 3], "REFUSED")),
+                      ("display-rounded", (3, 3, [3, 3], "REFUSED")))
+
+    def _pr705_probes(self) -> list[tuple[str, dict]]:
+        corpora = [("live corpus", (REPO_ROOT / RED_MUTATION_CORPUS).read_text(encoding="utf-8"), True)]
+        for side in ("red", "green"):
+            corpora.append((f"{side} fixture", FIXTURES["DG-RED-MUTATION-VERDICT"][side][RED_MUTATION_CORPUS], side != "red"))
+        found = []
+        for where, text, judge_expect in corpora:
+            for case in json.loads(text)["cases"]:
+                if case["kind"] == "probe" and "705" in case["id"]:
+                    found.append((where, case, judge_expect))
+        return found
+
+    def test_pr705_fixture_readings_are_the_measured_ones(self) -> None:
+        probes = self._pr705_probes()
+        self.assertGreaterEqual(len(probes), 5, "the live corpus and both fixtures hold PR #705 probes")
+        seen = set()
+        for where, case, judge_expect in probes:
+            want = next((v for key, v in self.PR705_READINGS if key in case["id"]), None)
+            self.assertIsNotNone(want, f"{where}: {case['id']} is a PR #705 probe with no measured reading to pin it to")
+            bug, fix, window, expect = want
+            self.assertEqual((case["bug_value"], case["fix_value"], case["window"]), (bug, fix, window), f"{where}: {case['id']}")
+            if judge_expect:  # the RED fixture records a WRONG answer on purpose, but never a wrong reading
+                self.assertEqual(case["expect"], expect, f"{where}: {case['id']}")
+            seen.add((where, bug, fix))
+        # the GREEN fixture keeps one separating PASS probe and the 2.2 s REFUSED probe, so both outcomes are covered
+        green = {c["id"]: c["expect"] for w, c, _j in probes if w == "green fixture"}
+        self.assertEqual(sorted(green.values()), ["PASS", "REFUSED", "REFUSED"], green)
+
+    def test_pr705_2_2_probe_is_refused_by_the_checker_on_the_measured_readings(self) -> None:
+        ok, reason = red_mutation_verdict.probe_discriminates(2, 2.2, (2.0, 2.5))
+        self.assertFalse(ok, reason)
+        self.assertTrue(red_mutation_verdict.probe_discriminates(3, 2.8, (2.7, 2.9))[0])
+
+    # ---- r8 R7-T1: a REFUSED case is pinned to the reason it was written for ------------------------------------
+    def test_red_mutation_verdict_refused_case_is_pinned_to_its_reason(self) -> None:
+        guard = GUARDS["DG-RED-MUTATION-VERDICT"]
+        # refused, but NOT because the run is green: its summary lists no PASSED line for the pass the runner counts
+        text = "=== short test summary info ===\nFAILED t.py::test_x - assert False\n=== 1 failed, 1 passed in 0.1s ===\n"
+        wrong = {"id": "wrong-reason", "kind": "verdict", "expect": "REFUSED", "reason": "the run is red but not at",
+                 "output": text, "expected_assertion": "other.py::test_x"}
+        right = {**wrong, "id": "right-reason", "reason": "-rA"}
+        others = [{"id": "p", "kind": "verdict", "expect": "PASS", "expected_assertion": "t.py::test_x",
+                   "output": "=== short test summary info ===\nFAILED t.py::test_x - assert False\n=== 1 failed in 0.1s ===\n"},
+                  {"id": "q", "kind": "probe", "expect": "PASS", "bug_value": 0, "fix_value": 1, "window": [1, 1]},
+                  {"id": "r", "kind": "probe", "expect": "REFUSED", "reason": "both sit inside", "bug_value": 1, "fix_value": 1, "window": [1, 1]}]
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            rels = _write_tree(root, {RED_MUTATION_CORPUS: json.dumps({"cases": others + [right]})})
+            self.assertEqual(run_guard(guard, root, rels), [])
+            rels = _write_tree(root, {RED_MUTATION_CORPUS: json.dumps({"cases": others + [wrong]})})
+            found = run_guard(guard, root, rels)
+            self.assertEqual(len(found), 1, found)
+            self.assertIn("wrong-reason", found[0].detail)
+            self.assertIn("reason", found[0].detail)
+
+    def test_red_mutation_verdict_refused_case_without_a_reason_is_could_not_check(self) -> None:
+        guard = GUARDS["DG-RED-MUTATION-VERDICT"]
+        base = {"id": "x", "kind": "verdict", "expect": "REFUSED", "output": "Ran 1 test\n\nOK\n", "expected_assertion": "a.py:1"}
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            for case in (base, {**base, "reason": ""}, {**base, "reason": None}, {**base, "reason": ["the run is green"]},
+                         {**base, "kind": "probe", "bug_value": 1, "fix_value": 1, "window": [1, 1]}):
+                rels = _write_tree(root, {RED_MUTATION_CORPUS: json.dumps({"cases": [case]})})
+                with self.assertRaises(CouldNotCheck, msg=repr(case)):
+                    run_guard(guard, root, rels)
+
     def test_red_mutation_verdict_corpus_number_spelling_is_not_lost_by_json(self) -> None:
         # adversary r5 pass 9 A2: json.loads turns 1e-400 into 0.0 and 1e400 into inf before the checker sees them,
         # so a probe recorded as PASS on a number no float can hold used to satisfy the guard.

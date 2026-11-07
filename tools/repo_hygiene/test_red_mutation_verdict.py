@@ -804,6 +804,62 @@ class VerdictOnText(unittest.TestCase):
         self.assertEqual(rmv.verdict(relative, "other.test_x.T.test_a")[0], rmv.REFUSED)
 
 
+    # ---- r8 (R7-C1 / R7-T1): a PASS needs a recognised terminal result line on EVERY path ------------------------
+    MIXED = ("def test_expected(): assert False\n"
+             "def test_imp():\n    import no_such_mod_rmv_r8\n")
+
+    def _cut_before_second_section(self, out: str) -> str:
+        """A -rN log whose tail was lost: everything from the second FAILURES section on (the import failure, the
+        result bar) is gone, so the text still holds a readable assertion failure and nothing that closes the run."""
+        marks = [m.start() for m in re.finditer(r"^_{3,} test_\w+ _{3,}$", out, re.M)]
+        self.assertGreaterEqual(len(marks), 2, out)
+        return out[:marks[1]]
+
+    def test_rN_missing_tail_before_import_failure_is_could_not_check(self) -> None:
+        for columns in (80, 200):
+            full = _run_pytest({"test_t.py": self.MIXED}, "-rN", "--tb=short", columns=columns)
+            self.assertRegex(full, r"2 failed", full)
+            cut = self._cut_before_second_section(full)
+            self.assertNotRegex(cut, r"\d+ (?:failed|passed)", cut)  # no result bar survives the cut
+            status, reason = rmv.verdict(cut, "test_t.py:1")
+            self.assertEqual(status, rmv.REFUSED, f"{reason}\n{cut}")
+            self.assertIn("COULD-NOT-CHECK", reason, cut)
+            self.assertIn("result line", reason, cut)
+
+    def test_rN_complete_runs_are_still_judged(self) -> None:
+        for columns in (80, 200):
+            only = _run_pytest({"test_t.py": "def test_expected(): assert False\n"}, "-rN", "--tb=short", columns=columns)
+            self.assertEqual(rmv.verdict(only, "test_t.py:1")[0], rmv.PASS, only)  # complete, assertion only
+            mixed = _run_pytest({"test_t.py": self.MIXED}, "-rN", "--tb=short", columns=columns)
+            status, reason = rmv.verdict(mixed, "test_t.py:1")  # complete, assertion plus import failure
+            self.assertEqual(status, rmv.REFUSED, mixed)
+            self.assertIn("collection or import error", reason, mixed)
+
+    def test_unittest_blocks_with_no_result_line_are_could_not_check(self) -> None:
+        block = ("=" * 70 + "\nFAIL: test_a (test_x.T.test_a)\n" + "-" * 70
+                 + '\nTraceback (most recent call last):\n  File "test_x.py", line 5, in test_a\n'
+                 "    self.assertEqual(1, 2)\nAssertionError: 1 != 2\n")
+        status, reason = rmv.verdict(block, "test_x.py:5")
+        self.assertEqual(status, rmv.REFUSED, reason)
+        self.assertIn("COULD-NOT-CHECK", reason)
+        self.assertIn("result line", reason)
+        self.assertEqual(rmv.verdict(block + "\nRan 1 test in 0.0s\n\nFAILED (failures=1)\n", "test_x.py:5")[0], rmv.PASS)
+
+    def test_no_parsed_failure_leaves_the_count_check_with_an_empty_answer(self) -> None:
+        # R7-C1 as the hub ACK words it: `_count_mismatch` returned "" for a text with no result line, whatever it held.
+        cut = "=== FAILURES ===\n___ test_x ___\nE assert False\nt.py:2: AssertionError\n"
+        self.assertTrue(rmv.parse_run(cut).failures)
+        self.assertNotEqual(rmv.parse_run(cut).mismatch, "")
+
+    def test_a_long_subtest_header_is_read_in_linear_time(self) -> None:
+        # opus r7 RMV-UT-IDENTITIES-SCALING-1: every ' (' x ')' pair was tried with a slice copy each.
+        import time
+        rest = "test_x (t.T.test_x) (rows=[" + ", ".join(f"({i}, {i + 1})" for i in range(3000)) + "])"
+        started = time.perf_counter()
+        self.assertEqual(rmv._ut_identities(rest), [("test_x", "t.T.test_x")])
+        self.assertLess(time.perf_counter() - started, 2.0)
+
+
 class CliTypedErrors(unittest.TestCase):
     def test_missing_output_file_exits_2_with_a_message_not_a_traceback(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -849,6 +905,23 @@ class ProbeDiscriminates(unittest.TestCase):
         #   [Math]::Min(330.0, 2.8) -> Double 2.8
         # Window [2.7, 2.9]: 2.8 is inside, 3 is outside, so only the fix reading passes.
         self.assertTrue(rmv.probe_discriminates(3, 2.8, (2.7, 2.9))[0])
+
+
+    def test_r8_window_must_be_a_list_or_tuple_of_two_numbers(self) -> None:
+        # opus r7 RMV-PROBE-WINDOW-PAIR-1: a dict's keys and a two-character string unpacked as the bounds.
+        for window in ({"0": 5, "1": 6}, "01", {0, 1}, iter((0, 1))):
+            ok, reason = rmv.probe_discriminates(3, 0, window)
+            self.assertFalse(ok, (window, reason))
+            self.assertIn("COULD-NOT-CHECK", reason)
+        self.assertTrue(rmv.probe_discriminates(3, 0, [0, 1])[0])
+        self.assertTrue(rmv.probe_discriminates(3, 0, (0, 1))[0])
+
+    def test_r8_pr705_measured_readings_are_the_ones_the_fixtures_use(self) -> None:
+        # powershell.exe 5.1.19041.6456, sol r1 (PR comment 6680026607): the Int32 overload reads 2 for the 2.2 s probe and
+        # 3 for the 2.8 s probe; the double overload reads the probe itself. Every PR #705 reading in the corpus and in
+        # the guard fixtures must be one of these pairs (the guard tests pin the fixtures, this pins the arithmetic).
+        for probe, bug, fix, window, want in ((2.2, 2, 2.2, (2.0, 2.5), False), (2.8, 3, 2.8, (2.7, 2.9), True)):
+            self.assertEqual(rmv.probe_discriminates(bug, fix, window)[0], want, probe)
 
     def test_each_failure_shape_is_named(self) -> None:
         self.assertIn("neither", rmv.probe_discriminates(30, 40, (0, 2))[1])
