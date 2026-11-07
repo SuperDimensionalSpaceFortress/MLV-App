@@ -35,6 +35,12 @@ REFUSED with a reason that starts ``COULD-NOT-CHECK (<typed reason>)``. That is 
 * ``separator`` / ``empty``: a unittest method name holding ``.`` ``/`` ``\\`` ``:``, an identity (run or
   expectation) with an empty segment (``test_s..T.test_a``, a trailing ``.`` or ``::``), or any id that does
   not split into exactly its own segments.
+* ``bracket`` (r13 hub ruling; twelve rounds of first-``[`` parsing each found a new false PASS): an id (run or
+  expectation) with a ``[`` BEFORE its last separator: ``::`` for a pytest node id, ``.`` ``/`` ``\\`` for a dotted
+  unittest id or an expectation without ``::``, ``/`` ``\\`` for a file path (a frame, a ``file:line`` expectation, a
+  module ``ERROR`` id, a ``SKIPPED`` location). A class or file name set through globals() may hold ``[`` and a function
+  name ``]``, so only a trailing ``[...]`` on the LAST segment is read as a parameter id, and one that holds the
+  separator itself (``test_x[a::b]``) cannot be told from a name boundary (``TestA[x.py::test_y]``) and is refused too.
 * ``line number``: a ``file:line`` expectation or a traceback frame whose line number has more than 9 digits.
 * ``failure blocks`` / ``sections``: the runner's own failed-or-errored count (``FAILED (failures=1, errors=1)``,
   ``2 failed``; a stated ``0`` is a count too) disagrees with the unittest failure blocks or the pytest failure sections that could be read. A
@@ -221,6 +227,7 @@ REASON_CODES = frozenset((
     "cnc-chained", "cnc-captured", "cnc-expectation", "cnc-line-framing", "cnc-decoding", "cnc-line-number", "cnc-frame",
     "cnc-identity", "cnc-pairing", "cnc-summary-split", "cnc-exception-type", "cnc-short-summary", "cnc-result-line",
     "cnc-no-result-line", "cnc-no-ran-footer", "cnc-runner", "cnc-count", "cnc-internal-error",
+    "cnc-bracket-before-last-segment",
     # REFUSED, probe_discriminates
     "probe-number", "probe-nan", "probe-infinite", "probe-empty-window", "probe-both-inside", "probe-neither-inside",
     "probe-bug-inside",
@@ -408,9 +415,42 @@ def _line_no(digits: str) -> int:
     return int(digits)
 
 
+_NODE_SEPS = ("::",)  # a pytest node id `dir/file.py::Class::name[param]`: its last segment follows its last `::`
+_DOTTED_SEPS = (".", "/", "\\")  # a unittest `module.Class.name`, or an expectation that holds no `::`
+_PATH_SEPS = ("/", "\\")  # a file path: a frame, a `file:line` expectation, a module ERROR id, a SKIPPED location
+
+
+def _bracket_before_last_segment(text: str, seps: tuple[str, ...]) -> bool:
+    """True when `text` has a `[` before its last separator (r13 HUB RULING, r12 adversary f2b4440f A1-A3, Dot 04ceb61).
+    Only a trailing `[...]` on the LAST segment is a parameter id; a `[` earlier sits in a class, file or directory name
+    set through globals(), or the text after it is a parameter id that holds the separator (`test_x[a::b]`), and those
+    two read the same (`TestA[x.py::test_y]`: class `TestA[x.py` and function `test_y]`, or a parameter id). Every
+    reader that cuts at the FIRST `[` (_empty_segment, _norm_path, _split_top, _segs, _node_name, _summary_readings) is
+    reached by an identity only after this check, so it is told which reading a text means only when there is one."""
+    j = text.find("[")
+    return j >= 0 and any(sep in text[j + 1:] for sep in seps)
+
+
+def _bracket_reason(what: str, text: str) -> _Reason:
+    return _Reason("cnc-bracket-before-last-segment", f"bracket: {what} {text[:60]!r} has a `[` before its last "
+                   "separator: a class, file or directory name may hold `[` (set through globals()), so where its "
+                   "segments end and its parameter id starts cannot be told")
+
+
+def _expectation_seps(text: str) -> tuple[str, ...]:
+    return _NODE_SEPS if "::" in text else _DOTTED_SEPS
+
+
+def _node_seps(node: str) -> tuple[str, ...]:
+    """A summary node `file.ext::name` is a node id; one with no `::` (a module-level ERROR) is a file path."""
+    return _NODE_SEPS if "::" in node else _PATH_SEPS
+
+
 def _empty_segment(text: str) -> bool:
     """True when an id has an empty segment (`a..b`, `a.`, `a::`, `::a`, `a//b`): nothing real prints one, so an
-    id with one is never matched, only refused. A leading `/` (an absolute path) is not an empty segment."""
+    id with one is never matched, only refused. A leading `/` (an absolute path) is not an empty segment. It reads only
+    the text before the first `[`; every caller first refuses a `[` before the last separator (r13, f2b4440f A3), so
+    every separator is in that text."""
     j = text.find("[")
     head = text if j < 0 else text[:j]
     dotted = "::" not in head  # `file.py::Class::name` names are not dotted; a unittest `module.Class.name` is
@@ -447,7 +487,8 @@ class Parsed:
 
 def _norm_path(text: str) -> list[str]:
     """Path segments of `text`. A trailing pytest parameter id (from the first `[`) stays inside the last
-    segment, so `/` and `\\` in it never split."""
+    segment, so `/` and `\\` in it never split. A path with a `[` before a later `/` or `\\` (a directory name holding
+    `[`) never gets here: _bracket_before_last_segment refuses it at the expectation, the node, the frame (r13)."""
     j = text.find("[")
     head, tail = (text, "") if j < 0 else (text[:j], text[j:])
     parts = [p for p in head.replace("\\", "/").split("/") if p and p != "."]
@@ -460,9 +501,11 @@ def _norm_path(text: str) -> list[str]:
 
 
 def _split_top(text: str, sep: str) -> list[str]:
-    """Split on `sep` before the pytest parameter id. A node's names are identifiers, so the FIRST `[`
-    starts the parameter id and it runs to the end of the text; whatever it holds (`]`, `::`, `/`, `.`,
-    unbalanced brackets) stays inside the last part. No bracket counting: user text cannot move a boundary."""
+    """Split on `sep` before the pytest parameter id, which starts at the FIRST `[` and runs to the end of the text;
+    whatever it holds (`]`, `/`, `.`, unbalanced brackets) stays inside the last part. A name may hold `[` (set through
+    globals()), so the first `[` is the parameter id only when no `sep` follows it: every identity reaches this split
+    only after _bracket_before_last_segment refused that (r13). A pytest section title (`Class.name[1.5]`) is the
+    runner's own heading of a node that passed that check, so a `.` after its `[` belongs to the parameter id."""
     j = text.find("[")
     head, tail = (text, "") if j < 0 else (text[:j], text[j:])
     parts = head.split(sep)
@@ -653,6 +696,8 @@ def _parse_unittest(lines: list[str]) -> list[Failure]:
         elif ids and any(ch in name for ch in "./\\:"):
             odd = _Reason("cnc-identity", f"separator in the method name {name[:40]!r}: its identity would split into "
                           "invented segments")
+        elif ids and _bracket_before_last_segment(full, _DOTTED_SEPS):  # r13 (f2b4440f A3: `t.T[x]..Oops.test_a`)
+            odd = _bracket_reason("the unittest identity", full)
         elif ids and (_empty_segment(full) or any(tok in full for tok in ("/", "\\", "::"))):
             odd = _Reason("cnc-identity", f"empty or foreign segment in the test identity {full[:60]!r}")
         # FAIL is only unittest's word for "failureException was raised", and a test may set that to any
@@ -794,14 +839,20 @@ def _other_line(word: str, line: str) -> tuple[int, str]:
         m = _SKIPPED_BODY.fullmatch(body)
         if not m:
             return 0, "a SKIPPED line that is not `SKIPPED [n] file:line: reason`"
-        if _empty_segment(body[m.end(1) + 2:].split(":", 1)[0]):
+        where = body[m.end(1) + 2:].split(":", 1)[0]
+        if _bracket_before_last_segment(where, _PATH_SEPS):  # r13: raised, so the bracket code is the primary one
+            raise _Unclassifiable("cnc-bracket-before-last-segment", _bracket_reason("the SKIPPED location", where))
+        if _empty_segment(where):
             return 0, "a SKIPPED line whose file path has an empty segment"
         return int(m[1]), ""
     if not _OTHER_NODE.fullmatch(body):
         return 0, f"a {word} line that is not `{word} <file>::<name>`"
     if word == "PASSED" and " - " in body:
         return 0, "a PASSED line holding ' - ' (a real one is `PASSED <id>` alone)"
-    if _empty_segment(body.split(" - ", 1)[0]):
+    node = body.split(" - ", 1)[0]
+    if _bracket_before_last_segment(node, _node_seps(node)):  # r13 (f2b4440f A3: `PASSED t.py::TestB[x]::test_x::[p]`)
+        raise _Unclassifiable("cnc-bracket-before-last-segment", _bracket_reason(f"the {word} id", node))
+    if _empty_segment(node):
         return 0, f"a {word} line whose id has an empty segment (`::::`, a trailing `::`, `//`): no such id exists"
     return 1, ""
 
@@ -910,8 +961,16 @@ def _parse_pytest(lines: list[str], stats: dict | None = None) -> list[Failure]:
                 stats["summary"] += 1
                 stats["bad"] = stats["bad"] or _unreadable_reading(word, line, readings)
                 line_no = stats["summary"]
+                # r13 HUB RULING (f2b4440f A1, A2, A3): a node with a `[` before its last `::` is COULD-NOT-CHECK. The one
+                # reading of a line is refused at once; a line with more than one reading is refused already (below), and
+                # one of its readings with such a `[` keeps every section from telling it (_node_name cannot say which
+                # heading that reading prints), so it stays COULD-NOT-CHECK.
+                bracketed = [r[0] for r in readings if _bracket_before_last_segment(r[0], _node_seps(r[0]))]
+                if bracketed and len(readings) == 1:
+                    raise _Unclassifiable("cnc-bracket-before-last-segment", _bracket_reason(f"the {word} node",
+                                                                                             bracketed[0]))
                 reading_names.extend((line_no, _node_name(r[0])) for r in readings)
-                if len(readings) > 1:
+                if len(readings) > 1 and not bracketed:
                     # r11: the run's own failure sections (they precede the summary, so `out` holds them) name their
                     # tests; a reading is told only when EXACTLY ONE of them is the account of a section, by its test
                     # name AND its file (r12, r11 pass 3 A1: a name alone may belong to another file's section).
@@ -1153,6 +1212,10 @@ def parse_run(text: str | list[str]) -> Parsed:
     stats: dict = {}
     ut = _parse_unittest(lines)
     failures = ut + _parse_pytest(lines, stats)
+    for f in failures:  # r13: a frame file is a path, and _norm_path cuts it at its first `[` (see _bracket_before_last_segment)
+        for file, _line in f.frames:
+            if _bracket_before_last_segment(file, _PATH_SEPS):
+                raise _Unclassifiable("cnc-bracket-before-last-segment", _bracket_reason("the frame file", file))
     last, result, bad = _last_result(lines), None, ""
     if last is not None:
         try:
@@ -1185,6 +1248,12 @@ def _precheck(lines: list[str] | None, expected: str) -> str:
         return _Reason("cnc-captured", "captured output in the run: the test's own text follows the divider and can say "
                        "anything")
     site = _EXPECT_SITE.match(expected)
+    # r13 HUB RULING (f2b4440f A2, Dot 04ceb61: `TestA[x].py::test_x[p]` lost its FILE kind at the first `[`): checked
+    # before the empty-segment check, which cuts at the first `[` too
+    if site and _bracket_before_last_segment(site["file"], _PATH_SEPS):
+        return _bracket_reason("the expected file path", site["file"])
+    if not site and _bracket_before_last_segment(expected, _expectation_seps(expected)):
+        return _bracket_reason("the expected test identity", expected)
     if site:
         _line_no(site["line"])
         if _empty_segment(site["file"]):  # r11 pass 2 A3: `a//t.py:2` lost its empty segment in _norm_path and matched

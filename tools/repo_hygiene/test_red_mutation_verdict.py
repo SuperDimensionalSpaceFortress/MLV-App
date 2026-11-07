@@ -264,7 +264,14 @@ class AdversaryR3Pass2(unittest.TestCase):
     def test_a4_separators_inside_a_parameter_id_stay_inside_it(self) -> None:
         src = "import pytest\n@pytest.mark.parametrize('x',[1],ids=['a::b/c'])\ndef test_x(x): assert False\n"
         out = _run_pytest({"test_memory.py": src})
-        self.assertEqual(rmv.verdict(out, "test_memory.py::test_x[a::b/c]")[0], rmv.PASS, out)
+        # r13 HUB RULING: a `::` inside the trailing brackets reads the same as a class `test_x[a` holding method `b/c]`
+        # (see SummarySplitR11.test_bracket_before_last_segment_is_could_not_check), so it is COULD-NOT-CHECK, never PASS
+        v = rmv.classify(out, "test_memory.py::test_x[a::b/c]")
+        self.assertEqual((v.status, v.code), (rmv.REFUSED, "cnc-bracket-before-last-segment"), out)
+        self.refused(out, "c]")
+        src = "import pytest\n@pytest.mark.parametrize('x',[1],ids=['a/b.c'])\ndef test_x(x): assert False\n"
+        out = _run_pytest({"test_memory.py": src})  # a `/` or `.` after the last `::` stays inside the parameter id
+        self.assertEqual(rmv.verdict(out, "test_memory.py::test_x[a/b.c]")[0], rmv.PASS, out)
         self.refused(out, "c]")
 
     def test_a5_class_level_collection_error_in_a_summary_blocks_pass(self) -> None:
@@ -1710,13 +1717,15 @@ class SummarySplitR11(unittest.TestCase):
                     v = rmv.classify(text, "t.py::TestA::test_target[x]")
                     want_code = "cnc-summary-split" if c.isascii() else "cnc-short-summary"
                     self.assertEqual((v.status, v.code), (rmv.REFUSED, want_code), v)
-        # controls: a parameter id holding ' - ' or '::', one cut after its `]`, stays readable
+        # controls: a parameter id holding ' - ', one cut after its `]`, stays readable
         for line, want in (("FAILED t.py::test_x[a - b] - assert 1 == 2", "t.py::test_x[a - b]"),
-                           ("FAILED t.py::test_x[p] - AssertionError: boom", "t.py::test_x[p]"),
-                           ("FAILED t.py::T::test_x[a::b] - assert 1 == 2", "t.py::T::test_x[a::b]")):
+                           ("FAILED t.py::test_x[p] - AssertionError: boom", "t.py::test_x[p]")):
             with self.subTest(line=line):
                 v = rmv.classify(self._run(line), want)
                 self.assertEqual((v.status, v.code), (rmv.PASS, "assertion-failed"), v)
+        # r13 HUB RULING: one holding '::' is no longer read (a `[` before the last `::`; `TestA[x.py::test_y]` reads alike)
+        v = rmv.classify(self._run("FAILED t.py::T::test_x[a::b] - assert 1 == 2"), "t.py::T::test_x[a::b]")
+        self.assertEqual((v.status, v.code), (rmv.REFUSED, "cnc-bracket-before-last-segment"), v)
 
     def test_r12_pass1_a2_bare_failed_is_an_assertion_head(self) -> None:
         # adversary r12 pass 1 A2 (d1ff9699, minor): pytest.fail() with no message prints a bare `Failed`
@@ -1728,6 +1737,75 @@ class SummarySplitR11(unittest.TestCase):
             with self.subTest(msg=msg):
                 self.assertEqual(rmv.classify(self._run(f"FAILED t.py::test_x - {msg}"), "t.py::test_x").status,
                                  rmv.REFUSED)
+
+    BRACKET = "cnc-bracket-before-last-segment"
+
+    def _bracket(self, text: str, expected: str) -> None:
+        v = rmv.classify(text, expected)
+        self.assertEqual((v.status, v.code), (rmv.REFUSED, self.BRACKET), v)
+
+    def test_bracket_before_last_segment_is_could_not_check(self) -> None:
+        # r13 HUB RULING (r12 adversary f2b4440f A1-A3, Dot 04ceb61): a class name set through globals() may hold `[`, so
+        # the FIRST `[` is not the start of the parameter id. Any id with a `[` before its last `::` (a pytest node), or
+        # before its last `.`/`/`/`\` (a dotted id, a path), is COULD-NOT-CHECK, on the expected side and the run side.
+        # A2 (Dot's two-file witness): class `TestA[x].py` in t.py is not FILE TestA[x].py
+        dot = self._run("FAILED t.py::TestA[x].py::test_x[p] - AssertionError: boom")
+        for expected in ("TestA[x].py::test_x[p]", "TestA[x]/TestB.py::test_x[p]", "t.py::TestA[x].py::test_x[p]",
+                         "test_x[p]"):  # the last one is a safe expectation: the RUN side refuses
+            with self.subTest(a2=expected):
+                self._bracket(dot, expected)
+        safe = self._run("FAILED t.py::test_x[p] - AssertionError: boom")
+        for expected in ("TestA[x].py::test_x[p]", "TestA[x]/TestB.py::test_x[p]", "t.py::TestB[x]::test_x::[p]",
+                         "TestA[x.py::test_y]", "t.T[x]..Oops.test_a", "a[x]/t.py:2", "a[x]\\t.py:2"):
+            with self.subTest(expected_side=expected):  # an unsafe expectation against a readable run
+                self._bracket(safe, expected)
+        # A2 sibling, an unbalanced `[` in a file or class name and a `]` in a function name: the same text as a
+        # parameter id holding `::`, so a `::` inside the trailing brackets cannot be told from a name boundary either
+        self._bracket(self._run("FAILED t.py::TestA[x.py::test_y] - AssertionError: boom"), "TestA[x.py::test_y]")
+        # A3: an empty segment after the class bracket, run side (pytest FAILED and each non-failure word, and unittest)
+        self._bracket(self._run("FAILED t.py::TestB[x]::test_x::[p] - AssertionError"), "t.py::TestB[x]::test_x::[p]")
+        self._bracket(self._run("FAILED t.py::TestB[x]::test_x::[p] - AssertionError"), "test_x[p]")
+        for word in ("PASSED", "XFAIL", "XPASS"):
+            count = {"PASSED": "1 passed", "XFAIL": "1 xfailed", "XPASS": "1 xpassed"}[word]
+            text = (f"=== short test summary info ===\n{word} t.py::TestB[x]::test_x::[p]\n"
+                    f"FAILED t.py::test_a - AssertionError\n=== 1 failed, {count} in 0.1s ===\n")
+            with self.subTest(word=word):
+                self._bracket(text, "t.py::test_a")
+        ut = ("F\n======================================================================\nFAIL: test_a (t.T[x]..Oops.test_a)\n"
+              "----------------------------------------------------------------------\nTraceback (most recent call last):\n"
+              '  File "t.py", line 4, in test_a\nAssertionError: 1 != 2\n\n'
+              "----------------------------------------------------------------------\nRan 1 test in 0.001s\n\n"
+              "FAILED (failures=1)\n")
+        self._bracket(ut, "t.py:4")
+        self._bracket(ut.replace("t.T[x]..Oops.test_a", "t.T[x].Oops.test_a"), "t.py:4")  # no empty segment: still `[`
+        # a frame in a directory whose name holds `[`: the path is split at its first `[` no more
+        frame = ("=== FAILURES ===\n___ test_x ___\nE   AssertionError: boom\na[x]/t.py:2: AssertionError\n"
+                 "=== short test summary info ===\nFAILED t.py::test_x - AssertionError: boom\n=== 1 failed in 0.1s ===\n")
+        self._bracket(frame, "t.py::test_x")
+        self._bracket(self._run("ERROR a[x]/t.py - ValueError: boom"), "t.py::test_x")  # a module id is a path
+        # A1: the competing node `u.py::TestA[x]::test_target[p]` (its section prints `TestA[x].test_target[p]`)
+        a1 = ("=== FAILURES ===\n___ TestA[x].test_target[p] - AssertionError: x.test_x ___\nE TypeError: boom\n"
+              "t.py:2: TypeError\n___ TestA[x].test_target[p] ___\nE AssertionError\nt.py:8: AssertionError\n"
+              "=== short test summary info ===\n"
+              "FAILED t.py::TestA[x].test_target[p] - AssertionError: x::test_x - TypeError: boom\n"
+              "FAILED u.py::TestA[x]::test_target[p] - AssertionError\n=== 2 failed in 0.04s ===\n")
+        self._bracket(a1, "t.py::TestA[x].test_target[p]")
+
+    def test_bracket_only_in_the_trailing_parameter_id_stays_readable(self) -> None:
+        # r13 controls: a `[` after the last separator is the last segment's parameter id, whatever it holds but `::`
+        for line, want in (("FAILED t.py::test_x[p] - AssertionError: boom", "t.py::test_x[p]"),
+                           ("FAILED t.py::TestA::test_x[a[b]] - AssertionError: boom", "t.py::TestA::test_x[a[b]]"),
+                           ("FAILED t.py::test_x[a/b] - AssertionError: boom", "t.py::test_x[a/b]"),
+                           ("FAILED t.py::TestA::test_x[1.5] - AssertionError: boom", "t.py::TestA::test_x[1.5]"),
+                           ("FAILED d/t.py::TestA::test_x[a.b\\c] - AssertionError: boom", "TestA::test_x[a.b\\c]")):
+            with self.subTest(line=line):
+                v = rmv.classify(self._run(line), want)
+                self.assertEqual((v.status, v.code), (rmv.PASS, "assertion-failed"), v)
+        section = ("=== FAILURES ===\n___ TestA.test_x[1.5] ___\nE   AssertionError: boom\nt.py:3: AssertionError\n"
+                   "=== short test summary info ===\nFAILED t.py::TestA::test_x[1.5] - AssertionError: boom\n"
+                   "=== 1 failed in 0.1s ===\n")  # a section title is pytest's own heading: a `.` in its param is read
+        v = rmv.classify(section, "t.py::TestA::test_x[1.5]")
+        self.assertEqual((v.status, v.code), (rmv.PASS, "assertion-failed"), v)
 
 
 class ReasonCodeR11(unittest.TestCase):
