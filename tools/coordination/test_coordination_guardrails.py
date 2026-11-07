@@ -2331,6 +2331,79 @@ def test_r3c_adv_a3_prompt_length_is_counted_in_code_points_not_utf16_units(tmp_
     assert "-PromptChars (Get-LaneCodePointCount -Text ([string]$Prompt))" in LANE_RUNNER.read_text(encoding="utf-8")
 
 
+R4_PROSE = "x" * 130 + "\n"
+# (verdict value as JSON text, expected refusal reason). Null, absent and blank keep the historical reason; any
+# other non-String kind is named, so the receipt says WHAT the model wrote instead of a verdict.
+R4_VERDICT_KINDS = [
+    ("[]", "codex-verdict-wrong-kind-Array"),
+    ('["APPROVE"]', "codex-verdict-wrong-kind-Array"),
+    ("{}", "codex-verdict-wrong-kind-Object"),
+    ('{"a":"APPROVE"}', "codex-verdict-wrong-kind-Object"),
+    ("true", "codex-verdict-wrong-kind-Boolean"),
+    ("false", "codex-verdict-wrong-kind-Boolean"),
+    ("1", "codex-verdict-wrong-kind-Number"),
+    ("1.5", "codex-verdict-wrong-kind-Number"),
+    ("1e999", "codex-verdict-wrong-kind-Number"),
+    ("null", "codex-no-verdict"),
+    ('""', "codex-no-verdict"),
+    ('"   "', "codex-no-verdict"),
+]
+
+
+def test_r4_dot_p2_a_verdict_of_a_non_string_kind_is_never_positive_evidence(tmp_path):
+    # Dot P2 on 45ef9f60: a final {"verdict":[]} was projected through GetRawText() to the nonblank string "[]", so
+    # the consumer booked workCompleted=true. A contract-bearing key keeps its JSON kind: verdict is a String.
+    for val, reason in R4_VERDICT_KINDS:
+        body = '{"verdict":%s,"reviewer":"sol"}' % val
+        for wrap in ("%s\n", "```json\n%s\n```\n"):
+            r = _work_evidence(tmp_path, "codex", R4_PROSE + wrap % body, 0, prompt_chars=600, require_verdict=True)
+            assert r["workCompleted"] is False and r["reason"] == reason, (val, wrap, r)
+    # the kind is judged on the LAST duplicate key, as ConvertFrom-LaneJsonObject has always resolved it
+    r = _work_evidence(tmp_path, "codex", R4_PROSE + '{"verdict":"APPROVE","verdict":[]}\n', 0, prompt_chars=600, require_verdict=True)
+    assert r["workCompleted"] is False and r["reason"] == "codex-verdict-wrong-kind-Array", r
+    # a non-string verdict in the FINAL object is not rescued by a provisional String verdict before it
+    r = _work_evidence(tmp_path, "codex", R4_PROSE + '```json\n{"verdict":"APPROVE"}\n```\n{"verdict":{}}\n', 0, prompt_chars=600, require_verdict=True)
+    assert r["workCompleted"] is False and r["reason"] == "codex-verdict-wrong-kind-Object", r
+
+
+def test_r4_dot_p2_controls_a_string_verdict_with_unrelated_nested_metadata_still_completes(tmp_path):
+    for body in (KEY_FINAL_JSON,
+                 '{"verdict":"CHANGES_REQUESTED","findings":[{"id":1,"detail":{"k":[]}}],"meta":{},"empty":[],"n":null,"b":true,"x":1.5}',
+                 '{\n  "verdict": "APPROVE",\n  "findings": [],\n  "metadata": {"a": {}, "b": []}\n}'):
+        for wrap in ("%s\n", "```json\n%s\n```\n"):
+            r = _work_evidence(tmp_path, "codex", R4_PROSE + wrap % body, 0, prompt_chars=600, require_verdict=True)
+            assert r["workCompleted"] is True and r["reason"] is None, (body, wrap, r)
+    # a String that merely LOOKS like another kind is still a String (the contract is the JSON kind)
+    r = _work_evidence(tmp_path, "codex", R4_PROSE + '{"verdict":"[]"}\n', 0, prompt_chars=600, require_verdict=True)
+    assert r["workCompleted"] is True, r
+
+
+def test_r4_dot_p2_the_contract_names_the_allowed_json_kind_per_field_in_code():
+    src = REFUSAL_HELPER.read_text(encoding="utf-8")
+    assert "$script:LANE_JSON_CONTRACT" in src
+    for field in ("verdict", "type", "subtype", "terminal_reason", "result", "is_error", "api_error_status"):
+        assert re.search(r"(?m)^\s*%s\s*=\s*@\('[A-Za-z']+" % field, src), field
+    # no projection of a nested JSON element into raw text remains in the object builder
+    builder = src[src.index("function ConvertFrom-LaneJsonObject"):src.index("function Test-LaneJsonScalar")]
+    assert "default  { $v = $e.GetRawText() }" not in builder
+    assert "-NotePropertyValue $v" in builder
+
+
+def test_r4_dot_p2_claude_envelope_fields_of_the_wrong_kind_are_not_completion_evidence(tmp_path):
+    # the same class on the claude side: subtype / terminal_reason / result keep their kind too
+    for env in ('{"type":"result","subtype":["success"],"is_error":false,"result":"ok"}\n',
+                '{"type":"result","subtype":{},"is_error":false,"result":"ok"}\n',
+                '{"type":"result","subtype":"success","is_error":false,"terminal_reason":["completed"],"result":"ok"}\n',
+                '{"type":"result","subtype":"success","is_error":"false","result":"ok"}\n'):
+        r = _work_evidence(tmp_path, "claude", env, 0)
+        assert r["workCompleted"] is False, (env, r)
+    ok = '{"type":"result","subtype":"success","is_error":false,"terminal_reason":"completed","result":"ok","meta":{"a":[]}}\n'
+    assert _work_evidence(tmp_path, "claude", ok, 0)["workCompleted"] is True
+    # an array-typed result text never feeds the refusal vocabulary
+    env = '{"type":"result","subtype":"success","is_error":true,"api_error_status":null,"result":["You\'ve hit your session limit."]}\n'
+    assert _classify(tmp_path, "", "claude", answer=env) is None
+
+
 def test_r3c_a4_an_array_typed_result_line_is_not_the_envelope_and_hides_no_refusal(tmp_path):
     diag = '{"type":["result"],"subtype":"success","is_error":false}\n'
     r = _work_evidence(tmp_path, "claude", diag, 0)
