@@ -35,7 +35,8 @@ void debayer_reduced_hchroma121_rgb16(uint16_t *out, const uint16_t *in, int w, 
 /* CPU-DUALISO-REDUCED-RECON-H2C-PORT-1 r10: the x4 route's edge chroma. rgb holds
  * debayerBasicU16's output for bayer (RGGB, R at (even row, even col), bayer already
  * bit-shifted by that call). G is left as it is. R and B are rebuilt from a
- * gradient-directed Hamilton-Adams G and a bilinear colour-difference interpolation,
+ * gradient-directed Hamilton-Adams G (each direction clamped to its two G neighbours,
+ * r11) and a bilinear colour-difference interpolation,
  * both in a balanced domain where R ~ aR * G + cR and B ~ aB * G + cB (a least-squares
  * fit per frame against the 4 G neighbours of every second R or B row; a degenerate
  * fit falls back to a = 1, c = 0), and the colour difference is laid on the bilinear G:

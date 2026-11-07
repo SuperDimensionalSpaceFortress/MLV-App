@@ -645,8 +645,12 @@ static inline float debayer_hacd_site(const uint16_t *row, const uint16_t *u1, c
     const float lh = 2.0f * c - l2 - r2;
     const float lv = 2.0f * c - HACD_BAL(u2[x]) - HACD_BAL(d2[x]);
 #undef HACD_BAL
-    const float gh = 0.5f * (l1 + r1) + 0.25f * lh;
-    const float gv = 0.5f * (up1 + dn1) + 0.25f * lv;
+    /* r11: each directional G is clamped to its two G neighbours. Unclamped, the Laplacian of a colour
+     * whose difference to G is not constant (a saturated colour edge, or the a = 1, c = 0 fallback on a
+     * gained raw) pushed G past both neighbours and put more false colour on the edge than the bilinear
+     * (run dir sim_r11b.py / sim_r11c.py: red disc on blue 1.143x, fallback diagonal step 1.125x). */
+    const float gh = fminf(fmaxf(0.5f * (l1 + r1) + 0.25f * lh, fminf(l1, r1)), fmaxf(l1, r1));
+    const float gv = fminf(fmaxf(0.5f * (up1 + dn1) + 0.25f * lv, fminf(up1, dn1)), fmaxf(up1, dn1));
     const float dh = fabsf(l1 - r1) + fabsf(lh);
     const float dv = fabsf(up1 - dn1) + fabsf(lv);
     float gg = (dh < dv) ? gh : (dv < dh) ? gv : 0.5f * (gh + gv);
