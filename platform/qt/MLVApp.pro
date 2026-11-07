@@ -391,6 +391,7 @@ HEADERS += MainWindow.h \
            PlaybackRoutePrewarmPolicy.h \
            PlaybackRouteStagedSlotPolicy.h \
            PlaybackReconWarmRunPolicy.h \
+           ResizeStillDrawingWait.h \
            PlaybackReconWarmRun.h \
            PlaybackGpuClockKickPolicy.h \
            PlaybackAudioGate.h \

@@ -24,6 +24,7 @@
 #include "PlaybackPrepPresentationPolicy.h"
 #include "VisualCaptureSourceDifference.h"
 #include "ClipOpenAbortPolicy.h"
+#include "ResizeStillDrawingWait.h"
 #include "debug/StageTiming.h"
 extern "C" {
 #include "../../src/mlv/pipeline_stage_capture.h"
@@ -3134,6 +3135,32 @@ void MainWindow::timerEvent(QTimerEvent *t)
     }
 }
 
+// GUI-SMOKE-FOREGROUND-HANG-NOLA-1: resizeEvent's wait for the frame in flight, bounded (ResizeStillDrawingWait.h). It
+// used to be `while( m_frameStillDrawing ) qApp->processEvents();`: a stale-true flag (nothing left in flight to clear
+// it) pumped the GUI thread forever after the smoke runner's showFullScreen() resize. A flag still set while the render
+// thread has stayed idle for the grace window is stale and is cleared; a busy render thread is waited on up to the
+// deadline, then the redraw proceeds. One always-on line whenever it actually waited.
+void MainWindow::waitForResizeStillDrawing( const QString &site )
+{
+    QElapsedTimer clock;
+    clock.start();
+    resize_still_drawing_wait::Callbacks callbacks;
+    callbacks.stillDrawing = [this]() { return m_frameStillDrawing; };
+    callbacks.renderIdle = [this]() { return !renderThreadBusyForPlaybackAdvance( currentPlaybackAdvanceTarget() ); };
+    callbacks.pump = []() { qApp->processEvents(); };
+    callbacks.clearStale = [this]() { m_frameStillDrawing = false; };
+    callbacks.nowMs = [&clock]() { return static_cast<std::int64_t>( clock.elapsed() ); };
+    const resize_still_drawing_wait::Result result = resize_still_drawing_wait::wait( callbacks );
+    if( result.outcome == resize_still_drawing_wait::Outcome::NotWaiting ) return;
+    logInteractionEvent(
+        QStringLiteral("resize.still_drawing_wait"),
+        QStringLiteral("outcome=%1 waited_ms=%2 site=%3 render_idle=%4")
+            .arg( QLatin1String( resize_still_drawing_wait::outcomeName( result.outcome ) ) )
+            .arg( static_cast<qlonglong>( result.waitedMs ) )
+            .arg( site )
+            .arg( bool01( result.renderIdle ) ) );
+}
+
 //Window resized -> scale picture
 void MainWindow::resizeEvent(QResizeEvent *event)
 {
@@ -3172,11 +3199,11 @@ void MainWindow::resizeEvent(QResizeEvent *event)
             m_pRenderThread->lock();
             m_pRenderThread->unlock();
         }
-        while( m_frameStillDrawing ) qApp->processEvents();
+        waitForResizeStillDrawing( QStringLiteral("resize") );
         drawFrame();
         if( ui->checkBoxGradientEnable->isChecked() && ui->groupBoxLinearGradient->isChecked() )
         {
-            while( m_frameStillDrawing ) qApp->processEvents();
+            waitForResizeStillDrawing( QStringLiteral("gradient") );
             m_pGradientElement->redrawGradientElement( m_pScene->width(),
                                                        m_pScene->height(),
                                                        getMlvWidth( m_pMlvObject ),

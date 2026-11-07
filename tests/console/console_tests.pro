@@ -162,6 +162,7 @@ HEADERS += \
     $$REPO_ROOT/platform/qt/PlaybackRoutePrewarmPolicy.h \
     $$REPO_ROOT/platform/qt/PlaybackRouteStagedSlotPolicy.h \
     $$REPO_ROOT/platform/qt/PlaybackReconWarmRunPolicy.h \
+    $$REPO_ROOT/platform/qt/ResizeStillDrawingWait.h \
     $$REPO_ROOT/platform/qt/PlaybackGpuClockKickPolicy.h \
     $$REPO_ROOT/platform/qt/GpuTexturePresentAvailabilityPolicy.h \
     $$REPO_ROOT/platform/qt/DisplayDeviceMapping.h \
