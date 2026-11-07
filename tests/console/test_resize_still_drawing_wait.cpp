@@ -207,6 +207,46 @@ TEST(ResizeStillDrawingWait, APumpThatOutlastsTheDeadlineEndsTheWaitWithoutAnoth
     ASSERT_EQ(static_cast<std::int64_t>(10000), result.waitedMs);
 }
 
+// adversary r1 pass 3 A2: renderIdle() reaches the renderer mutex (RenderFrameThread::isIdle), so it can block. The
+// deadline must be judged on a clock sampled AFTER it, or a pump runs past 2000 ms: pump 1 returns at 1999, renderIdle
+// blocks to 2003 and reports busy; the wait must end Timeout with no second pump.
+TEST(ResizeStillDrawingWait, ARenderIdleThatBlocksPastTheDeadlineEndsTheWaitWithoutAnotherPump)
+{
+    FakeWorld world;
+    Callbacks c = world.callbacks();
+    c.pump = [&world]() { ++world.pumps; world.nowMs += 1999; };
+    c.renderIdle = [&world]() {
+        ++world.renderIdleCalls;
+        if (world.nowMs - 1000 == 1999) world.nowMs += 4; // blocked on the renderer mutex 1999 -> 2003
+        return false;
+    };
+    const Result result = wait(c);
+    ASSERT_TRUE(result.outcome == Outcome::Timeout);
+    ASSERT_EQ(1, world.pumps);
+    ASSERT_EQ(1, result.pumps);
+    ASSERT_EQ(0, world.clearStaleCalls);
+    ASSERT_EQ(static_cast<std::int64_t>(2003), result.waitedMs);
+}
+
+// adversary r1 pass 3 A2, same class on the stale grace: time spent blocked inside renderIdle() is time the render
+// thread held its mutex (busy), so the idle run starts when the sample RETURNS, not before it. renderIdle blocks 100 ms
+// on its first call and then reports idle; the grace must still be a full 50 ms measured from that return.
+TEST(ResizeStillDrawingWait, TimeBlockedInsideRenderIdleIsNotCountedAsIdleGrace)
+{
+    FakeWorld world;
+    Callbacks c = world.callbacks();
+    c.renderIdle = [&world]() {
+        if (world.renderIdleCalls++ == 0) world.nowMs += 100;
+        return true;
+    };
+    const Result result = wait(c);
+    ASSERT_TRUE(result.outcome == Outcome::StaleCleared);
+    ASSERT_EQ(1, world.clearStaleCalls);
+    // pump 1 returns at t=5, the first sample returns at t=105: stale no earlier than t=155
+    ASSERT_TRUE(result.waitedMs >= 105 + kStaleIdleGraceMs);
+    ASSERT_TRUE(result.waitedMs <= 105 + kStaleIdleGraceMs + world.stepMs);
+}
+
 // adversary r1 re-pass A1: a handler the pump dispatches (Updater::getReleaseList's processEvents() loop) can run its
 // own unfiltered nested loop, which admits Ctrl+I's modal dialog: no synchronous pump can bound that. The contract is
 // therefore stated as what it is (zero pumps after the deadline; one pump's duration is the caller's), never as
@@ -299,11 +339,16 @@ TEST(ResizeStillDrawingWaitWiring, AGradientSiteTimeoutDefersTheRedrawToTheLande
     ASSERT_TRUE(gradientIf >= 0);
     const QString tail = body.mid(gradientIf);
     const int redrawAt = tail.indexOf(QStringLiteral("m_pGradientElement->redrawGradientElement("));
-    const int elseAt = tail.indexOf(QStringLiteral("else"));
     const int deferAt = tail.indexOf(QStringLiteral("m_zoomModeChanged = true;"));
     ASSERT_TRUE(redrawAt > 0);
-    ASSERT_TRUE(elseAt > redrawAt);
-    ASSERT_TRUE(deferAt > elseAt);
+    ASSERT_TRUE(deferAt > redrawAt);
+    // adversary r1 pass 3 A1: StaleCleared (and Cleared) can return while a Ready frame is published but frameReady has
+    // not been emitted yet (isIdle ignores Ready slots), so no outcome proves the scene is final. The re-anchor on the
+    // landed frame is armed on EVERY outcome, after the wait and the immediate redraw: never inside an else (Timeout
+    // only), never before the wait (a frame landing inside a pump would consume it early).
+    ASSERT_FALSE(tail.left(deferAt).contains(QStringLiteral("else")));
+    const QString gradientBlock = tail.left(tail.indexOf(QStringLiteral("event->accept();")));
+    ASSERT_EQ(1, gradientBlock.count(QStringLiteral("m_zoomModeChanged = true;")));
 
     // the frame-ready path still consumes the flag with a gradient redraw on the landed scene
     const QString finish = functionBody(source,
