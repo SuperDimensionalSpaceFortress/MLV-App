@@ -1273,9 +1273,14 @@ bool RenderFrameThread::isIdle()
 
 // GUI-SMOKE-FOREGROUND-HANG-NOLA-1 (adversary r3 pass 3 A1): the resize wait's sample. Never waits for m_mutex: held means
 // busy (resize_still_drawing_wait::probeIdleWithoutWaiting).
-bool RenderFrameThread::isIdleNoWait()
+// adversary r4 pass 2 A1: epochOut is written inside the critical section, so the epoch and the idle decision are one
+// observation (work starts bump the epoch under m_mutex).
+bool RenderFrameThread::isIdleNoWait( uint64_t *epochOut )
 {
-    return resize_still_drawing_wait::probeIdleWithoutWaiting( m_mutex, [this]() { return isIdleLocked(); } );
+    return resize_still_drawing_wait::probeIdleWithoutWaiting( m_mutex, [&]() {
+        if( epochOut ) *epochOut = busyEpoch();
+        return isIdleLocked();
+    } );
 }
 
 bool RenderFrameThread::isIdleLocked( void ) const
@@ -1291,9 +1296,11 @@ bool RenderFrameThread::isIdleExceptPlaybackLookahead( int activePlaybackTarget,
 }
 
 bool RenderFrameThread::isIdleExceptPlaybackLookaheadNoWait( int activePlaybackTarget,
-                                                             uint64_t activeGeneration )
+                                                             uint64_t activeGeneration,
+                                                             uint64_t *epochOut )
 {
     return resize_still_drawing_wait::probeIdleWithoutWaiting( m_mutex, [&]() {
+        if( epochOut ) *epochOut = busyEpoch();
         return isIdleExceptPlaybackLookaheadLocked( activePlaybackTarget, activeGeneration );
     } );
 }

@@ -2886,16 +2886,18 @@ bool MainWindow::renderThreadBusyForPlaybackAdvance( int activePlaybackTarget )
 // GUI-SMOKE-FOREGROUND-HANG-NOLA-1 (adversary r3 pass 3 A1): the resize wait's renderIdle() sample. The same decision as
 // !renderThreadBusyForPlaybackAdvance(), but it never waits for the renderer mutex: a held mutex is busy at once, so a
 // hold of any length ends the idle run and no duration threshold exists. Every other caller keeps the blocking read.
-bool MainWindow::renderThreadIdleNoWait( int activePlaybackTarget )
+// epochOut receives the renderer's busy epoch from inside the same critical section (adversary r4 pass 2 A1).
+bool MainWindow::renderThreadIdleNoWait( int activePlaybackTarget, std::uint64_t *epochOut )
 {
     if( !m_pRenderThread ) return true;
     if( ui->actionPlay->isChecked() && playbackRenderLookaheadFrames() > 0 )
     {
         return m_pRenderThread->isIdleExceptPlaybackLookaheadNoWait(
             activePlaybackTarget,
-            m_playbackPresentationGeneration.load( std::memory_order_acquire ) );
+            m_playbackPresentationGeneration.load( std::memory_order_acquire ),
+            epochOut );
     }
-    return m_pRenderThread->isIdleNoWait();
+    return m_pRenderThread->isIdleNoWait( epochOut );
 }
 
 // adversary r4 A1 (probe-to-clear): the resize wait's stale clear. renderThreadIdleNoWait's decision, re-taken while the
@@ -3183,11 +3185,12 @@ bool MainWindow::waitForResizeStillDrawing( const QString &site )
     clock.start();
     resize_still_drawing_wait::Callbacks callbacks;
     callbacks.stillDrawing = [this]() { return m_frameStillDrawing; };
-    callbacks.renderIdle = [this]() { return renderThreadIdleNoWait( currentPlaybackAdvanceTarget() ); };
+    std::uint64_t sampledEpoch = 0; // written by each sample inside the renderer's critical section (r4 pass 2 A1)
+    callbacks.renderIdle = [this, &sampledEpoch]() { return renderThreadIdleNoWait( currentPlaybackAdvanceTarget(), &sampledEpoch ); };
     callbacks.pump = []() { qApp->processEvents( QEventLoop::ExcludeUserInputEvents ); };
     // adversary r4 A1: work that starts and ends between two samples changes the epoch; the clear is confirmed under the
     // renderer mutex at the run's epoch, so work that starts after the last sample is never cleared over
-    callbacks.busyEpoch = [this]() -> std::uint64_t { return m_pRenderThread ? m_pRenderThread->busyEpoch() : 0; };
+    callbacks.busyEpoch = [&sampledEpoch]() { return sampledEpoch; };
     callbacks.clearStale = [this]( std::uint64_t epoch ) { return clearStaleStillDrawingIfIdle( currentPlaybackAdvanceTarget(), epoch ); };
     callbacks.nowMs = [&clock]() { return static_cast<std::int64_t>( clock.elapsed() ); };
     // adversary r3 pass 2 A1: a renderer-mutex hold shorter than one millisecond tick must still be seen

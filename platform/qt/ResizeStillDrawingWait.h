@@ -48,8 +48,9 @@ struct Callbacks
 {
     std::function<bool()> stillDrawing;
     std::function<bool()> renderIdle; // never waits for the renderer mutex (probeIdleWithoutWaiting)
-    // adversary r4 A1: a monotonic count of renderer work starts, read right after each renderIdle() sample (optional;
-    // unset = constant). Work that starts and ends between two idle samples changes it, and that ends the run.
+    // adversary r4 A1: a monotonic count of renderer work starts AS OBSERVED BY the last renderIdle() sample, atomically
+    // with its idle decision (pass 2 A1; optional, unset = constant). Work that starts and ends between two idle samples
+    // changes it, and that ends the run.
     std::function<std::uint64_t()> busyEpoch;
     std::function<void()> pump;
     // adversary r4 A1: confirm-and-clear. Clears the flag only if the renderer is idle NOW and its busy epoch still
@@ -133,14 +134,15 @@ inline Result wait( const Callbacks &callbacks )
         }
 
         result.renderIdle = callbacks.renderIdle();
-        // Read AFTER the idle sample: work that started before it (and possibly ended) has already bumped the epoch, and
-        // work that starts between the two reads only makes the run restart (conservative).
+        // The epoch the sample observed ATOMICALLY with its idle decision (adversary r4 pass 2 A1): the caller records it
+        // inside the probe's critical section and busyEpoch() returns that record, never a live read, so work starting
+        // after the sample can never become the run's baseline.
         const std::uint64_t epoch = callbacks.busyEpoch ? callbacks.busyEpoch() : 0;
         // adversary r1 pass 3 A2: both the stale grace and the deadline are judged on a clock sampled after renderIdle()
         // returns (it no longer waits for the renderer mutex, but its time is still never left unjudged). Nothing runs
         // between this sample and the next pump.
         const std::int64_t sampledUs = clockUs();
-        const std::int64_t waitedUs = sampledUs - startUs;
+        std::int64_t waitedUs = sampledUs - startUs;
         result.waitedMs = waitedUs / 1000;
         if( !result.renderIdle )
         {
@@ -173,6 +175,10 @@ inline Result wait( const Callbacks &callbacks )
             }
             result.renderIdle = false;
             idleRun = false;
+            // adversary r4 pass 2 A2: the confirmation can take time, so the deadline is judged on a clock read after it
+            // (no pump ever starts past the deadline).
+            waitedUs = clockUs() - startUs;
+            result.waitedMs = waitedUs / 1000;
         }
         if( waitedUs >= kDeadlineMs * 1000 )
         {

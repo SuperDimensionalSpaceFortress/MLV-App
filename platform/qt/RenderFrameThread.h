@@ -397,9 +397,12 @@ public:
     /* GUI-SMOKE-FOREGROUND-HANG-NOLA-1 (adversary r3 pass 3 A1): isIdle() and isIdleExceptPlaybackLookahead() for the
      * resize wait's sample. They never wait for m_mutex: a mutex someone holds reports busy at once
      * (resize_still_drawing_wait::probeIdleWithoutWaiting). Every other caller keeps the blocking reads above. */
-    bool isIdleNoWait( void );
+    /* epochOut (optional) receives busyEpoch() inside the same critical section as the idle decision (adversary r4
+     * pass 2 A1); it is untouched when the mutex is held (busy). */
+    bool isIdleNoWait( uint64_t *epochOut = nullptr );
     bool isIdleExceptPlaybackLookaheadNoWait( int activePlaybackTarget,
-                                              uint64_t activeGeneration );
+                                              uint64_t activeGeneration,
+                                              uint64_t *epochOut = nullptr );
     /* adversary r4 A1: a monotonic count of starts of pipeline work (a render request, a warm run starting, a slot
      * entering a busy state, a render starting). Two equal reads around an idle sample prove no work started between. */
     uint64_t busyEpoch( void ) const;

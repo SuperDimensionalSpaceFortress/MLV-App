@@ -1260,7 +1260,7 @@ private:
     int playbackRenderLookaheadFrames() const;
     int currentPlaybackAdvanceTarget();
     bool renderThreadBusyForPlaybackAdvance( int activePlaybackTarget );
-    bool renderThreadIdleNoWait( int activePlaybackTarget );
+    bool renderThreadIdleNoWait( int activePlaybackTarget, uint64_t *epochOut );
     bool clearStaleStillDrawingIfIdle( int activePlaybackTarget, uint64_t epoch );
     bool waitForResizeStillDrawing( const QString &site );
     bool m_automationPacingIsolated = false;
