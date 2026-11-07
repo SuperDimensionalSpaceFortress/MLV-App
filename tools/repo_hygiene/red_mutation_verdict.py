@@ -1037,9 +1037,13 @@ def main(argv: list[str] | None = None) -> int:
             pass
     if args.cmd == "verdict":
         try:
-            text = Path(args.output).read_text(encoding="utf-8", errors="replace")
-        except OSError as exc:
-            print(f"cannot read --output {args.output!r}: {type(exc).__name__}: {exc.strerror or exc}", file=sys.stderr)
+            # newline="": no newline translation, so _frame sees the saved file's own line ends (a lone CR included;
+            # read_text() would turn it into LF first: r9 adversary A1).
+            with Path(args.output).open(encoding="utf-8", errors="replace", newline="") as fh:
+                text = fh.read()
+        except (OSError, ValueError) as exc:  # ValueError: a path holding NUL (r9 adversary A2)
+            print(f"cannot read --output {args.output!r}: {type(exc).__name__}: {getattr(exc, 'strerror', None) or exc}",
+                  file=sys.stderr)
             return 2
         status, reason = verdict(text, args.expect)
     else:

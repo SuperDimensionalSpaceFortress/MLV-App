@@ -30,9 +30,14 @@ def _run_unittest(files: dict[str, str], target: str) -> str:
     with tempfile.TemporaryDirectory() as tmp:
         for name, text in files.items():
             Path(tmp, name).write_text(text, encoding="utf-8", newline="\n")
-        proc = subprocess.run([sys.executable, "-m", "unittest", target], cwd=tmp, text=True,
-                              encoding="utf-8", errors="replace", capture_output=True, timeout=120)
-    return proc.stdout + proc.stderr
+        proc = subprocess.run([sys.executable, "-m", "unittest", target], cwd=tmp, capture_output=True, timeout=120)
+    return _raw_text(proc)
+
+
+def _raw_text(proc: subprocess.CompletedProcess) -> str:
+    """stdout + stderr decoded WITHOUT newline translation (r9 adversary A1 sibling): the text a saved file of the run
+    holds, so verdict() frames the runner's own line ends (CRLF on Windows)."""
+    return (proc.stdout + proc.stderr).decode("utf-8", errors="replace")
 
 
 class VerdictOnRealRuns(unittest.TestCase):
@@ -140,9 +145,9 @@ def _run_pytest(files: dict[str, str], *args: str, columns: int = 80, ci: bool =
         for name, text in files.items():
             Path(tmp, name).parent.mkdir(parents=True, exist_ok=True)
             Path(tmp, name).write_text(text, encoding="utf-8", newline="\n")
-        proc = subprocess.run([sys.executable, "-m", "pytest", "-p", "no:cacheprovider", *args], cwd=tmp, text=True,
-                              encoding="utf-8", errors="replace", capture_output=True, timeout=120, env=env)
-    return proc.stdout + proc.stderr
+        proc = subprocess.run([sys.executable, "-m", "pytest", "-p", "no:cacheprovider", *args], cwd=tmp,
+                              capture_output=True, timeout=120, env=env)
+    return _raw_text(proc)
 
 
 class AdversaryR3(unittest.TestCase):
@@ -325,10 +330,10 @@ class NarrowedPromiseR4(unittest.TestCase):
         src = "import unittest\nclass T(unittest.TestCase):\n def test_x(self):\n  print('hello')\n  self.assertEqual(1, 2)\n"
         with tempfile.TemporaryDirectory() as tmp:
             Path(tmp, "test_buf.py").write_text(src, encoding="utf-8")
-            proc = subprocess.run([sys.executable, "-m", "unittest", "-b", "test_buf"], cwd=tmp, text=True,
+            proc = subprocess.run([sys.executable, "-m", "unittest", "-b", "test_buf"], cwd=tmp,
                                   capture_output=True, timeout=120)
-        self.assertIn("Stdout:", proc.stderr)
-        self.cnc(proc.stdout + proc.stderr, "test_buf.T.test_x", "captured")
+        self.assertIn(b"Stdout:", proc.stderr)
+        self.cnc(_raw_text(proc), "test_buf.T.test_x", "captured")
 
     def test_a3_oversize_cli_number_is_a_typed_refusal_in_every_position(self) -> None:
         big = str(10 ** 400)
@@ -811,7 +816,7 @@ class VerdictOnText(unittest.TestCase):
     def _cut_before_second_section(self, out: str) -> str:
         """A -rN log whose tail was lost: everything from the second FAILURES section on (the import failure, the
         result bar) is gone, so the text still holds a readable assertion failure and nothing that closes the run."""
-        marks = [m.start() for m in re.finditer(r"^_{3,} test_\w+ _{3,}$", out, re.M)]
+        marks = [m.start() for m in re.finditer(r"^_{3,} test_\w+ _{3,}\r?$", out, re.M)]  # the run's own CRLF on Windows
         self.assertGreaterEqual(len(marks), 2, out)
         return out[:marks[1]]
 
