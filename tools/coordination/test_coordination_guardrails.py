@@ -1077,6 +1077,572 @@ def test_invoke_lane_error_mode_pin_catches_each_launch_ahead_of_the_block(tmp_p
     assert false_alarms == {}, "a comment, a string or a function definition is not a launch"
 
 
+# --- LANE-CHILD-LOADER-DIALOG-CODEX-SANDBOX-1: the codex lane's children must find the MinGW runtime DLLs ----------
+# MEASURED 2026-11-06 (System log, source 'Application Popup'): green2.exe 09:56:51Z and red.exe 09:57:28Z raised "libstdc++-6.dll / libgcc_s_seh-1.dll was
+# not found" on the owner's desktop AFTER the error-mode fix above merged. The codex sandbox's spawn does not carry that mode to the commands it runs, so the
+# mode cannot be the only defence. The lane's environment now also ends in the MinGW bin directory, so a MinGW-built exe finds its DLLs and never reaches the
+# loader failure that raises the box. The seam is Add-CodexLaneRuntimePath, extracted from the script text; nothing here starts codex or an exe without DLLs.
+_CODEX_RUNTIME_PATH_PWSH = shutil.which("pwsh")
+codex_runtime_path_only = pytest.mark.skipif(
+    sys.platform != "win32" or _CODEX_RUNTIME_PATH_PWSH is None,
+    reason="the function admits only Windows fully qualified directories (X:\\... or \\\\server\\...) and needs pwsh to run",
+)
+
+
+def _ps_quote(value):
+    """A value inside a PowerShell single-quoted literal."""
+    return str(value).replace("'", "''")
+
+
+def _free_drive_letter():
+    for letter in "ZYXWVUTSRQPONMLKJIHGFED":
+        if not os.path.exists(f"{letter}:\\"):
+            return letter
+    pytest.skip("no unused drive letter to stand in for a retired toolchain drive")
+
+
+def _codex_runtime_path_run(tmp_path, call, env=None, cwd=None):
+    """Extract Add-CodexLaneRuntimePath from Invoke-Lane.ps1 by AST, run `call` against a fresh ProcessStartInfo, print its PATH= line."""
+    driver = tmp_path / "driver.ps1"
+    driver.write_text(
+        "param([string]$Script)\n"
+        "$ErrorActionPreference = 'Stop'\n"
+        "[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)\n"  # a U+00AD in PATH must round-trip to the assertion
+        "$tokens = $null; $errors = $null\n"
+        "$ast = [System.Management.Automation.Language.Parser]::ParseFile($Script, [ref]$tokens, [ref]$errors)\n"
+        "$fn = @($ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq 'Add-CodexLaneRuntimePath' }, $true))\n"
+        "if ($fn.Count -ne 1) { Write-Output 'MISSING-FUNCTION'; exit 3 }\n"
+        ". ([scriptblock]::Create($fn[0].Extent.Text))\n"
+        "$psi = [System.Diagnostics.ProcessStartInfo]::new()\n"
+        + call
+        + "\n'PATH=' + [string]$psi.Environment['PATH']\n",
+        encoding="utf-8-sig",  # a non-ASCII tmp_path (an accented profile name) must not break the harness
+    )
+    return subprocess.run(
+        [_CODEX_RUNTIME_PATH_PWSH, "-NoProfile", "-NonInteractive", "-File", str(driver), str(LANE_RUNNER)],
+        text=True, encoding="utf-8", capture_output=True, timeout=120, env=env, cwd=cwd,
+    )
+
+
+def _codex_runtime_path_field(done, name):
+    assert done.returncode == 0, f"probe failed: {done.stdout!r} {done.stderr!r}"
+    m = re.search(rf"^{name}=(.*)$", done.stdout, re.M)
+    assert m, f"no {name}= line: {done.stdout!r}"
+    return m.group(1).strip(" \t\r\n")  # NOT .strip(): that also removes U+00A0, which a path may legally end in (adversary A1 on 6a05d587)
+
+
+@codex_runtime_path_only
+def test_codex_lane_environment_ends_in_the_mingw_bin_directory(tmp_path):
+    mingw = tmp_path / "mingw" / "bin"
+    mingw.mkdir(parents=True)
+    done = _codex_runtime_path_run(
+        tmp_path,
+        "$psi.Environment['PATH'] = 'C:\\first;C:\\second'\n"
+        f"[void](Add-CodexLaneRuntimePath -Psi $psi -Candidates @('{_ps_quote(mingw)}'))",
+    )
+    path = _codex_runtime_path_field(done, "PATH")
+    # APPENDED: tools already on PATH (git, python, pwsh) keep resolving to what they resolved to before.
+    assert path == f"C:\\first;C:\\second;{mingw}", path
+
+
+@codex_runtime_path_only
+def test_codex_lane_runtime_path_appends_a_missing_directory_once_and_never_duplicates(tmp_path):
+    # r3 (hub ruling): the existence lookup is gone. A missing directory on PATH is harmless (the loader skips it), and the lookup was the source of 12
+    # introduced findings across r1/r2. So a candidate is appended whether or not it exists, once, and never when an equivalent spelling is already there.
+    present = tmp_path / "bin"
+    present.mkdir()
+    absent = tmp_path / "no-such-dir"
+    # The drive letter is the one part of a path whose case never matters, so it is the one part that is folded (adversary A1 on ff7ec6c5: C:\case may be
+    # a case-sensitive directory); everything after it is compared exactly.
+    inherited = str(present)[0].swapcase() + str(present)[1:] + "\\"
+    done = _codex_runtime_path_run(
+        tmp_path,
+        f"$psi.Environment['PATH'] = 'C:\\first;' + '{_ps_quote(inherited)}'\n"
+        f"[void](Add-CodexLaneRuntimePath -Psi $psi -Candidates @('{_ps_quote(absent)}', '{_ps_quote(present)}', '{_ps_quote(present)}', '{_ps_quote(absent)}'))",
+    )
+    path = _codex_runtime_path_field(done, "PATH")
+    # `present` is already there under another drive-letter case and a trailing backslash: not added again. `absent` is added once although it does not exist.
+    assert path == f"C:\\first;{inherited};{absent}", path
+
+
+@codex_runtime_path_only
+def test_codex_lane_runtime_path_builds_a_path_when_the_environment_has_none(tmp_path):
+    present = tmp_path / "bin"
+    present.mkdir()
+    done = _codex_runtime_path_run(
+        tmp_path,
+        "[void]$psi.Environment.Remove('PATH')\n"
+        f"[void](Add-CodexLaneRuntimePath -Psi $psi -Candidates @('{_ps_quote(present)}'))",
+    )
+    assert _codex_runtime_path_field(done, "PATH") == str(present)
+
+
+@codex_runtime_path_only
+def test_codex_lane_runtime_path_default_candidates_include_mingw_root_bin(tmp_path):
+    root = tmp_path / "toolchain"
+    (root / "bin").mkdir(parents=True)
+    env = {**os.environ, "MINGW_ROOT": str(root)}
+    done = _codex_runtime_path_run(
+        tmp_path,
+        "$psi.Environment['PATH'] = 'C:\\first'\n[void](Add-CodexLaneRuntimePath -Psi $psi)",
+        env=env,
+    )
+    path = _codex_runtime_path_field(done, "PATH")
+    assert path.split(";")[:2] == ["C:\\first", str(root / "bin")], path
+
+
+@codex_runtime_path_only
+def test_codex_lane_runtime_path_survives_a_mingw_root_on_an_absent_drive(tmp_path):
+    # Adversary A1 on 6372cc4e: Join-Path threw DriveNotFound for a drive that is gone, which failed the whole lane before codex started. r3: there is no
+    # filesystem call at all, so a retired MINGW_ROOT drive costs nothing: no error, no wait, and the candidate is appended like any other.
+    drive = _free_drive_letter()
+    env = {**os.environ, "MINGW_ROOT": f"{drive}:\\retired-toolchain"}
+    done = _codex_runtime_path_run(
+        tmp_path,
+        "$psi.Environment['PATH'] = 'C:\\first'\n$sw = [System.Diagnostics.Stopwatch]::StartNew()\n"
+        "[void](Add-CodexLaneRuntimePath -Psi $psi)\n'ELAPSED_MS=' + [int]$sw.ElapsedMilliseconds",
+        env=env,
+    )
+    path = _codex_runtime_path_field(done, "PATH")
+    assert path.split(";")[:2] == ["C:\\first", f"{drive}:\\retired-toolchain\\bin"], path
+    assert int(_codex_runtime_path_field(done, "ELAPSED_MS")) < 1000, done.stdout
+
+
+@codex_runtime_path_only
+def test_codex_lane_runtime_path_never_adds_a_relative_directory(tmp_path):
+    # Adversary A2 on 6372cc4e: Test-Path judged a relative candidate from the launcher's cwd, but a relative PATH entry is searched from the CHILD's
+    # cwd (the lane's WorkDir), where the DLLs are not. A directory is added only when it is fully qualified.
+    (tmp_path / "mingw" / "bin").mkdir(parents=True)
+    done = _codex_runtime_path_run(
+        tmp_path,
+        "$psi.Environment['PATH'] = 'C:\\first'\n[void](Add-CodexLaneRuntimePath -Psi $psi -Candidates @('mingw\\bin', '.\\mingw\\bin', '\\Windows'))",
+        cwd=str(tmp_path),
+    )
+    assert _codex_runtime_path_field(done, "PATH") == "C:\\first"
+    env = {**os.environ, "MINGW_ROOT": "mingw"}
+    done = _codex_runtime_path_run(
+        tmp_path, "$psi.Environment['PATH'] = 'C:\\first'\n[void](Add-CodexLaneRuntimePath -Psi $psi)", env=env, cwd=str(tmp_path),
+    )
+    path = _codex_runtime_path_field(done, "PATH")
+    assert "mingw" not in path.replace("mingw1310_64", ""), path
+
+
+@codex_runtime_path_only
+def test_codex_lane_runtime_path_never_adds_a_directory_that_would_split_into_two_entries(tmp_path):
+    # Adversary A1 on e284b182: a directory whose own name holds ';' (C:\toolchains;child\bin) was accepted, then serialized into PATH as
+    # C:\toolchains plus a relative child\bin. A name PATH cannot carry intact is skipped.
+    odd = tmp_path / "tool;chains" / "bin"
+    odd.mkdir(parents=True)
+    done = _codex_runtime_path_run(
+        tmp_path,
+        "$psi.Environment['PATH'] = 'C:\\first'\n"
+        f"[void](Add-CodexLaneRuntimePath -Psi $psi -Candidates @('{_ps_quote(odd)}'))",
+    )
+    assert _codex_runtime_path_field(done, "PATH") == "C:\\first"
+
+
+@codex_runtime_path_only
+def test_codex_lane_runtime_path_treats_slash_spellings_as_one_directory(tmp_path):
+    # Adversary A2 (advisory) on e284b182: C:/x/bin and C:\x\bin were both appended. The same directory is added once, and in its backslash spelling.
+    present = tmp_path / "bin"
+    present.mkdir()
+    forward = str(present).replace("\\", "/")
+    done = _codex_runtime_path_run(
+        tmp_path,
+        "$psi.Environment['PATH'] = 'C:\\first'\n"
+        f"[void](Add-CodexLaneRuntimePath -Psi $psi -Candidates @('{_ps_quote(forward)}', '{_ps_quote(present)}'))",
+    )
+    assert _codex_runtime_path_field(done, "PATH") == f"C:\\first;{present}"
+
+
+@codex_runtime_path_only
+def test_codex_lane_runtime_path_treats_slash_spellings_already_on_path_as_present(tmp_path):
+    # Adversary A2 on 56281b89: the candidate was normalised ('/' -> '\') but the EXISTING PATH entries were not, so PATH='C:/x/bin/' still got
+    # C:\x\bin appended. Both sides of the duplicate check use one normalisation.
+    present = tmp_path / "bin"
+    present.mkdir()
+    forward = str(present).replace("\\", "/")
+    start = f"C:\\first;{forward}/"
+    done = _codex_runtime_path_run(
+        tmp_path,
+        f"$psi.Environment['PATH'] = '{_ps_quote(start)}'\n"
+        f"[void](Add-CodexLaneRuntimePath -Psi $psi -Candidates @('{_ps_quote(present)}'))",
+    )
+    assert _codex_runtime_path_field(done, "PATH") == start
+
+
+@codex_runtime_path_only
+def test_codex_lane_runtime_path_skips_a_unc_directory_by_name(tmp_path):
+    # Adversary A1 on 56281b89: a UNC candidate (explicit, or through MINGW_ROOT) is never added. Kept from r1/r2; with the lookup gone it is skipped by name only.
+    done = _codex_runtime_path_run(
+        tmp_path,
+        "$psi.Environment['PATH'] = 'C:\\first'\n"
+        "[void](Add-CodexLaneRuntimePath -Psi $psi -Candidates @('\\\\blackhole-host\\share\\mingw\\bin'))",
+    )
+    assert _codex_runtime_path_field(done, "PATH") == "C:\\first"
+    env = {**os.environ, "MINGW_ROOT": "\\\\blackhole-host\\share\\mingw"}
+    done = _codex_runtime_path_run(tmp_path, "$psi.Environment['PATH'] = 'C:\\first'\n[void](Add-CodexLaneRuntimePath -Psi $psi)", env=env)
+    assert "blackhole-host" not in _codex_runtime_path_field(done, "PATH")
+
+
+@codex_runtime_path_only
+def test_codex_lane_runtime_path_adds_both_candidates_with_no_filesystem_call_and_no_budget(tmp_path):
+    # Adversary A2 on e370ba86: the lookup's budget bounded the wait, not the work (runspace start-up and normalisation sat outside it), so with -TimeoutSec 1
+    # elapsed reached 1180 ms and the next launch-budget guard threw. r3: nothing is looked up, so there is no work to budget. Candidates on a drive letter
+    # that does not exist (the stand-in for a dead mapped drive) are appended at once, both of them, and the function takes no budget parameter.
+    gone = _free_drive_letter()
+    done = _codex_runtime_path_run(
+        tmp_path,
+        "$psi.Environment['PATH'] = 'C:\\first'\n$sw = [System.Diagnostics.Stopwatch]::StartNew()\n"
+        f"$r = @(Add-CodexLaneRuntimePath -Psi $psi -Candidates @('{gone}:\\toolchain\\bin', '{gone}:\\other\\bin'))\n"
+        "'ADDED=' + $r.Count\n'ELAPSED_MS=' + [int]$sw.ElapsedMilliseconds",
+    )
+    assert _codex_runtime_path_field(done, "ADDED") == "2", done.stdout
+    assert _codex_runtime_path_field(done, "PATH") == f"C:\\first;{gone}:\\toolchain\\bin;{gone}:\\other\\bin"
+    assert int(_codex_runtime_path_field(done, "ELAPSED_MS")) < 1000, done.stdout
+
+
+def _add_codex_runtime_path_function_text():
+    body = LANE_RUNNER.read_text(encoding="utf-8").replace("\r\n", "\n")
+    start = body.index("function Add-CodexLaneRuntimePath {")
+    end = body.index("\n}\n", start) + 3
+    return body[start:end]
+
+
+def _strip_ps_comments(text):
+    return "\n".join(re.sub(r"(?<![`'\"])#.*$", "", line) for line in text.splitlines())
+
+
+def test_codex_lane_runtime_path_makes_no_filesystem_call_and_creates_no_thread():
+    # Adversary A2/A3 on e370ba86 and the hub ruling for r3: the function must not touch the filesystem (a lookup can block in SMB, behind a junction, on
+    # a dead mapped drive) and must not create a runspace or thread (an abandoned blocked one keeps the lane process alive: 4845 ms to EXIT). Source shape.
+    code = _strip_ps_comments(_add_codex_runtime_path_function_text())
+    banned = (
+        "RunspaceFactory", "[powershell]::Create", "BeginInvoke", "Start-Job", "Start-ThreadJob", "ForEach-Object -Parallel", "[System.Threading",
+        "DriveInfo", "Test-Path", "Get-Item", "Get-ChildItem", "Resolve-Path", "Convert-Path", "Get-PSDrive", "Set-Location", "Push-Location",
+        "Directory]::Exists", "File]::Exists", "GetFullPath", "Path]::IsPathRooted", "Join-Path", "Split-Path", "LookupScript", "LookupTimeoutMs", "BudgetMs",
+        "Stopwatch", "WaitOne",
+    )
+    found = [b for b in banned if b.lower() in code.lower()]
+    assert not found, f"Add-CodexLaneRuntimePath must not touch the filesystem or create threads; found {found}"
+
+
+def test_codex_lane_runtime_path_takes_no_lookup_or_budget_parameter():
+    code = _add_codex_runtime_path_function_text()
+    params = re.search(r"param\((.*?)\n    \)", code, re.S).group(1)
+    assert sorted(re.findall(r"\]\s*\$([A-Za-z]+)\b", params)) == ["Candidates", "Psi"], params
+
+
+def test_codex_lane_runtime_path_compares_path_keys_ordinally():
+    # Adversary A1 on e370ba86: a PowerShell hashtable, and the -eq/-ne/-in/-contains operators, compare strings with the current culture, which ignores
+    # U+00AD (soft hyphen): a segment holding only U+00AD was `-eq ''` and was dropped, so a nonexistent inherited directory 'X\<U+00AD>\bin' collided with the real
+    # 'X\bin'. Path keys live in an ordinal HashSet, and no string operator that can fold a path is left in the function.
+    code = _strip_ps_comments(_add_codex_runtime_path_function_text())
+    assert "@{}" not in code, "a hashtable folds keys with the culture"
+    assert re.search(r"HashSet\[string\]\]::new\(\[(?:System\.)?StringComparer\]::Ordinal\)", code), "the seen-set must be an ordinal HashSet[string]"
+    operators = re.findall(r"^.*\s-(?:i?c?eq|i?c?ne|i?c?in|i?c?notin|i?c?contains|i?c?notcontains|i?c?like|i?c?lt|i?c?gt)\b.*$", code, re.M)
+    offenders = [ln.strip() for ln in operators if not re.search(r"\.(?:Count|Length)\b|\$null -eq|-eq \$null", ln)]
+    assert not offenders, f"culture-sensitive comparison of a path string: {offenders}"
+    # -match / -notmatch / -split are case-insensitive: [A-Za-z] under them also accepts U+212A (adversary A2 on ff7ec6c5). Use -cmatch / -cnotmatch.
+    insensitive = [ln.strip() for ln in code.splitlines() if re.search(r"\s-(?:i?match|i?notmatch)\b", ln)]
+    assert not insensitive, f"a case-insensitive regex operator on a path string: {insensitive}"
+    assert "ToLowerInvariant" not in code and "ToLower()" not in code, "no case fold beyond the drive letter"
+    # .Trim() with no argument strips every Unicode space, U+00A0 included, which is a legal directory-name character (adversary A1 on 6a05d587).
+    assert not re.search(r"\.Trim\(\)", code), "Trim() with no argument alters a path whose name holds a Unicode space"
+
+
+@codex_runtime_path_only
+def test_codex_lane_runtime_path_compares_everything_after_the_drive_letter_exactly(tmp_path):
+    # Adversary A1 on ff7ec6c5: with MINGW_ROOT=C:\case\mingw and PATH=...;C:\case\MINGW\bin on a case-sensitive NTFS directory, the ASCII case fold gave the
+    # two (different) directories one key and suppressed the usable one. A false "absent" costs a harmless duplicate, a false "present" costs the whole fix,
+    # so only the drive letter folds; the rest of the path is compared exactly.
+    upper = tmp_path / "CASE" / "bin"
+    lower = tmp_path / "case" / "bin"
+    done = _codex_runtime_path_run(
+        tmp_path,
+        f"$psi.Environment['PATH'] = 'C:\\first;{_ps_quote(upper)}'\n"
+        f"$r = @(Add-CodexLaneRuntimePath -Psi $psi -Candidates @('{_ps_quote(lower)}'))\n"
+        "'ADDED=' + $r.Count",
+    )
+    assert _codex_runtime_path_field(done, "ADDED") == "1", done.stdout
+    assert _codex_runtime_path_field(done, "PATH") == f"C:\\first;{upper};{lower}"
+    # the same spelling is still one directory, and so is the drive letter in another case
+    done = _codex_runtime_path_run(
+        tmp_path,
+        f"$psi.Environment['PATH'] = 'C:\\first;{_ps_quote(lower)}'\n"
+        f"$r = @(Add-CodexLaneRuntimePath -Psi $psi -Candidates @('{_ps_quote(lower)}'))\n"
+        "'ADDED=' + $r.Count",
+    )
+    assert _codex_runtime_path_field(done, "ADDED") == "0", done.stdout
+
+
+@codex_runtime_path_only
+def test_codex_lane_runtime_path_a_non_ascii_look_alike_is_not_a_drive_letter(tmp_path):
+    # Adversary A2 on ff7ec6c5: PowerShell's -match is case-insensitive, so [A-Za-z] also matched U+212A (the Kelvin sign) and the candidate
+    # '<KELVIN>:\runtime\bin' was appended although it is not a drive. A drive letter is an ASCII letter, matched case-sensitively.
+    kelvin = "\u212a"
+    done = _codex_runtime_path_run(
+        tmp_path,
+        "$psi.Environment['PATH'] = 'C:\\first'\n"
+        f"$r = @(Add-CodexLaneRuntimePath -Psi $psi -Candidates @('{kelvin}:\\runtime\\bin', '{kelvin}:/runtime/bin'))\n"
+        "'ADDED=' + $r.Count",
+    )
+    assert _codex_runtime_path_field(done, "ADDED") == "0", done.stdout
+    assert _codex_runtime_path_field(done, "PATH") == "C:\\first"
+
+
+@codex_runtime_path_only
+def test_codex_lane_runtime_path_keeps_a_no_break_space_in_the_configured_root(tmp_path):
+    # Adversary A1 on 6a05d587: MINGW_ROOT='C:\toolchains\mingw<U+00A0>' was Trim()med (which strips U+00A0), so the directory the operator configured
+    # was replaced by a different one and omitted. U+00A0 is a legal directory-name character; only ASCII blanks around the value are removed.
+    nbsp = "\u00a0"
+    env = {**os.environ, "MINGW_ROOT": f"C:\\toolchains\\mingw{nbsp}"}
+    done = _codex_runtime_path_run(tmp_path, "$psi.Environment['PATH'] = 'C:\\first'\n[void](Add-CodexLaneRuntimePath -Psi $psi)", env=env)
+    path = _codex_runtime_path_field(done, "PATH")
+    assert path.split(";")[:2] == ["C:\\first", f"C:\\toolchains\\mingw{nbsp}\\bin"], path
+    # as an explicit candidate too, ending in U+00A0
+    done = _codex_runtime_path_run(
+        tmp_path,
+        "$psi.Environment['PATH'] = 'C:\\first'\n"
+        f"[void](Add-CodexLaneRuntimePath -Psi $psi -Candidates @('C:\\x\\bin{nbsp}'))",
+    )
+    assert _codex_runtime_path_field(done, "PATH") == f"C:\\first;C:\\x\\bin{nbsp}"
+    # ASCII blanks around the configured value are still ignored
+    env = {**os.environ, "MINGW_ROOT": "  C:\\toolchains\\mingw \t"}
+    done = _codex_runtime_path_run(tmp_path, "$psi.Environment['PATH'] = 'C:\\first'\n[void](Add-CodexLaneRuntimePath -Psi $psi)", env=env)
+    assert _codex_runtime_path_field(done, "PATH").split(";")[:2] == ["C:\\first", "C:\\toolchains\\mingw\\bin"]
+
+
+@codex_runtime_path_only
+def test_codex_lane_runtime_path_resolves_dot_dot_at_the_root_the_way_windows_does(tmp_path):
+    # Adversary A2 on 6a05d587: Windows canonicalises C:\..\toolchain to C:\toolchain (the root has no parent), but the empty-stack '..' branch
+    # rejected it, so MINGW_ROOT='C:\..\toolchain' was dropped and the inherited C:\..\toolchain\bin was not recognised as C:\toolchain\bin.
+    env = {**os.environ, "MINGW_ROOT": "C:\\..\\toolchain"}
+    done = _codex_runtime_path_run(tmp_path, "$psi.Environment['PATH'] = 'C:\\first'\n[void](Add-CodexLaneRuntimePath -Psi $psi)", env=env)
+    assert _codex_runtime_path_field(done, "PATH").split(";")[:2] == ["C:\\first", "C:\\toolchain\\bin"]
+    done = _codex_runtime_path_run(
+        tmp_path,
+        "$psi.Environment['PATH'] = 'C:\\first;C:\\..\\toolchain\\bin'\n"
+        "$r = @(Add-CodexLaneRuntimePath -Psi $psi -Candidates @('C:\\a\\..\\..\\toolchain\\bin'))\n'ADDED=' + $r.Count",
+    )
+    assert _codex_runtime_path_field(done, "ADDED") == "0", done.stdout
+
+
+@codex_runtime_path_only
+def test_codex_lane_runtime_path_a_soft_hyphen_segment_is_not_the_real_directory(tmp_path):
+    # Adversary A1 on e370ba86 (input: PATH 'C:\Qt\Tools\mingw1310_64\<U+00AD>\bin', installed default toolchain, ADDED=0). A segment that is only U+00AD is a
+    # different (nonexistent) directory, not an empty segment, so it does not make the real directory look present, and as a candidate it keeps its own spelling.
+    present = tmp_path / "bin"
+    present.mkdir()
+    shy = "\u00ad"
+    inherited = f"{tmp_path}\\{shy}\\bin"
+    done = _codex_runtime_path_run(
+        tmp_path,
+        f"$psi.Environment['PATH'] = 'C:\\first;{_ps_quote(inherited)}'\n"
+        f"$r = @(Add-CodexLaneRuntimePath -Psi $psi -Candidates @('{_ps_quote(present)}'))\n"
+        "'ADDED=' + $r.Count",
+    )
+    assert _codex_runtime_path_field(done, "ADDED") == "1", done.stdout
+    assert _codex_runtime_path_field(done, "PATH") == f"C:\\first;{inherited};{present}"
+    # as a candidate it is not collapsed into the real directory
+    done = _codex_runtime_path_run(
+        tmp_path,
+        "$psi.Environment['PATH'] = 'C:\\first'\n"
+        f"[void](Add-CodexLaneRuntimePath -Psi $psi -Candidates @('{_ps_quote(inherited)}', '{_ps_quote(present)}'))",
+    )
+    assert _codex_runtime_path_field(done, "PATH") == f"C:\\first;{inherited};{present}"
+
+
+@codex_runtime_path_only
+def test_codex_lane_runtime_path_compares_names_the_way_the_filesystem_does(tmp_path):
+    # Adversary A2 on 834f307b: ToLowerInvariant folds U+212A (the Kelvin sign) to 'k', so an inherited entry '...\Tas<KELVIN>s' was taken for the
+    # existing directory '...\Tasks' and the real one was never added. NTFS does not treat them as one name. Only ASCII letters are case-folded;
+    # a non-ASCII difference is a different directory (a false "absent" costs a duplicate, a false "present" costs the fix).
+    present = tmp_path / "tasks"
+    present.mkdir()
+    lookalike = str(tmp_path / "tas\u212as")
+    done = _codex_runtime_path_run(
+        tmp_path,
+        f"$psi.Environment['PATH'] = 'C:\\first;{_ps_quote(lookalike)}'\n"
+        f"$r = @(Add-CodexLaneRuntimePath -Psi $psi -Candidates @('{_ps_quote(present)}'))\n"
+        "'ADDED=' + $r.Count",
+    )
+    assert _codex_runtime_path_field(done, "ADDED") == "1", done.stdout
+
+
+@codex_runtime_path_only
+def test_codex_lane_runtime_path_does_not_count_a_spelling_the_loader_will_not_match(tmp_path):
+    # Adversary A1 on 7688a2a3: PATH='...\bin ' (trailing space) was trimmed into the seen-set, so the usable directory was never added and
+    # the DLLs stayed unfound. An inherited entry counts as present only when it is a plain, exact spelling; a false "absent" costs a harmless duplicate,
+    # a false "present" costs the whole fix.
+    present = tmp_path / "bin"
+    present.mkdir()
+    for spelling in (f"{present} ", f" {present}", f'"{present}"', f"{present}."):
+        start = f"C:\\first;{spelling}"
+        done = _codex_runtime_path_run(
+            tmp_path,
+            f"$psi.Environment['PATH'] = '{_ps_quote(start)}'\n"
+            f"[void](Add-CodexLaneRuntimePath -Psi $psi -Candidates @('{_ps_quote(present)}'))",
+        )
+        assert _codex_runtime_path_field(done, "PATH") == f"{start};{present}", spelling
+
+
+@codex_runtime_path_only
+def test_codex_lane_runtime_path_treats_dot_segments_as_the_directory_they_name(tmp_path):
+    # Adversary A3 (advisory, introduced) on 7688a2a3: <dir>\.\bin and <dir>\bin are one directory but were both appended. Dot segments are resolved
+    # lexically (Windows does the same before it touches the disk) on the candidate and on the inherited entries, and the directory is added once, resolved.
+    present = tmp_path / "bin"
+    present.mkdir()
+    (tmp_path / "side").mkdir()
+    dotted = f"{tmp_path}\\.\\bin"
+    parent = f"{tmp_path}\\side\\..\\bin"
+    done = _codex_runtime_path_run(
+        tmp_path,
+        "$psi.Environment['PATH'] = 'C:\\first'\n"
+        f"[void](Add-CodexLaneRuntimePath -Psi $psi -Candidates @('{_ps_quote(dotted)}', '{_ps_quote(parent)}', '{_ps_quote(present)}'))",
+    )
+    assert _codex_runtime_path_field(done, "PATH") == f"C:\\first;{present}"
+    start = f"C:\\first;{dotted}"
+    done = _codex_runtime_path_run(
+        tmp_path,
+        f"$psi.Environment['PATH'] = '{_ps_quote(start)}'\n"
+        f"[void](Add-CodexLaneRuntimePath -Psi $psi -Candidates @('{_ps_quote(present)}'))",
+    )
+    assert _codex_runtime_path_field(done, "PATH") == start
+
+
+# r4 (Sol r3 + adversary A1 on 071338fa): the segment checks ran BEFORE a following '..' could remove the segment, so a configured root whose spelling
+# merely passes through a bad name (C:\toolchains\discard.\..\mingw) was refused although it names C:\toolchains\mingw. Windows resolves '.' and '..'
+# first; so does the function now, and every check (trailing dot or space, reserved character, quote, semicolon) runs over the SURVIVING segments.
+_CODEX_DEFAULT_QT_BIN = "C:\\Qt\\Tools\\mingw1310_64\\bin"
+_CANCELED_SEGMENTS = {
+    "trailing-dot": "discard.",
+    "trailing-space": "discard ",
+    "semicolon": "dis;card",
+    "quote": 'dis"card',
+    "reserved-lt": "dis<card",
+    "reserved-star": "dis*card",
+    "reserved-colon": "dis:card",
+}
+
+
+@codex_runtime_path_only
+@pytest.mark.parametrize("bad", list(_CANCELED_SEGMENTS.values()), ids=list(_CANCELED_SEGMENTS))
+def test_codex_lane_runtime_path_a_canceled_bad_segment_does_not_refuse_the_configured_root(tmp_path, bad):
+    configured = f"C:\\toolchains\\{bad}\\..\\mingw"
+    env = {**os.environ, "MINGW_ROOT": configured}
+    done = _codex_runtime_path_run(tmp_path, "$psi.Environment['PATH'] = 'C:\\first'\n[void](Add-CodexLaneRuntimePath -Psi $psi)", env=env)
+    # the configured toolchain is ADDED, ahead of the default Qt candidate (Sol r3: it was omitted, leaving only the Qt default)
+    assert _codex_runtime_path_field(done, "PATH").split(";") == ["C:\\first", "C:\\toolchains\\mingw\\bin", _CODEX_DEFAULT_QT_BIN], done.stdout
+    # the same spelling as an explicit candidate, and with the cancelled segment last before '..' at the end
+    done = _codex_runtime_path_run(
+        tmp_path,
+        "$psi.Environment['PATH'] = 'C:\\first'\n"
+        f"$r = @(Add-CodexLaneRuntimePath -Psi $psi -Candidates @('{_ps_quote(f'C:\\toolchains\\mingw\\bin\\{bad}\\..')}'))\n'ADDED=' + $r.Count",
+    )
+    assert _codex_runtime_path_field(done, "ADDED") == "1", done.stdout
+    assert _codex_runtime_path_field(done, "PATH") == "C:\\first;C:\\toolchains\\mingw\\bin"
+
+
+@codex_runtime_path_only
+@pytest.mark.parametrize(
+    "surviving",
+    ["bad.", "bad ", "ba;d", 'ba"d', "ba<d", "ba>d", "ba|d", "ba?d", "ba*d", "ba:d", "bad\t"],
+    ids=["dot", "space", "semicolon", "quote", "lt", "gt", "pipe", "question", "star", "colon", "tab"],
+)
+def test_codex_lane_runtime_path_a_surviving_bad_segment_is_still_refused(tmp_path, surviving):
+    # Control: reducing first must not weaken the checks. A bad segment that is still in the path after '.' and '..' are resolved stays refused,
+    # and so does a bad segment sitting before a '..' that removes a DIFFERENT segment.
+    # (a trailing ASCII blank on the configured VALUE is trimmed by design, so the bad segment is never the last one here)
+    for configured in (f"C:\\toolchains\\{surviving}\\mingw", f"C:\\toolchains\\{surviving}\\x\\..\\mingw", f"C:\\toolchains\\mingw\\{surviving}\\sub"):
+        env = {**os.environ, "MINGW_ROOT": configured}
+        done = _codex_runtime_path_run(tmp_path, "$psi.Environment['PATH'] = 'C:\\first'\n[void](Add-CodexLaneRuntimePath -Psi $psi)", env=env)
+        assert _codex_runtime_path_field(done, "PATH") == f"C:\\first;{_CODEX_DEFAULT_QT_BIN}", configured
+
+
+@codex_runtime_path_only
+def test_codex_lane_runtime_path_dot_dot_above_the_root_clamps_and_relative_and_unc_stay_refused(tmp_path):
+    # HUB RULING 20261107T1220Z: '..' above the drive root stays at the root, as Windows canonicalisation does.
+    for configured, expected in (
+        ("C:\\..\\toolchains\\mingw", "C:\\toolchains\\mingw\\bin"),
+        ("C:\\a\\..\\..\\toolchains\\mingw", "C:\\toolchains\\mingw\\bin"),
+        ("C:\\x.\\..\\..\\toolchains\\mingw", "C:\\toolchains\\mingw\\bin"),
+    ):
+        env = {**os.environ, "MINGW_ROOT": configured}
+        done = _codex_runtime_path_run(tmp_path, "$psi.Environment['PATH'] = 'C:\\first'\n[void](Add-CodexLaneRuntimePath -Psi $psi)", env=env)
+        assert _codex_runtime_path_field(done, "PATH").split(";") == ["C:\\first", expected, _CODEX_DEFAULT_QT_BIN], configured
+    # relative and UNC spellings stay refused even when a cancelled segment would reduce them to something plausible
+    for configured in ("toolchains\\discard.\\..\\mingw", ".\\toolchains\\mingw", "\\\\host\\share\\discard.\\..\\mingw", "\\toolchains\\mingw"):
+        env = {**os.environ, "MINGW_ROOT": configured}
+        done = _codex_runtime_path_run(tmp_path, "$psi.Environment['PATH'] = 'C:\\first'\n[void](Add-CodexLaneRuntimePath -Psi $psi)", env=env)
+        assert _codex_runtime_path_field(done, "PATH") == f"C:\\first;{_CODEX_DEFAULT_QT_BIN}", configured
+
+
+@codex_runtime_path_only
+def test_codex_lane_runtime_path_an_inherited_entry_is_reduced_before_it_is_checked(tmp_path):
+    # Same order for the inherited PATH: C:\toolchains\discard.\..\mingw\bin IS C:\toolchains\mingw\bin, so the directory is present and is not added
+    # twice; an inherited entry whose bad segment SURVIVES is not counted as present (a false "absent" costs a duplicate, a false "present" the fix).
+    done = _codex_runtime_path_run(
+        tmp_path,
+        "$psi.Environment['PATH'] = 'C:\\first;C:\\toolchains\\discard.\\..\\mingw\\bin'\n"
+        "$r = @(Add-CodexLaneRuntimePath -Psi $psi -Candidates @('C:\\toolchains\\mingw\\bin'))\n'ADDED=' + $r.Count",
+    )
+    assert _codex_runtime_path_field(done, "ADDED") == "0", done.stdout
+    done = _codex_runtime_path_run(
+        tmp_path,
+        "$psi.Environment['PATH'] = 'C:\\first;C:\\toolchains\\mingw.\\bin'\n"
+        "$r = @(Add-CodexLaneRuntimePath -Psi $psi -Candidates @('C:\\toolchains\\mingw\\bin'))\n'ADDED=' + $r.Count",
+    )
+    assert _codex_runtime_path_field(done, "ADDED") == "1", done.stdout
+    assert _codex_runtime_path_field(done, "PATH") == "C:\\first;C:\\toolchains\\mingw.\\bin;C:\\toolchains\\mingw\\bin"
+
+
+@codex_runtime_path_only
+def test_codex_lane_runtime_path_an_inherited_entry_the_loader_cannot_use_does_not_count_as_present(tmp_path):
+    # Adversary A1 on fb022797 (introduced, major): reduction made 'C:\Qt\Tools\mingw1310_64\bin\' + '.\' * 16330 (a 32 KB spelling) look like the
+    # canonical directory, so the usable candidate was suppressed (ADDED=0) while LoadLibraryExW fails on the raw string. The raw spelling must stay within
+    # what a loader search entry can be: an entry plus '\' plus the longest runtime DLL name (libgcc_s_seh-1.dll, 18 characters) within MAX_PATH. A longer
+    # spelling is treated as absent (a duplicate costs 30 bytes; a false "present" costs the fix).
+    base = "C:\\Qt\\Tools\\mingw1310_64\\bin"
+    padded = base + "\\" + ".\\" * 16330
+    env = {**os.environ, "MINGW_ROOT": ""}
+    done = _codex_runtime_path_run(
+        tmp_path,
+        f"$psi.Environment['PATH'] = 'C:\\Program Files\\nodejs;C:\\Windows\\System32;{padded}'\n"
+        "$r = @(Add-CodexLaneRuntimePath -Psi $psi)\n'ADDED=' + $r.Count",
+        env=env,
+    )
+    assert _codex_runtime_path_field(done, "ADDED") == "1", done.stdout
+    assert _codex_runtime_path_field(done, "PATH").endswith(f";{base}"), done.stdout
+    # the boundary: 240 characters is still a spelling the loader can use, 241 is not
+    for pad_len, added in ((240, "0"), (241, "1")):
+        k, extra = divmod(pad_len - (len(base) + 1), 2)
+        entry = base + "\\" + ".\\" * k + ("." if extra else "")
+        assert len(entry) == pad_len, (len(entry), pad_len)
+        done = _codex_runtime_path_run(
+            tmp_path,
+            f"$psi.Environment['PATH'] = 'C:\\first;{entry}'\n"
+            f"$r = @(Add-CodexLaneRuntimePath -Psi $psi -Candidates @('{base}'))\n'ADDED=' + $r.Count",
+        )
+        assert _codex_runtime_path_field(done, "ADDED") == added, (pad_len, done.stdout)
+
+
+def test_codex_lane_runtime_path_is_wired_into_the_codex_child_only():
+    body = LANE_RUNNER.read_text(encoding="utf-8").replace("\r\n", "\n")
+    assert "function Add-CodexLaneRuntimePath" in body, "Invoke-Lane lacks Add-CodexLaneRuntimePath"
+    calls = [m.start() for m in re.finditer(r"^\s*\$\w+ = @\(Add-CodexLaneRuntimePath -Psi \$psi\)", body, re.M)]
+    assert len(calls) == 1, f"expected exactly one call on the lane child's $psi, found {len(calls)}"
+    guard = "if ($cfg.engine -eq 'codex') {"
+    window = body[max(0, calls[0] - 900):calls[0]]
+    assert guard in window, "the call must sit inside `if ($cfg.engine -eq 'codex')`: the claude lane's environment is unchanged"
+    # r3: no lookup, so no budget: the call takes nothing but the child's $psi and cannot be the reason a launch-budget check throws.
+    assert "-BudgetMs" not in body[calls[0]:calls[0] + 200] and "codexRuntimeBudgetMs" not in body, "the call must carry no lookup budget"
+    # After the child's $psi exists and before its streams are redirected, i.e. before anything can start it.
+    created = body.index("$psi = [System.Diagnostics.ProcessStartInfo]::new()\n$psi.WorkingDirectory")
+    redirected = body.index("$psi.RedirectStandardInput  = $true")
+    assert created < calls[0] < redirected, "the call must run between the lane child's $psi creation and its stream redirection"
+
+
 def test_invoke_lane_marks_only_the_claude_child_as_a_fleet_lane():
     # KEY-VERDICT-OVERWRITTEN-BY-ROTATION-CHECKPOINT-1. The user-level Stop hook usage-guard.py skips
     # its rotation-checkpoint block when MLV_FLEET_LANE is set; without it a headless lane takes one more

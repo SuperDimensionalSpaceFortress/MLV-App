@@ -1,0 +1,647 @@
+"""No new thread_local in product code (CPU-SCOPE-LIVE-CRASH-FIX-1).
+
+On mingw-w64 v11 the exe's TLS callback runs a thread_local's C++ destructor after libgcc's emutls key destructor has
+freed its storage. Non-trivial per-thread caches go through mlvThreadExitCache (src/processing/ThreadExitCache.h).
+
+Grammar: the whole word thread_local anywhere in any file under platform/ or src/, against an exact allow-list of
+(relative path, stripped line, reason). This does not parse C++. It does not interpret comments or literals, and
+every approximation it makes fails toward reporting a line or raising an error, never toward hiding one; what it
+does not cover is listed under Limits below:
+- Every regular file is read, whatever its suffix (.inc, .hxx, .hh, .ipp, no suffix at all), as bytes decoded as
+  UTF-8 with errors=replace. A token in a non-C++ file is an over-report that an allow-list row answers. There is
+  no include list and no skip list: an #include can name any file (adversary r3 A1: a skip list of binary
+  suffixes let #include "cache.png" hide a declaration).
+- The files come from an os.scandir walk that catches nothing (product_files). A scanned directory that is
+  missing, a directory that cannot be listed, an entry that vanishes mid-scan and a file that cannot be read all
+  raise, so ProductTreeTests errors; none of them reads clean (sol r3 B1: Path.rglob swallowed the listing error).
+  An entry whose cached type answers are both False is typed by a fresh stat, and that answer is used: a regular
+  file is read, a directory is walked, anything else (socket, FIFO, device) raises (sol r4 B1).
+- Speed: decoding every file cost about 13 s on the real tree, 12 s of it in the .zip/.xz archives (r3
+  measurement). So a file is decoded only when its raw bytes may hold the token in either view (may_hold_token).
+  That gate is a superset of what the decoded search can find: the token and every continuation are ASCII, and
+  UTF-8 decoding with errors=replace keeps each ASCII byte as the same character in the same order, so a token
+  in either decoded view is the same twelve bytes, contiguous, in the matching byte view. The gate can pass a file
+  the decoded search then finds clean (a longer identifier, say); it cannot fail one the search would report.
+- Each file is searched in two views and the union is reported: the text as it is, and the text with every
+  continuation removed. A continuation is what libcpp's _cpp_clean_line splices: a backslash, then any run of
+  libcpp's is_nvspace (space, tab, form feed, vertical tab and NUL), then LF, CR LF or a lone CR; GCC accepts the
+  whitespace with a warning (opus r3 B1: NUL was missing). UTF-8 decoding keeps each NUL as U+0000, so the bytes
+  and the decoded views agree. A token split by a continuation shows in the second view. A token
+  at a line end that a continuation would glue to the next word (thread_local, backslash, newline, Foo g;) shows in
+  the first. Translation reverts a continuation inside a raw string; the second view does not, but since the first
+  view is searched too, that can only add a report, never remove one.
+- A comment, string or raw string holding the token is reported on purpose and needs an allow-list row (or a
+  reword). The guard used to strip comments; that lexer kept having corners (digit separators, raw strings,
+  continuations) and each corner hid a real declaration.
+
+Limits, stated plainly (out of scope):
+- Token pasting: #define CAT(a,b) a##b, then CAT(thread_,local) Foo g; holds no token in the source.
+- A macro or -D define that spells the token outside platform/ and src/ (a .pro under platform/ is read).
+- UTF-16 sources: the token is not a run of UTF-8 bytes there.
+- Trigraph ??/ as a backslash (off by default in GNU modes; removed in C++17).
+- Generated code and DLLs: Qt6Core.dll, libgomp-1.dll and libstdc++-6.dll reference __emutls_get_address and
+  nothing here reaches them.
+- It cannot judge triviality on an allow-listed line: the reason is a human's claim. An allow-list row is keyed
+  by the line's text, not its place, so an allowed line that moves, repeats, or loses the #if branch around it
+  still reads green (THREAD-LOCAL-GUARD-HELPER-BRANCH-PIN-1).
+- A directory symlink is not descended (a file symlink is read): a target outside platform/ and src/ is not
+  scanned (THREAD-LOCAL-GUARD-SYMLINK-DIR-1). A dangling symlink raises.
+- __thread, __declspec(thread) and C11 _Thread_local register no destructor; QThreadStorage is a different
+  mechanism with no product use today.
+- The object census (nm -u for __cxa_thread_atexit on every release .o) is the structural proof; this is only the
+  source-level gate.
+"""
+import errno
+import os
+from pathlib import Path
+import re
+import stat
+import tempfile
+import unittest
+from unittest import mock
+
+
+ROOT = Path(__file__).resolve().parents[2]
+SCANNED_DIRECTORIES = ("platform", "src")
+TOKEN = re.compile(r"\bthread_local\b")
+# libcpp's _cpp_clean_line walks back from a newline over is_nvspace (space, \t, \f, \v and NUL) to a backslash.
+CONTINUATION = re.compile(r"\\[ \t\f\v\x00]*(?:\r\n|\n|\r)")
+BYTES_CONTINUATION = re.compile(rb"\\[ \t\f\v\x00]*(?:\r\n|\n|\r)")
+
+COMMENT_TEXT = "comment text; declares nothing"
+ALLOW_LIST = {
+    (
+        "platform/qt/AudioPlayback.cpp",
+        "static thread_local bool comInitialized = false;",
+    ): "trivially destructible bool; registers no destructor",
+    (
+        "src/processing/ThreadExitCache.h",
+        "T & mlvThreadExitCache() { static thread_local T t; return t; }",
+    ): "the helper's non-MinGW branch; the failing ordering is specific to MinGW",
+    (
+        "src/processing/ThreadExitCache.h",
+        "* thread_local objects from coming back. */",
+    ): COMMENT_TEXT,
+    (
+        "src/processing/ThreadExitCache.h",
+        "// Why: on mingw-w64 v11 the exe's TLS callback runs thread_local destructors after",
+    ): COMMENT_TEXT,
+    (
+        "platform/qt/LookAssistAnalysisPump.h",
+        "// MinGW a thread_local destructor can run after its storage is freed (commit 9183c7cf6, tls_exit_order_fixture).",
+    ): COMMENT_TEXT,
+}
+
+
+def views(text):
+    """The text as it is, and the text with every continuation removed."""
+    return (text, CONTINUATION.sub("", text))
+
+
+def thread_local_lines(text):
+    """The stripped lines, from either view, that hold the token; each distinct line once."""
+    found = []
+    for view in views(text):
+        for line in view.splitlines():
+            stripped = line.strip()
+            if TOKEN.search(stripped) and stripped not in found:
+                found.append(stripped)
+    return found
+
+
+def may_hold_token(data):
+    """Bytes-level gate: False only when neither view of the decoded text can hold the token (see the docstring)."""
+    return b"thread_local" in data or b"thread_local" in BYTES_CONTINUATION.sub(b"", data)
+
+
+def product_files(root):
+    """Every regular file under the scanned directories, sorted. Nothing here catches an OSError.
+
+    Sol r3 B1: Path.rglob swallowed PermissionError and FileNotFoundError from os.scandir on a subdirectory, so a
+    declaration in an unlistable directory read clean; Path.is_file answers False on a failed stat too (on 3.13 for
+    ENOENT, ENOTDIR, EBADF and ELOOP; from 3.14 it is os.path.isfile, False on any OSError). Here a
+    scanned directory that is missing, a directory that cannot be listed or iterated, and a stat that fails all
+    raise, so ProductTreeTests errors instead of passing.
+    """
+    files = []
+    pending = [os.path.join(root, directory) for directory in SCANNED_DIRECTORIES]
+    while pending:
+        directory = pending.pop()
+        with os.scandir(directory) as entries:
+            for entry in entries:
+                if entry.is_dir(follow_symlinks=False):
+                    pending.append(entry.path)
+                elif entry.is_file():
+                    files.append(entry.path)
+                else:
+                    # DirEntry.is_dir and is_file cache their answer and answer False on FileNotFoundError (an entry
+                    # removed after the listing, a dangling symlink). The fresh stat decides, and every answer it
+                    # gives is used (sol r4 B1: a file symlink whose target came back was stat-ed, then dropped).
+                    fresh = os.stat(entry.path).st_mode
+                    if stat.S_ISREG(fresh):
+                        files.append(entry.path)
+                    elif stat.S_ISDIR(fresh):
+                        if not stat.S_ISLNK(os.lstat(entry.path).st_mode):
+                            pending.append(entry.path)
+                        # else a directory symlink: the stated limit THREAD-LOCAL-GUARD-SYMLINK-DIR-1.
+                    else:
+                        raise OSError("neither a regular file nor a directory (mode %o): %s" % (fresh, entry.path))
+    return sorted(Path(path) for path in files)
+
+
+def scan(root):
+    """Every (relative path, stripped line) in the scanned product trees, from every regular file."""
+    found = []
+    for path in product_files(root):
+        data = path.read_bytes()
+        if may_hold_token(data):
+            relative = path.relative_to(root).as_posix()
+            found.extend((relative, line) for line in thread_local_lines(data.decode("utf-8", errors="replace")))
+    return found
+
+
+def offenders(root):
+    return [entry for entry in scan(root) if entry not in ALLOW_LIST]
+
+
+RAW_PREFIXES = ("", "u8", "u", "U", "L")
+LINE_ENDS = ("\n", "\r\n")
+
+
+# Sol r3 B1's probe declaration: non-trivial, so it registers a destructor.
+GUARD_PROBE = "struct GuardProbe { ~GuardProbe() {} }; static thread_local GuardProbe hidden;\n"
+
+
+def raw_string_splice(prefix, eol):
+    # Sol r2 B1: translation reverts the splice inside the raw string, so the string ends at the second )x" and the
+    # declaration is real; splicing first made an early terminator and the /* after it ate the declaration.
+    return 'struct Foo { ~Foo() {} };%sauto s = %sR"x(foo)x\\%s"/*)x"; thread_local Foo g; // */%s' % (
+        eol,
+        prefix,
+        eol,
+        eol,
+    )
+
+
+# (file name, source) pairs that each hold a real or possible declaration; every one must be reported.
+HIDDEN_SHAPES = (
+    [("raw-%s-%s.cpp" % (prefix or "plain", "crlf" if eol == "\r\n" else "lf"), raw_string_splice(prefix, eol))
+     for prefix in RAW_PREFIXES for eol in LINE_ENDS]
+    + [
+        ("splice-space.cpp", "thread_\\ \nlocal Foo g;\n"),
+        ("splice-tab-crlf.cpp", "thread_\\\t\r\nlocal Foo g;\r\n"),
+        ("splice-lone-cr.cpp", "thread_\\\rlocal Foo g;\r"),
+        # Opus r3 B1: libcpp's is_nvspace includes NUL, so backslash, NULs, newline is a continuation too.
+        ("splice-nul.cpp", "thread_\\\x00\nlocal Foo g;\n"),
+        ("splice-nul-nul-space.cpp", "thread_\\\x00\x00 \nlocal Foo g;\n"),
+        ("splice-nul-crlf.cpp", "thread_\\\x00\r\nlocal Foo g;\r\n"),
+        ("split-terminator-space.cpp", "/* c *\\ \n/ thread_local Foo g;\n"),
+        ("glued-by-splice.cpp", "thread_local\\\nFoo g;\n"),
+        ("digit-separator.cpp", "double d = 0x1.A'Bp0; const char c = '\"'; const char * s = \"//\"; thread_local Foo g;\n"),
+        ("comment-markers.cpp", 'const char * s = "/*"; thread_local Foo g; const char * e = "*/";\n'),
+        ("x.inc", "static thread_local std::vector<int> v;\n"),
+        ("x.hxx", "static thread_local std::vector<int> v;\n"),
+        ("x.hh", "static thread_local std::vector<int> v;\n"),
+        ("x.ipp", "static thread_local std::vector<int> v;\n"),
+        ("NOSUFFIX", "static thread_local std::vector<int> v;\n"),
+        # Adversary r3 A1: a file with a binary suffix can still be #included.
+        ("cache.png", "#include <vector>\nstatic thread_local std::vector<int> hidden;\n"),
+        ("cache.zip", "static thread_local std::vector<int> hidden;\n"),
+        ("cache.tar.xz", "thread_\\\nlocal Foo g;\n"),
+        ("cache.ico", "static thread_local std::vector<int> hidden;\n"),
+        ("cache.gif", "static thread_local std::vector<int> hidden;\n"),
+        ("cache.icns", "static thread_local std::vector<int> hidden;\n"),
+        ("cache.blend", "static thread_local std::vector<int> hidden;\n"),
+        ("cache.ttf", "static thread_local std::vector<int> hidden;\n"),
+        # Sol r4 B1: the source of a file symlink whose target was absent at is_file() and back at the fresh stat.
+        # test_an_entry_that_reappears_is_scanned serves every shape through that path too.
+        ("reappeared-symlink-target.cpp", GUARD_PROBE),
+    ]
+)
+
+
+def write_allow_listed_tree(root):
+    """Each allow-listed line in its file under root, so ProductTreeTests reads green on that tree."""
+    by_file = {}
+    for path, line in ALLOW_LIST:
+        by_file.setdefault(path, []).append(line)
+    for path, lines in by_file.items():
+        (root / path).parent.mkdir(parents=True, exist_ok=True)
+        (root / path).write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def product_tree_result(root):
+    """Run ProductTreeTests against root instead of the repository, restoring ROOT and the class state after."""
+    global ROOT
+    saved_root, had_found, saved_found = ROOT, "found" in ProductTreeTests.__dict__, ProductTreeTests.__dict__.get("found")
+    result = unittest.TestResult()
+    try:
+        ROOT = root
+        unittest.TestLoader().loadTestsFromTestCase(ProductTreeTests).run(result)
+    finally:
+        ROOT = saved_root
+        if had_found:
+            ProductTreeTests.found = saved_found
+        elif "found" in ProductTreeTests.__dict__:
+            del ProductTreeTests.found
+    return result
+
+
+def scandir_raising(directory, error):
+    """os.scandir, except that listing directory raises error (sol r3 B1's probe)."""
+    real_scandir = os.scandir
+    target = os.path.normcase(os.path.abspath(directory))
+    code = errno.EACCES if error is PermissionError else errno.ENOENT
+
+    def scandir(path="."):
+        if os.path.normcase(os.path.abspath(path)) == target:
+            raise error(code, "directory enumeration denied", os.fspath(path))
+        return real_scandir(path)
+
+    return scandir
+
+
+class _Listing:
+    """A stand-in for the iterator os.scandir returns."""
+
+    def __init__(self, entries):
+        self._entries = entries
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def __iter__(self):
+        return iter(self._entries)
+
+    def close(self):
+        pass
+
+
+class _GhostEntry:
+    """A listed entry that is gone by the time it is examined: DirEntry answers False to is_dir and is_file."""
+
+    def __init__(self, directory, name):
+        self.name = name
+        self.path = os.path.join(directory, name)
+
+    def is_dir(self, follow_symlinks=True):
+        return False
+
+    def is_file(self, follow_symlinks=True):
+        return False
+
+    def is_symlink(self):
+        return False
+
+    def is_junction(self):
+        return False
+
+    def __fspath__(self):
+        return self.path
+
+
+def scandir_ghosting(ghost_path):
+    """os.scandir, except that the real entry for ghost_path answers False to is_dir and is_file (sol r4 B1's race:
+    a file symlink whose target was absent when is_file() followed it), while os.stat on it stays real."""
+    real_scandir = os.scandir
+    target = os.path.normcase(os.path.abspath(ghost_path))
+
+    def scandir(path="."):
+        entries = list(real_scandir(path))
+        return _Listing([_GhostEntry(os.fspath(path), entry.name)
+                         if os.path.normcase(os.path.abspath(entry.path)) == target else entry
+                         for entry in entries])
+
+    return scandir
+
+
+class ThreadLocalGrammarTests(unittest.TestCase):
+    def test_a_plain_declaration_is_found(self):
+        self.assertEqual(["thread_local Foo g;"], thread_local_lines("thread_local Foo g;\n"))
+
+    def test_a_static_local_is_found(self):
+        self.assertEqual(["static thread_local Foo g;"], thread_local_lines("void f() {\n  static thread_local Foo g;\n}\n"))
+
+    def test_a_macro_is_found(self):
+        self.assertEqual(["#define X thread_local"], thread_local_lines("#define X thread_local\nX Foo g;\n"))
+
+    def test_a_token_split_by_a_continuation_is_found(self):
+        self.assertEqual(["thread_local Foo g;"], thread_local_lines("thread_\\\nlocal Foo g;\n"))
+
+    def test_comments_are_found(self):
+        # Flipped in r3: a token in a comment is reported on purpose and needs an allow-list row.
+        self.assertEqual(
+            ["// thread_local Foo g;", "/* thread_local", "thread_local */"],
+            thread_local_lines("// thread_local Foo g;\n/* thread_local\n thread_local */\nint x;\n"),
+        )
+
+    def test_a_continued_line_comment_is_found(self):
+        # Flipped in r3.
+        self.assertEqual(
+            ["thread_local Foo g;", "// comment thread_local Foo g;"],
+            thread_local_lines("// comment \\\nthread_local Foo g;\nint x;\n"),
+        )
+
+    def test_comment_markers_inside_a_string_do_not_hide_the_token(self):
+        self.assertEqual(
+            ['const char * s = "//"; thread_local Foo g;'],
+            thread_local_lines('const char * s = "//"; thread_local Foo g;\n'),
+        )
+        self.assertEqual(
+            ['const char * s = "/*"; thread_local Foo g; const char * e = "*/";'],
+            thread_local_lines('const char * s = "/*"; thread_local Foo g; const char * e = "*/";\n'),
+        )
+
+    def test_comment_markers_inside_a_raw_string_do_not_hide_the_token(self):
+        self.assertEqual(
+            ['const char * s = R"x(/*)x"; thread_local Foo g;'],
+            thread_local_lines('const char * s = R"x(/*)x"; thread_local Foo g;\n'),
+        )
+
+    def test_comment_markers_inside_a_prefixed_raw_string_do_not_hide_the_token(self):
+        # Adversary A2.
+        for prefix in ("u8R", "uR", "UR", "LR"):
+            source = 'const char * s = %s"x("/*)x";\nthread_local Foo g;\n' % prefix
+            self.assertEqual(["thread_local Foo g;"], thread_local_lines(source), prefix)
+
+    def test_a_comment_terminator_split_by_a_continuation_does_not_hide_the_token(self):
+        # Adversary A3. Both views report it now: the physical line and the spliced one.
+        self.assertEqual(
+            ["/ thread_local Foo g;", "/* ignored */ thread_local Foo g;"],
+            thread_local_lines("/* ignored *\\\n/ thread_local Foo g;\n"),
+        )
+
+    def test_a_splice_inside_a_raw_string_does_not_hide_the_token(self):
+        # Sol r2 B1 (fable B1, opus B1): all five raw prefixes, LF and CRLF.
+        for prefix in RAW_PREFIXES:
+            for eol in LINE_ENDS:
+                lines = thread_local_lines(raw_string_splice(prefix, eol))
+                self.assertIn('"/*)x"; thread_local Foo g; // */', lines, (prefix, eol))
+
+    def test_a_continuation_with_trailing_whitespace_is_a_continuation(self):
+        # Opus r2 B2: GCC takes backslash, whitespace, newline as a continuation.
+        for source in ("thread_\\ \nlocal Foo g;\n", "thread_\\\t\r\nlocal Foo g;\r\n", "thread_\\ \f\v\nlocal Foo g;\n"):
+            self.assertEqual(["thread_local Foo g;"], thread_local_lines(source), repr(source))
+
+    def test_a_continuation_with_nul_whitespace_is_a_continuation(self):
+        # Opus r3 B1, end to end on the bytes path: the gate passes the file, decoding keeps each NUL as U+0000, and
+        # the spliced view reports the declaration.
+        for data in (b"thread_\\\x00\nlocal Foo g;\n", b"thread_\\\x00\x00 \nlocal Foo g;\n",
+                     b"thread_\\\x00\r\nlocal Foo g;\r\n"):
+            with self.subTest(data=data):
+                text = data.decode("utf-8", errors="replace")
+                self.assertEqual(data.count(b"\x00"), text.count("\x00"))
+                self.assertTrue(may_hold_token(data))
+                self.assertEqual(["thread_local Foo g;"], thread_local_lines(text))
+
+    def test_a_directory_listing_error_is_raised_not_skipped(self):
+        # Sol r3 B1: Path.rglob swallowed PermissionError and FileNotFoundError from os.scandir on a subdirectory, so
+        # a declaration under it was never read and all three product-tree tests passed.
+        for denied in ("src/processing/rbfilter", "platform/qt/avir"):
+            for error in (PermissionError, FileNotFoundError):
+                with self.subTest(denied=denied, error=error.__name__), tempfile.TemporaryDirectory() as tmp:
+                    root = Path(tmp)
+                    write_allow_listed_tree(root)
+                    self.assertTrue(product_tree_result(root).wasSuccessful(), "baseline must be green")
+                    (root / denied).mkdir(parents=True, exist_ok=True)
+                    (root / denied / "hidden.cpp").write_text(GUARD_PROBE, encoding="utf-8")
+                    self.assertTrue(offenders(root), "the probe is found when the listing works")
+                    with mock.patch("os.scandir", scandir_raising(root / denied, error)):
+                        with self.assertRaises(error):
+                            offenders(root)
+                        result = product_tree_result(root)
+                    self.assertFalse(result.wasSuccessful(), "ProductTreeTests passed with the listing denied")
+
+    def test_a_missing_scanned_directory_is_raised_not_skipped(self):
+        for missing in SCANNED_DIRECTORIES:
+            with self.subTest(missing=missing), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                for directory in SCANNED_DIRECTORIES:
+                    if directory != missing:
+                        (root / directory).mkdir()
+                with self.assertRaises(FileNotFoundError):
+                    scan(root)
+
+    def test_an_entry_that_vanishes_mid_scan_is_raised_not_skipped(self):
+        # DirEntry.is_dir and is_file answer False on FileNotFoundError; the walk must not take that as "skip".
+        real_scandir = os.scandir
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "src" / "processing").mkdir(parents=True)
+            (root / "platform").mkdir()
+            target = os.path.normcase(os.path.abspath(root / "src" / "processing"))
+
+            def scandir(path="."):
+                if os.path.normcase(os.path.abspath(path)) == target:
+                    return _Listing(list(real_scandir(path)) + [_GhostEntry(os.fspath(path), "gone.cpp")])
+                return real_scandir(path)
+
+            with mock.patch("os.scandir", scandir):
+                with self.assertRaises(FileNotFoundError):
+                    scan(root)
+
+    def test_an_entry_that_reappears_is_scanned(self):
+        # Sol r4 B1: both cached answers False, then a fresh stat that succeeds. Its answer was dropped, so a regular
+        # file (a file symlink whose target came back) or a real directory was never read and ProductTreeTests passed.
+        for subtree in ("src/processing/rbfilter", "platform/qt/avir"):
+            for kind in ("file", "directory"):
+                with self.subTest(subtree=subtree, kind=kind), tempfile.TemporaryDirectory() as tmp:
+                    root = Path(tmp)
+                    write_allow_listed_tree(root)
+                    (root / subtree).mkdir(parents=True, exist_ok=True)
+                    ghost = root / subtree / ("hidden.cpp" if kind == "file" else "reappeared")
+                    source = ghost if kind == "file" else ghost / "hidden.cpp"
+                    source.parent.mkdir(parents=True, exist_ok=True)
+                    source.write_text(GUARD_PROBE, encoding="utf-8")
+                    expected = (source.relative_to(root).as_posix(), GUARD_PROBE.strip())
+                    with mock.patch("os.scandir", scandir_ghosting(ghost)):
+                        self.assertIn(expected, offenders(root))
+                        self.assertFalse(product_tree_result(root).wasSuccessful(), "a reappeared entry read clean")
+        for name, source in HIDDEN_SHAPES:
+            with self.subTest(shape=name), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                (root / "src" / "processing").mkdir(parents=True)
+                (root / "platform").mkdir()
+                ghost = root / "src" / "processing" / name
+                ghost.write_bytes(source.encode("utf-8"))
+                with mock.patch("os.scandir", scandir_ghosting(ghost)):
+                    self.assertTrue(offenders(root), name)
+
+    def test_an_entry_that_reappears_as_neither_file_nor_directory_is_raised(self):
+        # A fresh stat that is a socket, FIFO or device is an error, never a silent skip.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "src").mkdir()
+            (root / "platform").mkdir()
+            ghost = root / "src" / "hidden.cpp"
+            ghost.write_text(GUARD_PROBE, encoding="utf-8")
+            real_stat = os.stat
+            target = os.path.normcase(os.path.abspath(ghost))
+
+            def fifo_stat(path, *args, **kwargs):
+                result = real_stat(path, *args, **kwargs)
+                if os.path.normcase(os.path.abspath(path)) == target:
+                    return os.stat_result((stat.S_IFIFO | 0o644,) + tuple(result)[1:])
+                return result
+
+            with mock.patch("os.scandir", scandir_ghosting(ghost)), mock.patch("os.stat", fifo_stat):
+                with self.assertRaises(OSError):
+                    scan(root)
+                self.assertFalse(product_tree_result(root).wasSuccessful())
+
+    def test_a_lone_carriage_return_ends_a_continuation(self):
+        self.assertEqual(["thread_local Foo g;"], thread_local_lines("thread_\\\rlocal Foo g;\r"))
+
+    def test_a_comment_terminator_split_with_trailing_whitespace_does_not_hide_the_token(self):
+        # Opus r2 B2, second input.
+        self.assertIn("/ thread_local Foo g;", thread_local_lines("/* c *\\ \n/ thread_local Foo g;\n"))
+
+    def test_the_unspliced_view_reports_a_token_a_continuation_would_glue(self):
+        # Direction 1 of the union: the spliced view alone misses it.
+        source = "thread_local\\\nFoo g;\n"
+        self.assertIsNone(TOKEN.search(views(source)[1]))
+        self.assertEqual(["thread_local\\"], thread_local_lines(source))
+
+    def test_the_spliced_view_reports_a_token_split_by_a_continuation(self):
+        # Direction 2 of the union: the unspliced view alone misses it.
+        source = "thread_\\ \nlocal Foo g;\n"
+        self.assertIsNone(TOKEN.search(views(source)[0]))
+        self.assertEqual(["thread_local Foo g;"], thread_local_lines(source))
+
+    def test_a_digit_separator_does_not_open_a_literal(self):
+        self.assertEqual(
+            ["int n = 1'000; thread_local Foo g;"],
+            thread_local_lines("int n = 1'000; thread_local Foo g;\n"),
+        )
+
+    def test_a_prefixed_character_literal_does_not_desynchronise_quotes(self):
+        # Adversary second pass A1.
+        source = "const wchar_t c = L'\"'; const char * s = \"//\"; thread_local Foo g;\n"
+        self.assertEqual([source.strip()], thread_local_lines(source))
+
+    def test_a_hex_digit_separator_does_not_open_a_literal(self):
+        self.assertEqual(
+            ["int n = 0xA'B; thread_local Foo g;"],
+            thread_local_lines("int n = 0xA'B; thread_local Foo g;\n"),
+        )
+
+    def test_a_hex_float_digit_separator_does_not_hide_the_token(self):
+        # Adversary third pass A1 (r1).
+        source = "double d = 0x1.A'Bp0; const char c = '\"'; const char * s = \"//\"; thread_local Foo g;\n"
+        self.assertEqual([source.strip()], thread_local_lines(source))
+
+    def test_a_pp_number_that_starts_at_its_point_still_has_a_digit_separator(self):
+        for number in (".5'0", "return.5'0", "a.b.5'0"):
+            source = "x = %s; const char c = '\"'; const char * s = \"//\"; thread_local Foo g;\n" % number
+            self.assertEqual([source.strip()], thread_local_lines(source), number)
+
+    def test_a_character_literal_after_a_point_is_still_a_literal(self):
+        for literal in (".'\"'", "s.L'\"'"):
+            source = "x = %s; const char * s = \"//\"; thread_local Foo g;\n" % literal
+            self.assertEqual([source.strip()], thread_local_lines(source), literal)
+
+    def test_a_longer_identifier_is_not_the_token(self):
+        self.assertEqual([], thread_local_lines("int my_thread_local_count;\nint thread_locals;\n"))
+
+    def test_the_bytes_gate_never_drops_what_the_decoded_search_reports(self):
+        # The gate must be a superset of thread_local_lines on the decoded text, invalid UTF-8 included.
+        import random
+
+        fixed = [source.encode("utf-8") for _, source in HIDDEN_SHAPES] + [
+            b"\xc3\\\n\xa9 thread_local Foo g;\n",
+            b"\xe2thread_local Foo g;\n",
+            b"\xffthread_\\ \r\nlocal\xfe Foo g;\n",
+            b"thread_\xc3\\\nlocal Foo g;\n",
+        ]
+        pieces = [b"thread_", b"local", b"thread_local", b"\\", b"\\ \n", b"\\\r\n", b"\\\r", b"\n", b" ", b"\xc3",
+                  b"\xa9", b"\xe2\x80", b"\xff", b"x", b"_", b"/*", b"*/", b"\"", b"R\"x(", b"\x00", b"\\\x00\n",
+                  b"\\\x00\r\n", b"\\\x00\x00 \n"]
+        rng = random.Random(761)
+        generated = [b"".join(rng.choice(pieces) for _ in range(rng.randint(1, 12))) for _ in range(3000)]
+        for data in fixed + generated:
+            if thread_local_lines(data.decode("utf-8", errors="replace")):
+                self.assertTrue(may_hold_token(data), data)
+
+    def test_every_hidden_shape_is_reported(self):
+        for name, source in HIDDEN_SHAPES:
+            self.assertTrue(thread_local_lines(source), name)
+
+    def test_the_scan_reads_every_file_and_skips_other_trees(self):
+        # Flipped in r3: there is no include list and no skip list, so note.txt, icon.PNG and ffmpeg.tar.xz are
+        # reported too (opus r2 B3: .inc, .hxx, .hh, .ipp; adversary r3 A1: binary suffixes).
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "src" / "a").mkdir(parents=True)
+            (root / "platform").mkdir()
+            (root / "tests").mkdir()
+            for name in ("x.cxx", "y.inl", "z.TCC", "p.inc", "q.hxx", "r.hh", "s.ipp", "NOSUFFIX"):
+                (root / "src" / "a" / name).write_text("thread_local int t;\n", encoding="utf-8")
+            (root / "platform" / "w.h").write_text("thread_local int t;\n", encoding="utf-8")
+            (root / "platform" / "note.txt").write_text("thread_local int t;\n", encoding="utf-8")
+            (root / "platform" / "latin1.c").write_bytes(b"/* caf\xe9 */ thread_local int t;\n")
+            (root / "platform" / "pixels.fpm").write_text("thread_local int t;\n", encoding="utf-8")
+            (root / "platform" / "icon.PNG").write_bytes(b"\x89PNG thread_local int t;\n")
+            (root / "platform" / "ffmpeg.tar.xz").write_bytes(b"thread_local int t;\n")
+            (root / "tests" / "v.cpp").write_text("thread_local int t;\n", encoding="utf-8")
+            self.assertEqual(
+                {
+                    "src/a/x.cxx",
+                    "src/a/y.inl",
+                    "src/a/z.TCC",
+                    "src/a/p.inc",
+                    "src/a/q.hxx",
+                    "src/a/r.hh",
+                    "src/a/s.ipp",
+                    "src/a/NOSUFFIX",
+                    "platform/w.h",
+                    "platform/note.txt",
+                    "platform/latin1.c",
+                    "platform/pixels.fpm",
+                    "platform/icon.PNG",
+                    "platform/ffmpeg.tar.xz",
+                },
+                {path for path, _ in scan(root)},
+            )
+
+    def test_the_product_tree_check_reports_each_hidden_shape(self):
+        # Sol r2: all three product-tree tests passed with a hidden declaration in the tree.
+        import tempfile
+
+        for name, source in HIDDEN_SHAPES:
+            with tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                (root / "src" / "processing").mkdir(parents=True)
+                (root / "platform").mkdir()
+                (root / "src" / "processing" / name).write_bytes(source.encode("utf-8"))
+                self.assertTrue(offenders(root), name)
+
+
+class ProductTreeTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.found = scan(ROOT)
+
+    def test_no_thread_local_outside_the_allow_list(self):
+        self.assertEqual(
+            [],
+            [entry for entry in self.found if entry not in ALLOW_LIST],
+            "thread_local in product code: use mlvThreadExitCache (src/processing/ThreadExitCache.h), "
+            "or add an exact allow-list entry with the reason it registers no destructor "
+            "(a comment or string that mentions it: reason '" + COMMENT_TEXT + "', or reword)",
+        )
+
+    def test_every_allow_list_entry_still_exists(self):
+        found = set(self.found)
+        self.assertEqual([], [entry for entry in ALLOW_LIST if entry not in found], "stale allow-list entry")
+
+    def test_every_allow_list_entry_gives_a_reason(self):
+        self.assertTrue(all(reason.strip() for reason in ALLOW_LIST.values()))
+
+
+if __name__ == "__main__":
+    unittest.main()
