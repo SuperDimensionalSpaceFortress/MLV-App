@@ -824,10 +824,10 @@ static void debayer_hacd_select_row(uint16_t *out, const uint16_t *bayer, const 
          * adjacent pixels share, so it runs once per site, in tiles: the curvature sums first, then r12's float test
          * (own sum / a <= cd, the same IEEE divide and compare) as a straight loop the compiler can run four lanes
          * wide, then each pixel picks its value with a select instead of a data-dependent branch. */
-        const int ns = (w - py + 1) / 2; /* own sites sx = 2 j + py < w */
-        for (int j0 = 0; j0 < ns; j0 += DEBAYER_H121_TILE)
+        const int nsites = (w - py + 1) / 2; /* own sites sx = 2 j + py < w */
+        for (int j0 = 0; j0 < nsites; j0 += DEBAYER_H121_TILE)
         {
-            const int nj = MIN(DEBAYER_H121_TILE, ns - j0);
+            const int nj = MIN(DEBAYER_H121_TILE, nsites - j0);
             float so[DEBAYER_H121_TILE], sc[DEBAYER_H121_TILE];
             int take[DEBAYER_H121_TILE];
             for (int t = 0; t < nj; ++t)
@@ -842,7 +842,7 @@ static void debayer_hacd_select_row(uint16_t *out, const uint16_t *bayer, const 
             }
             for (int t = 0; t < nj; ++t) take[t] = so[t] / a <= sc[t];
             /* pixel x's site is j = x >> 1, except past the last site (odd w, B), which mirrors to j - 1 */
-            const int x1 = (j0 + nj == ns) ? w : 2 * (j0 + nj);
+            const int x1 = (j0 + nj == nsites) ? w : 2 * (j0 + nj);
             for (int x = 2 * j0; x < x1; ++x)
             {
                 int t = (x >> 1) - j0;
