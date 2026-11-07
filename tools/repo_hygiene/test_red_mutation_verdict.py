@@ -1791,6 +1791,33 @@ class SummarySplitR11(unittest.TestCase):
               "FAILED u.py::TestA[x]::test_target[p] - AssertionError\n=== 2 failed in 0.04s ===\n")
         self._bracket(a1, "t.py::TestA[x].test_target[p]")
 
+    def test_r13_pass1_other_lines_check_every_reading_of_their_id(self) -> None:
+        # adversary r13 pass 1 (11a64a80): A1, a SKIPPED location cut at its first `:` (a drive letter) and A2, an
+        # XFAIL/XPASS id cut at its first ' - ' (inside its parameter id), each hid the rest of the id from the checks
+        def text(line: str, count: str) -> str:
+            return (f"=== short test summary info ===\n{line}\nFAILED t.py::test_a - AssertionError\n"
+                    f"=== 1 failed, {count} in 0.1s ===\n")
+        for line in ("SKIPPED [1] C:\\a[x]\\t.py:3: why", "SKIPPED [1] C:/a[x]/t.py:3: why", "SKIPPED [1] a[x]/t.py:3: why"):
+            with self.subTest(line=line):
+                self._bracket(text(line, "1 skipped"), "t.py::test_a")
+        for line in ("SKIPPED [1] C:\\a\\\\t.py:3: why", "SKIPPED [1] C:/a//t.py:3: why"):  # an empty segment after `C:`
+            with self.subTest(line=line):
+                v = rmv.classify(text(line, "1 skipped"), "t.py::test_a")
+                self.assertEqual(v.status, rmv.REFUSED, v)
+        for word, count in (("XFAIL", "1 xfailed"), ("XPASS", "1 xpassed")):
+            for node in ("t.py::test_b[p - q::r] - reason", "t.py::TestB[x - y]::test_b - reason"):
+                with self.subTest(word=word, node=node):
+                    self._bracket(text(f"{word} {node}", count), "t.py::test_a")
+            with self.subTest(word=word, empty=True):  # an empty segment after a ' - ' inside a class name
+                v = rmv.classify(text(f"{word} t.py::TestB - x::::test_b - reason", count), "t.py::test_a")
+                self.assertEqual(v.status, rmv.REFUSED, v)
+        # controls: a drive-qualified SKIPPED location and an XFAIL with a reason stay readable
+        for line, count in (("SKIPPED [1] C:\\a\\t.py:3: why", "1 skipped"), ("XFAIL t.py::test_b[p] - reason", "1 xfailed"),
+                            ("XPASS t.py::test_b - a reason", "1 xpassed")):
+            with self.subTest(control=line):
+                v = rmv.classify(text(line, count), "t.py::test_a")
+                self.assertEqual((v.status, v.code), (rmv.PASS, "assertion-failed"), v)
+
     def test_bracket_only_in_the_trailing_parameter_id_stays_readable(self) -> None:
         # r13 controls: a `[` after the last separator is the last segment's parameter id, whatever it holds but `::`
         for line, want in (("FAILED t.py::test_x[p] - AssertionError: boom", "t.py::test_x[p]"),

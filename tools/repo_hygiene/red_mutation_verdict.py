@@ -839,20 +839,28 @@ def _other_line(word: str, line: str) -> tuple[int, str]:
         m = _SKIPPED_BODY.fullmatch(body)
         if not m:
             return 0, "a SKIPPED line that is not `SKIPPED [n] file:line: reason`"
-        where = body[m.end(1) + 2:].split(":", 1)[0]
-        if _bracket_before_last_segment(where, _PATH_SEPS):  # r13: raised, so the bracket code is the primary one
-            raise _Unclassifiable("cnc-bracket-before-last-segment", _bracket_reason("the SKIPPED location", where))
-        if _empty_segment(where):
+        # r13 pass 1 A1 (11a64a80): the file ends at ANY `:<line>: `, not at the first `:` (a drive letter `C:\a[x]\t.py`
+        # was read as `C`), so EVERY reading of it is checked; raised, so the bracket code is the primary one
+        rest = body[m.end(1) + 2:]
+        wheres = [rest[:k.start()] for k in re.finditer(r":[0-9]+: ", rest)]
+        for where in wheres:
+            if _bracket_before_last_segment(where, _PATH_SEPS):
+                raise _Unclassifiable("cnc-bracket-before-last-segment", _bracket_reason("the SKIPPED location", where))
+        if any(_empty_segment(where) for where in wheres):
             return 0, "a SKIPPED line whose file path has an empty segment"
         return int(m[1]), ""
     if not _OTHER_NODE.fullmatch(body):
         return 0, f"a {word} line that is not `{word} <file>::<name>`"
     if word == "PASSED" and " - " in body:
         return 0, "a PASSED line holding ' - ' (a real one is `PASSED <id>` alone)"
-    node = body.split(" - ", 1)[0]
-    if _bracket_before_last_segment(node, _node_seps(node)):  # r13 (f2b4440f A3: `PASSED t.py::TestB[x]::test_x::[p]`)
-        raise _Unclassifiable("cnc-bracket-before-last-segment", _bracket_reason(f"the {word} id", node))
-    if _empty_segment(node):
+    # r13 pass 1 A2 (11a64a80): an XFAIL/XPASS id may hold ' - ' (in its parameter id, or a class name set through
+    # globals()), so the id ends at ANY ' - ' or runs to the end of the line: EVERY reading of it is checked, never only
+    # the text before the first ' - ' (the reason text is then checked too, which only ever refuses)
+    nodes = [body[:k.start()] for k in re.finditer(" - ", body)] + [body]
+    for node in nodes:
+        if _bracket_before_last_segment(node, _node_seps(node)):  # r13 (f2b4440f A3: `PASSED t.py::TestB[x]::test_x::[p]`)
+            raise _Unclassifiable("cnc-bracket-before-last-segment", _bracket_reason(f"the {word} id", node))
+    if any(_empty_segment(node) for node in nodes):
         return 0, f"a {word} line whose id has an empty segment (`::::`, a trailing `::`, `//`): no such id exists"
     return 1, ""
 
