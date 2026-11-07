@@ -300,6 +300,75 @@ TEST(ResizeStillDrawingWait, ABlockedSampleEndsTheIdleRunSoSeparateIdlePeriodsNe
     ASSERT_TRUE(result.waitedMs <= 150 + kStaleIdleGraceMs + 1);
 }
 
+// adversary r3 pass 2 A1: a millisecond clock cannot see a block that starts and ends inside one tick. The adversary's
+// input: a microsecond clock tUs from 0, nowMs = tUs/1000; pumps set tUs to 1000, 50100, 51000 (then 1000 apart); every
+// sample idle; the second blocks 50100 -> 50900 (800 us, same 50 ms tick). The helper reads the fine clock (nowUs), so
+// the block restarts the run at 50.9 ms and the stale clear needs t >= 100.9 ms; the ms-only arithmetic cleared at 51.
+TEST(ResizeStillDrawingWait, ABlockInsideOneMillisecondTickStillEndsTheIdleRun)
+{
+    std::int64_t tUs = 0;
+    bool flag = true;
+    int pumps = 0;
+    int samples = 0;
+    int clears = 0;
+    Callbacks c;
+    c.stillDrawing = [&flag]() { return flag; };
+    c.pump = [&tUs, &pumps]() {
+        ++pumps;
+        if (pumps == 1) tUs = 1000;
+        else if (pumps == 2) tUs = 50100;
+        else if (pumps == 3) tUs = 51000;
+        else tUs += 1000;
+    };
+    c.renderIdle = [&tUs, &samples]() {
+        if (samples++ == 1) tUs = 50900; // blocked on the renderer mutex 50100 -> 50900 us
+        return true;
+    };
+    c.clearStale = [&flag, &clears]() { ++clears; flag = false; };
+    c.nowMs = [&tUs]() { return tUs / 1000; };
+    c.nowUs = [&tUs]() { return tUs; };
+    const Result result = wait(c);
+    ASSERT_TRUE(result.outcome == Outcome::StaleCleared);
+    ASSERT_EQ(1, clears);
+    ASSERT_TRUE(result.waitedMs >= 100); // 100.9 ms truncated
+    ASSERT_TRUE(result.waitedMs <= 102);
+}
+
+// The other side of the same rule: a sample that costs what an uncontended renderer-mutex read costs (well under
+// kBlockedSampleUs) is not a block, so a quiet render thread is still stale-cleared after the grace, not only at the
+// 2000 ms deadline. Its own time is still never credited as idle.
+TEST(ResizeStillDrawingWait, AnUncontendedSampleDoesNotRestartTheIdleRun)
+{
+    ASSERT_TRUE(resize_still_drawing_wait::kBlockedSampleUs > 10);
+    ASSERT_TRUE(resize_still_drawing_wait::kBlockedSampleUs < 1000);
+    std::int64_t tUs = 0;
+    bool flag = true;
+    int clears = 0;
+    Callbacks c;
+    c.stillDrawing = [&flag]() { return flag; };
+    c.pump = [&tUs]() { tUs += 990; };
+    c.renderIdle = [&tUs]() { tUs += 10; return true; }; // 10 us per sample
+    c.clearStale = [&flag, &clears]() { ++clears; flag = false; };
+    c.nowMs = [&tUs]() { return tUs / 1000; };
+    c.nowUs = [&tUs]() { return tUs; };
+    const Result result = wait(c);
+    ASSERT_TRUE(result.outcome == Outcome::StaleCleared);
+    ASSERT_EQ(1, clears);
+    ASSERT_TRUE(result.waitedMs >= kStaleIdleGraceMs);
+    ASSERT_TRUE(result.waitedMs <= kStaleIdleGraceMs + 5);
+}
+
+TEST(ResizeStillDrawingWaitWiring, TheSiteWaitFeedsTheHelperAMicrosecondClock)
+{
+    const QString source = readRepoFile(QStringLiteral("platform/qt/MainWindow.cpp"));
+    const QString body = functionBody(source,
+        QStringLiteral("MainWindow::waitForResizeStillDrawing( const QString &site )"),
+        QStringLiteral("//Window resized -> scale picture"));
+    ASSERT_FALSE(body.isEmpty());
+    ASSERT_TRUE(body.contains(QStringLiteral(
+        "callbacks.nowUs = [&clock]() { return static_cast<std::int64_t>( clock.nsecsElapsed() / 1000 ); };")));
+}
+
 // r3 (adversary r2 pass 3 A1, which supersedes r2's request-serial floor). drawFrameReady sizes the scene from the zoom and
 // stretch state at PRESENT time (computeDisplaySceneGeometry + setSceneRect), so the geometry a frame lands on is not a
 // property of its request serial: an OLDER request can present at the NEW geometry. The serial floor rejected it and left

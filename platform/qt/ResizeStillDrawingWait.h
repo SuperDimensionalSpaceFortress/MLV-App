@@ -48,7 +48,10 @@ struct Callbacks
     std::function<void()> pump;
     std::function<void()> clearStale;
     std::function<std::int64_t()> nowMs; // monotonic
+    std::function<std::int64_t()> nowUs; // r3 RED stub: not read yet
 };
+
+constexpr std::int64_t kBlockedSampleUs = 100; // r3 RED stub: not used yet
 
 struct Result
 {
