@@ -664,6 +664,11 @@ def _foreign_type(failure: Failure) -> str:
     class of any name may subclass ImportError (or an ExceptionGroup holding one), so only a builtin exception that
     is not an ImportError, an assertion, or pytest's ``Failed:`` is known not to be an import failure."""
     text = failure.exc.strip()
+    if not text and not failure.assertion:
+        # r8 adversary pass 2, A1: an exception group prints no `E` line (and -rN prints no summary line), so nothing
+        # shows the type of this failure; "" must never read as "known not to be an import error".
+        return ("no exception line is shown for a failing test (an exception group prints none): its class may "
+                "subclass ImportError, which the run does not say")
     if not text or _ASSERT_HEAD.match(text):
         return ""
     token = re.match(r"[\w.]+", text)
@@ -712,7 +717,7 @@ def _count_mismatch(text: str, ut_blocks: int, stats: dict) -> str:
         # in, is message text), and a unittest `OK`/`FAILED (...)` trailer has its `Ran N tests` footer before it.
         # Otherwise the runner's counts are missing and a later failure (an import error included) may have been cut.
         lines = [ln for ln in text.splitlines() if ln.strip()]
-        final = lines[-1].strip() if lines else ""
+        final = lines[-1] if lines else ""  # NOT stripped: a real result line starts at column 0 (adversary pass 2, A2)
         if not _RESULT_LINE.match(final):
             return ("no final result line (the run must end in a unittest `OK`/`FAILED (...)` trailer or a pytest "
                     "`=== N failed ... ===` bar): a cut-off log cannot be reconciled with the runner's counts")
@@ -789,7 +794,8 @@ def verdict(output: str, expected: str) -> tuple[str, str]:
         pre = _precheck(output, expected)
         status, reason = _verdict(output, expected)
     except _Unclassifiable as exc:
-        return REFUSED, f"COULD-NOT-CHECK ({exc})"
+        # a count or summary problem found by the precheck is the more basic one: it leads, the other follows
+        return REFUSED, f"COULD-NOT-CHECK ({pre or exc})" + (f"; also: {exc}" if pre else "")
     except Exception as exc:  # noqa: BLE001 - the promise is a refusal, never an uncaught traceback
         return REFUSED, f"COULD-NOT-CHECK (internal-error {type(exc).__name__} while reading the text)"
     if pre:
