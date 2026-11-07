@@ -1993,7 +1993,10 @@ def test_codex_answer_of_supplementary_plane_format_characters_is_empty(tmp_path
 def test_codex_final_fence_decides_even_when_it_is_malformed_or_not_an_object(tmp_path):
     # adversary A2: an earlier provisional block with a verdict must not rescue a broken final block.
     body = "x" * 120 + "\n```json\n" + '{"verdict":"APPROVE"}' + "\n```\n"
-    for tail in ('```json\n{"verdict":null\n```', "```json\n[]\n```", '```json\n{"verdict":"APPROVE"', "```json\n```"):
+    for tail in ('```json\n{"verdict":null\n```', "```json\n[]\n```", '```json\n{"verdict":"APPROVE"', "```json\n```",
+                 '```json\n[{"verdict":"APPROVE"}]\n```',                      # A1 (2nd pass): array, not object
+                 '```json title="final"\n{"verdict":null}\n```',               # A2: info string after the language
+                 '```json5\n{"verdict":null}\n```', '~~~json\n{"verdict":null}\n~~~'):
         r = _work_evidence(tmp_path, "codex", body + tail, 0, prompt_chars=600, require_verdict=True)
         assert r["workCompleted"] is False and r["reason"] == "codex-no-verdict", (tail, r)
     # control: a well-formed final block after the provisional one is the verdict
@@ -2020,6 +2023,46 @@ def test_invoke_lane_wiring_final_json_without_properties_is_no_verdict_not_a_th
     key_prompt = 'Review.\nFinal json: {"verdict":"APPROVE|CHANGES_REQUESTED"}\n' + "x" * 600
     w = _run_invoke_lane_codex_wiring(tmp_path, "x" * 120 + "\n{}", "", "", key_prompt)
     assert w["evidence"]["reason"] == "codex-no-verdict", w
+
+
+def test_codex_verdict_field_name_is_case_exact(tmp_path):
+    # adversary A3 (2nd pass): PowerShell member lookup is case-insensitive; the contract field is 'verdict'.
+    for fld in ("VERDICT", "Verdict"):
+        r = _work_evidence(tmp_path, "codex", "x" * 120 + "\n" + '{"%s":"APPROVE"}' % fld, 0, prompt_chars=600, require_verdict=True)
+        assert r["workCompleted"] is False and r["reason"] == "codex-no-verdict", (fld, r)
+
+
+def test_substance_length_honours_a_cap_below_one(tmp_path):
+    # adversary A5 (2nd pass): Cap 0 returned 1 for a supplementary-plane character.
+    cmd = (f". '{REFUSAL_HELPER}'; "
+           "[string](Get-LaneAnswerSubstanceLength -Answer ([char]::ConvertFromUtf32(0x1F600) * 5) -Cap 0) + ' ' + "
+           "[string](Get-LaneAnswerSubstanceLength -Answer ([char]::ConvertFromUtf32(0x1F600) * 5) -Cap 3)")
+    out = subprocess.run(["pwsh", "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", cmd], text=True, capture_output=True)
+    assert out.returncode == 0, out.stderr
+    assert out.stdout.strip() == "1 3", out.stdout
+
+
+def test_invoke_lane_wiring_refusal_text_delivered_as_the_answer_is_still_refused_when_stderr_corroborates(tmp_path):
+    # adversary A6 (2nd pass): the base refused this (blank stdout, ERROR line on stderr). The same line in the
+    # last-message file must not turn it into a completed lane. Without stderr corroboration (A3) it is an answer.
+    e = "ERROR: you've hit your usage limit. try again at Nov 9th"
+    prompt = "Review this change. " + "p" * 600
+    w = _run_invoke_lane_codex_wiring(tmp_path, "\n".join([e, e, e]), "", e + "\n", prompt)
+    assert w["refusal"] is not None and w["refusal"]["kind"] == "provider-usage-limit", w
+    w = _run_invoke_lane_codex_wiring(tmp_path, "\n".join([e, e, e]), "", "", prompt)
+    assert w["refusal"] is None, w
+    # one real line makes it an answer even with the ERROR line on stderr
+    w = _run_invoke_lane_codex_wiring(tmp_path, REAL_SIZED_CODEX_ANSWER + "\n" + e, "", e + "\n", prompt)
+    assert w["refusal"] is None, w
+
+
+def test_invoke_lane_writes_the_selected_answer_to_the_output_file_when_the_last_message_has_no_substance():
+    # adversary A4 (2nd pass): outputSha256 hashes $final while outputPath is the last-message file.
+    body = LANE_RUNNER.read_text(encoding="utf-8")
+    needle = ("if (-not $timedOut -and (Test-LaneAnswerHasSubstance -Answer $codexAnswerEvidence) "
+              "-and -not (Test-LaneAnswerHasSubstance -Answer $lastMessage)) {\n        Write-Utf8NoBom $lastPath $codexAnswerEvidence")
+    assert needle.replace("\n", "\r\n") in body or needle in body, "selected answer must be written to the receipt output file"
+    assert body.index(needle.split("\n")[0]) < body.index("outputSha256 = Get-Sha256 $final")
 
 
 def test_invoke_lane_assigns_the_codex_answer_evidence_exactly_once():

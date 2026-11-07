@@ -66,7 +66,7 @@ function Find-ClaudeResultEnvelope {
         $t = $ln.Trim()
         if ($t.Length -eq 0) { continue }
         $cand = $null
-        try { $cand = $t | ConvertFrom-Json -ErrorAction Stop } catch { continue }
+        try { $cand = $t | ConvertFrom-Json -NoEnumerate -ErrorAction Stop } catch { continue }
         if ($null -eq $cand -or $cand -isnot [System.Management.Automation.PSCustomObject]) { continue }
         $candNames = @($cand.PSObject.Properties | ForEach-Object { $_.Name })
         if (-not ($candNames -contains 'type') -or [string]$cand.type -ne 'result') { continue }
@@ -116,6 +116,7 @@ $script:CODEX_PROBE_PROMPT_CHARS = 400
 function Get-LaneAnswerSubstanceLength {
     param([AllowEmptyString()][AllowNull()][string]$Answer, [int]$Cap = 2147483647)
     if ([string]::IsNullOrEmpty($Answer)) { return 0 }
+    if ($Cap -lt 1) { $Cap = 1 }
     $rest = [regex]::Replace($Answer, '[\s\p{Cf}]', '')
     if ($rest.Length -eq 0) { return 0 }
     if (-not [regex]::IsMatch($rest, '[\uD800-\uDFFF]')) { return [Math]::Min($rest.Length, $Cap) }
@@ -144,23 +145,40 @@ function Test-PromptDemandsVerdict {
     return [regex]::IsMatch($Prompt, '"verdict"\s*:')
 }
 
-# The FINAL json object of an answer: the LAST fenced block (an unterminated last fence runs to the end of
-# the answer), else the last line-start '{' that parses to the end. A malformed or non-object final block
-# is $null: an earlier provisional block never stands in for it. Returns the object, or $null.
+# The FINAL json object of an answer: the LAST fenced block (``` or ~~~, any info string such as json5 or
+# title="final"; an unterminated last fence runs to the end of the answer), else the last line-start '{'
+# that parses to the end. A malformed or non-object final block (an array included: -NoEnumerate keeps
+# '[{...}]' an array) is $null: an earlier provisional block never stands in for it. Returns the object or $null.
+function ConvertFrom-LaneJsonObject {
+    param([AllowEmptyString()][AllowNull()][string]$Text)
+    if ([string]::IsNullOrWhiteSpace($Text)) { return $null }
+    try { $o = $Text | ConvertFrom-Json -NoEnumerate -ErrorAction Stop } catch { return $null }
+    if ($o -is [System.Management.Automation.PSCustomObject]) { return $o }
+    return $null
+}
+
 function Get-LaneFinalJsonObject {
     param([AllowEmptyString()][AllowNull()][string]$Answer)
     if ([string]::IsNullOrWhiteSpace($Answer)) { return $null }
-    $fenced = [regex]::Matches($Answer, '(?ms)^[ \t]*```[A-Za-z]*[ \t]*\r?\n(.*?)(?:^[ \t]*```[ \t]*\r?$|\z)')
-    if ($fenced.Count -gt 0) {
-        try { $o = $fenced[$fenced.Count - 1].Groups[1].Value | ConvertFrom-Json -ErrorAction Stop } catch { return $null }
-        if ($o -is [System.Management.Automation.PSCustomObject]) { return $o }
-        return $null
+    $lines = $Answer -split "`r?`n"
+    $inBlock = $false; $sawBlock = $false
+    $cur = New-Object System.Collections.Generic.List[string]
+    $last = $null
+    foreach ($ln in $lines) {
+        $isFence = ($ln -match '^[ \t]*(```+|~~~+)')
+        if (-not $inBlock) {
+            if ($isFence) { $inBlock = $true; $sawBlock = $true; $cur = New-Object System.Collections.Generic.List[string] }
+            continue
+        }
+        if ($isFence -and $ln -match '^[ \t]*(```+|~~~+)[ \t]*$') { $inBlock = $false; $last = ($cur -join "`n"); continue }
+        $cur.Add($ln)
     }
+    if ($inBlock) { $last = ($cur -join "`n") }
+    if ($sawBlock) { return (ConvertFrom-LaneJsonObject -Text $last) }
     $starts = [regex]::Matches($Answer, '(?m)^\s*\{')
     for ($i = $starts.Count - 1; $i -ge 0; $i--) {
-        $tail = $Answer.Substring($starts[$i].Index).Trim()
-        try { $o = $tail | ConvertFrom-Json -ErrorAction Stop } catch { continue }
-        if ($o -is [System.Management.Automation.PSCustomObject]) { return $o }
+        $o = ConvertFrom-LaneJsonObject -Text $Answer.Substring($starts[$i].Index).Trim()
+        if ($null -ne $o) { return $o }
     }
     return $null
 }
@@ -211,7 +229,7 @@ function Get-LaneWorkEvidence {
         }
         if ($RequireVerdict) {
             $fin = Get-LaneFinalJsonObject -Answer $Answer
-            $vp = if ($null -ne $fin) { $fin.PSObject.Properties['verdict'] } else { $null }
+            $vp = if ($null -ne $fin) { @($fin.PSObject.Properties | Where-Object { $_.Name -ceq 'verdict' }) | Select-Object -First 1 } else { $null }
             $v = if ($null -ne $vp -and $null -ne $vp.Value) { [string]$vp.Value } else { '' }
             if ([string]::IsNullOrWhiteSpace($v)) { $rec.reason = 'codex-no-verdict'; return $rec }
         }
@@ -260,7 +278,14 @@ function Get-ProviderRefusal {
     # uses the same emptiness test as the completion evidence (K4 r2: a Cf-only answer is not an answer).
     # Residual, named: a refusal whose text arrives AS the answer is not detected here, as before K4; an
     # answer made only of ERROR lines may be exactly what the prompt asked for (adversary A3).
-    if (Test-LaneAnswerHasSubstance -Answer $Answer) { return $null }
+    # Exception: an answer made ONLY of ERROR-framed lines, whose refusal is corroborated by an ERROR-framed
+    # refusal line on stderr, is the refusal text delivered as the answer (adversary A6: the base saw it on
+    # stderr with a blank stdout). With nothing on stderr it is just what the prompt asked for (A3).
+    if (Test-LaneAnswerHasSubstance -Answer $Answer) {
+        $ansLines = @(($Answer -split "`r?`n") | Where-Object { Test-LaneAnswerHasSubstance -Answer $_ })
+        $onlyErrors = (@($ansLines | Where-Object { $_ -notmatch '^\s*ERROR\b' }).Count -eq 0)
+        if (-not $onlyErrors) { return $null }
+    }
     if ([string]::IsNullOrWhiteSpace($Text)) { return $null }
     $scan = $Text
     if (-not [string]::IsNullOrEmpty($Prompt)) {

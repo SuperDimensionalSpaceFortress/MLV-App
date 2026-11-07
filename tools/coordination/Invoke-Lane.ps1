@@ -3156,6 +3156,11 @@ if ($cfg.engine -eq 'claude') {
     if ([string]::IsNullOrWhiteSpace($final)) { $final = $stderrText }
     if ($null -eq $final) { $final = '' }
     if ($timedOut) { Write-Utf8NoBom $lastPath $final }
+    # K4 r2 (adversary A4): when the selected answer came from stdout because the last-message file had no
+    # substance, the receipt's outputPath file must hold the answer the outputSha256 below describes.
+    if (-not $timedOut -and (Test-LaneAnswerHasSubstance -Answer $codexAnswerEvidence) -and -not (Test-LaneAnswerHasSubstance -Answer $lastMessage)) {
+        Write-Utf8NoBom $lastPath $codexAnswerEvidence
+    }
     # LANE-MODEL-CURRENCY-1 round 2 (sol blocker 2): resolvedModel is proof, not intent. codex
     # exec emits no modelUsage-style attestation the way claude's own JSON does, so the bar here
     # is the card's stated minimum: a clean exit (never timed out, exit 0) that produced real
