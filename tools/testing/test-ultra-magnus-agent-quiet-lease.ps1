@@ -648,15 +648,41 @@ function Test-NamesFixture([string]$CommandLine, [string]$Fx) { return (Get-Fixt
 function Get-FixtureChildPids([string]$Fx) { return @((Get-FixtureCensus $Fx).survivors) }
 # r5: the census reports both buckets. -Rows is the pure seam (objects with ProcessId and CommandLine; r6: parent pids and creation times are
 # no longer read); the default is a fresh Win32_Process query.
-function Get-FixtureCensus([string]$Fx, $Rows = $null) {
+# r9 (sol r8 B1, INV-11): the row skipped as "this suite" is -SelfPid, by default $script:SuiteSelfPid (= $PID: the real-run exclusion is
+# unchanged). A synthetic table never takes that default; it goes through Get-SyntheticCensus below.
+$script:SuiteSelfPid = $PID
+function Get-FixtureCensus([string]$Fx, $Rows = $null, [int]$SelfPid = $script:SuiteSelfPid) {
     if ($null -eq $Rows) { $Rows = @(Get-CimInstance -ClassName Win32_Process -ErrorAction Stop) }
     $sv = [System.Collections.Generic.List[int]]::new(); $uk = [System.Collections.Generic.List[int]]::new()
     foreach ($row in @($Rows)) {
-        if ([int]$row.ProcessId -eq $PID) { continue }
+        if ([int]$row.ProcessId -eq $SelfPid) { continue }
         $m = Get-FixtureMatch ([string]$row.CommandLine) $Fx
         if ($m -ceq 'fixture') { $sv.Add([int]$row.ProcessId) } elseif ($m -ceq 'unknown') { $uk.Add([int]$row.ProcessId) }
     }
     return [pscustomobject]@{ survivors = @($sv.ToArray()); unknown = @($uk.ToArray()) }
+}
+# r9 (sol r8 B1, INV-11; proposed catalogue row mock-census-self-PID-collision): a SYNTHETIC census table (rows a case builds, with fixed mock
+# pids) must never depend on the pid the host gave the suite. With the default self exclusion, a mock row whose pid the host happened to
+# give the suite (sol: self=24680 or 24684) was skipped, and the case's exact expected result failed (the FIFO runner, then the hosted
+# Python entry). Every case feeds its rows through this helper, which passes an explicit -SelfPid provably outside the table (one above
+# its largest pid), so the result is the same for any host pid. Each call is logged for lease-seam-census-self-pid, which replays it with
+# the host self pid forced to each colliding pid. $script:SyntheticCensusLog = $null turns the log off (the replay itself).
+$script:SyntheticCensusLog = [System.Collections.Generic.List[object]]::new()
+function Get-SyntheticCensus([string]$Fx, $Rows) {
+    $rowsA = @($Rows)
+    $max = 0
+    foreach ($r in $rowsA) { if ([int]$r.ProcessId -gt $max) { $max = [int]$r.ProcessId } }
+    $c = Get-FixtureCensus $Fx -Rows $rowsA -SelfPid ($max + 1)
+    if ($null -ne $script:SyntheticCensusLog) { $script:SyntheticCensusLog.Add([pscustomobject]@{ fx = $Fx; rows = $rowsA; result = "survivors=[$(@($c.survivors) -join ',')] unknown=[$(@($c.unknown) -join ',')]" }) }
+    return $c
+}
+# r9 (sol r8 B1 class): the first mock-pid block [Base, Base+Count) at or above Base that no taken id falls in (a registered child's real
+# pid, the suite's own pid). A mock table fed to the DEFAULT owned set (this suite's registry of real children) uses it, so a mock id can
+# never be a live registered child's real pid, whatever pids the host assigned.
+function Get-DisjointMockBase([int]$Base, [int]$Count, [int[]]$Taken) {
+    $b = $Base
+    while (@(@($Taken) | Where-Object { $_ -ge $b -and $_ -lt $b + $Count }).Count -gt 0) { $b += [Math]::Max(1, $Count) }
+    return $b
 }
 # r3 (adversary r3 A1): an identity check and the kill must act on ONE pinned process. The process is opened by pid and its handle held first
 # (Windows never gives a pid to a new process while a handle to the old one is open), the identity check runs against that pinned process, and
@@ -1157,7 +1183,8 @@ try {
         'lease-snapshot-bound-straddle', 'lease-probe-watchdog-add-type-failure', 'lease-probe-watchdog-ctor-failure', 'lease-probe-watchdog-arm-paths',
         'lapse-end-timing-pure', 'lease-seam-pid-cleanup', 'lease-start-post-start-failure', 'lease-start-post-start-cleanup-throws', 'fake-flag-unreadable',
         'lease-seam-command-mode', 'lease-seam-wrapper-host', 'fixture-census-probe-error', 'fake-release-readable-deadline', 'fake-release-unreadable-then-readable-deadline',
-        'fake-release-unreadable-deadline', 'lease-seam-unowned-never-killed', 'fake-release-absent-after-deadline', 'fake-release-absent-before-deadline')
+        'fake-release-unreadable-deadline', 'lease-seam-unowned-never-killed', 'fake-release-absent-after-deadline', 'fake-release-absent-before-deadline',
+        'lease-seam-census-self-pid')
     foreach ($o in $Only) { Assert-True ($notAfterCases -contains $o) "-Only names a known case: '$o' (known: $($notAfterCases -join ', '))" }
     function Test-Case([string]$Name) { return ($Only.Count -eq 0 -or $Only -contains $Name) }
     # Hang guard: an agent that ignores notAfterUtc would wait these cases out; the queue ceiling then ends them queue-expired
@@ -3899,13 +3926,13 @@ try { $out = @(Add-LeaseSlotSnapshot -JobId 'jB4a' -Phase 'request') } catch { $
             # pass-8 A1 verbatim: '' (an escaped apostrophe) then ..\.. climbs out of the dir: never a kill match, and still counted
             $g = Get-FixtureMatch $c5A1 $c5A1Fx; if ($g -cne 'unknown') { $c5Bad.Add("[pass-8 A1] match=$g want unknown") }
             # pass-9 A1 verbatim: a '=' inside script text is no option, so an unrelated process (parent 4) is counted unknown and never killed
-            $c5A9 = Get-FixtureCensus $c5A1Fx -Rows @([pscustomobject]@{ ProcessId = 24680; CommandLine = 'pwsh.exe -Command "Start-Sleep -Seconds 300 # =C:\Temp\um-agent-quiet-lease-1234-abcd1234"'; ParentProcessId = 4; CreationDate = [DateTime]::UtcNow })
+            $c5A9 = Get-SyntheticCensus $c5A1Fx @([pscustomobject]@{ ProcessId = 24680; CommandLine = 'pwsh.exe -Command "Start-Sleep -Seconds 300 # =C:\Temp\um-agent-quiet-lease-1234-abcd1234"'; ParentProcessId = 4; CreationDate = [DateTime]::UtcNow })
             if (-not (@($c5A9.survivors).Count -eq 0 -and (@($c5A9.unknown) -join ',') -ceq '24680')) { $c5Bad.Add("[pass-9 A1] survivors=[$(@($c5A9.survivors) -join ',')] unknown=[$(@($c5A9.unknown) -join ',')] want survivors=[] unknown=[24680]") }
             # The census through the -Rows seam. r6: the rows still carry parent pids and start times (r5 read them for descent); they must change
             # nothing. Only a whole argument is a survivor; every embedded line is unknown, a direct child of this suite or not.
             $c5Now = [DateTime]::UtcNow
             $c5SelfStart = (Get-Process -Id $PID).get_StartTime().ToUniversalTime()
-            $c5Census = Get-FixtureCensus $c5Fx -Rows @(
+            $c5Census = Get-SyntheticCensus $c5Fx @(   # r9 (sol r8 B1): synthetic rows never meet the host self pid
                 [pscustomobject]@{ ProcessId = 24680; CommandLine = $c5Sol; ParentProcessId = 4; CreationDate = $c5Now }                                         # embedded -> unknown
                 [pscustomobject]@{ ProcessId = 24681; CommandLine = 'python.exe C:/Temp/fx/x'; ParentProcessId = 4; CreationDate = $c5Now }                     # whole argument -> survivor
                 [pscustomobject]@{ ProcessId = 24682; CommandLine = 'python.exe C:\Temp\fx2\log.txt'; ParentProcessId = $PID; CreationDate = $c5Now }           # sibling -> unknown
@@ -3930,7 +3957,7 @@ try { $out = @(Add-LeaseSlotSnapshot -JobId 'jB4a' -Phase 'request') } catch { $
                 # r6 pass-11 A1 (sol's input verbatim): a whole -Command argument that is script text starting with the dir; f8d1df88 killed it
                 [pscustomobject]@{ ProcessId = 24683; ParentProcessId = 4; CreationDate = $p10S; CommandLine = 'pwsh.exe -Command "C:\Temp\um-agent-quiet-lease-1234-abcd1234\sub\`..\`..\unrelated\log.ps1; Start-Sleep -Seconds 300"' }
             )
-            $p10Census = Get-FixtureCensus $p10Fx -Rows $p10Rows
+            $p10Census = Get-SyntheticCensus $p10Fx $p10Rows
             $script:P10Killed = [System.Collections.Generic.List[int]]::new()
             $p10Open = {
                 param($i)
@@ -3959,9 +3986,9 @@ try { $out = @(Add-LeaseSlotSnapshot -JobId 'jB4a' -Phase 'request') } catch { $
             $p12A2Rows = @([pscustomobject]@{ ProcessId = 24681; CommandLine = 'cmd.exe /k "echo=C:\Temp\um-agent-quiet-lease-1234-abcd1234"' }
                 [pscustomobject]@{ ProcessId = 24682; CommandLine = 'python.exe C:\Temp\um-agent-quiet-lease-1234-abcd1234\heavy-slot-fake.py status' })   # control: still killed
             $script:P10Killed.Clear()
-            $p12A1C = Get-FixtureCensus $p12A1Fx -Rows $p12A1Rows
+            $p12A1C = Get-SyntheticCensus $p12A1Fx $p12A1Rows
             $p12A1S = @(Stop-FixtureLeftovers $p12A1Fx @(24680, 24682) -Rows $p12A1Rows -OpenPid $p10Open -Owned @(New-MockOwnedChild 24680 $script:P10Killed; New-MockOwnedChild 24682 $script:P10Killed))   # r8: owned, and still unknown under a script-character root: not killed
-            $p12A2C = Get-FixtureCensus $p10Fx -Rows $p12A2Rows
+            $p12A2C = Get-SyntheticCensus $p10Fx $p12A2Rows
             $p12A2S = @(Stop-FixtureLeftovers $p10Fx @(24681, 24682) -Rows $p12A2Rows -OpenPid $p10Open -Owned @(New-MockOwnedChild 24682 $script:P10Killed))   # r8: the control is owned
             $p12Row = "A1 survivors=[$(@($p12A1C.survivors) -join ',')] unknown=[$(@($p12A1C.unknown) -join ',')] stopped=[$($p12A1S -join ',')]; A2 survivors=[$(@($p12A2C.survivors) -join ',')] unknown=[$(@($p12A2C.unknown) -join ',')] stopped=[$($p12A2S -join ',')]; killed=[$($script:P10Killed -join ',')]"
             $p12Want = 'A1 survivors=[] unknown=[24680,24682] stopped=[]; A2 survivors=[24682] unknown=[24681] stopped=[24682]; killed=[24682]'
@@ -4237,7 +4264,7 @@ try { $out = @(Add-LeaseSlotSnapshot -JobId 'jB4a' -Phase 'request') } catch { $
             $m | Add-Member -MemberType ScriptMethod -Name Dispose -Value { }
             return $m
         }
-        $cmC = Get-FixtureCensus $cmFx -Rows $cmCensusRows.ToArray()
+        $cmC = Get-SyntheticCensus $cmFx $cmCensusRows.ToArray()   # r9 (sol r8 B1): ids 24680+n never meet the host self pid
         # r8: the controls are OWNED children (mock objects, Kill records into CmKilled); the attack rows are not owned. The kill column now
         # follows ownership, the match columns are unchanged.
         $cmOwned = @(foreach ($k in $cmControls.Keys) { New-MockOwnedChild $cmIds[$k] $script:CmKilled })
@@ -4310,7 +4337,7 @@ try { $out = @(Add-LeaseSlotSnapshot -JobId 'jB4a' -Phase 'request') } catch { $
             $m | Add-Member -MemberType ScriptMethod -Name Dispose -Value { }
             return $m
         }
-        $whC = Get-FixtureCensus $whFx -Rows $whCensusRows.ToArray()
+        $whC = Get-SyntheticCensus $whFx $whCensusRows.ToArray()   # r9 (sol r8 B1): ids 25680+n never meet the host self pid
         $whOwned = @(foreach ($k in $whControls.Keys) { New-MockOwnedChild $whIds[$k] $script:WhKilled })   # r8: the controls are owned
         $whS = @(Stop-FixtureLeftovers $whFx @($whIds.Values) -Rows $whCensusRows.ToArray() -OpenPid $whOpen -Owned $whOwned)
         $whBad = [System.Collections.Generic.List[string]]::new()
@@ -4351,7 +4378,11 @@ try { $out = @(Add-LeaseSlotSnapshot -JobId 'jB4a' -Phase 'request') } catch { $
         $unCensusRows = [System.Collections.Generic.List[object]]::new()
         $unIds = [ordered]@{}
         $unN = 0
-        foreach ($k in $unRows.Keys) { $unIds[$k] = 26680 + $unN; $unN++; $unCensusRows.Add([pscustomobject]@{ ProcessId = $unIds[$k]; CommandLine = $unRows[$k] }) }
+        # r9 (sol r8 B1 class): (b) feeds the DEFAULT owned set (this suite's registry of REAL children), so the mock id block is moved past
+        # every registered child's real pid and the suite's own pid: a mock row can never reach a live registered child's Kill.
+        $unTaken = @(@(foreach ($o in @($script:OwnedChildren.ToArray())) { try { [int]$o.Id } catch { } }) + @([int]$PID))
+        $unBase = Get-DisjointMockBase 26680 $unRows.Count $unTaken
+        foreach ($k in $unRows.Keys) { $unIds[$k] = $unBase + $unN; $unN++; $unCensusRows.Add([pscustomobject]@{ ProcessId = $unIds[$k]; CommandLine = $unRows[$k] }) }
         $script:UnKilled = [System.Collections.Generic.List[int]]::new()
         $script:UnOpens = 0
         $unOpen = {
@@ -4365,12 +4396,19 @@ try { $out = @(Add-LeaseSlotSnapshot -JobId 'jB4a' -Phase 'request') } catch { $
             return $m
         }
         $unBad = [System.Collections.Generic.List[string]]::new()
-        $unC = Get-FixtureCensus $unFx -Rows $unCensusRows.ToArray()
+        $unC = Get-SyntheticCensus $unFx $unCensusRows.ToArray()   # r9 (sol r8 B1): synthetic rows never meet the host self pid
         # (a) classification, row by row and as counts
         $unCls = @{ fixture = 0; unknown = 0; none = 0 }
         foreach ($k in $unRows.Keys) {
             $m = Get-FixtureMatch $unRows[$k] $unFx; $unCls[$m]++
             if ($m -cne $unWant[$k]) { $unBad.Add("[$k] match=$m want $($unWant[$k]) (the census classification must not change)") }
+        }
+        # r9 (sol r8 B1, site 4368-4378): the census counts were only reported, so a dropped mock row underreported silently. Now asserted:
+        # the census survivors are exactly the 'fixture' rows and its unknown exactly the 'unknown' rows, by id, in order, and as counts.
+        $unWantSv = (@(foreach ($k in $unRows.Keys) { if ($unWant[$k] -ceq 'fixture') { [int]$unIds[$k] } }) -join ',')
+        $unWantUk = (@(foreach ($k in $unRows.Keys) { if ($unWant[$k] -ceq 'unknown') { [int]$unIds[$k] } }) -join ',')
+        if (-not (@($unC.survivors).Count -eq $unCls.fixture -and @($unC.unknown).Count -eq $unCls.unknown -and (@($unC.survivors) -join ',') -ceq $unWantSv -and (@($unC.unknown) -join ',') -ceq $unWantUk)) {
+            $unBad.Add("census counts: survivors=$(@($unC.survivors).Count) unknown=$(@($unC.unknown).Count) want survivors=$($unCls.fixture) unknown=$($unCls.unknown) (ids survivors=[$(@($unC.survivors) -join ',')] want [$unWantSv]; unknown=[$(@($unC.unknown) -join ',')] want [$unWantUk])")
         }
         # (b) nothing owned: no open, no Kill, nothing stopped (the default owned set is this suite's registry, which holds none of these pids)
         $unS = @(Stop-FixtureLeftovers $unFx @($unIds.Values) -Rows $unCensusRows.ToArray() -OpenPid $unOpen)
@@ -4410,7 +4448,78 @@ try { $out = @(Add-LeaseSlotSnapshot -JobId 'jB4a' -Phase 'request') } catch { $
             foreach ($o in $unReal) { if ($null -ne $o) { try { $null = $o.WaitForExit(5000) } catch { } } }
         }
         Assert-True ($unBad.Count -eq 0) "lease-seam-unowned-never-killed: no command line authorizes a kill: pass-16 A1's python -c line and every r7 command-mode, wrapper and python-forward row keep their census classification, and the sweep never opens or kills a process this suite does not hold (mockKills=[]); an owned 'fixture' child is still stopped through its own object (HUB RULING 20261107T1649Z): $($unBad -join ' ; ')"
-        $results.leaseSeamUnownedNeverKilled = [ordered]@{ rows = $unRows.Count; fixture = $unCls.fixture; unknown = $unCls.unknown; none = $unCls.none; unowned = $unRowB; owned = $unRowC; real = $unRowD }
+        $results.leaseSeamUnownedNeverKilled = [ordered]@{ rows = $unRows.Count; idBase = $unBase; fixture = $unCls.fixture; unknown = $unCls.unknown; none = $unCls.none; unowned = $unRowB; owned = $unRowC; real = $unRowD }
+    }
+    # lease-seam-census-self-pid (r9; sol r8 B1, INV-11, proposed catalogue row mock-census-self-PID-collision): no synthetic census table
+    # depends on the pid the host gave the suite. Every synthetic census call this run made (Get-SyntheticCensus logs each; this case adds
+    # one table holding every witness pid, so it is never vacuous when run alone) is replayed with the census's host self pid forced to each
+    # witness: sol's 24680 and 24684, then one colliding pid from every other fixed-pid table (24681: c5 census / pass-12 A2 / command-mode;
+    # 24683: c5 census / pass-10 / command-mode; 25680: wrapper-host; 26680: unowned-never-killed). Each replay must equal the logged
+    # result. The forcing is shown to REACH the census: the DEFAULT path (no -SelfPid: the real-run exclusion, unchanged) under the same
+    # forced pid drops exactly that row. Control: 5000 is in no table, every replay is unchanged and nothing is dropped. Static guard: no
+    # call site outside Get-SyntheticCensus (and this case's default-path probe) feeds -Rows to Get-FixtureCensus.
+    if (Test-Case 'lease-seam-census-self-pid') {
+        $spsFx = 'C:\Temp\um-agent-quiet-lease-1234-abcd1234'
+        $spsWitness = [ordered]@{ 'sol-24680' = 24680; 'sol-24684' = 24684; 'c5-p12a2-cm-24681' = 24681; 'c5-p10-cm-24683' = 24683; 'wrapper-host-25680' = 25680; 'unowned-26680' = 26680 }
+        $spsOwnRows = @(foreach ($w in $spsWitness.Keys) { [pscustomobject]@{ ProcessId = $spsWitness[$w]; CommandLine = "python.exe C:\Temp\um-agent-quiet-lease-1234-abcd1234\w$($spsWitness[$w]).py" } })
+        $spsOwn = Get-SyntheticCensus $spsFx $spsOwnRows
+        $spsOwnWant = "survivors=[$(@($spsWitness.Values) -join ',')] unknown=[]"
+        $spsOwnGot = "survivors=[$(@($spsOwn.survivors) -join ',')] unknown=[$(@($spsOwn.unknown) -join ',')]"
+        $spsWantCalls = 1
+        if (Test-Case 'lease-seam-pid-cleanup') { $spsWantCalls += 5 }   # c5A9, c5 census, pass-10, pass-12 A1, pass-12 A2
+        if (Test-Case 'lease-seam-command-mode') { $spsWantCalls += 1 }
+        if (Test-Case 'lease-seam-wrapper-host') { $spsWantCalls += 1 }
+        if (Test-Case 'lease-seam-unowned-never-killed') { $spsWantCalls += 1 }
+        $spsLog = @($script:SyntheticCensusLog.ToArray())
+        # static guard over this file: Get-FixtureCensus ... -Rows only inside Get-SyntheticCensus or Invoke-DefaultSelfCensus
+        $spsTok = $null; $spsErr = $null
+        $spsAst = [System.Management.Automation.Language.Parser]::ParseFile($PSCommandPath, [ref]$spsTok, [ref]$spsErr)
+        $spsDirect = @($spsAst.FindAll({ param($n) $n -is [System.Management.Automation.Language.CommandAst] -and $n.GetCommandName() -ceq 'Get-FixtureCensus' -and $n.Extent.Text -match '-Rows\b' }, $true) | Where-Object {
+                $p = $_.Parent; while ($null -ne $p -and -not ($p -is [System.Management.Automation.Language.FunctionDefinitionAst])) { $p = $p.Parent }
+                -not ($null -ne $p -and @('Get-SyntheticCensus', 'Invoke-DefaultSelfCensus') -contains $p.Name) })
+        $spsSynthSites = @($spsAst.FindAll({ param($n) $n -is [System.Management.Automation.Language.CommandAst] -and $n.GetCommandName() -ceq 'Get-SyntheticCensus' }, $true)).Count
+        Assert-True ($spsOwnGot -ceq $spsOwnWant -and $spsLog.Count -eq $spsWantCalls -and $spsDirect.Count -eq 0 -and $spsSynthSites -ge 9) "lease-seam-census-self-pid: every synthetic census table goes through Get-SyntheticCensus and was logged (own table $spsOwnGot want $spsOwnWant; logged calls=$($spsLog.Count) want $spsWantCalls; direct Get-FixtureCensus -Rows sites outside the helper=$($spsDirect.Count) at lines [$(@($spsDirect | ForEach-Object { $_.Extent.StartLineNumber }) -join ',')]; Get-SyntheticCensus call sites=$spsSynthSites want >= 9)"
+        function Invoke-DefaultSelfCensus([string]$Fx, $Rows) { return (Get-FixtureCensus $Fx -Rows $Rows) }   # the real-run default, on purpose
+        $spsSavedSelf = $script:SuiteSelfPid; $spsSavedLog = $script:SyntheticCensusLog
+        $spsOut = [ordered]@{}
+        try {
+            $script:SyntheticCensusLog = $null   # replays are not logged
+            function Test-SelfPidReplay([int]$H) {
+                $script:SuiteSelfPid = $H
+                $bad = [System.Collections.Generic.List[string]]::new(); $hits = 0
+                foreach ($e in $spsLog) {
+                    $c = Get-SyntheticCensus $e.fx $e.rows
+                    $got = "survivors=[$(@($c.survivors) -join ',')] unknown=[$(@($c.unknown) -join ',')]"
+                    if ($got -cne $e.result) { $bad.Add("[$($e.fx) rows=$(@($e.rows).Count)] replay $got want $($e.result)") }
+                    if ((@($c.survivors) + @($c.unknown)) -contains $H) {
+                        $hits++
+                        $d = Invoke-DefaultSelfCensus $e.fx $e.rows
+                        if ((@($d.survivors) + @($d.unknown)) -contains $H) { $bad.Add("[$($e.fx)] the default census kept row $H (the forced self pid did not reach the census)") }
+                    }
+                }
+                return [pscustomobject]@{ bad = $bad; hits = $hits; row = "self=$H replays=$($spsLog.Count) collisions=$hits bad=$($bad.Count)" }
+            }
+            $r = Test-SelfPidReplay 24680; $spsOut['sol-24680'] = $r.row
+            Assert-True ($r.bad.Count -eq 0 -and $r.hits -ge 1) "lease-seam-census-self-pid [sol-24680]: with the host self pid forced to 24680 (sol r8 B1 witness) every synthetic table gives its logged result, and the default path drops the colliding row: $($r.row) $($r.bad -join ' ; ')"
+            $r = Test-SelfPidReplay 24684; $spsOut['sol-24684'] = $r.row
+            Assert-True ($r.bad.Count -eq 0 -and $r.hits -ge 1) "lease-seam-census-self-pid [sol-24684]: with the host self pid forced to 24684 (sol r8 B1 witness) every synthetic table gives its logged result, and the default path drops the colliding row: $($r.row) $($r.bad -join ' ; ')"
+            $r = Test-SelfPidReplay 24681; $spsOut['c5-p12a2-cm-24681'] = $r.row
+            Assert-True ($r.bad.Count -eq 0 -and $r.hits -ge 1) "lease-seam-census-self-pid [c5-p12a2-cm-24681]: forced self pid 24681 (c5 census, pass-12 A2, command-mode) changes no synthetic result: $($r.row) $($r.bad -join ' ; ')"
+            $r = Test-SelfPidReplay 24683; $spsOut['c5-p10-cm-24683'] = $r.row
+            Assert-True ($r.bad.Count -eq 0 -and $r.hits -ge 1) "lease-seam-census-self-pid [c5-p10-cm-24683]: forced self pid 24683 (c5 census, pass-10, command-mode) changes no synthetic result: $($r.row) $($r.bad -join ' ; ')"
+            $r = Test-SelfPidReplay 25680; $spsOut['wrapper-host-25680'] = $r.row
+            Assert-True ($r.bad.Count -eq 0 -and $r.hits -ge 1) "lease-seam-census-self-pid [wrapper-host-25680]: forced self pid 25680 (wrapper-host table) changes no synthetic result: $($r.row) $($r.bad -join ' ; ')"
+            $r = Test-SelfPidReplay 26680; $spsOut['unowned-26680'] = $r.row
+            Assert-True ($r.bad.Count -eq 0 -and $r.hits -ge 1) "lease-seam-census-self-pid [unowned-26680]: forced self pid 26680 (unowned-never-killed table) changes no synthetic result: $($r.row) $($r.bad -join ' ; ')"
+            $r = Test-SelfPidReplay 5000; $spsOut['control-5000'] = $r.row
+            Assert-True ($r.bad.Count -eq 0 -and $r.hits -eq 0) "lease-seam-census-self-pid [control-5000]: a self pid in no table changes nothing and collides with nothing: $($r.row) $($r.bad -join ' ; ')"
+        }
+        finally { $script:SuiteSelfPid = $spsSavedSelf; $script:SyntheticCensusLog = $spsSavedLog }
+        # the unowned case's DEFAULT-owned-set sweep (b): its mock id block is moved past every taken id (a registered child's real pid)
+        $spsBase = "$(Get-DisjointMockBase 26680 51 @(26680))/$(Get-DisjointMockBase 26680 51 @(26730))/$(Get-DisjointMockBase 26680 51 @(26731))/$(Get-DisjointMockBase 26680 51 @(5000))/$(Get-DisjointMockBase 26680 51 @(26680, 26731))/$(Get-DisjointMockBase 26680 51 @())"
+        $spsOut['disjoint-base'] = $spsBase
+        Assert-True ($spsBase -ceq '26731/26731/26680/26680/26782/26680') "lease-seam-census-self-pid [unowned-registry-26680]: a mock id block fed to the default owned set skips every taken real pid (26680, 26730 move it; 26731, 5000 and none do not): $spsBase want 26731/26731/26680/26680/26782/26680"
+        $results.leaseSeamCensusSelfPid = [ordered]@{ loggedCalls = $spsLog.Count; syntheticSites = $spsSynthSites; witnesses = $spsOut }
     }
     # fixture-census-probe-error (r7 E1; Dot advisory 6706643231, hub ACK 6706997355): a suite whose suite-end fixture census THROWS has no
     # survivor count, so it must not end as status PASS (r6 printed PASS with survivors=unknown unknown=unknown, and the FIFO parent accepts any
