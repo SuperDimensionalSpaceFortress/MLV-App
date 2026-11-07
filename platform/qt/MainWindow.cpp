@@ -3139,10 +3139,11 @@ void MainWindow::timerEvent(QTimerEvent *t)
 // used to be `while( m_frameStillDrawing ) qApp->processEvents();`: a stale-true flag (nothing left in flight to clear
 // it) pumped the GUI thread forever after the smoke runner's showFullScreen() resize. A flag still set while the render
 // thread has stayed idle for the grace window is stale and is cleared; a busy render thread is waited on up to the
-// deadline, then the redraw proceeds. One always-on line whenever it actually waited. The pump defers user input
-// (adversary r1 A1): a shortcut's modal dialog would run a nested loop inside one pump that the deadline cannot bound;
-// the input is delivered by the next unfiltered pass of the event loop. Returns false on Timeout (the frame asked for
-// has not landed, so the scene still has the old geometry), true otherwise.
+// deadline, then the redraw proceeds. One always-on line whenever it actually waited. The pump itself dispatches no
+// user input (ExcludeUserInputEvents defers it to the next unfiltered pass; adversary r1 A1). A handler the pump runs
+// that starts its own nested event loop (a modal dialog, Updater::getReleaseList) still suspends the wait until that
+// loop returns, as it suspended the old spin; ResizeStillDrawingWait.h "WHAT IS BOUNDED". Returns false on Timeout
+// (the frame asked for has not landed, so the scene still has the old geometry), true otherwise.
 bool MainWindow::waitForResizeStillDrawing( const QString &site )
 {
     QElapsedTimer clock;
