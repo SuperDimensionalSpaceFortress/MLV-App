@@ -1972,7 +1972,10 @@ function Add-CodexLaneRuntimePath {
         # The existence lookup is a seam: a script taking the path and returning $true when a directory is there. It runs in its OWN runspace under a
         # deadline (adversary A2 on 7688a2a3: a local-looking path can be a symlink or junction into a share, which no name or drive-type gate sees).
         [string]$LookupScript = $null,
-        [int]$LookupTimeoutMs = 1500
+        [ValidateRange(1, 60000)][int]$LookupTimeoutMs = 1500,
+        # TOTAL time all lookups together may spend (adversary A1 on 834f307b). The caller passes what is left of the invocation's -TimeoutSec, halved, so a
+        # stalled lookup can never be the reason the next budget check throws launch-budget-exhausted. 0 looks nothing up.
+        [ValidateRange(0, 600000)][int]$BudgetMs = 3000
     )
     if ($null -eq $Candidates) {
         $Candidates = @()
@@ -2006,11 +2009,24 @@ function Add-CodexLaneRuntimePath {
         return ($p.Substring(0, 3) + ($stack -join '\'))
     }
     $current = if ($Psi.Environment.ContainsKey('PATH')) { [string]$Psi.Environment['PATH'] } else { '' }
+    # The comparison key folds the case of ASCII letters ONLY. ToLowerInvariant also folds U+212A (the Kelvin sign) to 'k', so an inherited entry 'Tas<KELVIN>s'
+    # was taken for the real 'Tasks' and the real directory was never added (adversary A2 on 834f307b); NTFS does not treat them as one name. A non-ASCII
+    # difference is a different directory here: a false "absent" is a duplicate, a false "present" costs the fix.
+    $dirKey = {
+        param([string]$d)
+        $sb = [System.Text.StringBuilder]::new()
+        foreach ($c in $d.TrimEnd('\').ToCharArray()) {
+            $n = [int]$c
+            if ($n -ge 65 -and $n -le 90) { [void]$sb.Append([char]($n + 32)) } else { [void]$sb.Append($c) }
+        }
+        return $sb.ToString()
+    }
     $seen = @{}
     foreach ($entry in ($current -split ';')) {
         $norm = & $dirNorm $entry
-        if ($norm) { $seen[$norm.TrimEnd('\').ToLowerInvariant()] = $true }
+        if ($norm) { $seen[(& $dirKey $norm)] = $true }
     }
+    $lookupClock = [System.Diagnostics.Stopwatch]::StartNew()
     $added = @()
     foreach ($dir in $Candidates) {
         if ([string]::IsNullOrWhiteSpace($dir)) { continue }
@@ -2024,7 +2040,7 @@ function Add-CodexLaneRuntimePath {
         if ($dir.Contains(';') -or $dir.Contains('"')) { continue }
         $dir = & $dirNorm $dir
         if (-not $dir) { continue }
-        $key = $dir.TrimEnd('\').ToLowerInvariant()
+        $key = & $dirKey $dir
         if ($seen.ContainsKey($key)) { continue }
         # A drive letter can still be a mapped share (or be gone): its type is read first, a local call that does not touch the share, and a drive that
         # is not a local disk is skipped with no lookup.
@@ -2034,12 +2050,14 @@ function Add-CodexLaneRuntimePath {
         # The lookup itself, under a deadline (adversary A2 on 7688a2a3): C:\link\bin where C:\link is a junction or symlink to \\host\share passes every
         # gate above and then stalls in SMB. A lookup still blocked at the deadline costs ITS candidate, not the launch. Its runspace is neither stopped
         # nor disposed (both wait for the blocked call) and is left to the process end.
+        $waitMs = [math]::Min($LookupTimeoutMs, $BudgetMs - $lookupClock.ElapsedMilliseconds)
+        if ($waitMs -le 0) { break }   # nothing is left to look anything up with
         $exists = $false
         try {
             $ps = [powershell]::Create()
             [void]$ps.AddScript($LookupScript).AddArgument($dir)
             $async = $ps.BeginInvoke()
-            if ($async.AsyncWaitHandle.WaitOne($LookupTimeoutMs)) {
+            if ($async.AsyncWaitHandle.WaitOne([int]$waitMs)) {
                 $answer = @($ps.EndInvoke($async))
                 $exists = ($answer.Count -gt 0 -and [bool]$answer[$answer.Count - 1])
                 $ps.Dispose()
@@ -2830,7 +2848,9 @@ if ($cfg.engine -eq 'claude') {
 if ($cfg.engine -eq 'codex') {
     # Fail open with a warning, like the error-mode block: a PATH nicety must never be the reason a review lane does not start.
     try {
-        $codexRuntimePathAdded = @(Add-CodexLaneRuntimePath -Psi $psi)
+        # The lookups get half of what is left of THIS invocation's -TimeoutSec (at most 3 s), so a stalled lookup cannot be what exhausts the launch budget.
+        $codexRuntimeBudgetMs = [int][math]::Max(0, [math]::Min(3000, [math]::Floor((($TimeoutSec * 1000.0) - $sw.Elapsed.TotalMilliseconds) / 2)))
+        $codexRuntimePathAdded = @(Add-CodexLaneRuntimePath -Psi $psi -BudgetMs $codexRuntimeBudgetMs)
         if ($codexRuntimePathAdded.Count -gt 0) { Write-Host ("[codex-runtime-path] appended to the lane PATH: {0}" -f ($codexRuntimePathAdded -join ';')) }
     }
     catch { Write-Warning "CODEX_RUNTIME_PATH_NOT_SET: $($_.Exception.Message) -- a MinGW-built exe the model runs may raise a loader dialog on the desktop" }

@@ -1266,7 +1266,9 @@ def test_codex_lane_runtime_path_treats_slash_spellings_already_on_path_as_prese
 # as an added directory.
 def _recorder_call(tmp_path, candidates):
     rec = tmp_path / "lookups.txt"
-    script = f"param($p) Add-Content -LiteralPath '{rec}' -Value $p; return $true"
+    # The recorder's own path is quoted for the INNER literal here and the whole script again for the outer one (adversary A4 on 834f307b: a tmp
+    # path holding an apostrophe broke the inner literal).
+    script = f"param($p) Add-Content -LiteralPath '{_ps_quote(rec)}' -Value $p; return $true"
     cand = "" if candidates is None else f" -Candidates @({candidates})"
     return rec, (
         "$psi.Environment['PATH'] = 'C:\\first'\n"
@@ -1327,6 +1329,72 @@ def test_codex_lane_runtime_path_abandons_a_lookup_that_outlasts_its_deadline(tm
 
 
 @codex_runtime_path_only
+def test_codex_lane_runtime_path_recorder_survives_an_apostrophe_in_the_tmp_path(tmp_path):
+    # Adversary A4 on 834f307b: the recorder path was spliced into an inner single-quoted literal unescaped, so the harness itself failed to parse.
+    odd = tmp_path / "O'Brien"
+    odd.mkdir()
+    system_drive = os.environ.get("SystemDrive", "C:")
+    rec, call = _recorder_call(odd, f"'{_ps_quote(system_drive)}\\probe-apostrophe\\bin'")
+    done = _codex_runtime_path_run(odd, call)
+    _codex_runtime_path_field(done, "PATH")
+    assert "probe-apostrophe" in _recorded(rec), done.stdout
+
+
+@codex_runtime_path_only
+def test_codex_lane_runtime_path_lookups_never_outspend_the_budget_they_are_given(tmp_path):
+    # Adversary A1 on 834f307b: the per-lookup deadline was independent of the lane's remaining launch budget, so with -TimeoutSec 1 a stalled lookup
+    # waited its full 1500 ms and the very next check threw launch-budget-exhausted. The caller now hands the function a total budget (-BudgetMs);
+    # a candidate that cannot be looked up inside what is left is skipped, and a budget of 0 looks nothing up.
+    a = tmp_path / "bin-a"
+    b = tmp_path / "bin-b"
+    a.mkdir()
+    b.mkdir()
+    rec, call = _recorder_call(tmp_path, f"'{_ps_quote(a)}'")
+    call = call.replace("-LookupScript", "-BudgetMs 0 -LookupScript")
+    done = _codex_runtime_path_run(tmp_path, call)
+    assert _codex_runtime_path_field(done, "PATH") == "C:\\first" and _recorded(rec) == "", done.stdout
+    slow = "param($p) Start-Sleep -Seconds 20; return $true"
+    done = _codex_runtime_path_run(
+        tmp_path,
+        "$psi.Environment['PATH'] = 'C:\\first'\n"
+        "$sw = [System.Diagnostics.Stopwatch]::StartNew()\n"
+        f"[void](Add-CodexLaneRuntimePath -Psi $psi -Candidates @('{_ps_quote(a)}', '{_ps_quote(b)}') -LookupScript '{_ps_quote(slow)}' -BudgetMs 200)\n"
+        "'ELAPSED_MS=' + [int]$sw.ElapsedMilliseconds",
+    )
+    assert _codex_runtime_path_field(done, "PATH") == "C:\\first"
+    assert int(_codex_runtime_path_field(done, "ELAPSED_MS")) < 2500, done.stdout  # two 1500 ms waits would be 3000+
+
+
+@codex_runtime_path_only
+def test_codex_lane_runtime_path_rejects_a_deadline_that_is_not_finite(tmp_path):
+    # Adversary A3 (advisory) on 834f307b: -LookupTimeoutMs -1 reached WaitOne as Timeout.Infinite. A non-positive deadline is a parameter error.
+    present = tmp_path / "bin"
+    present.mkdir()
+    done = _codex_runtime_path_run(
+        tmp_path,
+        f"[void](Add-CodexLaneRuntimePath -Psi $psi -Candidates @('{_ps_quote(present)}') -LookupTimeoutMs -1)",
+    )
+    assert done.returncode != 0 and "LookupTimeoutMs" in done.stderr, (done.stdout, done.stderr)
+
+
+@codex_runtime_path_only
+def test_codex_lane_runtime_path_compares_names_the_way_the_filesystem_does(tmp_path):
+    # Adversary A2 on 834f307b: ToLowerInvariant folds U+212A (the Kelvin sign) to 'k', so an inherited entry '...\Tas<KELVIN>s' was taken for the
+    # existing directory '...\Tasks' and the real one was never added. NTFS does not treat them as one name. Only ASCII letters are case-folded;
+    # a non-ASCII difference is a different directory (a false "absent" costs a duplicate, a false "present" costs the fix).
+    present = tmp_path / "tasks"
+    present.mkdir()
+    lookalike = str(tmp_path / "tas\u212as")
+    done = _codex_runtime_path_run(
+        tmp_path,
+        f"$psi.Environment['PATH'] = 'C:\\first;{_ps_quote(lookalike)}'\n"
+        f"$r = @(Add-CodexLaneRuntimePath -Psi $psi -Candidates @('{_ps_quote(present)}'))\n"
+        "'ADDED=' + $r.Count",
+    )
+    assert _codex_runtime_path_field(done, "ADDED") == "1", done.stdout
+
+
+@codex_runtime_path_only
 def test_codex_lane_runtime_path_does_not_count_a_spelling_the_loader_will_not_match(tmp_path):
     # Adversary A1 on 7688a2a3: PATH='...\bin ' (trailing space) was trimmed into the seen-set, so the usable directory was never added and
     # the DLLs stayed unfound. An inherited entry counts as present only when it is a plain, exact spelling; a false "absent" costs a harmless duplicate,
@@ -1370,11 +1438,15 @@ def test_codex_lane_runtime_path_treats_dot_segments_as_the_directory_they_name(
 def test_codex_lane_runtime_path_is_wired_into_the_codex_child_only():
     body = LANE_RUNNER.read_text(encoding="utf-8").replace("\r\n", "\n")
     assert "function Add-CodexLaneRuntimePath" in body, "Invoke-Lane lacks Add-CodexLaneRuntimePath"
-    calls = [m.start() for m in re.finditer(r"^\s*\$\w+ = @\(Add-CodexLaneRuntimePath -Psi \$psi\)", body, re.M)]
+    calls = [m.start() for m in re.finditer(r"^\s*\$\w+ = @\(Add-CodexLaneRuntimePath -Psi \$psi -BudgetMs \$\w+\)", body, re.M)]
     assert len(calls) == 1, f"expected exactly one call on the lane child's $psi, found {len(calls)}"
     guard = "if ($cfg.engine -eq 'codex') {"
-    window = body[max(0, calls[0] - 200):calls[0]]
+    window = body[max(0, calls[0] - 900):calls[0]]
     assert guard in window, "the call must sit inside `if ($cfg.engine -eq 'codex')`: the claude lane's environment is unchanged"
+    # Adversary A1 on 834f307b: the lookups' total budget is what is LEFT of this invocation's -TimeoutSec, so a stalled lookup cannot be the reason
+    # the very next budget check throws launch-budget-exhausted.
+    budget_line = re.search(r"^\s*\$\w+ = .*\$TimeoutSec.*\$sw\.Elapsed.*$", window, re.M)
+    assert budget_line, "the call's -BudgetMs must be derived from $TimeoutSec and the invocation stopwatch $sw"
     # After the child's $psi exists and before its streams are redirected, i.e. before anything can start it.
     created = body.index("$psi = [System.Diagnostics.ProcessStartInfo]::new()\n$psi.WorkingDirectory")
     redirected = body.index("$psi.RedirectStandardInput  = $true")
