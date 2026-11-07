@@ -1088,6 +1088,44 @@ class VerdictOnText(unittest.TestCase):
         self.assertIn("COULD-NOT-CHECK", proc.stdout)
         self.assertIn("U+000B", proc.stdout)
 
+    # ---- r9 adversary pass 1 (e1bde592) ------------------------------------------------------------------------
+    PT_RED = "=== FAILURES ===\n___ test_x ___\nE assert False\nt.py:2: AssertionError\n=== 1 failed in 0.1s ===\n"
+
+    def _cli(self, data: bytes, *output: str) -> tuple[int, str]:
+        import contextlib
+        import io
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp, "red.txt")
+            path.write_bytes(data)
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(buf):
+                code = rmv.main(["verdict", "--output", output[0] if output else str(path), "--expect", "t.py:2"])
+        return code, buf.getvalue()
+
+    def test_r9_adv_a1_the_cli_does_not_translate_a_lone_cr_before_the_framing(self) -> None:
+        # Path.read_text() reads with universal newlines, so a lone CR became LF before _frame could see it.
+        code, printed = self._cli(self.PT_RED.replace("\n", "\r").encode("utf-8"))
+        self.assertEqual(code, 1, printed)
+        self.assertIn("COULD-NOT-CHECK", printed)
+        self.assertIn("U+000D", printed)
+        for eol in ("\n", "\r\n"):  # controls: LF and CRLF files still read as the run they hold
+            with self.subTest(eol=repr(eol)):
+                code, printed = self._cli(self.PT_RED.replace("\n", eol).encode("utf-8"))
+                self.assertEqual(code, 0, printed)
+
+    def test_r9_adv_a2_an_output_path_with_a_nul_is_the_typed_exit_2(self) -> None:
+        code, printed = self._cli(b"", "x\x00y")
+        self.assertEqual(code, 2, printed)
+        self.assertIn("cannot read", printed)
+        self.assertNotIn("Traceback", printed)
+
+    def test_r9_adv_a1_sibling_the_real_run_helpers_keep_the_runner_line_ends(self) -> None:
+        # The helpers hand verdict() exactly the text a saved file holds, so the real-run tests go through _frame with
+        # the runner's own line ends (CRLF on Windows), never through a newline translation.
+        out = _run_pytest({"test_t.py": "def test_x():\n    assert False\n"})
+        self.assertEqual("\r\n" in out, sys.platform == "win32", out[-200:])
+        self.assertEqual(rmv.verdict(out, "test_t.py:2")[0], rmv.PASS, out)
+
 
 class CliTypedErrors(unittest.TestCase):
     def test_missing_output_file_exits_2_with_a_message_not_a_traceback(self) -> None:
