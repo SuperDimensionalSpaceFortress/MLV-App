@@ -1152,14 +1152,17 @@ def test_codex_lane_runtime_path_appends_a_missing_directory_once_and_never_dupl
     present = tmp_path / "bin"
     present.mkdir()
     absent = tmp_path / "no-such-dir"
+    # The drive letter is the one part of a path whose case never matters, so it is the one part that is folded (adversary A1 on ff7ec6c5: C:\case may be
+    # a case-sensitive directory); everything after it is compared exactly.
+    inherited = str(present)[0].swapcase() + str(present)[1:] + "\\"
     done = _codex_runtime_path_run(
         tmp_path,
-        f"$psi.Environment['PATH'] = 'C:\\first;' + '{_ps_quote(str(present).upper())}' + '\\'\n"
+        f"$psi.Environment['PATH'] = 'C:\\first;' + '{_ps_quote(inherited)}'\n"
         f"[void](Add-CodexLaneRuntimePath -Psi $psi -Candidates @('{_ps_quote(absent)}', '{_ps_quote(present)}', '{_ps_quote(present)}', '{_ps_quote(absent)}'))",
     )
     path = _codex_runtime_path_field(done, "PATH")
-    # `present` is already there under another case and a trailing backslash: not added again. `absent` is added once although it does not exist.
-    assert path == f"C:\\first;{str(present).upper()}\\;{absent}", path
+    # `present` is already there under another drive-letter case and a trailing backslash: not added again. `absent` is added once although it does not exist.
+    assert path == f"C:\\first;{inherited};{absent}", path
 
 
 @codex_runtime_path_only
@@ -1340,6 +1343,50 @@ def test_codex_lane_runtime_path_compares_path_keys_ordinally():
     operators = re.findall(r"^.*\s-(?:i?c?eq|i?c?ne|i?c?in|i?c?notin|i?c?contains|i?c?notcontains|i?c?like|i?c?lt|i?c?gt)\b.*$", code, re.M)
     offenders = [ln.strip() for ln in operators if not re.search(r"\.(?:Count|Length)\b|\$null -eq|-eq \$null", ln)]
     assert not offenders, f"culture-sensitive comparison of a path string: {offenders}"
+    # -match / -notmatch / -split are case-insensitive: [A-Za-z] under them also accepts U+212A (adversary A2 on ff7ec6c5). Use -cmatch / -cnotmatch.
+    insensitive = [ln.strip() for ln in code.splitlines() if re.search(r"\s-(?:i?match|i?notmatch)\b", ln)]
+    assert not insensitive, f"a case-insensitive regex operator on a path string: {insensitive}"
+    assert "ToLowerInvariant" not in code and "ToLower()" not in code, "no case fold beyond the drive letter"
+
+
+@codex_runtime_path_only
+def test_codex_lane_runtime_path_compares_everything_after_the_drive_letter_exactly(tmp_path):
+    # Adversary A1 on ff7ec6c5: with MINGW_ROOT=C:\case\mingw and PATH=...;C:\case\MINGW\bin on a case-sensitive NTFS directory, the ASCII case fold gave the
+    # two (different) directories one key and suppressed the usable one. A false "absent" costs a harmless duplicate, a false "present" costs the whole fix,
+    # so only the drive letter folds; the rest of the path is compared exactly.
+    upper = tmp_path / "CASE" / "bin"
+    lower = tmp_path / "case" / "bin"
+    done = _codex_runtime_path_run(
+        tmp_path,
+        f"$psi.Environment['PATH'] = 'C:\\first;{_ps_quote(upper)}'\n"
+        f"$r = @(Add-CodexLaneRuntimePath -Psi $psi -Candidates @('{_ps_quote(lower)}'))\n"
+        "'ADDED=' + $r.Count",
+    )
+    assert _codex_runtime_path_field(done, "ADDED") == "1", done.stdout
+    assert _codex_runtime_path_field(done, "PATH") == f"C:\\first;{upper};{lower}"
+    # the same spelling is still one directory, and so is the drive letter in another case
+    done = _codex_runtime_path_run(
+        tmp_path,
+        f"$psi.Environment['PATH'] = 'C:\\first;{_ps_quote(lower)}'\n"
+        f"$r = @(Add-CodexLaneRuntimePath -Psi $psi -Candidates @('{_ps_quote(lower)}'))\n"
+        "'ADDED=' + $r.Count",
+    )
+    assert _codex_runtime_path_field(done, "ADDED") == "0", done.stdout
+
+
+@codex_runtime_path_only
+def test_codex_lane_runtime_path_a_non_ascii_look_alike_is_not_a_drive_letter(tmp_path):
+    # Adversary A2 on ff7ec6c5: PowerShell's -match is case-insensitive, so [A-Za-z] also matched U+212A (the Kelvin sign) and the candidate
+    # '<KELVIN>:\runtime\bin' was appended although it is not a drive. A drive letter is an ASCII letter, matched case-sensitively.
+    kelvin = "\u212a"
+    done = _codex_runtime_path_run(
+        tmp_path,
+        "$psi.Environment['PATH'] = 'C:\\first'\n"
+        f"$r = @(Add-CodexLaneRuntimePath -Psi $psi -Candidates @('{kelvin}:\\runtime\\bin', '{kelvin}:/runtime/bin'))\n"
+        "'ADDED=' + $r.Count",
+    )
+    assert _codex_runtime_path_field(done, "ADDED") == "0", done.stdout
+    assert _codex_runtime_path_field(done, "PATH") == "C:\\first"
 
 
 @codex_runtime_path_only

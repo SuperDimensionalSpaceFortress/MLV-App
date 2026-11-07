@@ -1992,7 +1992,7 @@ function Add-CodexLaneRuntimePath {
         param([string]$d)
         if ([string]::IsNullOrEmpty($d) -or -not [string]::Equals($d, $d.Trim(), $ordinal) -or $d.Contains('"')) { return $null }
         $p = $d.Replace('/', '\')
-        if ($p -notmatch '^[A-Za-z]:\\') { return $null }
+        if ($p -cnotmatch '^[A-Za-z]:\\') { return $null }
         $stack = [System.Collections.Generic.List[string]]::new()
         foreach ($seg in $p.Substring(3).Split('\')) {
             if ($seg.Length -eq 0 -or [string]::Equals($seg, '.', $ordinal)) { continue }
@@ -2001,23 +2001,20 @@ function Add-CodexLaneRuntimePath {
                 $stack.RemoveAt($stack.Count - 1)
                 continue
             }
-            if ($seg -match '[ .]$' -or $seg -match '[<>:|?*]') { return $null }
+            if ($seg -cmatch '[ .]$' -or $seg -cmatch '[<>:|?*\x00-\x1f]') { return $null }
             $stack.Add($seg)
         }
         return ($p.Substring(0, 3) + ($stack -join '\'))
     }
     $current = if ($Psi.Environment.ContainsKey('PATH')) { [string]$Psi.Environment['PATH'] } else { '' }
-    # The comparison key folds the case of ASCII letters ONLY. ToLowerInvariant also folds U+212A (the Kelvin sign) to 'k', so an inherited entry 'Tas<KELVIN>s'
-    # was taken for the real 'Tasks' and the real directory was never added (adversary A2 on 834f307b); NTFS does not treat them as one name. A non-ASCII
-    # difference is a different directory here: a false "absent" is a duplicate, a false "present" costs the fix.
+    # The comparison key folds the case of the DRIVE LETTER only; everything after it is compared exactly (adversary A1 on ff7ec6c5). A directory can be
+    # case-sensitive on NTFS (per-directory flag), where C:\case\MINGW\bin and C:\case\mingw\bin are two directories and only one holds the DLLs; folding the
+    # whole path let an inherited spelling of the unusable one suppress the usable one. A false "absent" is a harmless duplicate PATH entry, a false "present"
+    # costs the fix, so the key errs toward absent. (Earlier rounds folded ASCII letters and, before that, ToLowerInvariant, which also folded U+212A: adversary
+    # A2 on 834f307b.) The drive letter is an ASCII letter by the caller's -cmatch, so ToUpperInvariant cannot reach a non-ASCII character.
     $dirKey = {
         param([string]$d)
-        $sb = [System.Text.StringBuilder]::new()
-        foreach ($c in $d.TrimEnd('\').ToCharArray()) {
-            $n = [int]$c
-            if ($n -ge 65 -and $n -le 90) { [void]$sb.Append([char]($n + 32)) } else { [void]$sb.Append($c) }
-        }
-        return $sb.ToString()
+        return ($d.Substring(0, 1).ToUpperInvariant() + $d.Substring(1).TrimEnd('\'))
     }
     $seen = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::Ordinal)
     foreach ($entry in ($current -split ';')) {
@@ -2030,7 +2027,7 @@ function Add-CodexLaneRuntimePath {
         $dir = $dir.Trim()
         # A DRIVE-LETTER path only (X:\... or X:/...): a relative PATH entry is searched from the CHILD's working directory, not the launcher's
         # (adversary A2 on 6372cc4e), and a UNC path is skipped by name (adversary A1 on 56281b89). Skipped by name, with no filesystem call.
-        if ($dir -notmatch '^[A-Za-z]:[\\/]') { continue }
+        if ($dir -cnotmatch '^[A-Za-z]:[\\/]') { continue }
         # A name PATH cannot carry intact is skipped: ';' would serialize as two entries (C:\toolchains;child\bin -> C:\toolchains plus a relative
         # child\bin, adversary A1 on e284b182) and '"' is PATH's own quoting.
         if ($dir.Contains(';') -or $dir.Contains('"')) { continue }
