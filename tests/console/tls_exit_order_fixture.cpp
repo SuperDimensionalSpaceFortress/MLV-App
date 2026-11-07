@@ -19,8 +19,9 @@
 //   setspecific_fail  The helper with pthread_setspecific failing. Expected: it stops with abort, GREEN; returning is RED.
 //   kind is stdthread | qthread | omp, and also main for helper.
 //
-// Output: one "RESULT mode=... kind=... verdict=... ..." line on stdout. Exit 0 when a verdict was reached, 3 when INVALID,
-// 4 on a usage error.
+// Output: one "RESULT mode=... kind=... verdict=... ..." line on stdout. Exit 0 when a verdict was reached, 3 when INVALID
+// (a control, or a setup step such as a key or an allocation, failed: the record names it in why=), 4 on a usage error.
+// MLV_TLS_FIXTURE_FAULT=<site> is a test-only seam that fails one setup step (see faultAt); unset, it changes nothing.
 
 #include <windows.h>
 #include <psapi.h>
@@ -35,6 +36,7 @@
 #include "processing/rbfilter/rbf_wrapper.h"
 
 #include <atomic>
+#include <cerrno>
 #include <chrono>
 #include <csignal>
 #include <cstdint>
@@ -91,6 +93,35 @@ SearchResult g_search;
 
 void ** g_kept = nullptr; // VirtualAlloc'd in main, so the search's bookkeeping does not touch the heap under test.
 
+// Test-only fault seam. MLV_TLS_FIXTURE_FAULT=<site> makes that one setup step fail, so its INVALID path can be run.
+// Unset, which is the default, it changes nothing. Sites: neg_alloc, pos_alloc, search_alloc, warm_alloc, key_create,
+// kept_alloc, set_key.
+const char * g_fault = nullptr;
+
+bool faultAt(const char * const site)
+{
+    return g_fault && std::strcmp(g_fault, site) == 0;
+}
+
+void * blockMalloc(const char * const site)
+{
+    return faultAt(site) ? nullptr : std::malloc(kBlockSize);
+}
+
+// A setup step a verdict depends on failed: a control or search allocation, or a key. The first reason is kept, and every
+// report reads it before any verdict, so a missing control gives INVALID with that reason and exit 3, never a result.
+std::atomic<const char *> g_setup_failure{nullptr};
+
+void noteSetupFailure(const char * const why)
+{
+    const char * expected = nullptr;
+    g_setup_failure.compare_exchange_strong(expected, why);
+}
+
+// The mode and kind from argv, for the INVALID record a worker thread prints when it has to stop.
+std::string g_mode_arg = "unknown";
+std::string g_kind_arg = "unknown";
+
 void freePositiveControlOnce()
 {
     if (g_pos_block)
@@ -109,8 +140,14 @@ void * searchForBase(const bool keepBase)
     void * found = nullptr;
     for (; n < kSearchLimit; ++n)
     {
-        void * const m = std::malloc(kBlockSize);
-        if (!m) break;
+        // The seam fails the search once the positive control is back: a search cut short there has not looked for the base.
+        void * const m = (faultAt("search_alloc") && g_search.pos_found) ? nullptr : std::malloc(kBlockSize);
+        if (!m)
+        {
+            // A search cut short has not looked for the base: base_found=0 would read as GREEN.
+            noteSetupFailure("search_alloc_failed");
+            break;
+        }
         g_kept[n] = m;
         if (m == g_base) { g_search.base_found = true; found = m; }
         if (m == g_pos_target) g_search.pos_found = true;
@@ -169,14 +206,27 @@ __attribute__((noinline)) Probe::~Probe()
     // Members are destroyed after this. In crash mode that is the free() the dump shows failing.
 }
 
-// K that was never set never fires, which would read as a result. A failure here is the fixture's own: stop.
+int printResult(const char * mode, const std::string & kind, const char * verdict, const std::string & detail);
+
+// K that was never set never fires, which would read as a result. A failure here is the fixture's own: stop, INVALID.
 void setKeyK()
 {
-    if (pthread_setspecific(g_key_k, reinterpret_cast<void *>(1)) != 0)
+    if (faultAt("set_key") || pthread_setspecific(g_key_k, reinterpret_cast<void *>(1)) != 0)
     {
         std::fprintf(stderr, "pthread_setspecific(K) failed\n");
+        printResult(g_mode_arg.c_str(), g_kind_arg, "INVALID", "why=set_key_failed");
         std::_Exit(3);
     }
+}
+
+// The two same-size controls, allocated on the worker. A control that could not be allocated is not a control.
+void allocateControls()
+{
+    g_pos_block = blockMalloc("pos_alloc");
+    g_pos_target = g_pos_block;
+    g_neg_block = blockMalloc("neg_alloc");
+    if (!g_pos_block) noteSetupFailure("positive_control_alloc_failed");
+    if (!g_neg_block) noteSetupFailure("negative_control_alloc_failed");
 }
 
 __attribute__((noinline)) void touchProbe()
@@ -191,9 +241,7 @@ void workerBody()
 {
     DuplicateHandle(GetCurrentProcess(), GetCurrentThread(), GetCurrentProcess(), &g_worker_handle, 0, FALSE, DUPLICATE_SAME_ACCESS);
     touchProbe();
-    g_pos_block = std::malloc(kBlockSize);
-    g_pos_target = g_pos_block;
-    g_neg_block = std::malloc(kBlockSize);
+    allocateControls();
     setKeyK();
 }
 
@@ -239,11 +287,17 @@ bool runOnKind(const std::string & kind, const std::function<void()> & body)
 
 // Force the low-fragmentation heap on for this size class, as it was in the dump (slot 316 of an LFH user block). Without
 // this a freed block can coalesce with a neighbour in the backend, and the search would miss it and read as GREEN.
-void warmLfh()
+bool warmLfh()
 {
     static void * warm[2000];
-    for (void *& p : warm) p = std::malloc(kBlockSize);
+    bool ok = true;
+    for (void *& p : warm)
+    {
+        p = blockMalloc("warm_alloc");
+        if (!p) ok = false;
+    }
     for (size_t i = 0; i < 2000; i += 2) std::free(warm[i]);
+    return ok;
 }
 
 int printResult(const char * mode, const std::string & kind, const char * verdict, const std::string & detail)
@@ -259,6 +313,7 @@ int reportOrder(const std::string & kind, const bool finished)
     const int probe = g_probe_stamp.load();
     const std::string detail = "k_seq=" + std::to_string(k) + " probe_seq=" + std::to_string(probe);
     if (!finished) return printResult("order", kind, "INVALID", detail + " why=worker_never_finished");
+    if (const char * const why = g_setup_failure.load()) return printResult("order", kind, "INVALID", detail + " why=" + why);
     if (g_base_mismatch.load()) return printResult("order", kind, "INVALID", detail + " why=base_is_not_object_minus_8");
     if (probe == 0) return printResult("order", kind, "INVALID", detail + " why=probe_destructor_never_ran");
     if (k == 0) return printResult("order", kind, kind == "stdthread" ? "INVALID" : "NO_KEY_DTOR", detail + " why=key_destructor_never_ran");
@@ -277,6 +332,7 @@ int reportReuse(const std::string & kind, const bool finished)
     const std::string detail = "k_seq=" + std::to_string(g_k_stamp.load()) + " probe_seq=" + std::to_string(g_probe_stamp.load())
         + " base_found=" + std::to_string(s.base_found) + " pos_found=" + std::to_string(s.pos_found)
         + " neg_found=" + std::to_string(s.neg_found) + " attempts=" + std::to_string(s.attempts);
+    if (const char * const why = g_setup_failure.load()) return printResult("reuse", kind, "INVALID", detail + " why=" + why);
     if (g_base_mismatch.load()) return printResult("reuse", kind, "INVALID", detail + " why=base_is_not_object_minus_8");
     if (!s.ran) return printResult("reuse", kind, "INVALID", detail + " why=search_never_ran");
     if (!s.pos_found) return printResult("reuse", kind, "INVALID", detail + " why=positive_control_not_found");
@@ -321,9 +377,7 @@ __attribute__((noinline)) void helperBody()
     g_base = base;
     if (base != static_cast<char *>(self) - 8) g_base_mismatch.store(true);
     mlvThreadExitCache<HelperT>();
-    g_pos_block = std::malloc(kBlockSize);
-    g_pos_target = g_pos_block;
-    g_neg_block = std::malloc(kBlockSize);
+    allocateControls();
     setKeyK();
 }
 
@@ -336,6 +390,7 @@ int runHelper(const std::string & kind)
         helperBody();
         CloseHandle(g_worker_handle);
         g_worker_handle = nullptr;
+        if (const char * const why = g_setup_failure.load()) return printResult("helper", kind, "INVALID", std::string("why=") + why);
         return printResult("helper", kind, g_helper_ctor.load() == 1 ? "GREEN" : "INVALID",
                            "ctor=" + std::to_string(g_helper_ctor.load()) + " dtor=" + std::to_string(g_helper_dtor.load()));
     }
@@ -350,6 +405,7 @@ int runHelper(const std::string & kind)
         + " bad=" + std::to_string(g_helper_bad.load()) + " k_seq=" + std::to_string(g_k_stamp.load())
         + " dtor_seq=" + std::to_string(g_helper_dtor_stamp.load()) + " base_found=" + std::to_string(s.base_found)
         + " pos_found=" + std::to_string(s.pos_found) + " neg_found=" + std::to_string(s.neg_found) + " attempts=" + std::to_string(s.attempts);
+    if (const char * const why = g_setup_failure.load()) return printResult("helper", kind, "INVALID", detail + " why=" + why);
     if (g_base_mismatch.load()) return printResult("helper", kind, "INVALID", detail + " why=base_is_not_object_minus_8");
     // The adversary has to have run, or this exit 0 says nothing.
     if (!s.ran || !s.pos_found || !s.base_found || s.neg_found) return printResult("helper", kind, "INVALID", detail + " why=adversary_did_not_take_the_block");
@@ -504,14 +560,29 @@ int main(int argc, char ** argv)
         std::fprintf(stderr, "unknown kind %s for mode %s\n", kind.c_str(), mode.c_str());
         return 4;
     }
+    // Checked before any setup, so a usage error is 4 whatever the setup would have done.
+    const bool knownMode = mode == "order" || mode == "reuse" || mode == "crash" || mode == "helper" || mode == "identity"
+        || mode == "bench" || mode == "churn" || mode == "churn_control" || mode == "setspecific_fail";
+    if (!knownMode)
+    {
+        std::fprintf(stderr, "unknown mode %s\n", mode.c_str());
+        return 4;
+    }
+    g_mode_arg = mode;
+    g_kind_arg = kind;
 
+    g_fault = std::getenv("MLV_TLS_FIXTURE_FAULT");
+
+    // From here a failure is the fixture's own setup, not the caller's: an INVALID record and exit 3, never usage exit 4.
     g_emutls_touch = 1;
-    if (g_emutls_touch != 1) return 4;
-    if (pthread_key_create(&g_key_k, keyDestructor) != 0) return 4;
+    if (g_emutls_touch != 1) return printResult(mode.c_str(), kind, "INVALID", "why=emutls_touch_failed");
+    const int keyRc = faultAt("key_create") ? EAGAIN : pthread_key_create(&g_key_k, keyDestructor);
+    if (keyRc != 0) return printResult(mode.c_str(), kind, "INVALID", "why=key_create_failed rc=" + std::to_string(keyRc));
 
-    g_kept = static_cast<void **>(VirtualAlloc(nullptr, kSearchLimit * sizeof(void *), MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
-    if (!g_kept) return 4;
-    warmLfh();
+    g_kept = faultAt("kept_alloc") ? nullptr
+                                   : static_cast<void **>(VirtualAlloc(nullptr, kSearchLimit * sizeof(void *), MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
+    if (!g_kept) return printResult(mode.c_str(), kind, "INVALID", "why=kept_alloc_failed");
+    if (!warmLfh()) return printResult(mode.c_str(), kind, "INVALID", "why=warm_alloc_failed");
 
     if (mode == "order")
     {
@@ -531,6 +602,7 @@ int main(int argc, char ** argv)
             printResult("crash", kind, "INVALID", "why=worker_never_finished");
             std::_Exit(3);
         }
+        if (const char * const why = g_setup_failure.load()) return printResult("crash", kind, "INVALID", std::string("why=") + why);
         // Reached only when the free() did not fast-fail. Not a gate: heap termination policy may differ on this OS.
         return printResult("crash", kind, "NO_FAST_FAIL",
                            "base_found=" + std::to_string(g_search.base_found)
