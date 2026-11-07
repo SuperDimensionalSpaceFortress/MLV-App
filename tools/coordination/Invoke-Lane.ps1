@@ -1968,7 +1968,11 @@ function Set-CodexLaunchStartInfo {
 function Add-CodexLaneRuntimePath {
     param(
         [Parameter(Mandatory = $true)]$Psi,
-        [string[]]$Candidates = $null
+        [string[]]$Candidates = $null,
+        # The existence lookup is a seam: a script taking the path and returning $true when a directory is there. It runs in its OWN runspace under a
+        # deadline (adversary A2 on 7688a2a3: a local-looking path can be a symlink or junction into a share, which no name or drive-type gate sees).
+        [string]$LookupScript = $null,
+        [int]$LookupTimeoutMs = 1500
     )
     if ($null -eq $Candidates) {
         $Candidates = @()
@@ -1977,35 +1981,70 @@ function Add-CodexLaneRuntimePath {
         if (-not [string]::IsNullOrWhiteSpace($env:MINGW_ROOT)) { $Candidates += ($env:MINGW_ROOT.Trim().TrimEnd('\', '/') + '\bin') }
         $Candidates += 'C:\Qt\Tools\mingw1310_64\bin'
     }
+    if ([string]::IsNullOrEmpty($LookupScript)) { $LookupScript = 'param($p) [System.IO.Directory]::Exists($p)' }
+    # ONE lexical normalisation for both sides of the duplicate check, and for what is appended: '/' is '\', '.' and '..' segments are resolved (Windows
+    # does the same before it touches the disk), repeated separators collapse (adversary A2 on 56281b89, A3 on 7688a2a3). It returns $null for a spelling
+    # the loader may not match to the directory it names: leading/trailing whitespace, a quote, a segment ending in space or dot, a reserved character, or
+    # a non-drive-letter path. An INHERITED entry in such a spelling is not counted as present (adversary A1 on 7688a2a3: 'C:\x\bin ' was trimmed into the
+    # seen-set, so the usable directory was never added); a false "absent" costs a harmless duplicate, a false "present" costs the whole fix.
+    $dirNorm = {
+        param([string]$d)
+        if ([string]::IsNullOrEmpty($d) -or $d -ne $d.Trim() -or $d.Contains('"')) { return $null }
+        $p = $d.Replace('/', '\')
+        if ($p -notmatch '^[A-Za-z]:\\') { return $null }
+        $stack = [System.Collections.Generic.List[string]]::new()
+        foreach ($seg in $p.Substring(3).Split('\')) {
+            if ($seg -eq '' -or $seg -eq '.') { continue }
+            if ($seg -eq '..') {
+                if ($stack.Count -eq 0) { return $null }
+                $stack.RemoveAt($stack.Count - 1)
+                continue
+            }
+            if ($seg -match '[ .]$' -or $seg -match '[<>:|?*]') { return $null }
+            $stack.Add($seg)
+        }
+        return ($p.Substring(0, 3) + ($stack -join '\'))
+    }
     $current = if ($Psi.Environment.ContainsKey('PATH')) { [string]$Psi.Environment['PATH'] } else { '' }
-    # ONE normalisation for both sides of the duplicate check: '/' is '\', no trailing separator, any case (adversary A2 on 56281b89: the candidate
-    # was normalised but the existing PATH entries were not, so PATH='C:/x/bin' still got C:\x\bin appended).
-    $dirKey = { param([string]$d) $d.Trim().Trim('"').Replace('/', '\').TrimEnd('\').ToLowerInvariant() }
     $seen = @{}
     foreach ($entry in ($current -split ';')) {
-        $key = & $dirKey $entry
-        if ($key) { $seen[$key] = $true }
+        $norm = & $dirNorm $entry
+        if ($norm) { $seen[$norm.TrimEnd('\').ToLowerInvariant()] = $true }
     }
     $added = @()
     foreach ($dir in $Candidates) {
         if ([string]::IsNullOrWhiteSpace($dir)) { continue }
+        $dir = $dir.Trim()
         # A DRIVE-LETTER path only (X:\... or X:/...): a relative PATH entry is searched from the CHILD's working directory, not the launcher's where
-        # Test-Path would judge it (adversary A2 on 6372cc4e), and a UNC path is never looked up at all: Test-Path on \\host\share\... can block in the
-        # SMB layer past the launch budget and fail the lane launch-budget-exhausted before codex starts (adversary A1 on 56281b89). Skipped by name.
-        if ($dir.Trim() -notmatch '^[A-Za-z]:[\\/]') { continue }
+        # the lookup would judge it (adversary A2 on 6372cc4e), and a UNC path is never looked up at all: it can block in the SMB layer past the launch
+        # budget and fail the lane launch-budget-exhausted before codex starts (adversary A1 on 56281b89). Skipped by name.
+        if ($dir -notmatch '^[A-Za-z]:[\\/]') { continue }
         # A name PATH cannot carry intact is skipped: ';' would serialize as two entries (C:\toolchains;child\bin -> C:\toolchains plus a relative
-        # child\bin, adversary A1 on e284b182) and '"' is PATH's own quoting. '/' is respelled '\' so one directory is added once, in one spelling.
+        # child\bin, adversary A1 on e284b182) and '"' is PATH's own quoting.
         if ($dir.Contains(';') -or $dir.Contains('"')) { continue }
-        $dir = $dir.Trim().Replace('/', '\')
-        $key = & $dirKey $dir
+        $dir = & $dirNorm $dir
+        if (-not $dir) { continue }
+        $key = $dir.TrimEnd('\').ToLowerInvariant()
         if ($seen.ContainsKey($key)) { continue }
         # A drive letter can still be a mapped share (or be gone): its type is read first, a local call that does not touch the share, and a drive that
         # is not a local disk is skipped with no lookup.
         $driveType = 'Unknown'
         try { $driveType = [string][System.IO.DriveInfo]::new($dir.Substring(0, 1)).DriveType } catch { $driveType = 'Unknown' }
         if ($driveType -in @('Network', 'NoRootDirectory', 'Unknown')) { continue }
+        # The lookup itself, under a deadline (adversary A2 on 7688a2a3): C:\link\bin where C:\link is a junction or symlink to \\host\share passes every
+        # gate above and then stalls in SMB. A lookup still blocked at the deadline costs ITS candidate, not the launch. Its runspace is neither stopped
+        # nor disposed (both wait for the blocked call) and is left to the process end.
         $exists = $false
-        try { $exists = Test-Path -LiteralPath $dir -PathType Container } catch { $exists = $false }
+        try {
+            $ps = [powershell]::Create()
+            [void]$ps.AddScript($LookupScript).AddArgument($dir)
+            $async = $ps.BeginInvoke()
+            if ($async.AsyncWaitHandle.WaitOne($LookupTimeoutMs)) {
+                $answer = @($ps.EndInvoke($async))
+                $exists = ($answer.Count -gt 0 -and [bool]$answer[$answer.Count - 1])
+                $ps.Dispose()
+            }
+        } catch { $exists = $false }
         if (-not $exists) { continue }
         $seen[$key] = $true
         $added += $dir

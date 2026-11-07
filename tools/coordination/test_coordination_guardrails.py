@@ -1261,36 +1261,36 @@ def test_codex_lane_runtime_path_treats_slash_spellings_already_on_path_as_prese
     assert _codex_runtime_path_field(done, "PATH") == start
 
 
-# A Test-Path stand-in that records what the function looks up and answers "exists" to everything, so a candidate the function should have skipped
-# shows up as a recorded lookup AND as an added directory. It shadows the cmdlet for the function under test (a function outranks a cmdlet).
-_RECORD_LOOKUPS = (
-    "$script:lookups = @()\n"
-    "function Test-Path { $script:lookups += ($args -join ' '); return $true }\n"
-)
-_PRINT_LOOKUPS = "\n'LOOKUPS=' + ($script:lookups -join '|')"
+# The function's directory lookup is a seam (-LookupScript, run in its own runspace under a deadline). These tests hand it a recorder that appends every
+# path it is asked about to a file and answers "exists" to everything, so a candidate the function should have skipped shows up as a recorded lookup AND
+# as an added directory.
+def _recorder_call(tmp_path, candidates):
+    rec = tmp_path / "lookups.txt"
+    script = f"param($p) Add-Content -LiteralPath '{rec}' -Value $p; return $true"
+    cand = "" if candidates is None else f" -Candidates @({candidates})"
+    return rec, (
+        "$psi.Environment['PATH'] = 'C:\\first'\n"
+        f"[void](Add-CodexLaneRuntimePath -Psi $psi{cand} -LookupScript '{_ps_quote(script)}')"
+    )
+
+
+def _recorded(rec):
+    return rec.read_text(encoding="utf-8") if rec.exists() else ""
 
 
 @codex_runtime_path_only
 def test_codex_lane_runtime_path_never_looks_up_a_unc_directory(tmp_path):
     # Adversary A1 on 56281b89: Test-Path on \\host\share\... can block in the SMB layer for longer than the launch budget, and the lane then fails
     # launch-budget-exhausted before codex starts. A UNC candidate (explicit, or through MINGW_ROOT) is skipped with no filesystem lookup at all.
-    done = _codex_runtime_path_run(
-        tmp_path,
-        _RECORD_LOOKUPS
-        + "$psi.Environment['PATH'] = 'C:\\first'\n"
-        + "[void](Add-CodexLaneRuntimePath -Psi $psi -Candidates @('\\\\blackhole-host\\share\\mingw\\bin'))"
-        + _PRINT_LOOKUPS,
-    )
+    rec, call = _recorder_call(tmp_path, "'\\\\blackhole-host\\share\\mingw\\bin'")
+    done = _codex_runtime_path_run(tmp_path, call)
     assert _codex_runtime_path_field(done, "PATH") == "C:\\first"
-    assert _codex_runtime_path_field(done, "LOOKUPS") == "", done.stdout
+    assert _recorded(rec) == "", done.stdout
     env = {**os.environ, "MINGW_ROOT": "\\\\blackhole-host\\share\\mingw"}
-    done = _codex_runtime_path_run(
-        tmp_path,
-        _RECORD_LOOKUPS + "$psi.Environment['PATH'] = 'C:\\first'\n[void](Add-CodexLaneRuntimePath -Psi $psi)" + _PRINT_LOOKUPS,
-        env=env,
-    )
+    rec, call = _recorder_call(tmp_path, None)
+    done = _codex_runtime_path_run(tmp_path, call, env=env)
     assert "blackhole-host" not in _codex_runtime_path_field(done, "PATH")
-    assert "blackhole-host" not in _codex_runtime_path_field(done, "LOOKUPS"), done.stdout
+    assert "blackhole-host" not in _recorded(rec), done.stdout
 
 
 @codex_runtime_path_only
@@ -1300,16 +1300,71 @@ def test_codex_lane_runtime_path_looks_up_only_a_local_drive(tmp_path):
     # still looked up, so the positive control below is what keeps this from passing by skipping everything.
     gone = _free_drive_letter()
     system_drive = os.environ.get("SystemDrive", "C:")
-    done = _codex_runtime_path_run(
-        tmp_path,
-        _RECORD_LOOKUPS
-        + "$psi.Environment['PATH'] = 'C:\\first'\n"
-        + f"[void](Add-CodexLaneRuntimePath -Psi $psi -Candidates @('{gone}:\\toolchain\\bin', '{_ps_quote(system_drive)}\\probe-toolchain\\bin'))"
-        + _PRINT_LOOKUPS,
-    )
-    lookups = _codex_runtime_path_field(done, "LOOKUPS")
+    rec, call = _recorder_call(tmp_path, f"'{gone}:\\toolchain\\bin', '{_ps_quote(system_drive)}\\probe-toolchain\\bin'")
+    done = _codex_runtime_path_run(tmp_path, call)
+    lookups = _recorded(rec)
     assert f"{gone}:" not in lookups and f"{gone}:" not in _codex_runtime_path_field(done, "PATH"), done.stdout
     assert "probe-toolchain" in lookups, f"a local fixed drive must still be looked up: {done.stdout!r}"
+
+
+@codex_runtime_path_only
+def test_codex_lane_runtime_path_abandons_a_lookup_that_outlasts_its_deadline(tmp_path):
+    # Adversary A2 on 7688a2a3: C:\lane-runtime-link is a local, fixed-drive path whose target is \\host\share, so no name-based gate sees the share and
+    # Test-Path follows the link into SMB with no timeout. The lookup now runs under a deadline; one still blocked when it passes costs its candidate,
+    # not the launch. A lookup that sleeps 20 s stands in for the blocked SMB call.
+    present = tmp_path / "bin"
+    present.mkdir()
+    slow = "param($p) Start-Sleep -Seconds 20; return $true"
+    done = _codex_runtime_path_run(
+        tmp_path,
+        "$psi.Environment['PATH'] = 'C:\\first'\n"
+        "$sw = [System.Diagnostics.Stopwatch]::StartNew()\n"
+        f"[void](Add-CodexLaneRuntimePath -Psi $psi -Candidates @('{_ps_quote(present)}') -LookupScript '{_ps_quote(slow)}' -LookupTimeoutMs 300)\n"
+        "'ELAPSED_MS=' + [int]$sw.ElapsedMilliseconds",
+    )
+    assert _codex_runtime_path_field(done, "PATH") == "C:\\first"
+    assert int(_codex_runtime_path_field(done, "ELAPSED_MS")) < 10000, done.stdout
+
+
+@codex_runtime_path_only
+def test_codex_lane_runtime_path_does_not_count_a_spelling_the_loader_will_not_match(tmp_path):
+    # Adversary A1 on 7688a2a3: PATH='...\bin ' (trailing space) was trimmed into the seen-set, so the usable directory was never added and
+    # the DLLs stayed unfound. An inherited entry counts as present only when it is a plain, exact spelling; a false "absent" costs a harmless duplicate,
+    # a false "present" costs the whole fix.
+    present = tmp_path / "bin"
+    present.mkdir()
+    for spelling in (f"{present} ", f" {present}", f'"{present}"', f"{present}."):
+        start = f"C:\\first;{spelling}"
+        done = _codex_runtime_path_run(
+            tmp_path,
+            f"$psi.Environment['PATH'] = '{_ps_quote(start)}'\n"
+            f"[void](Add-CodexLaneRuntimePath -Psi $psi -Candidates @('{_ps_quote(present)}'))",
+        )
+        assert _codex_runtime_path_field(done, "PATH") == f"{start};{present}", spelling
+
+
+@codex_runtime_path_only
+def test_codex_lane_runtime_path_treats_dot_segments_as_the_directory_they_name(tmp_path):
+    # Adversary A3 (advisory, introduced) on 7688a2a3: <dir>\.\bin and <dir>\bin are one directory but were both appended. Dot segments are resolved
+    # lexically (Windows does the same before it touches the disk) on the candidate and on the inherited entries, and the directory is added once, resolved.
+    present = tmp_path / "bin"
+    present.mkdir()
+    (tmp_path / "side").mkdir()
+    dotted = f"{tmp_path}\\.\\bin"
+    parent = f"{tmp_path}\\side\\..\\bin"
+    done = _codex_runtime_path_run(
+        tmp_path,
+        "$psi.Environment['PATH'] = 'C:\\first'\n"
+        f"[void](Add-CodexLaneRuntimePath -Psi $psi -Candidates @('{_ps_quote(dotted)}', '{_ps_quote(parent)}', '{_ps_quote(present)}'))",
+    )
+    assert _codex_runtime_path_field(done, "PATH") == f"C:\\first;{present}"
+    start = f"C:\\first;{dotted}"
+    done = _codex_runtime_path_run(
+        tmp_path,
+        f"$psi.Environment['PATH'] = '{_ps_quote(start)}'\n"
+        f"[void](Add-CodexLaneRuntimePath -Psi $psi -Candidates @('{_ps_quote(present)}'))",
+    )
+    assert _codex_runtime_path_field(done, "PATH") == start
 
 
 def test_codex_lane_runtime_path_is_wired_into_the_codex_child_only():
