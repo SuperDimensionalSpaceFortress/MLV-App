@@ -3208,6 +3208,8 @@ void MainWindow::resizeEvent(QResizeEvent *event)
         drawFrame();
         if( ui->checkBoxGradientEnable->isChecked() && ui->groupBoxLinearGradient->isChecked() )
         {
+            // On Timeout the frame drawFrame() asked for has not landed and the scene keeps its old geometry, so no redraw
+            // now (adversary r1 A2).
             if( waitForResizeStillDrawing( QStringLiteral("gradient") ) )
             {
                 m_pGradientElement->redrawGradientElement( m_pScene->width(),
@@ -3215,12 +3217,12 @@ void MainWindow::resizeEvent(QResizeEvent *event)
                                                            getMlvWidth( m_pMlvObject ),
                                                            getMlvHeight( m_pMlvObject ) );
             }
-            else
-            {
-                // Timeout: the frame drawFrame() asked for has not landed and the scene keeps its old geometry, so the
-                // frame-ready path (finishPresentedFrame) redraws the gradient on the landed scene (adversary r1 A2).
-                m_zoomModeChanged = true;
-            }
+            // Every outcome re-anchors on the landed frame: finishPresentedFrame consumes m_zoomModeChanged with a gradient
+            // redraw on the scene that frame sets. A stale or cleared flag does not prove the frame landed: isIdle ignores
+            // a Ready slot whose frameReady has not been emitted yet (RenderFrameThread.cpp), so a late frame can still
+            // change the scene (adversary r1 pass 3 A1). Armed after the wait, so a frame landing inside a pump cannot
+            // consume it early; a spare redraw on an unchanged scene places the overlay where it already is.
+            m_zoomModeChanged = true;
         }
     }
     event->accept();

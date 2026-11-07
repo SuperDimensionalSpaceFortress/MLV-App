@@ -10,7 +10,9 @@
 //   - pump; flag clears               -> Cleared
 //   - flag still set after >= kMinPumpsBeforeStale pumps, while renderIdle() has held continuously for
 //     >= kStaleIdleGraceMs             -> clearStale() once, StaleCleared
-//   - kDeadlineMs since entry, measured after a pump -> Timeout (the caller proceeds)
+//   - kDeadlineMs since entry, measured after a pump's renderIdle() sample (it can block on the renderer mutex), i.e.
+//     immediately before the next pump -> Timeout (the caller proceeds)
+// The idle grace runs from when a renderIdle() sample RETURNS idle: time blocked inside it is never counted as idle.
 // A busy render thread is never forged clear: it only ever times out.
 // WHAT IS BOUNDED (adversary r1 A1 and its re-pass): the time this helper spends deciding, i.e. the number of pumps
 // after the deadline is zero. The deadline is checked after every pump, so a pump that outlasts it ends the wait at
@@ -88,6 +90,10 @@ inline Result wait( const Callbacks &callbacks )
         }
 
         result.renderIdle = callbacks.renderIdle();
+        // adversary r1 pass 3 A2: renderIdle() reaches the renderer mutex and can block, so both the stale grace and the
+        // deadline are judged on a clock sampled after it returns. Nothing runs between this sample and the next pump.
+        const std::int64_t sampledMs = callbacks.nowMs();
+        result.waitedMs = sampledMs - startMs;
         if( !result.renderIdle )
         {
             idleRun = false;
@@ -95,12 +101,12 @@ inline Result wait( const Callbacks &callbacks )
         else if( !idleRun )
         {
             idleRun = true;
-            idleSinceMs = nowMs;
+            idleSinceMs = sampledMs;
         }
 
         if( idleRun
          && result.pumps >= kMinPumpsBeforeStale
-         && nowMs - idleSinceMs >= kStaleIdleGraceMs )
+         && sampledMs - idleSinceMs >= kStaleIdleGraceMs )
         {
             callbacks.clearStale();
             result.outcome = Outcome::StaleCleared;
