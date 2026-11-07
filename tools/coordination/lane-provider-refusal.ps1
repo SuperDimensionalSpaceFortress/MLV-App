@@ -88,7 +88,9 @@ function Find-ClaudeResultEnvelope {
         $cand = ConvertFrom-LaneJsonObject -Text $t
         if ($null -eq $cand) { continue }
         $candNames = @($cand.PSObject.Properties | ForEach-Object { $_.Name })
-        if (-not ($candNames -contains 'type') -or [string]$cand.type -ne 'result') { continue }
+        # r3c (A4, advisory): type must BE the string "result"; [string]@('result') is also 'result', so an array-typed
+        # diagnostic line was taken for the envelope and hid the real one behind it.
+        if (-not ($candNames -contains 'type') -or $cand.type -isnot [string] -or $cand.type -ne 'result') { continue }
         return $cand
     }
     return $null
@@ -171,15 +173,61 @@ function Test-PromptDemandsVerdict {
 function ConvertFrom-LaneJsonObject {
     param([AllowEmptyString()][AllowNull()][string]$Text)
     if ([string]::IsNullOrWhiteSpace($Text)) { return $null }
-    $isObject = $false
+    # r3c (adversary A1): the object is BUILT from the strict parse, never re-parsed by ConvertFrom-Json, which throws
+    # on valid JSON (nested keys that differ only by case, an empty key, a key named PSObject) and so erased a real
+    # verdict. Top-level members only (every consumer reads top-level scalars): a nested value is kept as its raw
+    # text. A duplicate key: the last one wins; a key that collides with an earlier one only by case is dropped
+    # (PowerShell member names are case-insensitive), so the first spelling stays addressable.
+    $o = $null
     try {
         $doc = [System.Text.Json.JsonDocument]::Parse($Text)
-        try { $isObject = ($doc.RootElement.ValueKind -eq [System.Text.Json.JsonValueKind]::Object) } finally { $doc.Dispose() }
+        try {
+            if ($doc.RootElement.ValueKind -ne [System.Text.Json.JsonValueKind]::Object) { return $null }
+            $o = New-Object psobject
+            foreach ($p in $doc.RootElement.EnumerateObject()) {
+                $e = $p.Value
+                $v = $null
+                switch ($e.ValueKind.ToString()) {
+                    'String' { $v = $e.GetString() }
+                    'True'   { $v = $true }
+                    'False'  { $v = $false }
+                    'Null'   { $v = $null }
+                    'Number' { $l = 0L; if ($e.TryGetInt64([ref]$l)) { $v = $l } else { $v = $e.GetRawText() } }
+                    default  { $v = $e.GetRawText() }
+                }
+                try {
+                    $have = $o.PSObject.Properties[$p.Name]
+                    if ($null -ne $have -and $have.Name -cne $p.Name) { continue }
+                    Add-Member -InputObject $o -NotePropertyName $p.Name -NotePropertyValue $v -Force -ErrorAction Stop
+                } catch { continue }
+            }
+        } finally { $doc.Dispose() }
     } catch { return $null }
-    if (-not $isObject) { return $null }
-    try { $o = $Text | ConvertFrom-Json -NoEnumerate -ErrorAction Stop } catch { return $null }
-    if ($o -is [System.Management.Automation.PSCustomObject]) { return $o }
-    return $null
+    return $o
+}
+
+# True when the text is one JSON value that is neither an object nor an array: null, true, false, a number or a
+# string (r3c, adversary A2). Such a final line is a non-object terminal value, not prose.
+function Test-LaneJsonScalar {
+    param([AllowEmptyString()][AllowNull()][string]$Text)
+    if ([string]::IsNullOrWhiteSpace($Text)) { return $false }
+    $scalar = $false
+    try {
+        $doc = [System.Text.Json.JsonDocument]::Parse($Text)
+        try {
+            $k = $doc.RootElement.ValueKind
+            $scalar = ($k -ne [System.Text.Json.JsonValueKind]::Object -and $k -ne [System.Text.Json.JsonValueKind]::Array)
+        } finally { $doc.Dispose() }
+    } catch { return $false }
+    return $scalar
+}
+
+# Characters as Unicode code points: a surrogate pair is one character (r3c, adversary A3). String.Length counts
+# UTF-16 units, so a prompt of 205 characters with 195 emoji read as 400 and lost the short-probe exemption.
+function Get-LaneCodePointCount {
+    param([AllowEmptyString()][AllowNull()][string]$Text)
+    if ([string]::IsNullOrEmpty($Text)) { return 0 }
+    return [regex]::Replace($Text, '[\uD800-\uDBFF][\uDC00-\uDFFF]', 'x').Length
 }
 
 # Index of the bracket that closes the JSON value opened at $Start ('{' or '['), skipping string contents and
@@ -272,6 +320,14 @@ function Get-LaneTerminalCandidate {
     if ($inBlock) { return [pscustomobject]@{ form = 'fenced'; text = ($cur -join "`n"); startLine = $curStart } }
     $firstTail = if ($null -eq $lastFence) { 0 } else { $lastFence.endLine + 1 }
     if ($firstTail -lt $lines.Count) {
+        # r3c (adversary A2): when the LAST non-blank line is a lone JSON scalar (null / false / 0 / "text") it is the
+        # terminal value, a non-object, so no earlier fenced or unfenced approval stands in for it.
+        for ($li = $lines.Count - 1; $li -ge $firstTail; $li--) {
+            $lt = $lines[$li].Trim([char[]](9, 10, 13, 32))
+            if ($lt.Length -eq 0) { continue }
+            if (Test-LaneJsonScalar -Text $lt) { return [pscustomobject]@{ form = 'unfenced'; text = $lt; startLine = $li } }
+            break
+        }
         $tailText = ($lines[$firstTail..($lines.Count - 1)] -join "`n")
         $c = Get-LaneLastTopLevelJson -Text $tailText
         if ($null -ne $c) {

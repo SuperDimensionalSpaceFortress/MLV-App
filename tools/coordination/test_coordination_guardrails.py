@@ -2286,6 +2286,59 @@ def test_r3c_a_non_boolean_is_error_is_never_a_provider_refusal(tmp_path):
     assert _classify(tmp_path, "", "claude", answer=REAL_CLAUDE_429_ENVELOPE) is not None
 
 
+def test_r3c_adv_a1_valid_nested_metadata_never_erases_a_real_verdict(tmp_path):
+    # adversary r3c A1: ConvertFrom-Json throws on nested keys differing only by case, an empty key and a key named
+    # PSObject; the strict parse accepts all three, so the verdict was lost.
+    prose = "x" * 130 + "\n"
+    for meta in ('{"foo":1,"Foo":2}', '{"":1}', '{"PSObject":1}'):
+        body = '{"verdict":"APPROVE","metadata":%s}' % meta
+        for wrap in ("%s\n", "```json\n%s\n```\n"):
+            r = _work_evidence(tmp_path, "codex", prose + wrap % body, 0, prompt_chars=600, require_verdict=True)
+            assert r["workCompleted"] is True, (meta, wrap, r)
+    # top-level duplicate key: the last one wins, as ConvertFrom-Json did
+    r = _work_evidence(tmp_path, "codex", prose + '{"verdict":null,"verdict":"APPROVE"}\n', 0, prompt_chars=600, require_verdict=True)
+    assert r["workCompleted"] is True, r
+    r = _work_evidence(tmp_path, "codex", prose + '{"verdict":"APPROVE","verdict":null}\n', 0, prompt_chars=600, require_verdict=True)
+    assert r["workCompleted"] is False and r["reason"] == "codex-no-verdict", r
+    # a strict-parse failure still fails (the build never loosens the contract)
+    r = _work_evidence(tmp_path, "codex", prose + '{"verdict":"APPROVE",}\n', 0, prompt_chars=600, require_verdict=True)
+    assert r["workCompleted"] is False, r
+    # a claude success envelope with such metadata is still an envelope
+    env = '{"type":"result","subtype":"success","is_error":false,"meta":{"a":1,"A":2},"result":"ok"}\n'
+    assert _work_evidence(tmp_path, "claude", env, 0)["workCompleted"] is True
+
+
+def test_r3c_adv_a2_a_final_scalar_line_never_leaves_an_earlier_approval_authoritative(tmp_path):
+    prose = "x" * 130 + "\n"
+    prov = '```json\n{"verdict":"APPROVE"}\n```\n'
+    for tail in ("null", "false", "0", '"no verdict issued"', "true", "-1.5e3"):
+        r = _work_evidence(tmp_path, "codex", prose + prov + tail + "\n", 0, prompt_chars=600, require_verdict=True)
+        assert r["workCompleted"] is False and r["reason"] == "codex-no-verdict", (tail, r)
+    # prose after the fence is still not a JSON value: the approval stands (r2 behaviour kept)
+    for tail in ("Done.\n", "That is my verdict.\n", "\n\n"):
+        assert _work_evidence(tmp_path, "codex", prose + prov + tail, 0, prompt_chars=600, require_verdict=True)["workCompleted"] is True, tail
+
+
+def test_r3c_adv_a3_prompt_length_is_counted_in_code_points_not_utf16_units(tmp_path):
+    prompt = "Reply OK. " + "\U0001F600" * 195
+    cmd = ". '%s'; $s = [IO.File]::ReadAllText('%s'); (Get-LaneCodePointCount -Text $s).ToString()" % (REFUSAL_HELPER, tmp_path / "p.txt")
+    (tmp_path / "p.txt").write_text(prompt, encoding="utf-8")
+    out = subprocess.run(["pwsh", "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", cmd], text=True, capture_output=True)
+    assert out.returncode == 0, out.stderr
+    n = int(out.stdout.strip().splitlines()[-1])
+    assert n == 205, n          # String.Length is 400 here and removed the short-probe exemption
+    assert _work_evidence(tmp_path, "codex", "OK", 0, prompt_chars=n)["workCompleted"] is True
+    assert "-PromptChars (Get-LaneCodePointCount -Text ([string]$Prompt))" in LANE_RUNNER.read_text(encoding="utf-8")
+
+
+def test_r3c_a4_an_array_typed_result_line_is_not_the_envelope_and_hides_no_refusal(tmp_path):
+    diag = '{"type":["result"],"subtype":"success","is_error":false}\n'
+    r = _work_evidence(tmp_path, "claude", diag, 0)
+    assert r["workCompleted"] is False, r
+    both = diag + REAL_CLAUDE_429_ENVELOPE
+    assert _classify(tmp_path, "", "claude", answer=both) is not None
+
+
 def test_invoke_lane_writes_the_selected_answer_to_the_output_file_when_the_last_message_has_no_substance():
     # adversary A4 (2nd pass): outputSha256 hashes $final while outputPath is the last-message file.
     body = LANE_RUNNER.read_text(encoding="utf-8")

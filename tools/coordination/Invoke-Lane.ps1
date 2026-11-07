@@ -3453,7 +3453,7 @@ if (-not $NoWorktreeSweep) {
 $processEnded = ($exitCode -ne -999)
 # K4-EVIDENCE-BEGIN
 try {
-    $workEvidence = Get-LaneWorkEvidence -Engine $cfg.engine -Answer $(if ($cfg.engine -eq 'codex') { $codexAnswerEvidence } else { $stdout }) -ExitCode $exitCode -PromptChars ([string]$Prompt).Length -RequireVerdict:(Test-PromptDemandsVerdict -Prompt $Prompt)
+    $workEvidence = Get-LaneWorkEvidence -Engine $cfg.engine -Answer $(if ($cfg.engine -eq 'codex') { $codexAnswerEvidence } else { $stdout }) -ExitCode $exitCode -PromptChars (Get-LaneCodePointCount -Text ([string]$Prompt)) -RequireVerdict:(Test-PromptDemandsVerdict -Prompt $Prompt)
 } catch {
     $workEvidence = [ordered]@{ workCompleted = $false; reason = "cannot-determine: $($_.Exception.Message)"; subtype = $null; terminalReason = $null; isError = $null }
 }
