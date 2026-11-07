@@ -2140,16 +2140,25 @@ def test_get_provider_refusal_direct_unrelated_recovered_stderr_is_not_a_refusal
     assert r is None, r
 
 
-def test_r3_adv_a1_an_unterminated_final_fence_is_malformed_even_when_its_body_parses(tmp_path):
-    # adversary r3 A1: an open fence at the end of the answer never closed, so it is not a finished block.
+def test_r3_adv_a1_an_unterminated_final_fence_counts_only_as_one_complete_strict_object(tmp_path):
+    # adversary r3 A1, narrowed by the real-receipt replay: an open fence at the end of the answer runs to the end,
+    # and its body is judged as a whole. Two REAL complete codex receipts (fleet-runs 20260906T160250Z and
+    # 20260906T191539Z) end in an unclosed ```json fence around a complete verdict object, so that shape completes.
     prose = "x" * 130 + "\n"
-    for tail in ('```json\n{"verdict":"APPROVE"}\n', '~~~json\n{"verdict":"APPROVE"}', '````json\n{"verdict":"APPROVE"}\n```\n'):
+    approve = '{"verdict":"APPROVE"}'
+    for tail in ('```json\n' + approve + '\n', '~~~json\n' + approve, '```json\n' + approve):
+        r = _work_evidence(tmp_path, "codex", prose + tail, 0, prompt_chars=600, require_verdict=True)
+        assert r["workCompleted"] is True, (tail, r)
+    # truncated JSON, a null verdict, trailing prose, a short close and a mismatched close are never a completion
+    for tail in ('```json\n{"verdict":"APPROVE"', '```json\n{"verdict":null}\n', '```json\n' + approve + '\nand then I kept going\n',
+                 '````json\n' + approve + '\n```\n', '```json\n' + approve + '\n~~~\n', '~~~json\n' + approve + '\n```\n'):
         r = _work_evidence(tmp_path, "codex", prose + tail, 0, prompt_chars=600, require_verdict=True)
         assert r["workCompleted"] is False and r["reason"] == "codex-no-verdict", (tail, r)
-    # a provisional closed APPROVE then an unterminated fence is also not a completion
-    prov = '```json\n{"verdict":"APPROVE"}\n```\n'
-    r = _work_evidence(tmp_path, "codex", prose + prov + '```json\n{"verdict":"APPROVE"}\n', 0, prompt_chars=600, require_verdict=True)
-    assert r["workCompleted"] is False, r
+    # a provisional closed APPROVE then an unterminated fence with a null or truncated body is not a completion
+    prov = '```json\n' + approve + '\n```\n'
+    for tail in ('```json\n{"verdict":null}\n', '```json\n{"verdict":"APPROVE"'):
+        r = _work_evidence(tmp_path, "codex", prose + prov + tail, 0, prompt_chars=600, require_verdict=True)
+        assert r["workCompleted"] is False, (tail, r)
     assert _work_evidence(tmp_path, "codex", prose + prov, 0, prompt_chars=600, require_verdict=True)["workCompleted"] is True
 
 

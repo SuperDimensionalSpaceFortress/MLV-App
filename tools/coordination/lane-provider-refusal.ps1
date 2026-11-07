@@ -218,8 +218,8 @@ function Get-LaneLastTopLevelJson {
 # top-level values; the LAST one in the answer decides and an earlier one never stands in for it.
 #   - A fence opens on a line of 3+ backticks or 3+ tildes (any info string) and closes ONLY on a line of the
 #     SAME character, at least as long as the opening, and nothing else. A mismatched or short close is
-#     content. A fence that never closes is MALFORMED (adversary A1): its text is $null, so an unterminated
-#     last fence is never a completion even when its body parses.
+#     content. A fence that never closes runs to the end of the answer and counts ONLY when that body is one
+#     complete strict JSON object (adversary A1, narrowed by the real-receipt replay: see the note below).
 #   - An unfenced candidate is the last top-level '{' or '[' value after the last fenced block (see
 #     Get-LaneLastTopLevelJson). It outranks the fenced block before it, whatever its shape.
 # Lines are split by Split-LaneLines. Returns [pscustomobject]@{ form = 'fenced'|'unfenced'|'none'; text; startLine }.
@@ -247,7 +247,11 @@ function Get-LaneTerminalCandidate {
         }
         $cur.Add($ln)
     }
-    if ($inBlock) { return [pscustomobject]@{ form = 'fenced'; text = $null; startLine = $curStart } }
+    # An open final fence runs to the end of the answer. Its body is the candidate text, so the strict object
+    # parse decides: a complete object whose closing fence the model dropped is a finished verdict (two REAL
+    # complete codex receipts end that way), while truncated JSON, trailing prose, or a close of another
+    # character or a shorter length (all of which stay in the body) fail the parse and are never a completion.
+    if ($inBlock) { return [pscustomobject]@{ form = 'fenced'; text = ($cur -join "`n"); startLine = $curStart } }
     $firstTail = if ($null -eq $lastFence) { 0 } else { $lastFence.endLine + 1 }
     if ($firstTail -lt $lines.Count) {
         $tailText = ($lines[$firstTail..($lines.Count - 1)] -join "`n")
