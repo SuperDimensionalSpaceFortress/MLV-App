@@ -506,14 +506,19 @@ function Split-WindowsCommandLine([string]$CommandLine) {
 #   'fixture' (the census counts it AND the sweep may kill it) only on a token-boundary match, after '/' -> '\' and ignoring case:
 #     - an argument, or the value after its first '=', that resolves (GetFullPath) to the dir or under it (r4's rule, kept), or
 #     - an occurrence INSIDE an argument whose left side is a quote, whitespace or '=' and whose right side is
-#         '\' with no '..' before the next quote or the end (a path under the dir that cannot climb out),
-#         the same quote that opened it ('<dir>' or "<dir>": the quoted string IS the dir),
-#         whitespace or the end with whitespace on the left (a bare script token), or the end with '=' on the left.
+#         '\' (a path under the dir),
+#         the same quote that opened it ('<dir>' or "<dir>": the quoted string IS the dir), not doubled ('' / "" escape a quote),
+#         whitespace or the end with whitespace on the left (a bare script token), or the end with '=' on the left,
+#       AND no '..' anywhere after it in that argument (r5 pass-8 A1: an escaped quote ('sub''folder\..\..\x') ended the old scan early, and
+#       no quoting rule can say where a script string really ends, so any later '..' that could climb out leaves the match unknown),
+#       AND (r5 pass-8 A1 class) the process descends from this suite's own process (-Ours: its parent chain reaches $PID, each parent started
+#       no later than its child). Script text can still rewrite the path ('<dir>' + '2', -replace, a path join): reading code cannot be made
+#       safe, so an embedded match is only ever killed in a process this suite started; anywhere else it is counted as unknown.
 #   'unknown' (counted, never killed): the line contains the dir text in any other form. A sibling ("<dir> other", <dir>2, <dir>-other,
 #     <dir>'other) is unknown, so r4 B1 stays closed (never killed), and no reading of the line can hide a live writer as a zero.
 #   The hub text also names whitespace as a right boundary; inside one quoted argument ("<dir> other\log.txt", r3 pass-4 A1 / r4 B1) that is a
 #   sibling path, so whitespace only bounds a token that whitespace also opened, and every other whitespace case is unknown.
-function Get-FixtureMatch([string]$CommandLine, [string]$Fx) {
+function Get-FixtureMatch([string]$CommandLine, [string]$Fx, [bool]$Ours = $false) {
     if ([string]::IsNullOrEmpty($CommandLine) -or [string]::IsNullOrEmpty($Fx)) { return 'none' }
     $root = $Fx.Replace([char]'/', [char]'\').TrimEnd([char]'\')
     # The pre-filter is the dir's LEAF name (um-agent-quiet-lease-<pid>-<guid8>, unique to this run): a line that names the dir in a form the
@@ -542,28 +547,55 @@ function Get-FixtureMatch([string]$CommandLine, [string]$Fx) {
             $e = $i + $root.Length
             $lQuote = ($l -eq [char]"'" -or $l -eq [char]'"'); $lSpace = [char]::IsWhiteSpace($l)
             if (-not ($lQuote -or $lSpace -or $l -eq [char]'=')) { continue }
-            if ($e -ge $tn.Length) { if ($lSpace -or $l -eq [char]'=') { return 'fixture' }; continue }
-            $r = $tn[$e]
-            if ($r -eq [char]'\') {
-                $stop = $tn.IndexOfAny([char[]]@([char]"'", [char]'"'), $e); if ($stop -lt 0) { $stop = $tn.Length }
-                if ($tn.Substring($e, $stop - $e).IndexOf('..') -lt 0) { return 'fixture' }
-                continue
+            if ($tn.IndexOf('..', $e, [StringComparison]::Ordinal) -ge 0) { continue }   # pass-8 A1: a later '..' may climb out, however it is quoted
+            $bounded = $false
+            if ($e -ge $tn.Length) { $bounded = ($lSpace -or $l -eq [char]'=') }
+            else {
+                $r = $tn[$e]
+                if ($r -eq [char]'\') { $bounded = $true }
+                elseif ($lQuote -and $r -eq $l) { $bounded = -not (($e + 1 -lt $tn.Length -and $tn[$e + 1] -eq $l) -or ($i -ge 2 -and $tn[$i - 2] -eq $l)) }
+                elseif ($lSpace -and [char]::IsWhiteSpace($r)) { $bounded = $true }
             }
-            if ($lQuote -and $r -eq $l) { return 'fixture' }
-            if ($lSpace -and [char]::IsWhiteSpace($r)) { return 'fixture' }
+            if ($bounded -and $Ours) { return 'fixture' }
         }
     }
     return 'unknown'
 }
-function Test-NamesFixture([string]$CommandLine, [string]$Fx) { return (Get-FixtureMatch $CommandLine $Fx) -ceq 'fixture' }
+function Test-NamesFixture([string]$CommandLine, [string]$Fx, [bool]$Ours = $false) { return (Get-FixtureMatch $CommandLine $Fx $Ours) -ceq 'fixture' }
 function Get-FixtureChildPids([string]$Fx) { return @((Get-FixtureCensus $Fx).survivors) }
-# r5: the census reports both buckets. -Rows is the pure seam (objects with ProcessId and CommandLine); the default is a fresh Win32_Process query.
+# r5 pass-8 A1: the pids in $Rows that descend from this suite's process. A row's parent chain must reach $PID through rows each started no
+# later than its child (so a stranger that inherited a dead parent's pid number is not adopted), and the step into $PID must be a process that
+# started after this one. Rows without a creation time or parent descend from nothing.
+function Get-SuiteDescendants($Rows) {
+    $by = @{}
+    foreach ($r in @($Rows)) { $by[[int]$r.ProcessId] = $r }
+    $selfStart = (Get-Process -Id $PID).get_StartTime().ToUniversalTime()
+    $set = [System.Collections.Generic.HashSet[int]]::new()
+    foreach ($r in @($Rows)) {
+        $cur = $r; $ok = $false
+        for ($d = 0; $d -lt 64 -and $null -ne $cur; $d++) {
+            if ($null -eq $cur.CreationDate -or $null -eq $cur.ParentProcessId) { break }
+            $cs = ([DateTime]$cur.CreationDate).ToUniversalTime()
+            $pp = [int]$cur.ParentProcessId
+            if ($pp -eq $PID) { $ok = ($cs -ge $selfStart); break }
+            if ($pp -eq [int]$cur.ProcessId) { break }
+            $par = $by[$pp]
+            if ($null -eq $par -or $null -eq $par.CreationDate -or ([DateTime]$par.CreationDate).ToUniversalTime() -gt $cs) { break }
+            $cur = $par
+        }
+        if ($ok) { [void]$set.Add([int]$r.ProcessId) }
+    }
+    return , $set
+}
+# r5: the census reports both buckets. -Rows is the pure seam (objects with ProcessId, CommandLine, ParentProcessId, CreationDate); the default
+# is a fresh Win32_Process query.
 function Get-FixtureCensus([string]$Fx, $Rows = $null) {
     if ($null -eq $Rows) { $Rows = @(Get-CimInstance -ClassName Win32_Process -ErrorAction Stop) }
+    $ours = Get-SuiteDescendants $Rows
     $sv = [System.Collections.Generic.List[int]]::new(); $uk = [System.Collections.Generic.List[int]]::new()
     foreach ($row in @($Rows)) {
         if ([int]$row.ProcessId -eq $PID) { continue }
-        $m = Get-FixtureMatch ([string]$row.CommandLine) $Fx
+        $m = Get-FixtureMatch ([string]$row.CommandLine) $Fx ($ours.Contains([int]$row.ProcessId))
         if ($m -ceq 'fixture') { $sv.Add([int]$row.ProcessId) } elseif ($m -ceq 'unknown') { $uk.Add([int]$row.ProcessId) }
     }
     return [pscustomobject]@{ survivors = @($sv.ToArray()); unknown = @($uk.ToArray()) }
@@ -597,7 +629,8 @@ function Stop-FixtureLeftovers([string]$Fx, [int[]]$Candidates) {
     # r4: NOT a GetNewClosure() block: a closure binds to a dynamic module that sees only global functions, so under `pwsh -Command "& <this>"`
     # Test-NamesFixture was "not recognized", the throw was caught as "not ours" and the sweep stopped nothing. $Fx is read from this
     # function's scope (Stop-PinnedProcess runs the block as its child).
-    $isFixture = { param($p) $row = @(Get-CimInstance -ClassName Win32_Process -Filter "ProcessId=$($p.Id)" -ErrorAction Stop); $row.Count -eq 1 -and (Test-NamesFixture $row[0].CommandLine $Fx) }
+    # r5 pass-8 A1: the same predicate as the census, descent included (one snapshot, taken after the pin, so the pinned process's row is its own).
+    $isFixture = { param($p) $all = @(Get-CimInstance -ClassName Win32_Process -ErrorAction Stop); $row = @($all | Where-Object { [int]$_.ProcessId -eq [int]$p.Id }); $row.Count -eq 1 -and (Test-NamesFixture $row[0].CommandLine $Fx ((Get-SuiteDescendants $all).Contains([int]$p.Id))) }
     $kill = [System.Collections.Generic.List[int]]::new()
     foreach ($k in @($Candidates)) { if (Stop-PinnedProcess $k $isFixture) { $kill.Add($k) } }
     return @($kill)
@@ -3721,29 +3754,50 @@ try { $out = @(Add-LeaseSlotSnapshot -JobId 'jB4a' -Phase 'request') } catch { $
             # processes. A sibling (<dir> other, <dir>2) is still never a kill match (r4 B1 stays closed), but it is counted as unknown.
             $c5Fx = 'C:\Temp\fx'
             $c5Sol = 'pwsh.exe -Command "Import-Module ''C:\repo\VenueChain.psm1''; $l = Start-VenueJobLiveness -AgentShare ''C:\Temp\fx'' -JobId ''j''; Start-Sleep -Seconds 300"'
+            # want = a process this suite did not start; ours = one it did (-Ours). An embedded match is a kill match only in ours (pass-8 A1).
+            $c5A1Fx = 'C:\Temp\um-agent-quiet-lease-1234-abcd1234'
+            $c5A1 = 'pwsh.exe -Command "Get-Item ''C:\Temp\um-agent-quiet-lease-1234-abcd1234\sub''''folder\..\..\unrelated\log.txt''; Start-Sleep -Seconds 300"'
             $c5Rows = @(
-                @{ cl = $c5Sol; want = 'fixture' }                                                    # sol r4 B1, verbatim
-                @{ cl = 'python.exe C:/Temp/fx/x'; want = 'fixture' }                                  # sol r4 B1 class: forward slashes
-                @{ cl = 'pwsh.exe -Command "Start-VenueJobLiveness -AgentShare C:\Temp\fx -JobId j"'; want = 'fixture' }   # a bare script token
-                @{ cl = 'pwsh.exe -Command "& { Get-Item ''C:/Temp/fx/x.json'' }"'; want = 'fixture' }  # embedded, forward slashes, under the dir
-                @{ cl = 'python.exe -c "open(\"C:\Temp\fx\calls.jsonl\")"'; want = 'fixture' }        # embedded in a double-quoted script string
-                @{ cl = 'pwsh.exe -Command "x -AgentShare=C:\Temp\fx"'; want = 'fixture' }             # embedded, '=' on the left, end of argument
-                @{ cl = 'python.exe "C:\Temp\fx other\log.txt"'; want = 'unknown' }                    # r4 B1 sibling: never a kill match
-                @{ cl = 'python.exe C:\Temp\fx2\log.txt'; want = 'unknown' }                           # hub ruling sibling
-                @{ cl = 'pwsh.exe -Command "x -AgentShare ''C:\Temp\fx other''"'; want = 'unknown' }  # embedded sibling with a space
-                @{ cl = 'pwsh.exe -Command "x -AgentShare ''C:\Temp\fx2''"'; want = 'unknown' }        # embedded sibling
-                @{ cl = 'pwsh.exe -Command "x ''C:\Temp\fx\..\fx2\y''"'; want = 'unknown' }            # embedded, climbs out: not admitted, still counted
-                @{ cl = 'python.exe -c "p = ''C:\\Temp\\fx\\x''"'; want = 'unknown' }                  # doubled backslashes: the leaf still names it
-                @{ cl = 'python.exe C:\Temp\other\y.txt'; want = 'none' }
+                @{ cl = $c5Sol; want = 'unknown'; ours = 'fixture' }                                   # sol r4 B1, verbatim
+                @{ cl = 'python.exe C:/Temp/fx/x'; want = 'fixture'; ours = 'fixture' }                # sol r4 B1 class: forward slashes (a whole argument)
+                @{ cl = 'pwsh.exe -Command "Start-VenueJobLiveness -AgentShare C:\Temp\fx -JobId j"'; want = 'unknown'; ours = 'fixture' }   # a bare script token
+                @{ cl = 'pwsh.exe -Command "& { Get-Item ''C:/Temp/fx/x.json'' }"'; want = 'unknown'; ours = 'fixture' }  # embedded, forward slashes, under the dir
+                @{ cl = 'python.exe -c "open(\"C:\Temp\fx\calls.jsonl\")"'; want = 'unknown'; ours = 'fixture' }        # embedded in a double-quoted script string
+                @{ cl = 'pwsh.exe -Command "x -AgentShare=C:\Temp\fx"'; want = 'fixture'; ours = 'fixture' }             # the value after the first '=' (r4's rule)
+                @{ cl = 'python.exe "C:\Temp\fx other\log.txt"'; want = 'unknown'; ours = 'unknown' }                    # r4 B1 sibling: never a kill match
+                @{ cl = 'python.exe C:\Temp\fx2\log.txt'; want = 'unknown'; ours = 'unknown' }                           # hub ruling sibling
+                @{ cl = 'pwsh.exe -Command "x -AgentShare ''C:\Temp\fx other''"'; want = 'unknown'; ours = 'unknown' }  # embedded sibling with a space
+                @{ cl = 'pwsh.exe -Command "x -AgentShare ''C:\Temp\fx2''"'; want = 'unknown'; ours = 'unknown' }        # embedded sibling
+                @{ cl = 'pwsh.exe -Command "x ''C:\Temp\fx''''other''"'; want = 'unknown'; ours = 'unknown' }            # '' is an escaped quote: <dir>'other
+                @{ cl = 'pwsh.exe -Command "x ''C:\Temp\fx\..\fx2\y''"'; want = 'unknown'; ours = 'unknown' }            # embedded, climbs out: not admitted, still counted
+                @{ cl = 'python.exe -c "p = ''C:\\Temp\\fx\\x''"'; want = 'unknown'; ours = 'unknown' }                  # doubled backslashes: the leaf still names it
+                @{ cl = 'python.exe C:\Temp\other\y.txt'; want = 'none'; ours = 'none' }
             )
             $c5Bad = [System.Collections.Generic.List[string]]::new()
             foreach ($r in $c5Rows) {
-                $g = Get-FixtureMatch $r.cl $c5Fx
-                $kill = [bool](Test-NamesFixture $r.cl $c5Fx)
-                if ($g -cne $r.want -or $kill -ne ($r.want -ceq 'fixture')) { $c5Bad.Add("[$($r.cl)] match=$g kill=$kill want $($r.want)") }
+                foreach ($o in @($false, $true)) {
+                    $w = if ($o) { $r.ours } else { $r.want }
+                    $g = Get-FixtureMatch $r.cl $c5Fx $o
+                    $kill = [bool](Test-NamesFixture $r.cl $c5Fx $o)
+                    if ($g -cne $w -or $kill -ne ($w -ceq 'fixture')) { $c5Bad.Add("[$($r.cl)] ours=$o match=$g kill=$kill want $w") }
+                }
             }
-            $c5Census = Get-FixtureCensus $c5Fx -Rows @([pscustomobject]@{ ProcessId = 24680; CommandLine = $c5Sol }, [pscustomobject]@{ ProcessId = 24681; CommandLine = 'python.exe C:/Temp/fx/x' }, [pscustomobject]@{ ProcessId = 24682; CommandLine = 'python.exe C:\Temp\fx2\log.txt' })
-            if (-not ((@($c5Census.survivors) -join ',') -ceq '24680,24681' -and (@($c5Census.unknown) -join ',') -ceq '24682')) { $c5Bad.Add("sol's census: survivors=[$(@($c5Census.survivors) -join ',')] unknown=[$(@($c5Census.unknown) -join ',')] want survivors=[24680,24681] unknown=[24682]") }
+            # pass-8 A1 verbatim: '' (an escaped apostrophe) then ..\.. climbs out of the dir: never a kill match, ours or not, and still counted
+            foreach ($o in @($false, $true)) { $g = Get-FixtureMatch $c5A1 $c5A1Fx $o; if ($g -cne 'unknown') { $c5Bad.Add("[pass-8 A1] ours=$o match=$g want unknown") } }
+            # The census through the -Rows seam: descent is decided from the rows' parents and start times.
+            $c5Now = [DateTime]::UtcNow
+            $c5SelfStart = (Get-Process -Id $PID).get_StartTime().ToUniversalTime()
+            $c5Census = Get-FixtureCensus $c5Fx -Rows @(
+                [pscustomobject]@{ ProcessId = 24680; CommandLine = $c5Sol; ParentProcessId = 4; CreationDate = $c5Now }                                         # sol's: not ours -> unknown
+                [pscustomobject]@{ ProcessId = 24681; CommandLine = 'python.exe C:/Temp/fx/x'; ParentProcessId = 4; CreationDate = $c5Now }                     # whole argument -> survivor
+                [pscustomobject]@{ ProcessId = 24682; CommandLine = 'python.exe C:\Temp\fx2\log.txt'; ParentProcessId = $PID; CreationDate = $c5Now }           # sibling, even ours -> unknown
+                [pscustomobject]@{ ProcessId = 24683; CommandLine = $c5Sol; ParentProcessId = $PID; CreationDate = $c5Now }                                       # sol's line in our child -> survivor
+                [pscustomobject]@{ ProcessId = 24684; CommandLine = $c5Sol; ParentProcessId = 24683; CreationDate = $c5Now.AddSeconds(1) }                        # our grandchild -> survivor
+                [pscustomobject]@{ ProcessId = 24685; CommandLine = $c5Sol; ParentProcessId = $PID; CreationDate = $c5SelfStart.AddHours(-1) }                    # older than us: a reused parent pid -> unknown
+                [pscustomobject]@{ ProcessId = 24686; CommandLine = $c5Sol; ParentProcessId = 24683; CreationDate = $c5Now.AddSeconds(-30) }                      # older than its "parent" -> unknown
+                [pscustomobject]@{ ProcessId = 24687; CommandLine = ($c5A1 -replace 'um-agent-quiet-lease-1234-abcd1234', 'fx'); ParentProcessId = $PID; CreationDate = $c5Now }   # A1 shape in ours -> unknown
+            )
+            if (-not ((@($c5Census.survivors) -join ',') -ceq '24681,24683,24684' -and (@($c5Census.unknown) -join ',') -ceq '24680,24682,24685,24686,24687')) { $c5Bad.Add("census rows: survivors=[$(@($c5Census.survivors) -join ',')] unknown=[$(@($c5Census.unknown) -join ',')] want survivors=[24681,24683,24684] unknown=[24680,24682,24685,24686,24687]") }
             # real processes: an embedded single-quoted dir, a forward-slash path under it, and a forward-slash sibling. The first two are counted and
             # stopped by the sweep; the sibling is counted as unknown and the sweep leaves it alive.
             function Start-SeamKidArgv([string[]]$Argv) {
