@@ -1511,6 +1511,92 @@ def test_codex_lane_runtime_path_treats_dot_segments_as_the_directory_they_name(
     assert _codex_runtime_path_field(done, "PATH") == start
 
 
+# r4 (Sol r3 + adversary A1 on 071338fa): the segment checks ran BEFORE a following '..' could remove the segment, so a configured root whose spelling
+# merely passes through a bad name (C:\toolchains\discard.\..\mingw) was refused although it names C:\toolchains\mingw. Windows resolves '.' and '..'
+# first; so does the function now, and every check (trailing dot or space, reserved character, quote, semicolon) runs over the SURVIVING segments.
+_CODEX_DEFAULT_QT_BIN = "C:\\Qt\\Tools\\mingw1310_64\\bin"
+_CANCELED_SEGMENTS = {
+    "trailing-dot": "discard.",
+    "trailing-space": "discard ",
+    "semicolon": "dis;card",
+    "quote": 'dis"card',
+    "reserved-lt": "dis<card",
+    "reserved-star": "dis*card",
+    "reserved-colon": "dis:card",
+}
+
+
+@codex_runtime_path_only
+@pytest.mark.parametrize("bad", list(_CANCELED_SEGMENTS.values()), ids=list(_CANCELED_SEGMENTS))
+def test_codex_lane_runtime_path_a_canceled_bad_segment_does_not_refuse_the_configured_root(tmp_path, bad):
+    configured = f"C:\\toolchains\\{bad}\\..\\mingw"
+    env = {**os.environ, "MINGW_ROOT": configured}
+    done = _codex_runtime_path_run(tmp_path, "$psi.Environment['PATH'] = 'C:\\first'\n[void](Add-CodexLaneRuntimePath -Psi $psi)", env=env)
+    # the configured toolchain is ADDED, ahead of the default Qt candidate (Sol r3: it was omitted, leaving only the Qt default)
+    assert _codex_runtime_path_field(done, "PATH").split(";") == ["C:\\first", "C:\\toolchains\\mingw\\bin", _CODEX_DEFAULT_QT_BIN], done.stdout
+    # the same spelling as an explicit candidate, and with the cancelled segment last before '..' at the end
+    done = _codex_runtime_path_run(
+        tmp_path,
+        "$psi.Environment['PATH'] = 'C:\\first'\n"
+        f"$r = @(Add-CodexLaneRuntimePath -Psi $psi -Candidates @('{_ps_quote(f'C:\\toolchains\\mingw\\bin\\{bad}\\..')}'))\n'ADDED=' + $r.Count",
+    )
+    assert _codex_runtime_path_field(done, "ADDED") == "1", done.stdout
+    assert _codex_runtime_path_field(done, "PATH") == "C:\\first;C:\\toolchains\\mingw\\bin"
+
+
+@codex_runtime_path_only
+@pytest.mark.parametrize(
+    "surviving",
+    ["bad.", "bad ", "ba;d", 'ba"d', "ba<d", "ba>d", "ba|d", "ba?d", "ba*d", "ba:d", "bad\t"],
+    ids=["dot", "space", "semicolon", "quote", "lt", "gt", "pipe", "question", "star", "colon", "tab"],
+)
+def test_codex_lane_runtime_path_a_surviving_bad_segment_is_still_refused(tmp_path, surviving):
+    # Control: reducing first must not weaken the checks. A bad segment that is still in the path after '.' and '..' are resolved stays refused,
+    # and so does a bad segment sitting before a '..' that removes a DIFFERENT segment.
+    # (a trailing ASCII blank on the configured VALUE is trimmed by design, so the bad segment is never the last one here)
+    for configured in (f"C:\\toolchains\\{surviving}\\mingw", f"C:\\toolchains\\{surviving}\\x\\..\\mingw", f"C:\\toolchains\\mingw\\{surviving}\\sub"):
+        env = {**os.environ, "MINGW_ROOT": configured}
+        done = _codex_runtime_path_run(tmp_path, "$psi.Environment['PATH'] = 'C:\\first'\n[void](Add-CodexLaneRuntimePath -Psi $psi)", env=env)
+        assert _codex_runtime_path_field(done, "PATH") == f"C:\\first;{_CODEX_DEFAULT_QT_BIN}", configured
+
+
+@codex_runtime_path_only
+def test_codex_lane_runtime_path_dot_dot_above_the_root_clamps_and_relative_and_unc_stay_refused(tmp_path):
+    # HUB RULING 20261107T1220Z: '..' above the drive root stays at the root, as Windows canonicalisation does.
+    for configured, expected in (
+        ("C:\\..\\toolchains\\mingw", "C:\\toolchains\\mingw\\bin"),
+        ("C:\\a\\..\\..\\toolchains\\mingw", "C:\\toolchains\\mingw\\bin"),
+        ("C:\\x.\\..\\..\\toolchains\\mingw", "C:\\toolchains\\mingw\\bin"),
+    ):
+        env = {**os.environ, "MINGW_ROOT": configured}
+        done = _codex_runtime_path_run(tmp_path, "$psi.Environment['PATH'] = 'C:\\first'\n[void](Add-CodexLaneRuntimePath -Psi $psi)", env=env)
+        assert _codex_runtime_path_field(done, "PATH").split(";") == ["C:\\first", expected, _CODEX_DEFAULT_QT_BIN], configured
+    # relative and UNC spellings stay refused even when a cancelled segment would reduce them to something plausible
+    for configured in ("toolchains\\discard.\\..\\mingw", ".\\toolchains\\mingw", "\\\\host\\share\\discard.\\..\\mingw", "\\toolchains\\mingw"):
+        env = {**os.environ, "MINGW_ROOT": configured}
+        done = _codex_runtime_path_run(tmp_path, "$psi.Environment['PATH'] = 'C:\\first'\n[void](Add-CodexLaneRuntimePath -Psi $psi)", env=env)
+        assert _codex_runtime_path_field(done, "PATH") == f"C:\\first;{_CODEX_DEFAULT_QT_BIN}", configured
+
+
+@codex_runtime_path_only
+def test_codex_lane_runtime_path_an_inherited_entry_is_reduced_before_it_is_checked(tmp_path):
+    # Same order for the inherited PATH: C:\toolchains\discard.\..\mingw\bin IS C:\toolchains\mingw\bin, so the directory is present and is not added
+    # twice; an inherited entry whose bad segment SURVIVES is not counted as present (a false "absent" costs a duplicate, a false "present" the fix).
+    done = _codex_runtime_path_run(
+        tmp_path,
+        "$psi.Environment['PATH'] = 'C:\\first;C:\\toolchains\\discard.\\..\\mingw\\bin'\n"
+        "$r = @(Add-CodexLaneRuntimePath -Psi $psi -Candidates @('C:\\toolchains\\mingw\\bin'))\n'ADDED=' + $r.Count",
+    )
+    assert _codex_runtime_path_field(done, "ADDED") == "0", done.stdout
+    done = _codex_runtime_path_run(
+        tmp_path,
+        "$psi.Environment['PATH'] = 'C:\\first;C:\\toolchains\\mingw.\\bin'\n"
+        "$r = @(Add-CodexLaneRuntimePath -Psi $psi -Candidates @('C:\\toolchains\\mingw\\bin'))\n'ADDED=' + $r.Count",
+    )
+    assert _codex_runtime_path_field(done, "ADDED") == "1", done.stdout
+    assert _codex_runtime_path_field(done, "PATH") == "C:\\first;C:\\toolchains\\mingw.\\bin;C:\\toolchains\\mingw\\bin"
+
+
 def test_codex_lane_runtime_path_is_wired_into_the_codex_child_only():
     body = LANE_RUNNER.read_text(encoding="utf-8").replace("\r\n", "\n")
     assert "function Add-CodexLaneRuntimePath" in body, "Invoke-Lane lacks Add-CodexLaneRuntimePath"

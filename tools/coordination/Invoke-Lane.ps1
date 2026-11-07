@@ -1987,13 +1987,17 @@ function Add-CodexLaneRuntimePath {
     # (adversary A1 on e370ba86, ADDED=0). Path keys live in an ordinal HashSet; the segment tests use [string]::Equals(..., Ordinal) and .Length.
     $ordinal = [System.StringComparison]::Ordinal
     # ONE lexical normalisation for both sides of the duplicate check, and for what is appended: '/' is '\', '.' and '..' segments are resolved (Windows
-    # does the same before it touches the disk), repeated separators collapse (adversary A2 on 56281b89, A3 on 7688a2a3). It returns $null for a spelling
-    # the loader may not match to the directory it names: leading/trailing whitespace, a quote, a segment ending in space or dot, a reserved character, or
-    # a non-drive-letter path. An INHERITED entry in such a spelling is not counted as present (adversary A1 on 7688a2a3: 'C:\x\bin ' was trimmed into the
-    # seen-set, so the usable directory was never added); a false "absent" costs a harmless duplicate, a false "present" costs the whole fix.
+    # does the same before it touches the disk), repeated separators collapse (adversary A2 on 56281b89, A3 on 7688a2a3). REDUCTION COMES FIRST and every
+    # check runs on what SURVIVES it (r4, Sol r3 + adversary A1 on 071338fa: C:\toolchains\discard.\..\mingw names C:\toolchains\mingw, but 'discard.' was
+    # refused before the '..' could remove it, so the configured toolchain was omitted; a canceled space, ';', '"' or reserved-character segment failed the
+    # same way). It returns $null for a spelling the loader may not match to the directory it names: a segment that survives and ends in space or dot or
+    # holds a reserved character, ';' or '"', or a non-drive-letter path. No whole-input blank test is needed: leading blanks fail the drive-letter match
+    # and a trailing blank is the end of the last segment, which always survives. An INHERITED entry in such a spelling is not counted as present
+    # (adversary A1 on 7688a2a3: 'C:\x\bin ' was trimmed into the seen-set, so the usable directory was never added); a false "absent" costs a harmless
+    # duplicate, a false "present" costs the whole fix.
     $dirNorm = {
         param([string]$d)
-        if ([string]::IsNullOrEmpty($d) -or -not [string]::Equals($d, $d.Trim($blanks), $ordinal) -or $d.Contains('"')) { return $null }
+        if ([string]::IsNullOrEmpty($d)) { return $null }
         $p = $d.Replace('/', '\')
         if ($p -cnotmatch '^[A-Za-z]:\\') { return $null }
         $stack = [System.Collections.Generic.List[string]]::new()
@@ -2004,10 +2008,16 @@ function Add-CodexLaneRuntimePath {
                 if ($stack.Count -gt 0) { $stack.RemoveAt($stack.Count - 1) }
                 continue
             }
-            if ($seg -cmatch '[ .]$' -or $seg -cmatch '[<>:|?*\x00-\x1f]') { return $null }
             $stack.Add($seg)
         }
-        return ($p.Substring(0, 3) + ($stack -join '\'))
+        # Validation over the SURVIVORS only. ';' would serialize as two PATH entries (adversary A1 on e284b182) and '"' is PATH's own quoting.
+        foreach ($seg in $stack) {
+            if ($seg -cmatch '[ .]$' -or $seg -cmatch '[<>:|?*;"\x00-\x1f]') { return $null }
+        }
+        $result = $p.Substring(0, 3) + ($stack -join '\')
+        # ... and over the serialized result, which is what PATH will carry.
+        if ($result.Contains(';') -or $result.Contains('"')) { return $null }
+        return $result
     }
     $current = if ($Psi.Environment.ContainsKey('PATH')) { [string]$Psi.Environment['PATH'] } else { '' }
     # The comparison key folds the case of the DRIVE LETTER only; everything after it is compared exactly (adversary A1 on ff7ec6c5). A directory can be
@@ -2031,9 +2041,9 @@ function Add-CodexLaneRuntimePath {
         # A DRIVE-LETTER path only (X:\... or X:/...): a relative PATH entry is searched from the CHILD's working directory, not the launcher's
         # (adversary A2 on 6372cc4e), and a UNC path is skipped by name (adversary A1 on 56281b89). Skipped by name, with no filesystem call.
         if ($dir -cnotmatch '^[A-Za-z]:[\\/]') { continue }
-        # A name PATH cannot carry intact is skipped: ';' would serialize as two entries (C:\toolchains;child\bin -> C:\toolchains plus a relative
-        # child\bin, adversary A1 on e284b182) and '"' is PATH's own quoting.
-        if ($dir.Contains(';') -or $dir.Contains('"')) { continue }
+        # A name PATH cannot carry intact (';' would serialize as two entries, C:\toolchains;child\bin -> C:\toolchains plus a relative child\bin, adversary
+        # A1 on e284b182; '"' is PATH's own quoting) is refused by $dirNorm, AFTER '.' and '..' are resolved, so one inside a canceled segment no longer
+        # refuses the candidate (r4); one that survives reduction still does.
         $dir = & $dirNorm $dir
         if (-not $dir) { continue }
         # HashSet.Add is false when the key is already there: an inherited entry, or an earlier candidate in another spelling.
