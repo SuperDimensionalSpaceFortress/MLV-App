@@ -3102,17 +3102,33 @@ TEST( PlaybackConformDropFrame, R24NoGrantBelowTwoWholeFramesEverPresentsAJumpOf
     }
 }
 
-TEST( PlaybackConformDropFrame, R24ARealStallOfAWholePeriodOrMoreStillSkipsUnderDropFrame )
+TEST( PlaybackConformDropFrame, R26ARealStallBeyondTheDebtCapStillSkipsUnderDropFrame )
 {
-    // Pinned so the fix never removes it: a tick that owes at least one whole period beyond the frame it presents
-    // (granted >= 2) is the documented drop-frame skip after a stall, conform or not -- and stall evidence
-    // (GUI-SMOKE-FOREGROUND-HANG-NOLA-1), never a conform PASS.
-    ASSERT_EQ( 2, conformDropTickTransition( 1152.0, 2.0, true ) );
-    ASSERT_EQ( 2, conformDropTickTransition( 1152.8, 2.13, true ) );   // 88.9 ms at 24 fps (receipt 3ac586e9's interval)
-    ASSERT_EQ( 3, conformDropTickTransition( 1152.0, 3.0, true ) );
-    ASSERT_EQ( 3, conformDropTickTransition( 1152.5, 3.4, true ) );
-    for( const double granted : { 2.0, 2.13, 3.0, 3.4, 7.25 } )
-        ASSERT_TRUE( sameBits( granted, playback_frame_range::conformDropFrameDelta( 1152.8, granted, true ) ) );
+    // Pinned so the fix never removes it: the documented drop-frame skip after a REAL stall stays under conform, and it is
+    // stall evidence (GUI-SMOKE-FOREGROUND-HANG-NOLA-1), never a conform PASS. r26 (receipt ecca9f02): a real stall is a
+    // backlog above kConformMaxDebtFrames, not one tick granted 2 or more -- such a tick presents the next frame (r24 pinned
+    // jumps of 2 and 3 here, which is the QUIET-leg conformMaxJump 2 the r24 judge failed on).
+    ASSERT_EQ( 1, conformDropTickTransition( 1152.0, 2.0, true ) );
+    ASSERT_EQ( 1, conformDropTickTransition( 1152.8, 2.13, true ) );   // 88.9 ms at 24 fps (receipt 3ac586e9's interval)
+    ASSERT_EQ( 1, conformDropTickTransition( 1152.0, 3.0, true ) );
+    ASSERT_EQ( 1, conformDropTickTransition( 1152.5, 3.4, true ) );
+    ASSERT_EQ( 1, conformDropTickTransition( 1152.8, 7.25, true ) );
+    ASSERT_EQ( 1, conformDropTickTransition( 1152.0, 9.0, true ) );    // a backlog of exactly the cap is still carried
+    // above the cap the frames beyond it are skipped on that tick (a 1 s stall at 24 fps skips 15 and carries 8)
+    ASSERT_EQ( 2, conformDropTickTransition( 1152.0, 10.0, true ) );
+    ASSERT_EQ( 4, conformDropTickTransition( 1152.5, 12.0, true ) );
+    ASSERT_EQ( 16, conformDropTickTransition( 1152.0, 24.0, true ) );
+    // and nothing granted is lost: position plus the carried debt is the position plus the grant
+    for( const double granted : { 2.0, 2.13, 3.0, 3.4, 7.25, 9.0, 10.0, 24.0 } )
+    {
+        double debt = 0.0;
+        const double delta = playback_frame_range::conformDropFrameDelta( 1152.8, granted, true, debt );
+        ASSERT_NEAR( 1152.8 + granted, 1152.8 + delta + debt, 1e-9 );
+        ASSERT_TRUE( debt <= playback_frame_range::kConformMaxDebtFrames + 1e-9 );
+    }
+    // without conform the same stall tick skips exactly as it always did
+    ASSERT_EQ( 2, conformDropTickTransition( 1152.8, 2.13, false ) );
+    ASSERT_EQ( 3, conformDropTickTransition( 1152.0, 3.0, false ) );
 }
 
 TEST( PlaybackConformDropFrame, R24WithoutConformTheDropFrameTickIsByteIdentical )

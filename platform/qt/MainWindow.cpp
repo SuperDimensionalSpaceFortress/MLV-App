@@ -12238,7 +12238,8 @@ void MainWindow::playbackHandling(int timeDiff)
                 // HFR-NATIVE-60FPS-FULLRES-1 r24 (key3 B1 M-HFR-CONFORM-SKIP): under conform the catch-up advances by whole
                 // frames, so a tick that owes less than one whole period beyond the next frame presents that frame (never
                 // N -> N + 2 from a fractional position) and carries the rest as m_conformDropDebtFrames, repaid one presented
-                // frame per later tick (adversary A1 on 9b900412); a real stall still skips. Without conform the grant is unchanged.
+                // frame per later tick (adversary A1 on 9b900412); r26: a lone long tick is carried too, and only a backlog above
+                // kConformMaxDebtFrames (a real stall) skips. Without conform the grant is unchanged.
                 const playback_frame_range::DropFrameTickResult dropFrameTick =
                     playback_frame_range::advanceDropFrameTick(
                         m_newPosDropMode,

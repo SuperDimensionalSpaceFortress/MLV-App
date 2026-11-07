@@ -306,12 +306,14 @@ inline DropFrameTickResult advanceDropFrameTick(
 // presents the next frame (keeping the sub-frame phase), and the whole frames it would have skipped become a DEBT the
 // stateful form below carries and repays on the following ticks, one presented frame per tick (r24 adversary A1 on
 // 9b900412: dropping them instead lost a frame of time per late tick, 22.696 source fps). The documented drop-frame skip
-// after a REAL stall stays: a grant of at least 1 + kConformStallDebtFrames is a tick that owes at least one whole period
-// beyond the frame it presents, and it skips exactly as before (and is stall evidence, never a conform PASS).
+// after a REAL stall stays, but a real stall is a BACKLOG the renderer cannot repay, not one long tick: r26 (receipt
+// ecca9f02, a QUIET leg) showed ONE GUI-late tick of 125.899 ms granted about 3 frames, which r24 treated as a stall
+// (a grant of 2 or more, the retired kConformStallDebtFrames rule) and skipped (conformMaxJump 2). Under conform every
+// grant, however large, now presents the next frame and carries the rest as debt; only a backlog above
+// kConformMaxDebtFrames is skipped (stall evidence, never a conform PASS).
 //
 // Without conform, and for every tick that crosses at most one integer, the grant is returned unchanged, bit for bit:
 // non-conform drop-frame behaviour is byte-identical, and so is every ordinary conformed tick that carries no debt.
-inline constexpr double kConformStallDebtFrames = 1.0;
 // The most debt carried. r25 adversary A1 on 205b54cc: a cap of 2 DISCARDED the granted frames above it, so a burst of
 // sub-stall late ticks (six 66 ms ticks every 48, each granted 1.584 < 2) lost time and played at 21.948 source fps. A
 // burst like that reaches about 4 frames of backlog; up to this cap the backlog is carried and every frame is shown. Above
@@ -343,13 +345,13 @@ inline double conformWholeFrameDelta( double currentPosition, double wantedFrame
 // present; each later conformed tick asks for its grant plus that debt and still lands at most one integer on, so the debt is
 // repaid one presented frame per tick and the source pace stays the guard's. Cleared without conform. At most
 // kConformMaxDebtFrames is carried; a backlog above it is skipped on this tick, never discarded (r25 adversary A1), so the
-// position plus the carried debt always equals the position plus everything granted. A real stall (the grant alone
-// >= 1 + kConformStallDebtFrames) skips with the grant as before and leaves the debt to the following ticks.
+// position plus the carried debt always equals the position plus everything granted. r26: a single long tick (a grant of
+// 2 or more on its own) is no longer skipped by itself; it is carried like any other backlog, so a lone
+// GUI-late tick on a quiet host presents the next frame, and only the part of a backlog above the cap is skipped.
 inline double conformDropFrameDelta( double currentPosition, double grantedFrames, bool conformActive, double & debtFrames )
 {
     if( !conformActive ) { debtFrames = 0.0; return grantedFrames; }
     if( !( grantedFrames > 0.0 ) || !( currentPosition >= 0.0 ) ) return grantedFrames;
-    if( grantedFrames >= 1.0 + kConformStallDebtFrames ) return grantedFrames;   // a real stall: the documented skip
     const double wanted = debtFrames > 0.0 ? grantedFrames + debtFrames : grantedFrames;
     const double delta = conformWholeFrameDelta( currentPosition, wanted );
     double debt = ( currentPosition + wanted ) - ( currentPosition + delta );
