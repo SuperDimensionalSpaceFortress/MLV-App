@@ -391,10 +391,13 @@ inline double conformDropFrameDelta( double currentPosition, double grantedFrame
 // r27 fix iteration 1 (adversary A1 on d98be193): the targetPresented input of conformDropFrameDelta. \a lastPresentedFrame
 // is m_lastPresentedPlaybackFrame, \a position is m_newPosDropMode, and \a presentOutstanding says whether a present of the
 // current target is still coming (a render in flight for it, or a lookahead request or slot for it in the active generation).
+// The engine is held only while that present is outstanding. invalidatePlaybackPrepForDisplayChange clears the last presented
+// frame to -1 (Drop Frame toggle, display change, Play), and timerFrameEvent never re-draws the frame it last drew, so with an
+// idle renderer no present is coming: d98be193 held such a target until the debt cap (376 ms, debt 8). Nothing outstanding
+// means nothing to wait for, so the gate is open, as it was before r27.
 inline bool conformTargetPresented( long long lastPresentedFrame, double position, bool presentOutstanding )
 {
-    (void)presentOutstanding;
-    return lastPresentedFrame == static_cast<long long>( position );
+    return lastPresentedFrame == static_cast<long long>( position ) || !presentOutstanding;
 }
 
 // The single-tick form (no debt carried in or out): the same delta for a tick that carries no debt.

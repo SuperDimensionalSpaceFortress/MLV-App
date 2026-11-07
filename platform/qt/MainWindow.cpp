@@ -2875,6 +2875,21 @@ bool MainWindow::renderThreadBusyForPlaybackAdvance( int activePlaybackTarget )
     return !m_pRenderThread->isIdle();
 }
 
+// HFR-NATIVE-60FPS-FULLRES-1 r27 fix iteration 1 (adversary A1 on d98be193): whether a present of the drop-frame engine's
+// current target is still coming -- a render in flight for it (or non-speculative work) or a lookahead request or slot for it
+// in the active generation. The conformed tick holds only then (playback_frame_range::conformTargetPresented). The render
+// thread is asked only under conform and only while the target is not the frame drawFrameReady last accepted.
+bool MainWindow::conformTargetPresentOutstanding()
+{
+    if( !m_pRenderThread || !playbackConformActive() ) return false;
+    const int target = static_cast<int>( m_newPosDropMode );
+    if( target < 0 || m_lastPresentedPlaybackFrame == static_cast<long long>( target ) ) return false;
+    if( renderThreadBusyForPlaybackAdvance( target ) ) return true;
+    return m_pRenderThread->hasPlaybackLookaheadRequest(
+        static_cast<uint32_t>( target ),
+        m_playbackPresentationGeneration.load( std::memory_order_acquire ) );
+}
+
 static int mlvappStartPlaybackTimer( QObject *owner, double framerate )
 {
     if( !owner ) return 0;
@@ -12240,9 +12255,10 @@ void MainWindow::playbackHandling(int timeDiff)
                 // N -> N + 2 from a fractional position) and carries the rest as m_conformDropDebtFrames, repaid one presented
                 // frame per later tick (adversary A1 on 9b900412); r26: a lone long tick is carried too, and only a backlog above
                 // kConformMaxDebtFrames (a real stall) skips. Without conform the grant is unchanged.
-                // r27 (adversary A1 on be20bc59): the debt is repaid as the renderer PRESENTS, never faster. Until drawFrameReady
-                // has accepted the current target (m_lastPresentedPlaybackFrame) a conformed tick does not move past it, so a
-                // queued lookahead is never pruned by the repayment (100 -> 102).
+                // r27 (adversary A1 on be20bc59): the debt is repaid as the renderer PRESENTS, never faster. While a present of the
+                // current target is outstanding and drawFrameReady has not accepted it (m_lastPresentedPlaybackFrame) a conformed
+                // tick does not move past it, so a queued lookahead is never pruned by the repayment (100 -> 102). Fix iteration 1
+                // (adversary A1 on d98be193): with no present outstanding (an invalidation, an idle renderer) nothing holds.
                 const playback_frame_range::DropFrameTickResult dropFrameTick =
                     playback_frame_range::advanceDropFrameTick(
                         m_newPosDropMode,
@@ -12250,7 +12266,8 @@ void MainWindow::playbackHandling(int timeDiff)
                             m_newPosDropMode,
                             m_playbackPaceGuard.grant( getPlaybackFramerate() * (double)timeDiff / 1000.0, paceNowMs, playbackPaceGuardFps() ),
                             playbackConformActive(), m_conformDropDebtFrames,
-                            m_lastPresentedPlaybackFrame == static_cast<long long>( m_newPosDropMode ) ),
+                            playback_frame_range::conformTargetPresented(
+                                m_lastPresentedPlaybackFrame, m_newPosDropMode, conformTargetPresentOutstanding() ) ),
                         ui->spinBoxCutIn->value(), ui->spinBoxCutOut->value(),
                         ui->actionLoop->isChecked() );
                 // slip_summary: the granted share, read back from the tick (a wrap subtracted the cut range width;

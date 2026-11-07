@@ -164,7 +164,8 @@ TEST(PlaybackConformWiring, DropFrameTickQuantisesTheConformedCatchupToWholeFram
         "                            m_newPosDropMode,\n"
         "                            m_playbackPaceGuard.grant( getPlaybackFramerate() * (double)timeDiff / 1000.0, paceNowMs, playbackPaceGuardFps() ),\n"
         "                            playbackConformActive(), m_conformDropDebtFrames,\n"
-        "                            m_lastPresentedPlaybackFrame == static_cast<long long>( m_newPosDropMode ) ),");
+        "                            playback_frame_range::conformTargetPresented(\n"
+        "                                m_lastPresentedPlaybackFrame, m_newPosDropMode, conformTargetPresentOutstanding() ) ),");
     ASSERT_EQ(1, countOccurrences(body, call));
     // r27 (adversary A1 on be20bc59): the repayment is gated on the target drawFrameReady accepted, and that member is set
     // there, after the forward-only guard and before the early advance that runs this tick
@@ -172,6 +173,14 @@ TEST(PlaybackConformWiring, DropFrameTickQuantisesTheConformedCatchupToWholeFram
     const int accepted = drawReady.indexOf(QStringLiteral("    m_lastPresentedPlaybackFrame = static_cast<long long>( display_frame );"));
     ASSERT_TRUE(accepted > 0);
     ASSERT_TRUE(drawReady.indexOf(QStringLiteral("const bool predictiveGpuTexNrEarlyAdvance ="), accepted) > accepted);
+    // fix iteration 1 (adversary A1 on d98be193): the hold needs a present that is still coming -- a render in flight for the
+    // target or a lookahead request or slot for it in the active generation; nothing outstanding never holds
+    const int outstanding = drawReady.indexOf(QStringLiteral("bool MainWindow::conformTargetPresentOutstanding()"));
+    ASSERT_TRUE(outstanding > 0);
+    const QString outstandingBody = drawReady.mid(outstanding, drawReady.indexOf(QStringLiteral("\n}\n"), outstanding) - outstanding);
+    ASSERT_TRUE(outstandingBody.contains(QStringLiteral("if( !m_pRenderThread || !playbackConformActive() ) return false;")));
+    ASSERT_TRUE(outstandingBody.contains(QStringLiteral("if( renderThreadBusyForPlaybackAdvance( target ) ) return true;")));
+    ASSERT_TRUE(outstandingBody.contains(QStringLiteral("m_pRenderThread->hasPlaybackLookaheadRequest(")));
     // adversary A1 on 9b900412: the held frames are carried and repaid, and no debt survives a Play stop or start
     ASSERT_EQ(1, countOccurrences(body, QStringLiteral(
         "        m_playbackPaceGuard.reset();\n"
