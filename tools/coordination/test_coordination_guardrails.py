@@ -1107,6 +1107,7 @@ def _codex_runtime_path_run(tmp_path, call, env=None, cwd=None):
     driver.write_text(
         "param([string]$Script)\n"
         "$ErrorActionPreference = 'Stop'\n"
+        "[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)\n"  # a U+00AD in PATH must round-trip to the assertion
         "$tokens = $null; $errors = $null\n"
         "$ast = [System.Management.Automation.Language.Parser]::ParseFile($Script, [ref]$tokens, [ref]$errors)\n"
         "$fn = @($ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq 'Add-CodexLaneRuntimePath' }, $true))\n"
@@ -1119,7 +1120,7 @@ def _codex_runtime_path_run(tmp_path, call, env=None, cwd=None):
     )
     return subprocess.run(
         [_CODEX_RUNTIME_PATH_PWSH, "-NoProfile", "-NonInteractive", "-File", str(driver), str(LANE_RUNNER)],
-        text=True, capture_output=True, timeout=120, env=env, cwd=cwd,
+        text=True, encoding="utf-8", capture_output=True, timeout=120, env=env, cwd=cwd,
     )
 
 
@@ -1145,18 +1146,20 @@ def test_codex_lane_environment_ends_in_the_mingw_bin_directory(tmp_path):
 
 
 @codex_runtime_path_only
-def test_codex_lane_runtime_path_skips_a_missing_directory_and_never_duplicates(tmp_path):
+def test_codex_lane_runtime_path_appends_a_missing_directory_once_and_never_duplicates(tmp_path):
+    # r3 (hub ruling): the existence lookup is gone. A missing directory on PATH is harmless (the loader skips it), and the lookup was the source of 12
+    # introduced findings across r1/r2. So a candidate is appended whether or not it exists, once, and never when an equivalent spelling is already there.
     present = tmp_path / "bin"
     present.mkdir()
     absent = tmp_path / "no-such-dir"
     done = _codex_runtime_path_run(
         tmp_path,
         f"$psi.Environment['PATH'] = 'C:\\first;' + '{_ps_quote(str(present).upper())}' + '\\'\n"
-        f"[void](Add-CodexLaneRuntimePath -Psi $psi -Candidates @('{_ps_quote(absent)}', '{_ps_quote(present)}', '{_ps_quote(present)}'))",
+        f"[void](Add-CodexLaneRuntimePath -Psi $psi -Candidates @('{_ps_quote(absent)}', '{_ps_quote(present)}', '{_ps_quote(present)}', '{_ps_quote(absent)}'))",
     )
     path = _codex_runtime_path_field(done, "PATH")
-    # `present` is already there under another case and a trailing backslash: not added again. `absent` does not exist: not added.
-    assert path == f"C:\\first;{str(present).upper()}\\", path
+    # `present` is already there under another case and a trailing backslash: not added again. `absent` is added once although it does not exist.
+    assert path == f"C:\\first;{str(present).upper()}\\;{absent}", path
 
 
 @codex_runtime_path_only
@@ -1187,15 +1190,19 @@ def test_codex_lane_runtime_path_default_candidates_include_mingw_root_bin(tmp_p
 
 @codex_runtime_path_only
 def test_codex_lane_runtime_path_survives_a_mingw_root_on_an_absent_drive(tmp_path):
-    # Adversary A1 on 6372cc4e: Join-Path throws DriveNotFound for a drive that is gone, which failed the whole lane before codex started.
-    # A retired MINGW_ROOT must only cost the candidate it names; the default toolchain, when installed, is still added.
+    # Adversary A1 on 6372cc4e: Join-Path threw DriveNotFound for a drive that is gone, which failed the whole lane before codex started. r3: there is no
+    # filesystem call at all, so a retired MINGW_ROOT drive costs nothing: no error, no wait, and the candidate is appended like any other.
     drive = _free_drive_letter()
     env = {**os.environ, "MINGW_ROOT": f"{drive}:\\retired-toolchain"}
     done = _codex_runtime_path_run(
-        tmp_path, "$psi.Environment['PATH'] = 'C:\\first'\n[void](Add-CodexLaneRuntimePath -Psi $psi)", env=env,
+        tmp_path,
+        "$psi.Environment['PATH'] = 'C:\\first'\n$sw = [System.Diagnostics.Stopwatch]::StartNew()\n"
+        "[void](Add-CodexLaneRuntimePath -Psi $psi)\n'ELAPSED_MS=' + [int]$sw.ElapsedMilliseconds",
+        env=env,
     )
     path = _codex_runtime_path_field(done, "PATH")
-    assert path.split(";")[0] == "C:\\first" and f"{drive}:" not in path, path
+    assert path.split(";")[:2] == ["C:\\first", f"{drive}:\\retired-toolchain\\bin"], path
+    assert int(_codex_runtime_path_field(done, "ELAPSED_MS")) < 1000, done.stdout
 
 
 @codex_runtime_path_only
@@ -1261,120 +1268,103 @@ def test_codex_lane_runtime_path_treats_slash_spellings_already_on_path_as_prese
     assert _codex_runtime_path_field(done, "PATH") == start
 
 
-# The function's directory lookup is a seam (-LookupScript, run in its own runspace under a deadline). These tests hand it a recorder that appends every
-# path it is asked about to a file and answers "exists" to everything, so a candidate the function should have skipped shows up as a recorded lookup AND
-# as an added directory.
-def _recorder_call(tmp_path, candidates):
-    rec = tmp_path / "lookups.txt"
-    # The recorder's own path is quoted for the INNER literal here and the whole script again for the outer one (adversary A4 on 834f307b: a tmp
-    # path holding an apostrophe broke the inner literal).
-    script = f"param($p) Add-Content -LiteralPath '{_ps_quote(rec)}' -Value $p; return $true"
-    cand = "" if candidates is None else f" -Candidates @({candidates})"
-    return rec, (
-        "$psi.Environment['PATH'] = 'C:\\first'\n"
-        f"[void](Add-CodexLaneRuntimePath -Psi $psi{cand} -LookupScript '{_ps_quote(script)}')"
-    )
-
-
-def _recorded(rec):
-    return rec.read_text(encoding="utf-8") if rec.exists() else ""
-
-
 @codex_runtime_path_only
-def test_codex_lane_runtime_path_never_looks_up_a_unc_directory(tmp_path):
-    # Adversary A1 on 56281b89: Test-Path on \\host\share\... can block in the SMB layer for longer than the launch budget, and the lane then fails
-    # launch-budget-exhausted before codex starts. A UNC candidate (explicit, or through MINGW_ROOT) is skipped with no filesystem lookup at all.
-    rec, call = _recorder_call(tmp_path, "'\\\\blackhole-host\\share\\mingw\\bin'")
-    done = _codex_runtime_path_run(tmp_path, call)
+def test_codex_lane_runtime_path_skips_a_unc_directory_by_name(tmp_path):
+    # Adversary A1 on 56281b89: a UNC candidate (explicit, or through MINGW_ROOT) is never added. Kept from r1/r2; with the lookup gone it is skipped by name only.
+    done = _codex_runtime_path_run(
+        tmp_path,
+        "$psi.Environment['PATH'] = 'C:\\first'\n"
+        "[void](Add-CodexLaneRuntimePath -Psi $psi -Candidates @('\\\\blackhole-host\\share\\mingw\\bin'))",
+    )
     assert _codex_runtime_path_field(done, "PATH") == "C:\\first"
-    assert _recorded(rec) == "", done.stdout
     env = {**os.environ, "MINGW_ROOT": "\\\\blackhole-host\\share\\mingw"}
-    rec, call = _recorder_call(tmp_path, None)
-    done = _codex_runtime_path_run(tmp_path, call, env=env)
+    done = _codex_runtime_path_run(tmp_path, "$psi.Environment['PATH'] = 'C:\\first'\n[void](Add-CodexLaneRuntimePath -Psi $psi)", env=env)
     assert "blackhole-host" not in _codex_runtime_path_field(done, "PATH")
-    assert "blackhole-host" not in _recorded(rec), done.stdout
 
 
 @codex_runtime_path_only
-def test_codex_lane_runtime_path_looks_up_only_a_local_drive(tmp_path):
-    # Defect-class sweep for A1: the same stall is possible through a drive letter that is mapped to a share, or that is not there. The drive type is
-    # read first (a local call that does not touch the share); a drive that is not a local disk is skipped with no lookup. A local fixed drive is
-    # still looked up, so the positive control below is what keeps this from passing by skipping everything.
+def test_codex_lane_runtime_path_adds_both_candidates_with_no_filesystem_call_and_no_budget(tmp_path):
+    # Adversary A2 on e370ba86: the lookup's budget bounded the wait, not the work (runspace start-up and normalisation sat outside it), so with -TimeoutSec 1
+    # elapsed reached 1180 ms and the next launch-budget guard threw. r3: nothing is looked up, so there is no work to budget. Candidates on a drive letter
+    # that does not exist (the stand-in for a dead mapped drive) are appended at once, both of them, and the function takes no budget parameter.
     gone = _free_drive_letter()
-    system_drive = os.environ.get("SystemDrive", "C:")
-    rec, call = _recorder_call(tmp_path, f"'{gone}:\\toolchain\\bin', '{_ps_quote(system_drive)}\\probe-toolchain\\bin'")
-    done = _codex_runtime_path_run(tmp_path, call)
-    lookups = _recorded(rec)
-    assert f"{gone}:" not in lookups and f"{gone}:" not in _codex_runtime_path_field(done, "PATH"), done.stdout
-    assert "probe-toolchain" in lookups, f"a local fixed drive must still be looked up: {done.stdout!r}"
+    done = _codex_runtime_path_run(
+        tmp_path,
+        "$psi.Environment['PATH'] = 'C:\\first'\n$sw = [System.Diagnostics.Stopwatch]::StartNew()\n"
+        f"$r = @(Add-CodexLaneRuntimePath -Psi $psi -Candidates @('{gone}:\\toolchain\\bin', '{gone}:\\other\\bin'))\n"
+        "'ADDED=' + $r.Count\n'ELAPSED_MS=' + [int]$sw.ElapsedMilliseconds",
+    )
+    assert _codex_runtime_path_field(done, "ADDED") == "2", done.stdout
+    assert _codex_runtime_path_field(done, "PATH") == f"C:\\first;{gone}:\\toolchain\\bin;{gone}:\\other\\bin"
+    assert int(_codex_runtime_path_field(done, "ELAPSED_MS")) < 1000, done.stdout
+
+
+def _add_codex_runtime_path_function_text():
+    body = LANE_RUNNER.read_text(encoding="utf-8").replace("\r\n", "\n")
+    start = body.index("function Add-CodexLaneRuntimePath {")
+    end = body.index("\n}\n", start) + 3
+    return body[start:end]
+
+
+def _strip_ps_comments(text):
+    return "\n".join(re.sub(r"(?<![`'\"])#.*$", "", line) for line in text.splitlines())
+
+
+def test_codex_lane_runtime_path_makes_no_filesystem_call_and_creates_no_thread():
+    # Adversary A2/A3 on e370ba86 and the hub ruling for r3: the function must not touch the filesystem (a lookup can block in SMB, behind a junction, on
+    # a dead mapped drive) and must not create a runspace or thread (an abandoned blocked one keeps the lane process alive: 4845 ms to EXIT). Source shape.
+    code = _strip_ps_comments(_add_codex_runtime_path_function_text())
+    banned = (
+        "RunspaceFactory", "[powershell]::Create", "BeginInvoke", "Start-Job", "Start-ThreadJob", "ForEach-Object -Parallel", "[System.Threading",
+        "DriveInfo", "Test-Path", "Get-Item", "Get-ChildItem", "Resolve-Path", "Convert-Path", "Get-PSDrive", "Set-Location", "Push-Location",
+        "Directory]::Exists", "File]::Exists", "GetFullPath", "Path]::IsPathRooted", "Join-Path", "Split-Path", "LookupScript", "LookupTimeoutMs", "BudgetMs",
+        "Stopwatch", "WaitOne",
+    )
+    found = [b for b in banned if b.lower() in code.lower()]
+    assert not found, f"Add-CodexLaneRuntimePath must not touch the filesystem or create threads; found {found}"
+
+
+def test_codex_lane_runtime_path_takes_no_lookup_or_budget_parameter():
+    code = _add_codex_runtime_path_function_text()
+    params = re.search(r"param\((.*?)\n    \)", code, re.S).group(1)
+    assert sorted(re.findall(r"\]\s*\$([A-Za-z]+)\b", params)) == ["Candidates", "Psi"], params
+
+
+def test_codex_lane_runtime_path_compares_path_keys_ordinally():
+    # Adversary A1 on e370ba86: a PowerShell hashtable, and the -eq/-ne/-in/-contains operators, compare strings with the current culture, which ignores
+    # U+00AD (soft hyphen): a segment holding only U+00AD was `-eq ''` and was dropped, so a nonexistent inherited directory 'X\<U+00AD>\bin' collided with the real
+    # 'X\bin'. Path keys live in an ordinal HashSet, and no string operator that can fold a path is left in the function.
+    code = _strip_ps_comments(_add_codex_runtime_path_function_text())
+    assert "@{}" not in code, "a hashtable folds keys with the culture"
+    assert re.search(r"HashSet\[string\]\]::new\(\[(?:System\.)?StringComparer\]::Ordinal\)", code), "the seen-set must be an ordinal HashSet[string]"
+    operators = re.findall(r"^.*\s-(?:i?c?eq|i?c?ne|i?c?in|i?c?notin|i?c?contains|i?c?notcontains|i?c?like|i?c?lt|i?c?gt)\b.*$", code, re.M)
+    offenders = [ln.strip() for ln in operators if not re.search(r"\.(?:Count|Length)\b|\$null -eq|-eq \$null", ln)]
+    assert not offenders, f"culture-sensitive comparison of a path string: {offenders}"
 
 
 @codex_runtime_path_only
-def test_codex_lane_runtime_path_abandons_a_lookup_that_outlasts_its_deadline(tmp_path):
-    # Adversary A2 on 7688a2a3: C:\lane-runtime-link is a local, fixed-drive path whose target is \\host\share, so no name-based gate sees the share and
-    # Test-Path follows the link into SMB with no timeout. The lookup now runs under a deadline; one still blocked when it passes costs its candidate,
-    # not the launch. A lookup that sleeps 20 s stands in for the blocked SMB call.
+def test_codex_lane_runtime_path_a_soft_hyphen_segment_is_not_the_real_directory(tmp_path):
+    # Adversary A1 on e370ba86 (input: PATH 'C:\Qt\Tools\mingw1310_64\<U+00AD>\bin', installed default toolchain, ADDED=0). A segment that is only U+00AD is a
+    # different (nonexistent) directory, not an empty segment, so it does not make the real directory look present, and as a candidate it keeps its own spelling.
     present = tmp_path / "bin"
     present.mkdir()
-    slow = "param($p) Start-Sleep -Seconds 20; return $true"
+    shy = "\u00ad"
+    inherited = f"{tmp_path}\\{shy}\\bin"
+    done = _codex_runtime_path_run(
+        tmp_path,
+        f"$psi.Environment['PATH'] = 'C:\\first;{_ps_quote(inherited)}'\n"
+        f"$r = @(Add-CodexLaneRuntimePath -Psi $psi -Candidates @('{_ps_quote(present)}'))\n"
+        "'ADDED=' + $r.Count",
+    )
+    assert _codex_runtime_path_field(done, "ADDED") == "1", done.stdout
+    assert _codex_runtime_path_field(done, "PATH") == f"C:\\first;{inherited};{present}"
+    # as a candidate it is not collapsed into the real directory
     done = _codex_runtime_path_run(
         tmp_path,
         "$psi.Environment['PATH'] = 'C:\\first'\n"
-        "$sw = [System.Diagnostics.Stopwatch]::StartNew()\n"
-        f"[void](Add-CodexLaneRuntimePath -Psi $psi -Candidates @('{_ps_quote(present)}') -LookupScript '{_ps_quote(slow)}' -LookupTimeoutMs 300)\n"
-        "'ELAPSED_MS=' + [int]$sw.ElapsedMilliseconds",
+        f"[void](Add-CodexLaneRuntimePath -Psi $psi -Candidates @('{_ps_quote(inherited)}', '{_ps_quote(present)}'))",
     )
-    assert _codex_runtime_path_field(done, "PATH") == "C:\\first"
-    assert int(_codex_runtime_path_field(done, "ELAPSED_MS")) < 10000, done.stdout
-
-
-@codex_runtime_path_only
-def test_codex_lane_runtime_path_recorder_survives_an_apostrophe_in_the_tmp_path(tmp_path):
-    # Adversary A4 on 834f307b: the recorder path was spliced into an inner single-quoted literal unescaped, so the harness itself failed to parse.
-    odd = tmp_path / "O'Brien"
-    odd.mkdir()
-    system_drive = os.environ.get("SystemDrive", "C:")
-    rec, call = _recorder_call(odd, f"'{_ps_quote(system_drive)}\\probe-apostrophe\\bin'")
-    done = _codex_runtime_path_run(odd, call)
-    _codex_runtime_path_field(done, "PATH")
-    assert "probe-apostrophe" in _recorded(rec), done.stdout
-
-
-@codex_runtime_path_only
-def test_codex_lane_runtime_path_lookups_never_outspend_the_budget_they_are_given(tmp_path):
-    # Adversary A1 on 834f307b: the per-lookup deadline was independent of the lane's remaining launch budget, so with -TimeoutSec 1 a stalled lookup
-    # waited its full 1500 ms and the very next check threw launch-budget-exhausted. The caller now hands the function a total budget (-BudgetMs);
-    # a candidate that cannot be looked up inside what is left is skipped, and a budget of 0 looks nothing up.
-    a = tmp_path / "bin-a"
-    b = tmp_path / "bin-b"
-    a.mkdir()
-    b.mkdir()
-    rec, call = _recorder_call(tmp_path, f"'{_ps_quote(a)}'")
-    call = call.replace("-LookupScript", "-BudgetMs 0 -LookupScript")
-    done = _codex_runtime_path_run(tmp_path, call)
-    assert _codex_runtime_path_field(done, "PATH") == "C:\\first" and _recorded(rec) == "", done.stdout
-    slow = "param($p) Start-Sleep -Seconds 20; return $true"
-    done = _codex_runtime_path_run(
-        tmp_path,
-        "$psi.Environment['PATH'] = 'C:\\first'\n"
-        "$sw = [System.Diagnostics.Stopwatch]::StartNew()\n"
-        f"[void](Add-CodexLaneRuntimePath -Psi $psi -Candidates @('{_ps_quote(a)}', '{_ps_quote(b)}') -LookupScript '{_ps_quote(slow)}' -BudgetMs 200)\n"
-        "'ELAPSED_MS=' + [int]$sw.ElapsedMilliseconds",
-    )
-    assert _codex_runtime_path_field(done, "PATH") == "C:\\first"
-    assert int(_codex_runtime_path_field(done, "ELAPSED_MS")) < 2500, done.stdout  # two 1500 ms waits would be 3000+
-
-
-@codex_runtime_path_only
-def test_codex_lane_runtime_path_rejects_a_deadline_that_is_not_finite(tmp_path):
-    # Adversary A3 (advisory) on 834f307b: -LookupTimeoutMs -1 reached WaitOne as Timeout.Infinite. A non-positive deadline is a parameter error.
-    present = tmp_path / "bin"
-    present.mkdir()
-    done = _codex_runtime_path_run(
-        tmp_path,
-        f"[void](Add-CodexLaneRuntimePath -Psi $psi -Candidates @('{_ps_quote(present)}') -LookupTimeoutMs -1)",
-    )
-    assert done.returncode != 0 and "LookupTimeoutMs" in done.stderr, (done.stdout, done.stderr)
+    assert _codex_runtime_path_field(done, "PATH") == f"C:\\first;{inherited};{present}"
 
 
 @codex_runtime_path_only
@@ -1438,15 +1428,13 @@ def test_codex_lane_runtime_path_treats_dot_segments_as_the_directory_they_name(
 def test_codex_lane_runtime_path_is_wired_into_the_codex_child_only():
     body = LANE_RUNNER.read_text(encoding="utf-8").replace("\r\n", "\n")
     assert "function Add-CodexLaneRuntimePath" in body, "Invoke-Lane lacks Add-CodexLaneRuntimePath"
-    calls = [m.start() for m in re.finditer(r"^\s*\$\w+ = @\(Add-CodexLaneRuntimePath -Psi \$psi -BudgetMs \$\w+\)", body, re.M)]
+    calls = [m.start() for m in re.finditer(r"^\s*\$\w+ = @\(Add-CodexLaneRuntimePath -Psi \$psi\)", body, re.M)]
     assert len(calls) == 1, f"expected exactly one call on the lane child's $psi, found {len(calls)}"
     guard = "if ($cfg.engine -eq 'codex') {"
     window = body[max(0, calls[0] - 900):calls[0]]
     assert guard in window, "the call must sit inside `if ($cfg.engine -eq 'codex')`: the claude lane's environment is unchanged"
-    # Adversary A1 on 834f307b: the lookups' total budget is what is LEFT of this invocation's -TimeoutSec, so a stalled lookup cannot be the reason
-    # the very next budget check throws launch-budget-exhausted.
-    budget_line = re.search(r"^\s*\$\w+ = .*\$TimeoutSec.*\$sw\.Elapsed.*$", window, re.M)
-    assert budget_line, "the call's -BudgetMs must be derived from $TimeoutSec and the invocation stopwatch $sw"
+    # r3: no lookup, so no budget: the call takes nothing but the child's $psi and cannot be the reason a launch-budget check throws.
+    assert "-BudgetMs" not in body[calls[0]:calls[0] + 200] and "codexRuntimeBudgetMs" not in body, "the call must carry no lookup budget"
     # After the child's $psi exists and before its streams are redirected, i.e. before anything can start it.
     created = body.index("$psi = [System.Diagnostics.ProcessStartInfo]::new()\n$psi.WorkingDirectory")
     redirected = body.index("$psi.RedirectStandardInput  = $true")

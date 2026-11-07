@@ -1961,21 +1961,16 @@ function Set-CodexLaunchStartInfo {
 # runs finds its runtime DLLs and the loader failure that raises the box never happens. Why (a) and not (b): codex's shell_environment_policy inherits the
 # launcher's environment by default (config.toml sets only NODE_REPL_*), so PATH is the one channel known to cross the sandbox spawn, while an error mode is
 # per-process state the sandbox's spawn does not carry; a wrapper or config that sets a mode inside the sandbox is codex-version-specific and cannot be
-# tested without starting codex. The directory is APPENDED, so every tool already on PATH resolves exactly as before. Existing directories only; one already
-# present (any case, with or without a trailing backslash) is not added twice. Returns the directories added. Candidates: $env:MINGW_ROOT\bin (the build
-# docs' name for the toolchain, docs/02-developer-guide.md), then the default Qt-installer toolchain C:\Qt\Tools\mingw1310_64\bin that build-guard and
-# tools\testing\run-windows-test.ps1 use.
+# tested without starting codex. The directory is APPENDED, so every tool already on PATH resolves exactly as before. A directory is appended whether or not it
+# exists, and NOTHING here touches the filesystem (r3, hub ruling): a missing directory on PATH is harmless (the loader skips it), while the existence lookup
+# that r1 and r2 carried was the source of 12 introduced findings (a stall in SMB behind a UNC path, a mapped drive or a junction; a runspace that outlives
+# the lookup; a budget that bounded the wait but not the work). One already present (any ASCII case, with or without a trailing backslash) is not added
+# twice. Returns the directories added. Candidates: $env:MINGW_ROOT\bin (the build docs' name for the toolchain, docs/02-developer-guide.md), then the
+# default Qt-installer toolchain C:\Qt\Tools\mingw1310_64\bin that build-guard and tools\testing\run-windows-test.ps1 use.
 function Add-CodexLaneRuntimePath {
     param(
         [Parameter(Mandatory = $true)]$Psi,
-        [string[]]$Candidates = $null,
-        # The existence lookup is a seam: a script taking the path and returning $true when a directory is there. It runs in its OWN runspace under a
-        # deadline (adversary A2 on 7688a2a3: a local-looking path can be a symlink or junction into a share, which no name or drive-type gate sees).
-        [string]$LookupScript = $null,
-        [ValidateRange(1, 60000)][int]$LookupTimeoutMs = 1500,
-        # TOTAL time all lookups together may spend (adversary A1 on 834f307b). The caller passes what is left of the invocation's -TimeoutSec, halved, so a
-        # stalled lookup can never be the reason the next budget check throws launch-budget-exhausted. 0 looks nothing up.
-        [ValidateRange(0, 600000)][int]$BudgetMs = 3000
+        [string[]]$Candidates = $null
     )
     if ($null -eq $Candidates) {
         $Candidates = @()
@@ -1984,7 +1979,10 @@ function Add-CodexLaneRuntimePath {
         if (-not [string]::IsNullOrWhiteSpace($env:MINGW_ROOT)) { $Candidates += ($env:MINGW_ROOT.Trim().TrimEnd('\', '/') + '\bin') }
         $Candidates += 'C:\Qt\Tools\mingw1310_64\bin'
     }
-    if ([string]::IsNullOrEmpty($LookupScript)) { $LookupScript = 'param($p) [System.IO.Directory]::Exists($p)' }
+    # EVERY string comparison below is ordinal. PowerShell's -eq/-ne/-in/-contains and a @{} hashtable compare with the current culture, which ignores
+    # U+00AD (soft hyphen): a path segment holding only U+00AD was `-eq ''`, was dropped, and made a nonexistent inherited directory collide with the real one
+    # (adversary A1 on e370ba86, ADDED=0). Path keys live in an ordinal HashSet; the segment tests use [string]::Equals(..., Ordinal) and .Length.
+    $ordinal = [System.StringComparison]::Ordinal
     # ONE lexical normalisation for both sides of the duplicate check, and for what is appended: '/' is '\', '.' and '..' segments are resolved (Windows
     # does the same before it touches the disk), repeated separators collapse (adversary A2 on 56281b89, A3 on 7688a2a3). It returns $null for a spelling
     # the loader may not match to the directory it names: leading/trailing whitespace, a quote, a segment ending in space or dot, a reserved character, or
@@ -1992,13 +1990,13 @@ function Add-CodexLaneRuntimePath {
     # seen-set, so the usable directory was never added); a false "absent" costs a harmless duplicate, a false "present" costs the whole fix.
     $dirNorm = {
         param([string]$d)
-        if ([string]::IsNullOrEmpty($d) -or $d -ne $d.Trim() -or $d.Contains('"')) { return $null }
+        if ([string]::IsNullOrEmpty($d) -or -not [string]::Equals($d, $d.Trim(), $ordinal) -or $d.Contains('"')) { return $null }
         $p = $d.Replace('/', '\')
         if ($p -notmatch '^[A-Za-z]:\\') { return $null }
         $stack = [System.Collections.Generic.List[string]]::new()
         foreach ($seg in $p.Substring(3).Split('\')) {
-            if ($seg -eq '' -or $seg -eq '.') { continue }
-            if ($seg -eq '..') {
+            if ($seg.Length -eq 0 -or [string]::Equals($seg, '.', $ordinal)) { continue }
+            if ([string]::Equals($seg, '..', $ordinal)) {
                 if ($stack.Count -eq 0) { return $null }
                 $stack.RemoveAt($stack.Count - 1)
                 continue
@@ -2021,50 +2019,25 @@ function Add-CodexLaneRuntimePath {
         }
         return $sb.ToString()
     }
-    $seen = @{}
+    $seen = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::Ordinal)
     foreach ($entry in ($current -split ';')) {
         $norm = & $dirNorm $entry
-        if ($norm) { $seen[(& $dirKey $norm)] = $true }
+        if ($norm) { [void]$seen.Add((& $dirKey $norm)) }
     }
-    $lookupClock = [System.Diagnostics.Stopwatch]::StartNew()
     $added = @()
     foreach ($dir in $Candidates) {
         if ([string]::IsNullOrWhiteSpace($dir)) { continue }
         $dir = $dir.Trim()
-        # A DRIVE-LETTER path only (X:\... or X:/...): a relative PATH entry is searched from the CHILD's working directory, not the launcher's where
-        # the lookup would judge it (adversary A2 on 6372cc4e), and a UNC path is never looked up at all: it can block in the SMB layer past the launch
-        # budget and fail the lane launch-budget-exhausted before codex starts (adversary A1 on 56281b89). Skipped by name.
+        # A DRIVE-LETTER path only (X:\... or X:/...): a relative PATH entry is searched from the CHILD's working directory, not the launcher's
+        # (adversary A2 on 6372cc4e), and a UNC path is skipped by name (adversary A1 on 56281b89). Skipped by name, with no filesystem call.
         if ($dir -notmatch '^[A-Za-z]:[\\/]') { continue }
         # A name PATH cannot carry intact is skipped: ';' would serialize as two entries (C:\toolchains;child\bin -> C:\toolchains plus a relative
         # child\bin, adversary A1 on e284b182) and '"' is PATH's own quoting.
         if ($dir.Contains(';') -or $dir.Contains('"')) { continue }
         $dir = & $dirNorm $dir
         if (-not $dir) { continue }
-        $key = & $dirKey $dir
-        if ($seen.ContainsKey($key)) { continue }
-        # A drive letter can still be a mapped share (or be gone): its type is read first, a local call that does not touch the share, and a drive that
-        # is not a local disk is skipped with no lookup.
-        $driveType = 'Unknown'
-        try { $driveType = [string][System.IO.DriveInfo]::new($dir.Substring(0, 1)).DriveType } catch { $driveType = 'Unknown' }
-        if ($driveType -in @('Network', 'NoRootDirectory', 'Unknown')) { continue }
-        # The lookup itself, under a deadline (adversary A2 on 7688a2a3): C:\link\bin where C:\link is a junction or symlink to \\host\share passes every
-        # gate above and then stalls in SMB. A lookup still blocked at the deadline costs ITS candidate, not the launch. Its runspace is neither stopped
-        # nor disposed (both wait for the blocked call) and is left to the process end.
-        $waitMs = [math]::Min($LookupTimeoutMs, $BudgetMs - $lookupClock.ElapsedMilliseconds)
-        if ($waitMs -le 0) { break }   # nothing is left to look anything up with
-        $exists = $false
-        try {
-            $ps = [powershell]::Create()
-            [void]$ps.AddScript($LookupScript).AddArgument($dir)
-            $async = $ps.BeginInvoke()
-            if ($async.AsyncWaitHandle.WaitOne([int]$waitMs)) {
-                $answer = @($ps.EndInvoke($async))
-                $exists = ($answer.Count -gt 0 -and [bool]$answer[$answer.Count - 1])
-                $ps.Dispose()
-            }
-        } catch { $exists = $false }
-        if (-not $exists) { continue }
-        $seen[$key] = $true
+        # HashSet.Add is false when the key is already there: an inherited entry, or an earlier candidate in another spelling.
+        if (-not $seen.Add((& $dirKey $dir))) { continue }
         $added += $dir
     }
     if ($added.Count -gt 0) {
@@ -2848,9 +2821,7 @@ if ($cfg.engine -eq 'claude') {
 if ($cfg.engine -eq 'codex') {
     # Fail open with a warning, like the error-mode block: a PATH nicety must never be the reason a review lane does not start.
     try {
-        # The lookups get half of what is left of THIS invocation's -TimeoutSec (at most 3 s), so a stalled lookup cannot be what exhausts the launch budget.
-        $codexRuntimeBudgetMs = [int][math]::Max(0, [math]::Min(3000, [math]::Floor((($TimeoutSec * 1000.0) - $sw.Elapsed.TotalMilliseconds) / 2)))
-        $codexRuntimePathAdded = @(Add-CodexLaneRuntimePath -Psi $psi -BudgetMs $codexRuntimeBudgetMs)
+        $codexRuntimePathAdded = @(Add-CodexLaneRuntimePath -Psi $psi)
         if ($codexRuntimePathAdded.Count -gt 0) { Write-Host ("[codex-runtime-path] appended to the lane PATH: {0}" -f ($codexRuntimePathAdded -join ';')) }
     }
     catch { Write-Warning "CODEX_RUNTIME_PATH_NOT_SET: $($_.Exception.Message) -- a MinGW-built exe the model runs may raise a loader dialog on the desktop" }
