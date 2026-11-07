@@ -57,6 +57,16 @@ struct Callbacks
 // quiet render thread is not mistaken for a busy one (which would only ever time out), and a real hold is never idle.
 constexpr std::int64_t kBlockedSampleUs = 100;
 
+// RED stub (adversary r3 pass 3 A1): waits for the renderer mutex, as the current renderIdle() sample does.
+template <typename Mutex, typename IdleLocked>
+inline bool probeIdleWithoutWaiting( Mutex &rendererMutex, IdleLocked idleLocked )
+{
+    rendererMutex.lock();
+    const bool idle = idleLocked();
+    rendererMutex.unlock();
+    return idle;
+}
+
 struct Result
 {
     Outcome outcome = Outcome::NotWaiting;

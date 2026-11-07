@@ -11,11 +11,16 @@
 #include "../../platform/qt/ResizeStillDrawingWait.h"
 
 #include <QFile>
+#include <QMutex>
 #include <QString>
 #include <QTextStream>
 
+#include <atomic>
+#include <chrono>
 #include <cstdint>
+#include <functional>
 #include <string>
+#include <thread>
 
 using resize_still_drawing_wait::Callbacks;
 using resize_still_drawing_wait::Outcome;
@@ -247,29 +252,31 @@ TEST(ResizeStillDrawingWait, TimeBlockedInsideRenderIdleIsNotCountedAsIdleGrace)
     ASSERT_TRUE(result.waitedMs <= 105 + kStaleIdleGraceMs + world.stepMs);
 }
 
-// adversary r2 A1: the same rule once an idle run is already open. renderIdle() reports idle every time but blocks 100 ms
-// on its SECOND call; that blocked time must not be credited to the run. r3 A1: the time before the block must not be
-// credited either (a blocked sample ends the run), so the grace needs 50 ms of continuous idleness after the block.
+// adversary r2 A1: the same rule once an idle run is already open. r3 pass 3 A1: renderIdle() is a probe that never waits
+// for the renderer mutex (probeIdleWithoutWaiting), so a renderer holding it from t=10 to t=110 is seen as BUSY by every
+// sample in that window, at once, instead of as one slow idle sample. The run opened at t=5 ends there, and the grace
+// needs 50 ms of continuous idleness after the hold: neither the hold nor the time before it is credited.
 TEST(ResizeStillDrawingWait, TimeBlockedInsideALaterRenderIdleSampleIsNotCountedAsIdleGrace)
 {
     FakeWorld world;
     Callbacks c = world.callbacks();
     c.renderIdle = [&world]() {
-        if (world.renderIdleCalls++ == 1) world.nowMs += 100;
-        return true;
+        ++world.renderIdleCalls;
+        const std::int64_t rel = world.nowMs - 1000;
+        return rel < 10 || rel >= 110; // the renderer holds its mutex t=[10,110): the probe reports busy, never waits
     };
     const Result result = wait(c);
     ASSERT_TRUE(result.outcome == Outcome::StaleCleared);
     ASSERT_EQ(1, world.clearStaleCalls);
-    // run opens at t=5; sample 2 blocks t=10 -> 110 and the run restarts there: stale no earlier than t=160
+    // run opens at t=5 and ends at t=10; it reopens at t=110: stale no earlier than t=160
     ASSERT_TRUE(result.waitedMs >= 110 + kStaleIdleGraceMs);
     ASSERT_TRUE(result.waitedMs <= 110 + kStaleIdleGraceMs + world.stepMs);
 }
 
-// adversary r3 A1 (r2 advisory A2 raised to major): a blocked renderIdle() sample is a break in idleness (the render
-// thread held its mutex), so it must not join the idle time before it to the idle time after it. The adversary's input:
-// entry t=0, pumps return at 1, 50, 151 (then 1 ms apart), every sample idle, the second blocks 50 -> 150. r2's
-// arithmetic kept 49 ms of pre-block credit and stale-cleared at t=151, 1 ms after the block.
+// adversary r3 A1 (r2 advisory A2 raised to major): a renderer-mutex hold is a break in idleness, so it must not join the
+// idle time before it to the idle time after it. The adversary's input: entry t=0, pumps return at 1, 50, 151 (then 1 ms
+// apart), the renderer holds its mutex 50 -> 150. r2's arithmetic kept 49 ms of pre-block credit and stale-cleared at
+// t=151. r3 pass 3 A1: the probe sees the held mutex as busy at t=50 (it does not wait), so the run reopens at t=151.
 TEST(ResizeStillDrawingWait, ABlockedSampleEndsTheIdleRunSoSeparateIdlePeriodsNeverJoin)
 {
     std::int64_t now = 0;
@@ -286,24 +293,23 @@ TEST(ResizeStillDrawingWait, ABlockedSampleEndsTheIdleRunSoSeparateIdlePeriodsNe
         else if (pumps == 3) now = 151;
         else now += 1;
     };
-    c.renderIdle = [&now, &samples]() {
-        if (samples++ == 1) now = 150; // blocked on the renderer mutex 50 -> 150
-        return true;
+    c.renderIdle = [&samples]() {
+        return samples++ != 1; // the renderer holds its mutex 50 -> 150: the probe at t=50 reports busy at once
     };
     c.clearStale = [&flag, &clears]() { ++clears; flag = false; };
     c.nowMs = [&now]() { return now; };
     const Result result = wait(c);
     ASSERT_TRUE(result.outcome == Outcome::StaleCleared);
     ASSERT_EQ(1, clears);
-    // the only continuous idle run starts when the blocked sample returns (t=150)
+    // the only continuous idle run starts at the first idle sample after the hold (t=151)
     ASSERT_TRUE(result.waitedMs >= 150 + kStaleIdleGraceMs);
-    ASSERT_TRUE(result.waitedMs <= 150 + kStaleIdleGraceMs + 1);
+    ASSERT_TRUE(result.waitedMs <= 151 + kStaleIdleGraceMs + 1);
 }
 
-// adversary r3 pass 2 A1: a millisecond clock cannot see a block that starts and ends inside one tick. The adversary's
-// input: a microsecond clock tUs from 0, nowMs = tUs/1000; pumps set tUs to 1000, 50100, 51000 (then 1000 apart); every
-// sample idle; the second blocks 50100 -> 50900 (800 us, same 50 ms tick). The helper reads the fine clock (nowUs), so
-// the block restarts the run at 50.9 ms and the stale clear needs t >= 100.9 ms; the ms-only arithmetic cleared at 51.
+// adversary r3 pass 2 A1: a millisecond clock cannot see a hold that starts and ends inside one tick. The adversary's
+// input: a microsecond clock tUs from 0, nowMs = tUs/1000; pumps set tUs to 1000, 50100, 51000 (then 1000 apart); the
+// renderer holds its mutex 50100 -> 50900 (800 us, same 50 ms tick). The probe at 50.1 ms reports busy, the run reopens
+// at 51 ms and the stale clear needs t >= 101 ms; the ms-only arithmetic cleared at 51.
 TEST(ResizeStillDrawingWait, ABlockInsideOneMillisecondTickStillEndsTheIdleRun)
 {
     std::int64_t tUs = 0;
@@ -320,9 +326,8 @@ TEST(ResizeStillDrawingWait, ABlockInsideOneMillisecondTickStillEndsTheIdleRun)
         else if (pumps == 3) tUs = 51000;
         else tUs += 1000;
     };
-    c.renderIdle = [&tUs, &samples]() {
-        if (samples++ == 1) tUs = 50900; // blocked on the renderer mutex 50100 -> 50900 us
-        return true;
+    c.renderIdle = [&samples]() {
+        return samples++ != 1; // the renderer holds its mutex 50100 -> 50900 us: the probe reports busy at once
     };
     c.clearStale = [&flag, &clears]() { ++clears; flag = false; };
     c.nowMs = [&tUs]() { return tUs / 1000; };
@@ -330,24 +335,23 @@ TEST(ResizeStillDrawingWait, ABlockInsideOneMillisecondTickStillEndsTheIdleRun)
     const Result result = wait(c);
     ASSERT_TRUE(result.outcome == Outcome::StaleCleared);
     ASSERT_EQ(1, clears);
-    ASSERT_TRUE(result.waitedMs >= 100); // 100.9 ms truncated
+    ASSERT_TRUE(result.waitedMs >= 100); // 101 ms
     ASSERT_TRUE(result.waitedMs <= 102);
 }
 
-// The other side of the same rule: a sample that costs what an uncontended renderer-mutex read costs (well under
-// kBlockedSampleUs) is not a block, so a quiet render thread is still stale-cleared after the grace, not only at the
-// 2000 ms deadline. Its own time is still never credited as idle.
-TEST(ResizeStillDrawingWait, AnUncontendedSampleDoesNotRestartTheIdleRun)
+// adversary r3 pass 3 A1: with a probe that never waits, the time a sample takes is GUI-thread time, not renderer time, so
+// an idle sample is judged by its report alone and no duration threshold exists. A slow GUI thread (500 us per sample,
+// above r3's 100 us kBlockedSampleUs) must still stale-clear a quiet renderer after the grace; r3's threshold restarted
+// the run on every such sample, so it could only time out at 2000 ms.
+TEST(ResizeStillDrawingWait, AnIdleSampleIsJudgedByItsReportNotItsDuration)
 {
-    ASSERT_TRUE(resize_still_drawing_wait::kBlockedSampleUs > 10);
-    ASSERT_TRUE(resize_still_drawing_wait::kBlockedSampleUs < 1000);
     std::int64_t tUs = 0;
     bool flag = true;
     int clears = 0;
     Callbacks c;
     c.stillDrawing = [&flag]() { return flag; };
-    c.pump = [&tUs]() { tUs += 990; };
-    c.renderIdle = [&tUs]() { tUs += 10; return true; }; // 10 us per sample
+    c.pump = [&tUs]() { tUs += 500; };
+    c.renderIdle = [&tUs]() { tUs += 500; return true; }; // 500 us per sample, renderer mutex free
     c.clearStale = [&flag, &clears]() { ++clears; flag = false; };
     c.nowMs = [&tUs]() { return tUs / 1000; };
     c.nowUs = [&tUs]() { return tUs; };
@@ -355,7 +359,166 @@ TEST(ResizeStillDrawingWait, AnUncontendedSampleDoesNotRestartTheIdleRun)
     ASSERT_TRUE(result.outcome == Outcome::StaleCleared);
     ASSERT_EQ(1, clears);
     ASSERT_TRUE(result.waitedMs >= kStaleIdleGraceMs);
-    ASSERT_TRUE(result.waitedMs <= kStaleIdleGraceMs + 5);
+    ASSERT_TRUE(result.waitedMs <= kStaleIdleGraceMs + 2);
+}
+
+// adversary r3 pass 3 A1 (Dot's witness): stillDrawing stays true; nowUs from 0; pumps return at 1000, 50100 and 51100 us
+// (then 1000 apart); the renderer holds its mutex from 50100 to 50150 us. r3's sample WAITED for that mutex (50 us, under
+// kBlockedSampleUs), reported idle and kept the credit from 1000 us, so the flag was stale-cleared at 51.1 ms. The sample
+// is now probeIdleWithoutWaiting on the renderer mutex: it reports busy at 50100 us without waiting, the run reopens at
+// 51100 us, and the stale clear needs t >= 101.1 ms (a fresh grace from the hold, never less than 100.15 ms).
+namespace
+{
+
+// Holds a real QMutex on another thread (the renderer) until release(); joins on destruction so no test path leaks it.
+struct HeldRendererMutex
+{
+    QMutex &mutex;
+    std::thread holder;
+    std::atomic<bool> locked{false};
+    std::atomic<bool> releaseNow{false};
+    std::function<void()> beforeUnlock;
+
+    explicit HeldRendererMutex(QMutex &m) : mutex(m) {}
+    // Locks on the holder thread and returns once it is held; the holder frees it after maxHold or at join().
+    void hold(std::function<void()> onRelease, std::chrono::milliseconds maxHold)
+    {
+        beforeUnlock = std::move(onRelease);
+        holder = std::thread([this, maxHold]() {
+            mutex.lock();
+            locked.store(true);
+            const auto until = std::chrono::steady_clock::now() + maxHold;
+            while (!releaseNow.load() && std::chrono::steady_clock::now() < until)
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            if (beforeUnlock) beforeUnlock();
+            mutex.unlock();
+        });
+        while (!locked.load()) std::this_thread::yield();
+    }
+    void join()
+    {
+        releaseNow.store(true);
+        if (holder.joinable()) holder.join();
+    }
+    ~HeldRendererMutex() { join(); }
+};
+
+} // namespace
+
+TEST(ResizeStillDrawingWait, AShortRendererMutexHoldEndsTheIdleRunDotWitness)
+{
+    QMutex rendererMutex;
+    HeldRendererMutex renderer(rendererMutex);
+    std::atomic<std::int64_t> tUs{0};
+    bool flag = true;
+    int pumps = 0;
+    int clears = 0;
+    Callbacks c;
+    c.stillDrawing = [&flag]() { return flag; };
+    c.pump = [&]() {
+        ++pumps;
+        if (pumps == 1) tUs = 1000;
+        else if (pumps == 2)
+        {
+            tUs = 50100;
+            // the renderer takes its mutex at 50100 us and frees it at 50150 us (at pump 3, or after 1 s of real time,
+            // which is what the waiting RED stub sat through)
+            renderer.hold([&tUs]() { tUs = 50150; }, std::chrono::milliseconds(1000));
+        }
+        else if (pumps == 3) { renderer.join(); tUs = 51100; }
+        else tUs += 1000;
+    };
+    c.renderIdle = [&rendererMutex]() {
+        return resize_still_drawing_wait::probeIdleWithoutWaiting(rendererMutex, []() { return true; });
+    };
+    c.clearStale = [&flag, &clears]() { ++clears; flag = false; };
+    c.nowMs = [&tUs]() { return tUs.load() / 1000; };
+    c.nowUs = [&tUs]() { return tUs.load(); };
+    const Result result = wait(c);
+    renderer.join();
+    ASSERT_TRUE(result.outcome == Outcome::StaleCleared);
+    ASSERT_EQ(1, clears);
+    ASSERT_TRUE(result.waitedMs >= 100); // never the 51 ms stale clear r3 made
+    ASSERT_TRUE(result.waitedMs <= 102);
+}
+
+// The probe itself, on a real mutex held by another thread: busy at once, the idle decision never runs, and it never
+// waits for the holder (the RED stub, like r3's sample, waited the full 500 ms hold and then reported idle). Once the
+// mutex is free the probe takes it, returns the decision, and leaves it unlocked.
+TEST(ResizeStillDrawingWait, TheProbeReportsAHeldRendererMutexBusyWithoutWaiting)
+{
+    QMutex rendererMutex;
+    int decisions = 0;
+    const auto decide = [&decisions]() { ++decisions; return true; };
+    {
+        HeldRendererMutex renderer(rendererMutex);
+        renderer.hold(nullptr, std::chrono::milliseconds(500));
+        const auto t0 = std::chrono::steady_clock::now();
+        const bool idle = resize_still_drawing_wait::probeIdleWithoutWaiting(rendererMutex, decide);
+        const auto spentMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - t0).count();
+        ASSERT_FALSE(idle);
+        ASSERT_EQ(0, decisions);
+        ASSERT_TRUE(spentMs < 100);
+    }
+    ASSERT_TRUE(resize_still_drawing_wait::probeIdleWithoutWaiting(rendererMutex, decide));
+    ASSERT_EQ(1, decisions);
+    ASSERT_TRUE(rendererMutex.tryLock()); // the probe released it
+    rendererMutex.unlock();
+}
+
+// No duration threshold is left for a sample: the class of A1 (a contended wait shorter than the threshold) is gone.
+TEST(ResizeStillDrawingWaitWiring, TheWaitHasNoSampleDurationThreshold)
+{
+    const QString header = readRepoFile(QStringLiteral("platform/qt/ResizeStillDrawingWait.h"));
+    ASSERT_FALSE(header.isEmpty());
+    ASSERT_FALSE(header.contains(QStringLiteral("kBlockedSampleUs")));
+    ASSERT_TRUE(header.contains(QStringLiteral("if( !rendererMutex.tryLock() ) return false;")));
+}
+
+// The site's sample is the non-waiting probe on the renderer mutex (both resizeEvent sites share it), and every other
+// isIdle() / renderThreadBusyForPlaybackAdvance() caller keeps its blocking read unchanged.
+TEST(ResizeStillDrawingWaitWiring, TheSiteSampleNeverWaitsForTheRendererMutexAndOtherIdleReadersAreUnchanged)
+{
+    const QString source = readRepoFile(QStringLiteral("platform/qt/MainWindow.cpp"));
+    const QString body = functionBody(source,
+        QStringLiteral("MainWindow::waitForResizeStillDrawing( const QString &site )"),
+        QStringLiteral("//Window resized -> scale picture"));
+    ASSERT_FALSE(body.isEmpty());
+    ASSERT_TRUE(body.contains(QStringLiteral(
+        "callbacks.renderIdle = [this]() { return renderThreadIdleNoWait( currentPlaybackAdvanceTarget() ); };")));
+    ASSERT_FALSE(body.contains(QStringLiteral("renderThreadBusyForPlaybackAdvance")));
+
+    const QString noWait = functionBody(source,
+        QStringLiteral("bool MainWindow::renderThreadIdleNoWait( int activePlaybackTarget )"),
+        QStringLiteral("\n}"));
+    ASSERT_FALSE(noWait.isEmpty());
+    ASSERT_TRUE(noWait.contains(QStringLiteral("m_pRenderThread->isIdleExceptPlaybackLookaheadNoWait(")));
+    ASSERT_TRUE(noWait.contains(QStringLiteral("return m_pRenderThread->isIdleNoWait();")));
+    const QString busy = functionBody(source,
+        QStringLiteral("bool MainWindow::renderThreadBusyForPlaybackAdvance( int activePlaybackTarget )"),
+        QStringLiteral("\n}"));
+    ASSERT_TRUE(busy.contains(QStringLiteral("return !m_pRenderThread->isIdleExceptPlaybackLookahead(")));
+    ASSERT_TRUE(busy.contains(QStringLiteral("return !m_pRenderThread->isIdle();")));
+    ASSERT_FALSE(busy.contains(QStringLiteral("NoWait")));
+
+    const QString rft = readRepoFile(QStringLiteral("platform/qt/RenderFrameThread.cpp"));
+    ASSERT_FALSE(rft.isEmpty());
+    const QString isIdle = functionBody(rft, QStringLiteral("bool RenderFrameThread::isIdle()"), QStringLiteral("\n}"));
+    ASSERT_TRUE(isIdle.contains(QStringLiteral("QMutexLocker locker(&m_mutex);")));
+    const QString lookahead = functionBody(rft,
+        QStringLiteral("bool RenderFrameThread::isIdleExceptPlaybackLookahead( int activePlaybackTarget,"),
+        QStringLiteral("\n}"));
+    ASSERT_TRUE(lookahead.contains(QStringLiteral("QMutexLocker locker(&m_mutex);")));
+    const QString idleNoWait = functionBody(rft, QStringLiteral("bool RenderFrameThread::isIdleNoWait()"),
+        QStringLiteral("\n}"));
+    ASSERT_TRUE(idleNoWait.contains(QStringLiteral("resize_still_drawing_wait::probeIdleWithoutWaiting( m_mutex,")));
+    ASSERT_FALSE(idleNoWait.contains(QStringLiteral("QMutexLocker")));
+    const QString lookaheadNoWait = functionBody(rft,
+        QStringLiteral("bool RenderFrameThread::isIdleExceptPlaybackLookaheadNoWait( int activePlaybackTarget,"),
+        QStringLiteral("\n}"));
+    ASSERT_TRUE(lookaheadNoWait.contains(QStringLiteral("resize_still_drawing_wait::probeIdleWithoutWaiting( m_mutex,")));
+    ASSERT_FALSE(lookaheadNoWait.contains(QStringLiteral("QMutexLocker")));
 }
 
 TEST(ResizeStillDrawingWaitWiring, TheSiteWaitFeedsTheHelperAMicrosecondClock)
@@ -594,7 +757,7 @@ TEST(ResizeStillDrawingWaitWiring, TheSiteWaitUsesTheBoundedHelperAndLogsAlwaysO
         QStringLiteral("//Window resized -> scale picture"));
     ASSERT_FALSE(body.isEmpty());
     ASSERT_TRUE(body.contains(QStringLiteral("resize_still_drawing_wait::wait(")));
-    ASSERT_TRUE(body.contains(QStringLiteral("!renderThreadBusyForPlaybackAdvance( currentPlaybackAdvanceTarget() )")));
+    ASSERT_TRUE(body.contains(QStringLiteral("renderThreadIdleNoWait( currentPlaybackAdvanceTarget() )")));
     // adversary r1 A1: the pump defers user input, so a shortcut (Ctrl+I's file dialog) cannot open a nested modal loop
     // inside the bounded wait; the input is delivered by the next unfiltered event loop pass, not dropped
     ASSERT_TRUE(body.contains(QStringLiteral("qApp->processEvents( QEventLoop::ExcludeUserInputEvents );")));
