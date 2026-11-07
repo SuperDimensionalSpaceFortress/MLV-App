@@ -247,6 +247,59 @@ TEST(ResizeStillDrawingWait, TimeBlockedInsideRenderIdleIsNotCountedAsIdleGrace)
     ASSERT_TRUE(result.waitedMs <= 105 + kStaleIdleGraceMs + world.stepMs);
 }
 
+// adversary r2 A1: the same rule once an idle run is already open. renderIdle() reports idle every time but blocks 100 ms
+// on its SECOND call; that blocked time must not be credited to the run, so the grace still needs 50 ms of unblocked
+// time after it.
+TEST(ResizeStillDrawingWait, TimeBlockedInsideALaterRenderIdleSampleIsNotCountedAsIdleGrace)
+{
+    FakeWorld world;
+    Callbacks c = world.callbacks();
+    c.renderIdle = [&world]() {
+        if (world.renderIdleCalls++ == 1) world.nowMs += 100;
+        return true;
+    };
+    const Result result = wait(c);
+    ASSERT_TRUE(result.outcome == Outcome::StaleCleared);
+    ASSERT_EQ(1, world.clearStaleCalls);
+    // run opens at t=5; sample 2 blocks t=10 -> 110 (not idle credit): 50 ms of credit is reached at t=155
+    ASSERT_TRUE(result.waitedMs >= 155);
+    ASSERT_TRUE(result.waitedMs <= 155 + world.stepMs);
+}
+
+// adversary r2 A2: an OLDER request (serial 100, still preparing during the resize) can land after the re-anchor is armed
+// and consume m_zoomModeChanged on the old scene; the frame the resize asked for (101) then lands with no re-anchor.
+// The re-anchor carries a request-serial floor taken where it is armed (before drawFrame() at the resize site), and
+// finishPresentedFrame consumes it only for a frame requested at or after that floor. Every arm site sets the floor.
+TEST(ResizeStillDrawingWaitWiring, TheGradientReanchorIsConsumedOnlyByAFrameRequestedAfterItWasArmed)
+{
+    const QString source = readRepoFile(QStringLiteral("platform/qt/MainWindow.cpp"));
+    ASSERT_FALSE(source.isEmpty());
+    const QString header = readRepoFile(QStringLiteral("platform/qt/MainWindow.h"));
+    ASSERT_TRUE(header.contains(QStringLiteral("uint64_t m_gradientReanchorSerialFloor = 0;")));
+
+    const QString body = resizeEventBody();
+    ASSERT_FALSE(body.isEmpty());
+    const int floorAt = body.indexOf(QStringLiteral(
+        "const uint64_t gradientReanchorSerialFloor = m_nextRenderRequestSerial;"));
+    const int drawAt = body.indexOf(QStringLiteral("drawFrame();"));
+    const int armAt = body.indexOf(QStringLiteral("m_gradientReanchorSerialFloor = gradientReanchorSerialFloor;"));
+    const int gradientIf = body.indexOf(QStringLiteral("if( waitForResizeStillDrawing( QStringLiteral(\"gradient\") ) )"));
+    ASSERT_TRUE(floorAt >= 0);
+    ASSERT_TRUE(drawAt > floorAt);
+    ASSERT_TRUE(armAt > gradientIf);
+
+    // every arm of the re-anchor sets its floor
+    ASSERT_EQ(source.count(QStringLiteral("m_zoomModeChanged = true;")),
+              source.count(QStringLiteral("m_gradientReanchorSerialFloor = ")));
+
+    const QString finish = functionBody(source,
+        QStringLiteral("void MainWindow::finishPresentedFrame( uint64_t displayFrame,"),
+        QStringLiteral("\nvoid MainWindow::"));
+    ASSERT_FALSE(finish.isEmpty());
+    ASSERT_TRUE(finish.contains(QStringLiteral(
+        "readyFrame.requestSerial >= m_gradientReanchorSerialFloor")));
+}
+
 // adversary r1 re-pass A1: a handler the pump dispatches (Updater::getReleaseList's processEvents() loop) can run its
 // own unfiltered nested loop, which admits Ctrl+I's modal dialog: no synchronous pump can bound that. The contract is
 // therefore stated as what it is (zero pumps after the deadline; one pump's duration is the caller's), never as
@@ -355,7 +408,7 @@ TEST(ResizeStillDrawingWaitWiring, AGradientSiteTimeoutDefersTheRedrawToTheLande
         QStringLiteral("void MainWindow::finishPresentedFrame( uint64_t displayFrame,"),
         QStringLiteral("\nvoid MainWindow::"));
     ASSERT_FALSE(finish.isEmpty());
-    const int consumeAt = finish.indexOf(QStringLiteral("if( m_zoomModeChanged )"));
+    const int consumeAt = finish.indexOf(QStringLiteral("if( m_zoomModeChanged"));
     ASSERT_TRUE(consumeAt >= 0);
     const QString consume = finish.mid(consumeAt, 400);
     ASSERT_TRUE(consume.contains(QStringLiteral("m_zoomModeChanged = false;")));
