@@ -851,6 +851,61 @@ class VerdictOnText(unittest.TestCase):
         self.assertTrue(rmv.parse_run(cut).failures)
         self.assertNotEqual(rmv.parse_run(cut).mismatch, "")
 
+
+    # ---- r8 adversary A1: the terminal result is the LAST line of the run, not any result-shaped line --------------
+    def test_adversary_a1_a_result_shaped_line_inside_the_run_is_not_the_terminal_result(self) -> None:
+        # Sol's input: a real unittest log cut inside its second failure header. `FAILED (failures=1)` sits MID-text (a
+        # failing test printed it, or a trailer from another run was pasted in), no `Ran N tests` footer exists, and the
+        # complete log holds an ImportError, so a PASS here is wrong.
+        rule, dash = "=" * 70, "-" * 70
+        cut = ("FF\n" + rule + "\nFAIL: test_a (test_attack.T.test_a)\n" + dash + "\nTraceback (most recent call last):\n"
+               '  File "test_attack.py", line 4, in test_a\nAssertionError: bad\nFAILED (failures=1)\n\n'
+               + rule + "\nFAIL: test_b (test_attack.T.test_b)\n")
+        for want in ("test_attack.T.test_a", "test_attack.py:4"):
+            status, reason = rmv.verdict(cut, want)
+            self.assertEqual(status, rmv.REFUSED, f"{want}: {reason}")
+            self.assertIn("COULD-NOT-CHECK", reason)
+            self.assertIn("result line", reason)
+
+    def test_adversary_a1_a_unittest_trailer_without_its_ran_footer_is_not_terminal(self) -> None:
+        block = ("=" * 70 + "\nFAIL: test_a (test_x.T.test_a)\n" + "-" * 70
+                 + '\nTraceback (most recent call last):\n  File "test_x.py", line 5, in test_a\n'
+                 "    self.assertEqual(1, 2)\nAssertionError: 1 != 2\n")
+        status, reason = rmv.verdict(block + "\nFAILED (failures=1)\n", "test_x.py:5")
+        self.assertEqual(status, rmv.REFUSED, reason)
+        self.assertIn("result line", reason)
+        self.assertEqual(rmv.verdict(block + "\nRan 1 test in 0.0s\n\nFAILED (failures=1)\n", "test_x.py:5")[0], rmv.PASS)
+        # the trailer must also be the last thing in the run
+        status, reason = rmv.verdict(block + "\nRan 1 test in 0.0s\n\nFAILED (failures=1)\nmore text\n", "test_x.py:5")
+        self.assertEqual(status, rmv.REFUSED, reason)
+        self.assertIn("result line", reason)
+
+    def test_adversary_a1_a_pytest_bar_inside_the_run_is_not_the_terminal_result(self) -> None:
+        cut = ("=== FAILURES ===\n___ test_x ___\nE assert False\nt.py:2: AssertionError\n"
+               "=== 1 failed in 0.1s ===\n___ test_y ___\nE import error cut here\n")
+        status, reason = rmv.verdict(cut, "t.py:2")
+        self.assertEqual(status, rmv.REFUSED, reason)
+        self.assertIn("COULD-NOT-CHECK", reason)
+        self.assertIn("result line", reason)
+        complete = "=== FAILURES ===\n___ test_x ___\nE assert False\nt.py:2: AssertionError\n=== 1 failed in 0.1s ===\n"
+        self.assertEqual(rmv.verdict(complete, "t.py:2")[0], rmv.PASS)
+
+    # ---- r8 adversary A2: a header too long to read is refused at once, not parsed in quadratic time ---------------
+    def test_adversary_a2_an_overlong_subtest_header_is_could_not_check_in_bounded_time(self) -> None:
+        import time
+        rest = "test_x (t.T.test_x) (rows=[" + ", ".join(f"({i}, {i + 1})" for i in range(24000)) + "])"
+        block = ("=" * 70 + "\nFAIL: " + rest + "\n" + "-" * 70
+                 + '\nTraceback (most recent call last):\n  File "t.py", line 5, in test_x\n'
+                 "    self.assertEqual(1, 2)\nAssertionError: 1 != 2\n\nRan 1 test in 0.0s\n\nFAILED (failures=1)\n")
+        started = time.perf_counter()
+        status, reason = rmv.verdict(block, "t.py:5")
+        self.assertLess(time.perf_counter() - started, 2.0)
+        self.assertEqual(status, rmv.REFUSED, reason)
+        self.assertIn("COULD-NOT-CHECK", reason)
+        self.assertIn("header", reason)
+        short = block.replace(rest, "test_x (t.T.test_x) (rows=[(0, 1), (1, 2)])")  # an ordinary subTest header still reads
+        self.assertEqual(rmv.verdict(short, "t.py:5")[0], rmv.PASS)
+
     def test_a_long_subtest_header_is_read_in_linear_time(self) -> None:
         # opus r7 RMV-UT-IDENTITIES-SCALING-1: every ' (' x ')' pair was tried with a slice copy each.
         import time
