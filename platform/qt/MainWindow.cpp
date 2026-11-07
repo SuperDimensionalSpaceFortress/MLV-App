@@ -1617,6 +1617,7 @@ static bool lookAssistProcessedFloorLiftedPostInvalidShouldFailClosed(
 #include "PlaybackQualityPolicy.h"
 #include "PlaybackScaling.h"
 #include "PlaybackSwapInterval.h"
+#include "LookLabelPolicy.h"
 #include "ZebraThresholds.h"
 #include "batch/WorkerThreadCount.h"
 #include "ExportSettingsDialog.h"
@@ -9220,6 +9221,8 @@ int MainWindow::runGuiPlaybackSmoke(const GuiPlaybackSmokeOptions & options)
         m_lastLookAssistDiagnosticsValid = false;
         m_lookAssistApplied.clear();
         m_lookAssistFlavorOutcome.clear();
+        ++m_lookLabelSlidersApplied;   // r18 (adversary r17 dc21c1c9 A1): forced Off is a regrade, so the kept label is re-derived
+        updateLookLabel();
     };
 
     m_gpuPreviewProcessingBackendRequest = options.gpuPreviewProcessingBackend;
@@ -9904,6 +9907,31 @@ int MainWindow::runGuiPlaybackSmoke(const GuiPlaybackSmokeOptions & options)
     {
         return logFullscreenSmokeFailure(
             windowedSmoke ? "windowed_placement_not_verified" : "fullscreen_not_verified" );
+    }
+
+    // LOOK-FULLSCREEN-PARITY-1: the look label the screen actually shows (the receipt's lookLabelShown), read back
+    // from the surface that drew it -- not the text it was asked to draw. Bounded wait for the first paint after the
+    // placement above, before the timed Play.
+    {
+        updateLookLabel();
+        QString lookLabelSurface;
+        QString lookLabelShown = lookLabelShownText( &lookLabelSurface );
+        QElapsedTimer lookLabelClock;
+        lookLabelClock.start();
+        while( lookLabelShown != m_lookLabelText && lookLabelSurface != QStringLiteral("none")
+               && lookLabelClock.elapsed() < 1000 )
+        {
+            qApp->processEvents( QEventLoop::AllEvents );
+            sleepGuiThreadForSmokeRunner( 5 );   // master: every runner sleep is accounted apart from GUI busy
+            lookLabelShown = lookLabelShownText( &lookLabelSurface );
+        }
+        qInfo().noquote()
+            << QStringLiteral( "gui_smoke.look_label shown=\"%1\" expected=\"%2\" surface=%3 show_in_fullscreen=%4 wait_ms=%5" )
+                   .arg( lookLabelShown )
+                   .arg( m_lookLabelText )
+                   .arg( lookLabelSurface )
+                   .arg( bool01( m_lookLabelShowInFullscreen ) )
+                   .arg( lookLabelClock.elapsed() );
     }
 
     const qint64 preambleMs = preambleClock.elapsed();
@@ -11626,6 +11654,7 @@ int MainWindow::openMlvForPreview(QString fileName)
     //Raw black & white level (needed for preview picture)
     initRawBlackAndWhite();
 
+    recordLoadedClipReceipt( fileName );
     m_loadedClipFileName = fileName;
     markClipOpenSucceeded();
     return MLV_ERR_NONE;
@@ -12074,6 +12103,7 @@ int MainWindow::openMlv( QString fileName )
 
     m_frameChanged = true;
 
+    recordLoadedClipReceipt( fileName );
     m_loadedClipFileName = fileName;
     markClipOpenSucceeded();
     return MLV_ERR_NONE;
@@ -12765,6 +12795,19 @@ void MainWindow::initGui( void )
     m_pChosenDebayer->setText( tr( "AMaZE" ) );
     m_pChosenDebayer->setToolTip( tr( "Current debayer algorithm." ) );
     statusBar()->addWidget( m_pChosenDebayer );
+
+    //LOOK-FULLSCREEN-PARITY-1: the current look, windowed (fullscreen draws it in the preview's corner)
+    m_pLookLabelStatus = new QLabel( statusBar() );
+    m_pLookLabelStatus->setObjectName( QStringLiteral( "lookLabelStatus" ) );
+    m_pLookLabelStatus->setMinimumWidth( 120 );
+    m_pLookLabelStatus->setText( look_label::text( /*lookAssistEnabled=*/false, QString() ) );
+    m_pLookLabelStatus->setToolTip( tr( "Current Look Assist look." ) );
+    // r12 (adversary r12 A2): permanent, because QStatusBar hides a normal widget during a message and the GPU device-loss
+    // notice is a showMessage( text, 0 ) that never times out. The owner wants the look visible whenever windowed.
+    statusBar()->addPermanentWidget( m_pLookLabelStatus );
+    m_lookLabelText = m_pLookLabelStatus->text();
+    // Every way the checkbox changes without a click handler (a receipt, closing the clip) still updates the label.
+    connect( ui->checkBoxLookAssistEnable, &QCheckBox::toggled, this, [this]( bool ) { updateLookLabel(); } );
 
     //Phase 4E: Set up playback-quality status indicator. Tooltip-described
     //and toggleable via the Playback menu.
@@ -16169,6 +16212,18 @@ void MainWindow::setSliders(ReceiptSettings *receipt, bool paste)
     }
     invalidateGpuPreviewProcessingConfigCache();
     m_setSliders = true;
+    ++m_lookLabelSlidersApplied;   // r16 (adversary r15 1834b72e A1): a regrade, so a kept look label re-derives (sameGrade)
+    // r16 (adversary r16 39d1a995 A1): the active row's receipt applied to the attached sliders grades the loaded clip, even
+    // while another row owns it (a paste onto B in addFileToSession's pump), so the label reads it, with its switch recorded --
+    // on every apply (adversary r16 2200ebe1 A1: a second paste onto the key kept the first paste's switch).
+    if( m_fileLoaded && SESSION_CLIP_COUNT > 0 && SESSION_ACTIVE_CLIP_ROW >= 0
+     && look_label::slidersSetAppliedKey( receipt, ACTIVE_RECEIPT, m_lookLabelAppliedReceipt ) )
+    {
+        m_lookLabelAppliedReceipt = receipt;
+        m_lookLabelAppliedCloneLookAssist = receipt->lookAssistEnabled();
+    }
+    // r17 (adversary r16 efd170f4 A1): the key as this apply wrote it, re-asserted below once the modal work has returned.
+    const void *const lookLabelKeyAfterEarlyWrite = m_lookLabelAppliedReceipt;
     ui->horizontalSliderExposure->setValue( receipt->exposure() );
     ui->horizontalSliderContrast->setValue( receipt->contrast() );
     ui->horizontalSliderPivot->setValue( receipt->pivot() );
@@ -16619,11 +16674,25 @@ void MainWindow::setSliders(ReceiptSettings *receipt, bool paste)
     ui->checkBoxVidstabTripod->setChecked( receipt->vidStabTripod() );
     on_checkBoxVidstabTripod_toggled( receipt->vidStabTripod() );
 
+    // r17 (adversary r16 efd170f4 A1): every modal above has returned (the dark-frame dialogs at lineEditDarkFrameFile and the LUT
+    // error dialog at lineEditLutName, via setText's signal and the direct call). A same-path FileOpen in their event pump opened
+    // another row, which made itself the key; these sliders are what is on screen now, so the key (and its switch) is this
+    // receipt again before the relabel and the baseline mark below read it. Nothing from here to the mark pumps events.
+    if( look_label::slidersReassertsKeyAfterModal( receipt, lookLabelKeyAfterEarlyWrite,
+                                                   ( SESSION_CLIP_COUNT > 0 && SESSION_ACTIVE_CLIP_ROW >= 0 ) ? ACTIVE_RECEIPT : nullptr ) )
+    {
+        m_lookLabelAppliedReceipt = receipt;
+        m_lookLabelAppliedCloneLookAssist = receipt->lookAssistEnabled();
+    }
+
     {
         const bool lookAssistEnabled = receipt->lookAssistEnabled();
         QSignalBlocker lookAssistBlocker( ui->checkBoxLookAssistEnable );
         ui->checkBoxLookAssistEnable->setEnabled( m_fileLoaded );
         ui->checkBoxLookAssistEnable->setChecked( lookAssistEnabled );
+        // r18 (adversary r17 dc21c1c9 A1): the selector now shows this receipt's switch. A relabel inside the work above (a nested
+        // open in a dialog's pump) read the old selector at the same count, so this write is a regrade too.
+        ++m_lookLabelSlidersApplied;
         {
             // The receipt's element through the one shared rule: an unknown value is Classic plus a warning (never the
             // selector's previous value, which could be Cinematic), and the receipt is corrected to what is applied.
@@ -16652,6 +16721,7 @@ void MainWindow::setSliders(ReceiptSettings *receipt, bool paste)
                 ui->comboBoxLookAssistFlavor->setCurrentIndex( flavorIndex );
             }
         }
+        updateLookLabel();   // both signals were blocked above
         logInteractionEvent(
             QStringLiteral("look_assist.setSliders.begin"),
             QStringLiteral("enabled=%1 file_loaded=%2 baseline_valid=%3 receipt_exp=%4 receipt_contrast=%5 receipt_pivot=%6 receipt_temp=%7 receipt_tint=%8 raw_black=%9 raw_white=%10 frame=%11")
@@ -16681,12 +16751,31 @@ void MainWindow::setSliders(ReceiptSettings *receipt, bool paste)
         && receipt->lookAssistEnabled();
 
     m_lastLookAssistDiagnosticsValid = false;
+    // LOOK-FULLSCREEN-PARITY-1 r11 (adversary r10 A1 on 0b840efd): the baseline goes back below, so the screen shows the
+    // baseline. The label must not keep naming the flavor that landed before.
+    // r10 (key3 r9 B1 on 2b748fa3): marked whenever the loaded clip's receipt has its baseline restored or captured (r14: the
+    // receipt applied to the loaded clip, not the active row's), NOT only when the
+    // de-dupe marker names this receipt -- that marker moves to a clip whose analysis skips before begin() (empty_stats)
+    // while the outcome stays here. The mark is the outcome's (keyed by this receipt), so the next landing forgets it
+    // (sol + fable r9: an async result already in flight when this runs must still be named when it lands).
+    bool baselineRestoredUngraded = false;
     if( m_fileLoaded && receipt->lookAssistEnabled() )
     {
         if( receipt->lookAssistBaselineValid() )
+        {
             restoreLookAssistBaseline( receipt );
+        }
         else
+        {
+            // r13 (adversary r12 A1 on 6d722d33): Reset Receipt (defaults: enabled, baseline invalid) captures the reset
+            // sliders as the baseline -- the same: ungraded until an analysis lands.
             captureLookAssistBaseline( receipt );
+        }
+        // Before the apply block: a grade applied right below lands (landed() forgets the mark) and is named.
+        // r14 (sol r13 B1 on cc76ab62): keyed on the receipt restored here being the one applied to the loaded clip, never on
+        // the active row -- a nested FileOpen can leave a duplicate-path row active while this receipt's baseline goes back.
+        baselineRestoredUngraded = look_label::restoreMarksBaseline( receipt, m_lookLabelAppliedReceipt, activeReceiptAtLoad );
+        if( baselineRestoredUngraded ) m_lookAssistFlavorOutcome.baselineRestored( receipt );
 
         if( !deferLookAssistUntilBaselineFrame
          && !m_lookAssistApplied.isApplied( receipt ) )
@@ -16700,6 +16789,13 @@ void MainWindow::setSliders(ReceiptSettings *receipt, bool paste)
     {
         restoreLookAssistBaseline( receipt );
         syncLookAssistDerivedUiToReceipt( receipt );
+    }
+    // r11: only for the receipt the label reads (r14: the one applied to the loaded clip). r12 (adversary r11 A1 on 4337dad4): LABEL ONLY -- the
+    // reported outcome is untouched, because setReceipt saves it as the receipt's flavor (receiptValue: "classic" after a
+    // fallback); clearing it would save the selector's flavor over the baseline sliders. r10: the next landed() forgets the mark.
+    if( baselineRestoredUngraded )
+    {
+        updateLookLabel();   // the baseline is back: "Look: Baseline" until an analysis lands on this receipt
     }
 
     logInteractionEvent(
@@ -17047,6 +17143,24 @@ void MainWindow::drainLookAssistWorkers( const char *reason )
         QStringLiteral("reason=%1 waited_ms=%2")
             .arg( QString::fromLatin1( reason ) )
             .arg( ( mlv_stage_timing_now() - drain_start ) * 1000.0, 0, 'f', 1 ) );
+}
+
+/* LOOK-FULLSCREEN-PARITY-1 r15 (sol r14 B1): turning Look Assist off on the receipt an async analysis was dispatched for
+ * invalidates that analysis, so its worker stops early and its queued result is dropped at the generation check. Called by
+ * the three disable paths: the switch, a disabled paste (replaceReceipt) and a reset to a disabled default. The delivery
+ * check (look_label::asyncResultLands) still decides on its own, for any path that turns it off without coming here. */
+void MainWindow::invalidateLookAssistAsyncOnDisable( ReceiptSettings *receipt, const char *reason )
+{
+    if( !look_label::disableInvalidatesAsync( receipt, receipt && receipt->lookAssistEnabled(), m_lookAssistAsyncTarget ) )
+        return;
+    const int generation = ++m_lookAssistAsyncGeneration;
+    m_lookAssistAsyncTarget = nullptr;
+    // Adversary r15 (2b8e79d8) A1: the invalidated worker may take its pre-render early-out, which queues nothing, so no
+    // dropped callback would clear the de-dupe marker set at dispatch; a later toggle-on then dedup_skipped and the receipt was
+    // never analysed again. Nothing landed, so the marker is released here, for every disable path.
+    m_lookAssistApplied.clearIf( receipt );
+    logInteractionEvent( QStringLiteral("look_assist.async_invalidated"),
+                         QStringLiteral("reason=%1 generation=%2").arg( QString::fromLatin1( reason ) ).arg( generation ) );
 }
 
 // LOOK-ASSIST-CLIP-OPEN-GUI-BLOCK-1: the first-frame analysis, with the GUI thread pumping through its heavy calls. The
@@ -17450,6 +17564,8 @@ void MainWindow::applyLookAssistToReceipt( ReceiptSettings *receipt,
     }
     const LookAssistFlavor flavor = currentLookAssistFlavor();
     m_lookAssistFlavorOutcome.begin();   // reported (telemetry, receipt) only once this analysis lands
+    // r10: begin() keeps a setSliders baseline mark (the baseline stays on screen until this lands); landed() forgets it.
+    // No updateLookLabel() here on purpose: the previous look is still on screen, so its label stays until this lands.
     // Observation only: how the verdict and balance were reached, appended to look_assist.apply.result.
     LookAssistDecisionTrace decisionTrace;
     decisionTrace.pictureEvidenceAsked = !s_lookAssistMasterScenePass;
@@ -17607,6 +17723,7 @@ void MainWindow::applyLookAssistToReceipt( ReceiptSettings *receipt,
 
         // Bump generation so a stale worker result from a previous clip is discarded.
         const int dispatchGeneration = ++m_lookAssistAsyncGeneration;
+        m_lookAssistAsyncTarget = receipt;   // r15: a disable of this receipt invalidates this analysis
 
         // Capture by value for the worker lambda.
         mlvObject_t *mlvObj = m_pMlvObject;
@@ -17985,6 +18102,36 @@ void MainWindow::applyLookAssistToReceipt( ReceiptSettings *receipt,
                     m_lookAssistApplied.clearIf( receipt );
                     return;
                 }
+                // LOOK-FULLSCREEN-PARITY-1 r14 (adversary r14 2c5a92ed A1): the result grades only the receipt it analysed. An export
+                // clone's analysis landing here would grade the active row's receipt, whose own switch may be off, and the label
+                // could name neither. Dropped like a stale generation: the marker is cleared so the next trigger analyses again.
+                if( receipt != activeReceipt )
+                {
+                    m_lookAssistApplied.clearIf( receipt );
+                    logInteractionEvent( QStringLiteral("look_assist.apply.async_dropped"),
+                                         QStringLiteral("reason=analysed_receipt_not_active generation=%1").arg( dispatchGeneration ) );
+                    return;
+                }
+                // LOOK-FULLSCREEN-PARITY-1 r15 (sol r14 B1, catalogue L-08): applied only while Look Assist is on for this receipt AT
+                // DELIVERY. Turned off since dispatch (switch, disabled paste, disabled-default reset, automation receipt), the baseline is
+                // back and the label reads "Look: Off"; landing now would put a grade under it. Dropped before any preset write, on all
+                // three landing branches below; the diagnostics written above are withdrawn, as the switch-off itself does.
+                if( !look_label::asyncResultLands( receipt, activeReceipt, activeReceipt->lookAssistEnabled() ) )
+                {
+                    m_lastLookAssistDiagnosticsValid = false;
+                    m_lookAssistApplied.clearIf( receipt );
+                    logInteractionEvent( QStringLiteral("look_assist.apply.async_dropped"),
+                                         QStringLiteral("reason=look_assist_off_at_delivery generation=%1").arg( dispatchGeneration ) );
+                    return;
+                }
+                // LOOK-FULLSCREEN-PARITY-1 r14 (adversary r14 0d87c82e A1): this result lands on activeReceipt and grades its sliders, so
+                // the label reads it there -- not under an export clone the job recorded as the key (the clone's own landings are the
+                // synchronous path's, on the receipt it analysed). Label only: nothing here changes the grade.
+                const auto labelFollowsLanding = [this, activeReceipt]()
+                {
+                    m_lookLabelAppliedReceipt = activeReceipt;
+                    m_lookLabelAppliedCloneLookAssist = false;   // activeReceipt's live switch decides
+                };
 
                 // Async has only pre-apply PROXY color stats here. The
                 // processed-floor-lifted-awb-risk guard fires on those proxy
@@ -18013,7 +18160,9 @@ void MainWindow::applyLookAssistToReceipt( ReceiptSettings *receipt,
                         r.chromaSmoothAutoApplied );
                     m_lastLookAssistSafetyFallback = true;
                     m_lookAssistFlavorOutcome.landed( activeReceipt, r.flavorName, true );
+                    labelFollowsLanding();
                     activeReceipt->setLookAssistFlavor( m_lookAssistFlavorOutcome.receiptValue( activeReceipt, r.flavorName ) );
+                    updateLookLabel();   // L-04: the label names the applied look (the baseline), not the selected flavor
                     m_lastLookAssistExposure = activeReceipt->exposure();
                     m_lastLookAssistContrast = activeReceipt->contrast();
                     m_lastLookAssistPivot = activeReceipt->pivot();
@@ -18199,7 +18348,9 @@ void MainWindow::applyLookAssistToReceipt( ReceiptSettings *receipt,
                         r.chromaSmoothAutoApplied );
                     m_lastLookAssistSafetyFallback = true;
                     m_lookAssistFlavorOutcome.landed( activeReceipt, r.flavorName, true );
+                    labelFollowsLanding();
                     activeReceipt->setLookAssistFlavor( m_lookAssistFlavorOutcome.receiptValue( activeReceipt, r.flavorName ) );
+                    updateLookLabel();   // L-04: the label names the applied look (the baseline), not the selected flavor
                     m_lastLookAssistExposure = activeReceipt->exposure();
                     m_lastLookAssistContrast = activeReceipt->contrast();
                     m_lastLookAssistPivot = activeReceipt->pivot();
@@ -18235,6 +18386,8 @@ void MainWindow::applyLookAssistToReceipt( ReceiptSettings *receipt,
                 }
 
                 m_lookAssistFlavorOutcome.landed( activeReceipt, r.flavorName, false );
+                labelFollowsLanding();
+                updateLookLabel();   // the analysis landed: the label names the flavor applied
                 logInteractionEvent(
                     QStringLiteral("look_assist.apply.auto_wb_async_applied"),
                     QStringLiteral("generation=%1 valid=%2 source=%3 decision=%4 damping=%5 awb_temp=%6 awb_tint=%7 final_temp=%8 final_tint=%9 preset_exp=%10 frame=%11")
@@ -19102,9 +19255,11 @@ void MainWindow::applyLookAssistToReceipt( ReceiptSettings *receipt,
                 .arg( m_lastLookAssistPostGreenArtifactMeanAxis, 0, 'f', 3 )
                 .arg( m_lastLookAssistPostVisibleGreenAxis, 0, 'f', 3 ) );
         m_lastLookAssistSafetyFallback = true;
+        labelFollowsActiveSliders( receipt );   // r17 (adversary r17 4fcae002 A1): this landing grades the sliders
         // The baseline sliders are back: the receipt must not keep naming the selected (Cinematic) flavor over them.
         m_lookAssistFlavorOutcome.landed( receipt, lookAssistFlavorName( flavor ), true );
         receipt->setLookAssistFlavor( m_lookAssistFlavorOutcome.receiptValue( receipt, lookAssistFlavorName( flavor ) ) );
+        updateLookLabel();   // L-04: the label names the applied look (the baseline), not the selected flavor
         m_lastLookAssistExposure = receipt->exposure();
         m_lastLookAssistContrast = receipt->contrast();
         m_lastLookAssistPivot = receipt->pivot();
@@ -19122,8 +19277,10 @@ void MainWindow::applyLookAssistToReceipt( ReceiptSettings *receipt,
         return;
     }
 
+    labelFollowsActiveSliders( receipt );   // r17 (adversary r17 4fcae002 A1): this landing grades the sliders
     m_lookAssistFlavorOutcome.landed( receipt, lookAssistFlavorName( flavor ), false );
     receipt->setLookAssistFlavor( lookAssistFlavorName( flavor ) );
+    updateLookLabel();   // the analysis landed: the label names the flavor applied
     // grade= is appended after flavor=, and only for Film and Vision50d, so a Classic or Cinematic line stays byte-identical.
     // No '%' in it.
     const QString filmGradeLogTail = lookAssistFlavorLaysGradationCurve( flavor ) ? QStringLiteral(" grade=") + filmGrade : QString();
@@ -19435,6 +19592,7 @@ void MainWindow::replaceReceipt(ReceiptSettings *receiptTarget, ReceiptSettings 
     if( paste && cdui->checkBoxRawCorrectEnable->isChecked() )
     {
         receiptTarget->setLookAssistEnabled( receiptSource->lookAssistEnabled() );
+        invalidateLookAssistAsyncOnDisable( receiptTarget, "disabled_paste" );   // r15 (sol r14 B1): no-op unless pasted off
         receiptTarget->setLookAssistBaselineValid( receiptSource->lookAssistBaselineValid() );
         receiptTarget->setLookAssistBaselineExposure( receiptSource->lookAssistBaselineExposure() );
         receiptTarget->setLookAssistBaselineContrast( receiptSource->lookAssistBaselineContrast() );
@@ -19546,6 +19704,8 @@ int MainWindow::showFileInEditor(int row)
     }
     //Now set it was loaded once
     GET_RECEIPT( row )->setLoaded();
+    // r13 (adversary r13 63319bdb A1): this row's receipt is the one applied next, whatever row a nested FileOpen made active.
+    recordLoadedClipReceipt( m_loadedClipFileName, row );
     //Set sliders to receipt
     setSliders( GET_RECEIPT( row ), false );
 
@@ -22397,6 +22557,10 @@ void MainWindow::initPlaybackQualityFromSettings( void )
         ui->actionPlaybackShowQualityIndicator->setChecked( indicatorVisible );
     if ( ui->actionPlaybackVSync )
         ui->actionPlaybackVSync->setChecked( playbackVSyncFromSettings() );
+    m_lookLabelShowInFullscreen = look_label::showInFullscreenFromSettings();
+    if ( ui->actionShowLookLabelInFullscreen )
+        ui->actionShowLookLabelInFullscreen->setChecked( m_lookLabelShowInFullscreen );
+    updateLookLabel();
     applyPlaybackScopesMode( playbackScopesMode(), /*persist*/false );
     updatePhase3PlaybackQualityUi();
 
@@ -23558,6 +23722,14 @@ void MainWindow::on_actionPlaybackVSync_triggered()
     playbackVSyncWriteToSettings( ui->actionPlaybackVSync->isChecked() );
 }
 
+// LOOK-FULLSCREEN-PARITY-1: "Show Look Label in Fullscreen". Applies at once and persists.
+void MainWindow::on_actionShowLookLabelInFullscreen_triggered()
+{
+    m_lookLabelShowInFullscreen = ui->actionShowLookLabelInFullscreen->isChecked();
+    look_label::showInFullscreenWriteToSettings( m_lookLabelShowInFullscreen );
+    updateLookLabel();
+}
+
 // PLAYBACK-SCOPES-OPTION-1: "Scopes During Playback". Applies at once (the next presented frame and
 // the next policy read) and persists; in an automation run MLVAPP_PLAYBACK_SCOPES_DURING_PLAYBACK still wins
 // at the next start (PSO-01: an ordinary launch ignores it).
@@ -24038,6 +24210,7 @@ void MainWindow::on_actionResetReceipt_triggered()
     ACTIVE_RECEIPT->setLookAssistBaselineGradationCurve( receipt->lookAssistBaselineGradationCurve() );
     setReceipt( ACTIVE_RECEIPT );
     ACTIVE_RECEIPT->setLookAssistEnabled( resetLookAssistEnabled );
+    invalidateLookAssistAsyncOnDisable( ACTIVE_RECEIPT, "disabled_default_reset" );   // r15 (sol r14 B1): no-op unless the default is off
     if( resetLookAssistEnabled )
     {
         setSliders( ACTIVE_RECEIPT, false );
@@ -24567,7 +24740,22 @@ bool MainWindow::loadedClipIsRow( int row ) const
 {
     if( row < 0 || row >= SESSION_CLIP_COUNT || !m_fileLoaded || m_pMlvObject == nullptr || m_loadedClipFileName.isEmpty() )
         return false;
-    return m_loadedClipFileName == GET_CLIP( row )->getPath() || m_loadedClipFileName == GET_RECEIPT( row )->fileName();
+    // LOOK-FULLSCREEN-PARITY-1 r12 (adversary r12 A1): two rows can hold one path; the row the open recorded is the one loaded.
+    const bool rowHoldsPath = m_loadedClipFileName == GET_CLIP( row )->getPath() || m_loadedClipFileName == GET_RECEIPT( row )->fileName();
+    return loadedClipHeldByRow( rowHoldsPath, m_loadedClipReceipt != nullptr, GET_RECEIPT( row ) == m_loadedClipReceipt );
+}
+
+// Called where an open names the file it loaded: the active row when it holds that file, else the first row that does.
+// Both pointers are only ever compared, so a row removed later leaves nothing to read.
+// r13 (adversary r13 63319bdb A1): an opener that applies a known row's receipt next records again with that row, because a
+// FileOpen delivered in openMlv's event pump can move the active row to another row of the same path.
+void MainWindow::recordLoadedClipReceipt( const QString &fileName, int openerRow )
+{
+    const int openedRow = look_label::loadedClipOwnerRow( look_label::openRecordRow( openerRow, SESSION_ACTIVE_CLIP_ROW ), SESSION_CLIP_COUNT,
+        [this, &fileName]( int row ) { return fileName == GET_CLIP( row )->getPath() || fileName == GET_RECEIPT( row )->fileName(); } );
+    m_loadedClipReceipt = openedRow >= 0 ? GET_RECEIPT( openedRow ) : nullptr;
+    m_lookLabelAppliedReceipt = m_loadedClipReceipt;
+    m_lookLabelAppliedCloneLookAssist = false;   // the owner's live switch decides again
 }
 
 bool MainWindow::receiptOwnedByLoadedClip( const char *site )
@@ -24575,7 +24763,7 @@ bool MainWindow::receiptOwnedByLoadedClip( const char *site )
     const bool hasActiveReceipt = SESSION_CLIP_COUNT > 0 && SESSION_ACTIVE_CLIP_ROW >= 0
                                && SESSION_ACTIVE_CLIP_ROW < SESSION_CLIP_COUNT && ACTIVE_RECEIPT;
     const bool loadedIsActiveClip = hasActiveReceipt && !m_loadedClipFileName.isEmpty()
-        && ( m_loadedClipFileName == ACTIVE_CLIP->getPath() || m_loadedClipFileName == ACTIVE_RECEIPT->fileName() );
+        && loadedClipHeldByRow( m_loadedClipFileName == ACTIVE_CLIP->getPath() || m_loadedClipFileName == ACTIVE_RECEIPT->fileName(), m_loadedClipReceipt != nullptr, ACTIVE_RECEIPT == m_loadedClipReceipt );
     if( activeReceiptOwnsLoadedClip( m_slidersDetachedFromReceipt, m_fileLoaded && m_pMlvObject != nullptr,
                                      hasActiveReceipt, loadedIsActiveClip ) )
         return true;
@@ -25161,6 +25349,7 @@ void MainWindow::on_actionFullscreen_triggered( bool checked )
         ui->actionShowSessionArea->setEnabled( true );
         ui->actionShowAudioTrack->setEnabled( true );
     }
+    updateLookLabel();
     qApp->processEvents();
     m_frameChanged = true;
 }
@@ -25250,6 +25439,11 @@ void MainWindow::exportHandler( void )
             return;
         }
         m_exportOpenAbortRetries = 0;
+        // r12b (adversary r12 A1): the job grades this clone, not the row's receipt, so its outcome is read under the clone
+        // until the next open records a row. A failed final reopen keeps this clip and grade loaded.
+        m_lookLabelAppliedReceipt = m_exportQueue.first();
+        // r13 (adversary r12 31016339 A1): with its own switch -- the clone does not copy the row's.
+        m_lookLabelAppliedCloneLookAssist = m_exportQueue.first()->lookAssistEnabled();
         //Set sliders to receipt
         setSliders( m_exportQueue.first(), false );
         //Fill label in StatusDialog
@@ -25302,7 +25496,12 @@ void MainWindow::exportHandler( void )
         // r4 (adversary ddda72d6 A3): any failed reopen (prep refusal, or a locked / vanished file) leaves the job's
         // clip loaded, so the sliders detach; only a prep refusal is retried.
         if( reopenResult ) m_slidersDetachedFromReceipt = true;
-        else setSliders( GET_RECEIPT( m_lastClipBeforeExport ), false );
+        else
+        {
+            // r13 (adversary r13 63319bdb A1): the receipt applied next is this row's, not the active row's guess.
+            recordLoadedClipReceipt( m_loadedClipFileName, m_lastClipBeforeExport );
+            setSliders( GET_RECEIPT( m_lastClipBeforeExport ), false );
+        }
         SET_ACTIVE_CLIP_IDX( m_lastClipBeforeExport );
         if( clipOpenAbortedForPrep( reopenResult ) ) retryClipReopenAfterPrepAbort( m_lastClipBeforeExport );
         //Unblock GUI
@@ -31869,8 +32068,107 @@ LookAssistFlavor MainWindow::currentLookAssistFlavor()
     return selection.flavor;
 }
 
+// LOOK-FULLSCREEN-PARITY-1. Owner, 2026-10-15: "Full screen dont bypass the look. I just want text in the bottom
+// right showing current look when in full screen and somewhere on GUI when windowed". The label reads the state the
+// grade reads -- the receipt's Look Assist switch, the checkbox, and the flavor in force -- and never changes either.
+// The overlay is rasterised by the surface once per change; nothing here runs per frame.
+void MainWindow::updateLookLabel( void )
+{
+    // r12 (adversary r11 A1): the label names the look of the receipt that OWNS the loaded clip, never the active row's: a
+    // FullScreen delivered in addFileToSession's event pump has B active while A is loaded. m_fileLoaded is read first because
+    // this also runs from settings loading, before a session model exists.
+    const int ownerRow = !m_fileLoaded ? -1 : look_label::loadedClipOwnerRow(
+        SESSION_ACTIVE_CLIP_ROW, SESSION_CLIP_COUNT, [this]( int row ) { return loadedClipIsRow( row ); } );
+    ReceiptSettings *owner = ownerRow >= 0 ? GET_RECEIPT( ownerRow ) : nullptr;
+    // r13 (adversary r12 31016339 A1, A2): the switch is the applied receipt's (an export clone's was recorded with it), and the
+    // selector counts only while the sliders are attached -- detached, a click changes no grade.
+    const bool lookSwitch = look_label::appliedLookSwitch( m_lookLabelAppliedReceipt, owner, owner && owner->lookAssistEnabled(),
+                                                           m_lookLabelAppliedCloneLookAssist );
+    const bool lookOn = look_label::lookOnForOwner( owner != nullptr, lookSwitch,
+                                                    look_label::selectorDescribesOwner( owner && ownerRow == SESSION_ACTIVE_CLIP_ROW,
+                                                                                        !m_slidersDetachedFromReceipt ),
+                                                    ui->checkBoxLookAssistEnable->isChecked() );
+    // The look APPLIED (L-04): a safety fallback restored the baseline, so the label must not name the selected flavor.
+    // r10: a receipt setSliders put back to its baseline reads "Look: Baseline" until an analysis LANDS on it; the mark lives
+    // in the outcome (baselineRestored / showsBaseline), so every landed() forgets it in the same step (shownText reads it).
+    // r12b (adversary r12 A1): the outcome is read under the receipt applied to this clip. An export job grades a clone of
+    // the row's receipt, and a failed final reopen leaves that job's clip and grade loaded.
+    const void *lookReceipt = lookOn ? look_label::outcomeKey( m_lookLabelAppliedReceipt, owner ) : nullptr;
+    // r15 (adversary r15 f2588355 A1): a paste onto an inactive owner's row writes its switch without regrading; its text is
+    // kept, so an unchanged grade is never relabelled "Look: Off". r16 (adversary r15 1834b72e A1): only while the grade is the
+    // one the text was derived for -- an open's setSliders, a landing or a baseline mark on the key re-derives.
+    const look_label::LabelGrade grade = look_label::labelGrade( look_label::outcomeKey( m_lookLabelAppliedReceipt, owner ),
+                                                                 m_lookLabelSlidersApplied, m_lookAssistFlavorOutcome );
+    const bool keepText = look_label::keepsTextWithoutOwner( m_fileLoaded, ownerRow )
+                       || look_label::keepsTextForInactiveOwner( m_fileLoaded, m_lookLabelAppliedReceipt, owner,
+                                                                 owner && ownerRow == SESSION_ACTIVE_CLIP_ROW,
+                                                                 !m_slidersDetachedFromReceipt, !m_lookLabelText.isEmpty(),
+                                                                 look_label::sameGrade( grade, m_lookLabelDerivedGrade ) );
+    if( !keepText ) m_lookLabelDerivedGrade = grade;
+    const QString text = keepText ? m_lookLabelText : look_label::shownText(
+        lookOn, m_lookAssistFlavorOutcome, lookReceipt, lookAssistFlavorName( currentLookAssistFlavor() ) );
+    const bool fullscreenShown =
+        look_label::fullscreenOverlayShown( ui->actionFullscreen->isChecked(), m_lookLabelShowInFullscreen );
+    if( text == m_lookLabelText && fullscreenShown == m_lookLabelFullscreenShown ) return;
+    m_lookLabelText = text;
+    m_lookLabelFullscreenShown = fullscreenShown;
+    if( m_pLookLabelStatus ) m_pLookLabelStatus->setText( text );
+    // One corner label: the GPU window when it is the preview, else the CPU viewport.
+    const QString overlayText = fullscreenShown ? text : QString();
+    const bool gpuWindow = GpuDisplayWindow::isActive();
+    GpuDisplayWindow::setLookLabelIfActive( overlayText );
+    ui->graphicsView->setLookLabel( gpuWindow ? QString() : overlayText );
+    logInteractionEvent(
+        QStringLiteral("look_label.update"),
+        QStringLiteral("text=\"%1\" fullscreen_overlay=%2 surface=%3")
+            .arg( text )
+            .arg( bool01( fullscreenShown ) )
+            .arg( fullscreenShown ? ( gpuWindow ? QStringLiteral("gpu_window") : QStringLiteral("cpu_viewport") )
+                                  : QStringLiteral("status_bar") ) );
+}
+
+QString MainWindow::lookLabelShownText( QString *surface )
+{
+    QString where = QStringLiteral("none");
+    QString shown;
+    if( m_lookLabelFullscreenShown )
+    {
+        if( GpuDisplayWindow::isActive() )
+        {
+            where = QStringLiteral("fullscreen_gpu_window");
+            shown = GpuDisplayWindow::lookLabelDrawnTextIfActive();
+        }
+        else
+        {
+            where = QStringLiteral("fullscreen_cpu_viewport");
+            shown = ui->graphicsView->lookLabelDrawnText();
+        }
+    }
+    else if( m_pLookLabelStatus && m_pLookLabelStatus->isVisible() )
+    {
+        where = QStringLiteral("windowed_status_bar");
+        shown = m_pLookLabelStatus->text();
+    }
+    if( surface ) *surface = where;
+    return shown;
+}
+
+// r17 (adversary r17 4fcae002 A1): the active row's receipt graded on the attached sliders is what is on screen, so the label reads
+// it there, with its switch (look_label::activeGradeMovesKey). Called before each such grade relabels: both synchronous landings and
+// the switch, which the flavor change goes through.
+void MainWindow::labelFollowsActiveSliders( ReceiptSettings *receipt )
+{
+    ReceiptSettings *activeReceipt = ( SESSION_CLIP_COUNT > 0 && SESSION_ACTIVE_CLIP_ROW >= 0 ) ? ACTIVE_RECEIPT : nullptr;
+    if( m_fileLoaded && look_label::activeGradeMovesKey( receipt, activeReceipt, !m_slidersDetachedFromReceipt ) )
+    {
+        m_lookLabelAppliedReceipt = receipt;
+        m_lookLabelAppliedCloneLookAssist = receipt->lookAssistEnabled();
+    }
+}
+
 void MainWindow::on_comboBoxLookAssistFlavor_currentIndexChanged( int )
 {
+    updateLookLabel();
     // r5 (Dot 29eac4d5 A1): while the loaded clip is not the active row's, the selector writes nothing into it.
     if( !m_fileLoaded || !ACTIVE_RECEIPT || !receiptOwnedByLoadedClip( "look-assist-flavor" ) ) return;
     ACTIVE_RECEIPT->setLookAssistFlavor( lookAssistFlavorName( currentLookAssistFlavor() ) );
@@ -31905,6 +32203,10 @@ void MainWindow::on_checkBoxLookAssistEnable_clicked( bool checked )
             .arg( ui->horizontalSliderPosition->value() ) );
 
     ACTIVE_RECEIPT->setLookAssistEnabled( checked );
+    invalidateLookAssistAsyncOnDisable( ACTIVE_RECEIPT, "toggle_off" );   // r15 (sol r14 B1): no-op when checked
+    ++m_lookLabelSlidersApplied;   // r18 (adversary r17 dc21c1c9 A1): the switch regrades, so the kept label reads the click (sameGrade)
+    labelFollowsActiveSliders( ACTIVE_RECEIPT );   // r17 (adversary r17 4fcae002 A1): the switch regrades this receipt's sliders
+    updateLookLabel();
 
     // Off, on, or a new flavor: an async result dispatched before this no longer describes what the user asked for.
     ++m_lookAssistAsyncGeneration;
@@ -31915,6 +32217,11 @@ void MainWindow::on_checkBoxLookAssistEnable_clicked( bool checked )
             restoreLookAssistBaseline( ACTIVE_RECEIPT );
         else
             captureLookAssistBaseline( ACTIVE_RECEIPT );
+        // r11 (key3 r10 L-07 on e5109212): the baseline is on screen until the frame-ready analysis below lands. Look
+        // Assist turned off through setSliders (a paste or Reset Receipt) never clears the outcome, and the frame-ready
+        // step dedup_skips when the marker still names this receipt -- so without the mark the label kept the old flavor.
+        m_lookAssistFlavorOutcome.baselineRestored( ACTIVE_RECEIPT );
+        updateLookLabel();
 
         setReceipt( ACTIVE_RECEIPT );
 
@@ -32061,6 +32368,9 @@ void MainWindow::on_checkBoxLookAssistEnable_clicked( bool checked )
         m_lastLookAssistDiagnosticsValid = false;
         m_lookAssistApplied.clearIf( ACTIVE_RECEIPT );
         m_lookAssistFlavorOutcome.clear();   // the baseline is back: no grade, no fallback, only the selector's setting
+        // r18 (adversary r18 82a5a3ad A1): the relabel above recorded the grade with the old outcome (Cinematic landed). Without
+        // this one, a later relabel saw the cleared outcome as a regrade and read a switch pasted onto the then-inactive owner.
+        updateLookLabel();
     }
 
     setReceipt( ACTIVE_RECEIPT );

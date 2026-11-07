@@ -31,6 +31,7 @@
 #include <QToolButton>
 #include "../../src/batch/LookAssistAnalysis.h"   // LookAssistFlavor, and the LookAssistAppliedMarker member below
 #include "LookAssistAnalysisPump.h"
+#include "LookLabelPolicy.h"                        // look_label::LabelGrade member below (r16)
 #include "SessionModel.h"
 #include "PlaybackFrameRange.h"
 #include "PlaybackNativePaceGuard.h"
@@ -419,6 +420,7 @@ private slots:
     void on_actionPlaybackPreviewResQuarter_triggered();
     void on_actionPlaybackShowQualityIndicator_triggered();
     void on_actionPlaybackVSync_triggered();
+    void on_actionShowLookLabelInFullscreen_triggered();
     void on_actionPlaybackScopesHide_triggered();
     void on_actionPlaybackScopesThrottled_triggered();
     void on_actionPlaybackScopesLive_triggered();
@@ -844,6 +846,10 @@ private:
     QTime m_lastPlaybackFpsStatusUpdateTime;
     QLabel *m_pFrameNumber;
     QLabel *m_pChosenDebayer;
+    QLabel *m_pLookLabelStatus = nullptr;   // LOOK-FULLSCREEN-PARITY-1: the current look, windowed
+    QString m_lookLabelText;                // the text both labels show (updateLookLabel)
+    bool m_lookLabelFullscreenShown = false;
+    bool m_lookLabelShowInFullscreen = true; // the persisted "Show Look Label in Fullscreen" setting
     QLabel *m_pPlaybackQualityIndicator = nullptr; // Phase 4E
     // Phase 4F-toolbar: Playback Quality dropdown on the main toolbar. The
     // button is a second view onto the same Playback Quality QActions used
@@ -909,6 +915,16 @@ private:
     // r5 (Dot 29eac4d5 A1): the file the last successful open loaded; receiptOwnedByLoadedClip compares it with
     // the active row. A refused direct receipt write is logged once per clip-open generation.
     QString m_loadedClipFileName;
+    // LOOK-FULLSCREEN-PARITY-1 r12: the receipt of the row that open loaded for (two rows can hold one path). Compared, never read.
+    const ReceiptSettings *m_loadedClipReceipt = nullptr;
+    // r12b: the key the look outcome is read under: the recorded row's receipt, or the running export job's clone. Compared, never read.
+    const void *m_lookLabelAppliedReceipt = nullptr;
+    // r13: the export clone's Look Assist switch, recorded with the clone as the key (look_label::appliedLookSwitch).
+    bool m_lookLabelAppliedCloneLookAssist = false;
+    // r16 (adversary r15 1834b72e A1): setSliders applications so far, and the grade the label text was last derived for. An
+    // inactive owner's text is kept only while the grade is unchanged (look_label::sameGrade).
+    quint64 m_lookLabelSlidersApplied = 0;
+    look_label::LabelGrade m_lookLabelDerivedGrade;
     unsigned long long m_receiptWriteSkipLoggedGeneration = ~0ull;
     bool m_exportInProgress = false;
     // r4 (adversary A3): bumped at each export batch start; a retry timer of an earlier batch is a no-op.
@@ -1063,6 +1079,9 @@ private:
     // worker captures it at dispatch; the queued apply lambda re-checks before
     // touching any UI state, ensuring stale results from a previous clip are dropped.
     std::atomic<int> m_lookAssistAsyncGeneration{0};
+    // LOOK-FULLSCREEN-PARITY-1 r15 (sol r14 B1): the receipt the newest async analysis was dispatched for. Identity only (UI
+    // thread), never dereferenced: turning Look Assist off on it invalidates that analysis (invalidateLookAssistAsyncOnDisable).
+    const void *m_lookAssistAsyncTarget = nullptr;
     // Round-4 debt block: count of detached look-assist workers still running.
     // The worker reads m_pMlvObject (findMlvWhiteBalance renders from raw), so
     // every freeMlvObject path must drainLookAssistWorkers() first or the
@@ -1916,6 +1935,7 @@ private:
     void initPlaybackPreviewModeFromSettings( void );
     void initPlaybackPreviewResolutionFromSettings( void );
     void drainLookAssistWorkers( const char *reason );
+    void invalidateLookAssistAsyncOnDisable( ReceiptSettings *receipt, const char *reason );
     bool freeActiveMlvObjectAfterLifecycleBarrier( const char *reason );
     void initPlaybackScaleFactorFromSettings( void );
     void seedPlaybackQualityActiveStateForCurrentContext( void );
@@ -1969,6 +1989,7 @@ private:
     int showFileInEditor(int row);
     void markClipOpenSucceeded( void );
     bool loadedClipIsRow( int row ) const;
+    void recordLoadedClipReceipt( const QString &fileName, int openerRow = -1 );
     bool receiptOwnedByLoadedClip( const char *site );
     void retryClipReopenAfterPrepAbort( int row );
     void scheduleClipReopenRetry( int row, unsigned long long generation, int deferrals );
@@ -2053,6 +2074,16 @@ private:
                                    int analysisFrame = -1 );
     void syncLookAssistDerivedUiToReceipt( ReceiptSettings *receipt );
     lookassist::LookAssistFlavor currentLookAssistFlavor();
+    // LOOK-FULLSCREEN-PARITY-1: re-derives the look label from the state the grade uses (Look Assist
+    // on, the flavor in force) and pushes it to the status bar and, in fullscreen, to the preview
+    // surface's corner. Does nothing when neither the text nor where it shows changed.
+    void updateLookLabel( void );
+    // r17 (adversary r17 4fcae002 A1): a grade applied to the attached sliders for the active row's receipt makes it the
+    // label key, with its switch (look_label::activeGradeMovesKey).
+    void labelFollowsActiveSliders( ReceiptSettings *receipt );
+    // The look label text actually on screen now, and where ("fullscreen_gpu_window",
+    // "fullscreen_cpu_viewport", "windowed_status_bar" or "none"): the receipt's lookLabelShown.
+    QString lookLabelShownText( QString *surface );
     void setGradientMask( void );
     uint16_t autoCorrectRawBlackLevel( void );
     uint16_t autoCorrectRawWhiteLevel( void );
