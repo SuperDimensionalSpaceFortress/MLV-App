@@ -28,6 +28,17 @@
 # against the real 2026-09-07 stderr, a known-good transcript, and prose that only QUOTES a refusal.
 # ASCII-only by project convention.
 
+# An ERROR-framed line (r5 pass 2, adversary A1): the codex CLI frames a provider error as upper-case `ERROR:` (measured:
+# the 2026-09-07 refusal). PowerShell -match is case-INSENSITIVE, so "Error handling for HTTP 429 is now implemented." was
+# taken for a framed refusal line. The frame is case-exact; an ANSWER line, which is judged as a possible refusal, must
+# carry the colon too, so upper-case prose such as "ERROR handling ..." is an answer.
+function Test-LaneErrorFramedLine {
+    param([AllowEmptyString()][AllowNull()][string]$Line, [switch]$AnswerLine)
+    if ([string]::IsNullOrEmpty($Line)) { return $false }
+    if ($AnswerLine) { return ($Line -cmatch '^\s*ERROR:') }
+    return ($Line -cmatch '^\s*ERROR\b')
+}
+
 # Every refusal kind a line names, in pattern order, no duplicates (r4 pass 2, adversary A3): one line can name two
 # kinds ("You've hit your usage limit ... HTTP 429"), and the stderr corroboration compares kinds, so keeping only the
 # FIRST match on each side lost the shared one. Get-RefusalKind (the first) is what a single-kind caller reads.
@@ -498,7 +509,12 @@ function Get-LaneWorkEvidence {
             # r4: read through the contract and CASE-EXACT, so an Array / Object subtype or terminal_reason is "(kind-X)",
             # which equals neither 'success' nor 'completed', and a variant spelling ("TERMINAL_REASON") is never the field.
             if ($j.ContainsKey('subtype')) { $rec.subtype = Get-LaneContractText -Object $j -Name 'subtype' }
-            if ($j.ContainsKey('terminal_reason')) { $rec.terminalReason = Get-LaneContractText -Object $j -Name 'terminal_reason' }
+            if ($j.ContainsKey('terminal_reason')) {
+                $rec.terminalReason = Get-LaneContractText -Object $j -Name 'terminal_reason'
+                # r5 pass 2 (A2): PRESENT is not absent. A null reads as '' above, and an empty value is falsy, so either skipped
+                # the "absent or completed" check below; name them so the check sees a value that is not 'completed'.
+                if ($rec.terminalReason.Length -eq 0) { $rec.terminalReason = '(empty)' }
+            }
             # A real JSON boolean only (r3b A3): [bool]$null, [bool]0 and [bool]@() are $false, so a null or
             # non-boolean is_error must read as absent, never as "not an error".
             $ief = Get-LaneContractField -Object $j -Name 'is_error'
@@ -599,7 +615,7 @@ function Get-ProviderRefusal {
         $ansLines = @((Split-LaneLines -Text $Answer) | Where-Object { Test-LaneAnswerHasSubstance -Answer $_ })
         $answerKinds = New-Object System.Collections.Generic.List[string]
         foreach ($al in $ansLines) {
-            $aks = @(if ($al -match '^\s*ERROR\b') { Get-RefusalKinds -Line $al })
+            $aks = @(if (Test-LaneErrorFramedLine -Line $al -AnswerLine) { Get-RefusalKinds -Line $al })
             if ($aks.Count -eq 0) { return $null }
             foreach ($ak in $aks) { if (-not $answerKinds.Contains($ak)) { $answerKinds.Add($ak) } }
         }
@@ -613,7 +629,7 @@ function Get-ProviderRefusal {
         if ($i -ge 0) { $scan = $hay.Remove($i, $needle.Length) } else { $scan = $hay }
     }
     foreach ($line in @(Split-LaneLines -Text $scan)) {
-        if ($line -notmatch '^\s*ERROR\b') { continue }
+        if (-not (Test-LaneErrorFramedLine -Line $line)) { continue }
         # every kind the stderr line names counts; the first one the answer also names is the reported kind (r4 pass 2, A3)
         $kind = $null
         foreach ($k in @(Get-RefusalKinds -Line $line)) {

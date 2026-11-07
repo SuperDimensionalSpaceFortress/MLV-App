@@ -2581,6 +2581,38 @@ def test_r5_adv_a3_vertical_tab_and_form_feed_separate_refusal_classification_li
     assert r is not None and r["kind"] == "provider-rate-limit", r
 
 
+def test_r5_adv2_a1_ordinary_prose_that_starts_with_the_word_error_is_not_an_error_framed_line(tmp_path):
+    # adversary r5 pass 2 A1: the ERROR frame matched case-INsensitively, so a real answer such as "Error handling for HTTP 429
+    # is now implemented." was taken for an ERROR-framed refusal line and, with a recovered 429 on stderr, booked refused (125).
+    recovered = "ERROR: upstream probe returned 429; recovered"
+    for ans in ("Error handling for HTTP 429 is now implemented.", "error: rate limit handling added",
+                "ERROR handling for HTTP 429 is now implemented.", "Errors: 429 responses are retried."):
+        assert _classify(tmp_path, recovered, "codex", prompt="Summarize the completed fix in one sentence.", answer=ans) is None, ans
+    # the same prose on stderr is narration, not a framed refusal line
+    assert _classify(tmp_path, "Error handling for HTTP 429 is now implemented.\n", "codex", answer="") is None
+    assert _classify(tmp_path, "error: rate limit reached\n", "codex", answer="") is None
+    # controls: the real framing (upper case ERROR, a colon on an answer line) still classifies
+    ans = "ERROR: You've hit your usage limit. Visit settings to purchase more credits or try again at Nov 9th, 2026 8:09 PM."
+    r = _classify(tmp_path, ans + "\n", "codex", answer=ans)
+    assert r is not None and r["kind"] == "provider-usage-limit", r
+    r = _classify(tmp_path, REAL_CODEX_USAGE_LIMIT_STDERR, "codex", answer="")
+    assert r is not None and r["kind"] == "provider-usage-limit", r
+
+
+def test_r5_adv2_a2_a_present_but_null_or_empty_terminal_reason_is_not_absence(tmp_path):
+    # adversary r5 pass 2 A2: "absent or completed" is the contract. A present terminal_reason of null or "" was collapsed to
+    # '' by the text reader and then skipped by a truthiness guard, so it passed as absence. Present and not exactly
+    # "completed" is refused; absent still passes.
+    for tr in ('null', '""', '"   "', '[]', '{}', '0', 'false', '"Completed"', '"completed "'):
+        env = '{"type":"result","subtype":"success","is_error":false,"terminal_reason":%s}\n' % tr
+        r = _work_evidence(tmp_path, "claude", env, 0)
+        assert r["workCompleted"] is False and str(r["reason"]).startswith("terminal-reason-"), (tr, r)
+    ok_absent = '{"type":"result","subtype":"success","is_error":false,"result":"done"}\n'
+    assert _work_evidence(tmp_path, "claude", ok_absent, 0)["workCompleted"] is True
+    ok_done = '{"type":"result","subtype":"success","is_error":false,"terminal_reason":"completed"}\n'
+    assert _work_evidence(tmp_path, "claude", ok_done, 0)["workCompleted"] is True
+
+
 def test_r3c_a4_an_array_typed_result_line_is_not_the_envelope_and_hides_no_refusal(tmp_path):
     diag = '{"type":["result"],"subtype":"success","is_error":false}\n'
     r = _work_evidence(tmp_path, "claude", diag, 0)
