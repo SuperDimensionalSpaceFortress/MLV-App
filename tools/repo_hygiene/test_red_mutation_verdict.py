@@ -906,6 +906,54 @@ class VerdictOnText(unittest.TestCase):
         short = block.replace(rest, "test_x (t.T.test_x) (rows=[(0, 1), (1, 2)])")  # an ordinary subTest header still reads
         self.assertEqual(rmv.verdict(short, "t.py:5")[0], rmv.PASS)
 
+
+    # ---- r8 adversary pass 2 (8e754e3d) ----------------------------------------------------------------------
+    GROUP = ("class MissingDependency(ImportError): pass\n"
+             "def test_expected(): assert False\n"
+             "def test_import(): raise ExceptionGroup('deps', [MissingDependency('missing')])\n")
+
+    def test_adversary2_a1_a_failure_that_prints_no_exception_line_is_could_not_check(self) -> None:
+        # An exception group prints no `E` line, and under -rN there is no summary line either, so the exception type
+        # of the second failure is not shown anywhere; its class may subclass ImportError.
+        for columns in (80, 200):
+            for tb in ("--tb=long", "--tb=short"):
+                out = _run_pytest({"t.py": self.GROUP}, "-rN", tb, columns=columns)
+                self.assertIn("2 failed", out)
+                status, reason = rmv.verdict(out, "t.py:2")
+                self.assertEqual(status, rmv.REFUSED, f"{tb}: {reason}\n{out}")
+                self.assertIn("COULD-NOT-CHECK", reason, out)
+                self.assertIn("exception line", reason, out)
+        ordinary = _run_pytest({"t.py": "def test_expected(): assert False\ndef test_other(): raise TypeError('boom')\n"},
+                               "-rN", "--tb=short")
+        status, reason = rmv.verdict(ordinary, "t.py:1")  # an ordinary builtin type is still classified: not an import error
+        self.assertEqual(status, rmv.PASS, f"{reason}\n{ordinary}")
+
+    def test_adversary2_a1_the_same_group_in_a_unittest_run_is_could_not_check(self) -> None:
+        src = ("import unittest\n" + self.GROUP.split("\n", 1)[0] + "\n"
+               "class T(unittest.TestCase):\n"
+               "    def test_expected(self):\n        self.assertEqual(1, 2)\n"
+               "    def test_import(self):\n        raise ExceptionGroup('deps', [MissingDependency('missing')])\n")
+        out = _run_unittest({"test_t.py": src}, "test_t")
+        status, reason = rmv.verdict(out, "test_t.py:4")
+        self.assertEqual(status, rmv.REFUSED, f"{reason}\n{out}")
+        self.assertIn("COULD-NOT-CHECK", reason, out)
+
+    def test_adversary2_a2_an_indented_result_line_is_not_the_terminal_result(self) -> None:
+        # The terminal result starts at column 0: an indented ` FAILED (failures=2)` is message text, and with the
+        # strict reading the stated count (2) is never compared with the one readable failure.
+        unit = ("FF\n" + "=" * 70 + "\nFAIL: test_a (test_attack.A.test_a)\n" + "-" * 70
+                + '\nTraceback (most recent call last):\n  File "test_attack.py", line 3, in test_a\nAssertionError: bad\n'
+                "Ran 2 tests\n\n FAILED (failures=2)\n")
+        status, reason = rmv.verdict(unit, "test_attack.A.test_a")
+        self.assertEqual(status, rmv.REFUSED, reason)
+        self.assertIn("result line", reason)
+        pytest_text = ("=== FAILURES ===\n___ test_x ___\nE assert False\nt.py:2: AssertionError\n === 2 failed in 0.1s ===\n")
+        status, reason = rmv.verdict(pytest_text, "t.py:2")
+        self.assertEqual(status, rmv.REFUSED, reason)
+        self.assertIn("result line", reason)
+        flush = unit.replace(" FAILED (failures=2)", "FAILED (failures=1)")  # a real, flush-left trailer is judged
+        self.assertEqual(rmv.verdict(flush, "test_attack.A.test_a")[0], rmv.PASS)
+
     def test_a_long_subtest_header_is_read_in_linear_time(self) -> None:
         # opus r7 RMV-UT-IDENTITIES-SCALING-1: every ' (' x ')' pair was tried with a slice copy each.
         import time
