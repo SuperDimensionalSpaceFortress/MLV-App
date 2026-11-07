@@ -3326,6 +3326,35 @@ TEST( PlaybackConformDropFrame, R25A1ABurstOfSubStallLateTicksNeverLosesAPaidFra
         }
 }
 
+TEST( PlaybackConformDropFrame, R26ALoneGuiLateTickOnAQuietHostPresentsTheNextFrame )
+{
+    // HFR-NATIVE-60FPS-FULLRES-1 r26: the r24 conform judge FAILED on a QUIET leg (01-m16-1457-conform-windowed-s1-cuda,
+    // receipt ecca9f02-31e1-4ba4-ae37-82165559bd40): conformMaxJump 2. ONE GUI-late tick (max_interval_ms 125.899 at
+    // frame 673, cls_gui_late=1) was granted about 3 frames, reached 1 + kConformStallDebtFrames, and took the real-stall
+    // skip. Its tick shape on the engine: 8 ms polls at a 24 fps guard (frame 673 at about tick 3505), one 125.899 ms tick.
+    const auto lone = []( int t ) { return t == 3505 ? 125.899 : 8.0; };
+    const ConformPlayResult r = playConformedTicks( lone, true, 2860 );
+    ASSERT_EQ( 1, r.maxJump );
+    ASSERT_TRUE( r.consumedAt64998 >= int64_t( 1499 ) );
+    ASSERT_TRUE( r.sourceFps >= 23.28 && r.sourceFps <= 24.72 );
+    // the class, not the instance: one late tick of 2 up to 9 periods (its backlog fits kConformMaxDebtFrames), anywhere in
+    // the clip, presents the next frame and repays the rest on the following ticks
+    for( const int at : { 2, 700, 3505, 5001 } )
+        for( const double lateMs : { 84.0, 88.9, 125.899, 200.0, 333.0, 370.0 } )
+        {
+            const ConformPlayResult one = playConformedTicks( [=]( int t ) { return t == at ? lateMs : 8.0; }, true, 2860 );
+            ASSERT_EQ( 1, one.maxJump );
+            ASSERT_TRUE( one.consumedAt64998 >= int64_t( 1499 ) );
+        }
+    // the tick itself, from frame 672.8: the grant of 3.0216 presents 673 and every granted frame is carried, none lost
+    double debt = 0.0;
+    const double delta = playback_frame_range::conformDropFrameDelta( 672.8, 3.0216, true, debt );
+    ASSERT_EQ( 673, static_cast<int>( 672.8 + delta ) );
+    ASSERT_NEAR( 672.8 + 3.0216, 672.8 + delta + debt, 1e-9 );
+    // and the stateless form (no debt carried) presents the next frame too
+    ASSERT_EQ( 1, conformDropTickTransition( 672.8, 3.0216, true ) );
+}
+
 TEST( PlaybackConformDropFrame, R24A1TheCarriedDebtIsBoundedAndClearedWithoutConform )
 {
     // a held tick carries the whole frame it did not present; the next ordinary tick repays it as a one-frame step
