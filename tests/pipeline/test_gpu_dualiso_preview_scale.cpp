@@ -2334,6 +2334,21 @@ TEST(GpuDualIsoPreviewScale, CpuReducedOneRowBayerIsRefused)
     std::printf("[h2c-short-bayer] 64x4 at x2: taken, every output word 10000 %d\n", flat ? 1 : 0);
     ASSERT_TRUE(allOk);
     ASSERT_TRUE(flat);
+    // r12 pass 2 advisory A2 (pre-existing): under 4 columns the scalar row loop is empty too (video 4x8, Bayer 2x4 at
+    // x2 returned 1 over the output's previous contents); refused like the filtered branch.
+    R12BareVideo narrow(4, 8, 1);
+    ASSERT_TRUE(narrow.video != nullptr);
+    std::vector<uint16_t> nbuf(2u * 3u + 2u * 4u * 3u, 0xBEEFu);
+    std::vector<uint16_t> nbayer(2u * 4u, 10000u);
+    w = -1;
+    h = -1;
+    const int ngot = getMlvRawFrameDebayeredFromReducedReconnedRaw16(narrow.video, 1, nbayer.data(), 2, 4, 2,
+                                                                      nbuf.data() + 6, 1, &w, &h);
+    const bool nuntouched = std::all_of(nbuf.begin(), nbuf.end(), [](uint16_t v) { return v == 0xBEEFu; });
+    std::printf("[h2c-short-bayer] 2x4 at x2: entry %d (want 0), buffer untouched %d\n", ngot, nuntouched ? 1 : 0);
+    ASSERT_EQ(0, ngot);
+    ASSERT_TRUE(nuntouched);
+    ASSERT_EQ(-1, w);
 }
 
 // H2C-PORT-1 RED 3: the route. At x4 the CPU plan's Bayer is at x2 (fullWidth / 2 x
