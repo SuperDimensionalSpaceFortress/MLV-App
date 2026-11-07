@@ -293,8 +293,11 @@ is left alone. The receipt's `codexDirectChildStop` is present only in this case
   reached. They are not known to be gone, and this is never a clean stop.
 - `uncertain:kill-failed`, `uncertain:wait-timeout`, `uncertain:tree-unreadable`: the child or a
   descendant may still be alive.
-- `uncertain:ancestry-unreadable`: a candidate or a parent could not be read, so it was not
-  killed by the lane's own loop.
+- `uncertain:ancestry-unreadable:<site>:<code>`: a candidate or a parent could not be read, so it
+  was not killed by the lane's own loop. `<site>` is `parent-read` (the parent's creation time),
+  `kid-open` (opening the candidate by pid) or `kid-read` (its parent pid or creation time), and
+  `<code>` is the Win32 error of the failed read (5 is access denied). The outcome is the same for
+  every site; the suffix only says which read failed.
 - `uncertain:older-than-parent`: the parent matches and the child reads older. A backward clock
   step and a reused parent pid look the same, so it was not killed by the lane's own loop, and
   it may still be alive.

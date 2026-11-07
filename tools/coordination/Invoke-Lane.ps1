@@ -1049,7 +1049,7 @@ public static class MlvLaneJob {
     return (int)info.InheritedFromUniqueProcessId.ToInt64();
   }
   // r15 (Dot B5; adversary A2 = Dot B6): Members are the processes shown to be in the tree. Uncertain says why 'killed' would claim too much; the first reason found stands.
-  //   ancestry-unreadable: a candidate, or a parent, could not be read.
+  //   ancestry-unreadable:<parent-read|kid-open|kid-read>:<Win32 error>: a candidate, or a parent, could not be read; the site and the code say which read.
   //   older-than-parent: the parent matches and the child reads older. A backward clock step and a reused parent pid look the same, so it is neither killed nor called gone.
   //   descendant-unreachable: the snapshot saw a process under a pid whose holder has since gone, so that process cannot be shown to be in the tree, or to be gone.
   public sealed class DescendantWalk {
@@ -1077,12 +1077,13 @@ public static class MlvLaneJob {
       Process parent=walk.Dequeue();
       if(!kids.ContainsKey(parent.Id)) continue;
       Int64 parentCreated;
-      try { parentCreated=CreatedFileTime(parent); } catch(Win32Exception) { seen.Note("ancestry-unreadable"); continue; }
+      // PR 771 hosted CI saw a bare 'ancestry-unreadable' it could not explain (merge ref 516350c5, job 128440611866). Each note below now names the read that failed and its Win32 error code; the outcome is unchanged (uncertain).
+      try { parentCreated=CreatedFileTime(parent); } catch(Win32Exception ex) { seen.Note("ancestry-unreadable:parent-read:"+ex.NativeErrorCode); continue; }
       foreach(int id in kids[parent.Id]) {
         Process kid;
         try { kid=Process.GetProcessById(id); }
         catch(ArgumentException) { seen.NoteIfAnyBelow(kids,id); continue; }   // exited since the snapshot
-        catch(Win32Exception) { seen.Note("ancestry-unreadable"); continue; }
+        catch(Win32Exception ex) { seen.Note("ancestry-unreadable:kid-open:"+ex.NativeErrorCode); continue; }
         int parentPid; Int64 created;
         try {
           // The first read opens the handle, which this object then keeps, so both reads and any later Kill or wait are about one process.
@@ -1090,7 +1091,7 @@ public static class MlvLaneJob {
           created=CreatedFileTime(kid);
         }
         catch(InvalidOperationException) { seen.NoteIfAnyBelow(kids,id); kid.Dispose(); continue; }   // exited since the snapshot
-        catch(Win32Exception) { seen.Note("ancestry-unreadable"); kid.Dispose(); continue; }
+        catch(Win32Exception ex) { seen.Note("ancestry-unreadable:kid-read:"+ex.NativeErrorCode); kid.Dispose(); continue; }
         if(parentPid!=parent.Id) { seen.NoteIfAnyBelow(kids,id); kid.Dispose(); continue; }   // the pid changed hands: this process was never in the tree
         if(StartedBeforeParent(created,parentCreated)) { seen.Note("older-than-parent"); kid.Dispose(); continue; }
         seen.Members.Add(kid); walk.Enqueue(kid);
@@ -2200,6 +2201,8 @@ $dispatchLedgerState = $null
 $dispatchLedgerReservationId = $null
 # Harvested child stdout; initialised here so the finally can classify work evidence on every path.
 $stdout = ''
+# Codex answer (last-message file, else stdout) set at harvest; '' on every path that never harvested one.
+$codexAnswerEvidence = ''
 $authority  =[ordered]@{ permissionMode = 'unset'; allowedTools = 'unset'; sandbox = 'unset'; writableRoot = $null }
 $denyRules  = @()
 # LANE-NO-BACKGROUND-END-TURN-1 round 7: set here so a codex lane (which never enters the
@@ -3049,7 +3052,17 @@ Write-Utf8NoBom $errPath $stderrText
 # receipt proved that exitCode alone cannot tell "refused in 7 s" from "reviewed and objected".
 # Structurally, never by scanning the transcript (sol PR #80 R1+R2, both BLOCKER): the
 # transcript legitimately CONTAINS the refusal vocabulary even when the run answered.
-$providerRefusal = Get-ProviderRefusal -Text $stderrText -Answer $stdout -Engine $cfg.engine -Prompt $Prompt
+# K4 r2 (sol r1 B2): a codex lane's answer is the -o last-message file, else stdout. Refusal detection judges
+# that SAME answer the completion evidence uses, so a recovered-error line on stderr cannot turn a real
+# file-only answer into a provider refusal. The answer is selected once, here, and never reassigned.
+# K4-ANSWER-BEGIN
+if ($cfg.engine -eq 'codex') {
+    $lastMessage = if (Test-Path -LiteralPath $lastPath) { Get-Content -LiteralPath $lastPath -Raw } else { '' }
+    $codexAnswerEvidence = Get-CodexLaneAnswer -LastMessage $lastMessage -Stdout $stdout
+}
+$refusalAnswer = if ($cfg.engine -eq 'codex') { $codexAnswerEvidence } else { $stdout }
+$providerRefusal = Get-ProviderRefusal -Text $stderrText -Answer $refusalAnswer -Engine $cfg.engine -Prompt $Prompt
+# K4-ANSWER-END
 
 $final = ''
 if ($cfg.engine -eq 'claude') {
@@ -3131,8 +3144,9 @@ if ($cfg.engine -eq 'claude') {
     if (-not $final) { $final = $stdout }
     Write-Utf8NoBom $lastPath $final
 } else {
-    $final = if (Test-Path -LiteralPath $lastPath) { Get-Content -LiteralPath $lastPath -Raw } else { '' }
-    if ([string]::IsNullOrWhiteSpace($final)) { $final = $stdout }
+    # K4: the codex answer for completion evidence (selected above, before the refusal call) is the last-message
+    # file, else stdout -- not stderr (the fallback below).
+    $final = $codexAnswerEvidence
     # LAST-RESORT FALLBACK TO STDERR. codex writes its -o last-message file only on
     # a CLEAN exit and streams its working narration to STDERR, not stdout - so a
     # lane killed at the timeout leaves the last-message file absent and stdout
@@ -3142,7 +3156,14 @@ if ($cfg.engine -eq 'claude') {
     # approach entirely.
     if ([string]::IsNullOrWhiteSpace($final)) { $final = $stderrText }
     if ($null -eq $final) { $final = '' }
-    if ($timedOut) { Write-Utf8NoBom $lastPath $final }
+    # K4 r4 pass 2 (adversary A4): when the answer has no substance (a ZWSP-only last-message file) $final fell back to
+    # stderr above, and outputSha256 / outputBytes below describe $final, so the receipt output file must hold it too.
+    if ($timedOut -or ($final -ceq $stderrText -and -not (Test-LaneAnswerHasSubstance -Answer $codexAnswerEvidence))) { Write-Utf8NoBom $lastPath $final }
+    # K4 r2 (adversary A4): when the selected answer came from stdout because the last-message file had no
+    # substance, the receipt's outputPath file must hold the answer the outputSha256 below describes.
+    if (-not $timedOut -and (Test-LaneAnswerHasSubstance -Answer $codexAnswerEvidence) -and -not (Test-LaneAnswerHasSubstance -Answer $lastMessage)) {
+        Write-Utf8NoBom $lastPath $codexAnswerEvidence
+    }
     # LANE-MODEL-CURRENCY-1 round 2 (sol blocker 2): resolvedModel is proof, not intent. codex
     # exec emits no modelUsage-style attestation the way claude's own JSON does, so the bar here
     # is the card's stated minimum: a clean exit (never timed out, exit 0) that produced real
@@ -3433,11 +3454,13 @@ if (-not $NoWorktreeSweep) {
 # finished (exit 0 and, for claude, a success envelope). Until 2026-09-14 `complete` meant only the
 # former, so an exit-1 error_max_turns run was receipted state=complete, complete=true.
 $processEnded = ($exitCode -ne -999)
+# K4-EVIDENCE-BEGIN
 try {
-    $workEvidence = Get-LaneWorkEvidence -Engine $cfg.engine -Answer $stdout -ExitCode $exitCode
+    $workEvidence = Get-LaneWorkEvidence -Engine $cfg.engine -Answer $(if ($cfg.engine -eq 'codex') { $codexAnswerEvidence } else { $stdout }) -ExitCode $exitCode -PromptChars (Get-LaneCodePointCount -Text ([string]$Prompt)) -RequireVerdict:(Test-PromptDemandsVerdict -Prompt $Prompt)
 } catch {
     $workEvidence = [ordered]@{ workCompleted = $false; reason = "cannot-determine: $($_.Exception.Message)"; subtype = $null; terminalReason = $null; isError = $null }
 }
+# K4-EVIDENCE-END
 # LANE-NO-BACKGROUND-END-TURN-1: a success envelope is not positive evidence of work if the
 # tree never moved. HEAD still equal to the sha this lane started from, with tracked files
 # left dirty BY THIS LANE, is exactly what "I'll resume when the background job completes"
