@@ -559,23 +559,27 @@ function Get-FixtureMatch([string]$CommandLine, [string]$Fx) {
     # re-parses the line, but argv[0] is conhost), so the reader of an argument cannot be known from argv[0] alone, and a deny-list of wrappers
     # (cmd, conhost, dotnet, wsl, start, runas, ...) is never complete. The rule is an ALLOW-list of the programs this suite starts: a whole
     # argument is a kill match only when argv[0] is python (the fake heavy-slot.py, its probes and readers) or pwsh/powershell (read by the
-    # strict grammar below), or when argv[0] is itself a program inside the dir. Any other argv[0] is unknown (counted, never killed). In a
-    # python line, an argument naming a shell or launcher (cmd, pwsh, bash, conhost, python, ...) may be a command line the script runs, so
-    # nothing from that argument on is a kill match either.
+    # strict grammar below), or when argv[0] is itself a program inside the dir. Any other argv[0] is unknown (counted, never killed).
+    # r7 fix 2 (adversary r7 pass-15 A1): a python line can hand its own argv to any program (python -c "subprocess.run(sys.argv[1:])"
+    # pwsh-preview.exe -Command "... #" -File <dir>), and fix 1's list of shell names to stop at missed pwsh-preview: again a deny-list. So for
+    # python only ONE position is a candidate, the one python itself gives a meaning: argv[1] (the script, or the first data argument), or
+    # argv[3] when argv[1] is -c (argv[2] is the code). Every later argument, and every line whose argv[1] is another python option (-m,
+    # -u, -X, ...), is never a kill match. These are exactly the shapes this suite and the agent start: python <fx>\heavy-slot-fake.py ...,
+    # python -c <code> <fx>\<name>, python --output=<fx>\....
     $a0 = ([string]$argv[0]).Replace([char]'/', [char]'\')
     if (Test-FixturePlainPath $a0 $root $rootFull) { return 'fixture' }   # the program itself lives in the dir
-    $psAt = -1; $genericEnd = 0
+    $psAt = -1; $pyAt = -1
     if ($img -cmatch '^(pwsh|powershell|powershell_ise|powers~[0-9])$') { $psAt = 0 }
     elseif ($img -cmatch '^(python[0-9.]*|pythonw|python[0-9.]*w|py|pyw)$') {
-        $genericEnd = $argv.Count
-        for ($hi = 1; $hi -lt $argv.Count; $hi++) {
-            $hl = ([string]$argv[$hi]).Replace([char]'/', [char]'\'); $hl = $hl.Substring($hl.LastIndexOf([char]'\') + 1).ToLowerInvariant() -replace '\.(exe|dll|com|bat|cmd)$', ''
-            if ($hl -cmatch '^(cmd|pwsh|powershell|powershell_ise|powers~[0-9]|bash|sh|zsh|dash|wsl|conhost|dotnet|node|wscript|cscript|mshta|rundll32|start|runas|sudo|env|python[0-9.]*|pythonw|py|pyw)$') { $genericEnd = $hi; break }
+        $pyAt = if ($argv.Count -gt 1 -and ([string]$argv[1]) -ceq '-c') { 3 } else { 1 }
+        if ($pyAt -lt $argv.Count -and $pyAt -eq 1 -and ([string]$argv[1]).StartsWith('-') -and -not ([string]$argv[1]).StartsWith('--')) {
+            # a single-dash argv[1] other than -c is a python option (-m, -u, -X, -E, ...), not a script: only the -o=/-x= option-value shape
+            # the r6 rows pin is read, through the '=' rule below.
+            if (([string]$argv[1]).IndexOf([char]'=') -lt 0) { $pyAt = -1 }
         }
     }
-    for ($ti = 1; $ti -lt $genericEnd; $ti++) {
-        $prev = [string]$argv[$ti - 1]
-        if ($ti -gt 0 -and $prev -match '^(-[cek]|/[ckr]|--?(command|eval|exec))$') { continue }
+    foreach ($ti in @($pyAt)) {
+        if ($ti -lt 1 -or $ti -ge $argv.Count) { continue }
         $tn = ([string]$argv[$ti]).Replace([char]'/', [char]'\')
         $vals = @($tn)
         $q = $tn.IndexOf([char]'=')
@@ -4230,6 +4234,14 @@ try { $out = @(Add-LeaseSlotSnapshot -JobId 'jB4a' -Phase 'request') } catch { $
             'python-hands-cmd'        = 'python.exe -c "import subprocess,sys; subprocess.run(sys.argv[1:])" cmd /k echo C:\Temp\um-agent-quiet-lease-1234-abcd1234'
             'python-hands-pwsh'       = 'python.exe C:\Temp\other\run.py pwsh.exe -Command "x #" -File C:\Temp\um-agent-quiet-lease-1234-abcd1234'
             'python-hands-python'     = 'python.exe -c "import os,sys; os.execv(sys.argv[1], sys.argv[1:])" C:\Python\python.exe -c "import time" C:\Temp\um-agent-quiet-lease-1234-abcd1234\x'
+            # r7 fix 2 (adversary r7 pass-15 A1): verbatim, then the class: a python line hands its argv to a launcher no list names, or the
+            # fixture path is a LATER argument, or argv[1] is a python option (-m, -u): only argv[1] (argv[3] after -c <code>) is a candidate.
+            'p15-verbatim'            = 'python.exe -c "import subprocess,sys;subprocess.run(sys.argv[1:])" pwsh-preview.exe -Command "Start-Sleep 300 #" -File C:\Temp\um-agent-quiet-lease-1234-abcd1234'
+            'python-hands-any-name'   = 'python.exe -c "import subprocess,sys;subprocess.run(sys.argv[1:])" my-launcher.exe C:\Temp\um-agent-quiet-lease-1234-abcd1234\x'
+            'python-later-data-arg'   = 'python.exe C:\Temp\other\run.py --flag C:\Temp\um-agent-quiet-lease-1234-abcd1234\x'
+            'python-after-c-data-2'   = 'python.exe -c "import subprocess,sys;subprocess.run(sys.argv[2:])" x C:\Temp\um-agent-quiet-lease-1234-abcd1234\x'
+            'python-m-module'         = 'python.exe -m runpy C:\Temp\um-agent-quiet-lease-1234-abcd1234\x.py'
+            'python-option-first'     = 'python.exe -u C:\Temp\um-agent-quiet-lease-1234-abcd1234\heavy-slot-fake.py status'
         }
         $whControls = [ordered]@{
             'control-python-fake'     = '"C:\Python\python.exe" "C:\Temp\um-agent-quiet-lease-1234-abcd1234\heavy-slot-fake.py" lease release'
@@ -4267,7 +4279,7 @@ try { $out = @(Add-LeaseSlotSnapshot -JobId 'jB4a' -Phase 'request') } catch { $
             $want = if ($isControl) { 'match=fixture survivor=True unknown=False stopped=True killed=True' } else { 'match=unknown survivor=False unknown=True stopped=False killed=False' }
             if ($row -cne $want) { $whBad.Add("[$k] $row want $want") }
         }
-        Assert-True ($whBad.Count -eq 0) "lease-seam-wrapper-host: a fixture path on a line whose argv[0] is not a program this suite starts (a wrapper such as conhost, a shell, another interpreter), or after a shell named inside a python line, is counted unknown and never killed; the suite's python, pwsh -File and in-dir shapes are still killed (adversary r7 pass-14 A1): $($whBad -join ' ; ')"
+        Assert-True ($whBad.Count -eq 0) "lease-seam-wrapper-host: a fixture path on a line whose argv[0] is not a program this suite starts (a wrapper such as conhost, a shell, another interpreter), or after a shell named inside a python line, is counted unknown and never killed; the suite's python, pwsh -File and in-dir shapes are still killed (adversary r7 pass-14 A1, pass-15 A1): $($whBad -join ' ; ')"
         $results.leaseSeamWrapperHost = [ordered]@{ attackRows = $whRows.Count; controls = $whControls.Count; survivors = @($whC.survivors).Count; unknown = @($whC.unknown).Count; killed = "[$($script:WhKilled -join ',')]"; rows = $whOut }
     }
     # fixture-census-probe-error (r7 E1; Dot advisory 6706643231, hub ACK 6706997355): a suite whose suite-end fixture census THROWS has no
