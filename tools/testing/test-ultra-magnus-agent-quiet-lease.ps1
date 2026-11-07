@@ -504,7 +504,8 @@ function Split-WindowsCommandLine([string]$CommandLine) {
 # forward slashes (python.exe C:/Temp/fx/x); r4 only matched an argument that STARTS with the raw dir, so both were a false zero in the census.
 # Hub ruling 20261106T1728Z splits the decision in two:
 #   'fixture' (the census counts it AND the sweep may kill it) only when, after '/' -> '\' and ignoring case, an argument, or the value after
-#     an option name's '=', resolves (GetFullPath) to the dir or under it (r4's rule, kept; r5 pass-9 A1: only an option NAME before the '=').
+#     an option name's '=', resolves (GetFullPath) to the dir or under it (r4's rule, kept; r5 pass-9 A1: only an option NAME before the '=';
+#     r6 pass-11 A1: and what follows the dir is a plain path of simple names, never script text).
 #   'unknown' (counted, never killed): the line contains the dir's leaf in any other form, including every occurrence INSIDE an argument (a
 #     script string). A sibling ("<dir> other", <dir>2, <dir>-other, <dir>'other) is unknown, so r4 B1 stays closed (never killed), and no
 #     reading of the line can hide a live writer as a zero (unknown fails the suite-end check).
@@ -532,6 +533,11 @@ function Get-FixtureMatch([string]$CommandLine, [string]$Fx) {
         if ($q -gt 0 -and $tn.Substring(0, $q) -cmatch '^[-\\]{0,2}[A-Za-z0-9_][A-Za-z0-9_.\-]*$') { $vals += $tn.Substring($q + 1) }
         foreach ($v in $vals) {
             if (-not ($v.Equals($root, [StringComparison]::OrdinalIgnoreCase) -or $v.StartsWith($root + '\', [StringComparison]::OrdinalIgnoreCase))) { continue }
+            # r6 pass-11 A1: a whole argument can itself be script text (pwsh -Command "<dir>\sub\`..\`..\x.ps1; Start-Sleep 300"): its escapes,
+            # quotes, variables and separators mean the text is not the path the process uses, and GetFullPath reads `.. as a plain name. So the part
+            # after the dir must be a PLAIN path: '\'-separated names of [A-Za-z0-9_.-] that start with a letter, digit, '_' or '-' (no '.' or '..'
+            # segment, no ':' stream, no backtick, '$', quote, ';', space, '%' or bracket). Anything else is unknown (counted, never killed).
+            if ($v.Substring($root.Length) -cnotmatch '^(\\[A-Za-z0-9_\-][A-Za-z0-9_.\-]*)*\\?$') { continue }
             $full = $null
             try { $full = [IO.Path]::GetFullPath($v).TrimEnd([char]'\') } catch { continue }   # an unresolvable value is not admitted here (it stays unknown)
             if ($full.Equals($rootFull, [StringComparison]::OrdinalIgnoreCase) -or $full.StartsWith($rootFull + '\', [StringComparison]::OrdinalIgnoreCase)) { return 'fixture' }
@@ -3688,8 +3694,8 @@ try { $out = @(Add-LeaseSlotSnapshot -JobId 'jB4a' -Phase 'request') } catch { $
                 @{ cl = 'python.exe -c "import time; time.sleep(300)" "C:\Temp\um-agent-quiet-lease-1234-abcd1234\..\unrelated\log.txt"'; want = $false }
                 @{ cl = 'python.exe --log=C:\Temp\um-agent-quiet-lease-1234-abcd1234/../unrelated/log.txt'; want = $false }
                 @{ cl = 'python.exe C:\Temp\um-agent-quiet-lease-1234-abcd1234\sub\..\..\um-agent-quiet-lease-1234-abcd1234-other\x'; want = $false }
-                @{ cl = 'python.exe C:\Temp\um-agent-quiet-lease-1234-abcd1234\sub\..\heavy-slot-fake.py'; want = $true }
-                @{ cl = 'python.exe C:\Temp\um-agent-quiet-lease-1234-abcd1234\.\heavy-slot-fake.py'; want = $true }
+                @{ cl = 'python.exe C:\Temp\um-agent-quiet-lease-1234-abcd1234\sub\..\heavy-slot-fake.py'; want = $false }   # r6 pass-11 A1: a '..' segment is not a plain path (counted unknown)
+                @{ cl = 'python.exe C:\Temp\um-agent-quiet-lease-1234-abcd1234\.\heavy-slot-fake.py'; want = $false }        # r6 pass-11 A1: nor is a '.' segment
                 # r4 pass-5 A4 (verbatim): the same dir in other case is the fixture (Windows paths ignore case).
                 @{ cl = 'python.exe "C:\TEMP\UM-AGENT-QUIET-LEASE-1234-ABCD1234\heavy-slot-fake.py"'; want = $true }
             )
@@ -3729,6 +3735,18 @@ try { $out = @(Add-LeaseSlotSnapshot -JobId 'jB4a' -Phase 'request') } catch { $
                 @{ cl = 'pwsh.exe -Command "x ''C:\Temp\fx\..\fx2\y''"'; want = 'unknown' }            # embedded, climbs out: not admitted, still counted
                 @{ cl = 'python.exe -c "p = ''C:\\Temp\\fx\\x''"'; want = 'unknown' }                  # doubled backslashes: the leaf still names it
                 @{ cl = 'python.exe C:\Temp\other\y.txt'; want = 'none' }
+                # r6 pass-11 A1: a WHOLE argument that is script text starting with the dir. sol's shape (PowerShell reads `. as '.', so the path is
+                # C:\Temp\unrelated\log.ps1), then its class: separators, variables, quotes, streams, '.'/'..' segments, spaces. All unknown.
+                @{ cl = 'pwsh.exe -Command "C:\Temp\fx\sub\`..\`..\unrelated\log.ps1; Start-Sleep -Seconds 300"'; want = 'unknown' }
+                @{ cl = 'pwsh.exe -Command "C:\Temp\fx\x.ps1; Start-Sleep -Seconds 300"'; want = 'unknown' }
+                @{ cl = 'pwsh.exe -Command C:\Temp\fx\$x'; want = 'unknown' }
+                @{ cl = 'pwsh.exe -Command "C:\Temp\fx\a''b"'; want = 'unknown' }
+                @{ cl = 'python.exe C:\Temp\fx\x:stream'; want = 'unknown' }
+                @{ cl = 'python.exe C:\Temp\fx\sub\..\x'; want = 'unknown' }
+                @{ cl = 'python.exe "C:\Temp\fx\a b.txt"'; want = 'unknown' }
+                @{ cl = 'python.exe --log=C:\Temp\fx\`..\y'; want = 'unknown' }
+                @{ cl = 'python.exe C:\Temp\fx\heavy-slot-fake.py status'; want = 'fixture' }   # control: a plain path under the dir
+                @{ cl = 'python.exe C:\Temp\fx\'; want = 'fixture' }                            # control: the dir with a trailing separator
             )
             $c5Bad = [System.Collections.Generic.List[string]]::new()
             foreach ($r in $c5Rows) {
@@ -3767,6 +3785,8 @@ try { $out = @(Add-LeaseSlotSnapshot -JobId 'jB4a' -Phase 'request') } catch { $
                 [pscustomobject]@{ ProcessId = 24680; ParentProcessId = 24681; CreationDate = $p10S.AddMinutes(2); CommandLine = 'pwsh.exe -Command "Start-Sleep -Seconds 300 # =C:\Temp\um-agent-quiet-lease-1234-abcd1234"' }
                 [pscustomobject]@{ ProcessId = 24681; ParentProcessId = $PID; CreationDate = $p10S.AddMinutes(1); CommandLine = 'python.exe -c "import time; time.sleep(300)"' }
                 [pscustomobject]@{ ProcessId = 24682; ParentProcessId = $PID; CreationDate = $p10S.AddMinutes(1); CommandLine = 'python.exe C:\Temp\um-agent-quiet-lease-1234-abcd1234\heavy-slot-fake.py status' }
+                # r6 pass-11 A1 (sol's input verbatim): a whole -Command argument that is script text starting with the dir; f8d1df88 killed it
+                [pscustomobject]@{ ProcessId = 24683; ParentProcessId = 4; CreationDate = $p10S; CommandLine = 'pwsh.exe -Command "C:\Temp\um-agent-quiet-lease-1234-abcd1234\sub\`..\`..\unrelated\log.ps1; Start-Sleep -Seconds 300"' }
             )
             $p10Census = Get-FixtureCensus $p10Fx -Rows $p10Rows
             $script:P10Killed = [System.Collections.Generic.List[int]]::new()
@@ -3779,9 +3799,9 @@ try { $out = @(Add-LeaseSlotSnapshot -JobId 'jB4a' -Phase 'request') } catch { $
                 $m | Add-Member -MemberType ScriptMethod -Name Dispose -Value { }
                 return $m
             }
-            $p10Stopped = @(Stop-FixtureLeftovers $p10Fx @(24680, 24681, 24682) -Rows $p10Rows -OpenPid $p10Open)
+            $p10Stopped = @(Stop-FixtureLeftovers $p10Fx @(24680, 24681, 24682, 24683) -Rows $p10Rows -OpenPid $p10Open)
             $p10Row = "survivors=[$(@($p10Census.survivors) -join ',')] unknown=[$(@($p10Census.unknown) -join ',')] stopped=[$($p10Stopped -join ',')] killed=[$($script:P10Killed -join ',')]"
-            if ($p10Row -cne 'survivors=[24682] unknown=[24680] stopped=[24682] killed=[24682]') { $c5Bad.Add("[pass-10 A1] $p10Row want survivors=[24682] unknown=[24680] stopped=[24682] killed=[24682]") }
+            if ($p10Row -cne 'survivors=[24682] unknown=[24680,24683] stopped=[24682] killed=[24682]') { $c5Bad.Add("[pass-10 A1 / pass-11 A1] $p10Row want survivors=[24682] unknown=[24680,24683] stopped=[24682] killed=[24682]") }
             $results.pass10A1NoDescent = $p10Row
             # r6: no descent code is left to adopt a stranger (static guard: the census and the sweep never read a parent pid or creation time).
             $p10Src = Get-Content -LiteralPath $PSCommandPath -Raw
@@ -3810,7 +3830,7 @@ try { $out = @(Add-LeaseSlotSnapshot -JobId 'jB4a' -Phase 'request') } catch { $
             $c5Row = "embedded unknown=$(@($c5Real.unknown) -contains $c5Emb.Id) forward counted=$(@($c5Real.survivors) -contains $c5Fwd.Id) sibling unknown=$(@($c5Real.unknown) -contains $c5Sib.Id) stopped=[$($c5Stopped -join ',')] forward gone=$c5Gone embedded alive=$(-not $c5Emb.HasExited) sibling alive=$(-not $c5Sib.HasExited)"
             if (-not ((@($c5Real.unknown) -contains $c5Emb.Id) -and (@($c5Real.survivors) -contains $c5Fwd.Id) -and (@($c5Real.unknown) -contains $c5Sib.Id) -and $c5Gone -and $c5Stopped -notcontains $c5Emb.Id -and $c5Stopped -notcontains $c5Sib.Id -and -not $c5Emb.HasExited -and -not $c5Sib.HasExited)) { $c5Bad.Add("real processes: $c5Row") }
             Stop-OwnedChildren @($c5Emb, $c5Sib)   # r6: the sweep never kills an embedded match; this case ends the children it started through their objects
-            Assert-True ($c5Bad.Count -eq 0) "lease-seam-pid-cleanup: a fixture dir embedded in a script argument or written with forward slashes is counted (never a false zero), an embedded match or a sibling is counted unknown and never killed, and no pid ancestry confers ownership (sol r4 B1, r5 pass-10 A1): $($c5Bad -join ' ; ')"
+            Assert-True ($c5Bad.Count -eq 0) "lease-seam-pid-cleanup: a fixture dir embedded in a script argument or written with forward slashes is counted (never a false zero), an embedded match or a sibling is counted unknown and never killed, no pid ancestry confers ownership, and a whole argument that is script text is no kill match (sol r4 B1, r5 pass-10 A1, r6 pass-11 A1): $($c5Bad -join ' ; ')"
             $results.leaseSeamEmbeddedCensus = $c5Row
             # r4 pass-5 A2 (verbatim shape): pid 42424 is a process whose Handle getter fails (no pin) while every other query answers and the identity
             # check accepts it. A stop that goes on without the pin may kill whatever holds 42424 by then: it must refuse, and never call Kill().
