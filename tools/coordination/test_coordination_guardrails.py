@@ -1887,6 +1887,16 @@ def test_prompt_demanding_a_verdict_json_is_the_key_signal(tmp_path):
     assert not _prompt_demands_verdict(tmp_path, "Summarise the verdict of the committee.")
 
 
+def test_r6_adv2_a1_a_field_fragment_without_an_object_is_not_a_verdict_demand(tmp_path):
+    # adversary r6 pass 2 A1: the bare '"verdict"\s*:' pattern made a literal-output probe that merely quotes the field
+    # ('Reply with exactly these 10 characters: "verdict":') demand a verdict, so its answer '"verdict":' was rejected.
+    # A prompt demands a verdict by spelling a JSON OBJECT that carries the key: an opening brace comes before it.
+    assert not _prompt_demands_verdict(tmp_path, 'Reply with exactly these 10 characters: "verdict":')
+    assert not _prompt_demands_verdict(tmp_path, 'Print the key "verdict": then stop.')
+    assert _prompt_demands_verdict(tmp_path, 'Final json:\n{\n  "head": {"sha": "abc"},\n  "verdict": "APPROVE"\n}')
+    assert _prompt_demands_verdict(tmp_path, 'Reply with exactly: {"verdict":"APPROVE"}')
+
+
 # The Invoke-Lane wiring is EXECUTED, not string-matched: the statements between the K4 sentinels run
 # against fixture variables, so a later reassignment of $codexAnswerEvidence inside them reds.
 def _sentinel_block(body, name):

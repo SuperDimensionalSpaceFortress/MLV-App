@@ -198,7 +198,12 @@ function Test-LaneAnswerHasSubstance {
 function Test-PromptDemandsVerdict {
     param([AllowEmptyString()][AllowNull()][string]$Prompt)
     if ([string]::IsNullOrEmpty($Prompt)) { return $false }
-    return [regex]::IsMatch($Prompt, '"verdict"\s*:')
+    # r6 pass 2 (adversary A1): the key must sit in a spelled JSON OBJECT, so an opening brace comes before it. A prompt that
+    # only quotes the field ('Reply with exactly: "verdict":') is a literal-output probe, not a verdict demand. IndexOf then one
+    # match keeps it linear in the prompt length.
+    $open = $Prompt.IndexOf('{')
+    if ($open -lt 0) { return $false }
+    return [regex]::IsMatch($Prompt.Substring($open), '"verdict"\s*:')
 }
 
 # A JSON OBJECT, strictly (KERNEL-K4 r3, adversary A3): System.Text.Json with its defaults (no comments, no
