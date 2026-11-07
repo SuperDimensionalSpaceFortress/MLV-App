@@ -70,20 +70,17 @@ inline const char *outcomeName( Outcome outcome )
     return "unknown";
 }
 
-// The gradient re-anchor's request-serial floor (MainWindow::m_gradientReanchorSerialFloor) only ever rises while it is
-// armed: an arm that saved its floor earlier (resizeEvent takes it before drawFrame(), then waits, pumping) must not
-// lower a floor a newer geometry change armed during that wait (adversary r2 pass 2 A1).
-inline std::uint64_t raisedReanchorFloor( std::uint64_t current, std::uint64_t candidate )
-{
-    return candidate > current ? candidate : current;
-}
-
-// r3 RED stub: today's decision with the serial floor taken away is the flag alone. The fix keys it on geometry too.
+// MainWindow::finishPresentedFrame's gradient re-anchor (adversary r2 pass 3 A1). drawFrameReady sizes the scene from the
+// zoom and stretch state at PRESENT time, so the geometry a frame lands on is not a property of its request serial (an
+// older request can present at the new geometry, a newer one at the old). The overlay is re-anchored when the flag is
+// set (consumed on any frame, as the base does) or when the landed scene differs from the geometry it was last anchored
+// on (GradientElement records that on every redrawGradientElement call; -1 = never anchored). This covers a redraw on
+// the old scene followed by a late frame that changes it (r1 pass 3 A1), an older request consuming the flag on the old
+// scene (r2 pass 1 A2) and a geometry change armed inside the resize wait (r2 pass 2 A1), with no ordering state.
 inline bool gradientNeedsReanchor( bool zoomModeChanged, int anchoredSceneWidth, int anchoredSceneHeight,
                                    int sceneWidth, int sceneHeight )
 {
-    (void)anchoredSceneWidth; (void)anchoredSceneHeight; (void)sceneWidth; (void)sceneHeight;
-    return zoomModeChanged;
+    return zoomModeChanged || anchoredSceneWidth != sceneWidth || anchoredSceneHeight != sceneHeight;
 }
 
 inline Result wait( const Callbacks &callbacks )

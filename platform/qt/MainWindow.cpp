@@ -3205,9 +3205,6 @@ void MainWindow::resizeEvent(QResizeEvent *event)
             m_pRenderThread->unlock();
         }
         waitForResizeStillDrawing( QStringLiteral("resize") );
-        // The first request at the new geometry is drawFrame()'s; an older request still in flight must not consume the
-        // gradient re-anchor armed below (adversary r2 A2).
-        const uint64_t gradientReanchorSerialFloor = m_nextRenderRequestSerial;
         drawFrame();
         if( ui->checkBoxGradientEnable->isChecked() && ui->groupBoxLinearGradient->isChecked() )
         {
@@ -3224,10 +3221,10 @@ void MainWindow::resizeEvent(QResizeEvent *event)
             // redraw on the scene that frame sets. A stale or cleared flag does not prove the frame landed: isIdle ignores
             // a Ready slot whose frameReady has not been emitted yet (RenderFrameThread.cpp), so a late frame can still
             // change the scene (adversary r1 pass 3 A1). Armed after the wait, so a frame landing inside a pump cannot
-            // consume it early; a spare redraw on an unchanged scene places the overlay where it already is.
+            // consume it early; a spare redraw on an unchanged scene places the overlay where it already is. A frame that
+            // consumes it on the old scene does not strand the overlay either: finishPresentedFrame also re-anchors when the
+            // landed scene differs from the anchored one (gradientNeedsReanchor; adversary r2 pass 3 A1).
             m_zoomModeChanged = true;
-            // Raise, never lower: a geometry change dispatched inside the wait above armed a newer floor (adversary r2 pass 2 A1).
-            m_gradientReanchorSerialFloor = resize_still_drawing_wait::raisedReanchorFloor( m_gradientReanchorSerialFloor, gradientReanchorSerialFloor );
         }
     }
     event->accept();
@@ -22318,8 +22315,6 @@ void MainWindow::on_actionZoomFit_triggered(bool on)
         m_frameChanged = true;
     }
     m_zoomModeChanged = true;
-    m_gradientReanchorSerialFloor = resize_still_drawing_wait::raisedReanchorFloor( m_gradientReanchorSerialFloor,
-                                                                                 m_nextRenderRequestSerial ); // adversary r2 A2
 }
 
 //Click on Zoom: 100%
@@ -33307,10 +33302,14 @@ void MainWindow::finishPresentedFrame( uint64_t displayFrame,
         ui->graphicsView->verticalScrollBar()->setValue( ( getMlvHeight(m_pMlvObject) * getVerticalStretchFactor(false) - ui->graphicsView->height() ) / 2 );
     }
 
-    // adversary r2 A2: an older request still in flight when the re-anchor was armed lands on the old geometry and must
-    // not consume it. Serial 0 is a frame with no request serial (kept as before: it consumes).
-    if( m_zoomModeChanged
-     && ( readyFrame.requestSerial == 0 || readyFrame.requestSerial >= m_gradientReanchorSerialFloor ) )
+    // GUI-SMOKE-FOREGROUND-HANG-NOLA-1 (adversary r2 pass 3 A1): drawFrameReady sized the scene at present time, so the
+    // geometry this frame landed on decides placement, not its request serial. Re-anchor on the flag (any frame, as the
+    // base) or when the scene differs from the geometry the gradient was last anchored on.
+    if( resize_still_drawing_wait::gradientNeedsReanchor( m_zoomModeChanged,
+                                                          m_pGradientElement->anchoredSceneWidth(),
+                                                          m_pGradientElement->anchoredSceneHeight(),
+                                                          static_cast<int>( m_pScene->width() ),
+                                                          static_cast<int>( m_pScene->height() ) ) )
     {
         m_zoomModeChanged = false;
         m_pGradientElement->redrawGradientElement( m_pScene->width(),
@@ -35302,8 +35301,6 @@ void MainWindow::on_comboBoxHStretch_currentIndexChanged(int index)
     if( !m_inOpeningProcess && !m_setSliders ) on_horizontalSliderVignetteRadius_valueChanged( ui->horizontalSliderVignetteRadius->value() );
     resultingResolution();
     m_zoomModeChanged = true;
-    m_gradientReanchorSerialFloor = resize_still_drawing_wait::raisedReanchorFloor( m_gradientReanchorSerialFloor,
-                                                                                 m_nextRenderRequestSerial ); // adversary r2 A2
     m_frameChanged = true;
 }
 
@@ -35315,8 +35312,6 @@ void MainWindow::on_comboBoxVStretch_currentIndexChanged(int index)
     if( !m_inOpeningProcess && !m_setSliders ) on_horizontalSliderVignetteRadius_valueChanged( ui->horizontalSliderVignetteRadius->value() );
     resultingResolution();
     m_zoomModeChanged = true;
-    m_gradientReanchorSerialFloor = resize_still_drawing_wait::raisedReanchorFloor( m_gradientReanchorSerialFloor,
-                                                                                 m_nextRenderRequestSerial ); // adversary r2 A2
     m_frameChanged = true;
 }
 
