@@ -86,6 +86,10 @@ ALLOW_LIST = {
         "src/processing/ThreadExitCache.h",
         "// Why: on mingw-w64 v11 the exe's TLS callback runs thread_local destructors after",
     ): COMMENT_TEXT,
+    (
+        "platform/qt/LookAssistAnalysisPump.h",
+        "// MinGW a thread_local destructor can run after its storage is freed (commit 9183c7cf6, tls_exit_order_fixture).",
+    ): COMMENT_TEXT,
 }
 
 
