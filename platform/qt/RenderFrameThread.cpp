@@ -16,6 +16,7 @@
 #include "PlaybackQualityPolicy.h"
 #include "PlaybackSlotRelease.h"
 #include "ReconWorker.h"
+#include "ResizeStillDrawingWait.h"
 
 #include "../../src/batch/WorkerThreadCount.h"
 #include "../../src/debayer/debayer.h"
@@ -1266,6 +1267,18 @@ bool RenderFrameThread::isFrameReady()
 bool RenderFrameThread::isIdle()
 {
     QMutexLocker locker(&m_mutex);
+    return isIdleLocked();
+}
+
+// GUI-SMOKE-FOREGROUND-HANG-NOLA-1 (adversary r3 pass 3 A1): the resize wait's sample. Never waits for m_mutex: held means
+// busy (resize_still_drawing_wait::probeIdleWithoutWaiting).
+bool RenderFrameThread::isIdleNoWait()
+{
+    return resize_still_drawing_wait::probeIdleWithoutWaiting( m_mutex, [this]() { return isIdleLocked(); } );
+}
+
+bool RenderFrameThread::isIdleLocked( void ) const
+{
     return !(m_renderFrame || m_renderingFrame || phase3WorkInFlightLocked());
 }
 
@@ -1273,6 +1286,20 @@ bool RenderFrameThread::isIdleExceptPlaybackLookahead( int activePlaybackTarget,
                                                        uint64_t activeGeneration )
 {
     QMutexLocker locker(&m_mutex);
+    return isIdleExceptPlaybackLookaheadLocked( activePlaybackTarget, activeGeneration );
+}
+
+bool RenderFrameThread::isIdleExceptPlaybackLookaheadNoWait( int activePlaybackTarget,
+                                                             uint64_t activeGeneration )
+{
+    return resize_still_drawing_wait::probeIdleWithoutWaiting( m_mutex, [&]() {
+        return isIdleExceptPlaybackLookaheadLocked( activePlaybackTarget, activeGeneration );
+    } );
+}
+
+bool RenderFrameThread::isIdleExceptPlaybackLookaheadLocked( int activePlaybackTarget,
+                                                             uint64_t activeGeneration ) const
+{
     const auto blocks = [&]( const ReadyFrame::PresentationContext &context,
                              uint32_t frameNumber ) -> bool
     {

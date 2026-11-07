@@ -1260,6 +1260,7 @@ private:
     int playbackRenderLookaheadFrames() const;
     int currentPlaybackAdvanceTarget();
     bool renderThreadBusyForPlaybackAdvance( int activePlaybackTarget );
+    bool renderThreadIdleNoWait( int activePlaybackTarget );
     bool waitForResizeStillDrawing( const QString &site );
     bool m_automationPacingIsolated = false;
     // ENFORCE-4: the autoplay hook's verdict is a fail-closed LATCH (PlaybackFrameRange.h): armed failing (14) when the hook

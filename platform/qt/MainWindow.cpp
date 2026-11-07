@@ -2883,6 +2883,21 @@ bool MainWindow::renderThreadBusyForPlaybackAdvance( int activePlaybackTarget )
     return !m_pRenderThread->isIdle();
 }
 
+// GUI-SMOKE-FOREGROUND-HANG-NOLA-1 (adversary r3 pass 3 A1): the resize wait's renderIdle() sample. The same decision as
+// !renderThreadBusyForPlaybackAdvance(), but it never waits for the renderer mutex: a held mutex is busy at once, so a
+// hold of any length ends the idle run and no duration threshold exists. Every other caller keeps the blocking read.
+bool MainWindow::renderThreadIdleNoWait( int activePlaybackTarget )
+{
+    if( !m_pRenderThread ) return true;
+    if( ui->actionPlay->isChecked() && playbackRenderLookaheadFrames() > 0 )
+    {
+        return m_pRenderThread->isIdleExceptPlaybackLookaheadNoWait(
+            activePlaybackTarget,
+            m_playbackPresentationGeneration.load( std::memory_order_acquire ) );
+    }
+    return m_pRenderThread->isIdleNoWait();
+}
+
 static int mlvappStartPlaybackTimer( QObject *owner, double framerate )
 {
     if( !owner ) return 0;
@@ -3150,7 +3165,7 @@ bool MainWindow::waitForResizeStillDrawing( const QString &site )
     clock.start();
     resize_still_drawing_wait::Callbacks callbacks;
     callbacks.stillDrawing = [this]() { return m_frameStillDrawing; };
-    callbacks.renderIdle = [this]() { return !renderThreadBusyForPlaybackAdvance( currentPlaybackAdvanceTarget() ); };
+    callbacks.renderIdle = [this]() { return renderThreadIdleNoWait( currentPlaybackAdvanceTarget() ); };
     callbacks.pump = []() { qApp->processEvents( QEventLoop::ExcludeUserInputEvents ); };
     callbacks.clearStale = [this]() { m_frameStillDrawing = false; };
     callbacks.nowMs = [&clock]() { return static_cast<std::int64_t>( clock.elapsed() ); };

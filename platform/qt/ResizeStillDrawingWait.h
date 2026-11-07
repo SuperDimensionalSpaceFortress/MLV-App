@@ -10,11 +10,11 @@
 //   - pump; flag clears               -> Cleared
 //   - flag still set after >= kMinPumpsBeforeStale pumps, while renderIdle() has held continuously for
 //     >= kStaleIdleGraceMs             -> clearStale() once, StaleCleared
-//   - kDeadlineMs since entry, measured after a pump's renderIdle() sample (it can block on the renderer mutex), i.e.
-//     immediately before the next pump -> Timeout (the caller proceeds)
-// The idle grace runs from when a renderIdle() sample RETURNS idle, on a microsecond clock; a later sample that spends
-// kBlockedSampleUs or more inside renderIdle() restarts it where that sample returns, so blocked time is never idle and
-// never joins two idle periods. A shorter (uncontended) sample keeps the run, minus its own time.
+//   - kDeadlineMs since entry, measured after a pump's renderIdle() sample, i.e. immediately before the next pump
+//     -> Timeout (the caller proceeds)
+// renderIdle() must not wait for the renderer mutex (probeIdleWithoutWaiting): a held mutex is a busy sample. The idle
+// grace runs, on a microsecond clock, from when the first idle sample after a busy one (or after entry) RETURNS; any busy
+// sample ends the run, so a renderer hold of any length is never idle and never joins two idle periods.
 // A busy render thread is never forged clear: it only ever times out.
 // WHAT IS BOUNDED (adversary r1 A1 and its re-pass): the time this helper spends deciding, i.e. the number of pumps
 // after the deadline is zero. The deadline is checked after every pump, so a pump that outlasts it ends the wait at
@@ -52,16 +52,15 @@ struct Callbacks
     std::function<std::int64_t()> nowUs; // monotonic, microseconds; preferred (adversary r3 pass 2 A1)
 };
 
-// The shortest renderIdle() sample that counts as BLOCKED on the renderer mutex. An uncontended read costs a few
-// microseconds; a renderer holding the mutex for a frame holds it for milliseconds. 100 us sits between the two, so a
-// quiet render thread is not mistaken for a busy one (which would only ever time out), and a real hold is never idle.
-constexpr std::int64_t kBlockedSampleUs = 100;
-
-// RED stub (adversary r3 pass 3 A1): waits for the renderer mutex, as the current renderIdle() sample does.
+// The renderIdle() sample (adversary r3 pass 3 A1). It never waits for the renderer mutex: a mutex someone holds is
+// reported BUSY at once and idleLocked() does not run. A hold of any length is therefore seen as busy, which ends the idle
+// run; no duration threshold tells a contended sample from an uncontended one (r3's kBlockedSampleUs let a hold shorter
+// than 100 us keep the credit from before it). RenderFrameThread::isIdleNoWait / isIdleExceptPlaybackLookaheadNoWait use
+// it on m_mutex; every other isIdle() reader keeps its blocking read. Mutex needs tryLock() and unlock() (QMutex).
 template <typename Mutex, typename IdleLocked>
 inline bool probeIdleWithoutWaiting( Mutex &rendererMutex, IdleLocked idleLocked )
 {
-    rendererMutex.lock();
+    if( !rendererMutex.tryLock() ) return false;
     const bool idle = idleLocked();
     rendererMutex.unlock();
     return idle;
@@ -126,28 +125,25 @@ inline Result wait( const Callbacks &callbacks )
         }
 
         result.renderIdle = callbacks.renderIdle();
-        // adversary r1 pass 3 A2: renderIdle() reaches the renderer mutex and can block, so both the stale grace and the
-        // deadline are judged on a clock sampled after it returns. Nothing runs between this sample and the next pump.
+        // adversary r1 pass 3 A2: both the stale grace and the deadline are judged on a clock sampled after renderIdle()
+        // returns (it no longer waits for the renderer mutex, but its time is still never left unjudged). Nothing runs
+        // between this sample and the next pump.
         const std::int64_t sampledUs = clockUs();
         const std::int64_t waitedUs = sampledUs - startUs;
         result.waitedMs = waitedUs / 1000;
-        const std::int64_t sampleUs = sampledUs - pumpedUs;
         if( !result.renderIdle )
         {
+            // A busy sample ends the run. The probe reports a held renderer mutex as busy without waiting (adversary r3
+            // pass 3 A1), so a hold of any length is a break in idleness: neither the hold (adversary r2 A1) nor the idle
+            // time before it (adversary r3 A1) is credited to the next run.
             idleRun = false;
         }
-        else if( !idleRun || sampleUs >= kBlockedSampleUs )
+        else if( !idleRun )
         {
-            // A run opens when an idle sample returns. A sample that spent kBlockedSampleUs or more inside renderIdle()
-            // (the render thread held its mutex) is a break in idleness: it restarts the run where it returns, so neither
-            // the blocked time (adversary r2 A1) nor the idle time before it (adversary r3 A1) is credited.
+            // A run opens when an idle sample returns (adversary r1 pass 3 A2). An idle sample is judged by its report,
+            // never by its duration: the probe does not wait, so its time is GUI-thread time, not renderer time.
             idleRun = true;
             idleSinceUs = sampledUs;
-        }
-        else
-        {
-            // An uncontended read (under kBlockedSampleUs) keeps the run, but its own time is still not credited.
-            idleSinceUs += sampleUs;
         }
 
         if( idleRun
