@@ -544,25 +544,37 @@ function Get-FixtureMatch([string]$CommandLine, [string]$Fx) {
     if ($argv.Count -eq 0) { return 'unknown' }
     # r6 pass-12 A2 (and the pass-11 class): an argument is script text, never a path, when a shell reads it. cmd.exe re-parses the whole rest
     # of its line, so nothing on a cmd line is a whole match; for pwsh/powershell only the -File argument is a path, and r7: only when it is
-    # reached through known options, never after command text (Get-PsHostFileArg); for any other program the argument right after a script
-    # flag (-c, -e, -k, /c, /k, /r, --command, --eval, --exec) is script text.
+    # reached through known options, never after command text (Get-PsHostFileArg); for python the argument right after a script flag (-c,
+    # -e, -k, /c, /k, /r, --command, --eval, --exec) is script text; r7 fix 1: any other program is no kill match at all (allow-list below).
     $img = $argv[0].Replace([char]'/', [char]'\'); $img = $img.Substring($img.LastIndexOf([char]'\') + 1).ToLowerInvariant()
     if ($img.EndsWith('.exe')) { $img = $img.Substring(0, $img.Length - 4) }
     if ($img -ceq 'cmd') { return 'unknown' }
     # r7 (sol r6 B1, adversary r6 pass-13 A1): pwsh/powershell read their arguments IN ORDER, and once -Command (or -EncodedCommand,
     # -CommandWithArgs, or any prefix or dash form of them) appears, every later argument is command text: a '-File <dir>' after it is text
-    # (here a comment), not the script the process runs. r6 admitted the argument after ANY -File/-f. So a PowerShell host is found by the
-    # leaf of ANY argument (argv[0], or a wrapper's argument: dotnet pwsh.dll, conhost pwsh.exe, an unquoted 'C:\Program Files\...\pwsh.exe'
-    # whose argv[0] is 'C:\Program'; pwsh-preview, powershell_ise and the 8.3 name POWERS~1 too), and from there its arguments are walked by
-    # a strict grammar (Get-PsHostFileArg): only the -File argument reached through known options is a path; anything else is unknown.
-    $psAt = -1
-    for ($hi = 0; $hi -lt $argv.Count; $hi++) {
-        $hl = ([string]$argv[$hi]).Replace([char]'/', [char]'\'); $hl = $hl.Substring($hl.LastIndexOf([char]'\') + 1).ToLowerInvariant()
-        if ($hl -cmatch '^(pwsh|powershell|powers~[0-9])[^.]*(\.exe|\.dll)?$') { $psAt = $hi; break }
+    # (here a comment), not the script the process runs. r6 admitted the argument after ANY -File/-f. Now a pwsh/powershell argv[0] (also
+    # powershell_ise and the 8.3 name POWERS~1) has its arguments walked by a strict grammar (Get-PsHostFileArg): only the -File argument
+    # reached through known options is a path; anything else is unknown. A host behind a wrapper (dotnet pwsh.dll, conhost pwsh.exe, an
+    # unquoted 'C:\Program Files\...\pwsh.exe' whose argv[0] is 'C:\Program', pwsh-preview) is not on the allow-list below: unknown.
+    # r7 fix 1 (adversary r7 pass-14 A1): a wrapper hands its arguments to ANOTHER program (conhost.exe --headless cmd.exe /k echo <dir>: cmd
+    # re-parses the line, but argv[0] is conhost), so the reader of an argument cannot be known from argv[0] alone, and a deny-list of wrappers
+    # (cmd, conhost, dotnet, wsl, start, runas, ...) is never complete. The rule is an ALLOW-list of the programs this suite starts: a whole
+    # argument is a kill match only when argv[0] is python (the fake heavy-slot.py, its probes and readers) or pwsh/powershell (read by the
+    # strict grammar below), or when argv[0] is itself a program inside the dir. Any other argv[0] is unknown (counted, never killed). In a
+    # python line, an argument naming a shell or launcher (cmd, pwsh, bash, conhost, python, ...) may be a command line the script runs, so
+    # nothing from that argument on is a kill match either.
+    $a0 = ([string]$argv[0]).Replace([char]'/', [char]'\')
+    if (Test-FixturePlainPath $a0 $root $rootFull) { return 'fixture' }   # the program itself lives in the dir
+    $psAt = -1; $genericEnd = 0
+    if ($img -cmatch '^(pwsh|powershell|powershell_ise|powers~[0-9])$') { $psAt = 0 }
+    elseif ($img -cmatch '^(python[0-9.]*|pythonw|python[0-9.]*w|py|pyw)$') {
+        $genericEnd = $argv.Count
+        for ($hi = 1; $hi -lt $argv.Count; $hi++) {
+            $hl = ([string]$argv[$hi]).Replace([char]'/', [char]'\'); $hl = $hl.Substring($hl.LastIndexOf([char]'\') + 1).ToLowerInvariant() -replace '\.(exe|dll|com|bat|cmd)$', ''
+            if ($hl -cmatch '^(cmd|pwsh|powershell|powershell_ise|powers~[0-9]|bash|sh|zsh|dash|wsl|conhost|dotnet|node|wscript|cscript|mshta|rundll32|start|runas|sudo|env|python[0-9.]*|pythonw|py|pyw)$') { $genericEnd = $hi; break }
+        }
     }
-    $genericEnd = if ($psAt -ge 0) { $psAt } else { $argv.Count }
-    for ($ti = 0; $ti -lt $genericEnd; $ti++) {
-        $prev = if ($ti -gt 0) { [string]$argv[$ti - 1] } else { '' }
+    for ($ti = 1; $ti -lt $genericEnd; $ti++) {
+        $prev = [string]$argv[$ti - 1]
         if ($ti -gt 0 -and $prev -match '^(-[cek]|/[ckr]|--?(command|eval|exec))$') { continue }
         $tn = ([string]$argv[$ti]).Replace([char]'/', [char]'\')
         $vals = @($tn)
@@ -1104,7 +1116,7 @@ try {
         'lease-heat-trace-checked-python', 'lease-heat-trace-probe-watchdog',
         'lease-snapshot-bound-straddle', 'lease-probe-watchdog-add-type-failure', 'lease-probe-watchdog-ctor-failure', 'lease-probe-watchdog-arm-paths',
         'lapse-end-timing-pure', 'lease-seam-pid-cleanup', 'lease-start-post-start-failure', 'lease-start-post-start-cleanup-throws', 'fake-flag-unreadable',
-        'lease-seam-command-mode', 'fixture-census-probe-error', 'fake-release-readable-deadline', 'fake-release-unreadable-then-readable-deadline',
+        'lease-seam-command-mode', 'lease-seam-wrapper-host', 'fixture-census-probe-error', 'fake-release-readable-deadline', 'fake-release-unreadable-then-readable-deadline',
         'fake-release-unreadable-deadline')
     foreach ($o in $Only) { Assert-True ($notAfterCases -contains $o) "-Only names a known case: '$o' (known: $($notAfterCases -join ', '))" }
     function Test-Case([string]$Name) { return ($Only.Count -eq 0 -or $Only -contains $Name) }
@@ -4196,6 +4208,67 @@ try { $out = @(Add-LeaseSlotSnapshot -JobId 'jB4a' -Phase 'request') } catch { $
         }
         Assert-True ($cmBad.Count -eq 0) "lease-seam-command-mode: a '-File <fixture>' after PowerShell command text (-Command/-c/-EncodedCommand/-CommandWithArgs, any prefix or dash form, '--%', an unknown option) is counted unknown and never killed; a -File reached through known options is still killed (sol r6 B1): $($cmBad -join ' ; ')"
         $results.leaseSeamCommandMode = [ordered]@{ attackRows = $cmRows.Count; controls = $cmControls.Count; survivors = @($cmC.survivors).Count; unknown = @($cmC.unknown).Count; killed = "[$($script:CmKilled -join ',')]"; rows = $cmOut }
+    }
+    # lease-seam-wrapper-host (r7 fix 1; adversary r7 pass-14 A1): a wrapper hands the rest of its line to another program, so argv[0] does not
+    # say who reads an argument: conhost.exe --headless cmd.exe /k echo <fixture> is cmd re-parsing an echo, and r7's head killed it. The
+    # adversary's row verbatim, then the class (other wrappers and launchers, shells, interpreters this suite never starts, and a python line
+    # that hands a shell its argv), through the same census and sweep seams: all unknown, never killed. Controls: the suite's python shapes and
+    # a program inside the dir stay survivors and are killed.
+    if (Test-Case 'lease-seam-wrapper-host') {
+        $whFx = 'C:\Temp\um-agent-quiet-lease-1234-abcd1234'
+        $whRows = [ordered]@{
+            'a1-verbatim'             = 'conhost.exe --headless cmd.exe /k echo C:\Temp\um-agent-quiet-lease-1234-abcd1234'
+            'conhost-cmd-path'        = 'C:\Windows\System32\conhost.exe 0xffffffff -ForceV1 C:\Windows\System32\cmd.exe /c C:\Temp\um-agent-quiet-lease-1234-abcd1234\x.bat'
+            'conhost-python'          = 'conhost.exe --headless python.exe C:\Temp\um-agent-quiet-lease-1234-abcd1234\heavy-slot-fake.py status'
+            'wsl'                     = 'wsl.exe echo C:\Temp\um-agent-quiet-lease-1234-abcd1234'
+            'runas'                   = 'runas.exe /user:x C:\Temp\um-agent-quiet-lease-1234-abcd1234\x.ps1'
+            'rundll32'                = 'rundll32.exe url.dll,FileProtocolHandler C:\Temp\um-agent-quiet-lease-1234-abcd1234\x'
+            'bash-script'             = 'bash.exe C:\Temp\um-agent-quiet-lease-1234-abcd1234\x.sh'
+            'node-script'             = 'node.exe C:\Temp\um-agent-quiet-lease-1234-abcd1234\x.js'
+            'cscript'                 = 'cscript.exe //nologo C:\Temp\um-agent-quiet-lease-1234-abcd1234\x.vbs'
+            'unknown-program'         = 'tool.exe C:\Temp\um-agent-quiet-lease-1234-abcd1234\x'
+            'python-hands-cmd'        = 'python.exe -c "import subprocess,sys; subprocess.run(sys.argv[1:])" cmd /k echo C:\Temp\um-agent-quiet-lease-1234-abcd1234'
+            'python-hands-pwsh'       = 'python.exe C:\Temp\other\run.py pwsh.exe -Command "x #" -File C:\Temp\um-agent-quiet-lease-1234-abcd1234'
+            'python-hands-python'     = 'python.exe -c "import os,sys; os.execv(sys.argv[1], sys.argv[1:])" C:\Python\python.exe -c "import time" C:\Temp\um-agent-quiet-lease-1234-abcd1234\x'
+        }
+        $whControls = [ordered]@{
+            'control-python-fake'     = '"C:\Python\python.exe" "C:\Temp\um-agent-quiet-lease-1234-abcd1234\heavy-slot-fake.py" lease release'
+            'control-python3-data'    = 'python3.13.exe -c "import time" C:\Temp\um-agent-quiet-lease-1234-abcd1234\x'
+            'control-program-in-dir'  = 'C:\Temp\um-agent-quiet-lease-1234-abcd1234\tool.exe run'
+            'control-pwsh-file'       = '"C:\Program Files\PowerShell\7\pwsh.exe" -NoProfile -NonInteractive -File C:\Temp\um-agent-quiet-lease-1234-abcd1234\add-type-failure-child.ps1 -Mode x'
+        }
+        $whCensusRows = [System.Collections.Generic.List[object]]::new()
+        $whIds = [ordered]@{}
+        $whN = 0
+        foreach ($k in @($whRows.Keys) + @($whControls.Keys)) {
+            $cl = if ($whRows.Contains($k)) { $whRows[$k] } else { $whControls[$k] }
+            $whIds[$k] = 25680 + $whN; $whN++
+            $whCensusRows.Add([pscustomobject]@{ ProcessId = $whIds[$k]; CommandLine = $cl })
+        }
+        $script:WhKilled = [System.Collections.Generic.List[int]]::new()
+        $whOpen = {
+            param($i)
+            $m = [pscustomobject]@{ Id = $i }
+            $m | Add-Member -MemberType ScriptMethod -Name get_Handle -Value { [IntPtr]1 }
+            $m | Add-Member -MemberType ScriptMethod -Name get_HasExited -Value { $false }
+            $m | Add-Member -MemberType ScriptMethod -Name Kill -Value { $script:WhKilled.Add([int]$this.Id) }
+            $m | Add-Member -MemberType ScriptMethod -Name Dispose -Value { }
+            return $m
+        }
+        $whC = Get-FixtureCensus $whFx -Rows $whCensusRows.ToArray()
+        $whS = @(Stop-FixtureLeftovers $whFx @($whIds.Values) -Rows $whCensusRows.ToArray() -OpenPid $whOpen)
+        $whBad = [System.Collections.Generic.List[string]]::new()
+        $whOut = [ordered]@{}
+        foreach ($k in $whIds.Keys) {
+            $id = $whIds[$k]; $isControl = $whControls.Contains($k)
+            $m = Get-FixtureMatch $(if ($isControl) { $whControls[$k] } else { $whRows[$k] }) $whFx
+            $row = "match=$m survivor=$(@($whC.survivors) -contains $id) unknown=$(@($whC.unknown) -contains $id) stopped=$($whS -contains $id) killed=$($script:WhKilled -contains $id)"
+            $whOut[$k] = $row
+            $want = if ($isControl) { 'match=fixture survivor=True unknown=False stopped=True killed=True' } else { 'match=unknown survivor=False unknown=True stopped=False killed=False' }
+            if ($row -cne $want) { $whBad.Add("[$k] $row want $want") }
+        }
+        Assert-True ($whBad.Count -eq 0) "lease-seam-wrapper-host: a fixture path on a line whose argv[0] is not a program this suite starts (a wrapper such as conhost, a shell, another interpreter), or after a shell named inside a python line, is counted unknown and never killed; the suite's python, pwsh -File and in-dir shapes are still killed (adversary r7 pass-14 A1): $($whBad -join ' ; ')"
+        $results.leaseSeamWrapperHost = [ordered]@{ attackRows = $whRows.Count; controls = $whControls.Count; survivors = @($whC.survivors).Count; unknown = @($whC.unknown).Count; killed = "[$($script:WhKilled -join ',')]"; rows = $whOut }
     }
     # fixture-census-probe-error (r7 E1; Dot advisory 6706643231, hub ACK 6706997355): a suite whose suite-end fixture census THROWS has no
     # survivor count, so it must not end as status PASS (r6 printed PASS with survivors=unknown unknown=unknown, and the FIFO parent accepts any
