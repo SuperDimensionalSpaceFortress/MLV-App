@@ -3154,6 +3154,8 @@ bool MainWindow::waitForResizeStillDrawing( const QString &site )
     callbacks.pump = []() { qApp->processEvents( QEventLoop::ExcludeUserInputEvents ); };
     callbacks.clearStale = [this]() { m_frameStillDrawing = false; };
     callbacks.nowMs = [&clock]() { return static_cast<std::int64_t>( clock.elapsed() ); };
+    // adversary r3 pass 2 A1: a renderer-mutex hold shorter than one millisecond tick must still be seen
+    callbacks.nowUs = [&clock]() { return static_cast<std::int64_t>( clock.nsecsElapsed() / 1000 ); };
     const resize_still_drawing_wait::Result result = resize_still_drawing_wait::wait( callbacks );
     if( result.outcome == resize_still_drawing_wait::Outcome::NotWaiting ) return true;
     logInteractionEvent(
