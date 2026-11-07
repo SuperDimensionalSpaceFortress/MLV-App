@@ -24,6 +24,7 @@
 #include <array>
 #include <atomic>
 #include <deque>
+#include <functional>
 #include <memory>
 #include <vector>
 
@@ -399,6 +400,14 @@ public:
     bool isIdleNoWait( void );
     bool isIdleExceptPlaybackLookaheadNoWait( int activePlaybackTarget,
                                               uint64_t activeGeneration );
+    /* adversary r4 A1: a monotonic count of starts of pipeline work (a render request, a warm run starting, a slot
+     * entering a busy state, a render starting). Two equal reads around an idle sample prove no work started between. */
+    uint64_t busyEpoch( void ) const;
+    /* adversary r4 A1 (probe-to-clear): runs onIdleLocked while holding m_mutex iff it is free now (never waits), the
+     * pipeline is idle (the playback-advance decision when exceptPlaybackLookahead) and busyEpoch() == epoch. No render
+     * request or warm start can begin while it runs. Returns whether onIdleLocked ran. */
+    bool runIfIdleNoWait( bool exceptPlaybackLookahead, int activePlaybackTarget, uint64_t activeGeneration,
+                          uint64_t epoch, const std::function<void()> &onIdleLocked );
     void resetPipelineOverlapMeter( void );
     playback_overlap::OverlapSnapshot pipelineOverlapSnapshot( void );
     bool acquireLatestReadyFrame( ReadyFrame *frame );
@@ -746,6 +755,9 @@ private:
     bool phase3WorkInFlightLocked( void ) const;
     bool isIdleLocked( void ) const;
     bool isIdleExceptPlaybackLookaheadLocked( int activePlaybackTarget, uint64_t activeGeneration ) const;
+    static bool slotStateIsBusy( SlotState state );
+    void bumpBusyEpoch( void ) { m_busyEpoch.fetch_add( 1, std::memory_order_acq_rel ); }
+    std::atomic<uint64_t> m_busyEpoch{ 0 };
     void queueDecodeRequestLocked( int slotIndex, const RenderRequest &request );
     bool takeDecodeRequestForWorker( DecodeQueueEntry *entry );
     void decodeFrameForWorker( const DecodeQueueEntry &entry );

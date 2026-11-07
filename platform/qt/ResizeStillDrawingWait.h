@@ -9,12 +9,14 @@
 //   - flag already clear              -> NotWaiting (no pump, no clock read past the entry check)
 //   - pump; flag clears               -> Cleared
 //   - flag still set after >= kMinPumpsBeforeStale pumps, while renderIdle() has held continuously for
-//     >= kStaleIdleGraceMs             -> clearStale() once, StaleCleared
+//     >= kStaleIdleGraceMs at one busy epoch, and clearStale(epoch) confirms it -> StaleCleared
+//     (a refused clearStale ends the run; the wait goes on)
 //   - kDeadlineMs since entry, measured after a pump's renderIdle() sample, i.e. immediately before the next pump
 //     -> Timeout (the caller proceeds)
 // renderIdle() must not wait for the renderer mutex (probeIdleWithoutWaiting): a held mutex is a busy sample. The idle
 // grace runs, on a microsecond clock, from when the first idle sample after a busy one (or after entry) RETURNS; any busy
-// sample ends the run, so a renderer hold of any length is never idle and never joins two idle periods.
+// sample ends the run, so a renderer hold of any length is never idle and never joins two idle periods. So does a changed
+// busyEpoch (work that started and ended between two idle samples; adversary r4 A1).
 // A busy render thread is never forged clear: it only ever times out.
 // WHAT IS BOUNDED (adversary r1 A1 and its re-pass): the time this helper spends deciding, i.e. the number of pumps
 // after the deadline is zero. The deadline is checked after every pump, so a pump that outlasts it ends the wait at
@@ -45,10 +47,14 @@ constexpr int kMinPumpsBeforeStale = 2;
 struct Callbacks
 {
     std::function<bool()> stillDrawing;
-    std::function<bool()> renderIdle;
-    std::function<std::uint64_t()> busyEpoch; // RED stub (adversary r4 A1): read, ignored
+    std::function<bool()> renderIdle; // never waits for the renderer mutex (probeIdleWithoutWaiting)
+    // adversary r4 A1: a monotonic count of renderer work starts, read right after each renderIdle() sample (optional;
+    // unset = constant). Work that starts and ends between two idle samples changes it, and that ends the run.
+    std::function<std::uint64_t()> busyEpoch;
     std::function<void()> pump;
-    std::function<bool( std::uint64_t )> clearStale; // RED stub: return value ignored
+    // adversary r4 A1: confirm-and-clear. Clears the flag only if the renderer is idle NOW and its busy epoch still
+    // equals the run's (atomically against the renderer starting work, without waiting); returns whether it cleared.
+    std::function<bool( std::uint64_t )> clearStale;
     std::function<std::int64_t()> nowMs; // monotonic; used only when nowUs is not set
     std::function<std::int64_t()> nowUs; // monotonic, microseconds; preferred (adversary r3 pass 2 A1)
 };
@@ -113,6 +119,7 @@ inline Result wait( const Callbacks &callbacks )
     const std::int64_t startUs = clockUs();
     bool idleRun = false;
     std::int64_t idleSinceUs = 0;
+    std::uint64_t idleEpoch = 0;
     for( ;; )
     {
         callbacks.pump();
@@ -126,6 +133,9 @@ inline Result wait( const Callbacks &callbacks )
         }
 
         result.renderIdle = callbacks.renderIdle();
+        // Read AFTER the idle sample: work that started before it (and possibly ended) has already bumped the epoch, and
+        // work that starts between the two reads only makes the run restart (conservative).
+        const std::uint64_t epoch = callbacks.busyEpoch ? callbacks.busyEpoch() : 0;
         // adversary r1 pass 3 A2: both the stale grace and the deadline are judged on a clock sampled after renderIdle()
         // returns (it no longer waits for the renderer mutex, but its time is still never left unjudged). Nothing runs
         // between this sample and the next pump.
@@ -139,21 +149,30 @@ inline Result wait( const Callbacks &callbacks )
             // time before it (adversary r3 A1) is credited to the next run.
             idleRun = false;
         }
-        else if( !idleRun )
+        else if( !idleRun || epoch != idleEpoch )
         {
             // A run opens when an idle sample returns (adversary r1 pass 3 A2). An idle sample is judged by its report,
-            // never by its duration: the probe does not wait, so its time is GUI-thread time, not renderer time.
+            // never by its duration: the probe does not wait, so its time is GUI-thread time, not renderer time. A changed
+            // busy epoch means the renderer started work since the run opened, however briefly and even inside one pump
+            // (adversary r4 A1): the run reopens here, so none of that time is credited.
             idleRun = true;
             idleSinceUs = sampledUs;
+            idleEpoch = epoch;
         }
 
         if( idleRun
          && result.pumps >= kMinPumpsBeforeStale
          && sampledUs - idleSinceUs >= kStaleIdleGraceMs * 1000 )
         {
-            (void)callbacks.clearStale( callbacks.busyEpoch ? callbacks.busyEpoch() : 0 );
-            result.outcome = Outcome::StaleCleared;
-            return result;
+            // adversary r4 A1 (probe-to-clear): the renderer confirms idleness at the run's epoch and clears in the same
+            // critical section, so work starting after the last sample is never cleared over. A refusal is busy evidence.
+            if( callbacks.clearStale( idleEpoch ) )
+            {
+                result.outcome = Outcome::StaleCleared;
+                return result;
+            }
+            result.renderIdle = false;
+            idleRun = false;
         }
         if( waitedUs >= kDeadlineMs * 1000 )
         {

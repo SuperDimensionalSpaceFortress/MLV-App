@@ -2898,6 +2898,24 @@ bool MainWindow::renderThreadIdleNoWait( int activePlaybackTarget )
     return m_pRenderThread->isIdleNoWait();
 }
 
+// adversary r4 A1 (probe-to-clear): the resize wait's stale clear. renderThreadIdleNoWait's decision, re-taken while the
+// renderer mutex is held (never waited for) and only at the idle run's busy epoch; the flag is cleared inside that critical
+// section, so a render request or warm run cannot start between the decision and the clear. False = not cleared (busy).
+bool MainWindow::clearStaleStillDrawingIfIdle( int activePlaybackTarget, std::uint64_t epoch )
+{
+    if( !m_pRenderThread )
+    {
+        m_frameStillDrawing = false;
+        return true;
+    }
+    return m_pRenderThread->runIfIdleNoWait(
+        ui->actionPlay->isChecked() && playbackRenderLookaheadFrames() > 0,
+        activePlaybackTarget,
+        m_playbackPresentationGeneration.load( std::memory_order_acquire ),
+        epoch,
+        [this]() { m_frameStillDrawing = false; } );
+}
+
 static int mlvappStartPlaybackTimer( QObject *owner, double framerate )
 {
     if( !owner ) return 0;
@@ -3167,7 +3185,10 @@ bool MainWindow::waitForResizeStillDrawing( const QString &site )
     callbacks.stillDrawing = [this]() { return m_frameStillDrawing; };
     callbacks.renderIdle = [this]() { return renderThreadIdleNoWait( currentPlaybackAdvanceTarget() ); };
     callbacks.pump = []() { qApp->processEvents( QEventLoop::ExcludeUserInputEvents ); };
-    callbacks.clearStale = [this]( std::uint64_t ) { m_frameStillDrawing = false; return true; }; // RED stub
+    // adversary r4 A1: work that starts and ends between two samples changes the epoch; the clear is confirmed under the
+    // renderer mutex at the run's epoch, so work that starts after the last sample is never cleared over
+    callbacks.busyEpoch = [this]() -> std::uint64_t { return m_pRenderThread ? m_pRenderThread->busyEpoch() : 0; };
+    callbacks.clearStale = [this]( std::uint64_t epoch ) { return clearStaleStillDrawingIfIdle( currentPlaybackAdvanceTarget(), epoch ); };
     callbacks.nowMs = [&clock]() { return static_cast<std::int64_t>( clock.elapsed() ); };
     // adversary r3 pass 2 A1: a renderer-mutex hold shorter than one millisecond tick must still be seen
     callbacks.nowUs = [&clock]() { return static_cast<std::int64_t>( clock.nsecsElapsed() / 1000 ); };
