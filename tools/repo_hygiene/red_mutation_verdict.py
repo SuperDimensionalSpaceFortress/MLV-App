@@ -321,6 +321,9 @@ def _ends_with(whole: list[str], tail: list[str]) -> bool:
     return bool(whole) and bool(tail) and len(tail) <= len(whole) and whole[-len(tail):] == tail
 
 
+_UT_HEADER_MAX = 4096  # characters of a `FAIL: ...` header that are read; a longer one (a huge subTest repr) is refused
+
+
 def _ut_identities(rest: str) -> list[tuple[str, str]]:
     """EVERY reading of `name (module.Class.name)` (3.11+) with an optional ` (k=v)` subtest suffix -> [(name, full id)].
     A reading is a parenthesised group that ENDS WITH `.name`. A method name that itself holds ` (x.name)` gives
@@ -393,6 +396,9 @@ def _parse_unittest(text: str) -> list[Failure]:
         joined = "\n".join(block)
         collection = ("_FailedTest" in body[0] or "unittest/loader.py" in joined.replace("\\", "/")
                       or bool(_IMPORT_ERR.search(joined)))
+        if len(head["rest"]) > _UT_HEADER_MAX:  # adversary A2: bounded work, and no real test name is this long
+            raise _Unclassifiable(f"unittest header of {len(head['rest'])} characters is longer than {_UT_HEADER_MAX}: "
+                                  "its test identity is not read")
         readings = _ut_identities(head["rest"])
         if readings:
             name, full = readings[0]
@@ -681,7 +687,7 @@ def _final_green(text: str) -> bool:
 
 
 _UT_COUNTS = re.compile(r"[(,] ?(failures|errors)=(\d+)")
-_UT_RAN = re.compile(r"^Ran \d+ tests? in ", re.M)
+_UT_RAN = re.compile(r"^Ran \d+ tests?\b", re.M)  # the footer line; the elapsed time after it is not needed
 
 
 def _count_mismatch(text: str, ut_blocks: int, stats: dict) -> str:
@@ -700,13 +706,20 @@ def _count_mismatch(text: str, ut_blocks: int, stats: dict) -> str:
     last = None
     for m in _RESULT_LINE.finditer(text):
         last = m.group(0).strip()
+    if ut_blocks or stats["sections"] or stats["has_summary"] or stats["summary"]:
+        # R7-C1 (r8): failures were read, so the run must END in the runner's own result: the LAST non-blank line is a
+        # result line (adversary A1: a result-shaped line in the middle of a cut log, printed by a failing test or pasted
+        # in, is message text), and a unittest `OK`/`FAILED (...)` trailer has its `Ran N tests` footer before it.
+        # Otherwise the runner's counts are missing and a later failure (an import error included) may have been cut.
+        lines = [ln for ln in text.splitlines() if ln.strip()]
+        final = lines[-1].strip() if lines else ""
+        if not _RESULT_LINE.match(final):
+            return ("no final result line (the run must end in a unittest `OK`/`FAILED (...)` trailer or a pytest "
+                    "`=== N failed ... ===` bar): a cut-off log cannot be reconciled with the runner's counts")
+        if not final.startswith("=") and not _UT_RAN.search("\n".join(lines[:-1])):
+            return ("no final result line the counts can be read from: the unittest trailer has no `Ran N tests` footer "
+                    "before it")
     if last is None:
-        if ut_blocks or stats["sections"] or stats["has_summary"] or stats["summary"]:
-            # R7-C1 (r8): failures were read but nothing closes the run, so the runner's own counts are missing and a
-            # later failure (an import error included) may have been cut from the log. A terminal result is required
-            # on every path; text with no failure and no result is refused by the plain checks as unrecognized.
-            return ("no final result line (unittest `Ran N tests` + `OK`/`FAILED (...)`, or a pytest `=== N failed ... ===` "
-                    "bar): a cut-off log cannot be reconciled with the runner's counts")
         return ""
     if last.startswith("FAILED (") and _UT_RAN.search(text):
         want = sum(int(n) for _kind, n in _UT_COUNTS.findall(last))
