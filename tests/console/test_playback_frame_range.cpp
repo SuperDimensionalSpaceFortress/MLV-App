@@ -6,6 +6,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <functional>
 #include <limits>
 #include <string>
 #include <vector>
@@ -3231,7 +3232,15 @@ struct ConformPlayResult { int maxJump = 0; double reachedMs = -1.0; int64_t con
 // r24 adversary A1 on 9b900412: the engine as MainWindow runs it -- the pace guard at 24 fps with the first-tick notePresent, the
 // drop-frame tick through the STATEFUL conform delta (the debt it carries), the source-frame counter and the conform tracker --
 // over cut 1..2860 of a 59.94 clip, Loop off, until frame 1498 (1499 required source frames) is reached.
+ConformPlayResult playConformedTicks( const std::function<double( int )> & tickAt, bool conformActive, int cutOut );
+
 ConformPlayResult playConformed( int lateEvery, double lateMs, bool conformActive )
+{
+    return playConformedTicks( [=]( int t ) { return ( t % lateEvery == 0 ) ? lateMs : 8.0; }, conformActive, 2860 );
+}
+
+// r25 adversary A1 on 205b54cc: the same engine with an arbitrary tick-length pattern \a tickAt( t ) and cut 1..\a cutOut.
+ConformPlayResult playConformedTicks( const std::function<double( int )> & tickAt, bool conformActive, int cutOut )
 {
     playback_native_pace::NativePaceGuard guard;
     guard.reset();
@@ -3244,13 +3253,13 @@ ConformPlayResult playConformed( int lateEvery, double lateMs, bool conformActiv
     ConformPlayResult r;
     for( int t = 1; t < 100000 && r.reachedMs < 0.0; ++t )
     {
-        const double tickMs = ( t % lateEvery == 0 ) ? lateMs : 8.0;
+        const double tickMs = tickAt( t );
         nowMs += tickMs;
         const double granted = guard.grant( 24.0 * tickMs / 1000.0, nowMs, 24.0 );
         if( t == 1 ) guard.notePresent( nowMs, 24.0 );
         const double before = position;
         const playback_frame_range::DropFrameTickResult tick = playback_frame_range::advanceDropFrameTick(
-            position, playback_frame_range::conformDropFrameDelta( position, granted, conformActive, debt ), 1, 2860, false );
+            position, playback_frame_range::conformDropFrameDelta( position, granted, conformActive, debt ), 1, cutOut, false );
         position = tick.position;
         counter.noteEngineTick( before, position, tick.wrapped );
         if( nowMs <= 64998.0 ) r.consumedAt64998 = counter.consumed();
@@ -3293,6 +3302,30 @@ TEST( PlaybackConformDropFrame, R24A1HeldCatchupIsRepaidSoTheConformedSourcePace
         }
 }
 
+TEST( PlaybackConformDropFrame, R25A1ABurstOfSubStallLateTicksNeverLosesAPaidFrame )
+{
+    // adversary A1 on 205b54cc, its literal input: cut 1..1667 of a 59.94 clip conformed to 24 fps, Drop Frame, Loop off,
+    // tickMs = (t % 48 >= 42) ? 66 : 8 -- six consecutive late ticks, each granted 1.584 < 2 (never a real stall). On
+    // 205b54cc the debt reached 3 at tick 45 and the cap of 2 discarded a granted frame: frame 1498 at 68252 ms,
+    // 21.948 source fps, 1425 of 1499 consumed at 64998 ms. The backlog is now carried (and repaid one frame per tick).
+    const auto burst = []( int t ) { return ( t % 48 >= 42 ) ? 66.0 : 8.0; };
+    const ConformPlayResult r = playConformedTicks( burst, true, 1667 );
+    ASSERT_TRUE( r.consumedAt64998 >= int64_t( 1499 ) );    // the required source frames inside the 65000 ms safety
+    ASSERT_TRUE( r.reachedMs <= 62500.0 );                    // 1498 frames at 24 fps is 62417 ms
+    ASSERT_TRUE( r.sourceFps >= 23.28 && r.sourceFps <= 24.72 );
+    ASSERT_EQ( 1, r.maxJump );
+    // the class, not the instance: longer runs of sub-stall late ticks keep the pace, and every frame while the backlog
+    // fits kConformMaxDebtFrames
+    for( const int run : { 2, 4, 6, 8 } )
+        for( const double lateMs : { 50.0, 66.0, 82.0 } )
+        {
+            const ConformPlayResult b = playConformedTicks(
+                [=]( int t ) { return ( t % 48 >= 48 - run ) ? lateMs : 8.0; }, true, 1667 );
+            ASSERT_TRUE( b.consumedAt64998 >= int64_t( 1499 ) );
+            ASSERT_TRUE( b.sourceFps >= 23.28 && b.sourceFps <= 24.72 );
+        }
+}
+
 TEST( PlaybackConformDropFrame, R24A1TheCarriedDebtIsBoundedAndClearedWithoutConform )
 {
     // a held tick carries the whole frame it did not present; the next ordinary tick repays it as a one-frame step
@@ -3304,16 +3337,24 @@ TEST( PlaybackConformDropFrame, R24A1TheCarriedDebtIsBoundedAndClearedWithoutCon
     ASSERT_EQ( 1154, static_cast<int>( 1153.384 + repaid ) );
     ASSERT_NEAR( 1154.576, 1153.384 + repaid, 1e-9 );
     ASSERT_NEAR( 0.0, debt, 1e-12 );
-    // the debt never exceeds kConformMaxDebtFrames: a renderer that is always late plays every frame slower, it never bursts
+    // r25 adversary A1 on 205b54cc: the debt never exceeds kConformMaxDebtFrames, and the cap never DISCARDS a granted frame.
+    // A renderer that is always late (1.9 frames granted every tick) keeps the guard's pace: the position travels exactly
+    // what was granted (less the debt still carried), presenting the next frame while the backlog fits the cap and skipping
+    // only the frames beyond it -- the documented drop-frame catch-up, which is stall evidence, never a conform PASS.
     debt = 0.0;
     double position = 100.8;
+    double grantedTotal = 0.0;
+    int skips = 0;
     for( int t = 0; t < 200; ++t )
     {
         const double delta = playback_frame_range::conformDropFrameDelta( position, 1.9, true, debt );
-        ASSERT_TRUE( static_cast<int>( position + delta ) - static_cast<int>( position ) <= 1 );
+        if( static_cast<int>( position + delta ) - static_cast<int>( position ) > 1 ) ++skips;
         position += delta;
+        grantedTotal += 1.9;
         ASSERT_TRUE( debt <= playback_frame_range::kConformMaxDebtFrames + 1e-9 );
+        ASSERT_NEAR( 100.8 + grantedTotal, position + debt, 1e-6 );
     }
+    ASSERT_TRUE( skips > 0 );
     // without conform the debt is cleared and the grant is returned bit for bit
     const double g = 1.584;
     ASSERT_TRUE( sameBits( g, playback_frame_range::conformDropFrameDelta( 1152.8, g, false, debt ) ) );

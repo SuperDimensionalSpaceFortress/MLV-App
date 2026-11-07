@@ -164,7 +164,9 @@ maintained in this format.
 - High frame rate clips now conform to 24 fps playback by default: a clip
   above 30 fps plays as slow motion at 24 fps, so every recorded frame is
   shown (Drop Frame Mode can still skip one to catch up after a stall of
-  at least one whole frame period; a shorter delay shows the next frame).
+  at least one whole frame period, or once more than 8 frames of short
+  delays have built up; a shorter delay shows the next frame and is made
+  up on the following frames).
   Configure it under **Playback → High Frame Rate Conform** (enable,
   conform to 24/25/30 fps, for clips above 30/50 fps). Export, metadata and
   timecode keep the clip's own rate. The environment variable
