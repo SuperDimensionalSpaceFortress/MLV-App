@@ -266,65 +266,172 @@ TEST(ResizeStillDrawingWait, TimeBlockedInsideALaterRenderIdleSampleIsNotCounted
     ASSERT_TRUE(result.waitedMs <= 155 + world.stepMs);
 }
 
-// adversary r2 A2: an OLDER request (serial 100, still preparing during the resize) can land after the re-anchor is armed
-// and consume m_zoomModeChanged on the old scene; the frame the resize asked for (101) then lands with no re-anchor.
-// The re-anchor carries a request-serial floor taken where it is armed (before drawFrame() at the resize site), and
-// finishPresentedFrame consumes it only for a frame requested at or after that floor. Every arm site sets the floor.
-TEST(ResizeStillDrawingWaitWiring, TheGradientReanchorIsConsumedOnlyByAFrameRequestedAfterItWasArmed)
+// r3 (adversary r2 pass 3 A1, which supersedes r2's request-serial floor). drawFrameReady sizes the scene from the zoom and
+// stretch state at PRESENT time (computeDisplaySceneGeometry + setSceneRect), so the geometry a frame lands on is not a
+// property of its request serial: an OLDER request can present at the NEW geometry. The serial floor rejected it and left
+// the gradient at the old anchor. The re-anchor is now keyed on what decides placement: finishPresentedFrame re-anchors
+// when m_zoomModeChanged is set (consumed on any frame, as the base does) OR the scene differs from the geometry the
+// gradient was last anchored on (GradientElement records it on every redrawGradientElement call).
+namespace
+{
+
+// finishPresentedFrame's re-anchor as GradientElement::redrawGradientElement places the overlay: x = startX * sceneW / picW.
+// The adversary's clip: 1920x1080 picture, gradient start x=480, so x=480 at scene width 1920 and x=960 at 3840.
+struct GradientModel
+{
+    bool zoomModeChanged = false;
+    int anchoredW = -1;
+    int anchoredH = -1;
+    int redraws = 0;
+    std::int64_t x = -1;
+
+    void redraw(int sceneW, int sceneH)
+    {
+        anchoredW = sceneW;
+        anchoredH = sceneH;
+        x = 480 * static_cast<std::int64_t>(sceneW) / 1920;
+        ++redraws;
+    }
+    void present(int sceneW, int sceneH)
+    {
+        if (resize_still_drawing_wait::gradientNeedsReanchor(zoomModeChanged, anchoredW, anchoredH, sceneW, sceneH))
+        {
+            zoomModeChanged = false;
+            redraw(sceneW, sceneH);
+        }
+    }
+};
+
+} // namespace
+
+TEST(ResizeStillDrawingWait, TheReanchorDecisionIsTheFlagOrAChangedAnchoredGeometry)
+{
+    using resize_still_drawing_wait::gradientNeedsReanchor;
+    ASSERT_TRUE(gradientNeedsReanchor(true, 1920, 1080, 3840, 1080));   // r2 pass 3 A1: armed, lands at the new geometry
+    ASSERT_TRUE(gradientNeedsReanchor(false, 1920, 1080, 3840, 1080));  // flag already consumed on the old scene
+    ASSERT_TRUE(gradientNeedsReanchor(false, 1920, 1080, 1920, 2160));  // a height-only change (vertical stretch)
+    ASSERT_TRUE(gradientNeedsReanchor(true, 1920, 1080, 1920, 1080));   // the flag is consumed on any frame (base)
+    ASSERT_TRUE(gradientNeedsReanchor(false, -1, -1, 1920, 1080));      // never anchored
+    ASSERT_FALSE(gradientNeedsReanchor(false, 1920, 1080, 1920, 1080)); // no spare redraw per frame on a steady scene
+}
+
+// r2 pass 3 A1, the adversary's input: a stretch change arms the re-anchor, then request 100 (older than the next serial
+// 101) presents at 3840x1080. The gradient must move to x=960 on that frame; r2's floor left it at 480.
+TEST(ResizeStillDrawingWait, AnOlderRequestPresentingAtTheNewGeometryReanchorsTheGradient)
+{
+    GradientModel g;
+    g.redraw(1920, 1080);
+    ASSERT_EQ(static_cast<std::int64_t>(480), g.x);
+    g.zoomModeChanged = true;   // on_comboBoxHStretch_currentIndexChanged (factor 2)
+    g.present(3840, 1080);      // request 100
+    ASSERT_EQ(static_cast<std::int64_t>(960), g.x);
+    ASSERT_FALSE(g.zoomModeChanged);
+    const int redraws = g.redraws;
+    g.present(3840, 1080);      // request 101, same geometry: no spare redraw
+    ASSERT_EQ(redraws, g.redraws);
+    ASSERT_EQ(static_cast<std::int64_t>(960), g.x);
+}
+
+// r2 pass 1 A2: an older request consumes the flag on the OLD scene; the frame the resize asked for then changes the scene.
+// r1 pass 3 A1: a StaleCleared redraw anchors on the old scene and a late frame changes it. Both need no flag at all: the
+// changed geometry re-anchors.
+TEST(ResizeStillDrawingWait, AFlagConsumedOnTheOldSceneStillLeavesTheLandedFrameReanchored)
+{
+    GradientModel g;
+    g.redraw(1920, 1080);       // the gradient site's immediate redraw on the old scene (Cleared or StaleCleared)
+    g.zoomModeChanged = true;   // resizeEvent arms it after the wait
+    g.present(1920, 1080);      // request 100, old geometry: consumes the flag
+    ASSERT_FALSE(g.zoomModeChanged);
+    ASSERT_EQ(static_cast<std::int64_t>(480), g.x);
+    g.present(3840, 1080);      // request 101 (or the late Ready frame) lands at the new geometry
+    ASSERT_EQ(static_cast<std::int64_t>(960), g.x);
+
+    GradientModel late;         // r1 pass 3 A1 with no flag at all
+    late.redraw(1920, 1080);
+    late.present(3840, 1080);
+    ASSERT_EQ(static_cast<std::int64_t>(960), late.x);
+}
+
+// r2 pass 2 A1: a stretch change dispatched inside the resize wait arms the re-anchor too. With no floor there is no order
+// to get wrong: whichever request lands at the final geometry re-anchors, whether the old one lands first or not.
+TEST(ResizeStillDrawingWait, ANestedGeometryChangeDuringTheResizeWaitReanchorsInEitherLandingOrder)
+{
+    GradientModel oldFirst;
+    oldFirst.redraw(1920, 1080);
+    oldFirst.zoomModeChanged = true; // nested stretch change
+    oldFirst.zoomModeChanged = true; // resize arm after the wait
+    oldFirst.present(1920, 1080);
+    oldFirst.present(3840, 1080);
+    ASSERT_EQ(static_cast<std::int64_t>(960), oldFirst.x);
+
+    GradientModel newFirst;
+    newFirst.redraw(1920, 1080);
+    newFirst.zoomModeChanged = true;
+    newFirst.present(3840, 1080);    // the older request already presents at the new geometry
+    newFirst.present(3840, 1080);
+    ASSERT_EQ(static_cast<std::int64_t>(960), newFirst.x);
+}
+
+TEST(ResizeStillDrawingWaitWiring, TheGradientReanchorHasNoRequestSerialFloor)
 {
     const QString source = readRepoFile(QStringLiteral("platform/qt/MainWindow.cpp"));
-    ASSERT_FALSE(source.isEmpty());
     const QString header = readRepoFile(QStringLiteral("platform/qt/MainWindow.h"));
-    ASSERT_TRUE(header.contains(QStringLiteral("uint64_t m_gradientReanchorSerialFloor = 0;")));
+    const QString wait = readRepoFile(QStringLiteral("platform/qt/ResizeStillDrawingWait.h"));
+    ASSERT_FALSE(source.isEmpty());
+    ASSERT_FALSE(header.isEmpty());
+    ASSERT_FALSE(wait.isEmpty());
+    for (const QString & text : {source, header, wait})
+    {
+        ASSERT_FALSE(text.contains(QStringLiteral("m_gradientReanchorSerialFloor")));
+        ASSERT_FALSE(text.contains(QStringLiteral("gradientReanchorSerialFloor")));
+        ASSERT_FALSE(text.contains(QStringLiteral("raisedReanchorFloor")));
+    }
+}
 
-    const QString body = resizeEventBody();
-    ASSERT_FALSE(body.isEmpty());
-    const int floorAt = body.indexOf(QStringLiteral(
-        "const uint64_t gradientReanchorSerialFloor = m_nextRenderRequestSerial;"));
-    const int drawAt = body.indexOf(QStringLiteral("drawFrame();"));
-    const int armAt = body.indexOf(QStringLiteral(
-        "raisedReanchorFloor( m_gradientReanchorSerialFloor, gradientReanchorSerialFloor );"));
-    const int gradientIf = body.indexOf(QStringLiteral("if( waitForResizeStillDrawing( QStringLiteral(\"gradient\") ) )"));
-    ASSERT_TRUE(floorAt >= 0);
-    ASSERT_TRUE(drawAt > floorAt);
-    ASSERT_TRUE(armAt > gradientIf);
-
-    // every arm of the re-anchor sets its floor
-    ASSERT_EQ(source.count(QStringLiteral("m_zoomModeChanged = true;")),
-              source.count(QStringLiteral("m_gradientReanchorSerialFloor = ")));
-
+TEST(ResizeStillDrawingWaitWiring, FinishPresentedFrameReanchorsThroughTheGeometryDecision)
+{
+    const QString source = readRepoFile(QStringLiteral("platform/qt/MainWindow.cpp"));
     const QString finish = functionBody(source,
         QStringLiteral("void MainWindow::finishPresentedFrame( uint64_t displayFrame,"),
         QStringLiteral("\nvoid MainWindow::"));
     ASSERT_FALSE(finish.isEmpty());
-    ASSERT_TRUE(finish.contains(QStringLiteral(
-        "readyFrame.requestSerial >= m_gradientReanchorSerialFloor")));
+    const int decideAt = finish.indexOf(QStringLiteral(
+        "if( resize_still_drawing_wait::gradientNeedsReanchor( m_zoomModeChanged,"));
+    ASSERT_TRUE(decideAt >= 0);
+    const QString decide = finish.mid(decideAt, 700);
+    ASSERT_TRUE(decide.contains(QStringLiteral("m_pGradientElement->anchoredSceneWidth()")));
+    ASSERT_TRUE(decide.contains(QStringLiteral("m_pGradientElement->anchoredSceneHeight()")));
+    ASSERT_TRUE(decide.contains(QStringLiteral("static_cast<int>( m_pScene->width() )")));
+    ASSERT_TRUE(decide.contains(QStringLiteral("static_cast<int>( m_pScene->height() )")));
+    ASSERT_TRUE(decide.contains(QStringLiteral("m_zoomModeChanged = false;")));
+    ASSERT_TRUE(decide.contains(QStringLiteral("m_pGradientElement->redrawGradientElement( m_pScene->width(),")));
+    ASSERT_FALSE(finish.contains(QStringLiteral("requestSerial >= m_gradient")));
 }
 
-// adversary r2 pass 2 A1: resizeEvent saves floor 100 before drawFrame(), then waits; a stretch change dispatched inside
-// that wait (a nested loop) arms floor 101. The resize arm must not lower it back to 100, or old request 100 consumes the
-// re-anchor on the old scene. The floor only rises; every arm site goes through the one helper.
-TEST(ResizeStillDrawingWait, TheReanchorFloorOnlyRises)
+// Every gradient redraw records the geometry it anchored on, by construction: the one definition of redrawGradientElement
+// stores it, and MainWindow reaches the overlay only through m_pGradientElement->redrawGradientElement.
+TEST(ResizeStillDrawingWaitWiring, EveryGradientRedrawRecordsTheAnchoredGeometry)
 {
-    using resize_still_drawing_wait::raisedReanchorFloor;
-    ASSERT_EQ(static_cast<std::uint64_t>(101), raisedReanchorFloor(101, 100)); // the adversary's input
-    ASSERT_EQ(static_cast<std::uint64_t>(101), raisedReanchorFloor(100, 101));
-    ASSERT_EQ(static_cast<std::uint64_t>(7), raisedReanchorFloor(7, 7));
-    ASSERT_EQ(static_cast<std::uint64_t>(1), raisedReanchorFloor(0, 1));
-}
+    const QString cpp = readRepoFile(QStringLiteral("platform/qt/GradientElement.cpp"));
+    const QString header = readRepoFile(QStringLiteral("platform/qt/GradientElement.h"));
+    ASSERT_FALSE(cpp.isEmpty());
+    ASSERT_FALSE(header.isEmpty());
+    const QString redraw = functionBody(cpp,
+        QStringLiteral("void GradientElement::redrawGradientElement(int sceneX, int sceneY, int picX, int picY)"),
+        QStringLiteral("\n}"));
+    ASSERT_FALSE(redraw.isEmpty());
+    ASSERT_TRUE(redraw.contains(QStringLiteral("m_anchoredSceneWidth = sceneX;")));
+    ASSERT_TRUE(redraw.contains(QStringLiteral("m_anchoredSceneHeight = sceneY;")));
+    ASSERT_EQ(1, cpp.count(QStringLiteral("GradientElement::redrawGradientElement(")));
+    ASSERT_TRUE(header.contains(QStringLiteral("int m_anchoredSceneWidth = -1;")));
+    ASSERT_TRUE(header.contains(QStringLiteral("int m_anchoredSceneHeight = -1;")));
+    ASSERT_TRUE(header.contains(QStringLiteral("int anchoredSceneWidth( void ) const;")));
+    ASSERT_TRUE(header.contains(QStringLiteral("int anchoredSceneHeight( void ) const;")));
 
-TEST(ResizeStillDrawingWaitWiring, EveryReanchorArmRaisesTheFloorAndNeverAssignsItDirectly)
-{
     const QString source = readRepoFile(QStringLiteral("platform/qt/MainWindow.cpp"));
-    ASSERT_FALSE(source.isEmpty());
-    const QString raised = QStringLiteral(
-        "m_gradientReanchorSerialFloor = resize_still_drawing_wait::raisedReanchorFloor( m_gradientReanchorSerialFloor,");
-    const int arms = source.count(QStringLiteral("m_zoomModeChanged = true;"));
-    ASSERT_TRUE(arms >= 4);
-    ASSERT_EQ(arms, source.count(raised));
-    ASSERT_EQ(arms, source.count(QStringLiteral("m_gradientReanchorSerialFloor = ")));
-    const QString body = resizeEventBody();
-    ASSERT_TRUE(body.contains(raised + QStringLiteral(" gradientReanchorSerialFloor );")));
+    const int calls = source.count(QStringLiteral("redrawGradientElement("));
+    ASSERT_TRUE(calls >= 7);
+    ASSERT_EQ(calls, source.count(QStringLiteral("m_pGradientElement->redrawGradientElement(")));
 }
 
 // adversary r1 re-pass A1: a handler the pump dispatches (Updater::getReleaseList's processEvents() loop) can run its
@@ -430,14 +537,16 @@ TEST(ResizeStillDrawingWaitWiring, AGradientSiteTimeoutDefersTheRedrawToTheLande
     const QString gradientBlock = tail.left(tail.indexOf(QStringLiteral("event->accept();")));
     ASSERT_EQ(1, gradientBlock.count(QStringLiteral("m_zoomModeChanged = true;")));
 
-    // the frame-ready path still consumes the flag with a gradient redraw on the landed scene
+    // the frame-ready path still consumes the flag with a gradient redraw on the landed scene (r3: through the geometry
+    // decision, which takes the flag first)
     const QString finish = functionBody(source,
         QStringLiteral("void MainWindow::finishPresentedFrame( uint64_t displayFrame,"),
         QStringLiteral("\nvoid MainWindow::"));
     ASSERT_FALSE(finish.isEmpty());
-    const int consumeAt = finish.indexOf(QStringLiteral("if( m_zoomModeChanged"));
+    const int consumeAt = finish.indexOf(QStringLiteral(
+        "if( resize_still_drawing_wait::gradientNeedsReanchor( m_zoomModeChanged,"));
     ASSERT_TRUE(consumeAt >= 0);
-    const QString consume = finish.mid(consumeAt, 400);
+    const QString consume = finish.mid(consumeAt, 700);
     ASSERT_TRUE(consume.contains(QStringLiteral("m_zoomModeChanged = false;")));
     ASSERT_TRUE(consume.contains(QStringLiteral("m_pGradientElement->redrawGradientElement( m_pScene->width(),")));
 }

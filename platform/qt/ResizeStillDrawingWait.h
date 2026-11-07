@@ -78,6 +78,14 @@ inline std::uint64_t raisedReanchorFloor( std::uint64_t current, std::uint64_t c
     return candidate > current ? candidate : current;
 }
 
+// r3 RED stub: today's decision with the serial floor taken away is the flag alone. The fix keys it on geometry too.
+inline bool gradientNeedsReanchor( bool zoomModeChanged, int anchoredSceneWidth, int anchoredSceneHeight,
+                                   int sceneWidth, int sceneHeight )
+{
+    (void)anchoredSceneWidth; (void)anchoredSceneHeight; (void)sceneWidth; (void)sceneHeight;
+    return zoomModeChanged;
+}
+
 inline Result wait( const Callbacks &callbacks )
 {
     Result result;
