@@ -564,13 +564,20 @@ static void debayer_reduced_hchroma121_impl(uint16_t *out, const uint16_t *in, i
             const int g = (int)pm[1];
             for (int c = 0; c < 3; c += 2)
             {
-                if (sel && !(sel_keep & (c ? 2 : 1)))
+                if (sel)
                 {
-                    const float a = sel[c ? 1 : 0];
-                    const float own = fabsf((float)((int)pl[c] - 2 * (int)pm[c] + (int)pr[c])) / a;
-                    const float gc = (float)((int)pl[1] - 2 * g + (int)pr[1]);
-                    const float dif = fabsf((float)((int)pl[c] - 2 * (int)pm[c] + (int)pr[c]) / a - gc);
-                    if (own <= dif)
+                    /* r12 pass 3 A1: a kept channel (degenerate fit, e.g. a negative slope) is the bilinear's, so it
+                     * takes its own [1 2 1] as well; the colour difference to G is never laid on it. */
+                    int own_path = (sel_keep & (c ? 2 : 1)) != 0;
+                    if (!own_path)
+                    {
+                        const float a = sel[c ? 1 : 0];
+                        const float own = fabsf((float)((int)pl[c] - 2 * (int)pm[c] + (int)pr[c])) / a;
+                        const float gc = (float)((int)pl[1] - 2 * g + (int)pr[1]);
+                        const float dif = fabsf((float)((int)pl[c] - 2 * (int)pm[c] + (int)pr[c]) / a - gc);
+                        own_path = own <= dif;
+                    }
+                    if (own_path)
                     {
                         dst[(size_t)x * 3u + (size_t)c] =
                             (uint16_t)(((int)pl[c] + 2 * (int)pm[c] + (int)pr[c] + 2) >> 2);

@@ -63,7 +63,8 @@ int debayer_reduced_hacd_chroma_rgb16(uint16_t *rgb, const uint16_t *bayer, int 
  * a G-only edge) is then exact, while one that follows G keeps the colour difference.
  * The x4 CPU reduced route's chroma: debayer_reduced_hacd_chroma_rgb16 on rgb, then
  * debayer_reduced_hchroma121_ranged_rgb16 into filtered with that choice (the fit's
- * slopes; a kept channel takes the ranged colour-difference filter). Returns 0 with
+ * slopes; a kept channel, whose fit was degenerate, always takes its own plain [1 2 1],
+ * r12 pass 3). Returns 0 with
  * filtered untouched when the HA-CD step refuses. */
 int debayer_reduced_hacd_chroma121_rgb16(uint16_t *filtered, uint16_t *rgb, const uint16_t *bayer, int w, int h,
                                          int threads, float *scratch);

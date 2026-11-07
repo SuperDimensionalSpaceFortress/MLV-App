@@ -7198,7 +7198,8 @@ static int mlv_reduced_bayer_to_display_rgb16(uint16_t * out,
      * odd height (the last row pair is not reconstructed) or under 4 columns
      * debayerBasicU16 leaves rows of a previous frame's scratch in place
      * (adversary A3, pass 2 A2), so it refuses such a Bayer. The planners only
-     * produce even heights (whole 4*S-row blocks) and widths of at least 4. */
+     * produce even heights (whole 4*S-row blocks); a clip under 8 px wide can plan
+     * a Bayer under 4 columns, which is refused here (r12 pass 3 A2). */
     int rows = 0;
     if (displayScale == 2 * bayerScale)
     {
@@ -7224,8 +7225,8 @@ static int mlv_reduced_bayer_to_display_rgb16(uint16_t * out,
         /* r12 (adversary pass 9 A2 and r12 pass 1 A2, pre-existing): debayerBasicU16 reconstructs whole row pairs
          * from row 1, so under 4 rows it writes none (one row also read the row before out) and at an odd height
          * row h - 2 is never written; under 4 columns (r12 pass 2 A2) its row loop writes nothing either. The
-         * plain branch refuses what the filtered branch refuses; the planners only produce even heights of at
-         * least 4 and widths of at least 4. */
+         * plain branch refuses what the filtered branch refuses. The planners produce even heights of at least 4;
+         * a clip under 8 px wide can still plan a narrower Bayer (r12 pass 3 A2), which both branches refuse. */
         if (bw != out_w || bw < 4 || bh < 4 || (bh & 1) != 0 || bh > out_h) return 0;
         debayerBasicU16RecordingKernelMilliseconds(out, bayer, bw, bh, threads, bit_shift);
         rows = bh;
