@@ -524,13 +524,30 @@ function Get-FixtureMatch([string]$CommandLine, [string]$Fx) {
     if ($leaf.Length -eq 0) { $leaf = $root }
     if ($CommandLine.IndexOf($leaf, [StringComparison]::OrdinalIgnoreCase) -lt 0) { return 'none' }
     try { $rootFull = [IO.Path]::GetFullPath($root).TrimEnd([char]'\') } catch { return 'unknown' }
-    foreach ($t in (Split-WindowsCommandLine $CommandLine)) {
-        $tn = $t.Replace([char]'/', [char]'\')
+    # r6 pass-12 A1: the root itself must be a plain drive path (names of [A-Za-z0-9_.~-], none of them '.' or '..'; '~' for 8.3 temp names, a
+    # leading '.' for dirs like .claude-state): a temp dir holding ';', '#', a space or a quote makes even a whole argument readable as script,
+    # so with such a root nothing is a kill match (all unknown).
+    if ($root -cnotmatch '^[A-Za-z]:(\\(?!\.{1,2}(\\|$))[A-Za-z0-9_.\-~]+)+$') { return 'unknown' }
+    $argv = Split-WindowsCommandLine $CommandLine
+    if ($argv.Count -eq 0) { return 'unknown' }
+    # r6 pass-12 A2 (and the pass-11 class): an argument is script text, never a path, when a shell reads it. cmd.exe re-parses the whole rest
+    # of its line, so nothing on a cmd line is a whole match; for pwsh/powershell only the argument right after -File/-f is a path; for any
+    # other program the argument right after a script flag (-c, -e, -k, /c, /k, /r, --command, --eval, --exec) is script text.
+    $img = $argv[0].Replace([char]'/', [char]'\'); $img = $img.Substring($img.LastIndexOf([char]'\') + 1).ToLowerInvariant()
+    if ($img.EndsWith('.exe')) { $img = $img.Substring(0, $img.Length - 4) }
+    if ($img -ceq 'cmd') { return 'unknown' }
+    $psHost = ($img -ceq 'pwsh' -or $img -ceq 'powershell' -or $img -ceq 'powershell_ise')
+    for ($ti = 0; $ti -lt $argv.Count; $ti++) {
+        $prev = if ($ti -gt 0) { [string]$argv[$ti - 1] } else { '' }
+        if ($psHost) { if ($prev -notmatch '^[-/](f|file)$') { continue } }
+        elseif ($ti -gt 0 -and $prev -match '^(-[cek]|/[ckr]|--?(command|eval|exec))$') { continue }
+        $tn = ([string]$argv[$ti]).Replace([char]'/', [char]'\')
         $vals = @($tn)
         $q = $tn.IndexOf([char]'=')
-        # r5 pass-9 A1: the value after the first '=' is a whole value only when what precedes it is an option NAME (--output=, x=). A '='
-        # inside script text ('Start-Sleep 300 # =<dir>') is not an option, so that occurrence is embedded: unknown.
-        if ($q -gt 0 -and $tn.Substring(0, $q) -cmatch '^[-\\]{0,2}[A-Za-z0-9_][A-Za-z0-9_.\-]*$') { $vals += $tn.Substring($q + 1) }
+        # r5 pass-9 A1: the value after the first '=' is a whole value only when what precedes it is an option NAME. A '=' inside script text
+        # ('Start-Sleep 300 # =<dir>') is not an option, so that occurrence is embedded: unknown. r6 pass-12 A2: and the name starts with
+        # '-' or '--' (--output=, -o=); a bare word (echo=, x=) may be a command in script text.
+        if ($q -gt 0 -and $tn.Substring(0, $q) -cmatch '^--?[A-Za-z][A-Za-z0-9\-]*$') { $vals += $tn.Substring($q + 1) }
         foreach ($v in $vals) {
             if (-not ($v.Equals($root, [StringComparison]::OrdinalIgnoreCase) -or $v.StartsWith($root + '\', [StringComparison]::OrdinalIgnoreCase))) { continue }
             # r6 pass-11 A1: a whole argument can itself be script text (pwsh -Command "<dir>\sub\`..\`..\x.ps1; Start-Sleep 300"): its escapes,
@@ -3747,6 +3764,21 @@ try { $out = @(Add-LeaseSlotSnapshot -JobId 'jB4a' -Phase 'request') } catch { $
                 @{ cl = 'python.exe --log=C:\Temp\fx\`..\y'; want = 'unknown' }
                 @{ cl = 'python.exe C:\Temp\fx\heavy-slot-fake.py status'; want = 'fixture' }   # control: a plain path under the dir
                 @{ cl = 'python.exe C:\Temp\fx\'; want = 'fixture' }                            # control: the dir with a trailing separator
+                # r6 pass-12 A2 and its class: a shell reads the argument as script. cmd re-parses its whole line; pwsh/powershell take a path only
+                # after -File; any program's argument right after a script flag is code; a bare word before '=' is no option name.
+                @{ cl = 'cmd.exe /k "echo=C:\Temp\fx"'; want = 'unknown' }                      # sol's shape (pass-12 A2)
+                @{ cl = 'cmd.exe /c C:\Temp\fx\x.bat'; want = 'unknown' }
+                @{ cl = '"C:\Windows\System32\CMD.EXE" /c "C:\Temp\fx\x.bat"'; want = 'unknown' }
+                @{ cl = 'pwsh.exe C:\Temp\fx\x.ps1'; want = 'unknown' }                         # positional: -File in pwsh, -Command in Windows PowerShell
+                @{ cl = 'powershell.exe -NoProfile -Command C:\Temp\fx\x.ps1'; want = 'unknown' }
+                @{ cl = 'bash.exe -c C:/Temp/fx/x'; want = 'unknown' }
+                @{ cl = 'python.exe -c C:\Temp\fx\x'; want = 'unknown' }
+                @{ cl = 'node.exe -e C:\Temp\fx\x'; want = 'unknown' }
+                @{ cl = 'python.exe echo=C:\Temp\fx\x'; want = 'unknown' }
+                @{ cl = 'pwsh.exe -NoProfile -File C:\Temp\fx\x.ps1'; want = 'fixture' }        # control: the -File path is a path
+                @{ cl = 'python.exe -o=C:\Temp\fx\x'; want = 'fixture' }                        # control: a dashed option name
+                @{ cl = 'python.exe -c "import time" C:\Temp\fx\x'; want = 'fixture' }          # control: a data argument after the code (the suite's own readers)
+                @{ cl = 'C:\Temp\fx\tool.exe run'; want = 'fixture' }                           # control: a program inside the dir
             )
             $c5Bad = [System.Collections.Generic.List[string]]::new()
             foreach ($r in $c5Rows) {
@@ -3803,6 +3835,26 @@ try { $out = @(Add-LeaseSlotSnapshot -JobId 'jB4a' -Phase 'request') } catch { $
             $p10Row = "survivors=[$(@($p10Census.survivors) -join ',')] unknown=[$(@($p10Census.unknown) -join ',')] stopped=[$($p10Stopped -join ',')] killed=[$($script:P10Killed -join ',')]"
             if ($p10Row -cne 'survivors=[24682] unknown=[24680,24683] stopped=[24682] killed=[24682]') { $c5Bad.Add("[pass-10 A1 / pass-11 A1] $p10Row want survivors=[24682] unknown=[24680,24683] stopped=[24682] killed=[24682]") }
             $results.pass10A1NoDescent = $p10Row
+            # r6 pass-12 (sol's inputs verbatim, through the census and the sweep seams). A1: a fixture root that holds script characters (';', '#',
+            # spaces), so a whole argument under it is read as script; nothing under such a root is a kill match. A2: cmd /k "echo=<dir>", where
+            # echo= passed the old option-name rule. Both are counted unknown and the sweep never calls Kill on them.
+            $p12A1Fx = 'C:\Temp\safe;Start-Sleep -Seconds 300;#\um-agent-quiet-lease-1234-abcd1234'
+            $p12A1Rows = @([pscustomobject]@{ ProcessId = 24680; CommandLine = 'pwsh.exe -NoProfile -Command "C:\Temp\safe;Start-Sleep -Seconds 300;#\um-agent-quiet-lease-1234-abcd1234\x.ps1"' }
+                [pscustomobject]@{ ProcessId = 24682; CommandLine = 'python.exe "C:\Temp\safe;Start-Sleep -Seconds 300;#\um-agent-quiet-lease-1234-abcd1234\heavy-slot-fake.py" status' })
+            # a root with a '.'-led name (this lane's TEMP is <wt>\.claude-state\ls\...) is still plain; a '..' segment in a root is not
+            $p12Dot = "$([bool](Test-NamesFixture 'python.exe C:\w\.claude-state\ls\um-x\f.py' 'C:\w\.claude-state\ls\um-x'))/$([bool](Test-NamesFixture 'python.exe C:\w\..\ls\um-x\f.py' 'C:\w\..\ls\um-x'))"
+            if ($p12Dot -cne 'True/False') { $c5Bad.Add("[pass-12 A1 root] dot-led root kill/dot-dot root kill=$p12Dot want True/False") }
+            $p12A2Rows = @([pscustomobject]@{ ProcessId = 24681; CommandLine = 'cmd.exe /k "echo=C:\Temp\um-agent-quiet-lease-1234-abcd1234"' }
+                [pscustomobject]@{ ProcessId = 24682; CommandLine = 'python.exe C:\Temp\um-agent-quiet-lease-1234-abcd1234\heavy-slot-fake.py status' })   # control: still killed
+            $script:P10Killed.Clear()
+            $p12A1C = Get-FixtureCensus $p12A1Fx -Rows $p12A1Rows
+            $p12A1S = @(Stop-FixtureLeftovers $p12A1Fx @(24680, 24682) -Rows $p12A1Rows -OpenPid $p10Open)
+            $p12A2C = Get-FixtureCensus $p10Fx -Rows $p12A2Rows
+            $p12A2S = @(Stop-FixtureLeftovers $p10Fx @(24681, 24682) -Rows $p12A2Rows -OpenPid $p10Open)
+            $p12Row = "A1 survivors=[$(@($p12A1C.survivors) -join ',')] unknown=[$(@($p12A1C.unknown) -join ',')] stopped=[$($p12A1S -join ',')]; A2 survivors=[$(@($p12A2C.survivors) -join ',')] unknown=[$(@($p12A2C.unknown) -join ',')] stopped=[$($p12A2S -join ',')]; killed=[$($script:P10Killed -join ',')]"
+            $p12Want = 'A1 survivors=[] unknown=[24680,24682] stopped=[]; A2 survivors=[24682] unknown=[24681] stopped=[24682]; killed=[24682]'
+            if ($p12Row -cne $p12Want) { $c5Bad.Add("[pass-12 A1/A2] $p12Row want $p12Want") }
+            $results.pass12ScriptReaders = $p12Row
             # r6: no descent code is left to adopt a stranger (static guard: the census and the sweep never read a parent pid or creation time).
             $p10Src = Get-Content -LiteralPath $PSCommandPath -Raw
             $p10Def = [regex]::Match($p10Src, '(?s)\nfunction Get-FixtureMatch\(.*?\nfunction Format-FixtureLeakLine\(').Value
