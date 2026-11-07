@@ -71,6 +71,18 @@ NON-PROMISES:
   hand-written recursion (os.scandir in a loop, a recursive function), a `grep -r`/`find`/`git
   ls-files` subprocess, a shell hook (.sh, .cmd), and a hook script that lives outside tools/hooks/
   (user-scope hooks are never tracked; prove those by a receipt).
+- DG-RED-MUTATION-VERDICT checks the CHECKER, not any mutation run: the tracked corpus
+  tools/repo_hygiene/red_mutation_verdict_corpus.json pins what red_mutation_verdict.classify() and
+  probe_classify() must answer for every tracked case (the PR #705 probes among them, at the readings measured in
+  powershell.exe 5.1), and the guard fails when one answer drifts, when a case is answered with a reason CODE other than
+  the `code` it records (the checker's own name for the PRIMARY reason, red_mutation_verdict.REASON_CODES; compared as a
+  code, never as text, because a reason's text quotes its input: r11; a REFUSED case with no known `code`, or one still
+  holding the retired text `reason`, is a malformed corpus), or when the
+  corpus holds no PASS or no REFUSED case of a kind. Saved mutation output lives in
+  untracked .claude-state run dirs, so there is no live-tree evidence to scan; a lane runs
+  `py -3 tools/repo_hygiene/red_mutation_verdict.py verdict --output red.txt --expect <file:line>` on its own
+  red.txt. The checker's own limits are its module docstring NON-PROMISES (text only, default unittest and
+  pytest layouts, no proof the mutation was restored).
 
 If pwsh is not on PATH the AST guards SKIP with a reason; on a GitHub Actions
 runner (whose images carry pwsh) a missing pwsh FAILS instead.
@@ -90,6 +102,8 @@ import unittest
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Callable
+
+from . import red_mutation_verdict
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 PWSH_TIMEOUT_S = 300
@@ -663,6 +677,81 @@ def check_hook_walk_bound(root: Path, rel_paths: list[str]) -> list[Violation]:
             if not any(v.path == path and func == allowed for path, allowed, _why in HOOK_WALK_ALLOW)]
 
 
+RED_MUTATION_CORPUS = "tools/repo_hygiene/red_mutation_verdict_corpus.json"
+
+
+def is_red_mutation_corpus(rel: str) -> bool:
+    return rel == RED_MUTATION_CORPUS
+
+
+def check_red_mutation_verdict(root: Path, rel_paths: list[str]) -> list[Violation]:
+    """Fail when the checker's answer for any pinned corpus case differs from the recorded one."""
+    out: list[Violation] = []
+    if not rel_paths:
+        # The corpus is one tracked file that every real tree holds. Selecting nothing means it was
+        # deleted or renamed, and a guard that checks no input must not answer "no violation".
+        raise CouldNotCheck(f"{RED_MUTATION_CORPUS} is not in the selection: the corpus was deleted or "
+                            f"renamed, so no case was checked")
+    for rel in rel_paths:
+        try:
+            # parse_float=str keeps a number's spelling: json would read 1e-400 as 0.0 and 1e400 as inf, silently.
+            cases = json.loads((root / rel).read_text(encoding="utf-8"), parse_float=str)["cases"]
+            if not isinstance(cases, list) or not cases:
+                raise ValueError("cases is empty or not a list")
+        except (OSError, ValueError, KeyError, TypeError) as exc:
+            raise CouldNotCheck(f"{rel} is not a readable corpus: {exc}") from exc
+        seen: set[tuple[str, str]] = set()
+        for index, case in enumerate(cases, start=1):
+            try:
+                kind, want = case["kind"], case["expect"]
+                if want not in (red_mutation_verdict.PASS, red_mutation_verdict.REFUSED):
+                    raise ValueError(f"expect must be PASS or REFUSED, got {want!r}")
+                # r11 (r10 adversary A2): a case pins WHY by the checker's reason CODE, never by text. A reason's text
+                # quotes its input (an id, a node, repr() of a name), so any substring check of it can be satisfied by
+                # that input. `reason` (the r8-r10 text pin) is retired: a case still holding one is malformed.
+                if "reason" in case:
+                    raise ValueError("`reason` is retired (r11): record the checker's `code` "
+                                     "(red_mutation_verdict.REASON_CODES), which no input text can supply")
+                code = case.get("code")
+                if (want == red_mutation_verdict.REFUSED or code is not None) and (
+                        not isinstance(code, str) or code not in red_mutation_verdict.REASON_CODES):
+                    # r8 (R7-T1): a REFUSED answer alone is satisfied by a case that is refused for the wrong reason.
+                    raise ValueError(f"a REFUSED case needs a `code`, one of red_mutation_verdict.REASON_CODES "
+                                     f"(got {code!r})")
+                if kind == "verdict":
+                    if not isinstance(case["output"], str) or not isinstance(case["expected_assertion"], str):
+                        raise TypeError("output and expected_assertion must be strings")
+                    # r10 R8-T1: the code is the PRIMARY reason's. The `; also:` diagnostics are shown in a violation
+                    # but carry no code, so they never satisfy one.
+                    v = red_mutation_verdict.classify(case["output"], case["expected_assertion"])
+                elif kind == "probe":
+                    window = case["window"]
+                    if not isinstance(window, list) or len(window) != 2:
+                        raise TypeError(f"window must be a list of two bounds, got {window!r}")
+                    v = red_mutation_verdict.probe_classify(case["bug_value"], case["fix_value"], tuple(window))
+                else:
+                    raise ValueError(f"unknown kind {kind!r}")
+            except (KeyError, TypeError, ValueError) as exc:
+                raise CouldNotCheck(f"{rel} case {index} is malformed: {exc!r}") from exc
+            seen.add((kind, want))
+            shown = v.reason + "".join(f"; also: {a}" for a in v.also)
+            if v.status != want:
+                out.append(Violation("DG-RED-MUTATION-VERDICT", rel, index,
+                                     f"case {case.get('id')!r}: expected {want}, checker said {v.status} [{v.code}] "
+                                     f"({shown})"))
+            elif code is not None and v.code != code:
+                out.append(Violation("DG-RED-MUTATION-VERDICT", rel, index,
+                                     f"case {case.get('id')!r}: {v.status}, but with code {v.code!r}, not its recorded "
+                                     f"code {code!r}; primary reason: {shown}"))
+        for kind in ("verdict", "probe"):
+            for want in (red_mutation_verdict.PASS, red_mutation_verdict.REFUSED):
+                if (kind, want) not in seen:
+                    out.append(Violation("DG-RED-MUTATION-VERDICT", rel, 1,
+                                         f"corpus holds no {kind} case expecting {want}, so a checker that "
+                                         f"always answers the other way would pass"))
+    return out
+
+
 @dataclass(frozen=True)
 class Guard:
     id: str
@@ -690,6 +779,10 @@ REGISTRY: tuple[Guard, ...] = (
           "a per-turn hook script that walks a growing run-archive tree recursively (rglob, os.walk, -Recurse) "
           "saturates the machine, and the PreToolUse scan-guard never sees a hook's own process",
           is_hook_walk_scanned, check_hook_walk_bound, True),
+    Guard("DG-RED-MUTATION-VERDICT", "7cf7477",
+          "a test whose probe value cannot distinguish the bug from the fix passes under both, and a red-mutation "
+          "proof that only shows the suite went red does not show it failed AT the intended assertion",
+          is_red_mutation_corpus, check_red_mutation_verdict, False),
 )
 GUARDS = {g.id: g for g in REGISTRY}
 
@@ -912,6 +1005,43 @@ FIXTURES: dict[str, dict[str, dict[str, str]]] = {
                                  "$b = Get-Content $f -Raw -Receipt 1\n",
         },
     },
+    "DG-RED-MUTATION-VERDICT": {
+        "red": {
+            # Two cases whose recorded answer is wrong: a red run with no named assertion is not a PASS, and
+            # the PR #705 probe as the bus trap records it (the test rounded, so bug and fix both read 3) does not
+            # discriminate. No REFUSED case of either
+            # kind, so the "always answers PASS" checker would also go unnoticed: line 1 reports that too.
+            RED_MUTATION_CORPUS: json.dumps({"cases": [
+                {"id": "red-no-assertion", "kind": "verdict", "expect": "PASS",
+                 "output": "Ran 1 test in 0.001s\n\nFAILED (failures=1)\n", "expected_assertion": "t.py:1"},
+                {"id": "probe-705-display-rounded", "kind": "probe", "expect": "PASS",
+                 "bug_value": 3, "fix_value": 3, "window": [3, 3]},
+            ]}),
+        },
+        "green": {
+            RED_MUTATION_CORPUS: json.dumps({"cases": [
+                {"id": "fails-at-expected-line", "kind": "verdict", "expect": "PASS",
+                 "output": ("=" * 70 + "\nFAIL: test_a (t.T.test_a)\n" + "-" * 70 + "\n"
+                            "Traceback (most recent call last):\n  File \"t.py\", line 8, in test_a\n"
+                            "    self.assertEqual(3, 4)\nAssertionError: 3 != 4\n\n" + "-" * 70
+                            + "\nRan 1 test in 0.001s\n\nFAILED (failures=1)\n"),
+                 "expected_assertion": "t.py:8"},
+                # FORMAT NEGATIVE (r10 R8-T1): the count precheck is the primary refusal; "names no failing assertion"
+                # is only its `; also:` diagnostic, which never satisfies a recorded reason.
+                {"id": "red-no-assertion", "kind": "verdict", "expect": "REFUSED", "code": "cnc-count",
+                 "output": "Ran 1 test in 0.001s\n\nFAILED (failures=1)\n", "expected_assertion": "t.py:8"},
+                {"id": "probe-705-display-rounded", "kind": "probe", "expect": "REFUSED", "code": "probe-both-inside",
+                 "bug_value": 3, "fix_value": 3, "window": [3, 3]},
+                # Measured in powershell.exe 5.1.19041.6456: [Math]::Min(330, 2.2) is Int32 2 and [Math]::Min(330.0, 2.2) is
+                # Double 2.2, both inside [2.0, 2.5], so this probe cannot tell the overloads apart.
+                {"id": "probe-705-2.2s", "kind": "probe", "expect": "REFUSED", "code": "probe-both-inside",
+                 "bug_value": 2, "fix_value": 2.2, "window": [2.0, 2.5]},
+                # The separating control: [Math]::Min(330, 2.8) is Int32 3 and [Math]::Min(330.0, 2.8) is Double 2.8.
+                {"id": "probe-705-2.8s-raw-readings", "kind": "probe", "expect": "PASS",
+                 "bug_value": 3, "fix_value": 2.8, "window": [2.7, 2.9]},
+            ]}),
+        },
+    },
 }
 
 _LIVE: dict[str, tuple[list[Violation], float]] = {}
@@ -963,6 +1093,8 @@ class RegistryTests(unittest.TestCase):
         self.assertFalse(is_hook_walk_scanned("tools/other/session-checkpoint.py"))
         self.assertFalse(is_hook_walk_scanned("tools/hooks/README.md"))
         self.assertFalse(is_hook_walk_scanned("tools/coordination/x.py"))
+        self.assertTrue(is_red_mutation_corpus("tools/repo_hygiene/red_mutation_verdict_corpus.json"))
+        self.assertFalse(is_red_mutation_corpus("x/tools/repo_hygiene/red_mutation_verdict_corpus.json"))
 
     def test_untracked_files_are_not_checked(self) -> None:
         if shutil.which("git") is None:
@@ -1078,6 +1210,260 @@ class GuardFixtureTests(_PwshMixin, unittest.TestCase):
             both = walk + "TOP = list(os.walk('.'))\n"
             self.assertEqual(len(check_hook_walk_bound(root, _write_tree(root, {path: both}))), 1)
 
+    def test_red_mutation_verdict_red_fails(self) -> None:
+        self._assert_red("DG-RED-MUTATION-VERDICT", {(RED_MUTATION_CORPUS, 1), (RED_MUTATION_CORPUS, 2)})
+
+    def test_red_mutation_verdict_green_passes(self) -> None:
+        self._assert_green("DG-RED-MUTATION-VERDICT")
+
+    def test_red_mutation_verdict_malformed_corpus_is_could_not_check(self) -> None:
+        guard = GUARDS["DG-RED-MUTATION-VERDICT"]
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            for text in ("{not json", json.dumps({"cases": []}),
+                         json.dumps({"cases": [{"kind": "verdict", "expect": "PASS"}]})):
+                rels = _write_tree(root, {RED_MUTATION_CORPUS: text})
+                with self.assertRaises(CouldNotCheck, msg=text):
+                    run_guard(guard, root, rels)
+
+    def test_red_mutation_verdict_empty_selection_is_could_not_check(self) -> None:
+        # A deleted or renamed corpus selects no file; the guard must refuse to answer, not return [].
+        guard = GUARDS["DG-RED-MUTATION-VERDICT"]
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            with self.assertRaises(CouldNotCheck):
+                run_guard(guard, root, [])
+            subprocess.run(["git", "init", "-q", str(root)], check=True)
+            (root / "unrelated.txt").write_text("x", encoding="utf-8")
+            subprocess.run(["git", "-C", str(root), "add", "unrelated.txt"], check=True)
+            with self.assertRaises(CouldNotCheck):
+                run_guard(guard, root)
+
+    def test_red_mutation_verdict_null_or_non_string_fields_are_could_not_check(self) -> None:
+        # A corpus case with `output: null` or a non-string expected_assertion is a malformed
+        # corpus (CouldNotCheck), never an AttributeError out of the checker.
+        guard = GUARDS["DG-RED-MUTATION-VERDICT"]
+        good = {"kind": "verdict", "output": "Ran 1 test\n\nOK\n", "expected_assertion": "a.py:1", "expect": "REFUSED"}
+        bad = [{**good, "output": None}, {**good, "output": 7}, {**good, "expected_assertion": None},
+               {**good, "expected_assertion": ["a.py:1"]}, {**good, "expect": "MAYBE"}, {**good, "expect": None}]
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            for case in bad:
+                rels = _write_tree(root, {RED_MUTATION_CORPUS: json.dumps({"cases": [case]})})
+                with self.assertRaises(CouldNotCheck, msg=repr(case)):
+                    run_guard(guard, root, rels)
+
+    def test_red_mutation_verdict_probe_window_must_be_a_list_of_two_bounds(self) -> None:
+        # r7 adversary advisory A3: an object (its KEYS became the bounds) or a string ('12') used to read as a window.
+        guard = GUARDS["DG-RED-MUTATION-VERDICT"]
+        good = {"kind": "probe", "expect": "PASS", "bug_value": 0, "fix_value": 1, "window": [1, 100]}
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            for window in ({"1": 100, "2": 200}, "12", [1], [1, 2, 3], None):
+                rels = _write_tree(root, {RED_MUTATION_CORPUS: json.dumps({"cases": [{**good, "window": window}]})})
+                with self.assertRaises(CouldNotCheck, msg=repr(window)):
+                    run_guard(guard, root, rels)
+
+
+    # ---- r8: the PR #705 readings in every fixture are the MEASURED ones (sol r7 blocker; opus RMV-GUARD-FIXTURE-705-READING-1)
+    # powershell.exe 5.1.19041.6456, sol r1 (PR comment 6680026607): the Int32 overload reads 2 for the 2.2 s probe and 3 for
+    # the 2.8 s probe; the double overload reads the probe itself. "display-rounded" is the shape the bus trap records (the
+    # test rounded both readings to 3). Matched in this order, so "2.8s-raw" is not read as the rounded shape.
+    PR705_READINGS = (("2.2s", (2, 2.2, [2.0, 2.5], "REFUSED")),
+                      ("2.8s-raw", (3, 2.8, [2.7, 2.9], "PASS")),
+                      ("rounds-to-3", (3, 3, [3, 3], "REFUSED")),
+                      ("display-rounded", (3, 3, [3, 3], "REFUSED")))
+
+    def _pr705_probes(self) -> list[tuple[str, dict]]:
+        corpora = [("live corpus", (REPO_ROOT / RED_MUTATION_CORPUS).read_text(encoding="utf-8"), True)]
+        for side in ("red", "green"):
+            corpora.append((f"{side} fixture", FIXTURES["DG-RED-MUTATION-VERDICT"][side][RED_MUTATION_CORPUS], side != "red"))
+        found = []
+        for where, text, judge_expect in corpora:
+            for case in json.loads(text)["cases"]:
+                if case["kind"] == "probe" and "705" in case["id"]:
+                    found.append((where, case, judge_expect))
+        return found
+
+    def test_pr705_fixture_readings_are_the_measured_ones(self) -> None:
+        probes = self._pr705_probes()
+        self.assertGreaterEqual(len(probes), 5, "the live corpus and both fixtures hold PR #705 probes")
+        seen = set()
+        for where, case, judge_expect in probes:
+            want = next((v for key, v in self.PR705_READINGS if key in case["id"]), None)
+            self.assertIsNotNone(want, f"{where}: {case['id']} is a PR #705 probe with no measured reading to pin it to")
+            bug, fix, window, expect = want
+            self.assertEqual((case["bug_value"], case["fix_value"], case["window"]), (bug, fix, window), f"{where}: {case['id']}")
+            if judge_expect:  # the RED fixture records a WRONG answer on purpose, but never a wrong reading
+                self.assertEqual(case["expect"], expect, f"{where}: {case['id']}")
+            seen.add((where, bug, fix))
+        # the GREEN fixture keeps one separating PASS probe and the 2.2 s REFUSED probe, so both outcomes are covered
+        green = {c["id"]: c["expect"] for w, c, _j in probes if w == "green fixture"}
+        self.assertEqual(sorted(green.values()), ["PASS", "REFUSED", "REFUSED"], green)
+
+    def test_pr705_2_2_probe_is_refused_by_the_checker_on_the_measured_readings(self) -> None:
+        ok, reason = red_mutation_verdict.probe_discriminates(2, 2.2, (2.0, 2.5))
+        self.assertFalse(ok, reason)
+        self.assertTrue(red_mutation_verdict.probe_discriminates(3, 2.8, (2.7, 2.9))[0])
+
+    # ---- r8 R7-T1: a REFUSED case is pinned to the reason it was written for ------------------------------------
+    def test_red_mutation_verdict_refused_case_is_pinned_to_its_reason(self) -> None:
+        guard = GUARDS["DG-RED-MUTATION-VERDICT"]
+        # refused, but NOT because the run is green: its summary lists no PASSED line for the pass the runner counts
+        text = "=== short test summary info ===\nFAILED t.py::test_x - assert False\n=== 1 failed, 1 passed in 0.1s ===\n"
+        wrong = {"id": "wrong-reason", "kind": "verdict", "expect": "REFUSED", "code": "final-green",
+                 "output": text, "expected_assertion": "other.py::test_x"}
+        right = {**wrong, "id": "right-reason", "code": "cnc-short-summary"}
+        others = [{"id": "p", "kind": "verdict", "expect": "PASS", "expected_assertion": "t.py::test_x",
+                   "output": "=== short test summary info ===\nFAILED t.py::test_x - assert False\n=== 1 failed in 0.1s ===\n"},
+                  {"id": "q", "kind": "probe", "expect": "PASS", "bug_value": 0, "fix_value": 1, "window": [1, 1]},
+                  {"id": "r", "kind": "probe", "expect": "REFUSED", "code": "probe-both-inside", "bug_value": 1, "fix_value": 1, "window": [1, 1]}]
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            rels = _write_tree(root, {RED_MUTATION_CORPUS: json.dumps({"cases": others + [right]})})
+            self.assertEqual(run_guard(guard, root, rels), [])
+            rels = _write_tree(root, {RED_MUTATION_CORPUS: json.dumps({"cases": others + [wrong]})})
+            found = run_guard(guard, root, rels)
+            self.assertEqual(len(found), 1, found)
+            self.assertIn("wrong-reason", found[0].detail)
+            self.assertIn("code", found[0].detail)
+
+    # ---- r10 R8-T1 (Dot 6706642324): only the PRIMARY refusal satisfies a recorded reason ---------------------------
+    _R8T1_MALFORMED = ("=== short test summary info ===\nFAILED t.py::test_x - assert False\n"
+                       "=== 1 failed, 1 passed in 0.1s ===\n")  # the runner counts a pass this summary never lists
+    _R8T1_VALID = ("=== short test summary info ===\nPASSED t.py::test_ok\nFAILED t.py::test_x - assert False\n"
+                   "=== 1 failed, 1 passed in 0.1s ===\n")  # the same run, with the PASSED line -rA prints
+
+    def _r8t1_corpus(self, case: dict) -> str:
+        others = [{"id": "p", "kind": "verdict", "expect": "PASS", "expected_assertion": "t.py::test_x",
+                   "output": "=== short test summary info ===\nFAILED t.py::test_x - assert False\n=== 1 failed in 0.1s ===\n"},
+                  {"id": "q", "kind": "probe", "expect": "PASS", "bug_value": 0, "fix_value": 1, "window": [1, 1]},
+                  {"id": "r", "kind": "probe", "expect": "REFUSED", "code": "probe-both-inside", "bug_value": 1, "fix_value": 1, "window": [1, 1]}]
+        return json.dumps({"cases": others + [case]})
+
+    def test_semantic_reason_in_also_does_not_mask_summary_refusal(self) -> None:
+        guard = GUARDS["DG-RED-MUTATION-VERDICT"]
+        semantic, fmt_code = "not-at", "cnc-short-summary"
+        # (a) MALFORMED: the primary result is the format refusal; the semantic reason is only in the `; also:` text
+        malformed = {"id": "r8t1-malformed-semantic", "kind": "verdict", "expect": "REFUSED", "code": semantic,
+                     "output": self._R8T1_MALFORMED, "expected_assertion": "other.py::test_x"}
+        # (b) VALID-PASSED semantic twin: well formed, so the semantic refusal IS the primary result
+        valid = {**malformed, "id": "r8t1-valid-passed-semantic", "output": self._R8T1_VALID}
+        # (c) FORMAT-NEGATIVE CONTROL (explicitly labeled): malformed, and its recorded reason IS the format refusal
+        fmt = {**malformed, "id": "r8t1-format-negative-control", "code": fmt_code}
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            rels = _write_tree(root, {RED_MUTATION_CORPUS: self._r8t1_corpus(malformed)})
+            found = run_guard(guard, root, rels)
+            self.assertEqual(len(found), 1, found)
+            self.assertIn("r8t1-malformed-semantic", found[0].detail)
+            self.assertIn("primary", found[0].detail)
+            self.assertIn("COULD-NOT-CHECK (short-summary line", found[0].detail)  # the primary refusal is named
+            for ok in (valid, fmt):
+                rels = _write_tree(root, {RED_MUTATION_CORPUS: self._r8t1_corpus(ok)})
+                self.assertEqual(run_guard(guard, root, rels), [], ok["id"])
+        # the twin's primary is the semantic refusal itself; the control's primary is the format refusal and nothing else
+        self.assertEqual(red_mutation_verdict.classify(self._R8T1_VALID, "other.py::test_x").also, ())
+        got = red_mutation_verdict.classify(self._R8T1_MALFORMED, "other.py::test_x")
+        self.assertTrue(got.reason.startswith("COULD-NOT-CHECK (short-summary line"), got)
+        self.assertEqual(got.code, fmt_code)  # the code is the PRIMARY reason's; the diagnostic carries none
+        self.assertTrue(any("the run is red but not at" in a for a in got.also), got)
+        self.assertEqual(red_mutation_verdict.classify(self._R8T1_VALID, "other.py::test_x").code, semantic)
+
+    def test_red_mutation_verdict_reason_quoted_from_the_case_input_does_not_count(self) -> None:
+        # adversary pass 2 A2 (07087c00): the primary reason quotes the expected id, so "the run is green" recorded as
+        # the reason matched the quote of an expected id spelled "the run is green". Since r11 a case records a CODE:
+        # an expected id spelled like a reason changes nothing, and a quoted text is not a code at all.
+        guard = GUARDS["DG-RED-MUTATION-VERDICT"]
+        out = "=== short test summary info ===\nFAILED t.py::test_x - assert False\n=== 1 failed in 0.1s ===\n"
+        bad = {"id": "bad", "kind": "verdict", "expect": "REFUSED", "code": "final-green", "output": out,
+               "expected_assertion": "the run is green"}
+        spanning = {**bad, "id": "spanning", "code": "green", "expected_assertion": "the run is"}
+        good = {**bad, "id": "good", "code": "not-at", "expected_assertion": "other.py::test_x"}
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            for case in (bad, spanning):
+                rels = _write_tree(root, {RED_MUTATION_CORPUS: self._r8t1_corpus(case)})
+                found = run_guard(guard, root, rels)
+                self.assertEqual(len(found), 1, (case["id"], found))
+                self.assertIn(case["id"], found[0].detail)
+            for quoted in ({**good, "id": "quoted", "code": "t.py::test_x"},
+                           {**good, "id": "old-text-pin", "reason": "the run is red but not at"}):
+                rels = _write_tree(root, {RED_MUTATION_CORPUS: self._r8t1_corpus(quoted)})
+                with self.assertRaises(CouldNotCheck, msg=quoted["id"]):
+                    run_guard(guard, root, rels)
+            rels = _write_tree(root, {RED_MUTATION_CORPUS: self._r8t1_corpus(good)})
+            self.assertEqual(run_guard(guard, root, rels), [])
+
+    def test_red_mutation_verdict_reason_quoted_through_repr_does_not_count(self) -> None:
+        # r11, r10 adversary A2 (e2d9dc08): a reason quoting the input through repr() (`'MissingDependency'`) or an
+        # escaped node (`t.py::test\\tx`) is not a substring of the raw input, so the old raw-input check let it satisfy
+        # the case. The guard compares the checker's reason CODE now, never rendered text: neither witness is accepted.
+        guard = GUARDS["DG-RED-MUTATION-VERDICT"]
+        green = json.loads(FIXTURES["DG-RED-MUTATION-VERDICT"]["green"][RED_MUTATION_CORPUS])["cases"]
+        repr_case = {"id": "quoted-input", "kind": "verdict", "expect": "REFUSED", "reason": "'MissingDependency'",
+                     "output": "=== short test summary info ===\nFAILED t.py::test_x - MissingDependency: boom\n"
+                               "=== 1 failed in 0.1s ===\n", "expected_assertion": "other"}
+        escaped = {**repr_case, "id": "escaped-node", "reason": "'t.py::test\\tx'",
+                   "output": "=== short test summary info ===\nFAILED t.py::test\tx - assert False\n=== 1 failed in 0.1s ===\n"}
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            for case in (repr_case, escaped, {**repr_case, "code": "'MissingDependency'"},
+                         {**escaped, "code": "'t.py::test\\tx'"}):
+                rels = _write_tree(root, {RED_MUTATION_CORPUS: json.dumps({"cases": green + [case]})})
+                try:
+                    found = run_guard(guard, root, rels)
+                except CouldNotCheck:
+                    continue  # a case recording no known code is a malformed corpus: refused, never accepted
+                self.assertTrue(found, (case, "the guard accepted a reason quoted from the case's own input"))
+
+    def test_red_mutation_verdict_live_corpus_reasons_are_primary(self) -> None:
+        # every REFUSED case in the tracked corpus is refused FOR its recorded reason: the reason is in the primary
+        # refusal, never only in an `; also:` diagnostic (r10 R8-T1: case ut-red-names-no-assertion was)
+        cases = json.loads((Path(__file__).resolve().parents[2] / RED_MUTATION_CORPUS).read_text(encoding="utf-8"),
+                           parse_float=str)["cases"]
+        for case in cases:
+            if case["kind"] == "verdict" and case["expect"] == red_mutation_verdict.REFUSED:
+                got = red_mutation_verdict.classify(case["output"], case["expected_assertion"])
+                self.assertEqual(case["code"], got.code, case["id"])  # r11: the PRIMARY reason's code
+
+    def test_red_mutation_verdict_refused_case_without_a_reason_is_could_not_check(self) -> None:
+        guard = GUARDS["DG-RED-MUTATION-VERDICT"]
+        base = {"id": "x", "kind": "verdict", "expect": "REFUSED", "output": "Ran 1 test\n\nOK\n", "expected_assertion": "a.py:1"}
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            for case in (base, {**base, "code": ""}, {**base, "code": None}, {**base, "code": ["final-green"]},
+                         {**base, "code": "the run is green"}, {**base, "reason": "the run is green"},
+                         {**base, "code": "final-green", "reason": "the run is green"},
+                         {**base, "kind": "probe", "bug_value": 1, "fix_value": 1, "window": [1, 1]}):
+                rels = _write_tree(root, {RED_MUTATION_CORPUS: json.dumps({"cases": [case]})})
+                with self.assertRaises(CouldNotCheck, msg=repr(case)):
+                    run_guard(guard, root, rels)
+
+    def test_red_mutation_verdict_corpus_number_spelling_is_not_lost_by_json(self) -> None:
+        # adversary r5 pass 9 A2: json.loads turns 1e-400 into 0.0 and 1e400 into inf before the checker sees them,
+        # so a probe recorded as PASS on a number no float can hold used to satisfy the guard.
+        guard = GUARDS["DG-RED-MUTATION-VERDICT"]
+        verdicts = [{"kind": "verdict", "expect": "REFUSED", "code": "final-green", "output": "Ran 1 test\n\nOK\n",
+                     "expected_assertion": "a.py:1"},
+                    {"kind": "verdict", "expect": "PASS", "expected_assertion": "t.py::test_x",
+                     "output": "=== short test summary info ===\nFAILED t.py::test_x - assert False\n=== 1 failed in 0.1s ===\n"}]
+        refused = {"kind": "probe", "expect": "REFUSED", "code": "probe-both-inside", "bug_value": 1, "fix_value": 1, "window": [1, 1]}
+
+        def corpus(spelled_probe: str) -> str:
+            return json.dumps({"cases": verdicts + [refused]})[:-2] + ", " + spelled_probe + "]}"
+
+        control = '{"kind": "probe", "expect": "PASS", "bug_value": 0, "fix_value": 1, "window": [1, 1]}'
+        underflow = '{"kind": "probe", "expect": "PASS", "bug_value": 1, "fix_value": 1e-400, "window": [0, 0]}'
+        overflow = '{"kind": "probe", "expect": "PASS", "bug_value": 0, "fix_value": 1, "window": [1, 1e400]}'
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            rels = _write_tree(root, {RED_MUTATION_CORPUS: corpus(control)})
+            self.assertEqual(run_guard(guard, root, rels), [])  # a clean PASS probe is still accepted
+            for spelled in (underflow, overflow):
+                rels = _write_tree(root, {RED_MUTATION_CORPUS: corpus(spelled)})
+                self.assertTrue(run_guard(guard, root, rels), spelled)
+
     def test_ps_one_trap_red_fails(self) -> None:
         self._assert_red("PS-ONE-TRAP", {("a.ps1", 3), ("b.ps1", 3), ("c.ps1", 4),
                                           ("d.ps1", 3), ("e.ps1", 4), ("e.ps1", 8),
@@ -1132,6 +1518,10 @@ class LiveTreeTests(_PwshMixin, unittest.TestCase):
 
     def test_live_tree_hook_walk_bound(self) -> None:
         self._assert_live_green("DG-HOOK-WALK-BOUND")
+
+    def test_live_tree_red_mutation_verdict(self) -> None:
+        # The live input is the tracked corpus; saved mutation runs sit in untracked run dirs (see NON-PROMISES).
+        self._assert_live_green("DG-RED-MUTATION-VERDICT")
 
     def test_hook_walk_allowlist_has_no_stale_entries(self) -> None:
         rels = [p for p in tracked_files(REPO_ROOT) if is_hook_walk_scanned(p)]
