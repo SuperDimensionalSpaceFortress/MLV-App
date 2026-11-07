@@ -145,10 +145,10 @@ function Test-PromptDemandsVerdict {
     return [regex]::IsMatch($Prompt, '"verdict"\s*:')
 }
 
-# The FINAL json object of an answer: the LAST fenced block (``` or ~~~, any info string such as json5 or
-# title="final"; an unterminated last fence runs to the end of the answer), else the last line-start '{'
-# that parses to the end. A malformed or non-object final block (an array included: -NoEnumerate keeps
-# '[{...}]' an array) is $null: an earlier provisional block never stands in for it. Returns the object or $null.
+# The FINAL json object of an answer: whatever Get-LaneTerminalCandidate selects by position (the last
+# fenced block or the last unfenced object; an unterminated last fence runs to the end of the answer).
+# A malformed or non-object final candidate (an array included: -NoEnumerate keeps '[{...}]' an array) is
+# $null: an earlier provisional block never stands in for it. Returns the object or $null.
 function ConvertFrom-LaneJsonObject {
     param([AllowEmptyString()][AllowNull()][string]$Text)
     if ([string]::IsNullOrWhiteSpace($Text)) { return $null }
@@ -157,30 +157,64 @@ function ConvertFrom-LaneJsonObject {
     return $null
 }
 
-function Get-LaneFinalJsonObject {
+# Get-LaneTerminalCandidate: the ONE selector of an answer's terminal JSON candidate, by POSITION across
+# both forms (KERNEL-K4 r3, Dot items 1 and 3). The candidates are the fenced blocks and the unfenced
+# '{'-led runs; the LAST one in the answer decides and an earlier one never stands in for it.
+#   - A fence opens on a line of 3+ backticks or 3+ tildes (any info string) and closes ONLY on a line of the
+#     SAME character, at least as long as the opening, and nothing else. A mismatched or short close is
+#     content, so ``` closed only by ~~~ stays an unterminated (malformed) block that runs to the end.
+#   - An unfenced candidate is a line-start '{' OUTSIDE every fence that comes after the last fenced block.
+#     The last such start whose text parses to the end of the answer is the candidate (a nested '{' line of
+#     a multi-line object fails and falls back to the outer start); when none parses, the answer ends in
+#     malformed unfenced JSON and the candidate is that malformed text, so a provisional fenced APPROVE is
+#     not rescued by it.
+# Returns [pscustomobject]@{ form = 'fenced'|'unfenced'|'none'; text; startLine }.
+function Get-LaneTerminalCandidate {
     param([AllowEmptyString()][AllowNull()][string]$Answer)
-    if ([string]::IsNullOrWhiteSpace($Answer)) { return $null }
-    $lines = $Answer -split "`r?`n"
-    $inBlock = $false; $sawBlock = $false
-    $cur = New-Object System.Collections.Generic.List[string]
-    $last = $null
-    foreach ($ln in $lines) {
-        $isFence = ($ln -match '^[ \t]*(```+|~~~+)')
+    $none = [pscustomobject]@{ form = 'none'; text = $null; startLine = -1 }
+    if ([string]::IsNullOrWhiteSpace($Answer)) { return $none }
+    $lines = @($Answer -split "`r?`n")
+    $inBlock = $false; $fenceChar = ''; $fenceLen = 0
+    $cur = $null; $curStart = -1
+    $lastFence = $null
+    $starts = New-Object System.Collections.Generic.List[int]
+    for ($i = 0; $i -lt $lines.Count; $i++) {
+        $ln = $lines[$i]
         if (-not $inBlock) {
-            if ($isFence) { $inBlock = $true; $sawBlock = $true; $cur = New-Object System.Collections.Generic.List[string] }
+            if ($ln -match '^[ \t]*(`{3,}|~{3,})') {
+                $inBlock = $true; $fenceChar = $Matches[1].Substring(0, 1); $fenceLen = $Matches[1].Length
+                $cur = New-Object System.Collections.Generic.List[string]; $curStart = $i
+            } elseif ($ln -match '^\s*\{') { $starts.Add($i) }
             continue
         }
-        if ($isFence -and $ln -match '^[ \t]*(```+|~~~+)[ \t]*$') { $inBlock = $false; $last = ($cur -join "`n"); continue }
+        if ($ln -match '^[ \t]*(`{3,}|~{3,})[ \t]*$' -and $Matches[1].Substring(0, 1) -ceq $fenceChar -and $Matches[1].Length -ge $fenceLen) {
+            $inBlock = $false
+            $lastFence = [pscustomobject]@{ text = ($cur -join "`n"); startLine = $curStart; endLine = $i }
+            continue
+        }
         $cur.Add($ln)
     }
-    if ($inBlock) { $last = ($cur -join "`n") }
-    if ($sawBlock) { return (ConvertFrom-LaneJsonObject -Text $last) }
-    $starts = [regex]::Matches($Answer, '(?m)^\s*\{')
-    for ($i = $starts.Count - 1; $i -ge 0; $i--) {
-        $o = ConvertFrom-LaneJsonObject -Text $Answer.Substring($starts[$i].Index).Trim()
-        if ($null -ne $o) { return $o }
+    if ($inBlock) { $lastFence = [pscustomobject]@{ text = ($cur -join "`n"); startLine = $curStart; endLine = $lines.Count } }
+    $tail = @($starts | Where-Object { $null -eq $lastFence -or $_ -gt $lastFence.endLine })
+    if ($tail.Count -gt 0) {
+        for ($k = $tail.Count - 1; $k -ge 0; $k--) {
+            $t = ($lines[$tail[$k]..($lines.Count - 1)] -join "`n").Trim()
+            if ($null -ne (ConvertFrom-LaneJsonObject -Text $t)) {
+                return [pscustomobject]@{ form = 'unfenced'; text = $t; startLine = $tail[$k] }
+            }
+        }
+        $bad = ($lines[$tail[$tail.Count - 1]..($lines.Count - 1)] -join "`n").Trim()
+        return [pscustomobject]@{ form = 'unfenced'; text = $bad; startLine = $tail[$tail.Count - 1] }
     }
-    return $null
+    if ($null -ne $lastFence) { return [pscustomobject]@{ form = 'fenced'; text = $lastFence.text; startLine = $lastFence.startLine } }
+    return $none
+}
+
+function Get-LaneFinalJsonObject {
+    param([AllowEmptyString()][AllowNull()][string]$Answer)
+    $cand = Get-LaneTerminalCandidate -Answer $Answer
+    if ($cand.form -eq 'none') { return $null }
+    return (ConvertFrom-LaneJsonObject -Text $cand.text)
 }
 
 function Get-LaneWorkEvidence {
@@ -276,15 +310,23 @@ function Get-ProviderRefusal {
     }
     # It answered: not refused, and stderr narration (a recovered 429, say) never overturns that. "Answered"
     # uses the same emptiness test as the completion evidence (K4 r2: a Cf-only answer is not an answer).
-    # Residual, named: a refusal whose text arrives AS the answer is not detected here, as before K4; an
-    # answer made only of ERROR lines may be exactly what the prompt asked for (adversary A3).
-    # Exception: an answer made ONLY of ERROR-framed lines, whose refusal is corroborated by an ERROR-framed
-    # refusal line on stderr, is the refusal text delivered as the answer (adversary A6: the base saw it on
-    # stderr with a blank stdout). With nothing on stderr it is just what the prompt asked for (A3).
+    # Residual, named: a refusal whose text arrives AS the answer is detected only under the exception below;
+    # an answer made only of ERROR lines may be exactly what the prompt asked for (adversary A3).
+    # Exception (r3, sol r2 B1 + Dot item 2): an answer bypasses the "it answered" guard ONLY when EVERY
+    # answer line is ERROR-framed AND itself names a provider-refusal kind, AND an ERROR-framed stderr line
+    # names one of THOSE SAME kinds (adversary A6: the base saw it on stderr with a blank stdout). So
+    # unrelated recovered stderr ("ERROR: upstream probe returned 429; recovered") never invalidates a
+    # legitimate answer such as `ERROR: file not found`, and neither does a refusal-vocabulary answer whose
+    # stderr names a different kind. With nothing corroborating on stderr it is what the prompt asked for (A3).
+    $answerKinds = $null
     if (Test-LaneAnswerHasSubstance -Answer $Answer) {
         $ansLines = @(($Answer -split "`r?`n") | Where-Object { Test-LaneAnswerHasSubstance -Answer $_ })
-        $onlyErrors = (@($ansLines | Where-Object { $_ -notmatch '^\s*ERROR\b' }).Count -eq 0)
-        if (-not $onlyErrors) { return $null }
+        $answerKinds = New-Object System.Collections.Generic.List[string]
+        foreach ($al in $ansLines) {
+            $ak = if ($al -match '^\s*ERROR\b') { Get-RefusalKind -Line $al } else { $null }
+            if ($null -eq $ak) { return $null }
+            if (-not $answerKinds.Contains($ak)) { $answerKinds.Add($ak) }
+        }
     }
     if ([string]::IsNullOrWhiteSpace($Text)) { return $null }
     $scan = $Text
@@ -297,7 +339,9 @@ function Get-ProviderRefusal {
     foreach ($line in ($scan -split "`r?`n")) {
         if ($line -notmatch '^\s*ERROR\b') { continue }
         $kind = Get-RefusalKind -Line $line
-        if ($null -ne $kind) { return New-RefusalRecord -Kind $kind -Engine $Engine -Match $line }
+        if ($null -eq $kind) { continue }
+        if ($null -ne $answerKinds -and -not $answerKinds.Contains($kind)) { continue }
+        return New-RefusalRecord -Kind $kind -Engine $Engine -Match $line
     }
     return $null
 }

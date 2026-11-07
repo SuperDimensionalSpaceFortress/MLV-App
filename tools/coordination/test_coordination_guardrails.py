@@ -2056,6 +2056,90 @@ def test_invoke_lane_wiring_refusal_text_delivered_as_the_answer_is_still_refuse
     assert w["refusal"] is None, w
 
 
+def test_codex_terminal_verdict_is_selected_by_position_across_fenced_and_unfenced_forms(tmp_path):
+    # r3 Dot item 1 (the carried P2): any fence made the parser ignore a later UNFENCED final object. The
+    # terminal candidate is the LAST one by position, whichever form it takes.
+    prose = "x" * 130 + "\n"
+    diff = "```diff\n- old\n+ new\n```\n"
+    prov = "```json\n" + KEY_FINAL_JSON + "\n```\n"
+
+    def done(text):
+        return _work_evidence(tmp_path, "codex", text, 0, prompt_chars=600, require_verdict=True)
+
+    # prose + fenced diff + final unfenced APPROVE: accepted
+    assert done(prose + diff + KEY_FINAL_JSON + "\n")["workCompleted"] is True
+    # a multi-line unfenced final object with nested object lines is still one object
+    nested = '{\n  "verdict": "APPROVE",\n  "findings": [\n    {"id": 1}\n  ]\n}\n'
+    assert done(prose + diff + nested)["workCompleted"] is True
+    # provisional fenced APPROVE + final unfenced {"verdict": null}: not completed
+    r = done(prose + prov + '{"verdict": null}\n')
+    assert r["workCompleted"] is False and r["reason"] == "codex-no-verdict", r
+    # provisional fenced APPROVE + malformed trailing unfenced JSON: not completed
+    for bad in ('{"verdict": "APPROVE"', '{"verdict": }', '{"verdict":"APPROVE"} trailing'):
+        r = done(prose + prov + bad + "\n")
+        assert r["workCompleted"] is False and r["reason"] == "codex-no-verdict", (bad, r)
+    # the mirror: an unfenced draft followed by a final fenced block, the FENCE decides
+    r = done(prose + KEY_FINAL_JSON + "\n```json\n{\"verdict\":null}\n```\n")
+    assert r["workCompleted"] is False and r["reason"] == "codex-no-verdict", r
+    assert done(prose + '{"verdict":null}\n' + prov)["workCompleted"] is True
+    # controls: closing prose with no object line after the final fenced block does not disturb it
+    assert done(prose + prov + "Done.\n")["workCompleted"] is True
+
+
+def test_codex_fence_closes_only_on_the_same_character_and_at_least_the_opening_length(tmp_path):
+    # r3 Dot item 3: ``` closed only by ~~~ made a malformed (unterminated) block count as a valid final one.
+    obj = '{"verdict":"APPROVE"}'
+    prose = "x" * 130 + "\n"
+
+    def done(text):
+        return _work_evidence(tmp_path, "codex", text, 0, prompt_chars=600, require_verdict=True)
+
+    for bad in ("```json\n" + obj + "\n~~~\n", "~~~json\n" + obj + "\n```\n",
+                "````json\n" + obj + "\n```\n",          # a 3-char close never closes a 4-char open
+                "~~~~json\n" + obj + "\n~~~\n"):
+        r = done(prose + bad)
+        assert r["workCompleted"] is False and r["reason"] == "codex-no-verdict", (bad, r)
+    for good in ("```json\n" + obj + "\n```\n", "~~~json\n" + obj + "\n~~~\n",
+                 "````json\n" + obj + "\n````\n", "````json\n" + obj + "\n`````  \n"):  # same/longer close
+        assert done(prose + good)["workCompleted"] is True, good
+    # a shorter fence line INSIDE a longer block is content, so a provisional block cannot be re-closed early
+    inner = "````md\n```json\n" + obj + "\n```\n````\n"
+    assert done(prose + inner)["workCompleted"] is False, "the object is example text inside an md block"
+
+
+def test_invoke_lane_wiring_unrelated_recovered_stderr_never_overturns_an_error_framed_answer(tmp_path):
+    # r3 sol B1 / Dot item 2: the prompt asked for the literal text `ERROR: ...`; the run answered it; stderr
+    # narrates an unrelated error the run recovered from. The answer must stand. Both delivery shapes.
+    narration = "ERROR: upstream probe returned 429; recovered\n"
+    for text in ("ERROR: file not found", "ERROR: missing semicolon"):
+        prompt = "Reply with exactly: " + text
+        for last, stdout in ((text, ""), (None, text), (text, text)):
+            w = _run_invoke_lane_codex_wiring(tmp_path, last, stdout, narration, prompt)
+            assert w["refusal"] is None, (text, last, stdout, w)
+            assert w["evidence"]["workCompleted"] is True, (text, last, stdout, w)
+    # a refusal-vocabulary answer whose stderr names a DIFFERENT kind is still the requested text
+    w = _run_invoke_lane_codex_wiring(tmp_path, "ERROR: authentication failed", "", narration, "Reply with exactly: ERROR: authentication failed")
+    assert w["refusal"] is None, w
+    # a mixed ERROR answer (one line is not refusal text) is not the refusal delivered as the answer
+    e = "ERROR: you've hit your usage limit. try again at Nov 9th"
+    w = _run_invoke_lane_codex_wiring(tmp_path, "ERROR: file not found\n" + e, "", e + "\n", "Reply with exactly the lines")
+    assert w["refusal"] is None, w
+    # controls: a genuine refusal is still refused (blank answer; and the answer IS the refusal with the same kind on stderr)
+    w = _run_invoke_lane_codex_wiring(tmp_path, None, "", e + "\n", "Review this change")
+    assert w["refusal"] is not None and w["refusal"]["kind"] == "provider-usage-limit", w
+    w = _run_invoke_lane_codex_wiring(tmp_path, e, "", e + "\n", "Review this change")
+    assert w["refusal"] is not None and w["refusal"]["kind"] == "provider-usage-limit", w
+
+
+def test_get_provider_refusal_direct_unrelated_recovered_stderr_is_not_a_refusal(tmp_path):
+    # the helper called directly (not through the Invoke-Lane statements), sol's exact input
+    r = _classify(tmp_path, "ERROR: upstream probe returned 429; recovered\n", "codex",
+                  prompt="Reply with exactly: ERROR: file not found", answer="ERROR: file not found")
+    assert r is None, r
+    r = _classify(tmp_path, "ERROR: upstream probe returned 429; recovered\n", "codex", answer="ERROR: missing semicolon")
+    assert r is None, r
+
+
 def test_invoke_lane_writes_the_selected_answer_to_the_output_file_when_the_last_message_has_no_substance():
     # adversary A4 (2nd pass): outputSha256 hashes $final while outputPath is the last-message file.
     body = LANE_RUNNER.read_text(encoding="utf-8")
