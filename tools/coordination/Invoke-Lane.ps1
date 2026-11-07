@@ -1972,11 +1972,14 @@ function Add-CodexLaneRuntimePath {
         [Parameter(Mandatory = $true)]$Psi,
         [string[]]$Candidates = $null
     )
+    # ONLY ASCII blanks are trimmed. .Trim() with no argument also strips U+00A0 and the other Unicode spaces, which are legal directory-name characters, so
+    # MINGW_ROOT='C:\toolchains\mingw<U+00A0>' became a different directory and the configured one was omitted (adversary A1 on 6a05d587).
+    $blanks = [char[]]@(32, 9, 10, 13)
     if ($null -eq $Candidates) {
         $Candidates = @()
         # String concatenation, NOT Join-Path: Join-Path throws DriveNotFound for a MINGW_ROOT on a drive that is gone, which failed the whole lane
         # before codex started (adversary A1 on 6372cc4e). A retired MINGW_ROOT now only costs its own candidate.
-        if (-not [string]::IsNullOrWhiteSpace($env:MINGW_ROOT)) { $Candidates += ($env:MINGW_ROOT.Trim().TrimEnd('\', '/') + '\bin') }
+        if (-not [string]::IsNullOrEmpty($env:MINGW_ROOT) -and $env:MINGW_ROOT.Trim($blanks).Length -gt 0) { $Candidates += ($env:MINGW_ROOT.Trim($blanks).TrimEnd('\', '/') + '\bin') }
         $Candidates += 'C:\Qt\Tools\mingw1310_64\bin'
     }
     # EVERY string comparison below is ordinal. PowerShell's -eq/-ne/-in/-contains and a @{} hashtable compare with the current culture, which ignores
@@ -1990,15 +1993,15 @@ function Add-CodexLaneRuntimePath {
     # seen-set, so the usable directory was never added); a false "absent" costs a harmless duplicate, a false "present" costs the whole fix.
     $dirNorm = {
         param([string]$d)
-        if ([string]::IsNullOrEmpty($d) -or -not [string]::Equals($d, $d.Trim(), $ordinal) -or $d.Contains('"')) { return $null }
+        if ([string]::IsNullOrEmpty($d) -or -not [string]::Equals($d, $d.Trim($blanks), $ordinal) -or $d.Contains('"')) { return $null }
         $p = $d.Replace('/', '\')
         if ($p -cnotmatch '^[A-Za-z]:\\') { return $null }
         $stack = [System.Collections.Generic.List[string]]::new()
         foreach ($seg in $p.Substring(3).Split('\')) {
             if ($seg.Length -eq 0 -or [string]::Equals($seg, '.', $ordinal)) { continue }
             if ([string]::Equals($seg, '..', $ordinal)) {
-                if ($stack.Count -eq 0) { return $null }
-                $stack.RemoveAt($stack.Count - 1)
+                # The root has no parent: C:\..\x is C:\x, which is how Windows canonicalises it (adversary A2 on 6a05d587).
+                if ($stack.Count -gt 0) { $stack.RemoveAt($stack.Count - 1) }
                 continue
             }
             if ($seg -cmatch '[ .]$' -or $seg -cmatch '[<>:|?*\x00-\x1f]') { return $null }
@@ -2023,8 +2026,8 @@ function Add-CodexLaneRuntimePath {
     }
     $added = @()
     foreach ($dir in $Candidates) {
-        if ([string]::IsNullOrWhiteSpace($dir)) { continue }
-        $dir = $dir.Trim()
+        if ([string]::IsNullOrEmpty($dir)) { continue }
+        $dir = $dir.Trim($blanks)
         # A DRIVE-LETTER path only (X:\... or X:/...): a relative PATH entry is searched from the CHILD's working directory, not the launcher's
         # (adversary A2 on 6372cc4e), and a UNC path is skipped by name (adversary A1 on 56281b89). Skipped by name, with no filesystem call.
         if ($dir -cnotmatch '^[A-Za-z]:[\\/]') { continue }

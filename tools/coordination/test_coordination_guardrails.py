@@ -1128,7 +1128,7 @@ def _codex_runtime_path_field(done, name):
     assert done.returncode == 0, f"probe failed: {done.stdout!r} {done.stderr!r}"
     m = re.search(rf"^{name}=(.*)$", done.stdout, re.M)
     assert m, f"no {name}= line: {done.stdout!r}"
-    return m.group(1).strip()
+    return m.group(1).strip(" \t\r\n")  # NOT .strip(): that also removes U+00A0, which a path may legally end in (adversary A1 on 6a05d587)
 
 
 @codex_runtime_path_only
@@ -1347,6 +1347,8 @@ def test_codex_lane_runtime_path_compares_path_keys_ordinally():
     insensitive = [ln.strip() for ln in code.splitlines() if re.search(r"\s-(?:i?match|i?notmatch)\b", ln)]
     assert not insensitive, f"a case-insensitive regex operator on a path string: {insensitive}"
     assert "ToLowerInvariant" not in code and "ToLower()" not in code, "no case fold beyond the drive letter"
+    # .Trim() with no argument strips every Unicode space, U+00A0 included, which is a legal directory-name character (adversary A1 on 6a05d587).
+    assert not re.search(r"\.Trim\(\)", code), "Trim() with no argument alters a path whose name holds a Unicode space"
 
 
 @codex_runtime_path_only
@@ -1387,6 +1389,43 @@ def test_codex_lane_runtime_path_a_non_ascii_look_alike_is_not_a_drive_letter(tm
     )
     assert _codex_runtime_path_field(done, "ADDED") == "0", done.stdout
     assert _codex_runtime_path_field(done, "PATH") == "C:\\first"
+
+
+@codex_runtime_path_only
+def test_codex_lane_runtime_path_keeps_a_no_break_space_in_the_configured_root(tmp_path):
+    # Adversary A1 on 6a05d587: MINGW_ROOT='C:\toolchains\mingw<U+00A0>' was Trim()med (which strips U+00A0), so the directory the operator configured
+    # was replaced by a different one and omitted. U+00A0 is a legal directory-name character; only ASCII blanks around the value are removed.
+    nbsp = "\u00a0"
+    env = {**os.environ, "MINGW_ROOT": f"C:\\toolchains\\mingw{nbsp}"}
+    done = _codex_runtime_path_run(tmp_path, "$psi.Environment['PATH'] = 'C:\\first'\n[void](Add-CodexLaneRuntimePath -Psi $psi)", env=env)
+    path = _codex_runtime_path_field(done, "PATH")
+    assert path.split(";")[:2] == ["C:\\first", f"C:\\toolchains\\mingw{nbsp}\\bin"], path
+    # as an explicit candidate too, ending in U+00A0
+    done = _codex_runtime_path_run(
+        tmp_path,
+        "$psi.Environment['PATH'] = 'C:\\first'\n"
+        f"[void](Add-CodexLaneRuntimePath -Psi $psi -Candidates @('C:\\x\\bin{nbsp}'))",
+    )
+    assert _codex_runtime_path_field(done, "PATH") == f"C:\\first;C:\\x\\bin{nbsp}"
+    # ASCII blanks around the configured value are still ignored
+    env = {**os.environ, "MINGW_ROOT": "  C:\\toolchains\\mingw \t"}
+    done = _codex_runtime_path_run(tmp_path, "$psi.Environment['PATH'] = 'C:\\first'\n[void](Add-CodexLaneRuntimePath -Psi $psi)", env=env)
+    assert _codex_runtime_path_field(done, "PATH").split(";")[:2] == ["C:\\first", "C:\\toolchains\\mingw\\bin"]
+
+
+@codex_runtime_path_only
+def test_codex_lane_runtime_path_resolves_dot_dot_at_the_root_the_way_windows_does(tmp_path):
+    # Adversary A2 on 6a05d587: Windows canonicalises C:\..\toolchain to C:\toolchain (the root has no parent), but the empty-stack '..' branch
+    # rejected it, so MINGW_ROOT='C:\..\toolchain' was dropped and the inherited C:\..\toolchain\bin was not recognised as C:\toolchain\bin.
+    env = {**os.environ, "MINGW_ROOT": "C:\\..\\toolchain"}
+    done = _codex_runtime_path_run(tmp_path, "$psi.Environment['PATH'] = 'C:\\first'\n[void](Add-CodexLaneRuntimePath -Psi $psi)", env=env)
+    assert _codex_runtime_path_field(done, "PATH").split(";")[:2] == ["C:\\first", "C:\\toolchain\\bin"]
+    done = _codex_runtime_path_run(
+        tmp_path,
+        "$psi.Environment['PATH'] = 'C:\\first;C:\\..\\toolchain\\bin'\n"
+        "$r = @(Add-CodexLaneRuntimePath -Psi $psi -Candidates @('C:\\a\\..\\..\\toolchain\\bin'))\n'ADDED=' + $r.Count",
+    )
+    assert _codex_runtime_path_field(done, "ADDED") == "0", done.stdout
 
 
 @codex_runtime_path_only
