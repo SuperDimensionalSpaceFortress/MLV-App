@@ -207,6 +207,26 @@ TEST(ResizeStillDrawingWait, APumpThatOutlastsTheDeadlineEndsTheWaitWithoutAnoth
     ASSERT_EQ(static_cast<std::int64_t>(10000), result.waitedMs);
 }
 
+// adversary r1 re-pass A1: a handler the pump dispatches (Updater::getReleaseList's processEvents() loop) can run its
+// own unfiltered nested loop, which admits Ctrl+I's modal dialog: no synchronous pump can bound that. The contract is
+// therefore stated as what it is (zero pumps after the deadline; one pump's duration is the caller's), never as
+// "prevents" a nested modal loop.
+TEST(ResizeStillDrawingWaitWiring, TheBoundIsDocumentedAsPerPumpAndNestedLoopsAsTheCallers)
+{
+    const QString header = readRepoFile(QStringLiteral("platform/qt/ResizeStillDrawingWait.h"));
+    ASSERT_FALSE(header.isEmpty());
+    ASSERT_TRUE(header.contains(QStringLiteral("WHAT IS BOUNDED")));
+    ASSERT_TRUE(header.contains(QStringLiteral("the number of pumps\n// after the deadline is zero")));
+    ASSERT_TRUE(header.contains(QStringLiteral("Updater::getReleaseList")));
+    ASSERT_FALSE(header.contains(QStringLiteral("this never blocks")));
+    const QString source = readRepoFile(QStringLiteral("platform/qt/MainWindow.cpp"));
+    const int at = source.indexOf(QStringLiteral("bool MainWindow::waitForResizeStillDrawing( const QString &site )"));
+    ASSERT_TRUE(at > 0);
+    const QString preface = source.mid(qMax(0, at - 1600), 1600);
+    ASSERT_TRUE(preface.contains(QStringLiteral("still suspends the wait until that\n// loop returns")));
+    ASSERT_FALSE(preface.contains(QStringLiteral("would run a nested loop inside one pump that the deadline cannot bound;")));
+}
+
 TEST(ResizeStillDrawingWait, OutcomesHaveTheLogNames)
 {
     ASSERT_EQ(std::string("not_waiting"), name(Outcome::NotWaiting));
