@@ -1159,6 +1159,18 @@ class VerdictOnText(unittest.TestCase):
         for expected in ("test_s.TestOther.test_x", "TestOther.test_x", "test_x", "test_s.py:4"):
             self.assertEqual(rmv.verdict(ut, expected)[0], rmv.PASS, expected)
 
+    def test_r10_a1p2_a_parameter_id_holding_a_message_separator_with_the_message_dropped(self) -> None:
+        # adversary pass 2 A1 (07087c00): at width 80 pytest prints the node id alone; its parameter id holds `] - `
+        x = "x" * 60
+        line = f"FAILED t.py::test_x[] - AssertionError: {x}]"
+        out = f"=== short test summary info ===\n{line}\n=== 1 failed in 0.1s ===\n"
+        self.assertEqual(_primary(out, "t.py::test_x[]")[0], rmv.REFUSED)
+        sec = "=== FAILURES ===\n___ test_x[] - AssertionError: " + x + "] ___\nE TypeError: boom\nt.py:2: TypeError\n"
+        self.assertEqual(_primary(sec + out, "t.py::test_x[]")[0], rmv.REFUSED)  # with the TypeError section too
+        # control: an ordinary parametrized failure with its message is still judged
+        ok = "=== short test summary info ===\nFAILED t.py::test_x[1] - assert False\n=== 1 failed in 0.1s ===\n"
+        self.assertEqual(rmv.verdict(ok, "t.py::test_x[1]")[0], rmv.PASS)
+
     def test_r10_cli_still_prints_the_whole_text(self) -> None:
         malformed = ("=== short test summary info ===\nFAILED t.py::test_x - assert False\n"
                      "=== 1 failed, 1 passed in 0.1s ===\n")

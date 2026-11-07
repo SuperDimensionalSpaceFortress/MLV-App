@@ -733,7 +733,17 @@ def check_red_mutation_verdict(root: Path, rel_paths: list[str]) -> list[Violati
             if got != want:
                 out.append(Violation("DG-RED-MUTATION-VERDICT", rel, index,
                                      f"case {case.get('id')!r}: expected {want}, checker said {got} ({shown})"))
-            elif want == red_mutation_verdict.REFUSED and reason not in why:
+            elif want == red_mutation_verdict.REFUSED and any(
+                    isinstance(case.get(k), str) and reason in case[k] for k in ("output", "expected_assertion")):
+                # r10 adversary pass 2 A2: a reason quotes the case's own input (the expected id, a node id, a line).
+                # A recorded reason found in that input could be matched by the quote, not by the checker's words.
+                out.append(Violation("DG-RED-MUTATION-VERDICT", rel, index,
+                                     f"case {case.get('id')!r}: its recorded reason {reason!r} is text the case itself "
+                                     f"supplies (output or expected_assertion), so a match cannot show why it was "
+                                     f"refused; record words only the checker writes (primary reason: {shown})"))
+            elif want == red_mutation_verdict.REFUSED and reason not in (
+                    why.replace(case["expected_assertion"], "\x00") if kind == "verdict" and case["expected_assertion"]
+                    else why):  # the expected id is masked out: a reason may not lean on its quote, even in part
                 where = " (it appears only in a secondary `; also:` diagnostic)" if any(reason in a for a in also) else ""
                 out.append(Violation("DG-RED-MUTATION-VERDICT", rel, index,
                                      f"case {case.get('id')!r}: refused, but not for its recorded reason {reason!r}{where}; "
@@ -1364,6 +1374,26 @@ class GuardFixtureTests(_PwshMixin, unittest.TestCase):
         self.assertTrue(got.reason.startswith("COULD-NOT-CHECK (short-summary line"), got)
         self.assertNotIn(semantic, got.reason)
         self.assertTrue(any(semantic in a for a in got.also), got)
+
+    def test_red_mutation_verdict_reason_quoted_from_the_case_input_does_not_count(self) -> None:
+        # adversary pass 2 A2 (07087c00): the primary reason quotes the expected id, so "the run is green" recorded as
+        # the reason matched the quote of an expected id spelled "the run is green"
+        guard = GUARDS["DG-RED-MUTATION-VERDICT"]
+        out = "=== short test summary info ===\nFAILED t.py::test_x - assert False\n=== 1 failed in 0.1s ===\n"
+        bad = {"id": "bad", "kind": "verdict", "expect": "REFUSED", "reason": "the run is green", "output": out,
+               "expected_assertion": "the run is green"}
+        spanning = {**bad, "id": "spanning", "reason": "not at the run is", "expected_assertion": "the run is"}
+        quoted = {**bad, "id": "quoted", "reason": "t.py::test_x", "expected_assertion": "other.py::test_x"}
+        good = {**bad, "id": "good", "reason": "the run is red but not at", "expected_assertion": "other.py::test_x"}
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            for case in (bad, spanning, quoted):
+                rels = _write_tree(root, {RED_MUTATION_CORPUS: self._r8t1_corpus(case)})
+                found = run_guard(guard, root, rels)
+                self.assertEqual(len(found), 1, (case["id"], found))
+                self.assertIn(case["id"], found[0].detail)
+            rels = _write_tree(root, {RED_MUTATION_CORPUS: self._r8t1_corpus(good)})
+            self.assertEqual(run_guard(guard, root, rels), [])
 
     def test_red_mutation_verdict_live_corpus_reasons_are_primary(self) -> None:
         # every REFUSED case in the tracked corpus is refused FOR its recorded reason: the reason is in the primary

@@ -377,7 +377,11 @@ def _parse_summary_line(line: str, word: str) -> tuple[str, str, bool] | None:
     after = [i for i in seps if i > param and rest[i - 1] == "]"]
     if not after:
         return rest, "", False
-    return rest[:after[0]], rest[after[0] + 3:], len(after) > 1
+    msg = rest[after[0] + 3:]
+    # r10 adversary pass 2 A1: at a narrow width pytest DROPS the message and prints the node id alone. A parameter id
+    # holding `] - ` then splits as node + "message", and that "message" ends in the id's own closing `]`. A message
+    # that ends in `]` cannot be told from that, so the line is ambiguous (fail closed, never a guessed account).
+    return rest[:after[0]], msg, len(after) > 1 or msg.endswith("]")
 
 
 def _ends_with(whole: list[str], tail: list[str]) -> bool:
