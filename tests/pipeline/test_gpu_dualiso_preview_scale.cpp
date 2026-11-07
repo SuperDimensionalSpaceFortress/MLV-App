@@ -2694,6 +2694,61 @@ TEST(GpuDualIsoPreviewScale, HacdChroma121OutputIsPinned)
     ASSERT_EQ(0, bad);
 }
 
+// H2C-PORT-1 r15: the selected [1 2 1]'s own-path test is |q| <= |q - Gc| (q = L / a). Only an exact tie tells it
+// from `<`, and no HacdChroma121OutputIsPinned pattern hits one (r14 mutation-pins-r14.txt: own-tile-lt survived). Here
+// G sites are multiples of 4 and every interior R / B site is the exact mean of its four G neighbours, so both fits
+// are exactly a = 1, c = 0 and q is an integer: ties (q == Gc / 2) are common, and `<` changes the output. The
+// digests are 3cd2f144's (r15 run dir pin_gen_eq.c, also 63f8c6bf's); `<` on the R or the B test changes both seeds.
+static void hacdEqualityTieFill(uint16_t * bay, int w, int h, uint32_t seed)
+{
+    uint32_t s = 2166136261u ^ seed;
+    for (int y = 0; y < h; ++y)
+        for (int x = 0; x < w; ++x)
+        {
+            s = s * 1103515245u + 12345u;
+            bay[static_cast<size_t>(y) * static_cast<size_t>(w) + static_cast<size_t>(x)] =
+                static_cast<uint16_t>(4u * ((s >> 8) % 16u));
+        }
+    for (int y = 1; y + 1 < h; ++y)
+        for (int x = 1; x + 1 < w; ++x)
+            if (((y & 1) != (x & 1)) == 0)
+            {
+                const size_t i = static_cast<size_t>(y) * static_cast<size_t>(w) + static_cast<size_t>(x);
+                bay[i] = static_cast<uint16_t>((bay[i - static_cast<size_t>(w)] + bay[i + static_cast<size_t>(w)]
+                                                + bay[i - 1u] + bay[i + 1u]) / 4);
+            }
+}
+
+TEST(GpuDualIsoPreviewScale, HacdChroma121EqualityTieIsPinned)
+{
+    struct Pin { uint32_t seed; int threads; uint64_t fnv; };
+    static const Pin pins[] = {
+        { 0u, 1, 0x424bf5483666f455ull }, { 0u, 4, 0x424bf5483666f455ull },
+        { 1u, 1, 0xdd4b0edd4b0d3cbfull }, { 1u, 4, 0xdd4b0edd4b0d3cbfull },
+    };
+    const int w = 16, h = 16;
+    const size_t n = static_cast<size_t>(w) * static_cast<size_t>(h);
+    int bad = 0;
+    for (const Pin & pin : pins)
+    {
+        std::vector<uint16_t> bay(n, 0u), rgb(n * 3u, 0u), fil(n * 3u, 0u);
+        std::vector<float> scr(n, 0.0f);
+        hacdEqualityTieFill(bay.data(), w, h, pin.seed);
+        debayerBasicU16(rgb.data(), bay.data(), w, h, pin.threads, 0);
+        const int ok = debayer_reduced_hacd_chroma121_rgb16(fil.data(), rgb.data(), bay.data(), w, h, pin.threads,
+                                                            scr.data());
+        uint64_t hh = 1469598103934665603ull;
+        for (const uint16_t v : rgb) { hh ^= v; hh *= 1099511628211ull; }
+        for (const uint16_t v : fil) { hh ^= v; hh *= 1099511628211ull; }
+        const bool match = ok == 1 && hh == pin.fnv;
+        bad += match ? 0 : 1;
+        std::printf("[hacd-tie-pin] seed %u threads %d ok %d fnv %016llx want %016llx %s\n", pin.seed, pin.threads, ok,
+                    static_cast<unsigned long long>(hh), static_cast<unsigned long long>(pin.fnv),
+                    match ? "same" : "DIFFERS");
+    }
+    ASSERT_EQ(0, bad);
+}
+
 // H2C-PORT-1 r10: the per-frame cost of the new step (debayer_reduced_hacd_chroma_rgb16), timed
 // here and never from local playback, at the fixture's x2 Bayer and at a 2880 x 1620 x2 Bayer (a
 // 5760-wide clip at x4), median of 15 runs with getMlvCpuCores threads. Printed, not gated:
