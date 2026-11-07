@@ -42,7 +42,9 @@ REFUSED with a reason that starts ``COULD-NOT-CHECK (<typed reason>)``. That is 
   included.
 * ``short-summary line`` (r5 CLASS RULE, hub ruling; replaces the one-by-one repairs of passes 6 and 7): ANY pytest
   run in which a short-summary ``FAILED``/``ERROR`` line does not split into exactly ``<file.ext>::<name> -
-  <message>`` with a non-empty message (a multi-line or over-long node id, a `` - `` inside a directory name, a
+  <message>`` with a non-empty message (a multi-line node id, a ``WORD node`` longer than 74 characters, which pytest cuts
+  or drops the message of at its 80-column fallback width but not on a ``CI`` runner, so the line is judged before its
+  message is read and the verdict never depends on the terminal width, a `` - `` inside a directory name, a
   message cut to ``...`` before its exception type shows, a message that itself holds a ``<file>::<name>``; a module-level ``ERROR <file.ext> - <message>`` is the one
   allowed shape without ``::name``), or whose number of such lines differs from the runner's own failed+errored
   count, or that holds a summary line starting with no summary word, or whose ``PASSED``/``SKIPPED``/``XFAIL``/
@@ -388,11 +390,22 @@ def _pair_nodes(want: list[str], frames: list[tuple[str, int]], nodes: list[str]
 _PT_SUMMARY_WORDS = ("FAILED", "ERROR", "SKIPPED", "XFAIL", "XPASS", "PASSED")
 
 
+# pytest keeps a message only when `width - len("WORD node") >= 6` (" - " and an ellipsis); at its own fallback width
+# of 80 that is a `WORD node` of at most 74 characters. A longer one may have been cut by the runner's width.
+_SUMMARY_LINE_MAX_ID = 74
+
+
 def _summary_problem(word: str, node: str, msg: str) -> str:
     """The CLASS RULE for one short-summary `FAILED`/`ERROR` line (r5 hub ruling): it must split into exactly
     `<file.ext>::<name> - <message>` with a message that is not empty. "" when it does. Every shape a test name can
     forge (a multi-line or over-long id, a ' - ' inside a directory name) fails this one test, so no case is repaired
     one by one. A module-level collection `ERROR <file.ext> - <message>` has no `::name` and is allowed."""
+    if len(word) + 1 + len(node) > _SUMMARY_LINE_MAX_ID:
+        # pytest drops or ellipsizes the message when the line does not fit the terminal width (it does not, only
+        # when the CI / BUILD_NUMBER environment variable is set), so the same run prints a different line at
+        # width 80, at width 200 and on a CI runner. A line this long may have lost its message to the width of
+        # whoever ran it; that is judged BEFORE the message is read, so the answer never depends on the width.
+        return f"{word} {node[:60]!r} is too long to rule out a width-cut message (more than {_SUMMARY_LINE_MAX_ID} chars)"
     file_part, sep, name = node.partition("::")
     if not re.search(r"\.\w+$", file_part) or (word == "FAILED" and not (sep and name)):
         return f"{word} {node[:60]!r} is not <file>::<name> (a ' - ' inside a directory name?)"

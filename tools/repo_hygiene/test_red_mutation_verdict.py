@@ -128,8 +128,13 @@ class QualifiedIdentity(unittest.TestCase):
         self.assertEqual(rmv.verdict(out, "A.test_scale")[0], rmv.PASS, out)
 
 
-def _run_pytest(files: dict[str, str], *args: str, columns: int = 0) -> str:
-    env = {**__import__("os").environ, "COLUMNS": str(columns)} if columns else None  # wide: no summary truncation
+def _run_pytest(files: dict[str, str], *args: str, columns: int = 80, ci: bool = False) -> str:
+    """Run a REAL pytest with its width and CI mode pinned (r6): pytest cuts a short-summary message to the terminal
+    width (COLUMNS) unless CI / BUILD_NUMBER is set, so the runner's own environment must never choose the text."""
+    env = {k: v for k, v in __import__("os").environ.items() if k not in ("CI", "BUILD_NUMBER", "COLUMNS")}
+    env["COLUMNS"] = str(columns)
+    if ci:
+        env["CI"] = "true"
     with tempfile.TemporaryDirectory() as tmp:
         for name, text in files.items():
             Path(tmp, name).parent.mkdir(parents=True, exist_ok=True)
@@ -394,10 +399,10 @@ class NarrowedPromiseR4(unittest.TestCase):
         plain = _run_pytest({"test_memory.py": "def test_assert(): assert False\n"})
         self.assertEqual(rmv.verdict(plain, "test_memory.py::test_assert")[0], rmv.PASS, plain)
 
-    def _two_failures(self, name: str) -> str:
+    def _two_failures(self, name: str, **env) -> str:
         src = ("def test_assert(): assert False\ndef fail(): raise ImportError('missing')\n"
                f"globals()['{name}'] = fail\ndel fail\n")
-        out = _run_pytest({"test_memory.py": src}, "--tb=no")
+        out = _run_pytest({"test_memory.py": src}, "--tb=no", **env)
         self.assertIn("2 failed", out)
         return out
 
@@ -406,7 +411,23 @@ class NarrowedPromiseR4(unittest.TestCase):
             self.cnc(self._two_failures(f"test_import\\n{word}"), "test_memory.py::test_assert", "short-summary line")
 
     def test_pass7_a2_over_long_node_id_without_a_message_is_refused(self) -> None:
-        self.cnc(self._two_failures("test_import_' + 'x' * 90 + '"), "test_memory.py::test_assert", "short-summary line")
+        # r6: the same run prints a DIFFERENT line at width 80 (message dropped), at width 200 (full line) and on a
+        # CI runner (never cut). The verdict must be the same typed refusal for all of them.
+        for env in ({"columns": 80}, {"columns": 200}, {"columns": 80, "ci": True}, {"columns": 200, "ci": True}):
+            out = self._two_failures("test_import_' + 'x' * 90 + '", **env)
+            self.assertEqual("- ImportError: missing" in out, env["columns"] == 200 or bool(env.get("ci")), out)
+            self.cnc(out, "test_memory.py::test_assert", "short-summary line")
+
+    def test_r6_a_line_of_exactly_the_limit_is_still_read_and_one_longer_is_not(self) -> None:
+        """The boundary of the width rule, on hand-built lines: `FAILED <node>` of 74 characters keeps its message."""
+        bar = "=== 1 failed in 0.1s ==="
+        def out(node: str) -> str:
+            return f"=== short test summary info ===\nFAILED {node} - AssertionError: 1 != 2\n{bar}\n"
+        base = "test_memory.py::test_"
+        at = base + "a" * (74 - len("FAILED ") - len(base))
+        self.assertEqual(len("FAILED " + at), 74)
+        self.assertEqual(rmv.verdict(out(at), at)[0], rmv.PASS, out(at))
+        self.cnc(out(at + "a"), at + "a", "too long to rule out a width-cut message")
 
     def test_pass7_a3_dash_in_a_directory_name_does_not_invent_a_node(self) -> None:
         files = {"test_control.py": "def test_expected(): pass\n",
