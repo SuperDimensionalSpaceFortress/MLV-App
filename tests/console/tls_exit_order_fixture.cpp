@@ -204,12 +204,15 @@ __attribute__((noinline)) Probe::~Probe()
 {
     g_probe_stamp.store(++g_seq);
     // Crash mode with a recorded setup failure: the run is INVALID whatever happens next, so it stops here, before the
-    // member teardown below can touch storage emutls may already have freed (Sol r8 B1).
+    // member teardown below can touch storage emutls may already have freed (Sol r8 B1). This runs in the thread-exit TLS
+    // callback, where std::_Exit's process detach re-enters the thread_local destructor list and fast-fails (0xC0000409,
+    // r9 receipt b1-green.txt). TerminateProcess runs no detach and no destructor; stdout was flushed above.
     if (g_mode == Mode::Crash)
     {
         if (const char * const why = g_setup_failure.load())
         {
             printResult("crash", g_kind_arg, "INVALID", std::string("why=") + why);
+            TerminateProcess(GetCurrentProcess(), 3);
             std::_Exit(3);
         }
     }

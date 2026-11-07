@@ -184,7 +184,7 @@ class FixtureSourceTests(unittest.TestCase):
         probe = region(self.text, r"\n__attribute__\(\(noinline\)\) Probe::~Probe\(\)", r"\n}\n")
         crash_gate = re.search(r"if \(g_mode == Mode::Crash\)\s*\{\s*if \(const char \* const why = g_setup_failure\.load\(\)\)"
                                r"\s*\{\s*printResult\(\"crash\", g_kind_arg, \"INVALID\", std::string\(\"why=\"\) \+ why\);"
-                               r"\s*std::_Exit\(3\);", probe)
+                               r"\s*TerminateProcess\(GetCurrentProcess\(\), 3\);", probe)
         self.assertIsNotNone(crash_gate, "crash-mode ~Probe does not stop with INVALID/3 before its member teardown")
 
     def test_setup_steps_print_invalid_not_usage(self):
