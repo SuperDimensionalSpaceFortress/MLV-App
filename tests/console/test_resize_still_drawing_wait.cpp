@@ -548,6 +548,71 @@ TEST(ResizeStillDrawingWait, ARefusedStaleClearEndsTheRunAndNothingIsForgedClear
     ASSERT_TRUE(refusals >= 2);
 }
 
+// adversary r4 pass 2 A2: a refused clearStale() can take time (the GUI thread descheduled inside the confirmation), and
+// the deadline must be judged on a clock read after it. The adversary's input: the run opens at 1949000 us (epoch 42), the
+// next idle sample is at 1999000 us, clearStale(42) takes 4000 us and refuses. The deadline has passed when it returns, so
+// the wait must end Timeout with no further pump.
+TEST(ResizeStillDrawingWait, ARefusedStaleClearThatOutlastsTheDeadlineEndsTheWaitWithoutAnotherPump)
+{
+    std::int64_t tUs = 0;
+    int pumps = 0;
+    int pumpsAfterDeadline = 0;
+    Callbacks c;
+    c.stillDrawing = []() { return true; };
+    c.pump = [&]() {
+        if (tUs >= kDeadlineMs * 1000) ++pumpsAfterDeadline;
+        ++pumps;
+        if (pumps == 1) tUs = 1000;
+        else if (pumps == 2) tUs = 1949000;
+        else tUs += 50000;
+    };
+    int samples = 0;
+    c.renderIdle = [&samples]() { return samples++ != 0; }; // busy at 1000 us, idle from 1949000 us
+    c.busyEpoch = []() { return static_cast<std::uint64_t>(42); };
+    c.clearStale = [&tUs](std::uint64_t) { tUs += 4000; return false; }; // 1999000 -> 2003000 us, refused
+    c.nowMs = [&tUs]() { return tUs / 1000; };
+    c.nowUs = [&tUs]() { return tUs; };
+    const Result result = wait(c);
+    ASSERT_TRUE(result.outcome == Outcome::Timeout);
+    ASSERT_EQ(0, pumpsAfterDeadline);
+    ASSERT_EQ(3, pumps);
+    ASSERT_EQ(static_cast<std::int64_t>(2003), result.waitedMs);
+}
+
+// adversary r4 pass 2 A1: the epoch must be observed ATOMICALLY with the idle decision. Read after the probe unlocked, a
+// warm that started in between (1001 us) became the run's baseline (epoch 8 read at 1002 us), so its whole busy time was
+// credited and the flag was cleared at 51 ms. The sample now records the epoch inside the probe's critical section, and the
+// helper's busyEpoch() returns that recorded value, never a live read.
+TEST(ResizeStillDrawingWaitWiring, TheBusyEpochIsObservedInsideTheIdleProbesCriticalSection)
+{
+    const QString rft = readRepoFile(QStringLiteral("platform/qt/RenderFrameThread.cpp"));
+    ASSERT_FALSE(rft.isEmpty());
+    for (const QString &signature : {QStringLiteral("bool RenderFrameThread::isIdleNoWait( uint64_t *epochOut )"),
+                                     QStringLiteral("bool RenderFrameThread::isIdleExceptPlaybackLookaheadNoWait( int activePlaybackTarget,")})
+    {
+        const QString body = functionBody(rft, signature, QStringLiteral("\n}"));
+        ASSERT_FALSE(body.isEmpty());
+        const int probeAt = body.indexOf(QStringLiteral("resize_still_drawing_wait::probeIdleWithoutWaiting( m_mutex,"));
+        const int recordAt = body.indexOf(QStringLiteral("if( epochOut ) *epochOut = busyEpoch();"));
+        ASSERT_TRUE(probeAt >= 0);
+        ASSERT_TRUE(recordAt > probeAt); // inside the locked lambda, not after the probe returns
+    }
+    const QString source = readRepoFile(QStringLiteral("platform/qt/MainWindow.cpp"));
+    const QString body = functionBody(source,
+        QStringLiteral("MainWindow::waitForResizeStillDrawing( const QString &site )"),
+        QStringLiteral("//Window resized -> scale picture"));
+    ASSERT_TRUE(body.contains(QStringLiteral(
+        "callbacks.renderIdle = [this, &sampledEpoch]() { return renderThreadIdleNoWait( currentPlaybackAdvanceTarget(), &sampledEpoch ); };")));
+    ASSERT_TRUE(body.contains(QStringLiteral("callbacks.busyEpoch = [&sampledEpoch]() { return sampledEpoch; };")));
+    ASSERT_FALSE(body.contains(QStringLiteral("m_pRenderThread->busyEpoch()")));
+    const QString noWait = functionBody(source,
+        QStringLiteral("bool MainWindow::renderThreadIdleNoWait( int activePlaybackTarget, std::uint64_t *epochOut )"),
+        QStringLiteral("\n}"));
+    ASSERT_TRUE(noWait.contains(QStringLiteral("return m_pRenderThread->isIdleNoWait( epochOut );")));
+    ASSERT_TRUE(noWait.contains(QStringLiteral("activePlaybackTarget,")));
+    ASSERT_TRUE(noWait.contains(QStringLiteral("epochOut );")));
+}
+
 // The renderer side of r4 A1: every start of work bumps busyEpoch, and the clear is confirmed under the renderer mutex.
 TEST(ResizeStillDrawingWaitWiring, EveryStartOfRendererWorkBumpsTheBusyEpochAndTheClearIsConfirmed)
 {
@@ -589,8 +654,7 @@ TEST(ResizeStillDrawingWaitWiring, EveryStartOfRendererWorkBumpsTheBusyEpochAndT
     const QString body = functionBody(source,
         QStringLiteral("MainWindow::waitForResizeStillDrawing( const QString &site )"),
         QStringLiteral("//Window resized -> scale picture"));
-    ASSERT_TRUE(body.contains(QStringLiteral(
-        "callbacks.busyEpoch = [this]() -> std::uint64_t { return m_pRenderThread ? m_pRenderThread->busyEpoch() : 0; };")));
+    // (callbacks.busyEpoch returns the epoch the last sample observed: TheBusyEpochIsObservedInsideTheIdleProbesCriticalSection)
     ASSERT_TRUE(body.contains(QStringLiteral(
         "callbacks.clearStale = [this]( std::uint64_t epoch ) { return clearStaleStillDrawingIfIdle( currentPlaybackAdvanceTarget(), epoch ); };")));
     const QString clear = functionBody(source,
@@ -619,15 +683,15 @@ TEST(ResizeStillDrawingWaitWiring, TheSiteSampleNeverWaitsForTheRendererMutexAnd
         QStringLiteral("//Window resized -> scale picture"));
     ASSERT_FALSE(body.isEmpty());
     ASSERT_TRUE(body.contains(QStringLiteral(
-        "callbacks.renderIdle = [this]() { return renderThreadIdleNoWait( currentPlaybackAdvanceTarget() ); };")));
+        "callbacks.renderIdle = [this, &sampledEpoch]() { return renderThreadIdleNoWait( currentPlaybackAdvanceTarget(), &sampledEpoch ); };")));
     ASSERT_FALSE(body.contains(QStringLiteral("renderThreadBusyForPlaybackAdvance")));
 
     const QString noWait = functionBody(source,
-        QStringLiteral("bool MainWindow::renderThreadIdleNoWait( int activePlaybackTarget )"),
+        QStringLiteral("bool MainWindow::renderThreadIdleNoWait( int activePlaybackTarget, std::uint64_t *epochOut )"),
         QStringLiteral("\n}"));
     ASSERT_FALSE(noWait.isEmpty());
     ASSERT_TRUE(noWait.contains(QStringLiteral("m_pRenderThread->isIdleExceptPlaybackLookaheadNoWait(")));
-    ASSERT_TRUE(noWait.contains(QStringLiteral("return m_pRenderThread->isIdleNoWait();")));
+    ASSERT_TRUE(noWait.contains(QStringLiteral("return m_pRenderThread->isIdleNoWait( epochOut );")));
     const QString busy = functionBody(source,
         QStringLiteral("bool MainWindow::renderThreadBusyForPlaybackAdvance( int activePlaybackTarget )"),
         QStringLiteral("\n}"));
@@ -643,7 +707,7 @@ TEST(ResizeStillDrawingWaitWiring, TheSiteSampleNeverWaitsForTheRendererMutexAnd
         QStringLiteral("bool RenderFrameThread::isIdleExceptPlaybackLookahead( int activePlaybackTarget,"),
         QStringLiteral("\n}"));
     ASSERT_TRUE(lookahead.contains(QStringLiteral("QMutexLocker locker(&m_mutex);")));
-    const QString idleNoWait = functionBody(rft, QStringLiteral("bool RenderFrameThread::isIdleNoWait()"),
+    const QString idleNoWait = functionBody(rft, QStringLiteral("bool RenderFrameThread::isIdleNoWait( uint64_t *epochOut )"),
         QStringLiteral("\n}"));
     ASSERT_TRUE(idleNoWait.contains(QStringLiteral("resize_still_drawing_wait::probeIdleWithoutWaiting( m_mutex,")));
     ASSERT_FALSE(idleNoWait.contains(QStringLiteral("QMutexLocker")));
@@ -890,7 +954,7 @@ TEST(ResizeStillDrawingWaitWiring, TheSiteWaitUsesTheBoundedHelperAndLogsAlwaysO
         QStringLiteral("//Window resized -> scale picture"));
     ASSERT_FALSE(body.isEmpty());
     ASSERT_TRUE(body.contains(QStringLiteral("resize_still_drawing_wait::wait(")));
-    ASSERT_TRUE(body.contains(QStringLiteral("renderThreadIdleNoWait( currentPlaybackAdvanceTarget() )")));
+    ASSERT_TRUE(body.contains(QStringLiteral("renderThreadIdleNoWait( currentPlaybackAdvanceTarget(), &sampledEpoch )")));
     // adversary r1 A1: the pump defers user input, so a shortcut (Ctrl+I's file dialog) cannot open a nested modal loop
     // inside the bounded wait; the input is delivered by the next unfiltered event loop pass, not dropped
     ASSERT_TRUE(body.contains(QStringLiteral("qApp->processEvents( QEventLoop::ExcludeUserInputEvents );")));
