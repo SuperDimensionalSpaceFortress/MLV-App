@@ -16,6 +16,7 @@
 #include "PlaybackQualityPolicy.h"
 #include "PlaybackSlotRelease.h"
 #include "ReconWorker.h"
+#include "ResizeStillDrawingWait.h"
 
 #include "../../src/batch/WorkerThreadCount.h"
 #include "../../src/debayer/debayer.h"
@@ -1251,6 +1252,7 @@ void RenderFrameThread::renderFrame(uint32_t frameNumber,
     request.requestQueuePushStageTime =
         detailedTimelineTelemetry ? mlv_stage_timing_now() : 0.0;
     m_renderRequests.push_back( request );
+    bumpBusyEpoch();
     m_renderFrame = true;
     m_waitCondition.wakeAll();
 }
@@ -1266,6 +1268,23 @@ bool RenderFrameThread::isFrameReady()
 bool RenderFrameThread::isIdle()
 {
     QMutexLocker locker(&m_mutex);
+    return isIdleLocked();
+}
+
+// GUI-SMOKE-FOREGROUND-HANG-NOLA-1 (adversary r3 pass 3 A1): the resize wait's sample. Never waits for m_mutex: held means
+// busy (resize_still_drawing_wait::probeIdleWithoutWaiting).
+// adversary r4 pass 2 A1: epochOut is written inside the critical section, so the epoch and the idle decision are one
+// observation (work starts bump the epoch under m_mutex).
+bool RenderFrameThread::isIdleNoWait( uint64_t *epochOut )
+{
+    return resize_still_drawing_wait::probeIdleWithoutWaiting( m_mutex, [&]() {
+        if( epochOut ) *epochOut = busyEpoch();
+        return isIdleLocked();
+    } );
+}
+
+bool RenderFrameThread::isIdleLocked( void ) const
+{
     return !(m_renderFrame || m_renderingFrame || phase3WorkInFlightLocked());
 }
 
@@ -1273,6 +1292,53 @@ bool RenderFrameThread::isIdleExceptPlaybackLookahead( int activePlaybackTarget,
                                                        uint64_t activeGeneration )
 {
     QMutexLocker locker(&m_mutex);
+    return isIdleExceptPlaybackLookaheadLocked( activePlaybackTarget, activeGeneration );
+}
+
+bool RenderFrameThread::isIdleExceptPlaybackLookaheadNoWait( int activePlaybackTarget,
+                                                             uint64_t activeGeneration,
+                                                             uint64_t *epochOut )
+{
+    return resize_still_drawing_wait::probeIdleWithoutWaiting( m_mutex, [&]() {
+        if( epochOut ) *epochOut = busyEpoch();
+        return isIdleExceptPlaybackLookaheadLocked( activePlaybackTarget, activeGeneration );
+    } );
+}
+
+uint64_t RenderFrameThread::busyEpoch( void ) const
+{
+    return m_busyEpoch.load( std::memory_order_acquire );
+}
+
+bool RenderFrameThread::runIfIdleNoWait( bool exceptPlaybackLookahead, int activePlaybackTarget,
+                                         uint64_t activeGeneration, uint64_t epoch,
+                                         const std::function<void()> &onIdleLocked )
+{
+    return resize_still_drawing_wait::probeIdleWithoutWaiting( m_mutex, [&]() {
+        const bool idle = exceptPlaybackLookahead
+            ? isIdleExceptPlaybackLookaheadLocked( activePlaybackTarget, activeGeneration )
+            : isIdleLocked();
+        if( !idle || busyEpoch() != epoch ) return false;
+        onIdleLocked();
+        return true;
+    } );
+}
+
+// The slot states isIdle() counts as in flight (phase3WorkInFlightLocked, isIdleExceptPlaybackLookaheadLocked).
+bool RenderFrameThread::slotStateIsBusy( SlotState state )
+{
+    return state == SlotState::Requested
+        || state == SlotState::Decoding
+        || state == SlotState::Decoded
+        || state == SlotState::ReconReady
+        || state == SlotState::Recon
+        || state == SlotState::ProcessReady
+        || state == SlotState::Processing;
+}
+
+bool RenderFrameThread::isIdleExceptPlaybackLookaheadLocked( int activePlaybackTarget,
+                                                             uint64_t activeGeneration ) const
+{
     const auto blocks = [&]( const ReadyFrame::PresentationContext &context,
                              uint32_t frameNumber ) -> bool
     {
@@ -2257,6 +2323,7 @@ bool RenderFrameThread::takeReconRequestForWorker( ReconQueueEntry *entry )
     {
         entry->warmRealRequestPending = realWorkPendingLocked();
         m_warmRunning = !entry->warmRealRequestPending;
+        if( m_warmRunning ) bumpBusyEpoch();
     }
     if( heldForRender ) m_overlapMeter.noteReconHeldForRender();
     m_overlapMeter.upstreamBegin( mlv_stage_timing_now() * 1000.0,
@@ -3078,6 +3145,7 @@ void RenderFrameThread::setupActiveRequestLocked( const RenderRequest &request, 
     m_activeRenderRequest = request;
     m_activeQueuedPlaybackDropCount = request.queuedPlaybackDropCount;
     m_renderingFrame = true;
+    bumpBusyEpoch();
     m_renderingSlotIndex = slotIndex;
 }
 
@@ -3511,6 +3579,7 @@ void RenderFrameThread::transitionSlotState( int slotIndex,
     {
         return;
     }
+    if( slotStateIsBusy( to ) ) bumpBusyEpoch();
 
     Phase3Breadcrumbs::push(
         static_cast<uint8_t>( slotIndex ),
@@ -3617,6 +3686,7 @@ void RenderFrameThread::runSerial(void)
         m_activeQueuedPlaybackDropCount = instrumentedRequest.queuedPlaybackDropCount;
         m_activeRenderRequest = instrumentedRequest;
         m_renderingFrame = true;
+        bumpBusyEpoch();
         m_renderingSlotIndex = slotIndex;
         instrumentedRequest.runSerialActiveAssignDoneStageTime =
             playbackSmokeTimelineTelemetryEnabled() ? mlv_stage_timing_now() : 0.0;

@@ -178,6 +178,20 @@ void GradientElement::redrawGradientElement(int sceneX, int sceneY, int picX, in
     m_pGradientGraphicsItem->setRotation( m_angleStretched );
     createGradientElement( m_lengthStretched * sceneX / picX );
     m_pGradientGraphicsItem->blockSignals( false );
+    // GUI-SMOKE-FOREGROUND-HANG-NOLA-1: the scene geometry this placement is anchored on; MainWindow::finishPresentedFrame
+    // re-anchors when a landed frame's scene differs from it (ResizeStillDrawingWait.h gradientNeedsReanchor).
+    m_anchoredSceneWidth = sceneX;
+    m_anchoredSceneHeight = sceneY;
+}
+
+int GradientElement::anchoredSceneWidth( void ) const
+{
+    return m_anchoredSceneWidth;
+}
+
+int GradientElement::anchoredSceneHeight( void ) const
+{
+    return m_anchoredSceneHeight;
 }
 
 //Set movability on/off
