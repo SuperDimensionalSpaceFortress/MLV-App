@@ -2250,6 +2250,53 @@ TEST(GpuDualIsoPreviewScale, CpuReducedX4ConstantChannelSurvivesTheComposition)
     ASSERT_TRUE(allOk);
 }
 
+// H2C-PORT-1 r12, adversary r12 pass 2 A1 (adversary-37fef59b.json, debayer.c:720): the class of pass 9 A1, one degree
+// up. An R / B that does not follow G must not take G's edge: video 128x96, x2 Bayer 64x48, G 10000 for x < 48 and
+// 20000 from 48, every R and B site 2000 + 100 x (affine; the bilinear is exact on it). 37fef59b returned R/B 6568 /
+// 6575 at output (23, 10) for 6650 and 6925 / 6931 at (24, 10) for 6850: HA-CD and the [1 2 1] laid the G step on
+// them. Required, through the real entry at 1 and 4 cores: every R and B at output x in [2, 30) is the box of the
+// affine truth, 2050 + 200 x. Mutations: the own-channel choice dropped in either step.
+TEST(GpuDualIsoPreviewScale, CpuReducedX4AffineChannelUnderAGStepStaysExact)
+{
+    const int bw = 64, bh = 48, outW = 32, outH = 24;
+    std::vector<uint16_t> bayer(static_cast<size_t>(bw) * bh);
+    for (int y = 0; y < bh; ++y)
+        for (int x = 0; x < bw; ++x)
+        {
+            const bool isG = (y & 1) != (x & 1);
+            bayer[static_cast<size_t>(y) * bw + x] =
+                static_cast<uint16_t>(isG ? (x < 48 ? 10000 : 20000) : 2000 + 100 * x);
+        }
+    bool allOk = true;
+    for (const int cores : { 1, 4 })
+    {
+        R12BareVideo bare(128, 96, cores);
+        ASSERT_TRUE(bare.video != nullptr);
+        std::vector<uint16_t> work(bayer);
+        std::vector<uint16_t> out(static_cast<size_t>(outW) * outH * 3u, 0u);
+        int w = 0, h = 0;
+        ASSERT_EQ(1, getMlvRawFrameDebayeredFromReducedReconnedRaw16(bare.video, 1, work.data(), bw, bh, 4, out.data(), 1,
+                                                                     &w, &h));
+        int bad = 0, worst = 0;
+        for (int y = 0; y < outH; ++y)
+            for (int x = 2; x < 30; ++x)
+                for (int c = 0; c < 3; c += 2)
+                {
+                    const int want = 2050 + 200 * x;
+                    const int d = std::abs(static_cast<int>(out[(static_cast<size_t>(y) * outW + x) * 3u + c]) - want);
+                    bad += d != 0;
+                    worst = std::max(worst, d);
+                }
+        const size_t p23 = (static_cast<size_t>(10) * outW + 23) * 3u, p24 = (static_cast<size_t>(10) * outW + 24) * 3u;
+        std::printf("[h2c-x4-affine] cores %d: R/B at output x in [2, 30) off 2050 + 200 x: %d words (worst %d, want 0); "
+                    "(23,10) R %u B %u (6650), (24,10) R %u B %u (6850)\n",
+                    cores, bad, worst, static_cast<unsigned>(out[p23]), static_cast<unsigned>(out[p23 + 2u]),
+                    static_cast<unsigned>(out[p24]), static_cast<unsigned>(out[p24 + 2u]));
+        allOk = allOk && bad == 0;
+    }
+    ASSERT_TRUE(allOk);
+}
+
 // H2C-PORT-1 r12, adversary pass 9 advisory A2 (pre-existing, debayer.c:507): a reduced Bayer one row high passed the
 // plain branch's checks, and debayerBasicU16's bottom-row copy then read 192 words before the output (row -1).
 // r12 pass 1 advisory A2 (pre-existing, video_mlv.c:7224): the class is wider. debayerBasicU16 reconstructs whole row
