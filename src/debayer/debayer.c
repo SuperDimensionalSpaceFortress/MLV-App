@@ -579,6 +579,98 @@ static void debayer_hchroma121_own_tile(int *own, const int *L, const int *G, in
     }
 }
 
+/* r15 (pace): one tile [x0, x0 + n) of the selected, ranged [1 2 1], the same words r14 wrote. The row is copied
+ * into planar R / G / B arrays once (index i + 1 = column x0 + i; 0 and n + 1 hold the mirrored neighbours), so the
+ * per-pixel loop has no stride-3 loads, no edge index math and no branch: every term is a lane-wise integer op, the
+ * own test the same IEEE divide and compare (divps / cmpleps round and compare each lane as divss / comiss do), and
+ * the compiler runs it four lanes wide (SSE2 on the win32 flags; any other build runs the same loop scalar).
+ * Ranged, clamp(clamp(v, 0, 65535), lo, hi) == clamp(v, lo, hi) because 0 <= lo <= hi <= 65535. */
+static void debayer_hchroma121_sel_core(int *__restrict oR, int *__restrict oB, const int *__restrict R,
+                                        const int *__restrict G, const int *__restrict B, int n, const float *sel,
+                                        int sel_keep);
+static void debayer_hchroma121_sel_tile(uint16_t *dst, const uint16_t *src, int w, int x0, int n, const float *sel,
+                                        int sel_keep)
+{
+    int R[DEBAYER_H121_TILE + 2], G[DEBAYER_H121_TILE + 2], B[DEBAYER_H121_TILE + 2];
+    int oR[DEBAYER_H121_TILE], oB[DEBAYER_H121_TILE];
+    const int xe = x0 + n - 1;
+    const int xl = (x0 > 0) ? x0 - 1 : ((w > 1) ? x0 + 1 : x0);
+    const int xr = (xe < w - 1) ? xe + 1 : ((w > 1) ? xe - 1 : xe);
+    const uint16_t *s = src + (size_t)x0 * 3u;
+    R[0] = src[(size_t)xl * 3u]; G[0] = src[(size_t)xl * 3u + 1u]; B[0] = src[(size_t)xl * 3u + 2u];
+    for (int i = 0; i < n; ++i)
+    {
+        R[i + 1] = s[3 * i];
+        G[i + 1] = s[3 * i + 1];
+        B[i + 1] = s[3 * i + 2];
+    }
+    R[n + 1] = src[(size_t)xr * 3u]; G[n + 1] = src[(size_t)xr * 3u + 1u]; B[n + 1] = src[(size_t)xr * 3u + 2u];
+    debayer_hchroma121_sel_core(oR, oB, R, G, B, n, sel, sel_keep);
+    uint16_t *d = dst + (size_t)x0 * 3u;
+    for (int i = 0; i < n; ++i)
+    {
+        d[3 * i] = (uint16_t)oR[i];
+        d[3 * i + 1] = (uint16_t)G[i + 1];
+        d[3 * i + 2] = (uint16_t)oB[i];
+    }
+}
+
+/* R, G, B: planar rows of the caller's scratch with R[-1] and R[w] free for the mirrored halo (x0 = 0 takes x = 1,
+ * x = w - 1 takes w - 2, as the tile's xl / xr do). */
+static void debayer_hchroma121_sel_planar(uint16_t *dst, int *R, int *G, int *B, int *oR, int *oB, int w,
+                                          const float *sel, int sel_keep)
+{
+    const int ml = (w > 1) ? 1 : 0, mr = (w > 1) ? w - 2 : 0;
+    R[-1] = R[ml]; G[-1] = G[ml]; B[-1] = B[ml];
+    R[w] = R[mr]; G[w] = G[mr]; B[w] = B[mr];
+    debayer_hchroma121_sel_core(oR, oB, R - 1, G - 1, B - 1, w, sel, sel_keep);
+    for (int x = 0; x < w; ++x)
+    {
+        dst[3 * (size_t)x] = (uint16_t)oR[x];
+        dst[3 * (size_t)x + 1u] = (uint16_t)G[x];
+        dst[3 * (size_t)x + 2u] = (uint16_t)oB[x];
+    }
+}
+
+/* The per-pixel body of the two above: output i from taps i, i + 1, i + 2 of R / G / B. */
+static void debayer_hchroma121_sel_core(int *__restrict oR, int *__restrict oB, const int *__restrict R,
+                                        const int *__restrict G, const int *__restrict B, int n, const float *sel,
+                                        int sel_keep)
+{
+    const float aR = sel[0], aB = sel[1];
+    /* r12 pass 3 A1: a kept channel (degenerate fit) takes its own [1 2 1]; the colour difference is never laid on it */
+    const int kR = sel_keep & 1, kB = (sel_keep >> 1) & 1;
+    for (int i = 0; i < n; ++i)
+    {
+        const int gl = G[i], gm = G[i + 1], gr = G[i + 2];
+        const float gc = (float)(gl - 2 * gm + gr);
+        {
+            const int l = R[i], m = R[i + 1], r = R[i + 2];
+            const float q = (float)(l - 2 * m + r) / aR;
+            const int own = kR | (fabsf(q) <= fabsf(q - gc));
+            const int t = (l - gl) + 2 * (m - gm) + (r - gr);
+            int v = gm + ((t + 2) >> 2);
+            const int lo = MIN(MIN(l, m), r), hi = MAX(MAX(l, m), r);
+            v = (v < lo) ? lo : v;
+            v = (v > hi) ? hi : v;
+            const int vo = (l + 2 * m + r + 2) >> 2;
+            oR[i] = own ? vo : v;
+        }
+        {
+            const int l = B[i], m = B[i + 1], r = B[i + 2];
+            const float q = (float)(l - 2 * m + r) / aB;
+            const int own = kB | (fabsf(q) <= fabsf(q - gc));
+            const int t = (l - gl) + 2 * (m - gm) + (r - gr);
+            int v = gm + ((t + 2) >> 2);
+            const int lo = MIN(MIN(l, m), r), hi = MAX(MAX(l, m), r);
+            v = (v < lo) ? lo : v;
+            v = (v > hi) ? hi : v;
+            const int vo = (l + 2 * m + r + 2) >> 2;
+            oB[i] = own ? vo : v;
+        }
+    }
+}
+
 static void debayer_reduced_hchroma121_impl(uint16_t *out, const uint16_t *in, int w, int h, int threads, int ranged,
                                             const float *sel, int sel_keep)
 {
@@ -601,43 +693,48 @@ static void debayer_reduced_hchroma121_impl(uint16_t *out, const uint16_t *in, i
             }
             continue;
         }
-        /* sel: tiles of the row; curvatures, then the vector test, then a select per pixel */
+        /* sel: tiles of the row (r15: planar, see debayer_hchroma121_sel_tile) */
         for (int x0 = 0; x0 < w; x0 += DEBAYER_H121_TILE)
         {
-            const int n = MIN(DEBAYER_H121_TILE, w - x0);
-            int L[2][DEBAYER_H121_TILE], Gc[DEBAYER_H121_TILE], own[2][DEBAYER_H121_TILE];
-            for (int i = 0; i < n; ++i)
-            {
-                const int x = x0 + i;
-                const int xl = (x > 0) ? x - 1 : ((w > 1) ? x + 1 : x);
-                const int xr = (x < w - 1) ? x + 1 : ((w > 1) ? x - 1 : x);
-                const uint16_t *pl = src + (size_t)xl * 3u, *pm = src + (size_t)x * 3u, *pr = src + (size_t)xr * 3u;
-                Gc[i] = (int)pl[1] - 2 * (int)pm[1] + (int)pr[1];
-                L[0][i] = (int)pl[0] - 2 * (int)pm[0] + (int)pr[0];
-                L[1][i] = (int)pl[2] - 2 * (int)pm[2] + (int)pr[2];
-            }
-            for (int ci = 0; ci < 2; ++ci)
-            {
-                /* r12 pass 3 A1: a kept channel (degenerate fit, e.g. a negative slope) is the bilinear's, so it takes
-                 * its own [1 2 1] as well; the colour difference to G is never laid on it. */
-                if (sel_keep & (1 << ci))
-                    for (int i = 0; i < n; ++i) own[ci][i] = 1;
-                else
-                    debayer_hchroma121_own_tile(own[ci], L[ci], Gc, n, sel[ci]);
-            }
-            for (int i = 0; i < n; ++i)
-            {
-                const int x = x0 + i;
-                const int xl = (x > 0) ? x - 1 : ((w > 1) ? x + 1 : x);
-                const int xr = (x < w - 1) ? x + 1 : ((w > 1) ? x - 1 : x);
-                const uint16_t *pl = src + (size_t)xl * 3u, *pm = src + (size_t)x * 3u, *pr = src + (size_t)xr * 3u;
-                for (int c = 0; c < 3; c += 2)
+            if (ranged)
+                debayer_hchroma121_sel_tile(dst, src, w, x0, MIN(DEBAYER_H121_TILE, w - x0), sel, sel_keep);
+            else
+            {   /* not a caller today (the selected [1 2 1] is always ranged); kept as r14 wrote it */
+                const int n = MIN(DEBAYER_H121_TILE, w - x0);
+                int L[2][DEBAYER_H121_TILE], Gc[DEBAYER_H121_TILE], own[2][DEBAYER_H121_TILE];
+                for (int i = 0; i < n; ++i)
                 {
-                    const int v = debayer_hchroma121_cd(pl, pm, pr, c, ranged);
-                    const int vo = ((int)pl[c] + 2 * (int)pm[c] + (int)pr[c] + 2) >> 2;
-                    dst[(size_t)x * 3u + (size_t)c] = (uint16_t)(own[c ? 1 : 0][i] ? vo : v);
+                    const int x = x0 + i;
+                    const int xl = (x > 0) ? x - 1 : ((w > 1) ? x + 1 : x);
+                    const int xr = (x < w - 1) ? x + 1 : ((w > 1) ? x - 1 : x);
+                    const uint16_t *pl = src + (size_t)xl * 3u, *pm = src + (size_t)x * 3u, *pr = src + (size_t)xr * 3u;
+                    Gc[i] = (int)pl[1] - 2 * (int)pm[1] + (int)pr[1];
+                    L[0][i] = (int)pl[0] - 2 * (int)pm[0] + (int)pr[0];
+                    L[1][i] = (int)pl[2] - 2 * (int)pm[2] + (int)pr[2];
                 }
-                dst[(size_t)x * 3u + 1u] = pm[1];
+                for (int ci = 0; ci < 2; ++ci)
+                {
+                    /* r12 pass 3 A1: a kept channel (degenerate fit, e.g. a negative slope) is the bilinear's, so it
+                     * takes its own [1 2 1] as well; the colour difference to G is never laid on it. */
+                    if (sel_keep & (1 << ci))
+                        for (int i = 0; i < n; ++i) own[ci][i] = 1;
+                    else
+                        debayer_hchroma121_own_tile(own[ci], L[ci], Gc, n, sel[ci]);
+                }
+                for (int i = 0; i < n; ++i)
+                {
+                    const int x = x0 + i;
+                    const int xl = (x > 0) ? x - 1 : ((w > 1) ? x + 1 : x);
+                    const int xr = (x < w - 1) ? x + 1 : ((w > 1) ? x - 1 : x);
+                    const uint16_t *pl = src + (size_t)xl * 3u, *pm = src + (size_t)x * 3u, *pr = src + (size_t)xr * 3u;
+                    for (int c = 0; c < 3; c += 2)
+                    {
+                        const int v = debayer_hchroma121_cd(pl, pm, pr, c, ranged);
+                        const int vo = ((int)pl[c] + 2 * (int)pm[c] + (int)pr[c] + 2) >> 2;
+                        dst[(size_t)x * 3u + (size_t)c] = (uint16_t)(own[c ? 1 : 0][i] ? vo : v);
+                    }
+                    dst[(size_t)x * 3u + 1u] = pm[1];
+                }
             }
         }
     }
@@ -927,8 +1024,398 @@ static void debayer_hacd_range_row(uint16_t *out, const uint16_t *bayer, int w, 
     }
 }
 
-static int debayer_hacd_impl(uint16_t *rgb, const uint16_t *bayer, int w, int h, int threads, float *scratch,
-                             float *sel_out, int *keep_out)
+/* r15 (pace): the per-row stages after the site pass (px, select, range) as one planar pass over a row pair. The
+ * words are those debayer_hacd_px, debayer_hacd_select_row and debayer_hacd_range_row write (which stay the
+ * reference and the fallback); only the order of the work changes:
+ * - the select's site test depends on the own row sy alone, which rows 2k and 2k + 1 share, so it runs once per pair;
+ * - interior columns (no mirror) run as straight loops over column pairs (one own, one other column) on planar arrays
+ *   the compiler vectorises (SSE2 on the win32 flags; any other build runs the same loops scalar); the few mirrored
+ *   edge columns take debayer_hacd_final_px, the per-pixel form of the three stages.
+ * debayer_hacd_r16 is debayer_hacd_round16 as an int, clamped in float first so the conversion is unconditional (and
+ * the loop has no branch): v <= 0 or NaN -> 0 -> (int)0.5f = 0; v >= 65535 -> 65535 -> (int)65535.5f = 65535; any
+ * other v is unchanged, so every input gives round16's word. */
+static inline int debayer_hacd_r16(float v)
+{
+    float u = (v > 0.0f) ? v : 0.0f;
+    u = (u < 65535.0f) ? u : 65535.0f;
+    return (int)(u + 0.5f);
+}
+
+/* r12's select test at own site sx of own row sy (rows ya, yb = sy -+ 2 mirrored), mirrored columns. */
+static inline int debayer_hacd_take_site(const uint16_t *bayer, const float *dif, int w, int sy, int ya, int yb, int sx,
+                                         float a)
+{
+    const int xa = debayer_hacd_reflect(sx - 2, w), xb = debayer_hacd_reflect(sx + 2, w);
+    const uint16_t *bs = bayer + (size_t)sy * (size_t)w;
+    const float *fs = dif + (size_t)sy * (size_t)w;
+    const int cs = bs[sx];
+    const float so = (float)(abs((int)bs[xa] - 2 * cs + (int)bs[xb])
+                             + abs((int)bayer[(size_t)ya * (size_t)w + (size_t)sx] - 2 * cs
+                                   + (int)bayer[(size_t)yb * (size_t)w + (size_t)sx]));
+    const float sc = fabsf(fs[xa] - 2.0f * fs[sx] + fs[xb])
+                   + fabsf(dif[(size_t)ya * (size_t)w + (size_t)sx] - 2.0f * fs[sx] + dif[(size_t)yb * (size_t)w + (size_t)sx]);
+    return so / a <= sc;
+}
+
+/* One channel (own parity p, fit a, c) of one pixel through px, select (take) and range, mirrored. */
+static int debayer_hacd_final_px(const uint16_t *bayer, const float *dif, int w, int h, int y, int x, int p, float a,
+                                 float c, float gb, int take)
+{
+    const int oy = ((y & 1) == p), ox = ((x & 1) == p);
+    const int yu = debayer_hacd_reflect(y - 1, h), yd = debayer_hacd_reflect(y + 1, h);
+    const int xl = debayer_hacd_reflect(x - 1, w), xr = debayer_hacd_reflect(x + 1, w);
+    const float *fr = dif + (size_t)y * (size_t)w, *fu = dif + (size_t)yu * (size_t)w, *fd = dif + (size_t)yd * (size_t)w;
+    const uint16_t *br = bayer + (size_t)y * (size_t)w, *bu = bayer + (size_t)yu * (size_t)w;
+    const uint16_t *bd = bayer + (size_t)yd * (size_t)w;
+    float d;
+    int nv;
+    if (oy && ox) { d = fr[x]; nv = br[x]; }
+    else if (oy) { d = 0.5f * (fr[xl] + fr[xr]); nv = ((int)br[xl] + (int)br[xr] + 1) >> 1; }
+    else if (ox) { d = 0.5f * (fu[x] + fd[x]); nv = ((int)bu[x] + (int)bd[x] + 1) >> 1; }
+    else
+    {
+        d = 0.25f * (fu[xl] + fu[xr] + fd[xl] + fd[xr]);
+        nv = ((int)bu[xl] + (int)bu[xr] + (int)bd[xl] + (int)bd[xr] + 2) >> 2;
+    }
+    int v = take ? nv : debayer_hacd_r16(a * (gb + d) + c);
+    const uint16_t *r0 = oy ? bayer + (size_t)debayer_hacd_reflect(y - 2, h) * (size_t)w : bu;
+    const uint16_t *r1 = oy ? br : bd;
+    const uint16_t *r2 = oy ? bayer + (size_t)debayer_hacd_reflect(y + 2, h) * (size_t)w : bd;
+    const int c0 = ox ? debayer_hacd_reflect(x - 2, w) : xl, c1 = ox ? x : xr, c2 = ox ? debayer_hacd_reflect(x + 2, w) : xr;
+    int lo = 65535, hi = 0;
+    const uint16_t *rr[3] = { r0, r1, r2 };
+    const int cc[3] = { c0, c1, c2 };
+    for (int i = 0; i < 3; ++i)
+        for (int k = 0; k < 3; ++k)
+        {
+            const int s = rr[i][cc[k]];
+            if (s < lo) lo = s;
+            if (s > hi) hi = s;
+        }
+    if (v < lo) v = lo;
+    else if (v > hi) v = hi;
+    return v;
+}
+
+/* Interior column pairs j in [j1, j2] of row y, channel p: own column 2 j + p, other column 2 j + 1 - p, whose own
+ * neighbours are columns 2 (j - p) + p and 2 (j - p + 1) + p. fo, bo point at column p of their rows, so fo[2 j] is own
+ * column j. CL / CH: the own-row min / max of own column j. V gets the words at columns 2 j, 2 j + 1. */
+static void debayer_hacd_pair_rows(int *V, const float *Gp, const float *fo, const float *fuo, const float *fdo,
+                                   const uint16_t *bo, const uint16_t *buo, const uint16_t *bdo, const int *CL,
+                                   const int *CH, const int *take, int j1, int j2, int p, int oy, float a, float c)
+{
+    /* both arms of every select are computed, then picked: under the default -ftrapping-math the compiler does not
+     * speculate a float op that sits behind a condition, and would leave the loop scalar */
+    int *Vo = V + p, *Vn = V + 1 - p;
+    const float *Go = Gp + p, *Gn = Gp + 1 - p;
+    if (oy)
+    {
+        for (int j = j1; j <= j2; ++j)
+        {
+            const int jn = j - p;
+            const int t = take[j];
+            const int po = debayer_hacd_r16(a * (Go[2 * j] + fo[2 * j]) + c);
+            const int pn = debayer_hacd_r16(a * (Gn[2 * j] + 0.5f * (fo[2 * jn] + fo[2 * jn + 2])) + c);
+            const int no = (int)bo[2 * j];
+            const int nn = ((int)bo[2 * jn] + (int)bo[2 * jn + 2] + 1) >> 1;
+            int vo = t ? no : po;
+            int vn = t ? nn : pn;
+            const int lo = MIN(MIN(CL[j - 1], CL[j]), CL[j + 1]), hi = MAX(MAX(CH[j - 1], CH[j]), CH[j + 1]);
+            const int nlo = MIN(CL[jn], CL[jn + 1]), nhi = MAX(CH[jn], CH[jn + 1]);
+            vo = (vo < lo) ? lo : vo;
+            vo = (vo > hi) ? hi : vo;
+            vn = (vn < nlo) ? nlo : vn;
+            vn = (vn > nhi) ? nhi : vn;
+            Vo[2 * j] = vo;
+            Vn[2 * j] = vn;
+        }
+    }
+    else
+    {
+        for (int j = j1; j <= j2; ++j)
+        {
+            const int jn = j - p;
+            const int t = take[j];
+            const int po = debayer_hacd_r16(a * (Go[2 * j] + 0.5f * (fuo[2 * j] + fdo[2 * j])) + c);
+            const int pn = debayer_hacd_r16(a * (Gn[2 * j] + 0.25f * (fuo[2 * jn] + fuo[2 * jn + 2] + fdo[2 * jn]
+                                                                      + fdo[2 * jn + 2])) + c);
+            const int no = ((int)buo[2 * j] + (int)bdo[2 * j] + 1) >> 1;
+            const int nn = ((int)buo[2 * jn] + (int)buo[2 * jn + 2] + (int)bdo[2 * jn] + (int)bdo[2 * jn + 2] + 2) >> 2;
+            int vo = t ? no : po;
+            int vn = t ? nn : pn;
+            const int lo = MIN(MIN(CL[j - 1], CL[j]), CL[j + 1]), hi = MAX(MAX(CH[j - 1], CH[j]), CH[j + 1]);
+            const int nlo = MIN(CL[jn], CL[jn + 1]), nhi = MAX(CH[jn], CH[jn + 1]);
+            vo = (vo < lo) ? lo : vo;
+            vo = (vo > hi) ? hi : vo;
+            vn = (vn < nlo) ? nlo : vn;
+            vn = (vn > nhi) ? nhi : vn;
+            Vo[2 * j] = vo;
+            Vn[2 * j] = vn;
+        }
+    }
+}
+
+#if defined(__SSE2__) && (defined(__x86_64__) || defined(__i386__))
+#include <emmintrin.h> /* SSE2 only (the win32 build's -msse2 baseline; clang x86 builds included) */
+/* r15: SSE2 form of debayer_hacd_pair_rows (the same IEEE ops in the same order, four column pairs per step). Integer
+ * min / max as compare + select (SSE2 has no pminsd); maxps(v, 0) / minps(u, 65535) are r16's two selects (maxps returns
+ * its second operand on NaN, as `v > 0 ? v : 0` does). Returns the first column pair it did not process. Loads read
+ * columns up to 2 j + 9, so it stops before that passes w - 1. Row pointers here are NOT offset by p. */
+#define DH_SSE2_PAIR 1
+static inline __m128i dh_min32(__m128i a, __m128i b)
+{
+    const __m128i m = _mm_cmpgt_epi32(a, b);
+    return _mm_or_si128(_mm_and_si128(m, b), _mm_andnot_si128(m, a));
+}
+static inline __m128i dh_max32(__m128i a, __m128i b)
+{
+    const __m128i m = _mm_cmpgt_epi32(a, b);
+    return _mm_or_si128(_mm_and_si128(m, a), _mm_andnot_si128(m, b));
+}
+static inline __m128i dh_r16x4(__m128 v)
+{
+    __m128 u = _mm_max_ps(v, _mm_setzero_ps());
+    u = _mm_min_ps(u, _mm_set1_ps(65535.0f));
+    return _mm_cvttps_epi32(_mm_add_ps(u, _mm_set1_ps(0.5f)));
+}
+/* elements p[par], p[par + 2], p[par + 4], p[par + 6] */
+static inline __m128 dh_par_ps(const float *p, int par)
+{
+    const __m128 a = _mm_loadu_ps(p), b = _mm_loadu_ps(p + 4);
+    return par ? _mm_shuffle_ps(a, b, _MM_SHUFFLE(3, 1, 3, 1)) : _mm_shuffle_ps(a, b, _MM_SHUFFLE(2, 0, 2, 0));
+}
+static inline __m128i dh_par_u16(const uint16_t *p, int par)
+{
+    const __m128i v = _mm_loadu_si128((const __m128i *)(const void *)p);
+    return par ? _mm_srli_epi32(v, 16) : _mm_and_si128(v, _mm_set1_epi32(0xFFFF));
+}
+static int debayer_hacd_pair_rows_sse2(int *V, const float *Gp, const float *fr, const float *fu, const float *fd,
+                                       const uint16_t *br, const uint16_t *bu, const uint16_t *bd, const int *CL,
+                                       const int *CH, const int *take, int j1, int j2, int w, int p, int oy, float a,
+                                       float c)
+{
+    const __m128 va = _mm_set1_ps(a), vc = _mm_set1_ps(c), h5 = _mm_set1_ps(0.5f), q25 = _mm_set1_ps(0.25f);
+    const __m128i one = _mm_set1_epi32(1), two = _mm_set1_epi32(2), zero = _mm_setzero_si128();
+    const int dl = -2 * p, dr = 2 - 2 * p; /* the other column's own neighbours, relative to 2 j */
+    int j = j1;
+    for (; j + 3 <= j2 && 2 * j + 9 <= w - 1; j += 4)
+    {
+        const int x = 2 * j;
+        const __m128 go = dh_par_ps(Gp + x, p), gn = dh_par_ps(Gp + x, 1 - p);
+        __m128i po, pn, no, nn;
+        if (oy)
+        {
+            const __m128 fo = dh_par_ps(fr + x, p);
+            po = dh_r16x4(_mm_add_ps(_mm_mul_ps(va, _mm_add_ps(go, fo)), vc));
+            const __m128 fl = dh_par_ps(fr + x + dl, p), fh = dh_par_ps(fr + x + dr, p);
+            pn = dh_r16x4(_mm_add_ps(_mm_mul_ps(va, _mm_add_ps(gn, _mm_mul_ps(h5, _mm_add_ps(fl, fh)))), vc));
+            no = dh_par_u16(br + x, p);
+            nn = _mm_srai_epi32(_mm_add_epi32(_mm_add_epi32(dh_par_u16(br + x + dl, p), dh_par_u16(br + x + dr, p)), one), 1);
+        }
+        else
+        {
+            const __m128 fuo = dh_par_ps(fu + x, p), fdo = dh_par_ps(fd + x, p);
+            po = dh_r16x4(_mm_add_ps(_mm_mul_ps(va, _mm_add_ps(go, _mm_mul_ps(h5, _mm_add_ps(fuo, fdo)))), vc));
+            const __m128 ul = dh_par_ps(fu + x + dl, p), ur = dh_par_ps(fu + x + dr, p);
+            const __m128 dlv = dh_par_ps(fd + x + dl, p), drv = dh_par_ps(fd + x + dr, p);
+            const __m128 s4 = _mm_add_ps(_mm_add_ps(_mm_add_ps(ul, ur), dlv), drv);
+            pn = dh_r16x4(_mm_add_ps(_mm_mul_ps(va, _mm_add_ps(gn, _mm_mul_ps(q25, s4))), vc));
+            no = _mm_srai_epi32(_mm_add_epi32(_mm_add_epi32(dh_par_u16(bu + x, p), dh_par_u16(bd + x, p)), one), 1);
+            const __m128i i4 = _mm_add_epi32(_mm_add_epi32(dh_par_u16(bu + x + dl, p), dh_par_u16(bu + x + dr, p)),
+                                             _mm_add_epi32(dh_par_u16(bd + x + dl, p), dh_par_u16(bd + x + dr, p)));
+            nn = _mm_srai_epi32(_mm_add_epi32(i4, two), 2);
+        }
+        const __m128i m = _mm_cmpgt_epi32(_mm_loadu_si128((const __m128i *)(const void *)(take + j)), zero);
+        __m128i vo = _mm_or_si128(_mm_and_si128(m, no), _mm_andnot_si128(m, po));
+        __m128i vn = _mm_or_si128(_mm_and_si128(m, nn), _mm_andnot_si128(m, pn));
+        const __m128i cl0 = _mm_loadu_si128((const __m128i *)(const void *)(CL + j - 1));
+        const __m128i cl1 = _mm_loadu_si128((const __m128i *)(const void *)(CL + j));
+        const __m128i cl2 = _mm_loadu_si128((const __m128i *)(const void *)(CL + j + 1));
+        const __m128i ch0 = _mm_loadu_si128((const __m128i *)(const void *)(CH + j - 1));
+        const __m128i ch1 = _mm_loadu_si128((const __m128i *)(const void *)(CH + j));
+        const __m128i ch2 = _mm_loadu_si128((const __m128i *)(const void *)(CH + j + 1));
+        vo = dh_min32(dh_max32(vo, dh_min32(dh_min32(cl0, cl1), cl2)), dh_max32(dh_max32(ch0, ch1), ch2));
+        vn = p ? dh_min32(dh_max32(vn, dh_min32(cl0, cl1)), dh_max32(ch0, ch1))
+               : dh_min32(dh_max32(vn, dh_min32(cl1, cl2)), dh_max32(ch1, ch2));
+        const __m128i e = p ? vn : vo, o = p ? vo : vn; /* columns 2 j (even) and 2 j + 1 (odd) */
+        _mm_storeu_si128((__m128i *)(void *)(V + x), _mm_unpacklo_epi32(e, o));
+        _mm_storeu_si128((__m128i *)(void *)(V + x + 4), _mm_unpackhi_epi32(e, o));
+    }
+    return j;
+}
+#endif
+
+/* Rows y0 and y0 + 1 (if < h) through px, select and range, planar, and (filtered != NULL) the selected [1 2 1] of
+ * each finished row. buf: 10 w + 32 ints of thread scratch (it uses at most 9 w + 12). */
+static void debayer_hacd_rowpair(uint16_t *rgb, uint16_t *filtered, const uint16_t *bayer, const float *dif, int w,
+                                 int h, int y0, int keep, float aR, float cR, float aB, float cB, int *buf)
+{
+    const int half = (w + 2) / 2;
+    float *Gp = (float *)buf;
+    int *Gi = buf + w + 1;
+    int *VV[2] = { Gi + w + 2, Gi + 2 * (w + 2) };
+    int *tk[2] = { buf + 4 * (w + 2) + w, buf + 4 * (w + 2) + w + half };
+    int *CL = tk[1] + half, *CH = CL + half;
+    int *oR = CH + half, *oB = oR + w;
+    int nsites_[2] = { 0, 0 }, j2_[2] = { 0, 0 };
+    for (int ch = 0; ch < 2; ++ch)
+    {
+        if (keep & (1 << ch)) continue;
+        const int p = ch;
+        int *take = tk[ch];
+        const float a = ch ? aB : aR;
+        const int nsites = (w - p + 1) / 2;
+        int sy = (y0 & ~1) | p;
+        if (sy >= h) sy -= 2;
+        const int ya = debayer_hacd_reflect(sy - 2, h), yb = debayer_hacd_reflect(sy + 2, h);
+        const int j2 = (w - 3 - p) / 2; /* interior column pairs j in [1, j2]: no mirror for any tap */
+        nsites_[ch] = nsites;
+        j2_[ch] = j2;
+        {   /* the site test, once for both rows */
+            const uint16_t *bs = bayer + (size_t)sy * (size_t)w + p, *ba = bayer + (size_t)ya * (size_t)w + p;
+            const uint16_t *bb = bayer + (size_t)yb * (size_t)w + p;
+            const float *fs = dif + (size_t)sy * (size_t)w + p, *fa = dif + (size_t)ya * (size_t)w + p;
+            const float *fb = dif + (size_t)yb * (size_t)w + p;
+            take[0] = debayer_hacd_take_site(bayer, dif, w, sy, ya, yb, p, a);
+            for (int j = 1; j <= j2; ++j)
+            {
+                const int cs = bs[2 * j];
+                const float so = (float)(abs((int)bs[2 * j - 2] - 2 * cs + (int)bs[2 * j + 2])
+                                         + abs((int)ba[2 * j] - 2 * cs + (int)bb[2 * j]));
+                const float sc = fabsf(fs[2 * j - 2] - 2.0f * fs[2 * j] + fs[2 * j + 2])
+                               + fabsf(fa[2 * j] - 2.0f * fs[2 * j] + fb[2 * j]);
+                take[j] = so / a <= sc;
+            }
+            for (int j = (j2 < 1 ? 1 : j2 + 1); j < nsites; ++j)
+                take[j] = debayer_hacd_take_site(bayer, dif, w, sy, ya, yb, 2 * j + p, a);
+        }
+    }
+    for (int y = y0; y < y0 + 2 && y < h; ++y)
+    {
+        uint16_t *out = rgb + (size_t)y * (size_t)w * 3u;
+        for (int x = 0; x < w; ++x)
+        {
+            Gi[x] = out[(size_t)x * 3u + 1u];
+            Gp[x] = (float)Gi[x];
+        }
+        for (int ch = 0; ch < 2; ++ch)
+        {
+            int *V = VV[ch];
+            uint16_t *o = out + (ch ? 2u : 0u);
+            if (keep & (1 << ch))
+            {   /* a kept channel is the bilinear's, untouched; the [1 2 1] still reads it */
+                for (int x = 0; x < w; ++x) V[x] = o[(size_t)x * 3u];
+                continue;
+            }
+            const int p = ch, nsites = nsites_[ch], j2 = j2_[ch];
+            const int *take = tk[ch];
+            const float a = ch ? aB : aR, c = ch ? cB : cR;
+            const int oy = ((y & 1) == p);
+            const int yu = debayer_hacd_reflect(y - 1, h), yd = debayer_hacd_reflect(y + 1, h);
+            const uint16_t *r0 = oy ? bayer + (size_t)debayer_hacd_reflect(y - 2, h) * (size_t)w : bayer + (size_t)yu * (size_t)w;
+            const uint16_t *r1 = oy ? bayer + (size_t)y * (size_t)w : bayer + (size_t)yd * (size_t)w;
+            const uint16_t *r2 = oy ? bayer + (size_t)debayer_hacd_reflect(y + 2, h) * (size_t)w : r1;
+            for (int j = 0; j < nsites; ++j)
+            {
+                const int s = 2 * j + p;
+                CL[j] = MIN(MIN((int)r0[s], (int)r1[s]), (int)r2[s]);
+                CH[j] = MAX(MAX((int)r0[s], (int)r1[s]), (int)r2[s]);
+            }
+            if (j2 >= 1)
+            {
+                const float *fr = dif + (size_t)y * (size_t)w, *fu = dif + (size_t)yu * (size_t)w;
+                const float *fd = dif + (size_t)yd * (size_t)w;
+                const uint16_t *br = bayer + (size_t)y * (size_t)w, *bu = bayer + (size_t)yu * (size_t)w;
+                const uint16_t *bd = bayer + (size_t)yd * (size_t)w;
+                int js = 1;
+#ifdef DH_SSE2_PAIR
+                js = debayer_hacd_pair_rows_sse2(V, Gp, fr, fu, fd, br, bu, bd, CL, CH, take, 1, j2, w, p, oy, a, c);
+#endif
+                if (js <= j2)
+                {
+                    if (p) /* p a constant in each call, so the column offsets are */
+                        debayer_hacd_pair_rows(V, Gp, fr + 1, fu + 1, fd + 1, br + 1, bu + 1, bd + 1, CL, CH, take, js, j2,
+                                               1, oy, a, c);
+                    else
+                        debayer_hacd_pair_rows(V, Gp, fr, fu, fd, br, bu, bd, CL, CH, take, js, j2, 0, oy, a, c);
+                }
+            }
+            const int xi0 = (j2 >= 1) ? 2 : w, xi1 = (j2 >= 1) ? 2 * j2 + 2 : w; /* interior columns [xi0, xi1) */
+            for (int x = 0; x < w; ++x)
+            {
+                if (x == xi0) x = xi1;
+                if (x >= w) break;
+                const int t = take[MIN(x >> 1, nsites - 1)];
+                V[x] = debayer_hacd_final_px(bayer, dif, w, h, y, x, p, a, c, Gp[x], t);
+            }
+            for (int x = 0; x < w; ++x) o[(size_t)x * 3u] = (uint16_t)V[x];
+        }
+        if (filtered)
+        {
+            const float sel[2] = { aR, aB };
+            debayer_hchroma121_sel_planar(filtered + (size_t)y * (size_t)w * 3u, VV[0], Gi, VV[1], oR, oB, w, sel, keep);
+        }
+    }
+}
+
+static void debayer_hacd_rows_ref(uint16_t *rgb, const uint16_t *bayer, const float *dif, int w, int h, int y,
+                                  int keep, float aR, float cR, float aB, float cB);
+
+#ifdef DH_SSE2_PAIR
+/* r15: SSE2 form of the interior debayer_hacd_site loop, four sites (x, x + 2, x + 4, x + 6) per step, the same IEEE
+ * ops in the same order; every select is a compare + blend with the scalar operands, so -0 and ties pick as the
+ * scalar ternaries do. The G columns between the sites keep their scratch bits (read and written back unchanged).
+ * Loads read up to column x + 9; returns the first site it did not process. */
+static inline __m128 dh_blend(__m128 m, __m128 a, __m128 b)
+{
+    return _mm_or_ps(_mm_and_ps(m, a), _mm_andnot_ps(m, b));
+}
+static inline __m128 dh_u16ps(const uint16_t *p)
+{
+    return _mm_cvtepi32_ps(dh_par_u16(p, 0));
+}
+static int debayer_hacd_site_row_sse2(float *dd, const uint16_t *row, const uint16_t *u1, const uint16_t *d1,
+                                      const uint16_t *u2, const uint16_t *d2, int x, int w, float ck, float ik)
+{
+    const __m128 vck = _mm_set1_ps(ck), vik = _mm_set1_ps(ik), two = _mm_set1_ps(2.0f), h5 = _mm_set1_ps(0.5f);
+    const __m128 q25 = _mm_set1_ps(0.25f), zero = _mm_setzero_ps(), top = _mm_set1_ps(65535.0f);
+    const __m128 nosign = _mm_castsi128_ps(_mm_set1_epi32(0x7FFFFFFF));
+    for (; x + 9 < w; x += 8)
+    {
+        const __m128 c = _mm_mul_ps(_mm_sub_ps(dh_u16ps(row + x), vck), vik);
+        const __m128 l1 = dh_u16ps(row + x - 1), r1 = dh_u16ps(row + x + 1);
+        const __m128 l2 = _mm_mul_ps(_mm_sub_ps(dh_u16ps(row + x - 2), vck), vik);
+        const __m128 r2 = _mm_mul_ps(_mm_sub_ps(dh_u16ps(row + x + 2), vck), vik);
+        const __m128 up1 = dh_u16ps(u1 + x), dn1 = dh_u16ps(d1 + x);
+        const __m128 c2 = _mm_mul_ps(two, c);
+        const __m128 lh = _mm_sub_ps(_mm_sub_ps(c2, l2), r2);
+        const __m128 lv = _mm_sub_ps(_mm_sub_ps(c2, _mm_mul_ps(_mm_sub_ps(dh_u16ps(u2 + x), vck), vik)),
+                                     _mm_mul_ps(_mm_sub_ps(dh_u16ps(d2 + x), vck), vik));
+        /* debayer_hacd_clamp2(v, a, b): lo = a < b ? a : b (minps), hi = a < b ? b : a (maxps(b, a)) */
+        const __m128 vh = _mm_add_ps(_mm_mul_ps(h5, _mm_add_ps(l1, r1)), _mm_mul_ps(q25, lh));
+        const __m128 hlo = _mm_min_ps(l1, r1), hhi = _mm_max_ps(r1, l1);
+        const __m128 gh = dh_blend(_mm_cmplt_ps(vh, hlo), hlo, dh_blend(_mm_cmpgt_ps(vh, hhi), hhi, vh));
+        const __m128 vv = _mm_add_ps(_mm_mul_ps(h5, _mm_add_ps(up1, dn1)), _mm_mul_ps(q25, lv));
+        const __m128 vlo = _mm_min_ps(up1, dn1), vhi = _mm_max_ps(dn1, up1);
+        const __m128 gv = dh_blend(_mm_cmplt_ps(vv, vlo), vlo, dh_blend(_mm_cmpgt_ps(vv, vhi), vhi, vv));
+        const __m128 dh = _mm_add_ps(_mm_and_ps(_mm_sub_ps(l1, r1), nosign), _mm_and_ps(lh, nosign));
+        const __m128 dv = _mm_add_ps(_mm_and_ps(_mm_sub_ps(up1, dn1), nosign), _mm_and_ps(lv, nosign));
+        __m128 gg = dh_blend(_mm_cmplt_ps(dh, dv), gh, dh_blend(_mm_cmplt_ps(dv, dh), gv, _mm_mul_ps(h5, _mm_add_ps(gh, gv))));
+        gg = dh_blend(_mm_cmplt_ps(gg, zero), zero, gg);
+        gg = dh_blend(_mm_cmpgt_ps(gg, top), top, gg);
+        const __m128 r = _mm_sub_ps(c, gg);
+        const __m128 e = _mm_loadu_ps(dd + x), f = _mm_loadu_ps(dd + x + 4);
+        const __m128 g = _mm_shuffle_ps(e, f, _MM_SHUFFLE(3, 1, 3, 1)); /* the G columns' scratch, unchanged */
+        _mm_storeu_ps(dd + x, _mm_unpacklo_ps(r, g));
+        _mm_storeu_ps(dd + x + 4, _mm_unpackhi_ps(r, g));
+    }
+    return x;
+}
+#endif
+
+/* filtered: NULL (HA-CD alone), or the selected, ranged [1 2 1] output (r15: run per finished row). */
+static int debayer_hacd_impl(uint16_t *rgb, uint16_t *filtered, const uint16_t *bayer, int w, int h, int threads,
+                             float *scratch)
 {
     if (!rgb || !bayer || !scratch || w < 4 || h < 4) return 0;
     float aR, cR, aB, cB;
@@ -936,9 +1423,12 @@ static int debayer_hacd_impl(uint16_t *rgb, const uint16_t *bayer, int w, int h,
     const int okB = debayer_hacd_fit(bayer, w, h, 1, 1, &aB, &cB); /* B at (odd, odd) */
     /* r11: a degenerate fit keeps that channel as debayerBasicU16 wrote it. */
     const int keep = (okR ? 0 : 1) | (okB ? 0 : 2);
-    if (sel_out) { sel_out[0] = aR; sel_out[1] = aB; }
-    if (keep_out) *keep_out = keep;
-    if (keep == 3) return 1;
+    if (keep == 3)
+    {
+        const float sel3[2] = { aR, aB };
+        if (filtered) debayer_reduced_hchroma121_impl(filtered, rgb, w, h, threads, 1, sel3, keep);
+        return 1;
+    }
     const float iR = 1.0f / aR, iB = 1.0f / aB;
     /* scratch[i] at an R or B site = its balanced value minus its HA G (the colour
      * difference); G sites are not written. Same-colour neighbours (x +- 2, y +- 2)
@@ -960,6 +1450,9 @@ static int debayer_hacd_impl(uint16_t *rgb, const uint16_t *bayer, int w, int h,
         for (; x < 2; x += 2)
             dd[x] = debayer_hacd_site(row, u1, d1, u2, d2, x, debayer_hacd_reflect(x - 1, w), debayer_hacd_reflect(x + 1, w),
                                       debayer_hacd_reflect(x - 2, w), debayer_hacd_reflect(x + 2, w), ck, ik);
+#ifdef DH_SSE2_PAIR
+        x = debayer_hacd_site_row_sse2(dd, row, u1, d1, u2, d2, x, w, ck, ik);
+#endif
         for (; x + 2 < w; x += 2)
             dd[x] = debayer_hacd_site(row, u1, d1, u2, d2, x, x - 1, x + 1, x - 2, x + 2, ck, ik);
         for (; x < w; x += 2)
@@ -967,8 +1460,39 @@ static int debayer_hacd_impl(uint16_t *rgb, const uint16_t *bayer, int w, int h,
                                       debayer_hacd_reflect(x - 2, w), debayer_hacd_reflect(x + 2, w), ck, ik);
     }
 
-    #pragma omp parallel for if(threads > 1) num_threads(threads)
-    for (int y = 0; y < h; ++y)
+    /* r15 (pace): row pairs through debayer_hacd_rowpair, which also runs the selected [1 2 1] of each finished row
+     * (filtered != NULL); a thread whose scratch cannot be allocated runs the same rows through the per-row reference
+     * and the tiled [1 2 1] (the same words). */
+    const float sel[2] = { aR, aB };
+    #pragma omp parallel if(threads > 1) num_threads(threads)
+    {
+        int *rbuf = (int *)malloc(((size_t)w * 10u + 32u) * sizeof(int));
+        #pragma omp for
+        for (int k = 0; k < (h + 1) / 2; ++k)
+        {
+            if (rbuf)
+            {
+                debayer_hacd_rowpair(rgb, filtered, bayer, dif, w, h, 2 * k, keep, aR, cR, aB, cB, rbuf);
+                continue;
+            }
+            for (int y = 2 * k; y < 2 * k + 2 && y < h; ++y)
+            {
+                debayer_hacd_rows_ref(rgb, bayer, dif, w, h, y, keep, aR, cR, aB, cB);
+                if (filtered)
+                    for (int x0 = 0; x0 < w; x0 += DEBAYER_H121_TILE)
+                        debayer_hchroma121_sel_tile(filtered + (size_t)y * (size_t)w * 3u, rgb + (size_t)y * (size_t)w * 3u,
+                                                    w, x0, MIN(DEBAYER_H121_TILE, w - x0), sel, keep);
+            }
+        }
+        free(rbuf);
+    }
+    return 1;
+}
+
+/* The per-row reference of the stages after the site pass (r10 px, r12 select, r11 range), as r14 ran them. */
+static void debayer_hacd_rows_ref(uint16_t *rgb, const uint16_t *bayer, const float *dif, int w, int h, int y,
+                                  int keep, float aR, float cR, float aB, float cB)
+{
     {
         const size_t ro = (size_t)y * (size_t)w;
         const size_t uo = (size_t)debayer_hacd_reflect(y - 1, h) * (size_t)w;
@@ -991,24 +1515,21 @@ static int debayer_hacd_impl(uint16_t *rgb, const uint16_t *bayer, int w, int h,
         debayer_hacd_select_row(out, bayer, dif, w, h, y, keep, aR, aB);
         debayer_hacd_range_row(out, bayer, w, h, y, keep);
     }
-    return 1;
 }
 
 int debayer_reduced_hacd_chroma_rgb16(uint16_t *rgb, const uint16_t *bayer, int w, int h, int threads,
                                       float *scratch)
 {
-    return debayer_hacd_impl(rgb, bayer, w, h, threads, scratch, NULL, NULL);
+    return debayer_hacd_impl(rgb, NULL, bayer, w, h, threads, scratch);
 }
 
+/* r15 (pace): the selected, ranged [1 2 1] runs inside debayer_hacd_impl on each finished row (the same words the
+ * separate pass over rgb wrote: the filter reads one row only). */
 int debayer_reduced_hacd_chroma121_rgb16(uint16_t *filtered, uint16_t *rgb, const uint16_t *bayer, int w, int h,
                                          int threads, float *scratch)
 {
     if (!filtered) return 0;
-    float sel[2] = { 1.0f, 1.0f };
-    int keep = 3;
-    if (!debayer_hacd_impl(rgb, bayer, w, h, threads, scratch, sel, &keep)) return 0;
-    debayer_reduced_hchroma121_impl(filtered, rgb, w, h, threads, 1, sel, keep);
-    return 1;
+    return debayer_hacd_impl(rgb, filtered, bayer, w, h, threads, scratch);
 }
 
 typedef struct
