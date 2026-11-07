@@ -2251,29 +2251,42 @@ TEST(GpuDualIsoPreviewScale, CpuReducedX4ConstantChannelSurvivesTheComposition)
 }
 
 // H2C-PORT-1 r12, adversary pass 9 advisory A2 (pre-existing, debayer.c:507): a reduced Bayer one row high passed the
-// plain branch's checks, and debayerBasicU16's bottom-row copy then read 192 words before the output (row -1). Video
-// 128x96, bilinear; Bayer 64x1 of 10000 at x2 into a full 64 x 48 x 3 output placed after a guard region. Required:
-// the entry refuses it (returns 0) with the output, the guard and the dims untouched; 64x2 is still taken.
+// plain branch's checks, and debayerBasicU16's bottom-row copy then read 192 words before the output (row -1).
+// r12 pass 1 advisory A2 (pre-existing, video_mlv.c:7224): the class is wider. debayerBasicU16 reconstructs whole row
+// pairs from row 1, so under 4 rows it reconstructs none, and at an odd height row h - 2 is never written; the entry
+// returned 1 and the pad spread the output's previous contents. The plain branch now refuses what the filtered branch
+// already refuses (under 4 rows, odd). Video 128x96, bilinear; Bayer 64 x {1, 2, 3, 5, 7} of 10000 at x2 into a full
+// 64 x 48 x 3 output placed after a guard region: each is refused (returns 0) with the output, the guard and the
+// dims untouched. 64 x 4 is taken, and every word of it is 10000.
 TEST(GpuDualIsoPreviewScale, CpuReducedOneRowBayerIsRefused)
 {
     R12BareVideo bare(128, 96, 1);
     ASSERT_TRUE(bare.video != nullptr);
     const int bw = 64;
     const size_t guard = static_cast<size_t>(bw) * 3u, frame = static_cast<size_t>(bw) * 48u * 3u;
+    bool allOk = true;
+    for (const int rows : { 1, 2, 3, 5, 7 })
+    {
+        std::vector<uint16_t> buf(guard + frame, 0xBEEFu);
+        std::vector<uint16_t> bayer(static_cast<size_t>(bw) * static_cast<size_t>(rows), 10000u);
+        int w = -1, h = -1;
+        const int got = getMlvRawFrameDebayeredFromReducedReconnedRaw16(bare.video, 1, bayer.data(), bw, rows, 2,
+                                                                         buf.data() + guard, 1, &w, &h);
+        const bool untouched = std::all_of(buf.begin(), buf.end(), [](uint16_t v) { return v == 0xBEEFu; });
+        std::printf("[h2c-short-bayer] 64x%d at x2: entry %d (want 0), buffer untouched %d, dims %d x %d (want -1 x -1)\n",
+                    rows, got, untouched ? 1 : 0, w, h);
+        allOk = allOk && got == 0 && untouched && w == -1 && h == -1;
+    }
     std::vector<uint16_t> buf(guard + frame, 0xBEEFu);
-    std::vector<uint16_t> one(static_cast<size_t>(bw), 10000u);
+    std::vector<uint16_t> four(static_cast<size_t>(bw) * 4u, 10000u);
     int w = -1, h = -1;
-    const int got = getMlvRawFrameDebayeredFromReducedReconnedRaw16(bare.video, 1, one.data(), bw, 1, 2, buf.data() + guard,
-                                                                     1, &w, &h);
-    const bool untouched = std::all_of(buf.begin(), buf.end(), [](uint16_t v) { return v == 0xBEEFu; });
-    std::printf("[h2c-one-row] 64x1 at x2: entry %d (want 0), buffer untouched %d, dims %d x %d (want -1 x -1)\n", got,
-                untouched ? 1 : 0, w, h);
-    ASSERT_EQ(0, got);
-    ASSERT_TRUE(untouched);
-    ASSERT_EQ(-1, w);
-    std::vector<uint16_t> two(static_cast<size_t>(bw) * 2u, 10000u);
-    ASSERT_EQ(1, getMlvRawFrameDebayeredFromReducedReconnedRaw16(bare.video, 1, two.data(), bw, 2, 2, buf.data() + guard,
+    ASSERT_EQ(1, getMlvRawFrameDebayeredFromReducedReconnedRaw16(bare.video, 1, four.data(), bw, 4, 2, buf.data() + guard,
                                                                  1, &w, &h));
+    const bool flat = std::all_of(buf.begin() + static_cast<std::ptrdiff_t>(guard), buf.end(),
+                                  [](uint16_t v) { return v == 10000u; });
+    std::printf("[h2c-short-bayer] 64x4 at x2: taken, every output word 10000 %d\n", flat ? 1 : 0);
+    ASSERT_TRUE(allOk);
+    ASSERT_TRUE(flat);
 }
 
 // H2C-PORT-1 RED 3: the route. At x4 the CPU plan's Bayer is at x2 (fullWidth / 2 x
