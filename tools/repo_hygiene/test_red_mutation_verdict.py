@@ -727,6 +727,41 @@ class AllowlistR7(unittest.TestCase):
             self.assertIn("COULD-NOT-CHECK", why)
         self.assertEqual(rmv.main(["probe", "--bug", "3.0", "--fix", "1e3", "--window", "999", "1001"]), 0)  # control
 
+    # ---- r7 adversary pass on a7e41ffc: A1 (no closing bar), A2 (no summary section), A3 (empty id segments) ---------------
+    def test_r7_adversary2_a1_a_short_summary_with_no_final_result_bar_is_refused(self) -> None:
+        cut = "=== short test summary info ===\nFAILED t.py::test_x - AssertionError\n"
+        self.cnc(cut, "t.py::test_x", "short-summary line")
+        done = cut + "=== 1 failed in 0.1s ===\n"
+        self.assertEqual(rmv.verdict(done, "t.py::test_x")[0], rmv.PASS, done)  # control: the closing bar makes it readable
+        for columns in self.WIDTHS:
+            out = _run_pytest({"test_t.py": "def test_x(): assert False\n"}, "--tb=no", columns=columns)
+            self.assertEqual(rmv.verdict(out, "test_t.py::test_x")[0], rmv.PASS, out)
+            lines = out.rstrip("\n").splitlines()
+            self.cnc("\n".join(lines[:-1]) + "\n", "test_t.py::test_x", "short-summary line")  # the real run, bar cut off
+
+    def test_r7_adversary2_a2_a_run_without_a_summary_section_still_has_to_reconcile_its_passes(self) -> None:
+        text = "=== FAILURES ===\n___ test_x ___\nE assert False\nt.py:2: AssertionError\n=== 1 failed, 1 passed in 0.1s ===\n"
+        self.cnc(text, "t.py:2", "-rA")
+        for label in ("skipped", "xfailed", "xpassed"):
+            self.cnc(text.replace("1 passed", f"1 {label}"), "t.py:2", "-rA")
+        for columns in self.WIDTHS:  # the real runner: -rN prints no summary section at all
+            out = _run_pytest({"test_t.py": "def test_x(): assert False\ndef test_ok(): pass\n"}, "-rN", columns=columns)
+            self.assertNotIn("short test summary", out)
+            self.cnc(out, "test_t.py:1", "-rA")
+            alone = _run_pytest({"test_t.py": "def test_x(): assert False\n"}, "-rN", columns=columns)
+            self.assertEqual(rmv.verdict(alone, "test_t.py:1")[0], rmv.PASS, alone)  # control: nothing hidden, file:line
+
+    def test_r7_adversary2_a3_an_empty_segment_in_a_passed_xfail_or_skipped_id_is_refused(self) -> None:
+        for line, label in (("PASSED t.py::::test_ok", "passed"), ("PASSED t.py::test_ok::", "passed"),
+                            ("PASSED a//t.py::test_ok", "passed"), ("XFAIL t.py::::test_ok", "xfailed"),
+                            ("XPASS t.py::test_ok::", "xpassed"), ("SKIPPED [1] a//t.py:3: r", "skipped")):
+            text = (f"=== short test summary info ===\n{line}\nFAILED t.py::test_x - AssertionError\n"
+                    f"=== 1 failed, 1 {label} in 0.1s ===\n")
+            self.cnc(text, "t.py::test_x", "short-summary line")
+        ok = ("=== short test summary info ===\nPASSED t.py::test_ok\nFAILED t.py::test_x - AssertionError\n"
+              "=== 1 failed, 1 passed in 0.1s ===\n")
+        self.assertEqual(rmv.verdict(ok, "t.py::test_x")[0], rmv.PASS, ok)  # control
+
     def test_r6_open_a5_decimal_and_fraction_overflow_and_underflow_are_refused(self) -> None:
         from decimal import Decimal
         from fractions import Fraction

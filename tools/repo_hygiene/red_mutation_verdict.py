@@ -49,7 +49,9 @@ REFUSED with a reason that starts ``COULD-NOT-CHECK (<typed reason>)``. That is 
   <file.ext> - <message>`` is the one shape without ``::name``), ``PASSED <id>`` alone, ``SKIPPED [n] file:line:
   reason``, ``XFAIL``/``XPASS <id>``. The lines come in the ``-rA`` order (PASSED, SKIPPED, XFAIL, XPASS, then
   ERROR/FAILED), with no blank line, no other line and no rule line between the header and the final result bar, and
-  nothing after that bar. Their counts equal the runner's own: FAILED+ERROR lines the failed+errored count, and the
+  nothing after that bar (a summary with no closing bar is refused, and so is an id with an empty segment in any
+  line). Their counts equal the runner's own, and this holds with no summary section too (``-rN``): a bar that counts
+  a pass while no PASSED line lists it is COULD-NOT-CHECK, so ``-rN`` is readable only for a run with no passes: FAILED+ERROR lines the failed+errored count, and the
   PASSED/SKIPPED/XFAIL/XPASS lines the passed/skipped/xfailed/xpassed counts, ZERO INCLUDED, so a default (``-rfE``)
   run that counts a pass but lists none is COULD-NOT-CHECK: a forged ``PASSED`` continuation of a multi-line id could
   stand in for the real passes that run omits. Run the mutation with ``-rA``. A multi-line, non-ASCII, over-long or
@@ -449,11 +451,17 @@ def _other_line(word: str, line: str) -> tuple[int, str]:
         return 0, f"{word} line with a non-ASCII or control character"
     if word == "SKIPPED":
         m = _SKIPPED_BODY.fullmatch(body)
-        return (int(m[1]), "") if m else (0, "a SKIPPED line that is not `SKIPPED [n] file:line: reason`")
+        if not m:
+            return 0, "a SKIPPED line that is not `SKIPPED [n] file:line: reason`"
+        if _empty_segment(body[m.end(1) + 2:].split(":", 1)[0]):
+            return 0, "a SKIPPED line whose file path has an empty segment"
+        return int(m[1]), ""
     if not _OTHER_NODE.fullmatch(body):
         return 0, f"a {word} line that is not `{word} <file>::<name>`"
     if word == "PASSED" and " - " in body:
         return 0, "a PASSED line holding ' - ' (a real one is `PASSED <id>` alone)"
+    if _empty_segment(body.split(" - ", 1)[0]):
+        return 0, f"a {word} line whose id has an empty segment (`::::`, a trailing `::`, `//`): no such id exists"
     return 1, ""
 
 
@@ -606,6 +614,9 @@ def _parse_pytest(text: str, stats: dict | None = None) -> list[Failure]:
         if m_loc:
             cur["frames"].append((m_loc["file"], _line_no(m_loc["line"])))
     close()
+    if stats["has_summary"] and not after_result:
+        # The summary is closed by the runner's own result bar; without it the counts cannot be reconciled at all.
+        stats["bad"] = stats["bad"] or "the short summary is not closed by a final result bar (a cut-off or forged log?)"
     msgs = dict(nodes)
     for f in out:
         f.assertion = bool(f.assertion) and not f.collection
@@ -702,7 +713,7 @@ def _count_mismatch(text: str, ut_blocks: int, stats: dict) -> str:
             # real ones the runner counts. The lines must add up to the runner's own count, zero included.
             stated = re.search(rf"\b(\d+) {label}\b", last)
             shown = int(stated[1]) if stated else 0
-            if stats["has_summary"] and stats["words"][word] != shown:
+            if stats["words"][word] != shown:  # also with no summary section at all (-rN): the passes are still unlisted
                 hint = (": this summary lists none of them, so the run was not made with -rA (default reporting omits "
                         "PASSED/SKIPPED/XFAIL/XPASS lines)" if not stats["words"][word] else " (a multi-line test id?)")
                 return (f"short-summary line: {stats['words'][word]} {word} lines were read but the runner counts "
