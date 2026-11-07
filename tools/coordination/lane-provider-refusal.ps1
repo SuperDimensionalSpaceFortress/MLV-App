@@ -113,6 +113,27 @@ function Split-LaneJsonLines {
     return [regex]::Split($Text, '\r\n|[\r\n]')
 }
 
+# ONE definition of a BLANK character for every whitespace decision on the terminal-candidate path (r7, Dot B1): JSON
+# whitespace, every other Unicode whitespace (\s: U+00A0, U+1680, U+2000..U+200A, U+202F, U+205F, U+3000, U+0085, LS, PS,
+# VT, FF), format characters (Cf: U+200B, U+FEFF, U+2060, the U+E0001..U+E007F tags) and control characters (Cc). A
+# JSON-whitespace-only trim let '"no verdict issued"' + U+00A0 fail the strict scalar parse, read the NBSP as words after
+# the string (prose), and resurrect an earlier fenced approval. The candidate TEXT handed to the strict parse is never
+# trimmed by this: a blank character INSIDE or right after a JSON value still fails the parse, which refuses closed.
+# The H form excludes CR and LF so a line-start prefix never spans a line.
+$script:LANE_BLANK_UNIT = '(?:[\s\p{Cf}\p{Cc}]|\uDB40[\uDC01-\uDC7F])'
+$script:LANE_HBLANK_UNIT = '(?:[\s\p{Cf}\p{Cc}-[\r\n]]|\uDB40[\uDC01-\uDC7F])'
+$script:LANE_BLANK_EDGES_RX = [regex]('^' + $script:LANE_BLANK_UNIT + '+|' + $script:LANE_BLANK_UNIT + '+\z')
+$script:LANE_FENCE_OPEN_RX = [regex]('^' + $script:LANE_HBLANK_UNIT + '*(`{3,}|~{3,})')
+$script:LANE_FENCE_CLOSE_RX = [regex]('^' + $script:LANE_HBLANK_UNIT + '*(`{3,}|~{3,})' + $script:LANE_HBLANK_UNIT + '*\z')
+$script:LANE_TOP_LEVEL_RX = [regex]('(?m)^' + $script:LANE_HBLANK_UNIT + '*[\{\["]')
+
+# The text with every BLANK character removed from both ends; '' for a null, empty or all-blank text.
+function Get-LaneBlankTrimmed {
+    param([AllowEmptyString()][AllowNull()][string]$Text)
+    if ([string]::IsNullOrEmpty($Text)) { return '' }
+    return $script:LANE_BLANK_EDGES_RX.Replace($Text, '')
+}
+
 function Find-ClaudeResultEnvelope {
     param([AllowEmptyString()][AllowNull()][string]$Answer)
     if ([string]::IsNullOrWhiteSpace($Answer)) { return $null }
@@ -198,12 +219,51 @@ function Test-LaneAnswerHasSubstance {
 function Test-PromptDemandsVerdict {
     param([AllowEmptyString()][AllowNull()][string]$Prompt)
     if ([string]::IsNullOrEmpty($Prompt)) { return $false }
-    # r6 pass 2 (adversary A1): the key must sit in a spelled JSON OBJECT, so an opening brace comes before it. A prompt that
-    # only quotes the field ('Reply with exactly: "verdict":') is a literal-output probe, not a verdict demand. IndexOf then one
-    # match keeps it linear in the prompt length.
-    $open = $Prompt.IndexOf('{')
-    if ($open -lt 0) { return $false }
-    return [regex]::IsMatch($Prompt.Substring($open), '"verdict"\s*:')
+    # r6 pass 2 (adversary A1): a prompt that only quotes the field ('Reply with exactly: "verdict":') is a literal-output
+    # probe, not a verdict demand. r7 (r6 pass 3 A1 = Dot B2): "a brace somewhere before the key" is not enough either, because
+    # ANY earlier brace satisfied it ('The symbol { is punctuation. ... "verdict":', 'Ignore the example {}. ... "verdict":').
+    # A demand is a "verdict" KEY that is a top-level MEMBER of an object a brace opens AND closes:
+    #   - the key is a string at depth 1 of that object (not nested in an array, not inside a string value), preceded there
+    #     by the opening brace or a comma (a member-name position) and followed by a colon;
+    #   - the object closes: an unclosed punctuation brace never spelled an object, and a closed {} without the key is not one.
+    # Every '{' opens a candidate, so a nested object ({"result": {"verdict": ...}}) and an object after a stray brace or
+    # after a code block still count. Prompt text is prose around the spelled object, so the scan is lenient where JSON is
+    # strict: strings are tracked only inside a bracket, a raw line break ends a string, an unmatched closer is ignored, and
+    # values need not be valid JSON ("APPROVE"|"CHANGES_REQUESTED", <placeholder>, ...). One pass: linear in the length.
+    if ($Prompt.IndexOf('"verdict"', [System.StringComparison]::Ordinal) -lt 0) { return $false }
+    $stack = New-Object System.Collections.Generic.List[object]
+    $inStr = $false; $esc = $false; $strStart = -1; $strPrev = [char]0; $pendingKey = $false
+    for ($i = $Prompt.IndexOf('{'); $i -ge 0 -and $i -lt $Prompt.Length; $i++) {
+        $ch = $Prompt[$i]
+        if ($stack.Count -eq 0) {
+            if ($ch -ceq '{') { $stack.Add(@{ kind = [char]'{'; last = [char]'{'; hasKey = $false }) }
+            continue
+        }
+        $top = $stack[$stack.Count - 1]
+        if ($inStr) {
+            if ($esc) { $esc = $false; continue }
+            if ($ch -ceq [char]92) { $esc = $true; continue }
+            if ($ch -ceq [char]10 -or $ch -ceq [char]13) { $inStr = $false; $top.last = [char]34; continue }
+            if ($ch -ceq [char]34) {
+                $inStr = $false; $top.last = [char]34
+                $pendingKey = ($top.kind -ceq '{' -and ($strPrev -ceq '{' -or $strPrev -ceq ',') -and
+                    [string]::Equals($Prompt.Substring($strStart + 1, $i - $strStart - 1), 'verdict', [System.StringComparison]::Ordinal))
+            }
+            continue
+        }
+        if ([char]::IsWhiteSpace($ch)) { continue }
+        if ($pendingKey) { $pendingKey = $false; if ($ch -ceq ':') { $top.hasKey = $true } }
+        if ($ch -ceq [char]34) { $inStr = $true; $strStart = $i; $strPrev = $top.last; continue }
+        if ($ch -ceq '{' -or $ch -ceq '[') { $stack.Add(@{ kind = $ch; last = $ch; hasKey = $false }); continue }
+        if (($ch -ceq '}' -and $top.kind -ceq '{') -or ($ch -ceq ']' -and $top.kind -ceq '[')) {
+            if ($top.hasKey) { return $true }
+            $stack.RemoveAt($stack.Count - 1)
+            if ($stack.Count -gt 0) { $stack[$stack.Count - 1].last = $ch }
+            continue
+        }
+        $top.last = $ch
+    }
+    return $false
 }
 
 # A JSON OBJECT, strictly (KERNEL-K4 r3, adversary A3): System.Text.Json with its defaults (no comments, no
@@ -375,7 +435,7 @@ function Find-LaneJsonValueEnd {
 function Test-LaneUnterminatedStringLine {
     param([AllowEmptyString()][AllowNull()][string]$Line)
     if ([string]::IsNullOrEmpty($Line)) { return $false }
-    $t = $Line.Trim([char[]](9, 10, 13, 32))
+    $t = Get-LaneBlankTrimmed -Text $Line   # r7: one blank definition on this path
     if ($t.Length -eq 0 -or $t[0] -cne [char]34) { return $false }
     for ($i = 1; $i -lt $t.Length; $i++) {
         if ($t[$i] -ceq [char]92) { $i++; continue }
@@ -387,7 +447,9 @@ function Test-LaneUnterminatedStringLine {
 function Get-LaneLastTopLevelJson {
     param([AllowEmptyString()][AllowNull()][string]$Text)
     if ([string]::IsNullOrEmpty($Text)) { return $null }
-    $rx = [regex]'(?m)^[ \t]*[\{\["]'
+    # r7 (Dot B1 class): a value starts after any BLANK line prefix, not only space / tab, so U+00A0 + '{"findings":[]}' after a
+    # fenced approval is the last value and outranks it instead of being skipped as prose.
+    $rx = $script:LANE_TOP_LEVEL_RX
     $p = 0; $start = -1; $end = -1
     while ($p -lt $Text.Length) {
         $m = $rx.Match($Text, $p)
@@ -407,7 +469,8 @@ function Get-LaneLastTopLevelJson {
     }
     if ($start -lt 0) { return $null }
     $tailText = $Text.Substring($start)
-    # Only JSON whitespace may follow the value (r3c): a trailing NBSP / NEL / LS / PS is garbage, not a blank tail.
+    # Only JSON whitespace may follow the value (r3c): a trailing NBSP / NEL / LS / PS is garbage, not a blank tail. r7 keeps
+    # this deliberately: the garbage stays IN the candidate text, so the strict parse fails and the answer is refused closed.
     if ($end -ge 0 -and $Text.Substring($end + 1).Trim([char[]](9, 10, 13, 32)).Length -eq 0) { $tailText = $Text.Substring($start, $end - $start + 1) }
     return [pscustomobject]@{ text = $tailText; offset = $start; closed = ($end -ge 0) }
 }
@@ -427,7 +490,9 @@ function Test-LaneQuoteLedLineIsMalformedValue {
         if ($ch -ceq [char]34) { $close = $i; break }
     }
     if ($close -lt 0) { return $true }
-    return ($Line.Substring($close + 1).Trim([char[]](9, 10, 13, 32)).Length -eq 0)
+    # r7 (Dot B1): "nothing after the string" means nothing but BLANK characters. A JSON-whitespace-only trim read a trailing
+    # U+00A0 as words, so '"no verdict issued"' + NBSP was prose and the earlier fenced approval came back.
+    return ((Get-LaneBlankTrimmed -Text $Line.Substring($close + 1)).Length -eq 0)
 }
 
 # Get-LaneTerminalCandidate: the ONE selector of an answer's terminal JSON candidate, by POSITION across
@@ -455,8 +520,10 @@ function Get-LaneTerminalCandidate {
     for ($i = 0; $i -lt $lines.Count; $i++) {
         $ln = $lines[$i]
         if (-not $inBlock) {
-            if ($ln -match '^[ \t]*(`{3,}|~{3,})') {
-                $marker = $Matches[1]
+            # r7: a fence line may be indented by any BLANK characters (one definition on this path), open and close alike
+            $fm = $script:LANE_FENCE_OPEN_RX.Match($ln)
+            if ($fm.Success) {
+                $marker = $fm.Groups[1].Value
                 $enclosing = Get-LaneLastTopLevelJson -Text ($unf -join "`n")
                 if ($null -ne $enclosing -and -not $enclosing.closed) { $unf.Add($ln); continue }
                 $inBlock = $true; $fenceChar = $marker.Substring(0, 1); $fenceLen = $marker.Length
@@ -466,7 +533,8 @@ function Get-LaneTerminalCandidate {
             $unf.Add($ln)
             continue
         }
-        if ($ln -match '^[ \t]*(`{3,}|~{3,})[ \t]*$' -and $Matches[1].Substring(0, 1) -ceq $fenceChar -and $Matches[1].Length -ge $fenceLen) {
+        $fc = $script:LANE_FENCE_CLOSE_RX.Match($ln)
+        if ($fc.Success -and $fc.Groups[1].Value.Substring(0, 1) -ceq $fenceChar -and $fc.Groups[1].Value.Length -ge $fenceLen) {
             $inBlock = $false
             $lastFence = [pscustomobject]@{ text = ($cur -join "`n"); startLine = $curStart; endLine = $i }
             $unf.Clear()
@@ -493,7 +561,9 @@ function Get-LaneTerminalCandidate {
         # in for it. It is the last scalar by POSITION, so prose after it ("null" then "Done.") does not demote it; a
         # scalar line inside the bracket value is part of that value (the scan stops at its last line).
         for ($li = $lines.Count - 1; $li -ge $firstTail -and $li -gt $candEnd; $li--) {
-            $lt = $lines[$li].Trim([char[]](9, 10, 13, 32))
+            # r7 (Dot B1): trim every BLANK character, not JSON whitespace only. 'null' + U+00A0 or U+3000 + '"x"' is the same
+            # terminal value as without them; JSON-only trimming made it fail the scalar parse and read as prose.
+            $lt = Get-LaneBlankTrimmed -Text $lines[$li]
             if ($lt.Length -eq 0 -or $lt -notmatch '^(null|true|false|-?[0-9]|")') { continue }
             # r4 pass 2 (A1): a line that OPENS a JSON string but is not a complete one is a malformed terminal value (the
             # strict object parse rejects it), never prose; null / true / false / digits that are not a complete scalar
@@ -501,7 +571,7 @@ function Get-LaneTerminalCandidate {
             # r6 (adversary A1): a quote-led line is malformed only when its string never closes, or closes with nothing after it
             # (a complete valid string already passed as a scalar above). A closed string followed by words ('"Approve" is my
             # verdict.') is prose, so it does not replace a valid earlier verdict.
-            if ((Test-LaneJsonScalar -Text $lt) -or ($lt.StartsWith('"') -and (Test-LaneQuoteLedLineIsMalformedValue -Line $lt))) { return [pscustomobject]@{ form = 'unfenced'; text = $lt; startLine = $li } }
+            if ((Test-LaneJsonScalar -Text $lt) -or ($lt[0] -ceq [char]34 -and (Test-LaneQuoteLedLineIsMalformedValue -Line $lt))) { return [pscustomobject]@{ form = 'unfenced'; text = $lt; startLine = $li } }
         }
         if ($null -ne $c) { return [pscustomobject]@{ form = 'unfenced'; text = $c.text; startLine = $candStart } }
     }
@@ -579,7 +649,8 @@ function Get-LaneWorkEvidence {
             # the historical reason.
             $vf = Get-LaneContractField -Object $fin -Name 'verdict'
             if ($vf.present -and -not $vf.ok -and $vf.kind -ne 'Null') { $rec.reason = "codex-verdict-wrong-kind-$($vf.kind)"; return $rec }
-            if (-not $vf.ok -or [string]::IsNullOrWhiteSpace([string]$vf.value)) { $rec.reason = 'codex-no-verdict'; return $rec }
+            # r7 (Dot B1 class): blank is the ONE blank definition; IsNullOrWhiteSpace let a verdict of only U+200B / U+FEFF count
+            if (-not $vf.ok -or (Get-LaneBlankTrimmed -Text ([string]$vf.value)).Length -eq 0) { $rec.reason = 'codex-no-verdict'; return $rec }
         }
     }
     $rec.workCompleted = $true

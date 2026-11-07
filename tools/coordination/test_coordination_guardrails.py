@@ -2498,6 +2498,116 @@ def test_r6_adv_a1_closed_quoted_prose_after_the_last_fence_is_prose_not_a_malfo
         assert r["workCompleted"] is False and r["reason"] == "codex-no-verdict", (tail, r)
 
 
+def _work_evidence_many(tmp_path, answers, prompt_chars=600, require_verdict=True):
+    # One pwsh for many answers (the r7 whitespace variants), each through the real Get-LaneWorkEvidence.
+    srcs = []
+    for n, a in enumerate(answers):
+        p = tmp_path / f"many-{n}.txt"
+        p.write_text(a, encoding="utf-8", newline="")
+        srcs.append(str(p))
+    lst = tmp_path / "many.list"
+    lst.write_text("\n".join(srcs), encoding="utf-8")
+    rv = " -RequireVerdict" if require_verdict else ""
+    cmd = (
+        f". '{REFUSAL_HELPER}'; "
+        f"foreach ($f in [IO.File]::ReadAllLines('{lst}')) {{ $a = [IO.File]::ReadAllText($f); "
+        f"Get-LaneWorkEvidence -Engine codex -Answer $a -ExitCode 0 -PromptChars {prompt_chars}{rv} | ConvertTo-Json -Compress }}"
+    )
+    out = subprocess.run(["pwsh", "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", cmd],
+                         text=True, capture_output=True)
+    assert out.returncode == 0, out.stderr
+    lines = [ln for ln in out.stdout.strip().splitlines() if ln.startswith("{")]
+    assert len(lines) == len(answers), out.stdout
+    return [json.loads(ln) for ln in lines]
+
+
+# r7 F1 = r6 OPEN A1 = Dot B2 (lane-provider-refusal.ps1 Test-PromptDemandsVerdict): "a '{' somewhere before the key" is
+# satisfied by ANY earlier brace, so a literal-output probe that names a brace (or closes an unrelated object) demanded a
+# verdict and its exact requested answer was booked codex-no-verdict / ended-incomplete.
+R7_F1_PROMPTS = [
+    'The symbol { is punctuation. Reply with exactly these 10 characters: "verdict":',  # adversary-a96b095b.json A1
+    'Ignore the example {}. Reply with exactly these 10 characters: "verdict":',        # Dot B2, 73 characters
+]
+
+
+def test_r7_f1_an_unrelated_brace_before_a_quoted_field_is_not_a_verdict_demand(tmp_path):
+    for prompt in R7_F1_PROMPTS:
+        # the REAL completion path: Invoke-Lane's K4-EVIDENCE block decides the demand from the prompt itself
+        w = _run_invoke_lane_codex_wiring(tmp_path, '"verdict":', "", "", prompt)
+        assert w["evidence"]["workCompleted"] is True, (prompt, w)
+        assert not _prompt_demands_verdict(tmp_path, prompt), prompt
+
+
+def test_r7_f1_a_verdict_demand_is_a_verdict_key_inside_the_object_a_brace_opens(tmp_path):
+    # still demands: the key is a top-level member of an object that a brace opens and closes, wherever it sits
+    for prompt in ('Final json:\n{"verdict":"APPROVE|CHANGES_REQUESTED","reviewer":"sol"}',
+                   '{ "verdict" : "CLEAN|FINDINGS" }',
+                   'End with {"schema":"adversary-pass.v1", "verdict": "CLEAN" | "FINDINGS", "findings": [...]}',
+                   'Unrelated {} first, then the final json {"verdict": "APPROVE"}',
+                   'A stray { brace, then: {"verdict": "APPROVE"}',
+                   'Wrapped: {"result": {"verdict": "APPROVE"}}',
+                   'Code: if ($x) { $y = 1 } then reply {"verdict": "APPROVE"}'):
+        assert _prompt_demands_verdict(tmp_path, prompt), prompt
+    # not a demand: the key is not a member of an object a brace opens
+    for prompt in ('A brace { then the words "verdict": and no close',
+                   'The example {"note": "say \\"verdict\\": here"} is a string, not a key',
+                   'The list ["verdict": 1] is an array',
+                   'Closed {"other": 1} then "verdict": outside it',
+                   'A member value {"note": "verdict": 1}'):
+        assert not _prompt_demands_verdict(tmp_path, prompt), prompt
+    # a genuine key prompt still holds a keyless answer to the verdict contract, end to end
+    key_prompt = 'Review.\nFinal json: {"verdict":"APPROVE|CHANGES_REQUESTED"}\n' + "x" * 600
+    w = _run_invoke_lane_codex_wiring(tmp_path, KEY_ANSWER_BODY * 3, "", "", key_prompt)
+    assert w["evidence"]["reason"] == "codex-no-verdict", w
+
+
+# r7 F2 = Dot B1 (lane-provider-refusal.ps1 terminal-candidate path): the terminal-line scan trimmed JSON whitespace only,
+# so '"no verdict issued"' + U+00A0 failed the strict scalar parse, the quote-led helper read the NBSP as "words after the
+# string" (prose), and the earlier fenced approval was resurrected (workCompleted=true). Every whitespace decision on that
+# path treats Unicode whitespace (and Cf format characters) like JSON whitespace, or refuses closed.
+R7_F2_PROV = R4_PROSE + '```json\n{"verdict":"APPROVE"}\n```\n'
+R7_F2_CODE_POINTS = ["\u00a0", "\ufeff", "\u2000", "\u2005", "\u200a", "\u200b", "\u202f", "\u205f", "\u3000",
+                     "\u1680", "\u0085", "\u2060", "\u000b", "\u000c", "\u001e"]
+
+
+def test_r7_f2_dot_b1_a_closed_string_then_nbsp_after_the_last_fence_is_the_terminal_value(tmp_path):
+    r = _work_evidence(tmp_path, "codex", R7_F2_PROV + '"no verdict issued"\u00a0\n', 0, prompt_chars=600, require_verdict=True)
+    assert r["workCompleted"] is False and r["reason"] == "codex-no-verdict", r
+
+
+def test_r7_f2_every_unicode_whitespace_code_point_on_the_terminal_line_refuses_closed(tmp_path):
+    cases = []
+    for cp in R7_F2_CODE_POINTS:
+        cases += [('"no verdict issued"' + cp, cp, "trailing after a closed string"),
+                  (cp + '"no verdict issued"', cp, "leading before a closed string"),
+                  ("null" + cp, cp, "trailing after a scalar"),
+                  (cp + "false", cp, "leading before a scalar"),
+                  (cp + '{"findings":[]}', cp, "leading before a final object")]
+    res = _work_evidence_many(tmp_path, [R7_F2_PROV + line + "\n" for line, _, _ in cases])
+    bad = [(hex(ord(cp)), what, r) for (line, cp, what), r in zip(cases, res)
+           if not (r["workCompleted"] is False and r["reason"] == "codex-no-verdict")]
+    assert not bad, bad
+
+
+def test_r7_f2_unicode_whitespace_never_turns_prose_into_a_value_or_hides_a_verdict(tmp_path):
+    # controls: words after a closed string stay prose whatever the whitespace, and a final verdict object still counts
+    cases = []
+    for cp in ("\u00a0", "\u3000", "\u200b"):
+        cases += ['"Approve" is my verdict.' + cp, '"Approve"' + cp + "is my verdict.", cp + "3 findings." + cp,
+                  cp + '{"verdict":"APPROVE"}']
+    res = _work_evidence_many(tmp_path, [R7_F2_PROV + line + "\n" for line in cases])
+    bad = [(line, r) for line, r in zip(cases, res) if r["workCompleted"] is not True]
+    assert not bad, bad
+
+
+def test_r7_f2_a_verdict_of_only_format_characters_is_blank(tmp_path):
+    # the verdict-value blank test is a whitespace decision too: U+200B / U+FEFF / U+2060 are no verdict
+    vals = ["\u200b", "\ufeff", "\u2060", "\u00a0\u200b", "\u3000"]
+    res = _work_evidence_many(tmp_path, [R4_PROSE + '{"verdict":"%s"}\n' % v for v in vals])
+    bad = [(hex(ord(v[0])), r) for v, r in zip(vals, res) if r["reason"] != "codex-no-verdict"]
+    assert not bad, bad
+
+
 def test_r4_adv2_a2_unrelated_metadata_that_cannot_be_read_never_erases_the_contract_evidence(tmp_path):
     # adversary r4 pass 2 A2: JsonDocument.Parse accepts a lone surrogate escape, GetString() on it throws, and the
     # builder returned null, so a real verdict / success envelope / 429 refusal was lost.
