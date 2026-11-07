@@ -76,7 +76,20 @@ function New-RefusalRecord {
 function Split-LaneLines {
     param([AllowEmptyString()][AllowNull()][string]$Text)
     if ([string]::IsNullOrEmpty($Text)) { return @() }
-    return [regex]::Split($Text, '\r\n|[\r\n' + [string][char]0x85 + [char]0x2028 + [char]0x2029 + ']')
+    # r5 (adversary A3): every Unicode mandatory line break, not only the ones seen first -- VT (U+000B), FF (U+000C) and
+    # FS / GS / RS (U+001C..U+001E, which str.splitlines also breaks on) joined two lines, so a later line's refusal
+    # vocabulary was attributed to the first ERROR line.
+    $seps = [string][char]0x0B + [char]0x0C + [char]0x1C + [char]0x1D + [char]0x1E + [char]0x85 + [char]0x2028 + [char]0x2029
+    return [regex]::Split($Text, '\r\n|[\r\n' + $seps + ']')
+}
+
+# String equality for a contract value (r5, adversary A1): ORDINAL and case-exact. PowerShell -eq / -ceq / -cne on two
+# strings use the invariant-culture comparer, which IGNORES zero-width and NUL characters ("res\u0000ult" -ceq "result"
+# is $true), so a diagnostic line could pass for the result envelope and "4\u00002\u00009" read as the status 429. A value
+# that is not a string equals nothing.
+function Test-LaneOrdinalEqual {
+    param($Value, [string]$Expected)
+    return (($Value -is [string]) -and [string]::Equals([string]$Value, $Expected, [System.StringComparison]::Ordinal))
 }
 
 # The line split for JSON text (KERNEL-K4 r3b, adversary A1): CRLF, LF and a bare CR only. NEL / LS / PS are legal
@@ -101,7 +114,7 @@ function Find-ClaudeResultEnvelope {
         # r3c (A4, advisory): type must BE the string "result"; [string]@('result') is also 'result', so an array-typed
         # diagnostic line was taken for the envelope and hid the real one behind it. r4: read through the contract, case-exact.
         $tf = Get-LaneContractField -Object $cand -Name 'type'
-        if (-not $tf.ok -or $tf.value -cne 'result') { continue }
+        if (-not $tf.ok -or -not (Test-LaneOrdinalEqual -Value $tf.value -Expected 'result')) { continue }
         return $cand
     }
     return $null
@@ -336,15 +349,41 @@ function Find-LaneJsonValueEnd {
 # '{' or '[' and run to their balancing bracket, so a nested '{' line inside an unfinished or finished root is
 # never a candidate of its own (adversary A4). Anything but whitespace after the last value, an unclosed last
 # value, and a non-object last value all yield text that fails the strict object parse. $null: no value.
+#
+# r5 (adversary A2): a line-start '"' whose string never closes on its line (a JSON string cannot span a raw newline)
+# is an UNFINISHED value too, exactly like an unclosed bracket: it runs to the end of the text, so nothing after it
+# stands in for it. A complete quoted line is a scalar and is skipped here (the terminal-scalar scan reads it); a quoted
+# line that closes but carries prose ("Approve" is my verdict.) is prose and is skipped as well.
+# The result also says whether the last value `closed` (a bracket value found its balancing bracket); an unclosed one is
+# the enclosing value of everything after it.
+function Test-LaneUnterminatedStringLine {
+    param([AllowEmptyString()][AllowNull()][string]$Line)
+    if ([string]::IsNullOrEmpty($Line)) { return $false }
+    $t = $Line.Trim([char[]](9, 10, 13, 32))
+    if ($t.Length -eq 0 -or $t[0] -cne [char]34) { return $false }
+    for ($i = 1; $i -lt $t.Length; $i++) {
+        if ($t[$i] -ceq [char]92) { $i++; continue }
+        if ($t[$i] -ceq [char]34) { return $false }
+    }
+    return $true
+}
+
 function Get-LaneLastTopLevelJson {
     param([AllowEmptyString()][AllowNull()][string]$Text)
     if ([string]::IsNullOrEmpty($Text)) { return $null }
-    $rx = [regex]'(?m)^[ \t]*[\{\[]'
+    $rx = [regex]'(?m)^[ \t]*[\{\["]'
     $p = 0; $start = -1; $end = -1
     while ($p -lt $Text.Length) {
         $m = $rx.Match($Text, $p)
         if (-not $m.Success) { break }
         $s = $m.Index + $m.Length - 1
+        if ($Text[$s] -ceq [char]34) {
+            $eol = $Text.IndexOfAny([char[]](10, 13), $s)
+            if ($eol -lt 0) { $eol = $Text.Length }
+            if (Test-LaneUnterminatedStringLine -Line $Text.Substring($s, $eol - $s)) { $start = $s; $end = -1; break }
+            $p = $eol
+            continue
+        }
         $e = Find-LaneJsonValueEnd -Text $Text -Start $s
         $start = $s; $end = $e
         if ($e -lt 0) { break }
@@ -354,7 +393,7 @@ function Get-LaneLastTopLevelJson {
     $tailText = $Text.Substring($start)
     # Only JSON whitespace may follow the value (r3c): a trailing NBSP / NEL / LS / PS is garbage, not a blank tail.
     if ($end -ge 0 -and $Text.Substring($end + 1).Trim([char[]](9, 10, 13, 32)).Length -eq 0) { $tailText = $Text.Substring($start, $end - $start + 1) }
-    return [pscustomobject]@{ text = $tailText; offset = $start }
+    return [pscustomobject]@{ text = $tailText; offset = $start; closed = ($end -ge 0) }
 }
 
 # Get-LaneTerminalCandidate: the ONE selector of an answer's terminal JSON candidate, by POSITION across
@@ -375,18 +414,28 @@ function Get-LaneTerminalCandidate {
     $inBlock = $false; $fenceChar = ''; $fenceLen = 0
     $cur = $null; $curStart = -1
     $lastFence = $null
+    # r5 (adversary A2): the unfenced lines since the last fence closed. A fence line that opens while the LAST value in
+    # them is unfinished (an unclosed bracket, or an unterminated quote-led line) is CONTENT of that value, never a fence: a
+    # nested draft must not replace the unfinished enclosing value it sits in.
+    $unf = New-Object System.Collections.Generic.List[string]
     for ($i = 0; $i -lt $lines.Count; $i++) {
         $ln = $lines[$i]
         if (-not $inBlock) {
             if ($ln -match '^[ \t]*(`{3,}|~{3,})') {
-                $inBlock = $true; $fenceChar = $Matches[1].Substring(0, 1); $fenceLen = $Matches[1].Length
+                $marker = $Matches[1]
+                $enclosing = Get-LaneLastTopLevelJson -Text ($unf -join "`n")
+                if ($null -ne $enclosing -and -not $enclosing.closed) { $unf.Add($ln); continue }
+                $inBlock = $true; $fenceChar = $marker.Substring(0, 1); $fenceLen = $marker.Length
                 $cur = New-Object System.Collections.Generic.List[string]; $curStart = $i
+                continue
             }
+            $unf.Add($ln)
             continue
         }
         if ($ln -match '^[ \t]*(`{3,}|~{3,})[ \t]*$' -and $Matches[1].Substring(0, 1) -ceq $fenceChar -and $Matches[1].Length -ge $fenceLen) {
             $inBlock = $false
             $lastFence = [pscustomobject]@{ text = ($cur -join "`n"); startLine = $curStart; endLine = $i }
+            $unf.Clear()
             continue
         }
         $cur.Add($ln)
@@ -461,8 +510,9 @@ function Get-LaneWorkEvidence {
         if ($null -eq $rec.isError -and $null -eq $rec.subtype) { $rec.reason = 'no-result-envelope'; return $rec }
         if ($null -eq $rec.isError) { $rec.reason = 'envelope-is-error-absent'; return $rec }
         if ($rec.isError -ne $false) { $rec.reason = 'envelope-is-error'; return $rec }
-        if ($rec.subtype -ne 'success') { $rec.reason = "subtype-$($rec.subtype)"; return $rec }
-        if ($rec.terminalReason -and $rec.terminalReason -ne 'completed') { $rec.reason = "terminal-reason-$($rec.terminalReason)"; return $rec }
+        # r5 (A1): ordinal, so a subtype or terminal_reason with a NUL or zero-width character inside is not the vocabulary
+        if (-not (Test-LaneOrdinalEqual -Value $rec.subtype -Expected 'success')) { $rec.reason = "subtype-$($rec.subtype)"; return $rec }
+        if ($rec.terminalReason -and -not (Test-LaneOrdinalEqual -Value $rec.terminalReason -Expected 'completed')) { $rec.reason = "terminal-reason-$($rec.terminalReason)"; return $rec }
     }
     # KERNEL-K4-CODEX-SILENT-EXIT0-COMPLETED-1: codex has no envelope, so its positive evidence is
     # the answer itself. Exit 0 with an empty answer is a lane that said nothing, not a lane that
@@ -523,14 +573,14 @@ function Get-ProviderRefusal {
         # as '' here, so an array-typed result never feeds the refusal vocabulary.
         $statusField = Get-LaneContractField -Object $j -Name 'api_error_status'
         $status  = if ($statusField.ok) { [string]$statusField.value } else { '' }
-        if (-not $isError -and $status -eq '') { return $null }
+        if (-not $isError -and $status.Length -eq 0) { return $null }
         $rf = Get-LaneContractField -Object $j -Name 'result'
         $msg  = if ($rf.ok) { [string]$rf.value } else { '' }
         $kind = Get-RefusalKind -Line $msg
         # Result TEXT never classifies a successful envelope (sol PR #117 BLOCKER): with is_error=false only
         # the numeric 429 status counts. 134 recorded envelopes never pair is_error=false with a status.
         if (-not $isError) { $kind = $null }
-        if ($null -eq $kind -and $status -eq '429') { $kind = 'provider-rate-limit' }
+        if ($null -eq $kind -and (Test-LaneOrdinalEqual -Value $status -Expected '429')) { $kind = 'provider-rate-limit' }
         if ($null -eq $kind) { return $null }
         return New-RefusalRecord -Kind $kind -Engine $Engine -Match ("api_error_status=$status " + $msg)
     }
