@@ -1480,6 +1480,43 @@ class RunnerMetadataR11(unittest.TestCase):
         self.assertEqual(rmv.classify(ut, "a//t.py:8").code, "cnc-expectation")
         self.assertEqual(rmv.classify(ut, "a/t.py:8").status, rmv.PASS)
 
+    def test_frame_delimiter_count_only_on_frame_lines(self) -> None:
+        # r12 (Dot e3f43d7, request 6711763476): the `", line ` count ran on EVERY indented line, so a source line that
+        # holds the text was refused as cnc-frame before it was known to be a frame. It runs on frame lines only.
+        for src in ("""    self.fail('", line 1, ", line 2')""", """    x = '", line 1' + '", line 2'"""):
+            with self.subTest(src=src):
+                ut = _ut_text("FAILED (failures=1)").replace("    self.assertEqual(3, 4)", src)
+                v = rmv.classify(ut, "t.py:8")
+                self.assertEqual((v.status, v.code), (rmv.PASS, "assertion-failed"), v)
+        # the r11 pass 2 A1 co_name witness is a FRAME line with two readings: still refused
+        frame = '  File "real.py", line 3, in test_x "/victim.py", line 2, in target'
+        self.assertEqual(self._code(_ut_text("FAILED (failures=1)", frame=frame), "victim.py:2"), "cnc-frame")
+
+    A3_SOURCE = ('import unittest\nclass T(unittest.TestCase):\n    def test_x(self):\n        self.assertEqual(\n'
+                 '            """a\nFile "victim.py", line 2\nb""", 1)\n')
+
+    def test_r11_pass3_a3_source_line_is_never_a_frame(self) -> None:
+        # adversary r11 pass 3 A3 (071fa1a7): Python prints a frame's source lines four spaces in (3.11+ prints every line
+        # of a multi-line call), so the string text `File "victim.py", line 2` printed under the real t.py frame was read
+        # as a second frame and victim.py:2 passed. A frame is the two-space `  File "...", line N` line only.
+        text = ("=" * 70 + "\nFAIL: test_x (t.T.test_x)\n" + "-" * 70 + "\nTraceback (most recent call last):\n"
+                '  File "t.py", line 4, in test_x\n            self.assertEqual(\n            ~~~~~~~~~~~~~~~~^\n'
+                '                """a\n                ^^^^\n    File "victim.py", line 2\n'
+                "    ^^^^^^^^^^^^^^^^^^^^^^^^\n    b\"\"\", 1)\n    ^^^^^^^^\n"
+                "AssertionError: 'a\\nFile \"victim.py\", line 2\\nb' != 1\n\n" + "-" * 70
+                + "\nRan 1 test in 0.001s\n\nFAILED (failures=1)\n")
+        for eol in ("\n", "\r\n"):
+            with self.subTest(eol=eol):
+                v = rmv.classify(text.replace("\n", eol), "victim.py:2")
+                self.assertEqual((v.status, v.code), (rmv.REFUSED, "not-at"), v)
+                self.assertEqual(rmv.classify(text.replace("\n", eol), "t.py:4").status, rmv.PASS)  # the real frame
+        # the source line holding a malformed frame shape is source too, never a cnc-frame refusal
+        self.assertEqual(rmv.classify(text.replace('    File "victim.py", line 2\n', '    File "v.py", line 2.5,\n'),
+                                      "t.py:4").status, rmv.PASS)
+        real = _run_unittest({"t.py": self.A3_SOURCE}, "t")  # the real runner's own text
+        self.assertEqual(rmv.classify(real, "victim.py:2").status, rmv.REFUSED)
+        self.assertEqual(rmv.classify(real, "t.py:4").status, rmv.PASS)
+
     def test_pytest_location_line_requires_complete_integer_token(self) -> None:
         # the same rule for the pytest `file.py:N:` location line (a sibling of _FRAME)
         self.assertEqual(rmv.classify(_PT_SECTION_TEXT.format(loc="t.py:2: AssertionError"), "t.py:2").status, rmv.PASS)
@@ -1580,6 +1617,62 @@ class SummarySplitR11(unittest.TestCase):
         for ok in ("assert False", "assert 1 == 2", "AssertionError: boom", "AssertionError", "Failed: no"):  # controls
             with self.subTest(ok=ok):
                 self.assertEqual(rmv.classify(self._run(f"FAILED t.py::test_x - {ok}"), "t.py::test_x").status, rmv.PASS)
+
+    # r12 A1-U (Dot e3f43d7, request 6711763476; the same defect as r11 pass 3 A2): a later ' - ' whose left side is a node
+    # id but for a non-ASCII or control character was DROPPED, so the invented ASCII prefix was the only reading.
+    UNI_LINE = "FAILED t.py::TestA - AssertionError: x::test_{c} - TypeError: boom"
+    UNI_SECTION = ("=================================== FAILURES ===================================\n"
+                   "_____ TestA - AssertionError: x.test_{c} _____\n\n    def test_{c}(self):\n"
+                   ">       raise TypeError('boom')\nE       TypeError: boom\n\nt.py:3: TypeError\n"
+                   "=========================== short test summary info ============================\n")
+
+    def test_unicode_later_boundary_is_could_not_check(self) -> None:
+        for c in ("é", "​", "\t", "éé"):
+            with self.subTest(c=repr(c)):
+                # (a) Dot's summary-only witness, (b) the same with its full TypeError section
+                for text in (self._run(self.UNI_LINE.format(c=c)),
+                             self.UNI_SECTION.format(c=c) + self.UNI_LINE.format(c=c) + "\n=== 1 failed in 0.12s ===\n"):
+                    v = rmv.classify(text, "t.py::TestA")
+                    self.assertEqual((v.status, v.code), (rmv.REFUSED, "cnc-short-summary"), v)
+                    self.assertEqual(rmv.classify(text, "t.py:3").code, "cnc-short-summary")
+                # (c) the ERROR-line variant: refused for the unreadable id, before any collection guess
+                err = ("=== short test summary info ===\n" + self.UNI_LINE.format(c=c).replace("FAILED", "ERROR", 1)
+                       + "\n=== 1 error in 0.1s ===\n")
+                v = rmv.classify(err, "t.py::TestA")
+                self.assertEqual((v.status, v.code), (rmv.REFUSED, "cnc-short-summary"), v)
+        # ASCII CONTROLS keep the r11 verdicts: the ASCII twin (summary only, and with the section that names its node)
+        twin = self.UNI_LINE.format(c="e")
+        v = rmv.classify(self._run(twin), "t.py::TestA")
+        self.assertEqual((v.status, v.code), (rmv.REFUSED, "cnc-summary-split"), v)
+        twin_sec = self.UNI_SECTION.format(c="e") + twin + "\n=== 1 failed in 0.12s ===\n"
+        self.assertEqual((rmv.classify(twin_sec, "t.py::TestA").status, rmv.classify(twin_sec, "t.py::TestA").code),
+                         (rmv.REFUSED, "not-at"))
+        self.assertEqual(rmv.classify(twin_sec, "t.py:3").code, "non-assertion")
+        v = rmv.classify(self._run("FAILED t.py::test_a - AssertionError: boom"), "t.py::test_a")
+        self.assertEqual((v.status, v.code), (rmv.PASS, "assertion-failed"), v)
+        # a Unicode MESSAGE after one ASCII node id stays readable (the id is ASCII; only the message is not)
+        for msg in ("AssertionError: café", "assert 'é' == 'e'", "AssertionError: é::x"):
+            with self.subTest(msg=msg):
+                v = rmv.classify(self._run(f"FAILED t.py::test_a - {msg}"), "t.py::test_a")
+                self.assertEqual((v.status, v.code), (rmv.PASS, "assertion-failed"), v)
+
+    def test_r11_pass3_a1_section_binds_a_reading_only_in_its_own_file(self) -> None:
+        # adversary r11 pass 3 A1 (071fa1a7): u.py's section `TestA.test_target` named t.py's shorter reading, so the
+        # invented node t.py::TestA::test_target passed. A section tells a reading only when its frames are in that file.
+        out = ("=== FAILURES ===\n___ TestA::test_target - AssertionError: x::part.test_x ___\nE TypeError: boom\n"
+               "t.py:2: TypeError\n___ TestA.test_target ___\nE AssertionError\nu.py:3: AssertionError\n"
+               "=== short test summary info ===\n"
+               "FAILED t.py::TestA::test_target - AssertionError: x::part::test_x - TypeError: boom\n"
+               "FAILED u.py::TestA::test_target - AssertionError\n=== 2 failed in 0.04s ===\n")
+        v = rmv.classify(out, "t.py::TestA::test_target")
+        self.assertEqual((v.status, v.code), (rmv.REFUSED, "cnc-summary-split"), v)
+        # control: a section whose frame is in the reading's own file still tells it; the same name in u.py does not
+        one = ("=== FAILURES ===\n___ TestA.test_target ___\nE AssertionError: x - y\nt.py:3: AssertionError\n"
+               "=== short test summary info ===\nFAILED t.py::TestA::test_target - AssertionError: x - y\n"
+               "=== 1 failed in 0.04s ===\n")
+        self.assertEqual(rmv.classify(one, "t.py::TestA::test_target").status, rmv.PASS)
+        self.assertEqual(rmv.classify(one.replace("t.py:3:", "u.py:3:"), "t.py::TestA::test_target").code,
+                         "cnc-summary-split")
 
 
 class ReasonCodeR11(unittest.TestCase):

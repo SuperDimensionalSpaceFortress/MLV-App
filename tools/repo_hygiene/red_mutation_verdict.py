@@ -86,12 +86,18 @@ REFUSED with a reason that starts ``COULD-NOT-CHECK (<typed reason>)``. That is 
   that does not parse whole is COULD-NOT-CHECK.
 * ``frame`` (r11): a unittest ``File "...", line N`` frame ends after its ASCII line number with ``, in <name>`` or the
   end of the line, and a pytest ``file.py:N:`` location line with its ``:``. A line of either shape that does not parse
-  whole (``line 2.5,``, ``line 2x``, ``t.py:2.5:``) is COULD-NOT-CHECK, never a frame at its digit prefix.
+  whole (``line 2.5,``, ``line 2x``, ``t.py:2.5:``) is COULD-NOT-CHECK, never a frame at its digit prefix. A unittest
+  frame is the line at exactly two spaces that the traceback module prints (r12, r11 pass 3 A3): a frame's source lines
+  are printed four or more spaces in, so source text that reads ``File "victim.py", line 2`` (a multi-line string) is
+  never a frame, and a source line holding ``", line `` twice is not refused (Dot e3f43d7).
 * ``summary split`` (r11, r10 adversary A1): a class or function name set through ``globals()`` may hold `` - ``, so the
   first `` - `` of a ``FAILED``/``ERROR`` line is only one candidate end of its node id, and an exception class of ANY
   name may follow it (``type('Bad-Name', ...)`` prints ``t.Bad-Name``; r11 pass 1 A1), so every later `` - `` with a node
-  id on its left is another reading. A line with more than one reading is read only when EXACTLY ONE of them names the
-  test of one of the run's own failure sections (default tracebacks print one per failure); otherwise it is
+  id on its left is another reading, readable or not: a left side that is a node id but for a non-ASCII or control
+  character (a method ``test_`` plus an accented letter) makes the line COULD-NOT-CHECK, never a line read by dropping
+  that reading (r12 A1-U, Dot e3f43d7). A line with more than one reading is read only when EXACTLY ONE of them is the
+  account of one of the run's own failure sections, by its test name AND a frame in its file (r12, r11 pass 3 A1;
+  default tracebacks print one section per failure); otherwise it is
   COULD-NOT-CHECK (``FAILED t.py::TestA - AssertionError::test_x - TypeError: boom``), and so is a parameter id holding
   ``] - ``. A line naming an import error blocks like one under every reading. The cost, accepted: under ``--tb=no`` an
   assertion message holding `` - `` (``assert x - 1 == y``) is refused. An assertion head needs its own delimiter:
@@ -239,8 +245,11 @@ _EQ_RULE = re.compile(r"^={20,}\s*$")
 # A traceback frame is parsed WHOLE (r11, Dot r9-A1): the line number is ASCII digits followed by the runner's own
 # delimiter, `, in <name>` or the end of the line (a SyntaxError location has no function). A line of the frame's shape
 # that does not parse (`line 2.5,`, `line 2x`, a non-ASCII digit) is COULD-NOT-CHECK, never a frame at a digit prefix.
-_FRAME = re.compile(r'^\s*File "(?P<file>.+)", line (?P<line>[0-9]+)(?:, in .*)?[ \t]*$')
-_FRAME_SHAPE = re.compile(r'^\s*File ".*", line ')
+# r12 (r11 pass 3 A3, Dot e3f43d7): a frame is the line the traceback module prints for it, `  File "...", line N` at
+# exactly TWO spaces. Its source lines are printed four or more spaces in (3.11+ prints every line of a multi-line call,
+# with its caret lines), so a string's text `File "victim.py", line 2` is source, never a frame, and never a refusal.
+_FRAME = re.compile(r'^  File "(?P<file>.+)", line (?P<line>[0-9]+)(?:, in .*)?[ \t]*$')
+_FRAME_SHAPE = re.compile(r'^  File ".*", line ')
 _UT_HEAD = re.compile(r"^(?P<kind>FAIL|ERROR): (?P<name>.+?)(?: \((?P<ident>[^()]*)\))?(?: \(.*\))?\s*$")
 _UT_KIND = re.compile(r"^(?P<kind>FAIL|ERROR): (?P<rest>.+?)\s*$")
 _DASHES = re.compile(r"^-{70}\s*$")
@@ -517,7 +526,9 @@ def _summary_readings(line: str, word: str) -> list[tuple[str, str]] | None:
         return [(rest, "")]
     param = rest.find("[")
     if param < 0 or seps[0] < param:
-        cuts = [seps[0]] + [i for i in seps[1:] if _node_shaped(word, rest[:i])]
+        # r12 A1-U (Dot e3f43d7; r11 pass 3 A2): a later left side that is a node id but for a non-ASCII or control
+        # character is a reading too, never dropped; the caller refuses a line with such a reading (_unreadable_reading)
+        cuts = [seps[0]] + [i for i in seps[1:] if _node_plausible(word, rest[:i])]
         return [(rest[:i], rest[i + 3:]) for i in cuts]
     cuts = [i for i in seps if i > param and rest[i - 1] == "]"]
     if not cuts:
@@ -576,17 +587,19 @@ def _ut_walk(block: list[str]) -> tuple[list[tuple[str, int]], str]:
         if not ln.strip():
             continue
         if ln[:1].isspace():
+            if not _FRAME_SHAPE.match(ln):
+                continue  # a source or caret line: what it says is never read (r12, Dot e3f43d7; r11 pass 3 A3)
             if ln.count('", line ') > 1:
                 # r11 pass 2 A1: a function's co_name may hold `"/victim.py", line 2, in target`, so the line reads as two
-                # frames and which `", line N` ends the file name cannot be told
+                # frames and which `", line N` ends the file name cannot be told. Frame lines only (r12): a source line
+                # `self.fail('", line 1, ", line 2')` is not a frame and is not refused.
                 raise _Unclassifiable("cnc-frame", f"traceback frame {ln.strip()[:60]!r} holds more than one "
                                       "`\", line N`: which one ends its file name cannot be told")
             m = _FRAME.match(ln)
-            if m:
-                frames.append((m["file"], _line_no(m["line"])))
-            elif _FRAME_SHAPE.match(ln):
+            if not m:
                 raise _Unclassifiable("cnc-frame", f"traceback frame {ln.strip()[:60]!r}: its line number is not ASCII "
                                       "digits followed by the frame's own delimiter (`, in <name>` or the end of the line)")
+            frames.append((m["file"], _line_no(m["line"])))
             continue
         exc, in_tb = ln, False
     return frames, exc
@@ -712,15 +725,55 @@ _SUMMARY_LINE_MAX_ID = 74
 _SUMMARY_RANK = {"PASSED": 0, "SKIPPED": 1, "XFAIL": 2, "XPASS": 3, "ERROR": 4, "FAILED": 4}
 _OTHER_NODE = re.compile(r"[!-~][ -~]*?\.\w+::[ -~]+")  # `<ascii file>.ext::<name>`: the one readable id shape
 _SKIPPED_BODY = re.compile(rf"\[({_COUNT})\] [!-~][ -~]*?:[0-9]+: [ -~]*")  # the [n] group count: the one count spelling
-_MODULE_NODE = re.compile(r"[!-~][ -~]*?\.\w+")  # a module-level `ERROR <file.ext>`
 
 
-def _node_shaped(word: str, text: str) -> bool:
-    """True when `text` could be the node id of a `word` summary line: `<ascii file.ext>::<name>` (or, for ERROR, a
-    module `<file.ext>`), ASCII and printable."""
-    if not text.isascii() or not text.isprintable():
+# The node SHAPE without the ASCII/printable test (r12 A1-U): `<file>.<ext>::<name>` (or, for ERROR, `<file>.<ext>`) of
+# any characters. A real node id may hold any (`test_é`, a tab, U+200B set through globals()), so a left side of this
+# shape is a plausible boundary whatever it holds; that it cannot be READ is a refusal, not a reason to drop it.
+_PLAUSIBLE_NODE = re.compile(r".+?\.\w+::.+")  # one framed line: no line break to match
+_PLAUSIBLE_MODULE = re.compile(r".+?\.\w+")
+
+
+def _node_plausible(word: str, text: str) -> bool:
+    """True when `text` could be the node id of a `word` summary line, readable or not: `<file.ext>::<name>` (or, for
+    ERROR, a module `<file.ext>`) of any characters. The readable subset is the ASCII printable one (_summary_problem)."""
+    return bool(_PLAUSIBLE_NODE.fullmatch(text) or (word == "ERROR" and _PLAUSIBLE_MODULE.fullmatch(text)))
+
+
+def _unreadable_reading(word: str, line: str, readings: list[tuple[str, str]]) -> str:
+    """"" or why a FAILED/ERROR line with more than one reading cannot be read: one reading's node id holds a non-ASCII
+    or control character (r12 A1-U, Dot e3f43d7). Such a boundary is unsupported and plausible, so the line is
+    COULD-NOT-CHECK whichever reading a section would name: an ASCII prefix of it is never the node by elimination."""
+    if len(readings) < 2:
+        return ""
+    for node, _msg in readings:
+        if not node.isascii() or not node.isprintable():
+            return (f"{word} line {line[:60]!r} splits at a later ' - ' whose left side {node[:60]!r} is a node id but for "
+                    "a non-ASCII or control character: that id cannot be read, so which reading is the node cannot be told")
+    return ""
+
+
+def _bare_section_name(name: str) -> str:
+    """A pytest section header's test name without its `ERROR at setup of ` / `ERROR at teardown of ` prefix (a prefix
+    only: a parameter id may hold this text)."""
+    for prefix in ("ERROR at setup of ", "ERROR at teardown of "):
+        if name.startswith(prefix):
+            return name[len(prefix):]
+    return name
+
+
+def _section_tells(section: Failure, node: str) -> bool:
+    """True when a failure section is the account of the summary reading `node`: its header prints exactly that node's
+    test name (`Class.name`, `name[param]`) AND one of its traceback frames sits in that node's file (r12, r11 pass 3 A1:
+    u.py's `TestA.test_target` section named t.py's invented reading by its name alone). A section with no frame tells
+    nothing."""
+    parts = _split_top(node, "::")
+    if len(parts) < 2 or not section.ids or not section.frames:
         return False
-    return bool(_OTHER_NODE.fullmatch(text) or (word == "ERROR" and _MODULE_NODE.fullmatch(text)))
+    if ".".join(parts[1:]) != _bare_section_name(section.ids[0]):
+        return False
+    path = _norm_path(parts[0])
+    return any(_same_file(path, _norm_path(file)) for file, _line in section.frames)
 
 
 def _other_line(word: str, line: str) -> tuple[int, str]:
@@ -772,20 +825,6 @@ def _summary_problem(word: str, node: str, msg: str) -> str:
         # real `file.ext::name` then sits in the "message". A message that holds a node of its own cannot be split.
         return f"{word} {node[:60]!r} has a message that holds another <file>::<name> (the id may end later)"
     return ""
-
-
-def _section_names(sections: list[Failure]) -> set[str]:
-    """The test names the failure sections read so far print in their headers (`T.test_a`, `test_x[p]`), without the
-    `ERROR at setup of ` / `ERROR at teardown of ` prefix."""
-    names = set()
-    for f in sections:
-        name = f.ids[0] if f.ids else ""
-        for prefix in ("ERROR at setup of ", "ERROR at teardown of "):
-            if name.startswith(prefix):
-                name = name[len(prefix):]
-                break
-        names.add(name)
-    return names
 
 
 def _parse_pytest(lines: list[str], stats: dict | None = None) -> list[Failure]:
@@ -860,11 +899,12 @@ def _parse_pytest(lines: list[str], stats: dict | None = None) -> list[Failure]:
                 if not readings:
                     continue
                 stats["summary"] += 1
+                stats["bad"] = stats["bad"] or _unreadable_reading(word, line, readings)
                 if len(readings) > 1:
                     # r11: the run's own failure sections (they precede the summary, so `out` holds them) name their
-                    # tests; a reading is told only when EXACTLY ONE of them names a section's test.
-                    named = [r for r in readings if _split_top(r[0], "::")[1:]
-                             and ".".join(_split_top(r[0], "::")[1:]) in _section_names(out)]
+                    # tests; a reading is told only when EXACTLY ONE of them is the account of a section, by its test
+                    # name AND its file (r12, r11 pass 3 A1: a name alone may belong to another file's section).
+                    named = [r for r in readings if any(_section_tells(f, r[0]) for f in out)]
                     readings = named if len(named) == 1 else readings
                 node, msg = readings[0]
                 ambiguous = len(readings) > 1
@@ -948,11 +988,7 @@ def _parse_pytest(lines: list[str], stats: dict | None = None) -> list[Failure]:
     claims = [0] * len(nodes)
     for f in out:
         f.assertion = bool(f.assertion) and not f.collection
-        bare = f.ids[0]
-        for prefix in ("ERROR at setup of ", "ERROR at teardown of "):
-            if bare.startswith(prefix):  # a prefix only: a parameter id may hold this text
-                bare = bare[len(prefix):]
-                break
+        bare = _bare_section_name(f.ids[0])
         # The section header is a bare name (`T.test_a`, or just `test_x` for a module-level
         # function), so it is not an identity. Its identity is the FAILED-summary node id whose
         # tail is that name and whose file appears in the section's own traceback frames.
