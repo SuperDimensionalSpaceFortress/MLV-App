@@ -558,7 +558,7 @@ TEST(ResizeStillDrawingWaitWiring, EveryStartOfRendererWorkBumpsTheBusyEpochAndT
     ASSERT_TRUE(rfh.contains(QStringLiteral("std::atomic<uint64_t> m_busyEpoch{ 0 };")));
     ASSERT_TRUE(rfh.contains(QStringLiteral("uint64_t busyEpoch( void ) const;")));
     // a render request (the GUI's only way to start a frame)
-    const QString request = functionBody(rft, QStringLiteral("void RenderFrameThread::renderFrame( uint32_t frameNumber,"),
+    const QString request = functionBody(rft, QStringLiteral("void RenderFrameThread::renderFrame(uint32_t frameNumber,"),
         QStringLiteral("\n}"));
     ASSERT_FALSE(request.isEmpty());
     const int bumpAt = request.indexOf(QStringLiteral("bumpBusyEpoch();"));
