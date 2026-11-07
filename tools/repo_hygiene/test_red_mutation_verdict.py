@@ -917,15 +917,15 @@ class VerdictOnText(unittest.TestCase):
         # of the second failure is not shown anywhere; its class may subclass ImportError.
         for columns in (80, 200):
             for tb in ("--tb=long", "--tb=short"):
-                out = _run_pytest({"t.py": self.GROUP}, "-rN", tb, columns=columns)
+                out = _run_pytest({"test_t.py": self.GROUP}, "-rN", tb, columns=columns)
                 self.assertIn("2 failed", out)
-                status, reason = rmv.verdict(out, "t.py:2")
+                status, reason = rmv.verdict(out, "test_t.py:2")
                 self.assertEqual(status, rmv.REFUSED, f"{tb}: {reason}\n{out}")
                 self.assertIn("COULD-NOT-CHECK", reason, out)
                 self.assertIn("exception line", reason, out)
-        ordinary = _run_pytest({"t.py": "def test_expected(): assert False\ndef test_other(): raise TypeError('boom')\n"},
+        ordinary = _run_pytest({"test_t.py": "def test_expected(): assert False\ndef test_other(): raise TypeError('boom')\n"},
                                "-rN", "--tb=short")
-        status, reason = rmv.verdict(ordinary, "t.py:1")  # an ordinary builtin type is still classified: not an import error
+        status, reason = rmv.verdict(ordinary, "test_t.py:1")  # an ordinary builtin type is still classified: not an import error
         self.assertEqual(status, rmv.PASS, f"{reason}\n{ordinary}")
 
     def test_adversary2_a1_the_same_group_in_a_unittest_run_is_could_not_check(self) -> None:
@@ -934,7 +934,7 @@ class VerdictOnText(unittest.TestCase):
                "    def test_expected(self):\n        self.assertEqual(1, 2)\n"
                "    def test_import(self):\n        raise ExceptionGroup('deps', [MissingDependency('missing')])\n")
         out = _run_unittest({"test_t.py": src}, "test_t")
-        status, reason = rmv.verdict(out, "test_t.py:4")
+        status, reason = rmv.verdict(out, "test_t.py:5")
         self.assertEqual(status, rmv.REFUSED, f"{reason}\n{out}")
         self.assertIn("COULD-NOT-CHECK", reason, out)
 
