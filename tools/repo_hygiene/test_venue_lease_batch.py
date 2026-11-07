@@ -4756,12 +4756,13 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
         self._assert_nothing_submitted_input_intact(r, spec, before, "LEG_PLAN_REFUSED reason=LEG_SPEC_IS_RUN_OUTPUT item=1 ")
 
     # r12 pass 2 (adversary r12 A2'): what the preflight validated must still hold when the claim is taken, or the leg throws / refuses after the lease opened.
-    def _during_claim_wait(self, args: list[str], e: dict, change) -> tuple[int, str, str]:
+    def _during_claim_wait(self, args: list[str], e: dict, change, release: bool = True) -> tuple[int, str, str]:
         p = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=e)
         try:
             self._wait_for_log("CLAIM_HELD")
             change()
-            self.claim_path.unlink()   # the foreign owner lets go: this run takes the claim next poll
+            if release:
+                self.claim_path.unlink()   # the foreign owner lets go: this run takes the claim next poll
             so, se = p.communicate(timeout=240)
         finally:
             if p.poll() is None:
@@ -5190,8 +5191,17 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
         text = RUNNER.read_text(encoding="utf-8")
         # r3: the budget is New-GuardBudget's (a Stopwatch started at the grant read), so the claim guard and the post-open guard count on one monotonic clock each
         # r7: less 1 s for the guard's own end, now that its reads get the exact remainder
-        grant = text.index("$script:guardBudget = $(if ($req.granted) { New-GuardBudget ($ClaimTtlSec - $ClaimRenewSec - 1) ")
-        self.assertLess(text.index("$grantReadUtc = [DateTime]::UtcNow", grant - 2000), grant)
+        grant = text.index("$script:guardBudget = $(if ($req.granted) { New-GuardBudget $claimGuardSec ")
+        self.assertIn("$claimGuardSec = [double]($ClaimTtlSec - $ClaimRenewSec - 1);", text)
+        # r8 (LEASE-BATCH-ADV-A2-GRANT-STAMP-PIN-1, sol r7): a bounded window again, not "anywhere before". The stamp is the one assignment of $grantReadUtc in the file, and the
+        # first statement after the request's try/catch: after its REQUEST_THREW stand-in and before the first read of the grant, at most 200 characters on, in the same loop as the guard.
+        self.assertEqual(text.count("$grantReadUtc = "), 1)
+        request_end = text.rindex("state = 'REQUEST_THREW' }", 0, grant) + len("state = 'REQUEST_THREW' }")
+        stamp = text.index("$grantReadUtc = [DateTime]::UtcNow", request_end)
+        first_read = text.index("if (-not $req.granted) { if ($script:claimWait.denied -eq 0)", request_end)
+        self.assertLess(stamp, first_read)
+        self.assertLessEqual(first_read - request_end, 200, "the grant-stamp window grew: the stamp must stay right after the claim request")
+        self.assertLess(first_read, grant)
         # r4 (sol r3 B1): the whole guard runs under that budget (Invoke-InputGuard), not only its manifest and artifact reads
         call, clear = text.index("try { $hit = Invoke-InputGuard }", grant), text.index("$script:guardBudget = $null", grant)
         self.assertLess(grant, call)
@@ -5271,6 +5281,7 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
         probe.write_text("param($items)\n" + f"if (Test-Path -LiteralPath '{state}' -PathType Leaf) {{ {body} }}\n", encoding="utf-8")
         r = self.run_plan(self.write_plan(items or [self.item(self.specs[0], "A", self.commit_a)]), "-LeaseCapSec", cap, "-LegBudgetSec", leg, "-LeaseMarginSec", margin,
                           "-ArtifactProbeScript", str(probe), *extra, **env)
+        exited = datetime.now(timezone.utc)   # subprocess.run returned: the process is gone and its pipes closed (Dot I1 on #750)
         ticks = {}
         for line in self.events_raw():
             t, kind, rest = line.split(" ", 2)
@@ -5278,14 +5289,17 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
                 ticks.setdefault("open" if rest.startswith("lease-batch-open-") else "close", int(t))
         self.assertIn("open", ticks, r.stdout + r.stderr)
         # LEASE-BATCH-PREFLIGHT-TEST-ISOLATION-1 item 3: the second number returned is a CLOSE-submitted measurement ONLY when close_substituted is False. When no close was submitted
-        # (NO_CLOSE_EXPECTED) the runner's finishedUtc stands in for it, and the number is then how long the RUN took after the open: it proves termination (and, with the claim file
+        # (NO_CLOSE_EXPECTED) the observed process exit stands in for it, and the number is then how long the RUN took after the open: it proves termination (and, with the claim file
         # check beside it, claim cleanup), never a successful close and never a physical release of the lease.
+        # Dot I1 on #750: this was the runner's finishedUtc, which is stamped when the summary is built, before Write-RunSummary, Complete-VenueProcess and exit, so a stall after it passed.
+        def ticks_of(t: datetime) -> int:
+            return (t - datetime(1, 1, 1, tzinfo=timezone.utc)) // timedelta(microseconds=1) * 10
         self.close_substituted = False
         if "close" not in ticks and env.get("NO_CLOSE_EXPECTED"):
             # r6: a close redirect that failed closed submits no close job (JOB_WRITE_FAILED); the run's end then stands in for the close
             self.close_substituted = True
-            done = datetime.fromisoformat(batch_result(r.stdout)["finishedUtc"].replace("Z", "+00:00"))
-            ticks["close"] = (done - datetime(1, 1, 1, tzinfo=timezone.utc)) // timedelta(microseconds=1) * 10
+            self.summary_after_open = (ticks_of(datetime.fromisoformat(batch_result(r.stdout)["finishedUtc"].replace("Z", "+00:00"))) - ticks["open"]) / 1e7
+            ticks["close"] = ticks_of(exited)
         self.assertIn("close", ticks, r.stdout + r.stderr)
         return r, (ticks["close"] - ticks["open"]) / 1e7
 
@@ -5514,6 +5528,857 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
         self.assertEqual(self.kinds(), [], "no lease was opened")
         self.assertFalse(self.claim_path.exists(), "the claim taken for the guard was released")
         self.assertLess(took, 40, f"the run took {took:.1f} s: the 40 s read was waited for")
+        # LEASE-BATCH-CLAIM-WAIT-GUARD-READ-REFUSAL-1: the refusal says what each read took and that no claim wait came before it
+        self.assertRegex(r.stderr, self.GUARD_READS_RE.format("location:plan"))
+        self.assertIn("claimWaitBefore=no", r.stderr)
+
+    # LEASE-BATCH-CLAIM-WAIT-GUARD-READ-REFUSAL-1: #748's matrix and retry plans each stopped on one no-claim read that did not answer in its 30 s, while another chain held the venue, and
+    # every remaining leg went NOT_RUN. No lease, leg or write hangs on that read: the attempt that gets the claim guards again on its own budget before anything runs. So a read with
+    # no answer while no claim is held is read again next poll, writing nothing meanwhile, and only three in a row are the typed refusal, which then still says SHARE_UNREACHABLE.
+    # what each read took; '+' marks the one still running when the guard gave up on it
+    GUARD_READS_RE = r"guardReads\(sec\): start=[0-9.]+ (\S+=[0-9.]+ )*{}=[0-9.]+\+"
+
+    def _claim_wait_cmd(self, *extra: str, manifest_probe: Path | None = None, **env: str) -> tuple[list[str], dict]:
+        self._fresh_run_dir()
+        self._foreign_live_claim()
+        probes = ("-StagedBuildProbeScript", str(manifest_probe)) if manifest_probe else ()
+        return self.plan_cmd(self.write_plan([self.item(self.specs[0], "A", self.commit_a)]), *probes, *extra, **env)
+
+    def _assert_read_again_and_the_plan_ran(self, code: int, so: str, se: str, line: str = "CLAIM_WAIT_GUARD_NO_ANSWER", no_answers: int = 1) -> None:
+        self.assertEqual(code, 0, so + se)
+        self.assertNotIn("LEG_PLAN_REFUSED", se)
+        self.assertIn(f"{line} batch=1 unfinished=1/3 noAnswers={no_answers} ", se)
+        self.assertEqual(se.count(line), 1, se)
+        self.assertIn("claimWaitBefore=yes deniedPolls=1 ", se)
+        self.assertEqual(len(self.leg_calls()), 1, so + se)
+        log = (self.run_dir / "batch.log").read_text(encoding="utf-8")
+        self.assertLess(log.index(f"CLAIM_WAIT_GUARD_ANSWERED batch=1 unfinished=1 noAnswers={no_answers} "), log.index("CLAIM_HELD"), "a line was written before a read vouched for the input's location")
+        self.assertEqual(self.batches()[0]["endReason"], "ALL_LEGS_DONE")
+
+    def _run_acting_on_stderr(self, args: list[str], e: dict, marker: str, act, timeout_s: float = 240) -> tuple[int, str, str, float]:
+        # the run's stderr is read as it comes, and act() runs once on the first line carrying marker: a no-answer poll writes nothing into -RunDir, so stderr is all a case can wait on
+        t0 = time.monotonic()
+        p = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=e)
+        lines: list[str] = []
+        out: list[str] = []
+        acted = threading.Event()
+
+        def drain() -> None:
+            for line in p.stderr:
+                lines.append(line)
+                if marker in line and not acted.is_set():
+                    acted.set()
+                    act()
+        readers = [threading.Thread(target=drain, daemon=True), threading.Thread(target=lambda: out.append(p.stdout.read()), daemon=True)]
+        for t in readers:
+            t.start()
+        try:
+            p.wait(timeout=timeout_s)
+        finally:
+            if p.poll() is None:
+                subprocess.run(["taskkill", "/PID", str(p.pid), "/T", "/F"], capture_output=True, text=True, timeout=60)
+                p.wait(timeout=60)
+        for t in readers:
+            t.join(timeout=30)
+        return p.returncode, "".join(out), "".join(lines), time.monotonic() - t0
+
+    def _claim_loop_snippet(self, setup: str) -> dict:
+        # the runner's own no-answer branch and helpers, run in memory: only the sleep is replaced, so a wakeup that comes late is a fact of the case and not of the host
+        script = (f"$ast = [System.Management.Automation.Language.Parser]::ParseFile('{psq(RUNNER)}', [ref]$null, [ref]$null)\n"
+                  "foreach ($n in 'Test-ClaimWaitRetryRoom', 'Get-ClaimWaitUnfinishedText') { $f = $ast.Find({ param($x) $x -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $x.Name -eq $n }, $true); if ($f) { . ([scriptblock]::Create($f.Extent.Text)) } }\n"
+                  "$branch = $ast.Find({ param($x) $x -is [System.Management.Automation.Language.IfStatementAst] -and $x.Extent.Text.StartsWith('if ($hit -and $hit.noAnswer -and -not $req.granted)') }, $true)\n"
+                  "$script:ClaimWaitUnfinishedMax = 3; $script:ClaimWaitNoAnswerMax = 3; $script:ClaimWaitGuardSec = 1; $ClaimPollSec = 1; $batchNo = 1; $unfinished = 0; $noAnswers = 0; $Venue = 'bachelor'\n"
+                  "$req = [pscustomobject]@{ granted = $false; broken = @() }\n"
+                  "$hit = [pscustomobject]@{ item = 1; why = 'WHY'; noAnswer = $true; readAbandoned = $true }\n"
+                  "$script:slept = 0\n"
+                  "function Start-Sleep { param([int]$Seconds) $script:slept++; [Threading.Thread]::Sleep(($Seconds + $overshootSec) * 1000) }\n"
+                  f"{setup}\n"
+                  "$outcome = 'READ_AGAIN'\n"
+                  "foreach ($i in 1) { . ([scriptblock]::Create($branch.Extent.Text)); $outcome = 'REFUSAL' }\n"
+                  "[pscustomobject]@{ outcome = $outcome; slept = $script:slept; why = $hit.why } | ConvertTo-Json -Compress\n")
+        r = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, timeout=120)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        return json.loads(r.stdout.strip().splitlines()[-1])
+
+    def test_artifact_preflight_claim_wait_one_location_read_with_no_answer_costs_no_leg(self) -> None:
+        args, e = self._claim_wait_cmd("-GuardReadDelay", "claim:existence=40x1")
+        code, so, se = self._during_claim_wait(args, e, lambda: None)
+        self._assert_read_again_and_the_plan_ran(code, so, se)
+        self.assertRegex(se, self.GUARD_READS_RE.format("location:build1"))
+        self.assertIn("still reading the location of the build input", se)
+
+    def test_artifact_preflight_claim_wait_one_manifest_read_given_up_on_costs_no_leg(self) -> None:
+        calls = self.case / "manifest-calls.txt"
+        manifest_probe, _ = self._timed_probes(0, 0)
+        # the preflight is the first read; the first denied poll's is the second, and it does not answer inside the guard's 30 s
+        manifest_probe.write_text(manifest_probe.read_text(encoding="utf-8").replace(
+            "param($p)\n", f"param($p)\n[IO.File]::AppendAllText('{calls}', 'm' + [Environment]::NewLine)\nif ([IO.File]::ReadAllLines('{calls}').Count -eq 2) {{ [Threading.Thread]::Sleep(40000) }}\n", 1), encoding="utf-8")
+        args, e = self._claim_wait_cmd(manifest_probe=manifest_probe)
+        code, so, se = self._during_claim_wait(args, e, lambda: None)
+        self._assert_read_again_and_the_plan_ran(code, so, se)
+        self.assertIn("could not be read after the claim wait", se)
+        self.assertRegex(se, self.GUARD_READS_RE.format("content:build1"), "a read really given up on keeps its '+'")
+
+    def test_artifact_preflight_claim_wait_one_slow_read_that_left_no_room_costs_no_leg(self) -> None:
+        # the read answered, but the guard's 30 s went on it: the next read has no room to start (or, on a host so slow that the worker took over 2.5 s to reach it, the guard gave up on
+        # this one). Neither is a refusal yet. Sol and fable r2: the pass with no read given up on carries no '+' and says no read went unanswered; the other keeps both.
+        # r4 (the keys' control, INV-1): the manifest goes and comes back before the next pass, which no pass saw, so this is still a read again: the row below is the one that saw it gone.
+        manifest = self._staged_manifest(self.commit_a)
+        staged = manifest.read_bytes()
+
+        def gone_and_back_then_the_foreign_owner_lets_go() -> None:
+            manifest.unlink()
+            manifest.write_bytes(staged)
+            self._wait_for_log("CLAIM_HELD")
+            self.claim_path.unlink()
+        args, e = self._claim_wait_cmd("-GuardReadDelay", "claim:spec=28x1", "-ClaimPollSec", "3")
+        code, so, se, _ = self._run_acting_on_stderr(args, e, "CLAIM_WAIT_GUARD_NO_", gone_and_back_then_the_foreign_owner_lets_go)
+        if "CLAIM_WAIT_GUARD_NO_ANSWER" in se:
+            self._assert_read_again_and_the_plan_ran(code, so, se)
+            self.assertRegex(se, self.GUARD_READS_RE.format("content:spec1"))
+            return
+        self._assert_read_again_and_the_plan_ran(code, so, se, line="CLAIM_WAIT_GUARD_NO_ROOM", no_answers=0)
+        [line] = [l for l in se.splitlines() if "CLAIM_WAIT_GUARD_NO_ROOM" in l]
+        self.assertRegex(line, r"guardReads\(sec\): start=[0-9.]+ (\S+=[0-9.]+ )*content:spec1=[0-9.]+ claimWaitBefore=yes")
+        self.assertNotRegex(line, r"guardReads\(sec\): [^\]]*\+", "every read that started had answered")
+        self.assertNotIn("no answer", line.lower())
+        self.assertIn("no time is left in the claim wait", line)
+
+    def test_artifact_preflight_claim_wait_a_share_that_never_answers_still_refuses_typed_and_writes_nothing(self) -> None:
+        # the control: every read stalls past the guard's 30 s, the foreign claim never lets go. The same typed reason, after three reads in a row and never at the deadline.
+        args, e = self._claim_wait_cmd("-GuardReadDelay", "claim:existence=40")
+        t0 = time.monotonic()
+        r = subprocess.run(args, capture_output=True, text=True, timeout=200, env=e)
+        took = time.monotonic() - t0
+        self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+        self.assertIn("LEG_PLAN_REFUSED reason=SHARE_UNREACHABLE item=1 the guard's reads did not finish within the claim wait", r.stderr)
+        self.assertIn("an input whose location is unknown is refused", r.stderr)
+        self.assertIn("(no answer on 3 reads in a row while no claim was held)", r.stderr)
+        self.assertRegex(r.stderr, self.GUARD_READS_RE.format("location:build1"))
+        self.assertIn("claimWaitBefore=yes deniedPolls=3 ", r.stderr)
+        self.assertEqual(r.stderr.count("CLAIM_WAIT_GUARD_NO_ANSWER"), 2, r.stderr)
+        self.assertEqual(self.kinds(), [], "no lease was opened")
+        self.assertEqual(self.leg_calls(), [])
+        self.assertGreater(took, 3 * 30, f"the run took {took:.1f} s: each read keeps its whole 30 s")
+        self.assertLess(took, 3 * 30.5 + 2 * 1 + 30, f"the run took {took:.1f} s: three reads and two polls, then the refusal")
+        self.assertNotIn("CLAIM_HELD", (self.run_dir / "batch.log").read_text(encoding="utf-8"), "a line was written while no read had vouched for the input's location")
+
+    def test_artifact_preflight_claim_wait_a_read_with_no_answer_at_the_deadline_refuses_typed_not_deadline(self) -> None:
+        # no poll is left to read again in: the run ends in the refusal, because DEADLINE's own log line and receipt would write into a -RunDir nobody vouched for
+        args, e = self._claim_wait_cmd("-GuardReadDelay", "claim:existence=40", "-ClaimPollSec", "20", "-DeadlineUtc", utc_iso(datetime.now(timezone.utc) + timedelta(seconds=45)))
+        r = subprocess.run(args, capture_output=True, text=True, timeout=200, env=e)
+        self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+        self.assertIn("LEG_PLAN_REFUSED reason=SHARE_UNREACHABLE item=1 ", r.stderr)
+        self.assertIn("(no answer on 1 read in a row while no claim was held)", r.stderr)
+        self.assertNotIn("CLAIM_WAIT_GUARD_NO_ANSWER", r.stderr)
+        self.assertNotIn("BATCH_END", (self.run_dir / "batch.log").read_text(encoding="utf-8"))
+
+    def test_artifact_preflight_claim_wait_a_read_the_share_refused_at_once_is_still_the_refusal(self) -> None:
+        # the sibling control: a read that ANSWERED with a failure (the manifest write-locked) is an answer, so it is refused on that poll, as #705 r13 made it
+        manifest = self._staged_manifest(self.commit_a)
+        args, e = self._claim_wait_cmd()
+        code, so, se = self._during_claim_wait(args, e, lambda: self._lock_exclusive(manifest), release=False)
+        self.assertEqual(code, 2, so + se)
+        self.assertIn("LEG_PLAN_REFUSED reason=SHARE_UNREACHABLE item=1 ", se)
+        self.assertIn("could not be read after the claim wait", se)
+        self.assertNotIn("CLAIM_WAIT_GUARD_NO_ANSWER", se)
+        self.assertEqual(self.leg_calls(), [])
+
+    def test_artifact_preflight_claim_wait_r3_no_retry_when_a_whole_guard_does_not_fit_before_the_deadline(self) -> None:
+        # sol r2 B-01: 40 s left and a poll of 1 s. The first read gives up at about 31 s, and a second would be granted a fresh 30 s past the deadline (62 s on 38d61585). It is refused
+        # typed, at the first read, and nothing else is read.
+        args, e = self._claim_wait_cmd("-GuardReadDelay", "claim:existence=40", "-DeadlineUtc", utc_iso(datetime.now(timezone.utc) + timedelta(seconds=40)))
+        t0 = time.monotonic()
+        r = subprocess.run(args, capture_output=True, text=True, timeout=200, env=e)
+        took = time.monotonic() - t0
+        self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+        self.assertIn("LEG_PLAN_REFUSED reason=SHARE_UNREACHABLE item=1 ", r.stderr)
+        self.assertIn("(no answer on 1 read in a row while no claim was held)", r.stderr)
+        self.assertNotIn("CLAIM_WAIT_GUARD_NO_ANSWER", r.stderr)
+        self.assertNotIn("BATCH_END", (self.run_dir / "batch.log").read_text(encoding="utf-8"))
+        self.assertLess(took, 40, f"the run took {took:.1f} s: a second guard ran past the 40 s deadline")
+
+    def test_artifact_preflight_claim_wait_r3_the_room_is_asked_again_after_the_sleep(self) -> None:
+        # sol r2 B-01's second repro: the room was there before the sleep (1 s poll + 1 s guard + 0.5 s against 5 s), and a wakeup 4 s late spent it. No request starts after that.
+        late = self._claim_loop_snippet("$overshootSec = 4; $deadline = [DateTime]::UtcNow.AddSeconds(5)")
+        self.assertEqual((late["outcome"], late["slept"]), ("REFUSAL", 1), late)
+        self.assertIn("(no answer on 1 read in a row while no claim was held)", late["why"])
+        # the control: the same sleep on time, with room left
+        on_time = self._claim_loop_snippet("$overshootSec = 0; $deadline = [DateTime]::UtcNow.AddSeconds(20)")
+        self.assertEqual((on_time["outcome"], on_time["slept"]), ("READ_AGAIN", 1), on_time)
+        # and no room at all: no sleep, no read again
+        none_left = self._claim_loop_snippet("$overshootSec = 0; $deadline = [DateTime]::UtcNow.AddSeconds(2)")
+        self.assertEqual((none_left["outcome"], none_left["slept"]), ("REFUSAL", 0), none_left)
+
+    def test_artifact_preflight_claim_wait_r3_an_answered_poll_starts_no_request_after_the_deadline(self) -> None:
+        # the class sweep of B-01: the poll check before a sleep is only a plan. The runner's own claim loop, in memory: every pass answers, the foreign claim stays, and a wakeup 4 s late
+        # lands past the deadline. On 38d61585 that started another request; here the loop ends (DEADLINE, as ever), and with an on-time sleep it still polls.
+        def requests(setup: str) -> int:
+            script = (f"$ast = [System.Management.Automation.Language.Parser]::ParseFile('{psq(RUNNER)}', [ref]$null, [ref]$null)\n"
+                      "$loop = $ast.FindAll({ param($x) $x -is [System.Management.Automation.Language.WhileStatementAst] -and $x.Body.Extent.Text.Contains('Request-VenueClaim') }, $true) | Select-Object -Last 1\n"
+                      "foreach ($n in 'Test-ClaimWaitRetryRoom', 'Get-ClaimWaitUnfinishedText') { $f = $ast.Find({ param($x) $x -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $x.Name -eq $n }, $true); if ($f) { . ([scriptblock]::Create($f.Extent.Text)) } }\n"
+                      "$script:requests = 0; $script:ClaimWaitUnfinishedMax = 3; $script:ClaimWaitNoAnswerMax = 3; $script:ClaimWaitGuardSec = 30; $script:receiptGuardHit = $null; $script:claimWait = @{ denied = 0; startUtc = $null; endUtc = $null }\n"
+                      "$claim = $null; $lastHolder = ''; $unfinished = 0; $noAnswers = 0; $batchNo = 1; $Venue = 'bachelor'; $RunDir = 'r'; $Purpose = 'p'; $ClaimDir = 'c'; $ClaimTtlSec = 60; $ClaimRenewSec = 15; $ClaimPollSec = 1\n"
+                      "function Request-VenueClaim { $script:requests++; [pscustomobject]@{ granted = $false; broken = @(); claim = $null; state = 'held' } }\n"
+                      "function New-GuardBudget { param($a, $b, $c, $d, $e, $f) [pscustomobject]@{} }\n"
+                      "function Invoke-InputGuard { $null }\n"
+                      "function Test-AliasHit { param($h) $false }\n"
+                      "function LogBest { param($m) }\n"
+                      "function Start-Sleep { param([int]$Seconds) [Threading.Thread]::Sleep(($Seconds + $overshootSec) * 1000) }\n"
+                      f"{setup}\n"
+                      ". ([scriptblock]::Create($loop.Extent.Text))\n"
+                      "\"requests=$script:requests\"\n")
+            r = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, timeout=120)
+            self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+            return int(re.search(r"requests=([0-9]+)", r.stdout).group(1))
+        self.assertEqual(requests("$overshootSec = 4; $deadline = [DateTime]::UtcNow.AddSeconds(3)"), 1)
+        self.assertGreaterEqual(requests("$overshootSec = 0; $deadline = [DateTime]::UtcNow.AddSeconds(4)"), 2)
+
+    def test_artifact_preflight_claim_wait_r3_a_slow_claim_request_spends_the_retrys_room(self) -> None:
+        # adversary r3 A1: the room is there after the sleep, and the claim request itself then spends it (BUSY retries on a locked claim file). The runner's own claim loop, in memory: the
+        # second request takes 2.5 s of the ~5 s left, so no second guard (3 s here) fits, and the first pass's hit is the refusal, its strikes counted once.
+        # r6: the retry's request now runs on its bounded worker (~4 s here, the room less 1 s), which this 2.5 s request stays inside, so the room asked again after it is still what stops it.
+        d = self._retry_request_loop("[Threading.Thread]::Sleep(2500); " + self.DENIED, 6, extra="$script:ClaimWaitGuardSec = 3")
+        self.assertEqual((d["requests"], d["workerRequests"], d["guards"], d["thrown"], d["abandoned"]), (2, 1, 1, "", 0), d)
+        self.assertEqual(d["refused"], "WHY (no answer on 1 read in a row while no claim was held)", d)
+
+    def test_artifact_preflight_claim_wait_r3_an_answered_failure_before_a_stalled_read_still_refuses_on_that_poll(self) -> None:
+        # adversary r3 A2: the second pass finds the spec gone (an ANSWERED failure, kept in the worker) and then stalls on the build's existence read. That is the refusal on that poll, not a
+        # read to try again, however healthy the next one would look; the first pass, which only stalled, is still read again.
+        self._fresh_run_dir()
+        self._foreign_live_claim()
+        spec = self.case / "safe" / "fx-a.json"
+        spec.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(self.specs[0], spec)
+        args, e = self.plan_cmd(self.write_plan([self.item(spec, "A", self.commit_a)]), "-GuardReadDelay", "claim:existence=40x2")
+        code, so, se, _ = self._run_acting_on_stderr(args, e, "CLAIM_WAIT_GUARD_NO_ANSWER", spec.unlink)
+        self.assertEqual(code, 2, so + se)
+        self.assertEqual(se.count("CLAIM_WAIT_GUARD_NO_ANSWER"), 1, se)
+        self.assertIn("LEG_PLAN_REFUSED reason=SHARE_UNREACHABLE item=1 ", se)
+        self.assertIn("already answered with a failure: INPUT_VANISHED", se)
+        self.assertRegex(se, self.GUARD_READS_RE.format("location:build1"))
+        self.assertEqual(self.kinds(), [], "no lease was opened")
+
+    def test_artifact_preflight_claim_wait_r3_a_manifest_found_gone_before_a_stalled_read_still_refuses_on_that_poll(self) -> None:
+        # adversary r3 pass 2 A1: the sibling of the answered failure above. The location step confirms the manifest is gone, and leaves its typing to the content step, which a stalled spec
+        # read then never reaches. That is an answer too: the poll refuses, whatever the next read would find.
+        manifest = self._staged_manifest(self.commit_a)
+        args, e = self._claim_wait_cmd("-GuardReadDelay", "claim:spec=40x2")
+        code, so, se, _ = self._run_acting_on_stderr(args, e, "CLAIM_WAIT_GUARD_NO_ANSWER", manifest.unlink)
+        self.assertEqual(code, 2, so + se)
+        self.assertEqual(se.count("CLAIM_WAIT_GUARD_NO_ANSWER"), 1, se)
+        self.assertIn("already answered with a failure: BUILD_NOT_STAGED", se)
+        self.assertEqual(self.kinds(), [], "no lease was opened")
+
+    def test_artifact_preflight_claim_wait_r4_a_manifest_found_gone_then_no_room_is_refused_on_that_poll(self) -> None:
+        # r4 (sol, fable, opus r3 blocker; sol ran it at 28.01, 29 and 29.99 s): the row above with a pass that COMPLETES. The spec read answers at 28 s of the 30, so the next read has no
+        # room, and the worker returns its no-room hit instead of being given up on. The manifest was still found gone first: refused on that poll, never read again.
+        # (On a host so slow that the guard gives up on the spec read instead, the row above is what runs, and this says the same.)
+        manifest = self._staged_manifest(self.commit_a)
+        args, e = self._claim_wait_cmd("-GuardReadDelay", "claim:spec=28x2")
+        code, so, se, _ = self._run_acting_on_stderr(args, e, "CLAIM_WAIT_GUARD_NO_", manifest.unlink)
+        self.assertEqual(code, 2, so + se)
+        self.assertEqual(se.count("CLAIM_WAIT_GUARD_NO_"), 1, se)
+        self.assertIn("LEG_PLAN_REFUSED reason=SHARE_UNREACHABLE item=1 ", se)
+        self.assertIn("already answered with a failure: BUILD_NOT_STAGED", se)
+        self.assertEqual(self.kinds(), [], "no lease was opened")
+        self.assertEqual(self.leg_calls(), [])
+
+    def _guard_passes_in_memory(self, passes: str, stall_commit: str) -> list[dict]:
+        # one no-claim pass per row, in one process, through the runner's own Invoke-InputGuard, worker runspace, location and content steps, and VenueChain's bounded read. Only the
+        # alias and spec checks are stubbed, and a pass's room is cut at the named read's progress line (no read has to be slow, so no host is too slow or too fast for it).
+        flag = self.case / "stall-on"
+        manifest_probe, _ = self._timed_probes(8000, 0, when=f"$p -like '*{stall_commit[:12]}*' -and [IO.File]::Exists('{psq(flag)}')")
+        script = (f"$ast = [System.Management.Automation.Language.Parser]::ParseFile('{psq(RUNNER)}', [ref]$null, [ref]$null)\n"
+                  "function Get-Def([string]$n) { $ast.Find({ param($x) $x -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $x.Name -eq $n }, $true).Extent.Text }\n"
+                  "foreach ($n in 'New-GuardBudget', 'Invoke-InputGuard', 'Get-GuardTimingText', 'Get-InputOutputRefusal', 'Get-InputContentRefusal', 'Wait-GuardReadSeam', 'Get-OutputZones', 'Get-PhysicalPath', 'Get-FileIdentity', 'Remove-TrailingSeparator', 'Test-NothingAtName') { . ([scriptblock]::Create((Get-Def $n))) }\n"
+                  "foreach ($v in '$script:GuardReadMinSec', '$script:GuardWorkerFunctions', '$script:GuardWorker') { . ([scriptblock]::Create($ast.Find({ param($x) $x -is [System.Management.Automation.Language.AssignmentStatementAst] -and $x.Left.Extent.Text -ceq $v }, $true).Extent.Text)) }\n"
+                  "$t = Get-Def 'Set-GuardProgress'\n"
+                  "$cut = 'if ($Phase -ceq ''content'') { $b = $script:guardBudget; if ($b.cutKind -ceq $Input_.kind -and $b.cutItem -eq $Input_.item) { $b.sec = $b.clock.Elapsed.TotalSeconds + $b.room } }'\n"
+                  ". ([scriptblock]::Create($t.Substring(0, $t.LastIndexOf('}')) + \"`n$cut`n}\"))\n"
+                  "function Get-RunDirOutputRefusal { param($p) '' }\n"
+                  "function Get-InputUnresolvedCode { param($p, [switch]$SkipRead) '' }\n"
+                  "function Get-LegSpecRefusal { param($p, $b) @('', '') }\n"
+                  f"$here = '{psq(RUNNER.parent)}'; Import-Module (Join-Path $here 'VenueChain.psm1') -Force -DisableNameChecking\n"
+                  f"$legPlanMode = $true; $AgentShare = '{psq(self.share)}'; $RunDir = 'r'; $Venue = 'bachelor'; $ClaimDir = 'c'; $artifactProbe = $null; $script:guardDelaySeam = $null; $script:claimWait = $null\n"
+                  f"$stagedBuildProbe = [scriptblock]::Create([IO.File]::ReadAllText('{psq(manifest_probe)}'))\n"
+                  "function Build-Input([int]$item, [string]$commit, [string]$sha) { [pscustomobject]@{ kind = 'build'; item = $item; commit = $commit; sha256 = $sha; path = ($AgentShare.TrimEnd('\\') + '\\cache\\playback-attr-3-cuda-' + $commit.Substring(0, 12) + '-build.json') } }\n"
+                  f"$a = Build-Input 2 '{self.commit_a}' '{self.manifests[self.commit_a]}'; $b1 = Build-Input 1 '{self.commit_b}' '{self.manifests[self.commit_b]}'\n"
+                  "$spec = [pscustomobject]@{ kind = 'spec'; item = 1; path = 's'; backend = 'cpu' }\n"
+                  f"$rows = @(\n{passes}\n)\n"
+                  "$out = foreach ($row in $rows) {\n"
+                  "    $gone = $row.gone\n"
+                  f"    if ($row.stall) {{ [IO.File]::WriteAllText('{psq(flag)}', '') }} else {{ [IO.File]::Delete('{psq(flag)}') }}\n"
+                  "    if ($gone) { [IO.File]::Move($a.path, \"$($a.path).away\") }\n"
+                  "    $script:guardedInputs = @($row.inputs)\n"
+                  "    $script:guardBudget = New-GuardBudget 60 'the test room' 'SHARE_UNREACHABLE' $false 'claim' $true\n"
+                  "    $script:guardBudget | Add-Member cutKind $row.kind; $script:guardBudget | Add-Member cutItem $row.item; $script:guardBudget | Add-Member room $row.room\n"
+                  "    $h = Invoke-InputGuard\n"
+                  "    $script:guardBudget = $null\n"
+                  "    if ($gone) { [IO.File]::Move(\"$($a.path).away\", $a.path) }\n"
+                  "    [pscustomobject]@{ site = $row.site; gone = $gone; code = $h.code; item = $h.item; noAnswer = [bool]$h.noAnswer; readAbandoned = [bool]$h.readAbandoned; locationUnknown = [bool]$h.locationUnknown; why = $h.why }\n"
+                  "}\n"
+                  # a read given up on is a live thread the host would wait for
+                  "[Console]::Out.WriteLine((ConvertTo-Json -Compress -InputObject @($out))); [Console]::Out.Flush(); [Environment]::Exit(0)\n")
+        r = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, timeout=120)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        return json.loads(r.stdout.strip().splitlines()[-1])
+
+    def test_artifact_preflight_claim_wait_r4_a_manifest_found_gone_is_refused_at_each_exit_that_completes_the_pass(self) -> None:
+        # r4 catalogue row (sol, fable, opus r3): manifest found gone, then the pass ends on a no-room hit or a bounded manifest read given up on: the failure is named and noAnswer is off, so
+        # the claim loop refuses on that poll. Each exit has a row, its control next to it: the same exit with the manifest back answers nothing, stays noAnswer and is read again (INV-1).
+        # The no-room exit before a read also has the real-process row above. The build read's own room check has no read before it to delay, so only a cut room reaches it, and the A/B read
+        # given up on (sol's two-build form) is here because a real run of it costs two whole 30 s passes.
+        rows = {"no_room_next_read": ("@($spec, $a)", "'spec'", 1, 1, 0), "no_room_build_read": ("@($b1, $a)", "'build'", 2, 1, 0), "manifest_read_given_up": ("@($b1, $a)", "'build'", 1, 2.5, 1)}
+        passes = ",\n".join(f"[pscustomobject]@{{ site = '{site}'; gone = ${'true' if gone else 'false'}; inputs = {inputs}; kind = {kind}; item = {item}; room = {room}; stall = {'$true' if stall else '$false'} }}"
+                            for site, (inputs, kind, item, room, stall) in rows.items() for gone in (True, False))
+        got = {(d["site"], d["gone"]): d for d in self._guard_passes_in_memory(passes, self.commit_b)}
+        self.assertEqual(len(got), 6, got)
+        says = {"no_room_next_read": "to re-read the build input", "no_room_build_read": "to read and hash the staged build for", "manifest_read_given_up": "could not be read after the claim wait"}
+        for site, text in says.items():
+            given_up = site == "manifest_read_given_up"
+            with self.subTest(site=site, gone=True):
+                d = got[(site, True)]
+                self.assertEqual(d["code"], "SHARE_UNREACHABLE", d)
+                self.assertIn(text, d["why"])
+                self.assertFalse(d["noAnswer"], f"read again, not refused: {d}")
+                self.assertRegex(d["why"], r"already answered with a failure: BUILD_NOT_STAGED \S+ \[guardReads\(sec\): ", "named, before the timing, as the worker-given-up branch says it")
+                self.assertEqual((d["readAbandoned"], d["locationUnknown"]), (given_up, given_up), d)
+                self.assertEqual("+ claimWaitBefore" in d["why"], given_up, "'+' is only for a read really given up on")
+            with self.subTest(site=site, gone=False):
+                d = got[(site, False)]
+                self.assertEqual(d["code"], "SHARE_UNREACHABLE", d)
+                self.assertIn(text, d["why"])
+                self.assertTrue(d["noAnswer"], f"a pass that really did not finish is read again: {d}")
+                self.assertNotIn("already answered", d["why"])
+                self.assertEqual(d["readAbandoned"], given_up, d)
+
+    def test_artifact_preflight_claim_wait_r5_a_manifest_gone_then_back_in_the_same_pass_is_refused_on_that_poll(self) -> None:
+        # r5 catalogue row (sol r4 B1; hub ruling: sticky, fail closed): the location step finds the manifest gone, and it is back, STAGED with the original digest, before the content
+        # step reads it. On 30ecd3a4 the content read answered null and the plan was accepted; the pass saw it gone, so the poll refuses naming BUILD_NOT_STAGED. In memory, through the
+        # runner's own Get-InputOutputRefusal (direct) and Invoke-InputGuard (its worker), with VenueChain's real manifest read; only the alias and spec checks are stubbed, and the manifest
+        # is put back at the content step's progress line. Controls: never back (NOT_STAGED), back with other bytes (BUILD_MANIFEST_MISMATCH), never gone (accepted).
+        changed = self.case / "changed-on"
+        manifest = self._staged_manifest(self.commit_a)
+        hook = self.case / "r5-back-hook.ps1"
+        hook.write_text("if ($Phase -ceq 'content' -and [IO.File]::Exists($Input_.path + '.away') -and [IO.File]::Exists($Input_.path + '.back')) { [IO.File]::Move($Input_.path + '.away', $Input_.path); "
+                        f"if ([IO.File]::Exists('{psq(changed)}')) {{ [IO.File]::AppendAllText($Input_.path, ' ') }} }}\n", encoding="utf-8")
+        script = (f"$ast = [System.Management.Automation.Language.Parser]::ParseFile('{psq(RUNNER)}', [ref]$null, [ref]$null)\n"
+                  "function Get-Def([string]$n) { $ast.Find({ param($x) $x -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $x.Name -eq $n }, $true).Extent.Text }\n"
+                  "foreach ($n in 'New-GuardBudget', 'Invoke-InputGuard', 'Get-GuardTimingText', 'Get-InputOutputRefusal', 'Get-InputContentRefusal', 'Wait-GuardReadSeam', 'Get-OutputZones', 'Get-PhysicalPath', 'Get-FileIdentity', 'Remove-TrailingSeparator', 'Test-NothingAtName') { . ([scriptblock]::Create((Get-Def $n))) }\n"
+                  "foreach ($v in '$script:GuardReadMinSec', '$script:GuardWorkerFunctions', '$script:GuardWorker') { . ([scriptblock]::Create($ast.Find({ param($x) $x -is [System.Management.Automation.Language.AssignmentStatementAst] -and $x.Left.Extent.Text -ceq $v }, $true).Extent.Text)) }\n"
+                  # the manifest is put back at the content step's progress line, after the location step found it gone and before the content read
+                  "$t = Get-Def 'Set-GuardProgress'\n"
+                  f". ([scriptblock]::Create($t.Substring(0, $t.LastIndexOf('}}')) + \"`n\" + [IO.File]::ReadAllText('{psq(hook)}') + \"`n}}\"))\n"
+                  "function Get-RunDirOutputRefusal { param($p) '' }\n"
+                  "function Get-InputUnresolvedCode { param($p, [switch]$SkipRead) '' }\n"
+                  "function Get-LegSpecRefusal { param($p, $b) @('', '') }\n"
+                  f"$here = '{psq(RUNNER.parent)}'; Import-Module (Join-Path $here 'VenueChain.psm1') -Force -DisableNameChecking\n"
+                  f"$legPlanMode = $true; $AgentShare = '{psq(self.share)}'; $RunDir = 'r'; $Venue = 'bachelor'; $ClaimDir = 'c'; $artifactProbe = $null; $stagedBuildProbe = $null; $script:guardDelaySeam = $null; $script:claimWait = $null\n"
+                  f"$a = [pscustomobject]@{{ kind = 'build'; item = 1; commit = '{self.commit_a}'; sha256 = '{self.manifests[self.commit_a]}'; path = '{psq(manifest)}' }}\n"
+                  "$orig = [IO.File]::ReadAllBytes($a.path)\n"
+                  "$out = foreach ($mode in 'direct', 'wrapper') { foreach ($case in 'back_same', 'back_changed', 'gone_stays', 'never_gone') {\n"
+                  f"    if ($case -ceq 'back_changed') {{ [IO.File]::WriteAllText('{psq(changed)}', '') }} else {{ [IO.File]::Delete('{psq(changed)}') }}\n"
+                  "    if ($case -like 'back_*') { [IO.File]::WriteAllText($a.path + '.back', '') } else { [IO.File]::Delete($a.path + '.back') }\n"
+                  "    if ($case -cne 'never_gone') { [IO.File]::Move($a.path, $a.path + '.away') }\n"
+                  "    $script:guardedInputs = @($a)\n"
+                  "    $script:guardBudget = New-GuardBudget 60 'the test room' 'SHARE_UNREACHABLE' $false 'claim' $true\n"
+                  "    if ($mode -ceq 'direct') { $script:guardProgress = [hashtable]::Synchronized(@{ locationsDone = $false; item = 0; at = 'x'; steps = [Collections.ArrayList]::Synchronized([Collections.ArrayList]::new()) }); $h = Get-InputOutputRefusal; $script:guardProgress = $null }\n"
+                  "    else { $h = Invoke-InputGuard }\n"
+                  "    $script:guardBudget = $null\n"
+                  "    if ([IO.File]::Exists($a.path + '.away')) { [IO.File]::Delete($a.path); [IO.File]::Move($a.path + '.away', $a.path) }\n"
+                  "    [IO.File]::WriteAllBytes($a.path, $orig); [IO.File]::Delete($a.path + '.back')\n"
+                  "    [pscustomobject]@{ mode = $mode; case = $case; code = $h.code; item = $h.item; noAnswer = [bool]$h.noAnswer; why = $h.why }\n"
+                  "} }\n"
+                  "[Console]::Out.WriteLine((ConvertTo-Json -Compress -InputObject @($out)))\n")
+        r = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, timeout=120)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        got = {(d["mode"], d["case"]): d for d in json.loads(r.stdout.strip().splitlines()[-1])}
+        self.assertEqual(len(got), 8, got)
+        for mode in ("direct", "wrapper"):
+            with self.subTest(mode=mode, case="back_same"):
+                d = got[(mode, "back_same")]
+                self.assertEqual((d["code"], d["item"], d["noAnswer"]), ("BUILD_NOT_STAGED", 1, False), f"a manifest the pass saw gone is refused on that poll: {d}")
+                self.assertIn(f"{manifest} was gone when this guard pass looked for it", d["why"])
+            with self.subTest(mode=mode, case="controls"):
+                self.assertEqual(got[(mode, "back_changed")]["code"], "BUILD_MANIFEST_MISMATCH", got[(mode, "back_changed")])
+                self.assertEqual(got[(mode, "gone_stays")]["code"], "BUILD_NOT_STAGED", got[(mode, "gone_stays")])
+                self.assertIn("no staged build manifest for", got[(mode, "gone_stays")]["why"], "the content step's own NOT_STAGED wording, unchanged")
+                self.assertIsNone(got[(mode, "never_gone")]["code"], got[(mode, "never_gone")])
+
+    def test_artifact_preflight_claim_wait_r5_a_no_room_refusal_reads_no_input_before_it_prints(self) -> None:
+        # r5 catalogue row (sol r4 B2): a terminal no-room hit, and one that names an answered failure, refused through Stop-InputIsOutput with every input's path and identity read
+        # delayed 1500 ms. On 30ecd3a4 the refusal went through the write guard first (Test-RunDirWrite re-read the inputs with no bound) and printed 1.5 s late or more; here it reads
+        # nothing, writes nothing into -RunDir, and says the line is on stderr only, with batch.log there and not. The hits are the runner's own (Invoke-InputGuard, its room cut to 1 s at
+        # the first content read's progress line, so the next read has none: the spec exit and the build exit); only the final exit is a sentinel. The no-room hit keeps noAnswer, so a
+        # pass that truly did not finish is still read again (INV-1).
+        spec = self.case / "r5-spec.json"
+        spec.write_text("{}", encoding="utf-8")
+        manifest_probe, _ = self._timed_probes(4000, 0)
+        spec2 = self.case / "r5-spec2.json"
+        spec2.write_text("{}", encoding="utf-8")
+        gone = self.case / "r5-gone-build.json"
+        run_dir = self.case / "r5-run"
+        run_dir.mkdir(parents=True, exist_ok=True)
+        script = (f"$ast = [System.Management.Automation.Language.Parser]::ParseFile('{psq(RUNNER)}', [ref]$null, [ref]$null)\n"
+                  "function Get-Def([string]$n) { $ast.Find({ param($x) $x -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $x.Name -eq $n }, $true).Extent.Text }\n"
+                  "foreach ($n in 'New-GuardBudget', 'Invoke-InputGuard', 'Get-GuardTimingText', 'Get-InputOutputRefusal', 'Wait-GuardReadSeam', 'Get-OutputZones', 'Get-PhysicalPath', 'Get-FileIdentity', 'Remove-TrailingSeparator',\n"
+                  "    'Test-NothingAtName', 'Get-HitRefusal', 'Get-WriteDestinationHit', 'Test-RunDirWrite', 'Register-WriteRefusal', 'Stop-InputIsOutput') { . ([scriptblock]::Create((Get-Def $n))) }\n"
+                  # adversary r5 pass 2 A1: a build read's share is capped at 330 s, under a larger budget; the cap is 6 s here (the extracted function's literal), so a share runs out in seconds
+                  "$c = Get-Def 'Get-InputContentRefusal'; if (-not $c.Contains('[Math]::Min(330.0,')) { throw 'the 330 s share cap moved' }; . ([scriptblock]::Create($c.Replace('[Math]::Min(330.0,', '[Math]::Min(6.0,')))\n"
+                  "$t = Get-Def 'Set-GuardProgress'\n"
+                  ". ([scriptblock]::Create($t.Substring(0, $t.LastIndexOf('}')) + \"`nif (`$Phase -ceq 'content') { `$b = `$script:guardBudget; `$b.sec = `$b.clock.Elapsed.TotalSeconds + `$b.room }`n}\"))\n"
+                  ". ([scriptblock]::Create(((Get-Def 'Stop-PlanRefused') -replace '(?m)^\\s*exit 2\\s*$', \"throw 'EXIT2'\")))\n"
+                  "foreach ($v in '$script:GuardReadMinSec', '$script:GuardWorkerFunctions', '$script:GuardWorker') { . ([scriptblock]::Create($ast.Find({ param($x) $x -is [System.Management.Automation.Language.AssignmentStatementAst] -and $x.Left.Extent.Text -ceq $v }, $true).Extent.Text)) }\n"
+                  "function Get-RunDirOutputRefusal { param($p) '' }\n"
+                  "function Get-InputUnresolvedCode { param($p, [switch]$SkipRead) '' }\n"
+                  "function Get-LegSpecRefusal { param($p, $b) @('', '') }\n"
+                  "function Wait-RunDirReadSeam { }\n"
+                  "function Complete-VenueProcess { param($ExitCode) }\n"
+                  "function Register-LogFailure { param($w) }\n"
+                  "function Test-AliasHit { param($h) $false }\n"
+                  "function Enable-WriteSuppression { param($h) $script:RunOutputAliased = $true }\n"
+                  f"$here = '{psq(RUNNER.parent)}'; Import-Module (Join-Path $here 'VenueChain.psm1') -Force -DisableNameChecking\n"
+                  f"$legPlanMode = $true; $AgentShare = '{psq(self.share)}'; $RunDir = '{psq(run_dir)}'; $Venue = 'bachelor'; $ClaimDir = 'c'; $artifactProbe = $null; $script:guardDelaySeam = $null; $script:claimWait = $null\n"
+                  f"$stagedBuildProbe = [scriptblock]::Create([IO.File]::ReadAllText('{psq(manifest_probe)}'))\n"
+                  "$script:summaryBeforeExit = $null; $script:receiptGuardHit = $null\n"
+                  f"$spec = [pscustomobject]@{{ kind = 'spec'; item = 1; path = '{psq(spec)}'; backend = 'cpu' }}; $spec2 = [pscustomobject]@{{ kind = 'spec'; item = 3; path = '{psq(spec2)}'; backend = 'cpu' }}\n"
+                  f"$goneBuild = [pscustomobject]@{{ kind = 'build'; item = 2; commit = '{self.commit_a}'; sha256 = '{self.manifests[self.commit_a]}'; path = '{psq(gone)}' }}\n"
+                  f"$build = [pscustomobject]@{{ kind = 'build'; item = 1; commit = '{self.commit_a}'; sha256 = '{self.manifests[self.commit_a]}'; path = '{psq(self._staged_manifest(self.commit_a))}' }}\n"
+                  "function Get-Inputs([string]$k) { if ($k -ceq 'no_room') { @($spec, $spec2) } elseif ($k -ceq 'answered_no_room') { @($goneBuild, $spec) } else { @($build) } }\n"
+                  "$hits = [ordered]@{}\n"
+                  "foreach ($k in 'no_room', 'answered_no_room', 'hash_no_room') {\n"
+                  "    $script:guardedInputs = @(Get-Inputs $k)\n"
+                  "    $script:guardBudget = New-GuardBudget 60 'the test room' 'SHARE_UNREACHABLE' $false 'claim' ($k -cne 'hash_no_room')\n"
+                  # the hash row: a 60 s room, the build's 6 s share, a manifest read that answers at 4 s: the hash has under its 2 s minimum of the share while the budget has some 56 s left
+                  # (VenueChain: UNREACHABLE, artifactsUnhashed, no read given up on; adversary r5 A1 and its pass 2 form)
+                  "    $script:guardBudget | Add-Member room $(if ($k -ceq 'hash_no_room') { 60 } else { 1 })\n"
+                  "    $hits[$k] = Invoke-InputGuard; $script:guardBudget = $null\n"
+                  "}\n"
+                  # from here on every read of an input's (or batch.log's) path or identity is a share that answers 1.5 s late
+                  "function Get-PhysicalPath { param($p) $script:reads++; [Threading.Thread]::Sleep(1500); $p }\n"
+                  "function Get-FileIdentity { param($p) $script:reads++; [Threading.Thread]::Sleep(1500); [pscustomobject]@{ key = \"k:$p\"; links = 1 } }\n"
+                  "$out = foreach ($k in $hits.Keys) { foreach ($log in 'present', 'missing') {\n"
+                  "    $script:guardedInputs = @(Get-Inputs $k)\n"
+                  "    $batchLog = Join-Path $RunDir 'batch.log'\n"
+                  "    if ($log -ceq 'present') { [IO.File]::WriteAllText($batchLog, \"before`n\") } elseif ([IO.File]::Exists($batchLog)) { [IO.File]::Delete($batchLog) }\n"
+                  "    $script:RunOutputAliased = $false; $script:reads = 0; $err = [IO.StringWriter]::new(); $old = [Console]::Error; [Console]::SetError($err)\n"
+                  "    $sw = [Diagnostics.Stopwatch]::StartNew(); $ended = ''\n"
+                  "    try { Stop-InputIsOutput $hits[$k] } catch { $ended = $_.Exception.Message } finally { $ms = $sw.ElapsedMilliseconds; [Console]::SetError($old) }\n"
+                  "    [pscustomobject]@{ hit = $k; log = $log; ended = $ended; ms = $ms; reads = $script:reads; noAnswer = [bool]$hits[$k].noAnswer; readAbandoned = [bool]$hits[$k].readAbandoned; stderr = $err.ToString()\n"
+                  "        logText = $(if ([IO.File]::Exists($batchLog)) { [IO.File]::ReadAllText($batchLog) } else { $null }) }\n"
+                  "} }\n"
+                  "[Console]::Out.WriteLine((ConvertTo-Json -Compress -InputObject @($out)))\n")
+        r = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, timeout=120)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        got = json.loads(r.stdout.strip().splitlines()[-1])
+        self.assertEqual(len(got), 6, got)
+        for d in got:
+            with self.subTest(hit=d["hit"], log=d["log"]):
+                self.assertEqual(d["ended"], "EXIT2", d)
+                self.assertEqual(d["reads"], 0, f"the refusal read an input (or batch.log) with no bound before it printed: {d}")
+                self.assertLess(d["ms"], 1000, d)
+                self.assertIn("BATCH_USAGE LEG_PLAN_REFUSED reason=SHARE_UNREACHABLE item=", d["stderr"])
+                self.assertIn("no time is left in the test room" if d["hit"] != "hash_no_room" else "no time is left of -TimeoutSec", d["stderr"])
+                self.assertIn("batch.log is not written", d["stderr"])
+                self.assertIn("this refusal is on stderr only", d["stderr"])
+                self.assertEqual(d["logText"], "before\n" if d["log"] == "present" else None, "nothing was written into -RunDir")
+                answered = d["hit"] == "answered_no_room"
+                self.assertEqual(d["noAnswer"], d["hit"] == "no_room", "a pass that truly did not finish is still read again; one that saw a failure is refused (INV-1, INV-2)")
+                self.assertFalse(d["readAbandoned"], f"no read was given up on: the no-room exits themselves are under test: {d}")
+                self.assertEqual("already answered with a failure: BUILD_NOT_STAGED" in d["stderr"], answered, d)
+
+    def test_artifact_preflight_claim_wait_r3_a_claim_request_that_throws_on_a_retry_is_the_typed_refusal(self) -> None:
+        # adversary r3 pass 2 A2: the retry goes into a claim request nothing guarded, and a throw there ended the script with a read given up on still stuck on a live thread, which the host
+        # then waits for. The runner's own claim loop, in memory, with a request that really throws (a file at the claim folder reads BUSY): the first pass's hit is the refusal, the
+        # request's error named in it, and no second guard runs. With nothing unfinished the throw stays the throw it always was.
+        def run(setup: str) -> dict:
+            script = (f"$ast = [System.Management.Automation.Language.Parser]::ParseFile('{psq(RUNNER)}', [ref]$null, [ref]$null)\n"
+                      "$loop = $ast.FindAll({ param($x) $x -is [System.Management.Automation.Language.WhileStatementAst] -and $x.Body.Extent.Text.Contains('Request-VenueClaim') }, $true) | Select-Object -Last 1\n"
+                      "foreach ($n in 'Test-ClaimWaitRetryRoom', 'Get-ClaimWaitUnfinishedText') { . ([scriptblock]::Create($ast.Find({ param($x) $x -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $x.Name -eq $n }, $true).Extent.Text)) }\n"
+                      "Import-Module ([IO.Path]::Combine('" + psq(RUNNER.parent) + "', 'VenueChain.psm1')) -Force -DisableNameChecking\n"
+                      "$script:requests = 0; $script:guards = 0; $script:refused = ''; $script:thrown = ''; $script:ClaimWaitUnfinishedMax = 3; $script:ClaimWaitGuardSec = 1; $script:receiptGuardHit = $null; $script:claimWait = @{ denied = 0; startUtc = $null; endUtc = $null }\n"
+                      "$claim = $null; $lastHolder = ''; $unfinished = 0; $noAnswers = 0; $batchNo = 1; $Venue = 'bachelor'; $RunDir = 'r'; $Purpose = 'p'; $ClaimDir = 'c'; $ClaimTtlSec = 60; $ClaimRenewSec = 15; $ClaimPollSec = 1; $batches = @()\n"
+                      "function New-GuardBudget { param($a, $b, $c, $d, $e, $f) [pscustomobject]@{} }\n"
+                      "function Invoke-InputGuard { $script:guards++; [pscustomobject]@{ kind = 'content'; item = 1; code = 'SHARE_UNREACHABLE'; noAnswer = $true; readAbandoned = $true; locationUnknown = $true; why = 'WHY' } }\n"
+                      "function Test-AliasHit { param($h) $false }\n"
+                      "function LogBest { param($m) }\n"
+                      "function Stop-InputIsOutput { param($h) $script:refused = $h.why; throw 'REFUSED' }\n"
+                      "$deadline = [DateTime]::UtcNow.AddSeconds(60)\n"
+                      f"{setup}\n"
+                      "try { . ([scriptblock]::Create($loop.Extent.Text)) } catch { if ($_.Exception.Message -cne 'REFUSED') { $script:thrown = $_.Exception.Message } }\n"
+                      "[pscustomobject]@{ requests = $script:requests; guards = $script:guards; refused = $script:refused; thrown = $script:thrown } | ConvertTo-Json -Compress\n")
+            r = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, timeout=120)
+            self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+            return json.loads(r.stdout.strip().splitlines()[-1])
+        # r6: the retry's request runs on its bounded worker, which rethrows what the request threw
+        retry = self._retry_request_loop("throw 'claim folder went'", 60, extra="$script:ClaimWaitGuardSec = 1")
+        self.assertEqual((retry["requests"], retry["workerRequests"], retry["guards"], retry["thrown"]), (2, 1, 1, ""), retry)
+        self.assertEqual(retry["refused"], "WHY (the claim request then threw: claim folder went) (no answer on 1 read in a row while no claim was held)", retry)
+        first = run("function Request-VenueClaim { $script:requests++; throw 'claim folder went' }")
+        self.assertEqual((first["requests"], first["guards"], first["refused"], first["thrown"]), (1, 0, "", "claim folder went"), first)
+
+    DENIED = "[pscustomobject]@{ granted = $false; broken = @(); claim = $null; state = 'held' }"
+
+    def _retry_request_loop(self, retry: str, deadline_sec: float, extra: str = "", settle_sec: float = 0.0, release: str = "") -> dict:
+        # r6 (sol r5 blocker): the runner's own claim loop, in memory. The first request is master's (in this runspace, denied at once); every RETRY request answers with `retry`. The
+        # retry's request runs on a worker that imports VenueChain.psm1 from $here, so the same `retry` is a stub module there; on a head that still calls it inline, the in-runspace stub
+        # answers it the same way. The first guard pass does not finish (noAnswer), so the loop retries; a granted attempt's guard answers. `settle_sec` waits after the refusal for a
+        # worker given up on to end (a late grant it must release itself).
+        stub = Path(tempfile.mkdtemp(prefix="retry-req-", dir=self.case))
+        log = psq(stub)
+        (stub / "VenueChain.psm1").write_text(
+            "function Request-VenueClaim { param($Venue, $RunDir, $Purpose, $TtlSec, $ClaimDir) [IO.File]::AppendAllText('" + log + "\\requests.log', \"w`n\"); " + retry + " }\n"
+            "function Release-VenueClaim { param($Venue, $Nonce, $ClaimDir) " + release + "[IO.File]::AppendAllText('" + log + "\\releases.log', \"worker:$Nonce`n\"); 'RELEASED' }\n", encoding="utf-8")
+        script = (f"$ast = [System.Management.Automation.Language.Parser]::ParseFile('{psq(RUNNER)}', [ref]$null, [ref]$null)\n"
+                  "$loop = $ast.FindAll({ param($x) $x -is [System.Management.Automation.Language.WhileStatementAst] -and $x.Body.Extent.Text.Contains('Request-VenueClaim') }, $true) | Select-Object -Last 1\n"
+                  "foreach ($n in 'Test-ClaimWaitRetryRoom', 'Get-ClaimWaitUnfinishedText', 'Invoke-ClaimRetryRequest', 'Invoke-ClaimRetryRelease') { $f = $ast.Find({ param($x) $x -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $x.Name -eq $n }, $true); if ($f) { . ([scriptblock]::Create($f.Extent.Text)) } }\n"
+                  # r7: every $script:ClaimRetry* value (the workers, the grace and tail) and the guard's read minimum, as the runner sets them
+                  "foreach ($a in $ast.EndBlock.Statements) { if ($a -is [System.Management.Automation.Language.AssignmentStatementAst] -and ($a.Left.Extent.Text -clike '$script:ClaimRetry*' -or $a.Left.Extent.Text -ceq '$script:GuardReadMinSec')) { . ([scriptblock]::Create($a.Extent.Text)) } }\n"
+                  "Import-Module ([IO.Path]::Combine('" + psq(RUNNER.parent) + "', 'VenueChain.psm1')) -Force -DisableNameChecking\n"
+                  f"$here = '{log}'\n"
+                  "$script:budgets = [Collections.Generic.List[double]]::new(); $script:budgetRooms = [Collections.Generic.List[double]]::new()\n"
+                  "$script:requests = 0; $script:guards = 0; $script:refused = ''; $script:refusedAt = -1.0; $script:thrown = ''; $script:ClaimWaitUnfinishedMax = 3; $script:ClaimWaitGuardSec = 0; $script:receiptGuardHit = $null; $script:claimWait = @{ denied = 0; startUtc = $null; endUtc = $null }\n"
+                  "$claim = $null; $lastHolder = ''; $unfinished = 0; $noAnswers = 0; $batchNo = 1; $Venue = 'bachelor'; $RunDir = 'r'; $Purpose = 'p'; $ClaimDir = 'c'; $ClaimTtlSec = 60; $ClaimRenewSec = 15; $ClaimPollSec = 1; $batches = @()\n"
+                  "function Request-VenueClaim { $script:requests++; if ($script:requests -eq 1) { " + self.DENIED + " } else { " + retry + " } }\n"
+                  "function Release-VenueClaim { param($Venue, $Nonce, $ClaimDir) " + release + "[IO.File]::AppendAllText('" + log + "\\releases.log', \"main:$Nonce`n\"); 'RELEASED' }\n"
+                  "function New-GuardBudget { param($a, $b, $c, $d, $e, $f) [pscustomobject]@{} }\n"
+                  "function Invoke-InputGuard { $script:guards++; if ($req.granted) { $null } else { [pscustomobject]@{ kind = 'content'; item = 1; code = 'SHARE_UNREACHABLE'; noAnswer = $true; readAbandoned = $true; locationUnknown = $true; why = 'WHY' } } }\n"
+                  "function Test-AliasHit { param($h) $false }\n"
+                  "function LogBest { param($m) }\n"
+                  "function Start-Sleep { param([int]$Seconds) [Threading.Thread]::Sleep($Seconds * 1000) }\n"
+                  "function Stop-InputIsOutput { param($h) $script:refusedAt = $clock.Elapsed.TotalSeconds; $script:refused = $h.why; $script:aliasedAtRefusal = [bool]$script:RunOutputAliased; throw 'REFUSED' }\n"
+                  f"{extra}\n"
+                  f"$clock = [Diagnostics.Stopwatch]::StartNew(); $deadline = [DateTime]::UtcNow.AddSeconds({deadline_sec})\n"
+                  "try { . ([scriptblock]::Create($loop.Extent.Text)) } catch { if ($_.Exception.Message -cne 'REFUSED') { $script:thrown = $_.Exception.Message } }\n"
+                  "$ended = $clock.Elapsed.TotalSeconds\n"
+                  f"$settle = [Diagnostics.Stopwatch]::StartNew(); while ($settle.Elapsed.TotalSeconds -lt {settle_sec} -and -not (Test-Path '{log}\\releases.log')) {{ [Threading.Thread]::Sleep(100) }}\n"
+                  f"$w = @(if (Test-Path '{log}\\requests.log') {{ [IO.File]::ReadAllLines('{log}\\requests.log') }}); $rel = @(if (Test-Path '{log}\\releases.log') {{ [IO.File]::ReadAllLines('{log}\\releases.log') }})\n"
+                  "[Console]::Out.WriteLine(([pscustomobject]@{ requests = $script:requests + $w.Count; workerRequests = $w.Count; guards = $script:guards; refused = $script:refused; refusedAt = $script:refusedAt; ended = $ended; deadlineSec = "
+                  f"{deadline_sec}; thrown = $script:thrown; claim = $(if ($claim) {{ [string]$claim.nonce }}); releases = $rel; abandoned = (& (Get-Module VenueChain) {{ $script:VenueAbandonedReads }})\n"
+                  "    budgets = @($script:budgets); budgetRooms = @($script:budgetRooms); aliasedAtRefusal = [bool]$script:aliasedAtRefusal; probes = [int]$script:probes } | ConvertTo-Json -Compress)); [Console]::Out.Flush()\n"
+                  "[Environment]::Exit(0)\n")
+        try:
+            r = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, timeout=60)
+        except subprocess.TimeoutExpired:
+            self.fail(f"the claim loop did not end in 60 s (a deadline of {deadline_sec} s): the retry's claim request is not bounded")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        return json.loads(r.stdout.strip().splitlines()[-1])
+
+    def test_artifact_preflight_claim_wait_r6_a_retry_claim_request_that_overruns_the_room_is_the_saved_refusal_by_the_deadline(self) -> None:
+        # sol r5 blocker (key-attack row B-01b): an unfinished no-claim pass, then a retry request that takes longer than the room left (a claim folder on a share that stalls). The request
+        # is bounded by that room less 1 s, so the saved typed refusal prints before -DeadlineUtc, the worker given up on is counted, and no lease or leg follows. ~4 s per row.
+        for name, retry in (("slow", "[Threading.Thread]::Sleep(6000); " + self.DENIED), ("never", "[Threading.Thread]::Sleep(600000); " + self.DENIED)):
+            with self.subTest(retry=name):
+                d = self._retry_request_loop(retry, 4)
+                self.assertEqual(d["thrown"], "", d)
+                self.assertEqual((d["requests"], d["guards"], d["claim"]), (2, 1, None), d)
+                self.assertGreaterEqual(d["refusedAt"], 0, d)
+                self.assertLess(d["refusedAt"], d["deadlineSec"], f"the saved refusal printed after the deadline: {d}")
+                self.assertTrue(d["refused"].startswith("WHY (the claim request did not answer in "), d)
+                self.assertIn("(no answer on 1 read in a row while no claim was held)", d["refused"])
+                self.assertEqual(d["abandoned"], 1, f"the request's worker given up on is an abandoned read (Complete-VenueProcess exits at once): {d}")
+                self.assertEqual(d["releases"], [], d)
+        # adversary r6 A1: a deadline 30 days out overflowed WaitOne (past about 24.8 days), and the throw disposed the still-running worker synchronously. The wait is capped (600 s; 2 s
+        # here, the cap lifted from the runner and lowered in memory so the row is quick), so the never-returning request is given up on at the cap. ~4 s.
+        far = self._retry_request_loop("[Threading.Thread]::Sleep(600000); " + self.DENIED, 30 * 86400, extra="$script:ClaimRetryRequestMaxSec = 2")
+        self.assertEqual((far["requests"], far["guards"], far["claim"], far["thrown"], far["abandoned"]), (2, 1, None, "", 1), far)
+        self.assertTrue(far["refused"].startswith("WHY (the claim request did not answer in 2 s, the most a retry's request is waited for;"), far)
+
+    def test_artifact_preflight_claim_wait_r6_a_retry_with_less_room_than_the_floor_requests_nothing(self) -> None:
+        # the room left at the retry is about 1 s, under the 2 s floor: no request starts, the saved refusal prints now. The room checks are forced true so only the floor can stop it. ~2 s.
+        d = self._retry_request_loop(self.DENIED, 4, extra="function Test-ClaimWaitRetryRoom { $true }\n"
+                                     "function Start-Sleep { param([int]$Seconds) [Threading.Thread]::Sleep([Math]::Max(0, [int](($deadline - [DateTime]::UtcNow).TotalMilliseconds - 1000))) }")
+        self.assertEqual((d["requests"], d["workerRequests"], d["guards"], d["claim"], d["thrown"]), (1, 0, 1, None, ""), d)
+        self.assertLess(d["refusedAt"], d["deadlineSec"], d)
+        self.assertTrue(d["refused"].startswith("WHY (no claim request was made: "), d)
+        self.assertEqual(d["abandoned"], 0, d)
+
+    def test_artifact_preflight_claim_wait_r6_a_late_grant_is_released_and_refused(self) -> None:
+        # a retry request that GRANTS after its bound: the loop has already printed the saved refusal; the worker, finding itself given up on, releases its own grant, so no claim is left
+        # behind and no guard or lease runs on it. ~7 s. And the grant that comes back inside the bound but at or past the deadline (a late wakeup): released by the worker, never used. ~2 s.
+        late = self._retry_request_loop("[Threading.Thread]::Sleep(4000); [pscustomobject]@{ granted = $true; broken = @(); claim = [pscustomobject]@{ nonce = 'late-n' }; state = 'TAKEN' }", 4, settle_sec=6)
+        self.assertEqual((late["requests"], late["guards"], late["claim"], late["thrown"]), (2, 1, None, ""), late)
+        self.assertLess(late["refusedAt"], late["deadlineSec"], late)
+        self.assertEqual(late["releases"], ["worker:late-n"], f"the late grant was not released by its worker: {late}")
+        self.assertEqual(late["abandoned"], 1, late)
+        # inside the bound, past the deadline: Invoke-ClaimRetryRequest itself, a grant at once, with the worker's late cutoff moved to yesterday IN MEMORY (the function text lifted from
+        # the runner and that one argument replaced; adversary r6 A2: the runner takes no such parameter), as a caller woken late past the deadline would find it
+        stub = Path(tempfile.mkdtemp(prefix="retry-late-", dir=self.case))
+        (stub / "VenueChain.psm1").write_text(
+            "function Request-VenueClaim { param($Venue, $RunDir, $Purpose, $TtlSec, $ClaimDir) [pscustomobject]@{ granted = $true; broken = @(); claim = [pscustomobject]@{ nonce = 'edge-n' }; state = 'TAKEN' } }\n"
+            "function Release-VenueClaim { param($Venue, $Nonce, $ClaimDir) [IO.File]::AppendAllText('" + psq(stub) + "\\releases.log', \"worker:$Nonce`n\"); 'RELEASED' }\n", encoding="utf-8")
+        script = (f"$ast = [System.Management.Automation.Language.Parser]::ParseFile('{psq(RUNNER)}', [ref]$null, [ref]$null)\n"
+                  "$f = $ast.Find({ param($x) $x -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $x.Name -eq 'Invoke-ClaimRetryRequest' }, $true)\n"
+                  "$anchor = 'lateAfterUtc = $DeadlineUtc'; if (([regex]::Matches($f.Extent.Text, [regex]::Escape($anchor))).Count -ne 1) { throw 'the late cutoff anchor moved' }\n"
+                  ". ([scriptblock]::Create($f.Extent.Text.Replace($anchor, 'lateAfterUtc = [DateTime]::UtcNow.AddDays(-1)')))\n"
+                  "foreach ($a in $ast.EndBlock.Statements) { if ($a -is [System.Management.Automation.Language.AssignmentStatementAst] -and $a.Left.Extent.Text -clike '$script:ClaimRetryRequest*') { . ([scriptblock]::Create($a.Extent.Text)) } }\n"
+                  "Import-Module ([IO.Path]::Combine('" + psq(RUNNER.parent) + "', 'VenueChain.psm1')) -Force -DisableNameChecking\n"
+                  f"$here = '{psq(stub)}'\n"
+                  "$r = Invoke-ClaimRetryRequest -DeadlineUtc ([DateTime]::UtcNow.AddSeconds(30)) -RequestArgs @{ Venue = 'bachelor'; RunDir = 'r'; Purpose = 'p'; TtlSec = 60; ClaimDir = 'c' }\n"
+                  f"$s = [Diagnostics.Stopwatch]::StartNew(); while ($s.Elapsed.TotalSeconds -lt 8 -and -not (Test-Path '{psq(stub)}\\releases.log')) {{ [Threading.Thread]::Sleep(100) }}\n"
+                  f"[Console]::Out.WriteLine(([pscustomobject]@{{ granted = [bool]$r.granted; state = $r.state; why = $r.why; releases = @(if (Test-Path '{psq(stub)}\\releases.log') {{ [IO.File]::ReadAllLines('{psq(stub)}\\releases.log') }}) }} | ConvertTo-Json -Compress)); [Console]::Out.Flush(); [Environment]::Exit(0)\n")
+        r = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, timeout=60)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        edge = json.loads(r.stdout.strip().splitlines()[-1])
+        self.assertEqual((edge["granted"], edge["state"], edge["releases"]), (False, "REQUEST_LATE_GRANT", ["worker:edge-n"]), edge)
+
+    def test_artifact_preflight_claim_wait_r6_a_retry_grant_let_go_on_a_stalled_claim_share_still_refuses_by_the_deadline(self) -> None:
+        # adversary r6 pass 2 A1: the retry is granted at once, its guard refuses, and the claim share then stops answering: the release (inline, unbounded, before the refusal
+        # printed) held the refusal past the deadline. A claim granted on a retry is let go on a bounded worker, given up on (r7: at the reserve at most) and counted. ~4 s.
+        # r7: a 6 s deadline, so the grant (about 4.6 s left) has room for its cut guard (under 2 s of it, no guard runs at all: the 1.2 s row below)
+        d = self._retry_request_loop("[pscustomobject]@{ granted = $true; broken = @(); claim = [pscustomobject]@{ nonce = 'stuck-n' }; state = 'TAKEN' }", 6,
+                                     extra="$script:RunOutputAliased = $false; $script:suppressionHit = $null\nfunction Invoke-InputGuard { $script:guards++; if ($req.granted) { return [pscustomobject]@{ kind = 'content'; item = 1; code = 'LEG_SPEC_INVALID'; why = 'WHY' } }; "
+                                           "[pscustomobject]@{ kind = 'content'; item = 1; code = 'SHARE_UNREACHABLE'; noAnswer = $true; readAbandoned = $true; locationUnknown = $true; why = 'WHY' } }",
+                                     release="[Threading.Thread]::Sleep(600000); ")
+        self.assertEqual((d["requests"], d["guards"], d["claim"], d["thrown"], d["refused"]), (2, 2, None, "", "WHY"), d)
+        self.assertLess(d["refusedAt"], d["deadlineSec"], f"the refusal waited on the release past the deadline: {d}")
+        self.assertEqual(d["abandoned"], 1, f"the release given up on is an abandoned read: {d}")
+        # adversary r7 A1: the granted guard ANSWERED a failure (LEG_SPEC_INVALID: no location unknown, no suppression of its own), so the refusal would probe batch.log in -RunDir,
+        # unbounded, on the share that just stopped answering the release: the release given up on turns the write suppression on before the refusal
+        self.assertTrue(d["aliasedAtRefusal"], f"the refusal after a release given up on could still probe -RunDir: {d}")
+
+    # r7 (adversary r6 pass 3 A1): the guard of a claim granted on a retry. The stub guard waits exactly what Invoke-InputGuard's worker wait is for the budget it is handed (the
+    # budget plus 0.5 s, or a fixed 2 s under 2 s: :872) and then refuses, as a share that stays stuck makes it; Start-Sleep sleeps until `left` s remain.
+    RETRY_GUARD = ("function New-GuardBudget { param($a, $b, $c, $d, $e, $f) $script:budgets.Add([double]$a); $script:budgetRooms.Add(($deadline - [DateTime]::UtcNow).TotalSeconds); [pscustomobject]@{} }\n"
+                   "function Invoke-InputGuard { $script:guards++; if (-not $req.granted) { return [pscustomobject]@{ kind = 'content'; item = 1; code = 'SHARE_UNREACHABLE'; noAnswer = $true; readAbandoned = $true; locationUnknown = $true; why = 'WHY' } }\n"
+                   "    $s = $script:budgets[$script:budgets.Count - 1]; [Threading.Thread]::Sleep([int][Math]::Max(0.0, 1000.0 * $(if ($s -lt 2) { 2.0 } else { $s + 0.5 })))\n"
+                   "    [pscustomobject]@{ kind = 'content'; item = 1; code = 'SHARE_UNREACHABLE'; noAnswer = $true; readAbandoned = $true; locationUnknown = $true; why = 'GRANTED-GUARD' } }\n")
+
+    @staticmethod
+    def _sleep_until_left(left: float, grant_left: float | None = None) -> str:
+        grant = f"$env:MLV_TEST_RETRY_GRANT_AT = [string]$deadline.AddSeconds(-{grant_left}).Ticks; " if grant_left is not None else ""
+        return ("function Start-Sleep { param([int]$Seconds) " + grant +
+                f"[Threading.Thread]::Sleep([Math]::Max(0, [int](($deadline - [DateTime]::UtcNow).TotalMilliseconds - {int(left * 1000)}))) }}\n")
+
+    GRANT_AT = ("$t = [DateTime]::new([long]$env:MLV_TEST_RETRY_GRANT_AT, [DateTimeKind]::Utc); $ms = ($t - [DateTime]::UtcNow).TotalMilliseconds; if ($ms -gt 0) { [Threading.Thread]::Sleep([int]$ms) }; "
+                "[pscustomobject]@{ granted = $true; broken = @(); claim = [pscustomobject]@{ nonce = 'g-n' }; state = 'TAKEN' }")
+
+    def test_artifact_preflight_claim_wait_r7_a_retry_granted_with_no_room_for_its_guard_is_refused_by_the_deadline(self) -> None:
+        # the retry's request starts with 3.5 s left (its bound is 2.5 s) and grants with 1.2 s left. The guard it was given (the whole 1.2 s) waited a fixed 2 s, then the release:
+        # the refusal came at least 0.8 s after -DeadlineUtc. Now no guard runs, the grant is released on its worker, and the saved refusal prints before the deadline. ~4 s.
+        d = self._retry_request_loop(self.GRANT_AT, 4, extra=self.RETRY_GUARD + self._sleep_until_left(3.5, grant_left=1.2))
+        self.assertEqual((d["requests"], d["workerRequests"], d["claim"], d["thrown"]), (2, 1, None, ""), d)
+        self.assertGreaterEqual(d["refusedAt"], 0, d)
+        self.assertLess(d["refusedAt"], d["deadlineSec"], f"the refusal printed after the deadline: {d}")
+        self.assertEqual(d["guards"], 1, f"a guard ran on a grant with no room for one: {d}")
+        self.assertEqual(d["releases"], ["worker:g-n"], f"the grant was not released (bounded, on its worker): {d}")
+        self.assertEqual(d["abandoned"], 0, d)
+        self.assertTrue(d["refused"].startswith("WHY (the claim was then granted with "), d)
+        self.assertIn("so it was released and no guard ran) (no answer on 1 read in a row while no claim was held)", d["refused"])
+
+    def test_artifact_preflight_claim_wait_r7_a_retry_granted_with_room_runs_its_guard_cut_and_releases_by_the_deadline(self) -> None:
+        # granted at once with about 3.7 s left: its guard is cut to that room less 0.5 s and 1 s (it was the whole room, waited for plus 0.5 s: 0.5 s past the deadline before the
+        # release), so the guard gives up 1 s before -DeadlineUtc, and the claim is released and the refusal printed in that second. ~5 s.
+        d = self._retry_request_loop("[pscustomobject]@{ granted = $true; broken = @(); claim = [pscustomobject]@{ nonce = 'room-n' }; state = 'TAKEN' }", 4.5,
+                                     extra=self.RETRY_GUARD + self._sleep_until_left(4.0))
+        self.assertEqual((d["requests"], d["guards"], d["claim"], d["thrown"], d["refused"]), (2, 2, None, "", "GRANTED-GUARD"), d)
+        self.assertEqual(len(d["budgets"]), 2, d)
+        cut, room = d["budgets"][-1], d["budgetRooms"][-1]
+        self.assertGreaterEqual(cut, 2.0, f"the row needs a guard that runs: {d}")
+        self.assertLessEqual(cut, room - 1.5 + 0.05, f"the granted retry's guard was not cut to the room less 0.5 s and 1 s: {d}")
+        self.assertLess(d["refusedAt"], d["deadlineSec"], f"the refusal printed after the deadline: {d}")
+        self.assertEqual((d["releases"], d["abandoned"]), (["worker:room-n"], 0), d)
+
+    def test_artifact_preflight_claim_wait_r7_a_retry_release_with_no_room_is_given_up_on_at_once(self) -> None:
+        # Invoke-ClaimRetryRelease lifted from the runner, a claim share that never answers: with the deadline gone it was still given 1 s (the old floor); now it is given up on at
+        # once and counted, never started. With 0.6 s left it waits under that room. With room, a healthy release answers (INV-1). One process, ~3 s.
+        stub = Path(tempfile.mkdtemp(prefix="retry-rel-", dir=self.case))
+        (stub / "VenueChain.psm1").write_text(
+            "function Release-VenueClaim { param($Venue, $Nonce, $ClaimDir) [IO.File]::AppendAllText('" + psq(stub) + "\\releases.log', \"start:$Nonce`n\"); if ($Nonce -like 'stall*') { [Threading.Thread]::Sleep(600000) }; 'RELEASED' }\n", encoding="utf-8")
+        script = (f"$ast = [System.Management.Automation.Language.Parser]::ParseFile('{psq(RUNNER)}', [ref]$null, [ref]$null)\n"
+                  ". ([scriptblock]::Create($ast.Find({ param($x) $x -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $x.Name -eq 'Invoke-ClaimRetryRelease' }, $true).Extent.Text))\n"
+                  "foreach ($a in $ast.EndBlock.Statements) { if ($a -is [System.Management.Automation.Language.AssignmentStatementAst] -and $a.Left.Extent.Text -clike '$script:ClaimRetry*') { . ([scriptblock]::Create($a.Extent.Text)) } }\n"
+                  "Import-Module ([IO.Path]::Combine('" + psq(RUNNER.parent) + "', 'VenueChain.psm1')) -Force -DisableNameChecking\n"
+                  f"$here = '{psq(stub)}'; $Venue = 'bachelor'; $ClaimDir = 'c'\n"
+                  "$out = foreach ($c in @(@('stall-past', -1.0), @('stall-short', 0.6), @('ok-n', 30.0))) {\n"
+                  "    $script:RunOutputAliased = $false; $script:suppressionHit = $null; $script:batchLog = 'b'; $before = & (Get-Module VenueChain) { $script:VenueAbandonedReads }; $deadline = [DateTime]::UtcNow.AddSeconds($c[1]); $sw = [Diagnostics.Stopwatch]::StartNew()\n"
+                  "    $r = Invoke-ClaimRetryRelease $deadline $c[0]\n"
+                  "    [pscustomobject]@{ nonce = $c[0]; sec = $sw.Elapsed.TotalSeconds; result = [string]$r; aliased = [bool]$script:RunOutputAliased; abandoned = (& (Get-Module VenueChain) { $script:VenueAbandonedReads }) - $before } }\n"
+                  "[Threading.Thread]::Sleep(300)\n"
+                  f"[Console]::Out.WriteLine((ConvertTo-Json -Compress -InputObject @{{ cases = @($out); log = @(if (Test-Path '{psq(stub)}\\releases.log') {{ [IO.File]::ReadAllLines('{psq(stub)}\\releases.log') }}) }})); [Console]::Out.Flush(); [Environment]::Exit(0)\n")
+        r = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, timeout=60)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        got = json.loads(r.stdout.strip().splitlines()[-1])
+        past, short, ok = got["cases"]
+        self.assertLess(past["sec"], 0.3, f"a release with the deadline gone waited: {got}")
+        self.assertEqual(past["abandoned"], 1, f"a release given up on at once is counted: {got}")
+        self.assertTrue(past["result"].startswith("NO_ROOM "), got)
+        self.assertNotIn("start:stall-past", got["log"], f"a release with no room was started: {got}")
+        self.assertLess(short["sec"], 0.6, f"a release with 0.6 s left waited past that room: {got}")
+        self.assertEqual(short["abandoned"], 1, got)
+        self.assertEqual((ok["result"], ok["abandoned"], ok["aliased"]), ("RELEASED", 0, False), got)
+        # adversary r7 A1: a release given up on (or never started) turns the write suppression on
+        self.assertEqual((past["aliased"], short["aliased"]), (True, True), got)
+        self.assertIn("start:ok-n", got["log"], got)
+
+    # r8 (sol r7 blocker): a retry grant's release that THROWS (the claim share's ReadToEnd or Delete raising IOException, through EndInvoke) returned NO_ANSWER with the write
+    # suppression still off, so the refusal or log line after it probed -RunDir unbounded (Stop-PlanRefused's batch.log look and write guard, L's write guard). The runner's own
+    # Stop-InputIsOutput, Get-HitRefusal, Stop-PlanRefused (its exit made a throw), L and Test-RunDirWrite are lifted; every -RunDir probe they make (Wait-RunDirReadSeam, the write
+    # guard's Get-WriteDestinationHit) stalls 5 s, as a -RunDir on the share that just failed would. One row per caller of Invoke-ClaimRetryRelease.
+    RELEASE_PROBE_MS = 5000
+
+    def _retry_release_throws(self, site: str, release: str = "throw [IO.IOException]::new('the claim share went'); ") -> dict:
+        stub = Path(tempfile.mkdtemp(prefix="retry-rel-throw-", dir=self.case))
+        lift = ("foreach ($n in 'Stop-InputIsOutput', 'Get-HitRefusal', 'L', 'Test-RunDirWrite') { . ([scriptblock]::Create($ast.Find({ param($x) $x -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $x.Name -eq $n }, $true).Extent.Text)) }\n"
+                "$sp = $ast.Find({ param($x) $x -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $x.Name -eq 'Stop-PlanRefused' }, $true).Extent.Text\n"
+                "if ([regex]::Matches($sp, '(?m)^\\s*exit 2\\s*$').Count -ne 1) { throw 'the refusal exit anchor moved' }\n"
+                "$m = [regex]::Match($sp, '(?m)^\\s*exit 2\\s*$'); . ([scriptblock]::Create($sp.Remove($m.Index, $m.Length).Insert($m.Index, ' $script:refusedAt = $clock.Elapsed.TotalSeconds; $script:refused = $line; $script:aliasedAtRefusal = [bool]$script:RunOutputAliased; throw ''REFUSED''')))\n"
+                "function Complete-VenueProcess { param($ExitCode) }\n"
+                "function Wait-RunDirReadSeam { $script:probes++; [Threading.Thread]::Sleep(" + str(self.RELEASE_PROBE_MS) + ") }\n"
+                "function Get-WriteDestinationHit { param($Path, [switch]$Directory) $script:probes++; [Threading.Thread]::Sleep(" + str(self.RELEASE_PROBE_MS) + "); $null }\n"
+                "$script:RunOutputAliased = $false; $script:suppressionHit = $null; $script:summaryBeforeExit = $null; $script:probes = 0; $legPlanMode = $false; $batchLog = '" + psq(stub) + "\\batch.log'\n")
+        retry_guard = "function Invoke-InputGuard { $script:guards++; if (-not $req.granted) { return [pscustomobject]@{ kind = 'content'; item = 1; code = 'SHARE_UNREACHABLE'; noAnswer = $true; readAbandoned = $true; locationUnknown = $true; why = 'WHY' } }; "
+        granted = {
+            # :1925 -- the granted guard ANSWERS a failure (no location unknown, no suppression of its own); the refusal is Stop-InputIsOutput's
+            "answered": (retry_guard + "[pscustomobject]@{ kind = 'content'; item = 1; code = 'LEG_SPEC_INVALID'; why = 'WHY' } }\n", 6),
+            # :1898 -- the granted guard throws; the refusal is Stop-PlanRefused LEG_PLAN_INVALID
+            "threw": (retry_guard + "throw 'the guard went' }\n", 6),
+            # :1943 -- the granted guard answers clean but outlasts -ClaimTtlSec less -ClaimRenewSec (4 less 1 here): the claim is let go and CLAIM_LAPSED_IN_GUARD is logged (L)
+            "lapsed": (retry_guard + "[Threading.Thread]::Sleep(3100); $null }\n$ClaimTtlSec = 4; $ClaimRenewSec = 1\n"
+                       "function LogBest { param($m) if ($m -clike 'CLAIM_LAPSED_IN_GUARD*') { L $m | Out-Null; $script:refusedAt = $clock.Elapsed.TotalSeconds; $script:refused = $m; $script:aliasedAtRefusal = [bool]$script:RunOutputAliased; throw 'REFUSED' } }\n", 8),
+        }[site]
+        d = self._retry_request_loop("[pscustomobject]@{ granted = $true; broken = @(); claim = [pscustomobject]@{ nonce = 'throw-n' }; state = 'TAKEN' }", granted[1],
+                                     extra=lift + granted[0],
+                                     release=release)
+        return d
+
+    def test_artifact_preflight_claim_wait_r8_a_retry_release_that_throws_turns_the_suppression_on_at_every_caller(self) -> None:
+        # sol r7 blocker, at each of Invoke-ClaimRetryRelease's three callers: the retry is granted at once, the release throws IOException through EndInvoke, and what follows
+        # (the typed refusal, or CLAIM_LAPSED_IN_GUARD's log line) must make no -RunDir probe and print before -DeadlineUtc. Before r8 each made 1-2 probes (5 s each here), past
+        # the deadline. ~3 s, ~3 s and ~6 s green.
+        for site, start in (("answered", "LEG_PLAN_REFUSED reason=LEG_SPEC_INVALID item=1 WHY"), ("threw", "LEG_PLAN_REFUSED reason=LEG_PLAN_INVALID the plan could not be re-validated once the claim was held: the guard went"),
+                            ("lapsed", "CLAIM_LAPSED_IN_GUARD batch=1 ")):
+            with self.subTest(site=site):
+                d = self._retry_release_throws(site)
+                self.assertEqual((d["requests"], d["workerRequests"], d["guards"], d["claim"], d["thrown"]), (2, 1, 2, None, ""), d)
+                self.assertTrue(d["refused"].startswith(start), d)
+                self.assertEqual((d["abandoned"], d["releases"]), (0, []), f"the release threw (it answered, with an exception): nothing was given up on: {d}")
+                self.assertTrue(d["aliasedAtRefusal"], f"a release that threw left the write suppression off: {d}")
+                self.assertEqual(d["probes"], 0, f"the refusal after a release that threw probed -RunDir: {d}")
+                self.assertLess(d["refusedAt"], d["deadlineSec"], f"the refusal after a release that threw printed past the deadline: {d}")
+        # r8 pass 1 (adversary r8 A1): a release that ANSWERS but releases nothing (BUSY: the claim is still there, five opens of it refused, in 750 ms here) is not a release
+        # either: only RELEASED, NOT_OURS or ABSENT leave the suppression off. ~3 s.
+        d = self._retry_release_throws("answered", release="[Threading.Thread]::Sleep(750); return 'BUSY'; ")
+        self.assertEqual((d["guards"], d["claim"], d["thrown"], d["abandoned"], d["releases"]), (2, None, "", 0, []), d)
+        self.assertTrue(d["refused"].startswith("LEG_PLAN_REFUSED reason=LEG_SPEC_INVALID item=1 WHY"), d)
+        self.assertTrue(d["aliasedAtRefusal"], f"a release that answered BUSY left the write suppression off: {d}")
+        self.assertEqual(d["probes"], 0, f"the refusal after a release that answered BUSY probed -RunDir: {d}")
+        self.assertLess(d["refusedAt"], d["deadlineSec"], d)
+
+    def test_artifact_preflight_claim_wait_r6_a_fast_retry_request_is_unchanged(self) -> None:
+        # INV-1 controls: a retry request that is denied at once still loops (three unfinished passes, then the refusal, as in r5); one that grants at once with room proceeds, its guard
+        # answered and the claim taken, nothing released. ~4 s and ~2 s. The worker counts are asserted last and apart: on a head that asks inline they are the only difference.
+        denied = self._retry_request_loop(self.DENIED, 60)
+        self.assertEqual((denied["requests"], denied["guards"], denied["claim"], denied["thrown"]), (3, 3, None, ""), denied)
+        self.assertEqual(denied["refused"], "WHY (no answer on 3 reads in a row while no claim was held)", denied)
+        self.assertEqual((denied["abandoned"], denied["releases"]), (0, []), denied)
+        granted = self._retry_request_loop("[pscustomobject]@{ granted = $true; broken = @(); claim = [pscustomobject]@{ nonce = 'fast-n' }; state = 'TAKEN' }", 60)
+        self.assertEqual((granted["requests"], granted["guards"], granted["claim"], granted["refused"], granted["thrown"]), (2, 2, "fast-n", "", ""), granted)
+        self.assertEqual((granted["abandoned"], granted["releases"]), (0, []), granted)
+        # adversary r6 A1 and A2: a grant at once still proceeds with a deadline 30 days out (WaitOne overflowed there), and with a default parameter value naming a late cutoff
+        # (yesterday) in the session, which marked that timely grant late while the helper took one. ~2 s.
+        far = self._retry_request_loop("[pscustomobject]@{ granted = $true; broken = @(); claim = [pscustomobject]@{ nonce = 'far-n' }; state = 'TAKEN' }", 30 * 86400,
+                                       extra="$PSDefaultParameterValues['Invoke-ClaimRetryRequest:LateAfterUtc'] = [DateTime]::UtcNow.AddDays(-1)")
+        self.assertEqual((far["requests"], far["guards"], far["claim"], far["refused"], far["thrown"], far["abandoned"], far["releases"]), (2, 2, "far-n", "", "", 0, []), far)
+        self.assertEqual(denied["workerRequests"], 2, f"the two retries did not go through the bounded worker: {denied}")
+        self.assertEqual(granted["workerRequests"], 1, f"the retry did not go through the bounded worker: {granted}")
+
+    def test_artifact_preflight_claim_wait_r3_the_refusal_says_no_answer_only_for_reads_given_up_on(self) -> None:
+        # fable r2: three passes that ran out of room while every read answered are not "no answer on 3 reads", and a run of both says how many of each
+        cases = [(3, 3, "(no answer on 3 reads in a row while no claim was held)"),
+                 (3, 0, "(3 guard passes in a row ran out of time while no claim was held; every read that started answered)"),
+                 (3, 2, "(3 guard passes in a row did not finish while no claim was held: no answer on 2 reads, and the others ran out of time)"),
+                 (1, 0, "(1 guard pass in a row ran out of time while no claim was held; every read that started answered)")]
+        for strikes, given_up, want in cases:
+            ran = self._claim_loop_snippet(f"$overshootSec = 0; $deadline = [DateTime]::UtcNow.AddSeconds(600); $unfinished = {strikes - 1}; $noAnswers = {given_up - 1 if given_up else 0}; $hit.readAbandoned = {'$true' if given_up else '$false'}"
+                                           if strikes == 3 else "$overshootSec = 0; $deadline = [DateTime]::UtcNow.AddSeconds(1); $hit.readAbandoned = $false")
+            self.assertEqual(ran["outcome"], "REFUSAL", ran)
+            self.assertEqual(ran["why"], f"WHY {want}")
+
+    def test_artifact_preflight_claim_wait_r3_a_hit_with_no_room_is_not_a_read_given_up_on(self) -> None:
+        # in memory, so no host is too slow for it: the spec read answers at 1.5 s of a 3 s budget, the build read has no room to start. noAnswer keeps the retry; the '+' is only for
+        # a read given up on, and the seconds each read took are the same either way.
+        script = (f"$ast = [System.Management.Automation.Language.Parser]::ParseFile('{psq(RUNNER)}', [ref]$null, [ref]$null)\n"
+                  "foreach ($n in 'New-GuardBudget', 'Get-InputContentRefusal', 'Set-GuardProgress', 'Get-GuardTimingText') { . ([scriptblock]::Create($ast.Find({ param($x) $x -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $x.Name -eq $n }, $true).Extent.Text)) }\n"
+                  "$script:GuardReadMinSec = 2; $legPlanMode = $true; $script:claimWait = $null\n"
+                  "function Wait-GuardReadSeam { param($r) }\n"
+                  "function Get-LegSpecRefusal { param($p, $b) [Threading.Thread]::Sleep(1500); @($null, $null) }\n"
+                  "$script:guardedInputs = @([pscustomobject]@{ kind = 'spec'; item = 1; path = 's'; backend = 'cuda' }, [pscustomobject]@{ kind = 'build'; item = 1; path = 'm'; commit = ('a' * 40); sha256 = ('a' * 64) })\n"
+                  "$prog = [hashtable]::Synchronized(@{ locationsDone = $true; item = 0; at = 'x'; steps = [Collections.ArrayList]::Synchronized([Collections.ArrayList]::new()) })\n"
+                  "$script:guardProgress = $prog\n"
+                  "$script:guardBudget = New-GuardBudget 3 'the test room' 'SHARE_UNREACHABLE' $false 'claim' $true\n"
+                  "$h = Get-InputContentRefusal\n"
+                  "[pscustomobject]@{ noAnswer = [bool]$h.noAnswer; hasFlag = ($null -ne $h.PSObject.Properties['readAbandoned']); readAbandoned = [bool]$h.readAbandoned; answered = (Get-GuardTimingText $prog $script:guardBudget ([bool]$h.readAbandoned)); givenUp = (Get-GuardTimingText $prog $script:guardBudget $true) } | ConvertTo-Json -Compress\n")
+        r = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, timeout=120)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        d = json.loads(r.stdout.strip().splitlines()[-1])
+        self.assertTrue(d["noAnswer"], "it still reads again next poll")
+        self.assertTrue(d["hasFlag"], d)
+        self.assertFalse(d["readAbandoned"], d)
+        self.assertRegex(d["answered"], r"content:spec1=[0-9.]+ claimWaitBefore=no$")
+        self.assertRegex(d["givenUp"], r"content:spec1=[0-9.]+\+ claimWaitBefore=no$")
+
+    def test_artifact_preflight_claim_wait_r3_good_polls_between_no_answers_never_add_up_to_the_refusal(self) -> None:
+        # dot I2: "three in a row" is three in a row. Manifest reads 2, 4 and 6 are given up on, 3, 5 and 7 answer, then the foreign claim lets go: the plan runs.
+        calls = self.case / "manifest-calls.txt"
+        manifest_probe, _ = self._timed_probes(0, 0)
+        manifest_probe.write_text(manifest_probe.read_text(encoding="utf-8").replace(
+            "param($p)\n", f"param($p)\n[IO.File]::AppendAllText('{calls}', 'm' + [Environment]::NewLine)\nif (@(2, 4, 6) -contains [IO.File]::ReadAllLines('{calls}').Count) {{ [Threading.Thread]::Sleep(40000) }}\n", 1), encoding="utf-8")
+        args, e = self._claim_wait_cmd(manifest_probe=manifest_probe)
+
+        def until_three_were_given_up_on() -> None:
+            end = time.monotonic() + 180
+            while time.monotonic() < end and (not calls.exists() or len(calls.read_text(encoding="utf-8").splitlines()) < 7):
+                time.sleep(0.2)
+        code, so, se = self._during_claim_wait(args, e, until_three_were_given_up_on)
+        self.assertEqual(code, 0, so + se)
+        self.assertNotIn("LEG_PLAN_REFUSED", se)
+        self.assertEqual(se.count("CLAIM_WAIT_GUARD_NO_ANSWER batch=1 unfinished=1/3 noAnswers=1 "), 3, se)
+        self.assertNotIn("unfinished=2/3", se)
+        log = (self.run_dir / "batch.log").read_text(encoding="utf-8")
+        self.assertEqual(log.count("CLAIM_WAIT_GUARD_ANSWERED batch=1 unfinished=1 noAnswers=1 "), 3, log)
+        self.assertEqual(len(self.leg_calls()), 1, so + se)
+
+    def test_artifact_preflight_claim_wait_r3_a_hung_share_reacquired_after_no_answer_stops_at_the_deadline(self) -> None:
+        # fable r2 hardening 3: the foreign claim lets go between no-answers and the input is still bad. The granted attempt keeps first-failure behaviour (no second chance, the claim
+        # released, no lease), and its guard ends at the run's deadline, not on the claim's 10199 s budget. Fixture only: the 90 s read stands in for a share that does not answer.
+        args, e = self._claim_wait_cmd("-GuardReadDelay", "claim:existence=90", "-ClaimPollSec", "3", "-DeadlineUtc", utc_iso(datetime.now(timezone.utc) + timedelta(seconds=75)))
+        code, so, se, took = self._run_acting_on_stderr(args, e, "CLAIM_WAIT_GUARD_NO_ANSWER", self.claim_path.unlink)
+        self.assertEqual(code, 2, so + se)
+        self.assertIn("LEG_PLAN_REFUSED reason=SHARE_UNREACHABLE item=1 the guard's reads did not finish within the claim guard", se)
+        self.assertIn("cut to the run's deadline after an unfinished read", se)
+        self.assertEqual(se.count("CLAIM_WAIT_GUARD_NO_ANSWER"), 1, se)
+        self.assertNotIn("no answer on", se, "a granted attempt refuses on its first failure, not as a strike")
+        self.assertEqual(self.kinds(), [], "no lease was opened")
+        self.assertEqual(self.leg_calls(), [])
+        self.assertFalse(self.claim_path.exists(), "the claim taken for the guard was released")
+        # r7 (adversary r6 pass 3 A1): the granted retry's guard gives up 1 s before the 75 s deadline and the release and the refusal fit in that second, so the process ends by the
+        # deadline plus its own exit (Complete-VenueProcess exits at once: the guard's worker was given up on). 2 s for that exit, where 10 s hid a refusal up to 3 s late.
+        self.assertLess(took, 77, f"the run took {took:.1f} s: the refusal came after the 75 s deadline (or the 90 s read was waited for)")
+
+    def test_artifact_preflight_claim_wait_r3_waited_sec_ends_at_the_grant(self) -> None:
+        # opus r2 B2: 30 s in the open, then the open guard gives up. waitedSec said the time since the first denied poll, open included; it is the claim wait only.
+        args, e = self._claim_wait_cmd("-LeaseCapSec", "75", "-GuardReadDelay", "open:identity=25", FAKE_OPEN_SLEEP="30")
+        code, so, se = self._during_claim_wait(args, e, lambda: None)
+        self.assertEqual(code, 2, so + se)
+        self.assertIn("the guard's reads did not finish within the lease's room", se)
+        m = re.search(r"claimWaitBefore=yes deniedPolls=[0-9]+ waitedSec=([0-9]+)", se)
+        self.assertIsNotNone(m, se)
+        self.assertLess(int(m.group(1)), 25, f"waitedSec={m.group(1)} counts the 30 s open: {se}")
+
+    def test_artifact_preflight_claim_wait_r3_a_usage_stop_does_not_wait_on_a_read_given_up_on(self) -> None:
+        # fable r2 hardening 5: the scalar form ends a hit through Stop-Usage. One read is given up on and stays stuck, the spec then goes, and exit 2 comes without waiting out that read.
+        self._fresh_run_dir()
+        self._foreign_live_claim()
+        spec = self.case / "safe" / "fx-a.json"
+        spec.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(self.specs[0], spec)
+        args, e = self.batch_cmd([spec], "-GuardReadDelay", "claim:identity=120x1")
+        code, so, se, took = self._run_acting_on_stderr(args, e, "CLAIM_WAIT_GUARD_NO_ANSWER", spec.unlink)
+        self.assertEqual(code, 2, so + se)
+        self.assertIn("BATCH_USAGE ", se)
+        self.assertLess(took, 100, f"the run took {took:.1f} s: exit 2 waited on the stuck read")
 
     # r5 ITEM 1 (key3 r4 B1, catalogue row L-05; Dot 6457724432): an attempt the claim was NOT granted for ran the guard inline with no budget, and the guard hashed every cached
     # artifact (-VerifyArtifacts) on the venue's share on every -ClaimPollSec poll while a foreign chain held the venue (and measured). Master's wait read the manifests only.
@@ -5588,7 +6453,7 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
     # held the run before the typed refusal and the lease close. '<guard>:rundir=<sec>' stalls every read of -RunDir in that guard and after it; GUARD_READ_DELAY_SEAM on stderr names
     # each main-thread read that reached the stall.
     # LEASE-BATCH-PREFLIGHT-TEST-ISOLATION-1 item 3: renamed from ..._reaches_the_typed_refusal_and_the_close_inside_the_room. No close job is submitted here (JOB_WRITE_FAILED), so
-    # the measurement is the run's own end (finishedUtc), which proves termination and the claim release, not a close.
+    # the measurement is the run's own end (the observed process exit), which proves termination and the claim release, not a close.
     def test_artifact_preflight_r5_item2_a_stalled_rundir_after_the_open_reaches_the_typed_refusal_and_the_run_ends_with_the_claim_released_inside_the_room(self) -> None:
         # sol's repro: cap 75, leg budget 60, margin 0 (the post-open guard has 14 s); -RunDir's metadata reads stall 40 s once the open is answered
         r, ended_after_open = self._post_open_hash_run(0, "-GuardReadDelay", "open:rundir=40", cap="75", NO_CLOSE_EXPECTED="1")
@@ -5599,7 +6464,7 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
         self.assertEqual(self.leg_calls(), [])
         self.assertEqual([k for k in self.kinds() if not k.startswith(("OPEN", "CLOSE"))], [], "no probe and no leg ran")
         # the 14 s room and the documented 2 s bounded re-read of -RunDir (adversary r5 A1), never the 40 s stall: the run ENDED inside that (termination; no close was submitted)
-        self.assertLess(ended_after_open, 75 - 60 + 4 + 2, f"the run ended {ended_after_open:.1f} s after the open (finishedUtc stands in for a close that was never submitted): the stalled -RunDir was waited for")
+        self.assertLess(ended_after_open, 75 - 60 + 4 + 2, f"the run ended {ended_after_open:.1f} s after the open (the observed process exit stands in for a close that was never submitted): the stalled -RunDir was waited for")
         self.assertFalse(self.claim_path.exists(), "the claim file was removed (claim cleanup; says nothing of the lease's physical release)")
         self.assertIn("BATCH_OUTPUT_ALIASED", r.stderr)
         self.assertIn("an input whose location is unknown is refused", r.stderr)
@@ -5752,7 +6617,7 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
         self.assertIn("an input whose location is unknown is refused", r.stderr)
         self.assertEqual(self.leg_calls(), [])
         # the 14 s room and the 2 s bound on the -RunDir re-read and the TEMP walk (raced, one bound), never the 40 s stall: the run ENDED inside that (termination; no close was submitted)
-        self.assertLess(ended_after_open, 75 - 60 + 4 + 2, f"the run ended {ended_after_open:.1f} s after the open (finishedUtc stands in for a close that was never submitted): a TEMP read that reached the stalled -RunDir was waited for")
+        self.assertLess(ended_after_open, 75 - 60 + 4 + 2, f"the run ended {ended_after_open:.1f} s after the open (the observed process exit stands in for a close that was never submitted): a TEMP read that reached the stalled -RunDir was waited for")
         self.assertIn("BATCH_OUTPUT_REDIRECT_FAILED", r.stderr, "the redirect fails closed")
         self.assertIn(expect, r.stderr)
         self.assertEqual([str(x) for x in self.run_dir.rglob("venue-lease-batch-close-*")], [], "a close redirect was made inside -RunDir")
@@ -5798,10 +6663,10 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
     TEMP_WALK_REFUSAL_TAIL = "once the guard gave up on a location: it is not known to be outside -RunDir"
     RUNDIR_REREAD_REFUSAL_TAIL = "once the guard gave up on a location: where it is now is unknown, so TEMP is not known to be outside it"
 
-    def _responsive_rundir_temp_run(self, resolve_ms: int, identity_ms: int, stalled: bool) -> tuple[subprocess.CompletedProcess, float, Path]:
+    def _responsive_rundir_temp_run(self, resolve_ms: int, identity_ms: int, stalled: bool, extra_patches: tuple[tuple[str, str], ...] = ()) -> tuple[subprocess.CompletedProcess, float, Path]:
         temp = self.case / "iso-temp-elsewhere"
         temp.mkdir(parents=True, exist_ok=True)
-        self._mirror_with_bad_sidecar(runner_patches=((self.TEMP_SEAM_ANCHOR, f"$tempSeam = @({resolve_ms}, {identity_ms})"),))
+        self._mirror_with_bad_sidecar(runner_patches=((self.TEMP_SEAM_ANCHOR, f"$tempSeam = @({resolve_ms}, {identity_ms})"), *extra_patches))
         self.plan_runner = self.runner
         env = {"NO_CLOSE_EXPECTED": "1"} if stalled else {}
         r, measured = self._post_open_hash_run(0, "-GuardReadDelay", "open:identity=25", cap="75", TEMP=str(temp), TMP=str(temp), **env)
@@ -5826,7 +6691,15 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
         self.assertEqual(list(temp.glob("venue-lease-batch-close-*")), [], "a close redirect was made in a TEMP that did not answer")
         self.assertEqual([str(x) for x in self.run_dir.rglob("venue-lease-batch-close-*")], [], "a close redirect was made inside -RunDir")
         # the 14 s room and TEMP's 2 s bound, never the 40 s stall: the run ENDED inside that (termination; no close was submitted)
-        self.assertLess(ended_after_open, 75 - 60 + 4 + 2, f"the run ended {ended_after_open:.1f} s after the open (finishedUtc stands in for a close that was never submitted): TEMP's stalled walk was waited for")
+        self.assertLess(ended_after_open, 75 - 60 + 4 + 2, f"the run ended {ended_after_open:.1f} s after the open (the observed process exit stands in for a close that was never submitted): TEMP's stalled walk was waited for")
+
+    def test_artifact_preflight_claim_wait_dot_i1_the_measured_end_is_the_process_exit_not_the_summary_stamp(self) -> None:
+        # Dot I1 on #750: finishedUtc is stamped when the summary is built, before Write-RunSummary, Complete-VenueProcess and exit, so a stall after it passed the bound. A mirror stalls
+        # 8 s between the summary and the exit: the measured end must lie past the stamp by that much.
+        exit_line = "Complete-VenueProcess -ExitCode $exitCode   # a share read abandoned"
+        r, ended_after_open, _ = self._responsive_rundir_temp_run(40000, 0, stalled=True, extra_patches=((exit_line, "Start-Sleep -Seconds 8; " + exit_line),))
+        self.assertTrue(self.close_substituted, r.stdout + r.stderr)
+        self.assertGreaterEqual(ended_after_open - self.summary_after_open, 8, f"the process exit {ended_after_open:.1f} s after the open is not past the summary stamp {self.summary_after_open:.1f} s by the 8 s stall")
 
     def test_artifact_preflight_iso1_item1_control_a_responsive_rundir_and_an_unstalled_temp_walk_on_the_patched_mirror_still_gets_the_redirect(self) -> None:
         r, held, temp = self._responsive_rundir_temp_run(0, 0, stalled=False)
@@ -5876,7 +6749,8 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
                  "'A:packageZip=ok'; 'H:packageZip=' + ('1' * 64); 'A:exe=ok'; 'H:exe=' + ('2' * 64); 'A:dll=ok'; 'H:dll=' + ('3' * 64)")
         script = (f"Import-Module '{MODULE}' -Force -DisableNameChecking\n"
                   f"$ast = [System.Management.Automation.Language.Parser]::ParseFile('{RUNNER}', [ref]$null, [ref]$null)\n"
-                  "foreach ($n in 'New-GuardBudget', 'Get-InputContentRefusal') { . ([scriptblock]::Create($ast.Find({ param($x) $x -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $x.Name -eq $n }, $true).Extent.Text)) }\n"
+                  # r6 (adversary r6 A3): Get-InputContentRefusal calls Set-GuardProgress (a no-op with no progress object), so the harness lifts it too, never a CommandNotFound it ignores
+                  "foreach ($n in 'New-GuardBudget', 'Get-InputContentRefusal', 'Set-GuardProgress') { . ([scriptblock]::Create($ast.Find({ param($x) $x -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $x.Name -eq $n }, $true).Extent.Text)) }\n"
                   # the runner's own top-level threshold, when it has one
                   "$min = $ast.Find({ param($x) $x -is [System.Management.Automation.Language.AssignmentStatementAst] -and $x.Left.Extent.Text -ceq '$script:GuardReadMinSec' }, $true)\n"
                   "if ($min) { . ([scriptblock]::Create($min.Extent.Text)) }\n"
@@ -6091,7 +6965,7 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
         self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
         self.assertIn("BATCH_USAGE -GuardReadDelay is an offline test seam", r.stderr)
         # r4 adversary A3: a non-ASCII decimal digit (U+0661) is refused typed, not accepted by \d and thrown on by [int]
-        for bad in ("open:hash=5", "open:spec=١"):
+        for bad in ("open:hash=5", "open:spec=١", "open:rundir=40x1"):
             r = self.run_plan(self.write_plan([self.item(self.specs[0], "A", self.commit_a)]), "-GuardReadDelay", bad)
             self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
             self.assertIn("is not <claim|open>:<existence|identity|spec|rundir>=<sec>", r.stderr)
@@ -6349,7 +7223,15 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
         claim = self.run_dir / "bachelor.claim.json"
         p, spec, sha = self._spawn_open_wait("gatehold", "-ClaimTtlSec", "60", "-ClaimRenewSec", "1", "-CancelReconcileSec", "3",
                                              "-DeadlineUtc", utc_iso(datetime.now(timezone.utc) + timedelta(seconds=45)), claim_dir=self.run_dir)
-        nonce = json.loads(claim.read_text(encoding="utf-8"))["nonce"]
+        # r7 (CI run 42209009621, shard 3/11): the keeper renews this file every second, and a read that lands inside its write is a Windows sharing violation, not an answer: read again
+        for attempt in range(20):
+            try:
+                nonce = json.loads(claim.read_text(encoding="utf-8"))["nonce"]
+                break
+            except (PermissionError, json.JSONDecodeError):
+                if attempt == 19:
+                    raise
+                time.sleep(0.05)
         body = json.loads(spec.read_text(encoding="utf-8"))
         body.update({"nonce": nonce, "expiresUtc": "2026-10-26T12:00:00Z"})
         spec.write_text(json.dumps(body, separators=(",", ":")), encoding="utf-8")

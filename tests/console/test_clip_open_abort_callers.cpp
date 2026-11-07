@@ -221,9 +221,16 @@ TEST(ClipOpenAbortCallersWiring, SlidersThatDescribeNoReceiptAreNeverSaved)
 
     const QString exportEnd = bodyBetween(source, QStringLiteral("//Open last file which was opened before export"),
                                           QStringLiteral("//Unblock GUI"));
+    // LOOK-FULLSCREEN-PARITY-1 r13: the success branch records the row it applies (recordLoadedClipReceipt), then applies it.
     ASSERT_TRUE(exportEnd.contains(QStringLiteral(
         "if( reopenResult ) m_slidersDetachedFromReceipt = true;\n"
-        "        else setSliders( GET_RECEIPT( m_lastClipBeforeExport ), false );")));
+        "        else\n"
+        "        {\n")));
+    ASSERT_TRUE(exportEnd.contains(QStringLiteral(
+        "            recordLoadedClipReceipt( m_loadedClipFileName, m_lastClipBeforeExport );\n"
+        "            setSliders( GET_RECEIPT( m_lastClipBeforeExport ), false );\n"
+        "        }")));
+    ASSERT_EQ(exportEnd.count(QStringLiteral("setSliders(")), 1);
     const QString rename = bodyBetween(source, QStringLiteral("void MainWindow::renameActiveClip( void )"),
                                        QStringLiteral("void MainWindow::retryClipReopenAfterPrepAbort( int row )"));
     ASSERT_TRUE(rename.contains(QStringLiteral(
@@ -901,7 +908,7 @@ TEST(ClipOpenAbortR5Wiring, EveryDirectActiveReceiptWriteConsultsTheOwnershipPre
                                            QStringLiteral("void MainWindow::captureLookAssistBaseline( ReceiptSettings *receipt )"));
     ASSERT_EQ(setSliders.count(QStringLiteral("|| !receiptOwnedByLoadedClip( \"look-assist-setsliders-frame-ready\" )")), 2);
     const QString toggle = bodyBetween(source, QStringLiteral("void MainWindow::on_checkBoxLookAssistEnable_clicked( bool checked )"),
-                                       QStringLiteral("applyLookAssistToReceipt( ACTIVE_RECEIPT, analysisFrame );"));
+                                       QStringLiteral("applyLookAssistFromFrameReady( ACTIVE_RECEIPT, analysisFrame );"));
     ASSERT_TRUE(toggle.contains(QStringLiteral("|| !receiptOwnedByLoadedClip( \"look-assist-toggle-frame-ready\" )")));
 
     // the predicate reuses the r4 detachment state and compares the loaded file with the active row

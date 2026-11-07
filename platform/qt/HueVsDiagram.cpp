@@ -30,6 +30,7 @@ HueVsDiagram::HueVsDiagram(QWidget *parent)
     m_pFrameChanged = NULL;
     m_pProcessing = NULL;
     m_LoadAll = false;
+    m_drawOnly = false;
     m_diagramType = HueVsLuminance;
     resetLine();
 }
@@ -275,7 +276,7 @@ void HueVsDiagram::paintLine(QVector<QPointF> line, QPainter *pPainter, QColor c
     }
 
     //Set Procesing Element if available
-    if( active || m_LoadAll )
+    if( !m_drawOnly && ( active || m_LoadAll ) )
     {
         if( m_pProcessing != NULL )
         {
@@ -456,6 +457,10 @@ void HueVsDiagram::movePoint(qreal x, qreal y, bool release)
 void HueVsDiagram::resizeEvent(QResizeEvent *event)
 {
     m_width = size().width();
+    // A resize only redraws. The curve is unchanged (its points are normalized), and a resize is not user input, so it
+    // arrives inside a Look Assist pump turn while the worker reads the processing object (adversary A1, r4).
+    m_drawOnly = true;
     paintElement();
+    m_drawOnly = false;
     event->accept();
 }

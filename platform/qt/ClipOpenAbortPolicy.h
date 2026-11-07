@@ -65,6 +65,16 @@ inline bool activeReceiptOwnsLoadedClip( bool slidersDetached, bool clipLoaded, 
     return !slidersDetached && clipLoaded && hasActiveReceipt && loadedIsActiveClip;
 }
 
+// LOOK-FULLSCREEN-PARITY-1 r12 (adversary r12 A1): Open Session's Search can give a second row the path of the clip that
+// is already loaded, and the name alone then matches both rows. The open records which row's receipt it loaded for, and
+// that record decides: only that row holds the clip. If that row has left the session, no row holds it until another open
+// succeeds, even a row of the same path (r12b, adversary A2). Only an open that found no row of its file leaves nothing
+// recorded; then the name decides, as it did.
+inline bool loadedClipHeldByRow( bool rowHoldsLoadedPath, bool anyRowRecorded, bool rowIsRecorded )
+{
+    return rowHoldsLoadedPath && ( !anyRowRecorded || rowIsRecorded );
+}
+
 // Play's cut-range repair clamps the range it plays (the cut spin boxes) on any loaded clip; it saves that
 // range into the receipt only when the receipt owns the clip.
 inline bool playbackCutRangeRepairWritesReceipt( bool rangeChanged, bool receiptOwnsLoadedClip )
