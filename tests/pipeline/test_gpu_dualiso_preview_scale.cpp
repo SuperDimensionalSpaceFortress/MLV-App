@@ -57,6 +57,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
 #include <string>
 #include <vector>
 
@@ -1893,6 +1894,183 @@ TEST(GpuDualIsoPreviewScale, HacdChromaKeepsGAndANeutralRampNeutral)
     ASSERT_EQ(0, debayer_reduced_hacd_chroma_rgb16(small.data(), smallBayer.data(), 3, 8, 1, scratch.data()));
     ASSERT_EQ(0, debayer_reduced_hacd_chroma_rgb16(small.data(), smallBayer.data(), 8, 3, 1, nullptr));
     ASSERT_TRUE(std::all_of(small.begin(), small.end(), [](uint16_t v) { return v == 0xBEEFu; }));
+}
+
+// H2C-PORT-1 r11 hardening (CoS coverage limits, ACK issuecomment-6700549806): RGGB mosaic of three
+// full planes (R at even/even, B at odd/odd), rounded and clamped like a 16-bit Bayer.
+static std::vector<uint16_t> r11HacdMosaic(int w, int h, const std::vector<double> & r, const std::vector<double> & g,
+                                           const std::vector<double> & b)
+{
+    std::vector<uint16_t> out(static_cast<size_t>(w) * h);
+    for (int y = 0; y < h; ++y)
+        for (int x = 0; x < w; ++x)
+        {
+            const size_t i = static_cast<size_t>(y) * w + x;
+            const bool ye = (y % 2) == 0, xe = (x % 2) == 0;
+            const double v = (ye && xe) ? r[i] : (!ye && !xe) ? b[i] : g[i];
+            out[i] = static_cast<uint16_t>(std::lround(std::min(65535.0, std::max(0.0, v))));
+        }
+    return out;
+}
+
+// H2C-PORT-1 r11 RED: arbitrary colour. A saturated red disc on blue (G flat, then G stepping the other way)
+// through debayerBasicU16 and debayer_reduced_hacd_chroma_rgb16. Mean max(|R - R true|, |B - B true|) 3 px in
+// must not exceed the bilinear R/B (r8's x4 chroma, the control) it replaces: on the flat-G disc within 1 DN
+// (the clamped HA G equals the bilinear G there, so only rounding differs), on the stepping-G disc at or below
+// it; and away from the edge (5 x 5 all one colour) every R and B is exact within 1. 68c038b2 (no clamp):
+// 1.143x and 1.024x in the run dir's replica (sim_r11b.py), RED; the clamp: 1.000x and 0.836x. Printed, not
+// asserted (OPEN, design limit): colours whose difference to G flips sign across the edge (4-colour bands,
+// magenta / green diagonal) stay above the bilinear (replica 1.33x, 1.55x).
+TEST(GpuDualIsoPreviewScale, HacdChromaArbitraryColourEdgeNoWorseThanBilinear)
+{
+    const int w = 48, h = 40;
+    const size_t n = static_cast<size_t>(w) * h;
+    struct Scene { const char * name; double inR, inG, inB, outR, outG, outB; double slack; bool asserted; };
+    const Scene scenes[] = {
+        { "red disc on blue, G flat", 30000.0, 6000.0, 3000.0, 3000.0, 6000.0, 25000.0, 1.0, true },
+        { "red disc on blue, G steps", 30000.0, 5000.0, 3000.0, 3000.0, 9000.0, 25000.0, 0.0, true },
+        { "magenta disc on green (OPEN)", 28000.0, 5000.0, 26000.0, 4000.0, 22000.0, 6000.0, 0.0, false },
+    };
+    for (const Scene & sc : scenes)
+    {
+        std::vector<double> r(n), g(n), b(n);
+        std::vector<int> inside(n);
+        for (int y = 0; y < h; ++y)
+            for (int x = 0; x < w; ++x)
+            {
+                const size_t i = static_cast<size_t>(y) * w + x;
+                inside[i] = ((y - 20) * (y - 20) + (x - 24) * (x - 24)) < 100 ? 1 : 0;
+                r[i] = inside[i] ? sc.inR : sc.outR;
+                g[i] = inside[i] ? sc.inG : sc.outG;
+                b[i] = inside[i] ? sc.inB : sc.outB;
+            }
+        std::vector<uint16_t> work = r11HacdMosaic(w, h, r, g, b);
+        std::vector<uint16_t> rgb(n * 3u, 0u);
+        debayerBasicU16(rgb.data(), work.data(), w, h, 1, 0);
+        const std::vector<uint16_t> bil(rgb);
+        std::vector<float> scratch(n);
+        ASSERT_EQ(1, debayer_reduced_hacd_chroma_rgb16(rgb.data(), work.data(), w, h, 1, scratch.data()));
+        double sumH = 0.0, sumB = 0.0, flatWorst = 0.0;
+        int count = 0;
+        for (int y = 3; y < h - 3; ++y)
+            for (int x = 3; x < w - 3; ++x)
+            {
+                const size_t i = static_cast<size_t>(y) * w + x;
+                const double eh = std::max(std::fabs(rgb[i * 3u] - r[i]), std::fabs(rgb[i * 3u + 2u] - b[i]));
+                const double eb = std::max(std::fabs(bil[i * 3u] - r[i]), std::fabs(bil[i * 3u + 2u] - b[i]));
+                sumH += eh;
+                sumB += eb;
+                ++count;
+                bool flat = true;
+                for (int dy = -2; dy <= 2 && flat; ++dy)
+                    for (int dx = -2; dx <= 2 && flat; ++dx)
+                        flat = inside[static_cast<size_t>(y + dy) * w + (x + dx)] == inside[i];
+                if (flat) flatWorst = std::max(flatWorst, eh);
+            }
+        const double mh = sumH / count, mb = sumB / count;
+        const bool ok = mh <= mb + sc.slack && flatWorst <= 1.0;
+        std::printf("[hacd-colour] %-30s HA-CD mean %.2f | bilinear %.2f (ratio %.3f, bound bilinear + %.0f) | flat "
+                    "worst %.0f (<= 1) %s\n",
+                    sc.name, mh, mb, mh / mb, sc.slack, flatWorst, sc.asserted ? (ok ? "ok" : "FAIL") : "printed (OPEN)");
+        if (sc.asserted)
+        {
+            EXPECT_LE(mh, mb + sc.slack) << sc.name;
+            EXPECT_LE(flatWorst, 1.0) << sc.name;
+        }
+    }
+}
+
+// H2C-PORT-1 r11 RED: degenerate-fit transition. The same gained neutral diagonal step (kR 0.40, kB 0.65, black
+// 2048) in the right part of a 64 x 48 frame; the left part is either the same gained grey (the per-frame fit is
+// valid, aR ~0.41) or an anti-correlated colour ramp (R and B fall as G rises: the fit leaves its range and the
+// kernel takes a = 1, c = 0 on the gained raw). The false colour on the step, |R'-G| + |B'-G| with gain and
+// black taken out, must stay at or below the bilinear's in BOTH frames, so a frame that falls back never shows
+// more fringe than base. 68c038b2 (no clamp), replica sim_r11c.py: valid 0.841x, fallback 1.125x (RED); the
+// clamp: 0.500x and 0.822x.
+TEST(GpuDualIsoPreviewScale, HacdChromaDegenerateFitStaysAtOrBelowBilinear)
+{
+    const int w = 64, h = 48;
+    const size_t n = static_cast<size_t>(w) * h;
+    const double kr = 0.40, kb = 0.65, blk = 2048.0;
+    for (int fallback = 0; fallback < 2; ++fallback)
+    {
+        std::vector<double> r(n), g(n), b(n);
+        for (int y = 0; y < h; ++y)
+            for (int x = 0; x < w; ++x)
+            {
+                const size_t i = static_cast<size_t>(y) * w + x;
+                const double s = ((x - 32) + y < 40) ? 4000.0 : 40000.0;
+                if (x >= 32)
+                {
+                    r[i] = blk + kr * s; g[i] = blk + s; b[i] = blk + kb * s;
+                }
+                else if (fallback)
+                {
+                    r[i] = 60000.0 - 1800.0 * x; g[i] = 3000.0 + 1800.0 * x; b[i] = r[i];
+                }
+                else
+                {
+                    r[i] = blk + kr * 12000.0; g[i] = blk + 12000.0; b[i] = blk + kb * 12000.0;
+                }
+            }
+        std::vector<uint16_t> work = r11HacdMosaic(w, h, r, g, b);
+        std::vector<uint16_t> rgb(n * 3u, 0u);
+        debayerBasicU16(rgb.data(), work.data(), w, h, 1, 0);
+        const std::vector<uint16_t> bil(rgb);
+        std::vector<float> scratch(n);
+        ASSERT_EQ(1, debayer_reduced_hacd_chroma_rgb16(rgb.data(), work.data(), w, h, 1, scratch.data()));
+        double fh = 0.0, fb = 0.0;
+        int count = 0;
+        for (int y = 3; y < h - 3; ++y)
+            for (int x = 36; x < w - 3; ++x)
+            {
+                const size_t i = (static_cast<size_t>(y) * w + x) * 3u;
+                const double gg = rgb[i + 1] - blk;
+                fh += std::fabs((rgb[i] - blk) / kr - gg) + std::fabs((rgb[i + 2] - blk) / kb - gg);
+                fb += std::fabs((bil[i] - blk) / kr - gg) + std::fabs((bil[i + 2] - blk) / kb - gg);
+                ++count;
+            }
+        fh /= count;
+        fb /= count;
+        std::printf("[hacd-fit] %-8s step false colour HA-CD %.2f | bilinear %.2f (ratio %.3f, <= 1.000) %s\n",
+                    fallback ? "fallback" : "valid", fh, fb, fh / fb, fh <= fb ? "ok" : "FAIL");
+        EXPECT_LE(fh, fb) << (fallback ? "fallback (a = 1, c = 0)" : "valid fit");
+    }
+}
+
+// H2C-PORT-1 r11: minimum valid and odd dimensions. 4x4, 5x5, 5x4, 4x5, 7x9, 9x7 and 32x6 (15 fit samples: the
+// n < 16 fallback) on a flat saturated colour. G is set to the true G, R and B to a 0xBEEF sentinel, and the
+// scratch to NaN, so a consumer that read a site no producer wrote (a reflection that breaks the CFA parity at an
+// odd edge) prints 0 or keeps the sentinel. Every pixel, borders included, must come back exactly (R 30000, G
+// 6000, B 3000), with the same bytes for 1 and 4 threads. No defect was found at these sizes on 68c038b2: this
+// is GREEN on arrival, a pin, not a RED. Its discrimination is the replica's mutation (sim_r11c.py: a
+// clamp-to-edge reflection misses by 19875 DN).
+TEST(GpuDualIsoPreviewScale, HacdChromaMinimumAndOddSizesAreExact)
+{
+    const int sizes[][2] = { { 4, 4 }, { 5, 5 }, { 5, 4 }, { 4, 5 }, { 7, 9 }, { 9, 7 }, { 32, 6 } };
+    for (const auto & sz : sizes)
+    {
+        const int w = sz[0], h = sz[1];
+        const size_t n = static_cast<size_t>(w) * h;
+        const std::vector<double> r(n, 30000.0), g(n, 6000.0), b(n, 3000.0);
+        const std::vector<uint16_t> work = r11HacdMosaic(w, h, r, g, b);
+        std::vector<uint16_t> rgb1;
+        for (int threads : { 1, 4 })
+        {
+            std::vector<uint16_t> rgb(n * 3u, 0xBEEFu);
+            for (size_t i = 0; i < n; ++i) rgb[i * 3u + 1u] = 6000u;
+            std::vector<float> scratch(n, std::numeric_limits<float>::quiet_NaN());
+            ASSERT_EQ(1, debayer_reduced_hacd_chroma_rgb16(rgb.data(), work.data(), w, h, threads, scratch.data()))
+                << w << "x" << h;
+            int bad = 0;
+            for (size_t i = 0; i < n; ++i)
+                bad += (rgb[i * 3u] != 30000u) + (rgb[i * 3u + 1u] != 6000u) + (rgb[i * 3u + 2u] != 3000u);
+            std::printf("[hacd-size] %dx%d threads %d: %d of %zu words not exact\n", w, h, threads, bad, n * 3u);
+            EXPECT_EQ(0, bad) << w << "x" << h << " threads " << threads;
+            if (threads == 1) rgb1 = rgb;
+            else EXPECT_TRUE(rgb == rgb1) << w << "x" << h;
+        }
+    }
 }
 
 // H2C-PORT-1 RED 3: the route. At x4 the CPU plan's Bayer is at x2 (fullWidth / 2 x
