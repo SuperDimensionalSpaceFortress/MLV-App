@@ -12,8 +12,8 @@
 //     >= kStaleIdleGraceMs             -> clearStale() once, StaleCleared
 //   - kDeadlineMs since entry, measured after a pump's renderIdle() sample (it can block on the renderer mutex), i.e.
 //     immediately before the next pump -> Timeout (the caller proceeds)
-// The idle grace runs from when a renderIdle() sample RETURNS idle, and the time any later sample in the same run spends
-// blocked inside renderIdle() is subtracted: time blocked inside it is never counted as idle.
+// The idle grace runs from when a renderIdle() sample RETURNS idle; a later sample that spends any time blocked inside
+// renderIdle() restarts it where that sample returns, so blocked time is never idle and never joins two idle periods.
 // A busy render thread is never forged clear: it only ever times out.
 // WHAT IS BOUNDED (adversary r1 A1 and its re-pass): the time this helper spends deciding, i.e. the number of pumps
 // after the deadline is zero. The deadline is checked after every pump, so a pump that outlasts it ends the wait at
@@ -112,16 +112,13 @@ inline Result wait( const Callbacks &callbacks )
         {
             idleRun = false;
         }
-        else if( !idleRun )
+        else if( !idleRun || sampledMs > nowMs )
         {
+            // A run opens when an idle sample returns. A sample that spent time blocked inside renderIdle() (the render
+            // thread held its mutex) is a break in idleness: it restarts the run where it returns, so neither the blocked
+            // time (adversary r2 A1) nor the idle time before it (adversary r3 A1) is credited.
             idleRun = true;
             idleSinceMs = sampledMs;
-        }
-        else
-        {
-            // adversary r2 A1: an open run is not credited with the time this sample spent blocked inside renderIdle()
-            // (sampled from the post-pump clock, so the credit can only shrink).
-            idleSinceMs += sampledMs - nowMs;
         }
 
         if( idleRun
