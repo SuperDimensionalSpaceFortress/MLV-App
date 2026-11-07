@@ -1124,6 +1124,44 @@ class VerdictOnText(unittest.TestCase):
         self.assertIn("cannot read", printed)
         self.assertNotIn("Traceback", printed)
 
+    # ---- r9 adversary pass 2 (d0ab2372) ------------------------------------------------------------------------
+    UT_BLOCK = ("=" * 70 + "\nFAIL: test_a (t.T.test_a)\n" + "-" * 70 + "\nTraceback (most recent call last):\n"
+                '  File "t.py", line 8, in test_a\nAssertionError: bad\n\nRan 1 test in 0.1s\n\n')
+    PT_SECTION = "=== FAILURES ===\n___ test_x ___\nE assert False\nt.py:2: AssertionError\n"
+
+    def test_r9_adv2_a1_a_trailer_of_the_other_runner_is_could_not_check(self) -> None:
+        # One run has one runner: its terminal result must reconcile EVERY failure that was read, so failures read by
+        # one parser under the other runner's trailer cannot be counted at all.
+        for n in ("0", "1"):
+            with self.subTest(case=f"unittest blocks under a pytest bar of {n}"):
+                self._could_not_check(self.UT_BLOCK + f"=== {n} failed in 0.1s ===\n", "t.py:8", "runner")
+            with self.subTest(case=f"pytest section under a unittest trailer of {n}"):
+                self._could_not_check(self.PT_SECTION + f"Ran 1 test in 0.1s\n\nFAILED (failures={n})\n", "t.py:2", "runner")
+        both = self.UT_BLOCK.replace("Ran 1 test in 0.1s\n\n", "") + self.PT_SECTION + "Ran 1 test in 0.1s\n\nFAILED (failures=1)\n"
+        self._could_not_check(both, "t.py:8", "runner")
+        self.assertEqual(rmv.verdict(self.UT_BLOCK + "FAILED (failures=1)\n", "t.py:8")[0], rmv.PASS)  # controls
+        self.assertEqual(rmv.verdict(self.PT_SECTION + "=== 1 failed in 0.1s ===\n", "t.py:2")[0], rmv.PASS)
+
+    def test_r9_adv2_a2_a_lossy_decode_never_invents_a_matching_name(self) -> None:
+        raw = (b"F\n" + b"=" * 70 + b"\nFAIL: test_x (test_m.T.test_x)\n" + b"-" * 70
+               + b'\nTraceback (most recent call last):\n  File "test_\xe9.py", line 4, in test_x\nAssertionError: 1 != 2\n\n'
+               + b"-" * 70 + b"\nRan 1 test in 0.001s\n\nFAILED (failures=1)\n")  # cp1252 bytes: not UTF-8
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp, "red.txt")
+            path.write_bytes(raw)
+            import contextlib
+            import io
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(buf):
+                code = rmv.main(["verdict", "--output", str(path), "--expect", "test_�.py:4"])
+        self.assertEqual(code, 2, buf.getvalue())
+        self.assertIn("cannot read", buf.getvalue())
+        lossy = raw.decode("utf-8", errors="replace")  # a text already decoded with replacement is refused too
+        self._could_not_check(lossy, "test_�.py:4", "U+FFFD")
+        self.assertEqual(rmv.verdict(raw.decode("cp1252"), "test_\xe9.py:4")[0], rmv.PASS)  # the true name still reads
+        with self.assertRaises(UnicodeDecodeError):  # sibling: the real-run helpers decode strictly
+            _raw_text(subprocess.CompletedProcess([], 1, raw, b""))
+
     def test_r9_adv_a1_sibling_the_real_run_helpers_keep_the_runner_line_ends(self) -> None:
         # The helpers hand verdict() exactly the text a saved file holds, so the real-run tests go through _frame with
         # the runner's own line ends (CRLF on Windows), never through a newline translation.
