@@ -1210,6 +1210,15 @@ function Get-DvConformArmVerdict {
         if ($active -ne 0) { $why = 'conform was active' }
         elseif ($envOverride -ne 0) { $why = 'the app did not report MLVAPP_PLAYBACK_CONFORM=0' }
         elseif ($null -eq $clip -or $null -eq $play -or -not [double]::IsFinite($clip) -or -not [double]::IsFinite($play) -or $clip -le 0 -or [Math]::Abs($play - $clip) -gt (0.005 * $clip)) { $why = 'playback_fps is not within 0.5 % of clip_fps' }
+        else {
+            # HFR-NATIVE-60FPS-FULLRES-1 r26 (adversary A2 on be20bc59): the conform line's rates must be the engine's own, or a line that contradicts the summary
+            # (native = pace = 59.94, clip = playback = 24) proves nothing. clip_fps IS native_fps at print precision (Get-DvConformPaceProof's tolerance) and
+            # playback_fps is within 0.5 % of pace_fps.
+            $native = ConvertTo-DvDouble (Get-DvProp $Playback 'nativeFps')
+            $pace = ConvertTo-DvDouble (Get-DvProp $Playback 'paceFps')
+            if ($null -eq $native -or -not [double]::IsFinite($native) -or $native -le 0 -or [Math]::Abs($clip - $native) -gt 0.0005) { $why = "clip_fps=$clip is not the summary's native_fps=$native" }
+            elseif ($null -eq $pace -or -not [double]::IsFinite($pace) -or $pace -le 0 -or [Math]::Abs($play - $pace) -gt (0.005 * $pace)) { $why = "playback_fps=$play is not within 0.5 % of the engine's pace_fps=$pace" }
+        }
     }
     elseif ([string]$requested -ceq 'on') {
         # MERGE-MASTER r4 (ADV-A1): conform_active=1 alone is not proof. A requested conform arm needs the conformed pace PROVEN (finite, positive,

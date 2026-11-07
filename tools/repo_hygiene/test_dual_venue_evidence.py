@@ -5271,6 +5271,28 @@ class ConformArmIsHonouredTests(EvidenceFactory, ModuleMutationMixin, unittest.T
             with self.subTest(name):
                 self.assertEqual(got[name]["blocks"], name != "sound", got[name]["reason"])
 
+    def test_the_off_arm_verdict_needs_the_conform_rates_to_be_the_engines(self) -> None:
+        """HFR-NATIVE-60FPS-FULLRES-1 r26 (adversary A2 on be20bc59): 'off' checked playback_fps against clip_fps only, so a conform line that contradicts the
+        summary's own rates (native = pace = 59.94, clip = playback = 24) was honoured. The native arm is proven only when clip_fps IS native_fps (print
+        precision, as Get-DvConformPaceProof) and playback_fps is within 0.5 % of the engine's pace_fps."""
+        base = dict(conformLinePresent=True, summarySession="3", conformSession="3", conformActive=0, conformEnvOverride=0, nativeFps=59.94, paceFps=59.94)
+        rows = [("sol A2 literal: 24/24 line under a 59.94 engine", dict(base, conformClipFps=24.0, conformPlaybackFps=24.0)),
+                ("clip is native, playback is not the engine pace", dict(base, paceFps=24.0, conformClipFps=59.94, conformPlaybackFps=59.94)),
+                ("clip one print unit off native", dict(base, conformClipFps=59.941, conformPlaybackFps=59.94)),
+                ("native NaN", dict(base, nativeFps="NaN", conformClipFps=59.94, conformPlaybackFps=59.94)),
+                ("pace absent", dict({k: v for k, v in base.items() if k != "paceFps"}, conformClipFps=59.94, conformPlaybackFps=59.94)),
+                ("pace zero", dict(base, paceFps=0, conformClipFps=59.94, conformPlaybackFps=59.94)),
+                ("sound hfr", dict(base, conformClipFps=59.94, conformPlaybackFps=59.94)),
+                ("sound 23.976", dict(base, nativeFps=23.976, paceFps=23.976, conformClipFps=23.976, conformPlaybackFps=23.976))]
+        proc, out = run_pwsh_json("$rows = $env:DVE_ROWS | ConvertFrom-Json; $spec = [pscustomobject]@{ generatorArgs = [pscustomobject]@{ playbackConform = 'off' } }\n"
+                                  "@($rows | ForEach-Object { $v = Get-DvConformArmVerdict -Spec $spec -Playback $_.block; [pscustomobject]@{ name = $_.name; blocks = $v.blocks; reason = [string]$v.reason } }) | ConvertTo-Json -Compress",
+                                  DVE_ROWS=json.dumps([{"name": n, "block": b} for n, b in rows]))
+        self.assertIsNotNone(out, proc.stdout + proc.stderr)
+        got = {r["name"]: r for r in out}
+        for name, _ in rows:
+            with self.subTest(name):
+                self.assertEqual(got[name]["blocks"], not name.startswith("sound"), got[name]["reason"])
+
     def test_the_production_validator_fails_closed_on_an_unproven_conform_arm(self) -> None:
         spec = self.write_spec(generator_args={"playbackConform": "on"})
         repo = self.prod_repo(spec=spec)
