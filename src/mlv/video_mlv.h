@@ -251,8 +251,9 @@ int getMlvRawFrameDebayeredFromReconnedRaw16(mlvObject_t * video,
  * reduced BAYER's dims (plan.bayerWidth / bayerHeight); bayerScale = Width /
  * reducedWidth is reconScale, or 2 when reconScale is 4 (the x4 "H2c" route:
  * debayer at x2, R and B rebuilt by debayer_reduced_hacd_chroma_rgb16 (r10),
- * chroma-only horizontal [1 2 1] clamped to each channel's three taps (r12,
- * debayer_reduced_hchroma121_ranged_rgb16), 2x2 box). At x2 (bayerScale ==
+ * chroma-only horizontal [1 2 1] clamped to each channel's three taps, both
+ * steps taking a channel's own interpolation where it is smoother than the
+ * colour difference (r12, debayer_reduced_hacd_chroma121_rgb16), 2x2 box). At x2 (bayerScale ==
  * reconScale == 2), and at x4 with bayerScale 4, the bytes are the bilinear
  * debayer's, as before (r8: x2 is held at base behaviour).
  * reconHqDualIso selects the bit shift as in ...FromReconnedRaw16. */

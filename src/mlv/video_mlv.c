@@ -7173,7 +7173,8 @@ static float * mlv_ensure_thread_reduced_recon_hacd_scratch(uint64_t required_fl
  *  - displayScale == 2 * bayerScale (x4 from an x2 Bayer, "H2c"): bilinear at
  *    bw x bh, R and B rebuilt by debayer_reduced_hacd_chroma_rgb16 (r10: balanced
  *    HA G + colour difference on the bilinear G), chroma-only horizontal [1 2 1]
- *    clamped to each channel's three taps (r12), 2x2 box (whole row pairs only);
+ *    clamped to each channel's three taps (r12), both with the own-channel choice
+ *    (r12: debayer_reduced_hacd_chroma121_rgb16), 2x2 box (whole row pairs only);
  *  - otherwise (x2, and x4 from an x4 Bayer): the bilinear debayer's bytes, as
  *    before this card. r8 (hub ruling HUB-TICK 20261105T2045Z) holds x2 at base
  *    behaviour; x2's filter is CPU-DUALISO-REDUCED-X2-COMB-FILTER-1.
@@ -7210,10 +7211,11 @@ static int mlv_reduced_bayer_to_display_rgb16(uint16_t * out,
         if (!debayered || !filtered || !hacd_scratch) return 0;
         debayerBasicU16RecordingKernelMilliseconds(debayered, bayer, bw, bh, threads, bit_shift);
         /* r10: R and B from HA G + colour difference, on the bilinear G (bayer is shifted now). */
-        if (!debayer_reduced_hacd_chroma_rgb16(debayered, bayer, bw, bh, threads, hacd_scratch)) return 0;
-        /* r12 (adversary pass 9 A1): the ranged [1 2 1] keeps each R / B inside its three taps' own range, so a
-         * channel HA-CD held constant under a G-only edge stays constant through the filter and the box. */
-        debayer_reduced_hchroma121_ranged_rgb16(filtered, debayered, bw, bh, threads);
+        /* r12: HA-CD then the ranged [1 2 1] (adversary pass 9 A1: each R / B kept inside its three taps' own
+         * range), and in both steps a pixel whose own channel is smoother than the balanced colour difference
+         * takes its own interpolation (r12 pass 2 A1), so an R / B that does not follow G (constant or affine under
+         * a G-only edge) passes the filter and the box exactly. */
+        if (!debayer_reduced_hacd_chroma121_rgb16(filtered, debayered, bayer, bw, bh, threads, hacd_scratch)) return 0;
         if (!processingRgbU16BoxDownsample(filtered, out, bw, box_h, 2, threads)) return 0;
         rows = box_h / 2;
     }

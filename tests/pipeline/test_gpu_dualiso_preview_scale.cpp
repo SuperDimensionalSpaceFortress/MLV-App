@@ -2543,9 +2543,10 @@ TEST(GpuDualIsoPreviewScale, CpuReducedX4PlayingIsH2cByteForByte)
         std::vector<uint16_t> filt(deb.size(), 0u);
         debayerBasicU16(deb.data(), work.data(), bw, bh, threads, shift);
         std::vector<float> scratch(static_cast<size_t>(bw) * static_cast<size_t>(bh));
-        ASSERT_EQ(1, debayer_reduced_hacd_chroma_rgb16(deb.data(), work.data(), bw, bh, threads, scratch.data()));
-        // r12 (adversary pass 9 A1): the [1 2 1] clamped to each channel's three taps.
-        debayer_reduced_hchroma121_ranged_rgb16(filt.data(), deb.data(), bw, bh, threads);
+        // r12: the HA-CD step and the [1 2 1] clamped to each channel's three taps (pass 9 A1), both with the
+        // own-channel choice (r12 pass 2 A1), as one call.
+        ASSERT_EQ(1, debayer_reduced_hacd_chroma121_rgb16(filt.data(), deb.data(), work.data(), bw, bh, threads,
+                                                          scratch.data()));
         const int boxH = bh & ~1;
         ASSERT_EQ(1, processingRgbU16BoxDownsample(filt.data(), expected.data(), bw, boxH, 2, threads));
         for (int y = boxH / 2; y < outH; ++y)

@@ -55,6 +55,18 @@ void debayer_reduced_hchroma121_ranged_rgb16(uint16_t *out, const uint16_t *in, 
  * serial). */
 int debayer_reduced_hacd_chroma_rgb16(uint16_t *rgb, const uint16_t *bayer, int w, int h, int threads,
                                       float *scratch);
+/* r12 (adversary r12 pass 2 A1): in both steps above, a pixel whose own channel is locally
+ * smoother than the balanced colour difference (curvature at its nearest own site, scaled
+ * by the fit slope) takes that channel's own interpolation instead: in the HA-CD step the
+ * bilinear mean of its nearest own samples, before the 5x5 clamp; in the chroma step the
+ * plain [1 2 1] of the channel. An R or B that does not follow G (constant or affine under
+ * a G-only edge) is then exact, while one that follows G keeps the colour difference.
+ * The x4 CPU reduced route's chroma: debayer_reduced_hacd_chroma_rgb16 on rgb, then
+ * debayer_reduced_hchroma121_ranged_rgb16 into filtered with that choice (the fit's
+ * slopes; a kept channel takes the ranged colour-difference filter). Returns 0 with
+ * filtered untouched when the HA-CD step refuses. */
+int debayer_reduced_hacd_chroma121_rgb16(uint16_t *filtered, uint16_t *rgb, const uint16_t *bayer, int w, int h,
+                                         int threads, float *scratch);
 /* Quite quick bilinear debayer, floating point sadly; threads argument is unused */
 void debayerBasic(uint16_t * __restrict debayerto, float * __restrict bayerdata, int width, int height, int threads);
 /* More useable amaze, threads number should be the number of cores(or threads if >= i7) your cpu has */
