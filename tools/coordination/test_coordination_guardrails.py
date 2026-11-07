@@ -2258,6 +2258,34 @@ def test_r3b_adv_a3_a_claude_envelope_needs_a_real_boolean_false_is_error(tmp_pa
 
 
 
+def test_r3c_json_whitespace_is_space_tab_cr_lf_only_never_unicode_whitespace(tmp_path):
+    # r3c class sweep of r3b A1: String.Trim() also strips NBSP / NEL / LS / PS, which are NOT JSON whitespace, so
+    # a candidate or envelope wrapped in them parsed although the text is not JSON.
+    prose = "x" * 130 + "\n"
+    for sep in (" ", " ", " ", "\u0085", "　"):
+        r = _work_evidence(tmp_path, "codex", prose + '{"verdict":"APPROVE"}' + sep + "\n", 0, prompt_chars=600, require_verdict=True)
+        assert r["workCompleted"] is False and r["reason"] == "codex-no-verdict", (repr(sep), r)
+        env = '{"type":"result","subtype":"success","is_error":false,"result":"ok"}'
+        for wrapped in (sep + env, env + sep):
+            r = _work_evidence(tmp_path, "claude", wrapped + "\n", 0)
+            assert r["workCompleted"] is False, (repr(sep), r)
+    # JSON whitespace around a complete verdict object stays fine
+    ok = prose + '{"verdict":"APPROVE"}\t \r\n\n'
+    assert _work_evidence(tmp_path, "codex", ok, 0, prompt_chars=600, require_verdict=True)["workCompleted"] is True
+    env = ' \t{"type":"result","subtype":"success","is_error":false,"result":"ok"} \r\n'
+    assert _work_evidence(tmp_path, "claude", env, 0)["workCompleted"] is True
+
+
+def test_r3c_a_non_boolean_is_error_is_never_a_provider_refusal(tmp_path):
+    # r3c class sweep of r3b A3: `$j.is_error -eq $true` is true for the integer 1, so a non-boolean is_error
+    # whose result text names a usage limit read as a provider refusal.
+    for bad in ("1", '"true"', "[true]"):
+        env = ('{"type":"result","subtype":"success","is_error":%s,"api_error_status":null,'
+               '"result":"You\'ve hit your session limit."}\n') % bad
+        assert _classify(tmp_path, "", "claude", answer=env) is None, bad
+    assert _classify(tmp_path, "", "claude", answer=REAL_CLAUDE_429_ENVELOPE) is not None
+
+
 def test_invoke_lane_writes_the_selected_answer_to_the_output_file_when_the_last_message_has_no_substance():
     # adversary A4 (2nd pass): outputSha256 hashes $final while outputPath is the last-message file.
     body = LANE_RUNNER.read_text(encoding="utf-8")

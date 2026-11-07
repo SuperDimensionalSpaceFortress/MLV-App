@@ -82,7 +82,8 @@ function Find-ClaudeResultEnvelope {
     param([AllowEmptyString()][AllowNull()][string]$Answer)
     if ([string]::IsNullOrWhiteSpace($Answer)) { return $null }
     foreach ($ln in @(Split-LaneJsonLines -Text $Answer)) {
-        $t = $ln.Trim()
+        # JSON whitespace only (r3c): String.Trim() would also strip NBSP / NEL / LS / PS, which are not JSON whitespace.
+        $t = $ln.Trim([char[]](9, 10, 13, 32))
         if ($t.Length -eq 0) { continue }
         $cand = ConvertFrom-LaneJsonObject -Text $t
         if ($null -eq $cand) { continue }
@@ -225,7 +226,8 @@ function Get-LaneLastTopLevelJson {
     }
     if ($start -lt 0) { return $null }
     $tailText = $Text.Substring($start)
-    if ($end -ge 0 -and $Text.Substring($end + 1).Trim().Length -eq 0) { $tailText = $Text.Substring($start, $end - $start + 1) }
+    # Only JSON whitespace may follow the value (r3c): a trailing NBSP / NEL / LS / PS is garbage, not a blank tail.
+    if ($end -ge 0 -and $Text.Substring($end + 1).Trim([char[]](9, 10, 13, 32)).Length -eq 0) { $tailText = $Text.Substring($start, $end - $start + 1) }
     return [pscustomobject]@{ text = $tailText; offset = $start }
 }
 
@@ -371,7 +373,7 @@ function Get-ProviderRefusal {
         $j = Find-ClaudeResultEnvelope -Answer $Answer
         if ($null -eq $j) { return $null }
         $names = @($j.PSObject.Properties.Name)
-        $isError = ($names -contains 'is_error') -and ($j.is_error -eq $true)
+        $isError = ($names -contains 'is_error') -and ($j.is_error -is [bool]) -and ($j.is_error -eq $true)
         $status  = if ($names -contains 'api_error_status') { [string]$j.api_error_status } else { '' }
         if (-not $isError -and $status -eq '') { return $null }
         $msg  = if ($names -contains 'result') { [string]$j.result } else { '' }
