@@ -248,8 +248,8 @@ TEST(ResizeStillDrawingWait, TimeBlockedInsideRenderIdleIsNotCountedAsIdleGrace)
 }
 
 // adversary r2 A1: the same rule once an idle run is already open. renderIdle() reports idle every time but blocks 100 ms
-// on its SECOND call; that blocked time must not be credited to the run, so the grace still needs 50 ms of unblocked
-// time after it.
+// on its SECOND call; that blocked time must not be credited to the run. r3 A1: the time before the block must not be
+// credited either (a blocked sample ends the run), so the grace needs 50 ms of continuous idleness after the block.
 TEST(ResizeStillDrawingWait, TimeBlockedInsideALaterRenderIdleSampleIsNotCountedAsIdleGrace)
 {
     FakeWorld world;
@@ -261,9 +261,43 @@ TEST(ResizeStillDrawingWait, TimeBlockedInsideALaterRenderIdleSampleIsNotCounted
     const Result result = wait(c);
     ASSERT_TRUE(result.outcome == Outcome::StaleCleared);
     ASSERT_EQ(1, world.clearStaleCalls);
-    // run opens at t=5; sample 2 blocks t=10 -> 110 (not idle credit): 50 ms of credit is reached at t=155
-    ASSERT_TRUE(result.waitedMs >= 155);
-    ASSERT_TRUE(result.waitedMs <= 155 + world.stepMs);
+    // run opens at t=5; sample 2 blocks t=10 -> 110 and the run restarts there: stale no earlier than t=160
+    ASSERT_TRUE(result.waitedMs >= 110 + kStaleIdleGraceMs);
+    ASSERT_TRUE(result.waitedMs <= 110 + kStaleIdleGraceMs + world.stepMs);
+}
+
+// adversary r3 A1 (r2 advisory A2 raised to major): a blocked renderIdle() sample is a break in idleness (the render
+// thread held its mutex), so it must not join the idle time before it to the idle time after it. The adversary's input:
+// entry t=0, pumps return at 1, 50, 151 (then 1 ms apart), every sample idle, the second blocks 50 -> 150. r2's
+// arithmetic kept 49 ms of pre-block credit and stale-cleared at t=151, 1 ms after the block.
+TEST(ResizeStillDrawingWait, ABlockedSampleEndsTheIdleRunSoSeparateIdlePeriodsNeverJoin)
+{
+    std::int64_t now = 0;
+    bool flag = true;
+    int pumps = 0;
+    int samples = 0;
+    int clears = 0;
+    Callbacks c;
+    c.stillDrawing = [&flag]() { return flag; };
+    c.pump = [&now, &pumps]() {
+        ++pumps;
+        if (pumps == 1) now = 1;
+        else if (pumps == 2) now = 50;
+        else if (pumps == 3) now = 151;
+        else now += 1;
+    };
+    c.renderIdle = [&now, &samples]() {
+        if (samples++ == 1) now = 150; // blocked on the renderer mutex 50 -> 150
+        return true;
+    };
+    c.clearStale = [&flag, &clears]() { ++clears; flag = false; };
+    c.nowMs = [&now]() { return now; };
+    const Result result = wait(c);
+    ASSERT_TRUE(result.outcome == Outcome::StaleCleared);
+    ASSERT_EQ(1, clears);
+    // the only continuous idle run starts when the blocked sample returns (t=150)
+    ASSERT_TRUE(result.waitedMs >= 150 + kStaleIdleGraceMs);
+    ASSERT_TRUE(result.waitedMs <= 150 + kStaleIdleGraceMs + 1);
 }
 
 // r3 (adversary r2 pass 3 A1, which supersedes r2's request-serial floor). drawFrameReady sizes the scene from the zoom and
