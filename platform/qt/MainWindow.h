@@ -35,6 +35,8 @@
 #include "SessionModel.h"
 #include "PlaybackFrameRange.h"
 #include "PlaybackNativePaceGuard.h"
+#include "PlaybackDueWake.h"
+#include "PlaybackDueWakeSamples.h"
 #include "PlaybackPrepInFlightGate.h"
 #include "PlaybackPresentTrace.h"
 #include "PlaybackScopesDuringPlayback.h"
@@ -1240,6 +1242,39 @@ private:
     // PLAYBACK-CUDA-NATIVE-PACE-1: the ceiling on every engine advance in playbackHandling() -- the timeline never
     // runs faster than getFramerate() (native, or the explicit fpsOverride). Reset on every Play start and stop.
     playback_native_pace::NativePaceGuard m_playbackPaceGuard;
+    // HFR-NATIVE-M16-1457-GUI-PRESENT-CADENCE-1: after a paced present, a one-shot wake at the guard's due time for the
+    // next whole frame (msUntilCredit), so the advance never waits for the 10-16 ms Windows poll tick. The poll timer
+    // stays as the fallback. MLVAPP_PLAYBACK_DUE_WAKE=0 is the kill switch. Counters: playback_due_wake line.
+    std::unique_ptr<PlaybackDueWake> m_playbackDueWake;
+    bool m_playbackTailAdvanceMovedFrame = false;   // finishPresentedFrame's tail timerFrameEvent reached a new frame
+    bool m_playbackDueWakeHiRes = false;            // the wake ran on a high-resolution timer this Play (summary line)
+    double m_playbackDueWakeDueAtMs = 0.0;      // stage-time ms the armed wake is due
+    int m_playbackDueWakeRearmsThisPresent = 0;         // bounded: reset every present, capped at kPlaybackDueWakeMaxRearms
+    // r5 adversary pass 8 A2: the per-Play counters are unsigned 64-bit (a signed int overflowed, UB, after 2^31 events of a
+    // looping Play that never resets)
+    quint64 m_playbackDueWakeArmed = 0;
+    quint64 m_playbackDueWakeFired = 0;
+    quint64 m_playbackDueWakeAdvanced = 0;
+    quint64 m_playbackDueWakeRearmed = 0;
+    quint64 m_playbackDueWakeBusyDeferred = 0;
+    quint64 m_playbackDueWakeUnpresentedDeferred = 0;   // r2 A1: every-frame wake held until the requested frame presented
+    quint64 m_playbackDueWakePostUnsplit = 0;           // r5 pass 9 A1: native deliveries taken before the post-return stamp
+    quint64 m_playbackDueWakePostRefusedBase = 0;       // r7 passes 13-15 A1: the wake's cumulative counters at this Play's reset
+    quint64 m_playbackDueWakePostFailedBase = 0;
+    quint64 m_playbackDueWakePostRescuedBase = 0;
+    bool m_playbackDueWakePostBaselineSettled = true;   // r8 pass 17 A1: the reset's settlePostCounters() answered in time
+    long long m_playbackDueWakePresentedFrame = -1;     // r2 pass 4 A1: the frame whose present last ENDED (presentPlaybackPreparedFrame)
+    QString m_playbackDueWakeDelivery = QStringLiteral( "none" );   // r2: native-msg | notifier | qtimer, "+"-joined if arms differed
+    bool m_playbackDueWakeMechanismSeen = false;                    // r2 pass 5 A1: an arm of this Play recorded its mechanism
+    // r4 (Dot B1): bounded per Play (PlaybackDueWakeSamples.h), released at the Play-start reset
+    PlaybackDueWakeSamples m_playbackDueWakeLatenessMs;
+    // r6 (adversary pass 10 A2): the split at the post as BOUNDS (playbackDueWakeSplitBounds), native-message deliveries only:
+    // the post lies between the wait thread's first stamp and PostMessageW's return stamp, so no point split is claimed
+    PlaybackDueWakeSamples m_playbackDueWakeDueToPostLoMs;       // first stamp - due time
+    PlaybackDueWakeSamples m_playbackDueWakeDueToPostHiMs;       // return stamp - due time
+    PlaybackDueWakeSamples m_playbackDueWakePostToReceiveLoMs;   // GUI-thread receive time - return stamp
+    PlaybackDueWakeSamples m_playbackDueWakePostToReceiveHiMs;   // GUI-thread receive time - first stamp
+    PlaybackDueWakeSamples m_playbackDueWakePostCallMs;          // return stamp - first stamp (the attribution uncertainty)
     playback_present_trace::Recorder m_playbackPresentTrace;   // PLAYBACK-STARTUP-CATCHUP-BURST-1 r7, opt-in
     // PLAYBACK-BACHELOR-PRESENT-JITTER-1: per-present slip accounting and timeline-path reconciliation for the
     // smoke session (playback_smoke.slip_summary); fed only while m_playbackSmokeActive.
@@ -1999,6 +2034,13 @@ private:
     void setPreviewMode( void );
     double getFramerate( void );
     double playbackPaceGuardFps( void );
+    // HFR-NATIVE-M16-1457-GUI-PRESENT-CADENCE-1: wake the paced advance at the frame's due time, not the next poll tick
+    void armPlaybackDueWake( void );
+    void notePlaybackDueWakeArmMechanism( void );
+    void onPlaybackDueWake( void );
+    void cancelPlaybackDueWake( void );
+    void resetPlaybackDueWakeCounters( void );
+    QString playbackDueWakeSummaryLine( void ) const;
     void paintAudioTrack( void );
     uint8_t drawZebras( QImage *image );
     void drawFrameNumberLabel( int frameIndex = -1 );

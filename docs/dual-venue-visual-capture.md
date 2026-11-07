@@ -219,3 +219,55 @@ uncompressed RAW at the venue, any speed claim, or the venue volume's file syste
 | windowed-s2 cpu | `78c6b219-ff1b-4d0a-9ef3-8657db593d38.json` | `strip-m16-1243-pace-cinematic-windowed-s2-bachelor-cpu-7dc59c48-20261104203116.png` |
 
 `<leg>` is `m16-1243-pace-cinematic-fullscreen-s4` or `m16-1243-pace-cinematic-windowed-s2`.
+
+## 2026-11-05: same-batch A/B for HFR-NATIVE-M16-1457-GUI-PRESENT-CADENCE-1 (PR 743, r10 legs, r11 reading)
+
+Arm H is build `3801227dc191a50a5eaf52929f9806e8f6dcd95a`, manifest `eb37ec54a8960488c15923a08ad874a8a95ee69221828e345627c35b9fe25945`.
+Arm C is its merge base `03b9ea28143cd08ff3020bb3a63d9538b95d289f`, manifest `75681b0a635aeaf39ad54270c7231af6c2d631a56beb82e7f18737a3750814e6`.
+Twelve untraced CUDA legs ran on Bachelor, H C C H in each cell. Paths are under `.claude-state\dual-venue\` on the hub host; those
+files are not tracked. Each strip was opened and read.
+
+**These legs apply to those two builds only.** The merge just before this section brought master's `src/` and `platform/` changes into
+the PR branch, so no later commit of the branch has the product source these legs measured. This section changes no source itself.
+
+`presented` is `presented_fps` from the leg's `playback_smoke.summary` line, which is `presented_frames` / `elapsed_ms`. `timeline` is
+`timeline_fps` from that line. `fired` is from the leg's `playback_due_wake` line; arm C has no due wake. Look Assist is the receipt's
+`lookAssist.reported`, HONOURED on every leg.
+
+| # | arm | cell | presented | timeline | fired | Look Assist | visual | receipt | strip stamp |
+|---|---|---|---|---|---|---|---|---|---|
+| 01 | H | M16-1457 windowed s2 | 59.154 | 59.392 | 409 | 1 | OK | `CUDA-HEADROOM-1\m16-1457-native-windowed-s2\bachelor\be735c0e-3fac-48ab-8e5e-d24f5ad83c5f.json` | 20261105101730 |
+| 02 | C | M16-1457 windowed s2 | 45.627 | 59.486 | n/a | 1 | OK | `CUDA-HEADROOM-1\m16-1457-native-windowed-s2\bachelor\702542a4-c77f-4451-a6ad-f0c7a8218fee.json` | 20261105102134 |
+| 03 | C | M16-1457 windowed s2 | 45.164 | 59.503 | n/a | 1 | OK | `CUDA-HEADROOM-1\m16-1457-native-windowed-s2\bachelor\0c42e971-b407-4fc8-a227-01999eab1959.json` | 20261105102525 |
+| 04 | H | M16-1457 windowed s2 | 59.138 | 59.575 | 416 | 1 | OK | `CUDA-HEADROOM-1\m16-1457-native-windowed-s2\bachelor\57f23e51-3c87-454e-aedb-1ebaf6997c48.json` | 20261105102923 |
+| 05 | H | M16-1457 fullscreen s2 | 50.890 | 59.691 | 83 | 1 | OK | `CUDA-HEADROOM-1\m16-1457-native-fullscreen-s2\bachelor\2adab724-dd9f-4bc2-8128-f6bdd2e6979b.json` | 20261105103335 |
+| 06 | C | M16-1457 fullscreen s2 | 50.230 | 59.482 | n/a | 1 | OK | `CUDA-HEADROOM-1\m16-1457-native-fullscreen-s2\bachelor\cc17d25b-babe-4427-8168-3cbbc1e4cda8.json` | 20261105103726 |
+| 07 | C | M16-1457 fullscreen s2 | 50.689 | 59.508 | n/a | 1 | OK | `CUDA-HEADROOM-1\m16-1457-native-fullscreen-s2\bachelor\7d82ae91-d8c7-4650-b940-0434d11bce0a.json` | 20261105104120 |
+| 08 | H | M16-1457 fullscreen s2 | 50.645 | 59.503 | 74 | 1 | OK | `CUDA-HEADROOM-1\m16-1457-native-fullscreen-s2\bachelor\81bdbae1-bf98-438d-9d9f-5583811a6514.json` | 20261105104639 |
+| 09 | H | owner shape M16-1243 fullscreen s4 | 23.912 | 23.992 | 593 | 1 | OK | `PLAYBACK-BACHELOR-PRESENT-JITTER-1\m16-1243-pace-cinematic-fullscreen-s4\bachelor\de625d9b-977f-47e2-b0e0-83fcf70c8ab0.json` | 20261105105148 |
+| 10 | C | owner shape M16-1243 fullscreen s4 | 23.899 | 23.979 | n/a | 1 | OK | `PLAYBACK-BACHELOR-PRESENT-JITTER-1\m16-1243-pace-cinematic-fullscreen-s4\bachelor\38e3f762-f566-4904-8301-0253bb804738.json` | 20261105110132 |
+| 11 | C | owner shape M16-1243 fullscreen s4 | 23.936 | 23.976 | n/a | 1 | OK | `PLAYBACK-BACHELOR-PRESENT-JITTER-1\m16-1243-pace-cinematic-fullscreen-s4\bachelor\ff31d0dd-8175-4604-943a-00c0803d9a8f.json` | 20261105110701 |
+| 12 | H | owner shape M16-1243 fullscreen s4 | 23.901 | 23.981 | 593 | 1 | OK | `PLAYBACK-BACHELOR-PRESENT-JITTER-1\m16-1243-pace-cinematic-fullscreen-s4\bachelor\e2fdc743-b042-4d27-942f-b598573236f4.json` | 20261105111318 |
+
+A strip is `sheets\strip-<leg id>-bachelor-cuda-<first 8 of the arm's commit>-<strip stamp>.png`; `<leg id>` is the folder after the card
+in the receipt path.
+
+Land condition, as the hub set it before the legs ran (medians of two runs per arm):
+
+| Clause | H | C | Result | Verdict |
+|---|---|---|---|---|
+| Windowed s2: H - C >= +4 fps, the arms' runs do not overlap | 59.146 | 45.396 | +13.751 fps; 59.138-59.154 vs 45.164-45.627 | met |
+| Fullscreen s2: H no more than 2 % below C | 50.768 | 50.460 | +0.308 fps, +0.61 % | met |
+| Owner shape: H - C >= -0.3 fps, and no more than 2 % below C | 23.907 | 23.918 | -0.011 fps, -0.05 % | met |
+| Timeline max <= 60.04 | | | 59.691 | met |
+| Fired <= 3x presents | | | largest ratio 0.993 | met |
+| Look Assist on where the spec says on | | | 12 of 12 | met |
+| Every strip opened and clean | | | 12 of 12 | met |
+
+The claim is a windowed improvement, with no measured harm in the fullscreen and owner cells, at n=2 per arm, CUDA, on these three cells.
+
+Not proved: the card's wake bars, which r9 measured as failed on the trace legs (`late_p50` 12.594 / 3.781 / 3.387 / 3.242 ms against
+< 1.0; first advance p50 10.76 / 10.79 / 1.44 / 10.89 ms against <= 7.5) and which stay not met; any fullscreen speedup, moved to
+`HFR-NATIVE-M16-1457-GUI-TEXTURE-PRESENT-OFFLOAD-1`; a same-batch or untraced reading of any other display matrix cell (s1, s4 on
+M16-1457, and every CPU cell rest on r9's trace legs, whose fps is not speed); any venue but Bachelor. Every receipt is `ADVISORY`
+(`VENUE_ANCHOR_ABSENT`).
