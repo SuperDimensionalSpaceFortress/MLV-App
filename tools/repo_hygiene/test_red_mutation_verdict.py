@@ -1453,6 +1453,33 @@ class RunnerMetadataR11(unittest.TestCase):
                     self.assertEqual(rmv.classify(_ut_text("FAILED (failures=1)", frame=frame, eol=eol), "t.py:2").status,
                                      rmv.PASS)
 
+    def test_r11_pass2_a1_frame_line_with_two_readings_is_could_not_check(self) -> None:
+        # adversary r11 pass 2 A1 (75aecf85): a co_name `test_x "/victim.py", line 2, in target` made the frame of real.py:3
+        # read as victim.py:2; the pytest sibling is a directory named `victim.py:2: sub`. Both PASSed at e2d9dc08 too.
+        frame = '  File "real.py", line 3, in test_x "/victim.py", line 2, in target'
+        for want in ("victim.py:2", "real.py:3"):
+            self.assertEqual(self._code(_ut_text("FAILED (failures=1)", frame=frame), want), "cnc-frame")
+        pt = ("=== FAILURES ===\n___ test_x ___\nE assert False\nvictim.py:2: sub/real.py:3: AssertionError\n"
+              "=== short test summary info ===\nFAILED victim.py:2: sub/real.py::test_x - assert False\n"
+              "=== 1 failed in 0.1s ===\n")
+        self.assertEqual(self._code(pt, "victim.py:2"), "cnc-frame")
+        # controls: one frame per line, and a location line with one `<file>.py:N:` (its rest may name a function)
+        self.assertEqual(rmv.classify(_ut_text("FAILED (failures=1)"), "t.py:8").status, rmv.PASS)
+        self.assertEqual(rmv.classify(_PT_SECTION_TEXT.format(loc="t.py:2: in helper"), "t.py:2").status, rmv.PASS)
+
+    def test_r11_pass2_a3_file_line_expectation_with_an_empty_segment_is_refused(self) -> None:
+        # adversary r11 pass 2 A3 (75aecf85): `a//t.py:2` skipped the empty-segment check and _norm_path dropped the gap
+        out = "=== FAILURES ===\n___ test_x ___\nE assert False\na/t.py:2: AssertionError\n=== 1 failed in 0.1s ===\n"
+        for want in ("a//t.py:2", "a\\\\t.py:2", "a/./t.py:2x"):
+            with self.subTest(want=want):
+                self.assertEqual(rmv.classify(out, want).status, rmv.REFUSED)
+        for want in ("a//t.py:2", "a\\\\t.py:2"):
+            self.assertEqual(rmv.classify(out, want).code, "cnc-expectation")
+        self.assertEqual(rmv.classify(out, "a/t.py:2").status, rmv.PASS)  # control
+        ut = _ut_text("FAILED (failures=1)", frame='  File "a/t.py", line 8, in test_a')
+        self.assertEqual(rmv.classify(ut, "a//t.py:8").code, "cnc-expectation")
+        self.assertEqual(rmv.classify(ut, "a/t.py:8").status, rmv.PASS)
+
     def test_pytest_location_line_requires_complete_integer_token(self) -> None:
         # the same rule for the pytest `file.py:N:` location line (a sibling of _FRAME)
         self.assertEqual(rmv.classify(_PT_SECTION_TEXT.format(loc="t.py:2: AssertionError"), "t.py:2").status, rmv.PASS)

@@ -155,7 +155,9 @@ NON-PROMISES:
   ``__module__ = 'builtins'``, and one DEFINED IN ``__main__`` (a test file run as a script, ``python test_x.py``),
   because traceback and pytest print a ``__main__`` class unqualified too (an ``AssertionError`` or a ``TypeError``
   that is an ``ImportError``; r9 and r10 adversary A2). Its line is the builtin's line, character for character, so
-  no reading of the text can refuse it without refusing the builtin. Forgery shapes go to the P3 follow-up card, not to another round. Also not defended: an exception message that itself prints a complete
+  no reading of the text can refuse it without refusing the builtin. Also not defended (OPEN, r11 pass 2 A2, present at
+  e2d9dc08 too): a class whose ``__module__`` spells an assertion head (``__module__ = 'assert '`` prints ``assert
+  .MissingDependency: boom``); a module name can be any text, so its printed line can be made to read as an assertion. Forgery shapes go to the P3 follow-up card, not to another round. Also not defended: an exception message that itself prints a complete
   unittest block header (rule of ``=``, ``FAIL:``/``ERROR:`` line, rule of ``-``); a pytest test whose
   FUNCTION NAME holds `` - `` (set through ``globals()``), which a ``--tb=no`` summary line cannot tell from a
   message; a directory name holding ``[`` (read as the start of a parameter id). An ``ImportError`` named
@@ -574,6 +576,11 @@ def _ut_walk(block: list[str]) -> tuple[list[tuple[str, int]], str]:
         if not ln.strip():
             continue
         if ln[:1].isspace():
+            if ln.count('", line ') > 1:
+                # r11 pass 2 A1: a function's co_name may hold `"/victim.py", line 2, in target`, so the line reads as two
+                # frames and which `", line N` ends the file name cannot be told
+                raise _Unclassifiable("cnc-frame", f"traceback frame {ln.strip()[:60]!r} holds more than one "
+                                      "`\", line N`: which one ends its file name cannot be told")
             m = _FRAME.match(ln)
             if m:
                 frames.append((m["file"], _line_no(m["line"])))
@@ -915,6 +922,11 @@ def _parse_pytest(lines: list[str], stats: dict | None = None) -> list[Failure]:
                 cur["collection"] = True
             continue
         m_loc = _PT_LOC.match(line)
+        if m_loc and len(re.findall(r"\.py:\d+:", line)) > 1:
+            # r11 pass 2 A1 (pytest sibling): `victim.py:2: sub/real.py:3: AssertionError` (a directory named
+            # `victim.py:2: sub`) reads as two locations; which one is the frame cannot be told
+            raise _Unclassifiable("cnc-frame", f"location line {line.strip()[:60]!r} holds more than one `<file>.py:N:`: "
+                                  "which one is the frame cannot be told")
         if m_loc:
             cur["frames"].append((m_loc["file"], _line_no(m_loc["line"])))
         elif _PT_LOC_SHAPE.match(line):
@@ -1118,6 +1130,9 @@ def _precheck(lines: list[str] | None, expected: str) -> str:
     site = _EXPECT_SITE.match(expected)
     if site:
         _line_no(site["line"])
+        if _empty_segment(site["file"]):  # r11 pass 2 A3: `a//t.py:2` lost its empty segment in _norm_path and matched
+            return _Reason("cnc-expectation", "empty segment in the expected file path (`//`, `\\\\`): no such file "
+                           "exists")
     elif _empty_segment(expected):
         return _Reason("cnc-expectation", "empty segment in the expected test identity (`..`, a trailing `.` or `::`): no "
                        "such id exists")
