@@ -1314,6 +1314,57 @@ class GuardFixtureTests(_PwshMixin, unittest.TestCase):
             self.assertIn("wrong-reason", found[0].detail)
             self.assertIn("reason", found[0].detail)
 
+    # ---- r10 R8-T1 (Dot 6706642324): only the PRIMARY refusal satisfies a recorded reason ---------------------------
+    _R8T1_MALFORMED = ("=== short test summary info ===\nFAILED t.py::test_x - assert False\n"
+                       "=== 1 failed, 1 passed in 0.1s ===\n")  # the runner counts a pass this summary never lists
+    _R8T1_VALID = ("=== short test summary info ===\nPASSED t.py::test_ok\nFAILED t.py::test_x - assert False\n"
+                   "=== 1 failed, 1 passed in 0.1s ===\n")  # the same run, with the PASSED line -rA prints
+
+    def _r8t1_corpus(self, case: dict) -> str:
+        others = [{"id": "p", "kind": "verdict", "expect": "PASS", "expected_assertion": "t.py::test_x",
+                   "output": "=== short test summary info ===\nFAILED t.py::test_x - assert False\n=== 1 failed in 0.1s ===\n"},
+                  {"id": "q", "kind": "probe", "expect": "PASS", "bug_value": 0, "fix_value": 1, "window": [1, 1]},
+                  {"id": "r", "kind": "probe", "expect": "REFUSED", "reason": "both sit inside", "bug_value": 1, "fix_value": 1, "window": [1, 1]}]
+        return json.dumps({"cases": others + [case]})
+
+    def test_semantic_reason_in_also_does_not_mask_summary_refusal(self) -> None:
+        guard = GUARDS["DG-RED-MUTATION-VERDICT"]
+        semantic = "the run is red but not at"
+        # (a) MALFORMED: the primary result is the format refusal; the semantic reason is only in the `; also:` text
+        malformed = {"id": "r8t1-malformed-semantic", "kind": "verdict", "expect": "REFUSED", "reason": semantic,
+                     "output": self._R8T1_MALFORMED, "expected_assertion": "other.py::test_x"}
+        # (b) VALID-PASSED semantic twin: well formed, so the semantic refusal IS the primary result
+        valid = {**malformed, "id": "r8t1-valid-passed-semantic", "output": self._R8T1_VALID}
+        # (c) FORMAT-NEGATIVE CONTROL (explicitly labeled): malformed, and its recorded reason IS the format refusal
+        fmt = {**malformed, "id": "r8t1-format-negative-control", "reason": "-rA"}
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            rels = _write_tree(root, {RED_MUTATION_CORPUS: self._r8t1_corpus(malformed)})
+            found = run_guard(guard, root, rels)
+            self.assertEqual(len(found), 1, found)
+            self.assertIn("r8t1-malformed-semantic", found[0].detail)
+            self.assertIn("primary", found[0].detail)
+            self.assertIn("COULD-NOT-CHECK (short-summary line", found[0].detail)  # the primary refusal is named
+            for ok in (valid, fmt):
+                rels = _write_tree(root, {RED_MUTATION_CORPUS: self._r8t1_corpus(ok)})
+                self.assertEqual(run_guard(guard, root, rels), [], ok["id"])
+        # the twin's primary is the semantic refusal itself; the control's primary is the format refusal and nothing else
+        self.assertEqual(red_mutation_verdict.classify(self._R8T1_VALID, "other.py::test_x").also, ())
+        got = red_mutation_verdict.classify(self._R8T1_MALFORMED, "other.py::test_x")
+        self.assertTrue(got.reason.startswith("COULD-NOT-CHECK (short-summary line"), got)
+        self.assertNotIn(semantic, got.reason)
+        self.assertTrue(any(semantic in a for a in got.also), got)
+
+    def test_red_mutation_verdict_live_corpus_reasons_are_primary(self) -> None:
+        # every REFUSED case in the tracked corpus is refused FOR its recorded reason: the reason is in the primary
+        # refusal, never only in an `; also:` diagnostic (r10 R8-T1: case ut-red-names-no-assertion was)
+        cases = json.loads((Path(__file__).resolve().parents[2] / RED_MUTATION_CORPUS).read_text(encoding="utf-8"),
+                           parse_float=str)["cases"]
+        for case in cases:
+            if case["kind"] == "verdict" and case["expect"] == red_mutation_verdict.REFUSED:
+                got = red_mutation_verdict.classify(case["output"], case["expected_assertion"])
+                self.assertIn(case["reason"], got.reason, case["id"])
+
     def test_red_mutation_verdict_refused_case_without_a_reason_is_could_not_check(self) -> None:
         guard = GUARDS["DG-RED-MUTATION-VERDICT"]
         base = {"id": "x", "kind": "verdict", "expect": "REFUSED", "output": "Ran 1 test\n\nOK\n", "expected_assertion": "a.py:1"}

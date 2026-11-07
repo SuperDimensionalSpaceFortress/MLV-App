@@ -1085,6 +1085,48 @@ class VerdictOnText(unittest.TestCase):
                   and toks[i + 2][0] == tokenize.STRING and toks[i + 2][1] in ('"\\n"', "'\\n'")]
         self.assertEqual(len(splits), 1, "only _frame splits the text into lines")
 
+    # ---- r10 R8-T1 (Dot 6706642324): the primary refusal is a field of its own, never a substring of a composite ----
+    def test_r10_primary_reason_is_separate_from_also_diagnostics(self) -> None:
+        malformed = ("=== short test summary info ===\nFAILED t.py::test_x - assert False\n"
+                     "=== 1 failed, 1 passed in 0.1s ===\n")
+        got = rmv.classify(malformed, "other.py::test_x")
+        self.assertIsInstance(got, rmv.Verdict)
+        self.assertEqual(got.status, rmv.REFUSED)
+        self.assertTrue(got.reason.startswith("COULD-NOT-CHECK (short-summary line"), got)
+        self.assertNotIn("also", got.reason)
+        self.assertNotIn("the run is red but not at", got.reason)
+        self.assertEqual(len(got.also), 1, got)
+        self.assertTrue(got.also[0].startswith("the run is red but not at other.py::test_x"), got)
+        # verdict() keeps its (status, text) shape and its exact text: the primary, then each diagnostic after `; also: `
+        self.assertEqual(rmv.verdict(malformed, "other.py::test_x"),
+                         (got.status, got.reason + "".join("; also: " + a for a in got.also)))
+        # a precheck refusal that the classifier ALSO refuses as unclassifiable: the second one is a diagnostic too
+        cut = "Ran 1 test in 0.000s\n\nFAILED (failures=1)\n"
+        got = rmv.classify(cut, "t.py:8")
+        self.assertTrue(got.reason.startswith("COULD-NOT-CHECK (the runner counts 1"), got)
+        self.assertNotIn("names no failing assertion", got.reason)
+        self.assertEqual(rmv.verdict(cut, "t.py:8")[1], got.reason + "".join("; also: " + a for a in got.also))
+        # a refusal with no precheck problem and a PASS carry no diagnostic
+        for text, want in (("Ran 1 test in 0.0s\n\nOK\n", rmv.REFUSED), (self.PT_RED, rmv.PASS)):
+            got = rmv.classify(text, "t.py:2")
+            self.assertEqual((got.status, got.also), (want, ()), got)
+            self.assertEqual(rmv.verdict(text, "t.py:2"), (got.status, got.reason))
+        got = rmv.classify(None, "t.py:2")  # type: ignore[arg-type]
+        self.assertEqual((got.status, got.also), (rmv.REFUSED, ()), got)
+        self.assertIn("internal-error", got.reason)
+
+    def test_r10_cli_still_prints_the_whole_text(self) -> None:
+        malformed = ("=== short test summary info ===\nFAILED t.py::test_x - assert False\n"
+                     "=== 1 failed, 1 passed in 0.1s ===\n")
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp, "red.txt")
+            out.write_text(malformed, encoding="utf-8", newline="")
+            proc = subprocess.run([sys.executable, str(Path(rmv.__file__)), "verdict", "--output", str(out),
+                                   "--expect", "other.py::test_x"], text=True, capture_output=True, timeout=60)
+        self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+        self.assertEqual(proc.stdout.strip(), "REFUSED " + rmv.verdict(malformed, "other.py::test_x")[1])
+        self.assertIn("; also: the run is red but not at", proc.stdout)
+
     def test_r9_the_cli_refuses_a_saved_file_with_a_vertical_tab(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             out = Path(tmp, "red.txt")
