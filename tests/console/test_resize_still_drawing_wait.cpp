@@ -895,7 +895,9 @@ TEST(ResizeStillDrawingWaitWiring, TheSiteWaitUsesTheBoundedHelperAndLogsAlwaysO
     // inside the bounded wait; the input is delivered by the next unfiltered event loop pass, not dropped
     ASSERT_TRUE(body.contains(QStringLiteral("qApp->processEvents( QEventLoop::ExcludeUserInputEvents );")));
     ASSERT_FALSE(body.contains(QStringLiteral("qApp->processEvents();")));
-    ASSERT_TRUE(body.contains(QStringLiteral("m_frameStillDrawing = false;")));
+    // r4 A1: the stale clear is the renderer-confirmed clearStaleStillDrawingIfIdle (its body is pinned in
+    // EveryStartOfRendererWorkBumpsTheBusyEpochAndTheClearIsConfirmed)
+    ASSERT_TRUE(body.contains(QStringLiteral("clearStaleStillDrawingIfIdle( currentPlaybackAdvanceTarget(), epoch )")));
     ASSERT_TRUE(body.contains(QStringLiteral("QStringLiteral(\"resize.still_drawing_wait\")")));
     ASSERT_TRUE(body.contains(QStringLiteral(
         "\"outcome=%1 waited_ms=%2 site=%3 render_idle=%4\"")));
