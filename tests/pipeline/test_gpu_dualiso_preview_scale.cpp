@@ -1918,7 +1918,8 @@ static std::vector<uint16_t> r11HacdMosaic(int w, int h, const std::vector<doubl
 // must not exceed the bilinear R/B (r8's x4 chroma, the control) it replaces: on the flat-G disc within 1 DN
 // (the clamped HA G equals the bilinear G there, so only rounding differs), on the stepping-G disc at or below
 // it; and away from the edge (5 x 5 all one colour) every R and B is exact within 1. 68c038b2 (no clamp):
-// 1.143x and 1.024x in the run dir's replica (sim_r11b.py), RED; the clamp: 1.000x and 0.836x. Printed, not
+// 1.143x and 1.024x in the run dir's replica (sim_r11b.py), RED; the clamp: 1.000x and 0.836x; the clamp plus the
+// bilinear keep on a degenerate fit (A1, sim_r11d.py): 1.000x (both fits degenerate) and 0.795x. Printed, not
 // asserted (OPEN, design limit): colours whose difference to G flips sign across the edge (4-colour bands,
 // magenta / green diagonal) stay above the bilinear (replica 1.33x, 1.55x).
 TEST(GpuDualIsoPreviewScale, HacdChromaArbitraryColourEdgeNoWorseThanBilinear)
@@ -1985,25 +1986,33 @@ TEST(GpuDualIsoPreviewScale, HacdChromaArbitraryColourEdgeNoWorseThanBilinear)
 // black taken out, must stay at or below the bilinear's in BOTH frames, so a frame that falls back never shows
 // more fringe than base. 68c038b2 (no clamp), replica sim_r11c.py: valid 0.841x, fallback 1.125x (RED); the
 // clamp: 0.500x and 0.822x.
+// Third frame (adversary A1 on 685b40e3, adversary-685b40e3.json): the same anti-correlated left part, the right
+// part a gained neutral VERTICAL step (kR 0.25, kB 0.5, S 12000 -> 24000 at x = 48), read on x 36..60, y 3..44.
+// With the clamp alone the a = 1, c = 0 fallback doubles it (960 vs 480; pixel (47, 20) R 548 vs 6548), RED on
+// 685b40e3; a degenerate channel now keeps the bilinear R or B (replica sim_r11d.py: 480).
 TEST(GpuDualIsoPreviewScale, HacdChromaDegenerateFitStaysAtOrBelowBilinear)
 {
     const int w = 64, h = 48;
     const size_t n = static_cast<size_t>(w) * h;
-    const double kr = 0.40, kb = 0.65, blk = 2048.0;
+    const double blk = 2048.0;
+    const char * names[] = { "valid", "fallback", "A1" };
     bool allOk = true;
-    for (int fallback = 0; fallback < 2; ++fallback)
+    for (int variant = 0; variant < 3; ++variant)
     {
+        const bool a1 = variant == 2;
+        const double kr = a1 ? 0.25 : 0.40, kb = a1 ? 0.5 : 0.65;
+        const int x0 = 36, x1 = a1 ? 61 : w - 3, y0 = 3, y1 = a1 ? 45 : h - 3;
         std::vector<double> r(n), g(n), b(n);
         for (int y = 0; y < h; ++y)
             for (int x = 0; x < w; ++x)
             {
                 const size_t i = static_cast<size_t>(y) * w + x;
-                const double s = ((x - 32) + y < 40) ? 4000.0 : 40000.0;
+                const double s = a1 ? (x < 48 ? 12000.0 : 24000.0) : (((x - 32) + y < 40) ? 4000.0 : 40000.0);
                 if (x >= 32)
                 {
                     r[i] = blk + kr * s; g[i] = blk + s; b[i] = blk + kb * s;
                 }
-                else if (fallback)
+                else if (variant > 0)
                 {
                     r[i] = 60000.0 - 1800.0 * x; g[i] = 3000.0 + 1800.0 * x; b[i] = r[i];
                 }
@@ -2020,8 +2029,8 @@ TEST(GpuDualIsoPreviewScale, HacdChromaDegenerateFitStaysAtOrBelowBilinear)
         ASSERT_EQ(1, debayer_reduced_hacd_chroma_rgb16(rgb.data(), work.data(), w, h, 1, scratch.data()));
         double fh = 0.0, fb = 0.0;
         int count = 0;
-        for (int y = 3; y < h - 3; ++y)
-            for (int x = 36; x < w - 3; ++x)
+        for (int y = y0; y < y1; ++y)
+            for (int x = x0; x < x1; ++x)
             {
                 const size_t i = (static_cast<size_t>(y) * w + x) * 3u;
                 const double gg = rgb[i + 1] - blk;
@@ -2032,44 +2041,79 @@ TEST(GpuDualIsoPreviewScale, HacdChromaDegenerateFitStaysAtOrBelowBilinear)
         fh /= count;
         fb /= count;
         std::printf("[hacd-fit] %-8s step false colour HA-CD %.2f | bilinear %.2f (ratio %.3f, <= 1.000) %s\n",
-                    fallback ? "fallback" : "valid", fh, fb, fh / fb, fh <= fb ? "ok" : "FAIL");
+                    names[variant], fh, fb, fh / fb, fh <= fb ? "ok" : "FAIL");
         allOk = allOk && fh <= fb;
     }
     ASSERT_TRUE(allOk);
 }
 
-// H2C-PORT-1 r11: minimum valid and odd dimensions. 4x4, 5x5, 5x4, 4x5, 7x9, 9x7 and 32x6 (15 fit samples: the
-// n < 16 fallback) on a flat saturated colour. G is set to the true G, R and B to a 0xBEEF sentinel, and the
-// scratch to NaN, so a consumer that read a site no producer wrote (a reflection that breaks the CFA parity at an
-// odd edge) prints 0 or keeps the sentinel. Every pixel, borders included, must come back exactly (R 30000, G
-// 6000, B 3000), with the same bytes for 1 and 4 threads. No defect was found at these sizes on 68c038b2: this
-// is GREEN on arrival, a pin, not a RED. Its discrimination is the replica's mutation (sim_r11c.py: a
-// clamp-to-edge reflection misses by 19875 DN).
+// H2C-PORT-1 r11: minimum valid and odd dimensions, with G set to the true G, R and B to a 0xBEEF sentinel and the
+// scratch to NaN, at 1 and 4 threads (same bytes required).
+// (a) 4x4, 5x5, 5x4, 4x5, 7x9, 9x7 and 32x6 on a flat colour: every per-frame fit there is degenerate (fewer than 16
+//     samples, or no G variance), so R and B must be left exactly as the bilinear wrote them (here the sentinel) and
+//     G untouched. On 685b40e3 the identity fallback rewrote them (A1's class), RED.
+// (b) 34x7, 35x9, 37x11 and 36x10 on a gained neutral ramp (kR 0.40, kB 0.65, black 2048; the fit is valid): every R
+//     and B, borders included, is rewritten (no sentinel, no 0: a consumer reading a site no producer wrote, as a
+//     reflection that broke the CFA parity at an odd edge would, reads NaN and prints 0), and 3 px in R and B sit on G
+//     within 3 after the gain and black are taken out (replica sim_r11d.py: 0.00). Part (b) found no defect at
+//     68c038b2 or 685b40e3: it is a pin, GREEN on arrival.
 TEST(GpuDualIsoPreviewScale, HacdChromaMinimumAndOddSizesAreExact)
 {
-    const int sizes[][2] = { { 4, 4 }, { 5, 5 }, { 5, 4 }, { 4, 5 }, { 7, 9 }, { 9, 7 }, { 32, 6 } };
     bool allOk = true;
-    for (const auto & sz : sizes)
+    const int degenerate[][2] = { { 4, 4 }, { 5, 5 }, { 5, 4 }, { 4, 5 }, { 7, 9 }, { 9, 7 }, { 32, 6 } };
+    const int valid[][2] = { { 34, 7 }, { 35, 9 }, { 37, 11 }, { 36, 10 } };
+    const double kr = 0.40, kb = 0.65, blk = 2048.0;
+    for (int part = 0; part < 2; ++part)
     {
-        const int w = sz[0], h = sz[1];
-        const size_t n = static_cast<size_t>(w) * h;
-        const std::vector<double> r(n, 30000.0), g(n, 6000.0), b(n, 3000.0);
-        const std::vector<uint16_t> work = r11HacdMosaic(w, h, r, g, b);
-        std::vector<uint16_t> rgb1;
-        for (int threads : { 1, 4 })
+        const int count = part == 0 ? 7 : 4;
+        for (int k = 0; k < count; ++k)
         {
-            std::vector<uint16_t> rgb(n * 3u, 0xBEEFu);
-            for (size_t i = 0; i < n; ++i) rgb[i * 3u + 1u] = 6000u;
-            std::vector<float> scratch(n, std::numeric_limits<float>::quiet_NaN());
-            ASSERT_EQ(1, debayer_reduced_hacd_chroma_rgb16(rgb.data(), work.data(), w, h, threads, scratch.data()));
-            int bad = 0;
-            for (size_t i = 0; i < n; ++i)
-                bad += (rgb[i * 3u] != 30000u) + (rgb[i * 3u + 1u] != 6000u) + (rgb[i * 3u + 2u] != 3000u);
-            const bool same = threads == 1 || rgb == rgb1;
-            std::printf("[hacd-size] %dx%d threads %d: %d of %zu words not exact%s\n", w, h, threads, bad, n * 3u,
-                        same ? "" : "; differs from 1 thread");
-            allOk = allOk && bad == 0 && same;
-            if (threads == 1) rgb1 = rgb;
+            const int w = part == 0 ? degenerate[k][0] : valid[k][0];
+            const int h = part == 0 ? degenerate[k][1] : valid[k][1];
+            const size_t n = static_cast<size_t>(w) * h;
+            std::vector<double> r(n), g(n), b(n);
+            for (int y = 0; y < h; ++y)
+                for (int x = 0; x < w; ++x)
+                {
+                    const size_t i = static_cast<size_t>(y) * w + x;
+                    const double s = 3000.0 + 900.0 * x + 700.0 * y;
+                    r[i] = part == 0 ? 30000.0 : blk + kr * s;
+                    g[i] = part == 0 ? 6000.0 : blk + s;
+                    b[i] = part == 0 ? 3000.0 : blk + kb * s;
+                }
+            const std::vector<uint16_t> work = r11HacdMosaic(w, h, r, g, b);
+            std::vector<uint16_t> rgb1;
+            for (int threads : { 1, 4 })
+            {
+                std::vector<uint16_t> rgb(n * 3u, 0xBEEFu);
+                for (size_t i = 0; i < n; ++i) rgb[i * 3u + 1u] = static_cast<uint16_t>(std::lround(g[i]));
+                std::vector<float> scratch(n, std::numeric_limits<float>::quiet_NaN());
+                ASSERT_EQ(1, debayer_reduced_hacd_chroma_rgb16(rgb.data(), work.data(), w, h, threads, scratch.data()));
+                int bad = 0;
+                double worst = 0.0;
+                for (int y = 0; y < h; ++y)
+                    for (int x = 0; x < w; ++x)
+                    {
+                        const size_t i = static_cast<size_t>(y) * w + x;
+                        const uint16_t R = rgb[i * 3u], G = rgb[i * 3u + 1u], B = rgb[i * 3u + 2u];
+                        bad += G != static_cast<uint16_t>(std::lround(g[i]));
+                        if (part == 0)
+                        {
+                            bad += (R != 0xBEEFu) + (B != 0xBEEFu);
+                            continue;
+                        }
+                        bad += (R == 0xBEEFu || R == 0u) + (B == 0xBEEFu || B == 0u);
+                        if (x < 3 || y < 3 || x >= w - 3 || y >= h - 3) continue;
+                        worst = std::max(worst, std::fabs((R - blk) / kr - (G - blk)));
+                        worst = std::max(worst, std::fabs((B - blk) / kb - (G - blk)));
+                    }
+                const bool same = threads == 1 || rgb == rgb1;
+                std::printf("[hacd-size] %s %dx%d threads %d: %d bad words, interior worst %.2f (<= 3)%s\n",
+                            part == 0 ? "degenerate (R/B kept)" : "valid (R/B rebuilt)", w, h, threads, bad, worst,
+                            same ? "" : "; differs from 1 thread");
+                allOk = allOk && bad == 0 && worst <= 3.0 && same;
+                if (threads == 1) rgb1 = rgb;
+            }
         }
     }
     ASSERT_TRUE(allOk);
