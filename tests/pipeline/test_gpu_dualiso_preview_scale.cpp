@@ -2256,20 +2256,25 @@ TEST(GpuDualIsoPreviewScale, CpuReducedX4ConstantChannelSurvivesTheComposition)
 // 6575 at output (23, 10) for 6650 and 6925 / 6931 at (24, 10) for 6850: HA-CD and the [1 2 1] laid the G step on
 // them. Required, through the real entry at 1 and 4 cores: every R and B at output x in [2, 30) is the box of the
 // affine truth, 2050 + 200 x. Mutations: the own-channel choice dropped in either step.
+// r12 pass 3 A1 (adversary-82f68f5a.json, debayer.c:567): the same with R / B = 10000 - 100 x. The fit's slope is
+// negative, so both channels are kept (r11), and the kept channels took the colour-difference [1 2 1]: 5275 at (23, 10)
+// for 5350, 5225 at (24, 10) for 5150. Required: the box of the truth, 9950 - 200 x, on the same columns.
 TEST(GpuDualIsoPreviewScale, CpuReducedX4AffineChannelUnderAGStepStaysExact)
 {
     const int bw = 64, bh = 48, outW = 32, outH = 24;
-    std::vector<uint16_t> bayer(static_cast<size_t>(bw) * bh);
-    for (int y = 0; y < bh; ++y)
-        for (int x = 0; x < bw; ++x)
-        {
-            const bool isG = (y & 1) != (x & 1);
-            bayer[static_cast<size_t>(y) * bw + x] =
-                static_cast<uint16_t>(isG ? (x < 48 ? 10000 : 20000) : 2000 + 100 * x);
-        }
     bool allOk = true;
+    for (const int slope : { 100, -100 })
     for (const int cores : { 1, 4 })
     {
+        const int base = slope > 0 ? 2000 : 10000;
+        std::vector<uint16_t> bayer(static_cast<size_t>(bw) * bh);
+        for (int y = 0; y < bh; ++y)
+            for (int x = 0; x < bw; ++x)
+            {
+                const bool isG = (y & 1) != (x & 1);
+                bayer[static_cast<size_t>(y) * bw + x] =
+                    static_cast<uint16_t>(isG ? (x < 48 ? 10000 : 20000) : base + slope * x);
+            }
         R12BareVideo bare(128, 96, cores);
         ASSERT_TRUE(bare.video != nullptr);
         std::vector<uint16_t> work(bayer);
@@ -2282,16 +2287,17 @@ TEST(GpuDualIsoPreviewScale, CpuReducedX4AffineChannelUnderAGStepStaysExact)
             for (int x = 2; x < 30; ++x)
                 for (int c = 0; c < 3; c += 2)
                 {
-                    const int want = 2050 + 200 * x;
+                    const int want = base + slope / 2 + 2 * slope * x; // the box of base + slope * (2 x .. 2 x + 1)
                     const int d = std::abs(static_cast<int>(out[(static_cast<size_t>(y) * outW + x) * 3u + c]) - want);
                     bad += d != 0;
                     worst = std::max(worst, d);
                 }
         const size_t p23 = (static_cast<size_t>(10) * outW + 23) * 3u, p24 = (static_cast<size_t>(10) * outW + 24) * 3u;
-        std::printf("[h2c-x4-affine] cores %d: R/B at output x in [2, 30) off 2050 + 200 x: %d words (worst %d, want 0); "
-                    "(23,10) R %u B %u (6650), (24,10) R %u B %u (6850)\n",
-                    cores, bad, worst, static_cast<unsigned>(out[p23]), static_cast<unsigned>(out[p23 + 2u]),
-                    static_cast<unsigned>(out[p24]), static_cast<unsigned>(out[p24 + 2u]));
+        std::printf("[h2c-x4-affine] R/B %d %+d x, cores %d: R/B at output x in [2, 30) off the box of the truth: %d words "
+                    "(worst %d, want 0); (23,10) R %u B %u (%d), (24,10) R %u B %u (%d)\n",
+                    base, slope, cores, bad, worst, static_cast<unsigned>(out[p23]), static_cast<unsigned>(out[p23 + 2u]),
+                    base + slope / 2 + 46 * slope, static_cast<unsigned>(out[p24]), static_cast<unsigned>(out[p24 + 2u]),
+                    base + slope / 2 + 48 * slope);
         allOk = allOk && bad == 0;
     }
     ASSERT_TRUE(allOk);
