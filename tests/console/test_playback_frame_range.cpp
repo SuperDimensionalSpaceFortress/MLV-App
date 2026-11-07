@@ -3371,6 +3371,129 @@ TEST( PlaybackConformDropFrame, R26ALoneGuiLateTickOnAQuietHostPresentsTheNextFr
     ASSERT_EQ( 1, conformDropTickTransition( 672.8, 3.0216, true ) );
 }
 
+namespace
+{
+// r27 (adversary A1 on be20bc59): the same engine with a RENDERER. playConformedTicks presents every new target on the tick
+// that set it; here a target is presented only \a presentLatencyMs after it became the engine's target (floor of the
+// position), checked before each tick (sol's interleaving: a present due after the next timer tick lands after it). A
+// target the engine moves past before then is pruned and never presented (prunePlaybackLookaheadOutsideForwardWindow,
+// drawFrameReady's drop_lookahead). The conformed tick is told whether its current target has been presented
+// (MainWindow: m_lastPresentedPlaybackFrame, set when drawFrameReady accepts a frame). Frame 0 is presented at Play.
+ConformPlayResult playConformedTicksWithRenderer( const std::function<double( int )> & tickAt, double presentLatencyMs,
+                                                  int cutOut, double * maxDebt = nullptr )
+{
+    playback_native_pace::NativePaceGuard guard;
+    guard.reset();
+    PlaybackSourceAdvanceTracker tracker;
+    playback_frame_range::SourceFrameAdvanceCounter counter;
+    counter.begin( 0 );
+    tracker.notePresented( 0.0, 0, 0, 0, 2859 );
+    double position = 0.0, nowMs = 0.0, debt = 0.0, targetSinceMs = 0.0;
+    int target = 0, lastPresented = 0;
+    if( maxDebt ) *maxDebt = 0.0;
+    ConformPlayResult r;
+    for( int t = 1; t < 100000 && r.reachedMs < 0.0; ++t )
+    {
+        const double tickMs = tickAt( t );
+        nowMs += tickMs;
+        if( target != lastPresented && nowMs - targetSinceMs >= presentLatencyMs )
+        {
+            tracker.notePresented( nowMs / 1000.0, target, 0, 0, 2859 );
+            lastPresented = target;
+        }
+        const double granted = guard.grant( 24.0 * tickMs / 1000.0, nowMs, 24.0 );
+        if( t == 1 ) guard.notePresent( nowMs, 24.0 );
+        const double before = position;
+        const playback_frame_range::DropFrameTickResult tick = playback_frame_range::advanceDropFrameTick(
+            position,
+            playback_frame_range::conformDropFrameDelta( position, granted, true, debt,
+                                                         lastPresented == static_cast<int>( position ) ),
+            1, cutOut, false );
+        position = tick.position;
+        if( maxDebt && debt > *maxDebt ) *maxDebt = debt;
+        counter.noteEngineTick( before, position, tick.wrapped );
+        if( nowMs <= 64998.0 ) r.consumedAt64998 = counter.consumed();
+        if( static_cast<int>( position ) != target )
+        {
+            target = static_cast<int>( position );
+            targetSinceMs = nowMs;
+            if( presentLatencyMs <= 0.0 )
+            {
+                tracker.notePresented( nowMs / 1000.0, target, 0, 0, 2859 );
+                lastPresented = target;
+            }
+        }
+        if( position >= 1498.0 ) r.reachedMs = nowMs;
+    }
+    r.maxJump = tracker.maxJump();
+    r.sourceFps = tracker.sourceFps();
+    return r;
+}
+} // namespace
+
+TEST( PlaybackConformDropFrame, R27A1ACarriedDebtIsRepaidOnlyAsTheRendererPresents )
+{
+    // adversary A1 on be20bc59, its literal input: a 59.94 clip conformed to 24, Drop Frame, Loop off, cut 1..1667. One
+    // 125 ms tick from about 99.8 grants 3: 100 is the target with a debt of 2. Each later 8 ms tick asked for its grant plus
+    // the debt, so the engine advanced one integer per tick while the renderer was still presenting: 101.992 (debt 1), then
+    // 102.184 before 101's queued present landed. 101 was pruned and the presented frames went 100 -> 102. A conformed tick now
+    // never moves past a target the renderer has not presented; the share that would cross is carried as debt.
+    double debt = 1.0;
+    // sol's second tick: 101 is the target and not yet presented -- the engine holds it and carries the whole grant
+    const double held = playback_frame_range::conformDropFrameDelta( 101.992, 0.192, true, debt, false );
+    ASSERT_EQ( 101, static_cast<int>( 101.992 + held ) );
+    ASSERT_NEAR( 101.992 + 0.192 + 1.0, 101.992 + held + debt, 1e-9 );
+    // once 101 is presented the debt is repaid one frame at a time: 102, with the landing's phase
+    const double repaid = playback_frame_range::conformDropFrameDelta( 101.992 + held, 0.192, true, debt, true );
+    ASSERT_EQ( 102, static_cast<int>( 101.992 + held + repaid ) );
+    ASSERT_NEAR( 101.992 + 0.384 + 1.0, 101.992 + held + repaid + debt, 1e-9 );
+    // a tick that crosses no integer is the grant bit for bit, presented or not, and keeps the debt
+    debt = 2.0;
+    ASSERT_TRUE( sameBits( 0.192, playback_frame_range::conformDropFrameDelta( 100.8, 0.192, true, debt, false ) ) );
+    ASSERT_NEAR( 2.0, debt, 1e-12 );
+    // without conform the presented state changes nothing
+    for( const bool presented : { false, true } )
+    {
+        double none = 0.0;
+        ASSERT_TRUE( sameBits( 1.584, playback_frame_range::conformDropFrameDelta( 1152.8, 1.584, false, none, presented ) ) );
+    }
+
+    // the whole play: the lone late tick comes near 99.8, at tick 521 (0.192 a tick), and the renderer presents 10 ms after
+    // its target -- after the next 8 ms timer tick, as in sol's interleaving
+    const ConformPlayResult sol = playConformedTicksWithRenderer( []( int t ) { return t == 521 ? 125.0 : 8.0; }, 10.0, 1667 );
+    ASSERT_EQ( 1, sol.maxJump );
+    ASSERT_TRUE( sol.consumedAt64998 >= int64_t( 1499 ) );
+    ASSERT_TRUE( sol.sourceFps >= 23.28 && sol.sourceFps <= 24.72 );
+    // the class: a renderer that keeps up (present latency + one tick under the 41.7 ms period) shows every frame after any
+    // lone late tick whose backlog fits kConformMaxDebtFrames, and after a burst of late ticks, at the guard's pace
+    for( const double latency : { 0.0, 9.0, 10.0, 16.0, 20.0, 25.0 } )
+    {
+        for( const int at : { 2, 521, 700, 3505 } )
+            for( const double lateMs : { 84.0, 125.899, 200.0, 333.0 } )
+            {
+                double maxDebt = 0.0;
+                const ConformPlayResult one = playConformedTicksWithRenderer(
+                    [=]( int t ) { return t == at ? lateMs : 8.0; }, latency, 1667, &maxDebt );
+                ASSERT_EQ( 1, one.maxJump );
+                ASSERT_TRUE( one.consumedAt64998 >= int64_t( 1499 ) );
+                ASSERT_TRUE( one.sourceFps >= 23.28 && one.sourceFps <= 24.72 );
+                ASSERT_TRUE( maxDebt <= playback_frame_range::kConformMaxDebtFrames + 1e-9 );
+            }
+        const ConformPlayResult burst = playConformedTicksWithRenderer(
+            []( int t ) { return ( t % 48 >= 42 ) ? 66.0 : 8.0; }, latency, 1667 );
+        ASSERT_EQ( 1, burst.maxJump );
+        ASSERT_TRUE( burst.consumedAt64998 >= int64_t( 1499 ) );
+        ASSERT_TRUE( burst.sourceFps >= 23.28 && burst.sourceFps <= 24.72 );
+    }
+    // a renderer SLOWER than the period cannot show every frame: the backlog reaches the cap and the frames beyond it are
+    // skipped (stall evidence, never a conform PASS), but the timeline keeps the guard's pace and the debt stays bounded
+    double slowDebt = 0.0;
+    const ConformPlayResult slow = playConformedTicksWithRenderer( []( int ) { return 8.0; }, 60.0, 1667, &slowDebt );
+    ASSERT_TRUE( slow.maxJump > 1 );
+    ASSERT_TRUE( slow.consumedAt64998 >= int64_t( 1499 ) );
+    ASSERT_TRUE( slowDebt <= playback_frame_range::kConformMaxDebtFrames + 1e-9 );
+}
+
 TEST( PlaybackConformDropFrame, R24A1TheCarriedDebtIsBoundedAndClearedWithoutConform )
 {
     // a held tick carries the whole frame it did not present; the next ordinary tick repays it as a one-frame step

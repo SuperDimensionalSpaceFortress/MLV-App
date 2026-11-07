@@ -348,8 +348,10 @@ inline double conformWholeFrameDelta( double currentPosition, double wantedFrame
 // position plus the carried debt always equals the position plus everything granted. r26: a single long tick (a grant of
 // 2 or more on its own) is no longer skipped by itself; it is carried like any other backlog, so a lone
 // GUI-late tick on a quiet host presents the next frame, and only the part of a backlog above the cap is skipped.
-inline double conformDropFrameDelta( double currentPosition, double grantedFrames, bool conformActive, double & debtFrames )
+inline double conformDropFrameDelta( double currentPosition, double grantedFrames, bool conformActive, double & debtFrames,
+                                     bool targetPresented = true )
 {
+    (void)targetPresented;
     if( !conformActive ) { debtFrames = 0.0; return grantedFrames; }
     if( !( grantedFrames > 0.0 ) || !( currentPosition >= 0.0 ) ) return grantedFrames;
     const double wanted = debtFrames > 0.0 ? grantedFrames + debtFrames : grantedFrames;
