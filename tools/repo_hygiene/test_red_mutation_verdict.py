@@ -1495,16 +1495,64 @@ class SummarySplitR11(unittest.TestCase):
         ut = _ut_text("FAILED (failures=1)").replace("AssertionError: 3 != 4", "AssertionError:: 3 != 4")
         self.assertEqual(rmv.classify(ut, "t.py:8").status, rmv.REFUSED)
 
+    @staticmethod
+    def _with_section(name: str, line: str, e_line: str = "assert False") -> str:
+        """The default-traceback run of `line`: pytest prints the failure's own section (its header names the test)."""
+        return ("=================================== FAILURES ===================================\n"
+                f"_____ {name} _____\n\n    def test():\n>       assert False\nE       {e_line}\n\nt.py:2: AssertionError\n"
+                "=========================== short test summary info ============================\n"
+                + line + "\n=========================== 1 failed in 0.12s ===========================\n")
+
     def test_ordinary_assertion_lines_stay_accepted(self) -> None:
+        # one ' - ' (the boundary itself): readable from the summary line alone
         for line, want in (("FAILED t.py::test_x - AssertionError: boom", "t.py::test_x"),
                            ("FAILED t.py::test_x - AssertionError", "t.py::test_x"),
-                           ("FAILED t.py::test_x - assert (1 - 2) == 0", "t.py::test_x"),
-                           ("FAILED t.py::test_x - assert x - 1 == y", "t.py::test_x"),
-                           ("FAILED t.py::test_x - assert x[0] - 1 == 2", "t.py::test_x"),
-                           ("FAILED t.py::test_x[a - b] - assert 1 == 2", "t.py::test_x[a - b]"),
-                           ("FAILED t.py::test_x - AssertionError: 3 - 4 != 0", "t.py::test_x")):
+                           ("FAILED t.py::test_x[a - b] - assert 1 == 2", "t.py::test_x[a - b]")):
             with self.subTest(line=line):
                 self.assertEqual(rmv.classify(self._run(line), want).status, rmv.PASS)
+        # a ' - ' inside the message: readable when the failure's own section names exactly one of the readings
+        for line in ("FAILED t.py::test_x - assert (1 - 2) == 0", "FAILED t.py::test_x - assert x - 1 == y",
+                     "FAILED t.py::test_x - assert x[0] - 1 == 2", "FAILED t.py::test_x - AssertionError: 3 - 4 != 0",
+                     "FAILED t.py::test_x - AssertionError: a - b"):
+            with self.subTest(line=line):
+                self.assertEqual(rmv.classify(self._with_section("test_x", line), "t.py::test_x").status, rmv.PASS)
+                self.assertEqual(rmv.classify(self._with_section("test_x", line), "t.py:2").status, rmv.PASS)
+                # with --tb=no nothing names the node: two readings, COULD-NOT-CHECK (fail closed)
+                self.assertEqual(rmv.classify(self._run(line), "t.py::test_x").code, "cnc-summary-split")
+
+    def test_r11_pass1_a1_any_class_name_is_a_reading(self) -> None:
+        # adversary r11 pass 1 A1 (ab16d960): type('Bad-Name', (ImportError,), {'__module__': 't'}) prints `t.Bad-Name`,
+        # which no identifier grammar accepts, so the later split was missed and the invented node t.py::TestA passed.
+        line = "FAILED t.py::TestA - AssertionError: x::test_x - t.Bad-Name: boom"
+        v = rmv.classify(self._run(line), "t.py::TestA")
+        self.assertEqual((v.status, v.code), (rmv.REFUSED, "cnc-summary-split"), v)
+        for odd in ("t.a b: boom", "1x: boom", "t.<lambda>: boom", "t.Bad-Name"):
+            with self.subTest(odd=odd):
+                v = rmv.classify(self._run(f"FAILED t.py::test_a - AssertionError: x - {odd}"), "t.py::test_a")
+                self.assertEqual((v.status, v.code), (rmv.REFUSED, "cnc-summary-split"), v)
+        # the failure section names the REAL node, so the split is told and the real exception is judged
+        sec = self._with_section("TestA - AssertionError: x.test_x", line, e_line="t.Bad-Name: boom")
+        v = rmv.classify(sec, "t.py::TestA")
+        self.assertEqual(v.status, rmv.REFUSED, v)
+        self.assertEqual(rmv.classify(sec, "t.py:2").code, "cnc-exception-type")
+
+    def test_r11_pass1_a2_assert_head_needs_its_delimiter(self) -> None:
+        # adversary r11 pass 1 A2 (ab16d960): `assert\\b` matched `assert.MissingDependency` (a class in a module named
+        # assert, subclassing ImportError). Summary-only, full-section and -rN paths all returned PASS.
+        summary = self._run("FAILED t.py::test_x - assert.MissingDependency: boom")
+        self.assertEqual(rmv.classify(summary, "t.py::test_x").status, rmv.REFUSED)
+        section = ("=== FAILURES ===\n___ test_x ___\nE assert.MissingDependency: boom\nt.py:2: MissingDependency\n")
+        for tail in ("=== short test summary info ===\nFAILED t.py::test_x - assert.MissingDependency: boom\n"
+                     "=== 1 failed in 0.1s ===\n", "=== 1 failed in 0.1s ===\n"):
+            with self.subTest(tail=tail):
+                self.assertEqual(rmv.classify(section + tail, "t.py:2").status, rmv.REFUSED)
+        for head in ("AssertionError:x: boom", "Failed::x", "TypeError:x: boom"):  # the same delimiter, siblings
+            with self.subTest(head=head):
+                self.assertEqual(rmv.classify(self._run(f"FAILED t.py::test_x - {head}"), "t.py::test_x").status,
+                                 rmv.REFUSED)
+        for ok in ("assert False", "assert 1 == 2", "AssertionError: boom", "AssertionError", "Failed: no"):  # controls
+            with self.subTest(ok=ok):
+                self.assertEqual(rmv.classify(self._run(f"FAILED t.py::test_x - {ok}"), "t.py::test_x").status, rmv.PASS)
 
 
 class ReasonCodeR11(unittest.TestCase):

@@ -88,12 +88,15 @@ REFUSED with a reason that starts ``COULD-NOT-CHECK (<typed reason>)``. That is 
   end of the line, and a pytest ``file.py:N:`` location line with its ``:``. A line of either shape that does not parse
   whole (``line 2.5,``, ``line 2x``, ``t.py:2.5:``) is COULD-NOT-CHECK, never a frame at its digit prefix.
 * ``summary split`` (r11, r10 adversary A1): a class or function name set through ``globals()`` may hold `` - ``, so the
-  first `` - `` of a ``FAILED``/``ERROR`` line is only one candidate end of its node id. When a later `` - `` also has a
-  node id on its left and the start of an exception account on its right (``assert``, or a class name then ``: `` or
-  the end), the line has two readings and is COULD-NOT-CHECK (``FAILED t.py::TestA - AssertionError::test_x -
-  TypeError: boom``); so is a parameter id holding ``] - ``. A line naming an import error blocks like one under every
-  reading. ``AssertionError::`` (a ``:`` that starts ``::``) is never an assertion head. The cost, accepted: an assertion
-  message ending in `` - <word>`` or holding `` - <Name>: `` is refused too.
+  first `` - `` of a ``FAILED``/``ERROR`` line is only one candidate end of its node id, and an exception class of ANY
+  name may follow it (``type('Bad-Name', ...)`` prints ``t.Bad-Name``; r11 pass 1 A1), so every later `` - `` with a node
+  id on its left is another reading. A line with more than one reading is read only when EXACTLY ONE of them names the
+  test of one of the run's own failure sections (default tracebacks print one per failure); otherwise it is
+  COULD-NOT-CHECK (``FAILED t.py::TestA - AssertionError::test_x - TypeError: boom``), and so is a parameter id holding
+  ``] - ``. A line naming an import error blocks like one under every reading. The cost, accepted: under ``--tb=no`` an
+  assertion message holding `` - `` (``assert x - 1 == y``) is refused. An assertion head needs its own delimiter:
+  ``assert`` then whitespace or the end, ``AssertionError``/``Failed`` then ``: `` or the end (``assert.Name``,
+  ``AssertionError::x`` and ``AssertionError:x`` are class names, not assertions; r11 pass 1 A2).
 * ``runner``: one run has one runner. A unittest ``FAILED (...)`` trailer over pytest sections or summary lines, or a
   pytest bar over unittest blocks, is COULD-NOT-CHECK: the trailer's count does not cover the other runner's failures.
 * ``pairing`` (r9 hub ruling, a STRUCTURE): every pytest ``FAILED`` line is one failure OCCURRENCE with its own exception
@@ -254,13 +257,11 @@ _IMPORT_ANYWHERE = re.compile(r"(?:^|[^\w])(?:[\w.]+\.)?(?:ModuleNotFoundError|I
 _EXC_GROUP = re.compile(r"^(?:[\w.]+\.)?(?:Base)?ExceptionGroup\b")
 # An assertion message starts with `assert`, or is exactly the AssertionError class (word-bounded: a class
 # named AssertionErrorImpostor is not one), or pytest's `Failed:`.
-# r11 (r10 adversary A1): the `:` must not start a `::`, which no exception line prints after the class name but a node id
-# does (`AssertionError::test_x` is a forged class name, not an assertion).
-_ASSERT_HEAD = re.compile(r"(?:assert\b|AssertionError(?::(?!:)|\s*$)|Failed:(?!:))")
-_UT_ASSERT = re.compile(r"AssertionError(?::(?!:)|\s*$)")
-# The start of an exception account in a summary message: `assert ...`, or a (dotted) class name followed by `: ` or by
-# the end of the message. Used only to find every place a FAILED/ERROR line COULD end its node id (_parse_summary_line).
-_MSG_HEAD = re.compile(r"(?:assert\b|(?:[A-Za-z_][A-Za-z0-9_]*\.)*[A-Za-z_][A-Za-z0-9_]*(?::(?!:)|$))")
+# r11: each head needs the runner's own delimiter after it: `assert` then whitespace or the end, the class name then `: `
+# or the end. A word boundary is not one: `assert.MissingDependency` (a class in a module named `assert`, r11 pass 1 A2)
+# and `AssertionError::test_x` / `AssertionError:x` (forged class names, r10 A1) are not assertions.
+_ASSERT_HEAD = re.compile(r"(?:assert(?:\s|$)|AssertionError(?::[ \t]|:?\s*$)|Failed:(?:[ \t]|\s*$))")
+_UT_ASSERT = re.compile(r"AssertionError(?::[ \t]|:?\s*$)")
 _EXPECT_SITE = re.compile(r"^(?P<file>.+\.\w+):(?P<line>[0-9]+)\Z")
 # Every pattern below reads ONE framed line (see _frame): none is compiled multi-line, none searches the raw text.
 _RED_MARK = re.compile(r"^FAILED \(|^FAILED |\b\d+ (?:failed|errors?)\b|^Interrupted:")
@@ -497,34 +498,32 @@ def _id_ends_with(whole: list[tuple[str, str]], tail: list[tuple[str, str]]) -> 
     return True
 
 
-def _parse_summary_line(line: str, word: str) -> tuple[str, str, bool] | None:
-    """`FAILED <node> - <msg>` / `ERROR <node> - <msg>` -> (node, msg, ambiguous). Without a parameter id the
-    node ends at the first ' - '. With one, the node ends at a ' - ' that follows a `]`; when more than one
-    such separator exists the split cannot be told from a parameter id that contains it, so the line is
-    flagged ambiguous."""
+def _summary_readings(line: str, word: str) -> list[tuple[str, str]] | None:
+    """`FAILED <node> - <msg>` / `ERROR <node> - <msg>` -> EVERY (node, msg) reading of the line, the plain one first.
+    Without a parameter id the plain reading ends the node at the first ' - '. r11 (r10 adversary A1, r11 pass 1 A1): a
+    class or function name set through globals() may hold ' - ' (`TestA - AssertionError`), and an exception class of
+    any name prints after it (type('Bad-Name', ...) prints `t.Bad-Name`), so EVERY later ' - ' whose left side is a node
+    id is another reading. No grammar of the message can rule one out. With a parameter id, the node ends at a ' - '
+    that follows a `]`: each such separator is a reading, and so is the whole text when the message ends in `]` (r10
+    adversary pass 2 A1: at a narrow width pytest drops the message and prints the node id alone). More than one reading
+    is resolved only by the run's own failure section (see _parse_pytest); otherwise the line is COULD-NOT-CHECK."""
     if not line.startswith(word + " "):
         return None
     rest = line[len(word) + 1:].rstrip()
     seps = [i for i in range(len(rest)) if rest.startswith(" - ", i)]
     if not seps:
-        return rest, "", False
+        return [(rest, "")]
     param = rest.find("[")
     if param < 0 or seps[0] < param:
-        # r11 (r10 adversary A1): a class or function name set through globals() may hold ` - ` (`TestA - AssertionError`),
-        # so the FIRST ' - ' is only one candidate end of the node id. Any LATER ' - ' whose left side is a node id and
-        # whose right side starts an exception account (`assert`, or a class name then `: ` or the end) is another
-        # reading of the same line; with two readings the split is a guess, so the line is ambiguous (COULD-NOT-CHECK).
-        # A ' - ' inside an assertion message (`assert x - 1 == y`, `AssertionError: 3 - 4`) is not followed by one.
-        later = [i for i in seps[1:] if _node_shaped(word, rest[:i]) and _MSG_HEAD.match(rest[i + 3:])]
-        return rest[:seps[0]], rest[seps[0] + 3:], bool(later)
-    after = [i for i in seps if i > param and rest[i - 1] == "]"]
-    if not after:
-        return rest, "", False
-    msg = rest[after[0] + 3:]
-    # r10 adversary pass 2 A1: at a narrow width pytest DROPS the message and prints the node id alone. A parameter id
-    # holding `] - ` then splits as node + "message", and that "message" ends in the id's own closing `]`. A message
-    # that ends in `]` cannot be told from that, so the line is ambiguous (fail closed, never a guessed account).
-    return rest[:after[0]], msg, len(after) > 1 or msg.endswith("]")
+        cuts = [seps[0]] + [i for i in seps[1:] if _node_shaped(word, rest[:i])]
+        return [(rest[:i], rest[i + 3:]) for i in cuts]
+    cuts = [i for i in seps if i > param and rest[i - 1] == "]"]
+    if not cuts:
+        return [(rest, "")]
+    readings = [(rest[:i], rest[i + 3:]) for i in cuts]
+    if readings[0][1].endswith("]"):
+        readings.append((rest, ""))
+    return readings
 
 
 def _ends_with(whole: list[str], tail: list[str]) -> bool:
@@ -768,6 +767,20 @@ def _summary_problem(word: str, node: str, msg: str) -> str:
     return ""
 
 
+def _section_names(sections: list[Failure]) -> set[str]:
+    """The test names the failure sections read so far print in their headers (`T.test_a`, `test_x[p]`), without the
+    `ERROR at setup of ` / `ERROR at teardown of ` prefix."""
+    names = set()
+    for f in sections:
+        name = f.ids[0] if f.ids else ""
+        for prefix in ("ERROR at setup of ", "ERROR at teardown of "):
+            if name.startswith(prefix):
+                name = name[len(prefix):]
+                break
+        names.add(name)
+    return names
+
+
 def _parse_pytest(lines: list[str], stats: dict | None = None) -> list[Failure]:
     """`stats` (optional) receives what the text held that the runner's own count can be checked against:
     `sections` (failure/error sections), `summary` (FAILED/ERROR summary lines), `has_summary` (a short test summary
@@ -836,11 +849,18 @@ def _parse_pytest(lines: list[str], stats: dict | None = None) -> list[Failure]:
                 if why:
                     stats["bad"] = stats["bad"] or f"{line[:50]!r}: {why}"
             for word in ("FAILED", "ERROR"):
-                got = _parse_summary_line(line, word)
-                if not got:
+                readings = _summary_readings(line, word)
+                if not readings:
                     continue
                 stats["summary"] += 1
-                node, msg, ambiguous = got
+                if len(readings) > 1:
+                    # r11: the run's own failure sections (they precede the summary, so `out` holds them) name their
+                    # tests; a reading is told only when EXACTLY ONE of them names a section's test.
+                    named = [r for r in readings if _split_top(r[0], "::")[1:]
+                             and ".".join(_split_top(r[0], "::")[1:]) in _section_names(out)]
+                    readings = named if len(named) == 1 else readings
+                node, msg = readings[0]
+                ambiguous = len(readings) > 1
                 stats["bad"] = stats["bad"] or _summary_problem(word, node, msg)
                 if word == "FAILED":
                     nodes.append((node, msg))
@@ -968,7 +988,8 @@ def _foreign_type(failure: Failure) -> str:
         return ""
     token = re.match(r"[\w.]+", text)
     name = token.group(0) if token else text[:40]
-    if token and name in _EXC_NAMES and text[len(name):len(name) + 1] in ("", ":"):
+    after = text[len(name):]
+    if token and name in _EXC_NAMES and (after in ("", ":") or after.startswith(": ")):  # r11: `TypeError:x` is not one
         return ""  # an exact name from the fixed list (ImportError and its builtin subclasses are not on it)
     return _Reason("cnc-exception-type", f"exception type {name[:40]!r} of a failing test is not on the fixed list of "
                    "builtin names: its class may subclass ImportError, which the run does not say")
