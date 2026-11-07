@@ -54,8 +54,8 @@ struct Callbacks
 
 // The renderIdle() sample (adversary r3 pass 3 A1). It never waits for the renderer mutex: a mutex someone holds is
 // reported BUSY at once and idleLocked() does not run. A hold of any length is therefore seen as busy, which ends the idle
-// run; no duration threshold tells a contended sample from an uncontended one (r3's kBlockedSampleUs let a hold shorter
-// than 100 us keep the credit from before it). RenderFrameThread::isIdleNoWait / isIdleExceptPlaybackLookaheadNoWait use
+// run; no duration threshold tells a contended sample from an uncontended one (r3's 100 us threshold let a shorter hold
+// keep the credit from before it). RenderFrameThread::isIdleNoWait / isIdleExceptPlaybackLookaheadNoWait use
 // it on m_mutex; every other isIdle() reader keeps its blocking read. Mutex needs tryLock() and unlock() (QMutex).
 template <typename Mutex, typename IdleLocked>
 inline bool probeIdleWithoutWaiting( Mutex &rendererMutex, IdleLocked idleLocked )
