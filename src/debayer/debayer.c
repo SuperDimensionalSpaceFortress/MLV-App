@@ -583,8 +583,11 @@ static inline int debayer_hacd_reflect(int i, int n)
 }
 
 /* Least squares v ~ a * g4 + c over the sites of one colour (row parity py, column
- * parity px, every second such row), g4 = the mean of the 4 G neighbours. */
-static void debayer_hacd_fit(const uint16_t *bayer, int w, int h, int py, int px, float *a_out, float *c_out)
+ * parity px, every second such row), g4 = the mean of the 4 G neighbours. Returns 1 for a
+ * usable fit, 0 for a degenerate one (under 16 sites, no G variance, or a slope outside
+ * [1/64, 64]); r11: the caller then keeps that channel's bilinear (adversary A1: a = 1,
+ * c = 0 on a gained raw doubled a neutral edge's false colour against the bilinear). */
+static int debayer_hacd_fit(const uint16_t *bayer, int w, int h, int py, int px, float *a_out, float *c_out)
 {
     double n = 0.0, sg = 0.0, sv = 0.0, sgg = 0.0, sgv = 0.0;
     for (int y = 2 + py; y + 1 < h; y += 4)
@@ -604,6 +607,7 @@ static void debayer_hacd_fit(const uint16_t *bayer, int w, int h, int py, int px
         }
     }
     float a = 1.0f, c = 0.0f;
+    int ok = 0;
     if (n >= 16.0)
     {
         const double mg = sg / n, mv = sv / n;
@@ -616,11 +620,13 @@ static void debayer_hacd_fit(const uint16_t *bayer, int w, int h, int py, int px
             {
                 a = (float)fa;
                 c = (float)(mv - fa * mg);
+                ok = 1;
             }
         }
     }
     *a_out = a;
     *c_out = c;
+    return ok;
 }
 
 static inline uint16_t debayer_hacd_round16(float v)
@@ -661,9 +667,10 @@ static inline float debayer_hacd_site(const uint16_t *row, const uint16_t *u1, c
 
 /* One output pixel: the colour difference at its own site or the bilinear mean of its
  * nearest R / B sites (dif rows ro, uo = y - 1, dof = y + 1, columns xl, xr mirrored),
- * laid on the pixel's bilinear G and mapped back by the fit. */
+ * laid on the pixel's bilinear G and mapped back by the fit. keep: bit 0 keeps the
+ * bilinear R, bit 1 the bilinear B (that channel's fit was degenerate, r11). */
 static inline void debayer_hacd_px(uint16_t *out, const float *dif, size_t ro, size_t uo, size_t dof, int x,
-                                   int xl, int xr, int ye, int xe, float aR, float cR, float aB, float cB)
+                                   int xl, int xr, int ye, int xe, float aR, float cR, float aB, float cB, int keep)
 {
 #define HACD_D(o, xx) (dif[(o) + (size_t)(xx)])
     float dr, db;
@@ -690,8 +697,8 @@ static inline void debayer_hacd_px(uint16_t *out, const float *dif, size_t ro, s
 #undef HACD_D
     uint16_t *p = out + (size_t)x * 3u;
     const float gb = (float)p[1];
-    p[0] = debayer_hacd_round16(aR * (gb + dr) + cR);
-    p[2] = debayer_hacd_round16(aB * (gb + db) + cB);
+    if (!(keep & 1)) p[0] = debayer_hacd_round16(aR * (gb + dr) + cR);
+    if (!(keep & 2)) p[2] = debayer_hacd_round16(aB * (gb + db) + cB);
 }
 
 int debayer_reduced_hacd_chroma_rgb16(uint16_t *rgb, const uint16_t *bayer, int w, int h, int threads,
@@ -699,8 +706,11 @@ int debayer_reduced_hacd_chroma_rgb16(uint16_t *rgb, const uint16_t *bayer, int 
 {
     if (!rgb || !bayer || !scratch || w < 4 || h < 4) return 0;
     float aR, cR, aB, cB;
-    debayer_hacd_fit(bayer, w, h, 0, 0, &aR, &cR); /* R at (even, even) */
-    debayer_hacd_fit(bayer, w, h, 1, 1, &aB, &cB); /* B at (odd, odd) */
+    const int okR = debayer_hacd_fit(bayer, w, h, 0, 0, &aR, &cR); /* R at (even, even) */
+    const int okB = debayer_hacd_fit(bayer, w, h, 1, 1, &aB, &cB); /* B at (odd, odd) */
+    /* r11: a degenerate fit keeps that channel as debayerBasicU16 wrote it. */
+    const int keep = (okR ? 0 : 1) | (okB ? 0 : 2);
+    if (keep == 3) return 1;
     const float iR = 1.0f / aR, iB = 1.0f / aB;
     /* scratch[i] at an R or B site = its balanced value minus its HA G (the colour
      * difference); G sites are not written. Same-colour neighbours (x +- 2, y +- 2)
@@ -739,17 +749,17 @@ int debayer_reduced_hacd_chroma_rgb16(uint16_t *rgb, const uint16_t *bayer, int 
         const int ye = (y & 1) == 0;
         /* x = 0 and x = w - 1 mirror; the interior runs in (odd, even) pairs so each call's
          * column parity is a constant. */
-        debayer_hacd_px(out, dif, ro, uo, dof, 0, 1, 1, ye, 1, aR, cR, aB, cB);
+        debayer_hacd_px(out, dif, ro, uo, dof, 0, 1, 1, ye, 1, aR, cR, aB, cB, keep);
         int x = 1;
         for (; x + 2 < w; x += 2)
         {
-            debayer_hacd_px(out, dif, ro, uo, dof, x, x - 1, x + 1, ye, 0, aR, cR, aB, cB);
-            debayer_hacd_px(out, dif, ro, uo, dof, x + 1, x, x + 2, ye, 1, aR, cR, aB, cB);
+            debayer_hacd_px(out, dif, ro, uo, dof, x, x - 1, x + 1, ye, 0, aR, cR, aB, cB, keep);
+            debayer_hacd_px(out, dif, ro, uo, dof, x + 1, x, x + 2, ye, 1, aR, cR, aB, cB, keep);
         }
         for (; x < w - 1; ++x)
-            debayer_hacd_px(out, dif, ro, uo, dof, x, x - 1, x + 1, ye, (x & 1) == 0, aR, cR, aB, cB);
+            debayer_hacd_px(out, dif, ro, uo, dof, x, x - 1, x + 1, ye, (x & 1) == 0, aR, cR, aB, cB, keep);
         debayer_hacd_px(out, dif, ro, uo, dof, w - 1, w - 2, debayer_hacd_reflect(w, w), ye, ((w - 1) & 1) == 0, aR, cR,
-                        aB, cB);
+                        aB, cB, keep);
     }
     return 1;
 }

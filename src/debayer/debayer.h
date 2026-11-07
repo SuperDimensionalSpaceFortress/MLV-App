@@ -38,8 +38,9 @@ void debayer_reduced_hchroma121_rgb16(uint16_t *out, const uint16_t *in, int w, 
  * gradient-directed Hamilton-Adams G (each direction clamped to its two G neighbours,
  * r11) and a bilinear colour-difference interpolation,
  * both in a balanced domain where R ~ aR * G + cR and B ~ aB * G + cB (a least-squares
- * fit per frame against the 4 G neighbours of every second R or B row; a degenerate
- * fit falls back to a = 1, c = 0), and the colour difference is laid on the bilinear G:
+ * fit per frame against the 4 G neighbours of every second R or B row; r11: a degenerate
+ * fit leaves that channel exactly as debayerBasicU16 wrote it), and the colour difference
+ * is laid on the bilinear G:
  * R = aR * (G + (R' - Gha)) + cR, rounded and clamped to [0, 65535]. Border sites
  * mirror (x - 1 -> x + 1, x - 2 -> x + 2). scratch holds w * h floats.
  * Returns 1 when R and B were rebuilt, 0 (rgb untouched) when w or h < 4 or a
