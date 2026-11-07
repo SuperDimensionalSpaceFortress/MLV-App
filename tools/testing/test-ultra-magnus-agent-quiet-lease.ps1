@@ -322,18 +322,30 @@ if a[:2] == ["lease", "release"]:
     # r4 (sol r3 B3, :288): an unreadable flag is still THERE, so it never ends the poll as if the wrapper had deleted it; still unreadable at the
     # end of the wait is the typed failure, never state=none.
     t_end = time.time() + float(ctl.get("release_wait_s", 10))   # release_wait_s: only fake-flag-unreadable shortens it
+    # r7 F1 (Dot advisory 6706643231): only an OBSERVED absence is state=none. r6 cleared `last` on every readable poll, so a flag that stayed
+    # readable and present through the deadline (or turned readable again after being unreadable) ended as state=none, exit 0, although
+    # nothing ever saw it go. Now: absence seen -> none/0; the last poll unreadable -> unreadable/3 (unchanged); otherwise the deadline was
+    # reached with the flag last seen present -> a typed timeout, state=timeout, exit 5.
     last = None
+    gone = False
     while time.time() < t_end:
         try:
             if read_flag() is None:
-                last = None
+                gone = True
                 break
             last = None
         except FlagUnreadable as e:
+            if last is None:
+                log(cmd="release-poll-unreadable", why=str(e))   # r7 F1: the evidence that a poll really saw the flag unreadable
             last = e
         time.sleep(0.1)
-    if last is not None:
+    if not gone and last is not None:
         flag_unreadable_exit("release-poll", last, 3)
+    if not gone:
+        log(cmd="release-timeout", label=label, wait_s=float(ctl.get("release_wait_s", 10)))
+        print(json.dumps({"state": "timeout", "why": "the flag was still present at the release deadline"}), flush=True)
+        print("[heavy-slot] quiet lease release timed out: the flag was still present after %s s" % ctl.get("release_wait_s", 10), file=sys.stderr, flush=True)
+        sys.exit(5)
     print(json.dumps({"state": "none"}), flush=True)
     sys.exit(0)
 if a[:1] == ["status"]:
@@ -531,16 +543,27 @@ function Get-FixtureMatch([string]$CommandLine, [string]$Fx) {
     $argv = Split-WindowsCommandLine $CommandLine
     if ($argv.Count -eq 0) { return 'unknown' }
     # r6 pass-12 A2 (and the pass-11 class): an argument is script text, never a path, when a shell reads it. cmd.exe re-parses the whole rest
-    # of its line, so nothing on a cmd line is a whole match; for pwsh/powershell only the argument right after -File/-f is a path; for any
-    # other program the argument right after a script flag (-c, -e, -k, /c, /k, /r, --command, --eval, --exec) is script text.
+    # of its line, so nothing on a cmd line is a whole match; for pwsh/powershell only the -File argument is a path, and r7: only when it is
+    # reached through known options, never after command text (Get-PsHostFileArg); for any other program the argument right after a script
+    # flag (-c, -e, -k, /c, /k, /r, --command, --eval, --exec) is script text.
     $img = $argv[0].Replace([char]'/', [char]'\'); $img = $img.Substring($img.LastIndexOf([char]'\') + 1).ToLowerInvariant()
     if ($img.EndsWith('.exe')) { $img = $img.Substring(0, $img.Length - 4) }
     if ($img -ceq 'cmd') { return 'unknown' }
-    $psHost = ($img -ceq 'pwsh' -or $img -ceq 'powershell' -or $img -ceq 'powershell_ise')
-    for ($ti = 0; $ti -lt $argv.Count; $ti++) {
+    # r7 (sol r6 B1, adversary r6 pass-13 A1): pwsh/powershell read their arguments IN ORDER, and once -Command (or -EncodedCommand,
+    # -CommandWithArgs, or any prefix or dash form of them) appears, every later argument is command text: a '-File <dir>' after it is text
+    # (here a comment), not the script the process runs. r6 admitted the argument after ANY -File/-f. So a PowerShell host is found by the
+    # leaf of ANY argument (argv[0], or a wrapper's argument: dotnet pwsh.dll, conhost pwsh.exe, an unquoted 'C:\Program Files\...\pwsh.exe'
+    # whose argv[0] is 'C:\Program'; pwsh-preview, powershell_ise and the 8.3 name POWERS~1 too), and from there its arguments are walked by
+    # a strict grammar (Get-PsHostFileArg): only the -File argument reached through known options is a path; anything else is unknown.
+    $psAt = -1
+    for ($hi = 0; $hi -lt $argv.Count; $hi++) {
+        $hl = ([string]$argv[$hi]).Replace([char]'/', [char]'\'); $hl = $hl.Substring($hl.LastIndexOf([char]'\') + 1).ToLowerInvariant()
+        if ($hl -cmatch '^(pwsh|powershell|powers~[0-9])[^.]*(\.exe|\.dll)?$') { $psAt = $hi; break }
+    }
+    $genericEnd = if ($psAt -ge 0) { $psAt } else { $argv.Count }
+    for ($ti = 0; $ti -lt $genericEnd; $ti++) {
         $prev = if ($ti -gt 0) { [string]$argv[$ti - 1] } else { '' }
-        if ($psHost) { if ($prev -notmatch '^[-/](f|file)$') { continue } }
-        elseif ($ti -gt 0 -and $prev -match '^(-[cek]|/[ckr]|--?(command|eval|exec))$') { continue }
+        if ($ti -gt 0 -and $prev -match '^(-[cek]|/[ckr]|--?(command|eval|exec))$') { continue }
         $tn = ([string]$argv[$ti]).Replace([char]'/', [char]'\')
         $vals = @($tn)
         $q = $tn.IndexOf([char]'=')
@@ -548,19 +571,52 @@ function Get-FixtureMatch([string]$CommandLine, [string]$Fx) {
         # ('Start-Sleep 300 # =<dir>') is not an option, so that occurrence is embedded: unknown. r6 pass-12 A2: and the name starts with
         # '-' or '--' (--output=, -o=); a bare word (echo=, x=) may be a command in script text.
         if ($q -gt 0 -and $tn.Substring(0, $q) -cmatch '^--?[A-Za-z][A-Za-z0-9\-]*$') { $vals += $tn.Substring($q + 1) }
-        foreach ($v in $vals) {
-            if (-not ($v.Equals($root, [StringComparison]::OrdinalIgnoreCase) -or $v.StartsWith($root + '\', [StringComparison]::OrdinalIgnoreCase))) { continue }
-            # r6 pass-11 A1: a whole argument can itself be script text (pwsh -Command "<dir>\sub\`..\`..\x.ps1; Start-Sleep 300"): its escapes,
-            # quotes, variables and separators mean the text is not the path the process uses, and GetFullPath reads `.. as a plain name. So the part
-            # after the dir must be a PLAIN path: '\'-separated names of [A-Za-z0-9_.-] that start with a letter, digit, '_' or '-' (no '.' or '..'
-            # segment, no ':' stream, no backtick, '$', quote, ';', space, '%' or bracket). Anything else is unknown (counted, never killed).
-            if ($v.Substring($root.Length) -cnotmatch '^(\\[A-Za-z0-9_\-][A-Za-z0-9_.\-]*)*\\?$') { continue }
-            $full = $null
-            try { $full = [IO.Path]::GetFullPath($v).TrimEnd([char]'\') } catch { continue }   # an unresolvable value is not admitted here (it stays unknown)
-            if ($full.Equals($rootFull, [StringComparison]::OrdinalIgnoreCase) -or $full.StartsWith($rootFull + '\', [StringComparison]::OrdinalIgnoreCase)) { return 'fixture' }
-        }
+        foreach ($v in $vals) { if (Test-FixturePlainPath $v $root $rootFull) { return 'fixture' } }
+    }
+    if ($psAt -ge 0) {
+        $fa = Get-PsHostFileArg $argv ($psAt + 1)
+        if ($null -ne $fa -and (Test-FixturePlainPath ([string]$fa).Replace([char]'/', [char]'\') $root $rootFull)) { return 'fixture' }
     }
     return 'unknown'   # r6: an embedded occurrence, whatever bounds it, is counted and never killed (no descent, no ownership by pid)
+}
+# r6 pass-11 A1: a whole argument can itself be script text (pwsh -Command "<dir>\sub\`..\`..\x.ps1; Start-Sleep 300"): its escapes, quotes,
+# variables and separators mean the text is not the path the process uses, and GetFullPath reads `.. as a plain name. So the part after the dir
+# must be a PLAIN path: '\'-separated names of [A-Za-z0-9_.-] that start with a letter, digit, '_' or '-' (no '.' or '..' segment, no ':'
+# stream, no backtick, '$', quote, ';', space, '%' or bracket), and the value must resolve (GetFullPath) to the dir or under it.
+function Test-FixturePlainPath([string]$V, [string]$Root, [string]$RootFull) {
+    if (-not ($V.Equals($Root, [StringComparison]::OrdinalIgnoreCase) -or $V.StartsWith($Root + '\', [StringComparison]::OrdinalIgnoreCase))) { return $false }
+    if ($V.Substring($Root.Length) -cnotmatch '^(\\[A-Za-z0-9_\-][A-Za-z0-9_.\-]*)*\\?$') { return $false }
+    $full = $null
+    try { $full = [IO.Path]::GetFullPath($V).TrimEnd([char]'\') } catch { return $false }   # an unresolvable value is not admitted (it stays unknown)
+    return ($full.Equals($RootFull, [StringComparison]::OrdinalIgnoreCase) -or $full.StartsWith($RootFull + '\', [StringComparison]::OrdinalIgnoreCase))
+}
+# r7 (sol r6 B1): the script path a PowerShell host runs, or $null. The host's arguments from index $From are read left to right as pwsh and
+# Windows PowerShell read them, but only through options this grammar KNOWS: the switches -NoProfile/-nop, -NoLogo/-nol, -NonInteractive/-noni
+# and the valued -ExecutionPolicy/-ex/-ep and -WindowStyle/-w (a value that itself starts with a dash or '/' is refused). The argument after
+# -File/-f (also -fi, -fil; '-', '--', '/' or a Unicode dash, any case) is the path, and nothing after it is ever read (it belongs to the
+# script). Every other argument ends the walk with $null, so no LATER argument can be a path: -Command/-c and every prefix of it (-com,
+# -comm, --command, /Command), -EncodedCommand/-e/-ec/-enc, -CommandWithArgs/-cwa, '--%', '-File:<path>', an option this grammar does not
+# know, and a positional argument (the script in pwsh 7 but command text in Windows PowerShell). $null is 'unknown': counted, never killed.
+function Get-PsHostFileArg([string[]]$Argv, [int]$From) {
+    $dash = [char[]]@([char]'-', [char]'/', [char]0x2013, [char]0x2014, [char]0x2015)
+    $pi = $From
+    while ($pi -lt $Argv.Count) {
+        $t = [string]$Argv[$pi]
+        if ($t.Length -lt 2 -or $dash -notcontains $t[0]) { return $null }
+        $key = $t.Substring(1)
+        if ($dash -contains $key[0]) { $key = $key.Substring(1) }
+        $key = $key.ToLowerInvariant()
+        if ($key -cmatch '^(f|fi|fil|file)$') { if ($pi + 1 -lt $Argv.Count) { return [string]$Argv[$pi + 1] } else { return $null } }
+        if ($key -cmatch '^(noprofile|nop|nologo|nol|noninteractive|noni)$') { $pi++; continue }
+        if ($key -cmatch '^(executionpolicy|ex|ep|windowstyle|w)$') {
+            if ($pi + 1 -ge $Argv.Count) { return $null }
+            $val = [string]$Argv[$pi + 1]
+            if ($val.Length -eq 0 -or $dash -contains $val[0]) { return $null }
+            $pi += 2; continue
+        }
+        return $null
+    }
+    return $null
 }
 function Test-NamesFixture([string]$CommandLine, [string]$Fx) { return (Get-FixtureMatch $CommandLine $Fx) -ceq 'fixture' }
 function Get-FixtureChildPids([string]$Fx) { return @((Get-FixtureCensus $Fx).survivors) }
@@ -1047,7 +1103,9 @@ try {
         'lease-heat-trace-async-retry', 'lease-heat-trace-grant-coverage', 'queuedjob-lease-coverage-at-launch', 'lease-heat-trace-nonlocal-feed',
         'lease-heat-trace-checked-python', 'lease-heat-trace-probe-watchdog',
         'lease-snapshot-bound-straddle', 'lease-probe-watchdog-add-type-failure', 'lease-probe-watchdog-ctor-failure', 'lease-probe-watchdog-arm-paths',
-        'lapse-end-timing-pure', 'lease-seam-pid-cleanup', 'lease-start-post-start-failure', 'lease-start-post-start-cleanup-throws', 'fake-flag-unreadable')
+        'lapse-end-timing-pure', 'lease-seam-pid-cleanup', 'lease-start-post-start-failure', 'lease-start-post-start-cleanup-throws', 'fake-flag-unreadable',
+        'lease-seam-command-mode', 'fixture-census-probe-error', 'fake-release-readable-deadline', 'fake-release-unreadable-then-readable-deadline',
+        'fake-release-unreadable-deadline')
     foreach ($o in $Only) { Assert-True ($notAfterCases -contains $o) "-Only names a known case: '$o' (known: $($notAfterCases -join ', '))" }
     function Test-Case([string]$Name) { return ($Only.Count -eq 0 -or $Only -contains $Name) }
     # Hang guard: an agent that ignores notAfterUtc would wait these cases out; the queue ceiling then ends them queue-expired
@@ -4068,6 +4126,186 @@ try { $out = @(Add-LeaseSlotSnapshot -JobId 'jB4a' -Phase 'request') } catch { $
             Reset-Case @{ request = 'active' }
         }
     }
+    # lease-seam-command-mode (r7; sol r6 B1, adversary r6 pass-13 A1, proposed catalogue row "PowerShell command-mode boundary"): once a
+    # PowerShell host has seen -Command (or -EncodedCommand, -CommandWithArgs, any prefix or dash form of them), every later argument is
+    # command text, so a '-File <fixture>' after it names nothing the process runs. Sol's three rows verbatim, then the class (prefixes, '/' and
+    # '--' forms, a Unicode dash, encoded commands, '--%', an unknown or value-eating option, '-File:', a host found through a wrapper or an
+    # unquoted path), through the census (-Rows) and the sweep (-Rows/-OpenPid, an inert opener whose Kill only records the pid): each is
+    # counted unknown and never killed. Controls in the same census and sweep: a -File reached through known options, and the suite's own
+    # python reader shape, are still survivors and still killed (so the refusal is the rule, not a dead seam).
+    if (Test-Case 'lease-seam-command-mode') {
+        $cmFx = 'C:\Temp\um-agent-quiet-lease-1234-abcd1234'
+        $cmRows = [ordered]@{
+            'sol-b1-verbatim'      = 'pwsh.exe -NoProfile -Command "Start-Sleep -Seconds 300; # ignored" -File C:\Temp\um-agent-quiet-lease-1234-abcd1234'
+            'sol-powershell-c-f'   = 'powershell.exe /c "Start-Sleep -Seconds 300; # ignored" /f C:\Temp\um-agent-quiet-lease-1234-abcd1234'
+            'sol-pwsh-c-f'         = 'pwsh.exe -c "Start-Sleep -Seconds 300; # ignored" -f C:\Temp\um-agent-quiet-lease-1234-abcd1234'
+            'encodedcommand'       = 'pwsh.exe -EncodedCommand UwB0AGEAcgB0AC0AUwBsAGUAZQBwACAAMwAwADAA -File C:\Temp\um-agent-quiet-lease-1234-abcd1234'
+            'e'                    = 'pwsh.exe -e UwB0AGEAcgB0AC0AUwBsAGUAZQBwACAAMwAwADAA -File C:\Temp\um-agent-quiet-lease-1234-abcd1234\x.ps1'
+            'ec'                   = 'powershell -ec UwB0AGEAcgB0AC0AUwBsAGUAZQBwACAAMwAwADAA -f C:\Temp\um-agent-quiet-lease-1234-abcd1234\x.ps1'
+            'enc'                  = 'pwsh -enc UwB0AGEAcgB0AC0AUwBsAGUAZQBwACAAMwAwADAA -File C:\Temp\um-agent-quiet-lease-1234-abcd1234'
+            'com'                  = 'pwsh.exe -com "Start-Sleep 300 #" -File C:\Temp\um-agent-quiet-lease-1234-abcd1234'
+            'comm-unquoted-host'   = 'C:\Program Files\PowerShell\7\pwsh.exe -comm "Start-Sleep 300 #" -File C:\Temp\um-agent-quiet-lease-1234-abcd1234'
+            'slash-command'        = '"C:\Windows\System32\WindowsPowerShell\v1.0\POWERSHELL.EXE" /Command "Start-Sleep 300 #" /File C:\Temp\um-agent-quiet-lease-1234-abcd1234'
+            'double-dash-command'  = 'pwsh --command "Start-Sleep 300 #" --file C:\Temp\um-agent-quiet-lease-1234-abcd1234'
+            'commandwithargs'      = 'pwsh -CommandWithArgs "Start-Sleep 300 #" -File C:\Temp\um-agent-quiet-lease-1234-abcd1234'
+            'cwa'                  = 'pwsh -cwa "Start-Sleep 300 #" -f C:\Temp\um-agent-quiet-lease-1234-abcd1234'
+            'stop-parsing'         = 'pwsh --% -File C:\Temp\um-agent-quiet-lease-1234-abcd1234'
+            'en-dash-command'      = "pwsh $([char]0x2013)Command `"Start-Sleep 300 #`" -File C:\Temp\um-agent-quiet-lease-1234-abcd1234"
+            'value-option-eats-c'  = 'pwsh -ExecutionPolicy -c -File C:\Temp\um-agent-quiet-lease-1234-abcd1234'
+            'unknown-option'       = 'pwsh -Zzz "Start-Sleep 300 #" -File C:\Temp\um-agent-quiet-lease-1234-abcd1234'
+            'file-colon'           = 'pwsh -Command "Start-Sleep 300 #" -File:C:\Temp\um-agent-quiet-lease-1234-abcd1234'
+            'pwsh-preview'         = 'pwsh-preview.exe -Command "Start-Sleep 300 #" -File C:\Temp\um-agent-quiet-lease-1234-abcd1234'
+            'short-name-host'      = 'C:\Windows\System32\WINDOW~1\v1.0\POWERS~1.EXE -c "Start-Sleep 300 #" -f C:\Temp\um-agent-quiet-lease-1234-abcd1234'
+            'dotnet-pwsh-dll'      = 'dotnet.exe C:\pwsh\pwsh.dll -Command "Start-Sleep 300 #" -File C:\Temp\um-agent-quiet-lease-1234-abcd1234'
+            'conhost-wraps-pwsh'   = 'conhost.exe --headless pwsh.exe -c "Start-Sleep 300 #" -f C:\Temp\um-agent-quiet-lease-1234-abcd1234'
+        }
+        $cmControls = [ordered]@{
+            'control-file'         = 'pwsh.exe -NoProfile -File C:\Temp\um-agent-quiet-lease-1234-abcd1234\x.ps1'
+            'control-file-options' = 'pwsh.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File C:\Temp\um-agent-quiet-lease-1234-abcd1234\x.ps1 -Command y'
+            'control-python-data'  = 'python.exe -c "import time" C:\Temp\um-agent-quiet-lease-1234-abcd1234\x'
+        }
+        $cmCensusRows = [System.Collections.Generic.List[object]]::new()
+        $cmIds = [ordered]@{}
+        $cmN = 0
+        foreach ($k in @($cmRows.Keys) + @($cmControls.Keys)) {
+            $cl = if ($cmRows.Contains($k)) { $cmRows[$k] } else { $cmControls[$k] }
+            $cmIds[$k] = 24680 + $cmN; $cmN++
+            $cmCensusRows.Add([pscustomobject]@{ ProcessId = $cmIds[$k]; CommandLine = $cl })
+        }
+        $script:CmKilled = [System.Collections.Generic.List[int]]::new()
+        $cmOpen = {
+            param($i)
+            $m = [pscustomobject]@{ Id = $i }
+            $m | Add-Member -MemberType ScriptMethod -Name get_Handle -Value { [IntPtr]1 }
+            $m | Add-Member -MemberType ScriptMethod -Name get_HasExited -Value { $false }
+            $m | Add-Member -MemberType ScriptMethod -Name Kill -Value { $script:CmKilled.Add([int]$this.Id) }
+            $m | Add-Member -MemberType ScriptMethod -Name Dispose -Value { }
+            return $m
+        }
+        $cmC = Get-FixtureCensus $cmFx -Rows $cmCensusRows.ToArray()
+        $cmS = @(Stop-FixtureLeftovers $cmFx @($cmIds.Values) -Rows $cmCensusRows.ToArray() -OpenPid $cmOpen)
+        $cmBad = [System.Collections.Generic.List[string]]::new()
+        $cmOut = [ordered]@{}
+        foreach ($k in $cmIds.Keys) {
+            $id = $cmIds[$k]; $isControl = $cmControls.Contains($k)
+            $m = Get-FixtureMatch $(if ($isControl) { $cmControls[$k] } else { $cmRows[$k] }) $cmFx
+            $row = "match=$m survivor=$(@($cmC.survivors) -contains $id) unknown=$(@($cmC.unknown) -contains $id) stopped=$($cmS -contains $id) killed=$($script:CmKilled -contains $id)"
+            $cmOut[$k] = $row
+            $want = if ($isControl) { 'match=fixture survivor=True unknown=False stopped=True killed=True' } else { 'match=unknown survivor=False unknown=True stopped=False killed=False' }
+            if ($row -cne $want) { $cmBad.Add("[$k] $row want $want") }
+        }
+        Assert-True ($cmBad.Count -eq 0) "lease-seam-command-mode: a '-File <fixture>' after PowerShell command text (-Command/-c/-EncodedCommand/-CommandWithArgs, any prefix or dash form, '--%', an unknown option) is counted unknown and never killed; a -File reached through known options is still killed (sol r6 B1): $($cmBad -join ' ; ')"
+        $results.leaseSeamCommandMode = [ordered]@{ attackRows = $cmRows.Count; controls = $cmControls.Count; survivors = @($cmC.survivors).Count; unknown = @($cmC.unknown).Count; killed = "[$($script:CmKilled -join ',')]"; rows = $cmOut }
+    }
+    # fixture-census-probe-error (r7 E1; Dot advisory 6706643231, hub ACK 6706997355): a suite whose suite-end fixture census THROWS has no
+    # survivor count, so it must not end as status PASS (r6 printed PASS with survivors=unknown unknown=unknown, and the FIFO parent accepts any
+    # exit 0). A child run of this suite (-Only liveness-pure, which never queries processes) with Get-CimInstance shadowed by a function that
+    # throws must end non-PASS, naming the probe error, exit non-zero; the same child run without the injection is the control: status PASS,
+    # numeric survivors=0 unknown=0 from a census that ran.
+    if (Test-Case 'fixture-census-probe-error') {
+        $cpExe = (Get-Process -Id $PID).Path
+        $cpQ = { param($s) "'" + ([string]$s).Replace("'", "''") + "'" }
+        # the injected child runs under -Command (the shadowing function must exist before the suite starts) and exits with the suite's own exit
+        # code; the control runs under -File, whose exit code is the suite's (0 on a normal end).
+        $cpRun = "function global:Get-CimInstance { throw 'injected census failure (fixture-census-probe-error)' }; & $(& $cpQ $PSCommandPath) -RepoRoot $(& $cpQ $RepoRoot) -AgentScript $(& $cpQ $agentScript) -Python $(& $cpQ $Python) -Only liveness-pure; exit `$LASTEXITCODE"
+        $cpObjs = [System.Collections.Generic.List[object]]::new()
+        function Invoke-CensusChild([string[]]$Argv) {
+            $psiC = [Diagnostics.ProcessStartInfo]::new($cpExe)
+            foreach ($a in @('-NoProfile', '-NonInteractive') + @($Argv)) { [void]$psiC.ArgumentList.Add($a) }
+            $psiC.UseShellExecute = $false; $psiC.CreateNoWindow = $true; $psiC.RedirectStandardOutput = $true; $psiC.RedirectStandardError = $true
+            $pC = [Diagnostics.Process]::Start($psiC)
+            $cpObjs.Add($pC)
+            $oT = $pC.StandardOutput.ReadToEndAsync(); $eT = $pC.StandardError.ReadToEndAsync()
+            $done = $pC.WaitForExit(180000)
+            if (-not $done) { try { $pC.Kill($true) } catch { }; $null = $pC.WaitForExit(5000) }
+            $o = if ($oT.Wait(5000)) { [string]$oT.Result } else { '<unread>' }
+            $e = if ($eT.Wait(5000)) { [string]$eT.Result } else { '<unread>' }
+            $j = $null
+            $js = $o.IndexOf('{')
+            if ($js -ge 0) { try { $j = $o.Substring($js) | ConvertFrom-Json } catch { $j = $null } }
+            return [pscustomobject]@{ done = $done; rc = $(if ($done) { $pC.ExitCode } else { $null }); json = $j; out = $o; err = $e }
+        }
+        try {
+            $cpBad = [System.Collections.Generic.List[string]]::new()
+            $cpInj = Invoke-CensusChild @('-Command', $cpRun)
+            $cpCtl = Invoke-CensusChild @('-File', $PSCommandPath, '-RepoRoot', $RepoRoot, '-AgentScript', $agentScript, '-Python', $Python, '-Only', 'liveness-pure')
+            $ji = $cpInj.json; $jc = $cpCtl.json
+            $injRow = "done=$($cpInj.done) rc=$($cpInj.rc) status=$(if ($ji) { $ji.status }) probeError=[$(if ($ji) { $ji.probeError })] fixtureCensus=[$(if ($ji) { $ji.results.fixtureCensus })] censusRan=$(if ($ji) { $ji.results.fixtureCensusRan })"
+            $ctlRow = "done=$($cpCtl.done) rc=$($cpCtl.rc) status=$(if ($jc) { $jc.status }) fixtureCensus=[$(if ($jc) { $jc.results.fixtureCensus })] censusRan=$(if ($jc) { $jc.results.fixtureCensusRan })"
+            if (-not ($cpInj.done -and $null -ne $ji -and $ji.status -cne 'PASS' -and $ji.status -ceq 'FIXTURE_PROBE_ERROR' -and [string]$ji.probeError -like '*injected census failure*' -and $ji.results.fixtureCensus -ceq 'survivors=unknown unknown=unknown' -and $ji.results.fixtureCensusRan -eq $false -and $cpInj.rc -ne 0 -and $cpInj.out -notmatch '"status":\s*"PASS"' -and $cpInj.err -like '*FixtureLeakProbeError*')) { $cpBad.Add("injected: $injRow err=[$($cpInj.err.Trim())]") }
+            if (-not ($cpCtl.done -and $null -ne $jc -and $jc.status -ceq 'PASS' -and $cpCtl.rc -eq 0 -and $jc.results.fixtureCensus -ceq 'survivors=0 unknown=0' -and $jc.results.fixtureCensusRan -eq $true)) { $cpBad.Add("control: $ctlRow err=[$($cpCtl.err.Trim())]") }
+            Assert-True ($cpBad.Count -eq 0) "fixture-census-probe-error: a suite-end census that threw ends non-PASS (FIXTURE_PROBE_ERROR, the probe error named, exit non-zero), never PASS; a census that ran prints numeric survivors=0 unknown=0 with status PASS: $($cpBad -join ' ; ')"
+            $results.fixtureCensusProbeError = [ordered]@{ injected = $injRow; control = $ctlRow }
+        }
+        finally { Stop-OwnedChildren $cpObjs }
+    }
+    # fake-release-* (r7 F1; Dot advisory 6706643231, hub ACK 6706997355): the fake's `lease release` poll may end state=none, exit 0 only after
+    # it OBSERVED the flag gone. r6 cleared its last-unreadable error on every readable poll, so a flag still present at the deadline printed
+    # state=none and exited 0 without ever seeing absence. The fake is driven directly (release_wait_s = 2; the flag's owner pid 99999x is no
+    # process, so nothing deletes the flag): (i) readable and present through the deadline and (ii) unreadable for 0.8 s, then readable and
+    # present through the deadline both end as a typed timeout (state=timeout, exit 5, a release-timeout log line), never none/0; (iii)
+    # unreadable through the deadline ends typed unreadable, exit 3, exactly as before (the fix must not change it).
+    $frCases = @('fake-release-readable-deadline', 'fake-release-unreadable-then-readable-deadline', 'fake-release-unreadable-deadline')
+    if (@($frCases | Where-Object { Test-Case $_ }).Count -gt 0) {
+        $frObjs = [System.Collections.Generic.List[object]]::new()
+        $frFlag = Join-Path $fx 'quiet-lease.json'
+        $frRows = [ordered]@{}
+        function Invoke-FrRelease([int]$OwnerPid, [double]$UnreadableSec, [bool]$UnreadableToEnd) {
+            Reset-Case @{ request = 'hang'; read_attempts = 30; release_wait_s = 2 }
+            [IO.File]::WriteAllText($frFlag, (@{ label = $script:QuietLeaseLabel; pid = $OwnerPid; state = 'pending'; renewed = 0 } | ConvertTo-Json -Compress))
+            $psiR = [Diagnostics.ProcessStartInfo]::new($Python)
+            foreach ($a in @($fakePath, 'lease', 'release', '--label', $script:QuietLeaseLabel)) { [void]$psiR.ArgumentList.Add($a) }
+            $psiR.UseShellExecute = $false; $psiR.CreateNoWindow = $true; $psiR.RedirectStandardOutput = $true; $psiR.RedirectStandardError = $true
+            $psiR.Environment['HEAVY_SLOT_DIR'] = $fx
+            $pR = [Diagnostics.Process]::Start($psiR)
+            $frObjs.Add($pR)
+            $oT = $pR.StandardOutput.ReadToEndAsync(); $eT = $pR.StandardError.ReadToEndAsync()
+            $lk = $null; $lockOk = $null
+            try {
+                if ($UnreadableSec -gt 0 -or $UnreadableToEnd) {
+                    $null = Wait-Until { Test-Path -LiteralPath (Join-Path $fx "release-$OwnerPid") } 15
+                    $dlL = [DateTime]::UtcNow.AddSeconds(5)
+                    while ($null -eq $lk -and [DateTime]::UtcNow -lt $dlL) { try { $lk = [IO.File]::Open($frFlag, [IO.FileMode]::Open, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None) } catch { Start-Sleep -Milliseconds 5 } }
+                    $lockOk = ($null -ne $lk) -and -not $pR.HasExited
+                    if (-not $UnreadableToEnd) { Start-Sleep -Milliseconds ([int]($UnreadableSec * 1000)); if ($null -ne $lk) { $lk.Dispose(); $lk = $null } }
+                }
+                $done = $pR.WaitForExit(30000)
+                if (-not $done) { try { $pR.Kill() } catch { }; $null = $pR.WaitForExit(5000) }
+            }
+            finally { if ($null -ne $lk) { $lk.Dispose() } }
+            $calls = @(Get-Calls)
+            return [pscustomobject]@{
+                done = $done; rc = $(if ($done) { $pR.ExitCode } else { $null })
+                out = $(if ($oT.Wait(5000)) { ([string]$oT.Result).Trim() } else { '<unread>' }); err = $(if ($eT.Wait(5000)) { ([string]$eT.Result).Trim() } else { '<unread>' })
+                marker = (Test-Path -LiteralPath (Join-Path $fx "release-$OwnerPid")); flagLeft = (Test-Path -LiteralPath $frFlag); lockOk = $lockOk
+                timeoutLog = @($calls | Where-Object { $_.cmd -eq 'release-timeout' }).Count; pollUnreadableLog = @($calls | Where-Object { $_.cmd -eq 'release-poll-unreadable' }).Count
+            }
+        }
+        function Format-FrRow($R) { return "done=$($R.done) rc=$($R.rc) out=[$($R.out)] err=[$($R.err)] marker=$($R.marker) flagLeft=$($R.flagLeft) lockOk=$($R.lockOk) timeoutLog=$($R.timeoutLog) pollUnreadableLog=$($R.pollUnreadableLog)" }
+        function Test-FrTimeout($R) { return ($R.done -and $R.rc -eq 5 -and $R.out -match '"state": "timeout"' -and $R.out -notmatch '"state": "none"' -and $R.err -like '*quiet lease release timed out*' -and $R.timeoutLog -ge 1 -and $R.marker -and $R.flagLeft) }
+        try {
+            if (Test-Case 'fake-release-readable-deadline') {
+                $r = Invoke-FrRelease 999995 0 $false
+                $frRows['readable-deadline'] = Format-FrRow $r
+                Assert-True (Test-FrTimeout $r) "fake-release-readable-deadline: a flag still present and readable at the release deadline is a typed timeout (state=timeout, exit 5), never state=none/exit 0 (r7 F1 (i)): $(Format-FrRow $r)"
+            }
+            if (Test-Case 'fake-release-unreadable-then-readable-deadline') {
+                $r = Invoke-FrRelease 999997 0.8 $false
+                $frRows['unreadable-then-readable-deadline'] = Format-FrRow $r
+                Assert-True ((Test-FrTimeout $r) -and $r.lockOk -and $r.pollUnreadableLog -ge 1) "fake-release-unreadable-then-readable-deadline: a flag unreadable for a while, then readable and present through the deadline, is a typed timeout (exit 5), never state=none/exit 0, and a poll did see it unreadable (r7 F1 (ii)): $(Format-FrRow $r)"
+            }
+            if (Test-Case 'fake-release-unreadable-deadline') {
+                $r = Invoke-FrRelease 999999 0 $true
+                $frRows['unreadable-deadline'] = Format-FrRow $r
+                Assert-True ($r.done -and $r.rc -eq 3 -and $r.lockOk -and $r.out -match '"state": "unreadable"' -and $r.out -notmatch '"state": "(none|timeout)"' -and $r.err -like '*quiet lease flag unreadable*' -and $r.timeoutLog -eq 0) "fake-release-unreadable-deadline: a flag unreadable through the deadline stays a typed unreadable failure, exit 3 (unchanged by r7 F1 (iii)): $(Format-FrRow $r)"
+            }
+            $results.fakeReleaseDeadline = $frRows
+        }
+        finally {
+            Stop-OwnedChildren $frObjs
+            Reset-Case @{ request = 'active' }
+        }
+    }
     if (Test-Case 'lease-start-post-start-failure') {
         $psFails =[System.Collections.Generic.List[string]]::new()
         $script:PsSeamFn = ''
@@ -4273,6 +4511,8 @@ finally {
     $script:FixtureLeak = @()
     $script:FixtureLeakUnknown = @()
     $script:FixtureLeakStopped = @()
+    $script:FixtureLeakProbeError = $null
+    $script:FixtureLeakProbeFailed = $false
     try {
         # r5 (sol r4 B1): one census gives both buckets; the grace waits for both, and only 'fixture' (survivors) pids are ever stopped.
         $c0 = Get-FixtureCensus $fx
@@ -4284,7 +4524,7 @@ finally {
         }
     }
     # r3 (adversary r3 A6): a census that throws leaves no trustworthy count, so a stale list from an earlier census is dropped: the result is 'unknown'.
-    catch { $script:FixtureLeakProbeError = $_.Exception.Message; $script:FixtureLeak = @(); $script:FixtureLeakUnknown = @() }
+    catch { $script:FixtureLeakProbeFailed = $true; $script:FixtureLeakProbeError = "$($_.Exception.GetType().FullName): $($_.Exception.Message)"; $script:FixtureLeak = @(); $script:FixtureLeakUnknown = @() }
     if ($script:FixtureLeak.Count -gt 0) {
         # r4 (sol r3 hardening): "stopped now" names only the pids whose stop succeeded; a stop that threw or was refused is reported as NOT stopped.
         [Console]::Error.WriteLine((Format-FixtureLeakLine $script:FixtureLeak $script:FixtureLeakStopped))
@@ -4294,10 +4534,19 @@ finally {
     }
     Remove-Item -LiteralPath $fx -Recurse -Force -ErrorAction SilentlyContinue
 }
-$results.fixtureCensus = $(if ($null -ne $script:FixtureLeakProbeError) { 'survivors=unknown unknown=unknown' } else { "survivors=$($script:FixtureLeak.Count) unknown=$($script:FixtureLeakUnknown.Count)" })
+$results.fixtureCensus = $(if ($script:FixtureLeakProbeFailed) { 'survivors=unknown unknown=unknown' } else { "survivors=$($script:FixtureLeak.Count) unknown=$($script:FixtureLeakUnknown.Count)" })
 Assert-True ($script:FixtureLeak.Count -eq 0 -and $script:FixtureLeakUnknown.Count -eq 0) "no fixture child process survives the suite: $($results.fixtureCensus) pids=$($script:FixtureLeak -join ',') unknownPids=$($script:FixtureLeakUnknown -join ',')"
-$results.fixtureChildrenSurviving = $(if ($null -ne $script:FixtureLeakProbeError) { 'unknown' } else { $script:FixtureLeak.Count })
-$results.fixtureChildrenUnknown = $(if ($null -ne $script:FixtureLeakProbeError) { 'unknown' } else { $script:FixtureLeakUnknown.Count })
-if ($null -ne $script:FixtureLeakProbeError) { $results.fixtureChildrenProbeError = $script:FixtureLeakProbeError }   # a probe that could not run is reported as 'unknown', never as 0 and never a failure of its own
+$results.fixtureCensusRan = (-not $script:FixtureLeakProbeFailed)
+$results.fixtureChildrenSurviving = $(if ($script:FixtureLeakProbeFailed) { 'unknown' } else { $script:FixtureLeak.Count })
+$results.fixtureChildrenUnknown = $(if ($script:FixtureLeakProbeFailed) { 'unknown' } else { $script:FixtureLeakUnknown.Count })
+if ($script:FixtureLeakProbeFailed) {
+    # r7 E1 (Dot advisory 6706643231): a census that threw is NOT evidence that no child survived, so it can never end the suite as PASS (r6 printed
+    # status PASS with survivors=unknown unknown=unknown, and the FIFO parent accepts any exit 0). The final status names the probe error and the
+    # exit is non-zero; numeric survivors=0 unknown=0 is printed only by a census that ran (fixtureCensusRan=true).
+    $results.fixtureChildrenProbeError = $script:FixtureLeakProbeError
+    [Console]::Error.WriteLine("FAIL: the suite-end fixture census could not run (FixtureLeakProbeError): $($script:FixtureLeakProbeError); no survivor count exists, so the run is not a PASS")
+    [pscustomobject]@{ status = 'FIXTURE_PROBE_ERROR'; probeError = $script:FixtureLeakProbeError; agent = $agentScript; results = $results } | ConvertTo-Json -Depth 8
+    exit 3
+}
 
 [pscustomobject]@{ status = 'PASS'; agent = $agentScript; agentSha256 = (Get-FileHash -LiteralPath $agentScript -Algorithm SHA256).Hash; results = $results } | ConvertTo-Json -Depth 8
