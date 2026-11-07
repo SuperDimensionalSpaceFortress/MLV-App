@@ -962,6 +962,126 @@ class VerdictOnText(unittest.TestCase):
         self.assertEqual(rmv._ut_identities(rest), [("test_x", "t.T.test_x")])
         self.assertLess(time.perf_counter() - started, 2.0)
 
+    # ---- r9 (both r8 keys + r8 adversary A1-A3 on cd8773fc): two STRUCTURES, not three more parse rules -----------
+    # Structure 2: one exception account per FAILED occurrence; an ambiguous pairing of sections and occurrences is
+    # COULD-NOT-CHECK and names the node ids.
+    SUFFIX = ("=== FAILURES ===\n___ test_x ___\nE assert False\na/test_s.py:2: AssertionError\n"
+              "___ test_x ___\nE b.a.test_s.MissingDependency: missing\nb/a/test_s.py:3: MissingDependency\n"
+              "___ test_expected ___\nE assert False\ntest_ok.py:1: AssertionError\n=== short test summary info ===\n"
+              "FAILED a/test_s.py::test_x - assert False\n"
+              "FAILED b/a/test_s.py::test_x - b.a.test_s.MissingDependency: missing\n"
+              "FAILED test_ok.py::test_expected - assert False\n=== 3 failed in 0.1s ===\n")
+    DUPE = ("=== FAILURES ===\n___ test_x ___\nE test_dupe.MissingDependency: missing\ntest_dupe.py:5: MissingDependency\n"
+            "___ test_x ___\nE assert False\ntest_dupe.py:6: AssertionError\n=== short test summary info ===\n"
+            "FAILED test_dupe.py::test_x - test_dupe.MissingDependency: missing\n"
+            "FAILED test_dupe.py::test_x - assert False\n=== 2 failed in 0.1s ===\n")
+
+    def _could_not_check(self, text: str, expected: str, *needles: str) -> str:
+        status, reason = rmv.verdict(text, expected)
+        self.assertEqual(status, rmv.REFUSED, reason)
+        self.assertTrue(reason.startswith("COULD-NOT-CHECK"), reason)
+        for needle in needles:
+            self.assertIn(needle, reason)
+        return reason
+
+    def test_r9_a1_suffix_related_files_sharing_a_test_name_are_could_not_check(self) -> None:
+        self._could_not_check(self.SUFFIX, "test_ok.py:1", "a/test_s.py::test_x", "b/a/test_s.py::test_x")
+        shallow = self.SUFFIX.replace("b/a/test_s.py", "b/test_s.py").replace("a/test_s.py", "test_s.py")
+        self._could_not_check(shallow, "test_ok.py:1", "test_s.py::test_x", "b/test_s.py::test_x")
+
+    def test_r9_a1_class_row_suffix_related_files_with_the_same_exception_type(self) -> None:
+        same = self.SUFFIX.replace("E b.a.test_s.MissingDependency: missing\nb/a/test_s.py:3: MissingDependency",
+                                   "E assert False\nb/a/test_s.py:3: AssertionError").replace(
+            "b/a/test_s.py::test_x - b.a.test_s.MissingDependency: missing", "b/a/test_s.py::test_x - assert False")
+        self._could_not_check(same, "test_ok.py:1", "a/test_s.py::test_x", "b/a/test_s.py::test_x")
+
+    def test_r9_a1_control_files_that_are_not_suffix_related_still_pair(self) -> None:
+        apart = self.SUFFIX.replace("b/a/test_s.py", "b/test_s.py")  # a/test_s.py and b/test_s.py: two files, one each
+        reason = self._could_not_check(apart, "test_ok.py:1", "exception type")  # the custom type still blocks
+        self.assertNotIn("pairing", reason)
+        clean = apart.replace("E b.a.test_s.MissingDependency: missing\nb/test_s.py:3: MissingDependency",
+                              "E assert False\nb/test_s.py:3: AssertionError").replace(
+            "b/test_s.py::test_x - b.a.test_s.MissingDependency: missing", "b/test_s.py::test_x - assert False")
+        self.assertEqual(rmv.verdict(clean, "test_ok.py:1")[0], rmv.PASS)
+        self.assertEqual(rmv.verdict(clean, "b/test_s.py:3")[0], rmv.PASS)
+
+    def test_r9_a2_a_repeated_node_id_is_could_not_check(self) -> None:
+        self._could_not_check(self.DUPE, "test_dupe.py:6", "test_dupe.py::test_x")
+        swapped = self.DUPE.replace("FAILED test_dupe.py::test_x - test_dupe.MissingDependency: missing\n"
+                                    "FAILED test_dupe.py::test_x - assert False\n",
+                                    "FAILED test_dupe.py::test_x - assert False\n"
+                                    "FAILED test_dupe.py::test_x - test_dupe.MissingDependency: missing\n")
+        self._could_not_check(swapped, "test_dupe.py:6", "test_dupe.py::test_x")
+
+    def test_r9_a2_class_row_a_repeated_node_id_with_the_same_message(self) -> None:
+        same = ("=== FAILURES ===\n___ test_x ___\nE assert False\ntest_dupe.py:5: AssertionError\n"
+                "___ test_x ___\nE assert False\ntest_dupe.py:6: AssertionError\n=== short test summary info ===\n"
+                "FAILED test_dupe.py::test_x - assert False\nFAILED test_dupe.py::test_x - assert False\n"
+                "=== 2 failed in 0.1s ===\n")
+        self._could_not_check(same, "test_dupe.py:6", "test_dupe.py::test_x")
+        self._could_not_check(same, "test_dupe.py::test_x", "test_dupe.py::test_x")  # by id, too
+
+    # Structure 1: the text is framed ONCE at entry; a line boundary other than LF / CRLF is COULD-NOT-CHECK.
+    UT_GREEN = ("=" * 70 + "\nFAIL: test_x (t.T.test_x)\n" + "-" * 70 + "\nTraceback (most recent call last):\n"
+                '  File "t.py", line 2, in test_x\nAssertionError: no\n\nRan 1 test in 0.0s\n\nOK\n')
+    FOREIGN = ("\x0b", "\x0c", "\x1c", "\x1d", "\x1e", "\x85", " ", " ", "\r")
+
+    def test_r9_a3_a_foreign_line_boundary_is_could_not_check(self) -> None:
+        zero = self.UT_GREEN.replace("OK\n", "FAILED (failures=0)\n")
+        for sep in self.FOREIGN:
+            for text in (self.UT_GREEN, zero):
+                with self.subTest(sep=f"U+{ord(sep):04X}", tail=text[-8:]):
+                    self._could_not_check(text.replace("\n", sep), "t.py:2", f"U+{ord(sep):04X}")
+
+    def test_r9_a3_one_foreign_boundary_anywhere_refuses_the_whole_run(self) -> None:
+        red = self.UT_GREEN.replace("OK\n", "FAILED (failures=1)\n")
+        self.assertEqual(rmv.verdict(red, "t.py:2")[0], rmv.PASS)
+        for sep in self.FOREIGN:
+            with self.subTest(sep=f"U+{ord(sep):04X}"):
+                self._could_not_check(red.replace("AssertionError: no", "AssertionError: n" + sep + "o"), "t.py:2",
+                                      f"U+{ord(sep):04X}")
+
+    def test_r9_a3_lf_and_crlf_controls_keep_their_r8_verdicts(self) -> None:
+        red = self.UT_GREEN.replace("OK\n", "FAILED (failures=1)\n")
+        zero = self.UT_GREEN.replace("OK\n", "FAILED (failures=0)\n")
+        for eol in ("\n", "\r\n"):
+            with self.subTest(eol=repr(eol)):
+                self.assertEqual(rmv.verdict(red.replace("\n", eol), "t.py:2")[0], rmv.PASS)
+                status, reason = rmv.verdict(self.UT_GREEN.replace("\n", eol), "t.py:2")
+                self.assertEqual(status, rmv.REFUSED, reason)
+                self.assertIn("green", reason)
+                status, reason = rmv.verdict(zero.replace("\n", eol), "t.py:2")
+                self.assertEqual(status, rmv.REFUSED, reason)
+                self.assertIn("COULD-NOT-CHECK", reason)
+                self.assertIn("counts 0", reason)
+                pt = "=== FAILURES ===\n___ test_x ___\nE assert False\nt.py:2: AssertionError\n=== 1 failed in 0.1s ===\n"
+                self.assertEqual(rmv.verdict(pt.replace("\n", eol), "t.py:2")[0], rmv.PASS)
+
+    def test_r9_the_foreign_boundary_set_is_exactly_what_splitlines_splits_on(self) -> None:
+        splits = {chr(c) for c in range(0x110000)
+                  if not 0xD800 <= c <= 0xDFFF and len(("a" + chr(c) + "b").splitlines()) > 1}
+        self.assertEqual(splits - {"\n"}, set(self.FOREIGN))
+        self.assertEqual(set(rmv._FOREIGN_BREAKS), set(self.FOREIGN))
+
+    def test_r9_every_reader_uses_the_one_framing(self) -> None:
+        # No reader may split or anchor on the raw text again: one helper frames it, and every check reads its lines.
+        src = Path(rmv.__file__).read_text(encoding="utf-8")
+        code = src.split('"""', 2)[2]  # past the module docstring
+        self.assertNotIn(".splitlines(", code)
+        self.assertNotIn("re.M", code)
+        self.assertNotIn("re.MULTILINE", code)
+        self.assertEqual(code.count('.split("\\n")'), 1, "only _frame splits the text into lines")
+
+    def test_r9_the_cli_refuses_a_saved_file_with_a_vertical_tab(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp, "red.txt")
+            out.write_text(self.UT_GREEN.replace("\n", "\x0b"), encoding="utf-8", newline="")
+            proc = subprocess.run([sys.executable, str(Path(rmv.__file__)), "verdict", "--output", str(out),
+                                   "--expect", "t.py:2"], text=True, capture_output=True, timeout=60)
+        self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+        self.assertIn("COULD-NOT-CHECK", proc.stdout)
+        self.assertIn("U+000B", proc.stdout)
+
 
 class CliTypedErrors(unittest.TestCase):
     def test_missing_output_file_exits_2_with_a_message_not_a_traceback(self) -> None:
