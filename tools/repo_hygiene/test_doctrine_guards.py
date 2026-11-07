@@ -72,10 +72,11 @@ NON-PROMISES:
   ls-files` subprocess, a shell hook (.sh, .cmd), and a hook script that lives outside tools/hooks/
   (user-scope hooks are never tracked; prove those by a receipt).
 - DG-RED-MUTATION-VERDICT checks the CHECKER, not any mutation run: the tracked corpus
-  tools/repo_hygiene/red_mutation_verdict_corpus.json pins what red_mutation_verdict.verdict() and
+  tools/repo_hygiene/red_mutation_verdict_corpus.json pins what red_mutation_verdict.classify() and
   probe_discriminates() must answer for every tracked case (the PR #705 probes among them, at the readings measured in
   powershell.exe 5.1), and the guard fails when one answer drifts, when a REFUSED case is refused for a reason other than
-  the `reason` it records (a substring of the refusal; a REFUSED case with no `reason` is a malformed corpus), or when the
+  the `reason` it records (a substring of the PRIMARY refusal, never of a secondary `; also:` diagnostic; a REFUSED case
+  with no `reason` is a malformed corpus), or when the
   corpus holds no PASS or no REFUSED case of a kind. Saved mutation output lives in
   untracked .claude-state run dirs, so there is no live-tree evidence to scan; a lane runs
   `py -3 tools/repo_hygiene/red_mutation_verdict.py verdict --output red.txt --expect <file:line>` on its own
@@ -711,26 +712,32 @@ def check_red_mutation_verdict(root: Path, rel_paths: list[str]) -> list[Violati
                 if kind == "verdict":
                     if not isinstance(case["output"], str) or not isinstance(case["expected_assertion"], str):
                         raise TypeError("output and expected_assertion must be strings")
-                    got, why = red_mutation_verdict.verdict(case["output"], case["expected_assertion"])
+                    # r10 R8-T1: the recorded reason is matched against the PRIMARY reason only. The `; also:`
+                    # diagnostics are shown in a violation but never satisfy a reason (a semantic reason found in
+                    # one would hide the format refusal that actually decided the case).
+                    v = red_mutation_verdict.classify(case["output"], case["expected_assertion"])
+                    got, why, also = v.status, v.reason, v.also
                 elif kind == "probe":
                     window = case["window"]
                     if not isinstance(window, list) or len(window) != 2:
                         raise TypeError(f"window must be a list of two bounds, got {window!r}")
                     ok, why = red_mutation_verdict.probe_discriminates(
                         case["bug_value"], case["fix_value"], tuple(window))
-                    got = red_mutation_verdict.PASS if ok else red_mutation_verdict.REFUSED
+                    got, also = (red_mutation_verdict.PASS if ok else red_mutation_verdict.REFUSED), ()
                 else:
                     raise ValueError(f"unknown kind {kind!r}")
             except (KeyError, TypeError, ValueError) as exc:
                 raise CouldNotCheck(f"{rel} case {index} is malformed: {exc!r}") from exc
             seen.add((kind, want))
+            shown = why + "".join(f"; also: {a}" for a in also)
             if got != want:
                 out.append(Violation("DG-RED-MUTATION-VERDICT", rel, index,
-                                     f"case {case.get('id')!r}: expected {want}, checker said {got} ({why})"))
+                                     f"case {case.get('id')!r}: expected {want}, checker said {got} ({shown})"))
             elif want == red_mutation_verdict.REFUSED and reason not in why:
+                where = " (it appears only in a secondary `; also:` diagnostic)" if any(reason in a for a in also) else ""
                 out.append(Violation("DG-RED-MUTATION-VERDICT", rel, index,
-                                     f"case {case.get('id')!r}: refused, but not for its recorded reason {reason!r} "
-                                     f"(checker said: {why})"))
+                                     f"case {case.get('id')!r}: refused, but not for its recorded reason {reason!r}{where}; "
+                                     f"primary reason: {shown}"))
         for kind in ("verdict", "probe"):
             for want in (red_mutation_verdict.PASS, red_mutation_verdict.REFUSED):
                 if (kind, want) not in seen:
@@ -1014,7 +1021,10 @@ FIXTURES: dict[str, dict[str, dict[str, str]]] = {
                             "    self.assertEqual(3, 4)\nAssertionError: 3 != 4\n\n" + "-" * 70
                             + "\nRan 1 test in 0.001s\n\nFAILED (failures=1)\n"),
                  "expected_assertion": "t.py:8"},
-                {"id": "red-no-assertion", "kind": "verdict", "expect": "REFUSED", "reason": "names no failing assertion",
+                # FORMAT NEGATIVE (r10 R8-T1): the count precheck is the primary refusal; "names no failing assertion"
+                # is only its `; also:` diagnostic, which never satisfies a recorded reason.
+                {"id": "red-no-assertion", "kind": "verdict", "expect": "REFUSED",
+                 "reason": "the runner counts 1 failing unittest tests but 0 failure blocks were readable",
                  "output": "Ran 1 test in 0.001s\n\nFAILED (failures=1)\n", "expected_assertion": "t.py:8"},
                 {"id": "probe-705-display-rounded", "kind": "probe", "expect": "REFUSED", "reason": "both sit inside",
                  "bug_value": 3, "fix_value": 3, "window": [3, 3]},

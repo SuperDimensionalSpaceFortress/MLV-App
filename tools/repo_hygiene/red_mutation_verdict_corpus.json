@@ -65,11 +65,11 @@
   {
    "id": "ut-red-names-no-assertion",
    "kind": "verdict",
-   "why": "bare FAILED trailer with no block",
+   "why": "FORMAT NEGATIVE: bare FAILED trailer with no block. The count precheck refuses it first (1 counted, 0 blocks read); 'names no failing assertion' is only its secondary '; also:' diagnostic, which never satisfies a reason (r10 R8-T1)",
    "output": "Ran 1 test in 0.000s\n\nFAILED (failures=1)\n",
    "expected_assertion": "test_s.py:8",
    "expect": "REFUSED",
-   "reason": "names no failing assertion"
+   "reason": "the runner counts 1 failing unittest tests but 0 failure blocks were readable"
   },
   {
    "id": "unrecognized-output",

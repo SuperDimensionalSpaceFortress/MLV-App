@@ -88,6 +88,9 @@ REFUSED with a reason that starts ``COULD-NOT-CHECK (<typed reason>)``. That is 
 
 A refusal is checked BEFORE the older reasons and the older reason is appended (``; also: ...``), so a
 refusal that was already a refusal stays one. Only a PASS can be changed by this section, and only to REFUSED.
+The refusal is the PRIMARY reason and the appended text is a secondary diagnostic: ``classify()`` returns them as
+separate fields (``Verdict.reason``, ``Verdict.also``), and a check that pins why a case was refused matches the primary
+reason only (r10, Dot R8-T1). ``verdict()`` joins them into one text for display.
 
 NON-PROMISES:
 - It reads text. It cannot tell that the saved output came from a run of the mutated
@@ -894,9 +897,27 @@ def _precheck(lines: list[str] | None, expected: str) -> str:
     return parse_run(lines).mismatch
 
 
+@dataclass(frozen=True)
+class Verdict:
+    """One classification. ``reason`` is the PRIMARY reason, the one the status was decided for. ``also`` holds the
+    secondary diagnostics: what the older checks would have said about text the precheck already refused. A diagnostic
+    never decides anything, so a check that pins WHY a run was refused reads ``reason`` only (r10, Dot R8-T1: a
+    semantic reason matched inside an appended diagnostic hid the format refusal that actually decided the case)."""
+    status: str
+    reason: str
+    also: tuple[str, ...] = ()
+
+
 def verdict(output: str, expected: str) -> tuple[str, str]:
-    """Return (PASS|REFUSED, reason). PASS only when `expected` is an assertion that failed. Text it cannot classify
-    with certainty is REFUSED with a reason that starts ``COULD-NOT-CHECK`` (NARROWED PROMISE, module docstring)."""
+    """Return (PASS|REFUSED, text): the primary reason, then each diagnostic after ``; also: `` (see classify). PASS
+    only when `expected` is an assertion that failed. Text it cannot classify with certainty is REFUSED with a reason
+    that starts ``COULD-NOT-CHECK`` (NARROWED PROMISE, module docstring). For display: match a reason on classify()."""
+    v = classify(output, expected)
+    return v.status, v.reason + "".join(f"; also: {a}" for a in v.also)
+
+
+def classify(output: str, expected: str) -> Verdict:
+    """The verdict with its primary reason and its secondary diagnostics kept apart (see Verdict)."""
     pre, status, reason = "", REFUSED, ""
     try:
         lines = _frame(output) if isinstance(output, str) else None  # the ONE framing; every reader gets these lines
@@ -904,12 +925,12 @@ def verdict(output: str, expected: str) -> tuple[str, str]:
         status, reason = _verdict(lines, expected)
     except _Unclassifiable as exc:
         # a count or summary problem found by the precheck is the more basic one: it leads, the other follows
-        return REFUSED, f"COULD-NOT-CHECK ({pre or exc})" + (f"; also: {exc}" if pre else "")
+        return Verdict(REFUSED, f"COULD-NOT-CHECK ({pre or exc})", (str(exc),) if pre else ())
     except Exception as exc:  # noqa: BLE001 - the promise is a refusal, never an uncaught traceback
-        return REFUSED, f"COULD-NOT-CHECK (internal-error {type(exc).__name__} while reading the text)"
+        return Verdict(REFUSED, f"COULD-NOT-CHECK (internal-error {type(exc).__name__} while reading the text)")
     if pre:
-        return REFUSED, f"COULD-NOT-CHECK ({pre})" + (f"; also: {reason}" if status == REFUSED else "")
-    return status, reason
+        return Verdict(REFUSED, f"COULD-NOT-CHECK ({pre})", (reason,) if status == REFUSED else ())
+    return Verdict(status, reason)
 
 
 def _verdict(lines: list[str] | None, expected: str) -> tuple[str, str]:

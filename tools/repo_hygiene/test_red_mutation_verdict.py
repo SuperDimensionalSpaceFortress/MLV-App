@@ -35,6 +35,13 @@ def _run_unittest(files: dict[str, str], target: str) -> str:
     return _raw_text(proc)
 
 
+def _primary(output: str, expected: str) -> tuple[str, str]:
+    """(status, PRIMARY reason). A test that checks WHY a run was refused reads this, never verdict()'s joined text:
+    a word found only in an ``; also:`` diagnostic would pass while another refusal decided the case (r10, Dot R8-T1)."""
+    v = rmv.classify(output, expected)
+    return v.status, v.reason
+
+
 def _raw_text(proc: subprocess.CompletedProcess) -> str:
     """stdout + stderr decoded WITHOUT newline translation (r9 adversary A1 sibling): the text a saved file of the run
     holds, so verdict() frames the runner's own line ends (CRLF on Windows). Strict UTF-8 (adversary pass 2, A2
@@ -156,7 +163,7 @@ class AdversaryR3(unittest.TestCase):
     """Adversary pass r3 on ddbcb1a7: eight forged-output classes, each fed REAL runner output."""
 
     def refused(self, out: str, want: str, *, word: str = "") -> None:
-        status, reason = rmv.verdict(out, want)
+        status, reason = _primary(out, want)
         self.assertEqual(status, rmv.REFUSED, f"{want}: {reason}\n{out}")
         if word:
             self.assertIn(word, reason)
@@ -211,7 +218,12 @@ class AdversaryR3(unittest.TestCase):
         src = ("import unittest\nclass T(unittest.TestCase):\n def test_x(self): self.assertEqual(1,2)\n"
                " def test_imp(self):\n  try: raise ValueError('bad\\n'+'='*70+'\\nnot-a-header')\n"
                "  except ValueError: raise ImportError('missing')\n")
-        self.refused(_run_unittest({"test_delimiter.py": src}, "test_delimiter"), "test_delimiter.T.test_x", word="import")
+        # r10 R8-T1: the chain is refused first (its primary reason); the import error is only its diagnostic
+        self.refused(_run_unittest({"test_delimiter.py": src}, "test_delimiter"), "test_delimiter.T.test_x", word="chained")
+        # the same rule inside an unchained import error's own message: the block is still read, the import error found
+        plain = ("import unittest\nclass T(unittest.TestCase):\n def test_x(self): self.assertEqual(1,2)\n"
+                 " def test_imp(self): raise ImportError('missing\\n'+'='*70+'\\nnot-a-header')\n")
+        self.refused(_run_unittest({"test_delimiter.py": plain}, "test_delimiter"), "test_delimiter.T.test_x", word="import")
 
     def test_a8_parentheses_in_a_method_name_do_not_invent_an_identity(self) -> None:
         src = ("import unittest\nclass T(unittest.TestCase):\n def f(self): self.assertEqual(1,2)\n"
@@ -304,7 +316,7 @@ class NarrowedPromiseR4(unittest.TestCase):
     (A1-A6), each fed REAL runner output; the answer is COULD-NOT-CHECK, never a PASS and never a guess."""
 
     def cnc(self, out: str, want: str, word: str) -> None:
-        status, reason = rmv.verdict(out, want)
+        status, reason = _primary(out, want)
         self.assertEqual(status, rmv.REFUSED, f"{want}: {reason}\n{out}")
         self.assertIn("COULD-NOT-CHECK", reason, out)
         self.assertIn(word, reason, out)
@@ -493,7 +505,7 @@ class NarrowedPromiseR4(unittest.TestCase):
             self.cnc(top + lines + bar + "\n", "test_s.py::T::test_a", "short-summary line")
         cut = top + "FAILED test_s.py::T::test_a - Assertio...\n=== 1 failed in 0.1s ===\n"  # type cut off
         self.assertEqual(rmv.verdict(cut, "test_s.py::T::test_a")[0], rmv.REFUSED)
-        self.assertIn("COULD-NOT-CHECK", rmv.verdict(cut, "test_s.py::T::test_a")[1])
+        self.assertIn("COULD-NOT-CHECK", _primary(cut, "test_s.py::T::test_a")[1])
         green = top + ok + "=== 1 failed in 0.1s ===\n"
         self.assertEqual(rmv.verdict(green, "test_s.py::T::test_a")[0], rmv.PASS, green)
         plain = _run_pytest({"test_memory.py": "def test_assert(): assert False\n"}, "--tb=no")
@@ -590,7 +602,7 @@ class AllowlistR7(unittest.TestCase):
     WIDTHS = (80, 200)
 
     def cnc(self, out: str, want: str, word: str) -> None:
-        status, reason = rmv.verdict(out, want)
+        status, reason = _primary(out, want)
         self.assertEqual(status, rmv.REFUSED, f"{want}: {reason}\n{out}")
         self.assertIn("COULD-NOT-CHECK", reason, out)
         self.assertIn(word, reason, out)
@@ -778,9 +790,12 @@ class AllowlistR7(unittest.TestCase):
 
 class VerdictOnText(unittest.TestCase):
     def test_red_without_a_named_assertion_is_refused(self) -> None:
-        status, reason = rmv.verdict("Ran 3 tests in 0.1s\n\nFAILED (failures=1)\n", "a.py:1")
-        self.assertEqual(status, rmv.REFUSED)
-        self.assertIn("names no failing assertion", reason)
+        # r10 R8-T1: the count precheck decides this text (its primary reason); "names no failing assertion" is only
+        # the secondary diagnostic, so it is checked there and never as the reason
+        got = rmv.classify("Ran 3 tests in 0.1s\n\nFAILED (failures=1)\n", "a.py:1")
+        self.assertEqual(got.status, rmv.REFUSED)
+        self.assertIn("0 failure blocks were readable", got.reason)
+        self.assertTrue(any("names no failing assertion" in a for a in got.also), got)
 
     def test_missing_expectation_is_refused(self) -> None:
         self.assertEqual(rmv.verdict("Ran 1 test\n\nOK\n", "  ")[0], rmv.REFUSED)
@@ -984,7 +999,7 @@ class VerdictOnText(unittest.TestCase):
             "FAILED test_dupe.py::test_x - assert False\n=== 2 failed in 0.1s ===\n")
 
     def _could_not_check(self, text: str, expected: str, *needles: str) -> str:
-        status, reason = rmv.verdict(text, expected)
+        status, reason = _primary(text, expected)
         self.assertEqual(status, rmv.REFUSED, reason)
         self.assertTrue(reason.startswith("COULD-NOT-CHECK"), reason)
         for needle in needles:
