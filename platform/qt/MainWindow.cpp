@@ -3226,7 +3226,8 @@ void MainWindow::resizeEvent(QResizeEvent *event)
             // change the scene (adversary r1 pass 3 A1). Armed after the wait, so a frame landing inside a pump cannot
             // consume it early; a spare redraw on an unchanged scene places the overlay where it already is.
             m_zoomModeChanged = true;
-            m_gradientReanchorSerialFloor = gradientReanchorSerialFloor;
+            // Raise, never lower: a geometry change dispatched inside the wait above armed a newer floor (adversary r2 pass 2 A1).
+            m_gradientReanchorSerialFloor = resize_still_drawing_wait::raisedReanchorFloor( m_gradientReanchorSerialFloor, gradientReanchorSerialFloor );
         }
     }
     event->accept();
@@ -22317,7 +22318,8 @@ void MainWindow::on_actionZoomFit_triggered(bool on)
         m_frameChanged = true;
     }
     m_zoomModeChanged = true;
-    m_gradientReanchorSerialFloor = m_nextRenderRequestSerial; // only a frame requested from here re-anchors (adversary r2 A2)
+    m_gradientReanchorSerialFloor = resize_still_drawing_wait::raisedReanchorFloor( m_gradientReanchorSerialFloor,
+                                                                                 m_nextRenderRequestSerial ); // adversary r2 A2
 }
 
 //Click on Zoom: 100%
@@ -35300,7 +35302,8 @@ void MainWindow::on_comboBoxHStretch_currentIndexChanged(int index)
     if( !m_inOpeningProcess && !m_setSliders ) on_horizontalSliderVignetteRadius_valueChanged( ui->horizontalSliderVignetteRadius->value() );
     resultingResolution();
     m_zoomModeChanged = true;
-    m_gradientReanchorSerialFloor = m_nextRenderRequestSerial; // only a frame requested from here re-anchors (adversary r2 A2)
+    m_gradientReanchorSerialFloor = resize_still_drawing_wait::raisedReanchorFloor( m_gradientReanchorSerialFloor,
+                                                                                 m_nextRenderRequestSerial ); // adversary r2 A2
     m_frameChanged = true;
 }
 
@@ -35312,7 +35315,8 @@ void MainWindow::on_comboBoxVStretch_currentIndexChanged(int index)
     if( !m_inOpeningProcess && !m_setSliders ) on_horizontalSliderVignetteRadius_valueChanged( ui->horizontalSliderVignetteRadius->value() );
     resultingResolution();
     m_zoomModeChanged = true;
-    m_gradientReanchorSerialFloor = m_nextRenderRequestSerial; // only a frame requested from here re-anchors (adversary r2 A2)
+    m_gradientReanchorSerialFloor = resize_still_drawing_wait::raisedReanchorFloor( m_gradientReanchorSerialFloor,
+                                                                                 m_nextRenderRequestSerial ); // adversary r2 A2
     m_frameChanged = true;
 }
 
