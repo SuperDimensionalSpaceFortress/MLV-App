@@ -126,8 +126,11 @@ NON-PROMISES:
   defended, because the text is identical to what a genuine run prints: a test that forges its own node ids and
   whose run also hides the outcome it replaces (for example ``-rp`` listing a forged FAILED line while the real
   failure goes unlisted, which the counts, the order and the shapes cannot tell from a genuine ``-rpf`` run), and a
-  class that sets ``__module__ = 'builtins'`` so that it prints unqualified (``AssertionError`` that is an
-  ``ImportError``). Forgery shapes go to the P3 follow-up card, not to another round. Also not defended: an exception message that itself prints a complete
+  class that prints under a builtin's bare name while it is something else: one that sets
+  ``__module__ = 'builtins'``, and one DEFINED IN ``__main__`` (a test file run as a script, ``python test_x.py``),
+  because traceback and pytest print a ``__main__`` class unqualified too (an ``AssertionError`` or a ``TypeError``
+  that is an ``ImportError``; r9 and r10 adversary A2). Its line is the builtin's line, character for character, so
+  no reading of the text can refuse it without refusing the builtin. Forgery shapes go to the P3 follow-up card, not to another round. Also not defended: an exception message that itself prints a complete
   unittest block header (rule of ``=``, ``FAIL:``/``ERROR:`` line, rule of ``-``); a pytest test whose
   FUNCTION NAME holds `` - `` (set through ``globals()``), which a ``--tb=no`` summary line cannot tell from a
   message; a directory name holding ``[`` (read as the start of a parameter id). An ``ImportError`` named
@@ -316,10 +319,17 @@ def _split_top(text: str, sep: str) -> list[str]:
     return [p for p in parts if p]
 
 
-def _segs(text: str) -> list[str]:
-    """Segments of a test id, lossless for its own syntax: pytest `dir/file.py::Class::name[param]`
-    gives path parts (the .py suffix dropped) then the names; unittest `module.Class.method` gives
-    its dotted parts. Separators inside `[...]` never split."""
+_DIR, _FILE, _NAME, _ANY = "dir", "file", "name", "any"  # the KIND of an identity segment (r10 adversary A1)
+
+
+def _segs(text: str) -> list[tuple[str, str]]:
+    """Segments of a test id, lossless for its own syntax, each as (kind, text). A pytest node
+    `dir/file.py::Class::name[param]` gives typed parts: directories, the file (its .py suffix dropped), then the
+    names. A unittest `module.Class.method`, a pytest section title `Class.name`, or a `::` id whose head names no .py
+    file gives untyped (_ANY) parts: the text alone does not say where a module ends and a class begins. Separators
+    inside `[...]` never split.
+    KINDS (r10 adversary A1): the `.py` suffix used to be dropped and the kind forgotten, so a class `TestOther` in
+    test_s.py satisfied the expectation `TestOther.py::test_x`, which names another FILE. See _id_ends_with."""
     if "::" in text:
         parts = _split_top(text, "::")
         if not parts:
@@ -327,14 +337,27 @@ def _segs(text: str) -> list[str]:
         head, names = parts[0], parts[1:]
         path = _norm_path(head)
         if path and path[-1].endswith(".py") and len(path[-1]) > 3:
-            path[-1] = path[-1][:-3]
-        return path + names
+            return ([(_DIR, p) for p in path[:-1]] + [(_FILE, path[-1][:-3])] + [(_NAME, n) for n in names])
+        return [(_ANY, p) for p in path + names]
     if len(_norm_path(text)) > 1:
         path = _norm_path(text)
         if path and path[-1].endswith(".py") and len(path[-1]) > 3:
-            path[-1] = path[-1][:-3]
-        return path
-    return _split_top(text, ".")
+            return [(_DIR, p) for p in path[:-1]] + [(_FILE, path[-1][:-3])]
+        return [(_ANY, p) for p in path]
+    return [(_ANY, p) for p in _split_top(text, ".")]
+
+
+def _id_ends_with(whole: list[tuple[str, str]], tail: list[tuple[str, str]]) -> bool:
+    """_ends_with for typed id segments. Texts must be equal. An untyped segment of the EXPECTATION matches a
+    segment of any kind (it says no more than its text). A typed one (a directory, a file, a name) matches only a
+    segment of the same kind: the run's id must say the same thing, so a typed expectation never matches an untyped
+    unittest id, whose module/class boundary the text does not show (fail closed: REFUSED, never a guessed PASS)."""
+    if not whole or not tail or len(tail) > len(whole):
+        return False
+    for (t_kind, t_text), (w_kind, w_text) in zip(tail, whole[-len(tail):]):
+        if t_text != w_text or (t_kind != _ANY and t_kind != w_kind):
+            return False
+    return True
 
 
 def _parse_summary_line(line: str, word: str) -> tuple[str, str, bool] | None:
@@ -469,10 +492,10 @@ def _same_file(a: list[str], b: list[str]) -> bool:
     return _ends_with(a, b) or _ends_with(b, a)
 
 
-def _pair_nodes(want: list[str], frames: list[tuple[str, int]], nodes: list[str]) -> list[int]:
+def _pair_nodes(want: list[tuple[str, str]], frames: list[tuple[str, int]], nodes: list[str]) -> list[int]:
     """Indices of the FAILED occurrences (`nodes`, in summary order) a section with test name `want` and traceback
     `frames` may be. More than one is an ambiguous pairing, which the caller refuses (r9 hub ruling)."""
-    cands = [i for i, n in enumerate(nodes) if _ends_with(_segs(n), want)]
+    cands = [i for i, n in enumerate(nodes) if _id_ends_with(_segs(n), want)]
     if frames:
         def in_file(n: str, file: str) -> bool:
             return _same_file(_norm_path(_split_top(n, "::")[0]), _norm_path(file))
@@ -878,7 +901,7 @@ def _matches(failure: Failure, expected: str) -> bool:
         return any(line == want_line and _ends_with(_norm_path(file), want_file)
                    for file, line in failure.frames)
     want = _segs(expected)
-    return any(_ends_with(_segs(i), want) for i in failure.ids)
+    return any(_id_ends_with(_segs(i), want) for i in failure.ids)
 
 
 def _precheck(lines: list[str] | None, expected: str) -> str:

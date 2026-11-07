@@ -1130,6 +1130,35 @@ class VerdictOnText(unittest.TestCase):
         self.assertEqual((got.status, got.also), (rmv.REFUSED, ()), got)
         self.assertIn("internal-error", got.reason)
 
+    # ---- r10 adversary A1 (ee9972d8): a segment's KIND is part of the identity ------------------------------------
+    def test_r10_a1_a_class_name_does_not_satisfy_a_file_qualified_expectation(self) -> None:
+        def pt(node: str) -> str:
+            return f"=== short test summary info ===\nFAILED {node} - assert False\n=== 1 failed in 0.1s ===\n"
+
+        for node, expected in (("test_s.py::TestOther::test_x", "TestOther.py::test_x"),       # the finding's input
+                               ("q/dir.py::TestOther::test_x", "dir/TestOther.py::test_x"),    # a file named as a dir
+                               ("a.py::test_s::test_x", "a/test_s.py::test_x"),                # a dir named as a file
+                               ("pkg/test_s.py::test_x", "pkg.py::test_x")):                   # a dir as the file
+            status, reason = _primary(pt(node), expected)
+            self.assertEqual(status, rmv.REFUSED, (node, expected, reason))
+            self.assertIn("the run is red but not at", reason, (node, expected))
+        # controls: an expectation that says no more than the run still matches it
+        for expected in ("test_s.py::TestOther::test_x", "TestOther::test_x", "TestOther.test_x", "test_x",
+                         "test_s.TestOther.test_x"):
+            self.assertEqual(rmv.verdict(pt("test_s.py::TestOther::test_x"), expected)[0], rmv.PASS, expected)
+        self.assertEqual(rmv.verdict(pt("q/dir.py::TestOther::test_x"), "q/dir.py::TestOther::test_x")[0], rmv.PASS)
+
+    def test_r10_a1_a_file_qualified_expectation_never_matches_an_untyped_unittest_id(self) -> None:
+        # a unittest header prints `module.Class.method`: where the module ends is not in the text, so a FILE-qualified
+        # expectation is refused (fail closed), while the dotted forms still match
+        ut = ("=" * 70 + "\nFAIL: test_x (test_s.TestOther.test_x)\n" + "-" * 70 + "\n"
+              "Traceback (most recent call last):\n  File \"test_s.py\", line 4, in test_x\n"
+              "    self.assertEqual(1, 2)\nAssertionError: 1 != 2\n\n" + "-" * 70
+              + "\nRan 1 test in 0.001s\n\nFAILED (failures=1)\n")
+        self.assertEqual(_primary(ut, "TestOther.py::test_x")[0], rmv.REFUSED)
+        for expected in ("test_s.TestOther.test_x", "TestOther.test_x", "test_x", "test_s.py:4"):
+            self.assertEqual(rmv.verdict(ut, expected)[0], rmv.PASS, expected)
+
     def test_r10_cli_still_prints_the_whole_text(self) -> None:
         malformed = ("=== short test summary info ===\nFAILED t.py::test_x - assert False\n"
                      "=== 1 failed, 1 passed in 0.1s ===\n")
