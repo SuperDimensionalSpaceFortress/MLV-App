@@ -73,10 +73,11 @@ NON-PROMISES:
   (user-scope hooks are never tracked; prove those by a receipt).
 - DG-RED-MUTATION-VERDICT checks the CHECKER, not any mutation run: the tracked corpus
   tools/repo_hygiene/red_mutation_verdict_corpus.json pins what red_mutation_verdict.classify() and
-  probe_discriminates() must answer for every tracked case (the PR #705 probes among them, at the readings measured in
-  powershell.exe 5.1), and the guard fails when one answer drifts, when a REFUSED case is refused for a reason other than
-  the `reason` it records (a substring of the PRIMARY refusal, never of a secondary `; also:` diagnostic; a REFUSED case
-  with no `reason` is a malformed corpus), or when the
+  probe_classify() must answer for every tracked case (the PR #705 probes among them, at the readings measured in
+  powershell.exe 5.1), and the guard fails when one answer drifts, when a case is answered with a reason CODE other than
+  the `code` it records (the checker's own name for the PRIMARY reason, red_mutation_verdict.REASON_CODES; compared as a
+  code, never as text, because a reason's text quotes its input: r11; a REFUSED case with no known `code`, or one still
+  holding the retired text `reason`, is a malformed corpus), or when the
   corpus holds no PASS or no REFUSED case of a kind. Saved mutation output lives in
   untracked .claude-state run dirs, so there is no live-tree evidence to scan; a lane runs
   `py -3 tools/repo_hygiene/red_mutation_verdict.py verdict --output red.txt --expect <file:line>` on its own
@@ -705,49 +706,43 @@ def check_red_mutation_verdict(root: Path, rel_paths: list[str]) -> list[Violati
                 kind, want = case["kind"], case["expect"]
                 if want not in (red_mutation_verdict.PASS, red_mutation_verdict.REFUSED):
                     raise ValueError(f"expect must be PASS or REFUSED, got {want!r}")
-                reason = case.get("reason")
-                if want == red_mutation_verdict.REFUSED and (not isinstance(reason, str) or not reason.strip()):
+                # r11 (r10 adversary A2): a case pins WHY by the checker's reason CODE, never by text. A reason's text
+                # quotes its input (an id, a node, repr() of a name), so any substring check of it can be satisfied by
+                # that input. `reason` (the r8-r10 text pin) is retired: a case still holding one is malformed.
+                if "reason" in case:
+                    raise ValueError("`reason` is retired (r11): record the checker's `code` "
+                                     "(red_mutation_verdict.REASON_CODES), which no input text can supply")
+                code = case.get("code")
+                if (want == red_mutation_verdict.REFUSED or code is not None) and (
+                        not isinstance(code, str) or code not in red_mutation_verdict.REASON_CODES):
                     # r8 (R7-T1): a REFUSED answer alone is satisfied by a case that is refused for the wrong reason.
-                    raise ValueError("a REFUSED case needs a non-empty string `reason` (a substring of its refusal)")
+                    raise ValueError(f"a REFUSED case needs a `code`, one of red_mutation_verdict.REASON_CODES "
+                                     f"(got {code!r})")
                 if kind == "verdict":
                     if not isinstance(case["output"], str) or not isinstance(case["expected_assertion"], str):
                         raise TypeError("output and expected_assertion must be strings")
-                    # r10 R8-T1: the recorded reason is matched against the PRIMARY reason only. The `; also:`
-                    # diagnostics are shown in a violation but never satisfy a reason (a semantic reason found in
-                    # one would hide the format refusal that actually decided the case).
+                    # r10 R8-T1: the code is the PRIMARY reason's. The `; also:` diagnostics are shown in a violation
+                    # but carry no code, so they never satisfy one.
                     v = red_mutation_verdict.classify(case["output"], case["expected_assertion"])
-                    got, why, also = v.status, v.reason, v.also
                 elif kind == "probe":
                     window = case["window"]
                     if not isinstance(window, list) or len(window) != 2:
                         raise TypeError(f"window must be a list of two bounds, got {window!r}")
-                    ok, why = red_mutation_verdict.probe_discriminates(
-                        case["bug_value"], case["fix_value"], tuple(window))
-                    got, also = (red_mutation_verdict.PASS if ok else red_mutation_verdict.REFUSED), ()
+                    v = red_mutation_verdict.probe_classify(case["bug_value"], case["fix_value"], tuple(window))
                 else:
                     raise ValueError(f"unknown kind {kind!r}")
             except (KeyError, TypeError, ValueError) as exc:
                 raise CouldNotCheck(f"{rel} case {index} is malformed: {exc!r}") from exc
             seen.add((kind, want))
-            shown = why + "".join(f"; also: {a}" for a in also)
-            if got != want:
+            shown = v.reason + "".join(f"; also: {a}" for a in v.also)
+            if v.status != want:
                 out.append(Violation("DG-RED-MUTATION-VERDICT", rel, index,
-                                     f"case {case.get('id')!r}: expected {want}, checker said {got} ({shown})"))
-            elif want == red_mutation_verdict.REFUSED and any(
-                    isinstance(case.get(k), str) and reason in case[k] for k in ("output", "expected_assertion")):
-                # r10 adversary pass 2 A2: a reason quotes the case's own input (the expected id, a node id, a line).
-                # A recorded reason found in that input could be matched by the quote, not by the checker's words.
+                                     f"case {case.get('id')!r}: expected {want}, checker said {v.status} [{v.code}] "
+                                     f"({shown})"))
+            elif code is not None and v.code != code:
                 out.append(Violation("DG-RED-MUTATION-VERDICT", rel, index,
-                                     f"case {case.get('id')!r}: its recorded reason {reason!r} is text the case itself "
-                                     f"supplies (output or expected_assertion), so a match cannot show why it was "
-                                     f"refused; record words only the checker writes (primary reason: {shown})"))
-            elif want == red_mutation_verdict.REFUSED and reason not in (
-                    why.replace(case["expected_assertion"], "\x00") if kind == "verdict" and case["expected_assertion"]
-                    else why):  # the expected id is masked out: a reason may not lean on its quote, even in part
-                where = " (it appears only in a secondary `; also:` diagnostic)" if any(reason in a for a in also) else ""
-                out.append(Violation("DG-RED-MUTATION-VERDICT", rel, index,
-                                     f"case {case.get('id')!r}: refused, but not for its recorded reason {reason!r}{where}; "
-                                     f"primary reason: {shown}"))
+                                     f"case {case.get('id')!r}: {v.status}, but with code {v.code!r}, not its recorded "
+                                     f"code {code!r}; primary reason: {shown}"))
         for kind in ("verdict", "probe"):
             for want in (red_mutation_verdict.PASS, red_mutation_verdict.REFUSED):
                 if (kind, want) not in seen:
@@ -1033,14 +1028,13 @@ FIXTURES: dict[str, dict[str, dict[str, str]]] = {
                  "expected_assertion": "t.py:8"},
                 # FORMAT NEGATIVE (r10 R8-T1): the count precheck is the primary refusal; "names no failing assertion"
                 # is only its `; also:` diagnostic, which never satisfies a recorded reason.
-                {"id": "red-no-assertion", "kind": "verdict", "expect": "REFUSED",
-                 "reason": "the runner counts 1 failing unittest tests but 0 failure blocks were readable",
+                {"id": "red-no-assertion", "kind": "verdict", "expect": "REFUSED", "code": "cnc-count",
                  "output": "Ran 1 test in 0.001s\n\nFAILED (failures=1)\n", "expected_assertion": "t.py:8"},
-                {"id": "probe-705-display-rounded", "kind": "probe", "expect": "REFUSED", "reason": "both sit inside",
+                {"id": "probe-705-display-rounded", "kind": "probe", "expect": "REFUSED", "code": "probe-both-inside",
                  "bug_value": 3, "fix_value": 3, "window": [3, 3]},
                 # Measured in powershell.exe 5.1.19041.6456: [Math]::Min(330, 2.2) is Int32 2 and [Math]::Min(330.0, 2.2) is
                 # Double 2.2, both inside [2.0, 2.5], so this probe cannot tell the overloads apart.
-                {"id": "probe-705-2.2s", "kind": "probe", "expect": "REFUSED", "reason": "both sit inside",
+                {"id": "probe-705-2.2s", "kind": "probe", "expect": "REFUSED", "code": "probe-both-inside",
                  "bug_value": 2, "fix_value": 2.2, "window": [2.0, 2.5]},
                 # The separating control: [Math]::Min(330, 2.8) is Int32 3 and [Math]::Min(330.0, 2.8) is Double 2.8.
                 {"id": "probe-705-2.8s-raw-readings", "kind": "probe", "expect": "PASS",
@@ -1317,13 +1311,13 @@ class GuardFixtureTests(_PwshMixin, unittest.TestCase):
         guard = GUARDS["DG-RED-MUTATION-VERDICT"]
         # refused, but NOT because the run is green: its summary lists no PASSED line for the pass the runner counts
         text = "=== short test summary info ===\nFAILED t.py::test_x - assert False\n=== 1 failed, 1 passed in 0.1s ===\n"
-        wrong = {"id": "wrong-reason", "kind": "verdict", "expect": "REFUSED", "reason": "the run is green",
+        wrong = {"id": "wrong-reason", "kind": "verdict", "expect": "REFUSED", "code": "final-green",
                  "output": text, "expected_assertion": "other.py::test_x"}
-        right = {**wrong, "id": "right-reason", "reason": "-rA"}
+        right = {**wrong, "id": "right-reason", "code": "cnc-short-summary"}
         others = [{"id": "p", "kind": "verdict", "expect": "PASS", "expected_assertion": "t.py::test_x",
                    "output": "=== short test summary info ===\nFAILED t.py::test_x - assert False\n=== 1 failed in 0.1s ===\n"},
                   {"id": "q", "kind": "probe", "expect": "PASS", "bug_value": 0, "fix_value": 1, "window": [1, 1]},
-                  {"id": "r", "kind": "probe", "expect": "REFUSED", "reason": "both sit inside", "bug_value": 1, "fix_value": 1, "window": [1, 1]}]
+                  {"id": "r", "kind": "probe", "expect": "REFUSED", "code": "probe-both-inside", "bug_value": 1, "fix_value": 1, "window": [1, 1]}]
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             rels = _write_tree(root, {RED_MUTATION_CORPUS: json.dumps({"cases": others + [right]})})
@@ -1332,7 +1326,7 @@ class GuardFixtureTests(_PwshMixin, unittest.TestCase):
             found = run_guard(guard, root, rels)
             self.assertEqual(len(found), 1, found)
             self.assertIn("wrong-reason", found[0].detail)
-            self.assertIn("reason", found[0].detail)
+            self.assertIn("code", found[0].detail)
 
     # ---- r10 R8-T1 (Dot 6706642324): only the PRIMARY refusal satisfies a recorded reason ---------------------------
     _R8T1_MALFORMED = ("=== short test summary info ===\nFAILED t.py::test_x - assert False\n"
@@ -1344,19 +1338,19 @@ class GuardFixtureTests(_PwshMixin, unittest.TestCase):
         others = [{"id": "p", "kind": "verdict", "expect": "PASS", "expected_assertion": "t.py::test_x",
                    "output": "=== short test summary info ===\nFAILED t.py::test_x - assert False\n=== 1 failed in 0.1s ===\n"},
                   {"id": "q", "kind": "probe", "expect": "PASS", "bug_value": 0, "fix_value": 1, "window": [1, 1]},
-                  {"id": "r", "kind": "probe", "expect": "REFUSED", "reason": "both sit inside", "bug_value": 1, "fix_value": 1, "window": [1, 1]}]
+                  {"id": "r", "kind": "probe", "expect": "REFUSED", "code": "probe-both-inside", "bug_value": 1, "fix_value": 1, "window": [1, 1]}]
         return json.dumps({"cases": others + [case]})
 
     def test_semantic_reason_in_also_does_not_mask_summary_refusal(self) -> None:
         guard = GUARDS["DG-RED-MUTATION-VERDICT"]
-        semantic = "the run is red but not at"
+        semantic, fmt_code = "not-at", "cnc-short-summary"
         # (a) MALFORMED: the primary result is the format refusal; the semantic reason is only in the `; also:` text
-        malformed = {"id": "r8t1-malformed-semantic", "kind": "verdict", "expect": "REFUSED", "reason": semantic,
+        malformed = {"id": "r8t1-malformed-semantic", "kind": "verdict", "expect": "REFUSED", "code": semantic,
                      "output": self._R8T1_MALFORMED, "expected_assertion": "other.py::test_x"}
         # (b) VALID-PASSED semantic twin: well formed, so the semantic refusal IS the primary result
         valid = {**malformed, "id": "r8t1-valid-passed-semantic", "output": self._R8T1_VALID}
         # (c) FORMAT-NEGATIVE CONTROL (explicitly labeled): malformed, and its recorded reason IS the format refusal
-        fmt = {**malformed, "id": "r8t1-format-negative-control", "reason": "-rA"}
+        fmt = {**malformed, "id": "r8t1-format-negative-control", "code": fmt_code}
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             rels = _write_tree(root, {RED_MUTATION_CORPUS: self._r8t1_corpus(malformed)})
@@ -1372,28 +1366,56 @@ class GuardFixtureTests(_PwshMixin, unittest.TestCase):
         self.assertEqual(red_mutation_verdict.classify(self._R8T1_VALID, "other.py::test_x").also, ())
         got = red_mutation_verdict.classify(self._R8T1_MALFORMED, "other.py::test_x")
         self.assertTrue(got.reason.startswith("COULD-NOT-CHECK (short-summary line"), got)
-        self.assertNotIn(semantic, got.reason)
-        self.assertTrue(any(semantic in a for a in got.also), got)
+        self.assertEqual(got.code, fmt_code)  # the code is the PRIMARY reason's; the diagnostic carries none
+        self.assertTrue(any("the run is red but not at" in a for a in got.also), got)
+        self.assertEqual(red_mutation_verdict.classify(self._R8T1_VALID, "other.py::test_x").code, semantic)
 
     def test_red_mutation_verdict_reason_quoted_from_the_case_input_does_not_count(self) -> None:
         # adversary pass 2 A2 (07087c00): the primary reason quotes the expected id, so "the run is green" recorded as
-        # the reason matched the quote of an expected id spelled "the run is green"
+        # the reason matched the quote of an expected id spelled "the run is green". Since r11 a case records a CODE:
+        # an expected id spelled like a reason changes nothing, and a quoted text is not a code at all.
         guard = GUARDS["DG-RED-MUTATION-VERDICT"]
         out = "=== short test summary info ===\nFAILED t.py::test_x - assert False\n=== 1 failed in 0.1s ===\n"
-        bad = {"id": "bad", "kind": "verdict", "expect": "REFUSED", "reason": "the run is green", "output": out,
+        bad = {"id": "bad", "kind": "verdict", "expect": "REFUSED", "code": "final-green", "output": out,
                "expected_assertion": "the run is green"}
-        spanning = {**bad, "id": "spanning", "reason": "not at the run is", "expected_assertion": "the run is"}
-        quoted = {**bad, "id": "quoted", "reason": "t.py::test_x", "expected_assertion": "other.py::test_x"}
-        good = {**bad, "id": "good", "reason": "the run is red but not at", "expected_assertion": "other.py::test_x"}
+        spanning = {**bad, "id": "spanning", "code": "green", "expected_assertion": "the run is"}
+        good = {**bad, "id": "good", "code": "not-at", "expected_assertion": "other.py::test_x"}
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            for case in (bad, spanning, quoted):
+            for case in (bad, spanning):
                 rels = _write_tree(root, {RED_MUTATION_CORPUS: self._r8t1_corpus(case)})
                 found = run_guard(guard, root, rels)
                 self.assertEqual(len(found), 1, (case["id"], found))
                 self.assertIn(case["id"], found[0].detail)
+            for quoted in ({**good, "id": "quoted", "code": "t.py::test_x"},
+                           {**good, "id": "old-text-pin", "reason": "the run is red but not at"}):
+                rels = _write_tree(root, {RED_MUTATION_CORPUS: self._r8t1_corpus(quoted)})
+                with self.assertRaises(CouldNotCheck, msg=quoted["id"]):
+                    run_guard(guard, root, rels)
             rels = _write_tree(root, {RED_MUTATION_CORPUS: self._r8t1_corpus(good)})
             self.assertEqual(run_guard(guard, root, rels), [])
+
+    def test_red_mutation_verdict_reason_quoted_through_repr_does_not_count(self) -> None:
+        # r11, r10 adversary A2 (e2d9dc08): a reason quoting the input through repr() (`'MissingDependency'`) or an
+        # escaped node (`t.py::test\\tx`) is not a substring of the raw input, so the old raw-input check let it satisfy
+        # the case. The guard compares the checker's reason CODE now, never rendered text: neither witness is accepted.
+        guard = GUARDS["DG-RED-MUTATION-VERDICT"]
+        green = json.loads(FIXTURES["DG-RED-MUTATION-VERDICT"]["green"][RED_MUTATION_CORPUS])["cases"]
+        repr_case = {"id": "quoted-input", "kind": "verdict", "expect": "REFUSED", "reason": "'MissingDependency'",
+                     "output": "=== short test summary info ===\nFAILED t.py::test_x - MissingDependency: boom\n"
+                               "=== 1 failed in 0.1s ===\n", "expected_assertion": "other"}
+        escaped = {**repr_case, "id": "escaped-node", "reason": "'t.py::test\\tx'",
+                   "output": "=== short test summary info ===\nFAILED t.py::test\tx - assert False\n=== 1 failed in 0.1s ===\n"}
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            for case in (repr_case, escaped, {**repr_case, "code": "'MissingDependency'"},
+                         {**escaped, "code": "'t.py::test\\tx'"}):
+                rels = _write_tree(root, {RED_MUTATION_CORPUS: json.dumps({"cases": green + [case]})})
+                try:
+                    found = run_guard(guard, root, rels)
+                except CouldNotCheck:
+                    continue  # a case recording no known code is a malformed corpus: refused, never accepted
+                self.assertTrue(found, (case, "the guard accepted a reason quoted from the case's own input"))
 
     def test_red_mutation_verdict_live_corpus_reasons_are_primary(self) -> None:
         # every REFUSED case in the tracked corpus is refused FOR its recorded reason: the reason is in the primary
@@ -1403,14 +1425,16 @@ class GuardFixtureTests(_PwshMixin, unittest.TestCase):
         for case in cases:
             if case["kind"] == "verdict" and case["expect"] == red_mutation_verdict.REFUSED:
                 got = red_mutation_verdict.classify(case["output"], case["expected_assertion"])
-                self.assertIn(case["reason"], got.reason, case["id"])
+                self.assertEqual(case["code"], got.code, case["id"])  # r11: the PRIMARY reason's code
 
     def test_red_mutation_verdict_refused_case_without_a_reason_is_could_not_check(self) -> None:
         guard = GUARDS["DG-RED-MUTATION-VERDICT"]
         base = {"id": "x", "kind": "verdict", "expect": "REFUSED", "output": "Ran 1 test\n\nOK\n", "expected_assertion": "a.py:1"}
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            for case in (base, {**base, "reason": ""}, {**base, "reason": None}, {**base, "reason": ["the run is green"]},
+            for case in (base, {**base, "code": ""}, {**base, "code": None}, {**base, "code": ["final-green"]},
+                         {**base, "code": "the run is green"}, {**base, "reason": "the run is green"},
+                         {**base, "code": "final-green", "reason": "the run is green"},
                          {**base, "kind": "probe", "bug_value": 1, "fix_value": 1, "window": [1, 1]}):
                 rels = _write_tree(root, {RED_MUTATION_CORPUS: json.dumps({"cases": [case]})})
                 with self.assertRaises(CouldNotCheck, msg=repr(case)):
@@ -1420,11 +1444,11 @@ class GuardFixtureTests(_PwshMixin, unittest.TestCase):
         # adversary r5 pass 9 A2: json.loads turns 1e-400 into 0.0 and 1e400 into inf before the checker sees them,
         # so a probe recorded as PASS on a number no float can hold used to satisfy the guard.
         guard = GUARDS["DG-RED-MUTATION-VERDICT"]
-        verdicts = [{"kind": "verdict", "expect": "REFUSED", "reason": "the run is green", "output": "Ran 1 test\n\nOK\n",
+        verdicts = [{"kind": "verdict", "expect": "REFUSED", "code": "final-green", "output": "Ran 1 test\n\nOK\n",
                      "expected_assertion": "a.py:1"},
                     {"kind": "verdict", "expect": "PASS", "expected_assertion": "t.py::test_x",
                      "output": "=== short test summary info ===\nFAILED t.py::test_x - assert False\n=== 1 failed in 0.1s ===\n"}]
-        refused = {"kind": "probe", "expect": "REFUSED", "reason": "both sit inside", "bug_value": 1, "fix_value": 1, "window": [1, 1]}
+        refused = {"kind": "probe", "expect": "REFUSED", "code": "probe-both-inside", "bug_value": 1, "fix_value": 1, "window": [1, 1]}
 
         def corpus(spelled_probe: str) -> str:
             return json.dumps({"cases": verdicts + [refused]})[:-2] + ", " + spelled_probe + "]}"

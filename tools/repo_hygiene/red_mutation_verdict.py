@@ -75,6 +75,25 @@ REFUSED with a reason that starts ``COULD-NOT-CHECK (<typed reason>)``. That is 
   short summary, terminal result, ``Ran`` footer, counts, the green check) reads that one list of lines. A text holding
   U+FFFD (what a lossy decode leaves) is refused too, and the CLI reads ``--output`` as strict UTF-8 with no newline
   translation (a file that is not UTF-8 is exit 2).
+* ``result line`` (r11, Dot r9-A1, a GRAMMAR): the runner's last result line is parsed WHOLE, once, and its counts are
+  the only ones any check reads (no digit substring is ever taken from a partly read line). unittest: ``OK``, ``OK
+  (skipped=N, ...)`` or ``FAILED (failures=N, errors=N, skipped=N, expected failures=N, unexpected successes=N)``, each
+  field at most once and in that order; the ``Ran N tests in T s`` footer likewise. pytest: ``=== <N word>, ... in T s
+  ===`` with the words failed, passed, skipped, deselected, xfailed, xpassed, warning(s), error(s), rerun, each once,
+  then only the elapsed-time clause (``in 0.12s``, ``in 75.12s (0:01:15)``). A COUNT is ASCII digits printed as ``%d``:
+  no sign, no leading zero, no fraction, no exponent, no other script's digit (``failures=1.5``, ``-1 failed``, ``0.1
+  passed``, ``01 failed`` are refused, even where a digit inside equals the readable count). A line of the result shape
+  that does not parse whole is COULD-NOT-CHECK.
+* ``frame`` (r11): a unittest ``File "...", line N`` frame ends after its ASCII line number with ``, in <name>`` or the
+  end of the line, and a pytest ``file.py:N:`` location line with its ``:``. A line of either shape that does not parse
+  whole (``line 2.5,``, ``line 2x``, ``t.py:2.5:``) is COULD-NOT-CHECK, never a frame at its digit prefix.
+* ``summary split`` (r11, r10 adversary A1): a class or function name set through ``globals()`` may hold `` - ``, so the
+  first `` - `` of a ``FAILED``/``ERROR`` line is only one candidate end of its node id. When a later `` - `` also has a
+  node id on its left and the start of an exception account on its right (``assert``, or a class name then ``: `` or
+  the end), the line has two readings and is COULD-NOT-CHECK (``FAILED t.py::TestA - AssertionError::test_x -
+  TypeError: boom``); so is a parameter id holding ``] - ``. A line naming an import error blocks like one under every
+  reading. ``AssertionError::`` (a ``:`` that starts ``::``) is never an assertion head. The cost, accepted: an assertion
+  message ending in `` - <word>`` or holding `` - <Name>: `` is refused too.
 * ``runner``: one run has one runner. A unittest ``FAILED (...)`` trailer over pytest sections or summary lines, or a
   pytest bar over unittest blocks, is COULD-NOT-CHECK: the trailer's count does not cover the other runner's failures.
 * ``pairing`` (r9 hub ruling, a STRUCTURE): every pytest ``FAILED`` line is one failure OCCURRENCE with its own exception
@@ -91,6 +110,9 @@ refusal that was already a refusal stays one. Only a PASS can be changed by this
 The refusal is the PRIMARY reason and the appended text is a secondary diagnostic: ``classify()`` returns them as
 separate fields (``Verdict.reason``, ``Verdict.also``), and a check that pins why a case was refused matches the primary
 reason only (r10, Dot R8-T1). ``verdict()`` joins them into one text for display.
+REASON CODES (r11, r10 adversary A2): ``Verdict.code`` is the checker's own name for the primary reason (one of
+``REASON_CODES``), set at the site that writes the reason; ``probe_classify()`` gives the same for a probe. A reason's
+TEXT quotes its input (an id, a node, ``repr()`` of a name), so a check that pins why compares the code, never text.
 
 NON-PROMISES:
 - It reads text. It cannot tell that the saved output came from a run of the mutated
@@ -175,8 +197,45 @@ from pathlib import Path
 PASS = "PASS"
 REFUSED = "REFUSED"
 
+# REASON CODES (r11, r10 adversary A2): every verdict carries one of these, set by the checker AT THE SITE that writes the
+# reason. A check that pins why a case was refused compares the code, never the rendered text: a reason quotes its
+# input (an id, a node, repr() of a name), so a substring of it can always be supplied by that input.
+REASON_CODES = frozenset((
+    # PASS
+    "assertion-failed", "probe-separates",
+    # REFUSED, a semantic answer
+    "no-expectation", "final-green", "green", "unrecognized", "red-no-assertion", "collection", "ambiguous-expectation",
+    "non-assertion", "not-at",
+    # REFUSED, COULD-NOT-CHECK (NARROWED PROMISE)
+    "cnc-chained", "cnc-captured", "cnc-expectation", "cnc-line-framing", "cnc-decoding", "cnc-line-number", "cnc-frame",
+    "cnc-identity", "cnc-pairing", "cnc-summary-split", "cnc-exception-type", "cnc-short-summary", "cnc-result-line",
+    "cnc-no-result-line", "cnc-no-ran-footer", "cnc-runner", "cnc-count", "cnc-internal-error",
+    # REFUSED, probe_discriminates
+    "probe-number", "probe-nan", "probe-infinite", "probe-empty-window", "probe-both-inside", "probe-neither-inside",
+    "probe-bug-inside",
+))
+
+
+class _Reason(str):
+    """A reason's text with the checker's CODE for it (see REASON_CODES). It is a str, so text-only readers are unchanged;
+    the code travels with it from the site that wrote it to Verdict.code."""
+
+    code: str
+
+    def __new__(cls, code: str, text: str) -> "_Reason":
+        if code not in REASON_CODES:
+            raise ValueError(f"unknown reason code {code!r}")
+        self = super().__new__(cls, text)
+        self.code = code
+        return self
+
+
 _EQ_RULE = re.compile(r"^={20,}\s*$")
-_FRAME = re.compile(r'^\s*File "(?P<file>.+)", line (?P<line>\d+)')
+# A traceback frame is parsed WHOLE (r11, Dot r9-A1): the line number is ASCII digits followed by the runner's own
+# delimiter, `, in <name>` or the end of the line (a SyntaxError location has no function). A line of the frame's shape
+# that does not parse (`line 2.5,`, `line 2x`, a non-ASCII digit) is COULD-NOT-CHECK, never a frame at a digit prefix.
+_FRAME = re.compile(r'^\s*File "(?P<file>.+)", line (?P<line>[0-9]+)(?:, in .*)?[ \t]*$')
+_FRAME_SHAPE = re.compile(r'^\s*File ".*", line ')
 _UT_HEAD = re.compile(r"^(?P<kind>FAIL|ERROR): (?P<name>.+?)(?: \((?P<ident>[^()]*)\))?(?: \(.*\))?\s*$")
 _UT_KIND = re.compile(r"^(?P<kind>FAIL|ERROR): (?P<rest>.+?)\s*$")
 _DASHES = re.compile(r"^-{70}\s*$")
@@ -185,19 +244,89 @@ _CHAIN = ("The above exception was the direct cause of the following exception:"
           "During handling of the above exception, another exception occurred:")
 _PT_SECTION = re.compile(r"^_{2,} (?P<name>.+?) _{2,}\s*$")
 _PT_TOP = re.compile(r"^={3,} (?P<title>.+?) ={3,}\s*$")
-_PT_LOC = re.compile(r"^(?P<file>[^\s:][^\n]*?\.py):(?P<line>\d+):(?: (?P<rest>.*))?$")
+_PT_LOC = re.compile(r"^(?P<file>[^\s:][^\n]*?\.py):(?P<line>[0-9]+):(?: (?P<rest>.*))?$")
+# The pytest location line's shape (a `.py:` then any digit, \d on purpose so that a non-ASCII digit is caught): one that
+# _PT_LOC does not parse whole is COULD-NOT-CHECK (r11). A source line (`>` or indented) and an `E` line are not one.
+_PT_LOC_SHAPE = re.compile(r"^[^\s:>][^\n]*?\.py:\d")
 # A leading "| " / "+-" run is the gutter an ExceptionGroup traceback puts in front of nested errors.
 _IMPORT_ERR = re.compile(r"^[\s|+\-]*(?:[\w.]+\.)?(?:ModuleNotFoundError|ImportError)\b")
 _IMPORT_ANYWHERE = re.compile(r"(?:^|[^\w])(?:[\w.]+\.)?(?:ModuleNotFoundError|ImportError)\b")
 _EXC_GROUP = re.compile(r"^(?:[\w.]+\.)?(?:Base)?ExceptionGroup\b")
 # An assertion message starts with `assert`, or is exactly the AssertionError class (word-bounded: a class
 # named AssertionErrorImpostor is not one), or pytest's `Failed:`.
-_ASSERT_HEAD = re.compile(r"(?:assert\b|AssertionError(?::|\s*$)|Failed:)")
-_EXPECT_SITE = re.compile(r"^(?P<file>.+\.\w+):(?P<line>\d+)\Z")
+# r11 (r10 adversary A1): the `:` must not start a `::`, which no exception line prints after the class name but a node id
+# does (`AssertionError::test_x` is a forged class name, not an assertion).
+_ASSERT_HEAD = re.compile(r"(?:assert\b|AssertionError(?::(?!:)|\s*$)|Failed:(?!:))")
+_UT_ASSERT = re.compile(r"AssertionError(?::(?!:)|\s*$)")
+# The start of an exception account in a summary message: `assert ...`, or a (dotted) class name followed by `: ` or by
+# the end of the message. Used only to find every place a FAILED/ERROR line COULD end its node id (_parse_summary_line).
+_MSG_HEAD = re.compile(r"(?:assert\b|(?:[A-Za-z_][A-Za-z0-9_]*\.)*[A-Za-z_][A-Za-z0-9_]*(?::(?!:)|$))")
+_EXPECT_SITE = re.compile(r"^(?P<file>.+\.\w+):(?P<line>[0-9]+)\Z")
 # Every pattern below reads ONE framed line (see _frame): none is compiled multi-line, none searches the raw text.
 _RED_MARK = re.compile(r"^FAILED \(|^FAILED |\b\d+ (?:failed|errors?)\b|^Interrupted:")
 _GREEN_MARK = re.compile(r"^OK\b|\b\d+ passed\b")
+# The SHAPE of a runner result line (a line that claims to be one). Its fields are read only by _read_result, which
+# parses the whole line or refuses it: nothing reads a count from this shape.
 _RESULT_LINE = re.compile(r"^(?:OK\b.*|FAILED \(.*\)|=+ .*\bin \d[\d.]*s\b.*=+)\s*$")
+# COUNT SPELLING (r11, Dot r9-A1): a runner prints a count with %d, so a count is ASCII digits with no sign, no leading
+# zero, no fraction and no exponent. Anything else in a count field refuses the whole line.
+_COUNT = r"(?:0|[1-9][0-9]{0,8})"
+_UT_TRAILER = re.compile(r"(?P<word>OK|FAILED)(?: \((?P<fields>.*)\))?")
+_UT_ORDER = ("failures", "errors", "skipped", "expected failures", "unexpected successes")  # unittest's own print order
+_UT_FIELD = re.compile(rf"(?P<name>{'|'.join(_UT_ORDER)})=(?P<n>{_COUNT})")
+_PT_BAR = re.compile(r"=+ (?P<body>.+?) =+")
+# the elapsed-time clause pytest prints: `in 0.12s`, and from a minute on `in 75.12s (0:01:15)` (a timedelta)
+_PT_TIMED = re.compile(r"(?P<counts>.+?) in [0-9]+(?:\.[0-9]+)?s(?: \((?:[0-9]+ days?, )?[0-9]+:[0-9]{2}:[0-9]{2}\))?")
+_PT_FIELD = re.compile(rf"(?P<n>{_COUNT}) (?P<label>failed|passed|skipped|deselected|xfailed|xpassed|warnings?|errors?|rerun)")
+_PT_KEY = {"warning": "warnings", "error": "errors"}  # the singular pytest prints for exactly one
+
+
+@dataclass(frozen=True)
+class _Result:
+    """A runner result line parsed whole: the runner, whether it is green, and its counts by field name. The ONE place a
+    count is read; validation and reconciliation both consume these counts and never rescan the line."""
+    runner: str  # "unittest" | "pytest"
+    green: bool
+    counts: dict
+
+
+def _read_result(line: str) -> _Result:
+    """Parse a result-SHAPED line (_RESULT_LINE) whole, or raise _Unclassifiable (cnc-result-line)."""
+    s = line.rstrip()
+    m = _UT_TRAILER.fullmatch(s)
+    if m:
+        counts: dict = {}
+        for field in (m["fields"].split(", ") if m["fields"] is not None else ()):
+            f = _UT_FIELD.fullmatch(field)
+            if not f or f["name"] in counts:
+                break
+            counts[f["name"]] = int(f["n"])
+        else:
+            in_order = list(counts) == [k for k in _UT_ORDER if k in counts]
+            ok_fields = m["word"] == "FAILED" or not {"failures", "errors", "unexpected successes"} & set(counts)
+            if in_order and ok_fields and (m["fields"] is None) == (m["word"] == "OK" and not counts):
+                return _Result("unittest", m["word"] == "OK", counts)
+        raise _Unclassifiable("cnc-result-line", f"result line: {s[:60]!r} is not a unittest trailer of whole integer "
+                              "counts (`OK`, `OK (skipped=N)`, `FAILED (failures=N, errors=N, ...)`: each field once, in "
+                              "the runner's order, a count of ASCII digits with no sign, fraction or exponent)")
+    m = _PT_BAR.fullmatch(s)
+    t = _PT_TIMED.fullmatch(m["body"]) if m else None
+    if t:
+        counts = {}
+        if t["counts"] == "no tests ran":
+            return _Result("pytest", True, counts)
+        for part in t["counts"].split(", "):
+            f = _PT_FIELD.fullmatch(part)
+            key = _PT_KEY.get(f["label"], f["label"]) if f else ""
+            if not f or key in counts:
+                break
+            counts[key] = int(f["n"])
+        else:
+            # green as before r11: a bar that states no failed/error count at all (a stated `0 failed` is a count)
+            return _Result("pytest", "failed" not in counts and "errors" not in counts, counts)
+    raise _Unclassifiable("cnc-result-line", f"result line: {s[:60]!r} is not a pytest result bar of whole integer counts "
+                          "(`=== N failed, N passed, ... in 0.12s ===`: known outcome words, each once, a count of ASCII "
+                          "digits with no sign, fraction or exponent, and only the elapsed-time clause after them)")
 
 
 _CAPTURED_ANY = re.compile(r"^\s*-{2,}\s*Captured\b|^(?:Stdout|Stderr):\s*$")
@@ -231,7 +360,13 @@ _EXC_NAMES = frozenset((
 
 
 class _Unclassifiable(Exception):
-    """The text holds something this checker will not classify; verdict() turns it into COULD-NOT-CHECK."""
+    """The text holds something this checker will not classify; verdict() turns it into COULD-NOT-CHECK. ``code`` is the
+    checker's name for the reason (REASON_CODES)."""
+
+    def __init__(self, code: str, text: str) -> None:
+        super().__init__(text)
+        self.reason = _Reason(code, text)
+        self.code = code
 
 
 def _frame(text: str) -> list[str]:
@@ -241,11 +376,12 @@ def _frame(text: str) -> list[str]:
     this list and never the raw text."""
     m = _FOREIGN_BREAK.search(text)
     if m:
-        raise _Unclassifiable(f"line framing: the text holds U+{ord(m.group(0)):04X}, a line boundary other than \\n "
-                              "and \\r\\n, which some readers would split at and others would not")
+        raise _Unclassifiable("cnc-line-framing", f"line framing: the text holds U+{ord(m.group(0)):04X}, a line boundary "
+                              "other than \\n and \\r\\n, which some readers would split at and others would not")
     if "\ufffd" in text:  # r9 adversary pass 2, A2: a lossy decode put it where bytes were lost; any name may have held it
-        raise _Unclassifiable("decoding: the text holds U+FFFD, the replacement character a lossy decode puts where bytes "
-                              "could not be read, so a file name or test id holding it is not the one the run printed")
+        raise _Unclassifiable("cnc-decoding", "decoding: the text holds U+FFFD, the replacement character a lossy decode "
+                              "puts where bytes could not be read, so a file name or test id holding it is not the one "
+                              "the run printed")
     lines = text.replace("\r\n", "\n").split("\n")
     if lines[-1] == "":  # the newline that ends the last line starts no new line
         lines.pop()
@@ -254,7 +390,7 @@ def _frame(text: str) -> list[str]:
 
 def _line_no(digits: str) -> int:
     if len(digits) > _MAX_LINE_DIGITS:
-        raise _Unclassifiable(f"line number of {len(digits)} digits is not a line of a real file")
+        raise _Unclassifiable("cnc-line-number", f"line number of {len(digits)} digits is not a line of a real file")
     return int(digits)
 
 
@@ -292,6 +428,7 @@ class Parsed:
     red: bool = False
     green: bool = False
     mismatch: str = ""  # the runner's own failure count disagrees with what was readable: see _count_mismatch
+    result: _Result | None = None  # the LAST result line, parsed whole (None: no result line, or a malformed one)
 
 
 def _norm_path(text: str) -> list[str]:
@@ -373,7 +510,13 @@ def _parse_summary_line(line: str, word: str) -> tuple[str, str, bool] | None:
         return rest, "", False
     param = rest.find("[")
     if param < 0 or seps[0] < param:
-        return rest[:seps[0]], rest[seps[0] + 3:], False
+        # r11 (r10 adversary A1): a class or function name set through globals() may hold ` - ` (`TestA - AssertionError`),
+        # so the FIRST ' - ' is only one candidate end of the node id. Any LATER ' - ' whose left side is a node id and
+        # whose right side starts an exception account (`assert`, or a class name then `: ` or the end) is another
+        # reading of the same line; with two readings the split is a guess, so the line is ambiguous (COULD-NOT-CHECK).
+        # A ' - ' inside an assertion message (`assert x - 1 == y`, `AssertionError: 3 - 4`) is not followed by one.
+        later = [i for i in seps[1:] if _node_shaped(word, rest[:i]) and _MSG_HEAD.match(rest[i + 3:])]
+        return rest[:seps[0]], rest[seps[0] + 3:], bool(later)
     after = [i for i in seps if i > param and rest[i - 1] == "]"]
     if not after:
         return rest, "", False
@@ -435,6 +578,9 @@ def _ut_walk(block: list[str]) -> tuple[list[tuple[str, int]], str]:
             m = _FRAME.match(ln)
             if m:
                 frames.append((m["file"], _line_no(m["line"])))
+            elif _FRAME_SHAPE.match(ln):
+                raise _Unclassifiable("cnc-frame", f"traceback frame {ln.strip()[:60]!r}: its line number is not ASCII "
+                                      "digits followed by the frame's own delimiter (`, in <name>` or the end of the line)")
             continue
         exc, in_tb = ln, False
     return frames, exc
@@ -464,8 +610,8 @@ def _parse_unittest(lines: list[str]) -> list[Failure]:
         collection = ("_FailedTest" in body[0]
                       or any("unittest/loader.py" in ln.replace("\\", "/") or _IMPORT_ERR.match(ln) for ln in block))
         if len(head["rest"]) > _UT_HEADER_MAX:  # adversary A2: bounded work, and no real test name is this long
-            raise _Unclassifiable(f"unittest header of {len(head['rest'])} characters is longer than {_UT_HEADER_MAX}: "
-                                  "its test identity is not read")
+            raise _Unclassifiable("cnc-identity", f"unittest header of {len(head['rest'])} characters is longer than "
+                                  f"{_UT_HEADER_MAX}: its test identity is not read")
         readings = _ut_identities(head["rest"])
         if readings:
             name, full = readings[0]
@@ -479,14 +625,16 @@ def _parse_unittest(lines: list[str]) -> list[Failure]:
         ids = [] if "unittest.loader" in full else [full]
         odd = ""
         if len(readings) > 1:
-            odd = f"ambiguous identity: the header {head['rest'][:60]!r} reads as {len(readings)} different test identities"
+            odd = _Reason("cnc-identity", f"ambiguous identity: the header {head['rest'][:60]!r} reads as "
+                          f"{len(readings)} different test identities")
         elif ids and any(ch in name for ch in "./\\:"):
-            odd = f"separator in the method name {name[:40]!r}: its identity would split into invented segments"
+            odd = _Reason("cnc-identity", f"separator in the method name {name[:40]!r}: its identity would split into "
+                          "invented segments")
         elif ids and (_empty_segment(full) or any(tok in full for tok in ("/", "\\", "::"))):
-            odd = f"empty or foreign segment in the test identity {full[:60]!r}"
+            odd = _Reason("cnc-identity", f"empty or foreign segment in the test identity {full[:60]!r}")
         # FAIL is only unittest's word for "failureException was raised", and a test may set that to any
         # class: the assertion claim rests on the exception actually printed.
-        is_assertion = bool(re.match(r"AssertionError(?::|\s*$)", exc_line))
+        is_assertion = bool(_UT_ASSERT.match(exc_line))
         out.append(Failure(ids, frames, assertion=head["kind"] == "FAIL" and is_assertion and not collection,
                            collection=collection, note=body[0].strip(), odd=odd, exc=exc_line.strip()))
     return out
@@ -520,8 +668,9 @@ def _ambiguous_occurrences(nodes: list[str]) -> list[str]:
         seen[node] = seen.get(node, 0) + 1
     for node, k in seen.items():
         if k > 1:
-            notes.append(f"pairing: the FAILED node id {node[:60]!r} occurs {k} times (--keep-duplicates?): which failure "
-                         "section is which occurrence, and so which exception belongs to which, cannot be told")
+            notes.append(_Reason("cnc-pairing", f"pairing: the FAILED node id {node[:60]!r} occurs {k} times "
+                                 "(--keep-duplicates?): which failure section is which occurrence, and so which "
+                                 "exception belongs to which, cannot be told"))
     groups: dict[tuple[str, ...], dict[tuple[str, ...], str]] = {}
     for node in seen:
         parts = _split_top(node, "::")
@@ -530,7 +679,8 @@ def _ambiguous_occurrences(nodes: list[str]) -> list[str]:
         group = groups.setdefault(tuple(parts[1:]), {})
         rev = tuple(reversed(_norm_path(parts[0])))
         if rev in group:  # the same file spelled two ways (`./a/t.py` and `a/t.py`)
-            notes.append(f"pairing: FAILED {group[rev][:60]!r} and {node[:60]!r} name the same test in the same file")
+            notes.append(_Reason("cnc-pairing", f"pairing: FAILED {group[rev][:60]!r} and {node[:60]!r} name the same "
+                                 "test in the same file"))
             continue
         group[rev] = node
     for group in groups.values():
@@ -538,8 +688,9 @@ def _ambiguous_occurrences(nodes: list[str]) -> list[str]:
             for k in range(1, len(rev)):
                 other = group.get(rev[:k])
                 if other is not None:
-                    notes.append(f"pairing: FAILED {other[:60]!r} and {node[:60]!r} share a test name and one file path "
-                                 "is a suffix of the other: which failure section is which occurrence cannot be told")
+                    notes.append(_Reason("cnc-pairing", f"pairing: FAILED {other[:60]!r} and {node[:60]!r} share a test "
+                                         "name and one file path is a suffix of the other: which failure section is "
+                                         "which occurrence cannot be told"))
     return notes
 
 
@@ -554,7 +705,16 @@ _SUMMARY_LINE_MAX_ID = 74
 # FAILED/ERROR line is out of order. ERROR and FAILED share a rank (a default ``-rfE`` run prints them as f, E).
 _SUMMARY_RANK = {"PASSED": 0, "SKIPPED": 1, "XFAIL": 2, "XPASS": 3, "ERROR": 4, "FAILED": 4}
 _OTHER_NODE = re.compile(r"[!-~][ -~]*?\.\w+::[ -~]+")  # `<ascii file>.ext::<name>`: the one readable id shape
-_SKIPPED_BODY = re.compile(r"\[([0-9]+)\] [!-~][ -~]*?:[0-9]+: [ -~]*")
+_SKIPPED_BODY = re.compile(rf"\[({_COUNT})\] [!-~][ -~]*?:[0-9]+: [ -~]*")  # the [n] group count: the one count spelling
+_MODULE_NODE = re.compile(r"[!-~][ -~]*?\.\w+")  # a module-level `ERROR <file.ext>`
+
+
+def _node_shaped(word: str, text: str) -> bool:
+    """True when `text` could be the node id of a `word` summary line: `<ascii file.ext>::<name>` (or, for ERROR, a
+    module `<file.ext>`), ASCII and printable."""
+    if not text.isascii() or not text.isprintable():
+        return False
+    return bool(_OTHER_NODE.fullmatch(text) or (word == "ERROR" and _MODULE_NODE.fullmatch(text)))
 
 
 def _other_line(word: str, line: str) -> tuple[int, str]:
@@ -685,8 +845,17 @@ def _parse_pytest(lines: list[str], stats: dict | None = None) -> list[Failure]:
                 if word == "FAILED":
                     nodes.append((node, msg))
                     if _empty_segment(node):
-                        odd_notes.append(f"empty segment in the test identity {node[:60]!r}")
-                if ambiguous:
+                        odd_notes.append(_Reason("cnc-identity", f"empty segment in the test identity {node[:60]!r}"))
+                if ambiguous and _IMPORT_ANYWHERE.search(line):
+                    # every reading of the line names an import error: it blocks like one, whichever is the node
+                    summary_blockers.append(f"{word} {node[:60]} - {msg[:40]}")
+                elif ambiguous:
+                    # r11 (r10 adversary A1): a split with more than one reading is COULD-NOT-CHECK, never a guessed
+                    # node id and account; the line still blocks PASS like a collection error (both are refusals).
+                    odd_notes.append(_Reason("cnc-summary-split", f"summary split: the {word} line {line[:70]!r} splits "
+                                             "into node id and message at more than one ' - ' (a name holding ' - ' set "
+                                             "through globals(), or a parameter id holding '] - '): which is the node "
+                                             "cannot be told"))
                     summary_blockers.append(f"ambiguous summary line {word} {node[:60]}")
                 elif _IMPORT_ANYWHERE.search(msg) or _EXC_GROUP.match(msg):
                     # An import error named anywhere in the message, or an ExceptionGroup whose nested
@@ -728,6 +897,9 @@ def _parse_pytest(lines: list[str], stats: dict | None = None) -> list[Failure]:
         m_loc = _PT_LOC.match(line)
         if m_loc:
             cur["frames"].append((m_loc["file"], _line_no(m_loc["line"])))
+        elif _PT_LOC_SHAPE.match(line):
+            raise _Unclassifiable("cnc-frame", f"location line {line.strip()[:60]!r}: its line number is not ASCII digits "
+                                  "followed by the runner's own `:` delimiter")
     close()
     if stats["has_summary"] and not after_result:
         # The summary is closed by the runner's own result bar; without it the counts cannot be reconciled at all.
@@ -754,8 +926,9 @@ def _parse_pytest(lines: list[str], stats: dict | None = None) -> list[Failure]:
         # tail is that name and whose file appears in the section's own traceback frames.
         idx = _pair_nodes(_segs(bare), f.frames, names)
         if len(idx) > 1:
-            odd_notes.append(f"pairing: the failure section {bare[:60]!r} pairs with {len(idx)} FAILED occurrences ("
-                             + ", ".join(repr(names[i][:60]) for i in idx[:4]) + "): which one is its account cannot be told")
+            odd_notes.append(_Reason("cnc-pairing", f"pairing: the failure section {bare[:60]!r} pairs with {len(idx)} "
+                                     "FAILED occurrences (" + ", ".join(repr(names[i][:60]) for i in idx[:4])
+                                     + "): which one is its account cannot be told"))
         for i in idx:
             claims[i] += 1
         pairs.append(idx)
@@ -789,20 +962,21 @@ def _foreign_type(failure: Failure) -> str:
     if not text and not failure.assertion:
         # r8 adversary pass 2, A1: an exception group prints no `E` line (and -rN prints no summary line), so nothing
         # shows the type of this failure; "" must never read as "known not to be an import error".
-        return ("no exception line is shown for a failing test (an exception group prints none): its class may "
-                "subclass ImportError, which the run does not say")
+        return _Reason("cnc-exception-type", "no exception line is shown for a failing test (an exception group prints "
+                       "none): its class may subclass ImportError, which the run does not say")
     if not text or _ASSERT_HEAD.match(text):
         return ""
     token = re.match(r"[\w.]+", text)
     name = token.group(0) if token else text[:40]
     if token and name in _EXC_NAMES and text[len(name):len(name) + 1] in ("", ":"):
         return ""  # an exact name from the fixed list (ImportError and its builtin subclasses are not on it)
-    return (f"exception type {name[:40]!r} of a failing test is not on the fixed list of builtin names: its class may "
-            "subclass ImportError, which the run does not say")
+    return _Reason("cnc-exception-type", f"exception type {name[:40]!r} of a failing test is not on the fixed list of "
+                   "builtin names: its class may subclass ImportError, which the run does not say")
 
 
 def _last_result(lines: list[str]) -> str | None:
-    """The LAST framed line that is a runner result line, stripped; None when there is none."""
+    """The LAST framed line that has the SHAPE of a runner result line (_RESULT_LINE), stripped; None when there is none.
+    Its fields are read only by _read_result."""
     last = None
     for ln in lines:
         if _RESULT_LINE.match(ln):
@@ -810,21 +984,12 @@ def _last_result(lines: list[str]) -> str | None:
     return last
 
 
-def _final_green(lines: list[str]) -> bool:
-    """True when the LAST runner result line is green (unittest OK, or a pytest bar with no failed/error)."""
-    last = _last_result(lines)
-    if last is None:
-        return False
-    if last.startswith("OK"):
-        return True
-    return last.startswith("=") and not re.search(r"\b(?:failed|errors?)\b", last)
+# The unittest footer, parsed whole like the trailer (r11): `Ran N test(s)` with the one count spelling and an optional
+# elapsed time. A footer of another spelling (`Ran 1.5 tests`) is not the runner's, so the trailer has no footer.
+_UT_RAN = re.compile(rf"^Ran {_COUNT} tests?(?: in [0-9]+(?:\.[0-9]+)?s)?[ \t]*$")
 
 
-_UT_COUNTS = re.compile(r"[(,] ?(failures|errors)=(\d+)")
-_UT_RAN = re.compile(r"^Ran \d+ tests?\b")  # the footer line; the elapsed time after it is not needed
-
-
-def _count_mismatch(lines: list[str], ut_blocks: int, stats: dict) -> str:
+def _count_mismatch(lines: list[str], ut_blocks: int, stats: dict, result: _Result | None) -> str:
     """The runner states how many tests failed; every one must have been recognized as a block, section or summary
     line. A header this parser could not read (a multi-line test name) would otherwise drop its failure, an import
     error included, without a trace. "" when the counts agree, or when the text holds neither a failure nor a result
@@ -834,10 +999,9 @@ def _count_mismatch(lines: list[str], ut_blocks: int, stats: dict) -> str:
     that does not split into exactly ``<file>::<name> - <message>`` (see _summary_problem), a line that starts with
     no summary word, or a number of FAILED/ERROR lines that differs from the runner's own failed+errored count."""
     if stats["bad"]:
-        return f"short-summary line: {stats['bad']}"
+        return _Reason("cnc-short-summary", f"short-summary line: {stats['bad']}")
     if stats["stray"]:
-        return "short-summary line: a line starts with no summary word (a multi-line test id?)"
-    last = _last_result(lines)
+        return _Reason("cnc-short-summary", "short-summary line: a line starts with no summary word (a multi-line test id?)")
     if ut_blocks or stats["sections"] or stats["has_summary"] or stats["summary"]:
         # R7-C1 (r8): failures were read, so the run must END in the runner's own result: the LAST non-blank line is a
         # result line (adversary A1: a result-shaped line in the middle of a cut log, printed by a failing test or pasted
@@ -846,56 +1010,68 @@ def _count_mismatch(lines: list[str], ut_blocks: int, stats: dict) -> str:
         body = [ln for ln in lines if ln.strip()]
         final = body[-1] if body else ""  # NOT stripped: a real result line starts at column 0 (adversary pass 2, A2)
         if not _RESULT_LINE.match(final):
-            return ("no final result line (the run must end in a unittest `OK`/`FAILED (...)` trailer or a pytest "
-                    "`=== N failed ... ===` bar): a cut-off log cannot be reconciled with the runner's counts")
+            return _Reason("cnc-no-result-line", "no final result line (the run must end in a unittest `OK`/`FAILED (...)` "
+                           "trailer or a pytest `=== N failed ... ===` bar): a cut-off log cannot be reconciled with the "
+                           "runner's counts")
         if not final.startswith("=") and not any(_UT_RAN.match(ln) for ln in body[:-1]):
-            return ("no final result line the counts can be read from: the unittest trailer has no `Ran N tests` footer "
-                    "before it")
-    if last is None:
+            return _Reason("cnc-no-ran-footer", "no final result line the counts can be read from: the unittest trailer "
+                           "has no `Ran N tests` footer before it")
+    if result is None:
         return ""
+    counts = result.counts  # parsed WHOLE by _read_result (r11): the only counts read below, never a rescan of the line
     pt_read = stats["sections"] or stats["summary"] or stats["has_summary"]
     # ONE RUN, ONE RUNNER (r9 adversary pass 2, A1): the terminal result reconciles only its own runner's failures, so a
     # failure read by the other runner's parser would never be counted. Either kind under the other's trailer refuses.
-    if last.startswith("FAILED (") and pt_read:
-        return ("runner: a unittest `FAILED (...)` trailer closes a run in which pytest failure sections or summary lines "
-                "were read; one run has one runner, and these failures are not in its count")
-    if last.startswith("=") and ut_blocks:
-        return ("runner: a pytest result bar closes a run in which unittest failure blocks were read; one run has one "
-                "runner, and these failures are not in its count")
-    if last.startswith("FAILED (") and any(_UT_RAN.match(ln) for ln in lines):
-        want = sum(int(n) for _kind, n in _UT_COUNTS.findall(last))
+    if result.runner == "unittest" and not result.green and pt_read:
+        return _Reason("cnc-runner", "runner: a unittest `FAILED (...)` trailer closes a run in which pytest failure "
+                       "sections or summary lines were read; one run has one runner, and these failures are not in its count")
+    if result.runner == "pytest" and ut_blocks:
+        return _Reason("cnc-runner", "runner: a pytest result bar closes a run in which unittest failure blocks were read; "
+                       "one run has one runner, and these failures are not in its count")
+    if result.runner == "unittest" and not result.green and any(_UT_RAN.match(ln) for ln in lines):
+        want = counts.get("failures", 0) + counts.get("errors", 0)
         if want != ut_blocks:  # a stated 0 counts too: `FAILED (failures=0)` over a readable block is a contradiction
-            return f"the runner counts {want} failing unittest tests but {ut_blocks} failure blocks were readable"
-    elif last.startswith("="):
-        want = sum(int(n) for n in re.findall(r"\b(\d+) (?:failed|errors?)\b", last))
+            return _Reason("cnc-count", f"the runner counts {want} failing unittest tests but {ut_blocks} failure blocks "
+                           "were readable")
+    elif result.runner == "pytest":
+        want = counts.get("failed", 0) + counts.get("errors", 0)
         if stats["sections"] and stats["sections"] != want:
-            return f"the runner counts {want} failed or errored tests but {stats['sections']} sections were readable"
+            return _Reason("cnc-count", f"the runner counts {want} failed or errored tests but {stats['sections']} "
+                           "sections were readable")
         if stats["has_summary"] and stats["summary"] != want:
-            return (f"short-summary line: the runner counts {want} failed or errored tests but "
-                    f"{stats['summary']} FAILED/ERROR lines were readable")
+            return _Reason("cnc-short-summary", f"short-summary line: the runner counts {want} failed or errored tests "
+                           f"but {stats['summary']} FAILED/ERROR lines were readable")
         for word, label in (("PASSED", "passed"), ("XFAIL", "xfailed"), ("XPASS", "xpassed"), ("SKIPPED", "skipped")):
             # ALLOWLIST (r7): only a run that lists every one of these outcomes can be reconciled, which is what
             # ``-rA`` prints. A multi-line test id can start a continuation line with any summary word, and a default
             # (``-rfE``) run prints no PASSED/SKIPPED/XFAIL/XPASS line at all, so a forged one could stand in for the
             # real ones the runner counts. The lines must add up to the runner's own count, zero included.
-            stated = re.search(rf"\b(\d+) {label}\b", last)
-            shown = int(stated[1]) if stated else 0
+            shown = counts.get(label, 0)
             if stats["words"][word] != shown:  # also with no summary section at all (-rN): the passes are still unlisted
                 hint = (": this summary lists none of them, so the run was not made with -rA (default reporting omits "
                         "PASSED/SKIPPED/XFAIL/XPASS lines)" if not stats["words"][word] else " (a multi-line test id?)")
-                return (f"short-summary line: {stats['words'][word]} {word} lines were read but the runner counts "
-                        f"{shown} {label}{hint}")
+                return _Reason("cnc-short-summary", f"short-summary line: {stats['words'][word]} {word} lines were read "
+                               f"but the runner counts {shown} {label}{hint}")
     return ""
 
 
 def parse_run(text: str | list[str]) -> Parsed:
-    """Parse a run given as text (framed here, see _frame) or as the lines _frame already returned."""
+    """Parse a run given as text (framed here, see _frame) or as the lines _frame already returned. The LAST result line
+    is parsed whole ONCE (_read_result); a malformed one is the run's mismatch, and its counts are the only ones that
+    _count_mismatch and the green check read."""
     lines = _frame(text) if isinstance(text, str) else text
     stats: dict = {}
     ut = _parse_unittest(lines)
     failures = ut + _parse_pytest(lines, stats)
+    last, result, bad = _last_result(lines), None, ""
+    if last is not None:
+        try:
+            result = _read_result(last)
+        except _Unclassifiable as exc:
+            bad = exc.reason
     return Parsed(failures=failures, red=any(_RED_MARK.search(ln) for ln in lines) or bool(failures),
-                  green=any(_GREEN_MARK.search(ln) for ln in lines), mismatch=_count_mismatch(lines, len(ut), stats))
+                  green=any(_GREEN_MARK.search(ln) for ln in lines),
+                  mismatch=bad or _count_mismatch(lines, len(ut), stats, result), result=result)
 
 
 def _matches(failure: Failure, expected: str) -> bool:
@@ -909,18 +1085,21 @@ def _matches(failure: Failure, expected: str) -> bool:
 
 
 def _precheck(lines: list[str] | None, expected: str) -> str:
-    """The typed reason this text will not be classified, or "" (see NARROWED PROMISE in the module docstring)."""
+    """The typed reason this text will not be classified, or "" (see NARROWED PROMISE in the module docstring). A
+    reason returned here is a _Reason: it carries its code."""
     if lines is None or not isinstance(expected, str) or not expected.strip():
         return ""  # the plain checks below refuse these with their own reasons
     if any(ln.strip() in _CHAIN for ln in lines):
-        return "chained exception in the output: which exception the run reports is not decided here"
+        return _Reason("cnc-chained", "chained exception in the output: which exception the run reports is not decided here")
     if any(_CAPTURED_ANY.search(ln) for ln in lines):
-        return "captured output in the run: the test's own text follows the divider and can say anything"
+        return _Reason("cnc-captured", "captured output in the run: the test's own text follows the divider and can say "
+                       "anything")
     site = _EXPECT_SITE.match(expected)
     if site:
         _line_no(site["line"])
     elif _empty_segment(expected):
-        return "empty segment in the expected test identity (`..`, a trailing `.` or `::`): no such id exists"
+        return _Reason("cnc-expectation", "empty segment in the expected test identity (`..`, a trailing `.` or `::`): no "
+                       "such id exists")
     return parse_run(lines).mismatch
 
 
@@ -929,22 +1108,25 @@ class Verdict:
     """One classification. ``reason`` is the PRIMARY reason, the one the status was decided for. ``also`` holds the
     secondary diagnostics: what the older checks would have said about text the precheck already refused. A diagnostic
     never decides anything, so a check that pins WHY a run was refused reads ``reason`` only (r10, Dot R8-T1: a
-    semantic reason matched inside an appended diagnostic hid the format refusal that actually decided the case)."""
+    semantic reason matched inside an appended diagnostic hid the format refusal that actually decided the case).
+    ``code`` is the checker's own name for the primary reason (REASON_CODES), set at the site that wrote it (r11, r10
+    adversary A2): a reason's TEXT quotes its input, so a check that pins why compares ``code``, never text."""
     status: str
     reason: str
     also: tuple[str, ...] = ()
+    code: str = "cnc-internal-error"
 
 
 def verdict(output: str, expected: str) -> tuple[str, str]:
     """Return (PASS|REFUSED, text): the primary reason, then each diagnostic after ``; also: `` (see classify). PASS
     only when `expected` is an assertion that failed. Text it cannot classify with certainty is REFUSED with a reason
-    that starts ``COULD-NOT-CHECK`` (NARROWED PROMISE, module docstring). For display: match a reason on classify()."""
+    that starts ``COULD-NOT-CHECK`` (NARROWED PROMISE, module docstring). For display: pin a reason on classify().code."""
     v = classify(output, expected)
     return v.status, v.reason + "".join(f"; also: {a}" for a in v.also)
 
 
 def classify(output: str, expected: str) -> Verdict:
-    """The verdict with its primary reason and its secondary diagnostics kept apart (see Verdict)."""
+    """The verdict with its primary reason, its code and its secondary diagnostics kept apart (see Verdict)."""
     pre, status, reason = "", REFUSED, ""
     try:
         lines = _frame(output) if isinstance(output, str) else None  # the ONE framing; every reader gets these lines
@@ -952,52 +1134,58 @@ def classify(output: str, expected: str) -> Verdict:
         status, reason = _verdict(lines, expected)
     except _Unclassifiable as exc:
         # a count or summary problem found by the precheck is the more basic one: it leads, the other follows
-        return Verdict(REFUSED, f"COULD-NOT-CHECK ({pre or exc})", (str(exc),) if pre else ())
+        return Verdict(REFUSED, f"COULD-NOT-CHECK ({pre or exc})", (str(exc),) if pre else (),
+                       pre.code if pre else exc.code)
     except Exception as exc:  # noqa: BLE001 - the promise is a refusal, never an uncaught traceback
-        return Verdict(REFUSED, f"COULD-NOT-CHECK (internal-error {type(exc).__name__} while reading the text)")
+        return Verdict(REFUSED, f"COULD-NOT-CHECK (internal-error {type(exc).__name__} while reading the text)",
+                       code="cnc-internal-error")
     if pre:
-        return Verdict(REFUSED, f"COULD-NOT-CHECK ({pre})", (reason,) if status == REFUSED else ())
-    return Verdict(status, reason)
+        return Verdict(REFUSED, f"COULD-NOT-CHECK ({pre})", (reason,) if status == REFUSED else (), pre.code)
+    return Verdict(status, reason, code=reason.code)
 
 
-def _verdict(lines: list[str] | None, expected: str) -> tuple[str, str]:
+def _verdict(lines: list[str] | None, expected: str) -> tuple[str, _Reason]:
     if not expected or not expected.strip():
-        return REFUSED, "no expected assertion given (file:line or test id): a red suite proves nothing alone"
+        return REFUSED, _Reason("no-expectation", "no expected assertion given (file:line or test id): a red suite proves "
+                                "nothing alone")
     if lines is None:
         raise TypeError("the run output is not text")  # verdict() refuses it as an internal error, as before r9
-    if _final_green(lines):
-        return REFUSED, ("the run is green (final result line): failure-looking text above it was test output, "
-                         "so no assertion failed")
-    run = parse_run(lines)
+    run = parse_run(lines)  # the precheck parsed these lines already, so anything this raises it raised first
+    if run.result is not None and run.result.green:  # the LAST result line, parsed whole (r11)
+        return REFUSED, _Reason("final-green", "the run is green (final result line): failure-looking text above it was "
+                                "test output, so no assertion failed")
     for f in run.failures:
         if f.odd:
-            raise _Unclassifiable(f.odd)
+            raise _Unclassifiable(f.odd.code, f.odd)
     if not run.failures and not run.red:
         if run.green:
-            return REFUSED, "the run is green: the mutation was not detected by any assertion"
-        return REFUSED, "unrecognized output: no unittest or pytest result found, so nothing is proven"
+            return REFUSED, _Reason("green", "the run is green: the mutation was not detected by any assertion")
+        return REFUSED, _Reason("unrecognized", "unrecognized output: no unittest or pytest result found, so nothing is "
+                                "proven")
     if not run.failures:
-        return REFUSED, "the run is red but names no failing assertion (no FAIL/FAILED block with a location)"
+        return REFUSED, _Reason("red-no-assertion", "the run is red but names no failing assertion (no FAIL/FAILED block "
+                                "with a location)")
     broken = [f for f in run.failures if f.collection]
     if broken:
-        return REFUSED, ("collection or import error in the run (" + broken[0].note[:80]
-                         + "): red for a reason that is not the assertion")
+        return REFUSED, _Reason("collection", "collection or import error in the run (" + broken[0].note[:80]
+                                + "): red for a reason that is not the assertion")
     for f in run.failures:
         why = _foreign_type(f)
         if why:
-            raise _Unclassifiable(why)
+            raise _Unclassifiable(why.code, why)
     hit = [f for f in run.failures if _matches(f, expected)]
     if not _EXPECT_SITE.match(expected):
         named = sorted({i for f in hit for i in f.ids})
         if len(named) > 1:
-            return REFUSED, (f"{expected} is ambiguous: it matches {len(named)} failing tests ("
-                             + ", ".join(named[:4]) + "); name the class")
+            return REFUSED, _Reason("ambiguous-expectation", f"{expected} is ambiguous: it matches {len(named)} failing "
+                                    "tests (" + ", ".join(named[:4]) + "); name the class")
     if any(f.assertion for f in hit):
-        return PASS, f"assertion failed at {expected}"
+        return PASS, _Reason("assertion-failed", f"assertion failed at {expected}")
     if hit:
-        return REFUSED, f"{expected} raised a non-assertion error ({hit[0].note[:80]}): the mutation did not fail the assertion"
+        return REFUSED, _Reason("non-assertion", f"{expected} raised a non-assertion error ({hit[0].note[:80]}): the "
+                                "mutation did not fail the assertion")
     others = sorted({f.ids[0] if f.ids else f.note for f in run.failures})
-    return REFUSED, f"the run is red but not at {expected}; it failed at: " + ", ".join(others[:5])
+    return REFUSED, _Reason("not-at", f"the run is red but not at {expected}; it failed at: " + ", ".join(others[:5]))
 
 
 def _num(v: object) -> int | float:
@@ -1060,27 +1248,41 @@ def _cli_num(v: str) -> object:
 
 def probe_discriminates(bug_value: float, fix_value: float, window: tuple[float, float]) -> tuple[bool, str]:
     """True only when the FIX reading is inside the closed window and the BUG reading is outside."""
+    v = probe_classify(bug_value, fix_value, window)
+    return v.status == PASS, v.reason
+
+
+def probe_classify(bug_value: float, fix_value: float, window: tuple[float, float]) -> Verdict:
+    """probe_discriminates as a Verdict with its reason code (r11): PASS only when the probe separates bug from fix."""
+    def no(code: str, text: str) -> Verdict:
+        return Verdict(REFUSED, text, code=code)
+
     try:
         if type(window) not in (list, tuple) or len(window) != 2:  # a dict's keys or a 2-character string are not bounds
             raise TypeError("window must be a list or tuple of exactly two bounds")
         lo, hi = window
         bug_value, fix_value, lo, hi = _num(bug_value), _num(fix_value), _num(lo), _num(hi)
     except (TypeError, ValueError, OverflowError):
-        return False, "COULD-NOT-CHECK (number: probe readings and window must be numbers a float can hold, given as an int, a float or ASCII numeric text)"
+        return no("probe-number", "COULD-NOT-CHECK (number: probe readings and window must be numbers a float can hold, "
+                  "given as an int, a float or ASCII numeric text)")
     if any(isinstance(v, float) and math.isnan(v) for v in (bug_value, fix_value, lo, hi)):
-        return False, "NaN reading or window bound"
+        return no("probe-nan", "NaN reading or window bound")
     if any(isinstance(v, float) and math.isinf(v) for v in (bug_value, fix_value)):
-        return False, "COULD-NOT-CHECK (number: a probe reading must be finite; only a window bound may be infinite)"
+        return no("probe-infinite", "COULD-NOT-CHECK (number: a probe reading must be finite; only a window bound may be "
+                  "infinite)")
     if lo > hi:
-        return False, f"empty window ({lo} > {hi})"
+        return no("probe-empty-window", f"empty window ({lo} > {hi})")
     bug_in, fix_in = lo <= bug_value <= hi, lo <= fix_value <= hi
     if bug_in and fix_in:
-        return False, f"bug reading {bug_value} and fix reading {fix_value} both sit inside [{lo}, {hi}]: the assertion passes under both"
+        return no("probe-both-inside", f"bug reading {bug_value} and fix reading {fix_value} both sit inside "
+                  f"[{lo}, {hi}]: the assertion passes under both")
     if not bug_in and not fix_in:
-        return False, f"neither reading sits inside [{lo}, {hi}]: the assertion fails under the fix"
+        return no("probe-neither-inside", f"neither reading sits inside [{lo}, {hi}]: the assertion fails under the fix")
     if bug_in:
-        return False, f"only the bug reading {bug_value} sits inside [{lo}, {hi}]: the assertion passes under the bug and fails under the fix"
-    return True, f"fix reading {fix_value} inside [{lo}, {hi}], bug reading {bug_value} outside"
+        return no("probe-bug-inside", f"only the bug reading {bug_value} sits inside [{lo}, {hi}]: the assertion passes "
+                  "under the bug and fails under the fix")
+    return Verdict(PASS, f"fix reading {fix_value} inside [{lo}, {hi}], bug reading {bug_value} outside",
+                   code="probe-separates")
 
 
 def main(argv: list[str] | None = None) -> int:

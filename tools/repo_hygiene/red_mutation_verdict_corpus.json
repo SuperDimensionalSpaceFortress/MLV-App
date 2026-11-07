@@ -1,6 +1,6 @@
 {
  "schema": "red-mutation-verdict-corpus.v1",
- "note": "Pinned cases for tools/repo_hygiene/red_mutation_verdict.py. Each case records the verdict the checker must return; DG-RED-MUTATION-VERDICT fails when any case disagrees.",
+ "note": "Pinned cases for tools/repo_hygiene/red_mutation_verdict.py. Each case records the verdict the checker must return; DG-RED-MUTATION-VERDICT fails when any case disagrees. A case records the checker's reason `code` (red_mutation_verdict.REASON_CODES), never a text: the guard compares codes (r11).",
  "cases": [
   {
    "id": "ut-fails-at-expected-line",
@@ -8,7 +8,8 @@
    "why": "unittest FAIL block whose frame is the expected file:line",
    "output": "test_a (test_s.T.test_a) ... FAIL\ntest_b (test_s.T.test_b) ... ok\ntest_c (test_s.T.test_c) ... FAIL\ntest_d (test_s.T.test_d) ... ERROR\n\n======================================================================\nERROR: test_d (test_s.T.test_d)\n----------------------------------------------------------------------\nTraceback (most recent call last):\n  File \"C:\\work\\test_s.py\", line 17, in test_d\n    raise TypeError(\"boom\")\nTypeError: boom\n\n======================================================================\nFAIL: test_a (test_s.T.test_a)\n----------------------------------------------------------------------\nTraceback (most recent call last):\n  File \"C:\\work\\test_s.py\", line 8, in test_a\n    self.assertEqual(3, 4)\n    ~~~~~~~~~~~~~~~~^^^^^^\nAssertionError: 3 != 4\n\n======================================================================\nFAIL: test_c (test_s.T.test_c)\n----------------------------------------------------------------------\nTraceback (most recent call last):\n  File \"C:\\work\\test_s.py\", line 14, in test_c\n    helper(2)\n    ~~~~~~^^^\n  File \"C:\\work\\test_s.py\", line 4, in helper\n    assert x == 1, \"helper\"\n           ^^^^^^\nAssertionError: helper\n\n----------------------------------------------------------------------\nRan 4 tests in 0.001s\n\nFAILED (failures=2, errors=1)\n",
    "expected_assertion": "test_s.py:8",
-   "expect": "PASS"
+   "expect": "PASS",
+   "code": "assertion-failed"
   },
   {
    "id": "ut-fails-at-expected-test-id",
@@ -16,7 +17,8 @@
    "why": "unittest FAIL block whose id is the expected test",
    "output": "test_a (test_s.T.test_a) ... FAIL\ntest_b (test_s.T.test_b) ... ok\ntest_c (test_s.T.test_c) ... FAIL\ntest_d (test_s.T.test_d) ... ERROR\n\n======================================================================\nERROR: test_d (test_s.T.test_d)\n----------------------------------------------------------------------\nTraceback (most recent call last):\n  File \"C:\\work\\test_s.py\", line 17, in test_d\n    raise TypeError(\"boom\")\nTypeError: boom\n\n======================================================================\nFAIL: test_a (test_s.T.test_a)\n----------------------------------------------------------------------\nTraceback (most recent call last):\n  File \"C:\\work\\test_s.py\", line 8, in test_a\n    self.assertEqual(3, 4)\n    ~~~~~~~~~~~~~~~~^^^^^^\nAssertionError: 3 != 4\n\n======================================================================\nFAIL: test_c (test_s.T.test_c)\n----------------------------------------------------------------------\nTraceback (most recent call last):\n  File \"C:\\work\\test_s.py\", line 14, in test_c\n    helper(2)\n    ~~~~~~^^^\n  File \"C:\\work\\test_s.py\", line 4, in helper\n    assert x == 1, \"helper\"\n           ^^^^^^\nAssertionError: helper\n\n----------------------------------------------------------------------\nRan 4 tests in 0.001s\n\nFAILED (failures=2, errors=1)\n",
    "expected_assertion": "test_s.T.test_a",
-   "expect": "PASS"
+   "expect": "PASS",
+   "code": "assertion-failed"
   },
   {
    "id": "ut-fails-through-helper-frame",
@@ -24,7 +26,8 @@
    "why": "the expected line is the caller frame of a helper that raised",
    "output": "test_a (test_s.T.test_a) ... FAIL\ntest_b (test_s.T.test_b) ... ok\ntest_c (test_s.T.test_c) ... FAIL\ntest_d (test_s.T.test_d) ... ERROR\n\n======================================================================\nERROR: test_d (test_s.T.test_d)\n----------------------------------------------------------------------\nTraceback (most recent call last):\n  File \"C:\\work\\test_s.py\", line 17, in test_d\n    raise TypeError(\"boom\")\nTypeError: boom\n\n======================================================================\nFAIL: test_a (test_s.T.test_a)\n----------------------------------------------------------------------\nTraceback (most recent call last):\n  File \"C:\\work\\test_s.py\", line 8, in test_a\n    self.assertEqual(3, 4)\n    ~~~~~~~~~~~~~~~~^^^^^^\nAssertionError: 3 != 4\n\n======================================================================\nFAIL: test_c (test_s.T.test_c)\n----------------------------------------------------------------------\nTraceback (most recent call last):\n  File \"C:\\work\\test_s.py\", line 14, in test_c\n    helper(2)\n    ~~~~~~^^^\n  File \"C:\\work\\test_s.py\", line 4, in helper\n    assert x == 1, \"helper\"\n           ^^^^^^\nAssertionError: helper\n\n----------------------------------------------------------------------\nRan 4 tests in 0.001s\n\nFAILED (failures=2, errors=1)\n",
    "expected_assertion": "test_s.py:14",
-   "expect": "PASS"
+   "expect": "PASS",
+   "code": "assertion-failed"
   },
   {
    "id": "ut-expected-test-passed",
@@ -33,7 +36,7 @@
    "output": "test_a (test_s.T.test_a) ... FAIL\ntest_b (test_s.T.test_b) ... ok\ntest_c (test_s.T.test_c) ... FAIL\ntest_d (test_s.T.test_d) ... ERROR\n\n======================================================================\nERROR: test_d (test_s.T.test_d)\n----------------------------------------------------------------------\nTraceback (most recent call last):\n  File \"C:\\work\\test_s.py\", line 17, in test_d\n    raise TypeError(\"boom\")\nTypeError: boom\n\n======================================================================\nFAIL: test_a (test_s.T.test_a)\n----------------------------------------------------------------------\nTraceback (most recent call last):\n  File \"C:\\work\\test_s.py\", line 8, in test_a\n    self.assertEqual(3, 4)\n    ~~~~~~~~~~~~~~~~^^^^^^\nAssertionError: 3 != 4\n\n======================================================================\nFAIL: test_c (test_s.T.test_c)\n----------------------------------------------------------------------\nTraceback (most recent call last):\n  File \"C:\\work\\test_s.py\", line 14, in test_c\n    helper(2)\n    ~~~~~~^^^\n  File \"C:\\work\\test_s.py\", line 4, in helper\n    assert x == 1, \"helper\"\n           ^^^^^^\nAssertionError: helper\n\n----------------------------------------------------------------------\nRan 4 tests in 0.001s\n\nFAILED (failures=2, errors=1)\n",
    "expected_assertion": "test_s.py:11",
    "expect": "REFUSED",
-   "reason": "the run is red but not at"
+   "code": "not-at"
   },
   {
    "id": "ut-expected-site-raised-non-assertion",
@@ -42,7 +45,7 @@
    "output": "test_a (test_s.T.test_a) ... FAIL\ntest_b (test_s.T.test_b) ... ok\ntest_c (test_s.T.test_c) ... FAIL\ntest_d (test_s.T.test_d) ... ERROR\n\n======================================================================\nERROR: test_d (test_s.T.test_d)\n----------------------------------------------------------------------\nTraceback (most recent call last):\n  File \"C:\\work\\test_s.py\", line 17, in test_d\n    raise TypeError(\"boom\")\nTypeError: boom\n\n======================================================================\nFAIL: test_a (test_s.T.test_a)\n----------------------------------------------------------------------\nTraceback (most recent call last):\n  File \"C:\\work\\test_s.py\", line 8, in test_a\n    self.assertEqual(3, 4)\n    ~~~~~~~~~~~~~~~~^^^^^^\nAssertionError: 3 != 4\n\n======================================================================\nFAIL: test_c (test_s.T.test_c)\n----------------------------------------------------------------------\nTraceback (most recent call last):\n  File \"C:\\work\\test_s.py\", line 14, in test_c\n    helper(2)\n    ~~~~~~^^^\n  File \"C:\\work\\test_s.py\", line 4, in helper\n    assert x == 1, \"helper\"\n           ^^^^^^\nAssertionError: helper\n\n----------------------------------------------------------------------\nRan 4 tests in 0.001s\n\nFAILED (failures=2, errors=1)\n",
    "expected_assertion": "test_s.py:17",
    "expect": "REFUSED",
-   "reason": "raised a non-assertion error"
+   "code": "non-assertion"
   },
   {
    "id": "ut-import-error-is-not-the-assertion",
@@ -51,7 +54,7 @@
    "output": "E\n======================================================================\nERROR: test_bad (unittest.loader._FailedTest.test_bad)\n----------------------------------------------------------------------\nImportError: Failed to import test module: test_bad\nTraceback (most recent call last):\n  File \"C:\\py\\Lib\\unittest\\loader.py\", line 137, in loadTestsFromName\n    module = __import__(module_name)\n  File \"C:\\work\\test_bad.py\", line 1, in <module>\n    import nonexistent_mod_zz\nModuleNotFoundError: No module named 'nonexistent_mod_zz'\n\n\n----------------------------------------------------------------------\nRan 1 test in 0.000s\n\nFAILED (errors=1)\n",
    "expected_assertion": "test_bad.py:1",
    "expect": "REFUSED",
-   "reason": "collection or import error"
+   "code": "collection"
   },
   {
    "id": "ut-green-run",
@@ -60,7 +63,7 @@
    "output": "Ran 4 tests in 0.001s\n\nOK\n",
    "expected_assertion": "test_s.py:8",
    "expect": "REFUSED",
-   "reason": "the run is green"
+   "code": "final-green"
   },
   {
    "id": "ut-red-names-no-assertion",
@@ -69,7 +72,7 @@
    "output": "Ran 1 test in 0.000s\n\nFAILED (failures=1)\n",
    "expected_assertion": "test_s.py:8",
    "expect": "REFUSED",
-   "reason": "the runner counts 1 failing unittest tests but 0 failure blocks were readable"
+   "code": "cnc-count"
   },
   {
    "id": "unrecognized-output",
@@ -78,7 +81,7 @@
    "output": "hello world\n",
    "expected_assertion": "test_s.py:8",
    "expect": "REFUSED",
-   "reason": "unrecognized output"
+   "code": "unrecognized"
   },
   {
    "id": "no-expected-assertion-given",
@@ -87,7 +90,7 @@
    "output": "test_a (test_s.T.test_a) ... FAIL\ntest_b (test_s.T.test_b) ... ok\ntest_c (test_s.T.test_c) ... FAIL\ntest_d (test_s.T.test_d) ... ERROR\n\n======================================================================\nERROR: test_d (test_s.T.test_d)\n----------------------------------------------------------------------\nTraceback (most recent call last):\n  File \"C:\\work\\test_s.py\", line 17, in test_d\n    raise TypeError(\"boom\")\nTypeError: boom\n\n======================================================================\nFAIL: test_a (test_s.T.test_a)\n----------------------------------------------------------------------\nTraceback (most recent call last):\n  File \"C:\\work\\test_s.py\", line 8, in test_a\n    self.assertEqual(3, 4)\n    ~~~~~~~~~~~~~~~~^^^^^^\nAssertionError: 3 != 4\n\n======================================================================\nFAIL: test_c (test_s.T.test_c)\n----------------------------------------------------------------------\nTraceback (most recent call last):\n  File \"C:\\work\\test_s.py\", line 14, in test_c\n    helper(2)\n    ~~~~~~^^^\n  File \"C:\\work\\test_s.py\", line 4, in helper\n    assert x == 1, \"helper\"\n           ^^^^^^\nAssertionError: helper\n\n----------------------------------------------------------------------\nRan 4 tests in 0.001s\n\nFAILED (failures=2, errors=1)\n",
    "expected_assertion": "",
    "expect": "REFUSED",
-   "reason": "no expected assertion given"
+   "code": "no-expectation"
   },
   {
    "id": "pt-fails-at-expected-line",
@@ -95,7 +98,8 @@
    "why": "pytest section with the file:line location",
    "output": "============================= test session starts =============================\ncollected 4 items\n\ntest_s.py F.FF                                                           [100%]\n\n================================== FAILURES ===================================\n__________________________________ T.test_a ___________________________________\n\nself = <test_s.T testMethod=test_a>\n\n    def test_a(self):\n>       self.assertEqual(3, 4)\nE       AssertionError: 3 != 4\n\ntest_s.py:8: AssertionError\n__________________________________ T.test_c ___________________________________\n\nself = <test_s.T testMethod=test_c>\n\n    def test_c(self):\n>       helper(2)\n\ntest_s.py:14: \n_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _\n\nx = 2\n\n    def helper(x):\n>       assert x == 1, \"helper\"\nE       AssertionError: helper\nE       assert 2 == 1\n\ntest_s.py:4: AssertionError\n__________________________________ T.test_d ___________________________________\n\nself = <test_s.T testMethod=test_d>\n\n    def test_d(self):\n>       raise TypeError(\"boom\")\nE       TypeError: boom\n\ntest_s.py:17: TypeError\n=========================== short test summary info ===========================\nPASSED test_s.py::T::test_b\nFAILED test_s.py::T::test_a - AssertionError: 3 != 4\nFAILED test_s.py::T::test_c - AssertionError: helper\nFAILED test_s.py::T::test_d - TypeError: boom\n========================= 3 failed, 1 passed in 0.33s =========================\n",
    "expected_assertion": "test_s.py:8",
-   "expect": "PASS"
+   "expect": "PASS",
+   "code": "assertion-failed"
   },
   {
    "id": "pt-fails-at-expected-node-id",
@@ -103,7 +107,8 @@
    "why": "pytest node id from the FAILED summary",
    "output": "============================= test session starts =============================\ncollected 4 items\n\ntest_s.py F.FF                                                           [100%]\n\n================================== FAILURES ===================================\n__________________________________ T.test_a ___________________________________\n\nself = <test_s.T testMethod=test_a>\n\n    def test_a(self):\n>       self.assertEqual(3, 4)\nE       AssertionError: 3 != 4\n\ntest_s.py:8: AssertionError\n__________________________________ T.test_c ___________________________________\n\nself = <test_s.T testMethod=test_c>\n\n    def test_c(self):\n>       helper(2)\n\ntest_s.py:14: \n_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _\n\nx = 2\n\n    def helper(x):\n>       assert x == 1, \"helper\"\nE       AssertionError: helper\nE       assert 2 == 1\n\ntest_s.py:4: AssertionError\n__________________________________ T.test_d ___________________________________\n\nself = <test_s.T testMethod=test_d>\n\n    def test_d(self):\n>       raise TypeError(\"boom\")\nE       TypeError: boom\n\ntest_s.py:17: TypeError\n=========================== short test summary info ===========================\nPASSED test_s.py::T::test_b\nFAILED test_s.py::T::test_a - AssertionError: 3 != 4\nFAILED test_s.py::T::test_c - AssertionError: helper\nFAILED test_s.py::T::test_d - TypeError: boom\n========================= 3 failed, 1 passed in 0.33s =========================\n",
    "expected_assertion": "test_s.py::T::test_a",
-   "expect": "PASS"
+   "expect": "PASS",
+   "code": "assertion-failed"
   },
   {
    "id": "pt-expected-site-raised-non-assertion",
@@ -112,7 +117,7 @@
    "output": "============================= test session starts =============================\ncollected 4 items\n\ntest_s.py F.FF                                                           [100%]\n\n================================== FAILURES ===================================\n__________________________________ T.test_a ___________________________________\n\nself = <test_s.T testMethod=test_a>\n\n    def test_a(self):\n>       self.assertEqual(3, 4)\nE       AssertionError: 3 != 4\n\ntest_s.py:8: AssertionError\n__________________________________ T.test_c ___________________________________\n\nself = <test_s.T testMethod=test_c>\n\n    def test_c(self):\n>       helper(2)\n\ntest_s.py:14: \n_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _\n\nx = 2\n\n    def helper(x):\n>       assert x == 1, \"helper\"\nE       AssertionError: helper\nE       assert 2 == 1\n\ntest_s.py:4: AssertionError\n__________________________________ T.test_d ___________________________________\n\nself = <test_s.T testMethod=test_d>\n\n    def test_d(self):\n>       raise TypeError(\"boom\")\nE       TypeError: boom\n\ntest_s.py:17: TypeError\n=========================== short test summary info ===========================\nPASSED test_s.py::T::test_b\nFAILED test_s.py::T::test_a - AssertionError: 3 != 4\nFAILED test_s.py::T::test_c - AssertionError: helper\nFAILED test_s.py::T::test_d - TypeError: boom\n========================= 3 failed, 1 passed in 0.33s =========================\n",
    "expected_assertion": "test_s.py:17",
    "expect": "REFUSED",
-   "reason": "raised a non-assertion error"
+   "code": "non-assertion"
   },
   {
    "id": "pt-collection-error",
@@ -121,7 +126,7 @@
    "output": "============================= test session starts =============================\ncollected 0 items / 1 error\n\n=================================== ERRORS ====================================\n________________________ ERROR collecting test_bad.py _________________________\nImportError while importing test module 'C:\\work\\test_bad.py'.\nHint: make sure your test modules/packages have valid Python names.\nTraceback:\nC:\\py\\Lib\\importlib\\__init__.py:88: in import_module\n    return _bootstrap._gcd_import(name[level:], package, level)\n           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\ntest_bad.py:1: in <module>\n    import nonexistent_mod_zz\nE   ModuleNotFoundError: No module named 'nonexistent_mod_zz'\n!!!!!!!!!!!!!!!!!!! Interrupted: 1 error during collection !!!!!!!!!!!!!!!!!!!!\n============================== 1 error in 0.40s ===============================\n",
    "expected_assertion": "test_bad.py:1",
    "expect": "REFUSED",
-   "reason": "collection or import error"
+   "code": "collection"
   },
   {
    "id": "pt-green-run",
@@ -130,7 +135,7 @@
    "output": "============================= test session starts =============================\ncollected 4 items\n\ntest_s.py ....                                                           [100%]\n\n=========================== short test summary info ===========================\nPASSED test_s.py::T::test_a\nPASSED test_s.py::T::test_b\nPASSED test_s.py::T::test_c\nPASSED test_s.py::T::test_d\n=========================== 4 passed in 0.10s ===========================\n",
    "expected_assertion": "test_s.py:8",
    "expect": "REFUSED",
-   "reason": "the run is green"
+   "code": "final-green"
   },
   {
    "id": "probe-705-2.8s-rounds-to-3-both-ways",
@@ -143,7 +148,7 @@
     3
    ],
    "expect": "REFUSED",
-   "reason": "both sit inside"
+   "code": "probe-both-inside"
   },
   {
    "id": "probe-705-2.2s-int32-overload-also-reads-inside",
@@ -156,7 +161,7 @@
     2.5
    ],
    "expect": "REFUSED",
-   "reason": "both sit inside"
+   "code": "probe-both-inside"
   },
   {
    "id": "probe-minutes-vs-seconds-30-passes-both",
@@ -169,7 +174,7 @@
     1000000000
    ],
    "expect": "REFUSED",
-   "reason": "both sit inside"
+   "code": "probe-both-inside"
   },
   {
    "id": "probe-minutes-vs-seconds-0.05-separates",
@@ -181,7 +186,8 @@
     1,
     5
    ],
-   "expect": "PASS"
+   "expect": "PASS",
+   "code": "probe-separates"
   },
   {
    "id": "probe-bug-inside-fix-outside",
@@ -194,7 +200,7 @@
     5
    ],
    "expect": "REFUSED",
-   "reason": "only the bug reading"
+   "code": "probe-bug-inside"
   },
   {
    "id": "probe-empty-window",
@@ -207,7 +213,7 @@
     1
    ],
    "expect": "REFUSED",
-   "reason": "empty window"
+   "code": "probe-empty-window"
   },
   {
    "id": "ut-same-method-other-class",
@@ -216,7 +222,7 @@
    "output": "test_scale (test_s.A.test_scale) ... ok\ntest_scale (test_s.B.test_scale) ... FAIL\n\n======================================================================\nFAIL: test_scale (test_s.B.test_scale)\n----------------------------------------------------------------------\nTraceback (most recent call last):\n  File \"C:\\wk\\test_s.py\", line 12, in test_scale\n    self.assertEqual(scale(2), 121)\n    ~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^\nAssertionError: 120 != 121\n\n----------------------------------------------------------------------\nRan 2 tests in 0.001s\n\nFAILED (failures=1)\n",
    "expected_assertion": "test_s.A.test_scale",
    "expect": "REFUSED",
-   "reason": "the run is red but not at"
+   "code": "not-at"
   },
   {
    "id": "ut-qualified-id-of-the-failing-class",
@@ -224,7 +230,8 @@
    "why": "control: B.test_scale is the one that failed",
    "output": "test_scale (test_s.A.test_scale) ... ok\ntest_scale (test_s.B.test_scale) ... FAIL\n\n======================================================================\nFAIL: test_scale (test_s.B.test_scale)\n----------------------------------------------------------------------\nTraceback (most recent call last):\n  File \"C:\\wk\\test_s.py\", line 12, in test_scale\n    self.assertEqual(scale(2), 121)\n    ~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^\nAssertionError: 120 != 121\n\n----------------------------------------------------------------------\nRan 2 tests in 0.001s\n\nFAILED (failures=1)\n",
    "expected_assertion": "test_s.B.test_scale",
-   "expect": "PASS"
+   "expect": "PASS",
+   "code": "assertion-failed"
   },
   {
    "id": "ut-nonexistent-qualified-id",
@@ -233,7 +240,7 @@
    "output": "test_scale (test_s.A.test_scale) ... ok\ntest_scale (test_s.B.test_scale) ... FAIL\n\n======================================================================\nFAIL: test_scale (test_s.B.test_scale)\n----------------------------------------------------------------------\nTraceback (most recent call last):\n  File \"C:\\wk\\test_s.py\", line 12, in test_scale\n    self.assertEqual(scale(2), 121)\n    ~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^\nAssertionError: 120 != 121\n\n----------------------------------------------------------------------\nRan 2 tests in 0.001s\n\nFAILED (failures=1)\n",
    "expected_assertion": "zz.Nope.test_scale",
    "expect": "REFUSED",
-   "reason": "the run is red but not at"
+   "code": "not-at"
   },
   {
    "id": "ut-wrong-module-and-class-same-method",
@@ -242,7 +249,7 @@
    "output": "test_scale (test_s.A.test_scale) ... ok\ntest_scale (test_s.B.test_scale) ... FAIL\n\n======================================================================\nFAIL: test_scale (test_s.B.test_scale)\n----------------------------------------------------------------------\nTraceback (most recent call last):\n  File \"C:\\wk\\test_s.py\", line 12, in test_scale\n    self.assertEqual(scale(2), 121)\n    ~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^\nAssertionError: 120 != 121\n\n----------------------------------------------------------------------\nRan 2 tests in 0.001s\n\nFAILED (failures=1)\n",
    "expected_assertion": "wrong.Expected.test_scale",
    "expect": "REFUSED",
-   "reason": "the run is red but not at"
+   "code": "not-at"
   },
   {
    "id": "ut-file-line-other-directory",
@@ -251,7 +258,7 @@
    "output": "test_scale (test_s.A.test_scale) ... ok\ntest_scale (test_s.B.test_scale) ... FAIL\n\n======================================================================\nFAIL: test_scale (test_s.B.test_scale)\n----------------------------------------------------------------------\nTraceback (most recent call last):\n  File \"test_s.py\", line 12, in test_scale\n    self.assertEqual(scale(2), 121)\n    ~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^\nAssertionError: 120 != 121\n\n----------------------------------------------------------------------\nRan 2 tests in 0.001s\n\nFAILED (failures=1)\n",
    "expected_assertion": "elsewhere/test_s.py:12",
    "expect": "REFUSED",
-   "reason": "the run is red but not at"
+   "code": "not-at"
   },
   {
    "id": "ut-file-line-bare-name-matches-relative-frame",
@@ -259,7 +266,8 @@
    "why": "control: test_s.py:12 against a frame that is test_s.py:12",
    "output": "test_scale (test_s.A.test_scale) ... ok\ntest_scale (test_s.B.test_scale) ... FAIL\n\n======================================================================\nFAIL: test_scale (test_s.B.test_scale)\n----------------------------------------------------------------------\nTraceback (most recent call last):\n  File \"test_s.py\", line 12, in test_scale\n    self.assertEqual(scale(2), 121)\n    ~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^\nAssertionError: 120 != 121\n\n----------------------------------------------------------------------\nRan 2 tests in 0.001s\n\nFAILED (failures=1)\n",
    "expected_assertion": "test_s.py:12",
-   "expect": "PASS"
+   "expect": "PASS",
+   "code": "assertion-failed"
   },
   {
    "id": "ut-bare-method-name-matches-two-failures",
@@ -268,7 +276,7 @@
    "output": "test_scale (test_s.A.test_scale) ... FAIL\ntest_scale (test_s.B.test_scale) ... FAIL\n\n======================================================================\nFAIL: test_scale (test_s.A.test_scale)\n----------------------------------------------------------------------\nTraceback (most recent call last):\n  File \"C:\\wk\\test_s.py\", line 8, in test_scale\n    self.assertEqual(scale(2), 121)\n    ~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^\nAssertionError: 120 != 121\n\n======================================================================\nFAIL: test_scale (test_s.B.test_scale)\n----------------------------------------------------------------------\nTraceback (most recent call last):\n  File \"C:\\wk\\test_s.py\", line 12, in test_scale\n    self.assertEqual(scale(2), 121)\n    ~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^\nAssertionError: 120 != 121\n\n----------------------------------------------------------------------\nRan 2 tests in 0.001s\n\nFAILED (failures=2)\n",
    "expected_assertion": "test_scale",
    "expect": "REFUSED",
-   "reason": "is ambiguous"
+   "code": "ambiguous-expectation"
   },
   {
    "id": "ut-qualified-name-picks-one-of-two-failures",
@@ -276,7 +284,8 @@
    "why": "control: both classes failed, A.test_scale is named",
    "output": "test_scale (test_s.A.test_scale) ... FAIL\ntest_scale (test_s.B.test_scale) ... FAIL\n\n======================================================================\nFAIL: test_scale (test_s.A.test_scale)\n----------------------------------------------------------------------\nTraceback (most recent call last):\n  File \"C:\\wk\\test_s.py\", line 8, in test_scale\n    self.assertEqual(scale(2), 121)\n    ~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^\nAssertionError: 120 != 121\n\n======================================================================\nFAIL: test_scale (test_s.B.test_scale)\n----------------------------------------------------------------------\nTraceback (most recent call last):\n  File \"C:\\wk\\test_s.py\", line 12, in test_scale\n    self.assertEqual(scale(2), 121)\n    ~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^\nAssertionError: 120 != 121\n\n----------------------------------------------------------------------\nRan 2 tests in 0.001s\n\nFAILED (failures=2)\n",
    "expected_assertion": "A.test_scale",
-   "expect": "PASS"
+   "expect": "PASS",
+   "code": "assertion-failed"
   },
   {
    "id": "pt-same-function-other-file",
@@ -285,7 +294,7 @@
    "output": "============================= test session starts =============================\nplatform win32 -- Python 3.14.3, pytest-9.0.3, pluggy-1.6.0\nrootdir: C:\\wk\nplugins: anyio-4.13.0, hypothesis-6.152.4\ncollected 2 items\n\na\\test_s.py F                                                            [ 50%]\nb\\test_s.py .                                                            [100%]\n\n================================== FAILURES ===================================\n___________________________________ test_x ____________________________________\n\n    def test_x():\n>       assert 1 == 2\nE       assert 1 == 2\n\na\\test_s.py:2: AssertionError\n=========================== short test summary info ===========================\nPASSED b/test_s.py::test_x\nFAILED a/test_s.py::test_x - assert 1 == 2\n========================= 1 failed, 1 passed in 0.52s =========================\n",
    "expected_assertion": "b/test_s.py::test_x",
    "expect": "REFUSED",
-   "reason": "the run is red but not at"
+   "code": "not-at"
   },
   {
    "id": "pt-function-in-the-failing-file",
@@ -293,7 +302,8 @@
    "why": "control: a/test_s.py::test_x is the failure",
    "output": "============================= test session starts =============================\nplatform win32 -- Python 3.14.3, pytest-9.0.3, pluggy-1.6.0\nrootdir: C:\\wk\nplugins: anyio-4.13.0, hypothesis-6.152.4\ncollected 2 items\n\na\\test_s.py F                                                            [ 50%]\nb\\test_s.py .                                                            [100%]\n\n================================== FAILURES ===================================\n___________________________________ test_x ____________________________________\n\n    def test_x():\n>       assert 1 == 2\nE       assert 1 == 2\n\na\\test_s.py:2: AssertionError\n=========================== short test summary info ===========================\nPASSED b/test_s.py::test_x\nFAILED a/test_s.py::test_x - assert 1 == 2\n========================= 1 failed, 1 passed in 0.52s =========================\n",
    "expected_assertion": "a/test_s.py::test_x",
-   "expect": "PASS"
+   "expect": "PASS",
+   "code": "assertion-failed"
   },
   {
    "id": "pt-two-files-name-the-second",
@@ -301,7 +311,8 @@
    "why": "test_x failed in both files; the second is named",
    "output": "============================= test session starts =============================\nplatform win32 -- Python 3.14.3, pytest-9.0.3, pluggy-1.6.0\nrootdir: C:\\wk\nplugins: anyio-4.13.0, hypothesis-6.152.4\ncollected 2 items\n\na\\test_s.py F                                                            [ 50%]\nb\\test_s.py F                                                            [100%]\n\n================================== FAILURES ===================================\n___________________________________ test_x ____________________________________\n\n    def test_x():\n>       assert 1 == 2\nE       assert 1 == 2\n\na\\test_s.py:2: AssertionError\n___________________________________ test_x ____________________________________\n\n    def test_x():\n>       assert 1 == 2\nE       assert 1 == 2\n\nb\\test_s.py:2: AssertionError\n=========================== short test summary info ===========================\nFAILED a/test_s.py::test_x - assert 1 == 2\nFAILED b/test_s.py::test_x - assert 1 == 2\n============================== 2 failed in 0.55s ==============================\n",
    "expected_assertion": "b/test_s.py::test_x",
-   "expect": "PASS"
+   "expect": "PASS",
+   "code": "assertion-failed"
   },
   {
    "id": "pt-two-files-name-a-third",
@@ -310,7 +321,7 @@
    "output": "============================= test session starts =============================\nplatform win32 -- Python 3.14.3, pytest-9.0.3, pluggy-1.6.0\nrootdir: C:\\wk\nplugins: anyio-4.13.0, hypothesis-6.152.4\ncollected 2 items\n\na\\test_s.py F                                                            [ 50%]\nb\\test_s.py F                                                            [100%]\n\n================================== FAILURES ===================================\n___________________________________ test_x ____________________________________\n\n    def test_x():\n>       assert 1 == 2\nE       assert 1 == 2\n\na\\test_s.py:2: AssertionError\n___________________________________ test_x ____________________________________\n\n    def test_x():\n>       assert 1 == 2\nE       assert 1 == 2\n\nb\\test_s.py:2: AssertionError\n=========================== short test summary info ===========================\nFAILED a/test_s.py::test_x - assert 1 == 2\nFAILED b/test_s.py::test_x - assert 1 == 2\n============================== 2 failed in 0.55s ==============================\n",
    "expected_assertion": "c/test_s.py::test_x",
    "expect": "REFUSED",
-   "reason": "the run is red but not at"
+   "code": "not-at"
   },
   {
    "id": "pt-file-line-other-directory",
@@ -319,7 +330,7 @@
    "output": "============================= test session starts =============================\nplatform win32 -- Python 3.14.3, pytest-9.0.3, pluggy-1.6.0\nrootdir: C:\\wk\nplugins: anyio-4.13.0, hypothesis-6.152.4\ncollected 2 items\n\ntest_s.py F                                                            [ 50%]\nb\\test_s.py .                                                            [100%]\n\n================================== FAILURES ===================================\n___________________________________ test_x ____________________________________\n\n    def test_x():\n>       assert 1 == 2\nE       assert 1 == 2\n\ntest_s.py:2: AssertionError\n=========================== short test summary info ===========================\nPASSED b/test_s.py::test_x\nFAILED test_s.py::test_x - assert 1 == 2\n========================= 1 failed, 1 passed in 0.52s =========================\n",
    "expected_assertion": "elsewhere/test_s.py:2",
    "expect": "REFUSED",
-   "reason": "the run is red but not at"
+   "code": "not-at"
   },
   {
    "id": "pt-node-id-other-directory",
@@ -328,7 +339,7 @@
    "output": "============================= test session starts =============================\nplatform win32 -- Python 3.14.3, pytest-9.0.3, pluggy-1.6.0\nrootdir: C:\\wk\nplugins: anyio-4.13.0, hypothesis-6.152.4\ncollected 2 items\n\ntest_s.py F                                                            [ 50%]\nb\\test_s.py .                                                            [100%]\n\n================================== FAILURES ===================================\n___________________________________ test_x ____________________________________\n\n    def test_x():\n>       assert 1 == 2\nE       assert 1 == 2\n\ntest_s.py:2: AssertionError\n=========================== short test summary info ===========================\nPASSED b/test_s.py::test_x\nFAILED test_s.py::test_x - assert 1 == 2\n========================= 1 failed, 1 passed in 0.52s =========================\n",
    "expected_assertion": "elsewhere/test_s.py::test_x",
    "expect": "REFUSED",
-   "reason": "the run is red but not at"
+   "code": "not-at"
   },
   {
    "id": "probe-705-2.8s-raw-readings-separate",
@@ -340,7 +351,8 @@
     2.7,
     2.9
    ],
-   "expect": "PASS"
+   "expect": "PASS",
+   "code": "probe-separates"
   },
   {
    "id": "pt-dir-name-with-dot-py-is-another-directory",
@@ -349,7 +361,7 @@
    "output": "============================= test session starts =============================\nplatform win32 -- Python 3.14.3, pytest-9.0.3, pluggy-1.6.0\nrootdir: C:\\wk\nplugins: anyio-4.13.0, hypothesis-6.152.4\ncollected 2 items\n\na\\test_s.py F                                                            [ 50%]\nb\\test_s.py .                                                            [100%]\n\n================================== FAILURES ===================================\n___________________________________ test_x ____________________________________\n\n    def test_x():\n>       assert 1 == 2\nE       assert 1 == 2\n\na\\test_s.py:2: AssertionError\n=========================== short test summary info ===========================\nPASSED b/test_s.py::test_x\nFAILED a/test_s.py::test_x - assert 1 == 2\n========================= 1 failed, 1 passed in 0.52s =========================\n",
    "expected_assertion": "a.py/test_s.py::test_x",
    "expect": "REFUSED",
-   "reason": "the run is red but not at"
+   "code": "not-at"
   },
   {
    "id": "pt-param-id-with-dot-did-not-fail",
@@ -358,7 +370,7 @@
    "output": "============================= test session starts =============================\nplatform win32 -- Python 3.14.3, pytest-9.0.3, pluggy-1.6.0\nrootdir: C:\\wk\nplugins: anyio-4.13.0, hypothesis-6.152.4\ncollected 3 items\n\ntest_s.py F.F                                                            [100%]\n\n================================== FAILURES ===================================\n_________________________________ test_x[a/b] _________________________________\n\nv = 'a/b'\n\n    @pytest.mark.parametrize('v', ['a/b', 'a.b', 'a b'])\n    def test_x(v):\n>       assert v == 'a.b'\nE       AssertionError: assert 'a/b' == 'a.b'\nE         \nE         - a.b\nE         + a/b\n\ntest_s.py:5: AssertionError\n_________________________________ test_x[a b] _________________________________\n\nv = 'a b'\n\n    @pytest.mark.parametrize('v', ['a/b', 'a.b', 'a b'])\n    def test_x(v):\n>       assert v == 'a.b'\nE       AssertionError: assert 'a b' == 'a.b'\nE         \nE         - a.b\nE         + a b\n\ntest_s.py:5: AssertionError\n=========================== short test summary info ===========================\nPASSED test_s.py::test_x[a.b]\nFAILED test_s.py::test_x[a/b] - AssertionError: assert 'a/b' == 'a.b'\nFAILED test_s.py::test_x[a b] - AssertionError: assert 'a b' == 'a.b'\n========================= 2 failed, 1 passed in 1.51s =========================\n",
    "expected_assertion": "test_s.py::test_x[a.b]",
    "expect": "REFUSED",
-   "reason": "the run is red but not at"
+   "code": "not-at"
   },
   {
    "id": "pt-param-id-with-slash-failed",
@@ -366,7 +378,8 @@
    "why": "control: test_x[a/b] is a failing parameter",
    "output": "============================= test session starts =============================\nplatform win32 -- Python 3.14.3, pytest-9.0.3, pluggy-1.6.0\nrootdir: C:\\wk\nplugins: anyio-4.13.0, hypothesis-6.152.4\ncollected 3 items\n\ntest_s.py F.F                                                            [100%]\n\n================================== FAILURES ===================================\n_________________________________ test_x[a/b] _________________________________\n\nv = 'a/b'\n\n    @pytest.mark.parametrize('v', ['a/b', 'a.b', 'a b'])\n    def test_x(v):\n>       assert v == 'a.b'\nE       AssertionError: assert 'a/b' == 'a.b'\nE         \nE         - a.b\nE         + a/b\n\ntest_s.py:5: AssertionError\n_________________________________ test_x[a b] _________________________________\n\nv = 'a b'\n\n    @pytest.mark.parametrize('v', ['a/b', 'a.b', 'a b'])\n    def test_x(v):\n>       assert v == 'a.b'\nE       AssertionError: assert 'a b' == 'a.b'\nE         \nE         - a.b\nE         + a b\n\ntest_s.py:5: AssertionError\n=========================== short test summary info ===========================\nPASSED test_s.py::test_x[a.b]\nFAILED test_s.py::test_x[a/b] - AssertionError: assert 'a/b' == 'a.b'\nFAILED test_s.py::test_x[a b] - AssertionError: assert 'a b' == 'a.b'\n========================= 2 failed, 1 passed in 1.51s =========================\n",
    "expected_assertion": "test_s.py::test_x[a/b]",
-   "expect": "PASS"
+   "expect": "PASS",
+   "code": "assertion-failed"
   },
   {
    "id": "pt-param-id-with-space-failed",
@@ -374,7 +387,8 @@
    "why": "FAILED summary line whose node id holds a space: test_x[a b] (A3)",
    "output": "============================= test session starts =============================\nplatform win32 -- Python 3.14.3, pytest-9.0.3, pluggy-1.6.0\nrootdir: C:\\wk\nplugins: anyio-4.13.0, hypothesis-6.152.4\ncollected 3 items\n\ntest_s.py F.F                                                            [100%]\n\n================================== FAILURES ===================================\n_________________________________ test_x[a/b] _________________________________\n\nv = 'a/b'\n\n    @pytest.mark.parametrize('v', ['a/b', 'a.b', 'a b'])\n    def test_x(v):\n>       assert v == 'a.b'\nE       AssertionError: assert 'a/b' == 'a.b'\nE         \nE         - a.b\nE         + a/b\n\ntest_s.py:5: AssertionError\n_________________________________ test_x[a b] _________________________________\n\nv = 'a b'\n\n    @pytest.mark.parametrize('v', ['a/b', 'a.b', 'a b'])\n    def test_x(v):\n>       assert v == 'a.b'\nE       AssertionError: assert 'a b' == 'a.b'\nE         \nE         - a.b\nE         + a b\n\ntest_s.py:5: AssertionError\n=========================== short test summary info ===========================\nPASSED test_s.py::test_x[a.b]\nFAILED test_s.py::test_x[a/b] - AssertionError: assert 'a/b' == 'a.b'\nFAILED test_s.py::test_x[a b] - AssertionError: assert 'a b' == 'a.b'\n========================= 2 failed, 1 passed in 1.51s =========================\n",
    "expected_assertion": "test_s.py::test_x[a b]",
-   "expect": "PASS"
+   "expect": "PASS",
+   "code": "assertion-failed"
   },
   {
    "id": "ut-runtime-import-error-in-another-test",
@@ -383,7 +397,7 @@
    "output": "test_assert (test_attack.T.test_assert) ... FAIL\ntest_import (test_attack.T.test_import) ... ERROR\n\n======================================================================\nERROR: test_import (test_attack.T.test_import)\n----------------------------------------------------------------------\nTraceback (most recent call last):\n  File \"C:\\wk\\test_attack.py\", line 6, in test_import\n    import no_such_mod_rmv_attack\nModuleNotFoundError: No module named 'no_such_mod_rmv_attack'\n\n======================================================================\nFAIL: test_assert (test_attack.T.test_assert)\n----------------------------------------------------------------------\nTraceback (most recent call last):\n  File \"C:\\wk\\test_attack.py\", line 4, in test_assert\n    self.assertEqual(1, 2)\n    ~~~~~~~~~~~~~~~~^^^^^^\nAssertionError: 1 != 2\n\n----------------------------------------------------------------------\nRan 2 tests in 0.004s\n\nFAILED (failures=1, errors=1)\n",
    "expected_assertion": "test_attack.py:4",
    "expect": "REFUSED",
-   "reason": "collection or import error"
+   "code": "collection"
   },
   {
    "id": "pt-runtime-import-error-in-another-test",
@@ -392,7 +406,7 @@
    "output": "============================= test session starts =============================\nplatform win32 -- Python 3.14.3, pytest-9.0.3, pluggy-1.6.0\nrootdir: C:\\wk\nplugins: anyio-4.13.0, hypothesis-6.152.4\ncollected 2 items\n\ntest_s.py FF                                                             [100%]\n\n================================== FAILURES ===================================\n___________________________________ test_x ____________________________________\n\n    def test_x():\n>       assert 1 == 2\nE       assert 1 == 2\n\ntest_s.py:2: AssertionError\n__________________________________ test_imp ___________________________________\n\n    def test_imp():\n>       import no_such_mod_rmv_attack\nE       ModuleNotFoundError: No module named 'no_such_mod_rmv_attack'\n\ntest_s.py:5: ModuleNotFoundError\n=========================== short test summary info ===========================\nFAILED test_s.py::test_x - assert 1 == 2\nFAILED test_s.py::test_imp - ModuleNotFoundError: No module named 'no_such_mod_rmv_attack'\n============================== 2 failed in 0.52s ==============================\n",
    "expected_assertion": "test_s.py:2",
    "expect": "REFUSED",
-   "reason": "collection or import error"
+   "code": "collection"
   },
   {
    "id": "pt-summary-only-collection-error",
@@ -401,7 +415,7 @@
    "output": "============================= test session starts =============================\nplatform win32 -- Python 3.14.3, pytest-9.0.3, pluggy-1.6.0\nrootdir: C:\\wk\nplugins: anyio-4.13.0, hypothesis-6.152.4\ncollected 1 item / 1 error\n\ntest_s.py F                                                              [100%]\n\n=========================== short test summary info ===========================\nFAILED test_s.py::test_x - assert 1 == 2\nERROR test_bad.py - ModuleNotFoundError: No module named 'zz_rmv'\n========================= 1 failed, 1 error in 1.11s ==========================\n",
    "expected_assertion": "test_s.py::test_x",
    "expect": "REFUSED",
-   "reason": "collection or import error"
+   "code": "collection"
   },
   {
    "id": "pt-summary-only-runtime-import-error",
@@ -410,7 +424,7 @@
    "output": "===================== short test summary info =====================\nFAILED t.py::test_x - assert 1 == 2\nFAILED t.py::test_imp - ModuleNotFoundError: No module named missing\n===================== 2 failed in 0.1s =====================\n",
    "expected_assertion": "t.py::test_x",
    "expect": "REFUSED",
-   "reason": "collection or import error"
+   "code": "collection"
   },
   {
    "id": "pt-summary-only-error-node-import",
@@ -419,7 +433,7 @@
    "output": "===================== short test summary info =====================\nFAILED t.py::test_x - assert 1 == 2\nERROR t.py::test_imp - ImportError: missing\n===================== 1 failed, 1 error in 0.1s =====================\n",
    "expected_assertion": "t.py::test_x",
    "expect": "REFUSED",
-   "reason": "collection or import error"
+   "code": "collection"
   },
   {
    "id": "pt-chained-import-error-after-assertion",
@@ -428,7 +442,7 @@
    "output": "===================== FAILURES =====================\n____________________ test_x ____________________\nE assert 1 == 2\nt.py:2: AssertionError\nE ModuleNotFoundError: No module named missing\n===================== short test summary info =====================\nFAILED t.py::test_x - assert 1 == 2\n===================== 1 failed in 0.1s =====================\n",
    "expected_assertion": "t.py:2",
    "expect": "REFUSED",
-   "reason": "collection or import error"
+   "code": "collection"
   },
   {
    "id": "ut-fail-block-holding-an-import-error",
@@ -437,7 +451,7 @@
    "output": "======================================================================\nFAIL: test_a (test_s.T.test_a)\n----------------------------------------------------------------------\nTraceback (most recent call last):\n  File \"test_s.py\", line 8, in test_a\n    self.assertEqual(1, 2)\nAssertionError: 1 != 2\n\n======================================================================\nFAIL: test_imp (test_s.U.test_imp)\n----------------------------------------------------------------------\nTraceback (most recent call last):\n  File \"test_s.py\", line 20, in test_imp\n    raise ImportError(\"missing\")\nImportError: missing\n\n----------------------------------------------------------------------\nRan 2 tests in 0.001s\n\nFAILED (failures=2)\n",
    "expected_assertion": "test_s.py:8",
    "expect": "REFUSED",
-   "reason": "collection or import error"
+   "code": "collection"
   },
   {
    "id": "pt-param-id-holding-dash-bracket",
@@ -446,7 +460,7 @@
    "output": "===================== short test summary info =====================\nPASSED t.py::test_ok\nFAILED test_s.py::test_x[] - AssertionError] - TypeError: boom\n===================== 1 failed, 1 passed in 0.1s =====================\n",
    "expected_assertion": "test_s.py::test_x[]",
    "expect": "REFUSED",
-   "reason": "ambiguous summary line"
+   "code": "cnc-summary-split"
   },
   {
    "id": "pt-param-id-containing-error-at-setup-of",
@@ -455,7 +469,7 @@
    "output": "===================== FAILURES =====================\n____________________ test_x[] ____________________\nE TypeError: boom\nt.py:3: TypeError\n____________________ test_x[ERROR at setup of ] ____________________\nE assert False\nt.py:4: AssertionError\n===================== short test summary info =====================\nFAILED t.py::test_x[] - TypeError: boom\nFAILED t.py::test_x[ERROR at setup of ] - assert False\n===================== 2 failed in 0.1s =====================\n",
    "expected_assertion": "t.py::test_x[]",
    "expect": "REFUSED",
-   "reason": "raised a non-assertion error"
+   "code": "non-assertion"
   },
   {
    "id": "ut-green-run-whose-test-printed-a-failure-block",
@@ -464,7 +478,7 @@
    "output": "======================================================================\nFAIL: test_a (test_s.T.test_a)\n----------------------------------------------------------------------\nTraceback (most recent call last):\n  File \"test_s.py\", line 8, in test_a\n    self.assertEqual(1, 2)\nAssertionError: 1 != 2\n\n.\n----------------------------------------------------------------------\nRan 1 test in 0.000s\n\nOK\n",
    "expected_assertion": "test_s.py:8",
    "expect": "REFUSED",
-   "reason": "the run is green"
+   "code": "final-green"
   },
   {
    "id": "pt-directory-with-leading-space",
@@ -473,7 +487,7 @@
    "output": "===================== FAILURES =====================\n____________________ test_x ____________________\nE assert False\n a/test_s.py:2: AssertionError\n===================== short test summary info =====================\nFAILED  a/test_s.py::test_x - assert False\n===================== 1 failed in 0.1s =====================\n",
    "expected_assertion": "a/test_s.py::test_x",
    "expect": "REFUSED",
-   "reason": "the run is red but not at"
+   "code": "not-at"
   },
   {
    "id": "ut-method-name-with-a-space-bare-prefix",
@@ -482,7 +496,7 @@
    "output": "======================================================================\nFAIL: test one (__main__.T.test one)\n----------------------------------------------------------------------\nTraceback (most recent call last):\n  File \"t.py\", line 3, in f\n    self.assertEqual(1, 2)\nAssertionError: 1 != 2\n\n----------------------------------------------------------------------\nRan 1 test in 0.000s\n\nFAILED (failures=1)\n",
    "expected_assertion": "test",
    "expect": "REFUSED",
-   "reason": "the run is red but not at"
+   "code": "not-at"
   },
   {
    "id": "ut-method-name-with-a-space-full-id",
@@ -490,7 +504,8 @@
    "why": "control: the full id of the spaced method names the failure",
    "output": "======================================================================\nFAIL: test one (__main__.T.test one)\n----------------------------------------------------------------------\nTraceback (most recent call last):\n  File \"t.py\", line 3, in f\n    self.assertEqual(1, 2)\nAssertionError: 1 != 2\n\n----------------------------------------------------------------------\nRan 1 test in 0.000s\n\nFAILED (failures=1)\n",
    "expected_assertion": "T.test one",
-   "expect": "PASS"
+   "expect": "PASS",
+   "code": "assertion-failed"
   },
   {
    "id": "pt-helper-frame-in-the-other-file",
@@ -498,7 +513,8 @@
    "why": "test_x in a/ calls a helper in b/test_s.py; test_x in b/ also failed; naming a/ must still be PASS (adversary A3)",
    "output": "===================== FAILURES =====================\n____________________ test_x ____________________\nE assert False\na/test_s.py:2: \nE assert False\nb/test_s.py:5: AssertionError\n____________________ test_x ____________________\nE assert False\nb/test_s.py:2: AssertionError\n===================== short test summary info =====================\nFAILED a/test_s.py::test_x - assert False\nFAILED b/test_s.py::test_x - assert False\n===================== 2 failed in 0.1s =====================\n",
    "expected_assertion": "a/test_s.py::test_x",
-   "expect": "PASS"
+   "expect": "PASS",
+   "code": "assertion-failed"
   },
   {
    "id": "pt-summary-error-line-without-a-message-is-malformed",
@@ -507,7 +523,7 @@
    "output": "============================= test session starts =============================\nplatform win32 -- Python 3.14.3, pytest-9.0.3, pluggy-1.6.0\nrootdir: C:\\wk\nplugins: anyio-4.13.0, hypothesis-6.152.4\ncollected 1 item / 1 error\n\ntest_s.py F                                                              [100%]\n\n=========================== short test summary info ===========================\nFAILED test_s.py::test_x - assert 1 == 2\nERROR test_bad.py\n========================= 1 failed, 1 error in 1.11s ==========================\n",
    "expected_assertion": "test_s.py::test_x",
    "expect": "REFUSED",
-   "reason": "no message after"
+   "code": "cnc-short-summary"
   },
   {
    "id": "pt-summary-message-cut-before-the-exception-type-is-malformed",
@@ -516,7 +532,7 @@
    "output": "============================= test session starts =============================\nplatform win32 -- Python 3.14.3, pytest-9.0.3, pluggy-1.6.0\nrootdir: C:\\wk\nplugins: anyio-4.13.0, hypothesis-6.152.4\ncollected 2 items\n\ntest_s.py FF                                                             [100%]\n\n================================== FAILURES ===================================\n___________________________________ test_x ____________________________________\n\n    def test_x():\n>       assert 1 == 2\nE       assert 1 == 2\n\ntest_s.py:2: AssertionError\n__________________________________ test_imp ___________________________________\n\n    def test_imp():\n>       import no_such_mod_rmv_attack\nE       ModuleNotFoundError: No module named 'no_such_mod_rmv_attack'\n\ntest_s.py:5: ModuleNotFoundError\n=========================== short test summary info ===========================\nFAILED test_s.py::test_x - assert 1 == 2\nFAILED test_s.py::test_imp - ModuleNotFoundError: No module named 'no_such_mo...\n============================== 2 failed in 0.52s ==============================\n",
    "expected_assertion": "test_s.py:2",
    "expect": "REFUSED",
-   "reason": "cut to"
+   "code": "cnc-short-summary"
   }
  ]
 }

@@ -1345,5 +1345,199 @@ class ProbeDiscriminates(unittest.TestCase):
         self.assertTrue(rmv.probe_discriminates(3, 2.5, (2.0, 2.5))[0])
 
 
+def _ut_text(trailer: str, frame: str = '  File "t.py", line 8, in test_a', ran: str = "Ran 1 test in 0.001s",
+             eol: str = "\n") -> str:
+    """One readable unittest FAIL block (an assertion at t.py:8 by default), its footer and `trailer`."""
+    text = ("=" * 70 + "\nFAIL: test_a (t.T.test_a)\n" + "-" * 70 + "\nTraceback (most recent call last):\n" + frame
+            + "\n    self.assertEqual(3, 4)\nAssertionError: 3 != 4\n\n" + "-" * 70 + "\n" + ran + "\n\n" + trailer + "\n")
+    return text.replace("\n", eol)
+
+
+def _pt_text(bar: str, before: str = "", eol: str = "\n") -> str:
+    """A pytest short summary with one FAILED line (t.py::test_x, an assertion), `before` lines ahead of it, and `bar`."""
+    text = "=== short test summary info ===\n" + before + "FAILED t.py::test_x - assert False\n" + bar + "\n"
+    return text.replace("\n", eol)
+
+
+_PT_SECTION_TEXT = ("=================================== FAILURES ===================================\n"
+                    "____________________________________ test_x ____________________________________\n\n"
+                    "    def test_x():\n>       assert False\nE       assert False\n\n{loc}\n"
+                    "=========================== short test summary info ============================\n"
+                    "FAILED t.py::test_x - assert False\n"
+                    "============================== 1 failed in 0.12s ===============================\n")
+
+
+class RunnerMetadataR11(unittest.TestCase):
+    """r11, Dot r9-A1 (bus 7cf8484): a runner count field and a traceback line number are read WHOLE. Each malformed
+    value below holds a digit substring EQUAL to the real block/summary count, so a count-mismatch check cannot mask it:
+    only parsing the whole field refuses it. The primary reason (classify().code, r11 r10-A2) is asserted, never text."""
+
+    UT_MALFORMED = ("FAILED (failures=1.5)", "FAILED (failures=1.0)", "FAILED (failures=+1)", "FAILED (failures=01)",
+                    "FAILED (failures=1e0)", "FAILED (failures=1x)", "FAILED (failures=١)",
+                    "FAILED (failures=1, errors=0.0)", "FAILED (failures=1, errors=-0)", "FAILED (failures=1,errors=0)",
+                    "FAILED (failures=1, bogus=2)", "FAILED (failures=1, failures=0)", "FAILED (failures=1, skipped=1.5)",
+                    "FAILED (failures=1, expected failures=0.5)", "FAILED (failures=1, unexpected successes=x)")
+    PT_MALFORMED = ("=== -1 failed in 0.1s ===", "=== +1 failed in 0.1s ===", "=== 0.1 failed in 0.1s ===",
+                    "=== 1.1 failed in 0.1s ===", "=== 01 failed in 0.1s ===", "=== ١ failed in 0.1s ===",
+                    "=== 1 failed, 0.0 errors in 0.1s ===", "=== 1 failed, -0 errors in 0.1s ===",
+                    "=== 1 failed, 1 bogus in 0.1s ===", "=== 1 failed, 0 failed in 0.1s ===",
+                    "=== 1 failed in 0.1.2s ===", "=== 1 failed in 0.1s extra ===", "=== 1 failed, in 0.1s ===")
+    # every OTHER outcome count, each beside one summary line of its kind (so the extracted substring equals the tally)
+    PT_OUTCOME_MALFORMED = (("PASSED t.py::test_p\n", "=== 1 failed, 0.1 passed in 0.1s ==="),
+                            ("PASSED t.py::test_p\n", "=== 1 failed, -1 passed in 0.1s ==="),
+                            ("SKIPPED [1] t.py:3: why\n", "=== 1 failed, 0.1 skipped in 0.1s ==="),
+                            ("XFAIL t.py::test_f\n", "=== 1 failed, 0.1 xfailed in 0.1s ==="),
+                            ("XPASS t.py::test_z\n", "=== 1 failed, 0.1 xpassed in 0.1s ==="))
+
+    def _code(self, text: str, expected: str) -> str:
+        v = rmv.classify(text, expected)
+        self.assertEqual(v.status, rmv.REFUSED, (text, v))
+        return v.code
+
+    def test_runner_metadata_requires_complete_integer_fields_unittest(self) -> None:
+        self.assertEqual(rmv.classify(_ut_text("FAILED (failures=1)"), "t.py:8").status, rmv.PASS)  # the control
+        for trailer in self.UT_MALFORMED:
+            with self.subTest(trailer=trailer):
+                self.assertEqual(self._code(_ut_text(trailer), "t.py:8"), "cnc-result-line")
+        for trailer in ("OK (skipped=1.5)", "OK (failures=1)", "OK (skipped=01)"):  # a green trailer is parsed whole too
+            with self.subTest(trailer=trailer):
+                self.assertEqual(self._code("Ran 2 tests in 0.001s\n\n" + trailer + "\n", "t.py:8"), "cnc-result-line")
+        for ran in ("Ran 1.5 tests in 0.001s", "Ran -1 tests in 0.001s", "Ran 1 test in 0.0.1s"):  # the footer, too
+            with self.subTest(ran=ran):
+                self.assertEqual(self._code(_ut_text("FAILED (failures=1)", ran=ran), "t.py:8"), "cnc-no-ran-footer")
+
+    def test_runner_metadata_requires_complete_integer_fields_pytest(self) -> None:
+        self.assertEqual(rmv.classify(_pt_text("=== 1 failed in 0.1s ==="), "t.py::test_x").status, rmv.PASS)
+        for bar in self.PT_MALFORMED:
+            with self.subTest(bar=bar):
+                self.assertEqual(self._code(_pt_text(bar), "t.py::test_x"), "cnc-result-line")
+        for before, bar in self.PT_OUTCOME_MALFORMED:
+            with self.subTest(bar=bar):
+                self.assertEqual(self._code(_pt_text(bar, before), "t.py::test_x"), "cnc-result-line")
+
+    def test_runner_metadata_requires_complete_integer_fields_controls(self) -> None:
+        # genuine integer counts (zero, one, several), decimal elapsed times, every outcome word, LF and CRLF
+        for eol in ("\n", "\r\n"):
+            for trailer, n_blocks in (("FAILED (failures=1)", 1), ("FAILED (failures=1, skipped=2)", 1),
+                                      ("FAILED (failures=1, errors=0)", 1),
+                                      ("FAILED (failures=1, skipped=1, expected failures=3, unexpected successes=10)", 1)):
+                with self.subTest(trailer=trailer, eol=eol):
+                    self.assertEqual(rmv.classify(_ut_text(trailer, eol=eol), "t.py:8").status, rmv.PASS)
+            for bar, before in (("=== 1 failed in 0.1s ===", ""), ("=== 1 failed in 0.10s ===", ""),
+                                ("=== 1 failed in 75.12s (0:01:15) ===", ""), ("=== 1 failed, 0 errors in 3s ===", ""),
+                                ("=== 1 failed, 2 passed, 1 warning in 0.52s ===", "PASSED t.py::test_p\nPASSED t.py::test_q\n"),
+                                ("=== 1 failed, 1 skipped, 1 deselected, 12 warnings in 1.51s ===", "SKIPPED [1] t.py:3: why\n"),
+                                ("=== 1 failed, 1 xfailed, 1 xpassed in 0.1s ===", "XFAIL t.py::test_f\nXPASS t.py::test_z\n")):
+                with self.subTest(bar=bar, eol=eol):
+                    self.assertEqual(rmv.classify(_pt_text(bar, before, eol), "t.py::test_x").status, rmv.PASS)
+            # a stated count that disagrees is still refused for the COUNT, not for its spelling
+            self.assertEqual(rmv.classify(_ut_text("FAILED (failures=2)", eol=eol), "t.py:8").code, "cnc-count")
+            self.assertEqual(rmv.classify(_pt_text("=== 2 failed in 0.1s ===", eol=eol), "t.py::test_x").code,
+                             "cnc-short-summary")
+        for green in ("Ran 2 tests in 0.001s\n\nOK\n", "Ran 2 tests in 0.001s\n\nOK (skipped=1)\n",
+                      "Ran 3 tests in 0.001s\n\nOK (skipped=1, expected failures=1)\n",
+                      "=== short test summary info ===\nPASSED t.py::test_p\n=== 1 passed in 0.10s ===\n"):
+            with self.subTest(green=green):
+                self.assertEqual(rmv.classify(green, "t.py:8").code, "final-green")
+
+    def test_unittest_frame_line_requires_complete_integer_token(self) -> None:
+        for frame in ('  File "t.py", line 2.5, in test_a', '  File "t.py", line 2x, in test_a',
+                      '  File "t.py", line 2,in test_a', '  File "t.py", line 2 , in test_a',
+                      '  File "t.py", line ٢, in test_a', '  File "t.py", line +2, in test_a',
+                      '  File "t.py", line 2;'):
+            with self.subTest(frame=frame):
+                self.assertEqual(self._code(_ut_text("FAILED (failures=1)", frame=frame), "t.py:2"), "cnc-frame")
+        for eol in ("\n", "\r\n"):  # controls: a real frame, a frame with no function (as a SyntaxError prints it)
+            for frame in ('  File "t.py", line 2, in test_a', '  File "t.py", line 2'):
+                with self.subTest(frame=frame, eol=eol):
+                    self.assertEqual(rmv.classify(_ut_text("FAILED (failures=1)", frame=frame, eol=eol), "t.py:2").status,
+                                     rmv.PASS)
+
+    def test_pytest_location_line_requires_complete_integer_token(self) -> None:
+        # the same rule for the pytest `file.py:N:` location line (a sibling of _FRAME)
+        self.assertEqual(rmv.classify(_PT_SECTION_TEXT.format(loc="t.py:2: AssertionError"), "t.py:2").status, rmv.PASS)
+        for loc in ("t.py:2.5: AssertionError", "t.py:٢: AssertionError", "t.py:2x: AssertionError"):
+            with self.subTest(loc=loc):
+                self.assertEqual(self._code(_PT_SECTION_TEXT.format(loc=loc), "t.py:2"), "cnc-frame")
+        # an expectation is read whole too: a non-ASCII digit is not a line number
+        self.assertEqual(rmv.classify(_PT_SECTION_TEXT.format(loc="t.py:2: AssertionError"), "t.py:٢").status,
+                         rmv.REFUSED)
+
+
+class SummarySplitR11(unittest.TestCase):
+    """r11, r10 adversary A1 (e2d9dc08): a FAILED line whose node/message boundary is ambiguous is COULD-NOT-CHECK."""
+
+    def _run(self, line: str) -> str:
+        return "=== short test summary info ===\n" + line + "\n=== 1 failed in 0.1s ===\n"
+
+    def test_ambiguous_node_message_split_is_could_not_check(self) -> None:
+        # The witness: globals()['TestA - AssertionError'] = C, whose ordinary test_x raises TypeError('boom').
+        witness = self._run("FAILED t.py::TestA - AssertionError::test_x - TypeError: boom")
+        self.assertEqual(rmv.classify(witness, "t.py::TestA").code, "cnc-summary-split")
+        self.assertEqual(rmv.classify(witness, "t.py::TestA").status, rmv.REFUSED)
+        for line, want in (("FAILED t.py::test_a - AssertionError - TypeError: boom", "t.py::test_a"),
+                           ("FAILED t.py::test_a - AssertionError: x - TypeError: boom", "t.py::test_a"),
+                           ("FAILED t.py::test_a - AssertionError: x - Boom", "t.py::test_a"),
+                           ("FAILED t.py::T - assert x::test_a - TypeError: boom", "t.py::T")):
+            with self.subTest(line=line):
+                v = rmv.classify(self._run(line), want)
+                self.assertEqual((v.status, v.code), (rmv.REFUSED, "cnc-summary-split"), v)
+        # with the failure's own section: still refused (the adversary: a full TypeError section did not prevent it)
+        section = ("=================================== FAILURES ===================================\n"
+                   "___________________________ TestA - AssertionError.test_x ___________________________\n\n"
+                   "E       TypeError: boom\n\nt.py:3: TypeError\n")
+        self.assertEqual(rmv.classify(section + witness, "t.py::TestA").status, rmv.REFUSED)
+
+    def test_assertion_head_needs_a_real_delimiter(self) -> None:
+        # sibling :195/:489: `AssertionError::` is not an assertion (the `:` is the start of `::`)
+        v = rmv.classify(self._run("FAILED t.py::test_a - AssertionError::x"), "t.py::test_a")
+        self.assertEqual(v.status, rmv.REFUSED, v)
+        ut = _ut_text("FAILED (failures=1)").replace("AssertionError: 3 != 4", "AssertionError:: 3 != 4")
+        self.assertEqual(rmv.classify(ut, "t.py:8").status, rmv.REFUSED)
+
+    def test_ordinary_assertion_lines_stay_accepted(self) -> None:
+        for line, want in (("FAILED t.py::test_x - AssertionError: boom", "t.py::test_x"),
+                           ("FAILED t.py::test_x - AssertionError", "t.py::test_x"),
+                           ("FAILED t.py::test_x - assert (1 - 2) == 0", "t.py::test_x"),
+                           ("FAILED t.py::test_x - assert x - 1 == y", "t.py::test_x"),
+                           ("FAILED t.py::test_x - assert x[0] - 1 == 2", "t.py::test_x"),
+                           ("FAILED t.py::test_x[a - b] - assert 1 == 2", "t.py::test_x[a - b]"),
+                           ("FAILED t.py::test_x - AssertionError: 3 - 4 != 0", "t.py::test_x")):
+            with self.subTest(line=line):
+                self.assertEqual(rmv.classify(self._run(line), want).status, rmv.PASS)
+
+
+class ReasonCodeR11(unittest.TestCase):
+    """r11, r10 adversary A2: every verdict carries a reason CODE the checker sets where it writes the reason."""
+
+    QUOTED = ("=== short test summary info ===\nFAILED t.py::test_x - MissingDependency: boom\n"
+              "=== 1 failed in 0.1s ===\n")
+
+    def test_every_verdict_has_a_known_code(self) -> None:
+        cases = [(_ut_text("FAILED (failures=1)"), "t.py:8"), (_ut_text("FAILED (failures=1)"), "t.py:9"),
+                 (_ut_text("FAILED (failures=1.5)"), "t.py:8"), ("Ran 1 test in 0.001s\n\nOK\n", "t.py:8"),
+                 ("nothing here\n", "t.py:8"), (_ut_text("FAILED (failures=1)"), ""), (self.QUOTED, "other"),
+                 ("a\rb", "t.py:1"), (7, "t.py:1")]
+        for out, want in cases:
+            with self.subTest(out=out, want=want):
+                v = rmv.classify(out, want)
+                self.assertIn(v.code, rmv.REASON_CODES, v)
+        # the quoted input never becomes the code: the code is one of the checker's own names
+        self.assertEqual(rmv.classify(self.QUOTED, "other").code, "cnc-exception-type")
+        self.assertEqual(rmv.classify(_ut_text("FAILED (failures=1)"), "t.py:8").code, "assertion-failed")
+        self.assertEqual(rmv.classify(_ut_text("FAILED (failures=1)"), "t.py:9").code, "not-at")
+
+    def test_probe_codes(self) -> None:
+        for args, code in (((3, 3, (3, 3)), "probe-both-inside"), ((30, 40, (0, 2)), "probe-neither-inside"),
+                           ((1, 9, (0, 5)), "probe-bug-inside"), ((1, 2, (5, 1)), "probe-empty-window"),
+                           ((float("nan"), 2, (0, 5)), "probe-nan"), (("a", 2, (0, 5)), "probe-number"),
+                           ((float("inf"), 2, (0, 5)), "probe-infinite"), ((3, 2.8, (2.7, 2.9)), "probe-separates")):
+            with self.subTest(args=args):
+                v = rmv.probe_classify(*args)
+                self.assertEqual(v.code, code, v)
+                self.assertIn(v.code, rmv.REASON_CODES)
+                self.assertEqual(rmv.probe_discriminates(*args), (v.status == rmv.PASS, v.reason))
+
+
 if __name__ == "__main__":
     unittest.main()
