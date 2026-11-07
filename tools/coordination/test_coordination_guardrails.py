@@ -2140,6 +2140,75 @@ def test_get_provider_refusal_direct_unrelated_recovered_stderr_is_not_a_refusal
     assert r is None, r
 
 
+def test_r3_adv_a1_an_unterminated_final_fence_is_malformed_even_when_its_body_parses(tmp_path):
+    # adversary r3 A1: an open fence at the end of the answer never closed, so it is not a finished block.
+    prose = "x" * 130 + "\n"
+    for tail in ('```json\n{"verdict":"APPROVE"}\n', '~~~json\n{"verdict":"APPROVE"}', '````json\n{"verdict":"APPROVE"}\n```\n'):
+        r = _work_evidence(tmp_path, "codex", prose + tail, 0, prompt_chars=600, require_verdict=True)
+        assert r["workCompleted"] is False and r["reason"] == "codex-no-verdict", (tail, r)
+    # a provisional closed APPROVE then an unterminated fence is also not a completion
+    prov = '```json\n{"verdict":"APPROVE"}\n```\n'
+    r = _work_evidence(tmp_path, "codex", prose + prov + '```json\n{"verdict":"APPROVE"}\n', 0, prompt_chars=600, require_verdict=True)
+    assert r["workCompleted"] is False, r
+    assert _work_evidence(tmp_path, "codex", prose + prov, 0, prompt_chars=600, require_verdict=True)["workCompleted"] is True
+
+
+def test_r3_adv_a2_a_final_non_object_value_never_leaves_an_earlier_approval_authoritative(tmp_path):
+    # adversary r3 A2: an unfenced array after a fenced APPROVE was not a candidate start, so the fence stood.
+    prose = "x" * 130 + "\n"
+    prov = '```json\n{"verdict":"APPROVE"}\n```\n'
+    for tail in ('[{"verdict":null}]\n', '[\n  {"verdict":"APPROVE"}\n]\n', '{"verdict":"APPROVE"}\n[1]\n'):
+        r = _work_evidence(tmp_path, "codex", prose + prov + tail, 0, prompt_chars=600, require_verdict=True)
+        assert r["workCompleted"] is False and r["reason"] == "codex-no-verdict", (tail, r)
+    # two unfenced objects with prose between: the LAST top-level object decides, either way
+    ok = prose + '{"verdict":null}\nOn reflection:\n{"verdict":"APPROVE"}\n'
+    assert _work_evidence(tmp_path, "codex", ok, 0, prompt_chars=600, require_verdict=True)["workCompleted"] is True
+    bad = prose + '{"verdict":"APPROVE"}\nOn reflection:\n{"verdict":null}\n'
+    assert _work_evidence(tmp_path, "codex", bad, 0, prompt_chars=600, require_verdict=True)["workCompleted"] is False
+
+
+def test_r3_adv_a3_final_json_must_be_strict_json(tmp_path):
+    # adversary r3 A3: PowerShell ConvertFrom-Json accepts trailing commas and comments; the contract is JSON.
+    prose = "x" * 130 + "\n"
+    for body in ('{"verdict":"APPROVE",}', '{"verdict":"APPROVE"} // note', '{/*c*/"verdict":"APPROVE"}',
+                 '{"verdict":"APPROVE",\n "findings":[1,]}'):
+        for wrap in ("```json\n%s\n```\n", "%s\n"):
+            r = _work_evidence(tmp_path, "codex", prose + wrap % body, 0, prompt_chars=600, require_verdict=True)
+            assert r["workCompleted"] is False and r["reason"] == "codex-no-verdict", (body, wrap, r)
+    ok = '{"verdict":"APPROVE","findings":[],"note":"a \\" brace } in a string"}'
+    assert _work_evidence(tmp_path, "codex", prose + "```json\n" + ok + "\n```\n", 0, prompt_chars=600, require_verdict=True)["workCompleted"] is True
+    assert _work_evidence(tmp_path, "codex", prose + ok + "\n", 0, prompt_chars=600, require_verdict=True)["workCompleted"] is True
+
+
+def test_r3_adv_a4_a_nested_draft_never_replaces_an_unfinished_enclosing_object(tmp_path):
+    # adversary r3 A4: reverse suffix parsing picked the nested APPROVE object of an unfinished root.
+    prose = "x" * 130 + "\n"
+    for tail in ('{\n"verdict":null,\n"draft":\n{"verdict":"APPROVE"}',
+                 '{\n"verdict":null,\n"draft":[\n{"verdict":"APPROVE"}\n]'):
+        r = _work_evidence(tmp_path, "codex", prose + tail, 0, prompt_chars=600, require_verdict=True)
+        assert r["workCompleted"] is False and r["reason"] == "codex-no-verdict", (tail, r)
+    # a finished multi-line root with nested objects is still one object
+    nested = '{\n  "verdict": "APPROVE",\n  "findings": [\n    {"id": 1, "x": {"verdict": null}}\n  ]\n}\n'
+    assert _work_evidence(tmp_path, "codex", prose + nested, 0, prompt_chars=600, require_verdict=True)["workCompleted"] is True
+
+
+def test_r3_adv_a5_every_line_separator_splits_answer_lines_before_they_are_classified(tmp_path):
+    # adversary r3 A5: a bare CR (or U+2028 / U+2029 / U+0085) joined two answer lines into one, so a line that
+    # merely sits NEXT TO refusal vocabulary was classified as naming it.
+    e = "ERROR: you've hit your usage limit"
+    for sep in ("\r", "\u2028", "\u2029", "\u0085"):
+        r = _classify(tmp_path, e + "\n", "codex", prompt="Reply with exactly these lines",
+                      answer="ERROR: file not found" + sep + e)
+        assert r is None, (repr(sep), r)
+        # the all-refusal answer split by the same separator is still the refusal delivered as the answer
+        r = _classify(tmp_path, e + "\n", "codex", prompt="Review this", answer=e + sep + e)
+        assert r is not None and r["kind"] == "provider-usage-limit", (repr(sep), r)
+    # a fence close is recognised across the same separators
+    prose = "x" * 130 + "\r"
+    ok = prose + '```json\r{"verdict":"APPROVE"}\r```\r'
+    assert _work_evidence(tmp_path, "codex", ok, 0, prompt_chars=600, require_verdict=True)["workCompleted"] is True
+
+
 def test_invoke_lane_writes_the_selected_answer_to_the_output_file_when_the_last_message_has_no_substance():
     # adversary A4 (2nd pass): outputSha256 hashes $final while outputPath is the last-message file.
     body = LANE_RUNNER.read_text(encoding="utf-8")

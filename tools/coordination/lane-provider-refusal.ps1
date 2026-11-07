@@ -59,15 +59,23 @@ function New-RefusalRecord {
     return [ordered]@{ kind = $Kind; engine = $Engine; match = $Match.Trim(); retryAfter = $retry; remedy = $remedy }
 }
 
+# ONE definition of "a line" for every scan in this file (KERNEL-K4 r3, adversary A5): CRLF, LF, a bare CR,
+# NEL (U+0085), LS (U+2028) and PS (U+2029) all end a line. Splitting on LF alone let a bare CR join two
+# answer lines into one, so a line that merely sat NEXT TO refusal vocabulary was classified as naming it.
+function Split-LaneLines {
+    param([AllowEmptyString()][AllowNull()][string]$Text)
+    if ([string]::IsNullOrEmpty($Text)) { return @() }
+    return [regex]::Split($Text, '\r\n|[\r\n' + [string][char]0x85 + [char]0x2028 + [char]0x2029 + ']')
+}
+
 function Find-ClaudeResultEnvelope {
     param([AllowEmptyString()][AllowNull()][string]$Answer)
     if ([string]::IsNullOrWhiteSpace($Answer)) { return $null }
-    foreach ($ln in ($Answer -split "`r?`n")) {
+    foreach ($ln in @(Split-LaneLines -Text $Answer)) {
         $t = $ln.Trim()
         if ($t.Length -eq 0) { continue }
-        $cand = $null
-        try { $cand = $t | ConvertFrom-Json -NoEnumerate -ErrorAction Stop } catch { continue }
-        if ($null -eq $cand -or $cand -isnot [System.Management.Automation.PSCustomObject]) { continue }
+        $cand = ConvertFrom-LaneJsonObject -Text $t
+        if ($null -eq $cand) { continue }
         $candNames = @($cand.PSObject.Properties | ForEach-Object { $_.Name })
         if (-not ($candNames -contains 'type') -or [string]$cand.type -ne 'result') { continue }
         return $cand
@@ -145,46 +153,91 @@ function Test-PromptDemandsVerdict {
     return [regex]::IsMatch($Prompt, '"verdict"\s*:')
 }
 
-# The FINAL json object of an answer: whatever Get-LaneTerminalCandidate selects by position (the last
-# fenced block or the last unfenced object; an unterminated last fence runs to the end of the answer).
-# A malformed or non-object final candidate (an array included: -NoEnumerate keeps '[{...}]' an array) is
-# $null: an earlier provisional block never stands in for it. Returns the object or $null.
+# A JSON OBJECT, strictly (KERNEL-K4 r3, adversary A3): System.Text.Json with its defaults (no comments, no
+# trailing commas) must accept the text and its root must be an object. PowerShell ConvertFrom-Json is more
+# lenient than JSON (it takes a trailing comma and comments), so it only builds the object AFTER that check.
+# A non-object root (an array included), a malformed text or a blank one is $null.
 function ConvertFrom-LaneJsonObject {
     param([AllowEmptyString()][AllowNull()][string]$Text)
     if ([string]::IsNullOrWhiteSpace($Text)) { return $null }
+    $isObject = $false
+    try {
+        $doc = [System.Text.Json.JsonDocument]::Parse($Text)
+        try { $isObject = ($doc.RootElement.ValueKind -eq [System.Text.Json.JsonValueKind]::Object) } finally { $doc.Dispose() }
+    } catch { return $null }
+    if (-not $isObject) { return $null }
     try { $o = $Text | ConvertFrom-Json -NoEnumerate -ErrorAction Stop } catch { return $null }
     if ($o -is [System.Management.Automation.PSCustomObject]) { return $o }
     return $null
 }
 
+# Index of the bracket that closes the JSON value opened at $Start ('{' or '['), skipping string contents and
+# escapes; -1 when the value never closes. It balances brackets only: strictness is ConvertFrom-LaneJsonObject's.
+function Find-LaneJsonValueEnd {
+    param([string]$Text, [int]$Start)
+    $depth = 0; $inStr = $false; $esc = $false
+    for ($i = $Start; $i -lt $Text.Length; $i++) {
+        $ch = $Text[$i]
+        if ($inStr) {
+            if ($esc) { $esc = $false } elseif ($ch -ceq [char]92) { $esc = $true } elseif ($ch -ceq [char]34) { $inStr = $false }
+            continue
+        }
+        if ($ch -ceq [char]34) { $inStr = $true }
+        elseif ($ch -ceq '{' -or $ch -ceq '[') { $depth++ }
+        elseif ($ch -ceq '}' -or $ch -ceq ']') { $depth--; if ($depth -le 0) { return $i } }
+    }
+    return -1
+}
+
+# The LAST top-level JSON value of unfenced text, as the text to parse. Top-level values begin on a line-start
+# '{' or '[' and run to their balancing bracket, so a nested '{' line inside an unfinished or finished root is
+# never a candidate of its own (adversary A4). Anything but whitespace after the last value, an unclosed last
+# value, and a non-object last value all yield text that fails the strict object parse. $null: no value.
+function Get-LaneLastTopLevelJson {
+    param([AllowEmptyString()][AllowNull()][string]$Text)
+    if ([string]::IsNullOrEmpty($Text)) { return $null }
+    $rx = [regex]'(?m)^[ \t]*[\{\[]'
+    $p = 0; $start = -1; $end = -1
+    while ($p -lt $Text.Length) {
+        $m = $rx.Match($Text, $p)
+        if (-not $m.Success) { break }
+        $s = $m.Index + $m.Length - 1
+        $e = Find-LaneJsonValueEnd -Text $Text -Start $s
+        $start = $s; $end = $e
+        if ($e -lt 0) { break }
+        $p = $e + 1
+    }
+    if ($start -lt 0) { return $null }
+    $tailText = $Text.Substring($start)
+    if ($end -ge 0 -and $Text.Substring($end + 1).Trim().Length -eq 0) { $tailText = $Text.Substring($start, $end - $start + 1) }
+    return [pscustomobject]@{ text = $tailText; offset = $start }
+}
+
 # Get-LaneTerminalCandidate: the ONE selector of an answer's terminal JSON candidate, by POSITION across
 # both forms (KERNEL-K4 r3, Dot items 1 and 3). The candidates are the fenced blocks and the unfenced
-# '{'-led runs; the LAST one in the answer decides and an earlier one never stands in for it.
+# top-level values; the LAST one in the answer decides and an earlier one never stands in for it.
 #   - A fence opens on a line of 3+ backticks or 3+ tildes (any info string) and closes ONLY on a line of the
 #     SAME character, at least as long as the opening, and nothing else. A mismatched or short close is
-#     content, so ``` closed only by ~~~ stays an unterminated (malformed) block that runs to the end.
-#   - An unfenced candidate is a line-start '{' OUTSIDE every fence that comes after the last fenced block.
-#     The last such start whose text parses to the end of the answer is the candidate (a nested '{' line of
-#     a multi-line object fails and falls back to the outer start); when none parses, the answer ends in
-#     malformed unfenced JSON and the candidate is that malformed text, so a provisional fenced APPROVE is
-#     not rescued by it.
-# Returns [pscustomobject]@{ form = 'fenced'|'unfenced'|'none'; text; startLine }.
+#     content. A fence that never closes is MALFORMED (adversary A1): its text is $null, so an unterminated
+#     last fence is never a completion even when its body parses.
+#   - An unfenced candidate is the last top-level '{' or '[' value after the last fenced block (see
+#     Get-LaneLastTopLevelJson). It outranks the fenced block before it, whatever its shape.
+# Lines are split by Split-LaneLines. Returns [pscustomobject]@{ form = 'fenced'|'unfenced'|'none'; text; startLine }.
 function Get-LaneTerminalCandidate {
     param([AllowEmptyString()][AllowNull()][string]$Answer)
     $none = [pscustomobject]@{ form = 'none'; text = $null; startLine = -1 }
     if ([string]::IsNullOrWhiteSpace($Answer)) { return $none }
-    $lines = @($Answer -split "`r?`n")
+    $lines = @(Split-LaneLines -Text $Answer)
     $inBlock = $false; $fenceChar = ''; $fenceLen = 0
     $cur = $null; $curStart = -1
     $lastFence = $null
-    $starts = New-Object System.Collections.Generic.List[int]
     for ($i = 0; $i -lt $lines.Count; $i++) {
         $ln = $lines[$i]
         if (-not $inBlock) {
             if ($ln -match '^[ \t]*(`{3,}|~{3,})') {
                 $inBlock = $true; $fenceChar = $Matches[1].Substring(0, 1); $fenceLen = $Matches[1].Length
                 $cur = New-Object System.Collections.Generic.List[string]; $curStart = $i
-            } elseif ($ln -match '^\s*\{') { $starts.Add($i) }
+            }
             continue
         }
         if ($ln -match '^[ \t]*(`{3,}|~{3,})[ \t]*$' -and $Matches[1].Substring(0, 1) -ceq $fenceChar -and $Matches[1].Length -ge $fenceLen) {
@@ -194,22 +247,22 @@ function Get-LaneTerminalCandidate {
         }
         $cur.Add($ln)
     }
-    if ($inBlock) { $lastFence = [pscustomobject]@{ text = ($cur -join "`n"); startLine = $curStart; endLine = $lines.Count } }
-    $tail = @($starts | Where-Object { $null -eq $lastFence -or $_ -gt $lastFence.endLine })
-    if ($tail.Count -gt 0) {
-        for ($k = $tail.Count - 1; $k -ge 0; $k--) {
-            $t = ($lines[$tail[$k]..($lines.Count - 1)] -join "`n").Trim()
-            if ($null -ne (ConvertFrom-LaneJsonObject -Text $t)) {
-                return [pscustomobject]@{ form = 'unfenced'; text = $t; startLine = $tail[$k] }
-            }
+    if ($inBlock) { return [pscustomobject]@{ form = 'fenced'; text = $null; startLine = $curStart } }
+    $firstTail = if ($null -eq $lastFence) { 0 } else { $lastFence.endLine + 1 }
+    if ($firstTail -lt $lines.Count) {
+        $tailText = ($lines[$firstTail..($lines.Count - 1)] -join "`n")
+        $c = Get-LaneLastTopLevelJson -Text $tailText
+        if ($null -ne $c) {
+            $before = $tailText.Substring(0, $c.offset)
+            return [pscustomobject]@{ form = 'unfenced'; text = $c.text; startLine = $firstTail + ($before.Split("`n").Count - 1) }
         }
-        $bad = ($lines[$tail[$tail.Count - 1]..($lines.Count - 1)] -join "`n").Trim()
-        return [pscustomobject]@{ form = 'unfenced'; text = $bad; startLine = $tail[$tail.Count - 1] }
     }
     if ($null -ne $lastFence) { return [pscustomobject]@{ form = 'fenced'; text = $lastFence.text; startLine = $lastFence.startLine } }
     return $none
 }
 
+# The FINAL json object of an answer: whatever Get-LaneTerminalCandidate selects by position. A malformed,
+# unterminated or non-object terminal candidate is $null: an earlier provisional block never stands in for it.
 function Get-LaneFinalJsonObject {
     param([AllowEmptyString()][AllowNull()][string]$Answer)
     $cand = Get-LaneTerminalCandidate -Answer $Answer
@@ -320,7 +373,7 @@ function Get-ProviderRefusal {
     # stderr names a different kind. With nothing corroborating on stderr it is what the prompt asked for (A3).
     $answerKinds = $null
     if (Test-LaneAnswerHasSubstance -Answer $Answer) {
-        $ansLines = @(($Answer -split "`r?`n") | Where-Object { Test-LaneAnswerHasSubstance -Answer $_ })
+        $ansLines = @((Split-LaneLines -Text $Answer) | Where-Object { Test-LaneAnswerHasSubstance -Answer $_ })
         $answerKinds = New-Object System.Collections.Generic.List[string]
         foreach ($al in $ansLines) {
             $ak = if ($al -match '^\s*ERROR\b') { Get-RefusalKind -Line $al } else { $null }
@@ -336,7 +389,7 @@ function Get-ProviderRefusal {
         $i = $hay.IndexOf($needle, [System.StringComparison]::Ordinal)
         if ($i -ge 0) { $scan = $hay.Remove($i, $needle.Length) } else { $scan = $hay }
     }
-    foreach ($line in ($scan -split "`r?`n")) {
+    foreach ($line in @(Split-LaneLines -Text $scan)) {
         if ($line -notmatch '^\s*ERROR\b') { continue }
         $kind = Get-RefusalKind -Line $line
         if ($null -eq $kind) { continue }
