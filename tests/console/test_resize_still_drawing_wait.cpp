@@ -63,7 +63,7 @@ struct FakeWorld
             nowMs += stepMs;
             if( clearAfterPumps >= 0 && pumps >= clearAfterPumps ) flag = false;
         };
-        c.clearStale = [this]() { ++clearStaleCalls; flag = false; };
+        c.clearStale = [this](std::uint64_t) { ++clearStaleCalls; flag = false; return true; };
         c.nowMs = [this]() { return nowMs; };
         return c;
     }
@@ -296,7 +296,7 @@ TEST(ResizeStillDrawingWait, ABlockedSampleEndsTheIdleRunSoSeparateIdlePeriodsNe
     c.renderIdle = [&samples]() {
         return samples++ != 1; // the renderer holds its mutex 50 -> 150: the probe at t=50 reports busy at once
     };
-    c.clearStale = [&flag, &clears]() { ++clears; flag = false; };
+    c.clearStale = [&flag, &clears](std::uint64_t) { ++clears; flag = false; return true; };
     c.nowMs = [&now]() { return now; };
     const Result result = wait(c);
     ASSERT_TRUE(result.outcome == Outcome::StaleCleared);
@@ -329,7 +329,7 @@ TEST(ResizeStillDrawingWait, ABlockInsideOneMillisecondTickStillEndsTheIdleRun)
     c.renderIdle = [&samples]() {
         return samples++ != 1; // the renderer holds its mutex 50100 -> 50900 us: the probe reports busy at once
     };
-    c.clearStale = [&flag, &clears]() { ++clears; flag = false; };
+    c.clearStale = [&flag, &clears](std::uint64_t) { ++clears; flag = false; return true; };
     c.nowMs = [&tUs]() { return tUs / 1000; };
     c.nowUs = [&tUs]() { return tUs; };
     const Result result = wait(c);
@@ -352,7 +352,7 @@ TEST(ResizeStillDrawingWait, AnIdleSampleIsJudgedByItsReportNotItsDuration)
     c.stillDrawing = [&flag]() { return flag; };
     c.pump = [&tUs]() { tUs += 500; };
     c.renderIdle = [&tUs]() { tUs += 500; return true; }; // 500 us per sample, renderer mutex free
-    c.clearStale = [&flag, &clears]() { ++clears; flag = false; };
+    c.clearStale = [&flag, &clears](std::uint64_t) { ++clears; flag = false; return true; };
     c.nowMs = [&tUs]() { return tUs / 1000; };
     c.nowUs = [&tUs]() { return tUs; };
     const Result result = wait(c);
@@ -377,20 +377,24 @@ struct HeldRendererMutex
     std::thread holder;
     std::atomic<bool> locked{false};
     std::atomic<bool> releaseNow{false};
+    std::atomic<bool> released{false}; // set just before the holder unlocks: a waiting probe can only return after it
     std::function<void()> beforeUnlock;
 
     explicit HeldRendererMutex(QMutex &m) : mutex(m) {}
-    // Locks on the holder thread and returns once it is held; the holder frees it after maxHold or at join().
-    void hold(std::function<void()> onRelease, std::chrono::milliseconds maxHold)
+    // Locks on the holder thread and returns once it is held. The holder frees it at join(), or after kSafetyHold so a
+    // waiting (wrong) probe fails its assertions instead of hanging the suite. The tests decide on `released`, never on
+    // elapsed time, so a descheduled test thread cannot fail correct code (adversary r4 A2) short of a 5 s stall.
+    void hold(std::function<void()> onRelease)
     {
         beforeUnlock = std::move(onRelease);
-        holder = std::thread([this, maxHold]() {
+        holder = std::thread([this]() {
             mutex.lock();
             locked.store(true);
-            const auto until = std::chrono::steady_clock::now() + maxHold;
+            const auto until = std::chrono::steady_clock::now() + std::chrono::milliseconds(5000); // kSafetyHold
             while (!releaseNow.load() && std::chrono::steady_clock::now() < until)
                 std::this_thread::sleep_for(std::chrono::milliseconds(1));
             if (beforeUnlock) beforeUnlock();
+            released.store(true);
             mutex.unlock();
         });
         while (!locked.load()) std::this_thread::yield();
@@ -421,9 +425,9 @@ TEST(ResizeStillDrawingWait, AShortRendererMutexHoldEndsTheIdleRunDotWitness)
         else if (pumps == 2)
         {
             tUs = 50100;
-            // the renderer takes its mutex at 50100 us and frees it at 50150 us (at pump 3, or after 1 s of real time,
-            // which is what the waiting RED stub sat through)
-            renderer.hold([&tUs]() { tUs = 50150; }, std::chrono::milliseconds(1000));
+            // the renderer takes its mutex at 50100 us and frees it at 50150 us (at pump 3; a waiting probe sits out the
+            // safety hold instead)
+            renderer.hold([&tUs]() { tUs = 50150; });
         }
         else if (pumps == 3) { renderer.join(); tUs = 51100; }
         else tUs += 1000;
@@ -431,7 +435,7 @@ TEST(ResizeStillDrawingWait, AShortRendererMutexHoldEndsTheIdleRunDotWitness)
     c.renderIdle = [&rendererMutex]() {
         return resize_still_drawing_wait::probeIdleWithoutWaiting(rendererMutex, []() { return true; });
     };
-    c.clearStale = [&flag, &clears]() { ++clears; flag = false; };
+    c.clearStale = [&flag, &clears](std::uint64_t) { ++clears; flag = false; return true; };
     c.nowMs = [&tUs]() { return tUs.load() / 1000; };
     c.nowUs = [&tUs]() { return tUs.load(); };
     const Result result = wait(c);
@@ -443,8 +447,8 @@ TEST(ResizeStillDrawingWait, AShortRendererMutexHoldEndsTheIdleRunDotWitness)
 }
 
 // The probe itself, on a real mutex held by another thread: busy at once, the idle decision never runs, and it never
-// waits for the holder (the RED stub, like r3's sample, waited the full 500 ms hold and then reported idle). Once the
-// mutex is free the probe takes it, returns the decision, and leaves it unlocked.
+// waits for the holder (the RED stub, like r3's sample, waited the whole hold and then reported idle). Once the mutex is
+// free the probe takes it, returns the decision, and leaves it unlocked.
 TEST(ResizeStillDrawingWait, TheProbeReportsAHeldRendererMutexBusyWithoutWaiting)
 {
     QMutex rendererMutex;
@@ -452,19 +456,148 @@ TEST(ResizeStillDrawingWait, TheProbeReportsAHeldRendererMutexBusyWithoutWaiting
     const auto decide = [&decisions]() { ++decisions; return true; };
     {
         HeldRendererMutex renderer(rendererMutex);
-        renderer.hold(nullptr, std::chrono::milliseconds(500));
-        const auto t0 = std::chrono::steady_clock::now();
+        renderer.hold(nullptr);
         const bool idle = resize_still_drawing_wait::probeIdleWithoutWaiting(rendererMutex, decide);
-        const auto spentMs = std::chrono::duration_cast<std::chrono::milliseconds>(
-            std::chrono::steady_clock::now() - t0).count();
+        const bool returnedWhileHeld = !renderer.released.load();
         ASSERT_FALSE(idle);
         ASSERT_EQ(0, decisions);
-        ASSERT_TRUE(spentMs < 100);
+        ASSERT_TRUE(returnedWhileHeld); // it did not wait for the holder
     }
     ASSERT_TRUE(resize_still_drawing_wait::probeIdleWithoutWaiting(rendererMutex, decide));
     ASSERT_EQ(1, decisions);
     ASSERT_TRUE(rendererMutex.tryLock()); // the probe released it
     rendererMutex.unlock();
+}
+
+// adversary r4 A1: work that starts and ends INSIDE one pump is invisible to two idle samples. The adversary's input: entry
+// nowUs=0; idle probes return at 1000 and 51000 us; during pump 2 a warm run starts at 20000 us and ends at 40000 us. Both
+// probes report idle, and the run kept its credit from 1000 us, so the flag was stale-cleared at 51 ms after 11 ms of
+// real idleness. The renderer now counts every start of work (busyEpoch); a sample whose epoch differs from the run's
+// reopens the run where it returns, so the clear needs t >= 101 ms.
+TEST(ResizeStillDrawingWait, WorkThatStartsAndEndsBetweenTwoIdleSamplesEndsTheIdleRun)
+{
+    std::int64_t tUs = 0;
+    std::uint64_t epoch = 7;
+    bool flag = true;
+    int pumps = 0;
+    int clears = 0;
+    Callbacks c;
+    c.stillDrawing = [&flag]() { return flag; };
+    c.pump = [&]() {
+        ++pumps;
+        if (pumps == 1) tUs = 1000;
+        else if (pumps == 2) { tUs = 20000; ++epoch; tUs = 51000; } // m_warmRunning true 20000 -> 40000 us
+        else tUs += 1000;
+    };
+    c.renderIdle = []() { return true; };
+    c.busyEpoch = [&epoch]() { return epoch; };
+    c.clearStale = [&flag, &clears](std::uint64_t) { ++clears; flag = false; return true; };
+    c.nowMs = [&tUs]() { return tUs / 1000; };
+    c.nowUs = [&tUs]() { return tUs; };
+    const Result result = wait(c);
+    ASSERT_TRUE(result.outcome == Outcome::StaleCleared);
+    ASSERT_EQ(1, clears);
+    ASSERT_TRUE(result.waitedMs >= 101); // never the 51 ms clear
+    ASSERT_TRUE(result.waitedMs <= 102);
+}
+
+// adversary r4 A1, the probe-to-clear variant: work can start after the last idle sample and before the clear. clearStale
+// is a confirm-and-clear (the renderer re-checks idleness and the run's epoch while it holds its mutex, without waiting);
+// a refusal is busy evidence: nothing is cleared, the run ends, and a fresh 50 ms run must pass before the next attempt.
+TEST(ResizeStillDrawingWait, ARefusedStaleClearEndsTheRunAndNothingIsForgedClear)
+{
+    std::int64_t tUs = 0;
+    bool flag = true;
+    int attempts = 0;
+    std::uint64_t askedEpoch = 0;
+    std::int64_t firstAttemptUs = -1;
+    Callbacks c;
+    c.stillDrawing = [&flag]() { return flag; };
+    c.pump = [&tUs]() { tUs += 1000; };
+    c.renderIdle = []() { return true; };
+    c.busyEpoch = []() { return static_cast<std::uint64_t>(42); };
+    c.clearStale = [&](std::uint64_t e) {
+        askedEpoch = e;
+        if (attempts++ == 0) { firstAttemptUs = tUs; return false; } // a warm started after the probe
+        flag = false;
+        return true;
+    };
+    c.nowMs = [&tUs]() { return tUs / 1000; };
+    c.nowUs = [&tUs]() { return tUs; };
+    const Result result = wait(c);
+    ASSERT_TRUE(result.outcome == Outcome::StaleCleared);
+    ASSERT_EQ(2, attempts);
+    ASSERT_EQ(static_cast<std::uint64_t>(42), askedEpoch); // the run's epoch is what the renderer confirms
+    ASSERT_TRUE(firstAttemptUs > 0);
+    ASSERT_TRUE(result.waitedMs * 1000 >= firstAttemptUs + kStaleIdleGraceMs * 1000);
+
+    // a renderer that refuses every clear is never forged clear: the wait times out with the flag still set
+    bool stuck = true;
+    int refusals = 0;
+    Callbacks never;
+    std::int64_t nUs = 0;
+    never.stillDrawing = [&stuck]() { return stuck; };
+    never.pump = [&nUs]() { nUs += 1000; };
+    never.renderIdle = []() { return true; };
+    never.clearStale = [&refusals](std::uint64_t) { ++refusals; return false; };
+    never.nowMs = [&nUs]() { return nUs / 1000; };
+    never.nowUs = [&nUs]() { return nUs; };
+    const Result timedOut = wait(never);
+    ASSERT_TRUE(timedOut.outcome == Outcome::Timeout);
+    ASSERT_TRUE(stuck);
+    ASSERT_TRUE(refusals >= 2);
+}
+
+// The renderer side of r4 A1: every start of work bumps busyEpoch, and the clear is confirmed under the renderer mutex.
+TEST(ResizeStillDrawingWaitWiring, EveryStartOfRendererWorkBumpsTheBusyEpochAndTheClearIsConfirmed)
+{
+    const QString rft = readRepoFile(QStringLiteral("platform/qt/RenderFrameThread.cpp"));
+    const QString rfh = readRepoFile(QStringLiteral("platform/qt/RenderFrameThread.h"));
+    ASSERT_FALSE(rft.isEmpty());
+    ASSERT_FALSE(rfh.isEmpty());
+    ASSERT_TRUE(rfh.contains(QStringLiteral("std::atomic<uint64_t> m_busyEpoch{ 0 };")));
+    ASSERT_TRUE(rfh.contains(QStringLiteral("uint64_t busyEpoch( void ) const;")));
+    // a render request (the GUI's only way to start a frame)
+    const QString request = functionBody(rft, QStringLiteral("void RenderFrameThread::renderFrame( uint32_t frameNumber,"),
+        QStringLiteral("\n}"));
+    ASSERT_FALSE(request.isEmpty());
+    const int bumpAt = request.indexOf(QStringLiteral("bumpBusyEpoch();"));
+    ASSERT_TRUE(bumpAt >= 0 && bumpAt < request.indexOf(QStringLiteral("m_renderFrame = true;")));
+    // a warm run as it starts
+    ASSERT_TRUE(rft.contains(QStringLiteral("m_warmRunning = !entry->warmRealRequestPending;\n        if( m_warmRunning ) bumpBusyEpoch();")));
+    // every slot transition into a busy state, at the one chokepoint
+    const QString transition = functionBody(rft, QStringLiteral("void RenderFrameThread::transitionSlotState( int slotIndex,"),
+        QStringLiteral("\n}"));
+    ASSERT_TRUE(transition.contains(QStringLiteral("if( slotStateIsBusy( to ) ) bumpBusyEpoch();")));
+    // every render start
+    int renders = 0;
+    for (int at = rft.indexOf(QStringLiteral("m_renderingFrame = true;")); at >= 0;
+         at = rft.indexOf(QStringLiteral("m_renderingFrame = true;"), at + 1))
+    {
+        ++renders;
+        ASSERT_TRUE(rft.mid(at + 24, 60).trimmed().startsWith(QStringLiteral("bumpBusyEpoch();")));
+    }
+    ASSERT_TRUE(renders >= 2);
+    // the confirm-and-clear: idle now, same epoch, under the renderer mutex without waiting
+    const QString confirm = functionBody(rft, QStringLiteral("bool RenderFrameThread::runIfIdleNoWait("),
+        QStringLiteral("\n}"));
+    ASSERT_TRUE(confirm.contains(QStringLiteral("resize_still_drawing_wait::probeIdleWithoutWaiting( m_mutex,")));
+    ASSERT_TRUE(confirm.contains(QStringLiteral("busyEpoch() != epoch")));
+    ASSERT_TRUE(confirm.contains(QStringLiteral("onIdleLocked();")));
+
+    const QString source = readRepoFile(QStringLiteral("platform/qt/MainWindow.cpp"));
+    const QString body = functionBody(source,
+        QStringLiteral("MainWindow::waitForResizeStillDrawing( const QString &site )"),
+        QStringLiteral("//Window resized -> scale picture"));
+    ASSERT_TRUE(body.contains(QStringLiteral(
+        "callbacks.busyEpoch = [this]() -> std::uint64_t { return m_pRenderThread ? m_pRenderThread->busyEpoch() : 0; };")));
+    ASSERT_TRUE(body.contains(QStringLiteral(
+        "callbacks.clearStale = [this]( std::uint64_t epoch ) { return clearStaleStillDrawingIfIdle( currentPlaybackAdvanceTarget(), epoch ); };")));
+    const QString clear = functionBody(source,
+        QStringLiteral("bool MainWindow::clearStaleStillDrawingIfIdle( int activePlaybackTarget, std::uint64_t epoch )"),
+        QStringLiteral("\n}"));
+    ASSERT_TRUE(clear.contains(QStringLiteral("m_pRenderThread->runIfIdleNoWait(")));
+    ASSERT_TRUE(clear.contains(QStringLiteral("m_frameStillDrawing = false;")));
 }
 
 // No duration threshold is left for a sample: the class of A1 (a contended wait shorter than the threshold) is gone.

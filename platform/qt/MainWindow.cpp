@@ -3167,7 +3167,7 @@ bool MainWindow::waitForResizeStillDrawing( const QString &site )
     callbacks.stillDrawing = [this]() { return m_frameStillDrawing; };
     callbacks.renderIdle = [this]() { return renderThreadIdleNoWait( currentPlaybackAdvanceTarget() ); };
     callbacks.pump = []() { qApp->processEvents( QEventLoop::ExcludeUserInputEvents ); };
-    callbacks.clearStale = [this]() { m_frameStillDrawing = false; };
+    callbacks.clearStale = [this]( std::uint64_t ) { m_frameStillDrawing = false; return true; }; // RED stub
     callbacks.nowMs = [&clock]() { return static_cast<std::int64_t>( clock.elapsed() ); };
     // adversary r3 pass 2 A1: a renderer-mutex hold shorter than one millisecond tick must still be seen
     callbacks.nowUs = [&clock]() { return static_cast<std::int64_t>( clock.nsecsElapsed() / 1000 ); };

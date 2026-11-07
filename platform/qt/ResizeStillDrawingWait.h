@@ -46,8 +46,9 @@ struct Callbacks
 {
     std::function<bool()> stillDrawing;
     std::function<bool()> renderIdle;
+    std::function<std::uint64_t()> busyEpoch; // RED stub (adversary r4 A1): read, ignored
     std::function<void()> pump;
-    std::function<void()> clearStale;
+    std::function<bool( std::uint64_t )> clearStale; // RED stub: return value ignored
     std::function<std::int64_t()> nowMs; // monotonic; used only when nowUs is not set
     std::function<std::int64_t()> nowUs; // monotonic, microseconds; preferred (adversary r3 pass 2 A1)
 };
@@ -150,7 +151,7 @@ inline Result wait( const Callbacks &callbacks )
          && result.pumps >= kMinPumpsBeforeStale
          && sampledUs - idleSinceUs >= kStaleIdleGraceMs * 1000 )
         {
-            callbacks.clearStale();
+            (void)callbacks.clearStale( callbacks.busyEpoch ? callbacks.busyEpoch() : 0 );
             result.outcome = Outcome::StaleCleared;
             return result;
         }
