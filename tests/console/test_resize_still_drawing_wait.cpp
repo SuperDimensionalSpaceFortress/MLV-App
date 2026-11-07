@@ -577,6 +577,27 @@ TEST(ResizeStillDrawingWait, ARefusedStaleClearThatOutlastsTheDeadlineEndsTheWai
     ASSERT_EQ(0, pumpsAfterDeadline);
     ASSERT_EQ(3, pumps);
     ASSERT_EQ(static_cast<std::int64_t>(2003), result.waitedMs);
+    ASSERT_TRUE(result.renderIdle); // r4 pass 3 advisory A2: the last SAMPLE was idle; a refusal does not rewrite it
+}
+
+// r4 pass 3 advisory A1: a confirm-and-clear that takes time is counted in waitedMs. Pumps return at 1000 and 51000 us,
+// both samples idle, clearStale(42) advances the clock to 55000 us and clears: waited_ms is 55, not 51.
+TEST(ResizeStillDrawingWait, AStaleClearsOwnTimeIsReportedInWaitedMs)
+{
+    std::int64_t tUs = 0;
+    bool flag = true;
+    int pumps = 0;
+    Callbacks c;
+    c.stillDrawing = [&flag]() { return flag; };
+    c.pump = [&]() { ++pumps; tUs = pumps == 1 ? 1000 : 51000; };
+    c.renderIdle = []() { return true; };
+    c.busyEpoch = []() { return static_cast<std::uint64_t>(42); };
+    c.clearStale = [&](std::uint64_t) { tUs = 55000; flag = false; return true; };
+    c.nowMs = [&tUs]() { return tUs / 1000; };
+    c.nowUs = [&tUs]() { return tUs; };
+    const Result result = wait(c);
+    ASSERT_TRUE(result.outcome == Outcome::StaleCleared);
+    ASSERT_EQ(static_cast<std::int64_t>(55), result.waitedMs);
 }
 
 // adversary r4 pass 2 A1: the epoch must be observed ATOMICALLY with the idle decision. Read after the probe unlocked, a

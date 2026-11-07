@@ -168,17 +168,18 @@ inline Result wait( const Callbacks &callbacks )
         {
             // adversary r4 A1 (probe-to-clear): the renderer confirms idleness at the run's epoch and clears in the same
             // critical section, so work starting after the last sample is never cleared over. A refusal is busy evidence.
-            if( callbacks.clearStale( idleEpoch ) )
+            const bool cleared = callbacks.clearStale( idleEpoch );
+            // adversary r4 pass 2 A2: the confirmation can take time, so the deadline is judged on a clock read after it
+            // (no pump ever starts past the deadline), and waitedMs reports it either way (r4 pass 3 advisory A1).
+            waitedUs = clockUs() - startUs;
+            result.waitedMs = waitedUs / 1000;
+            if( cleared )
             {
                 result.outcome = Outcome::StaleCleared;
                 return result;
             }
-            result.renderIdle = false;
+            // result.renderIdle stays the last SAMPLE (r4 pass 3 advisory A2); the refusal only ends the run
             idleRun = false;
-            // adversary r4 pass 2 A2: the confirmation can take time, so the deadline is judged on a clock read after it
-            // (no pump ever starts past the deadline).
-            waitedUs = clockUs() - startUs;
-            result.waitedMs = waitedUs / 1000;
         }
         if( waitedUs >= kDeadlineMs * 1000 )
         {
