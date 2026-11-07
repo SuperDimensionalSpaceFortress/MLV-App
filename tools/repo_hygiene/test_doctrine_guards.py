@@ -707,8 +707,11 @@ def check_red_mutation_verdict(root: Path, rel_paths: list[str]) -> list[Violati
                         raise TypeError("output and expected_assertion must be strings")
                     got, why = red_mutation_verdict.verdict(case["output"], case["expected_assertion"])
                 elif kind == "probe":
+                    window = case["window"]
+                    if not isinstance(window, list) or len(window) != 2:
+                        raise TypeError(f"window must be a list of two bounds, got {window!r}")
                     ok, why = red_mutation_verdict.probe_discriminates(
-                        case["bug_value"], case["fix_value"], tuple(case["window"]))
+                        case["bug_value"], case["fix_value"], tuple(window))
                     got = red_mutation_verdict.PASS if ok else red_mutation_verdict.REFUSED
                 else:
                     raise ValueError(f"unknown kind {kind!r}")
@@ -1218,6 +1221,17 @@ class GuardFixtureTests(_PwshMixin, unittest.TestCase):
             for case in bad:
                 rels = _write_tree(root, {RED_MUTATION_CORPUS: json.dumps({"cases": [case]})})
                 with self.assertRaises(CouldNotCheck, msg=repr(case)):
+                    run_guard(guard, root, rels)
+
+    def test_red_mutation_verdict_probe_window_must_be_a_list_of_two_bounds(self) -> None:
+        # r7 adversary advisory A3: an object (its KEYS became the bounds) or a string ('12') used to read as a window.
+        guard = GUARDS["DG-RED-MUTATION-VERDICT"]
+        good = {"kind": "probe", "expect": "PASS", "bug_value": 0, "fix_value": 1, "window": [1, 100]}
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            for window in ({"1": 100, "2": 200}, "12", [1], [1, 2, 3], None):
+                rels = _write_tree(root, {RED_MUTATION_CORPUS: json.dumps({"cases": [{**good, "window": window}]})})
+                with self.assertRaises(CouldNotCheck, msg=repr(window)):
                     run_guard(guard, root, rels)
 
     def test_red_mutation_verdict_corpus_number_spelling_is_not_lost_by_json(self) -> None:

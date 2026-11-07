@@ -146,6 +146,7 @@ import math
 import re
 import sys
 from dataclasses import dataclass, field
+from fractions import Fraction
 from pathlib import Path
 
 PASS = "PASS"
@@ -318,17 +319,20 @@ def _ends_with(whole: list[str], tail: list[str]) -> bool:
     return bool(whole) and bool(tail) and len(tail) <= len(whole) and whole[-len(tail):] == tail
 
 
-def _ut_identity(rest: str) -> tuple[str, str] | None:
-    """`name (module.Class.name)` (3.11+) with an optional ` (k=v)` subtest suffix -> (name, full id).
-    The identity is the parenthesised group that ENDS WITH `.name`, so parentheses inside a method name
-    cannot be read as the module part. Older Pythons print `name (module.Class)`, handled by the caller."""
+def _ut_identities(rest: str) -> list[tuple[str, str]]:
+    """EVERY reading of `name (module.Class.name)` (3.11+) with an optional ` (k=v)` subtest suffix -> [(name, full id)].
+    A reading is a parenthesised group that ENDS WITH `.name`. A method name that itself holds ` (x.name)` gives
+    two readings (r7 adversary A1: ``test_x (bogus.test_x)`` reads as the name ``test_x`` of module ``bogus``), and the
+    caller refuses a header with more than one rather than choose. Older Pythons print `name (module.Class)`, handled by
+    the caller."""
+    found: list[tuple[str, str]] = []
     for i in (m.start() for m in re.finditer(r" \(", rest)):
         name, tail = rest[:i], rest[i + 2:]
         for j in (m.start() for m in re.finditer(r"\)", tail)):
             ident, after = tail[:j], tail[j + 1:]
             if ident.endswith("." + name) and (after == "" or re.fullmatch(r" \(.*\)", after)):
-                return name, ident
-    return None
+                found.append((name, ident))
+    return found
 
 
 def _ut_walk(block: list[str]) -> tuple[list[tuple[str, int]], str]:
@@ -381,9 +385,9 @@ def _parse_unittest(text: str) -> list[Failure]:
         joined = "\n".join(block)
         collection = ("_FailedTest" in body[0] or "unittest/loader.py" in joined.replace("\\", "/")
                       or bool(_IMPORT_ERR.search(joined)))
-        got = _ut_identity(head["rest"])
-        if got:
-            name, full = got
+        readings = _ut_identities(head["rest"])
+        if readings:
+            name, full = readings[0]
         else:  # older Pythons: `name (module.Class)`
             # The module part is the LAST parenthesised dotted group; an earlier group belongs to the name.
             groups = list(re.finditer(r" \(([A-Za-z_][\w.]*)\)", head["rest"]))
@@ -393,7 +397,9 @@ def _parse_unittest(text: str) -> list[Failure]:
             full = f"{pick.group(1)}.{name}" if pick else name
         ids = [] if "unittest.loader" in full else [full]
         odd = ""
-        if ids and any(ch in name for ch in "./\\:"):
+        if len(readings) > 1:
+            odd = f"ambiguous identity: the header {head['rest'][:60]!r} reads as {len(readings)} different test identities"
+        elif ids and any(ch in name for ch in "./\\:"):
             odd = f"separator in the method name {name[:40]!r}: its identity would split into invented segments"
         elif ids and (_empty_segment(full) or any(tok in full for tok in ("/", "\\", "::"))):
             odd = f"empty or foreign segment in the test identity {full[:60]!r}"
@@ -822,6 +828,16 @@ def _num(v: object) -> int | float:
         raise OverflowError("a number spelled out beyond what a float can hold (read as inf)")
     if x == 0.0 and re.search(r"[1-9]", re.split(r"[eE]", v)[0]):
         raise OverflowError("a nonzero number spelled out beyond what a float can hold (read as 0.0)")
+    if abs(x) >= 2 ** 53:
+        # From 2**53 a float skips integers, while integer text stays an exact int: read the same number two ways
+        # and `9007199254740993` differs from `9007199254740993.0`. Integral text is therefore returned as the exact
+        # int, and a non-integral value that large cannot be held by either type (r7 adversary A2).
+        if len(v) > 400:
+            raise OverflowError("a spelling too long to read exactly")
+        exact = Fraction(v.strip())
+        if exact.denominator != 1:
+            raise OverflowError("a non-integral number beyond 2**53, which neither an int nor a float holds exactly")
+        return int(exact)
     return x
 
 

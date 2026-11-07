@@ -702,6 +702,31 @@ class AllowlistR7(unittest.TestCase):
             self.assertIn("COULD-NOT-CHECK", why)
         self.assertEqual(rmv.main(["probe", "--bug", "1", "--fix", "2", "--window", "2", "2"]), 0)  # control: ASCII text
 
+    # ---- r7 adversary pass on f8c71bb8: A1 (unittest identity) and A2 (integer text vs its float spelling) -------------
+    def test_r7_adversary_a1_a_unittest_method_name_that_reads_two_ways_is_refused(self) -> None:
+        src = ("import unittest\nclass T(unittest.TestCase):\n def f(self): self.assertEqual(1, 2)\n"
+               "setattr(T, 'test_x (bogus.test_x)', T.f)\ndel T.f\n")
+        out = _run_unittest({"test_s.py": src}, "test_s")
+        self.assertIn("FAIL: test_x (bogus.test_x)", out)
+        self.cnc(out, "bogus.test_x", "identity")
+        self.cnc(out, "test_s.T.test_x (bogus.test_x)", "identity")
+        ordinary = _run_unittest({"test_s.py": TWO_CLASSES}, "test_s")  # control: one reading, still judged
+        self.assertEqual(rmv.verdict(ordinary, "test_s.py:12")[0], rmv.PASS, ordinary)
+
+    def test_r7_adversary_a2_integer_text_and_its_float_spelling_denote_one_number(self) -> None:
+        big = "9007199254740993"  # 2**53 + 1: a float cannot hold it
+        for spelling in (big + ".0", big + "e0", "90071992547409930e-1"):
+            self.assertEqual(rmv.main(["probe", "--bug", big, "--fix", spelling, "--window", "9007199254740992", "9007199254740992"]),
+                             1, spelling)  # same number on both sides, neither inside the window: not a discriminating probe
+            self.assertEqual(rmv.main(["probe", "--bug", "0", "--fix", big, "--window", spelling, spelling]), 0, spelling)
+            ok, why = rmv.probe_discriminates(big, spelling, (2 ** 53, 2 ** 53))
+            self.assertFalse(ok, why)
+        for spelling in (big + ".5", "9007199254740993.5e0"):  # neither an int nor a float can hold it exactly
+            ok, why = rmv.probe_discriminates(0, spelling, (1, 2))
+            self.assertFalse(ok)
+            self.assertIn("COULD-NOT-CHECK", why)
+        self.assertEqual(rmv.main(["probe", "--bug", "3.0", "--fix", "1e3", "--window", "999", "1001"]), 0)  # control
+
     def test_r6_open_a5_decimal_and_fraction_overflow_and_underflow_are_refused(self) -> None:
         from decimal import Decimal
         from fractions import Fraction
