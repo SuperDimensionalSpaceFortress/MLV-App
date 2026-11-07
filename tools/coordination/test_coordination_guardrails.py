@@ -2386,7 +2386,9 @@ def test_r4_dot_p2_the_contract_names_the_allowed_json_kind_per_field_in_code():
     # no projection of a nested JSON element into raw text remains in the object builder
     builder = src[src.index("function ConvertFrom-LaneJsonObject"):src.index("function Test-LaneJsonScalar")]
     assert "default  { $v = $e.GetRawText() }" not in builder
-    assert "-NotePropertyValue $v" in builder
+    # r4 A2: the result is a case-exact (ordinal) dictionary, not a psobject whose member names collide by case
+    assert "[System.StringComparer]::Ordinal" in builder and "$o[$p.Name] = $v" in builder
+    assert "Add-Member" not in builder
 
 
 def test_r4_dot_p2_claude_envelope_fields_of_the_wrong_kind_are_not_completion_evidence(tmp_path):
@@ -2401,6 +2403,62 @@ def test_r4_dot_p2_claude_envelope_fields_of_the_wrong_kind_are_not_completion_e
     assert _work_evidence(tmp_path, "claude", ok, 0)["workCompleted"] is True
     # an array-typed result text never feeds the refusal vocabulary
     env = '{"type":"result","subtype":"success","is_error":true,"api_error_status":null,"result":["You\'ve hit your session limit."]}\n'
+    assert _classify(tmp_path, "", "claude", answer=env) is None
+
+
+def test_r4_adv_a1_a_scalar_line_after_the_last_fence_decides_even_when_prose_follows_it(tmp_path):
+    # adversary r4 A1: only the LAST non-blank line was tested for a lone scalar, so "null" followed by "Done."
+    # left the earlier fenced APPROVE authoritative. The terminal JSON value is the last value by position.
+    prov = '```json\n{"verdict":"APPROVE"}\n```\n'
+    for scalar in ("null", "false", "0", '"no verdict issued"', "true", "-1.5e3"):
+        for tail in ("%s\nDone.\n", "%s\nDone.\nThat is my verdict.\n", "%s\n\n\nDone.", "Summary:\n%s\nDone.\n"):
+            r = _work_evidence(tmp_path, "codex", R4_PROSE + prov + tail % scalar, 0, prompt_chars=600, require_verdict=True)
+            assert r["workCompleted"] is False and r["reason"] == "codex-no-verdict", (scalar, tail, r)
+    # the same with no fence at all: an unfenced object, then a scalar, then prose
+    r = _work_evidence(tmp_path, "codex", R4_PROSE + '{"verdict":"APPROVE"}\nnull\nDone.\n', 0, prompt_chars=600, require_verdict=True)
+    assert r["workCompleted"] is False, r
+    # controls: prose alone after the fence leaves the approval standing; a scalar BEFORE a later object does not matter;
+    # a scalar line INSIDE a multi-line final object is part of that object
+    assert _work_evidence(tmp_path, "codex", R4_PROSE + prov + "Done.\nThat is my verdict.\n", 0, prompt_chars=600, require_verdict=True)["workCompleted"] is True
+    assert _work_evidence(tmp_path, "codex", R4_PROSE + 'null\n{"verdict":"APPROVE"}\n', 0, prompt_chars=600, require_verdict=True)["workCompleted"] is True
+    inner = '{\n  "verdict": "APPROVE",\n  "list": [\n    null\n  ]\n}\n'
+    assert _work_evidence(tmp_path, "codex", R4_PROSE + inner, 0, prompt_chars=600, require_verdict=True)["workCompleted"] is True
+    assert _work_evidence(tmp_path, "codex", R4_PROSE + prov + "3 findings.\nDone.\n", 0, prompt_chars=600, require_verdict=True)["workCompleted"] is True
+
+
+def test_r4_adv_a2_the_exactly_spelled_contract_field_is_never_hidden_by_a_case_variant(tmp_path):
+    # adversary r4 A2: PowerShell member names are case-insensitive, so a case-variant key that came FIRST made the
+    # builder drop the exactly-spelled contract field that came after it.
+    cx = lambda body: _work_evidence(tmp_path, "codex", R4_PROSE + body + "\n", 0, prompt_chars=600, require_verdict=True)
+    assert cx('{"VERDICT":null,"verdict":"APPROVE"}')["workCompleted"] is True
+    assert cx('{"Verdict":[],"verdict":"APPROVE"}')["workCompleted"] is True
+    assert cx('{"verdict":"APPROVE","VERDICT":[]}')["workCompleted"] is True
+    r = cx('{"VERDICT":"APPROVE","verdict":null}')
+    assert r["workCompleted"] is False and r["reason"] == "codex-no-verdict", r
+    r = cx('{"VERDICT":"APPROVE","verdict":[]}')
+    assert r["reason"] == "codex-verdict-wrong-kind-Array", r
+    r = cx('{"Verdict":"APPROVE"}')                       # only a variant spelling: still no verdict
+    assert r["workCompleted"] is False and r["reason"] == "codex-no-verdict", r
+    # claude envelope: the exact terminal_reason / is_error / subtype / type decide, whichever spelling came first
+    head = '{"type":"result","subtype":"success","is_error":false,'
+    r = _work_evidence(tmp_path, "claude", head + '"TERMINAL_REASON":"completed","terminal_reason":"max_turns"}\n', 0)
+    assert r["workCompleted"] is False and r["reason"] == "terminal-reason-max_turns", r
+    assert _work_evidence(tmp_path, "claude", head + '"terminal_reason":"completed","TERMINAL_REASON":"max_turns"}\n', 0)["workCompleted"] is True
+    assert _work_evidence(tmp_path, "claude", '{"IS_ERROR":true,"type":"result","subtype":"success","is_error":false}\n', 0)["workCompleted"] is True
+    assert _work_evidence(tmp_path, "claude", '{"is_error":false,"IS_ERROR":true,"type":"result","subtype":"success"}\n', 0)["workCompleted"] is True
+    assert _work_evidence(tmp_path, "claude", '{"type":"result","subtype":"success","IS_ERROR":false}\n', 0)["workCompleted"] is False  # no exact is_error
+    assert _work_evidence(tmp_path, "claude", '{"TYPE":"result","subtype":"success","is_error":false}\n', 0)["workCompleted"] is False   # not the envelope
+    assert _work_evidence(tmp_path, "claude", '{"TYPE":"x","type":"result","subtype":"success","is_error":false}\n', 0)["workCompleted"] is True
+    # refusal: result / api_error_status / is_error collisions hide no genuine refusal
+    env = '{"RESULT":"ok","type":"result","subtype":"success","is_error":true,"result":"You\'ve hit your session limit."}\n'
+    assert _classify(tmp_path, "", "claude", answer=env) is not None
+    env = '{"API_ERROR_STATUS":null,"type":"result","subtype":"success","is_error":true,"api_error_status":429,"result":"x"}\n'
+    r = _classify(tmp_path, "", "claude", answer=env)
+    assert r is not None and r["kind"] == "provider-rate-limit", r
+    env = '{"IS_ERROR":false,"type":"result","is_error":true,"api_error_status":429,"result":"x"}\n'
+    assert _classify(tmp_path, "", "claude", answer=env) is not None
+    # and a variant spelling alone never makes a refusal
+    env = '{"type":"result","subtype":"success","IS_ERROR":true,"result":"You\'ve hit your session limit."}\n'
     assert _classify(tmp_path, "", "claude", answer=env) is None
 
 

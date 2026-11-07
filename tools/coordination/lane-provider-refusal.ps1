@@ -87,10 +87,10 @@ function Find-ClaudeResultEnvelope {
         if ($t.Length -eq 0) { continue }
         $cand = ConvertFrom-LaneJsonObject -Text $t
         if ($null -eq $cand) { continue }
-        $candNames = @($cand.PSObject.Properties | ForEach-Object { $_.Name })
         # r3c (A4, advisory): type must BE the string "result"; [string]@('result') is also 'result', so an array-typed
-        # diagnostic line was taken for the envelope and hid the real one behind it.
-        if (-not ($candNames -contains 'type') -or $cand.type -isnot [string] -or $cand.type -ne 'result') { continue }
+        # diagnostic line was taken for the envelope and hid the real one behind it. r4: read through the contract, case-exact.
+        $tf = Get-LaneContractField -Object $cand -Name 'type'
+        if (-not $tf.ok -or $tf.value -cne 'result') { continue }
         return $cand
     }
     return $null
@@ -176,8 +176,9 @@ function ConvertFrom-LaneJsonObject {
     # r3c (adversary A1): the object is BUILT from the strict parse, never re-parsed by ConvertFrom-Json, which throws
     # on valid JSON (nested keys that differ only by case, an empty key, a key named PSObject) and so erased a real
     # verdict. Top-level members only (every consumer reads top-level scalars): a nested value is kept as a
-    # kind marker (see r4 below). A duplicate key: the last one wins; a key that collides with an earlier one only by case is dropped
-    # (PowerShell member names are case-insensitive), so the first spelling stays addressable.
+    # kind marker (see r4 below). The result is a CASE-EXACT dictionary (r4, adversary A2): PowerShell member names are
+    # case-insensitive, so a psobject let a variant spelling that came first ("VERDICT") hide the exactly-spelled contract
+    # field after it ("verdict"). A duplicate key: the last one wins; every distinct spelling stays addressable.
     # r4 (Dot P2): a member KEEPS ITS JSON KIND. String / True / False / Null are the PowerShell string, bool and
     # $null; a Number is a long, else a double; an Array, an Object and a number that is not a finite double are a
     # kind MARKER ([ordered]@{ jsonKind; raw }), never raw text: raw text made {"verdict":[]} the nonblank string
@@ -187,7 +188,7 @@ function ConvertFrom-LaneJsonObject {
         $doc = [System.Text.Json.JsonDocument]::Parse($Text)
         try {
             if ($doc.RootElement.ValueKind -ne [System.Text.Json.JsonValueKind]::Object) { return $null }
-            $o = New-Object psobject
+            $o = New-Object 'System.Collections.Generic.Dictionary[string,object]' ([System.StringComparer]::Ordinal)
             foreach ($p in $doc.RootElement.EnumerateObject()) {
                 $e = $p.Value
                 $v = $null
@@ -205,11 +206,7 @@ function ConvertFrom-LaneJsonObject {
                     }
                     default  { $v = [ordered]@{ jsonKind = $vk; raw = $e.GetRawText() } }
                 }
-                try {
-                    $have = $o.PSObject.Properties[$p.Name]
-                    if ($null -ne $have -and $have.Name -cne $p.Name) { continue }
-                    Add-Member -InputObject $o -NotePropertyName $p.Name -NotePropertyValue $v -Force -ErrorAction Stop
-                } catch { continue }
+                $o[$p.Name] = $v
             }
         } finally { $doc.Dispose() }
     } catch { return $null }
@@ -251,11 +248,11 @@ function Get-LaneContractField {
     param($Object, [string]$Name)
     $absent = [pscustomobject]@{ present = $false; kind = 'Absent'; ok = $false; value = $null }
     if ($null -eq $Object) { return $absent }
-    $prop = @($Object.PSObject.Properties | Where-Object { $_.Name -ceq $Name }) | Select-Object -First 1
-    if ($null -eq $prop) { return $absent }
-    $kind = Get-LaneJsonKind -Value $prop.Value
-    $ok = (@($script:LANE_JSON_CONTRACT[$Name]) -contains $kind)
-    return [pscustomobject]@{ present = $true; kind = $kind; ok = $ok; value = $(if ($ok) { $prop.Value } else { $null }) }
+    if (-not $Object.ContainsKey($Name)) { return $absent }
+    $val = $Object[$Name]
+    $kind = Get-LaneJsonKind -Value $val
+    $ok = (@($script:LANE_JSON_CONTRACT[$Name]) -ccontains $kind)
+    return [pscustomobject]@{ present = $true; kind = $kind; ok = $ok; value = $(if ($ok) { $val } else { $null }) }
 }
 
 # A contract field as TEXT for a comparison or a receipt: the string itself, '' for absent / null, and a fixed
@@ -382,20 +379,23 @@ function Get-LaneTerminalCandidate {
     if ($inBlock) { return [pscustomobject]@{ form = 'fenced'; text = ($cur -join "`n"); startLine = $curStart } }
     $firstTail = if ($null -eq $lastFence) { 0 } else { $lastFence.endLine + 1 }
     if ($firstTail -lt $lines.Count) {
-        # r3c (adversary A2): when the LAST non-blank line is a lone JSON scalar (null / false / 0 / "text") it is the
-        # terminal value, a non-object, so no earlier fenced or unfenced approval stands in for it.
-        for ($li = $lines.Count - 1; $li -ge $firstTail; $li--) {
-            $lt = $lines[$li].Trim([char[]](9, 10, 13, 32))
-            if ($lt.Length -eq 0) { continue }
-            if (Test-LaneJsonScalar -Text $lt) { return [pscustomobject]@{ form = 'unfenced'; text = $lt; startLine = $li } }
-            break
-        }
         $tailText = ($lines[$firstTail..($lines.Count - 1)] -join "`n")
         $c = Get-LaneLastTopLevelJson -Text $tailText
+        $candStart = -1; $candEnd = -1
         if ($null -ne $c) {
-            $before = $tailText.Substring(0, $c.offset)
-            return [pscustomobject]@{ form = 'unfenced'; text = $c.text; startLine = $firstTail + ($before.Split("`n").Count - 1) }
+            $candStart = $firstTail + ($tailText.Substring(0, $c.offset).Split("`n").Count - 1)
+            $candEnd = $candStart + ($c.text.Split("`n").Count - 1)
         }
+        # r3c (adversary A2) + r4 (A1): a lone JSON scalar line (null / false / 0 / "text") that comes AFTER the last
+        # top-level bracket value is the terminal value, a non-object, so no earlier fenced or unfenced approval stands
+        # in for it. It is the last scalar by POSITION, so prose after it ("null" then "Done.") does not demote it; a
+        # scalar line inside the bracket value is part of that value (the scan stops at its last line).
+        for ($li = $lines.Count - 1; $li -ge $firstTail -and $li -gt $candEnd; $li--) {
+            $lt = $lines[$li].Trim([char[]](9, 10, 13, 32))
+            if ($lt.Length -eq 0 -or $lt -notmatch '^(null|true|false|-?[0-9]|")') { continue }
+            if (Test-LaneJsonScalar -Text $lt) { return [pscustomobject]@{ form = 'unfenced'; text = $lt; startLine = $li } }
+        }
+        if ($null -ne $c) { return [pscustomobject]@{ form = 'unfenced'; text = $c.text; startLine = $candStart } }
     }
     if ($null -ne $lastFence) { return [pscustomobject]@{ form = 'fenced'; text = $lastFence.text; startLine = $lastFence.startLine } }
     return $none
@@ -424,14 +424,14 @@ function Get-LaneWorkEvidence {
     if ($Engine -eq 'claude') {
         $j = Find-ClaudeResultEnvelope -Answer $Answer
         if ($null -ne $j) {
-            $names = @($j.PSObject.Properties.Name)
-            # r4: read through the contract, so an Array / Object subtype or terminal_reason is "(kind-X)", which
-            # equals neither 'success' nor 'completed', instead of its raw JSON text.
-            if ($names -contains 'subtype') { $rec.subtype = Get-LaneContractText -Object $j -Name 'subtype' }
-            if ($names -contains 'terminal_reason') { $rec.terminalReason = Get-LaneContractText -Object $j -Name 'terminal_reason' }
+            # r4: read through the contract and CASE-EXACT, so an Array / Object subtype or terminal_reason is "(kind-X)",
+            # which equals neither 'success' nor 'completed', and a variant spelling ("TERMINAL_REASON") is never the field.
+            if ($j.ContainsKey('subtype')) { $rec.subtype = Get-LaneContractText -Object $j -Name 'subtype' }
+            if ($j.ContainsKey('terminal_reason')) { $rec.terminalReason = Get-LaneContractText -Object $j -Name 'terminal_reason' }
             # A real JSON boolean only (r3b A3): [bool]$null, [bool]0 and [bool]@() are $false, so a null or
             # non-boolean is_error must read as absent, never as "not an error".
-            if ($names -contains 'is_error' -and $j.is_error -is [bool]) { $rec.isError = $j.is_error }
+            $ief = Get-LaneContractField -Object $j -Name 'is_error'
+            if ($ief.ok) { $rec.isError = $ief.value }
         }
     }
     if ($ExitCode -ne 0) { $rec.reason = "exit-code-$ExitCode"; return $rec }
@@ -495,14 +495,15 @@ function Get-ProviderRefusal {
         # the tests); require that exact shape so an unrelated JSON blob is never mistaken for it.
         $j = Find-ClaudeResultEnvelope -Answer $Answer
         if ($null -eq $j) { return $null }
-        $names = @($j.PSObject.Properties.Name)
-        $isError = ($names -contains 'is_error') -and ($j.is_error -is [bool]) -and ($j.is_error -eq $true)
+        $ief = Get-LaneContractField -Object $j -Name 'is_error'
+        $isError = $ief.ok -and ($ief.value -eq $true)
         # r4: api_error_status is a String or a Number and result is a String (the contract); any other kind reads
         # as '' here, so an array-typed result never feeds the refusal vocabulary.
         $statusField = Get-LaneContractField -Object $j -Name 'api_error_status'
         $status  = if ($statusField.ok) { [string]$statusField.value } else { '' }
         if (-not $isError -and $status -eq '') { return $null }
-        $msg  = if ($names -contains 'result') { $rf = Get-LaneContractField -Object $j -Name 'result'; if ($rf.ok) { [string]$rf.value } else { '' } } else { '' }
+        $rf = Get-LaneContractField -Object $j -Name 'result'
+        $msg  = if ($rf.ok) { [string]$rf.value } else { '' }
         $kind = Get-RefusalKind -Line $msg
         # Result TEXT never classifies a successful envelope (sol PR #117 BLOCKER): with is_error=false only
         # the numeric 429 status counts. 134 recorded envelopes never pair is_error=false with a status.
