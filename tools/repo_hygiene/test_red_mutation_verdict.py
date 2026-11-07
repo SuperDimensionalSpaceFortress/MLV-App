@@ -1695,6 +1695,29 @@ class SummarySplitR11(unittest.TestCase):
         self.assertEqual(rmv.classify(one, "t.py::TestA::test_target").status, rmv.PASS)
         self.assertEqual(rmv.classify(one, "t.py::test_b").status, rmv.PASS)
 
+    def test_r12_pass2_a1_a_bracket_in_a_class_name_keeps_every_later_reading(self) -> None:
+        # adversary r12 pass 2 A1 (c62bbb01): a `[` in a nested class name (`test_target[x] - AssertionError: x`) sent the
+        # line down the parameter-id branch, which kept only cuts after a `]` and dropped the real one before TypeError.
+        for c in ("x", "é"):
+            line = f"FAILED t.py::TestA::test_target[x] - AssertionError: x::test_{c} - TypeError: boom"
+            section = ("=== FAILURES ===\n" f"___ TestA.test_target[x] - AssertionError: x.test_{c} ___\n"
+                       "E       TypeError: boom\nt.py:3: TypeError\n")
+            for text in (f"=== short test summary info ===\nPASSED t.py::TestA::test_target[x]\n{line}\n"
+                         "=== 1 failed, 1 passed in 0.1s ===\n",
+                         f"=== short test summary info ===\n{line}\n=== 1 failed in 0.1s ===\n",
+                         f"{section}=== short test summary info ===\n{line}\n=== 1 failed in 0.1s ===\n"):
+                with self.subTest(c=repr(c), text=text[:40]):
+                    v = rmv.classify(text, "t.py::TestA::test_target[x]")
+                    want_code = "cnc-summary-split" if c.isascii() else "cnc-short-summary"
+                    self.assertEqual((v.status, v.code), (rmv.REFUSED, want_code), v)
+        # controls: a parameter id holding ' - ' or '::', one cut after its `]`, stays readable
+        for line, want in (("FAILED t.py::test_x[a - b] - assert 1 == 2", "t.py::test_x[a - b]"),
+                           ("FAILED t.py::test_x[p] - AssertionError: boom", "t.py::test_x[p]"),
+                           ("FAILED t.py::T::test_x[a::b] - assert 1 == 2", "t.py::T::test_x[a::b]")):
+            with self.subTest(line=line):
+                v = rmv.classify(self._run(line), want)
+                self.assertEqual((v.status, v.code), (rmv.PASS, "assertion-failed"), v)
+
     def test_r12_pass1_a2_bare_failed_is_an_assertion_head(self) -> None:
         # adversary r12 pass 1 A2 (d1ff9699, minor): pytest.fail() with no message prints a bare `Failed`
         for msg in ("Failed", "Failed: why"):

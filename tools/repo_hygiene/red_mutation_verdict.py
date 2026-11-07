@@ -532,11 +532,13 @@ def _summary_readings(line: str, word: str) -> list[tuple[str, str]] | None:
         # character is a reading too, never dropped; the caller refuses a line with such a reading (_unreadable_reading)
         cuts = [seps[0]] + [i for i in seps[1:] if _node_plausible(word, rest[:i])]
         return [(rest[:i], rest[i + 3:]) for i in cuts]
-    cuts = [i for i in seps if i > param and rest[i - 1] == "]"]
-    if not cuts:
-        return [(rest, "")]
-    readings = [(rest[:i], rest[i + 3:]) for i in cuts]
-    if readings[0][1].endswith("]"):
+    bracket = [i for i in seps if i > param and rest[i - 1] == "]"]
+    # r12 pass 2 A1 (c62bbb01): the first `[` may sit in a CLASS name (a nested class `test_target[x] - AssertionError: x`
+    # set through globals()), and then the node goes on past it. A ' - ' whose left side is a node id (readable or not)
+    # with a `::` after that `[` is a reading too, never dropped; the caller refuses an unreadable one.
+    extra = [i for i in seps if i not in bracket and "::" in rest[param:i] and _node_plausible(word, rest[:i])]
+    readings = [(rest[:i], rest[i + 3:]) for i in sorted(bracket + extra)]
+    if not bracket or rest[bracket[0] + 3:].endswith("]"):
         readings.append((rest, ""))
     return readings
 
