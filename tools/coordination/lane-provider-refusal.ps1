@@ -282,7 +282,17 @@ function Test-PromptDemandsVerdict {
     # is prose around the spelled object, so the scans are lenient where JSON is strict: a raw CR or LF always ends a string
     # (an escape never carries across it), a mismatched nested closer is ignored, and values need not be valid JSON
     # ("APPROVE"|"CHANGES_REQUESTED", <placeholder>, ...). Cost: one regex pass plus two bounded scans per member-position key.
-    foreach ($m in [regex]::Matches($Prompt, '"verdict"\s*:')) {
+    # r7 pass 2 (adversary A2): the key is compared DECODED, as the strict JSON reader of the answer sees it, so an escaped
+    # spelling ("verdict") is the same key. Any quoted name followed by ':' is a candidate; one that is not raw 'verdict'
+    # is decoded only when it carries a backslash.
+    foreach ($m in [regex]::Matches($Prompt, '(?<!\\)"((?:[^"\\\r\n]|\\[^\r\n])*)"\s*:')) {
+        $raw = $m.Groups[1].Value
+        if (-not [string]::Equals($raw, 'verdict', [System.StringComparison]::Ordinal)) {
+            if ($raw.IndexOf([char]92) -lt 0) { continue }
+            $dec = $null
+            try { $kd = [System.Text.Json.JsonDocument]::Parse('"' + $raw + '"'); try { $dec = $kd.RootElement.GetString() } finally { $kd.Dispose() } } catch { $dec = $null }
+            if (-not [string]::Equals($dec, 'verdict', [System.StringComparison]::Ordinal)) { continue }
+        }
         $j = $m.Index - 1
         while ($j -ge 0 -and [char]::IsWhiteSpace($Prompt[$j])) { $j-- }
         if ($j -lt 0) { continue }
@@ -347,6 +357,13 @@ function Test-LanePromptObjectClosesAfter {
 # trailing commas) must accept the text and its root must be an object. PowerShell ConvertFrom-Json is more
 # lenient than JSON (it takes a trailing comma and comments), so it only builds the object AFTER that check.
 # A non-object root (an array included), a malformed text or a blank one is $null.
+# The strict parse options (r7 pass 2, adversary A1): System.Text.Json defaults EXCEPT MaxDepth. Its default of 64 made a valid
+# envelope or verdict object with deeply nested unrelated metadata throw, which erased the success envelope, a 429 refusal
+# and a codex verdict. 1024 is PowerShell ConvertFrom-Json's default depth, which the base read these through. Comments
+# and trailing commas stay disallowed.
+$script:LANE_JSON_OPTIONS = New-Object System.Text.Json.JsonDocumentOptions
+$script:LANE_JSON_OPTIONS.MaxDepth = 1024
+
 function ConvertFrom-LaneJsonObject {
     param([AllowEmptyString()][AllowNull()][string]$Text)
     if ([string]::IsNullOrWhiteSpace($Text)) { return $null }
@@ -362,7 +379,7 @@ function ConvertFrom-LaneJsonObject {
     # "[]". A consumer reads a contract field through Get-LaneContractField, which checks the kind.
     $o = $null
     try {
-        $doc = [System.Text.Json.JsonDocument]::Parse($Text)
+        $doc = [System.Text.Json.JsonDocument]::Parse($Text, $script:LANE_JSON_OPTIONS)
         try {
             if ($doc.RootElement.ValueKind -ne [System.Text.Json.JsonValueKind]::Object) { return $null }
             $o = New-Object 'System.Collections.Generic.Dictionary[string,object]' ([System.StringComparer]::Ordinal)
@@ -457,7 +474,7 @@ function Test-LaneJsonScalar {
     if ([string]::IsNullOrWhiteSpace($Text)) { return $false }
     $scalar = $false
     try {
-        $doc = [System.Text.Json.JsonDocument]::Parse($Text)
+        $doc = [System.Text.Json.JsonDocument]::Parse($Text, $script:LANE_JSON_OPTIONS)
         try {
             $k = $doc.RootElement.ValueKind
             $scalar = ($k -ne [System.Text.Json.JsonValueKind]::Object -and $k -ne [System.Text.Json.JsonValueKind]::Array)

@@ -2633,6 +2633,31 @@ def test_r7_adv_a2_prose_string_state_never_hides_a_later_verdict_object(tmp_pat
         assert w["evidence"]["reason"] == "codex-no-verdict", (prompt, w)
 
 
+def test_r7_adv2_a1_deeply_nested_unrelated_metadata_never_erases_the_contract_evidence(tmp_path):
+    # adversary r7 pass 2 A1: JsonDocument.Parse's default MaxDepth (64) threw on valid metadata nested 65 deep, so the strict
+    # object builder returned null: the success envelope, a 429 refusal and a codex verdict were all lost.
+    nested = "[" * 64 + "0" + "]" * 64
+    ok = '{"type":"result","subtype":"success","is_error":false,"result":"done","metadata":%s}\n' % nested
+    assert _work_evidence(tmp_path, "claude", ok, 0)["workCompleted"] is True
+    rl = '{"type":"result","is_error":true,"api_error_status":429,"result":"rate limited","metadata":%s}\n' % nested
+    r = _classify(tmp_path, "", "claude", answer=rl)
+    assert r is not None and r["kind"] == "provider-rate-limit", r
+    r = _work_evidence(tmp_path, "codex", R4_PROSE + '{"verdict":"APPROVE","metadata":%s}\n' % nested, 0, prompt_chars=600, require_verdict=True)
+    assert r["workCompleted"] is True, r
+
+
+def test_r7_adv2_a2_an_escaped_spelling_of_the_verdict_key_is_still_a_verdict_demand(tmp_path):
+    # adversary r7 pass 2 A2: the strict reader decodes "verdict" to verdict, but the raw-name regex did not, so the prompt
+    # demanded nothing and a keyless answer was booked complete.
+    for key in ('v\\u0065rdict', '\\u0076erdict', 've\\u0072dict', 'verdic\\u0074'):
+        prompt = 'Review. End with {"%s":"APPROVE|CHANGES_REQUESTED"}' % key + "x" * 600
+        w = _run_invoke_lane_codex_wiring(tmp_path, "x" * 130, "", "", prompt)
+        assert w["evidence"]["reason"] == "codex-no-verdict", (key, w)
+    # an escaped quote is never the opening of a key, and a different decoded name is not the key
+    assert not _prompt_demands_verdict(tmp_path, 'Note {"a": "\\"verdict\\": 1"} only')
+    assert not _prompt_demands_verdict(tmp_path, 'Note {"v\\u0065rdicts": 1} only')
+
+
 def test_r7_f2_a_verdict_of_only_format_characters_is_blank(tmp_path):
     # the verdict-value blank test is a whitespace decision too: U+200B / U+FEFF / U+2060 are no verdict
     vals = ["\u200b", "\ufeff", "\u2060", "\u00a0\u200b", "\u3000"]
