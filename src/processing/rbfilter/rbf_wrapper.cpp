@@ -8,6 +8,7 @@
 #include "rbf.h"
 #include "rbf_wrapper.h"
 #include "RBFilterPlain.h"
+#include "../ThreadExitCache.h"
 #include <atomic>
 #include <cctype>
 #include <cstddef>
@@ -19,7 +20,10 @@ extern "C" {
 
 namespace
 {
-thread_local CRBFilterPlain g_rbf_filter;
+CRBFilterPlain & rbfFilter()
+{
+    return mlvThreadExitCache<CRBFilterPlain>();
+}
 
 // Exact, case-insensitive: only 1/true/yes/on enable. Unset, empty, 0, off,
 // no, false and anything else (e.g. "1garbage", "trueish") disable.
@@ -125,7 +129,7 @@ void recursive_bf_reset_parallel_env_cache_for_testing(void)
 
 int recursive_bf_last_filter_was_parallel(void)
 {
-    return g_rbf_filter.lastFilterParallel() ? 1 : 0;
+    return rbfFilter().lastFilterParallel() ? 1 : 0;
 }
 
 void recursive_bf_wrap_with_curve_index_lut(uint16_t * img_in,
@@ -179,22 +183,23 @@ void recursive_bf_wrap_with_curve_index_lut(uint16_t * img_in,
     else
     {
         //Ming version with better right boarder
-        g_rbf_filter.reserveMemory( width, height, channel );
-        g_rbf_filter.setTimingEnabled( recursiveBfDetailTimingEnabled() );
-        g_rbf_filter.setParallelVertical( recursiveBfParallelVerticalEnabled() );
-        g_rbf_filter.setTwoThreadVerticalTeam( recursiveBfTwoThreadVerticalTeam() );
-        g_rbf_filter.setMaxThreads( recursiveBfMaxThreads() );
-        g_rbf_filter.filter( img_in,
-                             img_out,
-                             sigma_spatial,
-                             sigma_range,
-                             width,
-                             height,
-                             channel,
-                             output_lut,
-                             output_curve_r,
-                             output_curve_g,
-                             output_curve_b );
+        CRBFilterPlain & filter = rbfFilter();
+        filter.reserveMemory( width, height, channel );
+        filter.setTimingEnabled( recursiveBfDetailTimingEnabled() );
+        filter.setParallelVertical( recursiveBfParallelVerticalEnabled() );
+        filter.setTwoThreadVerticalTeam( recursiveBfTwoThreadVerticalTeam() );
+        filter.setMaxThreads( recursiveBfMaxThreads() );
+        filter.filter( img_in,
+                       img_out,
+                       sigma_spatial,
+                       sigma_range,
+                       width,
+                       height,
+                       channel,
+                       output_lut,
+                       output_curve_r,
+                       output_curve_g,
+                       output_curve_b );
     }
 }
 
@@ -218,7 +223,7 @@ void recursive_bf_get_last_timing(recursive_bf_timing_t * timing)
 {
     if( !timing ) return;
 
-    const RBFilterPlainTiming last = g_rbf_filter.lastTiming();
+    const RBFilterPlainTiming last = rbfFilter().lastTiming();
     timing->total_ms = last.total_ms;
     timing->boundary_ms = last.boundary_ms;
     timing->range_table_ms = last.range_table_ms;

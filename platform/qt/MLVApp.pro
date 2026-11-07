@@ -522,6 +522,7 @@ HEADERS += MainWindow.h \
     ../../src/processing/interpolation/spline.h \
     ../../src/processing/interpolation/cosine_interpolation.h \
     HueVsDiagram.h \
+    ../../src/processing/ThreadExitCache.h \
     ../../src/processing/rbfilter/rbf_wrapper.h \
     ../../src/processing/rbfilter/rbf.h \
     ../../src/processing/rbfilter/RBFilterPlain.h \

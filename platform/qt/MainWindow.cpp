@@ -1627,6 +1627,7 @@ static bool lookAssistProcessedFloorLiftedPostInvalidShouldFailClosed(
 #include "ScopesLabel.h"
 #include "avir/avirthreadpool.h"
 #include "PlaybackPrepCpuRoute.h"
+#include "../../src/processing/ThreadExitCache.h"
 #include "MoveToTrash.h"
 #include "OverwriteListDialog.h"
 #include "PixelMapListDialog.h"
@@ -2026,7 +2027,7 @@ static QImage build_fast_playback_scaled_image(const uint8_t * source,
                                                std::vector<uint8_t> & scaledBuffer,
                                                int targetBytesPerLine = 0)
 {
-    static thread_local FastPlaybackScaleCache cache;
+    FastPlaybackScaleCache & cache = mlvThreadExitCache<FastPlaybackScaleCache>();
     return playbackBuildFastScaledImage( source,
                                          sourceWidth,
                                          sourceHeight,
