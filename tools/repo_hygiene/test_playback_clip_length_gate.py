@@ -1883,6 +1883,7 @@ class PlaybackLauncherScanTests(unittest.TestCase):
 # whole-text matching; no `allowlisted:` comment can exempt a line any more).
 from tools.repo_hygiene.app_play_scan import (  # noqa: E402
     LOOP_OFF_ENTRY_MARKERS,
+    PINNED_EVENT_SITES,
     PINNED_HELPER_BODIES,
     PLAY_SOURCES,
     REVIEWED_PROGRAMMATIC_PLAY_SITES,
@@ -2107,6 +2108,40 @@ class AppPlayGateStaticClassTests(unittest.TestCase):
         for name, injected in evasions.items():
             with self.subTest(name):
                 self._assert_caught(self._inject_after_measured_loop_off(injected))
+
+    # -- LOOK-ASSIST-CLIP-OPEN-GUI-BLOCK-1 guard contract: the event-dispatch pin grew from 1 to 3 entries ------
+
+    _PINNED_POST_FIXTURE = {
+        "platform/qt/MyApplication.h": "bool f() { return QApplication::sendEvent( m_mainWindow, event ); }\n",
+        "platform/qt/LookAssistAnalysisPump.h": "void land() { if( target ) QCoreApplication::postEvent( target.data(), held ); }\n",
+        "platform/qt/MainWindow.cpp": "void g() { m_pump.hold( [this, o]() { QCoreApplication::postEvent( this, o ); } ); }\n",
+    }
+
+    @staticmethod
+    def _event_dispatch_problems(sources: dict[str, str]) -> list[str]:
+        # Fixture text is not a whole tree, so the other scans report it; only the event-dispatch rows are under test.
+        return [p for p in scan_app_play_sources(sources) if p.startswith("event dispatch ")]
+
+    def test_the_event_dispatch_pin_is_exactly_the_three_declared_sites(self) -> None:
+        self.assertEqual(PINNED_EVENT_SITES, {
+            ("platform/qt/MyApplication.h", "sendEvent"): 1,
+            ("platform/qt/LookAssistAnalysisPump.h", "postEvent"): 1,
+            ("platform/qt/MainWindow.cpp", "postEvent"): 1,
+        })
+
+    def test_the_two_pinned_postevent_sites_pass(self) -> None:
+        self.assertEqual(self._event_dispatch_problems(dict(self._PINNED_POST_FIXTURE)), [])
+
+    def test_a_third_postevent_fails_the_scan(self) -> None:
+        third = "\nvoid h() { QCoreApplication::postEvent( this, new QKeyEvent( QEvent::KeyPress, 0, {} ) ); }\n"
+        for path in ("platform/qt/MainWindow.cpp", "platform/qt/LookAssistAnalysisPump.h", "platform/qt/OtherWidget.cpp"):
+            with self.subTest(path):
+                sources = dict(self._PINNED_POST_FIXTURE)
+                sources[path] = sources.get(path, "") + third
+                problems = self._event_dispatch_problems(sources)
+                count = 2 if path in self._PINNED_POST_FIXTURE else 1
+                self.assertEqual(problems, [f"event dispatch postEvent in {path} x{count}: not a pinned site "
+                                            "(the Play shortcut can be synthesized)"])
 
     def test_the_tokenizer_is_not_fooled_by_comments_or_strings(self) -> None:
         blank, keep = strip_cpp('a = "//"; b(); // c\n/* d */ e = \'x\'; f = R"x(//)x";\n')
