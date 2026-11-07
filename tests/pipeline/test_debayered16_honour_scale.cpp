@@ -215,7 +215,8 @@ bool reducedRecon(MlvPipelineFixture & fixture, uint64_t frame, int scale, Worke
     }
     std::vector<uint16_t> raw(fullPixels(fixture));
     if (getMlvRawFrameUint16(fixture.video(), frame, raw.data()) != 0) return false;
-    reduced->assign(static_cast<size_t>(plan->reducedWidth) * static_cast<size_t>(plan->reducedHeight), 0u);
+    // H2C-PORT-1: the reduced Bayer (plan->bayerWidth x bayerHeight; x2 for the x4 plan).
+    reduced->assign(static_cast<size_t>(plan->bayerWidth) * static_cast<size_t>(plan->bayerHeight), 0u);
     return mlvDualIsoPreviewScaleReconRun(fixture.video(), plan, raw.data(), reduced->data(), &worker.state,
                                           kCpuCores, nullptr, nullptr) == 1;
 }
@@ -232,8 +233,8 @@ bool headArm(MlvPipelineFixture & fixture, uint64_t frame, int scale, WorkerStat
     const int fh = fixture.height();
     std::vector<uint16_t> rgb16(fullPixels(fixture) * 3u, 0u);
     int rw = 0, rh = 0;
-    if (getMlvRawFrameDebayeredFromReducedReconnedRaw16(fixture.video(), frame, reduced.data(), plan->reducedWidth,
-                                                        plan->reducedHeight, plan->scale, rgb16.data(),
+    if (getMlvRawFrameDebayeredFromReducedReconnedRaw16(fixture.video(), frame, reduced.data(), plan->bayerWidth,
+                                                        plan->bayerHeight, plan->scale, rgb16.data(),
                                                         llrpHQDualIso(fixture.video()) ? 1 : 0, &rw, &rh) != 1)
         return false;
     const PlaybackPrepReducedDecision decision =
@@ -398,7 +399,7 @@ ProductionResult productionStep(MlvPipelineFixture & fixture, uint64_t frame, in
         mlvDualIsoPreviewScaleRecon_t plan;
         if (mlvDualIsoPreviewScaleReconPlan(fixture.video(), scale, &plan))
         {
-            slot.reducedReconBayer.resize(static_cast<size_t>(plan.reducedWidth) * plan.reducedHeight);
+            slot.reducedReconBayer.resize(static_cast<size_t>(plan.bayerWidth) * plan.bayerHeight);
             // GPU-DEVICE-LOSS-SELF-HEAL-1 r5: the worker thread's last recon ran on CUDA (the frames before a loss).
             if (workerLastReconUsedCuda) llrpSetGpuPlaybackReconLastUsedForTesting(1);
             const int rc = mlvDualIsoPreviewScaleReconRun(fixture.video(), &plan, slot.rawImage16.data(),
@@ -407,8 +408,8 @@ ProductionResult productionStep(MlvPipelineFixture & fixture, uint64_t frame, in
             if (rc == 1)
             {
                 slot.reducedReconScale = plan.scale;
-                slot.reducedReconWidth = plan.reducedWidth;
-                slot.reducedReconHeight = plan.reducedHeight;
+                slot.reducedReconWidth = plan.bayerWidth;
+                slot.reducedReconHeight = plan.bayerHeight;
             }
             else if (rc < 0)
             {
@@ -1322,27 +1323,31 @@ TEST(Debayered16ReconReuse, HonourScaleCoreEntryRefusalsAndRowFill)
             return std::all_of(out.begin(), out.end(), [&](uint16_t v) { return v == sentinel; }) && w == -1 && h == -1;
         };
         const int hq = llrpHQDualIso(fixture.video()) ? 1 : 0;
-        ASSERT_EQ(0, getMlvRawFrameDebayeredFromReducedReconnedRaw16(fixture.video(), 1, reduced.data(), plan.reducedWidth,
-                                                                     plan.reducedHeight, 1, out.data(), hq, &w, &h));
+        // H2C-PORT-1: the entry takes the reduced Bayer's dims (x2 for the x4 plan).
+        const int bw = plan.bayerWidth;
+        const int bh = plan.bayerHeight;
+        ASSERT_EQ(0, getMlvRawFrameDebayeredFromReducedReconnedRaw16(fixture.video(), 1, reduced.data(), bw,
+                                                                     bh, 1, out.data(), hq, &w, &h));
         ASSERT_TRUE(untouched());
-        ASSERT_EQ(0, getMlvRawFrameDebayeredFromReducedReconnedRaw16(fixture.video(), 1, reduced.data(), plan.reducedWidth,
-                                                                     plan.reducedHeight, 8, out.data(), hq, &w, &h));
+        ASSERT_EQ(0, getMlvRawFrameDebayeredFromReducedReconnedRaw16(fixture.video(), 1, reduced.data(), bw,
+                                                                     bh, 8, out.data(), hq, &w, &h));
         ASSERT_TRUE(untouched());
         ASSERT_EQ(0, getMlvRawFrameDebayeredFromReducedReconnedRaw16(fixture.video(), 1, reduced.data(),
-                                                                     plan.reducedWidth - 2, plan.reducedHeight, scale,
+                                                                     bw - 2, bh, scale,
                                                                      out.data(), hq, &w, &h));
         ASSERT_TRUE(untouched());
-        ASSERT_EQ(0, getMlvRawFrameDebayeredFromReducedReconnedRaw16(fixture.video(), 1, reduced.data(), plan.reducedWidth,
-                                                                     outH + 1, scale, out.data(), hq, &w, &h));
+        ASSERT_EQ(0, getMlvRawFrameDebayeredFromReducedReconnedRaw16(fixture.video(), 1, reduced.data(), bw,
+                                                                     fixture.height() / plan.bayerScale + 1, scale,
+                                                                     out.data(), hq, &w, &h));
         ASSERT_TRUE(untouched());
         setMlvAlwaysUseAmaze(fixture.video());
-        ASSERT_EQ(0, getMlvRawFrameDebayeredFromReducedReconnedRaw16(fixture.video(), 1, reduced.data(), plan.reducedWidth,
-                                                                     plan.reducedHeight, scale, out.data(), hq, &w, &h));
+        ASSERT_EQ(0, getMlvRawFrameDebayeredFromReducedReconnedRaw16(fixture.video(), 1, reduced.data(), bw,
+                                                                     bh, scale, out.data(), hq, &w, &h));
         ASSERT_TRUE(untouched());
         setMlvDontAlwaysUseAmaze(fixture.video());
 
-        ASSERT_EQ(1, getMlvRawFrameDebayeredFromReducedReconnedRaw16(fixture.video(), 1, reduced.data(), plan.reducedWidth,
-                                                                     plan.reducedHeight, scale, out.data(), hq, &w, &h));
+        ASSERT_EQ(1, getMlvRawFrameDebayeredFromReducedReconnedRaw16(fixture.video(), 1, reduced.data(), bw,
+                                                                     bh, scale, out.data(), hq, &w, &h));
         ASSERT_EQ(outW, w);
         ASSERT_EQ(outH, h);
         std::printf("[debayered16-honour-scale] core entry x%d: reduced %dx%d out %dx%d filled rows %d\n", scale,
@@ -1385,8 +1390,8 @@ TEST(Debayered16ReconReuse, HonourScaleReducedEntryRecordsItsDebayerKernelTime)
         {
             std::vector<uint16_t> bayer(reduced); // the entry shifts its input in place
             int w = -1, h = -1;
-            ASSERT_EQ(1, getMlvRawFrameDebayeredFromReducedReconnedRaw16(fixture.video(), 1, bayer.data(), plan.reducedWidth,
-                                                                         plan.reducedHeight, scale, out.data(), hq, &w, &h));
+            ASSERT_EQ(1, getMlvRawFrameDebayeredFromReducedReconnedRaw16(fixture.video(), 1, bayer.data(), plan.bayerWidth,
+                                                                         plan.bayerHeight, scale, out.data(), hq, &w, &h));
             ++calls;
             kernelMs = getMlvLastDebayerKernelMilliseconds();
         }

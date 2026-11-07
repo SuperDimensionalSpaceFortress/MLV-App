@@ -2,6 +2,7 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
+#include <math.h>
 #include <pthread.h>
 
 #include "debayer.h"
@@ -532,6 +533,384 @@ void debayer_reduced_hnyquist121_rgb16(uint16_t *out, const uint16_t *in, int w,
             }
         }
     }
+}
+
+/* CPU-DUALISO-REDUCED-RECON-H2C-PORT-1: the chroma-only [1,2,1]/4 along x (see
+ * debayer.h). The x4 CPU reduced route runs it on its x2 debayer before the 2x2 box
+ * ("H2c"; the x2 route does not, r8): it lowpasses R-G and B-G across the
+ * columns, where the shrunk Bayer's colour sites sit a full reduced pixel apart, and
+ * leaves G (the picture's sharpness) alone. */
+/* sel (r12 pass 2 A1): NULL, or the per-frame fit slopes {aR, aB} plus keep bits (sel_keep). For a channel whose fit
+ * was usable, the taps' own curvature |R_l - 2 R_m + R_r| / a is compared with the curvature of the balanced colour
+ * difference |(R_l - 2 R_m + R_r) / a - (G_l - 2 G_m + G_r)|; where the channel itself is the smoother one (an R or B
+ * that does not follow G, e.g. affine under a G-only step) it takes the plain [1 2 1] of itself, which is exact on an
+ * affine channel, instead of laying the colour difference on G. */
+static void debayer_reduced_hchroma121_impl(uint16_t *out, const uint16_t *in, int w, int h, int threads, int ranged,
+                                            const float *sel, int sel_keep)
+{
+    if (!out || !in || w <= 0 || h <= 0) return;
+    #pragma omp parallel for if(threads > 1) num_threads(threads)
+    for (int y = 0; y < h; ++y)
+    {
+        const uint16_t *src = in + (size_t)y * (size_t)w * 3u;
+        uint16_t *dst = out + (size_t)y * (size_t)w * 3u;
+        for (int x = 0; x < w; ++x)
+        {
+            const int xl = (x > 0) ? x - 1 : ((w > 1) ? x + 1 : x);
+            const int xr = (x < w - 1) ? x + 1 : ((w > 1) ? x - 1 : x);
+            const uint16_t *pl = src + (size_t)xl * 3u;
+            const uint16_t *pm = src + (size_t)x * 3u;
+            const uint16_t *pr = src + (size_t)xr * 3u;
+            const int g = (int)pm[1];
+            for (int c = 0; c < 3; c += 2)
+            {
+                if (sel)
+                {
+                    /* r12 pass 3 A1: a kept channel (degenerate fit, e.g. a negative slope) is the bilinear's, so it
+                     * takes its own [1 2 1] as well; the colour difference to G is never laid on it. */
+                    int own_path = (sel_keep & (c ? 2 : 1)) != 0;
+                    if (!own_path)
+                    {
+                        const float a = sel[c ? 1 : 0];
+                        const float own = fabsf((float)((int)pl[c] - 2 * (int)pm[c] + (int)pr[c])) / a;
+                        const float gc = (float)((int)pl[1] - 2 * g + (int)pr[1]);
+                        const float dif = fabsf((float)((int)pl[c] - 2 * (int)pm[c] + (int)pr[c]) / a - gc);
+                        own_path = own <= dif;
+                    }
+                    if (own_path)
+                    {
+                        dst[(size_t)x * 3u + (size_t)c] =
+                            (uint16_t)(((int)pl[c] + 2 * (int)pm[c] + (int)pr[c] + 2) >> 2);
+                        continue;
+                    }
+                }
+                const int s = ((int)pl[c] - (int)pl[1]) + 2 * ((int)pm[c] - g) + ((int)pr[c] - (int)pr[1]);
+                int v = g + ((s + 2) >> 2);
+                if (v < 0) v = 0;
+                if (v > 65535) v = 65535;
+                if (ranged)
+                {
+                    const int lo = MIN(MIN((int)pl[c], (int)pm[c]), (int)pr[c]);
+                    const int hi = MAX(MAX((int)pl[c], (int)pm[c]), (int)pr[c]);
+                    if (v < lo) v = lo;
+                    else if (v > hi) v = hi;
+                }
+                dst[(size_t)x * 3u + (size_t)c] = (uint16_t)v;
+            }
+            dst[(size_t)x * 3u + 1u] = (uint16_t)g;
+        }
+    }
+}
+
+void debayer_reduced_hchroma121_rgb16(uint16_t *out, const uint16_t *in, int w, int h, int threads)
+{
+    debayer_reduced_hchroma121_impl(out, in, w, h, threads, 0, NULL, 0);
+}
+
+/* r12 (adversary pass 9 A1, see debayer.h): the [1 2 1] lays the taps' mean colour
+ * difference on the centre G, so a G-only edge under an R or B that HA-CD had held
+ * constant came back through it (R = B = 9062 / 10937 for 10000 after the 2x2 box). */
+void debayer_reduced_hchroma121_ranged_rgb16(uint16_t *out, const uint16_t *in, int w, int h, int threads)
+{
+    debayer_reduced_hchroma121_impl(out, in, w, h, threads, 1, NULL, 0);
+}
+
+/* CPU-DUALISO-REDUCED-RECON-H2C-PORT-1 r10 (see debayer.h). r9 failed V-FRINGE-OWN at
+ * s4 slot 150 (0.949 > 0.90). The run dir's sim_r10b.py / sim_r10c.py model the x4
+ * route against the base x4 route per phase: a row-wise HA G on the raw (gained)
+ * Bayer doubles the fringe, because HA's Laplacian term assumes R, G and B share one
+ * gain. Balanced, gradient-directed HA with the colour difference laid on the
+ * bilinear G keeps every modelled phase at or under 0.89 of base (bilinear 1.14). */
+static inline int debayer_hacd_reflect(int i, int n)
+{
+    if (i < 0) i = -i;
+    if (i >= n) i = 2 * (n - 1) - i;
+    return i;
+}
+
+/* Least squares v ~ a * g4 + c over the sites of one colour (row parity py, column
+ * parity px, every second such row), g4 = the mean of the 4 G neighbours. Returns 1 for a
+ * usable fit, 0 for a degenerate one (under 16 sites, no G variance, or a slope outside
+ * [1/64, 64]); r11: the caller then keeps that channel's bilinear (adversary A1: a = 1,
+ * c = 0 on a gained raw doubled a neutral edge's false colour against the bilinear). */
+static int debayer_hacd_fit(const uint16_t *bayer, int w, int h, int py, int px, float *a_out, float *c_out)
+{
+    double n = 0.0, sg = 0.0, sv = 0.0, sgg = 0.0, sgv = 0.0;
+    for (int y = 2 + py; y + 1 < h; y += 4)
+    {
+        const uint16_t *row = bayer + (size_t)y * (size_t)w;
+        const uint16_t *up = row - w;
+        const uint16_t *dn = row + w;
+        for (int x = (px ? 1 : 2); x + 1 < w; x += 2)
+        {
+            const double g = ((double)up[x] + (double)dn[x] + (double)row[x - 1] + (double)row[x + 1]) * 0.25;
+            const double v = (double)row[x];
+            n += 1.0;
+            sg += g;
+            sv += v;
+            sgg += g * g;
+            sgv += g * v;
+        }
+    }
+    float a = 1.0f, c = 0.0f;
+    int ok = 0;
+    if (n >= 16.0)
+    {
+        const double mg = sg / n, mv = sv / n;
+        const double var = sgg / n - mg * mg;
+        const double cov = sgv / n - mg * mv;
+        if (var > 1.0)
+        {
+            const double fa = cov / var;
+            if (fa >= 1.0 / 64.0 && fa <= 64.0)
+            {
+                a = (float)fa;
+                c = (float)(mv - fa * mg);
+                ok = 1;
+            }
+        }
+    }
+    *a_out = a;
+    *c_out = c;
+    return ok;
+}
+
+static inline uint16_t debayer_hacd_round16(float v)
+{
+    if (!(v > 0.0f)) return 0;
+    if (v >= 65535.0f) return 65535;
+    return (uint16_t)(int)(v + 0.5f);
+}
+
+/* One R or B site: its balanced value minus the gradient-directed HA G (row or
+ * column, the smaller |dG| + |Laplacian|; a tie averages both), G clamped to
+ * [0, 65535]. xl1 .. xr2 are the (mirrored) columns x - 1, x + 1, x - 2, x + 2. */
+static inline float debayer_hacd_site(const uint16_t *row, const uint16_t *u1, const uint16_t *d1,
+                                      const uint16_t *u2, const uint16_t *d2, int x, int xl1, int xr1,
+                                      int xl2, int xr2, float ck, float ik)
+{
+#define HACD_BAL(v) (((float)(v) - ck) * ik)
+    const float c = HACD_BAL(row[x]);
+    const float l1 = (float)row[xl1], r1 = (float)row[xr1];
+    const float l2 = HACD_BAL(row[xl2]), r2 = HACD_BAL(row[xr2]);
+    const float up1 = (float)u1[x], dn1 = (float)d1[x];
+    const float lh = 2.0f * c - l2 - r2;
+    const float lv = 2.0f * c - HACD_BAL(u2[x]) - HACD_BAL(d2[x]);
+#undef HACD_BAL
+    /* r11: each directional G is clamped to its two G neighbours. Unclamped, the Laplacian of a colour
+     * whose difference to G is not constant (a saturated colour edge, or the a = 1, c = 0 fallback on a
+     * gained raw) pushed G past both neighbours and put more false colour on the edge than the bilinear
+     * (run dir sim_r11b.py / sim_r11c.py: red disc on blue 1.143x, fallback diagonal step 1.125x). */
+    const float gh = fminf(fmaxf(0.5f * (l1 + r1) + 0.25f * lh, fminf(l1, r1)), fmaxf(l1, r1));
+    const float gv = fminf(fmaxf(0.5f * (up1 + dn1) + 0.25f * lv, fminf(up1, dn1)), fmaxf(up1, dn1));
+    const float dh = fabsf(l1 - r1) + fabsf(lh);
+    const float dv = fabsf(up1 - dn1) + fabsf(lv);
+    float gg = (dh < dv) ? gh : (dv < dh) ? gv : 0.5f * (gh + gv);
+    if (gg < 0.0f) gg = 0.0f;
+    if (gg > 65535.0f) gg = 65535.0f;
+    return c - gg;
+}
+
+/* One output pixel: the colour difference at its own site or the bilinear mean of its
+ * nearest R / B sites (dif rows ro, uo = y - 1, dof = y + 1, columns xl, xr mirrored),
+ * laid on the pixel's bilinear G and mapped back by the fit. keep: bit 0 keeps the
+ * bilinear R, bit 1 the bilinear B (that channel's fit was degenerate, r11). */
+static inline void debayer_hacd_px(uint16_t *out, const float *dif, size_t ro, size_t uo, size_t dof, int x,
+                                   int xl, int xr, int ye, int xe, float aR, float cR, float aB, float cB, int keep)
+{
+#define HACD_D(o, xx) (dif[(o) + (size_t)(xx)])
+    float dr, db;
+    if (ye && xe)
+    {   /* R site */
+        dr = HACD_D(ro, x);
+        db = 0.25f * (HACD_D(uo, xl) + HACD_D(uo, xr) + HACD_D(dof, xl) + HACD_D(dof, xr));
+    }
+    else if (!ye && !xe)
+    {   /* B site */
+        db = HACD_D(ro, x);
+        dr = 0.25f * (HACD_D(uo, xl) + HACD_D(uo, xr) + HACD_D(dof, xl) + HACD_D(dof, xr));
+    }
+    else if (ye)
+    {   /* G in an R row: R left and right, B above and below */
+        dr = 0.5f * (HACD_D(ro, xl) + HACD_D(ro, xr));
+        db = 0.5f * (HACD_D(uo, x) + HACD_D(dof, x));
+    }
+    else
+    {   /* G in a B row: R above and below, B left and right */
+        dr = 0.5f * (HACD_D(uo, x) + HACD_D(dof, x));
+        db = 0.5f * (HACD_D(ro, xl) + HACD_D(ro, xr));
+    }
+#undef HACD_D
+    uint16_t *p = out + (size_t)x * 3u;
+    const float gb = (float)p[1];
+    if (!(keep & 1)) p[0] = debayer_hacd_round16(aR * (gb + dr) + cR);
+    if (!(keep & 2)) p[2] = debayer_hacd_round16(aB * (gb + db) + cB);
+}
+
+/* r12 (adversary r12 pass 2 A1): colour-difference interpolation is exact where the balanced colour difference is
+ * locally affine, the plain bilinear where the channel itself is. An R / B that does not follow G (affine under a
+ * G-only step: 6568 for 6650 after the box) took G's edge. At the pixel's nearest own site s (mirrored), the
+ * channel's own curvature |v(s-2) - 2 v(s) + v(s+2)| along x plus along y, divided by the fit slope a, is compared
+ * with the same curvature of the colour difference (dif, written at every own site); where the channel is not the
+ * rougher one the pixel takes the bilinear mean of its own nearest samples (exact on an affine channel) instead.
+ * Reads dif only at own sites. A kept (bilinear) channel is not touched. */
+static void debayer_hacd_select_row(uint16_t *out, const uint16_t *bayer, const float *dif, int w, int h, int y,
+                                    int keep, float aR, float aB)
+{
+#define HACD_B(yy, xx) ((float)bayer[(size_t)(yy) * (size_t)w + (size_t)(xx)])
+#define HACD_F(yy, xx) (dif[(size_t)(yy) * (size_t)w + (size_t)(xx)])
+    for (int ch = 0; ch < 2; ++ch)
+    {
+        if (keep & (1 << ch)) continue;
+        const float a = ch ? aB : aR;
+        const int py = ch; /* own rows / columns: R even, B odd */
+        int sy = (y & ~1) | py;
+        if (sy >= h) sy -= 2;
+        const int ya = debayer_hacd_reflect(sy - 2, h), yb = debayer_hacd_reflect(sy + 2, h);
+        const int oy = ((y & 1) == py); /* the pixel is on an own row */
+        const int yo1 = debayer_hacd_reflect(y - 1, h), yo2 = debayer_hacd_reflect(y + 1, h);
+        for (int x = 0; x < w; ++x)
+        {
+            int sx = (x & ~1) | py;
+            if (sx >= w) sx -= 2;
+            const int xa = debayer_hacd_reflect(sx - 2, w), xb = debayer_hacd_reflect(sx + 2, w);
+            const float own = (fabsf(HACD_B(sy, xa) - 2.0f * HACD_B(sy, sx) + HACD_B(sy, xb))
+                             + fabsf(HACD_B(ya, sx) - 2.0f * HACD_B(sy, sx) + HACD_B(yb, sx))) / a;
+            const float cd = fabsf(HACD_F(sy, xa) - 2.0f * HACD_F(sy, sx) + HACD_F(sy, xb))
+                           + fabsf(HACD_F(ya, sx) - 2.0f * HACD_F(sy, sx) + HACD_F(yb, sx));
+            if (!(own <= cd)) continue;
+            const int ox = ((x & 1) == py);
+            const int xo1 = debayer_hacd_reflect(x - 1, w), xo2 = debayer_hacd_reflect(x + 1, w);
+            float v;
+            if (oy && ox) v = HACD_B(y, x);
+            else if (oy) v = 0.5f * (HACD_B(y, xo1) + HACD_B(y, xo2));
+            else if (ox) v = 0.5f * (HACD_B(yo1, x) + HACD_B(yo2, x));
+            else v = 0.25f * (HACD_B(yo1, xo1) + HACD_B(yo1, xo2) + HACD_B(yo2, xo1) + HACD_B(yo2, xo2));
+            out[(size_t)x * 3u + (ch ? 2u : 0u)] = debayer_hacd_round16(v);
+        }
+    }
+#undef HACD_B
+#undef HACD_F
+}
+
+/* r11 (adversary pass 2 A1): each rebuilt R / B is clamped to [min, max] of that channel's own Bayer
+ * samples in the pixel's 5x5 window (mirrored; a mirror keeps the CFA parity). With a valid fit, a G-only
+ * edge under a constant R or B imprinted the G edge onto it where the bilinear is exact (run dir
+ * sim_r11f.py: R(48,23) 10000 -> 8383); a channel constant over the window is now exact, and a neutral
+ * edge's true value stays inside the range (modelled false colour falls further, e.g. diagonal step
+ * 0.500 -> 0.343 of the bilinear). Rows are independent; a kept (bilinear) channel is not touched. */
+static void debayer_hacd_range_row(uint16_t *out, const uint16_t *bayer, int w, int h, int y, int keep)
+{
+    const uint16_t *rows[5];
+    for (int k = 0; k < 5; ++k)
+        rows[k] = bayer + (size_t)debayer_hacd_reflect(y - 2 + k, h) * (size_t)w;
+    for (int ch = 0; ch < 2; ++ch)
+    {
+        if (keep & (1 << ch)) continue;
+        const int k0 = ((y & 1) == ch) ? 0 : 1; /* R (ch 0) on even rows and columns, B (ch 1) on odd */
+        for (int x = 0; x < w; ++x)
+        {
+            const int x0 = ((x & 1) == ch) ? x - 2 : x - 1;
+            int lo = 65535, hi = 0;
+            for (int k = k0; k < 5; k += 2)
+            {
+                const uint16_t *r = rows[k];
+                for (int xx = x0; xx <= x + 2; xx += 2)
+                {
+                    const int v = r[(xx >= 0 && xx < w) ? xx : debayer_hacd_reflect(xx, w)];
+                    if (v < lo) lo = v;
+                    if (v > hi) hi = v;
+                }
+            }
+            uint16_t *p = out + (size_t)x * 3u + (ch ? 2u : 0u);
+            if ((int)*p < lo) *p = (uint16_t)lo;
+            else if ((int)*p > hi) *p = (uint16_t)hi;
+        }
+    }
+}
+
+static int debayer_hacd_impl(uint16_t *rgb, const uint16_t *bayer, int w, int h, int threads, float *scratch,
+                             float *sel_out, int *keep_out)
+{
+    if (!rgb || !bayer || !scratch || w < 4 || h < 4) return 0;
+    float aR, cR, aB, cB;
+    const int okR = debayer_hacd_fit(bayer, w, h, 0, 0, &aR, &cR); /* R at (even, even) */
+    const int okB = debayer_hacd_fit(bayer, w, h, 1, 1, &aB, &cB); /* B at (odd, odd) */
+    /* r11: a degenerate fit keeps that channel as debayerBasicU16 wrote it. */
+    const int keep = (okR ? 0 : 1) | (okB ? 0 : 2);
+    if (sel_out) { sel_out[0] = aR; sel_out[1] = aB; }
+    if (keep_out) *keep_out = keep;
+    if (keep == 3) return 1;
+    const float iR = 1.0f / aR, iB = 1.0f / aB;
+    /* scratch[i] at an R or B site = its balanced value minus its HA G (the colour
+     * difference); G sites are not written. Same-colour neighbours (x +- 2, y +- 2)
+     * share the site's balance; the +- 1 neighbours are G, which is never balanced. */
+    float *dif = scratch;
+
+    #pragma omp parallel for if(threads > 1) num_threads(threads)
+    for (int y = 0; y < h; ++y)
+    {
+        const uint16_t *row = bayer + (size_t)y * (size_t)w;
+        const uint16_t *u1 = bayer + (size_t)debayer_hacd_reflect(y - 1, h) * (size_t)w;
+        const uint16_t *d1 = bayer + (size_t)debayer_hacd_reflect(y + 1, h) * (size_t)w;
+        const uint16_t *u2 = bayer + (size_t)debayer_hacd_reflect(y - 2, h) * (size_t)w;
+        const uint16_t *d2 = bayer + (size_t)debayer_hacd_reflect(y + 2, h) * (size_t)w;
+        const float ck = (y & 1) ? cB : cR, ik = (y & 1) ? iB : iR;
+        float *dd = dif + (size_t)y * (size_t)w;
+        int x = (y & 1);
+        /* The border sites mirror; the interior (x - 2 >= 0, x + 2 < w) indexes directly. */
+        for (; x < 2; x += 2)
+            dd[x] = debayer_hacd_site(row, u1, d1, u2, d2, x, debayer_hacd_reflect(x - 1, w), debayer_hacd_reflect(x + 1, w),
+                                      debayer_hacd_reflect(x - 2, w), debayer_hacd_reflect(x + 2, w), ck, ik);
+        for (; x + 2 < w; x += 2)
+            dd[x] = debayer_hacd_site(row, u1, d1, u2, d2, x, x - 1, x + 1, x - 2, x + 2, ck, ik);
+        for (; x < w; x += 2)
+            dd[x] = debayer_hacd_site(row, u1, d1, u2, d2, x, debayer_hacd_reflect(x - 1, w), debayer_hacd_reflect(x + 1, w),
+                                      debayer_hacd_reflect(x - 2, w), debayer_hacd_reflect(x + 2, w), ck, ik);
+    }
+
+    #pragma omp parallel for if(threads > 1) num_threads(threads)
+    for (int y = 0; y < h; ++y)
+    {
+        const size_t ro = (size_t)y * (size_t)w;
+        const size_t uo = (size_t)debayer_hacd_reflect(y - 1, h) * (size_t)w;
+        const size_t dof = (size_t)debayer_hacd_reflect(y + 1, h) * (size_t)w;
+        uint16_t *out = rgb + ro * 3u;
+        const int ye = (y & 1) == 0;
+        /* x = 0 and x = w - 1 mirror; the interior runs in (odd, even) pairs so each call's
+         * column parity is a constant. */
+        debayer_hacd_px(out, dif, ro, uo, dof, 0, 1, 1, ye, 1, aR, cR, aB, cB, keep);
+        int x = 1;
+        for (; x + 2 < w; x += 2)
+        {
+            debayer_hacd_px(out, dif, ro, uo, dof, x, x - 1, x + 1, ye, 0, aR, cR, aB, cB, keep);
+            debayer_hacd_px(out, dif, ro, uo, dof, x + 1, x, x + 2, ye, 1, aR, cR, aB, cB, keep);
+        }
+        for (; x < w - 1; ++x)
+            debayer_hacd_px(out, dif, ro, uo, dof, x, x - 1, x + 1, ye, (x & 1) == 0, aR, cR, aB, cB, keep);
+        debayer_hacd_px(out, dif, ro, uo, dof, w - 1, w - 2, debayer_hacd_reflect(w, w), ye, ((w - 1) & 1) == 0, aR, cR,
+                        aB, cB, keep);
+        debayer_hacd_select_row(out, bayer, dif, w, h, y, keep, aR, aB);
+        debayer_hacd_range_row(out, bayer, w, h, y, keep);
+    }
+    return 1;
+}
+
+int debayer_reduced_hacd_chroma_rgb16(uint16_t *rgb, const uint16_t *bayer, int w, int h, int threads,
+                                      float *scratch)
+{
+    return debayer_hacd_impl(rgb, bayer, w, h, threads, scratch, NULL, NULL);
+}
+
+int debayer_reduced_hacd_chroma121_rgb16(uint16_t *filtered, uint16_t *rgb, const uint16_t *bayer, int w, int h,
+                                         int threads, float *scratch)
+{
+    if (!filtered) return 0;
+    float sel[2] = { 1.0f, 1.0f };
+    int keep = 3;
+    if (!debayer_hacd_impl(rgb, bayer, w, h, threads, scratch, sel, &keep)) return 0;
+    debayer_reduced_hchroma121_impl(filtered, rgb, w, h, threads, 1, sel, keep);
+    return 1;
 }
 
 typedef struct

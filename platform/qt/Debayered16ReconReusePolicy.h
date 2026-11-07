@@ -560,8 +560,11 @@ struct Debayered16InlineReducedRecon
 {
     bool reconstructed = false;
     int scale = 1;
+    /*! CPU-DUALISO-REDUCED-RECON-H2C-PORT-1: the reduced BAYER's dims and scale
+     *  (plan.bayerWidth / bayerHeight / bayerScale; x2 for an x4 recon). */
     int reducedWidth = 0;
     int reducedHeight = 0;
+    int bayerScale = 1;
     Debayered16ReconProvenance provenance;
     /*! The decode ran, so its thread-local telemetry describes this frame. */
     bool decoded = false;
@@ -609,8 +612,8 @@ inline Debayered16InlineReducedRecon debayered16RunInlineReducedRecon( mlvObject
     }
     try
     {
-        reducedBayer.resize( static_cast<size_t>( plan.reducedWidth )
-                             * static_cast<size_t>( plan.reducedHeight ) );
+        reducedBayer.resize( static_cast<size_t>( plan.bayerWidth )
+                             * static_cast<size_t>( plan.bayerHeight ) );
     }
     catch( const std::bad_alloc & )
     {
@@ -639,8 +642,9 @@ inline Debayered16InlineReducedRecon debayered16RunInlineReducedRecon( mlvObject
     recon.preDualIsoFixMs = llrpGetLastPreDualIsoFixMilliseconds();
     recon.provenance.done = debayered16ReconDoneStamp( video );
     recon.scale = plan.scale;
-    recon.reducedWidth = plan.reducedWidth;
-    recon.reducedHeight = plan.reducedHeight;
+    recon.reducedWidth = plan.bayerWidth;
+    recon.reducedHeight = plan.bayerHeight;
+    recon.bayerScale = plan.bayerScale;
     recon.reconstructed = true;
     return recon;
 }

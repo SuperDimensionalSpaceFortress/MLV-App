@@ -245,7 +245,7 @@ std::vector<uint8_t> scale2SubsetFrame(MlvPipelineFixture & fixture, uint64_t fr
     *fullResFixes = plan.fullResFixes;
     std::vector<uint16_t> raw(static_cast<size_t>(fixture.width()) * static_cast<size_t>(fixture.height()));
     ASSERT_EQ(0, getMlvRawFrameUint16(fixture.video(), frame, raw.data()));
-    std::vector<uint16_t> reduced(static_cast<size_t>(plan.reducedWidth) * static_cast<size_t>(plan.reducedHeight));
+    std::vector<uint16_t> reduced(static_cast<size_t>(plan.bayerWidth) * static_cast<size_t>(plan.bayerHeight));
     WorkerState worker;
     ASSERT_EQ(1, mlvDualIsoPreviewScaleReconRun(fixture.video(), &plan, raw.data(), reduced.data(),
                                                 &worker.state, 1, nullptr, nullptr));
@@ -254,7 +254,7 @@ std::vector<uint8_t> scale2SubsetFrame(MlvPipelineFixture & fixture, uint64_t fr
     std::vector<uint8_t> out(static_cast<size_t>(w) * static_cast<size_t>(h) * 3u);
     PreviewEnvelope envelope(scale);
     ASSERT_EQ(1, getMlvProcessedFrame8ScaledFromReducedReconnedRaw16(fixture.video(), frame, reduced.data(),
-                                                                     plan.reducedWidth, plan.reducedHeight,
+                                                                     plan.bayerWidth, plan.bayerHeight,
                                                                      plan.scale, out.data(), 1, scale));
     return out;
 }
@@ -435,7 +435,8 @@ std::vector<uint16_t> reducedRun(MlvPipelineFixture & fixture, const mlvDualIsoP
                                  const std::vector<uint16_t> & raw)
 {
     std::vector<uint16_t> full = raw;
-    std::vector<uint16_t> reduced(static_cast<size_t>(plan.reducedWidth) * static_cast<size_t>(plan.reducedHeight));
+    // H2C-PORT-1: the reduced Bayer (x2 for the CPU plan at x4).
+    std::vector<uint16_t> reduced(static_cast<size_t>(plan.bayerWidth) * static_cast<size_t>(plan.bayerHeight));
     WorkerState worker;
     ASSERT_EQ(1, mlvDualIsoPreviewScaleReconRun(fixture.video(), &plan, full.data(), reduced.data(), &worker.state, 1,
                                                 nullptr, nullptr));

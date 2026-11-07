@@ -244,8 +244,18 @@ int getMlvRawFrameDebayeredFromReconnedRaw16(mlvObject_t * video,
  * (Height / reconScale) RGB16 pixels, returned in outWidth / outHeight. No
  * decode, no llrawproc, no cache read or publish. A nonzero bit shift is applied
  * to reducedReconnedRaw in place. Returns 1 on success, 0 (nothing written) unless
- * reconScale is 2 or 4, reducedWidth == Width / reconScale, 0 < reducedHeight <=
- * Height / reconScale and the debayer is bilinear (doesMlvAlwaysUseAmaze == 0).
+ * reconScale is 2 or 4, reducedWidth == Width / bayerScale, reducedHeight is even
+ * and 4 <= reducedHeight <= Height / bayerScale (r12: a shorter or odd Bayer would
+ * leave rows unreconstructed) and the debayer is bilinear (doesMlvAlwaysUseAmaze == 0).
+ * CPU-DUALISO-REDUCED-RECON-H2C-PORT-1: reducedWidth / reducedHeight are the
+ * reduced BAYER's dims (plan.bayerWidth / bayerHeight); bayerScale = Width /
+ * reducedWidth is reconScale, or 2 when reconScale is 4 (the x4 "H2c" route:
+ * debayer at x2, R and B rebuilt by debayer_reduced_hacd_chroma_rgb16 (r10),
+ * chroma-only horizontal [1 2 1] clamped to each channel's three taps, both
+ * steps taking a channel's own interpolation where it is smoother than the
+ * colour difference (r12, debayer_reduced_hacd_chroma121_rgb16), 2x2 box). At x2 (bayerScale ==
+ * reconScale == 2), and at x4 with bayerScale 4, the bytes are the bilinear
+ * debayer's, as before (r8: x2 is held at base behaviour).
  * reconHqDualIso selects the bit shift as in ...FromReconnedRaw16. */
 int getMlvRawFrameDebayeredFromReducedReconnedRaw16(mlvObject_t * video,
                                                     uint64_t frameIndex,
@@ -300,6 +310,16 @@ typedef struct
     const char * reason;    /* "none" when reduced, otherwise why full resolution */
     int phaseTentShrink;    /* 1: shrink with pl_downsample_bayer_to_bayer_phase_tent (both
                              * plans, x2/x4); 0: the Phase 4B decimator (x8) */
+    /* CPU-DUALISO-REDUCED-RECON-H2C-PORT-1: the dims the shrink writes and the recon
+     * runs on (the reduced Bayer, bayerWidth x bayerHeight words). Equal to
+     * scale / reducedWidth / reducedHeight everywhere except the CPU plan at x4, which
+     * shrinks and reconstructs at x2 (bayerScale 2, fullWidth / 2 x sourceHeight / 2);
+     * its consumers debayer at x2, rebuild R and B (r10 HA-CD), take the chroma-only
+     * [1 2 1] and box to x4 ("H2c").
+     * reducedWidth / reducedHeight stay the display dims. */
+    int bayerScale;
+    int bayerWidth;
+    int bayerHeight;
 } mlvDualIsoPreviewScaleRecon_t;
 
 /* Process-wide counters of the phase-tent shrink (successful shrinks and their summed
@@ -316,7 +336,9 @@ int mlvDualIsoPreviewScaleReconPlan(mlvObject_t * video,
                                     mlvDualIsoPreviewScaleRecon_t * plan);
 /* Run the planned reduced recon: seed the ISO pattern from `fullRaw`, apply the
  * full-res fixes in place when planned, shrink into `reducedOut` (capacity
- * reducedWidth*reducedHeight words) and reconstruct it on `worker` without
+ * plan->bayerWidth*plan->bayerHeight words; CPU-DUALISO-REDUCED-RECON-H2C-PORT-1:
+ * the CPU plan at x4 writes an x2 Bayer, 4x reducedWidth*reducedHeight, so size
+ * the buffer from the bayer dims, never the display dims) and reconstruct it on `worker` without
  * publishing estimates to the shared llrawproc state, then apply the reduced
  * ISO-period notch to it (LLRP_WITH_DIMS_REDUCED_ISO_NOTCH; a notch that cannot
  * get its scratch fails the run like a failed recon). Returns 1 on success,
@@ -331,7 +353,8 @@ int mlvDualIsoPreviewScaleReconRun(mlvObject_t * video,
                                    double * fullResFixesMs,
                                    double * downsampleMs);
 /* The first half of ...Run: seed the ISO pattern, run the planned full-res
- * fixes in place and shrink into `reducedOut`. Returns 1 (fullRaw untouched)
+ * fixes in place and shrink into `reducedOut` (capacity plan->bayerWidth *
+ * plan->bayerHeight words, as ...Run). Returns 1 (fullRaw untouched)
  * or 2 (fixes changed fullRaw) on success, 0 / -1 on failure as ...Run. */
 int mlvDualIsoPreviewScaleReconShrink(mlvObject_t * video,
                                       const mlvDualIsoPreviewScaleRecon_t * plan,
