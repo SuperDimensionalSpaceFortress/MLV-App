@@ -191,6 +191,22 @@ TEST(ResizeStillDrawingWait, IdlenessMustHoldContinuouslyABusyBlipRestartsTheGra
     ASSERT_TRUE(result.waitedMs >= 100);
 }
 
+// adversary r1 A1: one pump that does not return (a nested modal loop) is outside any helper bound; the helper's part is
+// to check the deadline right after it and never pump again. The caller's part (pinned below) is a pump that cannot
+// dispatch the user input that opens such a loop.
+TEST(ResizeStillDrawingWait, APumpThatOutlastsTheDeadlineEndsTheWaitWithoutAnotherPump)
+{
+    FakeWorld world;
+    world.idleFromMs = INT64_MAX; // busy: nothing may call it stale
+    Callbacks c = world.callbacks();
+    c.pump = [&world]() { ++world.pumps; world.nowMs += 10000; };
+    const Result result = wait(c);
+    ASSERT_TRUE(result.outcome == Outcome::Timeout);
+    ASSERT_EQ(1, world.pumps);
+    ASSERT_EQ(0, world.clearStaleCalls);
+    ASSERT_EQ(static_cast<std::int64_t>(10000), result.waitedMs);
+}
+
 TEST(ResizeStillDrawingWait, OutcomesHaveTheLogNames)
 {
     ASSERT_EQ(std::string("not_waiting"), name(Outcome::NotWaiting));
@@ -209,7 +225,7 @@ TEST(ResizeStillDrawingWaitWiring, ResizeEventHasNoUnboundedSpinAndCallsTheHelpe
     // both former sites call the helper, each with its own site label, before the work it guarded
     const int resizeSite = body.indexOf(QStringLiteral("waitForResizeStillDrawing( QStringLiteral(\"resize\") );"));
     const int drawAt = body.indexOf(QStringLiteral("drawFrame();"));
-    const int gradientSite = body.indexOf(QStringLiteral("waitForResizeStillDrawing( QStringLiteral(\"gradient\") );"));
+    const int gradientSite = body.indexOf(QStringLiteral("waitForResizeStillDrawing( QStringLiteral(\"gradient\") )"));
     const int redrawAt = body.indexOf(QStringLiteral("m_pGradientElement->redrawGradientElement("));
     ASSERT_TRUE(resizeSite >= 0);
     ASSERT_TRUE(drawAt > resizeSite);
@@ -224,12 +240,15 @@ TEST(ResizeStillDrawingWaitWiring, TheSiteWaitUsesTheBoundedHelperAndLogsAlwaysO
 {
     const QString source = readRepoFile(QStringLiteral("platform/qt/MainWindow.cpp"));
     const QString body = functionBody(source,
-        QStringLiteral("void MainWindow::waitForResizeStillDrawing( const QString &site )"),
+        QStringLiteral("MainWindow::waitForResizeStillDrawing( const QString &site )"),
         QStringLiteral("//Window resized -> scale picture"));
     ASSERT_FALSE(body.isEmpty());
     ASSERT_TRUE(body.contains(QStringLiteral("resize_still_drawing_wait::wait(")));
     ASSERT_TRUE(body.contains(QStringLiteral("!renderThreadBusyForPlaybackAdvance( currentPlaybackAdvanceTarget() )")));
-    ASSERT_TRUE(body.contains(QStringLiteral("qApp->processEvents();")));
+    // adversary r1 A1: the pump defers user input, so a shortcut (Ctrl+I's file dialog) cannot open a nested modal loop
+    // inside the bounded wait; the input is delivered by the next unfiltered event loop pass, not dropped
+    ASSERT_TRUE(body.contains(QStringLiteral("qApp->processEvents( QEventLoop::ExcludeUserInputEvents );")));
+    ASSERT_FALSE(body.contains(QStringLiteral("qApp->processEvents();")));
     ASSERT_TRUE(body.contains(QStringLiteral("m_frameStillDrawing = false;")));
     ASSERT_TRUE(body.contains(QStringLiteral("QStringLiteral(\"resize.still_drawing_wait\")")));
     ASSERT_TRUE(body.contains(QStringLiteral(
@@ -238,4 +257,42 @@ TEST(ResizeStillDrawingWaitWiring, TheSiteWaitUsesTheBoundedHelperAndLogsAlwaysO
     // always-on: the log call is not trace-only
     ASSERT_FALSE(body.contains(QStringLiteral("true );")));
     ASSERT_FALSE(body.contains(QStringLiteral("while( m_frameStillDrawing )")));
+}
+
+// adversary r1 A2: a gradient-site Timeout means the frame drawFrame() asked for has not landed, so the scene still has
+// the old geometry. The redraw is then deferred to the frame-ready path (m_zoomModeChanged, consumed by
+// finishPresentedFrame against the landed scene) instead of placing the overlay on the old scene.
+TEST(ResizeStillDrawingWaitWiring, AGradientSiteTimeoutDefersTheRedrawToTheLandedFrame)
+{
+    const QString source = readRepoFile(QStringLiteral("platform/qt/MainWindow.cpp"));
+    const QString wrapper = functionBody(source,
+        QStringLiteral("MainWindow::waitForResizeStillDrawing( const QString &site )"),
+        QStringLiteral("//Window resized -> scale picture"));
+    ASSERT_FALSE(wrapper.isEmpty());
+    ASSERT_TRUE(source.contains(QStringLiteral("bool MainWindow::waitForResizeStillDrawing( const QString &site )")));
+    ASSERT_TRUE(wrapper.contains(QStringLiteral(
+        "return result.outcome != resize_still_drawing_wait::Outcome::Timeout;")));
+
+    const QString body = resizeEventBody();
+    ASSERT_FALSE(body.isEmpty());
+    const int gradientIf = body.indexOf(QStringLiteral("if( waitForResizeStillDrawing( QStringLiteral(\"gradient\") ) )"));
+    ASSERT_TRUE(gradientIf >= 0);
+    const QString tail = body.mid(gradientIf);
+    const int redrawAt = tail.indexOf(QStringLiteral("m_pGradientElement->redrawGradientElement("));
+    const int elseAt = tail.indexOf(QStringLiteral("else"));
+    const int deferAt = tail.indexOf(QStringLiteral("m_zoomModeChanged = true;"));
+    ASSERT_TRUE(redrawAt > 0);
+    ASSERT_TRUE(elseAt > redrawAt);
+    ASSERT_TRUE(deferAt > elseAt);
+
+    // the frame-ready path still consumes the flag with a gradient redraw on the landed scene
+    const QString finish = functionBody(source,
+        QStringLiteral("void MainWindow::finishPresentedFrame( uint64_t displayFrame,"),
+        QStringLiteral("\nvoid MainWindow::"));
+    ASSERT_FALSE(finish.isEmpty());
+    const int consumeAt = finish.indexOf(QStringLiteral("if( m_zoomModeChanged )"));
+    ASSERT_TRUE(consumeAt >= 0);
+    const QString consume = finish.mid(consumeAt, 400);
+    ASSERT_TRUE(consume.contains(QStringLiteral("m_zoomModeChanged = false;")));
+    ASSERT_TRUE(consume.contains(QStringLiteral("m_pGradientElement->redrawGradientElement( m_pScene->width(),")));
 }
