@@ -540,7 +540,7 @@ void debayer_reduced_hnyquist121_rgb16(uint16_t *out, const uint16_t *in, int w,
  * ("H2c"; the x2 route does not, r8): it lowpasses R-G and B-G across the
  * columns, where the shrunk Bayer's colour sites sit a full reduced pixel apart, and
  * leaves G (the picture's sharpness) alone. */
-void debayer_reduced_hchroma121_rgb16(uint16_t *out, const uint16_t *in, int w, int h, int threads)
+static void debayer_reduced_hchroma121_impl(uint16_t *out, const uint16_t *in, int w, int h, int threads, int ranged)
 {
     if (!out || !in || w <= 0 || h <= 0) return;
     #pragma omp parallel for if(threads > 1) num_threads(threads)
@@ -562,11 +562,31 @@ void debayer_reduced_hchroma121_rgb16(uint16_t *out, const uint16_t *in, int w, 
                 int v = g + ((s + 2) >> 2);
                 if (v < 0) v = 0;
                 if (v > 65535) v = 65535;
+                if (ranged)
+                {
+                    const int lo = MIN(MIN((int)pl[c], (int)pm[c]), (int)pr[c]);
+                    const int hi = MAX(MAX((int)pl[c], (int)pm[c]), (int)pr[c]);
+                    if (v < lo) v = lo;
+                    else if (v > hi) v = hi;
+                }
                 dst[(size_t)x * 3u + (size_t)c] = (uint16_t)v;
             }
             dst[(size_t)x * 3u + 1u] = (uint16_t)g;
         }
     }
+}
+
+void debayer_reduced_hchroma121_rgb16(uint16_t *out, const uint16_t *in, int w, int h, int threads)
+{
+    debayer_reduced_hchroma121_impl(out, in, w, h, threads, 0);
+}
+
+/* r12 (adversary pass 9 A1, see debayer.h): the [1 2 1] lays the taps' mean colour
+ * difference on the centre G, so a G-only edge under an R or B that HA-CD had held
+ * constant came back through it (R = B = 9062 / 10937 for 10000 after the 2x2 box). */
+void debayer_reduced_hchroma121_ranged_rgb16(uint16_t *out, const uint16_t *in, int w, int h, int threads)
+{
+    debayer_reduced_hchroma121_impl(out, in, w, h, threads, 1);
 }
 
 /* CPU-DUALISO-REDUCED-RECON-H2C-PORT-1 r10 (see debayer.h). r9 failed V-FRINGE-OWN at

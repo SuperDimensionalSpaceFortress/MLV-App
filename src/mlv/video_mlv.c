@@ -7172,8 +7172,8 @@ static float * mlv_ensure_thread_reduced_recon_hacd_scratch(uint64_t required_fl
 /* The CPU reduced recon's debayer at the display dims (out_w x out_h RGB16 in out):
  *  - displayScale == 2 * bayerScale (x4 from an x2 Bayer, "H2c"): bilinear at
  *    bw x bh, R and B rebuilt by debayer_reduced_hacd_chroma_rgb16 (r10: balanced
- *    HA G + colour difference on the bilinear G), chroma-only horizontal [1 2 1],
- *    2x2 box (whole row pairs only);
+ *    HA G + colour difference on the bilinear G), chroma-only horizontal [1 2 1]
+ *    clamped to each channel's three taps (r12), 2x2 box (whole row pairs only);
  *  - otherwise (x2, and x4 from an x4 Bayer): the bilinear debayer's bytes, as
  *    before this card. r8 (hub ruling HUB-TICK 20261105T2045Z) holds x2 at base
  *    behaviour; x2's filter is CPU-DUALISO-REDUCED-X2-COMB-FILTER-1.
@@ -7211,13 +7211,17 @@ static int mlv_reduced_bayer_to_display_rgb16(uint16_t * out,
         debayerBasicU16RecordingKernelMilliseconds(debayered, bayer, bw, bh, threads, bit_shift);
         /* r10: R and B from HA G + colour difference, on the bilinear G (bayer is shifted now). */
         if (!debayer_reduced_hacd_chroma_rgb16(debayered, bayer, bw, bh, threads, hacd_scratch)) return 0;
-        debayer_reduced_hchroma121_rgb16(filtered, debayered, bw, bh, threads);
+        /* r12 (adversary pass 9 A1): the ranged [1 2 1] keeps each R / B inside its three taps' own range, so a
+         * channel HA-CD held constant under a G-only edge stays constant through the filter and the box. */
+        debayer_reduced_hchroma121_ranged_rgb16(filtered, debayered, bw, bh, threads);
         if (!processingRgbU16BoxDownsample(filtered, out, bw, box_h, 2, threads)) return 0;
         rows = box_h / 2;
     }
     else
     {
-        if (bw != out_w || bh > out_h) return 0;
+        /* r12 (adversary pass 9 A2, pre-existing): one row would make debayerBasicU16's bottom-row copy read the
+         * row before out. */
+        if (bw != out_w || bh < 2 || bh > out_h) return 0;
         debayerBasicU16RecordingKernelMilliseconds(out, bayer, bw, bh, threads, bit_shift);
         rows = bh;
     }

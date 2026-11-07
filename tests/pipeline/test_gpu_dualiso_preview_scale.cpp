@@ -2484,7 +2484,8 @@ TEST(GpuDualIsoPreviewScale, CpuReducedX4PlayingIsH2cByteForByte)
         debayerBasicU16(deb.data(), work.data(), bw, bh, threads, shift);
         std::vector<float> scratch(static_cast<size_t>(bw) * static_cast<size_t>(bh));
         ASSERT_EQ(1, debayer_reduced_hacd_chroma_rgb16(deb.data(), work.data(), bw, bh, threads, scratch.data()));
-        debayer_reduced_hchroma121_rgb16(filt.data(), deb.data(), bw, bh, threads);
+        // r12 (adversary pass 9 A1): the [1 2 1] clamped to each channel's three taps.
+        debayer_reduced_hchroma121_ranged_rgb16(filt.data(), deb.data(), bw, bh, threads);
         const int boxH = bh & ~1;
         ASSERT_EQ(1, processingRgbU16BoxDownsample(filt.data(), expected.data(), bw, boxH, 2, threads));
         for (int y = boxH / 2; y < outH; ++y)
@@ -2583,6 +2584,54 @@ TEST(GpuDualIsoPreviewScale, HChroma121FiltersOnlyTheColourDifference)
     ASSERT_EQ(65535, static_cast<int>(highOut[3]));
     ASSERT_EQ(64000, static_cast<int>(highOut[4]));
     ASSERT_EQ(65535, static_cast<int>(highOut[5]));
+}
+
+// H2C-PORT-1 r12 (adversary pass 9 A1): debayer_reduced_hchroma121_ranged_rgb16 is the plain filter with each R' / B'
+// clamped to [min, max] of that channel over the three pixels it read. (1) R = B = 10000 under a G step 10000 -> 20000:
+// the plain filter gives 7500 / 12500 beside the step, the ranged one 10000 everywhere; G passes. (2) Where the plain
+// output is already inside the taps' range (the G ramp with R - G +-400 and B - G ramping above, away from the
+// mirrored edge), both give the same bytes. Mutations: no clamp; the range over G; the range over two taps.
+TEST(GpuDualIsoPreviewScale, HChroma121RangedKeepsAChannelInsideItsTaps)
+{
+    const int w = 8;
+    std::vector<uint16_t> step(static_cast<size_t>(w) * 3u);
+    for (int x = 0; x < w; ++x)
+    {
+        step[static_cast<size_t>(x) * 3u] = 10000;
+        step[static_cast<size_t>(x) * 3u + 1u] = static_cast<uint16_t>(x < 4 ? 10000 : 20000);
+        step[static_cast<size_t>(x) * 3u + 2u] = 10000;
+    }
+    std::vector<uint16_t> plain(step.size(), 0u), ranged(step.size(), 0u);
+    debayer_reduced_hchroma121_rgb16(plain.data(), step.data(), w, 1, 1);
+    debayer_reduced_hchroma121_ranged_rgb16(ranged.data(), step.data(), w, 1, 1);
+    ASSERT_EQ(7500, static_cast<int>(plain[3u * 3u]));
+    ASSERT_EQ(12500, static_cast<int>(plain[4u * 3u]));
+    for (int x = 0; x < w; ++x)
+    {
+        ASSERT_EQ(10000, static_cast<int>(ranged[static_cast<size_t>(x) * 3u]));
+        ASSERT_EQ(static_cast<int>(step[static_cast<size_t>(x) * 3u + 1u]), static_cast<int>(ranged[static_cast<size_t>(x) * 3u + 1u]));
+        ASSERT_EQ(10000, static_cast<int>(ranged[static_cast<size_t>(x) * 3u + 2u]));
+    }
+    const int rw = 6, rh = 2;
+    std::vector<uint16_t> in(static_cast<size_t>(rw) * rh * 3u);
+    for (int y = 0; y < rh; ++y)
+        for (int x = 0; x < rw; ++x)
+        {
+            uint16_t * p = in.data() + (static_cast<size_t>(y) * rw + x) * 3u;
+            p[1] = static_cast<uint16_t>(10000 + 1000 * x);
+            p[0] = static_cast<uint16_t>(p[1] + ((x % 2) ? -400 : 400));
+            p[2] = static_cast<uint16_t>(p[1] + 100 * x);
+        }
+    std::vector<uint16_t> a(in.size(), 0u), b(in.size(), 0u);
+    debayer_reduced_hchroma121_rgb16(a.data(), in.data(), rw, rh, 1);
+    debayer_reduced_hchroma121_ranged_rgb16(b.data(), in.data(), rw, rh, 4);
+    for (int y = 0; y < rh; ++y)
+        for (int x = 1; x < rw - 1; ++x)
+            for (int c = 0; c < 3; ++c)
+            {
+                const size_t i = (static_cast<size_t>(y) * rw + x) * 3u + static_cast<size_t>(c);
+                ASSERT_EQ(static_cast<int>(a[i]), static_cast<int>(b[i]));
+            }
 }
 
 namespace {

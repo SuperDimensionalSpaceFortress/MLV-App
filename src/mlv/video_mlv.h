@@ -244,13 +244,15 @@ int getMlvRawFrameDebayeredFromReconnedRaw16(mlvObject_t * video,
  * (Height / reconScale) RGB16 pixels, returned in outWidth / outHeight. No
  * decode, no llrawproc, no cache read or publish. A nonzero bit shift is applied
  * to reducedReconnedRaw in place. Returns 1 on success, 0 (nothing written) unless
- * reconScale is 2 or 4, reducedWidth == Width / bayerScale, 0 < reducedHeight <=
- * Height / bayerScale and the debayer is bilinear (doesMlvAlwaysUseAmaze == 0).
+ * reconScale is 2 or 4, reducedWidth == Width / bayerScale, 2 <= reducedHeight <=
+ * Height / bayerScale (r12: one row is refused) and the debayer is bilinear
+ * (doesMlvAlwaysUseAmaze == 0).
  * CPU-DUALISO-REDUCED-RECON-H2C-PORT-1: reducedWidth / reducedHeight are the
  * reduced BAYER's dims (plan.bayerWidth / bayerHeight); bayerScale = Width /
  * reducedWidth is reconScale, or 2 when reconScale is 4 (the x4 "H2c" route:
  * debayer at x2, R and B rebuilt by debayer_reduced_hacd_chroma_rgb16 (r10),
- * chroma-only horizontal [1 2 1], 2x2 box). At x2 (bayerScale ==
+ * chroma-only horizontal [1 2 1] clamped to each channel's three taps (r12,
+ * debayer_reduced_hchroma121_ranged_rgb16), 2x2 box). At x2 (bayerScale ==
  * reconScale == 2), and at x4 with bayerScale 4, the bytes are the bilinear
  * debayer's, as before (r8: x2 is held at base behaviour).
  * reconHqDualIso selects the bit shift as in ...FromReconnedRaw16. */

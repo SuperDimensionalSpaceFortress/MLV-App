@@ -32,6 +32,12 @@ void debayer_reduced_hnyquist121_rgb16(uint16_t *out, const uint16_t *in, int w,
  * rounds ((s + 2) >> 2, floor), clamped to [0, 65535]. Rows are independent
  * (threads > 1: OpenMP over rows). out and in must not alias. */
 void debayer_reduced_hchroma121_rgb16(uint16_t *out, const uint16_t *in, int w, int h, int threads);
+/* r12: the same filter, then each R' and B' clamped to [min, max] of that channel in the
+ * three input pixels it read (xl, x, xr). A channel constant over the three passes
+ * through exactly whatever G does, so the x4 route's 2x2 box (a mean of in-range values)
+ * cannot put a G-only edge back on it. G passes through. Same threading and aliasing
+ * rules. The x4 CPU reduced route runs this one; the plain filter is r8's composition. */
+void debayer_reduced_hchroma121_ranged_rgb16(uint16_t *out, const uint16_t *in, int w, int h, int threads);
 /* CPU-DUALISO-REDUCED-RECON-H2C-PORT-1 r10: the x4 route's edge chroma. rgb holds
  * debayerBasicU16's output for bayer (RGGB, R at (even row, even col), bayer already
  * bit-shifted by that call). G is left as it is. R and B are rebuilt from a
