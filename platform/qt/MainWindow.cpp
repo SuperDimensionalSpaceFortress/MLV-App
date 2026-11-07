@@ -12236,14 +12236,15 @@ void MainWindow::playbackHandling(int timeDiff)
                 const double sourcePositionBeforeDropTick = m_newPosDropMode;
                 // HFR-NATIVE-60FPS-FULLRES-1 r24 (key3 B1 M-HFR-CONFORM-SKIP): under conform the catch-up advances by whole
                 // frames, so a tick that owes less than one whole period beyond the next frame presents that frame (never
-                // N -> N + 2 from a fractional position); a real stall still skips. Without conform the grant is unchanged.
+                // N -> N + 2 from a fractional position) and carries the rest as m_conformDropDebtFrames, repaid one presented
+                // frame per later tick (adversary A1 on 9b900412); a real stall still skips. Without conform the grant is unchanged.
                 const playback_frame_range::DropFrameTickResult dropFrameTick =
                     playback_frame_range::advanceDropFrameTick(
                         m_newPosDropMode,
                         playback_frame_range::conformDropFrameDelta(
                             m_newPosDropMode,
                             m_playbackPaceGuard.grant( getPlaybackFramerate() * (double)timeDiff / 1000.0, paceNowMs, playbackPaceGuardFps() ),
-                            playbackConformActive() ),
+                            playbackConformActive(), m_conformDropDebtFrames ),
                         ui->spinBoxCutIn->value(), ui->spinBoxCutOut->value(),
                         ui->actionLoop->isChecked() );
                 // slip_summary: the granted share, read back from the tick (a wrap subtracted the cut range width;
@@ -12289,6 +12290,7 @@ void MainWindow::playbackHandling(int timeDiff)
     {
         m_newPosDropMode = ui->horizontalSliderPosition->value(); //track it also when playback is off
         m_playbackPaceGuard.reset();
+        m_conformDropDebtFrames = 0.0;
     }
 }
 
@@ -31612,6 +31614,7 @@ void MainWindow::on_actionPlay_toggled(bool checked)
         checked ? "play-start" : "play-stop" );
     // PLAYBACK-CUDA-NATIVE-PACE-1: the pace clock re-arms at this Play's first engine tick.
     m_playbackPaceGuard.reset();
+    m_conformDropDebtFrames = 0.0;   // HFR-NATIVE-60FPS-FULLRES-1 r24: no held conform frame survives a Play start or stop
     logInteractionEvent(
         QStringLiteral("play.toggled.begin"),
         QStringLiteral("checked=%1 file_loaded=%2 position=%3 cut_in=%4 cut_out=%5 frame_changed=%6 still_drawing=%7 pending_advance=%8")

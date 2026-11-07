@@ -3127,9 +3127,10 @@ TEST( PlaybackConformDropFrame, R24WithoutConformTheDropFrameTickIsByteIdentical
         ASSERT_TRUE( sameBits( granted, playback_frame_range::conformDropFrameDelta( 1152.8, granted, true ) ) );
 }
 
-TEST( PlaybackConformDropFrame, R24AHeldCatchupDropsWholeFramesKeepsThePhaseAndTheRecordersAgree )
+TEST( PlaybackConformDropFrame, R24AHeldCatchupPresentsTheNextFrameKeepsThePhaseAndTheRecordersAgree )
 {
-    // 1152.8 + 1.584 lands on 1153.384: exactly one whole frame of the grant is dropped (never repaid), the phase stays.
+    // 1152.8 + 1.584 lands on 1153.384: one whole frame of the grant is held back (the stateful form carries it as debt,
+    // R24A1* below), the phase stays.
     double landing = 0.0;
     ASSERT_EQ( 1, conformDropTickTransition( 1152.8, 1.584, true, &landing ) );
     ASSERT_NEAR( 1153.384, landing, 1e-9 );
@@ -3220,5 +3221,108 @@ TEST( PlaybackConformDropFrame, R24AConformedPlayWithSubPeriodGuiLateTicksPresen
         {
             ASSERT_EQ( 2, tracker.maxJump() );
         }
+    }
+}
+
+namespace
+{
+struct ConformPlayResult { int maxJump = 0; double reachedMs = -1.0; int64_t consumedAt64998 = 0; double sourceFps = 0.0; };
+
+// r24 adversary A1 on 9b900412: the engine as MainWindow runs it -- the pace guard at 24 fps with the first-tick notePresent, the
+// drop-frame tick through the STATEFUL conform delta (the debt it carries), the source-frame counter and the conform tracker --
+// over cut 1..2860 of a 59.94 clip, Loop off, until frame 1498 (1499 required source frames) is reached.
+ConformPlayResult playConformed( int lateEvery, double lateMs, bool conformActive )
+{
+    playback_native_pace::NativePaceGuard guard;
+    guard.reset();
+    PlaybackSourceAdvanceTracker tracker;
+    playback_frame_range::SourceFrameAdvanceCounter counter;
+    counter.begin( 0 );
+    tracker.notePresented( 0.0, 0, 0, 0, 2859 );
+    double position = 0.0, nowMs = 0.0, debt = 0.0;
+    int lastPresented = 0;
+    ConformPlayResult r;
+    for( int t = 1; t < 100000 && r.reachedMs < 0.0; ++t )
+    {
+        const double tickMs = ( t % lateEvery == 0 ) ? lateMs : 8.0;
+        nowMs += tickMs;
+        const double granted = guard.grant( 24.0 * tickMs / 1000.0, nowMs, 24.0 );
+        if( t == 1 ) guard.notePresent( nowMs, 24.0 );
+        const double before = position;
+        const playback_frame_range::DropFrameTickResult tick = playback_frame_range::advanceDropFrameTick(
+            position, playback_frame_range::conformDropFrameDelta( position, granted, conformActive, debt ), 1, 2860, false );
+        position = tick.position;
+        counter.noteEngineTick( before, position, tick.wrapped );
+        if( nowMs <= 64998.0 ) r.consumedAt64998 = counter.consumed();
+        const int presented = static_cast<int>( position );
+        if( presented != lastPresented )
+        {
+            tracker.notePresented( nowMs / 1000.0, presented, 0, 0, 2859 );
+            lastPresented = presented;
+        }
+        if( presented >= 1498 ) r.reachedMs = nowMs;
+    }
+    r.maxJump = tracker.maxJump();
+    r.sourceFps = tracker.sourceFps();
+    return r;
+}
+} // namespace
+
+TEST( PlaybackConformDropFrame, R24A1HeldCatchupIsRepaidSoTheConformedSourcePaceStaysInTheBand )
+{
+    // adversary A1's literal input: tickMs = (t % 48 == 0) ? 66 : 8 at a 24 fps guard. 9b900412 dropped the whole frame each held
+    // tick never repaid it: frame 1498 at 66002 ms, 22.696 source fps, 1474 of 1499 consumed at 64998 ms. The held frame is now a
+    // debt repaid by later ticks, one presented frame at a time, so the pace stays native and no presented jump exceeds 1.
+    const ConformPlayResult held = playConformed( 48, 66.0, true );
+    ASSERT_EQ( 1, held.maxJump );
+    ASSERT_TRUE( held.reachedMs > 0.0 );
+    ASSERT_TRUE( held.reachedMs <= 62500.0 );                 // 1498 frames at 24 fps is 62417 ms; the grants alone reach it at 62418 ms
+    ASSERT_TRUE( held.consumedAt64998 >= int64_t( 1499 ) );   // the required source frames inside the 65000 ms safety
+    ASSERT_TRUE( held.sourceFps >= 23.28 && held.sourceFps <= 24.72 );   // the committed conform band
+    // the same ticks without conform keep the old skip (jump 2) and the same pace: the repayment only re-times the frames
+    const ConformPlayResult plain = playConformed( 48, 66.0, false );
+    ASSERT_EQ( 2, plain.maxJump );
+    ASSERT_NEAR( plain.reachedMs, held.reachedMs, 100.0 );
+    // other late-tick cadences and lengths below a whole-period stall: still every frame, still in the band
+    for( const int every : { 5, 13, 48, 97 } )
+        for( const double lateMs : { 50.0, 66.0, 82.0 } )
+        {
+            const ConformPlayResult r = playConformed( every, lateMs, true );
+            ASSERT_EQ( 1, r.maxJump );
+            ASSERT_TRUE( r.sourceFps >= 23.28 && r.sourceFps <= 24.72 );
+        }
+}
+
+TEST( PlaybackConformDropFrame, R24A1TheCarriedDebtIsBoundedAndClearedWithoutConform )
+{
+    // a held tick carries the whole frame it did not present; the next ordinary tick repays it as a one-frame step
+    double debt = 0.0;
+    const double held = playback_frame_range::conformDropFrameDelta( 1152.8, 1.584, true, debt );
+    ASSERT_NEAR( 1153.384, 1152.8 + held, 1e-9 );
+    ASSERT_NEAR( 1.0, debt, 1e-9 );
+    const double repaid = playback_frame_range::conformDropFrameDelta( 1153.384, 0.192, true, debt );
+    ASSERT_EQ( 1154, static_cast<int>( 1153.384 + repaid ) );
+    ASSERT_NEAR( 1154.576, 1153.384 + repaid, 1e-9 );
+    ASSERT_NEAR( 0.0, debt, 1e-12 );
+    // the debt never exceeds kConformMaxDebtFrames: a renderer that is always late plays every frame slower, it never bursts
+    debt = 0.0;
+    double position = 100.8;
+    for( int t = 0; t < 200; ++t )
+    {
+        const double delta = playback_frame_range::conformDropFrameDelta( position, 1.9, true, debt );
+        ASSERT_TRUE( static_cast<int>( position + delta ) - static_cast<int>( position ) <= 1 );
+        position += delta;
+        ASSERT_TRUE( debt <= playback_frame_range::kConformMaxDebtFrames + 1e-9 );
+    }
+    // without conform the debt is cleared and the grant is returned bit for bit
+    const double g = 1.584;
+    ASSERT_TRUE( sameBits( g, playback_frame_range::conformDropFrameDelta( 1152.8, g, false, debt ) ) );
+    ASSERT_EQ( 0.0, debt );
+    // with no debt the stateful form is the stateless one, bit for bit
+    for( const double granted : { 0.192, 1.0, 1.2, 1.584, 1.999, 2.0, 2.13 } )
+    {
+        double none = 0.0;
+        ASSERT_TRUE( sameBits( playback_frame_range::conformDropFrameDelta( 1152.8, granted, true ),
+                               playback_frame_range::conformDropFrameDelta( 1152.8, granted, true, none ) ) );
     }
 }

@@ -163,8 +163,19 @@ TEST(PlaybackConformWiring, DropFrameTickQuantisesTheConformedCatchupToWholeFram
         "                        playback_frame_range::conformDropFrameDelta(\n"
         "                            m_newPosDropMode,\n"
         "                            m_playbackPaceGuard.grant( getPlaybackFramerate() * (double)timeDiff / 1000.0, paceNowMs, playbackPaceGuardFps() ),\n"
-        "                            playbackConformActive() ),");
+        "                            playbackConformActive(), m_conformDropDebtFrames ),");
     ASSERT_EQ(1, countOccurrences(body, call));
+    // adversary A1 on 9b900412: the held frames are carried and repaid, and no debt survives a Play stop or start
+    ASSERT_EQ(1, countOccurrences(body, QStringLiteral(
+        "        m_playbackPaceGuard.reset();\n"
+        "        m_conformDropDebtFrames = 0.0;")));
+    const QString source = mainWindowSource();
+    ASSERT_EQ(1, countOccurrences(source, QStringLiteral(
+        "    m_playbackPaceGuard.reset();\n"
+        "    m_conformDropDebtFrames = 0.0;   // HFR-NATIVE-60FPS-FULLRES-1 r24: no held conform frame survives a Play start or stop")));
+    // the tick's comment, the tick, the two clears: nothing else writes or reads it
+    ASSERT_EQ(4, countOccurrences(source, QStringLiteral("m_conformDropDebtFrames")));
+    ASSERT_TRUE(readRepoFile(QStringLiteral("platform/qt/MainWindow.h")).contains(QStringLiteral("double m_conformDropDebtFrames = 0.0;")));
     ASSERT_EQ(1, countOccurrences(body, QStringLiteral("playback_frame_range::advanceDropFrameTick(")));
     ASSERT_EQ(1, countOccurrences(body, QStringLiteral("playback_frame_range::conformDropFrameDelta(")));
     // the recorders read the tick's own position, after the quantisation

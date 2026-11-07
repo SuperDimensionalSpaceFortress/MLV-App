@@ -303,19 +303,23 @@ inline DropFrameTickResult advanceDropFrameTick(
 // Drop Frame Mode keeps the position fractional, so a tick granted 1.2 frames or more from x.8 crossed two integers and
 // presented N -> N + 2 (sol r23: 1152.8 + 1.584 = 1154.384, 1152 -> 1154) although the tick owed less than one whole
 // period beyond the frame it presents. Under conform the catch-up therefore advances by WHOLE frames: such a tick
-// presents the next frame, and the whole frames it would have skipped are dropped from the grant (never repaid, so the
-// timeline never runs faster than the pace; the sub-frame phase is kept). The documented drop-frame skip after a REAL
-// stall stays: a grant of at least 1 + kConformStallDebtFrames is a tick that owes at least one whole period beyond the
-// frame it presents, and it skips exactly as before (and is stall evidence, never a conform PASS).
+// presents the next frame (keeping the sub-frame phase), and the whole frames it would have skipped become a DEBT the
+// stateful form below carries and repays on the following ticks, one presented frame per tick (r24 adversary A1 on
+// 9b900412: dropping them instead lost a frame of time per late tick, 22.696 source fps). The documented drop-frame skip
+// after a REAL stall stays: a grant of at least 1 + kConformStallDebtFrames is a tick that owes at least one whole period
+// beyond the frame it presents, and it skips exactly as before (and is stall evidence, never a conform PASS).
 //
 // Without conform, and for every tick that crosses at most one integer, the grant is returned unchanged, bit for bit:
-// non-conform drop-frame behaviour is byte-identical, and so is every ordinary conformed tick.
+// non-conform drop-frame behaviour is byte-identical, and so is every ordinary conformed tick that carries no debt.
 inline constexpr double kConformStallDebtFrames = 1.0;
+// The most debt carried: a renderer that is always late plays every frame slower rather than bursting to repay a backlog.
+inline constexpr double kConformMaxDebtFrames = 2.0;
 
-inline double conformDropFrameDelta( double currentPosition, double grantedFrames, bool conformActive )
+// The whole-frame landing of a conformed tick that asks for \a wantedFrames from \a currentPosition: unchanged when it crosses
+// at most one integer, else the next frame with the landing's phase. No stall rule (the callers apply it to the GRANT).
+inline double conformWholeFrameDelta( double currentPosition, double wantedFrames )
 {
-    if( !conformActive || !( grantedFrames > 0.0 ) || !( currentPosition >= 0.0 ) ) return grantedFrames;
-    if( grantedFrames >= 1.0 + kConformStallDebtFrames ) return grantedFrames;   // a real stall: the documented skip
+    const double grantedFrames = wantedFrames;
     // the slider presents the integer part (setValue of an int; the position is never negative)
     const double presentedFrame = std::floor( currentPosition );
     const double landing = currentPosition + grantedFrames;
@@ -329,6 +333,31 @@ inline double conformDropFrameDelta( double currentPosition, double grantedFrame
     // the caller adds the delta back (advanceDropFrameTick): never let rounding land it a hair short of the next frame
     while( currentPosition + delta < nextFrame ) delta = std::nextafter( delta, grantedFrames );
     return delta;
+}
+
+// The stateful form MainWindow uses: \a debtFrames (m_conformDropDebtFrames) carries the whole frames a held tick did not
+// present; each later conformed tick asks for its grant plus that debt and still lands at most one integer on, so the debt is
+// repaid one presented frame per tick and the source pace stays the guard's. Cleared without conform; capped at
+// kConformMaxDebtFrames. A real stall (the grant alone >= 1 + kConformStallDebtFrames) skips with the grant as before and
+// leaves the debt to the following ticks.
+inline double conformDropFrameDelta( double currentPosition, double grantedFrames, bool conformActive, double & debtFrames )
+{
+    if( !conformActive ) { debtFrames = 0.0; return grantedFrames; }
+    if( !( grantedFrames > 0.0 ) || !( currentPosition >= 0.0 ) ) return grantedFrames;
+    if( grantedFrames >= 1.0 + kConformStallDebtFrames ) return grantedFrames;   // a real stall: the documented skip
+    const double wanted = debtFrames > 0.0 ? grantedFrames + debtFrames : grantedFrames;
+    const double delta = conformWholeFrameDelta( currentPosition, wanted );
+    double debt = ( currentPosition + wanted ) - ( currentPosition + delta );
+    if( !( debt > 1e-9 ) ) debt = 0.0;
+    debtFrames = debt < kConformMaxDebtFrames ? debt : kConformMaxDebtFrames;
+    return delta;
+}
+
+// The single-tick form (no debt carried in or out): the same delta for a tick that carries no debt.
+inline double conformDropFrameDelta( double currentPosition, double grantedFrames, bool conformActive )
+{
+    double debt = 0.0;
+    return conformDropFrameDelta( currentPosition, grantedFrames, conformActive, debt );
 }
 
 // HFR-NATIVE-60FPS-FULLRES-1 r21 fix iteration 1 (adversary A1 on 43db3021): the width a NON-drop Loop wrap is credited
