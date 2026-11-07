@@ -1597,6 +1597,36 @@ def test_codex_lane_runtime_path_an_inherited_entry_is_reduced_before_it_is_chec
     assert _codex_runtime_path_field(done, "PATH") == "C:\\first;C:\\toolchains\\mingw.\\bin;C:\\toolchains\\mingw\\bin"
 
 
+@codex_runtime_path_only
+def test_codex_lane_runtime_path_an_inherited_entry_the_loader_cannot_use_does_not_count_as_present(tmp_path):
+    # Adversary A1 on fb022797 (introduced, major): reduction made 'C:\Qt\Tools\mingw1310_64\bin\' + '.\' * 16330 (a 32 KB spelling) look like the
+    # canonical directory, so the usable candidate was suppressed (ADDED=0) while LoadLibraryExW fails on the raw string. The raw spelling must stay within
+    # what a loader search entry can be: an entry plus '\' plus the longest runtime DLL name (libgcc_s_seh-1.dll, 18 characters) within MAX_PATH. A longer
+    # spelling is treated as absent (a duplicate costs 30 bytes; a false "present" costs the fix).
+    base = "C:\\Qt\\Tools\\mingw1310_64\\bin"
+    padded = base + "\\" + ".\\" * 16330
+    env = {**os.environ, "MINGW_ROOT": ""}
+    done = _codex_runtime_path_run(
+        tmp_path,
+        f"$psi.Environment['PATH'] = 'C:\\Program Files\\nodejs;C:\\Windows\\System32;{padded}'\n"
+        "$r = @(Add-CodexLaneRuntimePath -Psi $psi)\n'ADDED=' + $r.Count",
+        env=env,
+    )
+    assert _codex_runtime_path_field(done, "ADDED") == "1", done.stdout
+    assert _codex_runtime_path_field(done, "PATH").endswith(f";{base}"), done.stdout
+    # the boundary: 240 characters is still a spelling the loader can use, 241 is not
+    for pad_len, added in ((240, "0"), (241, "1")):
+        k, extra = divmod(pad_len - (len(base) + 1), 2)
+        entry = base + "\\" + ".\\" * k + ("." if extra else "")
+        assert len(entry) == pad_len, (len(entry), pad_len)
+        done = _codex_runtime_path_run(
+            tmp_path,
+            f"$psi.Environment['PATH'] = 'C:\\first;{entry}'\n"
+            f"$r = @(Add-CodexLaneRuntimePath -Psi $psi -Candidates @('{base}'))\n'ADDED=' + $r.Count",
+        )
+        assert _codex_runtime_path_field(done, "ADDED") == added, (pad_len, done.stdout)
+
+
 def test_codex_lane_runtime_path_is_wired_into_the_codex_child_only():
     body = LANE_RUNNER.read_text(encoding="utf-8").replace("\r\n", "\n")
     assert "function Add-CodexLaneRuntimePath" in body, "Invoke-Lane lacks Add-CodexLaneRuntimePath"

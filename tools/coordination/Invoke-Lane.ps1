@@ -1964,8 +1964,8 @@ function Set-CodexLaunchStartInfo {
 # tested without starting codex. The directory is APPENDED, so every tool already on PATH resolves exactly as before. A directory is appended whether or not it
 # exists, and NOTHING here touches the filesystem (r3, hub ruling): a missing directory on PATH is harmless (the loader skips it), while the existence lookup
 # that r1 and r2 carried was the source of 12 introduced findings (a stall in SMB behind a UNC path, a mapped drive or a junction; a runspace that outlives
-# the lookup; a budget that bounded the wait but not the work). One already present (any ASCII case, with or without a trailing backslash) is not added
-# twice. Returns the directories added. Candidates: $env:MINGW_ROOT\bin (the build docs' name for the toolchain, docs/02-developer-guide.md), then the
+# the lookup; a budget that bounded the wait but not the work). One already present (the drive letter in either case, the rest compared exactly, with or without a trailing backslash; an inherited
+# spelling longer than 240 characters is not counted) is not added twice. Returns the directories added. Candidates: $env:MINGW_ROOT\bin (the build docs' name for the toolchain, docs/02-developer-guide.md), then the
 # default Qt-installer toolchain C:\Qt\Tools\mingw1310_64\bin that build-guard and tools\testing\run-windows-test.ps1 use.
 function Add-CodexLaneRuntimePath {
     param(
@@ -2031,6 +2031,11 @@ function Add-CodexLaneRuntimePath {
     }
     $seen = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::Ordinal)
     foreach ($entry in ($current -split ';')) {
+        # An inherited entry counts as present only when its RAW spelling is one the loader can search: the entry, a '\' and the longest runtime DLL name
+        # (libgcc_s_seh-1.dll, 18 characters) must fit MAX_PATH (260 with the terminator), so 240 characters at most. Reduction makes a padded spelling
+        # ('C:\Qt\Tools\mingw1310_64\bin\' + '.\' * 16330, 32 KB) look like the canonical directory while LoadLibraryExW fails on the raw string, which
+        # suppressed the usable candidate (adversary A1 on fb022797). A false "absent" costs a ~30 byte duplicate; a false "present" costs the fix.
+        if ($entry.Length -gt 240) { continue }
         $norm = & $dirNorm $entry
         if ($norm) { [void]$seen.Add((& $dirKey $norm)) }
     }
