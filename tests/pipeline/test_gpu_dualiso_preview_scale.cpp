@@ -2104,12 +2104,20 @@ TEST(GpuDualIsoPreviewScale, HacdChromaConstantChannelUnderAGEdgeStaysExact)
 //     reflection that broke the CFA parity at an odd edge would, reads NaN and prints 0), and 3 px in R and B sit on G
 //     within 3 after the gain and black are taken out (replica sim_r11d.py: 0.00). Part (b) found no defect at
 //     68c038b2 or 685b40e3: it is a pin, GREEN on arrival.
+// r12 (Dot advisory on #748, cos-feedback/mlv-app/pr-748.md): since 05cc2e15 the 5x5 own-sample range clamp lifts the
+// 0 that a NaN scratch read prints to the window's positive minimum, so "no 0" no longer sees a bad read. Each size
+// now also runs with the scratch poisoned with +1e6 and -1e6, and the bytes must equal the NaN run's: a read of a
+// site no producer wrote prints 0 -> lo under NaN and -1e6 but 65535 -> hi under +1e6, so it shows wherever the
+// clamp's range is not a single value. Mutation (run dir r12 mutation-border-*.txt): the x = 0 pixel taking column
+// 0 instead of the mirrored column 1 as its left neighbour passes the old checks on every size and fails this one
+// (5, 7, 9 and 9 words differ).
 TEST(GpuDualIsoPreviewScale, HacdChromaMinimumAndOddSizesAreExact)
 {
     bool allOk = true;
     const int degenerate[][2] = { { 4, 4 }, { 5, 5 }, { 5, 4 }, { 4, 5 }, { 7, 9 }, { 9, 7 }, { 32, 6 } };
     const int valid[][2] = { { 34, 7 }, { 35, 9 }, { 37, 11 }, { 36, 10 } };
     const double kr = 0.40, kb = 0.65, blk = 2048.0;
+    const float poisons[] = { std::numeric_limits<float>::quiet_NaN(), 1.0e6f, -1.0e6f };
     for (int part = 0; part < 2; ++part)
     {
         const int count = part == 0 ? 7 : 4;
@@ -2130,11 +2138,12 @@ TEST(GpuDualIsoPreviewScale, HacdChromaMinimumAndOddSizesAreExact)
                 }
             const std::vector<uint16_t> work = r11HacdMosaic(w, h, r, g, b);
             std::vector<uint16_t> rgb1;
+            for (const float poison : poisons)
             for (int threads : { 1, 4 })
             {
                 std::vector<uint16_t> rgb(n * 3u, 0xBEEFu);
                 for (size_t i = 0; i < n; ++i) rgb[i * 3u + 1u] = static_cast<uint16_t>(std::lround(g[i]));
-                std::vector<float> scratch(n, std::numeric_limits<float>::quiet_NaN());
+                std::vector<float> scratch(n, poison);
                 ASSERT_EQ(1, debayer_reduced_hacd_chroma_rgb16(rgb.data(), work.data(), w, h, threads, scratch.data()));
                 int bad = 0;
                 double worst = 0.0;
@@ -2154,16 +2163,117 @@ TEST(GpuDualIsoPreviewScale, HacdChromaMinimumAndOddSizesAreExact)
                         worst = std::max(worst, std::fabs((R - blk) / kr - (G - blk)));
                         worst = std::max(worst, std::fabs((B - blk) / kb - (G - blk)));
                     }
-                const bool same = threads == 1 || rgb == rgb1;
-                std::printf("[hacd-size] %s %dx%d threads %d: %d bad words, interior worst %.2f (<= 3)%s\n",
-                            part == 0 ? "degenerate (R/B kept)" : "valid (R/B rebuilt)", w, h, threads, bad, worst,
-                            same ? "" : "; differs from 1 thread");
+                // rgb1 is the first (NaN, 1 thread) run: every later poison and thread count must match it.
+                const bool same = rgb1.empty() || rgb == rgb1;
+                std::printf("[hacd-size] %s %dx%d scratch %g threads %d: %d bad words, interior worst %.2f (<= 3)%s\n",
+                            part == 0 ? "degenerate (R/B kept)" : "valid (R/B rebuilt)", w, h,
+                            static_cast<double>(poison), threads, bad, worst,
+                            same ? "" : "; differs from the NaN-scratch 1-thread run");
                 allOk = allOk && bad == 0 && worst <= 3.0 && same;
-                if (threads == 1) rgb1 = rgb;
+                if (rgb1.empty()) rgb1 = rgb;
             }
         }
     }
     ASSERT_TRUE(allOk);
+}
+
+namespace {
+// r12: a bare mlvObject_t of the given dims. With reconHqDualIso = 1 the reduced entry reads only the dims, the
+// frame count, use_amaze and cpu_cores, so no clip is needed to drive its arithmetic.
+struct R12BareVideo
+{
+    mlvObject_t * video = nullptr;
+    R12BareVideo(int w, int h, int cores)
+    {
+        video = initMlvObject();
+        if (!video) return;
+        video->RAWI.xRes = static_cast<uint16_t>(w);
+        video->RAWI.yRes = static_cast<uint16_t>(h);
+        video->frames = 2;
+        video->use_amaze = 0;
+        video->cpu_cores = cores;
+    }
+    ~R12BareVideo()
+    {
+        if (!video) return;
+        video->frames = 0;
+        freeMlvObject(video);
+    }
+};
+} // namespace
+
+// H2C-PORT-1 r12, adversary pass 9 A1 (r11 run dir adversary-05cc2e15.json, video_mlv.c:7214): the x4 constant-channel
+// correction must survive the output composition. Video 128x96, 2 frames, bilinear; RGGB Bayer 64x48 (the x2 Bayer of an
+// x4 recon): x < 32 every sample 2000 + 500 x; x >= 32 R and B 10000, G 10000 for x < 48 and 20000 from 48. HA-CD holds
+// R and B at 10000 there (r11), but the chroma [1 2 1] laid the taps' mean colour difference back on the centre G, and
+// the 2x2 box returned R = B = 9062 at output (23, 10) and 10937 at (24, 10). Required, through the real entry at 1 and
+// 4 cores: every R and B at output x >= 17 (Bayer x >= 34) is exactly 10000. Mutation: x4 back on the plain [1 2 1].
+TEST(GpuDualIsoPreviewScale, CpuReducedX4ConstantChannelSurvivesTheComposition)
+{
+    const int bw = 64, bh = 48, outW = 32, outH = 24;
+    std::vector<uint16_t> bayer(static_cast<size_t>(bw) * bh);
+    for (int y = 0; y < bh; ++y)
+        for (int x = 0; x < bw; ++x)
+        {
+            const bool isG = (y & 1) != (x & 1);
+            bayer[static_cast<size_t>(y) * bw + x] =
+                static_cast<uint16_t>(x < 32 ? 2000 + 500 * x : (isG ? (x < 48 ? 10000 : 20000) : 10000));
+        }
+    bool allOk = true;
+    for (const int cores : { 1, 4 })
+    {
+        R12BareVideo bare(128, 96, cores);
+        ASSERT_TRUE(bare.video != nullptr);
+        std::vector<uint16_t> work(bayer);
+        std::vector<uint16_t> out(static_cast<size_t>(outW) * outH * 3u, 0u);
+        int w = 0, h = 0;
+        ASSERT_EQ(1, getMlvRawFrameDebayeredFromReducedReconnedRaw16(bare.video, 1, work.data(), bw, bh, 4, out.data(), 1,
+                                                                     &w, &h));
+        ASSERT_EQ(outW, w);
+        ASSERT_EQ(outH, h);
+        int bad = 0, worst = 0;
+        for (int y = 0; y < outH; ++y)
+            for (int x = 17; x < outW; ++x)
+                for (int c = 0; c < 3; c += 2)
+                {
+                    const int d = std::abs(static_cast<int>(out[(static_cast<size_t>(y) * outW + x) * 3u + c]) - 10000);
+                    bad += d != 0;
+                    worst = std::max(worst, d);
+                }
+        const size_t p23 = (static_cast<size_t>(10) * outW + 23) * 3u, p24 = (static_cast<size_t>(10) * outW + 24) * 3u;
+        std::printf("[h2c-x4-constant] cores %d: R/B at output x >= 17 off 10000: %d words (worst %d, want 0); (23,10) R %u "
+                    "B %u, (24,10) R %u B %u (10000)\n",
+                    cores, bad, worst, static_cast<unsigned>(out[p23]), static_cast<unsigned>(out[p23 + 2u]),
+                    static_cast<unsigned>(out[p24]), static_cast<unsigned>(out[p24 + 2u]));
+        allOk = allOk && bad == 0;
+    }
+    ASSERT_TRUE(allOk);
+}
+
+// H2C-PORT-1 r12, adversary pass 9 advisory A2 (pre-existing, debayer.c:507): a reduced Bayer one row high passed the
+// plain branch's checks, and debayerBasicU16's bottom-row copy then read 192 words before the output (row -1). Video
+// 128x96, bilinear; Bayer 64x1 of 10000 at x2 into a full 64 x 48 x 3 output placed after a guard region. Required:
+// the entry refuses it (returns 0) with the output, the guard and the dims untouched; 64x2 is still taken.
+TEST(GpuDualIsoPreviewScale, CpuReducedOneRowBayerIsRefused)
+{
+    R12BareVideo bare(128, 96, 1);
+    ASSERT_TRUE(bare.video != nullptr);
+    const int bw = 64;
+    const size_t guard = static_cast<size_t>(bw) * 3u, frame = static_cast<size_t>(bw) * 48u * 3u;
+    std::vector<uint16_t> buf(guard + frame, 0xBEEFu);
+    std::vector<uint16_t> one(static_cast<size_t>(bw), 10000u);
+    int w = -1, h = -1;
+    const int got = getMlvRawFrameDebayeredFromReducedReconnedRaw16(bare.video, 1, one.data(), bw, 1, 2, buf.data() + guard,
+                                                                     1, &w, &h);
+    const bool untouched = std::all_of(buf.begin(), buf.end(), [](uint16_t v) { return v == 0xBEEFu; });
+    std::printf("[h2c-one-row] 64x1 at x2: entry %d (want 0), buffer untouched %d, dims %d x %d (want -1 x -1)\n", got,
+                untouched ? 1 : 0, w, h);
+    ASSERT_EQ(0, got);
+    ASSERT_TRUE(untouched);
+    ASSERT_EQ(-1, w);
+    std::vector<uint16_t> two(static_cast<size_t>(bw) * 2u, 10000u);
+    ASSERT_EQ(1, getMlvRawFrameDebayeredFromReducedReconnedRaw16(bare.video, 1, two.data(), bw, 2, 2, buf.data() + guard,
+                                                                 1, &w, &h));
 }
 
 // H2C-PORT-1 RED 3: the route. At x4 the CPU plan's Bayer is at x2 (fullWidth / 2 x
