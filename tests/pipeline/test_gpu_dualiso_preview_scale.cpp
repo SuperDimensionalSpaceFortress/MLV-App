@@ -2355,6 +2355,7 @@ TEST(GpuDualIsoPreviewScale, CpuReducedOneRowBayerIsRefused)
     ASSERT_EQ(0, ngot);
     ASSERT_TRUE(nuntouched);
     ASSERT_EQ(-1, w);
+    ASSERT_EQ(-1, h); // r14 (Dot / key3 r12 H2): the refusal leaves the height untouched too
 }
 
 // H2C-PORT-1 RED 3: the route. At x4 the CPU plan's Bayer is at x2 (fullWidth / 2 x
@@ -2584,6 +2585,87 @@ TEST(GpuDualIsoPreviewScale, CpuReducedX4PlayingIsH2cByteForByte)
     std::printf("[h2c-x4-pin] debayered16 entry x4 bayer x2 %dx%d out %dx%d: %zu of %zu words differ from H2c "
                 "+ r10 HA-CD chroma (want 0)\n", bw, bh, outW, outH, differ, routed.size());
     ASSERT_EQ(static_cast<size_t>(0), differ);
+}
+
+// H2C-PORT-1 r14 (pace): the x4 chroma step was rewritten for cost (inline G clamp, separable 5x5 range, one
+// own-path test per site, vector-friendly own-path tests) with its output unchanged. This pins that output: FNV-1a
+// over the HA-CD RGB and the filtered RGB of debayer_reduced_hacd_chroma121_rgb16, on four Bayer patterns (noisy
+// edges, an affine R/B under a G-only step, a negative R slope that keeps R, a red disc on blue) at three sizes
+// (one odd in both axes) and 1 and 4 threads. The digests are 3cd2f144's (r12), from the r14 run dir's
+// pin_gen.c linked against that commit's debayer.c. Any bit the step changes fails here.
+static void hacdPinFill(uint16_t * bay, int w, int h, int p)
+{
+    uint32_t s = 777u + static_cast<uint32_t>(p) * 131u + static_cast<uint32_t>(w) * 7u + static_cast<uint32_t>(h);
+    for (int y = 0; y < h; ++y)
+        for (int x = 0; x < w; ++x)
+        {
+            s = s * 1103515245u + 12345u;
+            const int n = static_cast<int>((s >> 8) % 600u) - 300;
+            const int isG = ((y & 1) != (x & 1)), isR = !(y & 1) && !(x & 1);
+            int g, v;
+            if (p == 0)
+            {
+                g = (((x / 5 + y / 3) & 1) ? 12000 : 4000) + n;
+                v = isG ? g : isR ? g * 3 / 4 + 500 + n / 2 : g / 2 + 800 - n / 2;
+            }
+            else if (p == 1)
+            {
+                g = x < w / 2 ? 10000 : 20000;
+                v = isG ? g : 2000 + 100 * x;
+            }
+            else if (p == 2)
+            {
+                g = 3000 + 40 * x + 25 * y + n / 6;
+                v = isG ? g : isR ? 60000 - g : g * 2;
+            }
+            else
+            {
+                const int d = (x - w / 2) * (x - w / 2) + (y - h / 2) * (y - h / 2) < (w * w) / 16;
+                g = (d ? 9000 : 15000) + n / 12;
+                v = isG ? g : isR ? (d ? 40000 : 3000) : (d ? 2000 : 30000);
+            }
+            bay[static_cast<size_t>(y) * static_cast<size_t>(w) + static_cast<size_t>(x)] =
+                static_cast<uint16_t>(v < 0 ? 0 : v > 65535 ? 65535 : v);
+        }
+}
+
+TEST(GpuDualIsoPreviewScale, HacdChroma121OutputIsPinned)
+{
+    struct Pin { int w, h, p, threads, ok; uint64_t fnv; };
+    static const Pin pins[] = {
+        { 64, 48, 0, 1, 1, 0xd06b517944dd8c98ull }, { 64, 48, 0, 4, 1, 0xd06b517944dd8c98ull },
+        { 64, 48, 1, 1, 1, 0x326805f45dd955e3ull }, { 64, 48, 1, 4, 1, 0x326805f45dd955e3ull },
+        { 64, 48, 2, 1, 1, 0x9029017a319dd788ull }, { 64, 48, 2, 4, 1, 0x9029017a319dd788ull },
+        { 64, 48, 3, 1, 1, 0xfb90370a781686adull }, { 64, 48, 3, 4, 1, 0xfb90370a781686adull },
+        { 301, 203, 0, 1, 1, 0xdca58bd84c74748eull }, { 301, 203, 0, 4, 1, 0xdca58bd84c74748eull },
+        { 301, 203, 1, 1, 1, 0x90ecf01f02679603ull }, { 301, 203, 1, 4, 1, 0x90ecf01f02679603ull },
+        { 301, 203, 2, 1, 1, 0xced5a7b8ca998b1bull }, { 301, 203, 2, 4, 1, 0xced5a7b8ca998b1bull },
+        { 301, 203, 3, 1, 1, 0x77120c547b561c13ull }, { 301, 203, 3, 4, 1, 0x77120c547b561c13ull },
+        { 1024, 96, 0, 1, 1, 0xf1561eb832aaf739ull }, { 1024, 96, 0, 4, 1, 0xf1561eb832aaf739ull },
+        { 1024, 96, 1, 1, 1, 0x586bed4d061c2683ull }, { 1024, 96, 1, 4, 1, 0x586bed4d061c2683ull },
+        { 1024, 96, 2, 1, 1, 0x68d1f0853310f037ull }, { 1024, 96, 2, 4, 1, 0x68d1f0853310f037ull },
+        { 1024, 96, 3, 1, 1, 0xa95f6076315d208aull }, { 1024, 96, 3, 4, 1, 0xa95f6076315d208aull },
+    };
+    int bad = 0;
+    for (const Pin & pin : pins)
+    {
+        const size_t n = static_cast<size_t>(pin.w) * static_cast<size_t>(pin.h);
+        std::vector<uint16_t> bay(n, 0u), rgb(n * 3u, 0u), fil(n * 3u, 0u);
+        std::vector<float> scr(n, 0.0f);
+        hacdPinFill(bay.data(), pin.w, pin.h, pin.p);
+        debayerBasicU16(rgb.data(), bay.data(), pin.w, pin.h, pin.threads, 0);
+        const int ok = debayer_reduced_hacd_chroma121_rgb16(fil.data(), rgb.data(), bay.data(), pin.w, pin.h,
+                                                            pin.threads, scr.data());
+        uint64_t hh = 1469598103934665603ull;
+        for (const uint16_t v : rgb) { hh ^= v; hh *= 1099511628211ull; }
+        for (const uint16_t v : fil) { hh ^= v; hh *= 1099511628211ull; }
+        const bool match = ok == pin.ok && hh == pin.fnv;
+        bad += match ? 0 : 1;
+        std::printf("[hacd-pin] %dx%d pattern %d threads %d ok %d fnv %016llx want %016llx %s\n", pin.w, pin.h, pin.p,
+                    pin.threads, ok, static_cast<unsigned long long>(hh), static_cast<unsigned long long>(pin.fnv),
+                    match ? "same" : "DIFFERS");
+    }
+    ASSERT_EQ(0, bad);
 }
 
 // H2C-PORT-1 r10: the per-frame cost of the new step (debayer_reduced_hacd_chroma_rgb16), timed
