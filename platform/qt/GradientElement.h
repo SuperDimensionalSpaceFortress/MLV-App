@@ -33,6 +33,9 @@ public:
 
     GraphicsPolygonMoveItem* gradientGraphicsElement( void );
     void redrawGradientElement( int sceneX, int sceneY, int picX, int picY );
+    // The scene geometry of the last redrawGradientElement call (-1 before the first one).
+    int anchoredSceneWidth( void ) const;
+    int anchoredSceneHeight( void ) const;
 
     void setMovable( bool on );
 
@@ -50,6 +53,8 @@ private:
     double m_stretchFactorX;
     double m_stretchFactorY;
     GraphicsPolygonMoveItem *m_pGradientGraphicsItem;
+    int m_anchoredSceneWidth = -1;
+    int m_anchoredSceneHeight = -1;
 };
 
 #endif // GRADIENTELEMENT_H
