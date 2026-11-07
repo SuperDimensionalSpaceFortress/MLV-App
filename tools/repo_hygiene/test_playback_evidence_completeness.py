@@ -109,8 +109,10 @@ class AbsentFieldIsInvalidOnTheRunnerLogSummaryTests(unittest.TestCase):
             # PLAYBACK-CLIP-LENGTH-HFR-10S-1: the floor is $floorSeconds (Get-GuiSmokeMinPlaySeconds of native_fps)
             "the requirement check is inverted": ("[int64]$required -lt [int64][Math]::Ceiling($floorSeconds",
                                                   "[int64]$required -gt [int64][Math]::Ceiling($floorSeconds"),
-            "an unknown native fps is forgiven": ("[double]$nativeFps -le 0) {\n        $failures += \"INVALID_SOURCE_FRAMES: native_fps=",
-                                                  "[double]$nativeFps -lt -1) {\n        $failures += \"INVALID_SOURCE_FRAMES: native_fps="),
+            # MERGE-MASTER r5 (CI-4): r4 (Grok G1) put the non-finite check in front of the same `-le 0` arm, so the anchor gained a ")";
+            # the mutation is unchanged (a zero native fps no longer fails the floor).
+            "an unknown native fps is forgiven": ("[double]$nativeFps -le 0)) {\n        $failures += \"INVALID_SOURCE_FRAMES: native_fps=",
+                                                  "[double]$nativeFps -lt -1)) {\n        $failures += \"INVALID_SOURCE_FRAMES: native_fps="),
         }
         probes = [dict(source_advanced=120, required_source_frames=120), dict(native_fps=0), dict(source_advanced=480, required_source_frames=480)]
         with tempfile.TemporaryDirectory(prefix="floor-mut-") as tmp:

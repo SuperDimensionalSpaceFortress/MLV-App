@@ -1991,6 +1991,16 @@
       ]
     },
     {
+      "path": "tests/console/test_playback_source_advance_tracker.cpp",
+      "anchor": "ASSERT_EQ ( 0.0 , t . spanSeconds ( ) ) ;",
+      "class": "not_run_proof_structural",
+      "clock": "other",
+      "justification": "PLAYBACK-HFR-CONFORM-DEFAULT-1 (re-land of #188): synthetic-input verification of PlaybackSourceAdvanceTracker: with fewer than two presented frames the measured span is defined to be 0 (no rate reported). The input is hand-built; nothing is inferred from a real run's timer.",
+      "lines": [
+        79
+      ]
+    },
+    {
       "path": "tests/console/test_playback_swap_interval.cpp",
       "anchor": "ASSERT_NEAR ( 0.0 , summary . swapCallAvgMs , 1 e - 9 ) ;",
       "class": "not_run_proof_structural",
@@ -2342,6 +2352,16 @@
       "justification": "PLAYBACK-STARTUP-WAIT-PREWARM-1 r2 StartEngine::sync: the video timeline position used for the printed offsets, with the same clamp as handoverContentMs; a value for the log line, never a run-proof.",
       "lines": [
         236
+      ]
+    },
+    {
+      "path": "platform/qt/PlaybackAudioStartPolicy.h",
+      "anchor": "&& lastAppliedSec > 0.0",
+      "class": "value_fallback_select",
+      "clock": "qpc_stage_clock",
+      "justification": "HFR-NATIVE-60FPS-FULLRES-1-MERGE-MASTER r6 isDuplicateSync: lastAppliedSec is the mlv_stage_timing_now() TIMESTAMP of the last applied audio sync, not a duration; 0.0 is the forgotten/never sentinel (forgetAppliedPlaybackAudioSync), filtered so a forgotten memo is never a duplicate. Moved verbatim from MainWindow.cpp's inline m_lastPlaybackAudioSyncTime > 0.0 (a name the scanner did not match); which syncs ran is m_playbackAudioSyncAppliedCount / SkippedCount, never this read.",
+      "lines": [
+        298
       ]
     },
     {
@@ -2802,6 +2822,27 @@
       "justification": "CUDA-RECON-DUALISO-TIMER-SPLIT-1 r2 test seam (adversary r1 passes 4-5 A1 RED test), not an elapsed-time inference: delay_ms is a requested sleep set only by llrpSetFakeGpuBackendLastTimingDelayMsForTesting for the in-process fake backend's timing getter (0 by default and always in the app). The comparison selects whether the fake sleeps at all (0 skips Sleep so the default fake never yields); it measures nothing and proves no run (backend_calls and rc do).",
       "lines": [
         1504
+      ]
+    },
+    {
+      "path": "tests/console/test_playback_frame_range.cpp",
+      "anchor": "for ( int t = 1 ; t < 100000 && r . reachedMs < 0.0 ; ++ t )",
+      "class": "value_fallback_select",
+      "clock": "other",
+      "justification": "HFR-NATIVE-60FPS-FULLRES-1 r24 unit fixture playConformed() (adversary A1 on 9b900412): reachedMs is not a timer read. It is a SIMULATED tick clock value -- nowMs is the fixture's own running sum of hand-chosen tickMs (8 ms, or lateMs on every lateEvery-th tick), so no QPC/omp/steady_clock is read anywhere in the loop -- and -1.0 is the 'frame 1498 not reached yet' sentinel it starts at. `reachedMs < 0.0` only keeps the simulation looping until the sentinel is replaced (bounded by t < 100000); every tick adds at least 8 ms, so a recorded reach is >= 8 and the sentinel is the only non-positive value. A sentinel/loop-exit select on synthetic input, never a stage run-proof.",
+      "lines": [
+        3245
+      ]
+    },
+    {
+      "path": "tests/console/test_playback_frame_range.cpp",
+      "anchor": "ASSERT_TRUE ( held . reachedMs > 0.0 ) ;",
+      "class": "run_proof",
+      "clock": "other",
+      "flag": "held.consumedAt64998 >= int64_t(1499) (SourceFrameAdvanceCounter::consumed() = forwardSteps + 1, asserted two lines below: 1499 consumed means the playhead advanced past frame 1498, so the reach is proved by a counter)",
+      "justification": "HFR-NATIVE-60FPS-FULLRES-1 r24 test R24A1HeldCatchupIsRepaidSoTheConformedSourcePaceStaysInTheBand: asserts the conformed simulation reached frame 1498, i.e. playConformed() replaced its -1.0 'not reached' sentinel. reachedMs is a SIMULATED tick clock in a unit fixture (the sum of the fixture's own tickMs values, at least 8 ms per tick), not a wall clock or any timer read, so the sub-resolution 'ran but read 0 ms' flake this inventory exists for cannot occur. The reach is also proved independently by the source-frame counter assert named in 'flag'; this compare is kept because the following line bounds the same value (reachedMs <= 62500.0) and a -1.0 sentinel would pass that bound alone.",
+      "lines": [
+        3278
       ]
     }
   ]

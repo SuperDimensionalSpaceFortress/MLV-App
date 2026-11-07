@@ -377,6 +377,8 @@ HEADERS += MainWindow.h \
            ClipLifecycleBarrier.h \
            LookAssistAnalysisPump.h \
            CrashForensics.h \
+           PlaybackConformPolicy.h \
+           PlaybackSourceAdvanceTracker.h \
            AutomationSettings.h \
            HubHostPlaybackGuard.h \
            PlaybackFrameRange.h \

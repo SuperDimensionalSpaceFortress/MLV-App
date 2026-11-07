@@ -163,7 +163,7 @@ PINNED_STOP_STATEMENTS = {
         "ui->spinBoxCutIn->value(), ui->spinBoxCutOut->value(), totalFrames, fps, requestedSeconds, "
         "playback_frame_range::minPlayWindowSeconds( fps ), !f3CutRangeRepairDisabledByEnvironment(), "
         "enginePaceFps > 0.0 ? enginePaceFps : -1.0, automationPlayPaceMode() );",
-        "const double enginePaceFps = getFramerate();",
+        "const double enginePaceFps = haveClip ? getPlaybackFramerate() : 0.0;",
         "const double fps = playGateNativeFps();",
     ),
     # PLAYBACK-CLIP-LENGTH-HFR-10S-1 (owner amendment 2026-10-15): the settle / play-action requests and the smoke's clip-aware
@@ -186,8 +186,11 @@ PINNED_STOP_STATEMENTS = {
         "if( m_fpsOverride && !m_automationPacingIsolated ) return m_frameRate;",
     ),
     "MainWindow::programmaticPlayState": (
+        # MERGE-MASTER r11 (ADV-A1b): the observation is noted in the Play's pace history, and the stop decision judges
+        # the pace with it (playback_frame_range::playPaceProjectsPastBudget).
+        "m_playPaceHistory.note( m_sourceAdvance.consumed(), elapsedMs );",
         "return playback_frame_range::evaluatePlayStop( m_sourceAdvance.consumed(), m_playRequiredSourceFrames, "
-        "ui->actionPlay->isChecked(), elapsedMs, safetyMs, automationPlayPaceMode() );",
+        "ui->actionPlay->isChecked(), elapsedMs, safetyMs, automationPlayPaceMode(), m_playPaceHistory );",
     ),
     "MainWindow::programmaticPlayConsumed": (
         "return m_playRequiredSourceFrames > 0 && m_sourceAdvance.consumed() >= m_playRequiredSourceFrames;",
