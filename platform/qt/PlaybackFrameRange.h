@@ -348,12 +348,32 @@ inline double conformWholeFrameDelta( double currentPosition, double wantedFrame
 // position plus the carried debt always equals the position plus everything granted. r26: a single long tick (a grant of
 // 2 or more on its own) is no longer skipped by itself; it is carried like any other backlog, so a lone
 // GUI-late tick on a quiet host presents the next frame, and only the part of a backlog above the cap is skipped.
+//
+// r27 (adversary A1 on be20bc59): repayment is gated on PRESENTATION, not on ticks. \a targetPresented says whether the
+// engine's current target, floor(\a currentPosition), has been presented (MainWindow: m_lastPresentedPlaybackFrame). Repaying
+// one integer per 8 ms tick outran the renderer: from 100.8 with a debt of 2 the engine reached 101.992 and then 102.184
+// before 101's queued present landed, so 101 was pruned and the presented frames went 100 -> 102. While the target is not
+// presented a conformed tick repays nothing and never crosses an integer: a grant that would cross is carried as debt
+// (position + debt still equals position + everything granted), and only a backlog above the cap is skipped. A tick that
+// crosses no integer is the grant unchanged, presented or not. With the default (true) the r26 behaviour is unchanged.
 inline double conformDropFrameDelta( double currentPosition, double grantedFrames, bool conformActive, double & debtFrames,
                                      bool targetPresented = true )
 {
-    (void)targetPresented;
     if( !conformActive ) { debtFrames = 0.0; return grantedFrames; }
     if( !( grantedFrames > 0.0 ) || !( currentPosition >= 0.0 ) ) return grantedFrames;
+    if( !targetPresented )
+    {
+        if( std::floor( currentPosition + grantedFrames ) <= std::floor( currentPosition ) ) return grantedFrames;
+        // hold the unpresented target: the whole grant is carried, and only a backlog above the cap is skipped now
+        const double debt = ( debtFrames > 0.0 ? debtFrames : 0.0 ) + grantedFrames;
+        if( debt > kConformMaxDebtFrames )
+        {
+            debtFrames = kConformMaxDebtFrames;
+            return debt - kConformMaxDebtFrames;
+        }
+        debtFrames = debt;
+        return 0.0;
+    }
     const double wanted = debtFrames > 0.0 ? grantedFrames + debtFrames : grantedFrames;
     const double delta = conformWholeFrameDelta( currentPosition, wanted );
     double debt = ( currentPosition + wanted ) - ( currentPosition + delta );

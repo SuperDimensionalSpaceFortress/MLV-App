@@ -163,8 +163,15 @@ TEST(PlaybackConformWiring, DropFrameTickQuantisesTheConformedCatchupToWholeFram
         "                        playback_frame_range::conformDropFrameDelta(\n"
         "                            m_newPosDropMode,\n"
         "                            m_playbackPaceGuard.grant( getPlaybackFramerate() * (double)timeDiff / 1000.0, paceNowMs, playbackPaceGuardFps() ),\n"
-        "                            playbackConformActive(), m_conformDropDebtFrames ),");
+        "                            playbackConformActive(), m_conformDropDebtFrames,\n"
+        "                            m_lastPresentedPlaybackFrame == static_cast<long long>( m_newPosDropMode ) ),");
     ASSERT_EQ(1, countOccurrences(body, call));
+    // r27 (adversary A1 on be20bc59): the repayment is gated on the target drawFrameReady accepted, and that member is set
+    // there, after the forward-only guard and before the early advance that runs this tick
+    const QString drawReady = mainWindowSource();
+    const int accepted = drawReady.indexOf(QStringLiteral("    m_lastPresentedPlaybackFrame = static_cast<long long>( display_frame );"));
+    ASSERT_TRUE(accepted > 0);
+    ASSERT_TRUE(drawReady.indexOf(QStringLiteral("const bool predictiveGpuTexNrEarlyAdvance ="), accepted) > accepted);
     // adversary A1 on 9b900412: the held frames are carried and repaid, and no debt survives a Play stop or start
     ASSERT_EQ(1, countOccurrences(body, QStringLiteral(
         "        m_playbackPaceGuard.reset();\n"

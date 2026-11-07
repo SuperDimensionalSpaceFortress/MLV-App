@@ -12240,13 +12240,17 @@ void MainWindow::playbackHandling(int timeDiff)
                 // N -> N + 2 from a fractional position) and carries the rest as m_conformDropDebtFrames, repaid one presented
                 // frame per later tick (adversary A1 on 9b900412); r26: a lone long tick is carried too, and only a backlog above
                 // kConformMaxDebtFrames (a real stall) skips. Without conform the grant is unchanged.
+                // r27 (adversary A1 on be20bc59): the debt is repaid as the renderer PRESENTS, never faster. Until drawFrameReady
+                // has accepted the current target (m_lastPresentedPlaybackFrame) a conformed tick does not move past it, so a
+                // queued lookahead is never pruned by the repayment (100 -> 102).
                 const playback_frame_range::DropFrameTickResult dropFrameTick =
                     playback_frame_range::advanceDropFrameTick(
                         m_newPosDropMode,
                         playback_frame_range::conformDropFrameDelta(
                             m_newPosDropMode,
                             m_playbackPaceGuard.grant( getPlaybackFramerate() * (double)timeDiff / 1000.0, paceNowMs, playbackPaceGuardFps() ),
-                            playbackConformActive(), m_conformDropDebtFrames ),
+                            playbackConformActive(), m_conformDropDebtFrames,
+                            m_lastPresentedPlaybackFrame == static_cast<long long>( m_newPosDropMode ) ),
                         ui->spinBoxCutIn->value(), ui->spinBoxCutOut->value(),
                         ui->actionLoop->isChecked() );
                 // slip_summary: the granted share, read back from the tick (a wrap subtracted the cut range width;
