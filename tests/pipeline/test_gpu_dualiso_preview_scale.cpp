@@ -2047,6 +2047,53 @@ TEST(GpuDualIsoPreviewScale, HacdChromaDegenerateFitStaysAtOrBelowBilinear)
     ASSERT_TRUE(allOk);
 }
 
+// H2C-PORT-1 r11, adversary pass 2 A1 (adversary-63b5d551.json): a valid per-frame fit (a neutral ramp R = G = B =
+// 2000 + 500 x for x < 32) beside a G-only edge under constant R = B = 10000 (G 10000 above y 24, 20000 below, x >= 32).
+// The bilinear reconstructs the constant R and B exactly; the colour difference laid on the bilinear G imprinted the G
+// edge onto them (R(48, 23) 10000 -> 8383, interior mean max(|R - Rt|, |B - Bt|) 133.62 -> 151.83; run dir sim_r11f.py).
+// Required: the x >= 35 half (3 px in) is exact, and the interior mean is at or below the bilinear's.
+TEST(GpuDualIsoPreviewScale, HacdChromaConstantChannelUnderAGEdgeStaysExact)
+{
+    const int w = 64, h = 48;
+    const size_t n = static_cast<size_t>(w) * h;
+    std::vector<double> r(n), g(n), b(n);
+    for (int y = 0; y < h; ++y)
+        for (int x = 0; x < w; ++x)
+        {
+            const size_t i = static_cast<size_t>(y) * w + x;
+            const double ramp = 2000.0 + 500.0 * x;
+            r[i] = x < 32 ? ramp : 10000.0;
+            b[i] = r[i];
+            g[i] = x < 32 ? ramp : (y < 24 ? 10000.0 : 20000.0);
+        }
+    std::vector<uint16_t> work = r11HacdMosaic(w, h, r, g, b);
+    std::vector<uint16_t> rgb(n * 3u, 0u);
+    debayerBasicU16(rgb.data(), work.data(), w, h, 1, 0);
+    const std::vector<uint16_t> bil(rgb);
+    std::vector<float> scratch(n);
+    ASSERT_EQ(1, debayer_reduced_hacd_chroma_rgb16(rgb.data(), work.data(), w, h, 1, scratch.data()));
+    double eh = 0.0, eb = 0.0, worstRight = 0.0;
+    int count = 0;
+    for (int y = 3; y < h - 3; ++y)
+        for (int x = 3; x < w - 3; ++x)
+        {
+            const size_t i = static_cast<size_t>(y) * w + x;
+            const double dh = std::max(std::fabs(rgb[i * 3u] - r[i]), std::fabs(rgb[i * 3u + 2u] - b[i]));
+            const double db = std::max(std::fabs(bil[i * 3u] - r[i]), std::fabs(bil[i * 3u + 2u] - b[i]));
+            eh += dh;
+            eb += db;
+            ++count;
+            if (x >= 35) worstRight = std::max(worstRight, dh);
+        }
+    eh /= count;
+    eb /= count;
+    const size_t p = (static_cast<size_t>(23) * w + 48) * 3u;
+    std::printf("[hacd-constant] interior mean HA-CD %.2f | bilinear %.2f (<=) ; x>=35 worst %.0f (== 0) ; R(48,23) %u (10000)\n",
+                eh, eb, worstRight, static_cast<unsigned>(rgb[p]));
+    const bool ok = eh <= eb && worstRight == 0.0 && rgb[p] == 10000u;
+    ASSERT_TRUE(ok);
+}
+
 // H2C-PORT-1 r11: minimum valid and odd dimensions, with G set to the true G, R and B to a 0xBEEF sentinel and the
 // scratch to NaN, at 1 and 4 threads (same bytes required).
 // (a) 4x4, 5x5, 5x4, 4x5, 7x9, 9x7 and 32x6 on a flat colour: every per-frame fit there is degenerate (fewer than 16
