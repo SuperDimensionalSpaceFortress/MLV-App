@@ -68,10 +68,20 @@ function Split-LaneLines {
     return [regex]::Split($Text, '\r\n|[\r\n' + [string][char]0x85 + [char]0x2028 + [char]0x2029 + ']')
 }
 
+# The line split for JSON text (KERNEL-K4 r3b, adversary A1): CRLF, LF and a bare CR only. NEL / LS / PS are legal
+# INSIDE a JSON string and are not JSON whitespace, so splitting a JSON candidate on them (Split-LaneLines) would
+# corrupt a legal string and let an illegal object parse. A raw CR/LF is never legal inside a JSON string, so the
+# normalisation to LF cannot change whether a candidate parses.
+function Split-LaneJsonLines {
+    param([AllowEmptyString()][AllowNull()][string]$Text)
+    if ([string]::IsNullOrEmpty($Text)) { return @() }
+    return [regex]::Split($Text, '\r\n|[\r\n]')
+}
+
 function Find-ClaudeResultEnvelope {
     param([AllowEmptyString()][AllowNull()][string]$Answer)
     if ([string]::IsNullOrWhiteSpace($Answer)) { return $null }
-    foreach ($ln in @(Split-LaneLines -Text $Answer)) {
+    foreach ($ln in @(Split-LaneJsonLines -Text $Answer)) {
         $t = $ln.Trim()
         if ($t.Length -eq 0) { continue }
         $cand = ConvertFrom-LaneJsonObject -Text $t
@@ -175,7 +185,9 @@ function ConvertFrom-LaneJsonObject {
 # escapes; -1 when the value never closes. It balances brackets only: strictness is ConvertFrom-LaneJsonObject's.
 function Find-LaneJsonValueEnd {
     param([string]$Text, [int]$Start)
-    $depth = 0; $inStr = $false; $esc = $false
+    # A stack of the closers still owed (r3b, adversary A2): a closer that is not the innermost owed one is a
+    # MISMATCH, so the value is malformed and never closes (-1) instead of silently ending an outer value early.
+    $stack = New-Object System.Collections.Generic.Stack[char]; $inStr = $false; $esc = $false
     for ($i = $Start; $i -lt $Text.Length; $i++) {
         $ch = $Text[$i]
         if ($inStr) {
@@ -183,8 +195,12 @@ function Find-LaneJsonValueEnd {
             continue
         }
         if ($ch -ceq [char]34) { $inStr = $true }
-        elseif ($ch -ceq '{' -or $ch -ceq '[') { $depth++ }
-        elseif ($ch -ceq '}' -or $ch -ceq ']') { $depth--; if ($depth -le 0) { return $i } }
+        elseif ($ch -ceq '{') { $stack.Push([char]'}') }
+        elseif ($ch -ceq '[') { $stack.Push([char]']') }
+        elseif ($ch -ceq '}' -or $ch -ceq ']') {
+            if ($stack.Count -eq 0 -or $stack.Pop() -cne $ch) { return -1 }
+            if ($stack.Count -eq 0) { return $i }
+        }
     }
     return -1
 }
@@ -222,12 +238,12 @@ function Get-LaneLastTopLevelJson {
 #     complete strict JSON object (adversary A1, narrowed by the real-receipt replay: see the note below).
 #   - An unfenced candidate is the last top-level '{' or '[' value after the last fenced block (see
 #     Get-LaneLastTopLevelJson). It outranks the fenced block before it, whatever its shape.
-# Lines are split by Split-LaneLines. Returns [pscustomobject]@{ form = 'fenced'|'unfenced'|'none'; text; startLine }.
+# Lines are split by Split-LaneJsonLines. Returns [pscustomobject]@{ form = 'fenced'|'unfenced'|'none'; text; startLine }.
 function Get-LaneTerminalCandidate {
     param([AllowEmptyString()][AllowNull()][string]$Answer)
     $none = [pscustomobject]@{ form = 'none'; text = $null; startLine = -1 }
     if ([string]::IsNullOrWhiteSpace($Answer)) { return $none }
-    $lines = @(Split-LaneLines -Text $Answer)
+    $lines = @(Split-LaneJsonLines -Text $Answer)
     $inBlock = $false; $fenceChar = ''; $fenceLen = 0
     $cur = $null; $curStart = -1
     $lastFence = $null
@@ -291,7 +307,9 @@ function Get-LaneWorkEvidence {
             $names = @($j.PSObject.Properties.Name)
             if ($names -contains 'subtype') { $rec.subtype = [string]$j.subtype }
             if ($names -contains 'terminal_reason') { $rec.terminalReason = [string]$j.terminal_reason }
-            if ($names -contains 'is_error') { $rec.isError = [bool]$j.is_error }
+            # A real JSON boolean only (r3b A3): [bool]$null, [bool]0 and [bool]@() are $false, so a null or
+            # non-boolean is_error must read as absent, never as "not an error".
+            if ($names -contains 'is_error' -and $j.is_error -is [bool]) { $rec.isError = $j.is_error }
         }
     }
     if ($ExitCode -ne 0) { $rec.reason = "exit-code-$ExitCode"; return $rec }

@@ -2217,6 +2217,46 @@ def test_r3_adv_a5_every_line_separator_splits_answer_lines_before_they_are_clas
     ok = prose + '```json\r{"verdict":"APPROVE"}\r```\r'
     assert _work_evidence(tmp_path, "codex", ok, 0, prompt_chars=600, require_verdict=True)["workCompleted"] is True
 
+def test_r3b_adv_a1_json_text_is_never_re_split_on_unicode_separators(tmp_path):
+    # adversary r3b A1: U+0085 / U+2028 / U+2029 are legal INSIDE a JSON string and are NOT JSON whitespace, so
+    # splitting a JSON candidate on them corrupted a legal string and made an illegal object parse.
+    prose = "x" * 130 + "\n"
+    for sep in ("\u2028", "\u2029", "\u0085"):
+        # illegal: the separator sits where JSON needs whitespace or a value -> never a completion
+        r = _work_evidence(tmp_path, "codex", prose + '{"verdict":' + sep + '"APPROVE"}', 0, prompt_chars=600, require_verdict=True)
+        assert r["workCompleted"] is False and r["reason"] == "codex-no-verdict", (repr(sep), r)
+        # legal: the separator inside a string value is part of the string
+        ok = '{"verdict":"APPROVE","note":"a' + sep + 'b"}'
+        assert _work_evidence(tmp_path, "codex", prose + ok + "\n", 0, prompt_chars=600, require_verdict=True)["workCompleted"] is True, repr(sep)
+        assert _work_evidence(tmp_path, "codex", prose + "```json\n" + ok + "\n```\n", 0, prompt_chars=600, require_verdict=True)["workCompleted"] is True, repr(sep)
+        # a claude success envelope carrying the separator inside a string is still recognised
+        env = '{"type":"result","subtype":"success","is_error":false,"result":"a' + sep + 'b"}'
+        r = _work_evidence(tmp_path, "claude", env + "\n", 0)
+        assert r["workCompleted"] is True, (repr(sep), r)
+
+
+def test_r3b_adv_a2_a_mismatched_closer_ends_the_value_as_malformed_not_as_closed(tmp_path):
+    # adversary r3b A2: ']' closed '{' in the depth counter, so scanning resumed and a nested APPROVE won.
+    prose = "x" * 130 + "\n"
+    for tail in ('{\n"verdict":null,\n"draft":]\n{"verdict":"APPROVE"}', '[\n"draft":}\n{"verdict":"APPROVE"}',
+                 '{\n"verdict":null,\n"draft":[\n{"verdict":"APPROVE"}\n}'):
+        r = _work_evidence(tmp_path, "codex", prose + tail, 0, prompt_chars=600, require_verdict=True)
+        assert r["workCompleted"] is False and r["reason"] == "codex-no-verdict", (tail, r)
+    nested = '{\n  "verdict": "APPROVE",\n  "findings": [\n    {"id": 1}\n  ]\n}\n'
+    assert _work_evidence(tmp_path, "codex", prose + nested, 0, prompt_chars=600, require_verdict=True)["workCompleted"] is True
+
+
+def test_r3b_adv_a3_a_claude_envelope_needs_a_real_boolean_false_is_error(tmp_path):
+    # adversary r3b A3 (pre-existing, same function): [bool]$null / [bool]0 / [bool]@() are $false, so a null or
+    # non-boolean is_error read as "not an error".
+    for bad in ("null", "0", "[]", "[false]", '"false"'):
+        env = '{"type":"result","subtype":"success","is_error":%s}' % bad
+        r = _work_evidence(tmp_path, "claude", env + "\n", 0)
+        assert r["workCompleted"] is False, (bad, r)
+    ok = _work_evidence(tmp_path, "claude", '{"type":"result","subtype":"success","is_error":false}\n', 0)
+    assert ok["workCompleted"] is True, ok
+
+
 
 def test_invoke_lane_writes_the_selected_answer_to_the_output_file_when_the_last_message_has_no_substance():
     # adversary A4 (2nd pass): outputSha256 hashes $final while outputPath is the last-message file.
