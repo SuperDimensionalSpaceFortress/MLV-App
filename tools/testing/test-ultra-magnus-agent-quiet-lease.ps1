@@ -503,22 +503,17 @@ function Split-WindowsCommandLine([string]$CommandLine) {
 # r5 (sol r4 B1): the fixture path may also sit INSIDE an argument (a `pwsh -Command "... -AgentShare 'C:\Temp\fx' ..."` script) or be written with
 # forward slashes (python.exe C:/Temp/fx/x); r4 only matched an argument that STARTS with the raw dir, so both were a false zero in the census.
 # Hub ruling 20261106T1728Z splits the decision in two:
-#   'fixture' (the census counts it AND the sweep may kill it) only on a token-boundary match, after '/' -> '\' and ignoring case:
-#     - an argument, or the value after its first '=', that resolves (GetFullPath) to the dir or under it (r4's rule, kept), or
-#     - an occurrence INSIDE an argument whose left side is a quote, whitespace or '=' and whose right side is
-#         '\' (a path under the dir),
-#         the same quote that opened it ('<dir>' or "<dir>": the quoted string IS the dir), not doubled ('' / "" escape a quote),
-#         whitespace or the end with whitespace on the left (a bare script token), or the end with '=' on the left,
-#       AND no '..' anywhere after it in that argument (r5 pass-8 A1: an escaped quote ('sub''folder\..\..\x') ended the old scan early, and
-#       no quoting rule can say where a script string really ends, so any later '..' that could climb out leaves the match unknown),
-#       AND (r5 pass-8 A1 class) the process descends from this suite's own process (-Ours: its parent chain reaches $PID, each parent started
-#       no later than its child). Script text can still rewrite the path ('<dir>' + '2', -replace, a path join): reading code cannot be made
-#       safe, so an embedded match is only ever killed in a process this suite started; anywhere else it is counted as unknown.
-#   'unknown' (counted, never killed): the line contains the dir text in any other form. A sibling ("<dir> other", <dir>2, <dir>-other,
-#     <dir>'other) is unknown, so r4 B1 stays closed (never killed), and no reading of the line can hide a live writer as a zero.
-#   The hub text also names whitespace as a right boundary; inside one quoted argument ("<dir> other\log.txt", r3 pass-4 A1 / r4 B1) that is a
-#   sibling path, so whitespace only bounds a token that whitespace also opened, and every other whitespace case is unknown.
-function Get-FixtureMatch([string]$CommandLine, [string]$Fx, [bool]$Ours = $false) {
+#   'fixture' (the census counts it AND the sweep may kill it) only when, after '/' -> '\' and ignoring case, an argument, or the value after
+#     an option name's '=', resolves (GetFullPath) to the dir or under it (r4's rule, kept; r5 pass-9 A1: only an option NAME before the '=').
+#   'unknown' (counted, never killed): the line contains the dir's leaf in any other form, including every occurrence INSIDE an argument (a
+#     script string). A sibling ("<dir> other", <dir>2, <dir>-other, <dir>'other) is unknown, so r4 B1 stays closed (never killed), and no
+#     reading of the line can hide a live writer as a zero (unknown fails the suite-end check).
+# r6 (adversary r5 pass-10 A1): r5 also killed an embedded match when the process "descended" from this suite, decided by walking
+#   ParentProcessId guarded by CreationDate order. Pid numbers are reused and the clock can step backward, so that walk adopted an unrelated
+#   process whose parent pid now belongs to a real suite child, and killed it. Script text can rewrite a path ('<dir>' + '2', -replace, a
+#   path join), so reading code cannot make an embedded kill safe, and pid ancestry cannot prove ownership: descent is dropped. An embedded
+#   match is never killed by the sweep; the suite stops the children it started through the Process objects it holds (Stop-OwnedChildren).
+function Get-FixtureMatch([string]$CommandLine, [string]$Fx) {
     if ([string]::IsNullOrEmpty($CommandLine) -or [string]::IsNullOrEmpty($Fx)) { return 'none' }
     $root = $Fx.Replace([char]'/', [char]'\').TrimEnd([char]'\')
     # The pre-filter is the dir's LEAF name (um-agent-quiet-lease-<pid>-<guid8>, unique to this run): a line that names the dir in a form the
@@ -533,7 +528,7 @@ function Get-FixtureMatch([string]$CommandLine, [string]$Fx, [bool]$Ours = $fals
         $vals = @($tn)
         $q = $tn.IndexOf([char]'=')
         # r5 pass-9 A1: the value after the first '=' is a whole value only when what precedes it is an option NAME (--output=, x=). A '='
-        # inside script text ('Start-Sleep 300 # =<dir>') is not an option, so that occurrence is judged as embedded below (descent required).
+        # inside script text ('Start-Sleep 300 # =<dir>') is not an option, so that occurrence is embedded: unknown.
         if ($q -gt 0 -and $tn.Substring(0, $q) -cmatch '^[-\\]{0,2}[A-Za-z0-9_][A-Za-z0-9_.\-]*$') { $vals += $tn.Substring($q + 1) }
         foreach ($v in $vals) {
             if (-not ($v.Equals($root, [StringComparison]::OrdinalIgnoreCase) -or $v.StartsWith($root + '\', [StringComparison]::OrdinalIgnoreCase))) { continue }
@@ -541,63 +536,19 @@ function Get-FixtureMatch([string]$CommandLine, [string]$Fx, [bool]$Ours = $fals
             try { $full = [IO.Path]::GetFullPath($v).TrimEnd([char]'\') } catch { continue }   # an unresolvable value is not admitted here (it stays unknown)
             if ($full.Equals($rootFull, [StringComparison]::OrdinalIgnoreCase) -or $full.StartsWith($rootFull + '\', [StringComparison]::OrdinalIgnoreCase)) { return 'fixture' }
         }
-        $at = 0
-        while (($i = $tn.IndexOf($root, $at, [StringComparison]::OrdinalIgnoreCase)) -ge 0) {
-            $at = $i + 1
-            if ($i -eq 0) { continue }   # an argument that starts with the dir was judged whole above
-            $l = $tn[$i - 1]
-            $e = $i + $root.Length
-            $lQuote = ($l -eq [char]"'" -or $l -eq [char]'"'); $lSpace = [char]::IsWhiteSpace($l)
-            if (-not ($lQuote -or $lSpace -or $l -eq [char]'=')) { continue }
-            if ($tn.IndexOf('..', $e, [StringComparison]::Ordinal) -ge 0) { continue }   # pass-8 A1: a later '..' may climb out, however it is quoted
-            $bounded = $false
-            if ($e -ge $tn.Length) { $bounded = ($lSpace -or $l -eq [char]'=') }
-            else {
-                $r = $tn[$e]
-                if ($r -eq [char]'\') { $bounded = $true }
-                elseif ($lQuote -and $r -eq $l) { $bounded = -not (($e + 1 -lt $tn.Length -and $tn[$e + 1] -eq $l) -or ($i -ge 2 -and $tn[$i - 2] -eq $l)) }
-                elseif ($lSpace -and [char]::IsWhiteSpace($r)) { $bounded = $true }
-            }
-            if ($bounded -and $Ours) { return 'fixture' }
-        }
     }
-    return 'unknown'
+    return 'unknown'   # r6: an embedded occurrence, whatever bounds it, is counted and never killed (no descent, no ownership by pid)
 }
-function Test-NamesFixture([string]$CommandLine, [string]$Fx, [bool]$Ours = $false) { return (Get-FixtureMatch $CommandLine $Fx $Ours) -ceq 'fixture' }
+function Test-NamesFixture([string]$CommandLine, [string]$Fx) { return (Get-FixtureMatch $CommandLine $Fx) -ceq 'fixture' }
 function Get-FixtureChildPids([string]$Fx) { return @((Get-FixtureCensus $Fx).survivors) }
-# r5 pass-8 A1: the pids in $Rows that descend from this suite's process. A row's parent chain must reach $PID through rows each started no
-# later than its child (so a stranger that inherited a dead parent's pid number is not adopted), and the step into $PID must be a process that
-# started after this one. Rows without a creation time or parent descend from nothing.
-function Get-SuiteDescendants($Rows) {
-    $by = @{}
-    foreach ($r in @($Rows)) { $by[[int]$r.ProcessId] = $r }
-    $selfStart = (Get-Process -Id $PID).get_StartTime().ToUniversalTime()
-    $set = [System.Collections.Generic.HashSet[int]]::new()
-    foreach ($r in @($Rows)) {
-        $cur = $r; $ok = $false
-        for ($d = 0; $d -lt 64 -and $null -ne $cur; $d++) {
-            if ($null -eq $cur.CreationDate -or $null -eq $cur.ParentProcessId) { break }
-            $cs = ([DateTime]$cur.CreationDate).ToUniversalTime()
-            $pp = [int]$cur.ParentProcessId
-            if ($pp -eq $PID) { $ok = ($cs -ge $selfStart); break }
-            if ($pp -eq [int]$cur.ProcessId) { break }
-            $par = $by[$pp]
-            if ($null -eq $par -or $null -eq $par.CreationDate -or ([DateTime]$par.CreationDate).ToUniversalTime() -gt $cs) { break }
-            $cur = $par
-        }
-        if ($ok) { [void]$set.Add([int]$r.ProcessId) }
-    }
-    return , $set
-}
-# r5: the census reports both buckets. -Rows is the pure seam (objects with ProcessId, CommandLine, ParentProcessId, CreationDate); the default
-# is a fresh Win32_Process query.
+# r5: the census reports both buckets. -Rows is the pure seam (objects with ProcessId and CommandLine; r6: parent pids and creation times are
+# no longer read); the default is a fresh Win32_Process query.
 function Get-FixtureCensus([string]$Fx, $Rows = $null) {
     if ($null -eq $Rows) { $Rows = @(Get-CimInstance -ClassName Win32_Process -ErrorAction Stop) }
-    $ours = Get-SuiteDescendants $Rows
     $sv = [System.Collections.Generic.List[int]]::new(); $uk = [System.Collections.Generic.List[int]]::new()
     foreach ($row in @($Rows)) {
         if ([int]$row.ProcessId -eq $PID) { continue }
-        $m = Get-FixtureMatch ([string]$row.CommandLine) $Fx ($ours.Contains([int]$row.ProcessId))
+        $m = Get-FixtureMatch ([string]$row.CommandLine) $Fx
         if ($m -ceq 'fixture') { $sv.Add([int]$row.ProcessId) } elseif ($m -ceq 'unknown') { $uk.Add([int]$row.ProcessId) }
     }
     return [pscustomobject]@{ survivors = @($sv.ToArray()); unknown = @($uk.ToArray()) }
@@ -626,15 +577,16 @@ function Stop-PinnedProcess([int]$ProcessId, [scriptblock]$IsOurs, [scriptblock]
 # different instants have the same local ticks (a child that started at 01:30 CDT and a stranger that got its pid at 01:30 CST). A method call, so a
 # start time that cannot be read throws to the caller instead of turning into $null.
 function Get-ProcessStartUtcTicks($Process) { return [long]$Process.get_StartTime().ToUniversalTime().Ticks }
-function Stop-FixtureLeftovers([string]$Fx, [int[]]$Candidates) {
+function Stop-FixtureLeftovers([string]$Fx, [int[]]$Candidates, $Rows = $null, [scriptblock]$OpenPid = $null) {
     # The command line is read AFTER the pin, so it describes the pinned process (an exited one is no longer listed and is not killed).
     # r4: NOT a GetNewClosure() block: a closure binds to a dynamic module that sees only global functions, so under `pwsh -Command "& <this>"`
-    # Test-NamesFixture was "not recognized", the throw was caught as "not ours" and the sweep stopped nothing. $Fx is read from this
-    # function's scope (Stop-PinnedProcess runs the block as its child).
-    # r5 pass-8 A1: the same predicate as the census, descent included (one snapshot, taken after the pin, so the pinned process's row is its own).
-    $isFixture = { param($p) $all = @(Get-CimInstance -ClassName Win32_Process -ErrorAction Stop); $row = @($all | Where-Object { [int]$_.ProcessId -eq [int]$p.Id }); $row.Count -eq 1 -and (Test-NamesFixture $row[0].CommandLine $Fx ((Get-SuiteDescendants $all).Contains([int]$p.Id))) }
+    # Test-NamesFixture was "not recognized", the throw was caught as "not ours" and the sweep stopped nothing. $Fx and $Rows are read from
+    # this function's scope (Stop-PinnedProcess runs the block as its child).
+    # r6 (r5 pass-10 A1): the predicate reads only the pinned process's own command line (no snapshot of other processes, no descent). -Rows and
+    # -OpenPid are the pure seams (rows as for Get-FixtureCensus; a process opener as for Stop-PinnedProcess -Open); unset = the real host.
+    $isFixture = { param($p) $row = if ($null -ne $Rows) { @(@($Rows) | Where-Object { [int]$_.ProcessId -eq [int]$p.Id }) } else { @(Get-CimInstance -ClassName Win32_Process -Filter "ProcessId=$([int]$p.Id)" -ErrorAction Stop) }; $row.Count -eq 1 -and (Test-NamesFixture $row[0].CommandLine $Fx) }
     $kill = [System.Collections.Generic.List[int]]::new()
-    foreach ($k in @($Candidates)) { if (Stop-PinnedProcess $k $isFixture) { $kill.Add($k) } }
+    foreach ($k in @($Candidates)) { $hit = if ($null -ne $OpenPid) { Stop-PinnedProcess $k $isFixture -Open $OpenPid } else { Stop-PinnedProcess $k $isFixture }; if ($hit) { $kill.Add($k) } }
     return @($kill)
 }
 function Format-FixtureLeakLine([int[]]$Leak, [int[]]$Stopped) {
@@ -3756,58 +3708,88 @@ try { $out = @(Add-LeaseSlotSnapshot -JobId 'jB4a' -Phase 'request') } catch { $
             # processes. A sibling (<dir> other, <dir>2) is still never a kill match (r4 B1 stays closed), but it is counted as unknown.
             $c5Fx = 'C:\Temp\fx'
             $c5Sol = 'pwsh.exe -Command "Import-Module ''C:\repo\VenueChain.psm1''; $l = Start-VenueJobLiveness -AgentShare ''C:\Temp\fx'' -JobId ''j''; Start-Sleep -Seconds 300"'
-            # want = a process this suite did not start; ours = one it did (-Ours). An embedded match is a kill match only in ours (pass-8 A1).
+            # r6 (r5 pass-10 A1): there is no "ours" any more. An embedded match is unknown (counted, never killed) whichever process carries it.
             $c5A1Fx = 'C:\Temp\um-agent-quiet-lease-1234-abcd1234'
             $c5A1 = 'pwsh.exe -Command "Get-Item ''C:\Temp\um-agent-quiet-lease-1234-abcd1234\sub''''folder\..\..\unrelated\log.txt''; Start-Sleep -Seconds 300"'
             $c5Rows = @(
-                @{ cl = $c5Sol; want = 'unknown'; ours = 'fixture' }                                   # sol r4 B1, verbatim
-                @{ cl = 'python.exe C:/Temp/fx/x'; want = 'fixture'; ours = 'fixture' }                # sol r4 B1 class: forward slashes (a whole argument)
-                @{ cl = 'pwsh.exe -Command "Start-VenueJobLiveness -AgentShare C:\Temp\fx -JobId j"'; want = 'unknown'; ours = 'fixture' }   # a bare script token
-                @{ cl = 'pwsh.exe -Command "& { Get-Item ''C:/Temp/fx/x.json'' }"'; want = 'unknown'; ours = 'fixture' }  # embedded, forward slashes, under the dir
-                @{ cl = 'python.exe -c "open(\"C:\Temp\fx\calls.jsonl\")"'; want = 'unknown'; ours = 'fixture' }        # embedded in a double-quoted script string
-                @{ cl = 'pwsh.exe -Command "x -AgentShare=C:\Temp\fx"'; want = 'unknown'; ours = 'fixture' }             # '=' inside script text: embedded (pass-9 A1)
-                @{ cl = 'pwsh.exe -Command "Start-Sleep -Seconds 300 # =C:\Temp\fx"'; want = 'unknown'; ours = 'fixture' }   # pass-9 A1 shape
-                @{ cl = 'pwsh.exe -Command "Start-Sleep -Seconds 300 # =C:\Temp\fx\sub\..\x"'; want = 'unknown'; ours = 'unknown' }   # pass-9 A1 variant: a later '..'
-                @{ cl = 'python.exe --share=C:\Temp\fx'; want = 'fixture'; ours = 'fixture' }                            # an option's value (r4's rule, kept)
-                @{ cl = 'python.exe "C:\Temp\fx other\log.txt"'; want = 'unknown'; ours = 'unknown' }                    # r4 B1 sibling: never a kill match
-                @{ cl = 'python.exe C:\Temp\fx2\log.txt'; want = 'unknown'; ours = 'unknown' }                           # hub ruling sibling
-                @{ cl = 'pwsh.exe -Command "x -AgentShare ''C:\Temp\fx other''"'; want = 'unknown'; ours = 'unknown' }  # embedded sibling with a space
-                @{ cl = 'pwsh.exe -Command "x -AgentShare ''C:\Temp\fx2''"'; want = 'unknown'; ours = 'unknown' }        # embedded sibling
-                @{ cl = 'pwsh.exe -Command "x ''C:\Temp\fx''''other''"'; want = 'unknown'; ours = 'unknown' }            # '' is an escaped quote: <dir>'other
-                @{ cl = 'pwsh.exe -Command "x ''C:\Temp\fx\..\fx2\y''"'; want = 'unknown'; ours = 'unknown' }            # embedded, climbs out: not admitted, still counted
-                @{ cl = 'python.exe -c "p = ''C:\\Temp\\fx\\x''"'; want = 'unknown'; ours = 'unknown' }                  # doubled backslashes: the leaf still names it
-                @{ cl = 'python.exe C:\Temp\other\y.txt'; want = 'none'; ours = 'none' }
+                @{ cl = $c5Sol; want = 'unknown' }                                   # sol r4 B1, verbatim
+                @{ cl = 'python.exe C:/Temp/fx/x'; want = 'fixture' }                # sol r4 B1 class: forward slashes (a whole argument)
+                @{ cl = 'pwsh.exe -Command "Start-VenueJobLiveness -AgentShare C:\Temp\fx -JobId j"'; want = 'unknown' }   # a bare script token
+                @{ cl = 'pwsh.exe -Command "& { Get-Item ''C:/Temp/fx/x.json'' }"'; want = 'unknown' }  # embedded, forward slashes, under the dir
+                @{ cl = 'python.exe -c "open(\"C:\Temp\fx\calls.jsonl\")"'; want = 'unknown' }        # embedded in a double-quoted script string
+                @{ cl = 'pwsh.exe -Command "x -AgentShare=C:\Temp\fx"'; want = 'unknown' }             # '=' inside script text: embedded (pass-9 A1)
+                @{ cl = 'pwsh.exe -Command "Start-Sleep -Seconds 300 # =C:\Temp\fx"'; want = 'unknown' }   # pass-9 A1 shape
+                @{ cl = 'pwsh.exe -Command "Start-Sleep -Seconds 300 # =C:\Temp\fx\sub\..\x"'; want = 'unknown' }   # pass-9 A1 variant: a later '..'
+                @{ cl = 'python.exe --share=C:\Temp\fx'; want = 'fixture' }                            # an option's value (r4's rule, kept)
+                @{ cl = 'python.exe "C:\Temp\fx other\log.txt"'; want = 'unknown' }                    # r4 B1 sibling: never a kill match
+                @{ cl = 'python.exe C:\Temp\fx2\log.txt'; want = 'unknown' }                           # hub ruling sibling
+                @{ cl = 'pwsh.exe -Command "x -AgentShare ''C:\Temp\fx other''"'; want = 'unknown' }  # embedded sibling with a space
+                @{ cl = 'pwsh.exe -Command "x -AgentShare ''C:\Temp\fx2''"'; want = 'unknown' }        # embedded sibling
+                @{ cl = 'pwsh.exe -Command "x ''C:\Temp\fx''''other''"'; want = 'unknown' }            # '' is an escaped quote: <dir>'other
+                @{ cl = 'pwsh.exe -Command "x ''C:\Temp\fx\..\fx2\y''"'; want = 'unknown' }            # embedded, climbs out: not admitted, still counted
+                @{ cl = 'python.exe -c "p = ''C:\\Temp\\fx\\x''"'; want = 'unknown' }                  # doubled backslashes: the leaf still names it
+                @{ cl = 'python.exe C:\Temp\other\y.txt'; want = 'none' }
             )
             $c5Bad = [System.Collections.Generic.List[string]]::new()
             foreach ($r in $c5Rows) {
-                foreach ($o in @($false, $true)) {
-                    $w = if ($o) { $r.ours } else { $r.want }
-                    $g = Get-FixtureMatch $r.cl $c5Fx $o
-                    $kill = [bool](Test-NamesFixture $r.cl $c5Fx $o)
-                    if ($g -cne $w -or $kill -ne ($w -ceq 'fixture')) { $c5Bad.Add("[$($r.cl)] ours=$o match=$g kill=$kill want $w") }
-                }
+                $g = Get-FixtureMatch $r.cl $c5Fx
+                $kill = [bool](Test-NamesFixture $r.cl $c5Fx)
+                if ($g -cne $r.want -or $kill -ne ($r.want -ceq 'fixture')) { $c5Bad.Add("[$($r.cl)] match=$g kill=$kill want $($r.want)") }
             }
-            # pass-8 A1 verbatim: '' (an escaped apostrophe) then ..\.. climbs out of the dir: never a kill match, ours or not, and still counted
-            foreach ($o in @($false, $true)) { $g = Get-FixtureMatch $c5A1 $c5A1Fx $o; if ($g -cne 'unknown') { $c5Bad.Add("[pass-8 A1] ours=$o match=$g want unknown") } }
+            # pass-8 A1 verbatim: '' (an escaped apostrophe) then ..\.. climbs out of the dir: never a kill match, and still counted
+            $g = Get-FixtureMatch $c5A1 $c5A1Fx; if ($g -cne 'unknown') { $c5Bad.Add("[pass-8 A1] match=$g want unknown") }
             # pass-9 A1 verbatim: a '=' inside script text is no option, so an unrelated process (parent 4) is counted unknown and never killed
             $c5A9 = Get-FixtureCensus $c5A1Fx -Rows @([pscustomobject]@{ ProcessId = 24680; CommandLine = 'pwsh.exe -Command "Start-Sleep -Seconds 300 # =C:\Temp\um-agent-quiet-lease-1234-abcd1234"'; ParentProcessId = 4; CreationDate = [DateTime]::UtcNow })
             if (-not (@($c5A9.survivors).Count -eq 0 -and (@($c5A9.unknown) -join ',') -ceq '24680')) { $c5Bad.Add("[pass-9 A1] survivors=[$(@($c5A9.survivors) -join ',')] unknown=[$(@($c5A9.unknown) -join ',')] want survivors=[] unknown=[24680]") }
-            # The census through the -Rows seam: descent is decided from the rows' parents and start times.
+            # The census through the -Rows seam. r6: the rows still carry parent pids and start times (r5 read them for descent); they must change
+            # nothing. Only a whole argument is a survivor; every embedded line is unknown, a direct child of this suite or not.
             $c5Now = [DateTime]::UtcNow
             $c5SelfStart = (Get-Process -Id $PID).get_StartTime().ToUniversalTime()
             $c5Census = Get-FixtureCensus $c5Fx -Rows @(
-                [pscustomobject]@{ ProcessId = 24680; CommandLine = $c5Sol; ParentProcessId = 4; CreationDate = $c5Now }                                         # sol's: not ours -> unknown
+                [pscustomobject]@{ ProcessId = 24680; CommandLine = $c5Sol; ParentProcessId = 4; CreationDate = $c5Now }                                         # embedded -> unknown
                 [pscustomobject]@{ ProcessId = 24681; CommandLine = 'python.exe C:/Temp/fx/x'; ParentProcessId = 4; CreationDate = $c5Now }                     # whole argument -> survivor
-                [pscustomobject]@{ ProcessId = 24682; CommandLine = 'python.exe C:\Temp\fx2\log.txt'; ParentProcessId = $PID; CreationDate = $c5Now }           # sibling, even ours -> unknown
-                [pscustomobject]@{ ProcessId = 24683; CommandLine = $c5Sol; ParentProcessId = $PID; CreationDate = $c5Now }                                       # sol's line in our child -> survivor
-                [pscustomobject]@{ ProcessId = 24684; CommandLine = $c5Sol; ParentProcessId = 24683; CreationDate = $c5Now.AddSeconds(1) }                        # our grandchild -> survivor
-                [pscustomobject]@{ ProcessId = 24685; CommandLine = $c5Sol; ParentProcessId = $PID; CreationDate = $c5SelfStart.AddHours(-1) }                    # older than us: a reused parent pid -> unknown
-                [pscustomobject]@{ ProcessId = 24686; CommandLine = $c5Sol; ParentProcessId = 24683; CreationDate = $c5Now.AddSeconds(-30) }                      # older than its "parent" -> unknown
-                [pscustomobject]@{ ProcessId = 24687; CommandLine = ($c5A1 -replace 'um-agent-quiet-lease-1234-abcd1234', 'fx'); ParentProcessId = $PID; CreationDate = $c5Now }   # A1 shape in ours -> unknown
+                [pscustomobject]@{ ProcessId = 24682; CommandLine = 'python.exe C:\Temp\fx2\log.txt'; ParentProcessId = $PID; CreationDate = $c5Now }           # sibling -> unknown
+                [pscustomobject]@{ ProcessId = 24683; CommandLine = $c5Sol; ParentProcessId = $PID; CreationDate = $c5Now }                                       # embedded, parent is $PID -> unknown (r5: survivor)
+                [pscustomobject]@{ ProcessId = 24684; CommandLine = $c5Sol; ParentProcessId = 24683; CreationDate = $c5Now.AddSeconds(1) }                        # embedded, "grandchild" -> unknown (r5: survivor)
+                [pscustomobject]@{ ProcessId = 24685; CommandLine = $c5Sol; ParentProcessId = $PID; CreationDate = $c5SelfStart.AddHours(-1) }                    # embedded -> unknown
+                [pscustomobject]@{ ProcessId = 24686; CommandLine = $c5Sol; ParentProcessId = 24683; CreationDate = $c5Now.AddSeconds(-30) }                      # embedded -> unknown
+                [pscustomobject]@{ ProcessId = 24687; CommandLine = ($c5A1 -replace 'um-agent-quiet-lease-1234-abcd1234', 'fx'); ParentProcessId = $PID; CreationDate = $c5Now }   # A1 shape -> unknown
+                [pscustomobject]@{ ProcessId = 24688; CommandLine = 'python.exe C:\Temp\fx\heavy-slot-fake.py status' }                                          # whole argument, no parent or start time -> survivor
             )
-            if (-not ((@($c5Census.survivors) -join ',') -ceq '24681,24683,24684' -and (@($c5Census.unknown) -join ',') -ceq '24680,24682,24685,24686,24687')) { $c5Bad.Add("census rows: survivors=[$(@($c5Census.survivors) -join ',')] unknown=[$(@($c5Census.unknown) -join ',')] want survivors=[24681,24683,24684] unknown=[24680,24682,24685,24686,24687]") }
-            # real processes: an embedded single-quoted dir, a forward-slash path under it, and a forward-slash sibling. The first two are counted and
-            # stopped by the sweep; the sibling is counted as unknown and the sweep leaves it alive.
+            if (-not ((@($c5Census.survivors) -join ',') -ceq '24681,24688' -and (@($c5Census.unknown) -join ',') -ceq '24680,24682,24683,24684,24685,24686,24687')) { $c5Bad.Add("census rows: survivors=[$(@($c5Census.survivors) -join ',')] unknown=[$(@($c5Census.unknown) -join ',')] want survivors=[24681,24688] unknown=[24680,24682,24683,24684,24685,24686,24687]") }
+            # r6 RED (r5 pass-10 A1, sol's input verbatim): 24680 is UNRELATED. Its original parent exited, a real suite child (24681, parent $PID) was
+            # given that pid, and the clock stepped back so 24681 looks older than 24680. r5's descent walk adopted 24680 as a suite grandchild: the
+            # census reported survivors=[24680] and the sweep killed it. Now: counted unknown, and the sweep (same predicate, rows and opener seams)
+            # never calls Kill on it. Control: a whole-argument row (24682) in the same sweep IS killed, so the refusal is the rule, not a dead seam.
+            $p10Fx = 'C:\Temp\um-agent-quiet-lease-1234-abcd1234'
+            $p10S = (Get-Process -Id $PID).get_StartTime().ToUniversalTime()
+            $p10Rows = @(
+                [pscustomobject]@{ ProcessId = 24680; ParentProcessId = 24681; CreationDate = $p10S.AddMinutes(2); CommandLine = 'pwsh.exe -Command "Start-Sleep -Seconds 300 # =C:\Temp\um-agent-quiet-lease-1234-abcd1234"' }
+                [pscustomobject]@{ ProcessId = 24681; ParentProcessId = $PID; CreationDate = $p10S.AddMinutes(1); CommandLine = 'python.exe -c "import time; time.sleep(300)"' }
+                [pscustomobject]@{ ProcessId = 24682; ParentProcessId = $PID; CreationDate = $p10S.AddMinutes(1); CommandLine = 'python.exe C:\Temp\um-agent-quiet-lease-1234-abcd1234\heavy-slot-fake.py status' }
+            )
+            $p10Census = Get-FixtureCensus $p10Fx -Rows $p10Rows
+            $script:P10Killed = [System.Collections.Generic.List[int]]::new()
+            $p10Open = {
+                param($i)
+                $m = [pscustomobject]@{ Id = $i }
+                $m | Add-Member -MemberType ScriptMethod -Name get_Handle -Value { [IntPtr]1 }
+                $m | Add-Member -MemberType ScriptMethod -Name get_HasExited -Value { $false }
+                $m | Add-Member -MemberType ScriptMethod -Name Kill -Value { $script:P10Killed.Add([int]$this.Id) }
+                $m | Add-Member -MemberType ScriptMethod -Name Dispose -Value { }
+                return $m
+            }
+            $p10Stopped = @(Stop-FixtureLeftovers $p10Fx @(24680, 24681, 24682) -Rows $p10Rows -OpenPid $p10Open)
+            $p10Row = "survivors=[$(@($p10Census.survivors) -join ',')] unknown=[$(@($p10Census.unknown) -join ',')] stopped=[$($p10Stopped -join ',')] killed=[$($script:P10Killed -join ',')]"
+            if ($p10Row -cne 'survivors=[24682] unknown=[24680] stopped=[24682] killed=[24682]') { $c5Bad.Add("[pass-10 A1] $p10Row want survivors=[24682] unknown=[24680] stopped=[24682] killed=[24682]") }
+            $results.pass10A1NoDescent = $p10Row
+            # r6: no descent code is left to adopt a stranger (static guard: the census and the sweep never read a parent pid or creation time).
+            $p10Src = Get-Content -LiteralPath $PSCommandPath -Raw
+            $p10Def = [regex]::Match($p10Src, '(?s)\nfunction Get-FixtureMatch\(.*?\nfunction Format-FixtureLeakLine\(').Value
+            if ($p10Def.Length -eq 0 -or $p10Def -match '\$\w+\.(ParentProcessId|CreationDate)\b' -or $p10Def -match 'Get-SuiteDescendants') { $c5Bad.Add("[pass-10 A1] the matcher/census/sweep definitions read a parent pid or creation time, or the definitions were not found (len=$($p10Def.Length))") }
+            # real processes: an embedded single-quoted dir, a forward-slash path under it, and a forward-slash sibling. r6: only the forward-slash
+            # whole argument is a survivor and stopped by the sweep; the embedded one and the sibling are counted unknown and the sweep leaves both
+            # alive (this case stops them through its own Process objects, in the finally below).
             function Start-SeamKidArgv([string[]]$Argv) {
                 $psiA = [Diagnostics.ProcessStartInfo]::new($Python)
                 foreach ($a in $Argv) { [void]$psiA.ArgumentList.Add($a) }
@@ -3824,10 +3806,11 @@ try { $out = @(Add-LeaseSlotSnapshot -JobId 'jB4a' -Phase 'request') } catch { $
             $c5Real = Get-FixtureCensus $fx
             if ($c5Live -ne 3) { $c5Bad.Add("real processes: only $c5Live of 3 children were alive before the census (a control that never ran proves nothing)") }
             $c5Stopped = @(Stop-FixtureLeftovers $fx @($c5Emb.Id, $c5Fwd.Id, $c5Sib.Id))
-            $c5Gone = (Wait-Until { $c5Emb.HasExited -and $c5Fwd.HasExited } 5)
-            $c5Row = "embedded counted=$(@($c5Real.survivors) -contains $c5Emb.Id) forward counted=$(@($c5Real.survivors) -contains $c5Fwd.Id) sibling unknown=$(@($c5Real.unknown) -contains $c5Sib.Id) stopped=[$($c5Stopped -join ',')] embedded+forward gone=$c5Gone sibling alive=$(-not $c5Sib.HasExited)"
-            if (-not ((@($c5Real.survivors) -contains $c5Emb.Id) -and (@($c5Real.survivors) -contains $c5Fwd.Id) -and (@($c5Real.unknown) -contains $c5Sib.Id) -and $c5Gone -and $c5Stopped -notcontains $c5Sib.Id -and -not $c5Sib.HasExited)) { $c5Bad.Add("real processes: $c5Row") }
-            Assert-True ($c5Bad.Count -eq 0) "lease-seam-pid-cleanup: a fixture dir embedded in a script argument or written with forward slashes is counted (never a false zero), and a sibling is counted unknown, never killed (sol r4 B1): $($c5Bad -join ' ; ')"
+            $c5Gone = (Wait-Until { $c5Fwd.HasExited } 5)
+            $c5Row = "embedded unknown=$(@($c5Real.unknown) -contains $c5Emb.Id) forward counted=$(@($c5Real.survivors) -contains $c5Fwd.Id) sibling unknown=$(@($c5Real.unknown) -contains $c5Sib.Id) stopped=[$($c5Stopped -join ',')] forward gone=$c5Gone embedded alive=$(-not $c5Emb.HasExited) sibling alive=$(-not $c5Sib.HasExited)"
+            if (-not ((@($c5Real.unknown) -contains $c5Emb.Id) -and (@($c5Real.survivors) -contains $c5Fwd.Id) -and (@($c5Real.unknown) -contains $c5Sib.Id) -and $c5Gone -and $c5Stopped -notcontains $c5Emb.Id -and $c5Stopped -notcontains $c5Sib.Id -and -not $c5Emb.HasExited -and -not $c5Sib.HasExited)) { $c5Bad.Add("real processes: $c5Row") }
+            Stop-OwnedChildren @($c5Emb, $c5Sib)   # r6: the sweep never kills an embedded match; this case ends the children it started through their objects
+            Assert-True ($c5Bad.Count -eq 0) "lease-seam-pid-cleanup: a fixture dir embedded in a script argument or written with forward slashes is counted (never a false zero), an embedded match or a sibling is counted unknown and never killed, and no pid ancestry confers ownership (sol r4 B1, r5 pass-10 A1): $($c5Bad -join ' ; ')"
             $results.leaseSeamEmbeddedCensus = $c5Row
             # r4 pass-5 A2 (verbatim shape): pid 42424 is a process whose Handle getter fails (no pin) while every other query answers and the identity
             # check accepts it. A stop that goes on without the pin may kill whatever holds 42424 by then: it must refuse, and never call Kill().
@@ -3910,14 +3893,15 @@ try { $out = @(Add-LeaseSlotSnapshot -JobId 'jB4a' -Phase 'request') } catch { $
             $fuObjs.Add($pF)
             return [pscustomobject]@{ p = $pF; out = $pF.StandardOutput.ReadToEndAsync(); err = $pF.StandardError.ReadToEndAsync() }
         }
-        function Wait-FakeCall($H, [int]$Ms = 30000) {
+        function Wait-FakeCall($H, [int]$Ms = 30000, [int]$ReadMs = 5000) {
             $Ms = [Math]::Max(0, [Math]::Min($Ms, 600000))   # r5 pass-9 A2 (advisory): -1 would be WaitForExit's infinite wait
+            $ReadMs = [Math]::Max(0, [Math]::Min($ReadMs, 5000))   # r6: the same clamp for the read wait (the H2 subcase passes a short one)
             $done = $H.p.WaitForExit($Ms)
             if (-not $done) { try { $H.p.Kill() } catch { }; $null = $H.p.WaitForExit(5000) }
             # r5 (sol r4 H2): a call that did not exit and whose Kill threw still holds its pipes open, so .Result would block forever. Each read is
-            # waited for at most 5 s; one that has not finished is reported as '<unread>' (the call is already a failure: exited=False).
-            $outT = if ($H.out.Wait(5000)) { ([string]$H.out.Result).Trim() } else { '<unread>' }
-            $errT = if ($H.err.Wait(5000)) { ([string]$H.err.Result).Trim() } else { '<unread>' }
+            # waited for at most -ReadMs (5 s); one that has not finished is reported as '<unread>' (the call is already a failure: exited=False).
+            $outT = if ($H.out.Wait($ReadMs)) { ([string]$H.out.Result).Trim() } else { '<unread>' }
+            $errT = if ($H.err.Wait($ReadMs)) { ([string]$H.err.Result).Trim() } else { '<unread>' }
             return [pscustomobject]@{ exited = $done; rc = $(if ($done) { $H.p.ExitCode } else { $null }); out = $outT; err = $errT }
         }
         function Lock-FakeFlag([double]$WithinSec = 5) {
@@ -3944,7 +3928,7 @@ try { $out = @(Add-LeaseSlotSnapshot -JobId 'jB4a' -Phase 'request') } catch { $
             $h2P | Add-Member -MemberType ScriptMethod -Name WaitForExit -Value { param($ms) $false }
             $h2P | Add-Member -MemberType ScriptMethod -Name Kill -Value { throw 'Access is denied' }
             $h2Sw = [Diagnostics.Stopwatch]::StartNew()
-            $h2R = Wait-FakeCall ([pscustomobject]@{ p = $h2P; out = $h2Tcs.Task; err = $h2Tcs.Task }) 10
+            $h2R = Wait-FakeCall ([pscustomobject]@{ p = $h2P; out = $h2Tcs.Task; err = $h2Tcs.Task }) 10 200
             $h2Sw.Stop()
             $fuRows['h2-bounded-collect'] = [ordered]@{ sec = [Math]::Round($h2Sw.Elapsed.TotalSeconds, 2); exited = $h2R.exited; out = $h2R.out; err = $h2R.err }
             if (-not ($h2Sw.Elapsed.TotalSeconds -lt 20 -and $h2R.exited -eq $false -and $h2R.out -ceq '<unread>' -and $h2R.err -ceq '<unread>')) { $fuFails.Add("(h2) a call that never exits and cannot be killed: want a bounded return with unread output, got sec=$([Math]::Round($h2Sw.Elapsed.TotalSeconds, 2)) exited=$($h2R.exited) out=[$($h2R.out)] err=[$($h2R.err)]") }
