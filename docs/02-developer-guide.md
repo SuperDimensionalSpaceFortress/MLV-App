@@ -1029,10 +1029,12 @@ jobs, plus a `Repo Hygiene Python windows lane containment` job that runs
 file, so it is collected in exactly one job), a `Repo Hygiene Python windows coordination heavy`
 job that runs the four slowest coordination test files (`test_doctrine_outbox.py`, `_concerns.py`,
 `_hooks.py` and `test_retire_lane_worktree.py`, about 14 min hosted) in parallel (windows shard 8
-ignores those files too), and the product oracles as
+ignores those files too), a `Repo Hygiene Python windows guardrails heavy` job that runs
+`tools/coordination/test_coordination_guardrails.py` and `tests/coordination/test_build_guard.py`
+(about 21-23 min hosted; shard 8 no longer names the first and ignores the second), and the product oracles as
 `Windows Product Oracles part N/3` jobs (none required by name); an aggregator per
-required name needs every one of its shards (the windows one also the containment and
-coordination heavy jobs) and
+required name needs every one of its shards (the windows one also the containment,
+coordination heavy and guardrails heavy jobs) and
 carries the required name. The unittest shards are sets of whole test classes weighted by measured
 seconds (`tools/repo_hygiene/ci_unittest_shard_weights.json`, regenerated from CI job logs
 with `tools/repo_hygiene/ci_unittest_shard_timings.py`), and every shard job proves the

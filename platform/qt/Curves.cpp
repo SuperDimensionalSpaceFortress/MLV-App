@@ -32,6 +32,7 @@ Curves::Curves(QWidget *parent)
     m_pProcessing = NULL;
     m_pFrameChanged = NULL;
     m_LoadAll = false;
+    m_drawOnly = false;
     resetLines();
 }
 
@@ -293,7 +294,11 @@ void Curves::mouseMoveEvent(QMouseEvent *mouse)
 void Curves::resizeEvent(QResizeEvent *event)
 {
     m_width = size().width();
+    // A resize only redraws. The curve is unchanged (its points are normalized), and a resize is not user input, so it
+    // arrives inside a Look Assist pump turn while the worker reads the processing object (adversary A1, r4).
+    m_drawOnly = true;
     paintElement();
+    m_drawOnly = false;
     event->accept();
 }
 
@@ -358,7 +363,7 @@ void Curves::paintLine(QVector<QPointF> line, QPainter *pPainter, QColor color, 
     }
 
     //Set Procesing Element if available
-    if( active || m_LoadAll )
+    if( !m_drawOnly && ( active || m_LoadAll ) )
     {
         if( m_pProcessing != NULL ) processingSetGCurve( m_pProcessing, numIn, pXin, pYin, channel );
         if( m_pFrameChanged != NULL ) *m_pFrameChanged = true;

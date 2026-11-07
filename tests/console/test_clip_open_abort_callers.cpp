@@ -908,7 +908,7 @@ TEST(ClipOpenAbortR5Wiring, EveryDirectActiveReceiptWriteConsultsTheOwnershipPre
                                            QStringLiteral("void MainWindow::captureLookAssistBaseline( ReceiptSettings *receipt )"));
     ASSERT_EQ(setSliders.count(QStringLiteral("|| !receiptOwnedByLoadedClip( \"look-assist-setsliders-frame-ready\" )")), 2);
     const QString toggle = bodyBetween(source, QStringLiteral("void MainWindow::on_checkBoxLookAssistEnable_clicked( bool checked )"),
-                                       QStringLiteral("applyLookAssistToReceipt( ACTIVE_RECEIPT, analysisFrame );"));
+                                       QStringLiteral("applyLookAssistFromFrameReady( ACTIVE_RECEIPT, analysisFrame );"));
     ASSERT_TRUE(toggle.contains(QStringLiteral("|| !receiptOwnedByLoadedClip( \"look-assist-toggle-frame-ready\" )")));
 
     // the predicate reuses the r4 detachment state and compares the loaded file with the active row
