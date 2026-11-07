@@ -76,8 +76,12 @@ MISSING_NEGATIVE_CONTROL_MODES = (
 )
 
 # The seam fails a search allocation only once the positive control is back and the base is not: when the search
-# finds the base first, it completes and never reaches the seam. So each run is INVALID or a complete search.
+# finds the base first, it completes and never reaches the seam. So each run is INVALID or a complete search. About
+# half the runs reached the seam on the pinned toolchain (r8: 6 of 10), so the test keeps going past SEARCH_ALLOC_RUNS
+# until the seam has fired once, up to SEARCH_ALLOC_MAX_RUNS (0.5**48 odds of a spurious miss). A toolchain where the base
+# always comes back first never reaches the seam; that fails on purpose, since the INVALID path is then unproven.
 SEARCH_ALLOC_RUNS = 12
+SEARCH_ALLOC_MAX_RUNS = 48
 
 USAGE_CASES = (
     ((), None),
@@ -246,8 +250,10 @@ class FixtureExeTests(unittest.TestCase):
 
     def test_search_alloc_is_invalid_3_or_a_complete_search_never_green(self):
         invalid = 0
-        for run in range(1, SEARCH_ALLOC_RUNS + 1):
-            with self.subTest(run=run):
+        runs = 0
+        while runs < SEARCH_ALLOC_MAX_RUNS and (runs < SEARCH_ALLOC_RUNS or invalid == 0):
+            runs += 1
+            with self.subTest(run=runs):
                 code, record, count, label = self.run_fixture(("reuse", "stdthread"), "search_alloc")
                 self.assertEqual(1, count, label)
                 self.assertNotEqual("GREEN", record.get("verdict"), "a cut-short search read as GREEN: " + label)
@@ -259,7 +265,7 @@ class FixtureExeTests(unittest.TestCase):
                     # The base came back before the positive control, so the seam was never reached.
                     self.assertEqual(("1", "1"), (record.get("base_found"), record.get("pos_found")), label)
                     self.assertEqual(0, code, label)
-        self.assertGreater(invalid, 0, "the search_alloc seam never fired in %d runs" % SEARCH_ALLOC_RUNS)
+        self.assertGreater(invalid, 0, "the search_alloc seam never fired in %d runs: its INVALID path is unproven" % runs)
 
     def test_usage_errors_stay_4(self):
         for args, fault in USAGE_CASES:
