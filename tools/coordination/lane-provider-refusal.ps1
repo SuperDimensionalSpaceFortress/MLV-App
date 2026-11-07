@@ -407,6 +407,24 @@ function Get-LaneLastTopLevelJson {
     return [pscustomobject]@{ text = $tailText; offset = $start; closed = ($end -ge 0) }
 }
 
+# A trimmed line that starts with a double quote: is it a malformed JSON string VALUE (true), or prose that merely opens
+# with a quoted word (false)? Scan the string the way JSON does (a backslash escapes the next character). No closing quote
+# on the line: malformed. A closing quote with only JSON whitespace after it: the whole line is one string, and the caller
+# already took it as a scalar if valid, so what reaches here is an invalid string: malformed. Anything else after the
+# closing quote is words, so prose (r6, adversary A1).
+function Test-LaneQuoteLedLineIsMalformedValue {
+    param([AllowEmptyString()][AllowNull()][string]$Line)
+    if ([string]::IsNullOrEmpty($Line) -or $Line[0] -cne [char]34) { return $false }
+    $close = -1
+    for ($i = 1; $i -lt $Line.Length; $i++) {
+        $ch = $Line[$i]
+        if ($ch -ceq [char]92) { $i++; continue }
+        if ($ch -ceq [char]34) { $close = $i; break }
+    }
+    if ($close -lt 0) { return $true }
+    return ($Line.Substring($close + 1).Trim([char[]](9, 10, 13, 32)).Length -eq 0)
+}
+
 # Get-LaneTerminalCandidate: the ONE selector of an answer's terminal JSON candidate, by POSITION across
 # both forms (KERNEL-K4 r3, Dot items 1 and 3). The candidates are the fenced blocks and the unfenced
 # top-level values; the LAST one in the answer decides and an earlier one never stands in for it.
@@ -475,7 +493,10 @@ function Get-LaneTerminalCandidate {
             # r4 pass 2 (A1): a line that OPENS a JSON string but is not a complete one is a malformed terminal value (the
             # strict object parse rejects it), never prose; null / true / false / digits that are not a complete scalar
             # ("3 findings.", "null hypothesis") stay prose.
-            if ((Test-LaneJsonScalar -Text $lt) -or $lt.StartsWith('"')) { return [pscustomobject]@{ form = 'unfenced'; text = $lt; startLine = $li } }
+            # r6 (adversary A1): a quote-led line is malformed only when its string never closes, or closes with nothing after it
+            # (a complete valid string already passed as a scalar above). A closed string followed by words ('"Approve" is my
+            # verdict.') is prose, so it does not replace a valid earlier verdict.
+            if ((Test-LaneJsonScalar -Text $lt) -or ($lt.StartsWith('"') -and (Test-LaneQuoteLedLineIsMalformedValue -Line $lt))) { return [pscustomobject]@{ form = 'unfenced'; text = $lt; startLine = $li } }
         }
         if ($null -ne $c) { return [pscustomobject]@{ form = 'unfenced'; text = $c.text; startLine = $candStart } }
     }

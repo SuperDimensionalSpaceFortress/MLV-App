@@ -1049,7 +1049,7 @@ public static class MlvLaneJob {
     return (int)info.InheritedFromUniqueProcessId.ToInt64();
   }
   // r15 (Dot B5; adversary A2 = Dot B6): Members are the processes shown to be in the tree. Uncertain says why 'killed' would claim too much; the first reason found stands.
-  //   ancestry-unreadable:<parent-read|kid-open|kid-read>:<Win32 error>: a candidate, or a parent, could not be read; the site and the code say which read.
+  //   ancestry-unreadable:<parent-read|kid-open|kid-read>:<error code>: a candidate, or a parent, could not be read; the site and the code say which read.
   //   older-than-parent: the parent matches and the child reads older. A backward clock step and a reused parent pid look the same, so it is neither killed nor called gone.
   //   descendant-unreachable: the snapshot saw a process under a pid whose holder has since gone, so that process cannot be shown to be in the tree, or to be gone.
   public sealed class DescendantWalk {
@@ -1077,7 +1077,7 @@ public static class MlvLaneJob {
       Process parent=walk.Dequeue();
       if(!kids.ContainsKey(parent.Id)) continue;
       Int64 parentCreated;
-      // PR 771 hosted CI saw a bare 'ancestry-unreadable' it could not explain (merge ref 516350c5, job 128440611866). Each note below now names the read that failed and its Win32 error code; the outcome is unchanged (uncertain).
+      // PR 771 hosted CI saw a bare 'ancestry-unreadable' it could not explain (merge ref 516350c5, job 128440611866). Each note below now names the read that failed and its error code (Win32, or the raw NTSTATUS for the parent-pid read); the outcome is unchanged (uncertain).
       try { parentCreated=CreatedFileTime(parent); } catch(Win32Exception ex) { seen.Note("ancestry-unreadable:parent-read:"+ex.NativeErrorCode); continue; }
       foreach(int id in kids[parent.Id]) {
         Process kid;

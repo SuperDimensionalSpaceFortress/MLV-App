@@ -2474,6 +2474,20 @@ def test_r4_adv2_a1_a_malformed_quote_led_line_after_the_last_fence_is_a_malform
         assert _work_evidence(tmp_path, "codex", R4_PROSE + prov + tail, 0, prompt_chars=600, require_verdict=True)["workCompleted"] is True, tail
 
 
+def test_r6_adv_a1_closed_quoted_prose_after_the_last_fence_is_prose_not_a_malformed_terminal_value(tmp_path):
+    # adversary r6 A1 (introduced by r4 pass 2 A1): StartsWith('"') made EVERY quote-led line the terminal value, so a valid
+    # fenced verdict followed by '"Approve" is my verdict.' was booked codex-no-verdict. Only a quote-led line whose string
+    # never closes, or closes with nothing after it and is not valid JSON, is a malformed terminal value.
+    prov = '~~~json\n{"verdict":"APPROVE"}\n~~~\n'
+    for tail in ('"Approve" is my verdict.\n', '"Approve" is my "final" verdict.\n', '"x" y\nDone.\n', '"a\\"b" then prose\n'):
+        r = _work_evidence(tmp_path, "codex", R4_PROSE + prov + tail, 0, prompt_chars=600, require_verdict=True)
+        assert r["workCompleted"] is True, (tail, r)
+    # controls: an unterminated string, a closed-but-invalid string alone, and a complete scalar all still end the answer
+    for tail in ('"no verdict issued\n', '"a\\qb"\n', '"APPROVE"\n', '"unterminated \\"\n'):
+        r = _work_evidence(tmp_path, "codex", R4_PROSE + prov + tail, 0, prompt_chars=600, require_verdict=True)
+        assert r["workCompleted"] is False and r["reason"] == "codex-no-verdict", (tail, r)
+
+
 def test_r4_adv2_a2_unrelated_metadata_that_cannot_be_read_never_erases_the_contract_evidence(tmp_path):
     # adversary r4 pass 2 A2: JsonDocument.Parse accepts a lone surrogate escape, GetString() on it throws, and the
     # builder returned null, so a real verdict / success envelope / 429 refusal was lost.
