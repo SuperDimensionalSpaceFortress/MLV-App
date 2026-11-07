@@ -244,9 +244,9 @@ int getMlvRawFrameDebayeredFromReconnedRaw16(mlvObject_t * video,
  * (Height / reconScale) RGB16 pixels, returned in outWidth / outHeight. No
  * decode, no llrawproc, no cache read or publish. A nonzero bit shift is applied
  * to reducedReconnedRaw in place. Returns 1 on success, 0 (nothing written) unless
- * reconScale is 2 or 4, reducedWidth == Width / bayerScale, 2 <= reducedHeight <=
- * Height / bayerScale (r12: one row is refused) and the debayer is bilinear
- * (doesMlvAlwaysUseAmaze == 0).
+ * reconScale is 2 or 4, reducedWidth == Width / bayerScale, reducedHeight is even
+ * and 4 <= reducedHeight <= Height / bayerScale (r12: a shorter or odd Bayer would
+ * leave rows unreconstructed) and the debayer is bilinear (doesMlvAlwaysUseAmaze == 0).
  * CPU-DUALISO-REDUCED-RECON-H2C-PORT-1: reducedWidth / reducedHeight are the
  * reduced BAYER's dims (plan.bayerWidth / bayerHeight); bayerScale = Width /
  * reducedWidth is reconScale, or 2 when reconScale is 4 (the x4 "H2c" route:
