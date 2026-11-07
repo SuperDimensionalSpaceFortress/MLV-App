@@ -66,6 +66,10 @@ FAULT_CASES = (
 )
 RUNS_PER_FAULT_CASE = 2
 
+# Sol r8 B1: crash mode, every thread kind, either control missing. Each must be INVALID/3 with SITES[site].
+CRASH_CONTROL_CASES = tuple((site, "crash", kind) for site in ("neg_alloc", "pos_alloc") for kind in ("stdthread", "qthread", "omp"))
+STATUS_HEAP_CORRUPTION = 0xC0000374
+
 # The r6 B1 escape: with the negative control missing, these modes printed GREEN (helper) or RED (reuse) and exit 0.
 MISSING_NEGATIVE_CONTROL_MODES = (
     ("helper", "stdthread"),
@@ -163,6 +167,25 @@ class FixtureSourceTests(unittest.TestCase):
                 check = body.find("g_setup_failure.load()")
                 self.assertNotEqual(-1, check, name + " never reads g_setup_failure")
                 self.assertLess(check, verdicts[0], name + " can print a verdict before it reads g_setup_failure")
+
+    def test_no_destructive_adversary_after_a_recorded_setup_failure(self):
+        """Sol r8 B1, by source: the key destructor's search and overwrite, and crash mode's late Probe teardown, are
+        each gated on g_setup_failure, so a failed control can only end as an INVALID record."""
+        key = region(self.text, r"\nvoid keyDestructor\(void \*\)", r"\n}\n")
+        search = key.find("searchForBase(")
+        self.assertNotEqual(-1, search, "keyDestructor no longer runs the search (update this test)")
+        gate = key.find("!g_setup_failure.load()")
+        self.assertNotEqual(-1, gate, "keyDestructor runs its adversary without reading g_setup_failure")
+        self.assertLess(gate, search, "keyDestructor searches before it reads g_setup_failure")
+        write = key.find("writeDumpBytes(")
+        self.assertNotEqual(-1, write, "keyDestructor no longer writes the dump bytes (update this test)")
+        self.assertRegex(key[search:write + len("writeDumpBytes(")], r"if \(block && !g_setup_failure\.load\(\)\) writeDumpBytes\(",
+                         "the dump write is not gated on a failure the search itself recorded")
+        probe = region(self.text, r"\n__attribute__\(\(noinline\)\) Probe::~Probe\(\)", r"\n}\n")
+        crash_gate = re.search(r"if \(g_mode == Mode::Crash\)\s*\{\s*if \(const char \* const why = g_setup_failure\.load\(\)\)"
+                               r"\s*\{\s*printResult\(\"crash\", g_kind_arg, \"INVALID\", std::string\(\"why=\"\) \+ why\);"
+                               r"\s*std::_Exit\(3\);", probe)
+        self.assertIsNotNone(crash_gate, "crash-mode ~Probe does not stop with INVALID/3 before its member teardown")
 
     def test_setup_steps_print_invalid_not_usage(self):
         setup = region(self.text, r"// From here a failure is the fixture's own setup", r'if \(mode == "order"\)')
@@ -284,15 +307,18 @@ class FixtureExeTests(unittest.TestCase):
                 self.assertNotIn(record.get("verdict"), VERDICT_WORDS, "a verdict on a missing negative control: " + label)
                 self.assertNotEqual(0, code, "exit 0 on a missing negative control: " + label)
 
-    # Known open (adversary A2): in crash mode the key destructor's adversary still runs with a control missing, and the
-    # heap fast-fails (0xC0000374) before the INVALID check. When A2 is fixed this becomes an unexpected success and the
-    # suite fails until the decorator is removed.
-    @unittest.expectedFailure
-    def test_crash_mode_missing_negative_control_is_invalid_3_A2_open(self):
-        code, record, count, label = self.run_fixture(("crash", "stdthread"), "neg_alloc")
-        self.assertEqual(1, count, label)
-        self.assertEqual("INVALID", record.get("verdict"), label)
-        self.assertEqual(3, code, label)
+    # --- Sol r8 B1: crash mode with a failed control. Before r9 the key destructor's adversary still ran and overwrote the
+    # freed Probe block, so the late teardown fast-failed (0xC0000374) before any RESULT. It must be INVALID/3, named. ----
+    def test_crash_mode_failed_control_is_invalid_3_with_the_named_why(self):
+        for site, mode, kind in CRASH_CONTROL_CASES:
+            for run in range(1, RUNS_PER_FAULT_CASE + 1):
+                with self.subTest(site=site, mode=mode, kind=kind, run=run):
+                    code, record, count, label = self.run_fixture((mode, kind), site)
+                    self.assertNotEqual(STATUS_HEAP_CORRUPTION, code, "heap fast-fail after a recorded control failure: " + label)
+                    self.assertEqual(1, count, "exactly one RESULT record: " + label)
+                    self.assertEqual("INVALID", record.get("verdict"), label)
+                    self.assertEqual(SITES[site], record.get("why"), label)
+                    self.assertEqual(3, code, label)
 
 
 if __name__ == "__main__":

@@ -10,7 +10,8 @@
 // Usage: tls_exit_order_fixture <mode> [kind]
 //   order <kind>   K's destructor stamps a sequence number, ~Probe stamps one. RED = K stamped first.
 //   reuse <kind>   ~Probe searches the heap for its own base block. RED = found (it was already freed).
-//   crash          K's destructor writes the dump's bytes into the freed block. Expected child exit 0xC0000374.
+//   crash          K's destructor writes the dump's bytes into the freed block. Expected child exit 0xC0000374. With a
+//                  setup failure recorded first, nothing is overwritten or torn down: INVALID, exit 3.
 //   helper <kind>  The same adversary, with T from mlvThreadExitCache. Expected: ~T exactly once on the thread, exit 0.
 //   identity       Repeated calls on one thread return the same object and do not reallocate.
 //   bench          ns per access, old thread_local against the helper.
@@ -182,21 +183,36 @@ void keyDestructor(void *)
     g_k_stamp.store(++g_seq);
     // Free the control as close to the base's own free as this fixture can get.
     freePositiveControlOnce();
-    if (g_mode == Mode::Crash || g_mode == Mode::Helper)
+    // A recorded setup failure already makes this run INVALID, so the adversary does not run: in crash mode its overwrite
+    // would make the late teardown fast-fail before the INVALID record is printed (Sol r8 B1).
+    if ((g_mode == Mode::Crash || g_mode == Mode::Helper) && !g_setup_failure.load())
     {
         // Same search as reuse, from the key destructor: the storage is free, and this is the slot being taken by another
         // owner before the late destructor reads it.
         void * const block = searchForBase(true);
-        if (block) writeDumpBytes(block);
+        // A search the seam cut short has recorded its failure: write nothing then.
+        if (block && !g_setup_failure.load()) writeDumpBytes(block);
         freeKept(g_search.attempts);
     }
 }
+
+int printResult(const char * mode, const std::string & kind, const char * verdict, const std::string & detail);
 
 Probe::Probe() : a(16, 1), b(16, 2), c(16, 3) {}
 
 __attribute__((noinline)) Probe::~Probe()
 {
     g_probe_stamp.store(++g_seq);
+    // Crash mode with a recorded setup failure: the run is INVALID whatever happens next, so it stops here, before the
+    // member teardown below can touch storage emutls may already have freed (Sol r8 B1).
+    if (g_mode == Mode::Crash)
+    {
+        if (const char * const why = g_setup_failure.load())
+        {
+            printResult("crash", g_kind_arg, "INVALID", std::string("why=") + why);
+            std::_Exit(3);
+        }
+    }
     if (g_mode == Mode::Reuse)
     {
         freePositiveControlOnce();
@@ -205,8 +221,6 @@ __attribute__((noinline)) Probe::~Probe()
     }
     // Members are destroyed after this. In crash mode that is the free() the dump shows failing.
 }
-
-int printResult(const char * mode, const std::string & kind, const char * verdict, const std::string & detail);
 
 // K that was never set never fires, which would read as a result. A failure here is the fixture's own: stop, INVALID.
 void setKeyK()
