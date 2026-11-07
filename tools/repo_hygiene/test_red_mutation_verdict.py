@@ -30,14 +30,16 @@ def _run_unittest(files: dict[str, str], target: str) -> str:
     with tempfile.TemporaryDirectory() as tmp:
         for name, text in files.items():
             Path(tmp, name).write_text(text, encoding="utf-8", newline="\n")
-        proc = subprocess.run([sys.executable, "-m", "unittest", target], cwd=tmp, capture_output=True, timeout=120)
+        proc = subprocess.run([sys.executable, "-m", "unittest", target], cwd=tmp, capture_output=True, timeout=120,
+                              env={**__import__("os").environ, "PYTHONIOENCODING": "utf-8"})
     return _raw_text(proc)
 
 
 def _raw_text(proc: subprocess.CompletedProcess) -> str:
     """stdout + stderr decoded WITHOUT newline translation (r9 adversary A1 sibling): the text a saved file of the run
-    holds, so verdict() frames the runner's own line ends (CRLF on Windows)."""
-    return (proc.stdout + proc.stderr).decode("utf-8", errors="replace")
+    holds, so verdict() frames the runner's own line ends (CRLF on Windows). Strict UTF-8 (adversary pass 2, A2
+    sibling): a lossy decode would hand verdict() a replacement character the run never printed."""
+    return (proc.stdout + proc.stderr).decode("utf-8")
 
 
 class VerdictOnRealRuns(unittest.TestCase):
@@ -1153,11 +1155,11 @@ class VerdictOnText(unittest.TestCase):
             import io
             buf = io.StringIO()
             with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(buf):
-                code = rmv.main(["verdict", "--output", str(path), "--expect", "test_�.py:4"])
+                code = rmv.main(["verdict", "--output", str(path), "--expect", "test_\ufffd.py:4"])
         self.assertEqual(code, 2, buf.getvalue())
         self.assertIn("cannot read", buf.getvalue())
         lossy = raw.decode("utf-8", errors="replace")  # a text already decoded with replacement is refused too
-        self._could_not_check(lossy, "test_�.py:4", "U+FFFD")
+        self._could_not_check(lossy, "test_\ufffd.py:4", "U+FFFD")
         self.assertEqual(rmv.verdict(raw.decode("cp1252"), "test_\xe9.py:4")[0], rmv.PASS)  # the true name still reads
         with self.assertRaises(UnicodeDecodeError):  # sibling: the real-run helpers decode strictly
             _raw_text(subprocess.CompletedProcess([], 1, raw, b""))

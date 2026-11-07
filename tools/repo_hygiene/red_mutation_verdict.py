@@ -72,7 +72,11 @@ REFUSED with a reason that starts ``COULD-NOT-CHECK (<typed reason>)``. That is 
 * ``line framing`` (r9 hub ruling, a STRUCTURE): the text is framed into lines ONCE, at entry, and only ``\\n`` and
   ``\\r\\n`` end a line. Any other boundary ``str.splitlines()`` knows (``\\r`` alone, ``\\x0b``, ``\\x0c``, ``\\x1c``-``\\x1e``,
   ``\\x85``, U+2028, U+2029) refuses the whole run, and the reason names the code point. Every reader (blocks, sections,
-  short summary, terminal result, ``Ran`` footer, counts, the green check) reads that one list of lines.
+  short summary, terminal result, ``Ran`` footer, counts, the green check) reads that one list of lines. A text holding
+  U+FFFD (what a lossy decode leaves) is refused too, and the CLI reads ``--output`` as strict UTF-8 with no newline
+  translation (a file that is not UTF-8 is exit 2).
+* ``runner``: one run has one runner. A unittest ``FAILED (...)`` trailer over pytest sections or summary lines, or a
+  pytest bar over unittest blocks, is COULD-NOT-CHECK: the trailer's count does not cover the other runner's failures.
 * ``pairing`` (r9 hub ruling, a STRUCTURE): every pytest ``FAILED`` line is one failure OCCURRENCE with its own exception
   account. A section takes the account of the one occurrence it pairs with; a node id printed more than once
   (``--keep-duplicates``), two node ids with one test name in files where one path is a suffix of the other
@@ -233,6 +237,9 @@ def _frame(text: str) -> list[str]:
     if m:
         raise _Unclassifiable(f"line framing: the text holds U+{ord(m.group(0)):04X}, a line boundary other than \\n "
                               "and \\r\\n, which some readers would split at and others would not")
+    if "\ufffd" in text:  # r9 adversary pass 2, A2: a lossy decode put it where bytes were lost; any name may have held it
+        raise _Unclassifiable("decoding: the text holds U+FFFD, the replacement character a lossy decode puts where bytes "
+                              "could not be read, so a file name or test id holding it is not the one the run printed")
     lines = text.replace("\r\n", "\n").split("\n")
     if lines[-1] == "":  # the newline that ends the last line starts no new line
         lines.pop()
@@ -816,6 +823,15 @@ def _count_mismatch(lines: list[str], ut_blocks: int, stats: dict) -> str:
                     "before it")
     if last is None:
         return ""
+    pt_read = stats["sections"] or stats["summary"] or stats["has_summary"]
+    # ONE RUN, ONE RUNNER (r9 adversary pass 2, A1): the terminal result reconciles only its own runner's failures, so a
+    # failure read by the other runner's parser would never be counted. Either kind under the other's trailer refuses.
+    if last.startswith("FAILED (") and pt_read:
+        return ("runner: a unittest `FAILED (...)` trailer closes a run in which pytest failure sections or summary lines "
+                "were read; one run has one runner, and these failures are not in its count")
+    if last.startswith("=") and ut_blocks:
+        return ("runner: a pytest result bar closes a run in which unittest failure blocks were read; one run has one "
+                "runner, and these failures are not in its count")
     if last.startswith("FAILED (") and any(_UT_RAN.match(ln) for ln in lines):
         want = sum(int(n) for _kind, n in _UT_COUNTS.findall(last))
         if want != ut_blocks:  # a stated 0 counts too: `FAILED (failures=0)` over a readable block is a contradiction
@@ -1039,9 +1055,11 @@ def main(argv: list[str] | None = None) -> int:
         try:
             # newline="": no newline translation, so _frame sees the saved file's own line ends (a lone CR included;
             # read_text() would turn it into LF first: r9 adversary A1).
-            with Path(args.output).open(encoding="utf-8", errors="replace", newline="") as fh:
+            # errors="strict": a file that is not UTF-8 is unreadable (exit 2); a replacement character could stand in
+            # for any letter of a name and so match an expectation that holds one (r9 adversary pass 2, A2).
+            with Path(args.output).open(encoding="utf-8", errors="strict", newline="") as fh:
                 text = fh.read()
-        except (OSError, ValueError) as exc:  # ValueError: a path holding NUL (r9 adversary A2)
+        except (OSError, ValueError) as exc:  # ValueError: a path holding NUL (r9 adversary A2), UnicodeDecodeError
             print(f"cannot read --output {args.output!r}: {type(exc).__name__}: {getattr(exc, 'strerror', None) or exc}",
                   file=sys.stderr)
             return 2
