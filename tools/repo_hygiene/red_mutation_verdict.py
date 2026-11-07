@@ -44,7 +44,9 @@ REFUSED with a reason that starts ``COULD-NOT-CHECK (<typed reason>)``. That is 
   run in which a short-summary ``FAILED``/``ERROR`` line does not split into exactly ``<file.ext>::<name> -
   <message>`` with a non-empty message (a multi-line node id, a ``WORD node`` longer than 74 characters, which pytest cuts
   or drops the message of at its 80-column fallback width but not on a ``CI`` runner, so the line is judged before its
-  message is read and the verdict never depends on the terminal width, a `` - `` inside a directory name, a
+  message is read and the verdict never depends on the terminal width (measured in terminal cells, an upper bound: a
+  non-ASCII character counts two; a ``=== x ===`` rule line inside the summary other than the final result bar, a
+  ``PASSED`` line holding `` - ``, and a ``SKIPPED`` line without ``[n] file:line: `` are forged continuations), a `` - `` inside a directory name, a
   message cut to ``...`` before its exception type shows, a message that itself holds a ``<file>::<name>``; a module-level ``ERROR <file.ext> - <message>`` is the one
   allowed shape without ``::name``), or whose number of such lines differs from the runner's own failed+errored
   count, or that holds a summary line starting with no summary word, or whose ``PASSED``/``SKIPPED``/``XFAIL``/
@@ -395,12 +397,18 @@ _PT_SUMMARY_WORDS = ("FAILED", "ERROR", "SKIPPED", "XFAIL", "XPASS", "PASSED")
 _SUMMARY_LINE_MAX_ID = 74
 
 
+def _cell_width(text: str) -> int:
+    """An UPPER BOUND of the terminal cells `text` takes: pytest measures a line in display cells (a CJK character is
+    two), not code points, so every non-ASCII character counts two. Over-counting only refuses more."""
+    return len(text) + sum(1 for ch in text if ord(ch) > 127)
+
+
 def _summary_problem(word: str, node: str, msg: str) -> str:
     """The CLASS RULE for one short-summary `FAILED`/`ERROR` line (r5 hub ruling): it must split into exactly
     `<file.ext>::<name> - <message>` with a message that is not empty. "" when it does. Every shape a test name can
     forge (a multi-line or over-long id, a ' - ' inside a directory name) fails this one test, so no case is repaired
     one by one. A module-level collection `ERROR <file.ext> - <message>` has no `::name` and is allowed."""
-    if len(word) + 1 + len(node) > _SUMMARY_LINE_MAX_ID:
+    if _cell_width(f"{word} {node}") > _SUMMARY_LINE_MAX_ID:
         # pytest drops or ellipsizes the message when the line does not fit the terminal width (it does not, only
         # when the CI / BUILD_NUMBER environment variable is set), so the same run prints a different line at
         # width 80, at width 200 and on a CI runner. A line this long may have lost its message to the width of
@@ -456,6 +464,10 @@ def _parse_pytest(text: str, stats: dict | None = None) -> list[Failure]:
 
     for line in text.splitlines():
         m_top = _PT_TOP.match(line)
+        if m_top and real_rule(line) and top.startswith("short test summary") and not _RESULT_LINE.match(line):
+            # Only the final result bar may follow the summary header. Any other `=== x ===` line there is part of
+            # a test id that spans lines (a forged section header), not pytest's own text.
+            stats["bad"] = stats["bad"] or f"a rule line {line.strip()[:40]!r} inside the short summary (a multi-line test id?)"
         if m_top and real_rule(line):
             width = width or len(line.rstrip())
             close()
@@ -469,10 +481,10 @@ def _parse_pytest(text: str, stats: dict | None = None) -> list[Failure]:
                 stats["stray"] += 1
             for word in stats["words"]:
                 if line.startswith(word + " "):  # tallied; _count_mismatch reconciles each with the runner's own count
-                    skipped = re.match(r"SKIPPED \[(\d+)\]", line)
+                    skipped = re.match(r"SKIPPED \[(\d+)\] \S+:\d+: ", line)
                     stats["words"][word] += int(skipped[1]) if skipped else 1
-                    if word == "SKIPPED" and not skipped:
-                        stats["stray"] += 1
+                    if (word == "SKIPPED" and not skipped) or (word == "PASSED" and " - " in line):
+                        stats["stray"] += 1  # a real PASSED line is `PASSED <id>` alone; ` - msg` is a forged continuation
             for word in ("FAILED", "ERROR"):
                 got = _parse_summary_line(line, word)
                 if not got:

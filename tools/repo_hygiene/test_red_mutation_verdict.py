@@ -133,6 +133,7 @@ def _run_pytest(files: dict[str, str], *args: str, columns: int = 80, ci: bool =
     width (COLUMNS) unless CI / BUILD_NUMBER is set, so the runner's own environment must never choose the text."""
     env = {k: v for k, v in __import__("os").environ.items() if k not in ("CI", "BUILD_NUMBER", "COLUMNS")}
     env["COLUMNS"] = str(columns)
+    env["PYTHONIOENCODING"] = "utf-8"  # the child prints non-ASCII ids; a cp1252 console would replace them
     if ci:
         env["CI"] = "true"
     with tempfile.TemporaryDirectory() as tmp:
@@ -428,6 +429,39 @@ class NarrowedPromiseR4(unittest.TestCase):
         self.assertEqual(len("FAILED " + at), 74)
         self.assertEqual(rmv.verdict(out(at), at)[0], rmv.PASS, out(at))
         self.cnc(out(at + "a"), at + "a", "too long to rule out a width-cut message")
+
+    def test_r6_pass10_a1_wide_characters_are_judged_by_display_width_not_code_points(self) -> None:
+        """pytest measures the summary line in terminal cells: 35 CJK characters are 70 cells but 35 code points."""
+        node = "t.py::test_" + "\u754c" * 35
+        conftest = ("def pytest_collection_modifyitems(items):\n    for item in items:\n"
+                    f"        item._nodeid = {node!r}\n")
+        for columns in (80, 200):
+            out = _run_pytest({"conftest.py": conftest, "test_t.py": "def test_x(): assert False\n"}, "--tb=no",
+                              columns=columns)
+            self.assertIn("1 failed", out)
+            self.cnc(out, node, "short-summary line")
+
+    def test_r6_pass10_a3_a_rule_line_inside_a_multi_line_id_cannot_hide_the_real_summary(self) -> None:
+        conftest = ("def pytest_collection_modifyitems(items):\n    for item in items:\n"
+                    "        item._nodeid = 'fake.py::test_expected - AssertionError\\n=== hidden ===\\nreal.py::' + item.name\n")
+        out = _run_pytest({"conftest.py": conftest, "test_real.py": "def test_other(): raise TypeError('boom')\n"},
+                          "--tb=no", columns=300)
+        self.assertIn("=== hidden ===", out)
+        self.cnc(out, "fake.py::test_expected", "short-summary line")
+
+    def test_r6_pass10_a2_a_forged_continuation_is_refused_even_when_a_genuine_outcome_matches_the_count(self) -> None:
+        # The adversary's variant: one genuine passing/skipped item so that the forged line's count agrees, and -rf so
+        # the genuine outcome prints no summary line of its own. Shape of a real line is what tells them apart.
+        for word, extra in (("PASSED", "def test_ok(): pass\n"),
+                            ("SKIPPED [1]", "import pytest\n@pytest.mark.skip(reason='r')\ndef test_ok(): pass\n")):
+            conftest = ("def pytest_collection_modifyitems(items):\n    for item in items:\n"
+                        "        if item.name == 'test_other':\n"
+                        f"            item._nodeid = 'fake.py::test_expected - AssertionError\\n{word} bad/test_real.py::test_other'\n")
+            out = _run_pytest({"conftest.py": conftest,
+                               "test_real.py": "def test_other(): raise TypeError('boom')\n" + extra},
+                              "--tb=no", "-rf", columns=300)
+            self.assertIn(f"{word} bad/test_real.py::test_other - TypeError: boom", out)
+            self.cnc(out, "fake.py::test_expected", "short-summary line")
 
     def test_pass7_a3_dash_in_a_directory_name_does_not_invent_a_node(self) -> None:
         files = {"test_control.py": "def test_expected(): pass\n",
