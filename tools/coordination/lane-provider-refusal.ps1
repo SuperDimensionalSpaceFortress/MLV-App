@@ -119,19 +119,64 @@ function Split-LaneJsonLines {
 # JSON-whitespace-only trim let '"no verdict issued"' + U+00A0 fail the strict scalar parse, read the NBSP as words after
 # the string (prose), and resurrect an earlier fenced approval. The candidate TEXT handed to the strict parse is never
 # trimmed by this: a blank character INSIDE or right after a JSON value still fails the parse, which refuses closed.
-# The H form excludes CR and LF so a line-start prefix never spans a line.
-$script:LANE_BLANK_UNIT = '(?:[\s\p{Cf}\p{Cc}]|\uDB40[\uDC01-\uDC7F])'
-$script:LANE_HBLANK_UNIT = '(?:[\s\p{Cf}\p{Cc}-[\r\n]]|\uDB40[\uDC01-\uDC7F])'
-$script:LANE_BLANK_EDGES_RX = [regex]('^' + $script:LANE_BLANK_UNIT + '+|' + $script:LANE_BLANK_UNIT + '+\z')
-$script:LANE_FENCE_OPEN_RX = [regex]('^' + $script:LANE_HBLANK_UNIT + '*(`{3,}|~{3,})')
-$script:LANE_FENCE_CLOSE_RX = [regex]('^' + $script:LANE_HBLANK_UNIT + '*(`{3,}|~{3,})' + $script:LANE_HBLANK_UNIT + '*\z')
-$script:LANE_TOP_LEVEL_RX = [regex]('(?m)^' + $script:LANE_HBLANK_UNIT + '*[\{\["]')
+# r7 pass 1 (adversary A1): judged per Unicode CODE POINT (System.Text.Rune) with the runtime's own category table, never by
+# a UTF-16 regex: \p{Cf} in a .NET regex sees one UTF-16 unit, so a supplementary format character (U+110BD, U+13430,
+# U+1BCA0, U+1D173, ...) is a surrogate pair it never matched. A lone surrogate is not blank.
+function Test-LaneBlankAt {
+    # The UTF-16 length (1 or 2) of the code point at $Index when it is blank; 0 when it is not.
+    param([string]$Text, [int]$Index)
+    $ch = $Text[$Index]
+    if ([int]$ch -gt 32 -and [int]$ch -lt 127) { return 0 }   # printable ASCII: never blank (the common case, no Rune work)
+    $r = [System.Text.Rune]::ReplacementChar
+    if (-not [System.Text.Rune]::TryGetRuneAt($Text, $Index, [ref]$r)) { return 0 }
+    if (-not [System.Text.Rune]::IsWhiteSpace($r)) {
+        $cat = [System.Text.Rune]::GetUnicodeCategory($r)
+        if ($cat -ne [System.Globalization.UnicodeCategory]::Format -and $cat -ne [System.Globalization.UnicodeCategory]::Control) { return 0 }
+    }
+    return $r.Utf16SequenceLength
+}
+
+# Length of the run of blank characters starting at $Start. -StopAtLineBreak: a CR or LF ends the run (a line-start prefix
+# never spans a line).
+function Get-LaneBlankPrefixLength {
+    param([string]$Text, [int]$Start = 0, [switch]$StopAtLineBreak)
+    $i = $Start
+    while ($i -lt $Text.Length) {
+        if ($StopAtLineBreak -and ($Text[$i] -ceq [char]10 -or $Text[$i] -ceq [char]13)) { break }
+        $w = Test-LaneBlankAt -Text $Text -Index $i
+        if ($w -eq 0) { break }
+        $i += $w
+    }
+    return ($i - $Start)
+}
 
 # The text with every BLANK character removed from both ends; '' for a null, empty or all-blank text.
 function Get-LaneBlankTrimmed {
     param([AllowEmptyString()][AllowNull()][string]$Text)
     if ([string]::IsNullOrEmpty($Text)) { return '' }
-    return $script:LANE_BLANK_EDGES_RX.Replace($Text, '')
+    $a = Get-LaneBlankPrefixLength -Text $Text
+    $z = $Text.Length
+    while ($z -gt $a) {
+        $k = $z - 1
+        if ($k - 1 -ge $a -and [char]::IsLowSurrogate($Text[$k]) -and [char]::IsHighSurrogate($Text[$k - 1])) { $k-- }
+        if ((Test-LaneBlankAt -Text $Text -Index $k) -eq 0) { break }
+        $z = $k
+    }
+    return $Text.Substring($a, $z - $a)
+}
+
+# A fence line: the marker (3+ backticks or 3+ tildes) after any blank prefix, else $null. -Close: nothing but blank
+# characters may follow the marker (an opening fence takes any info string).
+function Get-LaneFenceMarker {
+    param([AllowEmptyString()][AllowNull()][string]$Line, [switch]$Close)
+    if ([string]::IsNullOrEmpty($Line)) { return $null }
+    $c0 = $Line[0]
+    if ($c0 -cne '`' -and $c0 -cne '~' -and [int]$c0 -gt 32 -and [int]$c0 -lt 127) { return $null }   # fast path
+    $p = Get-LaneBlankPrefixLength -Text $Line
+    $m = [regex]::Match($Line.Substring($p), '^(`{3,}|~{3,})')
+    if (-not $m.Success) { return $null }
+    if ($Close -and (Get-LaneBlankTrimmed -Text $Line.Substring($p + $m.Length)).Length -ne 0) { return $null }
+    return $m.Groups[1].Value
 }
 
 function Find-ClaudeResultEnvelope {
@@ -226,42 +271,74 @@ function Test-PromptDemandsVerdict {
     #   - the key is a string at depth 1 of that object (not nested in an array, not inside a string value), preceded there
     #     by the opening brace or a comma (a member-name position) and followed by a colon;
     #   - the object closes: an unclosed punctuation brace never spelled an object, and a closed {} without the key is not one.
-    # Every '{' opens a candidate, so a nested object ({"result": {"verdict": ...}}) and an object after a stray brace or
-    # after a code block still count. Prompt text is prose around the spelled object, so the scan is lenient where JSON is
-    # strict: strings are tracked only inside a bracket, a raw line break ends a string, an unmatched closer is ignored, and
-    # values need not be valid JSON ("APPROVE"|"CHANGES_REQUESTED", <placeholder>, ...). One pass: linear in the length.
-    if ($Prompt.IndexOf('"verdict"', [System.StringComparison]::Ordinal) -lt 0) { return $false }
-    $stack = New-Object System.Collections.Generic.List[object]
-    $inStr = $false; $esc = $false; $strStart = -1; $strPrev = [char]0; $pendingKey = $false
-    for ($i = $Prompt.IndexOf('{'); $i -ge 0 -and $i -lt $Prompt.Length; $i++) {
-        $ch = $Prompt[$i]
-        if ($stack.Count -eq 0) {
-            if ($ch -ceq '{') { $stack.Add(@{ kind = [char]'{'; last = [char]'{'; hasKey = $false }) }
+    # r7 pass 1 (adversary A2): the scan is ANCHORED ON EACH KEY, never on string state carried in from earlier prose. A
+    # single left-to-right scan let a stray prose quote inside a stray brace (with or without a backslash before the line
+    # break) swallow the later object, so its demand was lost and a keyless answer was booked complete. Per occurrence of
+    # '"verdict"' + optional whitespace + ':' (case-exact):
+    #   1. member-name position: the previous non-whitespace character is '{' or ',';
+    #   2. after a ',', scanning BACK the nearest unmatched opener is '{' (not '[', not none): the comma is in an object;
+    #   3. scanning FORWARD from the colon, the first unmatched closer is '}' (an unclosed brace never spelled an object).
+    # Each scan starts at the key, where the string state is known, so prose before the object cannot reach it. Prompt text
+    # is prose around the spelled object, so the scans are lenient where JSON is strict: a raw CR or LF always ends a string
+    # (an escape never carries across it), a mismatched nested closer is ignored, and values need not be valid JSON
+    # ("APPROVE"|"CHANGES_REQUESTED", <placeholder>, ...). Cost: one regex pass plus two bounded scans per member-position key.
+    foreach ($m in [regex]::Matches($Prompt, '"verdict"\s*:')) {
+        $j = $m.Index - 1
+        while ($j -ge 0 -and [char]::IsWhiteSpace($Prompt[$j])) { $j-- }
+        if ($j -lt 0) { continue }
+        if ($Prompt[$j] -cne '{') {
+            if ($Prompt[$j] -cne ',') { continue }
+            if ((Find-LanePromptOpenerBefore -Text $Prompt -Index $j) -cne '{') { continue }
+        }
+        if (Test-LanePromptObjectClosesAfter -Text $Prompt -Start ($m.Index + $m.Length)) { return $true }
+    }
+    return $false
+}
+
+# The nearest UNMATCHED opener ('{' or '[') before $Index, string-aware scanning backward; '' when there is none. A quote
+# escaped by an odd run of backslashes is content; a raw CR or LF ends any string (a JSON string never spans one).
+function Find-LanePromptOpenerBefore {
+    param([string]$Text, [int]$Index)
+    $owed = New-Object System.Collections.Generic.Stack[char]; $inStr = $false
+    for ($b = $Index - 1; $b -ge 0; $b--) {
+        $ch = $Text[$b]
+        if ($ch -ceq [char]10 -or $ch -ceq [char]13) { $inStr = $false; continue }
+        if ($ch -ceq [char]34) {
+            $n = 0; $t = $b - 1
+            while ($t -ge 0 -and $Text[$t] -ceq [char]92) { $n++; $t-- }
+            if ($n % 2 -eq 0) { $inStr = -not $inStr }
             continue
         }
-        $top = $stack[$stack.Count - 1]
+        if ($inStr) { continue }
+        if ($ch -ceq '}' -or $ch -ceq ']') { $owed.Push($ch); continue }
+        if ($ch -ceq '{' -or $ch -ceq '[') {
+            if ($owed.Count -eq 0) { return [string]$ch }
+            $want = if ($ch -ceq '{') { [char]'}' } else { [char]']' }
+            if ($owed.Peek() -ceq $want) { [void]$owed.Pop() }
+        }
+    }
+    return ''
+}
+
+# True when, scanning FORWARD from $Start (outside any string), the first unmatched closer is '}': the object that holds the
+# key closes. ']' first (the key sat in an array) or the end of the text (never closed) is $false.
+function Test-LanePromptObjectClosesAfter {
+    param([string]$Text, [int]$Start)
+    $owed = New-Object System.Collections.Generic.Stack[char]; $inStr = $false; $esc = $false
+    for ($f = $Start; $f -lt $Text.Length; $f++) {
+        $ch = $Text[$f]
+        if ($ch -ceq [char]10 -or $ch -ceq [char]13) { $inStr = $false; $esc = $false; continue }
         if ($inStr) {
-            if ($esc) { $esc = $false; continue }
-            if ($ch -ceq [char]92) { $esc = $true; continue }
-            if ($ch -ceq [char]10 -or $ch -ceq [char]13) { $inStr = $false; $top.last = [char]34; continue }
-            if ($ch -ceq [char]34) {
-                $inStr = $false; $top.last = [char]34
-                $pendingKey = ($top.kind -ceq '{' -and ($strPrev -ceq '{' -or $strPrev -ceq ',') -and
-                    [string]::Equals($Prompt.Substring($strStart + 1, $i - $strStart - 1), 'verdict', [System.StringComparison]::Ordinal))
-            }
+            if ($esc) { $esc = $false } elseif ($ch -ceq [char]92) { $esc = $true } elseif ($ch -ceq [char]34) { $inStr = $false }
             continue
         }
-        if ([char]::IsWhiteSpace($ch)) { continue }
-        if ($pendingKey) { $pendingKey = $false; if ($ch -ceq ':') { $top.hasKey = $true } }
-        if ($ch -ceq [char]34) { $inStr = $true; $strStart = $i; $strPrev = $top.last; continue }
-        if ($ch -ceq '{' -or $ch -ceq '[') { $stack.Add(@{ kind = $ch; last = $ch; hasKey = $false }); continue }
-        if (($ch -ceq '}' -and $top.kind -ceq '{') -or ($ch -ceq ']' -and $top.kind -ceq '[')) {
-            if ($top.hasKey) { return $true }
-            $stack.RemoveAt($stack.Count - 1)
-            if ($stack.Count -gt 0) { $stack[$stack.Count - 1].last = $ch }
-            continue
+        if ($ch -ceq [char]34) { $inStr = $true; continue }
+        if ($ch -ceq '{') { $owed.Push([char]'}'); continue }
+        if ($ch -ceq '[') { $owed.Push([char]']'); continue }
+        if ($ch -ceq '}' -or $ch -ceq ']') {
+            if ($owed.Count -eq 0) { return ($ch -ceq '}') }
+            if ($owed.Peek() -ceq $ch) { [void]$owed.Pop() }
         }
-        $top.last = $ch
     }
     return $false
 }
@@ -448,24 +525,28 @@ function Get-LaneLastTopLevelJson {
     param([AllowEmptyString()][AllowNull()][string]$Text)
     if ([string]::IsNullOrEmpty($Text)) { return $null }
     # r7 (Dot B1 class): a value starts after any BLANK line prefix, not only space / tab, so U+00A0 + '{"findings":[]}' after a
-    # fenced approval is the last value and outranks it instead of being skipped as prose.
-    $rx = $script:LANE_TOP_LEVEL_RX
+    # fenced approval is the last value and outranks it instead of being skipped as prose. Line starts are position 0 and
+    # every position after an LF (the multiline '^' this scan used before r7); the prefix is judged per code point.
     $p = 0; $start = -1; $end = -1
     while ($p -lt $Text.Length) {
-        $m = $rx.Match($Text, $p)
-        if (-not $m.Success) { break }
-        $s = $m.Index + $m.Length - 1
-        if ($Text[$s] -ceq [char]34) {
+        $s = $p
+        if ((Test-LaneBlankAt -Text $Text -Index $p) -gt 0) { $s = $p + (Get-LaneBlankPrefixLength -Text $Text -Start $p -StopAtLineBreak) }
+        $q = $s
+        if ($s -lt $Text.Length -and $Text[$s] -ceq [char]34) {
             $eol = $Text.IndexOfAny([char[]](10, 13), $s)
             if ($eol -lt 0) { $eol = $Text.Length }
             if (Test-LaneUnterminatedStringLine -Line $Text.Substring($s, $eol - $s)) { $start = $s; $end = -1; break }
-            $p = $eol
-            continue
+            $q = $eol
+        } elseif ($s -lt $Text.Length -and ($Text[$s] -ceq '{' -or $Text[$s] -ceq '[')) {
+            $e = Find-LaneJsonValueEnd -Text $Text -Start $s
+            $start = $s; $end = $e
+            if ($e -lt 0) { break }
+            $q = $e + 1
         }
-        $e = Find-LaneJsonValueEnd -Text $Text -Start $s
-        $start = $s; $end = $e
-        if ($e -lt 0) { break }
-        $p = $e + 1
+        if ($q -ge $Text.Length) { break }
+        $nl = $Text.IndexOf([char]10, $q)
+        if ($nl -lt 0) { break }
+        $p = $nl + 1
     }
     if ($start -lt 0) { return $null }
     $tailText = $Text.Substring($start)
@@ -521,9 +602,8 @@ function Get-LaneTerminalCandidate {
         $ln = $lines[$i]
         if (-not $inBlock) {
             # r7: a fence line may be indented by any BLANK characters (one definition on this path), open and close alike
-            $fm = $script:LANE_FENCE_OPEN_RX.Match($ln)
-            if ($fm.Success) {
-                $marker = $fm.Groups[1].Value
+            $marker = Get-LaneFenceMarker -Line $ln
+            if ($null -ne $marker) {
                 $enclosing = Get-LaneLastTopLevelJson -Text ($unf -join "`n")
                 if ($null -ne $enclosing -and -not $enclosing.closed) { $unf.Add($ln); continue }
                 $inBlock = $true; $fenceChar = $marker.Substring(0, 1); $fenceLen = $marker.Length
@@ -533,8 +613,8 @@ function Get-LaneTerminalCandidate {
             $unf.Add($ln)
             continue
         }
-        $fc = $script:LANE_FENCE_CLOSE_RX.Match($ln)
-        if ($fc.Success -and $fc.Groups[1].Value.Substring(0, 1) -ceq $fenceChar -and $fc.Groups[1].Value.Length -ge $fenceLen) {
+        $fc = Get-LaneFenceMarker -Line $ln -Close
+        if ($null -ne $fc -and $fc.Substring(0, 1) -ceq $fenceChar -and $fc.Length -ge $fenceLen) {
             $inBlock = $false
             $lastFence = [pscustomobject]@{ text = ($cur -join "`n"); startLine = $curStart; endLine = $i }
             $unf.Clear()
