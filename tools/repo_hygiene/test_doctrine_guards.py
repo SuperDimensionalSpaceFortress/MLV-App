@@ -73,8 +73,10 @@ NON-PROMISES:
   (user-scope hooks are never tracked; prove those by a receipt).
 - DG-RED-MUTATION-VERDICT checks the CHECKER, not any mutation run: the tracked corpus
   tools/repo_hygiene/red_mutation_verdict_corpus.json pins what red_mutation_verdict.verdict() and
-  probe_discriminates() must answer for 21 cases (the PR #705 2.8 s probe among them), and the guard fails when
-  one answer drifts or the corpus holds no PASS or no REFUSED case of a kind. Saved mutation output lives in
+  probe_discriminates() must answer for every tracked case (the PR #705 probes among them, at the readings measured in
+  powershell.exe 5.1), and the guard fails when one answer drifts, when a REFUSED case is refused for a reason other than
+  the `reason` it records (a substring of the refusal; a REFUSED case with no `reason` is a malformed corpus), or when the
+  corpus holds no PASS or no REFUSED case of a kind. Saved mutation output lives in
   untracked .claude-state run dirs, so there is no live-tree evidence to scan; a lane runs
   `py -3 tools/repo_hygiene/red_mutation_verdict.py verdict --output red.txt --expect <file:line>` on its own
   red.txt. The checker's own limits are its module docstring NON-PROMISES (text only, default unittest and
@@ -702,6 +704,10 @@ def check_red_mutation_verdict(root: Path, rel_paths: list[str]) -> list[Violati
                 kind, want = case["kind"], case["expect"]
                 if want not in (red_mutation_verdict.PASS, red_mutation_verdict.REFUSED):
                     raise ValueError(f"expect must be PASS or REFUSED, got {want!r}")
+                reason = case.get("reason")
+                if want == red_mutation_verdict.REFUSED and (not isinstance(reason, str) or not reason.strip()):
+                    # r8 (R7-T1): a REFUSED answer alone is satisfied by a case that is refused for the wrong reason.
+                    raise ValueError("a REFUSED case needs a non-empty string `reason` (a substring of its refusal)")
                 if kind == "verdict":
                     if not isinstance(case["output"], str) or not isinstance(case["expected_assertion"], str):
                         raise TypeError("output and expected_assertion must be strings")
@@ -721,6 +727,10 @@ def check_red_mutation_verdict(root: Path, rel_paths: list[str]) -> list[Violati
             if got != want:
                 out.append(Violation("DG-RED-MUTATION-VERDICT", rel, index,
                                      f"case {case.get('id')!r}: expected {want}, checker said {got} ({why})"))
+            elif want == red_mutation_verdict.REFUSED and reason not in why:
+                out.append(Violation("DG-RED-MUTATION-VERDICT", rel, index,
+                                     f"case {case.get('id')!r}: refused, but not for its recorded reason {reason!r} "
+                                     f"(checker said: {why})"))
         for kind in ("verdict", "probe"):
             for want in (red_mutation_verdict.PASS, red_mutation_verdict.REFUSED):
                 if (kind, want) not in seen:
@@ -986,12 +996,13 @@ FIXTURES: dict[str, dict[str, dict[str, str]]] = {
     "DG-RED-MUTATION-VERDICT": {
         "red": {
             # Two cases whose recorded answer is wrong: a red run with no named assertion is not a PASS, and
-            # the PR #705 probe (bug and fix both read 3) does not discriminate. No REFUSED case of either
+            # the PR #705 probe as the bus trap records it (the test rounded, so bug and fix both read 3) does not
+            # discriminate. No REFUSED case of either
             # kind, so the "always answers PASS" checker would also go unnoticed: line 1 reports that too.
             RED_MUTATION_CORPUS: json.dumps({"cases": [
                 {"id": "red-no-assertion", "kind": "verdict", "expect": "PASS",
                  "output": "Ran 1 test in 0.001s\n\nFAILED (failures=1)\n", "expected_assertion": "t.py:1"},
-                {"id": "probe-705", "kind": "probe", "expect": "PASS",
+                {"id": "probe-705-display-rounded", "kind": "probe", "expect": "PASS",
                  "bug_value": 3, "fix_value": 3, "window": [3, 3]},
             ]}),
         },
@@ -1003,12 +1014,17 @@ FIXTURES: dict[str, dict[str, dict[str, str]]] = {
                             "    self.assertEqual(3, 4)\nAssertionError: 3 != 4\n\n" + "-" * 70
                             + "\nRan 1 test in 0.001s\n\nFAILED (failures=1)\n"),
                  "expected_assertion": "t.py:8"},
-                {"id": "red-no-assertion", "kind": "verdict", "expect": "REFUSED",
+                {"id": "red-no-assertion", "kind": "verdict", "expect": "REFUSED", "reason": "names no failing assertion",
                  "output": "Ran 1 test in 0.001s\n\nFAILED (failures=1)\n", "expected_assertion": "t.py:8"},
-                {"id": "probe-705-2.8s", "kind": "probe", "expect": "REFUSED",
+                {"id": "probe-705-display-rounded", "kind": "probe", "expect": "REFUSED", "reason": "both sit inside",
                  "bug_value": 3, "fix_value": 3, "window": [3, 3]},
-                {"id": "probe-705-2.2s", "kind": "probe", "expect": "PASS",
-                 "bug_value": 3, "fix_value": 2.2, "window": [2.0, 2.5]},
+                # Measured in powershell.exe 5.1.19041.6456: [Math]::Min(330, 2.2) is Int32 2 and [Math]::Min(330.0, 2.2) is
+                # Double 2.2, both inside [2.0, 2.5], so this probe cannot tell the overloads apart.
+                {"id": "probe-705-2.2s", "kind": "probe", "expect": "REFUSED", "reason": "both sit inside",
+                 "bug_value": 2, "fix_value": 2.2, "window": [2.0, 2.5]},
+                # The separating control: [Math]::Min(330, 2.8) is Int32 3 and [Math]::Min(330.0, 2.8) is Double 2.8.
+                {"id": "probe-705-2.8s-raw-readings", "kind": "probe", "expect": "PASS",
+                 "bug_value": 3, "fix_value": 2.8, "window": [2.7, 2.9]},
             ]}),
         },
     },
@@ -1281,7 +1297,7 @@ class GuardFixtureTests(_PwshMixin, unittest.TestCase):
         guard = GUARDS["DG-RED-MUTATION-VERDICT"]
         # refused, but NOT because the run is green: its summary lists no PASSED line for the pass the runner counts
         text = "=== short test summary info ===\nFAILED t.py::test_x - assert False\n=== 1 failed, 1 passed in 0.1s ===\n"
-        wrong = {"id": "wrong-reason", "kind": "verdict", "expect": "REFUSED", "reason": "the run is red but not at",
+        wrong = {"id": "wrong-reason", "kind": "verdict", "expect": "REFUSED", "reason": "the run is green",
                  "output": text, "expected_assertion": "other.py::test_x"}
         right = {**wrong, "id": "right-reason", "reason": "-rA"}
         others = [{"id": "p", "kind": "verdict", "expect": "PASS", "expected_assertion": "t.py::test_x",
@@ -1313,10 +1329,11 @@ class GuardFixtureTests(_PwshMixin, unittest.TestCase):
         # adversary r5 pass 9 A2: json.loads turns 1e-400 into 0.0 and 1e400 into inf before the checker sees them,
         # so a probe recorded as PASS on a number no float can hold used to satisfy the guard.
         guard = GUARDS["DG-RED-MUTATION-VERDICT"]
-        verdicts = [{"kind": "verdict", "expect": "REFUSED", "output": "Ran 1 test\n\nOK\n", "expected_assertion": "a.py:1"},
+        verdicts = [{"kind": "verdict", "expect": "REFUSED", "reason": "the run is green", "output": "Ran 1 test\n\nOK\n",
+                     "expected_assertion": "a.py:1"},
                     {"kind": "verdict", "expect": "PASS", "expected_assertion": "t.py::test_x",
                      "output": "=== short test summary info ===\nFAILED t.py::test_x - assert False\n=== 1 failed in 0.1s ===\n"}]
-        refused = {"kind": "probe", "expect": "REFUSED", "bug_value": 1, "fix_value": 1, "window": [1, 1]}
+        refused = {"kind": "probe", "expect": "REFUSED", "reason": "both sit inside", "bug_value": 1, "fix_value": 1, "window": [1, 1]}
 
         def corpus(spelled_probe: str) -> str:
             return json.dumps({"cases": verdicts + [refused]})[:-2] + ", " + spelled_probe + "]}"

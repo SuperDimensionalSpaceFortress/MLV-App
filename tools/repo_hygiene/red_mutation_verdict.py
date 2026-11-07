@@ -330,10 +330,16 @@ def _ut_identities(rest: str) -> list[tuple[str, str]]:
     found: list[tuple[str, str]] = []
     for i in (m.start() for m in re.finditer(r" \(", rest)):
         name, tail = rest[:i], rest[i + 2:]
-        for j in (m.start() for m in re.finditer(r"\)", tail)):
-            ident, after = tail[:j], tail[j + 1:]
-            if ident.endswith("." + name) and (after == "" or re.fullmatch(r" \(.*\)", after)):
+        # Only a `)` preceded by `.name` can close a reading, so look for ".name)" itself instead of trying every `)`
+        # (r8, opus r7 RMV-UT-IDENTITIES-SCALING-1: a large subTest repr made the old pair loop quadratic).
+        needle = "." + name + ")"
+        k = tail.find(needle)
+        while k != -1:
+            end = k + len(needle)
+            ident, after = tail[:end - 1], tail[end:]
+            if after == "" or re.fullmatch(r" \(.*\)", after):
                 found.append((name, ident))
+            k = tail.find(needle, k + 1)
     return found
 
 
@@ -681,7 +687,8 @@ _UT_RAN = re.compile(r"^Ran \d+ tests? in ", re.M)
 def _count_mismatch(text: str, ut_blocks: int, stats: dict) -> str:
     """The runner states how many tests failed; every one must have been recognized as a block, section or summary
     line. A header this parser could not read (a multi-line test name) would otherwise drop its failure, an import
-    error included, without a trace. "" when the counts agree or the text states none.
+    error included, without a trace. "" when the counts agree, or when the text holds neither a failure nor a result
+    line (the plain checks refuse that as unrecognized). A text WITH failures and NO result line is never "" (r8).
 
     The pytest short summary is judged as a CLASS (r5 hub ruling), typed ``short-summary line``: a FAILED/ERROR line
     that does not split into exactly ``<file>::<name> - <message>`` (see _summary_problem), a line that starts with
@@ -694,6 +701,12 @@ def _count_mismatch(text: str, ut_blocks: int, stats: dict) -> str:
     for m in _RESULT_LINE.finditer(text):
         last = m.group(0).strip()
     if last is None:
+        if ut_blocks or stats["sections"] or stats["has_summary"] or stats["summary"]:
+            # R7-C1 (r8): failures were read but nothing closes the run, so the runner's own counts are missing and a
+            # later failure (an import error included) may have been cut from the log. A terminal result is required
+            # on every path; text with no failure and no result is refused by the plain checks as unrecognized.
+            return ("no final result line (unittest `Ran N tests` + `OK`/`FAILED (...)`, or a pytest `=== N failed ... ===` "
+                    "bar): a cut-off log cannot be reconciled with the runner's counts")
         return ""
     if last.startswith("FAILED (") and _UT_RAN.search(text):
         want = sum(int(n) for _kind, n in _UT_COUNTS.findall(last))
@@ -870,6 +883,8 @@ def _cli_num(v: str) -> object:
 def probe_discriminates(bug_value: float, fix_value: float, window: tuple[float, float]) -> tuple[bool, str]:
     """True only when the FIX reading is inside the closed window and the BUG reading is outside."""
     try:
+        if type(window) not in (list, tuple) or len(window) != 2:  # a dict's keys or a 2-character string are not bounds
+            raise TypeError("window must be a list or tuple of exactly two bounds")
         lo, hi = window
         bug_value, fix_value, lo, hi = _num(bug_value), _num(fix_value), _num(lo), _num(hi)
     except (TypeError, ValueError, OverflowError):
