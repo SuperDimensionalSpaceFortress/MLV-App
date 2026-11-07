@@ -3139,19 +3139,22 @@ void MainWindow::timerEvent(QTimerEvent *t)
 // used to be `while( m_frameStillDrawing ) qApp->processEvents();`: a stale-true flag (nothing left in flight to clear
 // it) pumped the GUI thread forever after the smoke runner's showFullScreen() resize. A flag still set while the render
 // thread has stayed idle for the grace window is stale and is cleared; a busy render thread is waited on up to the
-// deadline, then the redraw proceeds. One always-on line whenever it actually waited.
-void MainWindow::waitForResizeStillDrawing( const QString &site )
+// deadline, then the redraw proceeds. One always-on line whenever it actually waited. The pump defers user input
+// (adversary r1 A1): a shortcut's modal dialog would run a nested loop inside one pump that the deadline cannot bound;
+// the input is delivered by the next unfiltered pass of the event loop. Returns false on Timeout (the frame asked for
+// has not landed, so the scene still has the old geometry), true otherwise.
+bool MainWindow::waitForResizeStillDrawing( const QString &site )
 {
     QElapsedTimer clock;
     clock.start();
     resize_still_drawing_wait::Callbacks callbacks;
     callbacks.stillDrawing = [this]() { return m_frameStillDrawing; };
     callbacks.renderIdle = [this]() { return !renderThreadBusyForPlaybackAdvance( currentPlaybackAdvanceTarget() ); };
-    callbacks.pump = []() { qApp->processEvents(); };
+    callbacks.pump = []() { qApp->processEvents( QEventLoop::ExcludeUserInputEvents ); };
     callbacks.clearStale = [this]() { m_frameStillDrawing = false; };
     callbacks.nowMs = [&clock]() { return static_cast<std::int64_t>( clock.elapsed() ); };
     const resize_still_drawing_wait::Result result = resize_still_drawing_wait::wait( callbacks );
-    if( result.outcome == resize_still_drawing_wait::Outcome::NotWaiting ) return;
+    if( result.outcome == resize_still_drawing_wait::Outcome::NotWaiting ) return true;
     logInteractionEvent(
         QStringLiteral("resize.still_drawing_wait"),
         QStringLiteral("outcome=%1 waited_ms=%2 site=%3 render_idle=%4")
@@ -3159,6 +3162,7 @@ void MainWindow::waitForResizeStillDrawing( const QString &site )
             .arg( static_cast<qlonglong>( result.waitedMs ) )
             .arg( site )
             .arg( bool01( result.renderIdle ) ) );
+    return result.outcome != resize_still_drawing_wait::Outcome::Timeout;
 }
 
 //Window resized -> scale picture
@@ -3203,11 +3207,19 @@ void MainWindow::resizeEvent(QResizeEvent *event)
         drawFrame();
         if( ui->checkBoxGradientEnable->isChecked() && ui->groupBoxLinearGradient->isChecked() )
         {
-            waitForResizeStillDrawing( QStringLiteral("gradient") );
-            m_pGradientElement->redrawGradientElement( m_pScene->width(),
-                                                       m_pScene->height(),
-                                                       getMlvWidth( m_pMlvObject ),
-                                                       getMlvHeight( m_pMlvObject ) );
+            if( waitForResizeStillDrawing( QStringLiteral("gradient") ) )
+            {
+                m_pGradientElement->redrawGradientElement( m_pScene->width(),
+                                                           m_pScene->height(),
+                                                           getMlvWidth( m_pMlvObject ),
+                                                           getMlvHeight( m_pMlvObject ) );
+            }
+            else
+            {
+                // Timeout: the frame drawFrame() asked for has not landed and the scene keeps its old geometry, so the
+                // frame-ready path (finishPresentedFrame) redraws the gradient on the landed scene (adversary r1 A2).
+                m_zoomModeChanged = true;
+            }
         }
     }
     event->accept();

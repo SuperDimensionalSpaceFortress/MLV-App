@@ -12,6 +12,9 @@
 //     >= kStaleIdleGraceMs             -> clearStale() once, StaleCleared
 //   - kDeadlineMs since entry          -> Timeout (the caller proceeds; this never blocks)
 // A busy render thread is never forged clear: it only ever times out.
+// The deadline is checked after every pump, so a pump that outlasts it ends the wait with no further pump; a pump
+// that never returns is outside any bound here, so the caller's pump must not dispatch user input (a shortcut's modal
+// dialog runs a nested loop): MainWindow pumps with QEventLoop::ExcludeUserInputEvents (adversary r1 A1).
 
 #include <cstdint>
 #include <functional>
