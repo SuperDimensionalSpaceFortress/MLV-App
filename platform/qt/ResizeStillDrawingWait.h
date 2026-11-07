@@ -70,6 +70,14 @@ inline const char *outcomeName( Outcome outcome )
     return "unknown";
 }
 
+// The gradient re-anchor's request-serial floor (MainWindow::m_gradientReanchorSerialFloor) only ever rises while it is
+// armed: an arm that saved its floor earlier (resizeEvent takes it before drawFrame(), then waits, pumping) must not
+// lower a floor a newer geometry change armed during that wait (adversary r2 pass 2 A1).
+inline std::uint64_t raisedReanchorFloor( std::uint64_t current, std::uint64_t candidate )
+{
+    return candidate > current ? candidate : current;
+}
+
 inline Result wait( const Callbacks &callbacks )
 {
     Result result;

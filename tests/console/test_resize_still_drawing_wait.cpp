@@ -282,7 +282,8 @@ TEST(ResizeStillDrawingWaitWiring, TheGradientReanchorIsConsumedOnlyByAFrameRequ
     const int floorAt = body.indexOf(QStringLiteral(
         "const uint64_t gradientReanchorSerialFloor = m_nextRenderRequestSerial;"));
     const int drawAt = body.indexOf(QStringLiteral("drawFrame();"));
-    const int armAt = body.indexOf(QStringLiteral("m_gradientReanchorSerialFloor = gradientReanchorSerialFloor;"));
+    const int armAt = body.indexOf(QStringLiteral(
+        "raisedReanchorFloor( m_gradientReanchorSerialFloor, gradientReanchorSerialFloor );"));
     const int gradientIf = body.indexOf(QStringLiteral("if( waitForResizeStillDrawing( QStringLiteral(\"gradient\") ) )"));
     ASSERT_TRUE(floorAt >= 0);
     ASSERT_TRUE(drawAt > floorAt);
@@ -298,6 +299,32 @@ TEST(ResizeStillDrawingWaitWiring, TheGradientReanchorIsConsumedOnlyByAFrameRequ
     ASSERT_FALSE(finish.isEmpty());
     ASSERT_TRUE(finish.contains(QStringLiteral(
         "readyFrame.requestSerial >= m_gradientReanchorSerialFloor")));
+}
+
+// adversary r2 pass 2 A1: resizeEvent saves floor 100 before drawFrame(), then waits; a stretch change dispatched inside
+// that wait (a nested loop) arms floor 101. The resize arm must not lower it back to 100, or old request 100 consumes the
+// re-anchor on the old scene. The floor only rises; every arm site goes through the one helper.
+TEST(ResizeStillDrawingWait, TheReanchorFloorOnlyRises)
+{
+    using resize_still_drawing_wait::raisedReanchorFloor;
+    ASSERT_EQ(static_cast<std::uint64_t>(101), raisedReanchorFloor(101, 100)); // the adversary's input
+    ASSERT_EQ(static_cast<std::uint64_t>(101), raisedReanchorFloor(100, 101));
+    ASSERT_EQ(static_cast<std::uint64_t>(7), raisedReanchorFloor(7, 7));
+    ASSERT_EQ(static_cast<std::uint64_t>(1), raisedReanchorFloor(0, 1));
+}
+
+TEST(ResizeStillDrawingWaitWiring, EveryReanchorArmRaisesTheFloorAndNeverAssignsItDirectly)
+{
+    const QString source = readRepoFile(QStringLiteral("platform/qt/MainWindow.cpp"));
+    ASSERT_FALSE(source.isEmpty());
+    const QString raised = QStringLiteral(
+        "m_gradientReanchorSerialFloor = resize_still_drawing_wait::raisedReanchorFloor( m_gradientReanchorSerialFloor,");
+    const int arms = source.count(QStringLiteral("m_zoomModeChanged = true;"));
+    ASSERT_TRUE(arms >= 4);
+    ASSERT_EQ(arms, source.count(raised));
+    ASSERT_EQ(arms, source.count(QStringLiteral("m_gradientReanchorSerialFloor = ")));
+    const QString body = resizeEventBody();
+    ASSERT_TRUE(body.contains(raised + QStringLiteral(" gradientReanchorSerialFloor );")));
 }
 
 // adversary r1 re-pass A1: a handler the pump dispatches (Updater::getReleaseList's processEvents() loop) can run its
