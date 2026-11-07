@@ -566,6 +566,149 @@ class NarrowedPromiseR4(unittest.TestCase):
             self.assertIn(word, rmv.__doc__)
 
 
+def _forged_id_conftest(first_line: str, tail: str, only: str = "test_other") -> str:
+    """A conftest that gives the test named `only` a node id of `first_line`, a line break, then `tail` + its name, so
+    the REAL runner prints a multi-line id (the shape a forged continuation line takes)."""
+    return ("def pytest_collection_modifyitems(items):\n    for item in items:\n"
+            f"        if item.name == {only!r}:\n"
+            f"            item._nodeid = {first_line + chr(10) + tail!r} + item.name\n")
+
+
+class AllowlistR7(unittest.TestCase):
+    """r7 HUB RULING (structural stop): the short-summary and numeric readers are ALLOWLISTS. PASS needs every input in
+    an enumerated readable shape from a run made with -rA; anything else is COULD-NOT-CHECK. One RED->GREEN case per
+    finding (Dot A1/A2, r6 OPEN A1-A5), each with a control showing that a readable shape is still judged. Real-runner
+    cases run at two terminal widths, because the r6 defect depended on it."""
+
+    WIDTHS = (80, 200)
+
+    def cnc(self, out: str, want: str, word: str) -> None:
+        status, reason = rmv.verdict(out, want)
+        self.assertEqual(status, rmv.REFUSED, f"{want}: {reason}\n{out}")
+        self.assertIn("COULD-NOT-CHECK", reason, out)
+        self.assertIn(word, reason, out)
+
+    # ---- Dot A1: a forged PASSED count that matches the real omitted pass total -------------------------------
+    def test_dot_a1_forged_passed_continuation_with_a_real_omitted_pass_is_refused(self) -> None:
+        ok = "def test_ok(): pass\n"
+        for columns in self.WIDTHS:
+            # the negative: ONE ordinary passing test, DEFAULT reporting (it omits PASSED lines), --tb=no
+            conftest = _forged_id_conftest("fake.py::test_expected - AssertionError", "PASSED real/test_real.py::")
+            out = _run_pytest({"conftest.py": conftest, "test_real.py": "def test_other(): raise TypeError('boom')\n" + ok},
+                              "--tb=no", columns=columns)
+            self.assertIn("1 failed, 1 passed", out)
+            self.assertNotIn("PASSED real/test_real.py::test_ok", out)  # the real pass has no line of its own
+            self.cnc(out, "fake.py::test_expected", "short-summary line")
+        # the same text without the ' - ' that the older rule keyed on: the forged line is exactly a real PASSED line
+        forged = ("=== short test summary info ===\nFAILED fake.py::test_expected - AssertionError\n"
+                  "PASSED real.py::test_ok\n=== 1 failed, 1 passed in 0.1s ===\n")
+        self.cnc(forged, "fake.py::test_expected", "short-summary line")
+        # default reporting alone: a run that counts a pass but lists none cannot be reconciled
+        plain = ("=== short test summary info ===\nFAILED t.py::test_x - AssertionError\n"
+                 "=== 1 failed, 1 passed in 0.1s ===\n")
+        self.cnc(plain, "t.py::test_x", "-rA")
+
+    def test_dot_a1_control_a_genuine_rA_run_is_still_judged(self) -> None:
+        src = "def test_expected(): assert False\ndef test_ok(): pass\n"
+        for columns in self.WIDTHS:
+            out = _run_pytest({"test_t.py": src}, "-rA", "--tb=no", columns=columns)
+            self.assertIn("PASSED test_t.py::test_ok", out)
+            self.assertEqual(rmv.verdict(out, "test_t.py::test_expected")[0], rmv.PASS, out)
+            plain = _run_pytest({"test_t.py": "def test_expected(): assert False\n"}, "--tb=no", columns=columns)
+            self.assertEqual(rmv.verdict(plain, "test_t.py::test_expected")[0], rmv.PASS, plain)  # no pass to hide
+
+    # ---- r6 OPEN A1: XFAIL / XPASS continuation of a multi-line id --------------------------------------------
+    def test_r6_open_a1_xfail_and_xpass_continuations_are_out_of_order_and_refused(self) -> None:
+        for word, label in (("XFAIL", "xfailed"), ("XPASS", "xpassed")):
+            text = ("=== short test summary info ===\nFAILED fake.py::test_expected - AssertionError\n"
+                    f"{word} real.py::test_other - TypeError: boom\n=== 1 failed, 1 {label} in 0.1s ===\n")
+            self.cnc(text, "fake.py::test_expected", "short-summary line")
+            for columns in self.WIDTHS:  # the real runner, with -rf hiding the genuine xfail/xpass
+                extra = ("import pytest\n@pytest.mark.xfail(reason='r')\ndef test_g(): "
+                         + ("assert False\n" if word == "XFAIL" else "pass\n"))
+                conftest = _forged_id_conftest("fake.py::test_expected - AssertionError", f"{word} real/test_real.py::")
+                out = _run_pytest({"conftest.py": conftest,
+                                   "test_real.py": "def test_other(): raise TypeError('boom')\n" + extra},
+                                  "--tb=no", "-rf", columns=columns)
+                self.assertIn(f"1 {label}", out)
+                self.cnc(out, "fake.py::test_expected", "short-summary line")
+
+    # ---- r6 OPEN A2: a result-shaped rule line inside a multi-line id ------------------------------------------
+    def test_r6_open_a2_a_result_shaped_rule_inside_an_id_is_refused(self) -> None:
+        text = ("=== short test summary info ===\nFAILED fake.py::test_expected - AssertionError\n"
+                "=== 1 failed in 0.1s ===\nreal.py::test_other - TypeError: boom\n=== 1 failed in 0.2s ===\n")
+        self.cnc(text, "fake.py::test_expected", "short-summary line")
+        for columns in self.WIDTHS:
+            conftest = _forged_id_conftest("fake.py::test_expected - AssertionError\n=== 1 failed in 0.1s ===", "real/test_real.py::")
+            out = _run_pytest({"conftest.py": conftest, "test_real.py": "def test_other(): raise TypeError('boom')\n"},
+                              "--tb=no", columns=columns)
+            self.assertIn("=== 1 failed in 0.1s ===", out)
+            self.cnc(out, "fake.py::test_expected", "short-summary line")
+        genuine = ("=== short test summary info ===\nFAILED t.py::test_x - AssertionError\n=== 1 failed in 0.1s ===\n")
+        self.assertEqual(rmv.verdict(genuine, "t.py::test_x")[0], rmv.PASS, genuine)  # control: one final bar is fine
+
+    # ---- r6 OPEN A3: the exception name must be exactly one on the fixed list -----------------------------------
+    def test_r6_open_a3_only_exact_builtin_names_are_read(self) -> None:
+        def run(msg: str) -> str:
+            return ("=== short test summary info ===\nFAILED t.py::test_expected - AssertionError\n"
+                    f"FAILED t.py::test_other - {msg}\n=== 2 failed in 0.1s ===\n")
+        for msg in ("UserWarning: boom", "builtins.TypeError: boom", "t.AssertionError: boom", "MyError: boom",
+                    "TypeError(boom)"):
+            self.cnc(run(msg), "t.py::test_expected", "exception type")
+        # an ExceptionGroup is not on the list either; the older import-blocking rule answers first
+        self.assertEqual(rmv.verdict(run("ExceptionGroup: deps (1 sub-exception)"), "t.py::test_expected")[0], rmv.REFUSED)
+        self.assertEqual(rmv.verdict(run("TypeError: boom"), "t.py::test_expected")[0], rmv.PASS)  # control
+        self.assertEqual(rmv.verdict(run("KeyError"), "t.py::test_expected")[0], rmv.PASS)  # no message is still a name
+        for columns in self.WIDTHS:  # a class that SHADOWS a builtin name prints module-qualified from the real runner
+            src = "class AssertionError(ImportError): pass\ndef test_expected(): assert False\n" \
+                  "def test_import(): raise AssertionError('missing')\n"
+            out = _run_pytest({"test_memory.py": src}, "--tb=no", columns=columns)
+            self.assertIn("test_memory.AssertionError: missing", out)
+            self.cnc(out, "test_memory.py::test_expected", "exception type")
+
+    # ---- Dot A2 / r6 OPEN A4 / A5: numbers ----------------------------------------------------------------------
+    def test_dot_a2_numeric_objects_are_refused_before_any_conversion(self) -> None:
+        from decimal import Decimal
+        from fractions import Fraction
+
+        class Floaty:  # numpy-like: a scalar object with __float__
+            def __init__(self, x: float) -> None:
+                self.x = x
+
+            def __float__(self) -> float:
+                return self.x
+
+        for bug, fix, window in (
+                (1, Decimal("1e-400"), (0, 0)), (1, Fraction(1, 10 ** 400), (0, 0)), (1, Decimal("-1e-400"), (0, 0)),
+                (1, 0, (Decimal("1e-400"), Decimal("1e-400"))), (0, 1, (1, Decimal("1e400"))),
+                (1, Decimal("5E-324"), (Decimal("5E-324"), 1)),  # survives conversion, still not an allowlisted type
+                (Decimal("0.5"), 3, (1, 5)), (Fraction(1, 2), 3, (1, 5)), (Floaty(1.0), 3, (1, 5)), (True, 3, (1, 5))):
+            ok, why = rmv.probe_discriminates(bug, fix, window)
+            self.assertFalse(ok, (bug, fix, window, why))
+            self.assertIn("COULD-NOT-CHECK", why, (bug, fix, window))
+        # controls: the allowlisted types are still judged, a real subnormal included
+        self.assertTrue(rmv.probe_discriminates(1, 5e-324, (5e-324, 1e-300))[0])
+        self.assertTrue(rmv.probe_discriminates(1, "5e-324", (5e-324, 1e-300))[0])
+        self.assertTrue(rmv.probe_discriminates(0.05, 3, (1, "5"))[0])
+        self.assertTrue(rmv.probe_discriminates(0, 5, (5, "inf"))[0])
+
+    def test_r6_open_a4_non_ascii_digits_and_separators_are_refused(self) -> None:
+        for bug, fix, lo, hi in (("1", "١e-400", "0", "0"),  # ARABIC-INDIC DIGIT ONE then e-400: float() reads 0.0
+                                 ("1", "１e-400", "0", "0"),  # FULLWIDTH DIGIT ONE
+                                 ("1", "1_0", "10", "10"), ("1", "2", "٢", "٢")):
+            self.assertEqual(rmv.main(["probe", "--bug", bug, "--fix", fix, "--window", lo, hi]), 1, (bug, fix, lo, hi))
+            ok, why = rmv.probe_discriminates(bug, fix, (lo, hi))
+            self.assertFalse(ok)
+            self.assertIn("COULD-NOT-CHECK", why)
+        self.assertEqual(rmv.main(["probe", "--bug", "1", "--fix", "2", "--window", "2", "2"]), 0)  # control: ASCII text
+
+    def test_r6_open_a5_decimal_and_fraction_overflow_and_underflow_are_refused(self) -> None:
+        from decimal import Decimal
+        from fractions import Fraction
+        for args in ((1, Decimal("1e-400"), (0, 0)), (1, Fraction(1, 10 ** 400), (0, 0)), (0, 1, (1, Decimal("1e400")))):
+            self.assertFalse(rmv.probe_discriminates(*args)[0], args)
+
+
 class VerdictOnText(unittest.TestCase):
     def test_red_without_a_named_assertion_is_refused(self) -> None:
         status, reason = rmv.verdict("Ran 3 tests in 0.1s\n\nFAILED (failures=1)\n", "a.py:1")

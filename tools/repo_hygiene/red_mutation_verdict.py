@@ -40,26 +40,33 @@ REFUSED with a reason that starts ``COULD-NOT-CHECK (<typed reason>)``. That is 
   ``2 failed``; a stated ``0`` is a count too) disagrees with the unittest failure blocks or the pytest failure sections that could be read. A
   header this parser cannot read (a test name holding a newline) would otherwise drop its failure, an ImportError
   included.
-* ``short-summary line`` (r5 CLASS RULE, hub ruling; replaces the one-by-one repairs of passes 6 and 7): ANY pytest
-  run in which a short-summary ``FAILED``/``ERROR`` line does not split into exactly ``<file.ext>::<name> -
-  <message>`` with a non-empty message (a multi-line node id, a ``WORD node`` longer than 74 characters, which pytest cuts
-  or drops the message of at its 80-column fallback width but not on a ``CI`` runner, so the line is judged before its
-  message is read and the verdict never depends on the terminal width (measured in terminal cells, an upper bound: a
-  non-ASCII character counts two; a ``=== x ===`` rule line inside the summary other than the final result bar, a
-  ``PASSED`` line holding `` - ``, and a ``SKIPPED`` line without ``[n] file:line: `` are forged continuations), a `` - `` inside a directory name, a
-  message cut to ``...`` before its exception type shows, a message that itself holds a ``<file>::<name>``; a module-level ``ERROR <file.ext> - <message>`` is the one
-  allowed shape without ``::name``), or whose number of such lines differs from the runner's own failed+errored
-  count, or that holds a summary line starting with no summary word, or whose ``PASSED``/``SKIPPED``/``XFAIL``/
-  ``XPASS`` lines do not add up to the runner's own passed/skipped/xfailed/xpassed count (a continuation line of a
-  multi-line id can start with any of those words). A test name can forge many shapes; none of them is parsed, they
-  all fail this one test.
-* ``exception type``: a failing test (any, not only the expected one) whose printed exception class is not a builtin
-  exception, an assertion or pytest's ``Failed:``. A run prints only the class NAME, and a class of any name may
-  subclass ``ImportError`` (or hold one in an ``ExceptionGroup``), so a custom type cannot be called "not an import
-  failure". Run the mutation so the only failures are assertions and builtin exceptions, or confirm by hand.
-* ``number``: a probe reading or window bound no float can hold (an integer or ``1e400`` spelled out, or ``1e-400``
-  which a float would read as ``0.0``), or an infinite reading. The corpus guard keeps each number's spelling
-  (``json.loads(parse_float=str)``) so a recorded ``1e-400`` is not read as ``0.0`` before this check sees it. A spelled ``inf`` window bound is a real unbounded window and is accepted.
+* ``short-summary line`` (an ALLOWLIST since the r7 hub ruling; r5 and r6 each found 5-6 new forged shapes of one class,
+  so the denylist of shapes was replaced): PASS needs a pytest short summary made ONLY of the shapes pytest prints
+  under ``-rA``, and anything else is COULD-NOT-CHECK. Every line is exactly one of ``FAILED``/``ERROR <ascii
+  file.ext>::<name> - <message>`` (single line, ``WORD node`` of at most 74 characters, which pytest cuts or drops the
+  message of at its 80-column fallback width but not on a ``CI`` runner, so the line is judged before its message is
+  read; a non-empty message that is not cut to ``...`` and holds no ``<file>::<name>``; a module-level ``ERROR
+  <file.ext> - <message>`` is the one shape without ``::name``), ``PASSED <id>`` alone, ``SKIPPED [n] file:line:
+  reason``, ``XFAIL``/``XPASS <id>``. The lines come in the ``-rA`` order (PASSED, SKIPPED, XFAIL, XPASS, then
+  ERROR/FAILED), with no blank line, no other line and no rule line between the header and the final result bar, and
+  nothing after that bar. Their counts equal the runner's own: FAILED+ERROR lines the failed+errored count, and the
+  PASSED/SKIPPED/XFAIL/XPASS lines the passed/skipped/xfailed/xpassed counts, ZERO INCLUDED, so a default (``-rfE``)
+  run that counts a pass but lists none is COULD-NOT-CHECK: a forged ``PASSED`` continuation of a multi-line id could
+  stand in for the real passes that run omits. Run the mutation with ``-rA``. A multi-line, non-ASCII, over-long or
+  otherwise unreadable id is none of these shapes; it is not parsed.
+* ``exception type``: a failing test (any, not only the expected one) whose printed exception class is not EXACTLY a name
+  on the fixed list ``_EXC_NAMES`` (the builtin exceptions less ImportError, ModuleNotFoundError, the ExceptionGroups and
+  the warnings; a dotted ``mod.Name`` is never on it), an assertion or pytest's ``Failed:``. A run prints only the class
+  NAME, and a class of any name may subclass ``ImportError`` (or hold one in an ``ExceptionGroup``), so a custom, aliased
+  or subclass name cannot be called "not an import failure". Run the mutation so the only failures are assertions and
+  builtin exceptions, or confirm by hand.
+* ``number`` (an ALLOWLIST since r7): a probe reading or window bound is an ``int``, a ``float``, or a ``str`` of ASCII
+  digits, a sign, a point and an exponent (a spelled ``inf``/``nan`` too). ``Decimal``, ``Fraction``, numpy-like scalars,
+  a ``bool``, any other type, and text with another script's digits or a ``_`` are COULD-NOT-CHECK BEFORE any conversion,
+  because their magnitude is not inspected here. Within the allowlist, a number no float can hold (an integer or
+  ``1e400`` spelled out, or ``1e-400`` which a float would read as ``0.0``) or an infinite reading is refused. The corpus
+  guard keeps each number's spelling (``json.loads(parse_float=str)``) so a recorded ``1e-400`` is not read as ``0.0``
+  before this check sees it. A spelled ``inf`` window bound is a real unbounded window and is accepted.
 * ``internal-error``: any other exception while reading the text. Never an uncaught traceback.
 
 A refusal is checked BEFORE the older reasons and the older reason is appended (``; also: ...``), so a
@@ -94,7 +101,13 @@ NON-PROMISES:
   failed/error count means no assertion failed, whatever failure-looking text a test printed above it.
 - Whitespace inside an id is significant (`` a/t.py`` is not ``a/t.py``; ``test one`` is not ``test``), and the
   expectation is never stripped: `` a/t.py:5`` and ``a/t.py:5\\n`` match nothing.
-- It reads text, so text can be forged. Not defended: an exception message that itself prints a complete
+- It reads text, so text can be forged. r7 TERMINATION (hub ruling): an allowlisted shape is judged, anything outside
+  it is refused, and a finding that only shows an input outside the allowlist being REFUSED is not a defect. Not
+  defended, because the text is identical to what a genuine run prints: a test that forges its own node ids and
+  whose run also hides the outcome it replaces (for example ``-rp`` listing a forged FAILED line while the real
+  failure goes unlisted, which the counts, the order and the shapes cannot tell from a genuine ``-rpf`` run), and a
+  class that sets ``__module__ = 'builtins'`` so that it prints unqualified (``AssertionError`` that is an
+  ``ImportError``). Forgery shapes go to the P3 follow-up card, not to another round. Also not defended: an exception message that itself prints a complete
   unittest block header (rule of ``=``, ``FAIL:``/``ERROR:`` line, rule of ``-``); a pytest test whose
   FUNCTION NAME holds `` - `` (set through ``globals()``), which a ``--tb=no`` summary line cannot tell from a
   message; a directory name holding ``[`` (read as the start of a parameter id). An ``ImportError`` named
@@ -129,7 +142,6 @@ NON-PROMISES:
 from __future__ import annotations
 
 import argparse
-import builtins
 import math
 import re
 import sys
@@ -164,9 +176,28 @@ _RESULT_LINE = re.compile(r"^(?:OK\b.*|FAILED \(.*\)|=+ .*\bin \d[\d.]*s\b.*=+)\
 
 
 _CAPTURED_ANY = re.compile(r"^\s*-{2,}\s*Captured\b|^(?:Stdout|Stderr):\s*$", re.M)
-_INT_TEXT = re.compile(r"\s*[+-]?\d+\s*")
-_INF_TEXT = re.compile(r"\s*[+-]?inf(?:inity)?\s*", re.I)
+# NUMBER ALLOWLIST (r7 hub ruling): a reading or window bound is an int, a float, or ASCII text of the shapes below.
+# Spelled out with [0-9] and re.ASCII so that no other script's digit (float() accepts them) and no `_` separator can slip in.
+_INT_TEXT = re.compile(r"[ \t]*[+-]?[0-9]+[ \t]*")
+_DEC_TEXT = re.compile(r"[ \t]*[+-]?(?:[0-9]+\.?[0-9]*|\.[0-9]+)(?:[eE][+-]?[0-9]+)?[ \t]*")
+_SPECIAL_TEXT = re.compile(r"[ \t]*[+-]?(?:inf(?:inity)?|nan)[ \t]*", re.I | re.A)
 _MAX_LINE_DIGITS = 9
+
+# EXCEPTION-NAME ALLOWLIST (r7 hub ruling): the printed class names this checker will read as "a builtin that is not
+# an import failure". A literal list, not a look-up in ``builtins`` at run time: ImportError, ModuleNotFoundError and
+# the ExceptionGroup types are deliberately absent (the first two are an import failure, the last may hold one), and
+# so is every warning class. Any other name, dotted (``mod.Name``) or not, is a custom, aliased or subclass name.
+_EXC_NAMES = frozenset((
+    "ArithmeticError", "AttributeError", "BaseException", "BlockingIOError", "BrokenPipeError", "BufferError",
+    "ChildProcessError", "ConnectionAbortedError", "ConnectionError", "ConnectionRefusedError", "ConnectionResetError",
+    "EOFError", "Exception", "FileExistsError", "FileNotFoundError", "FloatingPointError", "GeneratorExit",
+    "IndentationError", "IndexError", "InterruptedError", "IsADirectoryError", "KeyError", "KeyboardInterrupt",
+    "LookupError", "MemoryError", "NameError", "NotADirectoryError", "NotImplementedError", "OSError", "OverflowError",
+    "PermissionError", "ProcessLookupError", "RecursionError", "ReferenceError", "RuntimeError", "StopAsyncIteration",
+    "StopIteration", "SyntaxError", "SystemError", "SystemExit", "TabError", "TimeoutError", "TypeError",
+    "UnboundLocalError", "UnicodeDecodeError", "UnicodeEncodeError", "UnicodeError", "UnicodeTranslateError",
+    "ValueError", "ZeroDivisionError",
+))
 
 
 class _Unclassifiable(Exception):
@@ -389,26 +420,46 @@ def _pair_nodes(want: list[str], frames: list[tuple[str, int]], nodes: list[str]
     return cands if len(cands) == 1 else []
 
 
-_PT_SUMMARY_WORDS = ("FAILED", "ERROR", "SKIPPED", "XFAIL", "XPASS", "PASSED")
-
-
 # pytest keeps a message only when `width - len("WORD node") >= 6` (" - " and an ellipsis); at its own fallback width
 # of 80 that is a `WORD node` of at most 74 characters. A longer one may have been cut by the runner's width.
 _SUMMARY_LINE_MAX_ID = 74
 
 
-def _cell_width(text: str) -> int:
-    """An UPPER BOUND of the terminal cells `text` takes: pytest measures a line in display cells (a CJK character is
-    two), not code points, so every non-ASCII character counts two. Over-counting only refuses more."""
-    return len(text) + sum(1 for ch in text if ord(ch) > 127)
+# ALLOWLIST of short-summary line shapes (r7 hub ruling; replaces the denylist of forged continuations of r5 and r6).
+# Rank = the order pytest prints the groups in under ``-rA`` (reportchars ``PpsxXEf``): a continuation line of a
+# multi-line test id sits AFTER the line that started the id, so a PASSED/SKIPPED/XFAIL/XPASS line that follows a
+# FAILED/ERROR line is out of order. ERROR and FAILED share a rank (a default ``-rfE`` run prints them as f, E).
+_SUMMARY_RANK = {"PASSED": 0, "SKIPPED": 1, "XFAIL": 2, "XPASS": 3, "ERROR": 4, "FAILED": 4}
+_OTHER_NODE = re.compile(r"[!-~][ -~]*?\.\w+::[ -~]+")  # `<ascii file>.ext::<name>`: the one readable id shape
+_SKIPPED_BODY = re.compile(r"\[([0-9]+)\] [!-~][ -~]*?:[0-9]+: [ -~]*")
+
+
+def _other_line(word: str, line: str) -> tuple[int, str]:
+    """(how many tests the line stands for, "") for a PASSED/SKIPPED/XFAIL/XPASS summary line of exactly the shape pytest
+    prints under ``-rA``; (0, reason) for anything else. ASCII only, so no wide or invisible character can hide a line
+    break or a second id inside it."""
+    body = line[len(word) + 1:]
+    if not line.isascii() or not line.isprintable():
+        return 0, f"{word} line with a non-ASCII or control character"
+    if word == "SKIPPED":
+        m = _SKIPPED_BODY.fullmatch(body)
+        return (int(m[1]), "") if m else (0, "a SKIPPED line that is not `SKIPPED [n] file:line: reason`")
+    if not _OTHER_NODE.fullmatch(body):
+        return 0, f"a {word} line that is not `{word} <file>::<name>`"
+    if word == "PASSED" and " - " in body:
+        return 0, "a PASSED line holding ' - ' (a real one is `PASSED <id>` alone)"
+    return 1, ""
 
 
 def _summary_problem(word: str, node: str, msg: str) -> str:
-    """The CLASS RULE for one short-summary `FAILED`/`ERROR` line (r5 hub ruling): it must split into exactly
-    `<file.ext>::<name> - <message>` with a message that is not empty. "" when it does. Every shape a test name can
-    forge (a multi-line or over-long id, a ' - ' inside a directory name) fails this one test, so no case is repaired
-    one by one. A module-level collection `ERROR <file.ext> - <message>` has no `::name` and is allowed."""
-    if _cell_width(f"{word} {node}") > _SUMMARY_LINE_MAX_ID:
+    """The CLASS RULE for one short-summary `FAILED`/`ERROR` line (r5 hub ruling, an allowlist since r7): it must split
+    into exactly `<ascii file.ext>::<name> - <message>` with a message that is not empty and a width that no terminal
+    can have cut. "" when it does. Every shape a test name can forge (a multi-line, non-ASCII or over-long id, a ' - '
+    inside a directory name) fails this one test, so no case is repaired one by one. A module-level collection
+    `ERROR <file.ext> - <message>` has no `::name` and is allowed."""
+    if not node.isascii() or not node.isprintable():
+        return f"{word} {node[:60]!r} is not an ASCII, single-line node id"
+    if len(f"{word} {node}") > _SUMMARY_LINE_MAX_ID:
         # pytest drops or ellipsizes the message when the line does not fit the terminal width (it does not, only
         # when the CI / BUILD_NUMBER environment variable is set), so the same run prints a different line at
         # width 80, at width 200 and on a CI runner. A line this long may have lost its message to the width of
@@ -462,8 +513,14 @@ def _parse_pytest(text: str, stats: dict | None = None) -> list[Failure]:
     def real_section(line: str) -> bool:
         return not captured or not sec_width or abs(len(line.rstrip()) - sec_width) <= 1
 
+    after_result = False  # the final result bar of the short summary was seen: nothing may follow it
+    rank = 0  # highest group rank seen in the short summary (see _SUMMARY_RANK)
     for line in text.splitlines():
         m_top = _PT_TOP.match(line)
+        if after_result and line.strip():
+            # A result-shaped bar in the middle of a summary (a forged one inside a multi-line id) is followed by more
+            # text; the real final bar is the last line of the run.
+            stats["bad"] = stats["bad"] or f"text {line.strip()[:40]!r} after the final result bar (a multi-line test id?)"
         if m_top and real_rule(line) and top.startswith("short test summary") and not _RESULT_LINE.match(line):
             # Only the final result bar may follow the summary header. Any other `=== x ===` line there is part of
             # a test id that spans lines (a forged section header), not pytest's own text.
@@ -472,19 +529,23 @@ def _parse_pytest(text: str, stats: dict | None = None) -> list[Failure]:
             width = width or len(line.rstrip())
             close()
             captured = False
+            after_result = after_result or (top.startswith("short test summary") and bool(_RESULT_LINE.match(line)))
             top = m_top["title"].strip()
             continue
         if top.startswith("short test summary"):
             stats["has_summary"] = True
-            if line.strip() and not line.startswith(tuple(w + " " for w in _PT_SUMMARY_WORDS)) \
-                    and line.strip() not in _PT_SUMMARY_WORDS:
-                stats["stray"] += 1
-            for word in stats["words"]:
-                if line.startswith(word + " "):  # tallied; _count_mismatch reconciles each with the runner's own count
-                    skipped = re.match(r"SKIPPED \[(\d+)\] \S+:\d+: ", line)
-                    stats["words"][word] += int(skipped[1]) if skipped else 1
-                    if (word == "SKIPPED" and not skipped) or (word == "PASSED" and " - " in line):
-                        stats["stray"] += 1  # a real PASSED line is `PASSED <id>` alone; ` - msg` is a forged continuation
+            word = line.split(" ", 1)[0]
+            if not line.strip() or word not in _SUMMARY_RANK or not line.startswith(word + " "):
+                stats["stray"] += 1  # pytest prints no blank line here and every line starts with a summary word
+                continue
+            if _SUMMARY_RANK[word] < rank:
+                stats["bad"] = stats["bad"] or f"a {word} line after a FAILED/ERROR line (out of the -rA order: a multi-line test id?)"
+            rank = max(rank, _SUMMARY_RANK[word])
+            if word in stats["words"]:  # tallied; _count_mismatch reconciles each with the runner's own count
+                n, why = _other_line(word, line)
+                stats["words"][word] += n
+                if why:
+                    stats["bad"] = stats["bad"] or f"{line[:50]!r}: {why}"
             for word in ("FAILED", "ERROR"):
                 got = _parse_summary_line(line, word)
                 if not got:
@@ -578,11 +639,10 @@ def _foreign_type(failure: Failure) -> str:
         return ""
     token = re.match(r"[\w.]+", text)
     name = token.group(0) if token else text[:40]
-    cls = getattr(builtins, name, None) if re.fullmatch(r"\w+", name) else None
-    if isinstance(cls, type) and issubclass(cls, BaseException):
-        return ""  # a builtin: ImportError and its builtin subclasses are caught by their own name elsewhere
-    return (f"exception type {name[:40]!r} of a failing test is not a builtin: its class may subclass ImportError, "
-            "which the run does not say")
+    if token and name in _EXC_NAMES and text[len(name):len(name) + 1] in ("", ":"):
+        return ""  # an exact name from the fixed list (ImportError and its builtin subclasses are not on it)
+    return (f"exception type {name[:40]!r} of a failing test is not on the fixed list of builtin names: its class may "
+            "subclass ImportError, which the run does not say")
 
 
 def _final_green(text: str) -> bool:
@@ -630,13 +690,17 @@ def _count_mismatch(text: str, ut_blocks: int, stats: dict) -> str:
             return (f"short-summary line: the runner counts {want} failed or errored tests but "
                     f"{stats['summary']} FAILED/ERROR lines were readable")
         for word, label in (("PASSED", "passed"), ("XFAIL", "xfailed"), ("XPASS", "xpassed"), ("SKIPPED", "skipped")):
-            # A multi-line test id can start a continuation line with any summary word. Real lines of that word
-            # add up to the runner's own count; a forged one makes them differ.
+            # ALLOWLIST (r7): only a run that lists every one of these outcomes can be reconciled, which is what
+            # ``-rA`` prints. A multi-line test id can start a continuation line with any summary word, and a default
+            # (``-rfE``) run prints no PASSED/SKIPPED/XFAIL/XPASS line at all, so a forged one could stand in for the
+            # real ones the runner counts. The lines must add up to the runner's own count, zero included.
             stated = re.search(rf"\b(\d+) {label}\b", last)
             shown = int(stated[1]) if stated else 0
-            if stats["words"][word] and stats["words"][word] != shown:
+            if stats["has_summary"] and stats["words"][word] != shown:
+                hint = (": this summary lists none of them, so the run was not made with -rA (default reporting omits "
+                        "PASSED/SKIPPED/XFAIL/XPASS lines)" if not stats["words"][word] else " (a multi-line test id?)")
                 return (f"short-summary line: {stats['words'][word]} {word} lines were read but the runner counts "
-                        f"{shown} {label} (a multi-line test id?)")
+                        f"{shown} {label}{hint}")
     return ""
 
 
@@ -729,35 +793,50 @@ def _verdict(output: str, expected: str) -> tuple[str, str]:
 
 
 def _num(v: object) -> int | float:
-    """An int stays an int: Python compares int and float exactly, while float(2**53 + 1) would round it."""
-    if not isinstance(v, (int, float)):
-        try:
-            # Only text is parsed as an integer: int(Decimal('0.9')) or int(Fraction(9, 10)) would truncate to 0.
-            v = int(v) if isinstance(v, str) else float(v)  # type: ignore[arg-type]
-        except (TypeError, ValueError):
-            if isinstance(v, str) and _INT_TEXT.fullmatch(v):
-                raise OverflowError("integer text beyond the int() digit limit") from None
-            text = v
-            v = float(v)  # type: ignore[arg-type]
-            if math.isinf(v) and not _INF_TEXT.fullmatch(str(text)):
-                raise OverflowError("a number spelled out beyond what a float can hold (read as inf)")
-        else:
-            text = v
-        if isinstance(v, float) and v == 0.0 and re.search(r"[1-9]", re.split(r"[eE]", str(text))[0]):
-            raise OverflowError("a nonzero number spelled out beyond what a float can hold (read as 0.0)")
-        if isinstance(v, float) and math.isinf(v) and not isinstance(text, float) and not _INF_TEXT.fullmatch(str(text)):
-            raise OverflowError("a number spelled out beyond what a float can hold (read as inf)")
-    if isinstance(v, int):
+    """NUMBER ALLOWLIST (r7 hub ruling): accepts exactly an ``int``, a ``float``, or a ``str`` made of ASCII digits, a
+    sign, a point and an exponent (plus a spelled ``inf``/``nan``). ``Decimal``, ``Fraction``, numpy-like scalars, a
+    ``bool`` and every other type raise ``TypeError`` BEFORE any conversion, and text in another script's digits or with
+    a ``_`` separator raises ``ValueError``: ``float()`` reads those, and a magnitude cannot be inspected in a form the
+    checker has not enumerated. An int stays an int: Python compares int and float exactly, while float(2**53 + 1) would
+    round it. A nonzero spelling that a float reads as 0.0 or inf raises ``OverflowError``."""
+    if type(v) is float:
+        return v
+    if type(v) is int:
         float(v)  # OverflowError for an int no double can hold: not a real reading (callers refuse it)
-    return v
+        return v
+    if type(v) is not str:
+        raise TypeError(f"{type(v).__name__} is not an int, a float or ASCII numeric text")
+    if _INT_TEXT.fullmatch(v):
+        try:
+            n = int(v)
+        except ValueError:
+            raise OverflowError("integer text beyond the int() digit limit") from None
+        float(n)
+        return n
+    if _SPECIAL_TEXT.fullmatch(v):
+        return float(v)  # a spelled `inf` window bound is a real unbounded window; `nan` is refused by the caller
+    if not _DEC_TEXT.fullmatch(v):
+        raise ValueError("not ASCII numeric text")
+    x = float(v)
+    if math.isinf(x):
+        raise OverflowError("a number spelled out beyond what a float can hold (read as inf)")
+    if x == 0.0 and re.search(r"[1-9]", re.split(r"[eE]", v)[0]):
+        raise OverflowError("a nonzero number spelled out beyond what a float can hold (read as 0.0)")
+    return x
 
 
 def _cli_num(v: str) -> object:
-    """argparse type: a number, or (for an integer no double can hold) the text itself, so that
-    probe_discriminates refuses it by name instead of argparse raising OverflowError."""
+    """argparse type: a number, or (for text outside the allowlist that a float would still read) the text itself, so
+    that probe_discriminates refuses it by name instead of argparse raising. Plain garbage stays an argparse error."""
     try:
         return _num(v)
-    except OverflowError:
+    except (OverflowError, TypeError):
+        return v
+    except ValueError:
+        try:
+            float(v)
+        except ValueError:
+            raise
         return v
 
 
@@ -767,7 +846,7 @@ def probe_discriminates(bug_value: float, fix_value: float, window: tuple[float,
         lo, hi = window
         bug_value, fix_value, lo, hi = _num(bug_value), _num(fix_value), _num(lo), _num(hi)
     except (TypeError, ValueError, OverflowError):
-        return False, "COULD-NOT-CHECK (number: probe readings and window must be numbers a float can hold)"
+        return False, "COULD-NOT-CHECK (number: probe readings and window must be numbers a float can hold, given as an int, a float or ASCII numeric text)"
     if any(isinstance(v, float) and math.isnan(v) for v in (bug_value, fix_value, lo, hi)):
         return False, "NaN reading or window bound"
     if any(isinstance(v, float) and math.isinf(v) for v in (bug_value, fix_value)):
