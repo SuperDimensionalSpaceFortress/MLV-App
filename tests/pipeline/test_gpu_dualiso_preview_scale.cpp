@@ -2358,6 +2358,32 @@ TEST(GpuDualIsoPreviewScale, CpuReducedOneRowBayerIsRefused)
     ASSERT_EQ(-1, h); // r14 (Dot / key3 r12 H2): the refusal leaves the height untouched too
 }
 
+// H2C-PORT-1 r14, adversary r14 pass 1 A1 (RUN\adversary-78f4206b.json, video_mlv.c:7213): a 65532 x 43712 clip plans a
+// 32766 x 21856 Bayer at x2 and at x4; its 2,148,401,088 RGB words pass INT_MAX, past the int index debayerBasicU16 uses
+// (row 21847 column 1 wraps to a negative offset). Both reduced branches must refuse such a Bayer before any kernel runs:
+// entry 0, the (deliberately tiny) buffers untouched, w / h untouched. Without the refusal the kernel writes far outside.
+TEST(GpuDualIsoPreviewScale, CpuReducedBayerPastIntIndexIsRefused)
+{
+    R12BareVideo huge(65532, 43712, 1);
+    ASSERT_TRUE(huge.video != nullptr);
+    for (const int scale : { 2, 4 })
+    {
+        std::vector<uint16_t> obuf(64u, 0xBEEFu);
+        std::vector<uint16_t> bayer(64u, 10000u);
+        int w = -1, h = -1;
+        const int got = getMlvRawFrameDebayeredFromReducedReconnedRaw16(huge.video, 1, bayer.data(), 32766, 21856, scale,
+                                                                        obuf.data(), 1, &w, &h);
+        const bool untouched = std::all_of(obuf.begin(), obuf.end(), [](uint16_t v) { return v == 0xBEEFu; })
+                            && std::all_of(bayer.begin(), bayer.end(), [](uint16_t v) { return v == 10000u; });
+        std::printf("[h2c-int-index] 65532x43712 at x%d, Bayer 32766x21856: entry %d (want 0), buffers untouched %d\n",
+                    scale, got, untouched ? 1 : 0);
+        ASSERT_EQ(0, got);
+        ASSERT_TRUE(untouched);
+        ASSERT_EQ(-1, w);
+        ASSERT_EQ(-1, h);
+    }
+}
+
 // H2C-PORT-1 RED 3: the route. At x4 the CPU plan's Bayer is at x2 (fullWidth / 2 x
 // sourceHeight / 2, sourceHeight still the x4 crop) and BOTH reduced consumers take it (a
 // consumer that rejected the new dims would drop every playing frame to the slow full render).
