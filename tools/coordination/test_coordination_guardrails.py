@@ -1245,6 +1245,73 @@ def test_codex_lane_runtime_path_treats_slash_spellings_as_one_directory(tmp_pat
     assert _codex_runtime_path_field(done, "PATH") == f"C:\\first;{present}"
 
 
+@codex_runtime_path_only
+def test_codex_lane_runtime_path_treats_slash_spellings_already_on_path_as_present(tmp_path):
+    # Adversary A2 on 56281b89: the candidate was normalised ('/' -> '\') but the EXISTING PATH entries were not, so PATH='C:/x/bin/' still got
+    # C:\x\bin appended. Both sides of the duplicate check use one normalisation.
+    present = tmp_path / "bin"
+    present.mkdir()
+    forward = str(present).replace("\\", "/")
+    start = f"C:\\first;{forward}/"
+    done = _codex_runtime_path_run(
+        tmp_path,
+        f"$psi.Environment['PATH'] = '{_ps_quote(start)}'\n"
+        f"[void](Add-CodexLaneRuntimePath -Psi $psi -Candidates @('{_ps_quote(present)}'))",
+    )
+    assert _codex_runtime_path_field(done, "PATH") == start
+
+
+# A Test-Path stand-in that records what the function looks up and answers "exists" to everything, so a candidate the function should have skipped
+# shows up as a recorded lookup AND as an added directory. It shadows the cmdlet for the function under test (a function outranks a cmdlet).
+_RECORD_LOOKUPS = (
+    "$script:lookups = @()\n"
+    "function Test-Path { $script:lookups += ($args -join ' '); return $true }\n"
+)
+_PRINT_LOOKUPS = "\n'LOOKUPS=' + ($script:lookups -join '|')"
+
+
+@codex_runtime_path_only
+def test_codex_lane_runtime_path_never_looks_up_a_unc_directory(tmp_path):
+    # Adversary A1 on 56281b89: Test-Path on \\host\share\... can block in the SMB layer for longer than the launch budget, and the lane then fails
+    # launch-budget-exhausted before codex starts. A UNC candidate (explicit, or through MINGW_ROOT) is skipped with no filesystem lookup at all.
+    done = _codex_runtime_path_run(
+        tmp_path,
+        _RECORD_LOOKUPS
+        + "$psi.Environment['PATH'] = 'C:\\first'\n"
+        + "[void](Add-CodexLaneRuntimePath -Psi $psi -Candidates @('\\\\blackhole-host\\share\\mingw\\bin'))"
+        + _PRINT_LOOKUPS,
+    )
+    assert _codex_runtime_path_field(done, "PATH") == "C:\\first"
+    assert _codex_runtime_path_field(done, "LOOKUPS") == "", done.stdout
+    env = {**os.environ, "MINGW_ROOT": "\\\\blackhole-host\\share\\mingw"}
+    done = _codex_runtime_path_run(
+        tmp_path,
+        _RECORD_LOOKUPS + "$psi.Environment['PATH'] = 'C:\\first'\n[void](Add-CodexLaneRuntimePath -Psi $psi)" + _PRINT_LOOKUPS,
+        env=env,
+    )
+    assert "blackhole-host" not in _codex_runtime_path_field(done, "PATH")
+    assert "blackhole-host" not in _codex_runtime_path_field(done, "LOOKUPS"), done.stdout
+
+
+@codex_runtime_path_only
+def test_codex_lane_runtime_path_looks_up_only_a_local_drive(tmp_path):
+    # Defect-class sweep for A1: the same stall is possible through a drive letter that is mapped to a share, or that is not there. The drive type is
+    # read first (a local call that does not touch the share); a drive that is not a local disk is skipped with no lookup. A local fixed drive is
+    # still looked up, so the positive control below is what keeps this from passing by skipping everything.
+    gone = _free_drive_letter()
+    system_drive = os.environ.get("SystemDrive", "C:")
+    done = _codex_runtime_path_run(
+        tmp_path,
+        _RECORD_LOOKUPS
+        + "$psi.Environment['PATH'] = 'C:\\first'\n"
+        + f"[void](Add-CodexLaneRuntimePath -Psi $psi -Candidates @('{gone}:\\toolchain\\bin', '{_ps_quote(system_drive)}\\probe-toolchain\\bin'))"
+        + _PRINT_LOOKUPS,
+    )
+    lookups = _codex_runtime_path_field(done, "LOOKUPS")
+    assert f"{gone}:" not in lookups and f"{gone}:" not in _codex_runtime_path_field(done, "PATH"), done.stdout
+    assert "probe-toolchain" in lookups, f"a local fixed drive must still be looked up: {done.stdout!r}"
+
+
 def test_codex_lane_runtime_path_is_wired_into_the_codex_child_only():
     body = LANE_RUNNER.read_text(encoding="utf-8").replace("\r\n", "\n")
     assert "function Add-CodexLaneRuntimePath" in body, "Invoke-Lane lacks Add-CodexLaneRuntimePath"

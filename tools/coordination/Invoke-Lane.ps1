@@ -1978,23 +1978,32 @@ function Add-CodexLaneRuntimePath {
         $Candidates += 'C:\Qt\Tools\mingw1310_64\bin'
     }
     $current = if ($Psi.Environment.ContainsKey('PATH')) { [string]$Psi.Environment['PATH'] } else { '' }
+    # ONE normalisation for both sides of the duplicate check: '/' is '\', no trailing separator, any case (adversary A2 on 56281b89: the candidate
+    # was normalised but the existing PATH entries were not, so PATH='C:/x/bin' still got C:\x\bin appended).
+    $dirKey = { param([string]$d) $d.Trim().Trim('"').Replace('/', '\').TrimEnd('\').ToLowerInvariant() }
     $seen = @{}
     foreach ($entry in ($current -split ';')) {
-        $key = $entry.Trim().Trim('"').TrimEnd('\').ToLowerInvariant()
+        $key = & $dirKey $entry
         if ($key) { $seen[$key] = $true }
     }
     $added = @()
     foreach ($dir in $Candidates) {
         if ([string]::IsNullOrWhiteSpace($dir)) { continue }
-        # Fully qualified only (X:\... or \\server\...): a relative PATH entry is searched from the CHILD's working directory, not the launcher's
-        # where Test-Path would judge it, so a relative candidate would be validated in one place and searched in another (adversary A2 on 6372cc4e).
-        if ($dir.Trim() -notmatch '^([A-Za-z]:[\\/]|\\\\)') { continue }
+        # A DRIVE-LETTER path only (X:\... or X:/...): a relative PATH entry is searched from the CHILD's working directory, not the launcher's where
+        # Test-Path would judge it (adversary A2 on 6372cc4e), and a UNC path is never looked up at all: Test-Path on \\host\share\... can block in the
+        # SMB layer past the launch budget and fail the lane launch-budget-exhausted before codex starts (adversary A1 on 56281b89). Skipped by name.
+        if ($dir.Trim() -notmatch '^[A-Za-z]:[\\/]') { continue }
         # A name PATH cannot carry intact is skipped: ';' would serialize as two entries (C:\toolchains;child\bin -> C:\toolchains plus a relative
         # child\bin, adversary A1 on e284b182) and '"' is PATH's own quoting. '/' is respelled '\' so one directory is added once, in one spelling.
         if ($dir.Contains(';') -or $dir.Contains('"')) { continue }
         $dir = $dir.Trim().Replace('/', '\')
-        $key = $dir.TrimEnd('\').ToLowerInvariant()
+        $key = & $dirKey $dir
         if ($seen.ContainsKey($key)) { continue }
+        # A drive letter can still be a mapped share (or be gone): its type is read first, a local call that does not touch the share, and a drive that
+        # is not a local disk is skipped with no lookup.
+        $driveType = 'Unknown'
+        try { $driveType = [string][System.IO.DriveInfo]::new($dir.Substring(0, 1)).DriveType } catch { $driveType = 'Unknown' }
+        if ($driveType -in @('Network', 'NoRootDirectory', 'Unknown')) { continue }
         $exists = $false
         try { $exists = Test-Path -LiteralPath $dir -PathType Container } catch { $exists = $false }
         if (-not $exists) { continue }
