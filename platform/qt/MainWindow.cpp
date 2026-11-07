@@ -12234,10 +12234,16 @@ void MainWindow::playbackHandling(int timeDiff)
                 //PlaybackFrameRange.h for the BLOCKER note on why the wrapped case can never
                 //return the range's last frame)
                 const double sourcePositionBeforeDropTick = m_newPosDropMode;
+                // HFR-NATIVE-60FPS-FULLRES-1 r24 (key3 B1 M-HFR-CONFORM-SKIP): under conform the catch-up advances by whole
+                // frames, so a tick that owes less than one whole period beyond the next frame presents that frame (never
+                // N -> N + 2 from a fractional position); a real stall still skips. Without conform the grant is unchanged.
                 const playback_frame_range::DropFrameTickResult dropFrameTick =
                     playback_frame_range::advanceDropFrameTick(
                         m_newPosDropMode,
-                        m_playbackPaceGuard.grant( getPlaybackFramerate() * (double)timeDiff / 1000.0, paceNowMs, playbackPaceGuardFps() ),
+                        playback_frame_range::conformDropFrameDelta(
+                            m_newPosDropMode,
+                            m_playbackPaceGuard.grant( getPlaybackFramerate() * (double)timeDiff / 1000.0, paceNowMs, playbackPaceGuardFps() ),
+                            playbackConformActive() ),
                         ui->spinBoxCutIn->value(), ui->spinBoxCutOut->value(),
                         ui->actionLoop->isChecked() );
                 // slip_summary: the granted share, read back from the tick (a wrap subtracted the cut range width;

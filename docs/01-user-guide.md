@@ -677,7 +677,8 @@ JKL-style reverse playback; previous-frame stepping uses <kbd>,</kbd>.
 (for example 59.94 fps) play as slow motion at 24 fps by default, so a
 59.94 fps clip plays at about 0.4x speed and every recorded frame is
 shown (with **Drop Frame Mode** on, a frame can still be skipped to catch
-up after a stall, as at any rate). Configure it under **Playback → High
+up after a stall of at least one whole frame period; a shorter delay shows
+the next frame instead). Configure it under **Playback → High
 Frame Rate Conform**:
 
 | Setting | Default | Choices |

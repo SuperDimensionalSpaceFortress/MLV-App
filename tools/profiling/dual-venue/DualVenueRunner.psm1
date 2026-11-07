@@ -4099,12 +4099,21 @@ function Get-DvCriteriaMetrics {
     param($Metrics, $Playback)
     $m = [ordered]@{}
     if ($null -ne $Metrics) { foreach ($p in $Metrics.PSObject.Properties) { $m[$p.Name] = $p.Value } }
+    # HFR-NATIVE-60FPS-FULLRES-1 r24 (r23 adversary A1, DV-CONFORM-CRITERIA-METRICS-PRESENCE-GUARD-1): a conform value counts only when the block
+    # says its conform line is PRESENT (a real boolean $true, as Get-DvConformPaceProof requires) and is the MEASURED session's (conformSession
+    # equals summarySession, both non-empty). Before r24 a block with conformLinePresent=$false or another session's line still passed its values.
+    $linePresent = $(if ($null -ne $Playback) { Get-DvProp $Playback 'conformLinePresent' } else { $null })
+    $present = ($linePresent -is [bool]) -and $linePresent
+    $summarySession = $(if ($null -ne $Playback) { [string](Get-DvProp $Playback 'summarySession') } else { '' })
+    $conformSession = $(if ($null -ne $Playback) { [string](Get-DvProp $Playback 'conformSession') } else { '' })
+    $sameSession = ($summarySession -ne '') -and ($conformSession -ceq $summarySession)
     foreach ($name in $script:ConformCriteriaMetrics.Keys) {
-        $value = $(if ($null -ne $Playback) { Get-DvProp $Playback $script:ConformCriteriaMetrics[$name] } else { $null })
+        $value = $(if ($null -ne $Playback -and $present -and $sameSession) { Get-DvProp $Playback $script:ConformCriteriaMetrics[$name] } else { $null })
         $m[$name] = $value
         if ($null -eq $value) {
             $why = $(if ($null -eq $Playback) { 'no playback block was derived from the run log' }
-                     elseif ((Get-DvProp $Playback 'conformLinePresent') -ne $true) { 'no playback_smoke.conform line for the measured session in the run log' }
+                     elseif (-not $present) { 'no playback_smoke.conform line for the measured session in the run log' }
+                     elseif (-not $sameSession) { "the playback_smoke.conform line is for session $conformSession, not the measured session $summarySession" }
                      else { 'the measured session''s playback_smoke.conform line does not carry the field' })
             $m["${name}CouldNotCheck"] = $why
         }

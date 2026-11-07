@@ -296,6 +296,41 @@ inline DropFrameTickResult advanceDropFrameTick(
     return result;
 }
 
+// HFR-NATIVE-60FPS-FULLRES-1 r24 (key3 B1 M-HFR-CONFORM-SKIP, hub ruling 2026-11-07): the frame delta a drop-frame tick
+// applies, given the share \a grantedFrames the pace guard granted it at \a currentPosition (m_newPosDropMode).
+//
+// The conform promise is that on a quiet host every source frame is presented in order: an integer jump of exactly 1.
+// Drop Frame Mode keeps the position fractional, so a tick granted 1.2 frames or more from x.8 crossed two integers and
+// presented N -> N + 2 (sol r23: 1152.8 + 1.584 = 1154.384, 1152 -> 1154) although the tick owed less than one whole
+// period beyond the frame it presents. Under conform the catch-up therefore advances by WHOLE frames: such a tick
+// presents the next frame, and the whole frames it would have skipped are dropped from the grant (never repaid, so the
+// timeline never runs faster than the pace; the sub-frame phase is kept). The documented drop-frame skip after a REAL
+// stall stays: a grant of at least 1 + kConformStallDebtFrames is a tick that owes at least one whole period beyond the
+// frame it presents, and it skips exactly as before (and is stall evidence, never a conform PASS).
+//
+// Without conform, and for every tick that crosses at most one integer, the grant is returned unchanged, bit for bit:
+// non-conform drop-frame behaviour is byte-identical, and so is every ordinary conformed tick.
+inline constexpr double kConformStallDebtFrames = 1.0;
+
+inline double conformDropFrameDelta( double currentPosition, double grantedFrames, bool conformActive )
+{
+    if( !conformActive || !( grantedFrames > 0.0 ) || !( currentPosition >= 0.0 ) ) return grantedFrames;
+    if( grantedFrames >= 1.0 + kConformStallDebtFrames ) return grantedFrames;   // a real stall: the documented skip
+    // the slider presents the integer part (setValue of an int; the position is never negative)
+    const double presentedFrame = std::floor( currentPosition );
+    const double landing = currentPosition + grantedFrames;
+    if( std::floor( landing ) - presentedFrame <= 1.0 ) return grantedFrames;
+    // Present presentedFrame + 1, keeping the landing's phase. A phase within a hair of 1 is dropped too, so the source
+    // counter (floor + 1e-9) and the slider (truncation) always agree that exactly one frame advanced.
+    double phase = landing - std::floor( landing );
+    if( !( phase < 1.0 - 1e-6 ) ) phase = 0.0;
+    const double nextFrame = presentedFrame + 1.0;
+    double delta = ( nextFrame + phase ) - currentPosition;
+    // the caller adds the delta back (advanceDropFrameTick): never let rounding land it a hair short of the next frame
+    while( currentPosition + delta < nextFrame ) delta = std::nextafter( delta, grantedFrames );
+    return delta;
+}
+
 // HFR-NATIVE-60FPS-FULLRES-1 r21 fix iteration 1 (adversary A1 on 43db3021): the width a NON-drop Loop wrap is credited
 // (PlaybackWrapRecorder::noteEngineWrap). MainWindow::playbackHandling wraps once the playhead is at or past the cut's last frame
 // and moves it from fromFrame back to cutInFrame in ONE granted frame, so the width is the distance moved back plus that frame.

@@ -1,7 +1,11 @@
 #include "../common/minitest.h"
 #include "../../platform/qt/PlaybackFrameRange.h"
+#include "../../platform/qt/PlaybackNativePaceGuard.h"
+#include "../../platform/qt/PlaybackSourceAdvanceTracker.h"
 
+#include <cmath>
 #include <cstdio>
+#include <cstring>
 #include <limits>
 #include <string>
 #include <vector>
@@ -3043,4 +3047,178 @@ TEST( PlayStopDecision, R20AdversaryA2ARequirementFirstSeenPastTheDeadlineIsNeve
     ASSERT_TRUE( evaluatePlayStop( 1499, 1499, true, 64999, 65000 ) == PlayStopState::Reached );
     // required <= 0 still never reaches, past the deadline or not
     ASSERT_TRUE( evaluatePlayStop( 99999, 0, true, 65049, 65000 ) == PlayStopState::SafetyTimeout );
+}
+
+// ---- HFR-NATIVE-60FPS-FULLRES-1 r24 (key3 B1 M-HFR-CONFORM-SKIP, hub ruling 2026-11-07) ----
+//
+// The promise: on a quiet host, conform playback presents source frames in order, an integer jump of exactly 1. Drop
+// Frame Mode keeps m_newPosDropMode fractional, so a tick granted 1.2 frames or more from a position x.8 crossed two
+// integers and presented frame N -> N + 2 (sol r23: 1152.8 + 1.584 = 1154.384, so 1152 -> 1154, max_jump=2) although
+// the tick owed less than one whole period beyond the frame it presents. The documented drop-frame skip after a REAL
+// stall (a tick that owes at least one whole period beyond that frame) stays.
+namespace
+{
+// Exactly what MainWindow::playbackHandling's drop-frame branch does with one tick (Loop off, a cut far from the end):
+// the delta conformDropFrameDelta returns goes to advanceDropFrameTick, and the slider (setValue of an int) presents the
+// integer part. Returns the presented integer transition.
+int conformDropTickTransition( double position, double granted, bool conformActive, double * landing = nullptr )
+{
+    const playback_frame_range::DropFrameTickResult tick = playback_frame_range::advanceDropFrameTick(
+        position, playback_frame_range::conformDropFrameDelta( position, granted, conformActive ), 1, 2860, false );
+    if( landing ) *landing = tick.position;
+    return static_cast<int>( tick.position ) - static_cast<int>( position );
+}
+
+bool sameBits( double a, double b ) { return std::memcmp( &a, &b, sizeof a ) == 0; }
+} // namespace
+
+TEST( PlaybackConformDropFrame, R24SolTraceFromAFractionalPositionPresentsTheNextFrame )
+{
+    // sol r23's trace: position 1152.8, granted 1.584 and 1.2 -- each a debt below one whole period beyond frame 1153.
+    ASSERT_EQ( 1, conformDropTickTransition( 1152.8, 1.584, true ) );
+    ASSERT_EQ( 1, conformDropTickTransition( 1152.8, 1.2, true ) );
+    // the other two positions sol traced
+    ASSERT_EQ( 1, conformDropTickTransition( 100.8, 1.584, true ) );
+    ASSERT_EQ( 1, conformDropTickTransition( 500.7, 1.584, true ) );
+}
+
+TEST( PlaybackConformDropFrame, R24NoGrantBelowTwoWholeFramesEverPresentsAJumpOfTwoUnderConform )
+{
+    // The class, not the instance: every fractional position x.00..x.99 and every grant 0..1.999 (a debt below one whole
+    // period beyond the next frame) presents a transition of 0 or 1 under conform.
+    for( int f = 0; f < 100; ++f )
+    {
+        const double position = 1152.0 + f / 100.0;
+        for( int g = 0; g < 2000; ++g )
+        {
+            const double granted = g / 1000.0;
+            const int transition = conformDropTickTransition( position, granted, true );
+            ASSERT_TRUE( transition == 0 || transition == 1 );
+            // a tick that crosses at most one integer is untouched: the same delta, bit for bit
+            if( static_cast<int>( position + granted ) - static_cast<int>( position ) <= 1 )
+                ASSERT_TRUE( sameBits( granted, playback_frame_range::conformDropFrameDelta( position, granted, true ) ) );
+        }
+    }
+}
+
+TEST( PlaybackConformDropFrame, R24ARealStallOfAWholePeriodOrMoreStillSkipsUnderDropFrame )
+{
+    // Pinned so the fix never removes it: a tick that owes at least one whole period beyond the frame it presents
+    // (granted >= 2) is the documented drop-frame skip after a stall, conform or not -- and stall evidence
+    // (GUI-SMOKE-FOREGROUND-HANG-NOLA-1), never a conform PASS.
+    ASSERT_EQ( 2, conformDropTickTransition( 1152.0, 2.0, true ) );
+    ASSERT_EQ( 2, conformDropTickTransition( 1152.8, 2.13, true ) );   // 88.9 ms at 24 fps (receipt 3ac586e9's interval)
+    ASSERT_EQ( 3, conformDropTickTransition( 1152.0, 3.0, true ) );
+    ASSERT_EQ( 3, conformDropTickTransition( 1152.5, 3.4, true ) );
+    for( const double granted : { 2.0, 2.13, 3.0, 3.4, 7.25 } )
+        ASSERT_TRUE( sameBits( granted, playback_frame_range::conformDropFrameDelta( 1152.8, granted, true ) ) );
+}
+
+TEST( PlaybackConformDropFrame, R24WithoutConformTheDropFrameTickIsByteIdentical )
+{
+    // Non-conform drop-frame behaviour is unchanged: the grant is the delta, bit for bit, so 1152.8 + 1.584 still skips.
+    ASSERT_EQ( 2, conformDropTickTransition( 1152.8, 1.584, false ) );
+    ASSERT_EQ( 2, conformDropTickTransition( 1152.8, 1.2, false ) );
+    for( const double position : { 0.0, 0.5, 99.99, 1152.8, 2858.9 } )
+        for( const double granted : { 0.0, 0.192, 1.0, 1.2, 1.584, 1.999, 2.0, 19.0, -1.0 } )
+            ASSERT_TRUE( sameBits( granted, playback_frame_range::conformDropFrameDelta( position, granted, false ) ) );
+    // a grant that is not a positive number is passed through under conform too (nothing to quantise)
+    for( const double granted : { 0.0, -1.0 } )
+        ASSERT_TRUE( sameBits( granted, playback_frame_range::conformDropFrameDelta( 1152.8, granted, true ) ) );
+}
+
+TEST( PlaybackConformDropFrame, R24AHeldCatchupDropsWholeFramesKeepsThePhaseAndTheRecordersAgree )
+{
+    // 1152.8 + 1.584 lands on 1153.384: exactly one whole frame of the grant is dropped (never repaid), the phase stays.
+    double landing = 0.0;
+    ASSERT_EQ( 1, conformDropTickTransition( 1152.8, 1.584, true, &landing ) );
+    ASSERT_NEAR( 1153.384, landing, 1e-9 );
+    // what MainWindow records from the same tick: the granted share read back from the position (slip histogram), the
+    // source-frame counter, and the startup skip count all see the one-frame step the slider presents
+    const double before = 1152.8;
+    const playback_frame_range::DropFrameTickResult tick = playback_frame_range::advanceDropFrameTick(
+        before, playback_frame_range::conformDropFrameDelta( before, 1.584, true ), 1, 2860, false );
+    const double grantedDropFrames = tick.position - before + static_cast<double>( tick.wrapWidth );
+    ASSERT_NEAR( 0.584, grantedDropFrames, 1e-9 );
+    ASSERT_EQ( 0, playback_native_pace::skippedFrames( before, tick.position ) );
+    playback_frame_range::SourceFrameAdvanceCounter counter;
+    counter.begin( 1152 );
+    counter.noteEngineTick( before, tick.position, tick.wrapped );
+    ASSERT_EQ( int64_t( 2 ), counter.consumed() );   // frame 1152 plus the one advanced frame 1153
+    // a held landing whose phase is within a hair of 1 never lets the counter (floor + 1e-9) and the slider (truncation)
+    // differ: the phase is dropped and the next frame is presented exactly
+    double edge = 0.0;
+    ASSERT_EQ( 1, conformDropTickTransition( 1152.99999999995, 1.99999999999, true, &edge ) );
+    ASSERT_EQ( static_cast<int64_t>( std::floor( edge + 1e-9 ) ), static_cast<int64_t>( edge ) );
+    ASSERT_EQ( 1153.0, edge );
+    // and rounding never lands a held tick a hair short of the next frame, from small positions too
+    for( int f = 1; f < 1000; ++f )
+    {
+        const double position = f / 1000.0;
+        for( const double granted : { 1.2, 1.5, 1.584, 1.999 } )
+        {
+            const int transition = conformDropTickTransition( position, granted, true, &edge );
+            if( static_cast<int>( position + granted ) - static_cast<int>( position ) <= 1 ) continue;   // untouched tick
+            ASSERT_EQ( 1, transition );
+            ASSERT_EQ( static_cast<int64_t>( std::floor( edge + 1e-9 ) ), static_cast<int64_t>( edge ) );
+        }
+    }
+}
+
+TEST( PlaybackConformDropFrame, R24ConformHoldAtTheLoopEndStillWrapsOnTheRecordedWidth )
+{
+    // cut 1..1160 (frames 0..1159), Loop on: 1157.8 + 1.584 would cross two integers; under conform it presents 1158 and
+    // does not wrap; the next tick wraps on the width the engine subtracts, as before.
+    const int cutIn = 1, cutOut = 1160;
+    const playback_frame_range::DropFrameTickResult held = playback_frame_range::advanceDropFrameTick(
+        1157.8, playback_frame_range::conformDropFrameDelta( 1157.8, 1.584, true ), cutIn, cutOut, true );
+    ASSERT_FALSE( held.wrapped );
+    ASSERT_EQ( 1158, static_cast<int>( held.position ) );
+    const playback_frame_range::DropFrameTickResult wrap = playback_frame_range::advanceDropFrameTick(
+        held.position, playback_frame_range::conformDropFrameDelta( held.position, 0.8, true ), cutIn, cutOut, true );
+    ASSERT_TRUE( wrap.wrapped );
+    ASSERT_EQ( cutOut - cutIn, wrap.wrapWidth );
+}
+
+TEST( PlaybackConformDropFrame, R24AConformedPlayWithSubPeriodGuiLateTicksPresentsEveryFrame )
+{
+    // The engine end to end: the pace guard at 24 fps, an 8 ms poll, and every 97th tick a GUI-late tick of 50..82 ms
+    // (1.2..1.97 periods: late, not a whole-period stall), presented frames fed to the conform tracker. Under conform the
+    // largest jump is 1 and every frame is shown; the same ticks without conform jump 2 (receipt 3ac586e9's FAIL shape).
+    for( const bool conform : { true, false } )
+    {
+        playback_native_pace::NativePaceGuard guard;
+        guard.reset();
+        PlaybackSourceAdvanceTracker tracker;
+        double position = 0.0, nowMs = 0.0;
+        tracker.notePresented( 0.0, 0, 0, 0, 2859 );
+        int lastPresented = 0, lateTicks = 0;
+        for( int t = 1; position < 1499.0 && t < 40000; ++t )
+        {
+            const double tickMs = ( t % 97 == 0 ) ? 50.0 + ( ( t / 97 ) % 33 ) : 8.0;
+            if( tickMs > 8.0 ) ++lateTicks;
+            nowMs += tickMs;
+            const double granted = guard.grant( 24.0 * tickMs / 1000.0, nowMs, 24.0 );
+            if( t == 1 ) guard.notePresent( nowMs, 24.0 );
+            const playback_frame_range::DropFrameTickResult tick = playback_frame_range::advanceDropFrameTick(
+                position, playback_frame_range::conformDropFrameDelta( position, granted, conform ), 1, 2860, false );
+            position = tick.position;
+            const int presented = static_cast<int>( position );
+            if( presented != lastPresented )
+            {
+                tracker.notePresented( nowMs / 1000.0, presented, 0, 0, 2859 );
+                lastPresented = presented;
+            }
+        }
+        ASSERT_TRUE( lateTicks > 10 );
+        if( conform )
+        {
+            ASSERT_EQ( 1, tracker.maxJump() );
+            ASSERT_EQ( static_cast<uint64_t>( tracker.advancedFrames() + 1 ), tracker.presented() );
+        }
+        else
+        {
+            ASSERT_EQ( 2, tracker.maxJump() );
+        }
+    }
 }

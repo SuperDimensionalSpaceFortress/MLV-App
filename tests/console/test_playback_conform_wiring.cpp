@@ -150,6 +150,29 @@ TEST(PlaybackConformWiring, DropFrameGrantUsesPlaybackRateForBothInputs)
         "m_playbackPaceGuard.grant( getPlaybackFramerate() * (double)timeDiff / 1000.0, paceNowMs, playbackPaceGuardFps() ),")));
 }
 
+// HFR-NATIVE-60FPS-FULLRES-1 r24 (key3 B1 M-HFR-CONFORM-SKIP): the drop-frame tick applies the grant through
+// conformDropFrameDelta, gated on conform, and the slip/source-advance/wrap recorders read the position it produced. The
+// arithmetic is pinned by test_playback_frame_range.cpp's PlaybackConformDropFrame tests.
+TEST(PlaybackConformWiring, DropFrameTickQuantisesTheConformedCatchupToWholeFrames)
+{
+    const QString body = playbackHandlingBody(mainWindowSource());
+    ASSERT_FALSE(body.isEmpty());
+    const QString call = QStringLiteral(
+        "playback_frame_range::advanceDropFrameTick(\n"
+        "                        m_newPosDropMode,\n"
+        "                        playback_frame_range::conformDropFrameDelta(\n"
+        "                            m_newPosDropMode,\n"
+        "                            m_playbackPaceGuard.grant( getPlaybackFramerate() * (double)timeDiff / 1000.0, paceNowMs, playbackPaceGuardFps() ),\n"
+        "                            playbackConformActive() ),");
+    ASSERT_EQ(1, countOccurrences(body, call));
+    ASSERT_EQ(1, countOccurrences(body, QStringLiteral("playback_frame_range::advanceDropFrameTick(")));
+    ASSERT_EQ(1, countOccurrences(body, QStringLiteral("playback_frame_range::conformDropFrameDelta(")));
+    // the recorders read the tick's own position, after the quantisation
+    const int at = body.indexOf(call);
+    ASSERT_TRUE(body.indexOf(QStringLiteral("const double grantedDropFrames = dropFrameTick.position - sourcePositionBeforeDropTick"), at) > at);
+    ASSERT_TRUE(body.indexOf(QStringLiteral("m_sourceAdvance.noteEngineTick( sourcePositionBeforeDropTick, dropFrameTick.position, dropFrameTick.wrapped );"), at) > at);
+}
+
 TEST(PlaybackConformWiring, SlipHistogramMovesUsePlaybackRate)
 {
     const QString body = playbackHandlingBody(mainWindowSource());

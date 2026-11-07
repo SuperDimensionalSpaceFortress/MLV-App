@@ -12627,7 +12627,7 @@ class ConformMeasuredFieldsAreJudgedTests(unittest.TestCase):
         proc, out = run_pwsh_json(
             "$m = [pscustomobject]@{ conformSourceFps = 24.0; conformMaxJump = 1; conformAudioSyncRequests = 0; rows = 5 }\n"
             "$absent = Get-DvCriteriaMetrics -Metrics $m -Playback ([ordered]@{ conformLinePresent = $false })\n"
-            "$bad = Get-DvCriteriaMetrics -Metrics $m -Playback ([ordered]@{ conformLinePresent = $true; conformSourceFps = 33.6; conformMaxJump = 2; conformAudioSyncRequests = 1 })\n"
+            "$bad = Get-DvCriteriaMetrics -Metrics $m -Playback ([ordered]@{ conformLinePresent = $true; summarySession = '3'; conformSession = '3'; conformSourceFps = 33.6; conformMaxJump = 2; conformAudioSyncRequests = 1 })\n"
             "$none = Get-DvCriteriaMetrics -Metrics $m -Playback $null\n"
             "[ordered]@{ absent = $absent; bad = $bad; none = $none } | ConvertTo-Json -Compress -Depth 4")
         self.assertIsNotNone(out, proc.stdout + proc.stderr)
@@ -12637,6 +12637,38 @@ class ConformMeasuredFieldsAreJudgedTests(unittest.TestCase):
         self.assertNotIn("conformSourceFpsCouldNotCheck", out["bad"])
         self.assertIsNone(out["none"]["conformMaxJump"], out)
         self.assertIn("no playback block", out["none"]["conformMaxJumpCouldNotCheck"])
+
+    def test_r24_a1_a_hand_built_block_without_a_present_measured_session_line_is_never_trusted(self) -> None:
+        """r23 adversary A1 (DV-CONFORM-CRITERIA-METRICS-PRESENCE-GUARD-1), sol r23's literal: conformLinePresent=$false, mismatched sessions,
+        conformSourceFps=24, conformMaxJump=1, conformAudioSyncRequests=0 passed Get-DvCriteriaMetrics + Test-DvCriteria. Each shape now leaves the
+        values absent with a typed CouldNotCheck, so every conform criterion FAILS; only a present, same-session line passes."""
+        good = "conformSourceFps = 24.0; conformMaxJump = 1; conformAudioSyncRequests = 0"
+        shapes = {
+            "sol literal": ("conformLinePresent = $false; summarySession = '3'; conformSession = '2'", "no playback_smoke.conform line"),
+            "absent line, same session": ("conformLinePresent = $false; summarySession = '3'; conformSession = '3'", "no playback_smoke.conform line"),
+            "present line, other session": ("conformLinePresent = $true; summarySession = '3'; conformSession = '2'", "not the measured session 3"),
+            "present line, no measured session": ("conformLinePresent = $true; conformSession = '3'", "not the measured session"),
+            "presence as a string": ("conformLinePresent = 'true'; summarySession = '3'; conformSession = '3'", "no playback_smoke.conform line"),
+            "presence as an array": ("conformLinePresent = @($true); summarySession = '3'; conformSession = '3'", "no playback_smoke.conform line"),
+            "sound": ("conformLinePresent = $true; summarySession = '3'; conformSession = '3'", None),
+        }
+        criteria = json.dumps([{"metric": "conformSourceFps", "op": "ge", "value": 23.5}, {"metric": "conformMaxJump", "op": "eq", "value": 1},
+                               {"metric": "conformAudioSyncRequests", "op": "eq", "value": 0}])
+        for name, (fields, why) in shapes.items():
+            with self.subTest(shape=name):
+                proc, out = run_pwsh_json(
+                    f"$m = Get-DvCriteriaMetrics -Metrics ([pscustomobject]@{{ rows = 5 }}) -Playback ([pscustomobject]@{{ {fields}; {good} }})\n"
+                    "$v = Test-DvCriteria -Criteria ($env:DVE_CRIT | ConvertFrom-Json) -Metrics $m\n"
+                    "[ordered]@{ m = $m; pass = $v.pass } | ConvertTo-Json -Compress -Depth 4", DVE_CRIT=criteria)
+                self.assertIsNotNone(out, proc.stdout + proc.stderr)
+                if why is None:
+                    self.assertTrue(out["pass"], out)
+                    self.assertEqual((out["m"]["conformSourceFps"], out["m"]["conformMaxJump"]), (24.0, 1), out)
+                    continue
+                self.assertFalse(out["pass"], out)
+                for metric in ("conformSourceFps", "conformMaxJump", "conformAudioSyncRequests"):
+                    self.assertIsNone(out["m"][metric], out)
+                    self.assertIn(why, out["m"][metric + "CouldNotCheck"], out)
 
     def test_both_criteria_call_sites_judge_the_criteria_metrics(self) -> None:
         """Invoke-VenueLeg (the leg's own verdict) and Test-DvReceiptValid (the re-derived verdict) both hand Test-DvCriteria the criteria metrics."""
