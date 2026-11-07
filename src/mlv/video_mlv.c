@@ -7194,6 +7194,10 @@ static int mlv_reduced_bayer_to_display_rgb16(uint16_t * out,
 {
     if (!out || !bayer || bw <= 0 || bh <= 0 || out_w <= 0 || out_h <= 0) return 0;
     const uint64_t bayer_rgb_words = (uint64_t)bw * (uint64_t)bh * 3u;
+    /* r14 (adversary r14 pass 1 A1): debayerBasicU16 indexes RGB words as int, so a Bayer over INT_MAX RGB words
+     * (e.g. 32766 x 21856 for a 65532 x 43712 clip at x4) would overflow its index; both branches refuse it. The
+     * kernel-wide size_t indexing is card CPU-DEBAYER-BASIC-SIZE-T-INDEX-1. */
+    if (bayer_rgb_words > (uint64_t)INT_MAX) return 0;
     /* The filtered branch debayers into thread-local scratch: below 4 rows, at an
      * odd height (the last row pair is not reconstructed) or under 4 columns
      * debayerBasicU16 leaves rows of a previous frame's scratch in place
