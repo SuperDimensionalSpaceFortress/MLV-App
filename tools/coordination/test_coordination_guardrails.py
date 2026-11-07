@@ -2387,7 +2387,7 @@ def test_r4_dot_p2_the_contract_names_the_allowed_json_kind_per_field_in_code():
     builder = src[src.index("function ConvertFrom-LaneJsonObject"):src.index("function Test-LaneJsonScalar")]
     assert "default  { $v = $e.GetRawText() }" not in builder
     # r4 A2: the result is a case-exact (ordinal) dictionary, not a psobject whose member names collide by case
-    assert "[System.StringComparer]::Ordinal" in builder and "$o[$p.Name] = $v" in builder
+    assert "[System.StringComparer]::Ordinal" in builder and "$o[$name] = $v" in builder
     assert "Add-Member" not in builder
 
 
@@ -2460,6 +2460,55 @@ def test_r4_adv_a2_the_exactly_spelled_contract_field_is_never_hidden_by_a_case_
     # and a variant spelling alone never makes a refusal
     env = '{"type":"result","subtype":"success","IS_ERROR":true,"result":"You\'ve hit your session limit."}\n'
     assert _classify(tmp_path, "", "claude", answer=env) is None
+
+
+def test_r4_adv2_a1_a_malformed_quote_led_line_after_the_last_fence_is_a_malformed_terminal_value(tmp_path):
+    # adversary r4 pass 2 A1: an unterminated JSON string line ("no verdict issued) is a malformed terminal value, not
+    # prose, so the earlier provisional approval must not stand in for it.
+    prov = '```json\n{"verdict":"APPROVE"}\n```\n'
+    for tail in ('"no verdict issued\n', '"no verdict issued\nDone.\n', '"unterminated \\"\n'):
+        r = _work_evidence(tmp_path, "codex", R4_PROSE + prov + tail, 0, prompt_chars=600, require_verdict=True)
+        assert r["workCompleted"] is False and r["reason"] == "codex-no-verdict", (tail, r)
+    # prose that merely starts with a digit or a word is still prose; a complete quoted string is the scalar case
+    for tail in ("3 findings.\nDone.\n", "null hypothesis rejected.\n", "true to the spec.\n"):
+        assert _work_evidence(tmp_path, "codex", R4_PROSE + prov + tail, 0, prompt_chars=600, require_verdict=True)["workCompleted"] is True, tail
+
+
+def test_r4_adv2_a2_unrelated_metadata_that_cannot_be_read_never_erases_the_contract_evidence(tmp_path):
+    # adversary r4 pass 2 A2: JsonDocument.Parse accepts a lone surrogate escape, GetString() on it throws, and the
+    # builder returned null, so a real verdict / success envelope / 429 refusal was lost.
+    lone = '"note":"\\uD800"'
+    r = _work_evidence(tmp_path, "codex", R4_PROSE + '{"verdict":"APPROVE",%s}\n' % lone, 0, prompt_chars=600, require_verdict=True)
+    assert r["workCompleted"] is True, r
+    env = '{"type":"result","subtype":"success","is_error":false,%s}\n' % lone
+    assert _work_evidence(tmp_path, "claude", env, 0)["workCompleted"] is True
+    env = '{"type":"result","is_error":true,"api_error_status":429,"result":"x",%s}\n' % lone
+    r = _classify(tmp_path, "", "claude", answer=env)
+    assert r is not None and r["kind"] == "provider-rate-limit", r
+    # the contract field itself unreadable is never evidence
+    r = _work_evidence(tmp_path, "codex", R4_PROSE + '{"verdict":"\\uD800"}\n', 0, prompt_chars=600, require_verdict=True)
+    assert r["workCompleted"] is False, r
+
+
+def test_r4_adv2_a3_every_kind_a_line_names_counts_for_the_stderr_corroboration(tmp_path):
+    # adversary r4 pass 2 A3: the answer line names usage-limit AND 429 (rate-limit); stderr says HTTP 429. First-match
+    # classification kept only usage-limit for the answer and rate-limit for stderr, so the shared kind was lost.
+    ans = "ERROR: You've hit your usage limit. Visit settings to purchase more credits or try again at Nov 9th, 2026 8:09 PM. HTTP 429."
+    r = _classify(tmp_path, "ERROR: HTTP 429\n", "codex", answer=ans)
+    assert r is not None and r["kind"] in ("provider-usage-limit", "provider-rate-limit"), r
+    # controls: unrelated recovered stderr still never overturns an answer, and a refusal answer with no corroboration is an answer
+    assert _classify(tmp_path, "ERROR: upstream probe returned 429; recovered\n", "codex", answer="ERROR: file not found") is None
+    assert _classify(tmp_path, "", "codex", answer=ans) is None
+    assert _classify(tmp_path, "ERROR: authentication failed\n", "codex", answer=ans) is None
+
+
+def test_r4_adv2_a4_a_stderr_fallback_answer_is_written_to_the_output_file_the_receipt_hashes():
+    # adversary r4 pass 2 A4: with a ZWSP-only last-message file the selected answer is empty, $final falls back to
+    # stderr and outputSha256 hashes the narration while outputPath still holds the ZWSP. The file must be rewritten.
+    body = LANE_RUNNER.read_text(encoding="utf-8").replace("\r\n", "\n")
+    needle = "if ($timedOut -or ($final -ceq $stderrText -and -not (Test-LaneAnswerHasSubstance -Answer $codexAnswerEvidence))) { Write-Utf8NoBom $lastPath $final }"
+    assert needle in body, "the stderr fallback must be written to the receipt output file"
+    assert body.index(needle) < body.index("outputSha256 = Get-Sha256 $final")
 
 
 def test_r3c_a4_an_array_typed_result_line_is_not_the_envelope_and_hides_no_refusal(tmp_path):

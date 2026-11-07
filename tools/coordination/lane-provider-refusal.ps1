@@ -28,9 +28,13 @@
 # against the real 2026-09-07 stderr, a known-good transcript, and prose that only QUOTES a refusal.
 # ASCII-only by project convention.
 
-function Get-RefusalKind {
+# Every refusal kind a line names, in pattern order, no duplicates (r4 pass 2, adversary A3): one line can name two
+# kinds ("You've hit your usage limit ... HTTP 429"), and the stderr corroboration compares kinds, so keeping only the
+# FIRST match on each side lost the shared one. Get-RefusalKind (the first) is what a single-kind caller reads.
+function Get-RefusalKinds {
     param([AllowEmptyString()][AllowNull()][string]$Line)
-    if ([string]::IsNullOrWhiteSpace($Line)) { return $null }
+    $found = New-Object System.Collections.Generic.List[string]
+    if ([string]::IsNullOrWhiteSpace($Line)) { return }
     $patterns = @(
         @{ kind = 'provider-usage-limit'; rx = "you'?ve hit your (usage|session|weekly|monthly) limit" },
         @{ kind = 'provider-usage-limit'; rx = 'purchase more credits' },
@@ -42,8 +46,15 @@ function Get-RefusalKind {
         # token expired after an account rotation; envelope is_error=true, api_error_status=null.
         @{ kind = 'provider-auth';        rx = 'failed to authenticate|oauth session expired' }
     )
-    foreach ($p in $patterns) { if ($Line -imatch $p.rx) { return $p.kind } }
-    return $null
+    foreach ($p in $patterns) { if ($Line -imatch $p.rx -and -not $found.Contains($p.kind)) { $found.Add($p.kind) } }
+    return $found.ToArray()
+}
+
+function Get-RefusalKind {
+    param([AllowEmptyString()][AllowNull()][string]$Line)
+    $all = @(Get-RefusalKinds -Line $Line)
+    if ($all.Count -eq 0) { return $null }
+    return $all[0]
 }
 
 function New-RefusalRecord {
@@ -190,23 +201,31 @@ function ConvertFrom-LaneJsonObject {
             if ($doc.RootElement.ValueKind -ne [System.Text.Json.JsonValueKind]::Object) { return $null }
             $o = New-Object 'System.Collections.Generic.Dictionary[string,object]' ([System.StringComparer]::Ordinal)
             foreach ($p in $doc.RootElement.EnumerateObject()) {
-                $e = $p.Value
-                $v = $null
-                $vk = $e.ValueKind.ToString()
-                switch ($vk) {
-                    'String' { $v = $e.GetString() }
-                    'True'   { $v = $true }
-                    'False'  { $v = $false }
-                    'Null'   { $v = $null }
-                    'Number' {
-                        $l = 0L; $d = 0.0
-                        if ($e.TryGetInt64([ref]$l)) { $v = $l }
-                        elseif ($e.TryGetDouble([ref]$d) -and -not [double]::IsInfinity($d)) { $v = $d }
-                        else { $v = [ordered]@{ jsonKind = 'Number'; raw = $e.GetRawText() } }
-                    }
-                    default  { $v = [ordered]@{ jsonKind = $vk; raw = $e.GetRawText() } }
-                }
-                $o[$p.Name] = $v
+                # r4 pass 2 (A2): the strict parse accepts a lone surrogate escape ("\uD800") that GetString() / .Name
+                # cannot read. One unreadable member must never erase the object: its value becomes an 'Unreadable'
+                # kind marker (never contract evidence), and a member whose NAME is unreadable is skipped.
+                try {
+                    $name = $p.Name
+                    $e = $p.Value
+                    $v = $null
+                    $vk = $e.ValueKind.ToString()
+                    try {
+                        switch ($vk) {
+                            'String' { $v = $e.GetString() }
+                            'True'   { $v = $true }
+                            'False'  { $v = $false }
+                            'Null'   { $v = $null }
+                            'Number' {
+                                $l = 0L; $d = 0.0
+                                if ($e.TryGetInt64([ref]$l)) { $v = $l }
+                                elseif ($e.TryGetDouble([ref]$d) -and -not [double]::IsInfinity($d)) { $v = $d }
+                                else { $v = [ordered]@{ jsonKind = 'Number'; raw = $e.GetRawText() } }
+                            }
+                            default  { $v = [ordered]@{ jsonKind = $vk; raw = $e.GetRawText() } }
+                        }
+                    } catch { $v = [ordered]@{ jsonKind = 'Unreadable'; raw = '' } }
+                    $o[$name] = $v
+                } catch { continue }
             }
         } finally { $doc.Dispose() }
     } catch { return $null }
@@ -393,7 +412,10 @@ function Get-LaneTerminalCandidate {
         for ($li = $lines.Count - 1; $li -ge $firstTail -and $li -gt $candEnd; $li--) {
             $lt = $lines[$li].Trim([char[]](9, 10, 13, 32))
             if ($lt.Length -eq 0 -or $lt -notmatch '^(null|true|false|-?[0-9]|")') { continue }
-            if (Test-LaneJsonScalar -Text $lt) { return [pscustomobject]@{ form = 'unfenced'; text = $lt; startLine = $li } }
+            # r4 pass 2 (A1): a line that OPENS a JSON string but is not a complete one is a malformed terminal value (the
+            # strict object parse rejects it), never prose; null / true / false / digits that are not a complete scalar
+            # ("3 findings.", "null hypothesis") stay prose.
+            if ((Test-LaneJsonScalar -Text $lt) -or $lt.StartsWith('"')) { return [pscustomobject]@{ form = 'unfenced'; text = $lt; startLine = $li } }
         }
         if ($null -ne $c) { return [pscustomobject]@{ form = 'unfenced'; text = $c.text; startLine = $candStart } }
     }
@@ -527,9 +549,9 @@ function Get-ProviderRefusal {
         $ansLines = @((Split-LaneLines -Text $Answer) | Where-Object { Test-LaneAnswerHasSubstance -Answer $_ })
         $answerKinds = New-Object System.Collections.Generic.List[string]
         foreach ($al in $ansLines) {
-            $ak = if ($al -match '^\s*ERROR\b') { Get-RefusalKind -Line $al } else { $null }
-            if ($null -eq $ak) { return $null }
-            if (-not $answerKinds.Contains($ak)) { $answerKinds.Add($ak) }
+            $aks = @(if ($al -match '^\s*ERROR\b') { Get-RefusalKinds -Line $al })
+            if ($aks.Count -eq 0) { return $null }
+            foreach ($ak in $aks) { if (-not $answerKinds.Contains($ak)) { $answerKinds.Add($ak) } }
         }
     }
     if ([string]::IsNullOrWhiteSpace($Text)) { return $null }
@@ -542,9 +564,12 @@ function Get-ProviderRefusal {
     }
     foreach ($line in @(Split-LaneLines -Text $scan)) {
         if ($line -notmatch '^\s*ERROR\b') { continue }
-        $kind = Get-RefusalKind -Line $line
+        # every kind the stderr line names counts; the first one the answer also names is the reported kind (r4 pass 2, A3)
+        $kind = $null
+        foreach ($k in @(Get-RefusalKinds -Line $line)) {
+            if ($null -eq $answerKinds -or $answerKinds.Contains($k)) { $kind = $k; break }
+        }
         if ($null -eq $kind) { continue }
-        if ($null -ne $answerKinds -and -not $answerKinds.Contains($kind)) { continue }
         return New-RefusalRecord -Kind $kind -Engine $Engine -Match $line
     }
     return $null

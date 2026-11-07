@@ -3155,7 +3155,9 @@ if ($cfg.engine -eq 'claude') {
     # approach entirely.
     if ([string]::IsNullOrWhiteSpace($final)) { $final = $stderrText }
     if ($null -eq $final) { $final = '' }
-    if ($timedOut) { Write-Utf8NoBom $lastPath $final }
+    # K4 r4 pass 2 (adversary A4): when the answer has no substance (a ZWSP-only last-message file) $final fell back to
+    # stderr above, and outputSha256 / outputBytes below describe $final, so the receipt output file must hold it too.
+    if ($timedOut -or ($final -ceq $stderrText -and -not (Test-LaneAnswerHasSubstance -Answer $codexAnswerEvidence))) { Write-Utf8NoBom $lastPath $final }
     # K4 r2 (adversary A4): when the selected answer came from stdout because the last-message file had no
     # substance, the receipt's outputPath file must hold the answer the outputSha256 below describes.
     if (-not $timedOut -and (Test-LaneAnswerHasSubstance -Answer $codexAnswerEvidence) -and -not (Test-LaneAnswerHasSubstance -Answer $lastMessage)) {
