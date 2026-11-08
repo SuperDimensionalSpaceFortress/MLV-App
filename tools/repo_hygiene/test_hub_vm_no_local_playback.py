@@ -190,17 +190,24 @@ _COUNT_CACHE: dict = {}
 _WORD_LIST_CACHE: dict = {}
 
 
-def _popen_pwsh(probe: Path) -> "subprocess.Popen":
-    """The one place a pwsh lint probe is started in the background; counted in _PWSH_SPAWNS."""
-    _PWSH_SPAWNS.append(probe.name)
+def _popen_pwsh(probe: Path, counted: bool = True) -> "subprocess.Popen":
+    """The one place a pwsh lint probe is started in the background; counted in _PWSH_SPAWNS unless `counted` is False (the re-probe of a start fault in
+    _collect_counts: the witnesses count LOGICAL probes, and a recovered re-run must not read as an extra one -- adversary r1 A3)."""
+    if counted:
+        _PWSH_SPAWNS.append(probe.name)
     proc = subprocess.Popen([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-File", str(probe)],
                             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
     proc.started_at = time.monotonic()  # read by _collect_counts for its typed timeout message
     # CI-FLAKE-PROMPT-LINT-PWSH-RUNTIME-LOAD-1: when the child ENDED, so _collect_counts can tell a death inside the start-up window from a late one
     # even though the shards are collected one after another (collecting late must not make an early crash look late).
     proc.ended_at = None
-    proc.exit_watch = threading.Thread(target=_note_exit, args=(proc,), daemon=True)
-    proc.exit_watch.start()
+    proc.exit_watch = None
+    try:  # adversary r1 A2: the clock is advisory, so a thread that cannot start must never strand the child the caller is about to own
+        watcher = threading.Thread(target=_note_exit, args=(proc,), daemon=True)
+        watcher.start()
+        proc.exit_watch = watcher
+    except Exception:  # noqa: BLE001 - e.g. RuntimeError("can't start new thread"); the probe is then judged as ending when it is collected
+        pass
     return proc
 
 
@@ -479,7 +486,10 @@ def _collect_counts(proc: "subprocess.Popen", expected: int, deadline: float | N
         if deadline - time.monotonic() <= 0:
             raise LintProbeStartFault(f"lint probe start fault: {first.kind} in {probe.name}; no budget left for the one re-probe; attempt 1: {first.detail}", first.kind, first.detail) from None
         print(f"[{probe.name}] interpreter start fault ({first.detail.splitlines()[0]}): running the probe once more", file=sys.stderr)
-        again = _popen_pwsh(probe)
+        if deadline - time.monotonic() <= 0:  # adversary r1 A1: writing the log line took time too; the launch must still be inside the shared deadline
+            raise LintProbeStartFault(f"lint probe start fault: {first.kind} in {probe.name}; no budget left for the one re-probe (spent while it was announced); "
+                                      f"attempt 1: {first.detail}", first.kind, first.detail) from None
+        again = _popen_pwsh(probe, counted=False)
         try:
             return _collect_counts_once(again, expected, deadline)
         except LintProbeStartFault as second:
@@ -5832,7 +5842,7 @@ class CollectCountsRuntimeLoadFaultTests(unittest.TestCase):
         started: list = []
         script = list(later)
 
-        def fake_popen(probe):
+        def fake_popen(probe, counted=True):
             started.append(probe.name)
             return script.pop(0)
 
@@ -5935,7 +5945,7 @@ class CollectCountsRuntimeLoadFaultTests(unittest.TestCase):
         self.assertTrue(silent.startswith("lint probe start fault: pwsh start-up crash"), silent)
 
     def _raise_typed(self):
-        with mock.patch.object(sys.modules[__name__], "_popen_pwsh", lambda probe: self._fault()):
+        with mock.patch.object(sys.modules[__name__], "_popen_pwsh", lambda probe, counted=True: self._fault()):
             return _collect_counts(self._fault(), 1, time.monotonic() + 60)
 
     def test_the_classifier_accepts_each_stderr_shape_the_hosted_logs_printed(self):
@@ -5997,6 +6007,36 @@ class CollectCountsRuntimeLoadFaultTests(unittest.TestCase):
             _run_retrying_start_fault(times_out, "in-probe.ps1")
         self.assertEqual(1, len(calls), "a timeout is not re-run")
 
+    def test_adversary_a1_the_deadline_is_rechecked_after_the_retry_is_logged(self):
+        """Adversary r1 A1: logging the retry takes time; the launch must still be inside the shared deadline (the clock is scripted: the log write costs 1.7 s)."""
+        clock = [1000.0]
+
+        class SlowLog(io.StringIO):
+            def write(self, text):
+                clock[0] += 1.7
+                return super().write(text)
+
+        started: list = []
+        with mock.patch.object(sys.modules[__name__], "_popen_pwsh", lambda probe, counted=True: started.append(probe.name) or self.Scripted(0, "[1]", "")), \
+                mock.patch.object(time, "monotonic", lambda: clock[0]), contextlib.redirect_stderr(SlowLog()):
+            with self.assertRaises(AssertionError) as caught:
+                _collect_counts(self._fault(), 1, 1000.7)
+        self.assertEqual([], started, "the deadline passed while the retry was being logged: no launch")
+        self.assertTrue(str(caught.exception).startswith("lint probe start fault: pwsh runtime load failure"), str(caught.exception))
+        self.assertIn("no budget", str(caught.exception))
+
+    def test_adversary_a3_the_re_probe_is_not_counted_as_a_second_logical_probe(self):
+        """Adversary r1 A3: _PWSH_SPAWNS is what the differential witnesses count (one probe per distinct lint/corpus); a recovered re-probe must not add to it."""
+        flags: list = []
+
+        def fake_popen(probe, counted=True):
+            flags.append(counted)
+            return self.Scripted(0, "[1]", "")
+
+        with mock.patch.object(sys.modules[__name__], "_popen_pwsh", fake_popen), contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual([1], _collect_counts(self._fault(), 1, time.monotonic() + 60))
+        self.assertEqual([False], flags, "the re-probe is started uncounted")
+
     def test_the_start_window_is_the_one_the_lint_cache_probe_uses(self):
         """The classifier, the window and the signal set are the LintCache probe's own (#718, #747), not a second copy."""
         self.assertEqual(5, LINT_PROBE_START_WINDOW_SEC)
@@ -6025,6 +6065,49 @@ class PopenPwshExitClockTests(unittest.TestCase):
         self.assertIsNotNone(proc.ended_at)
         self.assertLess(lasted, time.monotonic() - proc.started_at - 1.0, "the lifetime excludes the 1.5 s the probe waited to be collected")
         self.assertEqual(float("inf"), _probe_lasted(mock.Mock(spec=[])), "a probe with no start time is never taken to be inside the window")
+
+    def test_adversary_a2_a_watcher_thread_that_cannot_start_does_not_orphan_the_child(self):
+        """Adversary r1 A2: if the exit watcher cannot be started the child is still returned (owned by the caller, who kills it), never left running unowned."""
+        tmp = Path(tempfile.mkdtemp(prefix="hubvm-exitclock-"))
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        probe = tmp / "quick-probe.ps1"
+        _write_probe(probe, "'[1]'\n")
+
+        class NoThreads:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            def start(self):
+                raise RuntimeError("can't start new thread")
+
+        with mock.patch.object(threading, "Thread", NoThreads):
+            proc = _popen_pwsh(probe)  # must not raise: the clock is advisory
+        try:
+            self.assertEqual("[1]", proc.communicate(timeout=60)[0].strip())
+            self.assertIsNone(proc.ended_at)
+            self.assertIsNone(proc.exit_watch)
+            self.assertTrue(_probe_lasted(proc) >= 0, "judged as ending when collected")
+        finally:
+            _kill(proc)
+
+    def test_adversary_a3_an_uncounted_start_is_not_in_the_spawn_list(self):
+        tmp = Path(tempfile.mkdtemp(prefix="hubvm-exitclock-"))
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        probe = tmp / "uncounted-probe.ps1"
+        _write_probe(probe, "'[1]'\n")
+        before = len(_PWSH_SPAWNS)
+        proc = _popen_pwsh(probe, counted=False)
+        try:
+            proc.communicate(timeout=60)
+        finally:
+            _kill(proc)
+        self.assertEqual(before, len(_PWSH_SPAWNS))
+        proc = _popen_pwsh(probe)
+        try:
+            proc.communicate(timeout=60)
+        finally:
+            _kill(proc)
+        self.assertEqual(["uncounted-probe.ps1"], _PWSH_SPAWNS[before:], "a normal start is still counted")
 
 
 if __name__ == "__main__":
