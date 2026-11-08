@@ -265,27 +265,29 @@ def _pidfd_send_kill(fd: int) -> None:
 class _PidHandle:
     """r5 (adversary A1, second form): a handle on the ORIGINAL child that PID recycling cannot redirect. Linux pidfd_open(), taken right after Popen() returns, when
     nobody has reaped yet (only this module's own watcher or collector ever will, and neither has the Popen yet), so the PID is certainly the child's. Unlike a
-    reaped (only this module's own watcher or collector ever will, and neither has the Popen yet), so the PID is certainly the child's. Unlike a
     PID or Popen.returncode it needs no reap to be recorded before it answers: the descriptor reports the exit of that one process, however late any thread that
     reaped it is. `running()` is False once the handle is closed. Thread-safe.
 
     r6: the same descriptor is how the child is SIGNALLED (`kill()`), because a signal by PID number can land on whatever process holds the number once the original
     is reaped. Only the exit watcher closes the handle in normal operation (after the child is reaped and its status recorded); the window timer only reads it, so a
     child that is still alive always still has an open handle. `_PidHandle(None)` is a handle that could not be opened (pidfd_open failed on a supported kernel,
-    e.g. EMFILE): it answers 'not running', so an unknown life is never taken for a proven long one, and it cannot signal (`kill()` says so)."""
+    e.g. EMFILE): it answers 'not running', so an unknown life is never taken for a proven long one, it cannot signal (`kill()` says so), and `unopened` is True so
+    that the exit watcher does not REAP the child (see _note_exit): an unreaped child keeps its PID reserved, which is what makes a signal by number safe then."""
 
     def __init__(self, fd: "int | None"):
+        self._lock = threading.Lock()  # r6 pass 14 A4: before anything else is acquired, so an interrupt in here cannot strand a half-built owner of a descriptor
+        self.unopened = fd is None
         self._fd = fd
-        self._lock = threading.Lock()
 
     def running(self) -> bool:
         with self._lock:
             return self._fd is not None and not _pidfd_exited(self._fd)
 
     def kill(self) -> bool:
-        """SIGKILL the original child through the descriptor. True when this settled the matter: the signal was delivered, the child had already exited (ESRCH), or
-        the kernel refused it (EPERM and the like) -- none of which is ever retried by PID number. False when the handle is closed or was never open, and the caller
-        must decide. The descriptor is used under the lock, so it cannot be closed (and its number reused) in the middle."""
+        """SIGKILL the original child through the descriptor. True when this settled the matter: the signal was delivered, or the child had already exited (ESRCH:
+        nothing to signal, and nothing is ever sent to another process). False when the handle is closed or was never open, and ALSO when the kernel refused the
+        signal (r6 pass 14 A2: a refusal is not a verdict, the child may still be alive), so the caller falls back to Popen's own poll()/kill(). The descriptor is
+        used under the lock, so it cannot be closed (and its number reused) in the middle."""
         with self._lock:
             if self._fd is None:
                 return False
@@ -294,9 +296,8 @@ class _PidHandle:
             except ProcessLookupError:
                 pass  # already exited: the child is gone, nothing to signal
             except OSError:
-                pass  # advisory cleanup: a refused signal is not retried against a bare PID
+                return False  # refused: not settled
             return True
-            return self._fd is not None and not _pidfd_exited(self._fd)
 
     def close(self) -> None:
         with self._lock:
@@ -323,9 +324,15 @@ def _open_pidfd(proc: "subprocess.Popen") -> "_PidHandle | None":
     try:
         if isinstance(proc, _REAL_POPEN) and hasattr(os, "pidfd_open") and isinstance(getattr(proc, "pid", None), int):
             try:
-                return _PidHandle(os.pidfd_open(proc.pid))
+                fd = os.pidfd_open(proc.pid)
             except Exception:  # noqa: BLE001
                 return _PidHandle(None)
+            try:
+                return _PidHandle(fd)
+            except BaseException:  # r6 pass 14 A4: an interrupt while the handle is built must not leave the descriptor without an owner
+                with contextlib.suppress(OSError):
+                    _close_pidfd(fd)
+                raise
     except Exception:  # noqa: BLE001
         pass
     return None
@@ -378,11 +385,31 @@ def _release_pid_handle(proc: "subprocess.Popen") -> None:
         handle.close()
 
 
+def _wait_without_reaping(proc: "subprocess.Popen") -> bool:
+    """r6 (adversary pass 14 A1): block until the child exits WITHOUT reaping it, and say True; False when that does not apply (the child has a usable pidfd, or the
+    platform has no waitid) and the caller waits the ordinary way.
+
+    Why: when pidfd_open() failed on a supported kernel there is no handle to signal the original child through, so _kill falls back to Popen's poll()/kill(), which
+    signal by PID number. That is safe exactly as long as nobody but the owner reaps the child: an exited, unreaped child is a zombie that keeps its PID reserved. The
+    exit watcher is the only other party that would reap, and with an unopened handle it observes the exit with a WNOWAIT waitid instead, leaving the reaping to the
+    owner (communicate/poll/_kill), which runs in the thread that also decides to signal."""
+    handle = getattr(proc, "pid_handle", None)
+    pid = getattr(proc, "pid", None)
+    if handle is None or not getattr(handle, "unopened", False) or not hasattr(os, "waitid") or not isinstance(pid, int):
+        return False
+    try:
+        os.waitid(os.P_PID, pid, os.WEXITED | os.WNOWAIT)
+    except ChildProcessError:  # somebody else already reaped it: Popen.wait() answers from the record
+        return False
+    return True
+
+
 def _note_exit(proc: "subprocess.Popen") -> None:
     """Record, on `proc`, the time.monotonic() instant this daemon thread (started by _spawn_watched) OBSERVED its process end, and stop the window timer
     then: a process that ended before the timer is due cannot be proven to have outlived the window."""
     try:
-        proc.wait()
+        if not _wait_without_reaping(proc):
+            proc.wait()
         proc.ended_at = time.monotonic()
         timer = getattr(proc, "window_timer", None)
         if timer is not None and proc.ended_at < getattr(timer, "interval", 0) + proc.started_at:
@@ -6451,7 +6478,10 @@ class CollectCountsRuntimeLoadFaultTests(unittest.TestCase):
 
         gate = None  # r6 (Dot E1): when set, the exit watcher is held here until the scheduler releases it, so events happen in the order the scripted clock says
 
+        waited = False  # r6 pass 14 A1: set when somebody REAPS the child through Popen.wait() (the watcher must not, where the handle could not be opened)
+
         def wait(self, timeout=None):
+            self.waited = True
             if self.gate is not None:
                 self.gate.wait(30)
             self.clock[0] = max(self.clock[0], self.wake_at)
@@ -6481,6 +6511,10 @@ class CollectCountsRuntimeLoadFaultTests(unittest.TestCase):
                                                                   "recycled": recycled, "reaped_at": reaped_at, "gate": threading.Event()})
 
         def waitid(idtype, pid, options):
+            if not options & 1:  # no WNOHANG: the exit watcher blocking until the child ends, without reaping it (r6 pass 14 A1)
+                child.gate.wait(30)
+                clock[0] = max(clock[0], wake_at)
+                return object()
             if recycled or clock[0] < exit_at:  # r5: a recycled PID names a NEW running child of the same parent, whatever became of the original
                 return None
             if reaped:
@@ -6681,7 +6715,7 @@ class CollectCountsRuntimeLoadFaultTests(unittest.TestCase):
             raise ProcessLookupError(3, "No such process")
 
         def denied(fd):
-            raise PermissionError(1, "Operation not permitted")
+            raise PermissionError(1, "Operation not permitted")  # r6 pass 14 A2
 
         with mock.patch.object(sys.modules[__name__], "_pidfd_send_kill", sent.append), mock.patch.object(sys.modules[__name__], "_close_pidfd", lambda fd: None):
             handle = _PidHandle(77)
@@ -6690,7 +6724,7 @@ class CollectCountsRuntimeLoadFaultTests(unittest.TestCase):
             with mock.patch.object(sys.modules[__name__], "_pidfd_send_kill", gone):
                 self.assertTrue(handle.kill(), "ESRCH: the child already exited -- a verdict, with no signal and no error")
             with mock.patch.object(sys.modules[__name__], "_pidfd_send_kill", denied):
-                self.assertTrue(handle.kill(), "a refused signal is a verdict too: never retried by PID number")
+                self.assertFalse(handle.kill(), "a refused signal settles nothing (the child may be alive): the caller falls back to Popen's own poll()/kill()")
             handle.close()
             self.assertFalse(handle.kill(), "a closed handle cannot signal, and says so (the caller decides)")
             self.assertEqual([77], sent)
@@ -6710,6 +6744,46 @@ class CollectCountsRuntimeLoadFaultTests(unittest.TestCase):
             with self.subTest(label + ", exit recorded"):
                 _kill(dead)
                 self.assertEqual([], bare, "a recorded exit is never signalled")
+
+    def test_r6_pass14_a2_a_refused_pidfd_signal_still_gets_the_child_killed_by_the_ordinary_path(self):
+        """Pass 14 A2: pidfd_send_signal raised PermissionError, the handle said 'settled', and _kill returned with the child alive (its communicate then timed out
+        and was swallowed). A refusal now falls through to Popen.poll()/kill()."""
+        bare: list = []
+        live = type("Live", (self.ScheduledPopen,), {"clock": [1000.0], "exit_at": 9e9, "wake_at": 9e9, "kill": lambda self: bare.append(self.pid)})(["pwsh"])
+        denied = mock.Mock(side_effect=PermissionError(1, "Operation not permitted"))
+        with mock.patch.object(sys.modules[__name__], "_pidfd_send_kill", denied), mock.patch.object(sys.modules[__name__], "_close_pidfd", lambda fd: None):
+            live.pid_handle = _PidHandle(77)
+            _kill(live)
+        self.assertEqual(1, denied.call_count)
+        self.assertEqual([4242], bare, "the live child was killed after the refusal")
+
+    def test_r6_pass14_a4_an_interrupt_while_the_pid_handle_is_built_closes_the_descriptor_it_was_given(self):
+        """Pass 14 A4: pidfd_open returned 77 and KeyboardInterrupt arrived inside _PidHandle.__init__ -- no owner existed, so descriptor 77 was never closed."""
+        closed: list = []
+
+        class Interrupted:
+            def __init__(self, fd):
+                raise KeyboardInterrupt
+
+        real_like = mock.Mock(spec=subprocess.Popen, pid=4242)
+        with mock.patch.object(os, "pidfd_open", lambda pid: 77, create=True), mock.patch.object(sys.modules[__name__], "_PidHandle", Interrupted), \
+                mock.patch.object(sys.modules[__name__], "_close_pidfd", closed.append):
+            with self.assertRaises(KeyboardInterrupt):
+                _open_pidfd(real_like)
+        self.assertEqual([77], closed, "the descriptor was released and the interrupt still propagated")
+
+    def test_r6_pass14_a1_where_the_handle_could_not_be_opened_the_watcher_does_not_reap_so_the_pid_stays_reserved(self):
+        """Pass 14 A1: with an unopened handle _kill falls back to a signal by PID number, safe only while nobody but the owner reaps (an exited, unreaped child is a
+        zombie that keeps its PID). The exit watcher therefore observes the exit with a WNOWAIT waitid and never calls Popen.wait(); the lifetime evidence is the same."""
+        proc, _ = self._scheduled_child(exit_at=1000.9, wake_at=1006.0, poll_blind=True, recycled=True, pidfd_error=OSError(24, "Too many open files"))
+        self.assertFalse(proc.waited, "the watcher did not reap the child")
+        self.assertEqual(1006.0, proc.ended_at, "and still noted when it saw the exit")
+        self.assertNotEqual(True, proc.window_proof)
+        # the ordinary paths -- a usable pidfd, no pidfd at all -- keep waiting the ordinary way
+        for label, kwargs in (("usable pidfd", dict(pidfd=True)), ("no pidfd", dict())):
+            with self.subTest(label):
+                again, _ = self._scheduled_child(exit_at=1000.9, wake_at=1006.0, **kwargs)
+                self.assertTrue(again.waited)
 
     def test_r6_a1_the_window_timer_does_not_close_the_handle_a_live_child_is_cleaned_up_through(self):
         """The timer decides the proof and nothing else: the descriptor stays open for the life of the child (only the watcher closes it, after the exit), so a
