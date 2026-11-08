@@ -832,6 +832,35 @@ class CounterWritePinTests(unittest.TestCase):
                 self.assert_caught(self.inject_in_smoke(statement), "unreviewed use of m_sourceAdvance")
         self.assertEqual(PINNED_COUNTER_READS, {"MainWindow::finishPlaybackSmokeTelemetry": 1})
 
+    def test_r31_every_compound_and_parenthesised_write_is_a_write(self) -> None:
+        """HFR-NATIVE-60FPS-FULLRES-1 r31 (Dot M2 on aa598479, the class): the read rule for .startFrame and the write rule for
+        m_playRequiredSourceFrames refused `=`, `op=`, `++` and `--` but not `<<=` / `>>=`, and a closing parenthesis before the operator hid
+        any write. Every shift-assignment and every parenthesised write of .startFrame, .highWater, .armed and the requirement is caught;
+        a plain .startFrame read and an `==` comparison stay free (the real sources are clean)."""
+        self.assertEqual(scan_app_play_sources(self.sources), [])
+        adv = "unreviewed use of m_sourceAdvance"
+        req = "m_playRequiredSourceFrames written"
+        cases = []
+        for member in ("startFrame", "highWater", "armed"):
+            for op in ("=", "+=", "-=", "*=", "|=", "<<=", ">>="):
+                cases.append((f"{member} {op}", f"m_sourceAdvance.{member} {op} 1;", adv))
+                cases.append((f"({member}) {op}", f"(m_sourceAdvance.{member}) {op} 1;", adv))
+            cases.append((f"{member}++", f"m_sourceAdvance.{member}++;", adv))
+            cases.append((f"({member})--", f"(m_sourceAdvance.{member})--;", adv))
+        for op in ("<<=", ">>="):
+            cases.append((f"requirement {op}", f"m_playRequiredSourceFrames {op} 1;", req))
+            cases.append((f"(requirement) {op}", f"(m_playRequiredSourceFrames) {op} 1;", req))
+        cases.append(("(requirement) =", "(m_playRequiredSourceFrames) = 1;", req))
+        for name, statement, needle in cases:
+            with self.subTest(name):
+                self.assert_caught(self.inject_in_smoke(statement), needle)
+        for name, statement in (("a startFrame read", "const long long advStart = m_sourceAdvance.startFrame;"),
+                                ("a startFrame comparison", "const bool advAtZero = ( m_sourceAdvance.startFrame ) == 0;"),
+                                ("a requirement comparison", "const bool reqZero = ( m_playRequiredSourceFrames ) == 0;"),
+                                ("a requirement shift read", "const long long reqHalf = m_playRequiredSourceFrames >> 1;")):
+            with self.subTest(name):
+                self.assertEqual(scan_app_play_sources(self.inject_in_smoke(statement)), [])
+
     def test_a_removed_or_extra_pinned_write_is_caught(self) -> None:
         self.assert_caught(self.mutated("m_sourceAdvance.begin( ui->horizontalSliderPosition->value() );\n        // CUDA-PERF",
                                         "// removed\n        // CUDA-PERF"), "on_actionPlay_toggled")
