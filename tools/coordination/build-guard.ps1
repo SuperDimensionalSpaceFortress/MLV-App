@@ -1007,6 +1007,13 @@ function Enter-HeavySlot([hashtable]$Options, [string]$Label) {
     # open. A pin mismatch, a REQUEUE or a COULD-NOT-CHECK prints its typed line and exits here: nothing ran.
     # A deadline that is not an instant is refused FIRST, so a missing shim cannot fail it open into a build that ignores the bound
     # (adversary cd45eeb5-A2).
+    # Before that, the deadline path's own variables (adversary 398e451f-A1): in Library mode a caller's AllScope variable is shared with
+    # these functions, and a read-only one cannot be assigned here, so an expired or invalid HeavySlotDeadlineUtc became the caller's
+    # value. Any of these names held AllScope is refused before anything is taken. The check calls no cmdlet (a caller's
+    # $PSDefaultParameterValues cannot bend it) and assigns nothing.
+    @('raw', 'at', 'styles', 'deadline', 'boundNote', 'waitMin', 'waitArg', 'giveUp').Where(
+        { $null -ne $ExecutionContext.SessionState.PSVariable.Get($_) -and ($ExecutionContext.SessionState.PSVariable.Get($_).Options -band [System.Management.Automation.ScopedItemOptions]::AllScope) }, 'First').ForEach(
+        { Write-BuildGuardTyped ('BUILD_HEAVY_SLOT_REFUSED label={0} reason=caller-allscope-variable name={1} utc={2}' -f $Label, $_, [DateTime]::UtcNow.ToString('o')); exit 2 })
     $deadline = Get-HeavySlotDeadline $Options
     if ($deadline.Why) {
         Write-BuildGuardTyped ('BUILD_HEAVY_SLOT_REFUSED label={0} reason=invalid-option HeavySlotWaitMinutes={1} HeavySlotEtaMinutes={2} ({3}) utc={4}' -f $Label, $Options.HeavySlotWaitMinutes, $Options.HeavySlotEtaMinutes, ($deadline.Why -replace '\s+', ' '), [DateTime]::UtcNow.ToString('o'))

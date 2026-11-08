@@ -1010,6 +1010,26 @@ def test_without_a_deadline_the_wait_stays_60_and_a_refusal_is_followed_by_a_fre
     assert not box["marker"].exists()
 
 
+@pytest.mark.parametrize("frozen, given", [
+    ("New-Variable raw -Value '2099-01-01T00:00:00Z' -Option AllScope,ReadOnly", "'2000-01-01T00:00:00Z'"),
+    ("New-Variable raw -Value '2099-01-01T00:00:00Z' -Option AllScope,ReadOnly", "'not-a-date'"),
+    ("New-Variable raw -Value '' -Option AllScope,ReadOnly", "'2000-01-01T00:00:00Z'"),
+    ("New-Variable deadline -Value ([DateTime]::SpecifyKind([DateTime]'2099-01-01', [DateTimeKind]::Utc)) -Option AllScope,ReadOnly",
+     "'2000-01-01T00:00:00Z'"),
+    ("New-Variable waitMin -Value 10080 -Option AllScope,ReadOnly", "'2000-01-01T00:00:00Z'"),
+], ids=["raw-expired", "raw-invalid", "raw-empty", "deadline-datetime", "waitMin"])
+def test_an_allscope_read_only_library_caller_variable_never_replaces_the_given_deadline(box, frozen, given) -> None:
+    # adversary 398e451f-A1 (its input is raw-expired and raw-invalid): in Library mode a caller's read-only AllScope $raw is shared with
+    # Get-HeavySlotDeadline, whose assignments then fail under Continue, so an expired or invalid HeavySlotDeadlineUtc became the caller's
+    # 2099 (wait=10080m) or, frozen empty, no deadline at all (60m); a frozen $deadline in Enter-HeavySlot did the same. Every variable of
+    # the deadline path is now refused when a caller holds it AllScope, before anything is taken or launched.
+    done = _stage_attempt(box, given, opts_line="$ErrorActionPreference = 'Continue'\n" + frozen + "\n")
+    name = frozen.split()[1]
+    assert done.returncode == 2, done.stdout + done.stderr
+    assert f"BUILD_HEAVY_SLOT_REFUSED label=attr3-assemble:abc reason=caller-allscope-variable name={name} " in done.stdout, done.stdout + done.stderr
+    assert _stub_calls(box) == [] and not box["marker"].exists()
+
+
 def test_the_deadline_can_come_from_the_environment(box) -> None:
     deadline = "2099-01-01T00:00:00Z"
     done = _stage_attempt(box, extra={"MLV_HEAVY_SLOT_DEADLINE_UTC": deadline})
