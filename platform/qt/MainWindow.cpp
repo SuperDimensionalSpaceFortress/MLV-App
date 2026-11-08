@@ -4227,6 +4227,7 @@ PlaybackPrepDrainOutcome MainWindow::drainPlaybackPrepInFlight( const char *reas
 bool MainWindow::playbackPrepQuiescentBeforeClipReplacement( const char *reason )
 {
     invalidatePlaybackPrepForDisplayChange( reason );
+    m_playbackPrepRgb8Pool.clear();   // r3: no recycled 8-bit buffer outlives the clip
     const PlaybackPrepDrainOutcome outcome = drainPlaybackPrepInFlight( reason, 2000 );
     if( playbackPrepBorrowFreeingMutationAllowed( outcome ) ) return true;
     logInteractionEvent(
@@ -4561,7 +4562,10 @@ MainWindow::PlaybackPrepResult MainWindow::buildPlaybackPrepResult( const Playba
                                              task.mlvWidth,
                                              task.mlvHeight,
                                              &reducedSourceConfig );
-        std::vector<uint8_t> cpuPreviewRgb8;
+        // CPU-S1-PACE-NEXT-LEVER-1 r3: on the worker, develop into a recycled buffer (given back
+        // by onPlaybackPrepResultReady after the present) instead of a fresh 12 MB vector per frame.
+        std::vector<uint8_t> cpuPreviewRgb8 =
+            threadState ? m_playbackPrepRgb8Pool.take() : std::vector<uint8_t>();
         const PlaybackPrepCpuRouteResult cpuRoute =
             playbackPrepCpuRouteRun( cpuWorkspace,
                                      reducedSource ? reducedSourceConfig : gpuPreviewProcessingConfig,
@@ -4584,6 +4588,7 @@ MainWindow::PlaybackPrepResult MainWindow::buildPlaybackPrepResult( const Playba
         QJsonObject &spanTelemetry = result.task.readyFrame.stageTimingTelemetry;
         spanTelemetry.insert( QStringLiteral("playback_prep_cpu_route_active"), true );
         spanTelemetry.insert( QStringLiteral("playback_prep_alloc_ms"), cpuRoute.allocMs );
+        spanTelemetry.insert( QStringLiteral("playback_prep_out8_allocated"), cpuRoute.out8Allocated );
         spanTelemetry.insert( QStringLiteral("playback_prep_reduce_ms"), cpuRoute.reduceMs );
         spanTelemetry.insert( QStringLiteral("playback_prep_sh_expand_ms"), cpuRoute.spans.shExpandMs );
         spanTelemetry.insert( QStringLiteral("playback_prep_pointwise_ms"), cpuRoute.spans.pointwiseMs );
@@ -5111,6 +5116,10 @@ void MainWindow::onPlaybackPrepResultReady( void )
     }
 
     presentPlaybackPreparedFrame( result );
+    // CPU-S1-PACE-NEXT-LEVER-1 r3: the present is done with the developed frame (nothing keeps a
+    // pointer into it past this point: it used to be freed right here), so its buffer goes back
+    // to the prep worker's pool.
+    m_playbackPrepRgb8Pool.give( std::move( result.scopeSourceImage ) );
     openGuiPresentGap();
 }
 

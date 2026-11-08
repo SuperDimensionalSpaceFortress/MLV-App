@@ -606,6 +606,119 @@ TEST(PrepPointwiseFast, Tier1OffWorkspaceScratchIsByteIdenticalWhenPoisoned)
     }
 }
 
+/* CPU-S1-PACE-NEXT-LEVER-1 r3: the playing route's 8-bit buffer is recycled through a
+ * PlaybackPrepRgb8Pool (prep thread takes, GUI thread gives back after the present), the
+ * hand-off MainWindow::buildPlaybackPrepResult / onPlaybackPrepResultReady run. Pinned, for
+ * tier 1 off and on, the full-size configs (disabled, pointwise, sharpen post-pass, Look Assist
+ * pointwise subset) and the x2 reduced path: over six frames (two alternating inputs) the route
+ * allocates out8 ONCE, and every frame -- developed into a recycled buffer pre-filled with 0xA5
+ * -- is byte-identical to the same frame developed into a fresh vector (the r2 behaviour). */
+TEST(PrepPointwiseFast, CpuRouteRecycledOut8IsByteIdenticalWhenPoisoned)
+{
+    MlvPipelineFixture offFixture;
+    openFixture(offFixture);
+    const GpuPreviewProcessingConfig enabledPointwise = buildConfig(offFixture, applyLookAssistOff);
+    ASSERT_TRUE(enabledPointwise.enabled);
+    MlvPipelineFixture sharpenFixture;
+    openFixture(sharpenFixture);
+    const GpuPreviewProcessingConfig enabledSpatial = buildConfig(sharpenFixture, [](processingObject_t * p) {
+        applyLookAssistOff(p);
+        processingSetSharpening(p, 0.5);
+    });
+    ASSERT_TRUE(gpuPreviewProcessingCpuHasSpatialPostPass(enabledSpatial));
+    GpuPreviewProcessingConfig disabled = enabledPointwise;
+    disabled.enabled = false;
+
+    const int w = kFullWidth;
+    const int h = kFullHeight;
+    const std::vector<uint16_t> frames[2] = { makeSyntheticFrame(w, h, 0x7101u), makeSyntheticFrame(w, h, 0x7202u) };
+    const std::vector<uint16_t> blur = makeBlockBlur(frames[0], w, h);
+    MlvPipelineFixture laFixture;
+    openFixture(laFixture);
+    const GpuPreviewProcessingConfig lookAssist = buildLookAssistOnConfig(laFixture, blur, w, h);
+
+    PlaybackPrepReducedDecision full;
+    PlaybackPrepReducedDecision x2;
+    x2.factor = 2;
+    x2.residual = 2;
+    const struct { const char * label; const GpuPreviewProcessingConfig * config; const PlaybackPrepReducedDecision * decision; } cases[] = {
+        { "disabled", &disabled, &full },
+        { "enabled_pointwise", &enabledPointwise, &full },
+        { "enabled_spatial_sharpen", &enabledSpatial, &full },
+        { "look_assist_cinematic_pointwise", &lookAssist, &full },
+        { "enabled_pointwise_x2", &enabledPointwise, &x2 },
+    };
+    for (const char * tier1Value : { static_cast<const char *>(nullptr), "1" })
+    {
+        EnvScope tier1(gpuPreviewProcessingTier1SwitchName(), tier1Value);
+        ASSERT_EQ(tier1Value != nullptr, gpuPreviewProcessingTier1Enabled());
+        for (const auto & c : cases)
+        {
+            const std::string label = std::string(c.label) + (tier1Value ? ".tier1_on" : ".tier1_off");
+            PlaybackPrepRgb8Pool pool;
+            PlaybackPrepCpuWorkspace workspace;
+            int allocations = 0;
+            const int kFrames = 6;
+            for (int f = 0; f < kFrames; ++f)
+            {
+                const std::vector<uint16_t> & frame = frames[f % 2];
+                /* The oracle: the same frame into a fresh vector on a fresh workspace (r2). */
+                PlaybackPrepCpuWorkspace oracleWorkspace;
+                std::vector<uint8_t> oracle8;
+                const PlaybackPrepCpuRouteResult oracleRoute =
+                    playbackPrepCpuRouteRun(oracleWorkspace, *c.config, 1, frame.data(), w, h, *c.decision, &oracle8);
+                ASSERT_TRUE(oracleRoute.out8Allocated);
+
+                /* Prep thread: take, develop, hand off (moved into the result). */
+                std::vector<uint8_t> out8 = pool.take();
+                const PlaybackPrepCpuRouteResult route =
+                    playbackPrepCpuRouteRun(workspace, *c.config, 1, frame.data(), w, h, *c.decision, &out8);
+                ASSERT_EQ(oracleRoute.reducedFactor, route.reducedFactor);
+                if (route.out8Allocated) ++allocations;
+                if (out8 != oracle8)
+                {
+                    size_t first = 0;
+                    while (first < out8.size() && first < oracle8.size() && out8[first] == oracle8[first]) ++first;
+                    ::minitest::fail(__FILE__, __LINE__, "recycled out8 == fresh out8",
+                                     label + " frame=" + std::to_string(f) + " first_byte=" + std::to_string(first)
+                                     + " size=" + std::to_string(out8.size()) + "/" + std::to_string(oracle8.size()));
+                }
+                std::vector<uint8_t> handedOff = std::move(out8);
+                /* GUI thread after the present: stale bytes, then back to the pool. */
+                std::fill(handedOff.begin(), handedOff.end(), static_cast<uint8_t>(0xA5));
+                pool.give(std::move(handedOff));
+            }
+            if (allocations != 1)
+                ::minitest::fail(__FILE__, __LINE__, "out8 allocated once over six frames",
+                                 label + " allocations=" + std::to_string(allocations));
+            ASSERT_EQ(1u, static_cast<unsigned>(pool.held()));
+            ASSERT_EQ(1u, static_cast<unsigned>(pool.takeMisses()));
+            ASSERT_EQ(static_cast<unsigned>(kFrames - 1), static_cast<unsigned>(pool.takeHits()));
+            std::printf("[PREP-OUT8-POOL] %s allocations=%d over %d frames, byte-identical\n",
+                        label.c_str(), allocations, kFrames);
+        }
+    }
+}
+
+/* The pool itself: bounded, largest-capacity first, empty buffers never held, clear() frees. */
+TEST(PrepPointwiseFast, Rgb8PoolIsBoundedAndHandsBackTheLargest)
+{
+    PlaybackPrepRgb8Pool pool;
+    ASSERT_TRUE(pool.take().capacity() == 0);
+    pool.give(std::vector<uint8_t>());
+    ASSERT_EQ(0u, static_cast<unsigned>(pool.held()));
+    pool.give(std::vector<uint8_t>(16));
+    pool.give(std::vector<uint8_t>(64));
+    pool.give(std::vector<uint8_t>(32));
+    ASSERT_EQ(static_cast<unsigned>(PlaybackPrepRgb8Pool::kMaxHeld), static_cast<unsigned>(pool.held()));
+    const std::vector<uint8_t> a = pool.take();
+    ASSERT_TRUE(a.capacity() >= 64u);
+    ASSERT_EQ(1u, static_cast<unsigned>(pool.held()));
+    pool.clear();
+    ASSERT_EQ(0u, static_cast<unsigned>(pool.held()));
+    ASSERT_TRUE(pool.take().capacity() == 0);
+}
+
 /* CPU-LOOKASSIST-AGX-FASTPATH-1: the shapes every committed M16-1243 CPU venue leg
  * renders. AgX is on by default (raw_processing.c initProcessingObject) and in
  * both Look Assist flavours, so these are the configs the prep worker actually

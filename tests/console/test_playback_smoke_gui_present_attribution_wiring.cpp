@@ -25,6 +25,8 @@
 #include <QStringList>
 #include <QTextStream>
 
+#include <cmath>
+#include <limits>
 #include <vector>
 
 namespace
@@ -706,6 +708,36 @@ TEST(GuiOtherBusySplit, NegativeOtherBusyBudgetNeverMakesASessionSumNegative)
     for (int i = 0; i < gui_present_gap::OtherBusySpans::kCount; ++i)
         ASSERT_TRUE(spans.sumMs[i] >= 0.0);
     ASSERT_TRUE(spans.unattributedSumMs >= 0.0);
+}
+
+TEST(GuiOtherBusySplit, NanPaintReadingOrBudgetNeverReachesASessionSum)
+{
+    // CPU-S1-PACE-NEXT-LEVER-1 r3, adversary A1 on f9f92e09: a NaN paintMs passed both `x < 0` clamps
+    // (end) and a NaN budget passed closeGap's, so NaN entered gapMs and then sumMs.
+    const double nan = std::numeric_limits<double>::quiet_NaN();
+    gui_present_gap::OtherBusySpans spans;
+    spans.openGap();
+    gui_present_gap::SpanClock start;
+    start.gapSerial = 7;
+    gui_present_gap::SpanClock stop = start;
+    stop.nowNs = 1000000;
+    stop.paintMs = nan;
+    spans.begin(start);
+    const double charged = spans.end(gui_present_gap::OtherBusySpan::DrawFrame, stop);
+    ASSERT_TRUE(std::isfinite(charged) && charged == 0.0);
+    const double rest = spans.closeGap(-1.0);
+    ASSERT_TRUE(std::isfinite(rest) && rest >= 0.0);
+    for (int i = 0; i < gui_present_gap::OtherBusySpans::kCount; ++i)
+        ASSERT_TRUE(std::isfinite(spans.sumMs[i]) && spans.sumMs[i] >= 0.0);
+    // A NaN budget: the named 1 ms span is folded at scale 1 or 0, never NaN.
+    spans.openGap();
+    spans.begin(spanClock(8, 0));
+    ASSERT_NEAR(1.0, spans.end(gui_present_gap::OtherBusySpan::DrawFrame, spanClock(8, 1)), 1e-9);
+    const double rest2 = spans.closeGap(nan);
+    ASSERT_TRUE(std::isfinite(rest2) && rest2 >= 0.0);
+    for (int i = 0; i < gui_present_gap::OtherBusySpans::kCount; ++i)
+        ASSERT_TRUE(std::isfinite(spans.sumMs[i]) && spans.sumMs[i] >= 0.0);
+    ASSERT_TRUE(std::isfinite(spans.unattributedSumMs) && spans.unattributedSumMs >= 0.0);
 }
 
 TEST(GuiOtherBusySplit, HandlersOpenTheirSpanFirstAndTheSummaryAppendsTheSplit)

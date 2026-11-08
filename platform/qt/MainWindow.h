@@ -37,6 +37,7 @@
 #include "PlaybackNativePaceGuard.h"
 #include "PlaybackPrepInFlightGate.h"
 #include "PlaybackPrepOwnership.h"
+#include "PlaybackPrepCpuRoute.h"                    // PlaybackPrepRgb8Pool member below (r3)
 #include "PlaybackPresentTrace.h"
 #include "PlaybackScopesDuringPlayback.h"
 #include "PlaybackSlipHistogram.h"
@@ -1775,6 +1776,9 @@ private:
     PlaybackPrepTask m_playbackPrepPending;
     std::deque<PlaybackPrepResult> m_playbackPrepResults;
     PlaybackPrepInFlightGate m_playbackPrepInFlight;
+    // CPU-S1-PACE-NEXT-LEVER-1 r3: the CPU route's 8-bit buffers, taken by the prep thread and
+    // given back by onPlaybackPrepResultReady once the frame is presented (thread-safe).
+    PlaybackPrepRgb8Pool m_playbackPrepRgb8Pool;
     std::atomic<uint64_t> m_playbackPrepStaleDropCount{0};
     std::atomic<uint64_t> m_playbackPrepGenerationDropCount{0};
     std::atomic<uint64_t> m_playbackPrepReplacedBeforeComputeCount{0};

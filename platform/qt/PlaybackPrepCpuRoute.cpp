@@ -127,6 +127,57 @@ uint16_t * PlaybackPrepCpuWorkspace::reducedInput(size_t words)
     return m_reducedInput.get();
 }
 
+std::vector<uint8_t> PlaybackPrepRgb8Pool::take()
+{
+    std::lock_guard<std::mutex> lk(m_mutex);
+    if ( m_held.empty() )
+    {
+        ++m_takeMisses;
+        return std::vector<uint8_t>();
+    }
+    size_t best = 0;
+    for ( size_t i = 1; i < m_held.size(); ++i )
+        if ( m_held[i].capacity() > m_held[best].capacity() ) best = i;
+    std::vector<uint8_t> buf = std::move(m_held[best]);
+    m_held.erase(m_held.begin() + static_cast<std::ptrdiff_t>(best));
+    ++m_takeHits;
+    return buf;
+}
+
+void PlaybackPrepRgb8Pool::give(std::vector<uint8_t> && buf)
+{
+    std::vector<uint8_t> dropped(std::move(buf));
+    if ( dropped.capacity() == 0 ) return;
+    std::lock_guard<std::mutex> lk(m_mutex);
+    if ( m_held.size() >= kMaxHeld ) return;   /* freed by `dropped` after the unlock */
+    m_held.push_back(std::move(dropped));
+}
+
+void PlaybackPrepRgb8Pool::clear()
+{
+    std::vector<std::vector<uint8_t>> dropped;
+    std::lock_guard<std::mutex> lk(m_mutex);
+    dropped.swap(m_held);
+}
+
+size_t PlaybackPrepRgb8Pool::held() const
+{
+    std::lock_guard<std::mutex> lk(m_mutex);
+    return m_held.size();
+}
+
+uint64_t PlaybackPrepRgb8Pool::takeHits() const
+{
+    std::lock_guard<std::mutex> lk(m_mutex);
+    return m_takeHits;
+}
+
+uint64_t PlaybackPrepRgb8Pool::takeMisses() const
+{
+    std::lock_guard<std::mutex> lk(m_mutex);
+    return m_takeMisses;
+}
+
 uint64_t PlaybackPrepCpuWorkspace::refusalCount(PlaybackPrepReducedRefusal refusal) const
 {
     const size_t index = static_cast<size_t>(refusal);
@@ -374,6 +425,7 @@ PlaybackPrepCpuRouteResult playbackPrepCpuRouteRun(PlaybackPrepCpuWorkspace & wo
         const int rw = width / factor;
         const int rh = height / factor;
         qint64 startNs = clock.nsecsElapsed();
+        result.out8Allocated = out8->capacity() < static_cast<size_t>(rw) * rh * 3u;
         out8->resize(static_cast<size_t>(rw) * rh * 3u);
         uint16_t * reducedInput = workspace.reducedInput(static_cast<size_t>(rw) * rh * 3u);
         uint16_t * scratch = scratchFor(rw, rh);
@@ -399,6 +451,10 @@ PlaybackPrepCpuRouteResult playbackPrepCpuRouteRun(PlaybackPrepCpuWorkspace & wo
     }
 
     qint64 startNs = clock.nsecsElapsed();
+    /* CPU-S1-PACE-NEXT-LEVER-1 r3: out8 is a PlaybackPrepRgb8Pool buffer on the
+     * playing route, so this resize reuses its capacity (r2: 3.6 ms per frame of
+     * alloc + zero-fill at 1808x2268 with a fresh vector). */
+    result.out8Allocated = out8->capacity() < static_cast<size_t>(width) * height * 3u;
     out8->resize(static_cast<size_t>(width) * height * 3u);
     uint16_t * scratch = scratchFor(width, height);
     result.allocMs = spanMs(clock, startNs);
