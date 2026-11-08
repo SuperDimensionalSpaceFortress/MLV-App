@@ -1095,6 +1095,42 @@ def test_a_library_callers_alias_never_replaces_the_deadline_path(box, alias, de
     assert low <= _wait_minutes(call) <= high, call["argv"]
 
 
+def test_a_deadline_that_passes_while_the_holder_is_built_launches_with_zero_wait(box) -> None:
+    # adversary 0919ae2e-A1 (its input): the launch-time sample of the deadline came BEFORE the holder command was built (:1168, whose
+    # Get-Process is :679), so a holder step that ran past the deadline launched heavy-slot with a stale positive wait. The holder is now
+    # built first; the sample is the last step before the launch.
+    opts_line = ("$savedHolder = ${function:New-HeavySlotHolder}\n"
+                 "function New-HeavySlotHolder { param([string]$ReadyFile, [string]$StopFile) [Threading.Thread]::Sleep(9000); & $savedHolder $ReadyFile $StopFile }\n")
+    done = _stage_attempt(box, "[DateTime]::UtcNow.AddSeconds(4)", opts_line=opts_line)
+    [call] = _stub_calls(box)
+    assert _wait_minutes(call) == 0.0, call["argv"]
+    assert done.returncode == 3, done.stdout + done.stderr
+    assert "BUILD_HEAVY_SLOT_REQUEUE label=attr3-assemble:abc code=75 " in done.stdout, done.stdout
+
+
+def test_nothing_but_net_calls_runs_between_the_deadline_sample_and_the_launch() -> None:
+    # adversary 0919ae2e-A1, the class (siblings :1169 ForEach-Object and :679 Get-Process): any command between the launch-time sample and
+    # Process.Start can take arbitrary time (or be a caller's), so the wait given would be stale. None is there.
+    script = (f"$a = [System.Management.Automation.Language.Parser]::ParseFile('{GUARD}', [ref]$null, [ref]$null)\n"
+              "$f = $a.Find({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq 'Enter-HeavySlot' }, $true)\n"
+              "$sample = @($f.Body.FindAll({ param($n) $n -is [System.Management.Automation.Language.IfStatementAst] -and "
+              "$n.Clauses[0].Item1.Extent.Text -eq '$deadline.At' }, $true))[-1]\n"
+              "$start = $f.Body.Find({ param($n) $n -is [System.Management.Automation.Language.InvokeMemberExpressionAst] -and "
+              "$n.Extent.Text -like '*Diagnostics.Process]::Start($psi)*' }, $true)\n"
+              "Write-Output ('SAMPLE ' + $sample.Extent.StartOffset + ' ' + ($sample.Extent.Text -match 'UtcNow'))\n"
+              "Write-Output ('START ' + $start.Extent.StartOffset)\n"
+              "$f.Body.FindAll({ param($n) $n -is [System.Management.Automation.Language.CommandAst] }, $true) | "
+              "Where-Object { $_.Extent.StartOffset -gt $sample.Extent.StartOffset -and $_.Extent.StartOffset -lt $start.Extent.StartOffset } | "
+              "ForEach-Object { 'CMD ' + $_.Extent.Text }\n")
+    done = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script],
+                          capture_output=True, text=True, timeout=60, check=False)
+    assert done.returncode == 0, done.stderr
+    lines = done.stdout.splitlines()
+    assert any(l.startswith("SAMPLE ") and l.endswith(" True") for l in lines), done.stdout
+    assert any(l.startswith("START ") and int(l.split()[1]) > 0 for l in lines), done.stdout
+    assert [l for l in lines if l.startswith("CMD ")] == [], done.stdout
+
+
 def _function_ast_names(path: Path, function: str) -> tuple:
     script = (f"$a = [System.Management.Automation.Language.Parser]::ParseFile('{path}', [ref]$null, [ref]$null)\n"
               f"$f = $a.Find({{ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq '{function}' }}, $true)\n"
