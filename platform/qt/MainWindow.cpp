@@ -24,6 +24,7 @@
 #include "PlaybackPrepPresentationPolicy.h"
 #include "VisualCaptureSourceDifference.h"
 #include "ClipOpenAbortPolicy.h"
+#include "ResizeStillDrawingWait.h"
 #include "debug/StageTiming.h"
 extern "C" {
 #include "../../src/mlv/pipeline_stage_capture.h"
@@ -2945,6 +2946,41 @@ long long MainWindow::conformDisplayedPlaybackFrame()
     return conformDisplayedFramePaintPending() ? -1 : m_lastDisplayedPlaybackFrame;
 }
 
+// GUI-SMOKE-FOREGROUND-HANG-NOLA-1 (adversary r3 pass 3 A1): the resize wait's renderIdle() sample. The same decision as
+// !renderThreadBusyForPlaybackAdvance(), but it never waits for the renderer mutex: a held mutex is busy at once, so a
+// hold of any length ends the idle run and no duration threshold exists. Every other caller keeps the blocking read.
+// epochOut receives the renderer's busy epoch from inside the same critical section (adversary r4 pass 2 A1).
+bool MainWindow::renderThreadIdleNoWait( int activePlaybackTarget, std::uint64_t *epochOut )
+{
+    if( !m_pRenderThread ) return true;
+    if( ui->actionPlay->isChecked() && playbackRenderLookaheadFrames() > 0 )
+    {
+        return m_pRenderThread->isIdleExceptPlaybackLookaheadNoWait(
+            activePlaybackTarget,
+            m_playbackPresentationGeneration.load( std::memory_order_acquire ),
+            epochOut );
+    }
+    return m_pRenderThread->isIdleNoWait( epochOut );
+}
+
+// adversary r4 A1 (probe-to-clear): the resize wait's stale clear. renderThreadIdleNoWait's decision, re-taken while the
+// renderer mutex is held (never waited for) and only at the idle run's busy epoch; the flag is cleared inside that critical
+// section, so a render request or warm run cannot start between the decision and the clear. False = not cleared (busy).
+bool MainWindow::clearStaleStillDrawingIfIdle( int activePlaybackTarget, std::uint64_t epoch )
+{
+    if( !m_pRenderThread )
+    {
+        m_frameStillDrawing = false;
+        return true;
+    }
+    return m_pRenderThread->runIfIdleNoWait(
+        ui->actionPlay->isChecked() && playbackRenderLookaheadFrames() > 0,
+        activePlaybackTarget,
+        m_playbackPresentationGeneration.load( std::memory_order_acquire ),
+        epoch,
+        [this]() { m_frameStillDrawing = false; } );
+}
+
 static int mlvappStartPlaybackTimer( QObject *owner, double framerate )
 {
     if( !owner ) return 0;
@@ -3199,6 +3235,43 @@ void MainWindow::timerEvent(QTimerEvent *t)
     }
 }
 
+// GUI-SMOKE-FOREGROUND-HANG-NOLA-1: resizeEvent's wait for the frame in flight, bounded (ResizeStillDrawingWait.h). It
+// used to be `while( m_frameStillDrawing ) qApp->processEvents();`: a stale-true flag (nothing left in flight to clear
+// it) pumped the GUI thread forever after the smoke runner's showFullScreen() resize. A flag still set while the render
+// thread has stayed idle for the grace window is stale and is cleared; a busy render thread is waited on up to the
+// deadline, then the redraw proceeds. One always-on line whenever it actually waited. The pump itself dispatches no
+// user input (ExcludeUserInputEvents defers it to the next unfiltered pass; adversary r1 A1). A handler the pump runs
+// that starts its own nested event loop (a modal dialog, Updater::getReleaseList) still suspends the wait until that
+// loop returns, as it suspended the old spin; ResizeStillDrawingWait.h "WHAT IS BOUNDED". Returns false on Timeout
+// (the frame asked for has not landed, so the scene still has the old geometry), true otherwise.
+bool MainWindow::waitForResizeStillDrawing( const QString &site )
+{
+    QElapsedTimer clock;
+    clock.start();
+    resize_still_drawing_wait::Callbacks callbacks;
+    callbacks.stillDrawing = [this]() { return m_frameStillDrawing; };
+    std::uint64_t sampledEpoch = 0; // written by each sample inside the renderer's critical section (r4 pass 2 A1)
+    callbacks.renderIdle = [this, &sampledEpoch]() { return renderThreadIdleNoWait( currentPlaybackAdvanceTarget(), &sampledEpoch ); };
+    callbacks.pump = []() { qApp->processEvents( QEventLoop::ExcludeUserInputEvents ); };
+    // adversary r4 A1: work that starts and ends between two samples changes the epoch; the clear is confirmed under the
+    // renderer mutex at the run's epoch, so work that starts after the last sample is never cleared over
+    callbacks.busyEpoch = [&sampledEpoch]() { return sampledEpoch; };
+    callbacks.clearStale = [this]( std::uint64_t epoch ) { return clearStaleStillDrawingIfIdle( currentPlaybackAdvanceTarget(), epoch ); };
+    callbacks.nowMs = [&clock]() { return static_cast<std::int64_t>( clock.elapsed() ); };
+    // adversary r3 pass 2 A1: a renderer-mutex hold shorter than one millisecond tick must still be seen
+    callbacks.nowUs = [&clock]() { return static_cast<std::int64_t>( clock.nsecsElapsed() / 1000 ); };
+    const resize_still_drawing_wait::Result result = resize_still_drawing_wait::wait( callbacks );
+    if( result.outcome == resize_still_drawing_wait::Outcome::NotWaiting ) return true;
+    logInteractionEvent(
+        QStringLiteral("resize.still_drawing_wait"),
+        QStringLiteral("outcome=%1 waited_ms=%2 site=%3 render_idle=%4")
+            .arg( QLatin1String( resize_still_drawing_wait::outcomeName( result.outcome ) ) )
+            .arg( static_cast<qlonglong>( result.waitedMs ) )
+            .arg( site )
+            .arg( bool01( result.renderIdle ) ) );
+    return result.outcome != resize_still_drawing_wait::Outcome::Timeout;
+}
+
 //Window resized -> scale picture
 void MainWindow::resizeEvent(QResizeEvent *event)
 {
@@ -3237,15 +3310,27 @@ void MainWindow::resizeEvent(QResizeEvent *event)
             m_pRenderThread->lock();
             m_pRenderThread->unlock();
         }
-        while( m_frameStillDrawing ) qApp->processEvents();
+        waitForResizeStillDrawing( QStringLiteral("resize") );
         drawFrame();
         if( ui->checkBoxGradientEnable->isChecked() && ui->groupBoxLinearGradient->isChecked() )
         {
-            while( m_frameStillDrawing ) qApp->processEvents();
-            m_pGradientElement->redrawGradientElement( m_pScene->width(),
-                                                       m_pScene->height(),
-                                                       getMlvWidth( m_pMlvObject ),
-                                                       getMlvHeight( m_pMlvObject ) );
+            // On Timeout the frame drawFrame() asked for has not landed and the scene keeps its old geometry, so no redraw
+            // now (adversary r1 A2).
+            if( waitForResizeStillDrawing( QStringLiteral("gradient") ) )
+            {
+                m_pGradientElement->redrawGradientElement( m_pScene->width(),
+                                                           m_pScene->height(),
+                                                           getMlvWidth( m_pMlvObject ),
+                                                           getMlvHeight( m_pMlvObject ) );
+            }
+            // Every outcome re-anchors on the landed frame: finishPresentedFrame consumes m_zoomModeChanged with a gradient
+            // redraw on the scene that frame sets. A stale or cleared flag does not prove the frame landed: isIdle ignores
+            // a Ready slot whose frameReady has not been emitted yet (RenderFrameThread.cpp), so a late frame can still
+            // change the scene (adversary r1 pass 3 A1). Armed after the wait, so a frame landing inside a pump cannot
+            // consume it early; a spare redraw on an unchanged scene places the overlay where it already is. A frame that
+            // consumes it on the old scene does not strand the overlay either: finishPresentedFrame also re-anchors when the
+            // landed scene differs from the anchored one (gradientNeedsReanchor; adversary r2 pass 3 A1).
+            m_zoomModeChanged = true;
         }
     }
     event->accept();
@@ -33692,7 +33777,14 @@ void MainWindow::finishPresentedFrame( uint64_t displayFrame,
         ui->graphicsView->verticalScrollBar()->setValue( ( getMlvHeight(m_pMlvObject) * getVerticalStretchFactor(false) - ui->graphicsView->height() ) / 2 );
     }
 
-    if( m_zoomModeChanged )
+    // GUI-SMOKE-FOREGROUND-HANG-NOLA-1 (adversary r2 pass 3 A1): drawFrameReady sized the scene at present time, so the
+    // geometry this frame landed on decides placement, not its request serial. Re-anchor on the flag (any frame, as the
+    // base) or when the scene differs from the geometry the gradient was last anchored on.
+    if( resize_still_drawing_wait::gradientNeedsReanchor( m_zoomModeChanged,
+                                                          m_pGradientElement->anchoredSceneWidth(),
+                                                          m_pGradientElement->anchoredSceneHeight(),
+                                                          static_cast<int>( m_pScene->width() ),
+                                                          static_cast<int>( m_pScene->height() ) ) )
     {
         m_zoomModeChanged = false;
         m_pGradientElement->redrawGradientElement( m_pScene->width(),

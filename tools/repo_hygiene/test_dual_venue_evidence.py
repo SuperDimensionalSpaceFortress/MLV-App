@@ -222,6 +222,11 @@ SHIPPED_LEGS = (*SHIPPED_LEGS, *NATIVE_TRACE_LEGS)
 # CPU-S1-RECON-CHAIN-ATTRIBUTION-1: the capture-free CPU fullscreen s1 arms that attribute the frame interval: control (c), prep fast path off (p), a worker cap of 12 (t12), Look Assist off (l).
 CHAINATTR_LEGS = tuple(f"legs/m16-1243-chainattr-{arm}-fullscreen-s1.json" for arm in ("c", "p", "t12", "l"))
 SHIPPED_LEGS = (*SHIPPED_LEGS, *CHAINATTR_LEGS)
+# GUI-SMOKE-FOREGROUND-HANG-NOLA-1: the M16-1457 native full-screen s1 pair taken from #420 (590b0df0, card HFR-NATIVE-60FPS-FULLRES-1) without its conform
+# arm (generatorArgs.playbackConform is not in this base's schema): the Look Assist OFF arm that hung foregrounding (-nola, a classic leg) and its Look Assist
+# ON Cinematic control. Capture-free paced cuda speed legs at scale 1; LegSpecSchemaTests pins the pair.
+HFR_NATIVE_S1_LEGS = ("legs/m16-1457-native-fullscreen-s1.json", "legs/m16-1457-native-fullscreen-s1-nola.json")
+SHIPPED_LEGS = (*SHIPPED_LEGS, *HFR_NATIVE_S1_LEGS)
 SHIPPED_LEGS_PS =", ".join(f"'{rel}'" for rel in SHIPPED_LEGS)
 OTHER_CLIP = "Z99-9999"
 MLV_EXT = "." + "mlv"  # never spelled as one literal token (the NA-4 gate trips on fixture basenames)
@@ -7550,6 +7555,8 @@ class LegSpecSchemaTests(unittest.TestCase):
             elif spec["card"] == "CPU-S1-RECON-CHAIN-ATTRIBUTION-1":   # the Look Assist on arms of the chain attribution (the classic arm l never reaches this chain)
                 self.assertEqual(spec["legId"], path.stem, path.name)
                 self.assertRegex(spec["legId"], r"^m16-1243-chainattr-(c|p|t12)-fullscreen-s1$", path.name)
+            elif spec["card"] == "HFR-NATIVE-60FPS-FULLRES-1":   # the Look Assist ON control of the native s1 pair (its -nola twin is classic)
+                self.assert_hfr_native_s1_flavored_leg(spec, path.name)
             else:   # the scale-4 flavored look leg, or its scale-2 twin (LOOK-ASSIST-CINEMATIC-BENCH-PAIR-1), or that twin's AgX-off copy (LOOK-ASSIST-FILM-FLAVOR-2 r2)
                 self.assertIn(spec["legId"], (f"m16-1243-look-{flavor}", f"m16-1243-look-scale2-{flavor}", f"m16-1243-look-scale2-{flavor}-agxoff"), path.name)
                 self.assertEqual(spec["legId"], path.stem, path.name)
@@ -7559,6 +7566,53 @@ class LegSpecSchemaTests(unittest.TestCase):
                     self.assertIn({"metric": "lookFlavorReported", "op": "eq", "value": flavor}, criteria,
                                   f"{path.name} {role}/{backend}: a {flavor} leg must gate on the applied flavor, or a fallback to Classic passes it")
         self.assertGreaterEqual(flavored, 1, "the committed Cinematic look leg is missing")
+
+    def assert_hfr_native_s1_flavored_leg(self, spec: dict, name: str) -> None:
+        """GUI-SMOKE-FOREGROUND-HANG-NOLA-1: the one flavored HFR-NATIVE-60FPS-FULLRES-1 leg this base ships is the Look Assist ON control of the native s1
+        pair. Any other legId on the card (a windowed cell, a lever, a typo) fails here, and so does a leg that drifts from the paced cuda s1 shape."""
+        self.assertIn("legs/" + name, HFR_NATIVE_S1_LEGS, f"{name}: not a registered HFR native s1 leg")
+        self.assertEqual(spec["legId"], Path(name).stem, name)
+        self.assertRegex(spec["legId"], r"^m16-1457-native-fullscreen-s1$", name)
+        self.assertEqual((spec["legType"], spec["clipId"], spec["backends"], spec["scaleFactor"], spec["displayMode"]),
+                         ("speed", "M16-1457", ["cuda"], 1, "fullscreen"), name)
+        self.assertIs(spec["generatorArgs"].get("forceLookAssist"), True, name)
+        # paced: no unpaced switch and no swap-interval override (the app's own pacing), the shape the foreground hang was seen in
+        self.assertNotIn("unpaced", spec["generatorArgs"], name)
+        self.assertNotIn("swapInterval", spec["generatorArgs"], name)
+
+    def test_an_hfr_native_leg_outside_the_shipped_s1_control_fails_the_flavor_rule(self) -> None:
+        """GUI-SMOKE-FOREGROUND-HANG-NOLA-1: the HFR-NATIVE-60FPS-FULLRES-1 branch of the applied-flavor rule admits the shipped s1 control and nothing else."""
+        name = "m16-1457-native-fullscreen-s1.json"
+        good = json.loads((DV / "legs" / name).read_text(encoding="utf-8"))
+        self.assert_hfr_native_s1_flavored_leg(good, name)   # the premise: the shipped leg passes
+        bad = {"unknown id": (dict(good, legId="m16-1457-native-fullscreen-s1-bogus"), "m16-1457-native-fullscreen-s1-bogus.json"),
+               "unshipped windowed cell": (dict(good, legId="m16-1457-native-windowed-s1"), "m16-1457-native-windowed-s1.json"),
+               "legId is not the file stem": (dict(good, legId="m16-1457-native-fullscreen-s1-nola"), name),
+               "scale 2": (dict(good, scaleFactor=2), name),
+               "cpu backend": (dict(good, backends=["cpu"]), name),
+               "windowed": (dict(good, displayMode="windowed"), name),
+               "Look Assist not forced": (dict(good, generatorArgs={k: v for k, v in good["generatorArgs"].items() if k != "forceLookAssist"}), name),
+               "unpaced": (dict(good, generatorArgs=dict(good["generatorArgs"], unpaced=True)), name),
+               "swap override": (dict(good, generatorArgs=dict(good["generatorArgs"], swapInterval=0)), name)}
+        for label, (spec, file_name) in bad.items():
+            with self.assertRaises(AssertionError, msg=label):
+                self.assert_hfr_native_s1_flavored_leg(spec, file_name)
+
+    def test_the_hfr_native_s1_nola_leg_is_the_on_leg_without_look_assist(self) -> None:
+        """GUI-SMOKE-FOREGROUND-HANG-NOLA-1: the hang A/B is one leg twice. -nola is m16-1457-native-fullscreen-s1 except its legId, disableLookAssist in place
+        of forceLookAssist + lookFlavor, and no Look Assist criteria (lookAssistForced, lookFlavorReported) in any list."""
+        load = lambda stem: json.loads((DV / "legs" / f"{stem}.json").read_text(encoding="utf-8"))
+        on, off = load("m16-1457-native-fullscreen-s1"), load("m16-1457-native-fullscreen-s1-nola")
+        self.assertEqual(on["generatorArgs"], {"telemetryArm": "LIGHT", "cpuQuiescenceThresholdPercent": 95, "forceLookAssist": True, "lookFlavor": "cinematic"})
+        self.assertEqual(off["generatorArgs"], {"telemetryArm": "LIGHT", "cpuQuiescenceThresholdPercent": 95, "disableLookAssist": True})
+        look = ({"metric": "lookAssistForced", "op": "eq", "value": True}, {"metric": "lookFlavorReported", "op": "eq", "value": "cinematic"})
+        stripped = json.loads(json.dumps(on))
+        for per_backend in stripped["criteria"].values():
+            for backend, criteria in per_backend.items():
+                for c in look:
+                    self.assertEqual(criteria.count(c), 1, backend)
+                    criteria.remove(c)
+        self.assertEqual(dict(stripped, legId=off["legId"], generatorArgs=off["generatorArgs"]), off)
 
     def test_the_cinematic_look_leg_is_the_classic_leg_plus_the_flavor_and_the_applied_flavor_criterion(self) -> None:
         load = lambda name: json.loads((DV / "legs" / f"{name}.json").read_text(encoding="utf-8"))
