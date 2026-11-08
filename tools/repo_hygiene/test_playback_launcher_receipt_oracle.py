@@ -813,6 +813,17 @@ class CounterWritePinTests(unittest.TestCase):
             with self.subTest(name):
                 self.assert_caught(self.inject_in_smoke(statement), needle)
 
+    def test_r30_reads_of_armed_and_the_high_water_mark_are_free_and_writes_are_not(self) -> None:
+        """HFR-NATIVE-60FPS-FULLRES-1 r30: the conform line prints engine_target from `m_sourceAdvance.armed ? m_sourceAdvance.highWater : -1`
+        (r29). Like .consumed() and .startFrame, a READ of .armed or .highWater writes nothing; every write to them is still caught."""
+        reads = self.inject_in_smoke("const bool advArmed = m_sourceAdvance.armed; const long long advHigh = m_sourceAdvance.highWater;"
+                                     " const bool advSame = m_sourceAdvance.highWater == 0;")
+        self.assertEqual(scan_app_play_sources(reads), [])
+        for name, statement in (("armed assigned", "m_sourceAdvance.armed = false;"), ("high water compound-assigned", "m_sourceAdvance.highWater += 5;"),
+                                ("high water incremented", "m_sourceAdvance.highWater++;"), ("armed or-assigned", "m_sourceAdvance.armed |= true;")):
+            with self.subTest(name):
+                self.assert_caught(self.inject_in_smoke(statement), "unreviewed use of m_sourceAdvance")
+
     def test_a_removed_or_extra_pinned_write_is_caught(self) -> None:
         self.assert_caught(self.mutated("m_sourceAdvance.begin( ui->horizontalSliderPosition->value() );\n        // CUDA-PERF",
                                         "// removed\n        // CUDA-PERF"), "on_actionPlay_toggled")
