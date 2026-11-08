@@ -966,3 +966,26 @@ TEST(PlaybackSourceAdvanceTracker, R29IterationOneAHandOffRecordedAfterANewerPai
     ASSERT_EQ(1u, t.presented());
     ASSERT_EQ(102, t.lastFrame());
 }
+
+// r29 fix iteration 2 (adversary A1 on 07226bc0): a paint inside an offscreen grab (the contact sheet's viewport()->grab(), the GL
+// window's capture paintGL before its swap) is not a display: inside an OffscreenPaintScope a surface's report credits nothing. The
+// frame stays waiting, so the normal paint that follows credits it; a submission before that paint supersedes it.
+TEST(PlaybackSourceAdvanceTracker, R29IterationTwoAnOffscreenGrabPaintIsNeverADisplay)
+{
+    R29SinkProbe probe;
+    playback_paint_credit::setSink(&r29Sink, &probe);
+    {
+        const playback_paint_credit::OffscreenPaintScope offscreen;
+        playback_paint_credit::notePainted(124);
+        {
+            const playback_paint_credit::OffscreenPaintScope nested;
+            playback_paint_credit::notePainted(124);
+        }
+        playback_paint_credit::notePainted(124);   // still inside the outer scope
+    }
+    ASSERT_EQ(0, probe.calls);
+    playback_paint_credit::notePainted(124);       // the normal paint after the grab
+    playback_paint_credit::setSink(nullptr, nullptr);
+    ASSERT_EQ(1, probe.calls);
+    ASSERT_EQ(124u, probe.last);
+}

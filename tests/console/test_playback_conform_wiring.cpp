@@ -849,7 +849,8 @@ TEST(PlaybackConformWiring, R29ConformTrackerIsCreditedAtPaintNeverAtHandOff)
     const int promote = windowSrc.indexOf(QStringLiteral("    m_presentedSerialValid = m_pendingPresentationSerialValid;\n"));
     ASSERT_TRUE(promote > 0);
     ASSERT_TRUE(windowSrc.indexOf(QStringLiteral("    if ( m_presentedSerialValid ) playback_paint_credit::notePainted( m_presentedSerial );"), promote) > promote);
-    ASSERT_EQ(1, countOccurrences(windowSrc, QStringLiteral("playback_paint_credit::notePainted(")));
+    // paintGL's report, and (fix iteration 2) the capture's report after its swap
+    ASSERT_EQ(2, countOccurrences(windowSrc, QStringLiteral("playback_paint_credit::notePainted(")));
     const QString viewportSrc = readRepoFile(QStringLiteral("platform/qt/GpuDisplayViewport.cpp"));
     ASSERT_TRUE(viewportSrc.contains(QStringLiteral(
         "    m_paintedSerialValid = m_paintedSerial != 0;\n"
@@ -868,4 +869,34 @@ TEST(PlaybackConformWiring, R29ConformTrackerIsCreditedAtPaintNeverAtHandOff)
     ASSERT_TRUE(paintBody.contains(QStringLiteral("if( m_playbackSmokeActive ) ++m_playbackSmokeConformPaintWaitEscapes;")));
     ASSERT_FALSE(paintBody.contains(QStringLiteral("m_playbackSmokeSourceAdvance")));
     ASSERT_FALSE(paintBody.contains(QStringLiteral("m_playbackSmokePaintCredit")));
+}
+
+// r29 fix iteration 2 (adversary A1 on 07226bc0): an offscreen grab's paint never credits. Every viewport grab in MainWindow goes through
+// grabGraphicsViewportOffscreen(), which holds an OffscreenPaintScope; the GL window's capture paintGL runs inside one too and reports the
+// serial only after its swap put the frame on screen.
+TEST(PlaybackConformWiring, R29IterationTwoOffscreenGrabPaintsNeverCredit)
+{
+    const QString source = mainWindowSource();
+    ASSERT_EQ(1, countOccurrences(source, QStringLiteral("viewport()->grab()")));
+    ASSERT_EQ(1, countOccurrences(source, QStringLiteral(
+        "QPixmap MainWindow::grabGraphicsViewportOffscreen()\n"
+        "{\n"
+        "    const playback_paint_credit::OffscreenPaintScope offscreen;\n"
+        "    return ui->graphicsView->viewport()->grab();\n"
+        "}")));
+    ASSERT_TRUE(countOccurrences(source, QStringLiteral("grabGraphicsViewportOffscreen()")) >= 8);   // the definition and its 7 callers
+    ASSERT_EQ(0, countOccurrences(source, QStringLiteral("->grab(")) - countOccurrences(source, QStringLiteral("viewport()->grab(")));
+    const QString windowSrc = readRepoFile(QStringLiteral("platform/qt/GpuDisplayWindow.cpp"));
+    const int grab = windowSrc.indexOf(QStringLiteral("bool GpuDisplayWindow::grabPresentedFramebufferIfActive(QImage *outImage,"));
+    ASSERT_TRUE(grab > 0);
+    const QString grabBody = windowSrc.mid(grab, windowSrc.indexOf(QStringLiteral("\n}\n"), grab) - grab);
+    ASSERT_TRUE(grabBody.contains(QStringLiteral(
+        "    {\n"
+        "        const playback_paint_credit::OffscreenPaintScope offscreen;   // the swap below presents it; credited after it\n"
+        "        win->paintGL();\n"
+        "    }")));
+    const int swapAt = grabBody.indexOf(QStringLiteral("    swapOutsidePaintEventAndRecord(win, glContext);"));
+    ASSERT_TRUE(swapAt > 0);
+    ASSERT_TRUE(grabBody.indexOf(QStringLiteral("    if ( win->m_presentedSerialValid ) playback_paint_credit::notePainted( win->m_presentedSerial );"), swapAt) > swapAt);
+    ASSERT_EQ(1, countOccurrences(grabBody, QStringLiteral("win->paintGL();")));
 }
