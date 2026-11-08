@@ -29,6 +29,7 @@ import os
 import random
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -232,8 +233,8 @@ def _spawn_watched(argv: list, encoding: "str | None" = None) -> "subprocess.Pop
         timer = getattr(proc, "window_timer", None)
         if timer is not None:
             timer.cancel()
+        _kill(proc)  # r6: signal through the handle first; the descriptor is released only after (a closed handle can no longer name the child)
         _release_pid_handle(proc)
-        _kill(proc)
         raise
     return proc
 
@@ -255,18 +256,46 @@ def _close_pidfd(fd: int) -> None:
     os.close(fd)
 
 
+def _pidfd_send_kill(fd: int) -> None:
+    """Seam (tests replace it): SIGKILL the one process a pidfd names (signal.pidfd_send_signal; Python 3.9+, Linux 5.1+). ProcessLookupError (ESRCH) means that
+    process has already exited -- it is never redirected to another process, whatever has happened to its PID."""
+    signal.pidfd_send_signal(fd, signal.SIGKILL)
+
+
 class _PidHandle:
     """r5 (adversary A1, second form): a handle on the ORIGINAL child that PID recycling cannot redirect. Linux pidfd_open(), taken right after Popen() returns, when
     nobody has reaped yet (only this module's own watcher or collector ever will, and neither has the Popen yet), so the PID is certainly the child's. Unlike a
+    reaped (only this module's own watcher or collector ever will, and neither has the Popen yet), so the PID is certainly the child's. Unlike a
     PID or Popen.returncode it needs no reap to be recorded before it answers: the descriptor reports the exit of that one process, however late any thread that
-    reaped it is. `running()` is False once the handle is closed (the owner closed it after an exit it saw, or after deciding the proof). Thread-safe."""
+    reaped it is. `running()` is False once the handle is closed. Thread-safe.
 
-    def __init__(self, fd: int):
+    r6: the same descriptor is how the child is SIGNALLED (`kill()`), because a signal by PID number can land on whatever process holds the number once the original
+    is reaped. Only the exit watcher closes the handle in normal operation (after the child is reaped and its status recorded); the window timer only reads it, so a
+    child that is still alive always still has an open handle. `_PidHandle(None)` is a handle that could not be opened (pidfd_open failed on a supported kernel,
+    e.g. EMFILE): it answers 'not running', so an unknown life is never taken for a proven long one, and it cannot signal (`kill()` says so)."""
+
+    def __init__(self, fd: "int | None"):
         self._fd = fd
         self._lock = threading.Lock()
 
     def running(self) -> bool:
         with self._lock:
+            return self._fd is not None and not _pidfd_exited(self._fd)
+
+    def kill(self) -> bool:
+        """SIGKILL the original child through the descriptor. True when this settled the matter: the signal was delivered, the child had already exited (ESRCH), or
+        the kernel refused it (EPERM and the like) -- none of which is ever retried by PID number. False when the handle is closed or was never open, and the caller
+        must decide. The descriptor is used under the lock, so it cannot be closed (and its number reused) in the middle."""
+        with self._lock:
+            if self._fd is None:
+                return False
+            try:
+                _pidfd_send_kill(self._fd)
+            except ProcessLookupError:
+                pass  # already exited: the child is gone, nothing to signal
+            except OSError:
+                pass  # advisory cleanup: a refused signal is not retried against a bare PID
+            return True
             return self._fd is not None and not _pidfd_exited(self._fd)
 
     def close(self) -> None:
@@ -287,10 +316,16 @@ class _PidHandle:
 
 def _open_pidfd(proc: "subprocess.Popen") -> "_PidHandle | None":
     """Seam (tests replace it): a _PidHandle on a real Popen child where the kernel offers pidfd_open (Linux 5.3+, Python 3.9+), else None (the caller falls back to
-    Popen's own record, see _child_is_running). Never raises: the clock is advisory."""
+    Popen's own record, see _child_is_running). Never raises: the clock is advisory.
+
+    r6 (sol r5 blocker): a platform that HAS pidfd_open but whose call failed (EMFILE, ENOMEM, a seccomp refusal) is not 'no pidfd': falling back to the
+    returncode/peek logic there would trust a PID that may have been recycled. It returns an unopened handle instead, which proves nothing (see _PidHandle)."""
     try:
         if isinstance(proc, _REAL_POPEN) and hasattr(os, "pidfd_open") and isinstance(getattr(proc, "pid", None), int):
-            return _PidHandle(os.pidfd_open(proc.pid))
+            try:
+                return _PidHandle(os.pidfd_open(proc.pid))
+            except Exception:  # noqa: BLE001
+                return _PidHandle(None)
     except Exception:  # noqa: BLE001
         pass
     return None
@@ -333,8 +368,8 @@ def _witness_window(proc: "subprocess.Popen", not_before: float) -> None:
             proc.window_proof = True
     except Exception:  # noqa: BLE001 - advisory; no proof is the safe answer
         pass
-    finally:
-        _release_pid_handle(proc)  # the decision is made either way; the descriptor is not needed again
+    # r6: the handle is NOT closed here. A child that outlived the window is still alive and may still need to be signalled through it (see _kill); the exit
+    # watcher closes it once the child is reaped and its status recorded.
 
 
 def _release_pid_handle(proc: "subprocess.Popen") -> None:
@@ -572,9 +607,17 @@ def _corpus_counts(lints: list[Path], texts: list[str], work: Path, tag: str) ->
 
 
 def _kill(proc: "subprocess.Popen") -> None:
-    """Stop a probe that is still running and reap it (no orphaned pwsh after a timeout or an earlier failure)."""
-    if proc.poll() is None:
-        proc.kill()
+    """Stop a probe that is still running and reap it (no orphaned pwsh after a timeout or an earlier failure).
+
+    r6 (adversary pass 13 A1, sol r5 blocker): the ORIGINAL child is signalled, never a PID number. Popen.kill() signals by number once poll() says None, and with the
+    exit watcher in the picture poll() says None for a child that the watcher has reaped but not yet recorded -- whose number may already belong to another process.
+    So: where the child has a pidfd (Linux), the signal goes through it (ESRCH = already exited: nothing is signalled); on Windows Popen holds the process handle, so
+    poll()/kill() already name the original process. A closed or absent handle on a child whose exit is not recorded falls back to Popen's own poll()/kill():
+    the watcher closes the handle only after it has recorded the exit, so that case is a live child (or a platform without pidfd) that must still be cleaned up."""
+    handle = getattr(proc, "pid_handle", None)
+    if handle is None or not handle.kill():
+        if proc.poll() is None:
+            proc.kill()
     try:
         proc.communicate(timeout=30)
     except Exception:  # noqa: BLE001 - best effort cleanup only
@@ -5168,7 +5211,13 @@ def _only_start_crash_text(stdout: "str | bytes | None", stderr: "str | bytes | 
 
 def _is_start_crash(done: "subprocess.CompletedProcess", elapsed: float) -> bool:
     """An interpreter start crash: died of a fault signal inside the start-up window, and either said nothing or said only the pwsh crash banner /
-    a .NET assembly-load failure (see _only_start_crash_text). A non-signal exit, a kill, a late death or any other output is a real failure."""
+    a .NET assembly-load failure (see _only_start_crash_text). A non-signal exit, a kill, a PROVABLY late death or any other output is a real failure.
+
+    r6 (Dot B2, wording only): `elapsed` is what _probe_lasted says, which is a proof and not a reading. A recognized start-fault signature gets its ONE extra attempt
+    whenever a long life was not PROVEN -- including when the window timer was delayed, failed to start, or had no handle to ask -- and a death the window timer
+    witnessed past the window is rejected. "Late" therefore means "provably late". The tradeoff, accepted: a genuinely late death whose timer was itself late
+    (or absent) is retried once, which costs one more attempt inside the shared deadline and cannot turn a real lint verdict green, because the same signature,
+    empty-or-banner output and a valid second result are still required."""
     return -done.returncode in LINT_PROBE_CRASH_SIGNALS and elapsed < LINT_PROBE_START_WINDOW_SEC and _only_start_crash_text(done.stdout, done.stderr)
 
 
@@ -6400,7 +6449,11 @@ class CollectCountsRuntimeLoadFaultTests(unittest.TestCase):
             reaped = self.exit_at if self.reaped_at is None else self.reaped_at
             return -6 if self.clock[0] >= reaped else None
 
+        gate = None  # r6 (Dot E1): when set, the exit watcher is held here until the scheduler releases it, so events happen in the order the scripted clock says
+
         def wait(self, timeout=None):
+            if self.gate is not None:
+                self.gate.wait(30)
             self.clock[0] = max(self.clock[0], self.wake_at)
             return -6
 
@@ -6416,13 +6469,16 @@ class CollectCountsRuntimeLoadFaultTests(unittest.TestCase):
             return "", CollectCountsRuntimeLoadFaultTests.REAL_STDERR
 
     def _scheduled_child(self, exit_at: float, wake_at: float, timer_at: "float | None" = None, begin_at: "float | None" = None, poll_blind: bool = False,
-                         reaped: bool = False, recycled: bool = False, reaped_at: "float | None" = None, pidfd: bool = False):
+                         reaped: bool = False, recycled: bool = False, reaped_at: "float | None" = None, pidfd: bool = False, pidfd_error: "OSError | None" = None):
         """_popen_pwsh over a ScheduledPopen on a scripted clock. The exit watcher runs (observing the exit at `wake_at`), then the window timer is fired at
         `timer_at` (default: the instant it is due, 5 s after the process existed), the clock being the one the child sees. `reaped`: the collector has already
-        reaped the child, so the non-reaping peek (waitid) reports ChildProcessError. Returns (the watched child, the clock list)."""
+        reaped the child, so the non-reaping peek (waitid) reports ChildProcessError. r6 (Dot E1): the two events happen in the order of their scripted times --
+        the timer fires first whenever it is due before the watcher wakes (the watcher is held until then, and only the watcher closes the handle), and the clock
+        is never rewound under a watcher that already ran. `pidfd_error`: the REAL _open_pidfd runs against a pidfd_open() that raises this error (the child
+        counts as a genuine Popen for it). Returns (the watched child, the clock list)."""
         clock = [1000.0]
         child = type("Scheduled", (self.ScheduledPopen,), {"clock": clock, "exit_at": exit_at, "wake_at": wake_at, "begin_at": begin_at, "poll_blind": poll_blind,
-                                                                  "recycled": recycled, "reaped_at": reaped_at})
+                                                                  "recycled": recycled, "reaped_at": reaped_at, "gate": threading.Event()})
 
         def waitid(idtype, pid, options):
             if recycled or clock[0] < exit_at:  # r5: a recycled PID names a NEW running child of the same parent, whatever became of the original
@@ -6437,24 +6493,40 @@ class CollectCountsRuntimeLoadFaultTests(unittest.TestCase):
             def __init__(self):
                 self.closed = False
 
-            def running(self):  # a closed real handle answers False too, but the watcher only closes it AFTER the exit, so the answer is the same at that time
-                return clock[0] < exit_at
+            def running(self):  # r6 (Dot E1): a closed real handle answers False, whenever it is asked
+                return not self.closed and clock[0] < exit_at
+
+            def kill(self):
+                return not self.closed
 
             def close(self):
                 self.closed = True
 
         # on every platform the peek is the scripted one: a Windows host has no os.waitid, a POSIX host would ask the kernel about pid 4242
+        open_pidfd = _open_pidfd if pidfd_error is not None else (lambda proc: FakePidfd() if pidfd else None)
         with mock.patch.object(subprocess, "Popen", child), mock.patch.object(time, "monotonic", lambda: clock[0]), self.recording_timers() as timers, \
-                mock.patch.object(sys.modules[__name__], "_open_pidfd", lambda proc: FakePidfd() if pidfd else None), \
+                mock.patch.object(sys.modules[__name__], "_open_pidfd", open_pidfd), \
+                mock.patch.object(sys.modules[__name__], "_REAL_POPEN", child if pidfd_error is not None else subprocess.Popen), \
+                (mock.patch.object(os, "pidfd_open", mock.Mock(side_effect=pidfd_error), create=True) if pidfd_error is not None else contextlib.nullcontext()), \
                 mock.patch.multiple(os, create=True, waitid=waitid, P_PID=1, WEXITED=4, WNOHANG=1, WNOWAIT=0x1000000):
             proc = _popen_pwsh(Path("r4-clock-probe.ps1"), counted=False)
-            proc.exit_watch.join(30)
-            self.assertFalse(proc.exit_watch.is_alive(), "the scripted watcher has finished")
-            self.assertEqual(max(wake_at, begin_at or 0.0), proc.ended_at, "the exit is observed when the watcher is next scheduled")
             self.assertEqual(1, len(timers), "one window timer per child")
-            for timer in timers:
-                clock[0] = timer_at if timer_at is not None else timer.args[1]
-                timer.fire()
+            fire_at = timer_at if timer_at is not None else timers[0].args[1]
+            if fire_at >= wake_at:  # the watcher wakes first, and the clock stays where the watcher left it when the timer then runs
+                child.gate.set()
+                proc.exit_watch.join(30)
+                self.assertFalse(proc.exit_watch.is_alive(), "the scripted watcher has finished")
+                clock[0] = fire_at
+                timers[0].fire()
+                proc.closed_after_timer = getattr(proc.pid_handle, "closed", None)
+            else:  # the timer is due first: it looks while the watcher is still blocked in wait(), then the watcher wakes
+                clock[0] = max(clock[0], fire_at)
+                timers[0].fire()
+                proc.closed_after_timer = getattr(proc.pid_handle, "closed", None)  # r6: the watcher has not run, so nothing may have closed the handle yet
+                child.gate.set()
+                proc.exit_watch.join(30)
+                self.assertFalse(proc.exit_watch.is_alive(), "the scripted watcher has finished")
+            self.assertEqual(max(wake_at, begin_at or 0.0), proc.ended_at, "the exit is observed when the watcher is next scheduled")
             clock[0] = max(clock[0], proc.ended_at)
         return proc, clock
 
@@ -6558,13 +6630,122 @@ class CollectCountsRuntimeLoadFaultTests(unittest.TestCase):
                              ("foreground", lambda: _run_pwsh_witnessed(Path("r5-probe.ps1"), 120))):
             killed.clear()
             child.clock[0] = 1000.0  # collecting the first child's corpse ran the shared scripted clock forward
-            handle = mock.Mock(**{"running.return_value": True})
+            handle = self.FakeHandle(killed)  # r6, changed on purpose: the unowned child is signalled through its handle ("pidfd"), then the handle is released
             with self.subTest(label), mock.patch.object(subprocess, "Popen", child), mock.patch.object(threading, "Timer", InterruptedTimer), \
                     mock.patch.object(sys.modules[__name__], "_open_pidfd", lambda proc: handle):
                 with self.assertRaises(KeyboardInterrupt):
                     start()
-                self.assertEqual([4242], killed, "the unowned child was killed")
-                handle.close.assert_called_once_with()
+                self.assertEqual(["pidfd"], killed, "the unowned child was killed through its handle, and not by PID number")
+                self.assertTrue(handle.closed, "and the descriptor was released afterwards")
+
+    class FakeHandle:
+        """r6: a duck-typed _PidHandle that records what is done through it. `kill()` answers True when it delivered a verdict (signalled, or found the child gone)."""
+
+        def __init__(self, signalled: list, closed: bool = False):
+            self.signalled, self.closed = signalled, closed
+
+        def kill(self):
+            if self.closed:
+                return False
+            self.signalled.append("pidfd")
+            return True
+
+        def running(self):
+            return not self.closed
+
+        def close(self):
+            self.closed = True
+
+    def _unrecorded_reap_child(self, bare: list):
+        """r6: a Popen whose child the watcher has REAPED but whose status it has not recorded yet (`poll()` says None), and whose PID may already belong to someone else.
+        A bare `kill()` -- Popen's signal by number -- is recorded in `bare`."""
+        return type("Reaped", (self.ScheduledPopen,), {"clock": [1000.0], "exit_at": 1000.9, "wake_at": 1006.0, "poll_blind": True, "recycled": True,
+                                                         "kill": lambda self: bare.append(self.pid)})(["pwsh"])
+
+    def test_r6_a1_kill_signals_the_original_child_through_its_handle_never_a_pid_that_may_be_recycled(self):
+        """r6 A1 (adversary pass 13, sol r5 blocker): _kill() asked Popen.poll() and then Popen.kill(), which signals a NUMBER. Between the watcher's waitpid() returning
+        and its recording returncode, poll() still says None and the number may belong to another process. The signal goes through the pidfd taken at launch, which names
+        the original child only; no number is ever signalled while that handle is open."""
+        bare: list = []
+        signalled: list = []
+        proc = self._unrecorded_reap_child(bare)
+        proc.pid_handle = self.FakeHandle(signalled)
+        _kill(proc)
+        self.assertEqual(["pidfd"], signalled)
+        self.assertEqual([], bare, "no signal by PID number while the child's handle is open")
+
+    def test_r6_a1_the_pid_handle_signals_the_one_process_it_names_and_reports_when_it_cannot(self):
+        sent: list = []
+
+        def gone(fd):
+            raise ProcessLookupError(3, "No such process")
+
+        def denied(fd):
+            raise PermissionError(1, "Operation not permitted")
+
+        with mock.patch.object(sys.modules[__name__], "_pidfd_send_kill", sent.append), mock.patch.object(sys.modules[__name__], "_close_pidfd", lambda fd: None):
+            handle = _PidHandle(77)
+            self.assertTrue(handle.kill())
+            self.assertEqual([77], sent)
+            with mock.patch.object(sys.modules[__name__], "_pidfd_send_kill", gone):
+                self.assertTrue(handle.kill(), "ESRCH: the child already exited -- a verdict, with no signal and no error")
+            with mock.patch.object(sys.modules[__name__], "_pidfd_send_kill", denied):
+                self.assertTrue(handle.kill(), "a refused signal is a verdict too: never retried by PID number")
+            handle.close()
+            self.assertFalse(handle.kill(), "a closed handle cannot signal, and says so (the caller decides)")
+            self.assertEqual([77], sent)
+
+    def test_r6_a1_a_live_child_is_still_cleaned_up_when_its_handle_is_already_closed_or_there_is_none(self):
+        """A closed handle (or none: Windows, or no pidfd) must not leave a LIVE child running; a recorded exit must never be signalled."""
+        for label, handle in (("closed handle", self.FakeHandle([], closed=True)), ("no handle", None)):
+            bare: list = []
+            live = type("Live", (self.ScheduledPopen,), {"clock": [1000.0], "exit_at": 9e9, "wake_at": 9e9, "kill": lambda self: bare.append(self.pid)})(["pwsh"])
+            live.pid_handle = handle
+            with self.subTest(label + ", child running"):
+                _kill(live)
+                self.assertEqual([4242], bare, "the live child is killed")
+            dead = type("Dead", (self.ScheduledPopen,), {"clock": [1000.0], "exit_at": 900.0, "wake_at": 900.0, "kill": lambda self: bare.append(self.pid)})(["pwsh"])
+            dead.pid_handle = handle
+            bare.clear()
+            with self.subTest(label + ", exit recorded"):
+                _kill(dead)
+                self.assertEqual([], bare, "a recorded exit is never signalled")
+
+    def test_r6_a1_the_window_timer_does_not_close_the_handle_a_live_child_is_cleaned_up_through(self):
+        """The timer decides the proof and nothing else: the descriptor stays open for the life of the child (only the watcher closes it, after the exit), so a
+        cleanup after the window still signals the original child."""
+        handle = self.FakeHandle([])
+        proc = mock.Mock(pid=4242, returncode=None, pid_handle=handle, window_proof=None)
+        with mock.patch.object(time, "monotonic", lambda: 1010.0):
+            _witness_window(proc, 1005.0)
+        self.assertTrue(proc.window_proof, "a child still running at the end of the window is proven")
+        self.assertFalse(handle.closed, "the timer does not close the handle")
+
+    def test_r6_e1_the_scheduler_orders_the_timer_and_the_watcher_by_their_scripted_times(self):
+        """Dot E1: the timer is not fired under a watcher that already ran (clock rewound) and the handle is closed only by the watcher, after the exit."""
+        for label, schedule, timer_first in (
+                ("timer due at 1005, watcher wakes at 1006", dict(exit_at=1000.9, wake_at=1006.0), True),
+                ("watcher wakes at 1004.99, timer ran at 1030", dict(exit_at=1004.99, wake_at=1004.99, timer_at=1030.0), False)):
+            with self.subTest(label):
+                proc, _ = self._scheduled_child(pidfd=True, **schedule)
+                self.assertIs(not timer_first, proc.closed_after_timer, "the handle is open when the timer looks only if the watcher has not run yet")
+                self.assertTrue(proc.pid_handle.closed, "the watcher closed it after the exit")
+                self.assertNotEqual(True, proc.window_proof, "an early death is never proven long, whichever event came first")
+
+    def test_r6_sol_r5_a_pidfd_open_that_fails_on_a_supported_kernel_never_proves_a_dead_child_alive(self):
+        """sol r5 blocker (pass 12 A1, supported-platform form): pidfd_open() itself raised (EMFILE) on Linux, so the old code fell back to the returncode/peek logic,
+        which a PID recycled during an unrecorded reap defeats -- the early death got a proof of life, a 6 s lifetime and no re-run. A failed open now leaves a handle
+        that answers 'not running' (an unknown life, never a long one), so both consumers keep their one re-run."""
+        for error in (OSError(24, "Too many open files"), OSError(12, "Cannot allocate memory")):
+            for who in (self._recovers_through_collect_counts, self._recovers_through_the_communicate_helper):
+                with self.subTest(f"{error.strerror}, {who.__name__}"):
+                    self._late_watcher_case(who, exit_at=1000.9, wake_at=1006.0, poll_blind=True, recycled=True, pidfd_error=error)
+
+    def test_r6_sol_r5_a_failed_pidfd_open_gives_no_proof_even_to_a_child_that_outlived_the_window(self):
+        """The cost, stated: where the open failed, a long life cannot be PROVEN either, so a recognized start-fault signature may get its one extra attempt
+        (the safe direction, see _is_start_crash). The window proof stays unset and nothing raises."""
+        proc, _ = self._scheduled_child(exit_at=1030.0, wake_at=1030.0, poll_blind=True, recycled=True, pidfd_error=OSError(24, "Too many open files"))
+        self.assertNotEqual(True, proc.window_proof)
 
     def test_r5_pass11_a1_the_pid_handle_reads_one_process_and_is_closed_exactly_once(self):
         exited = [False]
@@ -6600,7 +6781,10 @@ class CollectCountsRuntimeLoadFaultTests(unittest.TestCase):
             self.assertIsNone(_open_pidfd(self.ScheduledPopen(["pwsh"])), "a scripted child is never given a pidfd for its made-up PID")
             self.assertEqual([4242], opened)
             with mock.patch.object(os, "pidfd_open", mock.Mock(side_effect=OSError("ESRCH")), create=True):
-                self.assertIsNone(_open_pidfd(real_like), "a failing pidfd_open leaves the returncode/peek fallback")
+                failed = _open_pidfd(real_like)  # r6 (sol r5 blocker), changed on purpose: a failed open on a platform that HAS pidfd_open no longer falls back to a PID
+                self.assertIsInstance(failed, _PidHandle, "a failing pidfd_open leaves an unopened handle, not the returncode/peek fallback")
+                self.assertFalse(failed.running(), "an unopened handle never proves a life")
+                self.assertFalse(failed.kill(), "and cannot signal: the caller decides")
         if hasattr(os, "pidfd_open"):
             return
         self.assertIsNone(_open_pidfd(mock.Mock(spec=subprocess.Popen, pid=4242)), "no pidfd_open on this platform: the fallback stands")
