@@ -4229,7 +4229,7 @@ PlaybackPrepDrainOutcome MainWindow::drainPlaybackPrepInFlight( const char *reas
 bool MainWindow::playbackPrepQuiescentBeforeClipReplacement( const char *reason )
 {
     invalidatePlaybackPrepForDisplayChange( reason );
-    m_playbackPrepRgb8Pool.clear();   // r3: no recycled 8-bit buffer outlives the clip
+    m_playbackPrepRgb8Pool.clear();   // r3: no recycled 8-bit buffer outlives the clip (closed until the next take())
     const PlaybackPrepDrainOutcome outcome = drainPlaybackPrepInFlight( reason, 2000 );
     if( playbackPrepBorrowFreeingMutationAllowed( outcome ) ) return true;
     logInteractionEvent(
@@ -4310,7 +4310,10 @@ void MainWindow::recordClipOpenSourceStamp()
 // on false. The destructor joins the prep thread before calling this.
 bool MainWindow::freeActiveMlvObjectAfterLifecycleBarrier( const char *reason )
 {
-    m_playbackPrepRgb8Pool.clear();   // r3 (adversary A2 on e7e5271e): no recycled buffer outlives an unload
+    // r3 (adversary A2 on e7e5271e, A1 on c76e4457): no recycled buffer outlives an unload. clear() closes
+    // the pool until the next take(), so the queued result clearPresentationForClipOpen drops below gives
+    // its buffer back into a closed pool, which frees it.
+    m_playbackPrepRgb8Pool.clear();
     if( !m_pMlvObject )
         return playbackPrepBorrowFreeingMutationAllowed( drainPlaybackPrepInFlight( reason, 2000 ) );
 
@@ -31591,8 +31594,9 @@ void MainWindow::on_actionPlay_toggled(bool checked)
 {
     invalidatePlaybackPrepForDisplayChange(
         checked ? "play-start" : "play-stop" );
-    // r3 (adversary A2 on e7e5271e): stopped playback holds no recycled 8-bit buffer. A result
-    // still in flight may give one back afterwards; the next stop or clip unload frees it.
+    // r3 (adversary A2 on e7e5271e, A1 on c76e4457): stopped playback holds no recycled 8-bit buffer.
+    // clear() also closes the pool until the next frame takes one, so a result still in flight that
+    // gives its buffer back afterwards has it freed.
     if( !checked ) m_playbackPrepRgb8Pool.clear();
     // PLAYBACK-CUDA-NATIVE-PACE-1: the pace clock re-arms at this Play's first engine tick.
     m_playbackPaceGuard.reset();

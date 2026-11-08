@@ -122,11 +122,14 @@ class PlaybackPrepRgb8Pool
 public:
     static constexpr size_t kMaxHeld = 2;
 
-    /* A held buffer (the largest capacity), or an empty vector if none is held. */
+    /* A held buffer (the largest capacity), or an empty vector if none is held.
+     * Reopens a pool clear() closed. */
     std::vector<uint8_t> take();
-    /* Holds buf if it has capacity and fewer than kMaxHeld are held. */
+    /* Holds buf if it has capacity, the pool is open and fewer than kMaxHeld are held. */
     void give(std::vector<uint8_t> && buf);
-    /* Frees every held buffer (playback stop, clip change). */
+    /* Frees every held buffer and closes the pool until the next take() (playback
+     * stop, clip unload): a buffer given back in between is freed, whatever the order
+     * of the caller's clear and the drop that gives it (r3, adversary A1 on c76e4457). */
     void clear();
     size_t held() const;
     uint64_t takeHits() const;
@@ -137,6 +140,7 @@ private:
     std::vector<std::vector<uint8_t>> m_held;
     uint64_t m_takeHits = 0;
     uint64_t m_takeMisses = 0;
+    bool m_closed = false;
 };
 
 /* State the prep thread keeps across frames. Not thread-safe by design: one

@@ -130,6 +130,7 @@ uint16_t * PlaybackPrepCpuWorkspace::reducedInput(size_t words)
 std::vector<uint8_t> PlaybackPrepRgb8Pool::take()
 {
     std::lock_guard<std::mutex> lk(m_mutex);
+    m_closed = false;   /* a new frame: the pool clear() closed is open again */
     if ( m_held.empty() )
     {
         ++m_takeMisses;
@@ -149,7 +150,7 @@ void PlaybackPrepRgb8Pool::give(std::vector<uint8_t> && buf)
     std::vector<uint8_t> dropped(std::move(buf));
     if ( dropped.capacity() == 0 ) return;
     std::lock_guard<std::mutex> lk(m_mutex);
-    if ( m_held.size() >= kMaxHeld ) return;   /* freed by `dropped` after the unlock */
+    if ( m_closed || m_held.size() >= kMaxHeld ) return;   /* freed by `dropped` after the unlock */
     m_held.push_back(std::move(dropped));
 }
 
@@ -158,6 +159,7 @@ void PlaybackPrepRgb8Pool::clear()
     std::vector<std::vector<uint8_t>> dropped;
     std::lock_guard<std::mutex> lk(m_mutex);
     dropped.swap(m_held);
+    m_closed = true;
 }
 
 size_t PlaybackPrepRgb8Pool::held() const

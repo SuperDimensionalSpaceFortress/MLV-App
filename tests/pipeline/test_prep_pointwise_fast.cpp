@@ -721,6 +721,24 @@ TEST(PrepPointwiseFast, CpuRouteNullInputZeroesARecycledOut8)
     }
 }
 
+/* Adversary A1 on c76e4457 (major): freeActiveMlvObjectAfterLifecycleBarrier cleared the pool, then
+ * clearPresentationForClipOpen's invalidation gave the queued result's 12.3 MB buffer back into it, so
+ * the buffer outlived the unload (stop: an in-flight result's late give, likewise). clear() now closes
+ * the pool until the next take(): a give in between frees its buffer, whatever the call order. */
+TEST(PrepPointwiseFast, Rgb8PoolGiveAfterClearIsFreedUntilTheNextTake)
+{
+    PlaybackPrepRgb8Pool pool;
+    pool.give(std::vector<uint8_t>(64));
+    ASSERT_EQ(1u, static_cast<unsigned>(pool.held()));
+    pool.clear();
+    ASSERT_EQ(0u, static_cast<unsigned>(pool.held()));
+    pool.give(std::vector<uint8_t>(12301632u));   /* the late give after an unload / stop */
+    ASSERT_EQ(0u, static_cast<unsigned>(pool.held()));
+    ASSERT_TRUE(pool.take().capacity() == 0);    /* the next playback frame reopens it */
+    pool.give(std::vector<uint8_t>(64));
+    ASSERT_EQ(1u, static_cast<unsigned>(pool.held()));
+}
+
 /* The pool itself: bounded, largest-capacity first, empty buffers never held, clear() frees. */
 TEST(PrepPointwiseFast, Rgb8PoolIsBoundedAndHandsBackTheLargest)
 {
