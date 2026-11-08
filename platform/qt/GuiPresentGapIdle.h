@@ -138,7 +138,11 @@ public:
         if( exclusiveMs < 0.0 ) exclusiveMs = 0.0;
         if( m_depth > 0 && m_depth - 1 < kMaxDepth ) m_stack[m_depth - 1].childMs += inclusiveMs;
         if( !sameGap ) return 0.0;
-        gapMs[static_cast<int>( span )] += exclusiveMs;
+        // CPU-S1-PACE-NEXT-LEVER-1 (#770 r3 advisory A1): OtherBusySpan::Count, or any value outside
+        // the enum, pops its frame but is charged to no span (it would index past gapMs).
+        const int index = static_cast<int>( span );
+        if( index < 0 || index >= kCount ) return 0.0;
+        gapMs[index] += exclusiveMs;
         return exclusiveMs;
     }
 

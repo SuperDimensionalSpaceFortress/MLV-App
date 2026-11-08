@@ -24,6 +24,7 @@
 #include "mlv_pipeline_fixture.h"
 
 #include "../../platform/qt/GpuPreviewProcessing.h"
+#include "../../platform/qt/PlaybackPrepCpuRoute.h"
 #include "../../src/processing/raw_processing.h"
 
 #include <QByteArray>
@@ -522,6 +523,87 @@ TEST(PrepPointwiseFast, LookAssistOnAndOffAreAdmittedAndByteIdenticalAtFullSize)
     ASSERT_TRUE(!laOff.applyShadowsHighlights && !laOff.applyInLoopContrast && !laOff.applyVibrance);
     ASSERT_EQ(std::string(""), std::string(gpuPreviewProcessingPointwiseFastRefusal(laOff)));
     checkConfig("m16_la_off", laOff, frame, kFullWidth, kFullHeight, "");
+}
+
+/* CPU-S1-PACE-NEXT-LEVER-1 (Part B): with tier 1 off the CPU prep route's 16-bit buffer is
+ * the workspace's persistent scratch (never zero-filled) instead of a per-frame
+ * value-initialised vector. Pinned: for every config that reaches the unfused 16-bit pass
+ * (disabled, enabled without and with a spatial post-pass, the Look Assist pointwise
+ * subset), at the s1 size and an odd size, out8 from a scratch PRE-FILLED with 0xA5A5 is
+ * byte-identical to out8 from the old zeroed buffer, and the route wrote that scratch. */
+TEST(PrepPointwiseFast, Tier1OffWorkspaceScratchIsByteIdenticalWhenPoisoned)
+{
+    EnvScope tier1(gpuPreviewProcessingTier1SwitchName(), nullptr);
+    ASSERT_TRUE(!gpuPreviewProcessingTier1Enabled());
+
+    MlvPipelineFixture offFixture;
+    openFixture(offFixture);
+    const GpuPreviewProcessingConfig enabledPointwise = buildConfig(offFixture, applyLookAssistOff);
+    ASSERT_TRUE(enabledPointwise.enabled);
+    ASSERT_TRUE(!gpuPreviewProcessingCpuHasSpatialPostPass(enabledPointwise));
+
+    MlvPipelineFixture sharpenFixture;
+    openFixture(sharpenFixture);
+    const GpuPreviewProcessingConfig enabledSpatial = buildConfig(sharpenFixture, [](processingObject_t * p) {
+        applyLookAssistOff(p);
+        processingSetSharpening(p, 0.5);
+    });
+    ASSERT_TRUE(gpuPreviewProcessingCpuHasSpatialPostPass(enabledSpatial));
+
+    GpuPreviewProcessingConfig disabled = enabledPointwise;
+    disabled.enabled = false;
+
+    struct Size { int w; int h; };
+    for (const Size size : { Size{ kFullWidth, kFullHeight }, Size{ 1809, 1133 } })
+    {
+        const std::vector<uint16_t> frame = makeSyntheticFrame(size.w, size.h, 0x5A5Au + size.w);
+        const std::vector<uint16_t> blur = makeBlockBlur(frame, size.w, size.h);
+        MlvPipelineFixture laFixture;
+        openFixture(laFixture);
+        const GpuPreviewProcessingConfig lookAssist = buildLookAssistOnConfig(laFixture, blur, size.w, size.h);
+        const struct { const char * label; const GpuPreviewProcessingConfig * config; } cases[] = {
+            { "disabled", &disabled },
+            { "enabled_pointwise", &enabledPointwise },
+            { "enabled_spatial_sharpen", &enabledSpatial },
+            { "look_assist_cinematic_pointwise", &lookAssist },
+        };
+        const size_t words = static_cast<size_t>(size.w) * static_cast<size_t>(size.h) * 3u;
+        for (const auto & c : cases)
+        {
+            const std::string label = std::string(c.label) + "." + std::to_string(size.w) + "x" + std::to_string(size.h);
+            /* The old per-frame buffer: value-initialised. */
+            std::vector<uint16_t> zeroed(words, 0);
+            std::vector<uint8_t> oracle8(words, 0);
+            gpuPreviewProcessingApplyCpuReferenceTo8(*c.config, frame.data(), zeroed.data(), oracle8.data(),
+                                                     size.w, size.h, nullptr);
+
+            PlaybackPrepCpuWorkspace workspace;
+            uint16_t * poisoned = workspace.scratch16(size.w, size.h);
+            ASSERT_TRUE(poisoned != nullptr);
+            std::fill(poisoned, poisoned + words, static_cast<uint16_t>(0xA5A5));
+            std::vector<uint8_t> out8;
+            const PlaybackPrepCpuRouteResult route =
+                playbackPrepCpuRouteRun(workspace, *c.config, 1, frame.data(), size.w, size.h,
+                                        PlaybackPrepReducedDecision(), &out8);
+            ASSERT_EQ(1, route.reducedFactor);
+            ASSERT_TRUE(!route.spans.fused8);
+            /* The route used the workspace scratch (same buffer, no reallocation) ... */
+            ASSERT_EQ(1u, static_cast<unsigned>(workspace.scratch16Allocations()));
+            ASSERT_TRUE(workspace.scratch16(size.w, size.h) == poisoned);
+            if (std::all_of(poisoned, poisoned + words, [](uint16_t v) { return v == 0xA5A5; }))
+                ::minitest::fail(__FILE__, __LINE__, "route wrote the workspace scratch", label);
+            /* ... and no stage read a word before writing it. */
+            ASSERT_EQ(oracle8.size(), out8.size());
+            if (out8 != oracle8)
+            {
+                size_t first = 0;
+                while (first < out8.size() && out8[first] == oracle8[first]) ++first;
+                ::minitest::fail(__FILE__, __LINE__, "poisoned scratch out8 == zeroed buffer out8",
+                                 label + " first_byte=" + std::to_string(first));
+            }
+            std::printf("[PREP-SCRATCH] %s byte-identical with a 0xA5A5 scratch\n", label.c_str());
+        }
+    }
 }
 
 /* CPU-LOOKASSIST-AGX-FASTPATH-1: the shapes every committed M16-1243 CPU venue leg

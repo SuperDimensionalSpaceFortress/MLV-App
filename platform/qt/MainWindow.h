@@ -36,6 +36,7 @@
 #include "PlaybackFrameRange.h"
 #include "PlaybackNativePaceGuard.h"
 #include "PlaybackPrepInFlightGate.h"
+#include "PlaybackPrepOwnership.h"
 #include "PlaybackPresentTrace.h"
 #include "PlaybackScopesDuringPlayback.h"
 #include "PlaybackSlipHistogram.h"
@@ -730,6 +731,13 @@ private:
         bool displayPreviewCachingAllowed = false;
         bool playbackFastScaleActive = false;
         GpuDisplayViewport::PresentationOptions gpuPresentationOptions;
+        // CPU-S1-PACE-NEXT-LEVER-1 (Part A): sourceImage16 is the pinned slot's buffer, not a
+        // copy (playbackPrepMayBorrowSlotRgb16). The hash is set only under smoke frame
+        // telemetry; the prep worker re-hashes after its build (fail-closed lifetime check).
+        bool borrowedSlotRgb16 = false;
+        bool borrowedRgb16HashValid = false;
+        uint32_t borrowedRgb16Fnv = 0;
+        size_t borrowedRgb16Words = 0;
         std::vector<uint8_t> ownedSourceImage;
         std::vector<uint16_t> ownedSourceImage16;
         std::vector<float> ownedGpuAmazeTextureRawFrame;
@@ -1322,6 +1330,7 @@ private:
     uint64_t m_playbackSmokeStartPrepGenerationDrops = 0;
     uint64_t m_playbackSmokeStartPresentNothingDrops = 0;
     uint64_t m_playbackSmokeStartPrepReplacedBefore = 0;
+    uint64_t m_playbackSmokeStartPrepBorrowedRgb16Mutated = 0;
     uint64_t m_playbackSmokeStartPrepReplacedAfter = 0;
     uint64_t m_playbackSmokeStartScopeUpdates = 0;
     uint64_t m_playbackSmokeStartScopeSkips = 0;
@@ -1573,6 +1582,15 @@ private:
         // GpuDisplayViewport::presentImage calls.
         double regionImageFromImageMs = 0.0;
         double regionImageViewportMs = 0.0;
+        // CPU-S1-PACE-NEXT-LEVER-1: drawFrameReady's hand-off (ownership block through the
+        // pending-task store) and region_image's remaining calls, CPU-route frames only.
+        double handoffMs = 0.0;
+        quint64 handoffBorrowedRgb16Frames = 0;
+        quint64 handoffOwnedRgb16Bytes = 0;
+        double regionImageMagentaMs = 0.0;
+        double regionImageHashMs = 0.0;
+        double regionImageSetPixmapMs = 0.0;
+        double regionImageReleaseMs = 0.0;
     };
     PlaybackSmokePrepSpanTotals m_playbackSmokePrepSpans;
     // CPU-S1-RECON-UNDER-LOOK-PACE-LEVER-1 (Part A): the recon worker's sub-spans on presented frames.
@@ -1758,6 +1776,9 @@ private:
     std::atomic<uint64_t> m_playbackPrepGenerationDropCount{0};
     std::atomic<uint64_t> m_playbackPrepReplacedBeforeComputeCount{0};
     std::atomic<uint64_t> m_playbackPrepReplacedAfterComputeCount{0};
+    // CPU-S1-PACE-NEXT-LEVER-1: borrowed RGB16 frames whose sampled hash changed between the
+    // enqueue and the end of the prep worker's build (must stay 0).
+    std::atomic<uint64_t> m_playbackPrepBorrowedRgb16MutatedCount{0};
     std::atomic<uint64_t> m_presentNothingDropCount{0};
     bool m_lastPresentedFrameUsedGpuBilinearDebayer = false;
     int m_lastPresentedPlaybackScaleFactorActive = 1;
@@ -1896,7 +1917,7 @@ private:
                                            QRect *outGeometry,
                                            QSize *outPreviewSize );
     void onPlaybackSmokeApplicationStateChanged( Qt::ApplicationState state );
-    void enqueuePlaybackPrepTask( const PlaybackPrepTask &task );
+    void enqueuePlaybackPrepTask( PlaybackPrepTask &&task, double handoffStartStageTime );
     void invalidatePlaybackPrepForDisplayChange( const char *reason );
     PlaybackPrepDrainOutcome drainPlaybackPrepInFlight( const char *reason, int timeoutMs );
     // Returns playbackPrepBorrowFreeingMutationAllowed for its drain: a caller that

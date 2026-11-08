@@ -2843,6 +2843,26 @@
       "lines": [
         467
       ]
+    },
+    {
+      "path": "tests/console/test_playback_smoke_gui_present_attribution_wiring.cpp",
+      "anchor": "ASSERT_NEAR ( 0.0 , spans . gapMs [ i ] , 1 e - 9 ) ;",
+      "class": "not_run_proof_structural",
+      "clock": "other",
+      "justification": "CPU-S1-PACE-NEXT-LEVER-1 (#770 r3 advisory A1): pure-function unit test of gui_present_gap::OtherBusySpans on synthetic SpanClock values (no live clock): after end() is called with OtherBusySpan::Count and Count+1, every per-gap slot is still the 0.0 openGap() put there, i.e. an out-of-range span wrote nothing. Not a proof that any stage ran.",
+      "lines": [
+        689
+      ]
+    },
+    {
+      "path": "tests/console/test_playback_smoke_gui_present_attribution_wiring.cpp",
+      "anchor": "ASSERT_NEAR ( 0.0 , spans . sumMs [ i ] , 1 e - 9 ) ;",
+      "class": "not_run_proof_structural",
+      "clock": "other",
+      "justification": "Same synthetic OtherBusySpans check as the gapMs row above, for the session sums: gapMs[kCount] aliased sumMs[0] before the guard, so a 0.0 here is the proof the out-of-range end() wrote past nothing. Not a proof that any stage ran.",
+      "lines": [
+        690
+      ]
     }
   ]
 }

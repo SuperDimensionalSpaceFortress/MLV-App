@@ -132,6 +132,7 @@ HEADERS += \
     $$REPO_ROOT/platform/qt/PlaybackPrepPresentationPolicy.h \
     $$REPO_ROOT/platform/qt/PlaybackSlotRelease.h \
     $$REPO_ROOT/platform/qt/PlaybackPrepInFlightGate.h \
+    $$REPO_ROOT/platform/qt/PlaybackPrepOwnership.h \
     $$REPO_ROOT/platform/qt/ClipOpenAbortPolicy.h \
     $$REPO_ROOT/platform/qt/PlaybackGatePolicy.h \
     $$REPO_ROOT/platform/qt/AsyncH2dCounterContract.h \

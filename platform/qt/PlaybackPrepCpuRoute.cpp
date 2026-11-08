@@ -352,19 +352,20 @@ PlaybackPrepCpuRouteResult playbackPrepCpuRouteRun(PlaybackPrepCpuWorkspace & wo
     result.processedHeight = height;
     if ( !out8 || width <= 0 || height <= 0 ) return result;
 
-    /* Tier 1 off (the default): every frame gets the pre-card value-initialised
-     * 16-bit buffer and the unfused 16-bit pass; tier 1 on: the workspace's
-     * persistent scratch, and only when a post-pass needs the 16-bit result. */
+    /* Tier 1 off (the default): the unfused 16-bit pass; tier 1 on: only when a
+     * post-pass needs the 16-bit result. Either way the 16-bit buffer is the
+     * workspace's persistent scratch (reallocated only when the dims change, never
+     * zero-filled). CPU-S1-PACE-NEXT-LEVER-1 (Part B): tier 1 off used to zero a new
+     * width*height*3 buffer every frame (avg_playback_prep_alloc_ms ~9-10 ms at
+     * 1808x2268); the 16-bit pass writes every word before the conversion reads it
+     * (PrepPointwiseFast.Tier1OffWorkspaceScratchIsByteIdenticalWhenPoisoned). */
     const bool tier1 = gpuPreviewProcessingTier1Enabled();
     const bool scratchNeeded =
         !tier1 || !config.enabled || gpuPreviewProcessingCpuHasSpatialPostPass(config);
-    std::vector<uint16_t> frameBuffer16;
     auto scratchFor = [&](int w, int h) -> uint16_t *
     {
         if ( !scratchNeeded ) return nullptr;
-        if ( tier1 ) return workspace.scratch16(w, h);
-        frameBuffer16.assign(static_cast<size_t>(w) * static_cast<size_t>(h) * 3u, 0);
-        return frameBuffer16.data();
+        return workspace.scratch16(w, h);
     };
     const int factor = decision.factor;
     if ( factor > 1 && input16
