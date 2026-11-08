@@ -549,7 +549,8 @@ Write-CorePartitionNewFile $fresh 'ok'
 # CORE-PARTITION-HELPER-STOPFILE-OBSERVE-FLAKE-1: the test-only hold spliced into the decoded helper just before its stop-file check. Each pass
 # writes pass-N.polled (the count of processes it still tracks after its polls and enumeration) and waits, bounded at 60 s and named on timeout, for
 # pass-N.go, so a driver decides what happens between a pass's polls and its stop check instead of racing the host's scheduler for it.
-COVERAGE_HOLD_ANCHOR = "\nif (Test-Path -LiteralPath $stop) { $rec.endedBy = 'stop-file'; break }\n"
+# CORE-PARTITION-HELPER-PID-REUSE-1: the encoded helper carries no space around an assignment '=' (the generator drops them to make room)
+COVERAGE_HOLD_ANCHOR = "\nif (Test-Path -LiteralPath $stop) { $rec.endedBy='stop-file'; break }\n"
 COVERAGE_HOLD_HOOK = r"""
 $cpPass++; $cpHold = [string]$env:CP_HOLD_DIR; $cpHw = [Diagnostics.Stopwatch]::StartNew()
 [IO.File]::WriteAllText("$cpHold\pass-$cpPass.polled", [string]$live.Count)
@@ -1212,7 +1213,7 @@ class CorePartitionGeneratorTests(unittest.TestCase):
         # adversary r9 (5592421d) A1: the final pass enumerates same-path processes before it looks for the stop file
         src = base64.b64decode(re.search(r"(?m)^\$CorePartitionHelperEncoded = '([A-Za-z0-9+/=]+)'$", self.job("a")).group(1)).decode("utf-16-le")
         loop = src[src.index("while ($true) {"):]
-        self.assertLess(loop.index("$q.r.goneMs = "), loop.index("Test-Path -LiteralPath $stop"), "the stop file is looked for before the pass polls the tracked processes")
+        self.assertLess(loop.index("$q.r.goneMs="), loop.index("Test-Path -LiteralPath $stop"), "the stop file is looked for before the pass polls the tracked processes")
         self.assertLess(loop.index("Get-Process -Name $appName"), loop.index("Test-Path -LiteralPath $stop"), "the stop file is looked for before the pass enumerates same-path processes")
 
 
@@ -2389,7 +2390,7 @@ $global:cpP | Add-Member -MemberType ScriptProperty -Name ProcessorAffinity -Val
     if ($null -eq $global:cpF.firstAt) { $global:cpF.firstAt = $t }
     elseif (-not $global:cpF.stalled -and $t -ge $global:cpF.firstAt + 2500) { $global:cpF.stalled = $true; $global:cpF.exitAt = $t + 100; if ($env:CP_MODE -eq 'delayed') { Start-Sleep -Milliseconds 1500 } }
     [int64]4095 }
-function Get-Process { [CmdletBinding()] param([string]$Name) if (-not $global:cpF.stopped -and $global:cpF.sw.ElapsedMilliseconds -lt $global:cpF.exitAt) { $global:cpP } }
+function Get-Process { [CmdletBinding()] param([string]$Name, [int]$Id) if ($PSBoundParameters.ContainsKey('Id')) { return (@($global:cpP, $global:cpQ) | Where-Object { $null -ne $_ -and $_.Id -eq $Id }) }; if (-not $global:cpF.stopped -and $global:cpF.sw.ElapsedMilliseconds -lt $global:cpF.exitAt) { $global:cpP } }
 '@
 $src = $prelude + "`n" + ((@('Format-CorePartitionMask', 'Get-CorePartitionTopology', 'Test-CorePartitionMaskClass') | ForEach-Object { $fn[$_] }) -join "`n")
 $src = $src + "`n" + $hb
@@ -2544,6 +2545,10 @@ _CLOCK_APP = {**_APP, "startBeforeFirstPollMs": 50}
 CLOCK_STEPS_MS = (100, 500, 1000)
 # With the start unread at first sight the process refuses whatever the clock did (r3); these steps check that a backward step does not change that.
 CLOCK_START_UNREAD_STEPS_MS = (400, 700, 1000)
+# CORE-PARTITION-HELPER-PID-REUSE-1: the measured app with no handle held (byPid), and the process that takes its pid at enumeration 4 (idFrom/idTo: it holds the
+# pid from 4 to 9 without being listed by name unless from/to say so), started after the app.
+_REUSED_APP = {"id": 5000, "from": 1, "to": 3, "goneAt": 4, "startSec": 1, "handleFail": 1, "byPid": 1}
+_REUSER = {"id": 5000, "from": 99, "to": 0, "idFrom": 4, "idTo": 9, "goneAt": 10, "startBeforeFirstPollMs": -500}
 LATE_READ_SCENARIOS = {
     "control": {"procs": [_APP]},
     "path-empty-late": {"procs": [{**_APP, "pathFail": 3, "pathMode": "empty"}]},
@@ -2605,6 +2610,15 @@ LATE_READ_SCENARIOS = {
     "path-late-handle-unopened": {"procs": [{**_APP, "pathFail": 3, "pathMode": "empty", "handleFail": 1}]},
     # adversary pass 5 A2 on 8ad00092: the first Processor Information read throws, before the pending state exists
     "counter-read-throws": {"catThrow": 1, "procs": [_APP]},
+    # CORE-PARTITION-HELPER-PID-REUSE-1 (adversary A1 on 74c7d7d3, #696 r14b; Dot pr-696 comment 6470100169). The measured app is tracked with no handle held on
+    # it (its handle did not open, so every liveness poll opens the pid). The runner held its own handle through its post-exit sampling; the app exits at
+    # enumeration 4, once that handle is released, and before the helper's next poll another process holds the pid until enumeration 9. The pid is free from
+    # enumeration 10, which is the gone evidence a no-handle poll can see, and the stop arrives at enumeration 12. Polls are 250 ms apart, so the helper's
+    # once-a-second samples fall inside the reuse. Another image (never listed by name), and the same image (listed by name from its start, a new key).
+    "pid-reused-by-another-image": {"sleepMs": 250, "stopAt": 12, "procs": [_REUSED_APP, {**_REUSER, "exe": "other"}]},
+    "pid-reused-by-the-same-image": {"sleepMs": 250, "stopAt": 12, "procs": [_REUSED_APP, {**_REUSER, "from": 4, "to": 9}]},
+    # its control: the same app, the same identity on every poll, alive until enumeration 10
+    "pid-same-identity-control": {"sleepMs": 250, "stopAt": 12, "procs": [{**_REUSED_APP, "to": 9, "goneAt": 10}]},
     **{f"clock-back-path-{ms}": {"stepMs": ms, "procs": [{**_CLOCK_APP, "pathFail": 1, "pathMode": "empty"}]} for ms in CLOCK_STEPS_MS},
     **{f"clock-back-start-{ms}": {"stepMs": ms, "procs": [{**_CLOCK_APP, "startFail": 1}]} for ms in CLOCK_START_UNREAD_STEPS_MS},
 }
@@ -2624,7 +2638,9 @@ function Test-CpFails($Up, $From) { ($Up -eq -1) -or ($null -ne $Up -and $global
 $global:cpDoubles = @(foreach ($s in @($global:cpSpec.procs)) {
     $d = [pscustomobject]@{ Id = [int]$s.id; cpS = $s; PriorityClass = 'Normal'; ProcessorAffinity = [int64]4095 }
     $d | Add-Member -MemberType ScriptMethod -Name Refresh -Value { }
-    $d | Add-Member -MemberType ScriptProperty -Name HasExited -Value { if ($null -ne $this.cpS.exitedNullAt -and $global:cpPoll -ge $this.cpS.exitedNullAt -and ($null -eq $this.cpS.exitedNullTo -or $global:cpPoll -le $this.cpS.exitedNullTo)) { return $null }; $global:cpPoll -ge $this.cpS.goneAt }
+    $d | Add-Member -MemberType ScriptProperty -Name HasExited -Value { if ($null -ne $this.cpS.exitedNullAt -and $global:cpPoll -ge $this.cpS.exitedNullAt -and ($null -eq $this.cpS.exitedNullTo -or $global:cpPoll -le $this.cpS.exitedNullTo)) { return $null }
+        if ($this.cpS.byPid) { $o = Get-CpOccupant $this.Id; return ($null -eq $o -or $global:cpPoll -ge $o.cpS.goneAt) }
+        $global:cpPoll -ge $this.cpS.goneAt }
     $d | Add-Member -MemberType ScriptMethod -Name Refresh -Force -Value { if ($global:cpPoll -eq $this.cpS.exitedThrowAt) { throw [ComponentModel.Win32Exception]::new(5) } }
     $d | Add-Member -MemberType ScriptProperty -Name Handle -Value { if ($this.cpS.handleFail) { throw [ComponentModel.Win32Exception]::new(5) }; [IntPtr]1 }
     $d | Add-Member -MemberType ScriptProperty -Name Path -Value {
@@ -2638,13 +2654,20 @@ $global:cpDoubles = @(foreach ($s in @($global:cpSpec.procs)) {
         if ($null -ne $s.startBeforeFirstPollMs) { return $global:cpT1.AddMilliseconds(-$s.startBeforeFirstPollMs) }
         $global:cpLaunch.AddSeconds($s.startSec) }
     $d })
-function Get-Process { [CmdletBinding()] param([string]$Name)
+# CORE-PARTITION-HELPER-PID-REUSE-1: Get-Process -Id is the pid's occupant now (never counted as an enumeration): the double listed on that pid at this count, or
+# one whose idFrom/idTo say it holds the pid without being listed by name (another executable on the pid). byPid: no handle is held on the double, so its
+# HasExited, like a real Process's with no handle, opens the pid and reads whatever process holds it now (alive until that occupant's goneAt).
+function Get-CpOccupant([int]$Id) { @($global:cpDoubles | Where-Object { $_.Id -eq $Id -and $global:cpPoll -ge $(if ($null -ne $_.cpS.idFrom) { $_.cpS.idFrom } else { $_.cpS.from }) -and $global:cpPoll -le $(if ($null -ne $_.cpS.idTo) { $_.cpS.idTo } else { $_.cpS.to }) }) | Select-Object -Last 1 }
+function Get-Process { [CmdletBinding()] param([string]$Name, [int]$Id)
+    if ($PSBoundParameters.ContainsKey('Id')) { return (Get-CpOccupant $Id) }
     $global:cpPoll++
     if ($global:cpPoll -eq 1) { $global:cpT1 = [DateTime]::UtcNow }
     [IO.File]::AppendAllText($env:CP_POLLS, "$([DateTime]::UtcNow.Ticks)`n")
-    if ($global:cpPoll -eq 8) { [IO.File]::WriteAllText($env:MLV_CP_MEASURED, '5000'); [IO.File]::WriteAllText($env:MLV_CP_STOP, 'stop') }
+    # the helper's own monotonic stamp of this enumeration ($cw is the helper's stopwatch; this function runs in its scope)
+    [IO.File]::AppendAllText("$($env:CP_POLLS)ms", "$($cw.ElapsedMilliseconds)`n")
+    if ($global:cpPoll -eq $(if ($global:cpSpec.stopAt) { [int]$global:cpSpec.stopAt } else { 8 })) { [IO.File]::WriteAllText($env:MLV_CP_MEASURED, '5000'); [IO.File]::WriteAllText($env:MLV_CP_STOP, 'stop') }
     $global:cpDoubles | Where-Object { $global:cpPoll -ge $_.cpS.from -and $global:cpPoll -le $_.cpS.to } }
-function Start-Sleep { param([int]$Milliseconds) [Threading.Thread]::Sleep(20) }
+function Start-Sleep { param([int]$Milliseconds) [Threading.Thread]::Sleep([math]::Max(20, [int]$global:cpSpec.sleepMs)) }
 '@
 $src = $prelude + "`n" + ((@('Format-CorePartitionMask', 'Get-CorePartitionTopology', 'Test-CorePartitionMaskClass') | ForEach-Object { $fn[$_] }) -join "`n") + "`n" + $hb
 $out = [ordered]@{}
@@ -2688,7 +2711,10 @@ for ($b = 0; $b -lt $names.Count; $b += 4) {
             others = @(@($rec.others) | Where-Object { $null -ne $_ -and $null -eq $_.unidentified } | ForEach-Object { $_.pid })
             unidentified = @(@($rec.others) | Where-Object { $null -ne $_ -and $null -ne $_.unidentified } | ForEach-Object { $_.pid })
             by = $by; sessions = $rec.load.sessions; loadSec = $rec.load.seconds; vwhy = [string]$v.why; bench = $s.benchAffinityApplied; why = [string]$s.corePartitionNullReasons; skew = $rec.clockSkewMaxMs
-            polls = @([IO.File]::ReadAllLines((Join-Path $run.dir 'polls')) | ForEach-Object { [int64]$_ }) }
+            polls = @([IO.File]::ReadAllLines((Join-Path $run.dir 'polls')) | ForEach-Object { [int64]$_ })
+            pollsMs = @([IO.File]::ReadAllLines((Join-Path $run.dir 'pollsms')) | ForEach-Object { [int64]$_ })
+            appSampleMs = @(@($rec.samples) | Where-Object { $null -ne $_ -and $_.app } | ForEach-Object { [int64]$_.m })
+            firstApp = @(@($rec.instances) | Where-Object { $null -ne $_ -and $_.pid -eq 5000 } | ForEach-Object { [ordered]@{ start = [int64]$_.startUtcTicks; aliveMs = $_.aliveMs; goneMs = $_.goneMs } })[0] }
     }
 }
 $out | ConvertTo-Json -Compress -Depth 6
@@ -2705,7 +2731,8 @@ $hb = $hb.Replace($cat, '$cpFakeCat')
 $prelude = @'
 $cpFakeCat = [pscustomobject]@{}; $cpFakeCat | Add-Member -MemberType ScriptMethod -Name ReadCategory -Value { @{} }
 $global:cpPoll = 0
-function Get-Process { [CmdletBinding()] param([string]$Name)
+function Get-Process { [CmdletBinding()] param([string]$Name, [int]$Id)
+    if ($PSBoundParameters.ContainsKey('Id')) { return (Microsoft.PowerShell.Management\Get-Process -Id $Id -ErrorAction SilentlyContinue) }
     $global:cpPoll++
     [IO.File]::WriteAllText($env:CP_POLLS, [string]$global:cpPoll)
     Microsoft.PowerShell.Management\Get-Process -Name $Name -ErrorAction SilentlyContinue }
@@ -3027,6 +3054,40 @@ class CorePartitionR10Tests(unittest.TestCase):
                 self.assertGreaterEqual(rec["last"], polls[4], f"a failed liveness query ended the tracking of a live process: {case}")
                 self.assertIsNotNone(rec["goneMs"], case)
                 self.assertIn(case["vwhy"], self.ACCEPTED, case)
+
+    def test_pid_reuse_a_pid_reused_after_the_handle_is_released_ends_the_instance_at_the_reuse(self) -> None:
+        """CORE-PARTITION-HELPER-PID-REUSE-1 (adversary A1 on 74c7d7d3, #696 r14b; Dot pr-696 comment 6470100169), the real helper body. The measured app is
+        tracked with no handle held on it, so its liveness poll opens the pid. The runner releases its handle, the app's pid is reused before the helper's next
+        poll, and the new process holds it for five polls before the pid is free. On the base the poll reads the new process and stamps the measured app alive
+        through all five, with its samples, and the job ACCEPTS the record (the native acceptance trace: release, reuse before the exit is seen, false-alive
+        samples, then gone evidence before the helper ends, so no coverage guard refuses it). Now every poll re-checks the birth identity (start time and image
+        path) on the pid, and the first poll that reads another process ends the instance there: nothing after it is credited."""
+        for mode in ("pid-reused-by-another-image", "pid-reused-by-the-same-image"):
+            with self.subTest(mode=mode):
+                case = self.late_read(mode)
+                app, ms = case["firstApp"], case["pollsMs"]
+                # the app exits at enumeration 4 (pollsMs[3]); the first liveness poll after that runs before enumeration 5 (pollsMs[4])
+                self.assertLessEqual(app["aliveMs"], ms[3], f"a poll that read the pid's new process stamped the measured app alive: {case}")
+                self.assertIsNotNone(app["goneMs"], case)
+                self.assertGreaterEqual(app["goneMs"], ms[3], case)
+                self.assertLessEqual(app["goneMs"], ms[4], f"the measured app did not end at the first poll after its pid was reused: {case}")
+                self.assertEqual([m for m in case["appSampleMs"] if m > ms[3]], [], f"samples taken after the reuse were credited to the measured app: {case}")
+        trace = self.late_read("pid-reused-by-another-image")
+        self.assertEqual([trace["app"], trace["instances"], trace["unidentified"]], [5000, [5000], []], trace)
+        # the record is still accepted, now with the app's own lifetime (its endpoint gap is one poll)
+        self.assertIn(trace["vwhy"], self.ACCEPTED, trace)
+
+    def test_pid_reuse_control_the_same_identity_on_every_poll_keeps_the_instance_alive(self) -> None:
+        """CORE-PARTITION-HELPER-PID-REUSE-1 control (passes on the base and with the fix): the same no-handle app, whose pid holds the same process on every
+        poll, is alive through enumeration 9 with its samples credited, and is seen gone at the first poll after it exits."""
+        case = self.late_read("pid-same-identity-control")
+        app, ms = case["firstApp"], case["pollsMs"]
+        self.assertEqual([case["app"], case["instances"], case["unidentified"]], [5000, [5000], []], case)
+        self.assertGreaterEqual(app["aliveMs"], ms[8], f"a poll whose identity matched did not stamp the app alive: {case}")
+        self.assertGreaterEqual(app["goneMs"], ms[9], case)
+        self.assertLessEqual(app["goneMs"], ms[10], case)
+        self.assertTrue([m for m in case["appSampleMs"] if m > ms[3]], f"the live app's samples were not credited: {case}")
+        self.assertIn(case["vwhy"], self.ACCEPTED, case)
 
     def test_handover_a_process_on_a_recycled_tracked_pid_keeps_its_real_first_sight(self) -> None:
         """The same P2 alive and readable from enumeration 6: its first sight is enumeration 4, the pass that first listed it, not one pass late."""

@@ -5548,6 +5548,15 @@ public sealed class MlvCorePartitionLoad {
             # A failed query proves neither: the getter's throw reaches here as $null, not through the catch. That is no exit, since the seen key would stop the process
             # being tracked again and the job accepts an observed exit as coverage; and it is no alive stamp, since it can be a successor this user cannot open.
             $gone = $null; try { $q.p.Refresh(); $gone = $q.p.HasExited } catch { }
+            # CORE-PARTITION-HELPER-PID-REUSE-1 (adversary A1 on 74c7d7d3, #696 r14b): with no handle held ($q.h) the query above opens the pid, so once the pid is
+            # reused it reads the new process. Every poll that does not see it gone re-reads the birth identity on the pid AFTER that query, through a fresh
+            # process object (StartTime is cached by an object after its first read: r5 sol B1), and compares it as the tracking key does (start ticks, the
+            # exe's path). A start or a path read that differs is another process on the pid: gone at this poll, so nothing after it is credited. A read that
+            # fails proves neither; only a held handle (which keeps the pid from being reused) then vouches for an alive.
+            if (!$gone) {
+                $f = $s = $x = $null; try { $f = Get-Process -Id $q.r.pid -ea 0; $s = $f.StartTime.ToUniversalTime().Ticks } catch { }; try { $x = [string]$f.Path } catch { }
+                if (($s -and $s -ne $q.r.startUtcTicks) -or ($x -and $x -ine $exe)) { $gone = $true } elseif (!($s -and $x -or $q.h)) { $gone = $null }
+            }
             if ($gone -eq $false) {
                 try { $q.r.affinityLast = [int64]$q.p.ProcessorAffinity; $q.r.priorityLast = [string]$q.p.PriorityClass } catch { }
                 $q.r.lastSeenUtcTicks = & $clk; $q.r.aliveMs = $mo; if ($k -eq $own -and $loadOn) { $lb = $bn }
@@ -5595,7 +5604,7 @@ public sealed class MlvCorePartitionLoad {
                     $seen[$k] = 1; $fs = & $clk; if (!$pe) { $pe = @{ f = $fs; m = & $ms } }
                     $r = [ordered]@{ pid = $p.Id; startUtcTicks = $pst.Ticks; firstSeenUtcTicks = $pe.f; lastSeenUtcTicks = $fs; firstMs = $pe.m; goneUtcTicks = $null; aliveMs = $me; goneMs = $null; affinityFirst = $null; affinityLast = $null; priorityFirst = $null; priorityLast = $null; loadSec = 0.0; loadBytes = [int64]0; loadJoined = $null }
                     try { $r.affinityFirst = [int64]$p.ProcessorAffinity; $r.affinityLast = $r.affinityFirst; $r.priorityFirst = [string]$p.PriorityClass; $r.priorityLast = $r.priorityFirst } catch { $errs.Add("app-read: $($_.Exception.Message)") }
-                    $live[$k] = @{ p = $p; r = $r }
+                    $live[$k] = @{ p = $p; r = $r; h = $h }
                     if ($pst -lt $lu) { $others.Add($r) }
                     else {
                         $ins.Add($r)
@@ -6427,6 +6436,22 @@ if ($corePartitionEmit) {
     $cpHelperSource = (Get-CorePartitionFunctionSource @(${function:Format-CorePartitionMask}, ${function:Get-CorePartitionTopology}, ${function:Test-CorePartitionMaskClass}) "`n") + "`n" + $corePartitionHelperBody
     # Indentation and whole-line comments are dropped so the encoded command fits one command line (the C# here-string's closing "@ stays at column 0).
     $cpHelperSource = (@($cpHelperSource -split "\r?\n" | ForEach-Object { $_.TrimStart() } | Where-Object { $_ -ne '' -and -not $_.StartsWith('#') }) -join "`n")
+    # CORE-PARTITION-HELPER-PID-REUSE-1 (room for its identity re-check): the one space on each side of an assignment '=' is dropped too. The tokenizer
+    # finds each '=' token, so no text inside a string (the C# here-string, a message) is touched, and the result must tokenize to the same token
+    # kinds and texts in the same order, or generation throws.
+    $cpTk0 = $null; $cpPe = $null
+    [void][System.Management.Automation.Language.Parser]::ParseInput($cpHelperSource, [ref]$cpTk0, [ref]$cpPe)
+    if (@($cpPe).Count -gt 0) { throw "CORE_PARTITION_HELPER_UNPARSED the helper source has $(@($cpPe).Count) parse error(s)" }
+    $cpSb = [Text.StringBuilder]::new($cpHelperSource)
+    foreach ($cpEq in @($cpTk0 | Where-Object { $_.Kind -eq [System.Management.Automation.Language.TokenKind]::Equals } | Sort-Object { $_.Extent.StartOffset } -Descending)) {
+        $cpAt = $cpEq.Extent.StartOffset
+        if ($cpAt + 1 -lt $cpSb.Length -and $cpSb[$cpAt + 1] -eq ' ') { [void]$cpSb.Remove($cpAt + 1, 1) }
+        if ($cpAt -gt 0 -and $cpSb[$cpAt - 1] -eq ' ') { [void]$cpSb.Remove($cpAt - 1, 1) }
+    }
+    $cpTk1 = $null
+    [void][System.Management.Automation.Language.Parser]::ParseInput($cpSb.ToString(), [ref]$cpTk1, [ref]$cpPe)
+    if (@($cpPe).Count -gt 0 -or ((@($cpTk0 | ForEach-Object { "$($_.Kind) $($_.Text)" }) -join "`n") -cne (@($cpTk1 | ForEach-Object { "$($_.Kind) $($_.Text)" }) -join "`n"))) { throw 'CORE_PARTITION_HELPER_SQUEEZE_CHANGED_TOKENS dropping the spaces around an assignment changed how the helper tokenizes' }
+    $cpHelperSource = $cpSb.ToString()
     $cpHelperEncoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($cpHelperSource))
     # The limit: CreateProcess takes 32767 command-line chars; the pwsh path and switches before the encoded command are about 120 (sol r6 CP-06's
     # record HMAC took the helper past the earlier 30000).
