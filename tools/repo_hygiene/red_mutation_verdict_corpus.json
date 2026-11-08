@@ -533,6 +533,15 @@
    "expected_assertion": "test_s.py:2",
    "expect": "REFUSED",
    "code": "cnc-short-summary"
+  },
+  {
+   "id": "ut-legacy-dotted-module-header-with-a-python310-frame-is-could-not-check",
+   "kind": "verdict",
+   "why": "r16 hub ruling (Dot ef44c9a): CPython 3.10 prints module pkg.t, class test_x, method test_x as `test_x (pkg.t.test_x)`, the 3.11+ text of test pkg.t.test_x; a python3.10 library frame in the same output contradicts the default 3.11+ layout, so COULD-NOT-CHECK, never a PASS on the wrong identity",
+   "output": "======================================================================\nFAIL: test_x (pkg.t.test_x) [ordinary message]\n----------------------------------------------------------------------\nTraceback (most recent call last):\n  File \"/usr/lib/python3.10/unittest/case.py\", line 59, in testPartExecutor\n    yield\n  File \"/w/pkg/t.py\", line 5, in test_x\n    self.assertEqual(1, 2)\nAssertionError: 1 != 2\n\n----------------------------------------------------------------------\nRan 1 test in 0.001s\n\nFAILED (failures=1)\n",
+   "expected_assertion": "pkg.t.test_x",
+   "expect": "REFUSED",
+   "code": "cnc-layout"
   }
  ]
 }

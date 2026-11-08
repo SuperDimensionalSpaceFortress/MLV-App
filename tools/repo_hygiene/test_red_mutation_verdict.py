@@ -29,6 +29,7 @@ SUITE = (
 def _run_unittest(files: dict[str, str], target: str) -> str:
     with tempfile.TemporaryDirectory() as tmp:
         for name, text in files.items():
+            Path(tmp, name).parent.mkdir(parents=True, exist_ok=True)  # r16: a dotted module `pkg/t.py`
             Path(tmp, name).write_text(text, encoding="utf-8", newline="\n")
         proc = subprocess.run([sys.executable, "-m", "unittest", target], cwd=tmp, capture_output=True, timeout=120,
                               env={**__import__("os").environ, "PYTHONIOENCODING": "utf-8"})
@@ -1187,7 +1188,9 @@ class VerdictOnText(unittest.TestCase):
             proc = subprocess.run([sys.executable, str(Path(rmv.__file__)), "verdict", "--output", str(out),
                                    "--expect", "other.py::test_x"], text=True, capture_output=True, timeout=60)
         self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
-        self.assertEqual(proc.stdout.strip(), "REFUSED " + rmv.verdict(malformed, "other.py::test_x")[1])
+        # r16: the CLI line then names the unittest layout the verdict assumed (the default here)
+        self.assertEqual(proc.stdout.strip(), "REFUSED " + rmv.verdict(malformed, "other.py::test_x")[1]
+                         + " [unittest-layout=3.11+]")
         self.assertIn("; also: the run is red but not at", proc.stdout)
 
     def test_r9_the_cli_refuses_a_saved_file_with_a_vertical_tab(self) -> None:
@@ -2071,6 +2074,180 @@ class SummarySplitR11(unittest.TestCase):
         # the identity reader itself: a two-segment group ending in `.name` is the <= 3.10 layout only
         self.assertEqual(rmv._ut_identities("test_x (t.test_x) [m] (k=1)"), [("test_x", "t.test_x.test_x")])
         self.assertEqual(rmv._ut_identities("test_x (t.T.test_x) [m] (k=1)"), [("test_x", "t.T.test_x")])
+
+    # ---- r16 HUB RULING (HUB-TICK 20261108T0259Z; Dot ef44c9a on afc79648, the r15-RESIDUAL): the unittest LAYOUT contract.
+    # A group of three or more segments ending in `.name` is byte-identical between the 3.11+ test pkg.t.test_x and the
+    # <= 3.10 class test_x of the dotted module pkg.t (true id pkg.t.test_x.test_x). The caller declares the layout
+    # (--unittest-layout {3.11+,legacy}, default 3.11+), and a CPython library frame of the OTHER layout's version in the
+    # same saved output is COULD-NOT-CHECK (cnc-layout). Codes are asserted, never text.
+    _V310_FRAMES = ('/usr/lib/python3.10/unittest/case.py', 'C:\\msys64\\usr\\lib\\python3.10\\unittest\\case.py',
+                    'C:\\Python310\\Lib\\unittest\\case.py', 'C:/Python39/lib/unittest/case.py',
+                    '/home/u/.venv/lib/python3.9/site-packages/pkg/x.py')
+    _V314_FRAMES = ('/usr/lib/python3.14/unittest/case.py', 'C:\\Python314\\Lib\\unittest\\case.py',
+                    '/opt/py/lib/python3.13t/unittest/case.py', 'C:/Python311/lib/json/decoder.py')
+
+    @staticmethod
+    def _with_frame(out: str, path: str) -> str:
+        """`out` with one more traceback frame at `path`, first in every traceback (the runner's own line ends kept)."""
+        eol = "\r\n" if "\r\n" in out else "\n"
+        head = "Traceback (most recent call last):" + eol
+        frame = f'  File "{path}", line 59, in testPartExecutor{eol}    yield{eol}'
+        assert head in out, out
+        return out.replace(head, head + frame)
+
+    def _dotted_run(self, cls: str, body: str, *, legacy: bool = True) -> str:
+        """REAL unittest output of the dotted module `pkg.t` with one class `cls` and method `test_x` running `body`,
+        rendered by CPython 3.10's TestCase.__str__ (case.py:463-464, quoted above r15's tests) or by the host's own."""
+        src = ((self._LEGACY_STR if legacy else "import unittest\n") + f"class {cls}(unittest.TestCase):\n"
+               "    def test_x(self):\n" + "".join(f"        {ln}\n" for ln in body.splitlines()))
+        return _run_unittest({"pkg/__init__.py": "", "pkg/t.py": src}, "pkg.t")
+
+    def _dot_witness_texts(self) -> list[tuple[str, str]]:
+        rule, dash = "=" * 70, "-" * 70
+        witness = (rule + "\nFAIL: test_x (pkg.t.test_x) [ordinary message]\n" + dash
+                   + "\nTraceback (most recent call last):\n"
+                   '  File "pkg/t.py", line 5, in test_x\n    self.assertEqual(1, 2)\nAssertionError: 1 != 2\n\n' + dash
+                   + "\nRan 1 test in 0.001s\n\nFAILED (failures=1)\n")
+        texts = [("dot-witness", witness)]
+        for body, suffix in self.COLLISION_FORMS:
+            out = self._dotted_run("test_x", body)
+            self.assertIn(f"FAIL: test_x (pkg.t.test_x){suffix}\n", out.replace("\r\n", "\n"))
+            texts.append((suffix or "no-suffix", out))
+        return texts
+
+    def test_dotted_module_legacy_layout_contract_default_trips_on_legacy_evidence(self) -> None:
+        # (a) honest <= 3.10 output carrying a CPython 3.10 (or 3.9) library frame, read under the default 3.11+ layout:
+        # was PASS on the wrong identity pkg.t.test_x at afc79648; now COULD-NOT-CHECK cnc-layout, for every identity
+        for label, text in self._dot_witness_texts():
+            for path in self._V310_FRAMES:
+                evidenced = self._with_frame(text, path)
+                for want in ("pkg.t.test_x", "t.test_x", "pkg.t.test_x.test_x", "pkg/t.py:5"):
+                    with self.subTest(form=label, path=path, want=want):
+                        v = rmv.classify(evidenced, want)
+                        self.assertEqual((v.status, v.code), (rmv.REFUSED, "cnc-layout"), (v, evidenced))
+                        self.assertEqual(v.layout, "3.11+", v)
+                        v = rmv.classify(evidenced, want, unittest_layout="3.11+")
+                        self.assertEqual((v.status, v.code), (rmv.REFUSED, "cnc-layout"), (v, evidenced))
+
+    def test_dotted_module_legacy_layout_contract_declared_legacy_reads_module_class(self) -> None:
+        # (b) --unittest-layout legacy: the group is only `module.Class`, so the true pkg.t.test_x.test_x PASSes and the
+        # 3.11+ reading pkg.t.test_x does not, with or without the 3.10 frame
+        for label, text in self._dot_witness_texts():
+            for evidenced in (text, self._with_frame(text, self._V310_FRAMES[0]), self._with_frame(text, self._V310_FRAMES[2])):
+                with self.subTest(form=label, frame=evidenced.count("python3") + evidenced.count("Python3")):
+                    for right in ("pkg.t.test_x.test_x", "t.test_x.test_x", "test_x.test_x"):
+                        v = rmv.classify(evidenced, right, unittest_layout="legacy")
+                        self.assertEqual((v.status, v.code), (rmv.PASS, "assertion-failed"), (right, v, evidenced))
+                        self.assertEqual(v.layout, "legacy", v)
+                    for wrong in ("pkg.t.test_x", "t.test_x"):
+                        v = rmv.classify(evidenced, wrong, unittest_layout="legacy")
+                        self.assertEqual((v.status, v.code), (rmv.REFUSED, "not-at"), (wrong, v, evidenced))
+        # the legacy reading of a non-colliding class: module.Class plus the method name
+        legacy = self._dotted_run("T", "self.assertEqual(1, 2)")
+        self.assertIn("FAIL: test_x (pkg.t.T)\n", legacy.replace("\r\n", "\n"))
+        v = rmv.classify(legacy, "pkg.t.T.test_x", unittest_layout="legacy")
+        self.assertEqual((v.status, v.code), (rmv.PASS, "assertion-failed"), (v, legacy))
+        self.assertNotEqual(rmv.classify(legacy, "pkg.t.T", unittest_layout="legacy").status, rmv.PASS)
+
+    def test_dotted_module_legacy_layout_contract_legacy_trips_on_modern_evidence(self) -> None:
+        # (c) a CPython >= 3.11 library frame contradicts a declared legacy layout: COULD-NOT-CHECK cnc-layout
+        for label, text in self._dot_witness_texts():
+            for path in self._V314_FRAMES:
+                evidenced = self._with_frame(text, path)
+                for want in ("pkg.t.test_x.test_x", "pkg.t.test_x", "pkg/t.py:5"):
+                    with self.subTest(form=label, path=path, want=want):
+                        v = rmv.classify(evidenced, want, unittest_layout="legacy")
+                        self.assertEqual((v.status, v.code), (rmv.REFUSED, "cnc-layout"), (v, evidenced))
+
+    def test_dotted_module_legacy_layout_contract_controls_keep_their_verdict(self) -> None:
+        for body, suffix in self.COLLISION_FORMS:
+            with self.subTest(suffix=suffix):
+                # 3.11+ output (the host's own rendering) with a python3.14 frame, default layout: the true
+                # 3+-segment identity PASSes, for class T and for the colliding class test_x
+                for cls, true_id in (("T", "pkg.t.T.test_x"), ("test_x", "pkg.t.test_x.test_x")):
+                    modern = self._dotted_run(cls, body, legacy=False)
+                    self.assertIn(f"FAIL: test_x ({true_id}){suffix}\n", modern.replace("\r\n", "\n"))
+                    for out in (modern, self._with_frame(modern, self._V314_FRAMES[0]),
+                                self._with_frame(modern, self._V314_FRAMES[1])):
+                        v = rmv.classify(out, true_id)
+                        self.assertEqual((v.status, v.code), (rmv.PASS, "assertion-failed"), (v, out))
+                # no version evidence: the declared (default) layout stands, today's verdict kept. This is the r16
+                # NON-PROMISE: undeclared <= 3.10 output with no version evidence is read as 3.11+ (module docstring)
+                legacy = self._dotted_run("test_x", body)
+                v = rmv.classify(legacy, "pkg.t.test_x")
+                self.assertEqual((v.status, v.code), (rmv.PASS, "assertion-failed"), (v, legacy))
+        # 3.1 / 3.10 / 3.100 are three versions, never prefixes of each other; both separators; ASCII digits only
+        for path, version in (("/usr/lib/python3.1/os.py", (3, 1)), ("/usr/lib/python3.10/os.py", (3, 10)),
+                              ("/usr/lib/python3.100/os.py", (3, 100)), ("C:\\x\\lib\\python3.10\\os.py", (3, 10)),
+                              ("C:\\Python31\\Lib\\os.py", (3, 1)), ("C:\\Python310\\Lib\\os.py", (3, 10)),
+                              ("C:/Python3100/Lib/os.py", (3, 100)), ("C:\\Python39\\lib\\os.py", (3, 9)),
+                              ("/usr/lib64/python3.9/os.py", (3, 9)), ("/usr/lib/python3.13t/os.py", (3, 13)),
+                              ("C:\\py\\python310.zip\\json\\decoder.py", (3, 10)),
+                              ("/usr/lib/python2.7/os.py", (2, 7)),
+                              ("/w/pkg/t.py", None), ("/usr/lib/python3/dist-packages/x.py", None),
+                              ("/usr/lib/python3.010/os.py", None), ("/usr/lib/python3.\u0661\u0660/os.py", None),
+                              ("/usr/lib/python3.10", None), ("/w/mylib/python3.10/x.py", None),
+                              ("C:\\venv\\Lib\\site-packages\\x.py", None), ("C:\\Python3\\Lib\\os.py", None)):
+            with self.subTest(path=path):
+                self.assertEqual(rmv._stdlib_version(path), version)
+        modern = self._dotted_run("T", "self.assertEqual(1, 2)", legacy=False)
+        legacy = self._dotted_run("test_x", "self.assertEqual(1, 2)")
+        for path in ("/usr/lib/python3.100/os.py", "C:\\Python3100\\Lib\\os.py"):
+            with self.subTest(path=path):
+                # 3.100 is not 3.10: a 3.11+ run keeps its PASS under the default; a declared legacy layout trips
+                v = rmv.classify(self._with_frame(modern, path), "pkg.t.T.test_x")
+                self.assertEqual((v.status, v.code), (rmv.PASS, "assertion-failed"), v)
+                v = rmv.classify(self._with_frame(legacy, path), "pkg.t.test_x.test_x", unittest_layout="legacy")
+                self.assertEqual((v.status, v.code), (rmv.REFUSED, "cnc-layout"), v)
+        for path in ("/usr/lib/python3.1/os.py", "C:\\Python31\\Lib\\os.py"):
+            with self.subTest(path=path):
+                # 3.1 is not 3.10 either, and it is a version <= 3.10: the declared legacy layout stands; the default trips
+                v = rmv.classify(self._with_frame(legacy, path), "pkg.t.test_x.test_x", unittest_layout="legacy")
+                self.assertEqual((v.status, v.code), (rmv.PASS, "assertion-failed"), v)
+                v = rmv.classify(self._with_frame(modern, path), "pkg.t.T.test_x")
+                self.assertEqual((v.status, v.code), (rmv.REFUSED, "cnc-layout"), v)
+        # a pytest run is not read under a unittest layout: its frames are not layout evidence
+        pt = ("=== FAILURES ===\n___ test_x ___\nt.py:2: in test_x\n    f()\n/usr/lib/python3.10/json/decoder.py:5: in f\n"
+              "    assert False\nE   assert False\n/usr/lib/python3.10/json/decoder.py:5: AssertionError\n"
+              "=== short test summary info ===\nFAILED t.py::test_x - assert False\n=== 1 failed in 0.1s ===\n")
+        for layout in ("3.11+", "legacy"):
+            v = rmv.classify(pt, "t.py::test_x", unittest_layout=layout)
+            self.assertEqual((v.status, v.code), (rmv.PASS, "assertion-failed"), (layout, v))
+        # a source line that only QUOTES a library path is not a frame and is not evidence
+        quoted = modern.replace("self.assertEqual(1, 2)", "self.assertEqual(1, 2)  # /usr/lib/python3.10/os.py", 1)
+        v = rmv.classify(quoted, "pkg.t.T.test_x")
+        self.assertEqual((v.status, v.code), (rmv.PASS, "assertion-failed"), (v, quoted))
+
+    def test_dotted_module_legacy_layout_contract_cli_and_api(self) -> None:
+        legacy = self._dotted_run("test_x", 'with self.subTest("ordinary message"):\n    self.assertEqual(1, 2)')
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp, "red.txt")
+            out.write_text(legacy, encoding="utf-8", newline="")
+            ev = Path(tmp, "red310.txt")
+            ev.write_text(self._with_frame(legacy, self._V310_FRAMES[0]), encoding="utf-8", newline="")
+
+            def cli(*args: str) -> subprocess.CompletedProcess:
+                return subprocess.run([sys.executable, str(Path(rmv.__file__)), "verdict", *args], text=True,
+                                      capture_output=True, timeout=60)
+            proc = cli("--output", str(out), "--expect", "pkg.t.test_x.test_x", "--unittest-layout", "legacy")
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            self.assertTrue(proc.stdout.rstrip().endswith("[unittest-layout=legacy]"), proc.stdout)
+            self.assertEqual(len(proc.stdout.strip().splitlines()), 1, proc.stdout)
+            proc = cli("--output", str(out), "--expect", "pkg.t.test_x", "--unittest-layout", "legacy")
+            self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+            proc = cli("--output", str(ev), "--expect", "pkg.t.test_x")  # the default names its layout too
+            self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+            self.assertTrue(proc.stdout.rstrip().endswith("[unittest-layout=3.11+]"), proc.stdout)
+            self.assertIn("python3.10", proc.stdout)  # the reason names the evidence line
+            proc = cli("--output", str(out), "--expect", "pkg.t.test_x", "--unittest-layout", "3.10")
+            self.assertEqual(proc.returncode, 2, proc.stdout + proc.stderr)  # an unknown layout is bad usage
+        with self.assertRaises(ValueError):
+            rmv.classify(legacy, "pkg.t.test_x", unittest_layout="3.10")
+        with self.assertRaises(ValueError):
+            rmv.verdict(legacy, "pkg.t.test_x", unittest_layout="")
+        self.assertEqual(rmv.verdict(legacy, "pkg.t.test_x.test_x", unittest_layout="legacy")[0], rmv.PASS)
+        self.assertEqual(rmv.UNITTEST_LAYOUTS, ("3.11+", "legacy"))
+        self.assertIn("cnc-layout", rmv.REASON_CODES)
 
     def test_long_nonfailure_reason_is_bounded(self) -> None:
         # Dot 4153241 (:845/:859): every prefix of a SKIPPED/XFAIL/XPASS reason was materialized and checked, quadratic in

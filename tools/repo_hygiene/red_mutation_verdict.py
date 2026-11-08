@@ -21,7 +21,12 @@ Two decidable pieces:
 CLI (exit 0 = PASS, 1 = REFUSED, 2 = bad usage or an unreadable --output file)::
 
     py -3 tools/repo_hygiene/red_mutation_verdict.py verdict --output red.txt --expect tools/x/test_y.py:123
+    py -3 tools/repo_hygiene/red_mutation_verdict.py verdict --output red.txt --expect pkg.t.T.test_x --unittest-layout legacy
     py -3 tools/repo_hygiene/red_mutation_verdict.py probe --bug 3 --fix 3 --window 3 3
+
+``--unittest-layout {3.11+,legacy}`` (keyword ``unittest_layout`` of ``verdict()``/``classify()``; default ``3.11+``) declares
+the unittest header layout of the interpreter that ran the tests; the CLI line ends with ``[unittest-layout=<layout>]`` and
+``Verdict.layout`` carries it, so the assumption is in the saved verdict (r16 hub ruling; see ``layout`` below).
 
 THREAT MODEL (r14 hub ruling, HUB-TICK 20261107T2334Z, rule 1): "The checker reads runner TEXT. It guards against HONEST
 probes that fail for the wrong reason. It does not guard against HOSTILE test code. A test that builds a code object with
@@ -137,6 +142,13 @@ REFUSED with a reason that starts ``COULD-NOT-CHECK (<typed reason>)``. That is 
   the node ids. An occurrence that several sections pair with (an inherited test, whose frames all sit in the base
   class's file) is none of theirs: each keeps its own ``E`` line, and the occurrence counts by its own summary line. No
   occurrence's message is given to another section.
+* ``layout`` (r16 hub ruling, HUB-TICK 20261108T0259Z; ``cnc-layout``): a unittest traceback frame whose path sits in a
+  CPython library directory of the OTHER layout's version, read from the same saved output and never from the host
+  interpreter: ``lib/python3.10/``, ``lib\\python3.9\\``, ``Python310\\Lib\\``, ``Python39\\lib\\``, ``python310.zip\\`` (<= 3.10)
+  contradicts the declared ``3.11+``; the same directories of a version >= 3.11 contradict ``legacy``. The reason names the
+  frame. Either separator; the version is ASCII digits with no leading zero and ends with its directory, so 3.1, 3.10 and
+  3.100 are three versions (3.1 is a version <= 3.10 and so is legacy evidence; 3.100 is not). Any frame trips it, a
+  ``file:line`` expectation included. A frame in no such directory (``venv\\Lib\\``, ``lib/python3/``) is no evidence.
 * ``internal-error``: any other exception while reading the text. Never an uncaught traceback.
 
 A refusal is checked BEFORE the older reasons and the older reason is appended (``; also: ...``), so a
@@ -175,13 +187,21 @@ NON-PROMISES:
   without guessing (a parameter id holding ``] - ``).
 - The runner's FINAL result line decides green: unittest ``OK`` or a pytest bar with no
   failed/error count means no assertion failed, whatever failure-looking text a test printed above it.
-- unittest LAYOUT (r15, Dot R18 B1): 3.11+ prints ``name (module.Class.name)``, CPython <= 3.10 ``name (module.Class)``.
-  A group of two segments ending in ``.name`` (``test_x (t.test_x)``) cannot be 3.11+ (module, class and method are three
-  segments), so it reads as the <= 3.10 class ``test_x`` of module ``t``: ``t.test_x.test_x``. OPEN, for a hub ruling: a
-  group of three or more segments ending in ``.name`` (``test_x (pkg.t.test_x)``) is BOTH the 3.11+ ``pkg.t.test_x`` and
-  the <= 3.10 class ``test_x`` of module ``pkg.t``, character for character, and no line of the run tells the two apart.
-  It is read as 3.11+. Refusing it would refuse every 3.11+ identity expectation; a ``file:line`` expectation does not
-  depend on the layout.
+- unittest LAYOUT (r15, Dot R18 B1; r16 hub ruling, Dot ef44c9a): 3.11+ prints ``name (module.Class.name)``, CPython
+  <= 3.10 ``name (module.Class)``. The layout is DECLARED (``--unittest-layout``, default ``3.11+``). Under ``3.11+`` a
+  group of two segments ending in ``.name`` (``test_x (t.test_x)``) cannot be 3.11+ (module, class and method are three
+  segments), so it reads as the <= 3.10 class ``test_x`` of module ``t``: ``t.test_x.test_x`` (r15). Under ``legacy`` every
+  group is ``module.Class``: ``test_x (pkg.t.test_x)`` is ``pkg.t.test_x.test_x``.
+  NON-PROMISE (r16): a group of three or more segments ending in ``.name`` (``test_x (pkg.t.test_x)``) is BOTH the 3.11+
+  ``pkg.t.test_x`` and the <= 3.10 class ``test_x`` of module ``pkg.t``, character for character, and no line of a run
+  tells the two apart. UNDECLARED <= 3.10 OUTPUT THAT CARRIES NO VERSION EVIDENCE (see ``layout`` above) IS READ AS 3.11+,
+  so its 3.11+ reading can PASS. The same holds for a doctest of method n of class n (``n (pkg.t.n)``, any version). Why
+  this is the contract: the host runs CPython 3.14 (``py -3 --version``: ``Python 3.14.3``); hosted CI installs the version
+  in ``.python-version`` (``3.13.15``) through ``actions/setup-python`` ``python-version-file`` (.github/workflows/tests.yml:42,
+  :100 and every other setup-python step); CPython 3.10 reached end of life in October 2026. A run on <= 3.10 declares
+  ``--unittest-layout legacy``. A ``file:line`` expectation does not depend on the layout (the tripwire still applies).
+  STOP RULE (r16): a later layout variant under the declared or default layout whose output carries no version evidence is
+  DISTINGUISHED under this NON-PROMISE.
 - Whitespace inside an id is significant (`` a/t.py`` is not ``a/t.py``; ``test one`` is not ``test``), and the
   expectation is never stripped: `` a/t.py:5`` and ``a/t.py:5\\n`` match nothing.
 - It reads text, so text can be forged. r7 TERMINATION (hub ruling): an allowlisted shape is judged, anything outside
@@ -253,7 +273,7 @@ REASON_CODES = frozenset((
     "cnc-chained", "cnc-captured", "cnc-expectation", "cnc-line-framing", "cnc-decoding", "cnc-line-number", "cnc-frame",
     "cnc-identity", "cnc-pairing", "cnc-summary-split", "cnc-exception-type", "cnc-short-summary", "cnc-result-line",
     "cnc-no-result-line", "cnc-no-ran-footer", "cnc-runner", "cnc-count", "cnc-internal-error",
-    "cnc-bracket-before-last-segment", "cnc-traceback-line-break",
+    "cnc-bracket-before-last-segment", "cnc-traceback-line-break", "cnc-layout",
     # REFUSED, probe_discriminates
     "probe-number", "probe-nan", "probe-infinite", "probe-empty-window", "probe-both-inside", "probe-neither-inside",
     "probe-bug-inside",
@@ -292,6 +312,22 @@ _UT_KIND = re.compile(r"^(?P<kind>FAIL|ERROR): (?P<rest>.*\S)\s*$")
 # `test_x (t.T.test_x) [ordinary message]` fell to the legacy reading and became the invented id `t.T.test_x.test_x`.
 _SUBTEST_SUFFIX = re.compile(r"(?: \[.*\])?(?: \(.*\))?")
 _DASHES = re.compile(r"^-{70}\s*$")
+# r16 HUB RULING (HUB-TICK 20261108T0259Z; Dot ef44c9a): the unittest LAYOUT is DECLARED by the caller, never guessed from
+# the host interpreter. "3.11+" reads a header group as today (`name (module.Class.name)`, r15's two-segment rule kept);
+# "legacy" (CPython <= 3.10) reads it only as `module.Class`.
+LAYOUT_MODERN, LAYOUT_LEGACY = "3.11+", "legacy"
+UNITTEST_LAYOUTS = (LAYOUT_MODERN, LAYOUT_LEGACY)
+# The VERSION a traceback frame's path names, when it sits in a CPython library directory: POSIX `lib/python3.10/` (also
+# lib64, abiflags such as `3.13t`), Windows `Python310\Lib\` (also `-32`/`-arm64`), and the embedded `python310.zip\`.
+# Either separator, case-insensitive. The digits are ASCII, have no leading zero, and must be followed by the directory's
+# own end (POSIX abiflag letters then a separator; `Lib` after a Windows directory), so 3.1, 3.10 and 3.100 are three
+# versions, never a prefix of one another. A path in no such directory (`venv\Lib\`, `lib/python3/`) is no evidence.
+_STDLIB_DIRS = (
+    re.compile(r"(?:^|[/\\])lib(?:64)?[/\\]python(?P<major>[1-9][0-9]*)\.(?P<minor>0|[1-9][0-9]*)[a-z]*[/\\]", re.I | re.A),
+    re.compile(r"(?:^|[/\\])python(?P<major>[1-9])(?P<minor>0|[1-9][0-9]*)t?(?:-32|-64|-arm64)?[/\\]lib[/\\]", re.I | re.A),
+    re.compile(r"(?:^|[/\\])python(?P<major>[1-9])(?P<minor>0|[1-9][0-9]*)\.zip[/\\]", re.I | re.A),
+)
+_LAST_LEGACY = (3, 10)  # the last CPython whose unittest prints `name (module.Class)` (3.11 added the method segment)
 _PT_CAPTURED = re.compile(r"^-{3,} Captured .+ -{3,}\s*$")
 _CHAIN = ("The above exception was the direct cause of the following exception:",
           "During handling of the above exception, another exception occurred:")
@@ -452,6 +488,47 @@ def _line_no(digits: str) -> int:
     return int(digits)
 
 
+def _check_layout(layout: object) -> str:
+    """The declared unittest layout, or ValueError: a caller's bad keyword is bad usage, not text to refuse."""
+    if not isinstance(layout, str) or layout not in UNITTEST_LAYOUTS:
+        raise ValueError(f"unittest_layout must be one of {UNITTEST_LAYOUTS}, got {layout!r}")
+    return layout
+
+
+def _stdlib_version(path: str) -> tuple[int, int] | None:
+    """(major, minor) of the CPython library directory a frame path sits in (see _STDLIB_DIRS), or None. A path naming
+    two different versions gives None here; _layout_clash reads every version a path names (_stdlib_versions)."""
+    found = _stdlib_versions(path)
+    return found[0] if len(found) == 1 else None
+
+
+def _stdlib_versions(path: str) -> list[tuple[int, int]]:
+    seen: list[tuple[int, int]] = []
+    for rx in _STDLIB_DIRS:
+        for m in rx.finditer(path):
+            v = (int(m["major"]), int(m["minor"]))
+            if v not in seen:
+                seen.append(v)
+    return seen
+
+
+def _layout_clash(failures: list["Failure"], layout: str) -> str:
+    """r16 HUB RULING, the fail-closed TRIPWIRE: the cnc-layout reason when a traceback frame of the run's unittest blocks
+    sits in a CPython library directory of the OTHER layout's version (<= 3.10 contradicts 3.11+, >= 3.11 contradicts
+    legacy), or "". Read from the SAME saved output, never from the host interpreter; no version evidence = the declared
+    layout stands. Only real frames are read (_ut_walk): a source line that quotes a library path is not evidence."""
+    for f in failures:
+        for file, line in f.frames:
+            for v in _stdlib_versions(file):
+                if (v <= _LAST_LEGACY) == (layout == LAYOUT_MODERN):
+                    seen = "<= 3.10, whose unittest prints `name (module.Class)`" if v <= _LAST_LEGACY else \
+                        ">= 3.11, whose unittest prints `name (module.Class.name)`"
+                    return _Reason("cnc-layout", f"layout: read under --unittest-layout {layout}, but the traceback frame "
+                                   f"`File {file[:160]!r}, line {line}` sits in the library of CPython {v[0]}.{v[1]} "
+                                   f"({seen}); declare the layout of the interpreter that ran the tests")
+    return ""
+
+
 _NODE_SEPS = ("::",)  # a pytest node id `dir/file.py::Class::name[param]`: its last segment follows its last `::`
 _DOTTED_SEPS = (".", "/", "\\")  # a unittest `module.Class.name`, or an expectation that holds no `::`
 _PATH_SEPS = ("/", "\\")  # a file path: a frame, a `file:line` expectation, a module ERROR id, a SKIPPED location
@@ -523,6 +600,7 @@ class Parsed:
     green: bool = False
     mismatch: str = ""  # the runner's own failure count disagrees with what was readable: see _count_mismatch
     result: _Result | None = None  # the LAST result line, parsed whole (None: no result line, or a malformed one)
+    layout_clash: str = ""  # r16: the cnc-layout reason (see _layout_clash), or ""
 
 
 def _norm_path(text: str) -> list[str]:
@@ -723,7 +801,9 @@ def _ut_walk(block: list[str]) -> tuple[list[tuple[str, int]], str, set[int], st
     return frames, exc, joined, broke
 
 
-def _parse_unittest(lines: list[str]) -> list[Failure]:
+def _parse_unittest(lines: list[str], layout: str = LAYOUT_MODERN) -> list[Failure]:
+    """The unittest failure blocks of `lines`. Under the declared ``legacy`` layout (r16 hub ruling) a header group is
+    read ONLY as `module.Class` (the fallback below): no 3.11+ reading is made."""
     out: list[Failure] = []
     blocks: list[list[str]] = []
     current: list[str] | None = None
@@ -749,10 +829,11 @@ def _parse_unittest(lines: list[str]) -> list[Failure]:
         if len(head["rest"]) > _UT_HEADER_MAX:  # adversary A2: bounded work, and no real test name is this long
             raise _Unclassifiable("cnc-identity", f"unittest header of {len(head['rest'])} characters is longer than "
                                   f"{_UT_HEADER_MAX}: its test identity is not read")
-        readings = _ut_identities(head["rest"])
+        readings = _ut_identities(head["rest"]) if layout == LAYOUT_MODERN else []
         if readings:
             name, full = readings[0]
-        else:  # older Pythons: `name (module.Class)` (a two-segment `module.name` group is read in _ut_identities, r15)
+        else:  # older Pythons: `name (module.Class)` (a two-segment `module.name` group is read in _ut_identities, r15),
+            # and every header under the declared legacy layout (r16)
             # The module part is the LAST parenthesised dotted group; an earlier group belongs to the name. r14 fix 2
             # (716e6018-A1): only a group the subTest suffix (or nothing) follows, so a group inside `[msg]` or `(params)`
             # is never the class, and a 3.11+ identity with another suffix is never read as `module.Class` plus a name.
@@ -1313,13 +1394,14 @@ def _count_mismatch(lines: list[str], ut_blocks: int, stats: dict, result: _Resu
     return ""
 
 
-def parse_run(text: str | list[str]) -> Parsed:
+def parse_run(text: str | list[str], *, unittest_layout: str = LAYOUT_MODERN) -> Parsed:
     """Parse a run given as text (framed here, see _frame) or as the lines _frame already returned. The LAST result line
     is parsed whole ONCE (_read_result); a malformed one is the run's mismatch, and its counts are the only ones that
-    _count_mismatch and the green check read."""
+    _count_mismatch and the green check read. Its unittest blocks are read under the declared ``unittest_layout``."""
+    layout = _check_layout(unittest_layout)
     lines = _frame(text) if isinstance(text, str) else text
     stats: dict = {}
-    ut = _parse_unittest(lines)
+    ut = _parse_unittest(lines, layout)
     failures = ut + _parse_pytest(lines, stats)
     for f in failures:  # r13: a frame file is a path, and _norm_path cuts it at its first `[` (see _bracket_before_last_segment)
         for file, _line in f.frames:
@@ -1333,7 +1415,8 @@ def parse_run(text: str | list[str]) -> Parsed:
             bad = exc.reason
     return Parsed(failures=failures, red=any(_RED_MARK.search(ln) for ln in lines) or bool(failures),
                   green=any(_GREEN_MARK.search(ln) for ln in lines),
-                  mismatch=bad or _count_mismatch(lines, len(ut), stats, result), result=result)
+                  mismatch=bad or _count_mismatch(lines, len(ut), stats, result), result=result,
+                  layout_clash=_layout_clash(ut, layout))
 
 
 def _site_frames(failure: Failure, site: re.Match) -> list[int]:
@@ -1351,7 +1434,7 @@ def _matches(failure: Failure, expected: str) -> bool:
     return any(_id_ends_with(_segs(i), want) for i in failure.ids)
 
 
-def _precheck(lines: list[str] | None, expected: str) -> str:
+def _precheck(lines: list[str] | None, expected: str, layout: str = LAYOUT_MODERN) -> str:
     """The typed reason this text will not be classified, or "" (see NARROWED PROMISE in the module docstring). A
     reason returned here is a _Reason: it carries its code."""
     if lines is None or not isinstance(expected, str) or not expected.strip():
@@ -1376,7 +1459,8 @@ def _precheck(lines: list[str] | None, expected: str) -> str:
     elif _empty_segment(expected):
         return _Reason("cnc-expectation", "empty segment in the expected test identity (`..`, a trailing `.` or `::`): no "
                        "such id exists")
-    return parse_run(lines).mismatch
+    run = parse_run(lines, unittest_layout=layout)
+    return run.mismatch or run.layout_clash  # r16: a count problem is the more basic one and leads
 
 
 @dataclass(frozen=True)
@@ -1391,42 +1475,46 @@ class Verdict:
     reason: str
     also: tuple[str, ...] = ()
     code: str = "cnc-internal-error"
+    layout: str = LAYOUT_MODERN  # r16: the unittest layout the run was read under (declared by the caller)
 
 
-def verdict(output: str, expected: str) -> tuple[str, str]:
+def verdict(output: str, expected: str, *, unittest_layout: str = LAYOUT_MODERN) -> tuple[str, str]:
     """Return (PASS|REFUSED, text): the primary reason, then each diagnostic after ``; also: `` (see classify). PASS
     only when `expected` is an assertion that failed. Text it cannot classify with certainty is REFUSED with a reason
     that starts ``COULD-NOT-CHECK`` (NARROWED PROMISE, module docstring). For display: pin a reason on classify().code."""
-    v = classify(output, expected)
+    v = classify(output, expected, unittest_layout=unittest_layout)
     return v.status, v.reason + "".join(f"; also: {a}" for a in v.also)
 
 
-def classify(output: str, expected: str) -> Verdict:
-    """The verdict with its primary reason, its code and its secondary diagnostics kept apart (see Verdict)."""
+def classify(output: str, expected: str, *, unittest_layout: str = LAYOUT_MODERN) -> Verdict:
+    """The verdict with its primary reason, its code and its secondary diagnostics kept apart (see Verdict). The run's
+    unittest headers are read under ``unittest_layout`` (``"3.11+"``, the default, or ``"legacy"`` for CPython <= 3.10;
+    r16 hub ruling); any other value is ValueError. ``Verdict.layout`` names the layout used."""
+    layout = _check_layout(unittest_layout)
     pre, status, reason = "", REFUSED, ""
     try:
         lines = _frame(output) if isinstance(output, str) else None  # the ONE framing; every reader gets these lines
-        pre = _precheck(lines, expected)
-        status, reason = _verdict(lines, expected)
+        pre = _precheck(lines, expected, layout)
+        status, reason = _verdict(lines, expected, layout)
     except _Unclassifiable as exc:
         # a count or summary problem found by the precheck is the more basic one: it leads, the other follows
         return Verdict(REFUSED, f"COULD-NOT-CHECK ({pre or exc})", (str(exc),) if pre else (),
-                       pre.code if pre else exc.code)
+                       pre.code if pre else exc.code, layout)
     except Exception as exc:  # noqa: BLE001 - the promise is a refusal, never an uncaught traceback
         return Verdict(REFUSED, f"COULD-NOT-CHECK (internal-error {type(exc).__name__} while reading the text)",
-                       code="cnc-internal-error")
+                       code="cnc-internal-error", layout=layout)
     if pre:
-        return Verdict(REFUSED, f"COULD-NOT-CHECK ({pre})", (reason,) if status == REFUSED else (), pre.code)
-    return Verdict(status, reason, code=reason.code)
+        return Verdict(REFUSED, f"COULD-NOT-CHECK ({pre})", (reason,) if status == REFUSED else (), pre.code, layout)
+    return Verdict(status, reason, code=reason.code, layout=layout)
 
 
-def _verdict(lines: list[str] | None, expected: str) -> tuple[str, _Reason]:
+def _verdict(lines: list[str] | None, expected: str, layout: str = LAYOUT_MODERN) -> tuple[str, _Reason]:
     if not expected or not expected.strip():
         return REFUSED, _Reason("no-expectation", "no expected assertion given (file:line or test id): a red suite proves "
                                 "nothing alone")
     if lines is None:
         raise TypeError("the run output is not text")  # verdict() refuses it as an internal error, as before r9
-    run = parse_run(lines)  # the precheck parsed these lines already, so anything this raises it raised first
+    run = parse_run(lines, unittest_layout=layout)  # the precheck parsed these lines already: it raised anything first
     if run.result is not None and run.result.green:  # the LAST result line, parsed whole (r11)
         return REFUSED, _Reason("final-green", "the run is green (final result line): failure-looking text above it was "
                                 "test output, so no assertion failed")
@@ -1575,6 +1663,9 @@ def main(argv: list[str] | None = None) -> int:
     v = sub.add_parser("verdict")
     v.add_argument("--output", required=True, help="saved unittest or pytest output of the mutation run")
     v.add_argument("--expect", required=True, help="file:line or test id of the intended assertion")
+    v.add_argument("--unittest-layout", choices=UNITTEST_LAYOUTS, default=LAYOUT_MODERN,
+                   help="the unittest header layout of the interpreter that ran the tests: 3.11+ (default) prints "
+                        "`name (module.Class.name)`, legacy (CPython <= 3.10) `name (module.Class)`")
     p = sub.add_parser("probe")
     p.add_argument("--bug", type=_cli_num, required=True)
     p.add_argument("--fix", type=_cli_num, required=True)
@@ -1597,7 +1688,8 @@ def main(argv: list[str] | None = None) -> int:
             print(f"cannot read --output {args.output!r}: {type(exc).__name__}: {getattr(exc, 'strerror', None) or exc}",
                   file=sys.stderr)
             return 2
-        status, reason = verdict(text, args.expect)
+        status, reason = verdict(text, args.expect, unittest_layout=args.unittest_layout)
+        reason += f" [unittest-layout={args.unittest_layout}]"  # r16: the saved verdict names the layout it assumed
     else:
         ok, reason = probe_discriminates(args.bug, args.fix, tuple(args.window))
         status = PASS if ok else REFUSED
