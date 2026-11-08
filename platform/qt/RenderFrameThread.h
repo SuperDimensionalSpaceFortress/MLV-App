@@ -419,6 +419,10 @@ public:
                                       uint64_t activeGeneration );
     bool hasReadyPlaybackLookaheadFrame( uint32_t frameNumber,
                                          uint64_t activeGeneration );
+    /* HFR-NATIVE-60FPS-FULLRES-1 r27 fix iteration 2: a published Ready frame for
+     * frameNumber in activeGeneration, lookahead or not (not yet acquired). */
+    bool hasReadyFrameForPlaybackTarget( uint32_t frameNumber,
+                                         uint64_t activeGeneration );
     int prunePlaybackLookaheadOutsideForwardWindow( int activePlaybackTarget,
                                                     uint64_t activeGeneration,
                                                     int cutInFrame,

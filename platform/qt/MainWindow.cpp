@@ -2885,9 +2885,10 @@ bool MainWindow::conformTargetPresentOutstanding()
     const int target = static_cast<int>( m_newPosDropMode );
     if( target < 0 || m_lastPresentedPlaybackFrame == static_cast<long long>( target ) ) return false;
     if( renderThreadBusyForPlaybackAdvance( target ) ) return true;
-    return m_pRenderThread->hasPlaybackLookaheadRequest(
-        static_cast<uint32_t>( target ),
-        m_playbackPresentationGeneration.load( std::memory_order_acquire ) );
+    const uint64_t generation = m_playbackPresentationGeneration.load( std::memory_order_acquire );
+    // fix iteration 2 (adversary A1 on 9e88a583): a published Ready frame for the target, lookahead or not, is still coming
+    if( m_pRenderThread->hasReadyFrameForPlaybackTarget( static_cast<uint32_t>( target ), generation ) ) return true;
+    return m_pRenderThread->hasPlaybackLookaheadRequest( static_cast<uint32_t>( target ), generation );
 }
 
 static int mlvappStartPlaybackTimer( QObject *owner, double framerate )
