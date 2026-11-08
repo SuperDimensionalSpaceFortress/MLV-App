@@ -1561,7 +1561,9 @@ bool RenderFrameThread::hasReadyPlaybackLookaheadFrame( uint32_t frameNumber,
 
 // HFR-NATIVE-60FPS-FULLRES-1 r27 fix iteration 2 (adversary A1 on 9e88a583): isIdle() and isIdleExceptPlaybackLookahead()
 // omit Ready slots, so a frame published for the conform target but not yet acquired (the CPU path with lookahead 0 is a
-// non-lookahead slot) is still a present that is coming. No lookahead filter here.
+// non-lookahead slot) is still a present that is coming. No lookahead filter here. r28 (adversary A1 on c4efe7e3): "published"
+// is slot.ready alone, the predicate findLatestReadySlotLocked/findOldestReadySlotLocked acquire by -- with Phase3Mode::Disabled
+// publishRenderedSlot sets ready=true and leaves the state Idle, so a Ready-state check missed the published target.
 bool RenderFrameThread::hasReadyFrameForPlaybackTarget( uint32_t frameNumber,
                                                         uint64_t activeGeneration )
 {
@@ -1570,8 +1572,6 @@ bool RenderFrameThread::hasReadyFrameForPlaybackTarget( uint32_t frameNumber,
     {
         const FrameSlot &slot = m_frameSlots[i];
         if( !slot.ready ) continue;
-        if( slot.state.load( std::memory_order_acquire ) != SlotState::Ready )
-            continue;
         if( slot.frameNumber == frameNumber
          && slot.presentationContext.presentationGeneration == activeGeneration )
         {
