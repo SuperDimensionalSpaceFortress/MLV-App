@@ -188,7 +188,10 @@ TEST(PlaybackConformWiring, DropFrameTickQuantisesTheConformedCatchupToWholeFram
     const int ready = renderThread.indexOf(QStringLiteral("bool RenderFrameThread::hasReadyFrameForPlaybackTarget("));
     ASSERT_TRUE(ready > 0);
     const QString readyBody = renderThread.mid(ready, renderThread.indexOf(QStringLiteral("\n}\n"), ready) - ready);
-    ASSERT_TRUE(readyBody.contains(QStringLiteral("slot.state.load( std::memory_order_acquire ) != SlotState::Ready")));
+    // r28 (adversary A1 on c4efe7e3): published means slot.ready alone, as the acquisitions read it (Phase3Mode::Disabled
+    // publishes with the state left Idle); no slot-state filter
+    ASSERT_TRUE(readyBody.contains(QStringLiteral("if( !slot.ready ) continue;")));
+    ASSERT_FALSE(readyBody.contains(QStringLiteral("SlotState::")));
     ASSERT_TRUE(readyBody.contains(QStringLiteral("slot.presentationContext.presentationGeneration == activeGeneration")));
     ASSERT_FALSE(readyBody.contains(QStringLiteral("playbackLookaheadRequest")));
     // adversary A1 on 9b900412: the held frames are carried and repaid, and no debt survives a Play stop or start
