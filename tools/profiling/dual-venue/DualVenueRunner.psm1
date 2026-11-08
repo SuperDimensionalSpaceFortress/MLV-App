@@ -1380,6 +1380,9 @@ function Get-DvPlaybackEvidence {
         conformFirstFrame = (ConvertTo-DvInt64 $conformFields['first_frame'])
         conformLastFrame = (ConvertTo-DvInt64 $conformFields['last_frame'])
         conformEngineTarget = (ConvertTo-DvInt64 $conformFields['engine_target'])
+        # r30 (Dot D2 on 71104385): how many times the painted frames stepped backward (a seek back; the conform line's backward). Get-DvCriteriaMetrics
+        # judges no frozen tail across one: engine_target is the engine's high-water, not its final target. $null when the line does not carry it.
+        conformBackward = (ConvertTo-DvInt64 $conformFields['backward'])
         fpsOverride = (ConvertTo-DvInt64 $f['fps_override'])
         wrapped = $(if ($null -eq $wrappedField) { $null } else { $wrappedField -ne 0 })
         wrapCount = (ConvertTo-DvInt64 $f['wrap_count'])
@@ -4140,9 +4143,9 @@ function Get-DvCriteriaMetrics {
     # HFR-NATIVE-60FPS-FULLRES-1 r28 fix iteration 1 (adversary A2 on e052947c): a frozen presentation tail never passes. max_jump and source_fps are
     # measured between the first and the LAST presented frame, so a run that stops presenting at frame 1400 while the engine (the debt cap skipping)
     # reaches 1499 reads max_jump=1, source_fps=24. The conform line's source_advanced is what the presented frames covered; when the engine's
-    # source_advanced leads it by more than the carried-debt cap plus the frame in flight and the one being prepared, the frames past the last
-    # present were never shown: one jump the tracker could not see, and conformMaxJump becomes that shortfall (conformFrozenTailFrames names it).
-    # Within the tolerance nothing changes. Fix iteration 2 (adversary A4 on 4201a437): coverage the line does not carry, or carries unreadable, is
+    # source_advanced leads it by more than the allowance below, the frames past the last present were never shown: one jump the tracker could
+    # not see, and conformMaxJump becomes that shortfall (conformFrozenTailFrames names it). Within the allowance nothing changes (r28's
+    # carried-debt-cap tolerance is gone since r29, below). Fix iteration 2 (adversary A4 on 4201a437): coverage the line does not carry, or carries unreadable, is
     # a missing number, never a passing one -- conformMaxJump is then left absent with a typed CouldNotCheck, so its criterion FAILS (the app prints
     # source_advanced on every conform line, MainWindow.cpp playback_smoke.conform).
     #
@@ -4153,7 +4156,14 @@ function Get-DvCriteriaMetrics {
     # 1 when the engine holds one target not yet painted (H > L: conform never moves past an unpainted target), plus 1 when the first
     # painted frame is the one after the start (the start frame was on screen before Play). Every frame short beyond that was never shown.
     # Any of the three absent, unreadable or negative is a missing number: conformMaxJump is left absent, so its criterion FAILS.
-    $coverage = $(if ($null -ne $Playback -and $present -and $sameSession) { ConvertTo-DvInt64 (Get-DvProp $Playback 'conformSourceAdvanced') } else { $null })
+    #
+    # r30 (Dot D2 on 71104385): engine_target is the engine's HIGH-WATER target, and a seek back does not lower it, so a healthy Loop-off run that
+    # paints 0..1498, seeks back to 1398 and paints through 1448 (E=1499, H=1498, F=0, L=1448, C=1548) read 49 frozen frames that were all shown;
+    # and a run that froze at 1448 while the engine reached 1498, then sought back, paints the same ends. Neither the ends nor the count can tell
+    # them apart, so evidence with a backward step in the painted frames (backward > 0) is not judged: conformMaxJump is left absent with a typed
+    # CouldNotCheck and its criterion FAILS. A backward count absent, unreadable or negative is a missing number the same way. No conform leg seeks.
+    $backward = $(if ($null -ne $Playback -and $present -and $sameSession) { ConvertTo-DvInt64 (Get-DvProp $Playback 'conformBackward') } else { $null })
+    $coverage =$(if ($null -ne $Playback -and $present -and $sameSession) { ConvertTo-DvInt64 (Get-DvProp $Playback 'conformSourceAdvanced') } else { $null })
     $engineAdvanced = $(if ($null -ne $Playback) { ConvertTo-DvInt64 (Get-DvProp $Playback 'sourceAdvanced') } else { $null })
     $ends = [ordered]@{}
     foreach ($e in @(@('conformFirstFrame', 'first_frame'), @('conformLastFrame', 'last_frame'), @('conformEngineTarget', 'engine_target'))) {
@@ -4162,11 +4172,14 @@ function Get-DvCriteriaMetrics {
     }
     $missingEnd = @($ends.Keys | Where-Object { $null -eq $ends[$_] } | Select-Object -First 1)
     $maxJump = ConvertTo-DvInt64 $m['conformMaxJump']
-    if ($null -ne $maxJump -and ($null -eq $coverage -or $null -eq $engineAdvanced -or $missingEnd.Count -gt 0)) {
+    $backwardMissing = ($null -eq $backward) -or ($backward -lt 0)
+    if ($null -ne $maxJump -and ($null -eq $coverage -or $null -eq $engineAdvanced -or $missingEnd.Count -gt 0 -or $backwardMissing -or $backward -gt 0)) {
         $m['conformMaxJump'] = $null
         $m['conformMaxJumpCouldNotCheck'] = $(if ($null -eq $coverage) { 'the measured session''s playback_smoke.conform line carries no readable source_advanced (the presented coverage), so a frozen presentation tail cannot be ruled out' }
                                               elseif ($null -eq $engineAdvanced) { 'the run log''s summary carries no readable source_advanced (the engine''s advance), so a frozen presentation tail cannot be ruled out' }
-                                              else { "the measured session's playback_smoke.conform line carries no readable non-negative $($missingEnd[0]) (the painted coverage's ends and the engine's last target), so a frozen presentation tail cannot be ruled out" })
+                                              elseif ($missingEnd.Count -gt 0) { "the measured session's playback_smoke.conform line carries no readable non-negative $($missingEnd[0]) (the painted coverage's ends and the engine's last target), so a frozen presentation tail cannot be ruled out" }
+                                              elseif ($backwardMissing) { 'the measured session''s playback_smoke.conform line carries no readable non-negative backward (the painted frames'' backward steps), so a seek back cannot be ruled out and the tail cannot be judged' }
+                                              else { "the painted frames stepped backward $backward time(s) (a seek back): engine_target is the engine's high-water target, not its final one, and frames painted before the seek re-count, so a frozen tail cannot be told from a shown one; backward-seek evidence is not judged" })
     }
     elseif ($null -ne $maxJump) {
         $first = [int64]$ends['first_frame']; $last = [int64]$ends['last_frame']; $target = [int64]$ends['engine_target']
