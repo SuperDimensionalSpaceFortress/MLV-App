@@ -280,6 +280,10 @@ _FRAME_SHAPE = re.compile(r'^  File ".*", line ')
 # rescanned the trailing whitespace from every position, quadratic in a run of spaces (a subTest parameter `' ' * 24000`
 # took 6.9 s before the header-length guard). The same lazy form, _UT_HEAD, was unused and is removed.
 _UT_KIND = re.compile(r"^(?P<kind>FAIL|ERROR): (?P<rest>.*\S)\s*$")
+# r14 fix 2 (adversary 716e6018-A1): what unittest prints after a test's identity for a subTest, `_SubTest._subDescription`:
+# ` [msg]`, ` (k=v, ...)`, both (` [msg] (k=v)`), ` (<subtest>)`, or nothing. A `[msg]` suffix was not accepted, so
+# `test_x (t.T.test_x) [ordinary message]` fell to the legacy reading and became the invented id `t.T.test_x.test_x`.
+_SUBTEST_SUFFIX = re.compile(r"(?: \[.*\])?(?: \(.*\))?")
 _DASHES = re.compile(r"^-{70}\s*$")
 _PT_CAPTURED = re.compile(r"^-{3,} Captured .+ -{3,}\s*$")
 _CHAIN = ("The above exception was the direct cause of the following exception:",
@@ -640,7 +644,7 @@ def _ut_identities(rest: str) -> list[tuple[str, str]]:
         while k != -1:
             end = k + len(needle)
             ident, after = tail[:end - 1], tail[end:]
-            if after == "" or re.fullmatch(r" \(.*\)", after):
+            if _SUBTEST_SUFFIX.fullmatch(after):
                 found.append((name, ident))
             k = tail.find(needle, k + 1)
     return found
@@ -737,8 +741,11 @@ def _parse_unittest(lines: list[str]) -> list[Failure]:
         if readings:
             name, full = readings[0]
         else:  # older Pythons: `name (module.Class)`
-            # The module part is the LAST parenthesised dotted group; an earlier group belongs to the name.
-            groups = list(re.finditer(r" \(([A-Za-z_][\w.]*)\)", head["rest"]))
+            # The module part is the LAST parenthesised dotted group; an earlier group belongs to the name. r14 fix 2
+            # (716e6018-A1): only a group the subTest suffix (or nothing) follows, so a group inside `[msg]` or `(params)`
+            # is never the class, and a 3.11+ identity with another suffix is never read as `module.Class` plus a name.
+            groups = [g for g in re.finditer(r" \(([A-Za-z_][\w.]*)\)", head["rest"])
+                      if _SUBTEST_SUFFIX.fullmatch(head["rest"][g.end():])]
             dotted = [g for g in groups if "." in g.group(1)]
             pick = (dotted or groups or [None])[-1]
             name = head["rest"][:pick.start()] if pick else head["rest"]

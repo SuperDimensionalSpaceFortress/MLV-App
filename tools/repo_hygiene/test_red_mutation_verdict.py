@@ -1967,6 +1967,31 @@ class SummarySplitR11(unittest.TestCase):
                     v = rmv.classify(text, expected)
                     self.assertEqual((v.status, v.code), passing, v)
 
+    def test_subtest_message_header_keeps_its_identity(self) -> None:
+        # r14 adversary 716e6018-A1 (honest output): `with self.subTest("ordinary message")` prints the header
+        # `test_x (t.T.test_x) [ordinary message]`. Its `[msg]` suffix was not accepted, so the legacy fallback invented
+        # `t.T.test_x.test_x` and `test_x.test_x` PASSed while the failing test was T.test_x.
+        rule, dash = "=" * 70, "-" * 70
+        witness = (rule + "\nFAIL: test_x (t.T.test_x) [ordinary message]\n" + dash + "\nTraceback (most recent call last):\n"
+                   '  File "t.py", line 5, in test_x\n    self.assertEqual(1,2)\nAssertionError: 1 != 2\n\n' + dash
+                   + "\nRan 1 test in 0.001s\n\nFAILED (failures=1)\n")
+        self.assertNotEqual(rmv.classify(witness, "test_x.test_x").status, rmv.PASS)
+        v = rmv.classify(witness, "t.T.test_x")
+        self.assertEqual((v.status, v.code), (rmv.PASS, "assertion-failed"), v)
+        # real runs: message only, an empty message, message and parameters, parameters only
+        for sub in ('"ordinary message"', '""', '"m", k=1', "k=1, j='a (b.c)'", '"see (os.path)"'):
+            out = self._saved_ut("class T(unittest.TestCase):\n    def test_x(self):\n"
+                                 f"        with self.subTest({sub}):\n            self.assertEqual(1, 2)\n")
+            with self.subTest(sub=sub):
+                self.assertNotEqual(rmv.classify(out, "test_x.test_x").status, rmv.PASS, out)
+                v = rmv.classify(out, "t.T.test_x")
+                self.assertEqual((v.status, v.code), (rmv.PASS, "assertion-failed"), (v, out))
+        # the legacy form (Python < 3.11) with a message: the class group is the one the subTest suffix follows
+        legacy = witness.replace("test_x (t.T.test_x) [ordinary message]", "test_x (t.T) [see (os.path)]")
+        self.assertNotEqual(rmv.classify(legacy, "os.path.test_x").status, rmv.PASS)
+        v = rmv.classify(legacy, "t.T.test_x")
+        self.assertEqual((v.status, v.code), (rmv.PASS, "assertion-failed"), v)
+
     def test_long_nonfailure_reason_is_bounded(self) -> None:
         # Dot 4153241 (:845/:859): every prefix of a SKIPPED/XFAIL/XPASS reason was materialized and checked, quadratic in
         # its length. A 200 KB reason must finish in under 2 s, and it never PASSes as anything but the run's own failure.
