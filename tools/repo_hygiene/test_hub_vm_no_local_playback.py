@@ -231,11 +231,20 @@ def _spawn_watched(argv: list, encoding: "str | None" = None) -> "subprocess.Pop
 def _child_is_running(proc: "subprocess.Popen") -> bool:
     """Whether `proc` is running RIGHT NOW, without Popen's reaping lock. POSIX: a non-reaping waitid peek (a Popen.poll() answers None while another thread holds
     the lock, i.e. also for a child that thread has already reaped -- adversary pass 9 A2); an already reaped child is ChildProcessError, i.e. not running.
-    Elsewhere (Windows has no reaping lock) poll(). Anything unreadable is "not running": an unknown life is not a long one."""
+    Elsewhere (Windows has no reaping lock) poll(). Anything unreadable is "not running": an unknown life is not a long one.
+
+    r5 (adversary A1): a bare PID names whatever process holds it NOW, and the moment the original child is reaped its PID can be handed to a new child of the same
+    parent, which a peek would then call "running". So the answer is bound to the ORIGINAL child through the Popen object's own record: once `returncode` is set the
+    child was reaped (by its watcher or by the collector), its PID is no evidence of anything, and it is not running. That record is read before the peek AND after
+    it, so a reap that lands while the peek is in flight is not taken for a proof. Residual, stated plainly: the few bytecodes between a reaper's waitpid() returning
+    and Popen recording the status are invisible to this record; a PID would have to be recycled AND peeked inside exactly that gap to fool it."""
     pid = getattr(proc, "pid", None)
     try:
+        if getattr(proc, "returncode", None) is not None:
+            return False
         if hasattr(os, "waitid") and isinstance(pid, int):
-            return os.waitid(os.P_PID, pid, os.WEXITED | os.WNOHANG | os.WNOWAIT) is None
+            running = os.waitid(os.P_PID, pid, os.WEXITED | os.WNOHANG | os.WNOWAIT) is None
+            return running and getattr(proc, "returncode", None) is None
         return proc.poll() is None
     except Exception:  # noqa: BLE001 - ChildProcessError (reaped) and anything else
         return False
@@ -6278,24 +6287,32 @@ class CollectCountsRuntimeLoadFaultTests(unittest.TestCase):
     class ScheduledPopen:
         """r4: a pwsh child on a scripted clock (the list `clock`, patched in as time.monotonic). It started at clock 1000.0 and ends at `exit_at`; its exit
         watcher is only scheduled again at `wake_at` (never before `exit_at`), when its unbounded wait returns. `poll_blind` is POSIX's reaping lock held by the
-        collector: Popen.poll() answers None whatever the child did."""
+        collector: Popen.poll() answers None whatever the child did, and the returncode attribute stays None until that collector has finished (the reaper
+        has the child's status but has not recorded it yet). r5: `reaped_at` is when the child was reaped and Popen.returncode recorded (default `exit_at`);
+        `recycled` is a NEW child of the same parent that has taken over the original's PID, so a peek of that PID answers "running"."""
 
         clock = [1000.0]
         exit_at = 1000.9
         wake_at = 1006.0
         begin_at = None  # the clock when Popen() returns: a parent stalled inside the launch
         poll_blind = False
+        recycled = False
+        reaped_at = None
         pid = 4242
 
         def __init__(self, argv, **kwargs):
             self.args = argv
             self.stdout = self.stderr = self.stdin = None
+            self.collected = False
             if self.begin_at is not None:
                 self.clock[0] = self.begin_at
 
         @property
-        def returncode(self):  # None while the child runs, as Popen's is until somebody reaps it
-            return -6 if self.clock[0] >= self.exit_at else None
+        def returncode(self):  # None while the child runs, as Popen's is until somebody reaps AND records it
+            if self.poll_blind and not self.collected:
+                return None
+            reaped = self.exit_at if self.reaped_at is None else self.reaped_at
+            return -6 if self.clock[0] >= reaped else None
 
         def wait(self, timeout=None):
             self.clock[0] = max(self.clock[0], self.wake_at)
@@ -6309,18 +6326,20 @@ class CollectCountsRuntimeLoadFaultTests(unittest.TestCase):
 
         def communicate(self, timeout=None):
             self.clock[0] = max(self.clock[0], self.exit_at)  # collecting waits for the child to end
+            self.collected = True
             return "", CollectCountsRuntimeLoadFaultTests.REAL_STDERR
 
     def _scheduled_child(self, exit_at: float, wake_at: float, timer_at: "float | None" = None, begin_at: "float | None" = None, poll_blind: bool = False,
-                         reaped: bool = False):
+                         reaped: bool = False, recycled: bool = False, reaped_at: "float | None" = None):
         """_popen_pwsh over a ScheduledPopen on a scripted clock. The exit watcher runs (observing the exit at `wake_at`), then the window timer is fired at
         `timer_at` (default: the instant it is due, 5 s after the process existed), the clock being the one the child sees. `reaped`: the collector has already
         reaped the child, so the non-reaping peek (waitid) reports ChildProcessError. Returns (the watched child, the clock list)."""
         clock = [1000.0]
-        child = type("Scheduled", (self.ScheduledPopen,), {"clock": clock, "exit_at": exit_at, "wake_at": wake_at, "begin_at": begin_at, "poll_blind": poll_blind})
+        child = type("Scheduled", (self.ScheduledPopen,), {"clock": clock, "exit_at": exit_at, "wake_at": wake_at, "begin_at": begin_at, "poll_blind": poll_blind,
+                                                                  "recycled": recycled, "reaped_at": reaped_at})
 
         def waitid(idtype, pid, options):
-            if clock[0] < exit_at:
+            if recycled or clock[0] < exit_at:  # r5: a recycled PID names a NEW running child of the same parent, whatever became of the original
                 return None
             if reaped:
                 raise ChildProcessError(10, "No child processes")
@@ -6382,6 +6401,49 @@ class CollectCountsRuntimeLoadFaultTests(unittest.TestCase):
             with self.subTest(who.__name__):
                 self._late_watcher_case(who, exit_at=1000.9, wake_at=1006.3, poll_blind=True, reaped=True)
 
+    def test_r5_adversary_a1_a_recycled_pid_cannot_give_a_dead_original_child_a_proof_of_life(self):
+        """r5 adversary A1 (introduced, major): the original child (PID 4242) dies at 1000.9 and is reaped at once, its watcher pausing until 1006 before it
+        records the end. A NEW child of the same parent has taken PID 4242, so a bare-PID peek at 1005 (the original's window timer) answers "running". The
+        proof is bound to the ORIGINAL Popen (its own returncode says it was reaped), so the dead original gets none and keeps its one recognized-fault re-run."""
+        for who in (self._recovers_through_collect_counts, self._recovers_through_the_communicate_helper):
+            with self.subTest(who.__name__):
+                self._late_watcher_case(who, exit_at=1000.9, wake_at=1006.0, recycled=True)
+
+    def test_r5_adversary_a1_the_proof_is_bound_to_the_child_whatever_the_watchers_timing(self):
+        """The same recycled PID, over the schedules the r4 table covers: no death inside the window ever reads as a long life; a child that really outlived the
+        window (it is still running, unreaped, when the timer looks) still gets its proof, recycled PID or not."""
+        for label, schedule, outlived in (
+                ("died at 1000.9, watcher woke at 1006, PID recycled", dict(exit_at=1000.9, wake_at=1006.0, recycled=True), False),
+                ("died at 1000.9, watcher woke at 1030, PID recycled", dict(exit_at=1000.9, wake_at=1030.0, recycled=True), False),
+                ("died at 1004.99, watcher on time, PID recycled", dict(exit_at=1004.99, wake_at=1004.99, recycled=True), False),
+                ("died at 1000.9, reaped at 1001 by the collector, PID recycled", dict(exit_at=1000.9, wake_at=1006.0, reaped_at=1001.0, recycled=True), False),
+                ("died at 1006 (provably outlived the window), PID recycled after", dict(exit_at=1006.0, wake_at=1006.0, recycled=True), True)):
+            with self.subTest(label):
+                proc, _ = self._scheduled_child(**schedule)
+                known = _probe_lasted(proc)
+                self.assertEqual(outlived, proc.window_proof is True)
+                self.assertEqual(outlived, known >= LINT_PROBE_START_WINDOW_SEC, f"known life {known:.3f} s")
+
+    def test_r5_adversary_a1_the_peek_trusts_popens_own_record_before_and_after_it_looks_at_the_pid(self):
+        """The unit under the A1 fix: a recorded return code means the original is gone (its PID names someone else), checked BEFORE the peek and again AFTER
+        it, so a reap that lands between the two is not mistaken for a proof of life."""
+        def waitid(idtype, pid, options):
+            return None  # whatever now has this PID is running
+
+        with mock.patch.multiple(os, create=True, waitid=waitid, P_PID=1, WEXITED=4, WNOHANG=1, WNOWAIT=0x1000000):
+            self.assertTrue(_child_is_running(mock.Mock(pid=4242, returncode=None)), "an unreaped child that is running")
+            self.assertFalse(_child_is_running(mock.Mock(pid=4242, returncode=-6)), "reaped: the PID may belong to a new child")
+            self.assertFalse(_child_is_running(mock.Mock(pid=4242, returncode=0)))
+
+            reaped_during_the_look = mock.Mock(pid=4242, returncode=None)
+
+            def reaping_waitid(idtype, pid, options):
+                reaped_during_the_look.returncode = -6  # the reaper records the status while the peek is in flight
+                return None
+
+            with mock.patch.object(os, "waitid", reaping_waitid):
+                self.assertFalse(_child_is_running(reaped_during_the_look), "a peek that overlapped a reap proves nothing")
+
     def test_r4_the_peek_reads_a_running_child_as_running_and_an_unreadable_one_as_not(self):
         calls = []
         outcome = [None]
@@ -6390,7 +6452,7 @@ class CollectCountsRuntimeLoadFaultTests(unittest.TestCase):
             calls.append((idtype, pid, options))
             return outcome[0]
 
-        child = mock.Mock(pid=4242, **{"poll.return_value": 0})
+        child = mock.Mock(pid=4242, returncode=None, **{"poll.return_value": 0})  # r5: a fixture child with no recorded exit (Mock would invent one)
         with mock.patch.multiple(os, create=True, waitid=waitid, P_PID=1, WEXITED=4, WNOHANG=1, WNOWAIT=0x1000000):
             self.assertTrue(_child_is_running(child), "no state change under WNOHANG is a running child -- whatever Popen.poll() says")
             self.assertEqual([(1, 4242, 4 | 1 | 0x1000000)], calls, "WEXITED | WNOHANG | WNOWAIT: the child is not reaped by the look")
@@ -6400,8 +6462,8 @@ class CollectCountsRuntimeLoadFaultTests(unittest.TestCase):
                 self.assertFalse(_child_is_running(child), "an already reaped child")
             with mock.patch.object(os, "waitid", mock.Mock(side_effect=OSError("no"))):
                 self.assertFalse(_child_is_running(child), "an unreadable child is not taken to be running")
-        self.assertTrue(_child_is_running(mock.Mock(pid=None, **{"poll.return_value": None})), "without waitid (Windows) poll() decides")
-        self.assertFalse(_child_is_running(mock.Mock(pid=None, **{"poll.return_value": 0})))
+        self.assertTrue(_child_is_running(mock.Mock(pid=None, returncode=None, **{"poll.return_value": None})), "without waitid (Windows) poll() decides")
+        self.assertFalse(_child_is_running(mock.Mock(pid=None, returncode=None, **{"poll.return_value": 0})))
 
     def test_r4_sol_r3_the_window_is_proven_by_a_witness_not_read_off_the_observation_time(self):
         for label, schedule, outlived in (
@@ -6798,8 +6860,9 @@ class PopenPwshExitClockTests(unittest.TestCase):
         self.assertEqual(["quick-probe.ps1"], spawned, "one logical probe, however many launches it took")
         self.assertEqual(2 if scripted_fault or external_fault else 0, len(launches))
         self._assert_whose_clock(scripted_fault, first, proc, first_result, relaunches)
-        self.assertIsNotNone(proc.ended_at)
-        self.assertLess(lasted, time.monotonic() - proc.started_at - 1.0, "the lifetime excludes the 1.5 s the probe waited to be collected")
+        if proc.exit_watch is not None:  # r5 (pass-10 advisory A2): the watcher is advisory; a runner that cannot start a thread has no recorded end to assert on
+            self.assertIsNotNone(proc.ended_at)
+            self.assertLess(lasted, time.monotonic() - proc.started_at - 1.0, "the lifetime excludes the 1.5 s the probe waited to be collected")
         self.assertEqual(float("inf"), _probe_lasted(mock.Mock(spec=[])), "a probe with no start time is never taken to be inside the window")
 
     def test_a_real_probe_reports_how_long_it_lived_not_how_late_it_was_collected(self):
@@ -6871,6 +6934,19 @@ class PopenPwshExitClockTests(unittest.TestCase):
     def test_adversary_a2_a_watcher_thread_that_cannot_start_does_not_orphan_the_child(self):
         """Adversary r1 A2: if the exit watcher cannot be started the child is still returned (owned by the caller, who kills it), never left running unowned."""
         self._no_watcher_case(scripted_fault=False)
+
+    def test_r5_pass10_a2_the_lifetime_case_tolerates_a_runner_that_cannot_start_a_watcher_thread(self):
+        """Pass-10 advisory A2: the exit watcher is advisory, so the lifetime case's own end-time assertions apply only when a watcher exists."""
+        real_thread = threading.Thread
+
+        class NoWatcherThread(real_thread):  # only the exit watcher cannot start; subprocess's own helper threads still can
+            def start(self):
+                if getattr(self, "_target", None) is _note_exit:
+                    raise RuntimeError("can't start new thread")
+                super().start()
+
+        with mock.patch.object(threading, "Thread", NoWatcherThread):
+            self._lifetime_case(scripted_fault=False)
 
     def test_item1_the_no_watcher_probe_survives_a_scripted_start_fault(self):
         """Dot item 1 (:6165-6177): the first pwsh dies of the recorded fault; the re-launch is made while the watcher thread still cannot start."""
