@@ -1706,6 +1706,7 @@ function Get-DvLookAssistEvidence {
     param([Parameter(Mandatory)]$Spec, [AllowNull()][AllowEmptyString()][string]$LogText)
     $requested = ($null -ne (Get-DvProp $Spec 'look')) -or ((Get-DvProp (Get-DvProp $Spec 'generatorArgs') 'forceLookAssist') -eq $true)
     $reported = $null
+    $flavor = $null
     $verdict = 'NOT_REQUESTED'
     $reason = $null
     if ($requested) {
@@ -1721,12 +1722,15 @@ function Get-DvLookAssistEvidence {
             if (-not $m.Success) { $reason = 'the app''s gui_smoke.visual_state line carries no look_assist_enabled' }
             else {
                 $reported = $m.Groups['v'].Value
+                # VENUE-NATIVE-LEG-LOOKLEG-LABEL-1 r1 (adversary A1): the flavor the app applied, from the SAME record body (a Qt location suffix never answers for it)
+                $fm = [regex]::Match($found, '(^|\s)look_assist_flavor=(?<f>\S+)')
+                if ($fm.Success) { $flavor = $fm.Groups['f'].Value }
                 if ($reported -cne '1') { $reason = "the app's gui_smoke.visual_state line says look_assist_enabled=$reported (the leg asks for Look Assist on)" }
                 else { $verdict = 'HONOURED' }
             }
         }
     }
-    [ordered]@{ requested = $requested; reported = $reported; verdict = $verdict; reason = $reason; blocks = ($verdict -ceq 'NOT_HONOURED') }
+    [ordered]@{ requested = $requested; reported = $reported; flavor = $flavor; verdict = $verdict; reason = $reason; blocks = ($verdict -ceq 'NOT_HONOURED') }
 }
 
 # --- leg sets and the display matrix (DUAL-VENUE-DISPLAY-MATRIX-1) -------------------------------------------------------
@@ -3467,8 +3471,10 @@ function Test-DvReceiptValid {
             # Only the claim is re-derived (a receipt that predates the field, or says false, claims nothing); the leg TYPE binding above is untouched.
             if ((Get-DvProp $Receipt 'lookAssistOn') -eq $true) {
                 $claimVerdict = Get-DvLookAssistEvidence -Spec $spec -LogText $ev.logText
-                $claimRequested = [string](Get-DvProp $ev.summary 'lookFlavor'); $claimReported = [string](Get-DvProp $ev.summary 'lookFlavorReported')
-                if (-not ($claimVerdict.requested -and $claimVerdict.verdict -ceq 'HONOURED' -and (Get-DvProp $ev.summary 'lookAssistForced') -eq $true -and $claimRequested.Length -gt 0 -and $claimReported -ceq $claimRequested -and [string](Get-DvProp $Receipt 'lookAssistFlavor') -ceq $claimReported)) {
+                $claimRequestedRaw = Get-DvProp $ev.summary 'lookFlavor'; $claimReportedRaw = Get-DvProp $ev.summary 'lookFlavorReported'; $claimStoredRaw = Get-DvProp $Receipt 'lookAssistFlavor'
+                $claimRequested = [string]$claimRequestedRaw; $claimLogFlavor = [string]$claimVerdict.flavor
+                # strings only (adversary A2: a singleton array casts to its element); the flavor is the one the app's own record body names (adversary A1)
+                if (-not ($claimVerdict.requested -and $claimVerdict.verdict -ceq 'HONOURED' -and (Get-DvProp $ev.summary 'lookAssistForced') -eq $true -and $claimRequestedRaw -is [string] -and $claimReportedRaw -is [string] -and $claimStoredRaw -is [string] -and $claimRequested.Length -gt 0 -and $claimReportedRaw -ceq $claimRequested -and $claimLogFlavor -ceq $claimRequested -and $claimStoredRaw -ceq $claimLogFlavor)) {
                     $invalid.Add('LOOK_ASSIST_CLAIM_UNBACKED: the receipt says Look Assist ran (lookAssistOn) but the hashed run log / summary.json do not show it ran with the flavor lookAssistFlavor names')
                 }
             }

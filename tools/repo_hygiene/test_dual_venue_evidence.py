@@ -5073,8 +5073,8 @@ class DisplayModeIsRequestedAndObservedTests(EvidenceFactory, ModuleMutationMixi
         self.assertAdvisory(receipt, repo)
 
     # -- VENUE-NATIVE-LEG-LOOKLEG-LABEL-1 r1: a receipt's lookAssistOn claim is re-derived from the HASHED log and summary.json ----------
-    def look_claim(self, case: str, forced: bool = True, log_state: str = "look_assist_enabled=1", summary_flavor: str = "cinematic",
-                   reported: str = "cinematic", claim_flavor: str = "cinematic"):
+    def look_claim(self, case: str, forced: bool = True, log_state: str | None = "look_assist_enabled=1 look_assist_flavor=cinematic", summary_flavor: str = "cinematic",
+                   reported="cinematic", claim_flavor: str = "cinematic"):
         spec = self.write_spec()
         body = json.loads(spec.read_text(encoding="utf-8"))
         if forced:
@@ -5094,7 +5094,10 @@ class DisplayModeIsRequestedAndObservedTests(EvidenceFactory, ModuleMutationMixi
 
     def test_a_look_claim_the_hashed_evidence_does_not_back_is_invalid(self) -> None:
         cases = {"not-forced": dict(forced=False), "app-says-0": dict(log_state="look_assist_enabled=0"), "no-visual-state": dict(log_state=None),
-                 "other-flavor": dict(reported="classic"), "wrong-claimed-flavor": dict(claim_flavor="classic")}
+                 "other-flavor": dict(reported="classic"), "wrong-claimed-flavor": dict(claim_flavor="classic"),
+                 # adversary A1: the flavor comes from the app's record BODY, never a Qt location suffix; the summary flavor must be a plain string (A2)
+                 "location-suffix-flavor": dict(log_state="look_assist_enabled=1 look_assist_flavor=classic (C:/build look_assist_flavor=cinematic x/platform/qt/MainWindow.cpp:9831)"),
+                 "log-flavor-absent": dict(log_state="look_assist_enabled=1"), "array-reported-flavor": dict(reported=["cinematic"])}
         for case, opts in cases.items():
             with self.subTest(case=case):
                 repo, receipt = self.look_claim(case, **opts)
@@ -9572,7 +9575,7 @@ class VisualCaptureRunnerTests(RunnerHarness, unittest.TestCase):
     # leg-TYPE binding (Test-DvReceiptValid LEG_TYPE_MISMATCH keys on them), so a summary keyed on them hid the look. The look truth is its own top-level pair.
     NATIVE_LOOK_SUMMARY = {"lookLeg": False, "lookAssistForced": True, "lookFlavor": "cinematic", "lookFlavorReported": "cinematic", "lookFlavorHonored": True}
 
-    def run_native_look(self, summary: dict | None, look_assist_state: str | None = "look_assist_enabled=1", spec_args: dict | None = None):
+    def run_native_look(self, summary: dict | None, look_assist_state: str | None = "look_assist_enabled=1 look_assist_flavor=cinematic", spec_args: dict | None = None):
         spec = self.speed_spec(generatorArgs=spec_args if spec_args is not None else {"forceLookAssist": True, "lookFlavor": "cinematic"})
         self.write_artifacts(summary=summary, look_assist_state=look_assist_state)
         write_visual_captures(self.artifacts / "visual", "ok")
@@ -9598,9 +9601,12 @@ class VisualCaptureRunnerTests(RunnerHarness, unittest.TestCase):
         # fail closed: unknown is not on. The app says 0, or says nothing, or applied another flavor, or the job's own summary is silent.
         cases = (("app says 0", dict(self.NATIVE_LOOK_SUMMARY), "look_assist_enabled=0"),
                  ("no visual_state line", dict(self.NATIVE_LOOK_SUMMARY), None),
-                 ("another flavor applied", dict(self.NATIVE_LOOK_SUMMARY, lookFlavorReported="classic", lookFlavorHonored=False), "look_assist_enabled=1"),
-                 ("flavor report absent", {"lookLeg": False, "lookAssistForced": True, "lookFlavor": "cinematic"}, "look_assist_enabled=1"),
-                 ("summary says not forced", dict(self.NATIVE_LOOK_SUMMARY, lookAssistForced=False), "look_assist_enabled=1"))
+                 ("another flavor applied", dict(self.NATIVE_LOOK_SUMMARY, lookFlavorReported="classic", lookFlavorHonored=False), "look_assist_enabled=1 look_assist_flavor=classic"),
+                 ("flavor report absent", {"lookLeg": False, "lookAssistForced": True, "lookFlavor": "cinematic"}, "look_assist_enabled=1 look_assist_flavor=cinematic"),
+                 ("summary says not forced", dict(self.NATIVE_LOOK_SUMMARY, lookAssistForced=False), "look_assist_enabled=1 look_assist_flavor=cinematic"),
+                 # adversary A1: the job's parser read cinematic from a Qt location suffix while the record body said classic
+                 ("location suffix carries the flavor", dict(self.NATIVE_LOOK_SUMMARY), "look_assist_enabled=1 look_assist_flavor=classic (C:/build look_assist_flavor=cinematic x/platform/qt/MainWindow.cpp:9831)"),
+                 ("app log names no flavor", dict(self.NATIVE_LOOK_SUMMARY), "look_assist_enabled=1"))
         for name, summary, state in cases:
             with self.subTest(case=name):
                 receipt = self.run_native_look(summary, look_assist_state=state)
@@ -9618,7 +9624,8 @@ class VisualCaptureRunnerTests(RunnerHarness, unittest.TestCase):
 
     def test_a_conform_look_leg_also_states_the_look_at_the_top_level(self) -> None:
         spec = self.write_spec(leg_type="look", flavor="cinematic")
-        self.write_artifacts(sheet=True, summary={"lookLeg": True, "lookAssistForced": True, "lookFlavor": "cinematic", "lookFlavorReported": "cinematic", "lookFlavorHonored": True})
+        self.write_artifacts(sheet=True, summary={"lookLeg": True, "lookAssistForced": True, "lookFlavor": "cinematic", "lookFlavorReported": "cinematic", "lookFlavorHonored": True},
+                             look_assist_state="look_assist_enabled=1 look_assist_flavor=cinematic")
         receipt = self.run_leg("ultra-magnus", spec, extra=["-Backend", "cpu"])[1]
         self.assertIs(receipt["lookAssistOn"], True)
         self.assertEqual(receipt["lookAssistFlavor"], "cinematic")
