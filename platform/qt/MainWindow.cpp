@@ -31822,7 +31822,7 @@ void MainWindow::on_actionPlay_toggled(bool checked)
         checked ? "play-start" : "play-stop" );
     // PLAYBACK-CUDA-NATIVE-PACE-1: the pace clock re-arms at this Play's first engine tick.
     m_playbackPaceGuard.reset();
-    m_conformDropDebtFrames = 0.0;   // HFR-NATIVE-60FPS-FULLRES-1 r24: no held conform frame survives a Play start or stop
+    if( checked ) m_conformDropDebtFrames = 0.0;   // HFR-NATIVE-60FPS-FULLRES-1 r24: no held conform frame survives a Play start
     logInteractionEvent(
         QStringLiteral("play.toggled.begin"),
         QStringLiteral("checked=%1 file_loaded=%2 position=%3 cut_in=%4 cut_out=%5 frame_changed=%6 still_drawing=%7 pending_advance=%8")
@@ -31849,6 +31849,7 @@ void MainWindow::on_actionPlay_toggled(bool checked)
         // PLAYBACK-STARTUP-WAIT-S1-FIRST-AMAZE-AT-PLAY-1 Row K: a kick still held ends with its Play
         endPlaybackGpuClockKick( "play_stop" );
         finishPlaybackSmokeTelemetry( "play-stop" );
+        m_conformDropDebtFrames = 0.0;   // r30 (Dot D1): a stop clears it only after the conform line printed it (carried_debt)
         // CPU-SCOPE-LIVE-HEAP-CORRUPTION-1 F2: selectDebayerAlgorithm and applyEffectiveDualIsoPlaybackSettings
         // below mutate core state. r6 (adversary 7354a575 A2): drained after the telemetry has sampled its end
         // time, so the up-to-2 s wait is not counted in the Play interval.

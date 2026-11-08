@@ -249,6 +249,7 @@ void GraphicsZoomView::paintEvent(QPaintEvent *event)
     QGraphicsView::paintEvent(event);
     m_pixmapPaintedSerial = m_pixmapPendingSerial;   // r28: the pixmap handed over before this paint is on screen now
     playback_paint_credit::notePainted( m_pixmapPaintedSerial );   // r29 (adversary A1 on cf403dba): the conform tracker credits it now
+    m_pixmapComposedPaint.notePaint( m_pixmapPaintedSerial );   // r30 (adversary A1 on 71104385): the gate's paint check; not inside a grab
 }
 
 //The shared preview paint sink, which also counts the GL viewport's and GL window's paints

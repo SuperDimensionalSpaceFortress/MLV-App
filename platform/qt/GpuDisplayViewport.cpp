@@ -517,8 +517,9 @@ bool GpuDisplayViewport::paintedSerialFor(const QGraphicsView *view, quint64 *se
 bool GpuDisplayViewport::paintPendingForSerial(const QGraphicsView *view, quint64 serial)
 {
     const GpuDisplayViewport *viewport = from(view);
-    if ( !viewport || serial == 0 || viewport->m_presentationOptions.presentationSerial < serial ) return false;
-    return !( viewport->m_paintedSerialValid && viewport->m_paintedSerial >= serial );
+    if ( !viewport ) return false;
+    // HFR-NATIVE-60FPS-FULLRES-1 r30 (adversary A1 on 71104385): a composed paint, never the raw painted serial (an offscreen grab promotes it)
+    return viewport->m_composedPaint.pendingFor( viewport->m_presentationOptions.presentationSerial, serial );
 }
 
 GpuDisplayViewport::SamplingMode GpuDisplayViewport::samplingModeFor(const QGraphicsView *view)
@@ -1038,6 +1039,7 @@ void GpuDisplayViewport::paintGL()
     const preview_paint_timing::Scope paintTiming;
     // PLAYBACK-CPU-VISUAL-CAPTURE-TIMING-1: set again below only when this paint draws a frame.
     m_paintedSerialValid = false;
+    m_composedPaint.noteCleared();   // r30: and set again below only when a composed paint draws a frame
     const QColor clearColor = m_view
         ? m_view->backgroundBrush().color()
         : palette().color(QPalette::Window);
@@ -1150,6 +1152,7 @@ void GpuDisplayViewport::paintGL()
     m_paintedSerialValid = m_paintedSerial != 0;
     // HFR-NATIVE-60FPS-FULLRES-1 r29 (adversary A1 on cf403dba): this paint drew that serial; the conform tracker credits it now
     if ( m_paintedSerialValid ) playback_paint_credit::notePainted( m_paintedSerial );
+    m_composedPaint.notePaint( m_paintedSerial );   // r30 (adversary A1 on 71104385): the gate's paint check; not inside an offscreen grab
 
     // Bug A on-screen present A/B (V4): force the dGPU to flush/complete this frame
     // before Qt blits the FBO and presents it, in case the Optimus cross-adapter

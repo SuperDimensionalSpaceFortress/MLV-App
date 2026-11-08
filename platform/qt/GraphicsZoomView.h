@@ -17,6 +17,7 @@
 #include <QDebug>
 #include <QShortcut>
 #include "PreviewPaintTiming.h"
+#include "PlaybackSourceAdvanceTracker.h"
 
 class GraphicsZoomView : public QGraphicsView
 {
@@ -47,7 +48,8 @@ public:
     void notePixmapPresentSerial(quint64 serial) { m_pixmapPendingSerial = serial; }
     bool pixmapPaintPendingForSerial(quint64 serial) const
     {
-        return serial != 0 && m_pixmapPendingSerial >= serial && m_pixmapPaintedSerial < serial;
+        // r30 (adversary A1 on 71104385): a composed paint, never m_pixmapPaintedSerial (an offscreen viewport grab promotes it)
+        return m_pixmapComposedPaint.pendingFor( m_pixmapPendingSerial, serial );
     }
 
 public slots:
@@ -80,6 +82,7 @@ protected:
     QString m_lookLabelDrawnText;
     quint64 m_pixmapPendingSerial = 0;
     quint64 m_pixmapPaintedSerial = 0;
+    playback_paint_credit::ComposedPaintSerial m_pixmapComposedPaint;   // r30: the pixmap serial last painted ON SCREEN
     bool m_isZoomEnabled;
     PickerState m_pickerState;
     bool m_isMousePressed;

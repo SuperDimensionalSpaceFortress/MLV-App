@@ -11,6 +11,7 @@
 #include "GpuDebayer.h"
 #include "ZebraThresholds.h"
 #include "GpuPreviewProcessing.h"
+#include "PlaybackSourceAdvanceTracker.h"
 #include "../../src/mlv/llrawproc/llrawproc.h"
 #include <QImage>
 #include <QOpenGLFunctions>
@@ -232,6 +233,9 @@ private:
     GpuPresentSetupTiming m_lastPresentSetupTiming;
     quint64 m_paintedSerial;
     bool m_paintedSerialValid;
+    // HFR-NATIVE-60FPS-FULLRES-1 r30 (adversary A1 on 71104385): the serial last painted ON SCREEN (never by an offscreen grab);
+    // paintPendingForSerial reads it
+    playback_paint_credit::ComposedPaintSerial m_composedPaint;
 };
 
 #endif // GPUDISPLAYVIEWPORT_H

@@ -232,12 +232,49 @@ public:
     OffscreenPaintScope( const OffscreenPaintScope & ) = delete;
     OffscreenPaintScope &operator=( const OffscreenPaintScope & ) = delete;
 };
+/*! r30 (adversary A1 on 71104385, Dot B1): whether a paint now reaches the screen (no OffscreenPaintScope is open). */
+inline bool paintIsComposed() { return offscreenDepth() == 0; }
 inline void notePainted( uint64_t serial )
 {
-    if( offscreenDepth() > 0 ) return;
+    if( !paintIsComposed() ) return;
     const SinkSlot slot = sinkSlot();
     if( slot.sink && serial != 0 ) slot.sink( slot.context, serial );
 }
+
+/*! r30 (adversary A1 on 71104385, Dot B1): the serial a surface last painted ON SCREEN. The conform gate's paint check (each surface's
+ *  paint-pending query, MainWindow::conformDisplayedFramePaintPending) reads this, never the surface's raw painted serial: an offscreen
+ *  grab promotes that one (it must, so a capture names the content it read back), and the gate then opened on a frame never composed
+ *  (100 painted, 101 grabbed offscreen, 102 replacing 101). A paint inside an OffscreenPaintScope changes nothing here. GUI thread only. */
+class ComposedPaintSerial
+{
+public:
+    void reset() { m_serial = 0; m_valid = false; }
+    /*! A paint drew the frame handed over under \a serial (0 = content without a serial). Ignored inside an OffscreenPaintScope. */
+    void notePaint( uint64_t serial )
+    {
+        if( !paintIsComposed() ) return;
+        m_serial = serial;
+        m_valid = serial != 0;
+    }
+    /*! A paint drew no frame (nothing to present). Ignored inside an OffscreenPaintScope. */
+    void noteCleared()
+    {
+        if( paintIsComposed() ) m_valid = false;
+    }
+    /*! Whether the frame handed over under \a serial is still to be composed, the surface's newest hand-off being \a handedOverSerial:
+     *  false for no serial or one never handed over (\a handedOverSerial below it); otherwise until a composed paint drew it or later. */
+    bool pendingFor( uint64_t handedOverSerial, uint64_t serial ) const
+    {
+        if( serial == 0 || handedOverSerial < serial ) return false;
+        return !( m_valid && m_serial >= serial );
+    }
+    uint64_t serial() const { return m_serial; }
+    bool valid() const { return m_valid; }
+
+private:
+    uint64_t m_serial = 0;
+    bool m_valid = false;
+};
 }
 
 /*! HFR-NATIVE-60FPS-FULLRES-1-MERGE-MASTER r16 (adversary A1 on ff41b4fa), rule rewritten in r20: how many loop wraps a

@@ -206,9 +206,13 @@ TEST(PlaybackConformWiring, DropFrameTickQuantisesTheConformedCatchupToWholeFram
         ASSERT_TRUE(shown > 0);
         ASSERT_TRUE(src.indexOf(QStringLiteral("return conformDisplayedFramePaintPending() ? -1 : m_lastDisplayedPlaybackFrame;"), shown) > shown);
         const QString viewportSrc = readRepoFile(QStringLiteral("platform/qt/GpuDisplayViewport.cpp"));
-        ASSERT_TRUE(viewportSrc.contains(QStringLiteral("if ( !viewport || serial == 0 || viewport->m_presentationOptions.presentationSerial < serial ) return false;")));
+        // r30 (adversary A1 on 71104385): the only-a-serial-handed-over guard lives in ComposedPaintSerial::pendingFor, which both queries call
+        ASSERT_TRUE(viewportSrc.contains(QStringLiteral("return viewport->m_composedPaint.pendingFor( viewport->m_presentationOptions.presentationSerial, serial );")));
         const QString windowSrc = readRepoFile(QStringLiteral("platform/qt/GpuDisplayWindow.cpp"));
-        ASSERT_TRUE(windowSrc.contains(QStringLiteral("if ( !win || !win->m_pendingPresentationSerialValid || win->m_pendingPresentationSerial < serial ) return false;")));
+        ASSERT_TRUE(windowSrc.contains(QStringLiteral("if ( !win || !win->m_pendingPresentationSerialValid ) return false;")));
+        ASSERT_TRUE(windowSrc.contains(QStringLiteral("return win->m_composedPaint.pendingFor( win->m_pendingPresentationSerial, serial );")));
+        ASSERT_TRUE(readRepoFile(QStringLiteral("platform/qt/PlaybackSourceAdvanceTracker.h")).contains(QStringLiteral(
+            "if( serial == 0 || handedOverSerial < serial ) return false;")));
         // drawFrameReady's own window: from the accept until it returns (the inline present, or the enqueue that hands the
         // frame to the prep queue), the accepted frame is a present still to come -- the early advance runs inside it
         const int acceptedAt = src.indexOf(QStringLiteral("    m_lastPresentedPlaybackFrame = static_cast<long long>( display_frame );"));

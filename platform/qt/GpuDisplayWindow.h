@@ -404,6 +404,9 @@ private:
     bool m_pendingPresentationSerialValid;
     quint64 m_presentedSerial;
     bool m_presentedSerialValid;
+    // HFR-NATIVE-60FPS-FULLRES-1 r30 (adversary A1 on 71104385): the serial last put ON SCREEN -- a paintGL outside an offscreen scope,
+    // or the capture's swap after a successful readback; paintPendingForSerialIfActive reads it, never m_presentedSerial
+    playback_paint_credit::ComposedPaintSerial m_composedPaint;
     /* Set only for the duration of a synchronous grabPresentedFramebufferIfActive()
      * call: tells paintGL() to glReadPixels into m_captureReadback* right after it
      * finishes drawing, so the readback and the draw it reads back are the same call. */
