@@ -9,6 +9,7 @@
 #include "GpuDisplayWindow.h"
 #include "GpuFieldTelemetry.h"
 #include "LogLineField.h"
+#include "PlaybackSourceAdvanceTracker.h"
 #include "PlaybackSwapInterval.h"
 #include "PreviewPaintTiming.h"
 
@@ -1147,6 +1148,8 @@ void GpuDisplayViewport::paintGL()
     m_texturePresentationActive = true;
     m_paintedSerial = m_presentationOptions.presentationSerial;
     m_paintedSerialValid = m_paintedSerial != 0;
+    // HFR-NATIVE-60FPS-FULLRES-1 r29 (adversary A1 on cf403dba): this paint drew that serial; the conform tracker credits it now
+    if ( m_paintedSerialValid ) playback_paint_credit::notePainted( m_paintedSerial );
 
     // Bug A on-screen present A/B (V4): force the dGPU to flush/complete this frame
     // before Qt blits the FBO and presents it, in case the Optimus cross-adapter

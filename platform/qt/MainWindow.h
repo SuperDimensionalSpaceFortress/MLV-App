@@ -1179,6 +1179,16 @@ private:
     // PRESENTED-frame timeline advance (source fps, max jump) for playback_smoke.conform. m_sourceAdvance counts
     // ENGINE ticks and has no clock, so it cannot say whether every source frame reached the screen.
     PlaybackSourceAdvanceTracker m_playbackSmokeSourceAdvance;
+    // HFR-NATIVE-60FPS-FULLRES-1 r29 (adversary A1 on cf403dba, A2 on 4201a437): m_playbackSmokeSourceAdvance is credited at a
+    // surface's PAINT (playback_paint_credit -> notePlaybackSmokePainted), never at the hand-off; a frame replaced before its paint
+    // is superseded and never credited.
+    PlaybackPaintCreditLedger m_playbackSmokePaintCredit;
+    // Times the conform gate's paint wait (kConformPaintWaitMs) expired on an unpainted frame, one per frame. The escape lets the
+    // engine move on; it never counts the frame as displayed (only its paint credits it). Printed as paint_wait_escapes.
+    uint64_t m_playbackSmokeConformPaintWaitEscapes = 0;
+    quint64 m_conformPaintWaitEscapedSerial = 0;
+    static void playbackPaintCreditSink( void *context, uint64_t serial );
+    void notePlaybackSmokePainted( uint64_t serial );
     int m_lastPlaybackAudioSyncFrame = -1;
     double m_lastPlaybackAudioSyncTime = 0.0;
     bool m_playbackSmokeActive = false;

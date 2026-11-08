@@ -2412,6 +2412,8 @@ MainWindow::MainWindow(int &argc, char **argv, QWidget *parent) :
     QSurfaceFormat::setDefaultFormat(format);
 
     ui->setupUi(this);
+    // HFR-NATIVE-60FPS-FULLRES-1 r29: the display surfaces report each painted serial here (the conform tracker's credit)
+    playback_paint_credit::setSink( &MainWindow::playbackPaintCreditSink, this );
     ui->comboBoxLookAssistFlavor->setItemData( 0, lookAssistFlavorName( LookAssistFlavor::Classic ) );
     ui->comboBoxLookAssistFlavor->setItemData( 1, lookAssistFlavorName( LookAssistFlavor::Cinematic ) );
     // "Film grade", not "Film": the Profile preset "Film" is a different thing.
@@ -2686,6 +2688,7 @@ MainWindow::MainWindow(int &argc, char **argv, QWidget *parent) :
 //Destructor
 MainWindow::~MainWindow()
 {
+    playback_paint_credit::setSink( nullptr, nullptr );
     killTimer( m_timerId );
     killTimer( m_timerCacheId );
     flushPhase3PlaybackTime( true );
@@ -2916,6 +2919,9 @@ bool MainWindow::conformAcceptedTargetPresentPending()
 // window (requestUpdate), the GL viewport (update()) and, fix iteration 2 (adversary A1 on 4201a437), the CPU pixmap item (the
 // scene's queued update) paint it later, and a submission before that paint supersedes it. While any surface holds this frame's
 // serial unpainted (bounded by kConformPaintWaitMs) it is not on screen yet.
+// r29 (adversary A1 on cf403dba): the bound is an ESCAPE for a surface that never paints, never a display. When it expires the
+// engine may move on, but the frame is still unpainted: the conform tracker credits only a paint (m_playbackSmokePaintCredit),
+// so a frame the next submission replaces is never counted as shown, and each expiry is counted (paint_wait_escapes).
 bool MainWindow::conformDisplayedFramePaintPending()
 {
     if( m_lastDisplayedPlaybackFrame < 0 || m_lastDisplayedPlaybackSerial == 0 ) return false;
@@ -2923,8 +2929,14 @@ bool MainWindow::conformDisplayedFramePaintPending()
         GpuDisplayWindow::paintPendingForSerialIfActive( m_lastDisplayedPlaybackSerial )
         || GpuDisplayViewport::paintPendingForSerial( ui->graphicsView, m_lastDisplayedPlaybackSerial )
         || ui->graphicsView->pixmapPaintPendingForSerial( m_lastDisplayedPlaybackSerial );   // fix iteration 2: the CPU pixmap route
-    return playback_frame_range::conformDisplayPaintPending(
+    const bool pending = playback_frame_range::conformDisplayPaintPending(
         submittedUnpainted, ( mlv_stage_timing_now() - m_lastDisplayedPlaybackStageTime ) * 1000.0 );
+    if( submittedUnpainted && !pending && m_conformPaintWaitEscapedSerial != m_lastDisplayedPlaybackSerial )
+    {
+        m_conformPaintWaitEscapedSerial = m_lastDisplayedPlaybackSerial;
+        if( m_playbackSmokeActive ) ++m_playbackSmokeConformPaintWaitEscapes;
+    }
+    return pending;
 }
 
 // The displayed input of the conform gate: the frame finishPresentedFrame recorded, or none while its paint is still to come.
@@ -26485,6 +26497,8 @@ void MainWindow::beginPlaybackSmokeTelemetry( void )
     // reaches the summary's wrapped=/wrap_count= fields.
     m_playbackSmokeWrapped = false;
     m_playbackSmokeSourceAdvance.reset();
+    m_playbackSmokePaintCredit.reset();   // r29: a paint before this session's first hand-off credits nothing of it
+    m_playbackSmokeConformPaintWaitEscapes = 0;
     // r16 (adversary A1): engine wraps before this measured Play are not this Play's wraps
     m_playbackSmokeTrackerEngineWraps = m_playbackWrapRecorder.engineWraps;
     m_playbackSmokeStartRequestSerial = m_nextRenderRequestSerial;
@@ -26841,6 +26855,19 @@ void MainWindow::beginPlaybackSmokeTelemetry( void )
                .arg( bool01( m_playbackDisplayRequiredAcquired ) );
 }
 
+// HFR-NATIVE-60FPS-FULLRES-1 r29 (adversary A1 on cf403dba, A2 on 4201a437): a display surface painted the frame it was handed under
+// \a serial. The surfaces paint on the GUI thread; a report from any other thread is dropped, which only ever withholds a credit.
+void MainWindow::playbackPaintCreditSink( void *context, uint64_t serial )
+{
+    if( context ) static_cast<MainWindow *>( context )->notePlaybackSmokePainted( serial );
+}
+
+void MainWindow::notePlaybackSmokePainted( uint64_t serial )
+{
+    if( !m_playbackSmokeActive || QThread::currentThread() != thread() ) return;
+    m_playbackSmokePaintCredit.notePainted( serial, mlv_stage_timing_now(), m_playbackSmokeSourceAdvance );
+}
+
 void MainWindow::notePlaybackSmokePresentedFrame(
     uint64_t displayFrame,
     const RenderFrameThread::ReadyFrame &readyFrame,
@@ -26921,11 +26948,14 @@ void MainWindow::notePlaybackSmokePresentedFrame(
                                                           requestContext.engineWrapsAtRequest,
                                                           m_playbackSmokeTrackerEngineWraps,
                                                           m_playbackSmokePresentedFrames > 0 );
-    m_playbackSmokeSourceAdvance.notePresented( now,
-                                                static_cast<int>( displayFrame ),
-                                                sourceAdvanceWraps,
-                                                m_playbackWrapRecorder.engineWrapsWidth( sourceAdvanceWrapsBefore,
-                                                                                         sourceAdvanceWraps ) );
+    // r29 (adversary A1 on cf403dba, A2 on 4201a437): this is the HAND-OFF. The frame waits in the ledger for the surface's paint,
+    // which credits m_playbackSmokeSourceAdvance (notePlaybackSmokePainted); replaced before that paint, it is never credited.
+    m_playbackSmokePaintCredit.noteSubmitted( static_cast<uint64_t>( readyFrame.requestSerial ),
+                                              static_cast<int>( displayFrame ),
+                                              sourceAdvanceWraps,
+                                              m_playbackWrapRecorder.engineWrapsWidth( sourceAdvanceWrapsBefore,
+                                                                                       sourceAdvanceWraps ),
+                                              m_playbackSmokeSourceAdvance );
     // The engine's own wrap count (playbackHandling) is the authority; the inference above can only add.
     if( m_playbackWrapRecorder.replayCount() > 0 ) m_playbackSmokeWrapped = true;
 
@@ -31512,7 +31542,9 @@ void MainWindow::finishPlaybackSmokeTelemetry( const char *reason )
                    "conform_enabled=%5 conform_target=%6 conform_threshold=%7 export_fps_override=%8 "
                    "export_frame_rate=%9 audio_sync_requests=%10 presented=%11 source_advanced=%12 "
                    "span_s=%13 source_fps=%14 max_jump=%15 wraps=%16 backward=%17 repeats=%18 "
-                   "auto_target_fps=%19 effective_auto_target_fps=%20 conform_env_override=%21" )
+                   "auto_target_fps=%19 effective_auto_target_fps=%20 conform_env_override=%21 "
+                   "first_frame=%22 last_frame=%23 engine_target=%24 carried_debt=%25 paint_submitted=%26 "
+                   "paint_superseded=%27 paint_unverified=%28 paint_waiting=%29 paint_wait_escapes=%30" )
                    .arg( static_cast<qulonglong>( m_playbackSmokeSessionId ) )
                    .arg( smokeClipFps, 0, 'f', 3 )
                    .arg( m_pMlvObject ? getPlaybackFramerate() : 0.0, 0, 'f', 3 )
@@ -31534,7 +31566,19 @@ void MainWindow::finishPlaybackSmokeTelemetry( const char *reason )
                    .arg( static_cast<qulonglong>( adv.repeatedFrames() ) )
                    .arg( m_playbackAutoTargetFps )
                    .arg( effectivePlaybackAutoTargetFps() )
-                   .arg( playback_conform::conformEnvOverride() );
+                   .arg( playback_conform::conformEnvOverride() )
+                   // r29 (adversary A2 on cf403dba): the painted coverage's ends, and the engine's last target in the summary's own
+                   // coordinates (m_sourceAdvance: source_advanced = engine_target - source_start_frame + 1), so the venue judge
+                   // allows exactly the one target the engine may hold unpainted, never the carried debt (which no count holds)
+                   .arg( adv.firstFrame() )
+                   .arg( adv.lastFrame() )
+                   .arg( static_cast<qlonglong>( m_sourceAdvance.armed ? m_sourceAdvance.highWater : -1 ) )
+                   .arg( m_conformDropDebtFrames, 0, 'f', 3 )
+                   .arg( static_cast<qulonglong>( m_playbackSmokePaintCredit.submitted() ) )
+                   .arg( static_cast<qulonglong>( m_playbackSmokePaintCredit.superseded() ) )
+                   .arg( static_cast<qulonglong>( m_playbackSmokePaintCredit.unverified() ) )
+                   .arg( bool01( m_playbackSmokePaintCredit.waiting() ) )
+                   .arg( static_cast<qulonglong>( m_playbackSmokeConformPaintWaitEscapes ) );
     }
 
     // Window foreground state at session begin and at this gate, plus how many times the

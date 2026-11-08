@@ -1375,6 +1375,11 @@ function Get-DvPlaybackEvidence {
         # r28 fix iteration 1 (adversary A2 on e052947c): the source frames the PRESENTED frames covered (the conform line's source_advanced), so a
         # frozen presentation tail is seen against the engine's own source_advanced (Get-DvCriteriaMetrics). $null when the line does not carry it.
         conformSourceAdvanced = (ConvertTo-DvInt64 $conformFields['source_advanced'])
+        # r29 (adversary A2 on cf403dba): the painted coverage's first and last frame, and the engine's last target in the summary's own
+        # coordinates (MainWindow.cpp playback_smoke.conform first_frame / last_frame / engine_target). $null when the line does not carry them.
+        conformFirstFrame = (ConvertTo-DvInt64 $conformFields['first_frame'])
+        conformLastFrame = (ConvertTo-DvInt64 $conformFields['last_frame'])
+        conformEngineTarget = (ConvertTo-DvInt64 $conformFields['engine_target'])
         fpsOverride = (ConvertTo-DvInt64 $f['fps_override'])
         wrapped = $(if ($null -eq $wrappedField) { $null } else { $wrappedField -ne 0 })
         wrapCount = (ConvertTo-DvInt64 $f['wrap_count'])
@@ -4095,8 +4100,7 @@ function Get-DvVerbatimMetrics {
 }
 
 # HFR-NATIVE-60FPS-FULLRES-1 r19 (sol r18 B2): the measured conform fields a leg's criteria may name, and the re-derived playback block field each comes from.
-# r28 (adversary A2 on e052947c): kConformMaxDebtFrames (PlaybackFrameRange.h, 8) + the frame in flight + the frame being prepared.
-$script:ConformFrozenTailToleranceFrames = 10
+# r29 (adversary A2 on cf403dba): the frozen-tail allowance is no longer a constant (r28's 10); Get-DvCriteriaMetrics derives it from the conform line's ends.
 $script:ConformCriteriaMetrics = [ordered]@{ conformSourceFps = 'conformSourceFps'; conformMaxJump = 'conformMaxJump'; conformAudioSyncRequests = 'conformAudioSyncRequests' }
 
 function Get-DvCriteriaMetrics {
@@ -4141,19 +4145,41 @@ function Get-DvCriteriaMetrics {
     # Within the tolerance nothing changes. Fix iteration 2 (adversary A4 on 4201a437): coverage the line does not carry, or carries unreadable, is
     # a missing number, never a passing one -- conformMaxJump is then left absent with a typed CouldNotCheck, so its criterion FAILS (the app prints
     # source_advanced on every conform line, MainWindow.cpp playback_smoke.conform).
+    #
+    # r29 (adversary A2 on cf403dba): the tolerance of 10 assumed the carried debt (up to 8) was in the engine's source_advanced; it is not
+    # (the debt is granted time the engine has not advanced by), so a tail of 9 or 10 frames never shown passed. The allowance is now the
+    # exact figure the conform line's ends give: engine_target (H, the summary's own coordinates, source_advanced = H - start + 1) and the
+    # painted first_frame (F) and last_frame (L). A fully shown run falls short by exactly 1 (source_advanced counts the start frame), plus
+    # 1 when the engine holds one target not yet painted (H > L: conform never moves past an unpainted target), plus 1 when the first
+    # painted frame is the one after the start (the start frame was on screen before Play). Every frame short beyond that was never shown.
+    # Any of the three absent, unreadable or negative is a missing number: conformMaxJump is left absent, so its criterion FAILS.
     $coverage = $(if ($null -ne $Playback -and $present -and $sameSession) { ConvertTo-DvInt64 (Get-DvProp $Playback 'conformSourceAdvanced') } else { $null })
     $engineAdvanced = $(if ($null -ne $Playback) { ConvertTo-DvInt64 (Get-DvProp $Playback 'sourceAdvanced') } else { $null })
+    $ends = [ordered]@{}
+    foreach ($e in @(@('conformFirstFrame', 'first_frame'), @('conformLastFrame', 'last_frame'), @('conformEngineTarget', 'engine_target'))) {
+        $v = $(if ($null -ne $Playback -and $present -and $sameSession) { ConvertTo-DvInt64 (Get-DvProp $Playback $e[0]) } else { $null })
+        $ends[$e[1]] = $(if ($null -ne $v -and $v -ge 0) { $v } else { $null })
+    }
+    $missingEnd = @($ends.Keys | Where-Object { $null -eq $ends[$_] } | Select-Object -First 1)
     $maxJump = ConvertTo-DvInt64 $m['conformMaxJump']
-    if ($null -ne $maxJump -and ($null -eq $coverage -or $null -eq $engineAdvanced)) {
+    if ($null -ne $maxJump -and ($null -eq $coverage -or $null -eq $engineAdvanced -or $missingEnd.Count -gt 0)) {
         $m['conformMaxJump'] = $null
         $m['conformMaxJumpCouldNotCheck'] = $(if ($null -eq $coverage) { 'the measured session''s playback_smoke.conform line carries no readable source_advanced (the presented coverage), so a frozen presentation tail cannot be ruled out' }
-                                              else { 'the run log''s summary carries no readable source_advanced (the engine''s advance), so a frozen presentation tail cannot be ruled out' })
+                                              elseif ($null -eq $engineAdvanced) { 'the run log''s summary carries no readable source_advanced (the engine''s advance), so a frozen presentation tail cannot be ruled out' }
+                                              else { "the measured session's playback_smoke.conform line carries no readable non-negative $($missingEnd[0]) (the painted coverage's ends and the engine's last target), so a frozen presentation tail cannot be ruled out" })
     }
     elseif ($null -ne $maxJump) {
+        $first = [int64]$ends['first_frame']; $last = [int64]$ends['last_frame']; $target = [int64]$ends['engine_target']
+        $engineStart = $target - [int64]$engineAdvanced + 1
+        $held = [Math]::Min([Math]::Max($target - $last, 0L), 1L)
+        $startShown = [Math]::Min([Math]::Max($first - $engineStart, 0L), 1L)
+        $allowed = 1L + $held + $startShown
         $shortfall = [int64]$engineAdvanced - [int64]$coverage
-        if ($shortfall -gt $script:ConformFrozenTailToleranceFrames -and $shortfall -gt $maxJump) {
-            $m['conformMaxJump'] = $shortfall
-            $m['conformFrozenTailFrames'] = $shortfall
+        $unshown = $shortfall - $allowed
+        if ($unshown -gt 0 -and ($unshown + 1) -gt $maxJump) {
+            $m['conformMaxJump'] = $unshown + 1
+            $m['conformFrozenTailFrames'] = $unshown
+            $m['conformTailAllowanceFrames'] = $allowed
         }
     }
     [pscustomobject]$m

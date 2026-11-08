@@ -5332,8 +5332,10 @@ class ConformArmIsHonouredTests(EvidenceFactory, ModuleMutationMixin, unittest.T
         hfr24 = {"native_fps": "59.940", "pace_fps": "24.000"}
         base = conform_line(clip="59.940", play="24.000", active=1, env_override=1)
         for name, measured, outcome, needles in (
-                ("sound", " audio_sync_requests=0 source_advanced=1498 source_fps=24.000 max_jump=1", "PASS", ()),
-                ("sol r18 B2", " audio_sync_requests=1 source_advanced=1498 source_fps=33.600 max_jump=2", "FAIL", ("conformSourceFps le 24.72", "conformMaxJump eq 1", "conformAudioSyncRequests eq 0")),
+                # r29 (adversary A2 on cf403dba): the line carries the painted coverage's ends and the engine's last target (the summary here
+                # reports source_advanced=960 from frame 0: the engine reached 959)
+                ("sound", " audio_sync_requests=0 source_advanced=959 source_fps=24.000 max_jump=1 first_frame=0 last_frame=959 engine_target=959", "PASS", ()),
+                ("sol r18 B2", " audio_sync_requests=1 source_advanced=959 source_fps=33.600 max_jump=2 first_frame=0 last_frame=959 engine_target=959", "FAIL", ("conformSourceFps le 24.72", "conformMaxJump eq 1", "conformAudioSyncRequests eq 0")),
                 ("no measured fields", "", "FAIL", ("does not carry the field",))):
             with self.subTest(name):
                 self.write_artifacts(line=hfr24, extra_log_lines=[base + measured])
@@ -12680,9 +12682,10 @@ class ConformMeasuredFieldsAreJudgedTests(unittest.TestCase):
                 self.assertEqual([f.split(" ")[0].rstrip(":") for f in row["failures"]], ["conformMaxJump"], row)
 
     def test_r28_a2_a_presented_tail_within_the_debt_cap_tolerance_still_passes(self) -> None:
-        """The engine may lead the presented frames by the carried-debt cap (8) plus the frame in flight and the one being prepared: 10 frames short
-        still passes, 11 fails. Fix iteration 2 (adversary A4 on 4201a437): a line without source_advanced, or with an unreadable one, fails closed."""
-        cases = {"in step": ("1498", True), "at the tolerance": ("1489", True), "one past it": ("1488", False)}
+        """r29 (adversary A2 on cf403dba) replaced r28's tolerance of 10 (the carried-debt cap plus two frames, though the debt is never in the engine's
+        count) with the exact allowance the conform line's ends give: in step and one held target pass, one frame further short fails. Fix iteration 2
+        (adversary A4 on 4201a437): a line without source_advanced, or with an unreadable one, fails closed."""
+        cases = {"in step": ("1498", True), "one target held": ("1497", True), "one past it": ("1496", False), "r28's tolerance": ("1489", False)}
         for name, (coverage, passes) in cases.items():
             for row in self.chain(f" audio_sync_requests=0 presented=1499 source_advanced={coverage} source_fps=24.000 max_jump=1"):
                 with self.subTest(case=name, spec=row["spec"], role=row["role"]):
@@ -12733,7 +12736,8 @@ class ConformMeasuredFieldsAreJudgedTests(unittest.TestCase):
         proc, out = run_pwsh_json(
             "$m = [pscustomobject]@{ conformSourceFps = 24.0; conformMaxJump = 1; conformAudioSyncRequests = 0; rows = 5 }\n"
             "$absent = Get-DvCriteriaMetrics -Metrics $m -Playback ([ordered]@{ conformLinePresent = $false })\n"
-            "$bad = Get-DvCriteriaMetrics -Metrics $m -Playback ([ordered]@{ conformLinePresent = $true; summarySession = '3'; conformSession = '3'; conformSourceFps = 33.6; conformMaxJump = 2; conformAudioSyncRequests = 1; sourceAdvanced = 1499; conformSourceAdvanced = 1498 })\n"
+            "$bad = Get-DvCriteriaMetrics -Metrics $m -Playback ([ordered]@{ conformLinePresent = $true; summarySession = '3'; conformSession = '3'; conformSourceFps = 33.6; conformMaxJump = 2; conformAudioSyncRequests = 1; sourceAdvanced = 1499; conformSourceAdvanced = 1498;"
+            " conformFirstFrame = 0; conformLastFrame = 1498; conformEngineTarget = 1498 })\n"
             "$none = Get-DvCriteriaMetrics -Metrics $m -Playback $null\n"
             "[ordered]@{ absent = $absent; bad = $bad; none = $none } | ConvertTo-Json -Compress -Depth 4")
         self.assertIsNotNone(out, proc.stdout + proc.stderr)
@@ -12748,7 +12752,8 @@ class ConformMeasuredFieldsAreJudgedTests(unittest.TestCase):
         """r23 adversary A1 (DV-CONFORM-CRITERIA-METRICS-PRESENCE-GUARD-1), sol r23's literal: conformLinePresent=$false, mismatched sessions,
         conformSourceFps=24, conformMaxJump=1, conformAudioSyncRequests=0 passed Get-DvCriteriaMetrics + Test-DvCriteria. Each shape now leaves the
         values absent with a typed CouldNotCheck, so every conform criterion FAILS; only a present, same-session line passes."""
-        good = "conformSourceFps = 24.0; conformMaxJump = 1; conformAudioSyncRequests = 0; sourceAdvanced = 1499; conformSourceAdvanced = 1498"
+        good = ("conformSourceFps = 24.0; conformMaxJump = 1; conformAudioSyncRequests = 0; sourceAdvanced = 1499; conformSourceAdvanced = 1498;"
+                " conformFirstFrame = 0; conformLastFrame = 1498; conformEngineTarget = 1498")
         shapes = {
             "sol literal": ("conformLinePresent = $false; summarySession = '3'; conformSession = '2'", "no playback_smoke.conform line"),
             "absent line, same session": ("conformLinePresent = $false; summarySession = '3'; conformSession = '3'", "no playback_smoke.conform line"),

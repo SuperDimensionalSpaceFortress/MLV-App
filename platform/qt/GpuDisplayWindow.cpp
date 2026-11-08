@@ -14,6 +14,7 @@
 #include "PlaybackRouteStagedSlotPolicy.h"
 #include "PreviewPaintTiming.h"
 #include "PlaybackScaling.h"
+#include "PlaybackSourceAdvanceTracker.h"
 #include "PlaybackStartupSplit.h"
 #include "PlaybackSwapInterval.h"
 #include "debug/StageTiming.h"
@@ -2522,6 +2523,8 @@ void GpuDisplayWindow::paintGL()
     // route that produced this content did not supply a presentationSerial.
     m_presentedSerial = m_pendingPresentationSerial;
     m_presentedSerialValid = m_pendingPresentationSerialValid;
+    // HFR-NATIVE-60FPS-FULLRES-1 r29 (adversary A1 on cf403dba): this paint drew that serial; the conform tracker credits it now
+    if ( m_presentedSerialValid ) playback_paint_credit::notePainted( m_presentedSerial );
 
     if ( !m_loggedPresented )
     {

@@ -50,6 +50,7 @@ public:
         if( m_presented == 0 )
         {
             m_firstTime = nowSeconds;
+            m_firstFrame = frame;
         }
         else if( wrapsCrossed > 0 )
         {
@@ -78,6 +79,10 @@ public:
 
     uint64_t presented() const { return m_presented; }
     int64_t advancedFrames() const { return m_advanced; }
+    /*! HFR-NATIVE-60FPS-FULLRES-1 r29 (adversary A2 on cf403dba): the first and the last frame credited, -1 before any. The
+     *  conform line prints them so the venue judge sees the presented coverage's ends, not only its length. */
+    int firstFrame() const { return m_presented > 0 ? m_firstFrame : -1; }
+    int lastFrame() const { return m_presented > 0 ? m_lastFrame : -1; }
     /*! Largest forward jump between consecutive presented frames, wrap excluded. */
     int maxJump() const { return m_maxJump; }
     uint64_t wraps() const { return m_wraps; }
@@ -103,9 +108,120 @@ private:
     uint64_t m_backward = 0;
     uint64_t m_repeats = 0;
     int m_lastFrame = 0;
+    int m_firstFrame = 0;
     double m_firstTime = 0.0;
     double m_lastTime = 0.0;
 };
+
+/*! HFR-NATIVE-60FPS-FULLRES-1 r29 (adversary A1 on cf403dba, A2 on 4201a437): the conform tracker is credited when a surface
+ *  PAINTS a frame, never when the frame is handed to it. The GL window (requestUpdate), the GL viewport (update()) and the CPU
+ *  pixmap item (the scene's queued update) all paint later than MainWindow::finishPresentedFrame, and a submission before that
+ *  paint replaces the frame, so a hand-off credit read 100, 101, 102 and max_jump=1 while the screen showed 100 then 102.
+ *
+ *  One submission waits at a time: each surface holds one pending frame, and the next submission replaces it. A paint of the
+ *  waiting serial credits its frame at the paint's time. A newer submission, or a paint of a newer serial, before that paint
+ *  means the waiting frame never reached the screen: it is SUPERSEDED, never credited, and the loop wraps it carried pass to
+ *  the next submission (they were crossed all the same). A paint can land before its hand-off is recorded (a synchronous
+ *  paint inside the present), so the newest painted serial is kept and a later hand-off at or below it is credited at once.
+ *  A submission without a serial (0) can never be matched to a paint: it is never credited (unverified), so a route that does
+ *  not report its paints fails conform instead of passing it on hand-offs. */
+class PlaybackPaintCreditLedger
+{
+public:
+    void reset() { *this = PlaybackPaintCreditLedger(); }
+
+    /*! \a serial the request serial the surface was handed, \a frame the source frame, \a wrapsCrossed and \a wrapsCrossedWidth
+     *  as for PlaybackSourceAdvanceTracker::notePresented, computed at the hand-off. */
+    void noteSubmitted( uint64_t serial, int frame, int wrapsCrossed, int64_t wrapsCrossedWidth,
+                        PlaybackSourceAdvanceTracker &tracker )
+    {
+        if( m_waiting ) supersede();
+        m_frame = frame;
+        m_wraps = wrapsCrossed + m_carriedWraps;
+        m_wrapsWidth = wrapsCrossedWidth + m_carriedWrapsWidth;
+        m_carriedWraps = 0;
+        m_carriedWrapsWidth = 0;
+        ++m_submitted;
+        if( serial == 0 )
+        {
+            ++m_unverified;
+            m_carriedWraps = m_wraps;   // never credited: its wraps go to the next frame that is
+            m_carriedWrapsWidth = m_wrapsWidth;
+            return;
+        }
+        m_serial = serial;
+        m_waiting = true;
+        if( m_paintedValid && serial <= m_paintedSerial ) credit( m_paintedTime, tracker );
+    }
+
+    /*! A surface painted the frame it was handed under \a serial (its newest), at \a nowSeconds. */
+    void notePainted( uint64_t serial, double nowSeconds, PlaybackSourceAdvanceTracker &tracker )
+    {
+        if( serial == 0 ) return;
+        if( !m_paintedValid || serial > m_paintedSerial )
+        {
+            m_paintedSerial = serial;
+            m_paintedTime = nowSeconds;
+            m_paintedValid = true;
+        }
+        if( !m_waiting ) return;
+        if( serial == m_serial ) credit( nowSeconds, tracker );
+        else if( serial > m_serial ) supersede();   // a later frame reached the screen first
+    }
+
+    uint64_t submitted() const { return m_submitted; }
+    uint64_t credited() const { return m_credited; }
+    uint64_t superseded() const { return m_superseded; }
+    uint64_t unverified() const { return m_unverified; }
+    /*! A submission is still waiting for its paint. */
+    bool waiting() const { return m_waiting; }
+
+private:
+    void credit( double nowSeconds, PlaybackSourceAdvanceTracker &tracker )
+    {
+        tracker.notePresented( nowSeconds, m_frame, m_wraps, m_wrapsWidth );
+        m_waiting = false;
+        ++m_credited;
+    }
+    void supersede()
+    {
+        m_waiting = false;
+        ++m_superseded;
+        m_carriedWraps = m_wraps;
+        m_carriedWrapsWidth = m_wrapsWidth;
+    }
+
+    bool m_waiting = false;
+    uint64_t m_serial = 0;
+    int m_frame = 0;
+    int m_wraps = 0;
+    int64_t m_wrapsWidth = 0;
+    int m_carriedWraps = 0;
+    int64_t m_carriedWrapsWidth = 0;
+    bool m_paintedValid = false;
+    uint64_t m_paintedSerial = 0;
+    double m_paintedTime = 0.0;
+    uint64_t m_submitted = 0;
+    uint64_t m_credited = 0;
+    uint64_t m_superseded = 0;
+    uint64_t m_unverified = 0;
+};
+
+/*! r29: the one place a display surface reports a paint. GpuDisplayWindow::paintGL (its serial promotion),
+ *  GpuDisplayViewport::paintGL (m_paintedSerial) and GraphicsZoomView::paintEvent (m_pixmapPaintedSerial) call notePainted with
+ *  the serial they just drew; MainWindow installs the sink that feeds its PlaybackPaintCreditLedger. No sink, no effect. */
+namespace playback_paint_credit
+{
+using Sink = void (*)( void *context, uint64_t serial );
+struct SinkSlot { Sink sink = nullptr; void *context = nullptr; };
+inline SinkSlot &sinkSlot() { static SinkSlot slot; return slot; }
+inline void setSink( Sink sink, void *context ) { SinkSlot &slot = sinkSlot(); slot.sink = sink; slot.context = context; }
+inline void notePainted( uint64_t serial )
+{
+    const SinkSlot slot = sinkSlot();
+    if( slot.sink && serial != 0 ) slot.sink( slot.context, serial );
+}
+}
 
 /*! HFR-NATIVE-60FPS-FULLRES-1-MERGE-MASTER r16 (adversary A1 on ff41b4fa), rule rewritten in r20: how many loop wraps a
  *  presentation lands, for notePresented's `wrapsCrossed`. The presented-frame inference
