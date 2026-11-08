@@ -3469,12 +3469,15 @@ function Test-DvReceiptValid {
             # VENUE-NATIVE-LEG-LOOKLEG-LABEL-1 r1: a receipt that CLAIMS the look ran (lookAssistOn true) must be backed by the hashed evidence -- the app's own run log says
             # look_assist_enabled=1, the hashed summary.json says the look was forced and the flavor the app reported is the one requested, and lookAssistFlavor is that flavor.
             # Only the claim is re-derived (a receipt that predates the field, or says false, claims nothing); the leg TYPE binding above is untouched.
-            if ((Get-DvProp $Receipt 'lookAssistOn') -eq $true) {
+            $claimOnRaw = Get-DvProp $Receipt 'lookAssistOn'
+            if ($null -ne $claimOnRaw -and $claimOnRaw -isnot [bool]) { $invalid.Add('LOOK_ASSIST_CLAIM_UNBACKED: the receipt''s lookAssistOn is not a boolean') }
+            elseif ($claimOnRaw -is [bool] -and $claimOnRaw) {
                 $claimVerdict = Get-DvLookAssistEvidence -Spec $spec -LogText $ev.logText
+                $claimForcedRaw = Get-DvProp $ev.summary 'lookAssistForced'   # a real boolean only: `-eq $true` on an array is a filter, and on a string a cast (pass 2 A1)
                 $claimRequestedRaw = Get-DvProp $ev.summary 'lookFlavor'; $claimReportedRaw = Get-DvProp $ev.summary 'lookFlavorReported'; $claimStoredRaw = Get-DvProp $Receipt 'lookAssistFlavor'
                 $claimRequested = [string]$claimRequestedRaw; $claimLogFlavor = [string]$claimVerdict.flavor
                 # strings only (adversary A2: a singleton array casts to its element); the flavor is the one the app's own record body names (adversary A1)
-                if (-not ($claimVerdict.requested -and $claimVerdict.verdict -ceq 'HONOURED' -and (Get-DvProp $ev.summary 'lookAssistForced') -eq $true -and $claimRequestedRaw -is [string] -and $claimReportedRaw -is [string] -and $claimStoredRaw -is [string] -and $claimRequested.Length -gt 0 -and $claimReportedRaw -ceq $claimRequested -and $claimLogFlavor -ceq $claimRequested -and $claimStoredRaw -ceq $claimLogFlavor)) {
+                if (-not ($claimVerdict.requested -and $claimVerdict.verdict -ceq 'HONOURED' -and $claimForcedRaw -is [bool] -and $claimForcedRaw -and $claimRequestedRaw -is [string] -and $claimReportedRaw -is [string] -and $claimStoredRaw -is [string] -and $claimRequested.Length -gt 0 -and $claimReportedRaw -ceq $claimRequested -and $claimLogFlavor -ceq $claimRequested -and $claimStoredRaw -ceq $claimLogFlavor)) {
                     $invalid.Add('LOOK_ASSIST_CLAIM_UNBACKED: the receipt says Look Assist ran (lookAssistOn) but the hashed run log / summary.json do not show it ran with the flavor lookAssistFlavor names')
                 }
             }

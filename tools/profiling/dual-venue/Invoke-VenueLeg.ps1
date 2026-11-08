@@ -995,7 +995,7 @@ if ($lookAssistVerdict.requested) { $receipt['lookAssist'] = [ordered]@{ request
 # FAIL CLOSED, unknown is not on: on only when the leg asked for the look, the app's own log says look_assist_enabled=1, the job's summary says it forced the
 # look, and the flavor the app applied (read from the log record body, never a location suffix) equals the flavor the summary says was requested and reported.
 # lookAssistFlavor is that log-derived flavor, else null.
-$laSummaryForced = ($null -ne $summary -and $null -ne $summary.PSObject.Properties['lookAssistForced'] -and $summary.lookAssistForced -eq $true)
+$laSummaryForced = ($null -ne $summary -and $null -ne $summary.PSObject.Properties['lookAssistForced'] -and $summary.lookAssistForced -is [bool] -and $summary.lookAssistForced)
 $laRequestedFlavor = $(if ($null -ne $summary -and $null -ne $summary.PSObject.Properties['lookFlavor'] -and $summary.lookFlavor -is [string]) { [string]$summary.lookFlavor } else { '' })
 $laReportedFlavor = $(if ($null -ne $summary -and $null -ne $summary.PSObject.Properties['lookFlavorReported'] -and $summary.lookFlavorReported -is [string]) { [string]$summary.lookFlavorReported } else { '' })
 $laLogFlavor = [string]$lookAssistVerdict.flavor
