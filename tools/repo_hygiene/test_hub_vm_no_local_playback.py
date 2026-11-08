@@ -257,6 +257,14 @@ def _close_pidfd(fd: int) -> None:
     os.close(fd)
 
 
+def _dup_pidfd(fd: int) -> int:
+    """Seam (tests replace it): a private duplicate of a pidfd (it names the same process), for a wait that must not hold the handle's lock."""
+    return os.dup(fd)
+
+
+_PIDFD_POLL_SEC = 0.05  # r7: how often a pidfd is polled where it cannot be waited on (kernel without waitid(P_PIDFD), no descriptor left for a duplicate)
+
+
 def _pidfd_send_kill(fd: int) -> None:
     """Seam (tests replace it): SIGKILL the one process a pidfd names (signal.pidfd_send_signal; Python 3.9+, Linux 5.1+). ProcessLookupError (ESRCH) means that
     process has already exited -- it is never redirected to another process, whatever has happened to its PID."""
@@ -280,14 +288,43 @@ class _PidHandle:
     def __init__(self, fd: "int | None" = None):
         self._lock = threading.Lock()
         self._fd = fd
+        self.opened = fd is not None  # r7: a descriptor was held at some point (False: pidfd_open failed, so there is no pidfd to wait on)
 
     def adopt(self, fd: int) -> None:
         with self._lock:
             self._fd = fd
+            self.opened = True
 
     def running(self) -> bool:
         with self._lock:
             return self._fd is not None and not _pidfd_exited(self._fd)
+
+    def wait_exited(self) -> None:
+        """r7 (R6-W1): block until the ONE process this handle names has exited, WITHOUT reaping it, and never by PID. The wait is a WEXITED | WNOWAIT
+        waitid(P_PIDFD) on a private duplicate taken under the lock (the lock is not held while blocking, so kill() is never held up, and a close() of the handle
+        meanwhile cannot hand the number to another file under the wait). ECHILD means the process was already reaped by its owner: it has exited, seen now.
+        Where the kernel has pidfd_open but not waitid(P_PIDFD) (Linux 5.3: EINVAL), where no duplicate can be made (EMFILE), or once the handle is closed, the
+        same descriptor is polled instead (a pidfd is readable exactly when its process has exited; a closed handle answers 'not running')."""
+        with self._lock:
+            try:
+                fd = _dup_pidfd(self._fd) if self._fd is not None else None
+            except OSError:
+                fd = None
+        if fd is not None:
+            try:
+                os.waitid(os.P_PIDFD, fd, os.WEXITED | os.WNOWAIT)
+                return
+            except ChildProcessError:
+                return
+            except (OSError, AttributeError):  # EINVAL (no waitid(P_PIDFD)), or no os.P_PIDFD in this Python: polled below
+                pass
+            finally:
+                try:
+                    _close_pidfd(fd)
+                except OSError:
+                    pass
+        while self.running():
+            time.sleep(_PIDFD_POLL_SEC)
 
     def kill(self) -> bool:
         """SIGKILL the original child through the descriptor. True when this settled the matter: the signal was delivered, or the child had already exited (ESRCH:
@@ -388,21 +425,34 @@ def _release_pid_handle(proc: "subprocess.Popen") -> None:
 
 
 def _wait_without_reaping(proc: "subprocess.Popen") -> bool:
-    """r6 (adversary passes 14-15 A1): block until the child exits WITHOUT reaping it, and say True; False when the platform has no waitid (macOS, Windows) or the
-    child was already reaped, and the caller waits the ordinary way.
+    """r6 (adversary passes 14-15 A1): block until the child exits WITHOUT reaping it, and say True; False when the child's exit is already RECORDED or the platform
+    has no waitid (macOS, Windows), and the caller waits the ordinary way (Popen.wait(), which answers a recorded exit from the record).
 
     Why: _kill falls back to Popen's poll()/kill(), which signal by PID number, whenever the pidfd cannot settle the matter (none on this platform, none opened, a
     refused or unimplemented pidfd_send_signal). That is safe exactly as long as nobody but the owner reaps the child: an exited, unreaped child is a zombie that keeps
     its PID reserved, and the owner (communicate/poll/_kill) reaps in the thread that also decides to signal. The exit watcher is the only other party that would
     reap, so it observes the exit with a WNOWAIT waitid instead. Where there is no waitid the Windows/no-pidfd residual stands (Windows holds a process handle, so
-    Popen's signal cannot be redirected there; macOS keeps the documented pass-12 A1 residual)."""
+    Popen's signal cannot be redirected there; macOS keeps the documented pass-12 A1 residual).
+
+    r7 (R6-W1, Dot): a PID names whatever process holds it NOW. Once the original's exit is recorded its PID may already belong to another child of this parent,
+    and a wait on that number would credit the original with the other child's exit (a late `ended_at`, a handle held until then). So (a) a recorded exit is
+    never waited for again -- no waitid at all; (b) where a pidfd is held the wait is on the pidfd (_PidHandle.wait_exited), never on the PID; (c) the bare-PID
+    WNOWAIT wait is only the no-pidfd fallback (none on this platform, or pidfd_open failed), and its residual is the one already documented: the owner reaps
+    and the PID is handed to another child between the check below and the waitid. No form ever reaps, and none calls Popen.wait(): ECHILD (already reaped by
+    the owner) is an exit seen now."""
+    if getattr(proc, "returncode", None) is not None:
+        return False  # (a) recorded: the PID is no evidence of anything any more
     pid = getattr(proc, "pid", None)
     if not hasattr(os, "waitid") or not isinstance(pid, int):
         return False
+    handle = getattr(proc, "pid_handle", None)
+    if handle is not None and getattr(handle, "opened", False) is True:
+        handle.wait_exited()  # (b)
+        return True
     try:
-        os.waitid(os.P_PID, pid, os.WEXITED | os.WNOWAIT)
-    except ChildProcessError:  # somebody else already reaped it: Popen.wait() answers from the record
-        return False
+        os.waitid(os.P_PID, pid, os.WEXITED | os.WNOWAIT)  # (c)
+    except ChildProcessError:  # the owner already reaped it: it has exited, seen now
+        pass
     return True
 
 
@@ -5245,8 +5295,10 @@ def _is_start_crash(done: "subprocess.CompletedProcess", elapsed: float) -> bool
     r6 (Dot B2, wording only): `elapsed` is what _probe_lasted says, which is a proof and not a reading. A recognized start-fault signature gets its ONE extra attempt
     whenever a long life was not PROVEN -- including when the window timer was delayed, failed to start, or had no handle to ask -- and a death the window timer
     witnessed past the window is rejected. "Late" therefore means "provably late". The tradeoff, accepted: a genuinely late death whose timer was itself late
-    (or absent) is retried once, which costs one more attempt inside the shared deadline and cannot turn a real lint verdict green, because the same signature,
-    empty-or-banner output and a valid second result are still required."""
+    (or absent) is retried once, which costs one more attempt and cannot turn a real lint verdict green, because the same signature, empty-or-banner output and a
+    valid second result are still required. r7 (Dot nit, wording only): that attempt is inside a shared deadline only on the background and cache paths
+    (_collect_counts, _communicate_retrying_start_fault, _cache_probe); the foreground paths (_findings, _lint_word_lists through _run_retrying_start_fault)
+    have no shared deadline, and give the re-run its own 120 s timeout, so there it can cost up to a second 120 s."""
     return -done.returncode in LINT_PROBE_CRASH_SIGNALS and elapsed < LINT_PROBE_START_WINDOW_SEC and _only_start_crash_text(done.stdout, done.stderr)
 
 
@@ -6526,11 +6578,17 @@ class CollectCountsRuntimeLoadFaultTests(unittest.TestCase):
         class FakePidfd:
             """r5 pass 11 A1: the pidfd of the ORIGINAL child on the scripted clock -- it reports that one process's exit whatever was or was not recorded."""
 
+            opened = True
+
             def __init__(self):
                 self.closed = False
 
             def running(self):  # r6 (Dot E1): a closed real handle answers False, whenever it is asked
                 return not self.closed and clock[0] < exit_at
+
+            def wait_exited(self):  # r7 (R6-W1): the exit watcher blocks on the pidfd (never the PID) until the scheduler releases it
+                child.gate.wait(30)
+                clock[0] = max(clock[0], wake_at)
 
             def kill(self):
                 return not self.closed
@@ -6792,6 +6850,138 @@ class CollectCountsRuntimeLoadFaultTests(unittest.TestCase):
                 self.assertEqual(1006.0, proc.ended_at, "and still noted when it saw the exit")
                 if kwargs:  # with no pidfd at all the proof is the documented residual (pass 12 A1), unchanged by this round
                     self.assertNotEqual(True, proc.window_proof)
+
+    class PidTable:
+        """r7 (R6-W1): a PID-reuse-capable fake os.waitid. PID 4242 was the ORIGINAL child, which exited at 1000.9 and whose exit Popen has RECORDED (returncode set);
+        the kernel has since handed 4242 to a DIFFERENT live child of the same parent, which exits at 1030. A blocking waitid on the bare PID therefore waits for
+        that other child and reports ITS exit (the clock moves to 1030). Every call is recorded in `calls` as (idtype, id, options)."""
+
+        P_PID, P_PIDFD, WEXITED, WNOHANG, WNOWAIT = 1, 3, 4, 1, 0x1000000
+
+        def __init__(self, clock: list, recycled_exit_at: float = 1030.0):
+            self.clock, self.recycled_exit_at, self.calls = clock, recycled_exit_at, []
+
+        def waitid(self, idtype, ident, options):
+            self.calls.append((idtype, ident, options))
+            if idtype == self.P_PID and ident == 4242:
+                self.clock[0] = max(self.clock[0], self.recycled_exit_at)  # the recycled child, not the original, is what this wait observes
+                return object()
+            return object()
+
+        def patch(self):
+            return mock.patch.multiple(os, create=True, waitid=self.waitid, P_PID=self.P_PID, P_PIDFD=self.P_PIDFD, WEXITED=self.WEXITED, WNOHANG=self.WNOHANG,
+                                       WNOWAIT=self.WNOWAIT)
+
+    def _recorded_exit_child(self, clock: list, handle=None):
+        """r7: a Popen-like child whose exit is already RECORDED (returncode -6). Like Popen.wait(), wait() then answers from the record without touching the clock."""
+        proc = mock.Mock(pid=4242, returncode=-6, pid_handle=handle, started_at=1000.0, window_timer=None, ended_at=None)
+        proc.wait.side_effect = lambda timeout=None: -6
+        return proc
+
+    def test_r7_w1_a_recorded_exit_is_never_waited_for_again(self):
+        """R6-W1 control (i): once the original child's exit is recorded (returncode set), the exit observer issues NO waitid at all -- neither on the PID (which
+        may belong to another child by now) nor on a pidfd -- and Popen.wait() answers from the record."""
+        for label, handle in (("no pidfd", None), ("pidfd held", _PidHandle(77))):
+            with self.subTest(label), mock.patch.object(sys.modules[__name__], "_close_pidfd", lambda fd: None), \
+                    mock.patch.object(sys.modules[__name__], "_dup_pidfd", lambda fd: 91, create=True):
+                clock = [1001.0]
+                table = self.PidTable(clock)
+                proc = self._recorded_exit_child(clock, handle)
+                with table.patch(), mock.patch.object(time, "monotonic", lambda: clock[0]):
+                    self.assertFalse(_wait_without_reaping(proc), "recorded: the caller's Popen.wait() answers from the record")
+                    self.assertEqual([], table.calls, "no waitid once the exit is recorded")
+                if handle is not None:
+                    handle.close()  # inside the seam: a dropped handle would otherwise os.close(77) for real
+
+    def test_r7_w1_a_recycled_live_child_under_the_same_pid_is_never_credited_with_the_originals_exit(self):
+        """R6-W1 control (ii): the original exited and was recorded at 1000.9; PID 4242 now names a different LIVE child that exits at 1030. The exit watcher must not
+        wait on that PID: its observation (ended_at) stays the moment it ran (1001), the window timer is still cancelled on time, and the handle is released at once."""
+        for label, handle in (("no pidfd", None), ("pidfd held", _PidHandle(77))):
+            with self.subTest(label), mock.patch.object(sys.modules[__name__], "_close_pidfd", lambda fd: None), \
+                    mock.patch.object(sys.modules[__name__], "_dup_pidfd", lambda fd: 91, create=True):
+                clock = [1001.0]
+                table = self.PidTable(clock)
+                proc = self._recorded_exit_child(clock, handle)
+                timer = mock.Mock(interval=LINT_PROBE_START_WINDOW_SEC)
+                proc.window_timer = timer
+                with table.patch(), mock.patch.object(time, "monotonic", lambda: clock[0]):
+                    _note_exit(proc)
+                self.assertEqual([], [call for call in table.calls if call[1] == 4242], "the recycled PID was never waited on")
+                self.assertEqual(1001.0, proc.ended_at, "the original's exit is not credited with the recycled child's exit time (1030)")
+                timer.cancel.assert_called_once_with()
+                if handle is not None:
+                    self.assertFalse(handle.running(), "the handle was released when the exit was noted, not when the recycled child ended")
+
+    def test_r7_w1_a_held_pidfd_is_waited_on_never_the_bare_pid_and_never_reaped(self):
+        """R6-W1 control (iii): where a pidfd is held the observer waits on it (a private duplicate, so a concurrent close cannot hand the number to another file),
+        with WEXITED | WNOWAIT (it never reaps) and no WNOHANG; the bare PID is never asked. The duplicate is closed, the handle itself stays open."""
+        closed: list = []
+        with mock.patch.object(sys.modules[__name__], "_close_pidfd", closed.append), \
+                mock.patch.object(sys.modules[__name__], "_dup_pidfd", lambda fd: 91 if fd == 77 else -1, create=True):
+            clock = [1001.0]
+            table = self.PidTable(clock)
+            handle = _PidHandle(77)
+            proc = mock.Mock(pid=4242, returncode=None, pid_handle=handle)
+            with table.patch():
+                self.assertTrue(_wait_without_reaping(proc))
+            self.assertEqual([(table.P_PIDFD, 91, table.WEXITED | table.WNOWAIT)], table.calls, "P_PIDFD on the duplicate, WNOWAIT, blocking")
+            self.assertEqual([91], closed, "the duplicate is closed; the handle's own descriptor is not")
+            proc.wait.assert_not_called()
+            handle.close()
+            self.assertEqual([91, 77], closed)
+
+    def test_r7_w1_the_pidfd_wait_fallbacks_never_use_the_pid_and_never_reap(self):
+        """The pidfd forms that cannot block in waitid(P_PIDFD) -- the kernel lacks it (Linux 5.3: EINVAL), the duplicate cannot be made (EMFILE), the handle is already
+        closed -- watch the pidfd by polling instead; a pidfd whose process was already reaped (ECHILD) is an exit seen now. None of them asks the PID or calls
+        Popen.wait()."""
+        cases = (
+            ("waitid(P_PIDFD) unsupported", dict(waitid_error=OSError(22, "Invalid argument")), [False, True]),
+            ("dup fails", dict(dup_error=OSError(24, "Too many open files")), [False, False, True]),
+            ("already reaped (ECHILD)", dict(waitid_error=ChildProcessError(10, "No child processes")), []),
+            ("handle already closed", dict(closed=True), []))
+        for label, case, exits in cases:
+            with self.subTest(label):
+                polled = list(exits)
+                table_calls: list = []
+
+                def waitid(idtype, ident, options, error=case.get("waitid_error")):
+                    table_calls.append((idtype, ident, options))
+                    raise error
+
+                def dup(fd, error=case.get("dup_error")):
+                    if error is not None:
+                        raise error
+                    return 91
+
+                with mock.patch.object(sys.modules[__name__], "_close_pidfd", lambda fd: None), \
+                        mock.patch.object(sys.modules[__name__], "_dup_pidfd", dup, create=True), \
+                        mock.patch.object(sys.modules[__name__], "_pidfd_exited", lambda fd: polled.pop(0) if polled else True), \
+                        mock.patch.object(time, "sleep", lambda s: None), \
+                        mock.patch.multiple(os, create=True, waitid=waitid, P_PID=1, P_PIDFD=3, WEXITED=4, WNOHANG=1, WNOWAIT=0x1000000):
+                    handle = _PidHandle(77)
+                    if case.get("closed"):
+                        handle.close()
+                    proc = mock.Mock(pid=4242, returncode=None, pid_handle=handle)
+                    self.assertTrue(_wait_without_reaping(proc), "the exit is observed through the pidfd")
+                    handle.close()
+                self.assertEqual([], [call for call in table_calls if call[0] != 3], "never the bare PID")
+                self.assertEqual([], polled, "polled until the pidfd said the process exited")
+                proc.wait.assert_not_called()
+
+    def test_r7_w1_without_a_pidfd_the_documented_bare_pid_fallback_still_never_reaps(self):
+        """No pidfd held (none on this platform, or pidfd_open failed: an unopened handle): the bare-PID WNOWAIT wait is the documented fallback, taken only while
+        the exit is unrecorded; ECHILD (already reaped) is an exit seen now, never a reason to call Popen.wait()."""
+        for label, handle in (("no handle", None), ("unopened handle", _PidHandle())):
+            with self.subTest(label):
+                clock = [1001.0]
+                table = self.PidTable(clock, recycled_exit_at=1001.0)
+                proc = mock.Mock(pid=4242, returncode=None, pid_handle=handle)
+                with table.patch():
+                    self.assertTrue(_wait_without_reaping(proc))
+                    self.assertEqual([(1, 4242, 4 | 0x1000000)], table.calls)
+                    with mock.patch.object(os, "waitid", mock.Mock(side_effect=ChildProcessError(10, "No child processes"))):
+                        self.assertTrue(_wait_without_reaping(proc), "already reaped: seen now")
+                proc.wait.assert_not_called()
 
     def test_r6_pass15_a1_a_pidfd_signal_the_kernel_does_not_implement_falls_through_to_the_ordinary_kill(self):
         bare: list = []
