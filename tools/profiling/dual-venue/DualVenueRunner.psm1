@@ -4175,7 +4175,12 @@ function Get-DvCriteriaMetrics {
         $startShown = [Math]::Min([Math]::Max($first - $engineStart, 0L), 1L)
         $allowed = 1L + $held + $startShown
         $shortfall = [int64]$engineAdvanced - [int64]$coverage
-        $unshown = $shortfall - $allowed
+        # Fix iteration 1 (adversary A1 on 88eea505): the coverage counts forward steps, so a seek back re-counts the frames painted again (0..1448,
+        # back to 1398, 1398..1448 reads 1498) and the count alone hid 49 unshown tail frames. The ends judge the tail and the head directly: the
+        # engine's last target past the last painted frame, beyond the one held target, and the first painted frame past the engine's start,
+        # beyond the start frame. The larger of the two readings stands.
+        $byEnds = [Math]::Max($target - $last - 1L, 0L) + [Math]::Max($first - $engineStart - 1L, 0L)
+        $unshown = [Math]::Max($shortfall - $allowed, $byEnds)
         if ($unshown -gt 0 -and ($unshown + 1) -gt $maxJump) {
             $m['conformMaxJump'] = $unshown + 1
             $m['conformFrozenTailFrames'] = $unshown

@@ -122,7 +122,8 @@ private:
  *  waiting serial credits its frame at the paint's time. A newer submission, or a paint of a newer serial, before that paint
  *  means the waiting frame never reached the screen: it is SUPERSEDED, never credited, and the loop wraps it carried pass to
  *  the next submission (they were crossed all the same). A paint can land before its hand-off is recorded (a synchronous
- *  paint inside the present), so the newest painted serial is kept and a later hand-off at or below it is credited at once.
+ *  paint inside the present), so the newest painted serial is kept and a later hand-off OF THAT SERIAL is credited at once
+ *  (one below it was replaced by that paint: superseded).
  *  A submission without a serial (0) can never be matched to a paint: it is never credited (unverified), so a route that does
  *  not report its paints fails conform instead of passing it on hand-offs. */
 class PlaybackPaintCreditLedger
@@ -151,7 +152,10 @@ public:
         }
         m_serial = serial;
         m_waiting = true;
-        if( m_paintedValid && serial <= m_paintedSerial ) credit( m_paintedTime, tracker );
+        // fix iteration 1 (adversary A3 on 88eea505): only the exact serial the surface last painted is credited at once; one below it was
+        // replaced on the surface by that newer paint and never reached the screen
+        if( m_paintedValid && serial == m_paintedSerial ) credit( m_paintedTime, tracker );
+        else if( m_paintedValid && serial < m_paintedSerial ) supersede();
     }
 
     /*! A surface painted the frame it was handed under \a serial (its newest), at \a nowSeconds. */
