@@ -3197,8 +3197,9 @@ TEST( PlaybackConformDropFrame, R24ConformHoldAtTheLoopEndStillWrapsOnTheRecorde
         held.position, playback_frame_range::conformDropFrameDelta( held.position, 0.8, true ), cutIn, cutOut, true, true );
     ASSERT_FALSE( last.wrapped );
     ASSERT_EQ( 1159, static_cast<int>( last.position ) );
+    // 1159.184 + 1.0 = 1160.184: past the last frame, so it wraps (1159.184 + 0.8 = 1159.984 would still be on 1159)
     const playback_frame_range::DropFrameTickResult wrap = playback_frame_range::advanceDropFrameTick(
-        last.position, playback_frame_range::conformDropFrameDelta( last.position, 0.8, true ), cutIn, cutOut, true, true );
+        last.position, playback_frame_range::conformDropFrameDelta( last.position, 1.0, true ), cutIn, cutOut, true, true );
     ASSERT_TRUE( wrap.wrapped );
     ASSERT_EQ( cutOut - cutIn + 1, wrap.wrapWidth );
     ASSERT_EQ( 0, static_cast<int>( wrap.position ) );
