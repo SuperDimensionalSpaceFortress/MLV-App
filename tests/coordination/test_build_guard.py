@@ -27,6 +27,7 @@ BUILD_RELEASE = REPO_ROOT / "tools" / "build-release.ps1"
 STAGE_PROBE = REPO_ROOT / "tools" / "profiling" / "qscreen-probe" / "stage-probe-and-job.ps1"
 ATTR3_ASSEMBLE = REPO_ROOT / "tools" / "profiling" / "bachelor" / "playback-attr-3-cuda-assemble.ps1"
 ROUTED_LAUNCHERS = (BUILD_RELEASE, STAGE_PROBE, ATTR3_ASSEMBLE)
+STAGE_CHAIN = REPO_ROOT / "tools" / "profiling" / "dual-venue" / "Invoke-VenueStageChain.ps1"
 
 PWSH = shutil.which("pwsh.exe") or shutil.which("pwsh")
 
@@ -1125,6 +1126,164 @@ def test_the_attr3_assembler_hands_its_deadline_to_the_guard() -> None:
     assert re.search(r"Invoke-BuildGuard -Label \"attr3-assemble:\$\(\$names\.shortSha\)\" -RequestedJobs \$MakeJobs -Options \$guardOptions -Action", text), \
         "the build runs under the guard with the deadline option"
     assert re.search(r"if \(\$HeavySlotDeadlineUtc\) \{ \$guardOptions\.HeavySlotDeadlineUtc = \$HeavySlotDeadlineUtc \}", text)
+
+
+# --- r3 (sol key on d2543b8a, blocker): the FULL staging chain, driver -> stage chain -> stage one -> assembler -> build-guard ------
+# The incident chain (lane-HFR-NATIVE-60FPS-FULLRES-1-r31): venue-driver.ps1:24 passed -DeadlineUtc to its stage-chain copy, which
+# called stage-one.ps1 without it (:17), which called the assembler without it (:78), so the guard waited its 60 min default, was
+# refused, and stage-chain.ps1:22 asked for a FRESH ticket 300 s later. The fixtures below are that shape: the stage-one copy and the
+# assembler omit the deadline exactly as the incident's did, and the assembler takes the real guard the way the tracked one does.
+# Only heavy-slot is a stub (the scripted 'queued' mode: no real time passes, the real machine slot is never touched).
+
+_CHAIN_SHA = "0123456789abcdef0123456789abcdef01234567"
+
+_FIX_ASSEMBLER = (
+    "param([string]$SourceCommit, [string]$DllPairDir, [string]$OutDir, [switch]$SkipLaunchProbe, [string]$HeavySlotDeadlineUtc = '')\n"
+    ". $env:FIX_GUARD -Library\n"
+    "$guardOptions = @{ LockPath = $env:FIX_LOCK; MemoryProbeFile = $env:FIX_MEM; ProcessTableFile = $env:FIX_TABLE; HeavySlotSha256 = $env:FIX_SHA; PollSeconds = 0.2 }\n"
+    "if ($HeavySlotDeadlineUtc) { $guardOptions.HeavySlotDeadlineUtc = $HeavySlotDeadlineUtc }\n"
+    "Invoke-BuildGuard -Label 'attr3-assemble:0123456789ab' -Options $guardOptions -Action { param($Jobs) "
+    "Write-Output \"RESULT=ASSEMBLE_OK SOURCE=$SourceCommit\" }\n"
+)
+
+# The incident's stage-one.ps1 shape: param(Sha, Phase), no deadline anywhere; the assembler call of its line 78, the refusal regex of :81.
+_FIX_STAGE_ONE = (
+    "param([Parameter(Mandatory = $true)][string]$Sha, [Parameter(Mandatory = $true)][ValidateSet('dll', 'stage')][string]$Phase)\n"
+    "$ErrorActionPreference = 'Stop'\n"
+    "function Done([string]$Outcome, [int]$Code, [string]$Extra = '') { [Console]::Out.WriteLine(\"STAGE_ONE_RESULT phase=$Phase sha=$Sha outcome=$Outcome $Extra\".Trim()); exit $Code }\n"
+    "Add-Content -LiteralPath $env:FIX_STAGE_ONE_LOG -Value \"phase=$Phase hsdeadline=$env:MLV_HEAVY_SLOT_DEADLINE_UTC param=$($PSBoundParameters.ContainsKey('DeadlineUtc'))\"\n"
+    "if ($Phase -eq 'dll') { Done 'DLLPAIR_HARVESTED' 0 'dir=fixture' }\n"
+    "$out = & $env:FIX_PWSH -NoProfile -NonInteractive -File $env:FIX_ASSEMBLER -SourceCommit $Sha -DllPairDir 'fixture' -OutDir 'fixture' -SkipLaunchProbe 2>&1 | ForEach-Object { [string]$_ }\n"
+    "$ax = $LASTEXITCODE\n"
+    "$out | ForEach-Object { [Console]::Out.WriteLine($_) }\n"
+    "$guard = @($out | Where-Object { $_ -match '^(BUILD_MEM_REFUSED|BUILD_SLOT_BUSY|BUILD_HEAVY_SLOT_REQUEUE|BUILD_HEAVY_SLOT_COULD_NOT_CHECK)\\b' })\n"
+    "if ($guard.Count -gt 0 -and $ax -ne 0) { Done 'BUILD_GUARD_REFUSED' 3 }\n"
+    "if ($ax -ne 0) { Done 'ASSEMBLE_FAILED' 1 \"exit=$ax\" }\n"
+    "Done 'STAGE_OK' 0 ('manifest=' + ('a' * 64))\n"
+)
+
+
+def _chain_box(box: dict, queue_min: int, stage_one: str = _FIX_STAGE_ONE, extra: dict = None) -> tuple:
+    run = box["dir"] / "run"
+    run.mkdir(exist_ok=True)
+    assembler = box["dir"] / "assemble.ps1"
+    assembler.write_text(_FIX_ASSEMBLER, encoding="ascii")
+    stage_one_path = run / "stage-one.ps1"
+    stage_one_path.write_text(stage_one, encoding="ascii")
+    env = _env(heavy_slot=HEAVY_STUB, extra={
+        "STUB_HEAVY_SLOT_MODE": "queued", "STUB_HEAVY_SLOT_QUEUE_MIN": str(queue_min), "STUB_HEAVY_SLOT_LOG": str(box["dir"] / "stub.log"),
+        "FIX_GUARD": str(GUARD), "FIX_LOCK": str(box["lock"]), "FIX_MEM": _write_json(box["dir"] / "memory.json", OK_MEMORY),
+        "FIX_TABLE": _write_json(box["dir"] / "table.json", []), "FIX_SHA": _stub_sha(), "FIX_PWSH": PWSH,
+        "FIX_ASSEMBLER": str(assembler), "FIX_STAGE_ONE_LOG": str(box["dir"] / "stage-one.calls"),
+        **(extra or {}),
+    })
+    return run, stage_one_path, env
+
+
+def _run_chain(box: dict, queue_min: int, deadline: str, stage_one: str = _FIX_STAGE_ONE, extra: dict = None,
+               chain_args: list = ()) -> tuple:
+    # The venue driver's call (venue-driver.ps1:24), aimed at the TRACKED chain instead of a run-dir copy.
+    run, stage_one_path, env = _chain_box(box, queue_min, stage_one, extra)
+    done = subprocess.run(
+        [PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-File", str(STAGE_CHAIN), "-Sha", _CHAIN_SHA, "-DeadlineUtc", deadline,
+         "-StageOne", str(stage_one_path), "-RetrySec", "0", "-MaxAttempts", "2", *chain_args],
+        capture_output=True, text=True, timeout=180, env=env, check=False,
+    )
+    return done, run
+
+
+def _chain_status(run: Path) -> list:
+    status = run / f"stage-status-{_CHAIN_SHA[:8]}.txt"
+    return status.read_text(encoding="utf-8").splitlines() if status.exists() else []
+
+
+def _chain_stage_logs(run: Path) -> str:
+    return "\n".join(p.read_text(encoding="utf-8", errors="replace") for p in sorted(run.glob(f"stage-{_CHAIN_SHA[:8]}-stage-*.out.txt")))
+
+
+def _future(minutes: int) -> str:
+    from datetime import datetime, timedelta, timezone
+    return (datetime.now(timezone.utc) + timedelta(minutes=minutes)).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+@pytest.mark.parametrize("queue_min", [61, 130, 180])
+def test_the_driver_deadline_reaches_the_first_heavy_slot_ticket_through_the_full_stage_chain(box, queue_min) -> None:
+    # RED on d2543b8a: there is no tracked chain, and the incident's copy dropped the deadline (control below). GREEN: the stage-one copy
+    # and the assembler still omit it, yet the guard's first ticket waits what is left of the driver's deadline, not 60 min.
+    done, run = _run_chain(box, queue_min, _future(240))
+    status = _chain_status(run)
+    assert done.returncode == 0, done.stdout + done.stderr + "\n".join(status)
+    assert status and status[-1].endswith("STAGE_CHAIN_DONE"), status
+    assert any(f"sha={_CHAIN_SHA} outcome=STAGE_OK manifest=" + "a" * 64 in line for line in status), status
+    [call] = _stub_calls(box)  # ONE ticket: never discarded for a fresh one
+    assert 239 < _wait_minutes(call) <= 240, call["argv"]
+    logs = _chain_stage_logs(run)
+    bound = [line for line in logs.splitlines() if line.startswith("BUILD_HEAVY_SLOT_WAIT_BOUND ")]
+    assert len(bound) == 1 and " source=deadline " in bound[0] and " default=60m " in bound[0], logs
+    assert "BUILD_HEAVY_SLOT_REQUEUE" not in logs, logs
+
+
+@pytest.mark.parametrize("queue_min", [61, 130, 180])
+def test_no_deadline_control_the_incident_stage_one_alone_keeps_the_60m_default_and_loses_the_ticket(box, queue_min) -> None:
+    # The incident's stage-chain.ps1:17 call: stage-one with no deadline and nothing exported. Unchanged by this card: 60 min, refused
+    # (heavy-slot 75), a typed capacity exit 3, which the incident's copy turned into a 300 s sleep and a FRESH ticket.
+    run, stage_one_path, env = _chain_box(box, queue_min)
+    done = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-File", str(stage_one_path), "-Sha", _CHAIN_SHA, "-Phase", "stage"],
+                          capture_output=True, text=True, timeout=180, env=env, check=False)
+    assert done.returncode == 3, done.stdout + done.stderr
+    assert "BUILD_HEAVY_SLOT_REQUEUE label=attr3-assemble:0123456789ab code=75 " in done.stdout
+    assert "STAGE_ONE_RESULT phase=stage sha=" + _CHAIN_SHA + " outcome=BUILD_GUARD_REFUSED" in done.stdout
+    assert "BUILD_HEAVY_SLOT_WAIT_BOUND" not in done.stdout
+    [call] = _stub_calls(box)
+    assert _wait_minutes(call) == 60.0, call["argv"]
+
+
+def test_the_chain_deadline_replaces_an_ambient_one_and_reaches_a_stage_one_that_declares_it(box) -> None:
+    # An inherited value from some other caller (here long past) must not bound this chain's build; a stage-one that declares
+    # -DeadlineUtc is also handed it as a parameter (one with a fixed param list, as above, is not: that would not bind).
+    declares = _FIX_STAGE_ONE.replace("[string]$Phase)\n", "[string]$Phase, [string]$DeadlineUtc = '')\n", 1)
+    deadline = _future(200)
+    done, run = _run_chain(box, 130, deadline, stage_one=declares, extra={"MLV_HEAVY_SLOT_DEADLINE_UTC": "2000-01-01T00:00:00Z"})
+    assert done.returncode == 0, done.stdout + done.stderr + "\n".join(_chain_status(run))
+    [call] = _stub_calls(box)
+    assert 199 < _wait_minutes(call) <= 200, call["argv"]
+    calls = (box["dir"] / "stage-one.calls").read_text(encoding="utf-8").splitlines()
+    assert len(calls) == 2 and all(" param=True" in c and f"hsdeadline={deadline[:19]}" in c for c in calls), calls
+
+
+def test_the_chain_restores_the_callers_environment_when_run_in_process(box) -> None:
+    run, stage_one_path, env = _chain_box(box, 61, extra={"MLV_HEAVY_SLOT_DEADLINE_UTC": "keep-me"})
+    script = (f"& '{STAGE_CHAIN}' -Sha {_CHAIN_SHA} -DeadlineUtc '{_future(120)}' -StageOne '{stage_one_path}' -RetrySec 0 -MaxAttempts 1\n"
+              "Write-Output \"after=$env:MLV_HEAVY_SLOT_DEADLINE_UTC rc=$LASTEXITCODE\"\n")
+    done = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script],
+                          capture_output=True, text=True, timeout=180, env=env, check=False)
+    assert "after=keep-me rc=0" in done.stdout, done.stdout + done.stderr
+
+
+@pytest.mark.parametrize("bad", ["not-a-date", "11/8/2026", "15:30", ""])
+def test_a_chain_deadline_that_is_not_an_iso_instant_is_refused_before_anything_runs(box, bad) -> None:
+    done, run = _run_chain(box, 61, bad)
+    assert done.returncode == 2, done.stdout + done.stderr
+    assert "STAGE_CHAIN_REFUSED reason=invalid-deadline" in done.stdout + done.stderr
+    assert not (box["dir"] / "stage-one.calls").exists() and _stub_calls(box) == []
+
+
+def test_no_attempt_starts_once_the_chain_deadline_has_passed(box) -> None:
+    done, run = _run_chain(box, 61, "2000-01-01T00:00:00Z")
+    assert done.returncode == 3, done.stdout + done.stderr
+    assert any("STAGE_FAILED deadline-passed phase=dll" in line for line in _chain_status(run)), _chain_status(run)
+    assert not (box["dir"] / "stage-one.calls").exists() and _stub_calls(box) == []
+
+
+def test_a_capacity_refusal_is_retried_and_ends_typed_after_max_attempts(box) -> None:
+    # The retry rule of the incident copy (exit 3 = capacity, retry until the deadline) is kept; -MaxAttempts bounds it. A deadline
+    # shorter than the queue is still refused on its first ticket (the bound is the deadline, the queue is longer).
+    done, run = _run_chain(box, 180, _future(90))
+    assert done.returncode == 3, done.stdout + done.stderr
+    status = _chain_status(run)
+    assert any("STAGE_FAILED capacity-attempts-exhausted phase=stage attempts=2" in line for line in status), status
+    calls = _stub_calls(box)
+    assert len(calls) == 2 and all(88 < _wait_minutes(c) <= 90 for c in calls), [c["argv"] for c in calls]
 
 
 def test_print_jobs_takes_no_heavy_slot(box) -> None:
