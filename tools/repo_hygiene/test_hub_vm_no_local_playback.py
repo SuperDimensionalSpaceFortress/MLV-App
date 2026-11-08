@@ -458,7 +458,8 @@ def _run_retrying_start_fault(run, name: str) -> "subprocess.CompletedProcess":
         done = run()
         lasted = time.monotonic() - began
         if attempt == 2 and len(_PWSH_SPAWNS) > spawned + 1 and name in _PWSH_SPAWNS[spawned + 1:]:
-            # pass-3 A3: the re-run is the same LOGICAL probe; the differential witnesses and the 28-probe ceiling count _PWSH_SPAWNS, so drop its extra entry
+            # pass-3 A3 / Dot item 3: _PWSH_SPAWNS counts LOGICAL probes (what the differential witnesses and the 28-probe ceiling are written in); this
+            # re-run is a second PHYSICAL launch of the same logical probe, so its extra entry is dropped. Physical launches are not recorded anywhere.
             del _PWSH_SPAWNS[len(_PWSH_SPAWNS) - 1 - _PWSH_SPAWNS[::-1].index(name)]
         if done.returncode == 0 or not _is_start_crash(done, lasted):
             return done
@@ -467,6 +468,43 @@ def _run_retrying_start_fault(run, name: str) -> "subprocess.CompletedProcess":
             print(f"[{name}] interpreter start fault ({details[0].splitlines()[0]}): running the probe once more", file=sys.stderr)
     kind = _start_fault_kind(done.stderr)
     raise LintProbeStartFault(f"lint probe start fault: {kind} in {name}, on both attempts; {'; '.join(details)}", kind, details[-1])
+
+
+def _communicate_retrying_start_fault(proc: "subprocess.Popen", deadline: "float | None" = None, before_collect=None, popen=None) -> tuple:
+    """CI-FLAKE-PROMPT-LINT-PWSH-RUNTIME-LOAD-1 r2 (Dot item 1): the recovery for a test that starts a REAL pwsh with _popen_pwsh and reads its stdout itself
+    (the clock probes), instead of going through _collect_counts. It collects `proc`; if the child died of a recognized start fault (_is_start_crash, judged on the
+    exit clock exactly as _collect_counts_once does) it starts the SAME probe file once more with `popen` (default: _popen_pwsh, uncounted, so it stays one
+    LOGICAL probe) and collects that. Returns (the proc that stands, its stdout, its stderr), so the caller can still assert on that child's own watcher. Two
+    start faults raise a LintProbeStartFault naming both; any other result, including a plain non-zero exit, is returned as it came and is never re-run, and a
+    timeout is a typed AssertionError that is never re-run. `deadline` is one time.monotonic() instant for both attempts (default LINT_PROBE_BOUND_SEC from now);
+    a re-launch needs budget left. `before_collect(proc)` runs before each attempt is read (a test uses it to collect late)."""
+    if deadline is None:
+        deadline = time.monotonic() + LINT_PROBE_BOUND_SEC
+    probe = Path(str(proc.args[-1]))
+    relaunch = popen or (lambda path: _popen_pwsh(path, counted=False))
+    details: list = []
+    for attempt in (1, 2):
+        if before_collect is not None:
+            before_collect(proc)
+        remaining = deadline - time.monotonic()
+        try:
+            out, err = proc.communicate(timeout=max(1.0, remaining) if proc.poll() is not None else max(0.0, remaining))
+        except subprocess.TimeoutExpired:
+            _kill(proc)
+            raise AssertionError(f"lint probe {probe.name} did not finish inside its budget (bound {LINT_PROBE_BOUND_SEC} s)") from None
+        lasted = _probe_lasted(proc)
+        done = subprocess.CompletedProcess(proc.args, proc.returncode, stdout=out, stderr=err)
+        if proc.returncode == 0 or not _is_start_crash(done, lasted):
+            return proc, out, err
+        details.append(f"attempt {attempt}: rc={proc.returncode} after {lasted:.1f} s: {(err or '').strip() or '<no stderr>'}")
+        if attempt == 1:
+            if deadline - time.monotonic() <= 0:
+                raise LintProbeStartFault(f"lint probe start fault: {_start_fault_kind(err)} in {probe.name}; no budget left for the one re-run; {details[0]}",
+                                          _start_fault_kind(err), details[0])
+            print(f"[{probe.name}] interpreter start fault ({details[0].splitlines()[0]}): running the probe once more", file=sys.stderr)
+            proc = relaunch(probe)
+    kind = _start_fault_kind(err)
+    raise LintProbeStartFault(f"lint probe start fault: {kind} in {probe.name}, on both attempts; {'; '.join(details)}", kind, details[-1])
 
 
 def _start_fault_kind(stderr: "str | None") -> str:
@@ -494,12 +532,17 @@ def _collect_counts(proc: "subprocess.Popen", expected: int, deadline: float | N
         if deadline - time.monotonic() <= 0:  # adversary r1 A1: writing the log line took time too; the launch must still be inside the shared deadline
             raise LintProbeStartFault(f"lint probe start fault: {first.kind} in {probe.name}; no budget left for the one re-probe (spent while it was announced); "
                                       f"attempt 1: {first.detail}", first.kind, first.detail) from None
-        again = _popen_pwsh(probe, counted=False)
+        again = _popen_pwsh(probe, counted=False)  # Dot item 3: a second PHYSICAL launch of the same LOGICAL probe, so it is not entered in _PWSH_SPAWNS
         try:
             counts = _collect_counts_once(again, expected, deadline)
             ended = getattr(again, "ended_at", None)
             # adversary pass 2 A1: an exited probe is drained without a timeout, so its recorded end proves it was in time. Pass 3 A1: with no recorded end (the
             # watcher thread could not start) the clock at collection stands in for it, with NO slack (pass 4 A1): the later of the two is the safe bound.
+            # Dot item 2: so on this head the unknown-end case has NO grace (an earlier head gave it 0.5 s, pass 4 A1 removed it). The only slack left on
+            # this path is a floor on how long an ALREADY-EXITED probe's pipes may take to drain (max(1.0, remaining) in _collect_counts_once) and the 1 s
+            # exit-watcher join in _probe_lasted; neither extends the shared deadline for a probe that is still running (it gets exactly what is left).
+            # None of it is the foreground per-attempt bound: _findings / _lint_word_lists run each attempt under their own 120 s timeout, outside this
+            # shared deadline, so a re-run there can take up to a second 120 s.
             over = ended - deadline if isinstance(ended, (int, float)) else time.monotonic() - deadline
             if over > 0:
                 raise AssertionError(f"lint probe {probe.name} ({expected} rows): the one re-probe finished {over:.1f} s after the shared deadline, so its result is "
@@ -4518,6 +4561,9 @@ class LintDifferentialPinTests(unittest.TestCase):
     # CI-LINTDIFF-PIN-DETERMINISM-WITNESS-1 adds 3 single-shard probes (a 3-row corpus is one shard): the WITNESS_ROWS corpus (shared by the
     # changed-corpus and reordered-corpus tests, whichever runs first starts it), the changed corpus and the reordered corpus; the
     # cached-failure test starts none (its collector is stubbed) = 28.
+    # Dot item 3: 28 counts LOGICAL probes, i.e. the entries of _PWSH_SPAWNS. PHYSICAL launches are a different number: a probe whose pwsh dies of the
+    # recognized start fault (_is_start_crash) is launched once more (_collect_counts, _run_retrying_start_fault), uncounted, so the worst case is
+    # 28 logical probes = 56 physical launches, and the ceiling is not loosened for it. The numbers above are unchanged: the code's count is still 28.
     MAX_PWSH_SPAWNS = 28
 
     @classmethod
@@ -6077,7 +6123,9 @@ class CollectCountsRuntimeLoadFaultTests(unittest.TestCase):
                 clock[0] = self.drained_at
                 return self._streams
 
-        # pass 4 A1: there is no drain slack. 0.2 s past the deadline is late (rejected); inside it is accepted.
+        # pass 4 A1 / Dot item 2: with no recorded end there is NO grace on this head (an earlier head allowed 0.5 s). 0.2 s past the deadline is late
+        # (rejected); inside it is accepted. This is the shared-deadline check of the background re-probe; the foreground re-run has no such deadline
+        # and is bounded per attempt by its own 120 s timeout instead (see _run_retrying_start_fault).
         for drained_at, late in ((1001.2, True), (1000.9, False)):
             clock[0] = 1000.0
             with mock.patch.object(sys.modules[__name__], "_popen_pwsh", lambda probe, counted=True: QuickNoWatcher(drained_at)), \
@@ -6136,41 +6184,159 @@ class CollectCountsRuntimeLoadFaultTests(unittest.TestCase):
             self.assertEqual([1], _collect_counts(self._fault(), 1, time.monotonic() + 60))
         self.assertEqual([False], flags, "the re-probe is started uncounted")
 
+    def test_item1_the_communicate_helper_re_launches_a_start_fault_once_and_only_that(self):
+        """Dot item 1: _communicate_retrying_start_fault (the clock probes' recovery) re-launches only the recognized signature, once, inside one deadline."""
+        launched: list = []
+
+        def relaunch(later):
+            script = list(later)
+
+            def popen(path):
+                launched.append(path.name)
+                return script.pop(0)
+            return popen
+
+        def run(first, later=(), **kw):
+            launched.clear()
+            with contextlib.redirect_stderr(io.StringIO()):
+                return _communicate_retrying_start_fault(first, popen=relaunch(later), **kw)
+
+        good = self.Scripted(0, "[1]", "")
+        first = self._fault()
+        proc, out, _ = run(first, [good])
+        self.assertIs(good, proc)
+        self.assertEqual(("[1]", ["r13-pass-probe.ps1"]), (out, launched))
+        with self.assertRaises(LintProbeStartFault) as twice:
+            run(self._fault(), [self._fault()])
+        self.assertEqual(1, len(launched), "one re-launch, never two")
+        for needle in ("lint probe start fault: pwsh runtime load failure", "attempt 1", "attempt 2", "The given assembly name was invalid"):
+            self.assertIn(needle, str(twice.exception))
+        # guard rows: each is returned as it came, with no re-launch
+        for name, genuine in (("a plain non-zero exit", self.Scripted(1, "", self.REAL_STDERR)),
+                              ("lint output present", self.Scripted(-6, '[{"op":"lint"}]', self.REAL_STDERR)),
+                              ("a late death", self.Scripted(-6, "", self.REAL_STDERR, lasted=30.0)),
+                              ("another stderr text", self.Scripted(-6, "", "Segmentation fault")),
+                              ("a success", self.Scripted(0, "[1]", ""))):
+            proc, out, _ = run(genuine, [good])
+            self.assertIs(genuine, proc, name)
+            self.assertEqual([], launched, name)
+        # a spent deadline leaves no budget for the re-launch
+        with self.assertRaises(LintProbeStartFault) as spent:
+            run(self._fault(), [good], deadline=time.monotonic() - 1.0)
+        self.assertEqual([], launched)
+        self.assertIn("no budget", str(spent.exception))
+
+    def test_item1_the_communicate_helper_does_not_re_launch_a_timeout(self):
+        class Slow(self.Scripted):
+            def poll(self):
+                return None
+
+            def kill(self):
+                self.returncode = -9
+
+            def communicate(self, timeout=None):
+                if self.returncode == -9:
+                    return self._streams
+                raise subprocess.TimeoutExpired(self.args, timeout)
+
+        launched: list = []
+        with self.assertRaises(AssertionError) as caught:
+            _communicate_retrying_start_fault(Slow(-6, "", self.REAL_STDERR), deadline=time.monotonic() + 0.05, popen=lambda path: launched.append(path.name))
+        self.assertEqual([], launched)
+        self.assertIn("did not finish inside its budget", str(caught.exception))
+
     def test_the_start_window_is_the_one_the_lint_cache_probe_uses(self):
         """The classifier, the window and the signal set are the LintCache probe's own (#718, #747), not a second copy."""
         self.assertEqual(5, LINT_PROBE_START_WINDOW_SEC)
         self.assertIn(6, LINT_PROBE_CRASH_SIGNALS)
         self.assertIn("_is_start_crash(", inspect.getsource(_collect_counts_once))
         self.assertIn("_is_start_crash(", inspect.getsource(_run_retrying_start_fault))
+        self.assertIn("_is_start_crash(", inspect.getsource(_communicate_retrying_start_fault))
 
 
 @requires_pwsh
 class PopenPwshExitClockTests(unittest.TestCase):
-    """_popen_pwsh records when the child ended, so a shard collected late still reports how long it lived."""
+    """_popen_pwsh records when the child ended, so a shard collected late still reports how long it lived.
 
-    def test_a_real_probe_reports_how_long_it_lived_not_how_late_it_was_collected(self):
+    CI-FLAKE-PROMPT-LINT-PWSH-RUNTIME-LOAD-1 r2 (Dot item 1, advisory 6721928751): the two cases below start a REAL pwsh, so a runtime-load start fault of
+    that pwsh used to fail them with a bare `'' != '[1]'`. The `scripted_fault` variants make the FIRST launch die of the recorded fault (a scripted Popen,
+    so no pwsh crash is needed) and let any later launch be real."""
+
+    class FaultedPwsh:
+        """A pwsh child that already died of the recorded runtime-load fault: what Popen would hold for run 42465921249's probe."""
+
+        def __init__(self, argv):
+            self.args = argv
+            self.returncode = -6
+            self.stdout = self.stderr = self.stdin = None
+
+        def wait(self, timeout=None):
+            return self.returncode
+
+        def poll(self):
+            return self.returncode
+
+        def kill(self):
+            pass
+
+        def communicate(self, timeout=None):
+            return "", CollectCountsRuntimeLoadFaultTests.REAL_STDERR
+
+    @contextlib.contextmanager
+    def first_launch_dies(self):
+        """subprocess.Popen answers its FIRST call with FaultedPwsh and every later call with the real thing; yields the argv list of each launch."""
+        real = subprocess.Popen
+        launches: list = []
+
+        def popen(argv, *args, **kwargs):
+            launches.append(argv)
+            return self.FaultedPwsh(argv) if len(launches) == 1 else real(argv, *args, **kwargs)
+
+        with mock.patch.object(subprocess, "Popen", popen):
+            yield launches
+
+    def _quick_probe(self) -> Path:
         tmp = Path(tempfile.mkdtemp(prefix="hubvm-exitclock-"))
         self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
         probe = tmp / "quick-probe.ps1"
         _write_probe(probe, "'[1]'\n")
-        proc = _popen_pwsh(probe)
-        try:
-            proc.exit_watch.join(timeout=120)
+        return probe
+
+    def _lifetime_case(self, scripted_fault: bool) -> None:
+        probe = self._quick_probe()
+        before = len(_PWSH_SPAWNS)
+        def collected_late(attempt) -> None:
+            attempt.exit_watch.join(timeout=120)
             time.sleep(1.5)  # collected late
-            self.assertEqual(["[1]"], [proc.communicate(timeout=60)[0].strip()])
-            lasted = _probe_lasted(proc)
-        finally:
-            _kill(proc)
+
+        with self.first_launch_dies() if scripted_fault else contextlib.nullcontext([]) as launches:
+            first = proc = _popen_pwsh(probe)
+            try:
+                proc, out, _ = _communicate_retrying_start_fault(proc, before_collect=collected_late)
+                lasted = _probe_lasted(proc)
+            finally:
+                _kill(proc)
+                _kill(first)
+        spawned = _PWSH_SPAWNS[before:]
+        del _PWSH_SPAWNS[before:]
+        self.assertEqual(["[1]"], [out.strip()])
+        self.assertEqual(["quick-probe.ps1"], spawned, "one logical probe, however many launches it took")
+        self.assertEqual(2 if scripted_fault else 0, len(launches))
+        self.assertIs(scripted_fault, proc is not first, "after a start fault the clock asserted is the re-launch's own")
         self.assertIsNotNone(proc.ended_at)
         self.assertLess(lasted, time.monotonic() - proc.started_at - 1.0, "the lifetime excludes the 1.5 s the probe waited to be collected")
         self.assertEqual(float("inf"), _probe_lasted(mock.Mock(spec=[])), "a probe with no start time is never taken to be inside the window")
 
-    def test_adversary_a2_a_watcher_thread_that_cannot_start_does_not_orphan_the_child(self):
-        """Adversary r1 A2: if the exit watcher cannot be started the child is still returned (owned by the caller, who kills it), never left running unowned."""
-        tmp = Path(tempfile.mkdtemp(prefix="hubvm-exitclock-"))
-        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
-        probe = tmp / "quick-probe.ps1"
-        _write_probe(probe, "'[1]'\n")
+    def test_a_real_probe_reports_how_long_it_lived_not_how_late_it_was_collected(self):
+        self._lifetime_case(scripted_fault=False)
+
+    def test_item1_the_lifetime_probe_survives_a_scripted_start_fault(self):
+        """Dot item 1 (:6144-6150): the first pwsh dies of the recorded runtime-load fault; the probe is run once more and the re-launch's own clock is asserted."""
+        self._lifetime_case(scripted_fault=True)
+
+    def _no_watcher_case(self, scripted_fault: bool) -> None:
+        probe = self._quick_probe()
+        before = len(_PWSH_SPAWNS)
 
         class NoThreads:
             def __init__(self, *args, **kwargs):
@@ -6179,15 +6345,35 @@ class PopenPwshExitClockTests(unittest.TestCase):
             def start(self):
                 raise RuntimeError("can't start new thread")
 
-        with mock.patch.object(threading, "Thread", NoThreads):
-            proc = _popen_pwsh(probe)  # must not raise: the clock is advisory
-        try:
-            self.assertEqual("[1]", proc.communicate(timeout=60)[0].strip())
-            self.assertIsNone(proc.ended_at)
-            self.assertIsNone(proc.exit_watch)
-            self.assertTrue(_probe_lasted(proc) >= 0, "judged as ending when collected")
-        finally:
-            _kill(proc)
+        def start_without_a_watcher(path: Path, counted: bool = True):
+            with mock.patch.object(threading, "Thread", NoThreads):
+                return _popen_pwsh(path, counted=counted)  # must not raise: the clock is advisory
+
+        with self.first_launch_dies() if scripted_fault else contextlib.nullcontext([]) as launches:
+            first = proc = start_without_a_watcher(probe)
+            try:
+                proc, out, _ = _communicate_retrying_start_fault(proc, popen=lambda path: start_without_a_watcher(path, counted=False))
+                lasted = _probe_lasted(proc)
+            finally:
+                _kill(proc)
+                _kill(first)
+        spawned = _PWSH_SPAWNS[before:]
+        del _PWSH_SPAWNS[before:]
+        self.assertEqual("[1]", out.strip())
+        self.assertEqual(["quick-probe.ps1"], spawned, "one logical probe, however many launches it took")
+        self.assertEqual(2 if scripted_fault else 0, len(launches))
+        self.assertIs(scripted_fault, proc is not first)
+        self.assertIsNone(proc.ended_at)
+        self.assertIsNone(proc.exit_watch)
+        self.assertTrue(lasted >= 0, "judged as ending when collected")
+
+    def test_adversary_a2_a_watcher_thread_that_cannot_start_does_not_orphan_the_child(self):
+        """Adversary r1 A2: if the exit watcher cannot be started the child is still returned (owned by the caller, who kills it), never left running unowned."""
+        self._no_watcher_case(scripted_fault=False)
+
+    def test_item1_the_no_watcher_probe_survives_a_scripted_start_fault(self):
+        """Dot item 1 (:6165-6177): the first pwsh dies of the recorded fault; the re-launch is made while the watcher thread still cannot start."""
+        self._no_watcher_case(scripted_fault=True)
 
     def test_adversary_a3_an_uncounted_start_is_not_in_the_spawn_list(self):
         tmp = Path(tempfile.mkdtemp(prefix="hubvm-exitclock-"))
