@@ -879,10 +879,12 @@ def test_a_marker_for_a_non_heavy_slot_code_is_never_a_requeue(box) -> None:
 
 
 def _library_driver(box: dict, body: str, lock: str, cwd: Path = None, extra: dict = None,
-                    host_tail: str = None) -> subprocess.CompletedProcess:
+                    host_tail: str = None, prelude: str = "") -> subprocess.CompletedProcess:
+    # prelude runs BEFORE the guard is dot-sourced: what a Library caller already holds in its session when it loads the guard.
     driver = box["dir"] / "lib-driver.ps1"
     driver.write_text(
         "param([string]$Guard, [string]$Lock, [string]$Mem, [string]$Table, [string]$Sha)\n"
+        + prelude +
         ". $Guard -Library\n"
         "$opts = @{ LockPath = $Lock; MemoryProbeFile = $Mem; ProcessTableFile = $Table; HeavySlotSha256 = $Sha; PollSeconds = 0.2 }\n"
         + body,
@@ -962,7 +964,8 @@ def test_a_pin_mismatch_refuses_before_anything_runs(box) -> None:
 STAGE_QUEUE_ENV = {"STUB_HEAVY_SLOT_MODE": "queued", "STUB_HEAVY_SLOT_QUEUE_MIN": "130"}
 
 
-def _stage_attempt(box: dict, deadline_expr: str = None, opts_line: str = "", extra: dict = None) -> subprocess.CompletedProcess:
+def _stage_attempt(box: dict, deadline_expr: str = None, opts_line: str = "", extra: dict = None,
+                   prelude: str = "") -> subprocess.CompletedProcess:
     deadline = f"$opts.HeavySlotDeadlineUtc = {deadline_expr}\n" if deadline_expr else ""
     return _library_driver(
         box,
@@ -970,6 +973,7 @@ def _stage_attempt(box: dict, deadline_expr: str = None, opts_line: str = "", ex
         f"Invoke-BuildGuard -Label 'attr3-assemble:abc' -Options $opts -Action {{ param($Jobs) Set-Content -LiteralPath '{box['marker']}' -Value ran -Encoding ascii }}\n",
         str(box["lock"]),
         extra={**STAGE_QUEUE_ENV, **(extra or {})},
+        prelude=prelude,
     )
 
 
@@ -1028,6 +1032,99 @@ def test_an_allscope_read_only_library_caller_variable_never_replaces_the_given_
     assert done.returncode == 2, done.stdout + done.stderr
     assert f"BUILD_HEAVY_SLOT_REFUSED label=attr3-assemble:abc reason=caller-allscope-variable name={name} " in done.stdout, done.stdout + done.stderr
     assert _stub_calls(box) == [] and not box["marker"].exists()
+
+
+# --- r5 (adversary pass on c0a8936e: A1 and A2, both introduced majors) ---------------------------------------------------------------
+
+_FROZEN_CAP = "$ErrorActionPreference = 'Continue'\nNew-Variable HeavySlotMaxMinutes -Value 20000 -Option AllScope,ReadOnly\n"
+
+
+@pytest.mark.parametrize("site, prelude, deadline, opts_line", [
+    # The adversary's input (build-guard.ps1:1002 via :1097 and :1153): a caller froze the cap before loading the guard, and a far deadline.
+    ("far-deadline", _FROZEN_CAP, "'2099-01-01T00:00:00Z'", ""),
+    # :1101, the same cap read by the range check: an explicit 20000 min wait with no deadline.
+    ("explicit-wait", _FROZEN_CAP, None, "$opts.HeavySlotWaitMinutes = 20000\n"),
+])
+def test_a_library_callers_frozen_cap_never_lifts_the_one_week_wait(box, site, prelude, deadline, opts_line) -> None:
+    # adversary c0a8936e-A1: the guard's `$script:HeavySlotMaxMinutes = 10080` (:191) failed against the caller's read-only AllScope 20000, so
+    # the deadline wait was clamped to 20000 (:1002), the range check accepted it (:1101) and heavy-slot got --wait 20000m with a 20015 min
+    # hung-tool bound. The cap is now a literal inside Enter-HeavySlot: no name a caller can pre-seed is read for it.
+    done = _stage_attempt(box, deadline, opts_line=opts_line, prelude=prelude)
+    calls = _stub_calls(box)
+    assert all(_wait_minutes(c) <= 10080 for c in calls), [c["argv"] for c in calls]
+    if site == "far-deadline":
+        assert done.returncode == 0, done.stdout + done.stderr
+        [call] = calls
+        assert _wait_minutes(call) == 10080.0, call["argv"]
+    else:
+        assert done.returncode == 2, done.stdout + done.stderr
+        assert "BUILD_HEAVY_SLOT_REFUSED label=attr3-assemble:abc reason=invalid-option " in done.stdout and "from 0 to 10080" in done.stdout, done.stdout
+        assert calls == [] and not box["marker"].exists()
+
+
+@pytest.mark.parametrize("prelude, name, reason", [
+    # :1156 (and :191's sibling): the hung-tool slack the caller froze, AllScope or only read-only in the scope the guard is loaded into.
+    ("New-Variable HeavySlotGiveUpSlackMinutes -Value 20000 -Option AllScope,ReadOnly\n", "HeavySlotGiveUpSlackMinutes", "caller-frozen-variable"),
+    ("New-Variable HeavySlotGiveUpSlackMinutes -Value 20000 -Option ReadOnly\n", "HeavySlotGiveUpSlackMinutes", "caller-frozen-variable"),
+    # :1014, the guard list omitted every local but the deadline's: a frozen de-DE $inv made the launch-time wait a silent 0m (key3 sweep).
+    ("New-Variable inv -Value ([Globalization.CultureInfo]::GetCultureInfo('de-DE')) -Option AllScope,ReadOnly\n", "inv", "caller-allscope-variable"),
+    ("New-Variable maxMin -Value 20000 -Option AllScope,ReadOnly\n", "maxMin", "caller-allscope-variable"),
+], ids=["slack-allscope", "slack-readonly", "inv-allscope", "maxMin-allscope"])
+def test_a_library_callers_frozen_variable_of_the_wait_path_is_refused_before_anything_is_taken(box, prelude, name, reason) -> None:
+    # adversary c0a8936e-A1, the class: every variable the wait path reads is either this function's own (refused when a caller holds the name
+    # AllScope) or a script variable the guard set at load (refused when the caller froze it first, so the guard's own value never landed).
+    done = _stage_attempt(box, "([DateTime]::UtcNow.AddMinutes(200.5)).ToString('o')", prelude="$ErrorActionPreference = 'Continue'\n" + prelude)
+    assert done.returncode == 2, done.stdout + done.stderr
+    assert f"BUILD_HEAVY_SLOT_REFUSED label=attr3-assemble:abc reason={reason} name={name} " in done.stdout, done.stdout + done.stderr
+    assert _stub_calls(box) == [] and not box["marker"].exists()
+
+
+@pytest.mark.parametrize("alias, deadline, expect_rc, low, high", [
+    # build-guard.ps1:1017: an aliased deadline reader returned the options table, so an expired deadline became the ordinary 60 min wait.
+    ("Get-HeavySlotDeadline", "'2000-01-01T00:00:00Z'", 3, 0.0, 0.0),
+    # :1097 and :1153: an aliased wait helper.
+    ("Get-HeavySlotWaitFromDeadline", "([DateTime]::UtcNow.AddMinutes(200)).ToString('o')", 0, 199.0, 200.0),
+])
+def test_a_library_callers_alias_never_replaces_the_deadline_path(box, alias, deadline, expect_rc, low, high) -> None:
+    # adversary c0a8936e-A2 (its sibling input): a caller's alias outranks a function of the dot-sourced guard. The deadline path now calls no
+    # helper by name: it is read and turned into the wait inside Enter-HeavySlot.
+    prelude = f"Set-Alias -Name {alias} -Value Write-Output -Scope Global\n"
+    done = _stage_attempt(box, deadline, prelude=prelude)
+    assert done.returncode == expect_rc, done.stdout + done.stderr
+    [call] = _stub_calls(box)
+    assert low <= _wait_minutes(call) <= high, call["argv"]
+
+
+def _function_ast_names(path: Path, function: str) -> tuple:
+    script = (f"$a = [System.Management.Automation.Language.Parser]::ParseFile('{path}', [ref]$null, [ref]$null)\n"
+              f"$f = $a.Find({{ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq '{function}' }}, $true)\n"
+              "$f.Body.FindAll({ param($n) $n -is [System.Management.Automation.Language.VariableExpressionAst] }, $true) | "
+              "ForEach-Object { 'V ' + $_.VariablePath.UserPath }\n"
+              "$f.Body.FindAll({ param($n) $n -is [System.Management.Automation.Language.CommandAst] }, $true) | ForEach-Object { 'C ' + $_.GetCommandName() }\n")
+    done = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script],
+                          capture_output=True, text=True, timeout=60, check=False)
+    assert done.returncode == 0, done.stderr
+    lines = [l.strip() for l in done.stdout.splitlines() if l.strip()]
+    return {l[2:] for l in lines if l.startswith("V ")}, {l[2:] for l in lines if l.startswith("C ")}
+
+
+def test_the_heavy_slot_guard_lists_cover_every_variable_enter_heavyslot_reads() -> None:
+    # adversary c0a8936e-A1, the whole class: the first guard list must name every variable of Enter-HeavySlot, the second every script variable
+    # it reads; the cap is a literal; and the removed helpers are called nowhere (adversary c0a8936e-A2).
+    variables, commands = _function_ast_names(GUARD, "Enter-HeavySlot")
+    text = GUARD.read_text(encoding="utf-8")
+    guard = re.search(r"# CALLER-SHADOW GUARD, before that.*?\n\s*@\(([^)]*)\)\.Where\(.*?\n\s*@\(([^)]*)\)\.Where\(", text, re.S)
+    assert guard, "the guard lists are missing"
+    local_list = {n.strip().strip("'").lower() for n in guard.group(1).replace("\n", " ").split(",") if n.strip()}
+    script_list = {n.strip().strip("'").lower() for n in guard.group(2).split(",") if n.strip()}
+    automatic = {"_", "pid", "null", "true", "false", "executioncontext"}
+    used_local = {v.lower() for v in variables if ":" not in v} - automatic
+    used_script = {v.split(":", 1)[1].lower() for v in variables if v.lower().startswith("script:")}
+    assert used_local - local_list == set(), sorted(used_local - local_list)
+    assert used_script - script_list == set(), sorted(used_script - script_list)
+    assert "HeavySlotMaxMinutes" not in text, "the one-week cap is a literal, never a script variable"
+    assert not {"Get-HeavySlotDeadline", "Get-HeavySlotWaitFromDeadline"} & commands
+    assert "function Get-HeavySlotDeadline" not in text and "function Get-HeavySlotWaitFromDeadline" not in text
 
 
 def test_the_deadline_can_come_from_the_environment(box) -> None:
@@ -1396,27 +1493,22 @@ def test_a_capacity_refusal_is_retried_and_ends_typed_after_max_attempts(box) ->
 
 def test_a_deadline_that_passes_while_the_attempt_log_is_made_starts_no_child(box) -> None:
     # adversary 9528e35b-A1: the loop checked the deadline (:102), then built the log path and created the log (:104, :80), then launched the
-    # child (:81) with no second check, so prelaunch work that ran past the deadline (a slow share) still started an attempt after it. The
-    # delay is injected where the adversary put it, between the loop's check and the launch: an in-process caller's Join-Path that holds the
-    # attempt-log path until the deadline has passed. The stage-one would record that it ran.
+    # child (:81) with no second check, so prelaunch work that ran past the deadline (a slow share) still started an attempt after it.
+    # r5: the delay was a caller's global Join-Path, which the chain no longer calls (adversary c0a8936e-A2), and sat BEFORE the log was
+    # created, so a check moved above the create stayed green (Dot nit; sol and key3 hardening). The chain's own test seam now holds the
+    # attempt AFTER its log is created: the deadline check must come after the create, as the last step before the launch.
     run, stage_one_path, env = _chain_box(box, 61)
     ran = box["dir"] / "child-ran.txt"
-    slept = box["dir"] / "slept.txt"
     stage_one_path.write_text(f"param([string]$Sha, [string]$Phase)\nAdd-Content -LiteralPath '{ran}' -Value $Phase\nexit 0\n", encoding="ascii")
     script = (
-        "$global:FixDeadline = [DateTime]::UtcNow.AddSeconds(5)\n"
-        "function global:Join-Path { param([string]$Path, [string]$ChildPath)\n"
-        f"  if ($ChildPath -like 'stage-{_CHAIN_SHA[:8]}-*') {{\n"
-        "    while ([DateTime]::UtcNow -lt $global:FixDeadline.AddMilliseconds(300)) { Start-Sleep -Milliseconds 50 }\n"
-        f"    Set-Content -LiteralPath '{slept}' -Value 'held' }}\n"
-        "  Microsoft.PowerShell.Management\\Join-Path -Path $Path -ChildPath $ChildPath }\n"
-        f"& '{STAGE_CHAIN}' -Sha {_CHAIN_SHA} -DeadlineUtc $global:FixDeadline.ToString('o') -StageOne '{stage_one_path}' -RetrySec 0 -MaxAttempts 1\n"
+        "$d = [DateTime]::UtcNow.AddSeconds(6)\n"
+        f"& '{STAGE_CHAIN}' -Sha {_CHAIN_SHA} -DeadlineUtc $d.ToString('o') -StageOne '{stage_one_path}' -RetrySec 0 -MaxAttempts 1 -HoldAfterLogMsForTest 9000\n"
         "Write-Output \"rc=$LASTEXITCODE\"\n"
     )
     done = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script],
                           capture_output=True, text=True, timeout=180, env=env, check=False)
     status = _chain_status(run)
-    assert slept.exists(), "the injected delay never ran, so this proves nothing: " + done.stdout + done.stderr + "\n".join(status)
+    assert list(run.glob(f"stage-{_CHAIN_SHA[:8]}-dll-*.out.txt")), "the attempt log was never created, so the hold proves nothing: " + done.stdout + done.stderr
     assert not ran.exists(), "a child started after the deadline: " + ran.read_text(encoding="utf-8")
     assert "rc=3" in done.stdout, done.stdout + done.stderr + "\n".join(status)
     assert any("STAGE_FAILED deadline-passed-before-launch phase=dll attempt=1" in line for line in status), status
@@ -1500,6 +1592,75 @@ def test_the_chain_caller_shadow_guard_covers_every_variable_the_chain_uses() ->
     text = STAGE_CHAIN.read_text(encoding="utf-8")
     assert not re.search(r"(?<![:\w])\$rc\b", text), "the exit code is carried only in the uniquely named script variable"
     assert "exit $script:MlvStageChainExitCode" in text
+
+
+# Every command name the chain called through c0a8936e: its own four functions and the cmdlets it used.
+_CHAIN_SHADOWED = ["Set-ChainExit", "Log", "Refuse", "Invoke-StageOne", "Join-Path", "Test-Path", "Resolve-Path", "Split-Path",
+                   "Where-Object", "Select-Object", "Start-Sleep"]
+
+
+@pytest.mark.parametrize("site", ["child-fails", "deadline-passed", "before-launch", "capacity-attempts", "capacity-wait", "chain-throws"])
+def test_a_callers_alias_never_turns_a_failing_chain_into_exit_0(box, site) -> None:
+    # adversary c0a8936e-A2 (its input is child-fails: Set-Alias Set-ChainExit Write-Output, stage-one exits 9): an in-process caller's alias
+    # outranked the chain's own exit setter, so both setter calls only printed their argument and `exit $null` returned 0. One case per
+    # setter site (:136/:150, :142, :146, :151, :152, :161), with every command the chain used to call aliased to Write-Output. The chain now
+    # calls no command by name, so each still ends with its own non-zero exit.
+    exit_code = {"capacity-attempts": 3, "capacity-wait": 3}.get(site, 9 if site in ("child-fails", "chain-throws") else 0)
+    run, stage_one_path, env = _chain_box(box, 61, stage_one=f"param([string]$Sha, [string]$Phase)\nexit {exit_code}\n")
+    deadline = {"deadline-passed": "'2000-01-01T00:00:00Z'", "before-launch": "$d.ToString('o')", "capacity-wait": "$h.ToString('o')"}.get(
+        site, "'2099-01-01T00:00:00Z'")
+    extra = {"before-launch": "-HoldAfterLogMsForTest 9000 -MaxAttempts 1", "capacity-wait": "-RetrySec 86400 -MaxAttempts 0"}.get(
+        site, "-MaxAttempts 1")
+    retry = "" if site == "capacity-wait" else "-RetrySec 0"
+    expect = {"child-fails": 1, "chain-throws": 1}.get(site, 3)
+    user = os.environ.get("USERNAME")
+    if site == "chain-throws":
+        # The status file exists and stays writable; the run dir denies creating the attempt log, so the loop throws into the catch (:161).
+        (run / f"stage-status-{_CHAIN_SHA[:8]}.txt").write_text("", encoding="ascii")
+        subprocess.run(["icacls", str(run), "/deny", f"{user}:(AD,WD)"], capture_output=True, check=True)
+    aliases = "".join(f"Set-Alias -Name {n} -Value Write-Output -Scope Global\n" for n in _CHAIN_SHADOWED)
+    script = (f"{aliases}$d = [DateTime]::UtcNow.AddSeconds(6); $h = [DateTime]::UtcNow.AddHours(1); $global:LASTEXITCODE = 0\n"
+              f"& '{STAGE_CHAIN}' -Sha {_CHAIN_SHA} -DeadlineUtc {deadline} -StageOne '{stage_one_path}' {retry} {extra}\n"
+              "Write-Output \"rc=$LASTEXITCODE\"\n")
+    try:
+        done = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script],
+                              capture_output=True, text=True, timeout=180, env=env, check=False)
+    finally:
+        if site == "chain-throws":
+            subprocess.run(["icacls", str(run), "/remove:d", user], capture_output=True, check=False)
+    status = _chain_status(run)
+    assert f"rc={expect}" in done.stdout, done.stdout + done.stderr + "\n".join(status)
+    assert not any("STAGE_CHAIN_DONE" in line for line in status), status
+
+
+def test_the_chain_calls_no_command_by_name() -> None:
+    # adversary c0a8936e-A2, the whole class: a caller's alias or function outranks any command the chain names, its own functions and the
+    # built-in cmdlets alike. The chain names none: every command it runs is one of its own script blocks, invoked as `& $Helper`.
+    script = (f"$a = [System.Management.Automation.Language.Parser]::ParseFile('{STAGE_CHAIN}', [ref]$null, [ref]$null)\n"
+              "$a.FindAll({ param($n) $n -is [System.Management.Automation.Language.CommandAst] }, $true) | "
+              "ForEach-Object { $_.CommandElements[0].GetType().Name + ' ' + $_.CommandElements[0].Extent.Text }\n"
+              "$a.FindAll({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] }, $true) | ForEach-Object { 'FUNCTION ' + $_.Name }\n")
+    done = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script],
+                          capture_output=True, text=True, timeout=60, check=False)
+    assert done.returncode == 0, done.stderr
+    lines = [l.strip() for l in done.stdout.splitlines() if l.strip()]
+    assert lines, "no command found at all: the parse proves nothing"
+    named = [l for l in lines if not l.startswith("VariableExpressionAst ")]
+    assert named == [], named
+
+
+def test_a_sha_with_a_trailing_newline_is_refused_before_anything_runs(box) -> None:
+    # adversary advisory 9528e35b-A3: ValidatePattern('^[0-9a-f]{40}$') accepted '<40 hex>\n' ('$' matches before a final newline), which then
+    # reached the child's argv and the status lines. The pattern is anchored with \A and \z.
+    run, stage_one_path, env = _chain_box(box, 61)
+    ran = box["dir"] / "child-ran.txt"
+    stage_one_path.write_text(f"param([string]$Sha, [string]$Phase)\nAdd-Content -LiteralPath '{ran}' -Value $Phase\nexit 0\n", encoding="ascii")
+    script = (f"try {{ & '{STAGE_CHAIN}' -Sha (\"{_CHAIN_SHA}\" + \"`n\") -DeadlineUtc '2099-01-01T00:00:00Z' -StageOne '{stage_one_path}' -RetrySec 0 "
+              "-MaxAttempts 1; Write-Output \"ran rc=$LASTEXITCODE\" } catch { Write-Output \"refused=$($_.FullyQualifiedErrorId)\" }\n")
+    done = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script],
+                          capture_output=True, text=True, timeout=180, env=env, check=False)
+    assert "refused=ParameterArgumentValidationError" in done.stdout, done.stdout + done.stderr
+    assert not ran.exists() and _chain_status(run) == []
 
 
 def test_print_jobs_takes_no_heavy_slot(box) -> None:
