@@ -949,3 +949,20 @@ TEST(PlaybackSourceAdvanceTracker, R29A1PaintCreditSinkRoutesEverySurfaceReport)
     ASSERT_EQ(1, probe.calls);
     ASSERT_EQ(42u, probe.last);
 }
+
+// r29 fix iteration 1 (adversary A3 on 88eea505, advisory): only a frame whose own serial painted is credited. A hand-off recorded after
+// a NEWER serial painted (serial 13 painted, then 12 recorded) was never on screen: 13 replaced it. Only the exact serial the surface
+// last painted is credited at once (the synchronous paint inside its own present).
+TEST(PlaybackSourceAdvanceTracker, R29IterationOneAHandOffRecordedAfterANewerPaintIsNeverCredited)
+{
+    PlaybackSourceAdvanceTracker t;
+    PlaybackPaintCreditLedger ledger;
+    ledger.notePainted(13, 1.050, t);
+    ledger.noteSubmitted(12, 101, 0, 0, t);
+    ASSERT_EQ(0u, t.presented());
+    ASSERT_EQ(1u, ledger.superseded());
+    ASSERT_FALSE(ledger.waiting());
+    ledger.noteSubmitted(13, 102, 0, 0, t);      // the frame that painted: credited at its paint's time
+    ASSERT_EQ(1u, t.presented());
+    ASSERT_EQ(102, t.lastFrame());
+}

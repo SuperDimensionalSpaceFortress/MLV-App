@@ -12722,6 +12722,24 @@ class ConformMeasuredFieldsAreJudgedTests(unittest.TestCase):
                     self.assertEqual(len(row["failures"]), 1, row)
                     self.assertIn("no readable non-negative", row["failures"][0], row)
 
+    def test_r29_88eea505_a1_a_seek_back_cannot_hide_a_frozen_tail(self) -> None:
+        """r29 fix iteration 1 (adversary A1 on 88eea505), its literal input: frames 0..1448 painted, a seek back to 1398, 1398..1448 painted again, then
+        no paint while the engine reaches 1498. The replayed forward steps inflate the coverage to 1498 (backward=1), so the count leaves a shortfall of 1
+        and the 50 frames after 1448 were never shown. The ends say so directly: the engine's last target leads the last painted frame by 50, one of
+        which the engine may hold; 49 unshown frames are a jump of 50."""
+        for row in self.chain(" audio_sync_requests=0 presented=1550 source_advanced=1498 span_s=62.458 source_fps=23.984 max_jump=1 wraps=0 backward=1"
+                              " repeats=0 first_frame=0 last_frame=1448 engine_target=1498", ends=False):
+            with self.subTest(spec=row["spec"], role=row["role"]):
+                self.assertFalse(row["pass"], row)
+                self.assertEqual([f.split(" ")[0].rstrip(":") for f in row["failures"]], ["conformMaxJump"], row)
+        proc, out = run_pwsh_json(
+            "$m = Get-DvCriteriaMetrics -Metrics ([pscustomobject]@{ rows = 5 }) -Playback ([pscustomobject]@{ conformLinePresent = $true; summarySession = '3';"
+            " conformSession = '3'; conformSourceFps = 23.984; conformMaxJump = 1; conformAudioSyncRequests = 0; sourceAdvanced = 1499; conformSourceAdvanced = 1498;"
+            " conformFirstFrame = 0; conformLastFrame = 1448; conformEngineTarget = 1498 })\n"
+            "$m | ConvertTo-Json -Compress -Depth 4")
+        self.assertIsNotNone(out, proc.stdout + proc.stderr)
+        self.assertEqual((out["conformMaxJump"], out["conformFrozenTailFrames"]), (50, 49), out)
+
     def test_a_conform_line_without_the_measured_fields_fails_closed(self) -> None:
         """A build that does not print them (or a line that dropped them) is a missing number, never a passing one: each criterion fails with the typed reason."""
         for row in self.chain(""):
