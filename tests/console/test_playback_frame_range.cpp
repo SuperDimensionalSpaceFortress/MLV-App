@@ -3269,6 +3269,84 @@ TEST( PlaybackConformDropFrame, R32ConformedLoopPresentsTheCutsLastFrameBeforeTh
     ASSERT_EQ( 2, wraps );
 }
 
+TEST( PlaybackConformDropFrame, R32FixIteration2TheEngineOwnsTheConformedWrapFromTheLastFrame )
+{
+    // adversary A1 + A2 on 03850f7b: playbackHandling's outer "on the last frame" branch must not take the conformed Drop Frame
+    // Loop wrap; the drop-frame engine does (phase kept, conform gate). Every other shape keeps the outer branch.
+    using playback_frame_range::outerLastFrameBranchHandlesTick;
+    ASSERT_FALSE( outerLastFrameBranchHandlesTick( 718, 720, true, true, true ) );    // not on the last frame: never
+    ASSERT_FALSE( outerLastFrameBranchHandlesTick( 719, 720, true, true, true ) );    // conform + drop + loop: the engine's
+    ASSERT_TRUE( outerLastFrameBranchHandlesTick( 719, 720, true, true, false ) );    // no conform: unchanged
+    ASSERT_TRUE( outerLastFrameBranchHandlesTick( 719, 720, false, true, true ) );    // normal (whole-frame) mode: unchanged
+    ASSERT_TRUE( outerLastFrameBranchHandlesTick( 719, 720, true, false, true ) );    // no Loop: stop on the last frame
+    ASSERT_TRUE( outerLastFrameBranchHandlesTick( 900, 720, true, true, true ) );     // Cut Out moved below the playhead: cut-in
+    // A1's input: 718 painted, 718.8 + 0.24 -> 719.04 (719 now requested). 719 is accepted but its paint is withheld: while it is
+    // not on screen no conformed tick crosses into the wrap (the debt is carried), and the outer branch does not wrap either.
+    const int cutIn = 1, cutOut = 720;
+    double debt = 0.0;
+    playback_frame_range::DropFrameTickResult step = playback_frame_range::advanceDropFrameTick(
+        718.8, playback_frame_range::conformDropFrameDelta( 718.8, 0.24, true, debt, true ), cutIn, cutOut, true, true );
+    ASSERT_EQ( 719, static_cast<int>( step.position ) );
+    ASSERT_FALSE( outerLastFrameBranchHandlesTick( static_cast<int>( step.position ), cutOut, true, true, true ) );
+    for( int t = 0; t < 4; ++t )   // four 48 ms grants while 719 is unpainted (the debt stays under kConformMaxDebtFrames)
+    {
+        step = playback_frame_range::advanceDropFrameTick(
+            step.position, playback_frame_range::conformDropFrameDelta( step.position, 1.152, true, debt, /*targetPresented=*/false ),
+            cutIn, cutOut, true, true );
+        ASSERT_FALSE( step.wrapped );
+        ASSERT_EQ( 719, static_cast<int>( step.position ) );
+    }
+    ASSERT_TRUE( debt > 0.0 );
+    // 719 painted: the next tick wraps, by the cut's frame count, onto the first frame
+    step = playback_frame_range::advanceDropFrameTick(
+        step.position, playback_frame_range::conformDropFrameDelta( step.position, 0.192, true, debt, true ), cutIn, cutOut, true, true );
+    ASSERT_TRUE( step.wrapped );
+    ASSERT_EQ( cutOut - cutIn + 1, step.wrapWidth );
+    ASSERT_EQ( 0, static_cast<int>( step.position ) );
+}
+
+TEST( PlaybackConformDropFrame, R32FixIteration2AConformedTwoFrameLoopKeepsTheSourcePace )
+{
+    // adversary A2 on 03850f7b, its input: 60 fps conformed to 24, Cut In 1, Cut Out 2, Loop and Drop Frame on, 8 ms polls,
+    // immediate renders and paints, no debt. playbackHandling modelled: the outer branch (whole-frame grantLoopWrap, then the
+    // slider reset to the integer cut-in) when outerLastFrameBranchHandlesTick says so, else the conformed drop-frame engine.
+    // The old outer rule (slider >= cutOut - 1) is run beside it as the contrast: it lost the phase and a credit every lap.
+    for( const bool oldOuterRule : { false, true } )
+    {
+        const int cutIn = 1, cutOut = 2;
+        playback_native_pace::NativePaceGuard guard;
+        guard.reset();
+        double position = 0.0, nowMs = 0.0, debt = 0.0;
+        int lastPresented = 0;
+        long transitions = 0;
+        for( int t = 1; nowMs < 60000.0; ++t )
+        {
+            nowMs += 8.0;
+            const int slider = static_cast<int>( position );
+            const bool outer = oldOuterRule ? slider >= cutOut - 1
+                                            : playback_frame_range::outerLastFrameBranchHandlesTick( slider, cutOut, true, true, true );
+            if( outer )
+            {
+                if( !guard.grantLoopWrap( nowMs, 24.0 ) ) continue;
+                position = cutIn - 1;   // setValue( cutIn ): the slider signal resets m_newPosDropMode to the integer
+            }
+            else
+            {
+                const double granted = guard.grant( 24.0 * 8.0 / 1000.0, nowMs, 24.0 );
+                if( t == 1 ) guard.notePresent( nowMs, 24.0 );
+                position = playback_frame_range::advanceDropFrameTick(
+                    position, playback_frame_range::conformDropFrameDelta( position, granted, true, debt, true ),
+                    cutIn, cutOut, true, true ).position;
+            }
+            const int presented = static_cast<int>( position );
+            if( presented != lastPresented ) { ++transitions; lastPresented = presented; }
+        }
+        const double fps = transitions * 1000.0 / nowMs;
+        if( oldOuterRule ) ASSERT_TRUE( fps < 23.5 );                  // the A2 shape: about 22.3 fps
+        else ASSERT_TRUE( fps > 23.9 && fps < 24.1 );                  // every presented frame at the conform pace
+    }
+}
+
 TEST( PlaybackConformDropFrame, R24AConformedPlayWithSubPeriodGuiLateTicksPresentsEveryFrame )
 {
     // The engine end to end: the pace guard at 24 fps, an 8 ms poll, and every 97th tick a GUI-late tick of 50..82 ms

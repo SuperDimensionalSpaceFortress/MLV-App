@@ -12432,8 +12432,11 @@ void MainWindow::playbackHandling(int timeDiff)
         // (r1 venue: Reached at 480 frames, seen at 615). Once the required source frames are consumed, hold.
         if( m_automationPacingIsolated && mlvappPlaybackUnpacedRequested() && programmaticPlayConsumed() ) return;
 
-        //when on last frame
-        if( ui->horizontalSliderPosition->value() >= ui->spinBoxCutOut->value() - 1 )
+        //when on last frame (r32 fix iteration 2, adversary A1 + A2 on 03850f7b: under conform with Drop Frame and Loop the
+        //drop-frame engine owns the wrap from the last frame -- see playback_frame_range::outerLastFrameBranchHandlesTick)
+        if( playback_frame_range::outerLastFrameBranchHandlesTick(
+                ui->horizontalSliderPosition->value(), ui->spinBoxCutOut->value(),
+                ui->actionDropFrameMode->isChecked(), ui->actionLoop->isChecked(), playbackConformActive() ) )
         {
             if( ui->actionLoop->isChecked() )
             {

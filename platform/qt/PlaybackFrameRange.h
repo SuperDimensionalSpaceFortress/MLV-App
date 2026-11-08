@@ -304,6 +304,22 @@ inline DropFrameTickResult advanceDropFrameTick(
     return result;
 }
 
+// HFR-NATIVE-60FPS-FULLRES-1 r32 fix iteration 2 (adversary A1 + A2 on 03850f7b): whether MainWindow::playbackHandling's outer
+// "on the last frame" branch (a whole-frame grantLoopWrap, then setValue(cut-in), whose slider signal resets m_newPosDropMode to
+// the integer cut-in) handles this tick. With presentLastFrame the conformed drop-frame engine now reaches the cut's last frame,
+// so that branch would take the Loop wrap from it: without the conform presentation gate (A1: an unpainted 719 is replaced by
+// 0) and discarding the sub-frame phase plus one extra whole credit per lap (A2: a two-frame cut played at about 22.3 fps).
+// Under conform with Drop Frame and Loop, a playhead exactly on the last frame is the drop-frame engine's: advanceDropFrameTick
+// wraps once the position is past it, phase kept, through conformDropFrameDelta's gate. A playhead PAST the last frame (Cut Out
+// moved below it) still goes to cut-in through the outer branch, as does every non-conform, non-drop or non-loop tick.
+inline bool outerLastFrameBranchHandlesTick( int sliderValue, int cutOutValue, bool dropFrameMode, bool loopEnabled,
+                                             bool conformActive )
+{
+    if( sliderValue < cutOutValue - 1 ) return false;
+    if( dropFrameMode && loopEnabled && conformActive && sliderValue == cutOutValue - 1 ) return false;
+    return true;
+}
+
 // HFR-NATIVE-60FPS-FULLRES-1 r24 (key3 B1 M-HFR-CONFORM-SKIP, hub ruling 2026-11-07): the frame delta a drop-frame tick
 // applies, given the share \a grantedFrames the pace guard granted it at \a currentPosition (m_newPosDropMode).
 //

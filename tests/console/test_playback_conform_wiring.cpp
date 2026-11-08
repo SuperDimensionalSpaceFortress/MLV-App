@@ -175,6 +175,15 @@ TEST(PlaybackConformWiring, DropFrameTickQuantisesTheConformedCatchupToWholeFram
         "                        ui->actionLoop->isChecked(),\n"
         "                        playbackConformActive() );")));
     ASSERT_TRUE(body.indexOf(QStringLiteral("playbackConformActive() );   // r32 (adversary A1 on 2e0a3985)"), body.indexOf(call)) > body.indexOf(call));
+    // r32 fix iteration 2 (adversary A1 + A2 on 03850f7b): the outer "on the last frame" branch defers the conformed Drop Frame
+    // Loop wrap to that engine, and it runs before the engine (the else branch holds the drop-frame tick)
+    const QString outer = QStringLiteral(
+        "        if( playback_frame_range::outerLastFrameBranchHandlesTick(\n"
+        "                ui->horizontalSliderPosition->value(), ui->spinBoxCutOut->value(),\n"
+        "                ui->actionDropFrameMode->isChecked(), ui->actionLoop->isChecked(), playbackConformActive() ) )");
+    ASSERT_EQ(1, countOccurrences(body, outer));
+    ASSERT_TRUE(body.indexOf(outer) < body.indexOf(call));
+    ASSERT_EQ(0, countOccurrences(body, QStringLiteral("if( ui->horizontalSliderPosition->value() >= ui->spinBoxCutOut->value() - 1 )")));
     // r28 (CoS B1 6714996522 on c4efe7e3): the gate keys off the frame DISPLAYED, never off one drawFrameReady accepted but has
     // not shown. finishPresentedFrame records it before its tail advance; a display change clears it with the accepted frame.
     {
