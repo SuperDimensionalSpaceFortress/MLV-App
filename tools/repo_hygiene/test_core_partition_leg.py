@@ -2630,6 +2630,13 @@ LATE_READ_SCENARIOS = {
     "gone-key-relisted-other-exe": {"procs": [_APP, *_GONE_KEY_P0_B, {"id": 300, "from": 4, "to": 99, "goneAt": 999, "startSec": 1, "exe": "other"}]},
     # the pinned control: the app's handle is held (the pid cannot be reused while it is), alive until enumeration 10
     "pid-pinned-control": {"sleepMs": 250, "stopAt": 12, "procs": [{"id": 5000, "from": 1, "to": 9, "goneAt": 10, "startSec": 1}]},
+    # r2 (Dot pr-777 I1): the path branch alone. Another image takes the pid with the app's exact start, so only the Path read on the pid differs.
+    "pid-reused-same-start-other-path": {"sleepMs": 250, "stopAt": 12, "procs": [_REUSED_APP, {**_REUSER, "exe": "other", "startBeforeFirstPollMs": None, "startSec": 1}]},
+    # r2 (Dot pr-777 I1): HasExited reads false on every poll to enumeration 9, and from enumeration 4 on ONE of the two fresh identity reads fails (the other
+    # reads and matches). Pinned (a held handle): the fallback keeps stamping it alive. Unpinned: no new alive stamp, and no exit either, until the pid is free.
+    **{f"id-{what}-unread-{pin}": {"sleepMs": 250, "stopAt": 12, "procs": [{**base, f"id{what.capitalize()}FailFrom": 4}]}
+       for what in ("path", "start")
+       for pin, base in (("pinned", {"id": 5000, "from": 1, "to": 9, "goneAt": 10, "startSec": 1}), ("unpinned", {**_REUSED_APP, "to": 9, "goneAt": 10}))},
     **{f"clock-back-path-{ms}": {"stepMs": ms, "procs": [{**_CLOCK_APP, "pathFail": 1, "pathMode": "empty"}]} for ms in CLOCK_STEPS_MS},
     **{f"clock-back-start-{ms}": {"stepMs": ms, "procs": [{**_CLOCK_APP, "startFail": 1}]} for ms in CLOCK_START_UNREAD_STEPS_MS},
 }
@@ -2656,11 +2663,11 @@ $global:cpDoubles = @(foreach ($s in @($global:cpSpec.procs)) {
     $d | Add-Member -MemberType ScriptProperty -Name Handle -Value { if ($this.cpS.handleFail) { throw [ComponentModel.Win32Exception]::new(5) }; [IntPtr]1 }
     $d | Add-Member -MemberType ScriptProperty -Name Path -Value {
         $s = $this.cpS
-        if ((Test-CpFails $s.pathFail $s.pathFailFrom) -or $global:cpPoll -eq $s.pathFailAt) { if ($s.pathMode -eq 'throw') { throw [ComponentModel.Win32Exception]::new(5) }; return '' }
+        if ((Test-CpFails $s.pathFail $s.pathFailFrom) -or $global:cpPoll -eq $s.pathFailAt -or ($this.cpFresh -and (Test-CpFails $null $s.idPathFailFrom))) { if ($s.pathMode -eq 'throw') { throw [ComponentModel.Win32Exception]::new(5) }; return '' }
         if ($s.exe -eq 'other') { 'C:\elsewhere\mlvfake.exe' } else { $env:MLV_CP_EXE } }
     $d | Add-Member -MemberType ScriptProperty -Name StartTime -Value {
         $s = $this.cpS
-        if ((Test-CpFails $s.startFail $s.startFailFrom) -or $global:cpPoll -eq $s.startFailAt) { throw [ComponentModel.Win32Exception]::new(5) }
+        if ((Test-CpFails $s.startFail $s.startFailFrom) -or $global:cpPoll -eq $s.startFailAt -or ($this.cpFresh -and (Test-CpFails $null $s.idStartFailFrom))) { throw [ComponentModel.Win32Exception]::new(5) }
         if ($null -ne $s.recycleAt -and $global:cpPoll -ge $s.recycleAt) { if ($null -eq $global:cpNew) { $global:cpNew = [DateTime]::UtcNow.AddSeconds(3) }; return $global:cpNew }
         if ($null -ne $s.startBeforeFirstPollMs) { return $global:cpT1.AddMilliseconds(-$s.startBeforeFirstPollMs) }
         $global:cpLaunch.AddSeconds($s.startSec) }
@@ -2668,9 +2675,11 @@ $global:cpDoubles = @(foreach ($s in @($global:cpSpec.procs)) {
 # CORE-PARTITION-HELPER-PID-REUSE-1: Get-Process -Id is the pid's occupant now (never counted as an enumeration): the double listed on that pid at this count, or
 # one whose idFrom/idTo say it holds the pid without being listed by name (another executable on the pid). byPid: no handle is held on the double, so its
 # HasExited, like a real Process's with no handle, opens the pid and reads whatever process holds it now (alive until that occupant's goneAt).
+# r2 (Dot pr-777 I1): -Id returns a fresh object (a copy of the occupant, marked cpFresh), as the real cmdlet does, so idPathFailFrom/idStartFailFrom fail
+# only the identity re-read's Path or StartTime on that fresh object from that enumeration count on, never the listing's reads or the liveness query.
 function Get-CpOccupant([int]$Id) { @($global:cpDoubles | Where-Object { $_.Id -eq $Id -and $global:cpPoll -ge $(if ($null -ne $_.cpS.idFrom) { $_.cpS.idFrom } else { $_.cpS.from }) -and $global:cpPoll -le $(if ($null -ne $_.cpS.idTo) { $_.cpS.idTo } else { $_.cpS.to }) }) | Select-Object -Last 1 }
 function Get-Process { [CmdletBinding()] param([string]$Name, [int]$Id)
-    if ($PSBoundParameters.ContainsKey('Id')) { return (Get-CpOccupant $Id) }
+    if ($PSBoundParameters.ContainsKey('Id')) { $o = Get-CpOccupant $Id; if ($null -eq $o) { return }; $f = $o.psobject.Copy(); $f | Add-Member -NotePropertyName cpFresh -NotePropertyValue 1; return $f }
     $global:cpPoll++
     if ($global:cpPoll -eq 1) { $global:cpT1 = [DateTime]::UtcNow }
     [IO.File]::AppendAllText($env:CP_POLLS, "$([DateTime]::UtcNow.Ticks)`n")
@@ -3146,6 +3155,54 @@ $out | ConvertTo-Json -Compress
                 self.assertLessEqual(app["goneMs"], ms[10], case)
                 self.assertTrue([m for m in case["appSampleMs"] if m > ms[3]], f"the live app's samples were not credited: {case}")
         self.assertIn(self.late_read("pid-pinned-control")["vwhy"], self.ACCEPTED)
+
+    def test_pid_reuse_r2_a_successor_with_the_same_start_at_another_path_ends_the_instance_at_the_reuse(self) -> None:
+        """r2 (Dot pr-777 I1, hub ACK 6724631958): the path branch of the identity re-read on its own. The process that takes the unpinned app's pid at
+        enumeration 4 has the app's exact start ticks but another image path, so the start read matches and only the Path read differs. The first poll after
+        the reuse must end the instance there, as in the other-image case; without the path comparison it stays alive through the successor's life."""
+        case = self.late_read("pid-reused-same-start-other-path")
+        app, ms = case["firstApp"], case["pollsMs"]
+        self.assertEqual([case["app"], case["instances"], case["unidentified"]], [5000, [5000], []], case)
+        self.assertLessEqual(app["aliveMs"], ms[3], f"a poll that read another path on the pid (same start) stamped the measured app alive: {case}")
+        self.assertIsNotNone(app["goneMs"], case)
+        self.assertGreaterEqual(app["goneMs"], ms[3], case)
+        self.assertLessEqual(app["goneMs"], ms[4], f"the measured app did not end at the first poll that read another path on its pid: {case}")
+        self.assertEqual([m for m in case["appSampleMs"] if m > ms[3]], [], f"samples taken after the reuse were credited to the measured app: {case}")
+        self.assertIs(app["pinned"], False, case)
+        self.assertEqual(case["vwhy"], "measured-app-identity-unpinned", case)
+
+    def test_pid_reuse_r2_a_partial_fresh_identity_read_after_hasexited_false_keeps_a_pinned_app_alive(self) -> None:
+        """r2 (Dot pr-777 I1): the pinned fallback. HasExited reads false on every poll; from enumeration 4 on, one fresh identity read (the Path, or the start)
+        fails and the other reads and matches. A held handle keeps the pid from being reused, so the process is still the app: every poll stamps it alive
+        through enumeration 9, it is seen gone at the first poll after it exits, and the run is accepted. Without the pinned fallback no poll after
+        enumeration 3 would stamp it alive."""
+        for mode in ("id-path-unread-pinned", "id-start-unread-pinned"):
+            with self.subTest(mode=mode):
+                case = self.late_read(mode)
+                app, ms = case["firstApp"], case["pollsMs"]
+                self.assertEqual([case["app"], case["instances"], case["unidentified"]], [5000, [5000], []], case)
+                self.assertIs(app["pinned"], True, case)
+                self.assertGreaterEqual(app["aliveMs"], ms[8], f"a pinned app whose fresh identity read failed once per poll was not stamped alive: {case}")
+                self.assertGreaterEqual(app["goneMs"], ms[9], case)
+                self.assertLessEqual(app["goneMs"], ms[10], case)
+                self.assertTrue([m for m in case["appSampleMs"] if m > ms[3]], f"the pinned live app's samples were not credited: {case}")
+                self.assertIn(case["vwhy"], self.ACCEPTED, case)
+
+    def test_pid_reuse_r2_a_partial_fresh_identity_read_after_hasexited_false_gives_an_unpinned_app_no_new_alive_stamp(self) -> None:
+        """r2 (Dot pr-777 I1): the unpinned branch. The same polls on an app with no held handle: HasExited (which opens the pid) reads false, but one fresh
+        identity read fails, so nothing says the pid's occupant is still the app. The poll is unknown: no new alive stamp (aliveMs stays at the last poll
+        before enumeration 4, and no sample after it is credited) and no exit either (the instance stays tracked until the pid is free, then it is gone)."""
+        for mode in ("id-path-unread-unpinned", "id-start-unread-unpinned"):
+            with self.subTest(mode=mode):
+                case = self.late_read(mode)
+                app, ms = case["firstApp"], case["pollsMs"]
+                self.assertEqual([case["app"], case["instances"], case["unidentified"]], [5000, [5000], []], case)
+                self.assertIs(app["pinned"], False, case)
+                self.assertLessEqual(app["aliveMs"], ms[3], f"an unpinned app whose fresh identity read failed was stamped alive: {case}")
+                self.assertEqual([m for m in case["appSampleMs"] if m > ms[3]], [], f"samples taken while the unpinned app's identity was unread were credited: {case}")
+                self.assertGreaterEqual(app["goneMs"], ms[9], f"a failed identity read on an unpinned app was recorded as its exit: {case}")
+                self.assertLessEqual(app["goneMs"], ms[10], case)
+                self.assertEqual(case["vwhy"], "measured-app-identity-unpinned", case)
 
     def test_handover_a_process_on_a_recycled_tracked_pid_keeps_its_real_first_sight(self) -> None:
         """The same P2 alive and readable from enumeration 6: its first sight is enumeration 4, the pass that first listed it, not one pass late."""

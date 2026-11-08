@@ -5556,12 +5556,14 @@ public sealed class MlvCorePartitionLoad {
             # A failed query proves neither: the getter's throw reaches here as $null, not through the catch. That is no exit, since the seen key would stop the process
             # being tracked again and the job accepts an observed exit as coverage; and it is no alive stamp, since it can be a successor this user cannot open.
             $gone = $null; try { $q.p.Refresh(); $gone = $q.p.HasExited } catch { }
-            # CORE-PARTITION-HELPER-PID-REUSE-1 (adversary A1 on 74c7d7d3, #696 r14b): with no handle held ($q.h) the query above opens the pid, so once the pid is
-            # reused it reads the new process. Every poll that does not see it gone re-reads the birth identity on the pid AFTER that query, through a fresh
-            # process object (StartTime is cached by an object after its first read: r5 sol B1), and compares it as the tracking key does (start ticks, the
-            # exe's path). A start or a path read that differs is another process on the pid: gone at this poll, so nothing after it is credited. A read that
-            # fails proves neither; only a held handle (pinned: it keeps the pid from being reused) then vouches for an alive. A successor with the same start
-            # and path cannot be told from the process by any read on the pid (adversary A1 on aa71dd11), so the job refuses a measured app not pinned.
+            # CORE-PARTITION-HELPER-PID-REUSE-1 (adversary A1 on 74c7d7d3, #696 r14b): for a process tracked with no handle held ($q.r.pinned false: its handle
+            # did not open when it was tracked) the query above opens the pid, so once the pid is reused it reads the new process. So every poll that does not see
+            # it gone, pinned or not, re-reads the birth identity on the pid AFTER that query, through a fresh process object (StartTime is cached by an object
+            # after its first read: r5 sol B1), and compares it as the tracking key does (start ticks, the exe's path). Three outcomes: a start or a path read
+            # that differs is another process on the pid, so it is gone at this poll and nothing after it is credited; a start and a path that both read and
+            # match leave the query's answer; otherwise (a read failed) only a held handle ($q.r.pinned: it keeps the pid from being reused) leaves it, and with
+            # none the poll is unknown ($gone $null: no alive stamp and no exit). A successor with the same start and path cannot be told from the process by
+            # any read on the pid (adversary A1 on aa71dd11), so the job refuses a measured app not pinned.
             if (!$gone) {
                 $f = $s = $x = $null; try { $f = Get-Process -Id $q.r.pid -ea 0; $s = $f.StartTime.ToUniversalTime().Ticks } catch { }; try { $x = [string]$f.Path } catch { }
                 if (($s -and $s -ne $q.r.startUtcTicks) -or ($x -and $x -ine $exe)) { $gone = $true } elseif (!($s -and $x -or $q.r.pinned)) { $gone = $null }
@@ -5571,7 +5573,8 @@ public sealed class MlvCorePartitionLoad {
                 $q.r.lastSeenUtcTicks = & $clk; $q.r.aliveMs = $mo; if ($k -eq $own -and $loadOn) { $lb = $bn }
             } elseif ($gone) {
                 if ($k -eq $own) { if ($loadOn) { $q.r.loadJoined = $ld.Halt(); $loadOn = $false; & $lc $q.r }; $own = $null }
-                # r5: 2 marks a tracked key whose process has exited (on its held handle), so a later listing that carries it is another process (seen below)
+                # r5: 2 marks a retired tracked key: its liveness query saw the process exit, or (CORE-PARTITION-HELPER-PID-REUSE-1) the identity re-read
+                # above read another process on its pid. Either way a later listing that carries the key is another process (seen below).
                 $q.r.goneUtcTicks = & $clk; $q.r.goneMs = & $ms; $live.Remove($k); $seen[$k] = 2
             }
         }
