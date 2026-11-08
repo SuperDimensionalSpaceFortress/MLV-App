@@ -195,9 +195,10 @@ def _popen_pwsh(probe: Path, counted: bool = True) -> "subprocess.Popen":
     _collect_counts: the witnesses count LOGICAL probes, and a recovered re-run must not read as an extra one -- adversary r1 A3)."""
     if counted:
         _PWSH_SPAWNS.append(probe.name)
+    launched = time.monotonic()  # taken BEFORE the process exists (pass-3 A2): a parent stalled inside Popen() must not shorten the child's measured life
     proc = subprocess.Popen([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-File", str(probe)],
                             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-    proc.started_at = time.monotonic()  # read by _collect_counts for its typed timeout message
+    proc.started_at = launched  # read by _collect_counts for its typed timeout message and by _probe_lasted
     # CI-FLAKE-PROMPT-LINT-PWSH-RUNTIME-LOAD-1: when the child ENDED, so _collect_counts can tell a death inside the start-up window from a late one
     # even though the shards are collected one after another (collecting late must not make an early crash look late).
     proc.ended_at = None
@@ -451,10 +452,14 @@ def _run_retrying_start_fault(run, name: str) -> "subprocess.CompletedProcess":
     around the call) call it ONCE more. Two start faults raise a LintProbeStartFault naming both; anything else is returned as it came, so the
     caller's own return-code check still fails a genuine lint error exactly as before. A TimeoutExpired from `run` propagates and is not retried."""
     details = []
+    spawned = len(_PWSH_SPAWNS)
     for attempt in (1, 2):
         began = time.monotonic()
         done = run()
         lasted = time.monotonic() - began
+        if attempt == 2 and len(_PWSH_SPAWNS) > spawned + 1 and name in _PWSH_SPAWNS[spawned + 1:]:
+            # pass-3 A3: the re-run is the same LOGICAL probe; the differential witnesses and the 28-probe ceiling count _PWSH_SPAWNS, so drop its extra entry
+            del _PWSH_SPAWNS[len(_PWSH_SPAWNS) - 1 - _PWSH_SPAWNS[::-1].index(name)]
         if done.returncode == 0 or not _is_start_crash(done, lasted):
             return done
         details.append(f"attempt {attempt}: rc={done.returncode} after {lasted:.1f} s: {(done.stderr or '').strip() or '<no stderr>'}")
@@ -493,8 +498,11 @@ def _collect_counts(proc: "subprocess.Popen", expected: int, deadline: float | N
         try:
             counts = _collect_counts_once(again, expected, deadline)
             ended = getattr(again, "ended_at", None)
-            if isinstance(ended, (int, float)) and ended > deadline:  # adversary pass 2 A1: an exited probe is drained without a timeout; its recorded end proves it was in time
-                raise AssertionError(f"lint probe {probe.name} ({expected} rows): the one re-probe finished {ended - deadline:.1f} s after the shared deadline, so its result is "
+            # adversary pass 2 A1: an exited probe is drained without a timeout, so its recorded end proves it was in time. Pass 3 A1: with no recorded end (the
+            # watcher thread could not start) the clock at collection stands in for it, with 0.5 s of slack for the drain itself.
+            over = ended - deadline if isinstance(ended, (int, float)) else time.monotonic() - deadline - 0.5
+            if over > 0:
+                raise AssertionError(f"lint probe {probe.name} ({expected} rows): the one re-probe finished {over:.1f} s after the shared deadline, so its result is "
                                      f"not accepted; attempt 1 was a start fault: {first.kind}; {first.detail}")
             return counts
         except LintProbeStartFault as second:
@@ -6039,6 +6047,71 @@ class CollectCountsRuntimeLoadFaultTests(unittest.TestCase):
         self.assertIn("The given assembly name was invalid", message, "attempt 1's start fault is still named")
         counts, message, _, _ = self._collect(self._fault(), [self.Scripted(0, "[1]", "", lasted=9.0)], deadline_in=10.0)
         self.assertEqual([1], counts, "a re-probe that ended inside the deadline stands")
+
+    def test_adversary_pass3_a1_a_re_probe_with_no_recorded_end_is_judged_by_the_clock_at_collection(self):
+        """Adversary pass 3 A1: with no exit watcher (the thread could not start) an exited re-probe is drained; if it is collected after the deadline it is not accepted."""
+        clock = [1000.0]
+
+        class NoWatcher(self.Scripted):
+            def __init__(self):
+                super().__init__(0, "[1]", "")
+                self.ended_at = None
+
+            def communicate(self, timeout=None):
+                clock[0] = 1002.0  # drained at 1002 against a deadline of 1001
+                return self._streams
+
+        with mock.patch.object(sys.modules[__name__], "_popen_pwsh", lambda probe, counted=True: NoWatcher()), \
+                mock.patch.object(time, "monotonic", lambda: clock[0]), contextlib.redirect_stderr(io.StringIO()):
+            with self.assertRaises(AssertionError) as caught:
+                _collect_counts(self._fault(), 1, 1001.0)
+        self.assertIn("after the shared deadline", str(caught.exception))
+        clock[0] = 1000.0
+
+        class QuickNoWatcher(NoWatcher):
+            def communicate(self, timeout=None):
+                clock[0] = 1001.2  # 0.2 s past the deadline: inside the drain slack, accepted
+                return self._streams
+
+        with mock.patch.object(sys.modules[__name__], "_popen_pwsh", lambda probe, counted=True: QuickNoWatcher()), \
+                mock.patch.object(time, "monotonic", lambda: clock[0]), contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual([1], _collect_counts(self._fault(), 1, 1001.0))
+
+    def test_adversary_pass3_a2_the_start_time_is_taken_before_the_process_is_created(self):
+        """Adversary pass 3 A2: a parent stalled inside Popen() must not shrink the child's measured life; the lifetime runs from BEFORE the launch."""
+        clock = [1000.0]
+
+        class StalledPopen:
+            def __init__(self, *args, **kwargs):
+                clock[0] += 6.0  # the parent was descheduled for 6 s while the child ran and died
+                self.returncode = -6
+
+            def wait(self, timeout=None):
+                return self.returncode
+
+        with mock.patch.object(subprocess, "Popen", StalledPopen), mock.patch.object(time, "monotonic", lambda: clock[0]):
+            proc = _popen_pwsh(Path("stalled-probe.ps1"), counted=False)
+            proc.exit_watch.join(5)
+            lasted = _probe_lasted(proc)
+        self.assertEqual(6.0, lasted)
+        self.assertFalse(_is_start_crash(subprocess.CompletedProcess([], -6, stdout="", stderr=self.REAL_STDERR), lasted), "a six-second life is not a start-up death")
+
+    def test_adversary_pass3_a3_a_recovered_foreground_re_run_is_not_counted(self):
+        """Adversary pass 3 A3: the foreground re-run (word lists) starts a second pwsh through _run_pwsh; the witnesses and the 28-probe ceiling count logical probes."""
+        results = iter([subprocess.CompletedProcess([], -6, stdout="", stderr=self.REAL_STDERR), subprocess.CompletedProcess([], 0, stdout="{}", stderr="")])
+        before = len(_PWSH_SPAWNS)
+
+        def run():
+            _PWSH_SPAWNS.append("lists-probe.ps1")
+            return next(results)
+
+        try:
+            with contextlib.redirect_stderr(io.StringIO()):
+                done = _run_retrying_start_fault(run, "lists-probe.ps1")
+            self.assertEqual(0, done.returncode)
+            self.assertEqual(["lists-probe.ps1"], _PWSH_SPAWNS[before:], "one logical probe, however many times it was run")
+        finally:
+            del _PWSH_SPAWNS[before:]
 
     def test_adversary_a3_the_re_probe_is_not_counted_as_a_second_logical_probe(self):
         """Adversary r1 A3: _PWSH_SPAWNS is what the differential witnesses count (one probe per distinct lint/corpus); a recovered re-probe must not add to it."""
