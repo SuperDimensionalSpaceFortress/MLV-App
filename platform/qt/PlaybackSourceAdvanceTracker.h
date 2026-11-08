@@ -220,8 +220,21 @@ using Sink = void (*)( void *context, uint64_t serial );
 struct SinkSlot { Sink sink = nullptr; void *context = nullptr; };
 inline SinkSlot &sinkSlot() { static SinkSlot slot; return slot; }
 inline void setSink( Sink sink, void *context ) { SinkSlot &slot = sinkSlot(); slot.sink = sink; slot.context = context; }
+/*! r29 fix iteration 2 (adversary A1 on 07226bc0): a paint inside an offscreen grab (QWidget::grab of the viewport, which renders the
+ *  GL viewport's FBO or the scene into a pixmap without composing it; the GL window's capture paintGL before its swap) is not a display.
+ *  While a scope is open, reports are dropped; the frame stays waiting and the normal paint that follows credits it. GUI thread only. */
+inline int &offscreenDepth() { static int depth = 0; return depth; }
+class OffscreenPaintScope
+{
+public:
+    OffscreenPaintScope() { ++offscreenDepth(); }
+    ~OffscreenPaintScope() { --offscreenDepth(); }
+    OffscreenPaintScope( const OffscreenPaintScope & ) = delete;
+    OffscreenPaintScope &operator=( const OffscreenPaintScope & ) = delete;
+};
 inline void notePainted( uint64_t serial )
 {
+    if( offscreenDepth() > 0 ) return;
     const SinkSlot slot = sinkSlot();
     if( slot.sink && serial != 0 ) slot.sink( slot.context, serial );
 }

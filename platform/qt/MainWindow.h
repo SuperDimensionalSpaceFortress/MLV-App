@@ -1189,6 +1189,7 @@ private:
     quint64 m_conformPaintWaitEscapedSerial = 0;
     static void playbackPaintCreditSink( void *context, uint64_t serial );
     void notePlaybackSmokePainted( uint64_t serial );
+    QPixmap grabGraphicsViewportOffscreen();
     int m_lastPlaybackAudioSyncFrame = -1;
     double m_lastPlaybackAudioSyncTime = 0.0;
     bool m_playbackSmokeActive = false;

@@ -2018,7 +2018,11 @@ bool GpuDisplayWindow::grabPresentedFramebufferIfActive(QImage *outImage,
     win->m_captureReadbackSucceeded = false;
     win->m_captureReadbackImage = QImage();
     win->m_captureReadbackError.clear();
-    win->paintGL();
+    // HFR-NATIVE-60FPS-FULLRES-1 r29 fix iteration 2 (adversary A1 on 07226bc0): drawn here, on screen only once swapped below
+    {
+        const playback_paint_credit::OffscreenPaintScope offscreen;   // the swap below presents it; credited after it
+        win->paintGL();
+    }
     win->m_captureReadbackRequested = false;
 
     if ( presentedSerial ) *presentedSerial = win->m_presentedSerial;
@@ -2037,6 +2041,7 @@ bool GpuDisplayWindow::grabPresentedFramebufferIfActive(QImage *outImage,
     // swap now so the window's own swapchain reflects exactly what was just captured,
     // making this a real present rather than a side-channel readback.
     swapOutsidePaintEventAndRecord(win, glContext);
+    if ( win->m_presentedSerialValid ) playback_paint_credit::notePainted( win->m_presentedSerial );   // r29: presented by that swap
     if ( madeCurrent ) win->doneCurrent();
 
     if ( outImage ) *outImage = win->m_captureReadbackImage;

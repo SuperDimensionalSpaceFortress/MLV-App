@@ -165,9 +165,10 @@ TEST(PlaybackConformEnvOverride, TelemetryCarriesTheOverride)
     const QString source = readRepoFile(QStringLiteral("platform/qt/MainWindow.cpp"));
     const int at = source.indexOf(QStringLiteral("playback_smoke.conform session=%1"));
     ASSERT_TRUE(at >= 0);
-    const QString line = source.mid(at, 2000);
+    const QString line = source.mid(at, 4000);
     ASSERT_TRUE(line.contains(QStringLiteral("conform_env_override=%21")));
-    ASSERT_TRUE(line.contains(QStringLiteral(".arg( playback_conform::conformEnvOverride() );")));
+    // HFR-NATIVE-60FPS-FULLRES-1 r29: no longer the line's last argument (the painted ends and paint counts follow it)
+    ASSERT_TRUE(line.contains(QStringLiteral(".arg( playback_conform::conformEnvOverride() )")));
     const int start = source.indexOf(QStringLiteral("playback_smoke.start session=%1"));
     ASSERT_TRUE(start >= 0);
     const int startEnd = source.indexOf(QStringLiteral(";\n"), source.indexOf(QStringLiteral("MLVAPP_RAW_UINT16_PREFETCH_DECODERS"), start));

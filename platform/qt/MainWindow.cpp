@@ -10707,7 +10707,7 @@ int MainWindow::runGuiPlaybackSmoke(const GuiPlaybackSmokeOptions & options)
          && ui->graphicsView
          && ui->graphicsView->viewport() )
         {
-            screenshot = ui->graphicsView->viewport()->grab();
+            screenshot = grabGraphicsViewportOffscreen();
             screenshotMethod = QStringLiteral("app_internal_gl_viewport_grab");
         }
         if( screenshot.isNull() && m_pGraphicsItem )
@@ -10716,7 +10716,7 @@ int MainWindow::runGuiPlaybackSmoke(const GuiPlaybackSmokeOptions & options)
         }
         if( screenshot.isNull() && ui->graphicsView && ui->graphicsView->viewport() )
         {
-            screenshot = ui->graphicsView->viewport()->grab();
+            screenshot = grabGraphicsViewportOffscreen();
             screenshotMethod = QStringLiteral("app_internal_viewport_grab");
         }
 
@@ -11311,7 +11311,7 @@ int MainWindow::runGuiPlaybackSmoke(const GuiPlaybackSmokeOptions & options)
                        || GpuDisplayViewport::hasPresentedGpuReconTexture( ui->graphicsView ) )
                      && ui->graphicsView && ui->graphicsView->viewport() )
                     {
-                        contactFrameImage = ui->graphicsView->viewport()->grab().toImage();
+                        contactFrameImage = grabGraphicsViewportOffscreen().toImage();
                         contactFrameSource = QStringLiteral("app_internal_gl_viewport_grab");
                     }
                     if( contactFrameImage.isNull() && m_pGraphicsItem )
@@ -11321,7 +11321,7 @@ int MainWindow::runGuiPlaybackSmoke(const GuiPlaybackSmokeOptions & options)
                     }
                     if( contactFrameImage.isNull() && ui->graphicsView && ui->graphicsView->viewport() )
                     {
-                        contactFrameImage = ui->graphicsView->viewport()->grab().toImage();
+                        contactFrameImage = grabGraphicsViewportOffscreen().toImage();
                         contactFrameSource = QStringLiteral("app_internal_viewport_grab");
                     }
                     // r2 (A1): the presentation serial OF THE SURFACE THE IMAGE WAS READ FROM -- never inferred from
@@ -26868,6 +26868,14 @@ void MainWindow::notePlaybackSmokePainted( uint64_t serial )
     m_playbackSmokePaintCredit.notePainted( serial, mlv_stage_timing_now(), m_playbackSmokeSourceAdvance );
 }
 
+// r29 fix iteration 2 (adversary A1 on 07226bc0): every viewport grab (screenshots, contact-sheet frames) renders the GL viewport's FBO or
+// the scene into a pixmap without composing it on screen, so the paint it triggers never credits the conform tracker.
+QPixmap MainWindow::grabGraphicsViewportOffscreen()
+{
+    const playback_paint_credit::OffscreenPaintScope offscreen;
+    return ui->graphicsView->viewport()->grab();
+}
+
 void MainWindow::notePlaybackSmokePresentedFrame(
     uint64_t displayFrame,
     const RenderFrameThread::ReadyFrame &readyFrame,
@@ -29750,7 +29758,7 @@ QImage MainWindow::grabIdentityViewport( QString *reason )
     }
     if( ui->graphicsView && ui->graphicsView->viewport() )
     {
-        image = ui->graphicsView->viewport()->grab().toImage();
+        image = grabGraphicsViewportOffscreen().toImage();
         if( reason ) *reason = QStringLiteral( "graphics_view_viewport_grab" );
     }
     return image;
@@ -29885,7 +29893,7 @@ void MainWindow::noteContactSheetPresentedFrame(
        || GpuDisplayViewport::hasPresentedGpuReconTexture( ui->graphicsView ) )
      && ui->graphicsView && ui->graphicsView->viewport() )
     {
-        contactFrameImage = ui->graphicsView->viewport()->grab().toImage();
+        contactFrameImage = grabGraphicsViewportOffscreen().toImage();
         contactFrameSource = QStringLiteral("app_internal_gl_viewport_grab");
     }
     if( !gpuWindowGrabFailedClosed && contactFrameImage.isNull() && m_pGraphicsItem )
@@ -29896,7 +29904,7 @@ void MainWindow::noteContactSheetPresentedFrame(
     if( !gpuWindowGrabFailedClosed && contactFrameImage.isNull()
      && ui->graphicsView && ui->graphicsView->viewport() )
     {
-        contactFrameImage = ui->graphicsView->viewport()->grab().toImage();
+        contactFrameImage = grabGraphicsViewportOffscreen().toImage();
         contactFrameSource = QStringLiteral("app_internal_viewport_grab");
     }
 

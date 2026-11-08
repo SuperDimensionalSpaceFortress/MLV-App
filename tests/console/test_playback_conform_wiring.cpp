@@ -264,8 +264,9 @@ TEST(PlaybackConformWiring, DropFrameTickQuantisesTheConformedCatchupToWholeFram
     ASSERT_EQ(1, countOccurrences(source, QStringLiteral(
         "    m_playbackPaceGuard.reset();\n"
         "    m_conformDropDebtFrames = 0.0;   // HFR-NATIVE-60FPS-FULLRES-1 r24: no held conform frame survives a Play start or stop")));
-    // the tick's comment, the tick, the two clears: nothing else writes or reads it
-    ASSERT_EQ(4, countOccurrences(source, QStringLiteral("m_conformDropDebtFrames")));
+    // the tick's comment, the tick, the two clears, and (r29) the conform line's carried_debt read: nothing else writes or reads it
+    ASSERT_EQ(5, countOccurrences(source, QStringLiteral("m_conformDropDebtFrames")));
+    ASSERT_EQ(1, countOccurrences(source, QStringLiteral(".arg( m_conformDropDebtFrames, 0, 'f', 3 )")));
     ASSERT_TRUE(readRepoFile(QStringLiteral("platform/qt/MainWindow.h")).contains(QStringLiteral("double m_conformDropDebtFrames = 0.0;")));
     ASSERT_EQ(1, countOccurrences(body, QStringLiteral("playback_frame_range::advanceDropFrameTick(")));
     ASSERT_EQ(1, countOccurrences(body, QStringLiteral("playback_frame_range::conformDropFrameDelta(")));
