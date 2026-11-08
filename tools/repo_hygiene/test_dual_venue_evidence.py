@@ -5339,8 +5339,9 @@ class ConformArmIsHonouredTests(EvidenceFactory, ModuleMutationMixin, unittest.T
         for name, measured, outcome, needles in (
                 # r29 (adversary A2 on cf403dba): the line carries the painted coverage's ends and the engine's last target (the summary here
                 # reports source_advanced=960 from frame 0: the engine reached 959)
-                ("sound", " audio_sync_requests=0 source_advanced=959 source_fps=24.000 max_jump=1 first_frame=0 last_frame=959 engine_target=959", "PASS", ()),
-                ("sol r18 B2", " audio_sync_requests=1 source_advanced=959 source_fps=33.600 max_jump=2 first_frame=0 last_frame=959 engine_target=959", "FAIL", ("conformSourceFps le 24.72", "conformMaxJump eq 1", "conformAudioSyncRequests eq 0")),
+                # r30 (Dot D2 on 71104385): and backward (the painted frames' backward steps; 0 = no seek)
+                ("sound", " audio_sync_requests=0 source_advanced=959 source_fps=24.000 max_jump=1 first_frame=0 last_frame=959 engine_target=959 backward=0", "PASS", ()),
+                ("sol r18 B2", " audio_sync_requests=1 source_advanced=959 source_fps=33.600 max_jump=2 first_frame=0 last_frame=959 engine_target=959 backward=0", "FAIL", ("conformSourceFps le 24.72", "conformMaxJump eq 1", "conformAudioSyncRequests eq 0")),
                 ("no measured fields", "", "FAIL", ("does not carry the field",))):
             with self.subTest(name):
                 self.write_artifacts(line=hfr24, extra_log_lines=[base + measured])
@@ -12663,6 +12664,10 @@ class ConformMeasuredFieldsAreJudgedTests(unittest.TestCase):
         if measured and ends and "engine_target=" not in measured:
             m = re.search(r"source_advanced=(\d+)", measured)
             measured += f" first_frame=0 last_frame={m.group(1) if m else '1498'} engine_target=1498"
+        # r30 (Dot D2 on 71104385): the app prints backward (the painted frames' backward steps) on every conform line, and a line without it now
+        # fails closed; a measured line that does not name it carries backward=0 (no seek) unless `ends` is False.
+        if measured and ends and "backward=" not in measured:
+            measured += " backward=0"
         log = "\n".join([
             "interaction_trace event=automation.pacing_isolated site=gui-smoke-entry persisted_fps_override=0 persisted_frame_rate=24.000 drop_frame=1 settings_store=run_scoped",
             "playback_smoke.measured_session id=3",
@@ -12780,7 +12785,8 @@ class ConformMeasuredFieldsAreJudgedTests(unittest.TestCase):
         """r29 fix iteration 1 (adversary A1 on 88eea505), its literal input: frames 0..1448 painted, a seek back to 1398, 1398..1448 painted again, then
         no paint while the engine reaches 1498. The replayed forward steps inflate the coverage to 1498 (backward=1), so the count leaves a shortfall of 1
         and the 50 frames after 1448 were never shown. The ends say so directly: the engine's last target leads the last painted frame by 50, one of
-        which the engine may hold; 49 unshown frames are a jump of 50."""
+        which the engine may hold; 49 unshown frames are a jump of 50. r30 (Dot D2 on 71104385): a line with backward > 0 is no longer judged at all
+        (it fails with a typed CouldNotCheck, test_r30_dot_d2_...); the ends reading itself is pinned here with backward=0."""
         for row in self.chain(" audio_sync_requests=0 presented=1550 source_advanced=1498 span_s=62.458 source_fps=23.984 max_jump=1 wraps=0 backward=1"
                               " repeats=0 first_frame=0 last_frame=1448 engine_target=1498", ends=False):
             with self.subTest(spec=row["spec"], role=row["role"]):
@@ -12789,10 +12795,43 @@ class ConformMeasuredFieldsAreJudgedTests(unittest.TestCase):
         proc, out = run_pwsh_json(
             "$m = Get-DvCriteriaMetrics -Metrics ([pscustomobject]@{ rows = 5 }) -Playback ([pscustomobject]@{ conformLinePresent = $true; summarySession = '3';"
             " conformSession = '3'; conformSourceFps = 23.984; conformMaxJump = 1; conformAudioSyncRequests = 0; sourceAdvanced = 1499; conformSourceAdvanced = 1498;"
-            " conformFirstFrame = 0; conformLastFrame = 1448; conformEngineTarget = 1498 })\n"
+            " conformFirstFrame = 0; conformLastFrame = 1448; conformEngineTarget = 1498; conformBackward = 0 })\n"
             "$m | ConvertTo-Json -Compress -Depth 4")
         self.assertIsNotNone(out, proc.stdout + proc.stderr)
         self.assertEqual((out["conformMaxJump"], out["conformFrozenTailFrames"]), (50, 49), out)
+
+    def test_r30_dot_d2_backward_seek_evidence_is_could_not_check_never_a_frozen_tail(self) -> None:
+        """r30 (Dot D2 on 71104385), its literal input: a healthy Loop-off run paints 0..1498, seeks back to 1398 and paints through 1448. engine_target
+        is the engine's high-water (a seek back does not lower it), so E=1499, H=1498, F=0, L=1448, C=1548, max_jump=1 read maxJump=50 with 49 'frozen'
+        frames that were all painted before the seek. A run frozen at 1448 that then sought back paints the same ends, so neither can be judged:
+        backward > 0 leaves conformMaxJump absent with a typed CouldNotCheck naming the seek, never a frozen-tail figure. A backward count absent,
+        unreadable or negative is a missing number the same way; backward=0 keeps the ends reading."""
+        dot = (" audio_sync_requests=0 presented=1550 source_advanced=1548 span_s=64.542 source_fps=23.984 max_jump=1 wraps=0 backward=1"
+               " repeats=0 first_frame=0 last_frame=1448 engine_target=1498")
+        for row in self.chain(dot, ends=False):
+            with self.subTest(case="dot literal", spec=row["spec"], role=row["role"]):
+                self.assertFalse(row["pass"], row)
+                self.assertEqual(len(row["failures"]), 1, row)
+                self.assertTrue(row["failures"][0].startswith("conformMaxJump: "), row)
+                self.assertIn("stepped backward 1 time(s) (a seek back)", row["failures"][0], row)
+        for name, tail in (("no backward", ""), ("garbage backward", " backward=x"), ("negative backward", " backward=-1")):
+            line = (" audio_sync_requests=0 presented=1499 source_advanced=1498 source_fps=24.000 max_jump=1 wraps=0 repeats=0"
+                    " first_frame=0 last_frame=1498 engine_target=1498" + tail)
+            for row in self.chain(line, ends=False):
+                with self.subTest(case=name, spec=row["spec"], role=row["role"]):
+                    self.assertFalse(row["pass"], row)
+                    self.assertEqual(len(row["failures"]), 1, row)
+                    self.assertIn("no readable non-negative backward", row["failures"][0], row)
+        proc, out = run_pwsh_json(
+            "$pb = [pscustomobject]@{ conformLinePresent = $true; summarySession = '3'; conformSession = '3'; conformSourceFps = 23.984; conformMaxJump = 1;"
+            " conformAudioSyncRequests = 0; sourceAdvanced = 1499; conformSourceAdvanced = 1548; conformFirstFrame = 0; conformLastFrame = 1448;"
+            " conformEngineTarget = 1498; conformBackward = 1 }\n"
+            "$m = Get-DvCriteriaMetrics -Metrics ([pscustomobject]@{ rows = 5 }) -Playback $pb\n"
+            "$m | ConvertTo-Json -Compress -Depth 4")
+        self.assertIsNotNone(out, proc.stdout + proc.stderr)
+        self.assertIsNone(out["conformMaxJump"], out)
+        self.assertNotIn("conformFrozenTailFrames", out)
+        self.assertIn("a seek back", out["conformMaxJumpCouldNotCheck"], out)
 
     def test_a_conform_line_without_the_measured_fields_fails_closed(self) -> None:
         """A build that does not print them (or a line that dropped them) is a missing number, never a passing one: each criterion fails with the typed reason."""
@@ -12809,8 +12848,8 @@ class ConformMeasuredFieldsAreJudgedTests(unittest.TestCase):
             "$m = [pscustomobject]@{ conformSourceFps = 24.0; conformMaxJump = 1; conformAudioSyncRequests = 0; rows = 5 }\n"
             "$absent = Get-DvCriteriaMetrics -Metrics $m -Playback ([ordered]@{ conformLinePresent = $false })\n"
             "$bad = Get-DvCriteriaMetrics -Metrics $m -Playback ([ordered]@{ conformLinePresent = $true; summarySession = '3'; conformSession = '3'; conformSourceFps = 33.6; conformMaxJump = 2; conformAudioSyncRequests = 1; sourceAdvanced = 1499; conformSourceAdvanced = 1498;"
-            " conformFirstFrame = 0; conformLastFrame = 1498; conformEngineTarget = 1498 })\n"
-            "$none = Get-DvCriteriaMetrics -Metrics $m -Playback $null\n"
+            " conformFirstFrame = 0; conformLastFrame = 1498; conformEngineTarget = 1498; conformBackward = 0 })\n"
+            "$none =Get-DvCriteriaMetrics -Metrics $m -Playback $null\n"
             "[ordered]@{ absent = $absent; bad = $bad; none = $none } | ConvertTo-Json -Compress -Depth 4")
         self.assertIsNotNone(out, proc.stdout + proc.stderr)
         self.assertEqual((out["absent"]["conformSourceFps"], out["absent"]["rows"]), (None, 5), out)
@@ -12825,7 +12864,7 @@ class ConformMeasuredFieldsAreJudgedTests(unittest.TestCase):
         conformSourceFps=24, conformMaxJump=1, conformAudioSyncRequests=0 passed Get-DvCriteriaMetrics + Test-DvCriteria. Each shape now leaves the
         values absent with a typed CouldNotCheck, so every conform criterion FAILS; only a present, same-session line passes."""
         good = ("conformSourceFps = 24.0; conformMaxJump = 1; conformAudioSyncRequests = 0; sourceAdvanced = 1499; conformSourceAdvanced = 1498;"
-                " conformFirstFrame = 0; conformLastFrame = 1498; conformEngineTarget = 1498")
+                " conformFirstFrame = 0; conformLastFrame = 1498; conformEngineTarget = 1498; conformBackward = 0")
         shapes = {
             "sol literal": ("conformLinePresent = $false; summarySession = '3'; conformSession = '2'", "no playback_smoke.conform line"),
             "absent line, same session": ("conformLinePresent = $false; summarySession = '3'; conformSession = '3'", "no playback_smoke.conform line"),
