@@ -2863,6 +2863,26 @@
       "lines": [
         690
       ]
+    },
+    {
+      "path": "platform/qt/GuiPresentGapIdle.h",
+      "anchor": "if ( otherBusyMs < 0.0 ) otherBusyMs = 0.0 ;",
+      "class": "value_fallback_select",
+      "clock": "other",
+      "justification": "CPU-S1-PACE-NEXT-LEVER-1 (adversary A1 on 9bfdf8e0): OtherBusySpans::closeGap clamps a negative other-busy budget (an already-measured value from the gap clock) to 0 before it scales the named spans, so a negative budget can never subtract from a session sum. A data-validity clamp, not a proof that any stage ran.",
+      "lines": [
+        155
+      ]
+    },
+    {
+      "path": "tests/console/test_playback_smoke_gui_present_attribution_wiring.cpp",
+      "anchor": "ASSERT_TRUE ( spans . unattributedSumMs >= 0.0 ) ;",
+      "class": "not_run_proof_structural",
+      "clock": "other",
+      "justification": "CPU-S1-PACE-NEXT-LEVER-1 (adversary A1 on 9bfdf8e0): pure-function unit test of OtherBusySpans::closeGap with a synthetic negative budget (no live clock): the unattributed session sum stays non-negative. Not a proof that any stage ran.",
+      "lines": [
+        708
+      ]
     }
   ]
 }

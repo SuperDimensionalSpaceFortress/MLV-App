@@ -694,6 +694,20 @@ TEST(GuiOtherBusySplit, EndWithCountOrPastItNeverWritesPastGapMs)
     ASSERT_NEAR(3.0, spans.end(gui_present_gap::OtherBusySpan::DrawFrame, spanClock(7, 13)), 1e-9);
 }
 
+TEST(GuiOtherBusySplit, NegativeOtherBusyBudgetNeverMakesASessionSumNegative)
+{
+    // Adversary A1 on 9bfdf8e0: closeGap(-1) scaled 1 ms of named span by -1 into sumMs.
+    gui_present_gap::OtherBusySpans spans;
+    spans.openGap();
+    spans.begin(spanClock(7, 0));
+    ASSERT_NEAR(1.0, spans.end(gui_present_gap::OtherBusySpan::DrawFrame, spanClock(7, 1)), 1e-9);
+    const double rest = spans.closeGap(-1.0);
+    ASSERT_TRUE(rest >= 0.0);
+    for (int i = 0; i < gui_present_gap::OtherBusySpans::kCount; ++i)
+        ASSERT_TRUE(spans.sumMs[i] >= 0.0);
+    ASSERT_TRUE(spans.unattributedSumMs >= 0.0);
+}
+
 TEST(GuiOtherBusySplit, HandlersOpenTheirSpanFirstAndTheSummaryAppendsTheSplit)
 {
     const QString source = mainWindowSource();

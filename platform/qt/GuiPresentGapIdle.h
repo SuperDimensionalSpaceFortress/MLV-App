@@ -150,6 +150,9 @@ public:
     // named spans never exceed the gap's other busy) and return the unattributed remainder.
     double closeGap( double otherBusyMs )
     {
+        // CPU-S1-PACE-NEXT-LEVER-1 (adversary A1 on 9bfdf8e0): a negative budget is no budget; it
+        // would make the scale negative and subtract the named spans from the session sums.
+        if( otherBusyMs < 0.0 ) otherBusyMs = 0.0;
         double named = 0.0;
         for( int i = 0; i < kCount; ++i ) named += gapMs[i];
         const double scale = ( named > otherBusyMs && named > 0.0 ) ? otherBusyMs / named : 1.0;
