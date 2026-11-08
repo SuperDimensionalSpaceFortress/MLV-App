@@ -399,6 +399,7 @@ HEADERS += MainWindow.h \
            LogLineField.h \
            PlaybackWorkerJoin.h \
            PlaybackPrepInFlightGate.h \
+           PlaybackPrepOwnership.h \
            ClipOpenAbortPolicy.h \
            PlaybackPresentTrace.h \
            PlaybackSlotRelease.h \

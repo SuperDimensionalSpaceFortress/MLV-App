@@ -2803,6 +2803,86 @@
       "lines": [
         1504
       ]
+    },
+    {
+      "path": "platform/qt/GuiPresentGapIdle.h",
+      "anchor": "if ( ! ( inclusiveMs > 0.0 ) || ! std :: isfinite ( inclusiveMs ) ) inclusiveMs = 0.0 ;",
+      "class": "value_fallback_select",
+      "clock": "other",
+      "justification": "CPU-S1-RECON-UNDER-LOOK-PACE-LEVER-1 Part B: OtherBusySpans::end clamps a GUI handler span's inclusive time (wall less idle, runner sleep and paint inside it, from the QElapsedTimer gap clock) to 0 when the subtraction goes negative. A data-validity clamp on an already-measured value before it is recorded; whether the handler ran is the span's begin/end pair, never this value. r3 (adversary A1 on f9f92e09): written !(x > 0.0) || !isfinite(x) (and A4 on e7e5271e) so a NaN or infinite paint reading or budget clamps to 0 as well; still a data-validity clamp, not a proof that any stage ran.",
+      "lines": [
+        138
+      ]
+    },
+    {
+      "path": "platform/qt/GuiPresentGapIdle.h",
+      "anchor": "if ( ! ( exclusiveMs > 0.0 ) || ! std :: isfinite ( exclusiveMs ) ) exclusiveMs = 0.0 ;",
+      "class": "value_fallback_select",
+      "clock": "other",
+      "justification": "CPU-S1-RECON-UNDER-LOOK-PACE-LEVER-1 Part B: the same clamp for the span's exclusive time (inclusive less its nested spans) before it is added to the per-gap sum. A data-validity clamp, not a proof that any stage ran. r3 (adversary A1 on f9f92e09): written !(x > 0.0) || !isfinite(x) (and A4 on e7e5271e) so a NaN or infinite paint reading or budget clamps to 0 as well; still a data-validity clamp, not a proof that any stage ran.",
+      "lines": [
+        141
+      ]
+    },
+    {
+      "path": "tests/console/test_playback_smoke_gui_present_attribution_wiring.cpp",
+      "anchor": "ASSERT_NEAR ( 0.0 , target . value ( QStringLiteral ( \"llrawproc_total_ms\" ) ) . toDouble ( ) , 1 e - 9 ) ;",
+      "class": "not_run_proof_structural",
+      "clock": "other",
+      "justification": "Pure-function unit test of recon_worker_split::copyWorkerSplit on a synthetic, test-constructed QJsonObject (no live clock): asserts the copy left the target's own unprefixed key at the 0.0 the test put there, i.e. the copy never rewrites the render thread's keys. Not a proof that any stage ran.",
+      "lines": [
+        466
+      ]
+    },
+    {
+      "path": "tests/console/test_playback_smoke_gui_present_attribution_wiring.cpp",
+      "anchor": "ASSERT_NEAR ( 0.0 , target . value ( QStringLiteral ( \"dual_iso_full20_total_ms\" ) ) . toDouble ( ) , 1 e - 9 ) ;",
+      "class": "not_run_proof_structural",
+      "clock": "other",
+      "justification": "Same synthetic-input copyWorkerSplit check as the llrawproc_total_ms row above, for the full20 total key.",
+      "lines": [
+        467
+      ]
+    },
+    {
+      "path": "tests/console/test_playback_smoke_gui_present_attribution_wiring.cpp",
+      "anchor": "ASSERT_NEAR ( 0.0 , spans . gapMs [ i ] , 1 e - 9 ) ;",
+      "class": "not_run_proof_structural",
+      "clock": "other",
+      "justification": "CPU-S1-PACE-NEXT-LEVER-1 (#770 r3 advisory A1): pure-function unit test of gui_present_gap::OtherBusySpans on synthetic SpanClock values (no live clock): after end() is called with OtherBusySpan::Count and Count+1, every per-gap slot is still the 0.0 openGap() put there, i.e. an out-of-range span wrote nothing. Not a proof that any stage ran.",
+      "lines": [
+        689
+      ]
+    },
+    {
+      "path": "tests/console/test_playback_smoke_gui_present_attribution_wiring.cpp",
+      "anchor": "ASSERT_NEAR ( 0.0 , spans . sumMs [ i ] , 1 e - 9 ) ;",
+      "class": "not_run_proof_structural",
+      "clock": "other",
+      "justification": "Same synthetic OtherBusySpans check as the gapMs row above, for the session sums: gapMs[kCount] aliased sumMs[0] before the guard, so a 0.0 here is the proof the out-of-range end() wrote past nothing. Not a proof that any stage ran.",
+      "lines": [
+        690
+      ]
+    },
+    {
+      "path": "platform/qt/GuiPresentGapIdle.h",
+      "anchor": "if ( ! ( otherBusyMs > 0.0 ) || ! std :: isfinite ( otherBusyMs ) ) otherBusyMs = 0.0 ;",
+      "class": "value_fallback_select",
+      "clock": "other",
+      "justification": "CPU-S1-PACE-NEXT-LEVER-1 (adversary A1 on 9bfdf8e0): OtherBusySpans::closeGap clamps a negative other-busy budget (an already-measured value from the gap clock) to 0 before it scales the named spans, so a negative budget can never subtract from a session sum. A data-validity clamp, not a proof that any stage ran. r3 (adversary A1 on f9f92e09): written !(x > 0.0) || !isfinite(x) (and A4 on e7e5271e) so a NaN or infinite paint reading or budget clamps to 0 as well; still a data-validity clamp, not a proof that any stage ran.",
+      "lines": [
+        159
+      ]
+    },
+    {
+      "path": "tests/console/test_playback_smoke_gui_present_attribution_wiring.cpp",
+      "anchor": "ASSERT_TRUE ( spans . unattributedSumMs >= 0.0 ) ;",
+      "class": "not_run_proof_structural",
+      "clock": "other",
+      "justification": "CPU-S1-PACE-NEXT-LEVER-1 (adversary A1 on 9bfdf8e0): pure-function unit test of OtherBusySpans::closeGap with a synthetic negative budget (no live clock): the unattributed session sum stays non-negative. Not a proof that any stage ran.",
+      "lines": [
+        708
+      ]
     }
   ]
 }

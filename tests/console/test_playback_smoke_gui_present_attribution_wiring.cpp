@@ -13,13 +13,21 @@
 #include "../common/minitest.h"
 #include "../common/repo_paths.h"
 #include "../../platform/qt/GuiPresentGapIdle.h"
+#include "../../platform/qt/PlaybackPrepOwnership.h"
 #include "../../platform/qt/PreviewPaintTiming.h"
+#include "../../platform/qt/ReconWorkerSplit.h"
+
+#include <QJsonObject>
 
 #include <QFile>
 #include <QRegularExpression>
 #include <QString>
 #include <QStringList>
 #include <QTextStream>
+
+#include <cmath>
+#include <limits>
+#include <vector>
 
 namespace
 {
@@ -410,4 +418,850 @@ TEST(GuiPresentAttributionWiring, GlViewportAndGlWindowPaintsReachTheSamePaintSi
     const QString sink = readRepoFile(QStringLiteral("platform/qt/PreviewPaintTiming.h"));
     ASSERT_TRUE(sink.contains(QStringLiteral("inline Totals &totals()")));
     ASSERT_TRUE(sink.contains(QStringLiteral("~Scope()")));
+}
+
+// ---- CPU-S1-RECON-UNDER-LOOK-PACE-LEVER-1 -------------------------------------------------------------
+
+namespace
+{
+
+QString renderFrameThreadSource()
+{
+    return readRepoFile(QStringLiteral("platform/qt/RenderFrameThread.cpp"));
+}
+
+gui_present_gap::SpanClock spanClock(quint64 serial, qint64 nowMs, qint64 idleMs = 0, qint64 sleepMs = 0, double paintMs = 0.0)
+{
+    gui_present_gap::SpanClock c;
+    c.gapSerial = serial;
+    c.nowNs = nowMs * kNsPerMs;
+    c.idleNs = idleMs * kNsPerMs;
+    c.runnerSleepNs = sleepMs * kNsPerMs;
+    c.paintMs = paintMs;
+    return c;
+}
+
+} // namespace
+
+TEST(ReconWorkerSplit, CopiesOnlyTheWorkersSplitKeysUnderTheirOwnPrefix)
+{
+    // Input: the slot as the recon worker left it (its own llrawproc / full20 values) plus keys this
+    // split must not carry. The render thread's own (zero) values sit under the unprefixed keys.
+    QJsonObject worker;
+    worker.insert(QStringLiteral("llrawproc_total_ms"), 30.0);
+    worker.insert(QStringLiteral("llrawproc_dual_iso_ms"), 26.0);
+    worker.insert(QStringLiteral("dual_iso_full20_total_ms"), 25.0);
+    worker.insert(QStringLiteral("dual_iso_full20_mix_chroma_ms"), 7.0);
+    worker.insert(QStringLiteral("dual_iso_full20_valid"), true);
+    worker.insert(QStringLiteral("dual_iso_full20_threads"), 12);           // not a duration
+    worker.insert(QStringLiteral("render_thread_recon_worker_llrawproc_total_ms"), 30.0);
+    worker.insert(QStringLiteral("cpu_dualiso_recon_scale"), 1);
+    QJsonObject target;
+    target.insert(QStringLiteral("llrawproc_total_ms"), 0.0);
+    target.insert(QStringLiteral("dual_iso_full20_total_ms"), 0.0);
+    recon_worker_split::copyWorkerSplit(worker, target);
+    ASSERT_NEAR(30.0, target.value(QStringLiteral("recon_worker_llrawproc_total_ms")).toDouble(), 1e-9);
+    ASSERT_NEAR(26.0, target.value(QStringLiteral("recon_worker_llrawproc_dual_iso_ms")).toDouble(), 1e-9);
+    ASSERT_NEAR(7.0, target.value(QStringLiteral("recon_worker_dual_iso_full20_mix_chroma_ms")).toDouble(), 1e-9);
+    ASSERT_TRUE(target.value(QStringLiteral("recon_worker_dual_iso_full20_valid")).toBool());
+    ASSERT_FALSE(target.contains(QStringLiteral("recon_worker_dual_iso_full20_threads")));
+    ASSERT_FALSE(target.contains(QStringLiteral("recon_worker_render_thread_recon_worker_llrawproc_total_ms")));
+    ASSERT_FALSE(target.contains(QStringLiteral("recon_worker_cpu_dualiso_recon_scale")));
+    // The render thread's own keys are never rewritten.
+    ASSERT_NEAR(0.0, target.value(QStringLiteral("llrawproc_total_ms")).toDouble(), 1e-9);
+    ASSERT_NEAR(0.0, target.value(QStringLiteral("dual_iso_full20_total_ms")).toDouble(), 1e-9);
+}
+
+TEST(ReconWorkerSplit, AveragesAndResiduesAtEachLevelOfTheNesting)
+{
+    // Two presented frames with the split, one without (not counted). Frame values:
+    // llrawproc 40 = dark 1 + vstripes 1 + focus 1 + bad 1 + pattern_noise 1 + dual_iso 30 + chroma_smooth 1 (+4 residue);
+    // dual_iso 30 > full20 28 (+2 outside); full20 28 = pattern 1 noise 1 scratch 1 convert20 1 match 1 interp 5 fullres 2
+    // mix 10 final_blend 4 convert16 1 (+1 residue). The mix / mix_chroma leaves are reported as given (no residue).
+    QJsonObject frame;
+    const auto put = [&frame](const char *key, double v) {
+        frame.insert(recon_worker_split::prefix() + QLatin1String(key), v);
+    };
+    put("llrawproc_total_ms", 40); put("llrawproc_dark_frame_ms", 1); put("llrawproc_vertical_stripes_ms", 1);
+    put("llrawproc_focus_pixels_ms", 1); put("llrawproc_bad_pixels_ms", 1); put("llrawproc_pattern_noise_ms", 1);
+    put("llrawproc_dual_iso_ms", 30); put("llrawproc_chroma_smooth_ms", 1); put("llrawproc_other_ms", 4);
+    put("dual_iso_full20_total_ms", 28); put("dual_iso_full20_pattern_ms", 1); put("dual_iso_full20_noise_ms", 1);
+    put("dual_iso_full20_scratch_ms", 1); put("dual_iso_full20_convert20_ms", 1); put("dual_iso_full20_match_ms", 1);
+    put("dual_iso_full20_interp_ms", 5); put("dual_iso_full20_fullres_ms", 2); put("dual_iso_full20_mix_ms", 10);
+    put("dual_iso_full20_mix_halfres_ms", 2); put("dual_iso_full20_mix_chroma_ms", 6); put("dual_iso_full20_mix_chroma_copy_ms", 1);
+    put("dual_iso_full20_mix_chroma_fullres_ms", 2); put("dual_iso_full20_mix_chroma_halfres_ms", 2);
+    put("dual_iso_full20_mix_alias_map_ms", 1); put("dual_iso_full20_mix_overexposed_ms", 0);
+    put("dual_iso_full20_final_blend_ms", 4); put("dual_iso_full20_convert16_ms", 1); put("dual_iso_full20_other_ms", 1);
+    frame.insert(recon_worker_split::prefix() + QStringLiteral("dual_iso_full20_valid"), true);
+
+    recon_worker_split::Totals totals;
+    ASSERT_TRUE(totals.add(frame));
+    ASSERT_TRUE(totals.add(frame));
+    QJsonObject ownRecon;   // a frame whose render ran its own recon: the render thread's keys only
+    ownRecon.insert(QStringLiteral("llrawproc_total_ms"), 33.0);
+    ASSERT_FALSE(totals.add(ownRecon));
+    ASSERT_EQ(2u, static_cast<unsigned>(totals.frames));
+    ASSERT_EQ(2u, static_cast<unsigned>(totals.full20ValidFrames));
+
+    const auto avg = totals.averages();
+    ASSERT_NEAR(40.0, avg[recon_worker_split::LlrawprocTotal], 1e-9);
+    ASSERT_NEAR(6.0, avg[recon_worker_split::Full20MixChroma], 1e-9);
+    const recon_worker_split::Unattributed u = recon_worker_split::unattributed(avg);
+    ASSERT_NEAR(4.0, u.llrawprocMs, 1e-9);
+    ASSERT_NEAR(2.0, u.dualIsoOutsideFull20Ms, 1e-9);
+    ASSERT_NEAR(1.0, u.full20Ms, 1e-9);
+    // 40 less the six non-dual-iso stages (6) less full20's ten parts (27) = 7 (= 4 + 2 + 1).
+    ASSERT_NEAR(7.0, u.totalMs, 1e-9);
+
+    const QString text = totals.fieldsText();
+    ASSERT_TRUE(text.contains(QStringLiteral(" avg_full20_mix_chroma_ms=6.000")));
+    ASSERT_TRUE(text.contains(QStringLiteral(" avg_unattributed_ms=7.000")));
+    ASSERT_FALSE(text.contains(QStringLiteral("= ")));
+}
+
+TEST(ReconWorkerSplit, NoResidueIsComputedUnderMixOrMixChroma)
+{
+    // r1 adversary A1 (exact input): a consumed CPU full20 recon with chroma_smooth_method=1 and
+    // use_fullres=1. The CPU producer runs the chroma smoothing BEFORE mix (dualiso.c:6988), times its
+    // copy outside mix_chroma (:4708-4711) and adds the post-mix fullres reconstruction to
+    // mix_chroma_fullres (:7059-7069), so neither mix nor mix_chroma is the parent of those leaves:
+    // a residue under either is wrong (it read 0 for both, the producer trace gives 1 and 1).
+    QJsonObject frame;
+    const auto put = [&frame](const char *key, double v) {
+        frame.insert(recon_worker_split::prefix() + QLatin1String(key), v);
+    };
+    put("llrawproc_total_ms", 50);
+    put("dual_iso_full20_mix_ms", 5); put("dual_iso_full20_mix_halfres_ms", 3); put("dual_iso_full20_mix_alias_map_ms", 0);
+    put("dual_iso_full20_mix_overexposed_ms", 1); put("dual_iso_full20_mix_chroma_ms", 20);
+    put("dual_iso_full20_mix_chroma_copy_ms", 2); put("dual_iso_full20_mix_chroma_fullres_ms", 14);
+    put("dual_iso_full20_mix_chroma_halfres_ms", 7);
+    recon_worker_split::Totals totals;
+    ASSERT_TRUE(totals.add(frame));
+    const QString text = totals.fieldsText();
+    ASSERT_FALSE(text.contains(QStringLiteral("mix_unattributed")));
+    ASSERT_FALSE(text.contains(QStringLiteral("mix_chroma_unattributed")));
+    // The leaves are reported as measured.
+    ASSERT_TRUE(text.contains(QStringLiteral(" avg_full20_mix_ms=5.000")));
+    ASSERT_TRUE(text.contains(QStringLiteral(" avg_full20_mix_chroma_ms=20.000")));
+    ASSERT_TRUE(text.contains(QStringLiteral(" avg_full20_mix_chroma_copy_ms=2.000")));
+    ASSERT_TRUE(text.contains(QStringLiteral(" avg_full20_mix_chroma_fullres_ms=14.000")));
+    ASSERT_TRUE(text.contains(QStringLiteral(" avg_full20_mix_chroma_halfres_ms=7.000")));
+    // The fixed-nesting residues use mix only as one of full20's ten parts: 50 - 0 - 5 = 45.
+    ASSERT_TRUE(text.contains(QStringLiteral(" avg_unattributed_ms=45.000")));
+    // The header names the path dependence, so the next reader does not re-add the residue.
+    const QString header = readRepoFile(QStringLiteral("platform/qt/ReconWorkerSplit.h"));
+    ASSERT_TRUE(header.contains(QStringLiteral("PATH-DEPENDENT nesting, so NO residue is computed under mix or mix_chroma")));
+}
+
+TEST(ReconWorkerSplit, SummaryLinePinsEveryFieldName)
+{
+    // The field names on playback_smoke.recon_worker_split_summary (the dual-venue key=value parser and
+    // the round report read them by name).
+    const QStringList expected = {
+        QStringLiteral("llrawproc_total"), QStringLiteral("llrawproc_dark_frame"), QStringLiteral("llrawproc_vertical_stripes"),
+        QStringLiteral("llrawproc_focus_pixels"), QStringLiteral("llrawproc_bad_pixels"), QStringLiteral("llrawproc_pattern_noise"),
+        QStringLiteral("llrawproc_dual_iso"), QStringLiteral("llrawproc_chroma_smooth"), QStringLiteral("llrawproc_other"),
+        QStringLiteral("full20_total"), QStringLiteral("full20_pattern"), QStringLiteral("full20_noise"), QStringLiteral("full20_scratch"),
+        QStringLiteral("full20_convert20"), QStringLiteral("full20_match"), QStringLiteral("full20_interp"), QStringLiteral("full20_fullres"),
+        QStringLiteral("full20_mix"), QStringLiteral("full20_mix_halfres"), QStringLiteral("full20_mix_chroma"),
+        QStringLiteral("full20_mix_chroma_copy"), QStringLiteral("full20_mix_chroma_fullres"), QStringLiteral("full20_mix_chroma_halfres"),
+        QStringLiteral("full20_mix_alias_map"), QStringLiteral("full20_mix_overexposed"), QStringLiteral("full20_final_blend"),
+        QStringLiteral("full20_convert16"), QStringLiteral("full20_other"),
+    };
+    ASSERT_EQ(expected.size(), static_cast<int>(recon_worker_split::fields().size()));
+    const QString text = recon_worker_split::Totals().fieldsText();
+    for (int i = 0; i < expected.size(); ++i)
+    {
+        ASSERT_TRUE(expected[i] == QLatin1String(recon_worker_split::fields()[static_cast<size_t>(i)].name));
+        ASSERT_EQ(1, text.count(QStringLiteral(" avg_%1_ms=").arg(expected[i])));
+    }
+    for (const char *residue : { "llrawproc_unattributed", "dual_iso_outside_full20", "full20_unattributed", "unattributed" })
+        ASSERT_EQ(1, text.count(QStringLiteral(" avg_%1_ms=").arg(QLatin1String(residue))));
+    ASSERT_EQ(static_cast<int>(recon_worker_split::fields().size()) + 4, static_cast<int>(text.count(QStringLiteral(" avg_"))));
+
+    // The line is printed once, from the session totals, with frames and full20_valid_frames.
+    const QString finish = finishSmokeBody();
+    ASSERT_EQ(1, finish.count(QStringLiteral("playback_smoke.recon_worker_split_summary session=%1 frames=%2 ")));
+    ASSERT_TRUE(finish.contains(QStringLiteral("+ m_playbackSmokeReconWorkerSplit.fieldsText();")));
+    ASSERT_TRUE(notePresentedFrameBody().contains(QStringLiteral("m_playbackSmokeReconWorkerSplit.add( timing );")));
+    ASSERT_TRUE(beginSmokeBody().contains(QStringLiteral("m_playbackSmokeReconWorkerSplit.reset();")));
+}
+
+TEST(ReconWorkerSplit, RenderThreadKeepsTheWorkersValuesOnAConsumedRecon)
+{
+    // The worker writes the mix_chroma split too (the render thread wrote it alone before).
+    const QString source = renderFrameThreadSource();
+    const QString inserter = bracedBlockAfter(source, QStringLiteral("void insertLlrawprocReconTimingTelemetry( QJsonObject &target )"));
+    ASSERT_FALSE(inserter.isEmpty());
+    for (const char *key : { "dual_iso_full20_mix_chroma_ms", "dual_iso_full20_mix_chroma_copy_ms",
+                             "dual_iso_full20_mix_chroma_fullres_ms", "dual_iso_full20_mix_chroma_halfres_ms" })
+        ASSERT_EQ(1, inserter.count(QStringLiteral("QStringLiteral(\"%1\")").arg(QLatin1String(key))));
+
+    // drawFrame copies the worker's values, captured before resetMetadata, after the last writer of
+    // the unprefixed keys (the GPU no-readback restore) and only on a consumed recon.
+    const int restoreAt = source.lastIndexOf(QStringLiteral("restoreGpuPlaybackReconTimingTelemetry(\n            slot.stageTimingTelemetry,"));
+    const int copyAt = source.indexOf(QStringLiteral("recon_worker_split::copyWorkerSplit( preservedGpuPlaybackReconTextureTelemetry,"));
+    ASSERT_TRUE(restoreAt >= 0);
+    ASSERT_TRUE(copyAt > restoreAt);
+    ASSERT_EQ(1, source.count(QStringLiteral("recon_worker_split::copyWorkerSplit(")));
+    const QString gated = bracedBlockAfter(source.mid(restoreAt), QStringLiteral("    if( renderConsumedWorkerRecon )"));
+    ASSERT_TRUE(gated.contains(QStringLiteral("recon_worker_split::copyWorkerSplit( preservedGpuPlaybackReconTextureTelemetry,")));
+    // r1 adversary pass 2 A1: the gate is the render CONSUMING the worker's recon, never the slot
+    // merely holding one (a refused reuse renders its own). Set at exactly the three consuming sites.
+    ASSERT_EQ(1, source.count(QStringLiteral("bool renderConsumedWorkerRecon = false;")));
+    ASSERT_EQ(3, source.count(QStringLiteral("renderConsumedWorkerRecon =")) - 1 /* the declaration */);
+    ASSERT_EQ(1, source.count(QStringLiteral("renderConsumedWorkerRecon = decodedRawFrameAlreadyReconned;")));
+    ASSERT_EQ(1, source.count(QStringLiteral("renderConsumedWorkerRecon =\n            consumedPhase3Recon && decodedRawFrame != nullptr && decodedRawFrameAlreadyReconned;")));
+    ASSERT_EQ(1, source.count(QStringLiteral("renderConsumedWorkerRecon =\n            decodedRawFrame && decodedRawFrameAlreadyReconned && renderedFromPhase3Raw;")));
+    // The first is inside the GPU no-readback branch (no CPU recon there at all).
+    const QString gpuNoReadback = bracedBlockAfter(source, QStringLiteral("    bool renderConsumedWorkerRecon = false;\n    if( skipCpuDebayerForGpuTextureNoReadback )"));
+    ASSERT_TRUE(gpuNoReadback.contains(QStringLiteral("renderConsumedWorkerRecon = decodedRawFrameAlreadyReconned;")));
+    // The capture the copy reads is taken before resetMetadata.
+    const int preserveAt = source.indexOf(QStringLiteral("preserveGpuPlaybackReconTimingTelemetry(\n            slot.stageTimingTelemetry,\n            preservedGpuPlaybackReconTextureTelemetry );"));
+    const int resetAt = source.indexOf(QStringLiteral("slot.resetMetadata();"), preserveAt);
+    ASSERT_TRUE(preserveAt >= 0);
+    ASSERT_TRUE(resetAt > preserveAt);
+    ASSERT_TRUE(copyAt > resetAt);
+}
+
+TEST(GuiOtherBusySplit, NestedSpansAreExclusiveAndSumToTheGapsOtherBusy)
+{
+    // One gap (serial 7) of other busy 20 ms; the paint sink's running sum is 10 at the gap's open.
+    // timer_frame 0..16 holds playback_handling 2..6 (which holds slider_position 3..4) and draw_frame
+    // 8..14 (2 ms of preview paint inside it: the sum goes 10 -> 12); then draw_frame_ready 17..19 holds
+    // 1 ms of runner sleep. Inclusive: timer 16-2 = 14, handling 4, draw 6-2 = 4. Exclusive: slider 1,
+    // handling 3, draw 4, timer 14-4-4 = 6, ready 2-1 = 1 -> named 15, unattributed 5.
+    // (r1 adversary A2: the timer's start must carry the same paint sum, 10, as every reading before
+    // the draw; with 0 there it charged 12 ms of paint to the timer and its exclusive time read 0.)
+    gui_present_gap::OtherBusySpans spans;
+    spans.openGap();
+    spans.begin(spanClock(7, 0, 0, 0, 10.0));
+    spans.begin(spanClock(7, 2, 0, 0, 10.0));
+    spans.begin(spanClock(7, 3, 0, 0, 10.0));
+    ASSERT_NEAR(1.0, spans.end(gui_present_gap::OtherBusySpan::SliderPosition, spanClock(7, 4, 0, 0, 10.0)), 1e-9);
+    ASSERT_NEAR(3.0, spans.end(gui_present_gap::OtherBusySpan::PlaybackHandling, spanClock(7, 6, 0, 0, 10.0)), 1e-9);
+    spans.begin(spanClock(7, 8, 0, 0, 10.0));
+    ASSERT_NEAR(4.0, spans.end(gui_present_gap::OtherBusySpan::DrawFrame, spanClock(7, 14, 0, 0, 12.0)), 1e-9);
+    ASSERT_NEAR(6.0, spans.end(gui_present_gap::OtherBusySpan::TimerFrame, spanClock(7, 16, 0, 0, 12.0)), 1e-9);
+    spans.begin(spanClock(7, 17, 0, 0, 12.0));
+    ASSERT_NEAR(1.0, spans.end(gui_present_gap::OtherBusySpan::DrawFrameReady, spanClock(7, 19, 0, 1, 12.0)), 1e-9);
+    ASSERT_EQ(0, spans.depth());
+    ASSERT_NEAR(5.0, spans.closeGap(20.0), 1e-9);
+    ASSERT_NEAR(6.0, spans.sumMs[static_cast<int>(gui_present_gap::OtherBusySpan::TimerFrame)], 1e-9);
+    ASSERT_NEAR(1.0, spans.sumMs[static_cast<int>(gui_present_gap::OtherBusySpan::SliderPosition)], 1e-9);
+    ASSERT_NEAR(5.0, spans.unattributedSumMs, 1e-9);
+}
+
+TEST(GuiOtherBusySplit, SpanAcrossAGapEdgeOrOutsideAGapIsDropped)
+{
+    gui_present_gap::OtherBusySpans spans;
+    // Outside any gap (serial 0).
+    spans.begin(spanClock(0, 0));
+    ASSERT_NEAR(0.0, spans.end(gui_present_gap::OtherBusySpan::TimerFrame, spanClock(0, 5)), 1e-9);
+    // Opened in gap 3, ended in gap 4 (the gap closed and reopened inside it): dropped, and its time
+    // does not reach a parent either.
+    spans.begin(spanClock(4, 0));
+    spans.begin(spanClock(3, 1));
+    ASSERT_NEAR(0.0, spans.end(gui_present_gap::OtherBusySpan::DrawFrameReady, spanClock(4, 9)), 1e-9);
+    ASSERT_NEAR(10.0, spans.end(gui_present_gap::OtherBusySpan::TimerFrame, spanClock(4, 10)), 1e-9);
+    // Named spans never exceed the gap's other busy: 10 named against 4 other busy is scaled to 4.
+    ASSERT_NEAR(0.0, spans.closeGap(4.0), 1e-9);
+    ASSERT_NEAR(4.0, spans.sumMs[static_cast<int>(gui_present_gap::OtherBusySpan::TimerFrame)], 1e-9);
+    // An unbalanced end is ignored.
+    ASSERT_NEAR(0.0, spans.end(gui_present_gap::OtherBusySpan::TimerFrame, spanClock(5, 1)), 1e-9);
+    ASSERT_EQ(0, spans.depth());
+}
+
+TEST(GuiOtherBusySplit, EndWithCountOrPastItNeverWritesPastGapMs)
+{
+    // CPU-S1-PACE-NEXT-LEVER-1 (#770 r3 advisory A1): end() indexed gapMs with the span unchecked, so
+    // OtherBusySpan::Count (or anything past it) wrote gapMs[kCount], which is sumMs[0] in this layout.
+    // An out-of-range span still pops its frame (the stack stays balanced) but charges nothing.
+    gui_present_gap::OtherBusySpans spans;
+    spans.openGap();
+    for (int past = 0; past < 2; ++past)
+    {
+        spans.begin(spanClock(7, 0));
+        const auto bad = static_cast<gui_present_gap::OtherBusySpan>(gui_present_gap::OtherBusySpans::kCount + past);
+        ASSERT_NEAR(0.0, spans.end(bad, spanClock(7, 5)), 1e-9);
+        ASSERT_EQ(0, spans.depth());
+    }
+    for (int i = 0; i < gui_present_gap::OtherBusySpans::kCount; ++i)
+    {
+        ASSERT_NEAR(0.0, spans.gapMs[i], 1e-9);
+        ASSERT_NEAR(0.0, spans.sumMs[i], 1e-9);
+    }
+    // A valid span still charges as before.
+    spans.begin(spanClock(7, 10));
+    ASSERT_NEAR(3.0, spans.end(gui_present_gap::OtherBusySpan::DrawFrame, spanClock(7, 13)), 1e-9);
+}
+
+TEST(GuiOtherBusySplit, NegativeOtherBusyBudgetNeverMakesASessionSumNegative)
+{
+    // Adversary A1 on 9bfdf8e0: closeGap(-1) scaled 1 ms of named span by -1 into sumMs.
+    gui_present_gap::OtherBusySpans spans;
+    spans.openGap();
+    spans.begin(spanClock(7, 0));
+    ASSERT_NEAR(1.0, spans.end(gui_present_gap::OtherBusySpan::DrawFrame, spanClock(7, 1)), 1e-9);
+    const double rest = spans.closeGap(-1.0);
+    ASSERT_TRUE(rest >= 0.0);
+    for (int i = 0; i < gui_present_gap::OtherBusySpans::kCount; ++i)
+        ASSERT_TRUE(spans.sumMs[i] >= 0.0);
+    ASSERT_TRUE(spans.unattributedSumMs >= 0.0);
+}
+
+TEST(GuiOtherBusySplit, NanPaintReadingOrBudgetNeverReachesASessionSum)
+{
+    // CPU-S1-PACE-NEXT-LEVER-1 r3, adversary A1 on f9f92e09: a NaN paintMs passed both `x < 0` clamps
+    // (end) and a NaN budget passed closeGap's, so NaN entered gapMs and then sumMs.
+    const double nan = std::numeric_limits<double>::quiet_NaN();
+    gui_present_gap::OtherBusySpans spans;
+    spans.openGap();
+    gui_present_gap::SpanClock start;
+    start.gapSerial = 7;
+    gui_present_gap::SpanClock stop = start;
+    stop.nowNs = 1000000;
+    stop.paintMs = nan;
+    spans.begin(start);
+    const double charged = spans.end(gui_present_gap::OtherBusySpan::DrawFrame, stop);
+    ASSERT_TRUE(std::isfinite(charged) && charged == 0.0);
+    const double rest = spans.closeGap(-1.0);
+    ASSERT_TRUE(std::isfinite(rest) && rest >= 0.0);
+    for (int i = 0; i < gui_present_gap::OtherBusySpans::kCount; ++i)
+        ASSERT_TRUE(std::isfinite(spans.sumMs[i]) && spans.sumMs[i] >= 0.0);
+    // A NaN budget is no budget (r4, Dot nit): the named 1 ms span is charged ZERO, so no session sum
+    // and no unattributed remainder moves. (Finite/nonnegative alone also passed the old NaN scale.)
+    double sumsBefore[gui_present_gap::OtherBusySpans::kCount];
+    for (int i = 0; i < gui_present_gap::OtherBusySpans::kCount; ++i) sumsBefore[i] = spans.sumMs[i];
+    const double unattributedBefore = spans.unattributedSumMs;
+    spans.openGap();
+    spans.begin(spanClock(8, 0));
+    ASSERT_NEAR(1.0, spans.end(gui_present_gap::OtherBusySpan::DrawFrame, spanClock(8, 1)), 1e-9);
+    const double rest2 = spans.closeGap(nan);
+    ASSERT_TRUE(rest2 == 0.0);
+    for (int i = 0; i < gui_present_gap::OtherBusySpans::kCount; ++i)
+        ASSERT_TRUE(spans.sumMs[i] == sumsBefore[i]);
+    ASSERT_TRUE(spans.unattributedSumMs == unattributedBefore);
+    // The zero-budget contract the NaN case maps to: same zero charge.
+    spans.openGap();
+    spans.begin(spanClock(10, 0));
+    ASSERT_NEAR(1.0, spans.end(gui_present_gap::OtherBusySpan::DrawFrame, spanClock(10, 1)), 1e-9);
+    ASSERT_TRUE(spans.closeGap(0.0) == 0.0);
+    for (int i = 0; i < gui_present_gap::OtherBusySpans::kCount; ++i)
+        ASSERT_TRUE(spans.sumMs[i] == sumsBefore[i]);
+    ASSERT_TRUE(spans.unattributedSumMs == unattributedBefore);
+    // Adversary A4 on e7e5271e: paintMs = -Infinity made the span +Infinity, closeGap(1.0) scaled it by
+    // 1/Infinity = 0 and Infinity * 0 wrote NaN into sumMs.
+    spans.openGap();
+    gui_present_gap::SpanClock infStart;
+    infStart.gapSerial = 9;
+    gui_present_gap::SpanClock infStop = infStart;
+    infStop.nowNs = 1000000;
+    infStop.paintMs = -std::numeric_limits<double>::infinity();
+    spans.begin(infStart);
+    const double infCharged = spans.end(gui_present_gap::OtherBusySpan::DrawFrame, infStop);
+    ASSERT_TRUE(std::isfinite(infCharged));
+    const double rest3 = spans.closeGap(1.0);
+    ASSERT_TRUE(std::isfinite(rest3) && rest3 >= 0.0);
+    for (int i = 0; i < gui_present_gap::OtherBusySpans::kCount; ++i)
+        ASSERT_TRUE(std::isfinite(spans.sumMs[i]) && spans.sumMs[i] >= 0.0);
+    ASSERT_TRUE(std::isfinite(spans.closeGap(std::numeric_limits<double>::infinity())));
+    for (int i = 0; i < gui_present_gap::OtherBusySpans::kCount; ++i)
+        ASSERT_TRUE(std::isfinite(spans.sumMs[i]));
+}
+
+TEST(GuiOtherBusySplit, OverflowingFiniteSpansNeverPutNanInASessionSum)
+{
+    // r4, adversary A3 on ebe2c4aa (and r3 advisory A2): two finite spans of ~1e308 ms (a synthetic -1e308
+    // paint reading) summed to +Infinity in gapMs; closeGap(1.0) scaled by 0 and Infinity * 0 wrote NaN.
+    gui_present_gap::OtherBusySpans spans;
+    spans.openGap();
+    gui_present_gap::SpanClock start;
+    start.gapSerial = 7;
+    gui_present_gap::SpanClock stop = start;
+    stop.nowNs = 1000000;
+    stop.paintMs = -1e308;
+    for (int i = 0; i < 2; ++i)
+    {
+        spans.begin(start);
+        ASSERT_TRUE(std::isfinite(spans.end(gui_present_gap::OtherBusySpan::DrawFrame, stop)));
+    }
+    const double rest = spans.closeGap(1.0);
+    ASSERT_TRUE(std::isfinite(rest));
+    for (int i = 0; i < gui_present_gap::OtherBusySpans::kCount; ++i)
+        ASSERT_TRUE(std::isfinite(spans.sumMs[i]) && spans.sumMs[i] >= 0.0 && spans.sumMs[i] <= 1.0 + 1e-9);
+    ASSERT_TRUE(std::isfinite(spans.unattributedSumMs));
+}
+
+namespace
+{
+// The innermost { ... } block of `body` that contains offset `at` (empty when unbalanced).
+QString enclosingBlock(const QString & body, int at)
+{
+    int depth = 0;
+    int open = -1;
+    for (int i = at; i >= 0; --i)
+    {
+        if (body.at(i) == QLatin1Char('}')) ++depth;
+        else if (body.at(i) == QLatin1Char('{') && depth-- == 0) { open = i; break; }
+    }
+    if (open < 0) return QString();
+    depth = 0;
+    for (int i = open; i < body.length(); ++i)
+    {
+        if (body.at(i) == QLatin1Char('{')) ++depth;
+        else if (body.at(i) == QLatin1Char('}') && --depth == 0) return body.mid(open, i - open + 1);
+    }
+    return QString();
+}
+}
+
+// CPU-S1-PACE-NEXT-LEVER-1 r3, adversary A1 on e7e5271e (major): only a PRESENTED result gave its 8-bit
+// buffer back to m_playbackPrepRgb8Pool; a result the worker replaced (two finished before the GUI picked
+// one up), dropped on a generation change or at stop, or the GUI dropped, freed it, so the replace-before-
+// present pattern still allocated 12.3 MB per pair. Pinned: every place a computed result is dropped
+// (its request serial released or collected for release) gives that same result's buffer back in the
+// same block.
+TEST(PlaybackPrepRgb8Pool, EveryDroppedOrPresentedResultGivesItsBufferBack)
+{
+    const QString source = mainWindowSource();
+    struct Fn { const char * signature; int minDrops; };
+    const Fn fns[] = {
+        { "void MainWindow::playbackPrepThreadLoop( void )", 3 },   // generation drop, stop, replaced-after-compute
+        { "void MainWindow::onPlaybackPrepResultReady( void )", 1 },   // GUI generation drop
+        { "void MainWindow::invalidatePlaybackPrepForDisplayChange( const char *reason )", 1 },   // queued results
+    };
+    const QRegularExpression drop(QStringLiteral(
+        "(?:releasePresentedFrameForRequestSerial\\(\\s*|serialsToRelease\\.push_back\\(\\s*)(result|staleResult)\\.task\\.requestSerial"));
+    for (const Fn & fn : fns)
+    {
+        const QString body = bracedBlockAfter(source, QString::fromLatin1(fn.signature));
+        if (body.isEmpty()) ::minitest::fail(__FILE__, __LINE__, "function body found", fn.signature);
+        int drops = 0;
+        auto it = drop.globalMatch(body);
+        while (it.hasNext())
+        {
+            const QRegularExpressionMatch m = it.next();
+            ++drops;
+            const QString block = enclosingBlock(body, static_cast<int>(m.capturedStart()));
+            const QString give = QStringLiteral("m_playbackPrepRgb8Pool.give( std::move( %1.scopeSourceImage ), %1.task.presentationGeneration )").arg(m.captured(1));
+            if (!block.contains(give))
+                ::minitest::fail(__FILE__, __LINE__, "dropped result gives its buffer back in the same block",
+                                 std::string(fn.signature) + " at: " + body.mid(m.capturedStart(), 90).toStdString());
+        }
+        if (drops < fn.minDrops)
+            ::minitest::fail(__FILE__, __LINE__, "drop sites found", std::string(fn.signature) + " drops=" + std::to_string(drops));
+    }
+    // The presented result, after the present.
+    const QString ready = prepResultReadyBody();
+    const int present = ready.indexOf(QStringLiteral("presentPlaybackPreparedFrame( result );"));
+    ASSERT_TRUE(present >= 0);
+    ASSERT_TRUE(ready.indexOf(QStringLiteral("m_playbackPrepRgb8Pool.give( std::move( result.scopeSourceImage ), result.task.presentationGeneration );"), present) > present);
+}
+
+// Adversary A2 on e7e5271e (minor): the pool was cleared only on clip open, so buffers survived stop,
+// delete-clip and rename-clip. r4 (Dot B1, adversary A1 on 391464de, major): a clear that ran before its
+// path's generation bump, or a take() that reopened the pool, let a task admitted before a stop or unload
+// keep its buffer after the drain. Pinned: play-stop, clip replacement and both unload paths clear with
+// the current generation, after that path's bump and before its drain.
+TEST(PlaybackPrepRgb8Pool, StopAndClipUnloadClearThePool)
+{
+    const QString source = mainWindowSource();
+    const QString clearCall = QStringLiteral("m_playbackPrepRgb8Pool.clear( m_playbackPresentationGeneration.load( std::memory_order_acquire ) );");
+    const QString toggled = bracedBlockAfter(source, QStringLiteral("void MainWindow::on_actionPlay_toggled(bool checked)"));
+    ASSERT_FALSE(toggled.isEmpty());
+    const int toggleBump = toggled.indexOf(QStringLiteral("invalidatePlaybackPrepForDisplayChange("));
+    // r4 (adversary A1 on ebe2c4aa): play-start opens the pool with its own (post-bump) generation.
+    const int toggleOpen = toggled.indexOf(QStringLiteral("if( checked ) m_playbackPrepRgb8Pool.open( m_playbackPresentationGeneration.load( std::memory_order_acquire ) );"));
+    ASSERT_TRUE(toggleOpen > toggleBump);
+    const int toggleClear = toggled.indexOf(QStringLiteral("else ") + clearCall);
+    const int toggleDrain = toggled.indexOf(QStringLiteral("drainPlaybackPrepInFlight( \"play-stop\""));
+    ASSERT_TRUE(toggleBump >= 0 && toggleClear > toggleBump && toggleDrain > toggleClear);
+
+    const QString replace = bracedBlockAfter(source, QStringLiteral("bool MainWindow::playbackPrepQuiescentBeforeClipReplacement( const char *reason )"));
+    ASSERT_FALSE(replace.isEmpty());
+    const int replaceBump = replace.indexOf(QStringLiteral("invalidatePlaybackPrepForDisplayChange( reason );"));
+    const int replaceClear = replace.indexOf(clearCall);
+    const int replaceDrain = replace.indexOf(QStringLiteral("drainPlaybackPrepInFlight("));
+    ASSERT_TRUE(replaceBump >= 0 && replaceClear > replaceBump && replaceDrain > replaceClear);
+
+    const QString unload = bracedBlockAfter(source, QStringLiteral("bool MainWindow::freeActiveMlvObjectAfterLifecycleBarrier( const char *reason )"));
+    ASSERT_FALSE(unload.isEmpty());
+    // No-object path: clear, then the drain it returns.
+    const int early = unload.indexOf(QStringLiteral("if( !m_pMlvObject )"));
+    const int earlyClear = unload.indexOf(clearCall, early);
+    const int earlyDrain = unload.indexOf(QStringLiteral("drainPlaybackPrepInFlight( reason, 2000 )"), early);
+    ASSERT_TRUE(early >= 0 && earlyClear > early && earlyDrain > earlyClear);
+    // Object path: clearPresentationForClipOpen (its bump), then the clear, then the drain.
+    const int unloadBump = unload.indexOf(QStringLiteral("clearPresentationForClipOpen( barrierReason );"));
+    const int unloadClear = unload.indexOf(clearCall, unloadBump);
+    const int unloadDrain = unload.indexOf(QStringLiteral("waitForRenderThreadIdleBeforeCoreMutation( barrierReason )"), unloadBump);
+    ASSERT_TRUE(unloadBump > earlyDrain && unloadClear > unloadBump && unloadDrain > unloadClear);
+    const QString open = bracedBlockAfter(source, QStringLiteral("void MainWindow::clearPresentationForClipOpen( const char *reason )"));
+    ASSERT_TRUE(open.contains(QStringLiteral("invalidatePlaybackPrepForDisplayChange( reason );")));
+}
+
+// r4 (Dot B1): the pool is keyed on the presentation generation. Every give passes the generation of
+// the task whose buffer it returns, every clear passes the current generation, and take() takes no
+// argument (it never reopens the pool). A new give or clear site without its generation fails here.
+TEST(PlaybackPrepRgb8Pool, EveryGivePassesItsTaskGenerationAndEveryClearTheCurrentOne)
+{
+    const QString source = mainWindowSource();
+    const QRegularExpression anyGive(QStringLiteral("m_playbackPrepRgb8Pool\\.give\\("));
+    const QRegularExpression keyedGive(QStringLiteral(
+        "m_playbackPrepRgb8Pool\\.give\\( std::move\\( (\\w+)\\.scopeSourceImage \\), \\1\\.task\\.presentationGeneration \\);"));
+    int gives = 0;
+    for (auto it = anyGive.globalMatch(source); it.hasNext(); it.next()) ++gives;
+    int keyed = 0;
+    for (auto it = keyedGive.globalMatch(source); it.hasNext(); it.next()) ++keyed;
+    if (gives < 6 || keyed != gives)
+        ::minitest::fail(__FILE__, __LINE__, "every pool give passes its task generation",
+                         "gives=" + std::to_string(gives) + " keyed=" + std::to_string(keyed));
+    const QString keyedClear = QStringLiteral("m_playbackPrepRgb8Pool.clear( m_playbackPresentationGeneration.load( std::memory_order_acquire ) );");
+    const int clears = static_cast<int>(source.count(QStringLiteral("m_playbackPrepRgb8Pool.clear(")));
+    const int keyedClears = static_cast<int>(source.count(keyedClear));
+    if (clears < 4 || keyedClears != clears)
+        ::minitest::fail(__FILE__, __LINE__, "every pool clear passes the current generation",
+                         "clears=" + std::to_string(clears) + " keyed=" + std::to_string(keyedClears));
+    const int takes = static_cast<int>(source.count(QStringLiteral("m_playbackPrepRgb8Pool.take(")));
+    ASSERT_TRUE(takes >= 1 && takes == static_cast<int>(source.count(QStringLiteral("m_playbackPrepRgb8Pool.take()"))));
+    // The pool header: generation-keyed give/clear, no reopen flag.
+    const QString h = readRepoFile(QStringLiteral("platform/qt/PlaybackPrepCpuRoute.h"));
+    ASSERT_TRUE(h.contains(QStringLiteral("void give(std::vector<uint8_t> && buf, uint64_t generation);")));
+    ASSERT_TRUE(h.contains(QStringLiteral("void clear(uint64_t currentGeneration);")));
+    ASSERT_TRUE(h.contains(QStringLiteral("void open(uint64_t playGeneration);")));
+    // The only open is the play-start one (a second site would reopen recycling outside a playing span).
+    ASSERT_EQ(1, static_cast<int>(source.count(QStringLiteral("m_playbackPrepRgb8Pool.open("))));
+    ASSERT_FALSE(h.contains(QStringLiteral("m_closed")));
+}
+TEST(GuiOtherBusySplit, HandlersOpenTheirSpanFirstAndTheSummaryAppendsTheSplit)
+{
+    const QString source = mainWindowSource();
+    const struct { const char *signature; const char *span; } handlers[] = {
+        { "void MainWindow::drawFrameReady()\n{\n", "DrawFrameReady" },
+        { "void MainWindow::timerFrameEvent( bool predictivePlaybackAdvance )\n{\n", "TimerFrame" },
+        { "void MainWindow::playbackHandling(int timeDiff)\n{\n", "PlaybackHandling" },
+        { "void MainWindow::drawFrame( bool updateTimecodeLabel )\n{\n", "DrawFrame" },
+        { "void MainWindow::on_horizontalSliderPosition_valueChanged(int position)\n{\n", "SliderPosition" },
+    };
+    for (const auto &h : handlers)
+    {
+        const QString opening = QLatin1String(h.signature)
+            + QStringLiteral("    const GuiOtherBusyScope otherBusySpan( this, gui_present_gap::OtherBusySpan::%1 );")
+                  .arg(QLatin1String(h.span));
+        ASSERT_EQ(1, source.count(opening));
+    }
+    // The gap's serial moves on every open, and the close folds the spans with the gap's other busy.
+    const QString open = bracedBlockAfter(source, QStringLiteral("void MainWindow::openGuiPresentGap( void )"));
+    ASSERT_TRUE(open.contains(QStringLiteral("++m_guiPresentGapSerial;")));
+    ASSERT_TRUE(open.contains(QStringLiteral("m_guiOtherBusySpans.openGap();")));
+    ASSERT_TRUE(closeGapBody().contains(QStringLiteral("m_guiOtherBusySpans.closeGap( split.otherBusyMs );")));
+    ASSERT_TRUE(beginSmokeBody().contains(QStringLiteral("m_guiOtherBusySpans.resetSession();")));
+
+    // Appended after every existing gui_present_summary field (none renamed): one per span, then unattributed.
+    const QString finish = finishSmokeBody();
+    const QString format = summaryFormat(finish, QStringLiteral("playback_smoke.gui_present_summary session=%1"));
+    ASSERT_TRUE(format.contains(QStringLiteral("gui_idle_source=%15\" )")));
+    ASSERT_FALSE(format.contains(QStringLiteral("avg_gui_other_busy_timer_frame")));
+    ASSERT_TRUE(finish.contains(QStringLiteral("QStringLiteral( \" avg_gui_other_busy_%1_ms=%2\" )")));
+    ASSERT_TRUE(finish.contains(QStringLiteral("QStringLiteral( \" avg_gui_other_busy_unattributed_ms=%1\" )")));
+    ASSERT_TRUE(finish.contains(QStringLiteral("               + otherBusySplit;")));
+    const QStringList names = { QStringLiteral("draw_frame_ready"), QStringLiteral("timer_frame"), QStringLiteral("playback_handling"),
+                                QStringLiteral("draw_frame"), QStringLiteral("slider_position") };
+    ASSERT_EQ(names.size(), gui_present_gap::OtherBusySpans::kCount);
+    for (int i = 0; i < names.size(); ++i)
+        ASSERT_TRUE(names[i] == QLatin1String(gui_present_gap::otherBusySpanName(static_cast<gui_present_gap::OtherBusySpan>(i))));
+}
+
+TEST(GuiPresentAttributionWiring, RegionImageSplitsIntoFromImageAndViewport)
+{
+    const QString body = presentPreparedBody();
+    ASSERT_FALSE(body.isEmpty());
+    // Each call is timed on the region clock, and only the cache-miss fromImage is charged.
+    const int vpStart = body.indexOf(QStringLiteral("const qint64 prepRegionImageViewportStartNs = prepRegionClock.nsecsElapsed();"));
+    const int vpCall = body.indexOf(QStringLiteral("imagePresentedByViewport = GpuDisplayViewport::presentImage( ui->graphicsView,"));
+    const int vpEnd = body.indexOf(QStringLiteral("prepRegionImageViewportMs = prepRegionElapsedMs( prepRegionImageViewportStartNs );"));
+    ASSERT_TRUE(vpStart >= 0);
+    ASSERT_TRUE(vpCall > vpStart);
+    ASSERT_TRUE(vpEnd > vpCall);
+    const QString miss = bracedBlockAfter(body, QStringLiteral("            pic = cachedPixmap;\n        }\n        else"));
+    ASSERT_TRUE(miss.contains(QStringLiteral("pic = QPixmap::fromImage( displayImage );")));
+    ASSERT_TRUE(miss.contains(QStringLiteral("prepRegionImageFromImageMs = prepRegionElapsedMs( prepRegionImageFromImageStartNs );")));
+    ASSERT_EQ(1, body.count(QStringLiteral("QPixmap::fromImage( displayImage )")));
+    for (const char *key : { "playback_prep_region_image_from_image_ms", "playback_prep_region_image_viewport_ms" })
+        ASSERT_EQ(1, body.count(QStringLiteral("QStringLiteral(\"%1\")").arg(QLatin1String(key))));
+
+    // Summed on CPU-route frames and averaged on prep_summary, appended after the existing fields.
+    const QString gated = bracedBlockAfter(
+        notePresentedFrameBody(), QStringLiteral("if( telemetryBoolValue( timing, \"playback_prep_cpu_route_active\" ) )"));
+    ASSERT_TRUE(gated.contains(QStringLiteral("spans.regionImageFromImageMs +=")));
+    ASSERT_TRUE(gated.contains(QStringLiteral("spans.regionImageViewportMs +=")));
+    const QString format = summaryFormat(finishSmokeBody(), QStringLiteral("playback_smoke.prep_summary session=%1"));
+    ASSERT_TRUE(format.indexOf(QStringLiteral("avg_playback_prep_region_unattributed_ms=%36 "))
+                < format.indexOf(QStringLiteral("avg_playback_prep_region_image_from_image_ms=%37 ")));
+    ASSERT_EQ(1, format.count(QStringLiteral("avg_playback_prep_region_image_viewport_ms=%38")));
+    // CPU-S1-PACE-NEXT-LEVER-1 appends its fields after this one (PrepSummaryAppendsTheHandoffFields).
+    ASSERT_TRUE(finishSmokeBody().contains(QStringLiteral(".arg( avgCpuRouteMs( spans.regionImageViewportMs ), 0, 'f', 3 )\n               + handoffFields;")));
+}
+
+// ---------------------------------------------------------------------------------------------
+// CPU-S1-PACE-NEXT-LEVER-1 (Part A): the CPU playing route borrows the pinned slot's RGB16 frame.
+// ---------------------------------------------------------------------------------------------
+namespace
+{
+
+QString drawFrameReadyBody()
+{
+    return functionBody(mainWindowSource(), QStringLiteral("void MainWindow::drawFrameReady()\n{"),
+                        QStringLiteral("//Paintmode for gradient enabled/disabled"));
+}
+
+QString enqueueBody()
+{
+    return functionBody(mainWindowSource(),
+                        QStringLiteral("void MainWindow::enqueuePlaybackPrepTask( PlaybackPrepTask &&task, double handoffStartStageTime )"),
+                        QStringLiteral("void MainWindow::invalidatePlaybackPrepForDisplayChange( const char *reason )"));
+}
+
+QString prepThreadLoopBody()
+{
+    return functionBody(mainWindowSource(), QStringLiteral("void MainWindow::playbackPrepThreadLoop( void )"),
+                        QStringLiteral("void MainWindow::onPlaybackPrepResultReady( void )"));
+}
+
+// Every input that admits a borrow; each test case flips one.
+PlaybackPrepBorrowInputs admittedBorrow(const uint16_t * buffer)
+{
+    PlaybackPrepBorrowInputs in;
+    in.playing = true;
+    in.displayPreviewCachingAllowed = false;
+    in.cpuPreviewProcessingActive = true;
+    in.outputProcessed8 = false;
+    in.rawImage16 = buffer;
+    in.rawImage16Bytes = 600;
+    in.sourceImage16Bytes = 600;
+    return in;
+}
+
+} // namespace
+
+TEST(PlaybackPrepOwnership, BorrowTruthTableRefusesEveryGpuRouteAndEveryNonPlayingDisplay)
+{
+    const uint16_t buffer[300] = {};
+    ASSERT_TRUE(playbackPrepMayBorrowSlotRgb16(admittedBorrow(buffer)));
+    // The CPU route is either CPU preview processing or a 16-bit output mode.
+    {
+        PlaybackPrepBorrowInputs in = admittedBorrow(buffer);
+        in.cpuPreviewProcessingActive = false;
+        ASSERT_TRUE(playbackPrepMayBorrowSlotRgb16(in));           // Debayered16 / Processed16 output
+        in.outputProcessed8 = true;
+        ASSERT_FALSE(playbackPrepMayBorrowSlotRgb16(in));          // neither: the worker reads RGB8
+        in.cpuPreviewProcessingActive = true;
+        ASSERT_TRUE(playbackPrepMayBorrowSlotRgb16(in));           // Processed8 + CPU processing
+    }
+    // One refusal per input; the full product of the eight boolean refusals below is also refused.
+    const struct { const char * name; void (*flip)(PlaybackPrepBorrowInputs &); } refusals[] = {
+        { "paused", [](PlaybackPrepBorrowInputs & in) { in.playing = false; } },
+        { "display_cache", [](PlaybackPrepBorrowInputs & in) { in.displayPreviewCachingAllowed = true; } },
+        { "gpu16", [](PlaybackPrepBorrowInputs & in) { in.gpu16PreviewActive = true; } },
+        { "gpu_preview_processing", [](PlaybackPrepBorrowInputs & in) { in.gpuPreviewProcessingActive = true; } },
+        { "amaze_texture", [](PlaybackPrepBorrowInputs & in) { in.gpuAmazeTexturePresentCandidate = true; } },
+        { "recon_texture", [](PlaybackPrepBorrowInputs & in) { in.gpuPlaybackReconTexturePresentCandidate = true; } },
+        { "recon_no_readback", [](PlaybackPrepBorrowInputs & in) { in.gpuPlaybackReconTextureNoReadbackCandidate = true; } },
+        { "no_buffer", [](PlaybackPrepBorrowInputs & in) { in.rawImage16 = nullptr; } },
+        { "short_buffer", [](PlaybackPrepBorrowInputs & in) { in.rawImage16Bytes = 598; } },
+        { "no_dims", [](PlaybackPrepBorrowInputs & in) { in.sourceImage16Bytes = 0; } },
+    };
+    for (const auto & r : refusals)
+    {
+        PlaybackPrepBorrowInputs in = admittedBorrow(buffer);
+        r.flip(in);
+        if (playbackPrepMayBorrowSlotRgb16(in))
+            ::minitest::fail(__FILE__, __LINE__, "refused", r.name);
+    }
+    // Exhaustive over the boolean inputs: true only for the admitted CPU-route rows.
+    int admitted = 0;
+    for (int bits = 0; bits < (1 << 9); ++bits)
+    {
+        PlaybackPrepBorrowInputs in = admittedBorrow(buffer);
+        in.playing = bits & 1;
+        in.displayPreviewCachingAllowed = bits & 2;
+        in.cpuPreviewProcessingActive = bits & 4;
+        in.outputProcessed8 = bits & 8;
+        in.gpu16PreviewActive = bits & 16;
+        in.gpuPreviewProcessingActive = bits & 32;
+        in.gpuAmazeTexturePresentCandidate = bits & 64;
+        in.gpuPlaybackReconTexturePresentCandidate = bits & 128;
+        in.gpuPlaybackReconTextureNoReadbackCandidate = bits & 256;
+        const bool expected = in.playing && !in.displayPreviewCachingAllowed
+            && (in.cpuPreviewProcessingActive || !in.outputProcessed8)
+            && !in.gpu16PreviewActive && !in.gpuPreviewProcessingActive
+            && !in.gpuAmazeTexturePresentCandidate && !in.gpuPlaybackReconTexturePresentCandidate
+            && !in.gpuPlaybackReconTextureNoReadbackCandidate;
+        ASSERT_EQ(expected, playbackPrepMayBorrowSlotRgb16(in));
+        if (expected) ++admitted;
+    }
+    ASSERT_EQ(3, admitted);   // CPU processing x {Processed8, 16-bit} + 16-bit without CPU processing
+}
+
+TEST(PlaybackPrepOwnership, SampledHashSeesASingleChangedSampleAndCapsTheSamples)
+{
+    std::vector<uint16_t> frame(1808u * 2268u * 3u);
+    for (size_t i = 0; i < frame.size(); ++i) frame[i] = static_cast<uint16_t>(i * 2654435761u >> 7);
+    const uint32_t before = playbackPrepSampledRgb16Fnv(frame.data(), frame.size());
+    ASSERT_EQ(before, playbackPrepSampledRgb16Fnv(frame.data(), frame.size()));
+    const size_t step = frame.size() / 8192;
+    frame[step * 4096] ^= 0x0100;   // a sampled word, high byte only
+    ASSERT_TRUE(before != playbackPrepSampledRgb16Fnv(frame.data(), frame.size()));
+    frame[step * 4096] ^= 0x0100;
+    frame[step * 4096] ^= 0x0001;   // low byte only
+    ASSERT_TRUE(before != playbackPrepSampledRgb16Fnv(frame.data(), frame.size()));
+    // Null / empty input is a fixed value, never a read.
+    ASSERT_EQ(2166136261u, playbackPrepSampledRgb16Fnv(nullptr, 100));
+    ASSERT_EQ(2166136261u, playbackPrepSampledRgb16Fnv(frame.data(), 0));
+}
+
+TEST(PlaybackPrepOwnership, DrawFrameReadyConsultsTheHelperBeforeTheCopyAndMovesTheTask)
+{
+    const QString body = drawFrameReadyBody();
+    ASSERT_FALSE(body.isEmpty());
+    const int helperAt = body.indexOf(QStringLiteral("task.borrowedSlotRgb16 = playbackPrepMayBorrowSlotRgb16( borrowInputs );"));
+    const int assignAt = body.indexOf(QStringLiteral("task.ownedSourceImage16.assign( readyFrame.rawImage16,"));
+    ASSERT_TRUE(helperAt >= 0);
+    ASSERT_TRUE(assignAt > helperAt);
+    ASSERT_EQ(1, body.count(QStringLiteral("task.ownedSourceImage16.assign(")));
+    // The copy is skipped exactly when the helper admits the borrow.
+    const int guardAt = body.indexOf(QStringLiteral("    if( !task.borrowedSlotRgb16\n     && needsOwnedRgb16\n"));
+    ASSERT_TRUE(guardAt > helperAt && guardAt < assignAt);
+    // The slot pointer is what the task already carries; nothing else rebinds it.
+    ASSERT_TRUE(body.indexOf(QStringLiteral("task.sourceImage16 = readyFrame.rawImage16;")) < helperAt);
+    // Every GPU route input reaches the helper from the ready frame / this present's flags.
+    for (const char * wire : { "borrowInputs.playing = ui->actionPlay->isChecked();",
+                               "borrowInputs.displayPreviewCachingAllowed = displayPreviewCachingAllowed;",
+                               "borrowInputs.cpuPreviewProcessingActive = cpuPreviewProcessingActive;",
+                               "borrowInputs.outputProcessed8 = readyFrame.outputMode == RenderFrameThread::OutputProcessed8;",
+                               "borrowInputs.gpu16PreviewActive = gpu16PreviewActive;",
+                               "borrowInputs.gpuPreviewProcessingActive = gpuPreviewProcessingActive;",
+                               "borrowInputs.gpuAmazeTexturePresentCandidate = readyFrame.gpuAmazeTexturePresentCandidate;",
+                               "readyFrame.gpuPlaybackReconTexturePresentCandidate;",
+                               "readyFrame.gpuPlaybackReconTextureNoReadbackCandidate;",
+                               "borrowInputs.rawImage16 = readyFrame.rawImage16;",
+                               "borrowInputs.rawImage16Bytes = readyFrameRawImage16Bytes;",
+                               "borrowInputs.sourceImage16Bytes = sourceImage16Bytes;" })
+    {
+        if (!body.contains(QLatin1String(wire))) ::minitest::fail(__FILE__, __LINE__, "helper input wired", wire);
+    }
+    // The GPU copies are untouched.
+    ASSERT_EQ(1, body.count(QStringLiteral("task.ownedGpuAmazeTextureRawFrame.assign(")));
+    ASSERT_EQ(1, body.count(QStringLiteral("task.ownedGpuPlaybackReconTextureBayerFrame.assign(")));
+    ASSERT_EQ(1, body.count(QStringLiteral("task.ownedGpuPlaybackReconTextureInputBayerFrame.assign(")));
+    // Hand-off: moved, with the span start; the fail-closed hash only under smoke telemetry.
+    ASSERT_TRUE(body.contains(QStringLiteral("enqueuePlaybackPrepTask( std::move( task ), handoffStartStageTime );")));
+    ASSERT_TRUE(body.indexOf(QStringLiteral("const double handoffStartStageTime = mlv_stage_timing_now();")) < helperAt);
+    ASSERT_TRUE(body.contains(QStringLiteral("if( task.borrowedSlotRgb16 && m_playbackSmokeFrameTelemetry )")));
+}
+
+TEST(PlaybackPrepOwnership, EnqueueAndDequeueMoveNeverCopy)
+{
+    const QString enqueue = enqueueBody();
+    ASSERT_FALSE(enqueue.isEmpty());
+    ASSERT_TRUE(enqueue.contains(QStringLiteral("PlaybackPrepTask ownedTask = std::move( task );")));
+    ASSERT_TRUE(enqueue.contains(QStringLiteral("m_playbackPrepPending = std::move( ownedTask );")));
+    ASSERT_FALSE(enqueue.contains(QStringLiteral("m_playbackPrepPending = ownedTask;")));
+    // The replaced-before-compute release still reads the OLD pending serial before the store.
+    const int releaseAt = enqueue.indexOf(QStringLiteral("m_playbackPrepPending.requestSerial );"));
+    const int storeAt = enqueue.indexOf(QStringLiteral("m_playbackPrepPending = std::move( ownedTask );"));
+    ASSERT_TRUE(releaseAt >= 0 && storeAt > releaseAt);
+    ASSERT_EQ(2, enqueue.count(QStringLiteral("rebindOwnedImagePointers();")));
+    ASSERT_TRUE(enqueue.contains(QStringLiteral("QStringLiteral(\"playback_prep_handoff_ms\")")));
+    // The header takes an rvalue: a caller cannot hand it a copy by accident.
+    ASSERT_TRUE(readRepoFile(QStringLiteral("platform/qt/MainWindow.h"))
+                    .contains(QStringLiteral("void enqueuePlaybackPrepTask( PlaybackPrepTask &&task, double handoffStartStageTime );")));
+
+    const QString loop = prepThreadLoopBody();
+    ASSERT_FALSE(loop.isEmpty());
+    ASSERT_TRUE(loop.contains(QStringLiteral("task = std::move( m_playbackPrepPending );\n            task.rebindOwnedImagePointers();\n            m_playbackPrepPending = PlaybackPrepTask();")));
+    ASSERT_FALSE(loop.contains(QStringLiteral("task = m_playbackPrepPending;")));
+    // The worker re-hashes the borrowed frame after its build, while the slot is still pinned.
+    const int buildAt = loop.indexOf(QStringLiteral("PlaybackPrepResult result = buildPlaybackPrepResult( task, &threadState );"));
+    const int hashAt = loop.indexOf(QStringLiteral("playbackPrepSampledRgb16Fnv( task.sourceImage16, task.borrowedRgb16Words )"));
+    const int pushAt = loop.indexOf(QStringLiteral("m_playbackPrepResults.push_back( std::move( result ) );"));
+    ASSERT_TRUE(buildAt >= 0 && hashAt > buildAt && pushAt > hashAt);
+    ASSERT_TRUE(loop.contains(QStringLiteral("m_playbackPrepBorrowedRgb16MutatedCount.fetch_add( 1, std::memory_order_acq_rel );")));
+}
+
+TEST(PlaybackPrepOwnership, PresentingSlotsStayPinnedAndTheOneInitSiteIsDrained)
+{
+    const QString rft = readRepoFile(QStringLiteral("platform/qt/RenderFrameThread.cpp"));
+    // findFreeSlotLocked never hands a presenting (or ready, or rendering) slot to a render.
+    const QString freeSlot = bracedBlockAfter(rft, QStringLiteral("int RenderFrameThread::findFreeSlotLocked() const"));
+    ASSERT_TRUE(freeSlot.contains(QStringLiteral("if( slot.ready || slot.presenting ) continue;")));
+    ASSERT_TRUE(freeSlot.contains(QStringLiteral("if( i == m_renderingSlotIndex ) continue;")));
+    ASSERT_TRUE(freeSlot.contains(QStringLiteral("if( slot.state.load( std::memory_order_acquire ) != SlotState::Idle ) continue;")));
+    // Acquire pins it; only the by-serial release unpins it.
+    const QString acquire = functionBody(rft, QStringLiteral("bool RenderFrameThread::acquireReadySlotLocked( ReadyFrame *frame,"),
+                                         QStringLiteral("void RenderFrameThread::releasePresentedFrame()"));
+    ASSERT_TRUE(acquire.contains(QStringLiteral("slot.presenting = true;")));
+    ASSERT_TRUE(acquire.contains(QStringLiteral("frame->rawImage16 = slot.rawImage16.empty() ? nullptr : slot.rawImage16.data();")));
+    // A playback cancel keeps a Presenting slot pinned.
+    ASSERT_TRUE(rft.contains(QStringLiteral("// A Presenting slot stays pinned: its borrower releases it by serial.")));
+    // init is the one writer that ignores the pin: it has exactly one caller, after the prep drain
+    // and the lifecycle backstop (both abort the open when the worker does not go idle).
+    const QString mw = mainWindowSource();
+    ASSERT_EQ(1, mw.count(QStringLiteral("m_pRenderThread->init(")));
+    for (const QString & file : { QStringLiteral("platform/qt/RenderFrameThread.cpp"), QStringLiteral("platform/qt/GpuDisplayWindow.cpp"),
+                                  QStringLiteral("platform/qt/GpuDisplayViewport.cpp") })
+        ASSERT_EQ(0, readRepoFile(file).count(QStringLiteral("->init( m_pMlvObject")));
+    const QString open = functionBody(mw, QStringLiteral("int MainWindow::openMlv( QString fileName )"),
+                                      QStringLiteral("m_pendingPresentationRequests.clear();"));
+    ASSERT_FALSE(open.isEmpty());
+    const int quiescentAt = open.indexOf(QStringLiteral("if( !playbackPrepQuiescentBeforeClipReplacement( \"clip-open\" ) )\n    {\n        return kClipOpenAbortedPrepBusy;"));
+    const int backstopAt = open.indexOf(QStringLiteral("if( !freeActiveMlvObjectAfterLifecycleBarrier( \"clip-open\" ) )"));
+    const int initAt = open.indexOf(QStringLiteral("m_pRenderThread->init( m_pMlvObject,"));
+    ASSERT_TRUE(quiescentAt >= 0 && backstopAt > quiescentAt && initAt > backstopAt);
+    // Nothing between the backstop and init pumps events (a pump could start a new prep task).
+    const QString tail = open.mid(backstopAt, initAt - backstopAt);
+    ASSERT_FALSE(tail.contains(QStringLiteral("processEvents")));
+    ASSERT_FALSE(tail.contains(QStringLiteral("clearPresentationForClipOpen(")));
+    // The guard drops the pending task and drains the in-flight one; the backstop drains again.
+    const QString quiescent = bracedBlockAfter(mw, QStringLiteral("bool MainWindow::playbackPrepQuiescentBeforeClipReplacement( const char *reason )"));
+    ASSERT_TRUE(quiescent.contains(QStringLiteral("invalidatePlaybackPrepForDisplayChange( reason );")));
+    ASSERT_TRUE(quiescent.contains(QStringLiteral("drainPlaybackPrepInFlight( reason, 2000 )")));
+    const QString backstop = bracedBlockAfter(mw, QStringLiteral("bool MainWindow::freeActiveMlvObjectAfterLifecycleBarrier( const char *reason )"));
+    ASSERT_TRUE(backstop.contains(QStringLiteral("const bool prepMutationAllowed = waitForRenderThreadIdleBeforeCoreMutation( barrierReason );")));
+    ASSERT_TRUE(backstop.contains(QStringLiteral("return prepMutationAllowed;")));
+}
+
+TEST(PlaybackPrepOwnership, PrepSummaryAppendsTheHandoffFields)
+{
+    const QString finish = finishSmokeBody();
+    // Existing fields keep their names and positions; the new ones ride on handoffFields.
+    const QString format = summaryFormat(finish, QStringLiteral("playback_smoke.prep_summary session=%1"));
+    ASSERT_TRUE(format.contains(QStringLiteral("avg_playback_prep_region_image_viewport_ms=%38\" )")));
+    for (const char * field : { "avg_playback_prep_handoff_ms=%1", "handoff_borrowed_rgb16_frames=%2",
+                                "handoff_owned_rgb16_bytes=%3", "handoff_borrowed_rgb16_mutated_frames=%4",
+                                "avg_playback_prep_region_image_magenta_ms=%5", "avg_playback_prep_region_image_hash_ms=%6",
+                                "avg_playback_prep_region_image_set_pixmap_ms=%7", "avg_playback_prep_region_image_release_ms=%8" })
+    {
+        if (finish.count(QLatin1String(field)) != 1) ::minitest::fail(__FILE__, __LINE__, "prep_summary field", field);
+    }
+    ASSERT_TRUE(finish.contains(QStringLiteral("QStringLiteral( \" avg_playback_prep_handoff_ms=%1 ")));
+    // The mutation count is the session's delta of the worker's counter.
+    ASSERT_TRUE(finish.contains(QStringLiteral("m_playbackPrepBorrowedRgb16MutatedCount.load( std::memory_order_acquire )\n            - m_playbackSmokeStartPrepBorrowedRgb16Mutated;")));
+    ASSERT_TRUE(beginSmokeBody().contains(QStringLiteral("m_playbackSmokeStartPrepBorrowedRgb16Mutated =\n        m_playbackPrepBorrowedRgb16MutatedCount.load( std::memory_order_acquire );")));
+    // Summed on CPU-route frames from the per-frame keys.
+    const QString gated = bracedBlockAfter(
+        notePresentedFrameBody(), QStringLiteral("if( telemetryBoolValue( timing, \"playback_prep_cpu_route_active\" ) )"));
+    for (const char * key : { "playback_prep_handoff_ms", "playback_prep_handoff_borrowed_rgb16", "playback_prep_owned_rgb16_bytes",
+                              "playback_prep_region_image_magenta_ms", "playback_prep_region_image_hash_ms",
+                              "playback_prep_region_image_set_pixmap_ms", "playback_prep_region_image_release_ms" })
+    {
+        if (!gated.contains(QStringLiteral("timing, \"%1\" )").arg(QLatin1String(key))))
+            ::minitest::fail(__FILE__, __LINE__, "summed on CPU-route frames", key);
+    }
+    // Each residual key is produced once in the present.
+    const QString present = presentPreparedBody();
+    for (const char * key : { "playback_prep_region_image_magenta_ms", "playback_prep_region_image_hash_ms",
+                              "playback_prep_region_image_set_pixmap_ms", "playback_prep_region_image_release_ms" })
+        ASSERT_EQ(1, present.count(QStringLiteral("QStringLiteral(\"%1\")").arg(QLatin1String(key))));
 }

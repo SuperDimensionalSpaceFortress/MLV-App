@@ -5,6 +5,7 @@
 #include <QElapsedTimer>
 
 #include <algorithm>
+#include <cstdint>
 #include <cstring>
 #include <omp.h>
 
@@ -125,6 +126,68 @@ uint16_t * PlaybackPrepCpuWorkspace::reducedInput(size_t words)
         m_reducedInputWords = words;
     }
     return m_reducedInput.get();
+}
+
+std::vector<uint8_t> PlaybackPrepRgb8Pool::take()
+{
+    std::lock_guard<std::mutex> lk(m_mutex);
+    if ( m_held.empty() )
+    {
+        ++m_takeMisses;
+        return std::vector<uint8_t>();
+    }
+    size_t best = 0;
+    for ( size_t i = 1; i < m_held.size(); ++i )
+        if ( m_held[i].capacity() > m_held[best].capacity() ) best = i;
+    std::vector<uint8_t> buf = std::move(m_held[best]);
+    m_held.erase(m_held.begin() + static_cast<std::ptrdiff_t>(best));
+    ++m_takeHits;
+    return buf;
+}
+
+void PlaybackPrepRgb8Pool::give(std::vector<uint8_t> && buf, uint64_t generation)
+{
+    std::vector<uint8_t> dropped(std::move(buf));
+    if ( dropped.capacity() == 0 ) return;
+    std::lock_guard<std::mutex> lk(m_mutex);
+    /* r4: outside a playing span, or from a task admitted before the play-start, freed. */
+    if ( !m_open || generation < m_minGeneration || m_held.size() >= kMaxHeld ) return;   /* freed by `dropped` after the unlock */
+    m_held.push_back(std::move(dropped));
+}
+
+void PlaybackPrepRgb8Pool::open(uint64_t playGeneration)
+{
+    std::lock_guard<std::mutex> lk(m_mutex);
+    if ( playGeneration > m_minGeneration ) m_minGeneration = playGeneration;
+    m_open = true;
+}
+
+void PlaybackPrepRgb8Pool::clear(uint64_t currentGeneration)
+{
+    std::vector<std::vector<uint8_t>> dropped;
+    std::lock_guard<std::mutex> lk(m_mutex);
+    dropped.swap(m_held);
+    m_open = false;
+    const uint64_t floor = currentGeneration == UINT64_MAX ? UINT64_MAX : currentGeneration + 1;
+    if ( floor > m_minGeneration ) m_minGeneration = floor;
+}
+
+size_t PlaybackPrepRgb8Pool::held() const
+{
+    std::lock_guard<std::mutex> lk(m_mutex);
+    return m_held.size();
+}
+
+uint64_t PlaybackPrepRgb8Pool::takeHits() const
+{
+    std::lock_guard<std::mutex> lk(m_mutex);
+    return m_takeHits;
+}
+
+uint64_t PlaybackPrepRgb8Pool::takeMisses() const
+{
+    std::lock_guard<std::mutex> lk(m_mutex);
+    return m_takeMisses;
 }
 
 uint64_t PlaybackPrepCpuWorkspace::refusalCount(PlaybackPrepReducedRefusal refusal) const
@@ -352,19 +415,20 @@ PlaybackPrepCpuRouteResult playbackPrepCpuRouteRun(PlaybackPrepCpuWorkspace & wo
     result.processedHeight = height;
     if ( !out8 || width <= 0 || height <= 0 ) return result;
 
-    /* Tier 1 off (the default): every frame gets the pre-card value-initialised
-     * 16-bit buffer and the unfused 16-bit pass; tier 1 on: the workspace's
-     * persistent scratch, and only when a post-pass needs the 16-bit result. */
+    /* Tier 1 off (the default): the unfused 16-bit pass; tier 1 on: only when a
+     * post-pass needs the 16-bit result. Either way the 16-bit buffer is the
+     * workspace's persistent scratch (reallocated only when the dims change, never
+     * zero-filled). CPU-S1-PACE-NEXT-LEVER-1 (Part B): tier 1 off used to zero a new
+     * width*height*3 buffer every frame (avg_playback_prep_alloc_ms ~9-10 ms at
+     * 1808x2268); the 16-bit pass writes every word before the conversion reads it
+     * (PrepPointwiseFast.Tier1OffWorkspaceScratchIsByteIdenticalWhenPoisoned). */
     const bool tier1 = gpuPreviewProcessingTier1Enabled();
     const bool scratchNeeded =
         !tier1 || !config.enabled || gpuPreviewProcessingCpuHasSpatialPostPass(config);
-    std::vector<uint16_t> frameBuffer16;
     auto scratchFor = [&](int w, int h) -> uint16_t *
     {
         if ( !scratchNeeded ) return nullptr;
-        if ( tier1 ) return workspace.scratch16(w, h);
-        frameBuffer16.assign(static_cast<size_t>(w) * static_cast<size_t>(h) * 3u, 0);
-        return frameBuffer16.data();
+        return workspace.scratch16(w, h);
     };
     const int factor = decision.factor;
     if ( factor > 1 && input16
@@ -373,6 +437,7 @@ PlaybackPrepCpuRouteResult playbackPrepCpuRouteRun(PlaybackPrepCpuWorkspace & wo
         const int rw = width / factor;
         const int rh = height / factor;
         qint64 startNs = clock.nsecsElapsed();
+        result.out8Allocated = out8->capacity() < static_cast<size_t>(rw) * rh * 3u;
         out8->resize(static_cast<size_t>(rw) * rh * 3u);
         uint16_t * reducedInput = workspace.reducedInput(static_cast<size_t>(rw) * rh * 3u);
         uint16_t * scratch = scratchFor(rw, rh);
@@ -398,6 +463,10 @@ PlaybackPrepCpuRouteResult playbackPrepCpuRouteRun(PlaybackPrepCpuWorkspace & wo
     }
 
     qint64 startNs = clock.nsecsElapsed();
+    /* CPU-S1-PACE-NEXT-LEVER-1 r3: out8 is a PlaybackPrepRgb8Pool buffer on the
+     * playing route, so this resize reuses its capacity (r2: 3.6 ms per frame of
+     * alloc + zero-fill at 1808x2268 with a fresh vector). */
+    result.out8Allocated = out8->capacity() < static_cast<size_t>(width) * height * 3u;
     out8->resize(static_cast<size_t>(width) * height * 3u);
     uint16_t * scratch = scratchFor(width, height);
     result.allocMs = spanMs(clock, startNs);
@@ -405,6 +474,12 @@ PlaybackPrepCpuRouteResult playbackPrepCpuRouteRun(PlaybackPrepCpuWorkspace & wo
     {
         gpuPreviewProcessingApplyCpuReferenceTo8(config, input16, scratch,
                                                  out8->data(), width, height, &result.spans);
+    }
+    else
+    {
+        /* r3 (adversary A3 on e7e5271e): no input develops nothing; a recycled out8
+         * must read as the zeroed buffer a fresh one was, never as a stale frame. */
+        std::fill(out8->begin(), out8->end(), static_cast<uint8_t>(0));
     }
     return result;
 }

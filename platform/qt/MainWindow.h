@@ -36,6 +36,7 @@
 #include "PlaybackFrameRange.h"
 #include "PlaybackNativePaceGuard.h"
 #include "PlaybackPrepInFlightGate.h"
+#include "PlaybackPrepOwnership.h"
 #include "PlaybackPresentTrace.h"
 #include "PlaybackScopesDuringPlayback.h"
 #include "PlaybackSlipHistogram.h"
@@ -45,6 +46,7 @@
 #include "PlaybackRoutePrewarmPolicy.h"
 #include "PlaybackReconWarmRunPolicy.h"
 #include "GuiPresentGapIdle.h"
+#include "ReconWorkerSplit.h"
 #include "../../src/mlv_include.h"
 #include "InfoDialog.h"
 #include "StatusDialog.h"
@@ -54,6 +56,7 @@
 #include "GraphicsPickerScene.h"
 #include "MainWindowGpuPreviewPolicy.h"
 #include "GpuPreviewProcessing.h"
+#include "PlaybackPrepCpuRoute.h"   // r3: PlaybackPrepRgb8Pool member below; after mlv_include.h, whose extern "C" block must see the C processing headers first
 #include "RenderFrameThread.h"
 #include "ClipLifecycleBarrier.h"
 #include "GradientElement.h"
@@ -729,6 +732,13 @@ private:
         bool displayPreviewCachingAllowed = false;
         bool playbackFastScaleActive = false;
         GpuDisplayViewport::PresentationOptions gpuPresentationOptions;
+        // CPU-S1-PACE-NEXT-LEVER-1 (Part A): sourceImage16 is the pinned slot's buffer, not a
+        // copy (playbackPrepMayBorrowSlotRgb16). The hash is set only under smoke frame
+        // telemetry; the prep worker re-hashes after its build (fail-closed lifetime check).
+        bool borrowedSlotRgb16 = false;
+        bool borrowedRgb16HashValid = false;
+        uint32_t borrowedRgb16Fnv = 0;
+        size_t borrowedRgb16Words = 0;
         std::vector<uint8_t> ownedSourceImage;
         std::vector<uint16_t> ownedSourceImage16;
         std::vector<float> ownedGpuAmazeTextureRawFrame;
@@ -1324,6 +1334,7 @@ private:
     uint64_t m_playbackSmokeStartPrepGenerationDrops = 0;
     uint64_t m_playbackSmokeStartPresentNothingDrops = 0;
     uint64_t m_playbackSmokeStartPrepReplacedBefore = 0;
+    uint64_t m_playbackSmokeStartPrepBorrowedRgb16Mutated = 0;
     uint64_t m_playbackSmokeStartPrepReplacedAfter = 0;
     uint64_t m_playbackSmokeStartScopeUpdates = 0;
     uint64_t m_playbackSmokeStartScopeSkips = 0;
@@ -1571,8 +1582,23 @@ private:
         double regionFinishMs = 0.0;
         double regionTotalMs = 0.0;
         double regionUnattributedMs = 0.0;
+        // CPU-S1-RECON-UNDER-LOOK-PACE-LEVER-1 (Part B): region_image's QPixmap::fromImage and
+        // GpuDisplayViewport::presentImage calls.
+        double regionImageFromImageMs = 0.0;
+        double regionImageViewportMs = 0.0;
+        // CPU-S1-PACE-NEXT-LEVER-1: drawFrameReady's hand-off (ownership block through the
+        // pending-task store) and region_image's remaining calls, CPU-route frames only.
+        double handoffMs = 0.0;
+        quint64 handoffBorrowedRgb16Frames = 0;
+        quint64 handoffOwnedRgb16Bytes = 0;
+        double regionImageMagentaMs = 0.0;
+        double regionImageHashMs = 0.0;
+        double regionImageSetPixmapMs = 0.0;
+        double regionImageReleaseMs = 0.0;
     };
     PlaybackSmokePrepSpanTotals m_playbackSmokePrepSpans;
+    // CPU-S1-RECON-UNDER-LOOK-PACE-LEVER-1 (Part A): the recon worker's sub-spans on presented frames.
+    recon_worker_split::Totals m_playbackSmokeReconWorkerSplit;
     // CPU-S2-WINDOWED-GUI-PRESENT-TELEMETRY-1: GUI-thread wall time from one prep present's exit to
     // the next prep result's entry, less the event loop's blocked (idle) time in between, and less
     // the preview viewport paint inside it for "other busy" (playback_smoke.gui_present_summary).
@@ -1595,6 +1621,22 @@ private:
     qint64 m_guiPresentGapRunnerSleepNs = 0;
     double m_guiPresentGapPaintStartMs = 0.0;
     bool m_guiPresentIdleProbeConnected = false;
+    // CPU-S1-RECON-UNDER-LOOK-PACE-LEVER-1 (Part B): other busy split by GUI handler (GuiPresentGapIdle.h).
+    // The serial names the open gap (0 = none), so a span counts only inside one gap.
+    quint64 m_guiPresentGapSerial = 0;
+    gui_present_gap::OtherBusySpans m_guiOtherBusySpans;
+    gui_present_gap::SpanClock guiOtherBusySpanClock( void ) const;
+    class GuiOtherBusyScope
+    {
+    public:
+        GuiOtherBusyScope( MainWindow *window, gui_present_gap::OtherBusySpan span );
+        ~GuiOtherBusyScope();
+        GuiOtherBusyScope( const GuiOtherBusyScope & ) = delete;
+        GuiOtherBusyScope &operator=( const GuiOtherBusyScope & ) = delete;
+    private:
+        MainWindow *m_window;
+        gui_present_gap::OtherBusySpan m_span;
+    };
     double m_playbackSmokePrepWorkerTotalSumMs = 0.0;
     double m_playbackSmokePrepResultQueueSumMs = 0.0;
     double m_playbackSmokePrepTotalBeforeFinishSumMs = 0.0;
@@ -1734,10 +1776,16 @@ private:
     PlaybackPrepTask m_playbackPrepPending;
     std::deque<PlaybackPrepResult> m_playbackPrepResults;
     PlaybackPrepInFlightGate m_playbackPrepInFlight;
+    // CPU-S1-PACE-NEXT-LEVER-1 r3: the CPU route's 8-bit buffers, taken by the prep thread and
+    // given back by onPlaybackPrepResultReady once the frame is presented (thread-safe).
+    PlaybackPrepRgb8Pool m_playbackPrepRgb8Pool;
     std::atomic<uint64_t> m_playbackPrepStaleDropCount{0};
     std::atomic<uint64_t> m_playbackPrepGenerationDropCount{0};
     std::atomic<uint64_t> m_playbackPrepReplacedBeforeComputeCount{0};
     std::atomic<uint64_t> m_playbackPrepReplacedAfterComputeCount{0};
+    // CPU-S1-PACE-NEXT-LEVER-1: borrowed RGB16 frames whose sampled hash changed between the
+    // enqueue and the end of the prep worker's build (must stay 0).
+    std::atomic<uint64_t> m_playbackPrepBorrowedRgb16MutatedCount{0};
     std::atomic<uint64_t> m_presentNothingDropCount{0};
     bool m_lastPresentedFrameUsedGpuBilinearDebayer = false;
     int m_lastPresentedPlaybackScaleFactorActive = 1;
@@ -1876,7 +1924,7 @@ private:
                                            QRect *outGeometry,
                                            QSize *outPreviewSize );
     void onPlaybackSmokeApplicationStateChanged( Qt::ApplicationState state );
-    void enqueuePlaybackPrepTask( const PlaybackPrepTask &task );
+    void enqueuePlaybackPrepTask( PlaybackPrepTask &&task, double handoffStartStageTime );
     void invalidatePlaybackPrepForDisplayChange( const char *reason );
     PlaybackPrepDrainOutcome drainPlaybackPrepInFlight( const char *reason, int timeoutMs );
     // Returns playbackPrepBorrowFreeingMutationAllowed for its drain: a caller that

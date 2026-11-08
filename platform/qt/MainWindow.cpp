@@ -2932,6 +2932,7 @@ static int mlvappStartPlaybackTimer( QObject *owner, double framerate )
 
 void MainWindow::timerFrameEvent( bool predictivePlaybackAdvance )
 {
+    const GuiOtherBusyScope otherBusySpan( this, gui_present_gap::OtherBusySpan::TimerFrame );
     // No render starts during a Look Assist analysis. m_frameChanged stays set, so the first tick after landing draws.
     if( m_lookAssistPump.sessionOpen() ) return;
 
@@ -4059,9 +4060,12 @@ void MainWindow::queuePlaybackLookaheadRequests(
 // Playback-prep worker queue. drawFrameReady now dispatches work to a background
 // thread, then marshals completion back to the UI thread for final presentation.
 // Conflation is by request serial: only the latest requested serial can present.
-void MainWindow::enqueuePlaybackPrepTask( const PlaybackPrepTask &task )
+// CPU-S1-PACE-NEXT-LEVER-1 (Part A): the task is moved, never copied (each copy of a CPU-route
+// task duplicated its owned RGB16 frame). handoffStartStageTime opens playback_prep_handoff_ms,
+// closed once the task is stored as pending.
+void MainWindow::enqueuePlaybackPrepTask( PlaybackPrepTask &&task, double handoffStartStageTime )
 {
-    PlaybackPrepTask ownedTask = task;
+    PlaybackPrepTask ownedTask = std::move( task );
     ownedTask.rebindOwnedImagePointers();
 
     const uint64_t activeGeneration =
@@ -4094,9 +4098,15 @@ void MainWindow::enqueuePlaybackPrepTask( const PlaybackPrepTask &task )
                 m_pRenderThread->releasePresentedFrameForRequestSerial(
                     m_playbackPrepPending.requestSerial );
         }
-        m_playbackPrepPending = ownedTask;
+        m_playbackPrepPending = std::move( ownedTask );
         m_playbackPrepPending.rebindOwnedImagePointers();
         m_playbackPrepPendingValid = true;
+        if( handoffStartStageTime > 0.0 )
+        {
+            m_playbackPrepPending.readyFrame.stageTimingTelemetry.insert(
+                QStringLiteral("playback_prep_handoff_ms"),
+                ( mlv_stage_timing_now() - handoffStartStageTime ) * 1000.0 );
+        }
     }
     m_playbackPrepCv.notify_one();
 }
@@ -4125,9 +4135,11 @@ void MainWindow::invalidatePlaybackPrepForDisplayChange( const char *reason )
             m_playbackPrepPending = PlaybackPrepTask();
         }
         droppedResults = m_playbackPrepResults.size();
-        for( const PlaybackPrepResult &result : m_playbackPrepResults )
+        for( PlaybackPrepResult &result : m_playbackPrepResults )
         {
             serialsToRelease.push_back( result.task.requestSerial );
+            // r3 (adversary A1 on e7e5271e): a dropped result's 8-bit buffer is recycled too.
+            m_playbackPrepRgb8Pool.give( std::move( result.scopeSourceImage ), result.task.presentationGeneration );
         }
         m_playbackPrepResults.clear();
     }
@@ -4217,6 +4229,9 @@ PlaybackPrepDrainOutcome MainWindow::drainPlaybackPrepInFlight( const char *reas
 bool MainWindow::playbackPrepQuiescentBeforeClipReplacement( const char *reason )
 {
     invalidatePlaybackPrepForDisplayChange( reason );
+    // r4 (Dot B1): no recycled 8-bit buffer outlives the clip. After the bump above, so every task
+    // admitted before it is below the pool's floor and its late give() frees its buffer.
+    m_playbackPrepRgb8Pool.clear( m_playbackPresentationGeneration.load( std::memory_order_acquire ) );
     const PlaybackPrepDrainOutcome outcome = drainPlaybackPrepInFlight( reason, 2000 );
     if( playbackPrepBorrowFreeingMutationAllowed( outcome ) ) return true;
     logInteractionEvent(
@@ -4297,8 +4312,14 @@ void MainWindow::recordClipOpenSourceStamp()
 // on false. The destructor joins the prep thread before calling this.
 bool MainWindow::freeActiveMlvObjectAfterLifecycleBarrier( const char *reason )
 {
+    // r3 (adversary A2 on e7e5271e) / r4 (Dot B1, adversary A1 on 391464de): no recycled buffer outlives
+    // an unload. clear(g) raises the pool's floor to g + 1, so every task admitted at or before g gives
+    // its buffer back into the floor and has it freed, whatever the thread interleaving.
     if( !m_pMlvObject )
+    {
+        m_playbackPrepRgb8Pool.clear( m_playbackPresentationGeneration.load( std::memory_order_acquire ) );
         return playbackPrepBorrowFreeingMutationAllowed( drainPlaybackPrepInFlight( reason, 2000 ) );
+    }
 
     const QString reasonText =
         reason && *reason ? QString::fromLatin1( reason ) : QStringLiteral("unspecified");
@@ -4308,6 +4329,8 @@ bool MainWindow::freeActiveMlvObjectAfterLifecycleBarrier( const char *reason )
     m_fileLoaded = false;
     m_dontDraw = true;
     clearPresentationForClipOpen( barrierReason );
+    // r4: after clearPresentationForClipOpen's generation bump (and its queued-result give), before the drain.
+    m_playbackPrepRgb8Pool.clear( m_playbackPresentationGeneration.load( std::memory_order_acquire ) );
     const bool prepMutationAllowed = waitForRenderThreadIdleBeforeCoreMutation( barrierReason );
     drainLookAssistWorkers( barrierReason );
     m_clipLifecycleBarrier.waitForNoBorrowers();
@@ -4330,8 +4353,9 @@ bool MainWindow::freeActiveMlvObjectAfterLifecycleBarrier( const char *reason )
 // CPU route's scratch, reduced-input buffer and reduced-mask cache, and one avir
 // thread pool instead of one per frame. Callers without it (the inline GUI-thread
 // prep) get per-call temporaries, the pre-card behaviour.
-// D1 (r2): the tier-1 uses of this object -- the persistent full-size scratch
-// and the shared avir pool -- follow MLVAPP_PLAYBACK_PREP_TIER1 (default off).
+// D1 (r2): the tier-1 use of this object -- the shared avir pool -- follows
+// MLVAPP_PLAYBACK_PREP_TIER1 (default off). The persistent full-size 16-bit
+// scratch is used with the switch off too (CPU-S1-PACE-NEXT-LEVER-1 Part B).
 // The object itself is always built: tier 2 cannot run without it. Its
 // reduced-input buffer and reduced-mask cache live in `cpu`, and tier 2 is
 // eligible only when it exists (reducedInputs.playbackActive below requires
@@ -4550,7 +4574,10 @@ MainWindow::PlaybackPrepResult MainWindow::buildPlaybackPrepResult( const Playba
                                              task.mlvWidth,
                                              task.mlvHeight,
                                              &reducedSourceConfig );
-        std::vector<uint8_t> cpuPreviewRgb8;
+        // CPU-S1-PACE-NEXT-LEVER-1 r3: on the worker, develop into a recycled buffer (given back
+        // by onPlaybackPrepResultReady after the present) instead of a fresh 12 MB vector per frame.
+        std::vector<uint8_t> cpuPreviewRgb8 =
+            threadState ? m_playbackPrepRgb8Pool.take() : std::vector<uint8_t>();
         const PlaybackPrepCpuRouteResult cpuRoute =
             playbackPrepCpuRouteRun( cpuWorkspace,
                                      reducedSource ? reducedSourceConfig : gpuPreviewProcessingConfig,
@@ -4573,6 +4600,7 @@ MainWindow::PlaybackPrepResult MainWindow::buildPlaybackPrepResult( const Playba
         QJsonObject &spanTelemetry = result.task.readyFrame.stageTimingTelemetry;
         spanTelemetry.insert( QStringLiteral("playback_prep_cpu_route_active"), true );
         spanTelemetry.insert( QStringLiteral("playback_prep_alloc_ms"), cpuRoute.allocMs );
+        spanTelemetry.insert( QStringLiteral("playback_prep_out8_allocated"), cpuRoute.out8Allocated );
         spanTelemetry.insert( QStringLiteral("playback_prep_reduce_ms"), cpuRoute.reduceMs );
         spanTelemetry.insert( QStringLiteral("playback_prep_sh_expand_ms"), cpuRoute.spans.shExpandMs );
         spanTelemetry.insert( QStringLiteral("playback_prep_pointwise_ms"), cpuRoute.spans.pointwiseMs );
@@ -4953,8 +4981,10 @@ void MainWindow::playbackPrepThreadLoop( void )
                     || m_playbackPrepPendingValid;
             } );
             if( m_playbackPrepStop.load( std::memory_order_acquire ) ) return;
-            task = m_playbackPrepPending;
+            // CPU-S1-PACE-NEXT-LEVER-1 (Part A): moved out, never copied.
+            task = std::move( m_playbackPrepPending );
             task.rebindOwnedImagePointers();
+            m_playbackPrepPending = PlaybackPrepTask();
             m_playbackPrepPendingValid = false;
             m_playbackPrepInFlight.beginLocked( task.requestSerial );
         }
@@ -4987,6 +5017,14 @@ void MainWindow::playbackPrepThreadLoop( void )
         PlaybackPrepResult result = buildPlaybackPrepResult( task, &threadState );
         result.workerQueueMs = task.workerQueueMs;
         result.workerTotalMs = ( mlv_stage_timing_now() - workerStart ) * 1000.0;
+        // CPU-S1-PACE-NEXT-LEVER-1: the borrowed slot must not have changed under the build
+        // (the slot is still pinned here; it is released only at present or on a drop).
+        if( task.borrowedSlotRgb16 && task.borrowedRgb16HashValid
+         && playbackPrepSampledRgb16Fnv( task.sourceImage16, task.borrowedRgb16Words )
+                != task.borrowedRgb16Fnv )
+        {
+            m_playbackPrepBorrowedRgb16MutatedCount.fetch_add( 1, std::memory_order_acq_rel );
+        }
 
         // Generation changes invalidate display assumptions. Serial changes
         // only mean a newer request exists: discarding every completed frame
@@ -5001,6 +5039,7 @@ void MainWindow::playbackPrepThreadLoop( void )
             ++m_playbackPrepGenerationDropCount;
             if( m_pRenderThread )
                 m_pRenderThread->releasePresentedFrameForRequestSerial( result.task.requestSerial );
+            m_playbackPrepRgb8Pool.give( std::move( result.scopeSourceImage ), result.task.presentationGeneration );   // r3 (adversary A1 on e7e5271e)
             m_playbackPrepInFlight.endLocked();
             continue;
         }
@@ -5009,6 +5048,7 @@ void MainWindow::playbackPrepThreadLoop( void )
             std::lock_guard<std::mutex> lk( m_playbackPrepMutex );
             if( m_pRenderThread )
                 m_pRenderThread->releasePresentedFrameForRequestSerial( result.task.requestSerial );
+            m_playbackPrepRgb8Pool.give( std::move( result.scopeSourceImage ), result.task.presentationGeneration );   // r3 (adversary A1 on e7e5271e)
             m_playbackPrepInFlight.endLocked();
             continue;
         }
@@ -5018,13 +5058,15 @@ void MainWindow::playbackPrepThreadLoop( void )
             std::lock_guard<std::mutex> lk( m_playbackPrepMutex );
             if( !m_playbackPrepResults.empty() )
             {
-                for( const PlaybackPrepResult &staleResult : m_playbackPrepResults )
+                for( PlaybackPrepResult &staleResult : m_playbackPrepResults )
                 {
                     ++m_playbackPrepStaleDropCount;
                     ++m_playbackPrepReplacedAfterComputeCount;
                     if( m_pRenderThread )
                         m_pRenderThread->releasePresentedFrameForRequestSerial(
                             staleResult.task.requestSerial );
+                    // r3 (adversary A1 on e7e5271e): the replaced result's buffer is recycled, not freed.
+                    m_playbackPrepRgb8Pool.give( std::move( staleResult.scopeSourceImage ), staleResult.task.presentationGeneration );
                 }
                 m_playbackPrepResults.clear();
             }
@@ -5075,6 +5117,7 @@ void MainWindow::onPlaybackPrepResultReady( void )
             true );
         if( m_pRenderThread )
             m_pRenderThread->releasePresentedFrameForRequestSerial( result.task.requestSerial );
+        m_playbackPrepRgb8Pool.give( std::move( result.scopeSourceImage ), result.task.presentationGeneration );   // r3 (adversary A1 on e7e5271e)
         m_frameStillDrawing = renderThreadBusyForPlaybackAdvance( currentPlaybackAdvanceTarget() );
         return;
     }
@@ -5090,6 +5133,10 @@ void MainWindow::onPlaybackPrepResultReady( void )
     }
 
     presentPlaybackPreparedFrame( result );
+    // CPU-S1-PACE-NEXT-LEVER-1 r3: the present is done with the developed frame (nothing keeps a
+    // pointer into it past this point: it used to be freed right here), so its buffer goes back
+    // to the prep worker's pool.
+    m_playbackPrepRgb8Pool.give( std::move( result.scopeSourceImage ), result.task.presentationGeneration );
     openGuiPresentGap();
 }
 
@@ -5104,7 +5151,36 @@ void MainWindow::openGuiPresentGap( void )
     if( !m_playbackSmokeActive || !m_guiPresentIdleProbeConnected ) return;
     m_guiPresentGapRunnerSleepNs = 0;
     m_guiPresentGapPaintStartMs = ui->graphicsView->paintTiming().sumMs;
+    ++m_guiPresentGapSerial;
+    m_guiOtherBusySpans.openGap();
     m_guiPresentGapStartNs = m_guiPresentGapClock.nsecsElapsed();
+}
+
+// CPU-S1-RECON-UNDER-LOOK-PACE-LEVER-1 (Part B): the clock a GUI handler span reads at its start and
+// end. gapSerial 0 = no gap open, so a span outside a gap (or across a gap's open or close) is dropped.
+gui_present_gap::SpanClock MainWindow::guiOtherBusySpanClock( void ) const
+{
+    gui_present_gap::SpanClock clock;
+    clock.gapSerial = m_guiPresentGapStartNs >= 0 ? m_guiPresentGapSerial : 0;
+    clock.nowNs = m_guiPresentGapClock.nsecsElapsed();
+    clock.idleNs = m_guiPresentGapIdle.idleNs;
+    clock.runnerSleepNs = m_guiPresentGapRunnerSleepNs;
+    clock.paintMs = ui->graphicsView->paintTiming().sumMs;
+    return clock;
+}
+
+// Only inside a smoke session whose idle probe is connected (the gap is never open otherwise): one
+// branch per handler call when off.
+MainWindow::GuiOtherBusyScope::GuiOtherBusyScope( MainWindow *window, gui_present_gap::OtherBusySpan span )
+    : m_window( ( window->m_playbackSmokeActive && window->m_guiPresentIdleProbeConnected ) ? window : nullptr )
+    , m_span( span )
+{
+    if( m_window ) m_window->m_guiOtherBusySpans.begin( m_window->guiOtherBusySpanClock() );
+}
+
+MainWindow::GuiOtherBusyScope::~GuiOtherBusyScope()
+{
+    if( m_window ) m_window->m_guiOtherBusySpans.end( m_span, m_window->guiOtherBusySpanClock() );
 }
 
 void MainWindow::closeGuiPresentGap( void )
@@ -5127,6 +5203,7 @@ void MainWindow::closeGuiPresentGap( void )
     gaps.busyMaxMs = qMax( gaps.busyMaxMs, split.busyMs );
     gaps.otherBusySumMs += split.otherBusyMs;
     gaps.otherBusyMaxMs = qMax( gaps.otherBusyMaxMs, split.otherBusyMs );
+    m_guiOtherBusySpans.closeGap( split.otherBusyMs );
     m_guiPresentGapStartNs = -1;
     m_guiPresentGapIdle = gui_present_gap::IdleWaits();
 }
@@ -6592,6 +6669,13 @@ void MainWindow::presentPlaybackPreparedFrame( const PlaybackPrepResult &result 
         return;
     }
 
+    // CPU-S1-PACE-NEXT-LEVER-1: region_image's residual (after from_image and viewport) split
+    // into the magenta-band check, the trace hash, the setPixmap and the slot release.
+    double prepRegionImageMagentaMs = 0.0;
+    double prepRegionImageHashMs = 0.0;
+    double prepRegionImageSetPixmapMs = 0.0;
+    double prepRegionImageReleaseMs = 0.0;
+    const qint64 prepRegionImageMagentaStartNs = prepRegionClock.nsecsElapsed();
     int suppressedPresentedTopMagentaBandRows = 0;
     if( !framePresentedByViewport
      && playbackPolicyActive()
@@ -6608,6 +6692,8 @@ void MainWindow::presentPlaybackPreparedFrame( const PlaybackPrepResult &result 
     readyFrame.stageTimingTelemetry.insert(
         QStringLiteral("draw_frame_ready_present_top_magenta_band_rows"),
         suppressedPresentedTopMagentaBandRows );
+    prepRegionImageMagentaMs = prepRegionElapsedMs( prepRegionImageMagentaStartNs );
+    const qint64 prepRegionImageHashStartNs = prepRegionClock.nsecsElapsed();
 
     /* Presented-content hash: a sampled FNV-1a over the bytes about to be
      * shown, while the source buffer is still held (pre-release, so the
@@ -6644,18 +6730,24 @@ void MainWindow::presentPlaybackPreparedFrame( const PlaybackPrepResult &result 
                 .arg( QString::number( contentHash, 16 ) ),
             true );
     }
+    prepRegionImageHashMs = prepRegionElapsedMs( prepRegionImageHashStartNs );
 
     bool imagePresentedByViewport = false;
+    // CPU-S1-RECON-UNDER-LOOK-PACE-LEVER-1 (Part B): region_image split into its two calls.
+    double prepRegionImageViewportMs = 0.0;
+    double prepRegionImageFromImageMs = 0.0;
     if( !framePresentedByViewport )
     {
         // Threaded through so GpuDisplayWindow can record which requestSerial it actually
         // swapped in -- see GpuDisplayWindow::grabPresentedFramebufferIfActive.
         GpuDisplayViewport::PresentationOptions presentationOptions = task.gpuPresentationOptions;
         presentationOptions.presentationSerial = task.requestSerial;
+        const qint64 prepRegionImageViewportStartNs = prepRegionClock.nsecsElapsed();
         imagePresentedByViewport = GpuDisplayViewport::presentImage( ui->graphicsView,
                                                                       m_pGraphicsItem,
                                                                       displayImage,
                                                                       presentationOptions );
+        prepRegionImageViewportMs = prepRegionElapsedMs( prepRegionImageViewportStartNs );
     }
 
     if( !framePresentedByViewport && !imagePresentedByViewport )
@@ -6700,33 +6792,67 @@ void MainWindow::presentPlaybackPreparedFrame( const PlaybackPrepResult &result 
                                   &meta );
         }
 
-        QPixmap pic = cachedPixmapAvailable ? cachedPixmap : QPixmap::fromImage( displayImage );
+        QPixmap pic;
+        if( cachedPixmapAvailable )
+        {
+            pic = cachedPixmap;
+        }
+        else
+        {
+            const qint64 prepRegionImageFromImageStartNs = prepRegionClock.nsecsElapsed();
+            pic = QPixmap::fromImage( displayImage );
+            prepRegionImageFromImageMs = prepRegionElapsedMs( prepRegionImageFromImageStartNs );
+        }
+        const qint64 prepRegionImageSetPixmapStartNs = prepRegionClock.nsecsElapsed();
         if( zoomFitEnabled && pic.devicePixelRatio() == 1.0 )
         {
             pic.setDevicePixelRatio( devicePixelRatioF() );
         }
         m_pGraphicsItem->setPixmap( pic );
         m_graphicsItemPresentedSerial = task.requestSerial;
+        prepRegionImageSetPixmapMs = prepRegionElapsedMs( prepRegionImageSetPixmapStartNs );
         if( !displayPreviewCachingAllowed
          && m_pRenderThread
          && !releasePresentedFrameEarly )
         {
+            const qint64 prepRegionImageReleaseStartNs = prepRegionClock.nsecsElapsed();
             m_pRenderThread->releasePresentedFrameForRequestSerial( readyFrame.requestSerial );
             releasePresentedFrameEarly = true;
+            prepRegionImageReleaseMs = prepRegionElapsedMs( prepRegionImageReleaseStartNs );
         }
     }
     else if( !displayPreviewCachingAllowed
           && m_pRenderThread
           && !releasePresentedFrameEarly )
     {
+        const qint64 prepRegionImageReleaseStartNs = prepRegionClock.nsecsElapsed();
         m_pRenderThread->releasePresentedFrameForRequestSerial( readyFrame.requestSerial );
         releasePresentedFrameEarly = true;
+        prepRegionImageReleaseMs = prepRegionElapsedMs( prepRegionImageReleaseStartNs );
     }
 
     prepRegionImageMs = prepRegionElapsedMs( prepRegionImageStartNs );
     readyFrame.stageTimingTelemetry.insert(
         QStringLiteral("playback_prep_region_image_ms"),
         prepRegionImageMs );
+    readyFrame.stageTimingTelemetry.insert(
+        QStringLiteral("playback_prep_region_image_from_image_ms"),
+        prepRegionImageFromImageMs );
+    readyFrame.stageTimingTelemetry.insert(
+        QStringLiteral("playback_prep_region_image_viewport_ms"),
+        prepRegionImageViewportMs );
+    readyFrame.stageTimingTelemetry.insert(
+        QStringLiteral("playback_prep_region_image_magenta_ms"),
+        prepRegionImageMagentaMs );
+    readyFrame.stageTimingTelemetry.insert(
+        QStringLiteral("playback_prep_region_image_hash_ms"),
+        prepRegionImageHashMs );
+    readyFrame.stageTimingTelemetry.insert(
+        QStringLiteral("playback_prep_region_image_set_pixmap_ms"),
+        prepRegionImageSetPixmapMs );
+    readyFrame.stageTimingTelemetry.insert(
+        QStringLiteral("playback_prep_region_image_release_ms"),
+        prepRegionImageReleaseMs );
     m_lastDrawFrameReadyImageMs = prepRegionImageMs;
     mlv_stage_timing_note_elapsed("drawFrameReady.image", display_frame, m_lastDrawFrameReadyImageMs);
 
@@ -6921,6 +7047,7 @@ void MainWindow::computeDisplaySceneGeometry( int sourceWidth,
 //Draw a raw picture to the gui -> start render thread
 void MainWindow::drawFrame( bool updateTimecodeLabel )
 {
+    const GuiOtherBusyScope otherBusySpan( this, gui_present_gap::OtherBusySpan::DrawFrame );
     if( !m_clipLifecycleBarrier.acceptingRequests() )
     {
         m_frameStillDrawing = false;
@@ -12198,6 +12325,7 @@ int MainWindow::openMlv( QString fileName )
 //Handles the playback and must be triggered from timer
 void MainWindow::playbackHandling(int timeDiff)
 {
+    const GuiOtherBusyScope otherBusySpan( this, gui_present_gap::OtherBusySpan::PlaybackHandling );
     if( ui->actionPlay->isChecked() )
     {
         if( m_fileLoaded && m_pMlvObject )
@@ -21003,6 +21131,7 @@ void MainWindow::on_actionAboutQt_triggered()
 //Position Slider
 void MainWindow::on_horizontalSliderPosition_valueChanged(int position)
 {
+    const GuiOtherBusyScope otherBusySpan( this, gui_present_gap::OtherBusySpan::SliderPosition );
     if( !m_playbackInternalSliderAdvance )
     {
         invalidatePlaybackPrepForDisplayChange( "playback-position-change" );
@@ -26276,6 +26405,8 @@ void MainWindow::beginPlaybackSmokeTelemetry( void )
         m_presentNothingDropCount.load( std::memory_order_acquire );
     m_playbackSmokeStartPrepReplacedBefore =
         m_playbackPrepReplacedBeforeComputeCount.load( std::memory_order_acquire );
+    m_playbackSmokeStartPrepBorrowedRgb16Mutated =
+        m_playbackPrepBorrowedRgb16MutatedCount.load( std::memory_order_acquire );
     m_playbackSmokeStartPrepReplacedAfter =
         m_playbackPrepReplacedAfterComputeCount.load( std::memory_order_acquire );
     m_playbackSmokeStartScopeUpdates = m_playbackScopeUpdateCount;
@@ -26467,6 +26598,8 @@ void MainWindow::beginPlaybackSmokeTelemetry( void )
     m_guiPresentGaps = GuiPresentGapTotals();
     m_guiPresentGapStartNs = -1;
     m_guiPresentGapIdle = gui_present_gap::IdleWaits();
+    m_guiOtherBusySpans.resetSession();
+    m_playbackSmokeReconWorkerSplit.reset();
     ui->graphicsView->resetPaintTiming();
     m_playbackSmokePrepWorkerTotalSumMs = 0.0;
     m_playbackSmokePrepResultQueueSumMs = 0.0;
@@ -27667,8 +27800,30 @@ void MainWindow::notePlaybackSmokePresentedFrame(
             spans.regionTotalMs += telemetryDoubleValue( timing, "playback_prep_region_total_ms" );
             spans.regionUnattributedMs +=
                 telemetryDoubleValue( timing, "playback_prep_region_unattributed_ms" );
+            // CPU-S1-RECON-UNDER-LOOK-PACE-LEVER-1 (Part B): region_image's two calls.
+            spans.regionImageFromImageMs +=
+                telemetryDoubleValue( timing, "playback_prep_region_image_from_image_ms" );
+            spans.regionImageViewportMs +=
+                telemetryDoubleValue( timing, "playback_prep_region_image_viewport_ms" );
+            // CPU-S1-PACE-NEXT-LEVER-1: the hand-off and region_image's residual.
+            spans.handoffMs += telemetryDoubleValue( timing, "playback_prep_handoff_ms" );
+            if( telemetryBoolValue( timing, "playback_prep_handoff_borrowed_rgb16" ) )
+                ++spans.handoffBorrowedRgb16Frames;
+            spans.handoffOwnedRgb16Bytes += static_cast<quint64>(
+                telemetryDoubleValue( timing, "playback_prep_owned_rgb16_bytes" ) );
+            spans.regionImageMagentaMs +=
+                telemetryDoubleValue( timing, "playback_prep_region_image_magenta_ms" );
+            spans.regionImageHashMs +=
+                telemetryDoubleValue( timing, "playback_prep_region_image_hash_ms" );
+            spans.regionImageSetPixmapMs +=
+                telemetryDoubleValue( timing, "playback_prep_region_image_set_pixmap_ms" );
+            spans.regionImageReleaseMs +=
+                telemetryDoubleValue( timing, "playback_prep_region_image_release_ms" );
         }
     }
+    // CPU-S1-RECON-UNDER-LOOK-PACE-LEVER-1 (Part A): frames whose render consumed the phase-3 recon
+    // carry the worker's sub-spans under recon_worker_ (RenderFrameThread drawFrame).
+    m_playbackSmokeReconWorkerSplit.add( timing );
     m_playbackSmokePrepWorkerTotalSumMs += prepWorkerTotalMs;
     m_playbackSmokePrepResultQueueSumMs += prepResultQueueMs;
     m_playbackSmokePrepTotalBeforeFinishSumMs += prepTotalBeforeFinishMs;
@@ -30835,6 +30990,25 @@ void MainWindow::finishPlaybackSmokeTelemetry( const char *reason )
                 ? sum / static_cast<double>( spans.cpuRouteFrames )
                 : 0.0;
         };
+        // CPU-S1-PACE-NEXT-LEVER-1: appended after every existing prep_summary field (none renamed).
+        const uint64_t borrowedRgb16Mutated =
+            m_playbackPrepBorrowedRgb16MutatedCount.load( std::memory_order_acquire )
+            - m_playbackSmokeStartPrepBorrowedRgb16Mutated;
+        const QString handoffFields =
+            QStringLiteral( " avg_playback_prep_handoff_ms=%1 handoff_borrowed_rgb16_frames=%2 "
+                            "handoff_owned_rgb16_bytes=%3 handoff_borrowed_rgb16_mutated_frames=%4 "
+                            "avg_playback_prep_region_image_magenta_ms=%5 "
+                            "avg_playback_prep_region_image_hash_ms=%6 "
+                            "avg_playback_prep_region_image_set_pixmap_ms=%7 "
+                            "avg_playback_prep_region_image_release_ms=%8" )
+                .arg( avgCpuRouteMs( spans.handoffMs ), 0, 'f', 3 )
+                .arg( spans.handoffBorrowedRgb16Frames )
+                .arg( spans.handoffOwnedRgb16Bytes )
+                .arg( static_cast<qulonglong>( borrowedRgb16Mutated ) )
+                .arg( avgCpuRouteMs( spans.regionImageMagentaMs ), 0, 'f', 3 )
+                .arg( avgCpuRouteMs( spans.regionImageHashMs ), 0, 'f', 3 )
+                .arg( avgCpuRouteMs( spans.regionImageSetPixmapMs ), 0, 'f', 3 )
+                .arg( avgCpuRouteMs( spans.regionImageReleaseMs ), 0, 'f', 3 );
         qInfo().noquote()
             << QStringLiteral(
                    "playback_smoke.prep_summary session=%1 frames=%2 cpu_route_frames=%3 "
@@ -30853,7 +31027,9 @@ void MainWindow::finishPlaybackSmokeTelemetry( const char *reason )
                    "pointwise_fast_refusal_counts=%30 "
                    "avg_playback_prep_region_setup_ms=%31 avg_playback_prep_region_image_ms=%32 "
                    "avg_playback_prep_region_present_ms=%33 avg_playback_prep_region_finish_ms=%34 "
-                   "avg_playback_prep_region_total_ms=%35 avg_playback_prep_region_unattributed_ms=%36" )
+                   "avg_playback_prep_region_total_ms=%35 avg_playback_prep_region_unattributed_ms=%36 "
+                   "avg_playback_prep_region_image_from_image_ms=%37 "
+                   "avg_playback_prep_region_image_viewport_ms=%38" )
                    .arg( static_cast<qulonglong>( m_playbackSmokeSessionId ) )
                    .arg( m_playbackSmokePresentedFrames )
                    .arg( spans.cpuRouteFrames )
@@ -30891,7 +31067,10 @@ void MainWindow::finishPlaybackSmokeTelemetry( const char *reason )
                    .arg( avgCpuRouteMs( spans.regionPresentMs ), 0, 'f', 3 )
                    .arg( avgCpuRouteMs( spans.regionFinishMs ), 0, 'f', 3 )
                    .arg( avgCpuRouteMs( spans.regionTotalMs ), 0, 'f', 3 )
-                   .arg( avgCpuRouteMs( spans.regionUnattributedMs ), 0, 'f', 3 );
+                   .arg( avgCpuRouteMs( spans.regionUnattributedMs ), 0, 'f', 3 )
+                   .arg( avgCpuRouteMs( spans.regionImageFromImageMs ), 0, 'f', 3 )
+                   .arg( avgCpuRouteMs( spans.regionImageViewportMs ), 0, 'f', 3 )
+               + handoffFields;
     }
 
     /* CPU-S2-WINDOWED-GUI-PRESENT-TELEMETRY-1: GUI-thread present-side cost. The preview viewport
@@ -30908,6 +31087,18 @@ void MainWindow::finishPlaybackSmokeTelemetry( const char *reason )
         {
             return count > 0 ? sum / static_cast<double>( count ) : 0.0;
         };
+        // CPU-S1-RECON-UNDER-LOOK-PACE-LEVER-1 (Part B): other busy by GUI handler (exclusive time
+        // inside the gap), appended after every existing field; per gap, like avg_gui_other_busy_ms.
+        QString otherBusySplit;
+        for( int i = 0; i < gui_present_gap::OtherBusySpans::kCount; ++i )
+        {
+            otherBusySplit += QStringLiteral( " avg_gui_other_busy_%1_ms=%2" )
+                                  .arg( QLatin1String( gui_present_gap::otherBusySpanName(
+                                            static_cast<gui_present_gap::OtherBusySpan>( i ) ) ) )
+                                  .arg( avgOver( m_guiOtherBusySpans.sumMs[i], gaps.gaps ), 0, 'f', 3 );
+        }
+        otherBusySplit += QStringLiteral( " avg_gui_other_busy_unattributed_ms=%1" )
+                              .arg( avgOver( m_guiOtherBusySpans.unattributedSumMs, gaps.gaps ), 0, 'f', 3 );
         qInfo().noquote()
             << QStringLiteral(
                    "playback_smoke.gui_present_summary session=%1 frames=%2 "
@@ -30931,8 +31122,20 @@ void MainWindow::finishPlaybackSmokeTelemetry( const char *reason )
                    .arg( avgOver( gaps.otherBusySumMs, gaps.gaps ), 0, 'f', 3 )
                    .arg( gaps.otherBusyMaxMs, 0, 'f', 3 )
                    .arg( m_guiPresentIdleProbeConnected ? QStringLiteral("dispatcher")
-                                                        : QStringLiteral("none") );
+                                                        : QStringLiteral("none") )
+               + otherBusySplit;
     }
+
+    /* CPU-S1-RECON-UNDER-LOOK-PACE-LEVER-1 (Part A): the phase-3 recon WORKER's own llrawproc /
+     * dual_iso_full20 sub-spans on presented frames whose render consumed its recon (the render
+     * thread's llrawproc_* keys are its own, zero on those frames). Fields: ReconWorkerSplit.h. */
+    qInfo().noquote()
+        << QStringLiteral( "playback_smoke.recon_worker_split_summary session=%1 frames=%2 "
+                           "full20_valid_frames=%3" )
+               .arg( static_cast<qulonglong>( m_playbackSmokeSessionId ) )
+               .arg( static_cast<qulonglong>( m_playbackSmokeReconWorkerSplit.frames ) )
+               .arg( static_cast<qulonglong>( m_playbackSmokeReconWorkerSplit.full20ValidFrames ) )
+           + m_playbackSmokeReconWorkerSplit.fieldsText();
 
     /* CPU-DEBAYERED16-REUSE-PHASE3-RECON-1: debayered-16 frames whose render
      * consumed the phase-3 recon (one recon per frame) versus ran its own decode
@@ -31397,6 +31600,13 @@ void MainWindow::on_actionPlay_toggled(bool checked)
 {
     invalidatePlaybackPrepForDisplayChange(
         checked ? "play-start" : "play-stop" );
+    // r3 (adversary A2 on e7e5271e) / r4 (Dot B1, adversary A1 on 391464de and ebe2c4aa): the 8-bit pool
+    // recycles only inside a playing span. After the bump above: play-start opens it with this generation
+    // as its floor, so nothing admitted before the start (an in-flight task across the last stop, a paused
+    // frame) is held; play-stop closes it, frees what it holds and raises the floor past the stop, so a
+    // late give() (even from a task parked before its take()) and every paused-frame give are freed.
+    if( checked ) m_playbackPrepRgb8Pool.open( m_playbackPresentationGeneration.load( std::memory_order_acquire ) );
+    else m_playbackPrepRgb8Pool.clear( m_playbackPresentationGeneration.load( std::memory_order_acquire ) );
     // PLAYBACK-CUDA-NATIVE-PACE-1: the pace clock re-arms at this Play's first engine tick.
     m_playbackPaceGuard.reset();
     logInteractionEvent(
@@ -33797,6 +34007,7 @@ void MainWindow::finishPresentedFrame( uint64_t displayFrame,
 //Draw the frame when render thread is ready
 void MainWindow::drawFrameReady()
 {
+    const GuiOtherBusyScope otherBusySpan( this, gui_present_gap::OtherBusySpan::DrawFrameReady );
     // A frame that outlasted the drain bound presents on landing, never under the analysis.
     if( m_lookAssistPump.holdsPresentation() )
     {
@@ -34667,12 +34878,41 @@ void MainWindow::drawFrameReady()
         return;
     }
 
+    // CPU-S1-PACE-NEXT-LEVER-1 (Part A): playback_prep_handoff_ms runs from here to the pending
+    // store in enqueuePlaybackPrepTask.
+    const double handoffStartStageTime = mlv_stage_timing_now();
     const bool needsOwnedRgb16 =
         gpu16PreviewActive
         || gpuPreviewProcessingActive
         || cpuPreviewProcessingActive
         || readyFrame.outputMode != RenderFrameThread::OutputProcessed8;
-    if( needsOwnedRgb16
+    PlaybackPrepBorrowInputs borrowInputs;
+    borrowInputs.playing = ui->actionPlay->isChecked();
+    borrowInputs.displayPreviewCachingAllowed = displayPreviewCachingAllowed;
+    borrowInputs.cpuPreviewProcessingActive = cpuPreviewProcessingActive;
+    borrowInputs.outputProcessed8 = readyFrame.outputMode == RenderFrameThread::OutputProcessed8;
+    borrowInputs.gpu16PreviewActive = gpu16PreviewActive;
+    borrowInputs.gpuPreviewProcessingActive = gpuPreviewProcessingActive;
+    borrowInputs.gpuAmazeTexturePresentCandidate = readyFrame.gpuAmazeTexturePresentCandidate;
+    borrowInputs.gpuPlaybackReconTexturePresentCandidate =
+        readyFrame.gpuPlaybackReconTexturePresentCandidate;
+    borrowInputs.gpuPlaybackReconTextureNoReadbackCandidate =
+        readyFrame.gpuPlaybackReconTextureNoReadbackCandidate;
+    borrowInputs.rawImage16 = readyFrame.rawImage16;
+    borrowInputs.rawImage16Bytes = readyFrameRawImage16Bytes;
+    borrowInputs.sourceImage16Bytes = sourceImage16Bytes;
+    // The pinned slot's buffer is task.sourceImage16 already (set above); borrowing it skips the copy.
+    task.borrowedSlotRgb16 = playbackPrepMayBorrowSlotRgb16( borrowInputs );
+    task.readyFrame.stageTimingTelemetry.insert(
+        QStringLiteral("playback_prep_handoff_borrowed_rgb16"), task.borrowedSlotRgb16 );
+    if( task.borrowedSlotRgb16 && m_playbackSmokeFrameTelemetry )
+    {
+        task.borrowedRgb16Words = sourceImage16Bytes / sizeof( uint16_t );
+        task.borrowedRgb16Fnv = playbackPrepSampledRgb16Fnv( task.sourceImage16, task.borrowedRgb16Words );
+        task.borrowedRgb16HashValid = true;
+    }
+    if( !task.borrowedSlotRgb16
+     && needsOwnedRgb16
      && sourceImage16Bytes > 0
      && readyFrame.rawImage16
      && readyFrameRawImage16Bytes >= sourceImage16Bytes )
@@ -34710,7 +34950,7 @@ void MainWindow::drawFrameReady()
     task.rebindOwnedImagePointers();
     notePlaybackPrepOwnershipTelemetry();
 
-    enqueuePlaybackPrepTask( task );
+    enqueuePlaybackPrepTask( std::move( task ), handoffStartStageTime );
     return;
 
 }
