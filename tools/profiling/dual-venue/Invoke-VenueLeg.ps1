@@ -990,6 +990,17 @@ if ($outcome -in @('PASS', 'FAIL') -and $prepConflatedMoveVerdict.blocks) {
 # not show the app running with it on (gui_smoke.visual_state look_assist_enabled=1; 0 or missing blocks) measured another look: a typed INVALID, never a PASS or FAIL.
 $lookAssistVerdict = Get-DvLookAssistEvidence -Spec $spec -LogText $runLogText
 if ($lookAssistVerdict.requested) { $receipt['lookAssist'] = [ordered]@{ requested = $true; reported = $lookAssistVerdict.reported; verdict = $lookAssistVerdict.verdict } }
+# VENUE-NATIVE-LEG-LOOKLEG-LABEL-1 r1: the look TRUTH at the top level. A native HFR leg is a SPEED leg that forces Look Assist, so metrics.lookLeg (false) and
+# subject.lookFlavor (null) are its leg TYPE and stay so (Test-DvReceiptValid binds them to the committed spec); lookAssistOn / lookAssistFlavor say what ran.
+# FAIL CLOSED, unknown is not on: on only when the leg asked for the look, the app's own log says look_assist_enabled=1, the job's summary says it forced the
+# look, and the flavor the app reports equals the flavor the summary says was requested. lookAssistFlavor is that reported flavor, else null.
+$laSummaryForced = ($null -ne $summary -and $null -ne $summary.PSObject.Properties['lookAssistForced'] -and $summary.lookAssistForced -eq $true)
+$laRequestedFlavor = $(if ($null -ne $summary -and $null -ne $summary.PSObject.Properties['lookFlavor'] -and $summary.lookFlavor -is [string]) { [string]$summary.lookFlavor } else { '' })
+$laReportedFlavor = $(if ($null -ne $summary -and $null -ne $summary.PSObject.Properties['lookFlavorReported'] -and $summary.lookFlavorReported -is [string]) { [string]$summary.lookFlavorReported } else { '' })
+if ($lookAssistVerdict.requested -and ($lookAssistVerdict.verdict -ceq 'HONOURED') -and $laSummaryForced -and $laRequestedFlavor.Length -gt 0 -and ($laReportedFlavor -ceq $laRequestedFlavor)) {
+    $receipt['lookAssistOn'] = $true
+    $receipt['lookAssistFlavor'] = $laReportedFlavor
+}
 if ($outcome -in @('PASS', 'FAIL') -and $lookAssistVerdict.blocks) {
     $detail = "INVALID: the job result was $outcome ($detail) but LOOK_ASSIST_NOT_HONOURED: $($lookAssistVerdict.reason). A leg that did not run the look it names is no measurement under it"
     $outcome = 'INVALID'

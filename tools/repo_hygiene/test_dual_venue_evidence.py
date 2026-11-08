@@ -5072,6 +5072,34 @@ class DisplayModeIsRequestedAndObservedTests(EvidenceFactory, ModuleMutationMixi
         repo, ev, receipt = self.production(None, None, with_block=False)
         self.assertAdvisory(receipt, repo)
 
+    # -- VENUE-NATIVE-LEG-LOOKLEG-LABEL-1 r1: a receipt's lookAssistOn claim is re-derived from the HASHED log and summary.json ----------
+    def look_claim(self, case: str, forced: bool = True, log_state: str = "look_assist_enabled=1", summary_flavor: str = "cinematic",
+                   reported: str = "cinematic", claim_flavor: str = "cinematic"):
+        spec = self.write_spec()
+        body = json.loads(spec.read_text(encoding="utf-8"))
+        if forced:
+            body["generatorArgs"] = {"forceLookAssist": True, "lookFlavor": "cinematic"}
+        spec.write_text(json.dumps(body), encoding="utf-8")
+        repo = self.prod_repo(spec=spec)
+        ev = self.evidence("lc-" + case, backend="cuda", look_assist_state=log_state,
+                           summary={"lookAssistForced": forced, "lookFlavor": summary_flavor, "lookFlavorReported": reported})
+        receipt = self.receipt_for(repo, ev, backend="cuda")
+        receipt["lookAssistOn"] = True
+        receipt["lookAssistFlavor"] = claim_flavor
+        return repo, receipt
+
+    def test_a_backed_look_claim_re_derives_and_leaves_the_leg_type_binding_alone(self) -> None:
+        repo, receipt = self.look_claim("backed")
+        self.assertAdvisory(receipt, repo)
+
+    def test_a_look_claim_the_hashed_evidence_does_not_back_is_invalid(self) -> None:
+        cases = {"not-forced": dict(forced=False), "app-says-0": dict(log_state="look_assist_enabled=0"), "no-visual-state": dict(log_state=None),
+                 "other-flavor": dict(reported="classic"), "wrong-claimed-flavor": dict(claim_flavor="classic")}
+        for case, opts in cases.items():
+            with self.subTest(case=case):
+                repo, receipt = self.look_claim(case, **opts)
+                self.assertNotValid(receipt, repo, "LOOK_ASSIST_CLAIM_UNBACKED", status="INVALID")
+
     # -- one mutation per rule ----------------------------------------------------------------------------------------------------------
     def test_mutation_without_the_runner_gate_a_windowed_leg_that_ran_full_screen_passes(self) -> None:
         dv = self.mutated_runner([("Invoke-VenueLeg.ps1", "if ($outcome -in @('PASS', 'FAIL') -and $display.blocks) {", "if ($false) {")])
@@ -9538,6 +9566,62 @@ class VisualCaptureRunnerTests(RunnerHarness, unittest.TestCase):
         _, receipt, _ = self.run_leg("ultra-magnus", self.write_spec(), extra=["-Backend", "cpu"])
         self.assertEqual(receipt["outcome"], "PASS", receipt["outcomeDetail"])
         self.assertNotIn("lookAssist", receipt, "a leg that does not ask for Look Assist records nothing about it")
+
+    # VENUE-NATIVE-LEG-LOOKLEG-LABEL-1 r1 (owner ask 2026-11-06: "why havent i seen look assist applied to the 60fps benchmarks?"): a native HFR leg is a SPEED leg that
+    # forces Look Assist (generatorArgs.forceLookAssist) and the app honours it, yet its receipt said lookLeg=false (metrics) and subject.lookFlavor=null -- both are the
+    # leg-TYPE binding (Test-DvReceiptValid LEG_TYPE_MISMATCH keys on them), so a summary keyed on them hid the look. The look truth is its own top-level pair.
+    NATIVE_LOOK_SUMMARY = {"lookLeg": False, "lookAssistForced": True, "lookFlavor": "cinematic", "lookFlavorReported": "cinematic", "lookFlavorHonored": True}
+
+    def run_native_look(self, summary: dict | None, look_assist_state: str | None = "look_assist_enabled=1", spec_args: dict | None = None):
+        spec = self.speed_spec(generatorArgs=spec_args if spec_args is not None else {"forceLookAssist": True, "lookFlavor": "cinematic"})
+        self.write_artifacts(summary=summary, look_assist_state=look_assist_state)
+        write_visual_captures(self.artifacts / "visual", "ok")
+        return self.run_leg("ultra-magnus", spec, extra=["-Backend", "cpu"])[1]
+
+    def test_a_native_leg_that_forced_and_got_the_look_says_so_at_the_top_level(self) -> None:
+        receipt = self.run_native_look(dict(self.NATIVE_LOOK_SUMMARY))
+        self.assertEqual(receipt["outcome"], "PASS", receipt["outcomeDetail"])
+        self.assertIs(receipt["lookAssistOn"], True)
+        self.assertEqual(receipt["lookAssistFlavor"], "cinematic")
+        # the leg-TYPE fields keep meaning "this leg's TYPE is look": the validator's hash binding reads them
+        self.assertIs(receipt["metrics"]["lookLeg"], False)
+        self.assertIsNone(receipt["subject"]["lookFlavor"])
+
+    def test_a_leg_that_did_not_force_the_look_states_it_is_off(self) -> None:
+        receipt = self.run_native_look({"lookLeg": False, "lookAssistForced": False, "lookFlavor": None}, look_assist_state="look_assist_enabled=0", spec_args={})
+        self.assertEqual(receipt["outcome"], "PASS", receipt["outcomeDetail"])
+        self.assertIs(receipt["lookAssistOn"], False)
+        self.assertIsNone(receipt["lookAssistFlavor"])
+        self.assertNotIn("lookAssist", receipt)
+
+    def test_a_forced_look_that_was_not_honoured_does_not_claim_on(self) -> None:
+        # fail closed: unknown is not on. The app says 0, or says nothing, or applied another flavor, or the job's own summary is silent.
+        cases = (("app says 0", dict(self.NATIVE_LOOK_SUMMARY), "look_assist_enabled=0"),
+                 ("no visual_state line", dict(self.NATIVE_LOOK_SUMMARY), None),
+                 ("another flavor applied", dict(self.NATIVE_LOOK_SUMMARY, lookFlavorReported="classic", lookFlavorHonored=False), "look_assist_enabled=1"),
+                 ("flavor report absent", {"lookLeg": False, "lookAssistForced": True, "lookFlavor": "cinematic"}, "look_assist_enabled=1"),
+                 ("summary says not forced", dict(self.NATIVE_LOOK_SUMMARY, lookAssistForced=False), "look_assist_enabled=1"))
+        for name, summary, state in cases:
+            with self.subTest(case=name):
+                receipt = self.run_native_look(summary, look_assist_state=state)
+                self.assertIs(receipt["lookAssistOn"], False, receipt["outcomeDetail"])
+                self.assertIsNone(receipt["lookAssistFlavor"])
+
+    def test_a_conform_look_leg_keeps_its_leg_type_fields(self) -> None:
+        # control: passes before and after -- lookLeg / subject.lookFlavor still mean "the leg TYPE is look"
+        spec = self.write_spec(leg_type="look", flavor="cinematic")
+        self.write_artifacts(sheet=True, summary={"lookLeg": True, "lookAssistForced": True, "lookFlavor": "cinematic", "lookFlavorReported": "cinematic", "lookFlavorHonored": True})
+        receipt = self.run_leg("ultra-magnus", spec, extra=["-Backend", "cpu"])[1]
+        self.assertIs(receipt["metrics"]["lookLeg"], True)
+        self.assertEqual(receipt["subject"]["lookFlavor"], "cinematic")
+        self.assertEqual(receipt["look"]["legType"], "look")
+
+    def test_a_conform_look_leg_also_states_the_look_at_the_top_level(self) -> None:
+        spec = self.write_spec(leg_type="look", flavor="cinematic")
+        self.write_artifacts(sheet=True, summary={"lookLeg": True, "lookAssistForced": True, "lookFlavor": "cinematic", "lookFlavorReported": "cinematic", "lookFlavorHonored": True})
+        receipt = self.run_leg("ultra-magnus", spec, extra=["-Backend", "cpu"])[1]
+        self.assertIs(receipt["lookAssistOn"], True)
+        self.assertEqual(receipt["lookAssistFlavor"], "cinematic")
 
     def test_a_single_picture_over_an_unknown_or_identical_source_is_counted_and_surfaced(self) -> None:
         """PLAYBACK-FROZEN-DISPLAY-SOURCE-DIFF-1: only a source KNOWN to differ voids the leg. Unknown is surfaced in the detail (counted); identical is OK;

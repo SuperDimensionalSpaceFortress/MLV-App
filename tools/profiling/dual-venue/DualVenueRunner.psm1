@@ -3462,6 +3462,16 @@ function Test-DvReceiptValid {
             # CUDA-HEADROOM-1: an unpaced leg the app did not run unpaced is the pace wall, not throughput (Get-DvUnpacedEvidence).
             $unpacedVerdict = Get-DvUnpacedEvidence -Spec $spec -LogText $ev.logText
             if ($unpacedVerdict.blocks) { $invalid.Add("UNPACED_NOT_HONOURED: $($unpacedVerdict.reason); a paced run is no throughput measurement") }
+            # VENUE-NATIVE-LEG-LOOKLEG-LABEL-1 r1: a receipt that CLAIMS the look ran (lookAssistOn true) must be backed by the hashed evidence -- the app's own run log says
+            # look_assist_enabled=1, the hashed summary.json says the look was forced and the flavor the app reported is the one requested, and lookAssistFlavor is that flavor.
+            # Only the claim is re-derived (a receipt that predates the field, or says false, claims nothing); the leg TYPE binding above is untouched.
+            if ((Get-DvProp $Receipt 'lookAssistOn') -eq $true) {
+                $claimVerdict = Get-DvLookAssistEvidence -Spec $spec -LogText $ev.logText
+                $claimRequested = [string](Get-DvProp $ev.summary 'lookFlavor'); $claimReported = [string](Get-DvProp $ev.summary 'lookFlavorReported')
+                if (-not ($claimVerdict.requested -and $claimVerdict.verdict -ceq 'HONOURED' -and (Get-DvProp $ev.summary 'lookAssistForced') -eq $true -and $claimRequested.Length -gt 0 -and $claimReported -ceq $claimRequested -and [string](Get-DvProp $Receipt 'lookAssistFlavor') -ceq $claimReported)) {
+                    $invalid.Add('LOOK_ASSIST_CLAIM_UNBACKED: the receipt says Look Assist ran (lookAssistOn) but the hashed run log / summary.json do not show it ran with the flavor lookAssistFlavor names')
+                }
+            }
             # VENUE-LEG-PLAYBACK-MAX-THREADS-ARG-1: a capped leg the app did not run at the cap (or whose count is unreadable) is no measurement under it.
             $workerThreadsVerdict = Get-DvWorkerThreadsEvidence -Spec $spec -LogText $ev.logText -Summary $ev.summary
             if ($workerThreadsVerdict.blocks) { $invalid.Add("WORKER_THREADS_NOT_HONOURED: $($workerThreadsVerdict.reason); a run at another worker count is no measurement of the worker count its leg specifies") }
@@ -4011,6 +4021,11 @@ function New-DvReceipt {
         display = $null
         # LOOK-FULLSCREEN-PARITY-1: the "current look" label the app showed (Get-DvLookLabelEvidence), next to the display block. Informational, never a gate.
         lookLabel = $null
+        # VENUE-NATIVE-LEG-LOOKLEG-LABEL-1 r1: did Look Assist actually run in this leg, and with which flavor? FAIL CLOSED: false / null until Invoke-VenueLeg shows the
+        # app's own log AND the job's summary agree (unknown is not on). Separate from metrics.lookLeg / subject.lookFlavor, which stay the leg TYPE binding
+        # (a native HFR pace leg forces the look yet is a speed leg, so those two say false / null for it by design).
+        lookAssistOn = $false
+        lookAssistFlavor = $null
         look = $null
         # PLAYBACK-VISUAL-INSPECTION-1: a speed leg's window captures (Read-DvVisualCaptures): requested / opted out, the frames and their hashes,
         # the distinct-picture count, the play-vs-paused difference, the strip, and the gate verdict. Null on a look leg (its contact sheet is the look).
