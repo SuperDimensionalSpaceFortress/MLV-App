@@ -5073,8 +5073,12 @@ class DisplayModeIsRequestedAndObservedTests(EvidenceFactory, ModuleMutationMixi
         self.assertAdvisory(receipt, repo)
 
     # -- VENUE-NATIVE-LEG-LOOKLEG-LABEL-1 r1: a receipt's lookAssistOn claim is re-derived from the HASHED log and summary.json ----------
+    _UNSET = object()   # r2 (Dot bd11a92): None is a value the fixtures must be able to inject (a JSON null), so "not given" is its own sentinel
+
     def look_claim(self, case: str, forced: bool = True, log_state: str | None = "look_assist_enabled=1 look_assist_flavor=cinematic", summary_flavor: str = "cinematic",
-                   reported="cinematic", claim_flavor: str = "cinematic", forced_value=None):
+                   reported="cinematic", claim_flavor: str = "cinematic", forced_value=_UNSET, claim_on=_UNSET):
+        """`forced_value` replaces summary.json's lookAssistForced as given (None = a real JSON null); `claim_on` replaces the receipt's lookAssistOn
+        (default True; `self.ABSENT` drops the key)."""
         spec = self.write_spec()
         body = json.loads(spec.read_text(encoding="utf-8"))
         if forced:
@@ -5082,11 +5086,18 @@ class DisplayModeIsRequestedAndObservedTests(EvidenceFactory, ModuleMutationMixi
         spec.write_text(json.dumps(body), encoding="utf-8")
         repo = self.prod_repo(spec=spec)
         ev = self.evidence("lc-" + case, backend="cuda", look_assist_state=log_state,
-                           summary={"lookAssistForced": forced if forced_value is None else forced_value, "lookFlavor": summary_flavor, "lookFlavorReported": reported})
+                           summary={"lookAssistForced": forced if forced_value is self._UNSET else forced_value, "lookFlavor": summary_flavor, "lookFlavorReported": reported})
         receipt = self.receipt_for(repo, ev, backend="cuda")
-        receipt["lookAssistOn"] = True
+        if claim_on is self._UNSET:
+            receipt["lookAssistOn"] = True
+        elif claim_on is self.ABSENT:
+            receipt.pop("lookAssistOn", None)
+        else:
+            receipt["lookAssistOn"] = claim_on
         receipt["lookAssistFlavor"] = claim_flavor
         return repo, receipt
+
+    ABSENT = object()
 
     def test_a_backed_look_claim_re_derives_and_leaves_the_leg_type_binding_alone(self) -> None:
         repo, receipt = self.look_claim("backed")
@@ -5103,6 +5114,60 @@ class DisplayModeIsRequestedAndObservedTests(EvidenceFactory, ModuleMutationMixi
             with self.subTest(case=case):
                 repo, receipt = self.look_claim(case, **opts)
                 self.assertNotValid(receipt, repo, "LOOK_ASSIST_CLAIM_UNBACKED", status="INVALID")
+
+    # r2 (Dot bd11a92 / 12fa01e): the controls around the new rejection branch --------------------------------------------------------
+    def test_a_malformed_look_claim_is_refused_whatever_the_evidence_says(self) -> None:
+        # the claim must be a real boolean: the string "true", the number 1 and the array [true] each read as "on" under a loose cast or filter, and none is a claim
+        for case, bad in {"string-true": "true", "number-one": 1, "array-true": [True], "string-false": "false", "number-zero": 0}.items():
+            with self.subTest(case=case):
+                repo, receipt = self.look_claim("mal-" + case, claim_on=bad)   # the evidence is fully backing: the type alone refuses it
+                reasons = self.assertNotValid(receipt, repo, "LOOK_ASSIST_CLAIM_UNBACKED", status="INVALID")
+                self.assertTrue(any("not a boolean" in r for r in reasons), reasons)
+
+    def test_an_explicit_false_a_null_and_an_absent_look_claim_are_non_claims_and_are_never_re_derived_as_on(self) -> None:
+        # compatibility control for the new rejection branch: a receipt that predates the field, or says false / null, claims nothing -- accepted, whatever the
+        # evidence (backing it, or contradicting it), and the validator never turns it into "on"
+        for evidence_case, opts in {"evidence-backs-on": {}, "app-says-0": dict(log_state="look_assist_enabled=0"), "not-forced": dict(forced=False)}.items():
+            for claim_case, claim in {"false": False, "null": None, "absent": self.ABSENT}.items():
+                with self.subTest(evidence=evidence_case, claim=claim_case):
+                    repo, receipt = self.look_claim(f"nc-{evidence_case}-{claim_case}", claim_on=claim, **opts)
+                    self.assertAdvisory(receipt, repo)
+                    if claim is self.ABSENT:
+                        self.assertNotIn("lookAssistOn", receipt)
+                    else:
+                        self.assertEqual(receipt["lookAssistOn"], claim)
+
+    def test_a_look_claim_over_a_null_forced_flag_is_unbacked(self) -> None:
+        # the fixture default (_UNSET) never injected a null; None here is a real JSON null in summary.json (lookAssistForced: null) -- unknown is not forced
+        repo, receipt = self.look_claim("null-forced", forced_value=None)
+        self.assertNotValid(receipt, repo, "LOOK_ASSIST_CLAIM_UNBACKED", status="INVALID")
+
+    def test_a_look_claim_over_an_unknown_or_absent_summary_flavor_is_unbacked(self) -> None:
+        cases = {"reported-unknown": dict(reported="unknown", summary_flavor="unknown", claim_flavor="unknown"), "reported-null": dict(reported=None),
+                 "requested-null": dict(summary_flavor=None), "requested-empty": dict(summary_flavor="", reported="", claim_flavor=""),
+                 "claimed-null": dict(claim_flavor=None)}
+        for case, opts in cases.items():
+            with self.subTest(case=case):
+                repo, receipt = self.look_claim("uf-" + case, **opts)
+                self.assertNotValid(receipt, repo, "LOOK_ASSIST_CLAIM_UNBACKED", status="INVALID")
+
+    def test_a_look_claim_over_duplicate_flavor_records_that_disagree_is_unbacked(self) -> None:
+        # two flavor tokens in one record, or two visual_state records, that name different flavors: the app did not say ONE flavor, so no flavor is proven
+        two_records = "look_assist_enabled=1 look_assist_flavor=cinematic\ninteraction_trace event=gui_smoke.visual_state look_assist_enabled=1 look_assist_flavor=classic"
+        cases = {"two-tokens-one-record": "look_assist_enabled=1 look_assist_flavor=classic look_assist_flavor=cinematic",
+                 "two-tokens-one-record-requested-first": "look_assist_enabled=1 look_assist_flavor=cinematic look_assist_flavor=classic",
+                 "two-records-last-differs": two_records,
+                 "two-records-first-differs": "look_assist_enabled=1 look_assist_flavor=classic\ninteraction_trace event=gui_smoke.visual_state look_assist_enabled=1 look_assist_flavor=cinematic"}
+        for case, state in cases.items():
+            with self.subTest(case=case):
+                repo, receipt = self.look_claim("dup-" + case, log_state=state)
+                self.assertNotValid(receipt, repo, "LOOK_ASSIST_CLAIM_UNBACKED", status="INVALID")
+
+    def test_duplicate_flavor_records_that_agree_still_back_the_claim(self) -> None:
+        # control: repeating the SAME flavor is no ambiguity
+        state = "look_assist_enabled=1 look_assist_flavor=cinematic\ninteraction_trace event=gui_smoke.visual_state look_assist_enabled=1 look_assist_flavor=cinematic"
+        repo, receipt = self.look_claim("dup-agree", log_state=state)
+        self.assertAdvisory(receipt, repo)
 
     # -- one mutation per rule ----------------------------------------------------------------------------------------------------------
     def test_mutation_without_the_runner_gate_a_windowed_leg_that_ran_full_screen_passes(self) -> None:
@@ -9610,12 +9675,49 @@ class VisualCaptureRunnerTests(RunnerHarness, unittest.TestCase):
                  ("app log names no flavor", dict(self.NATIVE_LOOK_SUMMARY), "look_assist_enabled=1"),
                  # adversary pass 2 A1: `-eq $true` on an array is a filter, so [false, true] read as forced; the forced flag must be a real boolean
                  ("forced flag is an array", dict(self.NATIVE_LOOK_SUMMARY, lookAssistForced=[False, True]), "look_assist_enabled=1 look_assist_flavor=cinematic"),
-                 ("forced flag is a string", dict(self.NATIVE_LOOK_SUMMARY, lookAssistForced="true"), "look_assist_enabled=1 look_assist_flavor=cinematic"))
+                 ("forced flag is a string", dict(self.NATIVE_LOOK_SUMMARY, lookAssistForced="true"), "look_assist_enabled=1 look_assist_flavor=cinematic"),
+                 # r2 (Dot bd11a92): a REAL JSON null force value (the fixture's None sentinel used to mean "default"); unknown is not forced
+                 ("forced flag is null", dict(self.NATIVE_LOOK_SUMMARY, lookAssistForced=None), "look_assist_enabled=1 look_assist_flavor=cinematic"),
+                 ("forced flag is absent", {k: v for k, v in self.NATIVE_LOOK_SUMMARY.items() if k != "lookAssistForced"}, "look_assist_enabled=1 look_assist_flavor=cinematic"),
+                 # r2: an unknown, null or absent summary answers for nothing
+                 ("summary reports 'unknown'", dict(self.NATIVE_LOOK_SUMMARY, lookFlavorReported="unknown"), "look_assist_enabled=1 look_assist_flavor=cinematic"),
+                 ("summary reports null", dict(self.NATIVE_LOOK_SUMMARY, lookFlavorReported=None), "look_assist_enabled=1 look_assist_flavor=cinematic"),
+                 ("summary requests null", dict(self.NATIVE_LOOK_SUMMARY, lookFlavor=None), "look_assist_enabled=1 look_assist_flavor=cinematic"),
+                 ("summary requests ''", dict(self.NATIVE_LOOK_SUMMARY, lookFlavor="", lookFlavorReported=""), "look_assist_enabled=1 look_assist_flavor=cinematic"),
+                 ("no summary fields at all", {}, "look_assist_enabled=1 look_assist_flavor=cinematic"),
+                 # r2: duplicate flavor records that disagree -- the app did not say one flavor, so none is proven (whichever one the summary names)
+                 ("two flavor tokens in one record", dict(self.NATIVE_LOOK_SUMMARY), "look_assist_enabled=1 look_assist_flavor=classic look_assist_flavor=cinematic"),
+                 ("two flavor tokens, the requested one first", dict(self.NATIVE_LOOK_SUMMARY), "look_assist_enabled=1 look_assist_flavor=cinematic look_assist_flavor=classic"),
+                 ("two records, the last differs", dict(self.NATIVE_LOOK_SUMMARY),
+                  "look_assist_enabled=1 look_assist_flavor=cinematic\ninteraction_trace event=gui_smoke.visual_state look_assist_enabled=1 look_assist_flavor=classic"),
+                 ("two records, the first differs", dict(self.NATIVE_LOOK_SUMMARY),
+                  "look_assist_enabled=1 look_assist_flavor=classic\ninteraction_trace event=gui_smoke.visual_state look_assist_enabled=1 look_assist_flavor=cinematic"))
         for name, summary, state in cases:
             with self.subTest(case=name):
                 receipt = self.run_native_look(summary, look_assist_state=state)
                 self.assertIs(receipt["lookAssistOn"], False, receipt["outcomeDetail"])
                 self.assertIsNone(receipt["lookAssistFlavor"])
+
+    def test_duplicate_flavor_records_that_agree_still_claim_on(self) -> None:
+        # control: the same flavor repeated is no ambiguity
+        state = "look_assist_enabled=1 look_assist_flavor=cinematic\ninteraction_trace event=gui_smoke.visual_state look_assist_enabled=1 look_assist_flavor=cinematic"
+        receipt = self.run_native_look(dict(self.NATIVE_LOOK_SUMMARY), look_assist_state=state)
+        self.assertIs(receipt["lookAssistOn"], True, receipt["outcomeDetail"])
+        self.assertEqual(receipt["lookAssistFlavor"], "cinematic")
+
+    def test_a_leg_that_did_not_ask_for_the_look_stays_off_even_when_the_app_says_enabled(self) -> None:
+        # r2 (Dot 251ade27 / bd11a92): the shipped default has Look Assist ON (ReceiptSettings.cpp:113), so the app log says look_assist_enabled=1 for a leg that never asked
+        # for it. That is not a claim the LEG made: lookAssistOn is false / lookAssistFlavor null, and no `lookAssist` block is written. False means "not proven on".
+        enabled = "look_assist_enabled=1 look_assist_flavor=cinematic"
+        cases = (("nothing forced", {"lookLeg": False, "lookAssistForced": False, "lookFlavor": None}),
+                 ("the summary alone says forced", dict(self.NATIVE_LOOK_SUMMARY)))   # the spec is what asks; a summary that says otherwise never turns it on
+        for name, summary in cases:
+            with self.subTest(case=name):
+                receipt = self.run_native_look(summary, look_assist_state=enabled, spec_args={})
+                self.assertEqual(receipt["outcome"], "PASS", receipt["outcomeDetail"])
+                self.assertIs(receipt["lookAssistOn"], False)
+                self.assertIsNone(receipt["lookAssistFlavor"])
+                self.assertNotIn("lookAssist", receipt)
 
     def test_a_conform_look_leg_keeps_its_leg_type_fields(self) -> None:
         # control: passes before and after -- lookLeg / subject.lookFlavor still mean "the leg TYPE is look"

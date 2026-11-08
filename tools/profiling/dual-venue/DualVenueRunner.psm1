@@ -1711,9 +1711,16 @@ function Get-DvLookAssistEvidence {
     $reason = $null
     if ($requested) {
         $found = $null
+        # VENUE-NATIVE-LEG-LOOKLEG-LABEL-1 r2 (Dot bd11a92): every flavor token of every visual_state record, so duplicate records that disagree can be told from one that is repeated
+        $flavorsSeen = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
         if (-not [string]::IsNullOrEmpty($LogText)) {
             # r4 (r3 adversary A2 on #726): matched on the record body, so a Qt location path never selects (or answers for) the visual_state line
-            foreach ($line in (Get-DvLogRecordBodies -LogText $LogText)) { if ($line -match '(^|\s)event=gui_smoke\.visual_state(\s|$)') { $found = $line } }
+            foreach ($line in (Get-DvLogRecordBodies -LogText $LogText)) {
+                if ($line -match '(^|\s)event=gui_smoke\.visual_state(\s|$)') {
+                    $found = $line
+                    foreach ($ft in [regex]::Matches($line, '(^|\s)look_assist_flavor=(?<f>\S+)')) { [void]$flavorsSeen.Add($ft.Groups['f'].Value) }
+                }
+            }
         }
         $verdict = 'NOT_HONOURED'
         if ($null -eq $found) { $reason = 'the run log has no gui_smoke.visual_state line, so nothing shows the app ran with Look Assist on' }
@@ -1723,8 +1730,8 @@ function Get-DvLookAssistEvidence {
             else {
                 $reported = $m.Groups['v'].Value
                 # VENUE-NATIVE-LEG-LOOKLEG-LABEL-1 r1 (adversary A1): the flavor the app applied, from the SAME record body (a Qt location suffix never answers for it)
-                $fm = [regex]::Match($found, '(^|\s)look_assist_flavor=(?<f>\S+)')
-                if ($fm.Success) { $flavor = $fm.Groups['f'].Value }
+                # r2: ONE flavor or none -- two different flavor values anywhere in the visual_state records mean the app did not say which one ran, so none is proven (never "the first" or "the last")
+                if ($flavorsSeen.Count -eq 1) { $flavor = @($flavorsSeen)[0] }
                 if ($reported -cne '1') { $reason = "the app's gui_smoke.visual_state line says look_assist_enabled=$reported (the leg asks for Look Assist on)" }
                 else { $verdict = 'HONOURED' }
             }
@@ -4031,7 +4038,9 @@ function New-DvReceipt {
         # LOOK-FULLSCREEN-PARITY-1: the "current look" label the app showed (Get-DvLookLabelEvidence), next to the display block. Informational, never a gate.
         lookLabel = $null
         # VENUE-NATIVE-LEG-LOOKLEG-LABEL-1 r1: did Look Assist actually run in this leg, and with which flavor? FAIL CLOSED: false / null until Invoke-VenueLeg shows the
-        # app's own log AND the job's summary agree (unknown is not on). Separate from metrics.lookLeg / subject.lookFlavor, which stay the leg TYPE binding
+        # app's own log AND the job's summary agree (unknown is not on). SEMANTICS (Dot bd11a92, r2): false / null mean NOT PROVEN ON -- never "observed off"; a consumer
+        # must not read lookAssistOn=false as "Look Assist was off" (the shipped default is on, and an unasked-for, ambiguous or unreported leg also says false).
+        # A receipt claiming true is re-derived by Test-DvReceiptValid; false / null / absent claim nothing and are not. Separate from metrics.lookLeg / subject.lookFlavor, which stay the leg TYPE binding
         # (a native HFR pace leg forces the look yet is a speed leg, so those two say false / null for it by design).
         lookAssistOn = $false
         lookAssistFlavor = $null

@@ -994,7 +994,8 @@ if ($lookAssistVerdict.requested) { $receipt['lookAssist'] = [ordered]@{ request
 # subject.lookFlavor (null) are its leg TYPE and stay so (Test-DvReceiptValid binds them to the committed spec); lookAssistOn / lookAssistFlavor say what ran.
 # FAIL CLOSED, unknown is not on: on only when the leg asked for the look, the app's own log says look_assist_enabled=1, the job's summary says it forced the
 # look, and the flavor the app applied (read from the log record body, never a location suffix) equals the flavor the summary says was requested and reported.
-# lookAssistFlavor is that log-derived flavor, else null.
+# lookAssistFlavor is that log-derived flavor, else null. A flavor the app's records name two different ways is no flavor (Get-DvLookAssistEvidence). false / null
+# mean NOT PROVEN ON, never "observed off" (r2, Dot bd11a92): an unasked-for leg whose app log says look_assist_enabled=1 still says false.
 $laSummaryForced = ($null -ne $summary -and $null -ne $summary.PSObject.Properties['lookAssistForced'] -and $summary.lookAssistForced -is [bool] -and $summary.lookAssistForced)
 $laRequestedFlavor = $(if ($null -ne $summary -and $null -ne $summary.PSObject.Properties['lookFlavor'] -and $summary.lookFlavor -is [string]) { [string]$summary.lookFlavor } else { '' })
 $laReportedFlavor = $(if ($null -ne $summary -and $null -ne $summary.PSObject.Properties['lookFlavorReported'] -and $summary.lookFlavorReported -is [string]) { [string]$summary.lookFlavorReported } else { '' })
