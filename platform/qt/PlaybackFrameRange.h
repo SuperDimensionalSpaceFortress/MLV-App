@@ -400,6 +400,21 @@ inline bool conformTargetPresented( long long lastPresentedFrame, double positio
     return lastPresentedFrame == static_cast<long long>( position ) || !presentOutstanding;
 }
 
+// HFR-NATIVE-60FPS-FULLRES-1 r28 (CoS B1 on c4efe7e3): the targetPresented input MainWindow passes, from the frame drawFrameReady
+// accepted (\a acceptedFrame, m_lastPresentedPlaybackFrame), the frame last put on screen (\a displayedFrame,
+// m_lastDisplayedPlaybackFrame), whether the accepted frame's present is still to come (\a acceptedPresentPending: drawFrameReady
+// has not dispatched it yet, or the non-inline prep queue still holds it) and whether the renderer still owes the target
+// (\a rendererOutstanding: MainWindow::conformTargetPresentOutstanding).
+inline bool conformTargetShown( long long acceptedFrame, long long displayedFrame, double position, bool acceptedPresentPending,
+                                bool rendererOutstanding )
+{
+    // RED (c4efe7e3): an accepted target counts as presented, whatever its prep state
+    (void)displayedFrame;
+    (void)acceptedPresentPending;
+    const long long target = static_cast<long long>( position );
+    return conformTargetPresented( acceptedFrame, position, acceptedFrame == target ? false : rendererOutstanding );
+}
+
 // The single-tick form (no debt carried in or out): the same delta for a tick that carries no debt.
 inline double conformDropFrameDelta( double currentPosition, double grantedFrames, bool conformActive )
 {

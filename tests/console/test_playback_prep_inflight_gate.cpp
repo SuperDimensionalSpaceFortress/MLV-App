@@ -216,3 +216,112 @@ TEST(PlaybackPrepInFlightGate, DrainOutcomeWithNothingInFlightAllowsTheMutation)
     ASSERT_TRUE( outcome.drained );
     ASSERT_TRUE( playbackPrepBorrowFreeingMutationAllowed( outcome ) );
 }
+
+// HFR-NATIVE-60FPS-FULLRES-1 r28 (CoS B1 6714996522 on c4efe7e3): Play / conform / Drop Frame, Loop off, NON-INLINE CPU prep.
+// Frame 100 is on screen; drawFrameReady accepted 101 (m_lastPresentedPlaybackFrame = 101) BEFORE it was displayed, and the
+// engine sits at 101.992 with a debt of 1. On c4efe7e3 the accepted 101 opened the gate, so the 0.192 grant repaid to 102.184,
+// 102 was requested, and its enqueue could replace the still-pending prep of 101 (enqueuePlaybackPrepTask): 100 -> 102 on screen,
+// below the debt cap. The gate now keys off the frame DISPLAYED, and a frame the prep queue still holds is a present to come.
+// A real worker thread, held at barriers, walks the queue the way playbackPrepThreadLoop does: (i) the prep pending (not
+// picked up), (iii) in flight, (ii) completed but not consumed -- then consumed, and only then does the engine move on.
+TEST(PlaybackPrepInFlightGate, R28B1AnAcceptedFrameTheNonInlinePrepStillHoldsNeverOpensTheConformGate)
+{
+    std::mutex queueMutex;
+    std::condition_variable queueCv;
+    PlaybackPrepInFlightGate gate;
+    bool pendingValid = false;
+    int64_t pendingFrame = -1;
+    uint64_t pendingSerial = 0;
+    std::deque<int64_t> results;   // completed results' display frames
+    const auto frameOf = []( int64_t frame ) { return frame; };
+
+    const long long accepted = 101;
+    long long displayed = 100;
+    // the engine's next tick from 101.992 (debt 1, grant 0.192): the frame it lands on
+    const auto tickLandsOn = [&]( bool acceptedPresentPending ) -> int
+    {
+        double debt = 1.0;
+        const bool shown = playback_frame_range::conformTargetShown( accepted, displayed, 101.992, acceptedPresentPending, false );
+        const double delta = playback_frame_range::conformDropFrameDelta( 101.992, 0.192, true, debt, shown );
+        return static_cast<int>( std::floor( 101.992 + delta ) );
+    };
+    const auto heldLocked = [&]() {
+        return playbackPrepHoldsFrameLocked( pendingValid, pendingFrame, gate, results, frameOf, accepted );
+    };
+
+    // drawFrameReady's own window: 101 accepted, its present not dispatched yet (the early advance runs here)
+    ASSERT_EQ( 101, tickLandsOn( true ) );
+
+    std::promise<void> pickUp, taken, computeDone, completed;
+    std::shared_future<void> pickUpSignal = pickUp.get_future().share();
+    std::shared_future<void> computeDoneSignal = computeDone.get_future().share();
+    std::future<void> takenSignal = taken.get_future();
+    std::future<void> completedSignal = completed.get_future();
+    std::thread worker( [&]() {
+        pickUpSignal.wait();   // barrier: the task stays pending until the observer has seen it there
+        int64_t frame = -1;
+        {
+            std::unique_lock<std::mutex> lk( queueMutex );
+            queueCv.wait( lk, [&]{ return pendingValid; } );
+            frame = pendingFrame;
+            pendingValid = false;
+            gate.beginLocked( pendingSerial, frame );
+        }
+        taken.set_value();
+        computeDoneSignal.wait();   // barrier: in flight until released
+        {
+            std::lock_guard<std::mutex> lk( queueMutex );
+            results.push_back( frame );
+            gate.endLocked();
+        }
+        completed.set_value();
+    } );
+
+    // enqueuePlaybackPrepTask( 101 )
+    {
+        std::lock_guard<std::mutex> lk( queueMutex );
+        pendingFrame = accepted;
+        pendingSerial = 7;
+        pendingValid = true;
+    }
+    queueCv.notify_one();
+    // (i) pending, not picked up
+    bool heldPending = false;
+    { std::lock_guard<std::mutex> lk( queueMutex ); heldPending = heldLocked(); }
+    ASSERT_TRUE( heldPending );
+    ASSERT_EQ( 101, tickLandsOn( heldPending ) );
+    // (iii) in flight
+    pickUp.set_value();
+    takenSignal.wait();
+    bool heldInFlight = false;
+    { std::lock_guard<std::mutex> lk( queueMutex ); heldInFlight = heldLocked(); ASSERT_FALSE( pendingValid ); }
+    ASSERT_TRUE( heldInFlight );
+    ASSERT_EQ( 101, tickLandsOn( heldInFlight ) );
+    // (ii) completed, not consumed (onPlaybackPrepResultReady has not run: queued signal, or Look Assist holding it)
+    computeDone.set_value();
+    completedSignal.wait();
+    worker.join();
+    bool heldUnconsumed = false;
+    { std::lock_guard<std::mutex> lk( queueMutex ); heldUnconsumed = heldLocked(); ASSERT_FALSE( gate.inFlightLocked() ); }
+    ASSERT_TRUE( heldUnconsumed );
+    ASSERT_EQ( 101, tickLandsOn( heldUnconsumed ) );
+    // consumed and displayed (presentPlaybackPreparedFrame -> finishPresentedFrame): the debt is repaid, one frame on
+    {
+        std::lock_guard<std::mutex> lk( queueMutex );
+        ASSERT_EQ( 101, static_cast<int>( results.front() ) );
+        results.pop_front();
+        ASSERT_FALSE( heldLocked() );
+    }
+    displayed = 101;
+    ASSERT_EQ( 102, tickLandsOn( false ) );
+
+    // the escape is kept: 101 accepted, its prep gone without a display (dropped), the renderer idle -- nothing is coming, so
+    // nothing holds (adversary A1 on d98be193)
+    displayed = 100;
+    ASSERT_EQ( 102, tickLandsOn( false ) );
+    // and a target the renderer still owes, not yet accepted, holds as before (r27)
+    ASSERT_FALSE( playback_frame_range::conformTargetShown( 100, 100, 101.992, false, true ) );
+    ASSERT_TRUE( playback_frame_range::conformTargetShown( 100, 100, 101.992, false, false ) );
+    // a displayed target is shown whatever is pending
+    ASSERT_TRUE( playback_frame_range::conformTargetShown( 101, 101, 101.992, true, true ) );
+}

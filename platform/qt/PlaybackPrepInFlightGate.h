@@ -19,21 +19,26 @@
 class PlaybackPrepInFlightGate
 {
 public:
-    void beginLocked( uint64_t serial )
+    // HFR-NATIVE-60FPS-FULLRES-1 r28 (CoS B1 on c4efe7e3): \a frame is the task's display frame, so the conformed engine can
+    // tell that a frame drawFrameReady accepted is still being prepared (playbackPrepHoldsFrameLocked); -1 = not recorded.
+    void beginLocked( uint64_t serial, int64_t frame = -1 )
     {
         m_inFlight = true;
         m_serial = serial;
+        m_frame = frame;
     }
 
     // Call after the worker's last access to borrowed task memory.
     void endLocked()
     {
         m_inFlight = false;
+        m_frame = -1;
         m_cv.notify_all();
     }
 
     bool inFlightLocked() const { return m_inFlight; }
     uint64_t serialLocked() const { return m_serial; }
+    int64_t frameLocked() const { return m_inFlight ? m_frame : -1; }
 
     // Waits on `lock` (holding the queue mutex) until no task is in flight. Returns
     // false if the worker is still inside its section after timeoutMs.
@@ -64,7 +69,25 @@ private:
     std::condition_variable m_cv;
     bool m_inFlight = false;
     uint64_t m_serial = 0;
+    int64_t m_frame = -1;
 };
+
+// HFR-NATIVE-60FPS-FULLRES-1 r28 (CoS B1 on c4efe7e3): whether the non-inline prep queue still holds \a frame -- a frame
+// drawFrameReady accepted (m_lastPresentedPlaybackFrame) whose present has not happened yet. It is the pending task the
+// worker has not picked up, the task in flight, or a completed result onPlaybackPrepResultReady has not consumed. A pending
+// task can still be replaced by a newer enqueue (enqueuePlaybackPrepTask), so while it is held the frame is not on screen.
+// \a resultFrames is any range and \a frameOf maps an element to its display frame. The caller holds the queue mutex.
+template <class Results, class FrameOf>
+inline bool playbackPrepHoldsFrameLocked( bool pendingValid, int64_t pendingFrame, const PlaybackPrepInFlightGate &gate,
+                                          const Results &resultFrames, FrameOf frameOf, int64_t frame )
+{
+    if( frame < 0 ) return false;
+    if( pendingValid && pendingFrame == frame ) return true;
+    if( gate.frameLocked() == frame ) return true;
+    for( const auto &result : resultFrames )
+        if( static_cast<int64_t>( frameOf( result ) ) == frame ) return true;
+    return false;
+}
 
 // CPU-SCOPE-PLAYSTOP-LIFETIME-HARDENING-1 r2 (CoS B1): one drain, and what it allows.
 struct PlaybackPrepDrainOutcome

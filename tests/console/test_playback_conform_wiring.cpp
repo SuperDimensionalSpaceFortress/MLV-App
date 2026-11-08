@@ -164,9 +164,45 @@ TEST(PlaybackConformWiring, DropFrameTickQuantisesTheConformedCatchupToWholeFram
         "                            m_newPosDropMode,\n"
         "                            m_playbackPaceGuard.grant( getPlaybackFramerate() * (double)timeDiff / 1000.0, paceNowMs, playbackPaceGuardFps() ),\n"
         "                            playbackConformActive(), m_conformDropDebtFrames,\n"
-        "                            playback_frame_range::conformTargetPresented(\n"
-        "                                m_lastPresentedPlaybackFrame, m_newPosDropMode, conformTargetPresentOutstanding() ) ),");
+        "                            playback_frame_range::conformTargetShown(\n"
+        "                                m_lastPresentedPlaybackFrame, m_lastDisplayedPlaybackFrame, m_newPosDropMode,\n"
+        "                                conformAcceptedTargetPresentPending(), conformTargetPresentOutstanding() ) ),");
     ASSERT_EQ(1, countOccurrences(body, call));
+    // r28 (CoS B1 6714996522 on c4efe7e3): the gate keys off the frame DISPLAYED, never off one drawFrameReady accepted but has
+    // not shown. finishPresentedFrame records it before its tail advance; a display change clears it with the accepted frame.
+    {
+        const QString src = mainWindowSource();
+        ASSERT_TRUE(readRepoFile(QStringLiteral("platform/qt/MainWindow.h")).contains(QStringLiteral("long long m_lastDisplayedPlaybackFrame = -1;")));
+        ASSERT_TRUE(readRepoFile(QStringLiteral("platform/qt/MainWindow.h")).contains(QStringLiteral("long long m_playbackPresentDispatchFrame = -1;")));
+        const int finish = src.indexOf(QStringLiteral("void MainWindow::finishPresentedFrame( uint64_t displayFrame,"));
+        ASSERT_TRUE(finish > 0);
+        const int displayedAt = src.indexOf(QStringLiteral("    m_lastDisplayedPlaybackFrame = static_cast<long long>( displayFrame );"), finish);
+        ASSERT_TRUE(displayedAt > finish);
+        ASSERT_TRUE(src.indexOf(QStringLiteral("            timerFrameEvent();"), finish) > displayedAt);
+        const int invalidate = src.indexOf(QStringLiteral("void MainWindow::invalidatePlaybackPrepForDisplayChange( const char *reason )"));
+        ASSERT_TRUE(invalidate > 0);
+        const QString invalidateBody = src.mid(invalidate, src.indexOf(QStringLiteral("\n}\n"), invalidate) - invalidate);
+        ASSERT_TRUE(invalidateBody.contains(QStringLiteral("    m_lastPresentedPlaybackFrame = -1;\n    m_lastDisplayedPlaybackFrame = -1;")));
+        ASSERT_EQ(3, countOccurrences(src, QStringLiteral("m_lastDisplayedPlaybackFrame")));   // the tick, the record, the clear
+        // drawFrameReady's own window: from the accept until it returns (the inline present, or the enqueue that hands the
+        // frame to the prep queue), the accepted frame is a present still to come -- the early advance runs inside it
+        const int acceptedAt = src.indexOf(QStringLiteral("    m_lastPresentedPlaybackFrame = static_cast<long long>( display_frame );"));
+        ASSERT_TRUE(acceptedAt > 0);
+        const int windowAt = src.indexOf(QStringLiteral("    PlaybackPresentDispatchWindow presentDispatchWindow( m_playbackPresentDispatchFrame, static_cast<long long>( display_frame ) );"), acceptedAt);
+        ASSERT_TRUE(windowAt > acceptedAt);
+        ASSERT_TRUE(src.indexOf(QStringLiteral("const bool predictiveGpuTexNrEarlyAdvance ="), acceptedAt) > windowAt);
+        // the pending present: the dispatch window, or the non-inline prep queue still holding the accepted target
+        const int pending = src.indexOf(QStringLiteral("bool MainWindow::conformAcceptedTargetPresentPending()"));
+        ASSERT_TRUE(pending > 0);
+        const QString pendingBody = src.mid(pending, src.indexOf(QStringLiteral("\n}\n"), pending) - pending);
+        ASSERT_TRUE(pendingBody.contains(QStringLiteral("if( target < 0 || m_lastPresentedPlaybackFrame != target ) return false;")));
+        ASSERT_TRUE(pendingBody.contains(QStringLiteral("if( m_playbackPresentDispatchFrame == target ) return true;")));
+        ASSERT_TRUE(pendingBody.contains(QStringLiteral("std::lock_guard<std::mutex> lk( m_playbackPrepMutex );")));
+        ASSERT_TRUE(pendingBody.contains(QStringLiteral("return playbackPrepHoldsFrameLocked( m_playbackPrepPendingValid,")));
+        // the worker records the in-flight task's frame
+        ASSERT_EQ(1, countOccurrences(src, QStringLiteral(
+            "m_playbackPrepInFlight.beginLocked( task.requestSerial, static_cast<int64_t>( task.displayFrame ) );")));
+    }
     // r27 (adversary A1 on be20bc59): the repayment is gated on the target drawFrameReady accepted, and that member is set
     // there, after the forward-only guard and before the early advance that runs this tick
     const QString drawReady = mainWindowSource();
