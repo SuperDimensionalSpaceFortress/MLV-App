@@ -754,6 +754,21 @@ function Get-LaneWorkEvidence {
     return $rec
 }
 
+# r8 (sol r7 B1): the answer is REQUESTED OUTPUT when it has substance and EVERY substantive line (Split-LaneLines, the one
+# line definition), trimmed by the one blank rule (Get-LaneBlankTrimmed), occurs verbatim in the prompt: ordinal, case-exact,
+# after CRLF -> LF. An empty prompt contains nothing. A line carries no line break, so a match never spans prompt lines.
+function Test-LaneAnswerIsRequestedOutput {
+    param([AllowEmptyString()][AllowNull()][string]$Answer, [AllowEmptyString()][AllowNull()][string]$Prompt)
+    if ([string]::IsNullOrEmpty($Prompt) -or -not (Test-LaneAnswerHasSubstance -Answer $Answer)) { return $false }
+    $hay = $Prompt -replace "`r`n", "`n"
+    foreach ($ln in @(Split-LaneLines -Text $Answer)) {
+        if (-not (Test-LaneAnswerHasSubstance -Answer $ln)) { continue }
+        $t = Get-LaneBlankTrimmed -Text $ln
+        if ($t.Length -eq 0 -or $hay.IndexOf($t, [System.StringComparison]::Ordinal) -lt 0) { return $false }
+    }
+    return $true
+}
+
 function Get-ProviderRefusal {
     [CmdletBinding()]
     param(
@@ -804,6 +819,12 @@ function Get-ProviderRefusal {
     # unrelated recovered stderr ("ERROR: upstream probe returned 429; recovered") never invalidates a
     # legitimate answer such as `ERROR: file not found`, and neither does a refusal-vocabulary answer whose
     # stderr names a different kind. With nothing corroborating on stderr it is what the prompt asked for (A3).
+    # r8 (sol r7 B1, HUB RULING 20261108T0009Z): matching kinds is not evidence of a refusal -- "Reply with exactly: ERROR:
+    # rate limit handling added" answered exactly, beside a recovered "ERROR: upstream probe returned 429", shares a kind.
+    # The discriminator is REQUESTED OUTPUT: a provider refusal message is never text the prompt itself contains, so an
+    # answer whose every line occurs verbatim in the prompt is what was asked for (Test-LaneAnswerIsRequestedOutput).
+    # Named residual: a prompt that quotes a refusal line verbatim, answered by a provider that genuinely refuses with
+    # exactly that line at exit 0, is read as complete (no recorded codex refusal exits 0 with a prompt-contained answer).
     $answerKinds = $null
     if (Test-LaneAnswerHasSubstance -Answer $Answer) {
         $ansLines = @((Split-LaneLines -Text $Answer) | Where-Object { Test-LaneAnswerHasSubstance -Answer $_ })
@@ -813,6 +834,7 @@ function Get-ProviderRefusal {
             if ($aks.Count -eq 0) { return $null }
             foreach ($ak in $aks) { if (-not $answerKinds.Contains($ak)) { $answerKinds.Add($ak) } }
         }
+        if (Test-LaneAnswerIsRequestedOutput -Answer $Answer -Prompt $Prompt) { return $null }
     }
     if ([string]::IsNullOrWhiteSpace($Text)) { return $null }
     $scan = $Text

@@ -1905,9 +1905,25 @@ def _sentinel_block(body, name):
     return m.group(1)
 
 
-def _run_invoke_lane_codex_wiring(tmp_path, last, stdout, stderr, prompt, exit_code=0, engine="codex"):
+def _receipt_outcome_statements(body):
+    # r8 (sol r7 B1): the REAL completion path past the evidence -- Invoke-Lane's own $workCompleted, receipt `state`
+    # and `$propagated` exit statements, extracted verbatim (no failure, the process ended), so a refusal that outranks
+    # workEvidence.workCompleted is seen as state=refused / exit 125 exactly as the runner writes it.
+    wc = re.search(r"^\$workCompleted = \(\$null -eq \$failure.*$", body, re.M)
+    st = re.search(r"\bstate\s+= (if \(\$null -ne \$failure\).*?else \{ 'incomplete' \})", body, re.S)
+    pr = re.search(r"(\$propagated = switch \(\$exitCode\) \{.*?\r?\n\})\r?\nexit \$propagated", body, re.S)
+    assert wc and st and pr, "Invoke-Lane.ps1 lost its $workCompleted / receipt state / $propagated statements"
+    return ("$failure = $null\n$processEnded = ($exitCode -ne -999)\n" + wc.group(0) + "\n"
+            + "$receiptState = " + st.group(1) + "\n" + pr.group(1) + "\n")
+
+
+def _run_invoke_lane_codex_wiring(tmp_path, last, stdout, stderr, prompt, exit_code=0, engine="codex", receipt=False):
     body = LANE_RUNNER.read_text(encoding="utf-8")
     block_a, block_b = _sentinel_block(body, "K4-ANSWER"), _sentinel_block(body, "K4-EVIDENCE")
+    block_c = _receipt_outcome_statements(body) if receipt else ""
+    out_obj = ("[pscustomobject]@{ refusal = $providerRefusal; evidence = $workEvidence"
+               + ("; state = $receiptState; complete = $workCompleted; exit = $propagated" if receipt else "")
+               + " } | ConvertTo-Json -Compress -Depth 6\n")
     lf = tmp_path / "w.last.txt"
     if last is not None:
         lf.write_text(last, encoding="utf-8", newline="")
@@ -1918,6 +1934,7 @@ def _run_invoke_lane_codex_wiring(tmp_path, last, stdout, stderr, prompt, exit_c
     (tmp_path / "w.prompt.txt").write_text(prompt, encoding="utf-8", newline="")
     (tmp_path / "block-a.ps1").write_text(block_a, encoding="utf-8")
     (tmp_path / "block-b.ps1").write_text(block_b, encoding="utf-8")
+    (tmp_path / "block-c.ps1").write_text(block_c, encoding="utf-8")
     script = (
         "Set-StrictMode -Version Latest; $ErrorActionPreference = 'Stop'\n"
         f". '{REFUSAL_HELPER}'\n"
@@ -1930,7 +1947,8 @@ def _run_invoke_lane_codex_wiring(tmp_path, last, stdout, stderr, prompt, exit_c
         "$codexAnswerEvidence = ''\n"
         f". '{tmp_path / 'block-a.ps1'}'\n"
         f". '{tmp_path / 'block-b.ps1'}'\n"
-        "[pscustomobject]@{ refusal = $providerRefusal; evidence = $workEvidence } | ConvertTo-Json -Compress -Depth 6\n"
+        f". '{tmp_path / 'block-c.ps1'}'\n"
+        + out_obj
     )
     (tmp_path / "wiring.ps1").write_text(script, encoding="utf-8")
     out = subprocess.run(["pwsh", "-NoLogo", "-NoProfile", "-NonInteractive", "-File", str(tmp_path / "wiring.ps1")],
@@ -2148,6 +2166,86 @@ def test_get_provider_refusal_direct_unrelated_recovered_stderr_is_not_a_refusal
     assert r is None, r
     r = _classify(tmp_path, "ERROR: upstream probe returned 429; recovered\n", "codex", answer="ERROR: missing semicolon")
     assert r is None, r
+
+
+# --- r8 (sol r7 B1, HUB RULING 20261108T0009Z): the discriminator is REQUESTED OUTPUT, not vocabulary. A provider refusal
+# message is never text the prompt itself contains, so an ERROR-framed refusal-vocabulary answer whose every line occurs
+# verbatim in the prompt is the requested output, even when a recovered stderr line names the same kind.
+R8_SOL_WITNESSES = (
+    ("Reply with exactly: ERROR: rate limit handling added", "ERROR: rate limit handling added",
+     "ERROR: upstream probe returned 429; recovered\n"),
+    ("Reply with exactly: ERROR: authentication failed (example)", "ERROR: authentication failed (example)",
+     "ERROR: authentication failed on first attempt; recovered\n"),
+    ("Reply with exactly: ERROR: usage_limit_reached is a test fixture", "ERROR: usage_limit_reached is a test fixture",
+     "ERROR: usage_limit_reached on first attempt; recovered\n"),
+)
+
+
+def _r8_deliveries(answer):
+    # file-only, stdout-only, combined
+    return ((answer, ""), (None, answer), (answer, answer))
+
+
+def _assert_complete(w, ctx):
+    assert w["refusal"] is None, (ctx, w)
+    assert w["evidence"]["workCompleted"] is True, (ctx, w)
+    assert w["state"] == "complete" and w["complete"] is True and w["exit"] == 0, (ctx, w)
+
+
+@pytest.mark.parametrize("delivery", ["file-only", "stdout-only", "combined"])
+@pytest.mark.parametrize("witness", [0, 1, 2], ids=["rate-limit", "auth", "usage-limit"])
+def test_r8_sol_b1_requested_error_framed_answer_with_same_kind_recovered_stderr_is_complete(tmp_path, witness, delivery):
+    # sol r7 B1: nine executed counterexamples (3 kinds x file-only / stdout-only / combined) were state=refused, exit 125.
+    prompt, answer, stderr = R8_SOL_WITNESSES[witness]
+    last, stdout = dict(zip(("file-only", "stdout-only", "combined"), _r8_deliveries(answer)))[delivery]
+    w = _run_invoke_lane_codex_wiring(tmp_path, last, stdout, stderr, prompt, receipt=True)
+    _assert_complete(w, (prompt, last, stdout))
+
+
+def test_r8_dot_requested_http_429_answer_with_recovered_429_stderr_is_complete(tmp_path):
+    # Dot witness (bus 7737321, request 6714734662): last-message exactly the requested text, empty stdout, exit 0.
+    w = _run_invoke_lane_codex_wiring(tmp_path, "ERROR: HTTP 429", "", "ERROR: upstream probe returned 429; recovered\n",
+                                      "Reply with exactly this text and nothing else: ERROR: HTTP 429", receipt=True)
+    _assert_complete(w, "dot")
+
+
+def test_r8_requested_output_lines_are_trimmed_by_the_one_unicode_blank_rule(tmp_path):
+    # the line trim is the r7 blank rule (Unicode whitespace, Cf, Cc), so blank padding the prompt does not carry, and a
+    # CRLF prompt, never turn the requested text into a refusal.
+    stderr = "ERROR: upstream probe returned 429; recovered\n"
+    for answer in ("ERROR: HTTP 429 ", "　ERROR: HTTP 429​", "ERROR: HTTP 429\r\n \r\nERROR: HTTP 429  "):
+        w = _run_invoke_lane_codex_wiring(tmp_path, answer, "", stderr, "Reply with exactly:\r\nERROR: HTTP 429\r\n", receipt=True)
+        _assert_complete(w, repr(answer))
+    # the helper itself, directly
+    assert _classify(tmp_path, stderr, "codex", prompt="Say: ERROR: HTTP 429", answer="ERROR: HTTP 429 ") is None
+
+
+def test_r8_genuine_refusal_control_answer_not_in_the_prompt_is_still_refused_and_outranks_work_completed(tmp_path):
+    # control (must hold on both heads): the answer IS refusal text the prompt never contained, and stderr names the same
+    # kind. INV-11: the refusal outranks workEvidence.workCompleted -> refused, complete=false, exit 125.
+    w = _run_invoke_lane_codex_wiring(tmp_path, "ERROR: HTTP 429", "", "ERROR: HTTP 429\n", "Review this change", receipt=True)
+    assert w["refusal"] is not None and w["refusal"]["kind"] == "provider-rate-limit", w
+    assert w["evidence"]["workCompleted"] is True, w
+    assert w["state"] == "refused" and w["complete"] is False and w["exit"] == 125, w
+    kinds = ("provider-rate-limit", "provider-auth", "provider-usage-limit")
+    for (_, answer, stderr), kind in zip(R8_SOL_WITNESSES, kinds):
+        for last, stdout in _r8_deliveries(answer):
+            w = _run_invoke_lane_codex_wiring(tmp_path, last, stdout, stderr, "Review this change", receipt=True)
+            assert w["refusal"] is not None and w["refusal"]["kind"] == kind, (answer, last, stdout, w)
+            assert w["state"] == "refused" and w["exit"] == 125, (answer, w)
+
+
+def test_r8_a_partially_requested_or_case_different_answer_is_still_refused(tmp_path):
+    # EVERY substantive line must occur in the prompt, ordinally: one unrequested refusal line, or a case variant, is not
+    # requested output.
+    stderr = "ERROR: HTTP 429\n"
+    prompt = "Reply with exactly: ERROR: HTTP 429"
+    for answer in ("ERROR: HTTP 429\nERROR: rate limited, try again in 20s", "ERROR: http 429", "ERROR: HTTP  429"):
+        w = _run_invoke_lane_codex_wiring(tmp_path, answer, "", stderr, prompt, receipt=True)
+        assert w["refusal"] is not None and w["refusal"]["kind"] == "provider-rate-limit", (answer, w)
+        assert w["state"] == "refused" and w["exit"] == 125, (answer, w)
+    # an empty prompt contains nothing
+    assert _classify(tmp_path, stderr, "codex", prompt="", answer="ERROR: HTTP 429")["kind"] == "provider-rate-limit"
 
 
 def test_r3_adv_a1_an_unterminated_final_fence_counts_only_as_one_complete_strict_object(tmp_path):
