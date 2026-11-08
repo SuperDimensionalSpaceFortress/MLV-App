@@ -3383,9 +3383,13 @@ namespace
 // (invalidatePlaybackPrepForDisplayChange: Drop Frame toggle, display change). It clears the last presented frame to -1 and the
 // renderer is left idle: timerFrameEvent's duplicate-draw suppression never re-requests the current target, so its present
 // never comes. Only a NEW target is rendered and presented. \a maxPresentGapMs is the longest wall time between two presents.
+// r28: \a cancelledPresents counts the presents the invalidation cancelled (the target's render was still in flight, so that
+// frame is never presented), and \a conformGate false runs the same play with the r26 engine (targetPresented always true),
+// the baseline that tells a frame the invalidation itself loses from one the gate loses.
 ConformPlayResult playConformedTicksWithRenderer( const std::function<double( int )> & tickAt, double presentLatencyMs,
                                                   int cutOut, double * maxDebt = nullptr, int invalidateAt = -1,
-                                                  double * maxPresentGapMs = nullptr )
+                                                  double * maxPresentGapMs = nullptr, int * cancelledPresents = nullptr,
+                                                  bool conformGate = true )
 {
     playback_native_pace::NativePaceGuard guard;
     guard.reset();
@@ -3411,7 +3415,12 @@ ConformPlayResult playConformedTicksWithRenderer( const std::function<double( in
     {
         const double tickMs = tickAt( t );
         nowMs += tickMs;
-        if( t == invalidateAt ) { lastPresented = -1; presentCancelled = true; }
+        if( t == invalidateAt )
+        {
+            if( cancelledPresents && target != lastPresented ) ++*cancelledPresents;
+            lastPresented = -1;
+            presentCancelled = true;
+        }
         if( !presentCancelled && target != lastPresented && nowMs - targetSinceMs >= presentLatencyMs ) present( target );
         const double granted = guard.grant( 24.0 * tickMs / 1000.0, nowMs, 24.0 );
         if( t == 1 ) guard.notePresent( nowMs, 24.0 );
@@ -3421,7 +3430,7 @@ ConformPlayResult playConformedTicksWithRenderer( const std::function<double( in
             position,
             playback_frame_range::conformDropFrameDelta(
                 position, granted, true, debt,
-                playback_frame_range::conformTargetPresented( lastPresented, position, presentOutstanding ) ),
+                !conformGate || playback_frame_range::conformTargetPresented( lastPresented, position, presentOutstanding ) ),
             1, cutOut, false );
         position = tick.position;
         if( maxDebt && debt > *maxDebt ) *maxDebt = debt;
@@ -3502,12 +3511,17 @@ TEST( PlaybackConformDropFrame, R27A1ACarriedDebtIsRepaidOnlyAsTheRendererPresen
         ASSERT_TRUE( burstDebt <= playback_frame_range::kConformMaxDebtFrames + 1e-9 );
     }
     // a renderer SLOWER than the period cannot show every frame: the backlog reaches the cap and the frames beyond it are
-    // skipped (stall evidence, never a conform PASS), but the timeline keeps the guard's pace and the debt stays bounded
+    // skipped (stall evidence, never a conform PASS), but the timeline keeps the guard's pace and the debt stays bounded.
+    // r28 (hosted Tests 42428105872, :3508): the stall evidence is the presented pace, not a jump. This renderer restarts on
+    // every new target (a target moved past is pruned), so once the backlog sits at the cap each skip moves the target on
+    // every period, before its 60 ms present can land: presentation stops at about frame 930 (14.83 presented source fps
+    // over the play) while the engine reaches 1498 at the guard's pace. The tracker never sees a jump (maxJump 1), and the
+    // conform judge reads the pace below the band, a FAIL.
     double slowDebt = 0.0;
     const ConformPlayResult slow = playConformedTicksWithRenderer( []( int ) { return 8.0; }, 60.0, 1667, &slowDebt );
-    ASSERT_TRUE( slow.maxJump > 1 );
+    ASSERT_TRUE( slow.sourceFps < 23.28 );   // never a conform PASS
     ASSERT_TRUE( slow.consumedAt64998 >= int64_t( 1499 ) );
-    ASSERT_TRUE( slowDebt <= playback_frame_range::kConformMaxDebtFrames + 1e-9 );
+    ASSERT_NEAR( playback_frame_range::kConformMaxDebtFrames, slowDebt, 1e-9 );   // the backlog reached the cap, and no further
 }
 
 TEST( PlaybackConformDropFrame, R27A1bAnInvalidatedPresentWithAnIdleRendererNeverHoldsTheEngine )
@@ -3522,18 +3536,34 @@ TEST( PlaybackConformDropFrame, R27A1bAnInvalidatedPresentWithAnIdleRendererNeve
     ASSERT_TRUE( playback_frame_range::conformTargetPresented( 100, 100.4, true ) );    // presented
     ASSERT_FALSE( playback_frame_range::conformTargetPresented( 100, 101.2, true ) );   // r27 A1 on be20bc59: 101 is queued
     // the whole play: the invalidation lands near frame 100 (tick 521, 0.192 a tick), renderer latency 10 ms
+    // r28 (hosted Tests 42428105872, :3531): at 524/20, 700/10 and 700/20 the invalidation lands while the target's render is
+    // still in flight. It cancels that render (cancelPlaybackPresentationRequests), and duplicate-draw suppression never
+    // re-requests the target, so that one frame is never presented: maxJump 2, gap 88 ms. The engine without the gate (r26)
+    // loses the same frame. The gate adds no skip and no hold: every frame is shown when nothing was cancelled, and exactly
+    // the cancelled frame is lost otherwise.
+    int cancelledCases = 0;
     for( const int at : { 2, 521, 524, 700, 3505 } )
         for( const double latency : { 0.0, 10.0, 20.0 } )
         {
-            double maxDebt = 0.0, maxGap = 0.0;
+            double maxDebt = 0.0, maxGap = 0.0, baseDebt = 0.0, baseGap = 0.0;
+            int cancelled = 0, baseCancelled = 0;
             const ConformPlayResult r = playConformedTicksWithRenderer(
-                []( int ) { return 8.0; }, latency, 1667, &maxDebt, at, &maxGap );
-            ASSERT_EQ( 1, r.maxJump );
-            ASSERT_TRUE( maxDebt < 1.0 );          // d98be193: the cap, 8
-            ASSERT_TRUE( maxGap <= 70.0 );         // one 41.7 ms period, a tick and the latency; d98be193: about 376 ms
+                []( int ) { return 8.0; }, latency, 1667, &maxDebt, at, &maxGap, &cancelled );
+            const ConformPlayResult base = playConformedTicksWithRenderer(
+                []( int ) { return 8.0; }, latency, 1667, &baseDebt, at, &baseGap, &baseCancelled, false );
+            ASSERT_TRUE( cancelled == 0 || cancelled == 1 );
+            ASSERT_EQ( baseCancelled, cancelled );
+            cancelledCases += cancelled;
+            ASSERT_EQ( 1 + cancelled, r.maxJump );       // every frame, or exactly the one the invalidation cancelled
+            ASSERT_EQ( base.maxJump, r.maxJump );        // and the r26 engine loses the same
+            ASSERT_TRUE( maxDebt < 1.0 );                // d98be193: the cap, 8
+            ASSERT_TRUE( maxGap <= 70.0 + cancelled * 41.7 );   // one period, a tick and the latency (+ the cancelled frame's
+                                                                // period); d98be193: about 376 ms
+            ASSERT_TRUE( maxGap <= baseGap + 1e-9 );
             ASSERT_TRUE( r.consumedAt64998 >= int64_t( 1499 ) );
             ASSERT_TRUE( r.sourceFps >= 23.28 && r.sourceFps <= 24.72 );
         }
+    ASSERT_EQ( 3, cancelledCases );   // 524/20, 700/10, 700/20; the literal input (521: 100 presented, renderer idle) is not one
 }
 
 TEST( PlaybackConformDropFrame, R24A1TheCarriedDebtIsBoundedAndClearedWithoutConform )

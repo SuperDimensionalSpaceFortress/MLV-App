@@ -2829,9 +2829,20 @@
       "anchor": "for ( int t = 1 ; t < 100000 && r . reachedMs < 0.0 ; ++ t )",
       "class": "value_fallback_select",
       "clock": "other",
-      "justification": "HFR-NATIVE-60FPS-FULLRES-1 r24 unit fixture playConformed() (adversary A1 on 9b900412): reachedMs is not a timer read. It is a SIMULATED tick clock value -- nowMs is the fixture's own running sum of hand-chosen tickMs (8 ms, or lateMs on every lateEvery-th tick), so no QPC/omp/steady_clock is read anywhere in the loop -- and -1.0 is the 'frame 1498 not reached yet' sentinel it starts at. `reachedMs < 0.0` only keeps the simulation looping until the sentinel is replaced (bounded by t < 100000); every tick adds at least 8 ms, so a recorded reach is >= 8 and the sentinel is the only non-positive value. A sentinel/loop-exit select on synthetic input, never a stage run-proof.",
+      "justification": "HFR-NATIVE-60FPS-FULLRES-1 r24 unit fixture playConformed() (adversary A1 on 9b900412): reachedMs is not a timer read. It is a SIMULATED tick clock value -- nowMs is the fixture's own running sum of hand-chosen tickMs (8 ms, or lateMs on every lateEvery-th tick), so no QPC/omp/steady_clock is read anywhere in the loop -- and -1.0 is the 'frame 1498 not reached yet' sentinel it starts at. `reachedMs < 0.0` only keeps the simulation looping until the sentinel is replaced (bounded by t < 100000); every tick adds at least 8 ms, so a recorded reach is >= 8 and the sentinel is the only non-positive value. A sentinel/loop-exit select on synthetic input, never a stage run-proof. HFR-NATIVE-60FPS-FULLRES-1 r27 added a SECOND identical loop header, in the renderer-modelled fixture playConformedTicksWithRenderer() (adversary A1 on be20bc59), so the anchor now occurs twice (r28 recount, hosted Tests 42428105872 shard failures at test_duration_as_proof_inventory.py:108/:120). The second copy is the same shape: nowMs is again the fixture's own running sum of hand-chosen tickMs (tickAt(t), at least 8 ms a tick), no timer is read, and reachedMs < 0.0 only keeps the simulation looping until the 'position 1498 reached' sentinel -1.0 is replaced (bounded by t < 100000). Both copies are the same sentinel/loop-exit select on synthetic input.",
       "lines": [
-        3245
+        3270,
+        3414
+      ]
+    },
+    {
+      "path": "tests/console/test_playback_frame_range.cpp",
+      "anchor": "if ( presentLatencyMs <= 0.0 ) present ( target ) ;",
+      "class": "value_fallback_select",
+      "clock": "other",
+      "justification": "HFR-NATIVE-60FPS-FULLRES-1 r27 unit fixture playConformedTicksWithRenderer() (adversary A1 on be20bc59), classified in r28 (hosted Tests 42428105872). presentLatencyMs is not a timer read or a measured duration: it is a hand-chosen INPUT of the simulated renderer (0, 9, 10, 16, 20, 25 or 60 ms in the tests), the delay after which the modelled renderer presents a new target. `presentLatencyMs <= 0.0` selects the zero-latency model, where a new target is presented on the very tick that set it; any positive latency is presented later by the per-tick check above it. A mode select on a synthetic parameter, never evidence that a stage ran.",
+      "lines": [
+        3444
       ]
     },
     {
@@ -2842,7 +2853,7 @@
       "flag": "held.consumedAt64998 >= int64_t(1499) (SourceFrameAdvanceCounter::consumed() = forwardSteps + 1, asserted two lines below: 1499 consumed means the playhead advanced past frame 1498, so the reach is proved by a counter)",
       "justification": "HFR-NATIVE-60FPS-FULLRES-1 r24 test R24A1HeldCatchupIsRepaidSoTheConformedSourcePaceStaysInTheBand: asserts the conformed simulation reached frame 1498, i.e. playConformed() replaced its -1.0 'not reached' sentinel. reachedMs is a SIMULATED tick clock in a unit fixture (the sum of the fixture's own tickMs values, at least 8 ms per tick), not a wall clock or any timer read, so the sub-resolution 'ran but read 0 ms' flake this inventory exists for cannot occur. The reach is also proved independently by the source-frame counter assert named in 'flag'; this compare is kept because the following line bounds the same value (reachedMs <= 62500.0) and a -1.0 sentinel would pass that bound alone.",
       "lines": [
-        3278
+        3303
       ]
     }
   ]
