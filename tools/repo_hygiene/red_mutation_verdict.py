@@ -175,6 +175,13 @@ NON-PROMISES:
   without guessing (a parameter id holding ``] - ``).
 - The runner's FINAL result line decides green: unittest ``OK`` or a pytest bar with no
   failed/error count means no assertion failed, whatever failure-looking text a test printed above it.
+- unittest LAYOUT (r15, Dot R18 B1): 3.11+ prints ``name (module.Class.name)``, CPython <= 3.10 ``name (module.Class)``.
+  A group of two segments ending in ``.name`` (``test_x (t.test_x)``) cannot be 3.11+ (module, class and method are three
+  segments), so it reads as the <= 3.10 class ``test_x`` of module ``t``: ``t.test_x.test_x``. OPEN, for a hub ruling: a
+  group of three or more segments ending in ``.name`` (``test_x (pkg.t.test_x)``) is BOTH the 3.11+ ``pkg.t.test_x`` and
+  the <= 3.10 class ``test_x`` of module ``pkg.t``, character for character, and no line of the run tells the two apart.
+  It is read as 3.11+. Refusing it would refuse every 3.11+ identity expectation; a ``file:line`` expectation does not
+  depend on the layout.
 - Whitespace inside an id is significant (`` a/t.py`` is not ``a/t.py``; ``test one`` is not ``test``), and the
   expectation is never stripped: `` a/t.py:5`` and ``a/t.py:5\\n`` match nothing.
 - It reads text, so text can be forged. r7 TERMINATION (hub ruling): an allowlisted shape is judged, anything outside
@@ -633,7 +640,11 @@ def _ut_identities(rest: str) -> list[tuple[str, str]]:
     A reading is a parenthesised group that ENDS WITH `.name`. A method name that itself holds ` (x.name)` gives
     two readings (r7 adversary A1: ``test_x (bogus.test_x)`` reads as the name ``test_x`` of module ``bogus``), and the
     caller refuses a header with more than one rather than choose. Older Pythons print `name (module.Class)`, handled by
-    the caller."""
+    the caller.
+    r15 (Dot R18 B1 6715619691; honest output): 3.11+ prints module, class qualname AND method, so its group has at least
+    THREE dotted segments. A group of two that ends in `.name` is the <= 3.10 header of a class named like its method
+    (module t, class test_x, method test_x prints `test_x (t.test_x)`), so its one reading is `t.test_x.test_x`, never
+    `t.test_x`. That reading still counts toward the more-than-one refusal above."""
     found: list[tuple[str, str]] = []
     for i in (m.start() for m in re.finditer(r" \(", rest)):
         name, tail = rest[:i], rest[i + 2:]
@@ -645,7 +656,8 @@ def _ut_identities(rest: str) -> list[tuple[str, str]]:
             end = k + len(needle)
             ident, after = tail[:end - 1], tail[end:]
             if _SUBTEST_SUFFIX.fullmatch(after):
-                found.append((name, ident))
+                # `ident` ends in "." + name, so a dot count of one is the two-segment `module.name`: the legacy layout
+                found.append((name, ident if ident.count(".", 0, k) else f"{ident}.{name}"))
             k = tail.find(needle, k + 1)
     return found
 
@@ -740,7 +752,7 @@ def _parse_unittest(lines: list[str]) -> list[Failure]:
         readings = _ut_identities(head["rest"])
         if readings:
             name, full = readings[0]
-        else:  # older Pythons: `name (module.Class)`
+        else:  # older Pythons: `name (module.Class)` (a two-segment `module.name` group is read in _ut_identities, r15)
             # The module part is the LAST parenthesised dotted group; an earlier group belongs to the name. r14 fix 2
             # (716e6018-A1): only a group the subTest suffix (or nothing) follows, so a group inside `[msg]` or `(params)`
             # is never the class, and a 3.11+ identity with another suffix is never read as `module.Class` plus a name.

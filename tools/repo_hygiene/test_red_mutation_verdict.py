@@ -1992,6 +1992,86 @@ class SummarySplitR11(unittest.TestCase):
         v = rmv.classify(legacy, "t.T.test_x")
         self.assertEqual((v.status, v.code), (rmv.PASS, "assertion-failed"), v)
 
+    # r15 (Dot R18 B1 6715619691, bus a6a68d2; honest output): CPython <= 3.10 prints a test as `name (module.Class)`.
+    # CPython v3.10.0 Lib/unittest/case.py:463-464:
+    #     def __str__(self):
+    #         return "%s (%s)" % (self._testMethodName, strclass(self.__class__))
+    # and :1422-1443 (_SubTest):
+    #     def _subDescription(self):
+    #         parts = []
+    #         if self._message is not _subtest_msg_sentinel:
+    #             parts.append("[{}]".format(self._message))
+    #         if self.params:
+    #             params_desc = ', '.join(
+    #                 "{}={!r}".format(k, v)
+    #                 for (k, v) in self.params.items())
+    #             parts.append("({})".format(params_desc))
+    #         return " ".join(parts) or '(<subtest>)'
+    #     ...
+    #     def __str__(self):
+    #         return "{} {}".format(self.test_case, self._subDescription())
+    # So module t, class test_x, method test_x prints `test_x (t.test_x)` plus the subTest suffix, and its identity is
+    # t.test_x.test_x. A 3.11+ header names module, class AND method, so `t.test_x` (two segments) is never one.
+    _LEGACY_STR = ("import unittest\n"
+                   "unittest.TestCase.__str__ = lambda self: '%s (%s)' % (self._testMethodName,\n"
+                   "    '%s.%s' % (type(self).__module__, type(self).__qualname__))  # 3.10 case.py:463-464\n")
+
+    def _legacy_run(self, cls: str, body: str, *, legacy: bool = True) -> str:
+        """REAL unittest output of module `t` with one class `cls` and method `test_x` running `body`, rendered by the
+        CPython 3.10 TestCase.__str__ quoted above (``legacy``) or by the host's own (3.11+) one."""
+        src = ((self._LEGACY_STR if legacy else "import unittest\n") + f"class {cls}(unittest.TestCase):\n"
+               "    def test_x(self):\n" + "".join(f"        {ln}\n" for ln in body.splitlines()))
+        return _run_unittest({"t.py": src}, "t")
+
+    COLLISION_FORMS = (
+        ('with self.subTest("ordinary message"):\n    self.assertEqual(1, 2)', " [ordinary message]"),
+        ("with self.subTest(k=1):\n    self.assertEqual(1, 2)", " (k=1)"),
+        ('with self.subTest("m", k=1):\n    self.assertEqual(1, 2)', " [m] (k=1)"),
+        ("self.assertEqual(1, 2)", ""),
+    )
+
+    def test_legacy_subtest_class_method_collision(self) -> None:
+        rule, dash = "=" * 70, "-" * 70
+        witness = (rule + "\nFAIL: test_x (t.test_x) [ordinary message]\n" + dash + "\nTraceback (most recent call last):\n"
+                   '  File "t.py", line 5, in test_x\n    self.assertEqual(1, 2)\nAssertionError: 1 != 2\n\n' + dash
+                   + "\nRan 1 test in 0.001s\n\nFAILED (failures=1)\n")
+        texts = [("dot-witness", witness)]
+        for body, suffix in self.COLLISION_FORMS:
+            out = self._legacy_run("test_x", body)
+            self.assertIn(f"FAIL: test_x (t.test_x){suffix}\n", out.replace("\r\n", "\n"))
+            texts.append((suffix or "no-suffix", out))
+        for label, text in texts:
+            with self.subTest(form=label):
+                v = rmv.classify(text, "t.test_x")
+                self.assertEqual(v.status, rmv.REFUSED, (v, text))
+                self.assertEqual(v.code, "not-at", (v, text))
+                for right in ("t.test_x.test_x", "test_x.test_x"):
+                    v = rmv.classify(text, right)
+                    self.assertEqual((v.status, v.code), (rmv.PASS, "assertion-failed"), (right, v, text))
+
+    def test_legacy_collision_controls_keep_their_verdict(self) -> None:
+        for body, suffix in self.COLLISION_FORMS:
+            with self.subTest(suffix=suffix):
+                # 3.11+ (the host's own rendering), class T and the colliding class test_x: the true identity PASSes
+                modern = self._legacy_run("T", body, legacy=False)
+                self.assertIn(f"FAIL: test_x (t.T.test_x){suffix}\n", modern.replace("\r\n", "\n"))
+                v = rmv.classify(modern, "t.T.test_x")
+                self.assertEqual((v.status, v.code), (rmv.PASS, "assertion-failed"), (v, modern))
+                self.assertNotEqual(rmv.classify(modern, "t.T.test_x.test_x").status, rmv.PASS)
+                same = self._legacy_run("test_x", body, legacy=False)
+                self.assertIn(f"FAIL: test_x (t.test_x.test_x){suffix}\n", same.replace("\r\n", "\n"))
+                v = rmv.classify(same, "t.test_x.test_x")
+                self.assertEqual((v.status, v.code), (rmv.PASS, "assertion-failed"), (v, same))
+                # <= 3.10 with class T (no collision): the true identity PASSes, the class alone does not
+                legacy = self._legacy_run("T", body)
+                self.assertIn(f"FAIL: test_x (t.T){suffix}\n", legacy.replace("\r\n", "\n"))
+                v = rmv.classify(legacy, "t.T.test_x")
+                self.assertEqual((v.status, v.code), (rmv.PASS, "assertion-failed"), (v, legacy))
+                self.assertNotEqual(rmv.classify(legacy, "t.T").status, rmv.PASS)
+        # the identity reader itself: a two-segment group ending in `.name` is the <= 3.10 layout only
+        self.assertEqual(rmv._ut_identities("test_x (t.test_x) [m] (k=1)"), [("test_x", "t.test_x.test_x")])
+        self.assertEqual(rmv._ut_identities("test_x (t.T.test_x) [m] (k=1)"), [("test_x", "t.T.test_x")])
+
     def test_long_nonfailure_reason_is_bounded(self) -> None:
         # Dot 4153241 (:845/:859): every prefix of a SKIPPED/XFAIL/XPASS reason was materialized and checked, quadratic in
         # its length. A 200 KB reason must finish in under 2 s, and it never PASSes as anything but the run's own failure.
