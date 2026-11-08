@@ -5473,6 +5473,10 @@ function Write-CorePartitionNewFile([string]$Path, [string]$Text) {
     } finally { $nf.Dispose() }
 }
 $exe = [string]$env:MLV_CP_EXE; $stop = [string]$env:MLV_CP_STOP; $op = [string]$env:MLV_CP_OUT; $ready = [string]$env:MLV_CP_READY
+# CORE-PARTITION-HELPER-PID-REUSE-1 r2 (adversary A1 on f82e5037): a path is the exe's only when it equals it ORDINALLY, case-insensitive (equal lengths plus an
+# OrdinalIgnoreCase prefix, as Test-PresentMonIdentityText). PowerShell's -ieq / -ine are culture-sensitive and ignore U+00AD, U+200B and U+0000, so another
+# file's path (a soft hyphen in its name) read as the exe's. Every path the helper compares with the exe's goes through $ie.
+$ie = { param($a) $a.Length -eq $exe.Length -and $a.StartsWith($exe, 'OrdinalIgnoreCase') }
 $bench = [int64]$env:MLV_CP_BENCH; $lm = [int64]$env:MLV_CP_LOAD; $hm = [int64]$env:MLV_CP_HELPER; $threads = [int]$env:MLV_CP_THREADS
 # r9 (Dot 3 = adversary r8 aeacec83 A3): the self-deadline is a monotonic budget in ms from the helper's own start ($cw below), so no wall-clock
 # step, backward or forward, moves it.
@@ -5566,7 +5570,7 @@ public sealed class MlvCorePartitionLoad {
             # any read on the pid (adversary A1 on aa71dd11), so the job refuses a measured app not pinned.
             if (!$gone) {
                 $f = $s = $x = $null; try { $f = Get-Process -Id $q.r.pid -ea 0; $s = $f.StartTime.ToUniversalTime().Ticks } catch { }; try { $x = [string]$f.Path } catch { }
-                if (($s -and $s -ne $q.r.startUtcTicks) -or ($x -and $x -ine $exe)) { $gone = $true } elseif (!($s -and $x -or $q.r.pinned)) { $gone = $null }
+                if (($s -and $s -ne $q.r.startUtcTicks) -or ($x -and !(& $ie $x))) { $gone = $true } elseif (!($s -and $x -or $q.r.pinned)) { $gone = $null }
             }
             if ($gone -eq $false) {
                 try { $q.r.affinityLast = [int64]$q.p.ProcessorAffinity; $q.r.priorityLast = [string]$q.p.PriorityClass } catch { }
@@ -5602,7 +5606,7 @@ public sealed class MlvCorePartitionLoad {
                 # CORE-PARTITION-HELPER-PID-REUSE-1 (adversary A1 on 4fdc1512): so a listing that carries a gone key is always a successor with the gone process's
                 # exact start, and one whose Path reads as the exe is a same-path process alive now: recorded unidentified too (it was skipped, which hid an
                 # overlap once the identity re-read retired an unpinned process). Only a Path read at another exe is skipped (no same-path process).
-                if ($seen[$k]) { if ($pn[$p.Id] -or ($seen[$k] -gt 1 -and !($pp -and $pp -ine $exe))) { & $un $p.Id; $seen[$k] = 1 }; continue }
+                if ($seen[$k]) { if ($pn[$p.Id] -or ($seen[$k] -gt 1 -and !($pp -and !(& $ie $pp)))) { & $un $p.Id; $seen[$k] = 1 }; continue }
                 $pe = $pn[$p.Id]
                 # The start read at first sight ($pe.s) is a pending pid's identity, whatever the clock did since: any other start on that pid is a process on a recycled
                 # pid, and the one first listed ended unread. With no start read at first sight nothing can prove identity (r3, HUB RULING 2026-11-06, adversary A1/A2 on
@@ -5612,9 +5616,9 @@ public sealed class MlvCorePartitionLoad {
                 if ($pe -and $pst -and ($pst.Ticks -ne $pe.s -or $pe.o.HasExited -ne $false)) { & $un $p.Id; $pe = $null }
                 # A read that fails settles nothing, on a pid being tracked too: both reads failing cannot be told from that process exiting. A read at another path
                 # with no start cannot say which process it read, so it clears nothing. With no handle nothing can recover, so it is recorded at once, as on the base.
-                if (!$pp -or ($pp -ieq $exe -and !$pst)) { if ($pe) { } elseif ($h) { $pn[$p.Id] = @{ s = $pst.Ticks; o = $p; f = & $clk; m = & $ms } } else { & $un $p.Id; $seen[$k] = 1 } }
+                if (!$pp -or ((& $ie $pp) -and !$pst)) { if ($pe) { } elseif ($h) { $pn[$p.Id] = @{ s = $pst.Ticks; o = $p; f = & $clk; m = & $ms } } else { & $un $p.Id; $seen[$k] = 1 } }
                 elseif ($pst) { $pn.Remove($p.Id) }
-                if ($pp -ieq $exe -and $pst) {
+                if ((& $ie $pp) -and $pst) {
                     # firstSeenUtcTicks and firstMs are the real first sight, also for a process classed late; aliveMs is this poll's, the first it can vouch for.
                     $seen[$k] = 1; $fs = & $clk; if (!$pe) { $pe = @{ f = $fs; m = & $ms } }
                     $r = [ordered]@{ pid = $p.Id; startUtcTicks = $pst.Ticks; firstSeenUtcTicks = $pe.f; lastSeenUtcTicks = $fs; firstMs = $pe.m; goneUtcTicks = $null; aliveMs = $me; goneMs = $null; affinityFirst = $null; affinityLast = $null; priorityFirst = $null; priorityLast = $null; loadSec = 0.0; loadBytes = [int64]0; loadJoined = $null; pinned = !!$h }

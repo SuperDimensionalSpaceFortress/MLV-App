@@ -2637,6 +2637,12 @@ LATE_READ_SCENARIOS = {
     **{f"id-{what}-unread-{pin}": {"sleepMs": 250, "stopAt": 12, "procs": [{**base, f"id{what.capitalize()}FailFrom": 4}]}
        for what in ("path", "start")
        for pin, base in (("pinned", {"id": 5000, "from": 1, "to": 9, "goneAt": 10, "startSec": 1}), ("unpinned", {**_REUSED_APP, "to": 9, "goneAt": 10}))},
+    # r2 adversary A1 on f82e5037: exe 'soft' is the app's path with a soft hyphen (U+00AD) in the file name, another file that PowerShell's culture-sensitive
+    # -ieq / -ine call equal to the app's. Each of the helper's four path comparisons in turn: the seen-key rule, the identity re-read, and the listing's two.
+    "gone-key-relisted-culture-equal-exe": {"procs": [_APP, *_GONE_KEY_P0_B, {"id": 300, "from": 4, "to": 99, "goneAt": 999, "startSec": 1, "exe": "soft"}]},
+    "pid-reused-same-start-culture-equal-path": {"sleepMs": 250, "stopAt": 12, "procs": [_REUSED_APP, {**_REUSER, "exe": "soft", "startBeforeFirstPollMs": None, "startSec": 1}]},
+    "culture-equal-path-listed": {"procs": [_APP, {**_Q, "id": 400, "startSec": 1, "exe": "soft"}]},
+    "culture-equal-path-start-unread": {"procs": [_APP, {**_Q, "id": 400, "startSec": 1, "exe": "soft", "startFail": -1}]},
     **{f"clock-back-path-{ms}": {"stepMs": ms, "procs": [{**_CLOCK_APP, "pathFail": 1, "pathMode": "empty"}]} for ms in CLOCK_STEPS_MS},
     **{f"clock-back-start-{ms}": {"stepMs": ms, "procs": [{**_CLOCK_APP, "startFail": 1}]} for ms in CLOCK_START_UNREAD_STEPS_MS},
 }
@@ -2664,7 +2670,7 @@ $global:cpDoubles = @(foreach ($s in @($global:cpSpec.procs)) {
     $d | Add-Member -MemberType ScriptProperty -Name Path -Value {
         $s = $this.cpS
         if ((Test-CpFails $s.pathFail $s.pathFailFrom) -or $global:cpPoll -eq $s.pathFailAt -or ($this.cpFresh -and (Test-CpFails $null $s.idPathFailFrom))) { if ($s.pathMode -eq 'throw') { throw [ComponentModel.Win32Exception]::new(5) }; return '' }
-        if ($s.exe -eq 'other') { 'C:\elsewhere\mlvfake.exe' } else { $env:MLV_CP_EXE } }
+        if ($s.exe -eq 'other') { 'C:\elsewhere\mlvfake.exe' } elseif ($s.exe -eq 'soft') { $env:MLV_CP_EXE -replace 'mlvfake\.exe$', "mlv$([char]0xAD)fake.exe" } else { $env:MLV_CP_EXE } }
     $d | Add-Member -MemberType ScriptProperty -Name StartTime -Value {
         $s = $this.cpS
         if ((Test-CpFails $s.startFail $s.startFailFrom) -or $global:cpPoll -eq $s.startFailAt -or ($this.cpFresh -and (Test-CpFails $null $s.idStartFailFrom))) { throw [ComponentModel.Win32Exception]::new(5) }
@@ -3203,6 +3209,28 @@ $out | ConvertTo-Json -Compress
                 self.assertGreaterEqual(app["goneMs"], ms[9], f"a failed identity read on an unpinned app was recorded as its exit: {case}")
                 self.assertLessEqual(app["goneMs"], ms[10], case)
                 self.assertEqual(case["vwhy"], "measured-app-identity-unpinned", case)
+
+    def test_pid_reuse_r2_a1_a_path_equal_to_the_exe_only_under_culture_comparison_is_another_exe(self) -> None:
+        """r2, adversary A1 on f82e5037 (introduced at the seen-key rule; siblings the identity re-read and the listing's two path tests). PowerShell's -ieq /
+        -ine compare culture-sensitively and ignore U+00AD, so a process at the app's path with a soft hyphen in its file name (another file) read as the app's
+        path. The seen-key rule then recorded a successor at that other exe unidentified and refused a valid run; the identity re-read kept an unpinned app
+        alive on a successor at that path; the listing tracked such a process as a same-path instance, or held it pending and then unidentified. Every path the
+        helper compares with the exe's is now compared ordinally, case-insensitive (as Test-PresentMonIdentityText does), so each is another exe."""
+        with self.subTest(mode="gone-key-relisted-culture-equal-exe"):
+            relisted = self.late_read("gone-key-relisted-culture-equal-exe")
+            self.assertEqual(relisted["unidentified"], [], f"a gone key relisted at a culture-equal other exe was recorded unidentified: {relisted}")
+            self.assertIsNotNone(relisted["by"]["300"]["goneMs"], relisted)
+        with self.subTest(mode="pid-reused-same-start-culture-equal-path"):
+            reused = self.late_read("pid-reused-same-start-culture-equal-path")
+            app, ms = reused["firstApp"], reused["pollsMs"]
+            self.assertLessEqual(app["aliveMs"], ms[3], f"a successor at a culture-equal other path (same start) stamped the measured app alive: {reused}")
+            self.assertIsNotNone(app["goneMs"], reused)
+            self.assertLessEqual(app["goneMs"], ms[4], f"the measured app did not end at the first poll that read a culture-equal other path on its pid: {reused}")
+        for mode in ("culture-equal-path-listed", "culture-equal-path-start-unread"):
+            with self.subTest(mode=mode):
+                case = self.late_read(mode)
+                self.assertEqual([case["unidentified"], case["others"], case["instances"]], [[], [], [5000]], f"a process at a culture-equal other exe was classed as the app's path: {case}")
+                self.assertIn(case["vwhy"], self.ACCEPTED, case)
 
     def test_handover_a_process_on_a_recycled_tracked_pid_keeps_its_real_first_sight(self) -> None:
         """The same P2 alive and readable from enumeration 6: its first sight is enumeration 4, the pass that first listed it, not one pass late."""
