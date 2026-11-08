@@ -3402,7 +3402,8 @@ ConformPlayResult playConformedTicksWithRenderer( const std::function<double( in
     {
         tracker.notePresented( nowMs / 1000.0, frame, 0, 0, 2859 );
         lastPresented = frame;
-        if( maxPresentGapMs && nowMs - lastPresentMs > *maxPresentGapMs ) *maxPresentGapMs = nowMs - lastPresentMs;
+        // past the start (frame 1 lands one period plus the latency after Play's frame 0)
+        if( maxPresentGapMs && nowMs > 200.0 && nowMs - lastPresentMs > *maxPresentGapMs ) *maxPresentGapMs = nowMs - lastPresentMs;
         lastPresentMs = nowMs;
     };
     ConformPlayResult r;
@@ -3489,11 +3490,16 @@ TEST( PlaybackConformDropFrame, R27A1ACarriedDebtIsRepaidOnlyAsTheRendererPresen
                 ASSERT_TRUE( one.sourceFps >= 23.28 && one.sourceFps <= 24.72 );
                 ASSERT_TRUE( maxDebt <= playback_frame_range::kConformMaxDebtFrames + 1e-9 );
             }
+        // the r25 burst (six 66 ms ticks every 48): presents land on tick boundaries, so a latency of L shows one frame per
+        // ceil(L / 8) * 8 ms between bursts and one per 66 ms tick inside them. Up to 20 ms that is at least 20 frames per
+        // 732 ms cycle against the 17.57 it asks for; at 25 ms it is 16.5, a renderer that cannot keep up (below)
+        double burstDebt = 0.0;
         const ConformPlayResult burst = playConformedTicksWithRenderer(
-            []( int t ) { return ( t % 48 >= 42 ) ? 66.0 : 8.0; }, latency, 1667 );
-        ASSERT_EQ( 1, burst.maxJump );
+            []( int t ) { return ( t % 48 >= 42 ) ? 66.0 : 8.0; }, latency, 1667, &burstDebt );
+        if( latency <= 20.0 ) ASSERT_EQ( 1, burst.maxJump );
         ASSERT_TRUE( burst.consumedAt64998 >= int64_t( 1499 ) );
         ASSERT_TRUE( burst.sourceFps >= 23.28 && burst.sourceFps <= 24.72 );
+        ASSERT_TRUE( burstDebt <= playback_frame_range::kConformMaxDebtFrames + 1e-9 );
     }
     // a renderer SLOWER than the period cannot show every frame: the backlog reaches the cap and the frames beyond it are
     // skipped (stall evidence, never a conform PASS), but the timeline keeps the guard's pace and the debt stays bounded
