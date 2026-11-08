@@ -262,6 +262,7 @@ struct DropFrameTickResult
     bool wrapped = false;
     // HFR-NATIVE-60FPS-FULLRES-1 r21 (key3 M-HFR-DROP-WRAP-WIDTH): how far a wrap moved the position back, cutOut - cutIn (one
     // less than the cut range's frame count, because the range's last frame is never returned); 0 when the tick did not wrap.
+    // r32: cutOut - cutIn + 1 under advanceDropFrameTick's presentLastFrame (conform), where the last frame IS returned.
     // The wrap recorder stores this, so a Loop + Drop Frame wrap is credited the distance the timeline travelled.
     int wrapWidth = 0;
 };
@@ -276,20 +277,27 @@ struct DropFrameTickResult
 // tick is ABOUT to reach and subtracts before that position is ever returned/presented, so with
 // loopEnabled a position of exactly cutOutValue-1 (the range's last frame) can never be
 // returned by this function -- proven by the round-2 executable test, not just asserted.
+//
+// HFR-NATIVE-60FPS-FULLRES-1 r32 (adversary A1 on 2e0a3985): that early wrap breaks the conform promise (every source frame
+// is presented in order): conformed 60 -> 24 with Loop on, cut 1..720, 718.8 + 0.24 = 719.04 wrapped to 0.04 and frame 719
+// was never requested. \a presentLastFrame (MainWindow passes playbackConformActive()) wraps only once the position is PAST
+// the last frame, by the cut's frame count (cutOut - cutIn + 1, the distance the timeline really travels from the last frame
+// back to the first), so the last frame is presented before the wrap. With the default (false) the behaviour is unchanged.
 inline DropFrameTickResult advanceDropFrameTick(
     double currentPosition, double frameDelta, int cutInValue, int cutOutValue,
-    bool loopEnabled )
+    bool loopEnabled, bool presentLastFrame = false )
 {
     DropFrameTickResult result;
     result.position = currentPosition + frameDelta;
     const double lastFrame = static_cast<double>( cutOutValue - 1 );
-    if( loopEnabled && result.position >= lastFrame )
+    const double wrapAt = presentLastFrame ? lastFrame + 1.0 : lastFrame;
+    if( loopEnabled && result.position >= wrapAt )
     {
-        result.wrapWidth = cutOutValue - cutInValue;
+        result.wrapWidth = cutOutValue - cutInValue + ( presentLastFrame ? 1 : 0 );
         result.position -= static_cast<double>( result.wrapWidth );
         result.wrapped = true;
     }
-    else if( result.position >= lastFrame )
+    else if( !loopEnabled && result.position >= lastFrame )
     {
         result.position = lastFrame;
     }

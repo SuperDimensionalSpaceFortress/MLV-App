@@ -168,6 +168,13 @@ TEST(PlaybackConformWiring, DropFrameTickQuantisesTheConformedCatchupToWholeFram
         "                                m_lastPresentedPlaybackFrame, conformDisplayedPlaybackFrame(), m_newPosDropMode,\n"
         "                                conformAcceptedTargetPresentPending(), conformTargetPresentOutstanding() ) ),");
     ASSERT_EQ(1, countOccurrences(body, call));
+    // r32 (adversary A1 on 2e0a3985): under conform a Loop wrap waits until the cut's last frame was presented
+    // (advanceDropFrameTick's presentLastFrame; PlaybackConformDropFrame.R32* pin the arithmetic)
+    ASSERT_EQ(1, countOccurrences(body, QStringLiteral(
+        "                        ui->spinBoxCutIn->value(), ui->spinBoxCutOut->value(),\n"
+        "                        ui->actionLoop->isChecked(),\n"
+        "                        playbackConformActive() );")));
+    ASSERT_TRUE(body.indexOf(QStringLiteral("playbackConformActive() );   // r32 (adversary A1 on 2e0a3985)"), body.indexOf(call)) > body.indexOf(call));
     // r28 (CoS B1 6714996522 on c4efe7e3): the gate keys off the frame DISPLAYED, never off one drawFrameReady accepted but has
     // not shown. finishPresentedFrame records it before its tail advance; a display change clears it with the accepted frame.
     {

@@ -6875,8 +6875,8 @@ void MainWindow::presentPlaybackPreparedFrame( const PlaybackPrepResult &result 
         }
         m_pGraphicsItem->setPixmap( pic );
         m_graphicsItemPresentedSerial = task.requestSerial;
-        prepRegionImageSetPixmapMs = prepRegionElapsedMs( prepRegionImageSetPixmapStartNs );
         ui->graphicsView->notePixmapPresentSerial( static_cast<quint64>( task.requestSerial ) );   // r28: its paint is deferred
+        prepRegionImageSetPixmapMs = prepRegionElapsedMs( prepRegionImageSetPixmapStartNs );
         if( !displayPreviewCachingAllowed
          && m_pRenderThread
          && !releasePresentedFrameEarly )
@@ -12548,7 +12548,8 @@ void MainWindow::playbackHandling(int timeDiff)
                                 m_lastPresentedPlaybackFrame, conformDisplayedPlaybackFrame(), m_newPosDropMode,
                                 conformAcceptedTargetPresentPending(), conformTargetPresentOutstanding() ) ),
                         ui->spinBoxCutIn->value(), ui->spinBoxCutOut->value(),
-                        ui->actionLoop->isChecked() );
+                        ui->actionLoop->isChecked(),
+                        playbackConformActive() );   // r32 (adversary A1 on 2e0a3985): conform presents the cut's last frame before a Loop wrap
                 // slip_summary: the granted share, read back from the tick (a wrap subtracted the cut range width;
                 // the clamp at the last frame without Loop reports what was actually advanced).
                 const double grantedDropFrames = dropFrameTick.position - sourcePositionBeforeDropTick

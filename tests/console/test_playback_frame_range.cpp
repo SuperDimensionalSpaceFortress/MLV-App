@@ -3186,16 +3186,87 @@ TEST( PlaybackConformDropFrame, R24AHeldCatchupPresentsTheNextFrameKeepsThePhase
 TEST( PlaybackConformDropFrame, R24ConformHoldAtTheLoopEndStillWrapsOnTheRecordedWidth )
 {
     // cut 1..1160 (frames 0..1159), Loop on: 1157.8 + 1.584 would cross two integers; under conform it presents 1158 and
-    // does not wrap; the next tick wraps on the width the engine subtracts, as before.
+    // does not wrap. r32 (adversary A1 on 2e0a3985): MainWindow passes presentLastFrame = conform, so the next tick presents
+    // the last frame 1159 instead of wrapping, and the wrap after it is credited the cut's frame count (the distance travelled).
     const int cutIn = 1, cutOut = 1160;
     const playback_frame_range::DropFrameTickResult held = playback_frame_range::advanceDropFrameTick(
-        1157.8, playback_frame_range::conformDropFrameDelta( 1157.8, 1.584, true ), cutIn, cutOut, true );
+        1157.8, playback_frame_range::conformDropFrameDelta( 1157.8, 1.584, true ), cutIn, cutOut, true, true );
     ASSERT_FALSE( held.wrapped );
     ASSERT_EQ( 1158, static_cast<int>( held.position ) );
+    const playback_frame_range::DropFrameTickResult last = playback_frame_range::advanceDropFrameTick(
+        held.position, playback_frame_range::conformDropFrameDelta( held.position, 0.8, true ), cutIn, cutOut, true, true );
+    ASSERT_FALSE( last.wrapped );
+    ASSERT_EQ( 1159, static_cast<int>( last.position ) );
     const playback_frame_range::DropFrameTickResult wrap = playback_frame_range::advanceDropFrameTick(
-        held.position, playback_frame_range::conformDropFrameDelta( held.position, 0.8, true ), cutIn, cutOut, true );
+        last.position, playback_frame_range::conformDropFrameDelta( last.position, 0.8, true ), cutIn, cutOut, true, true );
     ASSERT_TRUE( wrap.wrapped );
-    ASSERT_EQ( cutOut - cutIn, wrap.wrapWidth );
+    ASSERT_EQ( cutOut - cutIn + 1, wrap.wrapWidth );
+    ASSERT_EQ( 0, static_cast<int>( wrap.position ) );
+    // without conform (presentLastFrame false) the pre-existing drop-frame wrap is unchanged: it fires on reaching the last frame
+    const playback_frame_range::DropFrameTickResult plain = playback_frame_range::advanceDropFrameTick( held.position, 0.8, cutIn, cutOut, true );
+    ASSERT_TRUE( plain.wrapped );
+    ASSERT_EQ( cutOut - cutIn, plain.wrapWidth );
+}
+
+TEST( PlaybackConformDropFrame, R32ConformedLoopPresentsTheCutsLastFrameBeforeTheWrap )
+{
+    // adversary A1 on 2e0a3985, its input verbatim: 60 fps conformed to 24, Drop Frame on, Loop on, Cut In 1, Cut Out 720,
+    // position 718.8 with frame 718 painted, granted 0.24, no debt, target presented. Before r32 the tick reached 719.04,
+    // wrapped at once (>= 719) to about 0.04, and frame 719 was never requested.
+    const int cutIn = 1, cutOut = 720;
+    double debt = 0.0;
+    const double delta = playback_frame_range::conformDropFrameDelta( 718.8, 0.24, true, debt, true );
+    ASSERT_NEAR( 0.24, delta, 1e-12 );
+    ASSERT_EQ( 0.0, debt );
+    const playback_frame_range::DropFrameTickResult tick =
+        playback_frame_range::advanceDropFrameTick( 718.8, delta, cutIn, cutOut, true, /*presentLastFrame=*/true );
+    ASSERT_FALSE( tick.wrapped );
+    ASSERT_EQ( 719, static_cast<int>( tick.position ) );
+    ASSERT_EQ( 0, tick.wrapWidth );
+    // a wrap lands on the first frame with the phase kept, and every recorder reads the distance the timeline travelled
+    const double before = 719.44;
+    const playback_frame_range::DropFrameTickResult wrap =
+        playback_frame_range::advanceDropFrameTick( before, 0.6, cutIn, cutOut, true, true );
+    ASSERT_TRUE( wrap.wrapped );
+    ASSERT_EQ( cutOut - cutIn + 1, wrap.wrapWidth );
+    ASSERT_NEAR( 0.04, wrap.position, 1e-9 );
+    ASSERT_NEAR( 0.6, wrap.position - before + static_cast<double>( wrap.wrapWidth ), 1e-9 );   // MainWindow's grantedDropFrames
+    // the contact-sheet loop qualification still recognises 719 -> 0 as a wrap (0-based cut 0..719)
+    ASSERT_TRUE( playback_frame_range::isContactSheetLoopWrapTransition( true, cutIn - 1, cutOut - 1, 719, 0 ) );
+    // end to end: two conformed laps at 24 fps from an 8 ms poll; every presented transition is +1 or the 719 -> 0 wrap, and
+    // every frame of the cut is presented on every lap (the class: no frame of the cut is skipped at the loop end)
+    playback_native_pace::NativePaceGuard guard;
+    guard.reset();
+    double position = 0.0, nowMs = 0.0, carried = 0.0;
+    int lastPresented = 0, wraps = 0;
+    std::vector<int> shownThisLap( 720, 0 );
+    shownThisLap[ 0 ] = 1;
+    for( int t = 1; wraps < 2 && t < 200000; ++t )
+    {
+        nowMs += 8.0;
+        const double granted = guard.grant( 24.0 * 8.0 / 1000.0, nowMs, 24.0 );
+        if( t == 1 ) guard.notePresent( nowMs, 24.0 );
+        const playback_frame_range::DropFrameTickResult step = playback_frame_range::advanceDropFrameTick(
+            position, playback_frame_range::conformDropFrameDelta( position, granted, true, carried, true ), cutIn, cutOut, true, true );
+        position = step.position;
+        const int presented = static_cast<int>( position );
+        if( presented == lastPresented ) continue;
+        if( step.wrapped )
+        {
+            ASSERT_EQ( 719, lastPresented );
+            ASSERT_EQ( 0, presented );
+            for( int f = 0; f < 720; ++f ) ASSERT_EQ( 1, shownThisLap[ f ] );
+            std::fill( shownThisLap.begin(), shownThisLap.end(), 0 );
+            ++wraps;
+        }
+        else
+        {
+            ASSERT_EQ( lastPresented + 1, presented );
+        }
+        shownThisLap[ presented ] = 1;
+        lastPresented = presented;
+    }
+    ASSERT_EQ( 2, wraps );
 }
 
 TEST( PlaybackConformDropFrame, R24AConformedPlayWithSubPeriodGuiLateTicksPresentsEveryFrame )
