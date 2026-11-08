@@ -1260,7 +1260,69 @@ def test_the_chain_restores_the_callers_environment_when_run_in_process(box) -> 
     assert "after=keep-me rc=0" in done.stdout, done.stdout + done.stderr
 
 
-@pytest.mark.parametrize("bad", ["not-a-date", "11/8/2026", "15:30", ""])
+def test_the_nightly_hands_its_deadline_to_the_assembler_child_only_never_its_own_process() -> None:
+    # adversary 8eb98036-A3 sibling (Invoke-VenueStageNightly.ps1:581): the nightly set the deadline in its own process environment around
+    # the assembler call, the same shared-state shape as the chain; it is now a per-child environment entry of Invoke-Child.
+    text = (REPO_ROOT / "tools" / "profiling" / "dual-venue" / "Invoke-VenueStageNightly.ps1").read_text(encoding="utf-8")
+    assert not re.search(r"\$env:MLV_HEAVY_SLOT_DEADLINE_UTC\s*=", text), "no process-wide assignment"
+    assert "SetEnvironmentVariable('MLV_HEAVY_SLOT_DEADLINE_UTC'" not in text
+    assert re.search(r"Invoke-Child 'assemble' \$Assembler @\([^)]*\) -ChildEnv @\{ MLV_HEAVY_SLOT_DEADLINE_UTC = ", text), "the assembler child gets it"
+    chain = STAGE_CHAIN.read_text(encoding="utf-8")
+    assert not re.search(r"\$env:MLV_HEAVY_SLOT_DEADLINE_UTC\s*=", chain)
+
+
+def test_the_chain_leaves_the_callers_environment_alone_even_when_remove_item_is_whatif(box) -> None:
+    # adversary 8eb98036-A2: the restore was Remove-Item Env:..., which an inherited $PSDefaultParameterValues['Remove-Item:WhatIf'] turns into
+    # a no-op, so the chain's deadline stayed in the caller and its next ordinary guard call waited a week instead of 60 min.
+    run, stage_one_path, env = _chain_box(box, 61)
+    script = ("$PSDefaultParameterValues['Remove-Item:WhatIf'] = $true\n"
+              f"& '{STAGE_CHAIN}' -Sha {_CHAIN_SHA} -DeadlineUtc '{_future(120)}' -StageOne '{stage_one_path}' -RetrySec 0 -MaxAttempts 1\n"
+              "Write-Output \"after=[$([Environment]::GetEnvironmentVariable('MLV_HEAVY_SLOT_DEADLINE_UTC'))] rc=$LASTEXITCODE\"\n")
+    done = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script],
+                          capture_output=True, text=True, timeout=180, env=env, check=False)
+    assert "after=[] rc=0" in done.stdout, done.stdout + done.stderr
+
+
+def test_the_chain_deadline_is_never_visible_to_another_runspace_of_the_callers_process(box) -> None:
+    # adversary 8eb98036-A3: the deadline was set in the PROCESS environment for the whole run, so a second chain (or any child) started from
+    # another runspace of the same host inherited THIS chain's deadline. It is now set only in each stage-one child's own environment.
+    run, stage_one_path, env = _chain_box(box, 61)
+    flag = box["dir"] / "chain-done.flag"
+    script = (
+        "$job = Start-ThreadJob -ScriptBlock { param($flag) $seen = 0; $end = (Get-Date).AddSeconds(120)\n"
+        "  while (-not (Test-Path -LiteralPath $flag) -and (Get-Date) -lt $end) { if ([Environment]::GetEnvironmentVariable('MLV_HEAVY_SLOT_DEADLINE_UTC')) { $seen++ }; Start-Sleep -Milliseconds 20 }\n"
+        "  $seen } -ArgumentList '" + str(flag) + "'\n"
+        f"& '{STAGE_CHAIN}' -Sha {_CHAIN_SHA} -DeadlineUtc '{_future(120)}' -StageOne '{stage_one_path}' -RetrySec 0 -MaxAttempts 1\n"
+        "$rc = $LASTEXITCODE\n"
+        f"New-Item -ItemType File -Path '{flag}' | Out-Null\n"
+        "Write-Output \"seen=$(Receive-Job $job -Wait -AutoRemoveJob) rc=$rc\"\n"
+    )
+    done = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script],
+                          capture_output=True, text=True, timeout=240, env=env, check=False)
+    assert "seen=0 rc=0" in done.stdout, done.stdout + done.stderr
+    [call] = _stub_calls(box)
+    assert 119 < _wait_minutes(call) <= 120, "the child still got the deadline"
+
+
+def test_a_run_dir_the_chain_cannot_write_is_refused_not_reported_staged(box) -> None:
+    # adversary 8eb98036-A1: with the status file and the stage logs unwritable, neither child started, $LASTEXITCODE was the caller's stale 0,
+    # and the chain returned 0 for a build that never ran. The run dir denies file creation here; the stage-one would exit 9 if it ran.
+    run, stage_one_path, env = _chain_box(box, 61, stage_one="param([string]$Sha, [string]$Phase)\nexit 9\n")
+    user = os.environ.get("USERNAME")
+    subprocess.run(["icacls", str(run), "/deny", f"{user}:(WD,AD)"], capture_output=True, check=True)
+    try:
+        script = (f"$global:LASTEXITCODE = 0\n& '{STAGE_CHAIN}' -Sha {_CHAIN_SHA} -DeadlineUtc '2099-01-01T00:00:00Z' -StageOne '{stage_one_path}' "
+                  "-RetrySec 0 -MaxAttempts 1\nWrite-Output \"rc=$LASTEXITCODE\"\n")
+        done = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script],
+                              capture_output=True, text=True, timeout=180, env=env, check=False)
+    finally:
+        subprocess.run(["icacls", str(run), "/remove:d", user], capture_output=True, check=False)
+    assert "rc=0" not in done.stdout, done.stdout + done.stderr
+    assert re.search(r"rc=[12]\b", done.stdout), done.stdout + done.stderr
+    assert "STAGE_CHAIN_REFUSED reason=run-dir-unwritable" in done.stdout or "STAGE_CHAIN_FAILED" in done.stdout, done.stdout + done.stderr
+
+
+@pytest.mark.parametrize("bad", ["not-a-date", "11/8/2026", "15:30", "", "2099-01-01T00:00:00.Z", "2099-01-01T00:00:00Z junk"])
 def test_a_chain_deadline_that_is_not_an_iso_instant_is_refused_before_anything_runs(box, bad) -> None:
     done, run = _run_chain(box, 61, bad)
     assert done.returncode == 2, done.stdout + done.stderr
