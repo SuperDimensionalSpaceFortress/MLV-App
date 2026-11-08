@@ -988,3 +988,45 @@ TEST(PlaybackConformWiring, R30AStopPrintsTheCarriedDebtBeforeClearingIt)
     ASSERT_TRUE(clear > telemetry);
     ASSERT_EQ(2, countOccurrences(body, QStringLiteral("m_conformDropDebtFrames")));
 }
+
+// r30 fix iteration 1 (adversary A1 on fad36acf): EVERY widget grab in MainWindow renders offscreen, not only the viewport's -- the
+// GUI smoke's window screenshot grab() renders the graphics view (and its CPU pixmap) into a pixmap, so it too runs inside an
+// OffscreenPaintScope, or the frame it draws is credited and marked composed before its screen paint.
+TEST(PlaybackConformWiring, R30IterationOneEveryWidgetGrabRunsInsideAnOffscreenScope)
+{
+    const QString source = mainWindowSource();
+    int grabs = 0;
+    for (int at = source.indexOf(QStringLiteral("grab()")); at >= 0; at = source.indexOf(QStringLiteral("grab()"), at + 6)) {
+        const int lineStart = source.lastIndexOf(QLatin1Char('\n'), at) + 1;
+        if (source.mid(lineStart, at - lineStart).trimmed().startsWith(QStringLiteral("//"))) continue;   // a comment naming it
+        ++grabs;
+        const int scope = source.lastIndexOf(QStringLiteral("const playback_paint_credit::OffscreenPaintScope "), at);
+        ASSERT_TRUE(scope > 0);
+        ASSERT_FALSE(source.mid(scope, at - scope).contains(QStringLiteral("\n}\n")));   // the scope is in the same function
+        ASSERT_TRUE(at - scope < 240);                                                    // and opened right before the grab
+    }
+    ASSERT_EQ(2, grabs);   // grabGraphicsViewportOffscreen() and the GUI smoke's window screenshot
+    ASSERT_EQ(1, countOccurrences(source, QStringLiteral(
+        "            const playback_paint_credit::OffscreenPaintScope offscreen;   // r30 fix iteration 1 (adversary A1 on fad36acf)\n"
+        "            windowScreenshot = grab();")));
+}
+
+// r30 fix iteration 1 (adversary A2 on fad36acf): the CPU pixmap item shows a frame only through the playback present, which notes
+// its serial; every other replacement (the clip-open / close placeholder) notes serial 0, so the placeholder's paint can never copy a
+// stale pending serial and credit (or mark composed) a frame it removed.
+TEST(PlaybackConformWiring, R30IterationOneEveryPixmapReplacementNotesTheSerialItCarries)
+{
+    const QString source = mainWindowSource();
+    int sets = 0;
+    for (int at = source.indexOf(QStringLiteral("m_pGraphicsItem->setPixmap(")); at >= 0;
+         at = source.indexOf(QStringLiteral("m_pGraphicsItem->setPixmap("), at + 1)) {
+        ++sets;
+        const int note = source.indexOf(QStringLiteral("ui->graphicsView->notePixmapPresentSerial("), at);
+        ASSERT_TRUE(note > at);
+        ASSERT_TRUE(note - at < 260);
+        ASSERT_FALSE(source.mid(at, note - at).contains(QStringLiteral("m_pGraphicsItem->setPixmap(")) && source.indexOf(QStringLiteral("m_pGraphicsItem->setPixmap("), at + 1) < note);
+    }
+    ASSERT_EQ(3, sets);
+    ASSERT_EQ(2, countOccurrences(source, QStringLiteral(
+        "ui->graphicsView->notePixmapPresentSerial( 0 );   // r30 fix iteration 1 (adversary A2 on fad36acf): the placeholder carries no frame")));
+}
