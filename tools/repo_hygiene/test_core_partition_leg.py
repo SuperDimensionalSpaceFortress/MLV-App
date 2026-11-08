@@ -2379,7 +2379,8 @@ $hb = $hb.Replace($cat, '$cpFakeCat')
 $prelude = @'
 $cpFakeCat = [pscustomobject]@{}; $cpFakeCat | Add-Member -MemberType ScriptMethod -Name ReadCategory -Value { @{} }
 $global:cpF = @{ sw = [Diagnostics.Stopwatch]::StartNew(); firstAt = $null; exitAt = [long]::MaxValue; stalled = $false; stopped = $false; start = [DateTime]::UtcNow }
-$global:cpP = [pscustomobject]@{ Id = 5000; Path = $env:MLV_CP_EXE; StartTime = $global:cpF.start; PriorityClass = 'Normal' }
+# CORE-PARTITION-HELPER-PID-REUSE-1: its handle opens, as a real app's does (the helper refuses a measured app it could not pin with a held handle)
+$global:cpP = [pscustomobject]@{ Id = 5000; Path = $env:MLV_CP_EXE; StartTime = $global:cpF.start; PriorityClass = 'Normal'; Handle = [IntPtr]1 }
 $global:cpP | Add-Member -MemberType ScriptMethod -Name Refresh -Value { }
 $global:cpP | Add-Member -MemberType ScriptProperty -Name HasExited -Value {
     $e = $global:cpF.sw.ElapsedMilliseconds -ge $global:cpF.exitAt
