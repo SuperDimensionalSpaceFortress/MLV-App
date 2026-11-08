@@ -196,7 +196,21 @@ def _popen_pwsh(probe: Path) -> "subprocess.Popen":
     proc = subprocess.Popen([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-File", str(probe)],
                             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
     proc.started_at = time.monotonic()  # read by _collect_counts for its typed timeout message
+    # CI-FLAKE-PROMPT-LINT-PWSH-RUNTIME-LOAD-1: when the child ENDED, so _collect_counts can tell a death inside the start-up window from a late one
+    # even though the shards are collected one after another (collecting late must not make an early crash look late).
+    proc.ended_at = None
+    proc.exit_watch = threading.Thread(target=_note_exit, args=(proc,), daemon=True)
+    proc.exit_watch.start()
     return proc
+
+
+def _note_exit(proc: "subprocess.Popen") -> None:
+    """Record, on `proc`, the time.monotonic() instant its process ended (runs on a daemon thread started by _popen_pwsh)."""
+    try:
+        proc.wait()
+        proc.ended_at = time.monotonic()
+    except Exception:  # noqa: BLE001 - the clock is advisory; a failed wait leaves ended_at None and the probe is judged as ending when collected
+        pass
 
 
 def _pwsh_argv(probe: Path) -> "list[str | None]":
@@ -237,7 +251,7 @@ def _lint_word_lists(lint: Path, work: Path) -> dict[str, list[str]]:
     if blob not in _WORD_LIST_CACHE:
         probe = work / "lists-probe.ps1"
         _write_probe(probe, ". " + _psq(lint) + "\nConvertTo-Json -InputObject (Get-LocalPlaybackLintWordLists) -Compress -Depth 4\n")
-        done = _run_pwsh(probe, 120)
+        done = _run_retrying_start_fault(lambda: _run_pwsh(probe, 120), probe.name)  # CI-FLAKE-PROMPT-LINT-PWSH-RUNTIME-LOAD-1
         if done.returncode != 0 or not done.stdout.strip():
             raise AssertionError(f"the lint exposes no word lists (Get-LocalPlaybackLintWordLists): {(done.stderr or done.stdout).strip()[:300]}")
         _WORD_LIST_CACHE[blob] = {k: [str(x) for x in v] for k, v in json.loads(done.stdout.strip()).items()}
@@ -401,12 +415,82 @@ def _kill(proc: "subprocess.Popen") -> None:
         pass
 
 
+class LintProbeStartFault(AssertionError):
+    """CI-FLAKE-PROMPT-LINT-PWSH-RUNTIME-LOAD-1: the pwsh child of a lint probe died of an interpreter start fault (see _is_start_crash) before it
+    printed any lint result, on every attempt it was given. This is the runner's fault, not a lint verdict: the message names it as such, with
+    the return code, the time it lasted and the stderr of each attempt. An AssertionError so every caller that already catches one keeps working."""
+
+    def __init__(self, message: str, kind: str = "pwsh start-up crash", detail: str = ""):
+        super().__init__(message)
+        self.kind = kind  # what the first stderr line says it was (see _start_fault_kind)
+        self.detail = detail  # "rc=<n> after <s> s: <stderr>" of the attempt that raised this
+
+
+def _probe_lasted(proc: "subprocess.Popen") -> float:
+    """Seconds the probe's process lived (start to end, from the exit watcher); the time of this call when the end was not recorded, and infinity
+    when the start was not (an unknown duration is never taken to be inside the start-up window)."""
+    started = getattr(proc, "started_at", None)
+    if not isinstance(started, (int, float)):
+        return float("inf")
+    watcher = getattr(proc, "exit_watch", None)
+    if isinstance(watcher, threading.Thread):
+        watcher.join(timeout=1)
+    ended = getattr(proc, "ended_at", None)
+    return max(0.0, (ended if isinstance(ended, (int, float)) else time.monotonic()) - started)
+
+
+def _run_retrying_start_fault(run, name: str) -> "subprocess.CompletedProcess":
+    """The foreground twin of _collect_counts' re-probe: call `run()` (it returns a CompletedProcess); if the pwsh start-faulted (_is_start_crash, measured
+    around the call) call it ONCE more. Two start faults raise a LintProbeStartFault naming both; anything else is returned as it came, so the
+    caller's own return-code check still fails a genuine lint error exactly as before. A TimeoutExpired from `run` propagates and is not retried."""
+    details = []
+    for attempt in (1, 2):
+        began = time.monotonic()
+        done = run()
+        lasted = time.monotonic() - began
+        if done.returncode == 0 or not _is_start_crash(done, lasted):
+            return done
+        details.append(f"attempt {attempt}: rc={done.returncode} after {lasted:.1f} s: {(done.stderr or '').strip() or '<no stderr>'}")
+        if attempt == 1:
+            print(f"[{name}] interpreter start fault ({details[0].splitlines()[0]}): running the probe once more", file=sys.stderr)
+    kind = _start_fault_kind(done.stderr)
+    raise LintProbeStartFault(f"lint probe start fault: {kind} in {name}, on both attempts; {'; '.join(details)}", kind, details[-1])
+
+
+def _start_fault_kind(stderr: "str | None") -> str:
+    return "pwsh runtime load failure" if LINT_PROBE_ASSEMBLY_LOAD in (stderr or "") else "pwsh start-up crash"
+
+
 def _collect_counts(proc: "subprocess.Popen", expected: int, deadline: float | None = None) -> list[int]:
     """The verdicts of one probe. `deadline` is a time.monotonic() instant shared by every probe of one evaluation (default: a fresh
     LINT_PROBE_BOUND_SEC from now). A probe still running at the deadline is killed and the test FAILS typed with the probe's name and the
-    elapsed time -- an AssertionError, never a subprocess.TimeoutExpired nor a job cancelled by the shard's 40 min cap."""
+    elapsed time -- an AssertionError, never a subprocess.TimeoutExpired nor a job cancelled by the shard's 40 min cap.
+
+    CI-FLAKE-PROMPT-LINT-PWSH-RUNTIME-LOAD-1: a probe whose pwsh died of an interpreter start fault (_is_start_crash: a fault signal inside the
+    start-up window, and only the crash banner / the .NET assembly-load failure on its streams, so no lint result) is run ONCE more from the same probe
+    file, inside what is left of the same deadline. If that fails the same way the failure is a LintProbeStartFault ("lint probe start fault: ...")
+    that names the start fault and both attempts; any other failure keeps its own message ("lint probe failed: ...")."""
     if deadline is None:
         deadline = time.monotonic() + LINT_PROBE_BOUND_SEC
+    try:
+        return _collect_counts_once(proc, expected, deadline)
+    except LintProbeStartFault as first:
+        probe = Path(str(proc.args[-1]))
+        if deadline - time.monotonic() <= 0:
+            raise LintProbeStartFault(f"lint probe start fault: {first.kind} in {probe.name}; no budget left for the one re-probe; attempt 1: {first.detail}", first.kind, first.detail) from None
+        print(f"[{probe.name}] interpreter start fault ({first.detail.splitlines()[0]}): running the probe once more", file=sys.stderr)
+        again = _popen_pwsh(probe)
+        try:
+            return _collect_counts_once(again, expected, deadline)
+        except LintProbeStartFault as second:
+            raise LintProbeStartFault(f"lint probe start fault: {second.kind} in {probe.name}, on both attempts; attempt 1: {first.detail}; "
+                                      f"attempt 2: {second.detail}", second.kind, second.detail) from None
+        finally:
+            _kill(again)
+
+
+def _collect_counts_once(proc: "subprocess.Popen", expected: int, deadline: float) -> list[int]:
+    """One attempt of _collect_counts: the verdicts, or an AssertionError (a LintProbeStartFault when the pwsh start-faulted)."""
     # r2 (sol B1 class): a probe that has already exited is only drained (the 1 s floor lets its pipe readers finish); one still running gets exactly
     # what is left of the shared deadline -- none, once it is spent -- so no floor grants time the budget no longer has.
     remaining = deadline - time.monotonic()
@@ -418,6 +502,11 @@ def _collect_counts(proc: "subprocess.Popen", expected: int, deadline: float | N
         raise AssertionError(f"lint probe {Path(str(proc.args[-1])).name} ({expected} rows) did not finish inside its budget "
                              f"(elapsed {elapsed:.0f} s, bound {LINT_PROBE_BOUND_SEC} s); the host is too slow for the differential corpus") from None
     if proc.returncode != 0:
+        lasted = _probe_lasted(proc)
+        if _is_start_crash(subprocess.CompletedProcess(proc.args, proc.returncode, stdout=out, stderr=err), lasted):
+            kind = _start_fault_kind(err)
+            detail = f"rc={proc.returncode} after {lasted:.1f} s: {(err or '').strip() or '<no stderr>'}"
+            raise LintProbeStartFault(f"lint probe start fault: {kind} in {Path(str(proc.args[-1])).name}; {detail}", kind, detail)
         raise AssertionError(f"lint probe failed: {err}")
     counts = json.loads(out.strip())
     if len(counts) != expected:
@@ -2313,7 +2402,8 @@ class PromptLintTests(unittest.TestCase):
             "$f = @(Get-LocalPlaybackPromptFindings -Text (Get-Content -LiteralPath " + _psq(src) + " -Raw))\n"
             "ConvertTo-Json -InputObject @($f) -Compress\n",
         )
-        done = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-File", str(probe)], capture_output=True, text=True, timeout=120)
+        done = _run_retrying_start_fault(  # CI-FLAKE-PROMPT-LINT-PWSH-RUNTIME-LOAD-1: run 40208899717 died here with `0 != -6` and the assembly-load text
+            lambda: subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-File", str(probe)], capture_output=True, text=True, timeout=120), probe.name)
         self.assertEqual(0, done.returncode, done.stderr)
         return json.loads(done.stdout.strip() or "[]")
 
@@ -4799,7 +4889,9 @@ LINT_PROBE_ASSEMBLY_LOAD = "The given assembly name was invalid."
 # Every accepted stderr line is matched WHOLE (adversary r1 A1): the message line may only carry an exception-type prefix, the File name line ends in the
 # public key (its token may be garbled into non-ASCII, as in the real log), and a frame's parameters are `Type name` pairs. Nothing else may follow.
 _LINT_PROBE_ASSEMBLY_MESSAGE = re.compile(r"^(?:Unhandled exception\.\s+)?(?:--->\s+)?(?:System\.[A-Za-z0-9_.]*Exception:\s+)?" + re.escape(LINT_PROBE_ASSEMBLY_LOAD) + "$")
-_LINT_PROBE_ASSEMBLY_FILE = re.compile(r"^File name: 'System\.[A-Za-z0-9_.]+, Version=\d+(?:\.\d+){3}, Culture=[A-Za-z0-9-]+, PublicKey(?:Token=(?:[0-9a-f]{16}|null))?[^\x00-\x7f]*'$")
+_LINT_PROBE_ASSEMBLY_FILE = re.compile(r"^File name: 'System\.[A-Za-z0-9_.]+, Version=\d+(?:\.\d+){3}, Culture=[A-Za-z0-9-]+, PublicKey(?:Token=(?:[0-9a-f]{1,16}|null))?[^\x00-\x7f]*'$")
+# CI-FLAKE-PROMPT-LINT-PWSH-RUNTIME-LOAD-1: the real logs print the token cut short -- `PublicKeyToken=b03f5f7f11d50a3'` (15 of 16 hex, run 42465921249) and
+# `PublicKeyToken=b0ﾰ'` (run 40208899717) -- so 1..16 hex digits are accepted before the optional garbage; the line must still end in the closing quote.
 _LINT_PROBE_FRAME_PARAM = r"[A-Za-z0-9_.`<>\[\]]+[*&]? [A-Za-z0-9_]+"
 _LINT_PROBE_DOTNET_FRAME = re.compile(rf"^at System\.[A-Za-z0-9_.`]+\((?:{_LINT_PROBE_FRAME_PARAM}(?:, {_LINT_PROBE_FRAME_PARAM})*)?\)$")
 
@@ -5703,6 +5795,236 @@ class LauncherGuardBlockTests(unittest.TestCase):
                     done = self._run_block(name, host, override)
                     self.assertEqual(0, done.returncode, f"{host}/{override}: {done.stdout}{done.stderr}")
                     self.assertIn("GUARD-PASSED", done.stdout)
+
+
+class CollectCountsRuntimeLoadFaultTests(unittest.TestCase):
+    """CI-FLAKE-PROMPT-LINT-PWSH-RUNTIME-LOAD-1 (Dot request 6719935021, hub ACK 6720120141 on PR #420). Tests run 42465921249 attempt 1, job 128685301743
+    (Repo Hygiene Python ubuntu shard 1/4): PromptLintTests.test_green_r13_an_executable_carrying_its_own_route_passes died in _collect_counts with
+    "lint probe failed: Unhandled exception. System.IO.FileLoadException: The given assembly name was invalid." -- the pwsh child failed to load a framework
+    assembly before any lint code ran (the same start fault as run 41585926746 job 125751263016 and run 40208899717, where `_findings` printed `0 != -6`).
+    These tests feed _collect_counts a scripted probe carrying that exact stderr, so no pwsh is needed. Base behaviour (0a553b4e): the generic "lint probe failed"."""
+
+    # The stderr as the job log printed it (stdout is not in the log). The PublicKeyToken is 15 hex characters there, one short of the real key.
+    REAL_STDERR = ("Unhandled exception. System.IO.FileLoadException: The given assembly name was invalid.\n"
+                   "File name: 'System.Collections.Specialized, Version=10.0.0.0, Culture=neutral, PublicKeyToken=b03f5f7f11d50a3'\n"
+                   "   at System.Reflection.AssemblyNameParser.Parse(ReadOnlySpan`1 name)\n"
+                   "   at System.Reflection.AssemblyName.ParseAsAssemblySpec(Char* pAssemblyName, Void* pAssemblySpec)\n\n")
+    BANNER = "An error has occurred that was not properly handled. Additional information is shown below. The PowerShell process will exit."
+
+    class Scripted:
+        """A finished probe: what Popen.communicate() would hand back, and when it started and ended (time.monotonic())."""
+
+        def __init__(self, returncode: int, stdout: str, stderr: str, lasted: float = 0.9, name: str = "r13-pass-probe.ps1"):
+            self.args = ["pwsh", "-NoLogo", "-NoProfile", "-NonInteractive", "-File", name]
+            self.returncode = returncode
+            self.started_at = 5000.0
+            self.ended_at = 5000.0 + lasted
+            self._streams = (stdout, stderr)
+
+        def poll(self):
+            return self.returncode
+
+        def communicate(self, timeout=None):
+            return self._streams
+
+    def _collect(self, first, later=(), deadline_in: float = 600.0):
+        """_collect_counts(first, 1) with each re-probe taken from `later`; returns (counts or None, message or None, probes started, stderr text)."""
+        started: list = []
+        script = list(later)
+
+        def fake_popen(probe):
+            started.append(probe.name)
+            return script.pop(0)
+
+        err = io.StringIO()
+        with mock.patch.object(sys.modules[__name__], "_popen_pwsh", fake_popen), contextlib.redirect_stderr(err):
+            try:
+                counts = _collect_counts(first, 1, time.monotonic() + deadline_in)
+            except AssertionError as caught:
+                return None, str(caught), started, err.getvalue()
+        return counts, None, started, err.getvalue()
+
+    def _fault(self, **kw):
+        return self.Scripted(-6, kw.pop("stdout", ""), kw.pop("stderr", self.REAL_STDERR), **kw)
+
+    def test_a_runtime_load_fault_is_re_probed_once_and_the_second_answer_stands(self):
+        counts, message, started, err = self._collect(self._fault(), [self.Scripted(0, "[1]", "")])
+        self.assertIsNone(message)
+        self.assertEqual([1], counts)
+        self.assertEqual(["r13-pass-probe.ps1"], started, "exactly one re-probe of the same probe script")
+        self.assertIn("r13-pass-probe.ps1", err, "the re-probe is logged on stderr with the probe name")
+        self.assertIn("rc=-6", err)
+
+    def test_two_runtime_load_faults_raise_the_typed_start_fault_not_the_generic_lint_failure(self):
+        counts, message, started, _ = self._collect(self._fault(), [self._fault(stdout=self.BANNER)])
+        self.assertIsNone(counts)
+        self.assertEqual(1, len(started), "one re-probe, never two")
+        self.assertTrue(message.startswith("lint probe start fault: pwsh runtime load failure"), message)
+        self.assertNotIn("lint probe failed", message)
+        for needle in ("r13-pass-probe.ps1", "rc=-6", "attempt 1", "attempt 2", "The given assembly name was invalid", "System.Collections.Specialized"):
+            self.assertIn(needle, message)
+
+    def test_the_re_probe_stays_inside_the_shared_deadline(self):
+        counts, message, started, _ = self._collect(self._fault(), [self.Scripted(0, "[1]", "")], deadline_in=-1.0)
+        self.assertIsNone(counts)
+        self.assertEqual([], started, "a spent deadline leaves no budget for the re-probe")
+        self.assertTrue(message.startswith("lint probe start fault: pwsh runtime load failure"), message)
+        self.assertIn("no budget", message)
+
+    def test_a_genuine_lint_failure_is_not_re_probed_and_keeps_the_generic_message(self):
+        """Guard rows: each is a pwsh failure that is NOT a start fault, so it fails once, as before, with "lint probe failed"."""
+        row = '[{"op":"lint","findings":[]}]'
+        rows = (
+            ("(a) lint output present", self.Scripted(-6, row, self.REAL_STDERR)),
+            ("(a) lint output beside the banner", self.Scripted(-6, self.BANNER + "\n[1]", self.REAL_STDERR)),
+            ("(b) a plain non-zero exit", self.Scripted(1, "", self.REAL_STDERR)),
+            ("(b) exit 134", self.Scripted(134, "", self.REAL_STDERR)),
+            ("(c) at the start window", self.Scripted(-6, "", self.REAL_STDERR, lasted=5.0)),
+            ("(c) past the start window", self.Scripted(-6, "", self.REAL_STDERR, lasted=30.0)),
+            ("(d) another stderr text", self.Scripted(-6, "", "Segmentation fault")),
+            ("(d) a lint error", self.Scripted(1, "", "Get-LocalPlaybackPromptFindings : the term is not recognized")),
+            ("(d) another line beside the real one", self.Scripted(-6, "", self.REAL_STDERR + "FAIL: lint cache state corrupt\n")),
+            ("(d) the literal inside prose", self.Scripted(-6, "", "FAIL: lint state corrupt; The given assembly name was invalid. (quoted input)")),
+            ("(e) an external kill", self.Scripted(-9, "", self.REAL_STDERR)),
+        )
+        for name, probe in rows:
+            counts, message, started, err = self._collect(probe, [self.Scripted(0, "[1]", "")])
+            self.assertIsNone(counts, name)
+            self.assertTrue(message.startswith("lint probe failed: "), f"{name}: {message}")
+            self.assertEqual([], started, f"{name} must not be re-probed")
+            self.assertNotIn("start fault", err)
+
+    def test_a_probe_that_times_out_is_not_re_probed(self):
+        class Slow(self.Scripted):
+            def poll(self):
+                return None
+
+            def kill(self):
+                self.returncode = -9
+
+            def communicate(self, timeout=None):
+                if self.returncode == -9:
+                    return self._streams
+                raise subprocess.TimeoutExpired(self.args, timeout)
+
+        counts, message, started, _ = self._collect(Slow(-6, "", self.REAL_STDERR), [self.Scripted(0, "[1]", "")], deadline_in=0.05)
+        self.assertIsNone(counts)
+        self.assertEqual([], started)
+        self.assertIn("did not finish inside its budget", message)
+
+    def test_a_re_probe_that_fails_for_a_real_reason_reports_that_reason(self):
+        counts, message, started, _ = self._collect(self._fault(), [self.Scripted(1, "", "Get-LocalPlaybackPromptFindings : the term is not recognized")])
+        self.assertIsNone(counts)
+        self.assertEqual(1, len(started))
+        self.assertTrue(message.startswith("lint probe failed: "), message)
+        self.assertIn("not recognized", message)
+
+    def test_a_probe_that_succeeds_is_untouched(self):
+        counts, message, started, err = self._collect(self.Scripted(0, "[0]", ""))
+        self.assertEqual(([0], None, [], ""), (counts, message, started, err))
+
+    def test_the_typed_failure_is_an_assertion_error_that_names_the_kind(self):
+        _, message, _, _ = self._collect(self._fault(), [self._fault()])
+        with self.assertRaises(LintProbeStartFault) as caught:
+            self._raise_typed()  # two scripted faults in a row
+        self.assertIsInstance(caught.exception, AssertionError)
+        self.assertEqual("pwsh runtime load failure", caught.exception.kind)
+        self.assertIn("pwsh runtime load failure", message)
+        # a silent fault signal is a start fault too, but it is not called a runtime load failure
+        _, silent, _, _ = self._collect(self.Scripted(-11, "", ""), [self.Scripted(-11, "", "")])
+        self.assertTrue(silent.startswith("lint probe start fault: pwsh start-up crash"), silent)
+
+    def _raise_typed(self):
+        with mock.patch.object(sys.modules[__name__], "_popen_pwsh", lambda probe: self._fault()):
+            return _collect_counts(self._fault(), 1, time.monotonic() + 60)
+
+    def test_the_classifier_accepts_each_stderr_shape_the_hosted_logs_printed(self):
+        """The three real shapes: run 42465921249 (15 hex digits of the token), run 40208899717 (`PublicKeyToken=b0` + a garbage character), run 41585926746
+        (`PublicKey` + a garbage character, with the banner on stdout)."""
+        head = "Unhandled exception. System.IO.FileLoadException: The given assembly name was invalid.\n"
+        tail = ("   at System.Reflection.AssemblyNameParser.Parse(ReadOnlySpan`1 name)\n"
+                "   at System.Reflection.AssemblyName.ParseAsAssemblySpec(Char* pAssemblyName, Void* pAssemblySpec)\n")
+        shapes = (
+            ("run 42465921249", "", self.REAL_STDERR),
+            ("run 40208899717", "", head + "File name: 'System.Collections.Specialized, Version=10.0.0.0, Culture=neutral, PublicKeyToken=b0ﾰ'\n" + tail),
+            ("run 41585926746", self.BANNER, head + "File name: 'System.Collections.Specialized, Version=10.0.0.0, Culture=neutral, PublicKeyﾰ'\n" + tail),
+            ("a full 16-digit token", "", head + "File name: 'System.Runtime, Version=10.0.0.0, Culture=neutral, PublicKeyToken=b03f5f7f11d50a3a'\n" + tail),
+        )
+        for name, stdout, stderr in shapes:
+            self.assertTrue(_is_start_crash(subprocess.CompletedProcess([], -6, stdout=stdout, stderr=stderr), 0.9), name)
+        for name, stderr in (("17 digits", "PublicKeyToken=b03f5f7f11d50a3ab"), ("non-hex", "PublicKeyToken=zzzz"), ("a suffix", "PublicKeyToken=b0' and more")):
+            bad = head + f"File name: 'System.Runtime, Version=10.0.0.0, Culture=neutral, {stderr}" + ("'\n" if "'" not in stderr else "\n") + tail
+            self.assertFalse(_is_start_crash(subprocess.CompletedProcess([], -6, stdout="", stderr=bad), 0.9), name)
+
+    def test_the_foreground_helper_re_runs_a_start_fault_once(self):
+        calls = []
+
+        def run_script(*results):
+            queue = list(results)
+            calls.clear()
+
+            def run():
+                calls.append(1)
+                return queue.pop(0)
+            return run
+
+        fault = subprocess.CompletedProcess([], -6, stdout="", stderr=self.REAL_STDERR)
+        good = subprocess.CompletedProcess([], 0, stdout="[]", stderr="")
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            self.assertIs(good, _run_retrying_start_fault(run_script(fault, good), "in-probe.ps1"))
+            self.assertEqual(2, len(calls))
+            self.assertIn("in-probe.ps1", err.getvalue())
+            with self.assertRaises(LintProbeStartFault) as twice:
+                _run_retrying_start_fault(run_script(fault, fault), "in-probe.ps1")
+            self.assertEqual(2, len(calls), "one re-run, never two")
+        self.assertTrue(str(twice.exception).startswith("lint probe start fault: pwsh runtime load failure"), str(twice.exception))
+        # guard rows: these come back unchanged after ONE run, for the caller's own check to fail as before
+        genuine = (subprocess.CompletedProcess([], 1, stdout="", stderr=self.REAL_STDERR),
+                   subprocess.CompletedProcess([], -6, stdout="[1]", stderr=self.REAL_STDERR),
+                   subprocess.CompletedProcess([], -6, stdout="", stderr="Segmentation fault"),
+                   subprocess.CompletedProcess([], 1, stdout="", stderr="Get-LocalPlaybackPromptFindings : not recognized"))
+        for done in genuine:
+            self.assertIs(done, _run_retrying_start_fault(run_script(done, good), "in-probe.ps1"))
+            self.assertEqual(1, len(calls), done)
+        timeout = subprocess.TimeoutExpired(["pwsh"], 120)
+
+        def times_out():
+            calls.append(1)
+            raise timeout
+        calls.clear()
+        with self.assertRaises(subprocess.TimeoutExpired):
+            _run_retrying_start_fault(times_out, "in-probe.ps1")
+        self.assertEqual(1, len(calls), "a timeout is not re-run")
+
+    def test_the_start_window_is_the_one_the_lint_cache_probe_uses(self):
+        """The classifier, the window and the signal set are the LintCache probe's own (#718, #747), not a second copy."""
+        self.assertEqual(5, LINT_PROBE_START_WINDOW_SEC)
+        self.assertIn(6, LINT_PROBE_CRASH_SIGNALS)
+        self.assertIn("_is_start_crash(", inspect.getsource(_collect_counts_once))
+        self.assertIn("_is_start_crash(", inspect.getsource(_run_retrying_start_fault))
+
+
+@requires_pwsh
+class PopenPwshExitClockTests(unittest.TestCase):
+    """_popen_pwsh records when the child ended, so a shard collected late still reports how long it lived."""
+
+    def test_a_real_probe_reports_how_long_it_lived_not_how_late_it_was_collected(self):
+        tmp = Path(tempfile.mkdtemp(prefix="hubvm-exitclock-"))
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        probe = tmp / "quick-probe.ps1"
+        _write_probe(probe, "'[1]'\n")
+        proc = _popen_pwsh(probe)
+        try:
+            proc.exit_watch.join(timeout=120)
+            time.sleep(1.5)  # collected late
+            self.assertEqual(["[1]"], [proc.communicate(timeout=60)[0].strip()])
+            lasted = _probe_lasted(proc)
+        finally:
+            _kill(proc)
+        self.assertIsNotNone(proc.ended_at)
+        self.assertLess(lasted, time.monotonic() - proc.started_at - 1.0, "the lifetime excludes the 1.5 s the probe waited to be collected")
+        self.assertEqual(float("inf"), _probe_lasted(mock.Mock(spec=[])), "a probe with no start time is never taken to be inside the window")
 
 
 if __name__ == "__main__":
