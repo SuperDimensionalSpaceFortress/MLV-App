@@ -226,7 +226,10 @@ SHIPPED_LEGS = (*SHIPPED_LEGS, *CHAINATTR_LEGS)
 # arm (generatorArgs.playbackConform is not in this base's schema): the Look Assist OFF arm that hung foregrounding (-nola, a classic leg) and its Look Assist
 # ON Cinematic control. Capture-free paced cuda speed legs at scale 1; LegSpecSchemaTests pins the pair.
 HFR_NATIVE_S1_LEGS = ("legs/m16-1457-native-fullscreen-s1.json", "legs/m16-1457-native-fullscreen-s1-nola.json")
-SHIPPED_LEGS = (*SHIPPED_LEGS, *HFR_NATIVE_S1_LEGS)
+# HFR-NATIVE-60FPS-FULLRES-1 r30 (merge of master into #420): #420 already ships the pair in HFR_NATIVE_LEGS, so each file is listed once (a duplicate
+# made LineEndingsCannotHideACommittedFileTests unlink the same checked-out file twice).
+SHIPPED_LEGS = (*SHIPPED_LEGS, *(rel for rel in HFR_NATIVE_S1_LEGS if rel not in SHIPPED_LEGS))
+assert len(set(SHIPPED_LEGS)) == len(SHIPPED_LEGS), "a shipped leg is listed twice"
 SHIPPED_LEGS_PS =", ".join(f"'{rel}'" for rel in SHIPPED_LEGS)
 OTHER_CLIP = "Z99-9999"
 MLV_EXT = "." + "mlv"  # never spelled as one literal token (the NA-4 gate trips on fixture basenames)
@@ -7604,8 +7607,10 @@ class LegSpecSchemaTests(unittest.TestCase):
         of forceLookAssist + lookFlavor, and no Look Assist criteria (lookAssistForced, lookFlavorReported) in any list."""
         load = lambda stem: json.loads((DV / "legs" / f"{stem}.json").read_text(encoding="utf-8"))
         on, off = load("m16-1457-native-fullscreen-s1"), load("m16-1457-native-fullscreen-s1-nola")
-        self.assertEqual(on["generatorArgs"], {"telemetryArm": "LIGHT", "cpuQuiescenceThresholdPercent": 95, "forceLookAssist": True, "lookFlavor": "cinematic"})
-        self.assertEqual(off["generatorArgs"], {"telemetryArm": "LIGHT", "cpuQuiescenceThresholdPercent": 95, "disableLookAssist": True})
+        # HFR-NATIVE-60FPS-FULLRES-1 r30 (merge into #420): #420's schema carries the conform arm, and both native speed legs run with it off
+        self.assertEqual(on["generatorArgs"], {"telemetryArm": "LIGHT", "cpuQuiescenceThresholdPercent": 95, "forceLookAssist": True, "lookFlavor": "cinematic",
+                                               "playbackConform": "off"})
+        self.assertEqual(off["generatorArgs"], {"telemetryArm": "LIGHT", "cpuQuiescenceThresholdPercent": 95, "disableLookAssist": True, "playbackConform": "off"})
         look = ({"metric": "lookAssistForced", "op": "eq", "value": True}, {"metric": "lookFlavorReported", "op": "eq", "value": "cinematic"})
         stripped = json.loads(json.dumps(on))
         for per_backend in stripped["criteria"].values():
