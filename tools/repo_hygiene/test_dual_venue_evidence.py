@@ -5332,8 +5332,8 @@ class ConformArmIsHonouredTests(EvidenceFactory, ModuleMutationMixin, unittest.T
         hfr24 = {"native_fps": "59.940", "pace_fps": "24.000"}
         base = conform_line(clip="59.940", play="24.000", active=1, env_override=1)
         for name, measured, outcome, needles in (
-                ("sound", " audio_sync_requests=0 source_fps=24.000 max_jump=1", "PASS", ()),
-                ("sol r18 B2", " audio_sync_requests=1 source_fps=33.600 max_jump=2", "FAIL", ("conformSourceFps le 24.72", "conformMaxJump eq 1", "conformAudioSyncRequests eq 0")),
+                ("sound", " audio_sync_requests=0 source_advanced=1498 source_fps=24.000 max_jump=1", "PASS", ()),
+                ("sol r18 B2", " audio_sync_requests=1 source_advanced=1498 source_fps=33.600 max_jump=2", "FAIL", ("conformSourceFps le 24.72", "conformMaxJump eq 1", "conformAudioSyncRequests eq 0")),
                 ("no measured fields", "", "FAIL", ("does not carry the field",))):
             with self.subTest(name):
                 self.write_artifacts(line=hfr24, extra_log_lines=[base + measured])
@@ -7274,9 +7274,15 @@ class LegSpecSchemaTests(unittest.TestCase):
         self.assertEqual(nola["generatorArgs"], {"telemetryArm": "LIGHT", "cpuQuiescenceThresholdPercent": 95, "disableLookAssist": True, "playbackConform": "off"})
         for role in ("acceptance", "supplementary"):
             self.assertNotIn("lookFlavorReported", json.dumps(nola["criteria"][role]), "Look Assist is off: no flavor criterion")
-        doc = json.loads((DV / "legsets" / "hfr-native-m16-1457.json").read_text(encoding="utf-8"))
-        self.assertEqual((doc["legSet"], doc["card"], doc["clipId"], sorted(doc["legs"])),
-                         ("hfr-native-m16-1457", "HFR-NATIVE-60FPS-FULLRES-1", "M16-1457", sorted(HFR_NATIVE_LEGS)))
+        # r28 (adversary A3 on 4201a437): one leg per cell in a set, so the acceptance cells are one set and each full screen s1 lever its own
+        named = []
+        for name, legs in (("hfr-native-m16-1457", HFR_NATIVE_LEGS[:2]), ("hfr-native-m16-1457-nola", HFR_NATIVE_LEGS[2:3]),
+                           ("hfr-native-m16-1457-la3", HFR_NATIVE_LEGS[3:4]), ("hfr-native-m16-1457-heavy", HFR_NATIVE_LEGS[4:5])):
+            doc = json.loads((DV / "legsets" / f"{name}.json").read_text(encoding="utf-8"))
+            self.assertEqual((doc["legSet"], doc["card"], doc["clipId"], sorted(doc["legs"])),
+                             (name, "HFR-NATIVE-60FPS-FULLRES-1", "M16-1457", sorted(legs)))
+            named += doc["legs"]
+        self.assertEqual(sorted(named), sorted(HFR_NATIVE_LEGS))
         roles = json.loads((DV / "venues.json").read_text(encoding="utf-8"))["roles"]
         self.assertEqual(roles["HFR-NATIVE-60FPS-FULLRES-1"], {"bachelor": "acceptance", "ultra-magnus": "supplementary"})
         # M16-1456 never carries the native arm
@@ -7284,6 +7290,25 @@ class LegSpecSchemaTests(unittest.TestCase):
             spec = json.loads(path.read_text(encoding="utf-8"))
             if spec["clipId"] == "M16-1456":
                 self.assertNotEqual((spec.get("generatorArgs") or {}).get("playbackConform"), "off", path.name)
+
+    @requires_windows_pwsh
+    def test_r28_a3_every_committed_leg_set_plans_with_unique_cells(self) -> None:
+        """HFR-NATIVE-60FPS-FULLRES-1 r28 fix iteration 2 (adversary A3 on 4201a437), its literal: Get-DvLegSetPlan on legsets/hfr-native-m16-1457.json
+        threw DVE_LEGSET_INVALID (baseline, nola, la3 and heavy all made the cell cuda-fullscreen-s1). The class: every committed set expands."""
+        sets = sorted(str(p) for p in (DV / "legsets").glob("*.json"))
+        self.assertGreaterEqual(len(sets), 7, sets)
+        proc, out = run_pwsh_json(
+            "$rows = foreach ($p in ($env:DVE_SETS -split ';')) {\n"
+            "  try { $plan = Get-DvLegSetPlan -LegSetPath $p -Repeats 1; [ordered]@{ set = $p; ok = $true; cells = @($plan.cells).Count; why = '' } }\n"
+            "  catch { [ordered]@{ set = $p; ok = $false; cells = 0; why = [string]$_.Exception.Message } }\n"
+            "}\n"
+            "ConvertTo-Json -InputObject @($rows) -Compress -Depth 4", DVE_SETS=";".join(sets))
+        self.assertIsNotNone(out, proc.stdout + proc.stderr)
+        self.assertEqual(len(out), len(sets), out)
+        for row in out:
+            with self.subTest(row["set"]):
+                self.assertTrue(row["ok"], row)
+                self.assertGreater(row["cells"], 0, row)
 
     def test_the_decoder_legs_are_their_twins_at_one_raw_prefetch_decoder(self) -> None:
         """PLAYBACK-LJ92-DECODE-THROUGHPUT-1: the K=1 arm differs from the leg it pairs with only in its legId and generatorArgs.rawPrefetchDecoders 1."""
@@ -12571,7 +12596,11 @@ class ConformMeasuredFieldsAreJudgedTests(unittest.TestCase):
     CLIP = "M16-1457"
     SPECS = tuple(f"legs/m16-{clip}-conform-{mode}-s1.json" for clip in ("1456", "1457") for mode in ("windowed", "fullscreen"))
 
-    def chain(self, measured: str) -> list[dict]:
+    def chain(self, measured: str, coverage: str | None = "1498") -> list[dict]:
+        # r28 fix iteration 2 (adversary A4 on 4201a437): the app prints source_advanced (the presented coverage) on every conform line, and a line
+        # without it now fails closed; a measured line that does not name it carries the in-step coverage unless `coverage` is None.
+        if measured and coverage is not None and "source_advanced=" not in measured:
+            measured += f" source_advanced={coverage}"
         log = "\n".join([
             "interaction_trace event=automation.pacing_isolated site=gui-smoke-entry persisted_fps_override=0 persisted_frame_rate=24.000 drop_frame=1 settings_store=run_scoped",
             "playback_smoke.measured_session id=3",
@@ -12646,15 +12675,19 @@ class ConformMeasuredFieldsAreJudgedTests(unittest.TestCase):
 
     def test_r28_a2_a_presented_tail_within_the_debt_cap_tolerance_still_passes(self) -> None:
         """The engine may lead the presented frames by the carried-debt cap (8) plus the frame in flight and the one being prepared: 10 frames short
-        still passes, 11 fails; a line without source_advanced is judged as before."""
+        still passes, 11 fails. Fix iteration 2 (adversary A4 on 4201a437): a line without source_advanced, or with an unreadable one, fails closed."""
         cases = {"in step": ("1498", True), "at the tolerance": ("1489", True), "one past it": ("1488", False)}
         for name, (coverage, passes) in cases.items():
             for row in self.chain(f" audio_sync_requests=0 presented=1499 source_advanced={coverage} source_fps=24.000 max_jump=1"):
                 with self.subTest(case=name, spec=row["spec"], role=row["role"]):
                     self.assertEqual(row["pass"], passes, row)
-        for row in self.chain(" audio_sync_requests=0 source_fps=24.000 max_jump=1"):
-            with self.subTest(case="no source_advanced", spec=row["spec"], role=row["role"]):
-                self.assertTrue(row["pass"], row)
+        for case, measured in (("no source_advanced", " audio_sync_requests=0 source_fps=24.000 max_jump=1"),
+                               ("garbage source_advanced", " audio_sync_requests=0 source_advanced=garbage source_fps=24.000 max_jump=1")):
+            for row in self.chain(measured, coverage=None):
+                with self.subTest(case=case, spec=row["spec"], role=row["role"]):
+                    self.assertFalse(row["pass"], row)
+                    self.assertEqual(len(row["failures"]), 1, row)
+                    self.assertIn("no readable source_advanced", row["failures"][0], row)
 
     def test_a_conform_line_without_the_measured_fields_fails_closed(self) -> None:
         """A build that does not print them (or a line that dropped them) is a missing number, never a passing one: each criterion fails with the typed reason."""
@@ -12670,7 +12703,7 @@ class ConformMeasuredFieldsAreJudgedTests(unittest.TestCase):
         proc, out = run_pwsh_json(
             "$m = [pscustomobject]@{ conformSourceFps = 24.0; conformMaxJump = 1; conformAudioSyncRequests = 0; rows = 5 }\n"
             "$absent = Get-DvCriteriaMetrics -Metrics $m -Playback ([ordered]@{ conformLinePresent = $false })\n"
-            "$bad = Get-DvCriteriaMetrics -Metrics $m -Playback ([ordered]@{ conformLinePresent = $true; summarySession = '3'; conformSession = '3'; conformSourceFps = 33.6; conformMaxJump = 2; conformAudioSyncRequests = 1 })\n"
+            "$bad = Get-DvCriteriaMetrics -Metrics $m -Playback ([ordered]@{ conformLinePresent = $true; summarySession = '3'; conformSession = '3'; conformSourceFps = 33.6; conformMaxJump = 2; conformAudioSyncRequests = 1; sourceAdvanced = 1499; conformSourceAdvanced = 1498 })\n"
             "$none = Get-DvCriteriaMetrics -Metrics $m -Playback $null\n"
             "[ordered]@{ absent = $absent; bad = $bad; none = $none } | ConvertTo-Json -Compress -Depth 4")
         self.assertIsNotNone(out, proc.stdout + proc.stderr)
@@ -12685,7 +12718,7 @@ class ConformMeasuredFieldsAreJudgedTests(unittest.TestCase):
         """r23 adversary A1 (DV-CONFORM-CRITERIA-METRICS-PRESENCE-GUARD-1), sol r23's literal: conformLinePresent=$false, mismatched sessions,
         conformSourceFps=24, conformMaxJump=1, conformAudioSyncRequests=0 passed Get-DvCriteriaMetrics + Test-DvCriteria. Each shape now leaves the
         values absent with a typed CouldNotCheck, so every conform criterion FAILS; only a present, same-session line passes."""
-        good = "conformSourceFps = 24.0; conformMaxJump = 1; conformAudioSyncRequests = 0"
+        good = "conformSourceFps = 24.0; conformMaxJump = 1; conformAudioSyncRequests = 0; sourceAdvanced = 1499; conformSourceAdvanced = 1498"
         shapes = {
             "sol literal": ("conformLinePresent = $false; summarySession = '3'; conformSession = '2'", "no playback_smoke.conform line"),
             "absent line, same session": ("conformLinePresent = $false; summarySession = '3'; conformSession = '3'", "no playback_smoke.conform line"),

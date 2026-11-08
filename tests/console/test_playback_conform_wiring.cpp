@@ -193,6 +193,14 @@ TEST(PlaybackConformWiring, DropFrameTickQuantisesTheConformedCatchupToWholeFram
         const QString paintBody = src.mid(paint, src.indexOf(QStringLiteral("\n}\n"), paint) - paint);
         ASSERT_TRUE(paintBody.contains(QStringLiteral("GpuDisplayWindow::paintPendingForSerialIfActive( m_lastDisplayedPlaybackSerial )")));
         ASSERT_TRUE(paintBody.contains(QStringLiteral("GpuDisplayViewport::paintPendingForSerial( ui->graphicsView, m_lastDisplayedPlaybackSerial )")));
+        // fix iteration 2 (adversary A1 on 4201a437): the CPU pixmap route too -- the present notes the serial, the view's paint promotes it
+        ASSERT_TRUE(paintBody.contains(QStringLiteral("ui->graphicsView->pixmapPaintPendingForSerial( m_lastDisplayedPlaybackSerial )")));
+        ASSERT_EQ(1, countOccurrences(src, QStringLiteral(
+            "        m_pGraphicsItem->setPixmap( pic );\n"
+            "        m_graphicsItemPresentedSerial = task.requestSerial;\n"
+            "        ui->graphicsView->notePixmapPresentSerial( static_cast<quint64>( task.requestSerial ) );")));
+        const QString zoomView = readRepoFile(QStringLiteral("platform/qt/GraphicsZoomView.cpp"));
+        ASSERT_TRUE(zoomView.contains(QStringLiteral("    QGraphicsView::paintEvent(event);\n    m_pixmapPaintedSerial = m_pixmapPendingSerial;")));
         ASSERT_TRUE(paintBody.contains(QStringLiteral("playback_frame_range::conformDisplayPaintPending(")));
         const int shown = src.indexOf(QStringLiteral("long long MainWindow::conformDisplayedPlaybackFrame()"));
         ASSERT_TRUE(shown > 0);

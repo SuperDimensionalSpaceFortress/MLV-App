@@ -246,6 +246,7 @@ void GraphicsZoomView::paintEvent(QPaintEvent *event)
 {
     const preview_paint_timing::Scope timing;
     QGraphicsView::paintEvent(event);
+    m_pixmapPaintedSerial = m_pixmapPendingSerial;   // r28: the pixmap handed over before this paint is on screen now
 }
 
 //The shared preview paint sink, which also counts the GL viewport's and GL window's paints

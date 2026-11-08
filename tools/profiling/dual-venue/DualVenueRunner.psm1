@@ -4138,11 +4138,18 @@ function Get-DvCriteriaMetrics {
     # reaches 1499 reads max_jump=1, source_fps=24. The conform line's source_advanced is what the presented frames covered; when the engine's
     # source_advanced leads it by more than the carried-debt cap plus the frame in flight and the one being prepared, the frames past the last
     # present were never shown: one jump the tracker could not see, and conformMaxJump becomes that shortfall (conformFrozenTailFrames names it).
-    # Within the tolerance (or without the field) nothing changes.
+    # Within the tolerance nothing changes. Fix iteration 2 (adversary A4 on 4201a437): coverage the line does not carry, or carries unreadable, is
+    # a missing number, never a passing one -- conformMaxJump is then left absent with a typed CouldNotCheck, so its criterion FAILS (the app prints
+    # source_advanced on every conform line, MainWindow.cpp playback_smoke.conform).
     $coverage = $(if ($null -ne $Playback -and $present -and $sameSession) { ConvertTo-DvInt64 (Get-DvProp $Playback 'conformSourceAdvanced') } else { $null })
     $engineAdvanced = $(if ($null -ne $Playback) { ConvertTo-DvInt64 (Get-DvProp $Playback 'sourceAdvanced') } else { $null })
     $maxJump = ConvertTo-DvInt64 $m['conformMaxJump']
-    if ($null -ne $maxJump -and $null -ne $coverage -and $null -ne $engineAdvanced) {
+    if ($null -ne $maxJump -and ($null -eq $coverage -or $null -eq $engineAdvanced)) {
+        $m['conformMaxJump'] = $null
+        $m['conformMaxJumpCouldNotCheck'] = $(if ($null -eq $coverage) { 'the measured session''s playback_smoke.conform line carries no readable source_advanced (the presented coverage), so a frozen presentation tail cannot be ruled out' }
+                                              else { 'the run log''s summary carries no readable source_advanced (the engine''s advance), so a frozen presentation tail cannot be ruled out' })
+    }
+    elseif ($null -ne $maxJump) {
         $shortfall = [int64]$engineAdvanced - [int64]$coverage
         if ($shortfall -gt $script:ConformFrozenTailToleranceFrames -and $shortfall -gt $maxJump) {
             $m['conformMaxJump'] = $shortfall

@@ -2913,14 +2913,16 @@ bool MainWindow::conformAcceptedTargetPresentPending()
 }
 
 // r28 fix iteration 1 (adversary A1 on e052947c): finishPresentedFrame runs when the frame is handed to the display, but the GL
-// window (requestUpdate) and the GL viewport (update()) paint it later, and a submission before that paint supersedes it. While
-// either surface holds this frame's serial unpainted (bounded by kConformPaintWaitMs) it is not on screen yet.
+// window (requestUpdate), the GL viewport (update()) and, fix iteration 2 (adversary A1 on 4201a437), the CPU pixmap item (the
+// scene's queued update) paint it later, and a submission before that paint supersedes it. While any surface holds this frame's
+// serial unpainted (bounded by kConformPaintWaitMs) it is not on screen yet.
 bool MainWindow::conformDisplayedFramePaintPending()
 {
     if( m_lastDisplayedPlaybackFrame < 0 || m_lastDisplayedPlaybackSerial == 0 ) return false;
     const bool submittedUnpainted =
         GpuDisplayWindow::paintPendingForSerialIfActive( m_lastDisplayedPlaybackSerial )
-        || GpuDisplayViewport::paintPendingForSerial( ui->graphicsView, m_lastDisplayedPlaybackSerial );
+        || GpuDisplayViewport::paintPendingForSerial( ui->graphicsView, m_lastDisplayedPlaybackSerial )
+        || ui->graphicsView->pixmapPaintPendingForSerial( m_lastDisplayedPlaybackSerial );   // fix iteration 2: the CPU pixmap route
     return playback_frame_range::conformDisplayPaintPending(
         submittedUnpainted, ( mlv_stage_timing_now() - m_lastDisplayedPlaybackStageTime ) * 1000.0 );
 }
@@ -6673,6 +6675,7 @@ void MainWindow::presentPlaybackPreparedFrame( const PlaybackPrepResult &result 
         }
         m_pGraphicsItem->setPixmap( pic );
         m_graphicsItemPresentedSerial = task.requestSerial;
+        ui->graphicsView->notePixmapPresentSerial( static_cast<quint64>( task.requestSerial ) );   // r28: its paint is deferred
         if( !displayPreviewCachingAllowed
          && m_pRenderThread
          && !releasePresentedFrameEarly )

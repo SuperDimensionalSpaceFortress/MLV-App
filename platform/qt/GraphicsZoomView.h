@@ -41,6 +41,15 @@ public:
     PaintTiming paintTiming(void) const;
     void resetPaintTiming(void);
 
+    // HFR-NATIVE-60FPS-FULLRES-1 r28 fix iteration 2 (adversary A1 on 4201a437): the CPU pixmap route's deferred paint. The playback
+    // present notes the request serial it handed the pixmap item; the next viewport paint draws it. Whether a frame with that serial
+    // (or a later one) was handed over and not yet painted.
+    void notePixmapPresentSerial(quint64 serial) { m_pixmapPendingSerial = serial; }
+    bool pixmapPaintPendingForSerial(quint64 serial) const
+    {
+        return serial != 0 && m_pixmapPendingSerial >= serial && m_pixmapPaintedSerial < serial;
+    }
+
 public slots:
     void shortCutZoomIn(void);
     void shortCutZoomOut(void);
@@ -69,6 +78,8 @@ protected:
     qreal m_lookLabelPixmapDpr = 0.0;
     QPixmap m_lookLabelPixmap;
     QString m_lookLabelDrawnText;
+    quint64 m_pixmapPendingSerial = 0;
+    quint64 m_pixmapPaintedSerial = 0;
     bool m_isZoomEnabled;
     PickerState m_pickerState;
     bool m_isMousePressed;
