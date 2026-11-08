@@ -641,14 +641,15 @@ def _scan_stop_sites(blank: str, keep: str) -> list[str]:
 # m_playRequiredSourceFrames (what the admitted Play must consume) decide every stop and every receipt, so they may be
 # written only here, by enclosing function and kind: ``reset`` = ``m_sourceAdvance = SourceFrameAdvanceCounter();``,
 # ``begin`` = ``m_sourceAdvance.begin(``, ``tick`` = ``m_sourceAdvance.noteEngineTick(``, ``required`` =
-# ``m_playRequiredSourceFrames = verdict.requiredFrames;``. Reads (``.consumed()``, ``.startFrame``) are free.
+# ``m_playRequiredSourceFrames = verdict.requiredFrames;``. Reads (``.consumed()``, ``.startFrame``) are free, and (HFR-NATIVE-60FPS-FULLRES-1
+# r30) so are reads of ``.armed`` and ``.highWater``: the conform line prints engine_target from them. A write to any of them stays unreviewed.
 PINNED_COUNTER_WRITES = {
     "MainWindow::programmaticPlay": {"reset": 2, "begin": 1, "required": 2},   # the admitted Play + the adopted running Play
     "MainWindow::on_actionPlay_toggled": {"begin": 1},                          # the FIRST Play start arms the counter
     "MainWindow::playbackHandling": {"tick": 3},                                # the three engine position advances
 }
 _ADV_USE = re.compile(r"\bm_sourceAdvance\b")
-_ADV_READ = re.compile(r"\s*\.\s*(?:consumed\s*\(\s*\)|startFrame\b(?!\s*(?:=(?!=)|[-+*/%&|^]=|\+\+|--)))")
+_ADV_READ = re.compile(r"\s*\.\s*(?:consumed\s*\(\s*\)|(?:startFrame|highWater|armed)\b(?!\s*(?:=(?!=)|[-+*/%&|^]=|\+\+|--)))")
 _ADV_BEGIN = re.compile(r"\s*\.\s*begin\s*\(")
 _ADV_TICK = re.compile(r"\s*\.\s*noteEngineTick\s*\(")
 _ADV_RESET = re.compile(r"\s*=(?!=)\s*playback_frame_range::SourceFrameAdvanceCounter\s*\(\s*\)\s*;")
