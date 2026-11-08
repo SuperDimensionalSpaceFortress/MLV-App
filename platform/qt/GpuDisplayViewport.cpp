@@ -513,6 +513,13 @@ bool GpuDisplayViewport::paintedSerialFor(const QGraphicsView *view, quint64 *se
     return valid;
 }
 
+bool GpuDisplayViewport::paintPendingForSerial(const QGraphicsView *view, quint64 serial)
+{
+    const GpuDisplayViewport *viewport = from(view);
+    if ( !viewport || serial == 0 || viewport->m_presentationOptions.presentationSerial < serial ) return false;
+    return !( viewport->m_paintedSerialValid && viewport->m_paintedSerial >= serial );
+}
+
 GpuDisplayViewport::SamplingMode GpuDisplayViewport::samplingModeFor(const QGraphicsView *view)
 {
     const GpuDisplayViewport *viewport = from(view);

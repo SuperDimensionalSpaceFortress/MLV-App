@@ -165,7 +165,7 @@ TEST(PlaybackConformWiring, DropFrameTickQuantisesTheConformedCatchupToWholeFram
         "                            m_playbackPaceGuard.grant( getPlaybackFramerate() * (double)timeDiff / 1000.0, paceNowMs, playbackPaceGuardFps() ),\n"
         "                            playbackConformActive(), m_conformDropDebtFrames,\n"
         "                            playback_frame_range::conformTargetShown(\n"
-        "                                m_lastPresentedPlaybackFrame, m_lastDisplayedPlaybackFrame, m_newPosDropMode,\n"
+        "                                m_lastPresentedPlaybackFrame, conformDisplayedPlaybackFrame(), m_newPosDropMode,\n"
         "                                conformAcceptedTargetPresentPending(), conformTargetPresentOutstanding() ) ),");
     ASSERT_EQ(1, countOccurrences(body, call));
     // r28 (CoS B1 6714996522 on c4efe7e3): the gate keys off the frame DISPLAYED, never off one drawFrameReady accepted but has
@@ -183,7 +183,24 @@ TEST(PlaybackConformWiring, DropFrameTickQuantisesTheConformedCatchupToWholeFram
         ASSERT_TRUE(invalidate > 0);
         const QString invalidateBody = src.mid(invalidate, src.indexOf(QStringLiteral("\n}\n"), invalidate) - invalidate);
         ASSERT_TRUE(invalidateBody.contains(QStringLiteral("    m_lastPresentedPlaybackFrame = -1;\n    m_lastDisplayedPlaybackFrame = -1;")));
-        ASSERT_EQ(3, countOccurrences(src, QStringLiteral("m_lastDisplayedPlaybackFrame")));   // the tick, the record, the clear
+        // the record, the clear, the accepted-pending paint check, the paint check, the gate's displayed input
+        ASSERT_EQ(5, countOccurrences(src, QStringLiteral("m_lastDisplayedPlaybackFrame")));
+        // fix iteration 1 (adversary A1 on e052947c): a GL surface's deferred paint -- the frame is displayed only once the surface that
+        // was handed its serial has painted it (bounded by kConformPaintWaitMs)
+        ASSERT_TRUE(src.indexOf(QStringLiteral("    m_lastDisplayedPlaybackSerial = static_cast<quint64>( readyFrame.requestSerial );"), finish) > finish);
+        const int paint = src.indexOf(QStringLiteral("bool MainWindow::conformDisplayedFramePaintPending()"));
+        ASSERT_TRUE(paint > 0);
+        const QString paintBody = src.mid(paint, src.indexOf(QStringLiteral("\n}\n"), paint) - paint);
+        ASSERT_TRUE(paintBody.contains(QStringLiteral("GpuDisplayWindow::paintPendingForSerialIfActive( m_lastDisplayedPlaybackSerial )")));
+        ASSERT_TRUE(paintBody.contains(QStringLiteral("GpuDisplayViewport::paintPendingForSerial( ui->graphicsView, m_lastDisplayedPlaybackSerial )")));
+        ASSERT_TRUE(paintBody.contains(QStringLiteral("playback_frame_range::conformDisplayPaintPending(")));
+        const int shown = src.indexOf(QStringLiteral("long long MainWindow::conformDisplayedPlaybackFrame()"));
+        ASSERT_TRUE(shown > 0);
+        ASSERT_TRUE(src.indexOf(QStringLiteral("return conformDisplayedFramePaintPending() ? -1 : m_lastDisplayedPlaybackFrame;"), shown) > shown);
+        const QString viewportSrc = readRepoFile(QStringLiteral("platform/qt/GpuDisplayViewport.cpp"));
+        ASSERT_TRUE(viewportSrc.contains(QStringLiteral("if ( !viewport || serial == 0 || viewport->m_presentationOptions.presentationSerial < serial ) return false;")));
+        const QString windowSrc = readRepoFile(QStringLiteral("platform/qt/GpuDisplayWindow.cpp"));
+        ASSERT_TRUE(windowSrc.contains(QStringLiteral("if ( !win || !win->m_pendingPresentationSerialValid || win->m_pendingPresentationSerial < serial ) return false;")));
         // drawFrameReady's own window: from the accept until it returns (the inline present, or the enqueue that hands the
         // frame to the prep queue), the accepted frame is a present still to come -- the early advance runs inside it
         const int acceptedAt = src.indexOf(QStringLiteral("    m_lastPresentedPlaybackFrame = static_cast<long long>( display_frame );"));
@@ -197,6 +214,7 @@ TEST(PlaybackConformWiring, DropFrameTickQuantisesTheConformedCatchupToWholeFram
         const QString pendingBody = src.mid(pending, src.indexOf(QStringLiteral("\n}\n"), pending) - pending);
         ASSERT_TRUE(pendingBody.contains(QStringLiteral("if( target < 0 || m_lastPresentedPlaybackFrame != target ) return false;")));
         ASSERT_TRUE(pendingBody.contains(QStringLiteral("if( m_playbackPresentDispatchFrame == target ) return true;")));
+        ASSERT_TRUE(pendingBody.contains(QStringLiteral("if( m_lastDisplayedPlaybackFrame == target && conformDisplayedFramePaintPending() ) return true;")));
         ASSERT_TRUE(pendingBody.contains(QStringLiteral("std::lock_guard<std::mutex> lk( m_playbackPrepMutex );")));
         ASSERT_TRUE(pendingBody.contains(QStringLiteral("return playbackPrepHoldsFrameLocked( m_playbackPrepPendingValid,")));
         // the worker records the in-flight task's frame

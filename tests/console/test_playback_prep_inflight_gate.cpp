@@ -1,10 +1,14 @@
 // CPU-SCOPE-LIVE-HEAP-CORRUPTION-1 F2: a drain returns only after the prep worker has left its in-flight section.
 #include "../common/minitest.h"
 #include "../../platform/qt/PlaybackPrepInFlightGate.h"
+#include "../../platform/qt/PlaybackFrameRange.h"
 
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cmath>
+#include <condition_variable>
+#include <deque>
 #include <future>
 #include <mutex>
 #include <thread>
@@ -341,4 +345,30 @@ TEST(PlaybackPrepInFlightGate, R28B1ThePresentDispatchWindowNamesTheAcceptedFram
         ASSERT_EQ( 101LL, slot );
     }
     ASSERT_EQ( -1LL, slot );
+}
+
+// HFR-NATIVE-60FPS-FULLRES-1 r28 fix iteration 1 (adversary A1 on e052947c), its literal input: Play / conform / Drop Frame, Loop off;
+// painted 100, accepted 101, position 101.992, debt 1, grant 0.192; 101 submitted to the deferred GL viewport, renderer idle.
+// finishPresentedFrame recorded 101 as displayed and its tail tick (the same stack) moved to 102.184 while the surface still showed 100.
+// Displayed now means painted: while the surface holds 101's serial unpainted, the gate gets no displayed frame and the accepted 101
+// is a present still to come -- bounded, so a surface that never paints holds nothing past kConformPaintWaitMs.
+TEST(PlaybackPrepInFlightGate, R28A1aFrameHandedToADeferredGlSurfaceIsDisplayedOnlyOncePainted)
+{
+    const auto tickLandsOn = []( long long displayedInput, bool acceptedPending ) -> int
+    {
+        double debt = 1.0;
+        const bool shown = playback_frame_range::conformTargetShown( 101, displayedInput, 101.992, acceptedPending, false );
+        return static_cast<int>( std::floor( 101.992 + playback_frame_range::conformDropFrameDelta( 101.992, 0.192, true, debt, shown ) ) );
+    };
+    // the surface was handed 101 and has not painted it, 2 ms after the hand-over (the tail tick's own stack)
+    const bool pending = playback_frame_range::conformDisplayPaintPending( true, 2.0 );
+    ASSERT_TRUE( pending );
+    ASSERT_EQ( 101, tickLandsOn( pending ? -1 : 101, pending ) );
+    // painted: the debt is repaid, one frame on
+    ASSERT_FALSE( playback_frame_range::conformDisplayPaintPending( false, 9.0 ) );
+    ASSERT_EQ( 102, tickLandsOn( 101, false ) );
+    // a surface that does not paint (hidden, not exposed) holds nothing past the bound
+    ASSERT_TRUE( playback_frame_range::conformDisplayPaintPending( true, playback_frame_range::kConformPaintWaitMs - 1.0 ) );
+    ASSERT_FALSE( playback_frame_range::conformDisplayPaintPending( true, playback_frame_range::kConformPaintWaitMs ) );
+    ASSERT_EQ( 102, tickLandsOn( 101, false ) );
 }

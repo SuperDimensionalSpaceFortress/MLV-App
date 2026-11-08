@@ -2901,6 +2901,8 @@ bool MainWindow::conformAcceptedTargetPresentPending()
     const long long target = static_cast<long long>( m_newPosDropMode );
     if( target < 0 || m_lastPresentedPlaybackFrame != target ) return false;
     if( m_playbackPresentDispatchFrame == target ) return true;
+    // fix iteration 1 (adversary A1 on e052947c): handed to a GL surface whose deferred paint has not drawn it yet
+    if( m_lastDisplayedPlaybackFrame == target && conformDisplayedFramePaintPending() ) return true;
     std::lock_guard<std::mutex> lk( m_playbackPrepMutex );
     return playbackPrepHoldsFrameLocked( m_playbackPrepPendingValid,
                                          static_cast<int64_t>( m_playbackPrepPending.displayFrame ),
@@ -2908,6 +2910,25 @@ bool MainWindow::conformAcceptedTargetPresentPending()
                                          m_playbackPrepResults,
                                          []( const PlaybackPrepResult &result ) { return result.task.displayFrame; },
                                          static_cast<int64_t>( target ) );
+}
+
+// r28 fix iteration 1 (adversary A1 on e052947c): finishPresentedFrame runs when the frame is handed to the display, but the GL
+// window (requestUpdate) and the GL viewport (update()) paint it later, and a submission before that paint supersedes it. While
+// either surface holds this frame's serial unpainted (bounded by kConformPaintWaitMs) it is not on screen yet.
+bool MainWindow::conformDisplayedFramePaintPending()
+{
+    if( m_lastDisplayedPlaybackFrame < 0 || m_lastDisplayedPlaybackSerial == 0 ) return false;
+    const bool submittedUnpainted =
+        GpuDisplayWindow::paintPendingForSerialIfActive( m_lastDisplayedPlaybackSerial )
+        || GpuDisplayViewport::paintPendingForSerial( ui->graphicsView, m_lastDisplayedPlaybackSerial );
+    return playback_frame_range::conformDisplayPaintPending(
+        submittedUnpainted, ( mlv_stage_timing_now() - m_lastDisplayedPlaybackStageTime ) * 1000.0 );
+}
+
+// The displayed input of the conform gate: the frame finishPresentedFrame recorded, or none while its paint is still to come.
+long long MainWindow::conformDisplayedPlaybackFrame()
+{
+    return conformDisplayedFramePaintPending() ? -1 : m_lastDisplayedPlaybackFrame;
 }
 
 static int mlvappStartPlaybackTimer( QObject *owner, double framerate )
@@ -12290,7 +12311,7 @@ void MainWindow::playbackHandling(int timeDiff)
                             m_playbackPaceGuard.grant( getPlaybackFramerate() * (double)timeDiff / 1000.0, paceNowMs, playbackPaceGuardFps() ),
                             playbackConformActive(), m_conformDropDebtFrames,
                             playback_frame_range::conformTargetShown(
-                                m_lastPresentedPlaybackFrame, m_lastDisplayedPlaybackFrame, m_newPosDropMode,
+                                m_lastPresentedPlaybackFrame, conformDisplayedPlaybackFrame(), m_newPosDropMode,
                                 conformAcceptedTargetPresentPending(), conformTargetPresentOutstanding() ) ),
                         ui->spinBoxCutIn->value(), ui->spinBoxCutOut->value(),
                         ui->actionLoop->isChecked() );
@@ -33272,6 +33293,8 @@ void MainWindow::finishPresentedFrame( uint64_t displayFrame,
 {
     // HFR-NATIVE-60FPS-FULLRES-1 r28 (CoS B1 on c4efe7e3): this frame is on screen; the tail advance below may move past it
     m_lastDisplayedPlaybackFrame = static_cast<long long>( displayFrame );
+    m_lastDisplayedPlaybackSerial = static_cast<quint64>( readyFrame.requestSerial );
+    m_lastDisplayedPlaybackStageTime = mlv_stage_timing_now();
     const int displaySourceWidth = rgb8DisplaySourceWidth > 0
         ? rgb8DisplaySourceWidth : readyFrame.renderedImageWidth;
     const int displaySourceHeight = rgb8DisplaySourceHeight > 0

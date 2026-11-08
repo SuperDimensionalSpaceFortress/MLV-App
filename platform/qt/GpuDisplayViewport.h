@@ -69,6 +69,10 @@ public:
      * (a cheap read, no readback). False when no viewport is installed, the last paint drew no frame, or the
      * route did not supply a serial. */
     static bool paintedSerialFor(const QGraphicsView *view, quint64 *serial);
+    /* HFR-NATIVE-60FPS-FULLRES-1 r28 (adversary A1 on e052947c): whether this viewport was handed a frame with
+     * presentationSerial >= serial that its paintGL() has not drawn yet (a deferred paint still to come). False when no
+     * viewport is installed, serial is 0, or the viewport was never handed that frame. */
+    static bool paintPendingForSerial(const QGraphicsView *view, quint64 serial);
     static SamplingMode samplingModeFor(const QGraphicsView *view);
     static QString rendererDescriptionFor(const QGraphicsView *view);
     static bool readPresentedBayer16Texture(QGraphicsView *view,

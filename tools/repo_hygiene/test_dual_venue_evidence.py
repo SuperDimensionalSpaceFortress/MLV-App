@@ -12635,6 +12635,27 @@ class ConformMeasuredFieldsAreJudgedTests(unittest.TestCase):
                     self.assertEqual(row["pass"], not failing, row)
                     self.assertEqual(sorted(f.split(" ")[0].rstrip(":") for f in row["failures"]), sorted(failing), row)
 
+    def test_r28_a2_a_frozen_presentation_tail_fails_every_conform_spec(self) -> None:
+        """HFR-NATIVE-60FPS-FULLRES-1 r28 fix iteration 1 (adversary A2 on e052947c), its literal input: frames 0..1400 presented at 24 fps, then no
+        present while the debt cap carries the engine to source_advanced=1499. max_jump and source_fps are measured up to the LAST present, so the line
+        reads max_jump=1, source_fps=24.000; before r28 every committed conform spec passed it. The 99 frames never shown are now one jump."""
+        for row in self.chain(" audio_sync_requests=0 presented=1401 source_advanced=1400 span_s=58.333 source_fps=24.000 max_jump=1"):
+            with self.subTest(spec=row["spec"], role=row["role"]):
+                self.assertFalse(row["pass"], row)
+                self.assertEqual([f.split(" ")[0].rstrip(":") for f in row["failures"]], ["conformMaxJump"], row)
+
+    def test_r28_a2_a_presented_tail_within_the_debt_cap_tolerance_still_passes(self) -> None:
+        """The engine may lead the presented frames by the carried-debt cap (8) plus the frame in flight and the one being prepared: 10 frames short
+        still passes, 11 fails; a line without source_advanced is judged as before."""
+        cases = {"in step": ("1498", True), "at the tolerance": ("1489", True), "one past it": ("1488", False)}
+        for name, (coverage, passes) in cases.items():
+            for row in self.chain(f" audio_sync_requests=0 presented=1499 source_advanced={coverage} source_fps=24.000 max_jump=1"):
+                with self.subTest(case=name, spec=row["spec"], role=row["role"]):
+                    self.assertEqual(row["pass"], passes, row)
+        for row in self.chain(" audio_sync_requests=0 source_fps=24.000 max_jump=1"):
+            with self.subTest(case="no source_advanced", spec=row["spec"], role=row["role"]):
+                self.assertTrue(row["pass"], row)
+
     def test_a_conform_line_without_the_measured_fields_fails_closed(self) -> None:
         """A build that does not print them (or a line that dropped them) is a missing number, never a passing one: each criterion fails with the typed reason."""
         for row in self.chain(""):

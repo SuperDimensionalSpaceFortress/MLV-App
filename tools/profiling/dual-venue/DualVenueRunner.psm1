@@ -1372,6 +1372,9 @@ function Get-DvPlaybackEvidence {
         conformSourceFps = (ConvertTo-DvDouble $conformFields['source_fps'])
         conformMaxJump = (ConvertTo-DvInt64 $conformFields['max_jump'])
         conformAudioSyncRequests = (ConvertTo-DvInt64 $conformFields['audio_sync_requests'])
+        # r28 fix iteration 1 (adversary A2 on e052947c): the source frames the PRESENTED frames covered (the conform line's source_advanced), so a
+        # frozen presentation tail is seen against the engine's own source_advanced (Get-DvCriteriaMetrics). $null when the line does not carry it.
+        conformSourceAdvanced = (ConvertTo-DvInt64 $conformFields['source_advanced'])
         fpsOverride = (ConvertTo-DvInt64 $f['fps_override'])
         wrapped = $(if ($null -eq $wrappedField) { $null } else { $wrappedField -ne 0 })
         wrapCount = (ConvertTo-DvInt64 $f['wrap_count'])
@@ -4092,6 +4095,8 @@ function Get-DvVerbatimMetrics {
 }
 
 # HFR-NATIVE-60FPS-FULLRES-1 r19 (sol r18 B2): the measured conform fields a leg's criteria may name, and the re-derived playback block field each comes from.
+# r28 (adversary A2 on e052947c): kConformMaxDebtFrames (PlaybackFrameRange.h, 8) + the frame in flight + the frame being prepared.
+$script:ConformFrozenTailToleranceFrames = 10
 $script:ConformCriteriaMetrics = [ordered]@{ conformSourceFps = 'conformSourceFps'; conformMaxJump = 'conformMaxJump'; conformAudioSyncRequests = 'conformAudioSyncRequests' }
 
 function Get-DvCriteriaMetrics {
@@ -4127,6 +4132,22 @@ function Get-DvCriteriaMetrics {
             $m["${name}CouldNotCheck"] = $why
         }
         elseif ($m.Contains("${name}CouldNotCheck")) { $m.Remove("${name}CouldNotCheck") }
+    }
+    # HFR-NATIVE-60FPS-FULLRES-1 r28 fix iteration 1 (adversary A2 on e052947c): a frozen presentation tail never passes. max_jump and source_fps are
+    # measured between the first and the LAST presented frame, so a run that stops presenting at frame 1400 while the engine (the debt cap skipping)
+    # reaches 1499 reads max_jump=1, source_fps=24. The conform line's source_advanced is what the presented frames covered; when the engine's
+    # source_advanced leads it by more than the carried-debt cap plus the frame in flight and the one being prepared, the frames past the last
+    # present were never shown: one jump the tracker could not see, and conformMaxJump becomes that shortfall (conformFrozenTailFrames names it).
+    # Within the tolerance (or without the field) nothing changes.
+    $coverage = $(if ($null -ne $Playback -and $present -and $sameSession) { ConvertTo-DvInt64 (Get-DvProp $Playback 'conformSourceAdvanced') } else { $null })
+    $engineAdvanced = $(if ($null -ne $Playback) { ConvertTo-DvInt64 (Get-DvProp $Playback 'sourceAdvanced') } else { $null })
+    $maxJump = ConvertTo-DvInt64 $m['conformMaxJump']
+    if ($null -ne $maxJump -and $null -ne $coverage -and $null -ne $engineAdvanced) {
+        $shortfall = [int64]$engineAdvanced - [int64]$coverage
+        if ($shortfall -gt $script:ConformFrozenTailToleranceFrames -and $shortfall -gt $maxJump) {
+            $m['conformMaxJump'] = $shortfall
+            $m['conformFrozenTailFrames'] = $shortfall
+        }
     }
     [pscustomobject]$m
 }

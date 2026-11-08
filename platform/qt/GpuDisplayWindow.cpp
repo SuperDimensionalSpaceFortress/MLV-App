@@ -2053,6 +2053,15 @@ bool GpuDisplayWindow::presentedSerialIfActive(quint64 *presentedSerial)
     return win->m_presentedSerialValid;
 }
 
+bool GpuDisplayWindow::paintPendingForSerialIfActive(quint64 serial)
+{
+    if ( serial == 0 ) return false;
+    QMutexLocker lock(&g_activeMutex);
+    GpuDisplayWindow *win = g_activeWindow.load(std::memory_order_acquire);
+    if ( !win || !win->m_pendingPresentationSerialValid || win->m_pendingPresentationSerial < serial ) return false;
+    return !( win->m_presentedSerialValid && win->m_presentedSerial >= serial );
+}
+
 bool GpuDisplayWindow::paintPendingNowIfActive(quint64 *presentedSerial)
 {
     {

@@ -1115,6 +1115,10 @@ private:
     long long m_lastDisplayedPlaybackFrame = -1;
     // The frame drawFrameReady accepted and has not dispatched yet (its inline present or its enqueue); -1 outside that window.
     long long m_playbackPresentDispatchFrame = -1;
+    // r28 fix iteration 1 (adversary A1 on e052947c): the request serial and stage time finishPresentedFrame recorded with it, so a
+    // GL surface's deferred paint can be seen still to come (conformDisplayedFramePaintPending).
+    quint64 m_lastDisplayedPlaybackSerial = 0;
+    double m_lastDisplayedPlaybackStageTime = 0.0;
     bool m_skipImmediateTimecodeLabel = false;
     bool m_playToFirstFramePending = false;
     bool m_playToFirstFrameTargetFrameValid = false;
@@ -1293,6 +1297,8 @@ private:
     bool renderThreadBusyForPlaybackAdvance( int activePlaybackTarget );
     bool conformTargetPresentOutstanding();
     bool conformAcceptedTargetPresentPending();
+    bool conformDisplayedFramePaintPending();
+    long long conformDisplayedPlaybackFrame();
     bool m_automationPacingIsolated = false;
     // ENFORCE-4: the autoplay hook's verdict is a fail-closed LATCH (PlaybackFrameRange.h): armed failing (14) when the hook
     // is installed, cleared only by consumption (Reached). Closing the app before the poll resolves exits 14, never 0.

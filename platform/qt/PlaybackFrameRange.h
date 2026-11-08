@@ -400,6 +400,17 @@ inline bool conformTargetPresented( long long lastPresentedFrame, double positio
     return lastPresentedFrame == static_cast<long long>( position ) || !presentOutstanding;
 }
 
+// HFR-NATIVE-60FPS-FULLRES-1 r28 fix iteration 1 (adversary A1 on e052947c): a frame finishPresentedFrame handed to a GL surface is
+// on screen only once that surface's paintGL() has drawn it (the GL window's requestUpdate and the viewport's update() defer the
+// paint, and a later submission before it supersedes the frame). \a submittedUnpainted: a surface holds this frame's serial
+// unpainted (GpuDisplayWindow::paintPendingForSerialIfActive, GpuDisplayViewport::paintPendingForSerial). The wait is bounded:
+// a surface that does not paint within kConformPaintWaitMs (hidden, not exposed) owes nothing the engine can wait for.
+constexpr double kConformPaintWaitMs = 100.0;
+inline bool conformDisplayPaintPending( bool submittedUnpainted, double sinceSubmitMs )
+{
+    return submittedUnpainted && sinceSubmitMs < kConformPaintWaitMs;
+}
+
 // HFR-NATIVE-60FPS-FULLRES-1 r28 (CoS B1 on c4efe7e3): the targetPresented input MainWindow passes, from the frame drawFrameReady
 // accepted (\a acceptedFrame, m_lastPresentedPlaybackFrame), the frame last put on screen (\a displayedFrame,
 // m_lastDisplayedPlaybackFrame), whether the accepted frame's present is still to come (\a acceptedPresentPending: drawFrameReady
