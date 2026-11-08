@@ -5163,6 +5163,31 @@ class DisplayModeIsRequestedAndObservedTests(EvidenceFactory, ModuleMutationMixi
                 repo, receipt = self.look_claim("dup-" + case, log_state=state)
                 self.assertNotValid(receipt, repo, "LOOK_ASSIST_CLAIM_UNBACKED", status="INVALID")
 
+    # r2 adversary pass 3 (54bd263e) A1 / A2 ------------------------------------------------------------------------------------------------
+    def test_a_look_claim_needs_the_flavor_from_the_same_record_that_says_enabled_and_a_flavor_the_app_applied(self) -> None:
+        enabled_no_flavor = "interaction_trace event=gui_smoke.visual_state look_assist_enabled=1"
+        cases = {
+            # A1: an EARLIER record's flavor must not be borrowed by the LAST record that says enabled=1 but names no flavor
+            "earlier-record-flavor-last-record-enabled-without-one": dict(log_state="look_assist_enabled=0 look_assist_flavor=cinematic\n" + enabled_no_flavor),
+            "earlier-record-enabled-and-flavor-last-record-without-one": dict(log_state="look_assist_enabled=1 look_assist_flavor=cinematic\n" + enabled_no_flavor),
+            # A2: the app prints `none` when no flavor was applied; `unknown` is the summary's own placeholder; neither is a flavor, and a name outside the app's set is none either
+            "app-says-none": dict(log_state="look_assist_enabled=1 look_assist_flavor=none", summary_flavor="none", reported="none", claim_flavor="none"),
+            "summary-says-unknown": dict(log_state="look_assist_enabled=1 look_assist_flavor=unknown", summary_flavor="unknown", reported="unknown", claim_flavor="unknown"),
+            "outside-the-apps-set": dict(log_state="look_assist_enabled=1 look_assist_flavor=sepia", summary_flavor="sepia", reported="sepia", claim_flavor="sepia"),
+            "wrong-case": dict(log_state="look_assist_enabled=1 look_assist_flavor=Cinematic", summary_flavor="Cinematic", reported="Cinematic", claim_flavor="Cinematic"),
+        }
+        for case, opts in cases.items():
+            with self.subTest(case=case):
+                repo, receipt = self.look_claim("a1a2-" + case, **opts)
+                self.assertNotValid(receipt, repo, "LOOK_ASSIST_CLAIM_UNBACKED", status="INVALID")
+
+    def test_every_flavor_the_app_names_still_backs_a_claim(self) -> None:
+        # control for the applied-flavor set: classic / cinematic / film / vision50d are lookAssistFlavorName's four values
+        for flavor in ("classic", "cinematic", "film", "vision50d"):
+            with self.subTest(flavor=flavor):
+                repo, receipt = self.look_claim("set-" + flavor, log_state=f"look_assist_enabled=1 look_assist_flavor={flavor}", summary_flavor=flavor, reported=flavor, claim_flavor=flavor)
+                self.assertAdvisory(receipt, repo)
+
     def test_duplicate_flavor_records_that_agree_still_back_the_claim(self) -> None:
         # control: repeating the SAME flavor is no ambiguity
         state = "look_assist_enabled=1 look_assist_flavor=cinematic\ninteraction_trace event=gui_smoke.visual_state look_assist_enabled=1 look_assist_flavor=cinematic"
@@ -9688,6 +9713,12 @@ class VisualCaptureRunnerTests(RunnerHarness, unittest.TestCase):
                  # r2: duplicate flavor records that disagree -- the app did not say one flavor, so none is proven (whichever one the summary names)
                  ("two flavor tokens in one record", dict(self.NATIVE_LOOK_SUMMARY), "look_assist_enabled=1 look_assist_flavor=classic look_assist_flavor=cinematic"),
                  ("two flavor tokens, the requested one first", dict(self.NATIVE_LOOK_SUMMARY), "look_assist_enabled=1 look_assist_flavor=cinematic look_assist_flavor=classic"),
+                 # r2 adversary pass 3 A1: the flavor must come from the SAME (last) record that says enabled=1 -- an earlier record's flavor is not borrowed
+                 ("flavor only in an earlier record", dict(self.NATIVE_LOOK_SUMMARY),
+                  "look_assist_enabled=0 look_assist_flavor=cinematic\ninteraction_trace event=gui_smoke.visual_state look_assist_enabled=1"),
+                 # r2 adversary pass 3 A2: `none` (what the app prints when it applied no flavor) and `unknown` are no applied flavor, even when the summary echoes them
+                 ("app applied no flavor (none)", dict(self.NATIVE_LOOK_SUMMARY, lookFlavor="none", lookFlavorReported="none"), "look_assist_enabled=1 look_assist_flavor=none"),
+                 ("flavor unknown", dict(self.NATIVE_LOOK_SUMMARY, lookFlavor="unknown", lookFlavorReported="unknown"), "look_assist_enabled=1 look_assist_flavor=unknown"),
                  ("two records, the last differs", dict(self.NATIVE_LOOK_SUMMARY),
                   "look_assist_enabled=1 look_assist_flavor=cinematic\ninteraction_trace event=gui_smoke.visual_state look_assist_enabled=1 look_assist_flavor=classic"),
                  ("two records, the first differs", dict(self.NATIVE_LOOK_SUMMARY),

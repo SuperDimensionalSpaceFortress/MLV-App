@@ -1695,6 +1695,9 @@ function Get-DvPrepConflatedMoveEvidence {
     [ordered]@{ requested = $requested; observed = $observed; verdict = $verdict; reason = $reason; blocks = ($verdict -ceq 'NOT_HONOURED') }
 }
 
+# The flavors the app can apply (src/batch/LookAssistAnalysis.cpp lookAssistFlavorName). The app's `look_assist_flavor=none` (nothing applied) is not among them.
+$script:DvAppliedLookFlavors = @('classic', 'cinematic', 'film', 'vision50d')
+
 function Get-DvLookAssistEvidence {
     <#
     .SYNOPSIS
@@ -1730,8 +1733,11 @@ function Get-DvLookAssistEvidence {
             else {
                 $reported = $m.Groups['v'].Value
                 # VENUE-NATIVE-LEG-LOOKLEG-LABEL-1 r1 (adversary A1): the flavor the app applied, from the SAME record body (a Qt location suffix never answers for it)
-                # r2: ONE flavor or none -- two different flavor values anywhere in the visual_state records mean the app did not say which one ran, so none is proven (never "the first" or "the last")
-                if ($flavorsSeen.Count -eq 1) { $flavor = @($flavorsSeen)[0] }
+                # r2: ONE flavor or none. (1) the flavor comes from the SAME record that says look_assist_enabled (adversary pass 3 A1: an earlier record's flavor is never borrowed by a
+                # later record that names none); (2) two different flavor values anywhere in the visual_state records mean the app did not say which one ran, so none is proven (never
+                # "the first" or "the last"); (3) it must be one the app can apply (adversary pass 3 A2: the app prints `none` when it applied no flavor, and `unknown` is a placeholder).
+                $lastFlavors = @([regex]::Matches($found, '(^|\s)look_assist_flavor=(?<f>\S+)') | ForEach-Object { $_.Groups['f'].Value } | Select-Object -Unique)
+                if ($flavorsSeen.Count -eq 1 -and $lastFlavors.Count -eq 1 -and ($script:DvAppliedLookFlavors -ccontains $lastFlavors[0])) { $flavor = $lastFlavors[0] }
                 if ($reported -cne '1') { $reason = "the app's gui_smoke.visual_state line says look_assist_enabled=$reported (the leg asks for Look Assist on)" }
                 else { $verdict = 'HONOURED' }
             }
