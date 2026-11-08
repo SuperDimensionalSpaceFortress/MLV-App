@@ -2693,8 +2693,9 @@ def test_r15_ancestry_that_cannot_be_read_is_typed_and_the_candidate_is_not_kill
     # The parent read itself is refused. The token names it, the candidate is left alone, and the root is still stopped.
     root=fixture_tree["root"]
     q=_stopped_lane(fixture_tree,_replacing(_PARENT_READ,_PARENT_READ+';\n          if(kid.Id!=0) throw new Win32Exception(5,"fixture-ancestry-refused")'),_replacing(_DIRECT_KILL,"$Proc.Kill()"))
-    assert q["codexDirectChildStop"]=="uncertain:ancestry-unreadable",q
-    assert "codex-direct-child-uncertain:ancestry-unreadable" in q["failure"],q
+    # The injected refusal is Win32Exception(5) on the candidate's own read, so the token names that site and code.
+    assert q["codexDirectChildStop"]=="uncertain:ancestry-unreadable:kid-read:5",q
+    assert "codex-direct-child-uncertain:ancestry-unreadable:kid-read:5" in q["failure"],q
     wait_absent(_state(root,"child.json"),5)
     assert _lives(_state(root,"grand.json")),q
 
