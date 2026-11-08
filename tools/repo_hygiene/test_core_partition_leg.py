@@ -2619,6 +2619,10 @@ LATE_READ_SCENARIOS = {
     "pid-reused-by-the-same-image": {"sleepMs": 250, "stopAt": 12, "procs": [_REUSED_APP, {**_REUSER, "from": 4, "to": 9}]},
     # its control: the same app, the same identity on every poll, alive until enumeration 10
     "pid-same-identity-control": {"sleepMs": 250, "stopAt": 12, "procs": [{**_REUSED_APP, "to": 9, "goneAt": 10}]},
+    # adversary A1 on aa71dd11: the process that takes the pid has the app's exact start (an unsampled clock step) and its path, so no read on the pid tells them apart
+    "pid-reused-with-the-same-start-and-path": {"sleepMs": 250, "stopAt": 12, "procs": [_REUSED_APP, {**_REUSER, "from": 4, "to": 9, "startBeforeFirstPollMs": None, "startSec": 1}]},
+    # the pinned control: the app's handle is held (the pid cannot be reused while it is), alive until enumeration 10
+    "pid-pinned-control": {"sleepMs": 250, "stopAt": 12, "procs": [{"id": 5000, "from": 1, "to": 9, "goneAt": 10, "startSec": 1}]},
     **{f"clock-back-path-{ms}": {"stepMs": ms, "procs": [{**_CLOCK_APP, "pathFail": 1, "pathMode": "empty"}]} for ms in CLOCK_STEPS_MS},
     **{f"clock-back-start-{ms}": {"stepMs": ms, "procs": [{**_CLOCK_APP, "startFail": 1}]} for ms in CLOCK_START_UNREAD_STEPS_MS},
 }
@@ -2714,7 +2718,7 @@ for ($b = 0; $b -lt $names.Count; $b += 4) {
             polls = @([IO.File]::ReadAllLines((Join-Path $run.dir 'polls')) | ForEach-Object { [int64]$_ })
             pollsMs = @([IO.File]::ReadAllLines((Join-Path $run.dir 'pollsms')) | ForEach-Object { [int64]$_ })
             appSampleMs = @(@($rec.samples) | Where-Object { $null -ne $_ -and $_.app } | ForEach-Object { [int64]$_.m })
-            firstApp = @(@($rec.instances) | Where-Object { $null -ne $_ -and $_.pid -eq 5000 } | ForEach-Object { [ordered]@{ start = [int64]$_.startUtcTicks; aliveMs = $_.aliveMs; goneMs = $_.goneMs } })[0] }
+            firstApp = @(@($rec.instances) | Where-Object { $null -ne $_ -and $_.pid -eq 5000 } | ForEach-Object { [ordered]@{ start = [int64]$_.startUtcTicks; aliveMs = $_.aliveMs; goneMs = $_.goneMs; pinned = $_.pinned } })[0] }
     }
 }
 $out | ConvertTo-Json -Compress -Depth 6
@@ -3061,7 +3065,8 @@ class CorePartitionR10Tests(unittest.TestCase):
         poll, and the new process holds it for five polls before the pid is free. On the base the poll reads the new process and stamps the measured app alive
         through all five, with its samples, and the job ACCEPTS the record (the native acceptance trace: release, reuse before the exit is seen, false-alive
         samples, then gone evidence before the helper ends, so no coverage guard refuses it). Now every poll re-checks the birth identity (start time and image
-        path) on the pid, and the first poll that reads another process ends the instance there: nothing after it is credited."""
+        path) on the pid, and the first poll that reads another process ends the instance there: nothing after it is credited. The record says the app was
+        not pinned by a held handle, and the job refuses it (adversary A1 on aa71dd11: a successor with the same start and path would read as the app)."""
         for mode in ("pid-reused-by-another-image", "pid-reused-by-the-same-image"):
             with self.subTest(mode=mode):
                 case = self.late_read(mode)
@@ -3074,20 +3079,53 @@ class CorePartitionR10Tests(unittest.TestCase):
                 self.assertEqual([m for m in case["appSampleMs"] if m > ms[3]], [], f"samples taken after the reuse were credited to the measured app: {case}")
         trace = self.late_read("pid-reused-by-another-image")
         self.assertEqual([trace["app"], trace["instances"], trace["unidentified"]], [5000, [5000], []], trace)
-        # the record is still accepted, now with the app's own lifetime (its endpoint gap is one poll)
-        self.assertIn(trace["vwhy"], self.ACCEPTED, trace)
+        self.assertIs(trace["firstApp"]["pinned"], False, trace)
+        self.assertEqual(trace["vwhy"], "measured-app-identity-unpinned", trace)
+        self.assertFalse(trace["bench"], trace)
+
+    def test_pid_reuse_a1_a_successor_with_the_same_start_and_path_on_an_unpinned_pid_refuses_the_run(self) -> None:
+        """CORE-PARTITION-HELPER-PID-REUSE-1, adversary A1 on aa71dd11 (introduced): the process that takes the unpinned app's pid has the app's exact start
+        ticks (an unsampled clock step) and its path, so every poll's identity re-read matches and its enumeration carries the app's seen key. On aa71dd11
+        the app stays alive through the successor's life and the run is accepted. Now a measured app with no held handle refuses."""
+        case = self.late_read("pid-reused-with-the-same-start-and-path")
+        self.assertEqual(case["app"], 5000, case)
+        self.assertEqual(case["vwhy"], "measured-app-identity-unpinned", f"a measured app whose pid a held handle never pinned was accepted: {case}")
+        self.assertFalse(case["bench"], case)
+        self.assertIn("appAffinityObserved=measured-app-identity-unpinned", case["why"])
+        self.assertIs(case["firstApp"]["pinned"], False, case)
+
+    def test_pid_reuse_the_pinned_flag_is_a_json_flag_and_only_false_refuses(self) -> None:
+        """CORE-PARTITION-HELPER-PID-REUSE-1: the job's verdict on the measured app's pinned flag. false refuses (measured-app-identity-unpinned); true and
+        absent are accepted as before; a number or a string (which -eq would read as a flag) is a malformed record."""
+        body = r"""
+$L = 639286128000000000
+function New-PinRec([string]$Pinned) {
+    $i = '{"pid":5000,"startUtcTicks":' + ($L + 30000000) + ',"firstSeenUtcTicks":' + ($L + 31000000) + ',"firstMs":3100,"lastSeenUtcTicks":' + ($L + 229500000) +
+        ',"goneUtcTicks":' + ($L + 230500000) + ',"aliveMs":22950,"goneMs":23050,"affinityFirst":4095,"affinityLast":4095' + $Pinned + '}'
+    ('{"schema":"mlv-app/core-partition-helper/v1","pid":4242,"app":' + $i + ',"instances":[' + $i + '],"others":[],"samples":[],"clockSkewMaxMs":0,"monoBaseMs":0,"endedBy":"stop-file"}') | ConvertFrom-Json
+}
+$out = [ordered]@{}
+$cases = [ordered]@{ absent = ''; true = ',"pinned":true'; false = ',"pinned":false'; zero = ',"pinned":0'; text = ',"pinned":"yes"' }
+foreach ($k in $cases.Keys) { $out[$k] = [string](Test-CorePartitionMeasuredApp (New-PinRec $cases[$k]) 5000 ($L + 29000000) ($L + 230000000) 0).why }
+$out | ConvertTo-Json -Compress
+"""
+        got = self.drive("pinned-flag", body, True)
+        self.assertEqual(got, {"absent": "", "true": "", "false": "measured-app-identity-unpinned", "zero": "helper-record-malformed", "text": "helper-record-malformed"}, got)
 
     def test_pid_reuse_control_the_same_identity_on_every_poll_keeps_the_instance_alive(self) -> None:
         """CORE-PARTITION-HELPER-PID-REUSE-1 control (passes on the base and with the fix): the same no-handle app, whose pid holds the same process on every
-        poll, is alive through enumeration 9 with its samples credited, and is seen gone at the first poll after it exits."""
-        case = self.late_read("pid-same-identity-control")
-        app, ms = case["firstApp"], case["pollsMs"]
-        self.assertEqual([case["app"], case["instances"], case["unidentified"]], [5000, [5000], []], case)
-        self.assertGreaterEqual(app["aliveMs"], ms[8], f"a poll whose identity matched did not stamp the app alive: {case}")
-        self.assertGreaterEqual(app["goneMs"], ms[9], case)
-        self.assertLessEqual(app["goneMs"], ms[10], case)
-        self.assertTrue([m for m in case["appSampleMs"] if m > ms[3]], f"the live app's samples were not credited: {case}")
-        self.assertIn(case["vwhy"], self.ACCEPTED, case)
+        poll, is alive through enumeration 9 with its samples credited, and is seen gone at the first poll after it exits. Its pinned twin (a held handle)
+        is the same and is accepted."""
+        for mode in ("pid-same-identity-control", "pid-pinned-control"):
+            with self.subTest(mode=mode):
+                case = self.late_read(mode)
+                app, ms = case["firstApp"], case["pollsMs"]
+                self.assertEqual([case["app"], case["instances"], case["unidentified"]], [5000, [5000], []], case)
+                self.assertGreaterEqual(app["aliveMs"], ms[8], f"a poll whose identity matched did not stamp the app alive: {case}")
+                self.assertGreaterEqual(app["goneMs"], ms[9], case)
+                self.assertLessEqual(app["goneMs"], ms[10], case)
+                self.assertTrue([m for m in case["appSampleMs"] if m > ms[3]], f"the live app's samples were not credited: {case}")
+        self.assertIn(self.late_read("pid-pinned-control")["vwhy"], self.ACCEPTED)
 
     def test_handover_a_process_on_a_recycled_tracked_pid_keeps_its_real_first_sight(self) -> None:
         """The same P2 alive and readable from enumeration 6: its first sight is enumeration 4, the pass that first listed it, not one pass late."""

@@ -5104,7 +5104,11 @@ function Test-CorePartitionHelperRecordShape($Record) {
             $num.Add(@($t.pMask, 'int64')); $num.Add(@($t.eMask, 'int64'))
         }
         if ($null -ne $Record.app) { foreach ($n in @('pid', 'startUtcTicks', 'affinityFirst', 'affinityLast')) { $num.Add(@($Record.app.$n, 'int64')) } }
-        foreach ($i in @(@($Record.instances) + @($Record.others) | Where-Object { $null -ne $_ })) { foreach ($n in @('pid', 'startUtcTicks', 'firstSeenUtcTicks', 'firstMs', 'goneUtcTicks', 'aliveMs', 'goneMs')) { $num.Add(@($i.$n, 'int64')) } }
+        foreach ($i in @(@($Record.instances) + @($Record.others) | Where-Object { $null -ne $_ })) {
+            # CORE-PARTITION-HELPER-PID-REUSE-1: whether a held handle pinned the process's pid is a JSON flag or absent (0 or a string would compare as a flag)
+            if ($null -ne $i.pinned -and $i.pinned -isnot [bool]) { return 'helper-record-malformed' }
+            foreach ($n in @('pid', 'startUtcTicks', 'firstSeenUtcTicks', 'firstMs', 'goneUtcTicks', 'aliveMs', 'goneMs')) { $num.Add(@($i.$n, 'int64')) }
+        }
         if ($null -ne $Record.load) {
             # r10 B4: the load session's join outcome is a JSON flag or absent
             if ($null -ne $Record.load.joined -and $Record.load.joined -isnot [bool]) { return 'helper-record-malformed' }
@@ -5212,7 +5216,7 @@ function Test-CorePartitionMeasuredApp($Helper, [int64]$MeasuredPid, [int64]$Mea
     $all = @(@($Helper.instances) + @($Helper.others) | Where-Object { $null -ne $_ } | ForEach-Object {
         [pscustomobject]@{ pid = (ConvertFrom-CorePartitionNumber $_.pid 'int64').value; start = (ConvertFrom-CorePartitionNumber $_.startUtcTicks 'int64').value; gone = (ConvertFrom-CorePartitionNumber $_.goneUtcTicks 'int64').value
             aliveMs = (ConvertFrom-CorePartitionNumber $_.aliveMs 'int64').value; goneMs = (ConvertFrom-CorePartitionNumber $_.goneMs 'int64').value
-            first = (ConvertFrom-CorePartitionNumber $_.firstSeenUtcTicks 'int64').value; firstMs = (ConvertFrom-CorePartitionNumber $_.firstMs 'int64').value } })
+            first = (ConvertFrom-CorePartitionNumber $_.firstSeenUtcTicks 'int64').value; firstMs = (ConvertFrom-CorePartitionNumber $_.firstMs 'int64').value; pinned = $_.pinned } })
     # r10 B3 (sol r9 B3 = adversary r9 8cf7e883 A3): a wall-clock step the helper's polls never sampled (stepped and restored between two polls) can
     # stamp a process start after its own first sighting, which moves it outside the app's window and hides the overlap. Every recorded process must
     # order consistently, start <= first seen <= seen gone (each within $slack), with its monotonic first-sight and last-alive stamps; one that does
@@ -5227,6 +5231,10 @@ function Test-CorePartitionMeasuredApp($Helper, [int64]$MeasuredPid, [int64]$Mea
     if ($m.Count -eq 0) { return @{ why = 'measured-app-not-observed' } }
     if ($m.Count -gt 1) { return @{ why = 'measured-pid-ambiguous' } }
     $a = $m[0]; $aStart = $a.start
+    # CORE-PARTITION-HELPER-PID-REUSE-1 (adversary A1 on aa71dd11): a measured app the helper tracked with no handle held (pinned false) had its pid open to
+    # reuse, and a successor with the same start ticks (an unsampled clock step) and the same path reads exactly as the app on every poll and in every
+    # enumeration, so its life, samples and load could be the successor's. Only a held handle rules that out. The helper writes pinned on every record.
+    if ($a.pinned -eq $false) { return @{ why = 'measured-app-identity-unpinned' } }
     foreach ($o in $all) {
         if ([object]::ReferenceEquals($o, $a)) { continue }
         $oStart = if ($null -ne $o.start) { $o.start - $slack } else { [int64]::MinValue }
@@ -5552,10 +5560,11 @@ public sealed class MlvCorePartitionLoad {
             # reused it reads the new process. Every poll that does not see it gone re-reads the birth identity on the pid AFTER that query, through a fresh
             # process object (StartTime is cached by an object after its first read: r5 sol B1), and compares it as the tracking key does (start ticks, the
             # exe's path). A start or a path read that differs is another process on the pid: gone at this poll, so nothing after it is credited. A read that
-            # fails proves neither; only a held handle (which keeps the pid from being reused) then vouches for an alive.
+            # fails proves neither; only a held handle (pinned: it keeps the pid from being reused) then vouches for an alive. A successor with the same start
+            # and path cannot be told from the process by any read on the pid (adversary A1 on aa71dd11), so the job refuses a measured app not pinned.
             if (!$gone) {
                 $f = $s = $x = $null; try { $f = Get-Process -Id $q.r.pid -ea 0; $s = $f.StartTime.ToUniversalTime().Ticks } catch { }; try { $x = [string]$f.Path } catch { }
-                if (($s -and $s -ne $q.r.startUtcTicks) -or ($x -and $x -ine $exe)) { $gone = $true } elseif (!($s -and $x -or $q.h)) { $gone = $null }
+                if (($s -and $s -ne $q.r.startUtcTicks) -or ($x -and $x -ine $exe)) { $gone = $true } elseif (!($s -and $x -or $q.r.pinned)) { $gone = $null }
             }
             if ($gone -eq $false) {
                 try { $q.r.affinityLast = [int64]$q.p.ProcessorAffinity; $q.r.priorityLast = [string]$q.p.PriorityClass } catch { }
@@ -5602,9 +5611,9 @@ public sealed class MlvCorePartitionLoad {
                 if ($pp -ieq $exe -and $pst) {
                     # firstSeenUtcTicks and firstMs are the real first sight, also for a process classed late; aliveMs is this poll's, the first it can vouch for.
                     $seen[$k] = 1; $fs = & $clk; if (!$pe) { $pe = @{ f = $fs; m = & $ms } }
-                    $r = [ordered]@{ pid = $p.Id; startUtcTicks = $pst.Ticks; firstSeenUtcTicks = $pe.f; lastSeenUtcTicks = $fs; firstMs = $pe.m; goneUtcTicks = $null; aliveMs = $me; goneMs = $null; affinityFirst = $null; affinityLast = $null; priorityFirst = $null; priorityLast = $null; loadSec = 0.0; loadBytes = [int64]0; loadJoined = $null }
+                    $r = [ordered]@{ pid = $p.Id; startUtcTicks = $pst.Ticks; firstSeenUtcTicks = $pe.f; lastSeenUtcTicks = $fs; firstMs = $pe.m; goneUtcTicks = $null; aliveMs = $me; goneMs = $null; affinityFirst = $null; affinityLast = $null; priorityFirst = $null; priorityLast = $null; loadSec = 0.0; loadBytes = [int64]0; loadJoined = $null; pinned = !!$h }
                     try { $r.affinityFirst = [int64]$p.ProcessorAffinity; $r.affinityLast = $r.affinityFirst; $r.priorityFirst = [string]$p.PriorityClass; $r.priorityLast = $r.priorityFirst } catch { $errs.Add("app-read: $($_.Exception.Message)") }
-                    $live[$k] = @{ p = $p; r = $r; h = $h }
+                    $live[$k] = @{ p = $p; r = $r }
                     if ($pst -lt $lu) { $others.Add($r) }
                     else {
                         $ins.Add($r)
