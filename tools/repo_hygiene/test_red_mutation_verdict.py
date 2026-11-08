@@ -2218,6 +2218,38 @@ class SummarySplitR11(unittest.TestCase):
         v = rmv.classify(quoted, "pkg.t.T.test_x")
         self.assertEqual((v.status, v.code), (rmv.PASS, "assertion-failed"), (v, quoted))
 
+    def test_dotted_module_legacy_layout_contract_every_version_in_a_path_is_read(self) -> None:
+        # r16 adversary ea405b3c-A1 (introduced, major): a non-overlapping finditer consumed the separator one library
+        # directory shares with the next, so `lib/python3.14/lib/python3.10/` named only 3.14 and the legacy header PASSed
+        # the wrong 3.11+ identity. Every library directory a path names is read: all three shapes, both directions.
+        rule, dash = "=" * 70, "-" * 70
+
+        def text(path: str) -> str:
+            return (rule + "\nFAIL: test_x (pkg.t.test_x)\n" + dash + "\nTraceback (most recent call last):\n"
+                    '  File "pkg/t.py", line 5, in test_x\n    with contextlib.ExitStack() as stack:\n'
+                    f'  File "{path}", line 601, in __exit__\n    raise exc_details[1]\n'
+                    "AssertionError: ordinary cleanup mismatch\n\n" + dash + "\nRan 1 test in 0.001s\n\nFAILED (failures=1)\n")
+        for path, versions in (("/opt/lib/python3.14/lib/python3.10/contextlib.py", [(3, 14), (3, 10)]),
+                               ("/opt/lib/python3.10/lib/python3.14/contextlib.py", [(3, 10), (3, 14)]),
+                               ("C:\\Python314\\Lib\\Python310\\Lib\\contextlib.py", [(3, 14), (3, 10)]),
+                               ("C:/Python310/Lib/Python314/Lib/contextlib.py", [(3, 10), (3, 14)]),
+                               ("C:\\py\\python314.zip\\python310.zip\\contextlib.py", [(3, 14), (3, 10)]),
+                               ("C:\\Python314\\Lib\\lib\\python3.10\\contextlib.py", [(3, 14), (3, 10)]),
+                               ("/x/lib/python3.10/python310.zip/contextlib.py", [(3, 10), (3, 10)])):
+            with self.subTest(path=path):
+                self.assertEqual(sorted(set(rmv._stdlib_versions(path))), sorted(set(versions)))
+                if len(set(versions)) == 1:
+                    continue
+                for layout in rmv.UNITTEST_LAYOUTS:
+                    for want in ("pkg.t.test_x", "pkg.t.test_x.test_x", "pkg/t.py:5"):
+                        v = rmv.classify(text(path), want, unittest_layout=layout)
+                        self.assertEqual((v.status, v.code), (rmv.REFUSED, "cnc-layout"), (layout, want, v))
+        # controls: one library version, of the declared layout, keeps the verdict
+        v = rmv.classify(text("/opt/lib/python3.14/contextlib.py"), "pkg.t.test_x")
+        self.assertEqual((v.status, v.code), (rmv.PASS, "assertion-failed"), v)
+        v = rmv.classify(text("C:\\Python310\\Lib\\contextlib.py"), "pkg.t.test_x.test_x", unittest_layout="legacy")
+        self.assertEqual((v.status, v.code), (rmv.PASS, "assertion-failed"), v)
+
     def test_dotted_module_legacy_layout_contract_cli_and_api(self) -> None:
         legacy = self._dotted_run("test_x", 'with self.subTest("ordinary message"):\n    self.assertEqual(1, 2)')
         with tempfile.TemporaryDirectory() as tmp:

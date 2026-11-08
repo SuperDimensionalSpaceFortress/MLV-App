@@ -319,14 +319,17 @@ LAYOUT_MODERN, LAYOUT_LEGACY = "3.11+", "legacy"
 UNITTEST_LAYOUTS = (LAYOUT_MODERN, LAYOUT_LEGACY)
 # The VERSION a traceback frame's path names, when it sits in a CPython library directory: POSIX `lib/python3.10/` (also
 # lib64, abiflags such as `3.13t`), Windows `Python310\Lib\` (also `-32`/`-arm64`), and the embedded `python310.zip\`.
-# Either separator, case-insensitive. The digits are ASCII, have no leading zero, and must be followed by the directory's
-# own end (POSIX abiflag letters then a separator; `Lib` after a Windows directory), so 3.1, 3.10 and 3.100 are three
-# versions, never a prefix of one another. A path in no such directory (`venv\Lib\`, `lib/python3/`) is no evidence.
-_STDLIB_DIRS = (
-    re.compile(r"(?:^|[/\\])lib(?:64)?[/\\]python(?P<major>[1-9][0-9]*)\.(?P<minor>0|[1-9][0-9]*)[a-z]*[/\\]", re.I | re.A),
-    re.compile(r"(?:^|[/\\])python(?P<major>[1-9])(?P<minor>0|[1-9][0-9]*)t?(?:-32|-64|-arm64)?[/\\]lib[/\\]", re.I | re.A),
-    re.compile(r"(?:^|[/\\])python(?P<major>[1-9])(?P<minor>0|[1-9][0-9]*)\.zip[/\\]", re.I | re.A),
-)
+# Either separator, case-insensitive. The path is split into its segments ONCE and every segment is read (r16 adversary
+# ea405b3c-A1: a regex scan consumed the separator one directory shares with the next, so `lib/python3.14/lib/python3.10/`
+# named only 3.14). A segment is matched WHOLE: the digits are ASCII with no leading zero and end with the segment (POSIX
+# abiflag letters aside), so 3.1, 3.10 and 3.100 are three versions, never a prefix of one another. The directory must
+# hold the frame's file (a segment follows it). A path in no such directory (`venv\Lib\`, `lib/python3/`) is no evidence.
+_PATH_SPLIT = re.compile(r"[/\\]")
+_SEG_LIB = re.compile(r"lib(?:64)?", re.I | re.A)  # POSIX `lib/` or `lib64/`, followed by `pythonX.Y`
+_SEG_POSIX_PY = re.compile(r"python(?P<major>[1-9][0-9]*)\.(?P<minor>0|[1-9][0-9]*)[a-z]*", re.I | re.A)
+_SEG_WIN_PY = re.compile(r"python(?P<major>[1-9])(?P<minor>0|[1-9][0-9]*)t?(?:-32|-64|-arm64)?", re.I | re.A)  # + `Lib`
+_SEG_WIN_LIB = re.compile(r"lib", re.I | re.A)
+_SEG_ZIP = re.compile(r"python(?P<major>[1-9])(?P<minor>0|[1-9][0-9]*)\.zip", re.I | re.A)
 _LAST_LEGACY = (3, 10)  # the last CPython whose unittest prints `name (module.Class)` (3.11 added the method segment)
 _PT_CAPTURED = re.compile(r"^-{3,} Captured .+ -{3,}\s*$")
 _CHAIN = ("The above exception was the direct cause of the following exception:",
@@ -496,16 +499,26 @@ def _check_layout(layout: object) -> str:
 
 
 def _stdlib_version(path: str) -> tuple[int, int] | None:
-    """(major, minor) of the CPython library directory a frame path sits in (see _STDLIB_DIRS), or None. A path naming
-    two different versions gives None here; _layout_clash reads every version a path names (_stdlib_versions)."""
+    """(major, minor) of the CPython library directory a frame path sits in (see _SEG_*), or None. A path naming two
+    different versions gives None here; _layout_clash reads every version a path names (_stdlib_versions)."""
     found = _stdlib_versions(path)
     return found[0] if len(found) == 1 else None
 
 
 def _stdlib_versions(path: str) -> list[tuple[int, int]]:
+    """EVERY CPython library version the path names, in path order, without repeats. Each segment is tested on its own
+    against each shape (no shared separator is consumed: r16 adversary ea405b3c-A1)."""
+    segs = _PATH_SPLIT.split(path)
     seen: list[tuple[int, int]] = []
-    for rx in _STDLIB_DIRS:
-        for m in rx.finditer(path):
+    for i, seg in enumerate(segs):
+        m = None
+        if i + 2 < len(segs) and _SEG_LIB.fullmatch(seg):
+            m = _SEG_POSIX_PY.fullmatch(segs[i + 1])  # lib/pythonX.Y/<file>
+        if m is None and i + 2 < len(segs) and _SEG_WIN_LIB.fullmatch(segs[i + 1]):
+            m = _SEG_WIN_PY.fullmatch(seg)  # PythonXY\Lib\<file>
+        if m is None and i + 1 < len(segs):
+            m = _SEG_ZIP.fullmatch(seg)  # pythonXY.zip\<file>
+        if m is not None:
             v = (int(m["major"]), int(m["minor"]))
             if v not in seen:
                 seen.append(v)
