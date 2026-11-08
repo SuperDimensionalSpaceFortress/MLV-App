@@ -209,23 +209,32 @@ def _spawn_watched(argv: list, encoding: "str | None" = None) -> "subprocess.Pop
     and a death after it always does when the timer is on time. A proof that is missing is an UNKNOWN life, which is never taken to be a long one."""
     launched = time.monotonic()  # taken BEFORE the process exists (pass-3 A2): a parent stalled inside Popen() must not shorten the child's measured life
     proc = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, **({"encoding": encoding} if encoding else {}))
-    proc.started_at = launched  # read by _collect_counts for its typed timeout message and by _probe_lasted
-    proc.ended_at = None
-    proc.window_proof = None
-    proc.window_timer = None
-    proc.exit_watch = None
-    proc.pid_handle = _open_pidfd(proc)  # r5 pass 11 A1: taken before any thread can reap, so it is bound to this very process (None where unsupported)
-    try:  # adversary r1 A2: the clock is advisory, so a thread that cannot start must never strand the child the caller is about to own
-        not_before = time.monotonic() + LINT_PROBE_START_WINDOW_SEC  # the process exists by now, so running at this instant means it lived the whole window
-        timer = threading.Timer(LINT_PROBE_START_WINDOW_SEC, _witness_window, args=(proc, not_before))
-        timer.daemon = True
-        proc.window_timer = timer
-        watcher = threading.Thread(target=_note_exit, args=(proc,), daemon=True)
-        watcher.start()
-        proc.exit_watch = watcher
-        timer.start()
-    except Exception:  # noqa: BLE001 - e.g. RuntimeError("can't start new thread"); the probe is then judged unproven and as ending when it is collected
-        pass
+    try:  # r5 pass 12 A2: from here to the return the caller does not own the child yet, so an interrupt (KeyboardInterrupt/SystemExit is not an Exception) must not strand it
+        proc.started_at = launched  # read by _collect_counts for its typed timeout message and by _probe_lasted
+        proc.ended_at = None
+        proc.window_proof = None
+        proc.window_timer = None
+        proc.exit_watch = None
+        proc.pid_handle = None
+        proc.pid_handle = _open_pidfd(proc)  # r5 pass 11 A1: taken before any thread can reap, so it is bound to this very process (None where unsupported)
+        try:  # adversary r1 A2: the clock is advisory, so a thread that cannot start must never strand the child the caller is about to own
+            not_before = time.monotonic() + LINT_PROBE_START_WINDOW_SEC  # the process exists by now, so running at this instant means it lived the whole window
+            timer = threading.Timer(LINT_PROBE_START_WINDOW_SEC, _witness_window, args=(proc, not_before))
+            timer.daemon = True
+            proc.window_timer = timer
+            watcher = threading.Thread(target=_note_exit, args=(proc,), daemon=True)
+            watcher.start()
+            proc.exit_watch = watcher
+            timer.start()
+        except Exception:  # noqa: BLE001 - e.g. RuntimeError("can't start new thread"); the probe is then judged unproven and as ending when it is collected
+            pass
+    except BaseException:
+        timer = getattr(proc, "window_timer", None)
+        if timer is not None:
+            timer.cancel()
+        _release_pid_handle(proc)
+        _kill(proc)
+        raise
     return proc
 
 
@@ -6534,6 +6543,28 @@ class CollectCountsRuntimeLoadFaultTests(unittest.TestCase):
                 self.assertEqual(outlived, proc.window_proof is True)
                 self.assertEqual(outlived, known >= LINT_PROBE_START_WINDOW_SEC, f"known life {known:.3f} s")
                 self.assertTrue(proc.pid_handle.closed, "the descriptor is released once the proof is decided")
+
+    def test_r5_pass12_a2_an_interrupt_while_the_watchers_are_being_set_up_does_not_strand_the_child(self):
+        """Pass 12 A2: Popen() succeeded, the caller does not own the child yet, and KeyboardInterrupt (not an Exception) arrives while the clock is being set up.
+        The child must be killed, its descriptor released, and the interrupt must still propagate -- from both the background and the foreground entry points."""
+        killed: list = []
+        child = type("Live", (self.ScheduledPopen,), {"kill": lambda self: killed.append(self.pid), "exit_at": 9e9, "wake_at": 9e9})
+
+        class InterruptedTimer:
+            def __init__(self, *args, **kwargs):
+                raise KeyboardInterrupt
+
+        for label, start in (("background", lambda: _popen_pwsh(Path("r5-probe.ps1"), counted=False)),
+                             ("foreground", lambda: _run_pwsh_witnessed(Path("r5-probe.ps1"), 120))):
+            killed.clear()
+            child.clock[0] = 1000.0  # collecting the first child's corpse ran the shared scripted clock forward
+            handle = mock.Mock(**{"running.return_value": True})
+            with self.subTest(label), mock.patch.object(subprocess, "Popen", child), mock.patch.object(threading, "Timer", InterruptedTimer), \
+                    mock.patch.object(sys.modules[__name__], "_open_pidfd", lambda proc: handle):
+                with self.assertRaises(KeyboardInterrupt):
+                    start()
+                self.assertEqual([4242], killed, "the unowned child was killed")
+                handle.close.assert_called_once_with()
 
     def test_r5_pass11_a1_the_pid_handle_reads_one_process_and_is_closed_exactly_once(self):
         exited = [False]
