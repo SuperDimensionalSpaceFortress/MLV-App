@@ -181,6 +181,16 @@ TEST(PlaybackConformWiring, DropFrameTickQuantisesTheConformedCatchupToWholeFram
     ASSERT_TRUE(outstandingBody.contains(QStringLiteral("if( !m_pRenderThread || !playbackConformActive() ) return false;")));
     ASSERT_TRUE(outstandingBody.contains(QStringLiteral("if( renderThreadBusyForPlaybackAdvance( target ) ) return true;")));
     ASSERT_TRUE(outstandingBody.contains(QStringLiteral("m_pRenderThread->hasPlaybackLookaheadRequest(")));
+    // fix iteration 2 (adversary A1 on 9e88a583): a published Ready frame for the target, lookahead or not (the CPU path with
+    // lookahead 0 is non-lookahead), is a present still coming -- isIdleExceptPlaybackLookahead and isIdle omit Ready slots
+    ASSERT_TRUE(outstandingBody.contains(QStringLiteral("m_pRenderThread->hasReadyFrameForPlaybackTarget(")));
+    const QString renderThread = readRepoFile(QStringLiteral("platform/qt/RenderFrameThread.cpp"));
+    const int ready = renderThread.indexOf(QStringLiteral("bool RenderFrameThread::hasReadyFrameForPlaybackTarget("));
+    ASSERT_TRUE(ready > 0);
+    const QString readyBody = renderThread.mid(ready, renderThread.indexOf(QStringLiteral("\n}\n"), ready) - ready);
+    ASSERT_TRUE(readyBody.contains(QStringLiteral("slot.state.load( std::memory_order_acquire ) != SlotState::Ready")));
+    ASSERT_TRUE(readyBody.contains(QStringLiteral("slot.presentationContext.presentationGeneration == activeGeneration")));
+    ASSERT_FALSE(readyBody.contains(QStringLiteral("playbackLookaheadRequest")));
     // adversary A1 on 9b900412: the held frames are carried and repaid, and no debt survives a Play stop or start
     ASSERT_EQ(1, countOccurrences(body, QStringLiteral(
         "        m_playbackPaceGuard.reset();\n"
