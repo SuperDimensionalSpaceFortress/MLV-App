@@ -1052,6 +1052,47 @@ def test_a_deadline_that_is_not_an_instant_is_refused_before_heavy_slot_starts(b
     assert not box["marker"].exists()
 
 
+def test_an_unspecified_kind_datetime_deadline_is_utc_not_the_hosts_local_time(box) -> None:
+    # adversary cd45eeb5-A1: ConvertFrom-Json turns '2026-11-08T11:59:00' into an Unspecified [DateTime]; ToUniversalTime read it as LOCAL
+    # time, so on a UTC-6 host a deadline a minute ago waited 359 min while the identical text waited 0.
+    done = _stage_attempt(box, "[DateTime]::SpecifyKind([DateTime]::UtcNow.AddMinutes(-1), [DateTimeKind]::Unspecified)")
+    assert done.returncode == 3, done.stdout + done.stderr
+    [call] = _stub_calls(box)
+    assert _wait_minutes(call) == 0.0, call["argv"]
+    from_text = _stage_attempt(box, "([DateTime]::UtcNow.AddMinutes(-1)).ToString('yyyy-MM-ddTHH:mm:ss')")
+    assert from_text.returncode == 3, from_text.stdout + from_text.stderr
+    assert _wait_minutes(_stub_calls(box)[1]) == 0.0, "the same instant as zone-less text agrees"
+
+
+def test_a_garbage_deadline_is_refused_even_when_the_shim_is_missing(box) -> None:
+    # adversary cd45eeb5-A2: a named shim that does not exist failed the guard open BEFORE the deadline was read, so a garbage deadline
+    # was silently ignored and the build ran without the bound (and without the machine slot).
+    missing = str(box["dir"] / "no-such-dir" / "heavy-slot.cmd")
+    done = _stage_attempt(box, "'not-a-date'", opts_line=f"$opts.HeavySlotCmd = '{missing}'\n")
+    assert done.returncode == 2, done.stdout + done.stderr
+    assert "BUILD_HEAVY_SLOT_REFUSED label=attr3-assemble:abc reason=invalid-option" in done.stdout and "HeavySlotDeadlineUtc" in done.stdout
+    assert not box["marker"].exists() and _stub_calls(box) == []
+    # control: a GOOD deadline with the same missing shim is still the documented fail-open build
+    ok = _stage_attempt(box, "([DateTime]::UtcNow.AddMinutes(30)).ToString('o')", opts_line=f"$opts.HeavySlotCmd = '{missing}'\n")
+    assert ok.returncode == 0, ok.stdout + ok.stderr
+    assert box["marker"].exists() and "HEAVY_SLOT_WARN" in ok.stderr
+
+
+def test_the_wait_is_taken_from_the_deadline_at_launch_not_before_a_slow_diagnostic(box) -> None:
+    # adversary cd45eeb5-A3: the wait was computed, then a diagnostic or probe could take seconds, then heavy-slot started with the stale
+    # figure, so its queue timeout landed after the driver's deadline. Here the held-slot probe takes 3 s; the deadline is 4 s out, so
+    # the wait given to heavy-slot must be about 1 s (0.017 min), not 4 s (0.067 min).
+    done = _stage_attempt(
+        box, "[DateTime]::UtcNow.AddSeconds(4)",
+        opts_line="function Test-HeavySlotHeldCanonical { param($h) Start-Sleep -Seconds 3; return '' }\n",
+        extra={"HEAVY_SLOT_HELD": "stub-1:1"},
+    )
+    assert done.returncode in (0, 3), done.stdout + done.stderr
+    [call] = _stub_calls(box)
+    assert _wait_minutes(call) < 0.04, call["argv"]
+    assert re.search(r" wait=0\.0\d+m ", done.stdout), done.stdout
+
+
 def test_a_blank_deadline_option_changes_nothing(box) -> None:
     done = _stage_attempt(box, "''")
     assert done.returncode == 3, done.stdout + done.stderr

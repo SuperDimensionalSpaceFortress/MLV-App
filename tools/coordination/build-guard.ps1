@@ -70,9 +70,11 @@
 #     staging driver passes its own (Options.HeavySlotDeadlineUtc, or env MLV_HEAVY_SLOT_DEADLINE_UTC; the option wins), and --wait
 #     is what is left of it: 0 once passed, one week at most. A 60 min refusal threw the ticket away, so the driver's retry
 #     re-queued as the YOUNGEST ticket behind other projects' work, for as long as the queue stayed deeper than 60 min. The guard
-#     prints BUILD_HEAVY_SLOT_WAIT_BOUND label=<l> wait=<n>m source=deadline deadline=<o> default=60m utc=<o> on stdout before it
-#     starts heavy-slot (never printed without a deadline). An unparsable deadline is BUILD_HEAVY_SLOT_REFUSED reason=invalid-option,
-#     exit 2, nothing launched. The machine HeavySlot itself is not touched (it admits oldest first already).
+#     prints BUILD_HEAVY_SLOT_WAIT_BOUND label=<l> wait=<n>m source=deadline deadline=<o> default=60m utc=<o> on stdout right after
+#     it starts heavy-slot (never printed without a deadline); wait= is the figure heavy-slot was given, taken from the deadline
+#     at launch. A zone-less deadline, text or [DateTime] of Kind Unspecified, is UTC. An unparsable deadline is
+#     BUILD_HEAVY_SLOT_REFUSED reason=invalid-option, exit 2, nothing launched, checked before the shim is even looked for.
+#     The machine HeavySlot itself is not touched (it admits oldest first already).
 #   - A heavy-slot call inside a build action does not pass through (the holder is a child of this guard,
 #     not an ancestor of the action), so it would wait for its own guard: do not nest one there.
 #   - heavy-slot's output goes to a log file beside the lock, never a pipe, so it can never block while it
@@ -974,9 +976,42 @@ function Exit-HeavySlotUnreadable($Lease, [string]$Label, [string]$What = 'ready
     exit 1
 }
 
+function Get-HeavySlotDeadline([hashtable]$Options) {
+    # STAGE-BUILD-HEAVY-SLOT-TIMEOUT-LOSES-TURN-1: the caller's deadline, or none. Options.HeavySlotDeadlineUtc (a UTC instant as text,
+    # or a [DateTime]) outranks env MLV_HEAVY_SLOT_DEADLINE_UTC; neither set, or blank, is none. Text without a zone is UTC. A
+    # [DateTime] of Kind Unspecified (what ConvertFrom-Json makes of a zone-less string) is UTC too, never the host's local time
+    # (adversary cd45eeb5-A1). Returns @{ At = <UTC DateTime or $null>; Why = <text when it is not an instant> }; it never throws.
+    $raw = $null
+    try { if ($Options.ContainsKey('HeavySlotDeadlineUtc')) { $raw = $Options['HeavySlotDeadlineUtc'] } } catch { }
+    if ($null -eq $raw -or ($raw -is [string] -and -not $raw.Trim())) { $raw = $env:MLV_HEAVY_SLOT_DEADLINE_UTC }
+    if ($null -eq $raw -or ($raw -is [string] -and -not $raw.Trim())) { return @{ At = $null; Why = '' } }
+    try {
+        if ($raw -is [DateTime]) {
+            $at = $(if ($raw.Kind -eq [DateTimeKind]::Unspecified) { [DateTime]::SpecifyKind($raw, [DateTimeKind]::Utc) } else { $raw.ToUniversalTime() })
+        } else {
+            $at = [DateTime]::MinValue
+            $styles = [Globalization.DateTimeStyles]::AssumeUniversal -bor [Globalization.DateTimeStyles]::AdjustToUniversal
+            if (-not [DateTime]::TryParse(([string]$raw).Trim(), [Globalization.CultureInfo]::InvariantCulture, $styles, [ref]$at)) { return @{ At = $null; Why = "HeavySlotDeadlineUtc '$raw' is not a UTC instant" } }
+        }
+        return @{ At = $at; Why = '' }
+    } catch { return @{ At = $null; Why = 'HeavySlotDeadlineUtc is not a UTC instant: ' + $_.Exception.Message } }
+}
+
+function Get-HeavySlotWaitFromDeadline([DateTime]$At) {
+    # What is left of the deadline in minutes: 0 once it has passed, one week (heavy-slot's largest wait) at most.
+    return [Math]::Min([Math]::Max(($At - [DateTime]::UtcNow).TotalMinutes, 0.0), [double]$script:HeavySlotMaxMinutes)
+}
+
 function Enter-HeavySlot([hashtable]$Options, [string]$Label) {
     # Takes the machine heavy slot for one build unit (see the header). Returns the lease, or $null when it fails
     # open. A pin mismatch, a REQUEUE or a COULD-NOT-CHECK prints its typed line and exits here: nothing ran.
+    # A deadline that is not an instant is refused FIRST, so a missing shim cannot fail it open into a build that ignores the bound
+    # (adversary cd45eeb5-A2).
+    $deadline = Get-HeavySlotDeadline $Options
+    if ($deadline.Why) {
+        Write-BuildGuardTyped ('BUILD_HEAVY_SLOT_REFUSED label={0} reason=invalid-option HeavySlotWaitMinutes={1} HeavySlotEtaMinutes={2} ({3}) utc={4}' -f $Label, $Options.HeavySlotWaitMinutes, $Options.HeavySlotEtaMinutes, ($deadline.Why -replace '\s+', ' '), [DateTime]::UtcNow.ToString('o'))
+        exit 2
+    }
     $cmd = Resolve-HeavySlotCmd $Options
     if (-not $cmd) {
         Write-BuildGuardLog "HEAVY_SLOT_WARN label=$Label shim=missing: heavy-slot.cmd not found; building WITHOUT the machine heavy slot (fail open)"
@@ -1049,19 +1084,11 @@ function Enter-HeavySlot([hashtable]$Options, [string]$Label) {
         # STAGE-BUILD-HEAVY-SLOT-TIMEOUT-LOSES-TURN-1: a staging driver that has its own deadline passes it here, and the wait is what
         # is left of it (0 once it has passed; one week at most), not the 60 min default. A refusal at 60 min threw the ticket's age
         # away: the driver re-queued as the youngest ticket, behind newer work, for as long as the queue stayed deeper than 60 min.
-        # Options.HeavySlotDeadlineUtc (a UTC instant, text or [DateTime]) outranks env MLV_HEAVY_SLOT_DEADLINE_UTC; neither set, or
-        # blank, leaves the wait as it was. An instant that does not parse is a typed invalid-option refusal below, nothing launched.
-        $deadlineRaw = $(if ($Options.ContainsKey('HeavySlotDeadlineUtc')) { $Options['HeavySlotDeadlineUtc'] } else { $null })
-        if ($null -eq $deadlineRaw -or ($deadlineRaw -is [string] -and -not $deadlineRaw.Trim())) { $deadlineRaw = $env:MLV_HEAVY_SLOT_DEADLINE_UTC }
-        if ($null -ne $deadlineRaw -and -not ($deadlineRaw -is [string] -and -not $deadlineRaw.Trim())) {
-            if ($deadlineRaw -is [DateTime]) { $deadlineAt = ([DateTime]$deadlineRaw).ToUniversalTime() }
-            else {
-                $deadlineAt = [DateTime]::MinValue
-                $styles = [Globalization.DateTimeStyles]::AssumeUniversal -bor [Globalization.DateTimeStyles]::AdjustToUniversal
-                if (-not [DateTime]::TryParse(([string]$deadlineRaw).Trim(), $inv, $styles, [ref]$deadlineAt)) { throw "HeavySlotDeadlineUtc '$deadlineRaw' is not a UTC instant" }
-            }
-            $waitMin = [Math]::Min([Math]::Max(($deadlineAt - [DateTime]::UtcNow).TotalMinutes, 0.0), [double]$script:HeavySlotMaxMinutes)
-            $boundNote = 'deadline={0}' -f $deadlineAt.ToString('o')
+        # The deadline was read and refused at the top of this function (Get-HeavySlotDeadline); here it only sets the first wait, which
+        # is checked like any other. The wait actually launched is computed again right before the launch (adversary cd45eeb5-A3).
+        if ($deadline.At) {
+            $waitMin = Get-HeavySlotWaitFromDeadline $deadline.At
+            $boundNote = 'deadline={0}' -f $deadline.At.ToString('o')
         }
         foreach ($d in @(@('HeavySlotWaitMinutes', $waitMin), @('HeavySlotEtaMinutes', $etaMin))) {
             if (-not ($d[1] -ge 0 -and $d[1] -le $script:HeavySlotMaxMinutes)) { throw ('{0} is not a number from 0 to {1}' -f $d[0], $script:HeavySlotMaxMinutes) }
@@ -1078,11 +1105,6 @@ function Enter-HeavySlot([hashtable]$Options, [string]$Label) {
         Write-BuildGuardTyped ('BUILD_HEAVY_SLOT_REFUSED label={0} reason=invalid-option HeavySlotWaitMinutes={1} HeavySlotEtaMinutes={2} ({3}) utc={4}' -f $Label, $Options.HeavySlotWaitMinutes, $Options.HeavySlotEtaMinutes, ($why -replace '\s+', ' '), [DateTime]::UtcNow.ToString('o'))
         exit 2
     }
-    # The bound actually used, named once per guarded call, only when a deadline set it: the first staged build after the change
-    # is read from this line (wait=, deadline=, and the 60 min default it replaced).
-    if ($boundNote) {
-        Write-BuildGuardTyped ('BUILD_HEAVY_SLOT_WAIT_BOUND label={0} wait={1} source=deadline {2} default={3}m utc={4}' -f $Label, $waitArg, $boundNote, $script:BuildGuardDefaults.HeavySlotWaitMinutes, [DateTime]::UtcNow.ToString('o'))
-    }
     # cmd opens the log for its own redirect and, when it cannot, writes that diagnostic to the stderr it inherited, past the
     # bounded writer (r9 adversary 353c9a42-A2: a lease directory that denies creating files). The guard makes the log first,
     # so a lease directory it cannot write fails open here with nothing launched.
@@ -1092,19 +1114,12 @@ function Enter-HeavySlot([hashtable]$Options, [string]$Label) {
         Write-BuildGuardLog ('HEAVY_SLOT_WARN label={0} shim={1} lease-log-failed: {2}; building WITHOUT the machine heavy slot (fail open)' -f $Label, $cmd, ($e.Message -replace '\s+', ' '))
         return $null
     }
-    # cmd quoting, as heavy-slot itself starts a batch child: each argument double-quoted. Its stdout and stderr go to a
-    # file, never a pipe, so nothing it writes while it holds the slot can block it (adversary A4).
-    $quoted = @($cmd, 'run', '--class', 'shared', '--label', $lease.Label, '--eta', $etaArg,
-        '--wait', $waitArg, '--exit-file', $lease.ExitFile,
-        '--', $exe, '-NoProfile', '-NonInteractive', '-EncodedCommand', (New-HeavySlotHolder $lease.Ready $lease.Stop)) |
-        ForEach-Object { '"' + ([string]$_ -replace '"', '""') + '"' }
     $psi = [System.Diagnostics.ProcessStartInfo]::new($env:ComSpec)
     $psi.UseShellExecute = $false
     # cmd's own streams are pipes whose read ends the guard closes at once (r9, 353c9a42-A2 class): a diagnostic of cmd itself
     # then fails at once, never waiting on a stdout or stderr the guard inherited. What heavy-slot writes goes to the log.
     $psi.RedirectStandardOutput = $true
     $psi.RedirectStandardError = $true
-    $psi.Arguments = '/d /v:off /s /c "' + ($quoted -join ' ') + ' >"' + $lease.Log + '" 2>&1"'
     $psi.Environment['HEAVY_SLOT_EXPECT_SHA256'] = $expected
     $psi.Environment['HEAVY_SLOT_EXPECT_KEEPER'] = '1'
     # A guarded build always takes the canonical machine slot: an inherited mutex name, slot count, state dir or keeper
@@ -1122,6 +1137,22 @@ function Enter-HeavySlot([hashtable]$Options, [string]$Label) {
             $heldDropped = 'heavy-slot: inherited HEAVY_SLOT_HELD={0} not passed through ({1}); taking the canonical slot' -f $env:HEAVY_SLOT_HELD, $notCanonical
         }
     }
+    # A deadline-bound wait is what is left of the deadline NOW, taken after every diagnostic and file step above (each can wait up to
+    # 2 s on an undrained pipe), so the queue timeout heavy-slot sets can never land past the driver's deadline (adversary cd45eeb5-A3).
+    # The hung-tool bound is measured from the launch, so it moves with the wait.
+    if ($deadline.At) {
+        $waitMin = Get-HeavySlotWaitFromDeadline $deadline.At
+        $waitArg = $waitMin.ToString('0.##########', $inv) + 'm'
+        if ($waitArg -cnotmatch '^\d+(\.\d+)?m$') { $waitArg = '0m'; $waitMin = 0.0 }
+        $giveUp = [TimeSpan]::FromMinutes($waitMin + $script:HeavySlotGiveUpSlackMinutes)
+    }
+    # cmd quoting, as heavy-slot itself starts a batch child: each argument double-quoted. Its stdout and stderr go to a
+    # file, never a pipe, so nothing it writes while it holds the slot can block it (adversary A4).
+    $quoted = @($cmd, 'run', '--class', 'shared', '--label', $lease.Label, '--eta', $etaArg,
+        '--wait', $waitArg, '--exit-file', $lease.ExitFile,
+        '--', $exe, '-NoProfile', '-NonInteractive', '-EncodedCommand', (New-HeavySlotHolder $lease.Ready $lease.Stop)) |
+        ForEach-Object { '"' + ([string]$_ -replace '"', '""') + '"' }
+    $psi.Arguments = '/d /v:off /s /c "' + ($quoted -join ' ') + ' >"' + $lease.Log + '" 2>&1"'
     # The hung-tool clock starts before the launch and before any diagnostic line (r6 sol B1).
     $waitClock = [System.Diagnostics.Stopwatch]::StartNew()
     try { $lease.Process = [System.Diagnostics.Process]::Start($psi) } catch {
@@ -1135,6 +1166,11 @@ function Enter-HeavySlot([hashtable]$Options, [string]$Label) {
         # The wait printed is the one heavy-slot was given, never the raw option (fable r6b note).
         Write-BuildGuardLog ('heavy-slot: waiting label={0} wait={1} exit-file={2} shim={3}' -f $lease.Label, $waitArg, $lease.ExitFile, $cmd)
         if ($heldDropped) { Write-BuildGuardLog $heldDropped }
+        # The bound actually used, named once per guarded call and only when a deadline set it: the first staged build after the change
+        # is read from this line (wait=, deadline=, and the 60 min default it replaced). After the launch, like every diagnostic here.
+        if ($boundNote) {
+            Write-BuildGuardTyped ('BUILD_HEAVY_SLOT_WAIT_BOUND label={0} wait={1} source=deadline {2} default={3}m utc={4}' -f $Label, $waitArg, $boundNote, $script:BuildGuardDefaults.HeavySlotWaitMinutes, [DateTime]::UtcNow.ToString('o'))
+        }
         while ($true) {
             Send-HeavySlotLines $lease
             # The ready file admits only while the holder it names still runs (checked after the file is seen, and again below).
