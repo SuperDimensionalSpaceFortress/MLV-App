@@ -1427,6 +1427,40 @@ def test_an_allscope_read_only_caller_variable_never_masks_a_failing_child(box, 
         assert any("STAGE_FAILED phase=dll" in line for line in status), status
 
 
+def test_caller_parameter_defaults_never_hide_an_allscope_deadline_from_the_guard(box) -> None:
+    # adversary f05a6892-A1 (its input): $PSDefaultParameterValues['Get-Variable:ValueOnly'] made the guard's Get-Variable return the bare value,
+    # so the AllScope option was never seen; the read-only caller $deadline (2099) then survived the chain's own assignment, and a deadline
+    # passed as 2000-01-01 ran both phases and returned 0. The guard now reads the session state directly and calls no cmdlet.
+    run, stage_one_path, env = _chain_box(box, 61)
+    ran = box["dir"] / "child-ran.txt"
+    stage_one_path.write_text(f"param([string]$Sha, [string]$Phase)\nAdd-Content -LiteralPath '{ran}' -Value $Phase\nexit 0\n", encoding="ascii")
+    script = ("$PSDefaultParameterValues['Get-Variable:ValueOnly'] = $true\n"
+              "New-Variable deadline -Value ([DateTime]::SpecifyKind([DateTime]'2099-01-01', [DateTimeKind]::Utc)) -Option AllScope,ReadOnly\n"
+              f"& '{STAGE_CHAIN}' -Sha {_CHAIN_SHA} -DeadlineUtc '2000-01-01T00:00:00Z' -StageOne '{stage_one_path}' -RunDir '{run}' -RetrySec 0 -MaxAttempts 1\n"
+              "Write-Output \"rc=$LASTEXITCODE\"\n")
+    done = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script],
+                          capture_output=True, text=True, timeout=180, env=env, check=False)
+    assert not ran.exists(), "a child ran past the supplied deadline: " + ran.read_text(encoding="utf-8")
+    assert "rc=2" in done.stdout, done.stdout + done.stderr + "\n".join(_chain_status(run))
+    assert "STAGE_CHAIN_REFUSED reason=caller-allscope-variable name=deadline " in done.stdout, done.stdout + done.stderr
+
+
+def test_a_dot_sourced_chain_is_refused_before_it_assigns_anything(box) -> None:
+    # adversary f05a6892-A1 (its dot-source note): dot-sourced, the chain's variables are the caller's, so a read-only caller $deadline that is NOT
+    # AllScope still froze it. That is refused before anything runs.
+    run, stage_one_path, env = _chain_box(box, 61)
+    ran = box["dir"] / "child-ran.txt"
+    stage_one_path.write_text(f"param([string]$Sha, [string]$Phase)\nAdd-Content -LiteralPath '{ran}' -Value $Phase\nexit 0\n", encoding="ascii")
+    script = ("New-Variable deadline -Value ([DateTime]::SpecifyKind([DateTime]'2099-01-01', [DateTimeKind]::Utc)) -Option ReadOnly\n"
+              f". '{STAGE_CHAIN}' -Sha {_CHAIN_SHA} -DeadlineUtc '2000-01-01T00:00:00Z' -StageOne '{stage_one_path}' -RunDir '{run}' -RetrySec 0 -MaxAttempts 1\n"
+              "Write-Output \"rc=$LASTEXITCODE\"\n")
+    done = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script],
+                          capture_output=True, text=True, timeout=180, env=env, check=False)
+    assert not ran.exists(), "a child ran past the supplied deadline: " + ran.read_text(encoding="utf-8")
+    assert "rc=2" in done.stdout, done.stdout + done.stderr + "\n".join(_chain_status(run))
+    assert "STAGE_CHAIN_REFUSED reason=dot-sourced " in done.stdout, done.stdout + done.stderr
+
+
 def test_the_chain_caller_shadow_guard_covers_every_variable_the_chain_uses() -> None:
     # adversary 9528e35b-A2, the whole class: any variable of the chain that an in-process caller holds AllScope is shared with (or, when
     # read-only, frozen by) that caller. The guard refuses every such name before anything runs, so its list must name every variable the
@@ -1437,9 +1471,9 @@ def test_the_chain_caller_shadow_guard_covers_every_variable_the_chain_uses() ->
     done = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script],
                           capture_output=True, text=True, timeout=60, check=False)
     assert done.returncode == 0, done.stderr
-    automatic = {"_", "pid", "pshome", "iswindows", "null", "true", "false", "erroractionpreference"}
+    automatic = {"_", "pid", "pshome", "iswindows", "null", "true", "false", "executioncontext", "myinvocation"}
     used = {n.strip().lower() for n in done.stdout.splitlines() if n.strip() and ":" not in n} - automatic
-    guard = re.search(r"# CALLER-SHADOW GUARD\b[^\n]*\n(?:#[^\n]*\n)*@\(([^)]*)\)", STAGE_CHAIN.read_text(encoding="utf-8"))
+    guard = re.search(r"# CALLER-SHADOW GUARD\b.*?\n@\(([^)]*)\)\.Where\(", STAGE_CHAIN.read_text(encoding="utf-8"), re.S)
     assert guard, "the guard list is missing"
     listed = {n.strip().strip("'").lower() for n in guard.group(1).split(",") if n.strip()}
     assert used - listed == set(), sorted(used - listed)

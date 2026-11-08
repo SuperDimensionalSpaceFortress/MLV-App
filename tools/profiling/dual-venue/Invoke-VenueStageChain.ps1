@@ -29,7 +29,9 @@
 # or a status/log write that fails later, is STAGE_CHAIN_FAILED (exit 1). Success is only ever a child's own exit 0 (adversary 8eb98036-A1).
 # Run in process (`& Invoke-VenueStageChain.ps1`), a caller's AllScope variable is shared with every scope of this script, and a read-only one cannot be
 # assigned here, so it could freeze the exit code at 0 after a failing child. Any AllScope variable whose name this script uses is STAGE_CHAIN_REFUSED
-# reason=caller-allscope-variable (exit 2) before anything else runs, and the exit code is carried only in $script:MlvStageChainExitCode, whose every
+# reason=caller-allscope-variable (exit 2) before anything else runs (read from the session state, never through a cmdlet that a caller's
+# $PSDefaultParameterValues can bend; adversary f05a6892-A1), a dot-sourced run is STAGE_CHAIN_REFUSED reason=dot-sourced, the caller's parameter
+# defaults never reach this script's cmdlets, and the exit code is carried only in $script:MlvStageChainExitCode, whose every
 # assignment is read back; one that does not land is STAGE_CHAIN_FAILED reason=exit-code-unassignable, exit 1 (adversary 9528e35b-A2). One case is
 # PowerShell's, not this script's: a read-only AllScope variable named like a PARAMETER fails the binding before any line here runs, so no exit code
 # is set at all: $LASTEXITCODE keeps the caller's old value and only $? (false) shows the failure. Run it with pwsh -File to rule this out.
@@ -44,12 +46,18 @@ param(
     # Attempts per phase; 0 = until the deadline (the copies' rule).
     [ValidateRange(0, 100000)][int]$MaxAttempts = 0
 )
-# CALLER-SHADOW GUARD (adversary 9528e35b-A2): first, before any of these names is assigned. The list names every variable this script uses
-# (a test reads it against the script's syntax tree); it assigns none itself, and its cmdlet is module-qualified.
-@('Sha', 'DeadlineUtc', 'StageOne', 'RunDir', 'RetrySec', 'MaxAttempts', 'Why', 'text', 'parsed', 'formats', 'deadline', 'errs', 'ast', 'declares', 'pwsh', 'status', 'utf8', 't', 'Phase', 'LogPath', 'psi', 'x', 'p', 'o', 'e', 'Value', 'deadlineText', 'attempt', 'phaseDone', 'log', 'code', 'last', 'MlvStageChainExitCode') |
-    Where-Object { (Microsoft.PowerShell.Utility\Get-Variable -Name $_ -ErrorAction Ignore).Options -band [System.Management.Automation.ScopedItemOptions]::AllScope } |
-    Select-Object -First 1 |
-    ForEach-Object { [Console]::Out.WriteLine(('STAGE_CHAIN_REFUSED reason=caller-allscope-variable name={0} sha={1} utc={2}' -f $_, $Sha, [DateTime]::UtcNow.ToString('o'))); exit 2 }
+# CALLER-SHADOW GUARD (adversary 9528e35b-A2, f05a6892-A1): first, before any of these names is assigned. The list names every variable this script
+# uses (a test reads it against the script's syntax tree). The guard assigns nothing and calls no cmdlet, so a caller's $PSDefaultParameterValues
+# (Get-Variable:ValueOnly hid the AllScope option from the first version) cannot reach it: it reads each variable through the session state.
+# Dot-sourced, every variable here IS the caller's, so that is refused outright.
+if ($MyInvocation.InvocationName -eq '.') {
+    [Console]::Out.WriteLine(('STAGE_CHAIN_REFUSED reason=dot-sourced sha={0} utc={1}' -f $Sha, [DateTime]::UtcNow.ToString('o'))); exit 2
+}
+@('PSDefaultParameterValues', 'ErrorActionPreference', 'Sha', 'DeadlineUtc', 'StageOne', 'RunDir', 'RetrySec', 'MaxAttempts', 'Why', 'text', 'parsed', 'formats', 'deadline', 'errs', 'ast', 'declares', 'pwsh', 'status', 'utf8', 't', 'Phase', 'LogPath', 'psi', 'x', 'p', 'o', 'e', 'Value', 'deadlineText', 'attempt', 'phaseDone', 'log', 'code', 'last', 'MlvStageChainExitCode').Where(
+    { $null -ne $ExecutionContext.SessionState.PSVariable.Get($_) -and ($ExecutionContext.SessionState.PSVariable.Get($_).Options -band [System.Management.Automation.ScopedItemOptions]::AllScope) }, 'First').ForEach(
+    { [Console]::Out.WriteLine(('STAGE_CHAIN_REFUSED reason=caller-allscope-variable name={0} sha={1} utc={2}' -f $_, $Sha, [DateTime]::UtcNow.ToString('o'))); exit 2 })
+# The caller's parameter defaults never reach a cmdlet of this script (a local, empty map; the caller's own is not AllScope, checked above).
+$PSDefaultParameterValues = @{}
 $ErrorActionPreference = 'Continue'
 
 function Refuse([string]$Why) {
