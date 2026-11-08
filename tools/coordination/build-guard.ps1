@@ -72,7 +72,7 @@
 #     re-queued as the YOUNGEST ticket behind other projects' work, for as long as the queue stayed deeper than 60 min. The guard
 #     prints BUILD_HEAVY_SLOT_WAIT_BOUND label=<l> wait=<n>m source=deadline deadline=<o> default=60m utc=<o> on stdout right after
 #     it starts heavy-slot (never printed without a deadline); wait= is the figure heavy-slot was given, taken from the deadline
-#     at launch. A zone-less deadline, text or [DateTime] of Kind Unspecified, is UTC. An unparsable deadline is
+#     just before launch, so the queue timeout is bounded by that sampled remaining budget plus the shim's start latency. A zone-less deadline, text or [DateTime] of Kind Unspecified, is UTC. An unparsable deadline is
 #     BUILD_HEAVY_SLOT_REFUSED reason=invalid-option, exit 2, nothing launched, checked before the shim is even looked for.
 #     The machine HeavySlot itself is not touched (it admits oldest first already).
 #   - A heavy-slot call inside a build action does not pass through (the holder is a child of this guard,
@@ -1138,7 +1138,9 @@ function Enter-HeavySlot([hashtable]$Options, [string]$Label) {
         }
     }
     # A deadline-bound wait is what is left of the deadline NOW, taken after every diagnostic and file step above (each can wait up to
-    # 2 s on an undrained pipe), so the queue timeout heavy-slot sets can never land past the driver's deadline (adversary cd45eeb5-A3).
+    # 2 s on an undrained pipe), so the queue timeout heavy-slot sets is bounded by the sampled remaining budget plus the shim's start
+    # latency (cmd and pwsh start after this sample, and heavy-slot's own clock starts once they have), not by a figure taken earlier
+    # (adversary cd45eeb5-A3; Dot I2, e132a66). It is a bound on the wait given, not a guarantee of landing before the deadline.
     # The hung-tool bound is measured from the launch, so it moves with the wait.
     if ($deadline.At) {
         $waitMin = Get-HeavySlotWaitFromDeadline $deadline.At

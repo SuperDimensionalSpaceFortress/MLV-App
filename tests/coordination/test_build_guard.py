@@ -1090,7 +1090,25 @@ def test_the_wait_is_taken_from_the_deadline_at_launch_not_before_a_slow_diagnos
     assert done.returncode in (0, 3), done.stdout + done.stderr
     [call] = _stub_calls(box)
     assert _wait_minutes(call) < 0.04, call["argv"]
-    assert re.search(r" wait=0\.0\d+m ", done.stdout), done.stdout
+    # A loaded host can spend the remaining second before the sample, so a correct figure is 0m as well as 0.0Nm (Dot I1, 8793a97).
+    assert re.search(r" wait=(?:0|0\.0\d+)m ", done.stdout), done.stdout
+
+
+@pytest.mark.parametrize("deadline_expr", ["[DateTime]::UtcNow.AddSeconds(2)", "[DateTime]::UtcNow.AddMinutes(-5)"])
+def test_a_deadline_that_has_passed_by_the_launch_gets_exactly_a_zero_wait(box, deadline_expr) -> None:
+    # Dot I1 (8793a97): the deterministic form of the slow-diagnostic test. The held-slot probe takes 3 s, so a deadline 2 s out has
+    # passed whatever the host speed, and the wait handed to heavy-slot must be exactly 0m. A wait computed BEFORE the probe (the
+    # stale sample the test above exists to catch) is still positive for the 2 s deadline and fails here; the -5 min deadline is the
+    # driver's deadline already in the past, which every ordering reads as 0m.
+    done = _stage_attempt(
+        box, deadline_expr,
+        opts_line="function Test-HeavySlotHeldCanonical { param($h) Start-Sleep -Seconds 3; return '' }\n",
+        extra={"HEAVY_SLOT_HELD": "stub-1:1"},
+    )
+    assert done.returncode in (0, 3), done.stdout + done.stderr
+    [call] = _stub_calls(box)
+    assert call["argv"][call["argv"].index("--wait") + 1] == "0m", call["argv"]
+    assert re.search(r" wait=0m source=deadline ", done.stdout), done.stdout
 
 
 def test_a_blank_deadline_option_changes_nothing(box) -> None:
