@@ -834,3 +834,118 @@ TEST(PlaybackSourceAdvanceTracker, R21DropFrameTickReportsTheWidthItSubtracted)
     ASSERT_EQ(12 - 5, offset.wrapWidth);
     ASSERT_EQ(5, static_cast<int>(offset.position));
 }
+
+// HFR-NATIVE-60FPS-FULLRES-1 r29 (adversary A1 on cf403dba, A2 on 4201a437): the conform tracker is credited at a surface's PAINT,
+// never at the hand-off. The adversary's sequence: 100 painted, 101 handed over with its paint deferred, the gate's 100 ms paint
+// wait expires, 102 is handed over before 101 paints, and the surface paints 102. A hand-off credit read 100, 101, 102 and
+// max_jump=1; the screen showed 100 then 102.
+TEST(PlaybackSourceAdvanceTracker, R29A1AFrameReplacedBeforeItsPaintIsNeverCredited)
+{
+    PlaybackSourceAdvanceTracker t;
+    PlaybackPaintCreditLedger ledger;
+    ledger.noteSubmitted(11, 100, 0, 0, t);
+    ledger.notePainted(11, 1.000, t);
+    ledger.noteSubmitted(12, 101, 0, 0, t);     // paint deferred past the gate's wait
+    ASSERT_TRUE(ledger.waiting());
+    ledger.noteSubmitted(13, 102, 0, 0, t);     // replaces 101 on the surface before 101 painted
+    ledger.notePainted(13, 1.104, t);
+    ASSERT_EQ(2u, t.presented());
+    ASSERT_EQ(2, t.maxJump());                  // 100 -> 102: the skipped frame is visible
+    ASSERT_EQ(2, t.advancedFrames());
+    ASSERT_EQ(1u, ledger.superseded());
+    ASSERT_EQ(2u, ledger.credited());
+    ASSERT_EQ(3u, ledger.submitted());
+    ASSERT_FALSE(ledger.waiting());
+    ASSERT_EQ(100, t.firstFrame());
+    ASSERT_EQ(102, t.lastFrame());
+}
+
+// A frame credited at its paint, at the paint's time (the span ends at the last paint, not the last hand-off); a frame still
+// waiting is not credited.
+TEST(PlaybackSourceAdvanceTracker, R29A1EveryFramePaintedIsCreditedAtItsPaintTime)
+{
+    PlaybackSourceAdvanceTracker t;
+    PlaybackPaintCreditLedger ledger;
+    for (int i = 0; i <= 24; ++i) {
+        ledger.noteSubmitted(static_cast<uint64_t>(100 + i), i, 0, 0, t);
+        ASSERT_EQ(static_cast<uint64_t>(i), t.presented());   // handed over, not painted: not credited
+        ledger.notePainted(static_cast<uint64_t>(100 + i), i / 24.0 + 0.005, t);
+    }
+    ASSERT_EQ(25u, t.presented());
+    ASSERT_EQ(1, t.maxJump());
+    ASSERT_NEAR(1.0, t.spanSeconds(), 1e-9);
+    ASSERT_EQ(0u, ledger.superseded());
+    ledger.noteSubmitted(200, 25, 0, 0, t);
+    ASSERT_EQ(25u, t.presented());
+    ASSERT_EQ(24, t.lastFrame());
+    ASSERT_TRUE(ledger.waiting());
+}
+
+// A paint inside the present lands before finishPresentedFrame records the hand-off: the newest painted serial is kept and the
+// hand-off is credited at once, at the paint's time. A newer serial painted while an older one waits supersedes the older.
+TEST(PlaybackSourceAdvanceTracker, R29A1APaintBeforeItsHandOffIsRecordedStillCredits)
+{
+    PlaybackSourceAdvanceTracker t;
+    PlaybackPaintCreditLedger ledger;
+    ledger.noteSubmitted(5, 40, 0, 0, t);
+    ledger.notePainted(5, 2.000, t);
+    ledger.noteSubmitted(6, 41, 0, 0, t);       // waits
+    ledger.notePainted(7, 2.050, t);            // 42 painted synchronously, before its hand-off is recorded
+    ASSERT_EQ(1u, ledger.superseded());         // 41 never reached the screen
+    ledger.noteSubmitted(7, 42, 0, 0, t);
+    ASSERT_EQ(2u, t.presented());
+    ASSERT_EQ(2, t.maxJump());
+    ASSERT_NEAR(0.050, t.spanSeconds(), 1e-9);
+    ASSERT_FALSE(ledger.waiting());
+    // a stale, older serial (another surface repainting what it last drew) changes nothing
+    ledger.noteSubmitted(8, 43, 0, 0, t);
+    ledger.notePainted(5, 2.060, t);
+    ASSERT_TRUE(ledger.waiting());
+    ASSERT_EQ(2u, t.presented());
+    ledger.notePainted(8, 2.070, t);
+    ledger.notePainted(8, 2.080, t);            // a repaint of the same serial credits nothing twice
+    ASSERT_EQ(3u, t.presented());
+}
+
+// The loop wraps a superseded frame carried were crossed all the same: they pass to the next credited frame. A submission with no
+// serial can never be matched to a paint and is never credited (fail closed).
+TEST(PlaybackSourceAdvanceTracker, R29A1SupersededWrapsCarryAndUnverifiedSubmissionsNeverCredit)
+{
+    PlaybackSourceAdvanceTracker t;
+    PlaybackPaintCreditLedger ledger;
+    ledger.noteSubmitted(1, 6, 0, 0, t);
+    ledger.notePainted(1, 0.0, t);
+    ledger.noteSubmitted(2, 7, 0, 0, t);
+    ledger.notePainted(2, 0.1, t);
+    ledger.noteSubmitted(3, 0, 1, 8, t);        // the wrap's landing, replaced before its paint
+    ledger.noteSubmitted(4, 1, 0, 0, t);
+    ledger.notePainted(4, 0.2, t);
+    ASSERT_EQ(1u, t.wraps());
+    ASSERT_EQ(1 + 2, t.advancedFrames());       // 6 -> 7, then 7 -> (wrap, cut 0..7) -> 1 = 1 + 8 - 7 = 2
+    ASSERT_EQ(1, t.maxJump());
+    PlaybackSourceAdvanceTracker u;
+    PlaybackPaintCreditLedger unverified;
+    unverified.noteSubmitted(0, 10, 0, 0, u);
+    unverified.notePainted(0, 1.0, u);
+    ASSERT_EQ(0u, u.presented());
+    ASSERT_EQ(1u, unverified.unverified());
+    ASSERT_FALSE(unverified.waiting());
+}
+
+// The surfaces report through one sink; without one, a paint report is a no-op.
+namespace {
+struct R29SinkProbe { uint64_t last = 0; int calls = 0; };
+void r29Sink(void *context, uint64_t serial) { auto *p = static_cast<R29SinkProbe *>(context); p->last = serial; ++p->calls; }
+}
+TEST(PlaybackSourceAdvanceTracker, R29A1PaintCreditSinkRoutesEverySurfaceReport)
+{
+    R29SinkProbe probe;
+    playback_paint_credit::notePainted(9);       // no sink installed: nothing
+    playback_paint_credit::setSink(&r29Sink, &probe);
+    playback_paint_credit::notePainted(0);       // no serial: nothing
+    playback_paint_credit::notePainted(42);
+    playback_paint_credit::setSink(nullptr, nullptr);
+    playback_paint_credit::notePainted(43);
+    ASSERT_EQ(1, probe.calls);
+    ASSERT_EQ(42u, probe.last);
+}

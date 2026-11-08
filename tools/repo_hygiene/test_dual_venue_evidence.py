@@ -12596,11 +12596,17 @@ class ConformMeasuredFieldsAreJudgedTests(unittest.TestCase):
     CLIP = "M16-1457"
     SPECS = tuple(f"legs/m16-{clip}-conform-{mode}-s1.json" for clip in ("1456", "1457") for mode in ("windowed", "fullscreen"))
 
-    def chain(self, measured: str, coverage: str | None = "1498") -> list[dict]:
+    def chain(self, measured: str, coverage: str | None = "1498", ends: bool = True) -> list[dict]:
         # r28 fix iteration 2 (adversary A4 on 4201a437): the app prints source_advanced (the presented coverage) on every conform line, and a line
         # without it now fails closed; a measured line that does not name it carries the in-step coverage unless `coverage` is None.
         if measured and coverage is not None and "source_advanced=" not in measured:
             measured += f" source_advanced={coverage}"
+        # r29 (adversary A2 on cf403dba): the app prints the painted coverage's ends and the engine's last target on every conform line. A measured
+        # line that does not name them carries the ends of a run painted from frame 0 over its coverage, with the engine at 1498 (the summary's
+        # source_advanced=1499 from source_start_frame=0). `ends=False` sends the line exactly as given.
+        if measured and ends and "engine_target=" not in measured:
+            m = re.search(r"source_advanced=(\d+)", measured)
+            measured += f" first_frame=0 last_frame={m.group(1) if m else '1498'} engine_target=1498"
         log = "\n".join([
             "interaction_trace event=automation.pacing_isolated site=gui-smoke-entry persisted_fps_override=0 persisted_frame_rate=24.000 drop_frame=1 settings_store=run_scoped",
             "playback_smoke.measured_session id=3",
@@ -12688,6 +12694,30 @@ class ConformMeasuredFieldsAreJudgedTests(unittest.TestCase):
                     self.assertFalse(row["pass"], row)
                     self.assertEqual(len(row["failures"]), 1, row)
                     self.assertIn("no readable source_advanced", row["failures"][0], row)
+
+    def test_r29_a2_a_frozen_tail_inside_the_old_tolerance_fails_every_conform_spec(self) -> None:
+        """HFR-NATIVE-60FPS-FULLRES-1 r29 (adversary A2 on cf403dba), its literal input: presented=1491, conform source_advanced=1490, span_s=62.083,
+        source_fps=24.000, max_jump=1 against the summary's source_advanced=1499. The engine reached 1498 while the painted frames stopped at 1490: 8 frames
+        past the one target the engine may hold were never shown, and r28's tolerance of 10 (which counted the carried debt, never in the engine's count)
+        passed it, and a shortfall of 10 too. The allowance is now exact: 1 for the start frame source_advanced counts, 1 for the held target."""
+        for name, coverage in (("adversary literal, short 9", "1490"), ("short 10", "1489"), ("short 3", "1496")):
+            for row in self.chain(f" audio_sync_requests=0 presented={int(coverage) + 1} source_advanced={coverage} span_s=62.083 source_fps=24.000 max_jump=1"):
+                with self.subTest(case=name, spec=row["spec"], role=row["role"]):
+                    self.assertFalse(row["pass"], row)
+                    self.assertEqual([f.split(" ")[0].rstrip(":") for f in row["failures"]], ["conformMaxJump"], row)
+        # the two shortfalls a fully shown run has: in step (engine at the last painted frame) and one target held unpainted
+        for name, coverage in (("in step", "1498"), ("one target held", "1497")):
+            for row in self.chain(f" audio_sync_requests=0 presented={int(coverage) + 1} source_advanced={coverage} source_fps=24.000 max_jump=1"):
+                with self.subTest(case=name, spec=row["spec"], role=row["role"]):
+                    self.assertTrue(row["pass"], row)
+        # the ends are required: absent, unreadable or negative is a missing number, never a passing one
+        for name, ends in (("no engine_target", " first_frame=0 last_frame=1498"), ("garbage engine_target", " first_frame=0 last_frame=1498 engine_target=x"),
+                           ("negative last_frame", " first_frame=0 last_frame=-1 engine_target=1498"), ("no ends at all", "")):
+            for row in self.chain(" audio_sync_requests=0 source_advanced=1498 source_fps=24.000 max_jump=1" + ends, ends=False):
+                with self.subTest(case=name, spec=row["spec"], role=row["role"]):
+                    self.assertFalse(row["pass"], row)
+                    self.assertEqual(len(row["failures"]), 1, row)
+                    self.assertIn("no readable non-negative", row["failures"][0], row)
 
     def test_a_conform_line_without_the_measured_fields_fails_closed(self) -> None:
         """A build that does not print them (or a line that dropped them) is a missing number, never a passing one: each criterion fails with the typed reason."""

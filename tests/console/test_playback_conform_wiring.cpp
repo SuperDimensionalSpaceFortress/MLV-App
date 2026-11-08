@@ -809,12 +809,63 @@ TEST(PlaybackConformWiring, ConformTelemetryLineCarriesTheAcceptanceInputs)
     const QString source = mainWindowSource();
     const int at = source.indexOf(QStringLiteral("playback_smoke.conform session=%1"));
     ASSERT_TRUE(at >= 0);
-    const QString line = source.mid(at, 1600);
+    const QString line = source.mid(at, 4000);   // r29: the format string and its .arg list (the ends and the paint counts at its end)
     for (const char * field : { "clip_fps=", "playback_fps=", "conform_active=", "export_fps_override=",
                                 "audio_sync_requests=", "source_fps=", "max_jump=", "wraps=",
                                 "effective_auto_target_fps=" }) {
         ASSERT_TRUE(line.contains(QString::fromLatin1(field)));
     }
-    ASSERT_TRUE(source.contains(QStringLiteral("m_playbackSmokeSourceAdvance.notePresented(")));
     ASSERT_TRUE(source.contains(QStringLiteral("m_playbackSmokeSourceAdvance.reset();")));
+    // r29 (adversary A2 on cf403dba): the painted coverage's ends and the engine's last target, for the venue judge's exact allowance;
+    // the paint ledger's counts and the paint-wait escapes beside them
+    for (const char * field : { "first_frame=", "last_frame=", "engine_target=", "carried_debt=", "paint_submitted=",
+                                "paint_superseded=", "paint_unverified=", "paint_waiting=", "paint_wait_escapes=" }) {
+        ASSERT_TRUE(line.contains(QString::fromLatin1(field)));
+    }
+    ASSERT_TRUE(line.contains(QStringLiteral(".arg( static_cast<qlonglong>( m_sourceAdvance.armed ? m_sourceAdvance.highWater : -1 ) )")));
+}
+
+// HFR-NATIVE-60FPS-FULLRES-1 r29 (adversary A1 on cf403dba, A2 on 4201a437): the conform tracker is credited at PAINT. The hand-off
+// (notePlaybackSmokePresentedFrame) only records the frame in the ledger; each display surface reports the serial it just painted
+// through playback_paint_credit, and MainWindow's sink credits the tracker. The gate's paint wait stays an escape that never credits.
+TEST(PlaybackConformWiring, R29ConformTrackerIsCreditedAtPaintNeverAtHandOff)
+{
+    const QString source = mainWindowSource();
+    const QString hand = functionBody(source,
+        QStringLiteral("void MainWindow::notePlaybackSmokePresentedFrame("),
+        QStringLiteral("void MainWindow::finishPlaybackSmokeTelemetry("));
+    ASSERT_FALSE(hand.isEmpty());
+    ASSERT_FALSE(hand.contains(QStringLiteral("m_playbackSmokeSourceAdvance.notePresented(")));
+    ASSERT_TRUE(hand.contains(QStringLiteral("m_playbackSmokePaintCredit.noteSubmitted( static_cast<uint64_t>( readyFrame.requestSerial ),")));
+    ASSERT_EQ(0, countOccurrences(source, QStringLiteral("m_playbackSmokeSourceAdvance.notePresented(")));
+    ASSERT_EQ(1, countOccurrences(source, QStringLiteral(
+        "    m_playbackSmokePaintCredit.notePainted( serial, mlv_stage_timing_now(), m_playbackSmokeSourceAdvance );")));
+    ASSERT_EQ(1, countOccurrences(source, QStringLiteral(
+        "    playback_paint_credit::setSink( &MainWindow::playbackPaintCreditSink, this );")));
+    ASSERT_EQ(1, countOccurrences(source, QStringLiteral("    playback_paint_credit::setSink( nullptr, nullptr );")));
+    ASSERT_TRUE(source.contains(QStringLiteral("    m_playbackSmokeSourceAdvance.reset();\n    m_playbackSmokePaintCredit.reset();")));
+    // each surface reports right after it promotes the serial it drew
+    const QString windowSrc = readRepoFile(QStringLiteral("platform/qt/GpuDisplayWindow.cpp"));
+    const int promote = windowSrc.indexOf(QStringLiteral("    m_presentedSerialValid = m_pendingPresentationSerialValid;\n"));
+    ASSERT_TRUE(promote > 0);
+    ASSERT_TRUE(windowSrc.indexOf(QStringLiteral("    if ( m_presentedSerialValid ) playback_paint_credit::notePainted( m_presentedSerial );"), promote) > promote);
+    ASSERT_EQ(1, countOccurrences(windowSrc, QStringLiteral("playback_paint_credit::notePainted(")));
+    const QString viewportSrc = readRepoFile(QStringLiteral("platform/qt/GpuDisplayViewport.cpp"));
+    ASSERT_TRUE(viewportSrc.contains(QStringLiteral(
+        "    m_paintedSerialValid = m_paintedSerial != 0;\n"
+        "    // HFR-NATIVE-60FPS-FULLRES-1 r29 (adversary A1 on cf403dba): this paint drew that serial; the conform tracker credits it now\n"
+        "    if ( m_paintedSerialValid ) playback_paint_credit::notePainted( m_paintedSerial );")));
+    ASSERT_EQ(1, countOccurrences(viewportSrc, QStringLiteral("playback_paint_credit::notePainted(")));
+    const QString zoomView = readRepoFile(QStringLiteral("platform/qt/GraphicsZoomView.cpp"));
+    ASSERT_TRUE(zoomView.contains(QStringLiteral(
+        "    m_pixmapPaintedSerial = m_pixmapPendingSerial;   // r28: the pixmap handed over before this paint is on screen now\n"
+        "    playback_paint_credit::notePainted( m_pixmapPaintedSerial );")));
+    // the paint wait is an escape, counted once per frame, and never a credit
+    const int paint = source.indexOf(QStringLiteral("bool MainWindow::conformDisplayedFramePaintPending()"));
+    ASSERT_TRUE(paint > 0);
+    const QString paintBody = source.mid(paint, source.indexOf(QStringLiteral("\n}\n"), paint) - paint);
+    ASSERT_TRUE(paintBody.contains(QStringLiteral("if( submittedUnpainted && !pending && m_conformPaintWaitEscapedSerial != m_lastDisplayedPlaybackSerial )")));
+    ASSERT_TRUE(paintBody.contains(QStringLiteral("if( m_playbackSmokeActive ) ++m_playbackSmokeConformPaintWaitEscapes;")));
+    ASSERT_FALSE(paintBody.contains(QStringLiteral("m_playbackSmokeSourceAdvance")));
+    ASSERT_FALSE(paintBody.contains(QStringLiteral("m_playbackSmokePaintCredit")));
 }
