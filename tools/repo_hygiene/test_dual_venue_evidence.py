@@ -5076,13 +5076,15 @@ class DisplayModeIsRequestedAndObservedTests(EvidenceFactory, ModuleMutationMixi
     _UNSET = object()   # r2 (Dot bd11a92): None is a value the fixtures must be able to inject (a JSON null), so "not given" is its own sentinel
 
     def look_claim(self, case: str, forced: bool = True, log_state: str | None = "look_assist_enabled=1 look_assist_flavor=cinematic", summary_flavor: str = "cinematic",
-                   reported="cinematic", claim_flavor: str = "cinematic", forced_value=_UNSET, claim_on=_UNSET):
+                   reported="cinematic", claim_flavor: str = "cinematic", forced_value=_UNSET, claim_on=_UNSET, inert_look: bool = False):
         """`forced_value` replaces summary.json's lookAssistForced as given (None = a real JSON null); `claim_on` replaces the receipt's lookAssistOn
-        (default True; `self.ABSENT` drops the key)."""
+        (default True; `self.ABSENT` drops the key); `inert_look` adds a `look` object to a SPEED spec (the runner forwards no forcing option for it)."""
         spec = self.write_spec()
         body = json.loads(spec.read_text(encoding="utf-8"))
         if forced:
             body["generatorArgs"] = {"forceLookAssist": True, "lookFlavor": "cinematic"}
+        if inert_look:
+            body["look"] = {"contactSheetFrames": 1, "lookFlavor": "cinematic"}
         spec.write_text(json.dumps(body), encoding="utf-8")
         repo = self.prod_repo(spec=spec)
         ev = self.evidence("lc-" + case, backend="cuda", look_assist_state=log_state,
@@ -5175,6 +5177,14 @@ class DisplayModeIsRequestedAndObservedTests(EvidenceFactory, ModuleMutationMixi
             "summary-says-unknown": dict(log_state="look_assist_enabled=1 look_assist_flavor=unknown", summary_flavor="unknown", reported="unknown", claim_flavor="unknown"),
             "outside-the-apps-set": dict(log_state="look_assist_enabled=1 look_assist_flavor=sepia", summary_flavor="sepia", reported="sepia", claim_flavor="sepia"),
             "wrong-case": dict(log_state="look_assist_enabled=1 look_assist_flavor=Cinematic", summary_flavor="Cinematic", reported="Cinematic", claim_flavor="Cinematic"),
+            # pass 4 A1: an EMPTY duplicate flavor token is still a token (`\S+` skipped it, so the uniqueness test saw one flavor)
+            "empty-duplicate-flavor-token-after": dict(log_state="look_assist_enabled=1 look_assist_flavor=cinematic look_assist_flavor="),
+            "empty-duplicate-flavor-token-before": dict(log_state="look_assist_enabled=1 look_assist_flavor= look_assist_flavor=cinematic"),
+            # pass 4 A2: contradictory enabled tokens in the record that answers for it are no unambiguous `on`
+            "enabled-1-then-0-in-one-record": dict(log_state="look_assist_enabled=1 look_assist_enabled=0 look_assist_flavor=cinematic"),
+            "enabled-0-then-1-in-one-record": dict(log_state="look_assist_enabled=0 look_assist_enabled=1 look_assist_flavor=cinematic"),
+            # pass 4 A3: the spec only ASKS for the look as a look leg or with generatorArgs.forceLookAssist; an inert `look` object on a speed spec forwards nothing
+            "inert-look-object-on-a-speed-spec": dict(forced=False, forced_value=True, inert_look=True),
         }
         for case, opts in cases.items():
             with self.subTest(case=case):
@@ -9719,6 +9729,10 @@ class VisualCaptureRunnerTests(RunnerHarness, unittest.TestCase):
                  # r2 adversary pass 3 A2: `none` (what the app prints when it applied no flavor) and `unknown` are no applied flavor, even when the summary echoes them
                  ("app applied no flavor (none)", dict(self.NATIVE_LOOK_SUMMARY, lookFlavor="none", lookFlavorReported="none"), "look_assist_enabled=1 look_assist_flavor=none"),
                  ("flavor unknown", dict(self.NATIVE_LOOK_SUMMARY, lookFlavor="unknown", lookFlavorReported="unknown"), "look_assist_enabled=1 look_assist_flavor=unknown"),
+                 # pass 4 A1 / A2: an empty duplicate flavor token is still a token; contradictory enabled tokens in the answering record are no unambiguous `on`
+                 ("empty duplicate flavor token", dict(self.NATIVE_LOOK_SUMMARY), "look_assist_enabled=1 look_assist_flavor=cinematic look_assist_flavor="),
+                 ("enabled 1 then 0 in one record", dict(self.NATIVE_LOOK_SUMMARY), "look_assist_enabled=1 look_assist_enabled=0 look_assist_flavor=cinematic"),
+                 ("enabled 0 then 1 in one record", dict(self.NATIVE_LOOK_SUMMARY), "look_assist_enabled=0 look_assist_enabled=1 look_assist_flavor=cinematic"),
                  ("two records, the last differs", dict(self.NATIVE_LOOK_SUMMARY),
                   "look_assist_enabled=1 look_assist_flavor=cinematic\ninteraction_trace event=gui_smoke.visual_state look_assist_enabled=1 look_assist_flavor=classic"),
                  ("two records, the first differs", dict(self.NATIVE_LOOK_SUMMARY),
@@ -9735,6 +9749,16 @@ class VisualCaptureRunnerTests(RunnerHarness, unittest.TestCase):
         receipt = self.run_native_look(dict(self.NATIVE_LOOK_SUMMARY), look_assist_state=state)
         self.assertIs(receipt["lookAssistOn"], True, receipt["outcomeDetail"])
         self.assertEqual(receipt["lookAssistFlavor"], "cinematic")
+
+    def test_an_inert_look_object_on_a_speed_spec_does_not_ask_for_the_look(self) -> None:
+        # r2 adversary pass 4 A3: Invoke-VenueLeg forwards a look only for legType look or generatorArgs.forceLookAssist; a `look` object on a SPEED spec forwards nothing,
+        # so a summary that says forced and a log that says enabled=1 are not the LEG's request being honoured. (The pre-existing gate predicate is left as it was.)
+        spec = self.speed_spec(generatorArgs={}, look={"contactSheetFrames": 1, "lookFlavor": "cinematic"})
+        self.write_artifacts(summary=dict(self.NATIVE_LOOK_SUMMARY), look_assist_state="look_assist_enabled=1 look_assist_flavor=cinematic")
+        write_visual_captures(self.artifacts / "visual", "ok")
+        receipt = self.run_leg("ultra-magnus", spec, extra=["-Backend", "cpu"])[1]
+        self.assertIs(receipt["lookAssistOn"], False, receipt["outcomeDetail"])
+        self.assertIsNone(receipt["lookAssistFlavor"])
 
     def test_a_leg_that_did_not_ask_for_the_look_stays_off_even_when_the_app_says_enabled(self) -> None:
         # r2 (Dot 251ade27 / bd11a92): the shipped default has Look Assist ON (ReceiptSettings.cpp:113), so the app log says look_assist_enabled=1 for a leg that never asked

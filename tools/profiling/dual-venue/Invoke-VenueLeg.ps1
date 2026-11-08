@@ -1000,7 +1000,7 @@ $laSummaryForced = ($null -ne $summary -and $null -ne $summary.PSObject.Properti
 $laRequestedFlavor = $(if ($null -ne $summary -and $null -ne $summary.PSObject.Properties['lookFlavor'] -and $summary.lookFlavor -is [string]) { [string]$summary.lookFlavor } else { '' })
 $laReportedFlavor = $(if ($null -ne $summary -and $null -ne $summary.PSObject.Properties['lookFlavorReported'] -and $summary.lookFlavorReported -is [string]) { [string]$summary.lookFlavorReported } else { '' })
 $laLogFlavor = [string]$lookAssistVerdict.flavor
-if ($lookAssistVerdict.requested -and ($lookAssistVerdict.verdict -ceq 'HONOURED') -and $laSummaryForced -and $laRequestedFlavor.Length -gt 0 -and ($laReportedFlavor -ceq $laRequestedFlavor) -and ($laLogFlavor -ceq $laRequestedFlavor)) {
+if ($lookAssistVerdict.asked -and ($lookAssistVerdict.verdict -ceq 'HONOURED') -and $laSummaryForced -and $laRequestedFlavor.Length -gt 0 -and ($laReportedFlavor -ceq $laRequestedFlavor) -and ($laLogFlavor -ceq $laRequestedFlavor)) {
     $receipt['lookAssistOn'] = $true
     $receipt['lookAssistFlavor'] = $laLogFlavor
 }
