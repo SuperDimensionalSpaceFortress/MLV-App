@@ -463,5 +463,11 @@ PlaybackPrepCpuRouteResult playbackPrepCpuRouteRun(PlaybackPrepCpuWorkspace & wo
         gpuPreviewProcessingApplyCpuReferenceTo8(config, input16, scratch,
                                                  out8->data(), width, height, &result.spans);
     }
+    else
+    {
+        /* r3 (adversary A3 on e7e5271e): no input develops nothing; a recycled out8
+         * must read as the zeroed buffer a fresh one was, never as a stale frame. */
+        std::fill(out8->begin(), out8->end(), static_cast<uint8_t>(0));
+    }
     return result;
 }

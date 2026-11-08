@@ -738,6 +738,104 @@ TEST(GuiOtherBusySplit, NanPaintReadingOrBudgetNeverReachesASessionSum)
     for (int i = 0; i < gui_present_gap::OtherBusySpans::kCount; ++i)
         ASSERT_TRUE(std::isfinite(spans.sumMs[i]) && spans.sumMs[i] >= 0.0);
     ASSERT_TRUE(std::isfinite(spans.unattributedSumMs) && spans.unattributedSumMs >= 0.0);
+    // Adversary A4 on e7e5271e: paintMs = -Infinity made the span +Infinity, closeGap(1.0) scaled it by
+    // 1/Infinity = 0 and Infinity * 0 wrote NaN into sumMs.
+    spans.openGap();
+    gui_present_gap::SpanClock infStart;
+    infStart.gapSerial = 9;
+    gui_present_gap::SpanClock infStop = infStart;
+    infStop.nowNs = 1000000;
+    infStop.paintMs = -std::numeric_limits<double>::infinity();
+    spans.begin(infStart);
+    const double infCharged = spans.end(gui_present_gap::OtherBusySpan::DrawFrame, infStop);
+    ASSERT_TRUE(std::isfinite(infCharged));
+    const double rest3 = spans.closeGap(1.0);
+    ASSERT_TRUE(std::isfinite(rest3) && rest3 >= 0.0);
+    for (int i = 0; i < gui_present_gap::OtherBusySpans::kCount; ++i)
+        ASSERT_TRUE(std::isfinite(spans.sumMs[i]) && spans.sumMs[i] >= 0.0);
+    ASSERT_TRUE(std::isfinite(spans.closeGap(std::numeric_limits<double>::infinity())));
+    for (int i = 0; i < gui_present_gap::OtherBusySpans::kCount; ++i)
+        ASSERT_TRUE(std::isfinite(spans.sumMs[i]));
+}
+
+namespace
+{
+// The innermost { ... } block of `body` that contains offset `at` (empty when unbalanced).
+QString enclosingBlock(const QString & body, int at)
+{
+    int depth = 0;
+    int open = -1;
+    for (int i = at; i >= 0; --i)
+    {
+        if (body.at(i) == QLatin1Char('}')) ++depth;
+        else if (body.at(i) == QLatin1Char('{') && depth-- == 0) { open = i; break; }
+    }
+    if (open < 0) return QString();
+    depth = 0;
+    for (int i = open; i < body.length(); ++i)
+    {
+        if (body.at(i) == QLatin1Char('{')) ++depth;
+        else if (body.at(i) == QLatin1Char('}') && --depth == 0) return body.mid(open, i - open + 1);
+    }
+    return QString();
+}
+}
+
+// CPU-S1-PACE-NEXT-LEVER-1 r3, adversary A1 on e7e5271e (major): only a PRESENTED result gave its 8-bit
+// buffer back to m_playbackPrepRgb8Pool; a result the worker replaced (two finished before the GUI picked
+// one up), dropped on a generation change or at stop, or the GUI dropped, freed it, so the replace-before-
+// present pattern still allocated 12.3 MB per pair. Pinned: every place a computed result is dropped
+// (its request serial released or collected for release) gives that same result's buffer back in the
+// same block.
+TEST(PlaybackPrepRgb8Pool, EveryDroppedOrPresentedResultGivesItsBufferBack)
+{
+    const QString source = mainWindowSource();
+    struct Fn { const char * signature; int minDrops; };
+    const Fn fns[] = {
+        { "void MainWindow::playbackPrepThreadLoop( void )", 3 },   // generation drop, stop, replaced-after-compute
+        { "void MainWindow::onPlaybackPrepResultReady( void )", 1 },   // GUI generation drop
+        { "void MainWindow::invalidatePlaybackPrepForDisplayChange( const char *reason )", 1 },   // queued results
+    };
+    const QRegularExpression drop(QStringLiteral(
+        "(?:releasePresentedFrameForRequestSerial\\(\\s*|serialsToRelease\\.push_back\\(\\s*)(result|staleResult)\\.task\\.requestSerial"));
+    for (const Fn & fn : fns)
+    {
+        const QString body = bracedBlockAfter(source, QString::fromLatin1(fn.signature));
+        if (body.isEmpty()) ::minitest::fail(__FILE__, __LINE__, "function body found", fn.signature);
+        int drops = 0;
+        auto it = drop.globalMatch(body);
+        while (it.hasNext())
+        {
+            const QRegularExpressionMatch m = it.next();
+            ++drops;
+            const QString block = enclosingBlock(body, static_cast<int>(m.capturedStart()));
+            const QString give = QStringLiteral("m_playbackPrepRgb8Pool.give( std::move( %1.scopeSourceImage ) )").arg(m.captured(1));
+            if (!block.contains(give))
+                ::minitest::fail(__FILE__, __LINE__, "dropped result gives its buffer back in the same block",
+                                 std::string(fn.signature) + " at: " + body.mid(m.capturedStart(), 90).toStdString());
+        }
+        if (drops < fn.minDrops)
+            ::minitest::fail(__FILE__, __LINE__, "drop sites found", std::string(fn.signature) + " drops=" + std::to_string(drops));
+    }
+    // The presented result, after the present.
+    const QString ready = prepResultReadyBody();
+    const int present = ready.indexOf(QStringLiteral("presentPlaybackPreparedFrame( result );"));
+    ASSERT_TRUE(present >= 0);
+    ASSERT_TRUE(ready.indexOf(QStringLiteral("m_playbackPrepRgb8Pool.give( std::move( result.scopeSourceImage ) );"), present) > present);
+}
+
+// Adversary A2 on e7e5271e (minor): the pool was cleared only on clip open, so buffers survived stop,
+// delete-clip and rename-clip. Pinned: play-stop and every clip unload (freeActiveMlvObjectAfterLifecycleBarrier)
+// clear it.
+TEST(PlaybackPrepRgb8Pool, StopAndClipUnloadClearThePool)
+{
+    const QString source = mainWindowSource();
+    const QString unload = bracedBlockAfter(source, QStringLiteral("bool MainWindow::freeActiveMlvObjectAfterLifecycleBarrier( const char *reason )"));
+    ASSERT_FALSE(unload.isEmpty());
+    ASSERT_TRUE(unload.contains(QStringLiteral("m_playbackPrepRgb8Pool.clear();")));
+    const QString toggled = bracedBlockAfter(source, QStringLiteral("void MainWindow::on_actionPlay_toggled(bool checked)"));
+    ASSERT_FALSE(toggled.isEmpty());
+    ASSERT_TRUE(toggled.contains(QStringLiteral("if( !checked ) m_playbackPrepRgb8Pool.clear();")));
 }
 
 TEST(GuiOtherBusySplit, HandlersOpenTheirSpanFirstAndTheSummaryAppendsTheSplit)

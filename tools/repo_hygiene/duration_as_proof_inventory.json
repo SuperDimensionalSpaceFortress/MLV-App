@@ -2806,22 +2806,22 @@
     },
     {
       "path": "platform/qt/GuiPresentGapIdle.h",
-      "anchor": "if ( ! ( inclusiveMs > 0.0 ) ) inclusiveMs = 0.0 ;",
+      "anchor": "if ( ! ( inclusiveMs > 0.0 ) || ! std :: isfinite ( inclusiveMs ) ) inclusiveMs = 0.0 ;",
       "class": "value_fallback_select",
       "clock": "other",
-      "justification": "CPU-S1-RECON-UNDER-LOOK-PACE-LEVER-1 Part B: OtherBusySpans::end clamps a GUI handler span's inclusive time (wall less idle, runner sleep and paint inside it, from the QElapsedTimer gap clock) to 0 when the subtraction goes negative. A data-validity clamp on an already-measured value before it is recorded; whether the handler ran is the span's begin/end pair, never this value. r3 (adversary A1 on f9f92e09): written !(x > 0.0) so a NaN (a non-finite paint reading or budget) clamps to 0 as well; still a data-validity clamp, not a proof that any stage ran.",
+      "justification": "CPU-S1-RECON-UNDER-LOOK-PACE-LEVER-1 Part B: OtherBusySpans::end clamps a GUI handler span's inclusive time (wall less idle, runner sleep and paint inside it, from the QElapsedTimer gap clock) to 0 when the subtraction goes negative. A data-validity clamp on an already-measured value before it is recorded; whether the handler ran is the span's begin/end pair, never this value. r3 (adversary A1 on f9f92e09): written !(x > 0.0) || !isfinite(x) (and A4 on e7e5271e) so a NaN or infinite paint reading or budget clamps to 0 as well; still a data-validity clamp, not a proof that any stage ran.",
       "lines": [
-        136
+        138
       ]
     },
     {
       "path": "platform/qt/GuiPresentGapIdle.h",
-      "anchor": "if ( ! ( exclusiveMs > 0.0 ) ) exclusiveMs = 0.0 ;",
+      "anchor": "if ( ! ( exclusiveMs > 0.0 ) || ! std :: isfinite ( exclusiveMs ) ) exclusiveMs = 0.0 ;",
       "class": "value_fallback_select",
       "clock": "other",
-      "justification": "CPU-S1-RECON-UNDER-LOOK-PACE-LEVER-1 Part B: the same clamp for the span's exclusive time (inclusive less its nested spans) before it is added to the per-gap sum. A data-validity clamp, not a proof that any stage ran. r3 (adversary A1 on f9f92e09): written !(x > 0.0) so a NaN (a non-finite paint reading or budget) clamps to 0 as well; still a data-validity clamp, not a proof that any stage ran.",
+      "justification": "CPU-S1-RECON-UNDER-LOOK-PACE-LEVER-1 Part B: the same clamp for the span's exclusive time (inclusive less its nested spans) before it is added to the per-gap sum. A data-validity clamp, not a proof that any stage ran. r3 (adversary A1 on f9f92e09): written !(x > 0.0) || !isfinite(x) (and A4 on e7e5271e) so a NaN or infinite paint reading or budget clamps to 0 as well; still a data-validity clamp, not a proof that any stage ran.",
       "lines": [
-        139
+        141
       ]
     },
     {
@@ -2866,12 +2866,12 @@
     },
     {
       "path": "platform/qt/GuiPresentGapIdle.h",
-      "anchor": "if ( ! ( otherBusyMs > 0.0 ) ) otherBusyMs = 0.0 ;",
+      "anchor": "if ( ! ( otherBusyMs > 0.0 ) || ! std :: isfinite ( otherBusyMs ) ) otherBusyMs = 0.0 ;",
       "class": "value_fallback_select",
       "clock": "other",
-      "justification": "CPU-S1-PACE-NEXT-LEVER-1 (adversary A1 on 9bfdf8e0): OtherBusySpans::closeGap clamps a negative other-busy budget (an already-measured value from the gap clock) to 0 before it scales the named spans, so a negative budget can never subtract from a session sum. A data-validity clamp, not a proof that any stage ran. r3 (adversary A1 on f9f92e09): written !(x > 0.0) so a NaN (a non-finite paint reading or budget) clamps to 0 as well; still a data-validity clamp, not a proof that any stage ran.",
+      "justification": "CPU-S1-PACE-NEXT-LEVER-1 (adversary A1 on 9bfdf8e0): OtherBusySpans::closeGap clamps a negative other-busy budget (an already-measured value from the gap clock) to 0 before it scales the named spans, so a negative budget can never subtract from a session sum. A data-validity clamp, not a proof that any stage ran. r3 (adversary A1 on f9f92e09): written !(x > 0.0) || !isfinite(x) (and A4 on e7e5271e) so a NaN or infinite paint reading or budget clamps to 0 as well; still a data-validity clamp, not a proof that any stage ran.",
       "lines": [
-        157
+        159
       ]
     },
     {

@@ -700,6 +700,27 @@ TEST(PrepPointwiseFast, CpuRouteRecycledOut8IsByteIdenticalWhenPoisoned)
     }
 }
 
+/* Adversary A3 on e7e5271e: with no input the route develops nothing; a recycled out8 (stale bytes)
+ * must come back as the zeroed buffer a fresh vector was, never as the previous frame. */
+TEST(PrepPointwiseFast, CpuRouteNullInputZeroesARecycledOut8)
+{
+    MlvPipelineFixture offFixture;
+    openFixture(offFixture);
+    const GpuPreviewProcessingConfig config = buildConfig(offFixture, applyLookAssistOff);
+    PlaybackPrepCpuWorkspace workspace;
+    for (const auto & dims : { std::pair<int, int>{ 1, 1 }, std::pair<int, int>{ 64, 32 } })
+    {
+        std::vector<uint8_t> out8(static_cast<size_t>(dims.first) * dims.second * 3u, static_cast<uint8_t>(0xA5));
+        const PlaybackPrepCpuRouteResult route =
+            playbackPrepCpuRouteRun(workspace, config, 1, nullptr, dims.first, dims.second, PlaybackPrepReducedDecision(), &out8);
+        ASSERT_TRUE(!route.out8Allocated);
+        ASSERT_EQ(static_cast<size_t>(dims.first) * dims.second * 3u, out8.size());
+        if (!std::all_of(out8.begin(), out8.end(), [](uint8_t v) { return v == 0; }))
+            ::minitest::fail(__FILE__, __LINE__, "null input leaves a zeroed out8",
+                             std::to_string(dims.first) + "x" + std::to_string(dims.second));
+    }
+}
+
 /* The pool itself: bounded, largest-capacity first, empty buffers never held, clear() frees. */
 TEST(PrepPointwiseFast, Rgb8PoolIsBoundedAndHandsBackTheLargest)
 {

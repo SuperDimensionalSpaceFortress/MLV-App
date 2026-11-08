@@ -10,6 +10,8 @@
 
 #include <QtGlobal>
 
+#include <cmath>
+
 namespace gui_present_gap
 {
 
@@ -132,11 +134,11 @@ public:
                                                - ( c.idleNs - f.start.idleNs )
                                                - ( c.runnerSleepNs - f.start.runnerSleepNs ) ) / 1000000.0
                 - ( c.paintMs - f.start.paintMs );
-            // r3 (adversary A1 on f9f92e09): written as !(x > 0) so a NaN paint reading clamps to 0 too.
-            if( !( inclusiveMs > 0.0 ) ) inclusiveMs = 0.0;
+            // r3 (adversary A1 on f9f92e09, A4 on e7e5271e): a NaN or infinite paint reading clamps to 0 too.
+            if( !( inclusiveMs > 0.0 ) || !std::isfinite( inclusiveMs ) ) inclusiveMs = 0.0;
         }
         double exclusiveMs = inclusiveMs - f.childMs;
-        if( !( exclusiveMs > 0.0 ) ) exclusiveMs = 0.0;
+        if( !( exclusiveMs > 0.0 ) || !std::isfinite( exclusiveMs ) ) exclusiveMs = 0.0;
         if( m_depth > 0 && m_depth - 1 < kMaxDepth ) m_stack[m_depth - 1].childMs += inclusiveMs;
         if( !sameGap ) return 0.0;
         // CPU-S1-PACE-NEXT-LEVER-1 (#770 r3 advisory A1): OtherBusySpan::Count, or any value outside
@@ -153,8 +155,8 @@ public:
     {
         // CPU-S1-PACE-NEXT-LEVER-1 (adversary A1 on 9bfdf8e0): a negative budget is no budget; it
         // would make the scale negative and subtract the named spans from the session sums.
-        // r3 (adversary A1 on f9f92e09): a NaN budget is no budget either.
-        if( !( otherBusyMs > 0.0 ) ) otherBusyMs = 0.0;
+        // r3 (adversary A1 on f9f92e09, A4 on e7e5271e): a NaN or infinite budget is no budget either.
+        if( !( otherBusyMs > 0.0 ) || !std::isfinite( otherBusyMs ) ) otherBusyMs = 0.0;
         double named = 0.0;
         for( int i = 0; i < kCount; ++i ) named += gapMs[i];
         const double scale = ( named > otherBusyMs && named > 0.0 ) ? otherBusyMs / named : 1.0;
