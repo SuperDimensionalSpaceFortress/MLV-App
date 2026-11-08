@@ -105,6 +105,8 @@ class OtherBusySpans
 public:
     static constexpr int kCount = static_cast<int>( OtherBusySpan::Count );
     static constexpr int kMaxDepth = 16;
+    // r4 (adversary A3 on ebe2c4aa): no real span or gap is anywhere near 1e12 ms (~31.7 years).
+    static constexpr double kMaxSpanMs = 1e12;
 
     // Per-gap exclusive ms; folded into the session sums when the gap closes.
     double gapMs[kCount] = {};
@@ -145,7 +147,11 @@ public:
         // the enum, pops its frame but is charged to no span (it would index past gapMs).
         const int index = static_cast<int>( span );
         if( index < 0 || index >= kCount ) return 0.0;
+        // r4 (adversary A3 on ebe2c4aa): finite spans (a synthetic -1e308 paint) summed to +Infinity here,
+        // and closeGap's Infinity * 0 then wrote NaN into sumMs. A span and a gap sum are capped.
+        if( exclusiveMs > kMaxSpanMs ) exclusiveMs = kMaxSpanMs;
         gapMs[index] += exclusiveMs;
+        if( gapMs[index] > kMaxSpanMs ) gapMs[index] = kMaxSpanMs;
         return exclusiveMs;
     }
 
@@ -157,6 +163,7 @@ public:
         // would make the scale negative and subtract the named spans from the session sums.
         // r3 (adversary A1 on f9f92e09, A4 on e7e5271e): a NaN or infinite budget is no budget either.
         if( !( otherBusyMs > 0.0 ) || !std::isfinite( otherBusyMs ) ) otherBusyMs = 0.0;
+        if( otherBusyMs > kMaxSpanMs ) otherBusyMs = kMaxSpanMs;   // r4 (A3): same cap as a span
         double named = 0.0;
         for( int i = 0; i < kCount; ++i ) named += gapMs[i];
         const double scale = ( named > otherBusyMs && named > 0.0 ) ? otherBusyMs / named : 1.0;

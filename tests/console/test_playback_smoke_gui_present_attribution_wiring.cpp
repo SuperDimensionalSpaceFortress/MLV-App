@@ -770,6 +770,29 @@ TEST(GuiOtherBusySplit, NanPaintReadingOrBudgetNeverReachesASessionSum)
         ASSERT_TRUE(std::isfinite(spans.sumMs[i]));
 }
 
+TEST(GuiOtherBusySplit, OverflowingFiniteSpansNeverPutNanInASessionSum)
+{
+    // r4, adversary A3 on ebe2c4aa (and r3 advisory A2): two finite spans of ~1e308 ms (a synthetic -1e308
+    // paint reading) summed to +Infinity in gapMs; closeGap(1.0) scaled by 0 and Infinity * 0 wrote NaN.
+    gui_present_gap::OtherBusySpans spans;
+    spans.openGap();
+    gui_present_gap::SpanClock start;
+    start.gapSerial = 7;
+    gui_present_gap::SpanClock stop = start;
+    stop.nowNs = 1000000;
+    stop.paintMs = -1e308;
+    for (int i = 0; i < 2; ++i)
+    {
+        spans.begin(start);
+        ASSERT_TRUE(std::isfinite(spans.end(gui_present_gap::OtherBusySpan::DrawFrame, stop)));
+    }
+    const double rest = spans.closeGap(1.0);
+    ASSERT_TRUE(std::isfinite(rest));
+    for (int i = 0; i < gui_present_gap::OtherBusySpans::kCount; ++i)
+        ASSERT_TRUE(std::isfinite(spans.sumMs[i]) && spans.sumMs[i] >= 0.0 && spans.sumMs[i] <= 1.0 + 1e-9);
+    ASSERT_TRUE(std::isfinite(spans.unattributedSumMs));
+}
+
 namespace
 {
 // The innermost { ... } block of `body` that contains offset `at` (empty when unbalanced).
@@ -848,7 +871,10 @@ TEST(PlaybackPrepRgb8Pool, StopAndClipUnloadClearThePool)
     const QString toggled = bracedBlockAfter(source, QStringLiteral("void MainWindow::on_actionPlay_toggled(bool checked)"));
     ASSERT_FALSE(toggled.isEmpty());
     const int toggleBump = toggled.indexOf(QStringLiteral("invalidatePlaybackPrepForDisplayChange("));
-    const int toggleClear = toggled.indexOf(QStringLiteral("if( !checked ) ") + clearCall);
+    // r4 (adversary A1 on ebe2c4aa): play-start opens the pool with its own (post-bump) generation.
+    const int toggleOpen = toggled.indexOf(QStringLiteral("if( checked ) m_playbackPrepRgb8Pool.open( m_playbackPresentationGeneration.load( std::memory_order_acquire ) );"));
+    ASSERT_TRUE(toggleOpen > toggleBump);
+    const int toggleClear = toggled.indexOf(QStringLiteral("else ") + clearCall);
     const int toggleDrain = toggled.indexOf(QStringLiteral("drainPlaybackPrepInFlight( \"play-stop\""));
     ASSERT_TRUE(toggleBump >= 0 && toggleClear > toggleBump && toggleDrain > toggleClear);
 
@@ -903,6 +929,9 @@ TEST(PlaybackPrepRgb8Pool, EveryGivePassesItsTaskGenerationAndEveryClearTheCurre
     const QString h = readRepoFile(QStringLiteral("platform/qt/PlaybackPrepCpuRoute.h"));
     ASSERT_TRUE(h.contains(QStringLiteral("void give(std::vector<uint8_t> && buf, uint64_t generation);")));
     ASSERT_TRUE(h.contains(QStringLiteral("void clear(uint64_t currentGeneration);")));
+    ASSERT_TRUE(h.contains(QStringLiteral("void open(uint64_t playGeneration);")));
+    // The only open is the play-start one (a second site would reopen recycling outside a playing span).
+    ASSERT_EQ(1, static_cast<int>(source.count(QStringLiteral("m_playbackPrepRgb8Pool.open("))));
     ASSERT_FALSE(h.contains(QStringLiteral("m_closed")));
 }
 TEST(GuiOtherBusySplit, HandlersOpenTheirSpanFirstAndTheSummaryAppendsTheSplit)

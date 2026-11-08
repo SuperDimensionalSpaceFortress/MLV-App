@@ -31600,11 +31600,13 @@ void MainWindow::on_actionPlay_toggled(bool checked)
 {
     invalidatePlaybackPrepForDisplayChange(
         checked ? "play-start" : "play-stop" );
-    // r3 (adversary A2 on e7e5271e) / r4 (Dot B1, adversary A1 on 391464de): stopped playback holds no
-    // recycled 8-bit buffer. After the bump above: clear(g) raises the pool's floor to g + 1, so a task
-    // admitted before the stop (even one parked before its take()) has its late give() freed, whatever
-    // the interleaving; the next play-start's bump re-enables recycling.
-    if( !checked ) m_playbackPrepRgb8Pool.clear( m_playbackPresentationGeneration.load( std::memory_order_acquire ) );
+    // r3 (adversary A2 on e7e5271e) / r4 (Dot B1, adversary A1 on 391464de and ebe2c4aa): the 8-bit pool
+    // recycles only inside a playing span. After the bump above: play-start opens it with this generation
+    // as its floor, so nothing admitted before the start (an in-flight task across the last stop, a paused
+    // frame) is held; play-stop closes it, frees what it holds and raises the floor past the stop, so a
+    // late give() (even from a task parked before its take()) and every paused-frame give are freed.
+    if( checked ) m_playbackPrepRgb8Pool.open( m_playbackPresentationGeneration.load( std::memory_order_acquire ) );
+    else m_playbackPrepRgb8Pool.clear( m_playbackPresentationGeneration.load( std::memory_order_acquire ) );
     // PLAYBACK-CUDA-NATIVE-PACE-1: the pace clock re-arms at this Play's first engine tick.
     m_playbackPaceGuard.reset();
     logInteractionEvent(

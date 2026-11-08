@@ -150,9 +150,16 @@ void PlaybackPrepRgb8Pool::give(std::vector<uint8_t> && buf, uint64_t generation
     std::vector<uint8_t> dropped(std::move(buf));
     if ( dropped.capacity() == 0 ) return;
     std::lock_guard<std::mutex> lk(m_mutex);
-    /* r4: a buffer from a task admitted before the last clear() is freed, not held. */
-    if ( generation < m_minGeneration || m_held.size() >= kMaxHeld ) return;   /* freed by `dropped` after the unlock */
+    /* r4: outside a playing span, or from a task admitted before the play-start, freed. */
+    if ( !m_open || generation < m_minGeneration || m_held.size() >= kMaxHeld ) return;   /* freed by `dropped` after the unlock */
     m_held.push_back(std::move(dropped));
+}
+
+void PlaybackPrepRgb8Pool::open(uint64_t playGeneration)
+{
+    std::lock_guard<std::mutex> lk(m_mutex);
+    if ( playGeneration > m_minGeneration ) m_minGeneration = playGeneration;
+    m_open = true;
 }
 
 void PlaybackPrepRgb8Pool::clear(uint64_t currentGeneration)
@@ -160,6 +167,7 @@ void PlaybackPrepRgb8Pool::clear(uint64_t currentGeneration)
     std::vector<std::vector<uint8_t>> dropped;
     std::lock_guard<std::mutex> lk(m_mutex);
     dropped.swap(m_held);
+    m_open = false;
     const uint64_t floor = currentGeneration == UINT64_MAX ? UINT64_MAX : currentGeneration + 1;
     if ( floor > m_minGeneration ) m_minGeneration = floor;
 }

@@ -118,13 +118,17 @@ struct PlaybackPrepCpuRouteResult
  * recycled buffer's stale contents are never read. Thread-safe; holds at most
  * kMaxHeld buffers (a buffer given past that is freed).
  *
- * r4 (Dot B1, adversary A1 on 391464de): keyed on the presentation generation
- * (MainWindow::m_playbackPresentationGeneration, monotonic). clear(g) raises a
- * floor to g + 1; a give() of a buffer from a task admitted at a generation
- * below the floor frees it. give and clear serialise on one mutex and the floor
- * only rises, so a task admitted at or before g never leaves a buffer held
- * after clear(g), whatever the interleaving (a give before the clear is freed
- * by it, a give after it is refused). take() never changes the floor. */
+ * r4 (Dot B1, adversary A1 on 391464de and on ebe2c4aa): keyed on the
+ * presentation generation (MainWindow::m_playbackPresentationGeneration,
+ * monotonic). The pool recycles only inside a playing span: it starts closed;
+ * open(g) at play-start (after that bump) opens it and raises a floor to g;
+ * clear(g) at stop, clip replacement or unload (after that path's bump) frees
+ * what it holds, closes it and raises the floor to g + 1. give() holds a buffer
+ * only while open and only when its task's generation is at or above the floor.
+ * open, clear and give serialise on one mutex and the floor only rises, so no
+ * buffer from a task admitted before a play-start (an in-flight task across a
+ * stop, a paused frame) is ever held, and a stopped pool holds nothing,
+ * whatever the interleaving. take() never changes the pool's state. */
 class PlaybackPrepRgb8Pool
 {
 public:
@@ -132,12 +136,16 @@ public:
 
     /* A held buffer (the largest capacity), or an empty vector if none is held. */
     std::vector<uint8_t> take();
-    /* Holds buf if it has capacity, generation is at or above the floor and fewer
-     * than kMaxHeld are held; otherwise frees it. generation = the presentation
-     * generation of the task the buffer was developed for. */
+    /* Holds buf if it has capacity, the pool is open, generation is at or above
+     * the floor and fewer than kMaxHeld are held; otherwise frees it. generation =
+     * the presentation generation of the task the buffer was developed for. */
     void give(std::vector<uint8_t> && buf, uint64_t generation);
-    /* Frees every held buffer and raises the floor to currentGeneration + 1
-     * (never lowers it): playback stop, clip replacement, clip unload. */
+    /* Play-start: opens the pool and raises the floor to playGeneration (never
+     * lowers it). */
+    void open(uint64_t playGeneration);
+    /* Frees every held buffer, closes the pool and raises the floor to
+     * currentGeneration + 1 (never lowers it; saturates): playback stop, clip
+     * replacement, clip unload. */
     void clear(uint64_t currentGeneration);
     size_t held() const;
     uint64_t takeHits() const;
@@ -149,6 +157,7 @@ private:
     uint64_t m_takeHits = 0;
     uint64_t m_takeMisses = 0;
     uint64_t m_minGeneration = 0;
+    bool m_open = false;
 };
 
 /* State the prep thread keeps across frames. Not thread-safe by design: one
