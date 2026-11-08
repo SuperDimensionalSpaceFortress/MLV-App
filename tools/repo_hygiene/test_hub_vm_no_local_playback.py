@@ -499,8 +499,8 @@ def _collect_counts(proc: "subprocess.Popen", expected: int, deadline: float | N
             counts = _collect_counts_once(again, expected, deadline)
             ended = getattr(again, "ended_at", None)
             # adversary pass 2 A1: an exited probe is drained without a timeout, so its recorded end proves it was in time. Pass 3 A1: with no recorded end (the
-            # watcher thread could not start) the clock at collection stands in for it, with 0.5 s of slack for the drain itself.
-            over = ended - deadline if isinstance(ended, (int, float)) else time.monotonic() - deadline - 0.5
+            # watcher thread could not start) the clock at collection stands in for it, with NO slack (pass 4 A1): the later of the two is the safe bound.
+            over = ended - deadline if isinstance(ended, (int, float)) else time.monotonic() - deadline
             if over > 0:
                 raise AssertionError(f"lint probe {probe.name} ({expected} rows): the one re-probe finished {over:.1f} s after the shared deadline, so its result is "
                                      f"not accepted; attempt 1 was a start fault: {first.kind}; {first.detail}")
@@ -6069,13 +6069,24 @@ class CollectCountsRuntimeLoadFaultTests(unittest.TestCase):
         clock[0] = 1000.0
 
         class QuickNoWatcher(NoWatcher):
+            def __init__(self, drained_at):
+                super().__init__()
+                self.drained_at = drained_at
+
             def communicate(self, timeout=None):
-                clock[0] = 1001.2  # 0.2 s past the deadline: inside the drain slack, accepted
+                clock[0] = self.drained_at
                 return self._streams
 
-        with mock.patch.object(sys.modules[__name__], "_popen_pwsh", lambda probe, counted=True: QuickNoWatcher()), \
-                mock.patch.object(time, "monotonic", lambda: clock[0]), contextlib.redirect_stderr(io.StringIO()):
-            self.assertEqual([1], _collect_counts(self._fault(), 1, 1001.0))
+        # pass 4 A1: there is no drain slack. 0.2 s past the deadline is late (rejected); inside it is accepted.
+        for drained_at, late in ((1001.2, True), (1000.9, False)):
+            clock[0] = 1000.0
+            with mock.patch.object(sys.modules[__name__], "_popen_pwsh", lambda probe, counted=True: QuickNoWatcher(drained_at)), \
+                    mock.patch.object(time, "monotonic", lambda: clock[0]), contextlib.redirect_stderr(io.StringIO()):
+                if late:
+                    with self.assertRaises(AssertionError):
+                        _collect_counts(self._fault(), 1, 1001.0)
+                else:
+                    self.assertEqual([1], _collect_counts(self._fault(), 1, 1001.0))
 
     def test_adversary_pass3_a2_the_start_time_is_taken_before_the_process_is_created(self):
         """Adversary pass 3 A2: a parent stalled inside Popen() must not shrink the child's measured life; the lifetime runs from BEFORE the launch."""
