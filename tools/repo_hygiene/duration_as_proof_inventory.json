@@ -2883,16 +2883,6 @@
       "lines": [
         708
       ]
-    },
-    {
-      "path": "tests/console/test_playback_smoke_gui_present_attribution_wiring.cpp",
-      "anchor": "ASSERT_TRUE ( std :: isfinite ( spans . unattributedSumMs ) && spans . unattributedSumMs >= 0.0 ) ;",
-      "class": "not_run_proof_structural",
-      "clock": "other",
-      "justification": "CPU-S1-PACE-NEXT-LEVER-1 r3 (adversary A1 on f9f92e09): pure-function unit test of OtherBusySpans::end/closeGap with a synthetic NaN paint reading and a NaN budget (no live clock): the unattributed session sum stays finite and non-negative. Not a proof that any stage ran.",
-      "lines": [
-        740
-      ]
     }
   ]
 }
