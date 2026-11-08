@@ -491,7 +491,12 @@ def _collect_counts(proc: "subprocess.Popen", expected: int, deadline: float | N
                                       f"attempt 1: {first.detail}", first.kind, first.detail) from None
         again = _popen_pwsh(probe, counted=False)
         try:
-            return _collect_counts_once(again, expected, deadline)
+            counts = _collect_counts_once(again, expected, deadline)
+            ended = getattr(again, "ended_at", None)
+            if isinstance(ended, (int, float)) and ended > deadline:  # adversary pass 2 A1: an exited probe is drained without a timeout; its recorded end proves it was in time
+                raise AssertionError(f"lint probe {probe.name} ({expected} rows): the one re-probe finished {ended - deadline:.1f} s after the shared deadline, so its result is "
+                                     f"not accepted; attempt 1 was a start fault: {first.kind}; {first.detail}")
+            return counts
         except LintProbeStartFault as second:
             raise LintProbeStartFault(f"lint probe start fault: {second.kind} in {probe.name}, on both attempts; attempt 1: {first.detail}; "
                                       f"attempt 2: {second.detail}", second.kind, second.detail) from None
@@ -5827,8 +5832,8 @@ class CollectCountsRuntimeLoadFaultTests(unittest.TestCase):
         def __init__(self, returncode: int, stdout: str, stderr: str, lasted: float = 0.9, name: str = "r13-pass-probe.ps1"):
             self.args = ["pwsh", "-NoLogo", "-NoProfile", "-NonInteractive", "-File", name]
             self.returncode = returncode
-            self.started_at = 5000.0
-            self.ended_at = 5000.0 + lasted
+            self.started_at = time.monotonic()
+            self.ended_at = self.started_at + lasted
             self._streams = (stdout, stderr)
 
         def poll(self):
@@ -6024,6 +6029,16 @@ class CollectCountsRuntimeLoadFaultTests(unittest.TestCase):
         self.assertEqual([], started, "the deadline passed while the retry was being logged: no launch")
         self.assertTrue(str(caught.exception).startswith("lint probe start fault: pwsh runtime load failure"), str(caught.exception))
         self.assertIn("no budget", str(caught.exception))
+
+    def test_adversary_a1_pass2_a_re_probe_that_ended_after_the_deadline_is_not_accepted(self):
+        """Adversary pass 2 A1: an exited re-probe is drained without a timeout, so its recorded end is what proves it finished inside the shared deadline."""
+        counts, message, started, _ = self._collect(self._fault(), [self.Scripted(0, "[1]", "", lasted=30.0)], deadline_in=10.0)
+        self.assertIsNone(counts, "a re-probe that ended 20 s after the deadline must not stand")
+        self.assertEqual(1, len(started))
+        self.assertIn("after the shared deadline", message)
+        self.assertIn("The given assembly name was invalid", message, "attempt 1's start fault is still named")
+        counts, message, _, _ = self._collect(self._fault(), [self.Scripted(0, "[1]", "", lasted=9.0)], deadline_in=10.0)
+        self.assertEqual([1], counts, "a re-probe that ended inside the deadline stands")
 
     def test_adversary_a3_the_re_probe_is_not_counted_as_a_second_logical_probe(self):
         """Adversary r1 A3: _PWSH_SPAWNS is what the differential witnesses count (one probe per distinct lint/corpus); a recovered re-probe must not add to it."""
