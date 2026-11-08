@@ -199,8 +199,13 @@ def _popen_pwsh(probe: Path, counted: bool = True) -> "subprocess.Popen":
     proc = subprocess.Popen([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-File", str(probe)],
                             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
     proc.started_at = launched  # read by _collect_counts for its typed timeout message and by _probe_lasted
-    # CI-FLAKE-PROMPT-LINT-PWSH-RUNTIME-LOAD-1: when the child ENDED, so _collect_counts can tell a death inside the start-up window from a late one
-    # even though the shards are collected one after another (collecting late must not make an early crash look late).
+    # CI-FLAKE-PROMPT-LINT-PWSH-RUNTIME-LOAD-1: what the exit watcher knows of the child's life, so _collect_counts can tell a death inside the start-up
+    # window from a late one even though the shards are collected one after another (collecting late must not make an early crash look late).
+    # r4 (sol r3 blocker): TWO instants, because the watcher is a thread that can itself wake late. `alive_until` is the last time the watcher SAW the child
+    # still running (a lower bound on its life, set only from evidence the child gave); `ended_at` is when the watcher OBSERVED the exit (an upper bound, kept
+    # for the deadline checks, which ask when a result became available). The lifetime the classifier uses is the lower bound (see _probe_lasted), so a
+    # watcher descheduled for seconds can never make an early crash look late.
+    proc.alive_until = None
     proc.ended_at = None
     proc.exit_watch = None
     try:  # adversary r1 A2: the clock is advisory, so a thread that cannot start must never strand the child the caller is about to own
@@ -212,12 +217,23 @@ def _popen_pwsh(probe: Path, counted: bool = True) -> "subprocess.Popen":
     return proc
 
 
+_EXIT_POLL_SEC = 0.1  # how often the exit watcher re-proves the child alive: the precision of the lower bound on its life
+
+
 def _note_exit(proc: "subprocess.Popen") -> None:
-    """Record, on `proc`, the time.monotonic() instant its process ended (runs on a daemon thread started by _popen_pwsh)."""
+    """Record, on `proc`, what this daemon thread (started by _popen_pwsh) learns of the child's life, as time.monotonic() instants: `alive_until`, the start
+    of the last bounded wait that TIMED OUT (the child was running then, whenever this thread was scheduled afterwards), and `ended_at`, when the exit was
+    observed. A wait that times out proves the child alive from the moment it was entered, so the instant is taken BEFORE the wait, never after it."""
     try:
-        proc.wait()
+        while True:
+            entered = time.monotonic()
+            try:
+                proc.wait(timeout=_EXIT_POLL_SEC)
+                break
+            except subprocess.TimeoutExpired:
+                proc.alive_until = entered
         proc.ended_at = time.monotonic()
-    except Exception:  # noqa: BLE001 - the clock is advisory; a failed wait leaves ended_at None and the probe is judged as ending when collected
+    except Exception:  # noqa: BLE001 - the clock is advisory; a failed wait leaves ended_at None, and a life nobody saw is never taken to be long
         pass
 
 
@@ -435,14 +451,21 @@ class LintProbeStartFault(AssertionError):
 
 
 def _probe_lasted(proc: "subprocess.Popen") -> float:
-    """Seconds the probe's process lived (start to end, from the exit watcher); the time of this call when the end was not recorded, and infinity
-    when the start was not (an unknown duration is never taken to be inside the start-up window)."""
+    """Seconds the probe's process is KNOWN to have lived, which is what the start-up classifier asks ("did it provably outlive the window?").
+    r4 (sol r3 blocker): for a probe watched by _note_exit this is `alive_until - started_at`, the last moment the child was seen running, or 0.0 when it
+    was never seen running -- NOT the moment the watcher noticed the exit, because a watcher that woke seconds late would otherwise turn a child that died
+    at 0.9 s into one that "lived 6 s", and the one recognized-start-fault retry would be refused. An unknown life is not a long life. A probe with no
+    `alive_until` at all (a scripted child that carries its exact end) is judged by `ended_at`, else by the time of this call. Infinity when the START
+    was not recorded (an unknown duration is never taken to be inside the start-up window)."""
     started = getattr(proc, "started_at", None)
     if not isinstance(started, (int, float)):
         return float("inf")
     watcher = getattr(proc, "exit_watch", None)
     if isinstance(watcher, threading.Thread):
         watcher.join(timeout=1)
+    if hasattr(proc, "alive_until"):
+        seen = proc.alive_until
+        return max(0.0, seen - started) if isinstance(seen, (int, float)) else 0.0
     ended = getattr(proc, "ended_at", None)
     return max(0.0, (ended if isinstance(ended, (int, float)) else time.monotonic()) - started)
 
@@ -455,12 +478,14 @@ def _run_retrying_start_fault(run, name: str) -> "subprocess.CompletedProcess":
     spawned = len(_PWSH_SPAWNS)
     for attempt in (1, 2):
         began = time.monotonic()
-        done = run()
+        try:
+            done = run()
+        finally:  # r4 (r3 advisory A1): a re-run that RAISES (a TimeoutExpired propagates) has been entered in _PWSH_SPAWNS all the same
+            if attempt == 2 and len(_PWSH_SPAWNS) > spawned + 1 and name in _PWSH_SPAWNS[spawned + 1:]:
+                # pass-3 A3 / Dot item 3: _PWSH_SPAWNS counts LOGICAL probes (what the differential witnesses and the 28-probe ceiling are written in); this
+                # re-run is a second PHYSICAL launch of the same logical probe, so its extra entry is dropped. Physical launches are not recorded anywhere.
+                del _PWSH_SPAWNS[len(_PWSH_SPAWNS) - 1 - _PWSH_SPAWNS[::-1].index(name)]
         lasted = time.monotonic() - began
-        if attempt == 2 and len(_PWSH_SPAWNS) > spawned + 1 and name in _PWSH_SPAWNS[spawned + 1:]:
-            # pass-3 A3 / Dot item 3: _PWSH_SPAWNS counts LOGICAL probes (what the differential witnesses and the 28-probe ceiling are written in); this
-            # re-run is a second PHYSICAL launch of the same logical probe, so its extra entry is dropped. Physical launches are not recorded anywhere.
-            del _PWSH_SPAWNS[len(_PWSH_SPAWNS) - 1 - _PWSH_SPAWNS[::-1].index(name)]
         if done.returncode == 0 or not _is_start_crash(done, lasted):
             return done
         details.append(f"attempt {attempt}: rc={done.returncode} after {lasted:.1f} s: {(done.stderr or '').strip() or '<no stderr>'}")
@@ -6166,8 +6191,133 @@ class CollectCountsRuntimeLoadFaultTests(unittest.TestCase):
             proc = _popen_pwsh(Path("stalled-probe.ps1"), counted=False)
             proc.exit_watch.join(5)
             lasted = _probe_lasted(proc)
-        self.assertEqual(6.0, lasted)
-        self.assertFalse(_is_start_crash(subprocess.CompletedProcess([], -6, stdout="", stderr=self.REAL_STDERR), lasted), "a six-second life is not a start-up death")
+        self.assertEqual(1000.0, proc.started_at, "the start is taken BEFORE Popen() runs, so the 6 s stall is not cut off the front of the child's life")
+        # r4 (sol r3 blocker) supersedes the pass-3 A2 expectation of 6.0: that figure was the watcher's own observation time, and the same figure is what a
+        # watcher woken late reports for a child that died at 0.9 s. The child was never SEEN running here, so its known life is 0.0 and the one recognized
+        # start-fault retry stays available (an unknown life is not a long life).
+        self.assertEqual(0.0, lasted)
+        self.assertTrue(_is_start_crash(subprocess.CompletedProcess([], -6, stdout="", stderr=self.REAL_STDERR), lasted))
+
+    class ScheduledPopen:
+        """r4: a pwsh child on a scripted clock (the list `clock`, patched in as time.monotonic). It started at clock 1000.0 and exits at `exit_at`. Its
+        exit watcher is descheduled from `stall_from` and next runs at `wake_at`; a bounded wait that is entered before `stall_from` and ends before the exit
+        times out and moves the clock by its timeout; an unbounded wait (the r3 watcher) returns when the watcher next runs."""
+
+        clock = [1000.0]
+        exit_at = 1000.9
+        stall_from = 1000.2
+        wake_at = 1006.0
+
+        def __init__(self, argv, **kwargs):
+            self.args = argv
+            self.returncode = -6
+            self.stdout = self.stderr = self.stdin = None
+
+        def wait(self, timeout=None):
+            now = self.clock[0]
+            if timeout is not None and now < self.stall_from and now + timeout < self.exit_at:
+                self.clock[0] = now + timeout
+                raise subprocess.TimeoutExpired(self.args, timeout)
+            self.clock[0] = max(now, self.wake_at)  # wake_at is never before exit_at: the watcher cannot see an exit that has not happened
+            return self.returncode
+
+        def poll(self):
+            return self.returncode
+
+        def kill(self):
+            pass
+
+        def communicate(self, timeout=None):
+            return "", CollectCountsRuntimeLoadFaultTests.REAL_STDERR
+
+    def _scheduled_child(self, exit_at: float, stall_from: float, wake_at: float):
+        """_popen_pwsh over a ScheduledPopen on a scripted clock; returns (the watched child, the clock list, once its exit has been observed)."""
+        clock = [1000.0]
+        child = type("Scheduled", (self.ScheduledPopen,), {"clock": clock, "exit_at": exit_at, "stall_from": stall_from, "wake_at": wake_at})
+        with mock.patch.object(subprocess, "Popen", child), mock.patch.object(time, "monotonic", lambda: clock[0]):
+            proc = _popen_pwsh(Path("r4-clock-probe.ps1"), counted=False)
+            proc.exit_watch.join(30)
+            self.assertFalse(proc.exit_watch.is_alive(), "the scripted watcher has finished")
+        return proc, clock
+
+    def _late_watcher_case(self, collect) -> None:
+        """r4 (sol r3 blocker): the child starts at 1000, dies of the recorded fault at 1000.9 and its watcher is only scheduled again at 1006. `collect(proc,
+        clock, relaunched)` runs one of the two consumers over it with a shared deadline of 1600; the recorded fault must still be recovered with ONE re-run."""
+        proc, clock = self._scheduled_child(exit_at=1000.9, stall_from=1000.2, wake_at=1006.0)
+        self.assertEqual(1006.0, proc.ended_at, "the observation is late: that is the premise")
+        relaunched: list = []
+        with mock.patch.object(time, "monotonic", lambda: clock[0]), contextlib.redirect_stderr(io.StringIO()):
+            good = self.Scripted(0, "[1]", "")  # built on the scripted clock, so its recorded end is comparable with the deadline
+            collect(proc, relaunched, good)
+        self.assertEqual(["r4-clock-probe.ps1"], relaunched, "exactly one re-run, of the same probe file")
+
+    def test_r4_sol_r3_a_late_watcher_does_not_turn_an_early_start_fault_into_a_lint_failure_in_collect_counts(self):
+        def collect(proc, relaunched, good):
+            def fake_popen(probe, counted=True):
+                relaunched.append(probe.name)
+                return good
+            with mock.patch.object(sys.modules[__name__], "_popen_pwsh", fake_popen):
+                self.assertEqual([1], _collect_counts(proc, 1, 1600.0))
+        self._late_watcher_case(collect)
+
+    def test_r4_sol_r3_a_late_watcher_does_not_turn_an_early_start_fault_into_a_lost_re_launch_in_the_communicate_helper(self):
+        def collect(proc, relaunched, good):
+            stood, out, _ = _communicate_retrying_start_fault(proc, deadline=1600.0, popen=lambda path: relaunched.append(path.name) or good)
+            self.assertIs(good, stood)
+            self.assertEqual("[1]", out)
+        self._late_watcher_case(collect)
+
+    def test_r4_sol_r3_the_known_life_is_what_was_seen_not_when_the_exit_was_noticed(self):
+        for label, exit_at, stall_from, wake_at, window_verdict in (
+                ("exit at 1000.9, watcher woke at 1006", 1000.9, 1000.2, 1006.0, True),
+                ("exit at 1000.9, watcher woke at 1010", 1000.9, 1000.2, 1010.0, True),
+                ("exit at 1000.9, watcher on time", 1000.9, 9999.0, 1000.9, True),
+                ("exit at 1006, watcher on time (a life that provably outlived the window)", 1006.0, 9999.0, 1006.0, False)):
+            with self.subTest(label):
+                proc, _ = self._scheduled_child(exit_at, stall_from, wake_at)
+                known = _probe_lasted(proc)
+                self.assertEqual(window_verdict, known < LINT_PROBE_START_WINDOW_SEC, f"known life {known:.2f} s")
+                self.assertLessEqual(known, exit_at - 1000.0, "the known life is a lower bound: it never exceeds the real one")
+                self.assertGreaterEqual(proc.ended_at, exit_at, "ended_at stays the observation time, which the deadline checks use")
+                self.assertEqual(window_verdict, _is_start_crash(subprocess.CompletedProcess(proc.args, -6, stdout="", stderr=self.REAL_STDERR), known))
+
+    def test_r4_sol_r3_control_a_fault_that_provably_outlived_the_window_is_not_re_run(self):
+        """The classifier is not loosened: a child seen running past the start-up window gets no re-launch from either consumer."""
+        for who in ("collect_counts", "communicate_helper"):
+            with self.subTest(who):
+                proc, clock = self._scheduled_child(exit_at=1006.0, stall_from=9999.0, wake_at=1006.0)
+                relaunched: list = []
+                with mock.patch.object(time, "monotonic", lambda: clock[0]), contextlib.redirect_stderr(io.StringIO()):
+                    late_good = self.Scripted(0, "[1]", "")
+                    if who == "collect_counts":
+                        with mock.patch.object(sys.modules[__name__], "_popen_pwsh", lambda probe, counted=True: relaunched.append(probe.name) or late_good):
+                            with self.assertRaises(AssertionError) as caught:
+                                _collect_counts(proc, 1, 1600.0)
+                        self.assertTrue(str(caught.exception).startswith("lint probe failed: "), str(caught.exception))
+                    else:
+                        stood, _, _ = _communicate_retrying_start_fault(proc, deadline=1600.0, popen=lambda path: relaunched.append(path.name) or late_good)
+                        self.assertIs(proc, stood, "the failed original child is handed back unchanged")
+                self.assertEqual([], relaunched, "no re-launch for a death outside the start-up window")
+
+    def test_r4_sol_r3_a1_a_foreground_re_run_that_times_out_leaves_no_duplicate_spawn_entry(self):
+        """r3 advisory A1: the second foreground run is entered in _PWSH_SPAWNS before it raises TimeoutExpired; the entry must still be dropped."""
+        before = len(_PWSH_SPAWNS)
+        calls: list = []
+
+        def run():
+            _PWSH_SPAWNS.append("lists-probe.ps1")
+            calls.append(1)
+            if len(calls) == 1:
+                return subprocess.CompletedProcess([], -6, stdout="", stderr=self.REAL_STDERR)
+            raise subprocess.TimeoutExpired(["pwsh"], 120)
+
+        try:
+            with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(subprocess.TimeoutExpired):
+                _run_retrying_start_fault(run, "lists-probe.ps1")
+            self.assertEqual(2, len(calls))
+            self.assertEqual(["lists-probe.ps1"], _PWSH_SPAWNS[before:], "one logical probe, however many times it was run")
+        finally:
+            del _PWSH_SPAWNS[before:]
 
     def test_adversary_pass3_a3_a_recovered_foreground_re_run_is_not_counted(self):
         """Adversary pass 3 A3: the foreground re-run (word lists) starts a second pwsh through _run_pwsh; the witnesses and the 28-probe ceiling count logical probes."""
