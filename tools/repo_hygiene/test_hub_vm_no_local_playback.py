@@ -484,25 +484,39 @@ def _communicate_retrying_start_fault(proc: "subprocess.Popen", deadline: "float
     relaunch = popen or (lambda path: _popen_pwsh(path, counted=False))
     details: list = []
     for attempt in (1, 2):
-        if before_collect is not None:
-            before_collect(proc)
-        remaining = deadline - time.monotonic()
-        try:
-            out, err = proc.communicate(timeout=max(1.0, remaining) if proc.poll() is not None else max(0.0, remaining))
-        except subprocess.TimeoutExpired:
-            _kill(proc)
-            raise AssertionError(f"lint probe {probe.name} did not finish inside its budget (bound {LINT_PROBE_BOUND_SEC} s)") from None
-        lasted = _probe_lasted(proc)
-        done = subprocess.CompletedProcess(proc.args, proc.returncode, stdout=out, stderr=err)
-        if proc.returncode == 0 or not _is_start_crash(done, lasted):
-            return proc, out, err
-        details.append(f"attempt {attempt}: rc={proc.returncode} after {lasted:.1f} s: {(err or '').strip() or '<no stderr>'}")
-        if attempt == 1:
-            if deadline - time.monotonic() <= 0:
-                raise LintProbeStartFault(f"lint probe start fault: {_start_fault_kind(err)} in {probe.name}; no budget left for the one re-run; {details[0]}",
-                                          _start_fault_kind(err), details[0])
-            print(f"[{probe.name}] interpreter start fault ({details[0].splitlines()[0]}): running the probe once more", file=sys.stderr)
-            proc = relaunch(probe)
+        try:  # r2 adversary A3: whatever raises while the re-launch is being collected, it must not be left running (the caller only knows the first child)
+            if before_collect is not None:
+                before_collect(proc)
+            remaining = deadline - time.monotonic()
+            try:
+                out, err = proc.communicate(timeout=max(1.0, remaining) if proc.poll() is not None else max(0.0, remaining))
+            except subprocess.TimeoutExpired:
+                _kill(proc)
+                raise AssertionError(f"lint probe {probe.name} did not finish inside its budget (bound {LINT_PROBE_BOUND_SEC} s)") from None
+            lasted = _probe_lasted(proc)
+            done = subprocess.CompletedProcess(proc.args, proc.returncode, stdout=out, stderr=err)
+            if proc.returncode == 0 or not _is_start_crash(done, lasted):
+                if attempt == 2:  # r2 adversary A2: as in _collect_counts, the re-launch's recorded end (else the clock at collection) must be inside the deadline; no grace
+                    ended = getattr(proc, "ended_at", None)
+                    over = ended - deadline if isinstance(ended, (int, float)) else time.monotonic() - deadline
+                    if over > 0:
+                        raise AssertionError(f"lint probe {probe.name}: the one re-run finished {over:.1f} s after the shared deadline, so its result is not accepted; "
+                                             f"attempt 1 was a start fault: {_start_fault_kind(details[0])}; {details[0]}")
+                return proc, out, err
+            details.append(f"attempt {attempt}: rc={proc.returncode} after {lasted:.1f} s: {(err or '').strip() or '<no stderr>'}")
+            if attempt == 1:
+                kind = _start_fault_kind(err)
+                if deadline - time.monotonic() <= 0:
+                    raise LintProbeStartFault(f"lint probe start fault: {kind} in {probe.name}; no budget left for the one re-run; {details[0]}", kind, details[0])
+                print(f"[{probe.name}] interpreter start fault ({details[0].splitlines()[0]}): running the probe once more", file=sys.stderr)
+                if deadline - time.monotonic() <= 0:  # r2 adversary A1: announcing the re-launch took time too; the launch must still be inside the shared deadline
+                    raise LintProbeStartFault(f"lint probe start fault: {kind} in {probe.name}; no budget left for the one re-run (spent while it was announced); "
+                                              f"{details[0]}", kind, details[0])
+                proc = relaunch(probe)
+        except BaseException:
+            if attempt == 2:
+                _kill(proc)
+            raise
     kind = _start_fault_kind(err)
     raise LintProbeStartFault(f"lint probe start fault: {kind} in {probe.name}, on both attempts; {'; '.join(details)}", kind, details[-1])
 
@@ -6226,6 +6240,83 @@ class CollectCountsRuntimeLoadFaultTests(unittest.TestCase):
         self.assertEqual([], launched)
         self.assertIn("no budget", str(spent.exception))
 
+    def test_r2_adversary_a1_the_communicate_helper_rechecks_the_deadline_after_announcing_the_re_launch(self):
+        """r2 adversary A1 (blocking, introduced): logging the re-launch takes time; the launch must still be inside the shared deadline, as in _collect_counts."""
+        clock = [1000.0]
+
+        class SlowLog(io.StringIO):
+            def write(self, text):
+                clock[0] += 1.7
+                return super().write(text)
+
+        launched: list = []
+        with mock.patch.object(time, "monotonic", lambda: clock[0]), contextlib.redirect_stderr(SlowLog()):
+            with self.assertRaises(LintProbeStartFault) as caught:
+                _communicate_retrying_start_fault(self._fault(), deadline=1000.7, popen=lambda path: launched.append(path.name) or self.Scripted(0, "[1]", ""))
+        self.assertEqual([], launched, "the deadline passed while the re-launch was being logged: no launch")
+        self.assertIn("no budget", str(caught.exception))
+        self.assertTrue(str(caught.exception).startswith("lint probe start fault: pwsh runtime load failure"), str(caught.exception))
+
+    def test_r2_adversary_a2_the_communicate_helper_does_not_accept_a_re_launch_that_finished_after_the_deadline(self):
+        """r2 adversary A2 (blocking, introduced): a re-launch's recorded end, or with none the clock at collection, must be inside the shared deadline; no grace."""
+        clock = [1000.0]
+
+        class NoWatcher(self.Scripted):
+            def __init__(self, drained_at):
+                super().__init__(0, "[1]", "")
+                self.ended_at = None
+                self.drained_at = drained_at
+
+            def communicate(self, timeout=None):
+                clock[0] = self.drained_at
+                return self._streams
+
+        cases = (
+            ("a recorded end 0.2 s late", lambda: self.Scripted(0, "[1]", "", lasted=1.2), True),
+            ("a recorded end inside", lambda: self.Scripted(0, "[1]", "", lasted=0.9), False),
+            ("no recorded end, collected 1.0 s late", lambda: NoWatcher(1002.0), True),
+            ("no recorded end, collected 0.2 s late", lambda: NoWatcher(1001.2), True),
+            ("no recorded end, collected inside", lambda: NoWatcher(1000.9), False),
+        )
+        for name, replacement, late in cases:
+            clock[0] = 1000.0
+            with mock.patch.object(time, "monotonic", lambda: clock[0]), contextlib.redirect_stderr(io.StringIO()):
+                first = self._fault()
+                if late:
+                    with self.assertRaises(AssertionError, msg=name) as caught:
+                        _communicate_retrying_start_fault(first, deadline=1001.0, popen=lambda path: replacement())
+                    self.assertIn("after the shared deadline", str(caught.exception), name)
+                    self.assertIn("The given assembly name was invalid", str(caught.exception), "attempt 1's start fault is still named: " + name)
+                else:
+                    proc, out, _ = _communicate_retrying_start_fault(first, deadline=1001.0, popen=lambda path: replacement())
+                    self.assertEqual("[1]", out, name)
+
+    def test_r2_adversary_a3_the_communicate_helper_kills_a_re_launch_it_cannot_finish_collecting(self):
+        """r2 adversary A3 (advisory, introduced): if collecting the re-launch raises (here a before_collect callback that needs a watcher that never started)
+        the re-launch is killed, not left running; and the test's own callback tolerates a missing watcher."""
+        killed: list = []
+
+        class Running(self.Scripted):
+            def __init__(self):
+                super().__init__(0, "[1]", "")
+                self.exit_watch = None
+
+            def poll(self):
+                return None if not killed else self.returncode
+
+            def kill(self):
+                killed.append(1)
+
+        def needs_a_watcher(attempt):
+            attempt.exit_watch.join(timeout=120)
+
+        first = self._fault()
+        first.exit_watch = mock.Mock()
+        with contextlib.redirect_stderr(io.StringIO()):
+            with self.assertRaises(AttributeError):
+                _communicate_retrying_start_fault(first, popen=lambda path: Running(), before_collect=needs_a_watcher)
+        self.assertEqual([1], killed, "the re-launch is killed when its collection raises")
+
     def test_item1_the_communicate_helper_does_not_re_launch_a_timeout(self):
         class Slow(self.Scripted):
             def poll(self):
@@ -6306,7 +6397,8 @@ class PopenPwshExitClockTests(unittest.TestCase):
         probe = self._quick_probe()
         before = len(_PWSH_SPAWNS)
         def collected_late(attempt) -> None:
-            attempt.exit_watch.join(timeout=120)
+            if attempt.exit_watch is not None:  # r2 adversary A3: a watcher that could not start leaves None
+                attempt.exit_watch.join(timeout=120)
             time.sleep(1.5)  # collected late
 
         with self.first_launch_dies() if scripted_fault else contextlib.nullcontext([]) as launches:
