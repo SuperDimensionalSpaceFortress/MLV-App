@@ -650,15 +650,18 @@ PINNED_COUNTER_WRITES = {
     "MainWindow::on_actionPlay_toggled": {"begin": 1},                          # the FIRST Play start arms the counter
     "MainWindow::playbackHandling": {"tick": 3},                                # the three engine position advances
 }
+# r31 (Dot M2 on aa598479, the class): ONE write-operator rule for every write check below -- `=` (not `==`), every compound assignment
+# including `<<=` / `>>=`, `++`, `--` -- and closing parentheses before the operator do not hide it (`(m_sourceAdvance.startFrame) <<= 1;`).
+_WRITE_OP = r"(?:\s*\))*\s*(?:(?:[-+*/%&|^]|<<|>>)?=(?!=)|\+\+|--)"
 _ADV_USE = re.compile(r"\bm_sourceAdvance\b")
-_ADV_READ = re.compile(r"\s*\.\s*(?:consumed\s*\(\s*\)|startFrame\b(?!\s*(?:=(?!=)|[-+*/%&|^]=|\+\+|--)))")
+_ADV_READ = re.compile(r"\s*\.\s*(?:consumed\s*\(\s*\)|startFrame\b(?!" + _WRITE_OP + r"))")
 PINNED_COUNTER_READS = {"MainWindow::finishPlaybackSmokeTelemetry": 1}   # the conform line's engine_target
 _ADV_PINNED_READ = re.compile(r"\bm_sourceAdvance\s*\.\s*armed\s*\?\s*m_sourceAdvance\s*\.\s*highWater\s*:\s*-\s*1\s*\)")
 _ADV_BEGIN = re.compile(r"\s*\.\s*begin\s*\(")
 _ADV_TICK = re.compile(r"\s*\.\s*noteEngineTick\s*\(")
 _ADV_RESET = re.compile(r"\s*=(?!=)\s*playback_frame_range::SourceFrameAdvanceCounter\s*\(\s*\)\s*;")
 _REQ_USE = re.compile(r"\bm_playRequiredSourceFrames\b")
-_REQ_WRITE_AFTER = re.compile(r"\s*(?:=(?!=)|[-+*/%&|^]=|\+\+|--)")
+_REQ_WRITE_AFTER = re.compile(_WRITE_OP)
 _REQ_ASSIGN_OK = re.compile(r"\s*=\s*verdict\.requiredFrames\s*;")
 _ESCAPE_BEFORE = re.compile(r"(?:(?<!&)&\s*(?:\w+\s*=\s*)?|\b(?:swap|exchange|move)\s*\(\s*|\+\+\s*|--\s*)$")
 
@@ -739,7 +742,7 @@ PINNED_BUDGET_WRITES = {
     "m_playRequestedSeconds": (re.compile(r"\s*=\s*requestedSeconds\s*;"), {"MainWindow::programmaticPlay": 2}),
     "m_playPaceFps": (re.compile(r"\s*=\s*verdict\.paceFps\s*;"), {"MainWindow::programmaticPlay": 2}),
 }
-_SCALAR_WRITE_AFTER = re.compile(r"\s*(?:=(?!=)|[-+*/%&|^]=|<<=|>>=|\+\+|--)")
+_SCALAR_WRITE_AFTER = re.compile(_WRITE_OP)   # r31: the shared rule (a parenthesised budget write is a write too)
 
 
 def _scan_budget_writes(blank: str) -> list[str]:

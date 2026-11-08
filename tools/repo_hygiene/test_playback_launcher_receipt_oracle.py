@@ -851,6 +851,10 @@ class CounterWritePinTests(unittest.TestCase):
             cases.append((f"requirement {op}", f"m_playRequiredSourceFrames {op} 1;", req))
             cases.append((f"(requirement) {op}", f"(m_playRequiredSourceFrames) {op} 1;", req))
         cases.append(("(requirement) =", "(m_playRequiredSourceFrames) = 1;", req))
+        # the sibling budget check (_SCALAR_WRITE_AFTER) shares the rule: a parenthesised budget / pace write is a write
+        budget = "other than the reviewed assignment"
+        cases.append(("(budget) =", "(m_playRequestedSeconds) = 3600;", budget))
+        cases.append(("(pace) <<=", "(m_playPaceFps) <<= 1;", budget))
         for name, statement, needle in cases:
             with self.subTest(name):
                 self.assert_caught(self.inject_in_smoke(statement), needle)
