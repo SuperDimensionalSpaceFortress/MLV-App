@@ -1994,6 +1994,20 @@ class SummarySplitR11(unittest.TestCase):
                 v = rmv.classify(run, "t.py::test_a")
                 self.assertLess(time.perf_counter() - start, 2.0, v)
                 self.assertEqual((v.status, v.code), (rmv.REFUSED, "cnc-short-summary"), v)
+        # r14 adversary e905500a-A1 (honest output): a subTest whose parameter holds 24000 spaces prints a unittest header
+        # that `.+?\s*$` backtracked over quadratically (6.9 s) before the header-length guard; both callers (:715, :725)
+        out = self._saved_ut("class T(unittest.TestCase):\n    def test_x(self):\n"
+                             "        with self.subTest(x=' ' * 24000):\n            self.assertEqual(1, 2)\n")
+        self.assertGreater(max(len(ln) for ln in out.splitlines()), 24000)
+        start = time.perf_counter()
+        v = rmv.classify(out, "t.T.test_x")
+        self.assertLess(time.perf_counter() - start, 2.0, v)
+        self.assertEqual((v.status, v.code), (rmv.REFUSED, "cnc-identity"), v)
+        # control: a short subTest header is still read
+        out = self._saved_ut("class T(unittest.TestCase):\n    def test_x(self):\n"
+                             "        with self.subTest(x='  a  '):\n            self.assertEqual(1, 2)\n")
+        v = rmv.classify(out, "t.py:5")
+        self.assertEqual((v.status, v.code), (rmv.PASS, "assertion-failed"), (v, out))
         # control: a summary line just under the bound is still read
         v = rmv.classify(text("XFAIL t.py::test_b - " + "r" * 3000, "1 xfailed"), "t.py::test_a")
         self.assertEqual((v.status, v.code), (rmv.PASS, "assertion-failed"), v)

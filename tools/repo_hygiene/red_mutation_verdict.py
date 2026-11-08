@@ -276,8 +276,10 @@ _EQ_RULE = re.compile(r"^={20,}\s*$")
 # with its caret lines), so a string's text `File "victim.py", line 2` is source, never a frame, and never a refusal.
 _FRAME = re.compile(r'^  File "(?P<file>.+)", line (?P<line>[0-9]+)(?:, in .*)?[ \t]*$')
 _FRAME_SHAPE = re.compile(r'^  File ".*", line ')
-_UT_HEAD = re.compile(r"^(?P<kind>FAIL|ERROR): (?P<name>.+?)(?: \((?P<ident>[^()]*)\))?(?: \(.*\))?\s*$")
-_UT_KIND = re.compile(r"^(?P<kind>FAIL|ERROR): (?P<rest>.+?)\s*$")
+# r14 (adversary e905500a-A1): `rest` ends at its LAST non-space character, matched greedily. The lazy `.+?\s*$` it replaces
+# rescanned the trailing whitespace from every position, quadratic in a run of spaces (a subTest parameter `' ' * 24000`
+# took 6.9 s before the header-length guard). The same lazy form, _UT_HEAD, was unused and is removed.
+_UT_KIND = re.compile(r"^(?P<kind>FAIL|ERROR): (?P<rest>.*\S)\s*$")
 _DASHES = re.compile(r"^-{70}\s*$")
 _PT_CAPTURED = re.compile(r"^-{3,} Captured .+ -{3,}\s*$")
 _CHAIN = ("The above exception was the direct cause of the following exception:",
