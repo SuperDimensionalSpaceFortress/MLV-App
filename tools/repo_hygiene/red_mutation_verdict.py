@@ -23,6 +23,14 @@ CLI (exit 0 = PASS, 1 = REFUSED, 2 = bad usage or an unreadable --output file)::
     py -3 tools/repo_hygiene/red_mutation_verdict.py verdict --output red.txt --expect tools/x/test_y.py:123
     py -3 tools/repo_hygiene/red_mutation_verdict.py probe --bug 3 --fix 3 --window 3 3
 
+THREAT MODEL (r14 hub ruling, HUB-TICK 20261107T2334Z, rule 1): "The checker reads runner TEXT. It guards against HONEST
+probes that fail for the wrong reason. It does not guard against HOSTILE test code. A test that builds a code object with
+a newline in co_name or co_filename (types.CodeType.replace, compile() with a crafted filename) could just as well print a
+whole fake report to stdout. No text parser can detect that. Python source cannot declare a function name holding a line
+break, so honest code never produces this shape." A false PASS from honest runner output is a defect; a forged report
+built by the test itself is out of scope. The ``traceback line break`` refusal below is a cheap fail-closed tripwire on top
+of that ruling, not a promise to detect hostile text.
+
 NARROWED PROMISE (r4 hub ruling; three adversary passes found 8, 9 and 6 new forged-text cases, so more
 instance parsing does not converge): for any input it cannot classify with certainty the checker answers
 REFUSED with a reason that starts ``COULD-NOT-CHECK (<typed reason>)``. That is the existing non-zero refusal
@@ -96,6 +104,17 @@ REFUSED with a reason that starts ``COULD-NOT-CHECK (<typed reason>)``. That is 
   frame is the line at exactly two spaces that the traceback module prints (r12, r11 pass 3 A3): a frame's source lines
   are printed four or more spaces in, so source text that reads ``File "victim.py", line 2`` (a multi-line string) is
   never a frame, and a source line holding ``", line `` twice is not refused (Dot e3f43d7).
+* ``traceback line break`` (r14 hub ruling; r13 adversary fde24fbc A1/A2, Dot 4153241; ``cnc-traceback-line-break``): a
+  line break inside a code object's name or file name prints a forged line. (a) In a unittest traceback, a second
+  column-0 line shaped like an exception head (``Name:`` or ``Name`` alone) after the exception line, or a frame header
+  after it, is COULD-NOT-CHECK: the real exception line is printed after the last frame, so a forged one before it always
+  trips this. A message line of that shape trips it too (the safe direction); the chaining sentences never do. (b) A frame
+  that DECIDES a ``file:line`` PASS and is printed directly next to another frame header (a unittest ``  File`` line, a
+  pytest ``path:N:`` location line), with no source line between them, is COULD-NOT-CHECK. A sourceless frame (exec'd or
+  frozen code) that decides nothing keeps its verdict.
+* ``long summary line`` (r14, Dot 4153241): a short-summary line (PASSED/SKIPPED/XFAIL/XPASS, and FAILED/ERROR, the same
+  class) longer than ``_SUMMARY_SCAN_MAX`` (4096) characters is ``short-summary line`` COULD-NOT-CHECK before its id or
+  reason is scanned (the scan checks every candidate end of its id as its own prefix, quadratic in the line).
 * ``summary split`` (r11, r10 adversary A1): a class or function name set through ``globals()`` may hold `` - ``, so the
   first `` - `` of a ``FAILED``/``ERROR`` line is only one candidate end of its node id, and an exception class of ANY
   name may follow it (``type('Bad-Name', ...)`` prints ``t.Bad-Name``; r11 pass 1 A1), so every later `` - `` with a node
@@ -227,7 +246,7 @@ REASON_CODES = frozenset((
     "cnc-chained", "cnc-captured", "cnc-expectation", "cnc-line-framing", "cnc-decoding", "cnc-line-number", "cnc-frame",
     "cnc-identity", "cnc-pairing", "cnc-summary-split", "cnc-exception-type", "cnc-short-summary", "cnc-result-line",
     "cnc-no-result-line", "cnc-no-ran-footer", "cnc-runner", "cnc-count", "cnc-internal-error",
-    "cnc-bracket-before-last-segment",
+    "cnc-bracket-before-last-segment", "cnc-traceback-line-break",
     # REFUSED, probe_discriminates
     "probe-number", "probe-nan", "probe-infinite", "probe-empty-window", "probe-both-inside", "probe-neither-inside",
     "probe-bug-inside",
@@ -263,6 +282,11 @@ _DASHES = re.compile(r"^-{70}\s*$")
 _PT_CAPTURED = re.compile(r"^-{3,} Captured .+ -{3,}\s*$")
 _CHAIN = ("The above exception was the direct cause of the following exception:",
           "During handling of the above exception, another exception occurred:")
+# r14 HUB RULING (fde24fbc-A1): a column-0 line shaped like an exception head, `Name:` or `Name` alone (a dotted module
+# path and a `<locals>` qualname included; \w is Unicode). In one unittest traceback's exception region a SECOND such line
+# is COULD-NOT-CHECK. The real exception line is always printed, so a forged one always trips it; a message line of this
+# shape trips it too, which is the safe direction. The chaining sentences hold spaces, so they never match.
+_EXC_HEAD_SHAPE = re.compile(r"^[^\W\d][\w.<>]*(?::|\s*$)")
 _PT_SECTION = re.compile(r"^_{2,} (?P<name>.+?) _{2,}\s*$")
 _PT_TOP = re.compile(r"^={3,} (?P<title>.+?) ={3,}\s*$")
 _PT_LOC = re.compile(r"^(?P<file>[^\s:][^\n]*?\.py):(?P<line>[0-9]+):(?: (?P<rest>.*))?$")
@@ -474,6 +498,9 @@ class Failure:
     note: str = ""
     odd: str = ""  # set when the identity cannot be told with certainty: verdict() refuses the whole run
     exc: str = ""  # the exception line the runner printed for this failure ("TypeError: boom"), "" when none was read
+    # r14: indices into `frames` of the frame headers printed directly next to another frame header (no source line between
+    # them). Such a frame may be a line break inside a code object's name or file name; it never decides a file:line PASS.
+    joined: set[int] = field(default_factory=set)
 
 
 @dataclass
@@ -617,24 +644,47 @@ def _ut_identities(rest: str) -> list[tuple[str, str]]:
     return found
 
 
-def _ut_walk(block: list[str]) -> tuple[list[tuple[str, int]], str]:
-    """(frames, exception line) of the REAL tracebacks in a unittest block. A traceback is entered only at
-    `Traceback (most recent call last):` (the first, or one that follows a chaining line); inside it the
-    indented `File "...", line N` lines are frames and the first unindented line is the exception line, after
-    which message text (which may print anything, a forged File line included) is ignored."""
+def _line_break(what: str, ln: str) -> _Reason:
+    return _Reason("cnc-traceback-line-break", f"traceback line break: {what} ({ln.strip()[:60]!r}); a line break inside "
+                   "a frame's function or file name prints a forged line here, so which line the runner wrote cannot be "
+                   "told")
+
+
+def _ut_walk(block: list[str]) -> tuple[list[tuple[str, int]], str, set[int], str]:
+    """(frames, exception line, joined frames, line-break reason) of the REAL tracebacks in a unittest block. A traceback
+    is entered only at `Traceback (most recent call last):` (the first, or one that follows a chaining line); inside it
+    the indented `File "...", line N` lines are frames and the first unindented line is the exception line. Its message
+    text is never read as a frame or an exception line, but (r14 tripwire, see _EXC_HEAD_SHAPE) a second column-0 line
+    shaped like an exception head, or a frame header, in that exception region gives the line-break reason: the block
+    is COULD-NOT-CHECK. It is the block's `odd` reason, so a more basic one (a green run, no result line) still leads."""
     frames: list[tuple[str, int]] = []
+    joined: set[int] = set()
+    broke = ""
     exc, in_tb, expect = "", False, True
+    region, prev_frame = False, False  # inside an exception region; the last non-blank traceback line was a frame header
     for ln in block:
         if not in_tb:
             if ln.rstrip() == "Traceback (most recent call last):" and expect:
-                in_tb, exc, expect = True, "", False
+                in_tb, exc, expect, region, prev_frame = True, "", False, False, False
             elif ln.strip() in _CHAIN:
-                expect = True
+                expect, region = True, False
+            elif region and not broke:
+                if _DASHES.match(ln):
+                    region = False  # the rule unittest prints after the last block: the runner's footer follows
+                elif _FRAME_SHAPE.match(ln):
+                    # r14 (a), part 2: a column-0 line (the exception line read above) before a frame header. The real
+                    # exception line is printed after the last frame, so the earlier one may be a co_name continuation.
+                    broke = _line_break("a traceback frame follows a column-0 line of its traceback", ln)
+                elif ln[:1] not in ("", " ", "\t") and _EXC_HEAD_SHAPE.match(ln):
+                    # r14 (a), part 1 (fde24fbc-A1): a second exception-head-shaped line: the real one is always printed,
+                    # so a forged one before it (`test_x\nAssertionError: forged`) always trips this
+                    broke = _line_break("a second exception line in one traceback", ln)
             continue
         if not ln.strip():
             continue
         if ln[:1].isspace():
             if not _FRAME_SHAPE.match(ln):
+                prev_frame = False
                 continue  # a source or caret line: what it says is never read (r12, Dot e3f43d7; r11 pass 3 A3)
             if ln.count('", line ') > 1:
                 # r11 pass 2 A1: a function's co_name may hold `"/victim.py", line 2, in target`, so the line reads as two
@@ -646,10 +696,13 @@ def _ut_walk(block: list[str]) -> tuple[list[tuple[str, int]], str]:
             if not m:
                 raise _Unclassifiable("cnc-frame", f"traceback frame {ln.strip()[:60]!r}: its line number is not ASCII "
                                       "digits followed by the frame's own delimiter (`, in <name>` or the end of the line)")
+            if prev_frame:  # r14 (b) (fde24fbc-A2): two frame headers with no source line between them
+                joined.update((len(frames) - 1, len(frames)))
             frames.append((m["file"], _line_no(m["line"])))
+            prev_frame = True
             continue
-        exc, in_tb = ln, False
-    return frames, exc
+        exc, in_tb, region = ln, False, True
+    return frames, exc, joined, broke
 
 
 def _parse_unittest(lines: list[str]) -> list[Failure]:
@@ -672,7 +725,7 @@ def _parse_unittest(lines: list[str]) -> list[Failure]:
         head = _UT_KIND.match(body[0])
         if not head:
             continue
-        frames, exc_line = _ut_walk(block)
+        frames, exc_line, joined, broke = _ut_walk(block)
         collection = ("_FailedTest" in body[0]
                       or any("unittest/loader.py" in ln.replace("\\", "/") or _IMPORT_ERR.match(ln) for ln in block))
         if len(head["rest"]) > _UT_HEADER_MAX:  # adversary A2: bounded work, and no real test name is this long
@@ -700,11 +753,13 @@ def _parse_unittest(lines: list[str]) -> list[Failure]:
             odd = _bracket_reason("the unittest identity", full)
         elif ids and (_empty_segment(full) or any(tok in full for tok in ("/", "\\", "::"))):
             odd = _Reason("cnc-identity", f"empty or foreign segment in the test identity {full[:60]!r}")
+        elif broke:  # r14 (a): the traceback's exception region holds a second exception line or a frame (see _ut_walk)
+            odd = broke
         # FAIL is only unittest's word for "failureException was raised", and a test may set that to any
         # class: the assertion claim rests on the exception actually printed.
         is_assertion = bool(_UT_ASSERT.match(exc_line))
         out.append(Failure(ids, frames, assertion=head["kind"] == "FAIL" and is_assertion and not collection,
-                           collection=collection, note=body[0].strip(), odd=odd, exc=exc_line.strip()))
+                           collection=collection, note=body[0].strip(), odd=odd, exc=exc_line.strip(), joined=joined))
     return out
 
 
@@ -828,6 +883,12 @@ def _section_tells(section: Failure, node: str) -> bool:
     return _same_file(_norm_path(_split_top(node, "::")[0]), _norm_path(section.frames[0][0]))
 
 
+# r14 (Dot 4153241): the longest short-summary line whose id and reason are scanned. A longer one is COULD-NOT-CHECK
+# (`cnc-short-summary`); at this length the per-prefix checks of _other_line (PASSED/SKIPPED/XFAIL/XPASS) and of
+# _summary_readings (every ' - ' of a FAILED/ERROR line, the same class) stay a few milliseconds.
+_SUMMARY_SCAN_MAX = 4096
+
+
 def _other_line(word: str, line: str) -> tuple[int, str]:
     """(how many tests the line stands for, "") for a PASSED/SKIPPED/XFAIL/XPASS summary line of exactly the shape pytest
     prints under ``-rA``; (0, reason) for anything else. ASCII only, so no wide or invisible character can hide a line
@@ -835,6 +896,10 @@ def _other_line(word: str, line: str) -> tuple[int, str]:
     body = line[len(word) + 1:]
     if not line.isascii() or not line.isprintable():
         return 0, f"{word} line with a non-ASCII or control character"
+    if len(line) > _SUMMARY_SCAN_MAX:
+        # r14 (Dot 4153241, :845/:859): every candidate end of the location or id below is checked as its own prefix, so
+        # the work grows with the square of the line; a line this long is refused before any of it is read
+        return 0, f"a {word} line of {len(line)} characters is longer than {_SUMMARY_SCAN_MAX}: its reason is not scanned"
     if word == "SKIPPED":
         m = _SKIPPED_BODY.fullmatch(body)
         if not m:
@@ -918,7 +983,7 @@ def _parse_pytest(lines: list[str], stats: dict | None = None) -> list[Failure]:
         if cur is not None:
             stats["sections"] += 1
             out.append(Failure([cur["name"]], cur["frames"], cur["assertion"], cur["collection"], cur["name"],
-                               exc=cur["first"]))
+                               exc=cur["first"], joined=cur["joined"]))
         cur = None
 
     # Width is checked only INSIDE a captured block, the one place a test can print: there a real rule has the
@@ -962,6 +1027,13 @@ def _parse_pytest(lines: list[str], stats: dict | None = None) -> list[Failure]:
                 stats["words"][word] += n
                 if why:
                     stats["bad"] = stats["bad"] or f"{line[:50]!r}: {why}"
+            if word in ("FAILED", "ERROR") and len(line) > _SUMMARY_SCAN_MAX:
+                # r14 (the FAILED/ERROR sibling of Dot 4153241 :845/:859): every ' - ' is a reading, each checked as its own
+                # prefix; the line still counts, and is refused before any reading of it is built
+                stats["summary"] += 1
+                stats["bad"] = stats["bad"] or (f"a {word} line of {len(line)} characters is longer than "
+                                                f"{_SUMMARY_SCAN_MAX}: its node id and message are not scanned")
+                continue
             for word in ("FAILED", "ERROR"):
                 readings = _summary_readings(line, word)
                 if not readings:
@@ -1022,7 +1094,7 @@ def _parse_pytest(lines: list[str], stats: dict | None = None) -> list[Failure]:
             captured = False
             name = m_sec["name"]
             cur = {"name": name, "frames": [], "assertion": None, "first": "",
-                   "collection": name.startswith("ERROR collecting")}
+                   "collection": name.startswith("ERROR collecting"), "joined": set(), "prev_loc": False}
             continue
         if cur is None:
             continue
@@ -1033,6 +1105,11 @@ def _parse_pytest(lines: list[str], stats: dict | None = None) -> list[Failure]:
             continue
         if captured:
             continue
+        # r14 (b): was the previous non-blank line of this section a location line? Real pytest never prints two in a row
+        # (long: source, `E` lines, then the location; short: the location, then its source or `???`)
+        was_loc = cur["prev_loc"]
+        if line.strip():
+            cur["prev_loc"] = False
         if line.startswith("E") and line[1:2] in (" ", "\t"):
             first = line[1:].strip()
             if cur["assertion"] is None:
@@ -1048,7 +1125,10 @@ def _parse_pytest(lines: list[str], stats: dict | None = None) -> list[Failure]:
             raise _Unclassifiable("cnc-frame", f"location line {line.strip()[:60]!r} holds more than one `<file>.py:N:`: "
                                   "which one is the frame cannot be told")
         if m_loc:
+            if was_loc:  # r14 (b) (fde24fbc-A2 pytest sibling: `victim.py:2: in injected` then `real.py:1: AssertionError`)
+                cur["joined"].update((len(cur["frames"]) - 1, len(cur["frames"])))
             cur["frames"].append((m_loc["file"], _line_no(m_loc["line"])))
+            cur["prev_loc"] = True
         elif _PT_LOC_SHAPE.match(line):
             raise _Unclassifiable("cnc-frame", f"location line {line.strip()[:60]!r}: its line number is not ASCII digits "
                                   "followed by the runner's own `:` delimiter")
@@ -1235,12 +1315,17 @@ def parse_run(text: str | list[str]) -> Parsed:
                   mismatch=bad or _count_mismatch(lines, len(ut), stats, result), result=result)
 
 
+def _site_frames(failure: Failure, site: re.Match) -> list[int]:
+    """Indices of the failure's frames that a `file:line` expectation names."""
+    want_file, want_line = _norm_path(site["file"]), _line_no(site["line"])
+    return [k for k, (file, line) in enumerate(failure.frames)
+            if line == want_line and _ends_with(_norm_path(file), want_file)]
+
+
 def _matches(failure: Failure, expected: str) -> bool:
     site = _EXPECT_SITE.match(expected)
     if site:
-        want_file, want_line = _norm_path(site["file"]), _line_no(site["line"])
-        return any(line == want_line and _ends_with(_norm_path(file), want_file)
-                   for file, line in failure.frames)
+        return bool(_site_frames(failure, site))
     want = _segs(expected)
     return any(_id_ends_with(_segs(i), want) for i in failure.ids)
 
@@ -1349,6 +1434,14 @@ def _verdict(lines: list[str] | None, expected: str) -> tuple[str, _Reason]:
         if len(named) > 1:
             return REFUSED, _Reason("ambiguous-expectation", f"{expected} is ambiguous: it matches {len(named)} failing "
                                     "tests (" + ", ".join(named[:4]) + "); name the class")
+    site = _EXPECT_SITE.match(expected)
+    for f in hit:
+        # r14 (b): the frame that DECIDES a file:line PASS was printed directly next to another frame header, so it may be
+        # a line break inside a code object's name or file name (fde24fbc-A2). A frame that decides nothing is not read.
+        if f.assertion and site and any(k in f.joined for k in _site_frames(f, site)):
+            why = _line_break(f"the frame that decides {expected} is printed directly next to another frame header, with "
+                              "no source line between them", expected)
+            raise _Unclassifiable(why.code, why)
     if any(f.assertion for f in hit):
         return PASS, _Reason("assertion-failed", f"assertion failed at {expected}")
     if hit:

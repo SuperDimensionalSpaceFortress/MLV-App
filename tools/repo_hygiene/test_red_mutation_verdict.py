@@ -1834,6 +1834,170 @@ class SummarySplitR11(unittest.TestCase):
         v = rmv.classify(section, "t.py::TestA::test_x[1.5]")
         self.assertEqual((v.status, v.code), (rmv.PASS, "assertion-failed"), v)
 
+    # r14 HUB RULING (HUB-TICK 20261107T2334Z; r13 adversary fde24fbc A1/A2, Dot 4153241): a line break inside a frame's
+    # metadata (a code object's co_name or filename) forges the next line. Out of threat model (hostile test code), but a
+    # cheap fail-closed tripwire refuses the shapes it leaves, typed `cnc-traceback-line-break`.
+    LINE_BREAK = "cnc-traceback-line-break"
+
+    @staticmethod
+    def _saved_ut(src: str, co_name: str | None = None) -> str:
+        """The unittest text of module `t` (``import unittest`` then `src`) whose ``T.test_x`` code object is renamed to
+        `co_name`: the r13 adversary's ``saved()``, run in this process so the code object can be replaced."""
+        import importlib.util
+        import io
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp, "t.py")
+            path.write_text("import unittest\n" + src, encoding="utf-8", newline="\n")
+            spec = importlib.util.spec_from_file_location("t", path)
+            mod = importlib.util.module_from_spec(spec)
+            saved, sys.modules["t"] = sys.modules.get("t"), mod
+            try:
+                spec.loader.exec_module(mod)
+                if co_name is not None:
+                    fn = mod.T.test_x
+                    fn.__code__ = fn.__code__.replace(co_name=co_name)
+                buf = io.StringIO()
+                unittest.TextTestRunner(stream=buf, verbosity=0).run(
+                    unittest.defaultTestLoader.loadTestsFromTestCase(mod.T))
+            finally:
+                if saved is None:
+                    sys.modules.pop("t", None)
+                else:
+                    sys.modules["t"] = saved
+        return buf.getvalue()
+
+    def _line_break(self, text: str, expected: str) -> None:
+        v = rmv.classify(text, expected)
+        self.assertEqual((v.status, v.code), (rmv.REFUSED, self.LINE_BREAK), (v, text))
+
+    @staticmethod
+    def _ut_block(body: str) -> str:
+        return ("=" * 70 + "\nFAIL: test_x (t.T.test_x)\n" + "-" * 70 + "\nTraceback (most recent call last):\n" + body
+                + "\n\n" + "-" * 70 + "\nRan 1 test in 0.001s\n\nFAILED (failures=1)\n")
+
+    def test_traceback_line_break_is_could_not_check(self) -> None:
+        # fde24fbc-A1, exactly as written: failureException=TypeError, co_name `test_x\nAssertionError: forged`. The real
+        # TypeError gets a FAIL header and the forged line was read as the exception line: PASS on a TypeError.
+        a1 = self._saved_ut('class T(unittest.TestCase):\n    failureException = TypeError\n    def test_x(self):\n'
+                            '        raise TypeError("boom")\n', "test_x\nAssertionError: forged")
+        for expected in ("t.T.test_x", "t.py:5"):
+            with self.subTest(a1=expected):
+                self._line_break(a1, expected)
+        # fde24fbc-A2, exactly as written: co_name `test_x\n  File "victim.py", line 2, in target` adds a frame that does
+        # not exist, and it decides `victim.py:2`
+        a2 = self._saved_ut("class T(unittest.TestCase):\n    def test_x(self):\n        self.assertEqual(1,2)\n",
+                            'test_x\n  File "victim.py", line 2, in target')
+        cases = [("a2", a2, "victim.py:2"),
+                 # the compiled-filename sibling: the forged frame comes FIRST, directly followed by the real one
+                 ("filename", self._ut_block('  File "t.py", line 4, in test_x\n    exec(code)\n'
+                                             '  File "victim.py", line 2, in injected\n'
+                                             '  File "real.py", line 1, in <module>\nAssertionError'), "victim.py:2"),
+                 # rule (a) part 2: a column-0 line between `Traceback` and a later frame header (it was read as a
+                 # non-assertion exception line, so the frames after it were dropped)
+                 ("col0-before-frame", self._ut_block('  File "t.py", line 4, in test_x\n    helper()\nforged line\n'
+                                                      '  File "victim.py", line 2, in target\n    self.assertEqual(1, 2)\n'
+                                                      "AssertionError: 1 != 2"), "victim.py:2"),
+                 # rule (a) part 1 with a forged frame after the forged exception line
+                 ("two-heads", self._ut_block('  File "t.py", line 5, in test_x\nAssertionError: forged\n'
+                                              '  File "t.py", line 9, in helper\n    raise TypeError("boom")\n'
+                                              "TypeError: boom"), "t.py:5")]
+        for name, text, expected in cases:
+            with self.subTest(case=name):
+                self._line_break(text, expected)
+        # the pytest sibling (:1051), hand-written as pytest's long and short reprs print it (the pytest form below runs the
+        # real formatter when pytest is importable): compile('assert False\n', 'victim.py:2: in injected\nreal.py', 'exec')
+        long_ = ("=== FAILURES ===\n___ test_x ___\n\n    def test_x():\n>       exec(code)\n\nt.py:4: \n"
+                 "_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _\n\n>   ???\nE   AssertionError\n\n"
+                 "victim.py:2: in injected\nreal.py:1: AssertionError\n=== 1 failed in 0.1s ===\n")
+        short = ("=== FAILURES ===\n___ test_x ___\nt.py:4: in test_x\n    exec(code)\nvictim.py:2: in injected\n"
+                 "real.py:1: in <module>\n    ???\nE   AssertionError\n=== 1 failed in 0.1s ===\n")
+        for name, text in (("long", long_), ("short", short)):
+            with self.subTest(pytest=name):
+                self._line_break(text, "victim.py:2")
+
+    def test_traceback_line_break_pytest_real_formatter(self) -> None:
+        try:
+            import pytest
+        except ImportError:
+            self.skipTest("pytest is not importable; the hand-written equivalent runs in the test above")
+        code = compile("assert False\n", "victim.py:2: in injected\nreal.py", "exec")
+        for style in ("long", "short"):
+            try:
+                exec(code, {})
+            except AssertionError:
+                body = str(pytest.ExceptionInfo.from_current().getrepr(style=style, showlocals=False, tbfilter=False))
+            text = "=== FAILURES ===\n___ test_x ___\n" + body + "\n=== 1 failed in 0.1s ===\n"
+            with self.subTest(style=style):
+                self._line_break(text, "victim.py:2")
+
+    def test_traceback_line_break_controls_keep_their_verdict(self) -> None:
+        passing = rmv.PASS, "assertion-failed"
+        # an ordinary AssertionError FAIL, and multi-line assertEqual diff messages (list, multi-line string, dict)
+        for src, line in (("        self.assertEqual(1, 2)\n", 4), ("        self.assertEqual([1, 2], [1, 3])\n", 4),
+                          ('        self.assertEqual("a\\nb\\n", "a\\nc\\n")\n', 4),
+                          ('        self.assertEqual({"a": 1, "b": [1, 2]}, {"a": 2, "b": [1, 2]})\n', 4)):
+            text = self._saved_ut("class T(unittest.TestCase):\n    def test_x(self):\n" + src)
+            for expected in ("t.T.test_x", f"t.py:{line}"):
+                with self.subTest(src=src, expected=expected):
+                    v = rmv.classify(text, expected)
+                    self.assertEqual((v.status, v.code), passing, (v, text))
+        # a chained exception keeps its verdict
+        chained = self._ut_block('  File "t.py", line 4, in test_x\n    f()\nKeyError: 1\n\n'
+                                 "During handling of the above exception, another exception occurred:\n\n"
+                                 "Traceback (most recent call last):\n"
+                                 '  File "t.py", line 6, in test_x\n    self.fail()\nAssertionError: None')
+        self.assertEqual(rmv.classify(chained, "t.py:6").code, "cnc-chained")
+        # sourceless frames that do not decide the verdict (exec'd or frozen code prints no source line)
+        for body in ('  File "t.py", line 8, in test_a\n    exec(code)\n  File "<string>", line 1, in <module>\n'
+                     "AssertionError: 3 != 4",
+                     '  File "t.py", line 8, in test_a\n    run()\n  File "<frozen a>", line 1, in x\n'
+                     '  File "<frozen b>", line 2, in y\nAssertionError: 3 != 4'):
+            with self.subTest(body=body):
+                v = rmv.classify(self._ut_block(body), "t.py:8")
+                self.assertEqual((v.status, v.code), passing, v)
+        # pytest: the long and short reprs of an ordinary two-frame assertion
+        long_ = ("=== FAILURES ===\n___ test_x ___\n\n    def test_x():\n>       helper()\n\nt.py:4: \n"
+                 "_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _\n\n    def helper():\n>       assert False\nE       assert False\n\n"
+                 "u.py:5: AssertionError\n=== 1 failed in 0.1s ===\n")
+        short = ("=== FAILURES ===\n___ test_x ___\nt.py:4: in test_x\n    helper()\nu.py:5: in helper\n    assert False\n"
+                 "E   assert False\n=== 1 failed in 0.1s ===\n")
+        for text in (long_, short):
+            for expected in ("u.py:5", "t.py:4"):
+                with self.subTest(text=text[-60:], expected=expected):
+                    v = rmv.classify(text, expected)
+                    self.assertEqual((v.status, v.code), passing, v)
+
+    def test_long_nonfailure_reason_is_bounded(self) -> None:
+        # Dot 4153241 (:845/:859): every prefix of a SKIPPED/XFAIL/XPASS reason was materialized and checked, quadratic in
+        # its length. A 200 KB reason must finish in under 2 s, and it never PASSes as anything but the run's own failure.
+        import time
+
+        def text(line: str, count: str) -> str:
+            return (f"=== short test summary info ===\n{line}\nFAILED t.py::test_a - AssertionError\n"
+                    f"=== 1 failed, {count} in 0.1s ===\n")
+        size = 200 * 1024
+        for line, count in (("SKIPPED [1] t.py:3: " + ("x:1: " * (size // 5)), "1 skipped"),
+                            ("XFAIL t.py::test_b - " + ("a - " * (size // 4)), "1 xfailed"),
+                            ("XPASS t.py::test_b - " + ("a - " * (size // 4)), "1 xpassed"),
+                            ("SKIPPED [1] t.py:3: " + ("x" * size), "1 skipped")):
+            with self.subTest(line=line[:30]):
+                start = time.perf_counter()
+                v = rmv.classify(text(line, count), "t.py::test_a")
+                self.assertLess(time.perf_counter() - start, 2.0, v)
+                self.assertEqual((v.status, v.code), (rmv.REFUSED, "cnc-short-summary"), v)
+        # the FAILED/ERROR sibling: every ' - ' of the line is a reading, each checked as its own prefix
+        for word in ("FAILED", "ERROR"):
+            run = (f"=== short test summary info ===\n{word} t.py::test_a - AssertionError: " + ("a - " * (size // 4))
+                   + f"\n=== 1 {'failed' if word == 'FAILED' else 'error'} in 0.1s ===\n")
+            with self.subTest(word=word):
+                start = time.perf_counter()
+                v = rmv.classify(run, "t.py::test_a")
+                self.assertLess(time.perf_counter() - start, 2.0, v)
+                self.assertEqual((v.status, v.code), (rmv.REFUSED, "cnc-short-summary"), v)
+        # control: a summary line just under the bound is still read
+        v = rmv.classify(text("XFAIL t.py::test_b - " + "r" * 3000, "1 xfailed"), "t.py::test_a")
+        self.assertEqual((v.status, v.code), (rmv.PASS, "assertion-failed"), v)
+
 
 class ReasonCodeR11(unittest.TestCase):
     """r11, r10 adversary A2: every verdict carries a reason CODE the checker sets where it writes the reason."""
