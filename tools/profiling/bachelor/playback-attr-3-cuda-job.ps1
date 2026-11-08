@@ -5235,6 +5235,17 @@ function Test-CorePartitionMeasuredApp($Helper, [int64]$MeasuredPid, [int64]$Mea
     # reuse, and a successor with the same start ticks (an unsampled clock step) and the same path reads exactly as the app on every poll and in every
     # enumeration, so its life, samples and load could be the successor's. Only a held handle rules that out. The helper writes pinned on every record.
     if ($a.pinned -eq $false) { return @{ why = 'measured-app-identity-unpinned' } }
+    # CORE-PARTITION-PREDECESSOR-CLOCK-STEP-1 (adversary A1@40d2259d, #696 r14b; its restatement A1@92715958, #777): the selection above is pid plus a
+    # start inside the launch window, and the helper's app must equal the candidate on pid AND birth stamp (helper-app-not-measured-pid below), but
+    # neither proves the instance is the runner's process. A predecessor on the pid whose gone stamp a tolerated clock step moved past the launch, or a
+    # successor that inherited the pid, path and (through an unsampled step) the birth stamp and was first seen after the app exited, passes both. The
+    # runner's process is the one OBSERVED across the runner's interval: first seen (firstSeenUtcTicks, a stamp whose clock gap the helper sampled)
+    # within the same 2 s launch tolerance of the launch, and, once seen gone, not seen gone more than 2 s before the runner's exit; each side is
+    # widened by $slack. A gone time still unset is judged below (coverage-*). Refused, typed; nothing of it is credited. Either wrong binding needs the
+    # runner's app never listed (listed, it is a second candidate, measured-pid-ambiguous, or its gone key makes the successor unidentified); an app whose
+    # whole life fell between two polls in a runner window shorter than the two tolerances is the residual (LIMIT A3, CORE-PARTITION-PROCESS-START-EVENTS-1).
+    if ($a.first - $slack -gt $MeasuredStartTicks + 20000000) { return @{ why = 'measured-app-seen-after-runner-launch' } }
+    if ($null -ne $a.gone -and $a.gone + $slack -lt $MeasuredEndTicks - 20000000) { return @{ why = 'measured-app-gone-before-runner-exit' } }
     foreach ($o in $all) {
         if ([object]::ReferenceEquals($o, $a)) { continue }
         $oStart = if ($null -ne $o.start) { $o.start - $slack } else { [int64]::MinValue }

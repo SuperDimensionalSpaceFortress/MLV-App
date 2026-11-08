@@ -1291,7 +1291,9 @@ $cs = Get-CorePartitionCounterSummary $samples 1 4096
 $r.counters = @($cs.appSamples, $cs.pcoreMHzMean, $cs.ecoreMHzMean, $cs.pcoreParkedSampleFraction)
 $r.workers = @((Get-CorePartitionWorkerThreads "playback_smoke.start session=1 worker_threads=16 x=1`nplayback_smoke.start session=3 scale_request=1 worker_threads=12 start_serial=2`n").value,
     (Get-CorePartitionWorkerThreads "nothing here").why, (Get-CorePartitionWorkerThreads '').why)
-$one = '"instances":[{"pid":5000,"startUtcTicks":639286128040000000,"firstSeenUtcTicks":639286128041000000,"firstMs":4100,"lastSeenUtcTicks":639286128200000000,"goneUtcTicks":639286128202000000,"aliveMs":16000,"goneMs":16200}],"clockSkewMaxMs":0'
+# the runner's 5000 (launch +3 s, exit +23 s): seen +4.1 s, last alive +22.0 s, seen gone +22.2 s (CORE-PARTITION-PREDECESSOR-CLOCK-STEP-1: its observed
+# life covers the runner's interval within the 2 s tolerances)
+$one = '"instances":[{"pid":5000,"startUtcTicks":639286128040000000,"firstSeenUtcTicks":639286128041000000,"firstMs":4100,"lastSeenUtcTicks":639286128220000000,"goneUtcTicks":639286128222000000,"aliveMs":16000,"goneMs":16200}],"clockSkewMaxMs":0'
 $helper = ('{"topologyCheck":{"ok":true,"reason":null,"pMask":4095,"eMask":1044480},"helperAffinityObserved":1044480,"app":{"pid":5000,"startUtcTicks":639286128040000000,"affinityFirst":4095,"affinityLast":4095},"load":{"seconds":10.0,"bytes":20000000000,"joined":true},"samples":[{"app":true,"m":1000,"inst":["0,0","0,12"],"freq":[2500,2500],"perf":[160,80],"park":[0,0]}],' + $one + '}') | ConvertFrom-Json
 $w = @{ value = 16; why = $null }
 $b2 = Get-CorePartitionScalars $helper $feed 4095 1044480 8 $w $null @mp
@@ -1434,6 +1436,32 @@ foreach ($k in $clockCases.Keys) {
     if ($hasClock) { $mpk.ClockSkewMs = $clockCases[$k][1] }
     $sc = Get-CorePartitionScalars $clockCases[$k][0] $feed 4095 1044480 8 $w $null $false @mpk
     $r.clock[$k] = @($sc.corePartitionTopologyOk, $sc.benchAffinityApplied, $sc.partitionLoadApplied, $sc.appAffinityObserved, $sc.partitionLoadGBps, $sc.pcoreMHzMean, [string]$sc.corePartitionNullReasons)
+}
+# CORE-PARTITION-PREDECESSOR-CLOCK-STEP-1: the runner launched its 5000 at +4 s and saw it exit at +24 s. Each record holds ONE recorded 5000 and
+# the helper bound it, so only the measured instance's own interval can tell it is not the runner's process.
+# (1) adversary OPEN A1@40d2259d (#696 r14b): a predecessor 5000 started +2.1 s, last alive +3.8 s, seen gone at real +3.9 s (goneMs 3900), but an
+# 800 ms forward step (under the 1000 ms tolerance; the helper's gap sample at that stamp says 800) stamps its gone time +4.7 s, past the launch.
+# (2) adversary A1@92715958 (#777 restatement): the runner's 5000 ran +4.05..+23.9 s unseen; a successor on the released pid with the same path and,
+# through an unsampled clock step, the same birth stamp (+4.05 s) is first seen at +24.2 s, after the app exited, and seen gone at +25.1 s.
+function New-CpStepRecord([string]$Inst, $Skew) { $o = New-CpRecord $Inst @($Inst); $o.clockSkewMaxMs = $Skew; $o }
+$stepCases = [ordered]@{
+    'predecessor-clock-step' = (New-CpStepRecord (New-CpInst 5000 2.1 2.2 3.8 4.7).Replace('"goneMs":4700', '"goneMs":3900') 800.0)
+    'successor-first-seen-after-exit' = (New-CpStepRecord (New-CpInst 5000 4.05 24.2 25.0 25.1).Replace('}', ',"pinned":true}') 0)
+    # the same refusals at zero gap, just past each 2 s tolerance: first seen +6.1 s; seen gone +21.9 s
+    'first-seen-past-tolerance' = (New-CpStepRecord (New-CpInst 5000 4.05 6.1 23.9 24.0) 0)
+    'gone-before-tolerance' = (New-CpStepRecord (New-CpInst 5000 4.05 4.2 21.8 21.9) 0)
+    # controls (accepted before and after): the runner's own 5000 observed across its whole interval under the same 800 ms gap; seen gone after the
+    # runner's exit stamp; and just inside each tolerance (first seen +5.9 s; seen gone +22.1 s)
+    'complete-interval-control' = (New-CpStepRecord (New-CpInst 5000 4.05 4.2 23.9 24.0) 800.0)
+    'gone-after-runner-exit-control' = (New-CpStepRecord (New-CpInst 5000 4.05 4.2 24.1 24.15) 0)
+    'first-seen-in-tolerance-control' = (New-CpStepRecord (New-CpInst 5000 4.05 5.9 23.9 24.0) 0)
+    'gone-in-tolerance-control' = (New-CpStepRecord (New-CpInst 5000 4.05 4.2 22.0 22.1) 0)
+}
+$r.step = [ordered]@{}
+foreach ($k in $stepCases.Keys) {
+    $sc = Get-CorePartitionScalars $stepCases[$k] $feed 4095 1044480 8 $w $null $false -MeasuredPid 5000 -MeasuredStartTicks ($L + 40000000) -MeasuredEndTicks ($L + 240000000) -ClockSkewMs 0
+    $v = Test-CorePartitionMeasuredApp $stepCases[$k] 5000 ($L + 40000000) ($L + 240000000) 0
+    $r.step[$k] = @($sc.corePartitionTopologyOk, $sc.benchAffinityApplied, $sc.partitionLoadApplied, $sc.appAffinityObserved, $sc.partitionLoadGBps, $sc.pcoreMHzMean, [string]$sc.corePartitionNullReasons, [string]$v.why)
 }
 # r8 A1: the job's own gap over its (wall ticks, monotonic ms) pairs: steady; a 100 s backward step; one pair; a non-numeric or missing reading
 $r.clockSkew = 'absent'
@@ -1618,7 +1646,7 @@ $CorePartitionBenchMask = [int64]4095
 $CorePartitionLoadMask = [int64]1044480
 $CorePartitionLoadThreads = 8
 $CorePartitionHelperMask = [int64]1044480
-$record = '{"schema":"mlv-app/core-partition-helper/v1","pid":4242,"topologyCheck":{"ok":true,"reason":null,"pMask":4095,"eMask":1044480},"helperAffinityObserved":1044480,"app":{"pid":5000,"startUtcTicks":639286128040000000,"affinityFirst":4095,"affinityLast":4095},"load":{"seconds":15,"bytes":30000000000,"joined":true},"samples":[{"app":true,"m":1000,"inst":["0,0","0,12"],"freq":[2500,2500],"perf":[160,80],"park":[0,0]}],"instances":[{"pid":5000,"startUtcTicks":639286128040000000,"firstSeenUtcTicks":639286128041000000,"firstMs":4100,"lastSeenUtcTicks":639286128200000000,"goneUtcTicks":639286128202000000,"aliveMs":16000,"goneMs":16200}],"clockSkewMaxMs":0}'
+$record = '{"schema":"mlv-app/core-partition-helper/v1","pid":4242,"topologyCheck":{"ok":true,"reason":null,"pMask":4095,"eMask":1044480},"helperAffinityObserved":1044480,"app":{"pid":5000,"startUtcTicks":639286128040000000,"affinityFirst":4095,"affinityLast":4095},"load":{"seconds":15,"bytes":30000000000,"joined":true},"samples":[{"app":true,"m":1000,"inst":["0,0","0,12"],"freq":[2500,2500],"perf":[160,80],"park":[0,0]}],"instances":[{"pid":5000,"startUtcTicks":639286128040000000,"firstSeenUtcTicks":639286128041000000,"firstMs":4100,"lastSeenUtcTicks":639286128220000000,"goneUtcTicks":639286128222000000,"aliveMs":16000,"goneMs":16200}],"clockSkewMaxMs":0}'
 # the runner's result.json: the launched pid and its launch..exit window, as the runner writes them (ISO 'o' strings)
 $runnerResult = '{"process":{"id":5000,"startedAtUtc":"' + [DateTime]::new([int64]639286128030000000, [DateTimeKind]::Utc).ToString('o') + '","endedAtUtc":"' + [DateTime]::new([int64]639286128230000000, [DateTimeKind]::Utc).ToString('o') + '"}}'
 $cases = @(
@@ -1934,6 +1962,31 @@ class CorePartitionPureHelperTests(unittest.TestCase):
         control = self.r["clock"]["under-tolerance-control"]
         self.assertEqual(control[:6], [True, True, True, "0x00FFF", 2.0, 4000.0], f"a gap under the tolerance with no real overlap is accepted: {control}")
         self.assertEqual(self.r["clockSkew"], [0, 100000, None, None, None], self.r["clockSkew"])
+
+    def test_predecessor_clock_step_an_instance_whose_observed_life_does_not_cover_the_runner_interval_is_refused(self) -> None:
+        """CORE-PARTITION-PREDECESSOR-CLOCK-STEP-1 (adversary OPEN A1@40d2259d on #696 r14b; its restatement A1@92715958 on #777): the one recorded
+        same-pid instance passed candidate selection on a tolerated clock step and was credited as the runner's app although its observed life did not
+        span the runner's launch..exit. The binding is pid plus birth stamp (the helper's app must equal the candidate on both), and the bound instance
+        must be first seen within 2 s (plus twice the clock gap) of the runner's launch and seen gone no earlier than 2 s (plus that slack) before the
+        runner's exit; otherwise it is refused, typed, and nothing of it is credited."""
+        refused = {
+            "predecessor-clock-step": "measured-app-gone-before-runner-exit",
+            "successor-first-seen-after-exit": "measured-app-seen-after-runner-launch",
+            "first-seen-past-tolerance": "measured-app-seen-after-runner-launch",
+            "gone-before-tolerance": "measured-app-gone-before-runner-exit",
+        }
+        for case, code in refused.items():
+            with self.subTest(case=case):
+                topo, bench, load, observed, gbps, pcore, why, verdict = self.r["step"][case]
+                self.assertEqual(verdict, code, f"an instance whose observed life does not cover the runner interval was bound: {self.r['step'][case]}")
+                self.assertEqual([bench, load, observed, gbps, pcore], [False, False, None, None, None], f"its evidence was credited: {why}")
+                for field in ("appAffinityObserved", "partitionLoadGBps", "pcoreMHzMean", "ecoreMHzMean", "pcoreParkedSampleFraction"):
+                    self.assertIn(f"{field}={code}", why)
+        for case in ("complete-interval-control", "gone-after-runner-exit-control", "first-seen-in-tolerance-control", "gone-in-tolerance-control"):
+            with self.subTest(case=case):
+                control = self.r["step"][case]
+                self.assertEqual(control[7], "", f"the runner's own instance, observed across its interval, was refused: {control}")
+                self.assertEqual(control[:6], [True, True, True, "0x00FFF", 2.0, 4000.0], f"its evidence is credited: {control}")
 
     def test_a_helper_that_never_started_publishes_no_package_feed_value_through_the_job_cleanup(self) -> None:
         """r8 A3 (adversary r7 6fac125a A3) through the job's own not-ready rule, cleanup block and scalar line: no helper object, fresh feed rows."""
@@ -2656,7 +2709,9 @@ LATE_READ_SCENARIOS = {
     # U+00C5 (appExe): 'angstrom' (U+212B in its place: equal length, culture-equal, ordinally another file) is another exe; 'case' (the same path, ASCII case
     # only) is the exe. Mode suffix -angstrom / -case, in site order: the seen-key rule, the identity re-read, the listing's pending and tracking tests.
     **{f"{site}-{exe}": {"appExe": _ANGSTROM_APP_EXE, **spec(exe)} for exe in ("angstrom", "case") for site, spec in _ORDINAL_SITES.items()},
-    **{f"clock-back-path-{ms}": {"stepMs": ms, "procs": [{**_CLOCK_APP, "pathFail": 1, "pathMode": "empty"}]} for ms in CLOCK_STEPS_MS},
+    # CORE-PARTITION-PREDECESSOR-CLOCK-STEP-1: polls 250 ms apart, so the app (gone at enumeration 6) outlives the step and its stepped gone stamp still follows the
+    # runner's launch, as a real app's does (at 20 ms polls it lived about 0.3 s, and a 1000 ms step stamped it gone before its own start)
+    **{f"clock-back-path-{ms}": {"stepMs": ms, "sleepMs": 250, "procs": [{**_CLOCK_APP, "pathFail": 1, "pathMode": "empty"}]} for ms in CLOCK_STEPS_MS},
     **{f"clock-back-start-{ms}": {"stepMs": ms, "procs": [{**_CLOCK_APP, "startFail": 1}]} for ms in CLOCK_START_UNREAD_STEPS_MS},
 }
 _LATE_READ_DRIVER_BODY = HELPER_SOURCE + r"""
@@ -2692,6 +2747,10 @@ $global:cpDoubles = @(foreach ($s in @($global:cpSpec.procs)) {
         if ((Test-CpFails $s.startFail $s.startFailFrom) -or $global:cpPoll -eq $s.startFailAt -or ($this.cpFresh -and (Test-CpFails $null $s.idStartFailFrom))) { throw [ComponentModel.Win32Exception]::new(5) }
         if ($null -ne $s.recycleAt -and $global:cpPoll -ge $s.recycleAt) { if ($null -eq $global:cpNew) { $global:cpNew = [DateTime]::UtcNow.AddSeconds(3) }; return $global:cpNew }
         if ($null -ne $s.startBeforeFirstPollMs) { return $global:cpT1.AddMilliseconds(-$s.startBeforeFirstPollMs) }
+        # CORE-PARTITION-PREDECESSOR-CLOCK-STEP-1: a process started after the launch (startSec >= 0) is stamped startSec - 2 s from enumeration 1, so the
+        # app (startSec 1) started 1 s before the helper's first listing, as a runner-launched app is seen within a poll of its start (it was 29 s before
+        # it, the shape a successor first seen after the app exited has). A process started before the launch (startSec < 0) stays relative to it.
+        if ($s.startSec -ge 0) { return $global:cpT1.AddSeconds($s.startSec - 2) }
         $global:cpLaunch.AddSeconds($s.startSec) }
     $d })
 # CORE-PARTITION-HELPER-PID-REUSE-1: Get-Process -Id is the pid's occupant now (never counted as an enumeration): the double listed on that pid at this count, or
@@ -2742,9 +2801,15 @@ for ($b = 0; $b -lt $names.Count; $b += 4) {
         $rec = $(try { [IO.File]::ReadAllText((Join-Path $run.dir 'helper.json')) | ConvertFrom-Json } catch { $null })
         if ($null -eq $rec) { $out[$run.mode] = [ordered]@{ exit = $run.h.ExitCode; record = $false }; continue }
         if ($scenarios.($run.mode).catThrow) { $out[$run.mode] = [ordered]@{ exit = $run.h.ExitCode; record = $true; errors = @($rec.errors) }; continue }
-        $start = ([DateTime]::new($run.launch, [DateTimeKind]::Utc)).AddSeconds(1).Ticks
-        $v = Test-CorePartitionMeasuredApp $rec 5000 ($start - 5000000) $end 0
-        $s = Get-CorePartitionScalars $rec ([ordered]@{ reasons = [ordered]@{} }) 4095 ([int64]$rec.helperAffinityObserved) $run.threads @{ value = 1; why = $null } $null $false -MeasuredPid 5000 -MeasuredStartTicks ($start - 5000000) -MeasuredEndTicks $end
+        # CORE-PARTITION-PREDECESSOR-CLOCK-STEP-1: the runner's window is the one a runner reports: launched 0.2 s before the app's start (the first 5000
+        # recorded; the launch +1 s when none is) and its exit stamped when the job wrote the stop, the stop enumeration's stamp (the helper's end was later,
+        # by its teardown and this loop's wait for the batch's earlier helpers)
+        $fa = @(@($rec.instances) | Where-Object { $null -ne $_ -and $_.pid -eq 5000 })
+        $start = $(if ($fa.Count -gt 0) { [int64]$fa[0].startUtcTicks } else { ([DateTime]::new($run.launch, [DateTimeKind]::Utc)).AddSeconds(1).Ticks }) - 2000000
+        $stopPoll = @([IO.File]::ReadAllLines((Join-Path $run.dir 'polls')))[$(if ($scenarios.($run.mode).stopAt) { [int]$scenarios.($run.mode).stopAt } else { 8 }) - 1]
+        if ($stopPoll) { $end = [int64]$stopPoll }
+        $v = Test-CorePartitionMeasuredApp $rec 5000 $start $end 0
+        $s = Get-CorePartitionScalars $rec ([ordered]@{ reasons = [ordered]@{} }) 4095 ([int64]$rec.helperAffinityObserved) $run.threads @{ value = 1; why = $null } $null $false -MeasuredPid 5000 -MeasuredStartTicks $start -MeasuredEndTicks $end
         $named = @(@($rec.instances) + @($rec.others) | Where-Object { $null -ne $_ -and $null -eq $_.unidentified })
         $by = [ordered]@{}
         foreach ($i in $named) { $by[[string]$i.pid] = [ordered]@{ start = [int64]$i.startUtcTicks; first = [int64]$i.firstSeenUtcTicks; last = [int64]$i.lastSeenUtcTicks; firstMs = $i.firstMs; aliveMs = $i.aliveMs; goneMs = $i.goneMs; loadSec = $i.loadSec; loadJoined = $i.loadJoined } }
