@@ -8,7 +8,7 @@
 #   pwsh -File <StageOne> -Sha <40> -Phase <dll|stage> [-DeadlineUtc <o>]
 # and its exit code is read as before: 0 done, 3 capacity (retried every -RetrySec seconds until the deadline), anything else a failure. The status file
 # <RunDir>\stage-status-<sha8>.txt (RunDir defaults to the stage-one script's folder) gets the same lines the copies wrote, so a driver still finds
-# `sha=<40> outcome=STAGE_OK manifest=<64>` there; each attempt's output is kept in <RunDir>\stage-<sha8>-<phase>-<utc>.out.txt.
+# `sha=<40> outcome=STAGE_OK manifest=<64>` there; each attempt's output is kept in its own <RunDir>\stage-<sha8>-<phase>-<utc>-<pid>-<guid8>.out.txt.
 #
 # THE DEADLINE REACHES THE MACHINE HEAVY SLOT. 2026-11-08 (lane-HFR-NATIVE-60FPS-FULLRES-1-r31): the driver passed -DeadlineUtc to its stage-chain copy, the
 # copy called stage-one without it, stage-one called the assembler without it, so tools\coordination\build-guard.ps1 waited its 60 min default, was refused
@@ -53,6 +53,8 @@ if (-not (Test-Path -LiteralPath $StageOne -PathType Leaf)) { Refuse ("stage-one
 $StageOne = (Resolve-Path -LiteralPath $StageOne).ProviderPath
 if (-not $RunDir) { $RunDir = Split-Path -Parent $StageOne }
 if (-not (Test-Path -LiteralPath $RunDir -PathType Container)) { Refuse ("run-dir-missing RunDir='{0}'" -f $RunDir) }
+# Absolute from here on: a relative path is PowerShell's location, which .NET file calls would read against the PROCESS directory (adversary 3c9ea703-A1).
+$RunDir = (Resolve-Path -LiteralPath $RunDir).ProviderPath
 
 $errs = $null
 $ast = [System.Management.Automation.Language.Parser]::ParseFile($StageOne, [ref]$null, [ref]$errs)
@@ -73,7 +75,9 @@ function Invoke-StageOne([string]$Phase, [string]$LogPath) {
     $psi.UseShellExecute = $false; $psi.CreateNoWindow = $true
     $psi.RedirectStandardOutput = $true; $psi.RedirectStandardError = $true; $psi.RedirectStandardInput = $true
     $psi.Environment['MLV_HEAVY_SLOT_DEADLINE_UTC'] = $deadlineText
-    [IO.File]::WriteAllText($LogPath, '', $utf8)   # the log must be writable BEFORE the child runs
+    # The log must be writable BEFORE the child runs, and must be THIS attempt's own: CreateNew fails on a name another chain already took
+    # (adversary 3c9ea703-A2), so two chains never share or overwrite one log.
+    ([IO.FileStream]::new($LogPath, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::Read)).Dispose()
     $p = [Diagnostics.Process]::Start($psi)
     try {
         $p.StandardInput.Close()
@@ -97,7 +101,7 @@ try {
         while (-not $phaseDone) {
             if ([DateTime]::UtcNow -ge $deadline) { Log "STAGE_FAILED deadline-passed phase=$phase"; $rc = 3; break }
             $attempt++
-            $log = Join-Path $RunDir ('stage-' + $Sha.Substring(0, 8) + "-$phase-" + [DateTime]::UtcNow.ToString('yyyyMMddTHHmmssfff') + '.out.txt')
+            $log = Join-Path $RunDir ('stage-' + $Sha.Substring(0, 8) + "-$phase-" + [DateTime]::UtcNow.ToString('yyyyMMddTHHmmssfff') + "-$PID-" + [Guid]::NewGuid().ToString('N').Substring(0, 8) + '.out.txt')
             $code = Invoke-StageOne $phase $log
             $last = @([IO.File]::ReadAllLines($log) | Where-Object { $_ -match '^STAGE_ONE_RESULT ' }) | Select-Object -Last 1
             Log "phase=$phase attempt=$attempt exit=$code $last"

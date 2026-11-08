@@ -1304,6 +1304,30 @@ def test_the_chain_deadline_is_never_visible_to_another_runspace_of_the_callers_
     assert 119 < _wait_minutes(call) <= 120, "the child still got the deadline"
 
 
+def test_a_relative_run_dir_is_the_powershell_location_not_the_process_directory(box) -> None:
+    # adversary 3c9ea703-A1: Test-Path accepted -RunDir '.' against PowerShell's location, but the status and log paths reached .NET relative
+    # and landed in the PROCESS working directory, so the chain could exit 0 with its evidence somewhere the driver never reads.
+    run, stage_one_path, env = _chain_box(box, 61)
+    script = (f"Set-Location -LiteralPath '{run}'\n"
+              f"& '{STAGE_CHAIN}' -Sha {_CHAIN_SHA} -DeadlineUtc '{_future(120)}' -StageOne '{stage_one_path}' -RunDir '.' -RetrySec 0 -MaxAttempts 1\n"
+              "Write-Output \"rc=$LASTEXITCODE\"\n")
+    done = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script],
+                          capture_output=True, text=True, timeout=180, env=env, check=False, cwd=str(box["dir"]))
+    assert "rc=0" in done.stdout, done.stdout + done.stderr
+    assert _chain_status(run) and _chain_status(run)[-1].endswith("STAGE_CHAIN_DONE"), done.stdout
+    assert not list(box["dir"].glob(f"stage-status-*")) and not list(box["dir"].glob(f"stage-{_CHAIN_SHA[:8]}-*")), \
+        "nothing written in the process directory"
+
+
+def test_each_attempt_log_is_created_new_under_a_unique_name() -> None:
+    # adversary 3c9ea703-A2: two chains on one run dir and sha that sample the same millisecond chose the same log name; one overwrote the
+    # other's output and could record the other's manifest beside its own exit code. The name now carries this process and a fresh GUID, and
+    # the file is created with CreateNew, so a collision is a failure (STAGE_CHAIN_FAILED), never a shared file.
+    text = STAGE_CHAIN.read_text(encoding="utf-8")
+    assert "[Guid]::NewGuid().ToString('N')" in text and "$PID" in text
+    assert "[IO.FileMode]::CreateNew" in text
+
+
 def test_a_run_dir_the_chain_cannot_write_is_refused_not_reported_staged(box) -> None:
     # adversary 8eb98036-A1: with the status file and the stage logs unwritable, neither child started, $LASTEXITCODE was the caller's stale 0,
     # and the chain returned 0 for a build that never ran. The run dir denies file creation here; the stage-one would exit 9 if it ran.
