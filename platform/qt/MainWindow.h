@@ -37,7 +37,6 @@
 #include "PlaybackNativePaceGuard.h"
 #include "PlaybackPrepInFlightGate.h"
 #include "PlaybackPrepOwnership.h"
-#include "PlaybackPrepCpuRoute.h"                    // PlaybackPrepRgb8Pool member below (r3)
 #include "PlaybackPresentTrace.h"
 #include "PlaybackScopesDuringPlayback.h"
 #include "PlaybackSlipHistogram.h"
@@ -57,6 +56,7 @@
 #include "GraphicsPickerScene.h"
 #include "MainWindowGpuPreviewPolicy.h"
 #include "GpuPreviewProcessing.h"
+#include "PlaybackPrepCpuRoute.h"   // r3: PlaybackPrepRgb8Pool member below; after mlv_include.h, whose extern "C" block must see the C processing headers first
 #include "RenderFrameThread.h"
 #include "ClipLifecycleBarrier.h"
 #include "GradientElement.h"
