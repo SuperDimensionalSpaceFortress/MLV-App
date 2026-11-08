@@ -44,7 +44,8 @@ public:
 
     // HFR-NATIVE-60FPS-FULLRES-1 r28 fix iteration 2 (adversary A1 on 4201a437): the CPU pixmap route's deferred paint. The playback
     // present notes the request serial it handed the pixmap item; the next viewport paint draws it. Whether a frame with that serial
-    // (or a later one) was handed over and not yet painted.
+    // (or a later one) was handed over and not yet painted. r30 fix iteration 1 (adversary A2 on fad36acf): any other pixmap (the
+    // clip-open placeholder) is noted as serial 0, so its paint never copies the frame it replaced.
     void notePixmapPresentSerial(quint64 serial) { m_pixmapPendingSerial = serial; }
     bool pixmapPaintPendingForSerial(quint64 serial) const
     {

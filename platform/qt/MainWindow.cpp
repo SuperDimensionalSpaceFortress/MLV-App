@@ -10644,7 +10644,13 @@ int MainWindow::runGuiPlaybackSmoke(const GuiPlaybackSmokeOptions & options)
         repaint();
         qApp->processEvents( QEventLoop::AllEvents );
 
-        QPixmap windowScreenshot = grab();
+        QPixmap windowScreenshot;
+        {
+            // HFR-NATIVE-60FPS-FULLRES-1: the grab renders the graphics view (its GL viewport FBO or CPU pixmap) into a pixmap, never
+            // onto the screen, so the paint it triggers neither credits the conform tracker nor marks the frame composed
+            const playback_paint_credit::OffscreenPaintScope offscreen;   // r30 fix iteration 1 (adversary A1 on fad36acf)
+            windowScreenshot = grab();
+        }
         QString windowScreenshotMethod = QStringLiteral("app_internal_window_grab");
         bool glWindowComposited = false;
         QString glWindowCompositeReason;
@@ -16300,6 +16306,7 @@ void MainWindow::deleteSession()
     invalidateDisplayPreviewCache();
     GpuDisplayViewport::clearPresentedImage( ui->graphicsView, m_pGraphicsItem );
     m_pGraphicsItem->setPixmap( QPixmap( ":/IMG/IMG/TransDummy.png" ) );
+    ui->graphicsView->notePixmapPresentSerial( 0 );   // r30 fix iteration 1 (adversary A2 on fad36acf): the placeholder carries no frame
     m_graphicsItemPresentedSerial = 0;
     m_pScene->setSceneRect( 0, 0, 10, 10 );
 
@@ -20600,6 +20607,7 @@ void MainWindow::clearPresentationForClipOpen( const char *reason )
         if( m_pGraphicsItem )
         {
             m_pGraphicsItem->setPixmap( QPixmap( ":/IMG/IMG/TransDummy.png" ) );
+            ui->graphicsView->notePixmapPresentSerial( 0 );   // r30 fix iteration 1 (adversary A2 on fad36acf): the placeholder carries no frame
             m_graphicsItemPresentedSerial = 0;
             m_pGraphicsItem->setVisible( true );
         }

@@ -1024,7 +1024,8 @@ TEST(PlaybackConformWiring, R30IterationOneEveryPixmapReplacementNotesTheSerialI
         const int note = source.indexOf(QStringLiteral("ui->graphicsView->notePixmapPresentSerial("), at);
         ASSERT_TRUE(note > at);
         ASSERT_TRUE(note - at < 260);
-        ASSERT_FALSE(source.mid(at, note - at).contains(QStringLiteral("m_pGraphicsItem->setPixmap(")) && source.indexOf(QStringLiteral("m_pGraphicsItem->setPixmap("), at + 1) < note);
+        const int nextSet = source.indexOf(QStringLiteral("m_pGraphicsItem->setPixmap("), at + 1);
+        ASSERT_TRUE(nextSet < 0 || nextSet > note);   // the note belongs to this replacement, not the next one
     }
     ASSERT_EQ(3, sets);
     ASSERT_EQ(2, countOccurrences(source, QStringLiteral(
