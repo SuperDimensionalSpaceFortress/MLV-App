@@ -214,6 +214,7 @@ def _spawn_watched(argv: list, encoding: "str | None" = None) -> "subprocess.Pop
     proc.window_proof = None
     proc.window_timer = None
     proc.exit_watch = None
+    proc.pid_handle = _open_pidfd(proc)  # r5 pass 11 A1: taken before any thread can reap, so it is bound to this very process (None where unsupported)
     try:  # adversary r1 A2: the clock is advisory, so a thread that cannot start must never strand the child the caller is about to own
         not_before = time.monotonic() + LINT_PROBE_START_WINDOW_SEC  # the process exists by now, so running at this instant means it lived the whole window
         timer = threading.Timer(LINT_PROBE_START_WINDOW_SEC, _witness_window, args=(proc, not_before))
@@ -228,6 +229,64 @@ def _spawn_watched(argv: list, encoding: "str | None" = None) -> "subprocess.Pop
     return proc
 
 
+_REAL_POPEN = subprocess.Popen  # captured at import: a test that swaps subprocess.Popen for a scripted child must not get a real pidfd for a made-up PID
+
+
+def _pidfd_exited(fd: int) -> bool:
+    """Seam (tests replace it): whether the process a pidfd names has exited -- a pidfd is readable exactly then. It names ONE process for life, so it needs neither
+    Popen's reaping lock nor the PID."""
+    import select
+    poller = select.poll()
+    poller.register(fd, select.POLLIN)
+    return bool(poller.poll(0))
+
+
+def _close_pidfd(fd: int) -> None:
+    """Seam (tests replace it)."""
+    os.close(fd)
+
+
+class _PidHandle:
+    """r5 (adversary A1, second form): a handle on the ORIGINAL child that PID recycling cannot redirect. Linux pidfd_open(), taken right after Popen() returns, when
+    nobody has reaped yet (only this module's own watcher or collector ever will, and neither has the Popen yet), so the PID is certainly the child's. Unlike a
+    PID or Popen.returncode it needs no reap to be recorded before it answers: the descriptor reports the exit of that one process, however late any thread that
+    reaped it is. `running()` is False once the handle is closed (the owner closed it after an exit it saw, or after deciding the proof). Thread-safe."""
+
+    def __init__(self, fd: int):
+        self._fd = fd
+        self._lock = threading.Lock()
+
+    def running(self) -> bool:
+        with self._lock:
+            return self._fd is not None and not _pidfd_exited(self._fd)
+
+    def close(self) -> None:
+        with self._lock:
+            fd, self._fd = self._fd, None
+            if fd is not None:
+                try:
+                    _close_pidfd(fd)
+                except OSError:
+                    pass
+
+    def __del__(self):
+        try:
+            self.close()
+        except Exception:  # noqa: BLE001 - interpreter shutdown
+            pass
+
+
+def _open_pidfd(proc: "subprocess.Popen") -> "_PidHandle | None":
+    """Seam (tests replace it): a _PidHandle on a real Popen child where the kernel offers pidfd_open (Linux 5.3+, Python 3.9+), else None (the caller falls back to
+    Popen's own record, see _child_is_running). Never raises: the clock is advisory."""
+    try:
+        if isinstance(proc, _REAL_POPEN) and hasattr(os, "pidfd_open") and isinstance(getattr(proc, "pid", None), int):
+            return _PidHandle(os.pidfd_open(proc.pid))
+    except Exception:  # noqa: BLE001
+        pass
+    return None
+
+
 def _child_is_running(proc: "subprocess.Popen") -> bool:
     """Whether `proc` is running RIGHT NOW, without Popen's reaping lock. POSIX: a non-reaping waitid peek (a Popen.poll() answers None while another thread holds
     the lock, i.e. also for a child that thread has already reaped -- adversary pass 9 A2); an already reaped child is ChildProcessError, i.e. not running.
@@ -236,10 +295,18 @@ def _child_is_running(proc: "subprocess.Popen") -> bool:
     r5 (adversary A1): a bare PID names whatever process holds it NOW, and the moment the original child is reaped its PID can be handed to a new child of the same
     parent, which a peek would then call "running". So the answer is bound to the ORIGINAL child through the Popen object's own record: once `returncode` is set the
     child was reaped (by its watcher or by the collector), its PID is no evidence of anything, and it is not running. That record is read before the peek AND after
-    it, so a reap that lands while the peek is in flight is not taken for a proof. Residual, stated plainly: the few bytecodes between a reaper's waitpid() returning
-    and Popen recording the status are invisible to this record; a PID would have to be recycled AND peeked inside exactly that gap to fool it."""
+    it, so a reap that lands while the peek is in flight is not taken for a proof.
+
+    r5 pass 11 (A1, second form): that record is not enough on its own, because a reaper that has reaped but not yet recorded the status (descheduled between
+    waitpid() and `returncode = ...`) leaves returncode None while the PID is already recycled. Where the kernel has pidfd_open the child is therefore watched through
+    a pidfd taken at launch (`pid_handle`, see _PidHandle), which names that one process and answers for it whatever any thread has or has not recorded. Only where
+    there is no pidfd (macOS, an old Linux kernel) does the returncode/peek logic above stand alone, and its residual -- a PID recycled AND peeked inside the few
+    bytecodes between a reaper's waitpid() and its recording the status -- is the one that remains; Windows has no recycling to fear (Popen holds a process handle)."""
     pid = getattr(proc, "pid", None)
     try:
+        handle = getattr(proc, "pid_handle", None)
+        if handle is not None:
+            return handle.running()
         if getattr(proc, "returncode", None) is not None:
             return False
         if hasattr(os, "waitid") and isinstance(pid, int):
@@ -257,6 +324,14 @@ def _witness_window(proc: "subprocess.Popen", not_before: float) -> None:
             proc.window_proof = True
     except Exception:  # noqa: BLE001 - advisory; no proof is the safe answer
         pass
+    finally:
+        _release_pid_handle(proc)  # the decision is made either way; the descriptor is not needed again
+
+
+def _release_pid_handle(proc: "subprocess.Popen") -> None:
+    handle = getattr(proc, "pid_handle", None)
+    if handle is not None:
+        handle.close()
 
 
 def _note_exit(proc: "subprocess.Popen") -> None:
@@ -270,6 +345,8 @@ def _note_exit(proc: "subprocess.Popen") -> None:
             timer.cancel()
     except Exception:  # noqa: BLE001 - the clock is advisory; a failed wait leaves ended_at None, and a life nobody proved is never taken to be long
         pass
+    finally:
+        _release_pid_handle(proc)  # the child is gone (or its wait failed): a closed handle answers "not running"
 
 
 def _pwsh_argv(probe: Path) -> "list[str | None]":
@@ -6330,7 +6407,7 @@ class CollectCountsRuntimeLoadFaultTests(unittest.TestCase):
             return "", CollectCountsRuntimeLoadFaultTests.REAL_STDERR
 
     def _scheduled_child(self, exit_at: float, wake_at: float, timer_at: "float | None" = None, begin_at: "float | None" = None, poll_blind: bool = False,
-                         reaped: bool = False, recycled: bool = False, reaped_at: "float | None" = None):
+                         reaped: bool = False, recycled: bool = False, reaped_at: "float | None" = None, pidfd: bool = False):
         """_popen_pwsh over a ScheduledPopen on a scripted clock. The exit watcher runs (observing the exit at `wake_at`), then the window timer is fired at
         `timer_at` (default: the instant it is due, 5 s after the process existed), the clock being the one the child sees. `reaped`: the collector has already
         reaped the child, so the non-reaping peek (waitid) reports ChildProcessError. Returns (the watched child, the clock list)."""
@@ -6345,8 +6422,21 @@ class CollectCountsRuntimeLoadFaultTests(unittest.TestCase):
                 raise ChildProcessError(10, "No child processes")
             return object()  # an exited, not yet reaped child
 
+        class FakePidfd:
+            """r5 pass 11 A1: the pidfd of the ORIGINAL child on the scripted clock -- it reports that one process's exit whatever was or was not recorded."""
+
+            def __init__(self):
+                self.closed = False
+
+            def running(self):  # a closed real handle answers False too, but the watcher only closes it AFTER the exit, so the answer is the same at that time
+                return clock[0] < exit_at
+
+            def close(self):
+                self.closed = True
+
         # on every platform the peek is the scripted one: a Windows host has no os.waitid, a POSIX host would ask the kernel about pid 4242
         with mock.patch.object(subprocess, "Popen", child), mock.patch.object(time, "monotonic", lambda: clock[0]), self.recording_timers() as timers, \
+                mock.patch.object(sys.modules[__name__], "_open_pidfd", lambda proc: FakePidfd() if pidfd else None), \
                 mock.patch.multiple(os, create=True, waitid=waitid, P_PID=1, WEXITED=4, WNOHANG=1, WNOWAIT=0x1000000):
             proc = _popen_pwsh(Path("r4-clock-probe.ps1"), counted=False)
             proc.exit_watch.join(30)
@@ -6424,6 +6514,75 @@ class CollectCountsRuntimeLoadFaultTests(unittest.TestCase):
                 self.assertEqual(outlived, proc.window_proof is True)
                 self.assertEqual(outlived, known >= LINT_PROBE_START_WINDOW_SEC, f"known life {known:.3f} s")
 
+    def test_r5_pass11_a1_a_reaper_that_has_not_recorded_the_status_yet_cannot_let_a_recycled_pid_prove_a_dead_child_alive(self):
+        """Pass 11 A1: the original dies at 1000.9, is REAPED, but the reaper is descheduled before Popen records returncode (it stays None -- `poll_blind` models that
+        until the collector finishes). A new child has taken PID 4242, so the peek at 1005 says "running" and no returncode contradicts it. The pidfd taken at launch
+        names the original process and says it exited, so neither consumer loses its one re-run."""
+        for who in (self._recovers_through_collect_counts, self._recovers_through_the_communicate_helper):
+            with self.subTest(who.__name__):
+                self._late_watcher_case(who, exit_at=1000.9, wake_at=1006.0, poll_blind=True, recycled=True, pidfd=True)
+
+    def test_r5_pass11_a1_the_pidfd_proof_follows_the_original_process_whatever_the_watchers_timing(self):
+        for label, schedule, outlived in (
+                ("died at 1000.9, status unrecorded, PID recycled, watcher woke at 1006", dict(exit_at=1000.9, wake_at=1006.0, poll_blind=True, recycled=True), False),
+                ("died at 1004.99, status unrecorded, PID recycled, watcher on time", dict(exit_at=1004.99, wake_at=1004.99, poll_blind=True, recycled=True), False),
+                ("died at 1006 (outlived the window), PID recycled after", dict(exit_at=1006.0, wake_at=1006.0, poll_blind=True, recycled=True), True),
+                ("died at 1005.01, watcher woke at 1030", dict(exit_at=1005.01, wake_at=1030.0, recycled=True), True)):
+            with self.subTest(label):
+                proc, _ = self._scheduled_child(pidfd=True, **schedule)
+                known = _probe_lasted(proc)
+                self.assertEqual(outlived, proc.window_proof is True)
+                self.assertEqual(outlived, known >= LINT_PROBE_START_WINDOW_SEC, f"known life {known:.3f} s")
+                self.assertTrue(proc.pid_handle.closed, "the descriptor is released once the proof is decided")
+
+    def test_r5_pass11_a1_the_pid_handle_reads_one_process_and_is_closed_exactly_once(self):
+        exited = [False]
+        closed: list = []
+        with mock.patch.object(sys.modules[__name__], "_pidfd_exited", lambda fd: exited[0]), \
+                mock.patch.object(sys.modules[__name__], "_close_pidfd", closed.append):
+            handle = _PidHandle(77)
+            self.assertTrue(handle.running())
+            exited[0] = True
+            self.assertFalse(handle.running(), "readable pidfd = the process exited")
+            exited[0] = False
+            handle.close()
+            handle.close()
+            self.assertEqual([77], closed, "closed once, however often close() is called")
+            self.assertFalse(handle.running(), "a closed handle is never 'running'")
+            failing = _PidHandle(78)
+            with mock.patch.object(sys.modules[__name__], "_close_pidfd", mock.Mock(side_effect=OSError("bad fd"))):
+                failing.close()  # tolerated: the descriptor is advisory
+
+    def test_r5_pass11_a1_a_pidfd_is_opened_only_for_a_real_popen_child(self):
+        opened: list = []
+
+        def pidfd_open(pid):
+            opened.append(pid)
+            return 55
+
+        with mock.patch.object(os, "pidfd_open", pidfd_open, create=True), mock.patch.object(sys.modules[__name__], "_close_pidfd", lambda fd: None):
+            real_like = mock.Mock(spec=subprocess.Popen, pid=4242)
+            handle = _open_pidfd(real_like)
+            self.assertIsInstance(handle, _PidHandle)
+            handle.close()
+            self.assertEqual([4242], opened)
+            self.assertIsNone(_open_pidfd(self.ScheduledPopen(["pwsh"])), "a scripted child is never given a pidfd for its made-up PID")
+            self.assertEqual([4242], opened)
+            with mock.patch.object(os, "pidfd_open", mock.Mock(side_effect=OSError("ESRCH")), create=True):
+                self.assertIsNone(_open_pidfd(real_like), "a failing pidfd_open leaves the returncode/peek fallback")
+        if hasattr(os, "pidfd_open"):
+            return
+        self.assertIsNone(_open_pidfd(mock.Mock(spec=subprocess.Popen, pid=4242)), "no pidfd_open on this platform: the fallback stands")
+
+    def test_r5_pass11_a1_a_probe_with_a_handle_asks_the_handle_not_the_pid(self):
+        """_child_is_running prefers the handle: a recycled PID (the peek says running) and a blind returncode are both overruled by the handle's answer."""
+        handle = mock.Mock(**{"running.return_value": False})
+        with mock.patch.multiple(os, create=True, waitid=lambda *a: None, P_PID=1, WEXITED=4, WNOHANG=1, WNOWAIT=0x1000000):
+            self.assertFalse(_child_is_running(mock.Mock(pid=4242, returncode=None, pid_handle=handle)))
+            handle.running.return_value = True
+            self.assertTrue(_child_is_running(mock.Mock(pid=4242, returncode=None, pid_handle=handle)))
+            self.assertEqual(2, handle.running.call_count)
+
     def test_r5_adversary_a1_the_peek_trusts_popens_own_record_before_and_after_it_looks_at_the_pid(self):
         """The unit under the A1 fix: a recorded return code means the original is gone (its PID names someone else), checked BEFORE the peek and again AFTER
         it, so a reap that lands between the two is not mistaken for a proof of life."""
@@ -6431,11 +6590,11 @@ class CollectCountsRuntimeLoadFaultTests(unittest.TestCase):
             return None  # whatever now has this PID is running
 
         with mock.patch.multiple(os, create=True, waitid=waitid, P_PID=1, WEXITED=4, WNOHANG=1, WNOWAIT=0x1000000):
-            self.assertTrue(_child_is_running(mock.Mock(pid=4242, returncode=None)), "an unreaped child that is running")
-            self.assertFalse(_child_is_running(mock.Mock(pid=4242, returncode=-6)), "reaped: the PID may belong to a new child")
-            self.assertFalse(_child_is_running(mock.Mock(pid=4242, returncode=0)))
+            self.assertTrue(_child_is_running(mock.Mock(pid=4242, pid_handle=None, returncode=None)), "an unreaped child that is running")
+            self.assertFalse(_child_is_running(mock.Mock(pid=4242, pid_handle=None, returncode=-6)), "reaped: the PID may belong to a new child")
+            self.assertFalse(_child_is_running(mock.Mock(pid=4242, pid_handle=None, returncode=0)))
 
-            reaped_during_the_look = mock.Mock(pid=4242, returncode=None)
+            reaped_during_the_look = mock.Mock(pid=4242, pid_handle=None, returncode=None)
 
             def reaping_waitid(idtype, pid, options):
                 reaped_during_the_look.returncode = -6  # the reaper records the status while the peek is in flight
@@ -6452,7 +6611,7 @@ class CollectCountsRuntimeLoadFaultTests(unittest.TestCase):
             calls.append((idtype, pid, options))
             return outcome[0]
 
-        child = mock.Mock(pid=4242, returncode=None, **{"poll.return_value": 0})  # r5: a fixture child with no recorded exit (Mock would invent one)
+        child = mock.Mock(pid=4242, pid_handle=None, returncode=None, **{"poll.return_value": 0})  # r5: a fixture child with no recorded exit (Mock would invent one)
         with mock.patch.multiple(os, create=True, waitid=waitid, P_PID=1, WEXITED=4, WNOHANG=1, WNOWAIT=0x1000000):
             self.assertTrue(_child_is_running(child), "no state change under WNOHANG is a running child -- whatever Popen.poll() says")
             self.assertEqual([(1, 4242, 4 | 1 | 0x1000000)], calls, "WEXITED | WNOHANG | WNOWAIT: the child is not reaped by the look")
@@ -6462,8 +6621,8 @@ class CollectCountsRuntimeLoadFaultTests(unittest.TestCase):
                 self.assertFalse(_child_is_running(child), "an already reaped child")
             with mock.patch.object(os, "waitid", mock.Mock(side_effect=OSError("no"))):
                 self.assertFalse(_child_is_running(child), "an unreadable child is not taken to be running")
-        self.assertTrue(_child_is_running(mock.Mock(pid=None, returncode=None, **{"poll.return_value": None})), "without waitid (Windows) poll() decides")
-        self.assertFalse(_child_is_running(mock.Mock(pid=None, returncode=None, **{"poll.return_value": 0})))
+        self.assertTrue(_child_is_running(mock.Mock(pid=None, pid_handle=None, returncode=None, **{"poll.return_value": None})), "without waitid (Windows) poll() decides")
+        self.assertFalse(_child_is_running(mock.Mock(pid=None, pid_handle=None, returncode=None, **{"poll.return_value": 0})))
 
     def test_r4_sol_r3_the_window_is_proven_by_a_witness_not_read_off_the_observation_time(self):
         for label, schedule, outlived in (
