@@ -72,6 +72,22 @@ private:
     int64_t m_frame = -1;
 };
 
+// HFR-NATIVE-60FPS-FULLRES-1 r28 (CoS B1 on c4efe7e3): drawFrameReady's dispatch window. From the accept of a frame until the call
+// returns (its early advance, then the inline present or the enqueue) \a slot (m_playbackPresentDispatchFrame) names that frame;
+// the previous value comes back on every return, a nested call included.
+class PlaybackPresentDispatchWindow
+{
+public:
+    PlaybackPresentDispatchWindow( long long &slot, long long frame ) : m_slot( slot ), m_previous( slot ) { m_slot = frame; }
+    ~PlaybackPresentDispatchWindow() { m_slot = m_previous; }
+    PlaybackPresentDispatchWindow( const PlaybackPresentDispatchWindow & ) = delete;
+    PlaybackPresentDispatchWindow &operator=( const PlaybackPresentDispatchWindow & ) = delete;
+
+private:
+    long long &m_slot;
+    long long m_previous;
+};
+
 // HFR-NATIVE-60FPS-FULLRES-1 r28 (CoS B1 on c4efe7e3): whether the non-inline prep queue still holds \a frame -- a frame
 // drawFrameReady accepted (m_lastPresentedPlaybackFrame) whose present has not happened yet. It is the pending task the
 // worker has not picked up, the task in flight, or a completed result onPlaybackPrepResultReady has not consumed. A pending

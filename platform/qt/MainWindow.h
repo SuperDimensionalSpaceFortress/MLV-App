@@ -1110,6 +1110,11 @@ private:
     // Last playback frame number accepted for presentation; drives the forward-only
     // present guard in drawFrameReady() that drops stale backward-jumping renders.
     long long m_lastPresentedPlaybackFrame = -1;
+    // HFR-NATIVE-60FPS-FULLRES-1 r28 (CoS B1 on c4efe7e3): the playback frame last put on screen (finishPresentedFrame). An
+    // accepted frame is not displayed yet: the non-inline prep may still hold it, and a newer enqueue can replace it.
+    long long m_lastDisplayedPlaybackFrame = -1;
+    // The frame drawFrameReady accepted and has not dispatched yet (its inline present or its enqueue); -1 outside that window.
+    long long m_playbackPresentDispatchFrame = -1;
     bool m_skipImmediateTimecodeLabel = false;
     bool m_playToFirstFramePending = false;
     bool m_playToFirstFrameTargetFrameValid = false;
@@ -1287,6 +1292,7 @@ private:
     int currentPlaybackAdvanceTarget();
     bool renderThreadBusyForPlaybackAdvance( int activePlaybackTarget );
     bool conformTargetPresentOutstanding();
+    bool conformAcceptedTargetPresentPending();
     bool m_automationPacingIsolated = false;
     // ENFORCE-4: the autoplay hook's verdict is a fail-closed LATCH (PlaybackFrameRange.h): armed failing (14) when the hook
     // is installed, cleared only by consumption (Reached). Closing the app before the poll resolves exits 14, never 0.

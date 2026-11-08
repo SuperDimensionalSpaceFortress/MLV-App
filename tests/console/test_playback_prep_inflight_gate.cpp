@@ -325,3 +325,20 @@ TEST(PlaybackPrepInFlightGate, R28B1AnAcceptedFrameTheNonInlinePrepStillHoldsNev
     // a displayed target is shown whatever is pending
     ASSERT_TRUE( playback_frame_range::conformTargetShown( 101, 101, 101.992, true, true ) );
 }
+
+// r28: drawFrameReady's dispatch window names the accepted frame until the call returns, and a nested call gives the outer
+// window's frame back
+TEST(PlaybackPrepInFlightGate, R28B1ThePresentDispatchWindowNamesTheAcceptedFrameUntilTheCallReturns)
+{
+    long long slot = -1;
+    {
+        PlaybackPresentDispatchWindow outer( slot, 101 );
+        ASSERT_EQ( 101LL, slot );
+        {
+            PlaybackPresentDispatchWindow nested( slot, 102 );
+            ASSERT_EQ( 102LL, slot );
+        }
+        ASSERT_EQ( 101LL, slot );
+    }
+    ASSERT_EQ( -1LL, slot );
+}

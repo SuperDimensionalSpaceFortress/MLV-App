@@ -408,11 +408,14 @@ inline bool conformTargetPresented( long long lastPresentedFrame, double positio
 inline bool conformTargetShown( long long acceptedFrame, long long displayedFrame, double position, bool acceptedPresentPending,
                                 bool rendererOutstanding )
 {
-    // RED (c4efe7e3): an accepted target counts as presented, whatever its prep state
-    (void)displayedFrame;
-    (void)acceptedPresentPending;
+    // Keyed off the DISPLAYED frame: an accepted frame is not on screen yet. Its present is outstanding while it is pending;
+    // once nothing for it is pending (it was dropped without a display) nothing is coming, and nothing holds (d98be193 A1).
+    // A target not yet accepted is owed by the renderer, as in r27.
     const long long target = static_cast<long long>( position );
-    return conformTargetPresented( acceptedFrame, position, acceptedFrame == target ? false : rendererOutstanding );
+    const bool outstanding = displayedFrame == target ? false
+                           : acceptedFrame == target  ? acceptedPresentPending
+                                                      : rendererOutstanding;
+    return conformTargetPresented( displayedFrame, position, outstanding );
 }
 
 // The single-tick form (no debt carried in or out): the same delta for a tick that carries no debt.

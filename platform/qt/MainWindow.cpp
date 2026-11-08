@@ -2891,6 +2891,25 @@ bool MainWindow::conformTargetPresentOutstanding()
     return m_pRenderThread->hasPlaybackLookaheadRequest( static_cast<uint32_t>( target ), generation );
 }
 
+// HFR-NATIVE-60FPS-FULLRES-1 r28 (CoS B1 6714996522 on c4efe7e3): whether the present of the target drawFrameReady accepted is
+// still to come -- drawFrameReady has not dispatched it yet (its early advance runs before the inline present or the enqueue),
+// or the non-inline prep queue still holds it. A pending task can be replaced by the next enqueue, so the engine must not move
+// past it. Nothing pending (the present happened, or the frame was dropped) means nothing is coming.
+bool MainWindow::conformAcceptedTargetPresentPending()
+{
+    if( !playbackConformActive() ) return false;
+    const long long target = static_cast<long long>( m_newPosDropMode );
+    if( target < 0 || m_lastPresentedPlaybackFrame != target ) return false;
+    if( m_playbackPresentDispatchFrame == target ) return true;
+    std::lock_guard<std::mutex> lk( m_playbackPrepMutex );
+    return playbackPrepHoldsFrameLocked( m_playbackPrepPendingValid,
+                                         static_cast<int64_t>( m_playbackPrepPending.displayFrame ),
+                                         m_playbackPrepInFlight,
+                                         m_playbackPrepResults,
+                                         []( const PlaybackPrepResult &result ) { return result.task.displayFrame; },
+                                         static_cast<int64_t>( target ) );
+}
+
 static int mlvappStartPlaybackTimer( QObject *owner, double framerate )
 {
     if( !owner ) return 0;
@@ -4035,6 +4054,7 @@ void MainWindow::invalidatePlaybackPrepForDisplayChange( const char *reason )
     // A display change re-renders the current frame; clear the forward-only present
     // guard so the next (correct) frame is shown regardless of the previous run.
     m_lastPresentedPlaybackFrame = -1;
+    m_lastDisplayedPlaybackFrame = -1;
     std::vector<uint64_t> serialsToRelease;
     bool droppedPending = false;
     size_t droppedResults = 0;
@@ -4881,7 +4901,7 @@ void MainWindow::playbackPrepThreadLoop( void )
             task = m_playbackPrepPending;
             task.rebindOwnedImagePointers();
             m_playbackPrepPendingValid = false;
-            m_playbackPrepInFlight.beginLocked( task.requestSerial );
+            m_playbackPrepInFlight.beginLocked( task.requestSerial, static_cast<int64_t>( task.displayFrame ) );
         }
 
         const double workerStart = mlv_stage_timing_now();
@@ -12259,7 +12279,9 @@ void MainWindow::playbackHandling(int timeDiff)
                 // r27 (adversary A1 on be20bc59): the debt is repaid as the renderer PRESENTS, never faster. While a present of the
                 // current target is outstanding and drawFrameReady has not accepted it (m_lastPresentedPlaybackFrame) a conformed
                 // tick does not move past it, so a queued lookahead is never pruned by the repayment (100 -> 102). Fix iteration 1
-                // (adversary A1 on d98be193): with no present outstanding (an invalidation, an idle renderer) nothing holds.
+                // (adversary A1 on d98be193): with no present outstanding (an invalidation, an idle renderer) nothing holds. r28
+                // (CoS B1 on c4efe7e3): the gate keys off the frame on SCREEN; an accepted frame whose present drawFrameReady has
+                // not dispatched, or that the non-inline prep still holds (pending, in flight, unconsumed), is still to come.
                 const playback_frame_range::DropFrameTickResult dropFrameTick =
                     playback_frame_range::advanceDropFrameTick(
                         m_newPosDropMode,
@@ -12267,8 +12289,9 @@ void MainWindow::playbackHandling(int timeDiff)
                             m_newPosDropMode,
                             m_playbackPaceGuard.grant( getPlaybackFramerate() * (double)timeDiff / 1000.0, paceNowMs, playbackPaceGuardFps() ),
                             playbackConformActive(), m_conformDropDebtFrames,
-                            playback_frame_range::conformTargetPresented(
-                                m_lastPresentedPlaybackFrame, m_newPosDropMode, conformTargetPresentOutstanding() ) ),
+                            playback_frame_range::conformTargetShown(
+                                m_lastPresentedPlaybackFrame, m_lastDisplayedPlaybackFrame, m_newPosDropMode,
+                                conformAcceptedTargetPresentPending(), conformTargetPresentOutstanding() ) ),
                         ui->spinBoxCutIn->value(), ui->spinBoxCutOut->value(),
                         ui->actionLoop->isChecked() );
                 // slip_summary: the granted share, read back from the tick (a wrap subtracted the cut range width;
@@ -33247,6 +33270,8 @@ void MainWindow::finishPresentedFrame( uint64_t displayFrame,
                                        int rgb8DisplaySourceWidth,
                                        int rgb8DisplaySourceHeight )
 {
+    // HFR-NATIVE-60FPS-FULLRES-1 r28 (CoS B1 on c4efe7e3): this frame is on screen; the tail advance below may move past it
+    m_lastDisplayedPlaybackFrame = static_cast<long long>( displayFrame );
     const int displaySourceWidth = rgb8DisplaySourceWidth > 0
         ? rgb8DisplaySourceWidth : readyFrame.renderedImageWidth;
     const int displaySourceHeight = rgb8DisplaySourceHeight > 0
@@ -34323,6 +34348,9 @@ void MainWindow::drawFrameReady()
         return;
     }
     m_lastPresentedPlaybackFrame = static_cast<long long>( display_frame );
+    // HFR-NATIVE-60FPS-FULLRES-1 r28 (CoS B1 on c4efe7e3): accepted is not displayed. Until this call returns (the early advance
+    // below, then the inline present or the enqueue to the prep queue) the frame's present is still to come.
+    PlaybackPresentDispatchWindow presentDispatchWindow( m_playbackPresentDispatchFrame, static_cast<long long>( display_frame ) );
     // PLAYBACK-STARTUP-CATCHUP-BURST-1: the pace clock starts when this Play's first present ENDS
     // (presentPlaybackPreparedFrame), not here: the first draw blocks the GUI thread for ~1 s on Bachelor CUDA,
     // and a clock started before it banked that stall and repaid it as one 23-frame jump (r3 venue legs).
