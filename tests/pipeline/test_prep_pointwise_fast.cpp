@@ -24,6 +24,7 @@
 #include "mlv_pipeline_fixture.h"
 
 #include "../../platform/qt/GpuPreviewProcessing.h"
+#include "../../platform/qt/PlaybackPrepCpuRoute.h"
 #include "../../src/processing/raw_processing.h"
 
 #include <QByteArray>
@@ -32,9 +33,11 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <cstdint>
 #include <cstdlib>
 #include <cstring>
 #include <functional>
+#include <future>
 #include <string>
 #include <thread>
 #include <vector>
@@ -522,6 +525,392 @@ TEST(PrepPointwiseFast, LookAssistOnAndOffAreAdmittedAndByteIdenticalAtFullSize)
     ASSERT_TRUE(!laOff.applyShadowsHighlights && !laOff.applyInLoopContrast && !laOff.applyVibrance);
     ASSERT_EQ(std::string(""), std::string(gpuPreviewProcessingPointwiseFastRefusal(laOff)));
     checkConfig("m16_la_off", laOff, frame, kFullWidth, kFullHeight, "");
+}
+
+/* CPU-S1-PACE-NEXT-LEVER-1 (Part B): with tier 1 off the CPU prep route's 16-bit buffer is
+ * the workspace's persistent scratch (never zero-filled) instead of a per-frame
+ * value-initialised vector. Pinned: for every config that reaches the unfused 16-bit pass
+ * (disabled, enabled without and with a spatial post-pass, the Look Assist pointwise
+ * subset), at the s1 size and an odd size, out8 from a scratch PRE-FILLED with 0xA5A5 is
+ * byte-identical to out8 from the old zeroed buffer, and the route wrote that scratch. */
+TEST(PrepPointwiseFast, Tier1OffWorkspaceScratchIsByteIdenticalWhenPoisoned)
+{
+    EnvScope tier1(gpuPreviewProcessingTier1SwitchName(), nullptr);
+    ASSERT_TRUE(!gpuPreviewProcessingTier1Enabled());
+
+    MlvPipelineFixture offFixture;
+    openFixture(offFixture);
+    const GpuPreviewProcessingConfig enabledPointwise = buildConfig(offFixture, applyLookAssistOff);
+    ASSERT_TRUE(enabledPointwise.enabled);
+    ASSERT_TRUE(!gpuPreviewProcessingCpuHasSpatialPostPass(enabledPointwise));
+
+    MlvPipelineFixture sharpenFixture;
+    openFixture(sharpenFixture);
+    const GpuPreviewProcessingConfig enabledSpatial = buildConfig(sharpenFixture, [](processingObject_t * p) {
+        applyLookAssistOff(p);
+        processingSetSharpening(p, 0.5);
+    });
+    ASSERT_TRUE(gpuPreviewProcessingCpuHasSpatialPostPass(enabledSpatial));
+
+    GpuPreviewProcessingConfig disabled = enabledPointwise;
+    disabled.enabled = false;
+
+    struct Size { int w; int h; };
+    for (const Size size : { Size{ kFullWidth, kFullHeight }, Size{ 1809, 1133 } })
+    {
+        const std::vector<uint16_t> frame = makeSyntheticFrame(size.w, size.h, 0x5A5Au + size.w);
+        const std::vector<uint16_t> blur = makeBlockBlur(frame, size.w, size.h);
+        MlvPipelineFixture laFixture;
+        openFixture(laFixture);
+        const GpuPreviewProcessingConfig lookAssist = buildLookAssistOnConfig(laFixture, blur, size.w, size.h);
+        const struct { const char * label; const GpuPreviewProcessingConfig * config; } cases[] = {
+            { "disabled", &disabled },
+            { "enabled_pointwise", &enabledPointwise },
+            { "enabled_spatial_sharpen", &enabledSpatial },
+            { "look_assist_cinematic_pointwise", &lookAssist },
+        };
+        const size_t words = static_cast<size_t>(size.w) * static_cast<size_t>(size.h) * 3u;
+        for (const auto & c : cases)
+        {
+            const std::string label = std::string(c.label) + "." + std::to_string(size.w) + "x" + std::to_string(size.h);
+            /* The old per-frame buffer: value-initialised. */
+            std::vector<uint16_t> zeroed(words, 0);
+            std::vector<uint8_t> oracle8(words, 0);
+            gpuPreviewProcessingApplyCpuReferenceTo8(*c.config, frame.data(), zeroed.data(), oracle8.data(),
+                                                     size.w, size.h, nullptr);
+
+            PlaybackPrepCpuWorkspace workspace;
+            uint16_t * poisoned = workspace.scratch16(size.w, size.h);
+            ASSERT_TRUE(poisoned != nullptr);
+            std::fill(poisoned, poisoned + words, static_cast<uint16_t>(0xA5A5));
+            std::vector<uint8_t> out8;
+            const PlaybackPrepCpuRouteResult route =
+                playbackPrepCpuRouteRun(workspace, *c.config, 1, frame.data(), size.w, size.h,
+                                        PlaybackPrepReducedDecision(), &out8);
+            ASSERT_EQ(1, route.reducedFactor);
+            ASSERT_TRUE(!route.spans.fused8);
+            /* The route used the workspace scratch (same buffer, no reallocation) ... */
+            ASSERT_EQ(1u, static_cast<unsigned>(workspace.scratch16Allocations()));
+            ASSERT_TRUE(workspace.scratch16(size.w, size.h) == poisoned);
+            if (std::all_of(poisoned, poisoned + words, [](uint16_t v) { return v == 0xA5A5; }))
+                ::minitest::fail(__FILE__, __LINE__, "route wrote the workspace scratch", label);
+            /* ... and no stage read a word before writing it. */
+            ASSERT_EQ(oracle8.size(), out8.size());
+            if (out8 != oracle8)
+            {
+                size_t first = 0;
+                while (first < out8.size() && out8[first] == oracle8[first]) ++first;
+                ::minitest::fail(__FILE__, __LINE__, "poisoned scratch out8 == zeroed buffer out8",
+                                 label + " first_byte=" + std::to_string(first));
+            }
+            std::printf("[PREP-SCRATCH] %s byte-identical with a 0xA5A5 scratch\n", label.c_str());
+        }
+    }
+}
+
+/* CPU-S1-PACE-NEXT-LEVER-1 r3: the playing route's 8-bit buffer is recycled through a
+ * PlaybackPrepRgb8Pool (prep thread takes, GUI thread gives back after the present), the
+ * hand-off MainWindow::buildPlaybackPrepResult / onPlaybackPrepResultReady run. Pinned, for
+ * tier 1 off and on, the full-size configs (disabled, pointwise, sharpen post-pass, Look Assist
+ * pointwise subset) and the x2 reduced path: over six frames (two alternating inputs) the route
+ * allocates out8 ONCE, and every frame -- developed into a recycled buffer pre-filled with 0xA5
+ * -- is byte-identical to the same frame developed into a fresh vector (the r2 behaviour). */
+TEST(PrepPointwiseFast, CpuRouteRecycledOut8IsByteIdenticalWhenPoisoned)
+{
+    MlvPipelineFixture offFixture;
+    openFixture(offFixture);
+    const GpuPreviewProcessingConfig enabledPointwise = buildConfig(offFixture, applyLookAssistOff);
+    ASSERT_TRUE(enabledPointwise.enabled);
+    MlvPipelineFixture sharpenFixture;
+    openFixture(sharpenFixture);
+    const GpuPreviewProcessingConfig enabledSpatial = buildConfig(sharpenFixture, [](processingObject_t * p) {
+        applyLookAssistOff(p);
+        processingSetSharpening(p, 0.5);
+    });
+    ASSERT_TRUE(gpuPreviewProcessingCpuHasSpatialPostPass(enabledSpatial));
+    GpuPreviewProcessingConfig disabled = enabledPointwise;
+    disabled.enabled = false;
+
+    const int w = kFullWidth;
+    const int h = kFullHeight;
+    const std::vector<uint16_t> frames[2] = { makeSyntheticFrame(w, h, 0x7101u), makeSyntheticFrame(w, h, 0x7202u) };
+    const std::vector<uint16_t> blur = makeBlockBlur(frames[0], w, h);
+    MlvPipelineFixture laFixture;
+    openFixture(laFixture);
+    const GpuPreviewProcessingConfig lookAssist = buildLookAssistOnConfig(laFixture, blur, w, h);
+
+    PlaybackPrepReducedDecision full;
+    PlaybackPrepReducedDecision x2;
+    x2.factor = 2;
+    x2.residual = 2;
+    const struct { const char * label; const GpuPreviewProcessingConfig * config; const PlaybackPrepReducedDecision * decision; } cases[] = {
+        { "disabled", &disabled, &full },
+        { "enabled_pointwise", &enabledPointwise, &full },
+        { "enabled_spatial_sharpen", &enabledSpatial, &full },
+        { "look_assist_cinematic_pointwise", &lookAssist, &full },
+        { "enabled_pointwise_x2", &enabledPointwise, &x2 },
+    };
+    for (const char * tier1Value : { static_cast<const char *>(nullptr), "1" })
+    {
+        EnvScope tier1(gpuPreviewProcessingTier1SwitchName(), tier1Value);
+        ASSERT_EQ(tier1Value != nullptr, gpuPreviewProcessingTier1Enabled());
+        for (const auto & c : cases)
+        {
+            const std::string label = std::string(c.label) + (tier1Value ? ".tier1_on" : ".tier1_off");
+            PlaybackPrepRgb8Pool pool;
+            pool.open(1);   /* r4: a playing span */
+            PlaybackPrepCpuWorkspace workspace;
+            int allocations = 0;
+            const int kFrames = 6;
+            for (int f = 0; f < kFrames; ++f)
+            {
+                const std::vector<uint16_t> & frame = frames[f % 2];
+                /* The oracle: the same frame into a fresh vector on a fresh workspace (r2). */
+                PlaybackPrepCpuWorkspace oracleWorkspace;
+                std::vector<uint8_t> oracle8;
+                const PlaybackPrepCpuRouteResult oracleRoute =
+                    playbackPrepCpuRouteRun(oracleWorkspace, *c.config, 1, frame.data(), w, h, *c.decision, &oracle8);
+                ASSERT_TRUE(oracleRoute.out8Allocated);
+
+                /* Prep thread: take, develop, hand off (moved into the result). */
+                std::vector<uint8_t> out8 = pool.take();
+                const PlaybackPrepCpuRouteResult route =
+                    playbackPrepCpuRouteRun(workspace, *c.config, 1, frame.data(), w, h, *c.decision, &out8);
+                ASSERT_EQ(oracleRoute.reducedFactor, route.reducedFactor);
+                if (route.out8Allocated) ++allocations;
+                if (out8 != oracle8)
+                {
+                    size_t first = 0;
+                    while (first < out8.size() && first < oracle8.size() && out8[first] == oracle8[first]) ++first;
+                    ::minitest::fail(__FILE__, __LINE__, "recycled out8 == fresh out8",
+                                     label + " frame=" + std::to_string(f) + " first_byte=" + std::to_string(first)
+                                     + " size=" + std::to_string(out8.size()) + "/" + std::to_string(oracle8.size()));
+                }
+                std::vector<uint8_t> handedOff = std::move(out8);
+                /* GUI thread after the present: stale bytes, then back to the pool. */
+                std::fill(handedOff.begin(), handedOff.end(), static_cast<uint8_t>(0xA5));
+                pool.give(std::move(handedOff), 1);   /* one playing generation */
+            }
+            if (allocations != 1)
+                ::minitest::fail(__FILE__, __LINE__, "out8 allocated once over six frames",
+                                 label + " allocations=" + std::to_string(allocations));
+            ASSERT_EQ(1u, static_cast<unsigned>(pool.held()));
+            ASSERT_EQ(1u, static_cast<unsigned>(pool.takeMisses()));
+            ASSERT_EQ(static_cast<unsigned>(kFrames - 1), static_cast<unsigned>(pool.takeHits()));
+            std::printf("[PREP-OUT8-POOL] %s allocations=%d over %d frames, byte-identical\n",
+                        label.c_str(), allocations, kFrames);
+        }
+    }
+}
+
+/* Adversary A3 on e7e5271e: with no input the route develops nothing; a recycled out8 (stale bytes)
+ * must come back as the zeroed buffer a fresh vector was, never as the previous frame. */
+TEST(PrepPointwiseFast, CpuRouteNullInputZeroesARecycledOut8)
+{
+    MlvPipelineFixture offFixture;
+    openFixture(offFixture);
+    const GpuPreviewProcessingConfig config = buildConfig(offFixture, applyLookAssistOff);
+    PlaybackPrepCpuWorkspace workspace;
+    for (const auto & dims : { std::pair<int, int>{ 1, 1 }, std::pair<int, int>{ 64, 32 } })
+    {
+        std::vector<uint8_t> out8(static_cast<size_t>(dims.first) * dims.second * 3u, static_cast<uint8_t>(0xA5));
+        const PlaybackPrepCpuRouteResult route =
+            playbackPrepCpuRouteRun(workspace, config, 1, nullptr, dims.first, dims.second, PlaybackPrepReducedDecision(), &out8);
+        ASSERT_TRUE(!route.out8Allocated);
+        ASSERT_EQ(static_cast<size_t>(dims.first) * dims.second * 3u, out8.size());
+        if (!std::all_of(out8.begin(), out8.end(), [](uint8_t v) { return v == 0; }))
+            ::minitest::fail(__FILE__, __LINE__, "null input leaves a zeroed out8",
+                             std::to_string(dims.first) + "x" + std::to_string(dims.second));
+    }
+}
+
+/* Adversary A1 on c76e4457 (major), kept under r4's generation-keyed pool: freeActiveMlvObjectAfterLifecycleBarrier
+ * cleared the pool, then clearPresentationForClipOpen's invalidation gave the queued result's 12.3 MB buffer
+ * back into it. r4 (Dot B1; adversary A1/A2 on ebe2c4aa): the pool recycles only between open(play-start
+ * generation) and clear(); a give from before the play-start is freed; take() changes nothing; the floor
+ * never goes down. */
+TEST(PrepPointwiseFast, Rgb8PoolGiveBelowTheClearFloorIsFreed)
+{
+    PlaybackPrepRgb8Pool pool;
+    pool.give(std::vector<uint8_t>(64), 7);         /* before any play-start: closed */
+    ASSERT_EQ(0u, static_cast<unsigned>(pool.held()));
+    pool.open(7);                                   /* play-start at generation 7 */
+    pool.give(std::vector<uint8_t>(64), 7);
+    ASSERT_EQ(1u, static_cast<unsigned>(pool.held()));
+    pool.clear(8);                                  /* stop at generation 8: closed, floor 9 */
+    ASSERT_EQ(0u, static_cast<unsigned>(pool.held()));
+    pool.give(std::vector<uint8_t>(12301632u), 7);  /* the late give of a task admitted at 7 */
+    pool.give(std::vector<uint8_t>(64), 8);         /* a task at the stop's own generation */
+    ASSERT_TRUE(pool.take().capacity() == 0);       /* take() does not reopen anything */
+    pool.give(std::vector<uint8_t>(64), 9);         /* a paused seek at 9 */
+    ASSERT_EQ(0u, static_cast<unsigned>(pool.held()));
+    pool.open(10);                                  /* play-start bumped to 10 */
+    pool.give(std::vector<uint8_t>(64), 9);         /* the paused frame, given back after the start */
+    ASSERT_EQ(0u, static_cast<unsigned>(pool.held()));
+    pool.give(std::vector<uint8_t>(64), 11);        /* a mid-play bump (scale change) recycles */
+    ASSERT_EQ(1u, static_cast<unsigned>(pool.held()));
+    pool.clear(3);                                  /* an older generation never lowers the floor */
+    pool.open(5);
+    pool.give(std::vector<uint8_t>(64), 9);
+    ASSERT_EQ(0u, static_cast<unsigned>(pool.held()));
+    pool.give(std::vector<uint8_t>(64), 10);
+    ASSERT_EQ(1u, static_cast<unsigned>(pool.held()));
+    pool.clear(UINT64_MAX);                         /* saturates, no wrap to floor 0 */
+    pool.give(std::vector<uint8_t>(64), UINT64_MAX);
+    ASSERT_EQ(0u, static_cast<unsigned>(pool.held()));
+}
+
+/* r4 (adversary A1 on ebe2c4aa): a frame admitted before a play-start (paused seek, or an in-flight task
+ * across the last stop) and given back after the open, on another thread, is never held. */
+TEST(PrepPointwiseFast, Rgb8PoolPrePlayStartTaskGivenAfterOpenIsFreed)
+{
+    PlaybackPrepRgb8Pool pool;
+    pool.clear(8);                                   /* stop at 8 */
+    std::promise<void> opened;
+    std::future<void> openedF = opened.get_future();
+    std::thread worker([&]() {
+        const uint64_t pausedGeneration = 9;         /* admitted during the paused seek */
+        std::vector<uint8_t> out8(12301632u, static_cast<uint8_t>(0x5A));
+        openedF.wait();                              /* parked across the play-start */
+        pool.give(std::move(out8), pausedGeneration);
+    });
+    pool.open(10);                                   /* play-start bumped to 10 */
+    opened.set_value();
+    worker.join();
+    ASSERT_EQ(0u, static_cast<unsigned>(pool.held()));
+    pool.give(std::vector<uint8_t>(64), 10);         /* the playing span's own frame recycles */
+    ASSERT_EQ(1u, static_cast<unsigned>(pool.held()));
+}
+/* r4: the same schedule as Rgb8PoolTaskParkedAcrossStopClearRetainsNothing, every order of the old task's
+ * take/give against the clear (take before or after it, give after it; then give before it), on real threads. */
+TEST(PrepPointwiseFast, Rgb8PoolEveryOrderOfOldTaskAndClearRetainsNothing)
+{
+    const uint64_t g = 7;
+    for (int order = 0; order < 2; ++order)
+    {
+        PlaybackPrepRgb8Pool pool;
+        pool.open(g);
+        pool.give(std::vector<uint8_t>(4096), g);
+        pool.give(std::vector<uint8_t>(2048), g);
+        std::promise<void> tookP, cleared, gaveP;
+        std::future<void> tookF = tookP.get_future(), clearedF = cleared.get_future(), gaveF = gaveP.get_future();
+        std::thread worker([&]() {
+            if (order == 1) clearedF.wait();          /* 1: take after the clear */
+            std::vector<uint8_t> out8 = pool.take();
+            out8.assign(4096, static_cast<uint8_t>(0x5A));
+            tookP.set_value();
+            if (order == 0) clearedF.wait();          /* 0: take before, give after */
+            pool.give(std::move(out8), g);
+            gaveP.set_value();
+        });
+        if (order == 0) tookF.wait();
+        pool.clear(g + 1);
+        cleared.set_value();
+        gaveF.wait();
+        worker.join();
+        if (pool.held() != 0)
+            ::minitest::fail(__FILE__, __LINE__, "no buffer retained", "order=" + std::to_string(order));
+    }
+    /* give before the clear: the clear frees it */
+    PlaybackPrepRgb8Pool pool;
+    pool.open(g);
+    std::thread worker([&]() { std::vector<uint8_t> out8 = pool.take(); out8.assign(64, 0); pool.give(std::move(out8), g); });
+    worker.join();
+    ASSERT_EQ(1u, static_cast<unsigned>(pool.held()));
+    pool.clear(g + 1);
+    ASSERT_EQ(0u, static_cast<unsigned>(pool.held()));
+}
+/* CPU-S1-PACE-NEXT-LEVER-1 r4 (Dot B1 / adversary A1 on 391464de, major): a worker admitted at
+ * generation g, parked before take(), resumes after play-stop's clear(); take() reopened the pool
+ * and the generation-drop give() kept 12,301,632 bytes after the drain. Deterministic barrier
+ * schedule on a real second thread (promises, no sleeps). */
+TEST(PrepPointwiseFast, Rgb8PoolTaskParkedAcrossStopClearRetainsNothing)
+{
+    const size_t kFrameBytes = 12301632u;   /* 1808 x 2268 x 3 */
+    const uint64_t g = 7;                    /* the playing generation the task was admitted at */
+    PlaybackPrepRgb8Pool pool;
+    pool.open(g);                                     /* play-start at g */
+    pool.give(std::vector<uint8_t>(kFrameBytes), g);   /* a presented frame at g recycled */
+    ASSERT_EQ(1u, static_cast<unsigned>(pool.held()));
+
+    std::promise<void> admitted, resume, done;
+    std::future<void> admittedF = admitted.get_future();
+    std::future<void> resumeF = resume.get_future();
+    std::future<void> doneF = done.get_future();
+    std::thread worker([&]() {
+        const uint64_t taskGeneration = g;   /* passed the generation check at g */
+        admitted.set_value();
+        resumeF.wait();                       /* parked before take() */
+        std::vector<uint8_t> out8 = pool.take();
+        out8.assign(kFrameBytes, static_cast<uint8_t>(0x5A));   /* the build */
+        pool.give(std::move(out8), taskGeneration);   /* the generation-drop give */
+        done.set_value();
+    });
+    admittedF.wait();
+    /* play-stop: invalidate bumps g -> g+1, then the clear */
+    pool.clear(g + 1);
+    resume.set_value();
+    doneF.wait();
+    worker.join();                             /* drain complete */
+    if (pool.held() != 0)
+        ::minitest::fail(__FILE__, __LINE__, "no buffer retained after stop + drain",
+                         "held=" + std::to_string(pool.held()));
+
+    /* Next playback (play-start bumps to g+2): legitimate reuse still hits. */
+    pool.open(g + 2);
+    std::vector<uint8_t> first = pool.take();
+    first.assign(kFrameBytes, 0);
+    pool.give(std::move(first), g + 2);
+    ASSERT_EQ(1u, static_cast<unsigned>(pool.held()));
+    const uint64_t hitsBefore = pool.takeHits();
+    const std::vector<uint8_t> reused = pool.take();
+    ASSERT_TRUE(reused.capacity() >= kFrameBytes);
+    ASSERT_EQ(static_cast<unsigned>(hitsBefore + 1), static_cast<unsigned>(pool.takeHits()));
+}
+
+/* r4, adversary A1 on ebe2c4aa (major): after play-stop at generation 8 (floor 9), a paused seek bumped the
+ * generation to 9 and the paused GPU16 result's 12,301,632-byte buffer, given back at 9, was held while
+ * stopped. A stopped pool holds nothing. */
+TEST(PrepPointwiseFast, Rgb8PoolPausedFrameAfterStopIsNotHeld)
+{
+    PlaybackPrepRgb8Pool pool;
+    pool.clear(8);                                    /* play-stop at generation 8 */
+    pool.give(std::vector<uint8_t>(12301632u), 9);    /* paused seek: generation 9, its presented give */
+    pool.give(std::vector<uint8_t>(12301632u), 10);   /* another paused seek */
+    if (pool.held() != 0)
+        ::minitest::fail(__FILE__, __LINE__, "a stopped pool holds no paused frame's buffer",
+                         "held=" + std::to_string(pool.held()));
+}
+
+/* r4, adversary A2 on ebe2c4aa (minor): clear(UINT64_MAX) saturated the floor at UINT64_MAX and a give at
+ * UINT64_MAX was held. */
+TEST(PrepPointwiseFast, Rgb8PoolMaxGenerationClearHoldsNothing)
+{
+    PlaybackPrepRgb8Pool pool;
+    pool.clear(UINT64_MAX);
+    pool.give(std::vector<uint8_t>(64), UINT64_MAX);
+    if (pool.held() != 0)
+        ::minitest::fail(__FILE__, __LINE__, "nothing held after clear(UINT64_MAX)", "held=" + std::to_string(pool.held()));
+}
+
+/* The pool itself: bounded, largest-capacity first, empty buffers never held, clear() frees. */
+TEST(PrepPointwiseFast, Rgb8PoolIsBoundedAndHandsBackTheLargest)
+{
+    PlaybackPrepRgb8Pool pool;
+    pool.open(1);
+    ASSERT_TRUE(pool.take().capacity() == 0);
+    pool.give(std::vector<uint8_t>(), 1);
+    ASSERT_EQ(0u, static_cast<unsigned>(pool.held()));
+    pool.give(std::vector<uint8_t>(16), 1);
+    pool.give(std::vector<uint8_t>(64), 1);
+    pool.give(std::vector<uint8_t>(32), 1);
+    ASSERT_EQ(static_cast<unsigned>(PlaybackPrepRgb8Pool::kMaxHeld), static_cast<unsigned>(pool.held()));
+    const std::vector<uint8_t> a = pool.take();
+    ASSERT_TRUE(a.capacity() >= 64u);
+    ASSERT_EQ(1u, static_cast<unsigned>(pool.held()));
+    pool.clear(1);
+    ASSERT_EQ(0u, static_cast<unsigned>(pool.held()));
+    ASSERT_TRUE(pool.take().capacity() == 0);
 }
 
 /* CPU-LOOKASSIST-AGX-FASTPATH-1: the shapes every committed M16-1243 CPU venue leg
