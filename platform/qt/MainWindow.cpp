@@ -4139,7 +4139,7 @@ void MainWindow::invalidatePlaybackPrepForDisplayChange( const char *reason )
         {
             serialsToRelease.push_back( result.task.requestSerial );
             // r3 (adversary A1 on e7e5271e): a dropped result's 8-bit buffer is recycled too.
-            m_playbackPrepRgb8Pool.give( std::move( result.scopeSourceImage ) );
+            m_playbackPrepRgb8Pool.give( std::move( result.scopeSourceImage ), result.task.presentationGeneration );
         }
         m_playbackPrepResults.clear();
     }
@@ -4229,7 +4229,9 @@ PlaybackPrepDrainOutcome MainWindow::drainPlaybackPrepInFlight( const char *reas
 bool MainWindow::playbackPrepQuiescentBeforeClipReplacement( const char *reason )
 {
     invalidatePlaybackPrepForDisplayChange( reason );
-    m_playbackPrepRgb8Pool.clear();   // r3: no recycled 8-bit buffer outlives the clip (closed until the next take())
+    // r4 (Dot B1): no recycled 8-bit buffer outlives the clip. After the bump above, so every task
+    // admitted before it is below the pool's floor and its late give() frees its buffer.
+    m_playbackPrepRgb8Pool.clear( m_playbackPresentationGeneration.load( std::memory_order_acquire ) );
     const PlaybackPrepDrainOutcome outcome = drainPlaybackPrepInFlight( reason, 2000 );
     if( playbackPrepBorrowFreeingMutationAllowed( outcome ) ) return true;
     logInteractionEvent(
@@ -4310,12 +4312,14 @@ void MainWindow::recordClipOpenSourceStamp()
 // on false. The destructor joins the prep thread before calling this.
 bool MainWindow::freeActiveMlvObjectAfterLifecycleBarrier( const char *reason )
 {
-    // r3 (adversary A2 on e7e5271e, A1 on c76e4457): no recycled buffer outlives an unload. clear() closes
-    // the pool until the next take(), so the queued result clearPresentationForClipOpen drops below gives
-    // its buffer back into a closed pool, which frees it.
-    m_playbackPrepRgb8Pool.clear();
+    // r3 (adversary A2 on e7e5271e) / r4 (Dot B1, adversary A1 on 391464de): no recycled buffer outlives
+    // an unload. clear(g) raises the pool's floor to g + 1, so every task admitted at or before g gives
+    // its buffer back into the floor and has it freed, whatever the thread interleaving.
     if( !m_pMlvObject )
+    {
+        m_playbackPrepRgb8Pool.clear( m_playbackPresentationGeneration.load( std::memory_order_acquire ) );
         return playbackPrepBorrowFreeingMutationAllowed( drainPlaybackPrepInFlight( reason, 2000 ) );
+    }
 
     const QString reasonText =
         reason && *reason ? QString::fromLatin1( reason ) : QStringLiteral("unspecified");
@@ -4325,6 +4329,8 @@ bool MainWindow::freeActiveMlvObjectAfterLifecycleBarrier( const char *reason )
     m_fileLoaded = false;
     m_dontDraw = true;
     clearPresentationForClipOpen( barrierReason );
+    // r4: after clearPresentationForClipOpen's generation bump (and its queued-result give), before the drain.
+    m_playbackPrepRgb8Pool.clear( m_playbackPresentationGeneration.load( std::memory_order_acquire ) );
     const bool prepMutationAllowed = waitForRenderThreadIdleBeforeCoreMutation( barrierReason );
     drainLookAssistWorkers( barrierReason );
     m_clipLifecycleBarrier.waitForNoBorrowers();
@@ -5033,7 +5039,7 @@ void MainWindow::playbackPrepThreadLoop( void )
             ++m_playbackPrepGenerationDropCount;
             if( m_pRenderThread )
                 m_pRenderThread->releasePresentedFrameForRequestSerial( result.task.requestSerial );
-            m_playbackPrepRgb8Pool.give( std::move( result.scopeSourceImage ) );   // r3 (adversary A1 on e7e5271e)
+            m_playbackPrepRgb8Pool.give( std::move( result.scopeSourceImage ), result.task.presentationGeneration );   // r3 (adversary A1 on e7e5271e)
             m_playbackPrepInFlight.endLocked();
             continue;
         }
@@ -5042,7 +5048,7 @@ void MainWindow::playbackPrepThreadLoop( void )
             std::lock_guard<std::mutex> lk( m_playbackPrepMutex );
             if( m_pRenderThread )
                 m_pRenderThread->releasePresentedFrameForRequestSerial( result.task.requestSerial );
-            m_playbackPrepRgb8Pool.give( std::move( result.scopeSourceImage ) );   // r3 (adversary A1 on e7e5271e)
+            m_playbackPrepRgb8Pool.give( std::move( result.scopeSourceImage ), result.task.presentationGeneration );   // r3 (adversary A1 on e7e5271e)
             m_playbackPrepInFlight.endLocked();
             continue;
         }
@@ -5060,7 +5066,7 @@ void MainWindow::playbackPrepThreadLoop( void )
                         m_pRenderThread->releasePresentedFrameForRequestSerial(
                             staleResult.task.requestSerial );
                     // r3 (adversary A1 on e7e5271e): the replaced result's buffer is recycled, not freed.
-                    m_playbackPrepRgb8Pool.give( std::move( staleResult.scopeSourceImage ) );
+                    m_playbackPrepRgb8Pool.give( std::move( staleResult.scopeSourceImage ), staleResult.task.presentationGeneration );
                 }
                 m_playbackPrepResults.clear();
             }
@@ -5111,7 +5117,7 @@ void MainWindow::onPlaybackPrepResultReady( void )
             true );
         if( m_pRenderThread )
             m_pRenderThread->releasePresentedFrameForRequestSerial( result.task.requestSerial );
-        m_playbackPrepRgb8Pool.give( std::move( result.scopeSourceImage ) );   // r3 (adversary A1 on e7e5271e)
+        m_playbackPrepRgb8Pool.give( std::move( result.scopeSourceImage ), result.task.presentationGeneration );   // r3 (adversary A1 on e7e5271e)
         m_frameStillDrawing = renderThreadBusyForPlaybackAdvance( currentPlaybackAdvanceTarget() );
         return;
     }
@@ -5130,7 +5136,7 @@ void MainWindow::onPlaybackPrepResultReady( void )
     // CPU-S1-PACE-NEXT-LEVER-1 r3: the present is done with the developed frame (nothing keeps a
     // pointer into it past this point: it used to be freed right here), so its buffer goes back
     // to the prep worker's pool.
-    m_playbackPrepRgb8Pool.give( std::move( result.scopeSourceImage ) );
+    m_playbackPrepRgb8Pool.give( std::move( result.scopeSourceImage ), result.task.presentationGeneration );
     openGuiPresentGap();
 }
 
@@ -31594,10 +31600,11 @@ void MainWindow::on_actionPlay_toggled(bool checked)
 {
     invalidatePlaybackPrepForDisplayChange(
         checked ? "play-start" : "play-stop" );
-    // r3 (adversary A2 on e7e5271e, A1 on c76e4457): stopped playback holds no recycled 8-bit buffer.
-    // clear() also closes the pool until the next frame takes one, so a result still in flight that
-    // gives its buffer back afterwards has it freed.
-    if( !checked ) m_playbackPrepRgb8Pool.clear();
+    // r3 (adversary A2 on e7e5271e) / r4 (Dot B1, adversary A1 on 391464de): stopped playback holds no
+    // recycled 8-bit buffer. After the bump above: clear(g) raises the pool's floor to g + 1, so a task
+    // admitted before the stop (even one parked before its take()) has its late give() freed, whatever
+    // the interleaving; the next play-start's bump re-enables recycling.
+    if( !checked ) m_playbackPrepRgb8Pool.clear( m_playbackPresentationGeneration.load( std::memory_order_acquire ) );
     // PLAYBACK-CUDA-NATIVE-PACE-1: the pace clock re-arms at this Play's first engine tick.
     m_playbackPaceGuard.reset();
     logInteractionEvent(

@@ -33,9 +33,11 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <cstdint>
 #include <cstdlib>
 #include <cstring>
 #include <functional>
+#include <future>
 #include <string>
 #include <thread>
 #include <vector>
@@ -686,7 +688,7 @@ TEST(PrepPointwiseFast, CpuRouteRecycledOut8IsByteIdenticalWhenPoisoned)
                 std::vector<uint8_t> handedOff = std::move(out8);
                 /* GUI thread after the present: stale bytes, then back to the pool. */
                 std::fill(handedOff.begin(), handedOff.end(), static_cast<uint8_t>(0xA5));
-                pool.give(std::move(handedOff));
+                pool.give(std::move(handedOff), 1);   /* one playing generation */
             }
             if (allocations != 1)
                 ::minitest::fail(__FILE__, __LINE__, "out8 allocated once over six frames",
@@ -721,22 +723,118 @@ TEST(PrepPointwiseFast, CpuRouteNullInputZeroesARecycledOut8)
     }
 }
 
-/* Adversary A1 on c76e4457 (major): freeActiveMlvObjectAfterLifecycleBarrier cleared the pool, then
- * clearPresentationForClipOpen's invalidation gave the queued result's 12.3 MB buffer back into it, so
- * the buffer outlived the unload (stop: an in-flight result's late give, likewise). clear() now closes
- * the pool until the next take(): a give in between frees its buffer, whatever the call order. */
-TEST(PrepPointwiseFast, Rgb8PoolGiveAfterClearIsFreedUntilTheNextTake)
+/* Adversary A1 on c76e4457 (major), kept under r4's generation-keyed pool: freeActiveMlvObjectAfterLifecycleBarrier
+ * cleared the pool, then clearPresentationForClipOpen's invalidation gave the queued result's 12.3 MB buffer
+ * back into it. A give from a generation below the floor clear() raised is freed; take() does not reopen
+ * the pool (r4, Dot B1); the next generation recycles again; the floor never goes down. */
+TEST(PrepPointwiseFast, Rgb8PoolGiveBelowTheClearFloorIsFreed)
 {
     PlaybackPrepRgb8Pool pool;
-    pool.give(std::vector<uint8_t>(64));
+    pool.give(std::vector<uint8_t>(64), 7);
     ASSERT_EQ(1u, static_cast<unsigned>(pool.held()));
-    pool.clear();
+    pool.clear(8);                                  /* stop at generation 8: floor 9 */
     ASSERT_EQ(0u, static_cast<unsigned>(pool.held()));
-    pool.give(std::vector<uint8_t>(12301632u));   /* the late give after an unload / stop */
+    pool.give(std::vector<uint8_t>(12301632u), 7);  /* the late give of a task admitted at 7 */
     ASSERT_EQ(0u, static_cast<unsigned>(pool.held()));
-    ASSERT_TRUE(pool.take().capacity() == 0);    /* the next playback frame reopens it */
-    pool.give(std::vector<uint8_t>(64));
+    pool.give(std::vector<uint8_t>(64), 8);         /* a task at the stop's own generation */
+    ASSERT_EQ(0u, static_cast<unsigned>(pool.held()));
+    ASSERT_TRUE(pool.take().capacity() == 0);       /* take() does not reopen anything */
+    pool.give(std::vector<uint8_t>(64), 8);
+    ASSERT_EQ(0u, static_cast<unsigned>(pool.held()));
+    pool.give(std::vector<uint8_t>(64), 9);         /* play-start bumped to 9: recycles */
     ASSERT_EQ(1u, static_cast<unsigned>(pool.held()));
+    pool.clear(3);                                  /* an older generation never lowers the floor */
+    ASSERT_EQ(0u, static_cast<unsigned>(pool.held()));
+    pool.give(std::vector<uint8_t>(64), 8);
+    ASSERT_EQ(0u, static_cast<unsigned>(pool.held()));
+    pool.give(std::vector<uint8_t>(64), 9);
+    ASSERT_EQ(1u, static_cast<unsigned>(pool.held()));
+    pool.clear(UINT64_MAX);                         /* saturates, no wrap to floor 0 */
+    pool.give(std::vector<uint8_t>(64), 9);
+    ASSERT_EQ(0u, static_cast<unsigned>(pool.held()));
+}
+
+/* r4: the same schedule as Rgb8PoolTaskParkedAcrossStopClearRetainsNothing, every order of the old task's
+ * take/give against the clear (take before or after it, give after it; then give before it), on real threads. */
+TEST(PrepPointwiseFast, Rgb8PoolEveryOrderOfOldTaskAndClearRetainsNothing)
+{
+    const uint64_t g = 7;
+    for (int order = 0; order < 2; ++order)
+    {
+        PlaybackPrepRgb8Pool pool;
+        pool.give(std::vector<uint8_t>(4096), g);
+        pool.give(std::vector<uint8_t>(2048), g);
+        std::promise<void> tookP, cleared, gaveP;
+        std::future<void> tookF = tookP.get_future(), clearedF = cleared.get_future(), gaveF = gaveP.get_future();
+        std::thread worker([&]() {
+            if (order == 1) clearedF.wait();          /* 1: take after the clear */
+            std::vector<uint8_t> out8 = pool.take();
+            out8.assign(4096, static_cast<uint8_t>(0x5A));
+            tookP.set_value();
+            if (order == 0) clearedF.wait();          /* 0: take before, give after */
+            pool.give(std::move(out8), g);
+            gaveP.set_value();
+        });
+        if (order == 0) tookF.wait();
+        pool.clear(g + 1);
+        cleared.set_value();
+        gaveF.wait();
+        worker.join();
+        if (pool.held() != 0)
+            ::minitest::fail(__FILE__, __LINE__, "no buffer retained", "order=" + std::to_string(order));
+    }
+    /* give before the clear: the clear frees it */
+    PlaybackPrepRgb8Pool pool;
+    std::thread worker([&]() { std::vector<uint8_t> out8 = pool.take(); out8.assign(64, 0); pool.give(std::move(out8), g); });
+    worker.join();
+    ASSERT_EQ(1u, static_cast<unsigned>(pool.held()));
+    pool.clear(g + 1);
+    ASSERT_EQ(0u, static_cast<unsigned>(pool.held()));
+}
+/* CPU-S1-PACE-NEXT-LEVER-1 r4 (Dot B1 / adversary A1 on 391464de, major): a worker admitted at
+ * generation g, parked before take(), resumes after play-stop's clear(); take() reopened the pool
+ * and the generation-drop give() kept 12,301,632 bytes after the drain. Deterministic barrier
+ * schedule on a real second thread (promises, no sleeps). */
+TEST(PrepPointwiseFast, Rgb8PoolTaskParkedAcrossStopClearRetainsNothing)
+{
+    const size_t kFrameBytes = 12301632u;   /* 1808 x 2268 x 3 */
+    const uint64_t g = 7;                    /* the playing generation the task was admitted at */
+    PlaybackPrepRgb8Pool pool;
+    pool.give(std::vector<uint8_t>(kFrameBytes), g);   /* a presented frame at g recycled */
+    ASSERT_EQ(1u, static_cast<unsigned>(pool.held()));
+
+    std::promise<void> admitted, resume, done;
+    std::future<void> admittedF = admitted.get_future();
+    std::future<void> resumeF = resume.get_future();
+    std::future<void> doneF = done.get_future();
+    std::thread worker([&]() {
+        const uint64_t taskGeneration = g;   /* passed the generation check at g */
+        admitted.set_value();
+        resumeF.wait();                       /* parked before take() */
+        std::vector<uint8_t> out8 = pool.take();
+        out8.assign(kFrameBytes, static_cast<uint8_t>(0x5A));   /* the build */
+        pool.give(std::move(out8), taskGeneration);   /* the generation-drop give */
+        done.set_value();
+    });
+    admittedF.wait();
+    /* play-stop: invalidate bumps g -> g+1, then the clear */
+    pool.clear(g + 1);
+    resume.set_value();
+    doneF.wait();
+    worker.join();                             /* drain complete */
+    if (pool.held() != 0)
+        ::minitest::fail(__FILE__, __LINE__, "no buffer retained after stop + drain",
+                         "held=" + std::to_string(pool.held()));
+
+    /* Next playback (play-start bumps to g+2): legitimate reuse still hits. */
+    std::vector<uint8_t> first = pool.take();
+    first.assign(kFrameBytes, 0);
+    pool.give(std::move(first), g + 2);
+    ASSERT_EQ(1u, static_cast<unsigned>(pool.held()));
+    const uint64_t hitsBefore = pool.takeHits();
+    const std::vector<uint8_t> reused = pool.take();
+    ASSERT_TRUE(reused.capacity() >= kFrameBytes);
+    ASSERT_EQ(static_cast<unsigned>(hitsBefore + 1), static_cast<unsigned>(pool.takeHits()));
 }
 
 /* The pool itself: bounded, largest-capacity first, empty buffers never held, clear() frees. */
@@ -744,16 +842,16 @@ TEST(PrepPointwiseFast, Rgb8PoolIsBoundedAndHandsBackTheLargest)
 {
     PlaybackPrepRgb8Pool pool;
     ASSERT_TRUE(pool.take().capacity() == 0);
-    pool.give(std::vector<uint8_t>());
+    pool.give(std::vector<uint8_t>(), 1);
     ASSERT_EQ(0u, static_cast<unsigned>(pool.held()));
-    pool.give(std::vector<uint8_t>(16));
-    pool.give(std::vector<uint8_t>(64));
-    pool.give(std::vector<uint8_t>(32));
+    pool.give(std::vector<uint8_t>(16), 1);
+    pool.give(std::vector<uint8_t>(64), 1);
+    pool.give(std::vector<uint8_t>(32), 1);
     ASSERT_EQ(static_cast<unsigned>(PlaybackPrepRgb8Pool::kMaxHeld), static_cast<unsigned>(pool.held()));
     const std::vector<uint8_t> a = pool.take();
     ASSERT_TRUE(a.capacity() >= 64u);
     ASSERT_EQ(1u, static_cast<unsigned>(pool.held()));
-    pool.clear();
+    pool.clear(1);
     ASSERT_EQ(0u, static_cast<unsigned>(pool.held()));
     ASSERT_TRUE(pool.take().capacity() == 0);
 }

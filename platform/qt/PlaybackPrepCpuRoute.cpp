@@ -5,6 +5,7 @@
 #include <QElapsedTimer>
 
 #include <algorithm>
+#include <cstdint>
 #include <cstring>
 #include <omp.h>
 
@@ -130,7 +131,6 @@ uint16_t * PlaybackPrepCpuWorkspace::reducedInput(size_t words)
 std::vector<uint8_t> PlaybackPrepRgb8Pool::take()
 {
     std::lock_guard<std::mutex> lk(m_mutex);
-    m_closed = false;   /* a new frame: the pool clear() closed is open again */
     if ( m_held.empty() )
     {
         ++m_takeMisses;
@@ -145,21 +145,23 @@ std::vector<uint8_t> PlaybackPrepRgb8Pool::take()
     return buf;
 }
 
-void PlaybackPrepRgb8Pool::give(std::vector<uint8_t> && buf)
+void PlaybackPrepRgb8Pool::give(std::vector<uint8_t> && buf, uint64_t generation)
 {
     std::vector<uint8_t> dropped(std::move(buf));
     if ( dropped.capacity() == 0 ) return;
     std::lock_guard<std::mutex> lk(m_mutex);
-    if ( m_closed || m_held.size() >= kMaxHeld ) return;   /* freed by `dropped` after the unlock */
+    /* r4: a buffer from a task admitted before the last clear() is freed, not held. */
+    if ( generation < m_minGeneration || m_held.size() >= kMaxHeld ) return;   /* freed by `dropped` after the unlock */
     m_held.push_back(std::move(dropped));
 }
 
-void PlaybackPrepRgb8Pool::clear()
+void PlaybackPrepRgb8Pool::clear(uint64_t currentGeneration)
 {
     std::vector<std::vector<uint8_t>> dropped;
     std::lock_guard<std::mutex> lk(m_mutex);
     dropped.swap(m_held);
-    m_closed = true;
+    const uint64_t floor = currentGeneration == UINT64_MAX ? UINT64_MAX : currentGeneration + 1;
+    if ( floor > m_minGeneration ) m_minGeneration = floor;
 }
 
 size_t PlaybackPrepRgb8Pool::held() const

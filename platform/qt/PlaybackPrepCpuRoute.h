@@ -116,21 +116,29 @@ struct PlaybackPrepCpuRouteResult
  * Every byte of the processed dims is written by the route (pinned by
  * PrepPointwiseFast.CpuRouteRecycledOut8IsByteIdenticalWhenPoisoned), so a
  * recycled buffer's stale contents are never read. Thread-safe; holds at most
- * kMaxHeld buffers (a buffer given past that is freed). */
+ * kMaxHeld buffers (a buffer given past that is freed).
+ *
+ * r4 (Dot B1, adversary A1 on 391464de): keyed on the presentation generation
+ * (MainWindow::m_playbackPresentationGeneration, monotonic). clear(g) raises a
+ * floor to g + 1; a give() of a buffer from a task admitted at a generation
+ * below the floor frees it. give and clear serialise on one mutex and the floor
+ * only rises, so a task admitted at or before g never leaves a buffer held
+ * after clear(g), whatever the interleaving (a give before the clear is freed
+ * by it, a give after it is refused). take() never changes the floor. */
 class PlaybackPrepRgb8Pool
 {
 public:
     static constexpr size_t kMaxHeld = 2;
 
-    /* A held buffer (the largest capacity), or an empty vector if none is held.
-     * Reopens a pool clear() closed. */
+    /* A held buffer (the largest capacity), or an empty vector if none is held. */
     std::vector<uint8_t> take();
-    /* Holds buf if it has capacity, the pool is open and fewer than kMaxHeld are held. */
-    void give(std::vector<uint8_t> && buf);
-    /* Frees every held buffer and closes the pool until the next take() (playback
-     * stop, clip unload): a buffer given back in between is freed, whatever the order
-     * of the caller's clear and the drop that gives it (r3, adversary A1 on c76e4457). */
-    void clear();
+    /* Holds buf if it has capacity, generation is at or above the floor and fewer
+     * than kMaxHeld are held; otherwise frees it. generation = the presentation
+     * generation of the task the buffer was developed for. */
+    void give(std::vector<uint8_t> && buf, uint64_t generation);
+    /* Frees every held buffer and raises the floor to currentGeneration + 1
+     * (never lowers it): playback stop, clip replacement, clip unload. */
+    void clear(uint64_t currentGeneration);
     size_t held() const;
     uint64_t takeHits() const;
     uint64_t takeMisses() const;
@@ -140,7 +148,7 @@ private:
     std::vector<std::vector<uint8_t>> m_held;
     uint64_t m_takeHits = 0;
     uint64_t m_takeMisses = 0;
-    bool m_closed = false;
+    uint64_t m_minGeneration = 0;
 };
 
 /* State the prep thread keeps across frames. Not thread-safe by design: one

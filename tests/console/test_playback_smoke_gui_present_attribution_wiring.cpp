@@ -729,15 +729,27 @@ TEST(GuiOtherBusySplit, NanPaintReadingOrBudgetNeverReachesASessionSum)
     ASSERT_TRUE(std::isfinite(rest) && rest >= 0.0);
     for (int i = 0; i < gui_present_gap::OtherBusySpans::kCount; ++i)
         ASSERT_TRUE(std::isfinite(spans.sumMs[i]) && spans.sumMs[i] >= 0.0);
-    // A NaN budget: the named 1 ms span is folded at scale 1 or 0, never NaN.
+    // A NaN budget is no budget (r4, Dot nit): the named 1 ms span is charged ZERO, so no session sum
+    // and no unattributed remainder moves. (Finite/nonnegative alone also passed the old NaN scale.)
+    double sumsBefore[gui_present_gap::OtherBusySpans::kCount];
+    for (int i = 0; i < gui_present_gap::OtherBusySpans::kCount; ++i) sumsBefore[i] = spans.sumMs[i];
+    const double unattributedBefore = spans.unattributedSumMs;
     spans.openGap();
     spans.begin(spanClock(8, 0));
     ASSERT_NEAR(1.0, spans.end(gui_present_gap::OtherBusySpan::DrawFrame, spanClock(8, 1)), 1e-9);
     const double rest2 = spans.closeGap(nan);
-    ASSERT_TRUE(std::isfinite(rest2) && rest2 >= 0.0);
+    ASSERT_TRUE(rest2 == 0.0);
     for (int i = 0; i < gui_present_gap::OtherBusySpans::kCount; ++i)
-        ASSERT_TRUE(std::isfinite(spans.sumMs[i]) && spans.sumMs[i] >= 0.0);
-    ASSERT_TRUE(std::isfinite(spans.unattributedSumMs) && spans.unattributedSumMs >= 0.0);
+        ASSERT_TRUE(spans.sumMs[i] == sumsBefore[i]);
+    ASSERT_TRUE(spans.unattributedSumMs == unattributedBefore);
+    // The zero-budget contract the NaN case maps to: same zero charge.
+    spans.openGap();
+    spans.begin(spanClock(10, 0));
+    ASSERT_NEAR(1.0, spans.end(gui_present_gap::OtherBusySpan::DrawFrame, spanClock(10, 1)), 1e-9);
+    ASSERT_TRUE(spans.closeGap(0.0) == 0.0);
+    for (int i = 0; i < gui_present_gap::OtherBusySpans::kCount; ++i)
+        ASSERT_TRUE(spans.sumMs[i] == sumsBefore[i]);
+    ASSERT_TRUE(spans.unattributedSumMs == unattributedBefore);
     // Adversary A4 on e7e5271e: paintMs = -Infinity made the span +Infinity, closeGap(1.0) scaled it by
     // 1/Infinity = 0 and Infinity * 0 wrote NaN into sumMs.
     spans.openGap();
@@ -809,7 +821,7 @@ TEST(PlaybackPrepRgb8Pool, EveryDroppedOrPresentedResultGivesItsBufferBack)
             const QRegularExpressionMatch m = it.next();
             ++drops;
             const QString block = enclosingBlock(body, static_cast<int>(m.capturedStart()));
-            const QString give = QStringLiteral("m_playbackPrepRgb8Pool.give( std::move( %1.scopeSourceImage ) )").arg(m.captured(1));
+            const QString give = QStringLiteral("m_playbackPrepRgb8Pool.give( std::move( %1.scopeSourceImage ), %1.task.presentationGeneration )").arg(m.captured(1));
             if (!block.contains(give))
                 ::minitest::fail(__FILE__, __LINE__, "dropped result gives its buffer back in the same block",
                                  std::string(fn.signature) + " at: " + body.mid(m.capturedStart(), 90).toStdString());
@@ -821,23 +833,78 @@ TEST(PlaybackPrepRgb8Pool, EveryDroppedOrPresentedResultGivesItsBufferBack)
     const QString ready = prepResultReadyBody();
     const int present = ready.indexOf(QStringLiteral("presentPlaybackPreparedFrame( result );"));
     ASSERT_TRUE(present >= 0);
-    ASSERT_TRUE(ready.indexOf(QStringLiteral("m_playbackPrepRgb8Pool.give( std::move( result.scopeSourceImage ) );"), present) > present);
+    ASSERT_TRUE(ready.indexOf(QStringLiteral("m_playbackPrepRgb8Pool.give( std::move( result.scopeSourceImage ), result.task.presentationGeneration );"), present) > present);
 }
 
 // Adversary A2 on e7e5271e (minor): the pool was cleared only on clip open, so buffers survived stop,
-// delete-clip and rename-clip. Pinned: play-stop and every clip unload (freeActiveMlvObjectAfterLifecycleBarrier)
-// clear it.
+// delete-clip and rename-clip. r4 (Dot B1, adversary A1 on 391464de, major): a clear that ran before its
+// path's generation bump, or a take() that reopened the pool, let a task admitted before a stop or unload
+// keep its buffer after the drain. Pinned: play-stop, clip replacement and both unload paths clear with
+// the current generation, after that path's bump and before its drain.
 TEST(PlaybackPrepRgb8Pool, StopAndClipUnloadClearThePool)
 {
     const QString source = mainWindowSource();
-    const QString unload = bracedBlockAfter(source, QStringLiteral("bool MainWindow::freeActiveMlvObjectAfterLifecycleBarrier( const char *reason )"));
-    ASSERT_FALSE(unload.isEmpty());
-    ASSERT_TRUE(unload.contains(QStringLiteral("m_playbackPrepRgb8Pool.clear();")));
+    const QString clearCall = QStringLiteral("m_playbackPrepRgb8Pool.clear( m_playbackPresentationGeneration.load( std::memory_order_acquire ) );");
     const QString toggled = bracedBlockAfter(source, QStringLiteral("void MainWindow::on_actionPlay_toggled(bool checked)"));
     ASSERT_FALSE(toggled.isEmpty());
-    ASSERT_TRUE(toggled.contains(QStringLiteral("if( !checked ) m_playbackPrepRgb8Pool.clear();")));
+    const int toggleBump = toggled.indexOf(QStringLiteral("invalidatePlaybackPrepForDisplayChange("));
+    const int toggleClear = toggled.indexOf(QStringLiteral("if( !checked ) ") + clearCall);
+    const int toggleDrain = toggled.indexOf(QStringLiteral("drainPlaybackPrepInFlight( \"play-stop\""));
+    ASSERT_TRUE(toggleBump >= 0 && toggleClear > toggleBump && toggleDrain > toggleClear);
+
+    const QString replace = bracedBlockAfter(source, QStringLiteral("bool MainWindow::playbackPrepQuiescentBeforeClipReplacement( const char *reason )"));
+    ASSERT_FALSE(replace.isEmpty());
+    const int replaceBump = replace.indexOf(QStringLiteral("invalidatePlaybackPrepForDisplayChange( reason );"));
+    const int replaceClear = replace.indexOf(clearCall);
+    const int replaceDrain = replace.indexOf(QStringLiteral("drainPlaybackPrepInFlight("));
+    ASSERT_TRUE(replaceBump >= 0 && replaceClear > replaceBump && replaceDrain > replaceClear);
+
+    const QString unload = bracedBlockAfter(source, QStringLiteral("bool MainWindow::freeActiveMlvObjectAfterLifecycleBarrier( const char *reason )"));
+    ASSERT_FALSE(unload.isEmpty());
+    // No-object path: clear, then the drain it returns.
+    const int early = unload.indexOf(QStringLiteral("if( !m_pMlvObject )"));
+    const int earlyClear = unload.indexOf(clearCall, early);
+    const int earlyDrain = unload.indexOf(QStringLiteral("drainPlaybackPrepInFlight( reason, 2000 )"), early);
+    ASSERT_TRUE(early >= 0 && earlyClear > early && earlyDrain > earlyClear);
+    // Object path: clearPresentationForClipOpen (its bump), then the clear, then the drain.
+    const int unloadBump = unload.indexOf(QStringLiteral("clearPresentationForClipOpen( barrierReason );"));
+    const int unloadClear = unload.indexOf(clearCall, unloadBump);
+    const int unloadDrain = unload.indexOf(QStringLiteral("waitForRenderThreadIdleBeforeCoreMutation( barrierReason )"), unloadBump);
+    ASSERT_TRUE(unloadBump > earlyDrain && unloadClear > unloadBump && unloadDrain > unloadClear);
+    const QString open = bracedBlockAfter(source, QStringLiteral("void MainWindow::clearPresentationForClipOpen( const char *reason )"));
+    ASSERT_TRUE(open.contains(QStringLiteral("invalidatePlaybackPrepForDisplayChange( reason );")));
 }
 
+// r4 (Dot B1): the pool is keyed on the presentation generation. Every give passes the generation of
+// the task whose buffer it returns, every clear passes the current generation, and take() takes no
+// argument (it never reopens the pool). A new give or clear site without its generation fails here.
+TEST(PlaybackPrepRgb8Pool, EveryGivePassesItsTaskGenerationAndEveryClearTheCurrentOne)
+{
+    const QString source = mainWindowSource();
+    const QRegularExpression anyGive(QStringLiteral("m_playbackPrepRgb8Pool\\.give\\("));
+    const QRegularExpression keyedGive(QStringLiteral(
+        "m_playbackPrepRgb8Pool\\.give\\( std::move\\( (\\w+)\\.scopeSourceImage \\), \\1\\.task\\.presentationGeneration \\);"));
+    int gives = 0;
+    for (auto it = anyGive.globalMatch(source); it.hasNext(); it.next()) ++gives;
+    int keyed = 0;
+    for (auto it = keyedGive.globalMatch(source); it.hasNext(); it.next()) ++keyed;
+    if (gives < 6 || keyed != gives)
+        ::minitest::fail(__FILE__, __LINE__, "every pool give passes its task generation",
+                         "gives=" + std::to_string(gives) + " keyed=" + std::to_string(keyed));
+    const QString keyedClear = QStringLiteral("m_playbackPrepRgb8Pool.clear( m_playbackPresentationGeneration.load( std::memory_order_acquire ) );");
+    const int clears = static_cast<int>(source.count(QStringLiteral("m_playbackPrepRgb8Pool.clear(")));
+    const int keyedClears = static_cast<int>(source.count(keyedClear));
+    if (clears < 4 || keyedClears != clears)
+        ::minitest::fail(__FILE__, __LINE__, "every pool clear passes the current generation",
+                         "clears=" + std::to_string(clears) + " keyed=" + std::to_string(keyedClears));
+    const int takes = static_cast<int>(source.count(QStringLiteral("m_playbackPrepRgb8Pool.take(")));
+    ASSERT_TRUE(takes >= 1 && takes == static_cast<int>(source.count(QStringLiteral("m_playbackPrepRgb8Pool.take()"))));
+    // The pool header: generation-keyed give/clear, no reopen flag.
+    const QString h = readRepoFile(QStringLiteral("platform/qt/PlaybackPrepCpuRoute.h"));
+    ASSERT_TRUE(h.contains(QStringLiteral("void give(std::vector<uint8_t> && buf, uint64_t generation);")));
+    ASSERT_TRUE(h.contains(QStringLiteral("void clear(uint64_t currentGeneration);")));
+    ASSERT_FALSE(h.contains(QStringLiteral("m_closed")));
+}
 TEST(GuiOtherBusySplit, HandlersOpenTheirSpanFirstAndTheSummaryAppendsTheSplit)
 {
     const QString source = mainWindowSource();
