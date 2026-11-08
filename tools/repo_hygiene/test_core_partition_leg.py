@@ -2552,6 +2552,15 @@ _REUSED_APP = {"id": 5000, "from": 1, "to": 3, "goneAt": 4, "startSec": 1, "hand
 _REUSER = {"id": 5000, "from": 99, "to": 0, "idFrom": 4, "idTo": 9, "goneAt": 10, "startBeforeFirstPollMs": -500}
 _GONE_KEY_P0_B = ({"id": 300, "from": 1, "to": 1, "goneAt": 2, "startSec": 1, "handleFail": 1, "byPid": 1},
                   {"id": 300, "from": 99, "to": 0, "idFrom": 2, "idTo": 3, "goneAt": 4, "startSec": 2, "exe": "other"})
+# r3 (Dot pr-777 I3): the app's exe for the equal-length comparison cases ("mlv" U+00C5 "fake.exe"), and one scenario per path comparison site with the
+# compared process at exe kind `e` ('angstrom' or 'case'): the same shapes as the soft-hyphen cases at those sites.
+_ANGSTROM_APP_EXE = "mlvÅfake.exe"
+_ORDINAL_SITES = {
+    "gone-key-relisted": lambda e: {"procs": [_APP, *_GONE_KEY_P0_B, {"id": 300, "from": 4, "to": 99, "goneAt": 999, "startSec": 1, "exe": e}]},
+    "pid-reused-same-start": lambda e: {"sleepMs": 250, "stopAt": 12, "procs": [_REUSED_APP, {**_REUSER, "exe": e, "startBeforeFirstPollMs": None, "startSec": 1}]},
+    "path-start-unread": lambda e: {"procs": [_APP, {**_Q, "id": 400, "startSec": 1, "exe": e, "startFail": -1}]},
+    "path-listed": lambda e: {"procs": [_APP, {**_Q, "id": 400, "startSec": 1, "exe": e}]},
+}
 LATE_READ_SCENARIOS = {
     "control": {"procs": [_APP]},
     "path-empty-late": {"procs": [{**_APP, "pathFail": 3, "pathMode": "empty"}]},
@@ -2643,6 +2652,10 @@ LATE_READ_SCENARIOS = {
     "pid-reused-same-start-culture-equal-path": {"sleepMs": 250, "stopAt": 12, "procs": [_REUSED_APP, {**_REUSER, "exe": "soft", "startBeforeFirstPollMs": None, "startSec": 1}]},
     "culture-equal-path-listed": {"procs": [_APP, {**_Q, "id": 400, "startSec": 1, "exe": "soft"}]},
     "culture-equal-path-start-unread": {"procs": [_APP, {**_Q, "id": 400, "startSec": 1, "exe": "soft", "startFail": -1}]},
+    # r3 (Dot pr-777 I3): the soft hyphen changes the length, so the length guard alone tells those apart. The same four sites, with the app's exe named with
+    # U+00C5 (appExe): 'angstrom' (U+212B in its place: equal length, culture-equal, ordinally another file) is another exe; 'case' (the same path, ASCII case
+    # only) is the exe. Mode suffix -angstrom / -case, in site order: the seen-key rule, the identity re-read, the listing's pending and tracking tests.
+    **{f"{site}-{exe}": {"appExe": _ANGSTROM_APP_EXE, **spec(exe)} for exe in ("angstrom", "case") for site, spec in _ORDINAL_SITES.items()},
     **{f"clock-back-path-{ms}": {"stepMs": ms, "procs": [{**_CLOCK_APP, "pathFail": 1, "pathMode": "empty"}]} for ms in CLOCK_STEPS_MS},
     **{f"clock-back-start-{ms}": {"stepMs": ms, "procs": [{**_CLOCK_APP, "startFail": 1}]} for ms in CLOCK_START_UNREAD_STEPS_MS},
 }
@@ -2670,7 +2683,10 @@ $global:cpDoubles = @(foreach ($s in @($global:cpSpec.procs)) {
     $d | Add-Member -MemberType ScriptProperty -Name Path -Value {
         $s = $this.cpS
         if ((Test-CpFails $s.pathFail $s.pathFailFrom) -or $global:cpPoll -eq $s.pathFailAt -or ($this.cpFresh -and (Test-CpFails $null $s.idPathFailFrom))) { if ($s.pathMode -eq 'throw') { throw [ComponentModel.Win32Exception]::new(5) }; return '' }
-        if ($s.exe -eq 'other') { 'C:\elsewhere\mlvfake.exe' } elseif ($s.exe -eq 'soft') { $env:MLV_CP_EXE -replace 'mlvfake\.exe$', "mlv$([char]0xAD)fake.exe" } else { $env:MLV_CP_EXE } }
+        # r3 (Dot pr-777 I3): 'angstrom' is the app's path with its U+00C5 (appExe) swapped for U+212B ANGSTROM SIGN, the same length, equal under culture
+        # comparison and different under ordinal; 'case' is the app's path with every ASCII lower-case letter upper-cased (the same file).
+        if ($s.exe -eq 'other') { 'C:\elsewhere\mlvfake.exe' } elseif ($s.exe -eq 'soft') { $env:MLV_CP_EXE -replace 'mlvfake\.exe$', "mlv$([char]0xAD)fake.exe" } elseif ($s.exe -eq 'angstrom') {
+            $env:MLV_CP_EXE.Replace([string][char]0xC5, [string][char]0x212B) } elseif ($s.exe -eq 'case') { [regex]::Replace($env:MLV_CP_EXE, '[a-z]', { $args[0].Value.ToUpperInvariant() }) } else { $env:MLV_CP_EXE } }
     $d | Add-Member -MemberType ScriptProperty -Name StartTime -Value {
         $s = $this.cpS
         if ((Test-CpFails $s.startFail $s.startFailFrom) -or $global:cpPoll -eq $s.startFailAt -or ($this.cpFresh -and (Test-CpFails $null $s.idStartFailFrom))) { throw [ComponentModel.Win32Exception]::new(5) }
@@ -2710,7 +2726,7 @@ for ($b = 0; $b -lt $names.Count; $b += 4) {
         $psi = [Diagnostics.ProcessStartInfo]::new("$env:ProgramFiles\PowerShell\7\pwsh.exe", "-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File `"$hp`"")
         $psi.UseShellExecute = $false; $psi.CreateNoWindow = $true
         $psi.Environment['CP_SPEC'] = ($spec | ConvertTo-Json -Compress -Depth 6); $psi.Environment['CP_LAUNCH_TICKS'] = [string]$launch; $psi.Environment['CP_POLLS'] = Join-Path $dir 'polls'
-        $psi.Environment['MLV_CP_EXE'] = Join-Path $dir 'mlvfake.exe'
+        $psi.Environment['MLV_CP_EXE'] = Join-Path $dir $(if ($spec.appExe) { [string]$spec.appExe } else { 'mlvfake.exe' })
         $psi.Environment['MLV_CP_STOP'] = Join-Path $dir 'stop'
         $psi.Environment['MLV_CP_READY'] = Join-Path $dir 'ready'
         $psi.Environment['MLV_CP_OUT'] = Join-Path $dir 'helper.json'
@@ -3231,6 +3247,53 @@ $out | ConvertTo-Json -Compress
                 case = self.late_read(mode)
                 self.assertEqual([case["unidentified"], case["others"], case["instances"]], [[], [], [5000]], f"a process at a culture-equal other exe was classed as the app's path: {case}")
                 self.assertIn(case["vwhy"], self.ACCEPTED, case)
+
+    def test_pid_reuse_r3_i3_an_equal_length_culture_equal_path_is_another_exe_at_each_site(self) -> None:
+        """r3 (Dot pr-777 I3, hub chat ruling 2026-11-08T19:23:06Z). The soft-hyphen cases above change the path's length, so the length guard alone tells
+        them apart and they cannot say whether the comparison is ordinal. Here the app's exe is named with U+00C5 and the compared path has U+212B ANGSTROM
+        SIGN in its place: the same length, equal under culture comparison (-ieq, CurrentCultureIgnoreCase), another file under OrdinalIgnoreCase. At each of
+        the four sites it must be another exe, with the outcome of the soft-hyphen case at that site."""
+        with self.subTest(mode="gone-key-relisted-angstrom"):
+            relisted = self.late_read("gone-key-relisted-angstrom")
+            self.assertEqual(relisted["unidentified"], [], f"the seen-key rule read a culture-equal equal-length other exe as the exe's: {relisted}")
+            self.assertIsNotNone(relisted["by"]["300"]["goneMs"], relisted)
+        with self.subTest(mode="pid-reused-same-start-angstrom"):
+            reused = self.late_read("pid-reused-same-start-angstrom")
+            app, ms = reused["firstApp"], reused["pollsMs"]
+            self.assertLessEqual(app["aliveMs"], ms[3], f"the identity re-read read a culture-equal equal-length other path (same start) as the app's: {reused}")
+            self.assertIsNotNone(app["goneMs"], reused)
+            self.assertLessEqual(app["goneMs"], ms[4], f"the measured app did not end at the first poll that read a culture-equal equal-length other path: {reused}")
+        for mode in ("path-start-unread-angstrom", "path-listed-angstrom"):
+            with self.subTest(mode=mode):
+                case = self.late_read(mode)
+                self.assertEqual([case["unidentified"], case["others"], case["instances"]], [[], [], [5000]], f"the listing classed a culture-equal equal-length other exe as the app's path: {case}")
+                self.assertIn(case["vwhy"], self.ACCEPTED, case)
+
+    def test_pid_reuse_r3_i3_control_the_same_path_in_another_ascii_case_is_the_exe_at_each_site(self) -> None:
+        """r3 (Dot pr-777 I3) control: the same four sites with the compared path the exe's own, every ASCII letter upper-cased (the U+00C5 kept). Windows paths
+        are case-insensitive, so it is the exe at every site, with the outcome of the exact path there: a gone key carried at the exe is recorded unidentified;
+        a same-start successor at the exe passes the identity re-read on every poll (only the missing pin refuses it); a same-path process whose start never
+        reads is recorded unidentified; one whose start reads is tracked as a same-path instance. A case-sensitive comparison fails each."""
+        with self.subTest(mode="gone-key-relisted-case"):
+            relisted = self.late_read("gone-key-relisted-case")
+            self.assertEqual(relisted["unidentified"], [300], f"the seen-key rule read the exe's path in another case as another exe: {relisted}")
+            self.assertEqual(relisted["vwhy"], "same-path-instance-unidentified", relisted)
+            self.assertIsNotNone(relisted["by"]["300"]["goneMs"], relisted)
+        with self.subTest(mode="pid-reused-same-start-case"):
+            reused = self.late_read("pid-reused-same-start-case")
+            app, ms = reused["firstApp"], reused["pollsMs"]
+            self.assertGreaterEqual(app["aliveMs"], ms[8], f"the identity re-read read the exe's path in another case as another process: {reused}")
+            self.assertGreaterEqual(app["goneMs"], ms[9], reused)
+            self.assertLessEqual(app["goneMs"], ms[10], reused)
+            self.assertIs(app["pinned"], False, reused)
+            self.assertEqual(reused["vwhy"], "measured-app-identity-unpinned", reused)
+        with self.subTest(mode="path-start-unread-case"):
+            case = self.late_read("path-start-unread-case")
+            self.assertEqual(case["unidentified"], [400], f"the listing did not hold the exe's path in another case (start unread) as a same-path process: {case}")
+            self.assertEqual(case["vwhy"], "same-path-instance-unidentified", case)
+        with self.subTest(mode="path-listed-case"):
+            case = self.late_read("path-listed-case")
+            self.assertEqual([case["unidentified"], case["others"], case["instances"]], [[], [], [5000, 400]], f"the listing did not track the exe's path in another case as a same-path instance: {case}")
 
     def test_handover_a_process_on_a_recycled_tracked_pid_keeps_its_real_first_sight(self) -> None:
         """The same P2 alive and readable from enumeration 6: its first sight is enumeration 4, the pass that first listed it, not one pass late."""
