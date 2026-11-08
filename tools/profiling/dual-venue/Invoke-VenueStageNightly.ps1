@@ -575,7 +575,12 @@ if ($buildInCache) {
     } else {
         if (Test-Path -LiteralPath $buildDir) { $buildDir = Join-Path $BuildRoot ("build-$s12-r" + [DateTime]::UtcNow.ToString('yyyyMMddHHmmss')) }
         Say "assemble $commit -> $buildDir (build-guard)"
-        $a = Invoke-Child 'assemble' $Assembler @('-SourceCommit', $commit, '-DllPairDir', $dllDir, '-OutDir', $buildDir)
+        # STAGE-BUILD-HEAVY-SLOT-TIMEOUT-LOSES-TURN-1: the assembler's machine heavy-slot wait is bounded by THIS call's deadline (an env var, so a
+        # stand-in assembler with a fixed parameter list is untouched), not the 60 min default whose refusal re-queued the caller as the youngest ticket.
+        $hsPrev = $env:MLV_HEAVY_SLOT_DEADLINE_UTC
+        $env:MLV_HEAVY_SLOT_DEADLINE_UTC = $script:Deadline.ToString('o')
+        try { $a = Invoke-Child 'assemble' $Assembler @('-SourceCommit', $commit, '-DllPairDir', $dllDir, '-OutDir', $buildDir) }
+        finally { [Environment]::SetEnvironmentVariable('MLV_HEAVY_SLOT_DEADLINE_UTC', $hsPrev) }
         if ($a.timedOut) { Stop-Nightly 'STAGE_CAP_EXCEEDED' "the assembler was still running at the $MaxTotalSec s cap and was killed (see $($script:WorkDir)\assemble.log)" }
         # A machine heavy-slot REQUEUE (heavy-slot code 75/76/77, or its holder gone before the action) is a capacity refusal
         # like the other two, never an assembly failure (MLV-VM-HEAVY-SLOT-ADOPT-1 r13, sol r12 B1).

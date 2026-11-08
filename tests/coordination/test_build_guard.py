@@ -50,6 +50,7 @@ FAST = ["-PollSeconds", "0.2"]
 def _env(exempt=None, heavy_slot: Path = NO_HEAVY_SLOT, extra: dict = None) -> dict:
     env = dict(os.environ)
     env.pop("MLV_BUILD_GUARD_EXEMPT", None)
+    env.pop("MLV_HEAVY_SLOT_DEADLINE_UTC", None)  # a staging driver's deadline never leaks into a test from the machine that runs it
     for name in ("HEAVY_SLOT_HELD", "HEAVY_SLOT_HELD_START", "HEAVY_SLOT_HELD_NAME", "MLV_LANE_RUN_DIR"):
         env.pop(name, None)
     # The stub's options are opt-ins: a test gets one only through `extra`, never from the machine that runs the suite.
@@ -949,6 +950,122 @@ def test_a_pin_mismatch_refuses_before_anything_runs(box) -> None:
     assert f"expected={PINNED_HEAVY_SLOT_SHA} actual={_stub_sha()}" in done.stdout
     assert _stub_calls(box) == [], "heavy-slot is never called"
     assert not box["marker"].exists() and not box["lock"].exists()
+
+
+# --- STAGE-BUILD-HEAVY-SLOT-TIMEOUT-LOSES-TURN-1: a staging build's wait is bounded by its driver's deadline -------------
+# 2026-11-08: a venue staging build waited the default 60 min on the machine slot, was refused (heavy-slot code 75), and the
+# stage chain re-queued 300 s later as the YOUNGEST ticket (#2 of 6 behind other projects' work). The slot admits oldest first,
+# so the turn was lost on our side. The scripted queue ('queued' stub mode) admits a ticket whose --wait covers the minutes of
+# work ahead of it; no real time passes and the real machine slot is never touched.
+
+STAGE_QUEUE_ENV = {"STUB_HEAVY_SLOT_MODE": "queued", "STUB_HEAVY_SLOT_QUEUE_MIN": "130"}
+
+
+def _stage_attempt(box: dict, deadline_expr: str = None, opts_line: str = "", extra: dict = None) -> subprocess.CompletedProcess:
+    deadline = f"$opts.HeavySlotDeadlineUtc = {deadline_expr}\n" if deadline_expr else ""
+    return _library_driver(
+        box,
+        f"{deadline}{opts_line}"
+        f"Invoke-BuildGuard -Label 'attr3-assemble:abc' -Options $opts -Action {{ param($Jobs) Set-Content -LiteralPath '{box['marker']}' -Value ran -Encoding ascii }}\n",
+        str(box["lock"]),
+        extra={**STAGE_QUEUE_ENV, **(extra or {})},
+    )
+
+
+def _wait_minutes(call: dict) -> float:
+    value = call["argv"][call["argv"].index("--wait") + 1]
+    assert value.endswith("m"), value
+    return float(value[:-1])
+
+
+def test_a_staging_deadline_bounds_the_wait_so_the_first_ticket_is_admitted(box) -> None:
+    # RED on fork/master 0a553b4e: the wait was the 60 min default, shorter than the 130 min of work ahead, so the ticket was
+    # refused and a retry would have been a fresh one. With the driver's deadline 240 min out the wait covers the queue.
+    done = _stage_attempt(box, "([DateTime]::UtcNow.AddMinutes(240)).ToString('o')")
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert box["marker"].exists(), "the build ran on the first ticket"
+    [call] = _stub_calls(box)
+    assert 239 < _wait_minutes(call) <= 240, call["argv"]
+    assert "BUILD_HEAVY_SLOT_REQUEUE" not in done.stdout
+    bound = [line for line in done.stdout.splitlines() if line.startswith("BUILD_HEAVY_SLOT_WAIT_BOUND ")]
+    assert len(bound) == 1, done.stdout
+    assert "label=attr3-assemble:abc" in bound[0] and " source=deadline " in bound[0] and " wait=2" in bound[0], bound[0]
+    assert re.search(r" deadline=\d{4}-\d\d-\d\dT[\d:.]+Z ", bound[0]), bound[0]
+
+
+def test_without_a_deadline_the_wait_stays_60_and_a_refusal_is_followed_by_a_fresh_ticket(box) -> None:
+    # The unchanged default (and today's failure shape): 60 min is shorter than the queue, so attempt 1 is refused and attempt 2
+    # is a NEW ticket. This passes before and after the fix; it pins that only a deadline changes the wait.
+    first = _stage_attempt(box)
+    second = _stage_attempt(box)
+    for done in (first, second):
+        assert done.returncode == 3, done.stdout + done.stderr
+        assert "BUILD_HEAVY_SLOT_REQUEUE label=attr3-assemble:abc code=75 ticket=stub-" in done.stdout
+        assert "BUILD_HEAVY_SLOT_WAIT_BOUND" not in done.stdout, "no deadline, no bound line"
+    calls = _stub_calls(box)
+    assert [_wait_minutes(c) for c in calls] == [60.0, 60.0]
+    tickets = [re.search(r"ticket=(\S+)", d.stdout).group(1) for d in (first, second)]
+    assert tickets[0] != tickets[1], "a refused waiter that retries gets a fresh ticket"
+    assert not box["marker"].exists()
+
+
+def test_the_deadline_can_come_from_the_environment(box) -> None:
+    deadline = "2099-01-01T00:00:00Z"
+    done = _stage_attempt(box, extra={"MLV_HEAVY_SLOT_DEADLINE_UTC": deadline})
+    assert done.returncode == 0, done.stdout + done.stderr
+    [call] = _stub_calls(box)
+    assert _wait_minutes(call) == 10080.0, "a far deadline is clamped to heavy-slot's one-week maximum"
+    assert "deadline=2099-01-01T00:00:00" in done.stdout and " wait=10080m " in done.stdout, done.stdout
+
+
+def test_an_options_deadline_outranks_the_environment(box) -> None:
+    done = _stage_attempt(box, "([DateTime]::UtcNow.AddMinutes(200)).ToString('o')", extra={"MLV_HEAVY_SLOT_DEADLINE_UTC": "2099-01-01T00:00:00Z"})
+    assert done.returncode == 0, done.stdout + done.stderr
+    [call] = _stub_calls(box)
+    assert 199 < _wait_minutes(call) <= 200, call["argv"]
+
+
+def test_a_deadline_that_has_passed_waits_zero_and_is_still_a_typed_requeue(box) -> None:
+    done = _stage_attempt(box, "([DateTime]::UtcNow.AddMinutes(-5)).ToString('o')")
+    assert done.returncode == 3, done.stdout + done.stderr
+    [call] = _stub_calls(box)
+    assert _wait_minutes(call) == 0.0, call["argv"]
+    assert "BUILD_HEAVY_SLOT_REQUEUE label=attr3-assemble:abc code=75 " in done.stdout
+    assert " wait=0m " in done.stdout and " source=deadline " in done.stdout
+    assert not box["marker"].exists()
+
+
+def test_a_deadline_given_as_a_datetime_is_bounded_too(box) -> None:
+    done = _stage_attempt(box, "[DateTime]::UtcNow.AddMinutes(180)")
+    assert done.returncode == 0, done.stdout + done.stderr
+    [call] = _stub_calls(box)
+    assert 179 < _wait_minutes(call) <= 180, call["argv"]
+
+
+@pytest.mark.parametrize("bad", ["not-a-date", "   x", "2026-13-45T99:00:00Z"])
+def test_a_deadline_that_is_not_an_instant_is_refused_before_heavy_slot_starts(box, bad) -> None:
+    done = _stage_attempt(box, f"'{bad}'")
+    assert done.returncode == 2, done.stdout + done.stderr
+    assert "BUILD_HEAVY_SLOT_REFUSED label=attr3-assemble:abc reason=invalid-option" in done.stdout
+    assert "HeavySlotDeadlineUtc" in done.stdout
+    assert _stub_calls(box) == [], "heavy-slot is never called"
+    assert not box["marker"].exists()
+
+
+def test_a_blank_deadline_option_changes_nothing(box) -> None:
+    done = _stage_attempt(box, "''")
+    assert done.returncode == 3, done.stdout + done.stderr
+    [call] = _stub_calls(box)
+    assert _wait_minutes(call) == 60.0
+    assert "BUILD_HEAVY_SLOT_WAIT_BOUND" not in done.stdout
+
+
+def test_the_attr3_assembler_hands_its_deadline_to_the_guard() -> None:
+    text = ATTR3_ASSEMBLE.read_text(encoding="utf-8")
+    assert "[string]$HeavySlotDeadlineUtc = ''," in text
+    assert re.search(r"Invoke-BuildGuard -Label \"attr3-assemble:\$\(\$names\.shortSha\)\" -RequestedJobs \$MakeJobs -Options \$guardOptions -Action", text), \
+        "the build runs under the guard with the deadline option"
+    assert re.search(r"if \(\$HeavySlotDeadlineUtc\) \{ \$guardOptions\.HeavySlotDeadlineUtc = \$HeavySlotDeadlineUtc \}", text)
 
 
 def test_print_jobs_takes_no_heavy_slot(box) -> None:

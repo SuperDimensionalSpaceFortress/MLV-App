@@ -97,7 +97,7 @@ Set-Content -LiteralPath $job -Value '# fixture smoke-runner job'
 
 FAKE_ASSEMBLE = r"""
 [CmdletBinding()] param([string]$SourceCommit, [string]$DllPairDir, [string]$OutDir)
-Add-Content -LiteralPath $env:FAKE_CALLS -Value "ASSEMBLE sha=$SourceCommit dll=$DllPairDir out=$OutDir pid=$PID"
+Add-Content -LiteralPath $env:FAKE_CALLS -Value "ASSEMBLE sha=$SourceCommit dll=$DllPairDir out=$OutDir pid=$PID hsdeadline=$env:MLV_HEAVY_SLOT_DEADLINE_UTC"
 switch ($env:FAKE_ASSEMBLE) {
     'guard' { "BUILD_MEM_REFUSED label=attr3-assemble:$($SourceCommit.Substring(0, 12)) freePhysGB=1.2 freeCommitGB=2.3 need=6/8 waitedSec=1200 utc=fixture"; exit 3 }
     'requeue' { "BUILD_HEAVY_SLOT_REQUEUE label=attr3-assemble:$($SourceCommit.Substring(0, 12)) code=$env:FAKE_REQUEUE_CODE ticket=t-1 reason=timed out utc=2026-10-29T10:00:00Z"; exit 3 }
@@ -703,6 +703,23 @@ class VenueStageNightlyTests(unittest.TestCase):
                 self.assertNotIn("ASSEMBLE_FAILED", p.stdout)
                 self.assertFalse(any("stage" in c for c in self.submissions()), self.submissions())
                 self.assertEqual(self.rows()[-1]["outcome"], "BUILD_GUARD_REFUSED")
+
+    def test_the_assembler_is_given_this_calls_deadline_as_its_heavy_slot_wait_bound(self) -> None:
+        # STAGE-BUILD-HEAVY-SLOT-TIMEOUT-LOSES-TURN-1: without it the assembler waits the 60 min default on the machine slot, is refused,
+        # and the caller's retry is the youngest ticket. The bound is this call's own deadline (start + -MaxTotalSec), via the environment.
+        self.built_dll_pair()
+        before = datetime.now(timezone.utc)
+        p = self.run_driver("-MaxTotalSec", "3600", env={"MLV_HEAVY_SLOT_DEADLINE_UTC": "2000-01-01T00:00:00Z"})
+        after = datetime.now(timezone.utc)
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        [call] = self.calls("ASSEMBLE")
+        raw = re.search(r" hsdeadline=(\S+)$", call).group(1)
+        self.assertNotEqual(raw, "2000-01-01T00:00:00Z", "the ambient value is replaced by this call's own deadline")
+        m = re.fullmatch(r"(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d)\.(\d+)Z", raw)
+        self.assertIsNotNone(m, raw)
+        got = datetime.strptime(m.group(1), "%Y-%m-%dT%H:%M:%S").replace(tzinfo=timezone.utc) + timedelta(microseconds=int(m.group(2)[:6]))
+        self.assertLessEqual(before + timedelta(seconds=3600 - 5), got)
+        self.assertLessEqual(got, after + timedelta(seconds=3600 + 5))
 
     def test_an_assembler_failure_is_typed(self) -> None:
         self.built_dll_pair()
