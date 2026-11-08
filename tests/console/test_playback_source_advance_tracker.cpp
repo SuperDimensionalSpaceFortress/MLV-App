@@ -989,3 +989,40 @@ TEST(PlaybackSourceAdvanceTracker, R29IterationTwoAnOffscreenGrabPaintIsNeverADi
     ASSERT_EQ(1, probe.calls);
     ASSERT_EQ(124u, probe.last);
 }
+
+// r30 (adversary A1 on 71104385, Dot B1): the conform GATE reads a COMPOSED paint. r29 kept an offscreen grab's paint out of the
+// tracker's credit, but each surface still promoted its raw painted serial inside the grab, and the gate's paint check read that
+// serial, so the adversary's input opened the gate on a frame never composed. Its literal input: frame 100 / serial 10 genuinely
+// painted; frame 101 / serial 11 submitted; a contact-sheet viewport grab paints serial 11 offscreen; before kConformPaintWaitMs an
+// 8 ms tick asks the gate, and frame 102 would replace never-displayed 101. ComposedPaintSerial (what each surface's paint-pending
+// query now reads) ignores a paint inside an OffscreenPaintScope, so 101 is still pending and the displayed input stays -1.
+TEST(PlaybackSourceAdvanceTracker, R30AnOffscreenGrabPaintNeverOpensTheConformGate)
+{
+    playback_paint_credit::ComposedPaintSerial surface;
+    uint64_t submitted = 10;
+    surface.notePaint(10);                                  // frame 100 / serial 10 genuinely painted
+    ASSERT_FALSE(surface.pendingFor(submitted, 10));
+    submitted = 11;                                         // frame 101 / serial 11 handed to the surface
+    ASSERT_TRUE(surface.pendingFor(submitted, 11));
+    {
+        const playback_paint_credit::OffscreenPaintScope grab;   // grabGraphicsViewportOffscreen(): paintGL / paintEvent into a pixmap
+        surface.notePaint(11);
+        surface.noteCleared();                              // nor does an offscreen paint that drew nothing clear the composed state
+    }
+    ASSERT_TRUE(surface.pendingFor(submitted, 11));         // never composed: still pending
+    ASSERT_EQ(10u, surface.serial());
+    ASSERT_TRUE(surface.valid());
+    // the gate's input (MainWindow::conformDisplayedFramePaintPending): 8 ms after the hand-off the frame is not displayed yet
+    ASSERT_TRUE(playback_frame_range::conformDisplayPaintPending(surface.pendingFor(submitted, 11), 8.0));
+    surface.notePaint(11);                                  // the normal paint that composes it
+    ASSERT_FALSE(surface.pendingFor(submitted, 11));
+    ASSERT_FALSE(playback_frame_range::conformDisplayPaintPending(surface.pendingFor(submitted, 11), 8.0));
+    // a composed paint that draws nothing (no texture) leaves the frame unpainted again; a serial never handed over is never pending
+    surface.noteCleared();
+    ASSERT_TRUE(surface.pendingFor(submitted, 11));
+    ASSERT_FALSE(surface.pendingFor(submitted, 12));
+    ASSERT_FALSE(surface.pendingFor(submitted, 0));
+    surface.reset();
+    ASSERT_FALSE(surface.valid());
+    ASSERT_EQ(0u, surface.serial());
+}

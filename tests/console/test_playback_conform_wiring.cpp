@@ -261,11 +261,13 @@ TEST(PlaybackConformWiring, DropFrameTickQuantisesTheConformedCatchupToWholeFram
         "        m_playbackPaceGuard.reset();\n"
         "        m_conformDropDebtFrames = 0.0;")));
     const QString source = mainWindowSource();
+    // r30 (Dot D1 on 71104385): a Play start clears it at once; a stop only after its telemetry printed it (R30AStopPrintsTheCarriedDebtBeforeClearingIt)
     ASSERT_EQ(1, countOccurrences(source, QStringLiteral(
         "    m_playbackPaceGuard.reset();\n"
-        "    m_conformDropDebtFrames = 0.0;   // HFR-NATIVE-60FPS-FULLRES-1 r24: no held conform frame survives a Play start or stop")));
-    // the tick's comment, the tick, the two clears, and (r29) the conform line's carried_debt read: nothing else writes or reads it
-    ASSERT_EQ(5, countOccurrences(source, QStringLiteral("m_conformDropDebtFrames")));
+        "    if( checked ) m_conformDropDebtFrames = 0.0;   // HFR-NATIVE-60FPS-FULLRES-1 r24: no held conform frame survives a Play start")));
+    // the tick's comment, the tick, the tick's clear, the Play start's and (r30) the Play stop's clears, and (r29) the conform line's
+    // carried_debt read: nothing else writes or reads it
+    ASSERT_EQ(6, countOccurrences(source, QStringLiteral("m_conformDropDebtFrames")));
     ASSERT_EQ(1, countOccurrences(source, QStringLiteral(".arg( m_conformDropDebtFrames, 0, 'f', 3 )")));
     ASSERT_TRUE(readRepoFile(QStringLiteral("platform/qt/MainWindow.h")).contains(QStringLiteral("double m_conformDropDebtFrames = 0.0;")));
     ASSERT_EQ(1, countOccurrences(body, QStringLiteral("playback_frame_range::advanceDropFrameTick(")));
@@ -900,4 +902,85 @@ TEST(PlaybackConformWiring, R29IterationTwoOffscreenGrabPaintsNeverCredit)
     ASSERT_TRUE(swapAt > 0);
     ASSERT_TRUE(grabBody.indexOf(QStringLiteral("    if ( win->m_presentedSerialValid ) playback_paint_credit::notePainted( win->m_presentedSerial );"), swapAt) > swapAt);
     ASSERT_EQ(1, countOccurrences(grabBody, QStringLiteral("win->paintGL();")));
+}
+
+// r30 (adversary A1 on 71104385, Dot B1): the conform gate's paint check reads a COMPOSED paint. Each surface keeps the serial it last
+// painted outside an OffscreenPaintScope (playback_paint_credit::ComposedPaintSerial) and its paint-pending query reads that, never the
+// raw painted serial an offscreen grab promotes (m_paintedSerial, m_presentedSerial, m_pixmapPaintedSerial still name what the
+// surface's content holds, for captures). The GL window's capture composes its frame only by the swap after a successful readback.
+TEST(PlaybackConformWiring, R30TheConformGateReadsAComposedPaintNeverARawPaintedSerial)
+{
+    const QString tracker = readRepoFile(QStringLiteral("platform/qt/PlaybackSourceAdvanceTracker.h"));
+    ASSERT_TRUE(tracker.contains(QStringLiteral("inline bool paintIsComposed() { return offscreenDepth() == 0; }")));
+    ASSERT_TRUE(tracker.contains(QStringLiteral("class ComposedPaintSerial")));
+
+    const QString viewportSrc = readRepoFile(QStringLiteral("platform/qt/GpuDisplayViewport.cpp"));
+    const int vq = viewportSrc.indexOf(QStringLiteral("bool GpuDisplayViewport::paintPendingForSerial(const QGraphicsView *view, quint64 serial)"));
+    ASSERT_TRUE(vq > 0);
+    const QString vqBody = viewportSrc.mid(vq, viewportSrc.indexOf(QStringLiteral("\n}\n"), vq) - vq);
+    ASSERT_TRUE(vqBody.contains(QStringLiteral("return viewport->m_composedPaint.pendingFor( viewport->m_presentationOptions.presentationSerial, serial );")));
+    ASSERT_FALSE(vqBody.contains(QStringLiteral("m_paintedSerial")));
+    ASSERT_TRUE(viewportSrc.contains(QStringLiteral("    m_paintedSerialValid = false;\n    m_composedPaint.noteCleared();")));
+    ASSERT_TRUE(viewportSrc.contains(QStringLiteral(
+        "    if ( m_paintedSerialValid ) playback_paint_credit::notePainted( m_paintedSerial );\n"
+        "    m_composedPaint.notePaint( m_paintedSerial );")));
+    ASSERT_TRUE(readRepoFile(QStringLiteral("platform/qt/GpuDisplayViewport.h")).contains(QStringLiteral("playback_paint_credit::ComposedPaintSerial m_composedPaint;")));
+
+    const QString windowSrc = readRepoFile(QStringLiteral("platform/qt/GpuDisplayWindow.cpp"));
+    const int wq = windowSrc.indexOf(QStringLiteral("bool GpuDisplayWindow::paintPendingForSerialIfActive(quint64 serial)"));
+    ASSERT_TRUE(wq > 0);
+    const QString wqBody = windowSrc.mid(wq, windowSrc.indexOf(QStringLiteral("\n}\n"), wq) - wq);
+    ASSERT_TRUE(wqBody.contains(QStringLiteral("return win->m_composedPaint.pendingFor( win->m_pendingPresentationSerial, serial );")));
+    ASSERT_FALSE(wqBody.contains(QStringLiteral("m_presentedSerial")));
+    ASSERT_TRUE(windowSrc.contains(QStringLiteral(
+        "    if ( m_presentedSerialValid ) playback_paint_credit::notePainted( m_presentedSerial );\n"
+        "    m_composedPaint.notePaint( m_presentedSerialValid ? m_presentedSerial : 0 );")));
+    ASSERT_TRUE(windowSrc.contains(QStringLiteral("        m_presentedSerialValid = false;\n        m_composedPaint.noteCleared();")));
+    ASSERT_TRUE(readRepoFile(QStringLiteral("platform/qt/GpuDisplayWindow.h")).contains(QStringLiteral("playback_paint_credit::ComposedPaintSerial m_composedPaint;")));
+    // the capture: its paintGL runs inside the scope (composes nothing); a failed readback returns before the swap (still nothing);
+    // only the swap composes it
+    const int grab = windowSrc.indexOf(QStringLiteral("bool GpuDisplayWindow::grabPresentedFramebufferIfActive(QImage *outImage,"));
+    ASSERT_TRUE(grab > 0);
+    const QString grabBody = windowSrc.mid(grab, windowSrc.indexOf(QStringLiteral("\n}\n"), grab) - grab);
+    const int failAt = grabBody.indexOf(QStringLiteral("    if ( !win->m_captureReadbackSucceeded )"));
+    const int swapAt = grabBody.indexOf(QStringLiteral("    swapOutsidePaintEventAndRecord(win, glContext);"));
+    const int composeAt = grabBody.indexOf(QStringLiteral(
+        "    win->m_composedPaint.notePaint( win->m_presentedSerialValid ? win->m_presentedSerial : 0 );"));
+    ASSERT_TRUE(failAt > 0 && swapAt > failAt && composeAt > swapAt);
+    ASSERT_EQ(1, countOccurrences(grabBody, QStringLiteral("m_composedPaint.")));
+
+    const QString zoomHeader = readRepoFile(QStringLiteral("platform/qt/GraphicsZoomView.h"));
+    ASSERT_TRUE(zoomHeader.contains(QStringLiteral("return m_pixmapComposedPaint.pendingFor( m_pixmapPendingSerial, serial );")));
+    ASSERT_FALSE(zoomHeader.contains(QStringLiteral("m_pixmapPaintedSerial < serial")));
+    const QString zoomView = readRepoFile(QStringLiteral("platform/qt/GraphicsZoomView.cpp"));
+    ASSERT_TRUE(zoomView.contains(QStringLiteral(
+        "    playback_paint_credit::notePainted( m_pixmapPaintedSerial );   // r29 (adversary A1 on cf403dba): the conform tracker credits it now\n"
+        "    m_pixmapComposedPaint.notePaint( m_pixmapPaintedSerial );")));
+    // the gate's paint check still asks exactly these three queries
+    const QString source = mainWindowSource();
+    const int paint = source.indexOf(QStringLiteral("bool MainWindow::conformDisplayedFramePaintPending()"));
+    ASSERT_TRUE(paint > 0);
+    const QString paintBody = source.mid(paint, source.indexOf(QStringLiteral("\n}\n"), paint) - paint);
+    ASSERT_FALSE(paintBody.contains(QStringLiteral("paintedSerialFor(")));
+    ASSERT_FALSE(paintBody.contains(QStringLiteral("presentedSerialIfActive(")));
+}
+
+// r30 (Dot D1 on 71104385): on_actionPlay_toggled cleared m_conformDropDebtFrames before the ordinary stop's telemetry, so the conform
+// line's carried_debt always printed 0.000 at a stop. A Play start still clears it at once; a stop clears it only after
+// finishPlaybackSmokeTelemetry( "play-stop" ) has printed it.
+TEST(PlaybackConformWiring, R30AStopPrintsTheCarriedDebtBeforeClearingIt)
+{
+    const QString source = mainWindowSource();
+    const int at = source.indexOf(QStringLiteral("void MainWindow::on_actionPlay_toggled(bool checked)"));
+    ASSERT_TRUE(at > 0);
+    const QString body = source.mid(at, source.indexOf(QStringLiteral("\n}\n"), at) - at);
+    ASSERT_EQ(1, countOccurrences(body, QStringLiteral(
+        "    if( checked ) m_conformDropDebtFrames = 0.0;   // HFR-NATIVE-60FPS-FULLRES-1 r24: no held conform frame survives a Play start")));
+    ASSERT_EQ(0, countOccurrences(body, QStringLiteral("\n    m_conformDropDebtFrames = 0.0;")));
+    const int telemetry = body.indexOf(QStringLiteral("        finishPlaybackSmokeTelemetry( \"play-stop\" );\n"));
+    const int clear = body.indexOf(QStringLiteral(
+        "        m_conformDropDebtFrames = 0.0;   // r30 (Dot D1): a stop clears it only after the conform line printed it (carried_debt)"));
+    ASSERT_TRUE(telemetry > 0);
+    ASSERT_TRUE(clear > telemetry);
+    ASSERT_EQ(2, countOccurrences(body, QStringLiteral("m_conformDropDebtFrames")));
 }
