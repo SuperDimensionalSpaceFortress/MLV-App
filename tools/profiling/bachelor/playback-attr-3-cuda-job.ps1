@@ -5595,8 +5595,11 @@ public sealed class MlvCorePartitionLoad {
                 # successor can get a gone process's exact start, so the entry refuses, as on the base. A tracked process whose reads fail once refuses too (hub ruling).
                 # r5 (sol r4 blocker = adversary pass 7 A1 on 00e5f732, hub ruling 1 of HUB-TICK 20261106T1439Z): a gone tracked key (2) read with its Path unread is a
                 # successor never identified, so it is recorded unidentified, never skipped; the key then goes back to 1, so it is recorded once. A key whose process
-                # is still tracked (1), or one whose Path reads, is skipped as before. An exited process is never listed, even while its handle is held (measured r5).
-                if ($seen[$k]) { if ($pn[$p.Id] -or $seen[$k] * !$pp -gt 1) { & $un $p.Id; $seen[$k] = 1 }; continue }
+                # is still tracked (1) is skipped as before. An exited process is never listed, even while its handle is held (measured r5).
+                # CORE-PARTITION-HELPER-PID-REUSE-1 (adversary A1 on 4fdc1512): so a listing that carries a gone key is always a successor with the gone process's
+                # exact start, and one whose Path reads as the exe is a same-path process alive now: recorded unidentified too (it was skipped, which hid an
+                # overlap once the identity re-read retired an unpinned process). Only a Path read at another exe is skipped (no same-path process).
+                if ($seen[$k]) { if ($pn[$p.Id] -or ($seen[$k] -gt 1 -and !($pp -and $pp -ine $exe))) { & $un $p.Id; $seen[$k] = 1 }; continue }
                 $pe = $pn[$p.Id]
                 # The start read at first sight ($pe.s) is a pending pid's identity, whatever the clock did since: any other start on that pid is a process on a recycled
                 # pid, and the one first listed ended unread. With no start read at first sight nothing can prove identity (r3, HUB RULING 2026-11-06, adversary A1/A2 on

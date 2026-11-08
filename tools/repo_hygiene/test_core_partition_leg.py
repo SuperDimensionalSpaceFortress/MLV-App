@@ -2549,6 +2549,8 @@ CLOCK_START_UNREAD_STEPS_MS = (400, 700, 1000)
 # pid from 4 to 9 without being listed by name unless from/to say so), started after the app.
 _REUSED_APP = {"id": 5000, "from": 1, "to": 3, "goneAt": 4, "startSec": 1, "handleFail": 1, "byPid": 1}
 _REUSER = {"id": 5000, "from": 99, "to": 0, "idFrom": 4, "idTo": 9, "goneAt": 10, "startBeforeFirstPollMs": -500}
+_GONE_KEY_P0_B = ({"id": 300, "from": 1, "to": 1, "goneAt": 2, "startSec": 1, "handleFail": 1, "byPid": 1},
+                  {"id": 300, "from": 99, "to": 0, "idFrom": 2, "idTo": 3, "goneAt": 4, "startSec": 2, "exe": "other"})
 LATE_READ_SCENARIOS = {
     "control": {"procs": [_APP]},
     "path-empty-late": {"procs": [{**_APP, "pathFail": 3, "pathMode": "empty"}]},
@@ -2621,6 +2623,10 @@ LATE_READ_SCENARIOS = {
     "pid-same-identity-control": {"sleepMs": 250, "stopAt": 12, "procs": [{**_REUSED_APP, "to": 9, "goneAt": 10}]},
     # adversary A1 on aa71dd11: the process that takes the pid has the app's exact start (an unsampled clock step) and its path, so no read on the pid tells them apart
     "pid-reused-with-the-same-start-and-path": {"sleepMs": 250, "stopAt": 12, "procs": [_REUSED_APP, {**_REUSER, "from": 4, "to": 9, "startBeforeFirstPollMs": None, "startSec": 1}]},
+    # adversary A1 on 4fdc1512: P0 on pid 300 is tracked unpinned and exits at enumeration 2; another image holds the pid at 2-3, so the identity re-read retires
+    # P0 (its key goes to 2); from 4 a same-path process listed with P0's exact start and a readable Path carries P0's key. Its control: the same, at another exe.
+    "gone-key-relisted-readable": {"procs": [_APP, *_GONE_KEY_P0_B, {"id": 300, "from": 4, "to": 99, "goneAt": 999, "startSec": 1}]},
+    "gone-key-relisted-other-exe": {"procs": [_APP, *_GONE_KEY_P0_B, {"id": 300, "from": 4, "to": 99, "goneAt": 999, "startSec": 1, "exe": "other"}]},
     # the pinned control: the app's handle is held (the pid cannot be reused while it is), alive until enumeration 10
     "pid-pinned-control": {"sleepMs": 250, "stopAt": 12, "procs": [{"id": 5000, "from": 1, "to": 9, "goneAt": 10, "startSec": 1}]},
     **{f"clock-back-path-{ms}": {"stepMs": ms, "procs": [{**_CLOCK_APP, "pathFail": 1, "pathMode": "empty"}]} for ms in CLOCK_STEPS_MS},
@@ -3093,6 +3099,19 @@ class CorePartitionR10Tests(unittest.TestCase):
         self.assertFalse(case["bench"], case)
         self.assertIn("appAffinityObserved=measured-app-identity-unpinned", case["why"])
         self.assertIs(case["firstApp"]["pinned"], False, case)
+
+    def test_pid_reuse_a_listing_that_carries_a_gone_key_at_the_exe_is_recorded(self) -> None:
+        """CORE-PARTITION-HELPER-PID-REUSE-1, adversary A1 on 4fdc1512 (introduced): an unpinned P0 is retired when another image takes its pid; a same-path
+        process then listed with P0's exact start and a readable Path carries P0's gone key. An exited process is never listed, so it is a successor alive
+        now; on 4fdc1512 the seen key skipped it and no overlap could see it. It is recorded unidentified and refuses. Control: the same successor at
+        another exe is no same-path process and is skipped."""
+        case = self.late_read("gone-key-relisted-readable")
+        self.assertEqual(case["unidentified"], [300], f"a same-path process carrying a gone key was dropped: {case}")
+        self.assertEqual(case["vwhy"], "same-path-instance-unidentified", case)
+        self.assertIsNotNone(case["by"]["300"]["goneMs"], f"the identity re-read did not retire P0: {case}")
+        control = self.late_read("gone-key-relisted-other-exe")
+        self.assertEqual(control["unidentified"], [], control)
+        self.assertIsNotNone(control["by"]["300"]["goneMs"], control)
 
     def test_pid_reuse_the_pinned_flag_is_a_json_flag_and_only_false_refuses(self) -> None:
         """CORE-PARTITION-HELPER-PID-REUSE-1: the job's verdict on the measured app's pinned flag. false refuses (measured-app-identity-unpinned); true and
