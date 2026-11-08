@@ -60,10 +60,18 @@ param(
 if ($MyInvocation.InvocationName -eq '.') {
     [Console]::Out.WriteLine(('STAGE_CHAIN_REFUSED reason=dot-sourced sha={0} utc={1}' -f $Sha, [DateTime]::UtcNow.ToString('o'))); exit 2
 }
-@('PSDefaultParameterValues', 'ErrorActionPreference', 'Sha', 'DeadlineUtc', 'StageOne', 'RunDir', 'RetrySec', 'MaxAttempts', 'HoldAfterLogMsForTest', 'RefuseChain', 'Why', 'text', 'parsed', 'formats', 'deadline', 'errs', 'ast', 'declares', 'pwsh', 'status', 'utf8', 'WriteChainLog', 't', 'InvokeStageOneChild', 'Phase', 'LogPath', 'psi', 'x', 'p', 'o', 'e', 'SetChainExit', 'Value', 'deadlineText', 'phase', 'attempt', 'phaseDone', 'log', 'code', 'last', 'MlvStageChainExitCode').Where(
+@('PSDefaultParameterValues', 'selfName', 'dpv', 'ErrorActionPreference', 'Sha', 'DeadlineUtc', 'StageOne', 'RunDir', 'RetrySec', 'MaxAttempts', 'HoldAfterLogMsForTest', 'RefuseChain', 'Why', 'text', 'parsed', 'formats', 'deadline', 'errs', 'ast', 'declares', 'pwsh', 'status', 'utf8', 'WriteChainLog', 't', 'InvokeStageOneChild', 'Phase', 'LogPath', 'psi', 'x', 'p', 'o', 'e', 'SetChainExit', 'Value', 'deadlineText', 'phase', 'attempt', 'phaseDone', 'log', 'code', 'last', 'MlvStageChainExitCode').Where(
     { $null -ne $ExecutionContext.SessionState.PSVariable.Get($_) -and ($ExecutionContext.SessionState.PSVariable.Get($_).Options -band [System.Management.Automation.ScopedItemOptions]::AllScope) }, 'First').ForEach(
     { [Console]::Out.WriteLine(('STAGE_CHAIN_REFUSED reason=caller-allscope-variable name={0} sha={1} utc={2}' -f $_, $Sha, [DateTime]::UtcNow.ToString('o'))); exit 2 })
-# The caller's parameter defaults never reach this script (a local, empty map; the caller's own is not AllScope, checked above).
+# A caller's $PSDefaultParameterValues entry for THIS script bound its parameters before the first line ran, so an omitted -DeadlineUtc became the
+# caller's 2099 (adversary 9b7006d5-A1). Any entry whose command pattern matches this script is refused (read from the session state, no cmdlet).
+$selfName = $MyInvocation.MyCommand.Name
+$dpv = $ExecutionContext.SessionState.PSVariable.GetValue('PSDefaultParameterValues')
+if ($dpv -is [System.Collections.IDictionary]) {
+    @($dpv.Keys).Where({ [string]$_ -ne 'Disabled' -and [System.Management.Automation.WildcardPattern]::new(([string]$_ -split ':', 2)[0], [System.Management.Automation.WildcardOptions]::IgnoreCase).IsMatch($selfName) }, 'First').ForEach(
+        { [Console]::Out.WriteLine(('STAGE_CHAIN_REFUSED reason=caller-parameter-default key={0} sha={1} utc={2}' -f $_, $Sha, [DateTime]::UtcNow.ToString('o'))); exit 2 })
+}
+# The caller's parameter defaults never reach this script's own steps (a local, empty map; the caller's own is not AllScope, checked above).
 $PSDefaultParameterValues = @{}
 $ErrorActionPreference = 'Continue'
 

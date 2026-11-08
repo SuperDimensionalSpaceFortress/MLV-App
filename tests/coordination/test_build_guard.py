@@ -1108,6 +1108,43 @@ def test_a_deadline_that_passes_while_the_holder_is_built_launches_with_zero_wai
     assert "BUILD_HEAVY_SLOT_REQUEUE label=attr3-assemble:abc code=75 " in done.stdout, done.stdout
 
 
+def test_a_holder_whose_tostring_is_slow_is_converted_before_the_deadline_sample(box) -> None:
+    # adversary 9b7006d5-A2 (its input): the holder value was converted to text by the quoting AFTER the launch-time sample, so an object whose
+    # ToString sleeps launched an expired deadline with a stale positive wait. Every argument is a [string] before the sample.
+    opts_line = ("$savedHolder = ${function:New-HeavySlotHolder}\n"
+                 "function New-HeavySlotHolder { param([string]$ReadyFile, [string]$StopFile) $o = [pscustomobject]@{ Encoded = (& $savedHolder $ReadyFile $StopFile) }\n"
+                 "  $o | Add-Member -MemberType ScriptMethod -Name ToString -Value { [Threading.Thread]::Sleep(9000); $this.Encoded } -Force; $o }\n")
+    done = _stage_attempt(box, "[DateTime]::UtcNow.AddSeconds(4)", opts_line=opts_line)
+    [call] = _stub_calls(box)
+    assert _wait_minutes(call) == 0.0, call["argv"]
+    assert done.returncode == 3, done.stdout + done.stderr
+
+
+def test_a_callers_parameter_default_for_the_chain_is_refused(box) -> None:
+    # adversary 9b7006d5-A1 (its input): a caller's $PSDefaultParameterValues['Invoke-VenueStageChain.ps1:DeadlineUtc'] bound the omitted deadline
+    # before the chain's first line, so both phases ran and the chain exited 0 instead of refusing the missing deadline.
+    run, stage_one_path, env = _chain_box(box, 61)
+    ran = box["dir"] / "child-ran.txt"
+    stage_one_path.write_text(f"param([string]$Sha, [string]$Phase)\nAdd-Content -LiteralPath '{ran}' -Value $Phase\nexit 0\n", encoding="ascii")
+    script = ("$PSDefaultParameterValues = @{ 'Invoke-VenueStageChain.ps1:DeadlineUtc' = '2099-01-01T00:00:00Z' }\n"
+              f"& '{STAGE_CHAIN}' -Sha {_CHAIN_SHA} -StageOne '{stage_one_path}' -RetrySec 0 -MaxAttempts 1\n"
+              "Write-Output \"rc=$LASTEXITCODE\"\n")
+    done = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script],
+                          capture_output=True, text=True, timeout=180, env=env, check=False)
+    assert not ran.exists(), "a child ran on the caller's default deadline"
+    assert "rc=2" in done.stdout, done.stdout + done.stderr
+    assert "STAGE_CHAIN_REFUSED reason=caller-parameter-default key=Invoke-VenueStageChain.ps1:DeadlineUtc " in done.stdout, done.stdout
+
+
+def test_the_assembler_refuses_a_callers_parameter_default_before_the_guard() -> None:
+    # adversary 9b7006d5-A1 sibling (playback-attr-3-cuda-assemble.ps1:76, :237): the same caller default bound -HeavySlotDeadlineUtc. The
+    # refusal sits before the guard is loaded and before the option is set.
+    text = ATTR3_ASSEMBLE.read_text(encoding="utf-8")
+    refuse = text.find("ASSEMBLE_REFUSED reason=caller-parameter-default")
+    assert refuse > 0
+    assert refuse < text.find("coordination\\build-guard.ps1') -Library") < text.find("$guardOptions.HeavySlotDeadlineUtc = $HeavySlotDeadlineUtc")
+
+
 def test_nothing_but_net_calls_runs_between_the_deadline_sample_and_the_launch() -> None:
     # adversary 0919ae2e-A1, the class (siblings :1169 ForEach-Object and :679 Get-Process): any command between the launch-time sample and
     # Process.Start can take arbitrary time (or be a caller's), so the wait given would be stale. None is there.

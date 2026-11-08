@@ -232,6 +232,14 @@ $StepLog['qmake'] = 0
 
 # BUILD-GUARD-1: the compile runs under the host-global build gate (memory floor, one build slot,
 # job count); a refusal exits 3 with BUILD_MEM_REFUSED / BUILD_SLOT_BUSY before anything is built.
+$assemblerSelfName = $MyInvocation.MyCommand.Name
+# Run in process, a caller's $PSDefaultParameterValues entry for this script bound -HeavySlotDeadlineUtc and replaced the deadline the caller's
+# environment carried (adversary 9b7006d5-A1 sibling). Such an entry is refused before the guard is entered.
+$callerDefaults = $ExecutionContext.SessionState.PSVariable.GetValue('PSDefaultParameterValues')
+if ($callerDefaults -is [System.Collections.IDictionary]) {
+    @($callerDefaults.Keys).Where({ [string]$_ -ne 'Disabled' -and [System.Management.Automation.WildcardPattern]::new(([string]$_ -split ':', 2)[0], [System.Management.Automation.WildcardOptions]::IgnoreCase).IsMatch($assemblerSelfName) }, 'First').ForEach(
+        { [Console]::Out.WriteLine(('ASSEMBLE_REFUSED reason=caller-parameter-default key={0}' -f $_)); exit 2 })
+}
 . (Join-Path $PSScriptRoot '..\..\coordination\build-guard.ps1') -Library
 $guardOptions = @{}
 if ($HeavySlotDeadlineUtc) { $guardOptions.HeavySlotDeadlineUtc = $HeavySlotDeadlineUtc }

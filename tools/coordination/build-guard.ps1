@@ -990,7 +990,7 @@ function Enter-HeavySlot([hashtable]$Options, [string]$Label) {
     # (a caller's $PSDefaultParameterValues cannot bend it) and assigns nothing.
     @('Options', 'Label', 'raw', 'at', 'styles', 'deadline', 'maxMin', 'slackMin', 'cmd', 'shim', 'cli', 'actual', 'expected', 'lock', 'dir', 'exe', 'pct',
         'why', 'id', 'lease', 'giveUp', 'inv', 'boundNote', 'waitMin', 'etaMin', 'd', 'waitArg', 'etaArg', 'a', 'e', 'psi', 'v', 'heldDropped',
-        'notCanonical', 'holderCmd', 'quoted', 'waitClock', 'admitted', 's', 'holder', 'code', 'i', 'what').Where(
+        'notCanonical', 'holderCmd', 'head', 'tail', 'logArg', 'quoted', 'waitClock', 'admitted', 's', 'holder', 'code', 'i', 'what').Where(
         { $null -ne $ExecutionContext.SessionState.PSVariable.Get($_) -and ($ExecutionContext.SessionState.PSVariable.Get($_).Options -band [System.Management.Automation.ScopedItemOptions]::AllScope) }, 'First').ForEach(
         { Write-BuildGuardTyped ('BUILD_HEAVY_SLOT_REFUSED label={0} reason=caller-allscope-variable name={1} utc={2}' -f $Label, $_, [DateTime]::UtcNow.ToString('o')); exit 2 })
     @('HeavySlotGiveUpSlackMinutes', 'BuildGuardDefaults').Where(
@@ -1158,7 +1158,12 @@ function Enter-HeavySlot([hashtable]$Options, [string]$Label) {
     # The holder command is built BEFORE the sample: built after it (its Get-Process, :679, or a slow host), an expired deadline launched
     # with a stale positive wait (adversary 0919ae2e-A1). From the sample to the launch only .NET calls and operators run, never a command
     # (a test reads the syntax tree).
-    $holderCmd = New-HeavySlotHolder $lease.Ready $lease.Stop
+    # Every argument is made a [string] here too, before the sample: an object whose ToString is slow (a caller's) would otherwise run that
+    # conversion after it (adversary 9b7006d5-A2).
+    $holderCmd = [string](New-HeavySlotHolder $lease.Ready $lease.Stop)
+    $head = [string[]]@($cmd, 'run', '--class', 'shared', '--label', $lease.Label, '--eta', $etaArg, '--wait')
+    $tail = [string[]]@('--exit-file', $lease.ExitFile, '--', $exe, '-NoProfile', '-NonInteractive', '-EncodedCommand', $holderCmd)
+    $logArg = [string]$lease.Log
     if ($deadline.At) {
         $waitMin = [Math]::Min([Math]::Max(($deadline.At - [DateTime]::UtcNow).TotalMinutes, 0.0), $maxMin)
         $waitArg = $waitMin.ToString('0.##########', $inv) + 'm'
@@ -1167,10 +1172,8 @@ function Enter-HeavySlot([hashtable]$Options, [string]$Label) {
     }
     # cmd quoting, as heavy-slot itself starts a batch child: each argument double-quoted. Its stdout and stderr go to a
     # file, never a pipe, so nothing it writes while it holds the slot can block it (adversary A4).
-    $quoted = @($cmd, 'run', '--class', 'shared', '--label', $lease.Label, '--eta', $etaArg,
-        '--wait', $waitArg, '--exit-file', $lease.ExitFile,
-        '--', $exe, '-NoProfile', '-NonInteractive', '-EncodedCommand', $holderCmd).ForEach({ '"' + ([string]$_ -replace '"', '""') + '"' })
-    $psi.Arguments = '/d /v:off /s /c "' + ($quoted -join ' ') + ' >"' + $lease.Log + '" 2>&1"'
+    $quoted = ($head + [string[]]@([string]$waitArg) + $tail).ForEach({ '"' + ($_ -replace '"', '""') + '"' })
+    $psi.Arguments = '/d /v:off /s /c "' + ($quoted -join ' ') + ' >"' + $logArg + '" 2>&1"'
     # The hung-tool clock starts before the launch and before any diagnostic line (r6 sol B1).
     $waitClock = [System.Diagnostics.Stopwatch]::StartNew()
     try { $lease.Process = [System.Diagnostics.Process]::Start($psi) } catch {
