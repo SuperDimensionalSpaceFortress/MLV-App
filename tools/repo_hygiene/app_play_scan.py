@@ -641,15 +641,19 @@ def _scan_stop_sites(blank: str, keep: str) -> list[str]:
 # m_playRequiredSourceFrames (what the admitted Play must consume) decide every stop and every receipt, so they may be
 # written only here, by enclosing function and kind: ``reset`` = ``m_sourceAdvance = SourceFrameAdvanceCounter();``,
 # ``begin`` = ``m_sourceAdvance.begin(``, ``tick`` = ``m_sourceAdvance.noteEngineTick(``, ``required`` =
-# ``m_playRequiredSourceFrames = verdict.requiredFrames;``. Reads (``.consumed()``, ``.startFrame``) are free, and (HFR-NATIVE-60FPS-FULLRES-1
-# r30) so are reads of ``.armed`` and ``.highWater``: the conform line prints engine_target from them. A write to any of them stays unreviewed.
+# ``m_playRequiredSourceFrames = verdict.requiredFrames;``. Reads (``.consumed()``, ``.startFrame``) are free. HFR-NATIVE-60FPS-FULLRES-1 r30 fix
+# iteration 2 (adversary A1 on aa598479): ``.armed`` and ``.highWater`` are read at ONE reviewed site only, PINNED_COUNTER_READS -- the conform line's
+# engine_target, ``m_sourceAdvance.armed ? m_sourceAdvance.highWater : -1 )``, a prvalue (int64_t vs int) nothing can write through. Any other use of
+# them (a parenthesised or shift-assigned write included) stays unreviewed.
 PINNED_COUNTER_WRITES = {
     "MainWindow::programmaticPlay": {"reset": 2, "begin": 1, "required": 2},   # the admitted Play + the adopted running Play
     "MainWindow::on_actionPlay_toggled": {"begin": 1},                          # the FIRST Play start arms the counter
     "MainWindow::playbackHandling": {"tick": 3},                                # the three engine position advances
 }
 _ADV_USE = re.compile(r"\bm_sourceAdvance\b")
-_ADV_READ = re.compile(r"\s*\.\s*(?:consumed\s*\(\s*\)|(?:startFrame|highWater|armed)\b(?!\s*(?:=(?!=)|[-+*/%&|^]=|\+\+|--)))")
+_ADV_READ = re.compile(r"\s*\.\s*(?:consumed\s*\(\s*\)|startFrame\b(?!\s*(?:=(?!=)|[-+*/%&|^]=|\+\+|--)))")
+PINNED_COUNTER_READS = {"MainWindow::finishPlaybackSmokeTelemetry": 1}   # the conform line's engine_target
+_ADV_PINNED_READ = re.compile(r"\bm_sourceAdvance\s*\.\s*armed\s*\?\s*m_sourceAdvance\s*\.\s*highWater\s*:\s*-\s*1\s*\)")
 _ADV_BEGIN = re.compile(r"\s*\.\s*begin\s*\(")
 _ADV_TICK = re.compile(r"\s*\.\s*noteEngineTick\s*\(")
 _ADV_RESET = re.compile(r"\s*=(?!=)\s*playback_frame_range::SourceFrameAdvanceCounter\s*\(\s*\)\s*;")
@@ -670,6 +674,15 @@ def _scan_counter_writes(blank: str, keep: str) -> list[str]:
         found.setdefault(function, {}).setdefault(kind, 0)
         found[function][kind] += 1
 
+    # r30 fix iteration 2: the uses inside the pinned read expression, at most PINNED_COUNTER_READS per function
+    reviewed_reads: set[int] = set()
+    reads_seen: dict[str, int] = {}
+    for read in _ADV_PINNED_READ.finditer(blank):
+        function = _enclosing(spans, read.start())
+        reads_seen[function] = reads_seen.get(function, 0) + 1
+        if reads_seen[function] <= PINNED_COUNTER_READS.get(function, 0):
+            reviewed_reads.update(use.start() for use in _ADV_USE.finditer(blank, read.start(), read.end()))
+
     for match in _ADV_USE.finditer(blank):
         function = _enclosing(spans, match.start())
         before = blank[max(0, match.start() - 12):match.start()]
@@ -678,6 +691,8 @@ def _scan_counter_writes(blank: str, keep: str) -> list[str]:
         if _ESCAPE_BEFORE.search(before):
             problems.append(f"platform/qt/MainWindow.cpp:{line}: m_sourceAdvance escapes by pointer / reference / swap / "
                             f"increment in {function}; the counter may only be read or written at the pinned sites")
+        elif match.start() in reviewed_reads:
+            continue
         elif _ADV_READ.match(after):
             continue
         elif _ADV_BEGIN.match(after):
