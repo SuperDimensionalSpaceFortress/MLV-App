@@ -1372,6 +1372,82 @@ def test_a_capacity_refusal_is_retried_and_ends_typed_after_max_attempts(box) ->
     assert len(calls) == 2 and all(88 < _wait_minutes(c) <= 90 for c in calls), [c["argv"] for c in calls]
 
 
+# --- r4 (adversary pass on 9528e35b: A1, A2, both introduced majors) --------------------------------------------------------------
+
+def test_a_deadline_that_passes_while_the_attempt_log_is_made_starts_no_child(box) -> None:
+    # adversary 9528e35b-A1: the loop checked the deadline (:102), then built the log path and created the log (:104, :80), then launched the
+    # child (:81) with no second check, so prelaunch work that ran past the deadline (a slow share) still started an attempt after it. The
+    # delay is injected where the adversary put it, between the loop's check and the launch: an in-process caller's Join-Path that holds the
+    # attempt-log path until the deadline has passed. The stage-one would record that it ran.
+    run, stage_one_path, env = _chain_box(box, 61)
+    ran = box["dir"] / "child-ran.txt"
+    slept = box["dir"] / "slept.txt"
+    stage_one_path.write_text(f"param([string]$Sha, [string]$Phase)\nAdd-Content -LiteralPath '{ran}' -Value $Phase\nexit 0\n", encoding="ascii")
+    script = (
+        "$global:FixDeadline = [DateTime]::UtcNow.AddSeconds(5)\n"
+        "function global:Join-Path { param([string]$Path, [string]$ChildPath)\n"
+        f"  if ($ChildPath -like 'stage-{_CHAIN_SHA[:8]}-*') {{\n"
+        "    while ([DateTime]::UtcNow -lt $global:FixDeadline.AddMilliseconds(300)) { Start-Sleep -Milliseconds 50 }\n"
+        f"    Set-Content -LiteralPath '{slept}' -Value 'held' }}\n"
+        "  Microsoft.PowerShell.Management\\Join-Path -Path $Path -ChildPath $ChildPath }\n"
+        f"& '{STAGE_CHAIN}' -Sha {_CHAIN_SHA} -DeadlineUtc $global:FixDeadline.ToString('o') -StageOne '{stage_one_path}' -RetrySec 0 -MaxAttempts 1\n"
+        "Write-Output \"rc=$LASTEXITCODE\"\n"
+    )
+    done = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script],
+                          capture_output=True, text=True, timeout=180, env=env, check=False)
+    status = _chain_status(run)
+    assert slept.exists(), "the injected delay never ran, so this proves nothing: " + done.stdout + done.stderr + "\n".join(status)
+    assert not ran.exists(), "a child started after the deadline: " + ran.read_text(encoding="utf-8")
+    assert "rc=3" in done.stdout, done.stdout + done.stderr + "\n".join(status)
+    assert any("STAGE_FAILED deadline-passed-before-launch phase=dll attempt=1" in line for line in status), status
+    assert not any("STAGE_CHAIN_DONE" in line for line in status), status
+
+
+@pytest.mark.parametrize("name, value, refused", [
+    ("rc", "0", False), ("MlvStageChainExitCode", "0", True), ("code", "0", True), ("phaseDone", "$true", True)])
+def test_an_allscope_read_only_caller_variable_never_masks_a_failing_child(box, name, value, refused) -> None:
+    # adversary 9528e35b-A2 (its input is the rc case): an in-process caller's `New-Variable rc -Value 0 -Option AllScope,ReadOnly` was copied
+    # into the chain's scope, so `$rc = 1` failed under Continue and the chain exited 0 after its stage-one exited 9. The chain no longer has an
+    # $rc: the exit code is $script:MlvStageChainExitCode, and that name, like `code` (the child's exit) and `phaseDone`, is refused before
+    # anything runs when a caller holds it AllScope. A failing child is never reported as a success either way.
+    run, stage_one_path, env = _chain_box(box, 61, stage_one="param([string]$Sha, [string]$Phase)\nexit 9\n")
+    script = (f"New-Variable -Name {name} -Value {value} -Option AllScope,ReadOnly\n"
+              f"& '{STAGE_CHAIN}' -Sha {_CHAIN_SHA} -DeadlineUtc '2099-01-01T00:00:00Z' -StageOne '{stage_one_path}' -RetrySec 0 -MaxAttempts 1\n"
+              "Write-Output \"rc=$LASTEXITCODE\"\n")
+    done = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script],
+                          capture_output=True, text=True, timeout=180, env=env, check=False)
+    status = _chain_status(run)
+    assert not any("STAGE_CHAIN_DONE" in line for line in status), status
+    if refused:
+        assert "rc=2" in done.stdout, done.stdout + done.stderr + "\n".join(status)
+        assert f"STAGE_CHAIN_REFUSED reason=caller-allscope-variable name={name} " in done.stdout, done.stdout + done.stderr
+        assert status == [], "refused before the status file is written"
+    else:
+        assert "rc=1" in done.stdout, done.stdout + done.stderr + "\n".join(status)
+        assert any("STAGE_FAILED phase=dll" in line for line in status), status
+
+
+def test_the_chain_caller_shadow_guard_covers_every_variable_the_chain_uses() -> None:
+    # adversary 9528e35b-A2, the whole class: any variable of the chain that an in-process caller holds AllScope is shared with (or, when
+    # read-only, frozen by) that caller. The guard refuses every such name before anything runs, so its list must name every variable the
+    # chain itself uses. Automatic variables and the $script:/$env: ones are the only exceptions.
+    script = (f"$a = [System.Management.Automation.Language.Parser]::ParseFile('{STAGE_CHAIN}', [ref]$null, [ref]$null)\n"
+              "$a.FindAll({ param($n) $n -is [System.Management.Automation.Language.VariableExpressionAst] }, $true) | "
+              "ForEach-Object { $_.VariablePath.UserPath } | Sort-Object -Unique\n")
+    done = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script],
+                          capture_output=True, text=True, timeout=60, check=False)
+    assert done.returncode == 0, done.stderr
+    automatic = {"_", "pid", "pshome", "iswindows", "null", "true", "false", "erroractionpreference"}
+    used = {n.strip().lower() for n in done.stdout.splitlines() if n.strip() and ":" not in n} - automatic
+    guard = re.search(r"# CALLER-SHADOW GUARD\b[^\n]*\n(?:#[^\n]*\n)*@\(([^)]*)\)", STAGE_CHAIN.read_text(encoding="utf-8"))
+    assert guard, "the guard list is missing"
+    listed = {n.strip().strip("'").lower() for n in guard.group(1).split(",") if n.strip()}
+    assert used - listed == set(), sorted(used - listed)
+    text = STAGE_CHAIN.read_text(encoding="utf-8")
+    assert not re.search(r"(?<![:\w])\$rc\b", text), "the exit code is carried only in the uniquely named script variable"
+    assert "exit $script:MlvStageChainExitCode" in text
+
+
 def test_print_jobs_takes_no_heavy_slot(box) -> None:
     done = _heavy(box, "run", ["-PrintJobs"])
     assert done.returncode == 0, done.stdout + done.stderr
