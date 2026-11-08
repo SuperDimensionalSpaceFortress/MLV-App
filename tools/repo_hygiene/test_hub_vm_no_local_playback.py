@@ -6393,7 +6393,40 @@ class PopenPwshExitClockTests(unittest.TestCase):
         _write_probe(probe, "'[1]'\n")
         return probe
 
-    def _lifetime_case(self, scripted_fault: bool) -> None:
+    @staticmethod
+    def _record_first_result(first) -> list:
+        """r3 (Dot 0aef3ba): keep what the helper's first collection of `first` returned -- (a CompletedProcess of its return code and streams, the time it lasted
+        by the helper's own clock, taken at the same moment) -- so a test can ask the SAME _is_start_crash classifier whether a re-launch was owed. Only the first
+        successful collection is kept; later calls (the test's own _kill) pass through."""
+        seen: list = []
+        collect = first.communicate
+
+        def communicate(*args, **kwargs):
+            out, err = collect(*args, **kwargs)
+            if not seen:
+                seen.append((subprocess.CompletedProcess(first.args, first.returncode, stdout=out, stderr=err), _probe_lasted(first)))
+            return out, err
+
+        first.communicate = communicate
+        return seen
+
+    def _assert_whose_clock(self, scripted_fault: bool, first, proc, first_result: list, relaunches: list) -> None:
+        """r3 (Dot 0aef3ba): which child's clock a probe case asserts on. A scripted fault must have been re-launched once. Without one, the first child stands,
+        OR -- because the first child is a REAL pwsh that can hit the recognized start fault on a loaded runner -- exactly one re-launch stands in for it, and only
+        when the first child's own result meets _is_start_crash (never any other failure, never a second re-launch)."""
+        if scripted_fault:
+            self.assertIsNot(proc, first, "after a start fault the clock asserted is the re-launch's own")
+            self.assertEqual(1, len(relaunches))
+            return
+        if proc is first:
+            self.assertEqual([], relaunches, "the first child stood, so nothing was re-launched")
+            return
+        self.assertEqual(1, len(relaunches), "a re-launch stood in for the first child: exactly one was made")
+        self.assertEqual(1, len(first_result), "the first child's result was collected once")
+        done, lasted = first_result[0]
+        self.assertTrue(_is_start_crash(done, lasted), f"the first child was replaced without a recognized start fault: rc={done.returncode} after {lasted:.1f} s: {done.stderr!r}")
+
+    def _lifetime_case(self, scripted_fault: bool, external_fault: bool = False) -> None:
         probe = self._quick_probe()
         before = len(_PWSH_SPAWNS)
         def collected_late(attempt) -> None:
@@ -6401,10 +6434,13 @@ class PopenPwshExitClockTests(unittest.TestCase):
                 attempt.exit_watch.join(timeout=120)
             time.sleep(1.5)  # collected late
 
-        with self.first_launch_dies() if scripted_fault else contextlib.nullcontext([]) as launches:
+        with self.first_launch_dies() if scripted_fault or external_fault else contextlib.nullcontext([]) as launches:
             first = proc = _popen_pwsh(probe)
+            first_result = self._record_first_result(first)
+            relaunches: list = []
             try:
-                proc, out, _ = _communicate_retrying_start_fault(proc, before_collect=collected_late)
+                proc, out, _ = _communicate_retrying_start_fault(proc, before_collect=collected_late,
+                                                                 popen=lambda path: relaunches.append(path.name) or _popen_pwsh(path, counted=False))
                 lasted = _probe_lasted(proc)
             finally:
                 _kill(proc)
@@ -6413,8 +6449,8 @@ class PopenPwshExitClockTests(unittest.TestCase):
         del _PWSH_SPAWNS[before:]
         self.assertEqual(["[1]"], [out.strip()])
         self.assertEqual(["quick-probe.ps1"], spawned, "one logical probe, however many launches it took")
-        self.assertEqual(2 if scripted_fault else 0, len(launches))
-        self.assertIs(scripted_fault, proc is not first, "after a start fault the clock asserted is the re-launch's own")
+        self.assertEqual(2 if scripted_fault or external_fault else 0, len(launches))
+        self._assert_whose_clock(scripted_fault, first, proc, first_result, relaunches)
         self.assertIsNotNone(proc.ended_at)
         self.assertLess(lasted, time.monotonic() - proc.started_at - 1.0, "the lifetime excludes the 1.5 s the probe waited to be collected")
         self.assertEqual(float("inf"), _probe_lasted(mock.Mock(spec=[])), "a probe with no start time is never taken to be inside the window")
@@ -6426,7 +6462,31 @@ class PopenPwshExitClockTests(unittest.TestCase):
         """Dot item 1 (:6144-6150): the first pwsh dies of the recorded runtime-load fault; the probe is run once more and the re-launch's own clock is asserted."""
         self._lifetime_case(scripted_fault=True)
 
-    def _no_watcher_case(self, scripted_fault: bool) -> None:
+    def test_r3_dot_0aef3ba_the_unscripted_lifetime_assertions_accept_a_recognized_real_start_fault(self):
+        """Dot 0aef3ba (PR 775 comment 6722660169): the ORDINARY (scripted_fault=False) assertions of the lifetime case, run with a recognized start fault
+        injected from OUTSIDE (the first launch dies of the recorded fault, as a real pwsh can), must hold on the re-launch: one re-launch, the same classifier."""
+        self._lifetime_case(scripted_fault=False, external_fault=True)
+
+    def test_r3_dot_0aef3ba_the_unscripted_no_watcher_assertions_accept_a_recognized_real_start_fault(self):
+        """Dot 0aef3ba: the same for the no-watcher case (the ordinary assertion path, a recognized start fault injected from outside)."""
+        self._no_watcher_case(scripted_fault=False, external_fault=True)
+
+    def test_r3_dot_0aef3ba_the_unscripted_check_is_not_loosened_to_any_replacement(self):
+        """Dot 0aef3ba / hub ruling: without a scripted fault a replaced first child passes ONLY for a recognized start fault and exactly one re-launch."""
+        first, other = object(), object()
+        fault = (subprocess.CompletedProcess([], -6, stdout="", stderr=CollectCountsRuntimeLoadFaultTests.REAL_STDERR), 0.0)
+        self._assert_whose_clock(False, first, first, [], [])  # the first child stood
+        self._assert_whose_clock(False, first, other, [fault], ["a.ps1"])  # one re-launch of a recognized fault
+        plain_failure = (subprocess.CompletedProcess([], 1, stdout="", stderr="boom"), 0.0)
+        late_signal = (subprocess.CompletedProcess([], -6, stdout="", stderr=CollectCountsRuntimeLoadFaultTests.REAL_STDERR), 600.0)
+        for label, result, relaunches in (("a plain non-zero exit", plain_failure, ["a.ps1"]), ("a fault signal outside the start-up window", late_signal, ["a.ps1"]),
+                                          ("two re-launches", fault, ["a.ps1", "a.ps1"]), ("no recorded first result", None, ["a.ps1"]), ("no re-launch at all", fault, [])):
+            with self.subTest(label), self.assertRaises(AssertionError):
+                self._assert_whose_clock(False, first, other, [] if result is None else [result], relaunches)
+        with self.assertRaises(AssertionError):  # a scripted fault still demands a re-launch
+            self._assert_whose_clock(True, first, first, [fault], [])
+
+    def _no_watcher_case(self, scripted_fault: bool, external_fault: bool = False) -> None:
         probe = self._quick_probe()
         before = len(_PWSH_SPAWNS)
 
@@ -6441,10 +6501,12 @@ class PopenPwshExitClockTests(unittest.TestCase):
             with mock.patch.object(threading, "Thread", NoThreads):
                 return _popen_pwsh(path, counted=counted)  # must not raise: the clock is advisory
 
-        with self.first_launch_dies() if scripted_fault else contextlib.nullcontext([]) as launches:
+        with self.first_launch_dies() if scripted_fault or external_fault else contextlib.nullcontext([]) as launches:
             first = proc = start_without_a_watcher(probe)
+            first_result = self._record_first_result(first)
+            relaunches: list = []
             try:
-                proc, out, _ = _communicate_retrying_start_fault(proc, popen=lambda path: start_without_a_watcher(path, counted=False))
+                proc, out, _ = _communicate_retrying_start_fault(proc, popen=lambda path: relaunches.append(path.name) or start_without_a_watcher(path, counted=False))
                 lasted = _probe_lasted(proc)
             finally:
                 _kill(proc)
@@ -6453,8 +6515,8 @@ class PopenPwshExitClockTests(unittest.TestCase):
         del _PWSH_SPAWNS[before:]
         self.assertEqual("[1]", out.strip())
         self.assertEqual(["quick-probe.ps1"], spawned, "one logical probe, however many launches it took")
-        self.assertEqual(2 if scripted_fault else 0, len(launches))
-        self.assertIs(scripted_fault, proc is not first)
+        self.assertEqual(2 if scripted_fault or external_fault else 0, len(launches))
+        self._assert_whose_clock(scripted_fault, first, proc, first_result, relaunches)
         self.assertIsNone(proc.ended_at)
         self.assertIsNone(proc.exit_watch)
         self.assertTrue(lasted >= 0, "judged as ending when collected")
