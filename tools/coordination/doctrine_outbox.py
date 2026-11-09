@@ -3660,18 +3660,23 @@ class _WinJob:
             if process:
                 k32.CloseHandle(process)
 
-    def kill_and_wait(self, timeout: float) -> None:
+    def kill_and_wait(self, timeout: float) -> int | None:
         """Kill every process in the job and wait, up to `timeout` seconds, until none is active. Closing the job handle
-        alone kills asynchronously: the processes (and the directory they were started in) can be held for a moment after it."""
+        alone kills asynchronously: the processes (and the directory they were started in) can be held for a moment after it.
+        Returns how many were still active at the deadline (0: the tree has exited), or None when the job could not be queried."""
         if not self._handle:
-            return
+            return 0
         self._k32.TerminateJobObject(self._handle, 1)
         import ctypes
         info = self._accounting()
         deadline = time.monotonic() + timeout
-        while self._k32.QueryInformationJobObject(self._handle, 1, ctypes.byref(info), ctypes.sizeof(info), None):   # BasicAccounting
-            if info.ActiveProcesses == 0 or time.monotonic() >= deadline:
-                return
+        while True:
+            if not self._k32.QueryInformationJobObject(self._handle, 1, ctypes.byref(info), ctypes.sizeof(info), None):   # BasicAccounting
+                return None
+            if info.ActiveProcesses == 0:
+                return 0
+            if time.monotonic() >= deadline:
+                return int(info.ActiveProcesses)
             time.sleep(0.02)
 
     def close(self) -> None:
@@ -3682,10 +3687,12 @@ class _WinJob:
 
 
 def _kill_route_tree(proc: subprocess.Popen, job: "_WinJob | None") -> None:
-    """End the route's process and every descendant it started, then reap the direct child."""
+    """End the route's process and every descendant it started, then reap the direct child. With a Job Object the tree is
+    waited for (bounded); a tree not confirmed exited is the typed Unknown ROUTE_TREE_NOT_EXITED, raised after the reaping."""
+    still_active: int | None = 0
     if os.name == "nt":
         if job is not None:
-            job.kill_and_wait(ROUTE_KILL_EXIT_WAIT)                     # the tree has exited (bounded) before the caller removes its cwd
+            still_active = job.kill_and_wait(ROUTE_KILL_EXIT_WAIT)      # the tree has exited (bounded) before the caller removes its cwd
             job.close()
         else:
             try:
@@ -3705,6 +3712,9 @@ def _kill_route_tree(proc: subprocess.Popen, job: "_WinJob | None") -> None:
         proc.wait(timeout=10)
     except subprocess.TimeoutExpired:
         pass
+    if still_active != 0:
+        seen = "could not be counted" if still_active is None else f"{still_active} process(es) still active"
+        raise Unknown("ROUTE_TREE_NOT_EXITED", f"the killed process tree {seen} after {ROUTE_KILL_EXIT_WAIT:g}s")
 
 
 def _drain_tail(stream, cap: int, sink: list) -> None:
@@ -3750,6 +3760,7 @@ def run_bounded_process(argv: list[str], cwd: pathlib.Path, env: dict[str, str],
         reader.start()
     deadline = time.monotonic() + timeout
     timed_out = False
+    stuck: Unknown | None = None
     try:
         proc.wait(timeout=max(0.0, deadline - time.monotonic()))
         for reader in readers:                                          # a descendant holding a pipe open counts against the same deadline
@@ -3759,11 +3770,16 @@ def run_bounded_process(argv: list[str], cwd: pathlib.Path, env: dict[str, str],
         timed_out = True
     finally:
         if timed_out:
-            _kill_route_tree(proc, job)
+            try:
+                _kill_route_tree(proc, job)
+            except Unknown as e:                                        # raised once the readers are joined, below
+                stuck = e
         elif job is not None:
             job.close()                                                 # a clean run leaves nothing of its own running
     for reader in readers:
         reader.join(5)
+    if stuck is not None:
+        raise stuck
     out, err = ([s[0].decode("utf-8", "replace") if s else "" for s in sinks])
     return (None if timed_out else proc.returncode), out, err
 
@@ -3819,6 +3835,10 @@ def _exercise_route_argv(argv: list[str], cwd: pathlib.Path, timeout: float, fil
         return "ROUTE_MISSING", f"PROGRAM_NOT_FOUND: {redact_route_text(str(e), secrets)}"
     except OSError as e:
         return "ROUTE_FAILED", f"could not start: {redact_route_text(str(e), secrets)}"
+    except Unknown as e:                                                # the launcher's typed outcome: the killed tree is not confirmed exited
+        if e.code != "ROUTE_TREE_NOT_EXITED":
+            raise
+        return "ROUTE_TIMEOUT", f"still running after {timeout:g}s; {e.detail}"
     if returncode is None:
         return "ROUTE_TIMEOUT", f"still running after {timeout:g}s; its process tree was killed"
     if returncode != 0:
@@ -3830,8 +3850,11 @@ def _exercise_route_argv(argv: list[str], cwd: pathlib.Path, timeout: float, fil
 
 def _writable_retry(func, path, _exc) -> None:
     """rmtree error hook: git object files are read-only on Windows; make the entry writable and retry once."""
-    os.chmod(path, stat.S_IWRITE)
-    func(path)
+    try:
+        os.chmod(path, stat.S_IWRITE)
+        func(path)
+    except FileNotFoundError:
+        pass                                                            # the entry went away between the failure and this retry: it is removed
 
 
 def remove_exercise_scratch(base: pathlib.Path, scratch_root: pathlib.Path) -> None:
@@ -3848,10 +3871,10 @@ def remove_exercise_scratch(base: pathlib.Path, scratch_root: pathlib.Path) -> N
             else:
                 shutil.rmtree(base, onerror=lambda f, p, e: _writable_retry(f, p, e))
             return
-        except FileNotFoundError:
-            return                                                      # already gone
         except OSError as e:                                            # a just-killed process still holds it (sharing violation 13/32)
-            if time.monotonic() >= deadline:
+            if isinstance(e, FileNotFoundError) and not os.path.lexists(base):
+                return                                                  # the scratch itself is gone; a missing CHILD is only a race, retried
+            if time.monotonic() + ROUTE_SCRATCH_REMOVE_PAUSE > deadline:    # no attempt starts after the deadline
                 raise Unknown("EXERCISE_SCRATCH_NOT_REMOVED",
                               f"{base} could not be removed within {ROUTE_SCRATCH_REMOVE_DEADLINE:g}s and is left behind: {e}") from e
             time.sleep(ROUTE_SCRATCH_REMOVE_PAUSE)

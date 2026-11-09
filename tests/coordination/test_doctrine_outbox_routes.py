@@ -2566,6 +2566,105 @@ def test_remove_exercise_scratch_with_a_persistent_sharing_violation_raises_the_
     assert caught.value.code == "EXERCISE_SCRATCH_NOT_REMOVED" and str(base) in caught.value.detail, caught.value
 
 
+# Adversary pass r1 (head 2efbdb59): A1 a child that vanished mid-removal must not read as "the scratch is gone"; A2 a tree that is
+# not confirmed exited is a typed outcome, not a silent return; A3 no removal attempt starts after the deadline.
+
+def test_a_child_that_vanishes_during_removal_is_not_the_scratch_being_gone(tmp_path, monkeypatch):
+    root = tmp_path / "scratch"
+    base = root / (ob.ROUTE_SCRATCH_PREFIX + "race")
+    base.mkdir(parents=True)
+    (base / "keep.txt").write_text("k", encoding="utf-8")
+    real = shutil.rmtree
+    calls: list[int] = []
+
+    def racing(path, *args, **kwargs):
+        calls.append(1)
+        if len(calls) == 1:                                              # the entry that failed is already gone when the hook retries it
+            hook = kwargs.get("onexc") or kwargs.get("onerror")
+            vanished = str(Path(path) / "racing.tmp")
+            hook(os.unlink, vanished, PermissionError(13, "in use")) if "onexc" in kwargs else hook(os.unlink, vanished, (PermissionError, None, None))
+        return real(path, *args, **kwargs)
+
+    monkeypatch.setattr(ob.shutil, "rmtree", racing)
+    ob.remove_exercise_scratch(base, root)
+    assert not base.exists(), "cleanup returned while the scratch directory (keep.txt) was still there"
+
+
+def test_a_file_not_found_for_a_child_does_not_end_the_removal_while_the_scratch_remains(tmp_path, monkeypatch):
+    root = tmp_path / "scratch"
+    base = root / (ob.ROUTE_SCRATCH_PREFIX + "gone-child")
+    base.mkdir(parents=True)
+    (base / "keep.txt").write_text("k", encoding="utf-8")
+    real = shutil.rmtree
+    calls: list[int] = []
+
+    def racing(path, *args, **kwargs):
+        calls.append(1)
+        if len(calls) == 1:
+            raise FileNotFoundError(2, "The system cannot find the file specified", str(Path(path) / "racing.tmp"))
+        return real(path, *args, **kwargs)
+
+    monkeypatch.setattr(ob.shutil, "rmtree", racing)
+    ob.remove_exercise_scratch(base, root)
+    assert not base.exists() and len(calls) == 2
+
+
+def test_no_scratch_removal_attempt_starts_after_the_deadline(tmp_path, monkeypatch):
+    import types
+    root = tmp_path / "scratch"
+    base = root / (ob.ROUTE_SCRATCH_PREFIX + "late")
+    base.mkdir(parents=True)
+    clock = [0.0]
+    starts: list[float] = []
+
+    def attempt(path, *args, **kwargs):
+        starts.append(clock[0])
+        clock[0] += 14.99 if len(starts) == 1 else 0.0                   # the first attempt is slow, then fails with the violation
+        raise PermissionError(13, "in use", str(path))
+
+    monkeypatch.setattr(ob.shutil, "rmtree", attempt)
+    monkeypatch.setattr(ob, "time", types.SimpleNamespace(monotonic=lambda: clock[0], sleep=lambda s: clock.__setitem__(0, clock[0] + s)))
+    with pytest.raises(ob.Unknown) as caught:
+        ob.remove_exercise_scratch(base, root)
+    assert caught.value.code == "EXERCISE_SCRATCH_NOT_REMOVED"
+    assert starts and max(starts) <= ob.ROUTE_SCRATCH_REMOVE_DEADLINE, starts
+
+
+@pytest.mark.skipif(os.name != "nt", reason="the Job Object exit wait is Windows-only")
+@pytest.mark.parametrize("remaining", [1, None])                       # still active at the deadline / the job could not be queried
+def test_a_killed_tree_not_confirmed_exited_is_a_typed_outcome_after_the_direct_child_is_reaped(remaining):
+    proc = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(600)"])
+
+    class Job:
+        closed = False
+
+        def kill_and_wait(self, timeout):
+            return remaining
+
+        def close(self):
+            self.closed = True
+
+    job = Job()
+    try:
+        with pytest.raises(ob.Unknown) as caught:
+            ob._kill_route_tree(proc, job)
+        assert caught.value.code == "ROUTE_TREE_NOT_EXITED", caught.value
+        assert job.closed and proc.poll() is not None, "the direct child must still be killed and reaped before the outcome is raised"
+    finally:
+        force_kill(proc.pid)
+
+
+def test_a_route_whose_killed_tree_is_not_confirmed_exited_stays_a_status_not_a_raise(tmp_path, monkeypatch):
+    clone = make_clone(tmp_path)
+
+    def stuck(*_a, **_k):
+        raise ob.Unknown("ROUTE_TREE_NOT_EXITED", "the killed process tree 2 process(es) still active after 10s")
+
+    monkeypatch.setattr(ob, "run_route_process", stuck)
+    status, detail = ob.exercise_route("git log", clone, 30, {})
+    assert status == "ROUTE_TIMEOUT" and "still active" in detail, (status, detail)
+
+
 @pytest.mark.skipif(os.name != "nt", reason="the Job Object exit wait is Windows-only")
 def test_a_timeout_returns_only_after_the_preparations_tree_has_exited(tmp_path, monkeypatch):
     script = tmp_path / "spawn.py"
