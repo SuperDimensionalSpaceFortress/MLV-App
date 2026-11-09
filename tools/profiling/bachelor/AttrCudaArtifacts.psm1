@@ -7203,29 +7203,34 @@ function Get-AttrCudaPlaybackTemporalCoverage {
         [double]$MaxGapMs
     )
 
-    $none = {
-        param([string]$Why)
-        [pscustomobject]@{
-            windowSource = 'unavailable'; unavailableReason = $Why; sufficient = $null; maxGapMs = $null; gapKind = $null
+    # One typed reason, one return: this body is spliced into the generated job, whose scan admits no dynamic invocation (R3).
+    $why = $null
+    $firstUtc = [datetime]::MinValue
+    $lastUtc = [datetime]::MinValue
+    if ($null -eq $EarliestAnchorUtc -or $null -eq $LatestAnchorUtc) { $why = 'no capture-start bracket' }
+    elseif ([datetime]$LatestAnchorUtc -lt [datetime]$EarliestAnchorUtc) { $why = 'the capture-start bracket is inverted' }
+    elseif (-not ($LatestAnchorTrusted -is [bool] -and $LatestAnchorTrusted)) {
+        $why = 'trace readiness was not observed, so the late end of the capture-start bracket is no bound on the PresentMon origin'
+    }
+    else {
+        $swapLines = @(if (-not [string]::IsNullOrEmpty($LogText)) { [regex]::Matches($LogText, 'playback_smoke\.gpu_window_swaps [^\r\n]*?first_swap_utc=(?<first>\S+) last_swap_utc=(?<last>\S+)') })
+        if ($swapLines.Count -eq 0) { $why = 'no playback_smoke.gpu_window_swaps line with first_swap_utc/last_swap_utc in the run log' }
+        else {
+            $last = $swapLines[$swapLines.Count - 1]
+            $inv = [System.Globalization.CultureInfo]::InvariantCulture
+            $styles = [System.Globalization.DateTimeStyles]::AdjustToUniversal -bor [System.Globalization.DateTimeStyles]::AssumeUniversal
+            if (-not [datetime]::TryParse($last.Groups['first'].Value, $inv, $styles, [ref]$firstUtc) -or -not [datetime]::TryParse($last.Groups['last'].Value, $inv, $styles, [ref]$lastUtc)) {
+                $why = 'the gpu_window_swaps first_swap_utc/last_swap_utc stamps are unparseable'
+            }
+            elseif ($lastUtc -le $firstUtc) { $why = 'the gpu_window_swaps window is empty or reversed' }
+        }
+    }
+    if ($null -ne $why) {
+        return [pscustomobject]@{
+            windowSource = 'unavailable'; unavailableReason = $why; sufficient = $null; maxGapMs = $null; gapKind = $null
             anchor = $null; windowFirstUtc = $null; windowLastUtc = $null; rowsInWindow = $null
         }
     }
-    if ($null -eq $EarliestAnchorUtc -or $null -eq $LatestAnchorUtc) { return (& $none 'no capture-start bracket') }
-    if ([datetime]$LatestAnchorUtc -lt [datetime]$EarliestAnchorUtc) { return (& $none 'the capture-start bracket is inverted') }
-    if (-not ($LatestAnchorTrusted -is [bool] -and $LatestAnchorTrusted)) {
-        return (& $none 'trace readiness was not observed, so the late end of the capture-start bracket is no bound on the PresentMon origin')
-    }
-    $swapLines = @(if (-not [string]::IsNullOrEmpty($LogText)) { [regex]::Matches($LogText, 'playback_smoke\.gpu_window_swaps [^\r\n]*?first_swap_utc=(?<first>\S+) last_swap_utc=(?<last>\S+)') })
-    if ($swapLines.Count -eq 0) { return (& $none 'no playback_smoke.gpu_window_swaps line with first_swap_utc/last_swap_utc in the run log') }
-    $last = $swapLines[$swapLines.Count - 1]
-    $inv = [Globalization.CultureInfo]::InvariantCulture
-    $styles = [Globalization.DateTimeStyles]::AdjustToUniversal -bor [Globalization.DateTimeStyles]::AssumeUniversal
-    $firstUtc = [datetime]::MinValue
-    $lastUtc = [datetime]::MinValue
-    if (-not [datetime]::TryParse($last.Groups['first'].Value, $inv, $styles, [ref]$firstUtc) -or -not [datetime]::TryParse($last.Groups['last'].Value, $inv, $styles, [ref]$lastUtc)) {
-        return (& $none 'the gpu_window_swaps first_swap_utc/last_swap_utc stamps are unparseable')
-    }
-    if ($lastUtc -le $firstUtc) { return (& $none 'the gpu_window_swaps window is empty or reversed') }
 
     $values = @($TimeInMsValues | Where-Object { $null -ne $_ })
     $worst = $null
