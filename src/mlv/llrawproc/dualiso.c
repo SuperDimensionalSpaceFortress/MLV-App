@@ -4947,6 +4947,18 @@ void dualisoSetMixChromaRingPerCallForTesting(int per_call)
     g_dualiso_mix_chroma_ring_per_call_for_testing = per_call ? 1 : 0;
 }
 
+/* Test-only ring failure switch (adversary 4e8c6627 A1): 1 = the fast kernel
+ * reports its ring allocation failure for every plane with a cell, so the
+ * matched-source smooth takes its fallback copy + legacy kernel. Always 0 in
+ * the product. */
+static int g_dualiso_mix_chroma_ring_fail_for_testing = 0;
+
+void dualisoSetMixChromaRingFailureForTesting(int fail);
+void dualisoSetMixChromaRingFailureForTesting(int fail)
+{
+    g_dualiso_mix_chroma_ring_fail_for_testing = fail ? 1 : 0;
+}
+
 #ifdef DUALISO_AVX2_AVAILABLE
 #include "dualiso_mix_chroma_avx2.inc"
 #endif
@@ -4966,8 +4978,10 @@ static inline size_t dualiso_cs2_thread_ints(int ncx, int npos)
  * only (test seam); otherwise the ring is the scratch's reusable buffer (K3).
  * use_avx2 selects the LEVER-2 kernel; callers pass it only when the dispatch
  * is active. avx2_ran (optional) is set to 1 only when the AVX2 kernel
- * actually smoothed cells, never for a plane too small to hold a cell (plain
- * copy) or a ring failure (adversary 457eb203 A1). */
+ * actually stored cells with its vector loop (ncx >= 8), never for a plane
+ * too small to hold a cell (plain copy), a plane whose cells all fall in the
+ * scalar tail (0 < ncx < 8, Grok G2) or a ring failure (adversary 457eb203
+ * A1). */
 static int dualiso_chroma_smooth_2x2_fast_u32(int w,
                                               int h,
                                               const uint32_t * __restrict inp,
@@ -5010,7 +5024,8 @@ static int dualiso_chroma_smooth_2x2_fast_u32(int w,
      * the AVX2 EV-row ring. */
     const size_t pos_row_ints = (size_t)DUALISO_CS2_POS_FIELDS * (size_t)npos;
     const size_t thread_ints = dualiso_cs2_thread_ints(ncx, npos);
-    if (thread_ints > SIZE_MAX / sizeof(int) / (size_t)max_threads)
+    if (thread_ints > SIZE_MAX / sizeof(int) / (size_t)max_threads
+        || g_dualiso_mix_chroma_ring_fail_for_testing)
     {
         return 0;
     }
@@ -5110,9 +5125,13 @@ static int dualiso_chroma_smooth_2x2_fast_u32(int w,
         free(rings);
     }
 #ifdef DUALISO_AVX2_AVAILABLE
+    /* Grok G2 (hub ACK 6741752322): the proof means the AVX2 vector store ran.
+     * dualiso_cs2_cell_row_avx2 stores 8 cells per step and leaves ncx % 8 to
+     * the scalar store, so a plane with 0 < ncx < 8 never reaches the vector
+     * store and does not count. */
     if (avx2_ran)
     {
-        *avx2_ran = use_avx2 ? 1 : 0;
+        *avx2_ran = (use_avx2 && ncx >= 8) ? 1 : 0;
     }
 #endif
     return 1;
@@ -5169,16 +5188,41 @@ int dualisoMixChroma2x2KernelForTesting(int use_fast,
     {
         return 0;
     }
-    int * raw2ev = (int *)malloc(DUALISO_RAW2EV_LUT_COUNT * sizeof(int));
-    int * ev2raw_0 = (int *)malloc(DUALISO_EV2RAW_LUT_COUNT * sizeof(int));
-    if (!raw2ev || !ev2raw_0)
+    /* The LUT pair (1 Mi log2 + 1.5 Mi pow) is kept across calls for the last
+     * (lut_black, lut_white): rebuilding it per call made the identity test
+     * cost ~125 s, past the 240 s CI shard bound with its neighbours (r2). */
+    static pthread_mutex_t lut_lock = PTHREAD_MUTEX_INITIALIZER;
+    static int * cached_raw2ev = NULL;
+    static int * cached_ev2raw_0 = NULL;
+    static int cached_black = -1;
+    static int cached_white = -1;
+    pthread_mutex_lock(&lut_lock);
+    if (!cached_raw2ev || !cached_ev2raw_0)
     {
-        free(raw2ev);
-        free(ev2raw_0);
-        return 0;
+        free(cached_raw2ev);
+        free(cached_ev2raw_0);
+        cached_raw2ev = (int *)malloc(DUALISO_RAW2EV_LUT_COUNT * sizeof(int));
+        cached_ev2raw_0 = (int *)malloc(DUALISO_EV2RAW_LUT_COUNT * sizeof(int));
+        cached_black = -1;
+        cached_white = -1;
+        if (!cached_raw2ev || !cached_ev2raw_0)
+        {
+            free(cached_raw2ev);
+            free(cached_ev2raw_0);
+            cached_raw2ev = NULL;
+            cached_ev2raw_0 = NULL;
+            pthread_mutex_unlock(&lut_lock);
+            return 0;
+        }
     }
-    build_ev2raw_lut(raw2ev, ev2raw_0, lut_black, lut_white);
-    int * ev2raw = ev2raw_0 + 10 * EV_RESOLUTION;
+    if (cached_black != lut_black || cached_white != lut_white)
+    {
+        build_ev2raw_lut(cached_raw2ev, cached_ev2raw_0, lut_black, lut_white);
+        cached_black = lut_black;
+        cached_white = lut_white;
+    }
+    int * raw2ev = cached_raw2ev;
+    int * ev2raw = cached_ev2raw_0 + 10 * EV_RESOLUTION;
     int ok = 1;
     const double kernel_start = mlv_stage_timing_now();
     if (use_fast)
@@ -5194,8 +5238,7 @@ int dualisoMixChroma2x2KernelForTesting(int use_fast,
     {
         *kernel_ms = dualiso_debug_elapsed_ms(kernel_start);
     }
-    free(raw2ev);
-    free(ev2raw_0);
+    pthread_mutex_unlock(&lut_lock);
     return ok;
 }
 
@@ -5307,9 +5350,11 @@ static inline int dualiso_smooth_source_plane(int route,
         {
             return avx2_ran;
         }
-        const double copy_start = mlv_stage_timing_now();
+        /* Fallback copy: timed only by the caller's windows (mix_chroma_ms and
+         * the fullres/halfres stage), like the kernel it stands in for. Adding
+         * it to mix_chroma_copy_ms as well counted it twice in the bench's
+         * mix_chroma + copy sum (adversary 4e8c6627 A1). */
         memcpy(output, input, plane_bytes);
-        g_dualiso_full20bit_timing.mix_chroma_copy_ms += dualiso_debug_elapsed_ms(copy_start);
     }
     hdr_chroma_smooth(info, input, output, method, raw2ev, ev2raw);
     return 0;
@@ -5371,7 +5416,8 @@ static inline int smooth_matched_source_planes(struct raw_info raw_info,
         memcpy(dark_smooth, dark, plane_bytes);
     }
     /* On the fast route no separate copy remains (it is inside the bands), so
-     * this times nothing unless a fast plane falls back below. */
+     * this times nothing; a fast plane that falls back copies inside the
+     * chroma window below and is counted there only (adversary 4e8c6627 A1). */
     g_dualiso_full20bit_timing.mix_chroma_copy_ms += dualiso_debug_elapsed_ms(stage_start);
 
 #ifndef STDOUT_SILENT
@@ -5413,7 +5459,9 @@ static inline int smooth_matched_source_planes(struct raw_info raw_info,
     g_dualiso_mix_chroma_probe_stage_cache = 0;
     g_dualiso_full20bit_timing.mix_chroma_probe_stage = 0;
     g_dualiso_full20bit_timing.mix_chroma_halfres_ms += dualiso_debug_elapsed_ms(stage_start);
-    /* Venue proof: both planes ran the AVX2 kernel this frame. */
+    /* Venue proof: both planes ran the AVX2 vector store this frame. A plane
+     * under 23 px wide (ncx < 8) only runs the scalar tail and does not count
+     * (Grok G2); the venue raw (1808 wide, ncx = 900) is far above that. */
     g_dualiso_full20bit_timing.mix_chroma_avx2_used = avx2_planes == 2;
 
     dualiso_debug_dump_source_smooth_plane("stage_bright_source_smooth.u32",
@@ -5425,6 +5473,68 @@ static inline int smooth_matched_source_planes(struct raw_info raw_info,
 
     g_dualiso_full20bit_timing.mix_chroma_ms += dualiso_debug_elapsed_ms(chroma_start);
     return 1;
+}
+
+/* Test-only entry (adversary 4e8c6627 A1): runs smooth_matched_source_planes
+ * once (2x2 method, a scratch of its own) on caller planes and returns in
+ * window_ms the wall time of that call, so a test can check that the
+ * mix_chroma_copy_ms and mix_chroma_ms it added are disjoint parts of the
+ * window. The caller resets and reads the full20 timing; the route is the one
+ * dualisoSetMixChromaRouteForTesting pinned. Returns the smooth's result. */
+int dualisoSmoothMatchedSourcePlanesForTesting(int w,
+                                               int h,
+                                               const uint32_t * dark,
+                                               const uint32_t * bright,
+                                               uint32_t * dark_smooth,
+                                               uint32_t * bright_smooth,
+                                               int black,
+                                               int dark_white,
+                                               int bright_white,
+                                               double * window_ms);
+int dualisoSmoothMatchedSourcePlanesForTesting(int w,
+                                               int h,
+                                               const uint32_t * dark,
+                                               const uint32_t * bright,
+                                               uint32_t * dark_smooth,
+                                               uint32_t * bright_smooth,
+                                               int black,
+                                               int dark_white,
+                                               int bright_white,
+                                               double * window_ms)
+{
+    if (!dark || !bright || !dark_smooth || !bright_smooth || w <= 0 || h <= 0
+        || black < 0 || dark_white <= black || bright_white <= black
+        || (uint32_t)dark_white >= DUALISO_RAW2EV_LUT_COUNT
+        || (uint32_t)bright_white >= DUALISO_RAW2EV_LUT_COUNT)
+    {
+        return 0;
+    }
+    struct raw_info info;
+    memset(&info, 0, sizeof(info));
+    info.width = w;
+    info.height = h;
+    info.pitch = w;
+    info.black_level = black;
+    info.white_level = dark_white;
+    dualiso_full20bit_scratch_t scratch;
+    memset(&scratch, 0, sizeof(scratch));
+    const double window_start = mlv_stage_timing_now();
+    const int ok = smooth_matched_source_planes(info,
+                                                (uint32_t *)dark,
+                                                (uint32_t *)bright,
+                                                dark_smooth,
+                                                bright_smooth,
+                                                1,
+                                                black,
+                                                dark_white,
+                                                bright_white,
+                                                &scratch);
+    if (window_ms)
+    {
+        *window_ms = dualiso_debug_elapsed_ms(window_start);
+    }
+    free_dualiso_full20bit_scratch(&scratch);
+    return ok;
 }
 
 static inline int mix_curve_key_matches(const dualiso_full20bit_scratch_t * scratch,
