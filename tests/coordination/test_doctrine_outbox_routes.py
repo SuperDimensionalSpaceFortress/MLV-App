@@ -3167,6 +3167,82 @@ def test_a_scratch_root_replaced_while_the_scratch_was_being_prepared_is_never_r
     assert (tmp_path / "scratch-saved" / seen["base"].name).exists()
 
 
+# Adversary pass r3 (head 26648c79): A1 the rmtree error hook acts on a directory renamed away and replaced by another ORDINARY one (no
+# link, same path string) between the outer look and the hook; A2 a creation-time pin that could not be read is never completed from
+# whatever is found at removal.
+
+def test_the_error_hook_never_chmods_or_unlinks_inside_a_scratch_replaced_by_an_ordinary_directory(tmp_path, monkeypatch):
+    import stat as stat_module
+    root = tmp_path / "scratch"
+    base = root / (ob.ROUTE_SCRATCH_PREFIX + "hookswap")
+    base.mkdir(parents=True)
+    (base / "f.txt").write_text("original", encoding="utf-8")
+    precious = base / "precious.txt"
+    acted: list[str] = []
+
+    def rmtree_that_loses_the_scratch_to_a_swap(path, *args, **kwargs):
+        os.rename(path, tmp_path / "scratch-saved")                      # the scratch is renamed away and another ordinary directory takes its name
+        Path(path).mkdir()
+        precious.write_text("not ours", encoding="utf-8")
+        os.chmod(precious, stat_module.S_IREAD)
+        hook = kwargs.get("onexc") or kwargs.get("onerror")
+        hook(lambda p: acted.append(str(p)), str(precious), PermissionError(13, "denied"))   # rmtree reports the entry it could not delete
+        raise PermissionError(13, "denied", str(path))
+
+    monkeypatch.setattr(ob.shutil, "rmtree", rmtree_that_loses_the_scratch_to_a_swap)
+    try:
+        with pytest.raises(ob.Unknown) as caught:
+            ob.remove_exercise_scratch(base, root)
+        assert caught.value.code == "EXERCISE_SCRATCH_NOT_REMOVED", caught.value
+        assert acted == [] and not os.access(precious, os.W_OK), (acted, "the replacement's file was made writable or deleted")
+    finally:
+        os.chmod(precious, stat_module.S_IREAD | stat_module.S_IWRITE)
+
+
+@pytest.mark.parametrize("missing", ["scratch", "root"])
+def test_a_creation_pin_that_could_not_be_read_is_never_completed_from_a_replacement(tmp_path, monkeypatch, missing):
+    root = tmp_path / "scratch"
+    base = root / (ob.ROUTE_SCRATCH_PREFIX + "halfpin")
+    base.mkdir(parents=True)
+    (base / "f.txt").write_text("original", encoding="utf-8")
+    real_root_id, real_work_id = ob._file_id(root, follow=True), ob._file_id(base)
+    ob._SCRATCH_PINS[ob._scratch_key(base)] = (None if missing == "root" else real_root_id, None if missing == "scratch" else real_work_id)
+    monkeypatch.setattr(ob, "ROUTE_SCRATCH_REMOVE_PAUSE", 0)
+    monkeypatch.setattr(ob, "ROUTE_SCRATCH_REMOVE_DEADLINE", 0.3)
+    precious = root / base.name / "precious.txt"
+    if missing == "scratch":                                             # only the object whose identity was never read is replaced
+        os.rename(base, tmp_path / "scratch-saved")
+        base.mkdir()
+        precious.write_text("not ours", encoding="utf-8")
+    else:
+        os.rename(root, tmp_path / "scratch-saved")                      # the root is replaced by an empty ordinary directory
+        root.mkdir()
+    with pytest.raises(ob.Unknown) as caught:
+        ob.remove_exercise_scratch(base, root)
+    assert caught.value.code == "EXERCISE_SCRATCH_NOT_REMOVED", caught.value
+    if missing == "scratch":
+        assert precious.exists(), "a replacement was adopted as the scratch and removed"
+        assert (tmp_path / "scratch-saved" / "f.txt").exists()
+    else:
+        assert (tmp_path / "scratch-saved" / base.name / "f.txt").exists(), "absence behind a replaced root was read as a removal"
+
+
+def test_creation_pins_both_identities_despite_a_transient_read_error(tmp_path, monkeypatch):
+    root = tmp_path / "scratch"
+    base = root / (ob.ROUTE_SCRATCH_PREFIX + "pinretry")
+    base.mkdir(parents=True)
+    real, calls = ob._file_id, [0]
+
+    def flaky_id(path, follow=False):
+        calls[0] += 1
+        return None if calls[0] <= 2 else real(path, follow)             # the first two reads fail transiently
+
+    monkeypatch.setattr(ob, "_file_id", flaky_id)
+    monkeypatch.setattr(ob.time, "sleep", lambda s: None)
+    ob._pin_scratch(base, root)
+    assert ob._SCRATCH_PINS.pop(ob._scratch_key(base)) == (real(root, True), real(base))
+
+
 def stale_bus_pair(tmp_path: Path, name: str, behind: bool) -> Path:
     """A bus clone of its own upstream, `behind` commits behind it (after a fetch) or not."""
     root = tmp_path / name

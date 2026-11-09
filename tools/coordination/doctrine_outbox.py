@@ -3897,20 +3897,24 @@ def _safe_to_touch(path: str | os.PathLike, base: str | os.PathLike | None) -> b
     return not _inside_a_link(path, base) and _resolves_inside(path, base)
 
 
-def _writable_retry(func, path, _exc, base: str | os.PathLike | None = None, deadline: float | None = None) -> None:
+def _writable_retry(func, path, _exc, base: str | os.PathLike | None = None, deadline: float | None = None, ours=None) -> None:
     """rmtree error hook: git object files are read-only on Windows; make the entry writable and retry once. It never
     acts on a link or on anything reached through one (up to `base`): chmod would follow it to a target outside the scratch,
     and it starts neither act after `deadline` (a monotonic time; the inspections themselves take time).
     The path is judged again right before each of the two acts (chmod, retry), so a directory swapped for a junction after
-    the first look is not followed. Python offers no handle-based chmod or unlink on Windows, so the instant between the last
+    the first look is not followed. `ours` (when given) answers whether the pinned scratch root and scratch are still the very
+    objects pinned (file identity), and is asked at the same two moments: a directory renamed away and replaced by another
+    ordinary one is not ours to chmod or unlink. Python offers no handle-based chmod or unlink on Windows, so the instant between the last
     look and the act cannot be closed here; closing it needs a process able to write inside the private scratch root."""
     def late() -> bool:
         return deadline is not None and time.monotonic() > deadline
-    if late() or not _safe_to_touch(path, base) or late():
+    def mine() -> bool:
+        return _safe_to_touch(path, base) and (ours is None or ours())
+    if late() or not mine() or late():
         return                                                          # left for rmtree's own failure to be reported; nothing is changed
     try:
         os.chmod(path, stat.S_IWRITE)
-        if _safe_to_touch(path, base) and not late():
+        if mine() and not late():
             func(path)
     except FileNotFoundError:
         pass                                                            # the entry went away between the failure and this retry: it is removed
@@ -3958,6 +3962,21 @@ def _scratch_key(base: pathlib.Path) -> str:
     return os.path.normcase(os.path.abspath(base))
 
 
+def _pin_scratch(base: pathlib.Path, scratch_root: str | os.PathLike, tries: int = 5) -> None:
+    """Record the identity of the scratch root and of the scratch `base` just made. A read that fails is repeated a few times, 50 ms
+    apart, so a transient error does not leave the pin incomplete; one that stays unreadable is recorded as None, which removal
+    never completes from whatever it finds later (the typed EXERCISE_SCRATCH_NOT_REMOVED, not an adopted replacement)."""
+    real = os.path.realpath(scratch_root)
+    root_id = work_id = None
+    for attempt in range(tries):
+        root_id, work_id = root_id or _file_id(real, follow=True), work_id or _file_id(base)
+        if root_id is not None and work_id is not None:
+            break
+        if attempt + 1 < tries:
+            time.sleep(0.05)
+    _SCRATCH_PINS[_scratch_key(base)] = (root_id, work_id)
+
+
 def remove_exercise_scratch(base: pathlib.Path, scratch_root: pathlib.Path) -> None:
     """Remove the scratch directory THIS run made, by name: it must sit directly under `scratch_root`, carry the
     run's prefix and be a real directory (not a link or junction). Anything else is left alone. Every look at it is
@@ -3985,7 +4004,7 @@ def remove_exercise_scratch(base: pathlib.Path, scratch_root: pathlib.Path) -> N
         state = "ok" if _scratch_guard_holds(work, root) else _scratch_state(work, root)
         if state in ("ok", "absent"):
             seen = _file_id(root, follow=True)
-            if root_id is None and not attempted:
+            if root_id is None and not attempted and not pinned_at_creation:
                 root_id = seen                                          # pinned at the first readable look, before anything is removed
             if seen is None or root_id is None:
                 return "unreadable"
@@ -3993,13 +4012,16 @@ def remove_exercise_scratch(base: pathlib.Path, scratch_root: pathlib.Path) -> N
                 return "foreign"
         if state == "ok":
             seen = _file_id(work)
-            if work_id is None and not attempted:
+            if work_id is None and not attempted and not pinned_at_creation:
                 work_id = seen
             if seen is None or work_id is None:
                 return "unreadable"
             if seen != work_id:
                 return "foreign"
         return state
+
+    def ours() -> bool:
+        return root_id is not None and work_id is not None and _file_id(root, follow=True) == root_id and _file_id(work) == work_id
 
     while True:
         state = look()
@@ -4020,9 +4042,9 @@ def remove_exercise_scratch(base: pathlib.Path, scratch_root: pathlib.Path) -> N
             attempted = True
             try:
                 if sys.version_info >= (3, 12):
-                    shutil.rmtree(work, onexc=lambda f, p, e: _writable_retry(f, p, e, work, deadline))
+                    shutil.rmtree(work, onexc=lambda f, p, e: _writable_retry(f, p, e, work, deadline, ours))
                 else:
-                    shutil.rmtree(work, onerror=lambda f, p, e: _writable_retry(f, p, e, work, deadline))
+                    shutil.rmtree(work, onerror=lambda f, p, e: _writable_retry(f, p, e, work, deadline, ours))
                 if look() == "absent":
                     return
                 failure = OSError(f"{base} still exists or cannot be inspected after the removal returned")   # a refused entry is a failure
@@ -4049,7 +4071,7 @@ def make_exercise_scratch(bus: pathlib.Path, scratch_root: pathlib.Path) -> tupl
         raise Unknown("EXERCISE_SCRATCH_INSIDE_BUS", f"scratch root {scratch_root} is inside the bus {bus}; routes never run in the live bus")
     scratch_root.mkdir(parents=True, exist_ok=True)
     base = pathlib.Path(tempfile.mkdtemp(prefix=ROUTE_SCRATCH_PREFIX, dir=str(scratch_root)))
-    _SCRATCH_PINS[_scratch_key(base)] = (_file_id(os.path.realpath(scratch_root), follow=True), _file_id(base))   # what removal must find again
+    _pin_scratch(base, scratch_root)                                    # what removal must find again
     try:
         clone = base / "bus"
         git_bin, refused = route_git_binary(clone)
