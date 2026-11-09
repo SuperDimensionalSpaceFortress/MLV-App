@@ -4045,7 +4045,7 @@ $presentMonCaptureTemporal = Get-AttrCudaTemporalCoverage -TimeInMsValues @($pmI
 # own swap window (playback_smoke.gpu_window_swaps first_swap_utc..last_swap_utc) under both ends of the capture-start bracket. Without
 # that window or a trusted bracket it falls back to the process lifetime, and presentMonTemporalWindowSource says which one was used.
 # The whole-capture result is published beside it (presentMonCaptureTemporal*), so a pre-roll gap is still named, never silent.
-$presentMonPlaybackTemporal = Get-AttrCudaPlaybackTemporalCoverage -TimeInMsValues @($pmIntervalRows | ForEach-Object { [double]$_.timeInMs }) -LogText $rawLog -EarliestAnchorUtc $presentMonCaptureStartUtc -LatestAnchorUtc $presentMonPostSpawnUtc -LatestAnchorTrusted $presentMonTraceReadyVerified -MaxGapMs $presentMonSufficiencyMaxGapMs
+$presentMonPlaybackTemporal = Get-AttrCudaPlaybackTemporalCoverage -TimeInMsValues @($displayReport.targetPositiveIntervalTimesMs) -LogText $rawLog -EarliestAnchorUtc $presentMonCaptureStartUtc -LatestAnchorUtc $presentMonPostSpawnUtc -LatestAnchorTrusted $presentMonTraceReadyVerified -MaxGapMs $presentMonSufficiencyMaxGapMs
 $presentMonTemporalWindowSource = if ($presentMonPlaybackTemporal.windowSource -ceq 'app_swap_window') { 'app_swap_window' } else { 'process_lifetime' }
 $presentMonTemporal = if ($presentMonTemporalWindowSource -ceq 'app_swap_window') { $presentMonPlaybackTemporal } else { $presentMonCaptureTemporal }
 $presentMonCountSufficient = ($pmIntervalRows.Count -ge $presentMonSufficiencyMinIntervalCount)

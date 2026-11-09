@@ -117,6 +117,34 @@ class PlaybackWindowCoverageTests(unittest.TestCase):
         self.assertEqual(coverage(stalled_leg_times(), reversed_line)["r"]["windowSource"], "unavailable")
 
 
+@requires_windows_pwsh
+class AdversaryR1Tests(unittest.TestCase):
+    """Adversary review-adversary-...-r1-10d7adaa findings A1-A3, each fed its own input."""
+
+    def test_a1_a_swap_marker_quoted_in_another_records_location_suffix_is_never_the_window(self) -> None:
+        log = ("[2026-11-09T00:00:30Z] [INFO] [0x1] playback_smoke.gpu_window_swaps session=1 window_active=1 telemetry_enabled=1 swaps=30 "
+               "first_swap_utc=2026-11-09T00:00:01Z last_swap_utc=2026-11-09T00:00:30Z\n"
+               "[2026-11-09T00:00:31Z] [INFO] [0x1] harmless record (C:/b playback_smoke.gpu_window_swaps first_swap_utc=2026-11-08 "
+               "last_swap_utc=2026-11-09 x/MainWindow.cpp:1)\n")
+        r = coverage([1000.0 * i for i in range(1, 31)], log, early="2026-11-09T00:00:00.0000000Z", late="2026-11-09T00:00:00.0000000Z")["r"]
+        self.assertEqual(r["windowSource"], "app_swap_window", r)
+        self.assertTrue(r["sufficient"], r)
+        self.assertEqual(r["maxGapMs"], 1000.0, r)
+
+    def test_a2_an_endpoint_with_zero_rows_is_never_outvoted_by_a_sufficient_one(self) -> None:
+        log = ("playback_smoke.gpu_window_swaps session=1 window_active=1 telemetry_enabled=1 swaps=30 "
+               "first_swap_utc=2026-11-09T00:00:01Z last_swap_utc=2026-11-09T00:00:02Z")
+        r = coverage([2000.0 + i for i in range(30)], log, early="2026-11-09T00:00:00.0000000Z", late="2026-11-09T00:00:01.0000000Z")["r"]
+        self.assertFalse(r["sufficient"], r)
+
+    def test_a3_the_report_carries_every_target_positive_interval_row_unwindowed_and_the_job_uses_it(self) -> None:
+        job = JOB.read_text(encoding="utf-8")
+        self.assertIn("$presentMonPlaybackTemporal = Get-AttrCudaPlaybackTemporalCoverage -TimeInMsValues @($displayReport.targetPositiveIntervalTimesMs) ", job)
+        module = MODULE.read_text(encoding="utf-8")
+        self.assertIn("targetPositiveIntervalTimesMs = @($parsedRows | Where-Object { $_.processId -eq $targetPid -and $null -ne $_.msBetweenDisplayChange "
+                      "-and $_.msBetweenDisplayChange -gt 0 } | ForEach-Object { [double]$_.timeInMs })", module)
+
+
 class JobWiringTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
@@ -124,7 +152,7 @@ class JobWiringTests(unittest.TestCase):
 
     def test_the_job_embeds_and_calls_the_playback_window_coverage(self) -> None:
         self.assertIn("    'Get-AttrCudaPlaybackTemporalCoverage',\n", self.job)
-        self.assertIn("$presentMonPlaybackTemporal = Get-AttrCudaPlaybackTemporalCoverage -TimeInMsValues @($pmIntervalRows | ForEach-Object { [double]$_.timeInMs }) "
+        self.assertIn("$presentMonPlaybackTemporal = Get-AttrCudaPlaybackTemporalCoverage -TimeInMsValues @($displayReport.targetPositiveIntervalTimesMs) "
                       "-LogText $rawLog -EarliestAnchorUtc $presentMonCaptureStartUtc -LatestAnchorUtc $presentMonPostSpawnUtc "
                       "-LatestAnchorTrusted $presentMonTraceReadyVerified -MaxGapMs $presentMonSufficiencyMaxGapMs", self.job)
         self.assertIn("$presentMonTemporal = if ($presentMonTemporalWindowSource -ceq 'app_swap_window') { $presentMonPlaybackTemporal } else { $presentMonCaptureTemporal }", self.job)

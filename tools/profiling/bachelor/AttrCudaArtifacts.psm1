@@ -4650,6 +4650,9 @@ function Get-AttrCudaPresentMonDisplayReport {
         selectedChain = $headlineBuild.selected
         selectedChainRows = $headlineBuild.selectedChainRows
         selectedPresentTimesMs = $headlineBuild.selectedPresentTimesMs
+        # PRESENTMON-BACHELOR-CUDA-INTERNAL-GAP-1 (adversary r1 A3): every positive-interval row of the target pid, NOT windowed by either
+        # bracket endpoint, so the playback-window temporal arm converts each endpoint from the same rows and never loses rows to the headline window.
+        targetPositiveIntervalTimesMs = @($parsedRows | Where-Object { $_.processId -eq $targetPid -and $null -ne $_.msBetweenDisplayChange -and $_.msBetweenDisplayChange -gt 0 } | ForEach-Object { [double]$_.timeInMs })
         clockBracket = $clockBracket
         # PRESENTMON-HARNESS-ROBUSTNESS-2 r1b: the headline endpoint's own window bounds, on the
         # same anchor as selectedChainRows' timeInMs -- see the buildWindow comment above.
@@ -7213,7 +7216,9 @@ function Get-AttrCudaPlaybackTemporalCoverage {
         $why = 'trace readiness was not observed, so the late end of the capture-start bracket is no bound on the PresentMon origin'
     }
     else {
-        $swapLines = @(if (-not [string]::IsNullOrEmpty($LogText)) { [regex]::Matches($LogText, 'playback_smoke\.gpu_window_swaps [^\r\n]*?first_swap_utc=(?<first>\S+) last_swap_utc=(?<last>\S+)') })
+        # adversary r1 A1: only a record that STARTS with the marker (after the optional log-sink prefix) counts, so the marker quoted in another
+        # record's Qt location suffix (a build path) is never taken for the swap window.
+        $swapLines = @(if (-not [string]::IsNullOrEmpty($LogText)) { [regex]::Matches($LogText, '(?m)^(\[[^\]\r\n]*\] \[[A-Za-z]+\] (\[0x[0-9A-Fa-f]+\] )?)?playback_smoke\.gpu_window_swaps [^\r\n]*?first_swap_utc=(?<first>\S+) last_swap_utc=(?<last>\S+)') })
         if ($swapLines.Count -eq 0) { $why = 'no playback_smoke.gpu_window_swaps line with first_swap_utc/last_swap_utc in the run log' }
         else {
             $last = $swapLines[$swapLines.Count - 1]
@@ -7239,7 +7244,9 @@ function Get-AttrCudaPlaybackTemporalCoverage {
         $endMs = ($lastUtc - $anchor.utc).TotalMilliseconds
         $inWindow = @($values | Where-Object { $_ -ge $startMs -and $_ -le $endMs })
         $cov = Get-AttrCudaTemporalCoverage -TimeInMsValues $inWindow -WindowStartMs $startMs -WindowEndMs $endMs -MaxGapMs $MaxGapMs
-        if ($null -eq $worst -or $cov.maxGapMs -gt $worst.cov.maxGapMs) { $worst = @{ cov = $cov; anchor = $anchor.name; rows = $inWindow.Count } }
+        # adversary r1 A2: an insufficient endpoint (zero rows is always insufficient) is never outvoted by a sufficient one; then the larger gap wins.
+        $worse = ($null -eq $worst) -or ((-not $cov.sufficient) -and $worst.cov.sufficient) -or (([bool]$cov.sufficient -eq [bool]$worst.cov.sufficient) -and $cov.maxGapMs -gt $worst.cov.maxGapMs)
+        if ($worse) { $worst = @{ cov = $cov; anchor = $anchor.name; rows = $inWindow.Count } }
     }
     [pscustomobject]@{
         windowSource = 'app_swap_window'; unavailableReason = $null
