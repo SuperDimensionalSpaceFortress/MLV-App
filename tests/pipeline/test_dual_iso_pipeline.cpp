@@ -7361,6 +7361,45 @@ TEST(DualIsoPipeline, MixChromaAvx2ProofIsZeroForAScalarTailOnlyPlane)
                      w, ncx, dualisoMixChromaAvx2Active(), timing.mix_chroma_avx2_used);
         ASSERT_EQ((ncx >= 8 && dualisoMixChromaAvx2Active()) ? 1 : 0, timing.mix_chroma_avx2_used);
     }
+
+    // Adversary a16ec254 A1: the vector loop runs but stores nothing. (a) 24x64, every value at the
+    // dark white (clipped in both planes): every 8-cell step is skipped. (b) 26x10 (ncx = 9, one
+    // cell row): only the scalar-tail cell 8 (x = 20, y = 4) is unclipped, so the only chroma
+    // stores are scalar. Neither may report the AVX2 path; (b) still changes the output.
+    for (const bool tail_only : { false, true })
+    {
+        const int w = tail_only ? 26 : 24;
+        const int hh = tail_only ? 10 : 64;
+        std::vector<uint32_t> dark(static_cast<size_t>(w) * hh, static_cast<uint32_t>(lut_white));
+        std::vector<uint32_t> bright = dark;
+        if (tail_only)
+        {
+            for (std::vector<uint32_t> * p : { &dark, &bright })
+            {
+                (*p)[static_cast<size_t>(4) * w + 20] = 200000u;
+                (*p)[static_cast<size_t>(5) * w + 21] = 200000u;
+            }
+        }
+        std::vector<uint32_t> dark_out(dark.size());
+        std::vector<uint32_t> bright_out(bright.size());
+        dualiso_debug_reset_full20bit_timing();
+        ASSERT_EQ(1, dualisoSmoothMatchedSourcePlanesForTesting(w, hh, dark.data(), bright.data(), dark_out.data(),
+                                                                bright_out.data(), lut_black, lut_white, bright_white,
+                                                                nullptr));
+        dualiso_full20bit_timing_t timing = {};
+        dualiso_debug_get_full20bit_timing(&timing);
+        const bool changed = dark_out != dark || bright_out != bright;
+        std::fprintf(stderr,
+                     "[mix-chroma-proof] case=%s w=%d h=%d avx2=%d mix_chroma_avx2_used=%d output_changed=%d\n",
+                     tail_only ? "vector-steps-clipped-tail-written" : "all-clipped", w, hh,
+                     dualisoMixChromaAvx2Active(), timing.mix_chroma_avx2_used, changed ? 1 : 0);
+        ASSERT_EQ(0, timing.mix_chroma_avx2_used);
+        if (tail_only)
+        {
+            // The scalar tail really wrote, so the case is not a plain copy.
+            ASSERT_TRUE(changed);
+        }
+    }
 }
 
 // Adversary 4e8c6627 A1: when the fast kernel cannot get its ring, the plane falls back to

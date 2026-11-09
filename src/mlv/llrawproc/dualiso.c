@@ -4978,10 +4978,11 @@ static inline size_t dualiso_cs2_thread_ints(int ncx, int npos)
  * only (test seam); otherwise the ring is the scratch's reusable buffer (K3).
  * use_avx2 selects the LEVER-2 kernel; callers pass it only when the dispatch
  * is active. avx2_ran (optional) is set to 1 only when the AVX2 kernel
- * actually stored cells with its vector loop (ncx >= 8), never for a plane
- * too small to hold a cell (plain copy), a plane whose cells all fall in the
- * scalar tail (0 < ncx < 8, Grok G2) or a ring failure (adversary 457eb203
- * A1). */
+ * actually ran at least one vector store (an unclipped 8-cell step), never
+ * for a plane too small to hold a cell (plain copy), a plane whose cells all
+ * fall in the scalar tail (0 < ncx < 8, Grok G2), a plane whose every vector
+ * step is clipped (adversary a16ec254 A1) or a ring failure (adversary
+ * 457eb203 A1). */
 static int dualiso_chroma_smooth_2x2_fast_u32(int w,
                                               int h,
                                               const uint32_t * __restrict inp,
@@ -5060,9 +5061,11 @@ static int dualiso_chroma_smooth_2x2_fast_u32(int w,
 #else
     (void)use_avx2;
 #endif
+    /* AVX2 vector stores over all bands (the path proof, adversary a16ec254 A1). */
+    long long avx2_vector_stores = 0;
 
 #ifdef _OPENMP
-#pragma omp parallel num_threads(max_threads)
+#pragma omp parallel num_threads(max_threads) reduction(+:avx2_vector_stores)
 #endif
     {
         int tid = 0;
@@ -5096,8 +5099,8 @@ static int dualiso_chroma_smooth_2x2_fast_u32(int w,
             if (use_avx2)
             {
                 int * ev_ring = cell + (size_t)DUALISO_CS2_CELL_FIELDS * (size_t)ncx;
-                dualiso_cs2_band_avx2(inp, out, w, i0, i1, ncx, npos, raw2ev, ev2raw,
-                                      black, white, avx2_mutation, slot, cell, ev_ring);
+                avx2_vector_stores += dualiso_cs2_band_avx2(inp, out, w, i0, i1, ncx, npos, raw2ev, ev2raw,
+                                                            black, white, avx2_mutation, slot, cell, ev_ring);
             }
             else
 #endif
@@ -5124,16 +5127,15 @@ static int dualiso_chroma_smooth_2x2_fast_u32(int w,
     {
         free(rings);
     }
-#ifdef DUALISO_AVX2_AVAILABLE
-    /* Grok G2 (hub ACK 6741752322): the proof means the AVX2 vector store ran.
-     * dualiso_cs2_cell_row_avx2 stores 8 cells per step and leaves ncx % 8 to
-     * the scalar store, so a plane with 0 < ncx < 8 never reaches the vector
-     * store and does not count. */
+    /* Grok G2 (hub ACK 6741752322) and adversary a16ec254 A1: the proof means
+     * an AVX2 vector store ran. dualiso_cs2_cell_row_avx2 stores 8 cells per
+     * step, skips a step whose cells are all clipped and leaves ncx % 8 to the
+     * scalar store, so a plane with 0 < ncx < 8, or whose every vector step is
+     * clipped (only scalar-tail cells written), does not count. */
     if (avx2_ran)
     {
-        *avx2_ran = (use_avx2 && ncx >= 8) ? 1 : 0;
+        *avx2_ran = (use_avx2 && avx2_vector_stores > 0) ? 1 : 0;
     }
-#endif
     return 1;
 }
 
@@ -5459,9 +5461,11 @@ static inline int smooth_matched_source_planes(struct raw_info raw_info,
     g_dualiso_mix_chroma_probe_stage_cache = 0;
     g_dualiso_full20bit_timing.mix_chroma_probe_stage = 0;
     g_dualiso_full20bit_timing.mix_chroma_halfres_ms += dualiso_debug_elapsed_ms(stage_start);
-    /* Venue proof: both planes ran the AVX2 vector store this frame. A plane
-     * under 23 px wide (ncx < 8) only runs the scalar tail and does not count
-     * (Grok G2); the venue raw (1808 wide, ncx = 900) is far above that. */
+    /* Venue proof: both planes ran an AVX2 vector store this frame. A plane
+     * under 23 px wide (ncx < 8) only runs the scalar tail, and a plane whose
+     * every 8-cell step is clipped skips every vector store; neither counts
+     * (Grok G2, adversary a16ec254 A1). The venue raw (1808 wide, ncx = 900)
+     * has unclipped cells on every real frame. */
     g_dualiso_full20bit_timing.mix_chroma_avx2_used = avx2_planes == 2;
 
     dualiso_debug_dump_source_smooth_plane("stage_bright_source_smooth.u32",

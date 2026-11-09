@@ -211,9 +211,11 @@ static void dualiso_cs2_cross_pass_avx2(int ncx,
     }
 }
 
-/* AVX2 form of dualiso_cs2_cell_row: 8 cells per step, scalar tail. */
+/* AVX2 form of dualiso_cs2_cell_row: 8 cells per step, scalar tail.
+ * Returns the number of 8-cell steps whose vector store ran (a step whose
+ * cells are all clipped is skipped and not counted; adversary a16ec254 A1). */
 DUALISO_CS2_AVX2
-static void dualiso_cs2_cell_row_avx2(const uint32_t * __restrict inp,
+static int dualiso_cs2_cell_row_avx2(const uint32_t * __restrict inp,
                                       uint32_t * __restrict out,
                                       int w,
                                       int y,
@@ -260,6 +262,7 @@ static void dualiso_cs2_cell_row_avx2(const uint32_t * __restrict inp,
     const __m256i bias3 = _mm256_set1_epi32(mutation == 2 ? 0 : 3);
     const __m256i zero = _mm256_setzero_si256();
 
+    int vector_stores = 0;
     int i = 0;
     for (; i + 8 <= ncx; i += 8)
     {
@@ -339,15 +342,18 @@ static void dualiso_cs2_cell_row_avx2(const uint32_t * __restrict inp,
         _mm256_storeu_si256(pb + 1, _mm256_blendv_epi8(_mm256_loadu_si256(pb + 1),
                                                        _mm256_unpackhi_epi32(vb, vb),
                                                        _mm256_unpackhi_epi32(zero, mb)));
+        vector_stores++;
     }
     dualiso_cs2_store_range(inp, out, w, y, ncx, i, ncx, mid, cell, ev2raw, black, white);
+    return vector_stores;
 }
 
 /* One thread band of cell rows [i0, i1): position row pi (p = 2 + 2pi)
  * reads raw rows 2pi+1 .. 2pi+4, kept as EV rows in a ring of 4 indexed by
- * raw row & 3 (each holds nk = npos + 2 even then nk odd values). */
+ * raw row & 3 (each holds nk = npos + 2 even then nk odd values).
+ * Returns the band's count of vector stores (dualiso_cs2_cell_row_avx2). */
 DUALISO_CS2_AVX2
-static void dualiso_cs2_band_avx2(const uint32_t * __restrict inp,
+static long long dualiso_cs2_band_avx2(const uint32_t * __restrict inp,
                                   uint32_t * __restrict out,
                                   int w,
                                   int i0,
@@ -383,6 +389,7 @@ static void dualiso_cs2_band_avx2(const uint32_t * __restrict inp,
     CS2_EV_CONVERT(2 * i0 + 5);
     CS2_EV_CONVERT(2 * i0 + 6);
     CS2_FILL(i0 + 1);
+    long long vector_stores = 0;
     for (int i = i0; i < i1; i++)
     {
         CS2_EV_CONVERT(2 * i + 7);
@@ -390,12 +397,14 @@ static void dualiso_cs2_band_avx2(const uint32_t * __restrict inp,
         CS2_FILL(i + 2);
         const dualiso_cs2_pos_row_t * up = &slot[i % 3];
         const dualiso_cs2_pos_row_t * dn = &slot[(i + 2) % 3];
-        dualiso_cs2_cell_row_avx2(inp, out, w, 4 + 2 * i, ncx,
-                                  mutation == 1 ? dn : up, &slot[(i + 1) % 3], mutation == 1 ? up : dn,
-                                  cell, ev2raw, black, white, mutation);
+        vector_stores += dualiso_cs2_cell_row_avx2(inp, out, w, 4 + 2 * i, ncx,
+                                                   mutation == 1 ? dn : up, &slot[(i + 1) % 3],
+                                                   mutation == 1 ? up : dn,
+                                                   cell, ev2raw, black, white, mutation);
     }
     #undef CS2_FILL
     #undef CS2_EV_CONVERT
     #undef CS2_EV_ODD
     #undef CS2_EV_EVEN
+    return vector_stores;
 }
