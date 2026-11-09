@@ -313,7 +313,7 @@ $rb = [Text.Encoding]::UTF8.GetBytes('{"schema":"mlv-app/core-partition-helper/v
 [IO.File]::WriteAllText($runLogPath, '[' + $corePartitionMeasuredLaunchUtc.AddMilliseconds(100).ToString('yyyy-MM-ddTHH:mm:ss.fffZ') + "] [info] [0x1] playback_smoke.start session=1 worker_threads=16`n[" + $corePartitionMeasuredLaunchUtc.AddMilliseconds(110).ToString('yyyy-MM-ddTHH:mm:ss.fffZ') + "] [info] [0x1] playback_smoke.measured_session id=1`n[" + $corePartitionMeasuredLaunchUtc.AddMilliseconds(150).ToString('yyyy-MM-ddTHH:mm:ss.fffZ') + "] [info] [0x1] playback_smoke.summary session=1 reason=play-stop elapsed_ms=50.000 presented_frames=1`n")
 """
 TERMINAL_CHILD_SETUP = TERMINAL_CHILD_SETUP.replace("__FIXTURE_ZONE_PS__", FIXTURE_ZONE_PS)
-TERMINAL_SUCCESS_TAIL ="__METRICS__\nWrite-Output \"PUBLISHWHY=$corePartitionPublishWhy\"\nexit 0\n"
+TERMINAL_SUCCESS_TAIL = "__METRICS__\nWrite-Output \"PUBLISHWHY=$corePartitionPublishWhy\"\nexit 0\n"
 # terminal class -> (CP_SAVE, the body that follows the smoke-launch finally)
 TERMINALS = {
     # exit 23 after the later log read (G 3376): sol r13d B1's own reproduction
@@ -4088,7 +4088,7 @@ function Resolve-AttrCudaSmokeRunLog { param($ResultJsonPath, $ContainingRoot) i
 # case published feed-no-rows-in-window, or one row fewer, intermittently. CP_WALL_STALL_MS (below) injects exactly that real time.
 function Get-Date { $L.AddMilliseconds($global:cpClk - 1000) }
 __FIXTURE_ZONE_PS__
-$row ="26.10.2026,12:01:00,x,99,99,Yes,Yes`n"
+$row = "26.10.2026,12:01:00,x,99,99,Yes,Yes`n"
 function Read-CorePartitionFeedSince($Path, $Offset, $Before) {
     $m = $global:cpClk; $global:cpClk += 500
     @{ exists = $true; length = 34 + $row.Length; monoMs = [int64]$m; doneMs = [int64]$global:cpClk; created = 123; fileId = 'same'; before = ''; window = $row; windowStartsMidRow = $false
@@ -4329,6 +4329,7 @@ def _r13_start_driver() -> str:
 R13_START_DRIVER = _r13_start_driver()
 
 R13_PURE = r"""
+__FIXTURE_ZONE_PS__
 $L = [DateTime]::new(2026, 10, 27, 21, 0, 0, [DateTimeKind]::Utc)
 function Ln([double]$AfterMs, [string]$Msg) { '[' + $L.AddMilliseconds($AfterMs).ToString('yyyy-MM-ddTHH:mm:ss.fffZ') + '] [info] [0x1a2b] ' + $Msg }
 function Pick($v) { @([string]$v.why, $v.gapMs, $v.session) }
@@ -4379,7 +4380,7 @@ $r.ceilingOverGapPastTeardown = Pick2 (Get-CorePartitionPlaybackStart $real $L.T
 $r.ceilingOverGapWithinTeardown = Pick2 (Get-CorePartitionPlaybackStart $real $L.Ticks 1000 1000 0 74000)
 # r13c: Select-CorePartitionFeedRowsFromStart, pure. A row's HWiNFO stamp (local d.M.yyyy,H:mm:ss[.fff]) is placed on the job's monotonic clock at
 # the measured launch's clock pair (launch UTC $L, mono 1000), as the playback start is; a row counts only at or after the anchor plus the skew
-function Hw([double]$Mono) { $L.AddMilliseconds($Mono - 1000).ToLocalTime().ToString('d.M.yyyy,H:mm:ss.fff', [Globalization.CultureInfo]::InvariantCulture) }
+function Hw([double]$Mono) { Format-CpFixtureStamp $L.AddMilliseconds($Mono - 1000) }
 $anchor = @{ startMonoMs = 24600.0; launchUtcTicks = $L.Ticks; launchMonoMs = 1000.0; skewMs = 0.0 }
 $rows = @('Date,Time,Total CPU Usage [%],CPU Package [C],CPU Package Power [W],Core Thermal Throttling (avg) [Yes/No],Package/Ring Thermal Throttling [Yes/No]', ((Hw 24000) + ',5,30,10,No,No'), ((Hw 24600) + ',5,80,100,No,No'), ((Hw 25600) + ',5,81,101,No,No'), '')
 function PickSel($v) { @([string]$v.why, $v.excluded, @($v.lines).Count) }
@@ -4395,7 +4396,7 @@ $a1c = @{ startMonoMs = 61000.0; launchUtcTicks = $L.Ticks; launchMonoMs = 1000.
 $r.selA1cExcursionBreaksTheOrder = PickSel (Select-CorePartitionFeedRowsFromStart @(((Hw 10500) + ',5,30,10,No,No'), ((Hw 61500) + ',5,30,10,No,No'), ((Hw 12500) + ',5,30,10,No,No'), ((Hw 62000) + ',5,80,100,No,No')) $a1c 92000)
 $r.selA1cInOrderControl = PickSel (Select-CorePartitionFeedRowsFromStart @(((Hw 10500) + ',5,30,10,No,No'), ((Hw 11500) + ',5,30,10,No,No'), ((Hw 12500) + ',5,30,10,No,No'), ((Hw 62000) + ',5,80,100,No,No')) $a1c 92000)
 $r.selSkewExcludesTheBoundaryRow = PickSel (Select-CorePartitionFeedRowsFromStart $rows $sk 26000)
-$r.selSecondsOnly = PickSel (Select-CorePartitionFeedRowsFromStart @(($L.AddSeconds(-60).ToLocalTime().ToString('d.M.yyyy,H:mm:ss', [Globalization.CultureInfo]::InvariantCulture) + ',5,30,10,No,No'), ($L.AddSeconds(60).ToLocalTime().ToString('d.M.yyyy,H:mm:ss', [Globalization.CultureInfo]::InvariantCulture) + ',5,80,100,No,No')) $anchor 62000)
+$r.selSecondsOnly = PickSel (Select-CorePartitionFeedRowsFromStart @(((Format-CpFixtureStamp $L.AddSeconds(-60)) -replace '\.\d{3}$', '') + ',5,30,10,No,No'), (((Format-CpFixtureStamp $L.AddSeconds(60)) -replace '\.\d{3}$', '') + ',5,80,100,No,No')) $anchor 62000)
 $r.selUnparseableStamp = PickSel (Select-CorePartitionFeedRowsFromStart @('10/24/2026,08:00:02,5,80,100,No,No') $anchor 26000)
 $r.selRowFromTheFuture = PickSel (Select-CorePartitionFeedRowsFromStart @(((Hw 24600) + ',5,80,100,No,No'), ((Hw 40000) + ',5,80,100,No,No')) $anchor 26000)
 $r.selNoAnchor = PickSel (Select-CorePartitionFeedRowsFromStart $rows $null 26000)
@@ -4419,6 +4420,7 @@ $ok = Get-CorePartitionStartBoundFeed $feed @{ why = $null }
 $r.passThrough = @($ok.rows, $ok.pkgWattsMean, $ok.reasons.Contains('rows'))
 $r | ConvertTo-Json -Compress -Depth 5
 """
+R13_PURE = R13_PURE.replace("__FIXTURE_ZONE_PS__", FIXTURE_ZONE_PS)
 
 
 # r13c (hosted CI run 40605556724, windows shard 4/8): the feed readers' monoMs is the Stopwatch read taken BEFORE the read, so it can never be
@@ -4501,13 +4503,25 @@ class CorePartitionFixtureClockDstTests(unittest.TestCase):
         self.assertEqual(got["newPinned"], ["", 1], got)
 
     def test_no_feed_fixture_stamps_in_the_hosts_zone(self) -> None:
-        """The class: every driver that writes a local-time feed row from a launch instant uses the pinned-zone stamp and pins the selector's
-        zone. ToLocalTime() in one of them brings the repeated-hour failure back for that driver."""
-        for name, text in (("MARKER_DRIVER", MARKER_DRIVER), ("TERMINAL_CHILD_SETUP", TERMINAL_CHILD_SETUP), ("R11_CLEANUP", R11_CLEANUP)):
-            self.assertNotIn("ToLocalTime()", text, name)
+        """The class: every PowerShell snippet constant in this file that touches a feed (derived, never listed: any upper-case str module
+        constant that names a feed file, the feed env var, the feed selector or a feed stamp) is free of ToLocalTime(, and every one that
+        BUILDS a stamp (the d.M.yyyy format or the pinned helper) uses the pinned-zone stamp and pins the selector's zone. ToLocalTime() in
+        one of them brings the repeated-hour failure back for that snippet. No snippet is exempt: the stamp builders Hw and selSecondsOnly
+        (R13_PURE) were the two the first three-driver guard missed (Grok G2 on aed96266)."""
+        touches_feed = re.compile(r"corePartitionFeedPath|feed\.csv|HEAVY_SLOT_FEED|Select-CorePartitionFeedRowsFromStart|d\.M\.yyyy|Format-CpFixtureStamp")
+        builds_stamp = re.compile(r"d\.M\.yyyy|Format-CpFixtureStamp")
+        snippets = {n: v for n, v in globals().items() if n.isupper() and isinstance(v, str) and touches_feed.search(v)}
+        stampers = {n for n, v in snippets.items() if builds_stamp.search(v)}
+        # the derived sets can never shrink below what the narrower guard named (a refactor that stops matching would otherwise pass vacuously)
+        self.assertLessEqual({"MARKER_DRIVER", "TERMINAL_CHILD_SETUP", "R11_CLEANUP", "R13_PURE", "R13_START_DRIVER"}, stampers)
+        self.assertLessEqual(stampers, set(snippets))
+        for name, text in snippets.items():
+            self.assertFalse("ToLocalTime(" in text, f"{name} builds a feed stamp in the host zone (ToLocalTime()")
+            self.assertNotIn("__FIXTURE_ZONE_PS__", text, name)
+        for name in sorted(stampers):
+            text = snippets[name]
             self.assertIn("Format-CpFixtureStamp", text, name)
             self.assertIn("function Select-CorePartitionFeedRowsFromStart(", text, name)
-            self.assertNotIn("__FIXTURE_ZONE_PS__", text, name)
 
 
 @requires_windows_pwsh
