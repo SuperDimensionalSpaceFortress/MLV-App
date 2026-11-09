@@ -7254,14 +7254,12 @@ function Get-AttrCudaPlaybackTemporalCoverage {
     $originSpanMs = ([datetime]$LatestAnchorUtc - [datetime]$EarliestAnchorUtc).TotalMilliseconds
     $startAtEarliestMs = ($firstUtc - [datetime]$EarliestAnchorUtc).TotalMilliseconds
     $windowMs = ($lastUtc - $firstUtc).TotalMilliseconds
-    $origins = [System.Collections.Generic.List[double]]::new()
-    [void]$origins.Add(0.0)
-    [void]$origins.Add($originSpanMs)
+    $origins = @(0.0, $originSpanMs)
     foreach ($v in $values) {
         foreach ($edge in @(($startAtEarliestMs - $v), ($startAtEarliestMs + $windowMs - $v))) {
             foreach ($step in @(-0.01, 0.0, 0.01)) {
                 $o = $edge + $step
-                if ($o -gt 0.0 -and $o -lt $originSpanMs) { [void]$origins.Add($o) }
+                if ($o -gt 0.0 -and $o -lt $originSpanMs) { $origins += $o }
             }
         }
     }
