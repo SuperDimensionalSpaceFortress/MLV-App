@@ -61,7 +61,7 @@
   },
   "generator": {
     "executable": "pipeline_tests.exe",
-    "source_state_commit": "ecee9817d1fac24d640ca8d6f61326ca348c97e9",
+    "source_state_commit": "cccfd97ee5a5bdd89a7733fee68a28f8eb429a29",
     "dependency_snapshot": {
       "complete": false,
       "scope": "listed_generator_sources_and_declared_fixture_receipt_inputs_only",
@@ -84,7 +84,7 @@
       "compiler": "MinGW 13.1",
       "evidence": {
         "path": ".github/workflows/tests.yml",
-        "sha256": "12ae56eb40c9a64a395e651b8b5523effa3d0368c8b2544fb0f9f62dbfbf5b9e",
+        "sha256": "f7abc2928da560bbd6125f57c9ed28acd3d980835ae8d5f452dec783d073de2f",
         "hash_mode": "lf_normalized_sha256"
       }
     },
@@ -106,7 +106,7 @@
       },
       {
         "path": "tests/pipeline/test_dual_iso_pipeline.cpp",
-        "sha256": "d2c5aede740092a6692291b8486a50db314754f32b2defaaac98f4c2302d97e2",
+        "sha256": "62dc9c51ad198a3df0a4488097995a4545a6f37deffd4a15ec51e89aa906d05f",
         "hash_mode": "lf_normalized_sha256"
       },
       {
