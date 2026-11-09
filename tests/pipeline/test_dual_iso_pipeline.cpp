@@ -6931,6 +6931,16 @@ TEST(DualIsoPipeline, MixChromaFast2x2KernelIsByteIdenticalToLegacy)
         ASSERT_EQ(0, std::memcmp(legacy.data(), fast.data(), legacy.size() * sizeof(uint32_t)));
         ASSERT_EQ(0, std::memcmp(plane.data(), fast.data(), plane.size() * sizeof(uint32_t)));
     }
+
+    // Adversary 5ef39f3a A1: the seam refuses a LUT the builder would index out of range.
+    {
+        const std::vector<uint32_t> plane(90u, 1000u);
+        std::vector<uint32_t> out(plane.size());
+        ASSERT_EQ(0, dualisoMixChroma2x2KernelForTesting(1, 9, 10, plane.data(), out.data(),
+                                                         lut_black, lut_white, lut_black, 1 << 20, nullptr));
+        ASSERT_EQ(0, dualisoMixChroma2x2KernelForTesting(0, 9, 10, plane.data(), out.data(),
+                                                         lut_black, lut_white, lut_white, lut_black, nullptr));
+    }
 }
 
 // Offline bench gate (opt-in: MLVAPP_MIX_CHROMA_BENCH=<runs>): two planes at the
@@ -6956,6 +6966,11 @@ TEST(DualIsoPipeline, MixChromaFast2x2BenchAtVenueGeometry)
     std::vector<uint32_t> out_b(bright.size());
     std::vector<uint32_t> out_d(dark.size());
     OpenMpThreadCountScope omp_scope(16);
+    // Report the team the kernels actually get (adversary 5ef39f3a A2).
+    int bench_threads = 1;
+#ifdef _OPENMP
+    bench_threads = omp_get_max_threads();
+#endif
     std::vector<double> legacy_ms;
     std::vector<double> fast_ms;
     for (int r = 0; r < runs + 2; r++)
@@ -6976,9 +6991,9 @@ TEST(DualIsoPipeline, MixChromaFast2x2BenchAtVenueGeometry)
     const double legacy_median = legacy_ms[legacy_ms.size() / 2];
     const double fast_median = fast_ms[fast_ms.size() / 2];
     std::fprintf(stderr,
-                 "[mix-chroma-bench] w=%d h=%d threads=16 runs=%d legacy_median_ms=%.3f fast_median_ms=%.3f "
+                 "[mix-chroma-bench] w=%d h=%d threads=%d runs=%d legacy_median_ms=%.3f fast_median_ms=%.3f "
                  "ratio=%.4f legacy_min_ms=%.3f fast_min_ms=%.3f\n",
-                 w, h, runs, legacy_median, fast_median, fast_median / legacy_median,
+                 w, h, bench_threads, runs, legacy_median, fast_median, fast_median / legacy_median,
                  legacy_ms.front(), fast_ms.front());
 }
 

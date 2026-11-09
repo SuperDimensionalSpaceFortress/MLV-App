@@ -4910,7 +4910,11 @@ int dualisoMixChroma2x2KernelForTesting(int use_fast,
                                         int lut_white,
                                         double * kernel_ms)
 {
-    if (!inp || !out || w <= 0 || h <= 0)
+    /* The LUT builder indexes raw2ev[white]; keep the seam inside the range
+     * production metadata guarantees (adversary 5ef39f3a A1). */
+    if (!inp || !out || w <= 0 || h <= 0
+        || lut_black < 0 || lut_white <= lut_black
+        || (uint32_t)lut_white >= DUALISO_RAW2EV_LUT_COUNT)
     {
         return 0;
     }
