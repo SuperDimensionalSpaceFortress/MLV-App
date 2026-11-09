@@ -59,6 +59,9 @@ param(
 #               one-element array that pwsh 7 would unroll, an array of one, an empty array) fails closed, at the gate and in
 #               Invoke-QueuedJob; a lapse the renew tick sees is latched, so a fresher sidecar written later revives no renew
 #               and no admission.
+#   renew-hook write retry - QUIET-LEASE-RENEW-HOOK-WRITE-RETRY-1 r1 (cases liveness-renew-hook-write-retry, -gate): the renew-on-read hook's
+#               sidecar write (Write-SidecarRaw) retries a transient IOException on the rename (3 attempts, 50 ms apart, IOException only); a
+#               persistent one throws SIDECAR-WRITE-FAILED job=<id> attempts=<n> with the tmp file removed; any other exception type is not retried.
 #   exit release evidence - QUIET-LEASE-EXIT-RELEASE-EVIDENCE-AND-EVENT-OBSERVE-1 r1 (cases queuedjob-queue-expired-post-admission,
 #               queuedjob-holder-lost-prelaunch, exit-release-pin): the queue-expired exit after admission and the pre-launch
 #               holder-lost refusal release the lease and record that release (leaseRelease) before Exit-HeavySlot, and every
@@ -472,7 +475,7 @@ function Reset-Case([hashtable]$Control, [int]$GraceSec = 120) {
     $script:Log.Clear(); $script:Beats.Clear(); $script:Age = 0; $script:Exempt = 0
     $script:EvLog.Clear(); $script:VerdictPassedAt = @{}
     $script:QuietLease = $null; $script:QuietLeaseWaiting = $null; $script:Admission = $null
-    $script:LogHook = $null; $script:HookFired = $false; $script:BeatHook = $null; $script:SidecarReadHook = $null; $script:VerdictNowPin = $null
+    $script:LogHook = $null; $script:HookFired = $false; $script:BeatHook = $null; $script:SidecarReadHook = $null; $script:VerdictNowPin = $null; $script:SidecarMoveFault = $null
 }
 function Test-PidAlive([int]$ProcessId) { return $null -ne (Get-Process -Id $ProcessId -ErrorAction SilentlyContinue) }
 # AGENT-LEASE-QUIET-LEASE-SEAM-PID-CLEANUP-1 (adversary r2 pass 2 A1): a fixture child is identified by its CURRENT command line (it names the fixture dir),
@@ -1173,7 +1176,7 @@ try {
         'notafter-queuedjob-pregate', 'notafter-queuedjob-gate', 'notafter-queuedjob-post-admission', 'notafter-prelaunch-marker',
         'notafter-prelaunch-confirm', 'notafter-renew-in-light-job', 'notafter-meta-unreadable',
         'queuedjob-cancel-post-admission', 'notafter-renew-crosses-deadline', 'notafter-meta-sticky',
-        'liveness-dead-before-request', 'liveness-lapses-while-pending', 'liveness-lapses-at-active', 'liveness-renewed-across-exit75', 'liveness-renewed-across-stall', 'liveness-renewal-stops-lapses', 'liveness-renewed-post-renewal-pause', 'liveness-renewal-stops-lapses-post-pause', 'liveness-renew-stall-override-bound',
+        'liveness-dead-before-request', 'liveness-lapses-while-pending', 'liveness-lapses-at-active', 'liveness-renewed-across-exit75', 'liveness-renewed-across-stall', 'liveness-renewal-stops-lapses', 'liveness-renewed-post-renewal-pause', 'liveness-renewal-stops-lapses-post-pause', 'liveness-renew-stall-override-bound', 'liveness-renew-hook-write-retry', 'liveness-renew-hook-write-retry-gate',
         'liveness-absent-unchanged', 'liveness-unparseable-expired', 'liveness-pure', 'liveness-reader', 'liveness-ast-guard', 'liveness-queuedjob',
         'liveness-root-shape', 'liveness-lapse-latched',
         'queuedjob-queue-expired-post-admission', 'queuedjob-holder-lost-prelaunch', 'exit-release-pin',
@@ -1195,11 +1198,44 @@ try {
     function Get-RequestArg($Call, [string]$Flag) { $a = @($Call.argv); $i = [Array]::IndexOf($a, $Flag); if ($i -lt 0) { return $null }; return $a[$i + 1] }
     function Get-Released { return @(Get-Calls | Where-Object { $_.cmd -eq 'release' }) }
     # liveness r1: the runner's sidecar, written the way the runner (#633 r5) writes it: a tmp file, then one replacing rename.
+    # SidecarMoveFault (test seam, QUIET-LEASE-RENEW-HOOK-WRITE-RETRY-1): $null = off. Otherwise @{ skip; remaining; kind; moves; injected }: the first
+    # `skip` renames succeed, the next `remaining` throw (kind 'io' = IOException, the antivirus/indexer lock on the rename; 'denied' =
+    # UnauthorizedAccessException), `moves` counts every rename attempted and `injected` every fault thrown. No sleeps, no real AV.
+    function Invoke-SidecarMove([string]$Tmp, [string]$Dst) {
+        $f = $script:SidecarMoveFault
+        if ($null -ne $f) {
+            $f.moves++
+            if ($f.skip -gt 0) { $f.skip-- }
+            elseif ($f.remaining -gt 0) {
+                $f.remaining--; $f.injected++
+                if ($f.kind -ceq 'denied') { throw [UnauthorizedAccessException]::new('injected: access denied on the sidecar rename') }
+                throw [IO.IOException]::new('injected: the process cannot access the file because it is being used by another process')
+            }
+        }
+        [IO.File]::Move($Tmp, $Dst, $true)
+    }
     function Write-SidecarRaw([string]$JobId, [string]$Text) {
         $dst = Join-Path $notAfterDir "$JobId.json"
         $tmp = "$dst.$([guid]::NewGuid().ToString('N')).tmp"
         [IO.File]::WriteAllText($tmp, $Text, [Text.UTF8Encoding]::new($false))
-        [IO.File]::Move($tmp, $dst, $true)
+        # QUIET-LEASE-RENEW-HOOK-WRITE-RETRY-1: the renew-on-read hook writes through here inside the gate's own sidecar read, so one transient
+        # sharing violation on the rename (antivirus/indexer lock, the Windows shape) must not fail the case. A bounded retry for IOException
+        # ONLY: 3 attempts, 50 ms apart; any other exception type propagates at once, untouched. On the last failure the tmp file is
+        # removed and a typed failure names the job and the attempt count (so a persistent fault is never mistaken for a gate defect).
+        $maxAttempts = 3
+        for ($attempt = 1; $attempt -le $maxAttempts; $attempt++) {
+            try { Invoke-SidecarMove $tmp $dst; return }
+            catch {
+                $ex = $_.Exception
+                if ($ex -is [System.Management.Automation.MethodInvocationException] -and $null -ne $ex.InnerException) { $ex = $ex.InnerException }
+                if ($ex -isnot [IO.IOException]) { Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue; throw }
+                if ($attempt -ge $maxAttempts) {
+                    Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue
+                    throw [InvalidOperationException]::new("SIDECAR-WRITE-FAILED job=$JobId attempts=$attempt $($ex.GetType().Name): $($ex.Message)", $ex)
+                }
+                Start-Sleep -Milliseconds 50
+            }
+        }
     }
     function New-SidecarJson([string]$JobId, $AliveUntil, [hashtable]$Over = @{}, [int]$Seq = 1) {
         $o = [ordered]@{ schema = 'mlv-app/job-notafter-sidecar/v1'; jobId = $JobId; aliveUntilUtc = $AliveUntil; writtenUtc = [DateTime]::UtcNow.ToString('o'); seq = $Seq; writerPid = $PID; writerHost = 'unit-vm' }
@@ -1292,12 +1328,13 @@ try {
     }
     # The wait of liveness-renewed-across-exit75 and -across-stall: two exit-75 refusals, then the third request turns active, with the
     # sidecar renewed on every gate read throughout (a wait of more than 3x the 3 s window).
-    function Invoke-RenewedAcrossExit75([string]$Name, [string]$JobId, [double]$StallSec, [double]$PostRenewPauseSec = 0) {
+    function Invoke-RenewedAcrossExit75([string]$Name, [string]$JobId, [double]$StallSec, [double]$PostRenewPauseSec = 0, [hashtable]$MoveFault = $null) {
         Reset-Case @{ request = 'refuse_then_active'; refuse_count = 2; active_after = 8 }
         $script:LeaseNotAfterMinAdmitSec = 1
         $script:AgeAfter = (Get-Date).AddSeconds(40)
         $mL = New-NotAfterMeta 3600
         $st = Start-SidecarRenewOnRead $JobId ([int]::MaxValue) $StallSec $PostRenewPauseSec
+        $script:SidecarMoveFault = $MoveFault   # armed AFTER the first write, so it lands on a hook write
         $tR = Get-Date
         $adm = Wait-QuietLeaseAdmission -JobId $JobId -Job ([pscustomobject]@{}) -Metadata $mL
         $elapsed = ((Get-Date) - $tR).TotalSeconds
@@ -2391,6 +2428,55 @@ function Exit-HeavySlot {
     # meanwhile; the next read renews it first, so the job is still admitted. The stall itself is asserted to have run.
     if (Test-Case 'liveness-renewed-across-stall') {
         $results.livenessRenewedAcrossStall = Invoke-RenewedAcrossExit75 'liveness-renewed-across-stall' 'jLs' 4
+    }
+
+    # ------------------------------------------------------------ liveness-renew-hook-write-retry (QUIET-LEASE-RENEW-HOOK-WRITE-RETRY-1)
+    # #724 removed the runspace writer that caught Write-Sidecar errors, so the renew-on-read hook's write now runs inside the gate's own
+    # sidecar read. A transient IOException on the rename (antivirus/indexer lock) must not fail the read; only a persistent one may, and
+    # then with a typed failure naming the job and the attempt count. Never any other exception type retried.
+    if (Test-Case 'liveness-renew-hook-write-retry') {
+        $jid = 'jRw'
+        $leftover = { @(Get-ChildItem -LiteralPath $notAfterDir -Filter "$jid.json.*.tmp" -File -ErrorAction SilentlyContinue).Count }
+        # (a) ONE transient IOException on the hook's first rename: the gate's read still returns the renewed sidecar.
+        Reset-Case @{ request = 'active' }
+        $st = Start-SidecarRenewOnRead $jid 1 0
+        $script:SidecarMoveFault = @{ skip = 0; remaining = 1; kind = 'io'; moves = 0; injected = 0 }
+        $err = $null; $sc = $null
+        try { $sc = Read-JobNotAfterSidecar -JobId $jid } catch { $err = $_ }
+        $f = $script:SidecarMoveFault
+        Assert-True ($null -eq $err) "liveness-renew-hook-write-retry: one transient IOException on the hook's rename does not fail the gate's sidecar read: $($err.Exception.Message)"
+        Assert-True ($f.injected -eq 1 -and $f.moves -eq 2 -and $st.renews -eq 1 -and $st.seq -eq 2) "liveness-renew-hook-write-retry: the rename was retried once and the renewal landed: injected=$($f.injected) moves=$($f.moves) renews=$($st.renews) seq=$($st.seq)"
+        $scSeq = if ($null -ne $sc -and $sc.state -ceq 'present') { [long]($sc.text | ConvertFrom-Json).seq } else { -1 }
+        Assert-True ($scSeq -eq 2 -and (& $leftover) -eq 0) "liveness-renew-hook-write-retry: the read sees the renewed sidecar (seq=$scSeq) and no tmp file is left ($(& $leftover))"
+        # (b) the fault persists for every attempt: a typed failure naming the job and 3 attempts, the tmp removed, never an untyped IOException.
+        Reset-Case @{ request = 'active' }
+        $st = Start-SidecarRenewOnRead $jid 1 0
+        $script:SidecarMoveFault = @{ skip = 0; remaining = 99; kind = 'io'; moves = 0; injected = 0 }
+        $err = $null
+        try { $null = Read-JobNotAfterSidecar -JobId $jid } catch { $err = $_ }
+        $f = $script:SidecarMoveFault
+        Assert-True ($null -ne $err -and $err.Exception.Message -like "SIDECAR-WRITE-FAILED job=$jid attempts=3*") "liveness-renew-hook-write-retry: a persistent IOException surfaces as the typed failure naming job and attempts: [$($err.Exception.Message)]"
+        Assert-True ($f.moves -eq 3 -and $f.injected -eq 3 -and -not ($err.Exception -is [IO.IOException]) -and (& $leftover) -eq 0) "liveness-renew-hook-write-retry: exactly 3 attempts, the failure is not an IOException, the tmp is removed: moves=$($f.moves) injected=$($f.injected) type=$($err.Exception.GetType().Name) leftover=$(& $leftover)"
+        # (c) any other exception type is never retried: one attempt, the original exception.
+        Reset-Case @{ request = 'active' }
+        $st = Start-SidecarRenewOnRead $jid 1 0
+        $script:SidecarMoveFault = @{ skip = 0; remaining = 99; kind = 'denied'; moves = 0; injected = 0 }
+        $err = $null
+        try { $null = Read-JobNotAfterSidecar -JobId $jid } catch { $err = $_ }
+        $f = $script:SidecarMoveFault
+        $inner = if ($null -ne $err) { $err.Exception } else { $null }
+        while ($null -ne $inner -and $inner -isnot [UnauthorizedAccessException] -and $null -ne $inner.InnerException) { $inner = $inner.InnerException }
+        Assert-True ($f.moves -eq 1 -and $f.injected -eq 1 -and $inner -is [UnauthorizedAccessException] -and $err.Exception.Message -notlike 'SIDECAR-WRITE-FAILED*') "liveness-renew-hook-write-retry: a non-IOException is not retried (1 attempt) and keeps its own type: moves=$($f.moves) injected=$($f.injected) msg=[$($err.Exception.Message)]"
+        $script:SidecarMoveFault = $null
+        $results.livenessRenewHookWriteRetry = [ordered]@{ transientMoves = 2; persistentAttempts = 3; deniedAttempts = 1 }
+    }
+    # The same fault inside the real wait: the hook's first renewal write hits one transient IOException (skip 1 = the setup write succeeds),
+    # and the gate still admits on the latest renewal exactly as liveness-renewed-across-exit75 does.
+    if (Test-Case 'liveness-renew-hook-write-retry-gate') {
+        $fault = @{ skip = 1; remaining = 1; kind = 'io'; moves = 0; injected = 0 }
+        $results.livenessRenewHookWriteRetryGate = Invoke-RenewedAcrossExit75 'liveness-renew-hook-write-retry-gate' 'jRg' 0 0 $fault
+        Assert-True ($fault.injected -eq 1) "liveness-renew-hook-write-retry-gate: the one transient IOException was injected on a hook write: injected=$($fault.injected) moves=$($fault.moves)"
+        $script:SidecarMoveFault = $null
     }
 
     # ------------------------------------------------------------ liveness-renewal-stops-lapses: the negative case, renewal really stops
