@@ -371,10 +371,8 @@ class TemplateOrderingTests(unittest.TestCase):
             self.template,
         )
         self.assertIn("$appSwapTelemetry = Get-AttrCudaAppSwapTelemetry -LogText $rawLog", self.template)
-        # PRESENTMON-BACHELOR-CUDA-INTERNAL-GAP-1: the process-lifetime result is now $presentMonCaptureTemporal, and
-        # $presentMonTemporal is the app-swap-window result when that window exists (test_presentmon_playback_window_gap.py).
         self.assertIn(
-            "$presentMonCaptureTemporal = Get-AttrCudaTemporalCoverage -TimeInMsValues "
+            "$presentMonTemporal = Get-AttrCudaTemporalCoverage -TimeInMsValues "
             "@($pmIntervalRows | ForEach-Object { [double]$_.timeInMs }) -WindowStartMs "
             "$displayReport.windowStartMs -WindowEndMs $displayReport.windowEndMs -MaxGapMs "
             "$presentMonSufficiencyMaxGapMs",
@@ -416,7 +414,7 @@ class TemplateOrderingTests(unittest.TestCase):
         )
         pm_rows_built = self.template.index("$pmRows = @($displayReport.selectedChainRows)")
         coverage_computed = self.template.index("$presentMonCoverageFraction = if (")
-        temporal_computed = self.template.index("$presentMonTemporal = if ($presentMonTemporalWindowSource -ceq 'app_swap_window')")
+        temporal_computed = self.template.index("$presentMonTemporal = Get-AttrCudaTemporalCoverage")
         status_assigned = self.template.index("$presentMonStatus = if ($presentMonSufficient)")
         self.assertLess(pm_rows_built, coverage_computed)
         self.assertLess(coverage_computed, temporal_computed)
@@ -509,6 +507,13 @@ class EmbeddedFunctionCoverageTests(unittest.TestCase):
         hfr_list_end = text.index("\n))", hfr_list_start)
         cls.hfr_conform_names = re.findall(r"'([A-Za-z]+-[A-Za-z]+)'", text[hfr_list_start:hfr_list_end])
 
+        # PRESENTMON-BACHELOR-CUDA-INTERNAL-GAP-1: the temporal arm over the app's swap window is spliced by its own bracketed statement too, and the template CALLS it. Its -Name list is
+        # parsed out of the generator here and embedded from the working-tree module, like the two splices above.
+        pm_gap_marker = text.index("# PRESENTMON-BACHELOR-CUDA-INTERNAL-GAP-1: the temporal arm over the app's swap window", hfr_list_end)
+        pm_gap_list_start = text.index("-Name @(", pm_gap_marker)
+        pm_gap_list_end = text.index("\n))", pm_gap_list_start)
+        cls.pm_internal_gap_names = re.findall(r"'([A-Za-z]+-[A-Za-z]+)'", text[pm_gap_list_start:pm_gap_list_end])
+
         # The body ONLY -- unlike this file's other classes, which keep the "$template = @'"
         # prefix (harmless there, since they only ever substring-search it) -- because this class
         # feeds the text to PowerShell's own parser, and a bare unterminated "@'" opener with no
@@ -545,6 +550,8 @@ class EmbeddedFunctionCoverageTests(unittest.TestCase):
                 "$embeddedFunctions = $embeddedFunctions + \"`r`n`r`n\" + (Get-AttrCudaEmbeddedFunctionSource -Name $orphanSweepNames)\n"
                 "$hfrConformNames = @(" + ",".join(f"'{n}'" for n in self.hfr_conform_names) + ")\n"
                 "$embeddedFunctions = $embeddedFunctions + \"`r`n`r`n\" + (Get-AttrCudaEmbeddedFunctionSource -Name $hfrConformNames)\n"
+                "$pmInternalGapNames = @(" + ",".join(f"'{n}'" for n in self.pm_internal_gap_names) + ")\n"
+                "$embeddedFunctions = $embeddedFunctions + \"`r`n`r`n\" + (Get-AttrCudaEmbeddedFunctionSource -Name $pmInternalGapNames)\n"
                 "$definedNames =[System.Collections.Generic.HashSet[string]]::new()\n"
                 "$tokens = $null; $errors = $null\n"
                 "$embeddedAst = [System.Management.Automation.Language.Parser]::ParseInput("

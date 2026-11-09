@@ -151,11 +151,15 @@ class JobWiringTests(unittest.TestCase):
         cls.job = JOB.read_text(encoding="utf-8")
 
     def test_the_job_embeds_and_calls_the_playback_window_coverage(self) -> None:
-        self.assertIn("    'Get-AttrCudaPlaybackTemporalCoverage',\n", self.job)
+        # Its own bracketed splice (the dual-venue byte-identity strip removes the card's text with the region), not a name in the base -Name list.
+        self.assertIn("(Get-AttrCudaEmbeddedFunctionSource -Name @(\n    'Get-AttrCudaPlaybackTemporalCoverage'\n))", self.job)
+        self.assertIn("# PRESENTMON-BACHELOR-CUDA-INTERNAL-GAP-1 >>>", self.job)
         self.assertIn("$presentMonPlaybackTemporal = Get-AttrCudaPlaybackTemporalCoverage -TimeInMsValues @($displayReport.targetPositiveIntervalTimesMs) "
                       "-LogText $rawLog -EarliestAnchorUtc $presentMonCaptureStartUtc -LatestAnchorUtc $presentMonPostSpawnUtc "
                       "-LatestAnchorTrusted $presentMonTraceReadyVerified -MaxGapMs $presentMonSufficiencyMaxGapMs", self.job)
-        self.assertIn("$presentMonTemporal = if ($presentMonTemporalWindowSource -ceq 'app_swap_window') { $presentMonPlaybackTemporal } else { $presentMonCaptureTemporal }", self.job)
+        # The base process-lifetime line stays verbatim; the window result overrides it only when the window exists, inside the card's region.
+        self.assertIn("if ($presentMonTemporalWindowSource -ceq 'app_swap_window') { $presentMonTemporal = $presentMonPlaybackTemporal }", self.job)
+        self.assertIn("$presentMonCaptureTemporal = $presentMonTemporal\n", self.job)
 
     def test_the_job_publishes_the_window_source_and_the_whole_capture_gap(self) -> None:
         for field in ("presentMonTemporalWindowSource = $presentMonTemporalWindowSource",

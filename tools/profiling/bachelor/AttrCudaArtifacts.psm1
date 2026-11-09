@@ -4650,9 +4650,11 @@ function Get-AttrCudaPresentMonDisplayReport {
         selectedChain = $headlineBuild.selected
         selectedChainRows = $headlineBuild.selectedChainRows
         selectedPresentTimesMs = $headlineBuild.selectedPresentTimesMs
+        # PRESENTMON-BACHELOR-CUDA-INTERNAL-GAP-1 >>>
         # PRESENTMON-BACHELOR-CUDA-INTERNAL-GAP-1 (adversary r1 A3): every positive-interval row of the target pid, NOT windowed by either
         # bracket endpoint, so the playback-window temporal arm converts each endpoint from the same rows and never loses rows to the headline window.
         targetPositiveIntervalTimesMs = @($parsedRows | Where-Object { $_.processId -eq $targetPid -and $null -ne $_.msBetweenDisplayChange -and $_.msBetweenDisplayChange -gt 0 } | ForEach-Object { [double]$_.timeInMs })
+        # PRESENTMON-BACHELOR-CUDA-INTERNAL-GAP-1 <<<
         clockBracket = $clockBracket
         # PRESENTMON-HARNESS-ROBUSTNESS-2 r1b: the headline endpoint's own window bounds, on the
         # same anchor as selectedChainRows' timeInMs -- see the buildWindow comment above.
@@ -7168,7 +7170,7 @@ function Get-AttrCudaPlaybackTemporalCoverage {
     Get-AttrCudaTemporalCoverage over the app's own measured swap window, not the MLVApp process lifetime.
     .DESCRIPTION
     PRESENTMON-BACHELOR-CUDA-INTERNAL-GAP-1: the display report's window is result.json process.startedAtUtc..endedAtUtc, the whole
-    process lifetime. MLVApp presents nothing while it loads the clip, runs the Look Assist baseline analysis, and idles after Stop, so
+    process lifetime. MLVApp presents nothing while it loads its input, runs the Look Assist baseline analysis, and idles after Stop, so
     those seconds read as PresentMon gaps. On the r4 stalled Bachelor CUDA leg the 12.7 s "internal" gap was the Look Assist baseline
     (before playback_smoke.start), and the longest gap inside the swap window was 96.5 ms; PresentMon lost no events.
     This runs Get-AttrCudaTemporalCoverage (no second gap scan) over the last playback_smoke.gpu_window_swaps line's
