@@ -2630,6 +2630,30 @@ def test_no_scratch_removal_attempt_starts_after_the_deadline(tmp_path, monkeypa
     assert starts and max(starts) <= ob.ROUTE_SCRATCH_REMOVE_DEADLINE, starts
 
 
+def test_a_pause_that_overshoots_the_deadline_does_not_start_another_removal_attempt(tmp_path, monkeypatch):
+    import types
+    root = tmp_path / "scratch"
+    base = root / (ob.ROUTE_SCRATCH_PREFIX + "overshoot")
+    base.mkdir(parents=True)
+    clock = [0.0]
+    starts: list[float] = []
+
+    def attempt(path, *args, **kwargs):
+        starts.append(clock[0])
+        clock[0] += 14.8 if len(starts) == 1 else 0.0                    # the first attempt fails at 14.8: the 0.1 s pause fits the budget ...
+        raise PermissionError(13, "in use", str(path))
+
+    def sleep(seconds):                                                  # ... but the scheduler wakes the sleeper at 15.1
+        clock[0] += seconds + 0.2
+
+    monkeypatch.setattr(ob.shutil, "rmtree", attempt)
+    monkeypatch.setattr(ob, "time", types.SimpleNamespace(monotonic=lambda: clock[0], sleep=sleep))
+    with pytest.raises(ob.Unknown) as caught:
+        ob.remove_exercise_scratch(base, root)
+    assert caught.value.code == "EXERCISE_SCRATCH_NOT_REMOVED"
+    assert starts == [0.0], starts
+
+
 @pytest.mark.skipif(os.name != "nt", reason="the Job Object exit wait is Windows-only")
 @pytest.mark.parametrize("remaining", [1, None])                       # still active at the deadline / the job could not be queried
 def test_a_killed_tree_not_confirmed_exited_is_a_typed_outcome_after_the_direct_child_is_reaped(remaining):

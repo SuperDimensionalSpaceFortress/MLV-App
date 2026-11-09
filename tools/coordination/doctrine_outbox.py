@@ -3864,6 +3864,7 @@ def remove_exercise_scratch(base: pathlib.Path, scratch_root: pathlib.Path) -> N
             or base.is_symlink() or not base.is_dir()):
         return
     deadline = time.monotonic() + ROUTE_SCRATCH_REMOVE_DEADLINE
+    failure: OSError
     while True:
         try:
             if sys.version_info >= (3, 12):
@@ -3874,10 +3875,15 @@ def remove_exercise_scratch(base: pathlib.Path, scratch_root: pathlib.Path) -> N
         except OSError as e:                                            # a just-killed process still holds it (sharing violation 13/32)
             if isinstance(e, FileNotFoundError) and not os.path.lexists(base):
                 return                                                  # the scratch itself is gone; a missing CHILD is only a race, retried
-            if time.monotonic() + ROUTE_SCRATCH_REMOVE_PAUSE > deadline:    # no attempt starts after the deadline
-                raise Unknown("EXERCISE_SCRATCH_NOT_REMOVED",
-                              f"{base} could not be removed within {ROUTE_SCRATCH_REMOVE_DEADLINE:g}s and is left behind: {e}") from e
-            time.sleep(ROUTE_SCRATCH_REMOVE_PAUSE)
+            failure = e
+        # No attempt starts after the deadline: not when the pause would cross it, and not when the pause itself overran it.
+        if time.monotonic() + ROUTE_SCRATCH_REMOVE_PAUSE > deadline:
+            break
+        time.sleep(ROUTE_SCRATCH_REMOVE_PAUSE)
+        if time.monotonic() > deadline:
+            break
+    raise Unknown("EXERCISE_SCRATCH_NOT_REMOVED",
+                  f"{base} could not be removed within {ROUTE_SCRATCH_REMOVE_DEADLINE:g}s and is left behind: {failure}") from failure
 
 
 def make_exercise_scratch(bus: pathlib.Path, scratch_root: pathlib.Path) -> tuple[pathlib.Path, pathlib.Path, str]:
