@@ -12611,8 +12611,8 @@ void MainWindow::playbackHandling(int timeDiff)
     {
         m_newPosDropMode = ui->horizontalSliderPosition->value(); //track it also when playback is off
         m_playbackPaceGuard.reset();
-        cancelPlaybackDueWake();   // HFR-NATIVE-M16-1457-GUI-PRESENT-CADENCE-1: a wake is only due against this clock
         m_conformDropDebtFrames = 0.0;
+        cancelPlaybackDueWake();   // HFR-NATIVE-M16-1457-GUI-PRESENT-CADENCE-1: a wake is only due against this clock
     }
 }
 
@@ -32319,6 +32319,7 @@ void MainWindow::on_actionPlay_toggled(bool checked)
     else m_playbackPrepRgb8Pool.clear( m_playbackPresentationGeneration.load( std::memory_order_acquire ) );
     // PLAYBACK-CUDA-NATIVE-PACE-1: the pace clock re-arms at this Play's first engine tick.
     m_playbackPaceGuard.reset();
+    if( checked ) m_conformDropDebtFrames = 0.0;   // HFR-NATIVE-60FPS-FULLRES-1 r24: no held conform frame survives a Play start
     // HFR-NATIVE-M16-1457-GUI-PRESENT-CADENCE-1: a pending due wake belongs to the clock just reset; the counters are
     // per Play, and only the fallback timer raises the timer resolution, for the duration of Play.
     cancelPlaybackDueWake();
@@ -32331,7 +32332,6 @@ void MainWindow::on_actionPlay_toggled(bool checked)
     {
         m_playbackDueWake->endPlay();
     }
-    if( checked ) m_conformDropDebtFrames = 0.0;   // HFR-NATIVE-60FPS-FULLRES-1 r24: no held conform frame survives a Play start
     logInteractionEvent(
         QStringLiteral("play.toggled.begin"),
         QStringLiteral("checked=%1 file_loaded=%2 position=%3 cut_in=%4 cut_out=%5 frame_changed=%6 still_drawing=%7 pending_advance=%8")
