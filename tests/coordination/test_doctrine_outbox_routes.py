@@ -3085,6 +3085,88 @@ def test_the_job_exit_wait_never_returns_later_than_its_own_deadline(monkeypatch
     assert clock[0] <= 0.05 + 1e-9, (clock, sleeps)                      # the unconditional 0.02 s pause crossed the deadline
 
 
+# Adversary pass r3 (head 7d239aba): A1 the FIRST removal attempt is also bound by the deadline (the guard's own time counts); A2 the
+# scratch root replaced by an ORDINARY directory (or file) at the same path keeps the same real-path string, so identity, not the
+# string, decides: the root and the scratch are pinned by file identity, from creation when make_exercise_scratch made them.
+
+def test_a_first_guard_that_outlasts_the_deadline_starts_no_removal_attempt(tmp_path, monkeypatch):
+    import types
+    root = tmp_path / "scratch"
+    base = root / (ob.ROUTE_SCRATCH_PREFIX + "slowfirst")
+    base.mkdir(parents=True)
+    clock = [0.0]
+    attempts: list[str] = []
+    real_guard = ob._scratch_guard_holds
+
+    def slow_first_guard(b, r):                                          # the very first look takes 16 s, past the default 15 s deadline
+        clock[0] += 16.0
+        return real_guard(b, r)
+
+    monkeypatch.setattr(ob, "_scratch_guard_holds", slow_first_guard)
+    monkeypatch.setattr(ob.shutil, "rmtree", lambda path, *a, **k: attempts.append(str(path)))
+    monkeypatch.setattr(ob, "time", types.SimpleNamespace(monotonic=lambda: clock[0], sleep=lambda s: clock.__setitem__(0, clock[0] + s)))
+    with pytest.raises(ob.Unknown) as caught:
+        ob.remove_exercise_scratch(base, root)
+    assert caught.value.code == "EXERCISE_SCRATCH_NOT_REMOVED", caught.value
+    assert attempts == [], attempts
+
+
+@pytest.mark.parametrize("kind", ["populated-directory", "empty-directory", "file"])
+def test_a_scratch_root_replaced_by_an_ordinary_path_during_the_pause_is_never_removed_through_or_read_as_done(tmp_path, monkeypatch, kind):
+    import types
+    root = tmp_path / "scratch"
+    base = root / (ob.ROUTE_SCRATCH_PREFIX + "ordinary-swap")
+    base.mkdir(parents=True)
+    (base / "f.txt").write_text("original", encoding="utf-8")
+    monkeypatch.setattr(ob.shutil, "rmtree", FlakyScratchRemoval(shutil.rmtree, 1))
+    precious = root / base.name / "precious.txt"
+    swapped: list[str] = []
+    real_time = ob.time
+
+    def pause(seconds):
+        if not swapped:
+            os.rename(root, tmp_path / "scratch-saved")                  # same path string, another object
+            if kind == "file":
+                root.write_text("not a directory", encoding="utf-8")
+            else:
+                root.mkdir()
+                if kind == "populated-directory":
+                    (root / base.name).mkdir()
+                    precious.write_text("not ours", encoding="utf-8")
+            swapped.append(kind)
+
+    monkeypatch.setattr(ob, "time", types.SimpleNamespace(monotonic=real_time.monotonic, sleep=pause))
+    with pytest.raises(ob.Unknown) as caught:
+        ob.remove_exercise_scratch(base, root)
+    assert swapped and caught.value.code == "EXERCISE_SCRATCH_NOT_REMOVED", (swapped, caught.value)
+    assert (tmp_path / "scratch-saved" / base.name / "f.txt").exists(), "the original scratch is still behind, so it was not removed"
+    if kind == "populated-directory":
+        assert precious.exists(), "a directory that is not ours was removed through the replaced root"
+
+
+def test_a_scratch_root_replaced_while_the_scratch_was_being_prepared_is_never_removed_through(tmp_path, monkeypatch):
+    bus = make_bus(tmp_path)
+    root = tmp_path / "scratch"
+    seen: dict[str, Path] = {}
+
+    def hung_after_a_swap(git_bin, args, cwd, clone, timeout=None):
+        base = Path(cwd)
+        seen["base"] = base
+        os.rename(root, tmp_path / "scratch-saved")                      # the swap lands during the long preparation, before any removal
+        root.mkdir()
+        (root / base.name).mkdir()
+        seen["precious"] = root / base.name / "precious.txt"
+        seen["precious"].write_text("not ours", encoding="utf-8")
+        raise ob.Unknown("ROUTE_TIMEOUT", "git clone still running after 2s; its process tree was killed")
+
+    monkeypatch.setattr(ob, "run_isolated_git", hung_after_a_swap)
+    with pytest.raises(ob.Unknown) as caught:
+        ob.make_exercise_scratch(bus, root)
+    assert caught.value.code == "ROUTE_TIMEOUT", caught.value            # the failure that ended the preparation stays the outcome
+    assert seen["precious"].exists(), "the replacement root's scratch-named directory was removed"
+    assert (tmp_path / "scratch-saved" / seen["base"].name).exists()
+
+
 def stale_bus_pair(tmp_path: Path, name: str, behind: bool) -> Path:
     """A bus clone of its own upstream, `behind` commits behind it (after a fetch) or not."""
     root = tmp_path / name
