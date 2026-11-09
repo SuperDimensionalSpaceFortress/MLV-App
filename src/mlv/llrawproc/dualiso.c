@@ -4623,11 +4623,26 @@ static inline void build_alias_map(struct raw_info raw_info,
  * the serial full-plane memcpy before the legacy kernel is gone.
  * Read footprint per position (p, q): rows p-1..p+2, cols q-1..q+2, i.e. the
  * legacy union footprint rows 1..ymax+4, cols 1..xmax+4. */
+/* One position row, as a structure of arrays so the per-cell median pass in
+ * dualiso_cs2_cell_row runs as plain vectorizable loops. */
 typedef struct
 {
-    int hr, hb, vr, vb, eht, evt;
-    int g1, g2, g3, g4, g5, g6;
-} dualiso_cs2_pos_t;
+    int * hr;
+    int * hb;
+    int * vr;
+    int * vb;
+    int * eht;
+    int * evt;
+    int * g1;
+    int * g2;
+    int * g3;
+    int * g4;
+    int * g5;
+    int * g6;
+} dualiso_cs2_pos_row_t;
+
+#define DUALISO_CS2_POS_FIELDS 12
+#define DUALISO_CS2_CELL_FIELDS 6
 
 /* Test-only RED switch (dualisoSetMixChromaFastMutationForTesting): 1 breaks
  * the fast kernel on purpose (k1/k3 cross rows swapped and the V-blue sample
@@ -4641,18 +4656,47 @@ void dualisoSetMixChromaFastMutationForTesting(int mutation)
     g_dualiso_cs2_mutation_for_testing = mutation;
 }
 
+static inline void dualiso_cs2_bind_pos_row(int * base, int npos, dualiso_cs2_pos_row_t * row)
+{
+    const size_t n = (size_t)npos;
+    row->hr = base;
+    row->hb = base + n;
+    row->vr = base + 2 * n;
+    row->vb = base + 3 * n;
+    row->eht = base + 4 * n;
+    row->evt = base + 5 * n;
+    row->g1 = base + 6 * n;
+    row->g2 = base + 7 * n;
+    row->g3 = base + 8 * n;
+    row->g4 = base + 9 * n;
+    row->g5 = base + 10 * n;
+    row->g6 = base + 11 * n;
+}
+
 static inline void dualiso_cs2_fill_pos_row(const uint32_t * __restrict inp,
                                             int w,
                                             int p,
                                             int npos,
                                             const int * __restrict raw2ev,
                                             int mutation,
-                                            dualiso_cs2_pos_t * __restrict row)
+                                            const dualiso_cs2_pos_row_t * row)
 {
     const uint32_t * r_m1 = inp + (size_t)(p - 1) * (size_t)w;
     const uint32_t * r_0 = inp + (size_t)p * (size_t)w;
     const uint32_t * r_p1 = r_0 + w;
     const uint32_t * r_p2 = inp + (size_t)(p + 2) * (size_t)w;
+    int * __restrict o_hr = row->hr;
+    int * __restrict o_hb = row->hb;
+    int * __restrict o_vr = row->vr;
+    int * __restrict o_vb = row->vb;
+    int * __restrict o_eht = row->eht;
+    int * __restrict o_evt = row->evt;
+    int * __restrict o_g1 = row->g1;
+    int * __restrict o_g2 = row->g2;
+    int * __restrict o_g3 = row->g3;
+    int * __restrict o_g4 = row->g4;
+    int * __restrict o_g5 = row->g5;
+    int * __restrict o_g6 = row->g6;
     /* Positions are filled eagerly, including ones only a skipped (fully
      * clipped) cell would use, which the legacy loop never looks up. Clamp
      * the LUT index so such a sample can never read past raw2ev (adversary
@@ -4670,17 +4714,47 @@ static inline void dualiso_cs2_fill_pos_row(const uint32_t * __restrict inp,
         const int g5 = DUALISO_CS2_EV(r_p1[q + 2]);
         const int g4 = DUALISO_CS2_EV(r_m1[q]);
         const int g6 = DUALISO_CS2_EV(r_p2[q + 1]);
-        dualiso_cs2_pos_t * o = &row[j];
-        o->hr = rr - (g1 + g3) / 2;
-        o->hb = bb - (g2 + g5) / 2;
-        o->eht = ABS(g1 - g3) + ABS(g2 - g5);
-        o->vr = rr - (g2 + g4) / 2;
-        o->vb = mutation ? (g1 + g6) / 2 - bb : bb - (g1 + g6) / 2;
-        o->evt = ABS(g2 - g4) + ABS(g1 - g6);
-        o->g1 = g1; o->g2 = g2; o->g3 = g3;
-        o->g4 = g4; o->g5 = g5; o->g6 = g6;
+        o_hr[j] = rr - (g1 + g3) / 2;
+        o_hb[j] = bb - (g2 + g5) / 2;
+        o_eht[j] = ABS(g1 - g3) + ABS(g2 - g5);
+        o_vr[j] = rr - (g2 + g4) / 2;
+        o_vb[j] = mutation ? (g1 + g6) / 2 - bb : bb - (g1 + g6) / 2;
+        o_evt[j] = ABS(g2 - g4) + ABS(g1 - g6);
+        o_g1[j] = g1;
+        o_g2[j] = g2;
+        o_g3[j] = g3;
+        o_g4[j] = g4;
+        o_g5[j] = g5;
+        o_g6[j] = g6;
     }
     #undef DUALISO_CS2_EV
+}
+
+/* med5 over the cell's 5 cross positions in the legacy k order: k0 (y, x-2)
+ * = mid[i], k1 (y-2, x) = up[i+1], k2 (y, x) = mid[i+1], k3 (y+2, x) =
+ * dn[i+1], k4 (y, x+2) = mid[i+2]. Plain loop so it vectorizes. */
+static inline void dualiso_cs2_med5_pass(int ncx,
+                                         const int * __restrict up,
+                                         const int * __restrict mid,
+                                         const int * __restrict dn,
+                                         int * __restrict med)
+{
+    for (int i = 0; i < ncx; i++)
+    {
+        med[i] = chroma_smooth_med5(mid[i], up[i + 1], mid[i + 1], dn[i + 1], mid[i + 2]);
+    }
+}
+
+static inline void dualiso_cs2_sum5_pass(int ncx,
+                                         const int * __restrict up,
+                                         const int * __restrict mid,
+                                         const int * __restrict dn,
+                                         int * __restrict sum)
+{
+    for (int i = 0; i < ncx; i++)
+    {
+        sum[i] = mid[i] + up[i + 1] + mid[i + 1] + dn[i + 1] + mid[i + 2];
+    }
 }
 
 static inline void dualiso_cs2_cell_row(const uint32_t * __restrict inp,
@@ -4688,9 +4762,10 @@ static inline void dualiso_cs2_cell_row(const uint32_t * __restrict inp,
                                         int w,
                                         int y,
                                         int ncx,
-                                        const dualiso_cs2_pos_t * __restrict up,
-                                        const dualiso_cs2_pos_t * __restrict mid,
-                                        const dualiso_cs2_pos_t * __restrict dn,
+                                        const dualiso_cs2_pos_row_t * up,
+                                        const dualiso_cs2_pos_row_t * mid,
+                                        const dualiso_cs2_pos_row_t * dn,
+                                        int * __restrict cell,
                                         const int * __restrict ev2raw,
                                         int black,
                                         int white)
@@ -4705,10 +4780,32 @@ static inline void dualiso_cs2_cell_row(const uint32_t * __restrict inp,
     const uint32_t * row_y_p1 = row_y + w;
     uint32_t * out_y = out + (size_t)y * (size_t)w;
     uint32_t * out_y_p1 = out_y + w;
+    const size_t n = (size_t)ncx;
+    int * c_drh = cell;
+    int * c_dbh = cell + n;
+    int * c_drv = cell + 2 * n;
+    int * c_dbv = cell + 3 * n;
+    int * c_eh = cell + 4 * n;
+    int * c_ev = cell + 5 * n;
+
+    /* Cross medians and direction sums for every cell of the row (cells the
+     * store loop skips are computed too and simply not used). */
+    dualiso_cs2_med5_pass(ncx, up->hr, mid->hr, dn->hr, c_drh);
+    dualiso_cs2_med5_pass(ncx, up->hb, mid->hb, dn->hb, c_dbh);
+    dualiso_cs2_med5_pass(ncx, up->vr, mid->vr, dn->vr, c_drv);
+    dualiso_cs2_med5_pass(ncx, up->vb, mid->vb, dn->vb, c_dbv);
+    dualiso_cs2_sum5_pass(ncx, up->eht, mid->eht, dn->eht, c_eh);
+    dualiso_cs2_sum5_pass(ncx, up->evt, mid->evt, dn->evt, c_ev);
 
     /* K2: whole output rows y and y+1 start as the input. */
     memcpy(out_y, row_y, (size_t)2 * (size_t)w * sizeof(uint32_t));
 
+    const int * __restrict cg1 = mid->g1 + 1;
+    const int * __restrict cg2 = mid->g2 + 1;
+    const int * __restrict cg3 = mid->g3 + 1;
+    const int * __restrict cg4 = mid->g4 + 1;
+    const int * __restrict cg5 = mid->g5 + 1;
+    const int * __restrict cg6 = mid->g6 + 1;
     for (int i = 0; i < ncx; i++)
     {
         const int x = 4 + 2 * i;
@@ -4720,28 +4817,19 @@ static inline void dualiso_cs2_cell_row(const uint32_t * __restrict inp,
         {
             continue;
         }
-        /* Position j = (q - 2) / 2; the cell's centre q = x sits at j = i + 1.
-         * Legacy k order: k0 (y, x-2), k1 (y-2, x), k2 (y, x), k3 (y+2, x),
-         * k4 (y, x+2). */
-        const dualiso_cs2_pos_t * k0 = &mid[i];
-        const dualiso_cs2_pos_t * k1 = &up[i + 1];
-        const dualiso_cs2_pos_t * k2 = &mid[i + 1];
-        const dualiso_cs2_pos_t * k3 = &dn[i + 1];
-        const dualiso_cs2_pos_t * k4 = &mid[i + 2];
-
-        const int eh = k0->eht + k1->eht + k2->eht + k3->eht + k4->eht;
-        const int ev = k0->evt + k1->evt + k2->evt + k3->evt + k4->evt;
-        const int drh = chroma_smooth_med5(k0->hr, k1->hr, k2->hr, k3->hr, k4->hr);
-        const int dbh = chroma_smooth_med5(k0->hb, k1->hb, k2->hb, k3->hb, k4->hb);
-        const int drv = chroma_smooth_med5(k0->vr, k1->vr, k2->vr, k3->vr, k4->vr);
-        const int dbv = chroma_smooth_med5(k0->vb, k1->vb, k2->vb, k3->vb, k4->vb);
-
-        const int g1 = k2->g1;
-        const int g2 = k2->g2;
-        const int g3 = k2->g3;
-        const int g4 = k2->g4;
-        const int g5 = k2->g5;
-        const int g6 = k2->g6;
+        const int drh = c_drh[i];
+        const int dbh = c_dbh[i];
+        const int drv = c_drv[i];
+        const int dbv = c_dbv[i];
+        const int eh = c_eh[i];
+        const int ev = c_ev[i];
+        /* Centre g1..g6 are the k2 position's own gathers. */
+        const int g1 = cg1[i];
+        const int g2 = cg2[i];
+        const int g3 = cg3[i];
+        const int g4 = cg4[i];
+        const int g5 = cg5[i];
+        const int g6 = cg6[i];
         const int grv = (g2 + g4) / 2;
         const int grh = (g1 + g3) / 2;
         const int gbv = (g1 + g6) / 2;
@@ -4811,9 +4899,11 @@ static int dualiso_chroma_smooth_2x2_fast_u32(int w,
         max_threads = 1;
     }
 #endif
-    const size_t ring_count = (size_t)3 * (size_t)npos;
-    dualiso_cs2_pos_t * rings =
-        (dualiso_cs2_pos_t *)malloc(ring_count * (size_t)max_threads * sizeof(dualiso_cs2_pos_t));
+    /* Per thread: 3 position rows of DUALISO_CS2_POS_FIELDS arrays, plus
+     * DUALISO_CS2_CELL_FIELDS per-cell arrays for the row being stored. */
+    const size_t pos_row_ints = (size_t)DUALISO_CS2_POS_FIELDS * (size_t)npos;
+    const size_t thread_ints = (size_t)3 * pos_row_ints + (size_t)DUALISO_CS2_CELL_FIELDS * (size_t)ncx;
+    int * rings = (int *)malloc(thread_ints * (size_t)max_threads * sizeof(int));
     if (!rings)
     {
         return 0;
@@ -4847,20 +4937,25 @@ static int dualiso_chroma_smooth_2x2_fast_u32(int w,
         const int i1 = (int)(((long long)ncy * (tid + 1)) / nth);
         if (i0 < i1)
         {
-            dualiso_cs2_pos_t * ring = rings + ring_count * (size_t)tid;
-            dualiso_cs2_pos_t * slot[3] = { ring, ring + npos, ring + 2 * npos };
+            int * base = rings + thread_ints * (size_t)tid;
+            dualiso_cs2_pos_row_t slot[3];
+            dualiso_cs2_bind_pos_row(base, npos, &slot[0]);
+            dualiso_cs2_bind_pos_row(base + pos_row_ints, npos, &slot[1]);
+            dualiso_cs2_bind_pos_row(base + 2 * pos_row_ints, npos, &slot[2]);
+            int * cell = base + 3 * pos_row_ints;
             /* Position row pi sits at p = 2 + 2 * pi; cell row i (y = 4 + 2i)
-             * needs position rows i (y-2), i+1 (y) and i+2 (y+2). */
-            dualiso_cs2_fill_pos_row(inp, w, 2 + 2 * i0, npos, raw2ev, mutation, slot[i0 % 3]);
-            dualiso_cs2_fill_pos_row(inp, w, 2 + 2 * (i0 + 1), npos, raw2ev, mutation, slot[(i0 + 1) % 3]);
+             * needs position rows i (y-2), i+1 (y) and i+2 (y+2). Each band
+             * fills its own 2-row halo. */
+            dualiso_cs2_fill_pos_row(inp, w, 2 + 2 * i0, npos, raw2ev, mutation, &slot[i0 % 3]);
+            dualiso_cs2_fill_pos_row(inp, w, 2 + 2 * (i0 + 1), npos, raw2ev, mutation, &slot[(i0 + 1) % 3]);
             for (int i = i0; i < i1; i++)
             {
-                dualiso_cs2_fill_pos_row(inp, w, 2 + 2 * (i + 2), npos, raw2ev, mutation, slot[(i + 2) % 3]);
-                const dualiso_cs2_pos_t * up = slot[i % 3];
-                const dualiso_cs2_pos_t * dn = slot[(i + 2) % 3];
+                dualiso_cs2_fill_pos_row(inp, w, 2 + 2 * (i + 2), npos, raw2ev, mutation, &slot[(i + 2) % 3]);
+                const dualiso_cs2_pos_row_t * up = &slot[i % 3];
+                const dualiso_cs2_pos_row_t * dn = &slot[(i + 2) % 3];
                 dualiso_cs2_cell_row(inp, out, w, 4 + 2 * i, ncx,
-                                     mutation ? dn : up, slot[(i + 1) % 3], mutation ? up : dn,
-                                     ev2raw, black, white);
+                                     mutation ? dn : up, &slot[(i + 1) % 3], mutation ? up : dn,
+                                     cell, ev2raw, black, white);
             }
         }
     }

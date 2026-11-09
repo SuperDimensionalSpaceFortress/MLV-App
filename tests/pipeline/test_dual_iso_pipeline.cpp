@@ -7046,8 +7046,21 @@ TEST(DualIsoPipeline, MixChromaFastRouteFull20IsByteIdenticalToLegacyFixtureClip
         ASSERT_TRUE(fixture.openClipFile(repo_file_path(QString::fromLatin1(clip[0])), &error_message));
         ASSERT_TRUE(fixture.loadReceipt(QString::fromLatin1(clip[1]), &error_message));
         ASSERT_TRUE(fixture.applyReceipt(&error_message));
-        const struct raw_info raw = fixture.video()->RAWI.raw_info;
+        // Same geometry llrawproc hands diso_get_full20bit (llrawproc.c, the
+        // "diso_validity && dual_iso_mode" block): frame resolution, pitch in
+        // pixels, full active area.
+        struct raw_info raw = fixture.video()->RAWI.raw_info;
+        raw.width = fixture.width();
+        raw.height = fixture.height();
+        raw.pitch = raw.width;
+        raw.active_area.x1 = 0;
+        raw.active_area.y1 = 0;
+        raw.active_area.x2 = raw.width;
+        raw.active_area.y2 = raw.height;
         ASSERT_TRUE(raw.width > 0 && raw.height > 0);
+        std::fprintf(stderr, "[mix-chroma-full20] clip=%s w=%d h=%d black=%d white=%d cfa=0x%08x\n",
+                     clip[0], raw.width, raw.height, raw.black_level, raw.white_level,
+                     static_cast<unsigned int>(raw.cfa_pattern));
         int frames_checked = 0;
         for (uint64_t frame = 0; frame < 3; frame++)
         {
