@@ -378,6 +378,8 @@ HEADERS += MainWindow.h \
            ClipLifecycleBarrier.h \
            LookAssistAnalysisPump.h \
            CrashForensics.h \
+           PlaybackConformPolicy.h \
+           PlaybackSourceAdvanceTracker.h \
            AutomationSettings.h \
            HubHostPlaybackGuard.h \
            PlaybackFrameRange.h \
@@ -394,6 +396,7 @@ HEADERS += MainWindow.h \
            PlaybackRoutePrewarmPolicy.h \
            PlaybackRouteStagedSlotPolicy.h \
            PlaybackReconWarmRunPolicy.h \
+           ResizeStillDrawingWait.h \
            PlaybackReconWarmRun.h \
            PlaybackGpuClockKickPolicy.h \
            PlaybackAudioGate.h \
@@ -401,6 +404,7 @@ HEADERS += MainWindow.h \
            LogLineField.h \
            PlaybackWorkerJoin.h \
            PlaybackPrepInFlightGate.h \
+           PlaybackPrepOwnership.h \
            ClipOpenAbortPolicy.h \
            PlaybackPresentTrace.h \
            PlaybackSlotRelease.h \
@@ -523,6 +527,7 @@ HEADERS += MainWindow.h \
     ../../src/processing/interpolation/spline.h \
     ../../src/processing/interpolation/cosine_interpolation.h \
     HueVsDiagram.h \
+    ../../src/processing/ThreadExitCache.h \
     ../../src/processing/rbfilter/rbf_wrapper.h \
     ../../src/processing/rbfilter/rbf.h \
     ../../src/processing/rbfilter/RBFilterPlain.h \

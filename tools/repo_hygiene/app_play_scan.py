@@ -163,7 +163,7 @@ PINNED_STOP_STATEMENTS = {
         "ui->spinBoxCutIn->value(), ui->spinBoxCutOut->value(), totalFrames, fps, requestedSeconds, "
         "playback_frame_range::minPlayWindowSeconds( fps ), !f3CutRangeRepairDisabledByEnvironment(), "
         "enginePaceFps > 0.0 ? enginePaceFps : -1.0, automationPlayPaceMode() );",
-        "const double enginePaceFps = getFramerate();",
+        "const double enginePaceFps = haveClip ? getPlaybackFramerate() : 0.0;",
         "const double fps = playGateNativeFps();",
     ),
     # PLAYBACK-CLIP-LENGTH-HFR-10S-1 (owner amendment 2026-10-15): the settle / play-action requests and the smoke's clip-aware
@@ -186,8 +186,11 @@ PINNED_STOP_STATEMENTS = {
         "if( m_fpsOverride && !m_automationPacingIsolated ) return m_frameRate;",
     ),
     "MainWindow::programmaticPlayState": (
+        # MERGE-MASTER r11 (ADV-A1b): the observation is noted in the Play's pace history, and the stop decision judges
+        # the pace with it (playback_frame_range::playPaceProjectsPastBudget).
+        "m_playPaceHistory.note( m_sourceAdvance.consumed(), elapsedMs );",
         "return playback_frame_range::evaluatePlayStop( m_sourceAdvance.consumed(), m_playRequiredSourceFrames, "
-        "ui->actionPlay->isChecked(), elapsedMs, safetyMs, automationPlayPaceMode() );",
+        "ui->actionPlay->isChecked(), elapsedMs, safetyMs, automationPlayPaceMode(), m_playPaceHistory );",
     ),
     "MainWindow::programmaticPlayConsumed": (
         "return m_playRequiredSourceFrames > 0 && m_sourceAdvance.consumed() >= m_playRequiredSourceFrames;",
@@ -638,19 +641,27 @@ def _scan_stop_sites(blank: str, keep: str) -> list[str]:
 # m_playRequiredSourceFrames (what the admitted Play must consume) decide every stop and every receipt, so they may be
 # written only here, by enclosing function and kind: ``reset`` = ``m_sourceAdvance = SourceFrameAdvanceCounter();``,
 # ``begin`` = ``m_sourceAdvance.begin(``, ``tick`` = ``m_sourceAdvance.noteEngineTick(``, ``required`` =
-# ``m_playRequiredSourceFrames = verdict.requiredFrames;``. Reads (``.consumed()``, ``.startFrame``) are free.
+# ``m_playRequiredSourceFrames = verdict.requiredFrames;``. Reads (``.consumed()``, ``.startFrame``) are free. HFR-NATIVE-60FPS-FULLRES-1 r30 fix
+# iteration 2 (adversary A1 on aa598479): ``.armed`` and ``.highWater`` are read at ONE reviewed site only, PINNED_COUNTER_READS -- the conform line's
+# engine_target, ``m_sourceAdvance.armed ? m_sourceAdvance.highWater : -1 )``, a prvalue (int64_t vs int) nothing can write through. Any other use of
+# them (a parenthesised or shift-assigned write included) stays unreviewed.
 PINNED_COUNTER_WRITES = {
     "MainWindow::programmaticPlay": {"reset": 2, "begin": 1, "required": 2},   # the admitted Play + the adopted running Play
     "MainWindow::on_actionPlay_toggled": {"begin": 1},                          # the FIRST Play start arms the counter
     "MainWindow::playbackHandling": {"tick": 3},                                # the three engine position advances
 }
+# r31 (Dot M2 on aa598479, the class): ONE write-operator rule for every write check below -- `=` (not `==`), every compound assignment
+# including `<<=` / `>>=`, `++`, `--` -- and closing parentheses before the operator do not hide it (`(m_sourceAdvance.startFrame) <<= 1;`).
+_WRITE_OP = r"(?:\s*\))*\s*(?:(?:[-+*/%&|^]|<<|>>)?=(?!=)|\+\+|--)"
 _ADV_USE = re.compile(r"\bm_sourceAdvance\b")
-_ADV_READ = re.compile(r"\s*\.\s*(?:consumed\s*\(\s*\)|startFrame\b(?!\s*(?:=(?!=)|[-+*/%&|^]=|\+\+|--)))")
+_ADV_READ = re.compile(r"\s*\.\s*(?:consumed\s*\(\s*\)|startFrame\b(?!" + _WRITE_OP + r"))")
+PINNED_COUNTER_READS = {"MainWindow::finishPlaybackSmokeTelemetry": 1}   # the conform line's engine_target
+_ADV_PINNED_READ = re.compile(r"\bm_sourceAdvance\s*\.\s*armed\s*\?\s*m_sourceAdvance\s*\.\s*highWater\s*:\s*-\s*1\s*\)")
 _ADV_BEGIN = re.compile(r"\s*\.\s*begin\s*\(")
 _ADV_TICK = re.compile(r"\s*\.\s*noteEngineTick\s*\(")
 _ADV_RESET = re.compile(r"\s*=(?!=)\s*playback_frame_range::SourceFrameAdvanceCounter\s*\(\s*\)\s*;")
 _REQ_USE = re.compile(r"\bm_playRequiredSourceFrames\b")
-_REQ_WRITE_AFTER = re.compile(r"\s*(?:=(?!=)|[-+*/%&|^]=|\+\+|--)")
+_REQ_WRITE_AFTER = re.compile(_WRITE_OP)
 _REQ_ASSIGN_OK = re.compile(r"\s*=\s*verdict\.requiredFrames\s*;")
 _ESCAPE_BEFORE = re.compile(r"(?:(?<!&)&\s*(?:\w+\s*=\s*)?|\b(?:swap|exchange|move)\s*\(\s*|\+\+\s*|--\s*)$")
 
@@ -666,6 +677,15 @@ def _scan_counter_writes(blank: str, keep: str) -> list[str]:
         found.setdefault(function, {}).setdefault(kind, 0)
         found[function][kind] += 1
 
+    # r30 fix iteration 2: the uses inside the pinned read expression, at most PINNED_COUNTER_READS per function
+    reviewed_reads: set[int] = set()
+    reads_seen: dict[str, int] = {}
+    for read in _ADV_PINNED_READ.finditer(blank):
+        function = _enclosing(spans, read.start())
+        reads_seen[function] = reads_seen.get(function, 0) + 1
+        if reads_seen[function] <= PINNED_COUNTER_READS.get(function, 0):
+            reviewed_reads.update(use.start() for use in _ADV_USE.finditer(blank, read.start(), read.end()))
+
     for match in _ADV_USE.finditer(blank):
         function = _enclosing(spans, match.start())
         before = blank[max(0, match.start() - 12):match.start()]
@@ -674,6 +694,8 @@ def _scan_counter_writes(blank: str, keep: str) -> list[str]:
         if _ESCAPE_BEFORE.search(before):
             problems.append(f"platform/qt/MainWindow.cpp:{line}: m_sourceAdvance escapes by pointer / reference / swap / "
                             f"increment in {function}; the counter may only be read or written at the pinned sites")
+        elif match.start() in reviewed_reads:
+            continue
         elif _ADV_READ.match(after):
             continue
         elif _ADV_BEGIN.match(after):
@@ -720,7 +742,7 @@ PINNED_BUDGET_WRITES = {
     "m_playRequestedSeconds": (re.compile(r"\s*=\s*requestedSeconds\s*;"), {"MainWindow::programmaticPlay": 2}),
     "m_playPaceFps": (re.compile(r"\s*=\s*verdict\.paceFps\s*;"), {"MainWindow::programmaticPlay": 2}),
 }
-_SCALAR_WRITE_AFTER = re.compile(r"\s*(?:=(?!=)|[-+*/%&|^]=|<<=|>>=|\+\+|--)")
+_SCALAR_WRITE_AFTER = re.compile(_WRITE_OP)   # r31: the shared rule (a parenthesised budget write is a write too)
 
 
 def _scan_budget_writes(blank: str) -> list[str]:

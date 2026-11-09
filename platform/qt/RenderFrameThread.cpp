@@ -16,6 +16,8 @@
 #include "PlaybackQualityPolicy.h"
 #include "PlaybackSlotRelease.h"
 #include "ReconWorker.h"
+#include "ReconWorkerSplit.h"
+#include "ResizeStillDrawingWait.h"
 
 #include "../../src/batch/WorkerThreadCount.h"
 #include "../../src/debayer/debayer.h"
@@ -465,6 +467,16 @@ void insertLlrawprocReconTimingTelemetry( QJsonObject &target )
                    dualIsoFull20.mix_ev_lut_ms );
     target.insert( QStringLiteral("dual_iso_full20_mix_halfres_ms"),
                    dualIsoFull20.mix_halfres_ms );
+    /* CPU-S1-RECON-UNDER-LOOK-PACE-LEVER-1: the worker's mix_chroma split, carried to the
+     * presented frame as recon_worker_* (ReconWorkerSplit.h). */
+    target.insert( QStringLiteral("dual_iso_full20_mix_chroma_ms"),
+                   dualIsoFull20.mix_chroma_ms );
+    target.insert( QStringLiteral("dual_iso_full20_mix_chroma_copy_ms"),
+                   dualIsoFull20.mix_chroma_copy_ms );
+    target.insert( QStringLiteral("dual_iso_full20_mix_chroma_fullres_ms"),
+                   dualIsoFull20.mix_chroma_fullres_ms );
+    target.insert( QStringLiteral("dual_iso_full20_mix_chroma_halfres_ms"),
+                   dualIsoFull20.mix_chroma_halfres_ms );
     target.insert( QStringLiteral("dual_iso_full20_mix_alias_map_ms"),
                    dualIsoFull20.mix_alias_map_ms );
     target.insert( QStringLiteral("dual_iso_full20_mix_overexposed_ms"),
@@ -1251,6 +1263,7 @@ void RenderFrameThread::renderFrame(uint32_t frameNumber,
     request.requestQueuePushStageTime =
         detailedTimelineTelemetry ? mlv_stage_timing_now() : 0.0;
     m_renderRequests.push_back( request );
+    bumpBusyEpoch();
     m_renderFrame = true;
     m_waitCondition.wakeAll();
 }
@@ -1266,6 +1279,23 @@ bool RenderFrameThread::isFrameReady()
 bool RenderFrameThread::isIdle()
 {
     QMutexLocker locker(&m_mutex);
+    return isIdleLocked();
+}
+
+// GUI-SMOKE-FOREGROUND-HANG-NOLA-1 (adversary r3 pass 3 A1): the resize wait's sample. Never waits for m_mutex: held means
+// busy (resize_still_drawing_wait::probeIdleWithoutWaiting).
+// adversary r4 pass 2 A1: epochOut is written inside the critical section, so the epoch and the idle decision are one
+// observation (work starts bump the epoch under m_mutex).
+bool RenderFrameThread::isIdleNoWait( uint64_t *epochOut )
+{
+    return resize_still_drawing_wait::probeIdleWithoutWaiting( m_mutex, [&]() {
+        if( epochOut ) *epochOut = busyEpoch();
+        return isIdleLocked();
+    } );
+}
+
+bool RenderFrameThread::isIdleLocked( void ) const
+{
     return !(m_renderFrame || m_renderingFrame || phase3WorkInFlightLocked());
 }
 
@@ -1273,6 +1303,53 @@ bool RenderFrameThread::isIdleExceptPlaybackLookahead( int activePlaybackTarget,
                                                        uint64_t activeGeneration )
 {
     QMutexLocker locker(&m_mutex);
+    return isIdleExceptPlaybackLookaheadLocked( activePlaybackTarget, activeGeneration );
+}
+
+bool RenderFrameThread::isIdleExceptPlaybackLookaheadNoWait( int activePlaybackTarget,
+                                                             uint64_t activeGeneration,
+                                                             uint64_t *epochOut )
+{
+    return resize_still_drawing_wait::probeIdleWithoutWaiting( m_mutex, [&]() {
+        if( epochOut ) *epochOut = busyEpoch();
+        return isIdleExceptPlaybackLookaheadLocked( activePlaybackTarget, activeGeneration );
+    } );
+}
+
+uint64_t RenderFrameThread::busyEpoch( void ) const
+{
+    return m_busyEpoch.load( std::memory_order_acquire );
+}
+
+bool RenderFrameThread::runIfIdleNoWait( bool exceptPlaybackLookahead, int activePlaybackTarget,
+                                         uint64_t activeGeneration, uint64_t epoch,
+                                         const std::function<void()> &onIdleLocked )
+{
+    return resize_still_drawing_wait::probeIdleWithoutWaiting( m_mutex, [&]() {
+        const bool idle = exceptPlaybackLookahead
+            ? isIdleExceptPlaybackLookaheadLocked( activePlaybackTarget, activeGeneration )
+            : isIdleLocked();
+        if( !idle || busyEpoch() != epoch ) return false;
+        onIdleLocked();
+        return true;
+    } );
+}
+
+// The slot states isIdle() counts as in flight (phase3WorkInFlightLocked, isIdleExceptPlaybackLookaheadLocked).
+bool RenderFrameThread::slotStateIsBusy( SlotState state )
+{
+    return state == SlotState::Requested
+        || state == SlotState::Decoding
+        || state == SlotState::Decoded
+        || state == SlotState::ReconReady
+        || state == SlotState::Recon
+        || state == SlotState::ProcessReady
+        || state == SlotState::Processing;
+}
+
+bool RenderFrameThread::isIdleExceptPlaybackLookaheadLocked( int activePlaybackTarget,
+                                                             uint64_t activeGeneration ) const
+{
     const auto blocks = [&]( const ReadyFrame::PresentationContext &context,
                              uint32_t frameNumber ) -> bool
     {
@@ -1551,6 +1628,28 @@ bool RenderFrameThread::hasReadyPlaybackLookaheadFrame( uint32_t frameNumber,
             continue;
         if( slot.frameNumber == frameNumber
          && slot.presentationContext.playbackLookaheadRequest
+         && slot.presentationContext.presentationGeneration == activeGeneration )
+        {
+            return true;
+        }
+    }
+    return false;
+}
+
+// HFR-NATIVE-60FPS-FULLRES-1 r27 fix iteration 2 (adversary A1 on 9e88a583): isIdle() and isIdleExceptPlaybackLookahead()
+// omit Ready slots, so a frame published for the conform target but not yet acquired (the CPU path with lookahead 0 is a
+// non-lookahead slot) is still a present that is coming. No lookahead filter here. r28 (adversary A1 on c4efe7e3): "published"
+// is slot.ready alone, the predicate findLatestReadySlotLocked/findOldestReadySlotLocked acquire by -- with Phase3Mode::Disabled
+// publishRenderedSlot sets ready=true and leaves the state Idle, so a Ready-state check missed the published target.
+bool RenderFrameThread::hasReadyFrameForPlaybackTarget( uint32_t frameNumber,
+                                                        uint64_t activeGeneration )
+{
+    QMutexLocker locker(&m_mutex);
+    for( int i = 0; i < static_cast<int>( m_frameSlots.size() ); ++i )
+    {
+        const FrameSlot &slot = m_frameSlots[i];
+        if( !slot.ready ) continue;
+        if( slot.frameNumber == frameNumber
          && slot.presentationContext.presentationGeneration == activeGeneration )
         {
             return true;
@@ -2257,6 +2356,7 @@ bool RenderFrameThread::takeReconRequestForWorker( ReconQueueEntry *entry )
     {
         entry->warmRealRequestPending = realWorkPendingLocked();
         m_warmRunning = !entry->warmRealRequestPending;
+        if( m_warmRunning ) bumpBusyEpoch();
     }
     if( heldForRender ) m_overlapMeter.noteReconHeldForRender();
     m_overlapMeter.upstreamBegin( mlv_stage_timing_now() * 1000.0,
@@ -3078,6 +3178,7 @@ void RenderFrameThread::setupActiveRequestLocked( const RenderRequest &request, 
     m_activeRenderRequest = request;
     m_activeQueuedPlaybackDropCount = request.queuedPlaybackDropCount;
     m_renderingFrame = true;
+    bumpBusyEpoch();
     m_renderingSlotIndex = slotIndex;
 }
 
@@ -3511,6 +3612,7 @@ void RenderFrameThread::transitionSlotState( int slotIndex,
     {
         return;
     }
+    if( slotStateIsBusy( to ) ) bumpBusyEpoch();
 
     Phase3Breadcrumbs::push(
         static_cast<uint8_t>( slotIndex ),
@@ -3617,6 +3719,7 @@ void RenderFrameThread::runSerial(void)
         m_activeQueuedPlaybackDropCount = instrumentedRequest.queuedPlaybackDropCount;
         m_activeRenderRequest = instrumentedRequest;
         m_renderingFrame = true;
+        bumpBusyEpoch();
         m_renderingSlotIndex = slotIndex;
         instrumentedRequest.runSerialActiveAssignDoneStageTime =
             playbackSmokeTimelineTelemetryEnabled() ? mlv_stage_timing_now() : 0.0;
@@ -5059,8 +5162,12 @@ void RenderFrameThread::drawFrame( int slotIndex,
      * thread-local and stale otherwise. */
     bool renderThreadProcessed8StageRan = false;
     bool renderThreadProcessed16StageRan = false;
+    /* CPU-S1-RECON-UNDER-LOOK-PACE-LEVER-1 (Part A, r1 adversary pass 2 A1): set only where this
+     * render actually consumed the worker's reconstruction; a refused reuse leaves it false. */
+    bool renderConsumedWorkerRecon = false;
     if( skipCpuDebayerForGpuTextureNoReadback )
     {
+        renderConsumedWorkerRecon = decodedRawFrameAlreadyReconned;
         slot.usedGpuAmazeDebayer = true;
         slot.gpuAmazeFallbackReason.clear();
         slot.gpuAmazeRendererDescription =
@@ -5420,6 +5527,8 @@ void RenderFrameThread::drawFrame( int slotIndex,
         }
         const bool consumedPhase3Recon =
             phase3ReconReuseOutcome == Debayered16ReconRefusal::None;
+        renderConsumedWorkerRecon =
+            consumedPhase3Recon && decodedRawFrame != nullptr && decodedRawFrameAlreadyReconned;
         /* CPU-DEBAYERED16-HONOUR-SCALE-1: only a reduced debayer that actually ran
          * changes the frame's dims (the gpuReducedReconSlot precedent above); the
          * prep worker sees them through slot.renderedImageWidth/Height. */
@@ -5633,9 +5742,11 @@ void RenderFrameThread::drawFrame( int slotIndex,
         slot.stageTimingTelemetry.insert(
             QStringLiteral("phase3_decoded_raw_consumed"),
             decodedRawFrame && !decodedRawFrameAlreadyReconned && renderedFromPhase3Raw );
+        renderConsumedWorkerRecon =
+            decodedRawFrame && decodedRawFrameAlreadyReconned && renderedFromPhase3Raw;
         slot.stageTimingTelemetry.insert(
             QStringLiteral("phase3_reconned_raw_consumed"),
-            decodedRawFrame && decodedRawFrameAlreadyReconned && renderedFromPhase3Raw );
+            renderConsumedWorkerRecon );
         slot.stageTimingTelemetry.insert(
             QStringLiteral("cpu_dualiso_reduced_recon_consumed"),
             renderedFromReducedRecon );
@@ -7124,8 +7235,9 @@ void RenderFrameThread::drawFrame( int slotIndex,
                                       getMlvLastProcessed8TotalMilliseconds() );
     slot.stageTimingTelemetry.insert( QStringLiteral("processed8_cache_store_ms"),
                                       getMlvLastProcessed8CacheStoreMilliseconds() );
+    // PROCESSED8-DIRECT-PATH-TELEMETRY-STALE-1 (sibling of PROCESSED8-MS-TELEMETRY-STUCK-1): only a draw that ran the processed-8 stage reports its direct-path flag.
     slot.stageTimingTelemetry.insert( QStringLiteral("processed8_direct_path_active"),
-                                      getMlvLastProcessed8DirectPathActive() != 0 );
+                                      renderThreadProcessed8StageRan && getMlvLastProcessed8DirectPathActive() != 0 );
     slot.stageTimingTelemetry.insert( QStringLiteral("processed8_direct_path_reason"),
                                       QString::fromLatin1(
                                           processingGetDirect8IncompatibilityReason(
@@ -7186,6 +7298,17 @@ void RenderFrameThread::drawFrame( int slotIndex,
         restoreGpuPlaybackReconTimingTelemetry(
             slot.stageTimingTelemetry,
             preservedGpuPlaybackReconTextureTelemetry );
+    }
+    /* CPU-S1-RECON-UNDER-LOOK-PACE-LEVER-1 (Part A): a render that consumed the phase-3 recon
+     * wrote its own (zero) llrawproc_* / dual_iso_full20_* values over the worker's above; the
+     * worker's, captured before resetMetadata, are kept under recon_worker_ (no writer here
+     * touches that prefix). The render thread's own keys are left as they are. Gated on the
+     * render CONSUMING it: a refused reuse (e.g. MLVAPP_DISABLE_DEBAYERED16_RECON_REUSE=1) leaves
+     * decodedRawFrameAlreadyReconned true but renders its own recon (r1 adversary pass 2 A1). */
+    if( renderConsumedWorkerRecon )
+    {
+        recon_worker_split::copyWorkerSplit( preservedGpuPlaybackReconTextureTelemetry,
+                                             slot.stageTimingTelemetry );
     }
 
     slot.processedFrame8Active =

@@ -1991,6 +1991,16 @@
       ]
     },
     {
+      "path": "tests/console/test_playback_source_advance_tracker.cpp",
+      "anchor": "ASSERT_EQ ( 0.0 , t . spanSeconds ( ) ) ;",
+      "class": "not_run_proof_structural",
+      "clock": "other",
+      "justification": "PLAYBACK-HFR-CONFORM-DEFAULT-1 (re-land of #188): synthetic-input verification of PlaybackSourceAdvanceTracker: with fewer than two presented frames the measured span is defined to be 0 (no rate reported). The input is hand-built; nothing is inferred from a real run's timer.",
+      "lines": [
+        79
+      ]
+    },
+    {
       "path": "tests/console/test_playback_swap_interval.cpp",
       "anchor": "ASSERT_NEAR ( 0.0 , summary . swapCallAvgMs , 1 e - 9 ) ;",
       "class": "not_run_proof_structural",
@@ -2342,6 +2352,16 @@
       "justification": "PLAYBACK-STARTUP-WAIT-PREWARM-1 r2 StartEngine::sync: the video timeline position used for the printed offsets, with the same clamp as handoverContentMs; a value for the log line, never a run-proof.",
       "lines": [
         236
+      ]
+    },
+    {
+      "path": "platform/qt/PlaybackAudioStartPolicy.h",
+      "anchor": "&& lastAppliedSec > 0.0",
+      "class": "value_fallback_select",
+      "clock": "qpc_stage_clock",
+      "justification": "HFR-NATIVE-60FPS-FULLRES-1-MERGE-MASTER r6 isDuplicateSync: lastAppliedSec is the mlv_stage_timing_now() TIMESTAMP of the last applied audio sync, not a duration; 0.0 is the forgotten/never sentinel (forgetAppliedPlaybackAudioSync), filtered so a forgotten memo is never a duplicate. Moved verbatim from MainWindow.cpp's inline m_lastPlaybackAudioSyncTime > 0.0 (a name the scanner did not match); which syncs ran is m_playbackAudioSyncAppliedCount / SkippedCount, never this read.",
+      "lines": [
+        298
       ]
     },
     {
@@ -2993,6 +3013,118 @@
       "justification": "HFR-NATIVE-M16-1457-GUI-PRESENT-CADENCE-1 r8 (adversary pass 17 A2): a source-text pin (QString::indexOf over PlaybackDueWake.cpp) that the retry loop stops when the computed wait is 0; the duration token is inside a string literal. Nothing is timed or proven to have run.",
       "lines": [
         1637
+      ]
+    },
+    {
+      "path": "tests/console/test_playback_frame_range.cpp",
+      "anchor": "for ( int t = 1 ; t < 100000 && r . reachedMs < 0.0 ; ++ t )",
+      "class": "value_fallback_select",
+      "clock": "other",
+      "justification": "HFR-NATIVE-60FPS-FULLRES-1 r24 unit fixture playConformed() (adversary A1 on 9b900412): reachedMs is not a timer read. It is a SIMULATED tick clock value -- nowMs is the fixture's own running sum of hand-chosen tickMs (8 ms, or lateMs on every lateEvery-th tick), so no QPC/omp/steady_clock is read anywhere in the loop -- and -1.0 is the 'frame 1498 not reached yet' sentinel it starts at. `reachedMs < 0.0` only keeps the simulation looping until the sentinel is replaced (bounded by t < 100000); every tick adds at least 8 ms, so a recorded reach is >= 8 and the sentinel is the only non-positive value. A sentinel/loop-exit select on synthetic input, never a stage run-proof. HFR-NATIVE-60FPS-FULLRES-1 r27 added a SECOND identical loop header, in the renderer-modelled fixture playConformedTicksWithRenderer() (adversary A1 on be20bc59), so the anchor now occurs twice (r28 recount, hosted Tests 42428105872 shard failures at test_duration_as_proof_inventory.py:108/:120). The second copy is the same shape: nowMs is again the fixture's own running sum of hand-chosen tickMs (tickAt(t), at least 8 ms a tick), no timer is read, and reachedMs < 0.0 only keeps the simulation looping until the 'position 1498 reached' sentinel -1.0 is replaced (bounded by t < 100000). Both copies are the same sentinel/loop-exit select on synthetic input.",
+      "lines": [
+        3270,
+        3414
+      ]
+    },
+    {
+      "path": "tests/console/test_playback_frame_range.cpp",
+      "anchor": "if ( presentLatencyMs <= 0.0 ) present ( target ) ;",
+      "class": "value_fallback_select",
+      "clock": "other",
+      "justification": "HFR-NATIVE-60FPS-FULLRES-1 r27 unit fixture playConformedTicksWithRenderer() (adversary A1 on be20bc59), classified in r28 (hosted Tests 42428105872). presentLatencyMs is not a timer read or a measured duration: it is a hand-chosen INPUT of the simulated renderer (0, 9, 10, 16, 20, 25 or 60 ms in the tests), the delay after which the modelled renderer presents a new target. `presentLatencyMs <= 0.0` selects the zero-latency model, where a new target is presented on the very tick that set it; any positive latency is presented later by the per-tick check above it. A mode select on a synthetic parameter, never evidence that a stage ran.",
+      "lines": [
+        3444
+      ]
+    },
+    {
+      "path": "tests/console/test_playback_frame_range.cpp",
+      "anchor": "ASSERT_TRUE ( held . reachedMs > 0.0 ) ;",
+      "class": "run_proof",
+      "clock": "other",
+      "flag": "held.consumedAt64998 >= int64_t(1499) (SourceFrameAdvanceCounter::consumed() = forwardSteps + 1, asserted two lines below: 1499 consumed means the playhead advanced past frame 1498, so the reach is proved by a counter)",
+      "justification": "HFR-NATIVE-60FPS-FULLRES-1 r24 test R24A1HeldCatchupIsRepaidSoTheConformedSourcePaceStaysInTheBand: asserts the conformed simulation reached frame 1498, i.e. playConformed() replaced its -1.0 'not reached' sentinel. reachedMs is a SIMULATED tick clock in a unit fixture (the sum of the fixture's own tickMs values, at least 8 ms per tick), not a wall clock or any timer read, so the sub-resolution 'ran but read 0 ms' flake this inventory exists for cannot occur. The reach is also proved independently by the source-frame counter assert named in 'flag'; this compare is kept because the following line bounds the same value (reachedMs <= 62500.0) and a -1.0 sentinel would pass that bound alone.",
+      "lines": [
+        3303
+      ]
+    },
+    {
+      "path": "platform/qt/GuiPresentGapIdle.h",
+      "anchor": "if ( ! ( inclusiveMs > 0.0 ) || ! std :: isfinite ( inclusiveMs ) ) inclusiveMs = 0.0 ;",
+      "class": "value_fallback_select",
+      "clock": "other",
+      "justification": "CPU-S1-RECON-UNDER-LOOK-PACE-LEVER-1 Part B: OtherBusySpans::end clamps a GUI handler span's inclusive time (wall less idle, runner sleep and paint inside it, from the QElapsedTimer gap clock) to 0 when the subtraction goes negative. A data-validity clamp on an already-measured value before it is recorded; whether the handler ran is the span's begin/end pair, never this value. r3 (adversary A1 on f9f92e09): written !(x > 0.0) || !isfinite(x) (and A4 on e7e5271e) so a NaN or infinite paint reading or budget clamps to 0 as well; still a data-validity clamp, not a proof that any stage ran.",
+      "lines": [
+        138
+      ]
+    },
+    {
+      "path": "platform/qt/GuiPresentGapIdle.h",
+      "anchor": "if ( ! ( exclusiveMs > 0.0 ) || ! std :: isfinite ( exclusiveMs ) ) exclusiveMs = 0.0 ;",
+      "class": "value_fallback_select",
+      "clock": "other",
+      "justification": "CPU-S1-RECON-UNDER-LOOK-PACE-LEVER-1 Part B: the same clamp for the span's exclusive time (inclusive less its nested spans) before it is added to the per-gap sum. A data-validity clamp, not a proof that any stage ran. r3 (adversary A1 on f9f92e09): written !(x > 0.0) || !isfinite(x) (and A4 on e7e5271e) so a NaN or infinite paint reading or budget clamps to 0 as well; still a data-validity clamp, not a proof that any stage ran.",
+      "lines": [
+        141
+      ]
+    },
+    {
+      "path": "tests/console/test_playback_smoke_gui_present_attribution_wiring.cpp",
+      "anchor": "ASSERT_NEAR ( 0.0 , target . value ( QStringLiteral ( \"llrawproc_total_ms\" ) ) . toDouble ( ) , 1 e - 9 ) ;",
+      "class": "not_run_proof_structural",
+      "clock": "other",
+      "justification": "Pure-function unit test of recon_worker_split::copyWorkerSplit on a synthetic, test-constructed QJsonObject (no live clock): asserts the copy left the target's own unprefixed key at the 0.0 the test put there, i.e. the copy never rewrites the render thread's keys. Not a proof that any stage ran.",
+      "lines": [
+        466
+      ]
+    },
+    {
+      "path": "tests/console/test_playback_smoke_gui_present_attribution_wiring.cpp",
+      "anchor": "ASSERT_NEAR ( 0.0 , target . value ( QStringLiteral ( \"dual_iso_full20_total_ms\" ) ) . toDouble ( ) , 1 e - 9 ) ;",
+      "class": "not_run_proof_structural",
+      "clock": "other",
+      "justification": "Same synthetic-input copyWorkerSplit check as the llrawproc_total_ms row above, for the full20 total key.",
+      "lines": [
+        467
+      ]
+    },
+    {
+      "path": "tests/console/test_playback_smoke_gui_present_attribution_wiring.cpp",
+      "anchor": "ASSERT_NEAR ( 0.0 , spans . gapMs [ i ] , 1 e - 9 ) ;",
+      "class": "not_run_proof_structural",
+      "clock": "other",
+      "justification": "CPU-S1-PACE-NEXT-LEVER-1 (#770 r3 advisory A1): pure-function unit test of gui_present_gap::OtherBusySpans on synthetic SpanClock values (no live clock): after end() is called with OtherBusySpan::Count and Count+1, every per-gap slot is still the 0.0 openGap() put there, i.e. an out-of-range span wrote nothing. Not a proof that any stage ran.",
+      "lines": [
+        689
+      ]
+    },
+    {
+      "path": "tests/console/test_playback_smoke_gui_present_attribution_wiring.cpp",
+      "anchor": "ASSERT_NEAR ( 0.0 , spans . sumMs [ i ] , 1 e - 9 ) ;",
+      "class": "not_run_proof_structural",
+      "clock": "other",
+      "justification": "Same synthetic OtherBusySpans check as the gapMs row above, for the session sums: gapMs[kCount] aliased sumMs[0] before the guard, so a 0.0 here is the proof the out-of-range end() wrote past nothing. Not a proof that any stage ran.",
+      "lines": [
+        690
+      ]
+    },
+    {
+      "path": "platform/qt/GuiPresentGapIdle.h",
+      "anchor": "if ( ! ( otherBusyMs > 0.0 ) || ! std :: isfinite ( otherBusyMs ) ) otherBusyMs = 0.0 ;",
+      "class": "value_fallback_select",
+      "clock": "other",
+      "justification": "CPU-S1-PACE-NEXT-LEVER-1 (adversary A1 on 9bfdf8e0): OtherBusySpans::closeGap clamps a negative other-busy budget (an already-measured value from the gap clock) to 0 before it scales the named spans, so a negative budget can never subtract from a session sum. A data-validity clamp, not a proof that any stage ran. r3 (adversary A1 on f9f92e09): written !(x > 0.0) || !isfinite(x) (and A4 on e7e5271e) so a NaN or infinite paint reading or budget clamps to 0 as well; still a data-validity clamp, not a proof that any stage ran.",
+      "lines": [
+        159
+      ]
+    },
+    {
+      "path": "tests/console/test_playback_smoke_gui_present_attribution_wiring.cpp",
+      "anchor": "ASSERT_TRUE ( spans . unattributedSumMs >= 0.0 ) ;",
+      "class": "not_run_proof_structural",
+      "clock": "other",
+      "justification": "CPU-S1-PACE-NEXT-LEVER-1 (adversary A1 on 9bfdf8e0): pure-function unit test of OtherBusySpans::closeGap with a synthetic negative budget (no live clock): the unattributed session sum stays non-negative. Not a proof that any stage ran.",
+      "lines": [
+        708
       ]
     }
   ]

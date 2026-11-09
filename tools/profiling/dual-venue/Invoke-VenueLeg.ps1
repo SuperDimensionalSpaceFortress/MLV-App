@@ -494,6 +494,8 @@ try {
         if ($spec.generatorArgs.PSObject.Properties['qualityMode']) { $gen['QualityMode'] = [string]$spec.generatorArgs.qualityMode }
         # PLAYBACK-VSYNC-DEFAULT-1: the vsync A/B arm, any leg type (the app reads MLVAPP_SWAP_INTERVAL).
         if ($spec.generatorArgs.PSObject.Properties['swapInterval']) { $gen['SwapInterval'] = [int]$spec.generatorArgs.swapInterval }
+        # HFR-NATIVE-60FPS-FULLRES-1: the conform arm, any leg type (the app reads MLVAPP_PLAYBACK_CONFORM).
+        if ($spec.generatorArgs.PSObject.Properties['playbackConform']) { $gen['PlaybackConform'] = [string]$spec.generatorArgs.playbackConform }
         # PLAYBACK-LJ92-DECODE-THROUGHPUT-1: the raw-uint16 prefetch decoder count, for any leg (not only a forced-look pace leg).
         if ($spec.generatorArgs.PSObject.Properties['rawPrefetchDecoders']) { $gen['RawPrefetchDecoders'] = [int]$spec.generatorArgs.rawPrefetchDecoders }
         # BACHELOR-CORE-PARTITION-AB-1: the core-partition A/B (bench affinity, the MLV-owned E-core load, the telemetry helper), for any leg; the generator refuses a bad combination, typed.
@@ -753,7 +755,8 @@ if ($null -ne $summary) { $receipt.metrics = Get-DvVerbatimMetrics -Summary $sum
 # itself) and cross-checked against the job's own block.
 $playback = $null
 if ($null -ne $summary -or $null -ne $runLogText) {
-    $playback = Get-DvPlaybackEvidence -Summary $summary -EvidenceManifest $manifest -ResultJson $resultJson -LogText $runLogText -LogSha256 $runLogSha -ExpectedClipId ([string]$spec.clipId)
+    $playback = Get-DvPlaybackEvidence -Summary $summary -EvidenceManifest $manifest -ResultJson $resultJson -LogText $runLogText -LogSha256 $runLogSha -ExpectedClipId ([string]$spec.clipId) `
+        -RequestedConform ([string](Get-DvProp (Get-DvProp $spec 'generatorArgs') 'playbackConform'))
     $receipt.playback = $playback
 }
 # The scale the app RENDERED at, from its own run log (never from the spec): the receipt carries both numbers and the leg cannot PASS under a scale it did not render at.
@@ -940,7 +943,8 @@ if ($visualRequest.applies -and $visualRequest.requested -and $artifactsShare -a
 $outcome = $resolved.outcome; $detail = $resolved.detail
 if ($outcome -eq 'CAPTURED') {
     $criteria = $spec.criteria.$role.$Backend
-    $verdictCriteria = Test-DvCriteria -Criteria $criteria -Metrics $receipt.metrics
+    # r19 (sol r18 B2): the criteria also see the run log's measured conform fields (Get-DvCriteriaMetrics); receipt.metrics stays verbatim
+    $verdictCriteria = Test-DvCriteria -Criteria $criteria -Metrics (Get-DvCriteriaMetrics -Metrics $receipt.metrics -Playback $receipt.playback)
     $sheetMissing = $isLook -and ($null -eq $receipt.look -or $null -eq $receipt.look.contactSheet)
     # (a capture that published NO run log has no proof at all -- no rendered scale to read, no source frames -- and ends INVALID below, not here)
     if (-not $scale.honoured -and $null -ne $runLogText) {
@@ -960,6 +964,15 @@ if ($outcome -eq 'CAPTURED') {
 if ($outcome -in @('PASS', 'FAIL') -and $display.blocks) {
     $detail = "INVALID: the job result was $outcome ($detail) but DISPLAY_MODE_NOT_HONOURED: $($display.reason). A run that did not use the display mode the leg names is no measurement under it"
     $outcome = 'INVALID'
+}
+# HFR-NATIVE-60FPS-FULLRES-1, FAIL CLOSED: a leg that names a conform arm (generatorArgs.playbackConform) and whose run log does not prove the app played under it is no
+# measurement under that arm: a typed INVALID, never a PASS or FAIL. The requested and observed values go in the detail. (A leg that names no arm is unchanged.)
+if ($outcome -in @('PASS', 'FAIL')) {
+    $conformArm = Get-DvConformArmVerdict -Spec $spec -Playback $playback
+    if ($conformArm.blocks) {
+        $detail = "INVALID: the job result was $outcome ($detail) but CONFORM_ARM_NOT_HONOURED: $($conformArm.reason). A run that did not play under the conform arm the leg names is no measurement under it"
+        $outcome = 'INVALID'
+    }
 }
 # CUDA-HEADROOM-1, FAIL CLOSED: an unpaced leg whose run log does not show the app lifting its pace guard (pace_unpaced active=1 drop_frame=0 for the measured session)
 # ran at the clip's own pace, so its fps is the pace wall, not throughput: a typed INVALID, never a PASS or FAIL. A leg that does not ask for it is unchanged.
@@ -990,6 +1003,20 @@ if ($outcome -in @('PASS', 'FAIL') -and $prepConflatedMoveVerdict.blocks) {
 # not show the app running with it on (gui_smoke.visual_state look_assist_enabled=1; 0 or missing blocks) measured another look: a typed INVALID, never a PASS or FAIL.
 $lookAssistVerdict = Get-DvLookAssistEvidence -Spec $spec -LogText $runLogText
 if ($lookAssistVerdict.requested) { $receipt['lookAssist'] = [ordered]@{ requested = $true; reported = $lookAssistVerdict.reported; verdict = $lookAssistVerdict.verdict } }
+# VENUE-NATIVE-LEG-LOOKLEG-LABEL-1 r1: the look TRUTH at the top level. A native HFR leg is a SPEED leg that forces Look Assist, so metrics.lookLeg (false) and
+# subject.lookFlavor (null) are its leg TYPE and stay so (Test-DvReceiptValid binds them to the committed spec); lookAssistOn / lookAssistFlavor say what ran.
+# FAIL CLOSED, unknown is not on: on only when the leg asked for the look, the app's own log says look_assist_enabled=1, the job's summary says it forced the
+# look, and the flavor the app applied (read from the log record body, never a location suffix) equals the flavor the summary says was requested and reported.
+# lookAssistFlavor is that log-derived flavor, else null. A flavor the app's records name two different ways is no flavor (Get-DvLookAssistEvidence). false / null
+# mean NOT PROVEN ON, never "observed off" (r2, Dot bd11a92): an unasked-for leg whose app log says look_assist_enabled=1 still says false.
+$laSummaryForced = ($null -ne $summary -and $null -ne $summary.PSObject.Properties['lookAssistForced'] -and $summary.lookAssistForced -is [bool] -and $summary.lookAssistForced)
+$laRequestedFlavor = $(if ($null -ne $summary -and $null -ne $summary.PSObject.Properties['lookFlavor'] -and $summary.lookFlavor -is [string]) { [string]$summary.lookFlavor } else { '' })
+$laReportedFlavor = $(if ($null -ne $summary -and $null -ne $summary.PSObject.Properties['lookFlavorReported'] -and $summary.lookFlavorReported -is [string]) { [string]$summary.lookFlavorReported } else { '' })
+$laLogFlavor = [string]$lookAssistVerdict.flavor
+if ($lookAssistVerdict.asked -and ($lookAssistVerdict.verdict -ceq 'HONOURED') -and $laSummaryForced -and $laRequestedFlavor.Length -gt 0 -and ($laReportedFlavor -ceq $laRequestedFlavor) -and ($laLogFlavor -ceq $laRequestedFlavor)) {
+    $receipt['lookAssistOn'] = $true
+    $receipt['lookAssistFlavor'] = $laLogFlavor
+}
 if ($outcome -in @('PASS', 'FAIL') -and $lookAssistVerdict.blocks) {
     $detail = "INVALID: the job result was $outcome ($detail) but LOOK_ASSIST_NOT_HONOURED: $($lookAssistVerdict.reason). A leg that did not run the look it names is no measurement under it"
     $outcome = 'INVALID'

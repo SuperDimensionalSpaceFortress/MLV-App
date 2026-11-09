@@ -430,6 +430,12 @@ param(
     # vsync A/B), any leg type. -1 (the default) sets nothing: the emitted job is the text it was before this parameter.
     [ValidateRange(-1, 1)][int]$SwapInterval = -1,
 
+    # HFR-NATIVE-60FPS-FULLRES-1: the high-frame-rate conform arm (passed to the app as MLVAPP_PLAYBACK_CONFORM=1 for 'on',
+    # 0 for 'off', the native-HFR arm), any leg type. Empty (the default) sets nothing: the emitted job is the text it was before.
+    # Case-sensitive (adversary A4): the emitter compares -ceq 'on', so 'ON' must be refused at bind, never emitted as 0.
+    [ValidateSet('', 'on', 'off', IgnoreCase = $false)]
+    [string]$PlaybackConform = '',
+
     # GPU-EVENT153-ROOTCAUSE-2: turns the CUDA backends' per-launch timer on (MLVAPP_CUDA_LAUNCH_TIMING=1) with this
     # per-launch line threshold in ms (MLVAPP_CUDA_LAUNCH_TIMING_MIN_MS). -1 (the default) sets nothing: the timer stays
     # OFF and the emitted job is the text it was before this parameter.
@@ -5104,7 +5110,11 @@ function Test-CorePartitionHelperRecordShape($Record) {
             $num.Add(@($t.pMask, 'int64')); $num.Add(@($t.eMask, 'int64'))
         }
         if ($null -ne $Record.app) { foreach ($n in @('pid', 'startUtcTicks', 'affinityFirst', 'affinityLast')) { $num.Add(@($Record.app.$n, 'int64')) } }
-        foreach ($i in @(@($Record.instances) + @($Record.others) | Where-Object { $null -ne $_ })) { foreach ($n in @('pid', 'startUtcTicks', 'firstSeenUtcTicks', 'firstMs', 'goneUtcTicks', 'aliveMs', 'goneMs')) { $num.Add(@($i.$n, 'int64')) } }
+        foreach ($i in @(@($Record.instances) + @($Record.others) | Where-Object { $null -ne $_ })) {
+            # CORE-PARTITION-HELPER-PID-REUSE-1: whether a held handle pinned the process's pid is a JSON flag or absent (0 or a string would compare as a flag)
+            if ($null -ne $i.pinned -and $i.pinned -isnot [bool]) { return 'helper-record-malformed' }
+            foreach ($n in @('pid', 'startUtcTicks', 'firstSeenUtcTicks', 'firstMs', 'goneUtcTicks', 'aliveMs', 'goneMs')) { $num.Add(@($i.$n, 'int64')) }
+        }
         if ($null -ne $Record.load) {
             # r10 B4: the load session's join outcome is a JSON flag or absent
             if ($null -ne $Record.load.joined -and $Record.load.joined -isnot [bool]) { return 'helper-record-malformed' }
@@ -5192,7 +5202,18 @@ function Test-CorePartitionHelperRecord($Record, $LaunchPid, $ExitCode, [bool]$M
 # both the helper's polls (its record's clockSkewMaxMs) and the job's own reads ($ClockSkewMs, Get-CorePartitionClockSkewMs); over it the verdict is
 # clock-discontinuity, and a gap nobody recorded is clock-unverified. Process start times are the OS's wall-clock stamps (a step before the helper
 # started is not seen here: LIMIT, CORE-PARTITION-PROCESS-START-EVENTS-1).
-function Test-CorePartitionMeasuredApp($Helper, [int64]$MeasuredPid, [int64]$MeasuredStartTicks, [int64]$MeasuredEndTicks, $ClockSkewMs = 0) {
+# r2 (Dot pr-780 S1): $MeasuredExitTicks is the runner's confirmed exit, endedAtUtc - process.exitToEndMs (a monotonic duration: adversary 9a2372b7
+# A1, no second wall-clock reading); $MeasuredEndTicks (endedAtUtc) is stamped only after the stdout/stderr drain, which can run seconds past the
+# exit. Only the exit-side interval check uses it (candidate selection and the overlap test keep endedAtUtc); 0 (an older receipt without it)
+# falls back to endedAtUtc. Which one was used is returned as exitStamp with that check's verdicts and the binding.
+# r3 (adversary f5182886 A1): no clock check covered the runner's own two wall reads, so an unsampled excursion on the endedAtUtc read alone moved
+# the derived exit by its size (+5 s: a false refusal; -5 s: before the real exit, a lenient check). $RunnerElapsedMonoMs is the runner's
+# launch..end on its monotonic clock (process.elapsedMonoMs); its disagreement with endedAtUtc - startedAtUtc is the runner's gap, judged like the
+# others: over the 1000 ms CLOCK TOLERANCE clock-discontinuity, under it widened into $slack. A value that is there but unusable is clock-unverified
+# (runnerClock unusable). $null (an older receipt) leaves the runner's stamps unchecked (runnerClock unverified): a drain (a $MeasuredExitTicks) is
+# then no proven exit (clock-unverified), and without one the exit-side check keeps the r1 rule on endedAtUtc. LIMIT: an excursion of the same size
+# on both runner reads cancels in the difference; one that persisted across the run is sampled by the helper's polls (clockSkewMaxMs).
+function Test-CorePartitionMeasuredApp($Helper, [int64]$MeasuredPid, [int64]$MeasuredStartTicks, [int64]$MeasuredEndTicks, $ClockSkewMs = 0, [int64]$MeasuredExitTicks = 0, $RunnerElapsedMonoMs = $null) {
     if ($MeasuredPid -le 0) { return @{ why = 'measured-pid-unknown' } }
     if ($MeasuredStartTicks -le 0 -or $MeasuredEndTicks -lt $MeasuredStartTicks) { return @{ why = 'measured-window-unknown' } }
     # sol r6 CP-07: every record number below went through the one guarded parse first
@@ -5209,10 +5230,20 @@ function Test-CorePartitionMeasuredApp($Helper, [int64]$MeasuredPid, [int64]$Mea
         if ([math]::Abs($gap) -gt 1000) { return @{ why = 'clock-discontinuity' } }
         $slack = [math]::Max($slack, [int64][math]::Ceiling(2 * [math]::Abs($gap) * 1e4))
     }
+    # r3 (adversary f5182886 A1): the runner's own gap, its wall launch..end against its monotonic launch..end
+    $runnerClock = 'unverified'; $runnerSkew = $null
+    if ($null -ne $RunnerElapsedMonoMs) {
+        $em = (ConvertFrom-CorePartitionNumber $RunnerElapsedMonoMs 'double').value
+        if ($null -eq $em -or $em -lt 0) { return @{ why = 'clock-unverified'; runnerClock = 'unusable' } }
+        $runnerSkew = [math]::Abs(($MeasuredEndTicks - $MeasuredStartTicks) / 1e4 - $em)
+        if ($runnerSkew -gt 1000) { return @{ why = 'clock-discontinuity'; runnerClock = 'verified'; runnerSkewMs = $runnerSkew } }
+        $slack = [math]::Max($slack, [int64][math]::Ceiling(2 * $runnerSkew * 1e4))
+        $runnerClock = 'verified'
+    }
     $all = @(@($Helper.instances) + @($Helper.others) | Where-Object { $null -ne $_ } | ForEach-Object {
         [pscustomobject]@{ pid = (ConvertFrom-CorePartitionNumber $_.pid 'int64').value; start = (ConvertFrom-CorePartitionNumber $_.startUtcTicks 'int64').value; gone = (ConvertFrom-CorePartitionNumber $_.goneUtcTicks 'int64').value
             aliveMs = (ConvertFrom-CorePartitionNumber $_.aliveMs 'int64').value; goneMs = (ConvertFrom-CorePartitionNumber $_.goneMs 'int64').value
-            first = (ConvertFrom-CorePartitionNumber $_.firstSeenUtcTicks 'int64').value; firstMs = (ConvertFrom-CorePartitionNumber $_.firstMs 'int64').value } })
+            first = (ConvertFrom-CorePartitionNumber $_.firstSeenUtcTicks 'int64').value; firstMs = (ConvertFrom-CorePartitionNumber $_.firstMs 'int64').value; pinned = $_.pinned } })
     # r10 B3 (sol r9 B3 = adversary r9 8cf7e883 A3): a wall-clock step the helper's polls never sampled (stepped and restored between two polls) can
     # stamp a process start after its own first sighting, which moves it outside the app's window and hides the overlap. Every recorded process must
     # order consistently, start <= first seen <= seen gone (each within $slack), with its monotonic first-sight and last-alive stamps; one that does
@@ -5227,10 +5258,38 @@ function Test-CorePartitionMeasuredApp($Helper, [int64]$MeasuredPid, [int64]$Mea
     if ($m.Count -eq 0) { return @{ why = 'measured-app-not-observed' } }
     if ($m.Count -gt 1) { return @{ why = 'measured-pid-ambiguous' } }
     $a = $m[0]; $aStart = $a.start
+    # CORE-PARTITION-HELPER-PID-REUSE-1 (adversary A1 on aa71dd11): a measured app the helper tracked with no handle held (pinned false) had its pid open to
+    # reuse, and a successor with the same start ticks (an unsampled clock step) and the same path reads exactly as the app on every poll and in every
+    # enumeration, so its life, samples and load could be the successor's. Only a held handle rules that out. The helper writes pinned on every record.
+    if ($a.pinned -eq $false) { return @{ why = 'measured-app-identity-unpinned' } }
+    # CORE-PARTITION-PREDECESSOR-CLOCK-STEP-1 (adversary A1@40d2259d, #696 r14b; its restatement A1@92715958, #777): the selection above is pid plus a
+    # start inside the launch window, and the helper's app must equal the candidate on pid AND birth stamp (helper-app-not-measured-pid below), but
+    # neither proves the instance is the runner's process. A predecessor on the pid whose gone stamp a tolerated clock step moved past the launch, or a
+    # successor that inherited the pid, path and (through an unsampled step) the birth stamp and was first seen after the app exited, passes both. The
+    # runner's process is the one OBSERVED across the runner's interval: first seen (firstSeenUtcTicks, a stamp whose clock gap the helper sampled)
+    # within the same 2 s launch tolerance of the launch, and, once seen gone, not seen gone more than 2 s before the runner's exit; each side is
+    # widened by $slack. A gone time still unset is judged below (coverage-*). Refused, typed; nothing of it is credited. Either wrong binding needs the
+    # runner's app never listed (listed, it is a second candidate, measured-pid-ambiguous, or its gone key makes the successor unidentified); an app whose
+    # whole life fell between two polls in a runner window shorter than the two tolerances is the residual (LIMIT A3, CORE-PARTITION-PROCESS-START-EVENTS-1).
+    if ($a.first - $slack -gt $MeasuredStartTicks + 20000000) { return @{ why = 'measured-app-seen-after-runner-launch' } }
+    # r2 (Dot pr-780 S1): the runner's exit is the moment its wait confirmed termination (endedAtUtc - exitToEndMs), not endedAtUtc, which also
+    # covers the stream drain after it; an older receipt without it falls back to endedAtUtc. An exit outside the runner's own launch..end window
+    # (a negative or over-long drain) is not the runner's exit and proves nothing: measured-exit-stamp-inconsistent.
+    $exitStamp = 'endedAtUtc'; $exitTicks = $MeasuredEndTicks
+    if ($MeasuredExitTicks -ne 0) {
+        if ($MeasuredExitTicks -lt $MeasuredStartTicks -or $MeasuredExitTicks -gt $MeasuredEndTicks) { return @{ why = 'measured-exit-stamp-inconsistent'; exitStamp = 'exitToEndMs'; runnerClock = $runnerClock } }
+        # r3: a drain measured back from a wall end stamp nobody checked is no proven exit
+        if ($null -eq $runnerSkew) { return @{ why = 'clock-unverified'; exitStamp = 'exitToEndMs'; runnerClock = $runnerClock } }
+        $exitStamp = 'exitToEndMs'; $exitTicks = $MeasuredExitTicks
+    }
+    if ($null -ne $a.gone -and $a.gone + $slack -lt $exitTicks - 20000000) { return @{ why = 'measured-app-gone-before-runner-exit'; exitStamp = $exitStamp; runnerClock = $runnerClock; runnerSkewMs = $runnerSkew } }
     foreach ($o in $all) {
         if ([object]::ReferenceEquals($o, $a)) { continue }
         $oStart = if ($null -ne $o.start) { $o.start - $slack } else { [int64]::MinValue }
         $oEnd = if ($null -ne $o.gone) { $o.gone + $slack } else { [int64]::MaxValue }
+        # r2 fix 2 (adversary 9a2372b7 A1): the app's life still ends at endedAtUtc here, after the drain, never at the derived exit. Only the
+        # refusal above is relaxed by the drain; an overlap is never cleared by it (a process started during the drain is refused as an overlap:
+        # the conservative side, adversary 6c16f4de advisory A1, left open).
         if ($oStart -le $MeasuredEndTicks -and $aStart -le $oEnd) { return @{ why = 'same-path-instance-overlap' } }
         # r10 B3: on the monotonic clock alone, each process is proven alive from its first sighting (firstMs) to its last alive poll (aliveMs); two
         # such spans that intersect were alive together, whatever the wall-clock stamps say
@@ -5249,7 +5308,7 @@ function Test-CorePartitionMeasuredApp($Helper, [int64]$MeasuredPid, [int64]$Mea
     # uncovered tail is too long to accept: coverage-endpoint-gap.
     $endpointMs = $a.goneMs - $a.aliveMs
     if ($endpointMs -gt 1000) { return @{ why = 'coverage-endpoint-gap'; endpointMs = $endpointMs } }
-    @{ why = $null; aliveMs = $a.aliveMs; endpointMs = $endpointMs }
+    @{ why = $null; aliveMs = $a.aliveMs; endpointMs = $endpointMs; exitStamp = $exitStamp; runnerClock = $runnerClock; runnerSkewMs = $runnerSkew }
 }
 
 # PURE. The summary scalars from the helper's record (or $null when it wrote none), the feed summary and the requested masks.
@@ -5257,13 +5316,13 @@ function Test-CorePartitionMeasuredApp($Helper, [int64]$MeasuredPid, [int64]$Mea
 # $MeasuredPid, $MeasuredStartTicks, $MeasuredEndTicks (sol r4 CP-02): the app evidence is used only when Test-CorePartitionMeasuredApp binds it to them.
 # $PublishWhy (sol r4 CP-05): set when core-partition.json was not published; every acceptance flag is then false with that reason.
 # $ClockSkewMs (r8 A1): the job's own wall/monotonic gap across the measured window, for Test-CorePartitionMeasuredApp.
-function Get-CorePartitionScalars($Helper, $Feed, [int64]$BenchMask, [int64]$LoadMask, [int]$LoadThreads, $Workers, [string]$HelperWhy, [bool]$HelperNotReady, [int64]$MeasuredPid, [string]$PublishWhy, [int64]$MeasuredStartTicks, [int64]$MeasuredEndTicks, $ClockSkewMs = 0) {
+function Get-CorePartitionScalars($Helper, $Feed, [int64]$BenchMask, [int64]$LoadMask, [int]$LoadThreads, $Workers, [string]$HelperWhy, [bool]$HelperNotReady, [int64]$MeasuredPid, [string]$PublishWhy, [int64]$MeasuredStartTicks, [int64]$MeasuredEndTicks, $ClockSkewMs = 0, [int64]$MeasuredExitTicks = 0, $RunnerElapsedMonoMs = $null) {
     $why = [ordered]@{}
     $h = $Helper
     # sol r6 CP-07: a record with a number that does not parse is no record (its reason is appended to the helper's), so nothing below can throw on it.
     $shapeWhy = Test-CorePartitionHelperRecordShape $h
     if ($shapeWhy) { $h = $null; $HelperWhy = Join-CorePartitionWhy $HelperWhy $shapeWhy }
-    $appVerdict = if ($null -ne $h) { Test-CorePartitionMeasuredApp $h $MeasuredPid $MeasuredStartTicks $MeasuredEndTicks $ClockSkewMs } else { @{ why = $null } }
+    $appVerdict = if ($null -ne $h) { Test-CorePartitionMeasuredApp $h $MeasuredPid $MeasuredStartTicks $MeasuredEndTicks $ClockSkewMs $MeasuredExitTicks $RunnerElapsedMonoMs } else { @{ why = $null } }
     $appWhy = $appVerdict.why
     $topoOk = $false; $pMask = [int64]0; $eMask = [int64]0
     if ($null -eq $h) { $why['corePartitionTopologyOk'] = $(if ($HelperWhy) { $HelperWhy } else { 'helper-record-missing' }) }
@@ -5465,6 +5524,10 @@ function Write-CorePartitionNewFile([string]$Path, [string]$Text) {
     } finally { $nf.Dispose() }
 }
 $exe = [string]$env:MLV_CP_EXE; $stop = [string]$env:MLV_CP_STOP; $op = [string]$env:MLV_CP_OUT; $ready = [string]$env:MLV_CP_READY
+# CORE-PARTITION-HELPER-PID-REUSE-1 r2 (adversary A1 on f82e5037): a path is the exe's only when it equals it ORDINALLY, case-insensitive (equal lengths plus an
+# OrdinalIgnoreCase prefix, as Test-PresentMonIdentityText). PowerShell's -ieq / -ine are culture-sensitive and ignore U+00AD, U+200B and U+0000, so another
+# file's path (a soft hyphen in its name) read as the exe's. Every path the helper compares with the exe's goes through $ie.
+$ie = { param($a) $a.Length -eq $exe.Length -and $a.StartsWith($exe, 'OrdinalIgnoreCase') }
 $bench = [int64]$env:MLV_CP_BENCH; $lm = [int64]$env:MLV_CP_LOAD; $hm = [int64]$env:MLV_CP_HELPER; $threads = [int]$env:MLV_CP_THREADS
 # r9 (Dot 3 = adversary r8 aeacec83 A3): the self-deadline is a monotonic budget in ms from the helper's own start ($cw below), so no wall-clock
 # step, backward or forward, moves it.
@@ -5548,12 +5611,25 @@ public sealed class MlvCorePartitionLoad {
             # A failed query proves neither: the getter's throw reaches here as $null, not through the catch. That is no exit, since the seen key would stop the process
             # being tracked again and the job accepts an observed exit as coverage; and it is no alive stamp, since it can be a successor this user cannot open.
             $gone = $null; try { $q.p.Refresh(); $gone = $q.p.HasExited } catch { }
+            # CORE-PARTITION-HELPER-PID-REUSE-1 (adversary A1 on 74c7d7d3, #696 r14b): for a process tracked with no handle held ($q.r.pinned false: its handle
+            # did not open when it was tracked) the query above opens the pid, so once the pid is reused it reads the new process. So every poll that does not see
+            # it gone, pinned or not, re-reads the birth identity on the pid AFTER that query, through a fresh process object (StartTime is cached by an object
+            # after its first read: r5 sol B1), and compares it as the tracking key does (start ticks, the exe's path). Three outcomes: a start or a path read
+            # that differs is another process on the pid, so it is gone at this poll and nothing after it is credited; a start and a path that both read and
+            # match leave the query's answer; otherwise (a read failed) only a held handle ($q.r.pinned: it keeps the pid from being reused) leaves it, and with
+            # none the poll is unknown ($gone $null: no alive stamp and no exit). A successor with the same start and path cannot be told from the process by
+            # any read on the pid (adversary A1 on aa71dd11), so the job refuses a measured app not pinned.
+            if (!$gone) {
+                $f = $s = $x = $null; try { $f = Get-Process -Id $q.r.pid -ea 0; $s = $f.StartTime.ToUniversalTime().Ticks } catch { }; try { $x = [string]$f.Path } catch { }
+                if (($s -and $s -ne $q.r.startUtcTicks) -or ($x -and !(& $ie $x))) { $gone = $true } elseif (!($s -and $x -or $q.r.pinned)) { $gone = $null }
+            }
             if ($gone -eq $false) {
                 try { $q.r.affinityLast = [int64]$q.p.ProcessorAffinity; $q.r.priorityLast = [string]$q.p.PriorityClass } catch { }
                 $q.r.lastSeenUtcTicks = & $clk; $q.r.aliveMs = $mo; if ($k -eq $own -and $loadOn) { $lb = $bn }
             } elseif ($gone) {
                 if ($k -eq $own) { if ($loadOn) { $q.r.loadJoined = $ld.Halt(); $loadOn = $false; & $lc $q.r }; $own = $null }
-                # r5: 2 marks a tracked key whose process has exited (on its held handle), so a later listing that carries it is another process (seen below)
+                # r5: 2 marks a retired tracked key: its liveness query saw the process exit, or (CORE-PARTITION-HELPER-PID-REUSE-1) the identity re-read
+                # above read another process on its pid. Either way a later listing that carries the key is another process (seen below).
                 $q.r.goneUtcTicks = & $clk; $q.r.goneMs = & $ms; $live.Remove($k); $seen[$k] = 2
             }
         }
@@ -5577,8 +5653,11 @@ public sealed class MlvCorePartitionLoad {
                 # successor can get a gone process's exact start, so the entry refuses, as on the base. A tracked process whose reads fail once refuses too (hub ruling).
                 # r5 (sol r4 blocker = adversary pass 7 A1 on 00e5f732, hub ruling 1 of HUB-TICK 20261106T1439Z): a gone tracked key (2) read with its Path unread is a
                 # successor never identified, so it is recorded unidentified, never skipped; the key then goes back to 1, so it is recorded once. A key whose process
-                # is still tracked (1), or one whose Path reads, is skipped as before. An exited process is never listed, even while its handle is held (measured r5).
-                if ($seen[$k]) { if ($pn[$p.Id] -or $seen[$k] * !$pp -gt 1) { & $un $p.Id; $seen[$k] = 1 }; continue }
+                # is still tracked (1) is skipped as before. An exited process is never listed, even while its handle is held (measured r5).
+                # CORE-PARTITION-HELPER-PID-REUSE-1 (adversary A1 on 4fdc1512): so a listing that carries a gone key is always a successor with the gone process's
+                # exact start, and one whose Path reads as the exe is a same-path process alive now: recorded unidentified too (it was skipped, which hid an
+                # overlap once the identity re-read retired an unpinned process). Only a Path read at another exe is skipped (no same-path process).
+                if ($seen[$k]) { if ($pn[$p.Id] -or ($seen[$k] -gt 1 -and !($pp -and !(& $ie $pp)))) { & $un $p.Id; $seen[$k] = 1 }; continue }
                 $pe = $pn[$p.Id]
                 # The start read at first sight ($pe.s) is a pending pid's identity, whatever the clock did since: any other start on that pid is a process on a recycled
                 # pid, and the one first listed ended unread. With no start read at first sight nothing can prove identity (r3, HUB RULING 2026-11-06, adversary A1/A2 on
@@ -5588,12 +5667,12 @@ public sealed class MlvCorePartitionLoad {
                 if ($pe -and $pst -and ($pst.Ticks -ne $pe.s -or $pe.o.HasExited -ne $false)) { & $un $p.Id; $pe = $null }
                 # A read that fails settles nothing, on a pid being tracked too: both reads failing cannot be told from that process exiting. A read at another path
                 # with no start cannot say which process it read, so it clears nothing. With no handle nothing can recover, so it is recorded at once, as on the base.
-                if (!$pp -or ($pp -ieq $exe -and !$pst)) { if ($pe) { } elseif ($h) { $pn[$p.Id] = @{ s = $pst.Ticks; o = $p; f = & $clk; m = & $ms } } else { & $un $p.Id; $seen[$k] = 1 } }
+                if (!$pp -or ((& $ie $pp) -and !$pst)) { if ($pe) { } elseif ($h) { $pn[$p.Id] = @{ s = $pst.Ticks; o = $p; f = & $clk; m = & $ms } } else { & $un $p.Id; $seen[$k] = 1 } }
                 elseif ($pst) { $pn.Remove($p.Id) }
-                if ($pp -ieq $exe -and $pst) {
+                if ((& $ie $pp) -and $pst) {
                     # firstSeenUtcTicks and firstMs are the real first sight, also for a process classed late; aliveMs is this poll's, the first it can vouch for.
                     $seen[$k] = 1; $fs = & $clk; if (!$pe) { $pe = @{ f = $fs; m = & $ms } }
-                    $r = [ordered]@{ pid = $p.Id; startUtcTicks = $pst.Ticks; firstSeenUtcTicks = $pe.f; lastSeenUtcTicks = $fs; firstMs = $pe.m; goneUtcTicks = $null; aliveMs = $me; goneMs = $null; affinityFirst = $null; affinityLast = $null; priorityFirst = $null; priorityLast = $null; loadSec = 0.0; loadBytes = [int64]0; loadJoined = $null }
+                    $r = [ordered]@{ pid = $p.Id; startUtcTicks = $pst.Ticks; firstSeenUtcTicks = $pe.f; lastSeenUtcTicks = $fs; firstMs = $pe.m; goneUtcTicks = $null; aliveMs = $me; goneMs = $null; affinityFirst = $null; affinityLast = $null; priorityFirst = $null; priorityLast = $null; loadSec = 0.0; loadBytes = [int64]0; loadJoined = $null; pinned = !!$h }
                     try { $r.affinityFirst = [int64]$p.ProcessorAffinity; $r.affinityLast = $r.affinityFirst; $r.priorityFirst = [string]$p.PriorityClass; $r.priorityLast = $r.priorityFirst } catch { $errs.Add("app-read: $($_.Exception.Message)") }
                     $live[$k] = @{ p = $p; r = $r }
                     if ($pst -lt $lu) { $others.Add($r) }
@@ -6076,6 +6155,17 @@ if ($SwapInterval -ge 0) {
     })
 }
 
+# HFR-NATIVE-60FPS-FULLRES-1: a conform-arm leg adds MLVAPP_PLAYBACK_CONFORM to the same env-list site, only when asked.
+if ($PlaybackConform -ne '') {
+    $conformValue = if ($PlaybackConform -ceq 'on') { '1' } else { '0' }
+    $conformAnchor = [regex]"(?<ind>[ \t]*)'MLVAPP_PLAYBACK_PHASE3_UNATTENDED=1',(?<nl>\r?\n)"
+    if ($conformAnchor.Matches($text).Count -ne 1) { throw 'DUAL_VENUE_PLAYBACK_CONFORM_ANCHOR_MISSING the job template has no single env-list site to add MLVAPP_PLAYBACK_CONFORM to' }
+    $text = $conformAnchor.Replace($text, [System.Text.RegularExpressions.MatchEvaluator]{
+        param($m)
+        $m.Value + $m.Groups['ind'].Value + "'MLVAPP_PLAYBACK_CONFORM=$conformValue'," + $m.Groups['nl'].Value
+    })
+}
+
 # GPU-EVENT153-ROOTCAUSE-2: the same env-list site gains the launch-timer pair, only when asked. The threshold is written in
 # invariant culture so a comma-decimal host never emits '2,5' (which the DLL would read as 2).
 if ($CudaLaunchTimingMinMs -ge 0) {
@@ -6427,6 +6517,22 @@ if ($corePartitionEmit) {
     $cpHelperSource = (Get-CorePartitionFunctionSource @(${function:Format-CorePartitionMask}, ${function:Get-CorePartitionTopology}, ${function:Test-CorePartitionMaskClass}) "`n") + "`n" + $corePartitionHelperBody
     # Indentation and whole-line comments are dropped so the encoded command fits one command line (the C# here-string's closing "@ stays at column 0).
     $cpHelperSource = (@($cpHelperSource -split "\r?\n" | ForEach-Object { $_.TrimStart() } | Where-Object { $_ -ne '' -and -not $_.StartsWith('#') }) -join "`n")
+    # CORE-PARTITION-HELPER-PID-REUSE-1 (room for its identity re-check): the one space on each side of an assignment '=' is dropped too. The tokenizer
+    # finds each '=' token, so no text inside a string (the C# here-string, a message) is touched, and the result must tokenize to the same token
+    # kinds and texts in the same order, or generation throws.
+    $cpTk0 = $null; $cpPe = $null
+    [void][System.Management.Automation.Language.Parser]::ParseInput($cpHelperSource, [ref]$cpTk0, [ref]$cpPe)
+    if (@($cpPe).Count -gt 0) { throw "CORE_PARTITION_HELPER_UNPARSED the helper source has $(@($cpPe).Count) parse error(s)" }
+    $cpSb = [Text.StringBuilder]::new($cpHelperSource)
+    foreach ($cpEq in @($cpTk0 | Where-Object { $_.Kind -eq [System.Management.Automation.Language.TokenKind]::Equals } | Sort-Object { $_.Extent.StartOffset } -Descending)) {
+        $cpAt = $cpEq.Extent.StartOffset
+        if ($cpAt + 1 -lt $cpSb.Length -and $cpSb[$cpAt + 1] -eq ' ') { [void]$cpSb.Remove($cpAt + 1, 1) }
+        if ($cpAt -gt 0 -and $cpSb[$cpAt - 1] -eq ' ') { [void]$cpSb.Remove($cpAt - 1, 1) }
+    }
+    $cpTk1 = $null
+    [void][System.Management.Automation.Language.Parser]::ParseInput($cpSb.ToString(), [ref]$cpTk1, [ref]$cpPe)
+    if (@($cpPe).Count -gt 0 -or ((@($cpTk0 | ForEach-Object { "$($_.Kind) $($_.Text)" }) -join "`n") -cne (@($cpTk1 | ForEach-Object { "$($_.Kind) $($_.Text)" }) -join "`n"))) { throw 'CORE_PARTITION_HELPER_SQUEEZE_CHANGED_TOKENS dropping the spaces around an assignment changed how the helper tokenizes' }
+    $cpHelperSource = $cpSb.ToString()
     $cpHelperEncoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($cpHelperSource))
     # The limit: CreateProcess takes 32767 command-line chars; the pwsh path and switches before the encoded command are about 120 (sol r6 CP-06's
     # record HMAC took the helper past the earlier 30000).
@@ -6566,11 +6672,25 @@ try {
     $corePartitionFeedEnd = Read-CorePartitionFeedSince $corePartitionFeedPath ([int64]$corePartitionFeedStart.length) ([string]$corePartitionFeedStart.before)
     # sol r4 CP-02: the measured app is the process the smoke runner launched (its result.json process.id); 0 when unknown, which binds nothing.
     # Its launch..exit window (process.startedAtUtc / endedAtUtc) binds the pid to that process, not a later one reusing it (adversary r5 A3).
-    $corePartitionMeasuredPid = [int64]0; $corePartitionMeasuredStartTicks = [int64]0; $corePartitionMeasuredEndTicks = [int64]0
+    # r2 (Dot pr-780 S1): and the confirmed exit, endedAtUtc - process.exitToEndMs (the runner's stream drain after its wait confirmed the exit,
+    # measured on the monotonic clock; adversary 9a2372b7 A1: never the wall-clock exitObservedAtUtc); 0 when the receipt has no number there (an
+    # older runner), and the exit-side check then falls back to endedAtUtc.
+    # r3 (adversary f5182886 A1): and the runner's launch..end on its monotonic clock (process.elapsedMonoMs, raw: the verdict parses it and checks
+    # endedAtUtc - startedAtUtc against it); $null when the receipt has none (an older runner).
+    $corePartitionMeasuredPid = [int64]0; $corePartitionMeasuredStartTicks = [int64]0; $corePartitionMeasuredEndTicks = [int64]0; $corePartitionMeasuredExitTicks = [int64]0; $corePartitionMeasuredExitToEndMs = $null; $corePartitionMeasuredRunnerElapsedMonoMs = $null
     try {
         $cpRunnerProcess = ([IO.File]::ReadAllText($resultPath) | ConvertFrom-Json).process
         if ($null -ne $cpRunnerProcess -and $null -ne $cpRunnerProcess.id) { $corePartitionMeasuredPid = [int64]$cpRunnerProcess.id }
         if ($null -ne $cpRunnerProcess) { $corePartitionMeasuredStartTicks = ConvertTo-CorePartitionUtcTicks $cpRunnerProcess.startedAtUtc; $corePartitionMeasuredEndTicks = ConvertTo-CorePartitionUtcTicks $cpRunnerProcess.endedAtUtc }
+        if ($null -ne $cpRunnerProcess -and $null -ne $cpRunnerProcess.PSObject.Properties['elapsedMonoMs']) { $corePartitionMeasuredRunnerElapsedMonoMs = $cpRunnerProcess.elapsedMonoMs }
+        # adversary 56b25d8b A2: a value that is there but does not parse, is negative or is longer than the runner's launch..end window is no exit:
+        # -1, which the verdict refuses (measured-exit-stamp-inconsistent), never a silent fall back to endedAtUtc. null (termination never
+        # confirmed) falls back.
+        if ($null -ne $cpRunnerProcess -and $null -ne $cpRunnerProcess.PSObject.Properties['exitToEndMs'] -and $null -ne $cpRunnerProcess.exitToEndMs -and $corePartitionMeasuredEndTicks -gt 0) {
+            $corePartitionMeasuredExitToEndMs = (ConvertFrom-CorePartitionNumber $cpRunnerProcess.exitToEndMs 'double').value
+            $cpDrainTicks = $(if ($null -ne $corePartitionMeasuredExitToEndMs) { [double]$corePartitionMeasuredExitToEndMs * 1e4 } else { [double]::NaN })
+            $corePartitionMeasuredExitTicks = $(if ([double]::IsNaN($cpDrainTicks) -or $cpDrainTicks -lt 0 -or $cpDrainTicks -gt [double]($corePartitionMeasuredEndTicks - $corePartitionMeasuredStartTicks)) { [int64]-1 } else { $corePartitionMeasuredEndTicks - [int64][math]::Floor($cpDrainTicks) })
+        }
     } catch { $corePartitionErrors.Add("measured-pid: $([string]$_.Exception.Message)") }
     if ($null -ne $corePartitionHelper) {
         # The pid goes to the helper BEFORE the stop file, so the helper binds its record to it as it ends.
@@ -6608,7 +6728,7 @@ try {
     } elseif (-not $corePartitionHelperWhy) { $corePartitionHelperWhy = 'helper-record-missing' }
     # r11 B1: the measured app's last observed-alive poll on the job's monotonic base, from the measured-app verdict ($null when it refused)
     $cpAppVerdict = @{ why = 'measured-app-unverified' }
-    try { $cpAppVerdict = Test-CorePartitionMeasuredApp $corePartitionHelperRecord $corePartitionMeasuredPid $corePartitionMeasuredStartTicks $corePartitionMeasuredEndTicks $corePartitionJobClockSkewMs } catch { $corePartitionErrors.Add("measured-app: $([string]$_.Exception.Message)") }
+    try { $cpAppVerdict = Test-CorePartitionMeasuredApp $corePartitionHelperRecord $corePartitionMeasuredPid $corePartitionMeasuredStartTicks $corePartitionMeasuredEndTicks $corePartitionJobClockSkewMs $corePartitionMeasuredExitTicks $corePartitionMeasuredRunnerElapsedMonoMs } catch { $corePartitionErrors.Add("measured-app: $([string]$_.Exception.Message)") }
     $corePartitionAppAliveMonoMs = Get-CorePartitionAppAliveMonoMs $corePartitionHelperRecord $cpAppVerdict
     # r13 (Dot 6452868627, CP-FEED-START-ANCHOR): the window's start is bound to the measured session's playback start, read from the run log the
     # result names (the same hash-checked snapshot the metrics read; unresolvable is feed-window-start-unverified). r13c (HUB RULING
@@ -6652,7 +6772,7 @@ try {
             # r9 (Dot 4): the samples and load are clipped to the helper's last poll that saw the app alive, so the window's end is known to within
             # the gap between that poll and the one that saw it gone (adversary r9 5592421d A2: the measured gap, nominally one 200 ms poll interval,
             # not a constant; null when the app evidence is refused): endpointErrorBoundMs. LIMIT, CORE-PARTITION-PROCESS-START-EVENTS-1.
-            measured = [ordered]@{ pid = $corePartitionMeasuredPid; startUtcTicks = $corePartitionMeasuredStartTicks; endUtcTicks = $corePartitionMeasuredEndTicks; jobClockSkewMs = $corePartitionJobClockSkewMs; endpointErrorBoundMs = $cpAppVerdict.endpointMs }
+            measured = [ordered]@{ pid = $corePartitionMeasuredPid; startUtcTicks = $corePartitionMeasuredStartTicks; endUtcTicks = $corePartitionMeasuredEndTicks; exitToEndMs = $corePartitionMeasuredExitToEndMs; exitUtcTicks = $corePartitionMeasuredExitTicks; exitStamp = $cpAppVerdict.exitStamp; runnerElapsedMonoMs = $corePartitionMeasuredRunnerElapsedMonoMs; runnerClock = $cpAppVerdict.runnerClock; runnerClockSkewMs = $cpAppVerdict.runnerSkewMs; jobClockSkewMs = $corePartitionJobClockSkewMs; endpointErrorBoundMs = $cpAppVerdict.endpointMs }
             measuredApp = $cpAppVerdict.why
             helper = $corePartitionHelperRecord
             feed = [ordered]@{
@@ -6708,7 +6828,7 @@ if ($cpPublication.unrecorded) {
     Write-Output "RESULT=CORE_PARTITION_UNRECORDED REASON=core-partition-json-unpublished+unpublished-status-unwritten ARTIFACTS=$Pub"
     exit 32
 }
-$corePartitionScalars = Get-CorePartitionScalars $corePartitionHelperRecord $corePartitionFeedSummary $CorePartitionBenchMask $CorePartitionLoadMask $CorePartitionLoadThreads (Get-CorePartitionWorkerThreads $rawLog) $corePartitionHelperWhy $corePartitionHelperNotReady $corePartitionMeasuredPid $corePartitionPublishWhy $corePartitionMeasuredStartTicks $corePartitionMeasuredEndTicks $corePartitionJobClockSkewMs
+$corePartitionScalars = Get-CorePartitionScalars $corePartitionHelperRecord $corePartitionFeedSummary $CorePartitionBenchMask $CorePartitionLoadMask $CorePartitionLoadThreads (Get-CorePartitionWorkerThreads $rawLog) $corePartitionHelperWhy $corePartitionHelperNotReady $corePartitionMeasuredPid $corePartitionPublishWhy $corePartitionMeasuredStartTicks $corePartitionMeasuredEndTicks $corePartitionJobClockSkewMs $corePartitionMeasuredExitTicks $corePartitionMeasuredRunnerElapsedMonoMs
 '@ + "`n" + $cpClose + "`n" + $cpMetricsAnchor)
     $cpMetricsAt = $text.IndexOf($cpMetricsAnchor, [StringComparison]::Ordinal)
     $cpKeysAnchor = '    cpuFrames = $gpuSummary.cpuFrames' + $cpEol
@@ -7708,6 +7828,7 @@ $clipContentSha256 = if ($isFixtureRehearsal) {
     fixtureRehearsal = $isFixtureRehearsal
     displayMode = $DisplayMode
     swapInterval = $(if ($SwapInterval -ge 0) { $SwapInterval } else { $null })
+    playbackConform = $(if ($PlaybackConform -ne '') { $PlaybackConform } else { $null })
     cudaLaunchTimingMinMs = $(if ($CudaLaunchTimingMinMs -ge 0) { $CudaLaunchTimingMinMs } else { $null })
     presentTrace = [bool]$PresentTrace
     firstPresentCapture = [bool]$FirstPresentCapture

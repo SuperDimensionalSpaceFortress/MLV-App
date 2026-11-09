@@ -24,6 +24,7 @@
 #include "PlaybackPrepPresentationPolicy.h"
 #include "VisualCaptureSourceDifference.h"
 #include "ClipOpenAbortPolicy.h"
+#include "ResizeStillDrawingWait.h"
 #include "debug/StageTiming.h"
 extern "C" {
 #include "../../src/mlv/pipeline_stage_capture.h"
@@ -709,14 +710,6 @@ static GpuPlaybackReconLiveVectorDumpResult dumpGpuPlaybackReconLiveVectorOnce(
     result.ok = ok;
     result.reason = ok ? QStringLiteral("ok") : QStringLiteral("write_failed");
     return result;
-}
-
-static QString playbackFpsStatusText( double fps )
-{
-    if( fps < 0.0 ) fps = 0.0;
-    return fps < 10.0
-        ? QStringLiteral( "Playback: %1 fps" ).arg( fps, 0, 'f', 1 )
-        : QStringLiteral( "Playback: %1 fps" ).arg( static_cast<int>( fps ) );
 }
 
 static int playbackScopeUpdateIntervalMs()
@@ -1635,6 +1628,7 @@ static bool lookAssistProcessedFloorLiftedPostInvalidShouldFailClosed(
 #include "ScopesLabel.h"
 #include "avir/avirthreadpool.h"
 #include "PlaybackPrepCpuRoute.h"
+#include "../../src/processing/ThreadExitCache.h"
 #include "MoveToTrash.h"
 #include "OverwriteListDialog.h"
 #include "PixelMapListDialog.h"
@@ -2034,7 +2028,7 @@ static QImage build_fast_playback_scaled_image(const uint8_t * source,
                                                std::vector<uint8_t> & scaledBuffer,
                                                int targetBytesPerLine = 0)
 {
-    static thread_local FastPlaybackScaleCache cache;
+    FastPlaybackScaleCache & cache = mlvThreadExitCache<FastPlaybackScaleCache>();
     return playbackBuildFastScaledImage( source,
                                          sourceWidth,
                                          sourceHeight,
@@ -2419,6 +2413,8 @@ MainWindow::MainWindow(int &argc, char **argv, QWidget *parent) :
     QSurfaceFormat::setDefaultFormat(format);
 
     ui->setupUi(this);
+    // HFR-NATIVE-60FPS-FULLRES-1 r29: the display surfaces report each painted serial here (the conform tracker's credit)
+    playback_paint_credit::setSink( &MainWindow::playbackPaintCreditSink, this );
     ui->comboBoxLookAssistFlavor->setItemData( 0, lookAssistFlavorName( LookAssistFlavor::Classic ) );
     ui->comboBoxLookAssistFlavor->setItemData( 1, lookAssistFlavorName( LookAssistFlavor::Cinematic ) );
     // "Film grade", not "Film": the Profile preset "Film" is a different thing.
@@ -2693,6 +2689,7 @@ MainWindow::MainWindow(int &argc, char **argv, QWidget *parent) :
 //Destructor
 MainWindow::~MainWindow()
 {
+    playback_paint_credit::setSink( nullptr, nullptr );
     killTimer( m_timerId );
     killTimer( m_timerCacheId );
     // HFR-NATIVE-M16-1457-GUI-PRESENT-CADENCE-1 r2: join the due wake's wait thread and drop its window and native
@@ -2885,6 +2882,108 @@ bool MainWindow::renderThreadBusyForPlaybackAdvance( int activePlaybackTarget )
     return !m_pRenderThread->isIdle();
 }
 
+// HFR-NATIVE-60FPS-FULLRES-1 r27 fix iteration 1 (adversary A1 on d98be193): whether a present of the drop-frame engine's
+// current target is still coming -- a render in flight for it (or non-speculative work) or a lookahead request or slot for it
+// in the active generation. The conformed tick holds only then (playback_frame_range::conformTargetPresented). The render
+// thread is asked only under conform and only while the target is not the frame drawFrameReady last accepted.
+bool MainWindow::conformTargetPresentOutstanding()
+{
+    if( !m_pRenderThread || !playbackConformActive() ) return false;
+    const int target = static_cast<int>( m_newPosDropMode );
+    if( target < 0 || m_lastPresentedPlaybackFrame == static_cast<long long>( target ) ) return false;
+    if( renderThreadBusyForPlaybackAdvance( target ) ) return true;
+    const uint64_t generation = m_playbackPresentationGeneration.load( std::memory_order_acquire );
+    // fix iteration 2 (adversary A1 on 9e88a583): a published Ready frame for the target, lookahead or not, is still coming
+    if( m_pRenderThread->hasReadyFrameForPlaybackTarget( static_cast<uint32_t>( target ), generation ) ) return true;
+    return m_pRenderThread->hasPlaybackLookaheadRequest( static_cast<uint32_t>( target ), generation );
+}
+
+// HFR-NATIVE-60FPS-FULLRES-1 r28 (CoS B1 6714996522 on c4efe7e3): whether the present of the target drawFrameReady accepted is
+// still to come -- drawFrameReady has not dispatched it yet (its early advance runs before the inline present or the enqueue),
+// or the non-inline prep queue still holds it. A pending task can be replaced by the next enqueue, so the engine must not move
+// past it. Nothing pending (the present happened, or the frame was dropped) means nothing is coming.
+bool MainWindow::conformAcceptedTargetPresentPending()
+{
+    if( !playbackConformActive() ) return false;
+    const long long target = static_cast<long long>( m_newPosDropMode );
+    if( target < 0 || m_lastPresentedPlaybackFrame != target ) return false;
+    if( m_playbackPresentDispatchFrame == target ) return true;
+    // fix iteration 1 (adversary A1 on e052947c): handed to a GL surface whose deferred paint has not drawn it yet
+    if( m_lastDisplayedPlaybackFrame == target && conformDisplayedFramePaintPending() ) return true;
+    std::lock_guard<std::mutex> lk( m_playbackPrepMutex );
+    return playbackPrepHoldsFrameLocked( m_playbackPrepPendingValid,
+                                         static_cast<int64_t>( m_playbackPrepPending.displayFrame ),
+                                         m_playbackPrepInFlight,
+                                         m_playbackPrepResults,
+                                         []( const PlaybackPrepResult &result ) { return result.task.displayFrame; },
+                                         static_cast<int64_t>( target ) );
+}
+
+// r28 fix iteration 1 (adversary A1 on e052947c): finishPresentedFrame runs when the frame is handed to the display, but the GL
+// window (requestUpdate), the GL viewport (update()) and, fix iteration 2 (adversary A1 on 4201a437), the CPU pixmap item (the
+// scene's queued update) paint it later, and a submission before that paint supersedes it. While any surface holds this frame's
+// serial unpainted (bounded by kConformPaintWaitMs) it is not on screen yet.
+// r29 (adversary A1 on cf403dba): the bound is an ESCAPE for a surface that never paints, never a display. When it expires the
+// engine may move on, but the frame is still unpainted: the conform tracker credits only a paint (m_playbackSmokePaintCredit),
+// so a frame the next submission replaces is never counted as shown, and each expiry is counted (paint_wait_escapes).
+bool MainWindow::conformDisplayedFramePaintPending()
+{
+    if( m_lastDisplayedPlaybackFrame < 0 || m_lastDisplayedPlaybackSerial == 0 ) return false;
+    const bool submittedUnpainted =
+        GpuDisplayWindow::paintPendingForSerialIfActive( m_lastDisplayedPlaybackSerial )
+        || GpuDisplayViewport::paintPendingForSerial( ui->graphicsView, m_lastDisplayedPlaybackSerial )
+        || ui->graphicsView->pixmapPaintPendingForSerial( m_lastDisplayedPlaybackSerial );   // fix iteration 2: the CPU pixmap route
+    const bool pending = playback_frame_range::conformDisplayPaintPending(
+        submittedUnpainted, ( mlv_stage_timing_now() - m_lastDisplayedPlaybackStageTime ) * 1000.0 );
+    if( submittedUnpainted && !pending && m_conformPaintWaitEscapedSerial != m_lastDisplayedPlaybackSerial )
+    {
+        m_conformPaintWaitEscapedSerial = m_lastDisplayedPlaybackSerial;
+        if( m_playbackSmokeActive ) ++m_playbackSmokeConformPaintWaitEscapes;
+    }
+    return pending;
+}
+
+// The displayed input of the conform gate: the frame finishPresentedFrame recorded, or none while its paint is still to come.
+long long MainWindow::conformDisplayedPlaybackFrame()
+{
+    return conformDisplayedFramePaintPending() ? -1 : m_lastDisplayedPlaybackFrame;
+}
+
+// GUI-SMOKE-FOREGROUND-HANG-NOLA-1 (adversary r3 pass 3 A1): the resize wait's renderIdle() sample. The same decision as
+// !renderThreadBusyForPlaybackAdvance(), but it never waits for the renderer mutex: a held mutex is busy at once, so a
+// hold of any length ends the idle run and no duration threshold exists. Every other caller keeps the blocking read.
+// epochOut receives the renderer's busy epoch from inside the same critical section (adversary r4 pass 2 A1).
+bool MainWindow::renderThreadIdleNoWait( int activePlaybackTarget, std::uint64_t *epochOut )
+{
+    if( !m_pRenderThread ) return true;
+    if( ui->actionPlay->isChecked() && playbackRenderLookaheadFrames() > 0 )
+    {
+        return m_pRenderThread->isIdleExceptPlaybackLookaheadNoWait(
+            activePlaybackTarget,
+            m_playbackPresentationGeneration.load( std::memory_order_acquire ),
+            epochOut );
+    }
+    return m_pRenderThread->isIdleNoWait( epochOut );
+}
+
+// adversary r4 A1 (probe-to-clear): the resize wait's stale clear. renderThreadIdleNoWait's decision, re-taken while the
+// renderer mutex is held (never waited for) and only at the idle run's busy epoch; the flag is cleared inside that critical
+// section, so a render request or warm run cannot start between the decision and the clear. False = not cleared (busy).
+bool MainWindow::clearStaleStillDrawingIfIdle( int activePlaybackTarget, std::uint64_t epoch )
+{
+    if( !m_pRenderThread )
+    {
+        m_frameStillDrawing = false;
+        return true;
+    }
+    return m_pRenderThread->runIfIdleNoWait(
+        ui->actionPlay->isChecked() && playbackRenderLookaheadFrames() > 0,
+        activePlaybackTarget,
+        m_playbackPresentationGeneration.load( std::memory_order_acquire ),
+        epoch,
+        [this]() { m_frameStillDrawing = false; } );
+}
+
 static int mlvappStartPlaybackTimer( QObject *owner, double framerate )
 {
     if( !owner ) return 0;
@@ -2898,6 +2997,7 @@ static int mlvappStartPlaybackTimer( QObject *owner, double framerate )
 
 void MainWindow::timerFrameEvent( bool predictivePlaybackAdvance )
 {
+    const GuiOtherBusyScope otherBusySpan( this, gui_present_gap::OtherBusySpan::TimerFrame );
     // No render starts during a Look Assist analysis. m_frameChanged stays set, so the first tick after landing draws.
     if( m_lookAssistPump.sessionOpen() ) return;
 
@@ -2914,7 +3014,8 @@ void MainWindow::timerFrameEvent( bool predictivePlaybackAdvance )
         if( playback_fps_meter::fpsMeterShouldReset( ui->actionPlay->isChecked(), hasDraw,
                                                      hasDraw ? lastDrawTime.msecsTo( now ) : 0 ) )
         {
-            const QString playbackFpsText = playbackFpsStatusText( 0.0 );
+            const QString playbackFpsText = playback_conform::playbackFpsStatusText(
+                0.0, getMlvFramerate( m_pMlvObject ), getPlaybackFramerate() );
             if( m_lastPlaybackFpsStatusText != playbackFpsText )
             {
                 m_pFpsStatus->setText( playbackFpsText );
@@ -2973,7 +3074,7 @@ void MainWindow::timerFrameEvent( bool predictivePlaybackAdvance )
     // An early predictive tick is rounded up to a frame period, and a render-thread stall is never one giant
     // catch-up step. The round-up alone outran native pace on a fast GPU: playbackHandling()'s
     // m_playbackPaceGuard is the ceiling (PlaybackNativePaceGuard.h).
-    timeDiff = playback_native_pace::shapedTickTimeDiffMs( timeDiff, getFramerate(), predictivePlaybackAdvance,
+    timeDiff = playback_native_pace::shapedTickTimeDiffMs( timeDiff, getPlaybackFramerate(), predictivePlaybackAdvance,
                                                            ui->actionPlay->isChecked(), hadPendingAdvance );
 
     //Playback
@@ -3063,7 +3164,8 @@ void MainWindow::timerFrameEvent( bool predictivePlaybackAdvance )
             if( shouldUpdateFpsText && m_playbackFpsEmaFrameMs > 0.0 )
             {
                 const double smoothedFps = 1000.0 / m_playbackFpsEmaFrameMs;
-                const QString playbackFpsText = playbackFpsStatusText( smoothedFps );
+                const QString playbackFpsText = playback_conform::playbackFpsStatusText(
+                    smoothedFps, getMlvFramerate( m_pMlvObject ), getPlaybackFramerate() );
                 if( m_lastPlaybackFpsStatusText != playbackFpsText )
                 {
                     m_pFpsStatus->setText( playbackFpsText );
@@ -3075,7 +3177,7 @@ void MainWindow::timerFrameEvent( bool predictivePlaybackAdvance )
         lastTime = nowTime;
 
         //When playback is off, the timeDiff is set to 0 for DropFrameMode
-        if( !ui->actionPlay->isChecked() ) timeDiff = 1000 / getFramerate();
+        if( !ui->actionPlay->isChecked() ) timeDiff = 1000 / getPlaybackFramerate();
     }
     else
     {
@@ -3141,6 +3243,43 @@ void MainWindow::timerEvent(QTimerEvent *t)
     }
 }
 
+// GUI-SMOKE-FOREGROUND-HANG-NOLA-1: resizeEvent's wait for the frame in flight, bounded (ResizeStillDrawingWait.h). It
+// used to be `while( m_frameStillDrawing ) qApp->processEvents();`: a stale-true flag (nothing left in flight to clear
+// it) pumped the GUI thread forever after the smoke runner's showFullScreen() resize. A flag still set while the render
+// thread has stayed idle for the grace window is stale and is cleared; a busy render thread is waited on up to the
+// deadline, then the redraw proceeds. One always-on line whenever it actually waited. The pump itself dispatches no
+// user input (ExcludeUserInputEvents defers it to the next unfiltered pass; adversary r1 A1). A handler the pump runs
+// that starts its own nested event loop (a modal dialog, Updater::getReleaseList) still suspends the wait until that
+// loop returns, as it suspended the old spin; ResizeStillDrawingWait.h "WHAT IS BOUNDED". Returns false on Timeout
+// (the frame asked for has not landed, so the scene still has the old geometry), true otherwise.
+bool MainWindow::waitForResizeStillDrawing( const QString &site )
+{
+    QElapsedTimer clock;
+    clock.start();
+    resize_still_drawing_wait::Callbacks callbacks;
+    callbacks.stillDrawing = [this]() { return m_frameStillDrawing; };
+    std::uint64_t sampledEpoch = 0; // written by each sample inside the renderer's critical section (r4 pass 2 A1)
+    callbacks.renderIdle = [this, &sampledEpoch]() { return renderThreadIdleNoWait( currentPlaybackAdvanceTarget(), &sampledEpoch ); };
+    callbacks.pump = []() { qApp->processEvents( QEventLoop::ExcludeUserInputEvents ); };
+    // adversary r4 A1: work that starts and ends between two samples changes the epoch; the clear is confirmed under the
+    // renderer mutex at the run's epoch, so work that starts after the last sample is never cleared over
+    callbacks.busyEpoch = [&sampledEpoch]() { return sampledEpoch; };
+    callbacks.clearStale = [this]( std::uint64_t epoch ) { return clearStaleStillDrawingIfIdle( currentPlaybackAdvanceTarget(), epoch ); };
+    callbacks.nowMs = [&clock]() { return static_cast<std::int64_t>( clock.elapsed() ); };
+    // adversary r3 pass 2 A1: a renderer-mutex hold shorter than one millisecond tick must still be seen
+    callbacks.nowUs = [&clock]() { return static_cast<std::int64_t>( clock.nsecsElapsed() / 1000 ); };
+    const resize_still_drawing_wait::Result result = resize_still_drawing_wait::wait( callbacks );
+    if( result.outcome == resize_still_drawing_wait::Outcome::NotWaiting ) return true;
+    logInteractionEvent(
+        QStringLiteral("resize.still_drawing_wait"),
+        QStringLiteral("outcome=%1 waited_ms=%2 site=%3 render_idle=%4")
+            .arg( QLatin1String( resize_still_drawing_wait::outcomeName( result.outcome ) ) )
+            .arg( static_cast<qlonglong>( result.waitedMs ) )
+            .arg( site )
+            .arg( bool01( result.renderIdle ) ) );
+    return result.outcome != resize_still_drawing_wait::Outcome::Timeout;
+}
+
 //Window resized -> scale picture
 void MainWindow::resizeEvent(QResizeEvent *event)
 {
@@ -3179,15 +3318,27 @@ void MainWindow::resizeEvent(QResizeEvent *event)
             m_pRenderThread->lock();
             m_pRenderThread->unlock();
         }
-        while( m_frameStillDrawing ) qApp->processEvents();
+        waitForResizeStillDrawing( QStringLiteral("resize") );
         drawFrame();
         if( ui->checkBoxGradientEnable->isChecked() && ui->groupBoxLinearGradient->isChecked() )
         {
-            while( m_frameStillDrawing ) qApp->processEvents();
-            m_pGradientElement->redrawGradientElement( m_pScene->width(),
-                                                       m_pScene->height(),
-                                                       getMlvWidth( m_pMlvObject ),
-                                                       getMlvHeight( m_pMlvObject ) );
+            // On Timeout the frame drawFrame() asked for has not landed and the scene keeps its old geometry, so no redraw
+            // now (adversary r1 A2).
+            if( waitForResizeStillDrawing( QStringLiteral("gradient") ) )
+            {
+                m_pGradientElement->redrawGradientElement( m_pScene->width(),
+                                                           m_pScene->height(),
+                                                           getMlvWidth( m_pMlvObject ),
+                                                           getMlvHeight( m_pMlvObject ) );
+            }
+            // Every outcome re-anchors on the landed frame: finishPresentedFrame consumes m_zoomModeChanged with a gradient
+            // redraw on the scene that frame sets. A stale or cleared flag does not prove the frame landed: isIdle ignores
+            // a Ready slot whose frameReady has not been emitted yet (RenderFrameThread.cpp), so a late frame can still
+            // change the scene (adversary r1 pass 3 A1). Armed after the wait, so a frame landing inside a pump cannot
+            // consume it early; a spare redraw on an unchanged scene places the overlay where it already is. A frame that
+            // consumes it on the old scene does not strand the overlay either: finishPresentedFrame also re-anchors when the
+            // landed scene differs from the anchored one (gradientNeedsReanchor; adversary r2 pass 3 A1).
+            m_zoomModeChanged = true;
         }
     }
     event->accept();
@@ -3980,9 +4131,12 @@ void MainWindow::queuePlaybackLookaheadRequests(
 // Playback-prep worker queue. drawFrameReady now dispatches work to a background
 // thread, then marshals completion back to the UI thread for final presentation.
 // Conflation is by request serial: only the latest requested serial can present.
-void MainWindow::enqueuePlaybackPrepTask( const PlaybackPrepTask &task )
+// CPU-S1-PACE-NEXT-LEVER-1 (Part A): the task is moved, never copied (each copy of a CPU-route
+// task duplicated its owned RGB16 frame). handoffStartStageTime opens playback_prep_handoff_ms,
+// closed once the task is stored as pending.
+void MainWindow::enqueuePlaybackPrepTask( PlaybackPrepTask &&task, double handoffStartStageTime )
 {
-    PlaybackPrepTask ownedTask = task;
+    PlaybackPrepTask ownedTask = std::move( task );
     ownedTask.rebindOwnedImagePointers();
 
     const uint64_t activeGeneration =
@@ -4015,9 +4169,15 @@ void MainWindow::enqueuePlaybackPrepTask( const PlaybackPrepTask &task )
                 m_pRenderThread->releasePresentedFrameForRequestSerial(
                     m_playbackPrepPending.requestSerial );
         }
-        m_playbackPrepPending = ownedTask;
+        m_playbackPrepPending = std::move( ownedTask );
         m_playbackPrepPending.rebindOwnedImagePointers();
         m_playbackPrepPendingValid = true;
+        if( handoffStartStageTime > 0.0 )
+        {
+            m_playbackPrepPending.readyFrame.stageTimingTelemetry.insert(
+                QStringLiteral("playback_prep_handoff_ms"),
+                ( mlv_stage_timing_now() - handoffStartStageTime ) * 1000.0 );
+        }
     }
     m_playbackPrepCv.notify_one();
 }
@@ -4031,6 +4191,7 @@ void MainWindow::invalidatePlaybackPrepForDisplayChange( const char *reason )
     // A display change re-renders the current frame; clear the forward-only present
     // guard so the next (correct) frame is shown regardless of the previous run.
     m_lastPresentedPlaybackFrame = -1;
+    m_lastDisplayedPlaybackFrame = -1;
     std::vector<uint64_t> serialsToRelease;
     bool droppedPending = false;
     size_t droppedResults = 0;
@@ -4046,9 +4207,11 @@ void MainWindow::invalidatePlaybackPrepForDisplayChange( const char *reason )
             m_playbackPrepPending = PlaybackPrepTask();
         }
         droppedResults = m_playbackPrepResults.size();
-        for( const PlaybackPrepResult &result : m_playbackPrepResults )
+        for( PlaybackPrepResult &result : m_playbackPrepResults )
         {
             serialsToRelease.push_back( result.task.requestSerial );
+            // r3 (adversary A1 on e7e5271e): a dropped result's 8-bit buffer is recycled too.
+            m_playbackPrepRgb8Pool.give( std::move( result.scopeSourceImage ), result.task.presentationGeneration );
         }
         m_playbackPrepResults.clear();
     }
@@ -4138,6 +4301,9 @@ PlaybackPrepDrainOutcome MainWindow::drainPlaybackPrepInFlight( const char *reas
 bool MainWindow::playbackPrepQuiescentBeforeClipReplacement( const char *reason )
 {
     invalidatePlaybackPrepForDisplayChange( reason );
+    // r4 (Dot B1): no recycled 8-bit buffer outlives the clip. After the bump above, so every task
+    // admitted before it is below the pool's floor and its late give() frees its buffer.
+    m_playbackPrepRgb8Pool.clear( m_playbackPresentationGeneration.load( std::memory_order_acquire ) );
     const PlaybackPrepDrainOutcome outcome = drainPlaybackPrepInFlight( reason, 2000 );
     if( playbackPrepBorrowFreeingMutationAllowed( outcome ) ) return true;
     logInteractionEvent(
@@ -4218,8 +4384,14 @@ void MainWindow::recordClipOpenSourceStamp()
 // on false. The destructor joins the prep thread before calling this.
 bool MainWindow::freeActiveMlvObjectAfterLifecycleBarrier( const char *reason )
 {
+    // r3 (adversary A2 on e7e5271e) / r4 (Dot B1, adversary A1 on 391464de): no recycled buffer outlives
+    // an unload. clear(g) raises the pool's floor to g + 1, so every task admitted at or before g gives
+    // its buffer back into the floor and has it freed, whatever the thread interleaving.
     if( !m_pMlvObject )
+    {
+        m_playbackPrepRgb8Pool.clear( m_playbackPresentationGeneration.load( std::memory_order_acquire ) );
         return playbackPrepBorrowFreeingMutationAllowed( drainPlaybackPrepInFlight( reason, 2000 ) );
+    }
 
     const QString reasonText =
         reason && *reason ? QString::fromLatin1( reason ) : QStringLiteral("unspecified");
@@ -4229,6 +4401,8 @@ bool MainWindow::freeActiveMlvObjectAfterLifecycleBarrier( const char *reason )
     m_fileLoaded = false;
     m_dontDraw = true;
     clearPresentationForClipOpen( barrierReason );
+    // r4: after clearPresentationForClipOpen's generation bump (and its queued-result give), before the drain.
+    m_playbackPrepRgb8Pool.clear( m_playbackPresentationGeneration.load( std::memory_order_acquire ) );
     const bool prepMutationAllowed = waitForRenderThreadIdleBeforeCoreMutation( barrierReason );
     drainLookAssistWorkers( barrierReason );
     m_clipLifecycleBarrier.waitForNoBorrowers();
@@ -4251,8 +4425,9 @@ bool MainWindow::freeActiveMlvObjectAfterLifecycleBarrier( const char *reason )
 // CPU route's scratch, reduced-input buffer and reduced-mask cache, and one avir
 // thread pool instead of one per frame. Callers without it (the inline GUI-thread
 // prep) get per-call temporaries, the pre-card behaviour.
-// D1 (r2): the tier-1 uses of this object -- the persistent full-size scratch
-// and the shared avir pool -- follow MLVAPP_PLAYBACK_PREP_TIER1 (default off).
+// D1 (r2): the tier-1 use of this object -- the shared avir pool -- follows
+// MLVAPP_PLAYBACK_PREP_TIER1 (default off). The persistent full-size 16-bit
+// scratch is used with the switch off too (CPU-S1-PACE-NEXT-LEVER-1 Part B).
 // The object itself is always built: tier 2 cannot run without it. Its
 // reduced-input buffer and reduced-mask cache live in `cpu`, and tier 2 is
 // eligible only when it exists (reducedInputs.playbackActive below requires
@@ -4471,7 +4646,10 @@ MainWindow::PlaybackPrepResult MainWindow::buildPlaybackPrepResult( const Playba
                                              task.mlvWidth,
                                              task.mlvHeight,
                                              &reducedSourceConfig );
-        std::vector<uint8_t> cpuPreviewRgb8;
+        // CPU-S1-PACE-NEXT-LEVER-1 r3: on the worker, develop into a recycled buffer (given back
+        // by onPlaybackPrepResultReady after the present) instead of a fresh 12 MB vector per frame.
+        std::vector<uint8_t> cpuPreviewRgb8 =
+            threadState ? m_playbackPrepRgb8Pool.take() : std::vector<uint8_t>();
         const PlaybackPrepCpuRouteResult cpuRoute =
             playbackPrepCpuRouteRun( cpuWorkspace,
                                      reducedSource ? reducedSourceConfig : gpuPreviewProcessingConfig,
@@ -4494,6 +4672,7 @@ MainWindow::PlaybackPrepResult MainWindow::buildPlaybackPrepResult( const Playba
         QJsonObject &spanTelemetry = result.task.readyFrame.stageTimingTelemetry;
         spanTelemetry.insert( QStringLiteral("playback_prep_cpu_route_active"), true );
         spanTelemetry.insert( QStringLiteral("playback_prep_alloc_ms"), cpuRoute.allocMs );
+        spanTelemetry.insert( QStringLiteral("playback_prep_out8_allocated"), cpuRoute.out8Allocated );
         spanTelemetry.insert( QStringLiteral("playback_prep_reduce_ms"), cpuRoute.reduceMs );
         spanTelemetry.insert( QStringLiteral("playback_prep_sh_expand_ms"), cpuRoute.spans.shExpandMs );
         spanTelemetry.insert( QStringLiteral("playback_prep_pointwise_ms"), cpuRoute.spans.pointwiseMs );
@@ -4874,10 +5053,12 @@ void MainWindow::playbackPrepThreadLoop( void )
                     || m_playbackPrepPendingValid;
             } );
             if( m_playbackPrepStop.load( std::memory_order_acquire ) ) return;
-            task = m_playbackPrepPending;
+            // CPU-S1-PACE-NEXT-LEVER-1 (Part A): moved out, never copied.
+            task = std::move( m_playbackPrepPending );
             task.rebindOwnedImagePointers();
+            m_playbackPrepPending = PlaybackPrepTask();
             m_playbackPrepPendingValid = false;
-            m_playbackPrepInFlight.beginLocked( task.requestSerial );
+            m_playbackPrepInFlight.beginLocked( task.requestSerial, static_cast<int64_t>( task.displayFrame ) );
         }
 
         const double workerStart = mlv_stage_timing_now();
@@ -4908,6 +5089,14 @@ void MainWindow::playbackPrepThreadLoop( void )
         PlaybackPrepResult result = buildPlaybackPrepResult( task, &threadState );
         result.workerQueueMs = task.workerQueueMs;
         result.workerTotalMs = ( mlv_stage_timing_now() - workerStart ) * 1000.0;
+        // CPU-S1-PACE-NEXT-LEVER-1: the borrowed slot must not have changed under the build
+        // (the slot is still pinned here; it is released only at present or on a drop).
+        if( task.borrowedSlotRgb16 && task.borrowedRgb16HashValid
+         && playbackPrepSampledRgb16Fnv( task.sourceImage16, task.borrowedRgb16Words )
+                != task.borrowedRgb16Fnv )
+        {
+            m_playbackPrepBorrowedRgb16MutatedCount.fetch_add( 1, std::memory_order_acq_rel );
+        }
 
         // Generation changes invalidate display assumptions. Serial changes
         // only mean a newer request exists: discarding every completed frame
@@ -4922,6 +5111,7 @@ void MainWindow::playbackPrepThreadLoop( void )
             ++m_playbackPrepGenerationDropCount;
             if( m_pRenderThread )
                 m_pRenderThread->releasePresentedFrameForRequestSerial( result.task.requestSerial );
+            m_playbackPrepRgb8Pool.give( std::move( result.scopeSourceImage ), result.task.presentationGeneration );   // r3 (adversary A1 on e7e5271e)
             m_playbackPrepInFlight.endLocked();
             continue;
         }
@@ -4930,6 +5120,7 @@ void MainWindow::playbackPrepThreadLoop( void )
             std::lock_guard<std::mutex> lk( m_playbackPrepMutex );
             if( m_pRenderThread )
                 m_pRenderThread->releasePresentedFrameForRequestSerial( result.task.requestSerial );
+            m_playbackPrepRgb8Pool.give( std::move( result.scopeSourceImage ), result.task.presentationGeneration );   // r3 (adversary A1 on e7e5271e)
             m_playbackPrepInFlight.endLocked();
             continue;
         }
@@ -4939,13 +5130,15 @@ void MainWindow::playbackPrepThreadLoop( void )
             std::lock_guard<std::mutex> lk( m_playbackPrepMutex );
             if( !m_playbackPrepResults.empty() )
             {
-                for( const PlaybackPrepResult &staleResult : m_playbackPrepResults )
+                for( PlaybackPrepResult &staleResult : m_playbackPrepResults )
                 {
                     ++m_playbackPrepStaleDropCount;
                     ++m_playbackPrepReplacedAfterComputeCount;
                     if( m_pRenderThread )
                         m_pRenderThread->releasePresentedFrameForRequestSerial(
                             staleResult.task.requestSerial );
+                    // r3 (adversary A1 on e7e5271e): the replaced result's buffer is recycled, not freed.
+                    m_playbackPrepRgb8Pool.give( std::move( staleResult.scopeSourceImage ), staleResult.task.presentationGeneration );
                 }
                 m_playbackPrepResults.clear();
             }
@@ -4996,6 +5189,7 @@ void MainWindow::onPlaybackPrepResultReady( void )
             true );
         if( m_pRenderThread )
             m_pRenderThread->releasePresentedFrameForRequestSerial( result.task.requestSerial );
+        m_playbackPrepRgb8Pool.give( std::move( result.scopeSourceImage ), result.task.presentationGeneration );   // r3 (adversary A1 on e7e5271e)
         m_frameStillDrawing = renderThreadBusyForPlaybackAdvance( currentPlaybackAdvanceTarget() );
         return;
     }
@@ -5011,6 +5205,10 @@ void MainWindow::onPlaybackPrepResultReady( void )
     }
 
     presentPlaybackPreparedFrame( result );
+    // CPU-S1-PACE-NEXT-LEVER-1 r3: the present is done with the developed frame (nothing keeps a
+    // pointer into it past this point: it used to be freed right here), so its buffer goes back
+    // to the prep worker's pool.
+    m_playbackPrepRgb8Pool.give( std::move( result.scopeSourceImage ), result.task.presentationGeneration );
     openGuiPresentGap();
 }
 
@@ -5025,7 +5223,36 @@ void MainWindow::openGuiPresentGap( void )
     if( !m_playbackSmokeActive || !m_guiPresentIdleProbeConnected ) return;
     m_guiPresentGapRunnerSleepNs = 0;
     m_guiPresentGapPaintStartMs = ui->graphicsView->paintTiming().sumMs;
+    ++m_guiPresentGapSerial;
+    m_guiOtherBusySpans.openGap();
     m_guiPresentGapStartNs = m_guiPresentGapClock.nsecsElapsed();
+}
+
+// CPU-S1-RECON-UNDER-LOOK-PACE-LEVER-1 (Part B): the clock a GUI handler span reads at its start and
+// end. gapSerial 0 = no gap open, so a span outside a gap (or across a gap's open or close) is dropped.
+gui_present_gap::SpanClock MainWindow::guiOtherBusySpanClock( void ) const
+{
+    gui_present_gap::SpanClock clock;
+    clock.gapSerial = m_guiPresentGapStartNs >= 0 ? m_guiPresentGapSerial : 0;
+    clock.nowNs = m_guiPresentGapClock.nsecsElapsed();
+    clock.idleNs = m_guiPresentGapIdle.idleNs;
+    clock.runnerSleepNs = m_guiPresentGapRunnerSleepNs;
+    clock.paintMs = ui->graphicsView->paintTiming().sumMs;
+    return clock;
+}
+
+// Only inside a smoke session whose idle probe is connected (the gap is never open otherwise): one
+// branch per handler call when off.
+MainWindow::GuiOtherBusyScope::GuiOtherBusyScope( MainWindow *window, gui_present_gap::OtherBusySpan span )
+    : m_window( ( window->m_playbackSmokeActive && window->m_guiPresentIdleProbeConnected ) ? window : nullptr )
+    , m_span( span )
+{
+    if( m_window ) m_window->m_guiOtherBusySpans.begin( m_window->guiOtherBusySpanClock() );
+}
+
+MainWindow::GuiOtherBusyScope::~GuiOtherBusyScope()
+{
+    if( m_window ) m_window->m_guiOtherBusySpans.end( m_span, m_window->guiOtherBusySpanClock() );
 }
 
 void MainWindow::closeGuiPresentGap( void )
@@ -5048,6 +5275,7 @@ void MainWindow::closeGuiPresentGap( void )
     gaps.busyMaxMs = qMax( gaps.busyMaxMs, split.busyMs );
     gaps.otherBusySumMs += split.otherBusyMs;
     gaps.otherBusyMaxMs = qMax( gaps.otherBusyMaxMs, split.otherBusyMs );
+    m_guiOtherBusySpans.closeGap( split.otherBusyMs );
     m_guiPresentGapStartNs = -1;
     m_guiPresentGapIdle = gui_present_gap::IdleWaits();
 }
@@ -6513,6 +6741,13 @@ void MainWindow::presentPlaybackPreparedFrame( const PlaybackPrepResult &result 
         return;
     }
 
+    // CPU-S1-PACE-NEXT-LEVER-1: region_image's residual (after from_image and viewport) split
+    // into the magenta-band check, the trace hash, the setPixmap and the slot release.
+    double prepRegionImageMagentaMs = 0.0;
+    double prepRegionImageHashMs = 0.0;
+    double prepRegionImageSetPixmapMs = 0.0;
+    double prepRegionImageReleaseMs = 0.0;
+    const qint64 prepRegionImageMagentaStartNs = prepRegionClock.nsecsElapsed();
     int suppressedPresentedTopMagentaBandRows = 0;
     if( !framePresentedByViewport
      && playbackPolicyActive()
@@ -6529,6 +6764,8 @@ void MainWindow::presentPlaybackPreparedFrame( const PlaybackPrepResult &result 
     readyFrame.stageTimingTelemetry.insert(
         QStringLiteral("draw_frame_ready_present_top_magenta_band_rows"),
         suppressedPresentedTopMagentaBandRows );
+    prepRegionImageMagentaMs = prepRegionElapsedMs( prepRegionImageMagentaStartNs );
+    const qint64 prepRegionImageHashStartNs = prepRegionClock.nsecsElapsed();
 
     /* Presented-content hash: a sampled FNV-1a over the bytes about to be
      * shown, while the source buffer is still held (pre-release, so the
@@ -6565,18 +6802,24 @@ void MainWindow::presentPlaybackPreparedFrame( const PlaybackPrepResult &result 
                 .arg( QString::number( contentHash, 16 ) ),
             true );
     }
+    prepRegionImageHashMs = prepRegionElapsedMs( prepRegionImageHashStartNs );
 
     bool imagePresentedByViewport = false;
+    // CPU-S1-RECON-UNDER-LOOK-PACE-LEVER-1 (Part B): region_image split into its two calls.
+    double prepRegionImageViewportMs = 0.0;
+    double prepRegionImageFromImageMs = 0.0;
     if( !framePresentedByViewport )
     {
         // Threaded through so GpuDisplayWindow can record which requestSerial it actually
         // swapped in -- see GpuDisplayWindow::grabPresentedFramebufferIfActive.
         GpuDisplayViewport::PresentationOptions presentationOptions = task.gpuPresentationOptions;
         presentationOptions.presentationSerial = task.requestSerial;
+        const qint64 prepRegionImageViewportStartNs = prepRegionClock.nsecsElapsed();
         imagePresentedByViewport = GpuDisplayViewport::presentImage( ui->graphicsView,
                                                                       m_pGraphicsItem,
                                                                       displayImage,
                                                                       presentationOptions );
+        prepRegionImageViewportMs = prepRegionElapsedMs( prepRegionImageViewportStartNs );
     }
 
     if( !framePresentedByViewport && !imagePresentedByViewport )
@@ -6621,33 +6864,68 @@ void MainWindow::presentPlaybackPreparedFrame( const PlaybackPrepResult &result 
                                   &meta );
         }
 
-        QPixmap pic = cachedPixmapAvailable ? cachedPixmap : QPixmap::fromImage( displayImage );
+        QPixmap pic;
+        if( cachedPixmapAvailable )
+        {
+            pic = cachedPixmap;
+        }
+        else
+        {
+            const qint64 prepRegionImageFromImageStartNs = prepRegionClock.nsecsElapsed();
+            pic = QPixmap::fromImage( displayImage );
+            prepRegionImageFromImageMs = prepRegionElapsedMs( prepRegionImageFromImageStartNs );
+        }
+        const qint64 prepRegionImageSetPixmapStartNs = prepRegionClock.nsecsElapsed();
         if( zoomFitEnabled && pic.devicePixelRatio() == 1.0 )
         {
             pic.setDevicePixelRatio( devicePixelRatioF() );
         }
         m_pGraphicsItem->setPixmap( pic );
         m_graphicsItemPresentedSerial = task.requestSerial;
+        ui->graphicsView->notePixmapPresentSerial( static_cast<quint64>( task.requestSerial ) );   // r28: its paint is deferred
+        prepRegionImageSetPixmapMs = prepRegionElapsedMs( prepRegionImageSetPixmapStartNs );
         if( !displayPreviewCachingAllowed
          && m_pRenderThread
          && !releasePresentedFrameEarly )
         {
+            const qint64 prepRegionImageReleaseStartNs = prepRegionClock.nsecsElapsed();
             m_pRenderThread->releasePresentedFrameForRequestSerial( readyFrame.requestSerial );
             releasePresentedFrameEarly = true;
+            prepRegionImageReleaseMs = prepRegionElapsedMs( prepRegionImageReleaseStartNs );
         }
     }
     else if( !displayPreviewCachingAllowed
           && m_pRenderThread
           && !releasePresentedFrameEarly )
     {
+        const qint64 prepRegionImageReleaseStartNs = prepRegionClock.nsecsElapsed();
         m_pRenderThread->releasePresentedFrameForRequestSerial( readyFrame.requestSerial );
         releasePresentedFrameEarly = true;
+        prepRegionImageReleaseMs = prepRegionElapsedMs( prepRegionImageReleaseStartNs );
     }
 
     prepRegionImageMs = prepRegionElapsedMs( prepRegionImageStartNs );
     readyFrame.stageTimingTelemetry.insert(
         QStringLiteral("playback_prep_region_image_ms"),
         prepRegionImageMs );
+    readyFrame.stageTimingTelemetry.insert(
+        QStringLiteral("playback_prep_region_image_from_image_ms"),
+        prepRegionImageFromImageMs );
+    readyFrame.stageTimingTelemetry.insert(
+        QStringLiteral("playback_prep_region_image_viewport_ms"),
+        prepRegionImageViewportMs );
+    readyFrame.stageTimingTelemetry.insert(
+        QStringLiteral("playback_prep_region_image_magenta_ms"),
+        prepRegionImageMagentaMs );
+    readyFrame.stageTimingTelemetry.insert(
+        QStringLiteral("playback_prep_region_image_hash_ms"),
+        prepRegionImageHashMs );
+    readyFrame.stageTimingTelemetry.insert(
+        QStringLiteral("playback_prep_region_image_set_pixmap_ms"),
+        prepRegionImageSetPixmapMs );
+    readyFrame.stageTimingTelemetry.insert(
+        QStringLiteral("playback_prep_region_image_release_ms"),
+        prepRegionImageReleaseMs );
     m_lastDrawFrameReadyImageMs = prepRegionImageMs;
     mlv_stage_timing_note_elapsed("drawFrameReady.image", display_frame, m_lastDrawFrameReadyImageMs);
 
@@ -6849,6 +7127,7 @@ void MainWindow::computeDisplaySceneGeometry( int sourceWidth,
 //Draw a raw picture to the gui -> start render thread
 void MainWindow::drawFrame( bool updateTimecodeLabel )
 {
+    const GuiOtherBusyScope otherBusySpan( this, gui_present_gap::OtherBusySpan::DrawFrame );
     if( !m_clipLifecycleBarrier.acceptingRequests() )
     {
         m_frameStillDrawing = false;
@@ -7034,6 +7313,7 @@ void MainWindow::drawFrame( bool updateTimecodeLabel )
         m_playbackStartupSplit.noteRequest( ( mlv_stage_timing_now() - m_playbackSmokeStartTime ) * 1000.0 );
     PresentationRequestContext requestContext;
     requestContext.requestSerial = requestSerial;
+    requestContext.engineWrapsAtRequest = m_playbackWrapRecorder.engineWraps;   // r17 adversary A1: see presentationLoopWraps
     requestContext.sceneWidth = sceneWidth;
     requestContext.sceneHeight = sceneHeight;
     requestContext.devicePixelRatioMilli = devicePixelRatioMilli;
@@ -9286,6 +9566,8 @@ int MainWindow::runGuiPlaybackSmoke(const GuiPlaybackSmokeOptions & options)
     // launch that bypassed tools/profiling/run-release-gui-smoke.ps1 (a direct exe launch). The clip must
     // be at least its floor (HFR-10S-1: 10 s for an HFR clip, else 20 s) and must outlast the play window
     // measured from --start-frame; path-free message.
+    // SOURCE seconds at the NATIVE fps, conformed or not (HUB RULING 2026-10-30T22:17:51Z): a 59.94 fps clip of 971
+    // frames is 16.2 s whatever rate it plays at.
     {
         const int guardFrames = static_cast<int>( getMlvFrames( m_pMlvObject ) );
         const double guardFps = static_cast<double>( getMlvFramerate( m_pMlvObject ) );
@@ -9965,7 +10247,9 @@ int MainWindow::runGuiPlaybackSmoke(const GuiPlaybackSmokeOptions & options)
     // The shared gate (programmaticPlay) refuses BEFORE Play -- path-free, typed exit 14 -- unless that
     // window is >= 20 s AND >= the requested window; this is also the one Play of the process.
     // A --presented-frames target ends the Play early after N presented frames, so it is a play window
-    // of N / fps seconds and must reach the 20 s floor too (a pinned run of 24 frames would play ~1 s).
+    // of N / fps seconds and must reach the clip's floor too (a pinned run of 24 frames would play ~1 s).
+    // fps is the NATIVE rate, conformed or not (HUB RULING 2026-10-30T22:17:51Z): each present advances one source
+    // frame, so a conformed HFR clip needs 600 presents for its 10 s floor, as a native one does.
     const double presentedTargetFps = static_cast<double>( getMlvFramerate( m_pMlvObject ) );
     if( !playback_frame_range::presentedFramesTargetReachesFloor( options.targetPresentedFrames, presentedTargetFps ) )
     {
@@ -10047,7 +10331,9 @@ int MainWindow::runGuiPlaybackSmoke(const GuiPlaybackSmokeOptions & options)
         m_contactSheetCaptureTargetSourceFrames.clear();
         // VENUE-LEG-AGXOFF-UNPACED-HEADROOM-1 r2 (sol B1): unpaced, the Play stops at its required source frames,
         // which a fast run reaches before the wall-clock centres; its targets are source-frame centres instead.
-        m_contactSheetCaptureUnpaced = m_automationPacingIsolated && mlvappPlaybackUnpacedRequested();
+        // MERGE-MASTER r3 (adversary A3): a CONFORMED Play's window counts source seconds, so its targets are source frames too.
+        m_contactSheetCaptureUnpaced = playback_frame_range::contactSheetInPassTargetsAreSourceFrames(
+            m_automationPacingIsolated && mlvappPlaybackUnpacedRequested(), playbackConformActive(), m_playRequiredSourceFrames );
         for( int i = 0; i < options.contactSheetFrames; ++i )
         {
             m_contactSheetCaptureTargetMs.append( static_cast<qint64>(
@@ -10060,7 +10346,7 @@ int MainWindow::runGuiPlaybackSmoke(const GuiPlaybackSmokeOptions & options)
         m_contactSheetPendingGrabs.clear();
         m_contactSheetCaptureNextTargetIndex = 0;
         m_contactSheetCaptureStartFrame = ui->horizontalSliderPosition->value();
-        m_contactSheetCaptureFps = getFramerate();
+        m_contactSheetCaptureFps = getPlaybackFramerate();
         m_contactSheetCaptureError.clear();
         m_contactSheetCaptureClock.start();
         m_contactSheetCaptureActive = true;
@@ -10499,7 +10785,13 @@ int MainWindow::runGuiPlaybackSmoke(const GuiPlaybackSmokeOptions & options)
         repaint();
         qApp->processEvents( QEventLoop::AllEvents );
 
-        QPixmap windowScreenshot = grab();
+        QPixmap windowScreenshot;
+        {
+            // HFR-NATIVE-60FPS-FULLRES-1: the grab renders the graphics view (its GL viewport FBO or CPU pixmap) into a pixmap, never
+            // onto the screen, so the paint it triggers neither credits the conform tracker nor marks the frame composed
+            const playback_paint_credit::OffscreenPaintScope offscreen;   // r30 fix iteration 1 (adversary A1 on fad36acf)
+            windowScreenshot = grab();
+        }
         QString windowScreenshotMethod = QStringLiteral("app_internal_window_grab");
         bool glWindowComposited = false;
         QString glWindowCompositeReason;
@@ -10647,7 +10939,7 @@ int MainWindow::runGuiPlaybackSmoke(const GuiPlaybackSmokeOptions & options)
          && ui->graphicsView
          && ui->graphicsView->viewport() )
         {
-            screenshot = ui->graphicsView->viewport()->grab();
+            screenshot = grabGraphicsViewportOffscreen();
             screenshotMethod = QStringLiteral("app_internal_gl_viewport_grab");
         }
         if( screenshot.isNull() && m_pGraphicsItem )
@@ -10656,7 +10948,7 @@ int MainWindow::runGuiPlaybackSmoke(const GuiPlaybackSmokeOptions & options)
         }
         if( screenshot.isNull() && ui->graphicsView && ui->graphicsView->viewport() )
         {
-            screenshot = ui->graphicsView->viewport()->grab();
+            screenshot = grabGraphicsViewportOffscreen();
             screenshotMethod = QStringLiteral("app_internal_viewport_grab");
         }
 
@@ -11086,7 +11378,7 @@ int MainWindow::runGuiPlaybackSmoke(const GuiPlaybackSmokeOptions & options)
         if( smokeFirstPresentCaptureRequested() )
             writeFirstPresentIdentity( options.contactSheetDir, m_identityPrePlayFrame );
 
-        const double contactSheetFps = getFramerate();
+        const double contactSheetFps = getPlaybackFramerate();
         const int contactSheetClipFrameCount = loadedFrameCount();
         const int sheetStartFrame = qBound(
             0, contactSheetStartFrame, qMax( 0, contactSheetClipFrameCount - 1 ) );
@@ -11251,7 +11543,7 @@ int MainWindow::runGuiPlaybackSmoke(const GuiPlaybackSmokeOptions & options)
                        || GpuDisplayViewport::hasPresentedGpuReconTexture( ui->graphicsView ) )
                      && ui->graphicsView && ui->graphicsView->viewport() )
                     {
-                        contactFrameImage = ui->graphicsView->viewport()->grab().toImage();
+                        contactFrameImage = grabGraphicsViewportOffscreen().toImage();
                         contactFrameSource = QStringLiteral("app_internal_gl_viewport_grab");
                     }
                     if( contactFrameImage.isNull() && m_pGraphicsItem )
@@ -11261,7 +11553,7 @@ int MainWindow::runGuiPlaybackSmoke(const GuiPlaybackSmokeOptions & options)
                     }
                     if( contactFrameImage.isNull() && ui->graphicsView && ui->graphicsView->viewport() )
                     {
-                        contactFrameImage = ui->graphicsView->viewport()->grab().toImage();
+                        contactFrameImage = grabGraphicsViewportOffscreen().toImage();
                         contactFrameSource = QStringLiteral("app_internal_viewport_grab");
                     }
                     // r2 (A1): the presentation serial OF THE SURFACE THE IMAGE WAS READ FROM -- never inferred from
@@ -11866,6 +12158,9 @@ int MainWindow::openMlv( QString fileName )
 
     //Reset audio engine
     m_pAudioPlayback->resetAudioEngine();
+    // MERGE-MASTER r7 (sol r6 B2): the reset closes the engine the last applied sync started, and Play can survive a
+    // reopen (rename), so forget that sync: the new clip's first requested sync is applied, never dropped as a duplicate.
+    forgetAppliedPlaybackAudioSync();
 
     /* Destroy it just for simplicity... and make a new one */
     if( !freeActiveMlvObjectAfterLifecycleBarrier( "clip-open" ) )
@@ -12004,7 +12299,8 @@ int MainWindow::openMlv( QString fileName )
     ui->horizontalSliderPosition->setMaximum( getMlvFrames( m_pMlvObject ) - 1 );
 
     //Restart timer
-    m_timerId = mlvappStartPlaybackTimer( this, getFramerate() );
+    m_timerId = mlvappStartPlaybackTimer( this, getPlaybackFramerate() );
+    refreshPlaybackFpsStatus();
 
     if( ui->actionDontSwitchDebayerForPlayback->isChecked() )
     {
@@ -12047,6 +12343,9 @@ int MainWindow::openMlv( QString fileName )
         applyPlaybackDebayerSelection();
     }
 
+    // MERGE-MASTER r7 (sol r6 B2): the new engine below has applied no sync (one consumed while the open pumped events
+    // went to the reset engine), so the memo is forgotten again right before it.
+    forgetAppliedPlaybackAudioSync();
     //Init audio playback engine
     m_pAudioPlayback->initAudioEngine( m_pMlvObject );
     armPlaybackRoutePrewarm();
@@ -12055,6 +12354,10 @@ int MainWindow::openMlv( QString fileName )
     ++m_lookAssistAsyncGeneration;
     m_fileLoaded = true;
     resetPlaybackQualityAutoRunState();
+    // MERGE-MASTER r11 (ADV-A2): the refresh after the timer restart above ran while m_fileLoaded was still false, so
+    // playbackConformActive() was false and the conform audio-mute tooltip was installed empty. Refresh it once the
+    // clip counts as loaded.
+    refreshPlaybackFpsStatus();
 
     //Audio Track
     paintAudioTrack();
@@ -12126,6 +12429,7 @@ int MainWindow::openMlv( QString fileName )
 //Handles the playback and must be triggered from timer
 void MainWindow::playbackHandling(int timeDiff)
 {
+    const GuiOtherBusyScope otherBusySpan( this, gui_present_gap::OtherBusySpan::PlaybackHandling );
     if( ui->actionPlay->isChecked() )
     {
         if( m_fileLoaded && m_pMlvObject )
@@ -12142,8 +12446,11 @@ void MainWindow::playbackHandling(int timeDiff)
         // (r1 venue: Reached at 480 frames, seen at 615). Once the required source frames are consumed, hold.
         if( m_automationPacingIsolated && mlvappPlaybackUnpacedRequested() && programmaticPlayConsumed() ) return;
 
-        //when on last frame
-        if( ui->horizontalSliderPosition->value() >= ui->spinBoxCutOut->value() - 1 )
+        //when on last frame (r32 fix iteration 2, adversary A1 + A2 on 03850f7b: under conform with Drop Frame and Loop the
+        //drop-frame engine owns the wrap from the last frame -- see playback_frame_range::outerLastFrameBranchHandlesTick)
+        if( playback_frame_range::outerLastFrameBranchHandlesTick(
+                ui->horizontalSliderPosition->value(), ui->spinBoxCutOut->value(),
+                ui->actionDropFrameMode->isChecked(), ui->actionLoop->isChecked(), playbackConformActive() ) )
         {
             if( ui->actionLoop->isChecked() )
             {
@@ -12173,8 +12480,10 @@ void MainWindow::playbackHandling(int timeDiff)
                     ? requestedCutInFrame
                     : clampedCutInFrame;
                 //Loop, goto cut in
-                // PLAYBACK-CLIP-LENGTH-ENFORCE-1 round 2: THE engine wrap -- counted here, not inferred.
-                m_playbackWrapRecorder.noteEngineWrap();
+                // PLAYBACK-CLIP-LENGTH-ENFORCE-1 round 2: THE engine wrap -- counted here, not inferred. r21 (adversary A1 on
+                // 43db3021): credited the distance from the playhead back to cut-in plus its one frame, so a Cut Out moved
+                // below the playhead before the wrap is still one frame, never a negative distance credited as nothing.
+                m_playbackWrapRecorder.noteEngineWrap( playback_frame_range::loopWrapWidth( ui->horizontalSliderPosition->value(), cutInFrame ) );
                 m_sourceAdvance.noteEngineTick( ui->horizontalSliderPosition->value(), cutInFrame, true );
                 m_playbackInternalSliderAdvance = true;
                 ui->horizontalSliderPosition->setValue( cutInFrame );
@@ -12183,7 +12492,7 @@ void MainWindow::playbackHandling(int timeDiff)
                     m_playbackSlipHistogram.noteTimelineMove( playback_slip::AdvancePath::LoopWrap,
                                                               ui->horizontalSliderPosition->value(), paceNowMs,
                                                               1.0, m_playbackPaceGuard.creditFrames(),
-                                                              getFramerate(), !paceGuardArmedBeforeTick );
+                                                              getPlaybackFramerate(), !paceGuardArmedBeforeTick );
                 m_frameChanged = true;
                 if( ui->actionAudioOutput->isChecked()
                  || ( repairDisabled && ui->actionDropFrameMode->isChecked() ) )
@@ -12195,7 +12504,7 @@ void MainWindow::playbackHandling(int timeDiff)
                 if( ui->actionAudioOutput->isChecked()
                  && ui->actionDropFrameMode->isChecked() )
                 {
-                    m_tryToSyncAudio = true;
+                    requestPlaybackAudioSync();
                 }
             }
             else
@@ -12222,7 +12531,7 @@ void MainWindow::playbackHandling(int timeDiff)
                         m_playbackSlipHistogram.noteTimelineMove( playback_slip::AdvancePath::WholeFrame,
                                                                   ui->horizontalSliderPosition->value(), paceNowMs,
                                                                   1.0, m_playbackPaceGuard.creditFrames(),
-                                                                  getFramerate(), !paceGuardArmedBeforeTick );
+                                                                  getPlaybackFramerate(), !paceGuardArmedBeforeTick );
                     m_newPosDropMode = ui->horizontalSliderPosition->value(); //track it also, for mode changing
                     m_frameChanged = true;
                 }
@@ -12234,26 +12543,47 @@ void MainWindow::playbackHandling(int timeDiff)
                 //PlaybackFrameRange.h for the BLOCKER note on why the wrapped case can never
                 //return the range's last frame)
                 const double sourcePositionBeforeDropTick = m_newPosDropMode;
+                // HFR-NATIVE-60FPS-FULLRES-1 r24 (key3 B1 M-HFR-CONFORM-SKIP): under conform the catch-up advances by whole
+                // frames, so a tick that owes less than one whole period beyond the next frame presents that frame (never
+                // N -> N + 2 from a fractional position) and carries the rest as m_conformDropDebtFrames, repaid one presented
+                // frame per later tick (adversary A1 on 9b900412); r26: a lone long tick is carried too, and only a backlog above
+                // kConformMaxDebtFrames (a real stall) skips. Without conform the grant is unchanged.
+                // r27 (adversary A1 on be20bc59): the debt is repaid as the renderer PRESENTS, never faster. While a present of the
+                // current target is outstanding and drawFrameReady has not accepted it (m_lastPresentedPlaybackFrame) a conformed
+                // tick does not move past it, so a queued lookahead is never pruned by the repayment (100 -> 102). Fix iteration 1
+                // (adversary A1 on d98be193): with no present outstanding (an invalidation, an idle renderer) nothing holds. r28
+                // (CoS B1 on c4efe7e3): the gate keys off the frame on SCREEN; an accepted frame whose present drawFrameReady has
+                // not dispatched, or that the non-inline prep still holds (pending, in flight, unconsumed), is still to come.
                 const playback_frame_range::DropFrameTickResult dropFrameTick =
                     playback_frame_range::advanceDropFrameTick(
                         m_newPosDropMode,
-                        m_playbackPaceGuard.grant( getFramerate() * (double)timeDiff / 1000.0, paceNowMs, playbackPaceGuardFps() ),
+                        playback_frame_range::conformDropFrameDelta(
+                            m_newPosDropMode,
+                            m_playbackPaceGuard.grant( getPlaybackFramerate() * (double)timeDiff / 1000.0, paceNowMs, playbackPaceGuardFps() ),
+                            playbackConformActive(), m_conformDropDebtFrames,
+                            playback_frame_range::conformTargetShown(
+                                m_lastPresentedPlaybackFrame, conformDisplayedPlaybackFrame(), m_newPosDropMode,
+                                conformAcceptedTargetPresentPending(), conformTargetPresentOutstanding() ) ),
                         ui->spinBoxCutIn->value(), ui->spinBoxCutOut->value(),
-                        ui->actionLoop->isChecked() );
+                        ui->actionLoop->isChecked(),
+                        playbackConformActive() );   // r32 (adversary A1 on 2e0a3985): conform presents the cut's last frame before a Loop wrap
                 // slip_summary: the granted share, read back from the tick (a wrap subtracted the cut range width;
                 // the clamp at the last frame without Loop reports what was actually advanced).
+                // r33 (adversary A1 on e0947e37): a tick can wrap more than one lap; each moved the position back by wrapWidth.
                 const double grantedDropFrames = dropFrameTick.position - sourcePositionBeforeDropTick
-                    + ( dropFrameTick.wrapped ? static_cast<double>( ui->spinBoxCutOut->value() - ui->spinBoxCutIn->value() ) : 0.0 );
+                    + static_cast<double>( dropFrameTick.wrapWidth ) * dropFrameTick.wrapLaps;
                 m_newPosDropMode = dropFrameTick.position;
                 // PLAYBACK-CLIP-LENGTH-ENFORCE-3: the drop-frame engine's source-frame advance (dropped frames
                 // still advance the timeline; a wrap never counts).
                 m_sourceAdvance.noteEngineTick( sourcePositionBeforeDropTick, dropFrameTick.position, dropFrameTick.wrapped );
-                // PLAYBACK-CLIP-LENGTH-ENFORCE-1 round 2: the drop-frame engine wrap, counted where it happens.
-                if( dropFrameTick.wrapped ) m_playbackWrapRecorder.noteEngineWrap();
+                // PLAYBACK-CLIP-LENGTH-ENFORCE-1 round 2: the drop-frame engine wrap, counted where it happens. r21 (key3
+                // M-HFR-DROP-WRAP-WIDTH): it is credited the width the tick subtracted (cutOut - cutIn), not the non-drop
+                // Loop wrap's cutOut - cutIn + 1, which counted one frame the timeline never travelled.
+                if( dropFrameTick.wrapped ) m_playbackWrapRecorder.noteEngineWrap( dropFrameTick.wrapWidth, dropFrameTick.wrapLaps );
                 //Sync audio
                 if( dropFrameTick.wrapped && ui->actionAudioOutput->isChecked() )
                 {
-                    m_tryToSyncAudio = true;
+                    requestPlaybackAudioSync();
                 }
                 //Because we need it NOW, block slider signals and draw after this function in this timerEvent
                 ui->horizontalSliderPosition->blockSignals( true );
@@ -12266,7 +12596,7 @@ void MainWindow::playbackHandling(int timeDiff)
                                               : playback_slip::AdvancePath::DropTick,
                         ui->horizontalSliderPosition->value(), paceNowMs,
                         grantedDropFrames, m_playbackPaceGuard.creditFrames(),
-                        getFramerate(), !paceGuardArmedBeforeTick );
+                        getPlaybackFramerate(), !paceGuardArmedBeforeTick );
                     // PLAYBACK-STARTUP-CATCHUP-BURST-1: startup_catchup_frames, the skips of the first 2 s after Play.
                     if( !dropFrameTick.wrapped
                      && paceNowMs - m_playbackSmokeStartTime * 1000.0 <= playback_native_pace::kStartupCatchupWindowMs )
@@ -12282,6 +12612,7 @@ void MainWindow::playbackHandling(int timeDiff)
         m_newPosDropMode = ui->horizontalSliderPosition->value(); //track it also when playback is off
         m_playbackPaceGuard.reset();
         cancelPlaybackDueWake();   // HFR-NATIVE-M16-1457-GUI-PRESENT-CADENCE-1: a wake is only due against this clock
+        m_conformDropDebtFrames = 0.0;
     }
 }
 
@@ -12608,6 +12939,7 @@ void MainWindow::initGui( void )
              &MainWindow::showPerformanceProfilingDialog );
     ui->menuPlayback->addSeparator();
     ui->menuPlayback->addAction( performanceProfilingAction );
+    setupPlaybackConformMenu();
     connect( ui->actionDropFrameMode,
              &QAction::toggled,
              this,
@@ -12788,9 +13120,10 @@ void MainWindow::initGui( void )
 
     //Set up fps status label
     m_pFpsStatus = new QLabel( statusBar() );
-    m_pFpsStatus->setMaximumWidth( 110 );
-    m_pFpsStatus->setMinimumWidth( 110 );
-    m_pFpsStatus->setText( playbackFpsStatusText( 0.0 ) );
+    // Wide enough for the conform suffix, e.g. "Playback: 24 fps (59.94 -> 24)".
+    m_pFpsStatus->setMaximumWidth( 210 );
+    m_pFpsStatus->setMinimumWidth( 210 );
+    m_pFpsStatus->setText( playback_conform::playbackFpsStatusText( 0.0, 0.0, 0.0 ) );
     m_lastPlaybackFpsStatusText = m_pFpsStatus->text();
     //m_pFpsStatus->setFrameStyle(QFrame::Panel | QFrame::Sunken);
     statusBar()->addWidget( m_pFpsStatus );
@@ -16121,6 +16454,7 @@ void MainWindow::deleteSession()
     invalidateDisplayPreviewCache();
     GpuDisplayViewport::clearPresentedImage( ui->graphicsView, m_pGraphicsItem );
     m_pGraphicsItem->setPixmap( QPixmap( ":/IMG/IMG/TransDummy.png" ) );
+    ui->graphicsView->notePixmapPresentSerial( 0 );   // r30 fix iteration 1 (adversary A2 on fad36acf): the placeholder carries no frame
     m_graphicsItemPresentedSerial = 0;
     m_pScene->setSceneRect( 0, 0, 10, 10 );
 
@@ -19992,6 +20326,8 @@ void MainWindow::setPreviewMode( void )
 }
 
 //Get the framerate. Override or Original
+//EXPORT / METADATA / TIMECODE rate: the export FPS override lives here and ONLY here. Playback reads
+//getPlaybackFramerate().
 double MainWindow::getFramerate( void )
 {
     // PLAYBACK-CLIP-LENGTH-ENFORCE-3: an automation run (GUI smoke, profile, autoplay hook) never reads the
@@ -20001,12 +20337,212 @@ double MainWindow::getFramerate( void )
     else return getMlvFramerate( m_pMlvObject );
 }
 
+//Get the rate the PLAYBACK timeline runs at (PLAYBACK-HFR-CONFORM-DEFAULT-1): the clip's own
+//rate, or the conform rate for a high-frame-rate clip. No export-override input, by design.
+double MainWindow::getPlaybackFramerate( void )
+{
+    return playback_conform::playbackFps( getMlvFramerate( m_pMlvObject ), m_conformEnabled, m_conformTargetFps, m_conformThresholdFps );
+}
+
+bool MainWindow::playbackConformActive( void )
+{
+    return m_fileLoaded && m_pMlvObject
+        && playback_conform::conformApplies( getMlvFramerate( m_pMlvObject ), m_conformEnabled, m_conformTargetFps, m_conformThresholdFps );
+}
+
+//Auto quality target: capped by the playback rate ONLY while conform is active, so a clip at or under
+//the threshold (a 23.976 clip included) keeps the user's Auto budget. An explicit env override of the
+//Auto target is a diagnostic and stays authoritative.
+int MainWindow::effectivePlaybackAutoTargetFps( void )
+{
+    if( playback_auto_target_fps_env_override() > 0 ) return m_playbackAutoTargetFps;
+    return playback_conform::effectiveAutoTargetFps( m_playbackAutoTargetFps, m_pMlvObject ? getPlaybackFramerate() : 0.0, playbackConformActive() );
+}
+
+//The ONLY place m_tryToSyncAudio is raised: audio is muted while conform is active (its native
+//rate cannot follow slowed-down picture); the saved actionAudioOutput is left untouched.
+void MainWindow::requestPlaybackAudioSync( void )
+{
+    if( !playback_conform::audioSyncAllowed( playbackConformActive() ) ) return;
+    m_tryToSyncAudio = true;
+}
+
+void MainWindow::refreshPlaybackFpsStatus( void )
+{
+    if( !m_pFpsStatus ) return;
+    const QString text = playback_conform::playbackFpsStatusText(
+        0.0, getMlvFramerate( m_pMlvObject ), getPlaybackFramerate() );
+    m_pFpsStatus->setText( text );
+    m_lastPlaybackFpsStatusText = text;
+    m_pFpsStatus->setToolTip( playbackConformActive() && ui->actionAudioOutput->isChecked()
+                                  && doesMlvHaveAudio( m_pMlvObject )
+                                  ? playback_conform::audioMutedStatusText()
+                                  : QString() );
+}
+
+// MERGE-MASTER r5 (AUDIO-A1): every conform control records the clip's conform state and playback rate before it changes
+// them; applyPlaybackConformSettings compares the two (playback_conform::pendingAudioStartOnConformChange).
+void MainWindow::noteConformStateBeforeChange( void )
+{
+    m_conformActiveBeforeChange = playbackConformActive();
+    m_conformPlaybackFpsBeforeChange = m_pMlvObject ? getPlaybackFramerate() : 0.0;
+}
+
+// MERGE-MASTER r6 (AUDIO-A1 residual, Dot 6544364013): the consumer's duplicate-sync memo describes audio that still runs
+// from the last applied sync (playback_audio_start::isDuplicateSync). A stop outside the consumer forgets it, so the next
+// requested sync is applied: the play stop, and a conform change that stops the audio while Play stays on. r7 (sol r6 B2):
+// so does every engine reset or re-init outside the consumer (clip open: resetAudioEngine and initAudioEngine).
+void MainWindow::forgetAppliedPlaybackAudioSync( void )
+{
+    m_lastPlaybackAudioSyncFrame = -1;
+    m_lastPlaybackAudioSyncTime = 0.0;
+}
+
+//Playback > High Frame Rate Conform: enable, target rate and threshold, persisted under
+//Playback/Conform* (deliberately not Playback/AutoTargetFps, which is the Auto quality budget).
+//Read and written through automation_settings::openAppSettings(), so an automation run uses its
+//run-scoped store and never the owner's settings.
+void MainWindow::setupPlaybackConformMenu( void )
+{
+    {
+        // Invalid saved values fall back to the defaults (playback_conform::loadSettings).
+        auto setStore = automation_settings::openAppSettings(); QSettings &set = *setStore;
+        const playback_conform::Settings saved = playback_conform::loadSettings( set );
+        m_conformEnabledSetting = saved.enabled;
+        // HFR-NATIVE-60FPS-FULLRES-1: MLVAPP_PLAYBACK_CONFORM=0|1 wins for this process and is never persisted.
+        m_conformEnabled = playback_conform::resolveConformEnabled( playback_conform::conformEnvOverride(), saved.enabled );
+        m_conformTargetFps = saved.targetFps;
+        m_conformThresholdFps = saved.thresholdFps;
+    }
+    QMenu *menu = ui->menuPlayback->addMenu( tr( "High Frame Rate Conform" ) );
+    menu->setToolTipsVisible( true );
+
+    QAction *enable = menu->addAction( tr( "Conform high frame rate clips" ) );
+    enable->setObjectName( QStringLiteral( "actionPlaybackConformEnabled" ) );
+    enable->setCheckable( true );
+    enable->setChecked( m_conformEnabled );
+    enable->setToolTip( tr( "Play clips faster than the threshold as slow motion at the target rate. "
+                            "Export is not affected; audio is muted while conforming." ) );
+    connect( enable, &QAction::toggled, this, [this]( bool on )
+    {
+        // MERGE-MASTER r3 (adversary A2): the toggle persists the user's choice, and MLVAPP_PLAYBACK_CONFORM=0|1 still wins for this process.
+        noteConformStateBeforeChange();
+        m_conformEnabledSetting = on;
+        m_conformEnabled = playback_conform::resolveConformEnabled( playback_conform::conformEnvOverride(), on );
+        applyPlaybackConformSettings( true );
+    } );
+
+    QMenu *targetMenu = menu->addMenu( tr( "Conform to" ) );
+    m_conformTargetGroup = new QActionGroup( this );
+    m_conformTargetGroup->setExclusive( true );
+    const double targets[] = { 24.0, 25.0, 30.0 };
+    for( const double target : targets )
+    {
+        QAction *a = targetMenu->addAction( tr( "%1 fps" ).arg( target, 0, 'g', 4 ) );
+        a->setCheckable( true );
+        a->setData( target );
+        a->setChecked( qFuzzyCompare( target, m_conformTargetFps ) );
+        m_conformTargetGroup->addAction( a );
+        connect( a, &QAction::triggered, this, [this, target]()
+        {
+            noteConformStateBeforeChange();
+            m_conformTargetFps = target;
+            applyPlaybackConformSettings( true );
+        } );
+    }
+
+    QMenu *thresholdMenu = menu->addMenu( tr( "For clips above" ) );
+    m_conformThresholdGroup = new QActionGroup( this );
+    m_conformThresholdGroup->setExclusive( true );
+    const double thresholds[] = { 30.0, 50.0 };
+    for( const double threshold : thresholds )
+    {
+        QAction *a = thresholdMenu->addAction( tr( "%1 fps" ).arg( threshold, 0, 'g', 4 ) );
+        a->setCheckable( true );
+        a->setData( threshold );
+        a->setChecked( qFuzzyCompare( threshold, m_conformThresholdFps ) );
+        m_conformThresholdGroup->addAction( a );
+        connect( a, &QAction::triggered, this, [this, threshold]()
+        {
+            noteConformStateBeforeChange();
+            m_conformThresholdFps = threshold;
+            applyPlaybackConformSettings( true );
+        } );
+    }
+
+    // MERGE-MASTER r11 (adversary A2, the ADV-A2 class): the mute tooltip also depends on Audio Output, and nothing else
+    // refreshes it when that is toggled on a loaded clip. Not before a clip is loaded: readSettings checks Audio Output
+    // while m_pMlvObject is still null.
+    connect( ui->actionAudioOutput, &QAction::toggled, this, [this]( bool )
+    {
+        if( m_fileLoaded && m_pMlvObject ) refreshPlaybackFpsStatus();
+    } );
+}
+
+void MainWindow::applyPlaybackConformSettings( bool persist )
+{
+    m_conformTargetFps = playback_conform::sanitizedTargetFps( m_conformTargetFps );
+    m_conformThresholdFps = playback_conform::sanitizedThresholdFps( m_conformThresholdFps );
+    if( persist )
+    {
+        auto setStore = automation_settings::openAppSettings(); QSettings &set = *setStore;
+        playback_conform::Settings s;
+        s.enabled = m_conformEnabledSetting;
+        s.targetFps = m_conformTargetFps;
+        s.thresholdFps = m_conformThresholdFps;
+        playback_conform::saveSettings( set, s );
+    }
+    // A conform change mid-playback that leaves the clip conformed: audio that was already running must stop (it cannot
+    // follow the new rate). The stop forgets the applied sync (MERGE-MASTER r6, AUDIO-A1 residual), so when a later change
+    // un-conforms the clip, the Rearm case below re-requests the start (requestPlaybackAudioSync) and the next present
+    // applies it, even at the same frame within the consumer's 100 ms duplicate window.
+    if( m_pAudioPlayback && playbackConformActive() )
+    {
+        m_pAudioPlayback->stop();
+        forgetAppliedPlaybackAudioSync();
+    }
+    // MERGE-MASTER r5 (AUDIO-A1): a pending audio start (raised at Play, not yet consumed by the first present) is
+    // touched only when this change moved the clip's effective conform state or playback rate. A 23.976 clip stays
+    // non-conformed under a target or threshold change, so its pending start survives (the drop-frame tick re-arms
+    // only on a wrap, so a cleared start never came back with Loop off).
+    switch( playback_conform::pendingAudioStartOnConformChange( m_conformActiveBeforeChange, m_conformPlaybackFpsBeforeChange,
+                                                                playbackConformActive(), m_pMlvObject ? getPlaybackFramerate() : 0.0 ) )
+    {
+    case playback_conform::PendingAudioStart::Clear:
+        m_tryToSyncAudio = false;
+        break;
+    case playback_conform::PendingAudioStart::Rearm:
+        m_tryToSyncAudio = false;
+        if( ui->actionAudioOutput->isChecked()
+         && ui->actionDropFrameMode->isChecked()
+         && ui->actionPlay->isChecked() )
+        {
+            requestPlaybackAudioSync();
+        }
+        break;
+    case playback_conform::PendingAudioStart::Keep:
+        break;
+    }
+    if( m_fileLoaded && m_pMlvObject )
+    {
+        killTimer( m_timerId );
+        m_timerId = mlvappStartPlaybackTimer( this, getPlaybackFramerate() );
+        resetPlaybackQualityAutoRunState();
+    }
+    refreshPlaybackFpsStatus();
+    if( playbackConformActive() && ui->actionAudioOutput->isChecked()
+     && m_pMlvObject && doesMlvHaveAudio( m_pMlvObject ) )
+    {
+        statusBar()->showMessage( playback_conform::audioMutedStatusText(), 4000 );
+    }
+}
+
 // CUDA-HEADROOM-1: the pace the NativePaceGuard is handed, and nothing else. An automation run that asked for
 // unpaced playback (mlvappPlaybackUnpacedRequested) hands it 0 (no limit) to measure throughput; the interactive
 // app never does.
 double MainWindow::playbackPaceGuardFps( void )
 {
-    return playback_native_pace::guardPaceFps( getFramerate(), m_automationPacingIsolated && mlvappPlaybackUnpacedRequested() );
+    return playback_native_pace::guardPaceFps( getPlaybackFramerate(), m_automationPacingIsolated && mlvappPlaybackUnpacedRequested() );
 }
 
 // HFR-NATIVE-M16-1457-GUI-PRESENT-CADENCE-1: MLVAPP_PLAYBACK_DUE_WAKE=0 turns the due wake off (the poll tick alone
@@ -20476,6 +21012,7 @@ void MainWindow::clearPresentationForClipOpen( const char *reason )
         if( m_pGraphicsItem )
         {
             m_pGraphicsItem->setPixmap( QPixmap( ":/IMG/IMG/TransDummy.png" ) );
+            ui->graphicsView->notePixmapPresentSerial( 0 );   // r30 fix iteration 1 (adversary A2 on fad36acf): the placeholder carries no frame
             m_graphicsItemPresentedSerial = 0;
             m_pGraphicsItem->setVisible( true );
         }
@@ -21189,6 +21726,7 @@ void MainWindow::on_actionAboutQt_triggered()
 //Position Slider
 void MainWindow::on_horizontalSliderPosition_valueChanged(int position)
 {
+    const GuiOtherBusyScope otherBusySpan( this, gui_present_gap::OtherBusySpan::SliderPosition );
     if( !m_playbackInternalSliderAdvance )
     {
         invalidatePlaybackPrepForDisplayChange( "playback-position-change" );
@@ -21209,7 +21747,7 @@ void MainWindow::on_horizontalSliderPosition_valueChanged(int position)
         m_newPosDropMode = position;
         if( ui->actionAudioOutput->isChecked() )
         {
-            m_tryToSyncAudio = true;
+            requestPlaybackAudioSync();
         }
     }
 
@@ -22031,7 +22569,7 @@ void MainWindow::on_actionGoto_First_Frame_triggered()
      && ui->actionDropFrameMode->isChecked()
      && ui->actionPlay->isChecked() )
     {
-        m_tryToSyncAudio = true;
+        requestPlaybackAudioSync();
     }
 }
 
@@ -23073,7 +23611,7 @@ void MainWindow::resetPlaybackQualityAutoRunState( void )
     m_playbackQualityAutoCapabilityTracker.reset();
     m_playbackQualityAutoDecisionBudgetMs =
         1000.0 / static_cast<double>( m_playbackAutoTargetFps > 0
-                                      ? m_playbackAutoTargetFps
+                                      ? effectivePlaybackAutoTargetFps()
                                       : 30 );
     m_playbackQualityAutoHeadroomCapability = false;
     if( m_playbackQualityMode == static_cast<int>( PlaybackQualityMode::Auto )
@@ -24423,7 +24961,7 @@ void MainWindow::on_actionExportSettings_triggered()
     {
         //Restart timer with chosen framerate
         killTimer( m_timerId );
-        m_timerId = mlvappStartPlaybackTimer( this, getFramerate() );
+        m_timerId = mlvappStartPlaybackTimer( this, getPlaybackFramerate() );
 
         //Refresh Timecode Label
         if( m_tcModeDuration )
@@ -25849,14 +26387,20 @@ void MainWindow::on_actionPlay_triggered(bool checked)
     else
     {
         //Start Audio
+        if( ui->actionAudioOutput->isChecked() && playbackConformActive() )
+        {
+            statusBar()->showMessage( playback_conform::audioMutedStatusText(), 4000 );
+        }
         if( ui->actionAudioOutput->isChecked()
          && ui->actionDropFrameMode->isChecked() )
         {
-            m_tryToSyncAudio = true;
+            requestPlaybackAudioSync();
             m_pAudioPlayback->clearStartReport();
             // PLAYBACK-STARTUP-WAIT-PREWARM-1 Row A: open the device now, silently and off the GUI thread, while the
             // first frame renders; the first present only resumes it (finishPresentedFrame).
-            if( !mlvappPlaybackAudioSyncLegacyRequested() )
+            // PLAYBACK-HFR-CONFORM-DEFAULT-1: not while conform mutes the audio (requestPlaybackAudioSync() left it off).
+            if( playback_conform::audioSyncAllowed( playbackConformActive() )
+             && !mlvappPlaybackAudioSyncLegacyRequested() )
                 m_pAudioPlayback->prepare( ui->horizontalSliderPosition->value() );
         }
     }
@@ -26451,6 +26995,11 @@ void MainWindow::beginPlaybackSmokeTelemetry( void )
     // is process-cumulative, so a wrap during a warm-up play (Look Assist Auto-warmup settle) still
     // reaches the summary's wrapped=/wrap_count= fields.
     m_playbackSmokeWrapped = false;
+    m_playbackSmokeSourceAdvance.reset();
+    m_playbackSmokePaintCredit.reset();   // r29: a paint before this session's first hand-off credits nothing of it
+    m_playbackSmokeConformPaintWaitEscapes = 0;
+    // r16 (adversary A1): engine wraps before this measured Play are not this Play's wraps
+    m_playbackSmokeTrackerEngineWraps = m_playbackWrapRecorder.engineWraps;
     m_playbackSmokeStartRequestSerial = m_nextRenderRequestSerial;
     m_playbackSmokeStartDecodeRequestsIssued =
         m_pRenderThread ? m_pRenderThread->decodeRequestsIssuedCount() : 0;
@@ -26462,6 +27011,8 @@ void MainWindow::beginPlaybackSmokeTelemetry( void )
         m_presentNothingDropCount.load( std::memory_order_acquire );
     m_playbackSmokeStartPrepReplacedBefore =
         m_playbackPrepReplacedBeforeComputeCount.load( std::memory_order_acquire );
+    m_playbackSmokeStartPrepBorrowedRgb16Mutated =
+        m_playbackPrepBorrowedRgb16MutatedCount.load( std::memory_order_acquire );
     m_playbackSmokeStartPrepReplacedAfter =
         m_playbackPrepReplacedAfterComputeCount.load( std::memory_order_acquire );
     m_playbackSmokeStartScopeUpdates = m_playbackScopeUpdateCount;
@@ -26471,7 +27022,7 @@ void MainWindow::beginPlaybackSmokeTelemetry( void )
     m_playbackSmokeStartAudioSyncSkipped = m_playbackAudioSyncSkippedCount;
     m_playbackSmokeStartTime = mlv_stage_timing_now();
     m_playbackPresentTrace.begin( m_playbackSmokeStartTime * 1000.0, 4096 );   // r7 present trace (no-op when off)
-    m_playbackSlipHistogram.reset( m_playbackSmokeStartPosition, getFramerate() );
+    m_playbackSlipHistogram.reset( m_playbackSmokeStartPosition, getPlaybackFramerate() );
     // PLAYBACK-STARTUP-CATCHUP-BURST-1: the timeline owes the wall time since Play only when the legacy startup banks
     // it; otherwise paced playback starts at the first present, and a later skip is a slip, never startup catch-up.
     if( mlvappPlaybackStartupCatchupLegacyRequested() )
@@ -26653,6 +27204,8 @@ void MainWindow::beginPlaybackSmokeTelemetry( void )
     m_guiPresentGaps = GuiPresentGapTotals();
     m_guiPresentGapStartNs = -1;
     m_guiPresentGapIdle = gui_present_gap::IdleWaits();
+    m_guiOtherBusySpans.resetSession();
+    m_playbackSmokeReconWorkerSplit.reset();
     ui->graphicsView->resetPaintTiming();
     m_playbackSmokePrepWorkerTotalSumMs = 0.0;
     m_playbackSmokePrepResultQueueSumMs = 0.0;
@@ -26745,7 +27298,7 @@ void MainWindow::beginPlaybackSmokeTelemetry( void )
                "env_quality_mode=%29 env_gpu_playback_recon=%30 "
                "env_gpu_playback_recon_texture_present=%31 "
                "auto_target_fps=%32 auto_reason_start=%33 "
-               "env_raw_uint16_prefetch_decoders=%34" )
+               "env_raw_uint16_prefetch_decoders=%34 env_playback_conform=%35" )
                .arg( static_cast<qulonglong>( m_playbackSmokeSessionId ) )
                .arg( m_playbackSmokeStartPosition )
                .arg( m_playbackSmokeStartCutIn )
@@ -26783,7 +27336,8 @@ void MainWindow::beginPlaybackSmokeTelemetry( void )
                .arg( QString::fromLatin1(
                    playbackQualityAutoDecisionReasonName(
                        m_playbackQualityAutoDecisionReason ) ) )
-               .arg( envValueForLog( "MLVAPP_RAW_UINT16_PREFETCH_DECODERS" ) );
+               .arg( envValueForLog( "MLVAPP_RAW_UINT16_PREFETCH_DECODERS" ) )
+               .arg( envValueForLog( "MLVAPP_PLAYBACK_CONFORM" ) );
 
     // PLAYBACK-PREP-CONFLATED-MOVE-FR1B-AB-1 r2: the prep route's engagement on a line of its own that carries no env-derived
     // text; the dual-venue runner reads engagement from this line only, never from the start line's env_* fields.
@@ -26802,6 +27356,27 @@ void MainWindow::beginPlaybackSmokeTelemetry( void )
                "playback_smoke.display_required session=%1 display_required=%2" )
                .arg( static_cast<qulonglong>( m_playbackSmokeSessionId ) )
                .arg( bool01( m_playbackDisplayRequiredAcquired ) );
+}
+
+// HFR-NATIVE-60FPS-FULLRES-1 r29 (adversary A1 on cf403dba, A2 on 4201a437): a display surface painted the frame it was handed under
+// \a serial. The surfaces paint on the GUI thread; a report from any other thread is dropped, which only ever withholds a credit.
+void MainWindow::playbackPaintCreditSink( void *context, uint64_t serial )
+{
+    if( context ) static_cast<MainWindow *>( context )->notePlaybackSmokePainted( serial );
+}
+
+void MainWindow::notePlaybackSmokePainted( uint64_t serial )
+{
+    if( !m_playbackSmokeActive || QThread::currentThread() != thread() ) return;
+    m_playbackSmokePaintCredit.notePainted( serial, mlv_stage_timing_now(), m_playbackSmokeSourceAdvance );
+}
+
+// r29 fix iteration 2 (adversary A1 on 07226bc0): every viewport grab (screenshots, contact-sheet frames) renders the GL viewport's FBO or
+// the scene into a pixmap without composing it on screen, so the paint it triggers never credits the conform tracker.
+QPixmap MainWindow::grabGraphicsViewportOffscreen()
+{
+    const playback_paint_credit::OffscreenPaintScope offscreen;
+    return ui->graphicsView->viewport()->grab();
 }
 
 void MainWindow::notePlaybackSmokePresentedFrame(
@@ -26853,17 +27428,45 @@ void MainWindow::notePlaybackSmokePresentedFrame(
     // "went backward" test also fires for an external backward scrub, or a stress seek to an
     // arbitrary earlier frame, during a session where Loop never actually wrapped -- see
     // isContactSheetLoopWrapTransition for why Loop state and jump size now both gate this.
-    if( m_playbackSmokePresentedFrames > 0
+    const bool playbackSmokeWrapNow =
+        m_playbackSmokePresentedFrames > 0
      && playback_frame_range::isContactSheetLoopWrapTransition(
             ui->actionLoop->isChecked(),
             ui->spinBoxCutIn->value() - 1,
             ui->spinBoxCutOut->value() - 1,
             m_playbackSmokeLastPresentedFrame,
-            static_cast<int>( displayFrame ) ) )
+            static_cast<int>( displayFrame ) );
+    if( playbackSmokeWrapNow )
     {
         m_playbackSmokeWrapped = true;
         m_playbackWrapRecorder.noteInferredWrap();   // second signal only; see PlaybackWrapRecorder
     }
+    // PLAYBACK-HFR-CONFORM-DEFAULT-1: how fast the TIMELINE moves (source frames per wall second) and the
+    // largest jump between PRESENTED source frames, loop wrap excluded (1 == every source frame shown).
+    // r16 (adversary A1 on ff41b4fa, re-pass A1/A2): the wrap is the engine's own count, never the inference
+    // (presentationLoopWraps): a drop-frame wrap from 700 of 0..719 is under the inference's 711 threshold,
+    // and over a cut range narrower than its tolerance the inference calls any backward seek a wrap.
+    // r17 (adversary A1 on 6451a8d9 and on eb5af034): the live count AND the count stamped when THIS frame was
+    // requested. The draw's early/tail advance (timerFrameEvent) runs before this call and can wrap the engine
+    // first, so an in-flight frame requested before the wrap must not take it (718 -> 719), while a lookahead
+    // frame requested across the boundary before the wrap still can (719 -> speculative 0).
+    // r19 (sol r18 B1; adversary A1 on 924d3d6f): a forward landing takes its wrap too, and each landing is
+    // credited one cut width per wrap it crossed.
+    // r20 (adversary A1 and A2 on dbeb9424): direction decides nothing, and a presented lookahead carries the stamp
+    // drawFrameReady gave it at its target check (presentationAcceptedLookaheadStamp).
+    const int sourceAdvanceWrapsBefore = m_playbackSmokeTrackerEngineWraps;
+    const int sourceAdvanceWraps = presentationLoopWraps( m_playbackWrapRecorder.engineWraps,
+                                                          requestContext.engineWrapsAtRequest,
+                                                          m_playbackSmokeTrackerEngineWraps,
+                                                          m_playbackSmokePresentedFrames > 0 );
+    // r29 (adversary A1 on cf403dba, A2 on 4201a437): this is the HAND-OFF. The frame waits in the ledger for the surface's paint,
+    // which credits m_playbackSmokeSourceAdvance (notePlaybackSmokePainted); replaced before that paint, it is never credited.
+    m_playbackSmokePaintCredit.noteSubmitted( static_cast<uint64_t>( readyFrame.requestSerial ),
+                                              static_cast<int>( displayFrame ),
+                                              sourceAdvanceWraps,
+                                              m_playbackWrapRecorder.engineWrapsWidth( sourceAdvanceWrapsBefore,
+                                                                                       sourceAdvanceWraps ),
+                                              m_playbackSmokeSourceAdvance );
     // The engine's own wrap count (playbackHandling) is the authority; the inference above can only add.
     if( m_playbackWrapRecorder.replayCount() > 0 ) m_playbackSmokeWrapped = true;
 
@@ -27853,8 +28456,30 @@ void MainWindow::notePlaybackSmokePresentedFrame(
             spans.regionTotalMs += telemetryDoubleValue( timing, "playback_prep_region_total_ms" );
             spans.regionUnattributedMs +=
                 telemetryDoubleValue( timing, "playback_prep_region_unattributed_ms" );
+            // CPU-S1-RECON-UNDER-LOOK-PACE-LEVER-1 (Part B): region_image's two calls.
+            spans.regionImageFromImageMs +=
+                telemetryDoubleValue( timing, "playback_prep_region_image_from_image_ms" );
+            spans.regionImageViewportMs +=
+                telemetryDoubleValue( timing, "playback_prep_region_image_viewport_ms" );
+            // CPU-S1-PACE-NEXT-LEVER-1: the hand-off and region_image's residual.
+            spans.handoffMs += telemetryDoubleValue( timing, "playback_prep_handoff_ms" );
+            if( telemetryBoolValue( timing, "playback_prep_handoff_borrowed_rgb16" ) )
+                ++spans.handoffBorrowedRgb16Frames;
+            spans.handoffOwnedRgb16Bytes += static_cast<quint64>(
+                telemetryDoubleValue( timing, "playback_prep_owned_rgb16_bytes" ) );
+            spans.regionImageMagentaMs +=
+                telemetryDoubleValue( timing, "playback_prep_region_image_magenta_ms" );
+            spans.regionImageHashMs +=
+                telemetryDoubleValue( timing, "playback_prep_region_image_hash_ms" );
+            spans.regionImageSetPixmapMs +=
+                telemetryDoubleValue( timing, "playback_prep_region_image_set_pixmap_ms" );
+            spans.regionImageReleaseMs +=
+                telemetryDoubleValue( timing, "playback_prep_region_image_release_ms" );
         }
     }
+    // CPU-S1-RECON-UNDER-LOOK-PACE-LEVER-1 (Part A): frames whose render consumed the phase-3 recon
+    // carry the worker's sub-spans under recon_worker_ (RenderFrameThread drawFrame).
+    m_playbackSmokeReconWorkerSplit.add( timing );
     m_playbackSmokePrepWorkerTotalSumMs += prepWorkerTotalMs;
     m_playbackSmokePrepResultQueueSumMs += prepResultQueueMs;
     m_playbackSmokePrepTotalBeforeFinishSumMs += prepTotalBeforeFinishMs;
@@ -29658,7 +30283,7 @@ QImage MainWindow::grabIdentityViewport( QString *reason )
     }
     if( ui->graphicsView && ui->graphicsView->viewport() )
     {
-        image = ui->graphicsView->viewport()->grab().toImage();
+        image = grabGraphicsViewportOffscreen().toImage();
         if( reason ) *reason = QStringLiteral( "graphics_view_viewport_grab" );
     }
     return image;
@@ -29793,7 +30418,7 @@ void MainWindow::noteContactSheetPresentedFrame(
        || GpuDisplayViewport::hasPresentedGpuReconTexture( ui->graphicsView ) )
      && ui->graphicsView && ui->graphicsView->viewport() )
     {
-        contactFrameImage = ui->graphicsView->viewport()->grab().toImage();
+        contactFrameImage = grabGraphicsViewportOffscreen().toImage();
         contactFrameSource = QStringLiteral("app_internal_gl_viewport_grab");
     }
     if( !gpuWindowGrabFailedClosed && contactFrameImage.isNull() && m_pGraphicsItem )
@@ -29804,7 +30429,7 @@ void MainWindow::noteContactSheetPresentedFrame(
     if( !gpuWindowGrabFailedClosed && contactFrameImage.isNull()
      && ui->graphicsView && ui->graphicsView->viewport() )
     {
-        contactFrameImage = ui->graphicsView->viewport()->grab().toImage();
+        contactFrameImage = grabGraphicsViewportOffscreen().toImage();
         contactFrameSource = QStringLiteral("app_internal_viewport_grab");
     }
 
@@ -31023,6 +31648,25 @@ void MainWindow::finishPlaybackSmokeTelemetry( const char *reason )
                 ? sum / static_cast<double>( spans.cpuRouteFrames )
                 : 0.0;
         };
+        // CPU-S1-PACE-NEXT-LEVER-1: appended after every existing prep_summary field (none renamed).
+        const uint64_t borrowedRgb16Mutated =
+            m_playbackPrepBorrowedRgb16MutatedCount.load( std::memory_order_acquire )
+            - m_playbackSmokeStartPrepBorrowedRgb16Mutated;
+        const QString handoffFields =
+            QStringLiteral( " avg_playback_prep_handoff_ms=%1 handoff_borrowed_rgb16_frames=%2 "
+                            "handoff_owned_rgb16_bytes=%3 handoff_borrowed_rgb16_mutated_frames=%4 "
+                            "avg_playback_prep_region_image_magenta_ms=%5 "
+                            "avg_playback_prep_region_image_hash_ms=%6 "
+                            "avg_playback_prep_region_image_set_pixmap_ms=%7 "
+                            "avg_playback_prep_region_image_release_ms=%8" )
+                .arg( avgCpuRouteMs( spans.handoffMs ), 0, 'f', 3 )
+                .arg( spans.handoffBorrowedRgb16Frames )
+                .arg( spans.handoffOwnedRgb16Bytes )
+                .arg( static_cast<qulonglong>( borrowedRgb16Mutated ) )
+                .arg( avgCpuRouteMs( spans.regionImageMagentaMs ), 0, 'f', 3 )
+                .arg( avgCpuRouteMs( spans.regionImageHashMs ), 0, 'f', 3 )
+                .arg( avgCpuRouteMs( spans.regionImageSetPixmapMs ), 0, 'f', 3 )
+                .arg( avgCpuRouteMs( spans.regionImageReleaseMs ), 0, 'f', 3 );
         qInfo().noquote()
             << QStringLiteral(
                    "playback_smoke.prep_summary session=%1 frames=%2 cpu_route_frames=%3 "
@@ -31041,7 +31685,9 @@ void MainWindow::finishPlaybackSmokeTelemetry( const char *reason )
                    "pointwise_fast_refusal_counts=%30 "
                    "avg_playback_prep_region_setup_ms=%31 avg_playback_prep_region_image_ms=%32 "
                    "avg_playback_prep_region_present_ms=%33 avg_playback_prep_region_finish_ms=%34 "
-                   "avg_playback_prep_region_total_ms=%35 avg_playback_prep_region_unattributed_ms=%36" )
+                   "avg_playback_prep_region_total_ms=%35 avg_playback_prep_region_unattributed_ms=%36 "
+                   "avg_playback_prep_region_image_from_image_ms=%37 "
+                   "avg_playback_prep_region_image_viewport_ms=%38" )
                    .arg( static_cast<qulonglong>( m_playbackSmokeSessionId ) )
                    .arg( m_playbackSmokePresentedFrames )
                    .arg( spans.cpuRouteFrames )
@@ -31079,7 +31725,10 @@ void MainWindow::finishPlaybackSmokeTelemetry( const char *reason )
                    .arg( avgCpuRouteMs( spans.regionPresentMs ), 0, 'f', 3 )
                    .arg( avgCpuRouteMs( spans.regionFinishMs ), 0, 'f', 3 )
                    .arg( avgCpuRouteMs( spans.regionTotalMs ), 0, 'f', 3 )
-                   .arg( avgCpuRouteMs( spans.regionUnattributedMs ), 0, 'f', 3 );
+                   .arg( avgCpuRouteMs( spans.regionUnattributedMs ), 0, 'f', 3 )
+                   .arg( avgCpuRouteMs( spans.regionImageFromImageMs ), 0, 'f', 3 )
+                   .arg( avgCpuRouteMs( spans.regionImageViewportMs ), 0, 'f', 3 )
+               + handoffFields;
     }
 
     /* CPU-S2-WINDOWED-GUI-PRESENT-TELEMETRY-1: GUI-thread present-side cost. The preview viewport
@@ -31096,6 +31745,18 @@ void MainWindow::finishPlaybackSmokeTelemetry( const char *reason )
         {
             return count > 0 ? sum / static_cast<double>( count ) : 0.0;
         };
+        // CPU-S1-RECON-UNDER-LOOK-PACE-LEVER-1 (Part B): other busy by GUI handler (exclusive time
+        // inside the gap), appended after every existing field; per gap, like avg_gui_other_busy_ms.
+        QString otherBusySplit;
+        for( int i = 0; i < gui_present_gap::OtherBusySpans::kCount; ++i )
+        {
+            otherBusySplit += QStringLiteral( " avg_gui_other_busy_%1_ms=%2" )
+                                  .arg( QLatin1String( gui_present_gap::otherBusySpanName(
+                                            static_cast<gui_present_gap::OtherBusySpan>( i ) ) ) )
+                                  .arg( avgOver( m_guiOtherBusySpans.sumMs[i], gaps.gaps ), 0, 'f', 3 );
+        }
+        otherBusySplit += QStringLiteral( " avg_gui_other_busy_unattributed_ms=%1" )
+                              .arg( avgOver( m_guiOtherBusySpans.unattributedSumMs, gaps.gaps ), 0, 'f', 3 );
         qInfo().noquote()
             << QStringLiteral(
                    "playback_smoke.gui_present_summary session=%1 frames=%2 "
@@ -31119,8 +31780,20 @@ void MainWindow::finishPlaybackSmokeTelemetry( const char *reason )
                    .arg( avgOver( gaps.otherBusySumMs, gaps.gaps ), 0, 'f', 3 )
                    .arg( gaps.otherBusyMaxMs, 0, 'f', 3 )
                    .arg( m_guiPresentIdleProbeConnected ? QStringLiteral("dispatcher")
-                                                        : QStringLiteral("none") );
+                                                        : QStringLiteral("none") )
+               + otherBusySplit;
     }
+
+    /* CPU-S1-RECON-UNDER-LOOK-PACE-LEVER-1 (Part A): the phase-3 recon WORKER's own llrawproc /
+     * dual_iso_full20 sub-spans on presented frames whose render consumed its recon (the render
+     * thread's llrawproc_* keys are its own, zero on those frames). Fields: ReconWorkerSplit.h. */
+    qInfo().noquote()
+        << QStringLiteral( "playback_smoke.recon_worker_split_summary session=%1 frames=%2 "
+                           "full20_valid_frames=%3" )
+               .arg( static_cast<qulonglong>( m_playbackSmokeSessionId ) )
+               .arg( static_cast<qulonglong>( m_playbackSmokeReconWorkerSplit.frames ) )
+               .arg( static_cast<qulonglong>( m_playbackSmokeReconWorkerSplit.full20ValidFrames ) )
+           + m_playbackSmokeReconWorkerSplit.fieldsText();
 
     /* CPU-DEBAYERED16-REUSE-PHASE3-RECON-1: debayered-16 frames whose render
      * consumed the phase-3 recon (one recon per frame) versus ran its own decode
@@ -31439,6 +32112,58 @@ void MainWindow::finishPlaybackSmokeTelemetry( const char *reason )
                .arg( m_playPaceFps, 0, 'f', 3 )
                .arg( bool01( m_fpsOverride && !m_automationPacingIsolated ) );
 
+    // PLAYBACK-HFR-CONFORM-DEFAULT-1: conform state + timeline speed. source_fps is source frames advanced per
+    // wall-clock second between the first and last PRESENTED frame (the 24 +/- 3 % acceptance); max_jump == 1
+    // means every source frame was shown (loop wrap excluded). audio_sync_requests must be 0 while
+    // conform_active=1 (audio muted). The export-override value is recorded so a leg proves it never reaches
+    // playback. One line per session, always emitted (the venue legs grep it).
+    {
+        const PlaybackSourceAdvanceTracker & adv = m_playbackSmokeSourceAdvance;
+        qInfo().noquote()
+            << QStringLiteral(
+                   "playback_smoke.conform session=%1 clip_fps=%2 playback_fps=%3 conform_active=%4 "
+                   "conform_enabled=%5 conform_target=%6 conform_threshold=%7 export_fps_override=%8 "
+                   "export_frame_rate=%9 audio_sync_requests=%10 presented=%11 source_advanced=%12 "
+                   "span_s=%13 source_fps=%14 max_jump=%15 wraps=%16 backward=%17 repeats=%18 "
+                   "auto_target_fps=%19 effective_auto_target_fps=%20 conform_env_override=%21 "
+                   "first_frame=%22 last_frame=%23 engine_target=%24 carried_debt=%25 paint_submitted=%26 "
+                   "paint_superseded=%27 paint_unverified=%28 paint_waiting=%29 paint_wait_escapes=%30" )
+                   .arg( static_cast<qulonglong>( m_playbackSmokeSessionId ) )
+                   .arg( smokeClipFps, 0, 'f', 3 )
+                   .arg( m_pMlvObject ? getPlaybackFramerate() : 0.0, 0, 'f', 3 )
+                   .arg( bool01( playbackConformActive() ) )
+                   .arg( bool01( m_conformEnabled ) )
+                   .arg( m_conformTargetFps, 0, 'f', 3 )
+                   .arg( m_conformThresholdFps, 0, 'f', 3 )
+                   .arg( bool01( m_fpsOverride ) )
+                   .arg( m_frameRate, 0, 'f', 3 )
+                   .arg( static_cast<qulonglong>(
+                             m_playbackAudioSyncRequestCount - m_playbackSmokeStartAudioSyncRequests ) )
+                   .arg( static_cast<qulonglong>( adv.presented() ) )
+                   .arg( static_cast<qlonglong>( adv.advancedFrames() ) )
+                   .arg( adv.spanSeconds(), 0, 'f', 3 )
+                   .arg( adv.sourceFps(), 0, 'f', 3 )
+                   .arg( adv.maxJump() )
+                   .arg( static_cast<qulonglong>( adv.wraps() ) )
+                   .arg( static_cast<qulonglong>( adv.backwardJumps() ) )
+                   .arg( static_cast<qulonglong>( adv.repeatedFrames() ) )
+                   .arg( m_playbackAutoTargetFps )
+                   .arg( effectivePlaybackAutoTargetFps() )
+                   .arg( playback_conform::conformEnvOverride() )
+                   // r29 (adversary A2 on cf403dba): the painted coverage's ends, and the engine's last target in the summary's own
+                   // coordinates (m_sourceAdvance: source_advanced = engine_target - source_start_frame + 1), so the venue judge
+                   // allows exactly the one target the engine may hold unpainted, never the carried debt (which no count holds)
+                   .arg( adv.firstFrame() )
+                   .arg( adv.lastFrame() )
+                   .arg( static_cast<qlonglong>( m_sourceAdvance.armed ? m_sourceAdvance.highWater : -1 ) )
+                   .arg( m_conformDropDebtFrames, 0, 'f', 3 )
+                   .arg( static_cast<qulonglong>( m_playbackSmokePaintCredit.submitted() ) )
+                   .arg( static_cast<qulonglong>( m_playbackSmokePaintCredit.superseded() ) )
+                   .arg( static_cast<qulonglong>( m_playbackSmokePaintCredit.unverified() ) )
+                   .arg( bool01( m_playbackSmokePaintCredit.waiting() ) )
+                   .arg( static_cast<qulonglong>( m_playbackSmokeConformPaintWaitEscapes ) );
+    }
+
     // Window foreground state at session begin and at this gate, plus how many times the
     // whole application lost the OS foreground during the session (event-driven via
     // onPlaybackSmokeApplicationStateChanged(), not polled) -- so the joined analysis can
@@ -31585,6 +32310,13 @@ void MainWindow::on_actionPlay_toggled(bool checked)
 {
     invalidatePlaybackPrepForDisplayChange(
         checked ? "play-start" : "play-stop" );
+    // r3 (adversary A2 on e7e5271e) / r4 (Dot B1, adversary A1 on 391464de and ebe2c4aa): the 8-bit pool
+    // recycles only inside a playing span. After the bump above: play-start opens it with this generation
+    // as its floor, so nothing admitted before the start (an in-flight task across the last stop, a paused
+    // frame) is held; play-stop closes it, frees what it holds and raises the floor past the stop, so a
+    // late give() (even from a task parked before its take()) and every paused-frame give are freed.
+    if( checked ) m_playbackPrepRgb8Pool.open( m_playbackPresentationGeneration.load( std::memory_order_acquire ) );
+    else m_playbackPrepRgb8Pool.clear( m_playbackPresentationGeneration.load( std::memory_order_acquire ) );
     // PLAYBACK-CUDA-NATIVE-PACE-1: the pace clock re-arms at this Play's first engine tick.
     m_playbackPaceGuard.reset();
     // HFR-NATIVE-M16-1457-GUI-PRESENT-CADENCE-1: a pending due wake belongs to the clock just reset; the counters are
@@ -31599,6 +32331,7 @@ void MainWindow::on_actionPlay_toggled(bool checked)
     {
         m_playbackDueWake->endPlay();
     }
+    if( checked ) m_conformDropDebtFrames = 0.0;   // HFR-NATIVE-60FPS-FULLRES-1 r24: no held conform frame survives a Play start
     logInteractionEvent(
         QStringLiteral("play.toggled.begin"),
         QStringLiteral("checked=%1 file_loaded=%2 position=%3 cut_in=%4 cut_out=%5 frame_changed=%6 still_drawing=%7 pending_advance=%8")
@@ -31625,6 +32358,7 @@ void MainWindow::on_actionPlay_toggled(bool checked)
         // PLAYBACK-STARTUP-WAIT-S1-FIRST-AMAZE-AT-PLAY-1 Row K: a kick still held ends with its Play
         endPlaybackGpuClockKick( "play_stop" );
         finishPlaybackSmokeTelemetry( "play-stop" );
+        m_conformDropDebtFrames = 0.0;   // r30 (Dot D1): a stop clears it only after the conform line printed it (carried_debt)
         // CPU-SCOPE-LIVE-HEAP-CORRUPTION-1 F2: selectDebayerAlgorithm and applyEffectiveDualIsoPlaybackSettings
         // below mutate core state. r6 (adversary 7354a575 A2): drained after the telemetry has sampled its end
         // time, so the up-to-2 s wait is not counted in the Play interval.
@@ -31635,8 +32369,7 @@ void MainWindow::on_actionPlay_toggled(bool checked)
         m_playToFirstFrameTargetFrame = -1;
         m_lastPlayStartPrerollRequested = false;
         m_playbackScopeLastUpdateTime = 0.0;
-        m_lastPlaybackAudioSyncFrame = -1;
-        m_lastPlaybackAudioSyncTime = 0.0;
+        forgetAppliedPlaybackAudioSync();
         resetPlaybackQualityAutoRunState();
     }
     selectDebayerAlgorithm();
@@ -31722,14 +32455,17 @@ playback_frame_range::PlayableWindowVerdict MainWindow::checkPlayableWindow( con
     Q_UNUSED( site );
     const bool haveClip = m_fileLoaded && m_pMlvObject;
     const int totalFrames = haveClip ? static_cast<int>( getMlvFrames( m_pMlvObject ) ) : 0;
+    // The window is SOURCE seconds at the NATIVE fps, conformed or not (HFR-10S-1; HUB RULING 2026-10-30T22:17:51Z):
+    // 20 s of a 59.94 clip is 1199 source frames at any playback rate. Conform changes only the pace below.
     const double fps = playGateNativeFps();
     // ENFORCE-2 round 2 (sol B3): measure the range the ENGINE plays -- with MLVAPP_F3_DISABLE_CUT_RANGE_REPAIR
     // set the play path leaves a collapsed / inverted range alone (normalizePlaybackCutRangeForLoadedClip), so
     // the gate must not assume the repair either. This is the one knob that changes the effective range.
-    // ENFORCE-3: the engine's REAL pace (getFramerate(): a persisted fpsOverride when pacing is not isolated)
-    // goes into the verdict -- the window must be consumable at that pace inside the safety budget, else the
-    // Play is refused before it starts. An unusable pace (<= 0) is passed as -1 and fails closed.
-    const double enginePaceFps = getFramerate();
+    // ENFORCE-3: the engine's REAL pace goes into the verdict -- the window must be consumable at that pace
+    // inside the safety budget, else the Play is refused before it starts. The pace is the PLAYBACK rate
+    // (getPlaybackFramerate(): conform included, the export fpsOverride never). An unusable pace (<= 0) is
+    // passed as -1 and fails closed.
+    const double enginePaceFps = haveClip ? getPlaybackFramerate() : 0.0;
     return playback_frame_range::evaluatePlayableWindow(
         ui->horizontalSliderPosition->value(),
         ui->spinBoxCutIn->value(),
@@ -31841,6 +32577,7 @@ bool MainWindow::programmaticPlay( const char *site, double requestedSeconds )
     m_playRequiredSourceFrames = verdict.requiredFrames;
     m_playRequestedSeconds = requestedSeconds;
     m_playPaceFps = verdict.paceFps;
+    m_playPaceHistory = playback_frame_range::PlayPaceHistory();
     ui->actionPlay->trigger();   // allowlisted: the gate's own Play
     return true;
 }
@@ -31853,10 +32590,13 @@ void MainWindow::programmaticStop( const char *site )
 }
 
 // ENFORCE-3: the ONE decision every automation Play wait makes. A wall clock alone is never a pass.
-playback_frame_range::PlayStopState MainWindow::programmaticPlayState( qint64 elapsedMs, qint64 safetyMs ) const
+// MERGE-MASTER r11 (ADV-A1b): every wait (autoplay, settle, play action, GUI smoke) reaches the pace probe through here,
+// so each observation is noted in the Play's pace history first and the probe judges the pace the run has shown.
+playback_frame_range::PlayStopState MainWindow::programmaticPlayState( qint64 elapsedMs, qint64 safetyMs )
 {
+    m_playPaceHistory.note( m_sourceAdvance.consumed(), elapsedMs );
     return playback_frame_range::evaluatePlayStop(
-        m_sourceAdvance.consumed(), m_playRequiredSourceFrames, ui->actionPlay->isChecked(), elapsedMs, safetyMs, automationPlayPaceMode() );
+        m_sourceAdvance.consumed(), m_playRequiredSourceFrames, ui->actionPlay->isChecked(), elapsedMs, safetyMs, automationPlayPaceMode(), m_playPaceHistory );
 }
 
 bool MainWindow::programmaticPlayConsumed() const
@@ -33201,6 +33941,10 @@ void MainWindow::finishPresentedFrame( uint64_t displayFrame,
                                        int rgb8DisplaySourceWidth,
                                        int rgb8DisplaySourceHeight )
 {
+    // HFR-NATIVE-60FPS-FULLRES-1 r28 (CoS B1 on c4efe7e3): this frame is on screen; the tail advance below may move past it
+    m_lastDisplayedPlaybackFrame = static_cast<long long>( displayFrame );
+    m_lastDisplayedPlaybackSerial = static_cast<quint64>( readyFrame.requestSerial );
+    m_lastDisplayedPlaybackStageTime = mlv_stage_timing_now();
     const int displaySourceWidth = rgb8DisplaySourceWidth > 0
         ? rgb8DisplaySourceWidth : readyFrame.renderedImageWidth;
     const int displaySourceHeight = rgb8DisplaySourceHeight > 0
@@ -33481,16 +34225,15 @@ void MainWindow::finishPresentedFrame( uint64_t displayFrame,
     splitStep( playback_startup_split::StepScopes );
 
     const double overlay_start = mlv_stage_timing_now();
-    if( m_tryToSyncAudio && m_pAudioPlayback && ui->actionAudioOutput->isChecked() && ui->actionPlay->isChecked() && ui->actionDropFrameMode->isChecked() )
+    if( m_tryToSyncAudio && m_pAudioPlayback && ui->actionAudioOutput->isChecked() && ui->actionPlay->isChecked() && ui->actionDropFrameMode->isChecked()
+     && playback_conform::audioSyncAllowed( playbackConformActive() ) )
     {
         m_tryToSyncAudio = false;
         ++m_playbackAudioSyncRequestCount;
         const double syncNow = mlv_stage_timing_now();
         const int syncFrame = m_newPosDropMode;
-        const bool duplicateRecentSync =
-            m_lastPlaybackAudioSyncFrame == syncFrame
-         && m_lastPlaybackAudioSyncTime > 0.0
-         && ( syncNow - m_lastPlaybackAudioSyncTime ) * 1000.0 < 100.0;
+        const bool duplicateRecentSync = playback_audio_start::isDuplicateSync( m_lastPlaybackAudioSyncFrame,
+                                                                            m_lastPlaybackAudioSyncTime, syncFrame, syncNow );
         if( duplicateRecentSync )
         {
             ++m_playbackAudioSyncSkippedCount;
@@ -33544,7 +34287,14 @@ void MainWindow::finishPresentedFrame( uint64_t displayFrame,
         ui->graphicsView->verticalScrollBar()->setValue( ( getMlvHeight(m_pMlvObject) * getVerticalStretchFactor(false) - ui->graphicsView->height() ) / 2 );
     }
 
-    if( m_zoomModeChanged )
+    // GUI-SMOKE-FOREGROUND-HANG-NOLA-1 (adversary r2 pass 3 A1): drawFrameReady sized the scene at present time, so the
+    // geometry this frame landed on decides placement, not its request serial. Re-anchor on the flag (any frame, as the
+    // base) or when the scene differs from the geometry the gradient was last anchored on.
+    if( resize_still_drawing_wait::gradientNeedsReanchor( m_zoomModeChanged,
+                                                          m_pGradientElement->anchoredSceneWidth(),
+                                                          m_pGradientElement->anchoredSceneHeight(),
+                                                          static_cast<int>( m_pScene->width() ),
+                                                          static_cast<int>( m_pScene->height() ) ) )
     {
         m_zoomModeChanged = false;
         m_pGradientElement->redrawGradientElement( m_pScene->width(),
@@ -33661,7 +34411,7 @@ void MainWindow::finishPresentedFrame( uint64_t displayFrame,
                             ? m_playbackQualityFrameCounter
                             : PlaybackQualityAutoSampler::kSlidingWindow;
                         decision = playback_auto_force_fast_decision(
-                            m_playbackAutoTargetFps,
+                            effectivePlaybackAutoTargetFps(),
                             sharperHeadroomScaleAllowed,
                             presentedIntervalMs,
                             diagnosticSampleCount );
@@ -33669,7 +34419,7 @@ void MainWindow::finishPresentedFrame( uint64_t displayFrame,
                     else
                     {
                         decision = m_playbackQualitySampler.decideNextSlot(
-                            m_playbackAutoTargetFps,
+                            effectivePlaybackAutoTargetFps(),
                             dualIsoActive,
                             mlvPlaybackAggressivePreviewMode() != 0,
                             sharperHeadroomScaleAllowed );
@@ -33993,6 +34743,7 @@ void MainWindow::finishPresentedFrame( uint64_t displayFrame,
 //Draw the frame when render thread is ready
 void MainWindow::drawFrameReady()
 {
+    const GuiOtherBusyScope otherBusySpan( this, gui_present_gap::OtherBusySpan::DrawFrameReady );
     // A frame that outlasted the drain bound presents on landing, never under the analysis.
     if( m_lookAssistPump.holdsPresentation() )
     {
@@ -34253,6 +35004,12 @@ void MainWindow::drawFrameReady()
             }
             return;
         }
+        // r20 (adversary A1 on dbeb9424): this frame IS the engine's active target, so the wraps before its landing are
+        // the live count here, before this draw's own early/tail advance moves the target or the count.
+        requestContext.engineWrapsAtRequest =
+            presentationAcceptedLookaheadStamp( requestContext.engineWrapsAtRequest,
+                                                m_playbackWrapRecorder.engineWraps );
+        readyFrame.presentationContext.engineWrapsAtRequest = requestContext.engineWrapsAtRequest;
     }
 
     // Forward-only present guard: during forward playback never present a frame older
@@ -34285,6 +35042,9 @@ void MainWindow::drawFrameReady()
         return;
     }
     m_lastPresentedPlaybackFrame = static_cast<long long>( display_frame );
+    // HFR-NATIVE-60FPS-FULLRES-1 r28 (CoS B1 on c4efe7e3): accepted is not displayed. Until this call returns (the early advance
+    // below, then the inline present or the enqueue to the prep queue) the frame's present is still to come.
+    PlaybackPresentDispatchWindow presentDispatchWindow( m_playbackPresentDispatchFrame, static_cast<long long>( display_frame ) );
     // PLAYBACK-STARTUP-CATCHUP-BURST-1: the pace clock starts when this Play's first present ENDS
     // (presentPlaybackPreparedFrame), not here: the first draw blocks the GUI thread for ~1 s on Bachelor CUDA,
     // and a clock started before it banked that stall and repaid it as one 23-frame jump (r3 venue legs).
@@ -34873,12 +35633,41 @@ void MainWindow::drawFrameReady()
         return;
     }
 
+    // CPU-S1-PACE-NEXT-LEVER-1 (Part A): playback_prep_handoff_ms runs from here to the pending
+    // store in enqueuePlaybackPrepTask.
+    const double handoffStartStageTime = mlv_stage_timing_now();
     const bool needsOwnedRgb16 =
         gpu16PreviewActive
         || gpuPreviewProcessingActive
         || cpuPreviewProcessingActive
         || readyFrame.outputMode != RenderFrameThread::OutputProcessed8;
-    if( needsOwnedRgb16
+    PlaybackPrepBorrowInputs borrowInputs;
+    borrowInputs.playing = ui->actionPlay->isChecked();
+    borrowInputs.displayPreviewCachingAllowed = displayPreviewCachingAllowed;
+    borrowInputs.cpuPreviewProcessingActive = cpuPreviewProcessingActive;
+    borrowInputs.outputProcessed8 = readyFrame.outputMode == RenderFrameThread::OutputProcessed8;
+    borrowInputs.gpu16PreviewActive = gpu16PreviewActive;
+    borrowInputs.gpuPreviewProcessingActive = gpuPreviewProcessingActive;
+    borrowInputs.gpuAmazeTexturePresentCandidate = readyFrame.gpuAmazeTexturePresentCandidate;
+    borrowInputs.gpuPlaybackReconTexturePresentCandidate =
+        readyFrame.gpuPlaybackReconTexturePresentCandidate;
+    borrowInputs.gpuPlaybackReconTextureNoReadbackCandidate =
+        readyFrame.gpuPlaybackReconTextureNoReadbackCandidate;
+    borrowInputs.rawImage16 = readyFrame.rawImage16;
+    borrowInputs.rawImage16Bytes = readyFrameRawImage16Bytes;
+    borrowInputs.sourceImage16Bytes = sourceImage16Bytes;
+    // The pinned slot's buffer is task.sourceImage16 already (set above); borrowing it skips the copy.
+    task.borrowedSlotRgb16 = playbackPrepMayBorrowSlotRgb16( borrowInputs );
+    task.readyFrame.stageTimingTelemetry.insert(
+        QStringLiteral("playback_prep_handoff_borrowed_rgb16"), task.borrowedSlotRgb16 );
+    if( task.borrowedSlotRgb16 && m_playbackSmokeFrameTelemetry )
+    {
+        task.borrowedRgb16Words = sourceImage16Bytes / sizeof( uint16_t );
+        task.borrowedRgb16Fnv = playbackPrepSampledRgb16Fnv( task.sourceImage16, task.borrowedRgb16Words );
+        task.borrowedRgb16HashValid = true;
+    }
+    if( !task.borrowedSlotRgb16
+     && needsOwnedRgb16
      && sourceImage16Bytes > 0
      && readyFrame.rawImage16
      && readyFrameRawImage16Bytes >= sourceImage16Bytes )
@@ -34916,7 +35705,7 @@ void MainWindow::drawFrameReady()
     task.rebindOwnedImagePointers();
     notePlaybackPrepOwnershipTelemetry();
 
-    enqueuePlaybackPrepTask( task );
+    enqueuePlaybackPrepTask( std::move( task ), handoffStartStageTime );
     return;
 
 }
@@ -35088,9 +35877,13 @@ bool MainWindow::normalizePlaybackCutRangeForLoadedClip( const char *where )
     const int cutInBefore = ui->spinBoxCutIn->value();
     const int cutOutBefore = ui->spinBoxCutOut->value();
     const double dropModeBefore = m_newPosDropMode;
-    const bool dropModeOutOfRange =
-        m_newPosDropMode < playback_frame_range::firstFrameIndex( normalized )
-     || m_newPosDropMode > playback_frame_range::lastFrameIndex( normalized );
+    // HFR-NATIVE-60FPS-FULLRES-1 r33 (hub ruling B1): the in-range test shares advanceDropFrameTick's wrap bound
+    // (playback_frame_range::dropFrameLoopWrapAt, the same playbackConformActive() flag), so a conformed position in
+    // [last, last + 1) keeps its sub-frame phase instead of being truncated to the last frame every tick (a conformed
+    // Loop with sub-frame ticks stuck on the last frame and never wrapped). Out of range is repaired as before.
+    bool dropModeOutOfRange = false;
+    const double dropModeRepaired = playback_frame_range::normalizeDropFramePosition(
+        m_newPosDropMode, normalized, totalFrames, playbackConformActive(), &dropModeOutOfRange );
     if( !normalized.changed && !dropModeOutOfRange ) return false;
 
     if( f3CutRangeRepairDisabledByEnvironment() )
@@ -35136,9 +35929,7 @@ bool MainWindow::normalizePlaybackCutRangeForLoadedClip( const char *where )
 
     if( dropModeOutOfRange )
     {
-        m_newPosDropMode = playback_frame_range::clampFrameIndex(
-            static_cast<int>( m_newPosDropMode ),
-            totalFrames );
+        m_newPosDropMode = dropModeRepaired;
     }
 
     return true;

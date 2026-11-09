@@ -95,6 +95,11 @@ LOCAL_ONLY_OR_UNCOLLECTED: dict[str, str] = {
         "tools/coordination/test_coordination_guardrails.py and test_demote_factory_bridge.py; "
         "it needs only the stdlib and its tracked testdata/ fixture, so it can join that step as-is"
     ),
+    "tests/console/test_tls_exit_order_fixture_faults.py": (
+        "UNCOLLECTED at CPU-SCOPE-LIVE-CRASH-FIX-1 r8, follow-up TLS-EXIT-ORDER-FIXTURE-CI-1: its exe tests "
+        "need the MinGW tls_exit_order_fixture build, which no workflow makes yet; that card builds it, "
+        "sets MLV_TLS_FIXTURE_EXE and names this file in a windows step (its source-level tests need only the stdlib)"
+    ),
     "tools/profiling/test_frame_colour_spatial_metrics.py": (
         "UNCOLLECTED at acc811f8, follow-up CI-COLLECT-PROFILING-NUMPY-PILLOW: factory-bridge.yml "
         "passes it to --ignore because numpy and Pillow are pinned in no hash-locked requirements file"

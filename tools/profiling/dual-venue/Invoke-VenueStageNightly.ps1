@@ -239,15 +239,17 @@ $StageReuseByName = { param($mod, $path, $id, $sha, $kind) Import-Module -Name $
 
 function Get-RemainingSec { [int][Math]::Floor(($script:Deadline - [DateTime]::UtcNow).TotalSeconds) }
 
-function Invoke-Child([string]$Label, [string]$Script, [string[]]$ArgList, [string]$CommandText = '') {
+function Invoke-Child([string]$Label, [string]$Script, [string[]]$ArgList, [string]$CommandText = '', [hashtable]$ChildEnv = @{}) {
     # One child process, bounded by what is left of -MaxTotalSec, killed with its tree past it. Its output is kept in the call's work dir.
-    # -CommandText runs a script text (-EncodedCommand) instead of -File <Script> <ArgList>.
+    # -CommandText runs a script text (-EncodedCommand) instead of -File <Script> <ArgList>. -ChildEnv sets variables in THIS child's environment
+    # only; this process's own environment is never written (adversary 8eb98036-A3 sibling).
     $remain = Get-RemainingSec
     if ($remain -le 2) { return [pscustomobject]@{ label = $Label; exit = $null; timedOut = $true; started = $false; out = ''; err = '' } }
     $psi = [Diagnostics.ProcessStartInfo]::new($pwshExe)
     $argv = $(if ($CommandText) { @('-NoProfile', '-NonInteractive', '-EncodedCommand', [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($CommandText))) } else { @('-NoProfile', '-NonInteractive', '-File', $Script) + $ArgList })
     foreach ($a in $argv) { [void]$psi.ArgumentList.Add([string]$a) }
     $psi.UseShellExecute = $false; $psi.RedirectStandardOutput = $true; $psi.RedirectStandardError = $true; $psi.RedirectStandardInput = $true; $psi.CreateNoWindow = $true
+    foreach ($k in $ChildEnv.Keys) { $psi.Environment[[string]$k] = [string]$ChildEnv[$k] }
     $p = [Diagnostics.Process]::Start($psi)
     $p.StandardInput.Close()
     $outTask = $p.StandardOutput.ReadToEndAsync(); $errTask = $p.StandardError.ReadToEndAsync()
@@ -575,7 +577,10 @@ if ($buildInCache) {
     } else {
         if (Test-Path -LiteralPath $buildDir) { $buildDir = Join-Path $BuildRoot ("build-$s12-r" + [DateTime]::UtcNow.ToString('yyyyMMddHHmmss')) }
         Say "assemble $commit -> $buildDir (build-guard)"
-        $a = Invoke-Child 'assemble' $Assembler @('-SourceCommit', $commit, '-DllPairDir', $dllDir, '-OutDir', $buildDir)
+        # STAGE-BUILD-HEAVY-SLOT-TIMEOUT-LOSES-TURN-1: the assembler's machine heavy-slot wait is bounded by THIS call's deadline (an env var, so a
+        # stand-in assembler with a fixed parameter list is untouched), not the 60 min default whose refusal re-queued the caller as the youngest ticket.
+        # It is set in the assembler child's environment only, never this process's (r3, adversary 8eb98036-A3 sibling).
+        $a = Invoke-Child 'assemble' $Assembler @('-SourceCommit', $commit, '-DllPairDir', $dllDir, '-OutDir', $buildDir) -ChildEnv @{ MLV_HEAVY_SLOT_DEADLINE_UTC = $script:Deadline.ToString('o') }
         if ($a.timedOut) { Stop-Nightly 'STAGE_CAP_EXCEEDED' "the assembler was still running at the $MaxTotalSec s cap and was killed (see $($script:WorkDir)\assemble.log)" }
         # A machine heavy-slot REQUEUE (heavy-slot code 75/76/77, or its holder gone before the action) is a capacity refusal
         # like the other two, never an assembly failure (MLV-VM-HEAVY-SLOT-ADOPT-1 r13, sol r12 B1).

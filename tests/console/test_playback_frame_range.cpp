@@ -1,6 +1,12 @@
 #include "../common/minitest.h"
 #include "../../platform/qt/PlaybackFrameRange.h"
+#include "../../platform/qt/PlaybackNativePaceGuard.h"
+#include "../../platform/qt/PlaybackSourceAdvanceTracker.h"
 
+#include <cmath>
+#include <cstdio>
+#include <cstring>
+#include <functional>
 #include <limits>
 #include <string>
 #include <vector>
@@ -244,6 +250,24 @@ TEST( PlaybackFrameRange, PacedInPassTargetsStayOnTheWallClockAndAMissedOneStays
     ASSERT_EQ( 1, simulateInPassCaptures( false, 24.0, 1, 20.0, 24.0 ) );
     ASSERT_FALSE( playback_frame_range::contactSheetInPassTargetDue( false, 8000, 10000, 480, 240 ) );
     ASSERT_TRUE( playback_frame_range::contactSheetInPassTargetDue( false, 10000, 10000, 1, 240 ) );
+}
+
+// MERGE-MASTER r3 (adversary A3 input): M16-1457, 1499 required source frames at 59.94 fps conformed to 24 fps
+// (62.4 s of wall clock), six in-pass frames. The targets are the source-window centres 125 .. 1374, not the
+// wall-clock centres of a 25 s window (~source frames 50 .. 550). Paced native keeps the wall clock; unpaced is unchanged.
+TEST( PlaybackFrameRange, ConformedInPassTargetsAreSourceFrameCentresOfTheWholeSourceWindow )
+{
+    ASSERT_TRUE( playback_frame_range::contactSheetInPassTargetsAreSourceFrames( false, true, 1499 ) );
+    ASSERT_FALSE( playback_frame_range::contactSheetInPassTargetsAreSourceFrames( false, false, 1499 ) );
+    ASSERT_TRUE( playback_frame_range::contactSheetInPassTargetsAreSourceFrames( true, false, 1499 ) );
+    ASSERT_TRUE( playback_frame_range::contactSheetInPassTargetsAreSourceFrames( true, false, 0 ) );
+    ASSERT_FALSE( playback_frame_range::contactSheetInPassTargetsAreSourceFrames( false, true, 0 ) );
+    const int64_t expected[] = { 125, 375, 625, 874, 1124, 1374 };
+    for( int i = 0; i < 6; ++i )
+        ASSERT_EQ( expected[i], playback_frame_range::contactSheetInPassTargetSourceFrames( i, 6, 1499 ) );
+    // Due on source frames consumed, whatever the wall clock: the last target is reached after 57 s of a 62 s Play.
+    ASSERT_FALSE( playback_frame_range::contactSheetInPassTargetDue( true, 22917, 22917, 551, 1374 ) );
+    ASSERT_TRUE( playback_frame_range::contactSheetInPassTargetDue( true, 57250, 22917, 1374, 1374 ) );
 }
 
 // The grabs run on the GUI thread inside the measured interval, so the honest figure next to the
@@ -807,6 +831,33 @@ TEST( HfrPlayFloor, AConformedPlayOfAnHfrClipStillAdvancesTenSecondsOfSourceFram
     ASSERT_TRUE( playback_frame_range::evaluatePlayStop( 600, v.requiredFrames, true, 25000, 35000 ) == playback_frame_range::PlayStopState::Reached );
 }
 
+TEST( HfrPlayFloor, AConformedPlayCannotStretchAShortHfrClipIntoALongerWindow )
+{
+    // HFR-NATIVE-60FPS-FULLRES-1 (HUB RULING 2026-10-30T22:17:51Z): 971 frames at 59.94 are 16.2 s of SOURCE. A 24 fps
+    // conform plays them for 40.5 s, but a 25 s window still needs ceil(25 x 59.94) = 1499 source frames: refused.
+    const PlayableWindowVerdict shortClip = evaluatePlayableWindow( 0, 1, 971, 971, 59.94, 25.0,
+                                                                    playback_frame_range::kFloorFromNativeFps, true, 24.0 );
+    ASSERT_FALSE( shortClip.ok );
+    ASSERT_EQ( std::string( "CLIP_TOO_SHORT" ), std::string( shortClip.reason ) );
+    ASSERT_EQ( 1499, shortClip.requiredFrames );
+    // The 27.8 s clip (1667 frames) is admitted at the 24 fps pace: 1498 / 24 = 62.4 s <= 25 / 0.5 + 15 = 65 s.
+    const PlayableWindowVerdict longClip = evaluatePlayableWindow( 0, 1, 1667, 1667, 59.94, 25.0,
+                                                                   playback_frame_range::kFloorFromNativeFps, true, 24.0 );
+    ASSERT_TRUE( longClip.ok );
+    ASSERT_EQ( 1499, longClip.requiredFrames );
+}
+
+TEST( HfrPlayFloor, AConformTooSlowForTheSourceWindowIsRefusedBeforePlay )
+{
+    // The ruling's recorded side effect, fail closed: a 120 fps clip conformed to 24 needs 1200 source frames for its
+    // 10 s floor, 1199 / 24 = 50 s of Play, over the 10 / 0.5 + 15 = 35 s budget: PLAY_PACE_TOO_SLOW before Play.
+    const PlayableWindowVerdict v = evaluatePlayableWindow( 0, 1, 3000, 3000, 120.0, 10.0,
+                                                            playback_frame_range::kFloorFromNativeFps, true, 24.0 );
+    ASSERT_FALSE( v.ok );
+    ASSERT_EQ( std::string( "PLAY_PACE_TOO_SLOW" ), std::string( v.reason ) );
+    ASSERT_EQ( 1200, v.requiredFrames );
+}
+
 TEST( HfrPlayFloor, AnHfrClipLoopedToReachTenSecondsIsRefusedAndNeverCountsAsPlayed )
 {
     // A 5 s HFR clip cannot be looped to 10 s: refused before Play ...
@@ -1060,6 +1111,1368 @@ TEST( PlayStopDecision, ARunTooSlowToFinishInsideTheBudgetEndsEarlyWithTheTypedP
     ASSERT_TRUE( slow.state == PlayStopState::PaceTooSlow );
     ASSERT_TRUE( slow.elapsedMs < budget );
     ASSERT_TRUE( slow.consumed < 480 );
+}
+
+// ---------------------------------------------------------------------------------------------------------
+// HFR-NATIVE-60FPS-FULLRES-1-MERGE-MASTER r11 (ADV-A1b; catalogue C-PACE-RECOVERY-01, M-04): a recovered startup wait
+// or stall must not be projected onto every remaining frame. The repro (sol 6551929282, fable 6552056715, r10
+// adversary A1): a 1667-frame 59.94 fps clip, default 24 fps conform, requestedSeconds 25, gated, Loop off. Admission
+// accepts 1499 source frames (1498 steps / 24 = 62.4 s) inside 65 s. With the first present ~1 s after the trigger and
+// 24 fps after, 8 s in it has consumed ~170, and master projected 8000 x 1498 / 169 = 70.9 s -> PLAY_PACE_TOO_SLOW
+// (GUI smoke exit 14), although the run finishes at ~63.4 s.
+// ---------------------------------------------------------------------------------------------------------
+namespace
+{
+using playback_frame_range::PlayPaceHistory;
+
+struct Stall
+{
+    int64_t atMs;
+    int64_t forMs;
+};
+
+// The engine is held (no advance) until firstPresentMs and inside every stall, and otherwise advances at paceFps. The
+// stop decision is polled every pollEvery ms with the Play's pace history, exactly as MainWindow::programmaticPlayState
+// does. From stopAdvancingAt on (default: never) the engine is held while Play stays on.
+EngineRun runStalledEngine( int64_t firstPresentMs, double paceFps, int64_t required, int64_t safetyMs,
+                            int64_t pollEvery = 10, std::vector<Stall> stalls = std::vector<Stall>(),
+                            int cutOut = 1667,
+                            int64_t stopAdvancingAt = std::numeric_limits<int64_t>::max() )
+{
+    EngineRun run;
+    SourceFrameAdvanceCounter counter;
+    counter.begin( 0 );
+    PlayPaceHistory history;
+    double position = 0.0;
+    const int64_t tickMs = 1;
+    for( int64_t now = 0; now <= 900000; now += tickMs )
+    {
+        if( now % pollEvery == 0 )
+        {
+            const bool playing = position < cutOut - 1;
+            history.note( counter.consumed(), now );
+            run.state = evaluatePlayStop( counter.consumed(), required, playing, now, safetyMs,
+                                          playback_frame_range::PlayPaceMode::Gated, history );
+            if( run.state != PlayStopState::Continue ) { run.elapsedMs = now; break; }
+        }
+        bool held = now < firstPresentMs || now >= stopAdvancingAt;
+        for( const Stall &s : stalls ) held = held || ( now >= s.atMs && now < s.atMs + s.forMs );
+        if( held ) continue;
+        const playback_frame_range::DropFrameTickResult tick =
+            advanceDropFrameTick( position, paceFps * tickMs / 1000.0, 1, cutOut, false );
+        counter.noteEngineTick( position, tick.position, tick.wrapped );
+        if( tick.wrapped ) run.wrapped = true;
+        position = tick.position;
+    }
+    run.consumed = counter.consumed();
+    run.position = position;
+    return run;
+}
+
+PlayPaceHistory historyOf( int64_t firstPresentMs, double paceFps, int64_t untilMs, int64_t pollMs = 10 )
+{
+    PlayPaceHistory history;
+    for( int64_t t = 0; t <= untilMs; t += pollMs )
+    {
+        const int64_t steps = t < firstPresentMs ? 0 : static_cast<int64_t>( ( t - firstPresentMs ) * paceFps / 1000.0 );
+        history.note( 1 + steps, t );
+    }
+    return history;
+}
+}
+
+TEST( PlayPaceRecovery, AdvA1bTheExactReproProjectsPastTheBudgetOnlyUnderTheOldAverage )
+{
+    const int64_t budget = playSafetyMs( 25.0 );
+    ASSERT_EQ( 65000, budget );
+    const PlayableWindowVerdict v = evaluatePlayableWindow( 0, 1, 1667, 1667, 59.94, 25.0, playback_frame_range::kFloorFromNativeFps, true, 24.0 );
+    ASSERT_TRUE( v.ok );
+    ASSERT_EQ( 1499, v.requiredFrames );
+    // master's average since the trigger: 8000 x 1498 / 169 = 70911 ms > 65000 (this is what refused the run)
+    ASSERT_TRUE( playback_frame_range::playPaceProjectsPastBudget( 170, 1499, 8000, budget ) );
+    ASSERT_TRUE( evaluatePlayStop( 170, 1499, true, 8000, budget ) == PlayStopState::PaceTooSlow );
+    // with the Play's history (first present at ~1 s, 24 fps since): 8000 + 1329 steps / 24 fps = 63.4 s -> keep going
+    const PlayPaceHistory h = historyOf( 1000, 24.0, 8000 );
+    ASSERT_TRUE( h.haveFirstStep );
+    ASSERT_FALSE( playback_frame_range::playPaceProjectsPastBudget( 170, 1499, 8000, budget, h ) );
+    ASSERT_TRUE( evaluatePlayStop( 170, 1499, true, 8000, budget, playback_frame_range::PlayPaceMode::Gated, h )
+                 == PlayStopState::Continue );
+}
+
+TEST( PlayPaceRecovery, AdvA1bAFirstPresentAtSixHundredOrOneThousandMsThen24FpsContinuesAndReachesTheEnd )
+{
+    const int64_t budget = playSafetyMs( 25.0 );
+    for( const int64_t firstPresent : { int64_t( 600 ), int64_t( 1000 ) } )
+    {
+        for( const int64_t poll : { int64_t( 10 ), int64_t( 50 ) } )   // the smoke/settle loops poll at 10 ms, autoplay at 50
+        {
+            const EngineRun run = runStalledEngine( firstPresent, 24.0, 1499, budget, poll );
+            ASSERT_TRUE( run.state == PlayStopState::Reached );
+            ASSERT_TRUE( run.consumed >= 1499 );
+            ASSERT_TRUE( run.elapsedMs < budget );
+            // 1498 steps at 24 fps after the first present: 62.4 s + the wait, paid once
+            ASSERT_TRUE( run.elapsedMs >= firstPresent + 62400 && run.elapsedMs <= firstPresent + 62500 + poll );
+            ASSERT_FALSE( run.wrapped );
+        }
+    }
+}
+
+TEST( PlayPaceRecovery, AdvA1bTheVenueFirstPresentRangeOfCudaReceiptsIsNotRefused )
+{
+    // fable 6552056715: CUDA first presents of 384-1691 ms. 1691 + 62417 = 64.1 s, still inside 65 s.
+    const int64_t budget = playSafetyMs( 25.0 );
+    for( const int64_t firstPresent : { int64_t( 361 ), int64_t( 384 ), int64_t( 1691 ) } )
+    {
+        const EngineRun run = runStalledEngine( firstPresent, 24.0, 1499, budget );
+        ASSERT_TRUE( run.state == PlayStopState::Reached );
+    }
+}
+
+TEST( PlayPaceRecovery, AdvA1bAMidRunTransientStallThatRecoversIsNotRefused )
+{
+    // One second held at 4 s (straddling the 8 s probe's view) and another at 20 s: 62.4 s + 2 s = 64.4 s < 65 s.
+    const int64_t budget = playSafetyMs( 25.0 );
+    std::vector<Stall> stalls;
+    stalls.push_back( Stall{ 4000, 1000 } );
+    stalls.push_back( Stall{ 20000, 1000 } );
+    const EngineRun run = runStalledEngine( 0, 24.0, 1499, budget, 10, stalls );
+    ASSERT_TRUE( run.state == PlayStopState::Reached );
+    ASSERT_TRUE( run.elapsedMs < budget );
+    // A stall right at the probe (7-8 s) too, after 7 s of 24 fps.
+    std::vector<Stall> atProbe;
+    atProbe.push_back( Stall{ 7000, 1500 } );
+    ASSERT_TRUE( runStalledEngine( 0, 24.0, 1499, budget, 10, atProbe ).state == PlayStopState::Reached );
+}
+
+TEST( PlayPaceRecovery, R11AdversaryA1AStallTheCountSatThroughIsNotChargedToTheStretchAfterIt )
+{
+    // r11 adversary A1 (aac1645f), its exact input: polled every 10 ms, consumed(t) = 1 + floor(24 x
+    // max(0, t - 1000 - min(1000, max(0, t - 3000))) / 1000) -- first present at 1 s, held 3..4 s, 24 fps otherwise.
+    // At (8000, 145) the 4..8 s stretch is 24 fps and the run finishes at 64.4 s; aac1645f anchored the window at the
+    // count's FIRST sighting (3000, 49), measured 19.2 fps and refused PaceTooSlow (73.8 s).
+    const int64_t budget = playSafetyMs( 25.0 );
+    PlayPaceHistory h;
+    int64_t consumed = 0;
+    for( int64_t t = 0; t <= 8000; t += 10 )
+    {
+        const int64_t held = std::min<int64_t>( 1000, std::max<int64_t>( 0, t - 3000 ) );
+        consumed = 1 + ( 24 * std::max<int64_t>( 0, t - 1000 - held ) ) / 1000;
+        h.note( consumed, t );
+        ASSERT_TRUE( evaluatePlayStop( consumed, 1499, true, t, budget, playback_frame_range::PlayPaceMode::Gated, h )
+                     == PlayStopState::Continue );
+    }
+    ASSERT_EQ( int64_t( 145 ), consumed );
+    ASSERT_TRUE( h.bestPace( consumed, 8000 ) * 1000.0 >= 24.0 );
+    std::vector<Stall> stall;
+    stall.push_back( Stall{ 3000, 1000 } );
+    const EngineRun run = runStalledEngine( 1000, 24.0, 1499, budget, 10, stall );
+    ASSERT_TRUE( run.state == PlayStopState::Reached );
+    ASSERT_TRUE( run.elapsedMs < budget );
+    // the same at the autoplay's 50 ms poll, and with the stall ending as late as 5 s
+    ASSERT_TRUE( runStalledEngine( 1000, 24.0, 1499, budget, 50, stall ).state == PlayStopState::Reached );
+    std::vector<Stall> late;
+    late.push_back( Stall{ 4000, 1000 } );
+    ASSERT_TRUE( runStalledEngine( 500, 24.0, 1499, budget, 10, late ).state == PlayStopState::Reached );
+}
+
+TEST( PlayPaceRecovery, AdvA1bAPaceThatTrulyCannotFinishIsStillRefusedWithTheTypedToken )
+{
+    // 20 fps sustained on the same window: 1498 / 20 = 74.9 s > 65 s. Refused at the probe, with or without a wait.
+    const int64_t budget = playSafetyMs( 25.0 );
+    for( const int64_t firstPresent : { int64_t( 0 ), int64_t( 1000 ) } )
+    {
+        for( const int64_t poll : { int64_t( 10 ), int64_t( 50 ) } )
+        {
+            const EngineRun run = runStalledEngine( firstPresent, 20.0, 1499, budget, poll );
+            ASSERT_TRUE( run.state == PlayStopState::PaceTooSlow );
+            ASSERT_TRUE( run.elapsedMs >= playback_frame_range::kPaceProbeMs && run.elapsedMs < 9000 );
+            ASSERT_TRUE( run.consumed < 1499 );
+            ASSERT_EQ( std::string( "PLAY_PACE_TOO_SLOW" ),
+                       std::string( playback_frame_range::playStopFailureReason( run.state ) ) );
+        }
+    }
+    // 22 fps (68.1 s) is refused too; 23.5 fps (63.7 s) is not.
+    ASSERT_TRUE( runStalledEngine( 0, 22.0, 1499, budget ).state == PlayStopState::PaceTooSlow );
+    ASSERT_TRUE( runStalledEngine( 0, 23.5, 1499, budget ).state == PlayStopState::Reached );
+    // A wait too long to repay: first present at 4 s then 24 fps needs 66.4 s -> refused, never a timeout first.
+    const EngineRun late = runStalledEngine( 4000, 24.0, 1499, budget );
+    ASSERT_TRUE( late.state == PlayStopState::PaceTooSlow );
+    ASSERT_TRUE( late.elapsedMs < budget );
+}
+
+TEST( PlayPaceRecovery, AdvA1bAnEngineThatStopsAdvancingNeverPassesAndEndsTyped )
+{
+    // 24 fps for 5 s, then held while Play stays on: refused (or, at worst, the typed timeout), never Reached, never a hang.
+    const int64_t budget = playSafetyMs( 25.0 );
+    const EngineRun run = runStalledEngine( 0, 24.0, 1499, budget, 10, std::vector<Stall>(), 1667, 5000 );
+    ASSERT_TRUE( run.state == PlayStopState::PaceTooSlow || run.state == PlayStopState::SafetyTimeout );
+    ASSERT_TRUE( run.elapsedMs <= budget );
+    ASSERT_TRUE( run.consumed < 1499 );
+}
+
+TEST( PlayPaceRecovery, NativeRunsAreUnchangedFromMaster )
+{
+    // Native 59.94 fps (no conform), same window: 1498 / 59.94 = 25 s, tolerated a ~4.9 s startup wait on master.
+    const int64_t budget = playSafetyMs( 25.0 );
+    const PlayableWindowVerdict v = evaluatePlayableWindow( 0, 1, 1667, 1667, 59.94, 25.0 );
+    ASSERT_TRUE( v.ok );
+    ASSERT_EQ( 1499, v.requiredFrames );
+    ASSERT_TRUE( runStalledEngine( 0, 59.94, 1499, budget ).state == PlayStopState::Reached );
+    ASSERT_TRUE( runStalledEngine( 4900, 59.94, 1499, budget ).state == PlayStopState::Reached );
+    // the existing native tables, through the history-taking path with a real history
+    ASSERT_TRUE( runEngine( 0, 1, 720, 12.0, 480, playSafetyMs( 20.0 ) ).state == PlayStopState::Reached );
+    ASSERT_TRUE( runEngine( 0, 1, 720, 6.0, 480, playSafetyMs( 20.0 ) ).state == PlayStopState::PaceTooSlow );
+    ASSERT_TRUE( runStalledEngine( 0, 6.0, 480, playSafetyMs( 20.0 ), 10, std::vector<Stall>(), 720 ).state
+                 == PlayStopState::PaceTooSlow );
+    ASSERT_TRUE( runStalledEngine( 0, 4.0, 600, budget, 10, std::vector<Stall>(), 720 ).state == PlayStopState::PaceTooSlow );
+    // a steady run from frame 0: the history agrees with master's average, so the verdict is master's
+    for( const double fps : { 4.0, 6.0, 12.0, 24.0, 59.94 } )
+    {
+        const PlayPaceHistory h = historyOf( 0, fps, 9000 );
+        const int64_t consumed = 1 + static_cast<int64_t>( 9000 * fps / 1000.0 );
+        ASSERT_EQ( playback_frame_range::playPaceProjectsPastBudget( consumed, 1499, 9000, budget ),
+                   playback_frame_range::playPaceProjectsPastBudget( consumed, 1499, 9000, budget, h ) );
+    }
+}
+
+TEST( PlayPaceRecovery, TheProjectionIsNeverStricterThanMastersAndWithoutHistoryIsMasters )
+{
+    const int64_t budget = playSafetyMs( 25.0 );
+    for( const int64_t firstPresent : { int64_t( 0 ), int64_t( 500 ), int64_t( 3000 ) } )
+    {
+        for( const double fps : { 10.0, 20.0, 24.0, 30.0 } )
+        {
+            const PlayPaceHistory h = historyOf( firstPresent, fps, 30000 );
+            for( int64_t consumed = 2; consumed < 1499; consumed += 37 )
+            {
+                for( int64_t elapsed = 8000; elapsed < budget; elapsed += 1700 )
+                {
+                    const bool master = playback_frame_range::playPaceProjectsPastBudget( consumed, 1499, elapsed, budget );
+                    if( !master ) ASSERT_FALSE( playback_frame_range::playPaceProjectsPastBudget( consumed, 1499, elapsed, budget, h ) );
+                    // the empty history is master's formula: elapsed x stepsNeeded / stepsDone
+                    const double projected = static_cast<double>( elapsed ) * 1498.0 / static_cast<double>( consumed - 1 );
+                    if( std::abs( projected - static_cast<double>( budget ) ) > 1e-3 )
+                        ASSERT_EQ( projected > static_cast<double>( budget ), master );
+                }
+            }
+        }
+    }
+}
+
+TEST( PlayPaceRecovery, TheHistoryStartsOverForANewPlayOrAnotherClock )
+{
+    PlayPaceHistory h = historyOf( 0, 24.0, 9000 );
+    ASSERT_TRUE( h.haveFirstStep );
+    ASSERT_TRUE( h.bestPace( 217, 9000 ) > 0.02 );
+    h.note( 1, 9010 );   // the counter was re-armed (consumed went back)
+    ASSERT_FALSE( h.haveFirstStep );
+    ASSERT_EQ( 0.0, h.bestWindowPace );
+    h = historyOf( 0, 24.0, 9000 );
+    h.note( 300, 50 );   // a clock that went back
+    ASSERT_TRUE( h.haveFirstStep );
+    ASSERT_EQ( int64_t( 50 ), h.firstStep.elapsedMs );
+    ASSERT_EQ( 0.0, h.bestWindowPace );
+    // nothing measured: no pace, so the probe falls back to master's average
+    const PlayPaceHistory empty;
+    ASSERT_EQ( 0.0, empty.bestPace( 170, 8000 ) );
+    // the window is kept bounded: a 60 s steady run holds about one window of change points, not the whole run
+    const PlayPaceHistory longRun = historyOf( 0, 59.94, 60000 );
+    ASSERT_TRUE( longRun.window.size() <= static_cast<size_t>( playback_frame_range::kPaceRecentWindowMs * 59.94 / 1000.0 ) + 8 );
+}
+
+// ---------------------------------------------------------------------------------------------------------
+// r12 (ADV-A1b residual; Dot 6553009018, follow-up 6553147568, on e565602e): SEVERAL recoverable stalls before the 8 s
+// probe, so every >= 3 s stretch contains stall time and every r11 estimate stays below the pace the engine plays at.
+// Dot's exact input: required 1499, safety 65000, 24 fps, polled every 10 ms, first present at 1 s, held 3.0-3.5 s and
+// 5.5-6.0 s: c(t) = 1 + floor(24 x max(0, t - 1000 - min(500, max(0, t - 3000)) - min(500, max(0, t - 5500))) / 1000).
+// At 8 s it has consumed 145; continuing at 24 fps it reaches 1499 at 64416.7 ms, inside 65 s.
+// ---------------------------------------------------------------------------------------------------------
+namespace
+{
+// The count Dot's formula gives for a first present, a play rate and any number of stalls (each held [atMs, atMs+forMs)).
+int64_t stalledCount( int64_t t, int64_t firstPresentMs, int64_t fpsInt, const std::vector<Stall> &stalls )
+{
+    int64_t played = t - firstPresentMs;
+    for( const Stall &s : stalls ) played -= std::min<int64_t>( s.forMs, std::max<int64_t>( 0, t - s.atMs ) );
+    return 1 + ( fpsInt * std::max<int64_t>( 0, played ) ) / 1000;
+}
+
+struct PolledRun
+{
+    PlayStopState state = PlayStopState::Continue;
+    int64_t elapsedMs = 0;
+    int64_t consumed = 0;
+    int64_t consumedAt8s = 0;
+};
+
+// Polls the stop decision every pollMs exactly as MainWindow::programmaticPlayState does (note, then decide).
+PolledRun pollStalledCount( int64_t firstPresentMs, int64_t fpsInt, const std::vector<Stall> &stalls,
+                            int64_t required, int64_t safetyMs, int64_t pollMs = 10 )
+{
+    PolledRun run;
+    PlayPaceHistory h;
+    for( int64_t t = 0; t <= 900000; t += pollMs )
+    {
+        run.consumed = stalledCount( t, firstPresentMs, fpsInt, stalls );
+        if( t == 8000 ) run.consumedAt8s = run.consumed;
+        h.note( run.consumed, t );
+        run.state = evaluatePlayStop( run.consumed, required, true, t, safetyMs, playback_frame_range::PlayPaceMode::Gated, h );
+        if( run.state != PlayStopState::Continue ) { run.elapsedMs = t; break; }
+    }
+    return run;
+}
+
+std::vector<Stall> stallsOf( std::initializer_list<Stall> list ) { return std::vector<Stall>( list ); }
+}
+
+TEST( PlayPaceRecovery, R12DotTwoRecoverableStallsBeforeTheProbeAreNotRefused )
+{
+    const int64_t budget = playSafetyMs( 25.0 );
+    const std::vector<Stall> dot = stallsOf( { Stall{ 3000, 500 }, Stall{ 5500, 500 } } );
+    // Dot's arithmetic, re-verified: 145 at 8 s; the uninterrupted stretches are 1-3, 3.5-5.5 and 6-8 s (2 s each).
+    ASSERT_EQ( int64_t( 145 ), stalledCount( 8000, 1000, 24, dot ) );
+    ASSERT_EQ( int64_t( 1499 ), stalledCount( 64417, 1000, 24, dot ) );
+    ASSERT_EQ( int64_t( 1498 ), stalledCount( 64416, 1000, 24, dot ) );
+    // every poll up to completion: never refused, never timed out, and Reached at 64.42 s
+    const PolledRun run = pollStalledCount( 1000, 24, dot, 1499, budget );
+    ASSERT_EQ( int64_t( 145 ), run.consumedAt8s );
+    ASSERT_TRUE( run.state == PlayStopState::Reached );
+    ASSERT_TRUE( run.elapsedMs >= 64416 && run.elapsedMs <= 64430 );
+    // the same through the engine model, at the smoke's 10 ms and the autoplay's 50 ms polls
+    for( const int64_t poll : { int64_t( 10 ), int64_t( 50 ) } )
+    {
+        const EngineRun engine = runStalledEngine( 1000, 24.0, 1499, budget, poll, dot );
+        ASSERT_TRUE( engine.state == PlayStopState::Reached );
+        ASSERT_TRUE( engine.elapsedMs < budget );
+    }
+}
+
+TEST( PlayPaceRecovery, R12ThreeStallsStallsOfDifferentLengthsAndAStallStraddlingTheWindowAreNotRefused )
+{
+    const int64_t budget = playSafetyMs( 25.0 );
+    // three stalls (1.3 s in all; stretches of 1.5, 1.5, 1.5 and 1.2 s): finishes at 64.72 s
+    // two stalls of 0.3 and 0.9 s (stretches 1.8, 1.7, 2.3 s): finishes at 64.62 s
+    // a stall ending 2.9 s before the probe, so the last stretch is just short of the 3 s window, plus an earlier one
+    // (stretches 1.0, 2.1, 2.9 s): finishes at 64.42 s
+    const std::vector<std::vector<Stall>> cases = {
+        stallsOf( { Stall{ 2500, 500 }, Stall{ 4500, 500 }, Stall{ 6500, 300 } } ),
+        stallsOf( { Stall{ 2800, 300 }, Stall{ 4800, 900 } } ),
+        stallsOf( { Stall{ 2000, 400 }, Stall{ 4500, 600 } } ),
+    };
+    for( const std::vector<Stall> &stalls : cases )
+    {
+        int64_t stallMs = 0;
+        for( const Stall &s : stalls ) stallMs += s.forMs;
+        for( const int64_t poll : { int64_t( 10 ), int64_t( 50 ) } )
+        {
+            const PolledRun run = pollStalledCount( 1000, 24, stalls, 1499, budget, poll );
+            ASSERT_TRUE( run.state == PlayStopState::Reached );
+            ASSERT_TRUE( run.elapsedMs < budget );
+            ASSERT_TRUE( run.elapsedMs >= 1000 + stallMs + 62416 );
+            ASSERT_TRUE( runStalledEngine( 1000, 24.0, 1499, budget, poll, stalls ).state == PlayStopState::Reached );
+        }
+    }
+}
+
+TEST( PlayPaceRecovery, R12AdversaryA1StallsShorterThanAFixedThresholdAreStillSeen )
+{
+    // r12 adversary A1 (cc9a1944), its exact input: 1 s first present, held [2500,2700), [4500,4700), [6500,6700), 24 fps
+    // otherwise, polled every 10 or 50 ms. At 8 s consumed = 154; cc9a1944's fixed 250 ms threshold counted the three
+    // ~240 ms holds as playing, measured 22.67 fps and refused PaceTooSlow (67.3 s), although the run finishes at 64.02 s.
+    const int64_t budget = playSafetyMs( 25.0 );
+    const std::vector<Stall> a1 = stallsOf( { Stall{ 2500, 200 }, Stall{ 4500, 200 }, Stall{ 6500, 200 } } );
+    ASSERT_EQ( int64_t( 154 ), stalledCount( 8000, 1000, 24, a1 ) );
+    for( const int64_t poll : { int64_t( 10 ), int64_t( 50 ) } )
+    {
+        const PolledRun run = pollStalledCount( 1000, 24, a1, 1499, budget, poll );
+        ASSERT_EQ( int64_t( 154 ), run.consumedAt8s );
+        ASSERT_TRUE( run.state == PlayStopState::Reached );
+        ASSERT_TRUE( run.elapsedMs >= 64016 && run.elapsedMs < budget );
+        ASSERT_TRUE( runStalledEngine( 1000, 24.0, 1499, budget, poll, a1 ).state == PlayStopState::Reached );
+    }
+    // shorter still: six 100 ms stalls at the 10 ms poll (finishes at 64.02 s)
+    const std::vector<Stall> six = stallsOf( { Stall{ 2000, 100 }, Stall{ 3000, 100 }, Stall{ 4000, 100 },
+                                               Stall{ 5000, 100 }, Stall{ 6000, 100 }, Stall{ 7000, 100 } } );
+    ASSERT_TRUE( pollStalledCount( 1000, 24, six, 1499, budget ).state == PlayStopState::Reached );
+}
+
+TEST( PlayPaceRecovery, R12ControlsStillEndTypedPaceTooSlow )
+{
+    const int64_t budget = playSafetyMs( 25.0 );
+    const std::vector<Stall> dot = stallsOf( { Stall{ 3000, 500 }, Stall{ 5500, 500 } } );
+    // a genuinely slow engine is refused at the probe, with Dot's stalls or without
+    for( const int64_t fps : { int64_t( 20 ), int64_t( 22 ) } )
+    {
+        for( const std::vector<Stall> &stalls : { std::vector<Stall>(), dot } )
+        {
+            const PolledRun run = pollStalledCount( 0, fps, stalls, 1499, budget );
+            ASSERT_TRUE( run.state == PlayStopState::PaceTooSlow );
+            ASSERT_TRUE( run.elapsedMs >= playback_frame_range::kPaceProbeMs && run.elapsedMs < 9000 );
+            ASSERT_TRUE( runStalledEngine( 0, static_cast<double>( fps ), 1499, budget, 10, stalls ).state
+                         == PlayStopState::PaceTooSlow );
+        }
+    }
+    // a 4 s first present then 24 fps (66.4 s), with an extra stall too: refused at the probe
+    ASSERT_TRUE( pollStalledCount( 4000, 24, std::vector<Stall>(), 1499, budget ).elapsedMs < 9000 );
+    ASSERT_TRUE( pollStalledCount( 4000, 24, stallsOf( { Stall{ 6000, 300 } } ), 1499, budget ).state == PlayStopState::PaceTooSlow );
+    // stall time that keeps growing (0.5, 1, 2, 4, 8, 16 s): the run really cannot finish inside 65 s. It is refused,
+    // typed, before the budget -- never Reached, never the timeout.
+    const std::vector<Stall> growing = stallsOf( { Stall{ 3000, 500 }, Stall{ 6000, 1000 }, Stall{ 10000, 2000 },
+                                                   Stall{ 16000, 4000 }, Stall{ 26000, 8000 }, Stall{ 40000, 16000 } } );
+    for( const int64_t poll : { int64_t( 10 ), int64_t( 50 ) } )
+    {
+        const PolledRun run = pollStalledCount( 500, 24, growing, 1499, budget, poll );
+        ASSERT_TRUE( run.state == PlayStopState::PaceTooSlow );
+        ASSERT_TRUE( run.elapsedMs < budget );
+        ASSERT_TRUE( run.consumed < 1499 );
+        // and at the moment it is refused, even 24 fps from here with no further stall could not make 65 s
+        ASSERT_TRUE( run.elapsedMs + ( 1499 - run.consumed ) * 1000 / 24 > budget );
+    }
+    // a time that is all stalls: one step every 400 ms, or ten steps at once every second -- too few playing frames to
+    // estimate a pace, so the probe is master's and refuses at 8 s
+    {
+        PlayPaceHistory h;
+        PlayStopState state = PlayStopState::Continue;
+        int64_t t = 0;
+        for( ; t <= budget && state == PlayStopState::Continue; t += 10 )
+        {
+            const int64_t c = 1 + t / 400;
+            h.note( c, t );
+            state = evaluatePlayStop( c, 1499, true, t, budget, playback_frame_range::PlayPaceMode::Gated, h );
+        }
+        ASSERT_TRUE( state == PlayStopState::PaceTooSlow );
+        ASSERT_TRUE( t - 10 < 9000 );
+    }
+    {
+        PlayPaceHistory h;
+        PlayStopState state = PlayStopState::Continue;
+        int64_t t = 0;
+        for( ; t <= budget && state == PlayStopState::Continue; t += 10 )
+        {
+            const int64_t c = 1 + 10 * ( t / 1000 );
+            h.note( c, t );
+            state = evaluatePlayStop( c, 1499, true, t, budget, playback_frame_range::PlayPaceMode::Gated, h );
+        }
+        ASSERT_TRUE( state == PlayStopState::PaceTooSlow );
+        ASSERT_TRUE( t - 10 < 9000 );
+    }
+    // a single short burst (1 s at 24 fps) and then one step every 600 ms: refused at the probe
+    {
+        PlayPaceHistory h;
+        PlayStopState state = PlayStopState::Continue;
+        int64_t t = 0;
+        for( ; t <= budget && state == PlayStopState::Continue; t += 10 )
+        {
+            const int64_t c = t < 2000 ? stalledCount( t, 1000, 24, std::vector<Stall>() ) : 25 + ( t - 2000 ) / 600;
+            h.note( c, t );
+            state = evaluatePlayStop( c, 1499, true, t, budget, playback_frame_range::PlayPaceMode::Gated, h );
+        }
+        ASSERT_TRUE( state == PlayStopState::PaceTooSlow );
+        ASSERT_TRUE( t - 10 < 9000 );
+    }
+    // stalls that recur all the time (0.6 s of 24 fps, then 0.4 s held, over and over: ~14 fps): refused at the probe
+    {
+        PlayPaceHistory h;
+        PlayStopState state = PlayStopState::Continue;
+        int64_t t = 0;
+        for( ; t <= budget && state == PlayStopState::Continue; t += 10 )
+        {
+            const int64_t played = ( t / 1000 ) * 600 + std::min<int64_t>( 600, t % 1000 );
+            const int64_t c = 1 + 24 * played / 1000;
+            h.note( c, t );
+            state = evaluatePlayStop( c, 1499, true, t, budget, playback_frame_range::PlayPaceMode::Gated, h );
+        }
+        ASSERT_TRUE( state == PlayStopState::PaceTooSlow );
+        ASSERT_TRUE( t - 10 < 9000 );
+    }
+}
+
+TEST( PlayPaceRecovery, R12ThePlayingPaceStartsOverWithTheHistoryAndNeedsEnoughPlaying )
+{
+    const std::vector<Stall> dot = stallsOf( { Stall{ 3000, 500 }, Stall{ 5500, 500 } } );
+    PlayPaceHistory h;
+    for( int64_t t = 0; t <= 8000; t += 10 ) h.note( stalledCount( t, 1000, 24, dot ), t );
+    ASSERT_TRUE( h.playingPace( 8000 ) * 1000.0 >= 23.9 );
+    const PlayPaceHistory::PlayingSplit split = h.playingSplit( 8000 );
+    // the two holds of ~550 ms each; r13 (sol r12 B2) charges only the 2 x 500 ms really held, less at most one poll gap
+    // and one step period per stall (it was the whole 1100 ms of holds before r13)
+    ASSERT_TRUE( split.stallMs >= 1000 - 2 * ( 10 + 42 ) && split.stallMs <= 1000 );
+    ASSERT_TRUE( split.thresholdMs >= 50 && split.thresholdMs <= 80 );  // median hold 40 ms + 2 x 10 ms polls
+    h.note( 1, 8010 );                                                  // a new Play re-armed the counter
+    ASSERT_EQ( int64_t( 0 ), h.holds );
+    ASSERT_EQ( int64_t( 0 ), h.overflowHolds );                         // (r14: the poll-gap histogram is gone)
+    ASSERT_EQ( int64_t( 0 ), h.playingSplit( 8010 ).thresholdMs );      // no closed hold: no threshold yet
+    ASSERT_EQ( int64_t( 0 ), h.playingSplit( 8010 ).stallMs );
+    ASSERT_EQ( 0.0, h.playingPace( 8010 ) );
+    // a steady engine at any pace has every hold counted as playing (the threshold follows its own cadence)
+    for( const int64_t fps : { int64_t( 3 ), int64_t( 12 ), int64_t( 24 ), int64_t( 60 ) } )
+    {
+        for( const int64_t poll : { int64_t( 10 ), int64_t( 16 ), int64_t( 50 ) } )
+        {
+            PlayPaceHistory steady;
+            for( int64_t t = 0; t <= 20000; t += poll ) steady.note( stalledCount( t, 0, fps, std::vector<Stall>() ), t );
+            const PlayPaceHistory::PlayingSplit st = steady.playingSplit( 20000 / poll * poll );
+            ASSERT_EQ( int64_t( 0 ), st.stallMs );
+        }
+    }
+    // holds longer than the histogram are always stalls
+    PlayPaceHistory longHolds;
+    for( int64_t t = 0; t <= 20000; t += 10 ) longHolds.note( 1 + t / 1500, t );
+    ASSERT_TRUE( longHolds.overflowHolds > 0 );
+    ASSERT_EQ( 0.0, longHolds.playingPace( 20000 ) );
+    // 2.9 s of playing is not enough; 3 s is
+    PlayPaceHistory s;
+    for( int64_t t = 0; t <= 2900; t += 10 ) s.note( stalledCount( t, 0, 24, std::vector<Stall>() ), t );
+    ASSERT_EQ( 0.0, s.playingPace( 2900 ) );
+    for( int64_t t = 2910; t <= 3100; t += 10 ) s.note( stalledCount( t, 0, 24, std::vector<Stall>() ), t );
+    ASSERT_TRUE( s.playingPace( 3100 ) > 0.0 );
+    // an open hold longer than the stall threshold is stall time, not playing time
+    ASSERT_EQ( int64_t( 0 ), s.playingSplit( 3100 ).stallMs );
+    s.note( s.lastConsumed, 3400 );
+    ASSERT_TRUE( s.playingSplit( 3400 ).stallMs >= 250 );
+    ASSERT_TRUE( s.playingPace( 3400 ) * 1000.0 >= 23.9 );
+}
+
+TEST( PlayPaceRecovery, R12TheProjectionWithStallsIsNeverStricterThanMasters )
+{
+    // the r11 grid, extended to histories with recoverable stalls (polled through Dot's formula)
+    const int64_t budget = playSafetyMs( 25.0 );
+    const std::vector<std::vector<Stall>> stallSets = {
+        std::vector<Stall>(),
+        stallsOf( { Stall{ 3000, 500 }, Stall{ 5500, 500 } } ),
+        stallsOf( { Stall{ 2500, 500 }, Stall{ 4500, 500 }, Stall{ 6500, 300 } } ),
+        stallsOf( { Stall{ 2000, 3000 } } ),
+    };
+    for( const std::vector<Stall> &stalls : stallSets )
+    {
+        for( const int64_t fps : { int64_t( 10 ), int64_t( 20 ), int64_t( 24 ), int64_t( 30 ) } )
+        {
+            PlayPaceHistory h;
+            for( int64_t t = 0; t <= 30000; t += 10 ) h.note( stalledCount( t, 500, fps, stalls ), t );
+            for( int64_t consumed = 2; consumed < 1499; consumed += 37 )
+            {
+                for( int64_t elapsed = 8000; elapsed < budget; elapsed += 1700 )
+                {
+                    const bool master = playback_frame_range::playPaceProjectsPastBudget( consumed, 1499, elapsed, budget );
+                    if( !master ) ASSERT_FALSE( playback_frame_range::playPaceProjectsPastBudget( consumed, 1499, elapsed, budget, h ) );
+                }
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------------------------------------
+// r13 (sol r12 CHANGES_REQUESTED on d5f0a5e1, PR comment 6554246648; catalogue C-PACE-RECOVERY-01, M-04): two more
+// feasible recovered conformed runs were refused PLAY_PACE_TOO_SLOW. required 1499, safety 65000, 24 fps, Gated.
+// B1 (pace-estimate quantization): first present 1 s, held [1800,2575) and [4800,5575). d5f0a5e1 projected 65305.2 ms
+//   at 8 s from 127 steps over 5320 ms (the open hold's 30 ms counted with no step); the run reaches 1499 at 64970 ms
+//   (10 ms poll) and at 65000 ms (50 ms poll, where Reached wins over the timeout).
+// B2 (stall-share overcharge): first present 10 ms, six 400 ms stalls at 1, 2, ... 6 s. d5f0a5e1 charged the six whole
+//   holds (2650 ms, each a frame period plus the poll quantum more than the 2400 ms really held), crossed the one-third
+//   share cap and fell back to an 84030 ms projection; the run reaches 1499 at 64830 ms.
+// ---------------------------------------------------------------------------------------------------------
+TEST( PlayPaceRecovery, R13SolB1QuantizationOfThePaceEstimateDoesNotRefuseAFeasibleRun )
+{
+    const int64_t budget = playSafetyMs( 25.0 );
+    const std::vector<Stall> b1 = stallsOf( { Stall{ 1800, 775 }, Stall{ 4800, 775 } } );
+    // sol's c(t) = 1 + floor(24 x max(0, t - 1000 - min(775, max(0, t - 1800)) - min(775, max(0, t - 4800))) / 1000)
+    ASSERT_EQ( int64_t( 131 ), stalledCount( 8000, 1000, 24, b1 ) );
+    ASSERT_EQ( int64_t( 1498 ), stalledCount( 64966, 1000, 24, b1 ) );
+    ASSERT_EQ( int64_t( 1499 ), stalledCount( 64967, 1000, 24, b1 ) );
+    // every poll to completion, at the smoke's 10 ms and the autoplay's 50 ms: never refused, never timed out
+    const PolledRun at10 = pollStalledCount( 1000, 24, b1, 1499, budget, 10 );
+    ASSERT_EQ( int64_t( 131 ), at10.consumedAt8s );
+    ASSERT_TRUE( at10.state == PlayStopState::Reached );
+    ASSERT_EQ( int64_t( 64970 ), at10.elapsedMs );
+    const PolledRun at50 = pollStalledCount( 1000, 24, b1, 1499, budget, 50 );
+    ASSERT_TRUE( at50.state == PlayStopState::Reached );
+    ASSERT_EQ( int64_t( 65000 ), at50.elapsedMs );   // the poll that sees 1499 is the budget's own: Reached wins
+    // and through the drop-frame engine model
+    for( const int64_t poll : { int64_t( 10 ), int64_t( 50 ) } )
+    {
+        const EngineRun engine = runStalledEngine( 1000, 24.0, 1499, budget, poll, b1 );
+        ASSERT_TRUE( engine.state == PlayStopState::Reached );
+        ASSERT_TRUE( engine.elapsedMs <= budget );
+    }
+}
+
+TEST( PlayPaceRecovery, R13SolB2WholeHoldsAreNotChargedAsStallTime )
+{
+    const int64_t budget = playSafetyMs( 25.0 );
+    const std::vector<Stall> b2 = stallsOf( { Stall{ 1000, 400 }, Stall{ 2000, 400 }, Stall{ 3000, 400 },
+                                              Stall{ 4000, 400 }, Stall{ 5000, 400 }, Stall{ 6000, 400 } } );
+    ASSERT_EQ( int64_t( 135 ), stalledCount( 8000, 10, 24, b2 ) );
+    for( const int64_t poll : { int64_t( 10 ), int64_t( 50 ) } )
+    {
+        const PolledRun run = pollStalledCount( 10, 24, b2, 1499, budget, poll );
+        ASSERT_EQ( int64_t( 135 ), run.consumedAt8s );
+        ASSERT_TRUE( run.state == PlayStopState::Reached );
+        ASSERT_TRUE( run.elapsedMs >= 64826 && run.elapsedMs <= budget );
+        const EngineRun engine = runStalledEngine( 10, 24.0, 1499, budget, poll, b2 );
+        ASSERT_TRUE( engine.state == PlayStopState::Reached );
+        ASSERT_TRUE( engine.elapsedMs <= budget );
+    }
+    // the share charged at 8 s is the time really held (2400 ms), never the whole holds: inside one third
+    PlayPaceHistory h;
+    for( int64_t t = 0; t <= 8000; t += 10 ) h.note( stalledCount( t, 10, 24, b2 ), t );
+    const PlayPaceHistory::PlayingSplit split = h.playingSplit( 8000 );
+    ASSERT_TRUE( split.stallMs <= 2400 );
+    ASSERT_TRUE( split.stallMs >= 2400 - 6 * 10 - 6 * 42 );   // at most one poll gap and one step period per stall less
+    ASSERT_TRUE( 2 * split.stallMs <= split.playingMs );
+    ASSERT_TRUE( h.playingPace( 8000 ) * 1000.0 >= 23.9 );
+}
+
+TEST( PlayPaceRecovery, R13SlowEnginesAreStillRefusedWithTheB1AndB2StallsToo )
+{
+    // negative controls for the r13 band: 20 and 22 fps (74.9 s / 68.1 s) are refused at the probe, steady or with
+    // either of sol's stall sets, at both polls -- the band only absorbs the poll quantum, never a slower engine
+    const int64_t budget = playSafetyMs( 25.0 );
+    const std::vector<std::vector<Stall>> sets = {
+        std::vector<Stall>(),
+        stallsOf( { Stall{ 1800, 775 }, Stall{ 4800, 775 } } ),
+        stallsOf( { Stall{ 1000, 400 }, Stall{ 2000, 400 }, Stall{ 3000, 400 },
+                    Stall{ 4000, 400 }, Stall{ 5000, 400 }, Stall{ 6000, 400 } } ),
+    };
+    for( const int64_t fps : { int64_t( 20 ), int64_t( 22 ) } )
+    {
+        for( const std::vector<Stall> &stalls : sets )
+        {
+            for( const int64_t poll : { int64_t( 10 ), int64_t( 50 ) } )
+            {
+                const PolledRun run = pollStalledCount( 0, fps, stalls, 1499, budget, poll );
+                ASSERT_TRUE( run.state == PlayStopState::PaceTooSlow );
+                ASSERT_TRUE( run.elapsedMs >= playback_frame_range::kPaceProbeMs && run.elapsedMs < 9000 );
+                ASSERT_TRUE( runStalledEngine( 0, static_cast<double>( fps ), 1499, budget, poll, stalls ).state
+                             == PlayStopState::PaceTooSlow );
+            }
+        }
+    }
+    // THE BOUND holds along both of sol's traces and Dot's: at every poll from the probe on, the optimistic finish is
+    // never later than the step that really reaches the requirement (64967 / 64826 / 64417 ms in the count's formula)
+    const std::vector<std::pair<int64_t, std::vector<Stall>>> traces = {
+        { int64_t( 1000 ), stallsOf( { Stall{ 1800, 775 }, Stall{ 4800, 775 } } ) },
+        { int64_t( 10 ), sets[2] },
+        { int64_t( 1000 ), stallsOf( { Stall{ 3000, 500 }, Stall{ 5500, 500 } } ) },
+    };
+    for( const auto &trace : traces )
+    {
+        int64_t reachMs = 0;
+        while( stalledCount( reachMs, trace.first, 24, trace.second ) < 1499 ) ++reachMs;
+        for( const int64_t poll : { int64_t( 10 ), int64_t( 16 ), int64_t( 50 ) } )
+        {
+            PlayPaceHistory h;
+            for( int64_t t = 0; t < reachMs; t += poll )
+            {
+                const int64_t c = stalledCount( t, trace.first, 24, trace.second );
+                h.note( c, t );
+                if( t >= playback_frame_range::kPaceProbeMs )
+                    ASSERT_TRUE( h.optimisticFinishMs( c, 1499, t ) <= static_cast<double>( reachMs ) );
+            }
+        }
+    }
+    // the trust bounds the band leaves alone (sol r12 INV-6 rows): too little playing time, too few steps, a genuine
+    // share-cap crossing -- each refuses the playing pace, so no optimistic finish is offered either
+    using Split = PlayPaceHistory::PlayingSplit;
+    const auto split = []( int64_t playingMs, int64_t steps, int64_t stallMs )
+    {
+        Split s;
+        s.thresholdMs = 60;
+        s.playingMs = playingMs;
+        s.playingSteps = steps;
+        s.stallMs = stallMs;
+        return s;
+    };
+    ASSERT_FALSE( PlayPaceHistory::playingSplitTrusted( split( 2900, 69, 0 ) ) );
+    ASSERT_FALSE( PlayPaceHistory::playingSplitTrusted( split( 4000, 23, 0 ) ) );
+    ASSERT_FALSE( PlayPaceHistory::playingSplitTrusted( split( 4000, 96, 2100 ) ) );
+    ASSERT_TRUE( PlayPaceHistory::playingSplitTrusted( split( 4000, 96, 2000 ) ) );
+    ASSERT_TRUE( std::isinf( PlayPaceHistory().optimisticFinishMs( 170, 1499, 8000 ) ) );   // no history: no band
+    // 23 fps steady (1498 / 23 = 65.1 s) cannot finish either; it is refused before the budget, typed
+    for( const int64_t poll : { int64_t( 10 ), int64_t( 50 ) } )
+    {
+        const PolledRun run = pollStalledCount( 0, 23, std::vector<Stall>(), 1499, budget, poll );
+        ASSERT_TRUE( run.state == PlayStopState::PaceTooSlow );
+        ASSERT_TRUE( run.elapsedMs < budget );
+    }
+}
+
+// r13 adversary pass on ff00e32a (A1, A2): polls are not evenly spaced (a GUI timer can be late), and the band and
+// the stall charge used the MEDIAN poll gap. Each input verbatim: the count, then the poll schedule.
+namespace
+{
+template <typename NextPoll>
+PolledRun pollIrregular( int64_t firstPresentMs, const std::vector<Stall> &stalls, NextPoll next,
+                         int64_t required, int64_t safetyMs, PlayPaceHistory *atProbe = nullptr )
+{
+    PolledRun run;
+    PlayPaceHistory h;
+    for( int64_t t = 0; t <= 900000; t = next( t ) )
+    {
+        run.consumed = stalledCount( t, firstPresentMs, 24, stalls );
+        h.note( run.consumed, t );
+        if( atProbe && t >= playback_frame_range::kPaceProbeMs && run.consumedAt8s == 0 )
+        {
+            run.consumedAt8s = run.consumed;
+            *atProbe = h;
+        }
+        run.state = evaluatePlayStop( run.consumed, required, true, t, safetyMs, playback_frame_range::PlayPaceMode::Gated, h );
+        if( run.state != PlayStopState::Continue ) { run.elapsedMs = t; break; }
+    }
+    return run;
+}
+}
+
+TEST( PlayPaceRecovery, R13AdversaryA1TheBandUsesTheActualPollGapsNotTheirMedian )
+{
+    // A1: c(t) = 1 + floor(24 x max(0, t - 1400 - clamp(t - 1800, 0, 550) - clamp(t - 4800, 0, 550)) / 1000); observe
+    // at t += 40 when t % 70 == 10, otherwise t += 10. ff00e32a's band (3 x the 10 ms median gap) projected 65307 ms at
+    // 8030 and refused; the run is observed Reached at 64940 ms.
+    const int64_t budget = playSafetyMs( 25.0 );
+    const std::vector<Stall> a1 = stallsOf( { Stall{ 1800, 550 }, Stall{ 4800, 550 } } );
+    const auto next = []( int64_t t ) { return t + ( t % 70 == 10 ? 40 : 10 ); };
+    const PolledRun run = pollIrregular( 1400, a1, next, 1499, budget );
+    ASSERT_TRUE( run.state == PlayStopState::Reached );
+    ASSERT_EQ( int64_t( 64940 ), run.elapsedMs );
+}
+
+TEST( PlayPaceRecovery, R13AdversaryA2AHoldThatOnlyWaitedOutALongPollGapIsNotChargedAsAStall )
+{
+    // A2: c(t) = 1 + floor(24 x max(0, t - 1480 - clamp(t - 1800, 0, 500) - clamp(t - 4800, 0, 500)) / 1000); observe
+    // at t += 50 when t % 100 == 0, otherwise t += 10. ff00e32a charged the 70/80 ms holds that straddle each 50 ms gap
+    // (1910 ms for 1000 ms really held), crossed the share cap and refused at 8000 (74437 ms); Reached at 64900 ms.
+    const int64_t budget = playSafetyMs( 25.0 );
+    const std::vector<Stall> a2 = stallsOf( { Stall{ 1800, 500 }, Stall{ 4800, 500 } } );
+    const auto next = []( int64_t t ) { return t + ( t % 100 == 0 ? 50 : 10 ); };
+    PlayPaceHistory probe;
+    const PolledRun run = pollIrregular( 1480, a2, next, 1499, budget, &probe );
+    ASSERT_TRUE( run.state == PlayStopState::Reached );
+    ASSERT_EQ( int64_t( 64900 ), run.elapsedMs );
+    const PlayPaceHistory::PlayingSplit split = probe.playingSplit( 8000 );
+    ASSERT_TRUE( split.stallMs <= 1000 );   // never more than really held
+    // THE BOUND under both irregular schedules: from the probe on, the optimistic finish is never later than the step
+    // that really reaches the requirement
+    struct Trace { int64_t firstPresentMs; std::vector<Stall> stalls; int schedule; };
+    const std::vector<Trace> traces = { { 1400, stallsOf( { Stall{ 1800, 550 }, Stall{ 4800, 550 } } ), 1 },
+                                        { 1480, a2, 2 } };
+    for( const Trace &tr : traces )
+    {
+        int64_t reachMs = 0;
+        while( stalledCount( reachMs, tr.firstPresentMs, 24, tr.stalls ) < 1499 ) ++reachMs;
+        PlayPaceHistory h;
+        for( int64_t t = 0; t < reachMs; t += ( tr.schedule == 1 ? ( t % 70 == 10 ? 40 : 10 ) : ( t % 100 == 0 ? 50 : 10 ) ) )
+        {
+            const int64_t c = stalledCount( t, tr.firstPresentMs, 24, tr.stalls );
+            h.note( c, t );
+            if( t >= playback_frame_range::kPaceProbeMs )
+                ASSERT_TRUE( h.optimisticFinishMs( c, 1499, t ) <= static_cast<double>( reachMs ) );
+        }
+    }
+    // the slow-engine controls under the same two schedules: still refused at the probe
+    for( const int64_t fps : { int64_t( 20 ), int64_t( 22 ) } )
+    {
+        for( const int scheduleId : { 1, 2 } )
+        {
+            PlayPaceHistory h;
+            PlayStopState state = PlayStopState::Continue;
+            int64_t t = 0;
+            for( ; t <= budget && state == PlayStopState::Continue; t += ( scheduleId == 1 ? ( t % 70 == 10 ? 40 : 10 )
+                                                                                  : ( t % 100 == 0 ? 50 : 10 ) ) )
+            {
+                const int64_t c = stalledCount( t, 0, fps, std::vector<Stall>() );
+                h.note( c, t );
+                state = evaluatePlayStop( c, 1499, true, t, budget, playback_frame_range::PlayPaceMode::Gated, h );
+                if( state != PlayStopState::Continue ) break;
+            }
+            ASSERT_TRUE( state == PlayStopState::PaceTooSlow );
+            ASSERT_TRUE( t >= playback_frame_range::kPaceProbeMs && t < 9000 );
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------------------------------------
+// r14 (r13 adversary A1 on 19a83d2d; Dot cos-feedback/mlv-app/pr-420.md 2026-11-01T15:29:45Z; CoS ask 6559996576, hub
+// ACK 6560188752): uneven polls collapsed the stall threshold. The input verbatim: required 1499, safety 65000, Gated,
+// c(t) = 1 + floor(24 x max(0, t - 800 - clamp(t - 1800, 0, 330) - clamp(t - 4800, 0, 330)) / 1000), observed from t = 0
+// with next(t) = t + (t % 125 < 10 ? 80 : 10), note then decide. 19a83d2d binned 57 of the 113 holds closed by 8 s at 0
+// (each ended by an 80 ms gap), so its median bin was 0 and its threshold 0 + 2 x the 10 ms median gap = 20 ms: the 51
+// ordinary 30/40 ms holds became stalls, 2100 ms of playing time missed the 3 s trust floor and the probe refused at
+// 8000 ms (69540 ms at 21.8 fps), although the count reaches 1499 at 63877 ms. The threshold is now the median hold
+// UPPER bound (hold + the poll gap before its first sighting): 90 ms here, and r12's median bin + 2 poll gaps exactly
+// whenever polls are even. Full trace: the r14 run dir, evidence/uneven-poll-trace.md.
+// ---------------------------------------------------------------------------------------------------------
+namespace
+{
+int64_t r14UnevenNext( int64_t t ) { return t + ( t % 125 < 10 ? 80 : 10 ); }
+
+// the 39cdfc57 adversary A1 schedule: every 10 ms except 1410..1450, 2410..2450, ..., 6410..6450 ms
+int64_t omittedPollNext( int64_t t )
+{
+    int64_t n = t + 10;
+    while( n >= 1410 && n <= 6450 && n % 1000 >= 410 && n % 1000 <= 450 ) n += 10;
+    return n;
+}
+
+// pollIrregular at any whole fps (note, then decide, until a verdict)
+template <typename NextPoll>
+PolledRun pollIrregularAt( int64_t fpsInt, int64_t firstPresentMs, const std::vector<Stall> &stalls, NextPoll next,
+                           int64_t required, int64_t safetyMs )
+{
+    PolledRun run;
+    PlayPaceHistory h;
+    for( int64_t t = 0; t <= 900000; t = next( t ) )
+    {
+        run.consumed = stalledCount( t, firstPresentMs, fpsInt, stalls );
+        h.note( run.consumed, t );
+        run.state = evaluatePlayStop( run.consumed, required, true, t, safetyMs, playback_frame_range::PlayPaceMode::Gated, h );
+        if( run.state != PlayStopState::Continue ) { run.elapsedMs = t; break; }
+    }
+    return run;
+}
+}
+
+TEST( PlayPaceRecovery, R14AdversaryA1UnevenPollsDoNotTurnOrdinaryHoldsIntoStalls )
+{
+    const int64_t budget = playSafetyMs( 25.0 );
+    const std::vector<Stall> a1 = stallsOf( { Stall{ 1800, 330 }, Stall{ 4800, 330 } } );
+    ASSERT_EQ( int64_t( 157 ), stalledCount( 8000, 800, 24, a1 ) );
+    ASSERT_EQ( int64_t( 1498 ), stalledCount( 63876, 800, 24, a1 ) );
+    ASSERT_EQ( int64_t( 1499 ), stalledCount( 63877, 800, 24, a1 ) );
+    // every poll to completion: never refused, never timed out, Reached at the first poll that sees 1499
+    PlayPaceHistory probe;
+    const PolledRun run = pollIrregular( 800, a1, r14UnevenNext, 1499, budget, &probe );
+    ASSERT_EQ( int64_t( 157 ), run.consumedAt8s );
+    ASSERT_TRUE( run.state == PlayStopState::Reached );
+    ASSERT_EQ( int64_t( 63880 ), run.elapsedMs );
+    // at the probe (t = 8000 is a poll): only the two 330 ms holds are stalls, charged no more than really held, and the
+    // rest is trusted playing time at 24 fps
+    ASSERT_EQ( int64_t( 8000 ), probe.lastElapsedMs );
+    ASSERT_EQ( int64_t( 0 ), PlayPaceHistory::histogramMedian( probe.holdCount, probe.holds + probe.overflowHolds ) );
+    const PlayPaceHistory::PlayingSplit split = probe.playingSplit( 8000 );
+    ASSERT_TRUE( split.thresholdMs > 2 * 10 );            // not 19a83d2d's median bin 0 + 2 x 10 ms
+    ASSERT_EQ( int64_t( 2 ), split.stallHolds );
+    ASSERT_TRUE( split.stallMs <= 2 * 330 );
+    ASSERT_TRUE( PlayPaceHistory::playingSplitTrusted( split ) );
+    ASSERT_TRUE( probe.playingPace( 8000 ) * 1000.0 >= 23.9 && probe.playingPace( 8000 ) * 1000.0 <= 24.1 );
+    ASSERT_FALSE( playback_frame_range::playPaceProjectsPastBudget( 157, 1499, 8000, budget, probe ) );
+    // THE BOUND along this trace: from the probe on, the optimistic finish is never later than the real completion
+    {
+        PlayPaceHistory h;
+        for( int64_t t = 0; t < 63877; t = r14UnevenNext( t ) )
+        {
+            const int64_t c = stalledCount( t, 800, 24, a1 );
+            h.note( c, t );
+            if( t >= playback_frame_range::kPaceProbeMs ) ASSERT_TRUE( h.optimisticFinishMs( c, 1499, t ) <= 63877.0 );
+        }
+    }
+    // the "three stalls" set under the same schedule (19a83d2d refused it at 8000 too; it reaches at 64717 ms)
+    const PolledRun three = pollIrregular( 1000, stallsOf( { Stall{ 2500, 500 }, Stall{ 4500, 500 }, Stall{ 6500, 300 } } ),
+                                           r14UnevenNext, 1499, budget );
+    ASSERT_TRUE( three.state == PlayStopState::Reached );
+    ASSERT_EQ( int64_t( 64720 ), three.elapsedMs );
+    // a steady engine at any pace, polled on this schedule, has no stall hold and no stall time
+    for( const int64_t fps : { int64_t( 3 ), int64_t( 12 ), int64_t( 20 ), int64_t( 24 ), int64_t( 30 ), int64_t( 60 ) } )
+    {
+        PlayPaceHistory steady;
+        int64_t last = 0;
+        for( int64_t t = 0; t <= 20000; t = r14UnevenNext( t ) ) { steady.note( stalledCount( t, 0, fps, std::vector<Stall>() ), t ); last = t; }
+        const PlayPaceHistory::PlayingSplit st = steady.playingSplit( last );
+        ASSERT_EQ( int64_t( 0 ), st.stallHolds );
+        ASSERT_EQ( int64_t( 0 ), st.stallMs );
+    }
+    // negative controls under the same schedule: 20 / 22 fps (74.9 s / 68.1 s), steady or with this input's stalls, are
+    // refused at the probe; 23 fps (65.1 s) is refused, typed, before the budget
+    for( const int64_t fps : { int64_t( 20 ), int64_t( 22 ) } )
+    {
+        for( const std::vector<Stall> &stalls : { std::vector<Stall>(), a1 } )
+        {
+            const PolledRun slow = pollIrregularAt( fps, 0, stalls, r14UnevenNext, 1499, budget );
+            ASSERT_TRUE( slow.state == PlayStopState::PaceTooSlow );
+            ASSERT_TRUE( slow.elapsedMs >= playback_frame_range::kPaceProbeMs && slow.elapsedMs < 9000 );
+        }
+    }
+    const PolledRun at23 = pollIrregularAt( 23, 0, std::vector<Stall>(), r14UnevenNext, 1499, budget );
+    ASSERT_TRUE( at23.state == PlayStopState::PaceTooSlow );
+    ASSERT_TRUE( at23.elapsedMs < budget );
+}
+
+TEST( PlayPaceRecovery, R14WithEvenPollsTheThresholdIsR12sMedianBinPlusTwoPollGapsExactly )
+{
+    // the pace is never stricter than r13 on an even-poll fixture: there the hold upper bound is the bin + 2 poll gaps,
+    // so the median upper bound IS r12/r13's median bin + 2 x the (one) poll gap, at every poll of every fixture
+    const std::vector<std::pair<int64_t, std::vector<Stall>>> fixtures = {
+        { int64_t( 0 ), std::vector<Stall>() },
+        { int64_t( 1000 ), stallsOf( { Stall{ 3000, 500 }, Stall{ 5500, 500 } } ) },
+        { int64_t( 1000 ), stallsOf( { Stall{ 2500, 200 }, Stall{ 4500, 200 }, Stall{ 6500, 200 } } ) },
+        { int64_t( 1000 ), stallsOf( { Stall{ 1800, 775 }, Stall{ 4800, 775 } } ) },
+        { int64_t( 10 ), stallsOf( { Stall{ 1000, 400 }, Stall{ 2000, 400 }, Stall{ 3000, 400 },
+                                     Stall{ 4000, 400 }, Stall{ 5000, 400 }, Stall{ 6000, 400 } } ) },
+    };
+    for( const auto &fx : fixtures )
+    {
+        for( const int64_t fps : { int64_t( 12 ), int64_t( 22 ), int64_t( 24 ), int64_t( 60 ) } )
+        {
+            for( const int64_t poll : { int64_t( 10 ), int64_t( 16 ), int64_t( 50 ) } )
+            {
+                PlayPaceHistory h;
+                for( int64_t t = 0; t <= 12000; t += poll )
+                {
+                    h.note( stalledCount( t, fx.first, fps, fx.second ), t );
+                    const int64_t medianBin = PlayPaceHistory::histogramMedian( h.holdCount, h.holds + h.overflowHolds );
+                    if( medianBin >= 0 ) ASSERT_EQ( medianBin + 2 * poll, h.playingSplit( t ).thresholdMs );
+                }
+            }
+        }
+    }
+}
+
+TEST( PlayPaceRecovery, R14TheOmittedPollCaseR13FixedHasAConsoleRegression )
+{
+    // 39cdfc57 adversary A1 (fixed in 19a83d2d by binning a hold less its own end gap; no console test until r14):
+    // c(t) = 1 + floor(24 x max(0, t - 10 - sum(i = 1..6, min(400, max(0, t - 1000 i)))) / 1000), observed every 10 ms
+    // except 1410..1450, 2410..2450, ..., 6410..6450 ms. 39cdfc57 charged 2584 ms of stall for the 2400 ms really held,
+    // crossed the one-third share cap and refused at 8000 ms (83888 ms); the count reaches 1499 at 64827 ms.
+    const int64_t budget = playSafetyMs( 25.0 );
+    const std::vector<Stall> b2 = stallsOf( { Stall{ 1000, 400 }, Stall{ 2000, 400 }, Stall{ 3000, 400 },
+                                              Stall{ 4000, 400 }, Stall{ 5000, 400 }, Stall{ 6000, 400 } } );
+    ASSERT_EQ( int64_t( 1010 ), omittedPollNext( 1000 ) );   // the schedule: 1400 is followed by 1460, 6400 by 6460
+    ASSERT_EQ( int64_t( 1460 ), omittedPollNext( 1400 ) );
+    ASSERT_EQ( int64_t( 6460 ), omittedPollNext( 6400 ) );
+    ASSERT_EQ( int64_t( 7410 ), omittedPollNext( 7400 ) );
+    ASSERT_EQ( int64_t( 1498 ), stalledCount( 64826, 10, 24, b2 ) );
+    ASSERT_EQ( int64_t( 1499 ), stalledCount( 64827, 10, 24, b2 ) );
+    PlayPaceHistory probe;
+    const PolledRun run = pollIrregular( 10, b2, omittedPollNext, 1499, budget, &probe );
+    ASSERT_EQ( int64_t( 135 ), run.consumedAt8s );
+    ASSERT_TRUE( run.state == PlayStopState::Reached );
+    ASSERT_EQ( int64_t( 64830 ), run.elapsedMs );
+    const PlayPaceHistory::PlayingSplit split = probe.playingSplit( 8000 );
+    ASSERT_EQ( int64_t( 6 ), split.stallHolds );
+    ASSERT_TRUE( split.stallMs <= 2400 );                 // never more than really held
+    ASSERT_TRUE( 2 * split.stallMs <= split.playingMs );  // inside the share cap
+    ASSERT_TRUE( probe.playingPace( 8000 ) * 1000.0 >= 23.9 );
+    // slow controls on the same schedule: 20 / 22 fps, steady or with the six stalls, refused at the probe
+    for( const int64_t fps : { int64_t( 20 ), int64_t( 22 ) } )
+    {
+        for( const std::vector<Stall> &stalls : { std::vector<Stall>(), b2 } )
+        {
+            const PolledRun slow = pollIrregularAt( fps, 0, stalls, omittedPollNext, 1499, budget );
+            ASSERT_TRUE( slow.state == PlayStopState::PaceTooSlow );
+            ASSERT_TRUE( slow.elapsedMs >= playback_frame_range::kPaceProbeMs && slow.elapsedMs < 9000 );
+        }
+    }
+}
+
+TEST( PlayPaceRecovery, R14SixShortStallsTheRecoveredClassAndThePinnedResolutionLimit )
+{
+    // the r12 DISTINGUISH (pr-comment-r12: six 100 ms stalls at the autoplay's 50 ms poll are refused), now an explicit
+    // regression on both sides. Six equal stalls at 2, 3, ... 7 s after a 1 s first present, 24 fps: every length here is
+    // feasible (1 s + 6 x len + 62.4 s < 65 s). r15: THE CADENCE THRESHOLD moved the limit at 50 ms from 140 to 80 ms.
+    const int64_t budget = playSafetyMs( 25.0 );
+    for( const int64_t len : { int64_t( 50 ), int64_t( 80 ), int64_t( 100 ), int64_t( 120 ), int64_t( 140 ),
+                               int64_t( 150 ), int64_t( 200 ), int64_t( 250 ) } )
+    {
+        std::vector<Stall> six;
+        for( int64_t at = 2000; at <= 7000; at += 1000 ) six.push_back( Stall{ at, len } );
+        ASSERT_TRUE( stalledCount( 64999, 1000, 24, six ) >= 1499 );
+        // the smoke's 10 ms poll sees every one of them: Reached, inside the budget
+        const PolledRun at10 = pollStalledCount( 1000, 24, six, 1499, budget, 10 );
+        ASSERT_TRUE( at10.state == PlayStopState::Reached );
+        ASSERT_TRUE( at10.elapsedMs < budget );
+        const PolledRun at50 = pollStalledCount( 1000, 24, six, 1499, budget, 50 );
+        if( len >= 80 )
+        {
+            ASSERT_TRUE( at50.state == PlayStopState::Reached );   // the class r12 left open, recovered at 50 ms too
+            ASSERT_TRUE( at50.elapsedMs <= budget );
+        }
+        else
+        {
+            // THE RESOLUTION LIMIT, pinned (r15): a 50 ms stall on a 41.7 ms step leaves a value that stayed about
+            // 92 ms, which a 50 ms poll shows as a 50 ms bin at most, under THE CADENCE THRESHOLD (twice the run's mean
+            // step, about 86 ms here). A lower threshold would also cast out an uneven slow engine's ordinary jitter and
+            // let it play on (R15AdversaryA1 jitter controls), so the run reads as a ~23 fps cadence and is refused,
+            // typed, at the probe -- never a timeout, never a hang.
+            ASSERT_TRUE( at50.state == PlayStopState::PaceTooSlow );
+            ASSERT_EQ( int64_t( 8000 ), at50.elapsedMs );
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------------------------------------
+// r15 (r14 adversary A1 on 11c27fc1; CoS ask 6559996576): recoverable ~150 ms stalls at the autoplay's 50 ms poll still
+// refused a feasible conformed run, depending on the phase. The input verbatim: a 1667-frame 59.94 fps clip conformed to
+// 24 fps, requestedSeconds 25, required 1499, safety 65000, Gated, Play running, no loop, polled every 50 ms from t = 0
+// (note, then decide), c(t) = 1 + floor(24 x max(0, t - 1000 - sum(clamp(t - s, 0, 150) for s in [1750, 2620, 3500,
+// 4410, 5380, 6230])) / 1000). At 8000 ms c = 147 and r14's threshold (the median hold upper bound) is 100 ms: three of
+// the six 150 ms stall holds bin at exactly 100 ms and stayed playing (6350 ms, 141 steps, 22.2 fps), so the optimistic
+// finish was 66926.6 ms and the probe refused (PaceTooSlow, exit 14). The count reaches 1499 at 64317 ms.
+// THE CADENCE THRESHOLD (twice an upper bound on the mean step since the first step, about 96 ms here) calls all six
+// stalls, at every phase of the poll; the r14 split is unchanged and the cadence split is only used to go on.
+// ---------------------------------------------------------------------------------------------------------
+namespace
+{
+std::vector<Stall> r15AdversaryStalls( int64_t offsetMs, int64_t lenMs )
+{
+    std::vector<Stall> s;
+    for( const int64_t at : { int64_t( 1750 ), int64_t( 2620 ), int64_t( 3500 ), int64_t( 4410 ), int64_t( 5380 ), int64_t( 6230 ) } )
+        s.push_back( Stall{ at + offsetMs, lenMs } );
+    return s;
+}
+
+// a count driven by a repeating pattern of step periods (ms) after a first present at firstPresentMs
+int64_t dwellPatternCount( int64_t t, int64_t firstPresentMs, const std::vector<int64_t> &dwellMs )
+{
+    int64_t steps = 0;
+    int64_t at = firstPresentMs;
+    for( size_t i = 0;; ++i )
+    {
+        at += dwellMs[i % dwellMs.size()];
+        if( at > t ) break;
+        ++steps;
+    }
+    return 1 + steps;
+}
+}
+
+TEST( PlayPaceRecovery, R15AdversaryA1RecoveredShortStallsAreNotRefusedAtAnyPollPhase )
+{
+    const int64_t budget = playSafetyMs( 25.0 );
+    ASSERT_EQ( int64_t( 65000 ), budget );
+    const std::vector<Stall> a1 = r15AdversaryStalls( 0, 150 );
+    ASSERT_EQ( int64_t( 147 ), stalledCount( 8000, 1000, 24, a1 ) );
+    ASSERT_EQ( int64_t( 1498 ), stalledCount( 64316, 1000, 24, a1 ) );
+    ASSERT_EQ( int64_t( 1499 ), stalledCount( 64317, 1000, 24, a1 ) );
+    // the exact input: Reached at the first 50 ms poll that sees 1499, never refused, never timed out
+    const PolledRun run = pollStalledCount( 1000, 24, a1, 1499, budget, 50 );
+    ASSERT_EQ( int64_t( 147 ), run.consumedAt8s );
+    ASSERT_TRUE( run.state == PlayStopState::Reached );
+    ASSERT_EQ( int64_t( 64350 ), run.elapsedMs );
+    // at the probe: the adversary's r14 split is still what playingSplit reports, and the cadence split sees six stalls
+    PlayPaceHistory probe;
+    for( int64_t t = 0; t <= 8000; t += 50 ) probe.note( stalledCount( t, 1000, 24, a1 ), t );
+    const PlayPaceHistory::PlayingSplit r14 = probe.playingSplit( 8000 );
+    ASSERT_EQ( int64_t( 100 ), r14.thresholdMs );
+    ASSERT_EQ( int64_t( 6350 ), r14.playingMs );
+    ASSERT_EQ( int64_t( 141 ), r14.playingSteps );
+    ASSERT_EQ( int64_t( 315 ), r14.stallMs );
+    ASSERT_EQ( int64_t( 200 ), r14.stretchEndLateMs );
+    const PlayPaceHistory::PlayingSplit cadence = probe.cadenceSplit( 8000 );
+    ASSERT_TRUE( cadence.thresholdMs >= 2 * 42 && cadence.thresholdMs < 100 );
+    ASSERT_EQ( int64_t( 6 ), cadence.stallHolds );
+    ASSERT_TRUE( cadence.stallMs <= 6 * 150 );              // never more than really held
+    ASSERT_TRUE( PlayPaceHistory::playingSplitTrusted( cadence ) );
+    // 138 steps over 5900 ms (23.4 fps, r14 22.2): the 50 ms stretch ends are late by up to 350 ms in all, which the
+    // r13 band takes back -- the optimistic finish (62334 ms) is not later than the real 64317 ms
+    ASSERT_TRUE( probe.playingPace( 8000 ) * 1000.0 >= 23.3 );
+    ASSERT_TRUE( probe.optimisticFinishMs( 147, 1499, 8000 ) <= 64317.0 );
+    ASSERT_FALSE( playback_frame_range::playPaceProjectsPastBudget( 147, 1499, 8000, budget, probe ) );
+    // THE PHASE SWEEP: the stall list offset by 0..49 ms, at the autoplay's 50 ms, a 33 ms and the smoke's 10 ms poll,
+    // and stalls of 80 to 250 ms on the same irregular starts: every run is Reached inside the budget, never before the
+    // count really reaches 1499; and from the probe on the optimistic finish is never later than that (THE BOUND)
+    for( const int64_t len : { int64_t( 80 ), int64_t( 100 ), int64_t( 120 ), int64_t( 150 ), int64_t( 200 ), int64_t( 250 ) } )
+    {
+        for( int64_t off = 0; off < 50; ++off )
+        {
+            const std::vector<Stall> stalls = r15AdversaryStalls( off, len );
+            int64_t reachMs = 0;
+            while( stalledCount( reachMs, 1000, 24, stalls ) < 1499 ) ++reachMs;
+            ASSERT_TRUE( reachMs < budget );
+            for( const int64_t poll : { int64_t( 50 ), int64_t( 33 ), int64_t( 10 ) } )
+            {
+                const PolledRun r = pollStalledCount( 1000, 24, stalls, 1499, budget, poll );
+                ASSERT_TRUE( r.state == PlayStopState::Reached );
+                ASSERT_TRUE( r.elapsedMs >= reachMs && r.elapsedMs <= budget );
+            }
+            if( len == 150 )
+            {
+                PlayPaceHistory h;
+                for( int64_t t = 0; t < reachMs; t += 50 )
+                {
+                    const int64_t c = stalledCount( t, 1000, 24, stalls );
+                    h.note( c, t );
+                    if( t >= playback_frame_range::kPaceProbeMs )
+                        ASSERT_TRUE( h.optimisticFinishMs( c, 1499, t ) <= static_cast<double>( reachMs ) );
+                }
+            }
+        }
+    }
+    // a steady engine at any pace, on even and uneven schedules, has no cadence stall: every bin is under its step
+    for( const int64_t fps : { int64_t( 3 ), int64_t( 12 ), int64_t( 20 ), int64_t( 24 ), int64_t( 30 ), int64_t( 60 ) } )
+    {
+        for( const int schedule : { 10, 16, 50, 125 } )
+        {
+            PlayPaceHistory steady;
+            int64_t last = 0;
+            for( int64_t t = 0; t <= 20000; t = ( schedule == 125 ? r14UnevenNext( t ) : t + schedule ) )
+            {
+                steady.note( stalledCount( t, 0, fps, std::vector<Stall>() ), t );
+                last = t;
+            }
+            const PlayPaceHistory::PlayingSplit st = steady.cadenceSplit( last );
+            ASSERT_EQ( int64_t( 0 ), st.stallHolds );
+            ASSERT_EQ( int64_t( 0 ), st.stallMs );
+        }
+    }
+    // negative controls: 20 / 22 fps with the adversary's stalls are refused at the probe at every poll; 23 fps (which
+    // cannot finish either) is refused, typed, before the budget
+    for( const int64_t poll : { int64_t( 10 ), int64_t( 50 ) } )
+    {
+        for( const int64_t fps : { int64_t( 20 ), int64_t( 22 ) } )
+        {
+            const PolledRun slow = pollStalledCount( 1000, fps, a1, 1499, budget, poll );
+            ASSERT_TRUE( slow.state == PlayStopState::PaceTooSlow );
+            ASSERT_TRUE( slow.elapsedMs >= playback_frame_range::kPaceProbeMs && slow.elapsedMs < 9000 );
+        }
+        const PolledRun at23 = pollStalledCount( 1000, 23, a1, 1499, budget, poll );
+        ASSERT_TRUE( at23.state == PlayStopState::PaceTooSlow );
+        ASSERT_TRUE( at23.elapsedMs < budget );
+    }
+    // jitter controls (why the factor is 2, not 1): uneven slow engines whose mean step is 45 ms (22.2 fps, 67.4 s) --
+    // 40/50, 30/60 and 20/70 ms alternation -- are refused at the probe as on r14, at the 10, 16 and 50 ms polls: no
+    // ordinary step of theirs stays twice the mean. (Factor 1 let the 30/60 one play to 62 s before the typed refusal.)
+    const std::vector<std::vector<int64_t>> uneven = { { 40, 50 }, { 30, 60 }, { 20, 70 } };
+    for( const std::vector<int64_t> &pattern : uneven )
+    {
+        for( const int64_t poll : { int64_t( 10 ), int64_t( 16 ), int64_t( 50 ) } )
+        {
+            PlayPaceHistory h;
+            PlayStopState state = PlayStopState::Continue;
+            int64_t t = 0;
+            for( ; t <= budget; t += poll )
+            {
+                const int64_t c = dwellPatternCount( t, 0, pattern );
+                h.note( c, t );
+                state = evaluatePlayStop( c, 1499, true, t, budget, playback_frame_range::PlayPaceMode::Gated, h );
+                if( state != PlayStopState::Continue ) break;
+            }
+            ASSERT_TRUE( state == PlayStopState::PaceTooSlow );
+            ASSERT_TRUE( t >= playback_frame_range::kPaceProbeMs && t < 9000 );
+        }
+    }
+    // the first forward step's lead gap must be known: a history whose first observation already had a step has no
+    // cadence bound, and the cadence split is then the r14 split exactly
+    PlayPaceHistory noLead;
+    for( int64_t t = 1500; t <= 8000; t += 50 ) noLead.note( stalledCount( t, 1000, 24, a1 ), t );
+    ASSERT_EQ( int64_t( -1 ), noLead.cadenceThresholdMs() );
+    ASSERT_EQ( noLead.playingSplit( 8000 ).thresholdMs, noLead.cadenceSplit( 8000 ).thresholdMs );
+}
+
+// ---------------------------------------------------------------------------------------------------------
+// r16 (Dot ask 6562596628 on 74a142ef, hub ACK 6562626759): THE DENSITY CASE. required 1499, safety 65000, Gated, a
+// 24 fps conformed run, first present 500 ms, ten 150 ms stalls every 640 ms from 1000 ms, polled every 50 ms from t = 0
+// (note, then decide): c(t) = 1 + floor(24 x max(0, t - 500 - sum(k = 0..9, clamp(t - 1000 - 640 k, 0, 150))) / 1000).
+// At 8 s every stall has ended and c = 145; the count reaches 1499 at 64417 ms (64416.7). 74a142ef: r15's U (about 52
+// ms) includes the stalls, so its cadence threshold (104 ms) is not below r14's 100 ms and the r14 split is used: the
+// four stall holds binned at 100 ms stay playing (6250 ms, 133 steps), the optimistic finish is 68020.3 ms and the probe
+// refuses at 8000 ms. THE STALL-FREE SPLIT judges the stalls against the playing stretches' own bound and casts out all
+// ten.
+// ---------------------------------------------------------------------------------------------------------
+namespace
+{
+std::vector<Stall> periodicStalls( int64_t fromMs, int64_t everyMs, int64_t lenMs, int64_t untilMs )
+{
+    std::vector<Stall> s;
+    for( int64_t at = fromMs; at + lenMs <= untilMs; at += everyMs ) s.push_back( Stall{ at, lenMs } );
+    return s;
+}
+
+// polls every pollMs from phaseMs (note, then decide) until a verdict
+PolledRun pollPhased( int64_t firstPresentMs, int64_t fpsInt, const std::vector<Stall> &stalls, int64_t required,
+                      int64_t safetyMs, int64_t pollMs, int64_t phaseMs )
+{
+    PolledRun run;
+    PlayPaceHistory h;
+    for( int64_t t = phaseMs; t <= 900000; t += pollMs )
+    {
+        run.consumed = stalledCount( t, firstPresentMs, fpsInt, stalls );
+        h.note( run.consumed, t );
+        run.state = evaluatePlayStop( run.consumed, required, true, t, safetyMs, playback_frame_range::PlayPaceMode::Gated, h );
+        if( run.state != PlayStopState::Continue ) { run.elapsedMs = t; break; }
+    }
+    return run;
+}
+}
+
+TEST( PlayPaceRecovery, R16DotDensityCaseRecoveredStallsAreNeverPlayingPace )
+{
+    const int64_t budget = playSafetyMs( 25.0 );
+    const std::vector<Stall> dense = periodicStalls( 1000, 640, 150, 7399 );
+    ASSERT_EQ( size_t( 10 ), dense.size() );
+    ASSERT_EQ( int64_t( 145 ), stalledCount( 8000, 500, 24, dense ) );
+    ASSERT_EQ( int64_t( 1498 ), stalledCount( 64416, 500, 24, dense ) );
+    ASSERT_EQ( int64_t( 1499 ), stalledCount( 64417, 500, 24, dense ) );
+    // the exact input: Reached at the first 50 ms poll that sees 1499 (74a142ef: PaceTooSlow at 8000)
+    const PolledRun run = pollStalledCount( 500, 24, dense, 1499, budget, 50 );
+    ASSERT_EQ( int64_t( 145 ), run.consumedAt8s );
+    ASSERT_TRUE( run.state == PlayStopState::Reached );
+    ASSERT_EQ( int64_t( 64450 ), run.elapsedMs );
+    // at the probe: r14's split and r15's cadence threshold are Dot's numbers; the stall-free split casts out all ten
+    PlayPaceHistory probe;
+    for( int64_t t = 0; t <= 8000; t += 50 ) probe.note( stalledCount( t, 500, 24, dense ), t );
+    const PlayPaceHistory::PlayingSplit r14 = probe.playingSplit( 8000 );
+    ASSERT_EQ( int64_t( 100 ), r14.thresholdMs );
+    ASSERT_EQ( int64_t( 6250 ), r14.playingMs );
+    ASSERT_EQ( int64_t( 133 ), r14.playingSteps );
+    ASSERT_EQ( int64_t( 104 ), probe.cadenceThresholdMs() );
+    ASSERT_EQ( int64_t( 100 ), probe.cadenceSplit( 8000 ).thresholdMs );   // r15 kept r14's split here
+    const PlayPaceHistory::PlayingSplit stallFree = probe.stallFreeSplit( 8000 );
+    ASSERT_EQ( int64_t( 99 ), stallFree.thresholdMs );    // one below the smallest cast-out bin (100 ms)
+    ASSERT_EQ( int64_t( 10 ), stallFree.stallHolds );
+    ASSERT_EQ( int64_t( 5650 ), stallFree.playingMs );
+    ASSERT_EQ( int64_t( 129 ), stallFree.playingSteps );
+    ASSERT_TRUE( stallFree.stallMs <= 10 * 150 );         // never more than really held
+    ASSERT_TRUE( PlayPaceHistory::playingSplitTrusted( stallFree ) );
+    // consistent: 100 ms > 2 x (5650 + the first step's 50 ms lead + the ten cast-out holds' 500 ms of end gaps) / 129
+    ASSERT_TRUE( 100 * 129 > 2 * ( 5650 + 50 + 500 ) );
+    ASSERT_TRUE( probe.optimisticFinishMs( 145, 1499, 8000 ) <= 64417.0 );
+    ASSERT_FALSE( playback_frame_range::playPaceProjectsPastBudget( 145, 1499, 8000, budget, probe ) );
+    // THE BOUND along the trace at every phase: from the probe on, the optimistic finish is never later than the step
+    // that really reaches 1499, and every phase is Reached
+    for( int64_t phase = 0; phase < 50; ++phase )
+    {
+        PlayPaceHistory h;
+        for( int64_t t = phase; t < 64417; t += 50 )
+        {
+            const int64_t c = stalledCount( t, 500, 24, dense );
+            h.note( c, t );
+            if( t >= playback_frame_range::kPaceProbeMs ) ASSERT_TRUE( h.optimisticFinishMs( c, 1499, t ) <= 64417.0 );
+        }
+        const PolledRun r = pollPhased( 500, 24, dense, 1499, budget, 50, phase );
+        ASSERT_TRUE( r.state == PlayStopState::Reached );
+        ASSERT_TRUE( r.elapsedMs >= 64417 && r.elapsedMs < 64417 + 50 );
+    }
+    // r16 re-pass A1 on 215bd10e: the same input observed only from t = 600 (600, 650, ... ms). The first observation
+    // already shows a step (c = 3), so the first step's lead gap is unknown; 215bd10e fell back to r14 (6200 ms, 132
+    // steps, optimistic 67962.5 ms) and refused at 8000. The bound now starts after the first closed hold.
+    {
+        PlayPaceHistory late;
+        for( int64_t t = 600; t <= 8000; t += 50 ) late.note( stalledCount( t, 500, 24, dense ), t );
+        ASSERT_FALSE( late.firstStepLeadKnown );
+        ASSERT_EQ( int64_t( 3 ), late.firstStep.consumed );
+        const PlayPaceHistory::PlayingSplit lateFree = late.stallFreeSplit( 8000 );
+        ASSERT_EQ( int64_t( 10 ), lateFree.stallHolds );
+        ASSERT_TRUE( late.optimisticFinishMs( 145, 1499, 8000 ) <= 64417.0 );
+        for( int64_t start = 550; start <= 1000; start += 50 )
+        {
+            const PolledRun r = pollPhased( 500, 24, dense, 1499, budget, 50, start );
+            ASSERT_TRUE( r.state == PlayStopState::Reached );
+            ASSERT_TRUE( r.elapsedMs >= 64417 && r.elapsedMs < 64417 + 50 );
+        }
+    }
+    // the same stalls never stopping (one every 640 ms to the end: 14 s of stall) cannot finish: refused, typed, before
+    // the budget; and the slow controls (20 / 22 fps) with the dense burst are refused at the probe
+    const PolledRun forever = pollStalledCount( 500, 24, periodicStalls( 1000, 640, 150, 900000 ), 1499, budget, 50 );
+    ASSERT_TRUE( forever.state == PlayStopState::PaceTooSlow );
+    ASSERT_TRUE( forever.elapsedMs < budget );
+    for( const int64_t fps : { int64_t( 20 ), int64_t( 22 ) } )
+    {
+        const PolledRun slow = pollStalledCount( 500, fps, dense, 1499, budget, 50 );
+        ASSERT_TRUE( slow.state == PlayStopState::PaceTooSlow );
+        ASSERT_TRUE( slow.elapsedMs >= playback_frame_range::kPaceProbeMs && slow.elapsedMs < 9000 );
+    }
+    // a steady engine at any pace and poll (even and uneven) is never split: no stall hold, no stall time
+    for( const int64_t fps : { int64_t( 3 ), int64_t( 12 ), int64_t( 20 ), int64_t( 24 ), int64_t( 30 ), int64_t( 60 ) } )
+    {
+        for( const int schedule : { 10, 16, 33, 50, 125 } )
+        {
+            PlayPaceHistory steady;
+            int64_t last = 0;
+            for( int64_t t = 0; t <= 20000; t = ( schedule == 125 ? r14UnevenNext( t ) : t + schedule ) )
+            {
+                steady.note( stalledCount( t, 0, fps, std::vector<Stall>() ), t );
+                last = t;
+            }
+            const PlayPaceHistory::PlayingSplit st = steady.stallFreeSplit( last );
+            ASSERT_EQ( int64_t( 0 ), st.stallHolds );
+            ASSERT_EQ( int64_t( 0 ), st.stallMs );
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------------------------------------
+// r16: THE GENERATED SWEEP. It checks exactly this sampled grid, not a continuous range: a 24 / 25 / 30 fps conformed run
+// (required 1499, safety 65000), first present 250 / 750 / 1500 ms, stalls of 100 / 150 / 200 / 250 / 300 ms every
+// 3000 / 1200 / 640 / 400 ms, either a burst that has ended by the probe (from 500 ms after the first present, the last
+// ending by 8000 ms) or stalls that never stop, polled every 50 ms at phases 0 / 12 / 25 / 37 / 49 ms: 360 combinations,
+// 1800 runs (r17 added the 45 never-stopping 3000 ms combinations the r16 test skipped; about 1.5 s more over the three
+// fps, measured standalone). Ground truth: the first ms the count reaches 1499 (feasible = by the budget).
+// THE BOUND IT PROVES (docs/playback-clip-length-rule.md): every feasible run is Reached, never before the count really
+// reaches 1499, and every infeasible one is refused PLAY_PACE_TOO_SLOW before the budget -- except two pinned classes,
+// each refused typed within 200 ms of the probe: (1) the STALL SHARE CAP: a burst whose stalls are more than a third of the time to the
+// probe is, at 8 s, the same count as stalls that keep coming (R12ControlsStillEndTypedPaceTooSlow); (2) THE TWO-POLL
+// LIMIT: a stall whose frame stays less than three poll gaps (step + stall < 150 ms, i.e. the 100 ms stalls here) can be
+// seen by only two polls -- a 50 ms bin, the same sighting as the 60 / 70 ms steps of the uneven engines that must be
+// refused at the probe (R15AdversaryA1 jitter controls) -- so it can stay playing pace. A wider grid (every phase 0..49,
+// 7 spacings, 5 first presents) is a SEPARATE receipt, not this test: see docs/playback-clip-length-rule.md for its
+// command, grid, counts and head.
+// ---------------------------------------------------------------------------------------------------------
+TEST( PlayPaceRecovery, R16GeneratedSweepEveryFeasibleRunCompletesAndEveryInfeasibleOneIsRefused )
+{
+    const int64_t budget = playSafetyMs( 25.0 );
+    int64_t feasibleReached = 0, infeasibleAtProbe = 0, infeasibleLater = 0, shareCapRefused = 0, twoPollRefused = 0;
+    int64_t pinnedReached = 0, pinnedLatestMs = 0, seenPastTheBudget = 0;
+    std::vector<int64_t> infeasiblePerFps( 3, 0 );
+    for( const bool burst : { true, false } )
+    for( size_t fi = 0; fi < 3; ++fi )
+    for( const int64_t firstPresent : { int64_t( 250 ), int64_t( 750 ), int64_t( 1500 ) } )
+    for( const int64_t len : { int64_t( 100 ), int64_t( 150 ), int64_t( 200 ), int64_t( 250 ), int64_t( 300 ) } )
+    for( const int64_t every : { int64_t( 3000 ), int64_t( 1200 ), int64_t( 640 ), int64_t( 400 ) } )
+    {
+        const int64_t fps = fi == 0 ? 24 : ( fi == 1 ? 25 : 30 );
+        const std::vector<Stall> stalls = periodicStalls( firstPresent + 500, every, len, burst ? 8000 : 900000 );
+        int64_t reach = 0;
+        while( stalledCount( reach, firstPresent, fps, stalls ) < 1499 ) ++reach;
+        const bool feasible = reach <= budget;
+        int64_t stalledBy8s = 0;
+        for( const Stall &s : stalls ) stalledBy8s += std::min<int64_t>( s.forMs, std::max<int64_t>( 0, 8000 - s.atMs ) );
+        const bool overShareCap = 2 * stalledBy8s > 8000 - firstPresent - stalledBy8s;
+        const bool twoPoll = len * fps + 1000 < 150 * fps;   // step + stall < 3 poll gaps
+        if( !feasible ) ++infeasiblePerFps[fi];
+        for( const int64_t phase : { int64_t( 0 ), int64_t( 12 ), int64_t( 25 ), int64_t( 37 ), int64_t( 49 ) } )
+        {
+            const PolledRun r = pollPhased( firstPresent, fps, stalls, 1499, budget, 50, phase );
+            if( !feasible )
+            {
+                ASSERT_TRUE( r.state == PlayStopState::PaceTooSlow );
+                ASSERT_TRUE( r.elapsedMs < budget );
+                ++( r.elapsedMs < playback_frame_range::kPaceProbeMs + 50 ? infeasibleAtProbe : infeasibleLater );
+            }
+            else if( r.state == PlayStopState::Reached )
+            {
+                ASSERT_TRUE( r.elapsedMs >= reach && r.elapsedMs < reach + 50 );
+                ++( overShareCap || twoPoll ? pinnedReached : feasibleReached );
+            }
+            else if( r.state == PlayStopState::SafetyTimeout )
+            {
+                // r20 (adversary A2 on 657fcd3d): a finish in the last poll gap before the budget, first seen after it. The
+                // poll cannot tell it from one just past the budget, so it ends typed, never a pass, and only at that poll.
+                ASSERT_TRUE( reach <= budget );
+                ASSERT_TRUE( r.elapsedMs > budget );
+                ASSERT_TRUE( r.elapsedMs >= reach && r.elapsedMs < reach + 50 );
+                ++seenPastTheBudget;
+            }
+            else
+            {
+                // only the two pinned classes, and only typed, within 200 ms of the probe
+                if( !( overShareCap || twoPoll ) || r.state != PlayStopState::PaceTooSlow
+                    || r.elapsedMs >= playback_frame_range::kPaceProbeMs + 200 )
+                    std::printf( "  r16 sweep FAIL: burst=%d fps=%lld first=%lld len=%lld every=%lld phase=%lld reach=%lld -> %d at %lld\n",
+                                 (int)burst, (long long)fps, (long long)firstPresent, (long long)len, (long long)every,
+                                 (long long)phase, (long long)reach, (int)r.state, (long long)r.elapsedMs );
+                ASSERT_TRUE( overShareCap || twoPoll );
+                ASSERT_TRUE( r.state == PlayStopState::PaceTooSlow );
+                ASSERT_TRUE( r.elapsedMs < playback_frame_range::kPaceProbeMs + 200 );   // within 200 ms of the probe
+                pinnedLatestMs = std::max( pinnedLatestMs, r.elapsedMs );
+                ++( overShareCap ? shareCapRefused : twoPollRefused );
+            }
+        }
+    }
+    std::printf( "  r16 sweep: feasible Reached=%lld (+%lld in a pinned class), infeasible refused at the probe=%lld, later=%lld; "
+                 "pinned refusals: share cap=%lld, two-poll=%lld, the latest at %lld ms; first seen past the budget=%lld\n",
+                 (long long)feasibleReached,
+                 (long long)pinnedReached, (long long)infeasibleAtProbe, (long long)infeasibleLater, (long long)shareCapRefused,
+                 (long long)twoPollRefused, (long long)pinnedLatestMs, (long long)seenPastTheBudget );
+    ASSERT_TRUE( feasibleReached > 0 && infeasibleAtProbe > 0 && infeasibleLater > 0 );
+    for( const int64_t n : infeasiblePerFps ) ASSERT_TRUE( n > 0 );   // the spacing reaches truly infeasible at every fps
 }
 
 TEST( LookAssistSettle, ASecondSettleNeverAsksForAnotherPlayBecauseTheProcessAdmitsExactlyOne )
@@ -1548,4 +2961,1128 @@ TEST( ContactSheetSeekFrameList, TheFirstFramePastTheClipIsNamedBeforeAnyPlay )
     ASSERT_EQ( 0, firstContactSheetSeekFrameOutOfRange( { 0 }, 1 ) );
     ASSERT_EQ( 3, firstContactSheetSeekFrameOutOfRange( { 3, 4 }, 0 ) );
     ASSERT_EQ( -1, firstContactSheetSeekFrameOutOfRange( {}, 0 ) );
+}
+
+// r20 (adversary A1 on 657fcd3d): native 60 fps, conform off, 2000 frames, requested 25 s, required 1500, budget 65000, Gated,
+// polled every 50 ms from 0 (note, then decide). The count sits at 2 until 4000 ms, runs at 60 fps to 5000 ms, holds at 62 until
+// 7000 ms, and runs at 60 fps from there. The stretch 4000..8000 ms proves 120 steps in 4000 ms, 30 fps, projecting 53933.333 ms.
+// The window kept only the newest anchor at least 3 s back (the count 61 last seen at 4950 ms, 20.66 fps), so the probe projected
+// past the budget and refused a run that reaches 1500 at 30966.667 ms. The pace is over ANY stretch of at least 3 s.
+namespace
+{
+int64_t r20A1Count( int64_t t )
+{
+    if( t < 17 ) return 1;
+    if( t < 4000 ) return 2;
+    if( t < 5000 ) return 2 + ( t - 4000 ) * 60 / 1000;
+    if( t < 7000 ) return 62;
+    return 62 + ( t - 7000 ) * 60 / 1000;
+}
+}
+
+TEST( PlayPaceRecovery, R20AdversaryA1ThePaceProbeReadsAnyStretchOfAtLeastThreeSeconds )
+{
+    PlayPaceHistory h;
+    PlayStopState state = PlayStopState::Continue;
+    int64_t t = 0;
+    for( ; t <= 900000; t += 50 )
+    {
+        h.note( r20A1Count( t ), t );
+        state = evaluatePlayStop( r20A1Count( t ), 1500, true, t, 65000, playback_frame_range::PlayPaceMode::Gated, h );
+        if( t == 8000 )
+        {
+            ASSERT_EQ( int64_t( 122 ), r20A1Count( t ) );
+            ASSERT_NEAR( 0.03, h.bestWindowPace, 1e-9 );
+            ASSERT_TRUE( state == PlayStopState::Continue );
+        }
+        if( state != PlayStopState::Continue ) break;
+    }
+    ASSERT_TRUE( state == PlayStopState::Reached );
+    ASSERT_EQ( int64_t( 31000 ), t );
+    // the stretch is anchored at a LAST sighting, so the stall inside it still counts against it: a steady 20 fps run is not lifted
+    PlayPaceHistory slow;
+    PlayStopState slowState = PlayStopState::Continue;
+    for( t = 0; t <= 900000; t += 50 )
+    {
+        const int64_t c = 1 + t * 20 / 1000;
+        slow.note( c, t );
+        slowState = evaluatePlayStop( c, 1500, true, t, 65000, playback_frame_range::PlayPaceMode::Gated, slow );
+        if( slowState != PlayStopState::Continue ) break;
+    }
+    ASSERT_TRUE( slowState == PlayStopState::PaceTooSlow );
+    ASSERT_EQ( int64_t( 8000 ), t );
+}
+
+// r20 (adversary A2 on 657fcd3d): native 59.94 fps, conform 24 fps, 1667 frames, requested 25 s, required 1499, budget 65000, Gated,
+// polled at 49 + 50k ms. A 2626 ms first-frame wait, then 24 fps: the count is 1498 at 64999 ms and first reaches 1499 at 65001 ms,
+// after the deadline. Reached was checked before the clock, so the next poll (65049 ms, count 1500) passed, and autoplay maps Reached
+// to exit 0. A requirement first SEEN past the deadline cannot be proved inside it, so it ends in the typed timeout, never a pass.
+TEST( PlayStopDecision, R20AdversaryA2ARequirementFirstSeenPastTheDeadlineIsNeverAPass )
+{
+    const auto count = []( int64_t t ) -> int64_t
+    {
+        if( t < 17 ) return 1;
+        if( t < 2626 ) return 2;
+        return 2 + ( t - 2626 ) * 24 / 1000;
+    };
+    PlayPaceHistory h;
+    PlayStopState state = PlayStopState::Continue;
+    int64_t t = 49;
+    for( ; t <= 900000; t += 50 )
+    {
+        h.note( count( t ), t );
+        state = evaluatePlayStop( count( t ), 1499, true, t, 65000, playback_frame_range::PlayPaceMode::Gated, h );
+        if( state != PlayStopState::Continue ) break;
+    }
+    ASSERT_EQ( int64_t( 1498 ), count( 64999 ) );
+    ASSERT_EQ( int64_t( 1500 ), count( 65049 ) );
+    ASSERT_EQ( int64_t( 65049 ), t );
+    ASSERT_TRUE( state == PlayStopState::SafetyTimeout );
+    ASSERT_EQ( std::string( "PLAY_SAFETY_TIMEOUT" ), std::string( playback_frame_range::playStopFailureReason( state ) ) );
+    // the same for a run that ended on that frame (it is late, not short) and for an informational run, whose ceiling this is
+    ASSERT_TRUE( evaluatePlayStop( 1500, 1499, false, 65049, 65000 ) == PlayStopState::SafetyTimeout );
+    ASSERT_TRUE( evaluatePlayStop( 1500, 1499, true, 65049, 65000, playback_frame_range::PlayPaceMode::MeasuredInformational ) == PlayStopState::SafetyTimeout );
+    // seen at or before the deadline it is inside it, whichever poll sees it, and a Play ending on that frame is still Reached
+    ASSERT_TRUE( evaluatePlayStop( 1499, 1499, true, 65000, 65000 ) == PlayStopState::Reached );
+    ASSERT_TRUE( evaluatePlayStop( 1499, 1499, false, 65000, 65000 ) == PlayStopState::Reached );
+    ASSERT_TRUE( evaluatePlayStop( 1499, 1499, true, 64999, 65000 ) == PlayStopState::Reached );
+    // required <= 0 still never reaches, past the deadline or not
+    ASSERT_TRUE( evaluatePlayStop( 99999, 0, true, 65049, 65000 ) == PlayStopState::SafetyTimeout );
+}
+
+// ---- HFR-NATIVE-60FPS-FULLRES-1 r24 (key3 B1 M-HFR-CONFORM-SKIP, hub ruling 2026-11-07) ----
+//
+// The promise: on a quiet host, conform playback presents source frames in order, an integer jump of exactly 1. Drop
+// Frame Mode keeps m_newPosDropMode fractional, so a tick granted 1.2 frames or more from a position x.8 crossed two
+// integers and presented frame N -> N + 2 (sol r23: 1152.8 + 1.584 = 1154.384, so 1152 -> 1154, max_jump=2) although
+// the tick owed less than one whole period beyond the frame it presents. The documented drop-frame skip after a REAL
+// stall (a tick that owes at least one whole period beyond that frame) stays.
+namespace
+{
+// Exactly what MainWindow::playbackHandling's drop-frame branch does with one tick (Loop off, a cut far from the end):
+// the delta conformDropFrameDelta returns goes to advanceDropFrameTick, and the slider (setValue of an int) presents the
+// integer part. Returns the presented integer transition.
+int conformDropTickTransition( double position, double granted, bool conformActive, double * landing = nullptr )
+{
+    const playback_frame_range::DropFrameTickResult tick = playback_frame_range::advanceDropFrameTick(
+        position, playback_frame_range::conformDropFrameDelta( position, granted, conformActive ), 1, 2860, false );
+    if( landing ) *landing = tick.position;
+    return static_cast<int>( tick.position ) - static_cast<int>( position );
+}
+
+bool sameBits( double a, double b ) { return std::memcmp( &a, &b, sizeof a ) == 0; }
+} // namespace
+
+TEST( PlaybackConformDropFrame, R24SolTraceFromAFractionalPositionPresentsTheNextFrame )
+{
+    // sol r23's trace: position 1152.8, granted 1.584 and 1.2 -- each a debt below one whole period beyond frame 1153.
+    ASSERT_EQ( 1, conformDropTickTransition( 1152.8, 1.584, true ) );
+    ASSERT_EQ( 1, conformDropTickTransition( 1152.8, 1.2, true ) );
+    // the other two positions sol traced
+    ASSERT_EQ( 1, conformDropTickTransition( 100.8, 1.584, true ) );
+    ASSERT_EQ( 1, conformDropTickTransition( 500.7, 1.584, true ) );
+}
+
+TEST( PlaybackConformDropFrame, R24NoGrantBelowTwoWholeFramesEverPresentsAJumpOfTwoUnderConform )
+{
+    // The class, not the instance: every fractional position x.00..x.99 and every grant 0..1.999 (a debt below one whole
+    // period beyond the next frame) presents a transition of 0 or 1 under conform.
+    for( int f = 0; f < 100; ++f )
+    {
+        const double position = 1152.0 + f / 100.0;
+        for( int g = 0; g < 2000; ++g )
+        {
+            const double granted = g / 1000.0;
+            const int transition = conformDropTickTransition( position, granted, true );
+            ASSERT_TRUE( transition == 0 || transition == 1 );
+            // a tick that crosses at most one integer is untouched: the same delta, bit for bit
+            if( static_cast<int>( position + granted ) - static_cast<int>( position ) <= 1 )
+                ASSERT_TRUE( sameBits( granted, playback_frame_range::conformDropFrameDelta( position, granted, true ) ) );
+        }
+    }
+}
+
+TEST( PlaybackConformDropFrame, R26ARealStallBeyondTheDebtCapStillSkipsUnderDropFrame )
+{
+    // Pinned so the fix never removes it: the documented drop-frame skip after a REAL stall stays under conform, and it is
+    // stall evidence (GUI-SMOKE-FOREGROUND-HANG-NOLA-1), never a conform PASS. r26 (receipt ecca9f02): a real stall is a
+    // backlog above kConformMaxDebtFrames, not one tick granted 2 or more -- such a tick presents the next frame (r24 pinned
+    // jumps of 2 and 3 here, which is the QUIET-leg conformMaxJump 2 the r24 judge failed on).
+    ASSERT_EQ( 1, conformDropTickTransition( 1152.0, 2.0, true ) );
+    ASSERT_EQ( 1, conformDropTickTransition( 1152.8, 2.13, true ) );   // 88.9 ms at 24 fps (receipt 3ac586e9's interval)
+    ASSERT_EQ( 1, conformDropTickTransition( 1152.0, 3.0, true ) );
+    ASSERT_EQ( 1, conformDropTickTransition( 1152.5, 3.4, true ) );
+    ASSERT_EQ( 1, conformDropTickTransition( 1152.8, 7.25, true ) );
+    ASSERT_EQ( 1, conformDropTickTransition( 1152.0, 9.0, true ) );    // a backlog of exactly the cap is still carried
+    // above the cap the frames beyond it are skipped on that tick (a 1 s stall at 24 fps skips 15 and carries 8)
+    ASSERT_EQ( 2, conformDropTickTransition( 1152.0, 10.0, true ) );
+    ASSERT_EQ( 4, conformDropTickTransition( 1152.5, 12.0, true ) );
+    ASSERT_EQ( 16, conformDropTickTransition( 1152.0, 24.0, true ) );
+    // and nothing granted is lost: position plus the carried debt is the position plus the grant
+    for( const double granted : { 2.0, 2.13, 3.0, 3.4, 7.25, 9.0, 10.0, 24.0 } )
+    {
+        double debt = 0.0;
+        const double delta = playback_frame_range::conformDropFrameDelta( 1152.8, granted, true, debt );
+        ASSERT_NEAR( 1152.8 + granted, 1152.8 + delta + debt, 1e-9 );
+        ASSERT_TRUE( debt <= playback_frame_range::kConformMaxDebtFrames + 1e-9 );
+    }
+    // without conform the same stall tick skips exactly as it always did
+    ASSERT_EQ( 2, conformDropTickTransition( 1152.8, 2.13, false ) );
+    ASSERT_EQ( 3, conformDropTickTransition( 1152.0, 3.0, false ) );
+}
+
+TEST( PlaybackConformDropFrame, R24WithoutConformTheDropFrameTickIsByteIdentical )
+{
+    // Non-conform drop-frame behaviour is unchanged: the grant is the delta, bit for bit, so 1152.8 + 1.584 still skips.
+    ASSERT_EQ( 2, conformDropTickTransition( 1152.8, 1.584, false ) );
+    ASSERT_EQ( 2, conformDropTickTransition( 1152.8, 1.2, false ) );
+    for( const double position : { 0.0, 0.5, 99.99, 1152.8, 2858.9 } )
+        for( const double granted : { 0.0, 0.192, 1.0, 1.2, 1.584, 1.999, 2.0, 19.0, -1.0 } )
+            ASSERT_TRUE( sameBits( granted, playback_frame_range::conformDropFrameDelta( position, granted, false ) ) );
+    // a grant that is not a positive number is passed through under conform too (nothing to quantise)
+    for( const double granted : { 0.0, -1.0 } )
+        ASSERT_TRUE( sameBits( granted, playback_frame_range::conformDropFrameDelta( 1152.8, granted, true ) ) );
+}
+
+TEST( PlaybackConformDropFrame, R24AHeldCatchupPresentsTheNextFrameKeepsThePhaseAndTheRecordersAgree )
+{
+    // 1152.8 + 1.584 lands on 1153.384: one whole frame of the grant is held back (the stateful form carries it as debt,
+    // R24A1* below), the phase stays.
+    double landing = 0.0;
+    ASSERT_EQ( 1, conformDropTickTransition( 1152.8, 1.584, true, &landing ) );
+    ASSERT_NEAR( 1153.384, landing, 1e-9 );
+    // what MainWindow records from the same tick: the granted share read back from the position (slip histogram), the
+    // source-frame counter, and the startup skip count all see the one-frame step the slider presents
+    const double before = 1152.8;
+    const playback_frame_range::DropFrameTickResult tick = playback_frame_range::advanceDropFrameTick(
+        before, playback_frame_range::conformDropFrameDelta( before, 1.584, true ), 1, 2860, false );
+    const double grantedDropFrames = tick.position - before + static_cast<double>( tick.wrapWidth );
+    ASSERT_NEAR( 0.584, grantedDropFrames, 1e-9 );
+    ASSERT_EQ( 0, playback_native_pace::skippedFrames( before, tick.position ) );
+    playback_frame_range::SourceFrameAdvanceCounter counter;
+    counter.begin( 1152 );
+    counter.noteEngineTick( before, tick.position, tick.wrapped );
+    ASSERT_EQ( int64_t( 2 ), counter.consumed() );   // frame 1152 plus the one advanced frame 1153
+    // a held landing whose phase is within a hair of 1 never lets the counter (floor + 1e-9) and the slider (truncation)
+    // differ: the phase is dropped and the next frame is presented exactly
+    double edge = 0.0;
+    ASSERT_EQ( 1, conformDropTickTransition( 1152.99999999995, 1.99999999999, true, &edge ) );
+    ASSERT_EQ( static_cast<int64_t>( std::floor( edge + 1e-9 ) ), static_cast<int64_t>( edge ) );
+    ASSERT_EQ( 1153.0, edge );
+    // and rounding never lands a held tick a hair short of the next frame, from small positions too
+    for( int f = 1; f < 1000; ++f )
+    {
+        const double position = f / 1000.0;
+        for( const double granted : { 1.2, 1.5, 1.584, 1.999 } )
+        {
+            const int transition = conformDropTickTransition( position, granted, true, &edge );
+            if( static_cast<int>( position + granted ) - static_cast<int>( position ) <= 1 ) continue;   // untouched tick
+            ASSERT_EQ( 1, transition );
+            ASSERT_EQ( static_cast<int64_t>( std::floor( edge + 1e-9 ) ), static_cast<int64_t>( edge ) );
+        }
+    }
+}
+
+TEST( PlaybackConformDropFrame, R24ConformHoldAtTheLoopEndStillWrapsOnTheRecordedWidth )
+{
+    // cut 1..1160 (frames 0..1159), Loop on: 1157.8 + 1.584 would cross two integers; under conform it presents 1158 and
+    // does not wrap. r32 (adversary A1 on 2e0a3985): MainWindow passes presentLastFrame = conform, so the next tick presents
+    // the last frame 1159 instead of wrapping, and the wrap after it is credited the cut's frame count (the distance travelled).
+    const int cutIn = 1, cutOut = 1160;
+    const playback_frame_range::DropFrameTickResult held = playback_frame_range::advanceDropFrameTick(
+        1157.8, playback_frame_range::conformDropFrameDelta( 1157.8, 1.584, true ), cutIn, cutOut, true, true );
+    ASSERT_FALSE( held.wrapped );
+    ASSERT_EQ( 1158, static_cast<int>( held.position ) );
+    const playback_frame_range::DropFrameTickResult last = playback_frame_range::advanceDropFrameTick(
+        held.position, playback_frame_range::conformDropFrameDelta( held.position, 0.8, true ), cutIn, cutOut, true, true );
+    ASSERT_FALSE( last.wrapped );
+    ASSERT_EQ( 1159, static_cast<int>( last.position ) );
+    // 1159.184 + 1.0 = 1160.184: past the last frame, so it wraps (1159.184 + 0.8 = 1159.984 would still be on 1159)
+    const playback_frame_range::DropFrameTickResult wrap = playback_frame_range::advanceDropFrameTick(
+        last.position, playback_frame_range::conformDropFrameDelta( last.position, 1.0, true ), cutIn, cutOut, true, true );
+    ASSERT_TRUE( wrap.wrapped );
+    ASSERT_EQ( cutOut - cutIn + 1, wrap.wrapWidth );
+    ASSERT_EQ( 0, static_cast<int>( wrap.position ) );
+    // r33 C1 (hub ruling 2026-11-08T21:54:27Z): the post-wrap phase, exactly. The wrap subtracts the cut's frame count and
+    // nothing else, so the position is bit for bit (1159.184 + 1.0) - 1160 (about 0.184): the sub-frame phase survives the wrap.
+    ASSERT_EQ( ( last.position + 1.0 ) - static_cast<double>( cutOut - cutIn + 1 ), wrap.position );
+    ASSERT_NEAR( 0.184, wrap.position, 1e-9 );
+    // r33 C1 below-boundary control: a grant that ends just below the wrap bound (1160) must NOT wrap; it stays on the last
+    // frame 1159 with its phase. Then a landing exactly on the bound wraps onto the first frame with phase 0, exactly.
+    ASSERT_EQ( 1160.0, playback_frame_range::dropFrameLoopWrapAt( cutOut, true ) );
+    const double belowGrant = 1159.999 - last.position;
+    const playback_frame_range::DropFrameTickResult below = playback_frame_range::advanceDropFrameTick(
+        last.position, playback_frame_range::conformDropFrameDelta( last.position, belowGrant, true ), cutIn, cutOut, true, true );
+    ASSERT_FALSE( below.wrapped );
+    ASSERT_EQ( 0, below.wrapWidth );
+    ASSERT_EQ( 1159, static_cast<int>( below.position ) );
+    ASSERT_TRUE( below.position < 1160.0 );
+    ASSERT_NEAR( 1159.999, below.position, 1e-9 );
+    const playback_frame_range::DropFrameTickResult onBound = playback_frame_range::advanceDropFrameTick(
+        1159.5, playback_frame_range::conformDropFrameDelta( 1159.5, 0.5, true ), cutIn, cutOut, true, true );
+    ASSERT_TRUE( onBound.wrapped );
+    ASSERT_EQ( 0.0, onBound.position );
+    const playback_frame_range::DropFrameTickResult justBelow = playback_frame_range::advanceDropFrameTick(
+        1159.5, playback_frame_range::conformDropFrameDelta( 1159.5, 0.4999, true ), cutIn, cutOut, true, true );
+    ASSERT_FALSE( justBelow.wrapped );
+    ASSERT_EQ( 1159, static_cast<int>( justBelow.position ) );
+    // without conform (presentLastFrame false) the pre-existing drop-frame wrap is unchanged: it fires on reaching the last frame
+    const playback_frame_range::DropFrameTickResult plain = playback_frame_range::advanceDropFrameTick( held.position, 0.8, cutIn, cutOut, true );
+    ASSERT_TRUE( plain.wrapped );
+    ASSERT_EQ( cutOut - cutIn, plain.wrapWidth );
+}
+
+TEST( PlaybackConformDropFrame, R32ConformedLoopPresentsTheCutsLastFrameBeforeTheWrap )
+{
+    // adversary A1 on 2e0a3985, its input verbatim: 60 fps conformed to 24, Drop Frame on, Loop on, Cut In 1, Cut Out 720,
+    // position 718.8 with frame 718 painted, granted 0.24, no debt, target presented. Before r32 the tick reached 719.04,
+    // wrapped at once (>= 719) to about 0.04, and frame 719 was never requested.
+    const int cutIn = 1, cutOut = 720;
+    double debt = 0.0;
+    const double delta = playback_frame_range::conformDropFrameDelta( 718.8, 0.24, true, debt, true );
+    ASSERT_NEAR( 0.24, delta, 1e-12 );
+    ASSERT_EQ( 0.0, debt );
+    const playback_frame_range::DropFrameTickResult tick =
+        playback_frame_range::advanceDropFrameTick( 718.8, delta, cutIn, cutOut, true, /*presentLastFrame=*/true );
+    ASSERT_FALSE( tick.wrapped );
+    ASSERT_EQ( 719, static_cast<int>( tick.position ) );
+    ASSERT_EQ( 0, tick.wrapWidth );
+    // a wrap lands on the first frame with the phase kept, and every recorder reads the distance the timeline travelled
+    const double before = 719.44;
+    const playback_frame_range::DropFrameTickResult wrap =
+        playback_frame_range::advanceDropFrameTick( before, 0.6, cutIn, cutOut, true, true );
+    ASSERT_TRUE( wrap.wrapped );
+    ASSERT_EQ( cutOut - cutIn + 1, wrap.wrapWidth );
+    ASSERT_NEAR( 0.04, wrap.position, 1e-9 );
+    ASSERT_NEAR( 0.6, wrap.position - before + static_cast<double>( wrap.wrapWidth ), 1e-9 );   // MainWindow's grantedDropFrames
+    // the contact-sheet loop qualification still recognises 719 -> 0 as a wrap (0-based cut 0..719)
+    ASSERT_TRUE( playback_frame_range::isContactSheetLoopWrapTransition( true, cutIn - 1, cutOut - 1, 719, 0 ) );
+    // end to end: two conformed laps at 24 fps from an 8 ms poll; every presented transition is +1 or the 719 -> 0 wrap, and
+    // every frame of the cut is presented on every lap (the class: no frame of the cut is skipped at the loop end)
+    playback_native_pace::NativePaceGuard guard;
+    guard.reset();
+    double position = 0.0, nowMs = 0.0, carried = 0.0;
+    int lastPresented = 0, wraps = 0;
+    std::vector<int> shownThisLap( 720, 0 );
+    shownThisLap[ 0 ] = 1;
+    for( int t = 1; wraps < 2 && t < 200000; ++t )
+    {
+        nowMs += 8.0;
+        const double granted = guard.grant( 24.0 * 8.0 / 1000.0, nowMs, 24.0 );
+        if( t == 1 ) guard.notePresent( nowMs, 24.0 );
+        const playback_frame_range::DropFrameTickResult step = playback_frame_range::advanceDropFrameTick(
+            position, playback_frame_range::conformDropFrameDelta( position, granted, true, carried, true ), cutIn, cutOut, true, true );
+        position = step.position;
+        const int presented = static_cast<int>( position );
+        if( presented == lastPresented ) continue;
+        if( step.wrapped )
+        {
+            ASSERT_EQ( 719, lastPresented );
+            ASSERT_EQ( 0, presented );
+            for( int f = 0; f < 720; ++f ) ASSERT_EQ( 1, shownThisLap[ f ] );
+            std::fill( shownThisLap.begin(), shownThisLap.end(), 0 );
+            ++wraps;
+        }
+        else
+        {
+            ASSERT_EQ( lastPresented + 1, presented );
+        }
+        shownThisLap[ presented ] = 1;
+        lastPresented = presented;
+    }
+    ASSERT_EQ( 2, wraps );
+}
+
+TEST( PlaybackConformDropFrame, R32FixIteration2TheEngineOwnsTheConformedWrapFromTheLastFrame )
+{
+    // adversary A1 + A2 on 03850f7b: playbackHandling's outer "on the last frame" branch must not take the conformed Drop Frame
+    // Loop wrap; the drop-frame engine does (phase kept, conform gate). Every other shape keeps the outer branch.
+    using playback_frame_range::outerLastFrameBranchHandlesTick;
+    ASSERT_FALSE( outerLastFrameBranchHandlesTick( 718, 720, true, true, true ) );    // not on the last frame: never
+    ASSERT_FALSE( outerLastFrameBranchHandlesTick( 719, 720, true, true, true ) );    // conform + drop + loop: the engine's
+    ASSERT_TRUE( outerLastFrameBranchHandlesTick( 719, 720, true, true, false ) );    // no conform: unchanged
+    ASSERT_TRUE( outerLastFrameBranchHandlesTick( 719, 720, false, true, true ) );    // normal (whole-frame) mode: unchanged
+    ASSERT_TRUE( outerLastFrameBranchHandlesTick( 719, 720, true, false, true ) );    // no Loop: stop on the last frame
+    ASSERT_TRUE( outerLastFrameBranchHandlesTick( 900, 720, true, true, true ) );     // Cut Out moved below the playhead: cut-in
+    // A1's input: 718 painted, 718.8 + 0.24 -> 719.04 (719 now requested). 719 is accepted but its paint is withheld: while it is
+    // not on screen no conformed tick crosses into the wrap (the debt is carried), and the outer branch does not wrap either.
+    const int cutIn = 1, cutOut = 720;
+    double debt = 0.0;
+    playback_frame_range::DropFrameTickResult step = playback_frame_range::advanceDropFrameTick(
+        718.8, playback_frame_range::conformDropFrameDelta( 718.8, 0.24, true, debt, true ), cutIn, cutOut, true, true );
+    ASSERT_EQ( 719, static_cast<int>( step.position ) );
+    ASSERT_FALSE( outerLastFrameBranchHandlesTick( static_cast<int>( step.position ), cutOut, true, true, true ) );
+    for( int t = 0; t < 4; ++t )   // four 48 ms grants while 719 is unpainted (the debt stays under kConformMaxDebtFrames)
+    {
+        step = playback_frame_range::advanceDropFrameTick(
+            step.position, playback_frame_range::conformDropFrameDelta( step.position, 1.152, true, debt, /*targetPresented=*/false ),
+            cutIn, cutOut, true, true );
+        ASSERT_FALSE( step.wrapped );
+        ASSERT_EQ( 719, static_cast<int>( step.position ) );
+    }
+    ASSERT_TRUE( debt > 0.0 );
+    // 719 painted: the next tick wraps, by the cut's frame count, onto the first frame
+    step = playback_frame_range::advanceDropFrameTick(
+        step.position, playback_frame_range::conformDropFrameDelta( step.position, 0.192, true, debt, true ), cutIn, cutOut, true, true );
+    ASSERT_TRUE( step.wrapped );
+    ASSERT_EQ( cutOut - cutIn + 1, step.wrapWidth );
+    ASSERT_EQ( 0, static_cast<int>( step.position ) );
+}
+
+TEST( PlaybackConformDropFrame, R32FixIteration2AConformedTwoFrameLoopKeepsTheSourcePace )
+{
+    // adversary A2 on 03850f7b, its input: 60 fps conformed to 24, Cut In 1, Cut Out 2, Loop and Drop Frame on, 8 ms polls,
+    // immediate renders and paints, no debt. playbackHandling modelled: the outer branch (whole-frame grantLoopWrap, then the
+    // slider reset to the integer cut-in) when outerLastFrameBranchHandlesTick says so, else the conformed drop-frame engine.
+    // The old outer rule (slider >= cutOut - 1) is run beside it as the contrast: it lost the phase and a credit every lap.
+    for( const bool oldOuterRule : { false, true } )
+    {
+        const int cutIn = 1, cutOut = 2;
+        playback_native_pace::NativePaceGuard guard;
+        guard.reset();
+        double position = 0.0, nowMs = 0.0, debt = 0.0;
+        int lastPresented = 0;
+        long transitions = 0;
+        for( int t = 1; nowMs < 60000.0; ++t )
+        {
+            nowMs += 8.0;
+            const int slider = static_cast<int>( position );
+            const bool outer = oldOuterRule ? slider >= cutOut - 1
+                                            : playback_frame_range::outerLastFrameBranchHandlesTick( slider, cutOut, true, true, true );
+            if( outer )
+            {
+                if( !guard.grantLoopWrap( nowMs, 24.0 ) ) continue;
+                position = cutIn - 1;   // setValue( cutIn ): the slider signal resets m_newPosDropMode to the integer
+            }
+            else
+            {
+                const double granted = guard.grant( 24.0 * 8.0 / 1000.0, nowMs, 24.0 );
+                if( t == 1 ) guard.notePresent( nowMs, 24.0 );
+                position = playback_frame_range::advanceDropFrameTick(
+                    position, playback_frame_range::conformDropFrameDelta( position, granted, true, debt, true ),
+                    cutIn, cutOut, true, true ).position;
+            }
+            const int presented = static_cast<int>( position );
+            if( presented != lastPresented ) { ++transitions; lastPresented = presented; }
+        }
+        const double fps = transitions * 1000.0 / nowMs;
+        if( oldOuterRule ) ASSERT_TRUE( fps < 23.5 );                  // the A2 shape: about 22.3 fps
+        else ASSERT_TRUE( fps > 23.9 && fps < 24.1 );                  // every presented frame at the conform pace
+    }
+}
+
+TEST( PlaybackConformDropFrame, R33B1TheNormalizerSharesTheWrapBoundAndKeepsTheLastFramesPhase )
+{
+    // hub ruling B1 2026-11-08T21:16:04Z (Dot 6727190400): normalizePlaybackCutRangeForLoadedClip called anything above the last
+    // frame out of range and truncated it, while advanceDropFrameTick wraps one frame later under conform. One bound now.
+    using playback_frame_range::CutRange;
+    using playback_frame_range::advanceDropFrameTick;
+    using playback_frame_range::dropFrameLoopWrapAt;
+    using playback_frame_range::dropFramePositionInCutRange;
+    using playback_frame_range::normalizeCutRange;
+    using playback_frame_range::normalizeDropFramePosition;
+    ASSERT_EQ( 720.0, dropFrameLoopWrapAt( 720, true ) );
+    ASSERT_EQ( 719.0, dropFrameLoopWrapAt( 720, false ) );
+    // (a) the bound is shared: over full and trimmed cuts, with and without conform, a position the engine would wrap from with a
+    // zero delta is exactly a position the normalizer calls out of range on the upper side, and the reverse
+    struct Cut { int cutIn, cutOut, total; };
+    for( const Cut c : { Cut{ 1, 720, 720 }, Cut{ 101, 460, 720 }, Cut{ 1, 360, 720 }, Cut{ 1, 2, 720 } } )
+    {
+        const CutRange range = normalizeCutRange( c.cutIn, c.cutOut, c.total, true );
+        ASSERT_TRUE( range.valid );
+        ASSERT_FALSE( range.changed );
+        for( const bool conform : { true, false } )
+        {
+            const double bound = dropFrameLoopWrapAt( c.cutOut, conform );
+            for( const double p : { bound - 1.0, bound - 0.5, bound - 0.001, std::nextafter( bound, 0.0 ), bound, bound + 0.25 } )
+            {
+                if( p < static_cast<double>( c.cutIn - 1 ) ) continue;
+                const bool wraps = advanceDropFrameTick( p, 0.0, c.cutIn, c.cutOut, true, conform ).wrapped;
+                if( conform ) ASSERT_EQ( wraps, !dropFramePositionInCutRange( p, range, conform ) );
+                else ASSERT_EQ( p > bound, !dropFramePositionInCutRange( p, range, conform ) );   // non-conform: the last frame itself is in
+            }
+        }
+        // (b) under conform a position in [last, last + 1) keeps its fraction, bit for bit; it is not repaired
+        const double last = static_cast<double>( c.cutOut - 1 );
+        for( const double p : { last, last + 0.04, last + 0.5, last + 0.999, std::nextafter( last + 1.0, 0.0 ) } )
+        {
+            bool out = true;
+            const double kept = normalizeDropFramePosition( p, range, c.total, true, &out );
+            ASSERT_FALSE( out );
+            ASSERT_EQ( p, kept );
+        }
+        // every in-range interior position too, conform or not
+        for( const double p : { static_cast<double>( c.cutIn - 1 ), c.cutIn - 1 + 0.3, last - 0.7 } )
+            for( const bool conform : { true, false } )
+            {
+                if( p < static_cast<double>( c.cutIn - 1 ) ) continue;
+                bool out = true;
+                ASSERT_EQ( p, normalizeDropFramePosition( p, range, c.total, conform, &out ) );
+                ASSERT_FALSE( out );
+            }
+    }
+}
+
+TEST( PlaybackConformDropFrame, R33B1TheGenuineOutOfRangeRepairIsKept )
+{
+    // (e) a truly out-of-range position is still repaired exactly as before r33: the integer part clamped to the clip
+    using playback_frame_range::CutRange;
+    using playback_frame_range::normalizeCutRange;
+    using playback_frame_range::normalizeDropFramePosition;
+    const CutRange full = normalizeCutRange( 1, 720, 720, true );
+    const CutRange trimmed = normalizeCutRange( 101, 460, 720, true );
+    bool out = false;
+    // without conform the pre-r33 rule is unchanged: past the last frame is out and truncated (719.04 -> 719)
+    ASSERT_EQ( 719.0, normalizeDropFramePosition( 719.04, full, 720, false, &out ) );
+    ASSERT_TRUE( out );
+    // at or past the conformed wrap bound: out, repaired (a position the engine never holds)
+    ASSERT_EQ( 719.0, normalizeDropFramePosition( 720.0, full, 720, true, &out ) );
+    ASSERT_TRUE( out );
+    ASSERT_EQ( 719.0, normalizeDropFramePosition( 900.6, full, 720, true, &out ) );
+    ASSERT_TRUE( out );
+    // a trimmed cut: Cut Out moved below the playhead (500.3 > 459 + 1) is out; the repair clamps to the CLIP, as before, and the
+    // outer last-frame branch then takes it back to cut-in
+    ASSERT_EQ( 500.0, normalizeDropFramePosition( 500.3, trimmed, 720, true, &out ) );
+    ASSERT_TRUE( out );
+    ASSERT_TRUE( playback_frame_range::outerLastFrameBranchHandlesTick( 500, 460, true, true, true ) );
+    // below the cut's first frame: out, truncated (the pre-r33 repair)
+    ASSERT_EQ( 50.0, normalizeDropFramePosition( 50.7, trimmed, 720, true, &out ) );
+    ASSERT_TRUE( out );
+    ASSERT_EQ( 0.0, normalizeDropFramePosition( -3.5, full, 720, true, &out ) );
+    ASSERT_TRUE( out );
+    // never undefined: a value too large for an int and not a number are repaired, never cast raw
+    ASSERT_EQ( 719.0, normalizeDropFramePosition( 1e300, full, 720, true, &out ) );
+    ASSERT_TRUE( out );
+    ASSERT_EQ( 100.0, normalizeDropFramePosition( std::numeric_limits<double>::quiet_NaN(), trimmed, 720, true, &out ) );
+    ASSERT_TRUE( out );
+    // the collapsed-range repair on the play path changes the cut; a conformed last-frame phase inside the repaired cut is kept
+    const CutRange widened = normalizeCutRange( 900, 900, 720, true );   // Cut In clamps to 720, the collapsed range widens
+    ASSERT_TRUE( widened.changed );
+    ASSERT_EQ( 719.5, normalizeDropFramePosition( 719.5, widened, 720, true, &out ) );
+    ASSERT_FALSE( out );
+}
+
+namespace {
+
+// r33 B1 (c): MainWindow::playbackHandling's per-tick chain with the REAL helpers it calls, in its order: the play-path cut-range
+// normalizer (normalizeCutRange + normalizeDropFramePosition, normalizePlaybackCutRangeForLoadedClip), the outer last-frame branch
+// (outerLastFrameBranchHandlesTick; a whole-frame grantLoopWrap, then the slider reset to the integer cut-in), else the conformed
+// drop-frame engine (conformDropFrameDelta + advanceDropFrameTick, presentLastFrame = conform). 60 fps conformed to 24, Drop Frame
+// and Loop on, an 8 ms poll. \a oldNormalizer runs the pre-r33 normalizer rule (truncate anything above the last frame) instead,
+// the contrast. \a holdLastFramePaintTicks withholds the paint of the cut's last frame for that many ticks on every arrival (d).
+struct ConformLoopChainResult
+{
+    int wraps = 0;
+    long transitions = 0;
+    double seconds = 0.0;
+    bool everyStepPlusOneOrWrap = true;
+    bool everyFrameEveryLap = true;
+    bool presentedNeverRegressedDuringHold = true;
+    bool debtNeverShrankDuringHold = true;
+    bool normalizerNeverMovedThePresentedFrame = true;
+    bool normalizerNeverRepaired = true;
+    double maxDebt = 0.0;
+};
+
+ConformLoopChainResult runConformLoopChain( int cutIn, int cutOut, int totalFrames, bool oldNormalizer, int holdLastFramePaintTicks,
+                                            int wantWraps, double maxSeconds )
+{
+    ConformLoopChainResult r;
+    const int firstFrame = cutIn - 1, lastFrame = cutOut - 1;
+    playback_native_pace::NativePaceGuard guard;
+    guard.reset();
+    double position = firstFrame, nowMs = 0.0, debt = 0.0;
+    int lastPresented = firstFrame, holdLeft = 0;
+    std::vector<int> shownThisLap( static_cast<size_t>( cutOut - cutIn + 1 ), 0 );
+    shownThisLap[ 0 ] = 1;
+    for( int t = 1; r.wraps < wantWraps && nowMs < maxSeconds * 1000.0; ++t )
+    {
+        nowMs += 8.0;
+        // 1. the play-path normalizer
+        const playback_frame_range::CutRange range = playback_frame_range::normalizeCutRange( cutIn, cutOut, totalFrames, true );
+        const double beforeNormalize = position;
+        const double debtBeforeNormalize = debt;
+        if( oldNormalizer )
+        {
+            if( position < playback_frame_range::firstFrameIndex( range ) || position > playback_frame_range::lastFrameIndex( range ) )
+                position = playback_frame_range::clampFrameIndex( static_cast<int>( position ), totalFrames );
+        }
+        else
+        {
+            bool out = false;
+            position = playback_frame_range::normalizeDropFramePosition( position, range, totalFrames, true, &out );
+            if( out ) r.normalizerNeverRepaired = false;
+        }
+        if( static_cast<int>( position ) != static_cast<int>( beforeNormalize ) ) r.normalizerNeverMovedThePresentedFrame = false;
+        if( debt != debtBeforeNormalize ) r.debtNeverShrankDuringHold = false;
+        // 2. the outer last-frame branch, else 3. the conformed drop-frame engine
+        const int slider = static_cast<int>( position );
+        bool wrapped = false;
+        if( playback_frame_range::outerLastFrameBranchHandlesTick( slider, cutOut, true, true, true ) )
+        {
+            if( !guard.grantLoopWrap( nowMs, 24.0 ) ) continue;
+            position = firstFrame;
+            wrapped = true;
+        }
+        else
+        {
+            const double granted = guard.grant( 24.0 * 8.0 / 1000.0, nowMs, 24.0 );
+            if( t == 1 ) guard.notePresent( nowMs, 24.0 );
+            const bool painted = !( slider == lastFrame && holdLeft > 0 );
+            const double debtBefore = debt;
+            const playback_frame_range::DropFrameTickResult step = playback_frame_range::advanceDropFrameTick(
+                position, playback_frame_range::conformDropFrameDelta( position, granted, true, debt, painted ),
+                cutIn, cutOut, true, true );
+            if( !painted )
+            {
+                --holdLeft;
+                if( step.wrapped || static_cast<int>( step.position ) != lastFrame ) r.presentedNeverRegressedDuringHold = false;
+                if( debt < debtBefore ) r.debtNeverShrankDuringHold = false;
+            }
+            position = step.position;
+            wrapped = step.wrapped;
+        }
+        r.maxDebt = std::max( r.maxDebt, debt );
+        const int presented = static_cast<int>( position );
+        if( presented == lastPresented ) continue;
+        ++r.transitions;
+        if( wrapped )
+        {
+            if( lastPresented != lastFrame || presented != firstFrame ) r.everyStepPlusOneOrWrap = false;
+            for( const int shown : shownThisLap ) if( shown != 1 ) r.everyFrameEveryLap = false;
+            std::fill( shownThisLap.begin(), shownThisLap.end(), 0 );
+            ++r.wraps;
+        }
+        else if( presented != lastPresented + 1 )
+        {
+            r.everyStepPlusOneOrWrap = false;
+        }
+        if( presented >= firstFrame && presented <= lastFrame ) shownThisLap[ static_cast<size_t>( presented - firstFrame ) ] = 1;
+        if( presented == lastFrame ) holdLeft = holdLastFramePaintTicks;
+        lastPresented = presented;
+    }
+    r.seconds = nowMs / 1000.0;
+    return r;
+}
+
+}  // namespace
+
+TEST( PlaybackConformDropFrame, R33B1TheRealNormalizeOuterEngineChainWrapsAConformedLoopWithSubFrameTicks )
+{
+    // (c) + (f): sub-frame ticks (0.192 frames per 8 ms poll) over full and trimmed cuts. With the r33 normalizer the conformed Loop
+    // presents every frame of the cut in order on every lap and wraps from the last frame onto the first, at the conform pace.
+    // The pre-r33 normalizer rule is the contrast: it truncated every position past the last frame, so the conformed Loop stuck
+    // on the last frame and never wrapped.
+    struct Cut { int cutIn, cutOut, total; };
+    for( const Cut c : { Cut{ 1, 720, 720 }, Cut{ 101, 460, 720 }, Cut{ 1, 360, 720 }, Cut{ 700, 720, 720 } } )
+    {
+        const int frames = c.cutOut - c.cutIn + 1;
+        const double lapSeconds = frames / 24.0;
+        const ConformLoopChainResult fixedChain = runConformLoopChain( c.cutIn, c.cutOut, c.total, false, 0, 2, 3.0 * lapSeconds + 2.0 );
+        ASSERT_EQ( 2, fixedChain.wraps );
+        ASSERT_TRUE( fixedChain.everyStepPlusOneOrWrap );
+        ASSERT_TRUE( fixedChain.everyFrameEveryLap );
+        ASSERT_TRUE( fixedChain.normalizerNeverRepaired );               // the engine's own positions are always in range
+        ASSERT_TRUE( fixedChain.normalizerNeverMovedThePresentedFrame );
+        const double fps = fixedChain.transitions / fixedChain.seconds;
+        ASSERT_TRUE( fps > 23.5 && fps < 24.5 );
+        const ConformLoopChainResult oldChain = runConformLoopChain( c.cutIn, c.cutOut, c.total, true, 0, 2, 3.0 * lapSeconds + 2.0 );
+        ASSERT_EQ( 0, oldChain.wraps );                                  // B1: stuck on the last frame
+        ASSERT_EQ( static_cast<long>( frames - 1 ), oldChain.transitions );
+    }
+}
+
+TEST( PlaybackConformDropFrame, R33B1PaintAndDebtControlsHoldOnTheBoundary )
+{
+    // (d): the cut's last frame is accepted but its paint is withheld for 6 polls (48 ms) on every arrival. Across the hold the
+    // presented frame stays the last frame (it never regresses, never wraps unpainted), the carried debt never shrinks, and the
+    // normalizer, run every tick, never moves the presented frame or touches the debt. Once painted the Loop wraps and every frame
+    // of the cut is still presented on every lap.
+    struct Cut { int cutIn, cutOut, total; };
+    for( const Cut c : { Cut{ 1, 720, 720 }, Cut{ 101, 460, 720 } } )
+    {
+        const double lapSeconds = ( c.cutOut - c.cutIn + 1 ) / 24.0;
+        const ConformLoopChainResult held = runConformLoopChain( c.cutIn, c.cutOut, c.total, false, 6, 2, 3.0 * lapSeconds + 2.0 );
+        ASSERT_EQ( 2, held.wraps );
+        ASSERT_TRUE( held.presentedNeverRegressedDuringHold );
+        ASSERT_TRUE( held.debtNeverShrankDuringHold );
+        ASSERT_TRUE( held.normalizerNeverMovedThePresentedFrame );
+        ASSERT_TRUE( held.normalizerNeverRepaired );
+        ASSERT_TRUE( held.everyStepPlusOneOrWrap );
+        ASSERT_TRUE( held.everyFrameEveryLap );
+        ASSERT_TRUE( held.maxDebt <= playback_frame_range::kConformMaxDebtFrames );
+    }
+}
+
+TEST( PlaybackConformDropFrame, R33A1ATickWiderThanTheCutWrapsEveryLapAndStaysInTheCut )
+{
+    // adversary A1 on e0947e37, its input: a 720-frame 60 fps clip conformed to 24, Cut In 101, Cut Out 102, Play + Loop + Drop
+    // Frame, position 100.25, no debt, target presented, granted 12.0 (a 500 ms GUI delay). The conformed delta is the next frame
+    // plus the backlog above kConformMaxDebtFrames: 4 applied, 8 carried. One subtraction of the width (2) left 102.25, so
+    // MainWindow requested frame 102, past the cut's last frame 101.
+    using playback_frame_range::DropFrameTickResult;
+    using playback_frame_range::advanceDropFrameTick;
+    const int cutIn = 101, cutOut = 102;
+    double debt = 0.0;
+    const double delta = playback_frame_range::conformDropFrameDelta( 100.25, 12.0, true, debt, true );
+    ASSERT_NEAR( 4.0, delta, 1e-9 );
+    ASSERT_NEAR( 8.0, debt, 1e-12 );
+    const DropFrameTickResult tick = advanceDropFrameTick( 100.25, delta, cutIn, cutOut, true, true );
+    ASSERT_TRUE( tick.wrapped );
+    ASSERT_EQ( 2, tick.wrapWidth );
+    ASSERT_EQ( 2, tick.wrapLaps );
+    ASSERT_NEAR( 100.25, tick.position, 1e-9 );
+    ASSERT_TRUE( static_cast<int>( tick.position ) >= cutIn - 1 );
+    ASSERT_TRUE( static_cast<int>( tick.position ) <= cutOut - 1 );
+    bool out = true;
+    playback_frame_range::normalizeDropFramePosition(
+        tick.position, playback_frame_range::normalizeCutRange( cutIn, cutOut, 720, true ), 720, true, &out );
+    ASSERT_FALSE( out );
+    // MainWindow's grantedDropFrames reads the applied delta back, and the wrap recorder gets every lap at its width
+    ASSERT_NEAR( delta, tick.position - 100.25 + static_cast<double>( tick.wrapWidth ) * tick.wrapLaps, 1e-9 );
+    playback_frame_range::PlaybackWrapRecorder recorder;
+    recorder.noteEngineWrap( tick.wrapWidth, tick.wrapLaps );
+    ASSERT_EQ( 2, recorder.engineWraps );
+    ASSERT_EQ( int64_t( 4 ), recorder.engineWrapsWidth( 0, 2 ) );
+    ASSERT_EQ( 2, recorder.replayCount() );
+    // the class (siblings MainWindow.cpp playbackHandling's setValue( m_newPosDropMode ) and drawFrame's requestedFrame): every
+    // applied delta, conform or not, on short and full cuts, lands inside [cut-in, wrap bound) and reads back exactly
+    struct Cut { int cutIn, cutOut; };
+    for( const Cut c : { Cut{ 101, 102 }, Cut{ 1, 2 }, Cut{ 5, 7 }, Cut{ 1, 720 } } )
+        for( const bool conform : { true, false } )
+        {
+            const double lower = static_cast<double>( c.cutIn - 1 );
+            const double upper = playback_frame_range::dropFrameLoopWrapAt( c.cutOut, conform );
+            for( const double start : { lower, lower + 0.5 * ( upper - lower ), std::nextafter( upper, 0.0 ) } )
+                for( const double applied : { 0.3, 1.0, 2.5, 4.0, 7.9, 13.0, 40.2, 1000.75 } )
+                {
+                    const DropFrameTickResult step = advanceDropFrameTick( start, applied, c.cutIn, c.cutOut, true, conform );
+                    ASSERT_TRUE( step.position >= lower - 1e-9 );
+                    ASSERT_TRUE( step.position < upper );
+                    ASSERT_NEAR( applied, step.position - start + static_cast<double>( step.wrapWidth ) * step.wrapLaps, 1e-6 );
+                    ASSERT_EQ( step.wrapped, step.wrapLaps > 0 );
+                }
+        }
+    // a single lap is the pre-r33 subtraction, bit for bit
+    const DropFrameTickResult one = advanceDropFrameTick( 719.44, 0.6, 1, 720, true, true );
+    ASSERT_EQ( 1, one.wrapLaps );
+    ASSERT_EQ( ( 719.44 + 0.6 ) - 720.0, one.position );
+    const DropFrameTickResult plainOne = advanceDropFrameTick( 718.5, 0.7, 1, 720, true, false );
+    ASSERT_EQ( 1, plainOne.wrapLaps );
+    ASSERT_EQ( ( 718.5 + 0.7 ) - 719.0, plainOne.position );
+    // no Loop: the clamp is unchanged and never a lap
+    const DropFrameTickResult clamp = advanceDropFrameTick( 100.25, 4.0, cutIn, cutOut, false, true );
+    ASSERT_FALSE( clamp.wrapped );
+    ASSERT_EQ( 0, clamp.wrapLaps );
+    ASSERT_EQ( 101.0, clamp.position );
+}
+
+TEST( PlaybackConformDropFrame, R24AConformedPlayWithSubPeriodGuiLateTicksPresentsEveryFrame )
+{
+    // The engine end to end: the pace guard at 24 fps, an 8 ms poll, and every 97th tick a GUI-late tick of 50..82 ms
+    // (1.2..1.97 periods: late, not a whole-period stall), presented frames fed to the conform tracker. Under conform the
+    // largest jump is 1 and every frame is shown; the same ticks without conform jump 2 (receipt 3ac586e9's FAIL shape).
+    for( const bool conform : { true, false } )
+    {
+        playback_native_pace::NativePaceGuard guard;
+        guard.reset();
+        PlaybackSourceAdvanceTracker tracker;
+        double position = 0.0, nowMs = 0.0;
+        tracker.notePresented( 0.0, 0, 0, 0, 2859 );
+        int lastPresented = 0, lateTicks = 0;
+        for( int t = 1; position < 1499.0 && t < 40000; ++t )
+        {
+            const double tickMs = ( t % 97 == 0 ) ? 50.0 + ( ( t / 97 ) % 33 ) : 8.0;
+            if( tickMs > 8.0 ) ++lateTicks;
+            nowMs += tickMs;
+            const double granted = guard.grant( 24.0 * tickMs / 1000.0, nowMs, 24.0 );
+            if( t == 1 ) guard.notePresent( nowMs, 24.0 );
+            const playback_frame_range::DropFrameTickResult tick = playback_frame_range::advanceDropFrameTick(
+                position, playback_frame_range::conformDropFrameDelta( position, granted, conform ), 1, 2860, false );
+            position = tick.position;
+            const int presented = static_cast<int>( position );
+            if( presented != lastPresented )
+            {
+                tracker.notePresented( nowMs / 1000.0, presented, 0, 0, 2859 );
+                lastPresented = presented;
+            }
+        }
+        ASSERT_TRUE( lateTicks > 10 );
+        if( conform )
+        {
+            ASSERT_EQ( 1, tracker.maxJump() );
+            ASSERT_EQ( static_cast<uint64_t>( tracker.advancedFrames() + 1 ), tracker.presented() );
+        }
+        else
+        {
+            ASSERT_EQ( 2, tracker.maxJump() );
+        }
+    }
+}
+
+namespace
+{
+struct ConformPlayResult { int maxJump = 0; double reachedMs = -1.0; int64_t consumedAt64998 = 0; double sourceFps = 0.0; };
+
+// r24 adversary A1 on 9b900412: the engine as MainWindow runs it -- the pace guard at 24 fps with the first-tick notePresent, the
+// drop-frame tick through the STATEFUL conform delta (the debt it carries), the source-frame counter and the conform tracker --
+// over cut 1..2860 of a 59.94 clip, Loop off, until frame 1498 (1499 required source frames) is reached.
+ConformPlayResult playConformedTicks( const std::function<double( int )> & tickAt, bool conformActive, int cutOut );
+
+ConformPlayResult playConformed( int lateEvery, double lateMs, bool conformActive )
+{
+    return playConformedTicks( [=]( int t ) { return ( t % lateEvery == 0 ) ? lateMs : 8.0; }, conformActive, 2860 );
+}
+
+// r25 adversary A1 on 205b54cc: the same engine with an arbitrary tick-length pattern \a tickAt( t ) and cut 1..\a cutOut.
+ConformPlayResult playConformedTicks( const std::function<double( int )> & tickAt, bool conformActive, int cutOut )
+{
+    playback_native_pace::NativePaceGuard guard;
+    guard.reset();
+    PlaybackSourceAdvanceTracker tracker;
+    playback_frame_range::SourceFrameAdvanceCounter counter;
+    counter.begin( 0 );
+    tracker.notePresented( 0.0, 0, 0, 0, 2859 );
+    double position = 0.0, nowMs = 0.0, debt = 0.0;
+    int lastPresented = 0;
+    ConformPlayResult r;
+    for( int t = 1; t < 100000 && r.reachedMs < 0.0; ++t )
+    {
+        const double tickMs = tickAt( t );
+        nowMs += tickMs;
+        const double granted = guard.grant( 24.0 * tickMs / 1000.0, nowMs, 24.0 );
+        if( t == 1 ) guard.notePresent( nowMs, 24.0 );
+        const double before = position;
+        const playback_frame_range::DropFrameTickResult tick = playback_frame_range::advanceDropFrameTick(
+            position, playback_frame_range::conformDropFrameDelta( position, granted, conformActive, debt ), 1, cutOut, false );
+        position = tick.position;
+        counter.noteEngineTick( before, position, tick.wrapped );
+        if( nowMs <= 64998.0 ) r.consumedAt64998 = counter.consumed();
+        const int presented = static_cast<int>( position );
+        if( presented != lastPresented )
+        {
+            tracker.notePresented( nowMs / 1000.0, presented, 0, 0, 2859 );
+            lastPresented = presented;
+        }
+        if( presented >= 1498 ) r.reachedMs = nowMs;
+    }
+    r.maxJump = tracker.maxJump();
+    r.sourceFps = tracker.sourceFps();
+    return r;
+}
+} // namespace
+
+TEST( PlaybackConformDropFrame, R24A1HeldCatchupIsRepaidSoTheConformedSourcePaceStaysInTheBand )
+{
+    // adversary A1's literal input: tickMs = (t % 48 == 0) ? 66 : 8 at a 24 fps guard. 9b900412 dropped the whole frame each held
+    // tick never repaid it: frame 1498 at 66002 ms, 22.696 source fps, 1474 of 1499 consumed at 64998 ms. The held frame is now a
+    // debt repaid by later ticks, one presented frame at a time, so the pace stays native and no presented jump exceeds 1.
+    const ConformPlayResult held = playConformed( 48, 66.0, true );
+    ASSERT_EQ( 1, held.maxJump );
+    ASSERT_TRUE( held.reachedMs > 0.0 );
+    ASSERT_TRUE( held.reachedMs <= 62500.0 );                 // 1498 frames at 24 fps is 62417 ms; the grants alone reach it at 62418 ms
+    ASSERT_TRUE( held.consumedAt64998 >= int64_t( 1499 ) );   // the required source frames inside the 65000 ms safety
+    ASSERT_TRUE( held.sourceFps >= 23.28 && held.sourceFps <= 24.72 );   // the committed conform band
+    // the same ticks without conform keep the old skip (jump 2) and the same pace: the repayment only re-times the frames
+    const ConformPlayResult plain = playConformed( 48, 66.0, false );
+    ASSERT_EQ( 2, plain.maxJump );
+    ASSERT_NEAR( plain.reachedMs, held.reachedMs, 100.0 );
+    // other late-tick cadences and lengths below a whole-period stall: still every frame, still in the band
+    for( const int every : { 5, 13, 48, 97 } )
+        for( const double lateMs : { 50.0, 66.0, 82.0 } )
+        {
+            const ConformPlayResult r = playConformed( every, lateMs, true );
+            ASSERT_EQ( 1, r.maxJump );
+            ASSERT_TRUE( r.sourceFps >= 23.28 && r.sourceFps <= 24.72 );
+        }
+}
+
+TEST( PlaybackConformDropFrame, R25A1ABurstOfSubStallLateTicksNeverLosesAPaidFrame )
+{
+    // adversary A1 on 205b54cc, its literal input: cut 1..1667 of a 59.94 clip conformed to 24 fps, Drop Frame, Loop off,
+    // tickMs = (t % 48 >= 42) ? 66 : 8 -- six consecutive late ticks, each granted 1.584 < 2 (never a real stall). On
+    // 205b54cc the debt reached 3 at tick 45 and the cap of 2 discarded a granted frame: frame 1498 at 68252 ms,
+    // 21.948 source fps, 1425 of 1499 consumed at 64998 ms. The backlog is now carried (and repaid one frame per tick).
+    const auto burst = []( int t ) { return ( t % 48 >= 42 ) ? 66.0 : 8.0; };
+    const ConformPlayResult r = playConformedTicks( burst, true, 1667 );
+    ASSERT_TRUE( r.consumedAt64998 >= int64_t( 1499 ) );    // the required source frames inside the 65000 ms safety
+    ASSERT_TRUE( r.reachedMs <= 62500.0 );                    // 1498 frames at 24 fps is 62417 ms
+    ASSERT_TRUE( r.sourceFps >= 23.28 && r.sourceFps <= 24.72 );
+    ASSERT_EQ( 1, r.maxJump );
+    // the class, not the instance: longer runs of sub-stall late ticks keep the pace, and every frame while the backlog
+    // fits kConformMaxDebtFrames
+    for( const int run : { 2, 4, 6, 8 } )
+        for( const double lateMs : { 50.0, 66.0, 82.0 } )
+        {
+            const ConformPlayResult b = playConformedTicks(
+                [=]( int t ) { return ( t % 48 >= 48 - run ) ? lateMs : 8.0; }, true, 1667 );
+            ASSERT_TRUE( b.consumedAt64998 >= int64_t( 1499 ) );
+            ASSERT_TRUE( b.sourceFps >= 23.28 && b.sourceFps <= 24.72 );
+        }
+}
+
+TEST( PlaybackConformDropFrame, R26ALoneGuiLateTickOnAQuietHostPresentsTheNextFrame )
+{
+    // HFR-NATIVE-60FPS-FULLRES-1 r26: the r24 conform judge FAILED on a QUIET leg (01-m16-1457-conform-windowed-s1-cuda,
+    // receipt ecca9f02-31e1-4ba4-ae37-82165559bd40): conformMaxJump 2. ONE GUI-late tick (max_interval_ms 125.899 at
+    // frame 673, cls_gui_late=1) was granted about 3 frames, reached 1 + kConformStallDebtFrames, and took the real-stall
+    // skip. Its tick shape on the engine: 8 ms polls at a 24 fps guard (frame 673 at about tick 3505), one 125.899 ms tick.
+    const auto lone = []( int t ) { return t == 3505 ? 125.899 : 8.0; };
+    const ConformPlayResult r = playConformedTicks( lone, true, 2860 );
+    ASSERT_EQ( 1, r.maxJump );
+    ASSERT_TRUE( r.consumedAt64998 >= int64_t( 1499 ) );
+    ASSERT_TRUE( r.sourceFps >= 23.28 && r.sourceFps <= 24.72 );
+    // the class, not the instance: one late tick of 2 up to 9 periods (its backlog fits kConformMaxDebtFrames), anywhere in
+    // the clip, presents the next frame and repays the rest on the following ticks
+    for( const int at : { 2, 700, 3505, 5001 } )
+        for( const double lateMs : { 84.0, 88.9, 125.899, 200.0, 333.0, 370.0 } )
+        {
+            const ConformPlayResult one = playConformedTicks( [=]( int t ) { return t == at ? lateMs : 8.0; }, true, 2860 );
+            ASSERT_EQ( 1, one.maxJump );
+            ASSERT_TRUE( one.consumedAt64998 >= int64_t( 1499 ) );
+        }
+    // the tick itself, from frame 672.8: the grant of 3.0216 presents 673 and every granted frame is carried, none lost
+    double debt = 0.0;
+    const double delta = playback_frame_range::conformDropFrameDelta( 672.8, 3.0216, true, debt );
+    ASSERT_EQ( 673, static_cast<int>( 672.8 + delta ) );
+    ASSERT_NEAR( 672.8 + 3.0216, 672.8 + delta + debt, 1e-9 );
+    // and the stateless form (no debt carried) presents the next frame too
+    ASSERT_EQ( 1, conformDropTickTransition( 672.8, 3.0216, true ) );
+}
+
+namespace
+{
+// r27 (adversary A1 on be20bc59): the same engine with a RENDERER. playConformedTicks presents every new target on the tick
+// that set it; here a target is presented only \a presentLatencyMs after it became the engine's target (floor of the
+// position), checked before each tick (sol's interleaving: a present due after the next timer tick lands after it). A
+// target the engine moves past before then is pruned and never presented (prunePlaybackLookaheadOutsideForwardWindow,
+// drawFrameReady's drop_lookahead). The conformed tick is told whether its current target has been presented
+// (MainWindow: m_lastPresentedPlaybackFrame, set when drawFrameReady accepts a frame). Frame 0 is presented at Play.
+// r27 fix iteration 1 (adversary A1 on d98be193): \a invalidateAt is the tick on which the app invalidates the presentation
+// (invalidatePlaybackPrepForDisplayChange: Drop Frame toggle, display change). It clears the last presented frame to -1 and the
+// renderer is left idle: timerFrameEvent's duplicate-draw suppression never re-requests the current target, so its present
+// never comes. Only a NEW target is rendered and presented. \a maxPresentGapMs is the longest wall time between two presents.
+// r28: \a cancelledPresents counts the presents the invalidation cancelled (the target's render was still in flight, so that
+// frame is never presented), and \a conformGate false runs the same play with the r26 engine (targetPresented always true),
+// the baseline that tells a frame the invalidation itself loses from one the gate loses.
+ConformPlayResult playConformedTicksWithRenderer( const std::function<double( int )> & tickAt, double presentLatencyMs,
+                                                  int cutOut, double * maxDebt = nullptr, int invalidateAt = -1,
+                                                  double * maxPresentGapMs = nullptr, int * cancelledPresents = nullptr,
+                                                  bool conformGate = true )
+{
+    playback_native_pace::NativePaceGuard guard;
+    guard.reset();
+    PlaybackSourceAdvanceTracker tracker;
+    playback_frame_range::SourceFrameAdvanceCounter counter;
+    counter.begin( 0 );
+    tracker.notePresented( 0.0, 0, 0, 0, 2859 );
+    double position = 0.0, nowMs = 0.0, debt = 0.0, targetSinceMs = 0.0, lastPresentMs = 0.0;
+    int target = 0, lastPresented = 0;
+    bool presentCancelled = false;
+    if( maxDebt ) *maxDebt = 0.0;
+    if( maxPresentGapMs ) *maxPresentGapMs = 0.0;
+    const auto present = [&]( int frame )
+    {
+        tracker.notePresented( nowMs / 1000.0, frame, 0, 0, 2859 );
+        lastPresented = frame;
+        // past the start (frame 1 lands one period plus the latency after Play's frame 0)
+        if( maxPresentGapMs && nowMs > 200.0 && nowMs - lastPresentMs > *maxPresentGapMs ) *maxPresentGapMs = nowMs - lastPresentMs;
+        lastPresentMs = nowMs;
+    };
+    ConformPlayResult r;
+    for( int t = 1; t < 100000 && r.reachedMs < 0.0; ++t )
+    {
+        const double tickMs = tickAt( t );
+        nowMs += tickMs;
+        if( t == invalidateAt )
+        {
+            if( cancelledPresents && target != lastPresented ) ++*cancelledPresents;
+            lastPresented = -1;
+            presentCancelled = true;
+        }
+        if( !presentCancelled && target != lastPresented && nowMs - targetSinceMs >= presentLatencyMs ) present( target );
+        const double granted = guard.grant( 24.0 * tickMs / 1000.0, nowMs, 24.0 );
+        if( t == 1 ) guard.notePresent( nowMs, 24.0 );
+        const double before = position;
+        const bool presentOutstanding = !presentCancelled && target != lastPresented;
+        const playback_frame_range::DropFrameTickResult tick = playback_frame_range::advanceDropFrameTick(
+            position,
+            playback_frame_range::conformDropFrameDelta(
+                position, granted, true, debt,
+                !conformGate || playback_frame_range::conformTargetPresented( lastPresented, position, presentOutstanding ) ),
+            1, cutOut, false );
+        position = tick.position;
+        if( maxDebt && debt > *maxDebt ) *maxDebt = debt;
+        counter.noteEngineTick( before, position, tick.wrapped );
+        if( nowMs <= 64998.0 ) r.consumedAt64998 = counter.consumed();
+        if( static_cast<int>( position ) != target )
+        {
+            target = static_cast<int>( position );
+            targetSinceMs = nowMs;
+            presentCancelled = false;
+            if( presentLatencyMs <= 0.0 ) present( target );
+        }
+        if( position >= 1498.0 ) r.reachedMs = nowMs;
+    }
+    r.maxJump = tracker.maxJump();
+    r.sourceFps = tracker.sourceFps();
+    return r;
+}
+} // namespace
+
+TEST( PlaybackConformDropFrame, R27A1ACarriedDebtIsRepaidOnlyAsTheRendererPresents )
+{
+    // adversary A1 on be20bc59, its literal input: a 59.94 clip conformed to 24, Drop Frame, Loop off, cut 1..1667. One
+    // 125 ms tick from about 99.8 grants 3: 100 is the target with a debt of 2. Each later 8 ms tick asked for its grant plus
+    // the debt, so the engine advanced one integer per tick while the renderer was still presenting: 101.992 (debt 1), then
+    // 102.184 before 101's queued present landed. 101 was pruned and the presented frames went 100 -> 102. A conformed tick now
+    // never moves past a target the renderer has not presented; the share that would cross is carried as debt.
+    double debt = 1.0;
+    // sol's second tick: 101 is the target and not yet presented -- the engine holds it and carries the whole grant
+    const double held = playback_frame_range::conformDropFrameDelta( 101.992, 0.192, true, debt, false );
+    ASSERT_EQ( 101, static_cast<int>( 101.992 + held ) );
+    ASSERT_NEAR( 101.992 + 0.192 + 1.0, 101.992 + held + debt, 1e-9 );
+    // once 101 is presented the debt is repaid one frame at a time: 102, with the landing's phase
+    const double repaid = playback_frame_range::conformDropFrameDelta( 101.992 + held, 0.192, true, debt, true );
+    ASSERT_EQ( 102, static_cast<int>( 101.992 + held + repaid ) );
+    ASSERT_NEAR( 101.992 + 0.384 + 1.0, 101.992 + held + repaid + debt, 1e-9 );
+    // a tick that crosses no integer is the grant bit for bit, presented or not, and keeps the debt
+    debt = 2.0;
+    ASSERT_TRUE( sameBits( 0.192, playback_frame_range::conformDropFrameDelta( 100.8, 0.192, true, debt, false ) ) );
+    ASSERT_NEAR( 2.0, debt, 1e-12 );
+    // without conform the presented state changes nothing
+    for( const bool presented : { false, true } )
+    {
+        double none = 0.0;
+        ASSERT_TRUE( sameBits( 1.584, playback_frame_range::conformDropFrameDelta( 1152.8, 1.584, false, none, presented ) ) );
+    }
+
+    // the whole play: the lone late tick comes near 99.8, at tick 521 (0.192 a tick), and the renderer presents 10 ms after
+    // its target -- after the next 8 ms timer tick, as in sol's interleaving
+    const ConformPlayResult sol = playConformedTicksWithRenderer( []( int t ) { return t == 521 ? 125.0 : 8.0; }, 10.0, 1667 );
+    ASSERT_EQ( 1, sol.maxJump );
+    ASSERT_TRUE( sol.consumedAt64998 >= int64_t( 1499 ) );
+    ASSERT_TRUE( sol.sourceFps >= 23.28 && sol.sourceFps <= 24.72 );
+    // the class: a renderer that keeps up (present latency + one tick under the 41.7 ms period) shows every frame after any
+    // lone late tick whose backlog fits kConformMaxDebtFrames, and after a burst of late ticks, at the guard's pace
+    for( const double latency : { 0.0, 9.0, 10.0, 16.0, 20.0, 25.0 } )
+    {
+        for( const int at : { 2, 521, 700, 3505 } )
+            for( const double lateMs : { 84.0, 125.899, 200.0, 333.0 } )
+            {
+                double maxDebt = 0.0;
+                const ConformPlayResult one = playConformedTicksWithRenderer(
+                    [=]( int t ) { return t == at ? lateMs : 8.0; }, latency, 1667, &maxDebt );
+                ASSERT_EQ( 1, one.maxJump );
+                ASSERT_TRUE( one.consumedAt64998 >= int64_t( 1499 ) );
+                ASSERT_TRUE( one.sourceFps >= 23.28 && one.sourceFps <= 24.72 );
+                ASSERT_TRUE( maxDebt <= playback_frame_range::kConformMaxDebtFrames + 1e-9 );
+            }
+        // the r25 burst (six 66 ms ticks every 48): presents land on tick boundaries, so a latency of L shows one frame per
+        // ceil(L / 8) * 8 ms between bursts and one per 66 ms tick inside them. Up to 20 ms that is at least 20 frames per
+        // 732 ms cycle against the 17.57 it asks for; at 25 ms it is 16.5, a renderer that cannot keep up (below)
+        double burstDebt = 0.0;
+        const ConformPlayResult burst = playConformedTicksWithRenderer(
+            []( int t ) { return ( t % 48 >= 42 ) ? 66.0 : 8.0; }, latency, 1667, &burstDebt );
+        if( latency <= 20.0 ) ASSERT_EQ( 1, burst.maxJump );
+        ASSERT_TRUE( burst.consumedAt64998 >= int64_t( 1499 ) );
+        ASSERT_TRUE( burst.sourceFps >= 23.28 && burst.sourceFps <= 24.72 );
+        ASSERT_TRUE( burstDebt <= playback_frame_range::kConformMaxDebtFrames + 1e-9 );
+    }
+    // a renderer SLOWER than the period cannot show every frame: the backlog reaches the cap and the frames beyond it are
+    // skipped (stall evidence, never a conform PASS), but the timeline keeps the guard's pace and the debt stays bounded.
+    // r28 (hosted Tests 42428105872, :3508): the stall evidence is the presented pace, not a jump. This renderer restarts on
+    // every new target (a target moved past is pruned), so once the backlog sits at the cap each skip moves the target on
+    // every period, before its 60 ms present can land: presentation stops at about frame 930 (14.83 presented source fps
+    // over the play) while the engine reaches 1498 at the guard's pace. The tracker never sees a jump (maxJump 1), and the
+    // conform judge reads the pace below the band, a FAIL.
+    double slowDebt = 0.0;
+    const ConformPlayResult slow = playConformedTicksWithRenderer( []( int ) { return 8.0; }, 60.0, 1667, &slowDebt );
+    ASSERT_TRUE( slow.sourceFps < 23.28 );   // never a conform PASS
+    ASSERT_TRUE( slow.consumedAt64998 >= int64_t( 1499 ) );
+    ASSERT_NEAR( playback_frame_range::kConformMaxDebtFrames, slowDebt, 1e-9 );   // the backlog reached the cap, and no further
+}
+
+TEST( PlaybackConformDropFrame, R27A1bAnInvalidatedPresentWithAnIdleRendererNeverHoldsTheEngine )
+{
+    // adversary A1 on d98be193, its literal input: a 59.94 clip conformed to 24, Loop off, cut 1..1667, at frame 100 with frame
+    // 100 presented and the renderer idle. Drop Frame Mode is switched on: invalidatePlaybackPrepForDisplayChange clears
+    // m_lastPresentedPlaybackFrame to -1, and timerFrameEvent never re-draws 100 (lastDrawnPlaybackPosition is still 100).
+    // d98be193's gate (presented == target) then held target 100 with no present coming: the first new draw came 376 ms later
+    // at 101.024 with a debt of 8. The engine holds only while a present of its target is outstanding.
+    ASSERT_TRUE( playback_frame_range::conformTargetPresented( -1, 100.4, false ) );   // nothing coming: never held
+    ASSERT_FALSE( playback_frame_range::conformTargetPresented( -1, 100.4, true ) );   // its present is coming: held
+    ASSERT_TRUE( playback_frame_range::conformTargetPresented( 100, 100.4, true ) );    // presented
+    ASSERT_FALSE( playback_frame_range::conformTargetPresented( 100, 101.2, true ) );   // r27 A1 on be20bc59: 101 is queued
+    // the whole play: the invalidation lands near frame 100 (tick 521, 0.192 a tick), renderer latency 10 ms
+    // r28 (hosted Tests 42428105872, :3531): at 524/20, 700/10 and 700/20 the invalidation lands while the target's render is
+    // still in flight. It cancels that render (cancelPlaybackPresentationRequests), and duplicate-draw suppression never
+    // re-requests the target, so that one frame is never presented: maxJump 2, gap 88 ms. The engine without the gate (r26)
+    // loses the same frame. The gate adds no skip and no hold: every frame is shown when nothing was cancelled, and exactly
+    // the cancelled frame is lost otherwise.
+    int cancelledCases = 0;
+    for( const int at : { 2, 521, 524, 700, 3505 } )
+        for( const double latency : { 0.0, 10.0, 20.0 } )
+        {
+            double maxDebt = 0.0, maxGap = 0.0, baseDebt = 0.0, baseGap = 0.0;
+            int cancelled = 0, baseCancelled = 0;
+            const ConformPlayResult r = playConformedTicksWithRenderer(
+                []( int ) { return 8.0; }, latency, 1667, &maxDebt, at, &maxGap, &cancelled );
+            const ConformPlayResult base = playConformedTicksWithRenderer(
+                []( int ) { return 8.0; }, latency, 1667, &baseDebt, at, &baseGap, &baseCancelled, false );
+            ASSERT_TRUE( cancelled == 0 || cancelled == 1 );
+            ASSERT_EQ( baseCancelled, cancelled );
+            cancelledCases += cancelled;
+            ASSERT_EQ( 1 + cancelled, r.maxJump );       // every frame, or exactly the one the invalidation cancelled
+            ASSERT_EQ( base.maxJump, r.maxJump );        // and the r26 engine loses the same
+            ASSERT_TRUE( maxDebt < 1.0 );                // d98be193: the cap, 8
+            ASSERT_TRUE( maxGap <= 70.0 + cancelled * 41.7 );   // one period, a tick and the latency (+ the cancelled frame's
+                                                                // period); d98be193: about 376 ms
+            ASSERT_TRUE( maxGap <= baseGap + 1e-9 );
+            ASSERT_TRUE( r.consumedAt64998 >= int64_t( 1499 ) );
+            ASSERT_TRUE( r.sourceFps >= 23.28 && r.sourceFps <= 24.72 );
+        }
+    ASSERT_EQ( 3, cancelledCases );   // 524/20, 700/10, 700/20; the literal input (521: 100 presented, renderer idle) is not one
+}
+
+TEST( PlaybackConformDropFrame, R24A1TheCarriedDebtIsBoundedAndClearedWithoutConform )
+{
+    // a held tick carries the whole frame it did not present; the next ordinary tick repays it as a one-frame step
+    double debt = 0.0;
+    const double held = playback_frame_range::conformDropFrameDelta( 1152.8, 1.584, true, debt );
+    ASSERT_NEAR( 1153.384, 1152.8 + held, 1e-9 );
+    ASSERT_NEAR( 1.0, debt, 1e-9 );
+    const double repaid = playback_frame_range::conformDropFrameDelta( 1153.384, 0.192, true, debt );
+    ASSERT_EQ( 1154, static_cast<int>( 1153.384 + repaid ) );
+    ASSERT_NEAR( 1154.576, 1153.384 + repaid, 1e-9 );
+    ASSERT_NEAR( 0.0, debt, 1e-12 );
+    // r25 adversary A1 on 205b54cc: the debt never exceeds kConformMaxDebtFrames, and the cap never DISCARDS a granted frame.
+    // A renderer that is always late (1.9 frames granted every tick) keeps the guard's pace: the position travels exactly
+    // what was granted (less the debt still carried), presenting the next frame while the backlog fits the cap and skipping
+    // only the frames beyond it -- the documented drop-frame catch-up, which is stall evidence, never a conform PASS.
+    debt = 0.0;
+    double position = 100.8;
+    double grantedTotal = 0.0;
+    int skips = 0;
+    for( int t = 0; t < 200; ++t )
+    {
+        const double delta = playback_frame_range::conformDropFrameDelta( position, 1.9, true, debt );
+        if( static_cast<int>( position + delta ) - static_cast<int>( position ) > 1 ) ++skips;
+        position += delta;
+        grantedTotal += 1.9;
+        ASSERT_TRUE( debt <= playback_frame_range::kConformMaxDebtFrames + 1e-9 );
+        ASSERT_NEAR( 100.8 + grantedTotal, position + debt, 1e-6 );
+    }
+    ASSERT_TRUE( skips > 0 );
+    // without conform the debt is cleared and the grant is returned bit for bit
+    const double g = 1.584;
+    ASSERT_TRUE( sameBits( g, playback_frame_range::conformDropFrameDelta( 1152.8, g, false, debt ) ) );
+    ASSERT_EQ( 0.0, debt );
+    // with no debt the stateful form is the stateless one, bit for bit
+    for( const double granted : { 0.192, 1.0, 1.2, 1.584, 1.999, 2.0, 2.13 } )
+    {
+        double none = 0.0;
+        ASSERT_TRUE( sameBits( playback_frame_range::conformDropFrameDelta( 1152.8, granted, true ),
+                               playback_frame_range::conformDropFrameDelta( 1152.8, granted, true, none ) ) );
+    }
 }

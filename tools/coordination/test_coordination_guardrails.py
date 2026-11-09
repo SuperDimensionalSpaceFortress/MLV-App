@@ -1077,6 +1077,572 @@ def test_invoke_lane_error_mode_pin_catches_each_launch_ahead_of_the_block(tmp_p
     assert false_alarms == {}, "a comment, a string or a function definition is not a launch"
 
 
+# --- LANE-CHILD-LOADER-DIALOG-CODEX-SANDBOX-1: the codex lane's children must find the MinGW runtime DLLs ----------
+# MEASURED 2026-11-06 (System log, source 'Application Popup'): green2.exe 09:56:51Z and red.exe 09:57:28Z raised "libstdc++-6.dll / libgcc_s_seh-1.dll was
+# not found" on the owner's desktop AFTER the error-mode fix above merged. The codex sandbox's spawn does not carry that mode to the commands it runs, so the
+# mode cannot be the only defence. The lane's environment now also ends in the MinGW bin directory, so a MinGW-built exe finds its DLLs and never reaches the
+# loader failure that raises the box. The seam is Add-CodexLaneRuntimePath, extracted from the script text; nothing here starts codex or an exe without DLLs.
+_CODEX_RUNTIME_PATH_PWSH = shutil.which("pwsh")
+codex_runtime_path_only = pytest.mark.skipif(
+    sys.platform != "win32" or _CODEX_RUNTIME_PATH_PWSH is None,
+    reason="the function admits only Windows fully qualified directories (X:\\... or \\\\server\\...) and needs pwsh to run",
+)
+
+
+def _ps_quote(value):
+    """A value inside a PowerShell single-quoted literal."""
+    return str(value).replace("'", "''")
+
+
+def _free_drive_letter():
+    for letter in "ZYXWVUTSRQPONMLKJIHGFED":
+        if not os.path.exists(f"{letter}:\\"):
+            return letter
+    pytest.skip("no unused drive letter to stand in for a retired toolchain drive")
+
+
+def _codex_runtime_path_run(tmp_path, call, env=None, cwd=None):
+    """Extract Add-CodexLaneRuntimePath from Invoke-Lane.ps1 by AST, run `call` against a fresh ProcessStartInfo, print its PATH= line."""
+    driver = tmp_path / "driver.ps1"
+    driver.write_text(
+        "param([string]$Script)\n"
+        "$ErrorActionPreference = 'Stop'\n"
+        "[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)\n"  # a U+00AD in PATH must round-trip to the assertion
+        "$tokens = $null; $errors = $null\n"
+        "$ast = [System.Management.Automation.Language.Parser]::ParseFile($Script, [ref]$tokens, [ref]$errors)\n"
+        "$fn = @($ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq 'Add-CodexLaneRuntimePath' }, $true))\n"
+        "if ($fn.Count -ne 1) { Write-Output 'MISSING-FUNCTION'; exit 3 }\n"
+        ". ([scriptblock]::Create($fn[0].Extent.Text))\n"
+        "$psi = [System.Diagnostics.ProcessStartInfo]::new()\n"
+        + call
+        + "\n'PATH=' + [string]$psi.Environment['PATH']\n",
+        encoding="utf-8-sig",  # a non-ASCII tmp_path (an accented profile name) must not break the harness
+    )
+    return subprocess.run(
+        [_CODEX_RUNTIME_PATH_PWSH, "-NoProfile", "-NonInteractive", "-File", str(driver), str(LANE_RUNNER)],
+        text=True, encoding="utf-8", capture_output=True, timeout=120, env=env, cwd=cwd,
+    )
+
+
+def _codex_runtime_path_field(done, name):
+    assert done.returncode == 0, f"probe failed: {done.stdout!r} {done.stderr!r}"
+    m = re.search(rf"^{name}=(.*)$", done.stdout, re.M)
+    assert m, f"no {name}= line: {done.stdout!r}"
+    return m.group(1).strip(" \t\r\n")  # NOT .strip(): that also removes U+00A0, which a path may legally end in (adversary A1 on 6a05d587)
+
+
+@codex_runtime_path_only
+def test_codex_lane_environment_ends_in_the_mingw_bin_directory(tmp_path):
+    mingw = tmp_path / "mingw" / "bin"
+    mingw.mkdir(parents=True)
+    done = _codex_runtime_path_run(
+        tmp_path,
+        "$psi.Environment['PATH'] = 'C:\\first;C:\\second'\n"
+        f"[void](Add-CodexLaneRuntimePath -Psi $psi -Candidates @('{_ps_quote(mingw)}'))",
+    )
+    path = _codex_runtime_path_field(done, "PATH")
+    # APPENDED: tools already on PATH (git, python, pwsh) keep resolving to what they resolved to before.
+    assert path == f"C:\\first;C:\\second;{mingw}", path
+
+
+@codex_runtime_path_only
+def test_codex_lane_runtime_path_appends_a_missing_directory_once_and_never_duplicates(tmp_path):
+    # r3 (hub ruling): the existence lookup is gone. A missing directory on PATH is harmless (the loader skips it), and the lookup was the source of 12
+    # introduced findings across r1/r2. So a candidate is appended whether or not it exists, once, and never when an equivalent spelling is already there.
+    present = tmp_path / "bin"
+    present.mkdir()
+    absent = tmp_path / "no-such-dir"
+    # The drive letter is the one part of a path whose case never matters, so it is the one part that is folded (adversary A1 on ff7ec6c5: C:\case may be
+    # a case-sensitive directory); everything after it is compared exactly.
+    inherited = str(present)[0].swapcase() + str(present)[1:] + "\\"
+    done = _codex_runtime_path_run(
+        tmp_path,
+        f"$psi.Environment['PATH'] = 'C:\\first;' + '{_ps_quote(inherited)}'\n"
+        f"[void](Add-CodexLaneRuntimePath -Psi $psi -Candidates @('{_ps_quote(absent)}', '{_ps_quote(present)}', '{_ps_quote(present)}', '{_ps_quote(absent)}'))",
+    )
+    path = _codex_runtime_path_field(done, "PATH")
+    # `present` is already there under another drive-letter case and a trailing backslash: not added again. `absent` is added once although it does not exist.
+    assert path == f"C:\\first;{inherited};{absent}", path
+
+
+@codex_runtime_path_only
+def test_codex_lane_runtime_path_builds_a_path_when_the_environment_has_none(tmp_path):
+    present = tmp_path / "bin"
+    present.mkdir()
+    done = _codex_runtime_path_run(
+        tmp_path,
+        "[void]$psi.Environment.Remove('PATH')\n"
+        f"[void](Add-CodexLaneRuntimePath -Psi $psi -Candidates @('{_ps_quote(present)}'))",
+    )
+    assert _codex_runtime_path_field(done, "PATH") == str(present)
+
+
+@codex_runtime_path_only
+def test_codex_lane_runtime_path_default_candidates_include_mingw_root_bin(tmp_path):
+    root = tmp_path / "toolchain"
+    (root / "bin").mkdir(parents=True)
+    env = {**os.environ, "MINGW_ROOT": str(root)}
+    done = _codex_runtime_path_run(
+        tmp_path,
+        "$psi.Environment['PATH'] = 'C:\\first'\n[void](Add-CodexLaneRuntimePath -Psi $psi)",
+        env=env,
+    )
+    path = _codex_runtime_path_field(done, "PATH")
+    assert path.split(";")[:2] == ["C:\\first", str(root / "bin")], path
+
+
+@codex_runtime_path_only
+def test_codex_lane_runtime_path_survives_a_mingw_root_on_an_absent_drive(tmp_path):
+    # Adversary A1 on 6372cc4e: Join-Path threw DriveNotFound for a drive that is gone, which failed the whole lane before codex started. r3: there is no
+    # filesystem call at all, so a retired MINGW_ROOT drive costs nothing: no error, no wait, and the candidate is appended like any other.
+    drive = _free_drive_letter()
+    env = {**os.environ, "MINGW_ROOT": f"{drive}:\\retired-toolchain"}
+    done = _codex_runtime_path_run(
+        tmp_path,
+        "$psi.Environment['PATH'] = 'C:\\first'\n$sw = [System.Diagnostics.Stopwatch]::StartNew()\n"
+        "[void](Add-CodexLaneRuntimePath -Psi $psi)\n'ELAPSED_MS=' + [int]$sw.ElapsedMilliseconds",
+        env=env,
+    )
+    path = _codex_runtime_path_field(done, "PATH")
+    assert path.split(";")[:2] == ["C:\\first", f"{drive}:\\retired-toolchain\\bin"], path
+    assert int(_codex_runtime_path_field(done, "ELAPSED_MS")) < 1000, done.stdout
+
+
+@codex_runtime_path_only
+def test_codex_lane_runtime_path_never_adds_a_relative_directory(tmp_path):
+    # Adversary A2 on 6372cc4e: Test-Path judged a relative candidate from the launcher's cwd, but a relative PATH entry is searched from the CHILD's
+    # cwd (the lane's WorkDir), where the DLLs are not. A directory is added only when it is fully qualified.
+    (tmp_path / "mingw" / "bin").mkdir(parents=True)
+    done = _codex_runtime_path_run(
+        tmp_path,
+        "$psi.Environment['PATH'] = 'C:\\first'\n[void](Add-CodexLaneRuntimePath -Psi $psi -Candidates @('mingw\\bin', '.\\mingw\\bin', '\\Windows'))",
+        cwd=str(tmp_path),
+    )
+    assert _codex_runtime_path_field(done, "PATH") == "C:\\first"
+    env = {**os.environ, "MINGW_ROOT": "mingw"}
+    done = _codex_runtime_path_run(
+        tmp_path, "$psi.Environment['PATH'] = 'C:\\first'\n[void](Add-CodexLaneRuntimePath -Psi $psi)", env=env, cwd=str(tmp_path),
+    )
+    path = _codex_runtime_path_field(done, "PATH")
+    assert "mingw" not in path.replace("mingw1310_64", ""), path
+
+
+@codex_runtime_path_only
+def test_codex_lane_runtime_path_never_adds_a_directory_that_would_split_into_two_entries(tmp_path):
+    # Adversary A1 on e284b182: a directory whose own name holds ';' (C:\toolchains;child\bin) was accepted, then serialized into PATH as
+    # C:\toolchains plus a relative child\bin. A name PATH cannot carry intact is skipped.
+    odd = tmp_path / "tool;chains" / "bin"
+    odd.mkdir(parents=True)
+    done = _codex_runtime_path_run(
+        tmp_path,
+        "$psi.Environment['PATH'] = 'C:\\first'\n"
+        f"[void](Add-CodexLaneRuntimePath -Psi $psi -Candidates @('{_ps_quote(odd)}'))",
+    )
+    assert _codex_runtime_path_field(done, "PATH") == "C:\\first"
+
+
+@codex_runtime_path_only
+def test_codex_lane_runtime_path_treats_slash_spellings_as_one_directory(tmp_path):
+    # Adversary A2 (advisory) on e284b182: C:/x/bin and C:\x\bin were both appended. The same directory is added once, and in its backslash spelling.
+    present = tmp_path / "bin"
+    present.mkdir()
+    forward = str(present).replace("\\", "/")
+    done = _codex_runtime_path_run(
+        tmp_path,
+        "$psi.Environment['PATH'] = 'C:\\first'\n"
+        f"[void](Add-CodexLaneRuntimePath -Psi $psi -Candidates @('{_ps_quote(forward)}', '{_ps_quote(present)}'))",
+    )
+    assert _codex_runtime_path_field(done, "PATH") == f"C:\\first;{present}"
+
+
+@codex_runtime_path_only
+def test_codex_lane_runtime_path_treats_slash_spellings_already_on_path_as_present(tmp_path):
+    # Adversary A2 on 56281b89: the candidate was normalised ('/' -> '\') but the EXISTING PATH entries were not, so PATH='C:/x/bin/' still got
+    # C:\x\bin appended. Both sides of the duplicate check use one normalisation.
+    present = tmp_path / "bin"
+    present.mkdir()
+    forward = str(present).replace("\\", "/")
+    start = f"C:\\first;{forward}/"
+    done = _codex_runtime_path_run(
+        tmp_path,
+        f"$psi.Environment['PATH'] = '{_ps_quote(start)}'\n"
+        f"[void](Add-CodexLaneRuntimePath -Psi $psi -Candidates @('{_ps_quote(present)}'))",
+    )
+    assert _codex_runtime_path_field(done, "PATH") == start
+
+
+@codex_runtime_path_only
+def test_codex_lane_runtime_path_skips_a_unc_directory_by_name(tmp_path):
+    # Adversary A1 on 56281b89: a UNC candidate (explicit, or through MINGW_ROOT) is never added. Kept from r1/r2; with the lookup gone it is skipped by name only.
+    done = _codex_runtime_path_run(
+        tmp_path,
+        "$psi.Environment['PATH'] = 'C:\\first'\n"
+        "[void](Add-CodexLaneRuntimePath -Psi $psi -Candidates @('\\\\blackhole-host\\share\\mingw\\bin'))",
+    )
+    assert _codex_runtime_path_field(done, "PATH") == "C:\\first"
+    env = {**os.environ, "MINGW_ROOT": "\\\\blackhole-host\\share\\mingw"}
+    done = _codex_runtime_path_run(tmp_path, "$psi.Environment['PATH'] = 'C:\\first'\n[void](Add-CodexLaneRuntimePath -Psi $psi)", env=env)
+    assert "blackhole-host" not in _codex_runtime_path_field(done, "PATH")
+
+
+@codex_runtime_path_only
+def test_codex_lane_runtime_path_adds_both_candidates_with_no_filesystem_call_and_no_budget(tmp_path):
+    # Adversary A2 on e370ba86: the lookup's budget bounded the wait, not the work (runspace start-up and normalisation sat outside it), so with -TimeoutSec 1
+    # elapsed reached 1180 ms and the next launch-budget guard threw. r3: nothing is looked up, so there is no work to budget. Candidates on a drive letter
+    # that does not exist (the stand-in for a dead mapped drive) are appended at once, both of them, and the function takes no budget parameter.
+    gone = _free_drive_letter()
+    done = _codex_runtime_path_run(
+        tmp_path,
+        "$psi.Environment['PATH'] = 'C:\\first'\n$sw = [System.Diagnostics.Stopwatch]::StartNew()\n"
+        f"$r = @(Add-CodexLaneRuntimePath -Psi $psi -Candidates @('{gone}:\\toolchain\\bin', '{gone}:\\other\\bin'))\n"
+        "'ADDED=' + $r.Count\n'ELAPSED_MS=' + [int]$sw.ElapsedMilliseconds",
+    )
+    assert _codex_runtime_path_field(done, "ADDED") == "2", done.stdout
+    assert _codex_runtime_path_field(done, "PATH") == f"C:\\first;{gone}:\\toolchain\\bin;{gone}:\\other\\bin"
+    assert int(_codex_runtime_path_field(done, "ELAPSED_MS")) < 1000, done.stdout
+
+
+def _add_codex_runtime_path_function_text():
+    body = LANE_RUNNER.read_text(encoding="utf-8").replace("\r\n", "\n")
+    start = body.index("function Add-CodexLaneRuntimePath {")
+    end = body.index("\n}\n", start) + 3
+    return body[start:end]
+
+
+def _strip_ps_comments(text):
+    return "\n".join(re.sub(r"(?<![`'\"])#.*$", "", line) for line in text.splitlines())
+
+
+def test_codex_lane_runtime_path_makes_no_filesystem_call_and_creates_no_thread():
+    # Adversary A2/A3 on e370ba86 and the hub ruling for r3: the function must not touch the filesystem (a lookup can block in SMB, behind a junction, on
+    # a dead mapped drive) and must not create a runspace or thread (an abandoned blocked one keeps the lane process alive: 4845 ms to EXIT). Source shape.
+    code = _strip_ps_comments(_add_codex_runtime_path_function_text())
+    banned = (
+        "RunspaceFactory", "[powershell]::Create", "BeginInvoke", "Start-Job", "Start-ThreadJob", "ForEach-Object -Parallel", "[System.Threading",
+        "DriveInfo", "Test-Path", "Get-Item", "Get-ChildItem", "Resolve-Path", "Convert-Path", "Get-PSDrive", "Set-Location", "Push-Location",
+        "Directory]::Exists", "File]::Exists", "GetFullPath", "Path]::IsPathRooted", "Join-Path", "Split-Path", "LookupScript", "LookupTimeoutMs", "BudgetMs",
+        "Stopwatch", "WaitOne",
+    )
+    found = [b for b in banned if b.lower() in code.lower()]
+    assert not found, f"Add-CodexLaneRuntimePath must not touch the filesystem or create threads; found {found}"
+
+
+def test_codex_lane_runtime_path_takes_no_lookup_or_budget_parameter():
+    code = _add_codex_runtime_path_function_text()
+    params = re.search(r"param\((.*?)\n    \)", code, re.S).group(1)
+    assert sorted(re.findall(r"\]\s*\$([A-Za-z]+)\b", params)) == ["Candidates", "Psi"], params
+
+
+def test_codex_lane_runtime_path_compares_path_keys_ordinally():
+    # Adversary A1 on e370ba86: a PowerShell hashtable, and the -eq/-ne/-in/-contains operators, compare strings with the current culture, which ignores
+    # U+00AD (soft hyphen): a segment holding only U+00AD was `-eq ''` and was dropped, so a nonexistent inherited directory 'X\<U+00AD>\bin' collided with the real
+    # 'X\bin'. Path keys live in an ordinal HashSet, and no string operator that can fold a path is left in the function.
+    code = _strip_ps_comments(_add_codex_runtime_path_function_text())
+    assert "@{}" not in code, "a hashtable folds keys with the culture"
+    assert re.search(r"HashSet\[string\]\]::new\(\[(?:System\.)?StringComparer\]::Ordinal\)", code), "the seen-set must be an ordinal HashSet[string]"
+    operators = re.findall(r"^.*\s-(?:i?c?eq|i?c?ne|i?c?in|i?c?notin|i?c?contains|i?c?notcontains|i?c?like|i?c?lt|i?c?gt)\b.*$", code, re.M)
+    offenders = [ln.strip() for ln in operators if not re.search(r"\.(?:Count|Length)\b|\$null -eq|-eq \$null", ln)]
+    assert not offenders, f"culture-sensitive comparison of a path string: {offenders}"
+    # -match / -notmatch / -split are case-insensitive: [A-Za-z] under them also accepts U+212A (adversary A2 on ff7ec6c5). Use -cmatch / -cnotmatch.
+    insensitive = [ln.strip() for ln in code.splitlines() if re.search(r"\s-(?:i?match|i?notmatch)\b", ln)]
+    assert not insensitive, f"a case-insensitive regex operator on a path string: {insensitive}"
+    assert "ToLowerInvariant" not in code and "ToLower()" not in code, "no case fold beyond the drive letter"
+    # .Trim() with no argument strips every Unicode space, U+00A0 included, which is a legal directory-name character (adversary A1 on 6a05d587).
+    assert not re.search(r"\.Trim\(\)", code), "Trim() with no argument alters a path whose name holds a Unicode space"
+
+
+@codex_runtime_path_only
+def test_codex_lane_runtime_path_compares_everything_after_the_drive_letter_exactly(tmp_path):
+    # Adversary A1 on ff7ec6c5: with MINGW_ROOT=C:\case\mingw and PATH=...;C:\case\MINGW\bin on a case-sensitive NTFS directory, the ASCII case fold gave the
+    # two (different) directories one key and suppressed the usable one. A false "absent" costs a harmless duplicate, a false "present" costs the whole fix,
+    # so only the drive letter folds; the rest of the path is compared exactly.
+    upper = tmp_path / "CASE" / "bin"
+    lower = tmp_path / "case" / "bin"
+    done = _codex_runtime_path_run(
+        tmp_path,
+        f"$psi.Environment['PATH'] = 'C:\\first;{_ps_quote(upper)}'\n"
+        f"$r = @(Add-CodexLaneRuntimePath -Psi $psi -Candidates @('{_ps_quote(lower)}'))\n"
+        "'ADDED=' + $r.Count",
+    )
+    assert _codex_runtime_path_field(done, "ADDED") == "1", done.stdout
+    assert _codex_runtime_path_field(done, "PATH") == f"C:\\first;{upper};{lower}"
+    # the same spelling is still one directory, and so is the drive letter in another case
+    done = _codex_runtime_path_run(
+        tmp_path,
+        f"$psi.Environment['PATH'] = 'C:\\first;{_ps_quote(lower)}'\n"
+        f"$r = @(Add-CodexLaneRuntimePath -Psi $psi -Candidates @('{_ps_quote(lower)}'))\n"
+        "'ADDED=' + $r.Count",
+    )
+    assert _codex_runtime_path_field(done, "ADDED") == "0", done.stdout
+
+
+@codex_runtime_path_only
+def test_codex_lane_runtime_path_a_non_ascii_look_alike_is_not_a_drive_letter(tmp_path):
+    # Adversary A2 on ff7ec6c5: PowerShell's -match is case-insensitive, so [A-Za-z] also matched U+212A (the Kelvin sign) and the candidate
+    # '<KELVIN>:\runtime\bin' was appended although it is not a drive. A drive letter is an ASCII letter, matched case-sensitively.
+    kelvin = "\u212a"
+    done = _codex_runtime_path_run(
+        tmp_path,
+        "$psi.Environment['PATH'] = 'C:\\first'\n"
+        f"$r = @(Add-CodexLaneRuntimePath -Psi $psi -Candidates @('{kelvin}:\\runtime\\bin', '{kelvin}:/runtime/bin'))\n"
+        "'ADDED=' + $r.Count",
+    )
+    assert _codex_runtime_path_field(done, "ADDED") == "0", done.stdout
+    assert _codex_runtime_path_field(done, "PATH") == "C:\\first"
+
+
+@codex_runtime_path_only
+def test_codex_lane_runtime_path_keeps_a_no_break_space_in_the_configured_root(tmp_path):
+    # Adversary A1 on 6a05d587: MINGW_ROOT='C:\toolchains\mingw<U+00A0>' was Trim()med (which strips U+00A0), so the directory the operator configured
+    # was replaced by a different one and omitted. U+00A0 is a legal directory-name character; only ASCII blanks around the value are removed.
+    nbsp = "\u00a0"
+    env = {**os.environ, "MINGW_ROOT": f"C:\\toolchains\\mingw{nbsp}"}
+    done = _codex_runtime_path_run(tmp_path, "$psi.Environment['PATH'] = 'C:\\first'\n[void](Add-CodexLaneRuntimePath -Psi $psi)", env=env)
+    path = _codex_runtime_path_field(done, "PATH")
+    assert path.split(";")[:2] == ["C:\\first", f"C:\\toolchains\\mingw{nbsp}\\bin"], path
+    # as an explicit candidate too, ending in U+00A0
+    done = _codex_runtime_path_run(
+        tmp_path,
+        "$psi.Environment['PATH'] = 'C:\\first'\n"
+        f"[void](Add-CodexLaneRuntimePath -Psi $psi -Candidates @('C:\\x\\bin{nbsp}'))",
+    )
+    assert _codex_runtime_path_field(done, "PATH") == f"C:\\first;C:\\x\\bin{nbsp}"
+    # ASCII blanks around the configured value are still ignored
+    env = {**os.environ, "MINGW_ROOT": "  C:\\toolchains\\mingw \t"}
+    done = _codex_runtime_path_run(tmp_path, "$psi.Environment['PATH'] = 'C:\\first'\n[void](Add-CodexLaneRuntimePath -Psi $psi)", env=env)
+    assert _codex_runtime_path_field(done, "PATH").split(";")[:2] == ["C:\\first", "C:\\toolchains\\mingw\\bin"]
+
+
+@codex_runtime_path_only
+def test_codex_lane_runtime_path_resolves_dot_dot_at_the_root_the_way_windows_does(tmp_path):
+    # Adversary A2 on 6a05d587: Windows canonicalises C:\..\toolchain to C:\toolchain (the root has no parent), but the empty-stack '..' branch
+    # rejected it, so MINGW_ROOT='C:\..\toolchain' was dropped and the inherited C:\..\toolchain\bin was not recognised as C:\toolchain\bin.
+    env = {**os.environ, "MINGW_ROOT": "C:\\..\\toolchain"}
+    done = _codex_runtime_path_run(tmp_path, "$psi.Environment['PATH'] = 'C:\\first'\n[void](Add-CodexLaneRuntimePath -Psi $psi)", env=env)
+    assert _codex_runtime_path_field(done, "PATH").split(";")[:2] == ["C:\\first", "C:\\toolchain\\bin"]
+    done = _codex_runtime_path_run(
+        tmp_path,
+        "$psi.Environment['PATH'] = 'C:\\first;C:\\..\\toolchain\\bin'\n"
+        "$r = @(Add-CodexLaneRuntimePath -Psi $psi -Candidates @('C:\\a\\..\\..\\toolchain\\bin'))\n'ADDED=' + $r.Count",
+    )
+    assert _codex_runtime_path_field(done, "ADDED") == "0", done.stdout
+
+
+@codex_runtime_path_only
+def test_codex_lane_runtime_path_a_soft_hyphen_segment_is_not_the_real_directory(tmp_path):
+    # Adversary A1 on e370ba86 (input: PATH 'C:\Qt\Tools\mingw1310_64\<U+00AD>\bin', installed default toolchain, ADDED=0). A segment that is only U+00AD is a
+    # different (nonexistent) directory, not an empty segment, so it does not make the real directory look present, and as a candidate it keeps its own spelling.
+    present = tmp_path / "bin"
+    present.mkdir()
+    shy = "\u00ad"
+    inherited = f"{tmp_path}\\{shy}\\bin"
+    done = _codex_runtime_path_run(
+        tmp_path,
+        f"$psi.Environment['PATH'] = 'C:\\first;{_ps_quote(inherited)}'\n"
+        f"$r = @(Add-CodexLaneRuntimePath -Psi $psi -Candidates @('{_ps_quote(present)}'))\n"
+        "'ADDED=' + $r.Count",
+    )
+    assert _codex_runtime_path_field(done, "ADDED") == "1", done.stdout
+    assert _codex_runtime_path_field(done, "PATH") == f"C:\\first;{inherited};{present}"
+    # as a candidate it is not collapsed into the real directory
+    done = _codex_runtime_path_run(
+        tmp_path,
+        "$psi.Environment['PATH'] = 'C:\\first'\n"
+        f"[void](Add-CodexLaneRuntimePath -Psi $psi -Candidates @('{_ps_quote(inherited)}', '{_ps_quote(present)}'))",
+    )
+    assert _codex_runtime_path_field(done, "PATH") == f"C:\\first;{inherited};{present}"
+
+
+@codex_runtime_path_only
+def test_codex_lane_runtime_path_compares_names_the_way_the_filesystem_does(tmp_path):
+    # Adversary A2 on 834f307b: ToLowerInvariant folds U+212A (the Kelvin sign) to 'k', so an inherited entry '...\Tas<KELVIN>s' was taken for the
+    # existing directory '...\Tasks' and the real one was never added. NTFS does not treat them as one name. Only ASCII letters are case-folded;
+    # a non-ASCII difference is a different directory (a false "absent" costs a duplicate, a false "present" costs the fix).
+    present = tmp_path / "tasks"
+    present.mkdir()
+    lookalike = str(tmp_path / "tas\u212as")
+    done = _codex_runtime_path_run(
+        tmp_path,
+        f"$psi.Environment['PATH'] = 'C:\\first;{_ps_quote(lookalike)}'\n"
+        f"$r = @(Add-CodexLaneRuntimePath -Psi $psi -Candidates @('{_ps_quote(present)}'))\n"
+        "'ADDED=' + $r.Count",
+    )
+    assert _codex_runtime_path_field(done, "ADDED") == "1", done.stdout
+
+
+@codex_runtime_path_only
+def test_codex_lane_runtime_path_does_not_count_a_spelling_the_loader_will_not_match(tmp_path):
+    # Adversary A1 on 7688a2a3: PATH='...\bin ' (trailing space) was trimmed into the seen-set, so the usable directory was never added and
+    # the DLLs stayed unfound. An inherited entry counts as present only when it is a plain, exact spelling; a false "absent" costs a harmless duplicate,
+    # a false "present" costs the whole fix.
+    present = tmp_path / "bin"
+    present.mkdir()
+    for spelling in (f"{present} ", f" {present}", f'"{present}"', f"{present}."):
+        start = f"C:\\first;{spelling}"
+        done = _codex_runtime_path_run(
+            tmp_path,
+            f"$psi.Environment['PATH'] = '{_ps_quote(start)}'\n"
+            f"[void](Add-CodexLaneRuntimePath -Psi $psi -Candidates @('{_ps_quote(present)}'))",
+        )
+        assert _codex_runtime_path_field(done, "PATH") == f"{start};{present}", spelling
+
+
+@codex_runtime_path_only
+def test_codex_lane_runtime_path_treats_dot_segments_as_the_directory_they_name(tmp_path):
+    # Adversary A3 (advisory, introduced) on 7688a2a3: <dir>\.\bin and <dir>\bin are one directory but were both appended. Dot segments are resolved
+    # lexically (Windows does the same before it touches the disk) on the candidate and on the inherited entries, and the directory is added once, resolved.
+    present = tmp_path / "bin"
+    present.mkdir()
+    (tmp_path / "side").mkdir()
+    dotted = f"{tmp_path}\\.\\bin"
+    parent = f"{tmp_path}\\side\\..\\bin"
+    done = _codex_runtime_path_run(
+        tmp_path,
+        "$psi.Environment['PATH'] = 'C:\\first'\n"
+        f"[void](Add-CodexLaneRuntimePath -Psi $psi -Candidates @('{_ps_quote(dotted)}', '{_ps_quote(parent)}', '{_ps_quote(present)}'))",
+    )
+    assert _codex_runtime_path_field(done, "PATH") == f"C:\\first;{present}"
+    start = f"C:\\first;{dotted}"
+    done = _codex_runtime_path_run(
+        tmp_path,
+        f"$psi.Environment['PATH'] = '{_ps_quote(start)}'\n"
+        f"[void](Add-CodexLaneRuntimePath -Psi $psi -Candidates @('{_ps_quote(present)}'))",
+    )
+    assert _codex_runtime_path_field(done, "PATH") == start
+
+
+# r4 (Sol r3 + adversary A1 on 071338fa): the segment checks ran BEFORE a following '..' could remove the segment, so a configured root whose spelling
+# merely passes through a bad name (C:\toolchains\discard.\..\mingw) was refused although it names C:\toolchains\mingw. Windows resolves '.' and '..'
+# first; so does the function now, and every check (trailing dot or space, reserved character, quote, semicolon) runs over the SURVIVING segments.
+_CODEX_DEFAULT_QT_BIN = "C:\\Qt\\Tools\\mingw1310_64\\bin"
+_CANCELED_SEGMENTS = {
+    "trailing-dot": "discard.",
+    "trailing-space": "discard ",
+    "semicolon": "dis;card",
+    "quote": 'dis"card',
+    "reserved-lt": "dis<card",
+    "reserved-star": "dis*card",
+    "reserved-colon": "dis:card",
+}
+
+
+@codex_runtime_path_only
+@pytest.mark.parametrize("bad", list(_CANCELED_SEGMENTS.values()), ids=list(_CANCELED_SEGMENTS))
+def test_codex_lane_runtime_path_a_canceled_bad_segment_does_not_refuse_the_configured_root(tmp_path, bad):
+    configured = f"C:\\toolchains\\{bad}\\..\\mingw"
+    env = {**os.environ, "MINGW_ROOT": configured}
+    done = _codex_runtime_path_run(tmp_path, "$psi.Environment['PATH'] = 'C:\\first'\n[void](Add-CodexLaneRuntimePath -Psi $psi)", env=env)
+    # the configured toolchain is ADDED, ahead of the default Qt candidate (Sol r3: it was omitted, leaving only the Qt default)
+    assert _codex_runtime_path_field(done, "PATH").split(";") == ["C:\\first", "C:\\toolchains\\mingw\\bin", _CODEX_DEFAULT_QT_BIN], done.stdout
+    # the same spelling as an explicit candidate, and with the cancelled segment last before '..' at the end
+    done = _codex_runtime_path_run(
+        tmp_path,
+        "$psi.Environment['PATH'] = 'C:\\first'\n"
+        f"$r = @(Add-CodexLaneRuntimePath -Psi $psi -Candidates @('{_ps_quote(f'C:\\toolchains\\mingw\\bin\\{bad}\\..')}'))\n'ADDED=' + $r.Count",
+    )
+    assert _codex_runtime_path_field(done, "ADDED") == "1", done.stdout
+    assert _codex_runtime_path_field(done, "PATH") == "C:\\first;C:\\toolchains\\mingw\\bin"
+
+
+@codex_runtime_path_only
+@pytest.mark.parametrize(
+    "surviving",
+    ["bad.", "bad ", "ba;d", 'ba"d', "ba<d", "ba>d", "ba|d", "ba?d", "ba*d", "ba:d", "bad\t"],
+    ids=["dot", "space", "semicolon", "quote", "lt", "gt", "pipe", "question", "star", "colon", "tab"],
+)
+def test_codex_lane_runtime_path_a_surviving_bad_segment_is_still_refused(tmp_path, surviving):
+    # Control: reducing first must not weaken the checks. A bad segment that is still in the path after '.' and '..' are resolved stays refused,
+    # and so does a bad segment sitting before a '..' that removes a DIFFERENT segment.
+    # (a trailing ASCII blank on the configured VALUE is trimmed by design, so the bad segment is never the last one here)
+    for configured in (f"C:\\toolchains\\{surviving}\\mingw", f"C:\\toolchains\\{surviving}\\x\\..\\mingw", f"C:\\toolchains\\mingw\\{surviving}\\sub"):
+        env = {**os.environ, "MINGW_ROOT": configured}
+        done = _codex_runtime_path_run(tmp_path, "$psi.Environment['PATH'] = 'C:\\first'\n[void](Add-CodexLaneRuntimePath -Psi $psi)", env=env)
+        assert _codex_runtime_path_field(done, "PATH") == f"C:\\first;{_CODEX_DEFAULT_QT_BIN}", configured
+
+
+@codex_runtime_path_only
+def test_codex_lane_runtime_path_dot_dot_above_the_root_clamps_and_relative_and_unc_stay_refused(tmp_path):
+    # HUB RULING 20261107T1220Z: '..' above the drive root stays at the root, as Windows canonicalisation does.
+    for configured, expected in (
+        ("C:\\..\\toolchains\\mingw", "C:\\toolchains\\mingw\\bin"),
+        ("C:\\a\\..\\..\\toolchains\\mingw", "C:\\toolchains\\mingw\\bin"),
+        ("C:\\x.\\..\\..\\toolchains\\mingw", "C:\\toolchains\\mingw\\bin"),
+    ):
+        env = {**os.environ, "MINGW_ROOT": configured}
+        done = _codex_runtime_path_run(tmp_path, "$psi.Environment['PATH'] = 'C:\\first'\n[void](Add-CodexLaneRuntimePath -Psi $psi)", env=env)
+        assert _codex_runtime_path_field(done, "PATH").split(";") == ["C:\\first", expected, _CODEX_DEFAULT_QT_BIN], configured
+    # relative and UNC spellings stay refused even when a cancelled segment would reduce them to something plausible
+    for configured in ("toolchains\\discard.\\..\\mingw", ".\\toolchains\\mingw", "\\\\host\\share\\discard.\\..\\mingw", "\\toolchains\\mingw"):
+        env = {**os.environ, "MINGW_ROOT": configured}
+        done = _codex_runtime_path_run(tmp_path, "$psi.Environment['PATH'] = 'C:\\first'\n[void](Add-CodexLaneRuntimePath -Psi $psi)", env=env)
+        assert _codex_runtime_path_field(done, "PATH") == f"C:\\first;{_CODEX_DEFAULT_QT_BIN}", configured
+
+
+@codex_runtime_path_only
+def test_codex_lane_runtime_path_an_inherited_entry_is_reduced_before_it_is_checked(tmp_path):
+    # Same order for the inherited PATH: C:\toolchains\discard.\..\mingw\bin IS C:\toolchains\mingw\bin, so the directory is present and is not added
+    # twice; an inherited entry whose bad segment SURVIVES is not counted as present (a false "absent" costs a duplicate, a false "present" the fix).
+    done = _codex_runtime_path_run(
+        tmp_path,
+        "$psi.Environment['PATH'] = 'C:\\first;C:\\toolchains\\discard.\\..\\mingw\\bin'\n"
+        "$r = @(Add-CodexLaneRuntimePath -Psi $psi -Candidates @('C:\\toolchains\\mingw\\bin'))\n'ADDED=' + $r.Count",
+    )
+    assert _codex_runtime_path_field(done, "ADDED") == "0", done.stdout
+    done = _codex_runtime_path_run(
+        tmp_path,
+        "$psi.Environment['PATH'] = 'C:\\first;C:\\toolchains\\mingw.\\bin'\n"
+        "$r = @(Add-CodexLaneRuntimePath -Psi $psi -Candidates @('C:\\toolchains\\mingw\\bin'))\n'ADDED=' + $r.Count",
+    )
+    assert _codex_runtime_path_field(done, "ADDED") == "1", done.stdout
+    assert _codex_runtime_path_field(done, "PATH") == "C:\\first;C:\\toolchains\\mingw.\\bin;C:\\toolchains\\mingw\\bin"
+
+
+@codex_runtime_path_only
+def test_codex_lane_runtime_path_an_inherited_entry_the_loader_cannot_use_does_not_count_as_present(tmp_path):
+    # Adversary A1 on fb022797 (introduced, major): reduction made 'C:\Qt\Tools\mingw1310_64\bin\' + '.\' * 16330 (a 32 KB spelling) look like the
+    # canonical directory, so the usable candidate was suppressed (ADDED=0) while LoadLibraryExW fails on the raw string. The raw spelling must stay within
+    # what a loader search entry can be: an entry plus '\' plus the longest runtime DLL name (libgcc_s_seh-1.dll, 18 characters) within MAX_PATH. A longer
+    # spelling is treated as absent (a duplicate costs 30 bytes; a false "present" costs the fix).
+    base = "C:\\Qt\\Tools\\mingw1310_64\\bin"
+    padded = base + "\\" + ".\\" * 16330
+    env = {**os.environ, "MINGW_ROOT": ""}
+    done = _codex_runtime_path_run(
+        tmp_path,
+        f"$psi.Environment['PATH'] = 'C:\\Program Files\\nodejs;C:\\Windows\\System32;{padded}'\n"
+        "$r = @(Add-CodexLaneRuntimePath -Psi $psi)\n'ADDED=' + $r.Count",
+        env=env,
+    )
+    assert _codex_runtime_path_field(done, "ADDED") == "1", done.stdout
+    assert _codex_runtime_path_field(done, "PATH").endswith(f";{base}"), done.stdout
+    # the boundary: 240 characters is still a spelling the loader can use, 241 is not
+    for pad_len, added in ((240, "0"), (241, "1")):
+        k, extra = divmod(pad_len - (len(base) + 1), 2)
+        entry = base + "\\" + ".\\" * k + ("." if extra else "")
+        assert len(entry) == pad_len, (len(entry), pad_len)
+        done = _codex_runtime_path_run(
+            tmp_path,
+            f"$psi.Environment['PATH'] = 'C:\\first;{entry}'\n"
+            f"$r = @(Add-CodexLaneRuntimePath -Psi $psi -Candidates @('{base}'))\n'ADDED=' + $r.Count",
+        )
+        assert _codex_runtime_path_field(done, "ADDED") == added, (pad_len, done.stdout)
+
+
+def test_codex_lane_runtime_path_is_wired_into_the_codex_child_only():
+    body = LANE_RUNNER.read_text(encoding="utf-8").replace("\r\n", "\n")
+    assert "function Add-CodexLaneRuntimePath" in body, "Invoke-Lane lacks Add-CodexLaneRuntimePath"
+    calls = [m.start() for m in re.finditer(r"^\s*\$\w+ = @\(Add-CodexLaneRuntimePath -Psi \$psi\)", body, re.M)]
+    assert len(calls) == 1, f"expected exactly one call on the lane child's $psi, found {len(calls)}"
+    guard = "if ($cfg.engine -eq 'codex') {"
+    window = body[max(0, calls[0] - 900):calls[0]]
+    assert guard in window, "the call must sit inside `if ($cfg.engine -eq 'codex')`: the claude lane's environment is unchanged"
+    # r3: no lookup, so no budget: the call takes nothing but the child's $psi and cannot be the reason a launch-budget check throws.
+    assert "-BudgetMs" not in body[calls[0]:calls[0] + 200] and "codexRuntimeBudgetMs" not in body, "the call must carry no lookup budget"
+    # After the child's $psi exists and before its streams are redirected, i.e. before anything can start it.
+    created = body.index("$psi = [System.Diagnostics.ProcessStartInfo]::new()\n$psi.WorkingDirectory")
+    redirected = body.index("$psi.RedirectStandardInput  = $true")
+    assert created < calls[0] < redirected, "the call must run between the lane child's $psi creation and its stream redirection"
+
+
 def test_invoke_lane_marks_only_the_claude_child_as_a_fleet_lane():
     # KEY-VERDICT-OVERWRITTEN-BY-ROTATION-CHECKPOINT-1. The user-level Stop hook usage-guard.py skips
     # its rotation-checkpoint block when MLV_FLEET_LANE is set; without it a headless lane takes one more
@@ -1641,9 +2207,10 @@ def test_provider_refusal_treats_empty_output_as_no_refusal(tmp_path):
 def test_invoke_lane_records_a_provider_refusal_as_refused_not_complete():
     body = LANE_RUNNER.read_text(encoding="utf-8")
     assert "lane-provider-refusal.ps1" in body, "Invoke-Lane must dot-source the one classifier"
-    assert "Get-ProviderRefusal -Text $stderrText -Answer $stdout" in body, (
+    assert "Get-ProviderRefusal -Text $stderrText -Answer $refusalAnswer" in body, (
         "classification must read the harvested stderr and the harvested answer separately, "
-        "never a blended blob (sol PR #80 R1+R2 BLOCKERs)"
+        "never a blended blob (sol PR #80 R1+R2 BLOCKERs); K4 r2: the answer is the SAME selected answer "
+        "the completion evidence uses (codex: last-message file else stdout), not stdout alone"
     )
     assert "-Prompt $Prompt" in body, "the echoed prompt must be excluded from classification (sol PR #80 R1 BLOCKER)"
     assert "providerRefusal = $providerRefusal" in body, "the receipt must carry the refusal verbatim"
@@ -1671,13 +2238,15 @@ CLAUDE_API_ERROR_SUCCESS_SUBTYPE_ENVELOPE = (
 )
 
 
-def _work_evidence(tmp_path, engine, answer, exit_code):
+def _work_evidence(tmp_path, engine, answer, exit_code, prompt_chars=None, require_verdict=False):
     asrc = tmp_path / "lane-answer.txt"
     asrc.write_text(answer, encoding="utf-8")
+    extra = (f" -PromptChars {prompt_chars}" if prompt_chars is not None else "") + (
+        " -RequireVerdict" if require_verdict else "")
     cmd = (
         f". '{REFUSAL_HELPER}'; "
         f"$a = [IO.File]::ReadAllText('{asrc}'); "
-        f"Get-LaneWorkEvidence -Engine '{engine}' -Answer $a -ExitCode {exit_code} | ConvertTo-Json -Compress"
+        f"Get-LaneWorkEvidence -Engine '{engine}' -Answer $a -ExitCode {exit_code}{extra} | ConvertTo-Json -Compress"
     )
     out = subprocess.run(
         ["pwsh", "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", cmd],
@@ -1720,9 +2289,1211 @@ def test_work_evidence_requires_every_success_signal(tmp_path):
     # No envelope on the claude engine is absence of evidence, not completion.
     assert _work_evidence(tmp_path, "claude", "", 0)["reason"] == "no-result-envelope"
     assert _work_evidence(tmp_path, "claude", "not json at all", 0)["workCompleted"] is False
-    # codex exposes no envelope: exit 0 is the only observable, and non-zero defeats it.
-    assert _work_evidence(tmp_path, "codex", "answer", 0)["workCompleted"] is True
-    assert _work_evidence(tmp_path, "codex", "answer", 1)["workCompleted"] is False
+    # codex exposes no envelope: exit 0 plus a real-sized answer is the observable, and non-zero defeats it.
+    # (K4 r2: the control answer is a realistic length; a 6-char "answer" is under the codex answer floor.)
+    assert _work_evidence(tmp_path, "codex", REAL_SIZED_CODEX_ANSWER, 0)["workCompleted"] is True
+    assert _work_evidence(tmp_path, "codex", REAL_SIZED_CODEX_ANSWER, 1)["workCompleted"] is False
+
+
+REAL_SIZED_CODEX_ANSWER = (
+    "APPROVE. I read the diff in full, ran the read-only checks I could, and every invariant in the table holds "
+    "on the literal inputs I traced; the one open point is recorded under self_failure."
+)  # 170 characters, well above the 120-character codex answer floor
+
+
+# KERNEL-K4-CODEX-SILENT-EXIT0-COMPLETED-1: a codex lane that exits 0 and answers nothing is not a
+# finished lane. Kernel K4 needs POSITIVE completion evidence; "the process exited 0" is not it.
+# Sampled 2026-11-06 (r2, every fleet-runs codex receipt with state=complete, exitCode=0 and a surviving
+# answer file: 2380): with whitespace and Cf characters removed, the 7 answers under 120 chars are all
+# smoke probes with prompts under 200 bytes; every prompt of 400+ bytes answered with >= 231 chars. So the
+# 120-char floor (prompt 400+ chars) rejects 0 real answers; replaying the real helper over the sample
+# rejects exactly 1, a key whose own answer says "verdict":null (a true positive).
+def test_codex_exit_0_with_an_empty_answer_is_not_complete(tmp_path):
+    r = _work_evidence(tmp_path, "codex", "", 0)
+    assert r["workCompleted"] is False, r
+    assert r["reason"] == "codex-empty-answer", r
+
+
+def test_codex_exit_0_with_a_whitespace_only_answer_is_not_complete(tmp_path):
+    for blank in ("   ", "\n", "\r\n\r\n", "\t \n  \t", "  \n"):
+        r = _work_evidence(tmp_path, "codex", blank, 0)
+        assert r["workCompleted"] is False, (blank, r)
+        assert r["reason"] == "codex-empty-answer", (blank, r)
+
+
+def test_codex_exit_0_with_a_real_answer_stays_complete(tmp_path):
+    assert _work_evidence(tmp_path, "codex", REAL_SIZED_CODEX_ANSWER, 0)["workCompleted"] is True
+    # Surrounding whitespace never hides a real answer; only an answer that is ALL whitespace is empty.
+    assert _work_evidence(tmp_path, "codex", "\n\n  " + REAL_SIZED_CODEX_ANSWER + "  \n", 0)["workCompleted"] is True
+
+
+def test_codex_nonzero_exit_keeps_its_exit_code_reason_over_the_empty_answer_reason(tmp_path):
+    # The exit code is checked first so an existing receipt reader still sees exit-code-N.
+    assert _work_evidence(tmp_path, "codex", "", 1)["reason"] == "exit-code-1"
+
+
+def _codex_answer(tmp_path, last, stdout):
+    # Feeds both inputs through files so quoting and newlines cannot change what is tested.
+    lf, sf = tmp_path / "last.txt", tmp_path / "stdout.txt"
+    lf.write_text(last, encoding="utf-8")
+    sf.write_text(stdout, encoding="utf-8")
+    cmd = (
+        f". '{REFUSAL_HELPER}'; "
+        f"$l = [IO.File]::ReadAllText('{lf}'); $s = [IO.File]::ReadAllText('{sf}'); "
+        "Get-CodexLaneAnswer -LastMessage $l -Stdout $s | ConvertTo-Json -Compress"
+    )
+    out = subprocess.run(["pwsh", "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", cmd],
+                         text=True, capture_output=True)
+    assert out.returncode == 0, out.stderr
+    return json.loads(out.stdout.strip().splitlines()[-1])
+
+
+def test_codex_answer_for_evidence_is_the_last_message_file_when_stdout_is_empty(tmp_path):
+    # Adversary A1 (b4372775): exit 0, stdout '', the real answer only in the -o last-message file.
+    # Judging stdout alone called that real answer empty, i.e. a false 'not completed' on a real answer.
+    ans = _codex_answer(tmp_path, REAL_SIZED_CODEX_ANSWER + "\n", "")
+    assert ans.replace("\r\n", "\n").strip() == REAL_SIZED_CODEX_ANSWER, ans  # write_text writes CRLF on Windows
+    assert _work_evidence(tmp_path, "codex", ans, 0)["workCompleted"] is True
+
+
+def test_codex_answer_for_evidence_falls_back_to_stdout_and_never_to_stderr(tmp_path):
+    assert _codex_answer(tmp_path, "  \n", "from stdout\n").strip() == "from stdout"
+    # last file wins when both are real
+    assert _codex_answer(tmp_path, "from file\n", "from stdout\n").strip() == "from file"
+    # neither has an answer: '' (the helper has no stderr input at all), so the lane is not complete
+    ans = _codex_answer(tmp_path, "", " \n")
+    assert ans == "", ans
+    assert _work_evidence(tmp_path, "codex", ans, 0)["reason"] == "codex-empty-answer"
+
+
+def test_invoke_lane_judges_codex_completion_on_the_harvested_answer_not_on_stdout_alone():
+    body = LANE_RUNNER.read_text(encoding="utf-8")
+    assert "$codexAnswerEvidence = Get-CodexLaneAnswer -LastMessage $lastMessage -Stdout $stdout" in body
+    assert "-Answer $(if ($cfg.engine -eq 'codex') { $codexAnswerEvidence } else { $stdout }) -ExitCode $exitCode" in body, (
+        "Get-LaneWorkEvidence must be fed the codex last-message answer; stdout alone mislabels a real answer as empty"
+    )
+    # The evidence answer is taken BEFORE the stderr narration fallback, never after it, and before the refusal call.
+    assert body.index("$codexAnswerEvidence = Get-CodexLaneAnswer") < body.index("$final = $stderrText")
+    assert body.index("$codexAnswerEvidence = Get-CodexLaneAnswer") < body.index("$providerRefusal = Get-ProviderRefusal")
+
+
+def test_codex_unrelated_nonblank_answers_under_the_floor_are_not_complete(tmp_path):
+    # sol r1 B1 / catalogue K4-01: the ledger (2026-11-01T17:10:49Z) names an "empty, whitespace-only or
+    # unrelated answer". "Is this answer related" is not decidable, so the rule is evidence-bound: a length
+    # floor on the answer with whitespace and Unicode Cf characters removed.
+    for text in ("Sure, here is a poem about spring.", "Still working; please wait.", "{}"):
+        r = _work_evidence(tmp_path, "codex", text, 0)
+        assert r["workCompleted"] is False, (text, r)
+        assert r["reason"] == "codex-answer-too-short", (text, r)
+
+
+def test_codex_answer_of_only_zero_width_characters_is_empty_not_complete(tmp_path):
+    # opus r1 note: .NET IsNullOrWhiteSpace does not treat U+200B (category Cf) as whitespace.
+    for text in ("\u200b", "\u200b\u200b \n\ufeff", "\u2060\u200d"):
+        r = _work_evidence(tmp_path, "codex", text, 0)
+        assert r["workCompleted"] is False, (text, r)
+        assert r["reason"] == "codex-empty-answer", (text, r)
+    # Cf characters pad nothing: a short answer disguised with zero-width padding is still too short.
+    r = _work_evidence(tmp_path, "codex", "\u200b" * 500 + "ok", 0)
+    assert r["workCompleted"] is False and r["reason"] == "codex-answer-too-short", r
+
+
+def test_codex_answer_floor_boundary_and_probe_exemption(tmp_path):
+    at_floor = "x" * 120
+    assert _work_evidence(tmp_path, "codex", at_floor, 0)["workCompleted"] is True
+    assert _work_evidence(tmp_path, "codex", "x" * 119, 0)["reason"] == "codex-answer-too-short"
+    # whitespace between words never counts toward the floor
+    assert _work_evidence(tmp_path, "codex", " ".join(["x"] * 119), 0)["reason"] == "codex-answer-too-short"
+    # A short probe prompt ("Reply with exactly: OK") legitimately gets a short answer.
+    assert _work_evidence(tmp_path, "codex", "OK", 0, prompt_chars=22)["workCompleted"] is True
+    # ... but a real task prompt does not, and an empty answer is empty for any prompt.
+    assert _work_evidence(tmp_path, "codex", "OK", 0, prompt_chars=19000)["reason"] == "codex-answer-too-short"
+    assert _work_evidence(tmp_path, "codex", "", 0, prompt_chars=22)["reason"] == "codex-empty-answer"
+    # Unknown prompt size (the helper called without it) applies the floor.
+    assert _work_evidence(tmp_path, "codex", "OK", 0)["reason"] == "codex-answer-too-short"
+
+
+KEY_FINAL_JSON = ('{"verdict":"APPROVE","reviewer":"sol","subject_sha":"' + "a" * 40 + '","pr":771,"findings":[]}')
+KEY_ANSWER_BODY = REAL_SIZED_CODEX_ANSWER + "\n\n"
+
+
+def test_codex_key_answer_needs_a_final_json_object_with_a_verdict(tmp_path):
+    ok = KEY_ANSWER_BODY + "```json\n" + KEY_FINAL_JSON + "\n```\n"
+    assert _work_evidence(tmp_path, "codex", ok, 0, require_verdict=True)["workCompleted"] is True
+    # long prose with no final json: a key that gave no verdict
+    r = _work_evidence(tmp_path, "codex", KEY_ANSWER_BODY * 3, 0, require_verdict=True)
+    assert r["workCompleted"] is False and r["reason"] == "codex-no-verdict", r
+    # the FINAL json decides: an earlier provisional block with a verdict does not rescue a final one without
+    prov = "```json\n" + KEY_FINAL_JSON + "\n```\n" + KEY_ANSWER_BODY + "```json\n{\"findings\":[]}\n```\n"
+    r = _work_evidence(tmp_path, "codex", prov, 0, require_verdict=True)
+    assert r["workCompleted"] is False and r["reason"] == "codex-no-verdict", r
+    # an empty verdict string is not a verdict
+    r = _work_evidence(tmp_path, "codex", KEY_ANSWER_BODY + "```json\n{\"verdict\":\"\"}\n```\n", 0, require_verdict=True)
+    assert r["reason"] == "codex-no-verdict", r
+    # unfenced trailing json object also counts
+    assert _work_evidence(tmp_path, "codex", KEY_ANSWER_BODY + KEY_FINAL_JSON + "\n", 0, require_verdict=True)["workCompleted"] is True
+    # without the switch (a non-key lane) no verdict is demanded
+    assert _work_evidence(tmp_path, "codex", KEY_ANSWER_BODY * 3, 0)["workCompleted"] is True
+
+
+def _prompt_demands_verdict(tmp_path, prompt):
+    psrc = tmp_path / "pd-prompt.txt"
+    psrc.write_text(prompt, encoding="utf-8")
+    cmd = f". '{REFUSAL_HELPER}'; $p = [IO.File]::ReadAllText('{psrc}'); [string](Test-PromptDemandsVerdict -Prompt $p)"
+    out = subprocess.run(["pwsh", "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", cmd],
+                         text=True, capture_output=True)
+    assert out.returncode == 0, out.stderr
+    return out.stdout.strip().splitlines()[-1] == "True"
+
+
+def test_prompt_demanding_a_verdict_json_is_the_key_signal(tmp_path):
+    assert _prompt_demands_verdict(tmp_path, 'Final json:\n{"verdict":"APPROVE|CHANGES_REQUESTED","reviewer":"sol"}')
+    assert _prompt_demands_verdict(tmp_path, '{ "verdict" : "CLEAN|FINDINGS" }')
+    assert not _prompt_demands_verdict(tmp_path, "Reply with exactly: OK")
+    assert not _prompt_demands_verdict(tmp_path, "Summarise the verdict of the committee.")
+
+
+def test_r6_adv2_a1_a_field_fragment_without_an_object_is_not_a_verdict_demand(tmp_path):
+    # adversary r6 pass 2 A1: the bare '"verdict"\s*:' pattern made a literal-output probe that merely quotes the field
+    # ('Reply with exactly these 10 characters: "verdict":') demand a verdict, so its answer '"verdict":' was rejected.
+    # A prompt demands a verdict by spelling a JSON OBJECT that carries the key: an opening brace comes before it.
+    assert not _prompt_demands_verdict(tmp_path, 'Reply with exactly these 10 characters: "verdict":')
+    assert not _prompt_demands_verdict(tmp_path, 'Print the key "verdict": then stop.')
+    assert _prompt_demands_verdict(tmp_path, 'Final json:\n{\n  "head": {"sha": "abc"},\n  "verdict": "APPROVE"\n}')
+    assert _prompt_demands_verdict(tmp_path, 'Reply with exactly: {"verdict":"APPROVE"}')
+
+
+# The Invoke-Lane wiring is EXECUTED, not string-matched: the statements between the K4 sentinels run
+# against fixture variables, so a later reassignment of $codexAnswerEvidence inside them reds.
+def _sentinel_block(body, name):
+    m = re.search(rf"# {name}-BEGIN\r?\n(.*?)# {name}-END", body, re.S)
+    assert m, f"Invoke-Lane.ps1 lost its {name} sentinels"
+    return m.group(1)
+
+
+def _receipt_outcome_statements(body):
+    # r8 (sol r7 B1): the REAL completion path past the evidence -- Invoke-Lane's own $workCompleted, receipt `state`
+    # and `$propagated` exit statements, extracted verbatim (no failure, the process ended), so a refusal that outranks
+    # workEvidence.workCompleted is seen as state=refused / exit 125 exactly as the runner writes it.
+    wc = re.search(r"^\$workCompleted = \(\$null -eq \$failure.*$", body, re.M)
+    st = re.search(r"\bstate\s+= (if \(\$null -ne \$failure\).*?else \{ 'incomplete' \})", body, re.S)
+    pr = re.search(r"(\$propagated = switch \(\$exitCode\) \{.*?\r?\n\})\r?\nexit \$propagated", body, re.S)
+    assert wc and st and pr, "Invoke-Lane.ps1 lost its $workCompleted / receipt state / $propagated statements"
+    return ("$failure = $null\n$processEnded = ($exitCode -ne -999)\n" + wc.group(0) + "\n"
+            + "$receiptState = " + st.group(1) + "\n" + pr.group(1) + "\n")
+
+
+def _run_invoke_lane_codex_wiring(tmp_path, last, stdout, stderr, prompt, exit_code=0, engine="codex", receipt=False):
+    body = LANE_RUNNER.read_text(encoding="utf-8")
+    block_a, block_b = _sentinel_block(body, "K4-ANSWER"), _sentinel_block(body, "K4-EVIDENCE")
+    block_c = _receipt_outcome_statements(body) if receipt else ""
+    out_obj = ("[pscustomobject]@{ refusal = $providerRefusal; evidence = $workEvidence"
+               + ("; state = $receiptState; complete = $workCompleted; exit = $propagated" if receipt else "")
+               + " } | ConvertTo-Json -Compress -Depth 6\n")
+    lf = tmp_path / "w.last.txt"
+    if last is not None:
+        lf.write_text(last, encoding="utf-8", newline="")
+    elif lf.exists():
+        lf.unlink()  # a previous call in the same tmp_path must not leave an answer behind
+    (tmp_path / "w.stdout.txt").write_text(stdout, encoding="utf-8", newline="")
+    (tmp_path / "w.stderr.txt").write_text(stderr, encoding="utf-8", newline="")
+    (tmp_path / "w.prompt.txt").write_text(prompt, encoding="utf-8", newline="")
+    (tmp_path / "block-a.ps1").write_text(block_a, encoding="utf-8")
+    (tmp_path / "block-b.ps1").write_text(block_b, encoding="utf-8")
+    (tmp_path / "block-c.ps1").write_text(block_c, encoding="utf-8")
+    script = (
+        "Set-StrictMode -Version Latest; $ErrorActionPreference = 'Stop'\n"
+        f". '{REFUSAL_HELPER}'\n"
+        f"$cfg = @{{ engine = '{engine}' }}\n"
+        f"$lastPath = '{lf}'\n"
+        f"$stdout = [IO.File]::ReadAllText('{tmp_path / 'w.stdout.txt'}')\n"
+        f"$stderrText = [IO.File]::ReadAllText('{tmp_path / 'w.stderr.txt'}')\n"
+        f"$Prompt = [IO.File]::ReadAllText('{tmp_path / 'w.prompt.txt'}')\n"
+        f"$exitCode = {exit_code}\n"
+        "$codexAnswerEvidence = ''\n"
+        f". '{tmp_path / 'block-a.ps1'}'\n"
+        f". '{tmp_path / 'block-b.ps1'}'\n"
+        f". '{tmp_path / 'block-c.ps1'}'\n"
+        + out_obj
+    )
+    (tmp_path / "wiring.ps1").write_text(script, encoding="utf-8")
+    out = subprocess.run(["pwsh", "-NoLogo", "-NoProfile", "-NonInteractive", "-File", str(tmp_path / "wiring.ps1")],
+                         text=True, capture_output=True)
+    assert out.returncode == 0, out.stderr + out.stdout
+    return json.loads(out.stdout.strip().splitlines()[-1])
+
+
+def test_invoke_lane_wiring_valid_file_only_answer_with_recovered_error_narration_is_complete(tmp_path):
+    # sol r1 B2 / catalogue K4-02: the last-message file holds the answer, stdout is empty, stderr narrates
+    # an error the run recovered from. Refusal detection must judge the SAME answer the evidence uses.
+    for narration in ("ERROR: upstream probe returned 429; recovered",
+                      "ERROR: authentication failed on first attempt; recovered",
+                      "ERROR: usage_limit_reached on first attempt; recovered"):
+        w = _run_invoke_lane_codex_wiring(tmp_path, REAL_SIZED_CODEX_ANSWER, "", narration + "\n", "Review this change")
+        assert w["refusal"] is None, (narration, w)
+        assert w["evidence"]["workCompleted"] is True, (narration, w)
+
+
+def test_invoke_lane_wiring_genuine_refusals_are_still_detected(tmp_path):
+    # no answer anywhere + an ERROR-framed refusal line on stderr
+    w = _run_invoke_lane_codex_wiring(tmp_path, None, "", "ERROR: you've hit your usage limit. try again at Nov 9th\n", "Review this change")
+    assert w["refusal"] is not None and w["refusal"]["kind"] == "provider-usage-limit", w
+    assert w["evidence"]["workCompleted"] is False, w
+    # A refusal that only reached the last-message file with a blank stdout and the ERROR line on stderr
+    w = _run_invoke_lane_codex_wiring(tmp_path, "\u200b", "", "ERROR: authentication failed\n", "Review this change")
+    assert w["refusal"] is not None and w["refusal"]["kind"] == "provider-auth", w
+    # a real answer that merely QUOTES refusal vocabulary is not a refusal
+    w = _run_invoke_lane_codex_wiring(tmp_path, REAL_SIZED_CODEX_ANSWER + "\nERROR: you've hit your usage limit (quoted)\n", "", "", "Review this change")
+    assert w["refusal"] is None, w
+
+
+def test_invoke_lane_wiring_judges_the_selected_answer_for_completion_floor_and_verdict(tmp_path):
+    key_prompt = 'Review.\nFinal json: {"verdict":"APPROVE|CHANGES_REQUESTED"}\n' + "x" * 600
+    good = KEY_ANSWER_BODY + "```json\n" + KEY_FINAL_JSON + "\n```\n"
+    # answer only in the last-message file
+    w = _run_invoke_lane_codex_wiring(tmp_path, good, "", "", key_prompt)
+    assert w["evidence"]["workCompleted"] is True, w
+    # stdout alone, last-message file blank
+    w = _run_invoke_lane_codex_wiring(tmp_path, " \n", good, "", key_prompt)
+    assert w["evidence"]["workCompleted"] is True, w
+    # a key prompt and a poem: too short; long prose with no verdict: no verdict
+    w = _run_invoke_lane_codex_wiring(tmp_path, "Sure, here is a poem about spring.", "", "", key_prompt)
+    assert w["evidence"]["reason"] == "codex-answer-too-short", w
+    w = _run_invoke_lane_codex_wiring(tmp_path, KEY_ANSWER_BODY * 3, "", "", key_prompt)
+    assert w["evidence"]["reason"] == "codex-no-verdict", w
+    # the same prose answering a non-key prompt is complete
+    w = _run_invoke_lane_codex_wiring(tmp_path, KEY_ANSWER_BODY * 3, "", "", "Summarise the layout of the repo. " + "x" * 600)
+    assert w["evidence"]["workCompleted"] is True, w
+    # a probe prompt gets a short answer
+    w = _run_invoke_lane_codex_wiring(tmp_path, "OK", "", "", "Reply with exactly: OK")
+    assert w["evidence"]["workCompleted"] is True, w
+    # stderr narration alone is never an answer
+    w = _run_invoke_lane_codex_wiring(tmp_path, None, "", "working... " * 40, "Reply with exactly: OK")
+    assert w["evidence"]["reason"] == "codex-empty-answer", w
+
+
+def test_codex_answer_of_supplementary_plane_format_characters_is_empty(tmp_path):
+    # adversary A1: Unicode tag characters (U+E0061, category Cf) are surrogate pairs in UTF-16; a
+    # code-unit regex leaves the halves behind and 60 of them read as 120 characters of substance.
+    tags = "".join(chr(0xE0061) for _ in range(60))
+    r = _work_evidence(tmp_path, "codex", tags, 0, prompt_chars=600)
+    assert r["workCompleted"] is False and r["reason"] == "codex-empty-answer", r
+    r = _work_evidence(tmp_path, "codex", tags + "ok", 0, prompt_chars=600)
+    assert r["workCompleted"] is False and r["reason"] == "codex-answer-too-short", r
+    # real supplementary-plane text still counts (an emoji is a character)
+    assert _work_evidence(tmp_path, "codex", "\U0001F600" * 120, 0, prompt_chars=600)["workCompleted"] is True
+
+
+def test_codex_final_fence_decides_even_when_it_is_malformed_or_not_an_object(tmp_path):
+    # adversary A2: an earlier provisional block with a verdict must not rescue a broken final block.
+    body = "x" * 120 + "\n```json\n" + '{"verdict":"APPROVE"}' + "\n```\n"
+    for tail in ('```json\n{"verdict":null\n```', "```json\n[]\n```", '```json\n{"verdict":"APPROVE"', "```json\n```",
+                 '```json\n[{"verdict":"APPROVE"}]\n```',                      # A1 (2nd pass): array, not object
+                 '```json title="final"\n{"verdict":null}\n```',               # A2: info string after the language
+                 '```json5\n{"verdict":null}\n```', '~~~json\n{"verdict":null}\n~~~'):
+        r = _work_evidence(tmp_path, "codex", body + tail, 0, prompt_chars=600, require_verdict=True)
+        assert r["workCompleted"] is False and r["reason"] == "codex-no-verdict", (tail, r)
+    # control: a well-formed final block after the provisional one is the verdict
+    ok = body + '```json\n{"verdict":"CHANGES_REQUESTED"}\n```\n'
+    assert _work_evidence(tmp_path, "codex", ok, 0, prompt_chars=600, require_verdict=True)["workCompleted"] is True
+
+
+def test_invoke_lane_wiring_successful_answer_that_quotes_refusal_vocabulary_is_not_refused(tmp_path):
+    # adversary A3: the prompt asked for the literal text; the run answered it. Base said not refused.
+    for text in ("ERROR: authentication failed", "ERROR: you've hit your usage limit"):
+        w = _run_invoke_lane_codex_wiring(tmp_path, text, text, "", "Reply with exactly: " + text)
+        assert w["refusal"] is None, (text, w)
+        assert w["evidence"]["workCompleted"] is True, (text, w)
+
+
+def test_invoke_lane_wiring_zero_width_last_message_falls_back_to_stdout(tmp_path):
+    # adversary A4: a last-message file holding only U+200B is blank, so stdout is the answer.
+    w = _run_invoke_lane_codex_wiring(tmp_path, "\u200b", "x" * 120, "", "Review this change " + "p" * 400)
+    assert w["evidence"]["workCompleted"] is True and w["refusal"] is None, w
+
+
+def test_invoke_lane_wiring_final_json_without_properties_is_no_verdict_not_a_throw(tmp_path):
+    # adversary A5 (strict mode): '{}' has no properties; reading .PSObject.Properties.Name threw.
+    key_prompt = 'Review.\nFinal json: {"verdict":"APPROVE|CHANGES_REQUESTED"}\n' + "x" * 600
+    w = _run_invoke_lane_codex_wiring(tmp_path, "x" * 120 + "\n{}", "", "", key_prompt)
+    assert w["evidence"]["reason"] == "codex-no-verdict", w
+
+
+def test_codex_verdict_field_name_is_case_exact(tmp_path):
+    # adversary A3 (2nd pass): PowerShell member lookup is case-insensitive; the contract field is 'verdict'.
+    for fld in ("VERDICT", "Verdict"):
+        r = _work_evidence(tmp_path, "codex", "x" * 120 + "\n" + '{"%s":"APPROVE"}' % fld, 0, prompt_chars=600, require_verdict=True)
+        assert r["workCompleted"] is False and r["reason"] == "codex-no-verdict", (fld, r)
+
+
+def test_substance_length_honours_a_cap_below_one(tmp_path):
+    # adversary A5 (2nd pass): Cap 0 returned 1 for a supplementary-plane character.
+    cmd = (f". '{REFUSAL_HELPER}'; "
+           "[string](Get-LaneAnswerSubstanceLength -Answer ([char]::ConvertFromUtf32(0x1F600) * 5) -Cap 0) + ' ' + "
+           "[string](Get-LaneAnswerSubstanceLength -Answer ([char]::ConvertFromUtf32(0x1F600) * 5) -Cap 3)")
+    out = subprocess.run(["pwsh", "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", cmd], text=True, capture_output=True)
+    assert out.returncode == 0, out.stderr
+    assert out.stdout.strip() == "1 3", out.stdout
+
+
+def test_invoke_lane_wiring_refusal_text_delivered_as_the_answer_is_still_refused_when_stderr_corroborates(tmp_path):
+    # adversary A6 (2nd pass): the base refused this (blank stdout, ERROR line on stderr). The same line in the
+    # last-message file must not turn it into a completed lane. Without stderr corroboration (A3) it is an answer.
+    e = "ERROR: you've hit your usage limit. try again at Nov 9th"
+    prompt = "Review this change. " + "p" * 600
+    w = _run_invoke_lane_codex_wiring(tmp_path, "\n".join([e, e, e]), "", e + "\n", prompt)
+    assert w["refusal"] is not None and w["refusal"]["kind"] == "provider-usage-limit", w
+    w = _run_invoke_lane_codex_wiring(tmp_path, "\n".join([e, e, e]), "", "", prompt)
+    assert w["refusal"] is None, w
+    # one real line makes it an answer even with the ERROR line on stderr
+    w = _run_invoke_lane_codex_wiring(tmp_path, REAL_SIZED_CODEX_ANSWER + "\n" + e, "", e + "\n", prompt)
+    assert w["refusal"] is None, w
+
+
+def test_codex_terminal_verdict_is_selected_by_position_across_fenced_and_unfenced_forms(tmp_path):
+    # r3 Dot item 1 (the carried P2): any fence made the parser ignore a later UNFENCED final object. The
+    # terminal candidate is the LAST one by position, whichever form it takes.
+    prose = "x" * 130 + "\n"
+    diff = "```diff\n- old\n+ new\n```\n"
+    prov = "```json\n" + KEY_FINAL_JSON + "\n```\n"
+
+    def done(text):
+        return _work_evidence(tmp_path, "codex", text, 0, prompt_chars=600, require_verdict=True)
+
+    # prose + fenced diff + final unfenced APPROVE: accepted
+    assert done(prose + diff + KEY_FINAL_JSON + "\n")["workCompleted"] is True
+    # a multi-line unfenced final object with nested object lines is still one object
+    nested = '{\n  "verdict": "APPROVE",\n  "findings": [\n    {"id": 1}\n  ]\n}\n'
+    assert done(prose + diff + nested)["workCompleted"] is True
+    # provisional fenced APPROVE + final unfenced {"verdict": null}: not completed
+    r = done(prose + prov + '{"verdict": null}\n')
+    assert r["workCompleted"] is False and r["reason"] == "codex-no-verdict", r
+    # provisional fenced APPROVE + malformed trailing unfenced JSON: not completed
+    for bad in ('{"verdict": "APPROVE"', '{"verdict": }', '{"verdict":"APPROVE"} trailing'):
+        r = done(prose + prov + bad + "\n")
+        assert r["workCompleted"] is False and r["reason"] == "codex-no-verdict", (bad, r)
+    # the mirror: an unfenced draft followed by a final fenced block, the FENCE decides
+    r = done(prose + KEY_FINAL_JSON + "\n```json\n{\"verdict\":null}\n```\n")
+    assert r["workCompleted"] is False and r["reason"] == "codex-no-verdict", r
+    assert done(prose + '{"verdict":null}\n' + prov)["workCompleted"] is True
+    # controls: closing prose with no object line after the final fenced block does not disturb it
+    assert done(prose + prov + "Done.\n")["workCompleted"] is True
+
+
+def test_codex_fence_closes_only_on_the_same_character_and_at_least_the_opening_length(tmp_path):
+    # r3 Dot item 3: ``` closed only by ~~~ made a malformed (unterminated) block count as a valid final one.
+    obj = '{"verdict":"APPROVE"}'
+    prose = "x" * 130 + "\n"
+
+    def done(text):
+        return _work_evidence(tmp_path, "codex", text, 0, prompt_chars=600, require_verdict=True)
+
+    for bad in ("```json\n" + obj + "\n~~~\n", "~~~json\n" + obj + "\n```\n",
+                "````json\n" + obj + "\n```\n",          # a 3-char close never closes a 4-char open
+                "~~~~json\n" + obj + "\n~~~\n"):
+        r = done(prose + bad)
+        assert r["workCompleted"] is False and r["reason"] == "codex-no-verdict", (bad, r)
+    for good in ("```json\n" + obj + "\n```\n", "~~~json\n" + obj + "\n~~~\n",
+                 "````json\n" + obj + "\n````\n", "````json\n" + obj + "\n`````  \n"):  # same/longer close
+        assert done(prose + good)["workCompleted"] is True, good
+    # a shorter fence line INSIDE a longer block is content, so a provisional block cannot be re-closed early
+    inner = "````md\n```json\n" + obj + "\n```\n````\n"
+    assert done(prose + inner)["workCompleted"] is False, "the object is example text inside an md block"
+
+
+def test_invoke_lane_wiring_unrelated_recovered_stderr_never_overturns_an_error_framed_answer(tmp_path):
+    # r3 sol B1 / Dot item 2: the prompt asked for the literal text `ERROR: ...`; the run answered it; stderr
+    # narrates an unrelated error the run recovered from. The answer must stand. Both delivery shapes.
+    narration = "ERROR: upstream probe returned 429; recovered\n"
+    for text in ("ERROR: file not found", "ERROR: missing semicolon"):
+        prompt = "Reply with exactly: " + text
+        for last, stdout in ((text, ""), (None, text), (text, text)):
+            w = _run_invoke_lane_codex_wiring(tmp_path, last, stdout, narration, prompt)
+            assert w["refusal"] is None, (text, last, stdout, w)
+            assert w["evidence"]["workCompleted"] is True, (text, last, stdout, w)
+    # a refusal-vocabulary answer whose stderr names a DIFFERENT kind is still the requested text
+    w = _run_invoke_lane_codex_wiring(tmp_path, "ERROR: authentication failed", "", narration, "Reply with exactly: ERROR: authentication failed")
+    assert w["refusal"] is None, w
+    # a mixed ERROR answer (one line is not refusal text) is not the refusal delivered as the answer
+    e = "ERROR: you've hit your usage limit. try again at Nov 9th"
+    w = _run_invoke_lane_codex_wiring(tmp_path, "ERROR: file not found\n" + e, "", e + "\n", "Reply with exactly the lines")
+    assert w["refusal"] is None, w
+    # controls: a genuine refusal is still refused (blank answer; and the answer IS the refusal with the same kind on stderr)
+    w = _run_invoke_lane_codex_wiring(tmp_path, None, "", e + "\n", "Review this change")
+    assert w["refusal"] is not None and w["refusal"]["kind"] == "provider-usage-limit", w
+    w = _run_invoke_lane_codex_wiring(tmp_path, e, "", e + "\n", "Review this change")
+    assert w["refusal"] is not None and w["refusal"]["kind"] == "provider-usage-limit", w
+
+
+def test_get_provider_refusal_direct_unrelated_recovered_stderr_is_not_a_refusal(tmp_path):
+    # the helper called directly (not through the Invoke-Lane statements), sol's exact input
+    r = _classify(tmp_path, "ERROR: upstream probe returned 429; recovered\n", "codex",
+                  prompt="Reply with exactly: ERROR: file not found", answer="ERROR: file not found")
+    assert r is None, r
+    r = _classify(tmp_path, "ERROR: upstream probe returned 429; recovered\n", "codex", answer="ERROR: missing semicolon")
+    assert r is None, r
+
+
+# --- r8 (sol r7 B1, HUB RULING 20261108T0009Z): the discriminator is REQUESTED OUTPUT, not vocabulary. A provider refusal
+# message is never text the prompt itself contains, so an ERROR-framed refusal-vocabulary answer whose every line occurs
+# verbatim in the prompt is the requested output, even when a recovered stderr line names the same kind.
+R8_SOL_WITNESSES = (
+    ("Reply with exactly: ERROR: rate limit handling added", "ERROR: rate limit handling added",
+     "ERROR: upstream probe returned 429; recovered\n"),
+    ("Reply with exactly: ERROR: authentication failed (example)", "ERROR: authentication failed (example)",
+     "ERROR: authentication failed on first attempt; recovered\n"),
+    ("Reply with exactly: ERROR: usage_limit_reached is a test fixture", "ERROR: usage_limit_reached is a test fixture",
+     "ERROR: usage_limit_reached on first attempt; recovered\n"),
+)
+
+
+def _r8_deliveries(answer):
+    # file-only, stdout-only, combined
+    return ((answer, ""), (None, answer), (answer, answer))
+
+
+def _assert_complete(w, ctx):
+    assert w["refusal"] is None, (ctx, w)
+    assert w["evidence"]["workCompleted"] is True, (ctx, w)
+    assert w["state"] == "complete" and w["complete"] is True and w["exit"] == 0, (ctx, w)
+
+
+@pytest.mark.parametrize("delivery", ["file-only", "stdout-only", "combined"])
+@pytest.mark.parametrize("witness", [0, 1, 2], ids=["rate-limit", "auth", "usage-limit"])
+def test_r8_sol_b1_requested_error_framed_answer_with_same_kind_recovered_stderr_is_complete(tmp_path, witness, delivery):
+    # sol r7 B1: nine executed counterexamples (3 kinds x file-only / stdout-only / combined) were state=refused, exit 125.
+    prompt, answer, stderr = R8_SOL_WITNESSES[witness]
+    last, stdout = dict(zip(("file-only", "stdout-only", "combined"), _r8_deliveries(answer)))[delivery]
+    w = _run_invoke_lane_codex_wiring(tmp_path, last, stdout, stderr, prompt, receipt=True)
+    _assert_complete(w, (prompt, last, stdout))
+
+
+def test_r8_dot_requested_http_429_answer_with_recovered_429_stderr_is_complete(tmp_path):
+    # Dot witness (bus 7737321, request 6714734662): last-message exactly the requested text, empty stdout, exit 0.
+    w = _run_invoke_lane_codex_wiring(tmp_path, "ERROR: HTTP 429", "", "ERROR: upstream probe returned 429; recovered\n",
+                                      "Reply with exactly this text and nothing else: ERROR: HTTP 429", receipt=True)
+    _assert_complete(w, "dot")
+
+
+def test_r8_requested_output_lines_are_trimmed_by_the_one_unicode_blank_rule(tmp_path):
+    # the line trim is the r7 blank rule (Unicode whitespace, Cf, Cc), so blank padding the prompt does not carry, and a
+    # CRLF prompt, never turn the requested text into a refusal.
+    stderr = "ERROR: upstream probe returned 429; recovered\n"
+    for answer in ("ERROR: HTTP 429 ", "　ERROR: HTTP 429​", "ERROR: HTTP 429\r\n \r\nERROR: HTTP 429  "):
+        w = _run_invoke_lane_codex_wiring(tmp_path, answer, "", stderr, "Reply with exactly:\r\nERROR: HTTP 429\r\n", receipt=True)
+        _assert_complete(w, repr(answer))
+    # the helper itself, directly
+    assert _classify(tmp_path, stderr, "codex", prompt="Say: ERROR: HTTP 429", answer="ERROR: HTTP 429 ") is None
+
+
+def test_r8_genuine_refusal_control_answer_not_in_the_prompt_is_still_refused_and_outranks_work_completed(tmp_path):
+    # control (must hold on both heads): the answer IS refusal text the prompt never contained, and stderr names the same
+    # kind. INV-11: the refusal outranks workEvidence.workCompleted -> refused, complete=false, exit 125.
+    w = _run_invoke_lane_codex_wiring(tmp_path, "ERROR: HTTP 429", "", "ERROR: HTTP 429\n", "Review this change", receipt=True)
+    assert w["refusal"] is not None and w["refusal"]["kind"] == "provider-rate-limit", w
+    assert w["evidence"]["workCompleted"] is True, w
+    assert w["state"] == "refused" and w["complete"] is False and w["exit"] == 125, w
+    kinds = ("provider-rate-limit", "provider-auth", "provider-usage-limit")
+    for (_, answer, stderr), kind in zip(R8_SOL_WITNESSES, kinds):
+        for last, stdout in _r8_deliveries(answer):
+            w = _run_invoke_lane_codex_wiring(tmp_path, last, stdout, stderr, "Review this change", receipt=True)
+            assert w["refusal"] is not None and w["refusal"]["kind"] == kind, (answer, last, stdout, w)
+            assert w["state"] == "refused" and w["exit"] == 125, (answer, w)
+
+
+def test_r8_a_partially_requested_or_case_different_answer_is_still_refused(tmp_path):
+    # EVERY substantive line must occur in the prompt, ordinally: one unrequested refusal line, or a case variant, is not
+    # requested output.
+    stderr = "ERROR: HTTP 429\n"
+    prompt = "Reply with exactly: ERROR: HTTP 429"
+    for answer in ("ERROR: HTTP 429\nERROR: rate limited, try again in 20s", "ERROR: http 429", "ERROR: HTTP  429"):
+        w = _run_invoke_lane_codex_wiring(tmp_path, answer, "", stderr, prompt, receipt=True)
+        assert w["refusal"] is not None and w["refusal"]["kind"] == "provider-rate-limit", (answer, w)
+        assert w["state"] == "refused" and w["exit"] == 125, (answer, w)
+    # an empty prompt contains nothing
+    assert _classify(tmp_path, stderr, "codex", prompt="", answer="ERROR: HTTP 429")["kind"] == "provider-rate-limit"
+
+
+def test_r3_adv_a1_an_unterminated_final_fence_counts_only_as_one_complete_strict_object(tmp_path):
+    # adversary r3 A1, narrowed by the real-receipt replay: an open fence at the end of the answer runs to the end,
+    # and its body is judged as a whole. Two REAL complete codex receipts (fleet-runs 20260906T160250Z and
+    # 20260906T191539Z) end in an unclosed ```json fence around a complete verdict object, so that shape completes.
+    prose = "x" * 130 + "\n"
+    approve = '{"verdict":"APPROVE"}'
+    for tail in ('```json\n' + approve + '\n', '~~~json\n' + approve, '```json\n' + approve):
+        r = _work_evidence(tmp_path, "codex", prose + tail, 0, prompt_chars=600, require_verdict=True)
+        assert r["workCompleted"] is True, (tail, r)
+    # truncated JSON, a null verdict, trailing prose, a short close and a mismatched close are never a completion
+    for tail in ('```json\n{"verdict":"APPROVE"', '```json\n{"verdict":null}\n', '```json\n' + approve + '\nand then I kept going\n',
+                 '````json\n' + approve + '\n```\n', '```json\n' + approve + '\n~~~\n', '~~~json\n' + approve + '\n```\n'):
+        r = _work_evidence(tmp_path, "codex", prose + tail, 0, prompt_chars=600, require_verdict=True)
+        assert r["workCompleted"] is False and r["reason"] == "codex-no-verdict", (tail, r)
+    # a provisional closed APPROVE then an unterminated fence with a null or truncated body is not a completion
+    prov = '```json\n' + approve + '\n```\n'
+    for tail in ('```json\n{"verdict":null}\n', '```json\n{"verdict":"APPROVE"'):
+        r = _work_evidence(tmp_path, "codex", prose + prov + tail, 0, prompt_chars=600, require_verdict=True)
+        assert r["workCompleted"] is False, (tail, r)
+    assert _work_evidence(tmp_path, "codex", prose + prov, 0, prompt_chars=600, require_verdict=True)["workCompleted"] is True
+
+
+def test_r3_adv_a2_a_final_non_object_value_never_leaves_an_earlier_approval_authoritative(tmp_path):
+    # adversary r3 A2: an unfenced array after a fenced APPROVE was not a candidate start, so the fence stood.
+    prose = "x" * 130 + "\n"
+    prov = '```json\n{"verdict":"APPROVE"}\n```\n'
+    for tail in ('[{"verdict":null}]\n', '[\n  {"verdict":"APPROVE"}\n]\n', '{"verdict":"APPROVE"}\n[1]\n'):
+        r = _work_evidence(tmp_path, "codex", prose + prov + tail, 0, prompt_chars=600, require_verdict=True)
+        assert r["workCompleted"] is False and r["reason"] == "codex-no-verdict", (tail, r)
+    # two unfenced objects with prose between: the LAST top-level object decides, either way
+    ok = prose + '{"verdict":null}\nOn reflection:\n{"verdict":"APPROVE"}\n'
+    assert _work_evidence(tmp_path, "codex", ok, 0, prompt_chars=600, require_verdict=True)["workCompleted"] is True
+    bad = prose + '{"verdict":"APPROVE"}\nOn reflection:\n{"verdict":null}\n'
+    assert _work_evidence(tmp_path, "codex", bad, 0, prompt_chars=600, require_verdict=True)["workCompleted"] is False
+
+
+def test_r3_adv_a3_final_json_must_be_strict_json(tmp_path):
+    # adversary r3 A3: PowerShell ConvertFrom-Json accepts trailing commas and comments; the contract is JSON.
+    prose = "x" * 130 + "\n"
+    for body in ('{"verdict":"APPROVE",}', '{"verdict":"APPROVE"} // note', '{/*c*/"verdict":"APPROVE"}',
+                 '{"verdict":"APPROVE",\n "findings":[1,]}'):
+        for wrap in ("```json\n%s\n```\n", "%s\n"):
+            r = _work_evidence(tmp_path, "codex", prose + wrap % body, 0, prompt_chars=600, require_verdict=True)
+            assert r["workCompleted"] is False and r["reason"] == "codex-no-verdict", (body, wrap, r)
+    ok = '{"verdict":"APPROVE","findings":[],"note":"a \\" brace } in a string"}'
+    assert _work_evidence(tmp_path, "codex", prose + "```json\n" + ok + "\n```\n", 0, prompt_chars=600, require_verdict=True)["workCompleted"] is True
+    assert _work_evidence(tmp_path, "codex", prose + ok + "\n", 0, prompt_chars=600, require_verdict=True)["workCompleted"] is True
+
+
+def test_r3_adv_a4_a_nested_draft_never_replaces_an_unfinished_enclosing_object(tmp_path):
+    # adversary r3 A4: reverse suffix parsing picked the nested APPROVE object of an unfinished root.
+    prose = "x" * 130 + "\n"
+    for tail in ('{\n"verdict":null,\n"draft":\n{"verdict":"APPROVE"}',
+                 '{\n"verdict":null,\n"draft":[\n{"verdict":"APPROVE"}\n]'):
+        r = _work_evidence(tmp_path, "codex", prose + tail, 0, prompt_chars=600, require_verdict=True)
+        assert r["workCompleted"] is False and r["reason"] == "codex-no-verdict", (tail, r)
+    # a finished multi-line root with nested objects is still one object
+    nested = '{\n  "verdict": "APPROVE",\n  "findings": [\n    {"id": 1, "x": {"verdict": null}}\n  ]\n}\n'
+    assert _work_evidence(tmp_path, "codex", prose + nested, 0, prompt_chars=600, require_verdict=True)["workCompleted"] is True
+
+
+def test_r3_adv_a5_every_line_separator_splits_answer_lines_before_they_are_classified(tmp_path):
+    # adversary r3 A5: a bare CR (or U+2028 / U+2029 / U+0085) joined two answer lines into one, so a line that
+    # merely sits NEXT TO refusal vocabulary was classified as naming it.
+    e = "ERROR: you've hit your usage limit"
+    for sep in ("\r", "\u2028", "\u2029", "\u0085"):
+        r = _classify(tmp_path, e + "\n", "codex", prompt="Reply with exactly these lines",
+                      answer="ERROR: file not found" + sep + e)
+        assert r is None, (repr(sep), r)
+        # the all-refusal answer split by the same separator is still the refusal delivered as the answer
+        r = _classify(tmp_path, e + "\n", "codex", prompt="Review this", answer=e + sep + e)
+        assert r is not None and r["kind"] == "provider-usage-limit", (repr(sep), r)
+    # a fence close is recognised across the same separators
+    prose = "x" * 130 + "\r"
+    ok = prose + '```json\r{"verdict":"APPROVE"}\r```\r'
+    assert _work_evidence(tmp_path, "codex", ok, 0, prompt_chars=600, require_verdict=True)["workCompleted"] is True
+
+def test_r3b_adv_a1_json_text_is_never_re_split_on_unicode_separators(tmp_path):
+    # adversary r3b A1: U+0085 / U+2028 / U+2029 are legal INSIDE a JSON string and are NOT JSON whitespace, so
+    # splitting a JSON candidate on them corrupted a legal string and made an illegal object parse.
+    prose = "x" * 130 + "\n"
+    for sep in ("\u2028", "\u2029", "\u0085"):
+        # illegal: the separator sits where JSON needs whitespace or a value -> never a completion
+        r = _work_evidence(tmp_path, "codex", prose + '{"verdict":' + sep + '"APPROVE"}', 0, prompt_chars=600, require_verdict=True)
+        assert r["workCompleted"] is False and r["reason"] == "codex-no-verdict", (repr(sep), r)
+        # legal: the separator inside a string value is part of the string
+        ok = '{"verdict":"APPROVE","note":"a' + sep + 'b"}'
+        assert _work_evidence(tmp_path, "codex", prose + ok + "\n", 0, prompt_chars=600, require_verdict=True)["workCompleted"] is True, repr(sep)
+        assert _work_evidence(tmp_path, "codex", prose + "```json\n" + ok + "\n```\n", 0, prompt_chars=600, require_verdict=True)["workCompleted"] is True, repr(sep)
+        # a claude success envelope carrying the separator inside a string is still recognised
+        env = '{"type":"result","subtype":"success","is_error":false,"result":"a' + sep + 'b"}'
+        r = _work_evidence(tmp_path, "claude", env + "\n", 0)
+        assert r["workCompleted"] is True, (repr(sep), r)
+
+
+def test_r3b_adv_a2_a_mismatched_closer_ends_the_value_as_malformed_not_as_closed(tmp_path):
+    # adversary r3b A2: ']' closed '{' in the depth counter, so scanning resumed and a nested APPROVE won.
+    prose = "x" * 130 + "\n"
+    for tail in ('{\n"verdict":null,\n"draft":]\n{"verdict":"APPROVE"}', '[\n"draft":}\n{"verdict":"APPROVE"}',
+                 '{\n"verdict":null,\n"draft":[\n{"verdict":"APPROVE"}\n}'):
+        r = _work_evidence(tmp_path, "codex", prose + tail, 0, prompt_chars=600, require_verdict=True)
+        assert r["workCompleted"] is False and r["reason"] == "codex-no-verdict", (tail, r)
+    nested = '{\n  "verdict": "APPROVE",\n  "findings": [\n    {"id": 1}\n  ]\n}\n'
+    assert _work_evidence(tmp_path, "codex", prose + nested, 0, prompt_chars=600, require_verdict=True)["workCompleted"] is True
+
+
+def test_r3b_adv_a3_a_claude_envelope_needs_a_real_boolean_false_is_error(tmp_path):
+    # adversary r3b A3 (pre-existing, same function): [bool]$null / [bool]0 / [bool]@() are $false, so a null or
+    # non-boolean is_error read as "not an error".
+    for bad in ("null", "0", "[]", "[false]", '"false"'):
+        env = '{"type":"result","subtype":"success","is_error":%s}' % bad
+        r = _work_evidence(tmp_path, "claude", env + "\n", 0)
+        assert r["workCompleted"] is False, (bad, r)
+    ok = _work_evidence(tmp_path, "claude", '{"type":"result","subtype":"success","is_error":false}\n', 0)
+    assert ok["workCompleted"] is True, ok
+
+
+
+def test_r3c_json_whitespace_is_space_tab_cr_lf_only_never_unicode_whitespace(tmp_path):
+    # r3c class sweep of r3b A1: String.Trim() also strips NBSP / NEL / LS / PS, which are NOT JSON whitespace, so
+    # a candidate or envelope wrapped in them parsed although the text is not JSON.
+    prose = "x" * 130 + "\n"
+    for sep in (" ", " ", " ", "\u0085", "　"):
+        r = _work_evidence(tmp_path, "codex", prose + '{"verdict":"APPROVE"}' + sep + "\n", 0, prompt_chars=600, require_verdict=True)
+        assert r["workCompleted"] is False and r["reason"] == "codex-no-verdict", (repr(sep), r)
+        env = '{"type":"result","subtype":"success","is_error":false,"result":"ok"}'
+        for wrapped in (sep + env, env + sep):
+            r = _work_evidence(tmp_path, "claude", wrapped + "\n", 0)
+            assert r["workCompleted"] is False, (repr(sep), r)
+    # JSON whitespace around a complete verdict object stays fine
+    ok = prose + '{"verdict":"APPROVE"}\t \r\n\n'
+    assert _work_evidence(tmp_path, "codex", ok, 0, prompt_chars=600, require_verdict=True)["workCompleted"] is True
+    env = ' \t{"type":"result","subtype":"success","is_error":false,"result":"ok"} \r\n'
+    assert _work_evidence(tmp_path, "claude", env, 0)["workCompleted"] is True
+
+
+def test_r3c_a_non_boolean_is_error_is_never_a_provider_refusal(tmp_path):
+    # r3c class sweep of r3b A3: `$j.is_error -eq $true` is true for the integer 1, so a non-boolean is_error
+    # whose result text names a usage limit read as a provider refusal.
+    for bad in ("1", '"true"', "[true]"):
+        env = ('{"type":"result","subtype":"success","is_error":%s,"api_error_status":null,'
+               '"result":"You\'ve hit your session limit."}\n') % bad
+        assert _classify(tmp_path, "", "claude", answer=env) is None, bad
+    assert _classify(tmp_path, "", "claude", answer=REAL_CLAUDE_429_ENVELOPE) is not None
+
+
+def test_r3c_adv_a1_valid_nested_metadata_never_erases_a_real_verdict(tmp_path):
+    # adversary r3c A1: ConvertFrom-Json throws on nested keys differing only by case, an empty key and a key named
+    # PSObject; the strict parse accepts all three, so the verdict was lost.
+    prose = "x" * 130 + "\n"
+    for meta in ('{"foo":1,"Foo":2}', '{"":1}', '{"PSObject":1}'):
+        body = '{"verdict":"APPROVE","metadata":%s}' % meta
+        for wrap in ("%s\n", "```json\n%s\n```\n"):
+            r = _work_evidence(tmp_path, "codex", prose + wrap % body, 0, prompt_chars=600, require_verdict=True)
+            assert r["workCompleted"] is True, (meta, wrap, r)
+    # top-level duplicate key: the last one wins, as ConvertFrom-Json did
+    r = _work_evidence(tmp_path, "codex", prose + '{"verdict":null,"verdict":"APPROVE"}\n', 0, prompt_chars=600, require_verdict=True)
+    assert r["workCompleted"] is True, r
+    r = _work_evidence(tmp_path, "codex", prose + '{"verdict":"APPROVE","verdict":null}\n', 0, prompt_chars=600, require_verdict=True)
+    assert r["workCompleted"] is False and r["reason"] == "codex-no-verdict", r
+    # a strict-parse failure still fails (the build never loosens the contract)
+    r = _work_evidence(tmp_path, "codex", prose + '{"verdict":"APPROVE",}\n', 0, prompt_chars=600, require_verdict=True)
+    assert r["workCompleted"] is False, r
+    # a claude success envelope with such metadata is still an envelope
+    env = '{"type":"result","subtype":"success","is_error":false,"meta":{"a":1,"A":2},"result":"ok"}\n'
+    assert _work_evidence(tmp_path, "claude", env, 0)["workCompleted"] is True
+
+
+def test_r3c_adv_a2_a_final_scalar_line_never_leaves_an_earlier_approval_authoritative(tmp_path):
+    prose = "x" * 130 + "\n"
+    prov = '```json\n{"verdict":"APPROVE"}\n```\n'
+    for tail in ("null", "false", "0", '"no verdict issued"', "true", "-1.5e3"):
+        r = _work_evidence(tmp_path, "codex", prose + prov + tail + "\n", 0, prompt_chars=600, require_verdict=True)
+        assert r["workCompleted"] is False and r["reason"] == "codex-no-verdict", (tail, r)
+    # prose after the fence is still not a JSON value: the approval stands (r2 behaviour kept)
+    for tail in ("Done.\n", "That is my verdict.\n", "\n\n"):
+        assert _work_evidence(tmp_path, "codex", prose + prov + tail, 0, prompt_chars=600, require_verdict=True)["workCompleted"] is True, tail
+
+
+def test_r3c_adv_a3_prompt_length_is_counted_in_code_points_not_utf16_units(tmp_path):
+    prompt = "Reply OK. " + "\U0001F600" * 195
+    cmd = ". '%s'; $s = [IO.File]::ReadAllText('%s'); (Get-LaneCodePointCount -Text $s).ToString()" % (REFUSAL_HELPER, tmp_path / "p.txt")
+    (tmp_path / "p.txt").write_text(prompt, encoding="utf-8")
+    out = subprocess.run(["pwsh", "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", cmd], text=True, capture_output=True)
+    assert out.returncode == 0, out.stderr
+    n = int(out.stdout.strip().splitlines()[-1])
+    assert n == 205, n          # String.Length is 400 here and removed the short-probe exemption
+    assert _work_evidence(tmp_path, "codex", "OK", 0, prompt_chars=n)["workCompleted"] is True
+    assert "-PromptChars (Get-LaneCodePointCount -Text ([string]$Prompt))" in LANE_RUNNER.read_text(encoding="utf-8")
+
+
+R4_PROSE = "x" * 130 + "\n"
+# (verdict value as JSON text, expected refusal reason). Null, absent and blank keep the historical reason; any
+# other non-String kind is named, so the receipt says WHAT the model wrote instead of a verdict.
+R4_VERDICT_KINDS = [
+    ("[]", "codex-verdict-wrong-kind-Array"),
+    ('["APPROVE"]', "codex-verdict-wrong-kind-Array"),
+    ("{}", "codex-verdict-wrong-kind-Object"),
+    ('{"a":"APPROVE"}', "codex-verdict-wrong-kind-Object"),
+    ("true", "codex-verdict-wrong-kind-Boolean"),
+    ("false", "codex-verdict-wrong-kind-Boolean"),
+    ("1", "codex-verdict-wrong-kind-Number"),
+    ("1.5", "codex-verdict-wrong-kind-Number"),
+    ("1e999", "codex-verdict-wrong-kind-Number"),
+    ("null", "codex-no-verdict"),
+    ('""', "codex-no-verdict"),
+    ('"   "', "codex-no-verdict"),
+]
+
+
+def test_r4_dot_p2_a_verdict_of_a_non_string_kind_is_never_positive_evidence(tmp_path):
+    # Dot P2 on 45ef9f60: a final {"verdict":[]} was projected through GetRawText() to the nonblank string "[]", so
+    # the consumer booked workCompleted=true. A contract-bearing key keeps its JSON kind: verdict is a String.
+    for val, reason in R4_VERDICT_KINDS:
+        body = '{"verdict":%s,"reviewer":"sol"}' % val
+        for wrap in ("%s\n", "```json\n%s\n```\n"):
+            r = _work_evidence(tmp_path, "codex", R4_PROSE + wrap % body, 0, prompt_chars=600, require_verdict=True)
+            assert r["workCompleted"] is False and r["reason"] == reason, (val, wrap, r)
+    # the kind is judged on the LAST duplicate key, as ConvertFrom-LaneJsonObject has always resolved it
+    r = _work_evidence(tmp_path, "codex", R4_PROSE + '{"verdict":"APPROVE","verdict":[]}\n', 0, prompt_chars=600, require_verdict=True)
+    assert r["workCompleted"] is False and r["reason"] == "codex-verdict-wrong-kind-Array", r
+    # a non-string verdict in the FINAL object is not rescued by a provisional String verdict before it
+    r = _work_evidence(tmp_path, "codex", R4_PROSE + '```json\n{"verdict":"APPROVE"}\n```\n{"verdict":{}}\n', 0, prompt_chars=600, require_verdict=True)
+    assert r["workCompleted"] is False and r["reason"] == "codex-verdict-wrong-kind-Object", r
+
+
+def test_r4_dot_p2_controls_a_string_verdict_with_unrelated_nested_metadata_still_completes(tmp_path):
+    for body in (KEY_FINAL_JSON,
+                 '{"verdict":"CHANGES_REQUESTED","findings":[{"id":1,"detail":{"k":[]}}],"meta":{},"empty":[],"n":null,"b":true,"x":1.5}',
+                 '{\n  "verdict": "APPROVE",\n  "findings": [],\n  "metadata": {"a": {}, "b": []}\n}'):
+        for wrap in ("%s\n", "```json\n%s\n```\n"):
+            r = _work_evidence(tmp_path, "codex", R4_PROSE + wrap % body, 0, prompt_chars=600, require_verdict=True)
+            assert r["workCompleted"] is True and r["reason"] is None, (body, wrap, r)
+    # a String that merely LOOKS like another kind is still a String (the contract is the JSON kind)
+    r = _work_evidence(tmp_path, "codex", R4_PROSE + '{"verdict":"[]"}\n', 0, prompt_chars=600, require_verdict=True)
+    assert r["workCompleted"] is True, r
+
+
+def test_r4_dot_p2_the_contract_names_the_allowed_json_kind_per_field_in_code():
+    src = REFUSAL_HELPER.read_text(encoding="utf-8")
+    assert "$script:LANE_JSON_CONTRACT" in src
+    for field in ("verdict", "type", "subtype", "terminal_reason", "result", "is_error", "api_error_status"):
+        assert re.search(r"(?m)^\s*%s\s*=\s*@\('[A-Za-z']+" % field, src), field
+    # no projection of a nested JSON element into raw text remains in the object builder
+    builder = src[src.index("function ConvertFrom-LaneJsonObject"):src.index("function Test-LaneJsonScalar")]
+    assert "default  { $v = $e.GetRawText() }" not in builder
+    # r4 A2: the result is a case-exact (ordinal) dictionary, not a psobject whose member names collide by case
+    assert "[System.StringComparer]::Ordinal" in builder and "$o[$name] = $v" in builder
+    assert "Add-Member" not in builder
+
+
+def test_r4_dot_p2_claude_envelope_fields_of_the_wrong_kind_are_not_completion_evidence(tmp_path):
+    # the same class on the claude side: subtype / terminal_reason / result keep their kind too
+    for env in ('{"type":"result","subtype":["success"],"is_error":false,"result":"ok"}\n',
+                '{"type":"result","subtype":{},"is_error":false,"result":"ok"}\n',
+                '{"type":"result","subtype":"success","is_error":false,"terminal_reason":["completed"],"result":"ok"}\n',
+                '{"type":"result","subtype":"success","is_error":"false","result":"ok"}\n'):
+        r = _work_evidence(tmp_path, "claude", env, 0)
+        assert r["workCompleted"] is False, (env, r)
+    ok = '{"type":"result","subtype":"success","is_error":false,"terminal_reason":"completed","result":"ok","meta":{"a":[]}}\n'
+    assert _work_evidence(tmp_path, "claude", ok, 0)["workCompleted"] is True
+    # an array-typed result text never feeds the refusal vocabulary
+    env = '{"type":"result","subtype":"success","is_error":true,"api_error_status":null,"result":["You\'ve hit your session limit."]}\n'
+    assert _classify(tmp_path, "", "claude", answer=env) is None
+
+
+def test_r4_adv_a1_a_scalar_line_after_the_last_fence_decides_even_when_prose_follows_it(tmp_path):
+    # adversary r4 A1: only the LAST non-blank line was tested for a lone scalar, so "null" followed by "Done."
+    # left the earlier fenced APPROVE authoritative. The terminal JSON value is the last value by position.
+    prov = '```json\n{"verdict":"APPROVE"}\n```\n'
+    for scalar in ("null", "false", "0", '"no verdict issued"', "true", "-1.5e3"):
+        for tail in ("%s\nDone.\n", "%s\nDone.\nThat is my verdict.\n", "%s\n\n\nDone.", "Summary:\n%s\nDone.\n"):
+            r = _work_evidence(tmp_path, "codex", R4_PROSE + prov + tail % scalar, 0, prompt_chars=600, require_verdict=True)
+            assert r["workCompleted"] is False and r["reason"] == "codex-no-verdict", (scalar, tail, r)
+    # the same with no fence at all: an unfenced object, then a scalar, then prose
+    r = _work_evidence(tmp_path, "codex", R4_PROSE + '{"verdict":"APPROVE"}\nnull\nDone.\n', 0, prompt_chars=600, require_verdict=True)
+    assert r["workCompleted"] is False, r
+    # controls: prose alone after the fence leaves the approval standing; a scalar BEFORE a later object does not matter;
+    # a scalar line INSIDE a multi-line final object is part of that object
+    assert _work_evidence(tmp_path, "codex", R4_PROSE + prov + "Done.\nThat is my verdict.\n", 0, prompt_chars=600, require_verdict=True)["workCompleted"] is True
+    assert _work_evidence(tmp_path, "codex", R4_PROSE + 'null\n{"verdict":"APPROVE"}\n', 0, prompt_chars=600, require_verdict=True)["workCompleted"] is True
+    inner = '{\n  "verdict": "APPROVE",\n  "list": [\n    null\n  ]\n}\n'
+    assert _work_evidence(tmp_path, "codex", R4_PROSE + inner, 0, prompt_chars=600, require_verdict=True)["workCompleted"] is True
+    assert _work_evidence(tmp_path, "codex", R4_PROSE + prov + "3 findings.\nDone.\n", 0, prompt_chars=600, require_verdict=True)["workCompleted"] is True
+
+
+def test_r4_adv_a2_the_exactly_spelled_contract_field_is_never_hidden_by_a_case_variant(tmp_path):
+    # adversary r4 A2: PowerShell member names are case-insensitive, so a case-variant key that came FIRST made the
+    # builder drop the exactly-spelled contract field that came after it.
+    cx = lambda body: _work_evidence(tmp_path, "codex", R4_PROSE + body + "\n", 0, prompt_chars=600, require_verdict=True)
+    assert cx('{"VERDICT":null,"verdict":"APPROVE"}')["workCompleted"] is True
+    assert cx('{"Verdict":[],"verdict":"APPROVE"}')["workCompleted"] is True
+    assert cx('{"verdict":"APPROVE","VERDICT":[]}')["workCompleted"] is True
+    r = cx('{"VERDICT":"APPROVE","verdict":null}')
+    assert r["workCompleted"] is False and r["reason"] == "codex-no-verdict", r
+    r = cx('{"VERDICT":"APPROVE","verdict":[]}')
+    assert r["reason"] == "codex-verdict-wrong-kind-Array", r
+    r = cx('{"Verdict":"APPROVE"}')                       # only a variant spelling: still no verdict
+    assert r["workCompleted"] is False and r["reason"] == "codex-no-verdict", r
+    # claude envelope: the exact terminal_reason / is_error / subtype / type decide, whichever spelling came first
+    head = '{"type":"result","subtype":"success","is_error":false,'
+    r = _work_evidence(tmp_path, "claude", head + '"TERMINAL_REASON":"completed","terminal_reason":"max_turns"}\n', 0)
+    assert r["workCompleted"] is False and r["reason"] == "terminal-reason-max_turns", r
+    assert _work_evidence(tmp_path, "claude", head + '"terminal_reason":"completed","TERMINAL_REASON":"max_turns"}\n', 0)["workCompleted"] is True
+    assert _work_evidence(tmp_path, "claude", '{"IS_ERROR":true,"type":"result","subtype":"success","is_error":false}\n', 0)["workCompleted"] is True
+    assert _work_evidence(tmp_path, "claude", '{"is_error":false,"IS_ERROR":true,"type":"result","subtype":"success"}\n', 0)["workCompleted"] is True
+    assert _work_evidence(tmp_path, "claude", '{"type":"result","subtype":"success","IS_ERROR":false}\n', 0)["workCompleted"] is False  # no exact is_error
+    assert _work_evidence(tmp_path, "claude", '{"TYPE":"result","subtype":"success","is_error":false}\n', 0)["workCompleted"] is False   # not the envelope
+    assert _work_evidence(tmp_path, "claude", '{"TYPE":"x","type":"result","subtype":"success","is_error":false}\n', 0)["workCompleted"] is True
+    # refusal: result / api_error_status / is_error collisions hide no genuine refusal
+    env = '{"RESULT":"ok","type":"result","subtype":"success","is_error":true,"result":"You\'ve hit your session limit."}\n'
+    assert _classify(tmp_path, "", "claude", answer=env) is not None
+    env = '{"API_ERROR_STATUS":null,"type":"result","subtype":"success","is_error":true,"api_error_status":429,"result":"x"}\n'
+    r = _classify(tmp_path, "", "claude", answer=env)
+    assert r is not None and r["kind"] == "provider-rate-limit", r
+    env = '{"IS_ERROR":false,"type":"result","is_error":true,"api_error_status":429,"result":"x"}\n'
+    assert _classify(tmp_path, "", "claude", answer=env) is not None
+    # and a variant spelling alone never makes a refusal
+    env = '{"type":"result","subtype":"success","IS_ERROR":true,"result":"You\'ve hit your session limit."}\n'
+    assert _classify(tmp_path, "", "claude", answer=env) is None
+
+
+def test_r4_adv2_a1_a_malformed_quote_led_line_after_the_last_fence_is_a_malformed_terminal_value(tmp_path):
+    # adversary r4 pass 2 A1: an unterminated JSON string line ("no verdict issued) is a malformed terminal value, not
+    # prose, so the earlier provisional approval must not stand in for it.
+    prov = '```json\n{"verdict":"APPROVE"}\n```\n'
+    for tail in ('"no verdict issued\n', '"no verdict issued\nDone.\n', '"unterminated \\"\n'):
+        r = _work_evidence(tmp_path, "codex", R4_PROSE + prov + tail, 0, prompt_chars=600, require_verdict=True)
+        assert r["workCompleted"] is False and r["reason"] == "codex-no-verdict", (tail, r)
+    # prose that merely starts with a digit or a word is still prose; a complete quoted string is the scalar case
+    for tail in ("3 findings.\nDone.\n", "null hypothesis rejected.\n", "true to the spec.\n"):
+        assert _work_evidence(tmp_path, "codex", R4_PROSE + prov + tail, 0, prompt_chars=600, require_verdict=True)["workCompleted"] is True, tail
+
+
+def test_r6_adv_a1_closed_quoted_prose_after_the_last_fence_is_prose_not_a_malformed_terminal_value(tmp_path):
+    # adversary r6 A1 (introduced by r4 pass 2 A1): StartsWith('"') made EVERY quote-led line the terminal value, so a valid
+    # fenced verdict followed by '"Approve" is my verdict.' was booked codex-no-verdict. Only a quote-led line whose string
+    # never closes, or closes with nothing after it and is not valid JSON, is a malformed terminal value.
+    prov = '~~~json\n{"verdict":"APPROVE"}\n~~~\n'
+    for tail in ('"Approve" is my verdict.\n', '"Approve" is my "final" verdict.\n', '"x" y\nDone.\n', '"a\\"b" then prose\n'):
+        r = _work_evidence(tmp_path, "codex", R4_PROSE + prov + tail, 0, prompt_chars=600, require_verdict=True)
+        assert r["workCompleted"] is True, (tail, r)
+    # controls: an unterminated string, a closed-but-invalid string alone, and a complete scalar all still end the answer
+    for tail in ('"no verdict issued\n', '"a\\qb"\n', '"APPROVE"\n', '"unterminated \\"\n'):
+        r = _work_evidence(tmp_path, "codex", R4_PROSE + prov + tail, 0, prompt_chars=600, require_verdict=True)
+        assert r["workCompleted"] is False and r["reason"] == "codex-no-verdict", (tail, r)
+
+
+def _work_evidence_many(tmp_path, answers, prompt_chars=600, require_verdict=True):
+    # One pwsh for many answers (the r7 whitespace variants), each through the real Get-LaneWorkEvidence.
+    srcs = []
+    for n, a in enumerate(answers):
+        p = tmp_path / f"many-{n}.txt"
+        p.write_text(a, encoding="utf-8", newline="")
+        srcs.append(str(p))
+    lst = tmp_path / "many.list"
+    lst.write_text("\n".join(srcs), encoding="utf-8")
+    rv = " -RequireVerdict" if require_verdict else ""
+    cmd = (
+        f". '{REFUSAL_HELPER}'; "
+        f"foreach ($f in [IO.File]::ReadAllLines('{lst}')) {{ $a = [IO.File]::ReadAllText($f); "
+        f"Get-LaneWorkEvidence -Engine codex -Answer $a -ExitCode 0 -PromptChars {prompt_chars}{rv} | ConvertTo-Json -Compress }}"
+    )
+    out = subprocess.run(["pwsh", "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", cmd],
+                         text=True, capture_output=True)
+    assert out.returncode == 0, out.stderr
+    lines = [ln for ln in out.stdout.strip().splitlines() if ln.startswith("{")]
+    assert len(lines) == len(answers), out.stdout
+    return [json.loads(ln) for ln in lines]
+
+
+# r7 F1 = r6 OPEN A1 = Dot B2 (lane-provider-refusal.ps1 Test-PromptDemandsVerdict): "a '{' somewhere before the key" is
+# satisfied by ANY earlier brace, so a literal-output probe that names a brace (or closes an unrelated object) demanded a
+# verdict and its exact requested answer was booked codex-no-verdict / ended-incomplete.
+R7_F1_PROMPTS = [
+    'The symbol { is punctuation. Reply with exactly these 10 characters: "verdict":',  # adversary-a96b095b.json A1
+    'Ignore the example {}. Reply with exactly these 10 characters: "verdict":',        # Dot B2, 73 characters
+]
+
+
+def test_r7_f1_an_unrelated_brace_before_a_quoted_field_is_not_a_verdict_demand(tmp_path):
+    for prompt in R7_F1_PROMPTS:
+        # the REAL completion path: Invoke-Lane's K4-EVIDENCE block decides the demand from the prompt itself
+        w = _run_invoke_lane_codex_wiring(tmp_path, '"verdict":', "", "", prompt)
+        assert w["evidence"]["workCompleted"] is True, (prompt, w)
+        assert not _prompt_demands_verdict(tmp_path, prompt), prompt
+
+
+def test_r7_f1_a_verdict_demand_is_a_verdict_key_inside_the_object_a_brace_opens(tmp_path):
+    # still demands: the key is a top-level member of an object that a brace opens and closes, wherever it sits
+    for prompt in ('Final json:\n{"verdict":"APPROVE|CHANGES_REQUESTED","reviewer":"sol"}',
+                   '{ "verdict" : "CLEAN|FINDINGS" }',
+                   'End with {"schema":"adversary-pass.v1", "verdict": "CLEAN" | "FINDINGS", "findings": [...]}',
+                   'Unrelated {} first, then the final json {"verdict": "APPROVE"}',
+                   'A stray { brace, then: {"verdict": "APPROVE"}',
+                   'Wrapped: {"result": {"verdict": "APPROVE"}}',
+                   'Code: if ($x) { $y = 1 } then reply {"verdict": "APPROVE"}'):
+        assert _prompt_demands_verdict(tmp_path, prompt), prompt
+    # not a demand: the key is not a member of an object a brace opens
+    for prompt in ('A brace { then the words "verdict": and no close',
+                   'The example {"note": "say \\"verdict\\": here"} is a string, not a key',
+                   'The list ["verdict": 1] is an array',
+                   'Closed {"other": 1} then "verdict": outside it',
+                   'A member value {"note": "verdict": 1}'):
+        assert not _prompt_demands_verdict(tmp_path, prompt), prompt
+    # a genuine key prompt still holds a keyless answer to the verdict contract, end to end
+    key_prompt = 'Review.\nFinal json: {"verdict":"APPROVE|CHANGES_REQUESTED"}\n' + "x" * 600
+    w = _run_invoke_lane_codex_wiring(tmp_path, KEY_ANSWER_BODY * 3, "", "", key_prompt)
+    assert w["evidence"]["reason"] == "codex-no-verdict", w
+
+
+# r7 F2 = Dot B1 (lane-provider-refusal.ps1 terminal-candidate path): the terminal-line scan trimmed JSON whitespace only,
+# so '"no verdict issued"' + U+00A0 failed the strict scalar parse, the quote-led helper read the NBSP as "words after the
+# string" (prose), and the earlier fenced approval was resurrected (workCompleted=true). Every whitespace decision on that
+# path treats Unicode whitespace (and Cf format characters) like JSON whitespace, or refuses closed.
+R7_F2_PROV = R4_PROSE + '```json\n{"verdict":"APPROVE"}\n```\n'
+R7_F2_CODE_POINTS = ["\u00a0", "\ufeff", "\u2000", "\u2005", "\u200a", "\u200b", "\u202f", "\u205f", "\u3000",
+                     "\u1680", "\u0085", "\u2060", "\u000b", "\u000c", "\u001e"]
+
+
+def test_r7_f2_dot_b1_a_closed_string_then_nbsp_after_the_last_fence_is_the_terminal_value(tmp_path):
+    r = _work_evidence(tmp_path, "codex", R7_F2_PROV + '"no verdict issued"\u00a0\n', 0, prompt_chars=600, require_verdict=True)
+    assert r["workCompleted"] is False and r["reason"] == "codex-no-verdict", r
+
+
+def test_r7_f2_every_unicode_whitespace_code_point_on_the_terminal_line_refuses_closed(tmp_path):
+    cases = []
+    for cp in R7_F2_CODE_POINTS:
+        cases += [('"no verdict issued"' + cp, cp, "trailing after a closed string"),
+                  (cp + '"no verdict issued"', cp, "leading before a closed string"),
+                  ("null" + cp, cp, "trailing after a scalar"),
+                  (cp + "false", cp, "leading before a scalar"),
+                  (cp + '{"findings":[]}', cp, "leading before a final object")]
+    res = _work_evidence_many(tmp_path, [R7_F2_PROV + line + "\n" for line, _, _ in cases])
+    bad = [(hex(ord(cp)), what, r) for (line, cp, what), r in zip(cases, res)
+           if not (r["workCompleted"] is False and r["reason"] == "codex-no-verdict")]
+    assert not bad, bad
+
+
+def test_r7_f2_unicode_whitespace_never_turns_prose_into_a_value_or_hides_a_verdict(tmp_path):
+    # controls: words after a closed string stay prose whatever the whitespace, and a final verdict object still counts
+    cases = []
+    for cp in ("\u00a0", "\u3000", "\u200b"):
+        cases += ['"Approve" is my verdict.' + cp, '"Approve"' + cp + "is my verdict.", cp + "3 findings." + cp,
+                  cp + '{"verdict":"APPROVE"}']
+    res = _work_evidence_many(tmp_path, [R7_F2_PROV + line + "\n" for line in cases])
+    bad = [(line, r) for line, r in zip(cases, res) if r["workCompleted"] is not True]
+    assert not bad, bad
+
+
+R7_ADV_SUPPLEMENTARY_CF = ["\U000110bd", "\U000110cd", "\U00013430", "\U0001bca0", "\U0001d173", "\U000e0001"]
+
+
+def test_r7_adv_a1_supplementary_format_characters_are_blank_on_the_terminal_candidate_path(tmp_path):
+    # adversary r7 A1: the blank class was a UTF-16 regex, so \p{Cf} never saw a supplementary format character (a surrogate
+    # pair): a verdict of only U+110BD counted, and U+110BD before a final object hid it so the fenced approval came back.
+    cases = []
+    for cp in R7_ADV_SUPPLEMENTARY_CF:
+        cases += [(R4_PROSE + '{"verdict":"%s"}\n' % cp, cp, "verdict of only the character"),
+                  (R7_F2_PROV + cp + '{"findings":[]}\n', cp, "leading before a final object"),
+                  (R7_F2_PROV + '"no verdict issued"' + cp + "\n", cp, "trailing after a closed string"),
+                  (R7_F2_PROV + cp + "null\n", cp, "leading before a scalar")]
+    res = _work_evidence_many(tmp_path, [a for a, _, _ in cases])
+    bad = [(hex(ord(cp)), what, r) for (_, cp, what), r in zip(cases, res)
+           if not (r["workCompleted"] is False and r["reason"] == "codex-no-verdict")]
+    assert not bad, bad
+    # a closing fence followed by a supplementary format character still closes (the same as a trailing space)
+    ok = _work_evidence_many(tmp_path, [R4_PROSE + '```json\n{"verdict":"APPROVE"}\n```' + cp + "\n" for cp in R7_ADV_SUPPLEMENTARY_CF])
+    assert all(r["workCompleted"] is True for r in ok), ok
+
+
+def test_r7_adv_a2_prose_string_state_never_hides_a_later_verdict_object(tmp_path):
+    # adversary r7 A2: inside a stray brace, a backslash before a raw line break escaped the break, so the prose string never
+    # ended and the later {"verdict": ...} object was read as string content: demand=false, a keyless answer booked complete.
+    # The class: NO prose quote before the object (same line or not, escaped break or not) may hide it.
+    for prompt in ('A stray { "unfinished \\\nReply with {"verdict":"APPROVE"}',
+                   'A stray { "unfinished \\\rReply with {"verdict":"APPROVE"}',
+                   'A stray { "unfinished Reply with {"verdict":"APPROVE"}',
+                   'Code: if ($x) { Write-Host "a\nthen reply {"verdict": "APPROVE"}'):
+        w = _run_invoke_lane_codex_wiring(tmp_path, "x" * 130, "", "", prompt)
+        assert w["evidence"]["reason"] == "codex-no-verdict", (prompt, w)
+
+
+def test_r7_adv2_a1_deeply_nested_unrelated_metadata_never_erases_the_contract_evidence(tmp_path):
+    # adversary r7 pass 2 A1: JsonDocument.Parse's default MaxDepth (64) threw on valid metadata nested 65 deep, so the strict
+    # object builder returned null: the success envelope, a 429 refusal and a codex verdict were all lost.
+    nested = "[" * 64 + "0" + "]" * 64
+    ok = '{"type":"result","subtype":"success","is_error":false,"result":"done","metadata":%s}\n' % nested
+    assert _work_evidence(tmp_path, "claude", ok, 0)["workCompleted"] is True
+    rl = '{"type":"result","is_error":true,"api_error_status":429,"result":"rate limited","metadata":%s}\n' % nested
+    r = _classify(tmp_path, "", "claude", answer=rl)
+    assert r is not None and r["kind"] == "provider-rate-limit", r
+    r = _work_evidence(tmp_path, "codex", R4_PROSE + '{"verdict":"APPROVE","metadata":%s}\n' % nested, 0, prompt_chars=600, require_verdict=True)
+    assert r["workCompleted"] is True, r
+
+
+def test_r7_adv2_a2_an_escaped_spelling_of_the_verdict_key_is_still_a_verdict_demand(tmp_path):
+    # adversary r7 pass 2 A2: the strict reader decodes "verdict" to verdict, but the raw-name regex did not, so the prompt
+    # demanded nothing and a keyless answer was booked complete.
+    for key in ('v\\u0065rdict', '\\u0076erdict', 've\\u0072dict', 'verdic\\u0074'):
+        prompt = 'Review. End with {"%s":"APPROVE|CHANGES_REQUESTED"}' % key + "x" * 600
+        w = _run_invoke_lane_codex_wiring(tmp_path, "x" * 130, "", "", prompt)
+        assert w["evidence"]["reason"] == "codex-no-verdict", (key, w)
+    # an escaped quote is never the opening of a key, and a different decoded name is not the key
+    assert not _prompt_demands_verdict(tmp_path, 'Note {"a": "\\"verdict\\": 1"} only')
+    assert not _prompt_demands_verdict(tmp_path, 'Note {"v\\u0065rdicts": 1} only')
+
+
+def test_r7_f2_a_verdict_of_only_format_characters_is_blank(tmp_path):
+    # the verdict-value blank test is a whitespace decision too: U+200B / U+FEFF / U+2060 are no verdict
+    vals = ["\u200b", "\ufeff", "\u2060", "\u00a0\u200b", "\u3000"]
+    res = _work_evidence_many(tmp_path, [R4_PROSE + '{"verdict":"%s"}\n' % v for v in vals])
+    bad = [(hex(ord(v[0])), r) for v, r in zip(vals, res) if r["reason"] != "codex-no-verdict"]
+    assert not bad, bad
+
+
+def test_r4_adv2_a2_unrelated_metadata_that_cannot_be_read_never_erases_the_contract_evidence(tmp_path):
+    # adversary r4 pass 2 A2: JsonDocument.Parse accepts a lone surrogate escape, GetString() on it throws, and the
+    # builder returned null, so a real verdict / success envelope / 429 refusal was lost.
+    lone = '"note":"\\uD800"'
+    r = _work_evidence(tmp_path, "codex", R4_PROSE + '{"verdict":"APPROVE",%s}\n' % lone, 0, prompt_chars=600, require_verdict=True)
+    assert r["workCompleted"] is True, r
+    env = '{"type":"result","subtype":"success","is_error":false,%s}\n' % lone
+    assert _work_evidence(tmp_path, "claude", env, 0)["workCompleted"] is True
+    env = '{"type":"result","is_error":true,"api_error_status":429,"result":"x",%s}\n' % lone
+    r = _classify(tmp_path, "", "claude", answer=env)
+    assert r is not None and r["kind"] == "provider-rate-limit", r
+    # the contract field itself unreadable is never evidence
+    r = _work_evidence(tmp_path, "codex", R4_PROSE + '{"verdict":"\\uD800"}\n', 0, prompt_chars=600, require_verdict=True)
+    assert r["workCompleted"] is False, r
+
+
+def test_r4_adv2_a3_every_kind_a_line_names_counts_for_the_stderr_corroboration(tmp_path):
+    # adversary r4 pass 2 A3: the answer line names usage-limit AND 429 (rate-limit); stderr says HTTP 429. First-match
+    # classification kept only usage-limit for the answer and rate-limit for stderr, so the shared kind was lost.
+    ans = "ERROR: You've hit your usage limit. Visit settings to purchase more credits or try again at Nov 9th, 2026 8:09 PM. HTTP 429."
+    r = _classify(tmp_path, "ERROR: HTTP 429\n", "codex", answer=ans)
+    assert r is not None and r["kind"] in ("provider-usage-limit", "provider-rate-limit"), r
+    # controls: unrelated recovered stderr still never overturns an answer, and a refusal answer with no corroboration is an answer
+    assert _classify(tmp_path, "ERROR: upstream probe returned 429; recovered\n", "codex", answer="ERROR: file not found") is None
+    assert _classify(tmp_path, "", "codex", answer=ans) is None
+    assert _classify(tmp_path, "ERROR: authentication failed\n", "codex", answer=ans) is None
+
+
+def test_r4_adv2_a4_a_stderr_fallback_answer_is_written_to_the_output_file_the_receipt_hashes():
+    # adversary r4 pass 2 A4: with a ZWSP-only last-message file the selected answer is empty, $final falls back to
+    # stderr and outputSha256 hashes the narration while outputPath still holds the ZWSP. The file must be rewritten.
+    body = LANE_RUNNER.read_text(encoding="utf-8").replace("\r\n", "\n")
+    needle = "if ($timedOut -or ($final -ceq $stderrText -and -not (Test-LaneAnswerHasSubstance -Answer $codexAnswerEvidence))) { Write-Utf8NoBom $lastPath $final }"
+    assert needle in body, "the stderr fallback must be written to the receipt output file"
+    assert body.index(needle) < body.index("outputSha256 = Get-Sha256 $final")
+
+
+def test_r5_adv_a1_contract_strings_compare_ordinally_so_an_ignorable_character_never_matches(tmp_path):
+    # adversary r5 A1: PowerShell -ceq / -cne / -eq on strings use the INVARIANT CULTURE comparer, which ignores zero-width
+    # and NUL characters, so "res\u0000ult" equalled "result", "succ\u0000ess" equalled "success", "4\u00002\u00009" equalled
+    # "429". A contract string must equal its vocabulary ORDINALLY.
+    real429 = '{"type":"result","is_error":true,"api_error_status":429,"result":"rate limited"}\n'
+    for ign in ("\\u0000", "\\u00ad", "\\u200b", "\\ufeff"):
+        diag = '{"type":"res%sult","subtype":"success","is_error":false,"result":"diagnostic"}\n' % ign
+        r = _classify(tmp_path, "", "claude", answer=diag + real429)
+        assert r is not None and r["kind"] == "provider-rate-limit", (ign, r)
+        w = _work_evidence(tmp_path, "claude", diag + real429, 0)
+        assert w["workCompleted"] is False, (ign, w)
+        # a subtype / terminal_reason / status that only LOOKS like the vocabulary is not the vocabulary
+        sub = '{"type":"result","subtype":"succ%sess","is_error":false}\n' % ign
+        assert _work_evidence(tmp_path, "claude", sub, 0)["workCompleted"] is False, ign
+        term = '{"type":"result","subtype":"success","is_error":false,"terminal_reason":"comp%sleted"}\n' % ign
+        assert _work_evidence(tmp_path, "claude", term, 0)["workCompleted"] is False, ign
+        stat = '{"type":"result","subtype":"success","is_error":false,"api_error_status":"4%s2%s9","result":"ok"}\n' % (ign, ign)
+        assert _classify(tmp_path, "", "claude", answer=stat) is None, ign
+    # controls: the exact vocabulary still works
+    assert _work_evidence(tmp_path, "claude", '{"type":"result","subtype":"success","is_error":false,"terminal_reason":"completed"}\n', 0)["workCompleted"] is True
+    r = _classify(tmp_path, "", "claude", answer='{"type":"result","subtype":"success","is_error":false,"api_error_status":"429","result":"ok"}\n')
+    assert r is not None and r["kind"] == "provider-rate-limit", r
+
+
+def test_r5_adv_a2_a_fence_inside_an_unfinished_enclosing_value_is_content_not_a_verdict(tmp_path):
+    # adversary r5 A2: an approval object in a fence that opens INSIDE an unfinished (never closed) outer object / array,
+    # or after an unterminated quote-led line, replaced the unfinished enclosing value and read as a finished verdict.
+    appr = '{"verdict":"APPROVE"}\n'
+    cases = {
+        "open-object": R4_PROSE + '{\n"verdict":null,\n"draft":\n~~~json\n' + appr + '~~~\n',
+        "open-array": R4_PROSE + '[\n"x",\n~~~json\n' + appr + '~~~\n',
+        "open-object-backtick": R4_PROSE + '{\n"a":1,\n```json\n' + appr + '```\n',
+        "malformed-closed-object": R4_PROSE + '{\n"verdict":null,\n"draft":"x",\n~~~json\n' + appr + '~~~\n}\n',
+        "quote-then-fence": R4_PROSE + '"unterminated\n~~~json\n' + appr + '~~~\n',
+        "quote-then-object": R4_PROSE + '"unterminated\n' + appr,
+        "quote-escaped-then-object": R4_PROSE + '"unterminated \\"\n' + appr,
+    }
+    for name, ans in cases.items():
+        r = _work_evidence(tmp_path, "codex", ans, 0, prompt_chars=600, require_verdict=True)
+        assert r["workCompleted"] is False and r["reason"] == "codex-no-verdict", (name, r)
+    # controls: a fence BEFORE or AFTER a finished value, a complete quoted line, and prose around a fence still pass
+    fenced = '```json\n' + appr + '```\n'
+    ok = {
+        "plain-fence": R4_PROSE + fenced,
+        "finished-object-then-fence": R4_PROSE + '{"verdict":"CHANGES_REQUESTED"}\n' + fenced,
+        "prose-with-quote-closed": R4_PROSE + '"Approve" is my verdict.\n' + fenced,
+        "quoted-complete-then-fence": R4_PROSE + '"note"\n' + fenced,
+        "bracket-prose-closed": R4_PROSE + '[1] see above\n' + fenced,
+        "fence-then-object": R4_PROSE + '```json\n{"verdict":"CHANGES_REQUESTED"}\n```\n' + appr,
+    }
+    for name, ans in ok.items():
+        r = _work_evidence(tmp_path, "codex", ans, 0, prompt_chars=600, require_verdict=True)
+        assert r["workCompleted"] is True, (name, r)
+
+
+def test_r5_adv_a3_vertical_tab_and_form_feed_separate_refusal_classification_lines(tmp_path):
+    # adversary r5 A3: Split-LaneLines did not split on VT (U+000B) or FF (U+000C), so a later line's 429 vocabulary was
+    # attributed to the first ERROR line and a valid answer read as refused. Every Unicode mandatory line break splits.
+    for sep in ("\u000b", "\u000c", "\u001c", "\u001d", "\u001e"):
+        ans = "ERROR: file not found" + sep + "ERROR: HTTP 429"
+        text = "ERROR: upstream probe returned 429; recovered"
+        assert _classify(tmp_path, text, "codex", answer=ans) is None, repr(sep)
+        # stderr sibling: the 429 sits on a line that is not ERROR-framed once the separator splits
+        assert _classify(tmp_path, "ERROR: file not found" + sep + "HTTP 429", "codex", answer="") is None, repr(sep)
+    # controls: LF still splits the same way, and a genuine ERROR-framed refusal line is still found after a VT
+    assert _classify(tmp_path, "ERROR: file not found\nHTTP 429", "codex", answer="") is None
+    r = _classify(tmp_path, "note\u000bERROR: HTTP 429", "codex", answer="")
+    assert r is not None and r["kind"] == "provider-rate-limit", r
+
+
+def test_r5_adv2_a1_ordinary_prose_that_starts_with_the_word_error_is_not_an_error_framed_line(tmp_path):
+    # adversary r5 pass 2 A1: the ERROR frame matched case-INsensitively, so a real answer such as "Error handling for HTTP 429
+    # is now implemented." was taken for an ERROR-framed refusal line and, with a recovered 429 on stderr, booked refused (125).
+    recovered = "ERROR: upstream probe returned 429; recovered"
+    for ans in ("Error handling for HTTP 429 is now implemented.", "error: rate limit handling added",
+                "ERROR handling for HTTP 429 is now implemented.", "Errors: 429 responses are retried."):
+        assert _classify(tmp_path, recovered, "codex", prompt="Summarize the completed fix in one sentence.", answer=ans) is None, ans
+    # the same prose on stderr is narration, not a framed refusal line
+    assert _classify(tmp_path, "Error handling for HTTP 429 is now implemented.\n", "codex", answer="") is None
+    assert _classify(tmp_path, "error: rate limit reached\n", "codex", answer="") is None
+    # controls: the real framing (upper case ERROR, a colon on an answer line) still classifies
+    ans = "ERROR: You've hit your usage limit. Visit settings to purchase more credits or try again at Nov 9th, 2026 8:09 PM."
+    r = _classify(tmp_path, ans + "\n", "codex", answer=ans)
+    assert r is not None and r["kind"] == "provider-usage-limit", r
+    r = _classify(tmp_path, REAL_CODEX_USAGE_LIMIT_STDERR, "codex", answer="")
+    assert r is not None and r["kind"] == "provider-usage-limit", r
+
+
+def test_r5_adv2_a2_a_present_but_null_or_empty_terminal_reason_is_not_absence(tmp_path):
+    # adversary r5 pass 2 A2: "absent or completed" is the contract. A present terminal_reason of null or "" was collapsed to
+    # '' by the text reader and then skipped by a truthiness guard, so it passed as absence. Present and not exactly
+    # "completed" is refused; absent still passes.
+    for tr in ('null', '""', '"   "', '[]', '{}', '0', 'false', '"Completed"', '"completed "'):
+        env = '{"type":"result","subtype":"success","is_error":false,"terminal_reason":%s}\n' % tr
+        r = _work_evidence(tmp_path, "claude", env, 0)
+        assert r["workCompleted"] is False and str(r["reason"]).startswith("terminal-reason-"), (tr, r)
+    ok_absent = '{"type":"result","subtype":"success","is_error":false,"result":"done"}\n'
+    assert _work_evidence(tmp_path, "claude", ok_absent, 0)["workCompleted"] is True
+    ok_done = '{"type":"result","subtype":"success","is_error":false,"terminal_reason":"completed"}\n'
+    assert _work_evidence(tmp_path, "claude", ok_done, 0)["workCompleted"] is True
+
+
+def test_r3c_a4_an_array_typed_result_line_is_not_the_envelope_and_hides_no_refusal(tmp_path):
+    diag = '{"type":["result"],"subtype":"success","is_error":false}\n'
+    r = _work_evidence(tmp_path, "claude", diag, 0)
+    assert r["workCompleted"] is False, r
+    both = diag + REAL_CLAUDE_429_ENVELOPE
+    assert _classify(tmp_path, "", "claude", answer=both) is not None
+
+
+def test_invoke_lane_writes_the_selected_answer_to_the_output_file_when_the_last_message_has_no_substance():
+    # adversary A4 (2nd pass): outputSha256 hashes $final while outputPath is the last-message file.
+    body = LANE_RUNNER.read_text(encoding="utf-8")
+    needle = ("if (-not $timedOut -and (Test-LaneAnswerHasSubstance -Answer $codexAnswerEvidence) "
+              "-and -not (Test-LaneAnswerHasSubstance -Answer $lastMessage)) {\n        Write-Utf8NoBom $lastPath $codexAnswerEvidence")
+    assert needle.replace("\n", "\r\n") in body or needle in body, "selected answer must be written to the receipt output file"
+    assert body.index(needle.split("\n")[0]) < body.index("outputSha256 = Get-Sha256 $final")
+
+
+def test_invoke_lane_assigns_the_codex_answer_evidence_exactly_once():
+    body = LANE_RUNNER.read_text(encoding="utf-8")
+    assigns = re.findall(r"\$codexAnswerEvidence\s*=\s*(.+)", body)
+    assert sorted(a.strip() for a in assigns) == sorted(["''", "Get-CodexLaneAnswer -LastMessage $lastMessage -Stdout $stdout"]), assigns
+    # both consumers read that one variable; the refusal call no longer reads stdout alone for codex
+    assert "Get-ProviderRefusal -Text $stderrText -Answer $refusalAnswer -Engine $cfg.engine -Prompt $Prompt" in body
+    assert "$refusalAnswer = if ($cfg.engine -eq 'codex') { $codexAnswerEvidence } else { $stdout }" in body
+    assert "Get-ProviderRefusal -Text $stderrText -Answer $stdout" not in body
 
 
 def test_invoke_lane_receipt_separates_process_ended_from_complete():
@@ -1814,7 +3585,7 @@ def test_lane_provider_refusal_classifies_by_engine_not_lane_name():
         "a matching astra arm and silently miss the next new lane too"
     )
     lane_body = LANE_RUNNER.read_text(encoding="utf-8")
-    assert "Get-ProviderRefusal -Text $stderrText -Answer $stdout -Engine $cfg.engine -Prompt $Prompt" in lane_body
+    assert "Get-ProviderRefusal -Text $stderrText -Answer $refusalAnswer -Engine $cfg.engine -Prompt $Prompt" in lane_body
 
 
 def test_claude_lane_child_effort_applies_the_resolved_table_effort_not_only_an_override():

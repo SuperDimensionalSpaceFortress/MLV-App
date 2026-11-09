@@ -1029,9 +1029,10 @@ public static class MlvLaneJob {
   [DllImport("kernel32.dll", SetLastError=true)]
   static extern bool GetProcessTimes(IntPtr process, out Int64 creation, out Int64 exit, out Int64 kernel, out Int64 user);
   // r14 fix iteration 1 (adversary A1 on 1d4adafb): creation FILETIMEs, which are UTC. Process.StartTime is local time and runs backward when daylight time ends, so a real child read as older than its parent.
-  static Int64 CreatedFileTime(Process p) {
+  static Int64 CreatedFileTime(Process p) { return CreatedFileTime(p.Handle); }
+  static Int64 CreatedFileTime(IntPtr process) {
     Int64 creation,exit,kernel,user;
-    if(!GetProcessTimes(p.Handle,out creation,out exit,out kernel,out user)) throw new Win32Exception(Marshal.GetLastWin32Error(),"GetProcessTimes");
+    if(!GetProcessTimes(process,out creation,out exit,out kernel,out user)) throw new Win32Exception(Marshal.GetLastWin32Error(),"GetProcessTimes");
     return creation;
   }
   public static bool StartedBeforeParent(Int64 kidCreated, Int64 parentCreated) { return kidCreated<parentCreated; }
@@ -1042,14 +1043,32 @@ public static class MlvLaneJob {
   }
   [DllImport("ntdll.dll")]
   static extern int NtQueryInformationProcess(IntPtr process, int infoClass, out PROCESS_BASIC_INFORMATION info, int length, out int returned);
-  static int ParentPidOf(Process p) {
+  [DllImport("ntdll.dll")]
+  static extern int NtQueryInformationProcess(IntPtr process, int infoClass, out UInt64 info, int length, out int returned);
+  static int ParentPidOf(IntPtr process) {
     PROCESS_BASIC_INFORMATION info; int returned;
-    int status=NtQueryInformationProcess(p.Handle,0,out info,Marshal.SizeOf(typeof(PROCESS_BASIC_INFORMATION)),out returned);
+    int status=NtQueryInformationProcess(process,0,out info,Marshal.SizeOf(typeof(PROCESS_BASIC_INFORMATION)),out returned);
     if(status<0) throw new Win32Exception(status,"NtQueryInformationProcess");
     return (int)info.InheritedFromUniqueProcessId.ToInt64();
   }
+  // CONTAINMENT-KID-READ-ACCESS-DENIED-1: the reads above need only PROCESS_QUERY_LIMITED_INFORMATION, but Process.Handle opens PROCESS_ALL_ACCESS. A protected process
+  // refuses that with 5, even to an elevated, debug-privileged account, and every Windows host keeps some whose parent pid is free (csrss, wininit: their smss instance
+  // has exited). Hosted CI read 'ancestry-unreadable:kid-read:5' (PR 420, 766, 775); which process it read is UNKNOWN, since no receipt names it. A protected process
+  // listed under a lane process that was handed its recycled parent pid is one possible mechanism, shown by injection only. Candidates are now read on a handle with only
+  // that right.
+  const uint PROCESS_QUERY_LIMITED_INFORMATION=0x1000;
+  const int ERROR_INVALID_PARAMETER=87;
+  [DllImport("kernel32.dll", SetLastError=true)]
+  static extern IntPtr OpenProcess(uint access, bool inheritHandle, int processId);
+  // The kernel numbers every process in creation order (ProcessSequenceNumber, class 92), whatever the clock does; 0 = not read. A process numbered below the pid's
+  // current holder existed before that holder, so the holder never created it: its recorded parent pid is a recycled one.
+  static UInt64 SequenceOf(IntPtr process) {
+    UInt64 sequence; int returned;
+    return NtQueryInformationProcess(process,92,out sequence,8,out returned)<0 ? 0UL : sequence;
+  }
+  public static bool CreatedBeforeBySequence(UInt64 kidSequence, UInt64 parentSequence) { return kidSequence!=0 && parentSequence!=0 && kidSequence<parentSequence; }
   // r15 (Dot B5; adversary A2 = Dot B6): Members are the processes shown to be in the tree. Uncertain says why 'killed' would claim too much; the first reason found stands.
-  //   ancestry-unreadable: a candidate, or a parent, could not be read.
+  //   ancestry-unreadable:<parent-read|kid-open|kid-read>:<error code>: a candidate, or a parent, could not be read; the site and the code say which read.
   //   older-than-parent: the parent matches and the child reads older. A backward clock step and a reused parent pid look the same, so it is neither killed nor called gone.
   //   descendant-unreachable: the snapshot saw a process under a pid whose holder has since gone, so that process cannot be shown to be in the tree, or to be gone.
   public sealed class DescendantWalk {
@@ -1076,24 +1095,40 @@ public static class MlvLaneJob {
     while(walk.Count>0) {
       Process parent=walk.Dequeue();
       if(!kids.ContainsKey(parent.Id)) continue;
-      Int64 parentCreated;
-      try { parentCreated=CreatedFileTime(parent); } catch(Win32Exception) { seen.Note("ancestry-unreadable"); continue; }
+      Int64 parentCreated; UInt64 parentSequence;
+      // PR 771 hosted CI saw a bare 'ancestry-unreadable' it could not explain (merge ref 516350c5, job 128440611866). Each note below now names the read that failed and its error code (Win32, or the raw NTSTATUS for the parent-pid read); the outcome is unchanged (uncertain).
+      try { parentCreated=CreatedFileTime(parent); parentSequence=SequenceOf(parent.Handle); } catch(Win32Exception ex) { seen.Note("ancestry-unreadable:parent-read:"+ex.NativeErrorCode); continue; }
       foreach(int id in kids[parent.Id]) {
         Process kid;
         try { kid=Process.GetProcessById(id); }
         catch(ArgumentException) { seen.NoteIfAnyBelow(kids,id); continue; }   // exited since the snapshot
-        catch(Win32Exception) { seen.Note("ancestry-unreadable"); continue; }
-        int parentPid; Int64 created;
-        try {
-          // The first read opens the handle, which this object then keeps, so both reads and any later Kill or wait are about one process.
-          parentPid=ParentPidOf(kid);
-          created=CreatedFileTime(kid);
+        catch(Win32Exception ex) { seen.Note("ancestry-unreadable:kid-open:"+ex.NativeErrorCode); continue; }
+        // Every read is on this query-limited handle. It holds the process, and so its pid, until the handle the kill and the wait use is open below, so the reads
+        // and any later Kill or wait are about one process.
+        IntPtr read=OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION,false,id);
+        if(read==IntPtr.Zero) {
+          int error=Marshal.GetLastWin32Error(); kid.Dispose();
+          if(error==ERROR_INVALID_PARAMETER) { seen.NoteIfAnyBelow(kids,id); continue; }   // no process holds the pid: exited since the snapshot
+          seen.Note("ancestry-unreadable:kid-read:"+error); continue;
         }
-        catch(InvalidOperationException) { seen.NoteIfAnyBelow(kids,id); kid.Dispose(); continue; }   // exited since the snapshot
-        catch(Win32Exception) { seen.Note("ancestry-unreadable"); kid.Dispose(); continue; }
-        if(parentPid!=parent.Id) { seen.NoteIfAnyBelow(kids,id); kid.Dispose(); continue; }   // the pid changed hands: this process was never in the tree
-        if(StartedBeforeParent(created,parentCreated)) { seen.Note("older-than-parent"); kid.Dispose(); continue; }
-        seen.Members.Add(kid); walk.Enqueue(kid);
+        try {
+          int parentPid; Int64 created; UInt64 sequence;
+          try {
+            parentPid=ParentPidOf(read);
+            created=CreatedFileTime(read);
+            sequence=SequenceOf(read);
+          }
+          catch(Win32Exception ex) { seen.Note("ancestry-unreadable:kid-read:"+ex.NativeErrorCode); kid.Dispose(); continue; }
+          if(parentPid!=parent.Id) { seen.NoteIfAnyBelow(kids,id); kid.Dispose(); continue; }   // the pid changed hands: this process was never in the tree
+          // Older than the parent by the kernel's count: a recycled parent pid, never a child. What the snapshot lists under it has the same lineage, none of it this parent's.
+          if(CreatedBeforeBySequence(sequence,parentSequence)) { kid.Dispose(); continue; }
+          if(StartedBeforeParent(created,parentCreated)) { seen.Note("older-than-parent"); kid.Dispose(); continue; }
+          // A member. Its own handle, the one Kill and the waits use, is opened while 'read' still holds the process.
+          try { GC.KeepAlive(kid.Handle); }
+          catch(InvalidOperationException) { seen.NoteIfAnyBelow(kids,id); kid.Dispose(); continue; }   // exited since the read
+          catch(Win32Exception ex) { seen.Note("ancestry-unreadable:kid-read:"+ex.NativeErrorCode); kid.Dispose(); continue; }
+          seen.Members.Add(kid); walk.Enqueue(kid);
+        } finally { CloseHandle(read); }
       }
     }
     return seen;
@@ -1955,6 +1990,111 @@ function Set-CodexLaunchStartInfo {
     foreach ($a in (@($Launch.PrefixArgs) + @($Argv))) { [void]$Psi.ArgumentList.Add([string]$a) }
 }
 # END Assert-CodexCommandLineFits
+# LANE-CHILD-LOADER-DIALOG-CODEX-SANDBOX-1: the error mode set above reaches a claude lane's children but NOT what the codex sandbox starts for the model
+# (measured 2026-11-06, System log 'Application Popup': green2.exe 09:56:51Z and red.exe 09:57:28Z, "libstdc++-6.dll / libgcc_s_seh-1.dll was not found", on the
+# owner's desktop, after the error-mode fix merged). Mechanism chosen: (a), the MinGW bin directory on the codex child's PATH, so a MinGW-built exe the model
+# runs finds its runtime DLLs and the loader failure that raises the box never happens. Why (a) and not (b): codex's shell_environment_policy inherits the
+# launcher's environment by default (config.toml sets only NODE_REPL_*), so PATH is the one channel known to cross the sandbox spawn, while an error mode is
+# per-process state the sandbox's spawn does not carry; a wrapper or config that sets a mode inside the sandbox is codex-version-specific and cannot be
+# tested without starting codex. The directory is APPENDED, so every tool already on PATH resolves exactly as before. A directory is appended whether or not it
+# exists, and NOTHING here touches the filesystem (r3, hub ruling): a missing directory on PATH is harmless (the loader skips it), while the existence lookup
+# that r1 and r2 carried was the source of 12 introduced findings (a stall in SMB behind a UNC path, a mapped drive or a junction; a runspace that outlives
+# the lookup; a budget that bounded the wait but not the work). One already present (the drive letter in either case, the rest compared exactly, with or without a trailing backslash; an inherited
+# spelling longer than 240 characters is not counted) is not added twice. Returns the directories added. Candidates: $env:MINGW_ROOT\bin (the build docs' name for the toolchain, docs/02-developer-guide.md), then the
+# default Qt-installer toolchain C:\Qt\Tools\mingw1310_64\bin that build-guard and tools\testing\run-windows-test.ps1 use.
+function Add-CodexLaneRuntimePath {
+    param(
+        [Parameter(Mandatory = $true)]$Psi,
+        [string[]]$Candidates = $null
+    )
+    # ONLY ASCII blanks are trimmed. .Trim() with no argument also strips U+00A0 and the other Unicode spaces, which are legal directory-name characters, so
+    # MINGW_ROOT='C:\toolchains\mingw<U+00A0>' became a different directory and the configured one was omitted (adversary A1 on 6a05d587).
+    $blanks = [char[]]@(32, 9, 10, 13)
+    if ($null -eq $Candidates) {
+        $Candidates = @()
+        # String concatenation, NOT Join-Path: Join-Path throws DriveNotFound for a MINGW_ROOT on a drive that is gone, which failed the whole lane
+        # before codex started (adversary A1 on 6372cc4e). A retired MINGW_ROOT now only costs its own candidate.
+        if (-not [string]::IsNullOrEmpty($env:MINGW_ROOT) -and $env:MINGW_ROOT.Trim($blanks).Length -gt 0) { $Candidates += ($env:MINGW_ROOT.Trim($blanks).TrimEnd('\', '/') + '\bin') }
+        $Candidates += 'C:\Qt\Tools\mingw1310_64\bin'
+    }
+    # EVERY string comparison below is ordinal. PowerShell's -eq/-ne/-in/-contains and a @{} hashtable compare with the current culture, which ignores
+    # U+00AD (soft hyphen): a path segment holding only U+00AD was `-eq ''`, was dropped, and made a nonexistent inherited directory collide with the real one
+    # (adversary A1 on e370ba86, ADDED=0). Path keys live in an ordinal HashSet; the segment tests use [string]::Equals(..., Ordinal) and .Length.
+    $ordinal = [System.StringComparison]::Ordinal
+    # ONE lexical normalisation for both sides of the duplicate check, and for what is appended: '/' is '\', '.' and '..' segments are resolved (Windows
+    # does the same before it touches the disk), repeated separators collapse (adversary A2 on 56281b89, A3 on 7688a2a3). REDUCTION COMES FIRST and every
+    # check runs on what SURVIVES it (r4, Sol r3 + adversary A1 on 071338fa: C:\toolchains\discard.\..\mingw names C:\toolchains\mingw, but 'discard.' was
+    # refused before the '..' could remove it, so the configured toolchain was omitted; a canceled space, ';', '"' or reserved-character segment failed the
+    # same way). It returns $null for a spelling the loader may not match to the directory it names: a segment that survives and ends in space or dot or
+    # holds a reserved character, ';' or '"', or a non-drive-letter path. No whole-input blank test is needed: leading blanks fail the drive-letter match
+    # and a trailing blank is the end of the last segment, which always survives. An INHERITED entry in such a spelling is not counted as present
+    # (adversary A1 on 7688a2a3: 'C:\x\bin ' was trimmed into the seen-set, so the usable directory was never added); a false "absent" costs a harmless
+    # duplicate, a false "present" costs the whole fix.
+    $dirNorm = {
+        param([string]$d)
+        if ([string]::IsNullOrEmpty($d)) { return $null }
+        $p = $d.Replace('/', '\')
+        if ($p -cnotmatch '^[A-Za-z]:\\') { return $null }
+        $stack = [System.Collections.Generic.List[string]]::new()
+        foreach ($seg in $p.Substring(3).Split('\')) {
+            if ($seg.Length -eq 0 -or [string]::Equals($seg, '.', $ordinal)) { continue }
+            if ([string]::Equals($seg, '..', $ordinal)) {
+                # The root has no parent: C:\..\x is C:\x, which is how Windows canonicalises it (adversary A2 on 6a05d587).
+                if ($stack.Count -gt 0) { $stack.RemoveAt($stack.Count - 1) }
+                continue
+            }
+            $stack.Add($seg)
+        }
+        # Validation over the SURVIVORS only. ';' would serialize as two PATH entries (adversary A1 on e284b182) and '"' is PATH's own quoting.
+        foreach ($seg in $stack) {
+            if ($seg -cmatch '[ .]$' -or $seg -cmatch '[<>:|?*;"\x00-\x1f]') { return $null }
+        }
+        $result = $p.Substring(0, 3) + ($stack -join '\')
+        # ... and over the serialized result, which is what PATH will carry.
+        if ($result.Contains(';') -or $result.Contains('"')) { return $null }
+        return $result
+    }
+    $current = if ($Psi.Environment.ContainsKey('PATH')) { [string]$Psi.Environment['PATH'] } else { '' }
+    # The comparison key folds the case of the DRIVE LETTER only; everything after it is compared exactly (adversary A1 on ff7ec6c5). A directory can be
+    # case-sensitive on NTFS (per-directory flag), where C:\case\MINGW\bin and C:\case\mingw\bin are two directories and only one holds the DLLs; folding the
+    # whole path let an inherited spelling of the unusable one suppress the usable one. A false "absent" is a harmless duplicate PATH entry, a false "present"
+    # costs the fix, so the key errs toward absent. (Earlier rounds folded ASCII letters and, before that, ToLowerInvariant, which also folded U+212A: adversary
+    # A2 on 834f307b.) The drive letter is an ASCII letter by the caller's -cmatch, so ToUpperInvariant cannot reach a non-ASCII character.
+    $dirKey = {
+        param([string]$d)
+        return ($d.Substring(0, 1).ToUpperInvariant() + $d.Substring(1).TrimEnd('\'))
+    }
+    $seen = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::Ordinal)
+    foreach ($entry in ($current -split ';')) {
+        # An inherited entry counts as present only when its RAW spelling is one the loader can search: the entry, a '\' and the longest runtime DLL name
+        # (libgcc_s_seh-1.dll, 18 characters) must fit MAX_PATH (260 with the terminator), so 240 characters at most. Reduction makes a padded spelling
+        # ('C:\Qt\Tools\mingw1310_64\bin\' + '.\' * 16330, 32 KB) look like the canonical directory while LoadLibraryExW fails on the raw string, which
+        # suppressed the usable candidate (adversary A1 on fb022797). A false "absent" costs a ~30 byte duplicate; a false "present" costs the fix.
+        if ($entry.Length -gt 240) { continue }
+        $norm = & $dirNorm $entry
+        if ($norm) { [void]$seen.Add((& $dirKey $norm)) }
+    }
+    $added = @()
+    foreach ($dir in $Candidates) {
+        if ([string]::IsNullOrEmpty($dir)) { continue }
+        $dir = $dir.Trim($blanks)
+        # A DRIVE-LETTER path only (X:\... or X:/...): a relative PATH entry is searched from the CHILD's working directory, not the launcher's
+        # (adversary A2 on 6372cc4e), and a UNC path is skipped by name (adversary A1 on 56281b89). Skipped by name, with no filesystem call.
+        if ($dir -cnotmatch '^[A-Za-z]:[\\/]') { continue }
+        # A name PATH cannot carry intact (';' would serialize as two entries, C:\toolchains;child\bin -> C:\toolchains plus a relative child\bin, adversary
+        # A1 on e284b182; '"' is PATH's own quoting) is refused by $dirNorm, AFTER '.' and '..' are resolved, so one inside a canceled segment no longer
+        # refuses the candidate (r4); one that survives reduction still does.
+        $dir = & $dirNorm $dir
+        if (-not $dir) { continue }
+        # HashSet.Add is false when the key is already there: an inherited entry, or an earlier candidate in another spelling.
+        if (-not $seen.Add((& $dirKey $dir))) { continue }
+        $added += $dir
+    }
+    if ($added.Count -gt 0) {
+        $Psi.Environment['PATH'] = if ($current.Trim(';')) { '{0};{1}' -f $current.TrimEnd(';'), ($added -join ';') } else { $added -join ';' }
+    }
+    return $added
+}
 # (b) An editing lane's tool grant must be an explicit, auditable list. 'ALL' is
 # never accepted - that is the exact grant this whole patch exists to narrow.
 if ($AllowEdits -and ([string]::IsNullOrWhiteSpace($AllowedTools) -or $AllowedTools -eq 'ALL')) {
@@ -2200,6 +2340,8 @@ $dispatchLedgerState = $null
 $dispatchLedgerReservationId = $null
 # Harvested child stdout; initialised here so the finally can classify work evidence on every path.
 $stdout = ''
+# Codex answer (last-message file, else stdout) set at harvest; '' on every path that never harvested one.
+$codexAnswerEvidence = ''
 $authority  =[ordered]@{ permissionMode = 'unset'; allowedTools = 'unset'; sandbox = 'unset'; writableRoot = $null }
 $denyRules  = @()
 # LANE-NO-BACKGROUND-END-TURN-1 round 7: set here so a codex lane (which never enters the
@@ -2727,6 +2869,15 @@ if ($cfg.engine -eq 'claude' -and $cfg.effort) {
 if ($cfg.engine -eq 'claude') {
     $psi.Environment['MLV_FLEET_LANE'] = '1'
 }
+# LANE-CHILD-LOADER-DIALOG-CODEX-SANDBOX-1: codex lanes only; the claude lane's environment is unchanged. See Add-CodexLaneRuntimePath.
+if ($cfg.engine -eq 'codex') {
+    # Fail open with a warning, like the error-mode block: a PATH nicety must never be the reason a review lane does not start.
+    try {
+        $codexRuntimePathAdded = @(Add-CodexLaneRuntimePath -Psi $psi)
+        if ($codexRuntimePathAdded.Count -gt 0) { Write-Host ("[codex-runtime-path] appended to the lane PATH: {0}" -f ($codexRuntimePathAdded -join ';')) }
+    }
+    catch { Write-Warning "CODEX_RUNTIME_PATH_NOT_SET: $($_.Exception.Message) -- a MinGW-built exe the model runs may raise a loader dialog on the desktop" }
+}
 # LANE-NO-BACKGROUND-END-TURN-1 round 2 (hub ruling): a CLAUDE_CODE_DISABLE_BACKGROUND_TASKS
 # child-environment flag was here through round 1. docs/never-authorized.json NA-3 prohibits
 # assigning ANY CLAUDE_CODE_* variable, and widening that rule is an authority change the hub
@@ -3049,7 +3200,17 @@ Write-Utf8NoBom $errPath $stderrText
 # receipt proved that exitCode alone cannot tell "refused in 7 s" from "reviewed and objected".
 # Structurally, never by scanning the transcript (sol PR #80 R1+R2, both BLOCKER): the
 # transcript legitimately CONTAINS the refusal vocabulary even when the run answered.
-$providerRefusal = Get-ProviderRefusal -Text $stderrText -Answer $stdout -Engine $cfg.engine -Prompt $Prompt
+# K4 r2 (sol r1 B2): a codex lane's answer is the -o last-message file, else stdout. Refusal detection judges
+# that SAME answer the completion evidence uses, so a recovered-error line on stderr cannot turn a real
+# file-only answer into a provider refusal. The answer is selected once, here, and never reassigned.
+# K4-ANSWER-BEGIN
+if ($cfg.engine -eq 'codex') {
+    $lastMessage = if (Test-Path -LiteralPath $lastPath) { Get-Content -LiteralPath $lastPath -Raw } else { '' }
+    $codexAnswerEvidence = Get-CodexLaneAnswer -LastMessage $lastMessage -Stdout $stdout
+}
+$refusalAnswer = if ($cfg.engine -eq 'codex') { $codexAnswerEvidence } else { $stdout }
+$providerRefusal = Get-ProviderRefusal -Text $stderrText -Answer $refusalAnswer -Engine $cfg.engine -Prompt $Prompt
+# K4-ANSWER-END
 
 $final = ''
 if ($cfg.engine -eq 'claude') {
@@ -3131,8 +3292,9 @@ if ($cfg.engine -eq 'claude') {
     if (-not $final) { $final = $stdout }
     Write-Utf8NoBom $lastPath $final
 } else {
-    $final = if (Test-Path -LiteralPath $lastPath) { Get-Content -LiteralPath $lastPath -Raw } else { '' }
-    if ([string]::IsNullOrWhiteSpace($final)) { $final = $stdout }
+    # K4: the codex answer for completion evidence (selected above, before the refusal call) is the last-message
+    # file, else stdout -- not stderr (the fallback below).
+    $final = $codexAnswerEvidence
     # LAST-RESORT FALLBACK TO STDERR. codex writes its -o last-message file only on
     # a CLEAN exit and streams its working narration to STDERR, not stdout - so a
     # lane killed at the timeout leaves the last-message file absent and stdout
@@ -3142,7 +3304,14 @@ if ($cfg.engine -eq 'claude') {
     # approach entirely.
     if ([string]::IsNullOrWhiteSpace($final)) { $final = $stderrText }
     if ($null -eq $final) { $final = '' }
-    if ($timedOut) { Write-Utf8NoBom $lastPath $final }
+    # K4 r4 pass 2 (adversary A4): when the answer has no substance (a ZWSP-only last-message file) $final fell back to
+    # stderr above, and outputSha256 / outputBytes below describe $final, so the receipt output file must hold it too.
+    if ($timedOut -or ($final -ceq $stderrText -and -not (Test-LaneAnswerHasSubstance -Answer $codexAnswerEvidence))) { Write-Utf8NoBom $lastPath $final }
+    # K4 r2 (adversary A4): when the selected answer came from stdout because the last-message file had no
+    # substance, the receipt's outputPath file must hold the answer the outputSha256 below describes.
+    if (-not $timedOut -and (Test-LaneAnswerHasSubstance -Answer $codexAnswerEvidence) -and -not (Test-LaneAnswerHasSubstance -Answer $lastMessage)) {
+        Write-Utf8NoBom $lastPath $codexAnswerEvidence
+    }
     # LANE-MODEL-CURRENCY-1 round 2 (sol blocker 2): resolvedModel is proof, not intent. codex
     # exec emits no modelUsage-style attestation the way claude's own JSON does, so the bar here
     # is the card's stated minimum: a clean exit (never timed out, exit 0) that produced real
@@ -3433,11 +3602,13 @@ if (-not $NoWorktreeSweep) {
 # finished (exit 0 and, for claude, a success envelope). Until 2026-09-14 `complete` meant only the
 # former, so an exit-1 error_max_turns run was receipted state=complete, complete=true.
 $processEnded = ($exitCode -ne -999)
+# K4-EVIDENCE-BEGIN
 try {
-    $workEvidence = Get-LaneWorkEvidence -Engine $cfg.engine -Answer $stdout -ExitCode $exitCode
+    $workEvidence = Get-LaneWorkEvidence -Engine $cfg.engine -Answer $(if ($cfg.engine -eq 'codex') { $codexAnswerEvidence } else { $stdout }) -ExitCode $exitCode -PromptChars (Get-LaneCodePointCount -Text ([string]$Prompt)) -RequireVerdict:(Test-PromptDemandsVerdict -Prompt $Prompt)
 } catch {
     $workEvidence = [ordered]@{ workCompleted = $false; reason = "cannot-determine: $($_.Exception.Message)"; subtype = $null; terminalReason = $null; isError = $null }
 }
+# K4-EVIDENCE-END
 # LANE-NO-BACKGROUND-END-TURN-1: a success envelope is not positive evidence of work if the
 # tree never moved. HEAD still equal to the sha this lane started from, with tracked files
 # left dirty BY THIS LANE, is exactly what "I'll resume when the background job completes"

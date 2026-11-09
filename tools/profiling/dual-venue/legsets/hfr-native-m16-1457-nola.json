@@ -1,0 +1,10 @@
+{
+  "schema": "mlv-app/dual-venue-legset/v1",
+  "legSet": "hfr-native-m16-1457-nola",
+  "card": "HFR-NATIVE-60FPS-FULLRES-1",
+  "clipId": "M16-1457",
+  "description": "HFR-NATIVE-60FPS-FULLRES-1: the Look Assist off lever of the native-HFR full screen s1 cell on M16-1457 (disableLookAssist; split out of hfr-native-m16-1457 in r28, adversary A3 on 4201a437).",
+  "legs": [
+    "legs/m16-1457-native-fullscreen-s1-nola.json"
+  ]
+}

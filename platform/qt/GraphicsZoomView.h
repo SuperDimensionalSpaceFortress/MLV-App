@@ -17,6 +17,7 @@
 #include <QDebug>
 #include <QShortcut>
 #include "PreviewPaintTiming.h"
+#include "PlaybackSourceAdvanceTracker.h"
 
 class GraphicsZoomView : public QGraphicsView
 {
@@ -40,6 +41,17 @@ public:
     using PaintTiming = preview_paint_timing::Totals;
     PaintTiming paintTiming(void) const;
     void resetPaintTiming(void);
+
+    // HFR-NATIVE-60FPS-FULLRES-1 r28 fix iteration 2 (adversary A1 on 4201a437): the CPU pixmap route's deferred paint. The playback
+    // present notes the request serial it handed the pixmap item; the next viewport paint draws it. Whether a frame with that serial
+    // (or a later one) was handed over and not yet painted. r30 fix iteration 1 (adversary A2 on fad36acf): any other pixmap (the
+    // clip-open placeholder) is noted as serial 0, so its paint never copies the frame it replaced.
+    void notePixmapPresentSerial(quint64 serial) { m_pixmapPendingSerial = serial; }
+    bool pixmapPaintPendingForSerial(quint64 serial) const
+    {
+        // r30 (adversary A1 on 71104385): a composed paint, never m_pixmapPaintedSerial (an offscreen viewport grab promotes it)
+        return m_pixmapComposedPaint.pendingFor( m_pixmapPendingSerial, serial );
+    }
 
 public slots:
     void shortCutZoomIn(void);
@@ -69,6 +81,9 @@ protected:
     qreal m_lookLabelPixmapDpr = 0.0;
     QPixmap m_lookLabelPixmap;
     QString m_lookLabelDrawnText;
+    quint64 m_pixmapPendingSerial = 0;
+    quint64 m_pixmapPaintedSerial = 0;
+    playback_paint_credit::ComposedPaintSerial m_pixmapComposedPaint;   // r30: the pixmap serial last painted ON SCREEN
     bool m_isZoomEnabled;
     PickerState m_pickerState;
     bool m_isMousePressed;

@@ -173,6 +173,20 @@ elseif ($m -eq 'empty') { [IO.File]::WriteAllText($r, '') }
 elseif ($m -like 'good*') { [IO.File]::WriteAllText($r, (Get-Mac ([string]$env:MLV_CP_NONCE))) }
 Start-Sleep -Seconds 2
 """
+# fixture-clock-DST (sol r1 B1 on b8d9522a, PR 783): a feed row's HWiNFO stamp is local time with no offset, so a fixture that wrote it in the HOST's
+# zone from the run's real launch instant (ToLocalTime) wrote an ambiguous stamp whenever the test ran in a repeated hour (Central: 1:00-2:00 on the
+# first Sunday of November) and the real selector, correctly, refused the row. The fixture instead stamps in a fixed-offset zone with no DST rules (UTC-5,
+# so the selector's local-to-UTC conversion is still exercised) and pins the selector's -Zone to it for the whole child, whatever the host zone or date.
+# The pin is a same-signature wrapper that defaults -Zone and calls the job's real selector (PSDefaultParameterValues is ignored by a simple function);
+# an explicit -Zone still wins, and the real definition is captured once, so running the snippet again (a driver loops over modes) never wraps the wrapper.
+# The selector's own ambiguous/invalid-stamp refusals keep their explicit-zone tests (selA1d*).
+FIXTURE_ZONE_PS = r"""
+$cpFixtureZone = [TimeZoneInfo]::CreateCustomTimeZone('cp-fixture-m0500', [TimeSpan]::FromHours(-5), 'cp fixture UTC-5', 'cp fixture UTC-5')
+if ($null -eq $global:cpRealFeedSelector) { $global:cpRealFeedSelector = ${function:Select-CorePartitionFeedRowsFromStart} }
+function Select-CorePartitionFeedRowsFromStart([string[]]$Lines, $Anchor, $ReadDoneMs, [double]$StampResolutionMs = 1000, $Zone = $null) { & $global:cpRealFeedSelector $Lines $Anchor $ReadDoneMs $StampResolutionMs $(if ($Zone -is [TimeZoneInfo]) { $Zone } else { $cpFixtureZone }) }
+function Format-CpFixtureStamp([DateTime]$UtcInstant) { [TimeZoneInfo]::ConvertTimeFromUtc($UtcInstant, $cpFixtureZone).ToString('d.M.yyyy,H:mm:ss.fff', [Globalization.CultureInfo]::InvariantCulture) }
+"""
+
 MARKER_DRIVER = r"""
 $ErrorActionPreference = 'Stop'
 $job = [IO.File]::ReadAllText($env:CP_JOB) -replace "`r`n", "`n"
@@ -207,7 +221,8 @@ foreach ($mode in ($env:CP_MODES -split ',')) {
     if ($mode -eq 'start-throws') { $env:ProgramFiles = Join-Path $Work 'no-such-program-files' }
     try { . ([scriptblock]::Create($pre)) } finally { $env:ProgramFiles = $pf }
     # r13c (rule (a)): the window row carries its HWiNFO stamp (local time), 400 ms after the measured launch, after the playback start (100 ms)
-    [IO.File]::AppendAllText($env:HEAVY_SLOT_FEED, $corePartitionMeasuredLaunchUtc.AddMilliseconds(400).ToLocalTime().ToString('d.M.yyyy,H:mm:ss.fff', [Globalization.CultureInfo]::InvariantCulture) + ",x,70.0,45.0,No,No`n")
+    __FIXTURE_ZONE_PS__
+    [IO.File]::AppendAllText($env:HEAVY_SLOT_FEED, (Format-CpFixtureStamp $corePartitionMeasuredLaunchUtc.AddMilliseconds(400)) + ",x,70.0,45.0,No,No`n")
     $resultPath = Join-Path $Work 'result.json'
     if ($mode -like 'good*') {
         # r11 B1: the stand-in helper writes no record, so the driver writes the genuine helper's (signed under the job's key, the runner's pid,
@@ -252,6 +267,7 @@ foreach ($mode in ($env:CP_MODES -split ',')) {
 }
 $out | ConvertTo-Json -Compress -Depth 8
 """
+MARKER_DRIVER = MARKER_DRIVER.replace("__FIXTURE_ZONE_PS__", FIXTURE_ZONE_PS)
 
 
 # r14 (sol r13d B1 = r13d OPEN A1, CORE-PARTITION-SINGLE-PUBLICATION-AFTER-SNAPSHOT-1): the job's own regions run for real inside a child pwsh
@@ -285,7 +301,8 @@ try {
 """
 # the MARKER_DRIVER 'good' setup: a window row 400 ms after the measured launch, the runner's result.json, the helper's signed record and log A
 TERMINAL_CHILD_SETUP = r"""
-[IO.File]::AppendAllText($env:HEAVY_SLOT_FEED, $corePartitionMeasuredLaunchUtc.AddMilliseconds(400).ToLocalTime().ToString('d.M.yyyy,H:mm:ss.fff', [Globalization.CultureInfo]::InvariantCulture) + ",x,70.0,45.0,No,No`n")
+__FIXTURE_ZONE_PS__
+[IO.File]::AppendAllText($env:HEAVY_SLOT_FEED, (Format-CpFixtureStamp $corePartitionMeasuredLaunchUtc.AddMilliseconds(400)) + ",x,70.0,45.0,No,No`n")
 $now = [DateTime]::UtcNow
 [IO.File]::WriteAllText($resultPath, ([ordered]@{ process = [ordered]@{ id = 5000; startedAtUtc = $now.AddSeconds(-5).ToString('o'); endedAtUtc = $now.ToString('o') } } | ConvertTo-Json -Depth 3))
 $mb = ((Get-CorePartitionMonoMs) - 150).ToString([Globalization.CultureInfo]::InvariantCulture)
@@ -295,6 +312,7 @@ $rb = [Text.Encoding]::UTF8.GetBytes('{"schema":"mlv-app/core-partition-helper/v
 [IO.File]::WriteAllText("$corePartitionHelperOut.mac", [Convert]::ToHexString([Security.Cryptography.HMACSHA256]::new([Text.Encoding]::UTF8.GetBytes($corePartitionHelperNonce)).ComputeHash($rb)))
 [IO.File]::WriteAllText($runLogPath, '[' + $corePartitionMeasuredLaunchUtc.AddMilliseconds(100).ToString('yyyy-MM-ddTHH:mm:ss.fffZ') + "] [info] [0x1] playback_smoke.start session=1 worker_threads=16`n[" + $corePartitionMeasuredLaunchUtc.AddMilliseconds(110).ToString('yyyy-MM-ddTHH:mm:ss.fffZ') + "] [info] [0x1] playback_smoke.measured_session id=1`n[" + $corePartitionMeasuredLaunchUtc.AddMilliseconds(150).ToString('yyyy-MM-ddTHH:mm:ss.fffZ') + "] [info] [0x1] playback_smoke.summary session=1 reason=play-stop elapsed_ms=50.000 presented_frames=1`n")
 """
+TERMINAL_CHILD_SETUP = TERMINAL_CHILD_SETUP.replace("__FIXTURE_ZONE_PS__", FIXTURE_ZONE_PS)
 TERMINAL_SUCCESS_TAIL = "__METRICS__\nWrite-Output \"PUBLISHWHY=$corePartitionPublishWhy\"\nexit 0\n"
 # terminal class -> (CP_SAVE, the body that follows the smoke-launch finally)
 TERMINALS = {
@@ -346,6 +364,111 @@ foreach ($name in @($terminals.Keys | Sort-Object)) {
         saves = $saves
         status = $(if ($null -ne $st) { [ordered]@{ stage = $st.stage; why = $st.why; startWhy = $st.startWhy; staleRecordOnDisk = $st.staleRecordOnDisk; errors = @($st.errors) } })
         summary = $(if ($null -ne $sm) { [ordered]@{ result = $sm.result; reason = $sm.reason } })
+    }
+}
+$out | ConvertTo-Json -Compress -Depth 8
+"""
+
+
+# CORE-PARTITION-TERMINAL-TEST-REAL-PUBLISHER-1 (ledger 2026-10-28T14:47:12Z, #696 key3 r14b H3, fable r13d CORE-PARTITION-STATUS-REAL-PUBLISHER-TEST-1):
+# TERMINAL_CHILD_HEAD above stubs Save-Json (it throws on a switch, it never publishes) and Publish-AttrCudaText (a bare WriteAllText), so the REAL
+# Save-Json -> Publish-AttrCudaText slot path that writes core-partition.json and core-partition-unpublished.json was never run by any test. These
+# children are the same terminals with neither stub: the driver lifts the job's own Save-Json and Publish-AttrCudaText, and everything they call
+# (Assert-AttrCudaWritableFileSlot, Get-AttrCudaFileId, ...), out of the GENERATED job text by AST, and a name in the work directory is occupied
+# before the child starts (a directory: the slot refuses it; a second hard link: the slot refuses to remove one of two names).
+_STUB_PUBLISH = "function Publish-AttrCudaText { param([string]$Path, [string]$Value) [IO.File]::WriteAllText($Path, $Value) }\n"
+_STUB_SAVE_FROM = "function Save-Json { param($Object, $Path)\n"
+_STUB_SAVE_TO = "function Resolve-AttrCudaSmokeRunLog"
+
+
+def _real_publisher_head(stubbed: str) -> str:
+    """TERMINAL_CHILD_HEAD with its Publish-AttrCudaText stub line and its Save-Json stub block replaced by one placeholder the driver fills."""
+    if stubbed.count(_STUB_PUBLISH) != 1 or stubbed.count(_STUB_SAVE_FROM) != 1 or stubbed.count(_STUB_SAVE_TO) != 1:
+        raise RuntimeError("TERMINAL_CHILD_HEAD no longer has the Publish-AttrCudaText / Save-Json stubs this head is derived from")
+    head = stubbed.replace(_STUB_PUBLISH, "")
+    start, end = head.index(_STUB_SAVE_FROM), head.index(_STUB_SAVE_TO)
+    return head[:start] + "__REAL_FUNCTIONS__\n" + head[end:]
+
+
+REAL_PUBLISHER_CHILD_HEAD = _real_publisher_head(TERMINAL_CHILD_HEAD)
+# the stand-ins the real head still carries (Write-JobTrace, New-AttrCudaDirectory, Resolve-AttrCudaSmokeRunLog): never lifted over them
+REAL_PUBLISHER_KEPT_STUBS = ("Write-JobTrace", "Resolve-AttrCudaSmokeRunLog", "New-AttrCudaDirectory")
+REAL_PUBLISHER_REQUIRED = ("Save-Json", "Publish-AttrCudaText", "Assert-AttrCudaWritableFileSlot")
+OCCUPY_STALE_RECORD = '{"schema":"stale-record","feed":{"summary":{"rows":99},"startWhy":""}}'
+_PRESENTMON_TERMINAL = "Set-LogB\n$rawLog = [IO.File]::ReadAllText($runLogPath)\nWrite-Output 'RESULT=PRESENTMON_UNAVAILABLE'\nexit 23\n"
+_SUCCESS_BODY = "$rawLog = [IO.File]::ReadAllText($runLogPath)\n" + TERMINAL_SUCCESS_TAIL
+# case -> (CP_SAVE (unused by the real head), the body after the smoke-launch finally, {name occupied before the run: 'dir' | 'hardlink'})
+REAL_TERMINALS = {
+    # control: nothing occupied, success whose later read is the same snapshot -> the real path writes core-partition.json once, no status
+    "real-success": ("ok", _SUCCESS_BODY, {}),
+    # only the status name occupied: the record publishes, the status is never needed -> the job is undisturbed
+    "real-status-occupied": ("ok", _SUCCESS_BODY, {"core-partition-unpublished.json": "dir"}),
+    # only the record name occupied (a directory): the real slot refuses it three times, the real status write succeeds -> published as unpublished
+    "real-record-occupied": ("ok", _SUCCESS_BODY, {"core-partition.json": "dir"}),
+    # both occupied: the record refuses and the typed status refuses too -> CORE_PARTITION_UNRECORDED, exit 32, and a failure terminal keeps its own exit
+    "real-both-occupied": ("ok", _SUCCESS_BODY, {"core-partition.json": "dir", "core-partition-unpublished.json": "dir"}),
+    "real-both-occupied-terminal": ("ok", _PRESENTMON_TERMINAL, {"core-partition.json": "dir", "core-partition-unpublished.json": "dir"}),
+    # a stale record of an earlier run holds a second hard link: the slot will not remove one of two names, the stale record stays, the status says so
+    "real-stale-multi-link": ("ok", _SUCCESS_BODY, {"core-partition.json": "hardlink"}),
+}
+REAL_PUBLISHER_DRIVER = r"""
+$ErrorActionPreference = 'Stop'
+$job = [IO.File]::ReadAllText($env:CP_JOB) -replace "`r`n", "`n"
+$regions = @(); $at = 0
+while (($s = $job.IndexOf($env:CP_OPEN, $at)) -ge 0) { $e = $job.IndexOf($env:CP_CLOSE, $s); $regions += $job.Substring($s, $e - $s); $at = $e + 1 }
+$fake = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($env:CP_FAKE_HELPER))
+$pre = [regex]::Replace($regions[0], "(?m)^\`$CorePartitionHelperEncoded = '[^']*'", { "`$CorePartitionHelperEncoded = '$fake'" })
+$pre = [regex]::Replace($pre, '(?m)^\$CorePartitionHelperAffinity = \[int64\]\d+', '$CorePartitionHelperAffinity = [int64]1')
+$fin = $(if ($regions.Count -gt 4) { $regions[4..($regions.Count - 1)] -join "`n" } else { '' })
+# the REAL publisher: Save-Json, Publish-AttrCudaText and everything they call, lifted from the generated job's own text (never rewritten)
+$parsed = [System.Management.Automation.Language.Parser]::ParseInput($job, [ref]$null, [ref]$null)
+$defs = @{}
+foreach ($d in $parsed.FindAll({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] }, $false)) { $defs[$d.Name] = $d }
+$kept = @($env:CP_KEPT_STUBS -split ',')
+$take = [Collections.Generic.List[string]]::new(); $queue = [Collections.Generic.Queue[string]]::new()
+foreach ($n in @($env:CP_REQUIRED -split ',')) { $queue.Enqueue($n) }
+while ($queue.Count -gt 0) {
+    $n = $queue.Dequeue()
+    if (-not $defs.ContainsKey($n) -or $take -contains $n -or $kept -contains $n) { continue }
+    $take.Add($n)
+    foreach ($c in $defs[$n].FindAll({ param($x) $x -is [System.Management.Automation.Language.CommandAst] }, $true)) { $cn = $c.GetCommandName(); if ($cn) { $queue.Enqueue($cn) } }
+}
+$real = (@($take | ForEach-Object { $defs[$_].Extent.Text }) -join "`n")
+$terminals = $env:CP_TERMINALS | ConvertFrom-Json -AsHashtable
+$out = [ordered]@{ '__lifted__' = @($take) }
+foreach ($name in @($terminals.Keys | Sort-Object)) {
+    $dir = Join-Path $env:CP_WORK $name; [void](New-Item -ItemType Directory -Path $dir)
+    $plants = $terminals[$name][2]
+    foreach ($pn in @($plants.Keys)) {
+        $pp = Join-Path $dir $pn
+        if ($plants[$pn] -eq 'dir') { [void](New-Item -ItemType Directory -Path $pp) }
+        elseif ($plants[$pn] -eq 'hardlink') { [IO.File]::WriteAllText($pp, $env:CP_STALE); [void](New-Item -ItemType HardLink -Path "$pp.other-name" -Target $pp) }
+    }
+    $body = ([string]$terminals[$name][1]).Replace('__METRICS__', $regions[2])
+    $kill = '    if ((Test-Path -LiteralPath ''variable:corePartitionHelper'') -and $null -ne $corePartitionHelper -and -not $corePartitionHelper.HasExited) { $corePartitionHelper.Kill() }'
+    $child = $env:CP_HEAD.Replace('__REAL_FUNCTIONS__', $real) + "`n" + $pre + "`n" + $env:CP_SETUP + "`n" + $regions[1] + "`n" + $body + "`n} finally {`n" + $fin + "`n" + $kill + "`n}`n"
+    $childPath = Join-Path $dir 'child.ps1'; [IO.File]::WriteAllText($childPath, $child)
+    $env:CP_TWORK = $dir; $env:CP_SAVE = [string]$terminals[$name][0]
+    $stdout = @(& "$env:ProgramFiles\PowerShell\7\pwsh.exe" -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $childPath 2>&1 | ForEach-Object { [string]$_ })
+    $rc = $LASTEXITCODE
+    $cpPath = Join-Path $dir 'core-partition.json'
+    $cp = $(if (Test-Path -LiteralPath $cpPath -PathType Leaf) { [IO.File]::ReadAllText($cpPath) | ConvertFrom-Json -AsHashtable })
+    $stPath = Join-Path $dir 'core-partition-unpublished.json'
+    $st = $(if (Test-Path -LiteralPath $stPath -PathType Leaf) { [IO.File]::ReadAllText($stPath) | ConvertFrom-Json -AsHashtable })
+    $smPath = Join-Path $dir 'summary.json'
+    $sm = $(if (Test-Path -LiteralPath $smPath -PathType Leaf) { [IO.File]::ReadAllText($smPath) | ConvertFrom-Json -AsHashtable })
+    $occupied = [ordered]@{}
+    foreach ($pn in @($plants.Keys | Sort-Object)) {
+        $pp = Join-Path $dir $pn; $it = Get-Item -LiteralPath $pp -Force -ErrorAction SilentlyContinue
+        $occupied[$pn] = [ordered]@{ exists = ($null -ne $it); isDir = ($null -ne $it -and $it.PSIsContainer); entries = $(if ($null -ne $it -and $it.PSIsContainer) { @(Get-ChildItem -LiteralPath $pp -Force).Count }); text = $(if ($null -ne $it -and -not $it.PSIsContainer) { [IO.File]::ReadAllText($pp) }) }
+    }
+    $out[$name] = [ordered]@{
+        rc = $rc; stdout = $stdout
+        onDisk = $(if ($null -ne $cp) { [ordered]@{ rows = $cp.feed.summary.rows; watts = $cp.feed.summary.pkgWattsMean; startWhy = [string]$cp.feed.startWhy; wattsWhy = $(if ($null -ne $cp.feed.summary.reasons) { [string]$cp.feed.summary.reasons['pkgWattsMean'] }); helper = ($null -ne $cp.helper); schema = [string]$cp.schema } })
+        status = $(if ($null -ne $st) { [ordered]@{ schema = $st.schema; stage = $st.stage; why = $st.why; startWhy = $st.startWhy; staleRecordOnDisk = $st.staleRecordOnDisk; errors = @($st.errors) } })
+        summary = $(if ($null -ne $sm) { [ordered]@{ result = $sm.result; reason = $sm.reason } })
+        occupied = $occupied
+        names = @(Get-ChildItem -LiteralPath $dir -Force | ForEach-Object { $_.Name } | Sort-Object)
     }
 }
 $out | ConvertTo-Json -Compress -Depth 8
@@ -549,7 +672,8 @@ Write-CorePartitionNewFile $fresh 'ok'
 # CORE-PARTITION-HELPER-STOPFILE-OBSERVE-FLAKE-1: the test-only hold spliced into the decoded helper just before its stop-file check. Each pass
 # writes pass-N.polled (the count of processes it still tracks after its polls and enumeration) and waits, bounded at 60 s and named on timeout, for
 # pass-N.go, so a driver decides what happens between a pass's polls and its stop check instead of racing the host's scheduler for it.
-COVERAGE_HOLD_ANCHOR = "\nif (Test-Path -LiteralPath $stop) { $rec.endedBy = 'stop-file'; break }\n"
+# CORE-PARTITION-HELPER-PID-REUSE-1: the encoded helper carries no space around an assignment '=' (the generator drops them to make room)
+COVERAGE_HOLD_ANCHOR = "\nif (Test-Path -LiteralPath $stop) { $rec.endedBy='stop-file'; break }\n"
 COVERAGE_HOLD_HOOK = r"""
 $cpPass++; $cpHold = [string]$env:CP_HOLD_DIR; $cpHw = [Diagnostics.Stopwatch]::StartNew()
 [IO.File]::WriteAllText("$cpHold\pass-$cpPass.polled", [string]$live.Count)
@@ -866,8 +990,8 @@ class CorePartitionGeneratorTests(unittest.TestCase):
                 self.assertIn("([IO.File]::ReadAllText($resultPath) | ConvertFrom-Json).process", text)
                 measured = text.index("Publish-AttrCudaText -Path $corePartitionMeasuredFile")
                 self.assertLess(measured, text.index("Publish-AttrCudaText -Path $corePartitionStopFile"), "the measured pid must reach the helper before it stops")
-                # r8 A1: and the job's own wall/monotonic clock gap
-                self.assertIn("$corePartitionHelperWhy $corePartitionHelperNotReady $corePartitionMeasuredPid $corePartitionPublishWhy $corePartitionMeasuredStartTicks $corePartitionMeasuredEndTicks $corePartitionJobClockSkewMs\n", text)
+                # r8 A1: and the job's own wall/monotonic clock gap; r3 (adversary f5182886 A1): and the runner's monotonic launch..end
+                self.assertIn("$corePartitionHelperWhy $corePartitionHelperNotReady $corePartitionMeasuredPid $corePartitionPublishWhy $corePartitionMeasuredStartTicks $corePartitionMeasuredEndTicks $corePartitionJobClockSkewMs $corePartitionMeasuredExitTicks $corePartitionMeasuredRunnerElapsedMonoMs\n", text)
                 self.assertIn("ConvertTo-CorePartitionUtcTicks $cpRunnerProcess.startedAtUtc", text)
                 for fn in ("function Test-CorePartitionMeasuredApp", "function Get-CorePartitionFeedHandleInfo", "function ConvertTo-CorePartitionUtcTicks", "function Get-CorePartitionClockSkewMs",
                            "function Test-CorePartitionReadyMarker", "function Get-CorePartitionReadyToken", "function Get-CorePartitionMonoMs"):
@@ -1078,6 +1202,106 @@ class CorePartitionGeneratorTests(unittest.TestCase):
         self.assertEqual([st["stage"], st["why"], st["staleRecordOnDisk"]], ["publish", "core-partition-json-unpublished", False], st)
         self.assertEqual(st["errors"].count("publish: save-json-refused-by-test"), 3, st)
 
+    def real_publisher_cases(self) -> dict:
+        """REAL_PUBLISHER_DRIVER's per-case results for job "a": the job's own Save-Json and Publish-AttrCudaText, not the stubs, run once per class."""
+        cls = type(self)
+        if getattr(cls, "_real_publisher", None) is None:
+            self.job("a")
+            work = Path(tempfile.mkdtemp(prefix="real-publisher-work-", dir=self.tmp))
+            driver = self.tmp / "real-publisher-driver.ps1"
+            driver.write_text(REAL_PUBLISHER_DRIVER, encoding="ascii")
+            proc = run_pwsh(["-File", str(driver)], env_extra={"CP_JOB": str(self.out["a"]), "CP_OPEN": OPEN, "CP_CLOSE": CLOSE, "CP_FAKE_HELPER": MARKER_HELPER,
+                                                               "CP_WORK": str(work), "CP_HEAD": REAL_PUBLISHER_CHILD_HEAD, "CP_SETUP": TERMINAL_CHILD_SETUP,
+                                                               "CP_TERMINALS": json.dumps(REAL_TERMINALS), "CP_STALE": OCCUPY_STALE_RECORD,
+                                                               "CP_KEPT_STUBS": ",".join(REAL_PUBLISHER_KEPT_STUBS), "CP_REQUIRED": ",".join(REAL_PUBLISHER_REQUIRED)})
+            self.assertEqual(proc.returncode, 0, proc.stdout[-3000:] + proc.stderr[-3000:])
+            cls._real_publisher = json.loads(proc.stdout.strip().splitlines()[-1])
+        return cls._real_publisher
+
+    def test_real_publisher_is_the_jobs_own_code_not_a_stub(self) -> None:
+        """The stubbed terminal children replace Save-Json and Publish-AttrCudaText; this one's functions are lifted from the generated job by AST.
+        Guard the lift itself: the real slot check must be among them (a stub-free child that silently lost it would pass every case below)."""
+        got = self.real_publisher_cases()
+        for name in REAL_PUBLISHER_REQUIRED:
+            self.assertIn(name, got["__lifted__"], got["__lifted__"])
+        self.assertNotIn("function Publish-AttrCudaText { param([string]$Path, [string]$Value) [IO.File]::WriteAllText", REAL_PUBLISHER_CHILD_HEAD)
+        self.assertNotIn("function Save-Json", REAL_PUBLISHER_CHILD_HEAD)
+        job = lf(self.job("a"))
+        self.assertIn("function Save-Json($Object, [string]$Path) {\n    # Artifact writes go through the slot-checked helper", job)
+        self.assertIn("function Publish-AttrCudaText {", job)
+
+    def test_real_publisher_success_writes_core_partition_json_through_the_real_slot(self) -> None:
+        """Control: nothing occupied -> the real Save-Json -> Publish-AttrCudaText writes core-partition.json (a plain file) with the window the stubbed
+        control publishes, writes no unpublished status, and the job exits as the success terminal does (0). The status name occupied by a directory
+        changes nothing, because a published record never touches it."""
+        got = self.real_publisher_cases()
+        for name in ("real-success", "real-status-occupied"):
+            with self.subTest(case=name):
+                c = got[name]
+                self.assertEqual(c["rc"], 0, c)
+                self.assertIsNotNone(c["onDisk"], f"the real publisher left no core-partition.json: {c}")
+                self.assertEqual([c["onDisk"]["rows"], c["onDisk"]["watts"], c["onDisk"]["startWhy"]], [1, 45.0, ""], c)
+                self.assertTrue(c["onDisk"]["helper"], c)
+                self.assertIn("PUBLISHWHY=", c["stdout"], c)
+                self.assertIsNone(c["status"], c)
+                self.assertIsNone(c["summary"], c)
+                self.assertFalse([n for n in c["names"] if re.search(r"(?i)tmp|partial|\.new$|\.part$", n)], c["names"])
+        occupied = got["real-status-occupied"]["occupied"]["core-partition-unpublished.json"]
+        self.assertEqual([occupied["exists"], occupied["isDir"], occupied["entries"]], [True, True, 0], "the real publisher wrote into the occupied status name")
+
+    def test_real_publisher_refuses_an_occupied_record_slot_and_records_why(self) -> None:
+        """Only the record name occupied by a directory: the real slot check throws ATTRCUDA_SLOT_OCCUPIED on each of the three tries, writes nothing
+        into the directory, and the real status write (the second real publish) lands core-partition-unpublished.json with the three real errors. The
+        directory is not a record claiming success: no core-partition.json file exists, so the status says staleRecordOnDisk false."""
+        c = self.real_publisher_cases()["real-record-occupied"]
+        self.assertEqual(c["rc"], 0, c)
+        self.assertIsNone(c["onDisk"], f"a core-partition.json file claims success although its slot was refused: {c}")
+        self.assertIn("PUBLISHWHY=core-partition-json-unpublished", c["stdout"], c)
+        st = c["status"]
+        self.assertIsNotNone(st, f"the refused record left no status through the real publisher: {c}")
+        self.assertEqual([st["schema"], st["stage"], st["why"], st["staleRecordOnDisk"]],
+                         ["mlv-app/core-partition-unpublished/v1", "publish", "core-partition-json-unpublished", False], st)
+        slot = [e for e in st["errors"] if e.startswith("publish: ATTRCUDA_SLOT_OCCUPIED ")]
+        self.assertEqual(len(slot), 3, st)
+        self.assertFalse([e for e in st["errors"] if "save-json-refused-by-test" in e], st)
+        record = c["occupied"]["core-partition.json"]
+        self.assertEqual([record["exists"], record["isDir"], record["entries"]], [True, True, 0], "the real publisher wrote into the occupied record slot")
+        self.assertFalse([n for n in c["names"] if re.search(r"(?i)tmp|partial|\.new$|\.part$", n)], c["names"])
+
+    def test_real_publisher_unrecorded_run_exits_32_and_leaves_no_record_claiming_success(self) -> None:
+        """Both names occupied by directories: the real record write and the real status write both refuse -> the success terminal ends
+        CORE_PARTITION_UNRECORDED (exit 32, a refusal summary.json written through the real publisher), and a failure terminal keeps its own exit (23)
+        and names CORE_PARTITION_UNRECORDED on the result stream. Neither core-partition.json nor core-partition-unpublished.json exists as a file."""
+        got = self.real_publisher_cases()
+        red = got["real-both-occupied"]
+        self.assertEqual(red["rc"], 32, f"a run whose real record and status writes both refused was not refused: {red}")
+        self.assertTrue(any(ln.startswith("RESULT=CORE_PARTITION_UNRECORDED REASON=core-partition-json-unpublished+unpublished-status-unwritten ARTIFACTS=") for ln in red["stdout"]), red)
+        self.assertEqual(red["summary"], {"result": "CORE_PARTITION_UNRECORDED", "reason": "core-partition-json-unpublished+unpublished-status-unwritten"}, red)
+        self.assertNotIn("PUBLISHWHY=", "\n".join(red["stdout"]), red)
+        term = got["real-both-occupied-terminal"]
+        self.assertEqual(term["rc"], 23, term)
+        self.assertTrue(any(ln.startswith("CORE_PARTITION_UNRECORDED REASON=core-partition-json-unpublished+unpublished-status-unwritten") for ln in term["stdout"]), term)
+        self.assertIsNone(term["summary"], term)
+        for name, c in (("success", red), ("failure-terminal", term)):
+            with self.subTest(terminal=name):
+                self.assertEqual([c["onDisk"], c["status"]], [None, None], c)
+                for slot in ("core-partition.json", "core-partition-unpublished.json"):
+                    occ = c["occupied"][slot]
+                    self.assertEqual([occ["exists"], occ["isDir"], occ["entries"]], [True, True, 0], f"{slot}: the real publisher wrote into the occupied slot: {c}")
+                self.assertFalse([n for n in c["names"] if re.search(r"(?i)tmp|partial|\.new$|\.part$", n)], c["names"])
+
+    def test_real_publisher_will_not_replace_a_stale_record_held_by_a_second_name(self) -> None:
+        """A stale core-partition.json of an earlier run has a second hard link: the real slot check refuses to remove one of two names
+        (ATTRCUDA_SLOT_OCCUPIED_MULTI_LINK, through Get-AttrCudaFileId), so the stale record stays byte for byte, and the real status says so:
+        staleRecordOnDisk true, never a silent success over it."""
+        c = self.real_publisher_cases()["real-stale-multi-link"]
+        self.assertEqual(c["rc"], 0, c)
+        st = c["status"]
+        self.assertIsNotNone(st, c)
+        self.assertEqual([st["why"], st["stage"], st["staleRecordOnDisk"]], ["core-partition-json-unpublished", "publish", True], st)
+        self.assertEqual(len([e for e in st["errors"] if e.startswith("publish: ATTRCUDA_SLOT_OCCUPIED_MULTI_LINK ")]), 3, st)
+        self.assertEqual(c["occupied"]["core-partition.json"]["text"], OCCUPY_STALE_RECORD, "the real publisher wrote through, or replaced, the stale record")
+
     def test_the_jobs_key_reaches_only_the_helper(self) -> None:
         """sol r6 CP-06: the per-job key is drawn at run time, handed to the helper by environment (never the command line), never traced or
         published, and the job checks the record with it, the helper's exit code and the launch pid."""
@@ -1212,7 +1436,7 @@ class CorePartitionGeneratorTests(unittest.TestCase):
         # adversary r9 (5592421d) A1: the final pass enumerates same-path processes before it looks for the stop file
         src = base64.b64decode(re.search(r"(?m)^\$CorePartitionHelperEncoded = '([A-Za-z0-9+/=]+)'$", self.job("a")).group(1)).decode("utf-16-le")
         loop = src[src.index("while ($true) {"):]
-        self.assertLess(loop.index("$q.r.goneMs = "), loop.index("Test-Path -LiteralPath $stop"), "the stop file is looked for before the pass polls the tracked processes")
+        self.assertLess(loop.index("$q.r.goneMs="), loop.index("Test-Path -LiteralPath $stop"), "the stop file is looked for before the pass polls the tracked processes")
         self.assertLess(loop.index("Get-Process -Name $appName"), loop.index("Test-Path -LiteralPath $stop"), "the stop file is looked for before the pass enumerates same-path processes")
 
 
@@ -1290,7 +1514,9 @@ $cs = Get-CorePartitionCounterSummary $samples 1 4096
 $r.counters = @($cs.appSamples, $cs.pcoreMHzMean, $cs.ecoreMHzMean, $cs.pcoreParkedSampleFraction)
 $r.workers = @((Get-CorePartitionWorkerThreads "playback_smoke.start session=1 worker_threads=16 x=1`nplayback_smoke.start session=3 scale_request=1 worker_threads=12 start_serial=2`n").value,
     (Get-CorePartitionWorkerThreads "nothing here").why, (Get-CorePartitionWorkerThreads '').why)
-$one = '"instances":[{"pid":5000,"startUtcTicks":639286128040000000,"firstSeenUtcTicks":639286128041000000,"firstMs":4100,"lastSeenUtcTicks":639286128200000000,"goneUtcTicks":639286128202000000,"aliveMs":16000,"goneMs":16200}],"clockSkewMaxMs":0'
+# the runner's 5000 (launch +3 s, exit +23 s): seen +4.1 s, last alive +22.0 s, seen gone +22.2 s (CORE-PARTITION-PREDECESSOR-CLOCK-STEP-1: its observed
+# life covers the runner's interval within the 2 s tolerances)
+$one = '"instances":[{"pid":5000,"startUtcTicks":639286128040000000,"firstSeenUtcTicks":639286128041000000,"firstMs":4100,"lastSeenUtcTicks":639286128220000000,"goneUtcTicks":639286128222000000,"aliveMs":16000,"goneMs":16200}],"clockSkewMaxMs":0'
 $helper = ('{"topologyCheck":{"ok":true,"reason":null,"pMask":4095,"eMask":1044480},"helperAffinityObserved":1044480,"app":{"pid":5000,"startUtcTicks":639286128040000000,"affinityFirst":4095,"affinityLast":4095},"load":{"seconds":10.0,"bytes":20000000000,"joined":true},"samples":[{"app":true,"m":1000,"inst":["0,0","0,12"],"freq":[2500,2500],"perf":[160,80],"park":[0,0]}],' + $one + '}') | ConvertFrom-Json
 $w = @{ value = 16; why = $null }
 $b2 = Get-CorePartitionScalars $helper $feed 4095 1044480 8 $w $null @mp
@@ -1433,6 +1659,70 @@ foreach ($k in $clockCases.Keys) {
     if ($hasClock) { $mpk.ClockSkewMs = $clockCases[$k][1] }
     $sc = Get-CorePartitionScalars $clockCases[$k][0] $feed 4095 1044480 8 $w $null $false @mpk
     $r.clock[$k] = @($sc.corePartitionTopologyOk, $sc.benchAffinityApplied, $sc.partitionLoadApplied, $sc.appAffinityObserved, $sc.partitionLoadGBps, $sc.pcoreMHzMean, [string]$sc.corePartitionNullReasons)
+}
+# CORE-PARTITION-PREDECESSOR-CLOCK-STEP-1: the runner launched its 5000 at +4 s and saw it exit at +24 s. Each record holds ONE recorded 5000 and
+# the helper bound it, so only the measured instance's own interval can tell it is not the runner's process.
+# (1) adversary OPEN A1@40d2259d (#696 r14b): a predecessor 5000 started +2.1 s, last alive +3.8 s, seen gone at real +3.9 s (goneMs 3900), but an
+# 800 ms forward step (under the 1000 ms tolerance; the helper's gap sample at that stamp says 800) stamps its gone time +4.7 s, past the launch.
+# (2) adversary A1@92715958 (#777 restatement): the runner's 5000 ran +4.05..+23.9 s unseen; a successor on the released pid with the same path and,
+# through an unsampled clock step, the same birth stamp (+4.05 s) is first seen at +24.2 s, after the app exited, and seen gone at +25.1 s.
+function New-CpStepRecord([string]$Inst, $Skew) { $o = New-CpRecord $Inst @($Inst); $o.clockSkewMaxMs = $Skew; $o }
+$stepCases = [ordered]@{
+    'predecessor-clock-step' = (New-CpStepRecord (New-CpInst 5000 2.1 2.2 3.8 4.7).Replace('"goneMs":4700', '"goneMs":3900') 800.0)
+    'successor-first-seen-after-exit' = (New-CpStepRecord (New-CpInst 5000 4.05 24.2 25.0 25.1).Replace('}', ',"pinned":true}') 0)
+    # the same refusals at zero gap, just past each 2 s tolerance: first seen +6.1 s; seen gone +21.9 s
+    'first-seen-past-tolerance' = (New-CpStepRecord (New-CpInst 5000 4.05 6.1 23.9 24.0) 0)
+    'gone-before-tolerance' = (New-CpStepRecord (New-CpInst 5000 4.05 4.2 21.8 21.9) 0)
+    # controls (accepted before and after): the runner's own 5000 observed across its whole interval under the same 800 ms gap; seen gone after the
+    # runner's exit stamp; and just inside each tolerance (first seen +5.9 s; seen gone +22.1 s)
+    'complete-interval-control' = (New-CpStepRecord (New-CpInst 5000 4.05 4.2 23.9 24.0) 800.0)
+    'gone-after-runner-exit-control' = (New-CpStepRecord (New-CpInst 5000 4.05 4.2 24.1 24.15) 0)
+    'first-seen-in-tolerance-control' = (New-CpStepRecord (New-CpInst 5000 4.05 5.9 23.9 24.0) 0)
+    'gone-in-tolerance-control' = (New-CpStepRecord (New-CpInst 5000 4.05 4.2 22.0 22.1) 0)
+}
+$r.step = [ordered]@{}
+foreach ($k in $stepCases.Keys) {
+    $sc = Get-CorePartitionScalars $stepCases[$k] $feed 4095 1044480 8 $w $null $false -MeasuredPid 5000 -MeasuredStartTicks ($L + 40000000) -MeasuredEndTicks ($L + 240000000) -ClockSkewMs 0
+    $v = Test-CorePartitionMeasuredApp $stepCases[$k] 5000 ($L + 40000000) ($L + 240000000) 0
+    $r.step[$k] = @($sc.corePartitionTopologyOk, $sc.benchAffinityApplied, $sc.partitionLoadApplied, $sc.appAffinityObserved, $sc.partitionLoadGBps, $sc.pcoreMHzMean, [string]$sc.corePartitionNullReasons, [string]$v.why)
+}
+# r2 (Dot pr-780 S1): the runner's termination stamp (process.exitObservedAtUtc) replaces endedAtUtc in the exit-side check only. Launch +4 s, endedAtUtc
+# +24 s (after a drain); exit stamp in seconds after L, or $null for an older receipt. The r1 refusals hold with an exit stamp at the end; a drained
+# app (true exit +20.0 s, seen gone +20.1 s) is bound on its exit stamp and refused on endedAtUtc; a stamp outside launch..end proves nothing.
+$r.stepExit = 'absent'
+if ((Get-Command Test-CorePartitionMeasuredApp).Parameters.ContainsKey('MeasuredExitTicks')) {
+    $drained = New-CpStepRecord (New-CpInst 5000 4.05 4.2 20.0 20.1) 0
+    $exitCases = [ordered]@{
+        'predecessor-clock-step-with-exit-stamp' = @($stepCases['predecessor-clock-step'], 23.95)
+        'successor-with-exit-stamp' = @($stepCases['successor-first-seen-after-exit'], 23.95)
+        'gone-before-tolerance-with-exit-stamp' = @($stepCases['gone-before-tolerance'], 23.95)
+        'gone-before-exit-stamp-tolerance' = @($drained, 22.2)
+        'drained-bound-on-exit-stamp' = @($drained, 20.05)
+        'drained-older-receipt' = @($drained, $null)
+        'exit-stamp-after-end' = @($drained, 25.0)
+        'exit-stamp-before-launch' = @($drained, 3.0)
+        'complete-interval-control-with-exit-stamp' = @($stepCases['complete-interval-control'], 23.95)
+        # adversary r2 (6c16f4de) advisory A1 (literal): another same-path 6000 started +21 s, after the app's confirmed exit (+20.05 s) but inside
+        # the drain before endedAtUtc (+24 s); it was never alive with the app. Control: one started +20.0 s, before that exit, still overlaps.
+        'drain-only-instance' = @($null, 20.05)
+        'started-before-exit-stamp-control' = @($null, 20.05)
+    }
+    $i5000d = New-CpInst 5000 4.05 4.2 19.9 20.1
+    $exitCases['drain-only-instance'][0] = New-CpStepRecord $i5000d 0
+    $exitCases['drain-only-instance'][0].instances = @(($i5000d | ConvertFrom-Json), ((New-CpInst 6000 21 21.1 22.9 23.1) | ConvertFrom-Json))
+    $exitCases['started-before-exit-stamp-control'][0] = New-CpStepRecord $i5000d 0
+    $exitCases['started-before-exit-stamp-control'][0].instances = @(($i5000d | ConvertFrom-Json), ((New-CpInst 6000 20.0 20.15 22.9 23.1) | ConvertFrom-Json))
+    $exitCases['adversary-9a2372b7-A1-early-exit'] = @((New-CpStepRecord $i5000d 0), 19.21)
+    $exitCases['adversary-9a2372b7-A1-early-exit'][0].instances = @(($i5000d | ConvertFrom-Json), ((New-CpInst 6000 19.95 20.15 23.9 24.1) | ConvertFrom-Json))
+    # r3: the runner's monotonic launch..end (20 s), in agreement with its wall launch..end, so its drain is a checked exit
+    $re = $(if ((Get-Command Test-CorePartitionMeasuredApp).Parameters.ContainsKey('RunnerElapsedMonoMs')) { @{ RunnerElapsedMonoMs = 20000.0 } } else { @{} })
+    foreach ($k in $exitCases.Keys) {
+        $x = $(if ($null -eq $exitCases[$k][1]) { [int64]0 } else { $L + [int64]($exitCases[$k][1] * 1e7) })
+        $sc = Get-CorePartitionScalars $exitCases[$k][0] $feed 4095 1044480 8 $w $null $false -MeasuredPid 5000 -MeasuredStartTicks ($L + 40000000) -MeasuredEndTicks ($L + 240000000) -ClockSkewMs 0 -MeasuredExitTicks $x @re
+        $v = Test-CorePartitionMeasuredApp $exitCases[$k][0] 5000 ($L + 40000000) ($L + 240000000) 0 $x @re
+        if ($r.stepExit -is [string]) { $r.stepExit = [ordered]@{} }
+        $r.stepExit[$k] = @($sc.appAffinityObserved, $sc.partitionLoadGBps, [string]$sc.corePartitionNullReasons, [string]$v.why, [string]$v.exitStamp)
+    }
 }
 # r8 A1: the job's own gap over its (wall ticks, monotonic ms) pairs: steady; a 100 s backward step; one pair; a non-numeric or missing reading
 $r.clockSkew = 'absent'
@@ -1617,7 +1907,7 @@ $CorePartitionBenchMask = [int64]4095
 $CorePartitionLoadMask = [int64]1044480
 $CorePartitionLoadThreads = 8
 $CorePartitionHelperMask = [int64]1044480
-$record = '{"schema":"mlv-app/core-partition-helper/v1","pid":4242,"topologyCheck":{"ok":true,"reason":null,"pMask":4095,"eMask":1044480},"helperAffinityObserved":1044480,"app":{"pid":5000,"startUtcTicks":639286128040000000,"affinityFirst":4095,"affinityLast":4095},"load":{"seconds":15,"bytes":30000000000,"joined":true},"samples":[{"app":true,"m":1000,"inst":["0,0","0,12"],"freq":[2500,2500],"perf":[160,80],"park":[0,0]}],"instances":[{"pid":5000,"startUtcTicks":639286128040000000,"firstSeenUtcTicks":639286128041000000,"firstMs":4100,"lastSeenUtcTicks":639286128200000000,"goneUtcTicks":639286128202000000,"aliveMs":16000,"goneMs":16200}],"clockSkewMaxMs":0}'
+$record = '{"schema":"mlv-app/core-partition-helper/v1","pid":4242,"topologyCheck":{"ok":true,"reason":null,"pMask":4095,"eMask":1044480},"helperAffinityObserved":1044480,"app":{"pid":5000,"startUtcTicks":639286128040000000,"affinityFirst":4095,"affinityLast":4095},"load":{"seconds":15,"bytes":30000000000,"joined":true},"samples":[{"app":true,"m":1000,"inst":["0,0","0,12"],"freq":[2500,2500],"perf":[160,80],"park":[0,0]}],"instances":[{"pid":5000,"startUtcTicks":639286128040000000,"firstSeenUtcTicks":639286128041000000,"firstMs":4100,"lastSeenUtcTicks":639286128220000000,"goneUtcTicks":639286128222000000,"aliveMs":16000,"goneMs":16200}],"clockSkewMaxMs":0}'
 # the runner's result.json: the launched pid and its launch..exit window, as the runner writes them (ISO 'o' strings)
 $runnerResult = '{"process":{"id":5000,"startedAtUtc":"' + [DateTime]::new([int64]639286128030000000, [DateTimeKind]::Utc).ToString('o') + '","endedAtUtc":"' + [DateTime]::new([int64]639286128230000000, [DateTimeKind]::Utc).ToString('o') + '"}}'
 $cases = @(
@@ -1934,6 +2224,62 @@ class CorePartitionPureHelperTests(unittest.TestCase):
         self.assertEqual(control[:6], [True, True, True, "0x00FFF", 2.0, 4000.0], f"a gap under the tolerance with no real overlap is accepted: {control}")
         self.assertEqual(self.r["clockSkew"], [0, 100000, None, None, None], self.r["clockSkew"])
 
+    def test_predecessor_clock_step_an_instance_whose_observed_life_does_not_cover_the_runner_interval_is_refused(self) -> None:
+        """CORE-PARTITION-PREDECESSOR-CLOCK-STEP-1 (adversary OPEN A1@40d2259d on #696 r14b; its restatement A1@92715958 on #777): the one recorded
+        same-pid instance passed candidate selection on a tolerated clock step and was credited as the runner's app although its observed life did not
+        span the runner's launch..exit. The binding is pid plus birth stamp (the helper's app must equal the candidate on both), and the bound instance
+        must be first seen within 2 s (plus twice the clock gap) of the runner's launch and seen gone no earlier than 2 s (plus that slack) before the
+        runner's exit; otherwise it is refused, typed, and nothing of it is credited."""
+        refused = {
+            "predecessor-clock-step": "measured-app-gone-before-runner-exit",
+            "successor-first-seen-after-exit": "measured-app-seen-after-runner-launch",
+            "first-seen-past-tolerance": "measured-app-seen-after-runner-launch",
+            "gone-before-tolerance": "measured-app-gone-before-runner-exit",
+        }
+        for case, code in refused.items():
+            with self.subTest(case=case):
+                topo, bench, load, observed, gbps, pcore, why, verdict = self.r["step"][case]
+                self.assertEqual(verdict, code, f"an instance whose observed life does not cover the runner interval was bound: {self.r['step'][case]}")
+                self.assertEqual([bench, load, observed, gbps, pcore], [False, False, None, None, None], f"its evidence was credited: {why}")
+                for field in ("appAffinityObserved", "partitionLoadGBps", "pcoreMHzMean", "ecoreMHzMean", "pcoreParkedSampleFraction"):
+                    self.assertIn(f"{field}={code}", why)
+        for case in ("complete-interval-control", "gone-after-runner-exit-control", "first-seen-in-tolerance-control", "gone-in-tolerance-control"):
+            with self.subTest(case=case):
+                control = self.r["step"][case]
+                self.assertEqual(control[7], "", f"the runner's own instance, observed across its interval, was refused: {control}")
+                self.assertEqual(control[:6], [True, True, True, "0x00FFF", 2.0, 4000.0], f"its evidence is credited: {control}")
+
+    def test_the_exit_side_check_uses_the_runners_termination_stamp_and_keeps_every_r1_refusal(self) -> None:
+        """r2 (Dot pr-780 S1): the runner's confirmed exit (endedAtUtc - process.exitToEndMs, a monotonic drain duration) replaces endedAtUtc
+        (stamped after the stream drain) in the exit-side check only, with the same 2 s tolerance and $slack; the verdict names what it used. An
+        exit outside the runner's launch..end window is refused, typed. The overlap test keeps endedAtUtc (adversary 9a2372b7 A1)."""
+        s = self.r["stepExit"]
+        self.assertIsInstance(s, dict, "Test-CorePartitionMeasuredApp takes no runner termination stamp (-MeasuredExitTicks)")
+        refused = {
+            "predecessor-clock-step-with-exit-stamp": ("measured-app-gone-before-runner-exit", "exitToEndMs"),
+            "successor-with-exit-stamp": ("measured-app-seen-after-runner-launch", ""),
+            "gone-before-tolerance-with-exit-stamp": ("measured-app-gone-before-runner-exit", "exitToEndMs"),
+            "gone-before-exit-stamp-tolerance": ("measured-app-gone-before-runner-exit", "exitToEndMs"),
+            "drained-older-receipt": ("measured-app-gone-before-runner-exit", "endedAtUtc"),
+            "exit-stamp-after-end": ("measured-exit-stamp-inconsistent", "exitToEndMs"),
+            "exit-stamp-before-launch": ("measured-exit-stamp-inconsistent", "exitToEndMs"),
+            "started-before-exit-stamp-control": ("same-path-instance-overlap", ""),
+            # adversary 9a2372b7 A1 (literal): 6000 started +19.95 s, before the app's real exit (+20 s); an exit moved to +19.21 s must not hide it
+            "adversary-9a2372b7-A1-early-exit": ("same-path-instance-overlap", ""),
+            # adversary 6c16f4de advisory A1 (left open, the conservative side): an instance started during the drain is still refused as an overlap
+            "drain-only-instance": ("same-path-instance-overlap", ""),
+        }
+        for case, (code, stamp) in refused.items():
+            with self.subTest(case=case):
+                observed, gbps, why, verdict, used = s[case]
+                self.assertEqual([verdict, used], [code, stamp], s[case])
+                self.assertEqual([observed, gbps], [None, None], f"its evidence was credited: {why}")
+                self.assertIn(f"appAffinityObserved={code}", why)
+        for case in ("drained-bound-on-exit-stamp", "complete-interval-control-with-exit-stamp"):
+            with self.subTest(case=case):
+                observed, gbps, why, verdict, used = s[case]
+                self.assertEqual([observed, gbps, verdict, used], ["0x00FFF", 2.0, "", "exitToEndMs"], s[case])
+
     def test_a_helper_that_never_started_publishes_no_package_feed_value_through_the_job_cleanup(self) -> None:
         """r8 A3 (adversary r7 6fac125a A3) through the job's own not-ready rule, cleanup block and scalar line: no helper object, fresh feed rows."""
         c = self.cleanup_cases()["start-failed-fresh-feed"]
@@ -2220,6 +2566,207 @@ $r | ConvertTo-Json -Depth 6 -Compress
 """
 
 
+# CORE-PARTITION-PREDECESSOR-CLOCK-STEP-1 r2 (Dot pr-780 S1): the producer chain, end to end. A real app process (python) exits at once, but a child it
+# started holds the inherited stdout pipe open for $HoldSec, so the runner's REAL Wait-GuiSmokeProcessBounded drains stdout until then. The runner's
+# own finalize text (its Wait-GuiSmokeProcessBounded call through its end stamp) and its own process receipt block are executed as written; the
+# receipt goes through JSON to a result.json, the job's own result.json read and its own measured-app call are executed as written, and the helper
+# record says what a helper polling at 200 ms would: the app first seen just after its start, seen gone just after its real exit.
+EXIT_STAMP_DRIVER = r"""
+$ErrorActionPreference = 'Stop'
+Import-Module $env:CP_BOUNDARY -Force
+$runnerText = [IO.File]::ReadAllText($env:CP_RUNNER) -replace "`r`n", "`n"
+$genText = [IO.File]::ReadAllText($env:CP_GEN) -replace "`r`n", "`n"
+function Get-Slice([string]$Text, [string]$From, [string]$To) {
+    $i = $Text.IndexOf($From); if ($i -lt 0) { throw "slice start not found: $From" }
+    $j = $Text.IndexOf($To, $i); if ($j -lt 0) { throw "slice end not found: $To" }
+    $Text.Substring($i, $j + $To.Length - $i)
+}
+$runnerFinalize = Get-Slice $runnerText '$processBoundary = Wait-GuiSmokeProcessBounded' '$endUtc = [datetime]::UtcNow'
+$rpI = $runnerText.IndexOf("`n    process = [pscustomobject]@{`n"); if ($rpI -lt 0) { throw 'runner process receipt block not found' }
+$rpJ = $runnerText.IndexOf("`n    }`n", $rpI + 1)
+$runnerProcess = $runnerText.Substring($rpI + 15, $rpJ + 6 - ($rpI + 15))
+$jobRead = Get-Slice $genText '$corePartitionMeasuredPid = [int64]0;' 'catch { $corePartitionErrors.Add("measured-pid: $([string]$_.Exception.Message)") }'
+$jobVerdict = Get-Slice $genText 'try { $cpAppVerdict = Test-CorePartitionMeasuredApp ' 'catch { $corePartitionErrors.Add("measured-app: $([string]$_.Exception.Message)") }'
+$out = [ordered]@{}
+foreach ($case in @(@('drain-held', 3.5, $false), @('drain-held-older-receipt', 3.5, $true), @('no-hold-control', 0.0, $false))) {
+    $name = $case[0]; $holdSec = [double]$case[1]; $older = [bool]$case[2]
+    $code = if ($holdSec -gt 0) { "import subprocess, sys; print('app-ok', flush=True); subprocess.Popen([sys.executable, '-c', 'import time; time.sleep($holdSec)']); sys.exit(0)" } else { "print('app-ok', flush=True)" }
+    # r3: the runner's own launch reads (its wall stamp and, from r3, its monotonic stamp beside it), executed as written
+    if ($runnerText.Contains('$startTimestamp = [System.Diagnostics.Stopwatch]::GetTimestamp()')) {
+        . ([scriptblock]::Create((Get-Slice $runnerText '$startUtc = [datetime]::UtcNow' '$startTimestamp = [System.Diagnostics.Stopwatch]::GetTimestamp()')))
+    } else { $startUtc = [datetime]::UtcNow }
+    $psi = [Diagnostics.ProcessStartInfo]::new(); $psi.FileName = $env:CP_PY; $psi.UseShellExecute = $false
+    $psi.RedirectStandardOutput = $true; $psi.RedirectStandardError = $true
+    [void]$psi.ArgumentList.Add('-c'); [void]$psi.ArgumentList.Add($code)
+    $process = [Diagnostics.Process]::new(); $process.StartInfo = $psi; [void]$process.Start()
+    $stdoutTask = $process.StandardOutput.ReadToEndAsync(); $stderrTask = $process.StandardError.ReadToEndAsync()
+    $hostLoadFinalizeTimeoutMs = 60000; $captureBindingFailures = @()
+    . ([scriptblock]::Create($runnerFinalize))
+    $receiptProcess = . ([scriptblock]::Create($runnerProcess))
+    if ($older) { foreach ($n in @('exitObservedAtUtc', 'exitToEndMs', 'elapsedMonoMs')) { $receiptProcess.PSObject.Properties.Remove($n) } }
+    $resultPath = Join-Path $env:CP_TMP "$name.result.json"
+    [IO.File]::WriteAllText($resultPath, ([ordered]@{ process = $receiptProcess } | ConvertTo-Json -Depth 6))
+    $appStart = $process.StartTime.ToUniversalTime().Ticks; $appExit = $process.ExitTime.ToUniversalTime().Ticks
+    $inst = '{"pid":' + $process.Id + ',"startUtcTicks":' + $appStart + ',"firstSeenUtcTicks":' + ($appStart + 100000) + ',"firstMs":10,"lastSeenUtcTicks":' + $appStart +
+        ',"goneUtcTicks":' + ($appExit + 1000000) + ',"aliveMs":10,"goneMs":210,"affinityFirst":4095,"affinityLast":4095,"pinned":true}'
+    $corePartitionHelperRecord = ('{"schema":"mlv-app/core-partition-helper/v1","pid":4242,"app":' + $inst + ',"instances":[' + $inst + '],"others":[],"samples":[],"clockSkewMaxMs":0,"monoBaseMs":0,"endedBy":"stop-file"}') | ConvertFrom-Json
+    $corePartitionErrors = [System.Collections.Generic.List[string]]::new(); $corePartitionJobClockSkewMs = 0
+    . ([scriptblock]::Create($jobRead))
+    $cpAppVerdict = @{ why = 'measured-app-unverified' }
+    . ([scriptblock]::Create($jobVerdict))
+    $out[$name] = [ordered]@{
+        why = [string]$cpAppVerdict.why; exitStamp = $cpAppVerdict.exitStamp; errors = @($corePartitionErrors)
+        terminationConfirmed = [bool]$processBoundary.terminationConfirmed; stdoutDrained = [bool]$processBoundary.stdoutDrained; stdout = [string]$processBoundary.stdout
+        receiptHasExitStamp = ($null -ne $receiptProcess.PSObject.Properties['exitToEndMs'] -and $null -ne $receiptProcess.exitToEndMs)
+        receiptHasElapsedMono = ($null -ne $receiptProcess.PSObject.Properties['elapsedMonoMs'] -and $null -ne $receiptProcess.elapsedMonoMs)
+        runnerClock = [string]$cpAppVerdict.runnerClock; runnerSkewMs = $cpAppVerdict.runnerSkewMs
+        endAfterExitMs = [int](($endUtc.Ticks - $appExit) / 1e4)
+        exitObservedAfterExitMs = $(if ($corePartitionMeasuredExitTicks -ne 0) { [int](($corePartitionMeasuredExitTicks - $appExit) / 1e4) } else { $null })
+    }
+}
+# adversary 56b25d8b A2: a receipt whose exitToEndMs is there but is no usable drain (does not parse, negative, longer than launch..end, overflows)
+# is refused, never a silent fall back; null (termination never confirmed) falls back. The last case's real app, receipt and helper record.
+foreach ($bad in @(@('drain-1e20', 1e20), @('drain-negative', -5.0), @('drain-text', 'abc'), @('drain-over-window', 1e9), @('drain-null', $null))) {
+    $crafted = $receiptProcess | ConvertTo-Json -Depth 6 | ConvertFrom-Json
+    $crafted.exitToEndMs = $bad[1]
+    $resultPath = Join-Path $env:CP_TMP "$($bad[0]).result.json"
+    [IO.File]::WriteAllText($resultPath, ([ordered]@{ process = $crafted } | ConvertTo-Json -Depth 6))
+    $corePartitionErrors = [System.Collections.Generic.List[string]]::new()
+    . ([scriptblock]::Create($jobRead))
+    $cpAppVerdict = @{ why = 'measured-app-unverified' }
+    . ([scriptblock]::Create($jobVerdict))
+    $out[$bad[0]] = @([string]$cpAppVerdict.why, [string]$cpAppVerdict.exitStamp, $corePartitionErrors.Count)
+}
+# adversary f5182886 A1 (literal), through the job's own result.json read and verdict call: L = 639286128000000000. The runner's 5000 launched at
+# L+4 s, its termination was confirmed at L+20 s and its monotonic end read at L+24 s (exitToEndMs 4000; launch..end on the monotonic clock 20000 ms).
+# An unsampled UTC excursion lands only on the endedAtUtc read: +5 s stamps L+29 s (derived exit L+25 s, a false gone-before-exit refusal), -5 s
+# stamps L+19 s (derived exit L+15 s, before the real one). Both skews are 0 and the helper saw the app gone at L+20.1 s. r3: the runner's wall
+# launch..end disagrees with its monotonic launch..end by 5000 ms, over the 1000 ms CLOCK TOLERANCE: clock-discontinuity. Controls: no excursion,
+# and an 800 ms excursion (under the tolerance, widened into the slack). A drain with no monotonic launch..end to check it against proves no exit
+# (clock-unverified); one that is there but unusable is refused, never a silent fallback.
+$advInst = '{"pid":5000,"startUtcTicks":639286128040500000,"firstSeenUtcTicks":639286128042000000,"firstMs":4200,"goneUtcTicks":639286128201000000,"aliveMs":19900,"goneMs":20100,"pinned":true}'
+$advRecordJson = '{"schema":"mlv-app/core-partition-helper/v1","pid":4242,"app":{"pid":5000,"startUtcTicks":639286128040500000,"affinityFirst":4095,"affinityLast":4095},"instances":[' + $advInst +
+    '],"others":[],"samples":[],"load":{"seconds":15,"bytes":30000000000,"joined":true},"helperAffinityObserved":1044480,"topologyCheck":{"ok":true,"pMask":4095,"eMask":1044480},"clockSkewMaxMs":0,"monoBaseMs":0,"endedBy":"stop-file"}'
+$advL = [int64]639286128000000000
+foreach ($adv in @(@('adv-f5182886-A1-plus5', 29.0, 20000.0), @('adv-f5182886-A1-minus5', 19.0, 20000.0), @('adv-f5182886-A1-no-excursion-control', 24.0, 20000.0),
+        @('adv-f5182886-A1-800ms-control', 24.8, 20000.0), @('adv-f5182886-A1-elapsed-missing', 24.0, 'absent'), @('adv-f5182886-A1-elapsed-null', 24.0, $null),
+        @('adv-f5182886-A1-elapsed-text', 24.0, 'abc'), @('adv-f5182886-A1-elapsed-negative', 24.0, -1.0))) {
+    $p = [ordered]@{ id = 5000; startedAtUtc = ([datetime]::new($advL + 40000000, [DateTimeKind]::Utc)).ToString('o'); endedAtUtc = ([datetime]::new($advL + [int64]($adv[1] * 1e7), [DateTimeKind]::Utc)).ToString('o'); exitToEndMs = 4000.0 }
+    if (-not ($adv[2] -is [string] -and $adv[2] -eq 'absent')) { $p.elapsedMonoMs = $adv[2] }
+    $resultPath = Join-Path $env:CP_TMP "$($adv[0]).result.json"
+    [IO.File]::WriteAllText($resultPath, ([ordered]@{ process = $p } | ConvertTo-Json -Depth 6))
+    $corePartitionHelperRecord = $advRecordJson | ConvertFrom-Json
+    $corePartitionErrors = [System.Collections.Generic.List[string]]::new(); $corePartitionJobClockSkewMs = 0
+    . ([scriptblock]::Create($jobRead))
+    $cpAppVerdict = @{ why = 'measured-app-unverified' }
+    . ([scriptblock]::Create($jobVerdict))
+    $out[$adv[0]] = @([string]$cpAppVerdict.why, [string]$cpAppVerdict.exitStamp, [string]$cpAppVerdict.runnerClock, $corePartitionErrors.Count)
+}
+# r3: the runner's monotonic launch stamp is read right after its wall launch stamp, before the app starts
+$out.startOrder = @($runnerText.IndexOf('$startUtc = [datetime]::UtcNow'), $runnerText.IndexOf('$startTimestamp = [System.Diagnostics.Stopwatch]::GetTimestamp()'), $runnerText.IndexOf('$process = [System.Diagnostics.Process]::Start($startInfo)'))
+# adversary 56b25d8b A1: the runner reads its monotonic end BEFORE its wall end, after the bounded wait
+$out.order =@($runnerText.IndexOf('$processBoundary = Wait-GuiSmokeProcessBounded'), $runnerText.IndexOf('$endTimestamp = [System.Diagnostics.Stopwatch]::GetTimestamp()'), $runnerText.IndexOf('$endUtc = [datetime]::UtcNow'))
+$out | ConvertTo-Json -Depth 6 -Compress
+"""
+
+
+@requires_windows_pwsh
+class CorePartitionRunnerExitStampTests(unittest.TestCase):
+    """CORE-PARTITION-PREDECESSOR-CLOCK-STEP-1 r2 (Dot pr-780 S1, hub-verified at bd6f283a): the r1 exit-side check compared the helper's gone stamp
+    with the runner's process.endedAtUtc, which the runner stamps only after Wait-GuiSmokeProcessBounded has drained stdout and stderr (up to 15 s
+    each). A correctly bound app whose stdout drain ran more than 2 s past its exit was refused. The runner now also records the moment termination
+    was confirmed (process.exitObservedAtUtc); the job's exit-side check uses it, says which stamp it used, and falls back to endedAtUtc for an
+    older receipt."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        import sys
+        cls._tmp = tempfile.TemporaryDirectory(prefix="core-partition-exit-stamp-")
+        cls.addClassCleanup(cls._tmp.cleanup)
+        driver = Path(cls._tmp.name) / "exit-stamp-driver.ps1"
+        driver.write_text(LIFT + EXIT_STAMP_DRIVER, encoding="ascii")
+        cls.raw = run_pwsh(["-File", str(driver)], env_extra={
+            "CP_GEN": str(GENERATOR), "CP_TMP": cls._tmp.name, "CP_PY": sys.executable,
+            "CP_RUNNER": str(ROOT / "tools" / "profiling" / "run-release-gui-smoke.ps1"),
+            "CP_BOUNDARY": str(ROOT / "tools" / "profiling" / "gui-smoke-process-boundary.psm1")}, timeout=180)
+        lines = cls.raw.stdout.strip().splitlines()
+        cls.r = json.loads(lines[-1]) if cls.raw.returncode == 0 and lines else None
+
+    def setUp(self) -> None:
+        self.assertIsNotNone(self.r, f"the producer chain did not run: {self.raw.stdout[-3000:]}{self.raw.stderr[-3000:]}")
+
+    def test_a_correct_app_whose_stdout_drain_outlasts_the_tolerance_is_bound_on_its_termination_stamp(self) -> None:
+        c = self.r["drain-held"]
+        # the scenario is real: the app exited, its stdout drained in full, and the runner's endedAtUtc landed more than 2 s (plus margin) after the exit
+        self.assertEqual([c["terminationConfirmed"], c["stdoutDrained"], c["stdout"].strip(), c["errors"]], [True, True, "app-ok", []], c)
+        self.assertGreater(c["endAfterExitMs"], 2500, f"the drain did not hold endedAtUtc past the 2 s tolerance: {c}")
+        self.assertTrue(c["receiptHasExitStamp"], f"the runner's receipt carries no termination stamp: {c}")
+        self.assertIsNotNone(c["exitObservedAfterExitMs"], c)
+        self.assertLess(c["exitObservedAfterExitMs"], 1000, f"the termination stamp is not the moment the runner saw the exit: {c}")
+        self.assertEqual(c["why"], "", f"the runner's own app, observed across its life, was refused because cleanup outlasted the tolerance: {c}")
+        self.assertEqual(c["exitStamp"], "exitToEndMs", c)
+
+    def test_an_older_receipt_without_the_termination_stamp_falls_back_to_endedAtUtc_and_says_so(self) -> None:
+        c = self.r["drain-held-older-receipt"]
+        self.assertFalse(c["receiptHasExitStamp"], c)
+        self.assertGreater(c["endAfterExitMs"], 2500, c)
+        self.assertEqual(c["why"], "measured-app-gone-before-runner-exit", f"the fallback did not keep the r1 rule: {c}")
+        self.assertEqual(c["exitStamp"], "endedAtUtc", f"the verdict does not say which stamp it used: {c}")
+
+    def test_a_drain_that_is_there_but_unusable_is_refused_never_a_silent_fallback(self) -> None:
+        """adversary 56b25d8b A2: exitToEndMs that overflows, is negative, does not parse or is longer than the runner's window is refused, typed."""
+        for case in ("drain-1e20", "drain-negative", "drain-text", "drain-over-window"):
+            with self.subTest(case=case):
+                self.assertEqual(self.r[case][:2], ["measured-exit-stamp-inconsistent", "exitToEndMs"], self.r[case])
+        self.assertEqual(self.r["drain-null"], ["", "endedAtUtc", 0], "termination never confirmed (null) falls back to endedAtUtc")
+
+    def test_the_runner_reads_its_monotonic_end_before_its_wall_end(self) -> None:
+        """adversary 56b25d8b A1: a delay between the two end reads can only shorten exitToEndMs, so the derived exit never moves before the real one."""
+        wait, mono, wall = self.r["order"]
+        self.assertTrue(0 <= wait < mono < wall, self.r["order"])
+    def test_a_wall_clock_excursion_on_the_runners_end_read_is_a_clock_discontinuity(self) -> None:
+        """adversary f5182886 A1 (literal): an unsampled +5 s / -5 s UTC excursion that lands only on the runner's endedAtUtc read moved the derived
+        exit (endedAtUtc - exitToEndMs) to a false refusal / before the real exit. The runner's wall launch..end now has to agree with its monotonic
+        launch..end (process.elapsedMonoMs) within the 1000 ms CLOCK TOLERANCE; over it the verdict is clock-discontinuity."""
+        for case in ("adv-f5182886-A1-plus5", "adv-f5182886-A1-minus5"):
+            with self.subTest(case=case):
+                self.assertEqual(self.r[case][0], "clock-discontinuity", self.r[case])
+                self.assertEqual(self.r[case][3], 0, self.r[case])
+        for case in ("adv-f5182886-A1-no-excursion-control", "adv-f5182886-A1-800ms-control"):
+            with self.subTest(case=case):
+                self.assertEqual(self.r[case], ["", "exitToEndMs", "verified", 0], f"the runner's own app under a checked runner clock was refused: {self.r[case]}")
+
+    def test_a_drain_with_no_runner_clock_check_proves_no_exit(self) -> None:
+        """r3: exitToEndMs without the runner's monotonic launch..end (missing or null) is clock-unverified for the exit-side check, labelled; a
+        value that is there but unusable is refused, never a silent fallback."""
+        for case in ("adv-f5182886-A1-elapsed-missing", "adv-f5182886-A1-elapsed-null"):
+            with self.subTest(case=case):
+                self.assertEqual(self.r[case], ["clock-unverified", "exitToEndMs", "unverified", 0], self.r[case])
+        for case in ("adv-f5182886-A1-elapsed-text", "adv-f5182886-A1-elapsed-negative"):
+            with self.subTest(case=case):
+                self.assertEqual(self.r[case][0], "clock-unverified", self.r[case])
+                self.assertEqual(self.r[case][2], "unusable", self.r[case])
+
+    def test_the_runner_records_its_monotonic_launch_to_end_and_the_job_checks_it(self) -> None:
+        """r3: the real producer chain: the runner's receipt carries elapsedMonoMs, read right after its wall launch stamp, and the job checks it."""
+        launch, mono, start = self.r["startOrder"]
+        self.assertTrue(0 <= launch < mono < start, self.r["startOrder"])
+        for case in ("drain-held", "no-hold-control"):
+            with self.subTest(case=case):
+                c = self.r[case]
+                self.assertTrue(c["receiptHasElapsedMono"], c)
+                self.assertEqual(c["runnerClock"], "verified", c)
+                self.assertLess(c["runnerSkewMs"], 1000, c)
+        self.assertFalse(self.r["drain-held-older-receipt"]["receiptHasElapsedMono"])
+        self.assertEqual(self.r["drain-held-older-receipt"]["runnerClock"], "unverified", "the older-receipt fallback does not say its runner clock is unchecked")
+
+    def test_an_app_with_no_held_drain_is_bound_control(self) -> None:
+        c = self.r["no-hold-control"]
+        self.assertEqual([c["terminationConfirmed"], c["stdoutDrained"], c["stdout"].strip(), c["errors"]], [True, True, "app-ok", []], c)
+        self.assertLess(c["endAfterExitMs"], 2000, c)
+        self.assertEqual(c["why"], "", c)
+
+
 @requires_windows_pwsh
 class CorePartitionR9Tests(unittest.TestCase):
     """r9 (Dot record a65f1786 = adversary r8 aeacec83 A1, A2, A4): the literals against the generator's own pure consumers and readers."""
@@ -2378,7 +2925,8 @@ $hb = $hb.Replace($cat, '$cpFakeCat')
 $prelude = @'
 $cpFakeCat = [pscustomobject]@{}; $cpFakeCat | Add-Member -MemberType ScriptMethod -Name ReadCategory -Value { @{} }
 $global:cpF = @{ sw = [Diagnostics.Stopwatch]::StartNew(); firstAt = $null; exitAt = [long]::MaxValue; stalled = $false; stopped = $false; start = [DateTime]::UtcNow }
-$global:cpP = [pscustomobject]@{ Id = 5000; Path = $env:MLV_CP_EXE; StartTime = $global:cpF.start; PriorityClass = 'Normal' }
+# CORE-PARTITION-HELPER-PID-REUSE-1: its handle opens, as a real app's does (the helper refuses a measured app it could not pin with a held handle)
+$global:cpP = [pscustomobject]@{ Id = 5000; Path = $env:MLV_CP_EXE; StartTime = $global:cpF.start; PriorityClass = 'Normal'; Handle = [IntPtr]1 }
 $global:cpP | Add-Member -MemberType ScriptMethod -Name Refresh -Value { }
 $global:cpP | Add-Member -MemberType ScriptProperty -Name HasExited -Value {
     $e = $global:cpF.sw.ElapsedMilliseconds -ge $global:cpF.exitAt
@@ -2389,7 +2937,7 @@ $global:cpP | Add-Member -MemberType ScriptProperty -Name ProcessorAffinity -Val
     if ($null -eq $global:cpF.firstAt) { $global:cpF.firstAt = $t }
     elseif (-not $global:cpF.stalled -and $t -ge $global:cpF.firstAt + 2500) { $global:cpF.stalled = $true; $global:cpF.exitAt = $t + 100; if ($env:CP_MODE -eq 'delayed') { Start-Sleep -Milliseconds 1500 } }
     [int64]4095 }
-function Get-Process { [CmdletBinding()] param([string]$Name) if (-not $global:cpF.stopped -and $global:cpF.sw.ElapsedMilliseconds -lt $global:cpF.exitAt) { $global:cpP } }
+function Get-Process { [CmdletBinding()] param([string]$Name, [int]$Id) if ($PSBoundParameters.ContainsKey('Id')) { return (@($global:cpP, $global:cpQ) | Where-Object { $null -ne $_ -and $_.Id -eq $Id }) }; if (-not $global:cpF.stopped -and $global:cpF.sw.ElapsedMilliseconds -lt $global:cpF.exitAt) { $global:cpP } }
 '@
 $src = $prelude + "`n" + ((@('Format-CorePartitionMask', 'Get-CorePartitionTopology', 'Test-CorePartitionMaskClass') | ForEach-Object { $fn[$_] }) -join "`n")
 $src = $src + "`n" + $hb
@@ -2544,6 +3092,21 @@ _CLOCK_APP = {**_APP, "startBeforeFirstPollMs": 50}
 CLOCK_STEPS_MS = (100, 500, 1000)
 # With the start unread at first sight the process refuses whatever the clock did (r3); these steps check that a backward step does not change that.
 CLOCK_START_UNREAD_STEPS_MS = (400, 700, 1000)
+# CORE-PARTITION-HELPER-PID-REUSE-1: the measured app with no handle held (byPid), and the process that takes its pid at enumeration 4 (idFrom/idTo: it holds the
+# pid from 4 to 9 without being listed by name unless from/to say so), started after the app.
+_REUSED_APP = {"id": 5000, "from": 1, "to": 3, "goneAt": 4, "startSec": 1, "handleFail": 1, "byPid": 1}
+_REUSER = {"id": 5000, "from": 99, "to": 0, "idFrom": 4, "idTo": 9, "goneAt": 10, "startBeforeFirstPollMs": -500}
+_GONE_KEY_P0_B = ({"id": 300, "from": 1, "to": 1, "goneAt": 2, "startSec": 1, "handleFail": 1, "byPid": 1},
+                  {"id": 300, "from": 99, "to": 0, "idFrom": 2, "idTo": 3, "goneAt": 4, "startSec": 2, "exe": "other"})
+# r3 (Dot pr-777 I3): the app's exe for the equal-length comparison cases ("mlv" U+00C5 "fake.exe"), and one scenario per path comparison site with the
+# compared process at exe kind `e` ('angstrom' or 'case'): the same shapes as the soft-hyphen cases at those sites.
+_ANGSTROM_APP_EXE = "mlvÅfake.exe"
+_ORDINAL_SITES = {
+    "gone-key-relisted": lambda e: {"procs": [_APP, *_GONE_KEY_P0_B, {"id": 300, "from": 4, "to": 99, "goneAt": 999, "startSec": 1, "exe": e}]},
+    "pid-reused-same-start": lambda e: {"sleepMs": 250, "stopAt": 12, "procs": [_REUSED_APP, {**_REUSER, "exe": e, "startBeforeFirstPollMs": None, "startSec": 1}]},
+    "path-start-unread": lambda e: {"procs": [_APP, {**_Q, "id": 400, "startSec": 1, "exe": e, "startFail": -1}]},
+    "path-listed": lambda e: {"procs": [_APP, {**_Q, "id": 400, "startSec": 1, "exe": e}]},
+}
 LATE_READ_SCENARIOS = {
     "control": {"procs": [_APP]},
     "path-empty-late": {"procs": [{**_APP, "pathFail": 3, "pathMode": "empty"}]},
@@ -2605,7 +3168,43 @@ LATE_READ_SCENARIOS = {
     "path-late-handle-unopened": {"procs": [{**_APP, "pathFail": 3, "pathMode": "empty", "handleFail": 1}]},
     # adversary pass 5 A2 on 8ad00092: the first Processor Information read throws, before the pending state exists
     "counter-read-throws": {"catThrow": 1, "procs": [_APP]},
-    **{f"clock-back-path-{ms}": {"stepMs": ms, "procs": [{**_CLOCK_APP, "pathFail": 1, "pathMode": "empty"}]} for ms in CLOCK_STEPS_MS},
+    # CORE-PARTITION-HELPER-PID-REUSE-1 (adversary A1 on 74c7d7d3, #696 r14b; Dot pr-696 comment 6470100169). The measured app is tracked with no handle held on
+    # it (its handle did not open, so every liveness poll opens the pid). The runner held its own handle through its post-exit sampling; the app exits at
+    # enumeration 4, once that handle is released, and before the helper's next poll another process holds the pid until enumeration 9. The pid is free from
+    # enumeration 10, which is the gone evidence a no-handle poll can see, and the stop arrives at enumeration 12. Polls are 250 ms apart, so the helper's
+    # once-a-second samples fall inside the reuse. Another image (never listed by name), and the same image (listed by name from its start, a new key).
+    "pid-reused-by-another-image": {"sleepMs": 250, "stopAt": 12, "procs": [_REUSED_APP, {**_REUSER, "exe": "other"}]},
+    "pid-reused-by-the-same-image": {"sleepMs": 250, "stopAt": 12, "procs": [_REUSED_APP, {**_REUSER, "from": 4, "to": 9}]},
+    # its control: the same app, the same identity on every poll, alive until enumeration 10
+    "pid-same-identity-control": {"sleepMs": 250, "stopAt": 12, "procs": [{**_REUSED_APP, "to": 9, "goneAt": 10}]},
+    # adversary A1 on aa71dd11: the process that takes the pid has the app's exact start (an unsampled clock step) and its path, so no read on the pid tells them apart
+    "pid-reused-with-the-same-start-and-path": {"sleepMs": 250, "stopAt": 12, "procs": [_REUSED_APP, {**_REUSER, "from": 4, "to": 9, "startBeforeFirstPollMs": None, "startSec": 1}]},
+    # adversary A1 on 4fdc1512: P0 on pid 300 is tracked unpinned and exits at enumeration 2; another image holds the pid at 2-3, so the identity re-read retires
+    # P0 (its key goes to 2); from 4 a same-path process listed with P0's exact start and a readable Path carries P0's key. Its control: the same, at another exe.
+    "gone-key-relisted-readable": {"procs": [_APP, *_GONE_KEY_P0_B, {"id": 300, "from": 4, "to": 99, "goneAt": 999, "startSec": 1}]},
+    "gone-key-relisted-other-exe": {"procs": [_APP, *_GONE_KEY_P0_B, {"id": 300, "from": 4, "to": 99, "goneAt": 999, "startSec": 1, "exe": "other"}]},
+    # the pinned control: the app's handle is held (the pid cannot be reused while it is), alive until enumeration 10
+    "pid-pinned-control": {"sleepMs": 250, "stopAt": 12, "procs": [{"id": 5000, "from": 1, "to": 9, "goneAt": 10, "startSec": 1}]},
+    # r2 (Dot pr-777 I1): the path branch alone. Another image takes the pid with the app's exact start, so only the Path read on the pid differs.
+    "pid-reused-same-start-other-path": {"sleepMs": 250, "stopAt": 12, "procs": [_REUSED_APP, {**_REUSER, "exe": "other", "startBeforeFirstPollMs": None, "startSec": 1}]},
+    # r2 (Dot pr-777 I1): HasExited reads false on every poll to enumeration 9, and from enumeration 4 on ONE of the two fresh identity reads fails (the other
+    # reads and matches). Pinned (a held handle): the fallback keeps stamping it alive. Unpinned: no new alive stamp, and no exit either, until the pid is free.
+    **{f"id-{what}-unread-{pin}": {"sleepMs": 250, "stopAt": 12, "procs": [{**base, f"id{what.capitalize()}FailFrom": 4}]}
+       for what in ("path", "start")
+       for pin, base in (("pinned", {"id": 5000, "from": 1, "to": 9, "goneAt": 10, "startSec": 1}), ("unpinned", {**_REUSED_APP, "to": 9, "goneAt": 10}))},
+    # r2 adversary A1 on f82e5037: exe 'soft' is the app's path with a soft hyphen (U+00AD) in the file name, another file that PowerShell's culture-sensitive
+    # -ieq / -ine call equal to the app's. Each of the helper's four path comparisons in turn: the seen-key rule, the identity re-read, and the listing's two.
+    "gone-key-relisted-culture-equal-exe": {"procs": [_APP, *_GONE_KEY_P0_B, {"id": 300, "from": 4, "to": 99, "goneAt": 999, "startSec": 1, "exe": "soft"}]},
+    "pid-reused-same-start-culture-equal-path": {"sleepMs": 250, "stopAt": 12, "procs": [_REUSED_APP, {**_REUSER, "exe": "soft", "startBeforeFirstPollMs": None, "startSec": 1}]},
+    "culture-equal-path-listed": {"procs": [_APP, {**_Q, "id": 400, "startSec": 1, "exe": "soft"}]},
+    "culture-equal-path-start-unread": {"procs": [_APP, {**_Q, "id": 400, "startSec": 1, "exe": "soft", "startFail": -1}]},
+    # r3 (Dot pr-777 I3): the soft hyphen changes the length, so the length guard alone tells those apart. The same four sites, with the app's exe named with
+    # U+00C5 (appExe): 'angstrom' (U+212B in its place: equal length, culture-equal, ordinally another file) is another exe; 'case' (the same path, ASCII case
+    # only) is the exe. Mode suffix -angstrom / -case, in site order: the seen-key rule, the identity re-read, the listing's pending and tracking tests.
+    **{f"{site}-{exe}": {"appExe": _ANGSTROM_APP_EXE, **spec(exe)} for exe in ("angstrom", "case") for site, spec in _ORDINAL_SITES.items()},
+    # CORE-PARTITION-PREDECESSOR-CLOCK-STEP-1: polls 250 ms apart, so the app (gone at enumeration 6) outlives the step and its stepped gone stamp still follows the
+    # runner's launch, as a real app's does (at 20 ms polls it lived about 0.3 s, and a 1000 ms step stamped it gone before its own start)
+    **{f"clock-back-path-{ms}": {"stepMs": ms, "sleepMs": 250, "procs": [{**_CLOCK_APP, "pathFail": 1, "pathMode": "empty"}]} for ms in CLOCK_STEPS_MS},
     **{f"clock-back-start-{ms}": {"stepMs": ms, "procs": [{**_CLOCK_APP, "startFail": 1}]} for ms in CLOCK_START_UNREAD_STEPS_MS},
 }
 _LATE_READ_DRIVER_BODY = HELPER_SOURCE + r"""
@@ -2624,27 +3223,45 @@ function Test-CpFails($Up, $From) { ($Up -eq -1) -or ($null -ne $Up -and $global
 $global:cpDoubles = @(foreach ($s in @($global:cpSpec.procs)) {
     $d = [pscustomobject]@{ Id = [int]$s.id; cpS = $s; PriorityClass = 'Normal'; ProcessorAffinity = [int64]4095 }
     $d | Add-Member -MemberType ScriptMethod -Name Refresh -Value { }
-    $d | Add-Member -MemberType ScriptProperty -Name HasExited -Value { if ($null -ne $this.cpS.exitedNullAt -and $global:cpPoll -ge $this.cpS.exitedNullAt -and ($null -eq $this.cpS.exitedNullTo -or $global:cpPoll -le $this.cpS.exitedNullTo)) { return $null }; $global:cpPoll -ge $this.cpS.goneAt }
+    $d | Add-Member -MemberType ScriptProperty -Name HasExited -Value { if ($null -ne $this.cpS.exitedNullAt -and $global:cpPoll -ge $this.cpS.exitedNullAt -and ($null -eq $this.cpS.exitedNullTo -or $global:cpPoll -le $this.cpS.exitedNullTo)) { return $null }
+        if ($this.cpS.byPid) { $o = Get-CpOccupant $this.Id; return ($null -eq $o -or $global:cpPoll -ge $o.cpS.goneAt) }
+        $global:cpPoll -ge $this.cpS.goneAt }
     $d | Add-Member -MemberType ScriptMethod -Name Refresh -Force -Value { if ($global:cpPoll -eq $this.cpS.exitedThrowAt) { throw [ComponentModel.Win32Exception]::new(5) } }
     $d | Add-Member -MemberType ScriptProperty -Name Handle -Value { if ($this.cpS.handleFail) { throw [ComponentModel.Win32Exception]::new(5) }; [IntPtr]1 }
     $d | Add-Member -MemberType ScriptProperty -Name Path -Value {
         $s = $this.cpS
-        if ((Test-CpFails $s.pathFail $s.pathFailFrom) -or $global:cpPoll -eq $s.pathFailAt) { if ($s.pathMode -eq 'throw') { throw [ComponentModel.Win32Exception]::new(5) }; return '' }
-        if ($s.exe -eq 'other') { 'C:\elsewhere\mlvfake.exe' } else { $env:MLV_CP_EXE } }
+        if ((Test-CpFails $s.pathFail $s.pathFailFrom) -or $global:cpPoll -eq $s.pathFailAt -or ($this.cpFresh -and (Test-CpFails $null $s.idPathFailFrom))) { if ($s.pathMode -eq 'throw') { throw [ComponentModel.Win32Exception]::new(5) }; return '' }
+        # r3 (Dot pr-777 I3): 'angstrom' is the app's path with its U+00C5 (appExe) swapped for U+212B ANGSTROM SIGN, the same length, equal under culture
+        # comparison and different under ordinal; 'case' is the app's path with every ASCII lower-case letter upper-cased (the same file).
+        if ($s.exe -eq 'other') { 'C:\elsewhere\mlvfake.exe' } elseif ($s.exe -eq 'soft') { $env:MLV_CP_EXE -replace 'mlvfake\.exe$', "mlv$([char]0xAD)fake.exe" } elseif ($s.exe -eq 'angstrom') {
+            $env:MLV_CP_EXE.Replace([string][char]0xC5, [string][char]0x212B) } elseif ($s.exe -eq 'case') { [regex]::Replace($env:MLV_CP_EXE, '[a-z]', { $args[0].Value.ToUpperInvariant() }) } else { $env:MLV_CP_EXE } }
     $d | Add-Member -MemberType ScriptProperty -Name StartTime -Value {
         $s = $this.cpS
-        if ((Test-CpFails $s.startFail $s.startFailFrom) -or $global:cpPoll -eq $s.startFailAt) { throw [ComponentModel.Win32Exception]::new(5) }
+        if ((Test-CpFails $s.startFail $s.startFailFrom) -or $global:cpPoll -eq $s.startFailAt -or ($this.cpFresh -and (Test-CpFails $null $s.idStartFailFrom))) { throw [ComponentModel.Win32Exception]::new(5) }
         if ($null -ne $s.recycleAt -and $global:cpPoll -ge $s.recycleAt) { if ($null -eq $global:cpNew) { $global:cpNew = [DateTime]::UtcNow.AddSeconds(3) }; return $global:cpNew }
         if ($null -ne $s.startBeforeFirstPollMs) { return $global:cpT1.AddMilliseconds(-$s.startBeforeFirstPollMs) }
+        # CORE-PARTITION-PREDECESSOR-CLOCK-STEP-1: a process started after the launch (startSec >= 0) is stamped startSec - 2 s from enumeration 1, so the
+        # app (startSec 1) started 1 s before the helper's first listing, as a runner-launched app is seen within a poll of its start (it was 29 s before
+        # it, the shape a successor first seen after the app exited has). A process started before the launch (startSec < 0) stays relative to it.
+        if ($s.startSec -ge 0) { return $global:cpT1.AddSeconds($s.startSec - 2) }
         $global:cpLaunch.AddSeconds($s.startSec) }
     $d })
-function Get-Process { [CmdletBinding()] param([string]$Name)
+# CORE-PARTITION-HELPER-PID-REUSE-1: Get-Process -Id is the pid's occupant now (never counted as an enumeration): the double listed on that pid at this count, or
+# one whose idFrom/idTo say it holds the pid without being listed by name (another executable on the pid). byPid: no handle is held on the double, so its
+# HasExited, like a real Process's with no handle, opens the pid and reads whatever process holds it now (alive until that occupant's goneAt).
+# r2 (Dot pr-777 I1): -Id returns a fresh object (a copy of the occupant, marked cpFresh), as the real cmdlet does, so idPathFailFrom/idStartFailFrom fail
+# only the identity re-read's Path or StartTime on that fresh object from that enumeration count on, never the listing's reads or the liveness query.
+function Get-CpOccupant([int]$Id) { @($global:cpDoubles | Where-Object { $_.Id -eq $Id -and $global:cpPoll -ge $(if ($null -ne $_.cpS.idFrom) { $_.cpS.idFrom } else { $_.cpS.from }) -and $global:cpPoll -le $(if ($null -ne $_.cpS.idTo) { $_.cpS.idTo } else { $_.cpS.to }) }) | Select-Object -Last 1 }
+function Get-Process { [CmdletBinding()] param([string]$Name, [int]$Id)
+    if ($PSBoundParameters.ContainsKey('Id')) { $o = Get-CpOccupant $Id; if ($null -eq $o) { return }; $f = $o.psobject.Copy(); $f | Add-Member -NotePropertyName cpFresh -NotePropertyValue 1; return $f }
     $global:cpPoll++
     if ($global:cpPoll -eq 1) { $global:cpT1 = [DateTime]::UtcNow }
     [IO.File]::AppendAllText($env:CP_POLLS, "$([DateTime]::UtcNow.Ticks)`n")
-    if ($global:cpPoll -eq 8) { [IO.File]::WriteAllText($env:MLV_CP_MEASURED, '5000'); [IO.File]::WriteAllText($env:MLV_CP_STOP, 'stop') }
+    # the helper's own monotonic stamp of this enumeration ($cw is the helper's stopwatch; this function runs in its scope)
+    [IO.File]::AppendAllText("$($env:CP_POLLS)ms", "$($cw.ElapsedMilliseconds)`n")
+    if ($global:cpPoll -eq $(if ($global:cpSpec.stopAt) { [int]$global:cpSpec.stopAt } else { 8 })) { [IO.File]::WriteAllText($env:MLV_CP_MEASURED, '5000'); [IO.File]::WriteAllText($env:MLV_CP_STOP, 'stop') }
     $global:cpDoubles | Where-Object { $global:cpPoll -ge $_.cpS.from -and $global:cpPoll -le $_.cpS.to } }
-function Start-Sleep { param([int]$Milliseconds) [Threading.Thread]::Sleep(20) }
+function Start-Sleep { param([int]$Milliseconds) [Threading.Thread]::Sleep([math]::Max(20, [int]$global:cpSpec.sleepMs)) }
 '@
 $src = $prelude + "`n" + ((@('Format-CorePartitionMask', 'Get-CorePartitionTopology', 'Test-CorePartitionMaskClass') | ForEach-Object { $fn[$_] }) -join "`n") + "`n" + $hb
 $out = [ordered]@{}
@@ -2661,7 +3278,7 @@ for ($b = 0; $b -lt $names.Count; $b += 4) {
         $psi = [Diagnostics.ProcessStartInfo]::new("$env:ProgramFiles\PowerShell\7\pwsh.exe", "-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File `"$hp`"")
         $psi.UseShellExecute = $false; $psi.CreateNoWindow = $true
         $psi.Environment['CP_SPEC'] = ($spec | ConvertTo-Json -Compress -Depth 6); $psi.Environment['CP_LAUNCH_TICKS'] = [string]$launch; $psi.Environment['CP_POLLS'] = Join-Path $dir 'polls'
-        $psi.Environment['MLV_CP_EXE'] = Join-Path $dir 'mlvfake.exe'
+        $psi.Environment['MLV_CP_EXE'] = Join-Path $dir $(if ($spec.appExe) { [string]$spec.appExe } else { 'mlvfake.exe' })
         $psi.Environment['MLV_CP_STOP'] = Join-Path $dir 'stop'
         $psi.Environment['MLV_CP_READY'] = Join-Path $dir 'ready'
         $psi.Environment['MLV_CP_OUT'] = Join-Path $dir 'helper.json'
@@ -2677,9 +3294,15 @@ for ($b = 0; $b -lt $names.Count; $b += 4) {
         $rec = $(try { [IO.File]::ReadAllText((Join-Path $run.dir 'helper.json')) | ConvertFrom-Json } catch { $null })
         if ($null -eq $rec) { $out[$run.mode] = [ordered]@{ exit = $run.h.ExitCode; record = $false }; continue }
         if ($scenarios.($run.mode).catThrow) { $out[$run.mode] = [ordered]@{ exit = $run.h.ExitCode; record = $true; errors = @($rec.errors) }; continue }
-        $start = ([DateTime]::new($run.launch, [DateTimeKind]::Utc)).AddSeconds(1).Ticks
-        $v = Test-CorePartitionMeasuredApp $rec 5000 ($start - 5000000) $end 0
-        $s = Get-CorePartitionScalars $rec ([ordered]@{ reasons = [ordered]@{} }) 4095 ([int64]$rec.helperAffinityObserved) $run.threads @{ value = 1; why = $null } $null $false -MeasuredPid 5000 -MeasuredStartTicks ($start - 5000000) -MeasuredEndTicks $end
+        # CORE-PARTITION-PREDECESSOR-CLOCK-STEP-1: the runner's window is the one a runner reports: launched 0.2 s before the app's start (the first 5000
+        # recorded; the launch +1 s when none is) and its exit stamped when the job wrote the stop, the stop enumeration's stamp (the helper's end was later,
+        # by its teardown and this loop's wait for the batch's earlier helpers)
+        $fa = @(@($rec.instances) | Where-Object { $null -ne $_ -and $_.pid -eq 5000 })
+        $start = $(if ($fa.Count -gt 0) { [int64]$fa[0].startUtcTicks } else { ([DateTime]::new($run.launch, [DateTimeKind]::Utc)).AddSeconds(1).Ticks }) - 2000000
+        $stopPoll = @([IO.File]::ReadAllLines((Join-Path $run.dir 'polls')))[$(if ($scenarios.($run.mode).stopAt) { [int]$scenarios.($run.mode).stopAt } else { 8 }) - 1]
+        if ($stopPoll) { $end = [int64]$stopPoll }
+        $v = Test-CorePartitionMeasuredApp $rec 5000 $start $end 0
+        $s = Get-CorePartitionScalars $rec ([ordered]@{ reasons = [ordered]@{} }) 4095 ([int64]$rec.helperAffinityObserved) $run.threads @{ value = 1; why = $null } $null $false -MeasuredPid 5000 -MeasuredStartTicks $start -MeasuredEndTicks $end
         $named = @(@($rec.instances) + @($rec.others) | Where-Object { $null -ne $_ -and $null -eq $_.unidentified })
         $by = [ordered]@{}
         foreach ($i in $named) { $by[[string]$i.pid] = [ordered]@{ start = [int64]$i.startUtcTicks; first = [int64]$i.firstSeenUtcTicks; last = [int64]$i.lastSeenUtcTicks; firstMs = $i.firstMs; aliveMs = $i.aliveMs; goneMs = $i.goneMs; loadSec = $i.loadSec; loadJoined = $i.loadJoined } }
@@ -2688,7 +3311,10 @@ for ($b = 0; $b -lt $names.Count; $b += 4) {
             others = @(@($rec.others) | Where-Object { $null -ne $_ -and $null -eq $_.unidentified } | ForEach-Object { $_.pid })
             unidentified = @(@($rec.others) | Where-Object { $null -ne $_ -and $null -ne $_.unidentified } | ForEach-Object { $_.pid })
             by = $by; sessions = $rec.load.sessions; loadSec = $rec.load.seconds; vwhy = [string]$v.why; bench = $s.benchAffinityApplied; why = [string]$s.corePartitionNullReasons; skew = $rec.clockSkewMaxMs
-            polls = @([IO.File]::ReadAllLines((Join-Path $run.dir 'polls')) | ForEach-Object { [int64]$_ }) }
+            polls = @([IO.File]::ReadAllLines((Join-Path $run.dir 'polls')) | ForEach-Object { [int64]$_ })
+            pollsMs = @([IO.File]::ReadAllLines((Join-Path $run.dir 'pollsms')) | ForEach-Object { [int64]$_ })
+            appSampleMs = @(@($rec.samples) | Where-Object { $null -ne $_ -and $_.app } | ForEach-Object { [int64]$_.m })
+            firstApp = @(@($rec.instances) | Where-Object { $null -ne $_ -and $_.pid -eq 5000 } | ForEach-Object { [ordered]@{ start = [int64]$_.startUtcTicks; aliveMs = $_.aliveMs; goneMs = $_.goneMs; pinned = $_.pinned } })[0] }
     }
 }
 $out | ConvertTo-Json -Compress -Depth 6
@@ -2705,7 +3331,8 @@ $hb = $hb.Replace($cat, '$cpFakeCat')
 $prelude = @'
 $cpFakeCat = [pscustomobject]@{}; $cpFakeCat | Add-Member -MemberType ScriptMethod -Name ReadCategory -Value { @{} }
 $global:cpPoll = 0
-function Get-Process { [CmdletBinding()] param([string]$Name)
+function Get-Process { [CmdletBinding()] param([string]$Name, [int]$Id)
+    if ($PSBoundParameters.ContainsKey('Id')) { return (Microsoft.PowerShell.Management\Get-Process -Id $Id -ErrorAction SilentlyContinue) }
     $global:cpPoll++
     [IO.File]::WriteAllText($env:CP_POLLS, [string]$global:cpPoll)
     Microsoft.PowerShell.Management\Get-Process -Name $Name -ErrorAction SilentlyContinue }
@@ -3028,6 +3655,204 @@ class CorePartitionR10Tests(unittest.TestCase):
                 self.assertIsNotNone(rec["goneMs"], case)
                 self.assertIn(case["vwhy"], self.ACCEPTED, case)
 
+    def test_pid_reuse_a_pid_reused_after_the_handle_is_released_ends_the_instance_at_the_reuse(self) -> None:
+        """CORE-PARTITION-HELPER-PID-REUSE-1 (adversary A1 on 74c7d7d3, #696 r14b; Dot pr-696 comment 6470100169), the real helper body. The measured app is
+        tracked with no handle held on it, so its liveness poll opens the pid. The runner releases its handle, the app's pid is reused before the helper's next
+        poll, and the new process holds it for five polls before the pid is free. On the base the poll reads the new process and stamps the measured app alive
+        through all five, with its samples, and the job ACCEPTS the record (the native acceptance trace: release, reuse before the exit is seen, false-alive
+        samples, then gone evidence before the helper ends, so no coverage guard refuses it). Now every poll re-checks the birth identity (start time and image
+        path) on the pid, and the first poll that reads another process ends the instance there: nothing after it is credited. The record says the app was
+        not pinned by a held handle, and the job refuses it (adversary A1 on aa71dd11: a successor with the same start and path would read as the app)."""
+        for mode in ("pid-reused-by-another-image", "pid-reused-by-the-same-image"):
+            with self.subTest(mode=mode):
+                case = self.late_read(mode)
+                app, ms = case["firstApp"], case["pollsMs"]
+                # the app exits at enumeration 4 (pollsMs[3]); the first liveness poll after that runs before enumeration 5 (pollsMs[4])
+                self.assertLessEqual(app["aliveMs"], ms[3], f"a poll that read the pid's new process stamped the measured app alive: {case}")
+                self.assertIsNotNone(app["goneMs"], case)
+                self.assertGreaterEqual(app["goneMs"], ms[3], case)
+                self.assertLessEqual(app["goneMs"], ms[4], f"the measured app did not end at the first poll after its pid was reused: {case}")
+                self.assertEqual([m for m in case["appSampleMs"] if m > ms[3]], [], f"samples taken after the reuse were credited to the measured app: {case}")
+        trace = self.late_read("pid-reused-by-another-image")
+        self.assertEqual([trace["app"], trace["instances"], trace["unidentified"]], [5000, [5000], []], trace)
+        self.assertIs(trace["firstApp"]["pinned"], False, trace)
+        self.assertEqual(trace["vwhy"], "measured-app-identity-unpinned", trace)
+        self.assertFalse(trace["bench"], trace)
+
+    def test_pid_reuse_a1_a_successor_with_the_same_start_and_path_on_an_unpinned_pid_refuses_the_run(self) -> None:
+        """CORE-PARTITION-HELPER-PID-REUSE-1, adversary A1 on aa71dd11 (introduced): the process that takes the unpinned app's pid has the app's exact start
+        ticks (an unsampled clock step) and its path, so every poll's identity re-read matches and its enumeration carries the app's seen key. On aa71dd11
+        the app stays alive through the successor's life and the run is accepted. Now a measured app with no held handle refuses."""
+        case = self.late_read("pid-reused-with-the-same-start-and-path")
+        self.assertEqual(case["app"], 5000, case)
+        self.assertEqual(case["vwhy"], "measured-app-identity-unpinned", f"a measured app whose pid a held handle never pinned was accepted: {case}")
+        self.assertFalse(case["bench"], case)
+        self.assertIn("appAffinityObserved=measured-app-identity-unpinned", case["why"])
+        self.assertIs(case["firstApp"]["pinned"], False, case)
+
+    def test_pid_reuse_a_listing_that_carries_a_gone_key_at_the_exe_is_recorded(self) -> None:
+        """CORE-PARTITION-HELPER-PID-REUSE-1, adversary A1 on 4fdc1512 (introduced): an unpinned P0 is retired when another image takes its pid; a same-path
+        process then listed with P0's exact start and a readable Path carries P0's gone key. An exited process is never listed, so it is a successor alive
+        now; on 4fdc1512 the seen key skipped it and no overlap could see it. It is recorded unidentified and refuses. Control: the same successor at
+        another exe is no same-path process and is skipped."""
+        case = self.late_read("gone-key-relisted-readable")
+        self.assertEqual(case["unidentified"], [300], f"a same-path process carrying a gone key was dropped: {case}")
+        self.assertEqual(case["vwhy"], "same-path-instance-unidentified", case)
+        self.assertIsNotNone(case["by"]["300"]["goneMs"], f"the identity re-read did not retire P0: {case}")
+        control = self.late_read("gone-key-relisted-other-exe")
+        self.assertEqual(control["unidentified"], [], control)
+        self.assertIsNotNone(control["by"]["300"]["goneMs"], control)
+
+    def test_pid_reuse_the_pinned_flag_is_a_json_flag_and_only_false_refuses(self) -> None:
+        """CORE-PARTITION-HELPER-PID-REUSE-1: the job's verdict on the measured app's pinned flag. false refuses (measured-app-identity-unpinned); true and
+        absent are accepted as before; a number or a string (which -eq would read as a flag) is a malformed record."""
+        body = r"""
+$L = 639286128000000000
+function New-PinRec([string]$Pinned) {
+    $i = '{"pid":5000,"startUtcTicks":' + ($L + 30000000) + ',"firstSeenUtcTicks":' + ($L + 31000000) + ',"firstMs":3100,"lastSeenUtcTicks":' + ($L + 229500000) +
+        ',"goneUtcTicks":' + ($L + 230500000) + ',"aliveMs":22950,"goneMs":23050,"affinityFirst":4095,"affinityLast":4095' + $Pinned + '}'
+    ('{"schema":"mlv-app/core-partition-helper/v1","pid":4242,"app":' + $i + ',"instances":[' + $i + '],"others":[],"samples":[],"clockSkewMaxMs":0,"monoBaseMs":0,"endedBy":"stop-file"}') | ConvertFrom-Json
+}
+$out = [ordered]@{}
+$cases = [ordered]@{ absent = ''; true = ',"pinned":true'; false = ',"pinned":false'; zero = ',"pinned":0'; text = ',"pinned":"yes"' }
+foreach ($k in $cases.Keys) { $out[$k] = [string](Test-CorePartitionMeasuredApp (New-PinRec $cases[$k]) 5000 ($L + 29000000) ($L + 230000000) 0).why }
+$out | ConvertTo-Json -Compress
+"""
+        got = self.drive("pinned-flag", body, True)
+        self.assertEqual(got, {"absent": "", "true": "", "false": "measured-app-identity-unpinned", "zero": "helper-record-malformed", "text": "helper-record-malformed"}, got)
+
+    def test_pid_reuse_control_the_same_identity_on_every_poll_keeps_the_instance_alive(self) -> None:
+        """CORE-PARTITION-HELPER-PID-REUSE-1 control (passes on the base and with the fix): the same no-handle app, whose pid holds the same process on every
+        poll, is alive through enumeration 9 with its samples credited, and is seen gone at the first poll after it exits. Its pinned twin (a held handle)
+        is the same and is accepted."""
+        for mode in ("pid-same-identity-control", "pid-pinned-control"):
+            with self.subTest(mode=mode):
+                case = self.late_read(mode)
+                app, ms = case["firstApp"], case["pollsMs"]
+                self.assertEqual([case["app"], case["instances"], case["unidentified"]], [5000, [5000], []], case)
+                self.assertGreaterEqual(app["aliveMs"], ms[8], f"a poll whose identity matched did not stamp the app alive: {case}")
+                self.assertGreaterEqual(app["goneMs"], ms[9], case)
+                self.assertLessEqual(app["goneMs"], ms[10], case)
+                self.assertTrue([m for m in case["appSampleMs"] if m > ms[3]], f"the live app's samples were not credited: {case}")
+        self.assertIn(self.late_read("pid-pinned-control")["vwhy"], self.ACCEPTED)
+
+    def test_pid_reuse_r2_a_successor_with_the_same_start_at_another_path_ends_the_instance_at_the_reuse(self) -> None:
+        """r2 (Dot pr-777 I1, hub ACK 6724631958): the path branch of the identity re-read on its own. The process that takes the unpinned app's pid at
+        enumeration 4 has the app's exact start ticks but another image path, so the start read matches and only the Path read differs. The first poll after
+        the reuse must end the instance there, as in the other-image case; without the path comparison it stays alive through the successor's life."""
+        case = self.late_read("pid-reused-same-start-other-path")
+        app, ms = case["firstApp"], case["pollsMs"]
+        self.assertEqual([case["app"], case["instances"], case["unidentified"]], [5000, [5000], []], case)
+        self.assertLessEqual(app["aliveMs"], ms[3], f"a poll that read another path on the pid (same start) stamped the measured app alive: {case}")
+        self.assertIsNotNone(app["goneMs"], case)
+        self.assertGreaterEqual(app["goneMs"], ms[3], case)
+        self.assertLessEqual(app["goneMs"], ms[4], f"the measured app did not end at the first poll that read another path on its pid: {case}")
+        self.assertEqual([m for m in case["appSampleMs"] if m > ms[3]], [], f"samples taken after the reuse were credited to the measured app: {case}")
+        self.assertIs(app["pinned"], False, case)
+        self.assertEqual(case["vwhy"], "measured-app-identity-unpinned", case)
+
+    def test_pid_reuse_r2_a_partial_fresh_identity_read_after_hasexited_false_keeps_a_pinned_app_alive(self) -> None:
+        """r2 (Dot pr-777 I1): the pinned fallback. HasExited reads false on every poll; from enumeration 4 on, one fresh identity read (the Path, or the start)
+        fails and the other reads and matches. A held handle keeps the pid from being reused, so the process is still the app: every poll stamps it alive
+        through enumeration 9, it is seen gone at the first poll after it exits, and the run is accepted. Without the pinned fallback no poll after
+        enumeration 3 would stamp it alive."""
+        for mode in ("id-path-unread-pinned", "id-start-unread-pinned"):
+            with self.subTest(mode=mode):
+                case = self.late_read(mode)
+                app, ms = case["firstApp"], case["pollsMs"]
+                self.assertEqual([case["app"], case["instances"], case["unidentified"]], [5000, [5000], []], case)
+                self.assertIs(app["pinned"], True, case)
+                self.assertGreaterEqual(app["aliveMs"], ms[8], f"a pinned app whose fresh identity read failed once per poll was not stamped alive: {case}")
+                self.assertGreaterEqual(app["goneMs"], ms[9], case)
+                self.assertLessEqual(app["goneMs"], ms[10], case)
+                self.assertTrue([m for m in case["appSampleMs"] if m > ms[3]], f"the pinned live app's samples were not credited: {case}")
+                self.assertIn(case["vwhy"], self.ACCEPTED, case)
+
+    def test_pid_reuse_r2_a_partial_fresh_identity_read_after_hasexited_false_gives_an_unpinned_app_no_new_alive_stamp(self) -> None:
+        """r2 (Dot pr-777 I1): the unpinned branch. The same polls on an app with no held handle: HasExited (which opens the pid) reads false, but one fresh
+        identity read fails, so nothing says the pid's occupant is still the app. The poll is unknown: no new alive stamp (aliveMs stays at the last poll
+        before enumeration 4, and no sample after it is credited) and no exit either (the instance stays tracked until the pid is free, then it is gone)."""
+        for mode in ("id-path-unread-unpinned", "id-start-unread-unpinned"):
+            with self.subTest(mode=mode):
+                case = self.late_read(mode)
+                app, ms = case["firstApp"], case["pollsMs"]
+                self.assertEqual([case["app"], case["instances"], case["unidentified"]], [5000, [5000], []], case)
+                self.assertIs(app["pinned"], False, case)
+                self.assertLessEqual(app["aliveMs"], ms[3], f"an unpinned app whose fresh identity read failed was stamped alive: {case}")
+                self.assertEqual([m for m in case["appSampleMs"] if m > ms[3]], [], f"samples taken while the unpinned app's identity was unread were credited: {case}")
+                self.assertGreaterEqual(app["goneMs"], ms[9], f"a failed identity read on an unpinned app was recorded as its exit: {case}")
+                self.assertLessEqual(app["goneMs"], ms[10], case)
+                self.assertEqual(case["vwhy"], "measured-app-identity-unpinned", case)
+
+    def test_pid_reuse_r2_a1_a_path_equal_to_the_exe_only_under_culture_comparison_is_another_exe(self) -> None:
+        """r2, adversary A1 on f82e5037 (introduced at the seen-key rule; siblings the identity re-read and the listing's two path tests). PowerShell's -ieq /
+        -ine compare culture-sensitively and ignore U+00AD, so a process at the app's path with a soft hyphen in its file name (another file) read as the app's
+        path. The seen-key rule then recorded a successor at that other exe unidentified and refused a valid run; the identity re-read kept an unpinned app
+        alive on a successor at that path; the listing tracked such a process as a same-path instance, or held it pending and then unidentified. Every path the
+        helper compares with the exe's is now compared ordinally, case-insensitive (as Test-PresentMonIdentityText does), so each is another exe."""
+        with self.subTest(mode="gone-key-relisted-culture-equal-exe"):
+            relisted = self.late_read("gone-key-relisted-culture-equal-exe")
+            self.assertEqual(relisted["unidentified"], [], f"a gone key relisted at a culture-equal other exe was recorded unidentified: {relisted}")
+            self.assertIsNotNone(relisted["by"]["300"]["goneMs"], relisted)
+        with self.subTest(mode="pid-reused-same-start-culture-equal-path"):
+            reused = self.late_read("pid-reused-same-start-culture-equal-path")
+            app, ms = reused["firstApp"], reused["pollsMs"]
+            self.assertLessEqual(app["aliveMs"], ms[3], f"a successor at a culture-equal other path (same start) stamped the measured app alive: {reused}")
+            self.assertIsNotNone(app["goneMs"], reused)
+            self.assertLessEqual(app["goneMs"], ms[4], f"the measured app did not end at the first poll that read a culture-equal other path on its pid: {reused}")
+        for mode in ("culture-equal-path-listed", "culture-equal-path-start-unread"):
+            with self.subTest(mode=mode):
+                case = self.late_read(mode)
+                self.assertEqual([case["unidentified"], case["others"], case["instances"]], [[], [], [5000]], f"a process at a culture-equal other exe was classed as the app's path: {case}")
+                self.assertIn(case["vwhy"], self.ACCEPTED, case)
+
+    def test_pid_reuse_r3_i3_an_equal_length_culture_equal_path_is_another_exe_at_each_site(self) -> None:
+        """r3 (Dot pr-777 I3, hub chat ruling 2026-11-08T19:23:06Z). The soft-hyphen cases above change the path's length, so the length guard alone tells
+        them apart and they cannot say whether the comparison is ordinal. Here the app's exe is named with U+00C5 and the compared path has U+212B ANGSTROM
+        SIGN in its place: the same length, equal under culture comparison (-ieq, CurrentCultureIgnoreCase), another file under OrdinalIgnoreCase. At each of
+        the four sites it must be another exe, with the outcome of the soft-hyphen case at that site."""
+        with self.subTest(mode="gone-key-relisted-angstrom"):
+            relisted = self.late_read("gone-key-relisted-angstrom")
+            self.assertEqual(relisted["unidentified"], [], f"the seen-key rule read a culture-equal equal-length other exe as the exe's: {relisted}")
+            self.assertIsNotNone(relisted["by"]["300"]["goneMs"], relisted)
+        with self.subTest(mode="pid-reused-same-start-angstrom"):
+            reused = self.late_read("pid-reused-same-start-angstrom")
+            app, ms = reused["firstApp"], reused["pollsMs"]
+            self.assertLessEqual(app["aliveMs"], ms[3], f"the identity re-read read a culture-equal equal-length other path (same start) as the app's: {reused}")
+            self.assertIsNotNone(app["goneMs"], reused)
+            self.assertLessEqual(app["goneMs"], ms[4], f"the measured app did not end at the first poll that read a culture-equal equal-length other path: {reused}")
+        for mode in ("path-start-unread-angstrom", "path-listed-angstrom"):
+            with self.subTest(mode=mode):
+                case = self.late_read(mode)
+                self.assertEqual([case["unidentified"], case["others"], case["instances"]], [[], [], [5000]], f"the listing classed a culture-equal equal-length other exe as the app's path: {case}")
+                self.assertIn(case["vwhy"], self.ACCEPTED, case)
+
+    def test_pid_reuse_r3_i3_control_the_same_path_in_another_ascii_case_is_the_exe_at_each_site(self) -> None:
+        """r3 (Dot pr-777 I3) control: the same four sites with the compared path the exe's own, every ASCII letter upper-cased (the U+00C5 kept). Windows paths
+        are case-insensitive, so it is the exe at every site, with the outcome of the exact path there: a gone key carried at the exe is recorded unidentified;
+        a same-start successor at the exe passes the identity re-read on every poll (only the missing pin refuses it); a same-path process whose start never
+        reads is recorded unidentified; one whose start reads is tracked as a same-path instance. A case-sensitive comparison fails each."""
+        with self.subTest(mode="gone-key-relisted-case"):
+            relisted = self.late_read("gone-key-relisted-case")
+            self.assertEqual(relisted["unidentified"], [300], f"the seen-key rule read the exe's path in another case as another exe: {relisted}")
+            self.assertEqual(relisted["vwhy"], "same-path-instance-unidentified", relisted)
+            self.assertIsNotNone(relisted["by"]["300"]["goneMs"], relisted)
+        with self.subTest(mode="pid-reused-same-start-case"):
+            reused = self.late_read("pid-reused-same-start-case")
+            app, ms = reused["firstApp"], reused["pollsMs"]
+            self.assertGreaterEqual(app["aliveMs"], ms[8], f"the identity re-read read the exe's path in another case as another process: {reused}")
+            self.assertGreaterEqual(app["goneMs"], ms[9], reused)
+            self.assertLessEqual(app["goneMs"], ms[10], reused)
+            self.assertIs(app["pinned"], False, reused)
+            self.assertEqual(reused["vwhy"], "measured-app-identity-unpinned", reused)
+        with self.subTest(mode="path-start-unread-case"):
+            case = self.late_read("path-start-unread-case")
+            self.assertEqual(case["unidentified"], [400], f"the listing did not hold the exe's path in another case (start unread) as a same-path process: {case}")
+            self.assertEqual(case["vwhy"], "same-path-instance-unidentified", case)
+        with self.subTest(mode="path-listed-case"):
+            case = self.late_read("path-listed-case")
+            self.assertEqual([case["unidentified"], case["others"], case["instances"]], [[], [], [5000, 400]], f"the listing did not track the exe's path in another case as a same-path instance: {case}")
+
     def test_handover_a_process_on_a_recycled_tracked_pid_keeps_its_real_first_sight(self) -> None:
         """The same P2 alive and readable from enumeration 6: its first sight is enumeration 4, the pass that first listed it, not one pass late."""
         case = self.late_read("recycled-over-tracked-read-later")
@@ -3262,6 +4087,7 @@ function Resolve-AttrCudaSmokeRunLog { param($ResultJsonPath, $ContainingRoot) i
 # and the job's own read: over 250 ms on a loaded hosted runner it moved the start bound (the rows sit 500 ms past the playback start) and the
 # case published feed-no-rows-in-window, or one row fewer, intermittently. CP_WALL_STALL_MS (below) injects exactly that real time.
 function Get-Date { $L.AddMilliseconds($global:cpClk - 1000) }
+__FIXTURE_ZONE_PS__
 $row = "26.10.2026,12:01:00,x,99,99,Yes,Yes`n"
 function Read-CorePartitionFeedSince($Path, $Offset, $Before) {
     $m = $global:cpClk; $global:cpClk += 500
@@ -3287,13 +4113,15 @@ foreach ($k in $cases.Keys) {
     $corePartitionJobProc = [pscustomobject]@{}
     $corePartitionJobProc | Add-Member -MemberType ScriptProperty -Name ProcessorAffinity -Value { [int64]1048575 } -SecondValue { $global:cpClk += $global:cpDelay }
     $corePartitionJobProc | Add-Member -MemberType ScriptMethod -Name Refresh -Value { }
-    $now = [DateTime]::UtcNow
+    # fixture-clock-DST (sol r1 B1, PR 783): CP_FIXTURE_NOW_UTC puts this driver's "now" at a chosen instant (the job's wall clock follows $L through
+    # the Get-Date double below), so a test can drive the feed fixture through a repeated or skipped local hour without touching the host clock
+    $now = $(if ($env:CP_FIXTURE_NOW_UTC) { [DateTime]::Parse($env:CP_FIXTURE_NOW_UTC, [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::AssumeUniversal -bor [Globalization.DateTimeStyles]::AdjustToUniversal) } else { [DateTime]::UtcNow })
     $L = $now.AddMilliseconds(1000 - $c[0])
     if ($env:CP_WALL_STALL_MS) { Start-Sleep -Milliseconds ([int]$env:CP_WALL_STALL_MS) }
     $W = { param([double]$m) $L.AddMilliseconds($m - 1000).Ticks }
     # r13c (CP-FEED-START-ANCHOR, rule (a)): a feed row's HWiNFO stamp (local d.M.yyyy,H:mm:ss.fff) for monotonic $m; the window row is stamped
     # at 2000, after the measured session's playback start (1500)
-    $H = { param([double]$m) [DateTime]::new((& $W $m), [DateTimeKind]::Utc).ToLocalTime().ToString('d.M.yyyy,H:mm:ss.fff', [Globalization.CultureInfo]::InvariantCulture) }
+    $H = { param([double]$m) Format-CpFixtureStamp ([DateTime]::new((& $W $m), [DateTimeKind]::Utc)) }
     $row = (& $H 2000) + ",x,99,99,Yes,Yes`n"
     $corePartitionMeasuredLaunchUtc = $L; $corePartitionPreHelperUtc = $L.AddSeconds(-1)
     $corePartitionClockPairs = [Collections.Generic.List[object]]::new(); $corePartitionClockPairs.Add(@($corePartitionMeasuredLaunchUtc.Ticks, [double]1000))
@@ -3336,6 +4164,9 @@ foreach ($k in $cases.Keys) {
 }
 $out | ConvertTo-Json -Compress -Depth 5
 """
+
+
+R11_CLEANUP = R11_CLEANUP.replace("__FIXTURE_ZONE_PS__", FIXTURE_ZONE_PS)
 
 
 def _r11_helper_base_driver() -> str:
@@ -3498,6 +4329,7 @@ def _r13_start_driver() -> str:
 R13_START_DRIVER = _r13_start_driver()
 
 R13_PURE = r"""
+__FIXTURE_ZONE_PS__
 $L = [DateTime]::new(2026, 10, 27, 21, 0, 0, [DateTimeKind]::Utc)
 function Ln([double]$AfterMs, [string]$Msg) { '[' + $L.AddMilliseconds($AfterMs).ToString('yyyy-MM-ddTHH:mm:ss.fffZ') + '] [info] [0x1a2b] ' + $Msg }
 function Pick($v) { @([string]$v.why, $v.gapMs, $v.session) }
@@ -3548,7 +4380,7 @@ $r.ceilingOverGapPastTeardown = Pick2 (Get-CorePartitionPlaybackStart $real $L.T
 $r.ceilingOverGapWithinTeardown = Pick2 (Get-CorePartitionPlaybackStart $real $L.Ticks 1000 1000 0 74000)
 # r13c: Select-CorePartitionFeedRowsFromStart, pure. A row's HWiNFO stamp (local d.M.yyyy,H:mm:ss[.fff]) is placed on the job's monotonic clock at
 # the measured launch's clock pair (launch UTC $L, mono 1000), as the playback start is; a row counts only at or after the anchor plus the skew
-function Hw([double]$Mono) { $L.AddMilliseconds($Mono - 1000).ToLocalTime().ToString('d.M.yyyy,H:mm:ss.fff', [Globalization.CultureInfo]::InvariantCulture) }
+function Hw([double]$Mono) { Format-CpFixtureStamp $L.AddMilliseconds($Mono - 1000) }
 $anchor = @{ startMonoMs = 24600.0; launchUtcTicks = $L.Ticks; launchMonoMs = 1000.0; skewMs = 0.0 }
 $rows = @('Date,Time,Total CPU Usage [%],CPU Package [C],CPU Package Power [W],Core Thermal Throttling (avg) [Yes/No],Package/Ring Thermal Throttling [Yes/No]', ((Hw 24000) + ',5,30,10,No,No'), ((Hw 24600) + ',5,80,100,No,No'), ((Hw 25600) + ',5,81,101,No,No'), '')
 function PickSel($v) { @([string]$v.why, $v.excluded, @($v.lines).Count) }
@@ -3564,7 +4396,7 @@ $a1c = @{ startMonoMs = 61000.0; launchUtcTicks = $L.Ticks; launchMonoMs = 1000.
 $r.selA1cExcursionBreaksTheOrder = PickSel (Select-CorePartitionFeedRowsFromStart @(((Hw 10500) + ',5,30,10,No,No'), ((Hw 61500) + ',5,30,10,No,No'), ((Hw 12500) + ',5,30,10,No,No'), ((Hw 62000) + ',5,80,100,No,No')) $a1c 92000)
 $r.selA1cInOrderControl = PickSel (Select-CorePartitionFeedRowsFromStart @(((Hw 10500) + ',5,30,10,No,No'), ((Hw 11500) + ',5,30,10,No,No'), ((Hw 12500) + ',5,30,10,No,No'), ((Hw 62000) + ',5,80,100,No,No')) $a1c 92000)
 $r.selSkewExcludesTheBoundaryRow = PickSel (Select-CorePartitionFeedRowsFromStart $rows $sk 26000)
-$r.selSecondsOnly = PickSel (Select-CorePartitionFeedRowsFromStart @(($L.AddSeconds(-60).ToLocalTime().ToString('d.M.yyyy,H:mm:ss', [Globalization.CultureInfo]::InvariantCulture) + ',5,30,10,No,No'), ($L.AddSeconds(60).ToLocalTime().ToString('d.M.yyyy,H:mm:ss', [Globalization.CultureInfo]::InvariantCulture) + ',5,80,100,No,No')) $anchor 62000)
+$r.selSecondsOnly = PickSel (Select-CorePartitionFeedRowsFromStart @((((Format-CpFixtureStamp $L.AddSeconds(-60)) -replace '\.\d{3}$', '') + ',5,30,10,No,No'), (((Format-CpFixtureStamp $L.AddSeconds(60)) -replace '\.\d{3}$', '') + ',5,80,100,No,No')) $anchor 62000)
 $r.selUnparseableStamp = PickSel (Select-CorePartitionFeedRowsFromStart @('10/24/2026,08:00:02,5,80,100,No,No') $anchor 26000)
 $r.selRowFromTheFuture = PickSel (Select-CorePartitionFeedRowsFromStart @(((Hw 24600) + ',5,80,100,No,No'), ((Hw 40000) + ',5,80,100,No,No')) $anchor 26000)
 $r.selNoAnchor = PickSel (Select-CorePartitionFeedRowsFromStart $rows $null 26000)
@@ -3588,6 +4420,7 @@ $ok = Get-CorePartitionStartBoundFeed $feed @{ why = $null }
 $r.passThrough = @($ok.rows, $ok.pkgWattsMean, $ok.reasons.Contains('rows'))
 $r | ConvertTo-Json -Compress -Depth 5
 """
+R13_PURE = R13_PURE.replace("__FIXTURE_ZONE_PS__", FIXTURE_ZONE_PS)
 
 
 # r13c (hosted CI run 40605556724, windows shard 4/8): the feed readers' monoMs is the Stopwatch read taken BEFORE the read, so it can never be
@@ -3623,6 +4456,73 @@ class CorePartitionR13cMonoStampTests(unittest.TestCase):
             self.assertEqual(proc.returncode, 0, proc.stdout[-3000:] + proc.stderr[-3000:])
             got = json.loads(proc.stdout.strip().splitlines()[-1])
         self.assertEqual([got["markLate"], got["sinceLate"]], [0, 0], got)
+
+
+# fixture-clock-DST (sol r1 B1, PR 783): the success fixture's own row, at a launch in the repeated local hour, through the job's real selector.
+# 'old' is the stamp b8d9522a wrote under Central time (the host zone, ToLocalTime): the selector refuses it. 'new' is the fixture's stamp: the
+# selector, with its -Zone pinned by the fixture as in every driver, keeps the row.
+FIXTURE_DST_UNIT = r"""
+$cst = [TimeZoneInfo]::FindSystemTimeZoneById('Central Standard Time')
+__FIXTURE_ZONE_PS__
+$L = [DateTime]::new(2026, 11, 1, 6, 30, 0, [DateTimeKind]::Utc)
+$anchor = @{ startMonoMs = 1100.0; launchUtcTicks = $L.Ticks; launchMonoMs = 1000.0; skewMs = 0.0 }
+$at = $L.AddMilliseconds(400)
+$old = [TimeZoneInfo]::ConvertTimeFromUtc($at, $cst).ToString('d.M.yyyy,H:mm:ss.fff', [Globalization.CultureInfo]::InvariantCulture)
+$new = Format-CpFixtureStamp $at
+function PickSel($v) { @([string]$v.why, @($v.lines).Count) }
+$r = [ordered]@{
+    oldStamp = $old; newStamp = $new
+    oldInCentral = PickSel (Select-CorePartitionFeedRowsFromStart @($old + ',x,70.0,45.0,No,No') $anchor 3000 1000 $cst)
+    newInCentral = PickSel (Select-CorePartitionFeedRowsFromStart @($new + ',x,70.0,45.0,No,No') $anchor 3000 1000 $cst)
+    newPinned = PickSel (Select-CorePartitionFeedRowsFromStart @($new + ',x,70.0,45.0,No,No') $anchor 3000)
+    pinnedZoneId = [string]$cpFixtureZone.Id
+}
+$r | ConvertTo-Json -Compress -Depth 4
+""".replace("__FIXTURE_ZONE_PS__", FIXTURE_ZONE_PS)
+
+
+@requires_windows_pwsh
+class CorePartitionFixtureClockDstTests(unittest.TestCase):
+    """fixture-clock-DST (sol r1 B1 on b8d9522a, PR 783): the feed fixtures name their stamps in a zone they pin, never in the host's."""
+
+    def test_the_success_fixtures_row_in_the_repeated_local_hour_is_kept_by_the_real_selector(self) -> None:
+        """Sol's instant: launch 2026-11-01T06:30:00Z, row 400 ms later. Stamped in Central it reads 1:30:00.400 twice, and the real selector
+        refuses it (feed-row-stamp-ambiguous, zero rows: the case sol reproduced); the fixture's own stamp, read in the zone the fixture pins,
+        names one instant and the row is kept, however the host zone and date fall."""
+        with tempfile.TemporaryDirectory(prefix="core-partition-fixture-dst-") as tmp:
+            script = Path(tmp) / "dst.ps1"
+            script.write_text(LIFT + FIXTURE_DST_UNIT, encoding="utf-8")
+            proc = run_pwsh(["-File", str(script)], env_extra={"CP_GEN": str(GENERATOR), "CP_DIR": tmp})
+            self.assertEqual(proc.returncode, 0, proc.stdout[-3000:] + proc.stderr[-3000:])
+            got = json.loads(proc.stdout.strip().splitlines()[-1])
+        self.assertEqual(got["oldStamp"], "1.11.2026,1:30:00.400", got)
+        self.assertEqual(got["oldInCentral"], ["feed-row-stamp-ambiguous", 0], got)
+        self.assertEqual(got["newStamp"], "1.11.2026,1:30:00.400", got)
+        self.assertEqual(got["newInCentral"], ["feed-row-stamp-ambiguous", 0], got)
+        self.assertEqual(got["pinnedZoneId"], "cp-fixture-m0500", got)
+        self.assertEqual(got["newPinned"], ["", 1], got)
+
+    def test_no_feed_fixture_stamps_in_the_hosts_zone(self) -> None:
+        """The class: every PowerShell snippet constant in this file that touches a feed (derived, never listed: any upper-case str module
+        constant that names a feed file, the feed env var, the feed selector or a feed stamp) is free of ToLocalTime(, and every one that
+        BUILDS a stamp (the d.M.yyyy format or the pinned helper) uses the pinned-zone stamp and pins the selector's zone. ToLocalTime() in
+        one of them brings the repeated-hour failure back for that snippet. No snippet is exempt: the stamp builders Hw and selSecondsOnly
+        (R13_PURE) were the two the first three-driver guard missed (Grok G2 on aed96266)."""
+        touches_feed = re.compile(r"corePartitionFeedPath|feed\.csv|HEAVY_SLOT_FEED|Select-CorePartitionFeedRowsFromStart|d\.M\.yyyy|Format-CpFixtureStamp")
+        builds_stamp = re.compile(r"d\.M\.yyyy|Format-CpFixtureStamp")
+        snippets = {n: v for n, v in globals().items() if n.isupper() and isinstance(v, str) and touches_feed.search(v)}
+        stampers = {n for n, v in snippets.items() if builds_stamp.search(v)}
+        # the derived sets can never shrink below what the narrower guard named (a refactor that stops matching would otherwise pass vacuously)
+        self.assertLessEqual({"MARKER_DRIVER", "TERMINAL_CHILD_SETUP", "R11_CLEANUP", "R13_PURE", "R13_START_DRIVER"}, stampers)
+        self.assertLessEqual(stampers, set(snippets))
+        for name, text in snippets.items():
+            # PowerShell is case-insensitive: .tolocaltime() is the same call (adversary A1 on 476fefe1)
+            self.assertIsNone(re.search(r"(?i)tolocaltime", text), f"{name} builds a feed stamp in the host zone (ToLocalTime)")
+            self.assertNotIn("__FIXTURE_ZONE_PS__", text, name)
+        for name in sorted(stampers):
+            text = snippets[name]
+            self.assertIn("Format-CpFixtureStamp", text, name)
+            self.assertIn("function Select-CorePartitionFeedRowsFromStart(", text, name)
 
 
 @requires_windows_pwsh
@@ -3665,6 +4565,25 @@ class CorePartitionR13StartTests(unittest.TestCase):
             got = self.r_stalled[case]
             self.assertEqual([got["rows"], got["wattsMean"], got["tempMean"], got["why"]], [rows, 100.0, 80.0, ""], got)
         self.assertEqual({k: v["why"] for k, v in self.r_stalled.items()}, {k: v["why"] for k, v in self.r.items()})
+
+    def test_fixture_clock_dst_a_launch_in_the_repeated_local_hour_publishes_the_same_windows(self) -> None:
+        """fixture-clock-DST (sol r1 B1 on b8d9522a, PR 783): the feed fixture stamped its rows in the HOST's zone, so a run during the repeated hour
+        after a fall-back (Central: 2026-11-01T06:00Z..07:00Z reads 1:00..2:00 twice) wrote stamps the real selector correctly refuses as
+        feed-row-stamp-ambiguous, and every case here lost its window. The same driver with its "now" forced to 2026-11-01T06:30:00Z, the
+        instant sol named, must give the outcome of the unforced run for every case: rows, means and reason."""
+        script = self.tmp / "r13-cleanup.ps1"
+        forced = self.tmp / "cleanup-repeated-hour"
+        forced.mkdir()
+        proc = run_pwsh(["-File", str(script)], env_extra={"CP_GEN": str(GENERATOR), "CP_DIR": str(forced), "CP_FIXTURE_NOW_UTC": "2026-11-01T06:30:00Z"})
+        self.assertEqual(proc.returncode, 0, proc.stdout[-3000:] + proc.stderr[-3000:])
+        got = json.loads(proc.stdout.strip().splitlines()[-1])
+        for case, one in got.items():
+            self.assertNotIn("threw", one, f"{case}: {one}")
+
+        def key(d: dict) -> dict:
+            return {k: [v.get("rows"), v.get("wattsMean"), v.get("tempMean"), v.get("why")] for k, v in d.items()}
+
+        self.assertEqual(key(got), key(self.r))
 
     def test_r13c_dot_counterexample_reports_the_playback_means_not_a_refusal(self) -> None:
         """Dot 6452868627 (literal): 60 s of startup rows (10 W / 30 C) then 30 s of playback rows (100 W / 80 C) in a 90 s window that passes the

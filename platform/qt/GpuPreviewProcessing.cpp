@@ -1,6 +1,7 @@
 #include "GpuPreviewProcessing.h"
 
 #include "../../src/processing/raw_processing.h"
+#include "../../src/processing/ThreadExitCache.h"
 #include "../../src/debug/StageTiming.h"
 #include "../../src/batch/WorkerThreadCount.h"
 
@@ -4411,7 +4412,7 @@ struct PointwiseFastView
     float agxInverse[9];
 };
 
-/* Writable table pointers for the fill pass (never the thread_local itself:
+/* Writable table pointers for the fill pass (never the per-thread cache itself:
  * the fill runs on every thread of the team). */
 struct PointwiseFastFill
 {
@@ -4755,7 +4756,7 @@ int pointwiseFastRun(const GpuPreviewProcessingConfig & config,
                      uint8_t * output8,
                      int pixelCount)
 {
-    static thread_local PointwiseFastTables tables;
+    PointwiseFastTables & tables = mlvThreadExitCache<PointwiseFastTables>();
     PointwiseFastView view;
     PointwiseFastFill fill;
     pointwiseFastPrepare(config, tables, &view, &fill);

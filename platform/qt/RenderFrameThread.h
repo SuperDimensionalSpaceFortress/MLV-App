@@ -24,6 +24,7 @@
 #include <array>
 #include <atomic>
 #include <deque>
+#include <functional>
 #include <memory>
 #include <vector>
 
@@ -175,6 +176,13 @@ public:
             GpuPreviewProcessingConfig gpuPreviewProcessingConfig;
             uint64_t gpuPreviewProcessingConfigGeneration = 0;
             QString playbackProcessingReason;
+            /* HFR-NATIVE-60FPS-FULLRES-1-MERGE-MASTER r17 (adversary A1 on 6451a8d9): the engine's loop-wrap
+             * count (PlaybackWrapRecorder::engineWraps) when this frame was REQUESTED. A frame requested before a
+             * wrap is presented after it whenever the draw's own early/tail advance wraps the engine first, so
+             * the source-advance tracker reads this beside the live count (presentationLoopWraps). A lookahead
+             * request copies its base request's count, and r20: MainWindow::drawFrameReady raises it to the live count
+             * when it accepts the frame as the engine's target (presentationAcceptedLookaheadStamp). */
+            int engineWrapsAtRequest = 0;
             bool playbackActive = false;
             bool dropFramePlaybackActive = false;
             bool renderThreadUsing16BitPreview = false;
@@ -393,6 +401,23 @@ public:
      * frames N+1..N+depth decode, recon and render ahead of it. */
     bool isIdleExceptPlaybackLookahead( int activePlaybackTarget,
                                         uint64_t activeGeneration );
+    /* GUI-SMOKE-FOREGROUND-HANG-NOLA-1 (adversary r3 pass 3 A1): isIdle() and isIdleExceptPlaybackLookahead() for the
+     * resize wait's sample. They never wait for m_mutex: a mutex someone holds reports busy at once
+     * (resize_still_drawing_wait::probeIdleWithoutWaiting). Every other caller keeps the blocking reads above. */
+    /* epochOut (optional) receives busyEpoch() inside the same critical section as the idle decision (adversary r4
+     * pass 2 A1); it is untouched when the mutex is held (busy). */
+    bool isIdleNoWait( uint64_t *epochOut = nullptr );
+    bool isIdleExceptPlaybackLookaheadNoWait( int activePlaybackTarget,
+                                              uint64_t activeGeneration,
+                                              uint64_t *epochOut = nullptr );
+    /* adversary r4 A1: a monotonic count of starts of pipeline work (a render request, a warm run starting, a slot
+     * entering a busy state, a render starting). Two equal reads around an idle sample prove no work started between. */
+    uint64_t busyEpoch( void ) const;
+    /* adversary r4 A1 (probe-to-clear): runs onIdleLocked while holding m_mutex iff it is free now (never waits), the
+     * pipeline is idle (the playback-advance decision when exceptPlaybackLookahead) and busyEpoch() == epoch. No render
+     * request or warm start can begin while it runs. Returns whether onIdleLocked ran. */
+    bool runIfIdleNoWait( bool exceptPlaybackLookahead, int activePlaybackTarget, uint64_t activeGeneration,
+                          uint64_t epoch, const std::function<void()> &onIdleLocked );
     void resetPipelineOverlapMeter( void );
     playback_overlap::OverlapSnapshot pipelineOverlapSnapshot( void );
     bool acquireLatestReadyFrame( ReadyFrame *frame );
@@ -411,6 +436,10 @@ public:
     bool hasPlaybackLookaheadRequest( uint32_t frameNumber,
                                       uint64_t activeGeneration );
     bool hasReadyPlaybackLookaheadFrame( uint32_t frameNumber,
+                                         uint64_t activeGeneration );
+    /* HFR-NATIVE-60FPS-FULLRES-1 r27 fix iteration 2: a published Ready frame for
+     * frameNumber in activeGeneration, lookahead or not (not yet acquired). */
+    bool hasReadyFrameForPlaybackTarget( uint32_t frameNumber,
                                          uint64_t activeGeneration );
     int prunePlaybackLookaheadOutsideForwardWindow( int activePlaybackTarget,
                                                     uint64_t activeGeneration,
@@ -738,6 +767,11 @@ private:
     void ensureReconWorkerStartedLocked( void );
     void stopReconWorkerLocked( void );
     bool phase3WorkInFlightLocked( void ) const;
+    bool isIdleLocked( void ) const;
+    bool isIdleExceptPlaybackLookaheadLocked( int activePlaybackTarget, uint64_t activeGeneration ) const;
+    static bool slotStateIsBusy( SlotState state );
+    void bumpBusyEpoch( void ) { m_busyEpoch.fetch_add( 1, std::memory_order_acq_rel ); }
+    std::atomic<uint64_t> m_busyEpoch{ 0 };
     void queueDecodeRequestLocked( int slotIndex, const RenderRequest &request );
     bool takeDecodeRequestForWorker( DecodeQueueEntry *entry );
     void decodeFrameForWorker( const DecodeQueueEntry &entry );

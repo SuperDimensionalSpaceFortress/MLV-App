@@ -77,6 +77,11 @@ SOURCES += \
     $$REPO_ROOT/tests/console/test_playback_frame_population_policy.cpp \
     $$REPO_ROOT/tests/console/test_playback_lookahead_loop_position_policy.cpp \
     $$REPO_ROOT/tests/console/test_playback_drop_frame_advance_policy.cpp \
+    $$REPO_ROOT/tests/console/test_playback_conform_policy.cpp \
+    $$REPO_ROOT/tests/console/test_playback_conform_wiring.cpp \
+    $$REPO_ROOT/tests/console/test_playback_conform_env_override.cpp \
+    $$REPO_ROOT/tests/console/test_playback_source_advance_tracker.cpp \
+    $$REPO_ROOT/tests/console/test_playback_source_advance_wiring.cpp \
     $$REPO_ROOT/tests/console/test_playback_fps_meter_policy.cpp \
     $$REPO_ROOT/tests/console/test_playback_fps_meter_wiring.cpp \
     $$REPO_ROOT/tests/console/test_playback_native_pace_guard.cpp \
@@ -93,6 +98,7 @@ SOURCES += \
     $$REPO_ROOT/tests/console/test_playback_route_prewarm_policy.cpp \
     $$REPO_ROOT/tests/console/test_playback_route_staged_slot_policy.cpp \
     $$REPO_ROOT/tests/console/test_playback_recon_warm_run_policy.cpp \
+    $$REPO_ROOT/tests/console/test_resize_still_drawing_wait.cpp \
     $$REPO_ROOT/tests/console/test_playback_gpu_clock_kick_policy.cpp \
     $$REPO_ROOT/tests/console/test_playback_warm_output_reuse_policy.cpp \
     $$REPO_ROOT/tests/console/test_playback_decode_render_overlap.cpp \
@@ -134,6 +140,7 @@ HEADERS += \
     $$REPO_ROOT/platform/qt/PlaybackPrepPresentationPolicy.h \
     $$REPO_ROOT/platform/qt/PlaybackSlotRelease.h \
     $$REPO_ROOT/platform/qt/PlaybackPrepInFlightGate.h \
+    $$REPO_ROOT/platform/qt/PlaybackPrepOwnership.h \
     $$REPO_ROOT/platform/qt/ClipOpenAbortPolicy.h \
     $$REPO_ROOT/platform/qt/PlaybackGatePolicy.h \
     $$REPO_ROOT/platform/qt/AsyncH2dCounterContract.h \
@@ -141,6 +148,8 @@ HEADERS += \
     $$REPO_ROOT/platform/qt/PlaybackFramePopulationPolicy.h \
     $$REPO_ROOT/platform/qt/PlaybackPresentedFrameIdentityTracker.h \
     $$REPO_ROOT/platform/qt/PlaybackDropFrameAdvancePolicy.h \
+    $$REPO_ROOT/platform/qt/PlaybackConformPolicy.h \
+    $$REPO_ROOT/platform/qt/PlaybackSourceAdvanceTracker.h \
     $$REPO_ROOT/platform/qt/PlaybackAchievedScalePolicy.h \
     $$REPO_ROOT/platform/qt/PlaybackScaleLabel.h \
     $$REPO_ROOT/platform/qt/PlaybackLookaheadLoopPositionPolicy.h \
@@ -165,6 +174,7 @@ HEADERS += \
     $$REPO_ROOT/platform/qt/PlaybackRoutePrewarmPolicy.h \
     $$REPO_ROOT/platform/qt/PlaybackRouteStagedSlotPolicy.h \
     $$REPO_ROOT/platform/qt/PlaybackReconWarmRunPolicy.h \
+    $$REPO_ROOT/platform/qt/ResizeStillDrawingWait.h \
     $$REPO_ROOT/platform/qt/PlaybackGpuClockKickPolicy.h \
     $$REPO_ROOT/platform/qt/GpuTexturePresentAvailabilityPolicy.h \
     $$REPO_ROOT/platform/qt/DisplayDeviceMapping.h \
