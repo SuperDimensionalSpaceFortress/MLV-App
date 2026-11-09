@@ -867,8 +867,8 @@ class CorePartitionGeneratorTests(unittest.TestCase):
                 self.assertIn("([IO.File]::ReadAllText($resultPath) | ConvertFrom-Json).process", text)
                 measured = text.index("Publish-AttrCudaText -Path $corePartitionMeasuredFile")
                 self.assertLess(measured, text.index("Publish-AttrCudaText -Path $corePartitionStopFile"), "the measured pid must reach the helper before it stops")
-                # r8 A1: and the job's own wall/monotonic clock gap
-                self.assertIn("$corePartitionHelperWhy $corePartitionHelperNotReady $corePartitionMeasuredPid $corePartitionPublishWhy $corePartitionMeasuredStartTicks $corePartitionMeasuredEndTicks $corePartitionJobClockSkewMs $corePartitionMeasuredExitTicks\n", text)
+                # r8 A1: and the job's own wall/monotonic clock gap; r3 (adversary f5182886 A1): and the runner's monotonic launch..end
+                self.assertIn("$corePartitionHelperWhy $corePartitionHelperNotReady $corePartitionMeasuredPid $corePartitionPublishWhy $corePartitionMeasuredStartTicks $corePartitionMeasuredEndTicks $corePartitionJobClockSkewMs $corePartitionMeasuredExitTicks $corePartitionMeasuredRunnerElapsedMonoMs\n", text)
                 self.assertIn("ConvertTo-CorePartitionUtcTicks $cpRunnerProcess.startedAtUtc", text)
                 for fn in ("function Test-CorePartitionMeasuredApp", "function Get-CorePartitionFeedHandleInfo", "function ConvertTo-CorePartitionUtcTicks", "function Get-CorePartitionClockSkewMs",
                            "function Test-CorePartitionReadyMarker", "function Get-CorePartitionReadyToken", "function Get-CorePartitionMonoMs"):
@@ -1491,10 +1491,12 @@ if ((Get-Command Test-CorePartitionMeasuredApp).Parameters.ContainsKey('Measured
     $exitCases['started-before-exit-stamp-control'][0].instances = @(($i5000d | ConvertFrom-Json), ((New-CpInst 6000 20.0 20.15 22.9 23.1) | ConvertFrom-Json))
     $exitCases['adversary-9a2372b7-A1-early-exit'] = @((New-CpStepRecord $i5000d 0), 19.21)
     $exitCases['adversary-9a2372b7-A1-early-exit'][0].instances = @(($i5000d | ConvertFrom-Json), ((New-CpInst 6000 19.95 20.15 23.9 24.1) | ConvertFrom-Json))
+    # r3: the runner's monotonic launch..end (20 s), in agreement with its wall launch..end, so its drain is a checked exit
+    $re = $(if ((Get-Command Test-CorePartitionMeasuredApp).Parameters.ContainsKey('RunnerElapsedMonoMs')) { @{ RunnerElapsedMonoMs = 20000.0 } } else { @{} })
     foreach ($k in $exitCases.Keys) {
         $x = $(if ($null -eq $exitCases[$k][1]) { [int64]0 } else { $L + [int64]($exitCases[$k][1] * 1e7) })
-        $sc = Get-CorePartitionScalars $exitCases[$k][0] $feed 4095 1044480 8 $w $null $false -MeasuredPid 5000 -MeasuredStartTicks ($L + 40000000) -MeasuredEndTicks ($L + 240000000) -ClockSkewMs 0 -MeasuredExitTicks $x
-        $v = Test-CorePartitionMeasuredApp $exitCases[$k][0] 5000 ($L + 40000000) ($L + 240000000) 0 $x
+        $sc = Get-CorePartitionScalars $exitCases[$k][0] $feed 4095 1044480 8 $w $null $false -MeasuredPid 5000 -MeasuredStartTicks ($L + 40000000) -MeasuredEndTicks ($L + 240000000) -ClockSkewMs 0 -MeasuredExitTicks $x @re
+        $v = Test-CorePartitionMeasuredApp $exitCases[$k][0] 5000 ($L + 40000000) ($L + 240000000) 0 $x @re
         if ($r.stepExit -is [string]) { $r.stepExit = [ordered]@{} }
         $r.stepExit[$k] = @($sc.appAffinityObserved, $sc.partitionLoadGBps, [string]$sc.corePartitionNullReasons, [string]$v.why, [string]$v.exitStamp)
     }
@@ -2366,7 +2368,10 @@ $out = [ordered]@{}
 foreach ($case in @(@('drain-held', 3.5, $false), @('drain-held-older-receipt', 3.5, $true), @('no-hold-control', 0.0, $false))) {
     $name = $case[0]; $holdSec = [double]$case[1]; $older = [bool]$case[2]
     $code = if ($holdSec -gt 0) { "import subprocess, sys; print('app-ok', flush=True); subprocess.Popen([sys.executable, '-c', 'import time; time.sleep($holdSec)']); sys.exit(0)" } else { "print('app-ok', flush=True)" }
-    $startUtc = [datetime]::UtcNow
+    # r3: the runner's own launch reads (its wall stamp and, from r3, its monotonic stamp beside it), executed as written
+    if ($runnerText.Contains('$startTimestamp = [System.Diagnostics.Stopwatch]::GetTimestamp()')) {
+        . ([scriptblock]::Create((Get-Slice $runnerText '$startUtc = [datetime]::UtcNow' '$startTimestamp = [System.Diagnostics.Stopwatch]::GetTimestamp()')))
+    } else { $startUtc = [datetime]::UtcNow }
     $psi = [Diagnostics.ProcessStartInfo]::new(); $psi.FileName = $env:CP_PY; $psi.UseShellExecute = $false
     $psi.RedirectStandardOutput = $true; $psi.RedirectStandardError = $true
     [void]$psi.ArgumentList.Add('-c'); [void]$psi.ArgumentList.Add($code)
@@ -2375,7 +2380,7 @@ foreach ($case in @(@('drain-held', 3.5, $false), @('drain-held-older-receipt', 
     $hostLoadFinalizeTimeoutMs = 60000; $captureBindingFailures = @()
     . ([scriptblock]::Create($runnerFinalize))
     $receiptProcess = . ([scriptblock]::Create($runnerProcess))
-    if ($older) { $receiptProcess.PSObject.Properties.Remove('exitObservedAtUtc'); $receiptProcess.PSObject.Properties.Remove('exitToEndMs') }
+    if ($older) { foreach ($n in @('exitObservedAtUtc', 'exitToEndMs', 'elapsedMonoMs')) { $receiptProcess.PSObject.Properties.Remove($n) } }
     $resultPath = Join-Path $env:CP_TMP "$name.result.json"
     [IO.File]::WriteAllText($resultPath, ([ordered]@{ process = $receiptProcess } | ConvertTo-Json -Depth 6))
     $appStart = $process.StartTime.ToUniversalTime().Ticks; $appExit = $process.ExitTime.ToUniversalTime().Ticks
@@ -2390,6 +2395,8 @@ foreach ($case in @(@('drain-held', 3.5, $false), @('drain-held-older-receipt', 
         why = [string]$cpAppVerdict.why; exitStamp = $cpAppVerdict.exitStamp; errors = @($corePartitionErrors)
         terminationConfirmed = [bool]$processBoundary.terminationConfirmed; stdoutDrained = [bool]$processBoundary.stdoutDrained; stdout = [string]$processBoundary.stdout
         receiptHasExitStamp = ($null -ne $receiptProcess.PSObject.Properties['exitToEndMs'] -and $null -ne $receiptProcess.exitToEndMs)
+        receiptHasElapsedMono = ($null -ne $receiptProcess.PSObject.Properties['elapsedMonoMs'] -and $null -ne $receiptProcess.elapsedMonoMs)
+        runnerClock = [string]$cpAppVerdict.runnerClock; runnerSkewMs = $cpAppVerdict.runnerSkewMs
         endAfterExitMs = [int](($endUtc.Ticks - $appExit) / 1e4)
         exitObservedAfterExitMs = $(if ($corePartitionMeasuredExitTicks -ne 0) { [int](($corePartitionMeasuredExitTicks - $appExit) / 1e4) } else { $null })
     }
@@ -2407,8 +2414,35 @@ foreach ($bad in @(@('drain-1e20', 1e20), @('drain-negative', -5.0), @('drain-te
     . ([scriptblock]::Create($jobVerdict))
     $out[$bad[0]] = @([string]$cpAppVerdict.why, [string]$cpAppVerdict.exitStamp, $corePartitionErrors.Count)
 }
+# adversary f5182886 A1 (literal), through the job's own result.json read and verdict call: L = 639286128000000000. The runner's 5000 launched at
+# L+4 s, its termination was confirmed at L+20 s and its monotonic end read at L+24 s (exitToEndMs 4000; launch..end on the monotonic clock 20000 ms).
+# An unsampled UTC excursion lands only on the endedAtUtc read: +5 s stamps L+29 s (derived exit L+25 s, a false gone-before-exit refusal), -5 s
+# stamps L+19 s (derived exit L+15 s, before the real one). Both skews are 0 and the helper saw the app gone at L+20.1 s. r3: the runner's wall
+# launch..end disagrees with its monotonic launch..end by 5000 ms, over the 1000 ms CLOCK TOLERANCE: clock-discontinuity. Controls: no excursion,
+# and an 800 ms excursion (under the tolerance, widened into the slack). A drain with no monotonic launch..end to check it against proves no exit
+# (clock-unverified); one that is there but unusable is refused, never a silent fallback.
+$advInst = '{"pid":5000,"startUtcTicks":639286128040500000,"firstSeenUtcTicks":639286128042000000,"firstMs":4200,"goneUtcTicks":639286128201000000,"aliveMs":19900,"goneMs":20100,"pinned":true}'
+$advRecordJson = '{"schema":"mlv-app/core-partition-helper/v1","pid":4242,"app":{"pid":5000,"startUtcTicks":639286128040500000,"affinityFirst":4095,"affinityLast":4095},"instances":[' + $advInst +
+    '],"others":[],"samples":[],"load":{"seconds":15,"bytes":30000000000,"joined":true},"helperAffinityObserved":1044480,"topologyCheck":{"ok":true,"pMask":4095,"eMask":1044480},"clockSkewMaxMs":0,"monoBaseMs":0,"endedBy":"stop-file"}'
+$advL = [int64]639286128000000000
+foreach ($adv in @(@('adv-f5182886-A1-plus5', 29.0, 20000.0), @('adv-f5182886-A1-minus5', 19.0, 20000.0), @('adv-f5182886-A1-no-excursion-control', 24.0, 20000.0),
+        @('adv-f5182886-A1-800ms-control', 24.8, 20000.0), @('adv-f5182886-A1-elapsed-missing', 24.0, 'absent'), @('adv-f5182886-A1-elapsed-null', 24.0, $null),
+        @('adv-f5182886-A1-elapsed-text', 24.0, 'abc'), @('adv-f5182886-A1-elapsed-negative', 24.0, -1.0))) {
+    $p = [ordered]@{ id = 5000; startedAtUtc = ([datetime]::new($advL + 40000000, [DateTimeKind]::Utc)).ToString('o'); endedAtUtc = ([datetime]::new($advL + [int64]($adv[1] * 1e7), [DateTimeKind]::Utc)).ToString('o'); exitToEndMs = 4000.0 }
+    if (-not ($adv[2] -is [string] -and $adv[2] -eq 'absent')) { $p.elapsedMonoMs = $adv[2] }
+    $resultPath = Join-Path $env:CP_TMP "$($adv[0]).result.json"
+    [IO.File]::WriteAllText($resultPath, ([ordered]@{ process = $p } | ConvertTo-Json -Depth 6))
+    $corePartitionHelperRecord = $advRecordJson | ConvertFrom-Json
+    $corePartitionErrors = [System.Collections.Generic.List[string]]::new(); $corePartitionJobClockSkewMs = 0
+    . ([scriptblock]::Create($jobRead))
+    $cpAppVerdict = @{ why = 'measured-app-unverified' }
+    . ([scriptblock]::Create($jobVerdict))
+    $out[$adv[0]] = @([string]$cpAppVerdict.why, [string]$cpAppVerdict.exitStamp, [string]$cpAppVerdict.runnerClock, $corePartitionErrors.Count)
+}
+# r3: the runner's monotonic launch stamp is read right after its wall launch stamp, before the app starts
+$out.startOrder = @($runnerText.IndexOf('$startUtc = [datetime]::UtcNow'), $runnerText.IndexOf('$startTimestamp = [System.Diagnostics.Stopwatch]::GetTimestamp()'), $runnerText.IndexOf('$process = [System.Diagnostics.Process]::Start($startInfo)'))
 # adversary 56b25d8b A1: the runner reads its monotonic end BEFORE its wall end, after the bounded wait
-$out.order = @($runnerText.IndexOf('$processBoundary = Wait-GuiSmokeProcessBounded'), $runnerText.IndexOf('$endTimestamp = [System.Diagnostics.Stopwatch]::GetTimestamp()'), $runnerText.IndexOf('$endUtc = [datetime]::UtcNow'))
+$out.order =@($runnerText.IndexOf('$processBoundary = Wait-GuiSmokeProcessBounded'), $runnerText.IndexOf('$endTimestamp = [System.Diagnostics.Stopwatch]::GetTimestamp()'), $runnerText.IndexOf('$endUtc = [datetime]::UtcNow'))
 $out | ConvertTo-Json -Depth 6 -Compress
 """
 
@@ -2467,6 +2501,42 @@ class CorePartitionRunnerExitStampTests(unittest.TestCase):
         """adversary 56b25d8b A1: a delay between the two end reads can only shorten exitToEndMs, so the derived exit never moves before the real one."""
         wait, mono, wall = self.r["order"]
         self.assertTrue(0 <= wait < mono < wall, self.r["order"])
+    def test_a_wall_clock_excursion_on_the_runners_end_read_is_a_clock_discontinuity(self) -> None:
+        """adversary f5182886 A1 (literal): an unsampled +5 s / -5 s UTC excursion that lands only on the runner's endedAtUtc read moved the derived
+        exit (endedAtUtc - exitToEndMs) to a false refusal / before the real exit. The runner's wall launch..end now has to agree with its monotonic
+        launch..end (process.elapsedMonoMs) within the 1000 ms CLOCK TOLERANCE; over it the verdict is clock-discontinuity."""
+        for case in ("adv-f5182886-A1-plus5", "adv-f5182886-A1-minus5"):
+            with self.subTest(case=case):
+                self.assertEqual(self.r[case][0], "clock-discontinuity", self.r[case])
+                self.assertEqual(self.r[case][3], 0, self.r[case])
+        for case in ("adv-f5182886-A1-no-excursion-control", "adv-f5182886-A1-800ms-control"):
+            with self.subTest(case=case):
+                self.assertEqual(self.r[case], ["", "exitToEndMs", "verified", 0], f"the runner's own app under a checked runner clock was refused: {self.r[case]}")
+
+    def test_a_drain_with_no_runner_clock_check_proves_no_exit(self) -> None:
+        """r3: exitToEndMs without the runner's monotonic launch..end (missing or null) is clock-unverified for the exit-side check, labelled; a
+        value that is there but unusable is refused, never a silent fallback."""
+        for case in ("adv-f5182886-A1-elapsed-missing", "adv-f5182886-A1-elapsed-null"):
+            with self.subTest(case=case):
+                self.assertEqual(self.r[case], ["clock-unverified", "exitToEndMs", "unverified", 0], self.r[case])
+        for case in ("adv-f5182886-A1-elapsed-text", "adv-f5182886-A1-elapsed-negative"):
+            with self.subTest(case=case):
+                self.assertEqual(self.r[case][0], "clock-unverified", self.r[case])
+                self.assertEqual(self.r[case][2], "unusable", self.r[case])
+
+    def test_the_runner_records_its_monotonic_launch_to_end_and_the_job_checks_it(self) -> None:
+        """r3: the real producer chain: the runner's receipt carries elapsedMonoMs, read right after its wall launch stamp, and the job checks it."""
+        launch, mono, start = self.r["startOrder"]
+        self.assertTrue(0 <= launch < mono < start, self.r["startOrder"])
+        for case in ("drain-held", "no-hold-control"):
+            with self.subTest(case=case):
+                c = self.r[case]
+                self.assertTrue(c["receiptHasElapsedMono"], c)
+                self.assertEqual(c["runnerClock"], "verified", c)
+                self.assertLess(c["runnerSkewMs"], 1000, c)
+        self.assertFalse(self.r["drain-held-older-receipt"]["receiptHasElapsedMono"])
+        self.assertEqual(self.r["drain-held-older-receipt"]["runnerClock"], "unverified", "the older-receipt fallback does not say its runner clock is unchecked")
+
     def test_an_app_with_no_held_drain_is_bound_control(self) -> None:
         c = self.r["no-hold-control"]
         self.assertEqual([c["terminationConfirmed"], c["stdoutDrained"], c["stdout"].strip(), c["errors"]], [True, True, "app-ok", []], c)
