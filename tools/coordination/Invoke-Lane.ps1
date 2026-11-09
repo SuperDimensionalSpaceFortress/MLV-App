@@ -1051,10 +1051,11 @@ public static class MlvLaneJob {
     if(status<0) throw new Win32Exception(status,"NtQueryInformationProcess");
     return (int)info.InheritedFromUniqueProcessId.ToInt64();
   }
-  // CONTAINMENT-KID-READ-ACCESS-DENIED-1: the reads above need only PROCESS_QUERY_LIMITED_INFORMATION, but Process.Handle opens PROCESS_ALL_ACCESS. A protected or SYSTEM
-  // process refuses that with 5, even to an elevated account, and every Windows host keeps some whose parent pid is free (csrss, wininit, winlogon: their smss instance has
-  // exited). A lane process handed that recycled pid had one listed under it, and hosted CI read 'ancestry-unreadable:kid-read:5' (PR 420, 766, 775). Candidates are now
-  // read on a handle with only that right.
+  // CONTAINMENT-KID-READ-ACCESS-DENIED-1: the reads above need only PROCESS_QUERY_LIMITED_INFORMATION, but Process.Handle opens PROCESS_ALL_ACCESS. A protected process
+  // refuses that with 5, even to an elevated, debug-privileged account, and every Windows host keeps some whose parent pid is free (csrss, wininit: their smss instance
+  // has exited). Hosted CI read 'ancestry-unreadable:kid-read:5' (PR 420, 766, 775); which process it read is UNKNOWN, since no receipt names it. A protected process
+  // listed under a lane process that was handed its recycled parent pid is one possible mechanism, shown by injection only. Candidates are now read on a handle with only
+  // that right.
   const uint PROCESS_QUERY_LIMITED_INFORMATION=0x1000;
   const int ERROR_INVALID_PARAMETER=87;
   [DllImport("kernel32.dll", SetLastError=true)]

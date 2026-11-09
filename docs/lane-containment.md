@@ -288,11 +288,15 @@ walked, and it does not read older than that parent (r15). A process whose paren
 is left alone. The reads use a handle with only `PROCESS_QUERY_LIMITED_INFORMATION`, and that
 handle stays open until the member's own handle, the one the kill and the wait use, is open, so
 the pid cannot change hands in between (CONTAINMENT-KID-READ-ACCESS-DENIED-1). Before that fix the
-reads went through `Process.Handle`, which asks for `PROCESS_ALL_ACCESS`. A protected or SYSTEM
-process refuses that with 5, even to an elevated account, and every Windows host keeps some whose
-parent pid is free (csrss, wininit, winlogon: their smss instance has exited). A lane process
-handed that recycled pid had one listed under it, and hosted CI read `ancestry-unreadable:kid-read:5`
-(PR 420 job 128859524832, PR 766 job 128492230194, PR 775 job 128881183190). A candidate whose
+reads went through `Process.Handle`, which asks for `PROCESS_ALL_ACCESS`. Hosted CI read
+`ancestry-unreadable:kid-read:5` (PR 420 job 128859524832, PR 766 job 128492230194, PR 775 job
+128881183190). The process it read is UNKNOWN: no receipt or log names it. One possible
+mechanism, shown only by an injected test: a protected process refuses `PROCESS_ALL_ACCESS` with 5,
+even to an elevated, debug-privileged account, and every Windows host keeps some whose parent pid is
+free (csrss, wininit: their smss instance has exited), so a lane process handed that recycled pid
+can have one listed under it. The tests model that refusal with a seam at the walk's one candidate
+open, because on an elevated host a process DACL does not bind a reader whose SeDebugPrivilege .NET
+enabled (r2: hosted run 42538300582 read `killed` where a no-grant DACL was meant to refuse). A candidate whose
 kernel process number (`ProcessSequenceNumber`, which follows creation order whatever the clock
 does) is below its parent's existed before that parent, so it is not its child: it is left alone
 and adds no uncertainty. When either number cannot be read, this rule says nothing. The receipt's
