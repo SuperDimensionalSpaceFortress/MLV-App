@@ -6913,6 +6913,24 @@ TEST(DualIsoPipeline, MixChromaFast2x2KernelIsByteIdenticalToLegacy)
             }
         }
     }
+
+    // Adversary eae11081 A2: a fully clipped plane holding values at or past
+    // the raw2ev LUT end. The legacy loop skips every cell without a lookup;
+    // the fast fill must not read past the LUT and must also copy the plane.
+    for (const uint32_t clipped : { (1u << 20) - 1u, 1u << 20, 0x7FFFFFFFu, 0xFFFFFFFFu })
+    {
+        const int w = 9;
+        const int h = 10;
+        const std::vector<uint32_t> plane(static_cast<size_t>(w) * static_cast<size_t>(h), clipped);
+        std::vector<uint32_t> legacy(plane.size(), 0xA5A5A5A5u);
+        std::vector<uint32_t> fast(plane.size(), 0x5A5A5A5Au);
+        ASSERT_EQ(1, dualisoMixChroma2x2KernelForTesting(0, w, h, plane.data(), legacy.data(),
+                                                         lut_black, lut_white, lut_black, lut_white, nullptr));
+        ASSERT_EQ(1, dualisoMixChroma2x2KernelForTesting(1, w, h, plane.data(), fast.data(),
+                                                         lut_black, lut_white, lut_black, lut_white, nullptr));
+        ASSERT_EQ(0, std::memcmp(legacy.data(), fast.data(), legacy.size() * sizeof(uint32_t)));
+        ASSERT_EQ(0, std::memcmp(plane.data(), fast.data(), plane.size() * sizeof(uint32_t)));
+    }
 }
 
 // Offline bench gate (opt-in: MLVAPP_MIX_CHROMA_BENCH=<runs>): two planes at the
@@ -6925,7 +6943,9 @@ TEST(DualIsoPipeline, MixChromaFast2x2BenchAtVenueGeometry)
     {
         SKIP_TEST("Set MLVAPP_MIX_CHROMA_BENCH=<runs> to run the offline mix-chroma bench.");
     }
-    const int runs = std::max(20, runs_env.toInt());
+    // Bounded so runs + 2 cannot overflow and the sample vectors are never empty
+    // (adversary eae11081 A1).
+    const int runs = std::min(1000, std::max(20, runs_env.toInt()));
     const int w = 1808;
     const int h = 2268;
     const int lut_black = 2048 * 64;

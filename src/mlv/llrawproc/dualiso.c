@@ -4653,17 +4653,23 @@ static inline void dualiso_cs2_fill_pos_row(const uint32_t * __restrict inp,
     const uint32_t * r_0 = inp + (size_t)p * (size_t)w;
     const uint32_t * r_p1 = r_0 + w;
     const uint32_t * r_p2 = inp + (size_t)(p + 2) * (size_t)w;
+    /* Positions are filled eagerly, including ones only a skipped (fully
+     * clipped) cell would use, which the legacy loop never looks up. Clamp
+     * the LUT index so such a sample can never read past raw2ev (adversary
+     * eae11081 A2). For every value the legacy kernel can look up in bounds
+     * (< DUALISO_RAW2EV_LUT_COUNT) the clamp is the identity. */
+    #define DUALISO_CS2_EV(v) raw2ev[MIN((uint32_t)(v), (uint32_t)(DUALISO_RAW2EV_LUT_COUNT - 1u))]
     for (int j = 0; j < npos; j++)
     {
         const int q = 2 + 2 * j;
-        const int rr = raw2ev[(int)r_0[q]];
-        const int bb = raw2ev[(int)r_p1[q + 1]];
-        const int g1 = raw2ev[(int)r_0[q + 1]];
-        const int g2 = raw2ev[(int)r_p1[q]];
-        const int g3 = raw2ev[(int)r_0[q - 1]];
-        const int g5 = raw2ev[(int)r_p1[q + 2]];
-        const int g4 = raw2ev[(int)r_m1[q]];
-        const int g6 = raw2ev[(int)r_p2[q + 1]];
+        const int rr = DUALISO_CS2_EV(r_0[q]);
+        const int bb = DUALISO_CS2_EV(r_p1[q + 1]);
+        const int g1 = DUALISO_CS2_EV(r_0[q + 1]);
+        const int g2 = DUALISO_CS2_EV(r_p1[q]);
+        const int g3 = DUALISO_CS2_EV(r_0[q - 1]);
+        const int g5 = DUALISO_CS2_EV(r_p1[q + 2]);
+        const int g4 = DUALISO_CS2_EV(r_m1[q]);
+        const int g6 = DUALISO_CS2_EV(r_p2[q + 1]);
         dualiso_cs2_pos_t * o = &row[j];
         o->hr = rr - (g1 + g3) / 2;
         o->hb = bb - (g2 + g5) / 2;
@@ -4674,6 +4680,7 @@ static inline void dualiso_cs2_fill_pos_row(const uint32_t * __restrict inp,
         o->g1 = g1; o->g2 = g2; o->g3 = g3;
         o->g4 = g4; o->g5 = g5; o->g6 = g6;
     }
+    #undef DUALISO_CS2_EV
 }
 
 static inline void dualiso_cs2_cell_row(const uint32_t * __restrict inp,
