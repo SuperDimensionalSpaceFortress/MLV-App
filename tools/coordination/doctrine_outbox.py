@@ -2808,6 +2808,9 @@ ROUTE_INJECTION_ENV = frozenset({"PYTHONPATH", "PYTHONSTARTUP", "PYTHONHOME", "N
 ROUTE_SCRATCH_PREFIX = "outbox-exercise-"
 ROUTE_DEFAULT_TIMEOUT_S = 60.0
 ROUTE_PREP_TIMEOUT = 120.0                                                                      # seconds per git call that prepares the scratch
+ROUTE_KILL_EXIT_WAIT = 10.0                                                                     # seconds a killed route's tree is waited for
+ROUTE_SCRATCH_REMOVE_DEADLINE = 15.0                                                            # seconds a held scratch directory is retried
+ROUTE_SCRATCH_REMOVE_PAUSE = 0.1                                                                # seconds between removal attempts
 ROUTE_OUTPUT_CAP_BYTES = 64 * 1024
 ROUTE_BUS_ENV = "FACTORY_BUS_CLONE"
 ROUTE_PASSING = ("ROUTE_OK", "ROUTE_NOT_EXECUTED")
@@ -3620,6 +3623,12 @@ class _WinJob:
                         ("JobMemoryLimit", ctypes.c_size_t), ("PeakProcessMemoryUsed", ctypes.c_size_t),
                         ("PeakJobMemoryUsed", ctypes.c_size_t)]
 
+        class Accounting(ctypes.Structure):                              # JOBOBJECT_BASIC_ACCOUNTING_INFORMATION
+            _fields_ = [("TotalUserTime", ctypes.c_int64), ("TotalKernelTime", ctypes.c_int64),
+                        ("ThisPeriodTotalUserTime", ctypes.c_int64), ("ThisPeriodTotalKernelTime", ctypes.c_int64),
+                        ("TotalPageFaultCount", wintypes.DWORD), ("TotalProcesses", wintypes.DWORD),
+                        ("ActiveProcesses", wintypes.DWORD), ("TotalTerminatedProcesses", wintypes.DWORD)]
+
         k32 = ctypes.WinDLL("kernel32", use_last_error=True)
         k32.CreateJobObjectW.restype = wintypes.HANDLE
         k32.CreateJobObjectW.argtypes = [wintypes.LPVOID, wintypes.LPCWSTR]
@@ -3628,7 +3637,10 @@ class _WinJob:
         k32.SetInformationJobObject.argtypes = [wintypes.HANDLE, ctypes.c_int, wintypes.LPVOID, wintypes.DWORD]
         k32.AssignProcessToJobObject.argtypes = [wintypes.HANDLE, wintypes.HANDLE]
         k32.CloseHandle.argtypes = [wintypes.HANDLE]
+        k32.TerminateJobObject.argtypes = [wintypes.HANDLE, wintypes.UINT]
+        k32.QueryInformationJobObject.argtypes = [wintypes.HANDLE, ctypes.c_int, wintypes.LPVOID, wintypes.DWORD, wintypes.LPVOID]
         self._k32 = k32
+        self._accounting = Accounting
         self._handle = k32.CreateJobObjectW(None, None)
         if not self._handle:
             raise OSError(ctypes.get_last_error(), "CreateJobObjectW failed")
@@ -3648,6 +3660,20 @@ class _WinJob:
             if process:
                 k32.CloseHandle(process)
 
+    def kill_and_wait(self, timeout: float) -> None:
+        """Kill every process in the job and wait, up to `timeout` seconds, until none is active. Closing the job handle
+        alone kills asynchronously: the processes (and the directory they were started in) can be held for a moment after it."""
+        if not self._handle:
+            return
+        self._k32.TerminateJobObject(self._handle, 1)
+        import ctypes
+        info = self._accounting()
+        deadline = time.monotonic() + timeout
+        while self._k32.QueryInformationJobObject(self._handle, 1, ctypes.byref(info), ctypes.sizeof(info), None):   # BasicAccounting
+            if info.ActiveProcesses == 0 or time.monotonic() >= deadline:
+                return
+            time.sleep(0.02)
+
     def close(self) -> None:
         """Close the job; Windows kills whatever is still in it."""
         if self._handle:
@@ -3659,6 +3685,7 @@ def _kill_route_tree(proc: subprocess.Popen, job: "_WinJob | None") -> None:
     """End the route's process and every descendant it started, then reap the direct child."""
     if os.name == "nt":
         if job is not None:
+            job.kill_and_wait(ROUTE_KILL_EXIT_WAIT)                     # the tree has exited (bounded) before the caller removes its cwd
             job.close()
         else:
             try:
@@ -3813,10 +3840,21 @@ def remove_exercise_scratch(base: pathlib.Path, scratch_root: pathlib.Path) -> N
     if (base.parent.resolve() != scratch_root.resolve() or not base.name.startswith(ROUTE_SCRATCH_PREFIX)
             or base.is_symlink() or not base.is_dir()):
         return
-    if sys.version_info >= (3, 12):
-        shutil.rmtree(base, onexc=_writable_retry)
-    else:
-        shutil.rmtree(base, onerror=lambda f, p, e: _writable_retry(f, p, e))
+    deadline = time.monotonic() + ROUTE_SCRATCH_REMOVE_DEADLINE
+    while True:
+        try:
+            if sys.version_info >= (3, 12):
+                shutil.rmtree(base, onexc=_writable_retry)
+            else:
+                shutil.rmtree(base, onerror=lambda f, p, e: _writable_retry(f, p, e))
+            return
+        except FileNotFoundError:
+            return                                                      # already gone
+        except OSError as e:                                            # a just-killed process still holds it (sharing violation 13/32)
+            if time.monotonic() >= deadline:
+                raise Unknown("EXERCISE_SCRATCH_NOT_REMOVED",
+                              f"{base} could not be removed within {ROUTE_SCRATCH_REMOVE_DEADLINE:g}s and is left behind: {e}") from e
+            time.sleep(ROUTE_SCRATCH_REMOVE_PAUSE)
 
 
 def make_exercise_scratch(bus: pathlib.Path, scratch_root: pathlib.Path) -> tuple[pathlib.Path, pathlib.Path, str]:
@@ -3847,8 +3885,15 @@ def make_exercise_scratch(bus: pathlib.Path, scratch_root: pathlib.Path) -> tupl
             if proc.returncode != 0:
                 raise GitError(f"git {' '.join(args)} (in {clone}): {proc.stderr.strip()}")
         return base, clone, proc.stdout.strip()
-    except BaseException:
-        remove_exercise_scratch(base, scratch_root)
+    except BaseException as failure:
+        try:
+            remove_exercise_scratch(base, scratch_root)
+        except Unknown as leftover:                                     # the failure that ended the preparation stays the outcome
+            if isinstance(failure, Unknown):
+                failure.detail = f"{failure.detail}; {leftover.detail}" if failure.detail else leftover.detail
+                failure.args = (f"{failure.code}: {failure.detail}",)
+            else:
+                _route_say(f"{leftover.code}: {leftover.detail}", sys.stderr)
         raise
 
 

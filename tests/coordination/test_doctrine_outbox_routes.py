@@ -2500,6 +2500,91 @@ def test_a_hung_scratch_preparation_is_the_route_timeout_outcome_and_leaves_no_s
                 force_kill(int(pid))
 
 
+# ---------- CI-FLAKE-OUTBOX-HUNG-SCRATCH-PERMISSIONERROR-1: a killed preparation may still hold the scratch directory ----------
+# Hosted CI (PR #781, run 42597694336) saw the test above fail with PermissionError(13): the hung preparation's tree was killed, but
+# Windows releases the scratch directory (the preparation's cwd) a moment after the kill, and the removal's single retry did not
+# cover a sharing violation. The PermissionError then REPLACED the typed ROUTE_TIMEOUT. These rows inject the sharing violation on
+# the removal itself (no race with a real process): a transient one is ridden out, a persistent one is a typed outcome.
+
+class FlakyScratchRemoval:
+    """shutil.rmtree stand-in: a scratch directory of this tool fails with a sharing violation `failures` times (None: always)."""
+
+    def __init__(self, real, failures: int | None) -> None:
+        self.real, self.failures, self.calls = real, failures, 0
+
+    def __call__(self, path, *args, **kwargs):
+        if Path(path).name.startswith(ob.ROUTE_SCRATCH_PREFIX):
+            self.calls += 1
+            if self.failures is None or self.calls <= self.failures:
+                raise PermissionError(13, "The process cannot access the file because it is being used by another process", str(path))
+        return self.real(path, *args, **kwargs)
+
+
+def hung_prep_that_leaves_scratch_held(monkeypatch, failures: int | None) -> FlakyScratchRemoval:
+    flaky = FlakyScratchRemoval(shutil.rmtree, failures)
+    monkeypatch.setattr(ob.shutil, "rmtree", flaky)
+
+    def hung(*_a, **_k):
+        raise ob.Unknown("ROUTE_TIMEOUT", "git clone still running after 2s; its process tree was killed")
+
+    monkeypatch.setattr(ob, "run_isolated_git", hung)
+    return flaky
+
+
+def test_a_transient_sharing_violation_on_scratch_removal_keeps_the_route_timeout_outcome(tmp_path, monkeypatch):
+    bus = make_bus(tmp_path)
+    flaky = hung_prep_that_leaves_scratch_held(monkeypatch, failures=3)
+    monkeypatch.setattr(ob, "ROUTE_SCRATCH_REMOVE_PAUSE", 0)
+    with pytest.raises(ob.Unknown) as caught:
+        ob.make_exercise_scratch(bus, tmp_path / "scratch")
+    assert caught.value.code == "ROUTE_TIMEOUT", caught.value
+    assert flaky.calls == 4, "the removal must retry the sharing violation until it succeeds"
+    assert list((tmp_path / "scratch").iterdir()) == [], "the half-made scratch directory was not removed"
+
+
+def test_a_persistent_sharing_violation_on_scratch_removal_is_a_typed_outcome_naming_the_leftover(tmp_path, monkeypatch):
+    bus = make_bus(tmp_path)
+    hung_prep_that_leaves_scratch_held(monkeypatch, failures=None)
+    monkeypatch.setattr(ob, "ROUTE_SCRATCH_REMOVE_PAUSE", 0)
+    monkeypatch.setattr(ob, "ROUTE_SCRATCH_REMOVE_DEADLINE", 0.3)
+    with pytest.raises(ob.Unknown) as caught:                            # never a bare PermissionError
+        ob.make_exercise_scratch(bus, tmp_path / "scratch")
+    assert caught.value.code == "ROUTE_TIMEOUT", caught.value            # the original outcome is kept ...
+    leftover = list((tmp_path / "scratch").iterdir())
+    assert len(leftover) == 1 and str(leftover[0]) in caught.value.detail, (leftover, caught.value.detail)   # ... and names the leftover
+
+
+def test_remove_exercise_scratch_with_a_persistent_sharing_violation_raises_the_distinct_typed_code(tmp_path, monkeypatch):
+    root = tmp_path / "scratch"
+    base = root / (ob.ROUTE_SCRATCH_PREFIX + "held")
+    base.mkdir(parents=True)
+    monkeypatch.setattr(ob.shutil, "rmtree", FlakyScratchRemoval(shutil.rmtree, None))
+    monkeypatch.setattr(ob, "ROUTE_SCRATCH_REMOVE_PAUSE", 0)
+    monkeypatch.setattr(ob, "ROUTE_SCRATCH_REMOVE_DEADLINE", 0.3)
+    with pytest.raises(ob.Unknown) as caught:
+        ob.remove_exercise_scratch(base, root)
+    assert caught.value.code == "EXERCISE_SCRATCH_NOT_REMOVED" and str(base) in caught.value.detail, caught.value
+
+
+@pytest.mark.skipif(os.name != "nt", reason="the Job Object exit wait is Windows-only")
+def test_a_timeout_returns_only_after_the_preparations_tree_has_exited(tmp_path, monkeypatch):
+    script = tmp_path / "spawn.py"
+    script.write_text(SPAWN, encoding="utf-8")
+    pidfile = tmp_path / "pids.txt"
+    prep_stand_in(monkeypatch, script, str(pidfile))
+    clone = prep_clone_dir(tmp_path)
+    try:
+        with pytest.raises(ob.Unknown) as caught:
+            ob.run_isolated_git("git", ["clone"], clone.parent, clone, timeout=2)
+        assert caught.value.code == "ROUTE_TIMEOUT"
+        parent, child = (int(p) for p in pidfile.read_text().split())
+        assert not pid_alive(parent) and not pid_alive(child), "the call returned while the killed tree was still running"   # no polling
+    finally:
+        if pidfile.exists():
+            for pid in pidfile.read_text().split():
+                force_kill(int(pid))
+
+
 def stale_bus_pair(tmp_path: Path, name: str, behind: bool) -> Path:
     """A bus clone of its own upstream, `behind` commits behind it (after a fetch) or not."""
     root = tmp_path / name
