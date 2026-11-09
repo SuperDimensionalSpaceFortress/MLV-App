@@ -3887,11 +3887,13 @@ def _is_absent(path: str | os.PathLike) -> bool:
 
 
 def _resolves_inside(path: str | os.PathLike, base: str | os.PathLike | None) -> bool:
-    """True when `path` really lives under `base` once every link and junction on it is resolved (no base: nothing to check)."""
+    """True when `path` really lives under `base` once every link and junction on `path` is resolved (no base: nothing to
+    check). `base` is NOT resolved again: the caller passes the real path it pinned, so a base reached through a swapped
+    ancestor cannot redefine "inside"."""
     if base is None:
         return True
     try:
-        real, root = os.path.normcase(os.path.realpath(path)), os.path.normcase(os.path.realpath(base))
+        real, root = os.path.normcase(os.path.realpath(path)), os.path.normcase(os.path.abspath(base))
         return os.path.commonpath([real, root]) == root
     except (OSError, ValueError):
         return False
@@ -3901,59 +3903,86 @@ def _safe_to_touch(path: str | os.PathLike, base: str | os.PathLike | None) -> b
     return not _inside_a_link(path, base) and _resolves_inside(path, base)
 
 
-def _writable_retry(func, path, _exc, base: str | os.PathLike | None = None) -> None:
+def _writable_retry(func, path, _exc, base: str | os.PathLike | None = None, deadline: float | None = None) -> None:
     """rmtree error hook: git object files are read-only on Windows; make the entry writable and retry once. It never
-    acts on a link or on anything reached through one (up to `base`): chmod would follow it to a target outside the scratch.
+    acts on a link or on anything reached through one (up to `base`): chmod would follow it to a target outside the scratch,
+    and it starts neither act after `deadline` (a monotonic time; the inspections themselves take time).
     The path is judged again right before each of the two acts (chmod, retry), so a directory swapped for a junction after
     the first look is not followed. Python offers no handle-based chmod or unlink on Windows, so the instant between the last
     look and the act cannot be closed here; closing it needs a process able to write inside the private scratch root."""
-    if not _safe_to_touch(path, base):
+    def late() -> bool:
+        return deadline is not None and time.monotonic() > deadline
+    if late() or not _safe_to_touch(path, base) or late():
         return                                                          # left for rmtree's own failure to be reported; nothing is changed
     try:
         os.chmod(path, stat.S_IWRITE)
-        if _safe_to_touch(path, base):
+        if _safe_to_touch(path, base) and not late():
             func(path)
     except FileNotFoundError:
         pass                                                            # the entry went away between the failure and this retry: it is removed
 
 
+def _scratch_state(base: pathlib.Path, scratch_root: pathlib.Path) -> str:
+    """'ok' (ours: directly under the pinned real `scratch_root`, the run's prefix, a real directory, no symlink and no
+    junction), 'absent' (confirmed gone), 'unreadable' (its metadata cannot be read: unknown, never gone) or 'foreign'."""
+    try:
+        if (os.path.normcase(os.path.realpath(scratch_root)) != os.path.normcase(str(scratch_root))   # the pinned root was swapped
+                or os.path.normcase(os.path.realpath(base.parent)) != os.path.normcase(str(scratch_root))
+                or not base.name.startswith(ROUTE_SCRATCH_PREFIX)):
+            return "foreign"
+        info = os.lstat(base)
+    except (FileNotFoundError, NotADirectoryError):
+        return "absent"
+    except (OSError, ValueError):
+        return "unreadable"
+    if (stat.S_ISLNK(info.st_mode) or getattr(info, "st_file_attributes", 0) & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+            or not stat.S_ISDIR(info.st_mode)):
+        return "foreign"
+    return "ok"
+
+
 def _scratch_guard_holds(base: pathlib.Path, scratch_root: pathlib.Path) -> bool:
-    """The whole guard for removing `base`: directly under `scratch_root`, the run's prefix, a real directory (no symlink,
-    no junction). Judged afresh before every removal attempt: it can change between attempts."""
-    return (base.parent.resolve() == scratch_root.resolve() and base.name.startswith(ROUTE_SCRATCH_PREFIX)
-            and not _is_link_or_junction(base) and base.is_dir())
+    """The whole guard for removing `base`. Judged afresh before every removal attempt: it can change between attempts."""
+    return _scratch_state(base, scratch_root) == "ok"
 
 
 def remove_exercise_scratch(base: pathlib.Path, scratch_root: pathlib.Path) -> None:
     """Remove the scratch directory THIS run made, by name: it must sit directly under `scratch_root`, carry the
     run's prefix and be a real directory (not a link or junction). Anything else is left alone. The guard is re-run before
-    EVERY attempt: a scratch swapped for a link while a retry paused is never removed or made writable through."""
-    if not _scratch_guard_holds(base, scratch_root):
+    EVERY attempt, against the scratch root's real path pinned at the start: a scratch (or its root) swapped for a link while
+    a retry paused is never removed or made writable through. A scratch whose metadata cannot be read is a typed outcome."""
+    root = pathlib.Path(os.path.realpath(scratch_root))                 # pinned: every later look compares against THIS, never a fresh resolve
+    work = root / base.name                                             # what is removed; `base` only names it in messages
+    if os.path.normcase(os.path.realpath(base.parent)) != os.path.normcase(str(root)):
+        return                                                          # not directly under the scratch root: not ours
+    if not _scratch_guard_holds(work, root):
+        if _scratch_state(work, root) == "unreadable":
+            raise Unknown("EXERCISE_SCRATCH_NOT_REMOVED", f"{base} cannot be inspected and is left behind")
         return
     deadline = time.monotonic() + ROUTE_SCRATCH_REMOVE_DEADLINE
     failure: OSError
     first = True
     while True:
         if not first:
-            if _is_absent(base):
+            if _is_absent(work):
                 return                                                  # confirmed gone (an unreadable scratch is not gone)
-            if not _scratch_guard_holds(base, scratch_root):
+            if not _scratch_guard_holds(work, root):
                 raise Unknown("EXERCISE_SCRATCH_NOT_REMOVED",
-                              f"{base} was replaced by a link or another directory, or cannot be inspected, during the removal; "
-                              f"it is left alone and behind: {failure}") from failure
+                              f"{base} was replaced by a link or another directory (or its root was), or cannot be inspected, during the "
+                              f"removal; it is left alone and behind: {failure}") from failure
             if time.monotonic() > deadline:                             # the guard itself took time: no attempt starts after the deadline
                 break
         first = False
         try:
             if sys.version_info >= (3, 12):
-                shutil.rmtree(base, onexc=lambda f, p, e: _writable_retry(f, p, e, base))
+                shutil.rmtree(work, onexc=lambda f, p, e: _writable_retry(f, p, e, work, deadline))
             else:
-                shutil.rmtree(base, onerror=lambda f, p, e: _writable_retry(f, p, e, base))
-            if _is_absent(base):
+                shutil.rmtree(work, onerror=lambda f, p, e: _writable_retry(f, p, e, work, deadline))
+            if _is_absent(work):
                 return
             failure = OSError(f"{base} still exists or cannot be inspected after the removal returned")   # a refused entry is a failure
         except OSError as e:                                           # a just-killed process still holds it (sharing violation 13/32)
-            if isinstance(e, FileNotFoundError) and _is_absent(base):
+            if isinstance(e, FileNotFoundError) and _is_absent(work):
                 return                                                  # the scratch itself is gone; a missing CHILD is only a race, retried
             failure = e
         # No attempt starts after the deadline: not when the pause would cross it; the loop top re-checks after the pause AND the guard.

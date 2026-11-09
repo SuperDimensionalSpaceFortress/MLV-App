@@ -2699,8 +2699,11 @@ def make_directory_link(link: Path, target: Path) -> str:
         os.symlink(target, link, target_is_directory=True)
         return "symlink"
     except (OSError, NotImplementedError):
-        import _winapi
-        _winapi.CreateJunction(str(target), str(link))
+        try:
+            import _winapi
+            _winapi.CreateJunction(str(target), str(link))
+        except (ImportError, AttributeError, OSError):
+            pytest.skip("this host allows neither a directory symlink nor a junction")
         return "junction"
 
 
@@ -2869,6 +2872,79 @@ def test_an_unreadable_scratch_root_is_never_reported_as_absent(tmp_path, monkey
     with pytest.raises(ob.Unknown) as caught:                            # success here would be a silent leak
         ob.remove_exercise_scratch(base, root)
     assert caught.value.code == "EXERCISE_SCRATCH_NOT_REMOVED", caught.value
+
+
+# Adversary pass r3 (head b5867b19): A1 unreadable from the very first look; A2 the scratch ROOT swapped for a junction during the
+# pause; A3 the error hook itself starts no act after the deadline.
+
+def test_a_scratch_unreadable_from_the_first_look_is_a_typed_outcome_naming_the_leftover(tmp_path, monkeypatch):
+    root = tmp_path / "scratch"
+    base = root / (ob.ROUTE_SCRATCH_PREFIX + "unreadable-first")
+    base.mkdir(parents=True)
+    real_lstat = os.lstat
+
+    def lstat(path, *a, **k):
+        if os.path.normcase(str(path)) == os.path.normcase(str(base)):
+            raise PermissionError(13, "Access is denied", str(path))
+        return real_lstat(path, *a, **k)
+
+    monkeypatch.setattr(ob.os, "lstat", lstat)
+    with pytest.raises(ob.Unknown) as caught:
+        ob.remove_exercise_scratch(base, root)
+    assert caught.value.code == "EXERCISE_SCRATCH_NOT_REMOVED" and str(base) in caught.value.detail, caught.value
+
+
+def test_a_scratch_root_swapped_for_a_junction_during_the_retry_pause_is_never_removed_through(tmp_path, monkeypatch):
+    import types
+    root = tmp_path / "scratch"
+    base = root / (ob.ROUTE_SCRATCH_PREFIX + "rootswap")
+    base.mkdir(parents=True)
+    outside = tmp_path / "outside"
+    victim_dir = outside / base.name
+    victim_dir.mkdir(parents=True)
+    victim = victim_dir / "readonly.txt"
+    victim.write_text("outside", encoding="utf-8")
+    import stat as stat_module
+    os.chmod(victim, stat_module.S_IREAD)
+    monkeypatch.setattr(ob.shutil, "rmtree", FlakyScratchRemoval(shutil.rmtree, 1))
+    kinds: list[str] = []
+    real_time = ob.time
+
+    def pause(seconds):
+        if not kinds:
+            os.rename(root, tmp_path / "scratch-saved")                  # the whole root moves away and a junction takes its name
+            kinds.append(make_directory_link(root, outside))
+
+    monkeypatch.setattr(ob, "time", types.SimpleNamespace(monotonic=real_time.monotonic, sleep=pause))
+    try:
+        with pytest.raises(ob.Unknown) as caught:
+            ob.remove_exercise_scratch(base, root)
+        assert kinds and caught.value.code == "EXERCISE_SCRATCH_NOT_REMOVED", (kinds, caught.value)
+        assert victim.exists() and not os.access(victim, os.W_OK), "the outside scratch-named directory was reached"
+    finally:
+        os.chmod(victim, stat_module.S_IREAD | stat_module.S_IWRITE)
+
+
+def test_the_error_hook_starts_neither_act_after_the_deadline_when_its_own_inspection_is_slow(tmp_path, monkeypatch):
+    import types
+    base = tmp_path / "scratch" / (ob.ROUTE_SCRATCH_PREFIX + "hookdeadline")
+    base.mkdir(parents=True)
+    victim = base / "ro.txt"
+    victim.write_text("x", encoding="utf-8")
+    clock = [14.9]
+    real_safe = ob._safe_to_touch
+
+    def slow_safe(path, b):                                              # each inspection takes 0.2 s
+        clock[0] += 0.2
+        return real_safe(path, b)
+
+    chmods: list[str] = []
+    retried: list[str] = []
+    monkeypatch.setattr(ob, "_safe_to_touch", slow_safe)
+    monkeypatch.setattr(ob, "time", types.SimpleNamespace(monotonic=lambda: clock[0], sleep=lambda s: None))
+    monkeypatch.setattr(ob.os, "chmod", lambda p, *a, **k: chmods.append(str(p)))
+    ob._writable_retry(lambda p: retried.append(p), str(victim), PermissionError(13, "denied"), base, 15.0)
+    assert chmods == [] and retried == [], (chmods, retried, clock)
 
 
 @pytest.mark.skipif(os.name != "nt", reason="the Job Object exit wait is Windows-only")
