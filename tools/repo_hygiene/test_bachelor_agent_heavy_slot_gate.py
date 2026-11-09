@@ -40,11 +40,12 @@ ROOT = Path(__file__).resolve().parents[2]
 AGENT = ROOT / "tools" / "profiling" / "bachelor" / "ultra-magnus-agent.ps1"
 FIFO_TEST = ROOT / "tools" / "testing" / "test-ultra-magnus-agent-heavy-slot-fifo.ps1"
 PWSH = shutil.which("pwsh")
-# Hang guard for the -UnitOnly run: it must stay above the sum of the fifo script's own per-suite bounds (400 s + 120 s), their two
+# Hang guard for the -UnitOnly run: it must stay above the sum of the fifo script's own per-suite bounds (600 s + 120 s), their two
 # bounded taskkills (2 x 60 s), their captured-output reads and capture cleanup (2 x (2 x 10 s + 10 s), sol r6 B1/B2) and its ~30 s of
-# unit cases (730 s), so a hung suite fails by its own name there first (a test pins the sum, derived from the script's own constants).
-# Measured 349 s locally, 282 s on the hosted runner.
-UNIT_RUN_TIMEOUT_SEC = 800
+# unit cases (930 s), so a hung suite fails by its own name there first (a test pins the sum, derived from the script's own constants).
+# Measured 349 s locally, 282 s on the hosted runner. QUIET-LEASE-FILE-BOUND-HEADROOM-1: the quiet-lease bound went 400 -> 600 s
+# (the guard 800 -> 1000 s, a 70 s margin over the 930 s worst case as before) after the file ran 401 s and 414 s on #781's heads.
+UNIT_RUN_TIMEOUT_SEC = 1000
 FIFO_UNIT_CASES_SEC = 30  # the fifo script's own unit cases, before its two bounded sub-suites
 # run_bounded's cleanup after a timeout (_kill_tree). One source of truth: the helper waits with exactly these bounds and the
 # regressions derive their elapsed ceiling from them, so any cleanup the helper allows passes and no other number is hand-tuned.
