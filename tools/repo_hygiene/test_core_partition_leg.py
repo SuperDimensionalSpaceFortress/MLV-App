@@ -1489,6 +1489,8 @@ if ((Get-Command Test-CorePartitionMeasuredApp).Parameters.ContainsKey('Measured
     $exitCases['drain-only-instance'][0].instances = @(($i5000d | ConvertFrom-Json), ((New-CpInst 6000 21 21.1 22.9 23.1) | ConvertFrom-Json))
     $exitCases['started-before-exit-stamp-control'][0] = New-CpStepRecord $i5000d 0
     $exitCases['started-before-exit-stamp-control'][0].instances = @(($i5000d | ConvertFrom-Json), ((New-CpInst 6000 20.0 20.15 22.9 23.1) | ConvertFrom-Json))
+    $exitCases['adversary-9a2372b7-A1-early-exit'] = @((New-CpStepRecord $i5000d 0), 19.21)
+    $exitCases['adversary-9a2372b7-A1-early-exit'][0].instances = @(($i5000d | ConvertFrom-Json), ((New-CpInst 6000 19.95 20.15 23.9 24.1) | ConvertFrom-Json))
     foreach ($k in $exitCases.Keys) {
         $x = $(if ($null -eq $exitCases[$k][1]) { [int64]0 } else { $L + [int64]($exitCases[$k][1] * 1e7) })
         $sc = Get-CorePartitionScalars $exitCases[$k][0] $feed 4095 1044480 8 $w $null $false -MeasuredPid 5000 -MeasuredStartTicks ($L + 40000000) -MeasuredEndTicks ($L + 240000000) -ClockSkewMs 0 -MeasuredExitTicks $x
@@ -2023,20 +2025,24 @@ class CorePartitionPureHelperTests(unittest.TestCase):
                 self.assertEqual(control[:6], [True, True, True, "0x00FFF", 2.0, 4000.0], f"its evidence is credited: {control}")
 
     def test_the_exit_side_check_uses_the_runners_termination_stamp_and_keeps_every_r1_refusal(self) -> None:
-        """r2 (Dot pr-780 S1): process.exitObservedAtUtc (when the runner's wait confirmed the exit) replaces endedAtUtc (stamped after the stream
-        drain) in the exit-side check only, with the same 2 s tolerance and $slack; the verdict names the stamp it used. A stamp outside the runner's
-        launch..end window is refused, typed."""
+        """r2 (Dot pr-780 S1): the runner's confirmed exit (endedAtUtc - process.exitToEndMs, a monotonic drain duration) replaces endedAtUtc
+        (stamped after the stream drain) in the exit-side check only, with the same 2 s tolerance and $slack; the verdict names what it used. An
+        exit outside the runner's launch..end window is refused, typed. The overlap test keeps endedAtUtc (adversary 9a2372b7 A1)."""
         s = self.r["stepExit"]
         self.assertIsInstance(s, dict, "Test-CorePartitionMeasuredApp takes no runner termination stamp (-MeasuredExitTicks)")
         refused = {
-            "predecessor-clock-step-with-exit-stamp": ("measured-app-gone-before-runner-exit", "exitObservedAtUtc"),
+            "predecessor-clock-step-with-exit-stamp": ("measured-app-gone-before-runner-exit", "exitToEndMs"),
             "successor-with-exit-stamp": ("measured-app-seen-after-runner-launch", ""),
-            "gone-before-tolerance-with-exit-stamp": ("measured-app-gone-before-runner-exit", "exitObservedAtUtc"),
-            "gone-before-exit-stamp-tolerance": ("measured-app-gone-before-runner-exit", "exitObservedAtUtc"),
+            "gone-before-tolerance-with-exit-stamp": ("measured-app-gone-before-runner-exit", "exitToEndMs"),
+            "gone-before-exit-stamp-tolerance": ("measured-app-gone-before-runner-exit", "exitToEndMs"),
             "drained-older-receipt": ("measured-app-gone-before-runner-exit", "endedAtUtc"),
-            "exit-stamp-after-end": ("measured-exit-stamp-inconsistent", "exitObservedAtUtc"),
-            "exit-stamp-before-launch": ("measured-exit-stamp-inconsistent", "exitObservedAtUtc"),
+            "exit-stamp-after-end": ("measured-exit-stamp-inconsistent", "exitToEndMs"),
+            "exit-stamp-before-launch": ("measured-exit-stamp-inconsistent", "exitToEndMs"),
             "started-before-exit-stamp-control": ("same-path-instance-overlap", ""),
+            # adversary 9a2372b7 A1 (literal): 6000 started +19.95 s, before the app's real exit (+20 s); an exit moved to +19.21 s must not hide it
+            "adversary-9a2372b7-A1-early-exit": ("same-path-instance-overlap", ""),
+            # adversary 6c16f4de advisory A1 (left open, the conservative side): an instance started during the drain is still refused as an overlap
+            "drain-only-instance": ("same-path-instance-overlap", ""),
         }
         for case, (code, stamp) in refused.items():
             with self.subTest(case=case):
@@ -2044,12 +2050,10 @@ class CorePartitionPureHelperTests(unittest.TestCase):
                 self.assertEqual([verdict, used], [code, stamp], s[case])
                 self.assertEqual([observed, gbps], [None, None], f"its evidence was credited: {why}")
                 self.assertIn(f"appAffinityObserved={code}", why)
-        # adversary r2 (6c16f4de) advisory A1: the overlap test ends the app's life at the same termination stamp, so an instance started during
-        # the drain, after the app's exit, is not an overlap
-        for case in ("drained-bound-on-exit-stamp", "complete-interval-control-with-exit-stamp", "drain-only-instance"):
+        for case in ("drained-bound-on-exit-stamp", "complete-interval-control-with-exit-stamp"):
             with self.subTest(case=case):
                 observed, gbps, why, verdict, used = s[case]
-                self.assertEqual([observed, gbps, verdict, used], ["0x00FFF", 2.0, "", "exitObservedAtUtc"], s[case])
+                self.assertEqual([observed, gbps, verdict, used], ["0x00FFF", 2.0, "", "exitToEndMs"], s[case])
 
     def test_a_helper_that_never_started_publishes_no_package_feed_value_through_the_job_cleanup(self) -> None:
         """r8 A3 (adversary r7 6fac125a A3) through the job's own not-ready rule, cleanup block and scalar line: no helper object, fresh feed rows."""
@@ -2352,7 +2356,7 @@ function Get-Slice([string]$Text, [string]$From, [string]$To) {
     $j = $Text.IndexOf($To, $i); if ($j -lt 0) { throw "slice end not found: $To" }
     $Text.Substring($i, $j + $To.Length - $i)
 }
-$runnerFinalize = Get-Slice $runnerText '$processBoundary = Wait-GuiSmokeProcessBounded' '$endUtc = [datetime]::UtcNow'
+$runnerFinalize = Get-Slice $runnerText '$processBoundary = Wait-GuiSmokeProcessBounded' '$endTimestamp = [System.Diagnostics.Stopwatch]::GetTimestamp()'
 $rpI = $runnerText.IndexOf("`n    process = [pscustomobject]@{`n"); if ($rpI -lt 0) { throw 'runner process receipt block not found' }
 $rpJ = $runnerText.IndexOf("`n    }`n", $rpI + 1)
 $runnerProcess = $runnerText.Substring($rpI + 15, $rpJ + 6 - ($rpI + 15))
@@ -2371,7 +2375,7 @@ foreach ($case in @(@('drain-held', 3.5, $false), @('drain-held-older-receipt', 
     $hostLoadFinalizeTimeoutMs = 60000; $captureBindingFailures = @()
     . ([scriptblock]::Create($runnerFinalize))
     $receiptProcess = . ([scriptblock]::Create($runnerProcess))
-    if ($older) { $receiptProcess.PSObject.Properties.Remove('exitObservedAtUtc') }
+    if ($older) { $receiptProcess.PSObject.Properties.Remove('exitObservedAtUtc'); $receiptProcess.PSObject.Properties.Remove('exitToEndMs') }
     $resultPath = Join-Path $env:CP_TMP "$name.result.json"
     [IO.File]::WriteAllText($resultPath, ([ordered]@{ process = $receiptProcess } | ConvertTo-Json -Depth 6))
     $appStart = $process.StartTime.ToUniversalTime().Ticks; $appExit = $process.ExitTime.ToUniversalTime().Ticks
@@ -2385,9 +2389,9 @@ foreach ($case in @(@('drain-held', 3.5, $false), @('drain-held-older-receipt', 
     $out[$name] = [ordered]@{
         why = [string]$cpAppVerdict.why; exitStamp = $cpAppVerdict.exitStamp; errors = @($corePartitionErrors)
         terminationConfirmed = [bool]$processBoundary.terminationConfirmed; stdoutDrained = [bool]$processBoundary.stdoutDrained; stdout = [string]$processBoundary.stdout
-        receiptHasExitStamp = ($null -ne $receiptProcess.PSObject.Properties['exitObservedAtUtc'] -and $null -ne $receiptProcess.exitObservedAtUtc)
+        receiptHasExitStamp = ($null -ne $receiptProcess.PSObject.Properties['exitToEndMs'] -and $null -ne $receiptProcess.exitToEndMs)
         endAfterExitMs = [int](($endUtc.Ticks - $appExit) / 1e4)
-        exitObservedAfterExitMs = $(if ($null -ne $processBoundary.PSObject.Properties['exitObservedAtUtc'] -and $null -ne $processBoundary.exitObservedAtUtc) { [int]((([datetime]$processBoundary.exitObservedAtUtc).ToUniversalTime().Ticks - $appExit) / 1e4) } else { $null })
+        exitObservedAfterExitMs = $(if ($corePartitionMeasuredExitTicks -ne 0) { [int](($corePartitionMeasuredExitTicks - $appExit) / 1e4) } else { $null })
     }
 }
 $out | ConvertTo-Json -Depth 6 -Compress
@@ -2428,7 +2432,7 @@ class CorePartitionRunnerExitStampTests(unittest.TestCase):
         self.assertIsNotNone(c["exitObservedAfterExitMs"], c)
         self.assertLess(c["exitObservedAfterExitMs"], 1000, f"the termination stamp is not the moment the runner saw the exit: {c}")
         self.assertEqual(c["why"], "", f"the runner's own app, observed across its life, was refused because cleanup outlasted the tolerance: {c}")
-        self.assertEqual(c["exitStamp"], "exitObservedAtUtc", c)
+        self.assertEqual(c["exitStamp"], "exitToEndMs", c)
 
     def test_an_older_receipt_without_the_termination_stamp_falls_back_to_endedAtUtc_and_says_so(self) -> None:
         c = self.r["drain-held-older-receipt"]

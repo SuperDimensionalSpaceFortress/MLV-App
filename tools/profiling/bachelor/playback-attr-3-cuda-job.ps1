@@ -5196,10 +5196,10 @@ function Test-CorePartitionHelperRecord($Record, $LaunchPid, $ExitCode, [bool]$M
 # both the helper's polls (its record's clockSkewMaxMs) and the job's own reads ($ClockSkewMs, Get-CorePartitionClockSkewMs); over it the verdict is
 # clock-discontinuity, and a gap nobody recorded is clock-unverified. Process start times are the OS's wall-clock stamps (a step before the helper
 # started is not seen here: LIMIT, CORE-PARTITION-PROCESS-START-EVENTS-1).
-# r2 (Dot pr-780 S1): $MeasuredExitTicks is the runner's process.exitObservedAtUtc, when its WaitForExit confirmed the exit; $MeasuredEndTicks
-# (endedAtUtc) is stamped only after the stdout/stderr drain, which can run seconds past the exit. The exit-side interval check and the end of the
-# app's life in the overlap test use it (candidate selection keeps endedAtUtc); 0 (an older receipt without it) falls back to endedAtUtc. Which
-# stamp was used is returned as exitStamp with the exit-side check's verdicts and the binding.
+# r2 (Dot pr-780 S1): $MeasuredExitTicks is the runner's confirmed exit, endedAtUtc - process.exitToEndMs (a monotonic duration: adversary 9a2372b7
+# A1, no second wall-clock reading); $MeasuredEndTicks (endedAtUtc) is stamped only after the stdout/stderr drain, which can run seconds past the
+# exit. Only the exit-side interval check uses it (candidate selection and the overlap test keep endedAtUtc); 0 (an older receipt without it)
+# falls back to endedAtUtc. Which one was used is returned as exitStamp with that check's verdicts and the binding.
 function Test-CorePartitionMeasuredApp($Helper, [int64]$MeasuredPid, [int64]$MeasuredStartTicks, [int64]$MeasuredEndTicks, $ClockSkewMs = 0, [int64]$MeasuredExitTicks = 0) {
     if ($MeasuredPid -le 0) { return @{ why = 'measured-pid-unknown' } }
     if ($MeasuredStartTicks -le 0 -or $MeasuredEndTicks -lt $MeasuredStartTicks) { return @{ why = 'measured-window-unknown' } }
@@ -5249,22 +5249,23 @@ function Test-CorePartitionMeasuredApp($Helper, [int64]$MeasuredPid, [int64]$Mea
     # runner's app never listed (listed, it is a second candidate, measured-pid-ambiguous, or its gone key makes the successor unidentified); an app whose
     # whole life fell between two polls in a runner window shorter than the two tolerances is the residual (LIMIT A3, CORE-PARTITION-PROCESS-START-EVENTS-1).
     if ($a.first - $slack -gt $MeasuredStartTicks + 20000000) { return @{ why = 'measured-app-seen-after-runner-launch' } }
-    # r2 (Dot pr-780 S1): the runner's exit is the moment its wait confirmed termination (exitObservedAtUtc), not endedAtUtc, which also covers the
-    # stream drain after it; an older receipt without it falls back to endedAtUtc. A termination stamp outside the runner's own launch..end window
-    # (each side widened by $slack) is not the runner's exit and proves nothing: measured-exit-stamp-inconsistent.
+    # r2 (Dot pr-780 S1): the runner's exit is the moment its wait confirmed termination (endedAtUtc - exitToEndMs), not endedAtUtc, which also
+    # covers the stream drain after it; an older receipt without it falls back to endedAtUtc. An exit outside the runner's own launch..end window
+    # (a negative or over-long drain) is not the runner's exit and proves nothing: measured-exit-stamp-inconsistent.
     $exitStamp = 'endedAtUtc'; $exitTicks = $MeasuredEndTicks
     if ($MeasuredExitTicks -ne 0) {
-        if ($MeasuredExitTicks + $slack -lt $MeasuredStartTicks -or $MeasuredExitTicks - $slack -gt $MeasuredEndTicks) { return @{ why = 'measured-exit-stamp-inconsistent'; exitStamp = 'exitObservedAtUtc' } }
-        $exitStamp = 'exitObservedAtUtc'; $exitTicks = $MeasuredExitTicks
+        if ($MeasuredExitTicks -lt $MeasuredStartTicks -or $MeasuredExitTicks -gt $MeasuredEndTicks) { return @{ why = 'measured-exit-stamp-inconsistent'; exitStamp = 'exitToEndMs' } }
+        $exitStamp = 'exitToEndMs'; $exitTicks = $MeasuredExitTicks
     }
     if ($null -ne $a.gone -and $a.gone + $slack -lt $exitTicks - 20000000) { return @{ why = 'measured-app-gone-before-runner-exit'; exitStamp = $exitStamp } }
     foreach ($o in $all) {
         if ([object]::ReferenceEquals($o, $a)) { continue }
         $oStart = if ($null -ne $o.start) { $o.start - $slack } else { [int64]::MinValue }
         $oEnd = if ($null -ne $o.gone) { $o.gone + $slack } else { [int64]::MaxValue }
-        # r2 (adversary 6c16f4de advisory A1): the app is alive until its exit ($exitTicks, the runner's termination stamp when it has one), not
-        # through the stream drain after it; a process that started during the drain was never alive with it
-        if ($oStart -le $exitTicks -and $aStart -le $oEnd) { return @{ why = 'same-path-instance-overlap' } }
+        # r2 fix 2 (adversary 9a2372b7 A1): the app's life still ends at endedAtUtc here, after the drain, never at the derived exit. Only the
+        # refusal above is relaxed by the drain; an overlap is never cleared by it (a process started during the drain is refused as an overlap:
+        # the conservative side, adversary 6c16f4de advisory A1, left open).
+        if ($oStart -le $MeasuredEndTicks -and $aStart -le $oEnd) { return @{ why = 'same-path-instance-overlap' } }
         # r10 B3: on the monotonic clock alone, each process is proven alive from its first sighting (firstMs) to its last alive poll (aliveMs); two
         # such spans that intersect were alive together, whatever the wall-clock stamps say
         if ($o.firstMs -le $o.aliveMs -and $a.firstMs -le $a.aliveMs -and $o.firstMs -le $a.aliveMs -and $a.firstMs -le $o.aliveMs) { return @{ why = 'same-path-instance-overlap' } }
@@ -6635,14 +6636,18 @@ try {
     $corePartitionFeedEnd = Read-CorePartitionFeedSince $corePartitionFeedPath ([int64]$corePartitionFeedStart.length) ([string]$corePartitionFeedStart.before)
     # sol r4 CP-02: the measured app is the process the smoke runner launched (its result.json process.id); 0 when unknown, which binds nothing.
     # Its launch..exit window (process.startedAtUtc / endedAtUtc) binds the pid to that process, not a later one reusing it (adversary r5 A3).
-    # r2 (Dot pr-780 S1): and process.exitObservedAtUtc, when the runner's wait confirmed the exit (before its stream drain); 0 when the receipt has
-    # none (an older runner), and the exit-side check then falls back to endedAtUtc.
-    $corePartitionMeasuredPid = [int64]0; $corePartitionMeasuredStartTicks = [int64]0; $corePartitionMeasuredEndTicks = [int64]0; $corePartitionMeasuredExitTicks = [int64]0
+    # r2 (Dot pr-780 S1): and the confirmed exit, endedAtUtc - process.exitToEndMs (the runner's stream drain after its wait confirmed the exit,
+    # measured on the monotonic clock; adversary 9a2372b7 A1: never the wall-clock exitObservedAtUtc); 0 when the receipt has no number there (an
+    # older runner), and the exit-side check then falls back to endedAtUtc.
+    $corePartitionMeasuredPid = [int64]0; $corePartitionMeasuredStartTicks = [int64]0; $corePartitionMeasuredEndTicks = [int64]0; $corePartitionMeasuredExitTicks = [int64]0; $corePartitionMeasuredExitToEndMs = $null
     try {
         $cpRunnerProcess = ([IO.File]::ReadAllText($resultPath) | ConvertFrom-Json).process
         if ($null -ne $cpRunnerProcess -and $null -ne $cpRunnerProcess.id) { $corePartitionMeasuredPid = [int64]$cpRunnerProcess.id }
         if ($null -ne $cpRunnerProcess) { $corePartitionMeasuredStartTicks = ConvertTo-CorePartitionUtcTicks $cpRunnerProcess.startedAtUtc; $corePartitionMeasuredEndTicks = ConvertTo-CorePartitionUtcTicks $cpRunnerProcess.endedAtUtc }
-        if ($null -ne $cpRunnerProcess -and $null -ne $cpRunnerProcess.PSObject.Properties['exitObservedAtUtc']) { $corePartitionMeasuredExitTicks = ConvertTo-CorePartitionUtcTicks $cpRunnerProcess.exitObservedAtUtc }
+        if ($null -ne $cpRunnerProcess -and $null -ne $cpRunnerProcess.PSObject.Properties['exitToEndMs'] -and $corePartitionMeasuredEndTicks -gt 0) {
+            $corePartitionMeasuredExitToEndMs = (ConvertFrom-CorePartitionNumber $cpRunnerProcess.exitToEndMs 'double').value
+            if ($null -ne $corePartitionMeasuredExitToEndMs) { $corePartitionMeasuredExitTicks = $corePartitionMeasuredEndTicks - [int64][math]::Floor($corePartitionMeasuredExitToEndMs * 1e4) }
+        }
     } catch { $corePartitionErrors.Add("measured-pid: $([string]$_.Exception.Message)") }
     if ($null -ne $corePartitionHelper) {
         # The pid goes to the helper BEFORE the stop file, so the helper binds its record to it as it ends.
@@ -6724,7 +6729,7 @@ try {
             # r9 (Dot 4): the samples and load are clipped to the helper's last poll that saw the app alive, so the window's end is known to within
             # the gap between that poll and the one that saw it gone (adversary r9 5592421d A2: the measured gap, nominally one 200 ms poll interval,
             # not a constant; null when the app evidence is refused): endpointErrorBoundMs. LIMIT, CORE-PARTITION-PROCESS-START-EVENTS-1.
-            measured = [ordered]@{ pid = $corePartitionMeasuredPid; startUtcTicks = $corePartitionMeasuredStartTicks; endUtcTicks = $corePartitionMeasuredEndTicks; exitObservedUtcTicks = $corePartitionMeasuredExitTicks; exitStamp = $cpAppVerdict.exitStamp; jobClockSkewMs = $corePartitionJobClockSkewMs; endpointErrorBoundMs = $cpAppVerdict.endpointMs }
+            measured = [ordered]@{ pid = $corePartitionMeasuredPid; startUtcTicks = $corePartitionMeasuredStartTicks; endUtcTicks = $corePartitionMeasuredEndTicks; exitToEndMs = $corePartitionMeasuredExitToEndMs; exitUtcTicks = $corePartitionMeasuredExitTicks; exitStamp = $cpAppVerdict.exitStamp; jobClockSkewMs = $corePartitionJobClockSkewMs; endpointErrorBoundMs = $cpAppVerdict.endpointMs }
             measuredApp = $cpAppVerdict.why
             helper = $corePartitionHelperRecord
             feed = [ordered]@{

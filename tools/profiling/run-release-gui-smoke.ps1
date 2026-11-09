@@ -2009,6 +2009,9 @@ $stderr = $processBoundary.stderr
 $processExitCode = [int]$processBoundary.exitCode
 $captureBindingFailures += @($processBoundary.failures)
 $endUtc = [datetime]::UtcNow
+# CORE-PARTITION-PREDECESSOR-CLOCK-STEP-1 r2: the same instant on the monotonic clock, so the receipt's exitToEndMs (the stream drain after the
+# confirmed exit) is a monotonic duration ending at this endedAtUtc, never the difference of two wall-clock readings
+$endTimestamp = [System.Diagnostics.Stopwatch]::GetTimestamp()
 # round 7: -SubjectProcess is now passed to the AFTER snapshot too (it previously was not passed
 # at all). Under the new interval-based verdict (Get-HostLoadVerdict computes each interval's
 # non-subject load itself -- see that function), the FINAL interval (last-during-or-before ->
@@ -2933,9 +2936,12 @@ $result = [pscustomobject]@{
         stderrDrained = [bool]$processBoundary.stderrDrained
         startedAtUtc = $startUtc.ToString("o")
         endedAtUtc = $endUtc.ToString("o")
-        # CORE-PARTITION-PREDECESSOR-CLOCK-STEP-1 r2 (Dot pr-780 S1): endedAtUtc is stamped after the stdout/stderr drain; this is the moment the
-        # process's termination was confirmed (Wait-GuiSmokeProcessBounded's exitObservedAtUtc), before that drain. null when never confirmed.
+        # CORE-PARTITION-PREDECESSOR-CLOCK-STEP-1 r2 (Dot pr-780 S1): endedAtUtc is stamped after the stdout/stderr drain. exitToEndMs is how long
+        # before endedAtUtc the process's termination was confirmed (Wait-GuiSmokeProcessBounded's exitObservedTimestamp), measured on the monotonic
+        # clock, so endedAtUtc - exitToEndMs is the exit with no second wall-clock reading in it; exitObservedAtUtc is that moment's wall-clock
+        # reading, for people only. Both null when termination was never confirmed.
         exitObservedAtUtc = $(if ($null -ne $processBoundary.exitObservedAtUtc) { ([datetime]$processBoundary.exitObservedAtUtc).ToString("o") } else { $null })
+        exitToEndMs = $(if ($null -ne $processBoundary.exitObservedTimestamp) { [math]::Round(([double]($endTimestamp - [int64]$processBoundary.exitObservedTimestamp)) * 1000.0 / [System.Diagnostics.Stopwatch]::Frequency, 3) } else { $null })
         stdout = $stdout.Trim()
         stderr = $stderr.Trim()
     }
