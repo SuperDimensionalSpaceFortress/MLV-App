@@ -2470,12 +2470,13 @@ function Exit-HeavySlot {
         $script:SidecarMoveFault = $null
         $results.livenessRenewHookWriteRetry = [ordered]@{ transientMoves = 2; persistentAttempts = 3; deniedAttempts = 1 }
     }
-    # The same fault inside the real wait: the hook's first renewal write hits one transient IOException (skip 1 = the setup write succeeds),
-    # and the gate still admits on the latest renewal exactly as liveness-renewed-across-exit75 does.
+    # The same fault inside the real wait: the hook's first renewal write hits one transient IOException (the setup write has already
+    # happened inside Invoke-RenewedAcrossExit75 before the fault is armed there, so skip is 0), and the gate still admits on the latest
+    # renewal exactly as liveness-renewed-across-exit75 does.
     if (Test-Case 'liveness-renew-hook-write-retry-gate') {
-        $fault = @{ skip = 1; remaining = 1; kind = 'io'; moves = 0; injected = 0 }
+        $fault = @{ skip = 0; remaining = 1; kind = 'io'; moves = 0; injected = 0 }
         $results.livenessRenewHookWriteRetryGate = Invoke-RenewedAcrossExit75 'liveness-renew-hook-write-retry-gate' 'jRg' 0 0 $fault
-        Assert-True ($fault.injected -eq 1) "liveness-renew-hook-write-retry-gate: the one transient IOException was injected on a hook write: injected=$($fault.injected) moves=$($fault.moves)"
+        Assert-True ($fault.injected -eq 1 -and $fault.moves -ge 2) "liveness-renew-hook-write-retry-gate: the one transient IOException was injected on the hook's FIRST write and retried (moves counts the failed attempt plus the retry): injected=$($fault.injected) moves=$($fault.moves)"
         $script:SidecarMoveFault = $null
     }
 
