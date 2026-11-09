@@ -2008,10 +2008,11 @@ $stdout = $processBoundary.stdout
 $stderr = $processBoundary.stderr
 $processExitCode = [int]$processBoundary.exitCode
 $captureBindingFailures += @($processBoundary.failures)
-$endUtc = [datetime]::UtcNow
-# CORE-PARTITION-PREDECESSOR-CLOCK-STEP-1 r2: the same instant on the monotonic clock, so the receipt's exitToEndMs (the stream drain after the
-# confirmed exit) is a monotonic duration ending at this endedAtUtc, never the difference of two wall-clock readings
+# CORE-PARTITION-PREDECESSOR-CLOCK-STEP-1 r2: the end on the monotonic clock, so the receipt's exitToEndMs (the stream drain after the confirmed
+# exit) is a monotonic duration, never the difference of two wall-clock readings. Read BEFORE endedAtUtc (adversary 56b25d8b A1): a delay between
+# the two reads can only shorten exitToEndMs, which moves the job's derived exit (endedAtUtc - exitToEndMs) later, never before the real exit.
 $endTimestamp = [System.Diagnostics.Stopwatch]::GetTimestamp()
+$endUtc = [datetime]::UtcNow
 # round 7: -SubjectProcess is now passed to the AFTER snapshot too (it previously was not passed
 # at all). Under the new interval-based verdict (Get-HostLoadVerdict computes each interval's
 # non-subject load itself -- see that function), the FINAL interval (last-during-or-before ->

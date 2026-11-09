@@ -2356,7 +2356,7 @@ function Get-Slice([string]$Text, [string]$From, [string]$To) {
     $j = $Text.IndexOf($To, $i); if ($j -lt 0) { throw "slice end not found: $To" }
     $Text.Substring($i, $j + $To.Length - $i)
 }
-$runnerFinalize = Get-Slice $runnerText '$processBoundary = Wait-GuiSmokeProcessBounded' '$endTimestamp = [System.Diagnostics.Stopwatch]::GetTimestamp()'
+$runnerFinalize = Get-Slice $runnerText '$processBoundary = Wait-GuiSmokeProcessBounded' '$endUtc = [datetime]::UtcNow'
 $rpI = $runnerText.IndexOf("`n    process = [pscustomobject]@{`n"); if ($rpI -lt 0) { throw 'runner process receipt block not found' }
 $rpJ = $runnerText.IndexOf("`n    }`n", $rpI + 1)
 $runnerProcess = $runnerText.Substring($rpI + 15, $rpJ + 6 - ($rpI + 15))
@@ -2394,6 +2394,21 @@ foreach ($case in @(@('drain-held', 3.5, $false), @('drain-held-older-receipt', 
         exitObservedAfterExitMs = $(if ($corePartitionMeasuredExitTicks -ne 0) { [int](($corePartitionMeasuredExitTicks - $appExit) / 1e4) } else { $null })
     }
 }
+# adversary 56b25d8b A2: a receipt whose exitToEndMs is there but is no usable drain (does not parse, negative, longer than launch..end, overflows)
+# is refused, never a silent fall back; null (termination never confirmed) falls back. The last case's real app, receipt and helper record.
+foreach ($bad in @(@('drain-1e20', 1e20), @('drain-negative', -5.0), @('drain-text', 'abc'), @('drain-over-window', 1e9), @('drain-null', $null))) {
+    $crafted = $receiptProcess | ConvertTo-Json -Depth 6 | ConvertFrom-Json
+    $crafted.exitToEndMs = $bad[1]
+    $resultPath = Join-Path $env:CP_TMP "$($bad[0]).result.json"
+    [IO.File]::WriteAllText($resultPath, ([ordered]@{ process = $crafted } | ConvertTo-Json -Depth 6))
+    $corePartitionErrors = [System.Collections.Generic.List[string]]::new()
+    . ([scriptblock]::Create($jobRead))
+    $cpAppVerdict = @{ why = 'measured-app-unverified' }
+    . ([scriptblock]::Create($jobVerdict))
+    $out[$bad[0]] = @([string]$cpAppVerdict.why, [string]$cpAppVerdict.exitStamp, $corePartitionErrors.Count)
+}
+# adversary 56b25d8b A1: the runner reads its monotonic end BEFORE its wall end, after the bounded wait
+$out.order = @($runnerText.IndexOf('$processBoundary = Wait-GuiSmokeProcessBounded'), $runnerText.IndexOf('$endTimestamp = [System.Diagnostics.Stopwatch]::GetTimestamp()'), $runnerText.IndexOf('$endUtc = [datetime]::UtcNow'))
 $out | ConvertTo-Json -Depth 6 -Compress
 """
 
@@ -2441,6 +2456,17 @@ class CorePartitionRunnerExitStampTests(unittest.TestCase):
         self.assertEqual(c["why"], "measured-app-gone-before-runner-exit", f"the fallback did not keep the r1 rule: {c}")
         self.assertEqual(c["exitStamp"], "endedAtUtc", f"the verdict does not say which stamp it used: {c}")
 
+    def test_a_drain_that_is_there_but_unusable_is_refused_never_a_silent_fallback(self) -> None:
+        """adversary 56b25d8b A2: exitToEndMs that overflows, is negative, does not parse or is longer than the runner's window is refused, typed."""
+        for case in ("drain-1e20", "drain-negative", "drain-text", "drain-over-window"):
+            with self.subTest(case=case):
+                self.assertEqual(self.r[case][:2], ["measured-exit-stamp-inconsistent", "exitToEndMs"], self.r[case])
+        self.assertEqual(self.r["drain-null"], ["", "endedAtUtc", 0], "termination never confirmed (null) falls back to endedAtUtc")
+
+    def test_the_runner_reads_its_monotonic_end_before_its_wall_end(self) -> None:
+        """adversary 56b25d8b A1: a delay between the two end reads can only shorten exitToEndMs, so the derived exit never moves before the real one."""
+        wait, mono, wall = self.r["order"]
+        self.assertTrue(0 <= wait < mono < wall, self.r["order"])
     def test_an_app_with_no_held_drain_is_bound_control(self) -> None:
         c = self.r["no-hold-control"]
         self.assertEqual([c["terminationConfirmed"], c["stdoutDrained"], c["stdout"].strip(), c["errors"]], [True, True, "app-ok", []], c)

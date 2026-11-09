@@ -6644,9 +6644,13 @@ try {
         $cpRunnerProcess = ([IO.File]::ReadAllText($resultPath) | ConvertFrom-Json).process
         if ($null -ne $cpRunnerProcess -and $null -ne $cpRunnerProcess.id) { $corePartitionMeasuredPid = [int64]$cpRunnerProcess.id }
         if ($null -ne $cpRunnerProcess) { $corePartitionMeasuredStartTicks = ConvertTo-CorePartitionUtcTicks $cpRunnerProcess.startedAtUtc; $corePartitionMeasuredEndTicks = ConvertTo-CorePartitionUtcTicks $cpRunnerProcess.endedAtUtc }
-        if ($null -ne $cpRunnerProcess -and $null -ne $cpRunnerProcess.PSObject.Properties['exitToEndMs'] -and $corePartitionMeasuredEndTicks -gt 0) {
+        # adversary 56b25d8b A2: a value that is there but does not parse, is negative or is longer than the runner's launch..end window is no exit:
+        # -1, which the verdict refuses (measured-exit-stamp-inconsistent), never a silent fall back to endedAtUtc. null (termination never
+        # confirmed) falls back.
+        if ($null -ne $cpRunnerProcess -and $null -ne $cpRunnerProcess.PSObject.Properties['exitToEndMs'] -and $null -ne $cpRunnerProcess.exitToEndMs -and $corePartitionMeasuredEndTicks -gt 0) {
             $corePartitionMeasuredExitToEndMs = (ConvertFrom-CorePartitionNumber $cpRunnerProcess.exitToEndMs 'double').value
-            if ($null -ne $corePartitionMeasuredExitToEndMs) { $corePartitionMeasuredExitTicks = $corePartitionMeasuredEndTicks - [int64][math]::Floor($corePartitionMeasuredExitToEndMs * 1e4) }
+            $cpDrainTicks = $(if ($null -ne $corePartitionMeasuredExitToEndMs) { [double]$corePartitionMeasuredExitToEndMs * 1e4 } else { [double]::NaN })
+            $corePartitionMeasuredExitTicks = $(if ([double]::IsNaN($cpDrainTicks) -or $cpDrainTicks -lt 0 -or $cpDrainTicks -gt [double]($corePartitionMeasuredEndTicks - $corePartitionMeasuredStartTicks)) { [int64]-1 } else { $corePartitionMeasuredEndTicks - [int64][math]::Floor($cpDrainTicks) })
         }
     } catch { $corePartitionErrors.Add("measured-pid: $([string]$_.Exception.Message)") }
     if ($null -ne $corePartitionHelper) {
