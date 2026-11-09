@@ -5197,8 +5197,9 @@ function Test-CorePartitionHelperRecord($Record, $LaunchPid, $ExitCode, [bool]$M
 # clock-discontinuity, and a gap nobody recorded is clock-unverified. Process start times are the OS's wall-clock stamps (a step before the helper
 # started is not seen here: LIMIT, CORE-PARTITION-PROCESS-START-EVENTS-1).
 # r2 (Dot pr-780 S1): $MeasuredExitTicks is the runner's process.exitObservedAtUtc, when its WaitForExit confirmed the exit; $MeasuredEndTicks
-# (endedAtUtc) is stamped only after the stdout/stderr drain, which can run seconds past the exit. Only the exit-side interval check below uses
-# it; 0 (an older receipt without it) falls back to endedAtUtc. Which stamp it used is returned as exitStamp with that check's verdicts.
+# (endedAtUtc) is stamped only after the stdout/stderr drain, which can run seconds past the exit. The exit-side interval check and the end of the
+# app's life in the overlap test use it (candidate selection keeps endedAtUtc); 0 (an older receipt without it) falls back to endedAtUtc. Which
+# stamp was used is returned as exitStamp with the exit-side check's verdicts and the binding.
 function Test-CorePartitionMeasuredApp($Helper, [int64]$MeasuredPid, [int64]$MeasuredStartTicks, [int64]$MeasuredEndTicks, $ClockSkewMs = 0, [int64]$MeasuredExitTicks = 0) {
     if ($MeasuredPid -le 0) { return @{ why = 'measured-pid-unknown' } }
     if ($MeasuredStartTicks -le 0 -or $MeasuredEndTicks -lt $MeasuredStartTicks) { return @{ why = 'measured-window-unknown' } }
@@ -5261,7 +5262,9 @@ function Test-CorePartitionMeasuredApp($Helper, [int64]$MeasuredPid, [int64]$Mea
         if ([object]::ReferenceEquals($o, $a)) { continue }
         $oStart = if ($null -ne $o.start) { $o.start - $slack } else { [int64]::MinValue }
         $oEnd = if ($null -ne $o.gone) { $o.gone + $slack } else { [int64]::MaxValue }
-        if ($oStart -le $MeasuredEndTicks -and $aStart -le $oEnd) { return @{ why = 'same-path-instance-overlap' } }
+        # r2 (adversary 6c16f4de advisory A1): the app is alive until its exit ($exitTicks, the runner's termination stamp when it has one), not
+        # through the stream drain after it; a process that started during the drain was never alive with it
+        if ($oStart -le $exitTicks -and $aStart -le $oEnd) { return @{ why = 'same-path-instance-overlap' } }
         # r10 B3: on the monotonic clock alone, each process is proven alive from its first sighting (firstMs) to its last alive poll (aliveMs); two
         # such spans that intersect were alive together, whatever the wall-clock stamps say
         if ($o.firstMs -le $o.aliveMs -and $a.firstMs -le $a.aliveMs -and $o.firstMs -le $a.aliveMs -and $a.firstMs -le $o.aliveMs) { return @{ why = 'same-path-instance-overlap' } }

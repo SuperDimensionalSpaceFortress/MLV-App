@@ -1479,7 +1479,16 @@ if ((Get-Command Test-CorePartitionMeasuredApp).Parameters.ContainsKey('Measured
         'exit-stamp-after-end' = @($drained, 25.0)
         'exit-stamp-before-launch' = @($drained, 3.0)
         'complete-interval-control-with-exit-stamp' = @($stepCases['complete-interval-control'], 23.95)
+        # adversary r2 (6c16f4de) advisory A1 (literal): another same-path 6000 started +21 s, after the app's confirmed exit (+20.05 s) but inside
+        # the drain before endedAtUtc (+24 s); it was never alive with the app. Control: one started +20.0 s, before that exit, still overlaps.
+        'drain-only-instance' = @($null, 20.05)
+        'started-before-exit-stamp-control' = @($null, 20.05)
     }
+    $i5000d = New-CpInst 5000 4.05 4.2 19.9 20.1
+    $exitCases['drain-only-instance'][0] = New-CpStepRecord $i5000d 0
+    $exitCases['drain-only-instance'][0].instances = @(($i5000d | ConvertFrom-Json), ((New-CpInst 6000 21 21.1 22.9 23.1) | ConvertFrom-Json))
+    $exitCases['started-before-exit-stamp-control'][0] = New-CpStepRecord $i5000d 0
+    $exitCases['started-before-exit-stamp-control'][0].instances = @(($i5000d | ConvertFrom-Json), ((New-CpInst 6000 20.0 20.15 22.9 23.1) | ConvertFrom-Json))
     foreach ($k in $exitCases.Keys) {
         $x = $(if ($null -eq $exitCases[$k][1]) { [int64]0 } else { $L + [int64]($exitCases[$k][1] * 1e7) })
         $sc = Get-CorePartitionScalars $exitCases[$k][0] $feed 4095 1044480 8 $w $null $false -MeasuredPid 5000 -MeasuredStartTicks ($L + 40000000) -MeasuredEndTicks ($L + 240000000) -ClockSkewMs 0 -MeasuredExitTicks $x
@@ -2027,6 +2036,7 @@ class CorePartitionPureHelperTests(unittest.TestCase):
             "drained-older-receipt": ("measured-app-gone-before-runner-exit", "endedAtUtc"),
             "exit-stamp-after-end": ("measured-exit-stamp-inconsistent", "exitObservedAtUtc"),
             "exit-stamp-before-launch": ("measured-exit-stamp-inconsistent", "exitObservedAtUtc"),
+            "started-before-exit-stamp-control": ("same-path-instance-overlap", ""),
         }
         for case, (code, stamp) in refused.items():
             with self.subTest(case=case):
@@ -2034,7 +2044,9 @@ class CorePartitionPureHelperTests(unittest.TestCase):
                 self.assertEqual([verdict, used], [code, stamp], s[case])
                 self.assertEqual([observed, gbps], [None, None], f"its evidence was credited: {why}")
                 self.assertIn(f"appAffinityObserved={code}", why)
-        for case in ("drained-bound-on-exit-stamp", "complete-interval-control-with-exit-stamp"):
+        # adversary r2 (6c16f4de) advisory A1: the overlap test ends the app's life at the same termination stamp, so an instance started during
+        # the drain, after the app's exit, is not an overlap
+        for case in ("drained-bound-on-exit-stamp", "complete-interval-control-with-exit-stamp", "drain-only-instance"):
             with self.subTest(case=case):
                 observed, gbps, why, verdict, used = s[case]
                 self.assertEqual([observed, gbps, verdict, used], ["0x00FFF", 2.0, "", "exitObservedAtUtc"], s[case])
