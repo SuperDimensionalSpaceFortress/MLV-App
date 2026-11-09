@@ -61,7 +61,11 @@ param(
 #               and no admission.
 #   renew-hook write retry - QUIET-LEASE-RENEW-HOOK-WRITE-RETRY-1 r1 (cases liveness-renew-hook-write-retry, -gate): the renew-on-read hook's
 #               sidecar write (Write-SidecarRaw) retries a transient IOException on the rename (3 attempts, 50 ms apart, IOException only); a
-#               persistent one throws SIDECAR-WRITE-FAILED job=<id> attempts=<n> with the tmp file removed; any other exception type is not retried.
+#               persistent one throws SIDECAR-WRITE-FAILED job=<id> attempts=<n> tmp=removed (the tmp file is removed when it can be); any other
+#               exception type is not retried.
+#   r2 (cases liveness-renew-hook-write-retry-cleanup-io, -cleanup-other; sol r1 B1): the removal is best-effort (a scanner can hold the tmp without
+#               delete sharing), so it is checked afterwards: the failure says tmp=removed only when the file is gone and tmp_remaining=<path> when it is
+#               not (the non-IOException path keeps its own type and carries Data['tmp_remaining'] plus a warning). A cleanup failure is reported, never hidden.
 #   exit release evidence - QUIET-LEASE-EXIT-RELEASE-EVIDENCE-AND-EVENT-OBSERVE-1 r1 (cases queuedjob-queue-expired-post-admission,
 #               queuedjob-holder-lost-prelaunch, exit-release-pin): the queue-expired exit after admission and the pre-launch
 #               holder-lost refusal release the lease and record that release (leaseRelease) before Exit-HeavySlot, and every
@@ -1176,7 +1180,7 @@ try {
         'notafter-queuedjob-pregate', 'notafter-queuedjob-gate', 'notafter-queuedjob-post-admission', 'notafter-prelaunch-marker',
         'notafter-prelaunch-confirm', 'notafter-renew-in-light-job', 'notafter-meta-unreadable',
         'queuedjob-cancel-post-admission', 'notafter-renew-crosses-deadline', 'notafter-meta-sticky',
-        'liveness-dead-before-request', 'liveness-lapses-while-pending', 'liveness-lapses-at-active', 'liveness-renewed-across-exit75', 'liveness-renewed-across-stall', 'liveness-renewal-stops-lapses', 'liveness-renewed-post-renewal-pause', 'liveness-renewal-stops-lapses-post-pause', 'liveness-renew-stall-override-bound', 'liveness-renew-hook-write-retry', 'liveness-renew-hook-write-retry-gate',
+        'liveness-dead-before-request', 'liveness-lapses-while-pending', 'liveness-lapses-at-active', 'liveness-renewed-across-exit75', 'liveness-renewed-across-stall', 'liveness-renewal-stops-lapses', 'liveness-renewed-post-renewal-pause', 'liveness-renewal-stops-lapses-post-pause', 'liveness-renew-stall-override-bound', 'liveness-renew-hook-write-retry', 'liveness-renew-hook-write-retry-gate', 'liveness-renew-hook-write-retry-cleanup-io', 'liveness-renew-hook-write-retry-cleanup-other',
         'liveness-absent-unchanged', 'liveness-unparseable-expired', 'liveness-pure', 'liveness-reader', 'liveness-ast-guard', 'liveness-queuedjob',
         'liveness-root-shape', 'liveness-lapse-latched',
         'queuedjob-queue-expired-post-admission', 'queuedjob-holder-lost-prelaunch', 'exit-release-pin',
@@ -1207,12 +1211,21 @@ try {
             $f.moves++
             if ($f.skip -gt 0) { $f.skip-- }
             elseif ($f.remaining -gt 0) {
+                # hold (QUIET-LEASE-RENEW-HOOK-WRITE-RETRY-1 r2): on the first injected fault, open the generated tmp FileAccess.Read /
+                # FileShare.Read and keep it open (no delete sharing), the scanner shape: the tmp then cannot be deleted. holderPath
+                # records the tmp; the case disposes holder and removes the file itself.
+                if ($f.hold -and $null -eq $f.holder) { $f.holderPath = $Tmp; $f.holder = [IO.FileStream]::new($Tmp, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read) }
                 $f.remaining--; $f.injected++
                 if ($f.kind -ceq 'denied') { throw [UnauthorizedAccessException]::new('injected: access denied on the sidecar rename') }
                 throw [IO.IOException]::new('injected: the process cannot access the file because it is being used by another process')
             }
         }
         [IO.File]::Move($Tmp, $Dst, $true)
+    }
+    # Best-effort tmp removal that reports what happened: $true only when the file is gone afterwards (checked, not assumed).
+    function Remove-SidecarTmp([string]$Tmp) {
+        try { Remove-Item -LiteralPath $Tmp -Force -ErrorAction Stop } catch { }
+        return (-not (Test-Path -LiteralPath $Tmp))
     }
     function Write-SidecarRaw([string]$JobId, [string]$Text) {
         $dst = Join-Path $notAfterDir "$JobId.json"
@@ -1221,17 +1234,26 @@ try {
         # QUIET-LEASE-RENEW-HOOK-WRITE-RETRY-1: the renew-on-read hook writes through here inside the gate's own sidecar read, so one transient
         # sharing violation on the rename (antivirus/indexer lock, the Windows shape) must not fail the case. A bounded retry for IOException
         # ONLY: 3 attempts, 50 ms apart; any other exception type propagates at once, untouched. On the last failure the tmp file is
-        # removed and a typed failure names the job and the attempt count (so a persistent fault is never mistaken for a gate defect).
+        # removed when it can be and a typed failure names the job and the attempt count (so a persistent fault is never mistaken for a gate defect).
+        # r2 (sol r1 B1): the removal is best-effort (a scanner can hold the tmp without delete sharing), so after it the tmp is looked for
+        # again: the failure says tmp=removed only when it is gone and tmp_remaining=<path> when it is not. A cleanup failure is reported, never hidden.
         $maxAttempts = 3
         for ($attempt = 1; $attempt -le $maxAttempts; $attempt++) {
             try { Invoke-SidecarMove $tmp $dst; return }
             catch {
                 $ex = $_.Exception
                 if ($ex -is [System.Management.Automation.MethodInvocationException] -and $null -ne $ex.InnerException) { $ex = $ex.InnerException }
-                if ($ex -isnot [IO.IOException]) { Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue; throw }
+                if ($ex -isnot [IO.IOException]) {
+                    # The original exception keeps its type; the cleanup outcome rides on its Data and a warning, never replacing it.
+                    if (-not (Remove-SidecarTmp $tmp)) {
+                        foreach ($d in @($_.Exception, $ex)) { try { $d.Data['tmp_remaining'] = $tmp } catch { } }
+                        Write-Warning "SIDECAR-WRITE-FAILED job=$JobId $($ex.GetType().Name) not retried; tmp_remaining=$tmp"
+                    }
+                    throw
+                }
                 if ($attempt -ge $maxAttempts) {
-                    Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue
-                    throw [InvalidOperationException]::new("SIDECAR-WRITE-FAILED job=$JobId attempts=$attempt $($ex.GetType().Name): $($ex.Message)", $ex)
+                    $tmpState = if (Remove-SidecarTmp $tmp) { 'tmp=removed' } else { "tmp_remaining=$tmp" }
+                    throw [InvalidOperationException]::new("SIDECAR-WRITE-FAILED job=$JobId attempts=$attempt $tmpState $($ex.GetType().Name): $($ex.Message)", $ex)
                 }
                 Start-Sleep -Milliseconds 50
             }
@@ -2478,6 +2500,66 @@ function Exit-HeavySlot {
         $results.livenessRenewHookWriteRetryGate = Invoke-RenewedAcrossExit75 'liveness-renew-hook-write-retry-gate' 'jRg' 0 0 $fault
         Assert-True ($fault.injected -eq 1 -and $fault.moves -ge 2) "liveness-renew-hook-write-retry-gate: the one transient IOException was injected on the hook's FIRST write and retried (moves counts the failed attempt plus the retry): injected=$($fault.injected) moves=$($fault.moves)"
         $script:SidecarMoveFault = $null
+    }
+
+    # ------------------------------------------------------------ cleanup accuracy (QUIET-LEASE-RENEW-HOOK-WRITE-RETRY-1 r2, sol r1 B1)
+    # A scanner holding the tmp without delete sharing makes the best-effort cleanup fail. The failure must then SAY the tmp remains
+    # (tmp_remaining=<path>) and never claim a removal that did not happen; a removed tmp is reported as tmp=removed.
+    # (io) the IOException-exhaustion path: held through all 3 renames and the cleanup.
+    if (Test-Case 'liveness-renew-hook-write-retry-cleanup-io') {
+        $jid = 'jRh'
+        $script:SidecarMoveFault = @{ skip = 0; remaining = 99; kind = 'io'; moves = 0; injected = 0; hold = $true; holder = $null; holderPath = $null }
+        $err = $null
+        try { Write-SidecarRaw $jid '{}' } catch { $err = $_ }
+        $f = $script:SidecarMoveFault
+        $msg = if ($null -ne $err) { $err.Exception.Message } else { '' }
+        $stillThere = ($null -ne $f.holderPath) -and (Test-Path -LiteralPath $f.holderPath)
+        try {
+            Assert-True ($null -ne $err -and $msg -like "SIDECAR-WRITE-FAILED job=$jid attempts=3*" -and $f.moves -eq 3 -and $f.injected -eq 3) "liveness-renew-hook-write-retry-cleanup-io: still the typed failure after exactly 3 attempts: moves=$($f.moves) msg=[$msg]"
+            Assert-True ($stillThere) "liveness-renew-hook-write-retry-cleanup-io: the held tmp really survived the cleanup (the fault is real): path=$($f.holderPath)"
+            Assert-True ($msg -like "*tmp_remaining=$($f.holderPath)*" -and $msg -notlike '*tmp=removed*') "liveness-renew-hook-write-retry-cleanup-io: the failure reports the tmp that remains and never claims its removal: [$msg]"
+        }
+        finally {
+            if ($null -ne $f.holder) { $f.holder.Dispose() }
+            if ($null -ne $f.holderPath) { Remove-Item -LiteralPath $f.holderPath -Force -ErrorAction SilentlyContinue }
+            $script:SidecarMoveFault = $null
+        }
+        # control: not held, the same persistent fault removes the tmp and says so.
+        $script:SidecarMoveFault = @{ skip = 0; remaining = 99; kind = 'io'; moves = 0; injected = 0 }
+        $err = $null
+        try { Write-SidecarRaw $jid '{}' } catch { $err = $_ }
+        $msg = if ($null -ne $err) { $err.Exception.Message } else { '' }
+        $script:SidecarMoveFault = $null
+        $left = @(Get-ChildItem -LiteralPath $notAfterDir -Filter "$jid.json.*.tmp" -File -ErrorAction SilentlyContinue).Count
+        Assert-True ($msg -like "SIDECAR-WRITE-FAILED job=$jid attempts=3*tmp=removed*" -and $msg -notlike '*tmp_remaining=*' -and $left -eq 0) "liveness-renew-hook-write-retry-cleanup-io: an unheld tmp is removed and the failure says tmp=removed: left=$left msg=[$msg]"
+        $results.livenessRenewHookWriteRetryCleanupIo = [ordered]@{ heldReported = $true; removedReported = $true }
+    }
+    # (other) the non-IOException path: held through the single rename and the cleanup; the original type survives and carries the outcome.
+    if (Test-Case 'liveness-renew-hook-write-retry-cleanup-other') {
+        $jid = 'jRo'
+        $script:SidecarMoveFault = @{ skip = 0; remaining = 99; kind = 'denied'; moves = 0; injected = 0; hold = $true; holder = $null; holderPath = $null }
+        $err = $null
+        try { Write-SidecarRaw $jid '{}' } catch { $err = $_ }
+        $f = $script:SidecarMoveFault
+        $stillThere = ($null -ne $f.holderPath) -and (Test-Path -LiteralPath $f.holderPath)
+        try {
+            Assert-True ($null -ne $err -and $err.Exception -is [UnauthorizedAccessException] -and $f.moves -eq 1 -and $f.injected -eq 1) "liveness-renew-hook-write-retry-cleanup-other: the original exception type is kept and not retried: moves=$($f.moves) type=$(if ($null -ne $err) { $err.Exception.GetType().Name })"
+            Assert-True ($stillThere) "liveness-renew-hook-write-retry-cleanup-other: the held tmp really survived the cleanup (the fault is real): path=$($f.holderPath)"
+            Assert-True ($err.Exception.Data['tmp_remaining'] -ceq $f.holderPath) "liveness-renew-hook-write-retry-cleanup-other: the surviving exception reports the tmp that remains: Data[tmp_remaining]=[$($err.Exception.Data['tmp_remaining'])]"
+        }
+        finally {
+            if ($null -ne $f.holder) { $f.holder.Dispose() }
+            if ($null -ne $f.holderPath) { Remove-Item -LiteralPath $f.holderPath -Force -ErrorAction SilentlyContinue }
+            $script:SidecarMoveFault = $null
+        }
+        # control: not held, the tmp is removed and the exception carries no tmp_remaining.
+        $script:SidecarMoveFault = @{ skip = 0; remaining = 99; kind = 'denied'; moves = 0; injected = 0 }
+        $err = $null
+        try { Write-SidecarRaw $jid '{}' } catch { $err = $_ }
+        $script:SidecarMoveFault = $null
+        $left = @(Get-ChildItem -LiteralPath $notAfterDir -Filter "$jid.json.*.tmp" -File -ErrorAction SilentlyContinue).Count
+        Assert-True ($null -ne $err -and $err.Exception -is [UnauthorizedAccessException] -and -not $err.Exception.Data.Contains('tmp_remaining') -and $left -eq 0) "liveness-renew-hook-write-retry-cleanup-other: an unheld tmp is removed and nothing claims otherwise: left=$left"
+        $results.livenessRenewHookWriteRetryCleanupOther = [ordered]@{ heldReported = $true; removedClean = $true }
     }
 
     # ------------------------------------------------------------ liveness-renewal-stops-lapses: the negative case, renewal really stops
