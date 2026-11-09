@@ -19,6 +19,7 @@ extern "C" {
 #include "../../src/batch/ReceiptApplier.h"
 #include "../../src/batch/ReceiptLoader.h"
 #include "../../platform/qt/DualIsoPatternMapping.h"
+#include "../../platform/qt/ReconWorkerSplit.h"
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -7239,6 +7240,26 @@ TEST(DualIsoPipeline, MixChromaFull20RouteBenchAtVenueGeometry)
     const double denom = t_med[0] - t_med[1];
     std::fprintf(stderr, "[mix-chroma-full20-bench] R=%.4f t0=%.3f t1=%.3f t2=%.3f avx2=%d team=%d\n",
                  denom != 0.0 ? (t_med[0] - t_med[2]) / denom : 0.0, t_med[0], t_med[1], t_med[2], avx2, team);
+}
+
+// Adversary 5f16bcdf A1: on a consumed worker recon the render thread writes its own (cleared)
+// full20 telemetry over the worker's, so the AVX2 path proof must survive under recon_worker_
+// (RenderFrameThread.cpp copyWorkerSplit), where MainWindow's counter reads it
+// (recon_worker_split::mixChromaAvx2Used).
+TEST(DualIsoPipeline, MixChromaAvx2ProofSurvivesAConsumedWorkerRecon)
+{
+    QJsonObject worker;
+    worker.insert(QStringLiteral("dual_iso_full20_valid"), true);
+    worker.insert(QStringLiteral("dual_iso_full20_mix_chroma_ms"), 7.0);
+    worker.insert(QStringLiteral("dual_iso_full20_mix_chroma_avx2_used"), true);
+    // The render thread consumed the reconned frame: its own flags are false.
+    QJsonObject presented;
+    presented.insert(QStringLiteral("dual_iso_full20_valid"), false);
+    presented.insert(QStringLiteral("dual_iso_full20_mix_chroma_avx2_used"), false);
+    recon_worker_split::copyWorkerSplit(worker, presented);
+    ASSERT_TRUE(presented.value(QStringLiteral("recon_worker_dual_iso_full20_mix_chroma_avx2_used")).toBool());
+    // The render thread's own key is left as it is.
+    ASSERT_FALSE(presented.value(QStringLiteral("dual_iso_full20_mix_chroma_avx2_used")).toBool());
 }
 
 TEST(DualIsoPipeline, MixChromaFastRouteFull20IsByteIdenticalToLegacySynthetic)

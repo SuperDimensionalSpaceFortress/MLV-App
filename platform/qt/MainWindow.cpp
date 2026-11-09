@@ -27397,8 +27397,8 @@ void MainWindow::notePlaybackSmokePresentedFrame(
         telemetryBoolValue( timing, "dual_iso_full20_use_alias_map" );
     const bool dualIsoFull20Fullres =
         telemetryBoolValue( timing, "dual_iso_full20_use_fullres" );
-    const bool dualIsoFull20MixChromaAvx2Used =
-        telemetryBoolValue( timing, "dual_iso_full20_mix_chroma_avx2_used" );
+    /* Render-thread recon or consumed worker recon (ReconWorkerSplit.h). */
+    const bool dualIsoFull20MixChromaAvx2Used = recon_worker_split::mixChromaAvx2Used( timing );
     const double llrawprocChromaSmoothMs =
         telemetryDoubleValue( timing, "llrawproc_chroma_smooth_ms" );
     const double llrawprocOtherMs =
@@ -27961,9 +27961,10 @@ void MainWindow::notePlaybackSmokePresentedFrame(
         m_playbackSmokeDualIsoFull20LastThreads = dualIsoFull20Threads;
         m_playbackSmokeDualIsoFull20LastAliasMap = dualIsoFull20AliasMap;
         m_playbackSmokeDualIsoFull20LastFullres = dualIsoFull20Fullres;
-        if( dualIsoFull20MixChromaAvx2Used )
-            ++m_playbackSmokeDualIsoMixChromaAvx2UsedFrames;
     }
+    /* Outside the render thread's full20 validity gate: a consumed worker recon leaves it false. */
+    if( dualIsoFull20MixChromaAvx2Used )
+        ++m_playbackSmokeDualIsoMixChromaAvx2UsedFrames;
     m_playbackSmokeLlrawprocChromaSmoothSumMs += llrawprocChromaSmoothMs;
     m_playbackSmokeLlrawprocOtherSumMs += llrawprocOtherMs;
     m_playbackSmokeDebayeredFrameSumMs += debayeredFrameMs;
@@ -31632,6 +31633,16 @@ void MainWindow::finishPlaybackSmokeTelemetry( const char *reason )
                .arg( m_playbackSmokeDebayerBasicU16Avx2AvailableFrames )
                .arg( m_playbackSmokeDebayerBasicU16Avx2UsedFrames );
 
+    /* CPU-S1-DUALISO-MIX-CHROMA-LEVER-2: venue proof of the matched-source smooth path, printed on
+     * every session (not under the full20 validity gate a consumed worker recon fails). */
+    qInfo().noquote()
+        << QStringLiteral(
+               "playback_smoke.dual_iso_mix_chroma_path session=%1 frames=%2 "
+               "dualiso_mix_chroma_avx2_used_frames=%3" )
+               .arg( static_cast<qulonglong>( m_playbackSmokeSessionId ) )
+               .arg( m_playbackSmokePresentedFrames )
+               .arg( m_playbackSmokeDualIsoMixChromaAvx2UsedFrames );
+
     qInfo().noquote()
         << QStringLiteral(
                "playback_smoke.processing_detail_summary session=%1 frames=%2 "
@@ -31783,8 +31794,7 @@ void MainWindow::finishPlaybackSmokeTelemetry( const char *reason )
                    "avg_chroma_halfres_center_non_average_write_both_probe_ms=%18 "
                    "avg_chroma_halfres_center_store_probe_ms=%19 "
                    "avg_chroma_halfres_center_store_r_probe_ms=%20 "
-                   "avg_chroma_halfres_center_store_b_probe_ms=%21 "
-                   "dualiso_mix_chroma_avx2_used_frames=%22" )
+                   "avg_chroma_halfres_center_store_b_probe_ms=%21" )
                    .arg( static_cast<qulonglong>( m_playbackSmokeSessionId ) )
                    .arg( m_playbackSmokeDualIsoFull20ValidFrames )
                    .arg( avgDualIsoFull20Ms( m_playbackSmokeDualIsoFull20MixChromaSumMs ), 0, 'f', 3 )
@@ -31805,8 +31815,7 @@ void MainWindow::finishPlaybackSmokeTelemetry( const char *reason )
                    .arg( avgDualIsoFull20Ms( m_playbackSmokeDualIsoFull20MixChromaHalfresCenterNonAverageWriteBothProbeSumMs ), 0, 'f', 3 )
                    .arg( avgDualIsoFull20Ms( m_playbackSmokeDualIsoFull20MixChromaHalfresCenterStoreProbeSumMs ), 0, 'f', 3 )
                    .arg( avgDualIsoFull20Ms( m_playbackSmokeDualIsoFull20MixChromaHalfresCenterStoreRProbeSumMs ), 0, 'f', 3 )
-                   .arg( avgDualIsoFull20Ms( m_playbackSmokeDualIsoFull20MixChromaHalfresCenterStoreBProbeSumMs ), 0, 'f', 3 )
-                   .arg( m_playbackSmokeDualIsoMixChromaAvx2UsedFrames );
+                   .arg( avgDualIsoFull20Ms( m_playbackSmokeDualIsoFull20MixChromaHalfresCenterStoreBProbeSumMs ), 0, 'f', 3 );
     }
 
     const uint64_t decodeRequestsIssuedNow =

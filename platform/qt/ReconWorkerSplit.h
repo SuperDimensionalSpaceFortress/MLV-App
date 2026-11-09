@@ -29,13 +29,27 @@ namespace recon_worker_split
 
 inline QString prefix() { return QStringLiteral( "recon_worker_" ); }
 
-// A worker key this split carries: an llrawproc_* or dual_iso_full20_* duration, or the full20 valid flag.
+// CPU-S1-DUALISO-MIX-CHROMA-LEVER-2: the full20 flag saying the matched-source smooth ran AVX2.
+inline QString mixChromaAvx2UsedKey() { return QStringLiteral( "dual_iso_full20_mix_chroma_avx2_used" ); }
+
+// A worker key this split carries: an llrawproc_* or dual_iso_full20_* duration, the full20 valid flag,
+// or the mix-chroma AVX2 path flag.
 inline bool isSplitKey( const QString &key )
 {
     const bool family = key.startsWith( QLatin1String( "llrawproc_" ) )
                      || key.startsWith( QLatin1String( "dual_iso_full20_" ) );
     return family && ( key.endsWith( QLatin1String( "_ms" ) )
-                       || key == QLatin1String( "dual_iso_full20_valid" ) );
+                       || key == QLatin1String( "dual_iso_full20_valid" )
+                       || key == mixChromaAvx2UsedKey() );
+}
+
+// A presented frame whose matched-source smooth ran the AVX2 kernel, on the render thread's own recon
+// or on the recon worker's (adversary 5f16bcdf A1: a consumed worker recon leaves the render thread's
+// unprefixed flag false; the worker's survives under recon_worker_).
+inline bool mixChromaAvx2Used( const QJsonObject &presented )
+{
+    return presented.value( mixChromaAvx2UsedKey() ).toBool()
+        || presented.value( prefix() + mixChromaAvx2UsedKey() ).toBool();
 }
 
 // Copies the worker's split keys from `worker` (the slot telemetry as the recon worker left it) into
