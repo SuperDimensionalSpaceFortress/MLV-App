@@ -2755,12 +2755,17 @@ def _set_process_dacl(handle,sddl):
     adv.ConvertStringSecurityDescriptorToSecurityDescriptorW.argtypes=[w.LPCWSTR,w.DWORD,ctypes.POINTER(ctypes.c_void_p),ctypes.c_void_p]
     adv.GetSecurityDescriptorDacl.argtypes=[ctypes.c_void_p,ctypes.POINTER(w.BOOL),ctypes.POINTER(ctypes.c_void_p),ctypes.POINTER(w.BOOL)]
     adv.SetSecurityInfo.argtypes=[w.HANDLE,ctypes.c_int,w.DWORD,ctypes.c_void_p,ctypes.c_void_p,ctypes.c_void_p,ctypes.c_void_p]
+    k32=ctypes.WinDLL("kernel32",use_last_error=True)
+    k32.LocalFree.argtypes=[ctypes.c_void_p]
     sd=ctypes.c_void_p()
     assert adv.ConvertStringSecurityDescriptorToSecurityDescriptorW(sddl,1,ctypes.byref(sd),None), ctypes.get_last_error()
-    present=w.BOOL(); dacl=ctypes.c_void_p(); defaulted=w.BOOL()
-    assert adv.GetSecurityDescriptorDacl(sd,ctypes.byref(present),ctypes.byref(dacl),ctypes.byref(defaulted)), ctypes.get_last_error()
-    rc=adv.SetSecurityInfo(int(handle),6,4,None,None,dacl,None)   # SE_KERNEL_OBJECT, DACL_SECURITY_INFORMATION
-    assert rc==0, rc
+    try:   # r2 (adversary advisory A1 on 30679c0e): the descriptor is the caller's to LocalFree
+        present=w.BOOL(); dacl=ctypes.c_void_p(); defaulted=w.BOOL()
+        assert adv.GetSecurityDescriptorDacl(sd,ctypes.byref(present),ctypes.byref(dacl),ctypes.byref(defaulted)), ctypes.get_last_error()
+        rc=adv.SetSecurityInfo(int(handle),6,4,None,None,dacl,None)   # SE_KERNEL_OBJECT, DACL_SECURITY_INFORMATION
+        assert rc==0, rc
+    finally:
+        k32.LocalFree(sd)
 
 
 def _older_process(sddl):
