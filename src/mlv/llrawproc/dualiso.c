@@ -28,6 +28,9 @@
 #include "opt_med.h"
 #include "wirth.h"
 #include <pthread.h>
+#ifdef _OPENMP
+#include <omp.h>
+#endif
 #if defined(__GNUC__) && !defined(__clang__) && (defined(__x86_64__) || defined(__i386__))
 #include <immintrin.h>
 #define DUALISO_AVX2_AVAILABLE 1
@@ -4605,6 +4608,334 @@ static inline void build_alias_map(struct raw_info raw_info,
 #include "chroma_smooth.c"
 #undef CHROMA_SMOOTH_5X5
 
+/* CPU-S1-DUALISO-MIX-CHROMA-LEVER-1: byte-identical fast form of the uint32
+ * chroma_smooth_2x2 instantiation above, bound to the dual-ISO matched-source
+ * smooth only (pixelproc.c's uint16 instantiation is untouched).
+ *
+ * K1: the legacy cell gathers 5 H + 5 V cross samples (6 raw2ev lookups each)
+ * plus 6 centre lookups. Every sample depends only on its position (p, q), and
+ * each position is shared by up to 5 cells, so each position is computed once
+ * (8 raw2ev lookups) into a per-thread ring of 3 position rows. The cell then
+ * runs the same med5, use_average, choose and clamped ev2raw store as the
+ * legacy non-probe path.
+ * K2: each thread band writes whole output rows (input copied, then the R/B
+ * sites patched), and the border rows are copied inside the same region, so
+ * the serial full-plane memcpy before the legacy kernel is gone.
+ * Read footprint per position (p, q): rows p-1..p+2, cols q-1..q+2, i.e. the
+ * legacy union footprint rows 1..ymax+4, cols 1..xmax+4. */
+typedef struct
+{
+    int hr, hb, vr, vb, eht, evt;
+    int g1, g2, g3, g4, g5, g6;
+} dualiso_cs2_pos_t;
+
+/* Test-only RED switch (dualisoSetMixChromaFastMutationForTesting): 1 breaks
+ * the fast kernel on purpose (k1/k3 cross rows swapped and the V-blue sample
+ * sign flipped) so the identity tests can be shown to fail. Always 0 in the
+ * product. */
+static int g_dualiso_cs2_mutation_for_testing = 0;
+
+void dualisoSetMixChromaFastMutationForTesting(int mutation);
+void dualisoSetMixChromaFastMutationForTesting(int mutation)
+{
+    g_dualiso_cs2_mutation_for_testing = mutation;
+}
+
+static inline void dualiso_cs2_fill_pos_row(const uint32_t * __restrict inp,
+                                            int w,
+                                            int p,
+                                            int npos,
+                                            const int * __restrict raw2ev,
+                                            int mutation,
+                                            dualiso_cs2_pos_t * __restrict row)
+{
+    const uint32_t * r_m1 = inp + (size_t)(p - 1) * (size_t)w;
+    const uint32_t * r_0 = inp + (size_t)p * (size_t)w;
+    const uint32_t * r_p1 = r_0 + w;
+    const uint32_t * r_p2 = inp + (size_t)(p + 2) * (size_t)w;
+    for (int j = 0; j < npos; j++)
+    {
+        const int q = 2 + 2 * j;
+        const int rr = raw2ev[(int)r_0[q]];
+        const int bb = raw2ev[(int)r_p1[q + 1]];
+        const int g1 = raw2ev[(int)r_0[q + 1]];
+        const int g2 = raw2ev[(int)r_p1[q]];
+        const int g3 = raw2ev[(int)r_0[q - 1]];
+        const int g5 = raw2ev[(int)r_p1[q + 2]];
+        const int g4 = raw2ev[(int)r_m1[q]];
+        const int g6 = raw2ev[(int)r_p2[q + 1]];
+        dualiso_cs2_pos_t * o = &row[j];
+        o->hr = rr - (g1 + g3) / 2;
+        o->hb = bb - (g2 + g5) / 2;
+        o->eht = ABS(g1 - g3) + ABS(g2 - g5);
+        o->vr = rr - (g2 + g4) / 2;
+        o->vb = mutation ? (g1 + g6) / 2 - bb : bb - (g1 + g6) / 2;
+        o->evt = ABS(g2 - g4) + ABS(g1 - g6);
+        o->g1 = g1; o->g2 = g2; o->g3 = g3;
+        o->g4 = g4; o->g5 = g5; o->g6 = g6;
+    }
+}
+
+static inline void dualiso_cs2_cell_row(const uint32_t * __restrict inp,
+                                        uint32_t * __restrict out,
+                                        int w,
+                                        int y,
+                                        int ncx,
+                                        const dualiso_cs2_pos_t * __restrict up,
+                                        const dualiso_cs2_pos_t * __restrict mid,
+                                        const dualiso_cs2_pos_t * __restrict dn,
+                                        const int * __restrict ev2raw,
+                                        int black,
+                                        int white)
+{
+    /* Same margin as the uint32 instantiation's CHROMA_SMOOTH_RAW_BLACK_MARGIN. */
+    const int black_thr = black + 64 * 64;
+    const unsigned int white_u = (unsigned int)white;
+    const int ev2raw_lo = -10 * EV_RESOLUTION;
+    const int ev2raw_hi = 14 * EV_RESOLUTION - 1;
+    const int direction_ev_thr = 64;
+    const uint32_t * row_y = inp + (size_t)y * (size_t)w;
+    const uint32_t * row_y_p1 = row_y + w;
+    uint32_t * out_y = out + (size_t)y * (size_t)w;
+    uint32_t * out_y_p1 = out_y + w;
+
+    /* K2: whole output rows y and y+1 start as the input. */
+    memcpy(out_y, row_y, (size_t)2 * (size_t)w * sizeof(uint32_t));
+
+    for (int i = 0; i < ncx; i++)
+    {
+        const int x = 4 + 2 * i;
+        const int r0 = (int)row_y[x];
+        const int b0 = (int)row_y_p1[x + 1];
+        const int write_r = (unsigned int)r0 < white_u;
+        const int write_b = (unsigned int)b0 < white_u;
+        if (UNLIKELY(!write_r && !write_b))
+        {
+            continue;
+        }
+        /* Position j = (q - 2) / 2; the cell's centre q = x sits at j = i + 1.
+         * Legacy k order: k0 (y, x-2), k1 (y-2, x), k2 (y, x), k3 (y+2, x),
+         * k4 (y, x+2). */
+        const dualiso_cs2_pos_t * k0 = &mid[i];
+        const dualiso_cs2_pos_t * k1 = &up[i + 1];
+        const dualiso_cs2_pos_t * k2 = &mid[i + 1];
+        const dualiso_cs2_pos_t * k3 = &dn[i + 1];
+        const dualiso_cs2_pos_t * k4 = &mid[i + 2];
+
+        const int eh = k0->eht + k1->eht + k2->eht + k3->eht + k4->eht;
+        const int ev = k0->evt + k1->evt + k2->evt + k3->evt + k4->evt;
+        const int drh = chroma_smooth_med5(k0->hr, k1->hr, k2->hr, k3->hr, k4->hr);
+        const int dbh = chroma_smooth_med5(k0->hb, k1->hb, k2->hb, k3->hb, k4->hb);
+        const int drv = chroma_smooth_med5(k0->vr, k1->vr, k2->vr, k3->vr, k4->vr);
+        const int dbv = chroma_smooth_med5(k0->vb, k1->vb, k2->vb, k3->vb, k4->vb);
+
+        const int g1 = k2->g1;
+        const int g2 = k2->g2;
+        const int g3 = k2->g3;
+        const int g4 = k2->g4;
+        const int g5 = k2->g5;
+        const int g6 = k2->g6;
+        const int grv = (g2 + g4) / 2;
+        const int grh = (g1 + g3) / 2;
+        const int gbv = (g1 + g6) / 2;
+        const int gbh = (g2 + g5) / 2;
+        const int choose_ev_lt_eh = ev < eh;
+        int dr = choose_ev_lt_eh ? drv : drh;
+        int db = choose_ev_lt_eh ? dbv : dbh;
+        const int use_average = r0 < black_thr || b0 < black_thr
+            || ABS(drv - drh) < direction_ev_thr
+            || ABS(grv - grh) < direction_ev_thr
+            || ABS(gbv - gbh) < direction_ev_thr;
+        int gr;
+        int gb;
+        if (use_average)
+        {
+            dr = (drv + drh) / 2;
+            gr = (g1 + g2 + g3 + g4) / 4;
+            db = (dbv + dbh) / 2;
+            gb = (g1 + g2 + g5 + g6) / 4;
+        }
+        else
+        {
+            gr = choose_ev_lt_eh ? grv : grh;
+            gb = choose_ev_lt_eh ? gbv : gbh;
+        }
+        if (write_r)
+        {
+            out_y[x] = chroma_smooth_ev2raw_clamped(ev2raw, ev2raw_lo, ev2raw_hi, gr + dr);
+        }
+        if (write_b)
+        {
+            out_y_p1[x + 1] = chroma_smooth_ev2raw_clamped(ev2raw, ev2raw_lo, ev2raw_hi, gb + db);
+        }
+    }
+}
+
+/* Returns 1 when out holds the full smoothed plane (copy fused), 0 when the
+ * per-thread ring could not be allocated (out untouched; caller falls back to
+ * memcpy + legacy kernel). */
+static int dualiso_chroma_smooth_2x2_fast_u32(int w,
+                                              int h,
+                                              const uint32_t * __restrict inp,
+                                              uint32_t * __restrict out,
+                                              const int * __restrict raw2ev,
+                                              const int * __restrict ev2raw,
+                                              int black,
+                                              int white)
+{
+    const int ncx = (w > 8) ? (w - 7) / 2 : 0;
+    const int ncy = (h > 9) ? (h - 8) / 2 : 0;
+    const size_t row_bytes = (size_t)w * sizeof(uint32_t);
+    if (ncx <= 0 || ncy <= 0)
+    {
+        if (w > 0 && h > 0)
+        {
+            memcpy(out, inp, row_bytes * (size_t)h);
+        }
+        return 1;
+    }
+
+    const int npos = ncx + 2;
+    int max_threads = 1;
+#ifdef _OPENMP
+    max_threads = omp_get_max_threads();
+    if (max_threads < 1)
+    {
+        max_threads = 1;
+    }
+#endif
+    const size_t ring_count = (size_t)3 * (size_t)npos;
+    dualiso_cs2_pos_t * rings =
+        (dualiso_cs2_pos_t *)malloc(ring_count * (size_t)max_threads * sizeof(dualiso_cs2_pos_t));
+    if (!rings)
+    {
+        return 0;
+    }
+
+    const int first_tail_row = 4 + 2 * ncy;
+    const int mutation = g_dualiso_cs2_mutation_for_testing;
+
+#ifdef _OPENMP
+#pragma omp parallel num_threads(max_threads)
+#endif
+    {
+        int tid = 0;
+        int nth = 1;
+#ifdef _OPENMP
+        tid = omp_get_thread_num();
+        nth = omp_get_num_threads();
+#endif
+        if (tid == 0)
+        {
+            memcpy(out, inp, row_bytes * 4);
+        }
+        if (tid == nth - 1 && first_tail_row < h)
+        {
+            memcpy(out + (size_t)first_tail_row * (size_t)w,
+                   inp + (size_t)first_tail_row * (size_t)w,
+                   row_bytes * (size_t)(h - first_tail_row));
+        }
+
+        const int i0 = (int)(((long long)ncy * tid) / nth);
+        const int i1 = (int)(((long long)ncy * (tid + 1)) / nth);
+        if (i0 < i1)
+        {
+            dualiso_cs2_pos_t * ring = rings + ring_count * (size_t)tid;
+            dualiso_cs2_pos_t * slot[3] = { ring, ring + npos, ring + 2 * npos };
+            /* Position row pi sits at p = 2 + 2 * pi; cell row i (y = 4 + 2i)
+             * needs position rows i (y-2), i+1 (y) and i+2 (y+2). */
+            dualiso_cs2_fill_pos_row(inp, w, 2 + 2 * i0, npos, raw2ev, mutation, slot[i0 % 3]);
+            dualiso_cs2_fill_pos_row(inp, w, 2 + 2 * (i0 + 1), npos, raw2ev, mutation, slot[(i0 + 1) % 3]);
+            for (int i = i0; i < i1; i++)
+            {
+                dualiso_cs2_fill_pos_row(inp, w, 2 + 2 * (i + 2), npos, raw2ev, mutation, slot[(i + 2) % 3]);
+                const dualiso_cs2_pos_t * up = slot[i % 3];
+                const dualiso_cs2_pos_t * dn = slot[(i + 2) % 3];
+                dualiso_cs2_cell_row(inp, out, w, 4 + 2 * i, ncx,
+                                     mutation ? dn : up, slot[(i + 1) % 3], mutation ? up : dn,
+                                     ev2raw, black, white);
+            }
+        }
+    }
+
+    free(rings);
+    return 1;
+}
+
+/* Legacy reference: serial full-plane copy, then the uint32 2x2 kernel. */
+static void dualiso_chroma_smooth_2x2_legacy_u32(int w,
+                                                 int h,
+                                                 uint32_t * inp,
+                                                 uint32_t * out,
+                                                 int * raw2ev,
+                                                 int * ev2raw,
+                                                 int black,
+                                                 int white)
+{
+    memcpy(out, inp, (size_t)w * (size_t)h * sizeof(uint32_t));
+    chroma_smooth_2x2(w, h, inp, out, raw2ev, ev2raw, black, white);
+}
+
+/* Test-only entry (pattern: dualisoSetAmazeThreadCreateFailureForTesting).
+ * Runs the legacy (use_fast=0) or fast (use_fast=1) 2x2 uint32 kernel on
+ * caller planes with an EV LUT built for (lut_black, lut_white), exactly as
+ * smooth_matched_source_planes builds it. kernel_ms (optional) receives the
+ * kernel time only (legacy: plane copy + kernel; fast: fused kernel), not the
+ * LUT build. Returns 1 on success. */
+int dualisoMixChroma2x2KernelForTesting(int use_fast,
+                                        int w,
+                                        int h,
+                                        const uint32_t * inp,
+                                        uint32_t * out,
+                                        int black,
+                                        int white,
+                                        int lut_black,
+                                        int lut_white,
+                                        double * kernel_ms);
+int dualisoMixChroma2x2KernelForTesting(int use_fast,
+                                        int w,
+                                        int h,
+                                        const uint32_t * inp,
+                                        uint32_t * out,
+                                        int black,
+                                        int white,
+                                        int lut_black,
+                                        int lut_white,
+                                        double * kernel_ms)
+{
+    if (!inp || !out || w <= 0 || h <= 0)
+    {
+        return 0;
+    }
+    int * raw2ev = (int *)malloc(DUALISO_RAW2EV_LUT_COUNT * sizeof(int));
+    int * ev2raw_0 = (int *)malloc(DUALISO_EV2RAW_LUT_COUNT * sizeof(int));
+    if (!raw2ev || !ev2raw_0)
+    {
+        free(raw2ev);
+        free(ev2raw_0);
+        return 0;
+    }
+    build_ev2raw_lut(raw2ev, ev2raw_0, lut_black, lut_white);
+    int * ev2raw = ev2raw_0 + 10 * EV_RESOLUTION;
+    int ok = 1;
+    const double kernel_start = mlv_stage_timing_now();
+    if (use_fast)
+    {
+        ok = dualiso_chroma_smooth_2x2_fast_u32(w, h, inp, out, raw2ev, ev2raw, black, white);
+    }
+    else
+    {
+        dualiso_chroma_smooth_2x2_legacy_u32(w, h, (uint32_t *)inp, out, raw2ev, ev2raw, black, white);
+    }
+    if (kernel_ms)
+    {
+        *kernel_ms = dualiso_debug_elapsed_ms(kernel_start);
+    }
+    free(raw2ev);
+    free(ev2raw_0);
+    return ok;
+}
+
 static inline void hdr_chroma_smooth(struct raw_info raw_info, uint32_t * input, uint32_t * output, int method, int * raw2ev, int * ev2raw)
 {
     int w = raw_info.width;
@@ -4681,6 +5012,38 @@ static void dualiso_debug_dump_source_smooth_plane(const char * name,
     fclose(f);
 }
 
+/* One matched-source plane: the fast fused kernel when use_fast, else (or if
+ * the fast ring cannot be allocated) the legacy copy + hdr_chroma_smooth. On
+ * the legacy route the caller has already copied both planes. */
+static inline void dualiso_smooth_source_plane(int use_fast,
+                                               struct raw_info info,
+                                               uint32_t * input,
+                                               uint32_t * output,
+                                               int method,
+                                               int * raw2ev,
+                                               int * ev2raw,
+                                               size_t plane_bytes)
+{
+    if (use_fast)
+    {
+        if (dualiso_chroma_smooth_2x2_fast_u32(info.width,
+                                               info.height,
+                                               input,
+                                               output,
+                                               raw2ev,
+                                               ev2raw,
+                                               info.black_level,
+                                               info.white_level))
+        {
+            return;
+        }
+        const double copy_start = mlv_stage_timing_now();
+        memcpy(output, input, plane_bytes);
+        g_dualiso_full20bit_timing.mix_chroma_copy_ms += dualiso_debug_elapsed_ms(copy_start);
+    }
+    hdr_chroma_smooth(info, input, output, method, raw2ev, ev2raw);
+}
+
 static inline int smooth_matched_source_planes(struct raw_info raw_info,
                                                uint32_t * dark,
                                                uint32_t * bright,
@@ -4700,14 +5063,25 @@ static inline int smooth_matched_source_planes(struct raw_info raw_info,
     {
         return 0;
     }
-    g_dualiso_full20bit_timing.mix_chroma_probe_mode = dualiso_mix_chroma_probe_mode();
+    const int probe_mode = dualiso_mix_chroma_probe_mode();
+    g_dualiso_full20bit_timing.mix_chroma_probe_mode = probe_mode;
+    /* CPU-S1-DUALISO-MIX-CHROMA-LEVER-1: the default route (probe unset or
+     * -1) takes the byte-identical fast 2x2 kernel with the copy fused into
+     * its parallel bands. Any probe mode >= 0 keeps the legacy copy + kernel
+     * so probe telemetry keeps its meaning. */
+    const int use_fast = probe_mode < 0 && chroma_smooth_method == 1;
 
     const size_t plane_pixels = (size_t)raw_info.width * (size_t)raw_info.height;
     const size_t plane_bytes = plane_pixels * sizeof(uint32_t);
 
     double stage_start = mlv_stage_timing_now();
-    memcpy(bright_smooth, bright, plane_bytes);
-    memcpy(dark_smooth, dark, plane_bytes);
+    if (!use_fast)
+    {
+        memcpy(bright_smooth, bright, plane_bytes);
+        memcpy(dark_smooth, dark, plane_bytes);
+    }
+    /* On the fast route no separate copy remains (it is inside the bands), so
+     * this times nothing unless a fast plane falls back below. */
     g_dualiso_full20bit_timing.mix_chroma_copy_ms += dualiso_debug_elapsed_ms(stage_start);
 
 #ifndef STDOUT_SILENT
@@ -4732,7 +5106,7 @@ static inline int smooth_matched_source_planes(struct raw_info raw_info,
     struct raw_info bright_info = raw_info;
     bright_info.black_level = black;
     bright_info.white_level = bright_white;
-    hdr_chroma_smooth(bright_info, bright, bright_smooth, chroma_smooth_method, raw2ev, ev2raw);
+    dualiso_smooth_source_plane(use_fast, bright_info, bright, bright_smooth, chroma_smooth_method, raw2ev, ev2raw, plane_bytes);
     g_dualiso_mix_chroma_probe_stage_cache = 0;
     g_dualiso_full20bit_timing.mix_chroma_probe_stage = 0;
     g_dualiso_full20bit_timing.mix_chroma_fullres_ms += dualiso_debug_elapsed_ms(stage_start);
@@ -4743,7 +5117,7 @@ static inline int smooth_matched_source_planes(struct raw_info raw_info,
     struct raw_info dark_info = raw_info;
     dark_info.black_level = black;
     dark_info.white_level = dark_white;
-    hdr_chroma_smooth(dark_info, dark, dark_smooth, chroma_smooth_method, raw2ev, ev2raw);
+    dualiso_smooth_source_plane(use_fast, dark_info, dark, dark_smooth, chroma_smooth_method, raw2ev, ev2raw, plane_bytes);
     g_dualiso_mix_chroma_probe_stage_cache = 0;
     g_dualiso_full20bit_timing.mix_chroma_probe_stage = 0;
     g_dualiso_full20bit_timing.mix_chroma_halfres_ms += dualiso_debug_elapsed_ms(stage_start);
