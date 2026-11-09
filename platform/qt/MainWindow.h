@@ -1710,6 +1710,9 @@ private:
     int m_playbackSmokeLastDebayerEngineMode = -1;
     int m_playbackSmokeDebayerBasicU16Avx2AvailableFrames = 0;
     int m_playbackSmokeDebayerBasicU16Avx2UsedFrames = 0;
+    /* CPU-S1-DUALISO-MIX-CHROMA-LEVER-2: full20 frames whose matched-source
+     * 2x2 smooth ran the AVX2 kernel. */
+    int m_playbackSmokeDualIsoMixChromaAvx2UsedFrames = 0;
     int m_playbackSmokeProcessed8CacheHits = 0;
     int m_playbackSmokeCpuDualIsoReducedReconFrames = 0;
     int m_playbackSmokeCpuDualIsoFullReconFrames = 0;

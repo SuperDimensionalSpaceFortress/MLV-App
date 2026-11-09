@@ -497,6 +497,8 @@ void insertLlrawprocReconTimingTelemetry( QJsonObject &target )
                    dualIsoFull20.use_alias_map != 0 );
     target.insert( QStringLiteral("dual_iso_full20_use_fullres"),
                    dualIsoFull20.use_fullres != 0 );
+    target.insert( QStringLiteral("dual_iso_full20_mix_chroma_avx2_used"),
+                   dualIsoFull20.mix_chroma_avx2_used != 0 );
     insertDualIsoWarmupInstrumentationTelemetry( target, dualIsoFull20 );
 }
 
@@ -6992,6 +6994,8 @@ void RenderFrameThread::drawFrame( int slotIndex,
                                       dualIsoFull20.use_alias_map != 0 );
     slot.stageTimingTelemetry.insert( QStringLiteral("dual_iso_full20_use_fullres"),
                                       dualIsoFull20.use_fullres != 0 );
+    slot.stageTimingTelemetry.insert( QStringLiteral("dual_iso_full20_mix_chroma_avx2_used"),
+                                      dualIsoFull20.mix_chroma_avx2_used != 0 );
     slot.stageTimingTelemetry.insert( QStringLiteral("dual_iso_full20_threads"),
                                       dualIsoFull20.threads );
     slot.stageTimingTelemetry.insert( QStringLiteral("dual_iso_full20_valid"),

@@ -70,6 +70,10 @@ extern "C" int dualisoMixChroma2x2KernelForTesting(int use_fast,
                                                    int lut_white,
                                                    double * kernel_ms);
 extern "C" void dualisoSetMixChromaFastMutationForTesting(int mutation);
+extern "C" int dualisoMixChromaAvx2Active(void);
+extern "C" int dualisoMixChromaReinitDispatchForTesting(void);
+extern "C" void dualisoSetMixChromaRouteForTesting(int route);
+extern "C" void dualisoSetMixChromaRingPerCallForTesting(int per_call);
 extern "C" int dngFormatDateTimeForFrameForTesting(mlvObject_t * mlv_data,
                                                      uint32_t frame_index,
                                                      char * datetime,
@@ -6715,8 +6719,11 @@ size_t mix_chroma_count_diff(const std::vector<uint32_t> & a, const std::vector<
     return diff;
 }
 
-// RED harness: MLVAPP_MIX_CHROMA_TEST_MUTATION=1 breaks the fast kernel on purpose
+// RED harness: MLVAPP_MIX_CHROMA_TEST_MUTATION=1 breaks both fast kernels on purpose
 // (dualisoSetMixChromaFastMutationForTesting); every identity test must then fail.
+// MLVAPP_MIX_CHROMA_TEST_MUTATION=2 breaks only the AVX2 kernel (srai for the
+// truncating /2 and /4): it fails with AVX2 on and passes with
+// MLVAPP_DISABLE_AVX2_DUALISO_MIX_CHROMA=1, which proves which path ran.
 struct MixChromaMutationFromEnv
 {
     MixChromaMutationFromEnv()
@@ -6726,6 +6733,43 @@ struct MixChromaMutationFromEnv
     ~MixChromaMutationFromEnv()
     {
         dualisoSetMixChromaFastMutationForTesting(0);
+    }
+};
+
+// CPU-S1-DUALISO-MIX-CHROMA-LEVER-2: the fast routes checked against the legacy
+// route 0. Route 2 (AVX2) runs only when its dispatch is active; otherwise its
+// half is reported SKIPPED, never PASS.
+std::vector<int> mix_chroma_fast_routes(const char * test)
+{
+    const int avx2 = dualisoMixChromaAvx2Active();
+    std::fprintf(stderr, "[mix-chroma-routes] test=%s avx2=%d route1=RUN route2=%s\n",
+                 test, avx2, avx2 ? "RUN" : "SKIPPED");
+    return avx2 ? std::vector<int>{ 1, 2 } : std::vector<int>{ 1 };
+}
+
+// The OpenMP team a parallel region really gets under the current settings.
+int mix_chroma_actual_team()
+{
+    int team = 1;
+#ifdef _OPENMP
+#pragma omp parallel
+    {
+#pragma omp single
+        team = omp_get_num_threads();
+    }
+#endif
+    return team;
+}
+
+struct ScopedMixChromaRoute
+{
+    explicit ScopedMixChromaRoute(int route)
+    {
+        dualisoSetMixChromaRouteForTesting(route);
+    }
+    ~ScopedMixChromaRoute()
+    {
+        dualisoSetMixChromaRouteForTesting(-1);
     }
 };
 
@@ -6765,13 +6809,15 @@ private:
     QByteArray old_value_;
 };
 
-// probe == nullptr runs the default (fast) route; a probe mode >= 0 runs legacy.
-// The matched-source smooth dumps both smoothed planes into dump_dir
-// (DUALISO_DEBUG_SOURCE_SMOOTH_DIR, written only by smooth_matched_source_planes),
-// which proves the stage ran and gives a plane-level identity check.
+// route pins the matched-source smooth (dualisoSetMixChromaRouteForTesting):
+// 0 = legacy copy + kernel, 1 = K1/K2 scalar, 2 = LEVER-2 AVX2; the probe env is
+// unset on every route. The matched-source smooth dumps both smoothed planes into
+// dump_dir (DUALISO_DEBUG_SOURCE_SMOOTH_DIR, written only by
+// smooth_matched_source_planes), which proves the stage ran and gives a
+// plane-level identity check.
 bool mix_chroma_run_full20(const struct raw_info & raw,
                            const std::vector<uint16_t> & source,
-                           const char * probe,
+                           int route,
                            int interp_method,
                            int iso_pattern_in,
                            const QString & dump_dir,
@@ -6781,7 +6827,8 @@ bool mix_chroma_run_full20(const struct raw_info & raw,
                            QByteArray * dark_plane)
 {
     ScopedMixChromaProbeEnv env;
-    env.set(probe);
+    env.set(nullptr);
+    ScopedMixChromaRoute route_scope(route);
     const QString bright_path = dump_dir + QStringLiteral("/stage_bright_source_smooth.u32");
     const QString dark_path = dump_dir + QStringLiteral("/stage_dark_source_smooth.u32");
     QFile::remove(bright_path);
@@ -6837,19 +6884,24 @@ void mix_chroma_expect_full20_identity(const char * label,
 {
     QTemporaryDir dump_dir;
     ASSERT_TRUE(dump_dir.isValid());
-    std::vector<uint16_t> fast_image;
     std::vector<uint16_t> legacy_image;
-    dualiso_full20bit_timing_t fast_timing = {};
     dualiso_full20bit_timing_t legacy_timing = {};
-    QByteArray fast_bright, fast_dark, legacy_bright, legacy_dark;
-    ASSERT_TRUE(mix_chroma_run_full20(raw, source, nullptr, interp_method, iso_pattern, dump_dir.path(),
-                                      &fast_image, &fast_timing, &fast_bright, &fast_dark));
-    ASSERT_TRUE(mix_chroma_run_full20(raw, source, "1", interp_method, iso_pattern, dump_dir.path(),
+    QByteArray legacy_bright, legacy_dark;
+    ASSERT_TRUE(mix_chroma_run_full20(raw, source, 0, interp_method, iso_pattern, dump_dir.path(),
                                       &legacy_image, &legacy_timing, &legacy_bright, &legacy_dark));
-    // Both runs reached the matched-source smooth (it alone writes the dumps),
-    // on different routes (probe mode recorded by that stage).
+    ASSERT_EQ(-1, legacy_timing.mix_chroma_probe_mode);
+    ASSERT_EQ(0, legacy_timing.mix_chroma_avx2_used);
+    for (const int route : mix_chroma_fast_routes(label))
+    {
+    std::vector<uint16_t> fast_image;
+    dualiso_full20bit_timing_t fast_timing = {};
+    QByteArray fast_bright, fast_dark;
+    ASSERT_TRUE(mix_chroma_run_full20(raw, source, route, interp_method, iso_pattern, dump_dir.path(),
+                                      &fast_image, &fast_timing, &fast_bright, &fast_dark));
+    // Both runs reached the matched-source smooth (it alone writes the dumps)
+    // with no probe; the route is pinned and the AVX2 flag says which kernel ran.
     ASSERT_EQ(-1, fast_timing.mix_chroma_probe_mode);
-    ASSERT_EQ(1, legacy_timing.mix_chroma_probe_mode);
+    ASSERT_EQ(route == 2 ? 1 : 0, fast_timing.mix_chroma_avx2_used);
     const qint64 plane_bytes = static_cast<qint64>(raw.width) * raw.height * 4;
     ASSERT_TRUE(fast_bright.size() > 0 && fast_dark.size() > 0);
     ASSERT_TRUE(fast_bright.size() <= plane_bytes && fast_dark.size() <= plane_bytes);
@@ -6872,9 +6924,11 @@ void mix_chroma_expect_full20_identity(const char * label,
         }
     }
     std::fprintf(stderr,
-                 "[mix-chroma-full20] case=%s interp=%d w=%d h=%d differing_pixels=%zu first=%lld "
+                 "[mix-chroma-full20] case=%s route=%d avx2=%d interp=%d w=%d h=%d differing_pixels=%zu first=%lld "
                  "changed_by_recon=%d\n",
                  label,
+                 route,
+                 dualisoMixChromaAvx2Active(),
                  interp_method,
                  raw.width,
                  raw.height,
@@ -6883,6 +6937,7 @@ void mix_chroma_expect_full20_identity(const char * label,
                  fast_image != source ? 1 : 0);
     ASSERT_EQ(static_cast<size_t>(0), diff);
     ASSERT_EQ(0, std::memcmp(fast_image.data(), legacy_image.data(), fast_image.size() * sizeof(uint16_t)));
+    }
 }
 
 } // namespace
@@ -6904,6 +6959,7 @@ TEST(DualIsoPipeline, MixChromaFast2x2KernelIsByteIdenticalToLegacy)
         { 127, 129 }, { 1808, 2268 },
     };
     const int thread_counts[3] = { 1, 2, 16 };
+    const std::vector<int> routes = mix_chroma_fast_routes("kernel");
     uint64_t seed = 1;
     for (const auto & g : geoms)
     {
@@ -6914,12 +6970,14 @@ TEST(DualIsoPipeline, MixChromaFast2x2KernelIsByteIdenticalToLegacy)
             const std::vector<uint32_t> plane = mix_chroma_random_plane(w, h, lut_black, white, seed++);
             for (int threads : thread_counts)
             {
+                for (const int route : routes)
+                {
                 OpenMpThreadCountScope omp_scope(threads);
                 std::vector<uint32_t> legacy(plane.size(), 0xA5A5A5A5u);
                 std::vector<uint32_t> fast(plane.size(), 0x5A5A5A5Au);
                 ASSERT_EQ(1, dualisoMixChroma2x2KernelForTesting(0, w, h, plane.data(), legacy.data(),
                                                                  lut_black, white, lut_black, lut_white, nullptr));
-                ASSERT_EQ(1, dualisoMixChroma2x2KernelForTesting(1, w, h, plane.data(), fast.data(),
+                ASSERT_EQ(1, dualisoMixChroma2x2KernelForTesting(route, w, h, plane.data(), fast.data(),
                                                                  lut_black, white, lut_black, lut_white, nullptr));
                 size_t first = SIZE_MAX;
                 const size_t diff = mix_chroma_count_diff(legacy, fast, &first);
@@ -6928,9 +6986,9 @@ TEST(DualIsoPipeline, MixChromaFast2x2KernelIsByteIdenticalToLegacy)
                 if (diff != 0 || (w >= 1808 && threads == 16))
                 {
                     std::fprintf(stderr,
-                                 "[mix-chroma-kernel] w=%d h=%d white=%d threads=%d differing_pixels=%zu first=%lld "
-                                 "legacy_changed=%zu\n",
-                                 w, h, white, threads, diff,
+                                 "[mix-chroma-kernel] route=%d avx2=%d w=%d h=%d white=%d threads=%d "
+                                 "differing_pixels=%zu first=%lld legacy_changed=%zu\n",
+                                 route, dualisoMixChromaAvx2Active(), w, h, white, threads, diff,
                                  first == SIZE_MAX ? -1LL : static_cast<long long>(first), changed);
                 }
                 ASSERT_EQ(static_cast<size_t>(0), diff);
@@ -6945,6 +7003,7 @@ TEST(DualIsoPipeline, MixChromaFast2x2KernelIsByteIdenticalToLegacy)
                     // No legacy cell: both outputs are the input.
                     ASSERT_EQ(static_cast<size_t>(0), changed);
                 }
+                }
             }
         }
     }
@@ -6952,19 +7011,70 @@ TEST(DualIsoPipeline, MixChromaFast2x2KernelIsByteIdenticalToLegacy)
     // Adversary eae11081 A2: a fully clipped plane holding values at or past
     // the raw2ev LUT end. The legacy loop skips every cell without a lookup;
     // the fast fill must not read past the LUT and must also copy the plane.
+    // 9x10 has one cell; 40x30 puts a full 8-cell AVX2 step on the clipped
+    // values too (EV-row conversion and the masked store).
     for (const uint32_t clipped : { (1u << 20) - 1u, 1u << 20, 0x7FFFFFFFu, 0xFFFFFFFFu })
     {
-        const int w = 9;
-        const int h = 10;
+        for (const auto & g : { std::make_pair(9, 10), std::make_pair(40, 30) })
+        {
+        for (const int route : routes)
+        {
+        const int w = g.first;
+        const int h = g.second;
         const std::vector<uint32_t> plane(static_cast<size_t>(w) * static_cast<size_t>(h), clipped);
         std::vector<uint32_t> legacy(plane.size(), 0xA5A5A5A5u);
         std::vector<uint32_t> fast(plane.size(), 0x5A5A5A5Au);
         ASSERT_EQ(1, dualisoMixChroma2x2KernelForTesting(0, w, h, plane.data(), legacy.data(),
                                                          lut_black, lut_white, lut_black, lut_white, nullptr));
-        ASSERT_EQ(1, dualisoMixChroma2x2KernelForTesting(1, w, h, plane.data(), fast.data(),
+        ASSERT_EQ(1, dualisoMixChroma2x2KernelForTesting(route, w, h, plane.data(), fast.data(),
                                                          lut_black, lut_white, lut_black, lut_white, nullptr));
         ASSERT_EQ(0, std::memcmp(legacy.data(), fast.data(), legacy.size() * sizeof(uint32_t)));
         ASSERT_EQ(0, std::memcmp(plane.data(), fast.data(), plane.size() * sizeof(uint32_t)));
+        }
+        }
+    }
+
+    // LUT-end case: a plane mixing in-range values with values up to the last
+    // raw2ev LUT entry (clipped, >= white) and near zero (far below black), so
+    // written and skipped cells share an AVX2 step and the ev2raw clamp runs at
+    // both ends. Values stay 20-bit: the legacy reference reads raw2ev
+    // unclamped for every neighbour of a written cell, as real 20-bit planes
+    // allow (values past the LUT are covered by the fully clipped planes above).
+    {
+        const int w = 1808;
+        const int h = 40;
+        std::vector<uint32_t> plane = mix_chroma_random_plane(w, h, lut_black, lut_white, 991);
+        MixChromaRng rng{ 4242 };
+        for (size_t i = 0; i < plane.size(); i++)
+        {
+            const uint32_t sel = rng.next() % 16u;
+            if (sel == 0u)
+            {
+                plane[i] = (1u << 20) - 1u - rng.next() % 4096u;
+            }
+            else if (sel == 1u)
+            {
+                plane[i] = (1u << 20) - 1u;
+            }
+            else if (sel == 2u)
+            {
+                plane[i] = rng.next() % 64u;
+            }
+        }
+        for (const int route : routes)
+        {
+            std::vector<uint32_t> legacy(plane.size(), 0xA5A5A5A5u);
+            std::vector<uint32_t> fast(plane.size(), 0x5A5A5A5Au);
+            ASSERT_EQ(1, dualisoMixChroma2x2KernelForTesting(0, w, h, plane.data(), legacy.data(),
+                                                             lut_black, lut_white, lut_black, lut_white, nullptr));
+            ASSERT_EQ(1, dualisoMixChroma2x2KernelForTesting(route, w, h, plane.data(), fast.data(),
+                                                             lut_black, lut_white, lut_black, lut_white, nullptr));
+            size_t first = SIZE_MAX;
+            const size_t diff = mix_chroma_count_diff(legacy, fast, &first);
+            std::fprintf(stderr, "[mix-chroma-kernel] case=lut-end route=%d avx2=%d differing_pixels=%zu\n",
+                         route, dualisoMixChromaAvx2Active(), diff);
+            ASSERT_EQ(static_cast<size_t>(0), diff);
+        }
     }
 
     // Adversary 5ef39f3a A1: the seam refuses a LUT the builder would index out of range.
@@ -7001,35 +7111,134 @@ TEST(DualIsoPipeline, MixChromaFast2x2BenchAtVenueGeometry)
     std::vector<uint32_t> out_b(bright.size());
     std::vector<uint32_t> out_d(dark.size());
     OpenMpThreadCountScope omp_scope(16);
-    // Report the team the kernels actually get (adversary 5ef39f3a A2).
-    int bench_threads = 1;
-#ifdef _OPENMP
-    bench_threads = omp_get_max_threads();
-#endif
+    // Report the team the kernels actually get (adversary 5ef39f3a A2), measured
+    // inside a parallel region under the same scope.
+    const int bench_threads = mix_chroma_actual_team();
+    const int avx2 = dualisoMixChromaAvx2Active();
     std::vector<double> legacy_ms;
     std::vector<double> fast_ms;
+    std::vector<double> avx2_ms;
     for (int r = 0; r < runs + 2; r++)
     {
-        double a = 0.0, b = 0.0, c = 0.0, d = 0.0;
+        double a = 0.0, b = 0.0, c = 0.0, d = 0.0, e = 0.0, f = 0.0;
         ASSERT_EQ(1, dualisoMixChroma2x2KernelForTesting(0, w, h, bright.data(), out_b.data(), lut_black, bright_white, lut_black, lut_white, &a));
         ASSERT_EQ(1, dualisoMixChroma2x2KernelForTesting(0, w, h, dark.data(), out_d.data(), lut_black, lut_white, lut_black, lut_white, &b));
         ASSERT_EQ(1, dualisoMixChroma2x2KernelForTesting(1, w, h, bright.data(), out_b.data(), lut_black, bright_white, lut_black, lut_white, &c));
         ASSERT_EQ(1, dualisoMixChroma2x2KernelForTesting(1, w, h, dark.data(), out_d.data(), lut_black, lut_white, lut_black, lut_white, &d));
+        ASSERT_EQ(1, dualisoMixChroma2x2KernelForTesting(2, w, h, bright.data(), out_b.data(), lut_black, bright_white, lut_black, lut_white, &e));
+        ASSERT_EQ(1, dualisoMixChroma2x2KernelForTesting(2, w, h, dark.data(), out_d.data(), lut_black, lut_white, lut_black, lut_white, &f));
         if (r >= 2)
         {
             legacy_ms.push_back(a + b);
             fast_ms.push_back(c + d);
+            avx2_ms.push_back(e + f);
         }
     }
     std::sort(legacy_ms.begin(), legacy_ms.end());
     std::sort(fast_ms.begin(), fast_ms.end());
+    std::sort(avx2_ms.begin(), avx2_ms.end());
     const double legacy_median = legacy_ms[legacy_ms.size() / 2];
     const double fast_median = fast_ms[fast_ms.size() / 2];
+    const double avx2_median = avx2_ms[avx2_ms.size() / 2];
     std::fprintf(stderr,
-                 "[mix-chroma-bench] w=%d h=%d threads=%d runs=%d legacy_median_ms=%.3f fast_median_ms=%.3f "
-                 "ratio=%.4f legacy_min_ms=%.3f fast_min_ms=%.3f\n",
-                 w, h, bench_threads, runs, legacy_median, fast_median, fast_median / legacy_median,
-                 legacy_ms.front(), fast_ms.front());
+                 "[mix-chroma-bench] w=%d h=%d threads=%d runs=%d avx2=%d legacy_median_ms=%.3f fast_median_ms=%.3f "
+                 "avx2_median_ms=%.3f ratio=%.4f avx2_ratio=%.4f legacy_min_ms=%.3f fast_min_ms=%.3f avx2_min_ms=%.3f\n",
+                 w, h, bench_threads, runs, avx2, legacy_median, fast_median, avx2_median,
+                 fast_median / legacy_median, avx2_median / legacy_median,
+                 legacy_ms.front(), fast_ms.front(), avx2_ms.front());
+}
+
+// LEVER-2 offline gate (opt-in: MLVAPP_MIX_CHROMA_FULL20_BENCH=<runs>, 20..200):
+// the whole full20 reconstruction of large_dual_iso frame 0 at 16 threads,
+// routes 0 (legacy), 1 (K1/K2 scalar) and 2 (LEVER-2 AVX2) alternating every
+// iteration. Per route: medians of total_ms, mix_chroma_ms + mix_chroma_copy_ms,
+// fullres_ms (phase balance) and the rest (total minus those). Gate figure
+// R = (t0 - t2) / (t0 - t1) on total_ms. MLVAPP_MIX_CHROMA_FULL20_BENCH_K3_OFF=1
+// runs the per-call ring (pre-K3) instead of the scratch-owned ring.
+TEST(DualIsoPipeline, MixChromaFull20RouteBenchAtVenueGeometry)
+{
+    const QByteArray runs_env = qgetenv("MLVAPP_MIX_CHROMA_FULL20_BENCH");
+    if (runs_env.isEmpty())
+    {
+        SKIP_TEST("Set MLVAPP_MIX_CHROMA_FULL20_BENCH=<runs> to run the full20 route bench.");
+    }
+    const int runs = std::min(200, std::max(20, runs_env.toInt()));
+    const int k3_off = qgetenv("MLVAPP_MIX_CHROMA_FULL20_BENCH_K3_OFF").toInt() != 0;
+    MlvPipelineFixture fixture;
+    QString error_message;
+    ASSERT_TRUE(fixture.openClipFile(repo_file_path(QStringLiteral("tests/fixtures/clips/large_dual_iso.mlv")),
+                                     &error_message));
+    ASSERT_TRUE(fixture.loadReceipt(QStringLiteral("tests/fixtures/receipts/large_dual_iso_hq.marxml"), &error_message));
+    ASSERT_TRUE(fixture.applyReceipt(&error_message));
+    struct raw_info raw = fixture.video()->RAWI.raw_info;
+    raw.width = fixture.width();
+    raw.height = fixture.height();
+    raw.pitch = raw.width;
+    raw.active_area.x1 = 0;
+    raw.active_area.y1 = 0;
+    raw.active_area.x2 = raw.width;
+    raw.active_area.y2 = raw.height;
+    std::vector<uint16_t> source(static_cast<size_t>(raw.width) * static_cast<size_t>(raw.height));
+    ASSERT_EQ(0, getMlvRawFrameUint16(fixture.video(), 0, source.data()));
+
+    ScopedMixChromaProbeEnv env;
+    env.set(nullptr);
+    OpenMpThreadCountScope omp_scope(16);
+    const int team = mix_chroma_actual_team();
+    const int avx2 = dualisoMixChromaAvx2Active();
+    dualisoSetMixChromaRingPerCallForTesting(k3_off);
+    // One scratch per route, reused across iterations as the product reuses it.
+    dualiso_full20bit_scratch_t scratch[3] = {};
+    std::vector<double> total[3], chroma[3], fullres[3], rest[3];
+    std::vector<uint16_t> image;
+    for (int r = 0; r < runs + 1; r++)
+    {
+        for (int route = 0; route < 3; route++)
+        {
+            ScopedMixChromaRoute route_scope(route);
+            dualiso_debug_reset_full20bit_timing();
+            image = source;
+            int iso_pattern = 0;
+            int auto_correction = -1;
+            double ev_correction = 1.0;
+            int black_delta = -1;
+            ASSERT_EQ(1, diso_get_full20bit(raw, image.data(), 0, 100, 200, &iso_pattern, &auto_correction,
+                                            &ev_correction, &black_delta, 0, 1, 1, 1, 1, 1, &scratch[route]));
+            dualiso_full20bit_timing_t t = {};
+            dualiso_debug_get_full20bit_timing(&t);
+            ASSERT_EQ(route == 2 && avx2 ? 1 : 0, t.mix_chroma_avx2_used);
+            if (r >= 1)
+            {
+                const double c = t.mix_chroma_ms + t.mix_chroma_copy_ms;
+                total[route].push_back(t.total_ms);
+                chroma[route].push_back(c);
+                fullres[route].push_back(t.fullres_ms);
+                rest[route].push_back(t.total_ms - c - t.fullres_ms);
+            }
+        }
+    }
+    dualisoSetMixChromaRingPerCallForTesting(0);
+    for (auto & s : scratch)
+    {
+        free_dualiso_full20bit_scratch(&s);
+    }
+    auto median = [](std::vector<double> v) {
+        std::sort(v.begin(), v.end());
+        return v[v.size() / 2];
+    };
+    double t_med[3];
+    for (int route = 0; route < 3; route++)
+    {
+        t_med[route] = median(total[route]);
+        std::fprintf(stderr,
+                     "[mix-chroma-full20-bench] route=%d w=%d h=%d team=%d avx2=%d k3_off=%d runs=%d "
+                     "total_ms=%.3f mix_chroma_ms=%.3f fullres_ms=%.3f unattributed_ms=%.3f\n",
+                     route, raw.width, raw.height, team, avx2, k3_off, runs, t_med[route],
+                     median(chroma[route]), median(fullres[route]), median(rest[route]));
+    }
+    const double denom = t_med[0] - t_med[1];
+    std::fprintf(stderr, "[mix-chroma-full20-bench] R=%.4f t0=%.3f t1=%.3f t2=%.3f avx2=%d team=%d\n",
+                 denom != 0.0 ? (t_med[0] - t_med[2]) / denom : 0.0, t_med[0], t_med[1], t_med[2], avx2, team);
 }
 
 TEST(DualIsoPipeline, MixChromaFastRouteFull20IsByteIdenticalToLegacySynthetic)
