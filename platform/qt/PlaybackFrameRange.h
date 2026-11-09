@@ -265,6 +265,10 @@ struct DropFrameTickResult
     // r32: cutOut - cutIn + 1 under advanceDropFrameTick's presentLastFrame (conform), where the last frame IS returned.
     // The wrap recorder stores this, so a Loop + Drop Frame wrap is credited the distance the timeline travelled.
     int wrapWidth = 0;
+    // r33 (adversary A1 on e0947e37): how many laps this tick wrapped, each by wrapWidth; 0 when it did not wrap. One tick can
+    // cross more than one lap when its applied delta is wider than the cut (a skipped backlog on a two-frame cut), so the
+    // position moved back by wrapWidth * wrapLaps, and MainWindow records every lap.
+    int wrapLaps = 0;
 };
 
 // advanceDropFrameTick mirrors MainWindow::playbackHandling's drop-frame-mode per-tick position
@@ -305,7 +309,21 @@ inline DropFrameTickResult advanceDropFrameTick(
     if( loopEnabled && result.position >= wrapAt )
     {
         result.wrapWidth = cutOutValue - cutInValue + ( presentLastFrame ? 1 : 0 );
-        result.position -= static_cast<double>( result.wrapWidth );
+        // r33 (adversary A1 on e0947e37): wrap by as many whole laps as the applied delta crossed, so the position lands back
+        // in [wrapAt - wrapWidth, wrapAt), inside the cut (Cut 101..102 conformed, 100.25 + 4 applied: two laps, 100.25; one
+        // subtraction left 102.25, past the cut's last frame 101). A single lap subtracts exactly as before (1.0 * w == w).
+        const double width = static_cast<double>( result.wrapWidth );
+        double laps = 1.0;
+        if( width > 0.0 )
+        {
+            laps = std::floor( ( result.position - wrapAt ) / width ) + 1.0;
+            laps = std::min( std::max( laps, 1.0 ), static_cast<double>( std::numeric_limits<int>::max() - 1 ) );
+            // the division's rounding: never one lap too many, never one too few
+            if( laps > 1.0 && result.position - ( laps - 1.0 ) * width < wrapAt ) laps -= 1.0;
+            if( result.position - laps * width >= wrapAt ) laps += 1.0;
+        }
+        result.position -= laps * width;
+        result.wrapLaps = static_cast<int>( laps );
         result.wrapped = true;
     }
     else if( !loopEnabled && result.position >= lastFrame )
@@ -565,7 +583,11 @@ struct PlaybackWrapRecorder
     int restartCount = 0;
     bool inferredWrap = false;
 
-    void noteEngineWrap( int cutWidth = 0 ) { ++engineWraps; engineWrapWidths.push_back( cutWidth ); }
+    // r33 (adversary A1 on e0947e37): \a laps wraps of \a cutWidth each (a drop-frame tick that crossed more than one lap).
+    void noteEngineWrap( int cutWidth = 0, int laps = 1 )
+    {
+        for( int lap = 0; lap < laps; ++lap ) { ++engineWraps; engineWrapWidths.push_back( cutWidth ); }
+    }
     // The total cut width of `count` wraps from wrap number `firstWrap` (0-based, as engineWraps counts them).
     int64_t engineWrapsWidth( int firstWrap, int count ) const
     {

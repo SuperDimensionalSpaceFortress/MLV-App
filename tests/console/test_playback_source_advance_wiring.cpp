@@ -76,11 +76,12 @@ TEST(PlaybackSourceAdvanceWiring, AnEngineWrapIsNotedBeforeTheFrameItLandsOnIsRe
     const int loopWrap = body.indexOf(QStringLiteral("m_playbackWrapRecorder.noteEngineWrap( playback_frame_range::loopWrapWidth( ui->horizontalSliderPosition->value(), cutInFrame ) );"));
     ASSERT_TRUE(loopWrap >= 0);
     ASSERT_TRUE(body.indexOf(QStringLiteral("ui->horizontalSliderPosition->setValue( cutInFrame );"), loopWrap) > loopWrap);
-    // r21 (key3 M-HFR-DROP-WRAP-WIDTH): a drop-frame wrap records the width its tick subtracted (cutOut - cutIn)
-    const int dropWrap = body.indexOf(QStringLiteral("if( dropFrameTick.wrapped ) m_playbackWrapRecorder.noteEngineWrap( dropFrameTick.wrapWidth );"));
+    // r21 (key3 M-HFR-DROP-WRAP-WIDTH): a drop-frame wrap records the width its tick subtracted (cutOut - cutIn); r33 (adversary
+    // A1 on e0947e37): once per lap the tick crossed
+    const int dropWrap = body.indexOf(QStringLiteral("if( dropFrameTick.wrapped ) m_playbackWrapRecorder.noteEngineWrap( dropFrameTick.wrapWidth, dropFrameTick.wrapLaps );"));
     ASSERT_TRUE(dropWrap >= 0);
     ASSERT_TRUE(body.indexOf(QStringLiteral("ui->horizontalSliderPosition->setValue( m_newPosDropMode );"), dropWrap) > dropWrap);
-    ASSERT_TRUE(body.indexOf(QStringLiteral("+ static_cast<double>( dropFrameTick.wrapWidth );")) > loopWrap);
+    ASSERT_TRUE(body.indexOf(QStringLiteral("+ static_cast<double>( dropFrameTick.wrapWidth ) * dropFrameTick.wrapLaps;")) > loopWrap);
     // and no wrap is credited the cut range as it stands (r21: neither engine moves by it once the cut changes under the playhead)
     const QString note = QStringLiteral("m_playbackWrapRecorder.noteEngineWrap(");
     const int firstNote = body.indexOf(note);

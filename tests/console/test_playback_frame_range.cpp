@@ -3614,6 +3614,69 @@ TEST( PlaybackConformDropFrame, R33B1PaintAndDebtControlsHoldOnTheBoundary )
     }
 }
 
+TEST( PlaybackConformDropFrame, R33A1ATickWiderThanTheCutWrapsEveryLapAndStaysInTheCut )
+{
+    // adversary A1 on e0947e37, its input: a 720-frame 60 fps clip conformed to 24, Cut In 101, Cut Out 102, Play + Loop + Drop
+    // Frame, position 100.25, no debt, target presented, granted 12.0 (a 500 ms GUI delay). The conformed delta is the next frame
+    // plus the backlog above kConformMaxDebtFrames: 4 applied, 8 carried. One subtraction of the width (2) left 102.25, so
+    // MainWindow requested frame 102, past the cut's last frame 101.
+    using playback_frame_range::DropFrameTickResult;
+    using playback_frame_range::advanceDropFrameTick;
+    const int cutIn = 101, cutOut = 102;
+    double debt = 0.0;
+    const double delta = playback_frame_range::conformDropFrameDelta( 100.25, 12.0, true, debt, true );
+    ASSERT_NEAR( 4.0, delta, 1e-9 );
+    ASSERT_NEAR( 8.0, debt, 1e-12 );
+    const DropFrameTickResult tick = advanceDropFrameTick( 100.25, delta, cutIn, cutOut, true, true );
+    ASSERT_TRUE( tick.wrapped );
+    ASSERT_EQ( 2, tick.wrapWidth );
+    ASSERT_EQ( 2, tick.wrapLaps );
+    ASSERT_NEAR( 100.25, tick.position, 1e-9 );
+    ASSERT_TRUE( static_cast<int>( tick.position ) >= cutIn - 1 );
+    ASSERT_TRUE( static_cast<int>( tick.position ) <= cutOut - 1 );
+    bool out = true;
+    playback_frame_range::normalizeDropFramePosition(
+        tick.position, playback_frame_range::normalizeCutRange( cutIn, cutOut, 720, true ), 720, true, &out );
+    ASSERT_FALSE( out );
+    // MainWindow's grantedDropFrames reads the applied delta back, and the wrap recorder gets every lap at its width
+    ASSERT_NEAR( delta, tick.position - 100.25 + static_cast<double>( tick.wrapWidth ) * tick.wrapLaps, 1e-9 );
+    playback_frame_range::PlaybackWrapRecorder recorder;
+    recorder.noteEngineWrap( tick.wrapWidth, tick.wrapLaps );
+    ASSERT_EQ( 2, recorder.engineWraps );
+    ASSERT_EQ( int64_t( 4 ), recorder.engineWrapsWidth( 0, 2 ) );
+    ASSERT_EQ( 2, recorder.replayCount() );
+    // the class (siblings MainWindow.cpp playbackHandling's setValue( m_newPosDropMode ) and drawFrame's requestedFrame): every
+    // applied delta, conform or not, on short and full cuts, lands inside [cut-in, wrap bound) and reads back exactly
+    struct Cut { int cutIn, cutOut; };
+    for( const Cut c : { Cut{ 101, 102 }, Cut{ 1, 2 }, Cut{ 5, 7 }, Cut{ 1, 720 } } )
+        for( const bool conform : { true, false } )
+        {
+            const double lower = static_cast<double>( c.cutIn - 1 );
+            const double upper = playback_frame_range::dropFrameLoopWrapAt( c.cutOut, conform );
+            for( const double start : { lower, lower + 0.5 * ( upper - lower ), std::nextafter( upper, 0.0 ) } )
+                for( const double applied : { 0.3, 1.0, 2.5, 4.0, 7.9, 13.0, 40.2, 1000.75 } )
+                {
+                    const DropFrameTickResult step = advanceDropFrameTick( start, applied, c.cutIn, c.cutOut, true, conform );
+                    ASSERT_TRUE( step.position >= lower - 1e-9 );
+                    ASSERT_TRUE( step.position < upper );
+                    ASSERT_NEAR( applied, step.position - start + static_cast<double>( step.wrapWidth ) * step.wrapLaps, 1e-6 );
+                    ASSERT_EQ( step.wrapped, step.wrapLaps > 0 );
+                }
+        }
+    // a single lap is the pre-r33 subtraction, bit for bit
+    const DropFrameTickResult one = advanceDropFrameTick( 719.44, 0.6, 1, 720, true, true );
+    ASSERT_EQ( 1, one.wrapLaps );
+    ASSERT_EQ( ( 719.44 + 0.6 ) - 720.0, one.position );
+    const DropFrameTickResult plainOne = advanceDropFrameTick( 718.5, 0.7, 1, 720, true, false );
+    ASSERT_EQ( 1, plainOne.wrapLaps );
+    ASSERT_EQ( ( 718.5 + 0.7 ) - 719.0, plainOne.position );
+    // no Loop: the clamp is unchanged and never a lap
+    const DropFrameTickResult clamp = advanceDropFrameTick( 100.25, 4.0, cutIn, cutOut, false, true );
+    ASSERT_FALSE( clamp.wrapped );
+    ASSERT_EQ( 0, clamp.wrapLaps );
+    ASSERT_EQ( 101.0, clamp.position );
+}
+
 TEST( PlaybackConformDropFrame, R24AConformedPlayWithSubPeriodGuiLateTicksPresentsEveryFrame )
 {
     // The engine end to end: the pace guard at 24 fps, an 8 ms poll, and every 97th tick a GUI-late tick of 50..82 ms
