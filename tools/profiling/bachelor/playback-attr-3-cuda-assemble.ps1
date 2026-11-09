@@ -70,11 +70,6 @@ param(
     # A value above 0 can only lower that choice, never raise it.
     [int]$MakeJobs = 0,
 
-    # STAGE-BUILD-HEAVY-SLOT-TIMEOUT-LOSES-TURN-1: a staging driver's own deadline (a UTC instant). When set, the machine heavy-slot
-    # wait is what is left of it, not the 60 min default, so a refused build never re-queues behind newer tickets. Blank: the guard's
-    # default, or env MLV_HEAVY_SLOT_DEADLINE_UTC if the caller exported one. The build-guard prints BUILD_HEAVY_SLOT_WAIT_BOUND.
-    [string]$HeavySlotDeadlineUtc = '',
-
     # The launch probe constructs a real QApplication with a sanitized PATH, so a missing
     # deploy fails here instead of on the measurement host. -SkipLaunchProbe exists for hosts
     # where no interactive session is available.
@@ -232,17 +227,13 @@ $StepLog['qmake'] = 0
 
 # BUILD-GUARD-1: the compile runs under the host-global build gate (memory floor, one build slot,
 # job count); a refusal exits 3 with BUILD_MEM_REFUSED / BUILD_SLOT_BUSY before anything is built.
-$assemblerSelfName = $MyInvocation.MyCommand.Name
-# Run in process, a caller's $PSDefaultParameterValues entry for this script bound -HeavySlotDeadlineUtc and replaced the deadline the caller's
-# environment carried (adversary 9b7006d5-A1 sibling). Such an entry is refused before the guard is entered.
-$callerDefaults = $ExecutionContext.SessionState.PSVariable.GetValue('PSDefaultParameterValues')
-if ($callerDefaults -is [System.Collections.IDictionary]) {
-    @($callerDefaults.Keys).Where({ [string]$_ -ne 'Disabled' -and [System.Management.Automation.WildcardPattern]::new(([string]$_ -split ':', 2)[0], [System.Management.Automation.WildcardOptions]::IgnoreCase).IsMatch($assemblerSelfName) }, 'First').ForEach(
-        { [Console]::Out.WriteLine(('ASSEMBLE_REFUSED reason=caller-parameter-default key={0}' -f $_)); exit 2 })
-}
+# STAGE-BUILD-HEAVY-SLOT-TIMEOUT-LOSES-TURN-1: a staging driver's deadline reaches the machine heavy slot ONLY through the environment this
+# process inherited (MLV_HEAVY_SLOT_DEADLINE_UTC, which the guard reads itself; the nightly and the stage chain set it in this child's
+# environment). There is deliberately no deadline parameter: this is an advanced script, so a caller's $PSDefaultParameterValues (under an
+# alias key, or a script-block default that empties the table while it binds) could supply one past any check made here (adversary
+# 9b7006d5-A1 and 84f4e8af-A1 sibling). No caller in the repo passed one.
 . (Join-Path $PSScriptRoot '..\..\coordination\build-guard.ps1') -Library
 $guardOptions = @{}
-if ($HeavySlotDeadlineUtc) { $guardOptions.HeavySlotDeadlineUtc = $HeavySlotDeadlineUtc }
 Invoke-BuildGuard -Label "attr3-assemble:$($names.shortSha)" -RequestedJobs $MakeJobs -Options $guardOptions -Action {
     param($Jobs)
     $script:MakeJobs = $Jobs

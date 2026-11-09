@@ -22,6 +22,14 @@
 #      exemption log. The slot and the job count still apply. An empty, whitespace or false-y value
 #      ('0', 'false', 'off', 'no') is not a reason and exempts nothing.
 #
+# HEAVY SLOT INVOCATION BOUNDARY (hub ruling HUB-TICK 20261108T2350Z item 4, STAGE-BUILD-HEAVY-SLOT-TIMEOUT-LOSES-TURN-1 r6). In Library
+# mode the guard is dot-sourced into its caller's session and runs there. A caller that rewrites that session before the call -- an alias or
+# function that shadows one of the guard's helpers or a built-in cmdlet, Update-TypeData or any other ETS change on any type, a
+# $PSDefaultParameterValues form, an AllScope, read-only or constant variable, or Set-StrictMode -- is outside what the heavy-slot path
+# defends: such a finding is the documented boundary, not a defect of the guard. Enter-HeavySlot keeps its caller-shadow guards and its
+# static .NET formatting, but they are not a promise against every such rewrite. What stays a defect, and is fixed: wrong arithmetic, a race,
+# a real caller in this repo, a file or environment input, or a child process. Command mode (pwsh -File) has no caller session at all.
+#
 # MACHINE HEAVY SLOT (MLV-VM-HEAVY-SLOT-ADOPT-1): every build (Command and Library mode; -PrintJobs takes
 # no slot and builds nothing, so it is not wrapped) first takes the machine-wide heavy slot shared with the
 # other projects on this host, so it is the OUTERMOST lock. Steps 1-3 above then run nested inside it,
@@ -990,7 +998,7 @@ function Enter-HeavySlot([hashtable]$Options, [string]$Label) {
     # (a caller's $PSDefaultParameterValues cannot bend it) and assigns nothing.
     @('Options', 'Label', 'raw', 'at', 'styles', 'deadline', 'maxMin', 'slackMin', 'cmd', 'shim', 'cli', 'actual', 'expected', 'lock', 'dir', 'exe', 'pct',
         'why', 'id', 'lease', 'giveUp', 'inv', 'boundNote', 'waitMin', 'etaMin', 'd', 'waitArg', 'etaArg', 'a', 'e', 'psi', 'v', 'heldDropped',
-        'notCanonical', 'holderCmd', 'head', 'tail', 'logArg', 'quoted', 'waitClock', 'admitted', 's', 'holder', 'code', 'i', 'what').Where(
+        'notCanonical', 'holderCmd', 'head', 'tail', 'logArg', 'quoted', 'waitClock', 'admitted', 's', 'holder', 'code', 'i', 'what', 'num', 'back').Where(
         { $null -ne $ExecutionContext.SessionState.PSVariable.Get($_) -and ($ExecutionContext.SessionState.PSVariable.Get($_).Options -band [System.Management.Automation.ScopedItemOptions]::AllScope) }, 'First').ForEach(
         { Write-BuildGuardTyped ('BUILD_HEAVY_SLOT_REFUSED label={0} reason=caller-allscope-variable name={1} utc={2}' -f $Label, $_, [DateTime]::UtcNow.ToString('o')); exit 2 })
     @('HeavySlotGiveUpSlackMinutes', 'BuildGuardDefaults').Where(
@@ -1101,17 +1109,27 @@ function Enter-HeavySlot([hashtable]$Options, [string]$Label) {
         # is checked like any other. The wait actually launched is computed again right before the launch (adversary cd45eeb5-A3).
         if ($deadline.At) {
             $waitMin = [Math]::Min([Math]::Max(($deadline.At - [DateTime]::UtcNow).TotalMinutes, 0.0), $maxMin)
-            $boundNote = 'deadline={0}' -f $deadline.At.ToString('o')
+            $boundNote = [string]::Concat('deadline=', [string]::Format($inv, '{0:o}', $deadline.At))
         }
         foreach ($d in @(@('HeavySlotWaitMinutes', $waitMin), @('HeavySlotEtaMinutes', $etaMin))) {
             if (-not ($d[1] -ge 0 -and $d[1] -le $maxMin)) { throw ('{0} is not a number from 0 to {1}' -f $d[0], $maxMin) }
         }
         # -0.0 is in range but formats as '-0' (r5b pass 2 A1); Abs makes it 0. Each value then goes out only in the form
         # heavy-slot's parser reads.
+        # Written with the static [string]::Format, never $x.ToString(): a Library caller's Update-TypeData can replace a method PowerShell
+        # calls on a value, so the text was '20000' for a 240 min wait (adversary 84f4e8af-A2). Each text is then read back with the static
+        # [double]::TryParse and must be the minutes computed (within 0.01) and within the cap; anything else is a refusal.
         $waitMin = [Math]::Abs($waitMin); $etaMin = [Math]::Abs($etaMin)
-        $waitArg = $waitMin.ToString('0.##########', $inv) + 'm'
-        $etaArg = $etaMin.ToString('0.##########', $inv) + 'm'
-        foreach ($a in $waitArg, $etaArg) { if ($a -cnotmatch '^\d+(\.\d+)?m$') { throw "'$a' is not a duration heavy-slot reads" } }
+        $num = [string]::Format($inv, '{0:0.##########}', $waitMin)
+        $back = 0.0
+        if (-not ($num -cmatch '^\d+(\.\d+)?$' -and [double]::TryParse($num, [Globalization.NumberStyles]::AllowDecimalPoint, $inv, [ref]$back) -and
+                [Math]::Abs($back - $waitMin) -le 0.01 -and $back -le $maxMin)) { throw "'$num' is not the wait of $waitMin min in a form heavy-slot reads" }
+        $waitArg = [string]::Concat($num, 'm')
+        $num = [string]::Format($inv, '{0:0.##########}', $etaMin)
+        $back = 0.0
+        if (-not ($num -cmatch '^\d+(\.\d+)?$' -and [double]::TryParse($num, [Globalization.NumberStyles]::AllowDecimalPoint, $inv, [ref]$back) -and
+                [Math]::Abs($back - $etaMin) -le 0.01 -and $back -le $maxMin)) { throw "'$num' is not the eta of $etaMin min in a form heavy-slot reads" }
+        $etaArg = [string]::Concat($num, 'm')
         $giveUp = [TimeSpan]::FromMinutes($waitMin + $slackMin)
     } catch { $why = $_.Exception.Message }
     if ($null -eq $giveUp) {
@@ -1166,8 +1184,11 @@ function Enter-HeavySlot([hashtable]$Options, [string]$Label) {
     $logArg = [string]$lease.Log
     if ($deadline.At) {
         $waitMin = [Math]::Min([Math]::Max(($deadline.At - [DateTime]::UtcNow).TotalMinutes, 0.0), $maxMin)
-        $waitArg = $waitMin.ToString('0.##########', $inv) + 'm'
-        if ($waitArg -cnotmatch '^\d+(\.\d+)?m$') { $waitArg = '0m'; $waitMin = 0.0 }
+        # The same static format and numeric read-back as above (adversary 84f4e8af-A2); a text that is not this wait launches 0m, never more.
+        $num = [string]::Format($inv, '{0:0.##########}', $waitMin)
+        $back = 0.0
+        if ($num -cmatch '^\d+(\.\d+)?$' -and [double]::TryParse($num, [Globalization.NumberStyles]::AllowDecimalPoint, $inv, [ref]$back) -and
+            [Math]::Abs($back - $waitMin) -le 0.01 -and $back -le $maxMin) { $waitArg = [string]::Concat($num, 'm') } else { $waitArg = '0m'; $waitMin = 0.0 }
         $giveUp = [TimeSpan]::FromMinutes($waitMin + $slackMin)
     }
     # cmd quoting, as heavy-slot itself starts a batch child: each argument double-quoted. Its stdout and stderr go to a

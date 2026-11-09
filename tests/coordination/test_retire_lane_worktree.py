@@ -4297,7 +4297,7 @@ ENCODED_LAUNCH_SITES = {
          "the Codex Desktop window and holds no lane worktree, so it is never a lane driver the retire guard has to find"),
     ],
     "tools/coordination/build-guard.ps1": [
-        ("'-EncodedCommand', (New-HeavySlotHolder $lease.Ready $lease.Stop)",
+        ("'-EncodedCommand', $holderCmd)",
          "EXECUTED (MLV-VM-HEAVY-SLOT-ADOPT-1 r3b): Enter-HeavySlot runs `cmd /c heavy-slot.cmd run --class shared ... --exit-file <f> -- "
          "<this pwsh> -NoProfile -NonInteractive -EncodedCommand <New-HeavySlotHolder>`. The decoded holder only writes the ready file "
          "(HEAVY_SLOT_HELD plus holder=<pid>@<start ticks>) and polls for the stop file or the guard's death (pid + start ticks). It is "
@@ -4604,6 +4604,10 @@ def test_launcher_census_build_guard_holder_is_its_one_encoded_launch_and_only_h
     """r3b item 2: build-guard's one -EncodedCommand launch runs New-HeavySlotHolder, which writes a file and waits, nothing else."""
     t = (REPO / "tools/coordination/build-guard.ps1").read_text(encoding="ascii")
     assert t.count("'-EncodedCommand'") == 1, "build-guard.ps1 gained another -EncodedCommand launch: classify it"
+    # STAGE-BUILD-HEAVY-SLOT-TIMEOUT-LOSES-TURN-1 r5 built the holder before the deadline sample, into $holderCmd: that one launch argument is
+    # still New-HeavySlotHolder's output and nothing else (assigned once, used once, by the launch).
+    assert t.count("$holderCmd = [string](New-HeavySlotHolder $lease.Ready $lease.Stop)") == 1
+    assert t.count("$holderCmd") == 2 and "'-EncodedCommand', $holderCmd)" in t
     fn = t.split("function New-HeavySlotHolder", 1)[1].split("\nfunction ", 1)[0]
     # The encoded program is the $text lines; their only substitutions are the two quoted file paths.
     body = fn.split("$text = @(", 1)[1].split(") -join", 1)[0]

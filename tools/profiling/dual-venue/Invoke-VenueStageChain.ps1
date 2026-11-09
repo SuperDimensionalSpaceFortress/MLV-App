@@ -38,13 +38,26 @@
 # variables and run with `& $Helper`, and every file, path and sleep step is a .NET call. A test reads the syntax tree and fails on any command named.
 # One case is PowerShell's, not this script's: a read-only AllScope variable named like a PARAMETER fails the binding before any line here runs, so no
 # exit code is set at all: $LASTEXITCODE keeps the caller's old value and only $? (false) shows the failure. Run it with pwsh -File to rule this out.
+# A PLAIN SCRIPT, ON PURPOSE (adversary 9b7006d5-A1, 84f4e8af-A1): PowerShell applies a caller's $PSDefaultParameterValues only to cmdlets and to
+# ADVANCED functions and scripts. With [CmdletBinding()] or any [Parameter()] here, a caller's default (under this script's name, an alias of it,
+# a wildcard key, or a script-block default that empties the table while it binds) supplied -DeadlineUtc before the first line ran. So this param
+# block carries neither: no default binds any parameter of it, and a script-block default never even runs. What Mandatory and strict binding
+# did is done below instead: a missing or malformed -Sha is STAGE_CHAIN_REFUSED reason=invalid-sha, and any argument this script does not
+# declare (a typo, or a common parameter such as -Verbose) is STAGE_CHAIN_REFUSED reason=unknown-argument, both exit 2 before anything runs.
+#
+# INVOCATION BOUNDARY (hub ruling HUB-TICK 20261108T2350Z item 4). Run in process, this script shares one session with its caller. A caller that
+# rewrites that session before the call -- an alias or function that shadows a command, Update-TypeData or any other ETS change on any type, a
+# $PSDefaultParameterValues form, an AllScope, read-only or constant variable, Set-StrictMode, or a redefined built-in cmdlet -- is outside what
+# this script defends: such a finding is the documented boundary, not a defect of the chain. The caller-shadow guards below are kept, but they
+# are not a promise against every such rewrite. What stays a defect, and is fixed: wrong arithmetic, a race, a real caller in this repo, a file or
+# environment input, or a child process. The supported call is `pwsh -NoProfile -NonInteractive -File`, which has no caller session at all.
 #
 # Exit: 0 staged (STAGE_CHAIN_DONE), 3 capacity until the deadline or -MaxAttempts, 1 a stage-one or chain failure, 2 a bad argument.
 param(
     # \A and \z: '$' would also match before a trailing newline (adversary 9528e35b-A3).
-    [Parameter(Mandatory = $true)][ValidatePattern('\A[0-9a-f]{40}\z')][string]$Sha,
+    [ValidatePattern('\A[0-9a-f]{40}\z')][string]$Sha = '',
     [string]$DeadlineUtc = '',
-    [Parameter(Mandatory = $true)][string]$StageOne,
+    [string]$StageOne = '',
     [string]$RunDir = '',
     [ValidateRange(0, 86400)][int]$RetrySec = 300,
     # Attempts per phase; 0 = until the deadline (the copies' rule).
@@ -60,16 +73,16 @@ param(
 if ($MyInvocation.InvocationName -eq '.') {
     [Console]::Out.WriteLine(('STAGE_CHAIN_REFUSED reason=dot-sourced sha={0} utc={1}' -f $Sha, [DateTime]::UtcNow.ToString('o'))); exit 2
 }
-@('PSDefaultParameterValues', 'selfName', 'dpv', 'ErrorActionPreference', 'Sha', 'DeadlineUtc', 'StageOne', 'RunDir', 'RetrySec', 'MaxAttempts', 'HoldAfterLogMsForTest', 'RefuseChain', 'Why', 'text', 'parsed', 'formats', 'deadline', 'errs', 'ast', 'declares', 'pwsh', 'status', 'utf8', 'WriteChainLog', 't', 'InvokeStageOneChild', 'Phase', 'LogPath', 'psi', 'x', 'p', 'o', 'e', 'SetChainExit', 'Value', 'deadlineText', 'phase', 'attempt', 'phaseDone', 'log', 'code', 'last', 'MlvStageChainExitCode').Where(
+@('PSDefaultParameterValues', 'args', 'ErrorActionPreference', 'Sha', 'DeadlineUtc', 'StageOne', 'RunDir', 'RetrySec', 'MaxAttempts', 'HoldAfterLogMsForTest', 'RefuseChain', 'Why', 'text', 'parsed', 'formats', 'deadline', 'errs', 'ast', 'declares', 'pwsh', 'status', 'utf8', 'WriteChainLog', 't', 'InvokeStageOneChild', 'Phase', 'LogPath', 'psi', 'x', 'p', 'o', 'e', 'SetChainExit', 'Value', 'deadlineText', 'phase', 'attempt', 'phaseDone', 'log', 'code', 'last', 'MlvStageChainExitCode').Where(
     { $null -ne $ExecutionContext.SessionState.PSVariable.Get($_) -and ($ExecutionContext.SessionState.PSVariable.Get($_).Options -band [System.Management.Automation.ScopedItemOptions]::AllScope) }, 'First').ForEach(
     { [Console]::Out.WriteLine(('STAGE_CHAIN_REFUSED reason=caller-allscope-variable name={0} sha={1} utc={2}' -f $_, $Sha, [DateTime]::UtcNow.ToString('o'))); exit 2 })
-# A caller's $PSDefaultParameterValues entry for THIS script bound its parameters before the first line ran, so an omitted -DeadlineUtc became the
-# caller's 2099 (adversary 9b7006d5-A1). Any entry whose command pattern matches this script is refused (read from the session state, no cmdlet).
-$selfName = $MyInvocation.MyCommand.Name
-$dpv = $ExecutionContext.SessionState.PSVariable.GetValue('PSDefaultParameterValues')
-if ($dpv -is [System.Collections.IDictionary]) {
-    @($dpv.Keys).Where({ [string]$_ -ne 'Disabled' -and [System.Management.Automation.WildcardPattern]::new(([string]$_ -split ':', 2)[0], [System.Management.Automation.WildcardOptions]::IgnoreCase).IsMatch($selfName) }, 'First').ForEach(
-        { [Console]::Out.WriteLine(('STAGE_CHAIN_REFUSED reason=caller-parameter-default key={0} sha={1} utc={2}' -f $_, $Sha, [DateTime]::UtcNow.ToString('o'))); exit 2 })
+# What [Parameter(Mandatory)] and an advanced script's strict binding did (see A PLAIN SCRIPT above): an undeclared argument lands in $args here, and
+# a -Sha that was never given is the empty default, which ValidatePattern does not check. Both are refused before anything runs.
+if ($args.Count -gt 0) {
+    [Console]::Out.WriteLine(('STAGE_CHAIN_REFUSED reason=unknown-argument argument={0} sha={1} utc={2}' -f ([string]$args[0] -replace '\s+', ' '), $Sha, [DateTime]::UtcNow.ToString('o'))); exit 2
+}
+if ($Sha -cnotmatch '\A[0-9a-f]{40}\z') {
+    [Console]::Out.WriteLine(('STAGE_CHAIN_REFUSED reason=invalid-sha Sha={0} utc={1}' -f ($Sha -replace '\s+', ' '), [DateTime]::UtcNow.ToString('o'))); exit 2
 }
 # The caller's parameter defaults never reach this script's own steps (a local, empty map; the caller's own is not AllScope, checked above).
 $PSDefaultParameterValues = @{}

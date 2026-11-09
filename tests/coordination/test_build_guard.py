@@ -1120,29 +1120,126 @@ def test_a_holder_whose_tostring_is_slow_is_converted_before_the_deadline_sample
     assert done.returncode == 3, done.stdout + done.stderr
 
 
-def test_a_callers_parameter_default_for_the_chain_is_refused(box) -> None:
-    # adversary 9b7006d5-A1 (its input): a caller's $PSDefaultParameterValues['Invoke-VenueStageChain.ps1:DeadlineUtc'] bound the omitted deadline
-    # before the chain's first line, so both phases ran and the chain exited 0 instead of refusing the missing deadline.
+# --- r6 (adversary pass on 84f4e8af: A1 and A2, both introduced majors; HUB-TICK 20261108T2350Z items 2 and 3) ----------------------
+
+# Each case: the caller's session before the call, and how it calls the chain. The deadline is OMITTED on every call, so the chain must refuse
+# it as missing (invalid-deadline DeadlineUtc=''): a caller's parameter default never supplies it, under any key.
+_CHAIN_DEFAULT_CASES = {
+    # adversary 9b7006d5-A1 (the r5 input): the plain entry under the chain's own name.
+    "real-name": ("$PSDefaultParameterValues = @{{ 'Invoke-VenueStageChain.ps1:DeadlineUtc' = '2099-01-01T00:00:00Z' }}\n", "& '{chain}'"),
+    # adversary 84f4e8af-A1 (its input): an alias of the chain, and the default under the alias's name.
+    "alias": ("Set-Alias StartStage '{chain}'\n$PSDefaultParameterValues = @{{ 'StartStage:DeadlineUtc' = '2099-01-01T00:00:00Z' }}\n", "StartStage"),
+    # its second input: a script-block default under the real name that empties the table while it binds, so a scan of the table made after
+    # binding (the r5 refusal) finds nothing and the 2099 deadline is accepted.
+    "scriptblock-clears": ("$PSDefaultParameterValues = @{{ 'Invoke-VenueStageChain.ps1:DeadlineUtc' = {{ $PSDefaultParameterValues.Clear(); "
+                           "'2099-01-01T00:00:00Z' }} }}\n", "& '{chain}'"),
+    # the same class under a wildcard key and a parameter-name wildcard.
+    "scriptblock-wildcard": ("$PSDefaultParameterValues = @{{ '*:Dead*' = {{ '2099-01-01T00:00:00Z' }} }}\n", "& '{chain}'"),
+}
+
+
+@pytest.mark.parametrize("case", list(_CHAIN_DEFAULT_CASES))
+def test_no_caller_parameter_default_ever_supplies_the_chain_deadline(box, case) -> None:
+    # adversary 9b7006d5-A1 and 84f4e8af-A1: the r5 refusal compared each key's command part with the script's own name, after binding. An alias
+    # key, or a script-block default that cleared the table while it bound, got past it, and both phases ran on the caller's 2099. The chain is
+    # now a plain script (no [CmdletBinding()], no [Parameter()]): PowerShell applies $PSDefaultParameterValues only to cmdlets and advanced
+    # functions or scripts, so no default binds any parameter of it, and no script-block default even runs.
     run, stage_one_path, env = _chain_box(box, 61)
     ran = box["dir"] / "child-ran.txt"
     stage_one_path.write_text(f"param([string]$Sha, [string]$Phase)\nAdd-Content -LiteralPath '{ran}' -Value $Phase\nexit 0\n", encoding="ascii")
-    script = ("$PSDefaultParameterValues = @{ 'Invoke-VenueStageChain.ps1:DeadlineUtc' = '2099-01-01T00:00:00Z' }\n"
-              f"& '{STAGE_CHAIN}' -Sha {_CHAIN_SHA} -StageOne '{stage_one_path}' -RetrySec 0 -MaxAttempts 1\n"
+    setup, call = _CHAIN_DEFAULT_CASES[case]
+    script = (setup.format(chain=STAGE_CHAIN)
+              + f"{call.format(chain=STAGE_CHAIN)} -Sha {_CHAIN_SHA} -StageOne '{stage_one_path}' -RetrySec 0 -MaxAttempts 1\n"
               "Write-Output \"rc=$LASTEXITCODE\"\n")
     done = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script],
                           capture_output=True, text=True, timeout=180, env=env, check=False)
-    assert not ran.exists(), "a child ran on the caller's default deadline"
+    assert not ran.exists(), "a child ran on the caller's default deadline: " + done.stdout
     assert "rc=2" in done.stdout, done.stdout + done.stderr
-    assert "STAGE_CHAIN_REFUSED reason=caller-parameter-default key=Invoke-VenueStageChain.ps1:DeadlineUtc " in done.stdout, done.stdout
+    assert "STAGE_CHAIN_REFUSED reason=invalid-deadline DeadlineUtc='' is not" in done.stdout, done.stdout + done.stderr
 
 
-def test_the_assembler_refuses_a_callers_parameter_default_before_the_guard() -> None:
-    # adversary 9b7006d5-A1 sibling (playback-attr-3-cuda-assemble.ps1:76, :237): the same caller default bound -HeavySlotDeadlineUtc. The
-    # refusal sits before the guard is loaded and before the option is set.
+def _param_attributes(path: Path) -> list:
+    script = (f"$a = [System.Management.Automation.Language.Parser]::ParseFile('{path}', [ref]$null, [ref]$null)\n"
+              "@($a.ParamBlock.Attributes) | ForEach-Object { 'BLOCK ' + $_.TypeName.FullName }\n"
+              "@($a.ParamBlock.Parameters) | ForEach-Object { $p = $_.Name.VariablePath.UserPath; 'PARAM ' + $p; "
+              "@($_.Attributes) | ForEach-Object { 'ATTR ' + $p + ' ' + $_.TypeName.FullName } }\n")
+    done = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script],
+                          capture_output=True, text=True, timeout=60, check=False)
+    assert done.returncode == 0, done.stderr
+    return [l.strip() for l in done.stdout.splitlines() if l.strip()]
+
+
+def test_the_chain_is_a_plain_script_so_no_parameter_default_applies_to_it() -> None:
+    # adversary 84f4e8af-A1, the class: any [CmdletBinding()] or [Parameter()] makes the chain an advanced script, and every parameter of an
+    # advanced script takes the caller's defaults again. The checks Mandatory made are explicit refusals instead (the tests below).
+    lines = _param_attributes(STAGE_CHAIN)
+    assert any(l == "PARAM DeadlineUtc" for l in lines), lines
+    advanced = [l for l in lines if (l.startswith("BLOCK ") or l.startswith("ATTR "))
+                and l.split()[-1].lower().split(".")[-1] in ("cmdletbinding", "cmdletbindingattribute", "parameter", "parameterattribute")]
+    assert advanced == [], advanced
+
+
+@pytest.mark.parametrize("argv, reason", [
+    (["-DeadlineUtc", "2099-01-01T00:00:00Z", "-StageOne", "{one}"], "invalid-sha"),
+    (["-Sha", "0123456789abcdef0123456789abcdef01234567", "-DeadlineUtc", "2099-01-01T00:00:00Z", "-StageOne", "{one}",
+      "-Bogus", "1"], "unknown-argument"),
+    (["-Sha", "0123456789abcdef0123456789abcdef01234567", "-DeadlineUtc", "2099-01-01T00:00:00Z", "-StageOne", "{one}", "-Verbose"], "unknown-argument"),
+], ids=["missing-sha", "unknown-parameter", "common-parameter"])
+def test_a_plain_chain_still_refuses_a_missing_sha_and_any_unknown_argument(box, argv, reason) -> None:
+    # What [Parameter(Mandatory)] and an advanced script's strict binding did, done explicitly: a missing -Sha and an argument the chain does not
+    # declare (a typo, or a common parameter it no longer takes) are refused before anything runs.
+    run, stage_one_path, env = _chain_box(box, 61)
+    ran = box["dir"] / "child-ran.txt"
+    stage_one_path.write_text(f"param([string]$Sha, [string]$Phase)\nAdd-Content -LiteralPath '{ran}' -Value $Phase\nexit 0\n", encoding="ascii")
+    done = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-File", str(STAGE_CHAIN),
+                           *[a.format(one=stage_one_path) for a in argv], "-RetrySec", "0", "-MaxAttempts", "1"],
+                          capture_output=True, text=True, timeout=180, env=env, check=False)
+    assert done.returncode == 2, done.stdout + done.stderr
+    assert f"STAGE_CHAIN_REFUSED reason={reason}" in done.stdout, done.stdout + done.stderr
+    assert not ran.exists() and _chain_status(run) == []
+
+
+def test_the_assembler_takes_no_deadline_parameter_so_no_caller_default_can_supply_one() -> None:
+    # adversary 84f4e8af-A1 sibling (playback-attr-3-cuda-assemble.ps1:240): the assembler is an advanced script, so an alias-keyed or
+    # script-block caller default could bind -HeavySlotDeadlineUtc past the r5 key scan and replace the expired deadline the caller's environment
+    # carried. No caller in the repo passed that parameter (the nightly and the chain hand the deadline over in the child's environment), so it
+    # is gone: the deadline reaches the guard only as MLV_HEAVY_SLOT_DEADLINE_UTC, which no parameter default can touch.
+    lines = _param_attributes(ATTR3_ASSEMBLE)
+    params = [l.split()[1] for l in lines if l.startswith("PARAM ")]
+    assert "SourceCommit" in params, lines
+    assert [p for p in params if "deadline" in p.lower()] == [], params
     text = ATTR3_ASSEMBLE.read_text(encoding="utf-8")
-    refuse = text.find("ASSEMBLE_REFUSED reason=caller-parameter-default")
-    assert refuse > 0
-    assert refuse < text.find("coordination\\build-guard.ps1') -Library") < text.find("$guardOptions.HeavySlotDeadlineUtc = $HeavySlotDeadlineUtc")
+    assert "HeavySlotDeadlineUtc" not in text and "caller-parameter-default" not in text
+    assert re.search(r"\$guardOptions = @\{\}\r?\nInvoke-BuildGuard -Label \"attr3-assemble:\$\(\$names\.shortSha\)\" -RequestedJobs \$MakeJobs "
+                     r"-Options \$guardOptions -Action", text), "the build runs under the guard with no deadline option of its own"
+
+
+# adversary 84f4e8af-A2 (its input): a Library caller's ETS ToString on System.Double, which only the guard's own format string meets.
+_ETS_DOUBLE_TOSTRING = (
+    "Update-TypeData -TypeName System.Double -MemberType ScriptMethod -MemberName ToString -Force -Value {\n"
+    "  if ($args.Count -ge 1 -and [string]$args[0] -ceq '0.##########') { return '20000' }\n"
+    "  if ($args.Count -ge 2) { return [string]::Format([IFormatProvider]$args[1], '{0:' + [string]$args[0] + '}', [double]$this) }\n"
+    "  if ($args.Count -eq 1) { return [string]::Format('{0:' + [string]$args[0] + '}', [double]$this) }\n"
+    "  [string]::Format([Globalization.CultureInfo]::InvariantCulture, '{0}', [double]$this) }\n"
+)
+
+
+@pytest.mark.parametrize("deadline, low, high", [
+    # build-guard.ps1:1169, the launch-time wait (and :1112, the first one).
+    ("([DateTime]::UtcNow.AddMinutes(240)).ToString('o')", 239.0, 240.0),
+    # :1112 and :1113 with no deadline: the 60 min default and the eta.
+    (None, 60.0, 60.0),
+], ids=["deadline", "default-wait"])
+def test_a_callers_ets_tostring_on_double_never_changes_the_wait_or_eta(box, deadline, low, high) -> None:
+    # adversary 84f4e8af-A2: --wait and --eta were written with $x.ToString(...), which a Library caller's Update-TypeData can replace, so
+    # --wait 20000m (twice the one-week cap) reached heavy-slot with a 240 min deadline. They are written with [string]::Format now, which
+    # ETS never sees, and each text is read back and must equal the minutes computed (within 0.01) and stay within the cap.
+    done = _stage_attempt(box, deadline, prelude=_ETS_DOUBLE_TOSTRING)
+    [call] = _stub_calls(box)
+    assert low <= _wait_minutes(call) <= high, call["argv"]
+    eta = call["argv"][call["argv"].index("--eta") + 1]
+    assert eta != "20000m" and float(eta[:-1]) <= 10080, call["argv"]
+    assert done.returncode in (0, 3), done.stdout + done.stderr
 
 
 def test_nothing_but_net_calls_runs_between_the_deadline_sample_and_the_launch() -> None:
@@ -1311,11 +1408,13 @@ def test_a_blank_deadline_option_changes_nothing(box) -> None:
 
 
 def test_the_attr3_assembler_hands_its_deadline_to_the_guard() -> None:
+    # r6 (adversary 84f4e8af-A1 sibling): the deadline reaches the guard through the environment only (MLV_HEAVY_SLOT_DEADLINE_UTC, which
+    # the guard reads itself); the assembler's -HeavySlotDeadlineUtc parameter is gone, so no caller default can supply one.
     text = ATTR3_ASSEMBLE.read_text(encoding="utf-8")
-    assert "[string]$HeavySlotDeadlineUtc = ''," in text
+    assert "HeavySlotDeadlineUtc" not in text, "the assembler declares and sets no deadline of its own"
     assert re.search(r"Invoke-BuildGuard -Label \"attr3-assemble:\$\(\$names\.shortSha\)\" -RequestedJobs \$MakeJobs -Options \$guardOptions -Action", text), \
-        "the build runs under the guard with the deadline option"
-    assert re.search(r"if \(\$HeavySlotDeadlineUtc\) \{ \$guardOptions\.HeavySlotDeadlineUtc = \$HeavySlotDeadlineUtc \}", text)
+        "the build runs under the guard"
+    assert "$env:MLV_HEAVY_SLOT_DEADLINE_UTC" in GUARD.read_text(encoding="utf-8"), "the guard reads the inherited deadline itself"
 
 
 # --- r3 (sol key on d2543b8a, blocker): the FULL staging chain, driver -> stage chain -> stage one -> assembler -> build-guard ------
@@ -1328,10 +1427,10 @@ def test_the_attr3_assembler_hands_its_deadline_to_the_guard() -> None:
 _CHAIN_SHA = "0123456789abcdef0123456789abcdef01234567"
 
 _FIX_ASSEMBLER = (
-    "param([string]$SourceCommit, [string]$DllPairDir, [string]$OutDir, [switch]$SkipLaunchProbe, [string]$HeavySlotDeadlineUtc = '')\n"
+    # r6: like the tracked assembler, no deadline parameter; the guard reads the inherited MLV_HEAVY_SLOT_DEADLINE_UTC.
+    "param([string]$SourceCommit, [string]$DllPairDir, [string]$OutDir, [switch]$SkipLaunchProbe)\n"
     ". $env:FIX_GUARD -Library\n"
     "$guardOptions = @{ LockPath = $env:FIX_LOCK; MemoryProbeFile = $env:FIX_MEM; ProcessTableFile = $env:FIX_TABLE; HeavySlotSha256 = $env:FIX_SHA; PollSeconds = 0.2 }\n"
-    "if ($HeavySlotDeadlineUtc) { $guardOptions.HeavySlotDeadlineUtc = $HeavySlotDeadlineUtc }\n"
     "Invoke-BuildGuard -Label 'attr3-assemble:0123456789ab' -Options $guardOptions -Action { param($Jobs) "
     "Write-Output \"RESULT=ASSEMBLE_OK SOURCE=$SourceCommit\" }\n"
 )
