@@ -867,8 +867,8 @@ class CorePartitionGeneratorTests(unittest.TestCase):
                 self.assertIn("([IO.File]::ReadAllText($resultPath) | ConvertFrom-Json).process", text)
                 measured = text.index("Publish-AttrCudaText -Path $corePartitionMeasuredFile")
                 self.assertLess(measured, text.index("Publish-AttrCudaText -Path $corePartitionStopFile"), "the measured pid must reach the helper before it stops")
-                # r8 A1: and the job's own wall/monotonic clock gap
-                self.assertIn("$corePartitionHelperWhy $corePartitionHelperNotReady $corePartitionMeasuredPid $corePartitionPublishWhy $corePartitionMeasuredStartTicks $corePartitionMeasuredEndTicks $corePartitionJobClockSkewMs\n", text)
+                # r8 A1: and the job's own wall/monotonic clock gap; r3 (adversary f5182886 A1): and the runner's monotonic launch..end
+                self.assertIn("$corePartitionHelperWhy $corePartitionHelperNotReady $corePartitionMeasuredPid $corePartitionPublishWhy $corePartitionMeasuredStartTicks $corePartitionMeasuredEndTicks $corePartitionJobClockSkewMs $corePartitionMeasuredExitTicks $corePartitionMeasuredRunnerElapsedMonoMs\n", text)
                 self.assertIn("ConvertTo-CorePartitionUtcTicks $cpRunnerProcess.startedAtUtc", text)
                 for fn in ("function Test-CorePartitionMeasuredApp", "function Get-CorePartitionFeedHandleInfo", "function ConvertTo-CorePartitionUtcTicks", "function Get-CorePartitionClockSkewMs",
                            "function Test-CorePartitionReadyMarker", "function Get-CorePartitionReadyToken", "function Get-CorePartitionMonoMs"):
@@ -1291,7 +1291,9 @@ $cs = Get-CorePartitionCounterSummary $samples 1 4096
 $r.counters = @($cs.appSamples, $cs.pcoreMHzMean, $cs.ecoreMHzMean, $cs.pcoreParkedSampleFraction)
 $r.workers = @((Get-CorePartitionWorkerThreads "playback_smoke.start session=1 worker_threads=16 x=1`nplayback_smoke.start session=3 scale_request=1 worker_threads=12 start_serial=2`n").value,
     (Get-CorePartitionWorkerThreads "nothing here").why, (Get-CorePartitionWorkerThreads '').why)
-$one = '"instances":[{"pid":5000,"startUtcTicks":639286128040000000,"firstSeenUtcTicks":639286128041000000,"firstMs":4100,"lastSeenUtcTicks":639286128200000000,"goneUtcTicks":639286128202000000,"aliveMs":16000,"goneMs":16200}],"clockSkewMaxMs":0'
+# the runner's 5000 (launch +3 s, exit +23 s): seen +4.1 s, last alive +22.0 s, seen gone +22.2 s (CORE-PARTITION-PREDECESSOR-CLOCK-STEP-1: its observed
+# life covers the runner's interval within the 2 s tolerances)
+$one = '"instances":[{"pid":5000,"startUtcTicks":639286128040000000,"firstSeenUtcTicks":639286128041000000,"firstMs":4100,"lastSeenUtcTicks":639286128220000000,"goneUtcTicks":639286128222000000,"aliveMs":16000,"goneMs":16200}],"clockSkewMaxMs":0'
 $helper = ('{"topologyCheck":{"ok":true,"reason":null,"pMask":4095,"eMask":1044480},"helperAffinityObserved":1044480,"app":{"pid":5000,"startUtcTicks":639286128040000000,"affinityFirst":4095,"affinityLast":4095},"load":{"seconds":10.0,"bytes":20000000000,"joined":true},"samples":[{"app":true,"m":1000,"inst":["0,0","0,12"],"freq":[2500,2500],"perf":[160,80],"park":[0,0]}],' + $one + '}') | ConvertFrom-Json
 $w = @{ value = 16; why = $null }
 $b2 = Get-CorePartitionScalars $helper $feed 4095 1044480 8 $w $null @mp
@@ -1434,6 +1436,70 @@ foreach ($k in $clockCases.Keys) {
     if ($hasClock) { $mpk.ClockSkewMs = $clockCases[$k][1] }
     $sc = Get-CorePartitionScalars $clockCases[$k][0] $feed 4095 1044480 8 $w $null $false @mpk
     $r.clock[$k] = @($sc.corePartitionTopologyOk, $sc.benchAffinityApplied, $sc.partitionLoadApplied, $sc.appAffinityObserved, $sc.partitionLoadGBps, $sc.pcoreMHzMean, [string]$sc.corePartitionNullReasons)
+}
+# CORE-PARTITION-PREDECESSOR-CLOCK-STEP-1: the runner launched its 5000 at +4 s and saw it exit at +24 s. Each record holds ONE recorded 5000 and
+# the helper bound it, so only the measured instance's own interval can tell it is not the runner's process.
+# (1) adversary OPEN A1@40d2259d (#696 r14b): a predecessor 5000 started +2.1 s, last alive +3.8 s, seen gone at real +3.9 s (goneMs 3900), but an
+# 800 ms forward step (under the 1000 ms tolerance; the helper's gap sample at that stamp says 800) stamps its gone time +4.7 s, past the launch.
+# (2) adversary A1@92715958 (#777 restatement): the runner's 5000 ran +4.05..+23.9 s unseen; a successor on the released pid with the same path and,
+# through an unsampled clock step, the same birth stamp (+4.05 s) is first seen at +24.2 s, after the app exited, and seen gone at +25.1 s.
+function New-CpStepRecord([string]$Inst, $Skew) { $o = New-CpRecord $Inst @($Inst); $o.clockSkewMaxMs = $Skew; $o }
+$stepCases = [ordered]@{
+    'predecessor-clock-step' = (New-CpStepRecord (New-CpInst 5000 2.1 2.2 3.8 4.7).Replace('"goneMs":4700', '"goneMs":3900') 800.0)
+    'successor-first-seen-after-exit' = (New-CpStepRecord (New-CpInst 5000 4.05 24.2 25.0 25.1).Replace('}', ',"pinned":true}') 0)
+    # the same refusals at zero gap, just past each 2 s tolerance: first seen +6.1 s; seen gone +21.9 s
+    'first-seen-past-tolerance' = (New-CpStepRecord (New-CpInst 5000 4.05 6.1 23.9 24.0) 0)
+    'gone-before-tolerance' = (New-CpStepRecord (New-CpInst 5000 4.05 4.2 21.8 21.9) 0)
+    # controls (accepted before and after): the runner's own 5000 observed across its whole interval under the same 800 ms gap; seen gone after the
+    # runner's exit stamp; and just inside each tolerance (first seen +5.9 s; seen gone +22.1 s)
+    'complete-interval-control' = (New-CpStepRecord (New-CpInst 5000 4.05 4.2 23.9 24.0) 800.0)
+    'gone-after-runner-exit-control' = (New-CpStepRecord (New-CpInst 5000 4.05 4.2 24.1 24.15) 0)
+    'first-seen-in-tolerance-control' = (New-CpStepRecord (New-CpInst 5000 4.05 5.9 23.9 24.0) 0)
+    'gone-in-tolerance-control' = (New-CpStepRecord (New-CpInst 5000 4.05 4.2 22.0 22.1) 0)
+}
+$r.step = [ordered]@{}
+foreach ($k in $stepCases.Keys) {
+    $sc = Get-CorePartitionScalars $stepCases[$k] $feed 4095 1044480 8 $w $null $false -MeasuredPid 5000 -MeasuredStartTicks ($L + 40000000) -MeasuredEndTicks ($L + 240000000) -ClockSkewMs 0
+    $v = Test-CorePartitionMeasuredApp $stepCases[$k] 5000 ($L + 40000000) ($L + 240000000) 0
+    $r.step[$k] = @($sc.corePartitionTopologyOk, $sc.benchAffinityApplied, $sc.partitionLoadApplied, $sc.appAffinityObserved, $sc.partitionLoadGBps, $sc.pcoreMHzMean, [string]$sc.corePartitionNullReasons, [string]$v.why)
+}
+# r2 (Dot pr-780 S1): the runner's termination stamp (process.exitObservedAtUtc) replaces endedAtUtc in the exit-side check only. Launch +4 s, endedAtUtc
+# +24 s (after a drain); exit stamp in seconds after L, or $null for an older receipt. The r1 refusals hold with an exit stamp at the end; a drained
+# app (true exit +20.0 s, seen gone +20.1 s) is bound on its exit stamp and refused on endedAtUtc; a stamp outside launch..end proves nothing.
+$r.stepExit = 'absent'
+if ((Get-Command Test-CorePartitionMeasuredApp).Parameters.ContainsKey('MeasuredExitTicks')) {
+    $drained = New-CpStepRecord (New-CpInst 5000 4.05 4.2 20.0 20.1) 0
+    $exitCases = [ordered]@{
+        'predecessor-clock-step-with-exit-stamp' = @($stepCases['predecessor-clock-step'], 23.95)
+        'successor-with-exit-stamp' = @($stepCases['successor-first-seen-after-exit'], 23.95)
+        'gone-before-tolerance-with-exit-stamp' = @($stepCases['gone-before-tolerance'], 23.95)
+        'gone-before-exit-stamp-tolerance' = @($drained, 22.2)
+        'drained-bound-on-exit-stamp' = @($drained, 20.05)
+        'drained-older-receipt' = @($drained, $null)
+        'exit-stamp-after-end' = @($drained, 25.0)
+        'exit-stamp-before-launch' = @($drained, 3.0)
+        'complete-interval-control-with-exit-stamp' = @($stepCases['complete-interval-control'], 23.95)
+        # adversary r2 (6c16f4de) advisory A1 (literal): another same-path 6000 started +21 s, after the app's confirmed exit (+20.05 s) but inside
+        # the drain before endedAtUtc (+24 s); it was never alive with the app. Control: one started +20.0 s, before that exit, still overlaps.
+        'drain-only-instance' = @($null, 20.05)
+        'started-before-exit-stamp-control' = @($null, 20.05)
+    }
+    $i5000d = New-CpInst 5000 4.05 4.2 19.9 20.1
+    $exitCases['drain-only-instance'][0] = New-CpStepRecord $i5000d 0
+    $exitCases['drain-only-instance'][0].instances = @(($i5000d | ConvertFrom-Json), ((New-CpInst 6000 21 21.1 22.9 23.1) | ConvertFrom-Json))
+    $exitCases['started-before-exit-stamp-control'][0] = New-CpStepRecord $i5000d 0
+    $exitCases['started-before-exit-stamp-control'][0].instances = @(($i5000d | ConvertFrom-Json), ((New-CpInst 6000 20.0 20.15 22.9 23.1) | ConvertFrom-Json))
+    $exitCases['adversary-9a2372b7-A1-early-exit'] = @((New-CpStepRecord $i5000d 0), 19.21)
+    $exitCases['adversary-9a2372b7-A1-early-exit'][0].instances = @(($i5000d | ConvertFrom-Json), ((New-CpInst 6000 19.95 20.15 23.9 24.1) | ConvertFrom-Json))
+    # r3: the runner's monotonic launch..end (20 s), in agreement with its wall launch..end, so its drain is a checked exit
+    $re = $(if ((Get-Command Test-CorePartitionMeasuredApp).Parameters.ContainsKey('RunnerElapsedMonoMs')) { @{ RunnerElapsedMonoMs = 20000.0 } } else { @{} })
+    foreach ($k in $exitCases.Keys) {
+        $x = $(if ($null -eq $exitCases[$k][1]) { [int64]0 } else { $L + [int64]($exitCases[$k][1] * 1e7) })
+        $sc = Get-CorePartitionScalars $exitCases[$k][0] $feed 4095 1044480 8 $w $null $false -MeasuredPid 5000 -MeasuredStartTicks ($L + 40000000) -MeasuredEndTicks ($L + 240000000) -ClockSkewMs 0 -MeasuredExitTicks $x @re
+        $v = Test-CorePartitionMeasuredApp $exitCases[$k][0] 5000 ($L + 40000000) ($L + 240000000) 0 $x @re
+        if ($r.stepExit -is [string]) { $r.stepExit = [ordered]@{} }
+        $r.stepExit[$k] = @($sc.appAffinityObserved, $sc.partitionLoadGBps, [string]$sc.corePartitionNullReasons, [string]$v.why, [string]$v.exitStamp)
+    }
 }
 # r8 A1: the job's own gap over its (wall ticks, monotonic ms) pairs: steady; a 100 s backward step; one pair; a non-numeric or missing reading
 $r.clockSkew = 'absent'
@@ -1618,7 +1684,7 @@ $CorePartitionBenchMask = [int64]4095
 $CorePartitionLoadMask = [int64]1044480
 $CorePartitionLoadThreads = 8
 $CorePartitionHelperMask = [int64]1044480
-$record = '{"schema":"mlv-app/core-partition-helper/v1","pid":4242,"topologyCheck":{"ok":true,"reason":null,"pMask":4095,"eMask":1044480},"helperAffinityObserved":1044480,"app":{"pid":5000,"startUtcTicks":639286128040000000,"affinityFirst":4095,"affinityLast":4095},"load":{"seconds":15,"bytes":30000000000,"joined":true},"samples":[{"app":true,"m":1000,"inst":["0,0","0,12"],"freq":[2500,2500],"perf":[160,80],"park":[0,0]}],"instances":[{"pid":5000,"startUtcTicks":639286128040000000,"firstSeenUtcTicks":639286128041000000,"firstMs":4100,"lastSeenUtcTicks":639286128200000000,"goneUtcTicks":639286128202000000,"aliveMs":16000,"goneMs":16200}],"clockSkewMaxMs":0}'
+$record = '{"schema":"mlv-app/core-partition-helper/v1","pid":4242,"topologyCheck":{"ok":true,"reason":null,"pMask":4095,"eMask":1044480},"helperAffinityObserved":1044480,"app":{"pid":5000,"startUtcTicks":639286128040000000,"affinityFirst":4095,"affinityLast":4095},"load":{"seconds":15,"bytes":30000000000,"joined":true},"samples":[{"app":true,"m":1000,"inst":["0,0","0,12"],"freq":[2500,2500],"perf":[160,80],"park":[0,0]}],"instances":[{"pid":5000,"startUtcTicks":639286128040000000,"firstSeenUtcTicks":639286128041000000,"firstMs":4100,"lastSeenUtcTicks":639286128220000000,"goneUtcTicks":639286128222000000,"aliveMs":16000,"goneMs":16200}],"clockSkewMaxMs":0}'
 # the runner's result.json: the launched pid and its launch..exit window, as the runner writes them (ISO 'o' strings)
 $runnerResult = '{"process":{"id":5000,"startedAtUtc":"' + [DateTime]::new([int64]639286128030000000, [DateTimeKind]::Utc).ToString('o') + '","endedAtUtc":"' + [DateTime]::new([int64]639286128230000000, [DateTimeKind]::Utc).ToString('o') + '"}}'
 $cases = @(
@@ -1935,6 +2001,62 @@ class CorePartitionPureHelperTests(unittest.TestCase):
         self.assertEqual(control[:6], [True, True, True, "0x00FFF", 2.0, 4000.0], f"a gap under the tolerance with no real overlap is accepted: {control}")
         self.assertEqual(self.r["clockSkew"], [0, 100000, None, None, None], self.r["clockSkew"])
 
+    def test_predecessor_clock_step_an_instance_whose_observed_life_does_not_cover_the_runner_interval_is_refused(self) -> None:
+        """CORE-PARTITION-PREDECESSOR-CLOCK-STEP-1 (adversary OPEN A1@40d2259d on #696 r14b; its restatement A1@92715958 on #777): the one recorded
+        same-pid instance passed candidate selection on a tolerated clock step and was credited as the runner's app although its observed life did not
+        span the runner's launch..exit. The binding is pid plus birth stamp (the helper's app must equal the candidate on both), and the bound instance
+        must be first seen within 2 s (plus twice the clock gap) of the runner's launch and seen gone no earlier than 2 s (plus that slack) before the
+        runner's exit; otherwise it is refused, typed, and nothing of it is credited."""
+        refused = {
+            "predecessor-clock-step": "measured-app-gone-before-runner-exit",
+            "successor-first-seen-after-exit": "measured-app-seen-after-runner-launch",
+            "first-seen-past-tolerance": "measured-app-seen-after-runner-launch",
+            "gone-before-tolerance": "measured-app-gone-before-runner-exit",
+        }
+        for case, code in refused.items():
+            with self.subTest(case=case):
+                topo, bench, load, observed, gbps, pcore, why, verdict = self.r["step"][case]
+                self.assertEqual(verdict, code, f"an instance whose observed life does not cover the runner interval was bound: {self.r['step'][case]}")
+                self.assertEqual([bench, load, observed, gbps, pcore], [False, False, None, None, None], f"its evidence was credited: {why}")
+                for field in ("appAffinityObserved", "partitionLoadGBps", "pcoreMHzMean", "ecoreMHzMean", "pcoreParkedSampleFraction"):
+                    self.assertIn(f"{field}={code}", why)
+        for case in ("complete-interval-control", "gone-after-runner-exit-control", "first-seen-in-tolerance-control", "gone-in-tolerance-control"):
+            with self.subTest(case=case):
+                control = self.r["step"][case]
+                self.assertEqual(control[7], "", f"the runner's own instance, observed across its interval, was refused: {control}")
+                self.assertEqual(control[:6], [True, True, True, "0x00FFF", 2.0, 4000.0], f"its evidence is credited: {control}")
+
+    def test_the_exit_side_check_uses_the_runners_termination_stamp_and_keeps_every_r1_refusal(self) -> None:
+        """r2 (Dot pr-780 S1): the runner's confirmed exit (endedAtUtc - process.exitToEndMs, a monotonic drain duration) replaces endedAtUtc
+        (stamped after the stream drain) in the exit-side check only, with the same 2 s tolerance and $slack; the verdict names what it used. An
+        exit outside the runner's launch..end window is refused, typed. The overlap test keeps endedAtUtc (adversary 9a2372b7 A1)."""
+        s = self.r["stepExit"]
+        self.assertIsInstance(s, dict, "Test-CorePartitionMeasuredApp takes no runner termination stamp (-MeasuredExitTicks)")
+        refused = {
+            "predecessor-clock-step-with-exit-stamp": ("measured-app-gone-before-runner-exit", "exitToEndMs"),
+            "successor-with-exit-stamp": ("measured-app-seen-after-runner-launch", ""),
+            "gone-before-tolerance-with-exit-stamp": ("measured-app-gone-before-runner-exit", "exitToEndMs"),
+            "gone-before-exit-stamp-tolerance": ("measured-app-gone-before-runner-exit", "exitToEndMs"),
+            "drained-older-receipt": ("measured-app-gone-before-runner-exit", "endedAtUtc"),
+            "exit-stamp-after-end": ("measured-exit-stamp-inconsistent", "exitToEndMs"),
+            "exit-stamp-before-launch": ("measured-exit-stamp-inconsistent", "exitToEndMs"),
+            "started-before-exit-stamp-control": ("same-path-instance-overlap", ""),
+            # adversary 9a2372b7 A1 (literal): 6000 started +19.95 s, before the app's real exit (+20 s); an exit moved to +19.21 s must not hide it
+            "adversary-9a2372b7-A1-early-exit": ("same-path-instance-overlap", ""),
+            # adversary 6c16f4de advisory A1 (left open, the conservative side): an instance started during the drain is still refused as an overlap
+            "drain-only-instance": ("same-path-instance-overlap", ""),
+        }
+        for case, (code, stamp) in refused.items():
+            with self.subTest(case=case):
+                observed, gbps, why, verdict, used = s[case]
+                self.assertEqual([verdict, used], [code, stamp], s[case])
+                self.assertEqual([observed, gbps], [None, None], f"its evidence was credited: {why}")
+                self.assertIn(f"appAffinityObserved={code}", why)
+        for case in ("drained-bound-on-exit-stamp", "complete-interval-control-with-exit-stamp"):
+            with self.subTest(case=case):
+                observed, gbps, why, verdict, used = s[case]
+                self.assertEqual([observed, gbps, verdict, used], ["0x00FFF", 2.0, "", "exitToEndMs"], s[case])
+
     def test_a_helper_that_never_started_publishes_no_package_feed_value_through_the_job_cleanup(self) -> None:
         """r8 A3 (adversary r7 6fac125a A3) through the job's own not-ready rule, cleanup block and scalar line: no helper object, fresh feed rows."""
         c = self.cleanup_cases()["start-failed-fresh-feed"]
@@ -2219,6 +2341,207 @@ if (Get-Command Read-CorePartitionFeedBytes -ErrorAction SilentlyContinue) {
 }
 $r | ConvertTo-Json -Depth 6 -Compress
 """
+
+
+# CORE-PARTITION-PREDECESSOR-CLOCK-STEP-1 r2 (Dot pr-780 S1): the producer chain, end to end. A real app process (python) exits at once, but a child it
+# started holds the inherited stdout pipe open for $HoldSec, so the runner's REAL Wait-GuiSmokeProcessBounded drains stdout until then. The runner's
+# own finalize text (its Wait-GuiSmokeProcessBounded call through its end stamp) and its own process receipt block are executed as written; the
+# receipt goes through JSON to a result.json, the job's own result.json read and its own measured-app call are executed as written, and the helper
+# record says what a helper polling at 200 ms would: the app first seen just after its start, seen gone just after its real exit.
+EXIT_STAMP_DRIVER = r"""
+$ErrorActionPreference = 'Stop'
+Import-Module $env:CP_BOUNDARY -Force
+$runnerText = [IO.File]::ReadAllText($env:CP_RUNNER) -replace "`r`n", "`n"
+$genText = [IO.File]::ReadAllText($env:CP_GEN) -replace "`r`n", "`n"
+function Get-Slice([string]$Text, [string]$From, [string]$To) {
+    $i = $Text.IndexOf($From); if ($i -lt 0) { throw "slice start not found: $From" }
+    $j = $Text.IndexOf($To, $i); if ($j -lt 0) { throw "slice end not found: $To" }
+    $Text.Substring($i, $j + $To.Length - $i)
+}
+$runnerFinalize = Get-Slice $runnerText '$processBoundary = Wait-GuiSmokeProcessBounded' '$endUtc = [datetime]::UtcNow'
+$rpI = $runnerText.IndexOf("`n    process = [pscustomobject]@{`n"); if ($rpI -lt 0) { throw 'runner process receipt block not found' }
+$rpJ = $runnerText.IndexOf("`n    }`n", $rpI + 1)
+$runnerProcess = $runnerText.Substring($rpI + 15, $rpJ + 6 - ($rpI + 15))
+$jobRead = Get-Slice $genText '$corePartitionMeasuredPid = [int64]0;' 'catch { $corePartitionErrors.Add("measured-pid: $([string]$_.Exception.Message)") }'
+$jobVerdict = Get-Slice $genText 'try { $cpAppVerdict = Test-CorePartitionMeasuredApp ' 'catch { $corePartitionErrors.Add("measured-app: $([string]$_.Exception.Message)") }'
+$out = [ordered]@{}
+foreach ($case in @(@('drain-held', 3.5, $false), @('drain-held-older-receipt', 3.5, $true), @('no-hold-control', 0.0, $false))) {
+    $name = $case[0]; $holdSec = [double]$case[1]; $older = [bool]$case[2]
+    $code = if ($holdSec -gt 0) { "import subprocess, sys; print('app-ok', flush=True); subprocess.Popen([sys.executable, '-c', 'import time; time.sleep($holdSec)']); sys.exit(0)" } else { "print('app-ok', flush=True)" }
+    # r3: the runner's own launch reads (its wall stamp and, from r3, its monotonic stamp beside it), executed as written
+    if ($runnerText.Contains('$startTimestamp = [System.Diagnostics.Stopwatch]::GetTimestamp()')) {
+        . ([scriptblock]::Create((Get-Slice $runnerText '$startUtc = [datetime]::UtcNow' '$startTimestamp = [System.Diagnostics.Stopwatch]::GetTimestamp()')))
+    } else { $startUtc = [datetime]::UtcNow }
+    $psi = [Diagnostics.ProcessStartInfo]::new(); $psi.FileName = $env:CP_PY; $psi.UseShellExecute = $false
+    $psi.RedirectStandardOutput = $true; $psi.RedirectStandardError = $true
+    [void]$psi.ArgumentList.Add('-c'); [void]$psi.ArgumentList.Add($code)
+    $process = [Diagnostics.Process]::new(); $process.StartInfo = $psi; [void]$process.Start()
+    $stdoutTask = $process.StandardOutput.ReadToEndAsync(); $stderrTask = $process.StandardError.ReadToEndAsync()
+    $hostLoadFinalizeTimeoutMs = 60000; $captureBindingFailures = @()
+    . ([scriptblock]::Create($runnerFinalize))
+    $receiptProcess = . ([scriptblock]::Create($runnerProcess))
+    if ($older) { foreach ($n in @('exitObservedAtUtc', 'exitToEndMs', 'elapsedMonoMs')) { $receiptProcess.PSObject.Properties.Remove($n) } }
+    $resultPath = Join-Path $env:CP_TMP "$name.result.json"
+    [IO.File]::WriteAllText($resultPath, ([ordered]@{ process = $receiptProcess } | ConvertTo-Json -Depth 6))
+    $appStart = $process.StartTime.ToUniversalTime().Ticks; $appExit = $process.ExitTime.ToUniversalTime().Ticks
+    $inst = '{"pid":' + $process.Id + ',"startUtcTicks":' + $appStart + ',"firstSeenUtcTicks":' + ($appStart + 100000) + ',"firstMs":10,"lastSeenUtcTicks":' + $appStart +
+        ',"goneUtcTicks":' + ($appExit + 1000000) + ',"aliveMs":10,"goneMs":210,"affinityFirst":4095,"affinityLast":4095,"pinned":true}'
+    $corePartitionHelperRecord = ('{"schema":"mlv-app/core-partition-helper/v1","pid":4242,"app":' + $inst + ',"instances":[' + $inst + '],"others":[],"samples":[],"clockSkewMaxMs":0,"monoBaseMs":0,"endedBy":"stop-file"}') | ConvertFrom-Json
+    $corePartitionErrors = [System.Collections.Generic.List[string]]::new(); $corePartitionJobClockSkewMs = 0
+    . ([scriptblock]::Create($jobRead))
+    $cpAppVerdict = @{ why = 'measured-app-unverified' }
+    . ([scriptblock]::Create($jobVerdict))
+    $out[$name] = [ordered]@{
+        why = [string]$cpAppVerdict.why; exitStamp = $cpAppVerdict.exitStamp; errors = @($corePartitionErrors)
+        terminationConfirmed = [bool]$processBoundary.terminationConfirmed; stdoutDrained = [bool]$processBoundary.stdoutDrained; stdout = [string]$processBoundary.stdout
+        receiptHasExitStamp = ($null -ne $receiptProcess.PSObject.Properties['exitToEndMs'] -and $null -ne $receiptProcess.exitToEndMs)
+        receiptHasElapsedMono = ($null -ne $receiptProcess.PSObject.Properties['elapsedMonoMs'] -and $null -ne $receiptProcess.elapsedMonoMs)
+        runnerClock = [string]$cpAppVerdict.runnerClock; runnerSkewMs = $cpAppVerdict.runnerSkewMs
+        endAfterExitMs = [int](($endUtc.Ticks - $appExit) / 1e4)
+        exitObservedAfterExitMs = $(if ($corePartitionMeasuredExitTicks -ne 0) { [int](($corePartitionMeasuredExitTicks - $appExit) / 1e4) } else { $null })
+    }
+}
+# adversary 56b25d8b A2: a receipt whose exitToEndMs is there but is no usable drain (does not parse, negative, longer than launch..end, overflows)
+# is refused, never a silent fall back; null (termination never confirmed) falls back. The last case's real app, receipt and helper record.
+foreach ($bad in @(@('drain-1e20', 1e20), @('drain-negative', -5.0), @('drain-text', 'abc'), @('drain-over-window', 1e9), @('drain-null', $null))) {
+    $crafted = $receiptProcess | ConvertTo-Json -Depth 6 | ConvertFrom-Json
+    $crafted.exitToEndMs = $bad[1]
+    $resultPath = Join-Path $env:CP_TMP "$($bad[0]).result.json"
+    [IO.File]::WriteAllText($resultPath, ([ordered]@{ process = $crafted } | ConvertTo-Json -Depth 6))
+    $corePartitionErrors = [System.Collections.Generic.List[string]]::new()
+    . ([scriptblock]::Create($jobRead))
+    $cpAppVerdict = @{ why = 'measured-app-unverified' }
+    . ([scriptblock]::Create($jobVerdict))
+    $out[$bad[0]] = @([string]$cpAppVerdict.why, [string]$cpAppVerdict.exitStamp, $corePartitionErrors.Count)
+}
+# adversary f5182886 A1 (literal), through the job's own result.json read and verdict call: L = 639286128000000000. The runner's 5000 launched at
+# L+4 s, its termination was confirmed at L+20 s and its monotonic end read at L+24 s (exitToEndMs 4000; launch..end on the monotonic clock 20000 ms).
+# An unsampled UTC excursion lands only on the endedAtUtc read: +5 s stamps L+29 s (derived exit L+25 s, a false gone-before-exit refusal), -5 s
+# stamps L+19 s (derived exit L+15 s, before the real one). Both skews are 0 and the helper saw the app gone at L+20.1 s. r3: the runner's wall
+# launch..end disagrees with its monotonic launch..end by 5000 ms, over the 1000 ms CLOCK TOLERANCE: clock-discontinuity. Controls: no excursion,
+# and an 800 ms excursion (under the tolerance, widened into the slack). A drain with no monotonic launch..end to check it against proves no exit
+# (clock-unverified); one that is there but unusable is refused, never a silent fallback.
+$advInst = '{"pid":5000,"startUtcTicks":639286128040500000,"firstSeenUtcTicks":639286128042000000,"firstMs":4200,"goneUtcTicks":639286128201000000,"aliveMs":19900,"goneMs":20100,"pinned":true}'
+$advRecordJson = '{"schema":"mlv-app/core-partition-helper/v1","pid":4242,"app":{"pid":5000,"startUtcTicks":639286128040500000,"affinityFirst":4095,"affinityLast":4095},"instances":[' + $advInst +
+    '],"others":[],"samples":[],"load":{"seconds":15,"bytes":30000000000,"joined":true},"helperAffinityObserved":1044480,"topologyCheck":{"ok":true,"pMask":4095,"eMask":1044480},"clockSkewMaxMs":0,"monoBaseMs":0,"endedBy":"stop-file"}'
+$advL = [int64]639286128000000000
+foreach ($adv in @(@('adv-f5182886-A1-plus5', 29.0, 20000.0), @('adv-f5182886-A1-minus5', 19.0, 20000.0), @('adv-f5182886-A1-no-excursion-control', 24.0, 20000.0),
+        @('adv-f5182886-A1-800ms-control', 24.8, 20000.0), @('adv-f5182886-A1-elapsed-missing', 24.0, 'absent'), @('adv-f5182886-A1-elapsed-null', 24.0, $null),
+        @('adv-f5182886-A1-elapsed-text', 24.0, 'abc'), @('adv-f5182886-A1-elapsed-negative', 24.0, -1.0))) {
+    $p = [ordered]@{ id = 5000; startedAtUtc = ([datetime]::new($advL + 40000000, [DateTimeKind]::Utc)).ToString('o'); endedAtUtc = ([datetime]::new($advL + [int64]($adv[1] * 1e7), [DateTimeKind]::Utc)).ToString('o'); exitToEndMs = 4000.0 }
+    if (-not ($adv[2] -is [string] -and $adv[2] -eq 'absent')) { $p.elapsedMonoMs = $adv[2] }
+    $resultPath = Join-Path $env:CP_TMP "$($adv[0]).result.json"
+    [IO.File]::WriteAllText($resultPath, ([ordered]@{ process = $p } | ConvertTo-Json -Depth 6))
+    $corePartitionHelperRecord = $advRecordJson | ConvertFrom-Json
+    $corePartitionErrors = [System.Collections.Generic.List[string]]::new(); $corePartitionJobClockSkewMs = 0
+    . ([scriptblock]::Create($jobRead))
+    $cpAppVerdict = @{ why = 'measured-app-unverified' }
+    . ([scriptblock]::Create($jobVerdict))
+    $out[$adv[0]] = @([string]$cpAppVerdict.why, [string]$cpAppVerdict.exitStamp, [string]$cpAppVerdict.runnerClock, $corePartitionErrors.Count)
+}
+# r3: the runner's monotonic launch stamp is read right after its wall launch stamp, before the app starts
+$out.startOrder = @($runnerText.IndexOf('$startUtc = [datetime]::UtcNow'), $runnerText.IndexOf('$startTimestamp = [System.Diagnostics.Stopwatch]::GetTimestamp()'), $runnerText.IndexOf('$process = [System.Diagnostics.Process]::Start($startInfo)'))
+# adversary 56b25d8b A1: the runner reads its monotonic end BEFORE its wall end, after the bounded wait
+$out.order =@($runnerText.IndexOf('$processBoundary = Wait-GuiSmokeProcessBounded'), $runnerText.IndexOf('$endTimestamp = [System.Diagnostics.Stopwatch]::GetTimestamp()'), $runnerText.IndexOf('$endUtc = [datetime]::UtcNow'))
+$out | ConvertTo-Json -Depth 6 -Compress
+"""
+
+
+@requires_windows_pwsh
+class CorePartitionRunnerExitStampTests(unittest.TestCase):
+    """CORE-PARTITION-PREDECESSOR-CLOCK-STEP-1 r2 (Dot pr-780 S1, hub-verified at bd6f283a): the r1 exit-side check compared the helper's gone stamp
+    with the runner's process.endedAtUtc, which the runner stamps only after Wait-GuiSmokeProcessBounded has drained stdout and stderr (up to 15 s
+    each). A correctly bound app whose stdout drain ran more than 2 s past its exit was refused. The runner now also records the moment termination
+    was confirmed (process.exitObservedAtUtc); the job's exit-side check uses it, says which stamp it used, and falls back to endedAtUtc for an
+    older receipt."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        import sys
+        cls._tmp = tempfile.TemporaryDirectory(prefix="core-partition-exit-stamp-")
+        cls.addClassCleanup(cls._tmp.cleanup)
+        driver = Path(cls._tmp.name) / "exit-stamp-driver.ps1"
+        driver.write_text(LIFT + EXIT_STAMP_DRIVER, encoding="ascii")
+        cls.raw = run_pwsh(["-File", str(driver)], env_extra={
+            "CP_GEN": str(GENERATOR), "CP_TMP": cls._tmp.name, "CP_PY": sys.executable,
+            "CP_RUNNER": str(ROOT / "tools" / "profiling" / "run-release-gui-smoke.ps1"),
+            "CP_BOUNDARY": str(ROOT / "tools" / "profiling" / "gui-smoke-process-boundary.psm1")}, timeout=180)
+        lines = cls.raw.stdout.strip().splitlines()
+        cls.r = json.loads(lines[-1]) if cls.raw.returncode == 0 and lines else None
+
+    def setUp(self) -> None:
+        self.assertIsNotNone(self.r, f"the producer chain did not run: {self.raw.stdout[-3000:]}{self.raw.stderr[-3000:]}")
+
+    def test_a_correct_app_whose_stdout_drain_outlasts_the_tolerance_is_bound_on_its_termination_stamp(self) -> None:
+        c = self.r["drain-held"]
+        # the scenario is real: the app exited, its stdout drained in full, and the runner's endedAtUtc landed more than 2 s (plus margin) after the exit
+        self.assertEqual([c["terminationConfirmed"], c["stdoutDrained"], c["stdout"].strip(), c["errors"]], [True, True, "app-ok", []], c)
+        self.assertGreater(c["endAfterExitMs"], 2500, f"the drain did not hold endedAtUtc past the 2 s tolerance: {c}")
+        self.assertTrue(c["receiptHasExitStamp"], f"the runner's receipt carries no termination stamp: {c}")
+        self.assertIsNotNone(c["exitObservedAfterExitMs"], c)
+        self.assertLess(c["exitObservedAfterExitMs"], 1000, f"the termination stamp is not the moment the runner saw the exit: {c}")
+        self.assertEqual(c["why"], "", f"the runner's own app, observed across its life, was refused because cleanup outlasted the tolerance: {c}")
+        self.assertEqual(c["exitStamp"], "exitToEndMs", c)
+
+    def test_an_older_receipt_without_the_termination_stamp_falls_back_to_endedAtUtc_and_says_so(self) -> None:
+        c = self.r["drain-held-older-receipt"]
+        self.assertFalse(c["receiptHasExitStamp"], c)
+        self.assertGreater(c["endAfterExitMs"], 2500, c)
+        self.assertEqual(c["why"], "measured-app-gone-before-runner-exit", f"the fallback did not keep the r1 rule: {c}")
+        self.assertEqual(c["exitStamp"], "endedAtUtc", f"the verdict does not say which stamp it used: {c}")
+
+    def test_a_drain_that_is_there_but_unusable_is_refused_never_a_silent_fallback(self) -> None:
+        """adversary 56b25d8b A2: exitToEndMs that overflows, is negative, does not parse or is longer than the runner's window is refused, typed."""
+        for case in ("drain-1e20", "drain-negative", "drain-text", "drain-over-window"):
+            with self.subTest(case=case):
+                self.assertEqual(self.r[case][:2], ["measured-exit-stamp-inconsistent", "exitToEndMs"], self.r[case])
+        self.assertEqual(self.r["drain-null"], ["", "endedAtUtc", 0], "termination never confirmed (null) falls back to endedAtUtc")
+
+    def test_the_runner_reads_its_monotonic_end_before_its_wall_end(self) -> None:
+        """adversary 56b25d8b A1: a delay between the two end reads can only shorten exitToEndMs, so the derived exit never moves before the real one."""
+        wait, mono, wall = self.r["order"]
+        self.assertTrue(0 <= wait < mono < wall, self.r["order"])
+    def test_a_wall_clock_excursion_on_the_runners_end_read_is_a_clock_discontinuity(self) -> None:
+        """adversary f5182886 A1 (literal): an unsampled +5 s / -5 s UTC excursion that lands only on the runner's endedAtUtc read moved the derived
+        exit (endedAtUtc - exitToEndMs) to a false refusal / before the real exit. The runner's wall launch..end now has to agree with its monotonic
+        launch..end (process.elapsedMonoMs) within the 1000 ms CLOCK TOLERANCE; over it the verdict is clock-discontinuity."""
+        for case in ("adv-f5182886-A1-plus5", "adv-f5182886-A1-minus5"):
+            with self.subTest(case=case):
+                self.assertEqual(self.r[case][0], "clock-discontinuity", self.r[case])
+                self.assertEqual(self.r[case][3], 0, self.r[case])
+        for case in ("adv-f5182886-A1-no-excursion-control", "adv-f5182886-A1-800ms-control"):
+            with self.subTest(case=case):
+                self.assertEqual(self.r[case], ["", "exitToEndMs", "verified", 0], f"the runner's own app under a checked runner clock was refused: {self.r[case]}")
+
+    def test_a_drain_with_no_runner_clock_check_proves_no_exit(self) -> None:
+        """r3: exitToEndMs without the runner's monotonic launch..end (missing or null) is clock-unverified for the exit-side check, labelled; a
+        value that is there but unusable is refused, never a silent fallback."""
+        for case in ("adv-f5182886-A1-elapsed-missing", "adv-f5182886-A1-elapsed-null"):
+            with self.subTest(case=case):
+                self.assertEqual(self.r[case], ["clock-unverified", "exitToEndMs", "unverified", 0], self.r[case])
+        for case in ("adv-f5182886-A1-elapsed-text", "adv-f5182886-A1-elapsed-negative"):
+            with self.subTest(case=case):
+                self.assertEqual(self.r[case][0], "clock-unverified", self.r[case])
+                self.assertEqual(self.r[case][2], "unusable", self.r[case])
+
+    def test_the_runner_records_its_monotonic_launch_to_end_and_the_job_checks_it(self) -> None:
+        """r3: the real producer chain: the runner's receipt carries elapsedMonoMs, read right after its wall launch stamp, and the job checks it."""
+        launch, mono, start = self.r["startOrder"]
+        self.assertTrue(0 <= launch < mono < start, self.r["startOrder"])
+        for case in ("drain-held", "no-hold-control"):
+            with self.subTest(case=case):
+                c = self.r[case]
+                self.assertTrue(c["receiptHasElapsedMono"], c)
+                self.assertEqual(c["runnerClock"], "verified", c)
+                self.assertLess(c["runnerSkewMs"], 1000, c)
+        self.assertFalse(self.r["drain-held-older-receipt"]["receiptHasElapsedMono"])
+        self.assertEqual(self.r["drain-held-older-receipt"]["runnerClock"], "unverified", "the older-receipt fallback does not say its runner clock is unchecked")
+
+    def test_an_app_with_no_held_drain_is_bound_control(self) -> None:
+        c = self.r["no-hold-control"]
+        self.assertEqual([c["terminationConfirmed"], c["stdoutDrained"], c["stdout"].strip(), c["errors"]], [True, True, "app-ok", []], c)
+        self.assertLess(c["endAfterExitMs"], 2000, c)
+        self.assertEqual(c["why"], "", c)
 
 
 @requires_windows_pwsh
@@ -2656,7 +2979,9 @@ LATE_READ_SCENARIOS = {
     # U+00C5 (appExe): 'angstrom' (U+212B in its place: equal length, culture-equal, ordinally another file) is another exe; 'case' (the same path, ASCII case
     # only) is the exe. Mode suffix -angstrom / -case, in site order: the seen-key rule, the identity re-read, the listing's pending and tracking tests.
     **{f"{site}-{exe}": {"appExe": _ANGSTROM_APP_EXE, **spec(exe)} for exe in ("angstrom", "case") for site, spec in _ORDINAL_SITES.items()},
-    **{f"clock-back-path-{ms}": {"stepMs": ms, "procs": [{**_CLOCK_APP, "pathFail": 1, "pathMode": "empty"}]} for ms in CLOCK_STEPS_MS},
+    # CORE-PARTITION-PREDECESSOR-CLOCK-STEP-1: polls 250 ms apart, so the app (gone at enumeration 6) outlives the step and its stepped gone stamp still follows the
+    # runner's launch, as a real app's does (at 20 ms polls it lived about 0.3 s, and a 1000 ms step stamped it gone before its own start)
+    **{f"clock-back-path-{ms}": {"stepMs": ms, "sleepMs": 250, "procs": [{**_CLOCK_APP, "pathFail": 1, "pathMode": "empty"}]} for ms in CLOCK_STEPS_MS},
     **{f"clock-back-start-{ms}": {"stepMs": ms, "procs": [{**_CLOCK_APP, "startFail": 1}]} for ms in CLOCK_START_UNREAD_STEPS_MS},
 }
 _LATE_READ_DRIVER_BODY = HELPER_SOURCE + r"""
@@ -2692,6 +3017,10 @@ $global:cpDoubles = @(foreach ($s in @($global:cpSpec.procs)) {
         if ((Test-CpFails $s.startFail $s.startFailFrom) -or $global:cpPoll -eq $s.startFailAt -or ($this.cpFresh -and (Test-CpFails $null $s.idStartFailFrom))) { throw [ComponentModel.Win32Exception]::new(5) }
         if ($null -ne $s.recycleAt -and $global:cpPoll -ge $s.recycleAt) { if ($null -eq $global:cpNew) { $global:cpNew = [DateTime]::UtcNow.AddSeconds(3) }; return $global:cpNew }
         if ($null -ne $s.startBeforeFirstPollMs) { return $global:cpT1.AddMilliseconds(-$s.startBeforeFirstPollMs) }
+        # CORE-PARTITION-PREDECESSOR-CLOCK-STEP-1: a process started after the launch (startSec >= 0) is stamped startSec - 2 s from enumeration 1, so the
+        # app (startSec 1) started 1 s before the helper's first listing, as a runner-launched app is seen within a poll of its start (it was 29 s before
+        # it, the shape a successor first seen after the app exited has). A process started before the launch (startSec < 0) stays relative to it.
+        if ($s.startSec -ge 0) { return $global:cpT1.AddSeconds($s.startSec - 2) }
         $global:cpLaunch.AddSeconds($s.startSec) }
     $d })
 # CORE-PARTITION-HELPER-PID-REUSE-1: Get-Process -Id is the pid's occupant now (never counted as an enumeration): the double listed on that pid at this count, or
@@ -2742,9 +3071,15 @@ for ($b = 0; $b -lt $names.Count; $b += 4) {
         $rec = $(try { [IO.File]::ReadAllText((Join-Path $run.dir 'helper.json')) | ConvertFrom-Json } catch { $null })
         if ($null -eq $rec) { $out[$run.mode] = [ordered]@{ exit = $run.h.ExitCode; record = $false }; continue }
         if ($scenarios.($run.mode).catThrow) { $out[$run.mode] = [ordered]@{ exit = $run.h.ExitCode; record = $true; errors = @($rec.errors) }; continue }
-        $start = ([DateTime]::new($run.launch, [DateTimeKind]::Utc)).AddSeconds(1).Ticks
-        $v = Test-CorePartitionMeasuredApp $rec 5000 ($start - 5000000) $end 0
-        $s = Get-CorePartitionScalars $rec ([ordered]@{ reasons = [ordered]@{} }) 4095 ([int64]$rec.helperAffinityObserved) $run.threads @{ value = 1; why = $null } $null $false -MeasuredPid 5000 -MeasuredStartTicks ($start - 5000000) -MeasuredEndTicks $end
+        # CORE-PARTITION-PREDECESSOR-CLOCK-STEP-1: the runner's window is the one a runner reports: launched 0.2 s before the app's start (the first 5000
+        # recorded; the launch +1 s when none is) and its exit stamped when the job wrote the stop, the stop enumeration's stamp (the helper's end was later,
+        # by its teardown and this loop's wait for the batch's earlier helpers)
+        $fa = @(@($rec.instances) | Where-Object { $null -ne $_ -and $_.pid -eq 5000 })
+        $start = $(if ($fa.Count -gt 0) { [int64]$fa[0].startUtcTicks } else { ([DateTime]::new($run.launch, [DateTimeKind]::Utc)).AddSeconds(1).Ticks }) - 2000000
+        $stopPoll = @([IO.File]::ReadAllLines((Join-Path $run.dir 'polls')))[$(if ($scenarios.($run.mode).stopAt) { [int]$scenarios.($run.mode).stopAt } else { 8 }) - 1]
+        if ($stopPoll) { $end = [int64]$stopPoll }
+        $v = Test-CorePartitionMeasuredApp $rec 5000 $start $end 0
+        $s = Get-CorePartitionScalars $rec ([ordered]@{ reasons = [ordered]@{} }) 4095 ([int64]$rec.helperAffinityObserved) $run.threads @{ value = 1; why = $null } $null $false -MeasuredPid 5000 -MeasuredStartTicks $start -MeasuredEndTicks $end
         $named = @(@($rec.instances) + @($rec.others) | Where-Object { $null -ne $_ -and $null -eq $_.unidentified })
         $by = [ordered]@{}
         foreach ($i in $named) { $by[[string]$i.pid] = [ordered]@{ start = [int64]$i.startUtcTicks; first = [int64]$i.firstSeenUtcTicks; last = [int64]$i.lastSeenUtcTicks; firstMs = $i.firstMs; aliveMs = $i.aliveMs; goneMs = $i.goneMs; loadSec = $i.loadSec; loadJoined = $i.loadJoined } }
