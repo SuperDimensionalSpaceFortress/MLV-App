@@ -2772,7 +2772,11 @@ def _older_process(sddl):
     # Started before the lane, so it is older than the lane's process by creation time and by the kernel's process count. Popen's own handle was opened before the DACL
     # changed, so it keeps the rights to stop it at the end.
     older=subprocess.Popen(["ping.exe","-n","150","127.0.0.1"],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,stdin=subprocess.DEVNULL,creationflags=subprocess.CREATE_NO_WINDOW)
-    _set_process_dacl(older._handle,sddl)
+    try:
+        _set_process_dacl(older._handle,sddl)
+    except BaseException:   # r2 (adversary advisory A1 on 3d170b25): no caller's finally covers it yet, so a failed setup stops it here
+        older.kill(); older.wait(10)
+        raise
     return older
 
 
