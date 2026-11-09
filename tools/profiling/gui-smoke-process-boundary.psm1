@@ -76,9 +76,14 @@ function Wait-GuiSmokeProcessBounded {
     $treeKillAttempted = $false
     $treeKillSucceeded = $false
     $terminationConfirmed = $false
+    # CORE-PARTITION-PREDECESSOR-CLOCK-STEP-1 r2 (Dot pr-780 S1): the wall-clock moment a WaitForExit call returned true, i.e. when termination was
+    # confirmed, stamped BEFORE the stream drain below (which can run up to 2 x $StreamDrainMs past the exit while a child holds an inherited
+    # handle). $null when termination was never confirmed. The caller's own end stamp, taken after this function returns, includes that drain.
+    $exitObservedAtUtc = $null
 
     try {
         $terminationConfirmed = $Process.WaitForExit($TimeoutMs)
+        if ($terminationConfirmed) { $exitObservedAtUtc = [datetime]::UtcNow }
     }
     catch {
         # round 7 (sol MINOR, same class as the two sanitizations already below): record only the
@@ -107,6 +112,7 @@ function Wait-GuiSmokeProcessBounded {
 
         try {
             $terminationConfirmed = $Process.WaitForExit($TerminationGraceMs)
+            if ($terminationConfirmed) { $exitObservedAtUtc = [datetime]::UtcNow }
         }
         catch {
             $failures.Add("MLVApp post-kill wait failed: $($_.Exception.GetType().Name)")
@@ -152,6 +158,7 @@ function Wait-GuiSmokeProcessBounded {
         treeKillAttempted = $treeKillAttempted
         treeKillSucceeded = $treeKillSucceeded
         terminationConfirmed = $terminationConfirmed
+        exitObservedAtUtc = $exitObservedAtUtc
         stdoutDrained = [bool]$stdoutResult.completed
         stderrDrained = [bool]$stderrResult.completed
         stdout = [string]$stdoutResult.text

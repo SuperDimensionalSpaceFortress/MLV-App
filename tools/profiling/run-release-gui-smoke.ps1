@@ -2933,6 +2933,9 @@ $result = [pscustomobject]@{
         stderrDrained = [bool]$processBoundary.stderrDrained
         startedAtUtc = $startUtc.ToString("o")
         endedAtUtc = $endUtc.ToString("o")
+        # CORE-PARTITION-PREDECESSOR-CLOCK-STEP-1 r2 (Dot pr-780 S1): endedAtUtc is stamped after the stdout/stderr drain; this is the moment the
+        # process's termination was confirmed (Wait-GuiSmokeProcessBounded's exitObservedAtUtc), before that drain. null when never confirmed.
+        exitObservedAtUtc = $(if ($null -ne $processBoundary.exitObservedAtUtc) { ([datetime]$processBoundary.exitObservedAtUtc).ToString("o") } else { $null })
         stdout = $stdout.Trim()
         stderr = $stderr.Trim()
     }

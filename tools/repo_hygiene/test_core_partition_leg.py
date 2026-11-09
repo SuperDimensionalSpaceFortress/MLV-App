@@ -868,7 +868,7 @@ class CorePartitionGeneratorTests(unittest.TestCase):
                 measured = text.index("Publish-AttrCudaText -Path $corePartitionMeasuredFile")
                 self.assertLess(measured, text.index("Publish-AttrCudaText -Path $corePartitionStopFile"), "the measured pid must reach the helper before it stops")
                 # r8 A1: and the job's own wall/monotonic clock gap
-                self.assertIn("$corePartitionHelperWhy $corePartitionHelperNotReady $corePartitionMeasuredPid $corePartitionPublishWhy $corePartitionMeasuredStartTicks $corePartitionMeasuredEndTicks $corePartitionJobClockSkewMs\n", text)
+                self.assertIn("$corePartitionHelperWhy $corePartitionHelperNotReady $corePartitionMeasuredPid $corePartitionPublishWhy $corePartitionMeasuredStartTicks $corePartitionMeasuredEndTicks $corePartitionJobClockSkewMs $corePartitionMeasuredExitTicks\n", text)
                 self.assertIn("ConvertTo-CorePartitionUtcTicks $cpRunnerProcess.startedAtUtc", text)
                 for fn in ("function Test-CorePartitionMeasuredApp", "function Get-CorePartitionFeedHandleInfo", "function ConvertTo-CorePartitionUtcTicks", "function Get-CorePartitionClockSkewMs",
                            "function Test-CorePartitionReadyMarker", "function Get-CorePartitionReadyToken", "function Get-CorePartitionMonoMs"):
@@ -1463,6 +1463,31 @@ foreach ($k in $stepCases.Keys) {
     $v = Test-CorePartitionMeasuredApp $stepCases[$k] 5000 ($L + 40000000) ($L + 240000000) 0
     $r.step[$k] = @($sc.corePartitionTopologyOk, $sc.benchAffinityApplied, $sc.partitionLoadApplied, $sc.appAffinityObserved, $sc.partitionLoadGBps, $sc.pcoreMHzMean, [string]$sc.corePartitionNullReasons, [string]$v.why)
 }
+# r2 (Dot pr-780 S1): the runner's termination stamp (process.exitObservedAtUtc) replaces endedAtUtc in the exit-side check only. Launch +4 s, endedAtUtc
+# +24 s (after a drain); exit stamp in seconds after L, or $null for an older receipt. The r1 refusals hold with an exit stamp at the end; a drained
+# app (true exit +20.0 s, seen gone +20.1 s) is bound on its exit stamp and refused on endedAtUtc; a stamp outside launch..end proves nothing.
+$r.stepExit = 'absent'
+if ((Get-Command Test-CorePartitionMeasuredApp).Parameters.ContainsKey('MeasuredExitTicks')) {
+    $drained = New-CpStepRecord (New-CpInst 5000 4.05 4.2 20.0 20.1) 0
+    $exitCases = [ordered]@{
+        'predecessor-clock-step-with-exit-stamp' = @($stepCases['predecessor-clock-step'], 23.95)
+        'successor-with-exit-stamp' = @($stepCases['successor-first-seen-after-exit'], 23.95)
+        'gone-before-tolerance-with-exit-stamp' = @($stepCases['gone-before-tolerance'], 23.95)
+        'gone-before-exit-stamp-tolerance' = @($drained, 22.2)
+        'drained-bound-on-exit-stamp' = @($drained, 20.05)
+        'drained-older-receipt' = @($drained, $null)
+        'exit-stamp-after-end' = @($drained, 25.0)
+        'exit-stamp-before-launch' = @($drained, 3.0)
+        'complete-interval-control-with-exit-stamp' = @($stepCases['complete-interval-control'], 23.95)
+    }
+    foreach ($k in $exitCases.Keys) {
+        $x = $(if ($null -eq $exitCases[$k][1]) { [int64]0 } else { $L + [int64]($exitCases[$k][1] * 1e7) })
+        $sc = Get-CorePartitionScalars $exitCases[$k][0] $feed 4095 1044480 8 $w $null $false -MeasuredPid 5000 -MeasuredStartTicks ($L + 40000000) -MeasuredEndTicks ($L + 240000000) -ClockSkewMs 0 -MeasuredExitTicks $x
+        $v = Test-CorePartitionMeasuredApp $exitCases[$k][0] 5000 ($L + 40000000) ($L + 240000000) 0 $x
+        if ($r.stepExit -is [string]) { $r.stepExit = [ordered]@{} }
+        $r.stepExit[$k] = @($sc.appAffinityObserved, $sc.partitionLoadGBps, [string]$sc.corePartitionNullReasons, [string]$v.why, [string]$v.exitStamp)
+    }
+}
 # r8 A1: the job's own gap over its (wall ticks, monotonic ms) pairs: steady; a 100 s backward step; one pair; a non-numeric or missing reading
 $r.clockSkew = 'absent'
 if (Get-Command Get-CorePartitionClockSkewMs -ErrorAction SilentlyContinue) {
@@ -1988,6 +2013,32 @@ class CorePartitionPureHelperTests(unittest.TestCase):
                 self.assertEqual(control[7], "", f"the runner's own instance, observed across its interval, was refused: {control}")
                 self.assertEqual(control[:6], [True, True, True, "0x00FFF", 2.0, 4000.0], f"its evidence is credited: {control}")
 
+    def test_the_exit_side_check_uses_the_runners_termination_stamp_and_keeps_every_r1_refusal(self) -> None:
+        """r2 (Dot pr-780 S1): process.exitObservedAtUtc (when the runner's wait confirmed the exit) replaces endedAtUtc (stamped after the stream
+        drain) in the exit-side check only, with the same 2 s tolerance and $slack; the verdict names the stamp it used. A stamp outside the runner's
+        launch..end window is refused, typed."""
+        s = self.r["stepExit"]
+        self.assertIsInstance(s, dict, "Test-CorePartitionMeasuredApp takes no runner termination stamp (-MeasuredExitTicks)")
+        refused = {
+            "predecessor-clock-step-with-exit-stamp": ("measured-app-gone-before-runner-exit", "exitObservedAtUtc"),
+            "successor-with-exit-stamp": ("measured-app-seen-after-runner-launch", ""),
+            "gone-before-tolerance-with-exit-stamp": ("measured-app-gone-before-runner-exit", "exitObservedAtUtc"),
+            "gone-before-exit-stamp-tolerance": ("measured-app-gone-before-runner-exit", "exitObservedAtUtc"),
+            "drained-older-receipt": ("measured-app-gone-before-runner-exit", "endedAtUtc"),
+            "exit-stamp-after-end": ("measured-exit-stamp-inconsistent", "exitObservedAtUtc"),
+            "exit-stamp-before-launch": ("measured-exit-stamp-inconsistent", "exitObservedAtUtc"),
+        }
+        for case, (code, stamp) in refused.items():
+            with self.subTest(case=case):
+                observed, gbps, why, verdict, used = s[case]
+                self.assertEqual([verdict, used], [code, stamp], s[case])
+                self.assertEqual([observed, gbps], [None, None], f"its evidence was credited: {why}")
+                self.assertIn(f"appAffinityObserved={code}", why)
+        for case in ("drained-bound-on-exit-stamp", "complete-interval-control-with-exit-stamp"):
+            with self.subTest(case=case):
+                observed, gbps, why, verdict, used = s[case]
+                self.assertEqual([observed, gbps, verdict, used], ["0x00FFF", 2.0, "", "exitObservedAtUtc"], s[case])
+
     def test_a_helper_that_never_started_publishes_no_package_feed_value_through_the_job_cleanup(self) -> None:
         """r8 A3 (adversary r7 6fac125a A3) through the job's own not-ready rule, cleanup block and scalar line: no helper object, fresh feed rows."""
         c = self.cleanup_cases()["start-failed-fresh-feed"]
@@ -2272,6 +2323,113 @@ if (Get-Command Read-CorePartitionFeedBytes -ErrorAction SilentlyContinue) {
 }
 $r | ConvertTo-Json -Depth 6 -Compress
 """
+
+
+# CORE-PARTITION-PREDECESSOR-CLOCK-STEP-1 r2 (Dot pr-780 S1): the producer chain, end to end. A real app process (python) exits at once, but a child it
+# started holds the inherited stdout pipe open for $HoldSec, so the runner's REAL Wait-GuiSmokeProcessBounded drains stdout until then. The runner's
+# own finalize text (its Wait-GuiSmokeProcessBounded call through its end stamp) and its own process receipt block are executed as written; the
+# receipt goes through JSON to a result.json, the job's own result.json read and its own measured-app call are executed as written, and the helper
+# record says what a helper polling at 200 ms would: the app first seen just after its start, seen gone just after its real exit.
+EXIT_STAMP_DRIVER = r"""
+$ErrorActionPreference = 'Stop'
+Import-Module $env:CP_BOUNDARY -Force
+$runnerText = [IO.File]::ReadAllText($env:CP_RUNNER) -replace "`r`n", "`n"
+$genText = [IO.File]::ReadAllText($env:CP_GEN) -replace "`r`n", "`n"
+function Get-Slice([string]$Text, [string]$From, [string]$To) {
+    $i = $Text.IndexOf($From); if ($i -lt 0) { throw "slice start not found: $From" }
+    $j = $Text.IndexOf($To, $i); if ($j -lt 0) { throw "slice end not found: $To" }
+    $Text.Substring($i, $j + $To.Length - $i)
+}
+$runnerFinalize = Get-Slice $runnerText '$processBoundary = Wait-GuiSmokeProcessBounded' '$endUtc = [datetime]::UtcNow'
+$rpI = $runnerText.IndexOf("`n    process = [pscustomobject]@{`n"); if ($rpI -lt 0) { throw 'runner process receipt block not found' }
+$rpJ = $runnerText.IndexOf("`n    }`n", $rpI + 1)
+$runnerProcess = $runnerText.Substring($rpI + 15, $rpJ + 6 - ($rpI + 15))
+$jobRead = Get-Slice $genText '$corePartitionMeasuredPid = [int64]0;' 'catch { $corePartitionErrors.Add("measured-pid: $([string]$_.Exception.Message)") }'
+$jobVerdict = Get-Slice $genText 'try { $cpAppVerdict = Test-CorePartitionMeasuredApp ' 'catch { $corePartitionErrors.Add("measured-app: $([string]$_.Exception.Message)") }'
+$out = [ordered]@{}
+foreach ($case in @(@('drain-held', 3.5, $false), @('drain-held-older-receipt', 3.5, $true), @('no-hold-control', 0.0, $false))) {
+    $name = $case[0]; $holdSec = [double]$case[1]; $older = [bool]$case[2]
+    $code = if ($holdSec -gt 0) { "import subprocess, sys; print('app-ok', flush=True); subprocess.Popen([sys.executable, '-c', 'import time; time.sleep($holdSec)']); sys.exit(0)" } else { "print('app-ok', flush=True)" }
+    $startUtc = [datetime]::UtcNow
+    $psi = [Diagnostics.ProcessStartInfo]::new(); $psi.FileName = $env:CP_PY; $psi.UseShellExecute = $false
+    $psi.RedirectStandardOutput = $true; $psi.RedirectStandardError = $true
+    [void]$psi.ArgumentList.Add('-c'); [void]$psi.ArgumentList.Add($code)
+    $process = [Diagnostics.Process]::new(); $process.StartInfo = $psi; [void]$process.Start()
+    $stdoutTask = $process.StandardOutput.ReadToEndAsync(); $stderrTask = $process.StandardError.ReadToEndAsync()
+    $hostLoadFinalizeTimeoutMs = 60000; $captureBindingFailures = @()
+    . ([scriptblock]::Create($runnerFinalize))
+    $receiptProcess = . ([scriptblock]::Create($runnerProcess))
+    if ($older) { $receiptProcess.PSObject.Properties.Remove('exitObservedAtUtc') }
+    $resultPath = Join-Path $env:CP_TMP "$name.result.json"
+    [IO.File]::WriteAllText($resultPath, ([ordered]@{ process = $receiptProcess } | ConvertTo-Json -Depth 6))
+    $appStart = $process.StartTime.ToUniversalTime().Ticks; $appExit = $process.ExitTime.ToUniversalTime().Ticks
+    $inst = '{"pid":' + $process.Id + ',"startUtcTicks":' + $appStart + ',"firstSeenUtcTicks":' + ($appStart + 100000) + ',"firstMs":10,"lastSeenUtcTicks":' + $appStart +
+        ',"goneUtcTicks":' + ($appExit + 1000000) + ',"aliveMs":10,"goneMs":210,"affinityFirst":4095,"affinityLast":4095,"pinned":true}'
+    $corePartitionHelperRecord = ('{"schema":"mlv-app/core-partition-helper/v1","pid":4242,"app":' + $inst + ',"instances":[' + $inst + '],"others":[],"samples":[],"clockSkewMaxMs":0,"monoBaseMs":0,"endedBy":"stop-file"}') | ConvertFrom-Json
+    $corePartitionErrors = [System.Collections.Generic.List[string]]::new(); $corePartitionJobClockSkewMs = 0
+    . ([scriptblock]::Create($jobRead))
+    $cpAppVerdict = @{ why = 'measured-app-unverified' }
+    . ([scriptblock]::Create($jobVerdict))
+    $out[$name] = [ordered]@{
+        why = [string]$cpAppVerdict.why; exitStamp = $cpAppVerdict.exitStamp; errors = @($corePartitionErrors)
+        terminationConfirmed = [bool]$processBoundary.terminationConfirmed; stdoutDrained = [bool]$processBoundary.stdoutDrained; stdout = [string]$processBoundary.stdout
+        receiptHasExitStamp = ($null -ne $receiptProcess.PSObject.Properties['exitObservedAtUtc'] -and $null -ne $receiptProcess.exitObservedAtUtc)
+        endAfterExitMs = [int](($endUtc.Ticks - $appExit) / 1e4)
+        exitObservedAfterExitMs = $(if ($null -ne $processBoundary.PSObject.Properties['exitObservedAtUtc'] -and $null -ne $processBoundary.exitObservedAtUtc) { [int]((([datetime]$processBoundary.exitObservedAtUtc).ToUniversalTime().Ticks - $appExit) / 1e4) } else { $null })
+    }
+}
+$out | ConvertTo-Json -Depth 6 -Compress
+"""
+
+
+@requires_windows_pwsh
+class CorePartitionRunnerExitStampTests(unittest.TestCase):
+    """CORE-PARTITION-PREDECESSOR-CLOCK-STEP-1 r2 (Dot pr-780 S1, hub-verified at bd6f283a): the r1 exit-side check compared the helper's gone stamp
+    with the runner's process.endedAtUtc, which the runner stamps only after Wait-GuiSmokeProcessBounded has drained stdout and stderr (up to 15 s
+    each). A correctly bound app whose stdout drain ran more than 2 s past its exit was refused. The runner now also records the moment termination
+    was confirmed (process.exitObservedAtUtc); the job's exit-side check uses it, says which stamp it used, and falls back to endedAtUtc for an
+    older receipt."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        import sys
+        cls._tmp = tempfile.TemporaryDirectory(prefix="core-partition-exit-stamp-")
+        cls.addClassCleanup(cls._tmp.cleanup)
+        driver = Path(cls._tmp.name) / "exit-stamp-driver.ps1"
+        driver.write_text(LIFT + EXIT_STAMP_DRIVER, encoding="ascii")
+        cls.raw = run_pwsh(["-File", str(driver)], env_extra={
+            "CP_GEN": str(GENERATOR), "CP_TMP": cls._tmp.name, "CP_PY": sys.executable,
+            "CP_RUNNER": str(ROOT / "tools" / "profiling" / "run-release-gui-smoke.ps1"),
+            "CP_BOUNDARY": str(ROOT / "tools" / "profiling" / "gui-smoke-process-boundary.psm1")}, timeout=180)
+        lines = cls.raw.stdout.strip().splitlines()
+        cls.r = json.loads(lines[-1]) if cls.raw.returncode == 0 and lines else None
+
+    def setUp(self) -> None:
+        self.assertIsNotNone(self.r, f"the producer chain did not run: {self.raw.stdout[-3000:]}{self.raw.stderr[-3000:]}")
+
+    def test_a_correct_app_whose_stdout_drain_outlasts_the_tolerance_is_bound_on_its_termination_stamp(self) -> None:
+        c = self.r["drain-held"]
+        # the scenario is real: the app exited, its stdout drained in full, and the runner's endedAtUtc landed more than 2 s (plus margin) after the exit
+        self.assertEqual([c["terminationConfirmed"], c["stdoutDrained"], c["stdout"].strip(), c["errors"]], [True, True, "app-ok", []], c)
+        self.assertGreater(c["endAfterExitMs"], 2500, f"the drain did not hold endedAtUtc past the 2 s tolerance: {c}")
+        self.assertTrue(c["receiptHasExitStamp"], f"the runner's receipt carries no termination stamp: {c}")
+        self.assertIsNotNone(c["exitObservedAfterExitMs"], c)
+        self.assertLess(c["exitObservedAfterExitMs"], 1000, f"the termination stamp is not the moment the runner saw the exit: {c}")
+        self.assertEqual(c["why"], "", f"the runner's own app, observed across its life, was refused because cleanup outlasted the tolerance: {c}")
+        self.assertEqual(c["exitStamp"], "exitObservedAtUtc", c)
+
+    def test_an_older_receipt_without_the_termination_stamp_falls_back_to_endedAtUtc_and_says_so(self) -> None:
+        c = self.r["drain-held-older-receipt"]
+        self.assertFalse(c["receiptHasExitStamp"], c)
+        self.assertGreater(c["endAfterExitMs"], 2500, c)
+        self.assertEqual(c["why"], "measured-app-gone-before-runner-exit", f"the fallback did not keep the r1 rule: {c}")
+        self.assertEqual(c["exitStamp"], "endedAtUtc", f"the verdict does not say which stamp it used: {c}")
+
+    def test_an_app_with_no_held_drain_is_bound_control(self) -> None:
+        c = self.r["no-hold-control"]
+        self.assertEqual([c["terminationConfirmed"], c["stdoutDrained"], c["stdout"].strip(), c["errors"]], [True, True, "app-ok", []], c)
+        self.assertLess(c["endAfterExitMs"], 2000, c)
+        self.assertEqual(c["why"], "", c)
 
 
 @requires_windows_pwsh

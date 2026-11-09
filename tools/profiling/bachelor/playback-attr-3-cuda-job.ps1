@@ -5196,7 +5196,10 @@ function Test-CorePartitionHelperRecord($Record, $LaunchPid, $ExitCode, [bool]$M
 # both the helper's polls (its record's clockSkewMaxMs) and the job's own reads ($ClockSkewMs, Get-CorePartitionClockSkewMs); over it the verdict is
 # clock-discontinuity, and a gap nobody recorded is clock-unverified. Process start times are the OS's wall-clock stamps (a step before the helper
 # started is not seen here: LIMIT, CORE-PARTITION-PROCESS-START-EVENTS-1).
-function Test-CorePartitionMeasuredApp($Helper, [int64]$MeasuredPid, [int64]$MeasuredStartTicks, [int64]$MeasuredEndTicks, $ClockSkewMs = 0) {
+# r2 (Dot pr-780 S1): $MeasuredExitTicks is the runner's process.exitObservedAtUtc, when its WaitForExit confirmed the exit; $MeasuredEndTicks
+# (endedAtUtc) is stamped only after the stdout/stderr drain, which can run seconds past the exit. Only the exit-side interval check below uses
+# it; 0 (an older receipt without it) falls back to endedAtUtc. Which stamp it used is returned as exitStamp with that check's verdicts.
+function Test-CorePartitionMeasuredApp($Helper, [int64]$MeasuredPid, [int64]$MeasuredStartTicks, [int64]$MeasuredEndTicks, $ClockSkewMs = 0, [int64]$MeasuredExitTicks = 0) {
     if ($MeasuredPid -le 0) { return @{ why = 'measured-pid-unknown' } }
     if ($MeasuredStartTicks -le 0 -or $MeasuredEndTicks -lt $MeasuredStartTicks) { return @{ why = 'measured-window-unknown' } }
     # sol r6 CP-07: every record number below went through the one guarded parse first
@@ -5245,7 +5248,15 @@ function Test-CorePartitionMeasuredApp($Helper, [int64]$MeasuredPid, [int64]$Mea
     # runner's app never listed (listed, it is a second candidate, measured-pid-ambiguous, or its gone key makes the successor unidentified); an app whose
     # whole life fell between two polls in a runner window shorter than the two tolerances is the residual (LIMIT A3, CORE-PARTITION-PROCESS-START-EVENTS-1).
     if ($a.first - $slack -gt $MeasuredStartTicks + 20000000) { return @{ why = 'measured-app-seen-after-runner-launch' } }
-    if ($null -ne $a.gone -and $a.gone + $slack -lt $MeasuredEndTicks - 20000000) { return @{ why = 'measured-app-gone-before-runner-exit' } }
+    # r2 (Dot pr-780 S1): the runner's exit is the moment its wait confirmed termination (exitObservedAtUtc), not endedAtUtc, which also covers the
+    # stream drain after it; an older receipt without it falls back to endedAtUtc. A termination stamp outside the runner's own launch..end window
+    # (each side widened by $slack) is not the runner's exit and proves nothing: measured-exit-stamp-inconsistent.
+    $exitStamp = 'endedAtUtc'; $exitTicks = $MeasuredEndTicks
+    if ($MeasuredExitTicks -ne 0) {
+        if ($MeasuredExitTicks + $slack -lt $MeasuredStartTicks -or $MeasuredExitTicks - $slack -gt $MeasuredEndTicks) { return @{ why = 'measured-exit-stamp-inconsistent'; exitStamp = 'exitObservedAtUtc' } }
+        $exitStamp = 'exitObservedAtUtc'; $exitTicks = $MeasuredExitTicks
+    }
+    if ($null -ne $a.gone -and $a.gone + $slack -lt $exitTicks - 20000000) { return @{ why = 'measured-app-gone-before-runner-exit'; exitStamp = $exitStamp } }
     foreach ($o in $all) {
         if ([object]::ReferenceEquals($o, $a)) { continue }
         $oStart = if ($null -ne $o.start) { $o.start - $slack } else { [int64]::MinValue }
@@ -5268,7 +5279,7 @@ function Test-CorePartitionMeasuredApp($Helper, [int64]$MeasuredPid, [int64]$Mea
     # uncovered tail is too long to accept: coverage-endpoint-gap.
     $endpointMs = $a.goneMs - $a.aliveMs
     if ($endpointMs -gt 1000) { return @{ why = 'coverage-endpoint-gap'; endpointMs = $endpointMs } }
-    @{ why = $null; aliveMs = $a.aliveMs; endpointMs = $endpointMs }
+    @{ why = $null; aliveMs = $a.aliveMs; endpointMs = $endpointMs; exitStamp = $exitStamp }
 }
 
 # PURE. The summary scalars from the helper's record (or $null when it wrote none), the feed summary and the requested masks.
@@ -5276,13 +5287,13 @@ function Test-CorePartitionMeasuredApp($Helper, [int64]$MeasuredPid, [int64]$Mea
 # $MeasuredPid, $MeasuredStartTicks, $MeasuredEndTicks (sol r4 CP-02): the app evidence is used only when Test-CorePartitionMeasuredApp binds it to them.
 # $PublishWhy (sol r4 CP-05): set when core-partition.json was not published; every acceptance flag is then false with that reason.
 # $ClockSkewMs (r8 A1): the job's own wall/monotonic gap across the measured window, for Test-CorePartitionMeasuredApp.
-function Get-CorePartitionScalars($Helper, $Feed, [int64]$BenchMask, [int64]$LoadMask, [int]$LoadThreads, $Workers, [string]$HelperWhy, [bool]$HelperNotReady, [int64]$MeasuredPid, [string]$PublishWhy, [int64]$MeasuredStartTicks, [int64]$MeasuredEndTicks, $ClockSkewMs = 0) {
+function Get-CorePartitionScalars($Helper, $Feed, [int64]$BenchMask, [int64]$LoadMask, [int]$LoadThreads, $Workers, [string]$HelperWhy, [bool]$HelperNotReady, [int64]$MeasuredPid, [string]$PublishWhy, [int64]$MeasuredStartTicks, [int64]$MeasuredEndTicks, $ClockSkewMs = 0, [int64]$MeasuredExitTicks = 0) {
     $why = [ordered]@{}
     $h = $Helper
     # sol r6 CP-07: a record with a number that does not parse is no record (its reason is appended to the helper's), so nothing below can throw on it.
     $shapeWhy = Test-CorePartitionHelperRecordShape $h
     if ($shapeWhy) { $h = $null; $HelperWhy = Join-CorePartitionWhy $HelperWhy $shapeWhy }
-    $appVerdict = if ($null -ne $h) { Test-CorePartitionMeasuredApp $h $MeasuredPid $MeasuredStartTicks $MeasuredEndTicks $ClockSkewMs } else { @{ why = $null } }
+    $appVerdict = if ($null -ne $h) { Test-CorePartitionMeasuredApp $h $MeasuredPid $MeasuredStartTicks $MeasuredEndTicks $ClockSkewMs $MeasuredExitTicks } else { @{ why = $null } }
     $appWhy = $appVerdict.why
     $topoOk = $false; $pMask = [int64]0; $eMask = [int64]0
     if ($null -eq $h) { $why['corePartitionTopologyOk'] = $(if ($HelperWhy) { $HelperWhy } else { 'helper-record-missing' }) }
@@ -6621,11 +6632,14 @@ try {
     $corePartitionFeedEnd = Read-CorePartitionFeedSince $corePartitionFeedPath ([int64]$corePartitionFeedStart.length) ([string]$corePartitionFeedStart.before)
     # sol r4 CP-02: the measured app is the process the smoke runner launched (its result.json process.id); 0 when unknown, which binds nothing.
     # Its launch..exit window (process.startedAtUtc / endedAtUtc) binds the pid to that process, not a later one reusing it (adversary r5 A3).
-    $corePartitionMeasuredPid = [int64]0; $corePartitionMeasuredStartTicks = [int64]0; $corePartitionMeasuredEndTicks = [int64]0
+    # r2 (Dot pr-780 S1): and process.exitObservedAtUtc, when the runner's wait confirmed the exit (before its stream drain); 0 when the receipt has
+    # none (an older runner), and the exit-side check then falls back to endedAtUtc.
+    $corePartitionMeasuredPid = [int64]0; $corePartitionMeasuredStartTicks = [int64]0; $corePartitionMeasuredEndTicks = [int64]0; $corePartitionMeasuredExitTicks = [int64]0
     try {
         $cpRunnerProcess = ([IO.File]::ReadAllText($resultPath) | ConvertFrom-Json).process
         if ($null -ne $cpRunnerProcess -and $null -ne $cpRunnerProcess.id) { $corePartitionMeasuredPid = [int64]$cpRunnerProcess.id }
         if ($null -ne $cpRunnerProcess) { $corePartitionMeasuredStartTicks = ConvertTo-CorePartitionUtcTicks $cpRunnerProcess.startedAtUtc; $corePartitionMeasuredEndTicks = ConvertTo-CorePartitionUtcTicks $cpRunnerProcess.endedAtUtc }
+        if ($null -ne $cpRunnerProcess -and $null -ne $cpRunnerProcess.PSObject.Properties['exitObservedAtUtc']) { $corePartitionMeasuredExitTicks = ConvertTo-CorePartitionUtcTicks $cpRunnerProcess.exitObservedAtUtc }
     } catch { $corePartitionErrors.Add("measured-pid: $([string]$_.Exception.Message)") }
     if ($null -ne $corePartitionHelper) {
         # The pid goes to the helper BEFORE the stop file, so the helper binds its record to it as it ends.
@@ -6663,7 +6677,7 @@ try {
     } elseif (-not $corePartitionHelperWhy) { $corePartitionHelperWhy = 'helper-record-missing' }
     # r11 B1: the measured app's last observed-alive poll on the job's monotonic base, from the measured-app verdict ($null when it refused)
     $cpAppVerdict = @{ why = 'measured-app-unverified' }
-    try { $cpAppVerdict = Test-CorePartitionMeasuredApp $corePartitionHelperRecord $corePartitionMeasuredPid $corePartitionMeasuredStartTicks $corePartitionMeasuredEndTicks $corePartitionJobClockSkewMs } catch { $corePartitionErrors.Add("measured-app: $([string]$_.Exception.Message)") }
+    try { $cpAppVerdict = Test-CorePartitionMeasuredApp $corePartitionHelperRecord $corePartitionMeasuredPid $corePartitionMeasuredStartTicks $corePartitionMeasuredEndTicks $corePartitionJobClockSkewMs $corePartitionMeasuredExitTicks } catch { $corePartitionErrors.Add("measured-app: $([string]$_.Exception.Message)") }
     $corePartitionAppAliveMonoMs = Get-CorePartitionAppAliveMonoMs $corePartitionHelperRecord $cpAppVerdict
     # r13 (Dot 6452868627, CP-FEED-START-ANCHOR): the window's start is bound to the measured session's playback start, read from the run log the
     # result names (the same hash-checked snapshot the metrics read; unresolvable is feed-window-start-unverified). r13c (HUB RULING
@@ -6707,7 +6721,7 @@ try {
             # r9 (Dot 4): the samples and load are clipped to the helper's last poll that saw the app alive, so the window's end is known to within
             # the gap between that poll and the one that saw it gone (adversary r9 5592421d A2: the measured gap, nominally one 200 ms poll interval,
             # not a constant; null when the app evidence is refused): endpointErrorBoundMs. LIMIT, CORE-PARTITION-PROCESS-START-EVENTS-1.
-            measured = [ordered]@{ pid = $corePartitionMeasuredPid; startUtcTicks = $corePartitionMeasuredStartTicks; endUtcTicks = $corePartitionMeasuredEndTicks; jobClockSkewMs = $corePartitionJobClockSkewMs; endpointErrorBoundMs = $cpAppVerdict.endpointMs }
+            measured = [ordered]@{ pid = $corePartitionMeasuredPid; startUtcTicks = $corePartitionMeasuredStartTicks; endUtcTicks = $corePartitionMeasuredEndTicks; exitObservedUtcTicks = $corePartitionMeasuredExitTicks; exitStamp = $cpAppVerdict.exitStamp; jobClockSkewMs = $corePartitionJobClockSkewMs; endpointErrorBoundMs = $cpAppVerdict.endpointMs }
             measuredApp = $cpAppVerdict.why
             helper = $corePartitionHelperRecord
             feed = [ordered]@{
@@ -6763,7 +6777,7 @@ if ($cpPublication.unrecorded) {
     Write-Output "RESULT=CORE_PARTITION_UNRECORDED REASON=core-partition-json-unpublished+unpublished-status-unwritten ARTIFACTS=$Pub"
     exit 32
 }
-$corePartitionScalars = Get-CorePartitionScalars $corePartitionHelperRecord $corePartitionFeedSummary $CorePartitionBenchMask $CorePartitionLoadMask $CorePartitionLoadThreads (Get-CorePartitionWorkerThreads $rawLog) $corePartitionHelperWhy $corePartitionHelperNotReady $corePartitionMeasuredPid $corePartitionPublishWhy $corePartitionMeasuredStartTicks $corePartitionMeasuredEndTicks $corePartitionJobClockSkewMs
+$corePartitionScalars = Get-CorePartitionScalars $corePartitionHelperRecord $corePartitionFeedSummary $CorePartitionBenchMask $CorePartitionLoadMask $CorePartitionLoadThreads (Get-CorePartitionWorkerThreads $rawLog) $corePartitionHelperWhy $corePartitionHelperNotReady $corePartitionMeasuredPid $corePartitionPublishWhy $corePartitionMeasuredStartTicks $corePartitionMeasuredEndTicks $corePartitionJobClockSkewMs $corePartitionMeasuredExitTicks
 '@ + "`n" + $cpClose + "`n" + $cpMetricsAnchor)
     $cpMetricsAt = $text.IndexOf($cpMetricsAnchor, [StringComparison]::Ordinal)
     $cpKeysAnchor = '    cpuFrames = $gpuSummary.cpuFrames' + $cpEol
