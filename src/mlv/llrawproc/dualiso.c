@@ -4965,7 +4965,9 @@ static inline size_t dualiso_cs2_thread_ints(int ncx, int npos)
  * memcpy + legacy kernel). scratch == NULL allocates the ring for this call
  * only (test seam); otherwise the ring is the scratch's reusable buffer (K3).
  * use_avx2 selects the LEVER-2 kernel; callers pass it only when the dispatch
- * is active. */
+ * is active. avx2_ran (optional) is set to 1 only when the AVX2 kernel
+ * actually smoothed cells, never for a plane too small to hold a cell (plain
+ * copy) or a ring failure (adversary 457eb203 A1). */
 static int dualiso_chroma_smooth_2x2_fast_u32(int w,
                                               int h,
                                               const uint32_t * __restrict inp,
@@ -4975,11 +4977,16 @@ static int dualiso_chroma_smooth_2x2_fast_u32(int w,
                                               int black,
                                               int white,
                                               dualiso_full20bit_scratch_t * scratch,
-                                              int use_avx2)
+                                              int use_avx2,
+                                              int * avx2_ran)
 {
     const int ncx = (w > 8) ? (w - 7) / 2 : 0;
     const int ncy = (h > 9) ? (h - 8) / 2 : 0;
     const size_t row_bytes = (size_t)w * sizeof(uint32_t);
+    if (avx2_ran)
+    {
+        *avx2_ran = 0;
+    }
     if (ncx <= 0 || ncy <= 0)
     {
         if (w > 0 && h > 0)
@@ -5102,6 +5109,12 @@ static int dualiso_chroma_smooth_2x2_fast_u32(int w,
     {
         free(rings);
     }
+#ifdef DUALISO_AVX2_AVAILABLE
+    if (avx2_ran)
+    {
+        *avx2_ran = use_avx2 ? 1 : 0;
+    }
+#endif
     return 1;
 }
 
@@ -5171,7 +5184,7 @@ int dualisoMixChroma2x2KernelForTesting(int use_fast,
     if (use_fast)
     {
         const int use_avx2 = use_fast == 2 && dualisoMixChromaAvx2Active();
-        ok = dualiso_chroma_smooth_2x2_fast_u32(w, h, inp, out, raw2ev, ev2raw, black, white, NULL, use_avx2);
+        ok = dualiso_chroma_smooth_2x2_fast_u32(w, h, inp, out, raw2ev, ev2raw, black, white, NULL, use_avx2, NULL);
     }
     else
     {
@@ -5265,7 +5278,8 @@ static void dualiso_debug_dump_source_smooth_plane(const char * name,
 /* One matched-source plane: the fast fused kernel when route is 1 (K1/K2
  * scalar) or 2 (LEVER-2 AVX2), else (or if the fast ring cannot be
  * allocated) the legacy copy + hdr_chroma_smooth. On the legacy route the
- * caller has already copied both planes. Returns 1 when the fast kernel ran. */
+ * caller has already copied both planes. Returns 1 only when the AVX2 kernel
+ * smoothed this plane (adversary 457eb203 A1: a cell-less plane is a copy). */
 static inline int dualiso_smooth_source_plane(int route,
                                               struct raw_info info,
                                               uint32_t * input,
@@ -5278,6 +5292,7 @@ static inline int dualiso_smooth_source_plane(int route,
 {
     if (route > 0)
     {
+        int avx2_ran = 0;
         if (dualiso_chroma_smooth_2x2_fast_u32(info.width,
                                                info.height,
                                                input,
@@ -5287,9 +5302,10 @@ static inline int dualiso_smooth_source_plane(int route,
                                                info.black_level,
                                                info.white_level,
                                                scratch,
-                                               route == 2))
+                                               route == 2,
+                                               &avx2_ran))
         {
-            return 1;
+            return avx2_ran;
         }
         const double copy_start = mlv_stage_timing_now();
         memcpy(output, input, plane_bytes);
@@ -5398,7 +5414,7 @@ static inline int smooth_matched_source_planes(struct raw_info raw_info,
     g_dualiso_full20bit_timing.mix_chroma_probe_stage = 0;
     g_dualiso_full20bit_timing.mix_chroma_halfres_ms += dualiso_debug_elapsed_ms(stage_start);
     /* Venue proof: both planes ran the AVX2 kernel this frame. */
-    g_dualiso_full20bit_timing.mix_chroma_avx2_used = route == 2 && avx2_planes == 2;
+    g_dualiso_full20bit_timing.mix_chroma_avx2_used = avx2_planes == 2;
 
     dualiso_debug_dump_source_smooth_plane("stage_bright_source_smooth.u32",
                                            bright_smooth,

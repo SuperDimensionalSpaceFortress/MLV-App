@@ -7203,8 +7203,9 @@ TEST(DualIsoPipeline, MixChromaFull20RouteBenchAtVenueGeometry)
             int auto_correction = -1;
             double ev_correction = 1.0;
             int black_delta = -1;
+            // threads = the measured team, so AMaZE runs its 16 workers (adversary 457eb203 A2).
             ASSERT_EQ(1, diso_get_full20bit(raw, image.data(), 0, 100, 200, &iso_pattern, &auto_correction,
-                                            &ev_correction, &black_delta, 0, 1, 1, 1, 1, 1, &scratch[route]));
+                                            &ev_correction, &black_delta, 0, 1, 1, 1, 1, team, &scratch[route]));
             dualiso_full20bit_timing_t t = {};
             dualiso_debug_get_full20bit_timing(&t);
             ASSERT_EQ(route == 2 && avx2 ? 1 : 0, t.mix_chroma_avx2_used);
@@ -7260,6 +7261,48 @@ TEST(DualIsoPipeline, MixChromaAvx2ProofSurvivesAConsumedWorkerRecon)
     ASSERT_TRUE(presented.value(QStringLiteral("recon_worker_dual_iso_full20_mix_chroma_avx2_used")).toBool());
     // The render thread's own key is left as it is.
     ASSERT_FALSE(presented.value(QStringLiteral("dual_iso_full20_mix_chroma_avx2_used")).toBool());
+}
+
+// Adversary 457eb203 A1: a frame too narrow to hold a 2x2 cell (ncx = 0) is a plain copy on
+// the fast route; the AVX2 path proof must stay 0 for it.
+TEST(DualIsoPipeline, MixChromaAvx2ProofIsZeroForACelllessPlane)
+{
+    struct raw_info raw = {};
+    raw.width = 8;
+    raw.height = 64;
+    raw.pitch = 8;
+    raw.bits_per_pixel = 14;
+    raw.black_level = 2048;
+    raw.white_level = 15000;
+    raw.active_area.x1 = 0;
+    raw.active_area.y1 = 0;
+    raw.active_area.x2 = 8;
+    raw.active_area.y2 = 64;
+    raw.cfa_pattern = 0x02010100;
+    std::vector<uint16_t> image(static_cast<size_t>(8) * 64);
+    for (int y = 0; y < 64; y++)
+    {
+        for (int x = 0; x < 8; x++)
+        {
+            image[static_cast<size_t>(y) * 8 + static_cast<size_t>(x)] = static_cast<uint16_t>((y % 4) < 2 ? 5000 : 3000);
+        }
+    }
+    ScopedMixChromaProbeEnv env;
+    env.set(nullptr);
+    dualiso_full20bit_scratch_t scratch = {};
+    int iso_pattern = 1;
+    int auto_correction = -1;
+    double ev_correction = 1.0;
+    int black_delta = 0;
+    const int rc = diso_get_full20bit(raw, image.data(), 0, 100, 200, &iso_pattern, &auto_correction, &ev_correction,
+                                      &black_delta, 1, 0, 0, 1, 0, 1, &scratch);
+    dualiso_full20bit_timing_t timing = {};
+    dualiso_debug_get_full20bit_timing(&timing);
+    free_dualiso_full20bit_scratch(&scratch);
+    std::fprintf(stderr, "[mix-chroma-proof] case=cellless w=8 h=64 rc=%d avx2=%d mix_chroma_avx2_used=%d\n",
+                 rc, dualisoMixChromaAvx2Active(), timing.mix_chroma_avx2_used);
+    ASSERT_EQ(1, rc);
+    ASSERT_EQ(0, timing.mix_chroma_avx2_used);
 }
 
 TEST(DualIsoPipeline, MixChromaFastRouteFull20IsByteIdenticalToLegacySynthetic)
