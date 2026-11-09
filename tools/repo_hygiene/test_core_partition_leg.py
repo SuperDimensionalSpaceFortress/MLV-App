@@ -352,6 +352,111 @@ $out | ConvertTo-Json -Compress -Depth 8
 """
 
 
+# CORE-PARTITION-TERMINAL-TEST-REAL-PUBLISHER-1 (ledger 2026-10-28T14:47:12Z, #696 key3 r14b H3, fable r13d CORE-PARTITION-STATUS-REAL-PUBLISHER-TEST-1):
+# TERMINAL_CHILD_HEAD above stubs Save-Json (it throws on a switch, it never publishes) and Publish-AttrCudaText (a bare WriteAllText), so the REAL
+# Save-Json -> Publish-AttrCudaText slot path that writes core-partition.json and core-partition-unpublished.json was never run by any test. These
+# children are the same terminals with neither stub: the driver lifts the job's own Save-Json and Publish-AttrCudaText, and everything they call
+# (Assert-AttrCudaWritableFileSlot, Get-AttrCudaFileId, ...), out of the GENERATED job text by AST, and a name in the work directory is occupied
+# before the child starts (a directory: the slot refuses it; a second hard link: the slot refuses to remove one of two names).
+_STUB_PUBLISH = "function Publish-AttrCudaText { param([string]$Path, [string]$Value) [IO.File]::WriteAllText($Path, $Value) }\n"
+_STUB_SAVE_FROM = "function Save-Json { param($Object, $Path)\n"
+_STUB_SAVE_TO = "function Resolve-AttrCudaSmokeRunLog"
+
+
+def _real_publisher_head(stubbed: str) -> str:
+    """TERMINAL_CHILD_HEAD with its Publish-AttrCudaText stub line and its Save-Json stub block replaced by one placeholder the driver fills."""
+    if stubbed.count(_STUB_PUBLISH) != 1 or stubbed.count(_STUB_SAVE_FROM) != 1 or stubbed.count(_STUB_SAVE_TO) != 1:
+        raise RuntimeError("TERMINAL_CHILD_HEAD no longer has the Publish-AttrCudaText / Save-Json stubs this head is derived from")
+    head = stubbed.replace(_STUB_PUBLISH, "")
+    start, end = head.index(_STUB_SAVE_FROM), head.index(_STUB_SAVE_TO)
+    return head[:start] + "__REAL_FUNCTIONS__\n" + head[end:]
+
+
+REAL_PUBLISHER_CHILD_HEAD = _real_publisher_head(TERMINAL_CHILD_HEAD)
+# the stand-ins the real head still carries (Write-JobTrace, New-AttrCudaDirectory, Resolve-AttrCudaSmokeRunLog): never lifted over them
+REAL_PUBLISHER_KEPT_STUBS = ("Write-JobTrace", "Resolve-AttrCudaSmokeRunLog", "New-AttrCudaDirectory")
+REAL_PUBLISHER_REQUIRED = ("Save-Json", "Publish-AttrCudaText", "Assert-AttrCudaWritableFileSlot")
+OCCUPY_STALE_RECORD = '{"schema":"stale-record","feed":{"summary":{"rows":99},"startWhy":""}}'
+_PRESENTMON_TERMINAL = "Set-LogB\n$rawLog = [IO.File]::ReadAllText($runLogPath)\nWrite-Output 'RESULT=PRESENTMON_UNAVAILABLE'\nexit 23\n"
+_SUCCESS_BODY = "$rawLog = [IO.File]::ReadAllText($runLogPath)\n" + TERMINAL_SUCCESS_TAIL
+# case -> (CP_SAVE (unused by the real head), the body after the smoke-launch finally, {name occupied before the run: 'dir' | 'hardlink'})
+REAL_TERMINALS = {
+    # control: nothing occupied, success whose later read is the same snapshot -> the real path writes core-partition.json once, no status
+    "real-success": ("ok", _SUCCESS_BODY, {}),
+    # only the status name occupied: the record publishes, the status is never needed -> the job is undisturbed
+    "real-status-occupied": ("ok", _SUCCESS_BODY, {"core-partition-unpublished.json": "dir"}),
+    # only the record name occupied (a directory): the real slot refuses it three times, the real status write succeeds -> published as unpublished
+    "real-record-occupied": ("ok", _SUCCESS_BODY, {"core-partition.json": "dir"}),
+    # both occupied: the record refuses and the typed status refuses too -> CORE_PARTITION_UNRECORDED, exit 32, and a failure terminal keeps its own exit
+    "real-both-occupied": ("ok", _SUCCESS_BODY, {"core-partition.json": "dir", "core-partition-unpublished.json": "dir"}),
+    "real-both-occupied-terminal": ("ok", _PRESENTMON_TERMINAL, {"core-partition.json": "dir", "core-partition-unpublished.json": "dir"}),
+    # a stale record of an earlier run holds a second hard link: the slot will not remove one of two names, the stale record stays, the status says so
+    "real-stale-multi-link": ("ok", _SUCCESS_BODY, {"core-partition.json": "hardlink"}),
+}
+REAL_PUBLISHER_DRIVER = r"""
+$ErrorActionPreference = 'Stop'
+$job = [IO.File]::ReadAllText($env:CP_JOB) -replace "`r`n", "`n"
+$regions = @(); $at = 0
+while (($s = $job.IndexOf($env:CP_OPEN, $at)) -ge 0) { $e = $job.IndexOf($env:CP_CLOSE, $s); $regions += $job.Substring($s, $e - $s); $at = $e + 1 }
+$fake = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($env:CP_FAKE_HELPER))
+$pre = [regex]::Replace($regions[0], "(?m)^\`$CorePartitionHelperEncoded = '[^']*'", { "`$CorePartitionHelperEncoded = '$fake'" })
+$pre = [regex]::Replace($pre, '(?m)^\$CorePartitionHelperAffinity = \[int64\]\d+', '$CorePartitionHelperAffinity = [int64]1')
+$fin = $(if ($regions.Count -gt 4) { $regions[4..($regions.Count - 1)] -join "`n" } else { '' })
+# the REAL publisher: Save-Json, Publish-AttrCudaText and everything they call, lifted from the generated job's own text (never rewritten)
+$parsed = [System.Management.Automation.Language.Parser]::ParseInput($job, [ref]$null, [ref]$null)
+$defs = @{}
+foreach ($d in $parsed.FindAll({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] }, $false)) { $defs[$d.Name] = $d }
+$kept = @($env:CP_KEPT_STUBS -split ',')
+$take = [Collections.Generic.List[string]]::new(); $queue = [Collections.Generic.Queue[string]]::new()
+foreach ($n in @($env:CP_REQUIRED -split ',')) { $queue.Enqueue($n) }
+while ($queue.Count -gt 0) {
+    $n = $queue.Dequeue()
+    if (-not $defs.ContainsKey($n) -or $take -contains $n -or $kept -contains $n) { continue }
+    $take.Add($n)
+    foreach ($c in $defs[$n].FindAll({ param($x) $x -is [System.Management.Automation.Language.CommandAst] }, $true)) { $cn = $c.GetCommandName(); if ($cn) { $queue.Enqueue($cn) } }
+}
+$real = (@($take | ForEach-Object { $defs[$_].Extent.Text }) -join "`n")
+$terminals = $env:CP_TERMINALS | ConvertFrom-Json -AsHashtable
+$out = [ordered]@{ '__lifted__' = @($take) }
+foreach ($name in @($terminals.Keys | Sort-Object)) {
+    $dir = Join-Path $env:CP_WORK $name; [void](New-Item -ItemType Directory -Path $dir)
+    $plants = $terminals[$name][2]
+    foreach ($pn in @($plants.Keys)) {
+        $pp = Join-Path $dir $pn
+        if ($plants[$pn] -eq 'dir') { [void](New-Item -ItemType Directory -Path $pp) }
+        elseif ($plants[$pn] -eq 'hardlink') { [IO.File]::WriteAllText($pp, $env:CP_STALE); [void](New-Item -ItemType HardLink -Path "$pp.other-name" -Target $pp) }
+    }
+    $body = ([string]$terminals[$name][1]).Replace('__METRICS__', $regions[2])
+    $kill = '    if ((Test-Path -LiteralPath ''variable:corePartitionHelper'') -and $null -ne $corePartitionHelper -and -not $corePartitionHelper.HasExited) { $corePartitionHelper.Kill() }'
+    $child = $env:CP_HEAD.Replace('__REAL_FUNCTIONS__', $real) + "`n" + $pre + "`n" + $env:CP_SETUP + "`n" + $regions[1] + "`n" + $body + "`n} finally {`n" + $fin + "`n" + $kill + "`n}`n"
+    $childPath = Join-Path $dir 'child.ps1'; [IO.File]::WriteAllText($childPath, $child)
+    $env:CP_TWORK = $dir; $env:CP_SAVE = [string]$terminals[$name][0]
+    $stdout = @(& "$env:ProgramFiles\PowerShell\7\pwsh.exe" -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $childPath 2>&1 | ForEach-Object { [string]$_ })
+    $rc = $LASTEXITCODE
+    $cpPath = Join-Path $dir 'core-partition.json'
+    $cp = $(if (Test-Path -LiteralPath $cpPath -PathType Leaf) { [IO.File]::ReadAllText($cpPath) | ConvertFrom-Json -AsHashtable })
+    $stPath = Join-Path $dir 'core-partition-unpublished.json'
+    $st = $(if (Test-Path -LiteralPath $stPath -PathType Leaf) { [IO.File]::ReadAllText($stPath) | ConvertFrom-Json -AsHashtable })
+    $smPath = Join-Path $dir 'summary.json'
+    $sm = $(if (Test-Path -LiteralPath $smPath -PathType Leaf) { [IO.File]::ReadAllText($smPath) | ConvertFrom-Json -AsHashtable })
+    $occupied = [ordered]@{}
+    foreach ($pn in @($plants.Keys | Sort-Object)) {
+        $pp = Join-Path $dir $pn; $it = Get-Item -LiteralPath $pp -Force -ErrorAction SilentlyContinue
+        $occupied[$pn] = [ordered]@{ exists = ($null -ne $it); isDir = ($null -ne $it -and $it.PSIsContainer); entries = $(if ($null -ne $it -and $it.PSIsContainer) { @(Get-ChildItem -LiteralPath $pp -Force).Count }); text = $(if ($null -ne $it -and -not $it.PSIsContainer) { [IO.File]::ReadAllText($pp) }) }
+    }
+    $out[$name] = [ordered]@{
+        rc = $rc; stdout = $stdout
+        onDisk = $(if ($null -ne $cp) { [ordered]@{ rows = $cp.feed.summary.rows; watts = $cp.feed.summary.pkgWattsMean; startWhy = [string]$cp.feed.startWhy; wattsWhy = $(if ($null -ne $cp.feed.summary.reasons) { [string]$cp.feed.summary.reasons['pkgWattsMean'] }); helper = ($null -ne $cp.helper); schema = [string]$cp.schema } })
+        status = $(if ($null -ne $st) { [ordered]@{ schema = $st.schema; stage = $st.stage; why = $st.why; startWhy = $st.startWhy; staleRecordOnDisk = $st.staleRecordOnDisk; errors = @($st.errors) } })
+        summary = $(if ($null -ne $sm) { [ordered]@{ result = $sm.result; reason = $sm.reason } })
+        occupied = $occupied
+        names = @(Get-ChildItem -LiteralPath $dir -Force | ForEach-Object { $_.Name } | Sort-Object)
+    }
+}
+$out | ConvertTo-Json -Compress -Depth 8
+"""
+
+
 # r2 (Dot improvement): the decoded helper run for real against a stand-in "app" (a copy of PING.EXE named mlvfake.exe; never MLVApp). One instance
 # of that exe already runs when the helper starts, a second starts after it is ready: only the second may be bound as the measured app.
 IDENTITY_DRIVER = r"""
@@ -1078,6 +1183,106 @@ class CorePartitionGeneratorTests(unittest.TestCase):
         self.assertIsNotNone(st, control)
         self.assertEqual([st["stage"], st["why"], st["staleRecordOnDisk"]], ["publish", "core-partition-json-unpublished", False], st)
         self.assertEqual(st["errors"].count("publish: save-json-refused-by-test"), 3, st)
+
+    def real_publisher_cases(self) -> dict:
+        """REAL_PUBLISHER_DRIVER's per-case results for job "a": the job's own Save-Json and Publish-AttrCudaText, not the stubs, run once per class."""
+        cls = type(self)
+        if getattr(cls, "_real_publisher", None) is None:
+            self.job("a")
+            work = Path(tempfile.mkdtemp(prefix="real-publisher-work-", dir=self.tmp))
+            driver = self.tmp / "real-publisher-driver.ps1"
+            driver.write_text(REAL_PUBLISHER_DRIVER, encoding="ascii")
+            proc = run_pwsh(["-File", str(driver)], env_extra={"CP_JOB": str(self.out["a"]), "CP_OPEN": OPEN, "CP_CLOSE": CLOSE, "CP_FAKE_HELPER": MARKER_HELPER,
+                                                               "CP_WORK": str(work), "CP_HEAD": REAL_PUBLISHER_CHILD_HEAD, "CP_SETUP": TERMINAL_CHILD_SETUP,
+                                                               "CP_TERMINALS": json.dumps(REAL_TERMINALS), "CP_STALE": OCCUPY_STALE_RECORD,
+                                                               "CP_KEPT_STUBS": ",".join(REAL_PUBLISHER_KEPT_STUBS), "CP_REQUIRED": ",".join(REAL_PUBLISHER_REQUIRED)})
+            self.assertEqual(proc.returncode, 0, proc.stdout[-3000:] + proc.stderr[-3000:])
+            cls._real_publisher = json.loads(proc.stdout.strip().splitlines()[-1])
+        return cls._real_publisher
+
+    def test_real_publisher_is_the_jobs_own_code_not_a_stub(self) -> None:
+        """The stubbed terminal children replace Save-Json and Publish-AttrCudaText; this one's functions are lifted from the generated job by AST.
+        Guard the lift itself: the real slot check must be among them (a stub-free child that silently lost it would pass every case below)."""
+        got = self.real_publisher_cases()
+        for name in REAL_PUBLISHER_REQUIRED:
+            self.assertIn(name, got["__lifted__"], got["__lifted__"])
+        self.assertNotIn("function Publish-AttrCudaText { param([string]$Path, [string]$Value) [IO.File]::WriteAllText", REAL_PUBLISHER_CHILD_HEAD)
+        self.assertNotIn("function Save-Json", REAL_PUBLISHER_CHILD_HEAD)
+        job = lf(self.job("a"))
+        self.assertIn("function Save-Json($Object, [string]$Path) {\n    # Artifact writes go through the slot-checked helper", job)
+        self.assertIn("function Publish-AttrCudaText {", job)
+
+    def test_real_publisher_success_writes_core_partition_json_through_the_real_slot(self) -> None:
+        """Control: nothing occupied -> the real Save-Json -> Publish-AttrCudaText writes core-partition.json (a plain file) with the window the stubbed
+        control publishes, writes no unpublished status, and the job exits as the success terminal does (0). The status name occupied by a directory
+        changes nothing, because a published record never touches it."""
+        got = self.real_publisher_cases()
+        for name in ("real-success", "real-status-occupied"):
+            with self.subTest(case=name):
+                c = got[name]
+                self.assertEqual(c["rc"], 0, c)
+                self.assertIsNotNone(c["onDisk"], f"the real publisher left no core-partition.json: {c}")
+                self.assertEqual([c["onDisk"]["rows"], c["onDisk"]["watts"], c["onDisk"]["startWhy"]], [1, 45.0, ""], c)
+                self.assertTrue(c["onDisk"]["helper"], c)
+                self.assertIn("PUBLISHWHY=", c["stdout"], c)
+                self.assertIsNone(c["status"], c)
+                self.assertIsNone(c["summary"], c)
+                self.assertFalse([n for n in c["names"] if re.search(r"(?i)tmp|partial|\.new$|\.part$", n)], c["names"])
+        occupied = got["real-status-occupied"]["occupied"]["core-partition-unpublished.json"]
+        self.assertEqual([occupied["exists"], occupied["isDir"], occupied["entries"]], [True, True, 0], "the real publisher wrote into the occupied status name")
+
+    def test_real_publisher_refuses_an_occupied_record_slot_and_records_why(self) -> None:
+        """Only the record name occupied by a directory: the real slot check throws ATTRCUDA_SLOT_OCCUPIED on each of the three tries, writes nothing
+        into the directory, and the real status write (the second real publish) lands core-partition-unpublished.json with the three real errors. The
+        directory is not a record claiming success: no core-partition.json file exists, so the status says staleRecordOnDisk false."""
+        c = self.real_publisher_cases()["real-record-occupied"]
+        self.assertEqual(c["rc"], 0, c)
+        self.assertIsNone(c["onDisk"], f"a core-partition.json file claims success although its slot was refused: {c}")
+        self.assertIn("PUBLISHWHY=core-partition-json-unpublished", c["stdout"], c)
+        st = c["status"]
+        self.assertIsNotNone(st, f"the refused record left no status through the real publisher: {c}")
+        self.assertEqual([st["schema"], st["stage"], st["why"], st["staleRecordOnDisk"]],
+                         ["mlv-app/core-partition-unpublished/v1", "publish", "core-partition-json-unpublished", False], st)
+        slot = [e for e in st["errors"] if e.startswith("publish: ATTRCUDA_SLOT_OCCUPIED ")]
+        self.assertEqual(len(slot), 3, st)
+        self.assertFalse([e for e in st["errors"] if "save-json-refused-by-test" in e], st)
+        record = c["occupied"]["core-partition.json"]
+        self.assertEqual([record["exists"], record["isDir"], record["entries"]], [True, True, 0], "the real publisher wrote into the occupied record slot")
+        self.assertFalse([n for n in c["names"] if re.search(r"(?i)tmp|partial|\.new$|\.part$", n)], c["names"])
+
+    def test_real_publisher_unrecorded_run_exits_32_and_leaves_no_record_claiming_success(self) -> None:
+        """Both names occupied by directories: the real record write and the real status write both refuse -> the success terminal ends
+        CORE_PARTITION_UNRECORDED (exit 32, a refusal summary.json written through the real publisher), and a failure terminal keeps its own exit (23)
+        and names CORE_PARTITION_UNRECORDED on the result stream. Neither core-partition.json nor core-partition-unpublished.json exists as a file."""
+        got = self.real_publisher_cases()
+        red = got["real-both-occupied"]
+        self.assertEqual(red["rc"], 32, f"a run whose real record and status writes both refused was not refused: {red}")
+        self.assertTrue(any(ln.startswith("RESULT=CORE_PARTITION_UNRECORDED REASON=core-partition-json-unpublished+unpublished-status-unwritten ARTIFACTS=") for ln in red["stdout"]), red)
+        self.assertEqual(red["summary"], {"result": "CORE_PARTITION_UNRECORDED", "reason": "core-partition-json-unpublished+unpublished-status-unwritten"}, red)
+        self.assertNotIn("PUBLISHWHY=", "\n".join(red["stdout"]), red)
+        term = got["real-both-occupied-terminal"]
+        self.assertEqual(term["rc"], 23, term)
+        self.assertTrue(any(ln.startswith("CORE_PARTITION_UNRECORDED REASON=core-partition-json-unpublished+unpublished-status-unwritten") for ln in term["stdout"]), term)
+        self.assertIsNone(term["summary"], term)
+        for name, c in (("success", red), ("failure-terminal", term)):
+            with self.subTest(terminal=name):
+                self.assertEqual([c["onDisk"], c["status"]], [None, None], c)
+                for slot in ("core-partition.json", "core-partition-unpublished.json"):
+                    occ = c["occupied"][slot]
+                    self.assertEqual([occ["exists"], occ["isDir"], occ["entries"]], [True, True, 0], f"{slot}: the real publisher wrote into the occupied slot: {c}")
+                self.assertFalse([n for n in c["names"] if re.search(r"(?i)tmp|partial|\.new$|\.part$", n)], c["names"])
+
+    def test_real_publisher_will_not_replace_a_stale_record_held_by_a_second_name(self) -> None:
+        """A stale core-partition.json of an earlier run has a second hard link: the real slot check refuses to remove one of two names
+        (ATTRCUDA_SLOT_OCCUPIED_MULTI_LINK, through Get-AttrCudaFileId), so the stale record stays byte for byte, and the real status says so:
+        staleRecordOnDisk true, never a silent success over it."""
+        c = self.real_publisher_cases()["real-stale-multi-link"]
+        self.assertEqual(c["rc"], 0, c)
+        st = c["status"]
+        self.assertIsNotNone(st, c)
+        self.assertEqual([st["why"], st["stage"], st["staleRecordOnDisk"]], ["core-partition-json-unpublished", "publish", True], st)
+        self.assertEqual(len([e for e in st["errors"] if e.startswith("publish: ATTRCUDA_SLOT_OCCUPIED_MULTI_LINK ")]), 3, st)
+        self.assertEqual(c["occupied"]["core-partition.json"]["text"], OCCUPY_STALE_RECORD, "the real publisher wrote through, or replaced, the stale record")
 
     def test_the_jobs_key_reaches_only_the_helper(self) -> None:
         """sol r6 CP-06: the per-job key is drawn at run time, handed to the helper by environment (never the command line), never traced or
