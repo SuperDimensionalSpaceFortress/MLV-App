@@ -65,7 +65,7 @@ param(
 #               exception type is not retried.
 #   r2 (cases liveness-renew-hook-write-retry-cleanup-io, -cleanup-other; sol r1 B1): the removal is best-effort (a scanner can hold the tmp without
 #               delete sharing), so it is checked afterwards: the failure says tmp=removed only when the file is gone and tmp_remaining=<path> when it is
-#               not (the non-IOException path keeps its own type and carries Data['tmp_remaining'] plus a warning). A cleanup failure is reported, never hidden.
+#               not (the non-IOException path keeps its own type and carries Data['tmp_remaining'], with no stream output). A cleanup failure is reported, never hidden.
 #   exit release evidence - QUIET-LEASE-EXIT-RELEASE-EVIDENCE-AND-EVENT-OBSERVE-1 r1 (cases queuedjob-queue-expired-post-admission,
 #               queuedjob-holder-lost-prelaunch, exit-release-pin): the queue-expired exit after admission and the pre-launch
 #               holder-lost refusal release the lease and record that release (leaseRelease) before Exit-HeavySlot, and every
@@ -1244,10 +1244,10 @@ try {
                 $ex = $_.Exception
                 if ($ex -is [System.Management.Automation.MethodInvocationException] -and $null -ne $ex.InnerException) { $ex = $ex.InnerException }
                 if ($ex -isnot [IO.IOException]) {
-                    # The original exception keeps its type; the cleanup outcome rides on its Data and a warning, never replacing it.
+                    # The original exception keeps its type; the cleanup outcome rides on its Data, never replacing it. No warning/stream
+                    # output: under `pwsh -File` the warning stream lands on STDOUT ahead of the JSON the FIFO aggregate parses (sol r2 A1).
                     if (-not (Remove-SidecarTmp $tmp)) {
                         foreach ($d in @($_.Exception, $ex)) { try { $d.Data['tmp_remaining'] = $tmp } catch { } }
-                        Write-Warning "SIDECAR-WRITE-FAILED job=$JobId $($ex.GetType().Name) not retried; tmp_remaining=$tmp"
                     }
                     throw
                 }
@@ -2517,7 +2517,8 @@ function Exit-HeavySlot {
         try {
             Assert-True ($null -ne $err -and $msg -like "SIDECAR-WRITE-FAILED job=$jid attempts=3*" -and $f.moves -eq 3 -and $f.injected -eq 3) "liveness-renew-hook-write-retry-cleanup-io: still the typed failure after exactly 3 attempts: moves=$($f.moves) msg=[$msg]"
             Assert-True ($stillThere) "liveness-renew-hook-write-retry-cleanup-io: the held tmp really survived the cleanup (the fault is real): path=$($f.holderPath)"
-            Assert-True ($msg -like "*tmp_remaining=$($f.holderPath)*" -and $msg -notlike '*tmp=removed*') "liveness-renew-hook-write-retry-cleanup-io: the failure reports the tmp that remains and never claims its removal: [$msg]"
+            # sol r2 A3: Contains, not -like (a path with [ ] is wildcard syntax to -like).
+            Assert-True ($msg.Contains("tmp_remaining=$($f.holderPath)") -and $msg -notlike '*tmp=removed*') "liveness-renew-hook-write-retry-cleanup-io: the failure reports the tmp that remains and never claims its removal: [$msg]"
         }
         finally {
             if ($null -ne $f.holder) { $f.holder.Dispose() }
@@ -2538,11 +2539,15 @@ function Exit-HeavySlot {
     if (Test-Case 'liveness-renew-hook-write-retry-cleanup-other') {
         $jid = 'jRo'
         $script:SidecarMoveFault = @{ skip = 0; remaining = 99; kind = 'denied'; moves = 0; injected = 0; hold = $true; holder = $null; holderPath = $null }
+        # sol r2 A1/A2: no warning-stream output at all (under `pwsh -File` the warning stream lands on STDOUT ahead of the JSON the FIFO aggregate
+        # parses), and the outcome survives -WarningAction Stop: run with the preference at Stop and capture stream 3.
         $err = $null
-        try { Write-SidecarRaw $jid '{}' } catch { $err = $_ }
+        $savedWarningPref = $WarningPreference; $WarningPreference = 'Stop'
+        try { $warnOut = @(. { try { Write-SidecarRaw $jid '{}' } catch { $err = $_ } } 3>&1) } finally { $WarningPreference = $savedWarningPref }
         $f = $script:SidecarMoveFault
         $stillThere = ($null -ne $f.holderPath) -and (Test-Path -LiteralPath $f.holderPath)
         try {
+            Assert-True (@($warnOut | Where-Object { $_ -is [Management.Automation.WarningRecord] }).Count -eq 0) "liveness-renew-hook-write-retry-cleanup-other: the cleanup report writes nothing to the warning stream (it would precede the JSON on stdout): $($warnOut -join ' | ')"
             Assert-True ($null -ne $err -and $err.Exception -is [UnauthorizedAccessException] -and $f.moves -eq 1 -and $f.injected -eq 1) "liveness-renew-hook-write-retry-cleanup-other: the original exception type is kept and not retried: moves=$($f.moves) type=$(if ($null -ne $err) { $err.Exception.GetType().Name })"
             Assert-True ($stillThere) "liveness-renew-hook-write-retry-cleanup-other: the held tmp really survived the cleanup (the fault is real): path=$($f.holderPath)"
             Assert-True ($err.Exception.Data['tmp_remaining'] -ceq $f.holderPath) "liveness-renew-hook-write-retry-cleanup-other: the surviving exception reports the tmp that remains: Data[tmp_remaining]=[$($err.Exception.Data['tmp_remaining'])]"
