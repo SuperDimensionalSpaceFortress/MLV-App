@@ -35577,9 +35577,13 @@ bool MainWindow::normalizePlaybackCutRangeForLoadedClip( const char *where )
     const int cutInBefore = ui->spinBoxCutIn->value();
     const int cutOutBefore = ui->spinBoxCutOut->value();
     const double dropModeBefore = m_newPosDropMode;
-    const bool dropModeOutOfRange =
-        m_newPosDropMode < playback_frame_range::firstFrameIndex( normalized )
-     || m_newPosDropMode > playback_frame_range::lastFrameIndex( normalized );
+    // HFR-NATIVE-60FPS-FULLRES-1 r33 (hub ruling B1): the in-range test shares advanceDropFrameTick's wrap bound
+    // (playback_frame_range::dropFrameLoopWrapAt, the same playbackConformActive() flag), so a conformed position in
+    // [last, last + 1) keeps its sub-frame phase instead of being truncated to the last frame every tick (a conformed
+    // Loop with sub-frame ticks stuck on the last frame and never wrapped). Out of range is repaired as before.
+    bool dropModeOutOfRange = false;
+    const double dropModeRepaired = playback_frame_range::normalizeDropFramePosition(
+        m_newPosDropMode, normalized, totalFrames, playbackConformActive(), &dropModeOutOfRange );
     if( !normalized.changed && !dropModeOutOfRange ) return false;
 
     if( f3CutRangeRepairDisabledByEnvironment() )
@@ -35625,9 +35629,7 @@ bool MainWindow::normalizePlaybackCutRangeForLoadedClip( const char *where )
 
     if( dropModeOutOfRange )
     {
-        m_newPosDropMode = playback_frame_range::clampFrameIndex(
-            static_cast<int>( m_newPosDropMode ),
-            totalFrames );
+        m_newPosDropMode = dropModeRepaired;
     }
 
     return true;

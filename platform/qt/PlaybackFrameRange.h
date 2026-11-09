@@ -283,6 +283,17 @@ struct DropFrameTickResult
 // was never requested. \a presentLastFrame (MainWindow passes playbackConformActive()) wraps only once the position is PAST
 // the last frame, by the cut's frame count (cutOut - cutIn + 1, the distance the timeline really travels from the last frame
 // back to the first), so the last frame is presented before the wrap. With the default (false) the behaviour is unchanged.
+//
+// HFR-NATIVE-60FPS-FULLRES-1 r33 (hub ruling B1 2026-11-08T21:16:04Z): THE Loop wrap bound of the drop-frame position, the one
+// value advanceDropFrameTick wraps at and dropFramePositionInCutRange (MainWindow::normalizePlaybackCutRangeForLoadedClip) keeps
+// in range below. The two used separate literals before r33: the engine wrapped at 720 while the normalizer called anything
+// above 719 out of range and truncated it to 719, so a conformed Loop with sub-frame ticks never reached the wrap.
+inline double dropFrameLoopWrapAt( int cutOutValue, bool presentLastFrame )
+{
+    const double lastFrame = static_cast<double>( cutOutValue - 1 );
+    return presentLastFrame ? lastFrame + 1.0 : lastFrame;
+}
+
 inline DropFrameTickResult advanceDropFrameTick(
     double currentPosition, double frameDelta, int cutInValue, int cutOutValue,
     bool loopEnabled, bool presentLastFrame = false )
@@ -290,7 +301,7 @@ inline DropFrameTickResult advanceDropFrameTick(
     DropFrameTickResult result;
     result.position = currentPosition + frameDelta;
     const double lastFrame = static_cast<double>( cutOutValue - 1 );
-    const double wrapAt = presentLastFrame ? lastFrame + 1.0 : lastFrame;
+    const double wrapAt = dropFrameLoopWrapAt( cutOutValue, presentLastFrame );
     if( loopEnabled && result.position >= wrapAt )
     {
         result.wrapWidth = cutOutValue - cutInValue + ( presentLastFrame ? 1 : 0 );
@@ -302,6 +313,36 @@ inline DropFrameTickResult advanceDropFrameTick(
         result.position = lastFrame;
     }
     return result;
+}
+
+// r33 B1: whether the drop-frame position (m_newPosDropMode) is inside the normalized cut \a range. Below the cut's first frame
+// it is out. With \a presentLastFrame (MainWindow passes playbackConformActive(), as it does to advanceDropFrameTick) a position
+// in [last, dropFrameLoopWrapAt) is IN range: the conformed engine holds the last frame there and its fraction is the sub-frame
+// phase toward the wrap. Without it the engine never leaves a position past the last frame (the Loop wrap fires on reaching it,
+// the non-Loop clamp holds it), so past the last frame is out, as before r33. Not a number is out. An invalid range has no
+// in-range position.
+inline bool dropFramePositionInCutRange( double position, const CutRange & range, bool presentLastFrame )
+{
+    if( !range.valid ) return false;
+    if( !( position >= static_cast<double>( firstFrameIndex( range ) ) ) ) return false;
+    if( presentLastFrame ) return position < dropFrameLoopWrapAt( range.cutOut, true );
+    return position <= static_cast<double>( lastFrameIndex( range ) );
+}
+
+// r33 B1: the drop-frame position MainWindow::normalizePlaybackCutRangeForLoadedClip keeps. In range (above): returned unchanged,
+// bit for bit, fraction kept. Out of range: the genuine repair the normalizer always made, the integer part clamped to the clip
+// (clampFrameIndex), kept as it was; a position too large for an int is clamped before the cast, and not a number repairs to the
+// cut's first frame. \a outOfRange reports which case applied (the normalizer's repair log and early return key off it).
+inline double normalizeDropFramePosition( double position, const CutRange & range, int totalFrames, bool presentLastFrame,
+                                          bool *outOfRange = nullptr )
+{
+    const bool out = !dropFramePositionInCutRange( position, range, presentLastFrame );
+    if( outOfRange ) *outOfRange = out;
+    if( !out ) return position;
+    if( std::isnan( position ) ) return static_cast<double>( clampFrameIndex( firstFrameIndex( range ), totalFrames ) );
+    const double top = static_cast<double>( std::max( totalFrames, 1 ) - 1 );
+    const double bounded = std::max( 0.0, std::min( position, top ) );
+    return static_cast<double>( clampFrameIndex( static_cast<int>( bounded ), totalFrames ) );
 }
 
 // HFR-NATIVE-60FPS-FULLRES-1 r32 fix iteration 2 (adversary A1 + A2 on 03850f7b): whether MainWindow::playbackHandling's outer

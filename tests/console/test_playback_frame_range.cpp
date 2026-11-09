@@ -3203,6 +3203,29 @@ TEST( PlaybackConformDropFrame, R24ConformHoldAtTheLoopEndStillWrapsOnTheRecorde
     ASSERT_TRUE( wrap.wrapped );
     ASSERT_EQ( cutOut - cutIn + 1, wrap.wrapWidth );
     ASSERT_EQ( 0, static_cast<int>( wrap.position ) );
+    // r33 C1 (hub ruling 2026-11-08T21:54:27Z): the post-wrap phase, exactly. The wrap subtracts the cut's frame count and
+    // nothing else, so the position is bit for bit (1159.184 + 1.0) - 1160 (about 0.184): the sub-frame phase survives the wrap.
+    ASSERT_EQ( ( last.position + 1.0 ) - static_cast<double>( cutOut - cutIn + 1 ), wrap.position );
+    ASSERT_NEAR( 0.184, wrap.position, 1e-9 );
+    // r33 C1 below-boundary control: a grant that ends just below the wrap bound (1160) must NOT wrap; it stays on the last
+    // frame 1159 with its phase. Then a landing exactly on the bound wraps onto the first frame with phase 0, exactly.
+    ASSERT_EQ( 1160.0, playback_frame_range::dropFrameLoopWrapAt( cutOut, true ) );
+    const double belowGrant = 1159.999 - last.position;
+    const playback_frame_range::DropFrameTickResult below = playback_frame_range::advanceDropFrameTick(
+        last.position, playback_frame_range::conformDropFrameDelta( last.position, belowGrant, true ), cutIn, cutOut, true, true );
+    ASSERT_FALSE( below.wrapped );
+    ASSERT_EQ( 0, below.wrapWidth );
+    ASSERT_EQ( 1159, static_cast<int>( below.position ) );
+    ASSERT_TRUE( below.position < 1160.0 );
+    ASSERT_NEAR( 1159.999, below.position, 1e-9 );
+    const playback_frame_range::DropFrameTickResult onBound = playback_frame_range::advanceDropFrameTick(
+        1159.5, playback_frame_range::conformDropFrameDelta( 1159.5, 0.5, true ), cutIn, cutOut, true, true );
+    ASSERT_TRUE( onBound.wrapped );
+    ASSERT_EQ( 0.0, onBound.position );
+    const playback_frame_range::DropFrameTickResult justBelow = playback_frame_range::advanceDropFrameTick(
+        1159.5, playback_frame_range::conformDropFrameDelta( 1159.5, 0.4999, true ), cutIn, cutOut, true, true );
+    ASSERT_FALSE( justBelow.wrapped );
+    ASSERT_EQ( 1159, static_cast<int>( justBelow.position ) );
     // without conform (presentLastFrame false) the pre-existing drop-frame wrap is unchanged: it fires on reaching the last frame
     const playback_frame_range::DropFrameTickResult plain = playback_frame_range::advanceDropFrameTick( held.position, 0.8, cutIn, cutOut, true );
     ASSERT_TRUE( plain.wrapped );
@@ -3345,6 +3368,249 @@ TEST( PlaybackConformDropFrame, R32FixIteration2AConformedTwoFrameLoopKeepsTheSo
         const double fps = transitions * 1000.0 / nowMs;
         if( oldOuterRule ) ASSERT_TRUE( fps < 23.5 );                  // the A2 shape: about 22.3 fps
         else ASSERT_TRUE( fps > 23.9 && fps < 24.1 );                  // every presented frame at the conform pace
+    }
+}
+
+TEST( PlaybackConformDropFrame, R33B1TheNormalizerSharesTheWrapBoundAndKeepsTheLastFramesPhase )
+{
+    // hub ruling B1 2026-11-08T21:16:04Z (Dot 6727190400): normalizePlaybackCutRangeForLoadedClip called anything above the last
+    // frame out of range and truncated it, while advanceDropFrameTick wraps one frame later under conform. One bound now.
+    using playback_frame_range::CutRange;
+    using playback_frame_range::advanceDropFrameTick;
+    using playback_frame_range::dropFrameLoopWrapAt;
+    using playback_frame_range::dropFramePositionInCutRange;
+    using playback_frame_range::normalizeCutRange;
+    using playback_frame_range::normalizeDropFramePosition;
+    ASSERT_EQ( 720.0, dropFrameLoopWrapAt( 720, true ) );
+    ASSERT_EQ( 719.0, dropFrameLoopWrapAt( 720, false ) );
+    // (a) the bound is shared: over full and trimmed cuts, with and without conform, a position the engine would wrap from with a
+    // zero delta is exactly a position the normalizer calls out of range on the upper side, and the reverse
+    struct Cut { int cutIn, cutOut, total; };
+    for( const Cut c : { Cut{ 1, 720, 720 }, Cut{ 101, 460, 720 }, Cut{ 1, 360, 720 }, Cut{ 1, 2, 720 } } )
+    {
+        const CutRange range = normalizeCutRange( c.cutIn, c.cutOut, c.total, true );
+        ASSERT_TRUE( range.valid );
+        ASSERT_FALSE( range.changed );
+        for( const bool conform : { true, false } )
+        {
+            const double bound = dropFrameLoopWrapAt( c.cutOut, conform );
+            for( const double p : { bound - 1.0, bound - 0.5, bound - 0.001, std::nextafter( bound, 0.0 ), bound, bound + 0.25 } )
+            {
+                if( p < static_cast<double>( c.cutIn - 1 ) ) continue;
+                const bool wraps = advanceDropFrameTick( p, 0.0, c.cutIn, c.cutOut, true, conform ).wrapped;
+                if( conform ) ASSERT_EQ( wraps, !dropFramePositionInCutRange( p, range, conform ) );
+                else ASSERT_EQ( p > bound, !dropFramePositionInCutRange( p, range, conform ) );   // non-conform: the last frame itself is in
+            }
+        }
+        // (b) under conform a position in [last, last + 1) keeps its fraction, bit for bit; it is not repaired
+        const double last = static_cast<double>( c.cutOut - 1 );
+        for( const double p : { last, last + 0.04, last + 0.5, last + 0.999, std::nextafter( last + 1.0, 0.0 ) } )
+        {
+            bool out = true;
+            const double kept = normalizeDropFramePosition( p, range, c.total, true, &out );
+            ASSERT_FALSE( out );
+            ASSERT_EQ( p, kept );
+        }
+        // every in-range interior position too, conform or not
+        for( const double p : { static_cast<double>( c.cutIn - 1 ), c.cutIn - 1 + 0.3, last - 0.7 } )
+            for( const bool conform : { true, false } )
+            {
+                if( p < static_cast<double>( c.cutIn - 1 ) ) continue;
+                bool out = true;
+                ASSERT_EQ( p, normalizeDropFramePosition( p, range, c.total, conform, &out ) );
+                ASSERT_FALSE( out );
+            }
+    }
+}
+
+TEST( PlaybackConformDropFrame, R33B1TheGenuineOutOfRangeRepairIsKept )
+{
+    // (e) a truly out-of-range position is still repaired exactly as before r33: the integer part clamped to the clip
+    using playback_frame_range::CutRange;
+    using playback_frame_range::normalizeCutRange;
+    using playback_frame_range::normalizeDropFramePosition;
+    const CutRange full = normalizeCutRange( 1, 720, 720, true );
+    const CutRange trimmed = normalizeCutRange( 101, 460, 720, true );
+    bool out = false;
+    // without conform the pre-r33 rule is unchanged: past the last frame is out and truncated (719.04 -> 719)
+    ASSERT_EQ( 719.0, normalizeDropFramePosition( 719.04, full, 720, false, &out ) );
+    ASSERT_TRUE( out );
+    // at or past the conformed wrap bound: out, repaired (a position the engine never holds)
+    ASSERT_EQ( 719.0, normalizeDropFramePosition( 720.0, full, 720, true, &out ) );
+    ASSERT_TRUE( out );
+    ASSERT_EQ( 719.0, normalizeDropFramePosition( 900.6, full, 720, true, &out ) );
+    ASSERT_TRUE( out );
+    // a trimmed cut: Cut Out moved below the playhead (500.3 > 459 + 1) is out; the repair clamps to the CLIP, as before, and the
+    // outer last-frame branch then takes it back to cut-in
+    ASSERT_EQ( 500.0, normalizeDropFramePosition( 500.3, trimmed, 720, true, &out ) );
+    ASSERT_TRUE( out );
+    ASSERT_TRUE( playback_frame_range::outerLastFrameBranchHandlesTick( 500, 460, true, true, true ) );
+    // below the cut's first frame: out, truncated (the pre-r33 repair)
+    ASSERT_EQ( 50.0, normalizeDropFramePosition( 50.7, trimmed, 720, true, &out ) );
+    ASSERT_TRUE( out );
+    ASSERT_EQ( 0.0, normalizeDropFramePosition( -3.5, full, 720, true, &out ) );
+    ASSERT_TRUE( out );
+    // never undefined: a value too large for an int and not a number are repaired, never cast raw
+    ASSERT_EQ( 719.0, normalizeDropFramePosition( 1e300, full, 720, true, &out ) );
+    ASSERT_TRUE( out );
+    ASSERT_EQ( 100.0, normalizeDropFramePosition( std::numeric_limits<double>::quiet_NaN(), trimmed, 720, true, &out ) );
+    ASSERT_TRUE( out );
+    // the collapsed-range repair on the play path changes the cut; a conformed last-frame phase inside the repaired cut is kept
+    const CutRange widened = normalizeCutRange( 900, 900, 720, true );   // Cut In clamps to 720, the collapsed range widens
+    ASSERT_TRUE( widened.changed );
+    ASSERT_EQ( 719.5, normalizeDropFramePosition( 719.5, widened, 720, true, &out ) );
+    ASSERT_FALSE( out );
+}
+
+namespace {
+
+// r33 B1 (c): MainWindow::playbackHandling's per-tick chain with the REAL helpers it calls, in its order: the play-path cut-range
+// normalizer (normalizeCutRange + normalizeDropFramePosition, normalizePlaybackCutRangeForLoadedClip), the outer last-frame branch
+// (outerLastFrameBranchHandlesTick; a whole-frame grantLoopWrap, then the slider reset to the integer cut-in), else the conformed
+// drop-frame engine (conformDropFrameDelta + advanceDropFrameTick, presentLastFrame = conform). 60 fps conformed to 24, Drop Frame
+// and Loop on, an 8 ms poll. \a oldNormalizer runs the pre-r33 normalizer rule (truncate anything above the last frame) instead,
+// the contrast. \a holdLastFramePaintTicks withholds the paint of the cut's last frame for that many ticks on every arrival (d).
+struct ConformLoopChainResult
+{
+    int wraps = 0;
+    long transitions = 0;
+    double seconds = 0.0;
+    bool everyStepPlusOneOrWrap = true;
+    bool everyFrameEveryLap = true;
+    bool presentedNeverRegressedDuringHold = true;
+    bool debtNeverShrankDuringHold = true;
+    bool normalizerNeverMovedThePresentedFrame = true;
+    bool normalizerNeverRepaired = true;
+    double maxDebt = 0.0;
+};
+
+ConformLoopChainResult runConformLoopChain( int cutIn, int cutOut, int totalFrames, bool oldNormalizer, int holdLastFramePaintTicks,
+                                            int wantWraps, double maxSeconds )
+{
+    ConformLoopChainResult r;
+    const int firstFrame = cutIn - 1, lastFrame = cutOut - 1;
+    playback_native_pace::NativePaceGuard guard;
+    guard.reset();
+    double position = firstFrame, nowMs = 0.0, debt = 0.0;
+    int lastPresented = firstFrame, holdLeft = 0;
+    std::vector<int> shownThisLap( static_cast<size_t>( cutOut - cutIn + 1 ), 0 );
+    shownThisLap[ 0 ] = 1;
+    for( int t = 1; r.wraps < wantWraps && nowMs < maxSeconds * 1000.0; ++t )
+    {
+        nowMs += 8.0;
+        // 1. the play-path normalizer
+        const playback_frame_range::CutRange range = playback_frame_range::normalizeCutRange( cutIn, cutOut, totalFrames, true );
+        const double beforeNormalize = position;
+        const double debtBeforeNormalize = debt;
+        if( oldNormalizer )
+        {
+            if( position < playback_frame_range::firstFrameIndex( range ) || position > playback_frame_range::lastFrameIndex( range ) )
+                position = playback_frame_range::clampFrameIndex( static_cast<int>( position ), totalFrames );
+        }
+        else
+        {
+            bool out = false;
+            position = playback_frame_range::normalizeDropFramePosition( position, range, totalFrames, true, &out );
+            if( out ) r.normalizerNeverRepaired = false;
+        }
+        if( static_cast<int>( position ) != static_cast<int>( beforeNormalize ) ) r.normalizerNeverMovedThePresentedFrame = false;
+        if( debt != debtBeforeNormalize ) r.debtNeverShrankDuringHold = false;
+        // 2. the outer last-frame branch, else 3. the conformed drop-frame engine
+        const int slider = static_cast<int>( position );
+        bool wrapped = false;
+        if( playback_frame_range::outerLastFrameBranchHandlesTick( slider, cutOut, true, true, true ) )
+        {
+            if( !guard.grantLoopWrap( nowMs, 24.0 ) ) continue;
+            position = firstFrame;
+            wrapped = true;
+        }
+        else
+        {
+            const double granted = guard.grant( 24.0 * 8.0 / 1000.0, nowMs, 24.0 );
+            if( t == 1 ) guard.notePresent( nowMs, 24.0 );
+            const bool painted = !( slider == lastFrame && holdLeft > 0 );
+            const double debtBefore = debt;
+            const playback_frame_range::DropFrameTickResult step = playback_frame_range::advanceDropFrameTick(
+                position, playback_frame_range::conformDropFrameDelta( position, granted, true, debt, painted ),
+                cutIn, cutOut, true, true );
+            if( !painted )
+            {
+                --holdLeft;
+                if( step.wrapped || static_cast<int>( step.position ) != lastFrame ) r.presentedNeverRegressedDuringHold = false;
+                if( debt < debtBefore ) r.debtNeverShrankDuringHold = false;
+            }
+            position = step.position;
+            wrapped = step.wrapped;
+        }
+        r.maxDebt = std::max( r.maxDebt, debt );
+        const int presented = static_cast<int>( position );
+        if( presented == lastPresented ) continue;
+        ++r.transitions;
+        if( wrapped )
+        {
+            if( lastPresented != lastFrame || presented != firstFrame ) r.everyStepPlusOneOrWrap = false;
+            for( const int shown : shownThisLap ) if( shown != 1 ) r.everyFrameEveryLap = false;
+            std::fill( shownThisLap.begin(), shownThisLap.end(), 0 );
+            ++r.wraps;
+        }
+        else if( presented != lastPresented + 1 )
+        {
+            r.everyStepPlusOneOrWrap = false;
+        }
+        if( presented >= firstFrame && presented <= lastFrame ) shownThisLap[ static_cast<size_t>( presented - firstFrame ) ] = 1;
+        if( presented == lastFrame ) holdLeft = holdLastFramePaintTicks;
+        lastPresented = presented;
+    }
+    r.seconds = nowMs / 1000.0;
+    return r;
+}
+
+}  // namespace
+
+TEST( PlaybackConformDropFrame, R33B1TheRealNormalizeOuterEngineChainWrapsAConformedLoopWithSubFrameTicks )
+{
+    // (c) + (f): sub-frame ticks (0.192 frames per 8 ms poll) over full and trimmed cuts. With the r33 normalizer the conformed Loop
+    // presents every frame of the cut in order on every lap and wraps from the last frame onto the first, at the conform pace.
+    // The pre-r33 normalizer rule is the contrast: it truncated every position past the last frame, so the conformed Loop stuck
+    // on the last frame and never wrapped.
+    struct Cut { int cutIn, cutOut, total; };
+    for( const Cut c : { Cut{ 1, 720, 720 }, Cut{ 101, 460, 720 }, Cut{ 1, 360, 720 }, Cut{ 700, 720, 720 } } )
+    {
+        const int frames = c.cutOut - c.cutIn + 1;
+        const double lapSeconds = frames / 24.0;
+        const ConformLoopChainResult fixedChain = runConformLoopChain( c.cutIn, c.cutOut, c.total, false, 0, 2, 3.0 * lapSeconds + 2.0 );
+        ASSERT_EQ( 2, fixedChain.wraps );
+        ASSERT_TRUE( fixedChain.everyStepPlusOneOrWrap );
+        ASSERT_TRUE( fixedChain.everyFrameEveryLap );
+        ASSERT_TRUE( fixedChain.normalizerNeverRepaired );               // the engine's own positions are always in range
+        ASSERT_TRUE( fixedChain.normalizerNeverMovedThePresentedFrame );
+        const double fps = fixedChain.transitions / fixedChain.seconds;
+        ASSERT_TRUE( fps > 23.5 && fps < 24.5 );
+        const ConformLoopChainResult oldChain = runConformLoopChain( c.cutIn, c.cutOut, c.total, true, 0, 2, 3.0 * lapSeconds + 2.0 );
+        ASSERT_EQ( 0, oldChain.wraps );                                  // B1: stuck on the last frame
+        ASSERT_EQ( static_cast<long>( frames - 1 ), oldChain.transitions );
+    }
+}
+
+TEST( PlaybackConformDropFrame, R33B1PaintAndDebtControlsHoldOnTheBoundary )
+{
+    // (d): the cut's last frame is accepted but its paint is withheld for 6 polls (48 ms) on every arrival. Across the hold the
+    // presented frame stays the last frame (it never regresses, never wraps unpainted), the carried debt never shrinks, and the
+    // normalizer, run every tick, never moves the presented frame or touches the debt. Once painted the Loop wraps and every frame
+    // of the cut is still presented on every lap.
+    struct Cut { int cutIn, cutOut, total; };
+    for( const Cut c : { Cut{ 1, 720, 720 }, Cut{ 101, 460, 720 } } )
+    {
+        const double lapSeconds = ( c.cutOut - c.cutIn + 1 ) / 24.0;
+        const ConformLoopChainResult held = runConformLoopChain( c.cutIn, c.cutOut, c.total, false, 6, 2, 3.0 * lapSeconds + 2.0 );
+        ASSERT_EQ( 2, held.wraps );
+        ASSERT_TRUE( held.presentedNeverRegressedDuringHold );
+        ASSERT_TRUE( held.debtNeverShrankDuringHold );
+        ASSERT_TRUE( held.normalizerNeverMovedThePresentedFrame );
+        ASSERT_TRUE( held.normalizerNeverRepaired );
+        ASSERT_TRUE( held.everyStepPlusOneOrWrap );
+        ASSERT_TRUE( held.everyFrameEveryLap );
+        ASSERT_TRUE( held.maxDebt <= playback_frame_range::kConformMaxDebtFrames );
     }
 }
 
