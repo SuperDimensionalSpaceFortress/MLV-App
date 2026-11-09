@@ -4516,7 +4516,8 @@ class CorePartitionFixtureClockDstTests(unittest.TestCase):
         self.assertLessEqual({"MARKER_DRIVER", "TERMINAL_CHILD_SETUP", "R11_CLEANUP", "R13_PURE", "R13_START_DRIVER"}, stampers)
         self.assertLessEqual(stampers, set(snippets))
         for name, text in snippets.items():
-            self.assertFalse("ToLocalTime(" in text, f"{name} builds a feed stamp in the host zone (ToLocalTime()")
+            # PowerShell is case-insensitive: .tolocaltime() is the same call (adversary A1 on 476fefe1)
+            self.assertIsNone(re.search(r"(?i)tolocaltime", text), f"{name} builds a feed stamp in the host zone (ToLocalTime)")
             self.assertNotIn("__FIXTURE_ZONE_PS__", text, name)
         for name in sorted(stampers):
             text = snippets[name]
