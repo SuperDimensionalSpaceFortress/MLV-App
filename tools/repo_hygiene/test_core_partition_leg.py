@@ -173,6 +173,20 @@ elseif ($m -eq 'empty') { [IO.File]::WriteAllText($r, '') }
 elseif ($m -like 'good*') { [IO.File]::WriteAllText($r, (Get-Mac ([string]$env:MLV_CP_NONCE))) }
 Start-Sleep -Seconds 2
 """
+# fixture-clock-DST (sol r1 B1 on b8d9522a, PR 783): a feed row's HWiNFO stamp is local time with no offset, so a fixture that wrote it in the HOST's
+# zone from the run's real launch instant (ToLocalTime) wrote an ambiguous stamp whenever the test ran in a repeated hour (Central: 1:00-2:00 on the
+# first Sunday of November) and the real selector, correctly, refused the row. The fixture instead stamps in a fixed-offset zone with no DST rules (UTC-5,
+# so the selector's local-to-UTC conversion is still exercised) and pins the selector's -Zone to it for the whole child, whatever the host zone or date.
+# The pin is a same-signature wrapper that defaults -Zone and calls the job's real selector (PSDefaultParameterValues is ignored by a simple function);
+# an explicit -Zone still wins, and the real definition is captured once, so running the snippet again (a driver loops over modes) never wraps the wrapper.
+# The selector's own ambiguous/invalid-stamp refusals keep their explicit-zone tests (selA1d*).
+FIXTURE_ZONE_PS = r"""
+$cpFixtureZone = [TimeZoneInfo]::CreateCustomTimeZone('cp-fixture-m0500', [TimeSpan]::FromHours(-5), 'cp fixture UTC-5', 'cp fixture UTC-5')
+if ($null -eq $global:cpRealFeedSelector) { $global:cpRealFeedSelector = ${function:Select-CorePartitionFeedRowsFromStart} }
+function Select-CorePartitionFeedRowsFromStart([string[]]$Lines, $Anchor, $ReadDoneMs, [double]$StampResolutionMs = 1000, $Zone = $null) { & $global:cpRealFeedSelector $Lines $Anchor $ReadDoneMs $StampResolutionMs $(if ($Zone -is [TimeZoneInfo]) { $Zone } else { $cpFixtureZone }) }
+function Format-CpFixtureStamp([DateTime]$UtcInstant) { [TimeZoneInfo]::ConvertTimeFromUtc($UtcInstant, $cpFixtureZone).ToString('d.M.yyyy,H:mm:ss.fff', [Globalization.CultureInfo]::InvariantCulture) }
+"""
+
 MARKER_DRIVER = r"""
 $ErrorActionPreference = 'Stop'
 $job = [IO.File]::ReadAllText($env:CP_JOB) -replace "`r`n", "`n"
@@ -207,7 +221,8 @@ foreach ($mode in ($env:CP_MODES -split ',')) {
     if ($mode -eq 'start-throws') { $env:ProgramFiles = Join-Path $Work 'no-such-program-files' }
     try { . ([scriptblock]::Create($pre)) } finally { $env:ProgramFiles = $pf }
     # r13c (rule (a)): the window row carries its HWiNFO stamp (local time), 400 ms after the measured launch, after the playback start (100 ms)
-    [IO.File]::AppendAllText($env:HEAVY_SLOT_FEED, $corePartitionMeasuredLaunchUtc.AddMilliseconds(400).ToLocalTime().ToString('d.M.yyyy,H:mm:ss.fff', [Globalization.CultureInfo]::InvariantCulture) + ",x,70.0,45.0,No,No`n")
+    __FIXTURE_ZONE_PS__
+    [IO.File]::AppendAllText($env:HEAVY_SLOT_FEED, (Format-CpFixtureStamp $corePartitionMeasuredLaunchUtc.AddMilliseconds(400)) + ",x,70.0,45.0,No,No`n")
     $resultPath = Join-Path $Work 'result.json'
     if ($mode -like 'good*') {
         # r11 B1: the stand-in helper writes no record, so the driver writes the genuine helper's (signed under the job's key, the runner's pid,
@@ -252,6 +267,7 @@ foreach ($mode in ($env:CP_MODES -split ',')) {
 }
 $out | ConvertTo-Json -Compress -Depth 8
 """
+MARKER_DRIVER = MARKER_DRIVER.replace("__FIXTURE_ZONE_PS__", FIXTURE_ZONE_PS)
 
 
 # r14 (sol r13d B1 = r13d OPEN A1, CORE-PARTITION-SINGLE-PUBLICATION-AFTER-SNAPSHOT-1): the job's own regions run for real inside a child pwsh
@@ -285,7 +301,8 @@ try {
 """
 # the MARKER_DRIVER 'good' setup: a window row 400 ms after the measured launch, the runner's result.json, the helper's signed record and log A
 TERMINAL_CHILD_SETUP = r"""
-[IO.File]::AppendAllText($env:HEAVY_SLOT_FEED, $corePartitionMeasuredLaunchUtc.AddMilliseconds(400).ToLocalTime().ToString('d.M.yyyy,H:mm:ss.fff', [Globalization.CultureInfo]::InvariantCulture) + ",x,70.0,45.0,No,No`n")
+__FIXTURE_ZONE_PS__
+[IO.File]::AppendAllText($env:HEAVY_SLOT_FEED, (Format-CpFixtureStamp $corePartitionMeasuredLaunchUtc.AddMilliseconds(400)) + ",x,70.0,45.0,No,No`n")
 $now = [DateTime]::UtcNow
 [IO.File]::WriteAllText($resultPath, ([ordered]@{ process = [ordered]@{ id = 5000; startedAtUtc = $now.AddSeconds(-5).ToString('o'); endedAtUtc = $now.ToString('o') } } | ConvertTo-Json -Depth 3))
 $mb = ((Get-CorePartitionMonoMs) - 150).ToString([Globalization.CultureInfo]::InvariantCulture)
@@ -295,7 +312,8 @@ $rb = [Text.Encoding]::UTF8.GetBytes('{"schema":"mlv-app/core-partition-helper/v
 [IO.File]::WriteAllText("$corePartitionHelperOut.mac", [Convert]::ToHexString([Security.Cryptography.HMACSHA256]::new([Text.Encoding]::UTF8.GetBytes($corePartitionHelperNonce)).ComputeHash($rb)))
 [IO.File]::WriteAllText($runLogPath, '[' + $corePartitionMeasuredLaunchUtc.AddMilliseconds(100).ToString('yyyy-MM-ddTHH:mm:ss.fffZ') + "] [info] [0x1] playback_smoke.start session=1 worker_threads=16`n[" + $corePartitionMeasuredLaunchUtc.AddMilliseconds(110).ToString('yyyy-MM-ddTHH:mm:ss.fffZ') + "] [info] [0x1] playback_smoke.measured_session id=1`n[" + $corePartitionMeasuredLaunchUtc.AddMilliseconds(150).ToString('yyyy-MM-ddTHH:mm:ss.fffZ') + "] [info] [0x1] playback_smoke.summary session=1 reason=play-stop elapsed_ms=50.000 presented_frames=1`n")
 """
-TERMINAL_SUCCESS_TAIL = "__METRICS__\nWrite-Output \"PUBLISHWHY=$corePartitionPublishWhy\"\nexit 0\n"
+TERMINAL_CHILD_SETUP = TERMINAL_CHILD_SETUP.replace("__FIXTURE_ZONE_PS__", FIXTURE_ZONE_PS)
+TERMINAL_SUCCESS_TAIL ="__METRICS__\nWrite-Output \"PUBLISHWHY=$corePartitionPublishWhy\"\nexit 0\n"
 # terminal class -> (CP_SAVE, the body that follows the smoke-launch finally)
 TERMINALS = {
     # exit 23 after the later log read (G 3376): sol r13d B1's own reproduction
@@ -4069,7 +4087,8 @@ function Resolve-AttrCudaSmokeRunLog { param($ResultJsonPath, $ContainingRoot) i
 # and the job's own read: over 250 ms on a loaded hosted runner it moved the start bound (the rows sit 500 ms past the playback start) and the
 # case published feed-no-rows-in-window, or one row fewer, intermittently. CP_WALL_STALL_MS (below) injects exactly that real time.
 function Get-Date { $L.AddMilliseconds($global:cpClk - 1000) }
-$row = "26.10.2026,12:01:00,x,99,99,Yes,Yes`n"
+__FIXTURE_ZONE_PS__
+$row ="26.10.2026,12:01:00,x,99,99,Yes,Yes`n"
 function Read-CorePartitionFeedSince($Path, $Offset, $Before) {
     $m = $global:cpClk; $global:cpClk += 500
     @{ exists = $true; length = 34 + $row.Length; monoMs = [int64]$m; doneMs = [int64]$global:cpClk; created = 123; fileId = 'same'; before = ''; window = $row; windowStartsMidRow = $false
@@ -4094,13 +4113,15 @@ foreach ($k in $cases.Keys) {
     $corePartitionJobProc = [pscustomobject]@{}
     $corePartitionJobProc | Add-Member -MemberType ScriptProperty -Name ProcessorAffinity -Value { [int64]1048575 } -SecondValue { $global:cpClk += $global:cpDelay }
     $corePartitionJobProc | Add-Member -MemberType ScriptMethod -Name Refresh -Value { }
-    $now = [DateTime]::UtcNow
+    # fixture-clock-DST (sol r1 B1, PR 783): CP_FIXTURE_NOW_UTC puts this driver's "now" at a chosen instant (the job's wall clock follows $L through
+    # the Get-Date double below), so a test can drive the feed fixture through a repeated or skipped local hour without touching the host clock
+    $now = $(if ($env:CP_FIXTURE_NOW_UTC) { [DateTime]::Parse($env:CP_FIXTURE_NOW_UTC, [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::AssumeUniversal -bor [Globalization.DateTimeStyles]::AdjustToUniversal) } else { [DateTime]::UtcNow })
     $L = $now.AddMilliseconds(1000 - $c[0])
     if ($env:CP_WALL_STALL_MS) { Start-Sleep -Milliseconds ([int]$env:CP_WALL_STALL_MS) }
     $W = { param([double]$m) $L.AddMilliseconds($m - 1000).Ticks }
     # r13c (CP-FEED-START-ANCHOR, rule (a)): a feed row's HWiNFO stamp (local d.M.yyyy,H:mm:ss.fff) for monotonic $m; the window row is stamped
     # at 2000, after the measured session's playback start (1500)
-    $H = { param([double]$m) [DateTime]::new((& $W $m), [DateTimeKind]::Utc).ToLocalTime().ToString('d.M.yyyy,H:mm:ss.fff', [Globalization.CultureInfo]::InvariantCulture) }
+    $H = { param([double]$m) Format-CpFixtureStamp ([DateTime]::new((& $W $m), [DateTimeKind]::Utc)) }
     $row = (& $H 2000) + ",x,99,99,Yes,Yes`n"
     $corePartitionMeasuredLaunchUtc = $L; $corePartitionPreHelperUtc = $L.AddSeconds(-1)
     $corePartitionClockPairs = [Collections.Generic.List[object]]::new(); $corePartitionClockPairs.Add(@($corePartitionMeasuredLaunchUtc.Ticks, [double]1000))
@@ -4143,6 +4164,9 @@ foreach ($k in $cases.Keys) {
 }
 $out | ConvertTo-Json -Compress -Depth 5
 """
+
+
+R11_CLEANUP = R11_CLEANUP.replace("__FIXTURE_ZONE_PS__", FIXTURE_ZONE_PS)
 
 
 def _r11_helper_base_driver() -> str:
@@ -4432,6 +4456,60 @@ class CorePartitionR13cMonoStampTests(unittest.TestCase):
         self.assertEqual([got["markLate"], got["sinceLate"]], [0, 0], got)
 
 
+# fixture-clock-DST (sol r1 B1, PR 783): the success fixture's own row, at a launch in the repeated local hour, through the job's real selector.
+# 'old' is the stamp b8d9522a wrote under Central time (the host zone, ToLocalTime): the selector refuses it. 'new' is the fixture's stamp: the
+# selector, with its -Zone pinned by the fixture as in every driver, keeps the row.
+FIXTURE_DST_UNIT = r"""
+$cst = [TimeZoneInfo]::FindSystemTimeZoneById('Central Standard Time')
+__FIXTURE_ZONE_PS__
+$L = [DateTime]::new(2026, 11, 1, 6, 30, 0, [DateTimeKind]::Utc)
+$anchor = @{ startMonoMs = 1100.0; launchUtcTicks = $L.Ticks; launchMonoMs = 1000.0; skewMs = 0.0 }
+$at = $L.AddMilliseconds(400)
+$old = [TimeZoneInfo]::ConvertTimeFromUtc($at, $cst).ToString('d.M.yyyy,H:mm:ss.fff', [Globalization.CultureInfo]::InvariantCulture)
+$new = Format-CpFixtureStamp $at
+function PickSel($v) { @([string]$v.why, @($v.lines).Count) }
+$r = [ordered]@{
+    oldStamp = $old; newStamp = $new
+    oldInCentral = PickSel (Select-CorePartitionFeedRowsFromStart @($old + ',x,70.0,45.0,No,No') $anchor 3000 1000 $cst)
+    newInCentral = PickSel (Select-CorePartitionFeedRowsFromStart @($new + ',x,70.0,45.0,No,No') $anchor 3000 1000 $cst)
+    newPinned = PickSel (Select-CorePartitionFeedRowsFromStart @($new + ',x,70.0,45.0,No,No') $anchor 3000)
+    pinnedZoneId = [string]$cpFixtureZone.Id
+}
+$r | ConvertTo-Json -Compress -Depth 4
+""".replace("__FIXTURE_ZONE_PS__", FIXTURE_ZONE_PS)
+
+
+@requires_windows_pwsh
+class CorePartitionFixtureClockDstTests(unittest.TestCase):
+    """fixture-clock-DST (sol r1 B1 on b8d9522a, PR 783): the feed fixtures name their stamps in a zone they pin, never in the host's."""
+
+    def test_the_success_fixtures_row_in_the_repeated_local_hour_is_kept_by_the_real_selector(self) -> None:
+        """Sol's instant: launch 2026-11-01T06:30:00Z, row 400 ms later. Stamped in Central it reads 1:30:00.400 twice, and the real selector
+        refuses it (feed-row-stamp-ambiguous, zero rows: the case sol reproduced); the fixture's own stamp, read in the zone the fixture pins,
+        names one instant and the row is kept, however the host zone and date fall."""
+        with tempfile.TemporaryDirectory(prefix="core-partition-fixture-dst-") as tmp:
+            script = Path(tmp) / "dst.ps1"
+            script.write_text(LIFT + FIXTURE_DST_UNIT, encoding="utf-8")
+            proc = run_pwsh(["-File", str(script)], env_extra={"CP_GEN": str(GENERATOR), "CP_DIR": tmp})
+            self.assertEqual(proc.returncode, 0, proc.stdout[-3000:] + proc.stderr[-3000:])
+            got = json.loads(proc.stdout.strip().splitlines()[-1])
+        self.assertEqual(got["oldStamp"], "1.11.2026,1:30:00.400", got)
+        self.assertEqual(got["oldInCentral"], ["feed-row-stamp-ambiguous", 0], got)
+        self.assertEqual(got["newStamp"], "1.11.2026,1:30:00.400", got)
+        self.assertEqual(got["newInCentral"], ["feed-row-stamp-ambiguous", 0], got)
+        self.assertEqual(got["pinnedZoneId"], "cp-fixture-m0500", got)
+        self.assertEqual(got["newPinned"], ["", 1], got)
+
+    def test_no_feed_fixture_stamps_in_the_hosts_zone(self) -> None:
+        """The class: every driver that writes a local-time feed row from a launch instant uses the pinned-zone stamp and pins the selector's
+        zone. ToLocalTime() in one of them brings the repeated-hour failure back for that driver."""
+        for name, text in (("MARKER_DRIVER", MARKER_DRIVER), ("TERMINAL_CHILD_SETUP", TERMINAL_CHILD_SETUP), ("R11_CLEANUP", R11_CLEANUP)):
+            self.assertNotIn("ToLocalTime()", text, name)
+            self.assertIn("Format-CpFixtureStamp", text, name)
+            self.assertIn("function Select-CorePartitionFeedRowsFromStart(", text, name)
+            self.assertNotIn("__FIXTURE_ZONE_PS__", text, name)
+
+
 @requires_windows_pwsh
 class CorePartitionR13StartTests(unittest.TestCase):
     """r13 (Dot 6452868627, CP-FEED-START-ANCHOR): the feed window's start is bound to the measured session's playback start, or refused typed."""
@@ -4472,6 +4550,25 @@ class CorePartitionR13StartTests(unittest.TestCase):
             got = self.r_stalled[case]
             self.assertEqual([got["rows"], got["wattsMean"], got["tempMean"], got["why"]], [rows, 100.0, 80.0, ""], got)
         self.assertEqual({k: v["why"] for k, v in self.r_stalled.items()}, {k: v["why"] for k, v in self.r.items()})
+
+    def test_fixture_clock_dst_a_launch_in_the_repeated_local_hour_publishes_the_same_windows(self) -> None:
+        """fixture-clock-DST (sol r1 B1 on b8d9522a, PR 783): the feed fixture stamped its rows in the HOST's zone, so a run during the repeated hour
+        after a fall-back (Central: 2026-11-01T06:00Z..07:00Z reads 1:00..2:00 twice) wrote stamps the real selector correctly refuses as
+        feed-row-stamp-ambiguous, and every case here lost its window. The same driver with its "now" forced to 2026-11-01T06:30:00Z, the
+        instant sol named, must give the outcome of the unforced run for every case: rows, means and reason."""
+        script = self.tmp / "r13-cleanup.ps1"
+        forced = self.tmp / "cleanup-repeated-hour"
+        forced.mkdir()
+        proc = run_pwsh(["-File", str(script)], env_extra={"CP_GEN": str(GENERATOR), "CP_DIR": str(forced), "CP_FIXTURE_NOW_UTC": "2026-11-01T06:30:00Z"})
+        self.assertEqual(proc.returncode, 0, proc.stdout[-3000:] + proc.stderr[-3000:])
+        got = json.loads(proc.stdout.strip().splitlines()[-1])
+        for case, one in got.items():
+            self.assertNotIn("threw", one, f"{case}: {one}")
+
+        def key(d: dict) -> dict:
+            return {k: [v.get("rows"), v.get("wattsMean"), v.get("tempMean"), v.get("why")] for k, v in d.items()}
+
+        self.assertEqual(key(got), key(self.r))
 
     def test_r13c_dot_counterexample_reports_the_playback_means_not_a_refusal(self) -> None:
         """Dot 6452868627 (literal): 60 s of startup rows (10 W / 30 C) then 30 s of playback rows (100 W / 80 C) in a 90 s window that passes the
