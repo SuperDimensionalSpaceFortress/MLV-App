@@ -1797,6 +1797,9 @@ function Get-DvPrepConflatedMoveEvidence {
     [ordered]@{ requested = $requested; observed = $observed; verdict = $verdict; reason = $reason; blocks = ($verdict -ceq 'NOT_HONOURED') }
 }
 
+# The flavors the app can apply (src/batch/LookAssistAnalysis.cpp lookAssistFlavorName). The app's `look_assist_flavor=none` (nothing applied) is not among them.
+$script:DvAppliedLookFlavors = @('classic', 'cinematic', 'film', 'vision50d')
+
 function Get-DvLookAssistEvidence {
     <#
     .SYNOPSIS
@@ -1807,14 +1810,26 @@ function Get-DvLookAssistEvidence {
     #>
     param([Parameter(Mandatory)]$Spec, [AllowNull()][AllowEmptyString()][string]$LogText)
     $requested = ($null -ne (Get-DvProp $Spec 'look')) -or ((Get-DvProp (Get-DvProp $Spec 'generatorArgs') 'forceLookAssist') -eq $true)
+    # VENUE-NATIVE-LEG-LOOKLEG-LABEL-1 r2 (adversary pass 4 A3): `asked` is what Invoke-VenueLeg actually FORWARDS -- a look leg, or a speed leg with generatorArgs.forceLookAssist true.
+    # An inert `look` object on a speed spec trips the gate's older `requested` predicate (left as it was) but forwards nothing, so it never backs the lookAssistOn claim.
+    $legTypeRaw = Get-DvProp $Spec 'legType'; $forceRaw = Get-DvProp (Get-DvProp $Spec 'generatorArgs') 'forceLookAssist'
+    $asked = (($legTypeRaw -is [string]) -and ($legTypeRaw -ceq 'look')) -or (($forceRaw -is [bool]) -and $forceRaw)
     $reported = $null
+    $flavor = $null
     $verdict = 'NOT_REQUESTED'
     $reason = $null
     if ($requested) {
         $found = $null
+        # VENUE-NATIVE-LEG-LOOKLEG-LABEL-1 r2 (Dot bd11a92): every flavor token of every visual_state record, so duplicate records that disagree can be told from one that is repeated
+        $flavorsSeen = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
         if (-not [string]::IsNullOrEmpty($LogText)) {
             # r4 (r3 adversary A2 on #726): matched on the record body, so a Qt location path never selects (or answers for) the visual_state line
-            foreach ($line in (Get-DvLogRecordBodies -LogText $LogText)) { if ($line -match '(^|\s)event=gui_smoke\.visual_state(\s|$)') { $found = $line } }
+            foreach ($line in (Get-DvLogRecordBodies -LogText $LogText)) {
+                if ($line -match '(^|\s)event=gui_smoke\.visual_state(\s|$)') {
+                    $found = $line
+                    foreach ($ft in [regex]::Matches($line, '(^|\s)look_assist_flavor=(?<f>\S*)')) { [void]$flavorsSeen.Add($ft.Groups['f'].Value) }
+                }
+            }
         }
         $verdict = 'NOT_HONOURED'
         if ($null -eq $found) { $reason = 'the run log has no gui_smoke.visual_state line, so nothing shows the app ran with Look Assist on' }
@@ -1823,12 +1838,21 @@ function Get-DvLookAssistEvidence {
             if (-not $m.Success) { $reason = 'the app''s gui_smoke.visual_state line carries no look_assist_enabled' }
             else {
                 $reported = $m.Groups['v'].Value
+                # VENUE-NATIVE-LEG-LOOKLEG-LABEL-1 r1 (adversary A1): the flavor the app applied, from the SAME record body (a Qt location suffix never answers for it)
+                # r2: ONE flavor or none. (1) the flavor comes from the SAME record that says look_assist_enabled (adversary pass 3 A1: an earlier record's flavor is never borrowed by a
+                # later record that names none); (2) two different flavor values anywhere in the visual_state records mean the app did not say which one ran, so none is proven (never
+                # "the first" or "the last"); (3) it must be one the app can apply (adversary pass 3 A2: the app prints `none` when it applied no flavor, and `unknown` is a placeholder).
+                # pass 4 A1: an EMPTY token (`look_assist_flavor=`) is a token too (`\S*`), so a duplicate that names nothing makes the record ambiguous instead of being skipped.
+                # pass 4 A2: two contradictory look_assist_enabled tokens in the answering record are no unambiguous `on` -- no flavor is proven from that record.
+                $lastFlavors = @([regex]::Matches($found, '(^|\s)look_assist_flavor=(?<f>\S*)') | ForEach-Object { $_.Groups['f'].Value } | Select-Object -Unique)
+                $enabledValues = @([regex]::Matches($found, '(^|\s)look_assist_enabled=(?<v>\S*)') | ForEach-Object { $_.Groups['v'].Value } | Select-Object -Unique)
+                if ($flavorsSeen.Count -eq 1 -and $lastFlavors.Count -eq 1 -and $enabledValues.Count -eq 1 -and ($script:DvAppliedLookFlavors -ccontains $lastFlavors[0])) { $flavor = $lastFlavors[0] }
                 if ($reported -cne '1') { $reason = "the app's gui_smoke.visual_state line says look_assist_enabled=$reported (the leg asks for Look Assist on)" }
                 else { $verdict = 'HONOURED' }
             }
         }
     }
-    [ordered]@{ requested = $requested; reported = $reported; verdict = $verdict; reason = $reason; blocks = ($verdict -ceq 'NOT_HONOURED') }
+    [ordered]@{ requested = $requested; asked = $asked; reported = $reported; flavor = $flavor; verdict = $verdict; reason = $reason; blocks = ($verdict -ceq 'NOT_HONOURED') }
 }
 
 # --- leg sets and the display matrix (DUAL-VENUE-DISPLAY-MATRIX-1) -------------------------------------------------------
@@ -3597,6 +3621,21 @@ function Test-DvReceiptValid {
             # CUDA-HEADROOM-1: an unpaced leg the app did not run unpaced is the pace wall, not throughput (Get-DvUnpacedEvidence).
             $unpacedVerdict = Get-DvUnpacedEvidence -Spec $spec -LogText $ev.logText
             if ($unpacedVerdict.blocks) { $invalid.Add("UNPACED_NOT_HONOURED: $($unpacedVerdict.reason); a paced run is no throughput measurement") }
+            # VENUE-NATIVE-LEG-LOOKLEG-LABEL-1 r1: a receipt that CLAIMS the look ran (lookAssistOn true) must be backed by the hashed evidence -- the app's own run log says
+            # look_assist_enabled=1, the hashed summary.json says the look was forced and the flavor the app reported is the one requested, and lookAssistFlavor is that flavor.
+            # Only the claim is re-derived (a receipt that predates the field, or says false, claims nothing); the leg TYPE binding above is untouched.
+            $claimOnRaw = Get-DvProp $Receipt 'lookAssistOn'
+            if ($null -ne $claimOnRaw -and $claimOnRaw -isnot [bool]) { $invalid.Add('LOOK_ASSIST_CLAIM_UNBACKED: the receipt''s lookAssistOn is not a boolean') }
+            elseif ($claimOnRaw -is [bool] -and $claimOnRaw) {
+                $claimVerdict = Get-DvLookAssistEvidence -Spec $spec -LogText $ev.logText
+                $claimForcedRaw = Get-DvProp $ev.summary 'lookAssistForced'   # a real boolean only: `-eq $true` on an array is a filter, and on a string a cast (pass 2 A1)
+                $claimRequestedRaw = Get-DvProp $ev.summary 'lookFlavor'; $claimReportedRaw = Get-DvProp $ev.summary 'lookFlavorReported'; $claimStoredRaw = Get-DvProp $Receipt 'lookAssistFlavor'
+                $claimRequested = [string]$claimRequestedRaw; $claimLogFlavor = [string]$claimVerdict.flavor
+                # strings only (adversary A2: a singleton array casts to its element); the flavor is the one the app's own record body names (adversary A1)
+                if (-not ($claimVerdict.asked -and $claimVerdict.verdict -ceq 'HONOURED' -and $claimForcedRaw -is [bool] -and $claimForcedRaw -and $claimRequestedRaw -is [string] -and $claimReportedRaw -is [string] -and $claimStoredRaw -is [string] -and $claimRequested.Length -gt 0 -and $claimReportedRaw -ceq $claimRequested -and $claimLogFlavor -ceq $claimRequested -and $claimStoredRaw -ceq $claimLogFlavor)) {
+                    $invalid.Add('LOOK_ASSIST_CLAIM_UNBACKED: the receipt says Look Assist ran (lookAssistOn) but the hashed run log / summary.json do not show it ran with the flavor lookAssistFlavor names')
+                }
+            }
             # VENUE-LEG-PLAYBACK-MAX-THREADS-ARG-1: a capped leg the app did not run at the cap (or whose count is unreadable) is no measurement under it.
             $workerThreadsVerdict = Get-DvWorkerThreadsEvidence -Spec $spec -LogText $ev.logText -Summary $ev.summary
             if ($workerThreadsVerdict.blocks) { $invalid.Add("WORKER_THREADS_NOT_HONOURED: $($workerThreadsVerdict.reason); a run at another worker count is no measurement of the worker count its leg specifies") }
@@ -4254,6 +4293,13 @@ function New-DvReceipt {
         display = $null
         # LOOK-FULLSCREEN-PARITY-1: the "current look" label the app showed (Get-DvLookLabelEvidence), next to the display block. Informational, never a gate.
         lookLabel = $null
+        # VENUE-NATIVE-LEG-LOOKLEG-LABEL-1 r1: did Look Assist actually run in this leg, and with which flavor? FAIL CLOSED: false / null until Invoke-VenueLeg shows the
+        # app's own log AND the job's summary agree (unknown is not on). SEMANTICS (Dot bd11a92, r2): false / null mean NOT PROVEN ON -- never "observed off"; a consumer
+        # must not read lookAssistOn=false as "Look Assist was off" (the shipped default is on, and an unasked-for, ambiguous or unreported leg also says false).
+        # A receipt claiming true is re-derived by Test-DvReceiptValid; false / null / absent claim nothing and are not. Separate from metrics.lookLeg / subject.lookFlavor, which stay the leg TYPE binding
+        # (a native HFR pace leg forces the look yet is a speed leg, so those two say false / null for it by design).
+        lookAssistOn = $false
+        lookAssistFlavor = $null
         look = $null
         # PLAYBACK-VISUAL-INSPECTION-1: a speed leg's window captures (Read-DvVisualCaptures): requested / opted out, the frames and their hashes,
         # the distinct-picture count, the play-vs-paused difference, the strip, and the gate verdict. Null on a look leg (its contact sheet is the look).

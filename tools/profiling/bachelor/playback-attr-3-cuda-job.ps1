@@ -5110,7 +5110,11 @@ function Test-CorePartitionHelperRecordShape($Record) {
             $num.Add(@($t.pMask, 'int64')); $num.Add(@($t.eMask, 'int64'))
         }
         if ($null -ne $Record.app) { foreach ($n in @('pid', 'startUtcTicks', 'affinityFirst', 'affinityLast')) { $num.Add(@($Record.app.$n, 'int64')) } }
-        foreach ($i in @(@($Record.instances) + @($Record.others) | Where-Object { $null -ne $_ })) { foreach ($n in @('pid', 'startUtcTicks', 'firstSeenUtcTicks', 'firstMs', 'goneUtcTicks', 'aliveMs', 'goneMs')) { $num.Add(@($i.$n, 'int64')) } }
+        foreach ($i in @(@($Record.instances) + @($Record.others) | Where-Object { $null -ne $_ })) {
+            # CORE-PARTITION-HELPER-PID-REUSE-1: whether a held handle pinned the process's pid is a JSON flag or absent (0 or a string would compare as a flag)
+            if ($null -ne $i.pinned -and $i.pinned -isnot [bool]) { return 'helper-record-malformed' }
+            foreach ($n in @('pid', 'startUtcTicks', 'firstSeenUtcTicks', 'firstMs', 'goneUtcTicks', 'aliveMs', 'goneMs')) { $num.Add(@($i.$n, 'int64')) }
+        }
         if ($null -ne $Record.load) {
             # r10 B4: the load session's join outcome is a JSON flag or absent
             if ($null -ne $Record.load.joined -and $Record.load.joined -isnot [bool]) { return 'helper-record-malformed' }
@@ -5218,7 +5222,7 @@ function Test-CorePartitionMeasuredApp($Helper, [int64]$MeasuredPid, [int64]$Mea
     $all = @(@($Helper.instances) + @($Helper.others) | Where-Object { $null -ne $_ } | ForEach-Object {
         [pscustomobject]@{ pid = (ConvertFrom-CorePartitionNumber $_.pid 'int64').value; start = (ConvertFrom-CorePartitionNumber $_.startUtcTicks 'int64').value; gone = (ConvertFrom-CorePartitionNumber $_.goneUtcTicks 'int64').value
             aliveMs = (ConvertFrom-CorePartitionNumber $_.aliveMs 'int64').value; goneMs = (ConvertFrom-CorePartitionNumber $_.goneMs 'int64').value
-            first = (ConvertFrom-CorePartitionNumber $_.firstSeenUtcTicks 'int64').value; firstMs = (ConvertFrom-CorePartitionNumber $_.firstMs 'int64').value } })
+            first = (ConvertFrom-CorePartitionNumber $_.firstSeenUtcTicks 'int64').value; firstMs = (ConvertFrom-CorePartitionNumber $_.firstMs 'int64').value; pinned = $_.pinned } })
     # r10 B3 (sol r9 B3 = adversary r9 8cf7e883 A3): a wall-clock step the helper's polls never sampled (stepped and restored between two polls) can
     # stamp a process start after its own first sighting, which moves it outside the app's window and hides the overlap. Every recorded process must
     # order consistently, start <= first seen <= seen gone (each within $slack), with its monotonic first-sight and last-alive stamps; one that does
@@ -5233,6 +5237,10 @@ function Test-CorePartitionMeasuredApp($Helper, [int64]$MeasuredPid, [int64]$Mea
     if ($m.Count -eq 0) { return @{ why = 'measured-app-not-observed' } }
     if ($m.Count -gt 1) { return @{ why = 'measured-pid-ambiguous' } }
     $a = $m[0]; $aStart = $a.start
+    # CORE-PARTITION-HELPER-PID-REUSE-1 (adversary A1 on aa71dd11): a measured app the helper tracked with no handle held (pinned false) had its pid open to
+    # reuse, and a successor with the same start ticks (an unsampled clock step) and the same path reads exactly as the app on every poll and in every
+    # enumeration, so its life, samples and load could be the successor's. Only a held handle rules that out. The helper writes pinned on every record.
+    if ($a.pinned -eq $false) { return @{ why = 'measured-app-identity-unpinned' } }
     foreach ($o in $all) {
         if ([object]::ReferenceEquals($o, $a)) { continue }
         $oStart = if ($null -ne $o.start) { $o.start - $slack } else { [int64]::MinValue }
@@ -5471,6 +5479,10 @@ function Write-CorePartitionNewFile([string]$Path, [string]$Text) {
     } finally { $nf.Dispose() }
 }
 $exe = [string]$env:MLV_CP_EXE; $stop = [string]$env:MLV_CP_STOP; $op = [string]$env:MLV_CP_OUT; $ready = [string]$env:MLV_CP_READY
+# CORE-PARTITION-HELPER-PID-REUSE-1 r2 (adversary A1 on f82e5037): a path is the exe's only when it equals it ORDINALLY, case-insensitive (equal lengths plus an
+# OrdinalIgnoreCase prefix, as Test-PresentMonIdentityText). PowerShell's -ieq / -ine are culture-sensitive and ignore U+00AD, U+200B and U+0000, so another
+# file's path (a soft hyphen in its name) read as the exe's. Every path the helper compares with the exe's goes through $ie.
+$ie = { param($a) $a.Length -eq $exe.Length -and $a.StartsWith($exe, 'OrdinalIgnoreCase') }
 $bench = [int64]$env:MLV_CP_BENCH; $lm = [int64]$env:MLV_CP_LOAD; $hm = [int64]$env:MLV_CP_HELPER; $threads = [int]$env:MLV_CP_THREADS
 # r9 (Dot 3 = adversary r8 aeacec83 A3): the self-deadline is a monotonic budget in ms from the helper's own start ($cw below), so no wall-clock
 # step, backward or forward, moves it.
@@ -5554,12 +5566,25 @@ public sealed class MlvCorePartitionLoad {
             # A failed query proves neither: the getter's throw reaches here as $null, not through the catch. That is no exit, since the seen key would stop the process
             # being tracked again and the job accepts an observed exit as coverage; and it is no alive stamp, since it can be a successor this user cannot open.
             $gone = $null; try { $q.p.Refresh(); $gone = $q.p.HasExited } catch { }
+            # CORE-PARTITION-HELPER-PID-REUSE-1 (adversary A1 on 74c7d7d3, #696 r14b): for a process tracked with no handle held ($q.r.pinned false: its handle
+            # did not open when it was tracked) the query above opens the pid, so once the pid is reused it reads the new process. So every poll that does not see
+            # it gone, pinned or not, re-reads the birth identity on the pid AFTER that query, through a fresh process object (StartTime is cached by an object
+            # after its first read: r5 sol B1), and compares it as the tracking key does (start ticks, the exe's path). Three outcomes: a start or a path read
+            # that differs is another process on the pid, so it is gone at this poll and nothing after it is credited; a start and a path that both read and
+            # match leave the query's answer; otherwise (a read failed) only a held handle ($q.r.pinned: it keeps the pid from being reused) leaves it, and with
+            # none the poll is unknown ($gone $null: no alive stamp and no exit). A successor with the same start and path cannot be told from the process by
+            # any read on the pid (adversary A1 on aa71dd11), so the job refuses a measured app not pinned.
+            if (!$gone) {
+                $f = $s = $x = $null; try { $f = Get-Process -Id $q.r.pid -ea 0; $s = $f.StartTime.ToUniversalTime().Ticks } catch { }; try { $x = [string]$f.Path } catch { }
+                if (($s -and $s -ne $q.r.startUtcTicks) -or ($x -and !(& $ie $x))) { $gone = $true } elseif (!($s -and $x -or $q.r.pinned)) { $gone = $null }
+            }
             if ($gone -eq $false) {
                 try { $q.r.affinityLast = [int64]$q.p.ProcessorAffinity; $q.r.priorityLast = [string]$q.p.PriorityClass } catch { }
                 $q.r.lastSeenUtcTicks = & $clk; $q.r.aliveMs = $mo; if ($k -eq $own -and $loadOn) { $lb = $bn }
             } elseif ($gone) {
                 if ($k -eq $own) { if ($loadOn) { $q.r.loadJoined = $ld.Halt(); $loadOn = $false; & $lc $q.r }; $own = $null }
-                # r5: 2 marks a tracked key whose process has exited (on its held handle), so a later listing that carries it is another process (seen below)
+                # r5: 2 marks a retired tracked key: its liveness query saw the process exit, or (CORE-PARTITION-HELPER-PID-REUSE-1) the identity re-read
+                # above read another process on its pid. Either way a later listing that carries the key is another process (seen below).
                 $q.r.goneUtcTicks = & $clk; $q.r.goneMs = & $ms; $live.Remove($k); $seen[$k] = 2
             }
         }
@@ -5583,8 +5608,11 @@ public sealed class MlvCorePartitionLoad {
                 # successor can get a gone process's exact start, so the entry refuses, as on the base. A tracked process whose reads fail once refuses too (hub ruling).
                 # r5 (sol r4 blocker = adversary pass 7 A1 on 00e5f732, hub ruling 1 of HUB-TICK 20261106T1439Z): a gone tracked key (2) read with its Path unread is a
                 # successor never identified, so it is recorded unidentified, never skipped; the key then goes back to 1, so it is recorded once. A key whose process
-                # is still tracked (1), or one whose Path reads, is skipped as before. An exited process is never listed, even while its handle is held (measured r5).
-                if ($seen[$k]) { if ($pn[$p.Id] -or $seen[$k] * !$pp -gt 1) { & $un $p.Id; $seen[$k] = 1 }; continue }
+                # is still tracked (1) is skipped as before. An exited process is never listed, even while its handle is held (measured r5).
+                # CORE-PARTITION-HELPER-PID-REUSE-1 (adversary A1 on 4fdc1512): so a listing that carries a gone key is always a successor with the gone process's
+                # exact start, and one whose Path reads as the exe is a same-path process alive now: recorded unidentified too (it was skipped, which hid an
+                # overlap once the identity re-read retired an unpinned process). Only a Path read at another exe is skipped (no same-path process).
+                if ($seen[$k]) { if ($pn[$p.Id] -or ($seen[$k] -gt 1 -and !($pp -and !(& $ie $pp)))) { & $un $p.Id; $seen[$k] = 1 }; continue }
                 $pe = $pn[$p.Id]
                 # The start read at first sight ($pe.s) is a pending pid's identity, whatever the clock did since: any other start on that pid is a process on a recycled
                 # pid, and the one first listed ended unread. With no start read at first sight nothing can prove identity (r3, HUB RULING 2026-11-06, adversary A1/A2 on
@@ -5594,12 +5622,12 @@ public sealed class MlvCorePartitionLoad {
                 if ($pe -and $pst -and ($pst.Ticks -ne $pe.s -or $pe.o.HasExited -ne $false)) { & $un $p.Id; $pe = $null }
                 # A read that fails settles nothing, on a pid being tracked too: both reads failing cannot be told from that process exiting. A read at another path
                 # with no start cannot say which process it read, so it clears nothing. With no handle nothing can recover, so it is recorded at once, as on the base.
-                if (!$pp -or ($pp -ieq $exe -and !$pst)) { if ($pe) { } elseif ($h) { $pn[$p.Id] = @{ s = $pst.Ticks; o = $p; f = & $clk; m = & $ms } } else { & $un $p.Id; $seen[$k] = 1 } }
+                if (!$pp -or ((& $ie $pp) -and !$pst)) { if ($pe) { } elseif ($h) { $pn[$p.Id] = @{ s = $pst.Ticks; o = $p; f = & $clk; m = & $ms } } else { & $un $p.Id; $seen[$k] = 1 } }
                 elseif ($pst) { $pn.Remove($p.Id) }
-                if ($pp -ieq $exe -and $pst) {
+                if ((& $ie $pp) -and $pst) {
                     # firstSeenUtcTicks and firstMs are the real first sight, also for a process classed late; aliveMs is this poll's, the first it can vouch for.
                     $seen[$k] = 1; $fs = & $clk; if (!$pe) { $pe = @{ f = $fs; m = & $ms } }
-                    $r = [ordered]@{ pid = $p.Id; startUtcTicks = $pst.Ticks; firstSeenUtcTicks = $pe.f; lastSeenUtcTicks = $fs; firstMs = $pe.m; goneUtcTicks = $null; aliveMs = $me; goneMs = $null; affinityFirst = $null; affinityLast = $null; priorityFirst = $null; priorityLast = $null; loadSec = 0.0; loadBytes = [int64]0; loadJoined = $null }
+                    $r = [ordered]@{ pid = $p.Id; startUtcTicks = $pst.Ticks; firstSeenUtcTicks = $pe.f; lastSeenUtcTicks = $fs; firstMs = $pe.m; goneUtcTicks = $null; aliveMs = $me; goneMs = $null; affinityFirst = $null; affinityLast = $null; priorityFirst = $null; priorityLast = $null; loadSec = 0.0; loadBytes = [int64]0; loadJoined = $null; pinned = !!$h }
                     try { $r.affinityFirst = [int64]$p.ProcessorAffinity; $r.affinityLast = $r.affinityFirst; $r.priorityFirst = [string]$p.PriorityClass; $r.priorityLast = $r.priorityFirst } catch { $errs.Add("app-read: $($_.Exception.Message)") }
                     $live[$k] = @{ p = $p; r = $r }
                     if ($pst -lt $lu) { $others.Add($r) }
@@ -6444,6 +6472,22 @@ if ($corePartitionEmit) {
     $cpHelperSource = (Get-CorePartitionFunctionSource @(${function:Format-CorePartitionMask}, ${function:Get-CorePartitionTopology}, ${function:Test-CorePartitionMaskClass}) "`n") + "`n" + $corePartitionHelperBody
     # Indentation and whole-line comments are dropped so the encoded command fits one command line (the C# here-string's closing "@ stays at column 0).
     $cpHelperSource = (@($cpHelperSource -split "\r?\n" | ForEach-Object { $_.TrimStart() } | Where-Object { $_ -ne '' -and -not $_.StartsWith('#') }) -join "`n")
+    # CORE-PARTITION-HELPER-PID-REUSE-1 (room for its identity re-check): the one space on each side of an assignment '=' is dropped too. The tokenizer
+    # finds each '=' token, so no text inside a string (the C# here-string, a message) is touched, and the result must tokenize to the same token
+    # kinds and texts in the same order, or generation throws.
+    $cpTk0 = $null; $cpPe = $null
+    [void][System.Management.Automation.Language.Parser]::ParseInput($cpHelperSource, [ref]$cpTk0, [ref]$cpPe)
+    if (@($cpPe).Count -gt 0) { throw "CORE_PARTITION_HELPER_UNPARSED the helper source has $(@($cpPe).Count) parse error(s)" }
+    $cpSb = [Text.StringBuilder]::new($cpHelperSource)
+    foreach ($cpEq in @($cpTk0 | Where-Object { $_.Kind -eq [System.Management.Automation.Language.TokenKind]::Equals } | Sort-Object { $_.Extent.StartOffset } -Descending)) {
+        $cpAt = $cpEq.Extent.StartOffset
+        if ($cpAt + 1 -lt $cpSb.Length -and $cpSb[$cpAt + 1] -eq ' ') { [void]$cpSb.Remove($cpAt + 1, 1) }
+        if ($cpAt -gt 0 -and $cpSb[$cpAt - 1] -eq ' ') { [void]$cpSb.Remove($cpAt - 1, 1) }
+    }
+    $cpTk1 = $null
+    [void][System.Management.Automation.Language.Parser]::ParseInput($cpSb.ToString(), [ref]$cpTk1, [ref]$cpPe)
+    if (@($cpPe).Count -gt 0 -or ((@($cpTk0 | ForEach-Object { "$($_.Kind) $($_.Text)" }) -join "`n") -cne (@($cpTk1 | ForEach-Object { "$($_.Kind) $($_.Text)" }) -join "`n"))) { throw 'CORE_PARTITION_HELPER_SQUEEZE_CHANGED_TOKENS dropping the spaces around an assignment changed how the helper tokenizes' }
+    $cpHelperSource = $cpSb.ToString()
     $cpHelperEncoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($cpHelperSource))
     # The limit: CreateProcess takes 32767 command-line chars; the pwsh path and switches before the encoded command are about 120 (sol r6 CP-06's
     # record HMAC took the helper past the earlier 30000).

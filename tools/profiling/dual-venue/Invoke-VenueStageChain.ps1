@@ -1,0 +1,207 @@
+# Invoke-VenueStageChain.ps1 -- the TRACKED stage chain a venue driver calls to stage ONE sha before its legs (STAGE-BUILD-HEAVY-SLOT-TIMEOUT-LOSES-TURN-1 r3).
+# ASCII only.
+#
+# A venue driver used to call a lane-local stage-chain.ps1 (a copy of a copy, never committed). Call this instead, with the same arguments plus the
+# path of the lane's stage-one script:
+#   & pwsh -NoProfile -NonInteractive -File <repo>\tools\profiling\dual-venue\Invoke-VenueStageChain.ps1 -Sha <40> -DeadlineUtc <ISO-8601> -StageOne <run>\stage-one.ps1
+# The stage-one script stays the lane's own (it names the venue, the worktree and the build root). It is run once per phase (dll, then stage) as
+#   pwsh -File <StageOne> -Sha <40> -Phase <dll|stage> [-DeadlineUtc <o>]
+# and its exit code is read as before: 0 done, 3 capacity (retried every -RetrySec seconds until the deadline), anything else a failure. The status file
+# <RunDir>\stage-status-<sha8>.txt (RunDir defaults to the stage-one script's folder) gets the same lines the copies wrote, so a driver still finds
+# `sha=<40> outcome=STAGE_OK manifest=<64>` there; each attempt's output is kept in its own <RunDir>\stage-<sha8>-<phase>-<utc>-<pid>-<guid8>.out.txt.
+#
+# THE DEADLINE REACHES THE MACHINE HEAVY SLOT. 2026-11-08 (lane-HFR-NATIVE-60FPS-FULLRES-1-r31): the driver passed -DeadlineUtc to its stage-chain copy, the
+# copy called stage-one without it, stage-one called the assembler without it, so tools\coordination\build-guard.ps1 waited its 60 min default, was refused
+# (heavy-slot 75), and the copy's retry 300 s later was a NEW ticket, the youngest in a queue deeper than 60 min. Here the chain deadline is
+#   - set as MLV_HEAVY_SLOT_DEADLINE_UTC (round-trip UTC) in EACH stage-one child's own environment, so a stage-one copy and an assembler that omit the
+#     parameter still hand it to the build guard by inheritance, which bounds the first ticket's --wait by it and prints BUILD_HEAVY_SLOT_WAIT_BOUND. The
+#     caller's process environment is never written: another runspace or chain in the same host never sees this chain's deadline (adversary 8eb98036-A2/A3);
+#   - also passed as -DeadlineUtc to a stage-one script whose param block declares it (read from the script's syntax tree, never guessed: a fixed param
+#     list would not bind an extra argument).
+# The deadline is an ISO-8601 instant (yyyy-MM-ddTHH:mm:ss[.f to .fffffff][Z|+hh:mm|-hh:mm]; no zone is UTC). Anything else is STAGE_CHAIN_REFUSED
+# reason=invalid-deadline, exit 2, before anything runs. No attempt starts once the deadline has passed: the deadline is checked before each attempt
+# (STAGE_FAILED deadline-passed, exit 3) and again after its log is created, immediately before the child is launched (STAGE_FAILED
+# deadline-passed-before-launch, exit 3; adversary 9528e35b-A1).
+# WHAT THE DEADLINE DOES NOT DO (Dot I2): it bounds when an attempt may START and, through the guard, the first heavy-slot ticket's --wait. That wait is
+# the remaining budget sampled when the guard launches heavy-slot, plus the shim's own start latency; it is not an absolute expiry. Nothing here cuts a
+# child off at the deadline: a stage-one that started in time runs to its own end.
+# FAIL CLOSED: a run dir the chain cannot write is STAGE_CHAIN_REFUSED reason=run-dir-unwritable (exit 2) before any child; a child that cannot be started,
+# or a status/log write that fails later, is STAGE_CHAIN_FAILED (exit 1). Success is only ever a child's own exit 0 (adversary 8eb98036-A1).
+# Run in process (`& Invoke-VenueStageChain.ps1`), a caller's AllScope variable is shared with every scope of this script, and a read-only one cannot be
+# assigned here, so it could freeze the exit code at 0 after a failing child. Any AllScope variable whose name this script uses is STAGE_CHAIN_REFUSED
+# reason=caller-allscope-variable (exit 2) before anything else runs (read from the session state, never through a cmdlet that a caller's
+# $PSDefaultParameterValues can bend; adversary f05a6892-A1), a dot-sourced run is STAGE_CHAIN_REFUSED reason=dot-sourced, the caller's parameter
+# defaults never reach this script, and the exit code is carried only in $script:MlvStageChainExitCode, whose every
+# assignment is read back; one that does not land is STAGE_CHAIN_FAILED reason=exit-code-unassignable, exit 1 (adversary 9528e35b-A2).
+# A caller's alias or function outranks a function of this script by name (Set-Alias Set-ChainExit Write-Output made the exit setter a no-op, so a failing
+# child exited 0; adversary c0a8936e-A2). So this script calls NO command by name: its own helpers are script blocks held in its own (guarded)
+# variables and run with `& $Helper`, and every file, path and sleep step is a .NET call. A test reads the syntax tree and fails on any command named.
+# One case is PowerShell's, not this script's: a read-only AllScope variable named like a PARAMETER fails the binding before any line here runs, so no
+# exit code is set at all: $LASTEXITCODE keeps the caller's old value and only $? (false) shows the failure. Run it with pwsh -File to rule this out.
+# A PLAIN SCRIPT, ON PURPOSE (adversary 9b7006d5-A1, 84f4e8af-A1): PowerShell applies a caller's $PSDefaultParameterValues only to cmdlets and to
+# ADVANCED functions and scripts. With [CmdletBinding()] or any [Parameter()] here, a caller's default (under this script's name, an alias of it,
+# a wildcard key, or a script-block default that empties the table while it binds) supplied -DeadlineUtc before the first line ran. So this param
+# block carries neither: no default binds any parameter of it, and a script-block default never even runs. What Mandatory and strict binding
+# did is done below instead: a missing or malformed -Sha is STAGE_CHAIN_REFUSED reason=invalid-sha, and any argument this script does not
+# declare (a typo, or a common parameter such as -Verbose) is STAGE_CHAIN_REFUSED reason=unknown-argument, both exit 2 before anything runs.
+#
+# INVOCATION BOUNDARY (hub ruling HUB-TICK 20261108T2350Z item 4). Run in process, this script shares one session with its caller. A caller that
+# rewrites that session before the call -- an alias or function that shadows a command, Update-TypeData or any other ETS change on any type, a
+# $PSDefaultParameterValues form, an AllScope, read-only or constant variable, Set-StrictMode, or a redefined built-in cmdlet -- is outside what
+# this script defends: such a finding is the documented boundary, not a defect of the chain. The caller-shadow guards below are kept, but they
+# are not a promise against every such rewrite. What stays a defect, and is fixed: wrong arithmetic, a race, a real caller in this repo, a file or
+# environment input, or a child process. The supported call is `pwsh -NoProfile -NonInteractive -File`, which has no caller session at all.
+#
+# Exit: 0 staged (STAGE_CHAIN_DONE), 3 capacity until the deadline or -MaxAttempts, 1 a stage-one or chain failure, 2 a bad argument.
+param(
+    # \A and \z: '$' would also match before a trailing newline (adversary 9528e35b-A3).
+    [ValidatePattern('\A[0-9a-f]{40}\z')][string]$Sha = '',
+    [string]$DeadlineUtc = '',
+    [string]$StageOne = '',
+    [string]$RunDir = '',
+    [ValidateRange(0, 86400)][int]$RetrySec = 300,
+    # Attempts per phase; 0 = until the deadline (the copies' rule).
+    [ValidateRange(0, 100000)][int]$MaxAttempts = 0,
+    # TEST SEAM ONLY (0 in every real call): milliseconds each attempt is held right after its log is created, before the last deadline check, so a test
+    # can stand in for a slow file system there and prove that check is the last step before the launch.
+    [ValidateRange(0, 600000)][int]$HoldAfterLogMsForTest = 0
+)
+# CALLER-SHADOW GUARD (adversary 9528e35b-A2, f05a6892-A1): first, before any of these names is assigned. The list names every variable this script
+# uses (a test reads it against the script's syntax tree). The guard assigns nothing and calls no cmdlet, so a caller's $PSDefaultParameterValues
+# (Get-Variable:ValueOnly hid the AllScope option from the first version) cannot reach it: it reads each variable through the session state.
+# Dot-sourced, every variable here IS the caller's, so that is refused outright.
+if ($MyInvocation.InvocationName -eq '.') {
+    [Console]::Out.WriteLine(('STAGE_CHAIN_REFUSED reason=dot-sourced sha={0} utc={1}' -f $Sha, [DateTime]::UtcNow.ToString('o'))); exit 2
+}
+@('PSDefaultParameterValues', 'args', 'ErrorActionPreference', 'Sha', 'DeadlineUtc', 'StageOne', 'RunDir', 'RetrySec', 'MaxAttempts', 'HoldAfterLogMsForTest', 'RefuseChain', 'Why', 'ResolveFsPath', 'PathText', 'prov', 'drv', 'resolved', 'text', 'parsed', 'formats', 'deadline', 'errs', 'ast', 'declares', 'pwsh', 'status', 'utf8', 'WriteChainLog', 't', 'InvokeStageOneChild', 'Phase', 'LogPath', 'psi', 'x', 'p', 'o', 'e', 'SetChainExit', 'Value', 'deadlineText', 'phase', 'attempt', 'phaseDone', 'log', 'code', 'last', 'MlvStageChainExitCode').Where(
+    { $null -ne $ExecutionContext.SessionState.PSVariable.Get($_) -and ($ExecutionContext.SessionState.PSVariable.Get($_).Options -band [System.Management.Automation.ScopedItemOptions]::AllScope) }, 'First').ForEach(
+    { [Console]::Out.WriteLine(('STAGE_CHAIN_REFUSED reason=caller-allscope-variable name={0} sha={1} utc={2}' -f $_, $Sha, [DateTime]::UtcNow.ToString('o'))); exit 2 })
+# What [Parameter(Mandatory)] and an advanced script's strict binding did (see A PLAIN SCRIPT above): an undeclared argument lands in $args here, and
+# a -Sha that was never given is the empty default, which ValidatePattern does not check. Both are refused before anything runs.
+if ($args.Count -gt 0) {
+    [Console]::Out.WriteLine(('STAGE_CHAIN_REFUSED reason=unknown-argument argument={0} sha={1} utc={2}' -f ([string]$args[0] -replace '\s+', ' '), $Sha, [DateTime]::UtcNow.ToString('o'))); exit 2
+}
+if ($Sha -cnotmatch '\A[0-9a-f]{40}\z') {
+    [Console]::Out.WriteLine(('STAGE_CHAIN_REFUSED reason=invalid-sha Sha={0} utc={1}' -f ($Sha -replace '\s+', ' '), [DateTime]::UtcNow.ToString('o'))); exit 2
+}
+# The caller's parameter defaults never reach this script's own steps (a local, empty map; the caller's own is not AllScope, checked above).
+$PSDefaultParameterValues = @{}
+$ErrorActionPreference = 'Continue'
+
+$RefuseChain = {
+    param([string]$Why)
+    [Console]::Out.WriteLine(('STAGE_CHAIN_REFUSED reason={0} sha={1} utc={2}' -f $Why, $Sha, [DateTime]::UtcNow.ToString('o')))
+    exit 2
+}
+
+# Strict shape first (TryParseExact alone accepts '00:00:00.Z' through the optional F digits; adversary 8eb98036-A4), then the instant itself.
+$text = [string]$DeadlineUtc
+$parsed = [DateTimeOffset]::MinValue
+$formats = [string[]]@('yyyy-MM-ddTHH:mm:ssK', 'yyyy-MM-ddTHH:mm:ss.FFFFFFFK')
+if ($text -cnotmatch '\A\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(\.\d{1,7})?(Z|[+-]\d\d:\d\d)?\z' -or
+    -not [DateTimeOffset]::TryParseExact($text, $formats, [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::AssumeUniversal, [ref]$parsed)) {
+    & $RefuseChain ("invalid-deadline DeadlineUtc='{0}' is not an ISO-8601 instant" -f ($text -replace '\s+', ' '))
+}
+$deadline = $parsed.UtcDateTime
+# Paths are resolved against PowerShell's location (never the PROCESS directory a .NET call would read a relative path against; adversary 3c9ea703-A1)
+# and checked with .NET, so no command is called. A path counts only when it resolves through the FileSystem provider to a fully qualified path:
+# Env:\tools resolved through the Environment provider to the bare text 'tools', which .NET then read against the process directory, and a path
+# that failed to resolve was kept as given (adversary 38afcbb2-A1 and its sibling). Anything else is refused like a missing file.
+$ResolveFsPath = {
+    param([string]$PathText)
+    $prov = $null; $drv = $null
+    try { $resolved = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($PathText, [ref]$prov, [ref]$drv) } catch { return '' }
+    if ($null -eq $prov -or $prov.Name -cne 'FileSystem' -or -not $resolved -or -not [IO.Path]::IsPathFullyQualified($resolved)) { return '' }
+    return [IO.Path]::GetFullPath($resolved)
+}
+$resolved = & $ResolveFsPath $StageOne
+if (-not $resolved -or -not [IO.File]::Exists($resolved)) { & $RefuseChain ("stage-one-missing StageOne='{0}'" -f $StageOne) }
+$StageOne = $resolved
+if (-not $RunDir) { $RunDir = [IO.Path]::GetDirectoryName($StageOne) }
+$resolved = & $ResolveFsPath $RunDir
+if (-not $resolved -or -not [IO.Directory]::Exists($resolved)) { & $RefuseChain ("run-dir-missing RunDir='{0}'" -f $RunDir) }
+$RunDir = $resolved
+
+$errs = $null
+$ast = [System.Management.Automation.Language.Parser]::ParseFile($StageOne, [ref]$null, [ref]$errs)
+$declares = $false
+if ($ast.ParamBlock) { $declares = $ast.ParamBlock.Parameters.Where({ $_.Name.VariablePath.UserPath -eq 'DeadlineUtc' }).Count -gt 0 }
+
+$pwsh = [IO.Path]::Combine($PSHOME, $(if ($IsWindows -or $env:OS -eq 'Windows_NT') { 'pwsh.exe' } else { 'pwsh' }))
+$status = [IO.Path]::Combine($RunDir, ('stage-status-' + $Sha.Substring(0, 8) + '.txt'))
+$utf8 = [Text.UTF8Encoding]::new($false)
+# Throws on failure (never a silent non-terminating error): every write the driver relies on either lands or ends the chain.
+$WriteChainLog = { param([string]$t) [IO.File]::AppendAllText($status, ('{0} {1}' -f [DateTime]::UtcNow.ToString('o'), $t) + [Environment]::NewLine, $utf8) }
+
+$InvokeStageOneChild = {
+    # One stage-one child. The deadline is in ITS environment only. Returns its exit code, or $null when the deadline passed before the launch (nothing
+    # was started); throws when it cannot be started or its log cannot be kept.
+    param([string]$Phase, [string]$LogPath)
+    $psi = [Diagnostics.ProcessStartInfo]::new($pwsh)
+    foreach ($x in @('-NoProfile', '-NonInteractive', '-File', $StageOne, '-Sha', $Sha, '-Phase', $Phase)) { [void]$psi.ArgumentList.Add($x) }
+    if ($declares) { [void]$psi.ArgumentList.Add('-DeadlineUtc'); [void]$psi.ArgumentList.Add($deadlineText) }
+    $psi.UseShellExecute = $false; $psi.CreateNoWindow = $true
+    $psi.RedirectStandardOutput = $true; $psi.RedirectStandardError = $true; $psi.RedirectStandardInput = $true
+    $psi.Environment['MLV_HEAVY_SLOT_DEADLINE_UTC'] = $deadlineText
+    # The log must be writable BEFORE the child runs, and must be THIS attempt's own: CreateNew fails on a name another chain already took
+    # (adversary 3c9ea703-A2), so two chains never share or overwrite one log.
+    ([IO.FileStream]::new($LogPath, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::Read)).Dispose()
+    if ($HoldAfterLogMsForTest -gt 0) { [Threading.Thread]::Sleep($HoldAfterLogMsForTest) }
+    # The loop's deadline check came before the log path was built and the log created; that work (a slow share) can run past the deadline, so the
+    # deadline is checked again here, the last step before the launch (adversary 9528e35b-A1).
+    if ([DateTime]::UtcNow -ge $deadline) { return $null }
+    $p = [Diagnostics.Process]::Start($psi)
+    try {
+        $p.StandardInput.Close()
+        $o = $p.StandardOutput.ReadToEndAsync(); $e = $p.StandardError.ReadToEndAsync()
+        # No runtime cutoff (Dot I2): a child that started before the deadline is waited for to its own end.
+        $p.WaitForExit()
+        [IO.File]::WriteAllText($LogPath, $o.GetAwaiter().GetResult() + $e.GetAwaiter().GetResult(), $utf8)
+        return $p.ExitCode
+    } finally { $p.Dispose() }
+}
+
+$deadlineText = $deadline.ToString('o', [Globalization.CultureInfo]::InvariantCulture)
+try {
+    & $WriteChainLog ("STAGE_CHAIN_START sha={0} deadline={1} stageOne={2} heavySlotDeadline=child-env{3}" -f $Sha, $deadlineText, $StageOne, $(if ($declares) { '+param' } else { '' }))
+} catch { & $RefuseChain ("run-dir-unwritable status='{0}' ({1})" -f $status, ($_.Exception.Message -replace '\s+', ' ')) }
+
+# The exit code lives only in $script:MlvStageChainExitCode (adversary 9528e35b-A2). Every assignment is read back; one that did not land ends the
+# chain at once with exit 1 (an `exit` is never caught by the catch below).
+$SetChainExit = {
+    param([int]$Value)
+    try { $script:MlvStageChainExitCode = $Value } catch { }
+    if ($script:MlvStageChainExitCode -isnot [int] -or $script:MlvStageChainExitCode -ne $Value) {
+        [Console]::Out.WriteLine(('STAGE_CHAIN_FAILED sha={0} reason=exit-code-unassignable wanted={1} utc={2}' -f $Sha, $Value, [DateTime]::UtcNow.ToString('o')))
+        exit 1
+    }
+}
+
+& $SetChainExit 0
+try {
+    foreach ($phase in @('dll', 'stage')) {
+        $attempt = 0
+        $phaseDone = $false
+        while (-not $phaseDone) {
+            if ([DateTime]::UtcNow -ge $deadline) { & $WriteChainLog "STAGE_FAILED deadline-passed phase=$phase"; & $SetChainExit 3; break }
+            $attempt++
+            $log = [IO.Path]::Combine($RunDir, ('stage-' + $Sha.Substring(0, 8) + "-$phase-" + [DateTime]::UtcNow.ToString('yyyyMMddTHHmmssfff') + "-$PID-" + [Guid]::NewGuid().ToString('N').Substring(0, 8) + '.out.txt'))
+            $code = & $InvokeStageOneChild $phase $log
+            if ($null -eq $code) { & $WriteChainLog "STAGE_FAILED deadline-passed-before-launch phase=$phase attempt=$attempt"; & $SetChainExit 3; break }
+            $last = [IO.File]::ReadAllLines($log).Where({ $_ -match '^STAGE_ONE_RESULT ' }, 'Last')
+            & $WriteChainLog "phase=$phase attempt=$attempt exit=$code $last"
+            if ($code -eq 0) { $phaseDone = $true; continue }
+            if ($code -ne 3) { & $WriteChainLog "STAGE_FAILED phase=$phase"; & $SetChainExit 1; break }
+            if ($MaxAttempts -gt 0 -and $attempt -ge $MaxAttempts) { & $WriteChainLog "STAGE_FAILED capacity-attempts-exhausted phase=$phase attempts=$attempt"; & $SetChainExit 3; break }
+            if ([DateTime]::UtcNow.AddSeconds($RetrySec) -ge $deadline) { & $WriteChainLog "STAGE_FAILED capacity-wait-exhausted phase=$phase attempts=$attempt"; & $SetChainExit 3; break }
+            if ($RetrySec -gt 0) { [Threading.Thread]::Sleep([TimeSpan]::FromSeconds($RetrySec)) }
+        }
+        if ($script:MlvStageChainExitCode -ne 0) { break }
+    }
+    if ($script:MlvStageChainExitCode -eq 0) { & $WriteChainLog 'STAGE_CHAIN_DONE' }
+} catch {
+    [Console]::Out.WriteLine(('STAGE_CHAIN_FAILED sha={0} reason={1} utc={2}' -f $Sha, ($_.Exception.Message -replace '\s+', ' '), [DateTime]::UtcNow.ToString('o')))
+    try { & $WriteChainLog ('STAGE_CHAIN_FAILED reason=' + ($_.Exception.Message -replace '\s+', ' ')) } catch { }
+    & $SetChainExit 1
+}
+exit $script:MlvStageChainExitCode

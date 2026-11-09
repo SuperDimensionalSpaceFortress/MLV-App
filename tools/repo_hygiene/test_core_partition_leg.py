@@ -549,7 +549,8 @@ Write-CorePartitionNewFile $fresh 'ok'
 # CORE-PARTITION-HELPER-STOPFILE-OBSERVE-FLAKE-1: the test-only hold spliced into the decoded helper just before its stop-file check. Each pass
 # writes pass-N.polled (the count of processes it still tracks after its polls and enumeration) and waits, bounded at 60 s and named on timeout, for
 # pass-N.go, so a driver decides what happens between a pass's polls and its stop check instead of racing the host's scheduler for it.
-COVERAGE_HOLD_ANCHOR = "\nif (Test-Path -LiteralPath $stop) { $rec.endedBy = 'stop-file'; break }\n"
+# CORE-PARTITION-HELPER-PID-REUSE-1: the encoded helper carries no space around an assignment '=' (the generator drops them to make room)
+COVERAGE_HOLD_ANCHOR = "\nif (Test-Path -LiteralPath $stop) { $rec.endedBy='stop-file'; break }\n"
 COVERAGE_HOLD_HOOK = r"""
 $cpPass++; $cpHold = [string]$env:CP_HOLD_DIR; $cpHw = [Diagnostics.Stopwatch]::StartNew()
 [IO.File]::WriteAllText("$cpHold\pass-$cpPass.polled", [string]$live.Count)
@@ -1212,7 +1213,7 @@ class CorePartitionGeneratorTests(unittest.TestCase):
         # adversary r9 (5592421d) A1: the final pass enumerates same-path processes before it looks for the stop file
         src = base64.b64decode(re.search(r"(?m)^\$CorePartitionHelperEncoded = '([A-Za-z0-9+/=]+)'$", self.job("a")).group(1)).decode("utf-16-le")
         loop = src[src.index("while ($true) {"):]
-        self.assertLess(loop.index("$q.r.goneMs = "), loop.index("Test-Path -LiteralPath $stop"), "the stop file is looked for before the pass polls the tracked processes")
+        self.assertLess(loop.index("$q.r.goneMs="), loop.index("Test-Path -LiteralPath $stop"), "the stop file is looked for before the pass polls the tracked processes")
         self.assertLess(loop.index("Get-Process -Name $appName"), loop.index("Test-Path -LiteralPath $stop"), "the stop file is looked for before the pass enumerates same-path processes")
 
 
@@ -2378,7 +2379,8 @@ $hb = $hb.Replace($cat, '$cpFakeCat')
 $prelude = @'
 $cpFakeCat = [pscustomobject]@{}; $cpFakeCat | Add-Member -MemberType ScriptMethod -Name ReadCategory -Value { @{} }
 $global:cpF = @{ sw = [Diagnostics.Stopwatch]::StartNew(); firstAt = $null; exitAt = [long]::MaxValue; stalled = $false; stopped = $false; start = [DateTime]::UtcNow }
-$global:cpP = [pscustomobject]@{ Id = 5000; Path = $env:MLV_CP_EXE; StartTime = $global:cpF.start; PriorityClass = 'Normal' }
+# CORE-PARTITION-HELPER-PID-REUSE-1: its handle opens, as a real app's does (the helper refuses a measured app it could not pin with a held handle)
+$global:cpP = [pscustomobject]@{ Id = 5000; Path = $env:MLV_CP_EXE; StartTime = $global:cpF.start; PriorityClass = 'Normal'; Handle = [IntPtr]1 }
 $global:cpP | Add-Member -MemberType ScriptMethod -Name Refresh -Value { }
 $global:cpP | Add-Member -MemberType ScriptProperty -Name HasExited -Value {
     $e = $global:cpF.sw.ElapsedMilliseconds -ge $global:cpF.exitAt
@@ -2389,7 +2391,7 @@ $global:cpP | Add-Member -MemberType ScriptProperty -Name ProcessorAffinity -Val
     if ($null -eq $global:cpF.firstAt) { $global:cpF.firstAt = $t }
     elseif (-not $global:cpF.stalled -and $t -ge $global:cpF.firstAt + 2500) { $global:cpF.stalled = $true; $global:cpF.exitAt = $t + 100; if ($env:CP_MODE -eq 'delayed') { Start-Sleep -Milliseconds 1500 } }
     [int64]4095 }
-function Get-Process { [CmdletBinding()] param([string]$Name) if (-not $global:cpF.stopped -and $global:cpF.sw.ElapsedMilliseconds -lt $global:cpF.exitAt) { $global:cpP } }
+function Get-Process { [CmdletBinding()] param([string]$Name, [int]$Id) if ($PSBoundParameters.ContainsKey('Id')) { return (@($global:cpP, $global:cpQ) | Where-Object { $null -ne $_ -and $_.Id -eq $Id }) }; if (-not $global:cpF.stopped -and $global:cpF.sw.ElapsedMilliseconds -lt $global:cpF.exitAt) { $global:cpP } }
 '@
 $src = $prelude + "`n" + ((@('Format-CorePartitionMask', 'Get-CorePartitionTopology', 'Test-CorePartitionMaskClass') | ForEach-Object { $fn[$_] }) -join "`n")
 $src = $src + "`n" + $hb
@@ -2544,6 +2546,21 @@ _CLOCK_APP = {**_APP, "startBeforeFirstPollMs": 50}
 CLOCK_STEPS_MS = (100, 500, 1000)
 # With the start unread at first sight the process refuses whatever the clock did (r3); these steps check that a backward step does not change that.
 CLOCK_START_UNREAD_STEPS_MS = (400, 700, 1000)
+# CORE-PARTITION-HELPER-PID-REUSE-1: the measured app with no handle held (byPid), and the process that takes its pid at enumeration 4 (idFrom/idTo: it holds the
+# pid from 4 to 9 without being listed by name unless from/to say so), started after the app.
+_REUSED_APP = {"id": 5000, "from": 1, "to": 3, "goneAt": 4, "startSec": 1, "handleFail": 1, "byPid": 1}
+_REUSER = {"id": 5000, "from": 99, "to": 0, "idFrom": 4, "idTo": 9, "goneAt": 10, "startBeforeFirstPollMs": -500}
+_GONE_KEY_P0_B = ({"id": 300, "from": 1, "to": 1, "goneAt": 2, "startSec": 1, "handleFail": 1, "byPid": 1},
+                  {"id": 300, "from": 99, "to": 0, "idFrom": 2, "idTo": 3, "goneAt": 4, "startSec": 2, "exe": "other"})
+# r3 (Dot pr-777 I3): the app's exe for the equal-length comparison cases ("mlv" U+00C5 "fake.exe"), and one scenario per path comparison site with the
+# compared process at exe kind `e` ('angstrom' or 'case'): the same shapes as the soft-hyphen cases at those sites.
+_ANGSTROM_APP_EXE = "mlvÅfake.exe"
+_ORDINAL_SITES = {
+    "gone-key-relisted": lambda e: {"procs": [_APP, *_GONE_KEY_P0_B, {"id": 300, "from": 4, "to": 99, "goneAt": 999, "startSec": 1, "exe": e}]},
+    "pid-reused-same-start": lambda e: {"sleepMs": 250, "stopAt": 12, "procs": [_REUSED_APP, {**_REUSER, "exe": e, "startBeforeFirstPollMs": None, "startSec": 1}]},
+    "path-start-unread": lambda e: {"procs": [_APP, {**_Q, "id": 400, "startSec": 1, "exe": e, "startFail": -1}]},
+    "path-listed": lambda e: {"procs": [_APP, {**_Q, "id": 400, "startSec": 1, "exe": e}]},
+}
 LATE_READ_SCENARIOS = {
     "control": {"procs": [_APP]},
     "path-empty-late": {"procs": [{**_APP, "pathFail": 3, "pathMode": "empty"}]},
@@ -2605,6 +2622,40 @@ LATE_READ_SCENARIOS = {
     "path-late-handle-unopened": {"procs": [{**_APP, "pathFail": 3, "pathMode": "empty", "handleFail": 1}]},
     # adversary pass 5 A2 on 8ad00092: the first Processor Information read throws, before the pending state exists
     "counter-read-throws": {"catThrow": 1, "procs": [_APP]},
+    # CORE-PARTITION-HELPER-PID-REUSE-1 (adversary A1 on 74c7d7d3, #696 r14b; Dot pr-696 comment 6470100169). The measured app is tracked with no handle held on
+    # it (its handle did not open, so every liveness poll opens the pid). The runner held its own handle through its post-exit sampling; the app exits at
+    # enumeration 4, once that handle is released, and before the helper's next poll another process holds the pid until enumeration 9. The pid is free from
+    # enumeration 10, which is the gone evidence a no-handle poll can see, and the stop arrives at enumeration 12. Polls are 250 ms apart, so the helper's
+    # once-a-second samples fall inside the reuse. Another image (never listed by name), and the same image (listed by name from its start, a new key).
+    "pid-reused-by-another-image": {"sleepMs": 250, "stopAt": 12, "procs": [_REUSED_APP, {**_REUSER, "exe": "other"}]},
+    "pid-reused-by-the-same-image": {"sleepMs": 250, "stopAt": 12, "procs": [_REUSED_APP, {**_REUSER, "from": 4, "to": 9}]},
+    # its control: the same app, the same identity on every poll, alive until enumeration 10
+    "pid-same-identity-control": {"sleepMs": 250, "stopAt": 12, "procs": [{**_REUSED_APP, "to": 9, "goneAt": 10}]},
+    # adversary A1 on aa71dd11: the process that takes the pid has the app's exact start (an unsampled clock step) and its path, so no read on the pid tells them apart
+    "pid-reused-with-the-same-start-and-path": {"sleepMs": 250, "stopAt": 12, "procs": [_REUSED_APP, {**_REUSER, "from": 4, "to": 9, "startBeforeFirstPollMs": None, "startSec": 1}]},
+    # adversary A1 on 4fdc1512: P0 on pid 300 is tracked unpinned and exits at enumeration 2; another image holds the pid at 2-3, so the identity re-read retires
+    # P0 (its key goes to 2); from 4 a same-path process listed with P0's exact start and a readable Path carries P0's key. Its control: the same, at another exe.
+    "gone-key-relisted-readable": {"procs": [_APP, *_GONE_KEY_P0_B, {"id": 300, "from": 4, "to": 99, "goneAt": 999, "startSec": 1}]},
+    "gone-key-relisted-other-exe": {"procs": [_APP, *_GONE_KEY_P0_B, {"id": 300, "from": 4, "to": 99, "goneAt": 999, "startSec": 1, "exe": "other"}]},
+    # the pinned control: the app's handle is held (the pid cannot be reused while it is), alive until enumeration 10
+    "pid-pinned-control": {"sleepMs": 250, "stopAt": 12, "procs": [{"id": 5000, "from": 1, "to": 9, "goneAt": 10, "startSec": 1}]},
+    # r2 (Dot pr-777 I1): the path branch alone. Another image takes the pid with the app's exact start, so only the Path read on the pid differs.
+    "pid-reused-same-start-other-path": {"sleepMs": 250, "stopAt": 12, "procs": [_REUSED_APP, {**_REUSER, "exe": "other", "startBeforeFirstPollMs": None, "startSec": 1}]},
+    # r2 (Dot pr-777 I1): HasExited reads false on every poll to enumeration 9, and from enumeration 4 on ONE of the two fresh identity reads fails (the other
+    # reads and matches). Pinned (a held handle): the fallback keeps stamping it alive. Unpinned: no new alive stamp, and no exit either, until the pid is free.
+    **{f"id-{what}-unread-{pin}": {"sleepMs": 250, "stopAt": 12, "procs": [{**base, f"id{what.capitalize()}FailFrom": 4}]}
+       for what in ("path", "start")
+       for pin, base in (("pinned", {"id": 5000, "from": 1, "to": 9, "goneAt": 10, "startSec": 1}), ("unpinned", {**_REUSED_APP, "to": 9, "goneAt": 10}))},
+    # r2 adversary A1 on f82e5037: exe 'soft' is the app's path with a soft hyphen (U+00AD) in the file name, another file that PowerShell's culture-sensitive
+    # -ieq / -ine call equal to the app's. Each of the helper's four path comparisons in turn: the seen-key rule, the identity re-read, and the listing's two.
+    "gone-key-relisted-culture-equal-exe": {"procs": [_APP, *_GONE_KEY_P0_B, {"id": 300, "from": 4, "to": 99, "goneAt": 999, "startSec": 1, "exe": "soft"}]},
+    "pid-reused-same-start-culture-equal-path": {"sleepMs": 250, "stopAt": 12, "procs": [_REUSED_APP, {**_REUSER, "exe": "soft", "startBeforeFirstPollMs": None, "startSec": 1}]},
+    "culture-equal-path-listed": {"procs": [_APP, {**_Q, "id": 400, "startSec": 1, "exe": "soft"}]},
+    "culture-equal-path-start-unread": {"procs": [_APP, {**_Q, "id": 400, "startSec": 1, "exe": "soft", "startFail": -1}]},
+    # r3 (Dot pr-777 I3): the soft hyphen changes the length, so the length guard alone tells those apart. The same four sites, with the app's exe named with
+    # U+00C5 (appExe): 'angstrom' (U+212B in its place: equal length, culture-equal, ordinally another file) is another exe; 'case' (the same path, ASCII case
+    # only) is the exe. Mode suffix -angstrom / -case, in site order: the seen-key rule, the identity re-read, the listing's pending and tracking tests.
+    **{f"{site}-{exe}": {"appExe": _ANGSTROM_APP_EXE, **spec(exe)} for exe in ("angstrom", "case") for site, spec in _ORDINAL_SITES.items()},
     **{f"clock-back-path-{ms}": {"stepMs": ms, "procs": [{**_CLOCK_APP, "pathFail": 1, "pathMode": "empty"}]} for ms in CLOCK_STEPS_MS},
     **{f"clock-back-start-{ms}": {"stepMs": ms, "procs": [{**_CLOCK_APP, "startFail": 1}]} for ms in CLOCK_START_UNREAD_STEPS_MS},
 }
@@ -2624,27 +2675,41 @@ function Test-CpFails($Up, $From) { ($Up -eq -1) -or ($null -ne $Up -and $global
 $global:cpDoubles = @(foreach ($s in @($global:cpSpec.procs)) {
     $d = [pscustomobject]@{ Id = [int]$s.id; cpS = $s; PriorityClass = 'Normal'; ProcessorAffinity = [int64]4095 }
     $d | Add-Member -MemberType ScriptMethod -Name Refresh -Value { }
-    $d | Add-Member -MemberType ScriptProperty -Name HasExited -Value { if ($null -ne $this.cpS.exitedNullAt -and $global:cpPoll -ge $this.cpS.exitedNullAt -and ($null -eq $this.cpS.exitedNullTo -or $global:cpPoll -le $this.cpS.exitedNullTo)) { return $null }; $global:cpPoll -ge $this.cpS.goneAt }
+    $d | Add-Member -MemberType ScriptProperty -Name HasExited -Value { if ($null -ne $this.cpS.exitedNullAt -and $global:cpPoll -ge $this.cpS.exitedNullAt -and ($null -eq $this.cpS.exitedNullTo -or $global:cpPoll -le $this.cpS.exitedNullTo)) { return $null }
+        if ($this.cpS.byPid) { $o = Get-CpOccupant $this.Id; return ($null -eq $o -or $global:cpPoll -ge $o.cpS.goneAt) }
+        $global:cpPoll -ge $this.cpS.goneAt }
     $d | Add-Member -MemberType ScriptMethod -Name Refresh -Force -Value { if ($global:cpPoll -eq $this.cpS.exitedThrowAt) { throw [ComponentModel.Win32Exception]::new(5) } }
     $d | Add-Member -MemberType ScriptProperty -Name Handle -Value { if ($this.cpS.handleFail) { throw [ComponentModel.Win32Exception]::new(5) }; [IntPtr]1 }
     $d | Add-Member -MemberType ScriptProperty -Name Path -Value {
         $s = $this.cpS
-        if ((Test-CpFails $s.pathFail $s.pathFailFrom) -or $global:cpPoll -eq $s.pathFailAt) { if ($s.pathMode -eq 'throw') { throw [ComponentModel.Win32Exception]::new(5) }; return '' }
-        if ($s.exe -eq 'other') { 'C:\elsewhere\mlvfake.exe' } else { $env:MLV_CP_EXE } }
+        if ((Test-CpFails $s.pathFail $s.pathFailFrom) -or $global:cpPoll -eq $s.pathFailAt -or ($this.cpFresh -and (Test-CpFails $null $s.idPathFailFrom))) { if ($s.pathMode -eq 'throw') { throw [ComponentModel.Win32Exception]::new(5) }; return '' }
+        # r3 (Dot pr-777 I3): 'angstrom' is the app's path with its U+00C5 (appExe) swapped for U+212B ANGSTROM SIGN, the same length, equal under culture
+        # comparison and different under ordinal; 'case' is the app's path with every ASCII lower-case letter upper-cased (the same file).
+        if ($s.exe -eq 'other') { 'C:\elsewhere\mlvfake.exe' } elseif ($s.exe -eq 'soft') { $env:MLV_CP_EXE -replace 'mlvfake\.exe$', "mlv$([char]0xAD)fake.exe" } elseif ($s.exe -eq 'angstrom') {
+            $env:MLV_CP_EXE.Replace([string][char]0xC5, [string][char]0x212B) } elseif ($s.exe -eq 'case') { [regex]::Replace($env:MLV_CP_EXE, '[a-z]', { $args[0].Value.ToUpperInvariant() }) } else { $env:MLV_CP_EXE } }
     $d | Add-Member -MemberType ScriptProperty -Name StartTime -Value {
         $s = $this.cpS
-        if ((Test-CpFails $s.startFail $s.startFailFrom) -or $global:cpPoll -eq $s.startFailAt) { throw [ComponentModel.Win32Exception]::new(5) }
+        if ((Test-CpFails $s.startFail $s.startFailFrom) -or $global:cpPoll -eq $s.startFailAt -or ($this.cpFresh -and (Test-CpFails $null $s.idStartFailFrom))) { throw [ComponentModel.Win32Exception]::new(5) }
         if ($null -ne $s.recycleAt -and $global:cpPoll -ge $s.recycleAt) { if ($null -eq $global:cpNew) { $global:cpNew = [DateTime]::UtcNow.AddSeconds(3) }; return $global:cpNew }
         if ($null -ne $s.startBeforeFirstPollMs) { return $global:cpT1.AddMilliseconds(-$s.startBeforeFirstPollMs) }
         $global:cpLaunch.AddSeconds($s.startSec) }
     $d })
-function Get-Process { [CmdletBinding()] param([string]$Name)
+# CORE-PARTITION-HELPER-PID-REUSE-1: Get-Process -Id is the pid's occupant now (never counted as an enumeration): the double listed on that pid at this count, or
+# one whose idFrom/idTo say it holds the pid without being listed by name (another executable on the pid). byPid: no handle is held on the double, so its
+# HasExited, like a real Process's with no handle, opens the pid and reads whatever process holds it now (alive until that occupant's goneAt).
+# r2 (Dot pr-777 I1): -Id returns a fresh object (a copy of the occupant, marked cpFresh), as the real cmdlet does, so idPathFailFrom/idStartFailFrom fail
+# only the identity re-read's Path or StartTime on that fresh object from that enumeration count on, never the listing's reads or the liveness query.
+function Get-CpOccupant([int]$Id) { @($global:cpDoubles | Where-Object { $_.Id -eq $Id -and $global:cpPoll -ge $(if ($null -ne $_.cpS.idFrom) { $_.cpS.idFrom } else { $_.cpS.from }) -and $global:cpPoll -le $(if ($null -ne $_.cpS.idTo) { $_.cpS.idTo } else { $_.cpS.to }) }) | Select-Object -Last 1 }
+function Get-Process { [CmdletBinding()] param([string]$Name, [int]$Id)
+    if ($PSBoundParameters.ContainsKey('Id')) { $o = Get-CpOccupant $Id; if ($null -eq $o) { return }; $f = $o.psobject.Copy(); $f | Add-Member -NotePropertyName cpFresh -NotePropertyValue 1; return $f }
     $global:cpPoll++
     if ($global:cpPoll -eq 1) { $global:cpT1 = [DateTime]::UtcNow }
     [IO.File]::AppendAllText($env:CP_POLLS, "$([DateTime]::UtcNow.Ticks)`n")
-    if ($global:cpPoll -eq 8) { [IO.File]::WriteAllText($env:MLV_CP_MEASURED, '5000'); [IO.File]::WriteAllText($env:MLV_CP_STOP, 'stop') }
+    # the helper's own monotonic stamp of this enumeration ($cw is the helper's stopwatch; this function runs in its scope)
+    [IO.File]::AppendAllText("$($env:CP_POLLS)ms", "$($cw.ElapsedMilliseconds)`n")
+    if ($global:cpPoll -eq $(if ($global:cpSpec.stopAt) { [int]$global:cpSpec.stopAt } else { 8 })) { [IO.File]::WriteAllText($env:MLV_CP_MEASURED, '5000'); [IO.File]::WriteAllText($env:MLV_CP_STOP, 'stop') }
     $global:cpDoubles | Where-Object { $global:cpPoll -ge $_.cpS.from -and $global:cpPoll -le $_.cpS.to } }
-function Start-Sleep { param([int]$Milliseconds) [Threading.Thread]::Sleep(20) }
+function Start-Sleep { param([int]$Milliseconds) [Threading.Thread]::Sleep([math]::Max(20, [int]$global:cpSpec.sleepMs)) }
 '@
 $src = $prelude + "`n" + ((@('Format-CorePartitionMask', 'Get-CorePartitionTopology', 'Test-CorePartitionMaskClass') | ForEach-Object { $fn[$_] }) -join "`n") + "`n" + $hb
 $out = [ordered]@{}
@@ -2661,7 +2726,7 @@ for ($b = 0; $b -lt $names.Count; $b += 4) {
         $psi = [Diagnostics.ProcessStartInfo]::new("$env:ProgramFiles\PowerShell\7\pwsh.exe", "-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File `"$hp`"")
         $psi.UseShellExecute = $false; $psi.CreateNoWindow = $true
         $psi.Environment['CP_SPEC'] = ($spec | ConvertTo-Json -Compress -Depth 6); $psi.Environment['CP_LAUNCH_TICKS'] = [string]$launch; $psi.Environment['CP_POLLS'] = Join-Path $dir 'polls'
-        $psi.Environment['MLV_CP_EXE'] = Join-Path $dir 'mlvfake.exe'
+        $psi.Environment['MLV_CP_EXE'] = Join-Path $dir $(if ($spec.appExe) { [string]$spec.appExe } else { 'mlvfake.exe' })
         $psi.Environment['MLV_CP_STOP'] = Join-Path $dir 'stop'
         $psi.Environment['MLV_CP_READY'] = Join-Path $dir 'ready'
         $psi.Environment['MLV_CP_OUT'] = Join-Path $dir 'helper.json'
@@ -2688,7 +2753,10 @@ for ($b = 0; $b -lt $names.Count; $b += 4) {
             others = @(@($rec.others) | Where-Object { $null -ne $_ -and $null -eq $_.unidentified } | ForEach-Object { $_.pid })
             unidentified = @(@($rec.others) | Where-Object { $null -ne $_ -and $null -ne $_.unidentified } | ForEach-Object { $_.pid })
             by = $by; sessions = $rec.load.sessions; loadSec = $rec.load.seconds; vwhy = [string]$v.why; bench = $s.benchAffinityApplied; why = [string]$s.corePartitionNullReasons; skew = $rec.clockSkewMaxMs
-            polls = @([IO.File]::ReadAllLines((Join-Path $run.dir 'polls')) | ForEach-Object { [int64]$_ }) }
+            polls = @([IO.File]::ReadAllLines((Join-Path $run.dir 'polls')) | ForEach-Object { [int64]$_ })
+            pollsMs = @([IO.File]::ReadAllLines((Join-Path $run.dir 'pollsms')) | ForEach-Object { [int64]$_ })
+            appSampleMs = @(@($rec.samples) | Where-Object { $null -ne $_ -and $_.app } | ForEach-Object { [int64]$_.m })
+            firstApp = @(@($rec.instances) | Where-Object { $null -ne $_ -and $_.pid -eq 5000 } | ForEach-Object { [ordered]@{ start = [int64]$_.startUtcTicks; aliveMs = $_.aliveMs; goneMs = $_.goneMs; pinned = $_.pinned } })[0] }
     }
 }
 $out | ConvertTo-Json -Compress -Depth 6
@@ -2705,7 +2773,8 @@ $hb = $hb.Replace($cat, '$cpFakeCat')
 $prelude = @'
 $cpFakeCat = [pscustomobject]@{}; $cpFakeCat | Add-Member -MemberType ScriptMethod -Name ReadCategory -Value { @{} }
 $global:cpPoll = 0
-function Get-Process { [CmdletBinding()] param([string]$Name)
+function Get-Process { [CmdletBinding()] param([string]$Name, [int]$Id)
+    if ($PSBoundParameters.ContainsKey('Id')) { return (Microsoft.PowerShell.Management\Get-Process -Id $Id -ErrorAction SilentlyContinue) }
     $global:cpPoll++
     [IO.File]::WriteAllText($env:CP_POLLS, [string]$global:cpPoll)
     Microsoft.PowerShell.Management\Get-Process -Name $Name -ErrorAction SilentlyContinue }
@@ -3027,6 +3096,204 @@ class CorePartitionR10Tests(unittest.TestCase):
                 self.assertGreaterEqual(rec["last"], polls[4], f"a failed liveness query ended the tracking of a live process: {case}")
                 self.assertIsNotNone(rec["goneMs"], case)
                 self.assertIn(case["vwhy"], self.ACCEPTED, case)
+
+    def test_pid_reuse_a_pid_reused_after_the_handle_is_released_ends_the_instance_at_the_reuse(self) -> None:
+        """CORE-PARTITION-HELPER-PID-REUSE-1 (adversary A1 on 74c7d7d3, #696 r14b; Dot pr-696 comment 6470100169), the real helper body. The measured app is
+        tracked with no handle held on it, so its liveness poll opens the pid. The runner releases its handle, the app's pid is reused before the helper's next
+        poll, and the new process holds it for five polls before the pid is free. On the base the poll reads the new process and stamps the measured app alive
+        through all five, with its samples, and the job ACCEPTS the record (the native acceptance trace: release, reuse before the exit is seen, false-alive
+        samples, then gone evidence before the helper ends, so no coverage guard refuses it). Now every poll re-checks the birth identity (start time and image
+        path) on the pid, and the first poll that reads another process ends the instance there: nothing after it is credited. The record says the app was
+        not pinned by a held handle, and the job refuses it (adversary A1 on aa71dd11: a successor with the same start and path would read as the app)."""
+        for mode in ("pid-reused-by-another-image", "pid-reused-by-the-same-image"):
+            with self.subTest(mode=mode):
+                case = self.late_read(mode)
+                app, ms = case["firstApp"], case["pollsMs"]
+                # the app exits at enumeration 4 (pollsMs[3]); the first liveness poll after that runs before enumeration 5 (pollsMs[4])
+                self.assertLessEqual(app["aliveMs"], ms[3], f"a poll that read the pid's new process stamped the measured app alive: {case}")
+                self.assertIsNotNone(app["goneMs"], case)
+                self.assertGreaterEqual(app["goneMs"], ms[3], case)
+                self.assertLessEqual(app["goneMs"], ms[4], f"the measured app did not end at the first poll after its pid was reused: {case}")
+                self.assertEqual([m for m in case["appSampleMs"] if m > ms[3]], [], f"samples taken after the reuse were credited to the measured app: {case}")
+        trace = self.late_read("pid-reused-by-another-image")
+        self.assertEqual([trace["app"], trace["instances"], trace["unidentified"]], [5000, [5000], []], trace)
+        self.assertIs(trace["firstApp"]["pinned"], False, trace)
+        self.assertEqual(trace["vwhy"], "measured-app-identity-unpinned", trace)
+        self.assertFalse(trace["bench"], trace)
+
+    def test_pid_reuse_a1_a_successor_with_the_same_start_and_path_on_an_unpinned_pid_refuses_the_run(self) -> None:
+        """CORE-PARTITION-HELPER-PID-REUSE-1, adversary A1 on aa71dd11 (introduced): the process that takes the unpinned app's pid has the app's exact start
+        ticks (an unsampled clock step) and its path, so every poll's identity re-read matches and its enumeration carries the app's seen key. On aa71dd11
+        the app stays alive through the successor's life and the run is accepted. Now a measured app with no held handle refuses."""
+        case = self.late_read("pid-reused-with-the-same-start-and-path")
+        self.assertEqual(case["app"], 5000, case)
+        self.assertEqual(case["vwhy"], "measured-app-identity-unpinned", f"a measured app whose pid a held handle never pinned was accepted: {case}")
+        self.assertFalse(case["bench"], case)
+        self.assertIn("appAffinityObserved=measured-app-identity-unpinned", case["why"])
+        self.assertIs(case["firstApp"]["pinned"], False, case)
+
+    def test_pid_reuse_a_listing_that_carries_a_gone_key_at_the_exe_is_recorded(self) -> None:
+        """CORE-PARTITION-HELPER-PID-REUSE-1, adversary A1 on 4fdc1512 (introduced): an unpinned P0 is retired when another image takes its pid; a same-path
+        process then listed with P0's exact start and a readable Path carries P0's gone key. An exited process is never listed, so it is a successor alive
+        now; on 4fdc1512 the seen key skipped it and no overlap could see it. It is recorded unidentified and refuses. Control: the same successor at
+        another exe is no same-path process and is skipped."""
+        case = self.late_read("gone-key-relisted-readable")
+        self.assertEqual(case["unidentified"], [300], f"a same-path process carrying a gone key was dropped: {case}")
+        self.assertEqual(case["vwhy"], "same-path-instance-unidentified", case)
+        self.assertIsNotNone(case["by"]["300"]["goneMs"], f"the identity re-read did not retire P0: {case}")
+        control = self.late_read("gone-key-relisted-other-exe")
+        self.assertEqual(control["unidentified"], [], control)
+        self.assertIsNotNone(control["by"]["300"]["goneMs"], control)
+
+    def test_pid_reuse_the_pinned_flag_is_a_json_flag_and_only_false_refuses(self) -> None:
+        """CORE-PARTITION-HELPER-PID-REUSE-1: the job's verdict on the measured app's pinned flag. false refuses (measured-app-identity-unpinned); true and
+        absent are accepted as before; a number or a string (which -eq would read as a flag) is a malformed record."""
+        body = r"""
+$L = 639286128000000000
+function New-PinRec([string]$Pinned) {
+    $i = '{"pid":5000,"startUtcTicks":' + ($L + 30000000) + ',"firstSeenUtcTicks":' + ($L + 31000000) + ',"firstMs":3100,"lastSeenUtcTicks":' + ($L + 229500000) +
+        ',"goneUtcTicks":' + ($L + 230500000) + ',"aliveMs":22950,"goneMs":23050,"affinityFirst":4095,"affinityLast":4095' + $Pinned + '}'
+    ('{"schema":"mlv-app/core-partition-helper/v1","pid":4242,"app":' + $i + ',"instances":[' + $i + '],"others":[],"samples":[],"clockSkewMaxMs":0,"monoBaseMs":0,"endedBy":"stop-file"}') | ConvertFrom-Json
+}
+$out = [ordered]@{}
+$cases = [ordered]@{ absent = ''; true = ',"pinned":true'; false = ',"pinned":false'; zero = ',"pinned":0'; text = ',"pinned":"yes"' }
+foreach ($k in $cases.Keys) { $out[$k] = [string](Test-CorePartitionMeasuredApp (New-PinRec $cases[$k]) 5000 ($L + 29000000) ($L + 230000000) 0).why }
+$out | ConvertTo-Json -Compress
+"""
+        got = self.drive("pinned-flag", body, True)
+        self.assertEqual(got, {"absent": "", "true": "", "false": "measured-app-identity-unpinned", "zero": "helper-record-malformed", "text": "helper-record-malformed"}, got)
+
+    def test_pid_reuse_control_the_same_identity_on_every_poll_keeps_the_instance_alive(self) -> None:
+        """CORE-PARTITION-HELPER-PID-REUSE-1 control (passes on the base and with the fix): the same no-handle app, whose pid holds the same process on every
+        poll, is alive through enumeration 9 with its samples credited, and is seen gone at the first poll after it exits. Its pinned twin (a held handle)
+        is the same and is accepted."""
+        for mode in ("pid-same-identity-control", "pid-pinned-control"):
+            with self.subTest(mode=mode):
+                case = self.late_read(mode)
+                app, ms = case["firstApp"], case["pollsMs"]
+                self.assertEqual([case["app"], case["instances"], case["unidentified"]], [5000, [5000], []], case)
+                self.assertGreaterEqual(app["aliveMs"], ms[8], f"a poll whose identity matched did not stamp the app alive: {case}")
+                self.assertGreaterEqual(app["goneMs"], ms[9], case)
+                self.assertLessEqual(app["goneMs"], ms[10], case)
+                self.assertTrue([m for m in case["appSampleMs"] if m > ms[3]], f"the live app's samples were not credited: {case}")
+        self.assertIn(self.late_read("pid-pinned-control")["vwhy"], self.ACCEPTED)
+
+    def test_pid_reuse_r2_a_successor_with_the_same_start_at_another_path_ends_the_instance_at_the_reuse(self) -> None:
+        """r2 (Dot pr-777 I1, hub ACK 6724631958): the path branch of the identity re-read on its own. The process that takes the unpinned app's pid at
+        enumeration 4 has the app's exact start ticks but another image path, so the start read matches and only the Path read differs. The first poll after
+        the reuse must end the instance there, as in the other-image case; without the path comparison it stays alive through the successor's life."""
+        case = self.late_read("pid-reused-same-start-other-path")
+        app, ms = case["firstApp"], case["pollsMs"]
+        self.assertEqual([case["app"], case["instances"], case["unidentified"]], [5000, [5000], []], case)
+        self.assertLessEqual(app["aliveMs"], ms[3], f"a poll that read another path on the pid (same start) stamped the measured app alive: {case}")
+        self.assertIsNotNone(app["goneMs"], case)
+        self.assertGreaterEqual(app["goneMs"], ms[3], case)
+        self.assertLessEqual(app["goneMs"], ms[4], f"the measured app did not end at the first poll that read another path on its pid: {case}")
+        self.assertEqual([m for m in case["appSampleMs"] if m > ms[3]], [], f"samples taken after the reuse were credited to the measured app: {case}")
+        self.assertIs(app["pinned"], False, case)
+        self.assertEqual(case["vwhy"], "measured-app-identity-unpinned", case)
+
+    def test_pid_reuse_r2_a_partial_fresh_identity_read_after_hasexited_false_keeps_a_pinned_app_alive(self) -> None:
+        """r2 (Dot pr-777 I1): the pinned fallback. HasExited reads false on every poll; from enumeration 4 on, one fresh identity read (the Path, or the start)
+        fails and the other reads and matches. A held handle keeps the pid from being reused, so the process is still the app: every poll stamps it alive
+        through enumeration 9, it is seen gone at the first poll after it exits, and the run is accepted. Without the pinned fallback no poll after
+        enumeration 3 would stamp it alive."""
+        for mode in ("id-path-unread-pinned", "id-start-unread-pinned"):
+            with self.subTest(mode=mode):
+                case = self.late_read(mode)
+                app, ms = case["firstApp"], case["pollsMs"]
+                self.assertEqual([case["app"], case["instances"], case["unidentified"]], [5000, [5000], []], case)
+                self.assertIs(app["pinned"], True, case)
+                self.assertGreaterEqual(app["aliveMs"], ms[8], f"a pinned app whose fresh identity read failed once per poll was not stamped alive: {case}")
+                self.assertGreaterEqual(app["goneMs"], ms[9], case)
+                self.assertLessEqual(app["goneMs"], ms[10], case)
+                self.assertTrue([m for m in case["appSampleMs"] if m > ms[3]], f"the pinned live app's samples were not credited: {case}")
+                self.assertIn(case["vwhy"], self.ACCEPTED, case)
+
+    def test_pid_reuse_r2_a_partial_fresh_identity_read_after_hasexited_false_gives_an_unpinned_app_no_new_alive_stamp(self) -> None:
+        """r2 (Dot pr-777 I1): the unpinned branch. The same polls on an app with no held handle: HasExited (which opens the pid) reads false, but one fresh
+        identity read fails, so nothing says the pid's occupant is still the app. The poll is unknown: no new alive stamp (aliveMs stays at the last poll
+        before enumeration 4, and no sample after it is credited) and no exit either (the instance stays tracked until the pid is free, then it is gone)."""
+        for mode in ("id-path-unread-unpinned", "id-start-unread-unpinned"):
+            with self.subTest(mode=mode):
+                case = self.late_read(mode)
+                app, ms = case["firstApp"], case["pollsMs"]
+                self.assertEqual([case["app"], case["instances"], case["unidentified"]], [5000, [5000], []], case)
+                self.assertIs(app["pinned"], False, case)
+                self.assertLessEqual(app["aliveMs"], ms[3], f"an unpinned app whose fresh identity read failed was stamped alive: {case}")
+                self.assertEqual([m for m in case["appSampleMs"] if m > ms[3]], [], f"samples taken while the unpinned app's identity was unread were credited: {case}")
+                self.assertGreaterEqual(app["goneMs"], ms[9], f"a failed identity read on an unpinned app was recorded as its exit: {case}")
+                self.assertLessEqual(app["goneMs"], ms[10], case)
+                self.assertEqual(case["vwhy"], "measured-app-identity-unpinned", case)
+
+    def test_pid_reuse_r2_a1_a_path_equal_to_the_exe_only_under_culture_comparison_is_another_exe(self) -> None:
+        """r2, adversary A1 on f82e5037 (introduced at the seen-key rule; siblings the identity re-read and the listing's two path tests). PowerShell's -ieq /
+        -ine compare culture-sensitively and ignore U+00AD, so a process at the app's path with a soft hyphen in its file name (another file) read as the app's
+        path. The seen-key rule then recorded a successor at that other exe unidentified and refused a valid run; the identity re-read kept an unpinned app
+        alive on a successor at that path; the listing tracked such a process as a same-path instance, or held it pending and then unidentified. Every path the
+        helper compares with the exe's is now compared ordinally, case-insensitive (as Test-PresentMonIdentityText does), so each is another exe."""
+        with self.subTest(mode="gone-key-relisted-culture-equal-exe"):
+            relisted = self.late_read("gone-key-relisted-culture-equal-exe")
+            self.assertEqual(relisted["unidentified"], [], f"a gone key relisted at a culture-equal other exe was recorded unidentified: {relisted}")
+            self.assertIsNotNone(relisted["by"]["300"]["goneMs"], relisted)
+        with self.subTest(mode="pid-reused-same-start-culture-equal-path"):
+            reused = self.late_read("pid-reused-same-start-culture-equal-path")
+            app, ms = reused["firstApp"], reused["pollsMs"]
+            self.assertLessEqual(app["aliveMs"], ms[3], f"a successor at a culture-equal other path (same start) stamped the measured app alive: {reused}")
+            self.assertIsNotNone(app["goneMs"], reused)
+            self.assertLessEqual(app["goneMs"], ms[4], f"the measured app did not end at the first poll that read a culture-equal other path on its pid: {reused}")
+        for mode in ("culture-equal-path-listed", "culture-equal-path-start-unread"):
+            with self.subTest(mode=mode):
+                case = self.late_read(mode)
+                self.assertEqual([case["unidentified"], case["others"], case["instances"]], [[], [], [5000]], f"a process at a culture-equal other exe was classed as the app's path: {case}")
+                self.assertIn(case["vwhy"], self.ACCEPTED, case)
+
+    def test_pid_reuse_r3_i3_an_equal_length_culture_equal_path_is_another_exe_at_each_site(self) -> None:
+        """r3 (Dot pr-777 I3, hub chat ruling 2026-11-08T19:23:06Z). The soft-hyphen cases above change the path's length, so the length guard alone tells
+        them apart and they cannot say whether the comparison is ordinal. Here the app's exe is named with U+00C5 and the compared path has U+212B ANGSTROM
+        SIGN in its place: the same length, equal under culture comparison (-ieq, CurrentCultureIgnoreCase), another file under OrdinalIgnoreCase. At each of
+        the four sites it must be another exe, with the outcome of the soft-hyphen case at that site."""
+        with self.subTest(mode="gone-key-relisted-angstrom"):
+            relisted = self.late_read("gone-key-relisted-angstrom")
+            self.assertEqual(relisted["unidentified"], [], f"the seen-key rule read a culture-equal equal-length other exe as the exe's: {relisted}")
+            self.assertIsNotNone(relisted["by"]["300"]["goneMs"], relisted)
+        with self.subTest(mode="pid-reused-same-start-angstrom"):
+            reused = self.late_read("pid-reused-same-start-angstrom")
+            app, ms = reused["firstApp"], reused["pollsMs"]
+            self.assertLessEqual(app["aliveMs"], ms[3], f"the identity re-read read a culture-equal equal-length other path (same start) as the app's: {reused}")
+            self.assertIsNotNone(app["goneMs"], reused)
+            self.assertLessEqual(app["goneMs"], ms[4], f"the measured app did not end at the first poll that read a culture-equal equal-length other path: {reused}")
+        for mode in ("path-start-unread-angstrom", "path-listed-angstrom"):
+            with self.subTest(mode=mode):
+                case = self.late_read(mode)
+                self.assertEqual([case["unidentified"], case["others"], case["instances"]], [[], [], [5000]], f"the listing classed a culture-equal equal-length other exe as the app's path: {case}")
+                self.assertIn(case["vwhy"], self.ACCEPTED, case)
+
+    def test_pid_reuse_r3_i3_control_the_same_path_in_another_ascii_case_is_the_exe_at_each_site(self) -> None:
+        """r3 (Dot pr-777 I3) control: the same four sites with the compared path the exe's own, every ASCII letter upper-cased (the U+00C5 kept). Windows paths
+        are case-insensitive, so it is the exe at every site, with the outcome of the exact path there: a gone key carried at the exe is recorded unidentified;
+        a same-start successor at the exe passes the identity re-read on every poll (only the missing pin refuses it); a same-path process whose start never
+        reads is recorded unidentified; one whose start reads is tracked as a same-path instance. A case-sensitive comparison fails each."""
+        with self.subTest(mode="gone-key-relisted-case"):
+            relisted = self.late_read("gone-key-relisted-case")
+            self.assertEqual(relisted["unidentified"], [300], f"the seen-key rule read the exe's path in another case as another exe: {relisted}")
+            self.assertEqual(relisted["vwhy"], "same-path-instance-unidentified", relisted)
+            self.assertIsNotNone(relisted["by"]["300"]["goneMs"], relisted)
+        with self.subTest(mode="pid-reused-same-start-case"):
+            reused = self.late_read("pid-reused-same-start-case")
+            app, ms = reused["firstApp"], reused["pollsMs"]
+            self.assertGreaterEqual(app["aliveMs"], ms[8], f"the identity re-read read the exe's path in another case as another process: {reused}")
+            self.assertGreaterEqual(app["goneMs"], ms[9], reused)
+            self.assertLessEqual(app["goneMs"], ms[10], reused)
+            self.assertIs(app["pinned"], False, reused)
+            self.assertEqual(reused["vwhy"], "measured-app-identity-unpinned", reused)
+        with self.subTest(mode="path-start-unread-case"):
+            case = self.late_read("path-start-unread-case")
+            self.assertEqual(case["unidentified"], [400], f"the listing did not hold the exe's path in another case (start unread) as a same-path process: {case}")
+            self.assertEqual(case["vwhy"], "same-path-instance-unidentified", case)
+        with self.subTest(mode="path-listed-case"):
+            case = self.late_read("path-listed-case")
+            self.assertEqual([case["unidentified"], case["others"], case["instances"]], [[], [], [5000, 400]], f"the listing did not track the exe's path in another case as a same-path instance: {case}")
 
     def test_handover_a_process_on_a_recycled_tracked_pid_keeps_its_real_first_sight(self) -> None:
         """The same P2 alive and readable from enumeration 6: its first sight is enumeration 4, the pass that first listed it, not one pass late."""

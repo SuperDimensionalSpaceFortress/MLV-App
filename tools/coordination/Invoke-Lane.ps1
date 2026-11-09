@@ -1029,9 +1029,10 @@ public static class MlvLaneJob {
   [DllImport("kernel32.dll", SetLastError=true)]
   static extern bool GetProcessTimes(IntPtr process, out Int64 creation, out Int64 exit, out Int64 kernel, out Int64 user);
   // r14 fix iteration 1 (adversary A1 on 1d4adafb): creation FILETIMEs, which are UTC. Process.StartTime is local time and runs backward when daylight time ends, so a real child read as older than its parent.
-  static Int64 CreatedFileTime(Process p) {
+  static Int64 CreatedFileTime(Process p) { return CreatedFileTime(p.Handle); }
+  static Int64 CreatedFileTime(IntPtr process) {
     Int64 creation,exit,kernel,user;
-    if(!GetProcessTimes(p.Handle,out creation,out exit,out kernel,out user)) throw new Win32Exception(Marshal.GetLastWin32Error(),"GetProcessTimes");
+    if(!GetProcessTimes(process,out creation,out exit,out kernel,out user)) throw new Win32Exception(Marshal.GetLastWin32Error(),"GetProcessTimes");
     return creation;
   }
   public static bool StartedBeforeParent(Int64 kidCreated, Int64 parentCreated) { return kidCreated<parentCreated; }
@@ -1042,12 +1043,30 @@ public static class MlvLaneJob {
   }
   [DllImport("ntdll.dll")]
   static extern int NtQueryInformationProcess(IntPtr process, int infoClass, out PROCESS_BASIC_INFORMATION info, int length, out int returned);
-  static int ParentPidOf(Process p) {
+  [DllImport("ntdll.dll")]
+  static extern int NtQueryInformationProcess(IntPtr process, int infoClass, out UInt64 info, int length, out int returned);
+  static int ParentPidOf(IntPtr process) {
     PROCESS_BASIC_INFORMATION info; int returned;
-    int status=NtQueryInformationProcess(p.Handle,0,out info,Marshal.SizeOf(typeof(PROCESS_BASIC_INFORMATION)),out returned);
+    int status=NtQueryInformationProcess(process,0,out info,Marshal.SizeOf(typeof(PROCESS_BASIC_INFORMATION)),out returned);
     if(status<0) throw new Win32Exception(status,"NtQueryInformationProcess");
     return (int)info.InheritedFromUniqueProcessId.ToInt64();
   }
+  // CONTAINMENT-KID-READ-ACCESS-DENIED-1: the reads above need only PROCESS_QUERY_LIMITED_INFORMATION, but Process.Handle opens PROCESS_ALL_ACCESS. A protected process
+  // refuses that with 5, even to an elevated, debug-privileged account, and every Windows host keeps some whose parent pid is free (csrss, wininit: their smss instance
+  // has exited). Hosted CI read 'ancestry-unreadable:kid-read:5' (PR 420, 766, 775); which process it read is UNKNOWN, since no receipt names it. A protected process
+  // listed under a lane process that was handed its recycled parent pid is one possible mechanism, shown by injection only. Candidates are now read on a handle with only
+  // that right.
+  const uint PROCESS_QUERY_LIMITED_INFORMATION=0x1000;
+  const int ERROR_INVALID_PARAMETER=87;
+  [DllImport("kernel32.dll", SetLastError=true)]
+  static extern IntPtr OpenProcess(uint access, bool inheritHandle, int processId);
+  // The kernel numbers every process in creation order (ProcessSequenceNumber, class 92), whatever the clock does; 0 = not read. A process numbered below the pid's
+  // current holder existed before that holder, so the holder never created it: its recorded parent pid is a recycled one.
+  static UInt64 SequenceOf(IntPtr process) {
+    UInt64 sequence; int returned;
+    return NtQueryInformationProcess(process,92,out sequence,8,out returned)<0 ? 0UL : sequence;
+  }
+  public static bool CreatedBeforeBySequence(UInt64 kidSequence, UInt64 parentSequence) { return kidSequence!=0 && parentSequence!=0 && kidSequence<parentSequence; }
   // r15 (Dot B5; adversary A2 = Dot B6): Members are the processes shown to be in the tree. Uncertain says why 'killed' would claim too much; the first reason found stands.
   //   ancestry-unreadable:<parent-read|kid-open|kid-read>:<error code>: a candidate, or a parent, could not be read; the site and the code say which read.
   //   older-than-parent: the parent matches and the child reads older. A backward clock step and a reused parent pid look the same, so it is neither killed nor called gone.
@@ -1076,25 +1095,40 @@ public static class MlvLaneJob {
     while(walk.Count>0) {
       Process parent=walk.Dequeue();
       if(!kids.ContainsKey(parent.Id)) continue;
-      Int64 parentCreated;
+      Int64 parentCreated; UInt64 parentSequence;
       // PR 771 hosted CI saw a bare 'ancestry-unreadable' it could not explain (merge ref 516350c5, job 128440611866). Each note below now names the read that failed and its error code (Win32, or the raw NTSTATUS for the parent-pid read); the outcome is unchanged (uncertain).
-      try { parentCreated=CreatedFileTime(parent); } catch(Win32Exception ex) { seen.Note("ancestry-unreadable:parent-read:"+ex.NativeErrorCode); continue; }
+      try { parentCreated=CreatedFileTime(parent); parentSequence=SequenceOf(parent.Handle); } catch(Win32Exception ex) { seen.Note("ancestry-unreadable:parent-read:"+ex.NativeErrorCode); continue; }
       foreach(int id in kids[parent.Id]) {
         Process kid;
         try { kid=Process.GetProcessById(id); }
         catch(ArgumentException) { seen.NoteIfAnyBelow(kids,id); continue; }   // exited since the snapshot
         catch(Win32Exception ex) { seen.Note("ancestry-unreadable:kid-open:"+ex.NativeErrorCode); continue; }
-        int parentPid; Int64 created;
-        try {
-          // The first read opens the handle, which this object then keeps, so both reads and any later Kill or wait are about one process.
-          parentPid=ParentPidOf(kid);
-          created=CreatedFileTime(kid);
+        // Every read is on this query-limited handle. It holds the process, and so its pid, until the handle the kill and the wait use is open below, so the reads
+        // and any later Kill or wait are about one process.
+        IntPtr read=OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION,false,id);
+        if(read==IntPtr.Zero) {
+          int error=Marshal.GetLastWin32Error(); kid.Dispose();
+          if(error==ERROR_INVALID_PARAMETER) { seen.NoteIfAnyBelow(kids,id); continue; }   // no process holds the pid: exited since the snapshot
+          seen.Note("ancestry-unreadable:kid-read:"+error); continue;
         }
-        catch(InvalidOperationException) { seen.NoteIfAnyBelow(kids,id); kid.Dispose(); continue; }   // exited since the snapshot
-        catch(Win32Exception ex) { seen.Note("ancestry-unreadable:kid-read:"+ex.NativeErrorCode); kid.Dispose(); continue; }
-        if(parentPid!=parent.Id) { seen.NoteIfAnyBelow(kids,id); kid.Dispose(); continue; }   // the pid changed hands: this process was never in the tree
-        if(StartedBeforeParent(created,parentCreated)) { seen.Note("older-than-parent"); kid.Dispose(); continue; }
-        seen.Members.Add(kid); walk.Enqueue(kid);
+        try {
+          int parentPid; Int64 created; UInt64 sequence;
+          try {
+            parentPid=ParentPidOf(read);
+            created=CreatedFileTime(read);
+            sequence=SequenceOf(read);
+          }
+          catch(Win32Exception ex) { seen.Note("ancestry-unreadable:kid-read:"+ex.NativeErrorCode); kid.Dispose(); continue; }
+          if(parentPid!=parent.Id) { seen.NoteIfAnyBelow(kids,id); kid.Dispose(); continue; }   // the pid changed hands: this process was never in the tree
+          // Older than the parent by the kernel's count: a recycled parent pid, never a child. What the snapshot lists under it has the same lineage, none of it this parent's.
+          if(CreatedBeforeBySequence(sequence,parentSequence)) { kid.Dispose(); continue; }
+          if(StartedBeforeParent(created,parentCreated)) { seen.Note("older-than-parent"); kid.Dispose(); continue; }
+          // A member. Its own handle, the one Kill and the waits use, is opened while 'read' still holds the process.
+          try { GC.KeepAlive(kid.Handle); }
+          catch(InvalidOperationException) { seen.NoteIfAnyBelow(kids,id); kid.Dispose(); continue; }   // exited since the read
+          catch(Win32Exception ex) { seen.Note("ancestry-unreadable:kid-read:"+ex.NativeErrorCode); kid.Dispose(); continue; }
+          seen.Members.Add(kid); walk.Enqueue(kid);
+        } finally { CloseHandle(read); }
       }
     }
     return seen;
