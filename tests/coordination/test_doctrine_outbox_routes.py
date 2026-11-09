@@ -2689,6 +2689,90 @@ def test_a_route_whose_killed_tree_is_not_confirmed_exited_stays_a_status_not_a_
     assert status == "ROUTE_TIMEOUT" and "still active" in detail, (status, detail)
 
 
+# Adversary pass r1 (head e5b969b6): A1 during the retry pause another process replaces the scratch directory with a directory link
+# (a symlink, or a junction where symlink creation is not permitted) to an outside read-only target. The guard ran once at the top,
+# so the next attempt followed the link and _writable_retry made the OUTSIDE target writable. The whole guard runs before EVERY attempt.
+
+def make_directory_link(link: Path, target: Path) -> str:
+    """Make `link` a directory link to `target`; return which kind ('symlink' or 'junction') this host allowed."""
+    try:
+        os.symlink(target, link, target_is_directory=True)
+        return "symlink"
+    except (OSError, NotImplementedError):
+        import _winapi
+        _winapi.CreateJunction(str(target), str(link))
+        return "junction"
+
+
+def swap_scratch_for_link_in_the_pause(monkeypatch, base: Path, target: Path, kinds: list[str]) -> None:
+    """The injected retry-pause seam: the first pause replaces `base` (a real directory) by a link to `target`."""
+    import types
+    real_time = ob.time
+
+    def pause(seconds):
+        if not kinds:
+            shutil.rmtree(base)
+            kinds.append(make_directory_link(base, target))
+
+    monkeypatch.setattr(ob, "time", types.SimpleNamespace(monotonic=real_time.monotonic, sleep=pause))
+
+
+@pytest.fixture
+def outside_readonly_target(tmp_path):
+    import stat
+    target = tmp_path / "outside"
+    target.mkdir()
+    keep = target / "precious.txt"
+    keep.write_text("precious", encoding="utf-8")
+    os.chmod(keep, stat.S_IREAD)
+    os.chmod(target, stat.S_IREAD)
+    yield target, keep
+    os.chmod(target, stat.S_IWRITE | stat.S_IREAD)
+    os.chmod(keep, stat.S_IWRITE | stat.S_IREAD)
+
+
+def attrs_of(path: Path) -> int:
+    info = os.stat(path)
+    return getattr(info, "st_file_attributes", info.st_mode)
+
+
+def test_a_scratch_swapped_for_a_directory_link_during_the_retry_pause_is_never_followed_or_made_writable(tmp_path, monkeypatch, outside_readonly_target):
+    target, keep = outside_readonly_target
+    root = tmp_path / "scratch"
+    base = root / (ob.ROUTE_SCRATCH_PREFIX + "swapped")
+    base.mkdir(parents=True)
+    (base / "child.txt").write_text("c", encoding="utf-8")
+    monkeypatch.setattr(ob.shutil, "rmtree", FlakyScratchRemoval(shutil.rmtree, 1))   # attempt 1: a sharing violation, so the pause runs
+    chmods: list[str] = []
+    real_chmod = os.chmod
+    monkeypatch.setattr(ob.os, "chmod", lambda p, *a, **k: (chmods.append(str(p)), real_chmod(p, *a, **k))[1])
+    kinds: list[str] = []
+    swap_scratch_for_link_in_the_pause(monkeypatch, base, target, kinds)
+    before = attrs_of(target)
+    with pytest.raises(ob.Unknown) as caught:                            # success with the link remaining would be a silent leak
+        ob.remove_exercise_scratch(base, root)
+    assert kinds, "the retry pause never ran: the test did not exercise the swap"
+    assert caught.value.code == "EXERCISE_SCRATCH_NOT_REMOVED" and str(base) in caught.value.detail, (kinds, caught.value)
+    assert not any(Path(p) == base or Path(p) == target or Path(p).is_relative_to(target) for p in chmods), (kinds, chmods)
+    assert keep.read_text(encoding="utf-8") == "precious" and os.path.lexists(base), kinds
+    assert attrs_of(target) == before, f"the outside target was changed ({kinds})"
+
+
+def test_the_rmtree_error_hook_never_makes_a_link_or_anything_under_one_writable(tmp_path, monkeypatch, outside_readonly_target):
+    target, keep = outside_readonly_target
+    root = tmp_path / "scratch"
+    base = root / (ob.ROUTE_SCRATCH_PREFIX + "hook")
+    base.mkdir(parents=True)
+    link = base / "link"
+    kind = make_directory_link(link, target)
+    chmods: list[str] = []
+    monkeypatch.setattr(ob.os, "chmod", lambda p, *a, **k: chmods.append(str(p)))
+    retried: list[str] = []
+    for path in (link, link / "precious.txt"):                           # the link itself, and an entry reached through it
+        ob._writable_retry(lambda p: retried.append(p), str(path), PermissionError(13, "denied"), base)
+    assert chmods == [] and retried == [], (kind, chmods, retried)
+
+
 @pytest.mark.skipif(os.name != "nt", reason="the Job Object exit wait is Windows-only")
 def test_a_timeout_returns_only_after_the_preparations_tree_has_exited(tmp_path, monkeypatch):
     script = tmp_path / "spawn.py"

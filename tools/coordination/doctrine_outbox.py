@@ -3848,8 +3848,37 @@ def _exercise_route_argv(argv: list[str], cwd: pathlib.Path, timeout: float, fil
     return "ROUTE_OK", ""
 
 
-def _writable_retry(func, path, _exc) -> None:
-    """rmtree error hook: git object files are read-only on Windows; make the entry writable and retry once."""
+def _is_link_or_junction(path: str | os.PathLike) -> bool:
+    """True for a symlink or any Windows reparse point (a junction is not a symlink to os.path.islink before 3.12 and to
+    Path.is_symlink always). A path that cannot be read is treated as a link: the caller then refuses to act on it."""
+    try:
+        if os.path.islink(path):
+            return True
+        return bool(getattr(os.lstat(path), "st_file_attributes", 0) & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400))
+    except FileNotFoundError:
+        return False                                                    # nothing there: there is no link to follow
+    except OSError:
+        return True
+
+
+def _inside_a_link(path: str | os.PathLike, base: str | os.PathLike | None) -> bool:
+    """True when `path`, or any directory between it and `base` (inclusive), is a link or junction."""
+    current = os.path.abspath(path)
+    stop = os.path.abspath(base) if base is not None else None
+    while True:
+        if _is_link_or_junction(current):
+            return True
+        parent = os.path.dirname(current)
+        if stop is None or current == stop or parent == current:
+            return False
+        current = parent
+
+
+def _writable_retry(func, path, _exc, base: str | os.PathLike | None = None) -> None:
+    """rmtree error hook: git object files are read-only on Windows; make the entry writable and retry once. It never
+    acts on a link or on anything reached through one (up to `base`): chmod would follow it to a target outside the scratch."""
+    if _inside_a_link(path, base):
+        return                                                          # left for rmtree's own failure to be reported; nothing is changed
     try:
         os.chmod(path, stat.S_IWRITE)
         func(path)
@@ -3857,22 +3886,36 @@ def _writable_retry(func, path, _exc) -> None:
         pass                                                            # the entry went away between the failure and this retry: it is removed
 
 
+def _scratch_guard_holds(base: pathlib.Path, scratch_root: pathlib.Path) -> bool:
+    """The whole guard for removing `base`: directly under `scratch_root`, the run's prefix, a real directory (no symlink,
+    no junction). Judged afresh before every removal attempt: it can change between attempts."""
+    return (base.parent.resolve() == scratch_root.resolve() and base.name.startswith(ROUTE_SCRATCH_PREFIX)
+            and not _is_link_or_junction(base) and base.is_dir())
+
+
 def remove_exercise_scratch(base: pathlib.Path, scratch_root: pathlib.Path) -> None:
     """Remove the scratch directory THIS run made, by name: it must sit directly under `scratch_root`, carry the
-    run's prefix and be a real directory (not a link). Anything else is left alone."""
-    if (base.parent.resolve() != scratch_root.resolve() or not base.name.startswith(ROUTE_SCRATCH_PREFIX)
-            or base.is_symlink() or not base.is_dir()):
+    run's prefix and be a real directory (not a link or junction). Anything else is left alone. The guard is re-run before
+    EVERY attempt: a scratch swapped for a link while a retry paused is never removed or made writable through."""
+    if not _scratch_guard_holds(base, scratch_root):
         return
     deadline = time.monotonic() + ROUTE_SCRATCH_REMOVE_DEADLINE
     failure: OSError
+    first = True
     while True:
+        if not first and os.path.lexists(base) and not _scratch_guard_holds(base, scratch_root):
+            raise Unknown("EXERCISE_SCRATCH_NOT_REMOVED",
+                          f"{base} was replaced by a link or another directory during the removal; it is left alone and behind: {failure}") from failure
+        first = False
         try:
             if sys.version_info >= (3, 12):
-                shutil.rmtree(base, onexc=_writable_retry)
+                shutil.rmtree(base, onexc=lambda f, p, e: _writable_retry(f, p, e, base))
             else:
-                shutil.rmtree(base, onerror=lambda f, p, e: _writable_retry(f, p, e))
-            return
-        except OSError as e:                                            # a just-killed process still holds it (sharing violation 13/32)
+                shutil.rmtree(base, onerror=lambda f, p, e: _writable_retry(f, p, e, base))
+            if not os.path.lexists(base):
+                return
+            failure = OSError(f"{base} still exists after the removal returned")   # a refused link/entry is a failure, never a success
+        except OSError as e:                                           # a just-killed process still holds it (sharing violation 13/32)
             if isinstance(e, FileNotFoundError) and not os.path.lexists(base):
                 return                                                  # the scratch itself is gone; a missing CHILD is only a race, retried
             failure = e
