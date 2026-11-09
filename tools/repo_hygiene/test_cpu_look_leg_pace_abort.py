@@ -190,7 +190,7 @@ def check_main_window_text(text: str) -> list[str]:
         problems.append("the app does not read the pace mode")
     if text.count("playback_frame_range::playSafetyMs( m_playRequestedSeconds, automationPlayPaceMode() )") != 4:
         problems.append("a safety-net budget ignores the pace mode")
-    if "elapsedMs, safetyMs, automationPlayPaceMode() );" not in text:
+    if "elapsedMs, safetyMs, automationPlayPaceMode(), m_playPaceHistory );" not in text:
         problems.append("the stop decision ignores the pace mode")
     if "enginePaceFps > 0.0 ? enginePaceFps : -1.0, automationPlayPaceMode() );" not in text:
         problems.append("the admission ignores the pace mode")

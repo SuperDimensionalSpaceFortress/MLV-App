@@ -104,6 +104,14 @@ LOOKAHEAD_LEGS = ("legs/m16-1243-pace-cinematic-fullscreen-s4-la3.json",)
 # ... and (r2) the stall-stage diagnostic: the owner-shape pace leg at telemetryArm HEAVY, which keeps the per-frame playback_smoke.frame log
 # (LIGHT disables it), so the present that ends a >= 250 ms interval shows its own stage times. Diagnostic only: never a pace number.
 HEAVY_LEGS = ("legs/m16-1243-pace-cinematic-fullscreen-s4-heavy.json",)
+# PLAYBACK-HFR-CONFORM-DEFAULT-1 added the conform legs on the 59.94 fps clip: the scale-1 display cells, cuda only (legsets/hfr-conform.json names them).
+HFR_CONFORM_LEGS = tuple(f"legs/m16-1456-conform-{mode}-s1.json" for mode in ("windowed", "fullscreen"))
+# ... and (PRODUCT-PR-STRANDED-SWEEP-1 r1g) the same two cells on M16-1457, the longer 59.94 fps clip (27.8 s) that meets max(20 s, 25 s window).
+HFR_CONFORM_LEGS_1457 = tuple(f"legs/m16-1457-conform-{mode}-s1.json" for mode in ("windowed", "fullscreen"))
+# HFR-NATIVE-60FPS-FULLRES-1: the native-HFR arm (playbackConform off) on M16-1457: two acceptance cells, the Look Assist off and lookahead 3 levers, and the
+# HEAVY stage-attribution leg (legsets/hfr-native-m16-1457.json names them).
+HFR_NATIVE_LEGS = ("legs/m16-1457-native-fullscreen-s1.json", "legs/m16-1457-native-windowed-s1.json", "legs/m16-1457-native-fullscreen-s1-nola.json",
+                   "legs/m16-1457-native-fullscreen-s1-la3.json", "legs/m16-1457-native-fullscreen-s1-heavy.json")
 # CPU-DUALISO-REDUCED-ISO-NOTCH-1: cpu-only cinematic look legs at playbackProcessing receipt, the only legs that reach the CPU reduced dual-ISO recon.
 CPU_REDUCED_LEGS = tuple(f"legs/m16-1243-cpu-reduced-{mode}-s{scale}.json" for scale in (2, 4) for mode in ("fullscreen", "windowed"))
 # PLAYBACK-LJ92-DECODE-THROUGHPUT-1: the K=1 arm of the raw-uint16 prefetch decoder A/B, one twin per leg it pairs with (the other arm is the leg
@@ -159,8 +167,8 @@ SHIPPED_LEGS = ("legs/m16-1243-speed.json", "legs/m16-1243-look.json", "legs/m16
                 "legs/m16-1243-look-scale2-film.json", "legs/m16-1243-look-scale2-vision50d.json",
                 *(f"legs/m16-1243-look-scale2-{flavor}-agxoff.json" for flavor in ("cinematic", "film", "vision50d")),
                 *(f"legs/m16-1243-display-{mode}-s{scale}-vsync1.json" for scale in (1, 2, 4) for mode in ("fullscreen", "windowed")),
-                *CPU_REDUCED_LEGS, *CPU_REDUCED_PACE_LEGS, *UPSTREAM_BASELINE_LEGS, *PTRACE_LEGS, *VISUAL_LEGS, *VISUAL_TWIN_LEGS, *SCOPE_LEGS, *SCOPE_LA_LEGS, *HEADROOM_LEGS, *PARTITION_LEGS,
-                *IDENTITY_LEGS, *MISSDUMP_LEGS, *Q1_CPU_LOOK_LEGS)
+                *HFR_CONFORM_LEGS, *HFR_CONFORM_LEGS_1457, *HFR_NATIVE_LEGS, *CPU_REDUCED_LEGS, *CPU_REDUCED_PACE_LEGS, *UPSTREAM_BASELINE_LEGS, *PTRACE_LEGS,
+                *VISUAL_LEGS, *VISUAL_TWIN_LEGS, *SCOPE_LEGS, *SCOPE_LA_LEGS, *HEADROOM_LEGS, *PARTITION_LEGS, *IDENTITY_LEGS, *MISSDUMP_LEGS, *Q1_CPU_LOOK_LEGS)
 # PLAYBACK-VSYNC-DEFAULT-1: the swap-interval-1 twins of the six display-matrix legs (the vsync A/B; the originals stay at the app's default 0).
 VSYNC1_LEGS = tuple(rel.replace(".json", "-vsync1.json") for rel in DISPLAY_MATRIX_LEGS)
 # LOOK-ASSIST-FILM-FLAVOR-2 r2: the AgX-off twins of the scale-2 Cinematic and Film legs carry a committed look receipt (look-receipts/agx-off.marxml).
@@ -218,7 +226,10 @@ SHIPPED_LEGS = (*SHIPPED_LEGS, *CHAINATTR_LEGS)
 # arm (generatorArgs.playbackConform is not in this base's schema): the Look Assist OFF arm that hung foregrounding (-nola, a classic leg) and its Look Assist
 # ON Cinematic control. Capture-free paced cuda speed legs at scale 1; LegSpecSchemaTests pins the pair.
 HFR_NATIVE_S1_LEGS = ("legs/m16-1457-native-fullscreen-s1.json", "legs/m16-1457-native-fullscreen-s1-nola.json")
-SHIPPED_LEGS = (*SHIPPED_LEGS, *HFR_NATIVE_S1_LEGS)
+# HFR-NATIVE-60FPS-FULLRES-1 r30 (merge of master into #420): #420 already ships the pair in HFR_NATIVE_LEGS, so each file is listed once (a duplicate
+# made LineEndingsCannotHideACommittedFileTests unlink the same checked-out file twice).
+SHIPPED_LEGS = (*SHIPPED_LEGS, *(rel for rel in HFR_NATIVE_S1_LEGS if rel not in SHIPPED_LEGS))
+assert len(set(SHIPPED_LEGS)) == len(SHIPPED_LEGS), "a shipped leg is listed twice"
 SHIPPED_LEGS_PS =", ".join(f"'{rel}'" for rel in SHIPPED_LEGS)
 OTHER_CLIP = "Z99-9999"
 MLV_EXT = "." + "mlv"  # never spelled as one literal token (the NA-4 gate trips on fixture basenames)
@@ -718,6 +729,23 @@ class GeneratorByteIdentityAndVariantTests(unittest.TestCase):
                 self.assertEqual(text.count(f"'MLVAPP_SWAP_INTERVAL={interval}',"), 1, name)
                 self.assertIn(f"'MLVAPP_PLAYBACK_PHASE3_UNATTENDED=1',\n    'MLVAPP_SWAP_INTERVAL={interval}',", text.replace("\r\n", "\n"), name)
 
+    def test_a_playback_conform_arm_reaches_the_apps_env_only_when_asked(self) -> None:
+        """HFR-NATIVE-60FPS-FULLRES-1: -PlaybackConform off|on adds MLVAPP_PLAYBACK_CONFORM=0|1 to the app's env list (the native-HFR arm and the
+        conform arm), for a pace leg and the default job alike; absent, the job is the text it was (the env line is the only difference)."""
+        plain = self.generate(GENERATOR, "pc-plain.job.ps1", []).read_text(encoding="utf-8").replace("\r\n", "\n")
+        self.assertNotIn("MLVAPP_PLAYBACK_CONFORM", plain)
+        for arm, value in (("off", "0"), ("on", "1")):
+            line = f"    'MLVAPP_PLAYBACK_CONFORM={value}',\n"
+            job = self.generate(GENERATOR, f"pc-{arm}.job.ps1", ["-PlaybackConform", arm])
+            self.assertEqual(self.parse_errors(job), 0, arm)
+            text = job.read_text(encoding="utf-8").replace("\r\n", "\n")
+            self.assertEqual(text.count(f"'MLVAPP_PLAYBACK_CONFORM={value}',"), 1, arm)
+            self.assertIn("'MLVAPP_PLAYBACK_PHASE3_UNATTENDED=1',\n" + line, text, arm)
+            self.assertEqual(text.replace(line, ""), plain, f"{arm}: the env line is the only difference from the plain job")
+        pace = self.generate(GENERATOR, "pc-pace.job.ps1", ["-ForceLookAssist", "-LookPaceLeg", "-LookFlavor", "cinematic", "-PlaybackConform", "off"])
+        self.assertEqual(self.parse_errors(pace), 0)
+        self.assertEqual(pace.read_text(encoding="utf-8").count("'MLVAPP_PLAYBACK_CONFORM=0',"), 1)
+
     def test_the_cuda_launch_timer_reaches_the_apps_env_only_when_asked(self) -> None:
         """GPU-EVENT153-ROOTCAUSE-2: -CudaLaunchTimingMinMs <ms> adds MLVAPP_CUDA_LAUNCH_TIMING=1 and its line threshold (an
         invariant-culture decimal) to the app's env list; absent, the job is the text it was. The runner maps the leg's
@@ -745,6 +773,17 @@ class GeneratorByteIdentityAndVariantTests(unittest.TestCase):
         schema = json.loads((DV / "leg-spec.schema.json").read_text(encoding="utf-8"))
         prop = schema["properties"]["generatorArgs"]["properties"]["cudaLaunchTimingMinMs"]
         self.assertEqual((prop["type"], prop["minimum"], prop["maximum"]), ("number", 0, 10000))
+
+    def test_the_runner_passes_a_legs_playback_conform_to_the_generator(self) -> None:
+        """HFR-NATIVE-60FPS-FULLRES-1: the schema's playbackConform maps to the generator's -PlaybackConform for any leg type, exactly like swapInterval."""
+        runner = (DV / "Invoke-VenueLeg.ps1").read_text(encoding="utf-8")
+        mapping = "if ($spec.generatorArgs.PSObject.Properties['playbackConform']) { $gen['PlaybackConform'] = [string]$spec.generatorArgs.playbackConform }"
+        self.assertIn(mapping, runner)
+        self.assertLess(runner.index(mapping), runner.index("if (-not $isLook -and $spec.generatorArgs.PSObject.Properties['forceLookAssist']"),
+                        "the mapping must sit outside the forceLookAssist branch")
+        schema = json.loads((DV / "leg-spec.schema.json").read_text(encoding="utf-8"))
+        self.assertEqual(schema["properties"]["generatorArgs"]["properties"]["playbackConform"]["enum"], ["on", "off"])
+        self.assertRegex(GENERATOR.read_text(encoding="utf-8"), r"\[ValidateSet\('', 'on', 'off', IgnoreCase = \$false\)\]\s+\[string\]\$PlaybackConform = ''")
 
     def test_the_present_trace_reaches_the_apps_env_only_when_asked(self) -> None:
         """PLAYBACK-STARTUP-CATCHUP-BURST-1 r7: -PresentTrace adds MLVAPP_PLAYBACK_PRESENT_TRACE=1 to the app's env list; absent, the job is
@@ -1291,7 +1330,7 @@ switch ($cfg.mainMode) {
 # The stub records every named argument it was handed (so a test can see that the runner passed a clip ID and a play
 # window, and never a path), and can be told to refuse the way the real generator does.
 STUB_GENERATOR = r"""
-param($SourceCommit,$BuildManifestSha256,$ClipId,$FixtureSha256,$OutFile,$RepoRoot,$Venue,$Backend,$ScaleFactor,$TelemetryArm,$CpuQuiescenceThresholdPercent,[switch]$ContactSheet,$ContactSheetFrames,[switch]$ForceLookAssist,$LookFlavor,$VenueTablePath,$PlaySeconds,$ExpectedScaleRequest,$DisplayMode,[switch]$VisualCapture,$AutomationSettingsDir,$GpuPreLaunches)
+param($SourceCommit,$BuildManifestSha256,$ClipId,$FixtureSha256,$OutFile,$RepoRoot,$Venue,$Backend,$ScaleFactor,$TelemetryArm,$CpuQuiescenceThresholdPercent,[switch]$ContactSheet,$ContactSheetFrames,[switch]$ForceLookAssist,$LookFlavor,$VenueTablePath,$PlaySeconds,$ExpectedScaleRequest,$DisplayMode,$PlaybackConform,[switch]$VisualCapture,$AutomationSettingsDir,$GpuPreLaunches)
 $cfg = Get-Content -LiteralPath $env:DVE_STUB -Raw | ConvertFrom-Json
 Add-Content -LiteralPath $cfg.genLog -Value (($PSBoundParameters.Keys | Sort-Object | ForEach-Object { $_ + '=' + $PSBoundParameters[$_] }) -join ';')
 if ($cfg.genRefusal) { throw $cfg.genRefusal }
@@ -1379,7 +1418,8 @@ class RunnerHarness:
         self.consent.write_text(json.dumps(consent_file(*records, blankets=blankets)), encoding="utf-8")
 
     def write_spec(self, card: str = "DUAL-VENUE-EVIDENCE-1", clip: str = OWNER_CLIP, leg_type: str = "speed", play_seconds: int | None = 25,
-                   flavor: str = "classic", scale: int = 4, accepted: dict | None = None, leg_id: str = "unit-leg", display_mode: str | None = None) -> Path:
+                   flavor: str = "classic", scale: int = 4, accepted: dict | None = None, leg_id: str = "unit-leg", display_mode: str | None = None,
+                   generator_args: dict | None = None) -> Path:
         spec = {
             "schema": "mlv-app/dual-venue-leg/v1", "legId": leg_id, "card": card, "legType": leg_type, "clipId": clip,
             "backends": ["cuda", "cpu"], "scaleFactor": scale,
@@ -1395,7 +1435,9 @@ class RunnerHarness:
             spec["acceptedEffectiveScale"] = accepted
         if display_mode is not None:
             spec["displayMode"] = display_mode
-        suffix = ("" if display_mode is None else f"-dm{display_mode}") + (("" if flavor == "classic" else f"-{flavor}") + ("" if scale == 4 else f"-s{scale}") + ("" if leg_id == "unit-leg" else f"-{leg_id}")
+        if generator_args is not None:
+            spec["generatorArgs"] = generator_args
+        suffix = ("" if display_mode is None else f"-dm{display_mode}") + ("" if generator_args is None else "-ga" + hashlib.sha1(json.dumps(generator_args, sort_keys=True).encode()).hexdigest()[:8]) + (("" if flavor == "classic" else f"-{flavor}") + ("" if scale == 4 else f"-s{scale}") + ("" if leg_id == "unit-leg" else f"-{leg_id}")
                   + ("" if accepted is None else "-acc" + "".join(f"{k}{v}" for k, v in sorted(accepted.items()))))
         path = self.tmp / f"spec-{card}-{clip}-{leg_type}-{play_seconds}{suffix}.json"
         path.write_text(json.dumps(spec), encoding="utf-8")
@@ -5227,6 +5269,232 @@ class DisplayModeIsRequestedAndObservedTests(EvidenceFactory, ModuleMutationMixi
                          "with the derivation removed the forged PASS re-derives; so the derivation is what refuses it")
 
 
+def conform_line(session: int = 3, clip: str = "23.976", play: str = "23.976", active: int = 0, env_override: int | None = 0) -> str:
+    """The app's playback_smoke.conform line (platform/qt/MainWindow.cpp); env_override None leaves conform_env_override out (a build before it)."""
+    line = f"playback_smoke.conform session={session} clip_fps={clip} playback_fps={play} conform_active={active} conform_enabled={active}"
+    return line + ("" if env_override is None else f" conform_env_override={env_override}")
+
+
+@requires_windows_pwsh
+class ConformArmIsHonouredTests(EvidenceFactory, ModuleMutationMixin, unittest.TestCase):
+    """HFR-NATIVE-60FPS-FULLRES-1: a leg's generatorArgs.playbackConform reaches the generator as -PlaybackConform (the app's MLVAPP_PLAYBACK_CONFORM), and the
+    leg FAILS CLOSED when the run log does not prove the app played under that arm: 'off' needs the measured session's conform line with conform_active=0,
+    conform_env_override=0 and playback_fps within 0.5 % of clip_fps; 'on' needs conform_active=1. Otherwise INVALID CONFORM_ARM_NOT_HONOURED, with the requested
+    and observed values in the detail. A leg that names no arm is unchanged."""
+
+    def setUp(self) -> None:
+        self.make_harness()
+
+    def leg(self, arm: str | None, lines: list[str], **opts):
+        self.write_artifacts(extra_log_lines=lines)
+        args = None if arm is None else {"playbackConform": arm}
+        return self.run_leg("ultra-magnus", self.write_spec(generator_args=args), extra=["-Backend", "cpu"], **opts)
+
+    def test_an_absent_arm_asks_the_generator_for_nothing_and_is_unchanged(self) -> None:
+        _, receipt, _ = self.leg(None, [])
+        self.assertEqual(receipt["outcome"], "PASS", receipt["outcomeDetail"])
+        self.assertNotIn("PlaybackConform", self.generator_calls()[-1])
+
+    def test_the_arm_reaches_the_generator(self) -> None:
+        self.leg("off", [conform_line()])
+        self.assertIn("PlaybackConform=off", self.generator_calls()[-1])
+
+    def test_a_native_leg_that_ran_native_passes(self) -> None:
+        _, receipt, _ = self.leg("off", [conform_line()])
+        self.assertEqual(receipt["outcome"], "PASS", receipt["outcomeDetail"])
+
+    def test_a_native_leg_that_ran_conformed_is_invalid(self) -> None:
+        proc, receipt, _ = self.leg("off", [conform_line(active=1, env_override=-1)])
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertEqual(receipt["outcome"], "INVALID", receipt["outcomeDetail"])
+        self.assertIn("CONFORM_ARM_NOT_HONOURED", receipt["outcomeDetail"])
+        self.assertIn("requested playbackConform=off", receipt["outcomeDetail"])
+        self.assertIn("conform_active=1", receipt["outcomeDetail"])
+
+    def test_a_native_leg_whose_playback_fps_is_off_the_clip_fps_by_more_than_half_a_percent_is_invalid(self) -> None:
+        _, receipt, _ = self.leg("off", [conform_line(play="24.200")])
+        self.assertEqual(receipt["outcome"], "INVALID", receipt["outcomeDetail"])
+        self.assertIn("CONFORM_ARM_NOT_HONOURED", receipt["outcomeDetail"])
+        self.assertIn("playback_fps is not within 0.5 % of clip_fps", receipt["outcomeDetail"])
+
+    def test_a_native_leg_with_a_non_finite_rate_is_invalid(self) -> None:
+        """MERGE-MASTER r3 (adversary A4): NaN / Infinity parse as doubles and every ordered comparison against them is false, so they slipped the 0.5 % check."""
+        for clip, play in (("59.940", "NaN"), ("Infinity", "24.000"), ("NaN", "NaN")):
+            _, receipt, _ = self.leg("off", [conform_line(clip=clip, play=play)])
+            self.assertEqual(receipt["outcome"], "INVALID", (clip, play, receipt["outcomeDetail"]))
+            self.assertIn("playback_fps is not within 0.5 % of clip_fps", receipt["outcomeDetail"], (clip, play))
+
+    def test_a_native_leg_whose_app_did_not_see_the_env_is_invalid(self) -> None:
+        for override in (-1, None):
+            _, receipt, _ = self.leg("off", [conform_line(env_override=override)])
+            self.assertEqual(receipt["outcome"], "INVALID", (override, receipt["outcomeDetail"]))
+            self.assertIn("MLVAPP_PLAYBACK_CONFORM=0", receipt["outcomeDetail"], override)
+
+    def test_a_native_leg_with_no_conform_line_for_the_measured_session_is_invalid(self) -> None:
+        for lines in ([], [conform_line(session=1)]):
+            _, receipt, _ = self.leg("off", lines)
+            self.assertEqual(receipt["outcome"], "INVALID", (lines, receipt["outcomeDetail"]))
+            self.assertIn("CONFORM_ARM_NOT_HONOURED", receipt["outcomeDetail"])
+
+    def test_a_conform_leg_needs_conform_active(self) -> None:
+        _, receipt, _ = self.leg("on", [conform_line(active=0, env_override=1)])
+        self.assertEqual(receipt["outcome"], "INVALID", receipt["outcomeDetail"])
+        self.assertIn("conform was not active", receipt["outcomeDetail"])
+        # MERGE-MASTER r7 (sol r6 B1): conform_active=1 on a 23.976 clip played at 23.976 is native-rate playback, not a conform (before r7 it PASSED).
+        _, receipt, _ = self.leg("on", [conform_line(active=1, env_override=1)])
+        self.assertEqual(receipt["outcome"], "INVALID", receipt["outcomeDetail"])
+        self.assertIn("no conform is proven", receipt["outcomeDetail"])
+        # the active conform that actually conformed (59.94 clip played at 24, engine paced at 24) passes
+        self.write_artifacts(line={"native_fps": "59.940", "pace_fps": "24.000"}, extra_log_lines=[conform_line(clip="59.940", play="24.000", active=1, env_override=1)])
+        _, receipt, _ = self.run_leg("ultra-magnus", self.write_spec(generator_args={"playbackConform": "on"}), extra=["-Backend", "cpu"])
+        self.assertEqual(receipt["outcome"], "PASS", receipt["outcomeDetail"])
+
+    # MERGE-MASTER r4 (Dot / adversary ADV-A1): an HFR run whose engine paced at the native 59.94 and whose measured-session conform line says
+    # conform_active=1 but carries a rate that cannot PROVE the conformed pace. Before r4 the 'on' arm checked conform_active only and the playback
+    # block fell back to the native pace rule, so each of these was valid=true, paceRule=native, and the leg PASSED.
+    HFR_NATIVE_PACE = {"native_fps": "59.940", "pace_fps": "59.940"}
+    UNPROVEN_ON_ARMS = (
+        ("playback NaN", [conform_line(clip="59.940", play="NaN", active=1, env_override=1)]),
+        ("playback +Infinity", [conform_line(clip="59.940", play="Infinity", active=1, env_override=1)]),
+        ("playback -Infinity", [conform_line(clip="59.940", play="-Infinity", active=1, env_override=1)]),
+        ("playback 0", [conform_line(clip="59.940", play="0", active=1, env_override=1)]),
+        ("playback negative", [conform_line(clip="59.940", play="-24.000", active=1, env_override=1)]),
+        ("clip NaN", [conform_line(clip="NaN", play="24.000", active=1, env_override=1)]),
+        ("clip +Infinity", [conform_line(clip="Infinity", play="24.000", active=1, env_override=1)]),
+        ("playback the engine did not pace at", [conform_line(clip="59.940", play="24.000", active=1, env_override=1)]),
+        ("a sound rate from another session only", [conform_line(session=1, clip="59.940", play="59.940", active=1, env_override=1),
+                                                    conform_line(clip="59.940", play="NaN", active=1, env_override=1)]),
+        # MERGE-MASTER r7 (sol r6 B1, Dot ask 6545453593): sol's leg -- active conform at the native rate, the engine paced at 59.94: no conform happened.
+        ("native rate, no conform happened", [conform_line(clip="59.940", play="59.940", active=1, env_override=1)]),
+        # MERGE-MASTER r8 (sol r7 B1, issuecomment-6549349607): stacked tolerances -- clip 60 (0.06 off native), playback 59.69 (0.25 off pace, under 60 x 0.995),
+        # engine pace = native = 59.94. Before r8 the leg PASSED (proven, honoured, valid); key3 CONFORM-PROOF-CLIP-NATIVE-EXACT-1: clip one print unit off native.
+        ("sol r7: native engine pace with tolerated clip / playback discrepancies", [conform_line(clip="60.000", play="59.690", active=1, env_override=1)]),
+    )
+
+    def test_a_conform_leg_whose_conformed_rate_is_not_proven_fails_closed(self) -> None:
+        for name, lines in self.UNPROVEN_ON_ARMS:
+            with self.subTest(name):
+                self.write_artifacts(line=self.HFR_NATIVE_PACE, extra_log_lines=lines)
+                _, receipt, _ = self.run_leg("ultra-magnus", self.write_spec(generator_args={"playbackConform": "on"}), extra=["-Backend", "cpu"])
+                self.assertEqual(receipt["outcome"], "INVALID", receipt["outcomeDetail"])
+                self.assertFalse(receipt["playback"]["valid"], receipt["playback"])
+                self.assertTrue(any("CONFORM_PACE_NOT_PROVEN" in r for r in receipt["playback"]["invalidReasons"]), receipt["playback"]["invalidReasons"])
+
+    def test_a_sound_hfr_conform_leg_still_passes(self) -> None:
+        """The control: native 59.94 conformed to 24 (engine paced at 24, the conform line says so) is the proven shape."""
+        self.write_artifacts(line={"native_fps": "59.940", "pace_fps": "24.000"}, extra_log_lines=[conform_line(clip="59.940", play="24.000", active=1, env_override=1)])
+        _, receipt, _ = self.run_leg("ultra-magnus", self.write_spec(generator_args={"playbackConform": "on"}), extra=["-Backend", "cpu"])
+        self.assertEqual(receipt["outcome"], "PASS", receipt["outcomeDetail"])
+        self.assertEqual((receipt["playback"]["valid"], receipt["playback"]["paceRule"]), (True, "conform"))
+
+    def test_the_on_arm_verdict_needs_the_conform_pace_proof(self) -> None:
+        """Get-DvConformArmVerdict, pure: 'on' blocks unless Get-DvConformPaceProof proves the conformed pace (NaN, +-Infinity, 0, negative, another session)."""
+        base = dict(conformLinePresent=True, summarySession="3", conformSession="3", conformActive=1, conformEnvOverride=1, nativeFps=59.94, paceFps=59.94)
+        rows = [("NaN", dict(base, conformClipFps=59.94, conformPlaybackFps="NaN")), ("+Inf", dict(base, conformClipFps=59.94, conformPlaybackFps="Infinity")),
+                ("-Inf", dict(base, conformClipFps=59.94, conformPlaybackFps="-Infinity")), ("zero", dict(base, conformClipFps=59.94, conformPlaybackFps=0)),
+                ("negative", dict(base, conformClipFps=59.94, conformPlaybackFps=-24)), ("clip NaN", dict(base, conformClipFps="NaN", conformPlaybackFps=24)),
+                ("pace NaN", dict(base, paceFps="NaN", conformClipFps=59.94, conformPlaybackFps=24)),
+                ("another session", dict(base, conformSession="1", conformClipFps=59.94, conformPlaybackFps=59.94)),
+                # MERGE-MASTER r7 (sol r6 B1): sol's literal row, native = pace = clip = playback = 59.94 with conform_active=1
+                ("native rate", dict(base, conformClipFps=59.94, conformPlaybackFps=59.94)),
+                # MERGE-MASTER r8 (sol r7 B1): the stacked-tolerance repro, the clip one print unit off native under a real 24-fps conform, and engine pace at native
+                ("sol r7 stack", dict(base, conformClipFps=60.0, conformPlaybackFps=59.69)),
+                ("clip off native by a print unit", dict(base, paceFps=24.0, conformClipFps=59.941, conformPlaybackFps=24.0)),
+                ("engine pace at native", dict(base, paceFps=59.90, conformClipFps=59.94, conformPlaybackFps=59.63)),
+                ("sound", dict(base, paceFps=24.0, conformClipFps=59.94, conformPlaybackFps=24.0))]
+        proc, out = run_pwsh_json("$rows = $env:DVE_ROWS | ConvertFrom-Json; $spec = [pscustomobject]@{ generatorArgs = [pscustomobject]@{ playbackConform = 'on' } }\n"
+                                  "@($rows | ForEach-Object { $v = Get-DvConformArmVerdict -Spec $spec -Playback $_.block; [pscustomobject]@{ name = $_.name; blocks = $v.blocks; reason = [string]$v.reason } }) | ConvertTo-Json -Compress",
+                                  DVE_ROWS=json.dumps([{"name": n, "block": b} for n, b in rows]))
+        self.assertIsNotNone(out, proc.stdout + proc.stderr)
+        got = {r["name"]: r for r in out}
+        for name, _ in rows:
+            with self.subTest(name):
+                self.assertEqual(got[name]["blocks"], name != "sound", got[name]["reason"])
+
+    def test_the_off_arm_verdict_needs_the_conform_rates_to_be_the_engines(self) -> None:
+        """HFR-NATIVE-60FPS-FULLRES-1 r26 (adversary A2 on be20bc59): 'off' checked playback_fps against clip_fps only, so a conform line that contradicts the
+        summary's own rates (native = pace = 59.94, clip = playback = 24) was honoured. The native arm is proven only when clip_fps IS native_fps (print
+        precision, as Get-DvConformPaceProof) and playback_fps is within 0.5 % of the engine's pace_fps."""
+        base = dict(conformLinePresent=True, summarySession="3", conformSession="3", conformActive=0, conformEnvOverride=0, nativeFps=59.94, paceFps=59.94)
+        rows = [("sol A2 literal: 24/24 line under a 59.94 engine", dict(base, conformClipFps=24.0, conformPlaybackFps=24.0)),
+                ("clip is native, playback is not the engine pace", dict(base, paceFps=24.0, conformClipFps=59.94, conformPlaybackFps=59.94)),
+                ("clip one print unit off native", dict(base, conformClipFps=59.941, conformPlaybackFps=59.94)),
+                ("native NaN", dict(base, nativeFps="NaN", conformClipFps=59.94, conformPlaybackFps=59.94)),
+                ("pace absent", dict({k: v for k, v in base.items() if k != "paceFps"}, conformClipFps=59.94, conformPlaybackFps=59.94)),
+                ("pace zero", dict(base, paceFps=0, conformClipFps=59.94, conformPlaybackFps=59.94)),
+                ("sound hfr", dict(base, conformClipFps=59.94, conformPlaybackFps=59.94)),
+                ("sound 23.976", dict(base, nativeFps=23.976, paceFps=23.976, conformClipFps=23.976, conformPlaybackFps=23.976))]
+        proc, out = run_pwsh_json("$rows = $env:DVE_ROWS | ConvertFrom-Json; $spec = [pscustomobject]@{ generatorArgs = [pscustomobject]@{ playbackConform = 'off' } }\n"
+                                  "@($rows | ForEach-Object { $v = Get-DvConformArmVerdict -Spec $spec -Playback $_.block; [pscustomobject]@{ name = $_.name; blocks = $v.blocks; reason = [string]$v.reason } }) | ConvertTo-Json -Compress",
+                                  DVE_ROWS=json.dumps([{"name": n, "block": b} for n, b in rows]))
+        self.assertIsNotNone(out, proc.stdout + proc.stderr)
+        got = {r["name"]: r for r in out}
+        for name, _ in rows:
+            with self.subTest(name):
+                self.assertEqual(got[name]["blocks"], not name.startswith("sound"), got[name]["reason"])
+
+    def test_the_production_validator_fails_closed_on_an_unproven_conform_arm(self) -> None:
+        spec = self.write_spec(generator_args={"playbackConform": "on"})
+        repo = self.prod_repo(spec=spec)
+        cases = []
+        # MERGE-MASTER r7 (sol r6 B1): the 'sound' row was a 23.976 clip played at 23.976 with conform_active=1 -- native-rate playback, which the validator
+        # now refuses ('native'); the sound row is a real conform (59.94 clip played and paced at 24).
+        hfr24 = {"native_fps": "59.940", "pace_fps": "24.000"}
+        for name, line, summary in (("sound", conform_line(clip="59.940", play="24.000", active=1, env_override=1), hfr24),
+                                    ("nan", conform_line(clip="23.976", play="NaN", active=1, env_override=1), None),
+                                    ("native", conform_line(clip="23.976", play="23.976", active=1, env_override=1), None)):
+            ev = self.evidence("pcon-" + name, backend="cuda", extra_log_lines=[line], line=summary)
+            cases.append((self.receipt_for(repo, ev, backend="cuda"), ev))
+        sound, nan, native = self.status_batch(repo, cases)
+        self.expect(sound, "ADVISORY", "sound")
+        self.expect(nan, "INVALID", "nan", needle="CONFORM_PACE_NOT_PROVEN")
+        self.expect(native, "INVALID", "native", needle="no conform is proven")
+
+    def test_the_production_validator_re_derives_the_verdict(self) -> None:
+        spec = self.write_spec(generator_args={"playbackConform": "off"})
+        repo = self.prod_repo(spec=spec)
+        cases = []
+        for name, line in (("native", conform_line()), ("conformed", conform_line(active=1, env_override=-1))):
+            ev = self.evidence("pc-" + name, backend="cuda", extra_log_lines=[line])
+            cases.append((self.receipt_for(repo, ev, backend="cuda"), ev))
+        native, conformed = self.status_batch(repo, cases)
+        self.expect(native, "ADVISORY", "native")
+        self.expect(conformed, "INVALID", "conformed", needle="CONFORM_ARM_NOT_HONOURED")
+
+    def test_r19_sol_b2_the_leg_verdict_judges_the_measured_conform_fields(self) -> None:
+        """r19 (sol r18 B2): Invoke-VenueLeg's own criteria verdict sees the run log's measured conform fields. A conform leg whose criteria are the
+        committed CONFORM_MEASURED_CRITERIA PASSES on the sound conformed run and FAILS on sol's fixture and on a line without the fields."""
+        spec_path = self.write_spec(generator_args={"playbackConform": "on"}, leg_id="r19-conform-measured")
+        spec = json.loads(spec_path.read_text(encoding="utf-8"))
+        for role in ("acceptance", "supplementary"):
+            spec["criteria"][role]["cpu"] = list(CONFORM_MEASURED_CRITERIA)
+        spec_path.write_text(json.dumps(spec), encoding="utf-8")
+        hfr24 = {"native_fps": "59.940", "pace_fps": "24.000"}
+        base = conform_line(clip="59.940", play="24.000", active=1, env_override=1)
+        for name, measured, outcome, needles in (
+                # r29 (adversary A2 on cf403dba): the line carries the painted coverage's ends and the engine's last target (the summary here
+                # reports source_advanced=960 from frame 0: the engine reached 959)
+                # r30 (Dot D2 on 71104385): and backward (the painted frames' backward steps; 0 = no seek)
+                ("sound", " audio_sync_requests=0 source_advanced=959 source_fps=24.000 max_jump=1 first_frame=0 last_frame=959 engine_target=959 backward=0", "PASS", ()),
+                ("sol r18 B2", " audio_sync_requests=1 source_advanced=959 source_fps=33.600 max_jump=2 first_frame=0 last_frame=959 engine_target=959 backward=0", "FAIL", ("conformSourceFps le 24.72", "conformMaxJump eq 1", "conformAudioSyncRequests eq 0")),
+                ("no measured fields", "", "FAIL", ("does not carry the field",))):
+            with self.subTest(name):
+                self.write_artifacts(line=hfr24, extra_log_lines=[base + measured])
+                _, receipt, _ = self.run_leg("ultra-magnus", spec_path, extra=["-Backend", "cpu"])
+                self.assertEqual(receipt["outcome"], outcome, receipt["outcomeDetail"])
+                self.assertEqual((receipt["playback"]["valid"], receipt["playback"]["paceRule"]), (True, "conform"), receipt["playback"])
+                for needle in needles:
+                    self.assertIn(needle, receipt["outcomeDetail"])
+                # receipt.metrics stays the verbatim summary metrics: the conform fields live in the playback block only
+                self.assertNotIn("conformSourceFps", receipt["metrics"])
+
+    def test_mutation_without_the_runner_gate_a_native_leg_that_ran_conformed_passes(self) -> None:
+        dv = self.mutated_runner([("Invoke-VenueLeg.ps1", "    if ($conformArm.blocks) {", "    if ($false) {")])
+        self.write_artifacts(extra_log_lines=[conform_line(active=1, env_override=-1)])
+        _, receipt, _ = self.run_leg("ultra-magnus", self.write_spec(generator_args={"playbackConform": "off"}), extra=["-Backend", "cpu"], dv=dv)
+        self.assertEqual(receipt["outcome"], "PASS", "with the gate removed the conformed run passes; so the gate is what stops it")
+
+
 def run_pwsh_json(script: str, **env: str):
     """Run a PowerShell snippet that imports the runner module and prints one JSON document; returns (CompletedProcess, parsed)."""
     proc = run_pwsh(["-Command", f"Import-Module '{DV / 'DualVenueRunner.psm1'}' -Force\n" + script], env_extra=env)
@@ -7086,6 +7354,105 @@ class LegSpecSchemaTests(unittest.TestCase):
             base["generatorArgs"].pop("telemetryArm")
             self.assertEqual(dict(arm, legId=base["legId"]), base, rel)
 
+    def test_every_leg_on_the_59_94_fps_clips_names_its_conform_arm(self) -> None:
+        """HFR-NATIVE-60FPS-FULLRES-1 r20 (adversary A2 on ce603f37): this PR makes conform the app's default above 30 fps, so a leg on a 59.94 fps clip that
+        names no arm (generatorArgs.playbackConform) silently plays at 24 fps. Get-DvConformArmVerdict has nothing to check, the conform pace rule passes it, and
+        a leg called native reports a 24 fps run as its evidence. So every such leg names its arm: 'on' for a conform leg, 'off' for every other one."""
+        legs = sorted((DV / "legs").glob("m16-145[67]-*.json"))
+        self.assertGreater(len(legs), 20)
+        for path in legs:
+            leg = json.loads(path.read_text(encoding="utf-8"))
+            self.assertEqual(leg["generatorArgs"].get("playbackConform"), "on" if "-conform-" in path.name else "off", path.name)
+
+    def test_each_hfr_conform_leg_is_its_display_cell_on_the_hfr_clip_on_cuda(self) -> None:
+        """PLAYBACK-HFR-CONFORM-DEFAULT-1: a conform leg is its scale-1 display-matrix cell with only the legId, card, clip and backends (cuda) changed, so its
+        numbers compare with the matrix cell's; the leg set names exactly these legs and the card's roles are declared.
+        HFR-NATIVE-60FPS-FULLRES-1-MERGE-MASTER r3 (adversary A1): each conform leg also requests playbackConform 'on', so a venue whose environment carries
+        MLVAPP_PLAYBACK_CONFORM=0 cannot pass a native run as conform evidence (CONFORM_ARM_NOT_HONOURED); every *-conform-* leg on disk is one of these."""
+        on_disk = sorted(f"legs/{p.name}" for p in (DV / "legs").glob("*-conform-*.json"))
+        self.assertEqual(on_disk, sorted((*HFR_CONFORM_LEGS, *HFR_CONFORM_LEGS_1457)))
+        for rel in (*HFR_CONFORM_LEGS, *HFR_CONFORM_LEGS_1457):
+            leg = json.loads((DV / rel).read_text(encoding="utf-8"))
+            self.jsonschema.validate(leg, self.schema)
+            self.assertEqual(leg["generatorArgs"].get("playbackConform"), "on", rel)
+            cell = json.loads((DV / "legs" / f"m16-1243-display-{leg['displayMode']}-s1.json").read_text(encoding="utf-8"))
+            self.assertEqual((leg["legId"], leg["card"], leg["clipId"], leg["backends"]),
+                             (Path(rel).stem, "PLAYBACK-HFR-CONFORM-DEFAULT-1", "M16-" + Path(rel).stem[4:8], ["cuda"]), rel)
+            # r19 (sol r18 B2): plus the measured conform criteria (source_fps band, max_jump 1, no audio sync), appended in both roles
+            cell_cuda = dict(cell, criteria={role: {"cuda": per["cuda"] + CONFORM_MEASURED_CRITERIA} for role, per in cell["criteria"].items()})
+            cell_cuda["generatorArgs"] = dict(cell["generatorArgs"], playbackConform="on")
+            self.assertEqual(dict(leg, legId=cell["legId"], card=cell["card"], clipId=cell["clipId"], backends=cell["backends"]), cell_cuda, rel)
+        for name, clip, legs in (("hfr-conform", "M16-1456", HFR_CONFORM_LEGS), ("hfr-conform-m16-1457", "M16-1457", HFR_CONFORM_LEGS_1457)):
+            doc = json.loads((DV / "legsets" / f"{name}.json").read_text(encoding="utf-8"))
+            self.assertEqual((doc["legSet"], doc["card"], doc["clipId"], sorted(doc["legs"])), (name, "PLAYBACK-HFR-CONFORM-DEFAULT-1", clip, sorted(legs)))
+        roles = json.loads((DV / "venues.json").read_text(encoding="utf-8"))["roles"]
+        self.assertEqual(roles["PLAYBACK-HFR-CONFORM-DEFAULT-1"], {"bachelor": "acceptance", "ultra-magnus": "supplementary"})
+
+    def test_the_native_hfr_legs_are_the_native_arm_on_m16_1457_and_the_leg_set_names_them(self) -> None:
+        """HFR-NATIVE-60FPS-FULLRES-1: every native leg is a capture-free cuda speed leg at scale 1 on M16-1457 (never M16-1456: 16.2 s native is under the
+        20 s floor) with playbackConform off; each lever differs from the full-screen acceptance cell only in its legId and its one lever arg."""
+        base = json.loads((DV / "legs" / "m16-1457-native-fullscreen-s1.json").read_text(encoding="utf-8"))
+        self.assertEqual(base["generatorArgs"], {"telemetryArm": "LIGHT", "cpuQuiescenceThresholdPercent": 95, "forceLookAssist": True,
+                                                 "lookFlavor": "cinematic", "playbackConform": "off"})
+        pace = json.loads((DV / "legs" / "m16-1243-pace-cinematic-fullscreen-s4.json").read_text(encoding="utf-8"))
+        self.assertEqual(base["criteria"], {role: {"cuda": per["cuda"]} for role, per in pace["criteria"].items()}, "criteria are the pace leg's cuda block")
+        for rel in HFR_NATIVE_LEGS:
+            leg = json.loads((DV / rel).read_text(encoding="utf-8"))
+            self.jsonschema.validate(leg, self.schema)
+            self.assertEqual((leg["legId"], leg["card"], leg["legType"], leg["clipId"], leg["playSeconds"], leg["backends"], leg["scaleFactor"]),
+                             (Path(rel).stem, "HFR-NATIVE-60FPS-FULLRES-1", "speed", "M16-1457", 25, ["cuda"], 1), rel)
+            self.assertEqual(leg["generatorArgs"]["playbackConform"], "off", rel)
+            self.assertNotIn("look", leg, rel)
+        load = lambda stem: json.loads((DV / "legs" / f"{stem}.json").read_text(encoding="utf-8"))
+        self.assertEqual(dict(load("m16-1457-native-windowed-s1"), legId=base["legId"], displayMode="fullscreen"), base)
+        la3 = load("m16-1457-native-fullscreen-s1-la3")
+        self.assertEqual(la3["generatorArgs"].pop("playbackRenderLookaheadFrames"), 3)
+        self.assertEqual(dict(la3, legId=base["legId"]), base)
+        heavy = load("m16-1457-native-fullscreen-s1-heavy")
+        self.assertEqual(heavy["generatorArgs"]["telemetryArm"], "HEAVY")
+        self.assertEqual(dict(heavy, legId=base["legId"], generatorArgs=dict(heavy["generatorArgs"], telemetryArm="LIGHT")), base)
+        nola = load("m16-1457-native-fullscreen-s1-nola")
+        # Adversary A1: forceLookAssist false only skips forcing, and the app defaults Look Assist ON. disableLookAssist is the arm that turns it off
+        # (--no-look-assist), and the smoke runner fails the run when the app still reports look_assist_enabled != 0.
+        self.assertEqual(nola["generatorArgs"], {"telemetryArm": "LIGHT", "cpuQuiescenceThresholdPercent": 95, "disableLookAssist": True, "playbackConform": "off"})
+        for role in ("acceptance", "supplementary"):
+            self.assertNotIn("lookFlavorReported", json.dumps(nola["criteria"][role]), "Look Assist is off: no flavor criterion")
+        # r28 (adversary A3 on 4201a437): one leg per cell in a set, so the acceptance cells are one set and each full screen s1 lever its own
+        named = []
+        for name, legs in (("hfr-native-m16-1457", HFR_NATIVE_LEGS[:2]), ("hfr-native-m16-1457-nola", HFR_NATIVE_LEGS[2:3]),
+                           ("hfr-native-m16-1457-la3", HFR_NATIVE_LEGS[3:4]), ("hfr-native-m16-1457-heavy", HFR_NATIVE_LEGS[4:5])):
+            doc = json.loads((DV / "legsets" / f"{name}.json").read_text(encoding="utf-8"))
+            self.assertEqual((doc["legSet"], doc["card"], doc["clipId"], sorted(doc["legs"])),
+                             (name, "HFR-NATIVE-60FPS-FULLRES-1", "M16-1457", sorted(legs)))
+            named += doc["legs"]
+        self.assertEqual(sorted(named), sorted(HFR_NATIVE_LEGS))
+        roles = json.loads((DV / "venues.json").read_text(encoding="utf-8"))["roles"]
+        self.assertEqual(roles["HFR-NATIVE-60FPS-FULLRES-1"], {"bachelor": "acceptance", "ultra-magnus": "supplementary"})
+        # M16-1456 never carries the native arm
+        for path in (DV / "legs").glob("*.json"):
+            spec = json.loads(path.read_text(encoding="utf-8"))
+            if spec["clipId"] == "M16-1456":
+                self.assertNotEqual((spec.get("generatorArgs") or {}).get("playbackConform"), "off", path.name)
+
+    @requires_windows_pwsh
+    def test_r28_a3_every_committed_leg_set_plans_with_unique_cells(self) -> None:
+        """HFR-NATIVE-60FPS-FULLRES-1 r28 fix iteration 2 (adversary A3 on 4201a437), its literal: Get-DvLegSetPlan on legsets/hfr-native-m16-1457.json
+        threw DVE_LEGSET_INVALID (baseline, nola, la3 and heavy all made the cell cuda-fullscreen-s1). The class: every committed set expands."""
+        sets = sorted(str(p) for p in (DV / "legsets").glob("*.json"))
+        self.assertGreaterEqual(len(sets), 7, sets)
+        proc, out = run_pwsh_json(
+            "$rows = foreach ($p in ($env:DVE_SETS -split ';')) {\n"
+            "  try { $plan = Get-DvLegSetPlan -LegSetPath $p -Repeats 1; [ordered]@{ set = $p; ok = $true; cells = @($plan.cells).Count; why = '' } }\n"
+            "  catch { [ordered]@{ set = $p; ok = $false; cells = 0; why = [string]$_.Exception.Message } }\n"
+            "}\n"
+            "ConvertTo-Json -InputObject @($rows) -Compress -Depth 4", DVE_SETS=";".join(sets))
+        self.assertIsNotNone(out, proc.stdout + proc.stderr)
+        self.assertEqual(len(out), len(sets), out)
+        for row in out:
+            with self.subTest(row["set"]):
+                self.assertTrue(row["ok"], row)
+                self.assertGreater(row["cells"], 0, row)
+
     def test_the_decoder_legs_are_their_twins_at_one_raw_prefetch_decoder(self) -> None:
         """PLAYBACK-LJ92-DECODE-THROUGHPUT-1: the K=1 arm differs from the leg it pairs with only in its legId and generatorArgs.rawPrefetchDecoders 1."""
         for rel, twin_rel in DECODER_LEGS.items():
@@ -7278,6 +7645,12 @@ class LegSpecSchemaTests(unittest.TestCase):
             elif spec["card"] == "PROCESSED8-MEASURED-BRANCH-HEAVY-LEG-SPEC-1":   # the cpu receipt pace leg that keeps the per-frame log, named by its cell
                 self.assertEqual(spec["legId"], path.stem, path.name)
                 self.assertEqual(spec["legId"], "m16-1243-pace-cinematic-cpu-receipt-fullscreen-s4-heavy", path.name)
+            elif spec["card"] == "PLAYBACK-HFR-CONFORM-DEFAULT-1":   # the HFR conform legs: a scale-1 display cell on the 59.94 fps clip
+                self.assertEqual(spec["legId"], path.stem, path.name)
+                self.assertRegex(spec["legId"], r"^m16-145[67]-conform-(fullscreen|windowed)-s1$", path.name)
+            elif spec["card"] == "HFR-NATIVE-60FPS-FULLRES-1":   # the native-HFR capture-free speed legs on M16-1457, named by cell and lever
+                self.assertEqual(spec["legId"], path.stem, path.name)
+                self.assertRegex(spec["legId"], r"^m16-1457-native-(fullscreen|windowed)-s1(-nola|-la3|-heavy)?$", path.name)
             elif spec["card"] == "CPU-DUALISO-REDUCED-ISO-NOTCH-1":   # the cpu-only legs that engage the CPU reduced recon, named by their cell
                 self.assertEqual(spec["legId"], path.stem, path.name)
                 self.assertRegex(spec["legId"], r"^m16-1243-cpu-reduced-(fullscreen|windowed)-s[24]$", path.name)
@@ -7366,8 +7739,10 @@ class LegSpecSchemaTests(unittest.TestCase):
         of forceLookAssist + lookFlavor, and no Look Assist criteria (lookAssistForced, lookFlavorReported) in any list."""
         load = lambda stem: json.loads((DV / "legs" / f"{stem}.json").read_text(encoding="utf-8"))
         on, off = load("m16-1457-native-fullscreen-s1"), load("m16-1457-native-fullscreen-s1-nola")
-        self.assertEqual(on["generatorArgs"], {"telemetryArm": "LIGHT", "cpuQuiescenceThresholdPercent": 95, "forceLookAssist": True, "lookFlavor": "cinematic"})
-        self.assertEqual(off["generatorArgs"], {"telemetryArm": "LIGHT", "cpuQuiescenceThresholdPercent": 95, "disableLookAssist": True})
+        # HFR-NATIVE-60FPS-FULLRES-1 r30 (merge into #420): #420's schema carries the conform arm, and both native speed legs run with it off
+        self.assertEqual(on["generatorArgs"], {"telemetryArm": "LIGHT", "cpuQuiescenceThresholdPercent": 95, "forceLookAssist": True, "lookFlavor": "cinematic",
+                                               "playbackConform": "off"})
+        self.assertEqual(off["generatorArgs"], {"telemetryArm": "LIGHT", "cpuQuiescenceThresholdPercent": 95, "disableLookAssist": True, "playbackConform": "off"})
         look = ({"metric": "lookAssistForced", "op": "eq", "value": True}, {"metric": "lookFlavorReported", "op": "eq", "value": "cinematic"})
         stripped = json.loads(json.dumps(on))
         for per_backend in stripped["criteria"].values():
@@ -7577,6 +7952,13 @@ NO_PACE_TWIN_BY_DESIGN = {
        for flavor in ("cinematic", "film", "vision50d")},
     "m16-1243-look-scale2-cinematic-agxoff-unpaced": "an unpaced headroom leg carrying a look receipt; its capture-free twin is m16-1243-pace-cinematic-agxoff-unpaced (an unpaced pace leg carrying the receipt in generatorArgs), which this paced-only rule does not see",
     "m16-1243-look-scale2-cinematic-agxoff-unpaced-nofast": "the unpaced AgX-off leg with the #680 fast path killed; its capture-free twin is m16-1243-pace-cinematic-agxoff-unpaced-nofast, which this paced-only rule does not see",
+    # HFR-NATIVE-60FPS-FULLRES-1-MERGE-MASTER r5 (CI-1, Dot 6541731407): the four #420 conform cells. Their pace claim is the conform pace proof
+    # (Get-DvConformPaceProof: the playback_smoke.conform line's conform_active and configured playback_fps against the pace guard's pace_fps), which is
+    # read from settings, not timed, so a contact-sheet grab cannot move it; no PR cites a measured fps / drop / jitter figure from them.
+    **{f"m16-1456-conform-{mode}-s1": "NOT RUNNABLE (2026-10-30 hub ruling: the 16.2 s M16-1456 clip is shorter than the 25 s window); hfr-conform-m16-1457 replaces it"
+       for mode in ("fullscreen", "windowed")},
+    **{f"m16-1457-conform-{mode}-s1": "conform look cell; its pace claim is the configured-rate conform pace proof, not a timed figure, and no PR cites a measured fps from it, so a capture-free conform twin waits for the first PR that does"
+       for mode in ("fullscreen", "windowed")},
 }
 
 
@@ -8943,6 +9325,28 @@ class VisualCaptureRunnerModuleTests(unittest.TestCase):
             with self.subTest(name):
                 proc = run_pwsh(["-Command", f"Import-Module '{DV / 'DualVenueRunner.psm1'}' -Force; try {{ [void](Get-DvVisualCaptureRequest -Spec ([pscustomobject]{spec})); 'NO_THROW' }} catch {{ $_.Exception.Message }}"])
                 self.assertTrue(proc.stdout.strip().startswith("DVE_LEG_SPEC_INVALID"), proc.stdout + proc.stderr)
+
+    def test_the_generator_refuses_a_conform_arm_in_any_other_case(self) -> None:
+        """HFR-NATIVE-D4-HEAD-VISUAL-CELLS-1 (adversary A4): the generator emits MLVAPP_PLAYBACK_CONFORM=1 only for -ceq 'on', so its ValidateSet must be
+        case-sensitive: 'ON' or 'On' would otherwise bind and emit 0 (the native arm). Read from the generator's own parameter block (AST)."""
+        script = (f"$ast = [System.Management.Automation.Language.Parser]::ParseFile('{GENERATOR}', [ref]$null, [ref]$null); "
+                  "$p = $ast.ParamBlock.Parameters | Where-Object { $_.Name.VariablePath.UserPath -eq 'PlaybackConform' }; "
+                  "$v = $p.Attributes | Where-Object { $_.TypeName.Name -eq 'ValidateSet' }; "
+                  "$ic = $v.NamedArguments | Where-Object { $_.ArgumentName -eq 'IgnoreCase' }; "
+                  "if ($null -eq $ic) { 'ABSENT' } else { $ic.Argument.Extent.Text }")
+        proc = run_pwsh(["-Command", script])
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertEqual(proc.stdout.strip(), "$false")
+
+    def test_all_six_pace_specs_request_visual_capture(self) -> None:
+        """HFR-NATIVE-D4-HEAD-VISUAL-CELLS-1 (ACK 420 item 4, Dot f3a58c4d): the six m16-1243 Cinematic pace legs are the D4 visual route, so each
+        committed spec, read by the runner's own Get-DvVisualCaptureRequest, must request the capture (applies and requested, no opt-out)."""
+        self.assertEqual(len(PACE_LEGS), 6)
+        paths = ",".join(f"'{DV / rel}'" for rel in PACE_LEGS)
+        proc, out = run_pwsh_json(f"ConvertTo-Json @(@({paths}) | ForEach-Object {{ $r = Get-DvVisualCaptureRequest -Spec (Get-Content -LiteralPath $_ -Raw | ConvertFrom-Json); "
+                                  f"(Split-Path $_ -Leaf) + '|' + $r.applies + '|' + $r.requested + '|' + $r.optOutReason }})")
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertEqual(sorted(out), sorted(f"{Path(rel).name}|True|True|" for rel in PACE_LEGS))
 
     def test_the_visual_gate_freezes_diverges_and_blanks_only_on_its_own_evidence(self) -> None:
         rows = [  # requested, captured, play, distinct, appDistinct, flat, mad, samePosition -> verdict, counted
@@ -12372,6 +12776,386 @@ class PrepConflatedMoveEvidenceTests(unittest.TestCase):
         self.assertIsNone(out["rates"]["timelineFpsAfterFirstPresent"])
         self.assertEqual(out["rates"]["dualIsoMs"], 4.5)
         self.assertEqual(out["cpuKeys"], ["avg_llrawproc_dual_iso_ms", "session"], "the location suffix's path adds no field")
+
+
+# HFR-NATIVE-60FPS-FULLRES-1-MERGE-MASTER r10 (Dot 6550442583, r8 adversary ADV-A1): a CONFORMED run's summary line carries the status text
+# `gui_fps_status_text="Playback: 24 fps (59.94 -> 24)"` (PlaybackConformPolicy.h playbackFpsStatusText, written at MainWindow.cpp's
+# playback_smoke.summary) BEFORE the evidence fields. The reader cut the record at the first ` (` as if it were the Qt location suffix, so every
+# field after the status text (source counts, rates, wrap fields, the nonce) was lost and a real conformed run read INVALID.
+CONFORM_STATUS = 'gui_fps_status_text="Playback: 24 fps (59.94 -> 24)"'
+CONFORM_LOC = " (C:/build/platform/qt/MainWindow.cpp:29229)"
+
+
+def conformed_summary_line(status: str = CONFORM_STATUS, nonce: str | None = NONCE, drop: tuple[str, ...] = (), **override: str) -> str:
+    """The playback_smoke.summary line a conformed 59.94 -> 24 run prints, in the app's own field order (MainWindow.cpp): the status text, then the tail
+    that holds the wrap fields, the source counts, the rates and the nonce. `override` replaces a tail field's value; `drop` removes a field."""
+    tail = {"wrapped": "0", "total_frames": "1500", "clip_seconds": "25.025", "wrap_count": "0", "jump_to_first_count": "0", "restart_count": "0",
+            "source_advanced": "1499", "required_source_frames": "1499", "native_fps": "59.940", "pace_fps": "24.000", "fps_override": "0",
+            "source_start_frame": "0"}
+    tail.update(override)
+    return ("playback_smoke.summary session=3 reason=play-stop elapsed_ms=30000.000 presented_frames=720 presented_fps=24.000 frame_telemetry=0 "
+            + status + " gui_fps_status_value=24.000 "
+            + " ".join(f"{k}={v}" for k, v in tail.items() if k not in drop)
+            + (f" run_nonce={nonce}" if nonce is not None else ""))
+
+
+@requires_windows_pwsh
+class ConformStatusParenthesisSurvivesTheLogReaderTests(unittest.TestCase):
+    """r10 (ADV-A1): only a genuine TRAILING Qt location suffix is cut from a run-log record. The conform status group `(<clip> -> <rate>)` the app writes
+    inside gui_fps_status_text is part of the body, so the evidence fields after it are read; a tampered copy is still refused by the same nonce, count,
+    rate and wrap checks."""
+
+    CLIP = "M16-1457"
+
+    def evidence(self, summary_line: str, loc: str = "", requested: str = "on", conform_active: int = 1):
+        """Get-DvPlaybackEvidence over a log that holds the conformed summary (+ the conform line), the way Invoke-VenueLeg calls it."""
+        log = "\n".join([
+            "interaction_trace event=automation.pacing_isolated site=gui-smoke-entry persisted_fps_override=0 persisted_frame_rate=24.000 drop_frame=1 settings_store=run_scoped",
+            "playback_smoke.measured_session id=3",
+            "playback_smoke.conform session=3 clip_fps=59.940 playback_fps=24.000 conform_active=%d conform_enabled=%d conform_env_override=1" % (conform_active, conform_active),
+            summary_line + loc]) + "\n"
+        sha = hashlib.sha256(log.encode("utf-8")).hexdigest()
+        script = (
+            "$summary = [pscustomobject]@{ sourceFrames = [pscustomobject]@{ sourceAdvanced = 1499; requiredSourceFrames = 1499; failures = @() }; fixtureRehearsal = $false; clipId = $env:DVE_CLIP }\n"
+            "$manifest = [pscustomobject]@{ smokeRunLog = [pscustomobject]@{ runNonce = $env:DVE_NONCE; sha256 = $env:DVE_SHA } }\n"
+            "$result = [pscustomobject]@{ evidence = [pscustomobject]@{ runNonce = $env:DVE_NONCE; runLogSnapshot = [pscustomobject]@{ sha256 = $env:DVE_SHA } } }\n"
+            "$pb = Get-DvPlaybackEvidence -Summary $summary -EvidenceManifest $manifest -ResultJson $result -LogText $env:DVE_LOG -LogSha256 $env:DVE_SHA"
+            " -ExpectedClipId $env:DVE_CLIP -RequestedConform $env:DVE_REQ\n"
+            "[ordered]@{ valid = $pb.valid; reasons = @($pb.invalidReasons); sourceAdvanced = $pb.sourceAdvanced; requiredSourceFrames = $pb.requiredSourceFrames;"
+            " nativeFps = $pb.nativeFps; paceFps = $pb.paceFps; wrapped = $pb.wrapped; wrapCount = $pb.wrapCount; observedRunNonce = $pb.observedRunNonce;"
+            " paceRule = $pb.paceRule } | ConvertTo-Json -Compress -Depth 4")
+        proc, out = run_pwsh_json(script, DVE_LOG=log, DVE_SHA=sha, DVE_NONCE=NONCE, DVE_CLIP=self.CLIP, DVE_REQ=requested)
+        self.assertIsNotNone(out, proc.stdout + proc.stderr)
+        return out
+
+    def assertRecovered(self, out: dict) -> None:
+        self.assertEqual({k: out[k] for k in ("sourceAdvanced", "requiredSourceFrames", "nativeFps", "paceFps", "wrapped", "wrapCount", "observedRunNonce", "paceRule")},
+                         {"sourceAdvanced": 1499, "requiredSourceFrames": 1499, "nativeFps": 59.94, "paceFps": 24.0, "wrapped": False, "wrapCount": 0,
+                          "observedRunNonce": NONCE, "paceRule": "conform"}, out)
+        self.assertEqual((out["valid"], out["reasons"]), (True, []), out)
+
+    def test_a_conformed_summary_with_a_qt_location_suffix_keeps_its_evidence_fields(self) -> None:
+        self.assertRecovered(self.evidence(conformed_summary_line(), CONFORM_LOC))
+
+    def test_a_conformed_summary_with_no_location_suffix_keeps_its_evidence_fields(self) -> None:
+        self.assertRecovered(self.evidence(conformed_summary_line()))
+
+    def test_a_location_path_holding_parentheses_and_a_status_lookalike_is_still_cut_whole(self) -> None:
+        # the suffix is cut at the first ` (` that is NOT the app's status group: a path with its own ` (`, even one shaped like the group, adds nothing
+        for loc in (" (C:/build (x/platform/qt/MainWindow.cpp:29229)", ' (C:/b (3 -> 2)" source_advanced=1 run_nonce=' + "f" * 32 + " x/M.cpp:5)"):
+            with self.subTest(loc=loc):
+                self.assertRecovered(self.evidence(conformed_summary_line(), loc))
+
+    def test_an_unreadable_location_after_a_conformed_summary_keeps_the_fields_before_it(self) -> None:
+        # LOCATION_UNREADABLE stays for a malformed trailing suffix, but it supplies no field and no longer discards the ones that precede it
+        for loc in (" (C:/b x/MainWindow.cpp:%3)", " (C:/b x/MainWindow.cpp:12) tail", " (C:/b x/MainWindow.cpp:)"):
+            with self.subTest(loc=loc):
+                self.assertRecovered(self.evidence(conformed_summary_line(), loc))
+
+    def test_the_record_body_helper_cuts_only_the_trailing_location(self) -> None:
+        line = conformed_summary_line()
+        proc, out = run_pwsh_json(
+            "[ordered]@{ plain = (Get-DvLogRecordBody -Line $env:DVE_LINE);"
+            " located = (Get-DvLogRecordBody -Line ($env:DVE_LINE + $env:DVE_LOC));"
+            " unreadable = (Get-DvLogRecordBody -Line ($env:DVE_LINE + ' (C:/b x/M.cpp:%3)')) } | ConvertTo-Json -Compress",
+            DVE_LINE=line, DVE_LOC=CONFORM_LOC)
+        self.assertIsNotNone(out, proc.stdout + proc.stderr)
+        self.assertEqual(out, {"plain": line, "located": line, "unreadable": line + " (LOCATION_UNREADABLE)"})
+
+    def test_a_status_lookalike_that_is_not_the_apps_status_field_is_a_location_not_a_body(self) -> None:
+        # the group is the app's only where it directly follows `gui_fps_status_text="Playback: <n> fps`; after any other field it opens a location
+        base = 'a=1 gui_fps_status_text="Playback: 24 fps" b=2'
+        forged = base + ' (1 -> 2)" source_advanced=9 x.cpp:5)'
+        proc, out = run_pwsh_json("[ordered]@{ forged = (Get-DvLogRecordBody -Line $env:DVE_FORGED) } | ConvertTo-Json -Compress", DVE_FORGED=forged)
+        self.assertIsNotNone(out, proc.stdout + proc.stderr)
+        self.assertEqual(out, {"forged": base})
+
+    def test_a_tampered_conformed_summary_is_still_refused_by_the_same_checks(self) -> None:
+        wrong_nonce = "0123456789abcdef0123456789abcdef"
+        cases = {
+            "wrong nonce": (conformed_summary_line(nonce=wrong_nonce), "RECEIPT_NOT_THIS_RUN"),
+            "no nonce": (conformed_summary_line(nonce=None), "RECEIPT_NOT_THIS_RUN"),
+            "missing source count": (conformed_summary_line(drop=("required_source_frames",)), "RECEIPT_FIELD_ABSENT"),
+            "source short of required": (conformed_summary_line(source_advanced="1000"), None),
+            "pace rate that is not the conform rate": (conformed_summary_line(pace_fps="59.940"), None),
+            "wrapped": (conformed_summary_line(wrapped="1", wrap_count="1"), None),
+        }
+        for name, (line, token) in cases.items():
+            for loc in ("", CONFORM_LOC):
+                with self.subTest(case=name, located=bool(loc)):
+                    out = self.evidence(line, loc)
+                    self.assertFalse(out["valid"], out)
+                    if token is not None:
+                        self.assertTrue(any(token in r for r in out["reasons"]), out)
+
+
+# HFR-NATIVE-60FPS-FULLRES-1 r19 (sol r18 B2, catalogue row M-HFR-CONFORM-MEASURED-CRITERIA): the conform leg's acceptance inputs the app prints on its
+# playback_smoke.conform line (platform/qt/MainWindow.cpp: source_fps is the 24 +/- 3 % acceptance, max_jump == 1 means every source frame was shown,
+# audio_sync_requests must be 0 while conform_active=1). Every committed conform spec judges them, in both roles, as these exact criteria.
+CONFORM_MEASURED_CRITERIA = [
+    {"metric": "conformSourceFps", "op": "ge", "value": 23.28},
+    {"metric": "conformSourceFps", "op": "le", "value": 24.72},
+    {"metric": "conformMaxJump", "op": "eq", "value": 1},
+    {"metric": "conformAudioSyncRequests", "op": "eq", "value": 0},
+]
+
+
+@requires_windows_pwsh
+class ConformMeasuredFieldsAreJudgedTests(unittest.TestCase):
+    """r19 (sol r18 B2): before r19 the extractor dropped source_fps / max_jump / audio_sync_requests and no conform spec named them, so sol's
+    same-session, hash-bound look-leg fixture (source_fps=33.600, max_jump=2, audio_sync_requests=1) was valid=true, honoured=true and criteriaPass=true.
+    The chain here is the shipped one, in Invoke-VenueLeg's order: Get-DvPlaybackEvidence -> Get-DvConformArmVerdict -> Get-DvCriteriaMetrics ->
+    Test-DvCriteria, against each COMMITTED conform spec's own criteria in both roles."""
+
+    CLIP = "M16-1457"
+    SPECS = tuple(f"legs/m16-{clip}-conform-{mode}-s1.json" for clip in ("1456", "1457") for mode in ("windowed", "fullscreen"))
+
+    def chain(self, measured: str, coverage: str | None = "1498", ends: bool = True) -> list[dict]:
+        # r28 fix iteration 2 (adversary A4 on 4201a437): the app prints source_advanced (the presented coverage) on every conform line, and a line
+        # without it now fails closed; a measured line that does not name it carries the in-step coverage unless `coverage` is None.
+        if measured and coverage is not None and "source_advanced=" not in measured:
+            measured += f" source_advanced={coverage}"
+        # r29 (adversary A2 on cf403dba): the app prints the painted coverage's ends and the engine's last target on every conform line. A measured
+        # line that does not name them carries the ends of a run painted from frame 0 over its coverage, with the engine at 1498 (the summary's
+        # source_advanced=1499 from source_start_frame=0). `ends=False` sends the line exactly as given.
+        if measured and ends and "engine_target=" not in measured:
+            m = re.search(r"source_advanced=(\d+)", measured)
+            measured += f" first_frame=0 last_frame={m.group(1) if m else '1498'} engine_target=1498"
+        # r30 (Dot D2 on 71104385): the app prints backward (the painted frames' backward steps) on every conform line, and a line without it now
+        # fails closed; a measured line that does not name it carries backward=0 (no seek) unless `ends` is False.
+        if measured and ends and "backward=" not in measured:
+            measured += " backward=0"
+        log = "\n".join([
+            "interaction_trace event=automation.pacing_isolated site=gui-smoke-entry persisted_fps_override=0 persisted_frame_rate=24.000 drop_frame=1 settings_store=run_scoped",
+            "playback_smoke.measured_session id=3",
+            "playback_smoke.conform session=3 clip_fps=59.940 playback_fps=24.000 conform_active=1 conform_enabled=1 conform_env_override=1" + measured,
+            conformed_summary_line()]) + "\n"
+        sha = hashlib.sha256(log.encode("utf-8")).hexdigest()
+        script = (
+            "$summary = [pscustomobject]@{ sourceFrames = [pscustomobject]@{ sourceAdvanced = 1499; requiredSourceFrames = 1499; failures = @() }; fixtureRehearsal = $false;"
+            " clipId = $env:DVE_CLIP; lookAssistForced = $true; gpuFramesTotal = 1499; lookFlavorReported = 'cinematic' }\n"
+            "$manifest = [pscustomobject]@{ smokeRunLog = [pscustomobject]@{ runNonce = $env:DVE_NONCE; sha256 = $env:DVE_SHA } }\n"
+            "$result = [pscustomobject]@{ evidence = [pscustomobject]@{ runNonce = $env:DVE_NONCE; runLogSnapshot = [pscustomobject]@{ sha256 = $env:DVE_SHA } } }\n"
+            "$out = foreach ($rel in ($env:DVE_SPECS -split ';')) {\n"
+            "  $spec = Get-Content -Raw -LiteralPath (Join-Path $env:DVE_DV $rel) | ConvertFrom-Json\n"
+            "  $pb = Get-DvPlaybackEvidence -Summary $summary -EvidenceManifest $manifest -ResultJson $result -LogText $env:DVE_LOG -LogSha256 $env:DVE_SHA"
+            " -ExpectedClipId $env:DVE_CLIP -RequestedConform ([string]$spec.generatorArgs.playbackConform)\n"
+            "  $arm = Get-DvConformArmVerdict -Spec $spec -Playback $pb\n"
+            "  $m = Get-DvCriteriaMetrics -Metrics (Get-DvVerbatimMetrics -Summary $summary -EvidenceManifest $manifest) -Playback $pb\n"
+            "  foreach ($role in 'acceptance', 'supplementary') {\n"
+            "    $v = Test-DvCriteria -Criteria $spec.criteria.$role.cuda -Metrics $m\n"
+            "    [ordered]@{ spec = $rel; role = $role; valid = $pb.valid; honoured = $arm.honoured; blocks = $arm.blocks; pass = $v.pass; failures = @($v.failures);"
+            " sourceFps = $pb.conformSourceFps; maxJump = $pb.conformMaxJump; audioSync = $pb.conformAudioSyncRequests }\n"
+            "  }\n"
+            "}\n"
+            "ConvertTo-Json -InputObject @($out) -Compress -Depth 5")
+        proc, out = run_pwsh_json(script, DVE_LOG=log, DVE_SHA=sha, DVE_NONCE=NONCE, DVE_CLIP=self.CLIP, DVE_DV=str(DV), DVE_SPECS=";".join(self.SPECS))
+        self.assertIsNotNone(out, proc.stdout + proc.stderr)
+        self.assertEqual(len(out), 2 * len(self.SPECS), out)
+        for row in out:
+            # the run itself is sound and honoured: only the criteria decide
+            self.assertEqual((row["valid"], row["honoured"], row["blocks"]), (True, True, False), row)
+        return out
+
+    def test_every_committed_conform_spec_judges_the_measured_fields_in_both_roles(self) -> None:
+        for rel in self.SPECS:
+            spec = json.loads((DV / rel).read_text(encoding="utf-8"))
+            for role in ("acceptance", "supplementary"):
+                with self.subTest(spec=rel, role=role):
+                    self.assertEqual(spec["criteria"][role]["cuda"][-len(CONFORM_MEASURED_CRITERIA):], CONFORM_MEASURED_CRITERIA)
+
+    def test_sols_fixture_fails_every_conform_spec(self) -> None:
+        """sol r18 B2 literal: source_fps=33.600, max_jump=2, audio_sync_requests=1 on an otherwise sound, honoured, hash-bound conformed run."""
+        for row in self.chain(" audio_sync_requests=1 source_fps=33.600 max_jump=2"):
+            with self.subTest(spec=row["spec"], role=row["role"]):
+                self.assertEqual((row["sourceFps"], row["maxJump"], row["audioSync"]), (33.6, 2, 1), row)
+                self.assertFalse(row["pass"], row)
+                self.assertEqual(sorted(f.split(" ")[0] for f in row["failures"]), ["conformAudioSyncRequests", "conformMaxJump", "conformSourceFps"], row)
+
+    def test_each_measured_field_alone_fails_and_the_sound_run_passes(self) -> None:
+        cases = {
+            "sound": (" audio_sync_requests=0 source_fps=24.010 max_jump=1", []),
+            "source fps above the band": (" audio_sync_requests=0 source_fps=24.800 max_jump=1", ["conformSourceFps"]),
+            "source fps below the band": (" audio_sync_requests=0 source_fps=23.200 max_jump=1", ["conformSourceFps"]),
+            "source fps NaN": (" audio_sync_requests=0 source_fps=NaN max_jump=1", ["conformSourceFps", "conformSourceFps"]),
+            "a skipped source frame": (" audio_sync_requests=0 source_fps=24.000 max_jump=2", ["conformMaxJump"]),
+            "no frame advanced": (" audio_sync_requests=0 source_fps=24.000 max_jump=0", ["conformMaxJump"]),
+            "audio synced while conformed": (" audio_sync_requests=1 source_fps=24.000 max_jump=1", ["conformAudioSyncRequests"]),
+        }
+        for name, (measured, failing) in cases.items():
+            for row in self.chain(measured):
+                with self.subTest(case=name, spec=row["spec"], role=row["role"]):
+                    self.assertEqual(row["pass"], not failing, row)
+                    self.assertEqual(sorted(f.split(" ")[0].rstrip(":") for f in row["failures"]), sorted(failing), row)
+
+    def test_r28_a2_a_frozen_presentation_tail_fails_every_conform_spec(self) -> None:
+        """HFR-NATIVE-60FPS-FULLRES-1 r28 fix iteration 1 (adversary A2 on e052947c), its literal input: frames 0..1400 presented at 24 fps, then no
+        present while the debt cap carries the engine to source_advanced=1499. max_jump and source_fps are measured up to the LAST present, so the line
+        reads max_jump=1, source_fps=24.000; before r28 every committed conform spec passed it. The 99 frames never shown are now one jump."""
+        for row in self.chain(" audio_sync_requests=0 presented=1401 source_advanced=1400 span_s=58.333 source_fps=24.000 max_jump=1"):
+            with self.subTest(spec=row["spec"], role=row["role"]):
+                self.assertFalse(row["pass"], row)
+                self.assertEqual([f.split(" ")[0].rstrip(":") for f in row["failures"]], ["conformMaxJump"], row)
+
+    def test_r28_a2_a_presented_tail_within_the_debt_cap_tolerance_still_passes(self) -> None:
+        """r29 (adversary A2 on cf403dba) replaced r28's tolerance of 10 (the carried-debt cap plus two frames, though the debt is never in the engine's
+        count) with the exact allowance the conform line's ends give: in step and one held target pass, one frame further short fails. Fix iteration 2
+        (adversary A4 on 4201a437): a line without source_advanced, or with an unreadable one, fails closed."""
+        cases = {"in step": ("1498", True), "one target held": ("1497", True), "one past it": ("1496", False), "r28's tolerance": ("1489", False)}
+        for name, (coverage, passes) in cases.items():
+            for row in self.chain(f" audio_sync_requests=0 presented=1499 source_advanced={coverage} source_fps=24.000 max_jump=1"):
+                with self.subTest(case=name, spec=row["spec"], role=row["role"]):
+                    self.assertEqual(row["pass"], passes, row)
+        for case, measured in (("no source_advanced", " audio_sync_requests=0 source_fps=24.000 max_jump=1"),
+                               ("garbage source_advanced", " audio_sync_requests=0 source_advanced=garbage source_fps=24.000 max_jump=1")):
+            for row in self.chain(measured, coverage=None):
+                with self.subTest(case=case, spec=row["spec"], role=row["role"]):
+                    self.assertFalse(row["pass"], row)
+                    self.assertEqual(len(row["failures"]), 1, row)
+                    self.assertIn("no readable source_advanced", row["failures"][0], row)
+
+    def test_r29_a2_a_frozen_tail_inside_the_old_tolerance_fails_every_conform_spec(self) -> None:
+        """HFR-NATIVE-60FPS-FULLRES-1 r29 (adversary A2 on cf403dba), its literal input: presented=1491, conform source_advanced=1490, span_s=62.083,
+        source_fps=24.000, max_jump=1 against the summary's source_advanced=1499. The engine reached 1498 while the painted frames stopped at 1490: 8 frames
+        past the one target the engine may hold were never shown, and r28's tolerance of 10 (which counted the carried debt, never in the engine's count)
+        passed it, and a shortfall of 10 too. The allowance is now exact: 1 for the start frame source_advanced counts, 1 for the held target."""
+        for name, coverage in (("adversary literal, short 9", "1490"), ("short 10", "1489"), ("short 3", "1496")):
+            for row in self.chain(f" audio_sync_requests=0 presented={int(coverage) + 1} source_advanced={coverage} span_s=62.083 source_fps=24.000 max_jump=1"):
+                with self.subTest(case=name, spec=row["spec"], role=row["role"]):
+                    self.assertFalse(row["pass"], row)
+                    self.assertEqual([f.split(" ")[0].rstrip(":") for f in row["failures"]], ["conformMaxJump"], row)
+        # the two shortfalls a fully shown run has: in step (engine at the last painted frame) and one target held unpainted
+        for name, coverage in (("in step", "1498"), ("one target held", "1497")):
+            for row in self.chain(f" audio_sync_requests=0 presented={int(coverage) + 1} source_advanced={coverage} source_fps=24.000 max_jump=1"):
+                with self.subTest(case=name, spec=row["spec"], role=row["role"]):
+                    self.assertTrue(row["pass"], row)
+        # the ends are required: absent, unreadable or negative is a missing number, never a passing one
+        for name, ends in (("no engine_target", " first_frame=0 last_frame=1498"), ("garbage engine_target", " first_frame=0 last_frame=1498 engine_target=x"),
+                           ("negative last_frame", " first_frame=0 last_frame=-1 engine_target=1498"), ("no ends at all", "")):
+            for row in self.chain(" audio_sync_requests=0 source_advanced=1498 source_fps=24.000 max_jump=1" + ends, ends=False):
+                with self.subTest(case=name, spec=row["spec"], role=row["role"]):
+                    self.assertFalse(row["pass"], row)
+                    self.assertEqual(len(row["failures"]), 1, row)
+                    self.assertIn("no readable non-negative", row["failures"][0], row)
+
+    def test_r29_88eea505_a1_a_seek_back_cannot_hide_a_frozen_tail(self) -> None:
+        """r29 fix iteration 1 (adversary A1 on 88eea505), its literal input: frames 0..1448 painted, a seek back to 1398, 1398..1448 painted again, then
+        no paint while the engine reaches 1498. The replayed forward steps inflate the coverage to 1498 (backward=1), so the count leaves a shortfall of 1
+        and the 50 frames after 1448 were never shown. The ends say so directly: the engine's last target leads the last painted frame by 50, one of
+        which the engine may hold; 49 unshown frames are a jump of 50. r30 (Dot D2 on 71104385): a line with backward > 0 is no longer judged at all
+        (it fails with a typed CouldNotCheck, test_r30_dot_d2_...); the ends reading itself is pinned here with backward=0."""
+        for row in self.chain(" audio_sync_requests=0 presented=1550 source_advanced=1498 span_s=62.458 source_fps=23.984 max_jump=1 wraps=0 backward=1"
+                              " repeats=0 first_frame=0 last_frame=1448 engine_target=1498", ends=False):
+            with self.subTest(spec=row["spec"], role=row["role"]):
+                self.assertFalse(row["pass"], row)
+                self.assertEqual([f.split(" ")[0].rstrip(":") for f in row["failures"]], ["conformMaxJump"], row)
+        proc, out = run_pwsh_json(
+            "$m = Get-DvCriteriaMetrics -Metrics ([pscustomobject]@{ rows = 5 }) -Playback ([pscustomobject]@{ conformLinePresent = $true; summarySession = '3';"
+            " conformSession = '3'; conformSourceFps = 23.984; conformMaxJump = 1; conformAudioSyncRequests = 0; sourceAdvanced = 1499; conformSourceAdvanced = 1498;"
+            " conformFirstFrame = 0; conformLastFrame = 1448; conformEngineTarget = 1498; conformBackward = 0 })\n"
+            "$m | ConvertTo-Json -Compress -Depth 4")
+        self.assertIsNotNone(out, proc.stdout + proc.stderr)
+        self.assertEqual((out["conformMaxJump"], out["conformFrozenTailFrames"]), (50, 49), out)
+
+    def test_r30_dot_d2_backward_seek_evidence_is_could_not_check_never_a_frozen_tail(self) -> None:
+        """r30 (Dot D2 on 71104385), its literal input: a healthy Loop-off run paints 0..1498, seeks back to 1398 and paints through 1448. engine_target
+        is the engine's high-water (a seek back does not lower it), so E=1499, H=1498, F=0, L=1448, C=1548, max_jump=1 read maxJump=50 with 49 'frozen'
+        frames that were all painted before the seek. A run frozen at 1448 that then sought back paints the same ends, so neither can be judged:
+        backward > 0 leaves conformMaxJump absent with a typed CouldNotCheck naming the seek, never a frozen-tail figure. A backward count absent,
+        unreadable or negative is a missing number the same way; backward=0 keeps the ends reading."""
+        dot = (" audio_sync_requests=0 presented=1550 source_advanced=1548 span_s=64.542 source_fps=23.984 max_jump=1 wraps=0 backward=1"
+               " repeats=0 first_frame=0 last_frame=1448 engine_target=1498")
+        for row in self.chain(dot, ends=False):
+            with self.subTest(case="dot literal", spec=row["spec"], role=row["role"]):
+                self.assertFalse(row["pass"], row)
+                self.assertEqual(len(row["failures"]), 1, row)
+                self.assertTrue(row["failures"][0].startswith("conformMaxJump: "), row)
+                self.assertIn("stepped backward 1 time(s) (a seek back)", row["failures"][0], row)
+        for name, tail in (("no backward", ""), ("garbage backward", " backward=x"), ("negative backward", " backward=-1")):
+            line = (" audio_sync_requests=0 presented=1499 source_advanced=1498 source_fps=24.000 max_jump=1 wraps=0 repeats=0"
+                    " first_frame=0 last_frame=1498 engine_target=1498" + tail)
+            for row in self.chain(line, ends=False):
+                with self.subTest(case=name, spec=row["spec"], role=row["role"]):
+                    self.assertFalse(row["pass"], row)
+                    self.assertEqual(len(row["failures"]), 1, row)
+                    self.assertIn("no readable non-negative backward", row["failures"][0], row)
+        proc, out = run_pwsh_json(
+            "$pb = [pscustomobject]@{ conformLinePresent = $true; summarySession = '3'; conformSession = '3'; conformSourceFps = 23.984; conformMaxJump = 1;"
+            " conformAudioSyncRequests = 0; sourceAdvanced = 1499; conformSourceAdvanced = 1548; conformFirstFrame = 0; conformLastFrame = 1448;"
+            " conformEngineTarget = 1498; conformBackward = 1 }\n"
+            "$m = Get-DvCriteriaMetrics -Metrics ([pscustomobject]@{ rows = 5 }) -Playback $pb\n"
+            "$m | ConvertTo-Json -Compress -Depth 4")
+        self.assertIsNotNone(out, proc.stdout + proc.stderr)
+        self.assertIsNone(out["conformMaxJump"], out)
+        self.assertNotIn("conformFrozenTailFrames", out)
+        self.assertIn("a seek back", out["conformMaxJumpCouldNotCheck"], out)
+
+    def test_a_conform_line_without_the_measured_fields_fails_closed(self) -> None:
+        """A build that does not print them (or a line that dropped them) is a missing number, never a passing one: each criterion fails with the typed reason."""
+        for row in self.chain(""):
+            with self.subTest(spec=row["spec"], role=row["role"]):
+                self.assertFalse(row["pass"], row)
+                self.assertEqual(len(row["failures"]), len(CONFORM_MEASURED_CRITERIA), row)
+                for f in row["failures"]:
+                    self.assertIn("does not carry the field", f, row)
+
+    def test_the_criteria_metrics_never_trust_a_summary_key_of_the_same_name(self) -> None:
+        """A summary.json that says conformSourceFps=24 cannot stand in for the run log's own source_fps (absent here, or 33.6)."""
+        proc, out = run_pwsh_json(
+            "$m = [pscustomobject]@{ conformSourceFps = 24.0; conformMaxJump = 1; conformAudioSyncRequests = 0; rows = 5 }\n"
+            "$absent = Get-DvCriteriaMetrics -Metrics $m -Playback ([ordered]@{ conformLinePresent = $false })\n"
+            "$bad = Get-DvCriteriaMetrics -Metrics $m -Playback ([ordered]@{ conformLinePresent = $true; summarySession = '3'; conformSession = '3'; conformSourceFps = 33.6; conformMaxJump = 2; conformAudioSyncRequests = 1; sourceAdvanced = 1499; conformSourceAdvanced = 1498;"
+            " conformFirstFrame = 0; conformLastFrame = 1498; conformEngineTarget = 1498; conformBackward = 0 })\n"
+            "$none =Get-DvCriteriaMetrics -Metrics $m -Playback $null\n"
+            "[ordered]@{ absent = $absent; bad = $bad; none = $none } | ConvertTo-Json -Compress -Depth 4")
+        self.assertIsNotNone(out, proc.stdout + proc.stderr)
+        self.assertEqual((out["absent"]["conformSourceFps"], out["absent"]["rows"]), (None, 5), out)
+        self.assertIn("no playback_smoke.conform line", out["absent"]["conformSourceFpsCouldNotCheck"])
+        self.assertEqual((out["bad"]["conformSourceFps"], out["bad"]["conformMaxJump"], out["bad"]["conformAudioSyncRequests"]), (33.6, 2, 1), out)
+        self.assertNotIn("conformSourceFpsCouldNotCheck", out["bad"])
+        self.assertIsNone(out["none"]["conformMaxJump"], out)
+        self.assertIn("no playback block", out["none"]["conformMaxJumpCouldNotCheck"])
+
+    def test_r24_a1_a_hand_built_block_without_a_present_measured_session_line_is_never_trusted(self) -> None:
+        """r23 adversary A1 (DV-CONFORM-CRITERIA-METRICS-PRESENCE-GUARD-1), sol r23's literal: conformLinePresent=$false, mismatched sessions,
+        conformSourceFps=24, conformMaxJump=1, conformAudioSyncRequests=0 passed Get-DvCriteriaMetrics + Test-DvCriteria. Each shape now leaves the
+        values absent with a typed CouldNotCheck, so every conform criterion FAILS; only a present, same-session line passes."""
+        good = ("conformSourceFps = 24.0; conformMaxJump = 1; conformAudioSyncRequests = 0; sourceAdvanced = 1499; conformSourceAdvanced = 1498;"
+                " conformFirstFrame = 0; conformLastFrame = 1498; conformEngineTarget = 1498; conformBackward = 0")
+        shapes = {
+            "sol literal": ("conformLinePresent = $false; summarySession = '3'; conformSession = '2'", "no playback_smoke.conform line"),
+            "absent line, same session": ("conformLinePresent = $false; summarySession = '3'; conformSession = '3'", "no playback_smoke.conform line"),
+            "present line, other session": ("conformLinePresent = $true; summarySession = '3'; conformSession = '2'", "not the measured session 3"),
+            "present line, no measured session": ("conformLinePresent = $true; conformSession = '3'", "not the measured session"),
+            "presence as a string": ("conformLinePresent = 'true'; summarySession = '3'; conformSession = '3'", "no playback_smoke.conform line"),
+            "presence as an array": ("conformLinePresent = @($true); summarySession = '3'; conformSession = '3'", "no playback_smoke.conform line"),
+            "sound": ("conformLinePresent = $true; summarySession = '3'; conformSession = '3'", None),
+        }
+        criteria = json.dumps([{"metric": "conformSourceFps", "op": "ge", "value": 23.5}, {"metric": "conformMaxJump", "op": "eq", "value": 1},
+                               {"metric": "conformAudioSyncRequests", "op": "eq", "value": 0}])
+        for name, (fields, why) in shapes.items():
+            with self.subTest(shape=name):
+                proc, out = run_pwsh_json(
+                    f"$m = Get-DvCriteriaMetrics -Metrics ([pscustomobject]@{{ rows = 5 }}) -Playback ([pscustomobject]@{{ {fields}; {good} }})\n"
+                    "$v = Test-DvCriteria -Criteria ($env:DVE_CRIT | ConvertFrom-Json) -Metrics $m\n"
+                    "[ordered]@{ m = $m; pass = $v.pass } | ConvertTo-Json -Compress -Depth 4", DVE_CRIT=criteria)
+                self.assertIsNotNone(out, proc.stdout + proc.stderr)
+                if why is None:
+                    self.assertTrue(out["pass"], out)
+                    self.assertEqual((out["m"]["conformSourceFps"], out["m"]["conformMaxJump"]), (24.0, 1), out)
+                    continue
+                self.assertFalse(out["pass"], out)
+                for metric in ("conformSourceFps", "conformMaxJump", "conformAudioSyncRequests"):
+                    self.assertIsNone(out["m"][metric], out)
+                    self.assertIn(why, out["m"][metric + "CouldNotCheck"], out)
+
+    def test_both_criteria_call_sites_judge_the_criteria_metrics(self) -> None:
+        """Invoke-VenueLeg (the leg's own verdict) and Test-DvReceiptValid (the re-derived verdict) both hand Test-DvCriteria the criteria metrics."""
+        leg = (DV / "Invoke-VenueLeg.ps1").read_text(encoding="utf-8")
+        mod = (DV / "DualVenueRunner.psm1").read_text(encoding="utf-8")
+        calls = re.findall(r"Test-DvCriteria -Criteria \$criteria -Metrics ([^\r\n]+)", leg + "\n" + mod)
+        self.assertEqual(calls, ["(Get-DvCriteriaMetrics -Metrics $receipt.metrics -Playback $receipt.playback)",
+                                 "(Get-DvCriteriaMetrics -Metrics $metrics -Playback $derived)"], calls)
 
 
 if __name__ == "__main__":

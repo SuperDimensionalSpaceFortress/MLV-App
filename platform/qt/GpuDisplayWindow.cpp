@@ -14,6 +14,7 @@
 #include "PlaybackRouteStagedSlotPolicy.h"
 #include "PreviewPaintTiming.h"
 #include "PlaybackScaling.h"
+#include "PlaybackSourceAdvanceTracker.h"
 #include "PlaybackStartupSplit.h"
 #include "PlaybackSwapInterval.h"
 #include "debug/StageTiming.h"
@@ -1095,6 +1096,7 @@ void GpuDisplayWindow::clearPresented()
     m_pendingPresentationSerialValid = false;
     m_presentedSerial = 0;
     m_presentedSerialValid = false;
+    m_composedPaint.reset();   // r30
     update();
 }
 
@@ -2017,7 +2019,11 @@ bool GpuDisplayWindow::grabPresentedFramebufferIfActive(QImage *outImage,
     win->m_captureReadbackSucceeded = false;
     win->m_captureReadbackImage = QImage();
     win->m_captureReadbackError.clear();
-    win->paintGL();
+    // HFR-NATIVE-60FPS-FULLRES-1 r29 fix iteration 2 (adversary A1 on 07226bc0): drawn here, on screen only once swapped below
+    {
+        const playback_paint_credit::OffscreenPaintScope offscreen;   // the swap below presents it; credited after it
+        win->paintGL();
+    }
     win->m_captureReadbackRequested = false;
 
     if ( presentedSerial ) *presentedSerial = win->m_presentedSerial;
@@ -2036,6 +2042,8 @@ bool GpuDisplayWindow::grabPresentedFramebufferIfActive(QImage *outImage,
     // swap now so the window's own swapchain reflects exactly what was just captured,
     // making this a real present rather than a side-channel readback.
     swapOutsidePaintEventAndRecord(win, glContext);
+    if ( win->m_presentedSerialValid ) playback_paint_credit::notePainted( win->m_presentedSerial );   // r29: presented by that swap
+    win->m_composedPaint.notePaint( win->m_presentedSerialValid ? win->m_presentedSerial : 0 );   // r30: composed by that swap
     if ( madeCurrent ) win->doneCurrent();
 
     if ( outImage ) *outImage = win->m_captureReadbackImage;
@@ -2051,6 +2059,17 @@ bool GpuDisplayWindow::presentedSerialIfActive(quint64 *presentedSerial)
     if ( !win ) return false;
     if ( presentedSerial ) *presentedSerial = win->m_presentedSerial;
     return win->m_presentedSerialValid;
+}
+
+bool GpuDisplayWindow::paintPendingForSerialIfActive(quint64 serial)
+{
+    if ( serial == 0 ) return false;
+    QMutexLocker lock(&g_activeMutex);
+    GpuDisplayWindow *win = g_activeWindow.load(std::memory_order_acquire);
+    if ( !win || !win->m_pendingPresentationSerialValid ) return false;
+    // HFR-NATIVE-60FPS-FULLRES-1 r30 (adversary A1 on 71104385): a composed present, never the raw presented serial (the capture's paintGL
+    // promotes it before its readback, and a failed readback never swaps)
+    return win->m_composedPaint.pendingFor( win->m_pendingPresentationSerial, serial );
 }
 
 bool GpuDisplayWindow::paintPendingNowIfActive(quint64 *presentedSerial)
@@ -2434,6 +2453,7 @@ void GpuDisplayWindow::paintGL()
     {
         m_texturePresentationActive = false;
         m_presentedSerialValid = false;
+        m_composedPaint.noteCleared();   // r30: a composed paint that drew no frame
         m_lookLabelDrawnText.clear();
         if ( m_captureReadbackRequested )
         {
@@ -2513,6 +2533,9 @@ void GpuDisplayWindow::paintGL()
     // route that produced this content did not supply a presentationSerial.
     m_presentedSerial = m_pendingPresentationSerial;
     m_presentedSerialValid = m_pendingPresentationSerialValid;
+    // HFR-NATIVE-60FPS-FULLRES-1 r29 (adversary A1 on cf403dba): this paint drew that serial; the conform tracker credits it now
+    if ( m_presentedSerialValid ) playback_paint_credit::notePainted( m_presentedSerial );
+    m_composedPaint.notePaint( m_presentedSerialValid ? m_presentedSerial : 0 );   // r30: the gate's paint check; not inside the capture's scope
 
     if ( !m_loggedPresented )
     {
