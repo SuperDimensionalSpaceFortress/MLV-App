@@ -965,6 +965,17 @@ if ($outcome -in @('PASS', 'FAIL') -and $display.blocks) {
     $detail = "INVALID: the job result was $outcome ($detail) but DISPLAY_MODE_NOT_HONOURED: $($display.reason). A run that did not use the display mode the leg names is no measurement under it"
     $outcome = 'INVALID'
 }
+# PRESENTMON-BACHELOR-CUDA-INTERNAL-GAP-1, FAIL CLOSED: a leg with a usable PresentMon status whose capture has a gap longer than the bound (5000 ms, the job's own temporal
+# ceiling) inside the app's swap window, or a gap that only the process-lifetime window measured, is no measurement: GPU timing on the presents in that gap is
+# unreachable. A typed INVALID (PRESENTMON_INTERNAL_GAP / PRESENTMON_GAP_UNLOCATED / PRESENTMON_GAP_UNMEASURED), never a PASS or FAIL. The verdict is recorded on every receipt with metrics.
+if ($null -ne $receipt.metrics) {
+    $presentMonGapVerdict = Get-DvPresentMonGapVerdict -Metrics $receipt.metrics
+    $receipt['presentMonGap'] = $presentMonGapVerdict
+    if ($outcome -in @('PASS', 'FAIL') -and $presentMonGapVerdict.blocks) {
+        $detail = "INVALID: the job result was $outcome ($detail) but $($presentMonGapVerdict.reason). A leg whose PresentMon capture lost that span is not counted"
+        $outcome = 'INVALID'
+    }
+}
 # HFR-NATIVE-60FPS-FULLRES-1, FAIL CLOSED: a leg that names a conform arm (generatorArgs.playbackConform) and whose run log does not prove the app played under it is no
 # measurement under that arm: a typed INVALID, never a PASS or FAIL. The requested and observed values go in the detail. (A leg that names no arm is unchanged.)
 if ($outcome -in @('PASS', 'FAIL')) {

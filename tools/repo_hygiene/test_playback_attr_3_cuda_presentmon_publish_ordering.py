@@ -371,8 +371,10 @@ class TemplateOrderingTests(unittest.TestCase):
             self.template,
         )
         self.assertIn("$appSwapTelemetry = Get-AttrCudaAppSwapTelemetry -LogText $rawLog", self.template)
+        # PRESENTMON-BACHELOR-CUDA-INTERNAL-GAP-1: the process-lifetime result is now $presentMonCaptureTemporal, and
+        # $presentMonTemporal is the app-swap-window result when that window exists (test_presentmon_playback_window_gap.py).
         self.assertIn(
-            "$presentMonTemporal = Get-AttrCudaTemporalCoverage -TimeInMsValues "
+            "$presentMonCaptureTemporal = Get-AttrCudaTemporalCoverage -TimeInMsValues "
             "@($pmIntervalRows | ForEach-Object { [double]$_.timeInMs }) -WindowStartMs "
             "$displayReport.windowStartMs -WindowEndMs $displayReport.windowEndMs -MaxGapMs "
             "$presentMonSufficiencyMaxGapMs",
@@ -414,7 +416,7 @@ class TemplateOrderingTests(unittest.TestCase):
         )
         pm_rows_built = self.template.index("$pmRows = @($displayReport.selectedChainRows)")
         coverage_computed = self.template.index("$presentMonCoverageFraction = if (")
-        temporal_computed = self.template.index("$presentMonTemporal = Get-AttrCudaTemporalCoverage")
+        temporal_computed = self.template.index("$presentMonTemporal = if ($presentMonTemporalWindowSource -ceq 'app_swap_window')")
         status_assigned = self.template.index("$presentMonStatus = if ($presentMonSufficient)")
         self.assertLess(pm_rows_built, coverage_computed)
         self.assertLess(coverage_computed, temporal_computed)

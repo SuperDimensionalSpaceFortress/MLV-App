@@ -4121,6 +4121,57 @@ function Test-DvCriteria {
     [pscustomobject]@{ pass = ($failures.Count -eq 0); informational = $false; failures = @($failures) }
 }
 
+# PRESENTMON-BACHELOR-CUDA-INTERNAL-GAP-1: the receipt-level PresentMon gap bound. It is the job's own temporal ceiling
+# (playback-attr-3-cuda-job.ps1 $presentMonSufficiencyMaxGapMs, PRESENTMON-HARNESS-ROBUSTNESS-2 r1b; test_presentmon_playback_window_gap.py pins
+# the two equal). Measured inside the app's swap window, 12 sampled Bachelor CUDA legs read 70-184 ms (worst bracket end) and the app's
+# own largest swap gap there and on the r4 stalled leg was 96.4 ms, so the bound never trips on a healthy leg. A gap past it is lost PresentMon rows, and GPU
+# timing on the presents in that gap is unreachable, so the leg is no measurement.
+$script:PresentMonGapBoundMs = 5000.0
+
+function Get-DvPresentMonGapVerdict {
+    <#
+    .SYNOPSIS
+    PRESENTMON-BACHELOR-CUDA-INTERNAL-GAP-1: does this leg's PresentMon capture have a gap longer than the bound? Read from the receipt's verbatim
+    metrics only: presentMonStatus, presentMonTemporalMaxGapMs, presentMonTemporalGapKind, presentMonTemporalWindowSource.
+    NOT_APPLICABLE (no block) when presentMonStatus is not 'ok' or 'degraded'. A CPU leg's PresentMon is informational and reads 'unavailable',
+    and the DISPLAY_ASLEEP override reads 'unavailable' too. Otherwise FAIL CLOSED:
+      PRESENTMON_GAP_UNMEASURED  a usable status with no finite non-negative gap;
+      PRESENTMON_INTERNAL_GAP    a gap over the bound inside the app's swap window (windowSource app_swap_window);
+      PRESENTMON_GAP_UNLOCATED   a gap over the bound measured over the process lifetime (no swap window, or a job before this card).
+                                 The gap may be the app's own pre-roll, but nothing places it outside playback, so it is not counted;
+      WITHIN_BOUND               no block.
+    Pure: the runner gates on it after the verbatim metrics are copied.
+    #>
+    param([AllowNull()]$Metrics)
+    $bound = $script:PresentMonGapBoundMs
+    $status = [string](Get-DvProp $Metrics 'presentMonStatus')
+    $rawGap = Get-DvProp $Metrics 'presentMonTemporalMaxGapMs'
+    $kind = Get-DvProp $Metrics 'presentMonTemporalGapKind'
+    $source = Get-DvProp $Metrics 'presentMonTemporalWindowSource'
+    $gap = $null
+    if ($rawGap -is [double] -or $rawGap -is [int] -or $rawGap -is [long] -or $rawGap -is [decimal]) {
+        $d = [double]$rawGap
+        if (-not [double]::IsNaN($d) -and -not [double]::IsInfinity($d) -and $d -ge 0) { $gap = $d }
+    }
+    $verdict = 'WITHIN_BOUND'
+    $reason = $null
+    if ($status -cnotin @('ok', 'degraded')) {
+        $verdict = 'NOT_APPLICABLE'
+        $reason = "presentMonStatus is '$status', not ok or degraded: no PresentMon cadence to bound"
+    }
+    elseif ($null -eq $gap) {
+        $verdict = 'PRESENTMON_GAP_UNMEASURED'
+        $reason = "PRESENTMON_GAP_UNMEASURED: presentMonStatus is '$status' but presentMonTemporalMaxGapMs is '$rawGap', not a finite non-negative number"
+    }
+    elseif ($gap -gt $bound) {
+        $where = $(if ($source -ceq 'app_swap_window') { "inside the app's swap window" } else { "over the MLVApp process lifetime (window source '$source'), so nothing places it outside playback" })
+        $verdict = $(if ($source -ceq 'app_swap_window') { 'PRESENTMON_INTERNAL_GAP' } else { 'PRESENTMON_GAP_UNLOCATED' })
+        $reason = "${verdict}: a $([math]::Round($gap, 1)) ms $kind PresentMon gap $where exceeds the $([math]::Round($bound)) ms bound; GPU timing on the presents in it is unreachable"
+    }
+    [ordered]@{ verdict = $verdict; blocks = ($verdict -cin @('PRESENTMON_GAP_UNMEASURED', 'PRESENTMON_INTERNAL_GAP', 'PRESENTMON_GAP_UNLOCATED')); boundMs = $bound
+        gapMs = $gap; gapKind = $kind; windowSource = $source; reason = $reason }
+}
+
 function Get-DvVerbatimMetrics {
     <#
     .SYNOPSIS
@@ -4363,4 +4414,4 @@ Export-ModuleMember -Function Get-DvOutcomeEnum, ConvertTo-DvCanonicalJson, Get-
     Test-DvUnderClaudeState, Test-DvLocalReceiptRoot, Read-DvClipConsent, Get-DvClipAdmission, Get-DvSmokeSummaryFields, Get-DvConformPaceProof, Get-DvConformArmVerdict, Get-DvMinPlaySeconds, Get-DvPlaybackProblems,
     Get-DvPlaybackEvidence, Get-DvScaleEvidence, Get-DvScaleLabel, Get-DvDisplayEvidence, Get-DvUnpacedEvidence, Get-DvLookLabelEvidence, Get-DvWorkerThreadsEvidence, Get-DvPrepConflatedMoveEvidence, Get-DvLookAssistEvidence, Get-DvLegSetPlan, Get-DvSmokeSessionLineFields, Get-DvSmokeSessionLineRead, Get-DvLogRecordBody, Get-DvMatrixRates, Get-DvMatrixRow, Get-DvMedian, ConvertTo-DvMatrixTable, Get-DvBlobById, Find-DvCommittedLegSpec, Read-DvCommittedLookReceipt, Read-DvEvidenceSet, Test-DvJsonEquivalent, Test-DvReceiptValid, Get-DvJobNotAfter, Get-DvUmRunNotAfterArgs, Get-DvUmRunDropVisibleUtc, Get-DvUmRunDropNotAfter, Test-DvNotAfterCoversDrop, Get-DvHealthVerdict,
     New-DvHealthProbeJobText, ConvertFrom-DvProbeStdout,
-    Get-DvResultToken, Resolve-DvJobOutcome, Test-DvCriteria, Get-DvVerbatimMetrics, Get-DvCriteriaMetrics, New-DvReceipt, Write-DvReceipt
+    Get-DvResultToken, Resolve-DvJobOutcome, Test-DvCriteria, Get-DvPresentMonGapVerdict, Get-DvVerbatimMetrics, Get-DvCriteriaMetrics, New-DvReceipt, Write-DvReceipt

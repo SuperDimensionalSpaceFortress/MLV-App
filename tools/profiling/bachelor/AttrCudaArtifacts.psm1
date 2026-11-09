@@ -7159,6 +7159,90 @@ function Get-AttrCudaTemporalCoverage {
     }
 }
 
+function Get-AttrCudaPlaybackTemporalCoverage {
+    <#
+    .SYNOPSIS
+    Get-AttrCudaTemporalCoverage over the app's own measured swap window, not the MLVApp process lifetime.
+    .DESCRIPTION
+    PRESENTMON-BACHELOR-CUDA-INTERNAL-GAP-1: the display report's window is result.json process.startedAtUtc..endedAtUtc, the whole
+    process lifetime. MLVApp presents nothing while it loads the clip, runs the Look Assist baseline analysis, and idles after Stop, so
+    those seconds read as PresentMon gaps. On the r4 stalled Bachelor CUDA leg the 12.7 s "internal" gap was the Look Assist baseline
+    (before playback_smoke.start), and the longest gap inside the swap window was 96.5 ms; PresentMon lost no events.
+    This runs Get-AttrCudaTemporalCoverage (no second gap scan) over the last playback_smoke.gpu_window_swaps line's
+    first_swap_utc..last_swap_utc, on PresentMon's clock. PresentMon's origin is only known to lie inside the capture-start bracket
+    [EarliestAnchorUtc, LatestAnchorUtc], so the window is converted under BOTH ends; the result with the larger gap is kept (anchor names
+    which end). windowSource is 'app_swap_window' on success. It is 'unavailable', with a typed unavailableReason and $null
+    sufficient/maxGapMs/gapKind, when there is no bracket, it is inverted, the late end is not trusted (trace readiness not observed), or
+    there is no parseable non-empty swap window. The caller then falls back to the process-lifetime window and says so.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [AllowNull()]
+        [AllowEmptyCollection()]
+        [double[]]$TimeInMsValues,
+
+        [Parameter(Mandatory = $true)]
+        [AllowNull()]
+        [AllowEmptyString()]
+        [string]$LogText,
+
+        [Parameter(Mandatory = $true)]
+        [AllowNull()]
+        [Nullable[datetime]]$EarliestAnchorUtc,
+
+        [Parameter(Mandatory = $true)]
+        [AllowNull()]
+        [Nullable[datetime]]$LatestAnchorUtc,
+
+        [Parameter(Mandatory = $true)]
+        [AllowNull()]
+        [object]$LatestAnchorTrusted,
+
+        [Parameter(Mandatory = $true)]
+        [double]$MaxGapMs
+    )
+
+    $none = {
+        param([string]$Why)
+        [pscustomobject]@{
+            windowSource = 'unavailable'; unavailableReason = $Why; sufficient = $null; maxGapMs = $null; gapKind = $null
+            anchor = $null; windowFirstUtc = $null; windowLastUtc = $null; rowsInWindow = $null
+        }
+    }
+    if ($null -eq $EarliestAnchorUtc -or $null -eq $LatestAnchorUtc) { return (& $none 'no capture-start bracket') }
+    if ([datetime]$LatestAnchorUtc -lt [datetime]$EarliestAnchorUtc) { return (& $none 'the capture-start bracket is inverted') }
+    if (-not ($LatestAnchorTrusted -is [bool] -and $LatestAnchorTrusted)) {
+        return (& $none 'trace readiness was not observed, so the late end of the capture-start bracket is no bound on the PresentMon origin')
+    }
+    $swapLines = @(if (-not [string]::IsNullOrEmpty($LogText)) { [regex]::Matches($LogText, 'playback_smoke\.gpu_window_swaps [^\r\n]*?first_swap_utc=(?<first>\S+) last_swap_utc=(?<last>\S+)') })
+    if ($swapLines.Count -eq 0) { return (& $none 'no playback_smoke.gpu_window_swaps line with first_swap_utc/last_swap_utc in the run log') }
+    $last = $swapLines[$swapLines.Count - 1]
+    $inv = [Globalization.CultureInfo]::InvariantCulture
+    $styles = [Globalization.DateTimeStyles]::AdjustToUniversal -bor [Globalization.DateTimeStyles]::AssumeUniversal
+    $firstUtc = [datetime]::MinValue
+    $lastUtc = [datetime]::MinValue
+    if (-not [datetime]::TryParse($last.Groups['first'].Value, $inv, $styles, [ref]$firstUtc) -or -not [datetime]::TryParse($last.Groups['last'].Value, $inv, $styles, [ref]$lastUtc)) {
+        return (& $none 'the gpu_window_swaps first_swap_utc/last_swap_utc stamps are unparseable')
+    }
+    if ($lastUtc -le $firstUtc) { return (& $none 'the gpu_window_swaps window is empty or reversed') }
+
+    $values = @($TimeInMsValues | Where-Object { $null -ne $_ })
+    $worst = $null
+    foreach ($anchor in @(@{ name = 'earliest'; utc = [datetime]$EarliestAnchorUtc }, @{ name = 'latest'; utc = [datetime]$LatestAnchorUtc })) {
+        $startMs = ($firstUtc - $anchor.utc).TotalMilliseconds
+        $endMs = ($lastUtc - $anchor.utc).TotalMilliseconds
+        $inWindow = @($values | Where-Object { $_ -ge $startMs -and $_ -le $endMs })
+        $cov = Get-AttrCudaTemporalCoverage -TimeInMsValues $inWindow -WindowStartMs $startMs -WindowEndMs $endMs -MaxGapMs $MaxGapMs
+        if ($null -eq $worst -or $cov.maxGapMs -gt $worst.cov.maxGapMs) { $worst = @{ cov = $cov; anchor = $anchor.name; rows = $inWindow.Count } }
+    }
+    [pscustomobject]@{
+        windowSource = 'app_swap_window'; unavailableReason = $null
+        sufficient = [bool]$worst.cov.sufficient; maxGapMs = $worst.cov.maxGapMs; gapKind = $worst.cov.gapKind
+        anchor = $worst.anchor; windowFirstUtc = $firstUtc.ToString('o'); windowLastUtc = $lastUtc.ToString('o'); rowsInWindow = $worst.rows
+    }
+}
+
 function ConvertTo-AttrCudaResultLineSafeText {
     <#
     .SYNOPSIS
@@ -7478,6 +7562,7 @@ Export-ModuleMember -Function `
     Get-AttrCudaAppSwapTelemetry, `
     Get-AttrCudaForegroundVerification, `
     Get-AttrCudaTemporalCoverage, `
+    Get-AttrCudaPlaybackTemporalCoverage, `
     ConvertTo-AttrCudaResultLineSafeText, `
     Register-AttrCudaDisplayWakeNativeMethods, `
     Get-AttrCudaScreensaverRunning, `
