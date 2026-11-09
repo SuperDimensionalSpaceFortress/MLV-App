@@ -7288,6 +7288,25 @@ TEST(DualIsoPipeline, MixChromaAvx2ProofSurvivesAConsumedWorkerRecon)
     ASSERT_TRUE(presented.value(QStringLiteral("recon_worker_dual_iso_full20_mix_chroma_avx2_used")).toBool());
     // The render thread's own key is left as it is.
     ASSERT_FALSE(presented.value(QStringLiteral("dual_iso_full20_mix_chroma_avx2_used")).toBool());
+    ASSERT_TRUE(recon_worker_split::mixChromaAvx2Used(presented));
+
+    // Adversary b2992f19 A1: the render thread's last-run record is not reset when it consumes a
+    // worker recon, so its unprefixed flag can be a stale true from its own earlier recon. A frame
+    // that carries the worker's split counts the worker's flag only.
+    QJsonObject worker_no_avx2;
+    worker_no_avx2.insert(QStringLiteral("llrawproc_total_ms"), 30.0);
+    worker_no_avx2.insert(QStringLiteral("dual_iso_full20_valid"), true);
+    worker_no_avx2.insert(QStringLiteral("dual_iso_full20_mix_chroma_avx2_used"), false);
+    QJsonObject stale;
+    stale.insert(QStringLiteral("dual_iso_full20_valid"), true);
+    stale.insert(QStringLiteral("dual_iso_full20_mix_chroma_avx2_used"), true);
+    recon_worker_split::copyWorkerSplit(worker_no_avx2, stale);
+    ASSERT_FALSE(recon_worker_split::mixChromaAvx2Used(stale));
+    // Without the worker's split the frame is the render thread's own recon: its flag counts.
+    QJsonObject own;
+    own.insert(QStringLiteral("dual_iso_full20_valid"), true);
+    own.insert(QStringLiteral("dual_iso_full20_mix_chroma_avx2_used"), true);
+    ASSERT_TRUE(recon_worker_split::mixChromaAvx2Used(own));
 }
 
 // Adversary 457eb203 A1: a frame too narrow to hold a 2x2 cell (ncx = 0) is a plain copy on

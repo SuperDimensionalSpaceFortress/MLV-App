@@ -43,13 +43,17 @@ inline bool isSplitKey( const QString &key )
                        || key == mixChromaAvx2UsedKey() );
 }
 
-// A presented frame whose matched-source smooth ran the AVX2 kernel, on the render thread's own recon
-// or on the recon worker's (adversary 5f16bcdf A1: a consumed worker recon leaves the render thread's
-// unprefixed flag false; the worker's survives under recon_worker_).
+// A presented frame whose matched-source smooth ran the AVX2 kernel, on the recon that produced THIS
+// frame. A frame that consumed the worker's recon carries the worker's flag under recon_worker_ (the
+// worker always writes it, RenderFrameThread.cpp insertLlrawprocReconTimingTelemetry), and only that
+// flag counts: the render thread ran no recon, and its unprefixed flag is its last-run record, which a
+// consumed frame does not reset, so it can be a stale true from its own earlier recon (adversary
+// 5f16bcdf A1, adversary b2992f19 A1). Any other frame is the render thread's own recon.
 inline bool mixChromaAvx2Used( const QJsonObject &presented )
 {
-    return presented.value( mixChromaAvx2UsedKey() ).toBool()
-        || presented.value( prefix() + mixChromaAvx2UsedKey() ).toBool();
+    const QString workerKey = prefix() + mixChromaAvx2UsedKey();
+    if( presented.contains( workerKey ) ) return presented.value( workerKey ).toBool();
+    return presented.value( mixChromaAvx2UsedKey() ).toBool();
 }
 
 // Copies the worker's split keys from `worker` (the slot telemetry as the recon worker left it) into
