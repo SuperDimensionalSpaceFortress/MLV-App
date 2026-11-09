@@ -2567,11 +2567,16 @@ def test_r14_iter1_a1_the_parent_age_check_reads_utc_filetimes_never_local_start
 _DIRECT_STDIN_THROW = "throw [System.IO.IOException]::new('fixture-stdin-write-failed')\n"
 _SNAPSHOT_CLOSED = "} finally { CloseHandle(snap); }\n"
 _PARENT_CREATED = "parentCreated=CreatedFileTime(parent)"
-_PARENT_READ = "parentPid=ParentPidOf(kid)"
+_PARENT_READ = "parentPid=ParentPidOf(read)"
 _MISMATCH_BRANCH = 'if(parentPid!=parent.Id) { seen.NoteIfAnyBelow(kids,id); kid.Dispose(); continue; }'
 _OLDER_BRANCH = 'if(StartedBeforeParent(created,parentCreated)) { seen.Note("older-than-parent"); kid.Dispose(); continue; }'
 _ACCEPT = "seen.Members.Add(kid); walk.Enqueue(kid);"
-_READ_CALL = "int status=NtQueryInformationProcess(p.Handle,"
+_READ_CALL = "int status=NtQueryInformationProcess(process,0,"
+# CONTAINMENT-KID-READ-ACCESS-DENIED-1: the parent read is on the walk's query-limited handle 'read', which holds the process while the handle the kill uses is opened.
+# The spy records the handle the one parent read used; acceptance requires it to be 'read', and the kill's handle to be the same kernel object (CompareObjectHandles).
+_SPY = _chain(_replacing(_READ_CALL,"fixtureRead=process;\n    "+_READ_CALL),
+              _replacing("  static int ParentPidOf(IntPtr process) {\n","  static IntPtr fixtureRead;\n  [DllImport(\"kernelbase.dll\")] static extern bool CompareObjectHandles(IntPtr a, IntPtr b);\n  static int ParentPidOf(IntPtr process) {\n"),
+              _replacing(_ACCEPT,'if(fixtureRead!=read || !CompareObjectHandles(read,kid.Handle)) throw new Win32Exception(5,"fixture-parent-read-on-another-handle");\n          '+_ACCEPT))
 
 
 def _ps_path(path):
@@ -2683,7 +2688,7 @@ def test_r15_control_a_snapshot_pid_held_by_an_older_unrelated_process_is_never_
 def test_r15_control_a_candidate_that_cannot_be_read_is_uncertain_and_never_killed_by_the_loop(fixture_tree):
     # The unreadable control, green on 05e95288 too: every creation-time read except the root's is refused, as for a process this account may not open.
     root=fixture_tree["root"]
-    refuse=_replacing("static Int64 CreatedFileTime(Process p) {\n",'static Int64 CreatedFileTime(Process p) {\n    if(p.Id.ToString()!=Environment.GetEnvironmentVariable("MLV_FIXTURE_READABLE")) throw new Win32Exception(5,"fixture-unreadable");\n')
+    refuse=_replacing("  static Int64 CreatedFileTime(IntPtr process) {\n",'  [DllImport("kernel32.dll")] static extern int GetProcessId(IntPtr process);\n  static Int64 CreatedFileTime(IntPtr process) {\n    if(GetProcessId(process).ToString()!=Environment.GetEnvironmentVariable("MLV_FIXTURE_READABLE")) throw new Win32Exception(5,"fixture-unreadable");\n')
     q=_stopped_lane(fixture_tree,refuse,_replacing(_DIRECT_KILL,"$Proc.Kill()"),before_throw="$env:MLV_FIXTURE_READABLE=[string]$proc.Id\n")
     assert q["codexDirectChildStop"].startswith("uncertain:"),q
     assert _lives(_state(root,"grand.json")),q
@@ -2704,10 +2709,7 @@ def test_r15_a_valid_child_is_accepted_on_the_handle_the_kill_then_uses(fixture_
     # A spy, not a race: two opens of one pid cannot be raced here. The one NtQueryInformationProcess call records its handle, and acceptance requires it to be the handle the lane keeps,
     # so a parent read through any other open fails here. The runtime kill misses the child, so its death also shows the walk accepted it on that read.
     root=fixture_tree["root"]
-    spy=_chain(_replacing(_READ_CALL,"fixtureRead=p.Handle;\n    "+_READ_CALL),
-               _replacing("  static int ParentPidOf(Process p) {\n","  static IntPtr fixtureRead;\n  static int ParentPidOf(Process p) {\n"),
-               _replacing(_ACCEPT,'if(fixtureRead!=kid.Handle) throw new Win32Exception(5,"fixture-parent-read-on-another-handle");\n        '+_ACCEPT))
-    q=_stopped_lane(fixture_tree,spy,_replacing(_DIRECT_KILL,"$Proc.Kill()"))
+    q=_stopped_lane(fixture_tree,_SPY,_replacing(_DIRECT_KILL,"$Proc.Kill()"))
     wait_absent(_state(root,"grand.json"),5)
     assert q["codexDirectChildStop"]=="killed",q
 
@@ -2723,11 +2725,7 @@ def test_r15_mutation_mismatch_marked_uncertain_but_still_killed_kills_the_repla
 
 
 def test_r15_mutation_parent_read_on_a_separately_opened_handle_is_seen_by_the_spy(fixture_tree):
-    spy=_chain(_replacing(_READ_CALL,"fixtureRead=p.Handle;\n    "+_READ_CALL),
-               _replacing("  static int ParentPidOf(Process p) {\n","  static IntPtr fixtureRead;\n  static int ParentPidOf(Process p) {\n"),
-               _replacing(_ACCEPT,'if(fixtureRead!=kid.Handle) throw new Win32Exception(5,"fixture-parent-read-on-another-handle");\n        '+_ACCEPT),
-               _replacing(_PARENT_READ,"parentPid=ParentPidOf(Process.GetProcessById(kid.Id))"))
-    q=_stopped_lane(fixture_tree,spy)
+    q=_stopped_lane(fixture_tree,_SPY,_replacing(_PARENT_READ,"parentPid=ParentPidOf(Process.GetProcessById(kid.Id).Handle)"))
     assert q["codexDirectChildStop"]=="uncertain:tree-unreadable",q
 
 
@@ -2742,6 +2740,156 @@ def test_r15_mutation_older_than_parent_accepted_as_a_member_kills_the_child(fix
     q=_stopped_lane(fixture_tree,_parent_reads_newer(),_replacing(_DIRECT_KILL,"$Proc.Kill()"),_replacing(_OLDER_BRANCH,"if(StartedBeforeParent(created,parentCreated)) { }"))
     wait_absent(_state(root,"grand.json"),5)
     assert q["codexDirectChildStop"]=="killed",q
+
+
+# CONTAINMENT-KID-READ-ACCESS-DENIED-1: hosted CI read 'uncertain:ancestry-unreadable:kid-read:5' three times (PR 420 job 128859524832 on :2660, PR 766 job 128492230194 and
+# PR 775 job 128881183190 on :2678). Every Windows host keeps processes whose parent pid is free (csrss, wininit, winlogon: their smss instance has exited). When a lane's
+# process is handed that recycled pid, the snapshot lists such an older process under it, ahead of the real children. The walk opened each candidate through Process.Handle,
+# which asks for PROCESS_ALL_ACCESS; a protected process refuses that with 5 even to an elevated account, although the reads need only PROCESS_QUERY_LIMITED_INFORMATION.
+# That is a possible mechanism for the hosted reads, not their proven cause: no receipt names the process (cause UNKNOWN). The older process is real. Two seams: the parent
+# pid it reports stands for the recycled pid (that cannot be forced on a shared host), and _grants_only stands for what it grants, because on an elevated host a DACL does not
+# bind a debug-privileged reader (r2, see _grants_only). Its real DACL still matches the seam, for hosts where it does bind.
+def _set_process_dacl(handle,sddl):
+    import ctypes, ctypes.wintypes as w
+    adv=ctypes.WinDLL("advapi32",use_last_error=True)
+    adv.ConvertStringSecurityDescriptorToSecurityDescriptorW.argtypes=[w.LPCWSTR,w.DWORD,ctypes.POINTER(ctypes.c_void_p),ctypes.c_void_p]
+    adv.GetSecurityDescriptorDacl.argtypes=[ctypes.c_void_p,ctypes.POINTER(w.BOOL),ctypes.POINTER(ctypes.c_void_p),ctypes.POINTER(w.BOOL)]
+    adv.SetSecurityInfo.argtypes=[w.HANDLE,ctypes.c_int,w.DWORD,ctypes.c_void_p,ctypes.c_void_p,ctypes.c_void_p,ctypes.c_void_p]
+    k32=ctypes.WinDLL("kernel32",use_last_error=True)
+    k32.LocalFree.argtypes=[ctypes.c_void_p]
+    sd=ctypes.c_void_p()
+    assert adv.ConvertStringSecurityDescriptorToSecurityDescriptorW(sddl,1,ctypes.byref(sd),None), ctypes.get_last_error()
+    try:   # r2 (adversary advisory A1 on 30679c0e): the descriptor is the caller's to LocalFree
+        present=w.BOOL(); dacl=ctypes.c_void_p(); defaulted=w.BOOL()
+        assert adv.GetSecurityDescriptorDacl(sd,ctypes.byref(present),ctypes.byref(dacl),ctypes.byref(defaulted)), ctypes.get_last_error()
+        rc=adv.SetSecurityInfo(int(handle),6,4,None,None,dacl,None)   # SE_KERNEL_OBJECT, DACL_SECURITY_INFORMATION
+        assert rc==0, rc
+    finally:
+        k32.LocalFree(sd)
+
+
+def _older_process(sddl):
+    # Started before the lane, so it is older than the lane's process by creation time and by the kernel's process count. Popen's own handle was opened before the DACL
+    # changed, so it keeps the rights to stop it at the end.
+    older=subprocess.Popen(["ping.exe","-n","150","127.0.0.1"],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,stdin=subprocess.DEVNULL,creationflags=subprocess.CREATE_NO_WINDOW)
+    try:
+        _set_process_dacl(older._handle,sddl)
+    except BaseException:   # r2 (adversary advisory A1 on 3d170b25): no caller's finally covers it yet, so a failed setup stops it here
+        older.kill(); older.wait(10)
+        raise
+    return older
+
+
+_QUERY_LIMITED_ONLY = "D:(A;;0x1000;;;WD)"   # PROCESS_QUERY_LIMITED_INFORMATION, what a protected process grants an elevated account
+_NOTHING = "D:"                               # no access to anyone: genuinely unreadable
+
+
+def _listed_first_under_the_root():
+    # The snapshot lists processes in creation order, so an older process under a recycled pid comes ahead of the real children: its note is the one that stands.
+    return _replacing(_SNAPSHOT_CLOSED,_SNAPSHOT_CLOSED+'string stale=Environment.GetEnvironmentVariable("MLV_FIXTURE_STALE_KID");\nkids.Remove(int.Parse(stale));\nif(!kids.ContainsKey(root.Id)) kids[root.Id]=new List<int>();\nkids[root.Id].Insert(0,int.Parse(stale));\n')
+
+
+def _reports_the_recycled_parent():
+    # The older process's recorded parent pid is the pid the lane's process now holds, as for csrss after its smss instance exited.
+    return _replacing(_MISMATCH_BRANCH,'if(id.ToString()==Environment.GetEnvironmentVariable("MLV_FIXTURE_STALE_KID")) parentPid=parent.Id;\n        '+_MISMATCH_BRANCH)
+
+
+# r2 (hosted CI red on 04be52f7: run 42538300582, job 128907409388, the two tests that need a real DACL to refuse an open read 'killed'). The runner is an elevated
+# administrator, and System.Diagnostics.ProcessManager's static constructor enables SeDebugPrivilege (LookupPrivilegeValue("SeDebugPrivilege"), AdjustTokenPrivileges;
+# pwsh 7.6.9, .NET 10.0.14). That privilege passes every DACL check on a process that is not protected, so a DACL cannot make a fixture process refuse an elevated reader.
+# What the older process refuses is therefore a seam at the walk's one candidate open: for the older process's pid, a request for any right outside 'grants' fails with 5,
+# which is how a protected process answers any caller. Every open of that pid is logged, so a run in which the older process never reached the kid read fails on that
+# premise, loudly, instead of reading 'killed'.
+def _grants_only(grants,log):
+    return _replacing('  [DllImport("kernel32.dll", SetLastError=true)]\n  static extern IntPtr OpenProcess(uint access, bool inheritHandle, int processId);\n',
+        '  [DllImport("kernel32.dll", EntryPoint="OpenProcess", SetLastError=true)]\n  static extern IntPtr FixtureRealOpenProcess(uint access, bool inheritHandle, int processId);\n'
+        '  static IntPtr OpenProcess(uint access, bool inheritHandle, int processId) {\n'
+        '    if(processId.ToString()==Environment.GetEnvironmentVariable("MLV_FIXTURE_STALE_KID")) {\n'
+        f'      bool refused=(access & ~0x{grants:X}U)!=0;\n'
+        f'      System.IO.File.AppendAllText(@"{log}",access.ToString("X")+(refused ? " refused" : " opened")+"\\n");\n'
+        '      if(refused) { Marshal.SetLastPInvokeError(5); return IntPtr.Zero; }\n'
+        '    }\n'
+        '    return FixtureRealOpenProcess(access,inheritHandle,processId);\n'
+        '  }\n')
+
+
+def _orphan_lane(tree,older,*extra,grants=0x1000):
+    # Returns the receipt and the opens of the older process's pid the walk made, in order.
+    log=tree["root"]/"older-opens.txt"
+    q=_stopped_lane(tree,_listed_first_under_the_root(),_reports_the_recycled_parent(),_grants_only(grants,log),*extra,before_throw=f"$env:MLV_FIXTURE_STALE_KID='{older.pid}'\n")
+    return q,(log.read_text(encoding="utf-8").splitlines() if log.exists() else [])
+
+
+def test_kid_read_a_protected_older_process_under_a_recycled_pid_is_no_member_and_the_stop_is_killed(fixture_tree):
+    # PR 775 / PR 766's shape (:2678 expected 'killed'). The older process is read on a query-limited handle, and the kernel's process count shows it existed before the
+    # lane's process, so it was never that process's child: it is neither killed nor a reason for doubt.
+    root=fixture_tree["root"]
+    older=_older_process(_QUERY_LIMITED_ONLY)
+    try:
+        q,opens=_orphan_lane(fixture_tree,older)
+        assert opens==["1000 opened"],(opens,q)   # the premise: the walk read the older process on a query-limited open
+        assert older.poll() is None, "the lane killed an older process that was never in the tree"
+        wait_absent(_state(root,"child.json"),5)
+        wait_absent(_state(root,"grand.json"),5)
+        assert q["codexDirectChildStop"]=="killed",q
+    finally:
+        older.kill(); older.wait(10)
+
+
+def test_kid_read_a_protected_older_process_ahead_of_a_child_reading_older_leaves_the_childs_own_word(fixture_tree):
+    # PR 420's shape (:2660 expected 'uncertain:older-than-parent'). The older process is listed first; it must not replace the word about the real child.
+    root=fixture_tree["root"]
+    older=_older_process(_QUERY_LIMITED_ONLY)
+    try:
+        q,opens=_orphan_lane(fixture_tree,older,_parent_reads_newer(),_replacing(_DIRECT_KILL,"$Proc.Kill()"))
+        assert opens==["1000 opened"],(opens,q)
+        assert older.poll() is None, "the lane killed an older process that was never in the tree"
+        wait_absent(_state(root,"child.json"),5)
+        assert _lives(_state(root,"grand.json")), "the explicit loop killed a process whose ancestry it could not establish"
+        assert q["codexDirectChildStop"]=="uncertain:older-than-parent",q
+    finally:
+        older.kill(); older.wait(10)
+
+
+def test_kid_read_control_an_older_process_that_cannot_be_read_at_all_stays_uncertain_and_lives(fixture_tree):
+    # The unreadable control: nothing is granted, so nothing about it can be shown. It is never killed, and 'killed' is never claimed. The refusal is the seam's (grants=0):
+    # the real no-grant DACL alone did not refuse the elevated, debug-privileged reader on the hosted runner (r2).
+    root=fixture_tree["root"]
+    older=_older_process(_NOTHING)
+    try:
+        q,opens=_orphan_lane(fixture_tree,older,grants=0)
+        assert opens==["1000 refused"],(opens,q)   # the premise: the older process was a candidate, and its read was refused
+        assert older.poll() is None, "the lane killed a process it could not read"
+        wait_absent(_state(root,"child.json"),5)
+        assert q["codexDirectChildStop"]=="uncertain:ancestry-unreadable:kid-read:5",q
+        assert "codex-direct-child-uncertain:ancestry-unreadable:kid-read:5" in q["failure"],q
+    finally:
+        older.kill(); older.wait(10)
+
+
+def test_kid_read_control_an_unread_process_count_proves_nothing_and_the_clock_word_stands(fixture_tree):
+    # Fail-closed control for the count: when it cannot be read (0), the older process is judged by its clock alone, which a recycled pid and a clock step share. Uncertain, alive.
+    older=_older_process(_QUERY_LIMITED_ONLY)
+    try:
+        q,opens=_orphan_lane(fixture_tree,older,_replacing("sequence=SequenceOf(read);","sequence=0;"))
+        assert opens==["1000 opened"],(opens,q)
+        assert older.poll() is None, "the lane killed a process it could not place in the tree"
+        assert q["codexDirectChildStop"]=="uncertain:older-than-parent",q
+    finally:
+        older.kill(); older.wait(10)
+
+
+def test_kid_read_mutation_reads_on_a_full_access_open_again_read_as_unreadable(fixture_tree):
+    # The mask is what matters: the same read through a PROCESS_ALL_ACCESS open is refused with 5 by a process that grants query-limited only (the seam: a real DACL does
+    # not refuse a debug-privileged reader, r2), and the token is the one hosted CI saw.
+    older=_older_process(_QUERY_LIMITED_ONLY)
+    try:
+        q,opens=_orphan_lane(fixture_tree,older,_replacing("OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION,false,id)","OpenProcess(0x1FFFFF,false,id)"))
+        assert opens==["1FFFFF refused"],(opens,q)
+        assert older.poll() is None,q
+        assert q["codexDirectChildStop"]=="uncertain:ancestry-unreadable:kid-read:5",q
+    finally:
+        older.kill(); older.wait(10)
 
 
 # VISUAL-JUDGE-TERRA-LANE-1 r15 fix iteration 1 (adversary A1 on 82faecd9): CreateProcess reads its command line up to the first NUL, so a NUL in one argument drops every argument after it,
