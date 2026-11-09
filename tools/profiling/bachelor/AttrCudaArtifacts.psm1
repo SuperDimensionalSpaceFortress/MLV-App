@@ -7218,15 +7218,22 @@ function Get-AttrCudaPlaybackTemporalCoverage {
         $why = 'trace readiness was not observed, so the late end of the capture-start bracket is no bound on the PresentMon origin'
     }
     else {
-        # adversary r1 A1: only a record that STARTS with the marker (after the optional log-sink prefix) counts, so the marker quoted in another
-        # record's Qt location suffix (a build path) is never taken for the swap window.
-        $swapLines = @(if (-not [string]::IsNullOrEmpty($LogText)) { [regex]::Matches($LogText, '(?m)^(\[[^\]\r\n]*\] \[[A-Za-z]+\] (\[0x[0-9A-Fa-f]+\] )?)?playback_smoke\.gpu_window_swaps [^\r\n]*?first_swap_utc=(?<first>\S+) last_swap_utc=(?<last>\S+)') })
-        if ($swapLines.Count -eq 0) { $why = 'no playback_smoke.gpu_window_swaps line with first_swap_utc/last_swap_utc in the run log' }
+        # adversary r1 A1 + r2 A1: only a record that STARTS with the marker (after the optional log-sink prefix) counts, so the marker quoted in another
+        # record's Qt location suffix (a build path) is never taken for the swap window. The LAST such record alone supplies the window, and only
+        # from its own key=value fields (the match stops at the first token that is not key=value, e.g. a " (C:/build ...)" location suffix): a final
+        # record that carries no stamps makes the arm unavailable instead of falling back to an earlier session's window.
+        $swapRecords = @(if (-not [string]::IsNullOrEmpty($LogText)) { [regex]::Matches($LogText, '(?m)^(?:\[[^\]\r\n]*\] \[[A-Za-z]+\] (?:\[0x[0-9A-Fa-f]+\] )?)?playback_smoke\.gpu_window_swaps(?<fields>(?: [A-Za-z_][A-Za-z0-9_]*=[^\s]*)*)') })
+        if ($swapRecords.Count -eq 0) { $why = 'no playback_smoke.gpu_window_swaps line with first_swap_utc/last_swap_utc in the run log' }
         else {
-            $last = $swapLines[$swapLines.Count - 1]
+            $fields = $swapRecords[$swapRecords.Count - 1].Groups['fields'].Value
+            $firstField = [regex]::Match($fields, '(?:^| )first_swap_utc=(?<v>\S+)')
+            $lastField = [regex]::Match($fields, '(?:^| )last_swap_utc=(?<v>\S+)')
             $inv = [System.Globalization.CultureInfo]::InvariantCulture
             $styles = [System.Globalization.DateTimeStyles]::AdjustToUniversal -bor [System.Globalization.DateTimeStyles]::AssumeUniversal
-            if (-not [datetime]::TryParse($last.Groups['first'].Value, $inv, $styles, [ref]$firstUtc) -or -not [datetime]::TryParse($last.Groups['last'].Value, $inv, $styles, [ref]$lastUtc)) {
+            if (-not $firstField.Success -or -not $lastField.Success) {
+                $why = 'the last playback_smoke.gpu_window_swaps record carries no first_swap_utc/last_swap_utc stamps'
+            }
+            elseif (-not [datetime]::TryParse($firstField.Groups['v'].Value, $inv, $styles, [ref]$firstUtc) -or -not [datetime]::TryParse($lastField.Groups['v'].Value, $inv, $styles, [ref]$lastUtc)) {
                 $why = 'the gpu_window_swaps first_swap_utc/last_swap_utc stamps are unparseable'
             }
             elseif ($lastUtc -le $firstUtc) { $why = 'the gpu_window_swaps window is empty or reversed' }
@@ -7240,15 +7247,41 @@ function Get-AttrCudaPlaybackTemporalCoverage {
     }
 
     $values = @($TimeInMsValues | Where-Object { $null -ne $_ })
+    # adversary r2 A2: PresentMon's origin may be ANY instant in [EarliestAnchorUtc, LatestAnchorUtc], and the worst gap need not sit at either end:
+    # the window slides over the rows as the origin moves, and a hole is inside it only for the origins between the endpoints. The gap as a
+    # function of the origin changes only where a row crosses a window edge, so the origins tried are the two endpoints plus, for every row, the origin
+    # that puts it exactly on the window start and on the window end, each with a 0.01 ms step either side (the edges are inclusive).
+    $originSpanMs = ([datetime]$LatestAnchorUtc - [datetime]$EarliestAnchorUtc).TotalMilliseconds
+    $startAtEarliestMs = ($firstUtc - [datetime]$EarliestAnchorUtc).TotalMilliseconds
+    $windowMs = ($lastUtc - $firstUtc).TotalMilliseconds
+    $origins = [System.Collections.Generic.List[double]]::new()
+    [void]$origins.Add(0.0)
+    [void]$origins.Add($originSpanMs)
+    foreach ($v in $values) {
+        foreach ($edge in @(($startAtEarliestMs - $v), ($startAtEarliestMs + $windowMs - $v))) {
+            foreach ($step in @(-0.01, 0.0, 0.01)) {
+                $o = $edge + $step
+                if ($o -gt 0.0 -and $o -lt $originSpanMs) { [void]$origins.Add($o) }
+            }
+        }
+    }
+    $originList = @($origins | Sort-Object -Unique)
+    if ($originList.Count -gt 1500) {
+        return [pscustomobject]@{
+            windowSource = 'unavailable'; unavailableReason = 'the capture-start bracket is too wide to evaluate every PresentMon origin it permits'; sufficient = $null; maxGapMs = $null; gapKind = $null
+            anchor = $null; windowFirstUtc = $null; windowLastUtc = $null; rowsInWindow = $null
+        }
+    }
     $worst = $null
-    foreach ($anchor in @(@{ name = 'earliest'; utc = [datetime]$EarliestAnchorUtc }, @{ name = 'latest'; utc = [datetime]$LatestAnchorUtc })) {
-        $startMs = ($firstUtc - $anchor.utc).TotalMilliseconds
-        $endMs = ($lastUtc - $anchor.utc).TotalMilliseconds
+    foreach ($originMs in $originList) {
+        $startMs = $startAtEarliestMs - $originMs
+        $endMs = $startMs + $windowMs
         $inWindow = @($values | Where-Object { $_ -ge $startMs -and $_ -le $endMs })
         $cov = Get-AttrCudaTemporalCoverage -TimeInMsValues $inWindow -WindowStartMs $startMs -WindowEndMs $endMs -MaxGapMs $MaxGapMs
-        # adversary r1 A2: an insufficient endpoint (zero rows is always insufficient) is never outvoted by a sufficient one; then the larger gap wins.
+        $anchorName = if ($originMs -eq 0.0) { 'earliest' } elseif ($originMs -eq $originSpanMs) { 'latest' } else { 'interior' }
+        # adversary r1 A2: an insufficient origin (zero rows is always insufficient) is never outvoted by a sufficient one; then the larger gap wins.
         $worse = ($null -eq $worst) -or ((-not $cov.sufficient) -and $worst.cov.sufficient) -or (([bool]$cov.sufficient -eq [bool]$worst.cov.sufficient) -and $cov.maxGapMs -gt $worst.cov.maxGapMs)
-        if ($worse) { $worst = @{ cov = $cov; anchor = $anchor.name; rows = $inWindow.Count } }
+        if ($worse) { $worst = @{ cov = $cov; anchor = $anchorName; rows = $inWindow.Count } }
     }
     [pscustomobject]@{
         windowSource = 'app_swap_window'; unavailableReason = $null

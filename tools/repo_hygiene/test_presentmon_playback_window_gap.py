@@ -145,6 +145,41 @@ class AdversaryR1Tests(unittest.TestCase):
                       "-and $_.msBetweenDisplayChange -gt 0 } | ForEach-Object { [double]$_.timeInMs })", module)
 
 
+@requires_windows_pwsh
+class AdversaryR2Tests(unittest.TestCase):
+    """Adversary review-adversary-...-r2-a63a0dd1 findings A1-A2 (both introduced, major), each fed its own input."""
+
+    EARLY = "2026-11-09T00:00:00.0000000Z"
+    GOOD = ("playback_smoke.gpu_window_swaps session=1 window_active=1 telemetry_enabled=1 swaps=30 "
+            "first_swap_utc=2026-11-09T00:00:01Z last_swap_utc=2026-11-09T00:00:30Z")
+    EMPTY = "playback_smoke.gpu_window_swaps session=2 window_active=1 telemetry_enabled=1 swaps=0 first_swap_utc= last_swap_utc= superseded_before_paint=0"
+
+    def test_a1_a_last_record_without_stamps_is_unavailable_never_an_earlier_sessions_window(self) -> None:
+        r = coverage([1000.0 * i for i in range(1, 31)], self.GOOD + "\n" + self.EMPTY, early=self.EARLY, late=self.EARLY)["r"]
+        self.assertEqual(r["windowSource"], "unavailable", r)
+        self.assertIsNone(r["sufficient"], r)
+
+    def test_a1_stamps_quoted_in_the_last_records_location_suffix_are_never_its_window(self) -> None:
+        log = self.EMPTY + " (C:/build first_swap_utc=2026-11-08 last_swap_utc=2026-11-09 x/MainWindow.cpp:31938)"
+        r = coverage([1000.0 * i for i in range(1, 31)], log, early=self.EARLY, late=self.EARLY)["r"]
+        self.assertEqual(r["windowSource"], "unavailable", r)
+
+    def test_a2_a_gap_the_bracket_permits_between_the_endpoints_is_never_admitted(self) -> None:
+        log = ("playback_smoke.gpu_window_swaps session=1 window_active=1 telemetry_enabled=1 swaps=162 "
+               "first_swap_utc=2026-11-09T00:01:00Z last_swap_utc=2026-11-09T00:01:25Z")
+        times = [38000.0 + 250.0 * i for i in range(81)] + [65000.0 + 250.0 * i for i in range(81)]
+        r = coverage(times, log, early=self.EARLY, late="2026-11-09T00:00:22.0000000Z")["r"]
+        # An origin 11 s into the bracket puts a 7 s hole inside the window: sufficient must be false (or the arm unavailable, never a pass).
+        self.assertFalse(r.get("sufficient"), r)
+        if r["windowSource"] == "app_swap_window":
+            self.assertGreaterEqual(r["maxGapMs"], 7000.0, r)
+
+    def test_a2_the_real_width_bracket_still_passes_the_healthy_leg(self) -> None:
+        r = coverage(stalled_leg_times(), SWAPS)["r"]
+        self.assertEqual(r["windowSource"], "app_swap_window", r)
+        self.assertTrue(r["sufficient"], r)
+
+
 class JobWiringTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
