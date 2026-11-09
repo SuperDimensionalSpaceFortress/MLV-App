@@ -1294,7 +1294,8 @@ try {
     # The cleanup STATUS token of a SIDECAR-WRITE-FAILED message, read at its FIXED position (right after attempts=<n>), never searched for
     # anywhere in the message: the tmp path that follows may itself contain 'tmp=removed' (sol r2 B1). $null = not the typed failure.
     function Get-SidecarTmpStatus([string]$Message) {
-        if ($Message -cmatch '^SIDECAR-WRITE-FAILED job=\S+ attempts=\d+ (tmp=removed|tmp_remaining=|tmp=unknown)') { return $Matches[1] }
+        # A COMPLETE token (adversary r3 A1): tmp=removed then a space, tmp_remaining= then a non-space (the path), tmp=unknown then '('.
+        if ($Message -cmatch '^SIDECAR-WRITE-FAILED job=\S+ attempts=\d+ (tmp=removed(?= )|tmp_remaining=(?=\S)|tmp=unknown(?=\())') { return $Matches[1] }
         return $null
     }
     # One Write-SidecarRaw under a persistent rename fault (kind 'io' | 'denied'), optionally holding the tmp open (-Hold) and/or with the
@@ -1309,7 +1310,10 @@ try {
         if ($null -ne $err) { foreach ($k in 'tmp_state', 'tmp_remaining', 'tmp_state_error') { if ($err.Exception.Data.Contains($k)) { $data[$k] = [string]$err.Exception.Data[$k] } } }
         $leftPaths = @(Get-ChildItem -LiteralPath $notAfterDir -Filter "$Jid.json.*.tmp" -File -ErrorAction SilentlyContinue | ForEach-Object { $_.FullName })
         if ($null -ne $fault.holder) { $fault.holder.Dispose() }
-        foreach ($p in $leftPaths) { Remove-Item -LiteralPath $p -Force -ErrorAction SilentlyContinue }
+        foreach ($p in $leftPaths) { try { Remove-Item -LiteralPath $p -Force -ErrorAction Stop } catch { } }
+        # adversary r3 A2: the removal is checked, not assumed - fixture residue the probe cannot remove fails the probe (never silently kept).
+        $stuck = @($leftPaths | Where-Object { Test-Path -LiteralPath $_ })
+        Assert-True ($stuck.Count -eq 0) "Invoke-SidecarCleanupProbe could not remove the probe's leftover tmp file(s): $($stuck -join '; ')"
         return [pscustomobject]@{ err = $err; msg = $(if ($null -ne $err) { $err.Exception.Message } else { '' }); moves = $fault.moves; injected = $fault.injected
             holderPath = $fault.holderPath; leftPaths = $leftPaths; data = $data }
     }
@@ -2630,6 +2634,9 @@ function Exit-HeavySlot {
         $notAfterDir = Join-Path $tokRoot 'notafter'
         try {
             New-Item -ItemType Directory -Force -Path $notAfterDir | Out-Null
+            # adversary r3 A1: the status token is a COMPLETE token. A longer word at the same position is not a status.
+            Assert-True ($null -eq (Get-SidecarTmpStatus 'SIDECAR-WRITE-FAILED job=jRt attempts=3 tmp=removedness IOException: x') -and $null -eq (Get-SidecarTmpStatus 'SIDECAR-WRITE-FAILED job=jRt attempts=3 tmp=unknownish IOException: x') -and $null -eq (Get-SidecarTmpStatus 'SIDECAR-WRITE-FAILED job=jRt attempts=3 tmp_remaining= IOException: x')) "cleanup-path-token: a malformed status token (tmp=removedness, tmp=unknownish, an empty tmp_remaining=) is not recognised as a status"
+            Assert-True ((Get-SidecarTmpStatus 'SIDECAR-WRITE-FAILED job=jRt attempts=3 tmp=removed IOException: x') -ceq 'tmp=removed' -and (Get-SidecarTmpStatus 'SIDECAR-WRITE-FAILED job=jRt attempts=3 tmp=unknown(UnauthorizedAccessException) IOException: x') -ceq 'tmp=unknown' -and (Get-SidecarTmpStatus 'SIDECAR-WRITE-FAILED job=jRt attempts=3 tmp_remaining=C:\x\y.tmp IOException: x') -ceq 'tmp_remaining=') "cleanup-path-token: the three well-formed status tokens are recognised"
             $r = Invoke-SidecarCleanupProbe 'jRt' 'io' $true
             Assert-True ($null -ne $r.holderPath -and $r.holderPath.Contains('tmp=removed') -and $r.msg.Contains("tmp_remaining=$($r.holderPath)")) "cleanup-path-token: premise - the retained-file report carries the substring tmp=removed inside the path: msg=[$($r.msg)]"
             Assert-True ((Get-SidecarTmpStatus $r.msg) -ceq 'tmp_remaining=' -and $r.data['tmp_state'] -ceq 'remaining') "cleanup-path-token: IOException path, held tmp, token path: status is 'remaining' (token=$(Get-SidecarTmpStatus $r.msg) state=$($r.data['tmp_state']))"
@@ -2664,8 +2671,22 @@ function Exit-HeavySlot {
         # Removal throws but the existence query works and finds the file: that is a checked 'remaining', not unknown.
         $r = Invoke-SidecarCleanupProbe 'jRu' 'io' $false @{ remove = $true; test = $false }
         Assert-True ((Get-SidecarTmpStatus $r.msg) -ceq 'tmp_remaining=' -and $r.data['tmp_state'] -ceq 'remaining' -and $r.leftPaths.Count -eq 1 -and $r.msg.Contains("tmp_remaining=$($r.leftPaths[0])")) "cleanup-unknown: removal threw but the file was observed: reported remaining with its path: token=$(Get-SidecarTmpStatus $r.msg) state=$($r.data['tmp_state'])"
-        $script:SidecarMoveFault = $null; $script:SidecarCleanupFault = $null
-        $results.livenessRenewHookWriteRetryCleanupUnknown = [ordered]@{ primaryKept = $true; stateUnknown = $true }
+        # adversary r3 A2: the probe's own leftover removal is checked, not assumed. A pre-existing tmp held open WITHOUT delete sharing cannot be
+        # removed, so the probe must fail loudly (its fixture residue is never left unreported), after disposing its own holder.
+        $heldLeft = Join-Path $notAfterDir 'jRz.json.00000000000000000000000000000000.tmp'
+        $heldStream = $null; $probeErr = $null
+        try {
+            [IO.File]::WriteAllText($heldLeft, '{}')
+            $heldStream = [IO.FileStream]::new($heldLeft, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)
+            try { $null = Invoke-SidecarCleanupProbe 'jRz' 'io' $false } catch { $probeErr = $_ }
+        }
+        finally {
+            if ($null -ne $heldStream) { $heldStream.Dispose() }
+            Remove-Item -LiteralPath $heldLeft -Force -ErrorAction SilentlyContinue
+            $script:SidecarMoveFault = $null; $script:SidecarCleanupFault = $null
+        }
+        Assert-True ($null -ne $probeErr -and "$probeErr" -like '*could not remove*') "cleanup-unknown: a probe leftover that cannot be removed fails the probe loudly instead of being swallowed: [$probeErr]"
+        $results.livenessRenewHookWriteRetryCleanupUnknown =[ordered]@{ primaryKept = $true; stateUnknown = $true }
     }
 
     # ------------------------------------------------------------ liveness-renewal-stops-lapses: the negative case, renewal really stops
