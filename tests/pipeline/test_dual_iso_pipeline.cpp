@@ -6766,16 +6766,29 @@ private:
 };
 
 // probe == nullptr runs the default (fast) route; a probe mode >= 0 runs legacy.
+// The matched-source smooth dumps both smoothed planes into dump_dir
+// (DUALISO_DEBUG_SOURCE_SMOOTH_DIR, written only by smooth_matched_source_planes),
+// which proves the stage ran and gives a plane-level identity check.
 bool mix_chroma_run_full20(const struct raw_info & raw,
                            const std::vector<uint16_t> & source,
                            const char * probe,
                            int interp_method,
                            int iso_pattern_in,
+                           const QString & dump_dir,
                            std::vector<uint16_t> * image,
-                           dualiso_full20bit_timing_t * timing)
+                           dualiso_full20bit_timing_t * timing,
+                           QByteArray * bright_plane,
+                           QByteArray * dark_plane)
 {
     ScopedMixChromaProbeEnv env;
     env.set(probe);
+    const QString bright_path = dump_dir + QStringLiteral("/stage_bright_source_smooth.u32");
+    const QString dark_path = dump_dir + QStringLiteral("/stage_dark_source_smooth.u32");
+    QFile::remove(bright_path);
+    QFile::remove(dark_path);
+    const bool had_dump = qEnvironmentVariableIsSet("DUALISO_DEBUG_SOURCE_SMOOTH_DIR");
+    const QByteArray old_dump = qgetenv("DUALISO_DEBUG_SOURCE_SMOOTH_DIR");
+    qputenv("DUALISO_DEBUG_SOURCE_SMOOTH_DIR", dump_dir.toLocal8Bit());
     dualiso_debug_reset_full20bit_timing();
     *image = source;
     dualiso_full20bit_scratch_t scratch = {};
@@ -6801,6 +6814,18 @@ bool mix_chroma_run_full20(const struct raw_info & raw,
                                       &scratch);
     dualiso_debug_get_full20bit_timing(timing);
     free_dualiso_full20bit_scratch(&scratch);
+    if (had_dump)
+    {
+        qputenv("DUALISO_DEBUG_SOURCE_SMOOTH_DIR", old_dump);
+    }
+    else
+    {
+        qunsetenv("DUALISO_DEBUG_SOURCE_SMOOTH_DIR");
+    }
+    QFile bright_file(bright_path);
+    QFile dark_file(dark_path);
+    *bright_plane = bright_file.open(QIODevice::ReadOnly) ? bright_file.readAll() : QByteArray();
+    *dark_plane = dark_file.open(QIODevice::ReadOnly) ? dark_file.readAll() : QByteArray();
     return rc == 1;
 }
 
@@ -6810,17 +6835,27 @@ void mix_chroma_expect_full20_identity(const char * label,
                                        int interp_method,
                                        int iso_pattern)
 {
+    QTemporaryDir dump_dir;
+    ASSERT_TRUE(dump_dir.isValid());
     std::vector<uint16_t> fast_image;
     std::vector<uint16_t> legacy_image;
     dualiso_full20bit_timing_t fast_timing = {};
     dualiso_full20bit_timing_t legacy_timing = {};
-    ASSERT_TRUE(mix_chroma_run_full20(raw, source, nullptr, interp_method, iso_pattern, &fast_image, &fast_timing));
-    ASSERT_TRUE(mix_chroma_run_full20(raw, source, "1", interp_method, iso_pattern, &legacy_image, &legacy_timing));
-    // Both runs reached the matched-source smooth, on different routes.
+    QByteArray fast_bright, fast_dark, legacy_bright, legacy_dark;
+    ASSERT_TRUE(mix_chroma_run_full20(raw, source, nullptr, interp_method, iso_pattern, dump_dir.path(),
+                                      &fast_image, &fast_timing, &fast_bright, &fast_dark));
+    ASSERT_TRUE(mix_chroma_run_full20(raw, source, "1", interp_method, iso_pattern, dump_dir.path(),
+                                      &legacy_image, &legacy_timing, &legacy_bright, &legacy_dark));
+    // Both runs reached the matched-source smooth (it alone writes the dumps),
+    // on different routes (probe mode recorded by that stage).
     ASSERT_EQ(-1, fast_timing.mix_chroma_probe_mode);
     ASSERT_EQ(1, legacy_timing.mix_chroma_probe_mode);
-    ASSERT_TRUE(fast_timing.mix_chroma_ms > 0.0);
-    ASSERT_TRUE(legacy_timing.mix_chroma_ms > 0.0);
+    const qint64 plane_bytes = static_cast<qint64>(raw.width) * raw.height * 4;
+    ASSERT_TRUE(fast_bright.size() > 0 && fast_dark.size() > 0);
+    ASSERT_TRUE(fast_bright.size() <= plane_bytes && fast_dark.size() <= plane_bytes);
+    // Smoothed source planes are byte-identical too (card section 2 extra check).
+    ASSERT_TRUE(fast_bright == legacy_bright);
+    ASSERT_TRUE(fast_dark == legacy_dark);
     ASSERT_EQ(source.size(), fast_image.size());
     ASSERT_EQ(fast_image.size(), legacy_image.size());
     size_t diff = 0;
