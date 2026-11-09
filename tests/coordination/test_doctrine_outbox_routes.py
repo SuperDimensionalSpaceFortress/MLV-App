@@ -2725,10 +2725,10 @@ def outside_readonly_target(tmp_path):
     keep = target / "precious.txt"
     keep.write_text("precious", encoding="utf-8")
     os.chmod(keep, stat.S_IREAD)
-    os.chmod(target, stat.S_IREAD)
+    os.chmod(target, stat.S_IREAD | stat.S_IEXEC)                        # r-x: the content stays readable and traversable on POSIX
     yield target, keep
-    os.chmod(target, stat.S_IWRITE | stat.S_IREAD)
-    os.chmod(keep, stat.S_IWRITE | stat.S_IREAD)
+    os.chmod(target, stat.S_IRWXU)                                       # the directory first: a child cannot be chmodded through 0500 teardown order
+    os.chmod(keep, stat.S_IREAD | stat.S_IWRITE)
 
 
 def attrs_of(path: Path) -> int:
@@ -2771,6 +2771,104 @@ def test_the_rmtree_error_hook_never_makes_a_link_or_anything_under_one_writable
     for path in (link, link / "precious.txt"):                           # the link itself, and an entry reached through it
         ob._writable_retry(lambda p: retried.append(p), str(path), PermissionError(13, "denied"), base)
     assert chmods == [] and retried == [], (kind, chmods, retried)
+
+
+# Adversary pass r2 (head 583a913d): A1 the guard's own time may carry the next attempt past the deadline; A2 a directory between the
+# hook's inspection and its chmod is swapped for a junction; A3 an unreadable scratch root must not read as "absent".
+
+def test_a_slow_guard_after_the_pause_does_not_carry_the_next_attempt_past_the_deadline(tmp_path, monkeypatch):
+    import types
+    root = tmp_path / "scratch"
+    base = root / (ob.ROUTE_SCRATCH_PREFIX + "slowguard")
+    base.mkdir(parents=True)
+    clock = [0.0]
+    starts: list[float] = []
+    real_guard = ob._scratch_guard_holds
+    guards = [0]
+
+    def attempt(path, *args, **kwargs):
+        starts.append(clock[0])
+        clock[0] += 14.8 if len(starts) == 1 else 0.0                    # the first attempt fails at 14.8: the 0.1 s pause fits ...
+        raise PermissionError(13, "in use", str(path))
+
+    def slow_guard(b, r):                                                # ... and the pause ends at 14.9, but the re-run guard takes 0.2 s
+        guards[0] += 1
+        if guards[0] > 1:
+            clock[0] += 0.2
+        return real_guard(b, r)
+
+    monkeypatch.setattr(ob.shutil, "rmtree", attempt)
+    monkeypatch.setattr(ob, "_scratch_guard_holds", slow_guard)
+    monkeypatch.setattr(ob, "time", types.SimpleNamespace(monotonic=lambda: clock[0], sleep=lambda s: clock.__setitem__(0, clock[0] + s)))
+    with pytest.raises(ob.Unknown) as caught:
+        ob.remove_exercise_scratch(base, root)
+    assert caught.value.code == "EXERCISE_SCRATCH_NOT_REMOVED"
+    assert starts == [0.0], starts
+
+
+def test_a_directory_swapped_for_a_junction_between_the_hooks_inspection_and_its_chmod_is_not_touched(tmp_path, monkeypatch, outside_readonly_target):
+    target, keep = outside_readonly_target
+    root = tmp_path / "scratch"
+    base = root / (ob.ROUTE_SCRATCH_PREFIX + "toctou")
+    objects = base / "objects"
+    objects.mkdir(parents=True)
+    victim = objects / "precious.txt"
+    victim.write_text("mine", encoding="utf-8")
+    import stat as stat_module
+    os.chmod(victim, stat_module.S_IREAD)
+    real_check = ob._inside_a_link
+    swapped: list[str] = []
+
+    def inspect_then_swap(path, b):
+        verdict = real_check(path, b)                                    # the inspection finds a plain directory ...
+        if not swapped:
+            os.chmod(victim, stat_module.S_IWRITE)
+            shutil.rmtree(objects)                                       # ... and the swap lands right after it
+            swapped.append(make_directory_link(objects, target))
+        return verdict
+
+    monkeypatch.setattr(ob, "_inside_a_link", inspect_then_swap)
+    removed: list[str] = []
+    before = attrs_of(keep)
+    ob._writable_retry(lambda p: removed.append(p), str(victim), PermissionError(13, "denied"), base)
+    assert swapped, "the swap seam never ran"
+    assert removed == [] and keep.exists() and attrs_of(keep) == before, (swapped, removed)
+
+
+def test_an_unreadable_scratch_root_is_never_reported_as_absent(tmp_path, monkeypatch):
+    root = tmp_path / "scratch"
+    base = root / (ob.ROUTE_SCRATCH_PREFIX + "unreadable")
+    base.mkdir(parents=True)
+    monkeypatch.setattr(ob, "ROUTE_SCRATCH_REMOVE_PAUSE", 0)
+    monkeypatch.setattr(ob, "ROUTE_SCRATCH_REMOVE_DEADLINE", 0.3)
+    monkeypatch.setattr(ob.shutil, "rmtree", lambda *a, **k: None)       # every entry was refused: rmtree returns without removing
+    real_guard = ob._scratch_guard_holds
+    real_lstat = os.lstat
+    unreadable = [False]
+
+    def guard(b, r):
+        verdict = real_guard(b, r)
+        unreadable[0] = True                                             # from the first guard on, the scratch's metadata cannot be read
+        return verdict
+
+    def lstat(path, *a, **k):
+        if unreadable[0] and str(path) == str(base):
+            raise PermissionError(13, "Access is denied", str(path))
+        return real_lstat(path, *a, **k)
+
+    def lexists(path):                                                   # os.path.lexists as documented: any OSError reads as "does not exist"
+        try:
+            lstat(path)
+        except (OSError, ValueError):
+            return False
+        return True
+
+    monkeypatch.setattr(ob, "_scratch_guard_holds", guard)
+    monkeypatch.setattr(ob.os, "lstat", lstat)
+    monkeypatch.setattr(ob.os.path, "lexists", lexists)
+    with pytest.raises(ob.Unknown) as caught:                            # success here would be a silent leak
+        ob.remove_exercise_scratch(base, root)
+    assert caught.value.code == "EXERCISE_SCRATCH_NOT_REMOVED", caught.value
 
 
 @pytest.mark.skipif(os.name != "nt", reason="the Job Object exit wait is Windows-only")
