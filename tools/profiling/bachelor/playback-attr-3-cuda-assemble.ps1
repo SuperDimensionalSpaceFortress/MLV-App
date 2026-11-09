@@ -227,8 +227,14 @@ $StepLog['qmake'] = 0
 
 # BUILD-GUARD-1: the compile runs under the host-global build gate (memory floor, one build slot,
 # job count); a refusal exits 3 with BUILD_MEM_REFUSED / BUILD_SLOT_BUSY before anything is built.
+# STAGE-BUILD-HEAVY-SLOT-TIMEOUT-LOSES-TURN-1: a staging driver's deadline reaches the machine heavy slot ONLY through the environment this
+# process inherited (MLV_HEAVY_SLOT_DEADLINE_UTC, which the guard reads itself; the nightly and the stage chain set it in this child's
+# environment). There is deliberately no deadline parameter: this is an advanced script, so a caller's $PSDefaultParameterValues (under an
+# alias key, or a script-block default that empties the table while it binds) could supply one past any check made here (adversary
+# 9b7006d5-A1 and 84f4e8af-A1 sibling). No caller in the repo passed one.
 . (Join-Path $PSScriptRoot '..\..\coordination\build-guard.ps1') -Library
-Invoke-BuildGuard -Label "attr3-assemble:$($names.shortSha)" -RequestedJobs $MakeJobs -Action {
+$guardOptions = @{}
+Invoke-BuildGuard -Label "attr3-assemble:$($names.shortSha)" -RequestedJobs $MakeJobs -Options $guardOptions -Action {
     param($Jobs)
     $script:MakeJobs = $Jobs
     Say "MAKE release -j$MakeJobs"
