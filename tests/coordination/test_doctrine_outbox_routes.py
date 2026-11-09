@@ -2881,6 +2881,8 @@ def test_a_scratch_unreadable_from_the_first_look_is_a_typed_outcome_naming_the_
     root = tmp_path / "scratch"
     base = root / (ob.ROUTE_SCRATCH_PREFIX + "unreadable-first")
     base.mkdir(parents=True)
+    monkeypatch.setattr(ob, "ROUTE_SCRATCH_REMOVE_PAUSE", 0)             # an unreadable scratch is retried to the deadline: keep it short
+    monkeypatch.setattr(ob, "ROUTE_SCRATCH_REMOVE_DEADLINE", 0.3)
     real_lstat = os.lstat
 
     def lstat(path, *a, **k):
@@ -2964,6 +2966,123 @@ def test_a_timeout_returns_only_after_the_preparations_tree_has_exited(tmp_path,
         if pidfile.exists():
             for pid in pidfile.read_text().split():
                 force_kill(int(pid))
+
+
+# Adversary pass r2 (head 0fc3c157): A1 a TRANSIENT metadata error on the first scratch look; A2 the scratch root swapped for a junction
+# to an EMPTY directory, so "absent" is read through the replaced root; A3 a killed preparation whose tree is not confirmed exited;
+# A5 the exit wait's pause must not carry it past its own deadline.
+
+def scratch_exists(path: Path) -> bool:
+    try:
+        os.lstat(path)
+    except FileNotFoundError:
+        return False
+    return True
+
+
+def test_a_transient_permission_error_on_the_first_scratch_look_is_retried_not_read_as_done(tmp_path, monkeypatch):
+    root = tmp_path / "scratch"
+    base = root / (ob.ROUTE_SCRATCH_PREFIX + "transient-first")
+    base.mkdir(parents=True)
+    (base / "f.txt").write_text("x", encoding="utf-8")
+    monkeypatch.setattr(ob, "ROUTE_SCRATCH_REMOVE_PAUSE", 0)
+    real_lstat, looks = os.lstat, [0]
+
+    def lstat(path, *a, **k):
+        if os.path.normcase(str(path)) == os.path.normcase(str(base)):
+            looks[0] += 1
+            if looks[0] == 1:
+                raise PermissionError(13, "Access is denied", str(path))      # transient: the next look succeeds
+        return real_lstat(path, *a, **k)
+
+    monkeypatch.setattr(ob.os, "lstat", lstat)
+    ob.remove_exercise_scratch(base, root)                               # removed, or a typed Unknown; never a silent leak
+    monkeypatch.undo()
+    assert not scratch_exists(base), "the scratch was left behind and the call returned normally"
+
+
+def test_absence_seen_through_a_scratch_root_replaced_during_the_pause_is_not_a_removal(tmp_path, monkeypatch):
+    import types
+    root = tmp_path / "scratch"
+    base = root / (ob.ROUTE_SCRATCH_PREFIX + "rootswap-empty")
+    base.mkdir(parents=True)
+    (base / "f.txt").write_text("x", encoding="utf-8")
+    outside = tmp_path / "outside-empty"
+    outside.mkdir()                                                      # holds nothing named like the scratch: every look says "absent"
+    monkeypatch.setattr(ob.shutil, "rmtree", FlakyScratchRemoval(shutil.rmtree, 1))
+    kinds: list[str] = []
+    real_time = ob.time
+
+    def pause(seconds):
+        if not kinds:
+            os.rename(root, tmp_path / "scratch-saved")
+            kinds.append(make_directory_link(root, outside))
+
+    monkeypatch.setattr(ob, "time", types.SimpleNamespace(monotonic=real_time.monotonic, sleep=pause))
+    with pytest.raises(ob.Unknown) as caught:                            # success here is a scratch that remains, reported as removed
+        ob.remove_exercise_scratch(base, root)
+    assert kinds and caught.value.code == "EXERCISE_SCRATCH_NOT_REMOVED", (kinds, caught.value)
+    assert (tmp_path / "scratch-saved" / base.name / "f.txt").exists()
+
+
+def test_a_preparation_whose_killed_tree_is_not_confirmed_exited_is_the_route_timeout(tmp_path, monkeypatch):
+    clone = prep_clone_dir(tmp_path)
+    prep_stand_in(monkeypatch, tmp_path / "unused.py")
+
+    def stuck(*_a, **_k):
+        raise ob.Unknown("ROUTE_TREE_NOT_EXITED", "the killed process tree 1 process(es) still active after 10s")
+
+    monkeypatch.setattr(ob, "run_bounded_process", stuck)
+    with pytest.raises(ob.Unknown) as caught:
+        ob.run_isolated_git("git", ["clone"], clone.parent, clone, timeout=2.0)
+    assert caught.value.code == "ROUTE_TIMEOUT", caught.value
+
+
+def test_make_exercise_scratch_with_an_unconfirmed_exit_of_the_clone_tree_is_the_route_timeout(tmp_path, monkeypatch):
+    bus = make_bus(tmp_path)
+    monkeypatch.setattr(ob, "ROUTE_SCRATCH_REMOVE_PAUSE", 0)
+
+    def stuck(*_a, **_k):
+        raise ob.Unknown("ROUTE_TREE_NOT_EXITED", "the killed process tree 1 process(es) still active after 10s")
+
+    monkeypatch.setattr(ob, "run_bounded_process", stuck)
+    with pytest.raises(ob.Unknown) as caught:
+        ob.make_exercise_scratch(bus, tmp_path / "scratch")
+    assert caught.value.code == "ROUTE_TIMEOUT", caught.value
+
+
+def test_the_job_exit_wait_never_returns_later_than_its_own_deadline(monkeypatch):
+    import ctypes
+    import types
+    clock = [0.0]
+    sleeps: list[float] = []
+
+    class Accounting(ctypes.Structure):
+        _fields_ = [("ActiveProcesses", ctypes.c_uint32)]
+
+    infos: list[Accounting] = []
+
+    def make_info() -> Accounting:
+        infos.append(Accounting())
+        return infos[-1]
+
+    class Kernel32:
+        def TerminateJobObject(self, handle, code):
+            return 1
+
+        def QueryInformationJobObject(self, handle, cls, ref, size, returned):
+            infos[-1].ActiveProcesses = 1                                # always one process still active
+            return 1
+
+    def sleep(seconds):
+        sleeps.append(seconds)
+        clock[0] += seconds
+
+    job = object.__new__(ob._WinJob)                                     # no real Job Object: the accounting calls are injected
+    job._k32, job._accounting, job._handle = Kernel32(), make_info, 1
+    monkeypatch.setattr(ob, "time", types.SimpleNamespace(monotonic=lambda: clock[0], sleep=sleep))
+    assert job.kill_and_wait(0.05) == 1
+    assert clock[0] <= 0.05 + 1e-9, (clock, sleeps)                      # the unconditional 0.02 s pause crossed the deadline
 
 
 def stale_bus_pair(tmp_path: Path, name: str, behind: bool) -> Path:
