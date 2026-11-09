@@ -1252,6 +1252,7 @@ try {
     # tmp_state_error only for 'unknown'. The cases assert on these entries, not on a substring of the message (sol r2 B1).
     function Set-SidecarTmpData($Exception, [string]$Tmp, $Cleanup) {
         try {
+            foreach ($k in 'tmp_remaining', 'tmp_state_error') { $Exception.Data.Remove($k) }   # adversary r4 A3: a re-recorded outcome drops the previous one's entries
             $Exception.Data['tmp_state'] = [string]$Cleanup.state
             if ($Cleanup.state -ceq 'remaining') { $Exception.Data['tmp_remaining'] = $Tmp }
             if ($Cleanup.state -ceq 'unknown') { $Exception.Data['tmp_state_error'] = [string]$Cleanup.error }
@@ -1311,7 +1312,7 @@ try {
     function Get-SidecarTmpCensus([string]$Jid) {
         try {
             if ($script:SidecarListFault) { throw [UnauthorizedAccessException]::new('injected: access denied on the sidecar tmp enumeration') }
-            return @{ paths = @(Get-ChildItem -LiteralPath $notAfterDir -Filter "$Jid.json.*.tmp" -File -Force -ErrorAction Stop | ForEach-Object { $_.FullName }); error = $null }
+            return @{ paths = @(Get-ChildItem -LiteralPath $notAfterDir -Filter "$Jid.json.*.tmp" -File -Force -ErrorAction Stop | Where-Object { $_.Name -match "^$([regex]::Escape($Jid))\.json\.[0-9a-fA-F]{32}\.tmp$" } | ForEach-Object { $_.FullName }); error = $null }   # exact job (adversary r4 A1): 'j' must not match 'j.json.other'
         }
         catch { return @{ paths = @(); error = $_.Exception.GetType().Name } }
     }
@@ -2732,6 +2733,12 @@ function Exit-HeavySlot {
         # the reader itself: a message that embeds the spoofing id is read from AFTER the exact-id prefix, and a longer word is still no status.
         $spoof = 'jRt attempts=3 tmp=removed x'
         Assert-True ((Get-SidecarTmpStatus "SIDECAR-WRITE-FAILED job=$spoof attempts=3 tmp_remaining=C:\p\q.tmp IOException: x" $spoof) -ceq 'tmp_remaining=' -and $null -eq (Get-SidecarTmpStatus "SIDECAR-WRITE-FAILED job=$spoof attempts=3 tmp=removedness IOException: x" $spoof)) "cleanup-identifier: the pure reader keys on the exact job id"
+        # adversary r4 A3: re-recording a different outcome on the same exception leaves no entry of the previous one.
+        $dx = [InvalidOperationException]::new('x')
+        Set-SidecarTmpData $dx 'old.tmp' @{ state = 'remaining'; error = $null }
+        Set-SidecarTmpData $dx 'new.tmp' @{ state = 'unknown'; error = 'OldError' }
+        Set-SidecarTmpData $dx 'new.tmp' @{ state = 'removed'; error = $null }
+        Assert-True ($dx.Data['tmp_state'] -ceq 'removed' -and -not $dx.Data.Contains('tmp_remaining') -and -not $dx.Data.Contains('tmp_state_error')) "cleanup-identifier: a later 'removed' outcome carries no tmp_remaining / tmp_state_error from an earlier one"
         $results.livenessRenewHookWriteRetryCleanupIdentifier = [ordered]@{ ids = 3 }
     }
     # (census) sol r3 B2: the probe's residue census must not pass silently when the enumeration fails or cannot see a hidden tmp.
@@ -2748,7 +2755,7 @@ function Exit-HeavySlot {
             Assert-True ($null -ne $probeErr -and "$probeErr" -like '*census*') "cleanup-census: an access-denied residue enumeration fails the probe as a census failure instead of passing with leftPaths=0: [$probeErr]"
             # (b) a HIDDEN retained tmp is seen by the census (leftPaths names it) and removed.
             $r = Invoke-SidecarCleanupProbe $jid 'io' $false @{ remove = $true; test = $false } $true
-            $hiddenLeft = @(Get-ChildItem -LiteralPath $notAfterDir -Filter 'jRl*.tmp' -File -Force -ErrorAction SilentlyContinue).Count
+            $hiddenLeft = Get-SidecarTmpLeftCount $jid
             & $sweepCensusResidue
             Assert-True ($r.data['tmp_state'] -ceq 'remaining' -and $r.leftPaths.Count -eq 1 -and $hiddenLeft -eq 0) "cleanup-census: a hidden retained tmp is counted by the probe and removed: state=$($r.data['tmp_state']) left=$($r.leftPaths.Count) stillOnDisk=$hiddenLeft"
             # (c) a hidden tmp that cannot be removed (held open without delete sharing): the probe fails loudly.
@@ -2764,6 +2771,12 @@ function Exit-HeavySlot {
             [IO.File]::WriteAllText($heldHidden, '{}')
             [IO.File]::SetAttributes($heldHidden, [IO.FileAttributes]::Hidden)
             Assert-True ((Get-SidecarTmpLeftCount $jid) -eq 1) "cleanup-census: the sibling residue count sees a hidden tmp"
+            # adversary r4 A1: the census is exact to its job: another job whose id extends this one ('jRl.json.other') is not this job's residue.
+            $otherJob = Join-Path $notAfterDir 'jRl.json.other.json.00000000000000000000000000000002.tmp'
+            [IO.File]::WriteAllText($otherJob, '{}')
+            $withOther = Get-SidecarTmpLeftCount $jid
+            Remove-Item -LiteralPath $otherJob -Force -ErrorAction SilentlyContinue
+            Assert-True ($withOther -eq 1) "cleanup-census: another job's tmp (prefix collision) is not counted as this job's residue: count=$withOther"
             $listThrown = $null
             $script:SidecarListFault = $true
             try { $null = Get-SidecarTmpLeftCount $jid } catch { $listThrown = $_ } finally { $script:SidecarListFault = $null }
