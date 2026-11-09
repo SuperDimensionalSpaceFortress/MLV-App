@@ -1199,6 +1199,34 @@ def test_a_plain_chain_still_refuses_a_missing_sha_and_any_unknown_argument(box,
     assert not ran.exists() and _chain_status(run) == []
 
 
+@pytest.mark.parametrize("which, mode", [("run-dir", "in-process"), ("run-dir", "file"), ("stage-one", "in-process")])
+def test_a_path_on_another_provider_is_refused_never_read_against_the_process_directory(box, which, mode) -> None:
+    # adversary 38afcbb2-A1 (its input is run-dir in-process; sibling :108 is stage-one): -RunDir Env:\tools resolved through the Environment
+    # provider to the bare text 'tools', which [IO.Directory]::Exists read against the PROCESS directory, so the status file was written into
+    # <process cwd>\tools. A path must resolve through the FileSystem provider to a fully qualified path, or the chain refuses it.
+    run, stage_one_path, env = _chain_box(box, 61)
+    ran = box["dir"] / "child-ran.txt"
+    stage_one_path.write_text(f"param([string]$Sha, [string]$Phase)\nAdd-Content -LiteralPath '{ran}' -Value $Phase\nexit 0\n", encoding="ascii")
+    proc_cwd = box["dir"] / "proc-cwd"
+    (proc_cwd / "tools").mkdir(parents=True)
+    (proc_cwd / "stage-one.ps1").write_text(stage_one_path.read_text(encoding="ascii"), encoding="ascii")
+    args = (["-StageOne", str(stage_one_path), "-RunDir", "Env:\\tools"] if which == "run-dir"
+            else ["-StageOne", "Env:\\stage-one.ps1", "-RunDir", str(run)])
+    common = ["-Sha", _CHAIN_SHA, "-DeadlineUtc", "2099-01-01T00:00:00Z", *args, "-RetrySec", "0", "-MaxAttempts", "1"]
+    if mode == "file":
+        argv = [PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-File", str(STAGE_CHAIN), *common]
+    else:
+        quoted = " ".join(a if a.startswith("-") else "'" + a + "'" for a in common)
+        argv = [PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command",
+                f"Set-Location -LiteralPath '{box['dir']}'\n& '{STAGE_CHAIN}' {quoted}\nWrite-Output \"rc=$LASTEXITCODE\"\n"]
+    done = subprocess.run(argv, capture_output=True, text=True, timeout=180, env=env, check=False, cwd=str(proc_cwd))
+    reason = "run-dir-missing" if which == "run-dir" else "stage-one-missing"
+    assert f"STAGE_CHAIN_REFUSED reason={reason}" in done.stdout, done.stdout + done.stderr
+    assert (done.returncode == 2) if mode == "file" else ("rc=2" in done.stdout), done.stdout + done.stderr
+    assert list((proc_cwd / "tools").iterdir()) == [], "the chain wrote into the process directory"
+    assert not ran.exists() and _chain_status(run) == []
+
+
 def test_the_assembler_takes_no_deadline_parameter_so_no_caller_default_can_supply_one() -> None:
     # adversary 84f4e8af-A1 sibling (playback-attr-3-cuda-assemble.ps1:240): the assembler is an advanced script, so an alias-keyed or
     # script-block caller default could bind -HeavySlotDeadlineUtc past the r5 key scan and replace the expired deadline the caller's environment

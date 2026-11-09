@@ -73,7 +73,7 @@ param(
 if ($MyInvocation.InvocationName -eq '.') {
     [Console]::Out.WriteLine(('STAGE_CHAIN_REFUSED reason=dot-sourced sha={0} utc={1}' -f $Sha, [DateTime]::UtcNow.ToString('o'))); exit 2
 }
-@('PSDefaultParameterValues', 'args', 'ErrorActionPreference', 'Sha', 'DeadlineUtc', 'StageOne', 'RunDir', 'RetrySec', 'MaxAttempts', 'HoldAfterLogMsForTest', 'RefuseChain', 'Why', 'text', 'parsed', 'formats', 'deadline', 'errs', 'ast', 'declares', 'pwsh', 'status', 'utf8', 'WriteChainLog', 't', 'InvokeStageOneChild', 'Phase', 'LogPath', 'psi', 'x', 'p', 'o', 'e', 'SetChainExit', 'Value', 'deadlineText', 'phase', 'attempt', 'phaseDone', 'log', 'code', 'last', 'MlvStageChainExitCode').Where(
+@('PSDefaultParameterValues', 'args', 'ErrorActionPreference', 'Sha', 'DeadlineUtc', 'StageOne', 'RunDir', 'RetrySec', 'MaxAttempts', 'HoldAfterLogMsForTest', 'RefuseChain', 'Why', 'ResolveFsPath', 'PathText', 'prov', 'drv', 'resolved', 'text', 'parsed', 'formats', 'deadline', 'errs', 'ast', 'declares', 'pwsh', 'status', 'utf8', 'WriteChainLog', 't', 'InvokeStageOneChild', 'Phase', 'LogPath', 'psi', 'x', 'p', 'o', 'e', 'SetChainExit', 'Value', 'deadlineText', 'phase', 'attempt', 'phaseDone', 'log', 'code', 'last', 'MlvStageChainExitCode').Where(
     { $null -ne $ExecutionContext.SessionState.PSVariable.Get($_) -and ($ExecutionContext.SessionState.PSVariable.Get($_).Options -band [System.Management.Automation.ScopedItemOptions]::AllScope) }, 'First').ForEach(
     { [Console]::Out.WriteLine(('STAGE_CHAIN_REFUSED reason=caller-allscope-variable name={0} sha={1} utc={2}' -f $_, $Sha, [DateTime]::UtcNow.ToString('o'))); exit 2 })
 # What [Parameter(Mandatory)] and an advanced script's strict binding did (see A PLAIN SCRIPT above): an undeclared argument lands in $args here, and
@@ -104,12 +104,23 @@ if ($text -cnotmatch '\A\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(\.\d{1,7})?(Z|[+-]\d\d:\d
 }
 $deadline = $parsed.UtcDateTime
 # Paths are resolved against PowerShell's location (never the PROCESS directory a .NET call would read a relative path against; adversary 3c9ea703-A1)
-# and checked with .NET, so no command is called.
-try { $StageOne = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($StageOne) } catch { }
-if (-not [IO.File]::Exists($StageOne)) { & $RefuseChain ("stage-one-missing StageOne='{0}'" -f $StageOne) }
+# and checked with .NET, so no command is called. A path counts only when it resolves through the FileSystem provider to a fully qualified path:
+# Env:\tools resolved through the Environment provider to the bare text 'tools', which .NET then read against the process directory, and a path
+# that failed to resolve was kept as given (adversary 38afcbb2-A1 and its sibling). Anything else is refused like a missing file.
+$ResolveFsPath = {
+    param([string]$PathText)
+    $prov = $null; $drv = $null
+    try { $resolved = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($PathText, [ref]$prov, [ref]$drv) } catch { return '' }
+    if ($null -eq $prov -or $prov.Name -cne 'FileSystem' -or -not $resolved -or -not [IO.Path]::IsPathFullyQualified($resolved)) { return '' }
+    return [IO.Path]::GetFullPath($resolved)
+}
+$resolved = & $ResolveFsPath $StageOne
+if (-not $resolved -or -not [IO.File]::Exists($resolved)) { & $RefuseChain ("stage-one-missing StageOne='{0}'" -f $StageOne) }
+$StageOne = $resolved
 if (-not $RunDir) { $RunDir = [IO.Path]::GetDirectoryName($StageOne) }
-try { $RunDir = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($RunDir) } catch { }
-if (-not [IO.Directory]::Exists($RunDir)) { & $RefuseChain ("run-dir-missing RunDir='{0}'" -f $RunDir) }
+$resolved = & $ResolveFsPath $RunDir
+if (-not $resolved -or -not [IO.Directory]::Exists($resolved)) { & $RefuseChain ("run-dir-missing RunDir='{0}'" -f $RunDir) }
+$RunDir = $resolved
 
 $errs = $null
 $ast = [System.Management.Automation.Language.Parser]::ParseFile($StageOne, [ref]$null, [ref]$errs)
