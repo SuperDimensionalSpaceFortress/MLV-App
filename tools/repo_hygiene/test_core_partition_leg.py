@@ -4396,7 +4396,7 @@ $a1c = @{ startMonoMs = 61000.0; launchUtcTicks = $L.Ticks; launchMonoMs = 1000.
 $r.selA1cExcursionBreaksTheOrder = PickSel (Select-CorePartitionFeedRowsFromStart @(((Hw 10500) + ',5,30,10,No,No'), ((Hw 61500) + ',5,30,10,No,No'), ((Hw 12500) + ',5,30,10,No,No'), ((Hw 62000) + ',5,80,100,No,No')) $a1c 92000)
 $r.selA1cInOrderControl = PickSel (Select-CorePartitionFeedRowsFromStart @(((Hw 10500) + ',5,30,10,No,No'), ((Hw 11500) + ',5,30,10,No,No'), ((Hw 12500) + ',5,30,10,No,No'), ((Hw 62000) + ',5,80,100,No,No')) $a1c 92000)
 $r.selSkewExcludesTheBoundaryRow = PickSel (Select-CorePartitionFeedRowsFromStart $rows $sk 26000)
-$r.selSecondsOnly = PickSel (Select-CorePartitionFeedRowsFromStart @(((Format-CpFixtureStamp $L.AddSeconds(-60)) -replace '\.\d{3}$', '') + ',5,30,10,No,No'), (((Format-CpFixtureStamp $L.AddSeconds(60)) -replace '\.\d{3}$', '') + ',5,80,100,No,No')) $anchor 62000)
+$r.selSecondsOnly = PickSel (Select-CorePartitionFeedRowsFromStart @((((Format-CpFixtureStamp $L.AddSeconds(-60)) -replace '\.\d{3}$', '') + ',5,30,10,No,No'), (((Format-CpFixtureStamp $L.AddSeconds(60)) -replace '\.\d{3}$', '') + ',5,80,100,No,No')) $anchor 62000)
 $r.selUnparseableStamp = PickSel (Select-CorePartitionFeedRowsFromStart @('10/24/2026,08:00:02,5,80,100,No,No') $anchor 26000)
 $r.selRowFromTheFuture = PickSel (Select-CorePartitionFeedRowsFromStart @(((Hw 24600) + ',5,80,100,No,No'), ((Hw 40000) + ',5,80,100,No,No')) $anchor 26000)
 $r.selNoAnchor = PickSel (Select-CorePartitionFeedRowsFromStart $rows $null 26000)
