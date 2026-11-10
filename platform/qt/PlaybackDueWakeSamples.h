@@ -1,0 +1,236 @@
+#pragma once
+
+/*! HFR-NATIVE-M16-1457-GUI-PRESENT-CADENCE-1 r4 (Dot B1): bounded storage for the due wake's per-Play sample sets (lateness,
+ *  due-to-post, post-to-receive). Every ordinary Play is a playback_smoke session (beginPlaybackSmokeTelemetry runs on every
+ *  Play start), so there is no measurement-only condition to gate on, and an unbounded vector grew without limit during a
+ *  looping Play (about 4.9 MiB/h at 60 wakes/s). Here memory is O(1) in the length of the Play:
+ *  - up to kExactCapacity samples are kept exactly, so a measured Play's percentiles are the ones the unbounded vector gave
+ *    (same nearest-rank formula, same nth_element selection), in range or not;
+ *  - past that, the samples move into a fixed-bin histogram, kBinMs wide over [kMinMs, kMaxMs);
+ *  - reset() releases both buffers' capacity (clear() alone kept it).
+ *
+ *  r5 (Dot B2): the r4 histogram clamped an out-of-range sample into its edge bin, so 16,385 wakes of 500 ms read p50 = p95 =
+ *  79.995 ms, a measured-looking value. Now:
+ *  - a sample below kMinMs (or NaN, which is never in range) counts in underflow(), one at or above kMaxMs in overflow(); they
+ *    are never put in a bin, and the two counts cover every sample of the Play (exact or binned);
+ *  - once binned, a rank that lands in the underflow or overflow is CENSORED: rank() says so, percentile() returns NaN (never
+ *    a bound that reads as measured), and playbackDueWakePercentileText() prints "<=-20.000" / ">=80.000";
+ *  - the bin-centre accuracy (within kBinMs / 2 of the exact rank) holds for in-range ranks only;
+ *  - playbackDueWakeRangeFields() is each set's disclosure on the summary line (exact, underflow, overflow, range). */
+
+#include <QString>
+
+#include <algorithm>
+#include <cmath>
+#include <cstddef>
+#include <cstdint>
+#include <limits>
+#include <vector>
+
+class PlaybackDueWakeSamples
+{
+public:
+    static constexpr std::size_t kExactCapacity = 16384;   // 4.5 min of wakes at 60 fps, kept exactly
+    static constexpr double kMinMs = -20.0;                // histogram range [kMinMs, kMaxMs)
+    static constexpr double kMaxMs = 80.0;
+    static constexpr double kBinMs = 0.01;
+    static constexpr double kBinsPerMs = 100.0;            // 1 / kBinMs, exact (r6: the bin edges are computed from it)
+    static constexpr std::size_t kBins = 10000;            // ( kMaxMs - kMinMs ) / kBinMs
+
+    //! r5 adversary pass 8 A1: a bin counts as many samples as the Play does (a uint32_t bin wrapped to 0 after 2^32 samples
+    //! of one value, and the rank scan then fell through to a false overflow). 10,000 x 8 B stays under the exact store's size.
+    using BinCount = std::uint64_t;
+    static_assert( sizeof( BinCount ) >= sizeof( std::size_t ), "a bin must hold every sample of the Play" );
+
+    //! a binned rank outside [kMinMs, kMaxMs) is censored: only its side of the range is known
+    enum class Censor { None, Underflow, Overflow };
+    struct Rank
+    {
+        double ms;       // the measured value (exact store), the bin centre (in range), or the crossed bound (censored)
+        Censor censor;
+        //! r6 (adversary pass 11 A1): every value the rank can be is in [loMs, hiMs]: the measured value itself (exact store),
+        //! the bin's edges (binned, in range), or the crossed bound (censored)
+        double loMs;
+        double hiMs;
+    };
+
+    void add( double ms )
+    {
+        ++m_count;
+        const Censor side = sideOf( ms );
+        if( side == Censor::Underflow ) ++m_underflow;
+        else if( side == Censor::Overflow ) ++m_overflow;
+        if( m_histogram.empty() )
+        {
+            if( m_exact.size() < kExactCapacity )
+            {
+                if( m_exact.size() == m_exact.capacity() )
+                    m_exact.reserve( std::min( kExactCapacity, std::max<std::size_t>( 64, m_exact.capacity() * 2 ) ) );
+                m_exact.push_back( ms );
+                return;
+            }
+            // the exact store is full: spill its in-range samples into the histogram (the out-of-range ones are already in
+            // underflow / overflow), and release it
+            m_histogram.assign( kBins, 0u );
+            for( const double sample : m_exact )
+                if( sideOf( sample ) == Censor::None ) ++m_histogram[binOf( sample )];
+            std::vector<double>().swap( m_exact );
+        }
+        if( side == Censor::None ) ++m_histogram[binOf( ms )];
+    }
+
+    //! \a n copies of \a ms: the same state as n add( ms ) calls, in O( min( n, kExactCapacity ) ) once past the exact store
+    void addRepeated( double ms, std::size_t n )
+    {
+        while( n > 0 && m_histogram.empty() ) { add( ms ); --n; }
+        if( n == 0 ) return;
+        m_count += n;
+        const Censor side = sideOf( ms );
+        if( side == Censor::Underflow ) m_underflow += n;
+        else if( side == Censor::Overflow ) m_overflow += n;
+        else m_histogram[binOf( ms )] += n;
+    }
+
+    //! nearest-rank rank, \a p in [0, 1]; { 0.0, None } with no samples (the summary line's old convention)
+    Rank rank( double p ) const
+    {
+        if( m_count == 0 ) return { 0.0, Censor::None, 0.0, 0.0 };
+        // r5 adversary pass 10 A5: the double rank is clamped to [0, m_count - 1] before the conversion (a count near SIZE_MAX
+        // rounds up to 2^64, and a p outside [0, 1] goes negative: both were out-of-range conversions)
+        const double rankAt = std::floor( p * static_cast<double>( m_count - 1 ) + 0.5 );
+        const std::size_t index = !( rankAt > 0.0 ) ? 0
+            : ( rankAt >= static_cast<double>( m_count - 1 ) ? m_count - 1 : static_cast<std::size_t>( rankAt ) );
+        if( m_histogram.empty() )
+        {
+            std::vector<double> values( m_exact );
+            std::nth_element( values.begin(), values.begin() + static_cast<std::ptrdiff_t>( index ), values.end() );
+            return { values[index], Censor::None, values[index], values[index] };
+        }
+        // ascending order: underflow, the bins, overflow
+        if( index < m_underflow ) return { kMinMs, Censor::Underflow, kMinMs, kMinMs };
+        std::size_t seen = m_underflow;
+        for( std::size_t bin = 0; bin < kBins; ++bin )
+        {
+            seen += m_histogram[bin];
+            if( seen > index )
+                return { kMinMs + ( static_cast<double>( bin ) + 0.5 ) * kBinMs, Censor::None, binEdgeMs( bin ), binEdgeMs( bin + 1 ) };
+        }
+        return { kMaxMs, Censor::Overflow, kMaxMs, kMaxMs };
+    }
+
+    //! the measured percentile, or NaN when the rank is censored (never a clamped bound)
+    double percentile( double p ) const
+    {
+        const Rank r = rank( p );
+        return r.censor == Censor::None ? r.ms : std::numeric_limits<double>::quiet_NaN();
+    }
+
+    std::size_t size() const { return m_count; }
+    bool exact() const { return m_histogram.empty(); }
+    //! samples below kMinMs (or NaN) / at or above kMaxMs, over the whole Play
+    std::size_t underflow() const { return m_underflow; }
+    std::size_t overflow() const { return m_overflow; }
+    //! bytes held by the two buffers (their capacity, not their size)
+    std::size_t storageBytes() const
+    {
+        return m_exact.capacity() * sizeof( double ) + m_histogram.capacity() * sizeof( BinCount );
+    }
+    static constexpr std::size_t maxStorageBytes()
+    {
+        return kExactCapacity * sizeof( double ) > kBins * sizeof( BinCount )
+            ? kExactCapacity * sizeof( double )
+            : kBins * sizeof( BinCount );
+    }
+
+    void reset()
+    {
+        std::vector<double>().swap( m_exact );
+        std::vector<BinCount>().swap( m_histogram );
+        m_count = 0;
+        m_underflow = 0;
+        m_overflow = 0;
+    }
+
+private:
+    static Censor sideOf( double ms )
+    {
+        if( !( ms >= kMinMs ) ) return Censor::Underflow;   // also NaN: never in range
+        if( ms >= kMaxMs ) return Censor::Overflow;
+        return Censor::None;
+    }
+
+    //! r6 (pass 11 A1): bin \a edge's lower edge, as ( edge - 2000 ) / 100 so an edge on the 0.01 ms grid is the nearest double
+    //! to its decimal value (kMinMs + edge * kBinMs accumulated error, and 20.01 - 20 printed 0.011 once ceiled)
+    static double binEdgeMs( std::size_t edge )
+    {
+        return ( static_cast<double>( edge ) + kMinMs * kBinsPerMs ) / kBinsPerMs;
+    }
+
+    //! an in-range sample's bin (the clamp only absorbs the floating-point rounding just below kMaxMs)
+    static std::size_t binOf( double ms )
+    {
+        const double estimate = std::floor( ( ms - kMinMs ) / kBinMs );
+        std::size_t bin = !( estimate > 0.0 ) ? 0
+            : ( estimate >= static_cast<double>( kBins - 1 ) ? kBins - 1 : static_cast<std::size_t>( estimate ) );
+        // r6 (adversary pass 12 A2): the division can round a sample across an edge; settle it against the very edges rank()
+        // reports, so binEdgeMs( bin ) <= ms < binEdgeMs( bin + 1 ) holds in double for every in-range sample
+        while( bin > 0 && ms < binEdgeMs( bin ) ) --bin;
+        while( bin < kBins - 1 && ms >= binEdgeMs( bin + 1 ) ) ++bin;
+        return bin;
+    }
+
+    std::vector<double> m_exact;
+    std::vector<BinCount> m_histogram;
+    std::size_t m_count = 0;
+    std::size_t m_underflow = 0;
+    std::size_t m_overflow = 0;
+};
+
+//! a percentile field's value on the playback_due_wake line: the measured value to 3 decimals, or the CENSORED bound with
+//! its marker ("<=-20.000" below the range, ">=80.000" at or above it) -- never a clamped value that reads as measured
+inline QString playbackDueWakePercentileText( const PlaybackDueWakeSamples &samples, double p )
+{
+    const PlaybackDueWakeSamples::Rank r = samples.rank( p );
+    if( r.censor == PlaybackDueWakeSamples::Censor::Underflow )
+        return QStringLiteral( "<=%1" ).arg( PlaybackDueWakeSamples::kMinMs, 0, 'f', 3 );
+    if( r.censor == PlaybackDueWakeSamples::Censor::Overflow )
+        return QStringLiteral( ">=%1" ).arg( PlaybackDueWakeSamples::kMaxMs, 0, 'f', 3 );
+    return QStringLiteral( "%1" ).arg( r.ms, 0, 'f', 3 );   // the r4 line's own formatting
+}
+
+//! r6 (adversary pass 11 A1): which end of a [lo, hi] split interval a percentile field is
+enum class PlaybackDueWakeBoundSide { Lower, Upper };
+
+//! a percentile field that is a BOUND (the lateness split's lo / hi sets): rounded OUTWARD, never to the nearest. Binned, a
+//! lower bound is its bin's lower edge and an upper bound its upper edge (the bin centre could cross the true value); either
+//! way it is floored (Lower) / ceiled (Upper) to the printed 0.001 ms. So the printed lower bound is <= every value its rank
+//! can be, and the printed upper bound >= it; the double rounding of an edge only ever loosens the bound by one 0.001 step.
+//! A censored rank prints as playbackDueWakePercentileText does (its side of the range is all that is known).
+inline QString playbackDueWakePercentileBoundText( const PlaybackDueWakeSamples &samples, double p, PlaybackDueWakeBoundSide side )
+{
+    const PlaybackDueWakeSamples::Rank r = samples.rank( p );
+    if( r.censor != PlaybackDueWakeSamples::Censor::None ) return playbackDueWakePercentileText( samples, p );
+    const bool lower = side == PlaybackDueWakeBoundSide::Lower;
+    const double bound = lower ? r.loMs : r.hiMs;
+    double steps = lower ? std::floor( bound * 1000.0 ) : std::ceil( bound * 1000.0 );
+    // r6 (adversary pass 12 A2): the product can round across a 0.001 step; the printed value (steps / 1000, the double its
+    // text parses back to) must not cross the bound, so step once more outward when it does
+    if( lower && steps / 1000.0 > bound ) steps -= 1.0;
+    if( !lower && steps / 1000.0 < bound ) steps += 1.0;
+    const double rounded = steps / 1000.0;
+    return QStringLiteral( "%1" ).arg( rounded == 0.0 ? 0.0 : rounded, 0, 'f', 3 );   // never "-0.000"
+}
+
+//! one set's disclosure on the playback_due_wake line: whether its percentiles are exact, how many samples fell below / at
+//! or above the histogram range, and that range
+inline QString playbackDueWakeRangeFields( const PlaybackDueWakeSamples &samples, const char *set )
+{
+    const QString name = QLatin1String( set );
+    return QStringLiteral( " %1_exact=%2 %1_underflow=%3 %1_overflow=%4 %1_range_ms=%5:%6" )
+        .arg( name )
+        .arg( samples.exact() ? 1 : 0 )
+        .arg( static_cast<qulonglong>( samples.underflow() ) )
+        .arg( static_cast<qulonglong>( samples.overflow() ) )
+        .arg( PlaybackDueWakeSamples::kMinMs, 0, 'f', 3 )
+        .arg( PlaybackDueWakeSamples::kMaxMs, 0, 'f', 3 );
+}
