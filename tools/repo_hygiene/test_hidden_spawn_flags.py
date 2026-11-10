@@ -333,6 +333,13 @@ class _Facts:
                     self._bind_module(a.asname, "asyncio.*")
                 elif not a.asname and root in ("subprocess", "os", "asyncio"):
                     self._bind_module(root, root)
+        elif isinstance(node, ast.ImportFrom) and (node.level > 0 or not node.module):  # `from .helpers import *`, `from . import os`
+            for a in node.names:
+                if a.name == "*":
+                    self._bind_module("os", "os")
+                    self._bind_module("subprocess", "subprocess")
+                elif a.name in _SUBMODULE_REEXPORTS:
+                    self._bind_module(a.asname or a.name, _SUBMODULE_REEXPORTS[a.name])
         elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
             origin = _MODULE_ALIASES.get(node.module, node.module)
             if node.module in ("importlib", "builtins"):
@@ -365,6 +372,9 @@ class _Facts:
                 for a in node.names:
                     if a.name in _SUBMODULE_REEXPORTS:
                         self._bind_module(a.asname or a.name, _SUBMODULE_REEXPORTS[a.name])
+                    elif a.name == "*":  # `from platform import *` brings the module's public `os` and `subprocess` along
+                        self._bind_module("os", "os")
+                        self._bind_module("subprocess", "subprocess")
 
     def _learn(self, name: str, value: ast.AST) -> list[str]:
         learned: list[str] = []
@@ -425,12 +435,15 @@ class _Facts:
         return None
 
     @staticmethod
-    def _fromlist_given(call: ast.Call) -> bool:
-        """Does ``__import__(name, ..., fromlist)`` carry a fromlist that could be non-empty? Then it returns the NAMED submodule, not the root."""
+    def _fromlist_state(call: ast.Call) -> bool | None:
+        """``__import__(name, ..., fromlist)``: True when the fromlist is a non-empty literal (the NAMED submodule is returned), False when
+        it is absent or an empty literal (the root is returned), None when it is a run-time value (either can be returned)."""
         arg = call.args[3] if len(call.args) > 3 else next((kw.value for kw in call.keywords if kw.arg == "fromlist"), None)
         if arg is None or (isinstance(arg, ast.Constant) and not arg.value):
             return False
-        return not (isinstance(arg, (ast.List, ast.Tuple)) and not arg.elts)
+        if isinstance(arg, (ast.List, ast.Tuple)):
+            return bool(arg.elts)
+        return True if isinstance(arg, ast.Constant) else None
 
     def import_target(self, node: ast.AST) -> tuple[bool, str | None, bool]:
         """(is this a dynamic import, the tracked module it returns or None, whether its module name could be resolved)."""
@@ -443,7 +456,10 @@ class _Facts:
         name = self.literal(arg)
         if name is None:
             return True, None, False
-        if kind == "__import__" and not self._fromlist_given(node):  # without a fromlist __import__('os.path') returns os; the root is the safe superset
+        fromlist = self._fromlist_state(node) if kind == "__import__" else False
+        if fromlist is None and "." in name:  # os.path with a fromlist known only at run time is os or os.path: not resolvable, so reported
+            return True, None, False
+        if kind == "__import__" and not fromlist:  # without a fromlist __import__('os.path') returns os; the root is the safe superset
             root = name.split(".")[0]
             root = _MODULE_ALIASES.get(root, root)
             return True, (root if root in _TRACKED_MODULES else None), True
@@ -583,8 +599,11 @@ def _reference_violations(tree: ast.AST, facts: _Facts) -> list[tuple[int, str]]
                 roots = [(node.module or "").split(".")[0]] if node.level == 0 else []
             else:
                 roots = [a.name.split(".")[0] for a in node.names]
-            if any(r in _CLASS_SCOPE_IMPORT_ROOTS for r in roots) and _in_class_scope(node, parent):
-                out.append((node.lineno, "imports a spawn or import module in a class body, where the name is a class attribute"))
+            # Any import in a class body: the name is a class attribute (`X.shutil.os`), which no later call is tied back to, and any
+            # module may re-export os / subprocess. (`roots` still names the spawn/import modules for the message.)
+            if _in_class_scope(node, parent):
+                what = "a spawn or import module" if any(r in _CLASS_SCOPE_IMPORT_ROOTS for r in roots) else "a module"
+                out.append((node.lineno, f"imports {what} in a class body, where the name is a class attribute"))
             if isinstance(node, ast.ImportFrom) and node.level == 0:
                 origin = _MODULE_ALIASES.get(node.module or "", node.module or "")
                 if origin in _STRICT_MODULES:
@@ -885,6 +904,11 @@ def _unescape_ps(script: str) -> str:
         ch = script[i]
         if ch == "`" and i + 1 < n and quote[i] != "'" and script[i + 1] not in "\r\n\"'":
             nxt = script[i + 1]
+            if nxt == "-" and (i == 0 or script[i - 1].isspace() or script[i - 1] in "(;|{"):
+                out.append(ch)  # `-WindowStyle at the start of a word is argument TEXT, not a parameter: keep the backtick that says so
+                out.append(nxt)
+                i += 2
+                continue
             if quote[i] == '"' and nxt in _PS_ESCAPE_LETTERS:
                 out.append(ch)
             out.append(nxt)
@@ -1797,7 +1821,7 @@ class AdversaryR4Tests(unittest.TestCase):
             "importlib": "class X:\n    import importlib\n",
         }.items():
             self.assertGreaterEqual(len(self._bad(src)), 1, label)
-        self.assertEqual(self._bad("class X:\n    import json\n    def m(self):\n        import subprocess\n        subprocess.run(['x'], creationflags=_NO_WINDOW)\n"), [])
+        self.assertEqual(self._bad("class X:\n    def m(self):\n        import subprocess\n        subprocess.run(['x'], creationflags=_NO_WINDOW)\n"), [])
 
     def test_pass8_a4_a5_a6_the_start_process_command_is_found_wherever_it_hides(self):
         def judge(ps: str) -> tuple[int, int]:
@@ -2220,6 +2244,46 @@ class AdversaryR5Pass10Tests(unittest.TestCase):
         }.items():
             self.assertGreaterEqual(len(self._bad(src)), 1, label)
         self.assertEqual(self._bad("import shutil\ns = shutil\ns.which('z')\nself.os = 1\n"), [])
+
+    # Pass 12 (review-adversary-MLV-LANE-CONSOLE-HIDDEN-1-r5-8f9b7763), findings A1-A4.
+    def test_pass12_a1_a_dotted_dunder_import_with_an_unresolvable_fromlist_is_reported(self):
+        for label, src in {
+            "name": "names = []\nm = __import__('os.path', fromlist=names)\nm.system('cmd.exe /c exit')\n",
+            "call": "m = __import__('asyncio.windows_utils', fromlist=pick())\nm.Popen(['x'])\n",
+            "positional": "m = __import__('os.path', globals(), locals(), names)\nm.system('x')\n",
+        }.items():
+            self.assertGreaterEqual(len(self._bad(src)), 1, label)
+        self.assertEqual(self._bad("m = __import__('json', fromlist=names)\nm.dumps(1)\n"), [])  # no dot: the root is the module either way
+
+    def test_pass12_a2_an_import_in_a_class_body_is_a_class_attribute(self):
+        for label, src in {
+            "shutil": "class X:\n    import shutil\nX.shutil.os.system('cmd.exe /c exit')\n",
+            "from import": "class X:\n    from platform import os\nX.os.system('x')\n",
+            "tempfile": "class X:\n    import tempfile\nX.tempfile._os.system('x')\n",
+            "nested": "class X:\n    if True:\n        import platform\nX.platform.subprocess.run(['x'])\n",
+            "json": "class X:\n    import json\n",
+        }.items():
+            self.assertGreaterEqual(len(self._bad(src)), 1, label)
+        self.assertEqual(self._bad("class X:\n    def m(self):\n        import json\n        return json.dumps(1)\n"), [])
+
+    def test_pass12_a3_a_star_import_from_any_module_may_bring_os_and_subprocess(self):
+        for label, src in {
+            "platform": "from platform import *\nos.system('cmd.exe /c exit')\n",
+            "subprocess": "from platform import *\nsubprocess.run(['x'])\n",
+            "logging.config": "from logging.config import *\nos.system('x')\n",
+            "alias": "from platform import *\ns = os\ns.system('x')\n",
+            "own package": "from .helpers import *\nos.popen('x')\n",
+        }.items():
+            self.assertGreaterEqual(len(self._bad(src)), 1, label)
+        self.assertEqual(self._bad("from platform import *\nprint(machine())\n"), [])
+
+    def test_pass12_a4_an_escaped_leading_dash_is_argument_text_not_a_parameter(self):
+        found, bad = _start_process_violations("x = 'Start-Process cmd.exe -ArgumentList `-WindowStyle:Hidden'\n")
+        self.assertEqual((found, len(bad)), (1, 1))
+        found, bad = _start_process_violations("x = 'Start-Process cmd.exe -ArgumentList `-WindowStyle Hidden'\n")
+        self.assertEqual((found, len(bad)), (1, 1))
+        self.assertEqual(_start_process_violations("x = 'Start`-Process cmd.exe -WindowStyle Hidden'\n"), (1, []))  # mid-token: still the command
+        self.assertEqual(_start_process_violations("x = 'Start-Process cmd.exe -Window`Style Hidden'\n"), (1, []))
 
 
 class SpawnSiteBehaviourTests(unittest.TestCase):
