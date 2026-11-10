@@ -3913,46 +3913,102 @@ def _writable_retry(func, path, _exc, base: str | os.PathLike | None = None, dea
     if late() or not mine() or late():
         return                                                          # left for rmtree's own failure to be reported; nothing is changed
     try:
-        os.chmod(path, stat.S_IWRITE)
+        if os.chmod in os.supports_follow_symlinks:
+            os.chmod(path, stat.S_IWRITE, follow_symlinks=False)   # never through a link swapped in after the look
+        else:
+            os.chmod(path, stat.S_IWRITE)
         if mine() and not late():
             func(path)
     except FileNotFoundError:
         pass                                                            # the entry went away between the failure and this retry: it is removed
 
 
-def _scratch_state(base: pathlib.Path, scratch_root: pathlib.Path) -> str:
-    """'ok' (ours: directly under the pinned real `scratch_root`, the run's prefix, a real directory, no symlink and no
-    junction), 'absent' (confirmed gone), 'unreadable' (its metadata cannot be read: unknown, never gone) or 'foreign'."""
-    try:
-        if (os.path.normcase(os.path.realpath(scratch_root)) != os.path.normcase(str(scratch_root))   # the pinned root was swapped
-                or os.path.normcase(os.path.realpath(base.parent)) != os.path.normcase(str(scratch_root))
-                or not base.name.startswith(ROUTE_SCRATCH_PREFIX)):
-            return "foreign"
-        info = os.lstat(base)
-    except (FileNotFoundError, NotADirectoryError):
-        return "absent"
-    except (OSError, ValueError):
-        return "unreadable"
-    if (stat.S_ISLNK(info.st_mode) or getattr(info, "st_file_attributes", 0) & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
-            or not stat.S_ISDIR(info.st_mode)):
-        return "foreign"
-    return "ok"
-
-
-def _scratch_guard_holds(base: pathlib.Path, scratch_root: pathlib.Path) -> bool:
-    """The whole guard for removing `base`. Judged afresh before every removal attempt: it can change between attempts."""
-    return _scratch_state(base, scratch_root) == "ok"
+_REPARSE = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
 
 
 def _file_id(path: str | os.PathLike, follow: bool = False) -> tuple[int, int] | None:
     """The identity (device, file index) of what `path` is right now, or None when it cannot be read. A path STRING cannot tell a
     directory from the one that was renamed away and replaced under the same name; this can. `follow` reads the target of a link
-    (the scratch root, already resolved), not the link."""
+    (the scratch root, already resolved), not the link. Only the creation pin reads through this (an unreadable pin is None, which
+    removal never completes from); the removal itself reads through _meta, where an unreadable identity is an error, never None."""
     try:
         info = os.stat(path) if follow else os.lstat(path)
     except (OSError, ValueError):
         return None
     return info.st_dev, info.st_ino
+
+
+def _ident(info: os.stat_result) -> tuple[int, int]:
+    return info.st_dev, info.st_ino
+
+
+def _plain_dir(info: os.stat_result) -> bool:
+    """A real directory: not a symlink, not a junction, not any other reparse point."""
+    return (stat.S_ISDIR(info.st_mode) and not stat.S_ISLNK(info.st_mode)
+            and not getattr(info, "st_file_attributes", 0) & _REPARSE)
+
+
+def _meta(call, *args):
+    """THE one way the scratch removal reads or changes metadata (lstat, rename, rmdir, unlink, scandir). Every failure reaches
+    the caller as an OSError, unchanged (FileNotFoundError included: only the caller can tell "gone" from "a child raced"); a
+    ValueError (a NUL in a name) is an OSError too. Nothing on the removal path turns a failed read into None or False, so a
+    transient denial or sharing violation is an OSError that the ONE bounded loop of _remove_pinned_scratch retries, and never a
+    mismatch, a "foreign" verdict or a "gone"."""
+    try:
+        return call(*args)
+    except ValueError as e:
+        raise OSError(f"{getattr(call, '__name__', call)}({', '.join(map(str, args))}): {e}") from e
+
+
+@functools.lru_cache(maxsize=None)
+def _kernel32():
+    import ctypes
+    from ctypes import wintypes
+    k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    k32.CreateFileW.restype = wintypes.HANDLE
+    k32.CreateFileW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, ctypes.c_void_p, wintypes.DWORD,
+                                wintypes.DWORD, wintypes.HANDLE]
+    k32.GetFileInformationByHandle.restype = wintypes.BOOL
+    k32.GetFileInformationByHandle.argtypes = [wintypes.HANDLE, ctypes.c_void_p]
+    k32.CloseHandle.restype = wintypes.BOOL
+    k32.CloseHandle.argtypes = [wintypes.HANDLE]
+    return k32
+
+
+class _DirHold:
+    """Hold the directory NAMED `path` open while the `with` block runs. On Windows this is a handle with list access, read/write
+    sharing and NO delete sharing, opened on the name itself (a link or junction is opened, never followed). While it is held,
+    Windows refuses to rename or remove that directory or ANY directory above it (sharing violation / access denied), so every
+    path lookup through it names the same objects; its children can still be removed. `with` yields whether the held object is a
+    reparse point or not a directory (never ours to walk). Opening is an OSError (FileNotFoundError when nothing has the name).
+    Elsewhere nothing is held and None is yielded: the checks then rest on path lookups alone (see the threat model)."""
+
+    def __init__(self, path: str | os.PathLike) -> None:
+        self.path, self.handle = os.fspath(path), None
+
+    def __enter__(self) -> bool | None:
+        if os.name != "nt":
+            return None
+        import ctypes
+        k32 = _kernel32()
+        handle = k32.CreateFileW(self.path, 0x0001 | 0x0080,             # FILE_LIST_DIRECTORY | FILE_READ_ATTRIBUTES
+                                 0x1 | 0x2, None, 3,                         # FILE_SHARE_READ | FILE_SHARE_WRITE (no DELETE); OPEN_EXISTING
+                                 0x02000000 | 0x00200000, None)              # FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT
+        if handle is None or handle == ctypes.c_void_p(-1).value:
+            code = ctypes.get_last_error()
+            raise OSError(None, ctypes.FormatError(code), self.path, code)
+        self.handle = handle
+        info = (ctypes.c_uint32 * 13)()                                      # BY_HANDLE_FILE_INFORMATION; [0] is dwFileAttributes
+        if not k32.GetFileInformationByHandle(handle, ctypes.byref(info)):
+            code = ctypes.get_last_error()
+            self.__exit__(None, None, None)
+            raise OSError(None, ctypes.FormatError(code), self.path, code)
+        return bool(info[0] & 0x400) or not info[0] & 0x10                  # a reparse point, or not a directory at all
+
+    def __exit__(self, *_exc) -> None:
+        if self.handle is not None:
+            _kernel32().CloseHandle(self.handle)
+            self.handle = None
 
 
 _SCRATCH_PINS: dict[str, tuple[tuple[int, int] | None, tuple[int, int] | None]] = {}   # scratch dir -> (root id, scratch id) at creation
@@ -3962,81 +4018,69 @@ def _scratch_key(base: pathlib.Path) -> str:
     return os.path.normcase(os.path.abspath(base))
 
 
+def _in_place(path: str | os.PathLike) -> bool:
+    """True when `path` (a name under the already-real scratch root) resolves to itself: no directory on it is a link or junction."""
+    try:
+        return os.path.normcase(os.path.realpath(path)) == os.path.normcase(os.path.abspath(path))
+    except (OSError, ValueError):
+        return False
+
+
 def _pin_scratch(base: pathlib.Path, scratch_root: str | os.PathLike) -> None:
     """Record the identity of the scratch root and of the scratch `base` just made, straight after it was created and with no pause
-    (a retry after a pause is itself a swap window whose second read would be recorded as the creation pin). Each is read twice,
-    back to back, and pinned only when both reads agree; the scratch must also still be EMPTY (what mkdtemp made is), so a
-    replacement put there between the reads, which holds something, is never taken for it. An identity that is unreadable, differs
-    between the reads or fails that check is recorded as None, which removal never completes from whatever it finds later (the typed
-    EXERCISE_SCRATCH_NOT_REMOVED, not an adopted replacement). What remains is an EMPTY ordinary directory swapped in before the
-    first read (no file is lost to it), and a same-user process that serves the identity reads and the emptiness scan from two
-    different objects by swapping between them: each is its own path lookup, and binding them to one object needs a handle-based
-    identity and listing that Python does not offer on Windows."""
+    (a retry after a pause is itself a swap window whose second read would be recorded as the creation pin). The reads are made
+    while `base` is HELD (_DirHold): from the moment the hold is open neither `base` nor its root can be renamed or removed, so its
+    identity reads and its emptiness scan all describe the one object the hold names, which must be a real directory (no link or
+    junction) that resolves to its own name directly under the real root. It must also be EMPTY (what mkdtemp made is): a populated
+    replacement swapped in before the hold opened is never taken for it. Each identity is still read twice, around the scan. An
+    identity that is unreadable, differs between the reads or fails a check is recorded as None, which removal never completes
+    from (the typed EXERCISE_SCRATCH_NOT_REMOVED, nothing removed). What remains on Windows is an EMPTY ordinary directory swapped
+    in before the hold opened (no file is lost to it); where no hold exists (not Windows) the reads rest on path lookups alone."""
     real = os.path.realpath(scratch_root)
-    root_a, work_a = _file_id(real, follow=True), _file_id(base)
-    root_b, work_b = _file_id(real, follow=True), _file_id(base)        # back to back, no pause: a swap between two reads shows as a difference
+    pin: tuple[tuple[int, int] | None, tuple[int, int] | None] = (None, None)
     try:
-        with os.scandir(base) as entries:
-            fresh = next(entries, None) is None                         # what mkdtemp just made is EMPTY: a populated one is not ours
-    except OSError:
-        fresh = False
-    _SCRATCH_PINS[_scratch_key(base)] = (root_a if root_a == root_b else None, work_a if work_a == work_b and fresh else None)
+        with _DirHold(base) as reparse:
+            root_a, work_a = _file_id(real, follow=True), _file_id(base)
+            with os.scandir(base) as entries:
+                fresh = next(entries, None) is None                     # what mkdtemp just made is EMPTY: a populated one is not ours
+            root_b, work_b = _file_id(real, follow=True), _file_id(base)    # around the scan: a swap between the reads shows as a difference
+            bound = (reparse is not True and _in_place(base)
+                     and os.path.normcase(os.path.dirname(os.path.abspath(base))) == os.path.normcase(real))
+            pin = (root_a if root_a == root_b and bound else None, work_a if work_a == work_b and fresh and bound else None)
+    except (OSError, ValueError):
+        pass                                                            # unreadable: (None, None), never completed from
+    _SCRATCH_PINS[_scratch_key(base)] = pin
 
 
-def _move_scratch_aside(work: pathlib.Path, root: pathlib.Path, root_id: tuple[int, int] | None,
-                        work_id: tuple[int, int] | None, base: pathlib.Path) -> pathlib.Path:
-    """Rename the scratch `work` to a fresh private random name in the same (pinned) parent, in one atomic rename, and return that
-    name only when the object now under it is the pinned scratch: the same file identity, a real directory, no link, junction or
-    reparse point, with the root still the pinned root. Anything else is put back under its name when it can be and is the typed
-    EXERCISE_SCRATCH_NOT_REMOVED, with nothing removed. A failed rename (held, gone) is an OSError for the caller's bounded loop, and
-    so is an object whose metadata could not be read once it was put back (unknown, retried; never removed, never read as gone)."""
-    private = root / f"{work.name}.rm-{os.urandom(8).hex()}"           # keeps the run's prefix; nobody can name it in advance
-    os.rename(work, private)
-    unreadable: OSError | None = None
-    try:
-        info = os.lstat(private)
-        same = ((info.st_dev, info.st_ino) == work_id and work_id is not None and root_id is not None
-                and _file_id(root, follow=True) == root_id and stat.S_ISDIR(info.st_mode) and not stat.S_ISLNK(info.st_mode)
-                and not getattr(info, "st_file_attributes", 0) & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400))
-    except (OSError, ValueError) as e:
-        same = False                                                    # unknown is not ours: never removed
-        unreadable = e if isinstance(e, OSError) else OSError(str(e))
-    if same:
-        return private
-    try:
-        os.rename(private, work)
-        where = f"it was put back under {work}"
-    except OSError as e:
-        where = f"it could not be put back and is left under {private} ({e})"
-    else:
-        if unreadable is not None:                                      # put back where the loop looks again: a transient denial is retried
-            raise OSError(f"{base}: its metadata could not be read under its private name ({unreadable}); it was put back") from unreadable
-    raise Unknown("EXERCISE_SCRATCH_NOT_REMOVED",
-                  f"{base}: what its name held when removal began is not the scratch this run made (another directory, a link or a "
-                  f"junction); nothing was removed and {where}")
+class _NotOurs(Exception):
+    """Inside one removal attempt: what a name holds is not the pinned scratch (or a directory inside it), so nothing more is
+    removed. Always ends the removal as the typed EXERCISE_SCRATCH_NOT_REMOVED, never as a retry and never as "removed"."""
 
 
 def remove_exercise_scratch(base: pathlib.Path, scratch_root: pathlib.Path) -> None:
     """Remove the scratch directory THIS run made. It must sit directly under `scratch_root`, carry the run's prefix and be a real
     directory (not a link or junction); one this run did not make that fails this is not ours and is left alone. The root is resolved
     once, here, and a scratch pinned at creation whose root resolves to two different places across the two reads at the start is
-    the typed outcome, never a normal return. Every later look is _scratch_state against that pinned real root plus the file identity
-    (device, file index) of the root and of the scratch, pinned when make_exercise_scratch made them (else at the first readable look,
-    before any removal attempt), so "gone" is only ever read through the pinned root. The pin is dropped when this returns or raises.
+    the typed outcome, never a normal return. The pin is dropped when this returns or raises.
 
-    Nothing inside is removed by the scratch's own name: it is first renamed, atomically and in the same parent, to a fresh private
-    random name, and only an object found under that name with the pinned identity (a real directory, no link, junction or reparse
-    point, under the pinned root) is removed; anything else is put back when it can be and is the typed outcome, nothing removed. So a
-    scratch (or root) renamed away and replaced by another directory, or swapped for a link or junction, at any moment up to that
-    rename is never removed through, made writable through or read as a removal.
+    THREAT MODEL. The scratch tree belongs to this process, under the review checkout. The helper must never delete through a link
+    or junction, must never delete a tree whose identity it did not pin, and must never report `removed` unless the tree is gone. A
+    concurrent actor that swaps a directory between two system calls cannot be fully excluded without OS handle-based deletion.
+    Against that actor the guarantee is FAIL-SAFE: refuse and leave data in place, with a typed reason. It is never "removed".
 
-    What this does NOT close (Python offers no handle-based delete on Windows, and rmtree walks by path string): a same-user process
-    that learns the private name and swaps it, or swaps the scratch root or a directory inside the scratch, after the identity check
-    and during the walk. Closing that needs a process able to write inside the private scratch root, as for _writable_retry.
+    How (see _remove_pinned_scratch): each attempt HOLDS the pinned root (_DirHold) for its whole length, so neither the root nor
+    any directory above it can be renamed or replaced while it runs, and checks it is a real directory with the pinned identity.
+    The scratch is then renamed, in the same root, to a fresh private random name, and HELD under that name; only an object that is
+    a real directory with the pinned identity there is walked. The walk (_remove_tree) holds every directory before it unlinks
+    anything under it and requires, under the hold, the identity it had when its parent listed it and no reparse point; a link or
+    junction INSIDE the scratch is removed as a link (os.unlink removes the link itself), never walked. Anything else stops the
+    removal with the typed EXERCISE_SCRATCH_NOT_REMOVED, the scratch put back under its own name when that is possible, and
+    nothing more removed. "Removed" is only ever reported from a lookup under the held, verified root that finds the name gone.
 
-    A scratch that is held (a just-killed process's sharing violation, on the rename or on the walk) or whose metadata cannot be read
-    is retried inside one bounded loop and is never read as gone. No removal attempt starts after the deadline, the first one
-    included; one still held or unreadable at the deadline is the typed Unknown EXERCISE_SCRATCH_NOT_REMOVED naming where it is left."""
+    A scratch that is held by another process (a just-killed process's sharing violation) or whose metadata cannot be read is
+    retried inside ONE bounded loop and is never read as gone. The deadline bounds attempts: none starts after it, and an attempt
+    that started before it runs to its end (a completed, verified removal is never discarded). One still held or unreadable at the
+    deadline is the typed Unknown EXERCISE_SCRATCH_NOT_REMOVED naming where it is left."""
     key = _scratch_key(base)
     pinned_at_creation = key in _SCRATCH_PINS
     root_id, work_id = _SCRATCH_PINS.get(key, (None, None))
@@ -4056,82 +4100,161 @@ def remove_exercise_scratch(base: pathlib.Path, scratch_root: pathlib.Path) -> N
 
 def _remove_pinned_scratch(base: pathlib.Path, root: pathlib.Path, root_id: tuple[int, int] | None,
                            work_id: tuple[int, int] | None, pinned_at_creation: bool) -> None:
-    """The bounded removal loop of remove_exercise_scratch (see there)."""
+    """The bounded removal loop of remove_exercise_scratch (see there for the threat model)."""
     work = root / base.name                                             # the scratch's own name; `base` only names it in messages
     target = work                                                       # where the scratch is now: `work`, then its private name
     deadline = time.monotonic() + ROUTE_SCRATCH_REMOVE_DEADLINE
     failure: OSError = OSError(f"the {ROUTE_SCRATCH_REMOVE_DEADLINE:g}s deadline passed before a removal attempt could start")
     first = True
-    attempted = False
-
-    def look() -> str:
-        """_scratch_state, then the identity of the root and of the scratch against their pins."""
-        nonlocal root_id, work_id
-        state = "ok" if _scratch_guard_holds(target, root) else _scratch_state(target, root)
-        if state in ("ok", "absent"):
-            seen = _file_id(root, follow=True)
-            if root_id is None and not attempted and not pinned_at_creation:
-                root_id = seen                                          # pinned at the first readable look, before anything is removed
-            if seen is None or root_id is None:
-                return "unreadable"
-            if seen != root_id:
-                return "foreign"
-        if state == "ok":
-            seen = _file_id(target)
-            if work_id is None and not attempted and not pinned_at_creation:
-                work_id = seen
-            if seen is None or work_id is None:
-                return "unreadable"
-            if seen != work_id:
-                return "foreign"
-        return state
-
-    def ours() -> bool:
-        return root_id is not None and work_id is not None and _file_id(root, follow=True) == root_id and _file_id(target) == work_id
+    renamed = False                                                     # an identity is adopted only before the first rename
+    emptied = False                                                     # this removal's own rmdir of the private name succeeded
 
     def where() -> str:
         return "" if target == work else f" (under its private name {target})"
 
-    while True:
-        state = look()
-        if state == "absent":
-            return                                                      # confirmed gone, through the pinned root
-        if state == "foreign":
-            if first and not pinned_at_creation:
-                return                                                  # never ours: left alone
-            raise Unknown("EXERCISE_SCRATCH_NOT_REMOVED",
-                          f"{base}{where()} was replaced by a link or another directory (or its root was) during the removal; "
-                          f"it is left alone and behind: {failure}") from failure
-        if time.monotonic() > deadline:                                 # the looks themselves took time: no attempt starts after the deadline
-            break
-        first = False
-        if state == "unreadable":
-            failure = OSError(f"{base}{where()} cannot be inspected")   # unknown is not gone, and is not touched; look again after the pause
-        else:
-            attempted = True
+    def attempt() -> str:
+        """One attempt: 'absent' or 'removed' (confirmed gone under the held root), 'foreign' (not ours) or 'unpinned'. A
+        transient failure is an OSError and a swap met part-way is _NotOurs."""
+        nonlocal target, root_id, work_id, renamed, emptied
+        if not work.name.startswith(ROUTE_SCRATCH_PREFIX):
+            return "foreign"                                            # not the run's prefix: never made by this tool
+        try:
+            hold = _DirHold(root)
+            root_reparse = hold.__enter__()
+        except (FileNotFoundError, NotADirectoryError):
+            return "foreign"                                            # the pinned root is gone: what its name holds is unknown
+        try:
+            info = _meta(os.lstat, root)
+            if root_reparse or not _plain_dir(info) or not _in_place(root):
+                return "foreign"                                        # the root itself became a link or junction
+            if root_id is None:
+                if pinned_at_creation or renamed:
+                    return "unpinned"
+                root_id = _ident(info)                                  # pinned at the first readable look, before anything is moved
+            if _ident(info) != root_id:
+                return "foreign"
             try:
-                if target == work:
-                    target = _move_scratch_aside(work, root, root_id, work_id, base)   # removal never walks the scratch's own name
-                    if time.monotonic() > deadline:                     # the rename and its check took time: the walk is an attempt too
-                        break
-                walked = target
-                if sys.version_info >= (3, 12):
-                    shutil.rmtree(walked, onexc=lambda f, p, e: _writable_retry(f, p, e, walked, deadline, ours))
-                else:
-                    shutil.rmtree(walked, onerror=lambda f, p, e: _writable_retry(f, p, e, walked, deadline, ours))
-                if look() == "absent":
-                    return
-                failure = OSError(f"{base}{where()} still exists or cannot be inspected after the removal returned")
-            except OSError as e:                                       # a just-killed process still holds it (sharing violation 13/32)
-                if isinstance(e, FileNotFoundError) and look() == "absent":
-                    return                                              # the scratch itself is gone; a missing CHILD is only a race, retried
-                failure = e
-        # No attempt starts after the deadline: not when the pause would cross it; the loop top re-checks after the pause AND the looks.
-        if time.monotonic() + ROUTE_SCRATCH_REMOVE_PAUSE > deadline:
+                found = _meta(os.lstat, target)
+            except (FileNotFoundError, NotADirectoryError):
+                if target != work and not emptied:
+                    return "moved"                                      # it left its private name, and not by this removal's rmdir
+                return "absent"                                         # confirmed gone, read through the held, verified root
+            if not _plain_dir(found):
+                return "foreign"
+            if work_id is None:
+                if pinned_at_creation or renamed:
+                    return "unpinned"
+                work_id = _ident(found)
+            if _ident(found) != work_id:
+                return "foreign"
+            if target == work:                                          # removal never walks the scratch's own name
+                private = root / f"{work.name}.rm-{os.urandom(8).hex()}"   # keeps the run's prefix; nobody can name it in advance
+                renamed = True
+                _meta(os.rename, work, private)
+                target = private
+            with _DirHold(target) as reparse:                           # from here the object under the private name cannot change
+                found = _meta(os.lstat, target)
+                if reparse or not _plain_dir(found) or _ident(found) != work_id or not _in_place(target):
+                    raise _NotOurs(f"{target} is not the scratch directory pinned for it")
+                _remove_tree(target)                                    # verified under the hold before anything under it is unlinked
+            _meta(os.rmdir, target)                                   # empty now; with the hold released, rmdir can only ever
+            emptied = True
+            try:                                                      # remove an empty directory or a link itself, never data
+                _meta(os.lstat, target)
+            except (FileNotFoundError, NotADirectoryError):
+                return "removed"
+            raise OSError(f"{base}{where()} still exists after its removal")
+        finally:
+            hold.__exit__(None, None, None)
+
+    def refuse(why: str) -> Unknown:
+        nonlocal target
+        if target != work:                                              # leave the data where it was: put it back under its name
+            try:
+                _meta(os.rename, target, work)
+                target, put = work, f"it was put back under {work}"
+            except OSError as e:
+                put = f"it could not be put back and is left under {target} ({e})"
+        else:
+            put = f"it is left under {work}"
+        return Unknown("EXERCISE_SCRATCH_NOT_REMOVED", f"{base}: {why}; nothing more was removed and {put}")
+
+    while time.monotonic() <= deadline:                                 # the budget bounds ATTEMPTS: checked before each one only
+        try:
+            outcome = attempt()
+        except _NotOurs as swapped:
+            raise refuse(f"{swapped}: a link, a junction or another directory took its name during the removal") from None
+        except OSError as e:                                            # held (sharing violation 13/32) or unreadable: retried
+            failure = e
+        else:
+            if outcome in ("absent", "removed"):
+                return
+            if outcome == "moved":                                      # never "removed": where it went is unknown
+                raise Unknown("EXERCISE_SCRATCH_NOT_REMOVED",
+                              f"{base}: it left its private name {target} while it was being removed, and not by this removal; "
+                              f"it is not reported removed: {failure}") from failure
+            if outcome == "foreign":
+                if first and not pinned_at_creation:
+                    return                                              # never ours: left alone
+                raise refuse("what its name (or its root's) holds is not the scratch this run made: it was replaced by a link, "
+                             "a junction or another directory")
+            raise refuse("its identity was not pinned, so nothing found under its name is known to be the scratch this run made")
+        first = False
+        if time.monotonic() + ROUTE_SCRATCH_REMOVE_PAUSE > deadline:     # no attempt starts after the deadline, nor a pause across it
             break
         time.sleep(ROUTE_SCRATCH_REMOVE_PAUSE)
     raise Unknown("EXERCISE_SCRATCH_NOT_REMOVED",
                   f"{base}{where()} could not be removed within {ROUTE_SCRATCH_REMOVE_DEADLINE:g}s and is left behind: {failure}") from failure
+
+
+def _remove_tree(top: str | os.PathLike) -> None:
+    """Remove everything INSIDE the scratch directory `top` (not `top` itself: its holder cannot remove it), which the caller holds
+    and has verified as the pinned scratch. Every directory under it is held while its own entries are removed, and must, under its
+    hold, be a real directory (no link, junction or reparse point), resolve to its own name and keep the identity it had when its
+    parent listed it, else the walk stops (_NotOurs) with nothing more removed. A link or junction inside is removed as a link,
+    never followed. A held entry is an OSError for the caller's bounded loop."""
+    _remove_contents(os.fspath(top))
+
+
+def _remove_contents(path: str) -> None:
+    with _meta(os.scandir, path) as listing:
+        names = [entry.path for entry in listing]
+    for child in names:
+        try:
+            info = _meta(os.lstat, child)
+        except (FileNotFoundError, NotADirectoryError):
+            continue                                                    # already gone: a child, never the scratch itself
+        if not _plain_dir(info):
+            _remove_entry(os.unlink, child, path)                       # a file, or a link/junction removed as itself
+            continue
+        try:
+            hold = _DirHold(child)
+            reparse = hold.__enter__()
+        except (FileNotFoundError, NotADirectoryError):
+            continue
+        try:
+            again = _meta(os.lstat, child)
+            if reparse or not _plain_dir(again) or _ident(again) != _ident(info) or not _in_place(child):
+                raise _NotOurs(f"{child} is not the directory listed there")
+            _remove_contents(child)
+        finally:
+            hold.__exit__(None, None, None)
+        _remove_entry(os.rmdir, child, path)                            # an empty directory, or a link swapped in: never data
+
+
+def _remove_entry(act, child: str, parent: str) -> None:
+    """unlink/rmdir one entry; a read-only one (git objects on Windows) is made writable and tried once more (_writable_retry)."""
+    try:
+        _meta(act, child)
+    except (FileNotFoundError, NotADirectoryError):
+        return
+    except PermissionError as denied:
+        _writable_retry(act, child, None, parent)
+        try:
+            _meta(os.lstat, child)                                      # strict: an unreadable entry is not a removed one
+        except (FileNotFoundError, NotADirectoryError):
+            return
+        raise denied
 
 
 def _remove_scratch_keeping(failure: BaseException, base: pathlib.Path, scratch_root: pathlib.Path) -> None:
@@ -4147,10 +4270,7 @@ def _remove_scratch_keeping(failure: BaseException, base: pathlib.Path, scratch_
         else:
             if hasattr(failure, "add_note"):
                 failure.add_note(said)
-            try:
-                _route_say(said, sys.stderr)
-            except (OSError, ValueError):                               # a closed or broken stderr never replaces the outcome
-                pass
+            _say_failure(said)                                          # a closed or broken stderr never replaces the outcome
 
 
 def make_exercise_scratch(bus: pathlib.Path, scratch_root: pathlib.Path) -> tuple[pathlib.Path, pathlib.Path, str]:
@@ -4232,6 +4352,16 @@ def _route_say(line: str, stream=None) -> None:
     stream = stream or sys.stdout
     encoding = getattr(stream, "encoding", None) or "utf-8"
     print(line.encode(encoding, errors="replace").decode(encoding), file=stream)
+
+
+def _say_failure(line: str) -> None:
+    """THE one way a diagnostic is written on a failure or cleanup path: to stderr, and a stderr that cannot be written (a closed
+    or broken pipe: BrokenPipeError 32, ValueError on a closed file, any OSError) is ignored, so the write can never replace the
+    exception or the typed outcome it reports."""
+    try:
+        _route_say(line, sys.stderr)
+    except (OSError, ValueError):
+        pass
 
 
 def bus_commits_behind_origin(bus: pathlib.Path, git_bin: str, clone: str | os.PathLike) -> int:
@@ -4598,7 +4728,7 @@ def cmd_validate(paths: list[pathlib.Path], deny_terms: list[tuple[str, str]],
                     raise Refusal("CONCERN_DUPLICATE_ID", f"{cid} also heads {concern_ids[cid].name}; the drain holds both")
                 concern_ids[cid] = p
         except Refusal as e:
-            print(f"[doctrine-outbox] REFUSED {p}: {e}", file=sys.stderr)
+            _say_failure(f"[doctrine-outbox] REFUSED {p}: {e}")
             ok = False
             continue
         print(f"[doctrine-outbox] OK {p}: target={item['meta']['target']} kind={item['meta']['kind']}")
@@ -4744,10 +4874,10 @@ def main(argv: list[str] | None = None) -> int:
         if "-h" not in argv and "--help" not in argv:
             require_configured()
     except Refusal as e:
-        print(f"[doctrine-outbox] {e}", file=sys.stderr)
+        _say_failure(f"[doctrine-outbox] {e}")                         # a broken stderr never replaces the typed exit code
         return 1
     except Unknown as e:
-        print(f"[doctrine-outbox] UNKNOWN {e}", file=sys.stderr)
+        _say_failure(f"[doctrine-outbox] UNKNOWN {e}")
         return 2
     parser = build_parser()
     args = parser.parse_args(argv)
@@ -4820,13 +4950,13 @@ def main(argv: list[str] | None = None) -> int:
             print(install_pre_push(repo))
             return 0
     except Refusal as e:
-        print(f"[doctrine-outbox] {e}", file=sys.stderr)
+        _say_failure(f"[doctrine-outbox] {e}")                         # a broken stderr never replaces the typed exit code
         return 1
     except Unknown as e:
-        print(f"[doctrine-outbox] UNKNOWN {e}", file=sys.stderr)
+        _say_failure(f"[doctrine-outbox] UNKNOWN {e}")
         return 2
     except GitError as e:
-        print(f"[doctrine-outbox] {e}", file=sys.stderr)
+        _say_failure(f"[doctrine-outbox] {e}")
         return 2
     print(f"[doctrine-outbox] unknown command {args.cmd}", file=sys.stderr)
     return 2

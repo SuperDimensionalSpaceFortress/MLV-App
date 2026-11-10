@@ -2521,8 +2521,8 @@ class FlakyScratchRemoval:
 
 
 def hung_prep_that_leaves_scratch_held(monkeypatch, failures: int | None) -> FlakyScratchRemoval:
-    flaky = FlakyScratchRemoval(shutil.rmtree, failures)
-    monkeypatch.setattr(ob.shutil, "rmtree", flaky)
+    flaky = FlakyScratchRemoval(ob._remove_tree, failures)
+    monkeypatch.setattr(ob, "_remove_tree", flaky)
 
     def hung(*_a, **_k):
         raise ob.Unknown("ROUTE_TIMEOUT", "git clone still running after 2s; its process tree was killed")
@@ -2558,7 +2558,7 @@ def test_remove_exercise_scratch_with_a_persistent_sharing_violation_raises_the_
     root = tmp_path / "scratch"
     base = root / (ob.ROUTE_SCRATCH_PREFIX + "held")
     base.mkdir(parents=True)
-    monkeypatch.setattr(ob.shutil, "rmtree", FlakyScratchRemoval(shutil.rmtree, None))
+    monkeypatch.setattr(ob, "_remove_tree", FlakyScratchRemoval(ob._remove_tree, None))
     monkeypatch.setattr(ob, "ROUTE_SCRATCH_REMOVE_PAUSE", 0)
     monkeypatch.setattr(ob, "ROUTE_SCRATCH_REMOVE_DEADLINE", 0.3)
     with pytest.raises(ob.Unknown) as caught:
@@ -2574,18 +2574,16 @@ def test_a_child_that_vanishes_during_removal_is_not_the_scratch_being_gone(tmp_
     base = root / (ob.ROUTE_SCRATCH_PREFIX + "race")
     base.mkdir(parents=True)
     (base / "keep.txt").write_text("k", encoding="utf-8")
-    real = shutil.rmtree
+    real = ob._remove_tree
     calls: list[int] = []
 
     def racing(path, *args, **kwargs):
         calls.append(1)
-        if len(calls) == 1:                                              # the entry that failed is already gone when the hook retries it
-            hook = kwargs.get("onexc") or kwargs.get("onerror")
-            vanished = str(Path(path) / "racing.tmp")
-            hook(os.unlink, vanished, PermissionError(13, "in use")) if "onexc" in kwargs else hook(os.unlink, vanished, (PermissionError, None, None))
+        if len(calls) == 1:                                              # an entry the walk listed is already gone when it is removed
+            ob._remove_entry(os.unlink, str(Path(path) / "racing.tmp"), str(path))
         return real(path, *args, **kwargs)
 
-    monkeypatch.setattr(ob.shutil, "rmtree", racing)
+    monkeypatch.setattr(ob, "_remove_tree", racing)
     ob.remove_exercise_scratch(base, root)
     assert not base.exists(), "cleanup returned while the scratch directory (keep.txt) was still there"
 
@@ -2595,7 +2593,7 @@ def test_a_file_not_found_for_a_child_does_not_end_the_removal_while_the_scratch
     base = root / (ob.ROUTE_SCRATCH_PREFIX + "gone-child")
     base.mkdir(parents=True)
     (base / "keep.txt").write_text("k", encoding="utf-8")
-    real = shutil.rmtree
+    real = ob._remove_tree
     calls: list[int] = []
 
     def racing(path, *args, **kwargs):
@@ -2604,7 +2602,7 @@ def test_a_file_not_found_for_a_child_does_not_end_the_removal_while_the_scratch
             raise FileNotFoundError(2, "The system cannot find the file specified", str(Path(path) / "racing.tmp"))
         return real(path, *args, **kwargs)
 
-    monkeypatch.setattr(ob.shutil, "rmtree", racing)
+    monkeypatch.setattr(ob, "_remove_tree", racing)
     ob.remove_exercise_scratch(base, root)
     assert not base.exists() and len(calls) == 2
 
@@ -2622,7 +2620,7 @@ def test_no_scratch_removal_attempt_starts_after_the_deadline(tmp_path, monkeypa
         clock[0] += 14.99 if len(starts) == 1 else 0.0                   # the first attempt is slow, then fails with the violation
         raise PermissionError(13, "in use", str(path))
 
-    monkeypatch.setattr(ob.shutil, "rmtree", attempt)
+    monkeypatch.setattr(ob, "_remove_tree", attempt)
     monkeypatch.setattr(ob, "time", types.SimpleNamespace(monotonic=lambda: clock[0], sleep=lambda s: clock.__setitem__(0, clock[0] + s)))
     with pytest.raises(ob.Unknown) as caught:
         ob.remove_exercise_scratch(base, root)
@@ -2646,7 +2644,7 @@ def test_a_pause_that_overshoots_the_deadline_does_not_start_another_removal_att
     def sleep(seconds):                                                  # ... but the scheduler wakes the sleeper at 15.1
         clock[0] += seconds + 0.2
 
-    monkeypatch.setattr(ob.shutil, "rmtree", attempt)
+    monkeypatch.setattr(ob, "_remove_tree", attempt)
     monkeypatch.setattr(ob, "time", types.SimpleNamespace(monotonic=lambda: clock[0], sleep=sleep))
     with pytest.raises(ob.Unknown) as caught:
         ob.remove_exercise_scratch(base, root)
@@ -2756,7 +2754,7 @@ def test_a_scratch_swapped_for_a_directory_link_during_the_retry_pause_is_never_
     base = root / (ob.ROUTE_SCRATCH_PREFIX + "swapped")
     base.mkdir(parents=True)
     (base / "child.txt").write_text("c", encoding="utf-8")
-    monkeypatch.setattr(ob.shutil, "rmtree", FlakyScratchRemoval(shutil.rmtree, 1))   # attempt 1: a sharing violation, so the pause runs
+    monkeypatch.setattr(ob, "_remove_tree", FlakyScratchRemoval(ob._remove_tree, 1))   # attempt 1: a sharing violation, so the pause runs
     chmods: list[str] = []
     real_chmod = os.chmod
     monkeypatch.setattr(ob.os, "chmod", lambda p, *a, **k: (chmods.append(str(p)), real_chmod(p, *a, **k))[1])
@@ -2791,34 +2789,36 @@ def test_the_rmtree_error_hook_never_makes_a_link_or_anything_under_one_writable
 # Adversary pass r2 (head 583a913d): A1 the guard's own time may carry the next attempt past the deadline; A2 a directory between the
 # hook's inspection and its chmod is swapped for a junction; A3 an unreadable scratch root must not read as "absent".
 
-def test_a_slow_guard_after_the_pause_does_not_carry_the_next_attempt_past_the_deadline(tmp_path, monkeypatch):
+def test_a_slow_check_inside_an_attempt_that_started_in_time_ends_that_attempt_and_starts_no_other(tmp_path, monkeypatch):
+    """r6 HUB RULING F2: the budget bounds ATTEMPTS (checked before each one); an attempt that started before the deadline runs to
+    its end, and none starts after it. (Was: a slow guard after the pause carried the next walk past the deadline.)"""
     import types
     root = tmp_path / "scratch"
     base = root / (ob.ROUTE_SCRATCH_PREFIX + "slowguard")
     base.mkdir(parents=True)
     clock = [0.0]
     starts: list[float] = []
-    real_guard = ob._scratch_guard_holds
-    guards = [0]
+    real_in_place = ob._in_place
+    checks = [0]
 
     def attempt(path, *args, **kwargs):
         starts.append(clock[0])
         clock[0] += 14.8 if len(starts) == 1 else 0.0                    # the first attempt fails at 14.8: the 0.1 s pause fits ...
         raise PermissionError(13, "in use", str(path))
 
-    def slow_guard(b, r):                                                # ... and the pause ends at 14.9, but the re-run guard takes 0.2 s
-        guards[0] += 1
-        if guards[0] > 1:
+    def slow_root_check(path):                                           # ... the pause ends at 14.9, and the second attempt's root check takes 0.2 s
+        checks[0] += 1
+        if os.path.normcase(str(path)) == os.path.normcase(os.path.realpath(root)) and checks[0] > 2:
             clock[0] += 0.2
-        return real_guard(b, r)
+        return real_in_place(path)
 
-    monkeypatch.setattr(ob.shutil, "rmtree", attempt)
-    monkeypatch.setattr(ob, "_scratch_guard_holds", slow_guard)
+    monkeypatch.setattr(ob, "_remove_tree", attempt)
+    monkeypatch.setattr(ob, "_in_place", slow_root_check)
     monkeypatch.setattr(ob, "time", types.SimpleNamespace(monotonic=lambda: clock[0], sleep=lambda s: clock.__setitem__(0, clock[0] + s)))
     with pytest.raises(ob.Unknown) as caught:
         ob.remove_exercise_scratch(base, root)
     assert caught.value.code == "EXERCISE_SCRATCH_NOT_REMOVED"
-    assert starts == [0.0], starts
+    assert len(starts) == 2 and starts[0] == 0.0 and starts[1] == pytest.approx(15.1), starts   # the in-time attempt ran; no third
 
 
 def test_a_directory_swapped_for_a_junction_between_the_hooks_inspection_and_its_chmod_is_not_touched(tmp_path, monkeypatch, outside_readonly_target):
@@ -2856,15 +2856,9 @@ def test_an_unreadable_scratch_root_is_never_reported_as_absent(tmp_path, monkey
     base.mkdir(parents=True)
     monkeypatch.setattr(ob, "ROUTE_SCRATCH_REMOVE_PAUSE", 0)
     monkeypatch.setattr(ob, "ROUTE_SCRATCH_REMOVE_DEADLINE", 0.3)
-    monkeypatch.setattr(ob.shutil, "rmtree", lambda *a, **k: None)       # every entry was refused: rmtree returns without removing
-    real_guard = ob._scratch_guard_holds
+    monkeypatch.setattr(ob, "_remove_tree", lambda *a, **k: None)       # every entry was refused: the walk returns without removing
     real_lstat = os.lstat
-    unreadable = [False]
-
-    def guard(b, r):
-        verdict = real_guard(b, r)
-        unreadable[0] = True                                             # from the first guard on, the scratch's metadata cannot be read
-        return verdict
+    unreadable = [True]                                                  # the scratch's metadata cannot be read
 
     def lstat(path, *a, **k):
         if unreadable[0] and str(path) == str(base):
@@ -2878,7 +2872,6 @@ def test_an_unreadable_scratch_root_is_never_reported_as_absent(tmp_path, monkey
             return False
         return True
 
-    monkeypatch.setattr(ob, "_scratch_guard_holds", guard)
     monkeypatch.setattr(ob.os, "lstat", lstat)
     monkeypatch.setattr(ob.os.path, "lexists", lexists)
     with pytest.raises(ob.Unknown) as caught:                            # success here would be a silent leak
@@ -2920,7 +2913,7 @@ def test_a_scratch_root_swapped_for_a_junction_during_the_retry_pause_is_never_r
     victim.write_text("outside", encoding="utf-8")
     import stat as stat_module
     os.chmod(victim, stat_module.S_IREAD)
-    monkeypatch.setattr(ob.shutil, "rmtree", FlakyScratchRemoval(shutil.rmtree, 1))
+    monkeypatch.setattr(ob, "_remove_tree", FlakyScratchRemoval(ob._remove_tree, 1))
     kinds: list[str] = []
     real_time = ob.time
 
@@ -3021,7 +3014,7 @@ def test_absence_seen_through_a_scratch_root_replaced_during_the_pause_is_not_a_
     (base / "f.txt").write_text("x", encoding="utf-8")
     outside = tmp_path / "outside-empty"
     outside.mkdir()                                                      # holds nothing named like the scratch: every look says "absent"
-    monkeypatch.setattr(ob.shutil, "rmtree", FlakyScratchRemoval(shutil.rmtree, 1))
+    monkeypatch.setattr(ob, "_remove_tree", FlakyScratchRemoval(ob._remove_tree, 1))
     kinds: list[str] = []
     real_time = ob.time
 
@@ -3101,26 +3094,34 @@ def test_the_job_exit_wait_never_returns_later_than_its_own_deadline(monkeypatch
 # scratch root replaced by an ORDINARY directory (or file) at the same path keeps the same real-path string, so identity, not the
 # string, decides: the root and the scratch are pinned by file identity, from creation when make_exercise_scratch made them.
 
-def test_a_first_guard_that_outlasts_the_deadline_starts_no_removal_attempt(tmp_path, monkeypatch):
+def test_no_attempt_starts_once_the_deadline_has_passed_and_a_slow_first_attempt_still_completes(tmp_path, monkeypatch):
+    """r6 HUB RULING F2: the deadline is checked before each attempt; an attempt that started in time is never discarded, even when
+    its own checks outlast the budget (it completes and the scratch is removed). A loop entered after the deadline starts none."""
     import types
     root = tmp_path / "scratch"
     base = root / (ob.ROUTE_SCRATCH_PREFIX + "slowfirst")
     base.mkdir(parents=True)
     clock = [0.0]
     attempts: list[str] = []
-    real_guard = ob._scratch_guard_holds
+    real_in_place = ob._in_place
 
-    def slow_first_guard(b, r):                                          # the very first look takes 16 s, past the default 15 s deadline
-        clock[0] += 16.0
-        return real_guard(b, r)
+    def slow_first_check(path):                                          # the very first look takes 16 s, past the default 15 s deadline
+        if not attempts and clock[0] == 0.0:
+            clock[0] += 16.0
+        return real_in_place(path)
 
-    monkeypatch.setattr(ob, "_scratch_guard_holds", slow_first_guard)
-    monkeypatch.setattr(ob.shutil, "rmtree", lambda path, *a, **k: attempts.append(str(path)))
+    monkeypatch.setattr(ob, "_in_place", slow_first_check)
+    monkeypatch.setattr(ob, "_remove_tree", lambda path, *a, **k: attempts.append(str(path)))
     monkeypatch.setattr(ob, "time", types.SimpleNamespace(monotonic=lambda: clock[0], sleep=lambda s: clock.__setitem__(0, clock[0] + s)))
+    ob.remove_exercise_scratch(base, root)                               # started at 0.0: runs to its end
+    assert len(attempts) == 1 and not base.exists(), attempts
+    late = root / (ob.ROUTE_SCRATCH_PREFIX + "late")
+    late.mkdir()
+    monkeypatch.setattr(ob, "ROUTE_SCRATCH_REMOVE_DEADLINE", -1.0)      # the budget is spent before the first attempt could start
     with pytest.raises(ob.Unknown) as caught:
-        ob.remove_exercise_scratch(base, root)
+        ob.remove_exercise_scratch(late, root)
     assert caught.value.code == "EXERCISE_SCRATCH_NOT_REMOVED", caught.value
-    assert attempts == [], attempts
+    assert len(attempts) == 1 and late.exists(), attempts
 
 
 @pytest.mark.parametrize("kind", ["populated-directory", "empty-directory", "file"])
@@ -3130,7 +3131,7 @@ def test_a_scratch_root_replaced_by_an_ordinary_path_during_the_pause_is_never_r
     base = root / (ob.ROUTE_SCRATCH_PREFIX + "ordinary-swap")
     base.mkdir(parents=True)
     (base / "f.txt").write_text("original", encoding="utf-8")
-    monkeypatch.setattr(ob.shutil, "rmtree", FlakyScratchRemoval(shutil.rmtree, 1))
+    monkeypatch.setattr(ob, "_remove_tree", FlakyScratchRemoval(ob._remove_tree, 1))
     precious = root / base.name / "precious.txt"
     swapped: list[str] = []
     real_time = ob.time
@@ -3189,28 +3190,33 @@ def test_the_error_hook_never_chmods_or_unlinks_inside_a_scratch_replaced_by_an_
     base = root / (ob.ROUTE_SCRATCH_PREFIX + "hookswap")
     base.mkdir(parents=True)
     (base / "f.txt").write_text("original", encoding="utf-8")
-    precious = Path()
     acted: list[str] = []
+    real_rename = os.rename
 
-    def rmtree_that_loses_the_scratch_to_a_swap(path, *args, **kwargs):
-        nonlocal precious
-        os.rename(path, tmp_path / "scratch-saved")                      # the scratch is renamed away and another ordinary directory takes its name
-        Path(path).mkdir()
-        precious = Path(path) / "precious.txt"                           # r5: `path` is the scratch's private name, not `base`
-        precious.write_text("not ours", encoding="utf-8")
-        os.chmod(precious, stat_module.S_IREAD)
-        hook = kwargs.get("onexc") or kwargs.get("onerror")
-        hook(lambda p: acted.append(str(p)), str(precious), PermissionError(13, "denied"))   # rmtree reports the entry it could not delete
-        raise PermissionError(13, "denied", str(path))
+    def rename_then_lose_the_scratch_to_a_swap(src, dst, *args, **kwargs):
+        real_rename(src, dst, *args, **kwargs)
+        if ".rm-" in os.fspath(dst) and not acted:                       # r6: right after the private rename, before its hold opens
+            acted.append(os.fspath(dst))
+            real_rename(dst, tmp_path / "scratch-saved")                 # the scratch is renamed away and another ordinary directory takes its name
+            Path(dst).mkdir()
+            planted = Path(dst) / "precious.txt"
+            planted.write_text("not ours", encoding="utf-8")
+            os.chmod(planted, stat_module.S_IREAD)
 
-    monkeypatch.setattr(ob.shutil, "rmtree", rmtree_that_loses_the_scratch_to_a_swap)
+    monkeypatch.setattr(ob.os, "rename", rename_then_lose_the_scratch_to_a_swap)
+    monkeypatch.setattr(ob, "_remove_tree", lambda path: (_ for _ in ()).throw(AssertionError(f"walked {path}")))
+    with pytest.raises(ob.Unknown) as caught:
+        ob.remove_exercise_scratch(base, root)
+    monkeypatch.setattr(ob.os, "rename", real_rename)
+    assert acted, "the swap seam never ran"
+    assert caught.value.code == "EXERCISE_SCRATCH_NOT_REMOVED", caught.value
+    precious = base / "precious.txt"                                     # the replacement is put back under the scratch's name, untouched
     try:
-        with pytest.raises(ob.Unknown) as caught:
-            ob.remove_exercise_scratch(base, root)
-        assert caught.value.code == "EXERCISE_SCRATCH_NOT_REMOVED", caught.value
-        assert acted == [] and not os.access(precious, os.W_OK), (acted, "the replacement's file was made writable or deleted")
+        assert precious.exists() and not os.access(precious, os.W_OK), "the replacement's file was made writable or deleted"
+        assert (tmp_path / "scratch-saved" / "f.txt").exists()
     finally:
-        os.chmod(precious, stat_module.S_IREAD | stat_module.S_IWRITE)
+        if precious.exists():
+            os.chmod(precious, stat_module.S_IREAD | stat_module.S_IWRITE)
 
 
 @pytest.mark.parametrize("missing", ["scratch", "root"])
@@ -3276,13 +3282,17 @@ def test_a_replacement_made_between_the_root_read_and_the_scratch_read_is_not_pi
     root = tmp_path / "scratch"
     base = root / (ob.ROUTE_SCRATCH_PREFIX + "pinbetween")
     base.mkdir(parents=True)
-    real, swapped = ob._file_id, [False]
+    real, swapped = ob._file_id, []
 
     def swap_after_the_root_read(path, follow=False):
         got = real(path, follow)
-        if follow and not swapped[0]:
-            swapped[0] = True
-            os.rename(base, tmp_path / "original-aside")
+        if follow and not swapped:
+            try:
+                os.rename(base, tmp_path / "original-aside")
+            except PermissionError as refused:                          # r6: the pin holds the scratch, so Windows refuses the swap
+                swapped.append(refused)
+                return got
+            swapped.append(True)
             base.mkdir()
             (base / "precious.txt").write_text("not ours", encoding="utf-8")
         return got
@@ -3292,6 +3302,12 @@ def test_a_replacement_made_between_the_root_read_and_the_scratch_read_is_not_pi
     monkeypatch.setattr(ob, "_file_id", real)
     monkeypatch.setattr(ob, "ROUTE_SCRATCH_REMOVE_PAUSE", 0)
     monkeypatch.setattr(ob, "ROUTE_SCRATCH_REMOVE_DEADLINE", 0.3)
+    assert swapped, "the swap seam never ran"
+    if swapped[0] is not True:                                           # the swap could not happen: the pin is the scratch itself
+        assert os.name == "nt", swapped
+        ob.remove_exercise_scratch(base, root)
+        assert not base.exists()
+        return
     with pytest.raises(ob.Unknown) as caught:
         ob.remove_exercise_scratch(base, root)
     assert caught.value.code == "EXERCISE_SCRATCH_NOT_REMOVED", caught.value
@@ -3455,17 +3471,17 @@ def test_an_unpinned_scratch_whose_root_resolves_elsewhere_is_still_left_alone(t
 def swap_scratch_after_its_last_look(monkeypatch, base: Path, replace) -> list[bool]:
     """The seam the review keys named: the scratch's identity is read (the last look before removal), and THEN another process
     renames it aside and `replace(base)` puts something else under the same name."""
-    real, swapped = ob._file_id, []
+    real, swapped = os.lstat, []
 
-    def read_then_swap(path, follow=False):
-        got = real(path, follow)
-        if not follow and not swapped and Path(path).name == base.name:
+    def read_then_swap(path, *args, **kwargs):                           # r6: the removal's last look is its strict lstat of the name
+        got = real(path, *args, **kwargs)
+        if not swapped and Path(path).name == base.name:
             swapped.append(True)
             os.rename(base, base.parent.parent / "original-aside")
             replace(base)
         return got
 
-    monkeypatch.setattr(ob, "_file_id", read_then_swap)
+    monkeypatch.setattr(ob.os, "lstat", read_then_swap)
     monkeypatch.setattr(ob, "ROUTE_SCRATCH_REMOVE_PAUSE", 0)
     monkeypatch.setattr(ob, "ROUTE_SCRATCH_REMOVE_DEADLINE", 0.3)
     return swapped
@@ -3515,7 +3531,7 @@ def test_a_scratch_swapped_for_a_link_after_the_last_look_is_never_walked_throug
     precious.write_text("not ours", encoding="utf-8")                   # writable: the walk deletes it unless it never walks there
     kinds: list[str] = []
     swapped = swap_scratch_after_its_last_look(monkeypatch, base, lambda path: kinds.append(make_directory_link(path, outside)))
-    monkeypatch.setattr(ob.shutil, "rmtree", walk_without_a_top_level_link_check)
+    monkeypatch.setattr(ob, "_remove_tree", walk_without_a_top_level_link_check)
     with pytest.raises(ob.Unknown) as caught:
         ob.remove_exercise_scratch(base, root)
     assert swapped and kinds, "the seam never ran"
@@ -3533,7 +3549,7 @@ def test_the_route_loop_keeps_its_own_failure_when_the_scratch_removal_also_fail
         raise ob.Unknown("ROUTE_SOMETHING_ELSE", "the route itself failed first")   # not ROUTE_TREE_NOT_EXITED: re-raised by the loop
 
     monkeypatch.setattr(ob, "exercise_route", route_fails)
-    monkeypatch.setattr(ob.shutil, "rmtree", FlakyScratchRemoval(shutil.rmtree, None))
+    monkeypatch.setattr(ob, "_remove_tree", FlakyScratchRemoval(ob._remove_tree, None))
     monkeypatch.setattr(ob, "ROUTE_SCRATCH_REMOVE_PAUSE", 0)
     monkeypatch.setattr(ob, "ROUTE_SCRATCH_REMOVE_DEADLINE", 0.3)
     with pytest.raises(ob.Unknown) as caught:
@@ -3549,7 +3565,7 @@ def test_the_route_loop_keeps_a_non_typed_failure_and_reports_the_leftover(tmp_p
         raise KeyboardInterrupt
 
     monkeypatch.setattr(ob, "exercise_route", route_interrupted)
-    monkeypatch.setattr(ob.shutil, "rmtree", FlakyScratchRemoval(shutil.rmtree, None))
+    monkeypatch.setattr(ob, "_remove_tree", FlakyScratchRemoval(ob._remove_tree, None))
     monkeypatch.setattr(ob, "ROUTE_SCRATCH_REMOVE_PAUSE", 0)
     monkeypatch.setattr(ob, "ROUTE_SCRATCH_REMOVE_DEADLINE", 0.3)
     with pytest.raises(KeyboardInterrupt):
@@ -3595,30 +3611,37 @@ def test_a_scratch_made_but_whose_pin_could_not_be_recorded_is_still_removed(tmp
 # Adversary pass r5 (head d9b83d99): A2 the private rename and its check take time, and the walk must not start after the deadline;
 # A3 a transient denial on the private name's metadata is retried, not final; A4 a broken stderr never replaces the first failure.
 
-def test_no_walk_starts_after_the_deadline_once_the_private_rename_and_its_check_took_time(tmp_path, monkeypatch):
+def test_a_verified_rename_that_ends_past_the_deadline_still_completes_the_removal(tmp_path, monkeypatch):
+    """r6 HUB RULING F2 (inverts the r5 test of d9b83d99 A2): the attempt passed its deadline check at 14.9 s, and the private
+    rename plus its identity check end at 15.1 s with the identities matching. That is SUCCESS: the budget bounds attempts and
+    never discards a completed, verified removal."""
     import types
     root = tmp_path / "scratch"
     base = root / (ob.ROUTE_SCRATCH_PREFIX + "lateaside")
     base.mkdir(parents=True)
     ob._pin_scratch(base, root)
+    (base / "f.txt").write_text("ours", encoding="utf-8")
     clock = [0.0]                                                        # the loop's deadline is ROUTE_SCRATCH_REMOVE_DEADLINE from here
     walks: list[str] = []
-    real_aside = ob._move_scratch_aside
+    real_rename, real_walk = os.rename, ob._remove_tree
 
-    def slow_aside(*args, **kwargs):
-        clock[0] = 14.9                                                  # the check at the loop top passed at 0.0; the rename starts ...
-        got = real_aside(*args, **kwargs)
-        clock[0] = ob.ROUTE_SCRATCH_REMOVE_DEADLINE + 0.1                # ... and the rename and its identity check end past the deadline
-        return got
+    def slow_rename(src, dst, *args, **kwargs):
+        clock[0] = 14.9                                                  # the check at the loop top passed; the rename starts ...
+        real_rename(src, dst, *args, **kwargs)
+        clock[0] = ob.ROUTE_SCRATCH_REMOVE_DEADLINE + 0.1                # ... and it and its identity check end past the deadline
 
-    monkeypatch.setattr(ob, "_move_scratch_aside", slow_aside)
-    monkeypatch.setattr(ob.shutil, "rmtree", lambda path, *a, **k: walks.append(str(path)))
+    def walk(path):
+        walks.append((str(path), clock[0]))
+        real_walk(path)
+
+    monkeypatch.setattr(ob.os, "rename", slow_rename)
+    monkeypatch.setattr(ob, "_remove_tree", walk)
     monkeypatch.setattr(ob, "time", types.SimpleNamespace(monotonic=lambda: clock[0], sleep=lambda s: clock.__setitem__(0, clock[0] + s)))
-    with pytest.raises(ob.Unknown) as caught:
-        ob.remove_exercise_scratch(base, root)
-    assert caught.value.code == "EXERCISE_SCRATCH_NOT_REMOVED", caught.value
-    assert walks == [], f"a walk started after the deadline: {walks}"
-    assert str(scratch_now(base)) in caught.value.detail, caught.value.detail   # names where the scratch is left
+    ob.remove_exercise_scratch(base, root)
+    monkeypatch.setattr(ob.os, "rename", real_rename)
+    assert len(walks) == 1 and ".rm-" in walks[0][0], walks              # one walk, under the private name only
+    assert walks[0][1] > ob.ROUTE_SCRATCH_REMOVE_DEADLINE, walks         # the scenario: the verified walk ran past the deadline
+    assert list(root.iterdir()) == [], list(root.iterdir())              # ... and its completed removal was kept
 
 
 def test_a_transient_denial_on_the_private_names_metadata_is_retried_not_final(tmp_path, monkeypatch):
@@ -3653,7 +3676,7 @@ def test_a_broken_stderr_never_replaces_the_preparations_own_failure(tmp_path, m
         raise BrokenPipeError(32, "Broken pipe")
 
     monkeypatch.setattr(ob, "run_isolated_git", git_fails)
-    monkeypatch.setattr(ob.shutil, "rmtree", FlakyScratchRemoval(shutil.rmtree, None))
+    monkeypatch.setattr(ob, "_remove_tree", FlakyScratchRemoval(ob._remove_tree, None))
     monkeypatch.setattr(ob, "ROUTE_SCRATCH_REMOVE_PAUSE", 0)
     monkeypatch.setattr(ob, "ROUTE_SCRATCH_REMOVE_DEADLINE", 0.3)
     monkeypatch.setattr(ob, "_route_say", broken_stderr)
@@ -3661,3 +3684,254 @@ def test_a_broken_stderr_never_replaces_the_preparations_own_failure(tmp_path, m
         ob.make_exercise_scratch(bus, tmp_path / "scratch")
     assert "first failure" in str(caught.value)
     assert any("EXERCISE_SCRATCH_NOT_REMOVED" in note for note in getattr(caught.value, "__notes__", [])), caught.value
+
+
+# r6 HUB RULING (E): fix the CLASS, not one race shape after another. Threat model (remove_exercise_scratch's docstring): never
+# delete through a link or junction, never delete a tree whose identity was not pinned, never report "removed" unless the tree is
+# gone; against a concurrent swapper the guarantee is FAIL-SAFE (typed refusal, data left in place). Each row feeds an adversary
+# finding's literal `input`. F1: e16da5aa A1 (the root swapped for a junction to itself before the private rename) and d9b83d99 A1
+# (the pin's identity reads and its emptiness scan served by two objects). F2: e16da5aa A2/A3 (a transient denial on a single
+# metadata call after the private rename is retried in the one loop). F3: a stderr whose write raises BrokenPipeError(32).
+
+class _BrokenStderr(io.TextIOBase):
+    encoding = "utf-8"
+
+    def write(self, _text):
+        raise BrokenPipeError(32, "Broken pipe")
+
+
+def _swap_root_for_a_junction_to_itself(root: Path, saved: Path) -> str:
+    os.rename(root, saved)
+    return make_directory_link(root, saved)
+
+
+@pytest.mark.parametrize("moment", ["before-the-private-rename", "before-the-root-hold"])
+def test_r6_f1_a_root_swapped_for_a_junction_to_itself_is_never_removed_through(tmp_path, monkeypatch, moment):
+    """e16da5aa A1, literal: a valid pinned scratch holding writable f.txt; after the final outer look and before
+    os.rename(work, private), the scratch root is renamed to `saved` and a junction to `saved` takes its name. The run's own files
+    may only ever be removed through the real, held root: either the swap is refused because the root is held (Windows), or the
+    attempt finds the junction and refuses, typed, with f.txt untouched. Never a removal through the junction, never "removed"."""
+    root = tmp_path / "scratch"
+    base = root / (ob.ROUTE_SCRATCH_PREFIX + "test")
+    base.mkdir(parents=True)
+    ob._pin_scratch(base, root)
+    (base / "f.txt").write_text("ours", encoding="utf-8")
+    saved = tmp_path / "saved"
+    swapped: list[object] = []
+    monkeypatch.setattr(ob, "ROUTE_SCRATCH_REMOVE_PAUSE", 0)
+    monkeypatch.setattr(ob, "ROUTE_SCRATCH_REMOVE_DEADLINE", 0.5)
+    if moment == "before-the-private-rename":
+        real_rename = os.rename
+
+        def rename(src, dst, *args, **kwargs):
+            if not swapped and ".rm-" in os.fspath(dst):
+                try:
+                    swapped.append(_swap_root_for_a_junction_to_itself(root, saved))
+                except PermissionError as refused:                      # the root is held for the whole attempt
+                    swapped.append(refused)
+            return real_rename(src, dst, *args, **kwargs)
+
+        monkeypatch.setattr(ob.os, "rename", rename)
+    else:
+        real_hold = ob._DirHold
+
+        class SwapThenHold(real_hold):
+            def __enter__(self):
+                if not swapped and os.path.normcase(self.path) == os.path.normcase(os.path.realpath(root)):
+                    swapped.append(_swap_root_for_a_junction_to_itself(root, saved))
+                return super().__enter__()
+
+        monkeypatch.setattr(ob, "_DirHold", SwapThenHold)
+    try:
+        ob.remove_exercise_scratch(base, root)
+        outcome = None
+    except ob.Unknown as caught:
+        outcome = caught
+    finally:
+        monkeypatch.undo()
+    assert swapped, "the swap seam never ran"
+    if isinstance(swapped[0], PermissionError):                          # the hold made the swap impossible: our own scratch is removed
+        assert os.name == "nt" and outcome is None and not os.path.lexists(saved), (swapped, outcome)
+        assert not ob._is_link_or_junction(root) and list(root.iterdir()) == [], list(root.iterdir())
+        return
+    assert outcome is not None and outcome.code == "EXERCISE_SCRATCH_NOT_REMOVED", outcome
+    assert (scratch_now(saved / base.name) / "f.txt").read_text(encoding="utf-8") == "ours", "removed through the junction"
+
+
+@pytest.mark.skipif(os.name != "nt", reason="the hold (a share-no-delete handle) is Windows-only; the POSIX residual is DISTINGUISHed")
+def test_r6_f1_a_pin_whose_reads_and_scan_are_served_by_two_objects_never_pins_the_populated_one(tmp_path, monkeypatch):
+    """d9b83d99 A1, literal: _pin_scratch for empty O; after the root read O is replaced by populated P (precious.txt), both
+    scratch identity reads see P, empty O is put back for the scan, and P is restored before cleanup. With the scratch HELD while
+    it is pinned, Windows refuses every one of those renames, so the pin is O's and P never exists; nothing not ours is removed."""
+    root = tmp_path / "scratch"
+    base = root / (ob.ROUTE_SCRATCH_PREFIX + "test")
+    base.mkdir(parents=True)
+    o_aside, p_aside = tmp_path / "O-aside", tmp_path / "P-aside"
+    real_id, real_scandir = ob._file_id, os.scandir
+    events: list[object] = []
+
+    def make_p_take_the_name():
+        os.rename(base, o_aside)
+        base.mkdir()
+        (base / "precious.txt").write_text("not ours", encoding="utf-8")
+
+    def file_id(path, follow=False):
+        got = real_id(path, follow)
+        if follow and not events:                                        # straight after the root read: O -> P
+            try:
+                make_p_take_the_name()
+                events.append("P")
+            except PermissionError as refused:
+                events.append(refused)
+        return got
+
+    def scandir(path=".", *args, **kwargs):
+        if events == ["P"] and os.path.normcase(os.fspath(path)) == os.path.normcase(str(base)):
+            os.rename(base, p_aside)                                     # empty O back for the scan
+            os.rename(o_aside, base)
+            events.append("O")
+        return real_scandir(path, *args, **kwargs)
+
+    monkeypatch.setattr(ob, "_file_id", file_id)
+    monkeypatch.setattr(ob.os, "scandir", scandir)
+    ob._pin_scratch(base, root)
+    monkeypatch.setattr(ob, "_file_id", real_id)
+    monkeypatch.setattr(ob.os, "scandir", real_scandir)
+    if "O" in events:                                                    # P restored before cleanup
+        os.rename(base, o_aside)
+        os.rename(p_aside, base)
+    monkeypatch.setattr(ob, "ROUTE_SCRATCH_REMOVE_PAUSE", 0)
+    monkeypatch.setattr(ob, "ROUTE_SCRATCH_REMOVE_DEADLINE", 0.5)
+    try:
+        ob.remove_exercise_scratch(base, root)
+    except ob.Unknown as caught:
+        assert caught.code == "EXERCISE_SCRATCH_NOT_REMOVED", caught
+    assert events and isinstance(events[0], PermissionError), f"the swap was not refused while the scratch was pinned: {events}"
+    assert not (base / "precious.txt").exists() and not o_aside.exists(), "P existed, so the hold did not bind the pin"
+    precious = [p for p in tmp_path.rglob("precious.txt")]
+    assert precious == [] or all(p.read_text(encoding="utf-8") == "not ours" for p in precious), precious
+
+
+@pytest.mark.parametrize("which", ["os.stat", "os.lstat"])
+def test_r6_f2_a_single_denied_root_read_after_the_private_rename_is_retried_not_final(tmp_path, monkeypatch, which):
+    """e16da5aa A2, literal: a valid pinned scratch; only the post-rename read of the root raises PermissionError(13) once; every
+    later operation would succeed. One denial is unknown, not "foreign": it is retried inside the one bounded loop."""
+    root = tmp_path / "scratch"
+    base = root / (ob.ROUTE_SCRATCH_PREFIX + "test")
+    base.mkdir(parents=True)
+    ob._pin_scratch(base, root)
+    (base / "f.txt").write_text("ours", encoding="utf-8")
+    monkeypatch.setattr(ob, "ROUTE_SCRATCH_REMOVE_PAUSE", 0)
+    real_rename, real_read = os.rename, getattr(os, which.split(".")[1])
+    state = {"renamed": False, "denied": 0}
+    real_root = os.path.normcase(os.path.realpath(root))
+
+    def rename(src, dst, *args, **kwargs):
+        real_rename(src, dst, *args, **kwargs)
+        if ".rm-" in os.fspath(dst):
+            state["renamed"] = True
+
+    def read(path, *args, **kwargs):
+        if state["renamed"] and not state["denied"] and os.path.normcase(os.fspath(path)) == real_root:
+            state["denied"] += 1
+            raise PermissionError(13, "Access is denied", os.fspath(path))
+        return real_read(path, *args, **kwargs)
+
+    monkeypatch.setattr(ob.os, "rename", rename)
+    monkeypatch.setattr(ob.os, which.split(".")[1], read)
+    ob.remove_exercise_scratch(base, root)                               # never the typed foreign-object outcome for one denial
+    monkeypatch.undo()
+    assert state["renamed"], "the private rename never ran"
+    assert list(root.iterdir()) == [], list(root.iterdir())
+
+
+def test_r6_f2_a_denied_private_read_then_a_held_put_back_is_retried_not_final(tmp_path, monkeypatch):
+    """e16da5aa A3, literal: a valid pinned scratch; the first lstat(private) raises PermissionError(13) once, then
+    rename(private, work) raises a sharing violation once; later attempts would succeed within the 15 s budget. Unknown is retried
+    under the private name (no put-back is needed for a transient), and the removal completes."""
+    root = tmp_path / "scratch"
+    base = root / (ob.ROUTE_SCRATCH_PREFIX + "test")
+    base.mkdir(parents=True)
+    ob._pin_scratch(base, root)
+    (base / "f.txt").write_text("ours", encoding="utf-8")
+    monkeypatch.setattr(ob, "ROUTE_SCRATCH_REMOVE_PAUSE", 0)
+    real_rename, real_lstat = os.rename, os.lstat
+    faults = {"lstat": 0, "rename": 0}
+
+    def lstat(path, *args, **kwargs):
+        if ".rm-" in os.fspath(path) and not faults["lstat"]:
+            faults["lstat"] += 1
+            raise PermissionError(13, "Access is denied", os.fspath(path))
+        return real_lstat(path, *args, **kwargs)
+
+    def rename(src, dst, *args, **kwargs):
+        if ".rm-" in os.fspath(src) and not faults["rename"]:
+            faults["rename"] += 1
+            err = PermissionError(13, "The process cannot access the file because it is being used by another process", os.fspath(src))
+            err.winerror = 32
+            raise err
+        return real_rename(src, dst, *args, **kwargs)
+
+    monkeypatch.setattr(ob.os, "lstat", lstat)
+    monkeypatch.setattr(ob.os, "rename", rename)
+    ob.remove_exercise_scratch(base, root)
+    monkeypatch.undo()
+    assert faults["lstat"] == 1, faults
+    assert list(root.iterdir()) == [], list(root.iterdir())
+
+
+def test_r6_f3_a_real_broken_stderr_never_replaces_the_preparations_failure(tmp_path, monkeypatch):
+    """F3: sys.stderr itself is a pipe whose reader closed (every write raises BrokenPipeError(32)); the preparation fails with
+    GitError and the scratch stays held, so the cleanup's own typed failure must be reported. GitError stays the outcome."""
+    bus = make_bus(tmp_path)
+
+    def git_fails(*_a, **_k):
+        raise ob.GitError("first failure")
+
+    monkeypatch.setattr(ob, "run_isolated_git", git_fails)
+    monkeypatch.setattr(ob, "_remove_tree", FlakyScratchRemoval(ob._remove_tree, None))
+    monkeypatch.setattr(ob, "ROUTE_SCRATCH_REMOVE_PAUSE", 0)
+    monkeypatch.setattr(ob, "ROUTE_SCRATCH_REMOVE_DEADLINE", 0.3)
+    monkeypatch.setattr(ob.sys, "stderr", _BrokenStderr())
+    with pytest.raises(ob.GitError) as caught:
+        ob.make_exercise_scratch(bus, tmp_path / "scratch")
+    monkeypatch.undo()
+    assert "first failure" in str(caught.value)
+    assert any("EXERCISE_SCRATCH_NOT_REMOVED" in note for note in getattr(caught.value, "__notes__", [])), caught.value
+
+
+@pytest.mark.parametrize("raised, code", [("Unknown", 2), ("Refusal", 1)])
+def test_r6_f3_a_broken_stderr_never_replaces_mains_typed_exit_code(monkeypatch, raised, code):
+    """F3 siblings (main's exception paths): reporting a typed failure on a broken stderr still returns its typed exit code."""
+    def failing(_argv):
+        raise ob.Unknown("EXERCISE_SCRATCH_NOT_REMOVED", "left behind") if raised == "Unknown" else ob.Refusal("refused")
+
+    monkeypatch.setattr(ob, "_apply_cli_config", failing)
+    monkeypatch.setattr(ob.sys, "stderr", _BrokenStderr())
+    assert ob.main(["validate"]) == code
+
+
+def test_r6_f1_a_scratch_moved_off_its_private_name_by_another_process_is_never_reported_removed(tmp_path, monkeypatch):
+    """Threat model: "removed" only when the tree is gone. After the private rename (and before its hold opens) another process
+    moves the scratch elsewhere: its private name is then empty, but this removal deleted nothing. That is typed, never a return."""
+    root = tmp_path / "scratch"
+    base = root / (ob.ROUTE_SCRATCH_PREFIX + "test")
+    base.mkdir(parents=True)
+    ob._pin_scratch(base, root)
+    (base / "f.txt").write_text("ours", encoding="utf-8")
+    moved = tmp_path / "moved-away"
+    real_rename = os.rename
+
+    def rename(src, dst, *args, **kwargs):
+        real_rename(src, dst, *args, **kwargs)
+        if ".rm-" in os.fspath(dst) and not moved.exists():
+            real_rename(dst, moved)
+
+    monkeypatch.setattr(ob.os, "rename", rename)
+    monkeypatch.setattr(ob, "ROUTE_SCRATCH_REMOVE_PAUSE", 0)
+    monkeypatch.setattr(ob, "ROUTE_SCRATCH_REMOVE_DEADLINE", 0.5)
+    with pytest.raises(ob.Unknown) as caught:
+        ob.remove_exercise_scratch(base, root)
+    monkeypatch.undo()
+    assert caught.value.code == "EXERCISE_SCRATCH_NOT_REMOVED", caught.value
+    assert (moved / "f.txt").read_text(encoding="utf-8") == "ours", "the moved scratch was touched"
