@@ -1271,15 +1271,19 @@ try {
     }
     # The fault in a cleanup outcome, or $null when it is well formed: ONE scalar string state from {removed, remaining, unknown}, and for
     # 'unknown' a non-empty scalar string error type. An array (empty or not), $null, another word or case, or a non-table is a fault (sol r4 B2).
+    # r8 (sol r7 B1): the validator reads through Get-SidecarCleanupFaultEntry, the SAME lookup rule every other reader uses (IDictionary.Contains with
+    # the raw string key). PowerShell's own indexer also converts the key, so a Dictionary[PSObject,object] keyed [psobject]'state' passed the old
+    # validator while the entry reader found no 'error'. Chosen over teaching every reader to unwrap PSObject keys: the seam stays plain-string keyed,
+    # there is ONE rule to keep in step, and a table whose keys the readers cannot resolve is refused (malformed) instead of read two ways.
     function Get-SidecarCleanupOutcomeFault($Cleanup) {
         if ($Cleanup -isnot [System.Collections.IDictionary]) { return 'outcome is not a table' }
-        # r6 (adversary r6 A2): reading the table can itself throw (a Dictionary[int,object] cannot be indexed with 'state'); that is a fault, not an escape.
+        # r6 (adversary r6 A2): reading the table can itself throw; that is a fault, not an escape.
         try {
-            $s = $Cleanup['state']
+            $s = (Get-SidecarCleanupFaultEntry $Cleanup 'state').value
             if ($s -isnot [string]) { return 'state is not one scalar string' }
             if ($s -cnotin @('removed', 'remaining', 'unknown')) { return "state [$s] is not removed|remaining|unknown" }
             if ($s -ceq 'unknown') {
-                $e = $Cleanup['error']
+                $e = (Get-SidecarCleanupFaultEntry $Cleanup 'error').value
                 # adversary r6 A3: the error type is written into the message as 'tmp=unknown(<error>)', so it must be one the reader's grammar accepts.
                 if ($e -isnot [string] -or $e -cnotmatch '^[\w.\x60]+\z') { return 'unknown needs a non-empty scalar error type of word characters' }
             }
@@ -1290,9 +1294,19 @@ try {
     # The writer's own call sites use this: a malformed outcome degrades to unknown(InvalidCleanupOutcome) so the PRIMARY failure still propagates
     # and the record is never contradictory. Set-SidecarTmpData itself refuses (below); a malformed outcome is a defect, reported, never recorded.
     # A valid outcome is returned as a fresh plain table built from the validated reads, so the call sites never read the caller's object again.
+    # Never throws (r8): any failure while resolving is itself an invalid outcome.
     function Resolve-SidecarCleanupOutcome($Cleanup) {
-        if ($null -eq (Get-SidecarCleanupOutcomeFault $Cleanup)) { return @{ state = [string]$Cleanup['state']; error = (Get-SidecarCleanupFaultEntry $Cleanup 'error').value } }   # the entry reader: a missing 'error' key is $null, never a KeyNotFoundException
+        try {
+            if ($null -eq (Get-SidecarCleanupOutcomeFault $Cleanup)) { return @{ state = [string](Get-SidecarCleanupFaultEntry $Cleanup 'state').value; error = (Get-SidecarCleanupFaultEntry $Cleanup 'error').value } }   # the entry reader: a missing 'error' key is $null, never a KeyNotFoundException
+        } catch { }
         return @{ state = 'unknown'; error = 'InvalidCleanupOutcome' }
+    }
+    # r8 (sol r7 B1, the class): the writer records the outcome on the exceptions it is about to throw, and NOTHING that goes wrong while doing so
+    # may replace the primary failure. A failure of the recorder is reported on the primary exception's Data['tmp_data_error'] (the error type;
+    # no warning, which under `pwsh -File` lands on STDOUT ahead of the JSON), and the caller then throws the primary as before.
+    function Set-SidecarTmpDataGuarded($Exception, [string]$Tmp, $Cleanup) {
+        try { Set-SidecarTmpData $Exception $Tmp $Cleanup }
+        catch { try { $Exception.Data['tmp_data_error'] = $_.Exception.GetType().Name } catch { } }
     }
     # Records the cleanup outcome on an exception's Data: tmp_state always, tmp_remaining only for a checked 'remaining', tmp_state_error only
     # for 'unknown'. The cases assert on these entries, not on a substring of the message (sol r2 B1). It THROWS exactly once: a typed
@@ -1304,7 +1318,7 @@ try {
         $fault = Get-SidecarCleanupOutcomeFault $Cleanup
         if ($null -ne $fault) { throw [ArgumentException]::new("malformed sidecar cleanup outcome: $fault", 'Cleanup') }
         try {
-            $cState = [string]$Cleanup['state']; $cError = (Get-SidecarCleanupFaultEntry $Cleanup 'error').value   # validated reads (indexer + entry reader), any IDictionary
+            $cState = [string](Get-SidecarCleanupFaultEntry $Cleanup 'state').value; $cError = (Get-SidecarCleanupFaultEntry $Cleanup 'error').value   # validated reads, the same entry reader as the validator
             foreach ($k in 'tmp_remaining', 'tmp_state_error') { $Exception.Data.Remove($k) }   # adversary r4 A3: a re-recorded outcome drops the previous one's entries
             $Exception.Data['tmp_state'] = $cState
             if ($cState -ceq 'remaining') { $Exception.Data['tmp_remaining'] = $Tmp }
@@ -1333,14 +1347,14 @@ try {
                     # The original exception keeps its type; the cleanup outcome rides on its Data, never replacing it. No warning/stream
                     # output: under `pwsh -File` the warning stream lands on STDOUT ahead of the JSON the FIFO aggregate parses (sol r2 A1).
                     $cleanup = Resolve-SidecarCleanupOutcome (Remove-SidecarTmp $tmp)
-                    foreach ($d in @($_.Exception, $ex)) { Set-SidecarTmpData $d $tmp $cleanup }
+                    foreach ($d in @($_.Exception, $ex)) { Set-SidecarTmpDataGuarded $d $tmp $cleanup }
                     throw
                 }
                 if ($attempt -ge $maxAttempts) {
                     $cleanup = Resolve-SidecarCleanupOutcome (Remove-SidecarTmp $tmp)
                     $tmpState = if ($cleanup.state -ceq 'removed') { 'tmp=removed' } elseif ($cleanup.state -ceq 'remaining') { "tmp_remaining=$tmp" } else { "tmp=unknown($($cleanup.error))" }
                     $failure = [InvalidOperationException]::new("SIDECAR-WRITE-FAILED job=$JobId attempts=$attempt $tmpState $($ex.GetType().Name): $($ex.Message)", $ex)
-                    Set-SidecarTmpData $failure $tmp $cleanup
+                    Set-SidecarTmpDataGuarded $failure $tmp $cleanup
                     throw $failure
                 }
                 Start-Sleep -Milliseconds 50
@@ -1358,8 +1372,9 @@ try {
     #  3. the writer's grammar right after '<n> ':  'tmp=removed <Type>: ' | 'tmp=unknown(<ErrType>) <Type>: ' | 'tmp_remaining=<dir>\<id>.json.<guid>.tmp <Type>: ';
     #  4. for removed/unknown, the rest of the message carries exactly ONE tmp token (tmp= or tmp_remaining=), else 'ambiguous'. A retained-file
     #     line is NOT scanned for tokens: its path (a temp root may hold ' attempts=1 tmp=removed ') and the exception tail are free text (CoS G4).
-    #     Two things are checked instead. (a) The path is pinned to the exact id's own tmp file after a separator, so a path whose file merely
-    #     ends in the id, or a longer id's tail, is refused ($null). (b) The tail after the header's '<Type>: ' must not hold a SECOND COMPLETE
+    #     Two things are checked instead. (a) The path is the text right after 'tmp_remaining=' up to the FIRST '.tmp <Type>: ' and must end in a
+    #     separator then the exact id's own tmp file, so a path whose file merely ends in the id, or a longer id's tail, or a wrong job's file
+    #     with the exact name only LATER in the exception text, is refused ($null; sol r7 B2). (b) The tail after the header's '<Type>: ' must not hold a SECOND COMPLETE
     #     writer header (' attempts=<n> <status> <Type>: '): that is a longer id's line read with a shorter id whose first header the id itself
     #     spells (CoS G6), so the reading is 'ambiguous'. A tail that only mentions framing words, with no second complete header, is still free text.
     #     The outcome's authority stays Data['tmp_state']; this text check only ever refuses, it never decides a status from identifier text.
@@ -1372,9 +1387,16 @@ try {
         # (adversary r6 A1: without the separator 'otherj.json.<guid>.tmp' read as j's, and a longer id's tail could be taken for the file name).
         if ($rest -cmatch '^\d+ tmp=removed [\w.\x60]+: ') { $status = 'tmp=removed' }
         elseif ($rest -cmatch '^\d+ tmp=unknown\([\w.\x60]+\) [\w.\x60]+: ') { $status = 'tmp=unknown' }
-        elseif ($rest -cmatch "^\d+ tmp_remaining=.+?[\\/]$([regex]::Escape($JobId))\.json\.[0-9a-fA-F]{32}\.tmp [\w.\x60]+: (?<tail>(?s:.*))\z") {
+        elseif ($rest -cmatch '^\d+ tmp_remaining=(?<path>.+?\.tmp) [\w.\x60]+: (?<tail>(?s:.*))\z') {
+            # r8 (sol r7 B2): the retained path is bound to the text right after 'tmp_remaining=' up to the FIRST '.tmp <Type>: ' (lazy, so it cannot
+            # swallow the exception text), and ITS file name must be the exact id's tmp file. The old pattern put the id inside one lazy match across
+            # header and tail, so 'otherj.json.<guid>.tmp IOException: see C:\fixture\j.json.<guid>.tmp' authenticated the wrong path from later text.
+            # A path that is not the exact id's (or whose own text spells '.tmp <Type>: ') is refused ($null), never searched for further down.
+            $retainedPath = $Matches['path']; $retainedTail = $Matches['tail']   # captured first: the next -match rewrites $Matches
+            if ($retainedPath -cnotmatch "[\\/]$([regex]::Escape($JobId))\.json\.[0-9a-fA-F]{32}\.tmp\z") { return $null }
             # r7 (CoS G6): a second COMPLETE writer header in the tail means this is a longer id's line read with a shorter id (see the header, 4b).
-            if ($Matches['tail'] -cmatch '(?s) attempts=\d+ (?:tmp=removed|tmp=unknown\([\w.\x60]+\)|tmp_remaining=.+?) [\w.\x60]+: ') { return 'ambiguous' }
+            # r8: 'complete' includes a well-formed retained path (<dir>\<id>.json.<32 hex>.tmp); 'tmp_remaining=bogus' is free text, not a header.
+            if ($retainedTail -cmatch '(?s) attempts=\d+ (?:tmp=removed|tmp=unknown\([\w.\x60]+\)|tmp_remaining=.+?[\\/][^\\/]*\.json\.[0-9a-fA-F]{32}\.tmp) [\w.\x60]+: ') { return 'ambiguous' }
             return 'tmp_remaining='
         }
         else { return $null }
@@ -2911,6 +2933,16 @@ function Exit-HeavySlot {
         # control: a retained line of 'j' whose exception tail merely mentions framing (no second complete header) is still read (CoS G4: the tail is free text).
         Assert-True ((Get-SidecarTmpStatus "SIDECAR-WRITE-FAILED job=j attempts=3 tmp_remaining=C:\fixture\j.json.$z32.tmp IOException: a attempts=1 tmp=removed b" 'j') -ceq 'tmp_remaining=') "cleanup-identifier(r7 G6): control - framing words in the exception tail without a second complete header do not make a retained line ambiguous"
         Assert-True ((Get-SidecarTmpStatus "SIDECAR-WRITE-FAILED job=j attempts=3 tmp_remaining=C:\fixture\j.json.$z32.tmp IOException: x" 'j') -ceq 'tmp_remaining=' -and (Get-SidecarTmpStatus "SIDECAR-WRITE-FAILED job=j attempts=3 tmp_remaining=/fixture/j.json.$z32.tmp IOException: x" 'j') -ceq 'tmp_remaining=') "cleanup-identifier(r6 A1): control - the id's own tmp file after a separator (either kind) is read"
+        # r8 (sol r7 B2): the retained path is the text right after 'tmp_remaining=' up to the FIRST '.tmp <Type>: ' and its file name must be the exact id's.
+        # The exact-job filename found LATER, in the exception text, never authenticates a wrong-job path.
+        $b2Wrong = "SIDECAR-WRITE-FAILED job=j attempts=3 tmp_remaining=C:\fixture\otherj.json.$z32.tmp IOException: see C:\fixture\j.json.$z32.tmp IOException: x"
+        Assert-True ($null -eq (Get-SidecarTmpStatus $b2Wrong 'j')) "cleanup-identifier(r8 B2): sol's literal - a wrong-job retained filename with the exact-job filename later in the exception text is refused: [$(Get-SidecarTmpStatus $b2Wrong 'j')]"
+        Assert-True ($null -eq (Get-SidecarTmpStatus "SIDECAR-WRITE-FAILED job=j attempts=3 tmp_remaining=C:\fixture\other.json.$z32.tmp IOException: x C:\fixture\j.json.$z32.tmp IOException: y" 'j') -and $null -eq (Get-SidecarTmpStatus "SIDECAR-WRITE-FAILED job=j attempts=3 tmp_remaining=C:\fixture\xj.json.$z32.tmp IOException: C:\fixture\j.json.$z32.tmp IOException: y" 'j')) "cleanup-identifier(r8 B2): variants - a different job name or a longer-id tail first, the exact name later in the text - are refused"
+        # the second literal: an INCOMPLETE second retained header (a path that is not a tmp file) is free text, not a second complete header.
+        $b2Incomplete = "SIDECAR-WRITE-FAILED job=j attempts=3 tmp_remaining=C:\fixture\j.json.$z32.tmp IOException: x attempts=3 tmp_remaining=bogus IOException: x"
+        Assert-True ((Get-SidecarTmpStatus $b2Incomplete 'j') -ceq 'tmp_remaining=') "cleanup-identifier(r8 B2): sol's second literal - an incomplete second retained header (path 'bogus') is not classified as a complete one: [$(Get-SidecarTmpStatus $b2Incomplete 'j')]"
+        Assert-True ((Get-SidecarTmpStatus "SIDECAR-WRITE-FAILED job=j attempts=3 tmp_remaining=C:\fixture\j.json.$z32.tmp IOException: x attempts=3 tmp_remaining=C:\y\z.json.$z32.tmp IOException: x" 'j') -ceq 'ambiguous') "cleanup-identifier(r8 B2): control - a COMPLETE second retained header (a well-formed tmp path) is still ambiguous"
+        Assert-True ((Get-SidecarTmpStatus "SIDECAR-WRITE-FAILED job=j attempts=3 tmp_remaining=C:\my dir\a b\j.json.$z32.tmp IOException: x" 'j') -ceq 'tmp_remaining=') "cleanup-identifier(r8 B2): control - a temp root with spaces still reads (the path is bound to the first '.tmp <Type>: ', not to a no-space token)"
         # adversary r4 A3: re-recording a different outcome on the same exception leaves no entry of the previous one.
         $dx = [InvalidOperationException]::new('x')
         Set-SidecarTmpData $dx 'old.tmp' @{ state = 'remaining'; error = $null }
@@ -3014,6 +3046,52 @@ function Exit-HeavySlot {
         $dxi = [InvalidOperationException]::new('x'); $thrownI = $null
         try { Set-SidecarTmpData $dxi 'p.tmp' $intKeyed } catch { $thrownI = $_.Exception }
         Assert-True ($thrownI -is [ArgumentException] -and $dxi.Data.Count -eq 0) "cleanup-state(r6 A2): the setter refuses an int-keyed outcome with the typed ArgumentException and records nothing: thrown=[$(if ($null -ne $thrownI) { $thrownI.GetType().Name })]"
+        # r8 (sol r7 B1): ONE key-lookup rule. A Dictionary[PSObject,object] keyed by [psobject]'state'/'error' passed the old validator (PowerShell's
+        # indexer converts the string key) while the entry reader (IDictionary.Contains with the raw string) saw no 'error', so Resolve built
+        # unknown/null, the setter recorded unknown with an empty error, and the writer threw ArgumentException over the primary rename failure.
+        # The validator now reads through the SAME entry reader, so a table whose keys the readers cannot resolve is malformed (refused/degraded),
+        # and a table the validator accepts is, by construction, one every reader reads the same way.
+        $psKeyed = [Collections.Generic.Dictionary[System.Management.Automation.PSObject, object]]::new()
+        $psKeyed[[psobject]'state'] = 'unknown'; $psKeyed[[psobject]'error'] = 'E'
+        $agreeTables = @(
+            @{ n = 'PSObject-keyed (sol r7 literal)'; t = $psKeyed },
+            @{ n = 'int-keyed'; t = $intKeyed },
+            @{ n = 'Hashtable'; t = @{ state = 'unknown'; error = 'E' } },
+            @{ n = 'ordered'; t = [ordered]@{ state = 'unknown'; error = 'E' } },
+            @{ n = 'Dictionary[string,object]'; t = $(& { $g = [Collections.Generic.Dictionary[string, object]]::new(); $g['state'] = 'unknown'; $g['error'] = 'E'; $g }) })
+        foreach ($at in $agreeTables) {
+            $vf = Get-SidecarCleanupOutcomeFault $at.t
+            $stE = Get-SidecarCleanupFaultEntry $at.t 'state'; $erE = Get-SidecarCleanupFaultEntry $at.t 'error'
+            $agree = ($null -ne $vf) -or ($stE.present -and $stE.value -ceq 'unknown' -and $erE.present -and $erE.value -ceq 'E')
+            Assert-True $agree "cleanup-state(r8 B1): validator and reader agree on [$($at.n)]: fault=[$vf] state=[$($stE.present)/$($stE.value)] error=[$($erE.present)/$($erE.value)] (an accepted table must read back its validated fields)"
+            $rs = Resolve-SidecarCleanupOutcome $at.t
+            Assert-True (($rs.state -ceq 'unknown' -and ($rs.error -ceq 'E' -or $rs.error -ceq 'InvalidCleanupOutcome'))) "cleanup-state(r8 B1): Resolve on [$($at.n)] never yields unknown with an empty error: state=[$($rs.state)] error=[$($rs.error)]"
+        }
+        Assert-True ($null -ne (Get-SidecarCleanupOutcomeFault $psKeyed)) "cleanup-state(r8 B1): the PSObject-keyed outcome is refused by the validator (its keys are not the strings the readers resolve): fault=[$(Get-SidecarCleanupOutcomeFault $psKeyed)]"
+        foreach ($kind in 'io', 'denied') {
+            $r = Invoke-SidecarCleanupProbe 'jRs' $kind $false @{ remove = $true; outcome = $psKeyed }
+            $want = $(if ($kind -ceq 'io') { [InvalidOperationException] } else { [UnauthorizedAccessException] })
+            $wantMoves = $(if ($kind -ceq 'io') { 3 } else { 1 })
+            Assert-True ($null -ne $r.err -and $r.err.Exception -is $want -and $r.moves -eq $wantMoves) "cleanup-state(r8 B1): [$kind] a PSObject-keyed outcome keeps the PRIMARY failure (attempt $wantMoves), not an ArgumentException: err=[$(if ($null -ne $r.err) { $r.err.Exception.GetType().Name + ': ' + $r.err.Exception.Message })] moves=$($r.moves)"
+            Assert-True ($r.data['tmp_state'] -ceq 'unknown' -and $r.data['tmp_state_error'] -ceq 'InvalidCleanupOutcome') "cleanup-state(r8 B1): [$kind] a PSObject-keyed outcome degrades to unknown(InvalidCleanupOutcome), never unknown with an empty error: state=[$($r.data['tmp_state'])] error=[$($r.data['tmp_state_error'])]"
+        }
+        $dxp = [InvalidOperationException]::new('x'); $thrownP = $null
+        try { Set-SidecarTmpData $dxp 'p.tmp' $psKeyed } catch { $thrownP = $_.Exception }
+        Assert-True ($thrownP -is [ArgumentException] -and $dxp.Data.Count -eq 0) "cleanup-state(r8 B1): the setter refuses a PSObject-keyed outcome and records nothing (no unknown with an empty error): thrown=[$(if ($null -ne $thrownP) { $thrownP.GetType().Name })] keys=[$(@($dxp.Data.Keys) -join ',')] error=[$($dxp.Data['tmp_state_error'])]"
+        # r8 class: whatever goes wrong while the writer records the cleanup outcome (here the setter itself throws), the PRIMARY failure is what
+        # propagates; the secondary error rides on Data['tmp_data_error'] (no warning: under `pwsh -File` the warning stream lands on STDOUT).
+        $origSetter = ${function:Set-SidecarTmpData}
+        try {
+            ${function:Set-SidecarTmpData} = { param($Exception, [string]$Tmp, $Cleanup) throw [InvalidOperationException]::new('injected: the outcome recorder failed') }
+            foreach ($kind in 'io', 'denied') {
+                $r = Invoke-SidecarCleanupProbe 'jRs' $kind $false $null
+                $want = $(if ($kind -ceq 'io') { [InvalidOperationException] } else { [UnauthorizedAccessException] })
+                $wantMoves = $(if ($kind -ceq 'io') { 3 } else { 1 })
+                Assert-True ($null -ne $r.err -and $r.err.Exception -is $want -and $r.moves -eq $wantMoves -and $r.err.Exception.Message -cnotmatch 'outcome recorder failed') "cleanup-state(r8 B1): [$kind] a throwing outcome recorder never replaces the primary failure: err=[$(if ($null -ne $r.err) { $r.err.Exception.GetType().Name + ': ' + $r.err.Exception.Message })] moves=$($r.moves)"
+                Assert-True ($null -ne $r.err -and $r.err.Exception.Data.Contains('tmp_data_error') -and [string]$r.err.Exception.Data['tmp_data_error'] -ceq 'InvalidOperationException') "cleanup-state(r8 B1): [$kind] the secondary error is reported on Data['tmp_data_error']: [$(if ($null -ne $r.err) { $r.err.Exception.Data['tmp_data_error'] })]"
+            }
+        }
+        finally { ${function:Set-SidecarTmpData} = $origSetter }
         # a VALID generic-dictionary outcome with no 'error' key is read (removed needs none), not a KeyNotFoundException
         $gRemoved = [Collections.Generic.Dictionary[string, object]]::new(); $gRemoved['state'] = 'removed'
         $r = Invoke-SidecarCleanupProbe 'jRs' 'io' $false @{ outcome = $gRemoved }
