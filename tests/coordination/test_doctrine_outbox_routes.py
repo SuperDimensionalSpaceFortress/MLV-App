@@ -2580,7 +2580,7 @@ def test_a_child_that_vanishes_during_removal_is_not_the_scratch_being_gone(tmp_
     def racing(path, *args, **kwargs):
         calls.append(1)
         if len(calls) == 1:                                              # an entry the walk listed is already gone when it is removed
-            ob._remove_entry(os.unlink, str(Path(path) / "racing.tmp"), str(path))
+            ob._remove_entry(str(Path(path) / "racing.tmp"), None, False)
         return real(path, *args, **kwargs)
 
     monkeypatch.setattr(ob, "_remove_tree", racing)
@@ -3592,9 +3592,11 @@ def test_a_creation_pin_is_dropped_even_when_the_removal_itself_raises(tmp_path,
     assert ob._scratch_key(base) not in ob._SCRATCH_PINS, "a pin outlived its removal and would match a later scratch of that name"
 
 
-def test_a_scratch_made_but_whose_pin_could_not_be_recorded_is_still_removed(tmp_path, monkeypatch):
-    """CoS G3, the scratch made but never removed: mkdtemp made it, then recording its pin failed; the preparation's own cleanup
-    must still remove it and leave no pin behind."""
+def test_a_scratch_made_but_whose_pin_could_not_be_recorded_is_never_adopted_and_is_named_as_left_behind(tmp_path, monkeypatch):
+    """CoS G3 under the r6 threat model (adversary r6 A3 on 0fd4c235): mkdtemp made it, then recording its pin failed. The cleanup
+    must never adopt whatever then holds its name (a replacement put there before the cleanup would be deleted), so an unpinned
+    scratch is the typed EXERCISE_SCRATCH_NOT_REMOVED naming it, attached to the preparation's own failure; no pin is left behind.
+    (Was: the cleanup removed it by adopting its identity at removal time, which is the adoption A3 turns into a deletion.)"""
     bus = make_bus(tmp_path)
     root = tmp_path / "scratch"
 
@@ -3602,9 +3604,11 @@ def test_a_scratch_made_but_whose_pin_could_not_be_recorded_is_still_removed(tmp
         raise RuntimeError("the pin could not be recorded")
 
     monkeypatch.setattr(ob, "_pin_scratch", pin_fails)
-    with pytest.raises(RuntimeError):
+    with pytest.raises(RuntimeError) as caught:
         ob.make_exercise_scratch(bus, root)
-    assert list(root.iterdir()) == [], "the scratch made before the pin failed was left behind"
+    leftover = list(root.iterdir())
+    assert len(leftover) == 1, leftover
+    assert any("EXERCISE_SCRATCH_NOT_REMOVED" in note and leftover[0].name in note for note in getattr(caught.value, "__notes__", [])), caught.value
     assert not [k for k in ob._SCRATCH_PINS if os.path.normcase(str(root)) in k], ob._SCRATCH_PINS
 
 
@@ -3815,7 +3819,8 @@ def test_r6_f1_a_pin_whose_reads_and_scan_are_served_by_two_objects_never_pins_t
 @pytest.mark.parametrize("which", ["os.stat", "os.lstat"])
 def test_r6_f2_a_single_denied_root_read_after_the_private_rename_is_retried_not_final(tmp_path, monkeypatch, which):
     """e16da5aa A2, literal: a valid pinned scratch; only the post-rename read of the root raises PermissionError(13) once; every
-    later operation would succeed. One denial is unknown, not "foreign": it is retried inside the one bounded loop."""
+    later operation would succeed. One denial is unknown, not "foreign": it is retried inside the one bounded loop. (r6 holds the
+    root for the whole attempt, so no post-rename root read exists any more; the row below injects one on the private name.)"""
     root = tmp_path / "scratch"
     base = root / (ob.ROUTE_SCRATCH_PREFIX + "test")
     base.mkdir(parents=True)
@@ -3935,3 +3940,140 @@ def test_r6_f1_a_scratch_moved_off_its_private_name_by_another_process_is_never_
     monkeypatch.undo()
     assert caught.value.code == "EXERCISE_SCRATCH_NOT_REMOVED", caught.value
     assert (moved / "f.txt").read_text(encoding="utf-8") == "ours", "the moved scratch was touched"
+
+# Adversary pass r6 (head 0fd4c235): A1 a pinned scratch moved off its own name before the first lookup is not "removed";
+# A2 Windows realpath keeps the \\?\ prefix when its verification lookup fails, which must not read as "foreign";
+# A3 a scratch whose pin record was never written is never adopted; A4 a child's identity comes from the listing itself.
+# A6: the post-rename denial row must really inject its denial.
+
+def test_r6_a6_a_single_denied_metadata_read_right_after_the_private_rename_is_injected_and_retried(tmp_path, monkeypatch):
+    root = tmp_path / "scratch"
+    base = root / (ob.ROUTE_SCRATCH_PREFIX + "test")
+    base.mkdir(parents=True)
+    ob._pin_scratch(base, root)
+    (base / "f.txt").write_text("ours", encoding="utf-8")
+    monkeypatch.setattr(ob, "ROUTE_SCRATCH_REMOVE_PAUSE", 0)
+    real_rename, real_lstat = os.rename, os.lstat
+    state = {"renamed": False, "denied": []}
+    names = {os.path.normcase(os.path.realpath(root))}
+
+    def rename(src, dst, *args, **kwargs):
+        real_rename(src, dst, *args, **kwargs)
+        if ".rm-" in os.fspath(dst):
+            state["renamed"] = True
+            names.add(os.path.normcase(os.fspath(dst)))
+
+    def lstat(path, *args, **kwargs):
+        if state["renamed"] and not state["denied"] and os.path.normcase(os.fspath(path)) in names:
+            state["denied"].append(os.fspath(path))
+            raise PermissionError(13, "Access is denied", os.fspath(path))
+        return real_lstat(path, *args, **kwargs)
+
+    monkeypatch.setattr(ob.os, "rename", rename)
+    monkeypatch.setattr(ob.os, "lstat", lstat)
+    ob.remove_exercise_scratch(base, root)
+    monkeypatch.undo()
+    assert len(state["denied"]) == 1, state                              # the denial was really injected, once
+    assert list(root.iterdir()) == [], list(root.iterdir())
+
+
+def test_r6_a1_a_pinned_scratch_moved_off_its_name_before_the_first_lookup_is_never_reported_removed(tmp_path, monkeypatch):
+    """0fd4c235 A1, literal: pin while empty, add f.txt, rename base to root/saved before the first scratch lookup, then remove."""
+    root = tmp_path / "scratch"
+    base = root / (ob.ROUTE_SCRATCH_PREFIX + "test")
+    base.mkdir(parents=True)
+    ob._pin_scratch(base, root)
+    (base / "f.txt").write_text("ours", encoding="utf-8")
+    os.rename(base, root / "saved")
+    monkeypatch.setattr(ob, "ROUTE_SCRATCH_REMOVE_PAUSE", 0)
+    monkeypatch.setattr(ob, "ROUTE_SCRATCH_REMOVE_DEADLINE", 0.5)
+    with pytest.raises(ob.Unknown) as caught:
+        ob.remove_exercise_scratch(base, root)
+    assert caught.value.code == "EXERCISE_SCRATCH_NOT_REMOVED", caught.value
+    assert (root / "saved" / "f.txt").read_text(encoding="utf-8") == "ours"
+
+
+@pytest.mark.skipif(os.name != "nt", reason="the extended-length prefix is a Windows realpath behavior")
+@pytest.mark.parametrize("fault", ["prefix-kept", "denied-once"])
+def test_r6_a2_a_transient_failure_inside_realpath_is_never_foreign(tmp_path, monkeypatch, fault):
+    """0fd4c235 A2, literal: during _in_place(root) the native lookup succeeds and only realpath's verification of the unprefixed
+    name fails once, so realpath returns the \\\\?\\-prefixed name; or the strict lookup itself raises a sharing violation once."""
+    root = tmp_path / "scratch"
+    base = root / (ob.ROUTE_SCRATCH_PREFIX + "test")
+    base.mkdir(parents=True)
+    ob._pin_scratch(base, root)
+    (base / "f.txt").write_text("ours", encoding="utf-8")
+    monkeypatch.setattr(ob, "ROUTE_SCRATCH_REMOVE_PAUSE", 0)
+    real_realpath, hits = os.path.realpath, []
+    real_root = os.path.normcase(real_realpath(root))
+
+    def realpath(path, *args, strict=False, **kwargs):
+        got = real_realpath(path, *args, strict=strict, **kwargs)
+        if strict and not hits and os.path.normcase(got) == real_root:
+            hits.append(fault)
+            if fault == "denied-once":
+                raise PermissionError(13, "The process cannot access the file because it is being used by another process", os.fspath(path))
+            return "\\\\?\\" + got
+        return got
+
+    monkeypatch.setattr(ob.os.path, "realpath", realpath)
+    ob.remove_exercise_scratch(base, root)
+    monkeypatch.undo()
+    assert hits == [fault], hits
+    assert list(root.iterdir()) == [], list(root.iterdir())
+
+
+def test_r6_a3_a_scratch_whose_pin_record_was_never_written_is_never_adopted_from_a_replacement(tmp_path, monkeypatch):
+    """0fd4c235 A3, literal: make_exercise_scratch(valid bus, root); an exception before _pin_scratch records anything, and before
+    the cleanup the original is renamed aside and an ordinary replacement holding precious.txt takes its name."""
+    bus = make_bus(tmp_path)
+    root = tmp_path / "scratch"
+    seen: dict[str, Path] = {}
+
+    def pin_fails_after_a_swap(base, scratch_root):
+        seen["base"] = base
+        os.rename(base, tmp_path / "original-aside")
+        base.mkdir()
+        (base / "precious.txt").write_text("not ours", encoding="utf-8")
+        raise RuntimeError("before the pin record was written")
+
+    monkeypatch.setattr(ob, "_pin_scratch", pin_fails_after_a_swap)
+    monkeypatch.setattr(ob, "ROUTE_SCRATCH_REMOVE_PAUSE", 0)
+    monkeypatch.setattr(ob, "ROUTE_SCRATCH_REMOVE_DEADLINE", 0.5)
+    with pytest.raises(RuntimeError):
+        ob.make_exercise_scratch(bus, root)
+    assert (seen["base"] / "precious.txt").read_text(encoding="utf-8") == "not ours", "the replacement was adopted and deleted"
+    assert (tmp_path / "original-aside").is_dir()
+
+
+def test_r6_a4_a_child_swapped_after_the_listing_is_never_walked_or_deleted(tmp_path, monkeypatch):
+    """0fd4c235 A4, literal: inside the privately renamed scratch, `objects` is listed; after the listing and before the child is
+    checked, `objects` is renamed aside and an ordinary directory holding precious.txt is moved into its name."""
+    root = tmp_path / "scratch"
+    base = root / (ob.ROUTE_SCRATCH_PREFIX + "test")
+    (base / "objects").mkdir(parents=True)                              # not pinned: identities adopted at the first look
+    (base / "objects" / "ours.txt").write_text("ours", encoding="utf-8")
+    planted = tmp_path / "planted"
+    planted.mkdir()
+    (planted / "precious.txt").write_text("not ours", encoding="utf-8")
+    real_list, swapped = ob._list_dir, []
+
+    def list_then_swap(path):
+        got = real_list(path)
+        for child, _identity, is_dir in got:
+            if is_dir and os.path.basename(child) == "objects" and not swapped:
+                os.rename(child, tmp_path / "objects-aside")
+                os.rename(planted, child)
+                swapped.append(child)
+        return got
+
+    monkeypatch.setattr(ob, "_list_dir", list_then_swap)
+    monkeypatch.setattr(ob, "ROUTE_SCRATCH_REMOVE_PAUSE", 0)
+    monkeypatch.setattr(ob, "ROUTE_SCRATCH_REMOVE_DEADLINE", 0.5)
+    with pytest.raises(ob.Unknown) as caught:
+        ob.remove_exercise_scratch(base, root)
+    assert swapped, "the swap seam never ran"
+    assert caught.value.code == "EXERCISE_SCRATCH_NOT_REMOVED", caught.value
+    survivors = list(tmp_path.rglob("precious.txt"))
+    assert len(survivors) == 1 and survivors[0].read_text(encoding="utf-8") == "not ours", survivors
+    assert (tmp_path / "objects-aside" / "ours.txt").exists()

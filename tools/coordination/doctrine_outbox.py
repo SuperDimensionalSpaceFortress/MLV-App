@@ -3970,6 +3970,10 @@ def _kernel32():
                                 wintypes.DWORD, wintypes.HANDLE]
     k32.GetFileInformationByHandle.restype = wintypes.BOOL
     k32.GetFileInformationByHandle.argtypes = [wintypes.HANDLE, ctypes.c_void_p]
+    k32.GetFileInformationByHandleEx.restype = wintypes.BOOL
+    k32.GetFileInformationByHandleEx.argtypes = [wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD]
+    k32.SetFileInformationByHandle.restype = wintypes.BOOL
+    k32.SetFileInformationByHandle.argtypes = [wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD]
     k32.CloseHandle.restype = wintypes.BOOL
     k32.CloseHandle.argtypes = [wintypes.HANDLE]
     return k32
@@ -3984,7 +3988,7 @@ class _DirHold:
     Elsewhere nothing is held and None is yielded: the checks then rest on path lookups alone (see the threat model)."""
 
     def __init__(self, path: str | os.PathLike) -> None:
-        self.path, self.handle = os.fspath(path), None
+        self.path, self.handle, self.index = os.fspath(path), None, None   # index: the held object's 64-bit file id (Windows)
 
     def __enter__(self) -> bool | None:
         if os.name != "nt":
@@ -4003,6 +4007,7 @@ class _DirHold:
             code = ctypes.get_last_error()
             self.__exit__(None, None, None)
             raise OSError(None, ctypes.FormatError(code), self.path, code)
+        self.index = (info[11] << 32) | info[12]                             # nFileIndexHigh, nFileIndexLow
         return bool(info[0] & 0x400) or not info[0] & 0x10                  # a reparse point, or not a directory at all
 
     def __exit__(self, *_exc) -> None:
@@ -4018,12 +4023,19 @@ def _scratch_key(base: pathlib.Path) -> str:
     return os.path.normcase(os.path.abspath(base))
 
 
+def _real(path: str | os.PathLike, strict: bool = False) -> str:
+    """os.path.realpath without the extended-length prefix that Windows' realpath KEEPS when its own verification lookup of the
+    unprefixed name fails (a transient denial): the prefixed name is the same resolved path, never a different place."""
+    real = os.path.realpath(path, strict=strict)
+    if real.startswith("\\\\?\\UNC\\"):
+        return "\\\\" + real[8:]
+    return real[4:] if real.startswith("\\\\?\\") else real
+
+
 def _in_place(path: str | os.PathLike) -> bool:
-    """True when `path` (a name under the already-real scratch root) resolves to itself: no directory on it is a link or junction."""
-    try:
-        return os.path.normcase(os.path.realpath(path)) == os.path.normcase(os.path.abspath(path))
-    except (OSError, ValueError):
-        return False
+    """True when `path` (a name under the already-real scratch root) resolves to itself: no directory on it is a link or junction.
+    Resolution is strict and goes through _meta: one that fails is an OSError for the bounded loop, never a False ("foreign")."""
+    return os.path.normcase(_meta(_real, path, True)) == os.path.normcase(os.path.abspath(path))
 
 
 def _pin_scratch(base: pathlib.Path, scratch_root: str | os.PathLike) -> None:
@@ -4036,9 +4048,9 @@ def _pin_scratch(base: pathlib.Path, scratch_root: str | os.PathLike) -> None:
     identity that is unreadable, differs between the reads or fails a check is recorded as None, which removal never completes
     from (the typed EXERCISE_SCRATCH_NOT_REMOVED, nothing removed). What remains on Windows is an EMPTY ordinary directory swapped
     in before the hold opened (no file is lost to it); where no hold exists (not Windows) the reads rest on path lookups alone."""
-    real = os.path.realpath(scratch_root)
     pin: tuple[tuple[int, int] | None, tuple[int, int] | None] = (None, None)
     try:
+        real = _real(scratch_root)
         with _DirHold(base) as reparse:
             root_a, work_a = _file_id(real, follow=True), _file_id(base)
             with os.scandir(base) as entries:
@@ -4085,8 +4097,8 @@ def remove_exercise_scratch(base: pathlib.Path, scratch_root: pathlib.Path) -> N
     pinned_at_creation = key in _SCRATCH_PINS
     root_id, work_id = _SCRATCH_PINS.get(key, (None, None))
     try:
-        root = pathlib.Path(os.path.realpath(scratch_root))             # pinned: every later look compares against THIS
-        parent = os.path.realpath(base.parent)
+        root = pathlib.Path(_real(scratch_root))                        # pinned: every later look compares against THIS
+        parent = _real(base.parent)
         if os.path.normcase(parent) != os.path.normcase(str(root)):
             if pinned_at_creation:                                      # ours, but its root cannot be pinned: unknown, never "done"
                 raise Unknown("EXERCISE_SCRATCH_NOT_REMOVED",
@@ -4136,9 +4148,9 @@ def _remove_pinned_scratch(base: pathlib.Path, root: pathlib.Path, root_id: tupl
             try:
                 found = _meta(os.lstat, target)
             except (FileNotFoundError, NotADirectoryError):
-                if target != work and not emptied:
-                    return "moved"                                      # it left its private name, and not by this removal's rmdir
-                return "absent"                                         # confirmed gone, read through the held, verified root
+                if emptied or not (pinned_at_creation or renamed):
+                    return "absent"                                     # removed by this removal, or never there and never ours
+                return "moved"                                          # ours, gone from its name, and not by this removal: moved
             if not _plain_dir(found):
                 return "foreign"
             if work_id is None:
@@ -4152,14 +4164,15 @@ def _remove_pinned_scratch(base: pathlib.Path, root: pathlib.Path, root_id: tupl
                 renamed = True
                 _meta(os.rename, work, private)
                 target = private
-            with _DirHold(target) as reparse:                           # from here the object under the private name cannot change
+            held = _DirHold(target)
+            with held as reparse:                                       # from here the object under the private name cannot change
                 found = _meta(os.lstat, target)
                 if reparse or not _plain_dir(found) or _ident(found) != work_id or not _in_place(target):
                     raise _NotOurs(f"{target} is not the scratch directory pinned for it")
                 _remove_tree(target)                                    # verified under the hold before anything under it is unlinked
-            _meta(os.rmdir, target)                                   # empty now; with the hold released, rmdir can only ever
+            _delete_entry(os.fspath(target), held.index, True, found)    # by handle, and only the object just verified (its file id)
             emptied = True
-            try:                                                      # remove an empty directory or a link itself, never data
+            try:
                 _meta(os.lstat, target)
             except (FileNotFoundError, NotADirectoryError):
                 return "removed"
@@ -4209,52 +4222,134 @@ def _remove_pinned_scratch(base: pathlib.Path, root: pathlib.Path, root_id: tupl
 
 def _remove_tree(top: str | os.PathLike) -> None:
     """Remove everything INSIDE the scratch directory `top` (not `top` itself: its holder cannot remove it), which the caller holds
-    and has verified as the pinned scratch. Every directory under it is held while its own entries are removed, and must, under its
-    hold, be a real directory (no link, junction or reparse point), resolve to its own name and keep the identity it had when its
-    parent listed it, else the walk stops (_NotOurs) with nothing more removed. A link or junction inside is removed as a link,
-    never followed. A held entry is an OSError for the caller's bounded loop."""
+    and has verified as the pinned scratch. Each entry's identity is taken from the LISTING itself (_list_dir: on Windows the file
+    id the directory hands out with each name, on POSIX the listing's inode), never from a later lookup of the name. Every directory
+    under `top` is held while its own entries are removed and must, under its hold, be a real directory (no link, junction or
+    reparse point) that resolves to its own name and carries the listed identity; every entry is deleted by _delete_entry, which on
+    Windows opens it (never through a link) and deletes THAT handle only when it carries the listed identity. Anything else stops
+    the walk (_NotOurs) with nothing more removed. A link or junction inside is removed as itself, never followed. A held entry is
+    an OSError for the caller's bounded loop."""
     _remove_contents(os.fspath(top))
 
 
-def _remove_contents(path: str) -> None:
-    with _meta(os.scandir, path) as listing:
-        names = [entry.path for entry in listing]
-    for child in names:
+def _list_dir(path: str) -> list[tuple[str, int | None, bool]]:
+    """(full name, identity, is a real directory) for each entry of the HELD directory `path`, the identity and kind read from the
+    listing itself, so a name swapped after the listing never carries the listed identity. Windows: GetFileInformationByHandleEx
+    with FileIdBothDirectoryInfo on a handle of `path` (the 64-bit file id). Elsewhere: os.scandir (the listing's d_ino, d_type)."""
+    if os.name != "nt":
+        with _meta(os.scandir, path) as listing:
+            return [(entry.path, entry.inode(), entry.is_dir(follow_symlinks=False) and not entry.is_symlink()) for entry in listing]
+    import ctypes
+    import struct
+    k32, found = _kernel32(), []
+    buffer = ctypes.create_string_buffer(64 * 1024)
+    holder = _DirHold(path)
+    with holder:
+        info_class = 11                                                  # FileIdBothDirectoryRestartInfo, then FileIdBothDirectoryInfo
+        while True:
+            if not k32.GetFileInformationByHandleEx(holder.handle, info_class, buffer, len(buffer)):
+                code = ctypes.get_last_error()
+                if code == 18:                                           # ERROR_NO_MORE_FILES
+                    break
+                raise OSError(None, ctypes.FormatError(code), path, code)
+            info_class, offset = 10, 0
+            while True:
+                step, = struct.unpack_from("<I", buffer, offset)
+                attributes, name_bytes = struct.unpack_from("<II", buffer, offset + 56)
+                file_id, = struct.unpack_from("<Q", buffer, offset + 96)
+                name = buffer.raw[offset + 104:offset + 104 + name_bytes].decode("utf-16-le")
+                if name not in (".", ".."):
+                    found.append((os.path.join(path, name), file_id, bool(attributes & 0x10) and not attributes & 0x400))
+                if not step:
+                    break
+                offset += step
+    return found
+
+
+def _delete_entry(path: str, identity: int | None, is_dir: bool, posix_info: os.stat_result | None = None) -> None:
+    """Delete ONE entry, only when it is the object listed (or held) as `identity`. Windows: it is opened by name for DELETE with
+    no link followed, its file id is compared on that handle, and that same handle is marked for deletion (POSIX semantics, read-only
+    ignored; plain disposition after clearing read-only where the volume lacks them), so no name lookup stands between the check
+    and the delete. A different object is _NotOurs, nothing deleted. A non-empty directory or a held entry is an OSError (retried).
+    Elsewhere: rmdir/unlink by name after an lstat identity check (the window between them is the documented POSIX limit)."""
+    if os.name != "nt":
+        if identity is not None or posix_info is not None:
+            now = _meta(os.lstat, path)
+            if (identity is not None and now.st_ino != identity) or (posix_info is not None and _ident(now) != _ident(posix_info)):
+                raise _NotOurs(f"{path} is not the entry listed there")
         try:
-            info = _meta(os.lstat, child)
-        except (FileNotFoundError, NotADirectoryError):
-            continue                                                    # already gone: a child, never the scratch itself
-        if not _plain_dir(info):
-            _remove_entry(os.unlink, child, path)                       # a file, or a link/junction removed as itself
+            _meta(os.rmdir if is_dir else os.unlink, path)
+        except PermissionError as denied:
+            _writable_retry(os.rmdir if is_dir else os.unlink, path, None, os.path.dirname(path))
+            try:
+                _meta(os.lstat, path)                                   # strict: an unreadable entry is not a removed one
+            except (FileNotFoundError, NotADirectoryError):
+                return
+            raise denied
+        return
+    import ctypes
+    k32 = _kernel32()
+    handle = k32.CreateFileW(path, 0x00010000 | 0x0080 | 0x0100,         # DELETE | FILE_READ_ATTRIBUTES | FILE_WRITE_ATTRIBUTES
+                             0x1 | 0x2 | 0x4, None, 3,                   # share read/write/delete; OPEN_EXISTING
+                             0x02000000 | 0x00200000, None)              # BACKUP_SEMANTICS (directories) | OPEN_REPARSE_POINT (no link followed)
+    if handle is None or handle == ctypes.c_void_p(-1).value:
+        code = ctypes.get_last_error()
+        raise OSError(None, ctypes.FormatError(code), path, code)
+    try:
+        info = (ctypes.c_uint32 * 13)()
+        if not k32.GetFileInformationByHandle(handle, ctypes.byref(info)):
+            code = ctypes.get_last_error()
+            raise OSError(None, ctypes.FormatError(code), path, code)
+        if identity is None or ((info[11] << 32) | info[12]) != identity:
+            raise _NotOurs(f"{path} is not the entry listed there")
+        flags = ctypes.c_uint32(0x1 | 0x2 | 0x10)                         # DELETE | POSIX_SEMANTICS | IGNORE_READONLY_ATTRIBUTE
+        if k32.SetFileInformationByHandle(handle, 21, ctypes.byref(flags), 4):   # FileDispositionInfoEx
+            return
+        code = ctypes.get_last_error()
+        if code not in (1, 50, 87):                                      # not "unsupported here": held, not empty, denied
+            raise OSError(None, ctypes.FormatError(code), path, code)
+        if info[0] & 0x1:                                                # read-only: cleared on THIS handle (FileBasicInfo)
+            basic = (ctypes.c_int64 * 5)(0, 0, 0, 0, (info[0] & ~0x1) or 0x80)
+            if not k32.SetFileInformationByHandle(handle, 0, ctypes.byref(basic), ctypes.sizeof(basic)):
+                code = ctypes.get_last_error()
+                raise OSError(None, ctypes.FormatError(code), path, code)
+        delete = ctypes.c_uint8(1)
+        if not k32.SetFileInformationByHandle(handle, 4, ctypes.byref(delete), 1):   # FileDispositionInfo
+            code = ctypes.get_last_error()
+            raise OSError(None, ctypes.FormatError(code), path, code)
+    finally:
+        k32.CloseHandle(handle)
+
+
+def _remove_contents(path: str) -> None:
+    for child, identity, is_dir in _list_dir(path):
+        if not is_dir:
+            _remove_entry(child, identity, False)                       # a file, or a link/junction removed as itself
             continue
         try:
             hold = _DirHold(child)
             reparse = hold.__enter__()
         except (FileNotFoundError, NotADirectoryError):
-            continue
+            continue                                                    # already gone: a child, never the scratch itself
         try:
-            again = _meta(os.lstat, child)
-            if reparse or not _plain_dir(again) or _ident(again) != _ident(info) or not _in_place(child):
+            if os.name == "nt":
+                same = hold.index == identity
+            else:
+                same = _meta(os.lstat, child).st_ino == identity
+            if reparse or not same or not _in_place(child):
                 raise _NotOurs(f"{child} is not the directory listed there")
             _remove_contents(child)
         finally:
             hold.__exit__(None, None, None)
-        _remove_entry(os.rmdir, child, path)                            # an empty directory, or a link swapped in: never data
+        _remove_entry(child, identity, True)                            # by handle, and only the listed directory, now empty
 
 
-def _remove_entry(act, child: str, parent: str) -> None:
-    """unlink/rmdir one entry; a read-only one (git objects on Windows) is made writable and tried once more (_writable_retry)."""
+def _remove_entry(child: str, identity: int | None, is_dir: bool) -> None:
+    """_delete_entry for one listed entry; one already gone is removed."""
     try:
-        _meta(act, child)
+        _delete_entry(child, identity, is_dir)
     except (FileNotFoundError, NotADirectoryError):
         return
-    except PermissionError as denied:
-        _writable_retry(act, child, None, parent)
-        try:
-            _meta(os.lstat, child)                                      # strict: an unreadable entry is not a removed one
-        except (FileNotFoundError, NotADirectoryError):
-            return
-        raise denied
 
 
 def _remove_scratch_keeping(failure: BaseException, base: pathlib.Path, scratch_root: pathlib.Path) -> None:
@@ -4284,8 +4379,9 @@ def make_exercise_scratch(bus: pathlib.Path, scratch_root: pathlib.Path) -> tupl
         raise Unknown("EXERCISE_SCRATCH_INSIDE_BUS", f"scratch root {scratch_root} is inside the bus {bus}; routes never run in the live bus")
     scratch_root.mkdir(parents=True, exist_ok=True)
     base = pathlib.Path(tempfile.mkdtemp(prefix=ROUTE_SCRATCH_PREFIX, dir=str(scratch_root)))
+    _SCRATCH_PINS[_scratch_key(base)] = (None, None)                    # made by THIS run, identity not yet read: never adopted later
     try:
-        _pin_scratch(base, scratch_root)                                # what removal must find again; a failure here still removes it
+        _pin_scratch(base, scratch_root)                              # what removal must find again; a failure here still removes it
         clone = base / "bus"
         git_bin, refused = route_git_binary(clone)
         if refused:
