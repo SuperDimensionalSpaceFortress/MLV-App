@@ -3416,3 +3416,55 @@ TEST(LookAssistScene, BothConsumersAskTheWindowLitCheckAtTheDisplayLevels)
     ASSERT_TRUE( applier.indexOf( QStringLiteral("cpuCores, true,\n                                      true );"), displayRenderer ) > displayRenderer );
     ASSERT_TRUE( applier.contains( QStringLiteral("if( displayLevels ) settings.flags |= MLV_PROCESSED_THUMBNAIL_DISPLAY_LEVELS;") ) );
 }
+
+// LOOK-ASSIST-UNDEREXPOSED-DAYLIGHT-AUTO-EXPOSURE-1: a display meter whose median is one code value carries no
+// mid-tone reading, so the exposure is the highlight (p99) cap, not the fallback 0. M16-1457 (median 1, p95 21,
+// p99 27) got exposure 0 while M16-1243 (median 2, p99 20) got 380: one code value decided +3.8 stops vs none.
+TEST(LookAssistScene, ADisplayMedianOfOneCodeValueLetsTheHighlightsGovernTheExposure)
+{
+    // RAW thumbnail statistics shaped like M16-1457.
+    LookAssistStats raw;
+    raw.median = 32; raw.p05 = 31; raw.p95 = 33; raw.p99 = 33;
+    raw.dynamicRange = 2; raw.clipLow = 0.0; raw.clipHigh = 0.0;
+
+    const auto meter = []( double median, double p95, double p99 ) {
+        LookAssistStats d;
+        d.median = median; d.p95 = p95; d.p99 = p99;
+        return d;
+    };
+
+    // (a) Night, display {1, 21, 27} (M16-1457): the p99 cap, bounded to 380. Was 0.
+    const LookAssistStats m1457 = meter( 1, 21, 27 );
+    ASSERT_EQ( 380, presetForLookAssistScene( LookAssistScene::Night, raw, nullptr, &m1457 ).exposure );
+    // (b) Shade, display {1, 19, 25}.
+    const LookAssistStats shadeMeter = meter( 1, 19, 25 );
+    ASSERT_EQ( 380, presetForLookAssistScene( LookAssistScene::Shade, raw, nullptr, &shadeMeter ).exposure );
+
+    // (c) Unchanged: display {2, 16, 20} (M16-1243) -> 380 for Night and Shade.
+    const LookAssistStats m1243 = meter( 2, 16, 20 );
+    ASSERT_EQ( 380, presetForLookAssistScene( LookAssistScene::Night, raw, nullptr, &m1243 ).exposure );
+    ASSERT_EQ( 380, presetForLookAssistScene( LookAssistScene::Shade, raw, nullptr, &m1243 ).exposure );
+
+    // At the same applied exposure the median-1 frame gets exactly the median-2 frame's preset: nothing else moves.
+    const LookAssistPreset viaCap = presetForLookAssistScene( LookAssistScene::Night, raw, nullptr, &m1457 );
+    const LookAssistPreset viaMedian = presetForLookAssistScene( LookAssistScene::Night, raw, nullptr, &m1243 );
+    ASSERT_EQ( viaMedian.contrast, viaCap.contrast );
+    ASSERT_EQ( viaMedian.pivot, viaCap.pivot );
+    ASSERT_EQ( viaMedian.shadows, viaCap.shadows );
+    ASSERT_EQ( viaMedian.highlights, viaCap.highlights );
+    ASSERT_EQ( viaMedian.vibrance, viaCap.vibrance );
+    ASSERT_EQ( viaMedian.temperatureDelta, viaCap.temperatureDelta );
+    ASSERT_EQ( viaMedian.tintDelta, viaCap.tintDelta );
+
+    // (d) Unchanged: an unreadable black frame {1, 1, 1} keeps exposure 0.
+    const LookAssistStats black = meter( 1, 1, 1 );
+    ASSERT_EQ( 0, presetForLookAssistScene( LookAssistScene::Night, raw, nullptr, &black ).exposure );
+    ASSERT_EQ( 0, presetForLookAssistScene( LookAssistScene::Shade, raw, nullptr, &black ).exposure );
+
+    // (e) Unchanged: the display.median 50 / p99 120 case the flavor tests use, per scene target (64/82/96/110).
+    const LookAssistStats mid = meter( 50, 100, 120 );
+    ASSERT_EQ( 36, presetForLookAssistScene( LookAssistScene::Night, raw, nullptr, &mid ).exposure );
+    ASSERT_EQ( 71, presetForLookAssistScene( LookAssistScene::ArtificialLights, raw, nullptr, &mid ).exposure );
+    ASSERT_EQ( 94, presetForLookAssistScene( LookAssistScene::Shade, raw, nullptr, &mid ).exposure );
+    ASSERT_EQ( 114, presetForLookAssistScene( LookAssistScene::BrightSun, raw, nullptr, &mid ).exposure );
+}

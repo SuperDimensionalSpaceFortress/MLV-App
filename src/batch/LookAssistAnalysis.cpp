@@ -2117,10 +2117,14 @@ LookAssistPreset presetForLookAssistScene( LookAssistScene scene,
     if( displayStats != nullptr && displayStats->median > 0.0 )
     {
         const int displayTarget = lookAssistDisplayTargetMedianForScene( scene );
-        int displayExposure = lookAssistExposureForTarget(
-            qMax( 1.0, displayStats->median ), (double)displayTarget, 0 );
         const int displayCap = lookAssistExposureForTarget(
             qMax( 1.0, displayStats->p99 ), 440.0, 400 );
+        int displayExposure = 0;
+        if( displayStats->median > 1.0 )
+            displayExposure = lookAssistExposureForTarget( displayStats->median, (double)displayTarget, 0 );
+        else if( displayStats->p99 > 1.0 )
+            // A median of one code value carries no mid-tone reading, so the highlights govern.
+            displayExposure = displayCap;
         displayExposure = qMin( displayExposure, displayCap );
         exposure = qBound( -120, displayExposure, 380 );
     }
