@@ -1378,6 +1378,23 @@ try {
     #     writer header (' attempts=<n> <status> <Type>: '): that is a longer id's line read with a shorter id whose first header the id itself
     #     spells (CoS G6), so the reading is 'ambiguous'. A tail that only mentions framing words, with no second complete header, is still free text.
     #     The outcome's authority stays Data['tmp_state']; this text check only ever refuses, it never decides a status from identifier text.
+    $script:SidecarRetainedRx = [regex]::new('\Gtmp_remaining=(?<path>.+?\.tmp) [\w.\x60]+: ')
+    $script:SidecarAttemptsStartRx = [regex]::new('(?= attempts=\d+ )')
+    $script:SidecarAttemptsRx = [regex]::new('\G attempts=\d+ ')
+    $script:SidecarStatusRx = [regex]::new('\G(?:tmp=removed|tmp=unknown\([\w.\x60]+\)) [\w.\x60]+: ')
+    # THE one recognizer of a retained-file writer header ('tmp_remaining=<path> <Type>: ') at $Start in $Text (r9, sol r8 B1: the first header and the
+    # tail's second-header check used two separately written recognizers, and the second borrowed a valid tmp filename from LATER exception text).
+    # Bind-then-validate, in this order and nowhere else: (1) the path is the text right after this header's own 'tmp_remaining=' up to the FIRST
+    # '.tmp <Type>: ' (lazy, single line, so it cannot swallow the exception text); (2) that bound path must end in a separator then
+    # '<name>.json.<32 hex>.tmp', and when $JobId is non-empty the <name> must be exactly the id. Returns @{ path; end } (end = index just past
+    # '<Type>: ') or $null when there is no header there or its own path is refused. It never looks at text after the bound path.
+    function Read-SidecarRetainedHeader([string]$Text, [int]$Start, [string]$JobId) {
+        $m = $script:SidecarRetainedRx.Match($Text, $Start)
+        if (-not $m.Success) { return $null }
+        $name = if ($JobId) { [regex]::Escape($JobId) } else { '[^\\/]*' }
+        if ($m.Groups['path'].Value -cnotmatch "[\\/]$name\.json\.[0-9a-fA-F]{32}\.tmp\z") { return $null }
+        return @{ path = $m.Groups['path'].Value; end = $m.Index + $m.Length }
+    }
     function Get-SidecarTmpStatus([Parameter(Mandatory)][string]$Message, [Parameter(Mandatory)][string]$JobId) {
         if ($JobId -cmatch 'job=|attempts=|tmp=|tmp_remaining=|[()]') { return 'ambiguous' }
         $prefix = "SIDECAR-WRITE-FAILED job=$JobId attempts="
@@ -1387,16 +1404,23 @@ try {
         # (adversary r6 A1: without the separator 'otherj.json.<guid>.tmp' read as j's, and a longer id's tail could be taken for the file name).
         if ($rest -cmatch '^\d+ tmp=removed [\w.\x60]+: ') { $status = 'tmp=removed' }
         elseif ($rest -cmatch '^\d+ tmp=unknown\([\w.\x60]+\) [\w.\x60]+: ') { $status = 'tmp=unknown' }
-        elseif ($rest -cmatch '^\d+ tmp_remaining=(?<path>.+?\.tmp) [\w.\x60]+: (?<tail>(?s:.*))\z') {
-            # r8 (sol r7 B2): the retained path is bound to the text right after 'tmp_remaining=' up to the FIRST '.tmp <Type>: ' (lazy, so it cannot
-            # swallow the exception text), and ITS file name must be the exact id's tmp file. The old pattern put the id inside one lazy match across
-            # header and tail, so 'otherj.json.<guid>.tmp IOException: see C:\fixture\j.json.<guid>.tmp' authenticated the wrong path from later text.
-            # A path that is not the exact id's (or whose own text spells '.tmp <Type>: ') is refused ($null), never searched for further down.
-            $retainedPath = $Matches['path']; $retainedTail = $Matches['tail']   # captured first: the next -match rewrites $Matches
-            if ($retainedPath -cnotmatch "[\\/]$([regex]::Escape($JobId))\.json\.[0-9a-fA-F]{32}\.tmp\z") { return $null }
+        elseif ($rest -cmatch '^\d+ (?=tmp_remaining=)') {
+            # r8 (sol r7 B2) / r9 (sol r8 B1): EVERY retained header, the first one here and any second one in the tail, is read by ONE helper
+            # (Read-SidecarRetainedHeader): the path is bound to the text right after THAT header's own 'tmp_remaining=' up to the FIRST '.tmp <Type>: '
+            # and validated, never searched for further down. The first header's file must be the exact id's tmp file; a refused path is $null.
+            $hdr = Read-SidecarRetainedHeader $rest $Matches[0].Length $JobId
+            if ($null -eq $hdr) { return $null }
             # r7 (CoS G6): a second COMPLETE writer header in the tail means this is a longer id's line read with a shorter id (see the header, 4b).
-            # r8: 'complete' includes a well-formed retained path (<dir>\<id>.json.<32 hex>.tmp); 'tmp_remaining=bogus' is free text, not a header.
-            if ($retainedTail -cmatch '(?s) attempts=\d+ (?:tmp=removed|tmp=unknown\([\w.\x60]+\)|tmp_remaining=.+?[\\/][^\\/]*\.json\.[0-9a-fA-F]{32}\.tmp) [\w.\x60]+: ') { return 'ambiguous' }
+            # r8/r9: 'complete' = ' attempts=<n> ' then tmp=removed | tmp=unknown(E) | a retained header whose OWN bound path is a well-formed tmp file
+            # (<dir>\<name>.json.<32 hex>.tmp), then '<Type>: '. 'tmp_remaining=bogus' and 'tmp_remaining=C:\bad\o.tmp IOException: see C:\y\z.json.<g>.tmp'
+            # are free text. Every ' attempts=<n> ' in the tail is a candidate start, so a complete header spelled inside a malformed one still counts.
+            foreach ($cand in $script:SidecarAttemptsStartRx.Matches($rest, $hdr.end)) {
+                $a = $script:SidecarAttemptsRx.Match($rest, $cand.Index)
+                if (-not $a.Success) { continue }
+                $q = $cand.Index + $a.Length
+                if ($script:SidecarStatusRx.Match($rest, $q).Success) { return 'ambiguous' }
+                if ($null -ne (Read-SidecarRetainedHeader $rest $q '')) { return 'ambiguous' }
+            }
             return 'tmp_remaining='
         }
         else { return $null }
@@ -2943,6 +2967,23 @@ function Exit-HeavySlot {
         Assert-True ((Get-SidecarTmpStatus $b2Incomplete 'j') -ceq 'tmp_remaining=') "cleanup-identifier(r8 B2): sol's second literal - an incomplete second retained header (path 'bogus') is not classified as a complete one: [$(Get-SidecarTmpStatus $b2Incomplete 'j')]"
         Assert-True ((Get-SidecarTmpStatus "SIDECAR-WRITE-FAILED job=j attempts=3 tmp_remaining=C:\fixture\j.json.$z32.tmp IOException: x attempts=3 tmp_remaining=C:\y\z.json.$z32.tmp IOException: x" 'j') -ceq 'ambiguous') "cleanup-identifier(r8 B2): control - a COMPLETE second retained header (a well-formed tmp path) is still ambiguous"
         Assert-True ((Get-SidecarTmpStatus "SIDECAR-WRITE-FAILED job=j attempts=3 tmp_remaining=C:\my dir\a b\j.json.$z32.tmp IOException: x" 'j') -ceq 'tmp_remaining=') "cleanup-identifier(r8 B2): control - a temp root with spaces still reads (the path is bound to the first '.tmp <Type>: ', not to a no-space token)"
+        # r9 (sol r8 B1): the SECOND retained header binds its path to the text right after ITS OWN 'tmp_remaining=' (up to the first '.tmp <Type>: ') and
+        # validates that; a valid tmp filename found only LATER in its exception text never authenticates a header whose own path is malformed.
+        $b1Good = "tmp_remaining=C:\x\j.json.$z32.tmp IOException: x"
+        $b1Lit = "SIDECAR-WRITE-FAILED job=j attempts=3 $b1Good attempts=3 tmp_remaining=C:\bad\other.tmp IOException: see C:\y\z.json.$z32.tmp IOException: x"
+        Assert-True ((Get-SidecarTmpStatus $b1Lit 'j') -ceq 'tmp_remaining=') "cleanup-identifier(r9 B1): sol's literal - a malformed second retained path with a valid tmp filename later in ITS exception text is free text, not a complete header: [$(Get-SidecarTmpStatus $b1Lit 'j')]"
+        $b1Sp = "SIDECAR-WRITE-FAILED job=j attempts=3 tmp_remaining=C:\my dir\j.json.$z32.tmp IOException: x attempts=3 tmp_remaining=C:\bad dir\other.tmp IOException: see C:\y y\z.json.$z32.tmp IOException: x"
+        Assert-True ((Get-SidecarTmpStatus $b1Sp 'j') -ceq 'tmp_remaining=') "cleanup-identifier(r9 B1): the same with space-containing paths reads tmp_remaining=: [$(Get-SidecarTmpStatus $b1Sp 'j')]"
+        $b1Ml = "SIDECAR-WRITE-FAILED job=j attempts=3 $b1Good attempts=3 tmp_remaining=C:\bad\other.tmp IOException: line1`nsee C:\y\z.json.$z32.tmp IOException: x`nline3"
+        Assert-True ((Get-SidecarTmpStatus $b1Ml 'j') -ceq 'tmp_remaining=') "cleanup-identifier(r9 B1): the same with a multiline exception tail reads tmp_remaining=: [$(Get-SidecarTmpStatus $b1Ml 'j')]"
+        Assert-True ((Get-SidecarTmpStatus "SIDECAR-WRITE-FAILED job=j attempts=3 $b1Good attempts=3 tmp_remaining=bogus IOException: x" 'j') -ceq 'tmp_remaining=') "cleanup-identifier(r9 B1): control - the simple bogus second path stays tmp_remaining="
+        Assert-True ((Get-SidecarTmpStatus "SIDECAR-WRITE-FAILED job=j attempts=3 $b1Good attempts=3 tmp_remaining=C:\y\z.json.$z32.tmp IOException: x" 'j') -ceq 'ambiguous') "cleanup-identifier(r9 B1): control - a genuinely complete second retained header stays ambiguous"
+        # a malformed second header does not hide a COMPLETE header inside its own exception text (every ' attempts=<n> ' is a candidate start).
+        $b1Nested = "SIDECAR-WRITE-FAILED job=j attempts=3 $b1Good attempts=3 tmp_remaining=C:\bad\other.tmp IOException: attempts=3 tmp=removed IOException: x"
+        Assert-True ((Get-SidecarTmpStatus $b1Nested 'j') -ceq 'ambiguous') "cleanup-identifier(r9 B1): a complete header spelled inside a malformed header's exception text is still a second complete header: [$(Get-SidecarTmpStatus $b1Nested 'j')]"
+        # the first and second headers are read by ONE helper, so a path the first refuses cannot be accepted by the second: a second header whose own
+        # file is a wrong-job-shaped but well-formed tmp path is complete (any job), and one whose path ends only in '.tmp' is not.
+        Assert-True ((Get-SidecarTmpStatus "SIDECAR-WRITE-FAILED job=j attempts=3 $b1Good attempts=3 tmp_remaining=C:\y\xj.json.$z32.tmp IOException: x" 'j') -ceq 'ambiguous' -and (Get-SidecarTmpStatus "SIDECAR-WRITE-FAILED job=j attempts=3 $b1Good attempts=3 tmp_remaining=C:\y\z.tmp IOException: x C:\q\z.json.$z32.tmp IOException: y" 'j') -ceq 'tmp_remaining=') "cleanup-identifier(r9 B1): shared binding - any well-formed second path is a complete header; a path that is only '*.tmp' is not, whatever follows it"
         # adversary r4 A3: re-recording a different outcome on the same exception leaves no entry of the previous one.
         $dx = [InvalidOperationException]::new('x')
         Set-SidecarTmpData $dx 'old.tmp' @{ state = 'remaining'; error = $null }
