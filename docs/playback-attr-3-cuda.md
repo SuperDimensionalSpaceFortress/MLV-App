@@ -99,6 +99,11 @@ pwsh -NoProfile -File tools\profiling\bachelor\playback-attr-3-cuda-assemble.ps1
     -SourceCommit <same-40-hex-sha> -DllPairDir <pair-artifacts-dir> -OutDir <build-dir>
 ```
 
+`MLV_HEAVY_SLOT_DEADLINE_UTC` (ISO-8601) must be set in the environment: `Invoke-VenueStageChain.ps1`
+and the nightly set it for you, and a manual run sets it itself. Without it the script stops at once with
+`STAGE_NO_HEAVY_SLOT_DEADLINE` (exit 27), before it writes anything or takes a heavy-slot ticket, because an
+unbounded wait is a 60 min default and every retry re-queues as the youngest ticket.
+
 It verifies the pair manifest (`sourceCommit` equal to `-SourceCommit`, every file's sha256
 matching the bytes on disk, a boolean `pendingSymbolPresence`) **before** deploying anything,
 then builds the Release exe from a clean `git archive` -- verified through the same
