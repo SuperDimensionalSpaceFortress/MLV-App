@@ -3204,13 +3204,13 @@ def test_the_error_hook_never_chmods_or_unlinks_inside_a_scratch_replaced_by_an_
             os.chmod(planted, stat_module.S_IREAD)
 
     monkeypatch.setattr(ob.os, "rename", rename_then_lose_the_scratch_to_a_swap)
-    monkeypatch.setattr(ob, "_remove_tree", lambda path: (_ for _ in ()).throw(AssertionError(f"walked {path}")))
+    monkeypatch.setattr(ob, "_remove_tree", lambda path, *a: (_ for _ in ()).throw(AssertionError(f"walked {path}")))
     with pytest.raises(ob.Unknown) as caught:
         ob.remove_exercise_scratch(base, root)
     monkeypatch.setattr(ob.os, "rename", real_rename)
     assert acted, "the swap seam never ran"
     assert caught.value.code == "EXERCISE_SCRATCH_NOT_REMOVED", caught.value
-    precious = base / "precious.txt"                                     # the replacement is put back under the scratch's name, untouched
+    precious = scratch_now(base) / "precious.txt"                        # the replacement stays where it is (r6 A1: never moved back), untouched
     try:
         assert precious.exists() and not os.access(precious, os.W_OK), "the replacement's file was made writable or deleted"
         assert (tmp_path / "scratch-saved" / "f.txt").exists()
@@ -3503,7 +3503,7 @@ def test_a_scratch_swapped_for_an_ordinary_directory_after_the_last_look_is_neve
         ob.remove_exercise_scratch(base, root)
     assert swapped, "the seam never ran"
     assert caught.value.code == "EXERCISE_SCRATCH_NOT_REMOVED", caught.value
-    assert (base / "precious.txt").exists(), "the replacement's file was deleted"
+    assert (scratch_now(base) / "precious.txt").exists(), "the replacement's file was deleted"   # never moved back (r6 A1)
     assert (tmp_path / "original-aside" / "f.txt").exists()
 
 
@@ -3634,9 +3634,9 @@ def test_a_verified_rename_that_ends_past_the_deadline_still_completes_the_remov
         real_rename(src, dst, *args, **kwargs)
         clock[0] = ob.ROUTE_SCRATCH_REMOVE_DEADLINE + 0.1                # ... and it and its identity check end past the deadline
 
-    def walk(path):
+    def walk(path, *args):
         walks.append((str(path), clock[0]))
-        real_walk(path)
+        real_walk(path, *args)
 
     monkeypatch.setattr(ob.os, "rename", slow_rename)
     monkeypatch.setattr(ob, "_remove_tree", walk)
@@ -4077,3 +4077,115 @@ def test_r6_a4_a_child_swapped_after_the_listing_is_never_walked_or_deleted(tmp_
     survivors = list(tmp_path.rglob("precious.txt"))
     assert len(survivors) == 1 and survivors[0].read_text(encoding="utf-8") == "not ours", survivors
     assert (tmp_path / "objects-aside" / "ours.txt").exists()
+
+# Adversary pass r6 (head bc0fecd8): A1 a put-back only ever moves the pinned scratch under the pinned root; A2 a retry never
+# re-pins a name with a new identity; A3 a scratch root named through a junction; A4 a lone UTF-16 surrogate in a listed name;
+# A5 a tree nested deeper than the walk can hold is a typed refusal, never a RecursionError.
+
+def test_r6_bc_a1_a_foreign_root_never_gets_an_unrelated_private_name_directory_moved_back(tmp_path, monkeypatch):
+    import types
+    root = tmp_path / "scratch"
+    base = root / (ob.ROUTE_SCRATCH_PREFIX + "test")
+    base.mkdir(parents=True)
+    ob._pin_scratch(base, root)
+    (base / "f.txt").write_text("ours", encoding="utf-8")
+    monkeypatch.setattr(ob, "_remove_tree", FlakyScratchRemoval(ob._remove_tree, 1))   # attempt 1: a sharing violation
+    seen: list[Path] = []
+    real_time = ob.time
+
+    def pause(_seconds):
+        if not seen:
+            private = scratch_now(base)
+            seen.append(private)
+            os.rename(root, tmp_path / "saved")
+            root.mkdir()
+            (root / private.name).mkdir()
+            (root / private.name / "precious.txt").write_text("not ours", encoding="utf-8")
+
+    monkeypatch.setattr(ob, "time", types.SimpleNamespace(monotonic=real_time.monotonic, sleep=pause))
+    with pytest.raises(ob.Unknown) as caught:
+        ob.remove_exercise_scratch(base, root)
+    assert seen and caught.value.code == "EXERCISE_SCRATCH_NOT_REMOVED", caught.value
+    assert (root / seen[0].name / "precious.txt").exists() and not base.exists(), list(root.iterdir())
+    assert (tmp_path / "saved" / seen[0].name / "f.txt").exists()
+
+
+@pytest.mark.skipif(os.name != "nt", reason="the held-handle open of a listed child is the Windows path")
+def test_r6_bc_a2_a_retry_never_accepts_a_new_identity_under_a_name_already_listed(tmp_path, monkeypatch):
+    root = tmp_path / "scratch"
+    base = root / (ob.ROUTE_SCRATCH_PREFIX + "test")
+    (base / "objects").mkdir(parents=True)
+    (base / "objects" / "ours.txt").write_text("ours", encoding="utf-8")
+    planted = tmp_path / "planted"
+    planted.mkdir()
+    (planted / "precious.txt").write_text("not ours", encoding="utf-8")
+    real_hold, swapped = ob._DirHold, []
+
+    class SwapThenFail(real_hold):
+        def __enter__(self):
+            if not swapped and os.path.basename(self.path) == "objects":
+                os.rename(self.path, tmp_path / "objects-aside")        # listed with one identity, then moved out ...
+                os.rename(planted, self.path)                            # ... and another takes the name
+                swapped.append(self.path)
+                raise PermissionError(13, "The process cannot access the file because it is being used by another process", self.path)
+            return super().__enter__()
+
+    monkeypatch.setattr(ob, "_DirHold", SwapThenFail)
+    monkeypatch.setattr(ob, "ROUTE_SCRATCH_REMOVE_PAUSE", 0)
+    monkeypatch.setattr(ob, "ROUTE_SCRATCH_REMOVE_DEADLINE", 0.5)
+    with pytest.raises(ob.Unknown) as caught:
+        ob.remove_exercise_scratch(base, root)
+    assert swapped and caught.value.code == "EXERCISE_SCRATCH_NOT_REMOVED", caught.value
+    survivors = list(tmp_path.rglob("precious.txt"))
+    assert len(survivors) == 1 and survivors[0].read_text(encoding="utf-8") == "not ours", survivors
+
+
+def test_r6_bc_a3_a_scratch_root_named_through_a_junction_is_made_and_removed_under_its_real_path(tmp_path, monkeypatch):
+    bus = make_bus(tmp_path)
+    real_root = tmp_path / "scratch-real"
+    real_root.mkdir()
+    alias = tmp_path / "scratch-link"
+    make_directory_link(alias, real_root)
+
+    def hung(*_a, **_k):                                                 # the preparation fails, so its own cleanup removes the scratch
+        raise ob.Unknown("ROUTE_TIMEOUT", "git clone still running after 2s; its process tree was killed")
+
+    monkeypatch.setattr(ob, "run_isolated_git", hung)
+    with pytest.raises(ob.Unknown) as caught:
+        ob.make_exercise_scratch(bus, alias)
+    assert caught.value.code == "ROUTE_TIMEOUT" and "EXERCISE_SCRATCH_NOT_REMOVED" not in caught.value.detail, caught.value
+    assert list(real_root.iterdir()) == [], list(real_root.iterdir())
+
+
+@pytest.mark.skipif(os.name != "nt", reason="NTFS names may hold a lone UTF-16 surrogate")
+def test_r6_bc_a4_a_listed_name_with_a_lone_surrogate_is_removed(tmp_path):
+    root = tmp_path / "scratch"
+    base = root / (ob.ROUTE_SCRATCH_PREFIX + "test")
+    base.mkdir(parents=True)
+    ob._pin_scratch(base, root)
+    with open(os.path.join(str(base), "\ud800"), "w", encoding="utf-8") as odd:
+        odd.write("ours")
+    ob.remove_exercise_scratch(base, root)
+    assert list(root.iterdir()) == [], list(root.iterdir())
+
+
+def test_r6_bc_a5_a_tree_nested_deeper_than_the_walk_can_hold_is_a_typed_refusal(tmp_path, monkeypatch):
+    root = tmp_path / "scratch"
+    base = root / (ob.ROUTE_SCRATCH_PREFIX + "test")
+    base.mkdir(parents=True)
+    ob._pin_scratch(base, root)
+    deep = base
+    for _ in range(40):
+        deep = deep / "a"
+    deep.mkdir(parents=True)
+    (deep / "f.txt").write_text("ours", encoding="utf-8")
+    depth = len(__import__("inspect").stack())
+    limit = sys.getrecursionlimit()
+    sys.setrecursionlimit(depth + 25)                                  # the walk cannot hold 40 levels on top of this stack
+    try:
+        with pytest.raises(ob.Unknown) as caught:
+            ob.remove_exercise_scratch(base, root)
+    finally:
+        sys.setrecursionlimit(limit)
+    assert caught.value.code == "EXERCISE_SCRATCH_NOT_REMOVED", caught.value
+    assert (scratch_now(base).joinpath(*["a"] * 40) / "f.txt").exists()
