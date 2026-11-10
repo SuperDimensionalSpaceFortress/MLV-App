@@ -27,8 +27,12 @@ treated as clean. Anywhere else a spawn module or API appears (a container, call
 ``globals()``) it is REPORTED, because the call cannot be tied back to it by syntax. An assignment expression (``:=``) is followed
 only as a statement (``(r := subprocess.run)``); used in place or inside a larger expression it is REPORTED. An attribute stored
 or deleted on a spawn module (``subprocess.CREATE_NO_WINDOW = 0``, ``os.name = ...``) is REPORTED. A submodule of asyncio is the
-module it re-exports (``asyncio.base_events.subprocess`` is ``subprocess``). A name that is the string of an event-loop spawn
-method (``getattr(loop, 'subprocess_exec')``, ``attrgetter``) is REPORTED. The standard ``_NO_WINDOW`` definition is trusted only
+module it re-exports (``asyncio.base_events.subprocess`` is ``subprocess``). A dotted ``__import__`` whose fromlist is known only at
+run time (a variable, a call, a ``*`` or ``**`` in its arguments, a list of only starred elements) may return the root or the submodule, so
+it is REPORTED. A name that is the string of an event-loop spawn method (``getattr(loop, 'subprocess_exec')``, ``attrgetter``) is REPORTED,
+also when it is built from literals (a ``+`` chain, ``%``, ``.format``, ``.join``, ``.replace`` or an f-string whose holes are literals).
+A module bound by ``import x [as y]`` (and a plain alias or literal dynamic import of one) is followed as a value: in a container,
+conditional, subscript, return, lambda, class attribute or call argument it is REPORTED, because any module may re-export ``os``. The standard ``_NO_WINDOW`` definition is trusted only
 when ``os``, ``subprocess`` and ``getattr`` each come from exactly one ordinary ``import``.
 
 Remaining limits, every one named (r5 rewrite: the scan is syntactic and static, so these are what it does NOT see):
@@ -39,6 +43,8 @@ Remaining limits, every one named (r5 rewrite: the scan is syntactic and static,
     ``multiprocessing``, ``_winapi``, ``concurrent.futures`` process pools, ``pty``, ``os.startfile``.
   * A method name assembled at run time (``getattr(loop, 'subprocess_' + kind)``) or held outside a string (``match`` patterns);
     a spawn name reached by ``getattr`` on an object that is not a tracked module.
+  * A module that is not bound by ``import x`` (a from-import such as ``from concurrent import futures``, or ``os.path`` taken as a value)
+    flowing into a container or return: a from-import may bind a class or function, and an attribute may be either, so it is not followed.
   * Hostile source that rebinds builtins or ``__import__``, or mutates a module through a path this scan does not parse. The
     card's promise is that no ACCIDENTAL unflagged spawn lands, not that deliberate evasion is impossible.
   * Any non-Python launcher: a ``.ps1`` / ``.cmd`` / ``.bat`` file that starts a console program is not read at all, and a
@@ -2068,7 +2074,9 @@ class AdversaryR4Tests(unittest.TestCase):
                        "exec", "eval", "ctypes", "CreateProcess", "non-Python", "agent-bridge",
                        # r5: the limits paragraph names each remaining gap
                        "sys.modules", "runpy", "importlib.util", "multiprocessing", "os.startfile", "attrgetter", "subprocess_' + kind",
-                       "pwsh", "cmd.exe", "-FilePath", "Invoke-Expression", "Invoke-Item", "cmd /c start", "dot-sourced", ":="):
+                       "pwsh", "cmd.exe", "-FilePath", "Invoke-Expression", "Invoke-Item", "cmd /c start", "dot-sourced", ":=",
+                       # r6: fromlist known only at run time, folded names, module flows
+                       "fromlist", "list of only starred", ".format", "class attribute", "from concurrent import futures"):
             self.assertIn(needle, module_doc, needle)
 
 
