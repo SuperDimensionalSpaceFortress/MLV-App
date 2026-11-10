@@ -1230,27 +1230,41 @@ try {
     # Best-effort tmp removal that reports what happened: $true only when the file is gone afterwards (checked, not assumed).
     # SidecarCleanupFault (test seam, sol r2 B2): $null = off. @{ remove; test } makes the tmp removal and/or the existence query throw
     # UnauthorizedAccessException, the shape of an inaccessible directory under ErrorActionPreference=Stop.
+    # EVERY read of the cleanup-fault seam goes through here (sol r5 B1). The seam may be any [System.Collections.IDictionary] (Hashtable,
+    # [ordered], Dictionary[string,object]): Dictionary<,> has no public .Contains(string) (that is the explicit IDictionary.Contains) and
+    # ContainsKey is not on a Hashtable, so membership is asked of the IDictionary INTERFACE method. Returns @{ present; value }; $null seam =
+    # not present. A seam that is not a dictionary is a typed ArgumentException: callers sit inside Remove-SidecarTmp's guard, which turns it
+    # into cleanup state unknown(ArgumentException); the probe's own reader swallows it.
+    $script:IDictionaryContains = [System.Collections.IDictionary].GetMethod('Contains')
+    function Get-SidecarCleanupFaultEntry($Fault, [string]$Key) {
+        if ($null -eq $Fault) { return @{ present = $false; value = $null } }
+        if ($Fault -isnot [System.Collections.IDictionary]) { throw [ArgumentException]::new("SidecarCleanupFault is not a dictionary ($($Fault.GetType().Name))", 'Fault') }
+        if (-not [bool]$script:IDictionaryContains.Invoke($Fault, @($Key))) { return @{ present = $false; value = $null } }
+        return @{ present = $true; value = ([System.Collections.IDictionary]$Fault)[$Key] }
+    }
     function Invoke-SidecarTmpRemove([string]$Tmp) {
-        $cf = $script:SidecarCleanupFault
-        if ($null -ne $cf -and $cf.remove) { throw [UnauthorizedAccessException]::new('injected: access denied on the sidecar tmp removal') }
+        if ((Get-SidecarCleanupFaultEntry $script:SidecarCleanupFault 'remove').value) { throw [UnauthorizedAccessException]::new('injected: access denied on the sidecar tmp removal') }
         Remove-Item -LiteralPath $Tmp -Force -ErrorAction Stop
     }
     function Test-SidecarTmpExists([string]$Tmp) {
-        $cf = $script:SidecarCleanupFault
-        if ($null -ne $cf -and $cf.test) { throw [UnauthorizedAccessException]::new('injected: access denied on the sidecar tmp existence query') }
+        if ((Get-SidecarCleanupFaultEntry $script:SidecarCleanupFault 'test').value) { throw [UnauthorizedAccessException]::new('injected: access denied on the sidecar tmp existence query') }
         return [bool](Test-Path -LiteralPath $Tmp -ErrorAction Stop)
     }
     # Returns @{ state; error }: 'removed' / 'remaining' only when the existence query CHECKED it; 'unknown' (error = the observation error's
-    # type name) when the query itself threw. NEVER throws: a cleanup failure must not replace the failure that sent us here (sol r2 B2).
+    # type name) when the query itself threw OR the cleanup-fault seam could not be read. NEVER throws: the whole body is guarded, so a cleanup
+    # failure can never replace the failure that sent us here (sol r2 B2, sol r5 B1).
     function Remove-SidecarTmp([string]$Tmp) {
-        try { Invoke-SidecarTmpRemove $Tmp } catch { }
-        # SidecarCleanupFault.outcome (test seam, sol r4 B2): when present it REPLACES the observed outcome, so the cases can feed the call sites a malformed one.
-        $cf = $script:SidecarCleanupFault
-        # .Contains (hashtable AND [ordered]; ContainsKey is hashtable-only, adversary r5 A3); the unary comma keeps a one-element array an array (A2).
-        if ($null -ne $cf -and $cf.Contains('outcome')) { return , $cf.outcome }
-        try { $exists = Test-SidecarTmpExists $Tmp }
+        try {
+            try { Invoke-SidecarTmpRemove $Tmp } catch { }
+            # SidecarCleanupFault.outcome (test seam, sol r4 B2): when present it REPLACES the observed outcome, so the cases can feed the call sites a malformed one.
+            # The unary comma keeps a one-element array an array (adversary r5 A2).
+            $outcome = Get-SidecarCleanupFaultEntry $script:SidecarCleanupFault 'outcome'
+            if ($outcome.present) { return , $outcome.value }
+            try { $exists = Test-SidecarTmpExists $Tmp }
+            catch { return @{ state = 'unknown'; error = $_.Exception.GetType().Name } }
+            return @{ state = $(if ($exists) { 'remaining' } else { 'removed' }); error = $null }
+        }
         catch { return @{ state = 'unknown'; error = $_.Exception.GetType().Name } }
-        return @{ state = $(if ($exists) { 'remaining' } else { 'removed' }); error = $null }
     }
     # The fault in a cleanup outcome, or $null when it is well formed: ONE scalar string state from {removed, remaining, unknown}, and for
     # 'unknown' a non-empty scalar string error type. An array (empty or not), $null, another word or case, or a non-table is a fault (sol r4 B2).
@@ -1271,8 +1285,11 @@ try {
         if ($null -eq (Get-SidecarCleanupOutcomeFault $Cleanup)) { return $Cleanup }
         return @{ state = 'unknown'; error = 'InvalidCleanupOutcome' }
     }
-    # Records the cleanup outcome on an exception's Data (never throws): tmp_state always, tmp_remaining only for a checked 'remaining',
-    # tmp_state_error only for 'unknown'. The cases assert on these entries, not on a substring of the message (sol r2 B1).
+    # Records the cleanup outcome on an exception's Data: tmp_state always, tmp_remaining only for a checked 'remaining', tmp_state_error only
+    # for 'unknown'. The cases assert on these entries, not on a substring of the message (sol r2 B1). It THROWS exactly once: a typed
+    # ArgumentException for a malformed outcome, before anything is recorded (the writer's call sites degrade such an outcome first, so the
+    # primary failure still propagates). Once the outcome is valid, a failure to write Data is swallowed (CoS G5, r6: the old header said
+    # "never throws", which was not true of the refusal).
     function Set-SidecarTmpData($Exception, [string]$Tmp, $Cleanup) {
         # r5 (sol r4 B2): validated BEFORE the guarded block, so a malformed outcome is refused (typed) and nothing is recorded.
         $fault = Get-SidecarCleanupOutcomeFault $Cleanup
@@ -1311,7 +1328,7 @@ try {
                 }
                 if ($attempt -ge $maxAttempts) {
                     $cleanup = Resolve-SidecarCleanupOutcome (Remove-SidecarTmp $tmp)
-                    $tmpState =if ($cleanup.state -ceq 'removed') { 'tmp=removed' } elseif ($cleanup.state -ceq 'remaining') { "tmp_remaining=$tmp" } else { "tmp=unknown($($cleanup.error))" }
+                    $tmpState = if ($cleanup.state -ceq 'removed') { 'tmp=removed' } elseif ($cleanup.state -ceq 'remaining') { "tmp_remaining=$tmp" } else { "tmp=unknown($($cleanup.error))" }
                     $failure = [InvalidOperationException]::new("SIDECAR-WRITE-FAILED job=$JobId attempts=$attempt $tmpState $($ex.GetType().Name): $($ex.Message)", $ex)
                     Set-SidecarTmpData $failure $tmp $cleanup
                     throw $failure
@@ -1320,25 +1337,28 @@ try {
             }
         }
     }
-    # The cleanup STATUS token of a SIDECAR-WRITE-FAILED message, read at its FIXED position (right after attempts=<n>), never searched for
-    # anywhere in the message: the tmp path that follows may itself contain 'tmp=removed' (sol r2 B1). $null = not the typed failure.
-    # r4 (sol r3 B1): the job id is caller-controlled (it may hold spaces and 'attempts=3 tmp=removed' framing), so the reader takes the EXACT job id
-    # and strips 'SIDECAR-WRITE-FAILED job=<id> attempts=' as a literal prefix before looking at the token; the id can never be read as status.
-    # The cases assert the structured Data['tmp_state'] first; this token is the secondary, message-side check.
+    # The cleanup STATUS token of a SIDECAR-WRITE-FAILED message: a CHECK OF THE WRITER'S EXACT FRAMING, never a classification of free text.
+    # The authority for the cleanup outcome is the structured Data['tmp_state'] (the cases assert it); this is the secondary, message-side check,
+    # and one case pins that the two agree on every writer path. HUB RULING r6 (three rounds of patching this parser): stop patching it.
+    # Returns $null = not this id's typed failure, or the token is not in the writer's exact shape; 'ambiguous' = the text has more than one
+    # reading and is REFUSED; otherwise 'tmp=removed' | 'tmp=unknown' | 'tmp_remaining='. It reads, in order:
+    #  1. a job id holding ANY framing token (job= attempts= tmp= tmp_remaining= ( )) is 'ambiguous' before the message is looked at: the id is
+    #     caller-controlled text and may spell the framing, so a status next to it cannot be told from identifier text (sol r4 B1, sol r5 B2);
+    #  2. the exact prefix 'SIDECAR-WRITE-FAILED job=<id> attempts=' (a literal, never a search);
+    #  3. the writer's grammar right after '<n> ':  'tmp=removed <Type>: ' | 'tmp=unknown(<ErrType>) <Type>: ' | 'tmp_remaining=<dir>\<id>.json.<guid>.tmp <Type>: ';
+    #  4. for removed/unknown, the rest of the message carries exactly ONE tmp token (tmp= or tmp_remaining=), else 'ambiguous'. A retained-file
+    #     line is NOT scanned past 'tmp_remaining=': its path (a temp root may hold ' attempts=1 tmp=removed ') and the exception tail are
+    #     free text; the path is instead pinned to the exact id's own tmp file, so a line written for a longer id is refused (CoS G4).
     function Get-SidecarTmpStatus([Parameter(Mandatory)][string]$Message, [Parameter(Mandatory)][string]$JobId) {
+        if ($JobId -cmatch 'job=|attempts=|tmp=|tmp_remaining=|[()]') { return 'ambiguous' }
         $prefix = "SIDECAR-WRITE-FAILED job=$JobId attempts="
         if (-not $Message.StartsWith($prefix, [StringComparison]::Ordinal)) { return $null }
-        # A COMPLETE token (adversary r3 A1): tmp=removed then a space, tmp_remaining= then a non-space (the path), tmp=unknown then '('.
         $rest = $Message.Substring($prefix.Length)
-        if ($rest -cnotmatch '^\d+ (tmp=removed(?= )|tmp_remaining=(?=\S)|tmp=unknown(?=\())') { return $null }
-        $status = $Matches[1]
-        # r5 (sol r4 B1): REFUSE AN AMBIGUOUS LINE. If, after the first token, the message carries ANOTHER ' attempts=<n> <status>' framing, the same
-        # line also parses with a longer job id (the id handed in is then only a prefix of the real one) and the token read here could be identifier text.
-        # A line with exactly one framing after the exact-id prefix has one reading; any other yields $null, never a guess. The exact id is masked
-        # in the tail first, but only in the writer's own tmp-file form (<id>.json.<guid>.tmp), which is not a second framing; masking every
-        # occurrence of the id would erase the framing when the id is itself one of its words ('attempts', '3', 'tmp'; adversary r5 A1).
-        $tail = [regex]::Replace($rest.Substring($Matches[0].Length), "$([regex]::Escape($JobId))\.json\.[0-9a-fA-F]{32}\.tmp", '<tmp>')
-        if ($tail -cmatch ' attempts=\d+ (?:tmp=removed(?= )|tmp_remaining=(?=\S)|tmp=unknown(?=\())') { return $null }
+        if ($rest -cmatch '^\d+ tmp=removed [\w.]+: ') { $status = 'tmp=removed' }
+        elseif ($rest -cmatch '^\d+ tmp=unknown\([\w.]+\) [\w.]+: ') { $status = 'tmp=unknown' }
+        elseif ($rest -cmatch "^\d+ tmp_remaining=.+?$([regex]::Escape($JobId))\.json\.[0-9a-fA-F]{32}\.tmp [\w.]+: ") { return 'tmp_remaining=' }
+        else { return $null }
+        if ([regex]::Matches($rest, 'tmp(?:_remaining)?=').Count -ne 1) { return 'ambiguous' }
         return $status
     }
     # The residue census of one probe job: every tmp the writer generated for $Jid in the sidecar directory, HIDDEN ones included (-Force) and
@@ -1369,7 +1389,9 @@ try {
         if ($null -ne $err) { foreach ($k in 'tmp_state', 'tmp_remaining', 'tmp_state_error') { if ($err.Exception.Data.Contains($k)) { $data[$k] = [string]$err.Exception.Data[$k] } } }
         # r4 (sol r3 B2): the census sees hidden files and surfaces its own failure; the holder is disposed and the removal attempted BEFORE
         # any assertion so a failing probe still releases what it holds.
-        $script:SidecarListFault = ($null -ne $CleanupFault -and [bool]$CleanupFault.list)
+        $listFlag = $false
+        try { $listFlag = [bool](Get-SidecarCleanupFaultEntry $CleanupFault 'list').value } catch { }   # an unreadable seam object is not a list fault
+        $script:SidecarListFault = $listFlag
         try { $census = Get-SidecarTmpCensus $Jid } finally { $script:SidecarListFault = $null }
         $leftPaths = @($census.paths)
         if ($null -ne $fault.holder) { $fault.holder.Dispose() }
@@ -2643,7 +2665,7 @@ function Exit-HeavySlot {
             Assert-True ($stillThere) "liveness-renew-hook-write-retry-cleanup-io: the held tmp really survived the cleanup (the fault is real): path=$($f.holderPath)"
             # sol r2 A3: Contains, not -like (a path with [ ] is wildcard syntax to -like). sol r2 B1: the status is the structured Data entry and
             # the token at its fixed position, never a whole-message substring search (the path in the report may itself contain 'tmp=removed').
-            Assert-True ($msg.Contains("tmp_remaining=$($f.holderPath)") -and (Get-SidecarTmpStatus $msg $jid) -ceq 'tmp_remaining=' -and $err.Exception.Data['tmp_state'] -ceq 'remaining') "liveness-renew-hook-write-retry-cleanup-io: the failure reports the tmp that remains and never claims its removal: [$msg]"
+            Assert-True ($msg.Contains("tmp_remaining=$($f.holderPath)") -and $err.Exception.Data['tmp_state'] -ceq 'remaining') "liveness-renew-hook-write-retry-cleanup-io: the failure reports the tmp that remains and never claims its removal: [$msg]"
         }
         finally {
             if ($null -ne $f.holder) { $f.holder.Dispose() }
@@ -2657,7 +2679,7 @@ function Exit-HeavySlot {
         $msg = if ($null -ne $err) { $err.Exception.Message } else { '' }
         $script:SidecarMoveFault = $null
         $left = Get-SidecarTmpLeftCount $jid
-        Assert-True ($msg -like "SIDECAR-WRITE-FAILED job=$jid attempts=3*" -and (Get-SidecarTmpStatus $msg $jid) -ceq 'tmp=removed' -and $err.Exception.Data['tmp_state'] -ceq 'removed' -and -not $err.Exception.Data.Contains('tmp_remaining') -and $left -eq 0) "liveness-renew-hook-write-retry-cleanup-io: an unheld tmp is removed and the failure says tmp=removed: left=$left msg=[$msg]"
+        Assert-True ($msg -like "SIDECAR-WRITE-FAILED job=$jid attempts=3*" -and $err.Exception.Data['tmp_state'] -ceq 'removed' -and -not $err.Exception.Data.Contains('tmp_remaining') -and $left -eq 0) "liveness-renew-hook-write-retry-cleanup-io: an unheld tmp is removed and the failure says tmp=removed: left=$left msg=[$msg]"
         $results.livenessRenewHookWriteRetryCleanupIo = [ordered]@{ heldReported = $true; removedReported = $true }
     }
     # (other) the non-IOException path: held through the single rename and the cleanup; the original type survives and carries the outcome.
@@ -2702,14 +2724,14 @@ function Exit-HeavySlot {
             New-Item -ItemType Directory -Force -Path $notAfterDir | Out-Null
             # adversary r3 A1: the status token is a COMPLETE token. A longer word at the same position is not a status.
             Assert-True ($null -eq (Get-SidecarTmpStatus 'SIDECAR-WRITE-FAILED job=jRt attempts=3 tmp=removedness IOException: x' 'jRt') -and $null -eq (Get-SidecarTmpStatus 'SIDECAR-WRITE-FAILED job=jRt attempts=3 tmp=unknownish IOException: x' 'jRt') -and $null -eq (Get-SidecarTmpStatus 'SIDECAR-WRITE-FAILED job=jRt attempts=3 tmp_remaining= IOException: x' 'jRt')) "cleanup-path-token: a malformed status token (tmp=removedness, tmp=unknownish, an empty tmp_remaining=) is not recognised as a status"
-            Assert-True ((Get-SidecarTmpStatus 'SIDECAR-WRITE-FAILED job=jRt attempts=3 tmp=removed IOException: x' 'jRt') -ceq 'tmp=removed' -and (Get-SidecarTmpStatus 'SIDECAR-WRITE-FAILED job=jRt attempts=3 tmp=unknown(UnauthorizedAccessException) IOException: x' 'jRt') -ceq 'tmp=unknown' -and (Get-SidecarTmpStatus 'SIDECAR-WRITE-FAILED job=jRt attempts=3 tmp_remaining=C:\x\y.tmp IOException: x' 'jRt') -ceq 'tmp_remaining=') "cleanup-path-token: the three well-formed status tokens are recognised"
+            Assert-True ((Get-SidecarTmpStatus 'SIDECAR-WRITE-FAILED job=jRt attempts=3 tmp=removed IOException: x' 'jRt') -ceq 'tmp=removed' -and (Get-SidecarTmpStatus 'SIDECAR-WRITE-FAILED job=jRt attempts=3 tmp=unknown(UnauthorizedAccessException) IOException: x' 'jRt') -ceq 'tmp=unknown' -and (Get-SidecarTmpStatus 'SIDECAR-WRITE-FAILED job=jRt attempts=3 tmp_remaining=C:\x\jRt.json.00000000000000000000000000000000.tmp IOException: x' 'jRt') -ceq 'tmp_remaining=') "cleanup-path-token: the three well-formed status tokens are recognised"
             $r = Invoke-SidecarCleanupProbe 'jRt' 'io' $true
             Assert-True ($null -ne $r.holderPath -and $r.holderPath.Contains('tmp=removed') -and $r.msg.Contains("tmp_remaining=$($r.holderPath)")) "cleanup-path-token: premise - the retained-file report carries the substring tmp=removed inside the path: msg=[$($r.msg)]"
-            Assert-True ((Get-SidecarTmpStatus $r.msg 'jRt') -ceq 'tmp_remaining=' -and $r.data['tmp_state'] -ceq 'remaining') "cleanup-path-token: IOException path, held tmp, token path: status is 'remaining' (token=$(Get-SidecarTmpStatus $r.msg 'jRt') state=$($r.data['tmp_state']))"
+            Assert-True ($r.data['tmp_state'] -ceq 'remaining') "cleanup-path-token: IOException path, held tmp, token path: the structured state is 'remaining' (state=$($r.data['tmp_state']))"
             $r = Invoke-SidecarCleanupProbe 'jRt' 'denied' $true
             Assert-True ($r.err.Exception -is [UnauthorizedAccessException] -and $r.data['tmp_state'] -ceq 'remaining' -and $r.data['tmp_remaining'] -ceq $r.holderPath) "cleanup-path-token: non-IOException path, held tmp, token path: state 'remaining' and Data['tmp_remaining'] names the tmp: state=$($r.data['tmp_state'])"
             $r = Invoke-SidecarCleanupProbe 'jRt' 'io' $false
-            Assert-True ((Get-SidecarTmpStatus $r.msg 'jRt') -ceq 'tmp=removed' -and $r.data['tmp_state'] -ceq 'removed' -and $r.leftPaths.Count -eq 0) "cleanup-path-token: IOException path, unheld tmp, token path: status is 'removed' (token=$(Get-SidecarTmpStatus $r.msg 'jRt') state=$($r.data['tmp_state']) left=$($r.leftPaths.Count))"
+            Assert-True ($r.data['tmp_state'] -ceq 'removed' -and $r.leftPaths.Count -eq 0) "cleanup-path-token: IOException path, unheld tmp, token path: the structured state is 'removed' (state=$($r.data['tmp_state']) left=$($r.leftPaths.Count))"
             $r = Invoke-SidecarCleanupProbe 'jRt' 'denied' $false
             Assert-True ($r.err.Exception -is [UnauthorizedAccessException] -and $r.data['tmp_state'] -ceq 'removed' -and -not $r.data.ContainsKey('tmp_remaining') -and $r.leftPaths.Count -eq 0) "cleanup-path-token: non-IOException path, unheld tmp: state 'removed', no tmp_remaining: state=$($r.data['tmp_state'])"
         }
@@ -2718,6 +2740,29 @@ function Exit-HeavySlot {
             Remove-Item -LiteralPath $tokRoot -Recurse -Force -ErrorAction SilentlyContinue
             $script:SidecarMoveFault = $null; $script:SidecarCleanupFault = $null
         }
+        # r6 (CoS G4): a temp root holding a FULL ' attempts=1 tmp=removed ' framing. The exact id's own retained-file line must still read as
+        # tmp_remaining= (the path is not scanned; the tmp filename is checked against the exact id instead), and its Data must say remaining.
+        $framedRoot = Join-Path $fx 't x attempts=1 tmp=removed y'
+        $notAfterDir = Join-Path $framedRoot 'notafter'
+        try {
+            New-Item -ItemType Directory -Force -Path $notAfterDir | Out-Null
+            $r = Invoke-SidecarCleanupProbe 'jRt' 'io' $true
+            Assert-True ($null -ne $r.holderPath -and $r.holderPath.Contains(' attempts=1 tmp=removed ') -and $r.msg.Contains("tmp_remaining=$($r.holderPath)")) "cleanup-path-token(G4): premise - the retained-file report carries a full attempts=1 tmp=removed framing inside the path: msg=[$($r.msg)]"
+            Assert-True ($r.data['tmp_state'] -ceq 'remaining' -and (Get-SidecarTmpStatus $r.msg 'jRt') -ceq 'tmp_remaining=') "cleanup-path-token(G4): the exact id's own line with a framed temp root reads tmp_remaining=: [$(Get-SidecarTmpStatus $r.msg 'jRt')]"
+            $r = Invoke-SidecarCleanupProbe 'jRt' 'io' $false
+            Assert-True ($r.data['tmp_state'] -ceq 'removed' -and (Get-SidecarTmpStatus $r.msg 'jRt') -ceq 'tmp=removed') "cleanup-path-token(G4): a removed tmp under a framed temp root reads tmp=removed: [$(Get-SidecarTmpStatus $r.msg 'jRt')]"
+        }
+        finally {
+            $notAfterDir = $savedNotAfterDir
+            Remove-Item -LiteralPath $framedRoot -Recurse -Force -ErrorAction SilentlyContinue
+            $script:SidecarMoveFault = $null; $script:SidecarCleanupFault = $null
+        }
+        # ... and the pure reader: framing in the path or in the exception tail of a retained-file line is not read; the same in a removed line is ambiguous.
+        $g4 = 'SIDECAR-WRITE-FAILED job=jRt attempts=3 tmp_remaining=C:\t x attempts=1 tmp=removed y\notafter\jRt.json.00000000000000000000000000000000.tmp IOException: a attempts=1 tmp=removed b'
+        Assert-True ((Get-SidecarTmpStatus $g4 'jRt') -ceq 'tmp_remaining=') "cleanup-path-token(G4): framing in the path AND the exception tail of a retained-file line is not scanned: [$(Get-SidecarTmpStatus $g4 'jRt')]"
+        Assert-True ((Get-SidecarTmpStatus 'SIDECAR-WRITE-FAILED job=jRt attempts=3 tmp=removed IOException: a attempts=1 tmp_remaining=C:\p b' 'jRt') -ceq 'ambiguous') "cleanup-path-token(G4): framing in the exception tail of a removed line is ambiguous"
+        # the tmp_remaining path must be the exact id's own tmp file: a path that is not <id>.json.<guid>.tmp is refused (wrong id handed in), never read.
+        Assert-True ($null -eq (Get-SidecarTmpStatus 'SIDECAR-WRITE-FAILED job=jRt attempts=3 tmp_remaining=C:\p\other.json.00000000000000000000000000000000.tmp IOException: x' 'jRt')) "cleanup-path-token(G4): a retained path that is not the exact id's tmp file is not read"
         $results.livenessRenewHookWriteRetryCleanupPathToken = [ordered]@{ pathCarriesToken = $true }
     }
     # (unknown) sol r2 B2: the tmp removal and/or the existence query throw (an inaccessible directory under ErrorActionPreference=Stop). The
@@ -2727,16 +2772,16 @@ function Exit-HeavySlot {
         $both = @{ remove = $true; test = $true }
         $r = Invoke-SidecarCleanupProbe 'jRu' 'io' $false $both
         Assert-True ($null -ne $r.err -and $r.err.Exception -is [InvalidOperationException] -and $r.msg -like 'SIDECAR-WRITE-FAILED job=jRu attempts=3*' -and $r.moves -eq 3 -and $r.injected -eq 3) "cleanup-unknown: IOException exhaustion with removal AND existence query throwing still surfaces SIDECAR-WRITE-FAILED after 3 attempts: type=$(if ($null -ne $r.err) { $r.err.Exception.GetType().Name }) msg=[$($r.msg)]"
-        Assert-True ((Get-SidecarTmpStatus $r.msg 'jRu') -ceq 'tmp=unknown' -and $r.data['tmp_state'] -ceq 'unknown' -and $r.data['tmp_state_error'] -ceq 'UnauthorizedAccessException' -and -not $r.data.ContainsKey('tmp_remaining')) "cleanup-unknown: IOException path reports the cleanup as unknown with the observation error's type, not removed: token=$(Get-SidecarTmpStatus $r.msg 'jRu') state=$($r.data['tmp_state']) error=$($r.data['tmp_state_error'])"
+        Assert-True ($r.data['tmp_state'] -ceq 'unknown' -and $r.data['tmp_state_error'] -ceq 'UnauthorizedAccessException' -and -not $r.data.ContainsKey('tmp_remaining')) "cleanup-unknown: IOException path reports the cleanup as unknown with the observation error's type, not removed: state=$($r.data['tmp_state']) error=$($r.data['tmp_state_error'])"
         $r = Invoke-SidecarCleanupProbe 'jRu' 'denied' $false $both
         Assert-True ($null -ne $r.err -and $r.err.Exception -is [UnauthorizedAccessException] -and $r.err.Exception.Message -like 'injected: access denied on the sidecar rename*' -and $r.moves -eq 1) "cleanup-unknown: non-IOException with removal AND existence query throwing keeps the ORIGINAL exception (not the cleanup error): type=$(if ($null -ne $r.err) { $r.err.Exception.GetType().Name }) msg=[$($r.msg)]"
         Assert-True ($r.data['tmp_state'] -ceq 'unknown' -and $r.data['tmp_state_error'] -ceq 'UnauthorizedAccessException' -and -not $r.data.ContainsKey('tmp_remaining')) "cleanup-unknown: the original exception still carries the cleanup state, unknown: state=$($r.data['tmp_state']) error=$($r.data['tmp_state_error'])"
         # Removal works but the existence query throws: the file is gone, yet it cannot be CHECKED, so it is never reported as removed.
         $r = Invoke-SidecarCleanupProbe 'jRu' 'io' $false @{ remove = $false; test = $true }
-        Assert-True ((Get-SidecarTmpStatus $r.msg 'jRu') -ceq 'tmp=unknown' -and $r.data['tmp_state'] -ceq 'unknown' -and $r.leftPaths.Count -eq 0) "cleanup-unknown: removal succeeded but the existence query threw: reported unknown, not removed: token=$(Get-SidecarTmpStatus $r.msg 'jRu') state=$($r.data['tmp_state'])"
+        Assert-True ($r.data['tmp_state'] -ceq 'unknown' -and $r.leftPaths.Count -eq 0) "cleanup-unknown: removal succeeded but the existence query threw: reported unknown, not removed: state=$($r.data['tmp_state'])"
         # Removal throws but the existence query works and finds the file: that is a checked 'remaining', not unknown.
         $r = Invoke-SidecarCleanupProbe 'jRu' 'io' $false @{ remove = $true; test = $false }
-        Assert-True ((Get-SidecarTmpStatus $r.msg 'jRu') -ceq 'tmp_remaining=' -and $r.data['tmp_state'] -ceq 'remaining' -and $r.leftPaths.Count -eq 1 -and $r.msg.Contains("tmp_remaining=$($r.leftPaths[0])")) "cleanup-unknown: removal threw but the file was observed: reported remaining with its path: token=$(Get-SidecarTmpStatus $r.msg 'jRu') state=$($r.data['tmp_state'])"
+        Assert-True ($r.data['tmp_state'] -ceq 'remaining' -and $r.leftPaths.Count -eq 1 -and $r.msg.Contains("tmp_remaining=$($r.leftPaths[0])")) "cleanup-unknown: removal threw but the file was observed: reported remaining with its path: state=$($r.data['tmp_state'])"
         # adversary r3 A2: the probe's own leftover removal is checked, not assumed. A pre-existing tmp held open WITHOUT delete sharing cannot be
         # removed, so the probe must fail loudly (its fixture residue is never left unreported), after disposing its own holder.
         $heldLeft = Join-Path $notAfterDir 'jRz.json.00000000000000000000000000000000.tmp'
@@ -2761,24 +2806,53 @@ function Exit-HeavySlot {
         foreach ($id in @('jRt attempts=3 tmp=removed x', 'j Rt', 'jRt tmp_remaining=x')) {
             $r = Invoke-SidecarCleanupProbe $id 'io' $false @{ remove = $true; test = $false }
             Assert-True ($r.data['tmp_state'] -ceq 'remaining' -and $r.leftPaths.Count -eq 1) "cleanup-identifier: id [$id], tmp retained: the writer's structured state is remaining: state=$($r.data['tmp_state']) left=$($r.leftPaths.Count)"
-            Assert-True ((Get-SidecarTmpStatus $r.msg $id) -ceq 'tmp_remaining=') "cleanup-identifier: id [$id], tmp retained: the message token is read as remaining, not taken from the identifier: token=[$(Get-SidecarTmpStatus $r.msg $id)] msg=[$($r.msg)]"
+            # (r6: the outcome is asserted on Data only; the message-side status of these framing ids is pinned by the agreement test below)
             $r = Invoke-SidecarCleanupProbe $id 'io' $false
-            Assert-True ($r.data['tmp_state'] -ceq 'removed' -and (Get-SidecarTmpStatus $r.msg $id) -ceq 'tmp=removed') "cleanup-identifier: id [$id], tmp removed: state and token both say removed: state=$($r.data['tmp_state']) token=[$(Get-SidecarTmpStatus $r.msg $id)]"
+            Assert-True ($r.data['tmp_state'] -ceq 'removed') "cleanup-identifier: id [$id], tmp removed: the writer's structured state is removed: state=$($r.data['tmp_state'])"
         }
-        # the reader itself: a message that embeds the spoofing id is read from AFTER the exact-id prefix, and a longer word is still no status.
+        # the reader itself: a framing id is refused ('ambiguous') before the message is looked at; a clean id's well-formed line is read.
         $spoof = 'jRt attempts=3 tmp=removed x'
-        Assert-True ((Get-SidecarTmpStatus "SIDECAR-WRITE-FAILED job=$spoof attempts=3 tmp_remaining=C:\p\q.tmp IOException: x" $spoof) -ceq 'tmp_remaining=' -and $null -eq (Get-SidecarTmpStatus "SIDECAR-WRITE-FAILED job=$spoof attempts=3 tmp=removedness IOException: x" $spoof)) "cleanup-identifier: the pure reader keys on the exact job id"
-        # r5 (sol r4 B1): the reader is handed an id that is only a PREFIX of the id the line was written with. The line is ambiguous (it also
-        # parses as the longer id, whose status is tmp_remaining=), so it is refused; identifier text is never classified as cleanup status.
+        Assert-True ((Get-SidecarTmpStatus "SIDECAR-WRITE-FAILED job=$spoof attempts=3 tmp_remaining=C:\p\$spoof.json.00000000000000000000000000000000.tmp IOException: x" $spoof) -ceq 'ambiguous' -and (Get-SidecarTmpStatus "SIDECAR-WRITE-FAILED job=$spoof attempts=3 tmp=removedness IOException: x" $spoof) -ceq 'ambiguous' -and (Get-SidecarTmpStatus 'SIDECAR-WRITE-FAILED job=j Rt attempts=3 tmp=removed IOException: x' 'j Rt') -ceq 'tmp=removed') "cleanup-identifier: the pure reader refuses a framing id and reads a clean one"
+        # r5 (sol r4 B1) / r6: the reader is handed an id that is only a PREFIX of the id the line was written with. After the shorter id's prefix the
+        # message is not in the writer's exact shape, so it is refused ($null); identifier text is never classified as cleanup status.
         $ambig = 'SIDECAR-WRITE-FAILED job=jRt attempts=3 tmp=removed x attempts=3 tmp_remaining=C:\fixture\retained.tmp IOException: x'
-        Assert-True ($null -eq (Get-SidecarTmpStatus $ambig 'jRt')) "cleanup-identifier: an ambiguous line read with the shorter id is refused, never classified from identifier text: [$(Get-SidecarTmpStatus $ambig 'jRt')]"
-        Assert-True ((Get-SidecarTmpStatus $ambig 'jRt attempts=3 tmp=removed x') -ceq 'tmp_remaining=') "cleanup-identifier: the same line read with the exact (longer) id is still tmp_remaining="
+        Assert-True ($null -eq (Get-SidecarTmpStatus $ambig 'jRt')) "cleanup-identifier: a line written for a longer id, read with the shorter id, is refused, never classified from identifier text: [$(Get-SidecarTmpStatus $ambig 'jRt')]"
+        Assert-True ((Get-SidecarTmpStatus $ambig 'jRt attempts=3 tmp=removed x') -ceq 'ambiguous') "cleanup-identifier: the same line read with the exact (longer, framing) id is 'ambiguous', not a status"
         $rl = Invoke-SidecarCleanupProbe 'jRt attempts=3 tmp=removed x' 'io' $false @{ remove = $true; test = $false }
-        Assert-True ($null -eq (Get-SidecarTmpStatus $rl.msg 'jRt') -and (Get-SidecarTmpStatus $rl.msg 'jRt attempts=3 tmp=removed x') -ceq 'tmp_remaining=') "cleanup-identifier: the REAL retained-file line of the longer id is refused for the shorter id and read for the exact one: [$($rl.msg)]"
+        Assert-True ($rl.data['tmp_state'] -ceq 'remaining' -and $null -eq (Get-SidecarTmpStatus $rl.msg 'jRt') -and (Get-SidecarTmpStatus $rl.msg 'jRt attempts=3 tmp=removed x') -ceq 'ambiguous') "cleanup-identifier: the REAL retained-file line of the longer id is refused for the shorter id and ambiguous for the exact one (Data says remaining): [$($rl.msg)]"
         foreach ($amb in @(
             @('SIDECAR-WRITE-FAILED job=jRt attempts=3 tmp=unknown(E) attempts=7 tmp_remaining=C:\p.tmp IOException: x', 'jRt'),
             @('SIDECAR-WRITE-FAILED job=jRt attempts=3 tmp_remaining=C:\a.tmp attempts=3 tmp=removed IOException: x', 'jRt'))) {
-            Assert-True ($null -eq (Get-SidecarTmpStatus $amb[0] $amb[1])) "cleanup-identifier: a line that carries a second attempts=<n> <status> framing is refused: [$($amb[0])]"
+            Assert-True ($null -eq (Get-SidecarTmpStatus $amb[0] $amb[1])) "cleanup-identifier: a line that is not the writer's exact shape for this id (second framing, retained path that is not the id's tmp file) is refused: [$($amb[0])]"
+        }
+        # r6 (sol r5 B2): Sol's literal. The id and the tmp filename both carry framing; the old reader (which masked the id inside the
+        # filename) returned tmp=removed from IDENTIFIER text while the real outcome is unknown. The reader never classifies from identifier text:
+        # an id holding any framing token is 'ambiguous', and the outcome is asserted on the writer's structured Data.
+        $solId = 'j attempts=3 tmp=unknown(E'
+        $solMsg = 'SIDECAR-WRITE-FAILED job=j attempts=3 tmp=unknown(E attempts=3 tmp=removed j attempts=3 tmp=unknown(E.json.00000000000000000000000000000000.tmp) IOException: x'
+        Assert-True ((Get-SidecarTmpStatus $solMsg $solId) -cne 'tmp=removed' -and (Get-SidecarTmpStatus $solMsg $solId) -ceq 'ambiguous') "cleanup-identifier(r6 B2): Sol's literal is ambiguous, never tmp=removed: [$(Get-SidecarTmpStatus $solMsg $solId)]"
+        $solReal = 'j attempts=3 tmp=unknown(E attempts=3 tmp=removed j'
+        $r = Invoke-SidecarCleanupProbe $solReal 'io' $false @{ outcome = @{ state = 'unknown'; error = 'E.json.00000000000000000000000000000000.tmp' } }
+        Assert-True ($r.data['tmp_state'] -ceq 'unknown' -and $r.data['tmp_state_error'] -ceq 'E.json.00000000000000000000000000000000.tmp') "cleanup-identifier(r6 B2): the structured Data holds the real outcome (unknown): state=[$($r.data['tmp_state'])]"
+        Assert-True ((Get-SidecarTmpStatus $r.msg $solReal) -ceq 'ambiguous' -and (Get-SidecarTmpStatus $r.msg 'j') -cne 'tmp=removed' -and (Get-SidecarTmpStatus $r.msg $solId) -cne 'tmp=removed') "cleanup-identifier(r6 B2): the real line of Sol's id is ambiguous for its exact id and never tmp=removed for a shorter one: exact=[$(Get-SidecarTmpStatus $r.msg $solReal)] short=[$(Get-SidecarTmpStatus $r.msg 'j')] msg=[$($r.msg)]"
+        # every framing token in an id makes the reader refuse, whatever the message says
+        foreach ($tok in 'job=', 'attempts=', 'tmp=', 'tmp_remaining=', '(', ')') {
+            $fid = "jRt${tok}x"
+            $fmsg = "SIDECAR-WRITE-FAILED job=$fid attempts=3 tmp=removed IOException: x"
+            Assert-True ((Get-SidecarTmpStatus $fmsg $fid) -ceq 'ambiguous') "cleanup-identifier(r6 B2): an id holding [$tok] is ambiguous: [$(Get-SidecarTmpStatus $fmsg $fid)]"
+        }
+        # a message with more than one tmp= token (not a retained-file path) is ambiguous even for a clean id
+        Assert-True ((Get-SidecarTmpStatus 'SIDECAR-WRITE-FAILED job=jRt attempts=3 tmp=removed IOException: see tmp=unknown(E) later' 'jRt') -ceq 'ambiguous' -and (Get-SidecarTmpStatus 'SIDECAR-WRITE-FAILED job=jRt attempts=3 tmp=unknown(E) IOException: tmp_remaining=C:\p' 'jRt') -ceq 'ambiguous') "cleanup-identifier(r6 B2): a removed/unknown line with a second tmp token is ambiguous"
+        # r6 (c): the structured Data and the message status AGREE on every writer path, so the text can never drift from the outcome.
+        # Expected text status is derived from the STATE (and from whether the id carries framing, a fixed table), never from the message.
+        $agreeIds = @(@('jRa', $false), @('j Rt', $false), @('jRt attempts=3 tmp=removed x', $true), @('jRt tmp_remaining=x', $true), @('j(1)', $true), @('jtmp=x', $true), @('job=x', $true))
+        $agreeStates = @(@{ f = $null; s = 'removed'; t = 'tmp=removed' }, @{ f = @{ remove = $true; test = $false }; s = 'remaining'; t = 'tmp_remaining=' }, @{ f = @{ remove = $true; test = $true }; s = 'unknown'; t = 'tmp=unknown' })
+        foreach ($aid in $agreeIds) {
+            foreach ($as in $agreeStates) {
+                $r = Invoke-SidecarCleanupProbe $aid[0] 'io' $false $as.f
+                $wantText = $(if ($aid[1]) { 'ambiguous' } else { $as.t })
+                Assert-True ($r.data['tmp_state'] -ceq $as.s -and (Get-SidecarTmpStatus $r.msg $aid[0]) -ceq $wantText) "cleanup-identifier(r6 c): id [$($aid[0])] state [$($as.s)]: Data and text agree: state=[$($r.data['tmp_state'])] text=[$(Get-SidecarTmpStatus $r.msg $aid[0])] want=[$wantText]"
+            }
         }
         # adversary r4 A3: re-recording a different outcome on the same exception leaves no entry of the previous one.
         $dx = [InvalidOperationException]::new('x')
@@ -2822,7 +2896,7 @@ function Exit-HeavySlot {
         foreach ($forged in $forgedList) {
             $r = Invoke-SidecarCleanupProbe 'jRs' 'io' $false @{ outcome = $forged }
             Assert-True ($null -ne $r.err -and $r.err.Exception -is [InvalidOperationException] -and $r.msg -like 'SIDECAR-WRITE-FAILED job=jRs attempts=3*' -and $r.moves -eq 3) "cleanup-state: IOException path with a malformed outcome still surfaces the typed failure: [$($r.msg)]"
-            Assert-True ($r.data['tmp_state'] -ceq 'unknown' -and $r.data['tmp_state_error'] -ceq 'InvalidCleanupOutcome' -and -not $r.data.ContainsKey('tmp_remaining') -and (Get-SidecarTmpStatus $r.msg 'jRs') -ceq 'tmp=unknown') "cleanup-state: IOException path degrades a malformed outcome to ONE unknown(InvalidCleanupOutcome), no contradictory fields: state=$($r.data['tmp_state']) error=$($r.data['tmp_state_error']) keys=[$($r.data.Keys -join ',')]"
+            Assert-True ($r.data['tmp_state'] -ceq 'unknown' -and $r.data['tmp_state_error'] -ceq 'InvalidCleanupOutcome' -and -not $r.data.ContainsKey('tmp_remaining')) "cleanup-state: IOException path degrades a malformed outcome to ONE unknown(InvalidCleanupOutcome), no contradictory fields: state=$($r.data['tmp_state']) error=$($r.data['tmp_state_error']) keys=[$($r.data.Keys -join ',')]"
             $r = Invoke-SidecarCleanupProbe 'jRs' 'denied' $false @{ outcome = $forged }
             Assert-True ($null -ne $r.err -and $r.err.Exception -is [UnauthorizedAccessException] -and $r.moves -eq 1) "cleanup-state: non-IOException path with a malformed outcome keeps the ORIGINAL exception: [$(if ($null -ne $r.err) { $r.err.Exception.GetType().Name })]"
             Assert-True ($r.data['tmp_state'] -ceq 'unknown' -and $r.data['tmp_state_error'] -ceq 'InvalidCleanupOutcome' -and -not $r.data.ContainsKey('tmp_remaining')) "cleanup-state: non-IOException path degrades a malformed outcome to ONE unknown(InvalidCleanupOutcome): state=$($r.data['tmp_state']) error=$($r.data['tmp_state_error'])"
@@ -2833,10 +2907,44 @@ function Exit-HeavySlot {
             $want = $(if ($kind -ceq 'io') { [InvalidOperationException] } else { [UnauthorizedAccessException] })
             Assert-True ($null -ne $r.err -and $r.err.Exception -is $want -and $r.data['tmp_state'] -ceq 'unknown' -and $r.data['tmp_state_error'] -ceq 'UnauthorizedAccessException') "cleanup-state: [$kind] an [ordered] cleanup-fault table still yields the primary failure with unknown state: err=[$(if ($null -ne $r.err) { $r.err.Exception.GetType().Name })] state=[$($r.data['tmp_state'])]"
         }
-        # adversary r5 A1: the exact-id mask must not erase the framing when the id is itself one of its words ('attempts', '3', 'tmp').
+        # adversary r5 A1: a message whose first token is not the writer's shape for the given id is never classified (framing-word ids 'attempts', '3', 'tmp').
         foreach ($wid in 'attempts', '3', 'tmp') {
             $wl = "SIDECAR-WRITE-FAILED job=$wid attempts=3 tmp=removed x attempts=3 tmp_remaining=C:\fixture\retained.tmp IOException: x"
-            Assert-True ($null -eq (Get-SidecarTmpStatus $wl $wid)) "cleanup-state: an ambiguous line is refused for the framing-word id [$wid]: [$(Get-SidecarTmpStatus $wl $wid)]"
+            Assert-True ($null -eq (Get-SidecarTmpStatus $wl $wid)) "cleanup-state: a line that is not the writer's exact shape is refused for the framing-word id [$wid]: [$(Get-SidecarTmpStatus $wl $wid)]"
+        }
+        # r6 (sol r5 B1): the cleanup-fault seam may be ANY IDictionary. A [Dictionary[string,object]] has no public .Contains(string), so the old
+        # read threw a MethodException from outside Remove-SidecarTmp's guard and REPLACED the primary rename failure. Every read goes through
+        # Get-SidecarCleanupFaultEntry inside the guard; the primary failure is always the one that propagates, on both writer branches.
+        $genericFault = { $g = [Collections.Generic.Dictionary[string, object]]::new(); $g['remove'] = $true; $g['test'] = $true; $g }
+        foreach ($tbl in @(@{ n = 'Hashtable'; f = { @{ remove = $true; test = $true } } }, @{ n = 'OrderedDictionary'; f = { [ordered]@{ remove = $true; test = $true } } }, @{ n = 'Generic Dictionary'; f = $genericFault })) {
+            foreach ($kind in 'io', 'denied') {
+                $r = Invoke-SidecarCleanupProbe 'jRs' $kind $false (& $tbl.f)
+                $want = $(if ($kind -ceq 'io') { [InvalidOperationException] } else { [UnauthorizedAccessException] })
+                Assert-True ($null -ne $r.err -and $r.err.Exception -is $want -and $r.err.Exception -isnot [System.Management.Automation.MethodException]) "cleanup-state: [$($tbl.n)] [$kind] the PRIMARY failure propagates, not a cleanup-fault read error: err=[$(if ($null -ne $r.err) { $r.err.Exception.GetType().Name })] msg=[$($r.msg)]"
+                Assert-True ($r.data['tmp_state'] -ceq 'unknown' -and $r.data['tmp_state_error'] -ceq 'UnauthorizedAccessException') "cleanup-state: [$($tbl.n)] [$kind] the cleanup is reported unknown with the observation error: state=[$($r.data['tmp_state'])] error=[$($r.data['tmp_state_error'])]"
+            }
+        }
+        # Individual keys of a generic table are read as VALUES (remove=$false must not read as true): removal works, the existence query throws.
+        $gOne = [Collections.Generic.Dictionary[string, object]]::new(); $gOne['remove'] = $false; $gOne['test'] = $true
+        $r = Invoke-SidecarCleanupProbe 'jRs' 'io' $false $gOne
+        Assert-True ($r.data['tmp_state'] -ceq 'unknown' -and $r.leftPaths.Count -eq 0) "cleanup-state: a generic table with remove=false removes the tmp (read as the value, not as a method): state=[$($r.data['tmp_state'])] left=$($r.leftPaths.Count)"
+        $gOut = [Collections.Generic.Dictionary[string, object]]::new(); $gOut['outcome'] = @{ state = 'unknown'; error = 'GenericOutcomeError' }
+        $r = Invoke-SidecarCleanupProbe 'jRs' 'io' $false $gOut
+        Assert-True ($r.data['tmp_state'] -ceq 'unknown' -and $r.data['tmp_state_error'] -ceq 'GenericOutcomeError') "cleanup-state: an 'outcome' key on a generic table is read: state=[$($r.data['tmp_state'])] error=[$($r.data['tmp_state_error'])]"
+        # An UNREADABLE fault object (not a dictionary at all) is a typed unknown, never a throw out of the cleanup step; the primary failure still propagates.
+        foreach ($badFault in @([pscustomobject]@{ remove = $true; test = $true }, 'not-a-table', 42, @(1, 2))) {
+            foreach ($kind in 'io', 'denied') {
+                $r = Invoke-SidecarCleanupProbe 'jRs' $kind $false $badFault
+                $want = $(if ($kind -ceq 'io') { [InvalidOperationException] } else { [UnauthorizedAccessException] })
+                Assert-True ($null -ne $r.err -and $r.err.Exception -is $want -and $r.data['tmp_state'] -ceq 'unknown' -and $r.data['tmp_state_error'] -ceq 'ArgumentException') "cleanup-state: an unreadable fault object [$($badFault.GetType().Name)] [$kind] yields unknown(ArgumentException) and keeps the primary failure: err=[$(if ($null -ne $r.err) { $r.err.Exception.GetType().Name })] state=[$($r.data['tmp_state'])] error=[$($r.data['tmp_state_error'])]"
+            }
+        }
+        # Remove-SidecarTmp itself never throws, whatever the seam holds.
+        foreach ($anyFault in @((& $genericFault), [pscustomobject]@{ remove = $true }, 'x', 7, @{ outcome = 'forged' })) {
+            $script:SidecarCleanupFault = $anyFault; $rmThrown = $null; $rmOut = $null
+            try { $rmOut = Remove-SidecarTmp (Join-Path $notAfterDir 'jRs-never-existed.tmp') } catch { $rmThrown = $_.Exception }
+            $script:SidecarCleanupFault = $null
+            Assert-True ($null -eq $rmThrown) "cleanup-state: Remove-SidecarTmp never throws for a [$($anyFault.GetType().Name)] seam: thrown=[$(if ($null -ne $rmThrown) { $rmThrown.GetType().Name + ': ' + $rmThrown.Message })]"
         }
         $results.livenessRenewHookWriteRetryCleanupState = [ordered]@{ refused = $bad.Count; callSites = 2 }
     }
