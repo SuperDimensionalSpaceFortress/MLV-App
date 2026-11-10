@@ -36,6 +36,9 @@ EXCLUDED_PREFIXES = (
     "tools/profiling/dual-venue/",
     "tools/gpu/backend/",
     "tools/repo_hygiene/brokered_closeout",
+    # The bus candidate: tests/coordination/test_doctrine_outbox_hooks.py pins its LF digest in doctrine-outbox.config.json,
+    # and the fleet steward lands the file on the bus. Its unflagged spawns are an OPEN line for that steward, not edited here.
+    "tools/coordination/doctrine_outbox.py",
 )
 EXCLUDED_NAME_RE = re.compile(r"^tools/coordination/merge[^/]*$")
 
