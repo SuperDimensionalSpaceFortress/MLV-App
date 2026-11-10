@@ -3626,25 +3626,67 @@ class EvidenceBoundReceiptTests(EvidenceFactory, ModuleMutationMixin, unittest.T
                     bad.append(f"{name}:{n}")
         return bad
 
+    # The census guards PRODUCTION paths: a script or module that reads a real receipt must re-derive it against the repo root. A test module is
+    # never such a reader -- it runs the validator on fixture receipts in a temp repo (often without -RepoRoot on purpose, see ps_receipt_status)
+    # or pins a production caller's exact line as a string. So test modules are out of the census BY PATH CLASS (tools/repo_hygiene/test_*.py and
+    # tests/**), never by file name; everything else, including a test-looking name outside the class, is still counted.
+    PRODUCTION_RECEIPT_CALLERS = frozenset({"tools/profiling/dual-venue/DualVenueRunner.psm1", "tools/profiling/dual-venue/New-VenueSheetPair.ps1",
+                                            "tools/profiling/dual-venue/New-VenueFlavorPair.ps1", "tools/profiling/dual-venue/Invoke-VenueBaseline.ps1"})
+    PRODUCTION_RECEIPT_READERS = frozenset({"tools/profiling/dual-venue/DualVenueRunner.psm1", "tools/profiling/dual-venue/Invoke-VenueLeg.ps1"})
+
+    @staticmethod
+    def is_test_module(path: str) -> bool:
+        return path.startswith("tests/") or re.fullmatch(r"tools/repo_hygiene/test_[^/]*\.py", path) is not None
+
+    @classmethod
+    def receipt_census(cls, texts: dict[str, str]) -> tuple[set[str], set[str]]:
+        prod = {n: t for n, t in texts.items() if not cls.is_test_module(n)}
+        callers = {n for n, t in prod.items() if re.search(r"Test-DvReceiptValid\s+-", t)}
+        readers = {n for n, t in prod.items() if "dual-venue-receipt/v1" in t or "dual-venue\\receipts" in t or "dual-venue/receipts" in t}
+        return callers, readers
+
     def test_every_in_tree_caller_of_the_validator_passes_the_repo_root_and_the_only_receipt_readers_are_the_known_ones(self) -> None:
         tracked = subprocess.run(["git", "-C", str(ROOT), "ls-files", "*.ps1", "*.psm1", "*.py"], capture_output=True, text=True, check=True).stdout.split()
         texts = {name: (ROOT / name).read_text(encoding="utf-8", errors="replace") for name in tracked if (ROOT / name).is_file()}
-        callers = {n for n, t in texts.items() if re.search(r"Test-DvReceiptValid\s+-", t) and n != "tools/repo_hygiene/test_dual_venue_evidence.py"}
+        callers, readers = self.receipt_census(texts)
         # LOOK-ASSIST-CINEMATIC-BENCH-PAIR-1 added New-VenueFlavorPair.ps1 (the Classic | Cinematic pair), which validates both receipts the same way.
-        self.assertEqual(callers, {"tools/profiling/dual-venue/DualVenueRunner.psm1", "tools/profiling/dual-venue/New-VenueSheetPair.ps1",
-                                   "tools/profiling/dual-venue/New-VenueFlavorPair.ps1", "tools/profiling/dual-venue/Invoke-VenueBaseline.ps1"})
+        self.assertEqual(callers, set(self.PRODUCTION_RECEIPT_CALLERS))
         self.assertEqual(self.readers_without_repo_root({n: texts[n] for n in callers}), [])
         # nothing else in the tree reads a receipt file: a new reader must call the validator (and be added to this list in review)
-        readers = {n for n, t in texts.items() if ("dual-venue-receipt/v1" in t or "dual-venue\\receipts" in t or "dual-venue/receipts" in t)
-                   # (test files hold receipt-shaped fixtures they never read back; test_venue_baseline.py's stub chain writes one for the baseline runner, which IS a caller above)
-                   and n not in ("tools/repo_hygiene/test_dual_venue_evidence.py", "tools/repo_hygiene/test_mlv_never_authorized.py", "tools/repo_hygiene/test_venue_baseline.py")}
-        self.assertEqual(readers, {"tools/profiling/dual-venue/DualVenueRunner.psm1", "tools/profiling/dual-venue/Invoke-VenueLeg.ps1"},
+        self.assertEqual(readers, set(self.PRODUCTION_RECEIPT_READERS),
                          "an unknown reader of dual-venue receipts must call Test-DvReceiptValid -RepoRoot and be named here")
         mutated = texts["tools/profiling/dual-venue/New-VenueSheetPair.ps1"].replace("Test-DvReceiptValid -Receipt $r -RepoRoot $repoRoot", "Test-DvReceiptValid -Receipt $r")
         self.assertNotEqual(mutated, texts["tools/profiling/dual-venue/New-VenueSheetPair.ps1"])
         self.assertEqual(self.readers_without_repo_root({"New-VenueSheetPair.ps1": mutated}), ["New-VenueSheetPair.ps1:" + str(next(
             i for i, l in enumerate(mutated.splitlines(), 1) if "Test-DvReceiptValid" in l and not l.lstrip().startswith("#")))],
             "a reader that drops -RepoRoot is caught by the scan -- so the scan guards item 3")
+
+    def test_the_census_exempts_only_test_modules_so_a_production_caller_without_the_repo_root_still_fails(self) -> None:
+        # PR #788 r4 R1: the test-module exemption is a path class, not a hole -- a non-test caller that omits -RepoRoot is still caught.
+        bare_call, pinned_call = "$v = Test-DvReceiptValid -Receipt $r\n", 'assertIn("Test-DvReceiptValid -Receipt $r -RepoRoot $repoRoot", t)\n'
+        exempt = ["tools/repo_hygiene/test_new_gap.py", "tests/coordination/test_reader.py", "tests/fixtures/reader.ps1"]
+        counted = ["tools/profiling/dual-venue/New-VenueReader.ps1", "tools/profiling/test_reader.ps1", "tools/repo_hygiene/test_reader.ps1",
+                   "tools/repo_hygiene/sub/test_reader.py", "tools/repo_hygiene/helpers_test.py", "attests/reader.ps1", "tools/tests/reader.ps1"]
+        for path in exempt:
+            self.assertTrue(self.is_test_module(path), path)
+            self.assertEqual(self.receipt_census({path: bare_call + pinned_call + "dual-venue/receipts\n"}), (set(), set()), path)
+        for path in counted:
+            self.assertFalse(self.is_test_module(path), path)
+            callers, readers = self.receipt_census({path: bare_call, path + ".r.ps1": "Get-ChildItem dual-venue/receipts\n"})
+            self.assertEqual(callers, {path}, "a non-test caller is in the census, so the known-callers equality fails on it: " + path)
+            self.assertEqual(readers, {path + ".r.ps1"}, path)
+            tree = {n: "Test-DvReceiptValid -Receipt $r -RepoRoot $repoRoot\n" for n in self.PRODUCTION_RECEIPT_CALLERS}
+            self.assertEqual(self.receipt_census(tree)[0], set(self.PRODUCTION_RECEIPT_CALLERS))
+            self.assertNotEqual(self.receipt_census(dict(tree, **{path: bare_call}))[0], set(self.PRODUCTION_RECEIPT_CALLERS), path)
+            self.assertEqual(self.readers_without_repo_root({path: bare_call}), [path + ":1"], "and its missing -RepoRoot is flagged: " + path)
+        # the real tree with one production caller's -RepoRoot dropped: the census still names it and the scan flags it
+        name = "tools/profiling/dual-venue/New-VenueFlavorPair.ps1"
+        text = (ROOT / name).read_text(encoding="utf-8", errors="replace")
+        mutated = re.sub(r"(Test-DvReceiptValid\s+-Receipt\s+\$\w+)\s+-RepoRoot\s+\$\w+", r"\1", text)
+        self.assertNotEqual(mutated, text)
+        callers, _ = self.receipt_census({name: mutated, "tools/repo_hygiene/test_presentmon_playback_window_gap.py": pinned_call})
+        self.assertEqual(callers, {name})
+        self.assertTrue(self.readers_without_repo_root({name: mutated}), "a production caller that drops -RepoRoot fails the census scan")
 
     # -- mutations: each rule's test can fail ----------------------------------------------------------------------------------------
     def test_mutation_trusting_the_consent_blobs_format_a_zero_record_blob_validates(self) -> None:
