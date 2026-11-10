@@ -637,3 +637,19 @@ TEST(PlaybackTexturePresentSplit, MainWindowWiring)
     ASSERT_NE( mw.find( "playback_texture_split::formatLine(" ), std::string::npos );
     ASSERT_NE( mw.find( "playback_texture_split::formatSlipFields( r.textureKnown, r.texture )" ), std::string::npos );
 }
+
+// r3 (#794 ADVISORY A1 on aea1159f, PlaybackTexturePresentSplit.h:247): the session id is an unsigned 64-bit value.
+// It was narrowed to long long and printed with %lld, so an id past LLONG_MAX printed negative.
+TEST(PlaybackTexturePresentSplit, A1SessionIdPrintsAsUnsigned64)
+{
+    PathAggregator agg;
+    agg.note( makeSample( 1.0, 1.0, 5.0 ) );
+    agg.note( makeSample( 2.0, 1.0, 6.0 ) );
+    const PartSums none;
+    const std::string top = playback_texture_split::formatLine( 18446744073709551615ULL, Path::Window, agg, none, none );
+    ASSERT_EQ( field( top, "session" ), std::string( "18446744073709551615" ) );
+    const std::string past = playback_texture_split::formatLine( 9223372036854775808ULL, Path::Window, agg, none, none );
+    ASSERT_EQ( field( past, "session" ), std::string( "9223372036854775808" ) );
+    const std::string small = playback_texture_split::formatLine( 7ULL, Path::Window, agg, none, none );
+    ASSERT_EQ( field( small, "session" ), std::string( "7" ) );
+}

@@ -238,13 +238,21 @@ inline void appendInt( std::string &out, const char *key, long long v )
     out += buf;
 }
 
+/*! r3 (#794 ADVISORY A1): an unsigned 64-bit value, printed whole (a session id past LLONG_MAX stays positive). */
+inline void appendUInt( std::string &out, const char *key, unsigned long long v )
+{
+    char buf[96];
+    std::snprintf( buf, sizeof( buf ), " %s=%llu", key, v );
+    out += buf;
+}
+
 /*! The LIGHT line for one path. \a guiLateSlips sums the parts of this path's gui_late slip presents (the
  *  frames G1 asks about); \a allSlips the parts of every slip present of this path. */
 inline std::string formatLine( unsigned long long session, Path path, const PathAggregator &agg,
                                const PartSums &guiLateSlips, const PartSums &allSlips )
 {
     std::string out = "playback_smoke.texture_present_split";
-    appendInt( out, "session", static_cast<long long>( session ) );
+    appendUInt( out, "session", session );
     out += " path=";
     out += pathName( path );
     appendInt( out, "frames", agg.frames() );

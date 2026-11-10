@@ -879,8 +879,9 @@ TEST(CudaLaunchTiming, DeviceSpansSitOnTheirOwnStreamAfterTheExistingWaits)
 {
     // CUDA-RECON-PRESENT-OVERLAP-TIMELINE-1. Recon: one run span per run, after the run's own
     // cudaEventSynchronize(ev_after_dl) and its elapsed reads, so its four events are complete and
-    // no wait is added. AMaZE: the stream-0 GL handoff (map, copy, unmap) is bracketed by a span
-    // on stream 0, closed right after the unmap.
+    // no wait is added. AMaZE: the GL handoff (map, copy, unmap) is bracketed by a span on the
+    // handoff's own stream, closed right after the unmap. HFR-NATIVE-M16-1457-GUI-TEXTURE-PRESENT-OFFLOAD-1 r3:
+    // that stream is the GUI present stream, or stream 0 while MLVAPP_CUDA_AMAZE_PRESENT_STREAM is off.
     const QString recon = readRepoFile(QStringLiteral("tools/gpu/backend/igpu_recon_cuda.cu"));
     const QString amaze = readRepoFile(QStringLiteral("tools/gpu/backend/igpu_amaze_debayer_cuda.cu"));
     const QString span = QStringLiteral(
@@ -898,10 +899,10 @@ TEST(CudaLaunchTiming, DeviceSpansSitOnTheirOwnStreamAfterTheExistingWaits)
                 < recon.indexOf(span));
     ASSERT_TRUE(recon.indexOf(QStringLiteral("cudaEventSynchronize(b->ev_after_dl)")) < recon.indexOf(span));
     ASSERT_TRUE(amaze.contains(QStringLiteral(
-        "igpu_lt::SpanScope handoff(\"gl_rgba16_direct:handoff\", 0);\n"
-        "        cudaError_t rc = IGPU_LT_SYNC_CALL(\"gl_rgba16_direct:map\", cudaGraphicsMapResources(1, &resource, 0));")));
+        "igpu_lt::SpanScope handoff(\"gl_rgba16_direct:handoff\", stream);\n"
+        "        cudaError_t rc = IGPU_LT_SYNC_CALL(\"gl_rgba16_direct:map\", cudaGraphicsMapResources(1, &resource, stream));")));
     ASSERT_TRUE(amaze.contains(QStringLiteral(
-        "IGPU_LT_SYNC_CALL(\"gl_rgba16_direct:unmap\", cudaGraphicsUnmapResources(1, &resource, 0));\n"
+        "IGPU_LT_SYNC_CALL(\"gl_rgba16_direct:unmap\", cudaGraphicsUnmapResources(1, &resource, stream));\n"
         "        handoff.end();")));
     ASSERT_EQ(1, (int)amaze.count(QStringLiteral("igpu_lt::SpanScope ")));
 }

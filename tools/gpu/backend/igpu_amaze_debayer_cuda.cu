@@ -37,6 +37,8 @@
 #include <GL/gl.h>
 #include <cuda_gl_interop.h>
 
+#include "igpu_amaze_present_stream.h"
+
 #ifndef GL_TEXTURE_2D
 #define GL_TEXTURE_2D 0x0DE1
 #endif
@@ -112,6 +114,11 @@ struct igpu_amaze_debayer_backend
     std::vector<cudaStream_t> liveTileStreams;
     CachedGlImageResource liveInputR16Resource;
     CachedGlImageResource liveOutputRgba16Resource;
+    /* HFR-NATIVE-M16-1457-GUI-TEXTURE-PRESENT-OFFLOAD-1 r3 (the stream-0 clause): the GUI present path's own
+     * cudaStreamNonBlocking stream (live_present_stream) and the event that orders it after the frame's AMaZE tile
+     * streams. Created on first use while MLVAPP_CUDA_AMAZE_PRESENT_STREAM is on; destroyed with the backend. */
+    cudaStream_t presentStream = nullptr;
+    cudaEvent_t presentProducerDone = nullptr;
     std::size_t livePixelCount = 0;
     int liveWidth = 0;
     int liveHeight = 0;
@@ -755,12 +762,13 @@ __global__ void k_reduced_hnyquist121(const uint16_t * in,
     }
 }
 
-void launch_reduced_hnyquist121(const uint16_t * in, uint16_t * out, int w, int h)
+/* r3: `stream` is the GUI present stream, or 0 (legacy, the pre-r3 launch) when the kill switch is off. */
+void launch_reduced_hnyquist121(const uint16_t * in, uint16_t * out, int w, int h, cudaStream_t stream = 0)
 {
     const dim3 block(32, 8);
     const dim3 grid((w + block.x - 1) / block.x, (h + block.y - 1) / block.y);
-    IGPU_LT_LAUNCH("k_reduced_hnyquist121", grid, block, 0,
-                   k_reduced_hnyquist121<<<grid, block>>>(in, out, w, h));
+    IGPU_LT_LAUNCH("k_reduced_hnyquist121", grid, block, stream,
+                   k_reduced_hnyquist121<<<grid, block, 0, stream>>>(in, out, w, h));
 }
 
 __device__ __forceinline__ uint16_t clamp_double_to_u16(double value)
@@ -989,11 +997,56 @@ void ensure_live_texture_buffers(igpu_amaze_debayer_backend * backend,
     backend->liveHeight = height;
 }
 
+/* HFR-NATIVE-M16-1457-GUI-TEXTURE-PRESENT-OFFLOAD-1 r3 (the stream-0 clause). The GUI present path's stream: its
+ * own cudaStreamNonBlocking stream (created on first use), or nullptr while MLVAPP_CUDA_AMAZE_PRESENT_STREAM is off,
+ * when every caller passes stream 0 and runs the pre-r3 calls unchanged. A non-blocking stream never waits on, and
+ * is never waited on by, the legacy default stream the worker's recon kernels use. */
+cudaStream_t live_present_stream(igpu_amaze_debayer_backend * backend)
+{
+    if (!igpu_amaze_present::present_stream_enabled(std::getenv(IGPU_AMAZE_PRESENT_STREAM_ENV))) return nullptr;
+    if (!backend->presentProducerDone)
+        CK(cudaEventCreateWithFlags(&backend->presentProducerDone, cudaEventDisableTiming));
+    if (!backend->presentStream)
+        CK(cudaStreamCreateWithFlags(&backend->presentStream, cudaStreamNonBlocking));
+    return backend->presentStream;
+}
+
+/* r3: the present stream's own completion point, so a run returns with its texture written and its buffers free
+ * for the next frame, as the stream-0 path did. It waits on this stream alone: never stream 0, never the device.
+ * cudaSuccess and no call when `stream` is nullptr (the switch off). */
+cudaError_t drain_present_stream(cudaStream_t stream, const char * stage)
+{
+    if (!stream) return cudaSuccess;
+    return IGPU_LT_SYNC_CALL(stage, cudaStreamSynchronize(stream));
+}
+
+/* r3: after a live run that failed or threw, whatever it queued on the present stream (the H-Nyquist filter, the
+ * pack, a copy) completes before the live buffers are left to the next frame. The drain's own code is noted at
+ * `site`. No call while the switch is off. */
+void drain_present_stream_after_failure(cudaStream_t stream, const char * site)
+{
+    const cudaError_t rc = drain_present_stream(stream, site);
+    if (rc != cudaSuccess)
+    {
+        IGPU_CUDA_ERROR_NOTE(rc, site);
+    }
+}
+
+void free_present_stream(igpu_amaze_debayer_backend * backend)
+{
+    if (!backend) return;
+    if (backend->presentStream) cudaStreamDestroy(backend->presentStream);
+    if (backend->presentProducerDone) cudaEventDestroy(backend->presentProducerDone);
+    backend->presentStream = nullptr;
+    backend->presentProducerDone = nullptr;
+}
+
 int copy_gl_r16_texture_to_bayer16(unsigned int glTexture,
                                    uint16_t * dBayer16,
                                    int width,
                                    int height,
-                                   CachedGlImageResource * cache = nullptr)
+                                   CachedGlImageResource * cache = nullptr,
+                                   cudaStream_t stream = 0)
 {
     if (glTexture == 0 || !dBayer16 || width <= 0 || height <= 0) return -1;
 
@@ -1026,7 +1079,7 @@ int copy_gl_r16_texture_to_bayer16(unsigned int glTexture,
         }
     }
 
-    cudaError_t rc = IGPU_LT_SYNC_CALL("gl_r16_in:map", cudaGraphicsMapResources(1, &resource, 0));
+    cudaError_t rc = IGPU_LT_SYNC_CALL("gl_r16_in:map", cudaGraphicsMapResources(1, &resource, stream));
     if (rc != cudaSuccess)
     {
         /* r8 (sol r7 blocker): an uncached resource's unregister code is noted too, at its own
@@ -1055,22 +1108,37 @@ int copy_gl_r16_texture_to_bayer16(unsigned int glTexture,
     if (arrayRc == cudaSuccess)
     {
         const std::size_t rowBytes = static_cast<std::size_t>(width) * sizeof(uint16_t);
-        rc = IGPU_LT_SYNC_CALL("gl_r16_in:copy_from_array",
-                               cudaMemcpy2DFromArray(dBayer16,
-                                                     rowBytes,
-                                                     mappedArray,
-                                                     0,
-                                                     0,
-                                                     rowBytes,
-                                                     static_cast<std::size_t>(height),
-                                                     cudaMemcpyDeviceToDevice));
+        rc = stream
+            ? IGPU_LT_SYNC_CALL("gl_r16_in:copy_from_array",
+                                cudaMemcpy2DFromArrayAsync(dBayer16,
+                                                           rowBytes,
+                                                           mappedArray,
+                                                           0,
+                                                           0,
+                                                           rowBytes,
+                                                           static_cast<std::size_t>(height),
+                                                           cudaMemcpyDeviceToDevice,
+                                                           stream))
+            : IGPU_LT_SYNC_CALL("gl_r16_in:copy_from_array",
+                                cudaMemcpy2DFromArray(dBayer16,
+                                                      rowBytes,
+                                                      mappedArray,
+                                                      0,
+                                                      0,
+                                                      rowBytes,
+                                                      static_cast<std::size_t>(height),
+                                                      cudaMemcpyDeviceToDevice));
     }
 
     const cudaError_t unmapRc =
-        IGPU_LT_SYNC_CALL("gl_r16_in:unmap", cudaGraphicsUnmapResources(1, &resource, 0));
+        IGPU_LT_SYNC_CALL("gl_r16_in:unmap", cudaGraphicsUnmapResources(1, &resource, stream));
+    /* r3: on the present stream the copy is asynchronous, and the AMaZE tile streams read dBayer16 next: the
+     * upload is complete before this returns (the present stream alone; no-op on stream 0). */
+    const cudaError_t drainRc = drain_present_stream(stream, "gl_r16_in:present_sync");
     const cudaError_t unregisterRc =
         cached ? cudaSuccess : cudaGraphicsUnregisterResource(resource);
-    if (arrayRc != cudaSuccess || rc != cudaSuccess || unmapRc != cudaSuccess || unregisterRc != cudaSuccess)
+    if (arrayRc != cudaSuccess || rc != cudaSuccess || unmapRc != cudaSuccess || drainRc != cudaSuccess
+        || unregisterRc != cudaSuccess)
     {
         /* r7: all evaluated codes are noted, each at its own site, before the return. */
         const igpu_cuda_error_slot::Evaluated evaluated[] = {
@@ -1078,6 +1146,7 @@ int copy_gl_r16_texture_to_bayer16(unsigned int glTexture,
             {(int)rc, "gl_r16_in:copy_from_array"},
             {(int)unmapRc, "gl_r16_in:unmap"},
             {(int)unregisterRc, "gl_r16_in:unregister"},
+            {(int)drainRc, "gl_r16_in:present_drain"},
         };
         IGPU_CUDA_ERROR_NOTE_EVALUATED(evaluated);
         if (arrayRc != cudaSuccess)
@@ -1092,6 +1161,10 @@ int copy_gl_r16_texture_to_bayer16(unsigned int glTexture,
             std::fprintf(stderr,
                          "[igpu_amaze_debayer_cuda] cudaGraphicsUnmapResources(GL_R16 source texture) failed: %s\n",
                          cudaGetErrorString(unmapRc));
+        if (drainRc != cudaSuccess)
+            std::fprintf(stderr,
+                         "[igpu_amaze_debayer_cuda] present-stream drain (GL_R16 source texture) failed: %s\n",
+                         cudaGetErrorString(drainRc));
         if (unregisterRc != cudaSuccess)
             std::fprintf(stderr,
                          "[igpu_amaze_debayer_cuda] cudaGraphicsUnregisterResource(GL_R16 source texture) failed: %s\n",
@@ -1524,7 +1597,9 @@ void run_frame_to_device_rgb16_bayer16_post_wb_batched(
     double wbMultiplierG,
     double wbMultiplierB,
     bool fastLaunchChecks = false,
-    LiveRunProbe * probe = nullptr)
+    LiveRunProbe * probe = nullptr,
+    cudaStream_t presentStream = nullptr,
+    cudaEvent_t presentProducerDone = nullptr)
 {
     const std::size_t batchSize = std::min(buffers.size(), streams.size());
     if (batchSize == 0)
@@ -1586,6 +1661,18 @@ void run_frame_to_device_rgb16_bayer16_post_wb_batched(
         {
             IGPU_CUDA_ERROR_NOTE(rc, "probe:event_join");
             probe->ok = false;
+        }
+    }
+    /* HFR-NATIVE-M16-1457-GUI-TEXTURE-PRESENT-OFFLOAD-1 r3: the GUI present stream's H-Nyquist / pack / GL copy read
+     * what these tiles wrote. The tile launch stays on its own non-blocking streams (it never used stream 0) and is
+     * ORDERED BY AN EVENT: one record per tile stream this frame used, each waited on by the present stream, on the
+     * device. Only while the present stream is on (both null otherwise: no call). */
+    if (presentStream && presentProducerDone)
+    {
+        for (std::size_t slot = 0; slot < active; ++slot)
+        {
+            CK(cudaEventRecord(presentProducerDone, streams[slot]));
+            CK(cudaStreamWaitEvent(presentStream, presentProducerDone, 0));
         }
     }
     for (std::size_t slot = 0; slot < active; ++slot)
@@ -1777,7 +1864,8 @@ int copy_rgba16_to_gl_rgba16_texture(const uint16_t * dRgba16,
                                      int width,
                                      int height,
                                      unsigned int glTexture,
-                                     CachedGlImageResource * cache = nullptr)
+                                     CachedGlImageResource * cache = nullptr,
+                                     cudaStream_t stream = 0)
 {
     if (!dRgba16 || width <= 0 || height <= 0 || glTexture == 0) return -1;
 
@@ -1816,10 +1904,10 @@ int copy_rgba16_to_gl_rgba16_texture(const uint16_t * dRgba16,
             }
         }
 
-        /* CUDA-RECON-PRESENT-OVERLAP-TIMELINE-1: the stream-0 GL handoff (map, copy, unmap) on
-         * the device clock (env-gated). */
-        igpu_lt::SpanScope handoff("gl_rgba16_direct:handoff", 0);
-        cudaError_t rc = IGPU_LT_SYNC_CALL("gl_rgba16_direct:map", cudaGraphicsMapResources(1, &resource, 0));
+        /* CUDA-RECON-PRESENT-OVERLAP-TIMELINE-1: the GL handoff (map, copy, unmap) on the device clock
+         * (env-gated). r3: on `stream`, the GUI present stream (stream 0 while the kill switch is off). */
+        igpu_lt::SpanScope handoff("gl_rgba16_direct:handoff", stream);
+        cudaError_t rc = IGPU_LT_SYNC_CALL("gl_rgba16_direct:map", cudaGraphicsMapResources(1, &resource, stream));
         if (rc != cudaSuccess)
         {
             /* r8 (sol r7 blocker): an uncached resource's unregister code is noted too, at its
@@ -1849,23 +1937,37 @@ int copy_rgba16_to_gl_rgba16_texture(const uint16_t * dRgba16,
         {
             const std::size_t rowBytes =
                 static_cast<std::size_t>(width) * 4u * sizeof(uint16_t);
-            rc = IGPU_LT_SYNC_CALL("gl_rgba16_direct:copy_to_array",
-                                   cudaMemcpy2DToArray(mappedArray,
-                                                       0,
-                                                       0,
-                                                       dRgba16,
-                                                       rowBytes,
-                                                       rowBytes,
-                                                       static_cast<std::size_t>(height),
-                                                       cudaMemcpyDeviceToDevice));
+            rc = stream
+                ? IGPU_LT_SYNC_CALL("gl_rgba16_direct:copy_to_array",
+                                    cudaMemcpy2DToArrayAsync(mappedArray,
+                                                             0,
+                                                             0,
+                                                             dRgba16,
+                                                             rowBytes,
+                                                             rowBytes,
+                                                             static_cast<std::size_t>(height),
+                                                             cudaMemcpyDeviceToDevice,
+                                                             stream))
+                : IGPU_LT_SYNC_CALL("gl_rgba16_direct:copy_to_array",
+                                    cudaMemcpy2DToArray(mappedArray,
+                                                        0,
+                                                        0,
+                                                        dRgba16,
+                                                        rowBytes,
+                                                        rowBytes,
+                                                        static_cast<std::size_t>(height),
+                                                        cudaMemcpyDeviceToDevice));
         }
 
         const cudaError_t unmapRc =
-            IGPU_LT_SYNC_CALL("gl_rgba16_direct:unmap", cudaGraphicsUnmapResources(1, &resource, 0));
+            IGPU_LT_SYNC_CALL("gl_rgba16_direct:unmap", cudaGraphicsUnmapResources(1, &resource, stream));
         handoff.end();
+        /* r3: the present stream's completion point (no-op on stream 0), before any cache reset or unregister. */
+        const cudaError_t drainRc = drain_present_stream(stream, "gl_rgba16_direct:present_sync");
         const cudaError_t unregisterRc =
             cached ? cudaSuccess : cudaGraphicsUnregisterResource(resource);
-        if (arrayRc != cudaSuccess || rc != cudaSuccess || unmapRc != cudaSuccess || unregisterRc != cudaSuccess)
+        if (arrayRc != cudaSuccess || rc != cudaSuccess || unmapRc != cudaSuccess || drainRc != cudaSuccess
+            || unregisterRc != cudaSuccess)
         {
             /* r7: all evaluated codes are noted, each at its own site, before the return. */
             const igpu_cuda_error_slot::Evaluated evaluated[] = {
@@ -1873,6 +1975,7 @@ int copy_rgba16_to_gl_rgba16_texture(const uint16_t * dRgba16,
                 {(int)rc, "gl_rgba16_direct:copy_to_array"},
                 {(int)unmapRc, "gl_rgba16_direct:unmap"},
                 {(int)unregisterRc, "gl_rgba16_direct:unregister"},
+                {(int)drainRc, "gl_rgba16_direct:present_drain"},
             };
             IGPU_CUDA_ERROR_NOTE_EVALUATED(evaluated);
             if (arrayRc != cudaSuccess)
@@ -1887,6 +1990,10 @@ int copy_rgba16_to_gl_rgba16_texture(const uint16_t * dRgba16,
                 std::fprintf(stderr,
                              "[igpu_amaze_debayer_cuda] cudaGraphicsUnmapResources(GL_RGBA16 direct texture) failed: %s\n",
                              cudaGetErrorString(unmapRc));
+            if (drainRc != cudaSuccess)
+                std::fprintf(stderr,
+                             "[igpu_amaze_debayer_cuda] present-stream drain (GL_RGBA16 direct texture) failed: %s\n",
+                             cudaGetErrorString(drainRc));
             if (unregisterRc != cudaSuccess)
                 std::fprintf(stderr,
                              "[igpu_amaze_debayer_cuda] cudaGraphicsUnregisterResource(GL_RGBA16 direct texture) failed: %s\n",
@@ -1951,7 +2058,8 @@ int copy_rgb16_to_gl_rgba16_texture_post_wb_undo(const uint16_t * dRgb16,
                                                  double wbMultiplierG,
                                                  double wbMultiplierB,
                                                  uint16_t * dRgba16Scratch = nullptr,
-                                                 CachedGlImageResource * cache = nullptr)
+                                                 CachedGlImageResource * cache = nullptr,
+                                                 cudaStream_t stream = 0)
 {
     if (!dRgb16 || width <= 0 || height <= 0 || glTexture == 0) return -1;
     if (wbMultiplierR <= 0.0 || wbMultiplierG <= 0.0 || wbMultiplierB <= 0.0) return -1;
@@ -1984,8 +2092,9 @@ int copy_rgb16_to_gl_rgba16_texture_post_wb_undo(const uint16_t * dRgb16,
         if (ownsScratch) CK(cudaMalloc(&dRgba16, rgbaBytes));
         const int threads = 256;
         const int blocks = static_cast<int>((pixelCount + threads - 1u) / threads);
-        IGPU_LT_LAUNCH("k_pack_rgb16_to_rgba16_post_wb_undo", blocks, threads, 0,
-                       k_pack_rgb16_to_rgba16_post_wb_undo<<<blocks, threads>>>(dRgb16,
+        /* r3: the pack writes what the copy reads, so it MOVES WITH the copy onto `stream` (0 when the switch is off). */
+        IGPU_LT_LAUNCH("k_pack_rgb16_to_rgba16_post_wb_undo", blocks, threads, stream,
+                       k_pack_rgb16_to_rgba16_post_wb_undo<<<blocks, threads, 0, stream>>>(dRgb16,
                                                                                 dRgba16,
                                                                                 pixelCount,
                                                                                 blackLevel,
@@ -2026,7 +2135,7 @@ int copy_rgb16_to_gl_rgba16_texture_post_wb_undo(const uint16_t * dRgb16,
             }
         }
 
-        cudaError_t rc = IGPU_LT_SYNC_CALL("gl_rgba16_post_wb:map", cudaGraphicsMapResources(1, &resource, 0));
+        cudaError_t rc = IGPU_LT_SYNC_CALL("gl_rgba16_post_wb:map", cudaGraphicsMapResources(1, &resource, stream));
         if (rc != cudaSuccess)
         {
             /* r8 (sol r7 blocker): an uncached resource's unregister code is noted too, at its
@@ -2056,22 +2165,37 @@ int copy_rgb16_to_gl_rgba16_texture_post_wb_undo(const uint16_t * dRgb16,
         if (arrayRc == cudaSuccess)
         {
             const std::size_t rowBytes = static_cast<std::size_t>(width) * 4u * sizeof(uint16_t);
-            rc = IGPU_LT_SYNC_CALL("gl_rgba16_post_wb:copy_to_array",
-                                   cudaMemcpy2DToArray(mappedArray,
-                                                       0,
-                                                       0,
-                                                       dRgba16,
-                                                       rowBytes,
-                                                       rowBytes,
-                                                       static_cast<std::size_t>(height),
-                                                       cudaMemcpyDeviceToDevice));
+            rc = stream
+                ? IGPU_LT_SYNC_CALL("gl_rgba16_post_wb:copy_to_array",
+                                    cudaMemcpy2DToArrayAsync(mappedArray,
+                                                             0,
+                                                             0,
+                                                             dRgba16,
+                                                             rowBytes,
+                                                             rowBytes,
+                                                             static_cast<std::size_t>(height),
+                                                             cudaMemcpyDeviceToDevice,
+                                                             stream))
+                : IGPU_LT_SYNC_CALL("gl_rgba16_post_wb:copy_to_array",
+                                    cudaMemcpy2DToArray(mappedArray,
+                                                        0,
+                                                        0,
+                                                        dRgba16,
+                                                        rowBytes,
+                                                        rowBytes,
+                                                        static_cast<std::size_t>(height),
+                                                        cudaMemcpyDeviceToDevice));
         }
 
         const cudaError_t unmapRc =
-            IGPU_LT_SYNC_CALL("gl_rgba16_post_wb:unmap", cudaGraphicsUnmapResources(1, &resource, 0));
+            IGPU_LT_SYNC_CALL("gl_rgba16_post_wb:unmap", cudaGraphicsUnmapResources(1, &resource, stream));
+        /* r3: the present stream's completion point (no-op on stream 0), before any cache reset, unregister or
+         * scratch free. */
+        const cudaError_t drainRc = drain_present_stream(stream, "gl_rgba16_post_wb:present_sync");
         const cudaError_t unregisterRc =
             cached ? cudaSuccess : cudaGraphicsUnregisterResource(resource);
-        if (arrayRc != cudaSuccess || rc != cudaSuccess || unmapRc != cudaSuccess || unregisterRc != cudaSuccess)
+        if (arrayRc != cudaSuccess || rc != cudaSuccess || unmapRc != cudaSuccess || drainRc != cudaSuccess
+            || unregisterRc != cudaSuccess)
         {
             /* r7: all evaluated codes are noted, each at its own site, before the return. */
             const igpu_cuda_error_slot::Evaluated evaluated[] = {
@@ -2079,6 +2203,7 @@ int copy_rgb16_to_gl_rgba16_texture_post_wb_undo(const uint16_t * dRgb16,
                 {(int)rc, "gl_rgba16_post_wb:copy_to_array"},
                 {(int)unmapRc, "gl_rgba16_post_wb:unmap"},
                 {(int)unregisterRc, "gl_rgba16_post_wb:unregister"},
+                {(int)drainRc, "gl_rgba16_post_wb:present_drain"},
             };
             IGPU_CUDA_ERROR_NOTE_EVALUATED(evaluated);
             /* r8: the scratch free (it notes its own code) now follows these notes. */
@@ -2095,6 +2220,10 @@ int copy_rgb16_to_gl_rgba16_texture_post_wb_undo(const uint16_t * dRgb16,
                 std::fprintf(stderr,
                              "[igpu_amaze_debayer_cuda] cudaGraphicsUnmapResources(GL_RGBA16 post-WB texture) failed: %s\n",
                              cudaGetErrorString(unmapRc));
+            if (drainRc != cudaSuccess)
+                std::fprintf(stderr,
+                             "[igpu_amaze_debayer_cuda] present-stream drain (GL_RGBA16 post-WB texture) failed: %s\n",
+                             cudaGetErrorString(drainRc));
             if (unregisterRc != cudaSuccess)
                 std::fprintf(stderr,
                              "[igpu_amaze_debayer_cuda] cudaGraphicsUnregisterResource(GL_RGBA16 post-WB texture) failed: %s\n",
@@ -2130,6 +2259,7 @@ extern "C" void igpu_amaze_debayer_destroy(igpu_amaze_debayer_backend * backend)
     if (backend) free_probe_and_kick(backend);
     free_input_capture(backend);
     free_live_texture_buffers(backend);
+    free_present_stream(backend);
     delete backend;
     igpu_lt::teardown("destroy");
 }
@@ -2392,15 +2522,20 @@ extern "C" int igpu_amaze_debayer_run_post_wb_gl_texture_from_r16_gl_texture(
 
     const double totalStart = now_ms();
     igpu_lt::FrameScope lt_frame(width, height);
+    /* r3: the GUI present stream (nullptr = the kill switch is off: stream 0, the pre-r3 calls). */
+    cudaStream_t present = nullptr;
     try
     {
         ensure_live_texture_buffers(backend, width, height);
+        present = live_present_stream(backend);
         const double uploadStart = now_ms();
+        /* r3: the upload drains its own stream before it returns (the tile streams read liveReconBayer16 next). */
         const int copyRc = copy_gl_r16_texture_to_bayer16(in_r16_gl_texture,
                                                           backend->liveReconBayer16,
                                                           width,
                                                           height,
-                                                          &backend->liveInputR16Resource);
+                                                          &backend->liveInputR16Resource,
+                                                          present);
         if (copyRc != 0) return copyRc;
         backend->lastTiming.upload_ms = now_ms() - uploadStart;
 
@@ -2425,15 +2560,19 @@ extern "C" int igpu_amaze_debayer_run_post_wb_gl_texture_from_r16_gl_texture(
             wb_multiplier_g,
             wb_multiplier_b,
             live_fast_launch_checks_from_env(),
-            probe);
+            probe,
+            present,
+            present ? backend->presentProducerDone : nullptr);
         stop_clock_kick_for_live_run(backend);
         const uint16_t * packRgb16 = backend->liveRgb16;
         if (hnyquist)
         {
+            /* r3: the filter's output is what the pack and copy read: it MOVES WITH them onto the present stream. */
             launch_reduced_hnyquist121(backend->liveRgb16,
                                        backend->liveRgb16Hnyquist,
                                        width,
-                                       height);
+                                       height,
+                                       present);
             CK(cudaGetLastError());
             packRgb16 = backend->liveRgb16Hnyquist;
         }
@@ -2447,7 +2586,8 @@ extern "C" int igpu_amaze_debayer_run_post_wb_gl_texture_from_r16_gl_texture(
                     width,
                     height,
                     out_rgba16_gl_texture,
-                    &backend->liveOutputRgba16Resource)
+                    &backend->liveOutputRgba16Resource,
+                    present)
                 : copy_rgb16_to_gl_rgba16_texture_post_wb_undo(
                     packRgb16,
                     width,
@@ -2458,7 +2598,9 @@ extern "C" int igpu_amaze_debayer_run_post_wb_gl_texture_from_r16_gl_texture(
                     wb_multiplier_g,
                     wb_multiplier_b,
                     backend->liveRgba16,
-                    &backend->liveOutputRgba16Resource);
+                    &backend->liveOutputRgba16Resource,
+                    present);
+        if (rc != 0) drain_present_stream_after_failure(present, "live_r16:present_drain");
         backend->lastTiming.download_ms = now_ms() - handoffStart;
         backend->lastTiming.total_ms = now_ms() - totalStart;
         /* Row 0: device_ms and mhz_after, after every timing field (armed runs only) */
@@ -2469,6 +2611,7 @@ extern "C" int igpu_amaze_debayer_run_post_wb_gl_texture_from_r16_gl_texture(
     catch (const CudaStageProbeError & error)
     {
         std::fprintf(stderr, "[igpu_amaze_debayer_cuda] %s\n", error.what());
+        drain_present_stream_after_failure(present, "live_r16:present_drain");
         backend->lastTiming.total_ms = now_ms() - totalStart;
         return -2;
     }
@@ -2499,9 +2642,12 @@ extern "C" int igpu_amaze_debayer_run_post_wb_gl_texture_from_device_bayer16(
 
     const double totalStart = now_ms();
     igpu_lt::FrameScope lt_frame(width, height);
+    /* r3: the GUI present stream (nullptr = the kill switch is off: stream 0, the pre-r3 calls). */
+    cudaStream_t present = nullptr;
     try
     {
         ensure_live_texture_buffers(backend, width, height);
+        present = live_present_stream(backend);
         backend->lastTiming.upload_ms = 0.0;
 
         /* PLAYBACK-STARTUP-WAIT-S1-FIRST-AMAZE-AT-PLAY-1 Row 0: armed runs only, outside kernel_ms. */
@@ -2525,15 +2671,19 @@ extern "C" int igpu_amaze_debayer_run_post_wb_gl_texture_from_device_bayer16(
             wb_multiplier_g,
             wb_multiplier_b,
             live_fast_launch_checks_from_env(),
-            probe);
+            probe,
+            present,
+            present ? backend->presentProducerDone : nullptr);
         stop_clock_kick_for_live_run(backend);
         const uint16_t * packRgb16 = backend->liveRgb16;
         if (hnyquist)
         {
+            /* r3: the filter's output is what the pack and copy read: it MOVES WITH them onto the present stream. */
             launch_reduced_hnyquist121(backend->liveRgb16,
                                        backend->liveRgb16Hnyquist,
                                        width,
-                                       height);
+                                       height,
+                                       present);
             CK(cudaGetLastError());
             packRgb16 = backend->liveRgb16Hnyquist;
         }
@@ -2547,7 +2697,8 @@ extern "C" int igpu_amaze_debayer_run_post_wb_gl_texture_from_device_bayer16(
                     width,
                     height,
                     out_rgba16_gl_texture,
-                    &backend->liveOutputRgba16Resource)
+                    &backend->liveOutputRgba16Resource,
+                    present)
                 : copy_rgb16_to_gl_rgba16_texture_post_wb_undo(
                     packRgb16,
                     width,
@@ -2558,7 +2709,9 @@ extern "C" int igpu_amaze_debayer_run_post_wb_gl_texture_from_device_bayer16(
                     wb_multiplier_g,
                     wb_multiplier_b,
                     backend->liveRgba16,
-                    &backend->liveOutputRgba16Resource);
+                    &backend->liveOutputRgba16Resource,
+                    present);
+        if (rc != 0) drain_present_stream_after_failure(present, "live_device:present_drain");
         backend->lastTiming.download_ms = now_ms() - handoffStart;
         backend->lastTiming.total_ms = now_ms() - totalStart;
         /* Row 0: device_ms and mhz_after, after every timing field (armed runs only) */
@@ -2569,6 +2722,7 @@ extern "C" int igpu_amaze_debayer_run_post_wb_gl_texture_from_device_bayer16(
     catch (const CudaStageProbeError & error)
     {
         std::fprintf(stderr, "[igpu_amaze_debayer_cuda] %s\n", error.what());
+        drain_present_stream_after_failure(present, "live_device:present_drain");
         backend->lastTiming.total_ms = now_ms() - totalStart;
         return -2;
     }

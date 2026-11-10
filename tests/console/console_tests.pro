@@ -109,6 +109,7 @@ SOURCES += \
     $$REPO_ROOT/tests/console/test_gpu_field_telemetry.cpp \
     $$REPO_ROOT/tests/console/test_gpu_device_loss_breaker.cpp \
     $$REPO_ROOT/tests/console/test_gpu_launch_budget.cpp \
+    $$REPO_ROOT/tests/console/test_amaze_present_stream.cpp \
     $$REPO_ROOT/tests/console/test_playback_present_trace.cpp \
     $$REPO_ROOT/tests/console/test_playback_scopes_during_playback.cpp \
     $$REPO_ROOT/tests/console/test_playback_scale_label.cpp \
@@ -183,6 +184,7 @@ HEADERS += \
     $$REPO_ROOT/platform/qt/DisplayDeviceMapping.h \
     $$REPO_ROOT/tools/gpu/backend/igpu_launch_timing_format.h \
     $$REPO_ROOT/tools/gpu/backend/igpu_launch_budget.h \
+    $$REPO_ROOT/tools/gpu/backend/igpu_amaze_present_stream.h \
     $$REPO_ROOT/platform/qt/GpuFieldTelemetryCore.h \
     $$REPO_ROOT/platform/qt/GpuDeviceLossBreakerCore.h \
     $$REPO_ROOT/platform/qt/VisualCaptureSourceDifference.h \

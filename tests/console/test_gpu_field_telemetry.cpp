@@ -282,8 +282,11 @@ int noteSites(const QString & source)
 // PLAYBACK-STARTUP-WAIT-S1-FIRST-AMAZE-AT-PLAY-1: AMaZE 49 = 17 macro notes (+11: the Row 0 probe's host_alloc,
 // device_pointer, sm_clock, event_create, elapsed, event_start, event_join; the Row K kick's stream, host_alloc,
 // launch, submit) + the same 32 evaluated entries.
+// HFR-NATIVE-M16-1457-GUI-TEXTURE-PRESENT-OFFLOAD-1 r3 (the present stream): AMaZE 53 = 18 macro notes (+1: the
+// live entries' failure-path drain, drain_present_stream_after_failure) + 35 evaluated entries (+3: each live GL
+// copy's present_drain, after its unmap).
 constexpr int kReconNotes = 27;
-constexpr int kAmazeNotes = 49;
+constexpr int kAmazeNotes = 53;
 
 QStringList failureCensus(const QString & recon, const QString & amaze)
 {
@@ -727,7 +730,7 @@ TEST(GpuFieldTelemetry, CudaFailureBranchesNoteTheCodeAndAddNoSync)
         ASSERT_TRUE(amaze.contains(QString::fromLatin1(note)));
     // PLAYBACK-STARTUP-WAIT-S1-FIRST-AMAZE-AT-PLAY-1: + 11 macro notes (probe:* x7, clock_kick:* x4), each in its
     // rc != cudaSuccess branch
-    ASSERT_EQ(49, noteSites(amaze)); // exact (r8 38, r7 22)
+    ASSERT_EQ(53, noteSites(amaze)); // exact (r3 present stream +4; r8 38, r7 22)
     ASSERT_EQ(27, noteSites(recon)); // r8: exact (r7 17)
     // r3: the exact counts and the brace-scope check (FailureCensusIsExactAndBraceScoped).
     ASSERT_EQ(std::string(), failureCensus(recon, amaze).join(QStringLiteral("; ")).toStdString());
@@ -958,7 +961,7 @@ TEST(GpuFieldTelemetry, FailureCensusIsExactAndBraceScoped)
     ASSERT_EQ(kReconNotes, noteSites(recon));
     ASSERT_EQ(kAmazeNotes, noteSites(amaze));
     ASSERT_EQ(24, (int)recon.count(QStringLiteral("IGPU_CUDA_ERROR_NOTE(")));  // r8: + 3 evaluated entries
-    ASSERT_EQ(17, (int)amaze.count(QStringLiteral("IGPU_CUDA_ERROR_NOTE(")));  // + 32 evaluated entries (r8 6; FIRST-AMAZE-AT-PLAY-1 +11)
+    ASSERT_EQ(18, (int)amaze.count(QStringLiteral("IGPU_CUDA_ERROR_NOTE(")));  // + 35 evaluated entries (r8 6; FIRST-AMAZE-AT-PLAY-1 +11; r3 present stream +1)
     ASSERT_EQ(std::string(), failureCensus(recon, amaze).join(QStringLiteral("; ")).toStdString());
 
     // Mutation 1 (sol's replay): drop the preupload:submit note -> recon count 26.
@@ -966,7 +969,7 @@ TEST(GpuFieldTelemetry, FailureCensusIsExactAndBraceScoped)
     ASSERT_EQ(std::string("recon notes 26 != 27"), failureCensus(noSubmit, amaze).join(QStringLiteral("; ")).toStdString());
     // Mutation 2: drop one AMaZE note -> one short (r8: the register note; the map note is an evaluated entry).
     const QString noMap = replacedOnce(amaze, QStringLiteral("            IGPU_CUDA_ERROR_NOTE(rc, \"gl_r16_in:register\");\n"), QString());
-    ASSERT_EQ(std::string("amaze notes 48 != 49"), failureCensus(recon, noMap).join(QStringLiteral("; ")).toStdString());
+    ASSERT_EQ(std::string("amaze notes 52 != 53"), failureCensus(recon, noMap).join(QStringLiteral("; ")).toStdString());
     // Mutation 3 (fable's repro): the note moved after an early-return failure check, into the
     // success path. Same count; the old 4-line context check accepted it.
     const QString earlyReturn = replacedOnce(recon,
@@ -1019,17 +1022,20 @@ QStringList glCopyCensus(const QString & recon, const QString & amaze)
           "{(int)unmap_error, \"gl_r16:unmap\"},"}, 1},
         {"amaze", "int copy_gl_r16_texture_to_bayer16(", "const cudaError_t unregisterRc =",
          {"{(int)arrayRc, \"gl_r16_in:mapped_array\"},", "{(int)rc, \"gl_r16_in:copy_from_array\"},",
-          "{(int)unmapRc, \"gl_r16_in:unmap\"},", "{(int)unregisterRc, \"gl_r16_in:unregister\"},"}, 2},
+          "{(int)unmapRc, \"gl_r16_in:unmap\"},", "{(int)unregisterRc, \"gl_r16_in:unregister\"},",
+          "{(int)drainRc, \"gl_r16_in:present_drain\"},"}, 2},
         {"amaze", "int copy_rgb16_to_gl_rgba16_texture(", "const cudaError_t freeRc =",
          {"{(int)arrayRc, \"gl_rgba16:mapped_array\"},", "{(int)rc, \"gl_rgba16:copy_to_array\"},",
           "{(int)unmapRc, \"gl_rgba16:unmap\"},", "{(int)unregisterRc, \"gl_rgba16:unregister\"},",
           "{(int)freeRc, \"gl_rgba16:free\"},"}, 4},
         {"amaze", "int copy_rgba16_to_gl_rgba16_texture(", "const cudaError_t unregisterRc =",
          {"{(int)arrayRc, \"gl_rgba16_direct:mapped_array\"},", "{(int)rc, \"gl_rgba16_direct:copy_to_array\"},",
-          "{(int)unmapRc, \"gl_rgba16_direct:unmap\"},", "{(int)unregisterRc, \"gl_rgba16_direct:unregister\"},"}, 3},
+          "{(int)unmapRc, \"gl_rgba16_direct:unmap\"},", "{(int)unregisterRc, \"gl_rgba16_direct:unregister\"},",
+          "{(int)drainRc, \"gl_rgba16_direct:present_drain\"},"}, 3},
         {"amaze", "int copy_rgb16_to_gl_rgba16_texture_post_wb_undo(", "const cudaError_t unregisterRc =",
          {"{(int)arrayRc, \"gl_rgba16_post_wb:mapped_array\"},", "{(int)rc, \"gl_rgba16_post_wb:copy_to_array\"},",
-          "{(int)unmapRc, \"gl_rgba16_post_wb:unmap\"},", "{(int)unregisterRc, \"gl_rgba16_post_wb:unregister\"},"}, 3},
+          "{(int)unmapRc, \"gl_rgba16_post_wb:unmap\"},", "{(int)unregisterRc, \"gl_rgba16_post_wb:unregister\"},",
+          "{(int)drainRc, \"gl_rgba16_post_wb:present_drain\"},"}, 3},
     };
     QStringList problems;
     for (const GlCopyHelper & h : helpers)
@@ -1070,11 +1076,12 @@ TEST(GpuFieldTelemetry, GlCopiesNoteEveryEvaluatedCodeBeforeAnyReturn)
     const QString recon = readRepoFile(QStringLiteral("tools/gpu/backend/igpu_recon_cuda.cu"));
     const QString amaze = readRepoFile(QStringLiteral("tools/gpu/backend/igpu_amaze_debayer_cuda.cu"));
     ASSERT_EQ(std::string(), glCopyCensus(recon, amaze).join(QStringLiteral("; ")).toStdString());
-    // 3 recon + 32 AMaZE evaluated entries (r7: 2 + 12), all inside the five GL copies.
+    // 3 recon + 35 AMaZE evaluated entries (r7: 2 + 12; r3: + the three live copies' present_drain), all inside the
+    // five GL copies.
     int entries = 0;
     for (const QString * source : {&recon, &amaze})
         for (QRegularExpressionMatchIterator it = evaluatedEntry().globalMatch(*source); it.hasNext(); it.next()) ++entries;
-    ASSERT_EQ(35, entries);
+    ASSERT_EQ(38, entries);
     int inCopies = 0;
     for (const char * signature : {"int copy_gl_r16_texture_to_bayer16(", "int copy_rgb16_to_gl_rgba16_texture(",
                                    "int copy_rgba16_to_gl_rgba16_texture(", "int copy_rgb16_to_gl_rgba16_texture_post_wb_undo("})
@@ -1082,7 +1089,7 @@ TEST(GpuFieldTelemetry, GlCopiesNoteEveryEvaluatedCodeBeforeAnyReturn)
              it.hasNext(); it.next()) ++inCopies;
     for (QRegularExpressionMatchIterator it = evaluatedEntry().globalMatch(
              functionText(recon, QStringLiteral("static int copy_bayer16_to_gl_r16_texture("))); it.hasNext(); it.next()) ++inCopies;
-    ASSERT_EQ(35, inCopies);
+    ASSERT_EQ(38, inCopies);
     // The helper the DLLs share: host-only, and it looks a name up for a failing code only.
     const QString slot = readRepoFile(QStringLiteral("tools/gpu/backend/igpu_cuda_error_slot.h"));
     ASSERT_TRUE(slot.contains(QStringLiteral(
