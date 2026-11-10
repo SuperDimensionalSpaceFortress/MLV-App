@@ -27,6 +27,7 @@
 
 #include <cmath>
 #include <cstdio>
+#include <map>
 #include <memory>
 #include <vector>
 
@@ -3794,6 +3795,257 @@ TEST(LookAssistScene, SafetyColorCastWarningLadder)
     ASSERT_TRUE( lookAssistColorCastWarning( true, s, 0.0, 5201, 4.0 ) == QStringLiteral("none") );
     ASSERT_TRUE( lookAssistColorCastWarning( true, s, 0.0, 6800, -4.0 ) == QStringLiteral("warm-amber-cast") );
     ASSERT_TRUE( lookAssistColorCastWarning( true, s, 0.0, 6799, -4.0 ) == QStringLiteral("none") );
+}
+
+// ---- 793-I1 / 793-F1 (Dot, bus 670beb8): the RetreatExposure ORCHESTRATION, through the seam the GUI calls
+// (lookAssistRunSafetyRetreat; MainWindow.cpp is not linked into console_tests, so the GUI's use of it is pinned as
+// text below). The rig is the live look: applyExposure moves the exposure only, measure returns the scripted
+// measurement of the exposure on screen, tagged (balanceSamples = 1000 + exposure) so the test can tell them apart.
+namespace
+{
+struct RetreatRigLook
+{
+    int exposure = 380;
+    int contrast = 14;
+    int pivot = 46;
+    int shadows = 32;
+    int highlights = -26;
+    int vibrance = 3;
+    int temperatureDelta = -150;
+    int tintDelta = 7;
+    QString grade = QStringLiteral("film-grade-cinematic");
+    bool sameExceptExposure( const RetreatRigLook &o ) const
+    {
+        return contrast == o.contrast && pivot == o.pivot && shadows == o.shadows && highlights == o.highlights
+            && vibrance == o.vibrance && temperatureDelta == o.temperatureDelta && tintDelta == o.tintDelta
+            && grade == o.grade;
+    }
+};
+LookAssistRetreatMeasurement retreatMeasured( int exposure, bool valid, const char *warning, double visible,
+                                              double ratio, double axis )
+{
+    LookAssistRetreatMeasurement m;
+    m.valid = valid;
+    m.warning = QString::fromLatin1( warning );
+    m.visibleGreenAxis = visible;
+    m.stats.greenArtifactRatio = ratio;
+    m.stats.greenArtifactMeanAxis = axis;
+    m.stats.balanceSamples = 1000 + exposure;
+    return m;
+}
+// M16-1456-shaped: clean (the logged before-lift line) and green over the fail-closed line (the logged after-lift line).
+LookAssistRetreatMeasurement retreatClean( int exposure )
+{
+    return retreatMeasured( exposure, true, "none", 5.646, 0.029882, 31.326 );
+}
+LookAssistRetreatMeasurement retreatGreen( int exposure )
+{
+    return retreatMeasured( exposure, true, "localized-green-artifact", 15.936, 0.264442, 45.833 );
+}
+struct RetreatRig
+{
+    RetreatRigLook look;
+    std::map<int, LookAssistRetreatMeasurement> byExposure;
+    QVector<int> applied;
+    QVector<int> measured;
+    LookAssistRetreatOutcome run( int appliedExposure, int baselineExposure )
+    {
+        look.exposure = appliedExposure;
+        return lookAssistRunSafetyRetreat(
+            appliedExposure, baselineExposure,
+            [this]( int exposure ) { look.exposure = exposure; applied.append( exposure ); },
+            [this]() -> LookAssistRetreatMeasurement
+            {
+                measured.append( look.exposure );
+                const auto it = byExposure.find( look.exposure );
+                return it == byExposure.end() ? LookAssistRetreatMeasurement() : it->second;
+            } );
+    }
+};
+}
+
+// I1 (1) An invalid bottom and a warned bottom: one measurement, no rung, RevertBaseline (the caller reverts the whole
+// look), and the log says kept_exposure=none ... kept_warning=reverted.
+TEST(LookAssistScene, SafetyRetreatOrchestrationRevertsOnAnInvalidOrWarnedBottom)
+{
+    const LookAssistRetreatMeasurement bottoms[] = {
+        retreatMeasured( 0, false, "none", 0.0, 0.0, 0.0 ),                       // invalid
+        retreatMeasured( 0, true, "global-magenta-cast", -9.0, 0.0, 0.0 ),        // warned (not green)
+        retreatGreen( 0 ),                                                        // warned (green: not the lift's)
+    };
+    for( const LookAssistRetreatMeasurement &bottom : bottoms )
+    {
+        RetreatRig rig;
+        rig.byExposure[0] = bottom;
+        rig.byExposure[190] = retreatClean( 190 );
+        const LookAssistRetreatOutcome out = rig.run( 380, 0 );
+        ASSERT_TRUE( out.action == LookAssistSafetyAction::RevertBaseline );
+        ASSERT_FALSE( out.rungKept );
+        ASSERT_EQ( 1, out.measurements );
+        ASSERT_EQ( 1, rig.applied.size() );
+        ASSERT_EQ( 0, rig.applied.at( 0 ) );
+        ASSERT_EQ( 0, out.triedRungs.size() );
+        const QString log = lookAssistSafetyRetreatLogFields( QStringLiteral("localized-green-artifact"), 380, 0, out, 7 );
+        ASSERT_TRUE( log.contains( QStringLiteral(" kept_exposure=none rungs_tried=0 rungs=none kept_warning=reverted frame=7") ) );
+        ASSERT_TRUE( log.contains( QStringLiteral(" bottom_warning=") + bottom.warning + QStringLiteral(" ") ) );
+    }
+}
+
+// I1 (2) The first rung (190, half the excess) is clean: it is kept, two measurements, and it is what is on screen.
+TEST(LookAssistScene, SafetyRetreatOrchestrationKeepsTheFirstCleanRung)
+{
+    RetreatRig rig;
+    rig.byExposure[0] = retreatClean( 0 );
+    rig.byExposure[190] = retreatClean( 190 );
+    rig.byExposure[95] = retreatClean( 95 );
+    const LookAssistRetreatOutcome out = rig.run( 380, 0 );
+    ASSERT_TRUE( out.action == LookAssistSafetyAction::Keep );
+    ASSERT_TRUE( out.rungKept );
+    ASSERT_EQ( 190, out.shownExposure );
+    ASSERT_EQ( 190, rig.look.exposure );
+    ASSERT_EQ( 1190, out.shown.stats.balanceSamples );
+    ASSERT_EQ( 2, out.measurements );
+    ASSERT_TRUE( rig.applied == ( QVector<int>{ 0, 190 } ) );
+    ASSERT_TRUE( rig.measured == ( QVector<int>{ 0, 190 } ) );
+}
+
+// I1 (3) The first rung is still over the fail-closed line, the second (95) is clean: the second is kept.
+TEST(LookAssistScene, SafetyRetreatOrchestrationKeepsTheSecondRungWhenTheFirstFails)
+{
+    RetreatRig rig;
+    rig.byExposure[0] = retreatClean( 0 );
+    rig.byExposure[190] = retreatGreen( 190 );
+    rig.byExposure[95] = retreatClean( 95 );
+    const LookAssistRetreatOutcome out = rig.run( 380, 0 );
+    ASSERT_TRUE( out.action == LookAssistSafetyAction::Keep );
+    ASSERT_TRUE( out.rungKept );
+    ASSERT_EQ( 95, out.shownExposure );
+    ASSERT_EQ( 95, rig.look.exposure );
+    ASSERT_EQ( 1095, out.shown.stats.balanceSamples );
+    ASSERT_EQ( 3, out.measurements );
+    ASSERT_TRUE( rig.applied == ( QVector<int>{ 0, 190, 95 } ) );
+    ASSERT_EQ( 2, out.triedRungs.size() );
+    ASSERT_TRUE( out.triedRungs.at( 0 ) == QStringLiteral("190:15.936:0.264442") );
+    ASSERT_TRUE( out.triedRungs.at( 1 ) == QStringLiteral("95:5.646:0.029882") );
+}
+
+// I1 (4) Both rungs fail: the baseline exposure is applied again WITHOUT a fourth measurement, and the outcome reports
+// the measured bottom (its tag), not the last failing rung's stats.
+TEST(LookAssistScene, SafetyRetreatOrchestrationRestoresTheMeasuredBottomWhenBothRungsFail)
+{
+    RetreatRig rig;
+    rig.byExposure[0] = retreatClean( 0 );
+    rig.byExposure[190] = retreatGreen( 190 );
+    rig.byExposure[95] = retreatGreen( 95 );
+    const LookAssistRetreatOutcome out = rig.run( 380, 0 );
+    ASSERT_TRUE( out.action == LookAssistSafetyAction::Keep );
+    ASSERT_FALSE( out.rungKept );
+    ASSERT_EQ( 0, out.shownExposure );
+    ASSERT_EQ( 0, rig.look.exposure );
+    ASSERT_TRUE( rig.applied == ( QVector<int>{ 0, 190, 95, 0 } ) );
+    ASSERT_TRUE( rig.measured == ( QVector<int>{ 0, 190, 95 } ) );
+    ASSERT_EQ( 3, out.measurements );
+    ASSERT_EQ( 1000, out.shown.stats.balanceSamples );
+    ASSERT_TRUE( out.shown.warning == QStringLiteral("none") );
+    const QString log = lookAssistSafetyRetreatLogFields( QStringLiteral("localized-green-artifact"), 380, 0, out, 0 );
+    ASSERT_TRUE( log.contains( QStringLiteral(" kept_exposure=0 rungs_tried=2 ") ) );
+    ASSERT_TRUE( log.contains( QStringLiteral(" kept_warning=none frame=0") ) );
+}
+
+// I1 (5) Only the exposure moves, on every path: the rig's other sliders and the film grade are untouched, and the GUI's
+// applyExposure callback sets preset.exposure and re-applies, nothing else (pinned as text: MainWindow.cpp is not linked).
+TEST(LookAssistScene, SafetyRetreatOrchestrationChangesNothingButTheExposure)
+{
+    const LookAssistRetreatMeasurement rung190[] = { retreatClean( 190 ), retreatGreen( 190 ) };
+    const LookAssistRetreatMeasurement bottoms[] = { retreatClean( 0 ), retreatGreen( 0 ) };
+    for( const LookAssistRetreatMeasurement &bottom : bottoms )
+    {
+        for( const LookAssistRetreatMeasurement &first : rung190 )
+        {
+            RetreatRig rig;
+            const RetreatRigLook before = rig.look;
+            rig.byExposure[0] = bottom;
+            rig.byExposure[190] = first;
+            rig.byExposure[95] = retreatGreen( 95 );
+            rig.run( 380, 0 );
+            ASSERT_TRUE( rig.look.sameExceptExposure( before ) );
+        }
+    }
+    const QString window = readRepoFile( QStringLiteral("platform/qt/MainWindow.cpp") );
+    ASSERT_FALSE( window.isEmpty() );
+    ASSERT_EQ( 1, window.count( QStringLiteral("lookAssistRunSafetyRetreat(") ) );
+    ASSERT_EQ( 1, window.count( QStringLiteral("[&]( int exposure ) { preset.exposure = exposure; applyLookAssistValues(); },") ) );
+    // The GUI no longer runs a retreat loop of its own.
+    ASSERT_EQ( 0, window.count( QStringLiteral("lookAssistSafetyRetreatRungs(") ) );
+}
+
+// I1 (6) + F1: receipt, diagnostics, the safety_retreat line and the FINAL picture all describe the same rung. The
+// 380 -> 190 path: kept_exposure=190, and the picture dump binds look-assist-final-frameN.png to 190 while the
+// pre-safety file keeps 380 under its own name. In the GUI the final picture is taken AFTER the retreat (and after the
+// revert), and the diagnostics are copied from the outcome the seam returned.
+TEST(LookAssistScene, SafetyRetreatOrchestrationFinalPictureReceiptAndDiagnosticsAgree)
+{
+    RetreatRig rig;
+    rig.byExposure[0] = retreatClean( 0 );
+    rig.byExposure[190] = retreatClean( 190 );
+    const LookAssistRetreatOutcome out = rig.run( 380, 0 );
+    ASSERT_EQ( 190, out.shownExposure );
+    const QString log = lookAssistSafetyRetreatLogFields( QStringLiteral("localized-green-artifact"), 380, 0, out, 3 );
+    ASSERT_TRUE( log == QStringLiteral("first_warning=localized-green-artifact applied_exposure=380 baseline_exposure=0 bottom_warning=none bottom_visible_green_axis=5.646 bottom_green_ratio=0.029882 kept_exposure=190 rungs_tried=1 rungs=190:5.646:0.029882 kept_warning=none frame=3") );
+    const QString dump = lookAssistPictureDumpFields( 3, 380, rig.look.exposure, QStringLiteral("retreat") );
+    ASSERT_TRUE( dump == QStringLiteral("pre_safety=look-assist-pre-safety-frame3.png pre_safety_exposure=380 final=look-assist-final-frame3.png final_exposure=190 safety=retreat frame=3") );
+    ASSERT_TRUE( lookAssistPictureDumpFileName( true, 0 ) == QStringLiteral("look-assist-final-frame0.png") );   // check_look_assist_profile_states.py
+    ASSERT_TRUE( lookAssistPictureDumpFileName( false, 0 ) == QStringLiteral("look-assist-pre-safety-frame0.png") );
+
+    const QString window = readRepoFile( QStringLiteral("platform/qt/MainWindow.cpp") );
+    ASSERT_FALSE( window.isEmpty() );
+    // The final name is only ever written through dumpFinalPicture, after the seam, on both landings.
+    ASSERT_EQ( 0, window.count( QStringLiteral("\"look-assist-final-frame") ) );   // no literal of its own (88d33de0 had one)
+    ASSERT_EQ( 1, window.count( QStringLiteral("dumpLivePicture( lookAssistPictureDumpFileName( true, analysisFrame ) );") ) );
+    ASSERT_EQ( 1, window.count( QStringLiteral("dumpLivePicture( lookAssistPictureDumpFileName( false, analysisFrame ) );") ) );
+    const int seamAt = window.indexOf( QStringLiteral("lookAssistRunSafetyRetreat(") );
+    const int revertAt = window.indexOf( QStringLiteral("restoreLookAssistSafetyBaseline( receipt, safeChromaSmooth, safeChromaSmoothAuto );") );
+    const int finalRevertAt = window.indexOf( QStringLiteral("dumpFinalPicture( receipt->exposure(), QStringLiteral(\"revert\") );") );
+    const int finalKeepAt = window.indexOf( QStringLiteral("dumpFinalPicture( receipt->exposure(), retreatKept ? QStringLiteral(\"retreat\") : QStringLiteral(\"keep\") );") );
+    const int preAt = window.indexOf( QStringLiteral("dumpLivePicture( lookAssistPictureDumpFileName( false, analysisFrame ) );") );
+    ASSERT_TRUE( preAt > 0 );
+    ASSERT_TRUE( seamAt > preAt );
+    ASSERT_TRUE( revertAt > seamAt );
+    ASSERT_TRUE( finalRevertAt > revertAt );
+    ASSERT_TRUE( finalKeepAt > finalRevertAt );
+    // The diagnostics and the log line are the outcome's.
+    ASSERT_EQ( 1, window.count( QStringLiteral("m_lastLookAssistExposure = retreat.shownExposure;") ) );
+    ASSERT_EQ( 1, window.count( QStringLiteral("postColorStats = retreat.shown.stats;") ) );
+    ASSERT_EQ( 1, window.count( QStringLiteral("m_lastLookAssistColorCastWarning = retreat.shown.warning;") ) );
+    ASSERT_EQ( 1, window.count( QStringLiteral("lookAssistSafetyRetreatLogFields( firstWarning, appliedExposure, baselineExposure, retreat, analysisFrame )") ) );
+}
+
+// I1 (7) Never more than three measurements (the bottom plus at most two rungs), whatever the exposures and however
+// every rung measures; exactly 1 + rungs tried.
+TEST(LookAssistScene, SafetyRetreatOrchestrationMeasuresAtMostThreeTimes)
+{
+    const int pairs[][2] = { { 380, 0 }, { 5, 0 }, { 2, 0 }, { 1, 0 }, { 300, 100 }, { 2000, -500 }, { 0, 0 } };
+    for( const auto &pair : pairs )
+    {
+        for( int rungsClean = 0; rungsClean < 2; ++rungsClean )
+        {
+            RetreatRig rig;
+            rig.byExposure[pair[1]] = retreatClean( pair[1] );
+            for( const int rung : lookAssistSafetyRetreatRungs( pair[0], pair[1] ) )
+            {
+                rig.byExposure[rung] = rungsClean ? retreatClean( rung ) : retreatGreen( rung );
+            }
+            const LookAssistRetreatOutcome out = rig.run( pair[0], pair[1] );
+            ASSERT_TRUE( out.measurements <= 3 );
+            ASSERT_EQ( out.measurements, rig.measured.size() );
+            ASSERT_EQ( 1 + out.triedRungs.size(), out.measurements );
+            if( out.rungKept )
+                ASSERT_TRUE( lookAssistSafetyRetreatRungs( pair[0], pair[1] ).contains( out.shownExposure ) );
+            else
+                ASSERT_EQ( pair[1], out.shownExposure );
+            ASSERT_EQ( rig.look.exposure, out.shownExposure );
+        }
+    }
 }
 
 // r4 (Dot 2761667): the clip-share gate is inclusive. The lift is allowed at exactly 0.002 and refused at the

@@ -2,6 +2,7 @@
 #define LOOKASSISTANALYSIS_H
 
 #include <QString>
+#include <QStringList>
 #include <QVector>
 
 #include <functional>
@@ -952,6 +953,50 @@ LookAssistSafetyAction lookAssistSafetyAction( const QString &warning,
 
 /* The exposures a RetreatExposure tries between the applied and the baseline exposure, highest first. */
 QVector<int> lookAssistSafetyRetreatRungs( int appliedExposure, int baselineExposure );
+
+/* ---- The RetreatExposure orchestration (793-I1): the GUI's sync path calls exactly this, with its live look behind the
+ * two callbacks, so the order of renders and the state left on screen are testable headless. ----
+ * One post-applied measurement of the look on screen (the GUI: analyzePostAppliedLook plus its warning). */
+struct LookAssistRetreatMeasurement
+{
+    bool valid = false;
+    LookAssistStats stats;
+    QString warning = QStringLiteral("none");
+    double visibleGreenAxis = 0.0;
+};
+struct LookAssistRetreatOutcome
+{
+    /* Keep: a rung or the measured bottom is on screen. RevertBaseline: the bottom is invalid or warned (the green is
+     * not the lift's), so the caller reverts the whole look. */
+    LookAssistSafetyAction action = LookAssistSafetyAction::RevertBaseline;
+    LookAssistRetreatMeasurement bottom;
+    bool rungKept = false;
+    int shownExposure = 0;                  // the exposure applied last: the one on screen when this returns
+    LookAssistRetreatMeasurement shown;     // the measurement of that state (the bottom's own when it was restored)
+    QStringList triedRungs;                 // "exposure:visible_green_axis:green_artifact_ratio", in order
+    int measurements = 0;                   // renders measured; never more than 3
+};
+/* applyExposure changes the exposure of the live look and nothing else; measure measures the look on screen. Applies the
+ * baseline exposure and measures it (the bottom); when the bottom is valid and warning-free, tries each
+ * lookAssistSafetyRetreatRungs rung (apply + measure) and keeps the first that does not fail closed; when none does,
+ * re-applies the baseline exposure WITHOUT measuring it again and reports the bottom's measurement. */
+LookAssistRetreatOutcome lookAssistRunSafetyRetreat( int appliedExposure,
+                                                     int baselineExposure,
+                                                     const std::function<void( int exposure )> &applyExposure,
+                                                     const std::function<LookAssistRetreatMeasurement()> &measure );
+/* The fields of the look_assist.apply.safety_retreat line, from the outcome (kept_exposure is "none" on a revert). */
+QString lookAssistSafetyRetreatLogFields( const QString &firstWarning,
+                                          int appliedExposure,
+                                          int baselineExposure,
+                                          const LookAssistRetreatOutcome &outcome,
+                                          int frame );
+
+/* ---- The env-gated picture dump (793-F1, MLVAPP_LOOK_ASSIST_PICTURE_DUMP). The look before the safety handling and the
+ * look finally shown are two files; look-assist-final-frameN.png is always written AFTER the safety handling. ---- */
+QString lookAssistPictureDumpFileName( bool finalLook, int frame );
+/* The fields of the look_assist.apply.picture_dump line binding each file to the exposure it shows. safety is "keep",
+ * "retreat" or "revert". */
+QString lookAssistPictureDumpFields( int frame, int preSafetyExposure, int finalExposure, const QString &safety );
 
 } // namespace lookassist
 

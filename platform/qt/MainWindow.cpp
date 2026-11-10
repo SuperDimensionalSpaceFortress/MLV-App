@@ -19278,8 +19278,13 @@ void MainWindow::applyLookAssistToReceipt( ReceiptSettings *receipt,
     // [PICTURE-DUMP] env-gated, read-only evidence (MLVAPP_LOOK_ASSIST_PICTURE_DUMP=<dir>): the picture
     // the app itself renders (live processing, analysis thumbnail) at the look just applied, so a
     // reviewer can measure the REAL app's result in a state the headless fixture cannot reproduce.
-    // Writes one PNG and never touches the receipt, the sliders or the look.
-    if( canAnalyzeProcessedColor && qEnvironmentVariableIsSet( "MLVAPP_LOOK_ASSIST_PICTURE_DUMP" ) )
+    // Writes PNGs and never touches the receipt, the sliders or the look. 793-F1: this one is the look BEFORE the safety
+    // handling (look-assist-pre-safety-frameN.png); look-assist-final-frameN.png is written after it (dumpFinalPicture),
+    // and a look_assist.apply.picture_dump line binds each file to the exposure it shows.
+    const bool pictureDump = canAnalyzeProcessedColor && qEnvironmentVariableIsSet( "MLVAPP_LOOK_ASSIST_PICTURE_DUMP" );
+    const QString dumpDir = qEnvironmentVariable( "MLVAPP_LOOK_ASSIST_PICTURE_DUMP" );
+    const int preSafetyExposure = preset.exposure;
+    auto dumpLivePicture = [&]( const QString &fileName )
     {
         QByteArray dumpThumbnail;
         dumpThumbnail.resize( colorWidth * colorHeight * 3 );
@@ -19291,11 +19296,22 @@ void MainWindow::applyLookAssistToReceipt( ReceiptSettings *receipt,
                                                  qMax( 1, mlvappEffectiveWorkerThreadCount() ),
                                                  reinterpret_cast<unsigned char *>( dumpThumbnail.data() ) );
         } );
-        const QString dumpDir = qEnvironmentVariable( "MLVAPP_LOOK_ASSIST_PICTURE_DUMP" );
         QDir().mkpath( dumpDir );
         const QImage dumpImage( reinterpret_cast<const uchar *>( dumpThumbnail.constData() ),
                                 colorWidth, colorHeight, colorWidth * 3, QImage::Format_RGB888 );
-        dumpImage.save( QDir( dumpDir ).filePath( QStringLiteral("look-assist-final-frame%1.png").arg( analysisFrame ) ) );
+        dumpImage.save( QDir( dumpDir ).filePath( fileName ) );
+    };
+    // The look finally shown, after the safety keep/retreat/revert; finalExposure is the exposure the receipt carries.
+    auto dumpFinalPicture = [&]( int finalExposure, const QString &safety )
+    {
+        if( !pictureDump ) return;
+        dumpLivePicture( lookAssistPictureDumpFileName( true, analysisFrame ) );
+        logInteractionEvent( QStringLiteral("look_assist.apply.picture_dump"),
+                             lookAssistPictureDumpFields( analysisFrame, preSafetyExposure, finalExposure, safety ) );
+    };
+    if( pictureDump )
+    {
+        dumpLivePicture( lookAssistPictureDumpFileName( false, analysisFrame ) );
 
         // Optional: ALSO render explicit looks ("label:exp,contrast,pivot,shadows,highlights,vibrance,temp,tint;...")
         // on a private clone with the GUI slider mapping, so another build's logged result (e.g. master's) can
@@ -19535,6 +19551,7 @@ void MainWindow::applyLookAssistToReceipt( ReceiptSettings *receipt,
     {
         safetyAction = LookAssistSafetyAction::RevertBaseline;   // nothing to re-measure with (post stats imply it; defensive)
     }
+    bool retreatKept = false;
     if( safetyAction == LookAssistSafetyAction::RetreatExposure )
     {
         // LOOK-ASSIST-GREEN-ARTIFACT-FALLBACK-AT-LIFTED-EXPOSURE-1: a green warning over a neutral that stays neutral, at an
@@ -19545,52 +19562,27 @@ void MainWindow::applyLookAssistToReceipt( ReceiptSettings *receipt,
         const int appliedExposure = preset.exposure;
         const int baselineExposure = receipt->lookAssistBaselineExposure();
 
-        preset.exposure = baselineExposure;
-        applyLookAssistValues();
-        const bool bottomValid = analyzePostAppliedLook();
-        const LookAssistStats bottomStats = postColorStats;
-        const QString bottomWarning = postColorCastWarningOf( bottomValid, bottomStats );
-        const double bottomVisible = postVisibleGreenAxisOf( bottomValid, bottomStats );
-
-        QStringList triedRungs;
-        QString keptExposure = QStringLiteral("none");
-        if( bottomValid && bottomWarning == QStringLiteral("none") )
+        // 793-I1: the shared orchestration (LookAssistAnalysis), the live look behind its two callbacks. Only the
+        // exposure moves; at most three measurements.
+        const LookAssistRetreatOutcome retreat = lookAssistRunSafetyRetreat(
+            appliedExposure,
+            baselineExposure,
+            [&]( int exposure ) { preset.exposure = exposure; applyLookAssistValues(); },
+            [&]() -> LookAssistRetreatMeasurement
+            {
+                LookAssistRetreatMeasurement m;
+                m.valid = analyzePostAppliedLook();
+                m.stats = postColorStats;
+                m.warning = postColorCastWarningOf( m.valid, m.stats );
+                m.visibleGreenAxis = postVisibleGreenAxisOf( m.valid, m.stats );
+                return m;
+            } );
+        postColorStats = retreat.shown.stats;
+        if( retreat.action == LookAssistSafetyAction::Keep )
         {
-            bool rungKept = false;
-            for( const int rung : lookAssistSafetyRetreatRungs( appliedExposure, baselineExposure ) )
-            {
-                preset.exposure = rung;
-                applyLookAssistValues();
-                const bool rungValid = analyzePostAppliedLook();
-                const QString rungWarning = postColorCastWarningOf( rungValid, postColorStats );
-                const double rungVisible = postVisibleGreenAxisOf( rungValid, postColorStats );
-                triedRungs.append( QStringLiteral("%1:%2:%3")
-                                       .arg( rung )
-                                       .arg( rungVisible, 0, 'f', 3 )
-                                       .arg( rungValid ? postColorStats.greenArtifactRatio : 0.0, 0, 'f', 6 ) );
-                if( rungValid
-                 && !lookAssistColorCastShouldFailClosed( rungWarning,
-                                                          postColorStats.greenArtifactRatio,
-                                                          postColorStats.greenArtifactMeanAxis,
-                                                          rungVisible,
-                                                          true ) )
-                {
-                    postColorStatsValid = true;
-                    rungKept = true;
-                    break;
-                }
-            }
-            if( !rungKept )
-            {
-                // No rung passed: the baseline exposure is shown, described by its own (identical-settings) measurement.
-                preset.exposure = baselineExposure;
-                applyLookAssistValues();
-                postColorStats = bottomStats;
-                postColorStatsValid = bottomValid;
-            }
-            keptExposure = QString::number( preset.exposure );
+            postColorStatsValid = retreat.shown.valid;
             // Every diagnostic that describes the shown look now describes the kept rung.
-            m_lastLookAssistExposure = preset.exposure;
+            m_lastLookAssistExposure = retreat.shownExposure;
             m_lastLookAssistPostBalanceValid = postColorStatsValid;
             m_lastLookAssistPostBalanceR = postColorStatsValid ? postColorStats.balanceR : 0.0;
             m_lastLookAssistPostBalanceG = postColorStatsValid ? postColorStats.balanceG : 0.0;
@@ -19598,30 +19590,16 @@ void MainWindow::applyLookAssistToReceipt( ReceiptSettings *receipt,
             m_lastLookAssistPostBalanceSamples = postColorStatsValid ? postColorStats.balanceSamples : 0;
             m_lastLookAssistPostGreenArtifactRatio = postColorStatsValid ? postColorStats.greenArtifactRatio : 0.0;
             m_lastLookAssistPostGreenArtifactMeanAxis = postColorStatsValid ? postColorStats.greenArtifactMeanAxis : 0.0;
-            m_lastLookAssistPostVisibleGreenAxis = postVisibleGreenAxisOf( postColorStatsValid, postColorStats );
-            m_lastLookAssistColorCastWarning = postColorCastWarningOf( postColorStatsValid, postColorStats );
-            safetyAction = LookAssistSafetyAction::Keep;
+            m_lastLookAssistPostVisibleGreenAxis = retreat.shown.visibleGreenAxis;
+            m_lastLookAssistColorCastWarning = retreat.shown.warning;
+            retreatKept = true;
         }
-        else
-        {
-            // The baseline exposure is not clean either: the green is not the lift's. Revert exactly as before; the
-            // diagnostics keep describing the first (failing) look.
-            safetyAction = LookAssistSafetyAction::RevertBaseline;
-        }
+        // Keep: a rung or the measured bottom is on screen. RevertBaseline: the baseline exposure is not clean either
+        // (the green is not the lift's); revert exactly as before, the diagnostics keep describing the first look.
+        safetyAction = retreat.action;
         logInteractionEvent(
             QStringLiteral("look_assist.apply.safety_retreat"),
-            QStringLiteral("first_warning=%1 applied_exposure=%2 baseline_exposure=%3 bottom_warning=%4 bottom_visible_green_axis=%5 bottom_green_ratio=%6 kept_exposure=%7 rungs_tried=%8 rungs=%9 kept_warning=%10 frame=%11")
-                .arg( firstWarning )
-                .arg( appliedExposure )
-                .arg( baselineExposure )
-                .arg( bottomWarning )
-                .arg( bottomVisible, 0, 'f', 3 )
-                .arg( bottomValid ? bottomStats.greenArtifactRatio : 0.0, 0, 'f', 6 )
-                .arg( keptExposure )
-                .arg( triedRungs.size() )
-                .arg( triedRungs.isEmpty() ? QStringLiteral("none") : triedRungs.join( QLatin1Char(',') ) )
-                .arg( safetyAction == LookAssistSafetyAction::Keep ? m_lastLookAssistColorCastWarning : QStringLiteral("reverted") )
-                .arg( analysisFrame ) );
+            lookAssistSafetyRetreatLogFields( firstWarning, appliedExposure, baselineExposure, retreat, analysisFrame ) );
     }
     if( safetyAction == LookAssistSafetyAction::RevertBaseline )
     {
@@ -19658,9 +19636,11 @@ void MainWindow::applyLookAssistToReceipt( ReceiptSettings *receipt,
         m_lastLookAssistAutoWhiteBalanceDecision = QStringLiteral("rejected-safety-fallback");
         m_lastLookAssistChromaSmooth = toolButtonChromaSmoothCurrentIndex();
         syncLookAssistDerivedUiToReceipt( receipt );
+        dumpFinalPicture( receipt->exposure(), QStringLiteral("revert") );   // 793-F1: the baseline look now shown
         requestFrameRefresh( true, "look-assist-safety-fallback" );
         return;
     }
+    dumpFinalPicture( receipt->exposure(), retreatKept ? QStringLiteral("retreat") : QStringLiteral("keep") );   // 793-F1
 
     labelFollowsActiveSliders( receipt );   // r17 (adversary r17 4fcae002 A1): this landing grades the sliders
     m_lookAssistFlavorOutcome.landed( receipt, lookAssistFlavorName( flavor ), false );

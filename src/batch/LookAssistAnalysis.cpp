@@ -2391,4 +2391,91 @@ QVector<int> lookAssistSafetyRetreatRungs( int appliedExposure, int baselineExpo
     return rungs;
 }
 
+LookAssistRetreatOutcome lookAssistRunSafetyRetreat( int appliedExposure,
+                                                     int baselineExposure,
+                                                     const std::function<void( int exposure )> &applyExposure,
+                                                     const std::function<LookAssistRetreatMeasurement()> &measure )
+{
+    LookAssistRetreatOutcome out;
+    applyExposure( baselineExposure );
+    out.shownExposure = baselineExposure;
+    out.bottom = measure();
+    ++out.measurements;
+    out.shown = out.bottom;
+    if( !out.bottom.valid || out.bottom.warning != QStringLiteral("none") )
+    {
+        out.action = LookAssistSafetyAction::RevertBaseline;
+        return out;
+    }
+    for( const int rung : lookAssistSafetyRetreatRungs( appliedExposure, baselineExposure ) )
+    {
+        applyExposure( rung );
+        out.shownExposure = rung;
+        const LookAssistRetreatMeasurement m = measure();
+        ++out.measurements;
+        out.triedRungs.append( QStringLiteral("%1:%2:%3")
+                                   .arg( rung )
+                                   .arg( m.visibleGreenAxis, 0, 'f', 3 )
+                                   .arg( m.valid ? m.stats.greenArtifactRatio : 0.0, 0, 'f', 6 ) );
+        if( m.valid
+         && !lookAssistColorCastShouldFailClosed( m.warning,
+                                                  m.stats.greenArtifactRatio,
+                                                  m.stats.greenArtifactMeanAxis,
+                                                  m.visibleGreenAxis,
+                                                  true ) )
+        {
+            out.rungKept = true;
+            out.shown = m;
+            break;
+        }
+    }
+    if( !out.rungKept )
+    {
+        // No rung passed: the baseline exposure is shown, described by its own (identical-settings) measurement.
+        applyExposure( baselineExposure );
+        out.shownExposure = baselineExposure;
+        out.shown = out.bottom;
+    }
+    out.action = LookAssistSafetyAction::Keep;
+    return out;
+}
+
+QString lookAssistSafetyRetreatLogFields( const QString &firstWarning,
+                                          int appliedExposure,
+                                          int baselineExposure,
+                                          const LookAssistRetreatOutcome &outcome,
+                                          int frame )
+{
+    const bool kept = outcome.action == LookAssistSafetyAction::Keep;
+    return QStringLiteral("first_warning=%1 applied_exposure=%2 baseline_exposure=%3 bottom_warning=%4 bottom_visible_green_axis=%5 bottom_green_ratio=%6 kept_exposure=%7 rungs_tried=%8 rungs=%9 kept_warning=%10 frame=%11")
+        .arg( firstWarning )
+        .arg( appliedExposure )
+        .arg( baselineExposure )
+        .arg( outcome.bottom.warning )
+        .arg( outcome.bottom.visibleGreenAxis, 0, 'f', 3 )
+        .arg( outcome.bottom.valid ? outcome.bottom.stats.greenArtifactRatio : 0.0, 0, 'f', 6 )
+        .arg( kept ? QString::number( outcome.shownExposure ) : QStringLiteral("none") )
+        .arg( outcome.triedRungs.size() )
+        .arg( outcome.triedRungs.isEmpty() ? QStringLiteral("none") : outcome.triedRungs.join( QLatin1Char(',') ) )
+        .arg( kept ? outcome.shown.warning : QStringLiteral("reverted") )
+        .arg( frame );
+}
+
+QString lookAssistPictureDumpFileName( bool finalLook, int frame )
+{
+    return ( finalLook ? QStringLiteral("look-assist-final-frame%1.png")
+                       : QStringLiteral("look-assist-pre-safety-frame%1.png") ).arg( frame );
+}
+
+QString lookAssistPictureDumpFields( int frame, int preSafetyExposure, int finalExposure, const QString &safety )
+{
+    return QStringLiteral("pre_safety=%1 pre_safety_exposure=%2 final=%3 final_exposure=%4 safety=%5 frame=%6")
+        .arg( lookAssistPictureDumpFileName( false, frame ) )
+        .arg( preSafetyExposure )
+        .arg( lookAssistPictureDumpFileName( true, frame ) )
+        .arg( finalExposure )
+        .arg( safety )
+        .arg( frame );
+}
+
 } // namespace lookassist
