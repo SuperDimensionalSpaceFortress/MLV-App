@@ -121,20 +121,18 @@ TEST(PlaybackTexturePresentSplit, TailWindowCountsOnlyKnownWindows)
     ASSERT_NEAR( agg.p95( Part::TailWindow ), 12.0, 1e-9 );
 }
 
-TEST(PlaybackTexturePresentSplit, CountsPaintedReconInFlightAndAheadCandidates)
+TEST(PlaybackTexturePresentSplit, CountsPaintedAndReconInFlight)
 {
     PathAggregator agg;
     agg.note( makeSample( 1.0, 1.0, 5.0 ) );
     Sample a = makeSample( 1.0, 1.0, 5.0 );
     a.reconInFlight = true;
-    a.aheadCandidateReady = true;
     Sample b = makeSample( 1.0, 1.0, 5.0 );
     b.painted = false;
     agg.note( a );
     agg.note( b );
     ASSERT_EQ( agg.painted(), 1 );
     ASSERT_EQ( agg.reconInFlight(), 1 );
-    ASSERT_EQ( agg.aheadCandidateReady(), 1 );
 }
 
 TEST(PlaybackTexturePresentSplit, PathsAreAggregatedApart)
@@ -176,7 +174,6 @@ TEST(PlaybackTexturePresentSplit, FormatLineCarriesEveryPartAndTheGateInputs)
     ASSERT_EQ( field( line, "slip_avg_draw_total_ms" ), std::string( "17.000" ) );
     ASSERT_EQ( field( line, "any_slip_events" ), std::string( "2" ) );
     ASSERT_EQ( field( line, "any_slip_avg_draw_total_ms" ), std::string( "15.000" ) );
-    ASSERT_EQ( field( line, "ahead_candidate_ready_at_present_return" ), std::string( "0" ) );
     for( int i = 0; i < playback_texture_split::kPartCount; ++i )
     {
         const std::string name = playback_texture_split::partName( static_cast<Part>( i ) );
@@ -444,44 +441,44 @@ TEST(PlaybackTexturePresentSplit, ViewportRecordsAmazePartsAndMainWindowGatesOnT
     ASSERT_NE( std::string::npos, mw.find( "telemetryBoolValue( timing, \"gpu_playback_recon_amaze_texture_present_active\" ) ) )" ) );
 }
 
-// Fix 2, adversary A1 on 3390ee51: Loop on, cut 0..719, presenting 719 while frame 0's lookahead recon already holds
-// its retained Bayer16. Both slots hold a token: another frame's is ready (the old "published frame > presented
-// frame" test said 0 > 719, no).
-TEST(PlaybackTexturePresentSplit, AheadCandidateCountsALoopWrappedLookahead)
+// r2, adversary A1 on 639d7cfc (input: presenting frame 100 on token 16, worker frame 101 on token 17, count=2; the
+// prepared-state assignment fails, token 17 is released, and the worker is suspended before its decrement while the
+// GUI samples). Any count kept beside the slot tokens can be read between the token step and the count step, so the
+// GUI would report another candidate whose token is already gone (or miss one just published). r2 removes the field
+// and the count: K1's gates G1/G2 never read it, and K2 decides its lookahead question with K2's own adoption
+// counters. The K1 line therefore carries no ahead-candidate field, and no product file keeps a retained-slot count.
+TEST(PlaybackTexturePresentSplit, A1NoAheadCandidateFieldReadsACountBesideTheSlotTokens)
 {
-    ASSERT_TRUE( playback_texture_split::aheadCandidateReady( 2, true ) );
-    ASSERT_TRUE( playback_texture_split::aheadCandidateReady( 1, false ) );
-}
-
-// Fix 2, adversary A2 on 3390ee51: frame 101's recon published token 17 and then rejected and released it; the slot
-// count went +1 and -1, so only the presented frame's own token is held: no candidate (the old marker kept 101).
-TEST(PlaybackTexturePresentSplit, AheadCandidateIgnoresAReleasedPublication)
-{
-    int held = 1;   // the presented frame 100's own slot
-    ++held;         // frame 101 publishes token 17 into its slot
-    --held;         // ...which the final validation rejects and releases
-    ASSERT_FALSE( playback_texture_split::aheadCandidateReady( held, true ) );
-    ASSERT_FALSE( playback_texture_split::aheadCandidateReady( 0, false ) );
-}
-
-// The slot count is conserved: every RenderFrameThread site that releases a slot's retained token also takes it off the
-// count, and the one publish site adds it (a new release site without the decrement reds here).
-TEST(PlaybackTexturePresentSplit, RetainedSlotCountTracksEveryPublishAndRelease)
-{
-    const std::string rft = readRepoFile( QStringLiteral( "platform/qt/RenderFrameThread.cpp" ) );
-    const auto count = [&rft]( const std::string &needle )
-    {
-        size_t n = 0;
-        for( size_t at = rft.find( needle ); at != std::string::npos; at = rft.find( needle, at + needle.size() ) ) ++n;
-        return n;
-    };
-    const size_t releases = count( "llrpGpuPlaybackReconReleaseRetainedDeviceBayer16(" );
-    ASSERT_EQ( size_t( 3 ), releases );
-    ASSERT_EQ( releases, count( "m_retainedDeviceBayer16SlotsHeld.fetch_sub( 1, std::memory_order_acq_rel );" ) );
-    ASSERT_EQ( size_t( 1 ), count( "m_retainedDeviceBayer16SlotsHeld.fetch_add( 1, std::memory_order_acq_rel );" ) );
+    PathAggregator agg;
+    agg.note( makeSample( 1.0, 1.0, 5.0 ) );   // frame 99, the excluded first present
+    agg.note( makeSample( 4.0, 2.0, 9.0 ) );   // frame 100, sampled while the worker sits between release and count
+    const std::string line = playback_texture_split::formatLine( 1, Path::Window, agg, PartSums(), PartSums() );
+    ASSERT_EQ( std::string::npos, line.find( "ahead_candidate" ) );
     const std::string mw = readRepoFile( QStringLiteral( "platform/qt/MainWindow.cpp" ) );
-    ASSERT_NE( std::string::npos, mw.find( "m_pRenderThread->retainedDeviceBayer16SlotsHeld()," ) );
-    ASSERT_NE( std::string::npos, mw.find( "task.gpuPlaybackReconTextureRetainedDeviceToken != 0 ) );" ) );
+    ASSERT_FALSE( mw.empty() );
+    ASSERT_EQ( std::string::npos, mw.find( "retainedDeviceBayer16SlotsHeld" ) );
+    ASSERT_EQ( std::string::npos, mw.find( "gpu_playback_recon_texture_present_ahead_candidate_ready" ) );
+    const std::string split = readRepoFile( QStringLiteral( "platform/qt/PlaybackTexturePresentSplit.h" ) );
+    ASSERT_FALSE( split.empty() );
+    ASSERT_EQ( std::string::npos, split.find( "aheadCandidateReady" ) );
+}
+
+// r2, adversary A2 on 639d7cfc (input: frame 101's recon publishes token 17 during a clip reopen, init() clears its
+// slot metadata without a decrement, and the new clip's single held token then reads as count 2). A never-reset count
+// is not conserved across init(); r2 removes it, so RenderFrameThread's slot-token sites (the stale-ready discard, the
+// validation reject, releaseSlotLocked, init()) are exactly the base's again and carry no K1 bookkeeping.
+TEST(PlaybackTexturePresentSplit, A2RenderFrameThreadKeepsNoRetainedSlotCount)
+{
+    const std::string rfth = readRepoFile( QStringLiteral( "platform/qt/RenderFrameThread.h" ) );
+    const std::string rft = readRepoFile( QStringLiteral( "platform/qt/RenderFrameThread.cpp" ) );
+    ASSERT_FALSE( rfth.empty() );
+    ASSERT_FALSE( rft.empty() );
+    ASSERT_EQ( std::string::npos, rfth.find( "SlotsHeld" ) );
+    ASSERT_EQ( std::string::npos, rft.find( "SlotsHeld" ) );
+    ASSERT_EQ( std::string::npos, rft.find( "// K1" ) );
+    // the recon-activity meter K1 keeps (recon_in_flight) is a read-only accessor over the existing overlap meter
+    ASSERT_NE( std::string::npos,
+               rfth.find( "playback_overlap::ReconActivity pipelineReconActivity( void ) const { return m_overlapMeter.reconActivity(); }" ) );
 }
 
 // Fix 2, adversary A3 on 3390ee51: a fallback present (no texture parts), then the path's FIRST texture present skips a

@@ -8,7 +8,11 @@
  * header sums them, per present path, into ONE LIGHT line:
  *
  *   playback_smoke.texture_present_split session=<n> path=<window|viewport> frames=<n> ... avg_<part>_ms= p95_<part>_ms=
- *   slip_avg_<part>_ms= ahead_candidate_ready_at_present_return=<n>
+ *   slip_avg_<part>_ms=
+ *
+ * r2 (adversary A1/A2 on 639d7cfc): the design's ahead_candidate_ready_at_present_return field is NOT emitted. It
+ * needed a retained-slot count kept beside the slot tokens, which the GUI can read between a token step and its count
+ * step and which init() does not conserve; the K1 gates (G1, G2) never read it, and K2 measures its own adoption.
  *
  * Pure and Qt-free (pattern: PlaybackSlipHistogram.h): MainWindow feeds values it already has, so the hot path takes
  * no new clock reads. The session's first present (one-time allocation) is excluded from every count and reported
@@ -96,16 +100,6 @@ inline bool sampleEligible( bool setupTimingKnown, bool amazeTexturePresented )
     return setupTimingKnown && amazeTexturePresented;
 }
 
-/*! Fix 2 (adversary A1/A2 on 3390ee51): a retained device Bayer16 other than this present's own was held by a frame
- *  slot when this present returned, i.e. a later frame's recon output that an AMaZE-ahead stage could already have
- *  used. Token-level, so a loop-wrapped lookahead (frame 0 while presenting the last frame) counts, and a publication
- *  the recon rejected and released, or a stale frame already discarded, does not. \a slotsHoldingRetained:
- *  RenderFrameThread::retainedDeviceBayer16SlotsHeld(); \a presentHoldsRetained: this present's own slot holds one. */
-inline bool aheadCandidateReady( int slotsHoldingRetained, bool presentHoldsRetained )
-{
-    return slotsHoldingRetained - ( presentHoldsRetained ? 1 : 0 ) > 0;
-}
-
 /*! One texture present, as MainWindow has it after the presenter returned. */
 struct Sample
 {
@@ -113,7 +107,6 @@ struct Sample
     bool tailWindowKnown = false;       // TailWindow holds a measured window (else it is not counted)
     bool painted = false;               // paint-per-submit ran (Paint/Swap are real)
     bool reconInFlight = false;         // a worker recon ran at some point during this present
-    bool aheadCandidateReady = false;   // a later frame's retained device Bayer16 was published when it returned
     Path path = Path::Window;
 
     double &at( Part p ) { return ms[static_cast<size_t>( p )]; }
@@ -176,7 +169,6 @@ public:
         }
         m_sums.add( s );
         if( s.painted ) ++m_painted;
-        if( s.aheadCandidateReady ) ++m_aheadCandidateReady;
         for( int i = 0; i < kPartCount; ++i )
         {
             if( static_cast<Part>( i ) == Part::TailWindow && !s.tailWindowKnown ) continue;
@@ -188,7 +180,6 @@ public:
     bool any() const { return m_firstSeen; }
     int frames() const { return m_sums.events; }
     int painted() const { return m_painted; }
-    int aheadCandidateReady() const { return m_aheadCandidateReady; }
     int reconInFlight() const { return m_sums.reconInFlight; }
     int tailWindowKnown() const { return m_sums.tailWindowEvents; }
     double firstWallMs() const { return m_firstWallMs; }
@@ -213,7 +204,6 @@ private:
     double m_firstWallMs = 0.0;
     PartSums m_sums;
     int m_painted = 0;
-    int m_aheadCandidateReady = 0;
     std::array<playback_sampling::StrideSampler, kPartCount> m_values = makeSamplers();
 };
 
@@ -278,7 +268,6 @@ inline std::string formatLine( unsigned long long session, Path path, const Path
     appendMs( out, "any_slip_avg_", Part::DrawTotal, allSlips.avg( Part::DrawTotal ) );
     appendMs( out, "any_slip_avg_", Part::AmazeKernel, allSlips.avg( Part::AmazeKernel ) );
     appendMs( out, "any_slip_avg_", Part::AmazeHandoff, allSlips.avg( Part::AmazeHandoff ) );
-    appendInt( out, "ahead_candidate_ready_at_present_return", agg.aheadCandidateReady() );
     return out;
 }
 
