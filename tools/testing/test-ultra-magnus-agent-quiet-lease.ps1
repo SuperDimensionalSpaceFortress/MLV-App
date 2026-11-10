@@ -1372,19 +1372,31 @@ try {
     #  3. the writer's grammar right after '<n> ':  'tmp=removed <Type>: ' | 'tmp=unknown(<ErrType>) <Type>: ' | 'tmp_remaining=<dir>\<id>.json.<guid>.tmp <Type>: ';
     #  4. for removed/unknown, the rest of the message carries exactly ONE tmp token (tmp= or tmp_remaining=), else 'ambiguous'. A retained-file
     #     line is NOT scanned for tokens: its path (a temp root may hold ' attempts=1 tmp=removed ') and the exception tail are free text (CoS G4).
-    #     Two things are checked instead. (a) The path is the text right after 'tmp_remaining=' up to the FIRST '.tmp <Type>: ' and must end in a
+    #     Two things are checked instead. (a) The path (grammar: see RETAINED-HEADER GRAMMAR below) is the text right after 'tmp_remaining=' up to the FIRST '.tmp <Type>: ' and must end in a
     #     separator then the exact id's own tmp file, so a path whose file merely ends in the id, or a longer id's tail, or a wrong job's file
     #     with the exact name only LATER in the exception text, is refused ($null; sol r7 B2). (b) The tail after the header's '<Type>: ' must not hold a SECOND COMPLETE
     #     writer header (' attempts=<n> <status> <Type>: '): that is a longer id's line read with a shorter id whose first header the id itself
     #     spells (CoS G6), so the reading is 'ambiguous'. A tail that only mentions framing words, with no second complete header, is still free text.
     #     The outcome's authority stays Data['tmp_state']; this text check only ever refuses, it never decides a status from identifier text.
-    $script:SidecarRetainedRx = [regex]::new('\Gtmp_remaining=(?<path>.+?\.tmp) [\w.\x60]+: ')
+    # RETAINED-HEADER GRAMMAR (r10, sol r9 B1; the third round on this recognizer, so it is written down once, here, and the table in the
+    # 'cleanup-identifier' case lists every accepted and refused shape of r6-r10):
+    #   header := 'tmp_remaining=' PATH ' ' TYPE ': '
+    #   PATH   := an ABSOLUTE path that STARTS the token: a drive and a separator ('C:\' or 'C:/') or a leading separator ('/x', '\\srv'); then
+    #             any run of characters legal in a Windows path, i.e. none of  : * ? " < > |  and no line break (spaces and '=' are fine);
+    #             it ENDS at the FIRST '.tmp' that is followed by ' ' TYPE ': '.    TYPE := [\w.`]+ (a .NET type name).
+    # The path is delimited by ITS OWN token and nothing after that token's end is ever searched: ':' cannot occur inside a legal path, so the
+    # lazy match cannot run on through 'IOException: see C:\y\j.json.<g>.tmp' to borrow a later filename; a token that does not start as an
+    # absolute path ('bogus', 'x\j.json...', '/ bogus IOException: ...') is simply NOT a header. A bound path is then VALIDATED where it stands
+    # (Read-SidecarRetainedHeader): it must end in a separator, then '<name>.json.<32 hex>.tmp', <name> = the exact id when one is given.
+    # Refused on purpose (conservative; never a status): a long-path prefix and a ':' in a directory name. The writer's temp root is a plain
+    # drive or UNC path, and a refusal degrades to $null, like any other header this check cannot attribute to the id.
+    $script:SidecarRetainedRx = [regex]::new('\Gtmp_remaining=(?<path>(?:[A-Za-z]:[\\/]|[\\/])[^:*?"<>|\r\n]*?\.tmp) [\w.\x60]+: ')
     $script:SidecarAttemptsStartRx = [regex]::new('(?= attempts=\d+ )')
     $script:SidecarAttemptsRx = [regex]::new('\G attempts=\d+ ')
     $script:SidecarStatusRx = [regex]::new('\G(?:tmp=removed|tmp=unknown\([\w.\x60]+\)) [\w.\x60]+: ')
     # THE one recognizer of a retained-file writer header ('tmp_remaining=<path> <Type>: ') at $Start in $Text (r9, sol r8 B1: the first header and the
     # tail's second-header check used two separately written recognizers, and the second borrowed a valid tmp filename from LATER exception text).
-    # Bind-then-validate, in this order and nowhere else: (1) the path is the text right after this header's own 'tmp_remaining=' up to the FIRST
+    # Bind-then-validate, in this order and nowhere else: (1) the path (see RETAINED-HEADER GRAMMAR above: an absolute, colon-free token) is the text right after this header's own 'tmp_remaining=' up to the FIRST
     # '.tmp <Type>: ' (lazy, single line, so it cannot swallow the exception text); (2) that bound path must end in a separator then
     # '<name>.json.<32 hex>.tmp', and when $JobId is non-empty the <name> must be exactly the id. Returns @{ path; end } (end = index just past
     # '<Type>: ') or $null when there is no header there or its own path is refused. It never looks at text after the bound path.
@@ -2993,6 +3005,53 @@ function Exit-HeavySlot {
         # the first and second headers are read by ONE helper, so a path the first refuses cannot be accepted by the second: a second header whose own
         # file is a wrong-job-shaped but well-formed tmp path is complete (any job), and one whose path ends only in '.tmp' is not.
         Assert-True ((Get-SidecarTmpStatus "SIDECAR-WRITE-FAILED job=j attempts=3 $b1Good attempts=3 tmp_remaining=C:\y\xj.json.$z32.tmp IOException: x" 'j') -ceq 'ambiguous' -and (Get-SidecarTmpStatus "SIDECAR-WRITE-FAILED job=j attempts=3 $b1Good attempts=3 tmp_remaining=C:\y\z.tmp IOException: x C:\q\z.json.$z32.tmp IOException: y" 'j') -ceq 'tmp_remaining=') "cleanup-identifier(r9 B1): shared binding - any well-formed second path is a complete header; a path that is only '*.tmp' is not, whatever follows it"
+        # r10 (sol r9 B1): THE GRAMMAR TABLE. Every accepted and refused shape of Get-SidecarTmpStatus from r6-r10, one row each, read through the one
+        # recognizer. Columns: name; message tail after 'SIDECAR-WRITE-FAILED job=<id> attempts=3 '; the id; the expected result ('NULL' = $null).
+        # A retained path is the token right after its own 'tmp_remaining=': an absolute path (drive + separator, or a leading separator) with no
+        # ':' '*' '?' '"' '<' '>' '|' in it, ending at the FIRST '.tmp <Type>: '; text after that token is never searched to make it valid.
+        $gr = @(
+            @{ n = 'r6 own file, backslash'; m = "tmp_remaining=C:\x\j.json.$z32.tmp IOException: x"; id = 'j'; want = 'tmp_remaining=' },
+            @{ n = 'r6 own file, forward slash'; m = "tmp_remaining=/x/j.json.$z32.tmp IOException: x"; id = 'j'; want = 'tmp_remaining=' },
+            @{ n = 'r8 temp root with spaces'; m = "tmp_remaining=C:\my dir\a b\j.json.$z32.tmp IOException: x"; id = 'j'; want = 'tmp_remaining=' },
+            @{ n = 'G4 framing in path and tail'; m = "tmp_remaining=C:\t x attempts=1 tmp=removed y\notafter\j.json.$z32.tmp IOException: a attempts=1 tmp=removed b"; id = 'j'; want = 'tmp_remaining=' },
+            @{ n = 'r7 tail mentions framing, no second header'; m = "tmp_remaining=C:\x\j.json.$z32.tmp IOException: a attempts=1 tmp=removed b"; id = 'j'; want = 'tmp_remaining=' },
+            @{ n = 'r7 multiline tail'; m = "tmp_remaining=C:\x\j.json.$z32.tmp IOException: line1`nline2"; id = 'j'; want = 'tmp_remaining=' },
+            @{ n = 'r8 bogus second header'; m = "tmp_remaining=C:\x\j.json.$z32.tmp IOException: x attempts=3 tmp_remaining=bogus IOException: x"; id = 'j'; want = 'tmp_remaining=' },
+            @{ n = 'r9 malformed second, valid name in its exception'; m = "tmp_remaining=C:\x\j.json.$z32.tmp IOException: x attempts=3 tmp_remaining=C:\bad\other.tmp IOException: see C:\y\z.json.$z32.tmp IOException: x"; id = 'j'; want = 'tmp_remaining=' },
+            @{ n = 'r9 same, spaces'; m = "tmp_remaining=C:\my dir\j.json.$z32.tmp IOException: x attempts=3 tmp_remaining=C:\bad dir\other.tmp IOException: see C:\y y\z.json.$z32.tmp IOException: x"; id = 'j'; want = 'tmp_remaining=' },
+            @{ n = 'r9 same, multiline'; m = "tmp_remaining=C:\x\j.json.$z32.tmp IOException: x attempts=3 tmp_remaining=C:\bad\other.tmp IOException: line1`nsee C:\y\z.json.$z32.tmp IOException: x`nline3"; id = 'j'; want = 'tmp_remaining=' },
+            @{ n = 'r9 A1 bogus second directly after first'; m = "tmp_remaining=C:\x\j.json.$z32.tmp IOException: attempts=3 tmp_remaining=bogus IOException: x"; id = 'j'; want = 'tmp_remaining=' },
+            @{ n = 'r10 second bogus, valid name only in its exception'; m = "tmp_remaining=C:\x\j.json.$z32.tmp IOException: x attempts=3 tmp_remaining=bogus IOException: see C:\y\z.json.$z32.tmp IOException: x"; id = 'j'; want = 'tmp_remaining=' },
+            @{ n = 'r10 second bogus with spaces, valid name only later'; m = "tmp_remaining=C:\my dir\j.json.$z32.tmp IOException: x attempts=3 tmp_remaining=bogus dir IOException: see C:\y y\z.json.$z32.tmp IOException: x"; id = 'j'; want = 'tmp_remaining=' },
+            @{ n = 'r10 second bogus multiline, valid name only later'; m = "tmp_remaining=C:\x\j.json.$z32.tmp IOException: x attempts=3 tmp_remaining=bogus IOException: line1`nsee C:\y\z.json.$z32.tmp IOException: x"; id = 'j'; want = 'tmp_remaining=' },
+            @{ n = 'r10 second starts with a separator but holds a colon'; m = "tmp_remaining=C:\x\j.json.$z32.tmp IOException: x attempts=3 tmp_remaining=/ bogus IOException: see /y/z.json.$z32.tmp IOException: x"; id = 'j'; want = 'tmp_remaining=' },
+            @{ n = 'r6 file merely ends in the id'; m = "tmp_remaining=C:\x\otherj.json.$z32.tmp IOException: x"; id = 'j'; want = 'NULL' },
+            @{ n = 'r8 wrong-job path, exact name later'; m = "tmp_remaining=C:\x\otherj.json.$z32.tmp IOException: see C:\x\j.json.$z32.tmp IOException: x"; id = 'j'; want = 'NULL' },
+            @{ n = 'r8 wrong-job path, exact name later, no colon after type'; m = "tmp_remaining=C:\x\other.json.$z32.tmp IOException: x C:\x\j.json.$z32.tmp IOException: y"; id = 'j'; want = 'NULL' },
+            @{ n = 'r10 first bogus, valid name only in its exception'; m = "tmp_remaining=bogus IOException: see C:\y\j.json.$z32.tmp IOException: x"; id = 'j'; want = 'NULL' },
+            @{ n = 'r10 first bogus with spaces, valid name only later'; m = "tmp_remaining=bogus dir IOException: see C:\y y\j.json.$z32.tmp IOException: x"; id = 'j'; want = 'NULL' },
+            @{ n = 'r10 first bogus multiline, valid name only later'; m = "tmp_remaining=bogus IOException: line1`nsee C:\y\j.json.$z32.tmp IOException: x"; id = 'j'; want = 'NULL' },
+            @{ n = 'r10 first starts with a separator but holds a colon'; m = "tmp_remaining=/ bogus IOException: see /y/j.json.$z32.tmp IOException: x"; id = 'j'; want = 'NULL' },
+            @{ n = 'r10 first path with a colon inside a directory'; m = "tmp_remaining=C:\a:b\j.json.$z32.tmp IOException: x"; id = 'j'; want = 'NULL' },
+            @{ n = 'r10 first path with no separator before the file'; m = "tmp_remaining=j.json.$z32.tmp IOException: x"; id = 'j'; want = 'NULL' },
+            @{ n = 'r8 complete second retained header'; m = "tmp_remaining=C:\x\j.json.$z32.tmp IOException: x attempts=3 tmp_remaining=C:\y\z.json.$z32.tmp IOException: x"; id = 'j'; want = 'ambiguous' },
+            @{ n = 'r9 A1 complete second right after first (removed)'; m = "tmp_remaining=C:\x\j.json.$z32.tmp IOException: attempts=3 tmp=removed IOException: x"; id = 'j'; want = 'ambiguous' },
+            @{ n = 'r9 A1 complete second right after first (unknown)'; m = "tmp_remaining=C:\x\j.json.$z32.tmp IOException: attempts=3 tmp=unknown(E) IOException: x"; id = 'j'; want = 'ambiguous' },
+            @{ n = 'r9 A1 complete second right after first (retained)'; m = "tmp_remaining=C:\x\j.json.$z32.tmp IOException: attempts=3 tmp_remaining=C:\y\z.json.$z32.tmp IOException: x"; id = 'j'; want = 'ambiguous' },
+            @{ n = 'r9 complete header spelled inside a malformed one'; m = "tmp_remaining=C:\x\j.json.$z32.tmp IOException: x attempts=3 tmp_remaining=C:\bad\other.tmp IOException: attempts=3 tmp=removed IOException: x"; id = 'j'; want = 'ambiguous' },
+            @{ n = 'r10 complete header spelled inside a bogus one'; m = "tmp_remaining=C:\x\j.json.$z32.tmp IOException: x attempts=3 tmp_remaining=bogus IOException: attempts=3 tmp=removed IOException: x"; id = 'j'; want = 'ambiguous' },
+            @{ n = 'r7 removed with a second tmp token'; m = "tmp=removed IOException: a attempts=1 tmp_remaining=C:\p b"; id = 'j'; want = 'ambiguous' },
+            @{ n = 'removed'; m = 'tmp=removed IOException: x'; id = 'j'; want = 'tmp=removed' },
+            @{ n = 'unknown'; m = 'tmp=unknown(E) IOException: x'; id = 'j'; want = 'tmp=unknown' },
+            @{ n = 'removedness is not removed'; m = 'tmp=removedness IOException: x'; id = 'j'; want = 'NULL' }
+        )
+        $grFail = @()
+        foreach ($g in $gr) {
+            $got = Get-SidecarTmpStatus ("SIDECAR-WRITE-FAILED job=$($g.id) attempts=3 " + $g.m) $g.id
+            $gotText = $(if ($null -eq $got) { 'NULL' } else { $got })
+            if ($gotText -cne $g.want) { $grFail += "[$($g.n)] want=[$($g.want)] got=[$gotText]" }
+        }
+        Assert-True ($grFail.Count -eq 0) "cleanup-identifier(grammar r10): $($grFail.Count) of $($gr.Count) rows differ: $($grFail -join ' | ')"
         # adversary r4 A3: re-recording a different outcome on the same exception leaves no entry of the previous one.
         $dx = [InvalidOperationException]::new('x')
         Set-SidecarTmpData $dx 'old.tmp' @{ state = 'remaining'; error = $null }
