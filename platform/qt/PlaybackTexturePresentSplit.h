@@ -51,7 +51,7 @@
 namespace playback_texture_split
 {
 
-inline constexpr int kMaxSamples = 100000;   // per part, per path: the sampler's cap (it strides beyond it, A4)
+inline constexpr int kMaxSamples = 100000;   // per part, per path: the sampler's cap (a uniform sample beyond it)
 
 enum class Part
 {
@@ -186,17 +186,18 @@ public:
     double avg( Part p ) const { return m_sums.avg( p ); }
     double p95( Part p ) const { return percentile( m_values[static_cast<size_t>( p )].values(), 0.95 ); }
     double median( Part p ) const { return percentile( m_values[static_cast<size_t>( p )].values(), 0.50 ); }
-    /*! The draw_total sampler's stride: 1 = every present is in the percentiles (A4). */
-    unsigned long long percentileStride() const
+    /*! r2 (A1 on b5f2308e): true when the percentiles come from a uniform sample of the session (it outgrew the cap);
+     *  false when every counted present is in them. */
+    bool percentilesSampled() const
     {
-        return m_values[static_cast<size_t>( Part::DrawTotal )].stride();
+        return m_values[static_cast<size_t>( Part::DrawTotal )].sampled();
     }
 
 private:
-    static std::array<playback_sampling::StrideSampler, kPartCount> makeSamplers()
+    static std::array<playback_sampling::SessionSampler, kPartCount> makeSamplers()
     {
-        std::array<playback_sampling::StrideSampler, kPartCount> a;
-        for( auto &s : a ) s = playback_sampling::StrideSampler( static_cast<size_t>( kMaxSamples ) );
+        std::array<playback_sampling::SessionSampler, kPartCount> a;
+        for( auto &s : a ) s = playback_sampling::SessionSampler( static_cast<size_t>( kMaxSamples ) );
         return a;
     }
 
@@ -204,7 +205,7 @@ private:
     double m_firstWallMs = 0.0;
     PartSums m_sums;
     int m_painted = 0;
-    std::array<playback_sampling::StrideSampler, kPartCount> m_values = makeSamplers();
+    std::array<playback_sampling::SessionSampler, kPartCount> m_values = makeSamplers();
 };
 
 /*! The session: one aggregator per path. */
@@ -250,7 +251,7 @@ inline std::string formatLine( unsigned long long session, Path path, const Path
     appendInt( out, "painted", agg.painted() );
     appendInt( out, "tail_window_known", agg.tailWindowKnown() );
     appendInt( out, "recon_in_flight", agg.reconInFlight() );
-    appendInt( out, "pct_stride", static_cast<long long>( agg.percentileStride() ) );
+    appendInt( out, "pct_sampled", agg.percentilesSampled() ? 1 : 0 );
     {
         char buf[64];
         std::snprintf( buf, sizeof( buf ), " first_wall_ms=%.3f", agg.firstWallMs() );

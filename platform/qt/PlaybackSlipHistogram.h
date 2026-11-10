@@ -847,10 +847,10 @@ private:
     std::array<long long, static_cast<int>( AdvancePath::Count )> m_advanceByPath {};
     std::array<Deadline, kDeadlineRingSize> m_deadlines {};
     std::vector<SlipRecord> m_slips;
-    playback_sampling::StrideSampler m_decode { static_cast<size_t>( kMaxStageSamples ) };
-    playback_sampling::StrideSampler m_recon { static_cast<size_t>( kMaxStageSamples ) };
-    playback_sampling::StrideSampler m_render { static_cast<size_t>( kMaxStageSamples ) };
-    playback_sampling::StrideSampler m_queue { static_cast<size_t>( kMaxStageSamples ) };
+    playback_sampling::SessionSampler m_decode { static_cast<size_t>( kMaxStageSamples ) };
+    playback_sampling::SessionSampler m_recon { static_cast<size_t>( kMaxStageSamples ) };
+    playback_sampling::SessionSampler m_render { static_cast<size_t>( kMaxStageSamples ) };
+    playback_sampling::SessionSampler m_queue { static_cast<size_t>( kMaxStageSamples ) };
 };
 
 } // namespace playback_slip

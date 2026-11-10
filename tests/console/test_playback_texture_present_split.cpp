@@ -5,6 +5,7 @@
 
 #include "../../platform/qt/PlaybackDecodeRenderOverlap.h"
 #include "../../platform/qt/PlaybackSlipHistogram.h"
+#include "../../platform/qt/PlaybackStartupSplit.h"
 #include "../../platform/qt/PlaybackStrideSampler.h"
 #include "../../platform/qt/PlaybackTexturePresentSplit.h"
 
@@ -359,30 +360,56 @@ TEST(PlaybackTexturePresentSplit, PercentilesCoverTheWholeSessionPastTheCap)
     PathAggregator agg;
     agg.note( makeSample( 1.0, 1.0, 1.0 ) );   // excluded first present
     for( int i = 0; i < 100000; ++i ) agg.note( makeSample( 1.0, 1.0, 1.0 ) );
-    for( int i = 0; i < 100001; ++i ) agg.note( makeSample( 1.0, 1.0, 10.0 ) );
-    ASSERT_EQ( 200001, agg.frames() );
+    for( int i = 0; i < 200000; ++i ) agg.note( makeSample( 1.0, 1.0, 10.0 ) );   // two thirds of the session
+    ASSERT_EQ( 300000, agg.frames() );
     ASSERT_NEAR( 10.0, agg.median( Part::DrawTotal ), 1e-9 );
     ASSERT_NEAR( 10.0, agg.p95( Part::DrawTotal ), 1e-9 );
-    ASSERT_TRUE( agg.percentileStride() > 1ull );
+    ASSERT_TRUE( agg.percentilesSampled() );
+    const std::string line = playback_texture_split::formatLine( 1, Path::Window, agg, PartSums(), PartSums() );
+    ASSERT_EQ( field( line, "pct_sampled" ), std::string( "1" ) );
 }
 
-TEST(PlaybackTexturePresentSplit, StrideSamplerKeepsEveryValueBelowTheCapAndAUniformSampleAbove)
+// r2 (A1 on b5f2308e): up to AND at the cap every value is kept in order; past it the store stays at the cap.
+TEST(PlaybackTexturePresentSplit, SessionSamplerKeepsEveryValueUpToTheCapAndAUniformSampleAbove)
 {
-    playback_sampling::StrideSampler s( 8 );
-    for( int i = 0; i < 7; ++i ) s.add( i );
-    ASSERT_EQ( size_t( 7 ), s.size() );   // below the cap: every value, in order
-    ASSERT_EQ( 1ull, s.stride() );
-    s.add( 7 );                            // reaches the cap: keeps 0,2,4,6 and strides 2
-    ASSERT_EQ( size_t( 4 ), s.size() );
-    ASSERT_EQ( 2ull, s.stride() );
+    playback_sampling::SessionSampler s( 8 );
+    for( int i = 0; i < 8; ++i ) s.add( i );
+    ASSERT_EQ( size_t( 8 ), s.size() );   // at the cap: every value, in order
+    ASSERT_FALSE( s.sampled() );
+    for( size_t k = 0; k < s.size(); ++k ) ASSERT_NEAR( static_cast<double>( k ), s.values()[k], 1e-12 );
     for( int i = 8; i < 100; ++i ) s.add( i );
-    ASSERT_TRUE( s.size() < s.cap() );
+    ASSERT_EQ( size_t( 8 ), s.size() );
     ASSERT_EQ( 100ull, s.seen() );
-    // every kept value is a multiple of the stride, starting at 0, with none skipped in between
-    for( size_t k = 0; k < s.size(); ++k )
-        ASSERT_NEAR( static_cast<double>( k * s.stride() ), s.values()[k], 1e-12 );
-    // the last kept value is within one stride of the session's end: the sample spans the whole session
-    ASSERT_TRUE( s.values().back() + static_cast<double>( s.stride() ) >= 99.0 );
+    ASSERT_TRUE( s.sampled() );
+    bool late = false;   // the sample reaches past the first cap's worth: it is not a prefix
+    for( double v : s.values() )
+    {
+        ASSERT_TRUE( v >= 0.0 && v < 100.0 );
+        if( v >= 8.0 ) late = true;
+    }
+    ASSERT_TRUE( late );
+    PathAggregator below;
+    below.note( makeSample( 1.0, 1.0, 1.0 ) );
+    below.note( makeSample( 1.0, 1.0, 1.0 ) );
+    ASSERT_FALSE( below.percentilesSampled() );
+}
+
+// r2 (A1 on b5f2308e), the class: a periodic session (period 2, 3 and 4) past the cap keeps each phase near its share
+// (a power-of-two stride kept one phase of period 2 and 4 only).
+TEST(PlaybackTexturePresentSplit, SessionSamplerDoesNotAliasPeriodicInput)
+{
+    for( int period : { 2, 3, 4 } )
+    {
+        playback_sampling::SessionSampler s( 1000 );
+        for( int i = 0; i < 100000; ++i ) s.add( static_cast<double>( i % period ) );
+        std::vector<int> phase( static_cast<size_t>( period ), 0 );
+        for( double v : s.values() ) ++phase[static_cast<size_t>( v )];
+        for( int c : phase )
+        {
+            const double share = static_cast<double>( c ) / static_cast<double>( s.size() );
+            ASSERT_TRUE( share > 0.6 / period && share < 1.4 / period );
+        }
+    }
 }
 
 // A4 siblings: the slip histogram's upstream-stage medians follow the whole session too.
@@ -479,6 +506,77 @@ TEST(PlaybackTexturePresentSplit, A2RenderFrameThreadKeepsNoRetainedSlotCount)
     // the recon-activity meter K1 keeps (recon_in_flight) is a read-only accessor over the existing overlap meter
     ASSERT_NE( std::string::npos,
                rfth.find( "playback_overlap::ReconActivity pipelineReconActivity( void ) const { return m_overlapMeter.reconActivity(); }" ) );
+}
+
+// r2, adversary A1 on b5f2308e, its input verbatim: 100000 presents, decode alternating 1 (even k) / 10 (odd k), the
+// last one an upstream-late slip with decode 8. Every value fits the cap, so the median is the whole session's (4.5,
+// as at 5761f3fe) and 8 is not over 2x it: sub=none. A sampler that thins AT the cap keeps only the even k (all 1),
+// reads median 1 and blames decode.
+TEST(PlaybackTexturePresentSplit, A1SessionAtTheCapKeepsEveryStageValue)
+{
+    const double period = 1000.0 / 60.0;
+    playback_slip::SlipHistogram h;
+    h.reset( 0, 60.0 );
+    const int n = 100000;
+    int timeline = 0;
+    for( int k = 0; k < n; ++k )
+    {
+        const double t = 1000.0 + k * period;
+        h.noteTimelineMove( playback_slip::AdvancePath::DropTick, k + 1, t, 1.0, 0.0 );
+        timeline = k + 1;
+        playback_slip::PresentSample s;
+        s.displayFrame = k;
+        s.presentMs = t + 1.0;
+        s.readyKnown = true;
+        s.readyMs = t - 1.0;
+        s.decodeMs = ( k % 2 == 0 ) ? 1.0 : 10.0;
+        s.drawMs = 5.0;
+        s.timelinePosition = timeline;
+        s.lookaheadCovered = true;
+        if( k == n - 1 )
+        {
+            h.noteTimelineMove( playback_slip::AdvancePath::DropTick, k + 2, t + period, 1.0, 0.0 );
+            timeline = k + 2;
+            s.displayFrame = k + 1;
+            s.presentMs = t + period + 1.0;
+            s.readyMs = t + period + 0.5;
+            s.decodeMs = 8.0;
+            s.timelinePosition = timeline;
+        }
+        h.notePresent( s );
+    }
+    const playback_slip::Summary sum = h.finish( 1000.0 + n * period, timeline );
+    ASSERT_EQ( 1LL, sum.classFrames[static_cast<int>( playback_slip::SlipClass::UpstreamLate )] );
+    ASSERT_EQ( 0LL, sum.upstreamStageFrames[static_cast<int>( playback_slip::UpstreamStage::Decode )] );
+    ASSERT_EQ( 1LL, sum.upstreamStageFrames[static_cast<int>( playback_slip::UpstreamStage::None )] );
+}
+
+// A1 sibling (PlaybackStartupSplit.h): exactly kMaxLaterSamples later presents, alternating 1 / 10, keep the exact
+// session median 5.5 (a thinning at the cap keeps the 1s only).
+TEST(PlaybackTexturePresentSplit, A1StartupMediansKeepEveryValueAtTheCap)
+{
+    playback_startup_split::StartupSplit split;
+    const int n = static_cast<int>( playback_startup_split::StartupSplit::kMaxLaterSamples );
+    for( int k = 0; k < n; ++k ) split.noteLaterPresent( ( k % 2 == 0 ) ? 1.0 : 10.0, ( k % 2 == 0 ) ? 2.0 : 20.0 );
+    ASSERT_NEAR( 5.5, split.medianLaterRenderMs(), 1e-9 );
+    ASSERT_NEAR( 11.0, split.medianLaterGuiPresentMs(), 1e-9 );
+}
+
+// A1 sibling (PlaybackTexturePresentSplit.h), at and past the cap: draw alternating 1 / 10. At the cap every value is
+// kept (p95 10); three caps' worth is a sample of the WHOLE session with no period-2 aliasing (a power-of-two stride
+// keeps only the even presents: all 1, p95 1).
+TEST(PlaybackTexturePresentSplit, A1TexturePercentilesDoNotAliasAPeriodicSession)
+{
+    PathAggregator atCap;
+    atCap.note( makeSample( 1.0, 1.0, 1.0 ) );   // excluded first present
+    for( int k = 0; k < playback_texture_split::kMaxSamples; ++k )
+        atCap.note( makeSample( 1.0, 1.0, ( k % 2 == 0 ) ? 1.0 : 10.0 ) );
+    ASSERT_NEAR( 10.0, atCap.p95( Part::DrawTotal ), 1e-9 );
+    PathAggregator past;
+    past.note( makeSample( 1.0, 1.0, 1.0 ) );
+    for( int k = 0; k < 3 * playback_texture_split::kMaxSamples; ++k )
+        past.note( makeSample( 1.0, 1.0, ( k % 2 == 0 ) ? 1.0 : 10.0 ) );
+    ASSERT_NEAR( 10.0, past.p95( Part::DrawTotal ), 1e-9 );
 }
 
 // Fix 2, adversary A3 on 3390ee51: a fallback present (no texture parts), then the path's FIRST texture present skips a

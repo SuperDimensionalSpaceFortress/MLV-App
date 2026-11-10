@@ -4,10 +4,16 @@
  *
  * HFR-NATIVE-M16-1457-GUI-TEXTURE-PRESENT-OFFLOAD-1 (adversary A4 on 2f1ec397, fixed for the whole class): the session
  * medians/percentiles kept the FIRST N values and then stopped, so a session longer than the cap reported a statistic
- * of its prefix while its counts covered the whole session. This keeps every stride-th value instead (population index
- * i is kept iff i % stride == 0); when the store reaches its cap it drops every second kept value and doubles the stride.
- * The kept values are then a uniform sample of the WHOLE session, never more than \a cap of them, and below the cap
- * (every leg today: a 25 s leg is ~1500 presents) it keeps every value exactly as before. Pure, no Qt.
+ * of its prefix while its counts covered the whole session.
+ *
+ * r2 (adversary A1 on b5f2308e): the first fix kept every stride-th value and halved the store when it REACHED the cap.
+ * That thinned a session of exactly cap values (the base kept all of them), and a power-of-two stride aliases any
+ * periodic input (alternating values kept only the even presents). This is a reservoir sample (Algorithm R) instead:
+ *   - up to and including \a cap values it keeps every value, in order, exactly as the base did;
+ *   - past the cap, value i (0-based) replaces a uniformly chosen kept value with probability cap / (i + 1), so the kept
+ *     values are a uniform sample of the WHOLE session, never more than \a cap, with no period it can alias.
+ * The random source is a fixed-seed splitmix64, so a session's sample is deterministic (tests and reruns agree). The
+ * file keeps its name; the class is SessionSampler. Pure, no Qt.
  */
 
 #ifndef PLAYBACKSTRIDESAMPLER_H
@@ -19,34 +25,44 @@
 namespace playback_sampling
 {
 
-class StrideSampler
+class SessionSampler
 {
 public:
-    explicit StrideSampler( size_t cap = 100000 ) : m_cap( cap < 2 ? 2 : cap ) {}
+    explicit SessionSampler( size_t cap = 100000 ) : m_cap( cap < 1 ? 1 : cap ) {}
 
     void add( double v )
     {
         const unsigned long long index = m_seen++;
-        if( index % m_stride != 0 ) return;
-        m_values.push_back( v );
-        if( m_values.size() < m_cap ) return;
-        size_t kept = 0;
-        for( size_t i = 0; i < m_values.size(); i += 2 ) m_values[kept++] = m_values[i];
-        m_values.resize( kept );
-        m_stride *= 2;
+        if( m_values.size() < m_cap )
+        {
+            m_values.push_back( v );
+            return;
+        }
+        // Algorithm R: keep the (index+1)-th value with probability cap / (index + 1), in a uniform slot
+        const unsigned long long slot = next() % ( index + 1 );
+        if( slot < m_cap ) m_values[static_cast<size_t>( slot )] = v;
     }
 
     const std::vector<double> &values() const { return m_values; }
     size_t size() const { return m_values.size(); }
     bool empty() const { return m_values.empty(); }
     unsigned long long seen() const { return m_seen; }
-    unsigned long long stride() const { return m_stride; }
     size_t cap() const { return m_cap; }
+    /*! True once the session outgrew the cap: the statistics then describe a uniform sample of it, not every value. */
+    bool sampled() const { return m_seen > m_cap; }
 
 private:
+    unsigned long long next()
+    {
+        unsigned long long z = ( m_state += 0x9E3779B97F4A7C15ull );
+        z = ( z ^ ( z >> 30 ) ) * 0xBF58476D1CE4E5B9ull;
+        z = ( z ^ ( z >> 27 ) ) * 0x94D049BB133111EBull;
+        return z ^ ( z >> 31 );
+    }
+
     size_t m_cap;
-    unsigned long long m_stride = 1;
     unsigned long long m_seen = 0;
+    unsigned long long m_state = 0x5EED5A3B1E5EED01ull;
     std::vector<double> m_values;
 };
 

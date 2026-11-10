@@ -402,8 +402,8 @@ private:
     FirstPresentSplit m_firstPresentSplit;
     RenderFirstSplit m_renderFirstSplit;
     AmazeFirstFrames m_amazeFirstFrames;
-    playback_sampling::StrideSampler m_laterRender { kMaxLaterSamples };
-    playback_sampling::StrideSampler m_laterGuiPresent { kMaxLaterSamples };
+    playback_sampling::SessionSampler m_laterRender { kMaxLaterSamples };
+    playback_sampling::SessionSampler m_laterGuiPresent { kMaxLaterSamples };
 };
 
 } // namespace playback_startup_split
