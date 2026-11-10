@@ -4070,8 +4070,16 @@ def _real(path: str | os.PathLike, strict: bool = False) -> str:
     unprefixed name fails (a transient denial): the prefixed name is the same resolved path, never a different place."""
     real = os.path.realpath(path, strict=strict)
     if real.startswith("\\\\?\\UNC\\"):
-        return "\\\\" + real[8:]
-    return real[4:] if real.startswith("\\\\?\\") else real
+        bare = "\\\\" + real[8:]
+    elif real.startswith("\\\\?\\"):
+        bare = real[4:]
+    else:
+        return real
+    # The prefix is MEANINGFUL for a name Windows would read as another place: a component ending in a dot or a space is trimmed
+    # in a bare name (`C:\bus.` is `C:\bus`, the live bus) but literal after the prefix. Such a name keeps its prefix (r8 A1).
+    if any(part.endswith((".", " ")) and part not in (".", "..") for part in bare.split("\\")):
+        return real
+    return bare
 
 
 def _in_place(path: str | os.PathLike) -> bool:
@@ -4439,6 +4447,8 @@ def _rename_verified(src: pathlib.Path, dst: pathlib.Path, ident: tuple[int, int
         seen = _meta(os.lstat, src)
         if not _plain_dir(seen) or _ident(seen) != ident:
             raise _NotOurs(f"{src} is not the scratch directory pinned for it")
+        if os.path.lexists(dst):                                        # rename(2) replaces an empty directory silently (r8 A2):
+            raise FileExistsError(17, "the destination already exists", os.fspath(dst))   # retried under a fresh name
         _meta(os.rename, src, dst)
         return
     import ctypes
@@ -4548,6 +4558,11 @@ def make_exercise_scratch(bus: pathlib.Path, scratch_root: pathlib.Path) -> tupl
         raise Unknown("EXERCISE_BUS_NOT_A_REPO", f"{bus} is not a git repository")
     if route_inside(route_real_path(str(scratch_root)), route_real_path(str(bus))):
         raise Unknown("EXERCISE_SCRATCH_INSIDE_BUS", f"scratch root {scratch_root} is inside the bus {bus}; routes never run in the live bus")
+    if os.name == "nt" and any(part.endswith((".", " ")) and part not in (".", "..")
+                               for part in os.fspath(scratch_root).removeprefix("\\\\?\\").split("\\")):
+        raise Unknown("EXERCISE_SCRATCH_ROOT_AMBIGUOUS",                # a bare `C:\bus.` is `C:\bus`, the live bus; the same name after
+                      f"scratch root {scratch_root} has a component ending in a dot or a space, which Windows trims from a "
+                      f"bare name; nothing was created")                # `\\?\` is another directory, and tempfile trims it again (r8 A1)
     scratch_root.mkdir(parents=True, exist_ok=True)
     scratch_root = pathlib.Path(_real(scratch_root))                    # a root named through a link or junction: made under its real path
     base = pathlib.Path(tempfile.mkdtemp(prefix=ROUTE_SCRATCH_PREFIX, dir=str(scratch_root)))

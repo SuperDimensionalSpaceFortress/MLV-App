@@ -4634,3 +4634,66 @@ def test_r8_a2_a_posix_retry_after_a_denial_never_acts_on_a_replacement_of_the_l
     assert entry.exists(), "the retry removed a replacement of the listed entry"
     assert PosixOs.denied, "the denial seam never ran"
     assert (tmp_path / "entry.aside").exists(), "the listed entry was not the one moved aside"
+
+
+# Adversary pass r8 on 2592c3e4: A1 (blocker) `_real` stripped the extended-length prefix from `\\?\C:\bus.`, and Windows reads
+# the bare `C:\bus.` as `C:\bus` (trailing dots and spaces are trimmed): the live bus. The prefix is kept whenever the bare name
+# would mean another place. A2 (major) the POSIX put-aside rename replaces an existing destination silently; it now refuses one.
+
+@pytest.mark.skipif(os.name != "nt", reason="trailing-dot trimming of a bare name is a Windows path rule")
+@pytest.mark.parametrize("tail", [".", " "])
+def test_r8b_a1_real_keeps_the_extended_prefix_when_the_bare_name_would_name_another_place(tmp_path, tail):
+    dotted = "\\\\?\\" + str(tmp_path / ("bus" + tail))
+    os.mkdir(dotted)
+    try:
+        real = ob._real(dotted)
+        assert real.startswith("\\\\?\\"), f"the prefix was stripped: {real!r} now names {os.path.abspath(real)!r}"
+    finally:
+        os.rmdir(dotted)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="trailing-dot trimming of a bare name is a Windows path rule")
+def test_r8b_a1_a_scratch_root_with_a_trailing_dot_never_makes_the_scratch_inside_the_live_bus(tmp_path, monkeypatch):
+    bus = tmp_path / "bus"
+    (bus / ".git").mkdir(parents=True)
+    dotted_root = "\\\\?\\" + str(tmp_path / "bus.")
+    made_in = []
+    real_mkdtemp = ob.tempfile.mkdtemp
+
+    def recording(*args, **kwargs):
+        made_in.append(kwargs.get("dir"))
+        return real_mkdtemp(*args, **kwargs)
+
+    monkeypatch.setattr(ob.tempfile, "mkdtemp", recording)
+    try:
+        with pytest.raises(ob.Unknown) as caught:                        # refused before anything is created
+            ob.make_exercise_scratch(bus, Path(dotted_root))
+    finally:
+        shutil.rmtree(dotted_root, ignore_errors=True)                   # the literal `bus.` directory, had one been made
+    assert caught.value.code == "EXERCISE_SCRATCH_ROOT_AMBIGUOUS", caught.value
+    assert not made_in, f"a scratch was made in {made_in!r}"
+    assert os.listdir(bus) == [".git"], os.listdir(bus)
+
+
+def test_r8b_a2_a_posix_put_aside_never_replaces_an_existing_destination(tmp_path, monkeypatch):
+    real_os = os
+
+    class PosixOs:
+        name = "posix"
+
+        def __getattr__(self, item):
+            return getattr(real_os, item)
+
+        def rename(self, src, dst):                                      # POSIX rename(2): an existing empty directory is replaced
+            if real_os.path.isdir(dst):
+                real_os.rmdir(dst)
+            return real_os.rename(src, dst)
+
+    work, other = tmp_path / "work", tmp_path / "work.rm-0000000000000000"
+    work.mkdir()
+    other.mkdir()
+    keep = os.lstat(other)
+    monkeypatch.setattr(ob, "os", PosixOs())
+    with pytest.raises(OSError):
+        ob._rename_verified(work, other, ob._file_id(work))
+    assert work.exists() and os.lstat(other).st_ino == keep.st_ino, "the unrelated destination was replaced"
