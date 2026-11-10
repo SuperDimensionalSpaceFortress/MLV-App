@@ -3227,20 +3227,64 @@ def test_a_creation_pin_that_could_not_be_read_is_never_completed_from_a_replace
         assert (tmp_path / "scratch-saved" / base.name / "f.txt").exists(), "absence behind a replaced root was read as a removal"
 
 
-def test_creation_pins_both_identities_despite_a_transient_read_error(tmp_path, monkeypatch):
+def test_a_creation_pin_is_one_read_and_an_unreadable_one_stays_unknown(tmp_path, monkeypatch):
+    """The pin is the identity of what THIS run just made. A second read after a pause (a retry) is a window in which a process
+    swaps the root or the scratch, and the replacement's identity would be recorded as the creation pin. So: one read of each,
+    no pause, and a read that fails is recorded as None, which removal refuses (the typed EXERCISE_SCRATCH_NOT_REMOVED) instead
+    of completing the pin from whatever it finds later. (The earlier test of this name pinned the retry itself: it required a
+    failing read to be repeated until it succeeded, which is the defect, so replacing it is not a loosening.)"""
     root = tmp_path / "scratch"
-    base = root / (ob.ROUTE_SCRATCH_PREFIX + "pinretry")
+    base = root / (ob.ROUTE_SCRATCH_PREFIX + "pinonce")
     base.mkdir(parents=True)
-    real, calls = ob._file_id, [0]
+    real, seen = ob._file_id, []
 
-    def flaky_id(path, follow=False):
-        calls[0] += 1
-        return None if calls[0] <= 2 else real(path, follow)             # the first two reads fail transiently
+    def failing_read(path, follow=False):
+        seen.append(os.path.normcase(str(path)))
+        return None                                                     # every read fails: the pin must not be completed later
 
-    monkeypatch.setattr(ob, "_file_id", flaky_id)
-    monkeypatch.setattr(ob.time, "sleep", lambda s: None)
+    def no_pause(seconds):
+        raise AssertionError(f"the pin paused {seconds}s between reads: that pause is a swap window")
+
+    monkeypatch.setattr(ob, "_file_id", failing_read)
+    monkeypatch.setattr(ob.time, "sleep", no_pause)
+    ob._pin_scratch(base, root)
+    assert ob._SCRATCH_PINS.pop(ob._scratch_key(base)) == (None, None)
+    assert len(seen) == 2, f"each identity is read exactly once, never retried: {seen}"
+    monkeypatch.setattr(ob, "_file_id", real)
     ob._pin_scratch(base, root)
     assert ob._SCRATCH_PINS.pop(ob._scratch_key(base)) == (real(root, True), real(base))
+
+
+def test_a_scratch_whose_first_creation_read_failed_is_not_adopted_from_a_replacement_made_during_any_pause(tmp_path, monkeypatch):
+    """The finding's input: the new scratch's first identity read raises, and while the pin pauses another process renames the
+    scratch aside and creates a replacement (with a file in it) under the same name. Nothing may be adopted and removed."""
+    root = tmp_path / "scratch"
+    base = root / (ob.ROUTE_SCRATCH_PREFIX + "pinswap")
+    base.mkdir(parents=True)
+    (base / "f.txt").write_text("original", encoding="utf-8")
+    real, reads = ob._file_id, [0]
+
+    def read_that_fails_once_for_the_scratch(path, follow=False):
+        reads[0] += 1
+        return None if (reads[0] == 2 and not follow) else real(path, follow)
+
+    def swap_in_the_pause(seconds):
+        os.rename(base, tmp_path / "saved")
+        base.mkdir()
+        (base / "precious.txt").write_text("not ours", encoding="utf-8")
+
+    monkeypatch.setattr(ob, "_file_id", read_that_fails_once_for_the_scratch)
+    monkeypatch.setattr(ob.time, "sleep", swap_in_the_pause)
+    ob._pin_scratch(base, root)
+    monkeypatch.setattr(ob, "_file_id", real)
+    monkeypatch.setattr(ob.time, "sleep", lambda s: None)               # the swap happens only inside the pin, never in the removal's own pauses
+    monkeypatch.setattr(ob, "ROUTE_SCRATCH_REMOVE_PAUSE", 0)
+    monkeypatch.setattr(ob, "ROUTE_SCRATCH_REMOVE_DEADLINE", 0.3)
+    swapped = (base / "precious.txt").exists()                          # True only when the pin paused
+    with pytest.raises(ob.Unknown) as caught:
+        ob.remove_exercise_scratch(base, root)
+    assert caught.value.code == "EXERCISE_SCRATCH_NOT_REMOVED", caught.value
+    assert (base / "precious.txt").exists() if swapped else (base / "f.txt").exists(), "a replacement was adopted as the creation pin and removed"
 
 
 def stale_bus_pair(tmp_path: Path, name: str, behind: bool) -> Path:

@@ -3962,19 +3962,13 @@ def _scratch_key(base: pathlib.Path) -> str:
     return os.path.normcase(os.path.abspath(base))
 
 
-def _pin_scratch(base: pathlib.Path, scratch_root: str | os.PathLike, tries: int = 5) -> None:
-    """Record the identity of the scratch root and of the scratch `base` just made. A read that fails is repeated a few times, 50 ms
-    apart, so a transient error does not leave the pin incomplete; one that stays unreadable is recorded as None, which removal
-    never completes from whatever it finds later (the typed EXERCISE_SCRATCH_NOT_REMOVED, not an adopted replacement)."""
+def _pin_scratch(base: pathlib.Path, scratch_root: str | os.PathLike) -> None:
+    """Record the identity of the scratch root and of the scratch `base` just made: ONE read of each, straight after the scratch
+    was created, and no pause. A repeated read (a retry after a pause) is itself a window in which another process swaps the root
+    or the scratch, and the replacement's identity would be recorded as the creation pin. A read that fails is recorded as None,
+    which removal never completes from whatever it finds later (the typed EXERCISE_SCRATCH_NOT_REMOVED, not an adopted replacement)."""
     real = os.path.realpath(scratch_root)
-    root_id = work_id = None
-    for attempt in range(tries):
-        root_id, work_id = root_id or _file_id(real, follow=True), work_id or _file_id(base)
-        if root_id is not None and work_id is not None:
-            break
-        if attempt + 1 < tries:
-            time.sleep(0.05)
-    _SCRATCH_PINS[_scratch_key(base)] = (root_id, work_id)
+    _SCRATCH_PINS[_scratch_key(base)] = (_file_id(real, follow=True), _file_id(base))
 
 
 def remove_exercise_scratch(base: pathlib.Path, scratch_root: pathlib.Path) -> None:
