@@ -297,7 +297,7 @@ $ErrorActionPreference = 'Stop'
 $A = 'System.Management.Automation.Language'
 $PathOnly = @('join-path', 'test-path', 'resolve-path', 'split-path', 'get-item', 'get-content', 'get-childitem', 'get-filehash', 'convert-path')
 $isRef = { param($n) (($n -is [System.Management.Automation.Language.StringConstantExpressionAst]) -or ($n -is [System.Management.Automation.Language.ExpandableStringExpressionAst])) -and ($n.Value -match ('(^|[\\/])' + [regex]::Escape($script:Needle) + '\.ps1$')) }
-$blank = { param([string]$t) $x = $t.Trim().Trim([char]39, [char]34).Trim(); ($x -eq '') -or ($x -eq '$null') }
+$blank = { param([string]$t) $x = ($t -replace '`[tnrs0]', ' ').Trim().Trim([char]39, [char]34, [char]40, [char]41).Trim(); ($x -eq '') -or ($x -eq '$null') -or ($x -eq '@') }
 foreach ($file in [IO.File]::ReadAllLines($ListFile)) {
     if (-not $file) { continue }
     $errs = $null
@@ -369,7 +369,7 @@ def _scan(files: "list[Path]") -> "list[dict]":
 
 
 def _tracked_files_naming_the_assembler() -> "list[str]":
-    done = subprocess.run([GIT, "-C", str(ROOT), "grep", "-l", "-I", NEEDLE], capture_output=True, text=True)
+    done = subprocess.run([GIT, "-C", str(ROOT), "grep", "-l", "-i", "-I", NEEDLE], capture_output=True, text=True)
     return [line.strip() for line in done.stdout.splitlines() if line.strip()]
 
 
@@ -429,7 +429,7 @@ class TrackedAssemblerCallerAstTests(unittest.TestCase):
 
     def test_mutation_whitespace_deadline_value_goes_red_adversary_a1(self) -> None:
         # adversary 44f72c7a-A1: '   ' passed the scan as a deadline, but the assembler refuses it (exit 27).
-        for blank in ("'   '", '"  "', "$null", "''"):
+        for blank in ("'   '", '"  "', "$null", "''", '"`t"', "($null)", "@()"):
             with self.subTest(value=blank):
                 sites = self._mutate(lambda t: t.replace("MLV_HEAVY_SLOT_DEADLINE_UTC = $script:Deadline.ToString('o')", "MLV_HEAVY_SLOT_DEADLINE_UTC = " + blank, 1))
                 self.assertEqual([s["shape"] for s in self._uncovered(sites)], ["ChildEnv-without-a-deadline"])
@@ -464,6 +464,14 @@ class TrackedAssemblerCallerAstTests(unittest.TestCase):
         # that is not the assembler's own invocation path.
         sites = self._mutate(lambda t: t + "\n# & tools\\profiling\\bachelor\\playback-attr-3-cuda-assemble.ps1 -SourceCommit x   (a comment)\n")
         self.assertEqual([s["covered"] for s in sites], [True])
+
+    def test_mutation_an_upper_case_path_caller_is_found_adversary_a2(self) -> None:
+        # Windows resolves the path case-insensitively, so the scan and the inventory (git grep -i) must too.
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "Invoke-Other.ps1"
+            path.write_text('param($c)\n& "$PSScriptRoot\\..\\bachelor\\PLAYBACK-ATTR-3-CUDA-ASSEMBLE.ps1" -SourceCommit $c\n', encoding="ascii")
+            sites = _scan([path])
+        self.assertEqual([(s["covered"], s["shape"]) for s in sites], [(False, "none")])
 
     def test_mutation_a_second_caller_file_is_found(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
