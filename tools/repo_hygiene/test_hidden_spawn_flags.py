@@ -219,8 +219,9 @@ def _label(expr: ast.AST) -> str:
 
 
 _FORMAT_BODY_RE = re.compile(r"([^!:]*)(?:!([rsa]))?(?::(.*))?", re.DOTALL)
-_PERCENT_SPEC_RE = re.compile(r"([#0\- +]*)([0-9]+|\*)?(?:\.([0-9]+|\*))?[hlL]?([sraidiouxXeEfFgGc%])")  # ASCII digits only: int() meets nothing else
+_PERCENT_SPEC_RE = re.compile(r"([#0\- +]*)([0-9]+|\*)?(?:\.([0-9]*|\*))?[hlL]?([sraidiouxXeEfFgGc%])")  # ASCII digits only: int() meets nothing else; `%.s` is precision 0 (pass-22 A1)
 _PERCENT_TAIL_RE = re.compile(r"(?:[^)]*\))?[#0\- +0-9.*hlL]*[A-Za-z%]?")  # what a field opened before a wildcard may still take: key, flags, width, conversion
+_PERCENT_UNPARSED_RE = re.compile(r"[#0\- +0-9.*hlL]*")  # the flags, width and precision of a `%` field the fold could not parse; the letter after them stays literal, so no name is cut
 _SPEC_NUMBER_LIMIT = 256  # a width or precision above this is never handed to Python's formatter (no huge allocation)
 _STRING_MAPPERS = frozenset({"lower", "upper", "casefold", "strip", "lstrip", "rstrip", "title", "capitalize", "swapcase"})
 _CASE_MAPPERS = frozenset({"lower", "upper", "casefold", "swapcase"})  # act character by character, so a wildcard in the text survives them
@@ -250,7 +251,7 @@ def _hedge(text: str) -> str:
     if _HEDGE_MODE[0] == "launch":
         keyword = _LOOSE_LAUNCH_RE.search(text)
         return _WILD + text[keyword.start():] if keyword else _WILD
-    held = [name for name in sorted(_LOOP_SPAWN_METHODS) if name in text]
+    held = [name for name in sorted(_LOOP_SPAWN_METHODS) if name in text.lower()]  # an unknown function may lower-case what it was given
     if not held:
         return _WILD
     common = held[0]
@@ -349,17 +350,10 @@ _OPERATOR_BINOPS = {"add": ast.Add, "concat": ast.Add, "mod": ast.Mod, "mul": as
 _DUNDER_BINOPS = {"__add__": (ast.Add, False), "__radd__": (ast.Add, True), "__mod__": (ast.Mod, False), "__rmod__": (ast.Mod, True),
                   "__mul__": (ast.Mult, False), "__rmul__": (ast.Mult, True)}
 
-
-def _is_str_type(node: ast.AST) -> bool:
-    """``str``, ``builtins.str``, ``type('')`` and ``''.__class__``: the receiver of an UNBOUND string method (``str.lower('X')``)."""
-    if isinstance(node, ast.Name):
-        return node.id == "str"
-    if isinstance(node, ast.Attribute):
-        return (node.attr == "str" and isinstance(node.value, ast.Name) and node.value.id == "builtins") or node.attr == "__class__"
-    return isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "type" and len(node.args) == 1 and not node.keywords
+_STR_METHODS = frozenset(name for name in dir(str) if not name.startswith("_")) | {"decode"}  # every public method of str, for a call spelled through the type
 
 
-def _bound_form(node: ast.AST) -> ast.AST:
+def _bound_form(node: ast.AST, consts: dict[str, str]) -> ast.AST:
     """The bound form of a call the fold reads under another spelling (G15): ``str.m(s, ...)`` is ``s.m(...)``, ``operator.concat(a, b)`` and
     ``a.__add__(b)`` are ``a + b`` (``add`` / ``mod`` / ``mul`` and their reflected forms too), and ``reversed([a, b])`` / ``list([a, b])`` are the
     list they stand for. Anything else is returned as it came."""
@@ -368,16 +362,29 @@ def _bound_form(node: ast.AST) -> ast.AST:
         if isinstance(arg, (ast.List, ast.Tuple)) and not any(isinstance(e, ast.Starred) for e in arg.elts):
             return ast.List(elts=list(reversed(arg.elts)) if node.func.id == "reversed" else list(arg.elts), ctx=ast.Load())
         return node
+    if (isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id in _OPERATOR_BINOPS and len(node.args) == 2 and not node.keywords
+            and not any(isinstance(a, ast.Starred) for a in node.args)):  # ``from operator import concat``: concat(a, b)
+        return ast.BinOp(left=node.args[0], op=_OPERATOR_BINOPS[node.func.id](), right=node.args[1])
     if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)):
         return node
     attr, recv = node.func.attr, node.func.value
-    if (isinstance(recv, ast.Name) and recv.id == "operator" and attr in _OPERATOR_BINOPS and len(node.args) == 2 and not node.keywords
-            and not any(isinstance(a, ast.Starred) for a in node.args)):
-        return ast.BinOp(left=node.args[0], op=_OPERATOR_BINOPS[attr](), right=node.args[1])
-    if _is_str_type(recv) and node.args and not isinstance(node.args[0], ast.Starred):
-        node = ast.Call(func=ast.Attribute(value=node.args[0], attr=attr, ctx=ast.Load()), args=node.args[1:], keywords=node.keywords)
-        recv = node.func.value
-    if attr in _DUNDER_BINOPS and len(node.args) == 1 and not node.keywords and not isinstance(node.args[0], ast.Starred):
+    plain = not any(isinstance(a, ast.Starred) for a in node.args)
+    if plain and not _text_base(recv, consts):
+        # The receiver is a module or a type under ANY name (``op = operator``, ``import builtins as b``, ``S = str``, ``type('')``, ``''.__class__``): a call of an
+        # operator function, a dunder or a string method through it is read by its method name, never by the spelling of the receiver (pass-22 A3).
+        if attr in _OPERATOR_BINOPS and len(node.args) == 2 and not node.keywords and all(_text_base(a, consts) for a in node.args):
+            return ast.BinOp(left=node.args[0], op=_OPERATOR_BINOPS[attr](), right=node.args[1])
+        if attr in _DUNDER_BINOPS and len(node.args) == 2 and not node.keywords:  # str.__add__(a, b)
+            op, reflected = _DUNDER_BINOPS[attr]
+            return ast.BinOp(left=node.args[1] if reflected else node.args[0], op=op(), right=node.args[0] if reflected else node.args[1])
+        # A string method called on the TYPE: `str`, `builtins.str`, `type(x)`, `x.__class__`. Any other receiver may be an instance (`source.index('needle')`), whose
+        # argument is not the text the method works on; those calls stay a call the fallback hedges (their arguments are hedged, never read as a receiver).
+        if (node.args and _text_base(node.args[0], consts) and (
+                (isinstance(recv, ast.Name) and recv.id in ("str", "bytes")) or (isinstance(recv, ast.Attribute) and recv.attr in ("str", "bytes", "__class__"))
+                or (isinstance(recv, ast.Call) and isinstance(recv.func, ast.Name) and recv.func.id == "type"))):  # str.lower(s, ...) is s.lower(...)
+            node = ast.Call(func=ast.Attribute(value=node.args[0], attr=attr, ctx=ast.Load()), args=node.args[1:], keywords=node.keywords)
+            recv = node.func.value
+    if attr in _DUNDER_BINOPS and len(node.args) == 1 and not node.keywords and plain:
         op, reflected = _DUNDER_BINOPS[attr]
         left, right = (node.args[0], recv) if reflected else (recv, node.args[0])
         return ast.BinOp(left=left, op=op(), right=right)
@@ -395,7 +402,7 @@ def _flatten(node: ast.AST, consts: dict[str, str], depth: int = 0) -> tuple[str
     """
     if depth > _FLATTEN_DEPTH:
         return _WILD, False
-    node = _bound_form(node)
+    node = _bound_form(node, consts)
     if isinstance(node, ast.Constant):
         return (node.value, True) if isinstance(node.value, str) else (_WILD, False)  # a number can print as any character (`{115:c}`)
     if isinstance(node, ast.Name):
@@ -447,7 +454,7 @@ def _flatten(node: ast.AST, consts: dict[str, str], depth: int = 0) -> tuple[str
     if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
         method, recv = node.func.attr, node.func.value
         if method == "join" and len(node.args) == 1 and not node.keywords:
-            node = ast.Call(func=node.func, args=[_bound_form(node.args[0])], keywords=[])  # ''.join(reversed(['a', 'b'])) joins the list reversed
+            node = ast.Call(func=node.func, args=[_bound_form(node.args[0], consts)], keywords=[])  # ''.join(reversed(['a', 'b'])) joins the list reversed
         if method in ("format", "format_map"):
             template, known = _flatten(recv, consts, depth + 1)
             if method == "format_map":
@@ -485,7 +492,7 @@ def _flatten(node: ast.AST, consts: dict[str, str], depth: int = 0) -> tuple[str
                 count = _int_literal(c)
                 count = (-1 if count < 0 or count > len(text) + 1 else count) if isinstance(count, int) else None  # str.replace takes a C ssize_t: more than the text holds is all
             if count is None or not (known and old_known and new_known):
-                return _hedge(text), False
+                return _hedge_texts([text, old, new]), False  # an unknown receiver (`S.replace(s, a, b)` through an alias of str) leaves its arguments as the text
             return text.replace(old, new, count), True
         if method in _STRING_MAPPERS and not node.keywords and len(node.args) <= 1:
             text, known = _flatten(recv, consts, depth + 1)
@@ -493,10 +500,12 @@ def _flatten(node: ast.AST, consts: dict[str, str], depth: int = 0) -> tuple[str
                 return getattr(text, method)(), known  # per character: a wildcard stays one
             chars, chars_known = _flatten(node.args[0], consts, depth + 1) if node.args else (None, True)
             if not (known and chars_known):
-                return _hedge(text), False
+                return _hedge_texts([text, chars or ""]), False  # `S.lower('SUBPROCESS_EXEC')` with S an alias of str: the receiver reads as nothing, the argument is the text
             if chars is not None:
-                return (getattr(text, method)(chars), True) if method in ("strip", "lstrip", "rstrip") else (_hedge(text), False)
+                return (getattr(text, method)(chars), True) if method in ("strip", "lstrip", "rstrip") else (_hedge_texts([text, chars]), False)
             return getattr(text, method)(), True
+    if isinstance(node, (ast.List, ast.Tuple, ast.Set)) and not any(isinstance(e, ast.Starred) for e in node.elts):
+        return "".join(_flatten(e, consts, depth + 1)[0] for e in node.elts), False  # a list of texts read as the texts side by side (read only as an argument of a call the fold has no arm for)
     if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "reversed" and len(node.args) == 1 and not node.keywords:
         text, known = _flatten(node.args[0], consts, depth + 1)  # the characters of a text, backwards (only ever read by a ``''.join``)
         return text[::-1], known
@@ -521,12 +530,24 @@ def _flatten(node: ast.AST, consts: dict[str, str], depth: int = 0) -> tuple[str
             [] if callee in _NOT_TEXT_OF_ARGS else [a for a in node.args if not isinstance(a, ast.Starred)] + [k.value for k in node.keywords])
     else:
         parts = [node.value] if isinstance(node, ast.Subscript) else []
-    hedged = []
-    for part in parts:
-        text, _ = _flatten(part, consts, depth + 1)
-        if text.replace(_WILD, ""):
-            hedged.append(_hedge(text))
-    return ("".join(hedged), False) if hedged else (_WILD, False)
+    return _hedge_texts([_flatten(part, consts, depth + 1)[0] for part in parts]), False
+
+
+def _hedge_texts(texts: list[str]) -> str:
+    """What a call the fold cannot apply may return of these texts (its receiver and arguments; a text that reads as nothing says nothing)."""
+    texts = [t for t in texts if t.replace(_WILD, "")]
+    if not texts:
+        return _WILD
+    # What the call returns may be any one of its texts, OR the texts put together in either order or read backwards (an aliased ``op.concat(a, b)``,
+    # ``fmt(a, b)``, ``rv(s)``): each piece alone is hedged, and so is the whole joined both ways and reversed (pass-22 A3).
+    joined = "".join(texts)
+    variants = [*texts, joined, "".join(reversed(texts)), joined[::-1]]
+    if len(texts) >= 2:  # a function that fills a template (``fmt('%sexec', 'subprocess_')``): the first or the last text filled with the others
+        for at in (0, len(texts) - 1):
+            rest = [(t, True) for i, t in enumerate(texts) if i != at]
+            variants.append(_fill_percent(texts[at], rest, {}, True)[0])
+            variants.append(_fill_format(texts[at], rest, {}, True)[0])
+    return "".join(dict.fromkeys(_hedge(v) for v in variants))
 
 
 def _int_literal(node: ast.AST | None) -> int | None | str:
@@ -671,10 +692,22 @@ def _fill_percent(template: str, positional: list[tuple[str, bool]], named: dict
             break
         out.append(template[pos:at])
         parsed = _percent_field(template, at)
-        if parsed is None:  # a `%` the fold cannot parse: nothing after it is read
+        if parsed is None:  # a `%` the fold cannot parse: the field is unknown, but the literal text AFTER it is still the template's (pass-22 A1)
             out.append(_WILD)
             ok = False
-            break
+            lost = True  # the arguments after an unknown field are not tracked
+            pos = at + 1
+            if template.startswith("(", pos):  # a key runs to its balanced close paren; with none it runs to the end
+                depth = 0
+                for j in range(pos, len(template)):
+                    depth += (template[j] == "(") - (template[j] == ")")
+                    if depth == 0:
+                        pos = j + 1
+                        break
+                else:
+                    pos = len(template)
+            pos = _PERCENT_UNPARSED_RE.match(template, pos).end()  # what a field may still take: flags, width, precision, length, one conversion character
+            continue
         key, flags, width, precision, conv, pos = parsed
         if conv == "%":
             out.append("%")
@@ -697,7 +730,7 @@ def _fill_percent(template: str, positional: list[tuple[str, bool]], named: dict
             ok = False
         elif value[1] and not _spec_too_big((width, precision)):
             try:
-                out.append(("%" + flags + (width or "") + ("." + precision if precision else "") + conv) % (value[0],))
+                out.append(("%" + flags + (width or "") + ("." + precision if precision is not None else "") + conv) % (value[0],))
             except (ValueError, TypeError):
                 out.append(_WILD)
                 ok = False
@@ -1623,6 +1656,23 @@ def _unsplice(script: str) -> str:
     return _SPLICED_WORD_RE.sub(bare, script)
 
 
+_QUOTED_LAUNCH_RE = re.compile(r"'\s*(start-process|saps|start)\s*'|\"\s*(start-process|saps|start)\s*\"", re.IGNORECASE)
+
+
+_NESTED_SCRIPT_PARAM_RE = re.compile(r"(?<!\S)-(?:c|a)\w*(?=[\s:]|$)", re.IGNORECASE)  # -Command / -c / -ArgumentList / -args: a value that PowerShell parses as a script
+
+
+def _might_launch(text: str, nested_value: bool = True) -> bool:
+    """The cheap filter in front of ``_judge_script``, read the way ``_judge_script`` reads its input: typographic characters mapped, backticks dropped
+    (and the double-quote reading of the text), quote splices taken out, THEN the launch words looked for. A quoted value that is NOT handed to a
+    command parameter that parses it (``Write-Host 'Start-Proce`ss'``) is text, so its backtick stays a plain character there (``nested_value`` False)."""
+    if not nested_value:
+        return bool(_START_PROCESS_RE.search(text))
+    text = text.translate(_PS_CHAR_MAP)
+    readings = (text, _unescape_ps(text), _dq_value(text)) if "`" in text else (text,)
+    return any(_START_PROCESS_RE.search(r) or _QUOTED_LAUNCH_RE.search(r) for r in (*readings, *(_unsplice(r) for r in readings)))
+
+
 def _judge_script(script: str) -> tuple[int, int]:
     """(Start-Process / saps / start statements, those lacking their own outer -WindowStyle Hidden). Quoted text is a nested script.
 
@@ -1669,7 +1719,8 @@ def _judge_script(script: str) -> tuple[int, int]:
             inner = statement[s + 1:e]
             if statement[s] == '"':
                 inner = _dq_value(inner)  # what a nested script made of this string would read
-            if (s, e) not in command_names and _START_PROCESS_RE.search(inner):
+            # A nested script is judged by _judge_script, which unescapes and unsplices it; a filter on the RAW inner would miss Sta"rt"-Proce`ss (pass-22 A2)
+            if (s, e) not in command_names and _might_launch(inner, bool(_NESTED_SCRIPT_PARAM_RE.search(statement[:s]))):
                 inner_found, inner_bad = _judge_script(inner)
                 found += inner_found
                 bad += inner_bad
@@ -1684,7 +1735,7 @@ def _text_base(node: ast.AST, consts: dict[str, str]) -> bool:
     """True when the chain of method calls and subscripts under ``node`` ends in a text ``_flatten`` reads (a string literal, a built string,
     a name bound once to a string)."""
     while True:
-        node = _bound_form(node)
+        node = _bound_form(node, consts)
         if isinstance(node, ast.Subscript):
             node = node.value
         elif isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
@@ -1698,7 +1749,7 @@ def _text_base(node: ast.AST, consts: dict[str, str]) -> bool:
 def _folds(node: ast.AST, consts: dict[str, str]) -> bool:
     """True when ``_flatten`` reads this node's text through a fold (the PowerShell side asks exactly this of every node, so it judges everything the
     Python side reads: a slice, a case or strip mapper, ``chr``, ``decode``, and a string method the fold has no arm for, by way of ``_hedge``)."""
-    node = _bound_form(node)  # ``str.m(s, ...)`` / ``operator.concat(a, b)`` are read as ``s.m(...)`` / ``a + b``
+    node = _bound_form(node, consts)  # ``str.m(s, ...)`` / ``operator.concat(a, b)`` are read as ``s.m(...)`` / ``a + b``
     if isinstance(node, (ast.JoinedStr, ast.BinOp)):
         return True
     if isinstance(node, ast.Subscript):
@@ -1793,10 +1844,9 @@ def _start_process_violations(py_source: str) -> tuple[int, list[int]]:
         text = text.translate(_PS_CHAR_MAP)  # typographic quotes and dashes are the ASCII ones to PowerShell
         # a backtick-escaped name (bareword) or a `n boundary (double quotes) must not hide the launch from the filter; every reading is unspliced AFTER it is
         # unescaped (the order _judge_script uses), because a backtick is not in a spliced word's class: St`art-Pro'cess' is Start-Process (G17)
-        flats = tuple(_unsplice(flat) for flat in ((text, _unescape_ps(text), _dq_value(text)) if "`" in text else (text,)))
-        text = _unsplice(text)  # `Start-"Process"` is Start-Process
-        if not any(_START_PROCESS_RE.search(flat) for flat in flats) and not re.search(r"'\s*(start-process|saps|start)\s*'|\"\s*(start-process|saps|start)\s*\"", text, re.I):
+        if not _might_launch(text):
             continue
+        text = _unsplice(text)  # `Start-"Process"` is Start-Process
         text_found, text_bad = _judge_script(text)
         found += text_found
         bad.extend([lineno] * text_bad)
@@ -3942,6 +3992,61 @@ class AdversaryR9Tests(unittest.TestCase):
                        "Start-Process cmd.exe -WindowStyle Hid\"den\"", "Start-Process cmd.exe -WindowStyle \"Hidden\",x", "Start-Process cmd.exe -WindowStyle Hidden` -Wait",
                        "Start-Process cmd.exe -WindowStyle Hidden,Minimized`\n -Wait", "Start-Process cmd.exe -WindowStyle Hidden`x"):
             self.assertEqual(_judge_script(script), (1, 1), script)
+
+    # ---- pass 22 (review-adversary-MLV-LANE-CONSOLE-HIDDEN-1-r9-d1f2aea1) A1-A3, as classes ----
+    def test_pass22_a1_a_percent_field_the_fold_cannot_parse_never_cuts_the_literal_text_after_it(self):
+        for expr in ("'%.ssubprocess_exec' % 'unused'", "'%.0ssubprocess_exec' % 'u'", "'%-.ssubprocess_exec' % 'u'",
+                     "'%(a).ssubprocess_exec' % {'a': 'u'}", "'%.*ssubprocess_exec' % (0, 'u')", "'%.s%.ssubprocess_exec' % ('u', 'v')",
+                     "'%.s' % 'x' + 'subprocess_exec'",
+                     "('%.s' + 'subprocess_') % 'x' + 'exec'", "'%.ssubprocess_%.sexec' % ('a', 'b')", "'%.ssubprocess_%sexec' % ('a', '')"):
+            self.assertGreaterEqual(len(self._bad(self._launch(expr))), 1, expr)
+        self.assertEqual(_flatten(ast.parse("'%.ssubprocess_exec' % 'unused'", mode="eval").body, {}), ("subprocess_exec", True))  # `%.s` is precision 0: nothing is printed
+        for expr in ("'%.ssaps cmd.exe' % 'unused'", f"'%.s{self.SP} cmd.exe' % 'unused'", f"'%5.s{self.SP} cmd.exe' % 'u'", f"'%(a).s{self.SP} cmd.exe' % {{'a': 'u'}}"):
+            self.assertEqual(self._ps(expr), (1, 1), expr)
+        for expr in ("'%.s' % 'unused'", "'%.sx' % a", "'%s: %.3s' % (a, b)", "'%.s%.s' % (a, b)", "'%.s' % kind + 'value'", "'%zvalue' % 'u'"):
+            self.assertEqual(self._bad(self._launch(expr)), [], expr)
+
+    def test_pass22_a2_a_nested_quoted_script_is_judged_after_unescaping_and_unsplicing(self):
+        outer = "Start-Process powershell.exe -WindowStyle Hidden -ArgumentList '-NoProfile','-Command','{}'"
+        for inner in ("Sta\"rt\"-Proce`ss cmd.exe", "s\"a\"`ps cmd.exe", "St`art-Pro\"cess\" cmd.exe", "Start-Process cmd.exe", "s`aps cmd.exe"):
+            script = outer.format(inner)
+            self.assertEqual(self._ps(repr(script)), (2, 1), inner)  # the hidden outer launch is fine; the inner one it hands to PowerShell is not
+            self.assertEqual(_judge_script(script), (2, 1), inner)
+            self.assertEqual(self._ps(repr(outer.format(inner + " -WindowStyle Hidden"))), (2, 0), inner)
+        dq = 'Start-Process powershell.exe -WindowStyle Hidden -ArgumentList "-Command","Sta\'rt\'-Pr`ocess cmd.exe"'
+        self.assertEqual(self._ps(repr(dq)), (2, 1))
+        for inner in ("Write-Host hi", "Get-Date", "st'ar'tup"):  # a nested script that launches nothing adds nothing
+            self.assertEqual(self._ps(repr(outer.format(inner))), (1, 0), inner)
+
+    def test_pass22_a3_the_fold_does_not_depend_on_the_name_a_module_or_type_was_imported_under(self):
+        aliases = {
+            "operator as op": ("import operator as op\n", ["op.concat('subprocess_', 'exec')", "op.add('subprocess_', 'exec')", "op.mod('%sexec', 'subprocess_')",
+                                                           "op.mul('subprocess_exec', 1)", "''.join(reversed(op.concat('cexe_', 'ssecorpbus')))"]),
+            "from operator import concat": ("from operator import concat, add, mod\n", ["concat('subprocess_', 'exec')", "add('subprocess_', 'exec')", "mod('%sexec', 'subprocess_')"]),
+            "builtins as b": ("import builtins as b\n", ["b.str.lower('SUBPROCESS_EXEC')", "b.str.removeprefix('zzsubprocess_exec', 'zz')", "b.str.format('{}exec', 'subprocess_')"]),
+            "str alias": ("S = str\nT = type('')\n", ["S.lower('SUBPROCESS_EXEC')", "S.join('', ['subprocess_', 'exec'])", "T.lower('SUBPROCESS_EXEC')", "S.__add__('subprocess_', 'exec')"]),
+            "method alias": ("low = str.lower\nrm = str.removeprefix\n", ["low('SUBPROCESS_EXEC')", "rm('zzsubprocess_exec', 'zz')"]),
+            "reversed alias": ("rv = reversed\nfrom builtins import reversed as rev\n", ["''.join(rv('cexe_ssecorpbus'))", "''.join(rev('cexe_ssecorpbus'))"]),
+            "functools": ("import functools\n", ["functools.reduce(op_add, ['subprocess_', 'exec'])", "ident('subprocess_', 'exec')", "ident('exec', 'subprocess_')"]),
+        }
+        for label, (prefix, exprs) in aliases.items():
+            for expr in exprs:
+                self.assertGreaterEqual(len(self._bad(prefix + self._launch(expr))), 1, (label, expr))
+        for expr in ("op.concat('Start-', 'Process cmd.exe')", "b.str.lower('START-PROCESS cmd.exe')", "b.str.removeprefix('zzStart-Process cmd.exe', 'zz')",
+                     "type('').join('', ['sap', 's cmd.exe'])", "S.__add__('Start-', 'Process cmd.exe')", "add('sap', 's cmd.exe')", "mod('%saps cmd.exe', 's')"):
+            self.assertEqual(self._ps(expr), (1, 1), expr)
+        # an INSTANCE method with a launch word as its argument is a call on something else: the fixture line `source.index("...Process]::Start(...)")`
+        for expr in ("source.index('$p = [System.Diagnostics.Process]::Start($i)')", "text.find('start')", "text.count('Start-Process')", "log.format('saps')"):
+            self.assertEqual(self._ps(expr)[1] <= self._ps(repr(expr.split("'")[1]))[1], True, expr)  # never worse than the argument text alone
+        for prefix, expr in (("import operator as op\n", "op.concat(a, b)"), ("import operator as op\n", "op.concat('sub', 'process')"), ("S = str\n", "S.lower(name)"),
+                             ("import builtins as b\n", "b.str.lower('hello')"), ("rv = reversed\n", "''.join(rv(name))"), ("", "ident('subprocess', 'exec')"),
+                             ("import os\n", "os.path.join('subprocess_', 'x')"), ("", "ident('value_', 'x')"), ("", "ident(a, b)"),
+                             ("tpl = 'abc{}'\n", "tpl.format('subprocess_')"), ("tpl = 'abc{}'\n", "tpl.replace('{}', 'subprocess_')"), ("", "'abc{}'.format('subprocess_')")):
+            self.assertEqual(self._bad(prefix + self._launch(expr)), [], (prefix, expr))
+        # a name bound to a text keeps its bound meaning: `tpl.format(...)` fills tpl, it does not make the argument the template
+        self.assertEqual(_flatten(ast.parse("tpl.format('subprocess_exec')", mode="eval").body, {"tpl": "abc{}"}), ("abcsubprocess_exec", True))
+        self.assertEqual(self._ps("S.lower('hello world')"), (0, 0))
+        self.assertEqual(self._ps("source.index('$p = [System.Diagnostics.Process]::Start($i)')"), (0, 0))  # the real fixture line (test_playback_host_load_gate.py)
 
     # ---- G16: the docstring names the fold set, not an example of an unread form ----
     def test_g16_the_powershell_limit_points_at_the_fold_set_and_does_not_call_chr_unread(self):
