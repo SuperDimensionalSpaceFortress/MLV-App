@@ -4697,3 +4697,90 @@ def test_r8b_a2_a_posix_put_aside_never_replaces_an_existing_destination(tmp_pat
     with pytest.raises(OSError):
         ob._rename_verified(work, other, ob._file_id(work))
     assert work.exists() and os.lstat(other).st_ino == keep.st_ino, "the unrelated destination was replaced"
+
+
+# Adversary pass r9 on b4a557e8: A1 (blocker) the by-handle final-path check folded case, so on a case-sensitive directory a
+# handle reached through a junction to the case-distinct sibling (`a` for `A`) was accepted and deleted through. A2 (major) the
+# POSIX put-aside checked the destination, then renamed by name: a destination created in between was replaced. A3 (major) a root
+# named through a link whose real path ends in a dot was resolved AFTER the ambiguity check, so the scratch was made at a
+# literal dotted name that tempfile/abspath then trimmed, and the created directory was orphaned.
+
+def _kernel_saying(reached):
+    class Kernel:
+        @staticmethod
+        def GetFinalPathNameByHandleW(handle, buffer, size, flags):
+            buffer.value = reached
+            return len(reached)
+
+        @staticmethod
+        def GetLongPathNameW(name, buffer, size):                         # a case-sensitive directory: the name exists as written
+            buffer.value = name
+            return len(name)
+    return Kernel
+
+
+@pytest.mark.skipif(os.name != "nt", reason="the by-handle final-path check is Windows only")
+def test_r9_a1_the_final_path_check_does_not_fold_case_between_distinct_names(monkeypatch):
+    drive = os.path.splitdrive(os.path.abspath(os.sep))[0]
+    asked = drive + r"\s\A\precious.txt"
+    reached = "\\\\?\\" + drive + r"\s\a\precious.txt"                    # the handle is on the case-distinct sibling
+    monkeypatch.setattr(ob, "_kernel32", lambda: _kernel_saying(reached))
+    assert ob._at_its_own_name(1, asked) is False, "a handle on `a` was taken for the name `A`"
+
+
+@pytest.mark.skipif(os.name != "nt", reason="the by-handle final-path check is Windows only")
+def test_r9_a1_sibling_the_final_path_check_still_accepts_the_same_name_and_a_drive_letter_in_another_case(monkeypatch):
+    drive = os.path.splitdrive(os.path.abspath(os.sep))[0]
+    asked = drive.lower() + r"\s\A\precious.txt"
+    reached = "\\\\?\\" + drive.upper() + r"\s\A\precious.txt"
+    monkeypatch.setattr(ob, "_kernel32", lambda: _kernel_saying(reached))
+    assert ob._at_its_own_name(1, asked) is True
+
+
+def test_r9_a2_a_posix_put_aside_never_replaces_a_destination_created_after_the_check(tmp_path, monkeypatch):
+    real_os = os
+
+    class Path_:
+        def __getattr__(self, item):
+            return getattr(real_os.path, item)
+
+        def lexists(self, path):                                          # absent when checked; another process creates it at once
+            got = real_os.path.lexists(path)
+            if not got and str(path).endswith("work.rm-0000000000000000"):
+                real_os.mkdir(path)
+            return got
+
+    class PosixOs:
+        name = "posix"
+        path = Path_()
+
+        def __getattr__(self, item):
+            return getattr(real_os, item)
+
+        def rename(self, src, dst):                                      # POSIX rename(2): an existing empty directory is replaced
+            if real_os.path.isdir(dst):
+                real_os.rmdir(dst)
+            return real_os.rename(src, dst)
+
+    work, other = tmp_path / "work", tmp_path / "work.rm-0000000000000000"
+    work.mkdir()
+    monkeypatch.setattr(ob, "os", PosixOs())
+    with pytest.raises(OSError):
+        ob._rename_verified(work, other, ob._file_id(work))
+    assert work.exists(), "the pinned directory was moved onto a destination another process created"
+
+
+@pytest.mark.skipif(os.name != "nt", reason="trailing-dot trimming of a bare name is a Windows path rule")
+def test_r9_a3_a_root_that_resolves_to_a_trailing_dot_name_is_refused_before_anything_is_created(tmp_path, monkeypatch):
+    bus = tmp_path / "bus"
+    (bus / ".git").mkdir(parents=True)
+    alias = tmp_path / "scratch-alias"
+    alias.mkdir()
+    dotted = "\\\\?\\" + str(tmp_path / "scratch.")
+    monkeypatch.setattr(ob, "_real", lambda path, strict=False: dotted if "scratch-alias" in str(path) else str(path))
+    made_in = []
+    monkeypatch.setattr(ob.tempfile, "mkdtemp", lambda *a, **k: made_in.append(k.get("dir")) or str(tmp_path / "x"))
+    with pytest.raises(ob.Unknown) as caught:
+        ob.make_exercise_scratch(bus, alias)
+    assert caught.value.code == "EXERCISE_SCRATCH_ROOT_AMBIGUOUS", caught.value
+    assert not made_in, f"a scratch was made in {made_in!r}"

@@ -4016,7 +4016,13 @@ def _at_its_own_name(handle, path: str) -> bool:
             name = "\\\\" + name[8:]
         elif name.startswith("\\\\?\\"):
             name = name[4:]
-        return os.path.normcase(name)
+        # Case is NOT folded (r9 A1): a case-sensitive directory may hold `A` and `a` as two objects, and a junction to the
+        # sibling would pass a folded comparison. GetLongPathNameW already gave `wanted` the on-disk case of every component; only
+        # the drive letter (and a UNC host/share) is case-insensitive by definition, so just those are folded.
+        if name.startswith("\\\\"):
+            host, share, rest = (name[2:].split("\\", 2) + ["", ""])[:3]
+            return "\\\\" + host.lower() + "\\" + share.lower() + ("\\" + rest if rest else "")
+        return name[:1].upper() + name[1:] if name[1:2] == ":" else name
     return plain(final) == plain(wanted)
 
 
@@ -4449,7 +4455,18 @@ def _rename_verified(src: pathlib.Path, dst: pathlib.Path, ident: tuple[int, int
             raise _NotOurs(f"{src} is not the scratch directory pinned for it")
         if os.path.lexists(dst):                                        # rename(2) replaces an empty directory silently (r8 A2):
             raise FileExistsError(17, "the destination already exists", os.fspath(dst))   # retried under a fresh name
-        _meta(os.rename, src, dst)
+        # A name taken between that check and the rename would still be replaced (r9 A2), so the name is CLAIMED atomically first:
+        # mkdir fails when anything holds it (FileExistsError, retried under a fresh name), and what rename then replaces is the
+        # empty directory this call just made. Removing that claim again when the rename fails leaves nothing behind.
+        _meta(os.mkdir, dst)
+        try:
+            _meta(os.rename, src, dst)
+        except BaseException:
+            try:
+                os.rmdir(dst)
+            except OSError:
+                pass
+            raise
         return
     import ctypes
     import msvcrt
@@ -4565,7 +4582,11 @@ def make_exercise_scratch(bus: pathlib.Path, scratch_root: pathlib.Path) -> tupl
                       f"bare name; nothing was created")                # `\\?\` is another directory, and tempfile trims it again (r8 A1)
     scratch_root.mkdir(parents=True, exist_ok=True)
     scratch_root = pathlib.Path(_real(scratch_root))                    # a root named through a link or junction: made under its real path
-    base = pathlib.Path(tempfile.mkdtemp(prefix=ROUTE_SCRATCH_PREFIX, dir=str(scratch_root)))
+    if os.name == "nt" and any(part.endswith((".", " ")) and part not in (".", "..")
+                               for part in os.fspath(scratch_root).removeprefix("\\\\?\\").split("\\")):
+        raise Unknown("EXERCISE_SCRATCH_ROOT_AMBIGUOUS",                # the same check on the RESOLVED root: a link whose target ends in a dot (r9 A3)
+                      f"scratch root {scratch_root} (resolved) has a component ending in a dot or a space; nothing was created")
+    base =pathlib.Path(tempfile.mkdtemp(prefix=ROUTE_SCRATCH_PREFIX, dir=str(scratch_root)))
     _SCRATCH_PINS[_scratch_key(base)] = (None, None)                    # made by THIS run, identity not yet read: never adopted later
     _SCRATCH_ROOTS[_scratch_key(base)] = str(scratch_root)              # the real root, as made under: removal never re-resolves it
     try:
