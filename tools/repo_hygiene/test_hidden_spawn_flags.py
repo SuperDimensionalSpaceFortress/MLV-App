@@ -353,6 +353,28 @@ _DUNDER_BINOPS = {"__add__": (ast.Add, False), "__radd__": (ast.Add, True), "__m
 _STR_METHODS = frozenset(name for name in dir(str) if not name.startswith("_")) | {"decode"}  # every public method of str, for a call spelled through the type
 
 
+_AMBIGUOUS_ACTIVE: set[int] = set()
+_STR_ALIASES: set[str] = set()  # names the file being scanned binds to the str type (`S = str`, `from builtins import str as S`); set per scan by _note_aliases
+
+
+def _note_aliases(tree: ast.AST) -> None:
+    _STR_ALIASES.clear()
+    for n in ast.walk(tree):
+        if isinstance(n, ast.Assign) and len(n.targets) == 1 and isinstance(n.targets[0], ast.Name):
+            v = n.value
+            if ((isinstance(v, ast.Name) and v.id in ("str", "bytes")) or (isinstance(v, ast.Attribute) and v.attr in ("str", "bytes", "__class__"))
+                    or (isinstance(v, ast.Call) and isinstance(v.func, ast.Name) and v.func.id == "type")):
+                _STR_ALIASES.add(n.targets[0].id)
+        elif isinstance(n, ast.ImportFrom) and n.module == "builtins":
+            _STR_ALIASES.update(a.asname or a.name for a in n.names if a.name in ("str", "bytes"))
+
+
+def _type_like(recv: ast.AST) -> bool:
+    """``str`` / ``bytes`` under any name the file gives them, ``builtins.str``, ``type(x)``, ``x.__class__``: the receiver of an UNBOUND string method."""
+    return ((isinstance(recv, ast.Name) and (recv.id in ("str", "bytes") or recv.id in _STR_ALIASES)) or (isinstance(recv, ast.Attribute) and recv.attr in ("str", "bytes", "__class__"))
+            or (isinstance(recv, ast.Call) and isinstance(recv.func, ast.Name) and recv.func.id == "type"))
+
+
 def _bound_form(node: ast.AST, consts: dict[str, str]) -> ast.AST:
     """The bound form of a call the fold reads under another spelling (G15): ``str.m(s, ...)`` is ``s.m(...)``, ``operator.concat(a, b)`` and
     ``a.__add__(b)`` are ``a + b`` (``add`` / ``mod`` / ``mul`` and their reflected forms too), and ``reversed([a, b])`` / ``list([a, b])`` are the
@@ -372,16 +394,14 @@ def _bound_form(node: ast.AST, consts: dict[str, str]) -> ast.AST:
     if plain and not _text_base(recv, consts):
         # The receiver is a module or a type under ANY name (``op = operator``, ``import builtins as b``, ``S = str``, ``type('')``, ``''.__class__``): a call of an
         # operator function, a dunder or a string method through it is read by its method name, never by the spelling of the receiver (pass-22 A3).
-        if attr in _OPERATOR_BINOPS and len(node.args) == 2 and not node.keywords and all(_text_base(a, consts) for a in node.args):
+        if attr in _OPERATOR_BINOPS and len(node.args) == 2 and not node.keywords:  # (mod's second operand may be a tuple or a mapping)
             return ast.BinOp(left=node.args[0], op=_OPERATOR_BINOPS[attr](), right=node.args[1])
         if attr in _DUNDER_BINOPS and len(node.args) == 2 and not node.keywords:  # str.__add__(a, b)
             op, reflected = _DUNDER_BINOPS[attr]
             return ast.BinOp(left=node.args[1] if reflected else node.args[0], op=op(), right=node.args[0] if reflected else node.args[1])
         # A string method called on the TYPE: `str`, `builtins.str`, `type(x)`, `x.__class__`. Any other receiver may be an instance (`source.index('needle')`), whose
         # argument is not the text the method works on; those calls stay a call the fallback hedges (their arguments are hedged, never read as a receiver).
-        if (node.args and _text_base(node.args[0], consts) and (
-                (isinstance(recv, ast.Name) and recv.id in ("str", "bytes")) or (isinstance(recv, ast.Attribute) and recv.attr in ("str", "bytes", "__class__"))
-                or (isinstance(recv, ast.Call) and isinstance(recv.func, ast.Name) and recv.func.id == "type"))):  # str.lower(s, ...) is s.lower(...)
+        if node.args and _text_base(node.args[0], consts) and _type_like(recv):  # str.lower(s, ...) is s.lower(...)
             node = ast.Call(func=ast.Attribute(value=node.args[0], attr=attr, ctx=ast.Load()), args=node.args[1:], keywords=node.keywords)
             recv = node.func.value
     if attr in _DUNDER_BINOPS and len(node.args) == 1 and not node.keywords and plain:
@@ -404,6 +424,8 @@ def _flatten(node: ast.AST, consts: dict[str, str], depth: int = 0) -> tuple[str
         return _WILD, False
     node = _bound_form(node, consts)
     if isinstance(node, ast.Constant):
+        if isinstance(node.value, bytes):
+            return node.value.decode("utf-8", "replace"), True  # b'subprocess_' + b'exec' read as the text it spells
         return (node.value, True) if isinstance(node.value, str) else (_WILD, False)  # a number can print as any character (`{115:c}`)
     if isinstance(node, ast.Name):
         value = consts.get(node.id) if isinstance(node.ctx, ast.Load) else None
@@ -455,6 +477,17 @@ def _flatten(node: ast.AST, consts: dict[str, str], depth: int = 0) -> tuple[str
         method, recv = node.func.attr, node.func.value
         if method == "join" and len(node.args) == 1 and not node.keywords:
             node = ast.Call(func=node.func, args=[_bound_form(node.args[0], consts)], keywords=[])  # ''.join(reversed(['a', 'b'])) joins the list reversed
+        if (method in _STR_METHODS and node.args and not isinstance(node.args[0], ast.Starred) and not _text_base(recv, consts) and _text_base(node.args[0], consts)
+                and id(node.func) not in _AMBIGUOUS_ACTIVE):  # keyed by the callee: a rebuilt call node shares it
+            # `S.format('{}{}', 'a', 'b')`: S may be the str type under a name this scan cannot resolve (the first argument is then the text) or an instance of
+            # something (the first argument is then an argument). Both readings are kept, side by side (pass-23 A1).
+            _AMBIGUOUS_ACTIVE.add(id(node.func))
+            try:
+                own = _flatten(node, consts, depth + 1)[0]
+            finally:
+                _AMBIGUOUS_ACTIVE.discard(id(node.func))
+            alt = _flatten(ast.Call(func=ast.Attribute(value=node.args[0], attr=method, ctx=ast.Load()), args=node.args[1:], keywords=node.keywords), consts, depth + 1)[0]
+            return (own if own == alt else own + _WILD + alt), False
         if method in ("format", "format_map"):
             template, known = _flatten(recv, consts, depth + 1)
             if method == "format_map":
@@ -506,6 +539,11 @@ def _flatten(node: ast.AST, consts: dict[str, str], depth: int = 0) -> tuple[str
             return getattr(text, method)(), True
     if isinstance(node, (ast.List, ast.Tuple, ast.Set)) and not any(isinstance(e, ast.Starred) for e in node.elts):
         return "".join(_flatten(e, consts, depth + 1)[0] for e in node.elts), False  # a list of texts read as the texts side by side (read only as an argument of a call the fold has no arm for)
+    if isinstance(node, ast.Dict) and all(k is not None for k in node.keys):
+        return "".join(_flatten(e, consts, depth + 1)[0] for pair in zip(node.keys, node.values) for e in pair), False  # a mapping: its keys and values side by side
+    if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr in ("decode", "encode"):
+        text, known = _flatten(node.func.value, consts, depth + 1)  # bytes and text read the same here; an explicit codec may change the characters
+        return text, known and not node.args and not node.keywords
     if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "reversed" and len(node.args) == 1 and not node.keywords:
         text, known = _flatten(node.args[0], consts, depth + 1)  # the characters of a text, backwards (only ever read by a ``''.join``)
         return text[::-1], known
@@ -599,9 +637,20 @@ def _fill_unknown_template(template: str, percent: bool) -> tuple[str, bool]:
     closing brace, or up to its key, flags, width and conversion character): that much of the segment is not trusted, the rest is kept."""
     out = []
     for i, seg in enumerate(re.split(re.escape(_WILD) + "+", template)):
+        # The head of a segment after a wildcard may be the tail of a field the wildcard opened, or may not: BOTH readings are kept (side by side, a wildcard
+        # between them), because dropping the head hides the literal text it holds (``(prefix + 'subprocess_exec{tail}').format(tail='')``, pass-23 A4).
+        lead = ""
         if i:
-            seg = seg[_PERCENT_TAIL_RE.match(seg).end():] if percent else seg[seg.rfind("}") + 1:]
-        out.append((_fill_percent if percent else _fill_format)(seg, [], {}, False, any_pos=True, any_named=True)[0])
+            # The head may be the tail of a field the wildcard opened (a key up to its paren, flags, width, precision and ONE conversion character; or up to a
+            # closing brace) or plain text. It is replaced by a wildcard, never deleted, and only as far as a field tail can reach: a literal name that
+            # starts at the head's conversion letter is still supplied by the wildcard, and one after it is kept whole (pass-23 A4).
+            if percent and not seg.startswith("%"):  # a segment that opens with its own field has no tail of an earlier one to shed
+                seg, lead = seg[re.match(r"(?:[^()]*\))?[#0\- +0-9.*hlL]*[A-Za-z%]?", seg).end():], _WILD
+            elif not percent:
+                close = seg.find("}")
+                if close >= 0 and "{" not in seg[:close]:  # a field the wildcard opened closes at this brace; a brace after a '{' closes the segment's OWN field
+                    seg, lead = seg[close + 1:], _WILD
+        out.append(lead + (_fill_percent if percent else _fill_format)(seg, [], {}, False, any_pos=True, any_named=True)[0])
     return _WILD.join(out), False
 
 
@@ -1476,6 +1525,7 @@ def _hidden_names(tree: ast.AST, facts: _Facts) -> tuple[set[str], set[str]]:
 
 def _unflagged_spawns_in_source(source: str, label: str) -> list[str]:
     tree = ast.parse(source, filename=label)
+    _note_aliases(tree)
     facts = _Facts(tree)
     hidden, module_like = _hidden_names(tree, facts)
     bad = [f"{label}:{line} {why}" for line, why in _reference_violations(tree, facts)]
@@ -1836,7 +1886,9 @@ def _start_process_violations(py_source: str) -> tuple[int, list[int]]:
     (f-string, ``%``, ``.format``, ``.join``) is REPORTED: its text is not known, so it cannot be proven hidden.
     """
     found, bad = 0, []
-    for lineno, text, built in _string_values(ast.parse(py_source)):
+    tree = ast.parse(py_source)
+    _note_aliases(tree)
+    for lineno, text, built in _string_values(tree):
         if built:
             found += 1
             bad.append(lineno)
@@ -4047,6 +4099,53 @@ class AdversaryR9Tests(unittest.TestCase):
         self.assertEqual(_flatten(ast.parse("tpl.format('subprocess_exec')", mode="eval").body, {"tpl": "abc{}"}), ("abcsubprocess_exec", True))
         self.assertEqual(self._ps("S.lower('hello world')"), (0, 0))
         self.assertEqual(self._ps("source.index('$p = [System.Diagnostics.Process]::Start($i)')"), (0, 0))  # the real fixture line (test_playback_host_load_gate.py)
+
+    # ---- pass 23 (review-adversary-MLV-LANE-CONSOLE-HIDDEN-1-r9-7b06e18a) A1-A4, as classes ----
+    def test_pass23_a1_a_string_method_through_an_alias_of_the_type_reads_its_arguments(self):
+        for prefix, expr in (("S = str\n", "S.format('{}{}', 'subprocess_', 'exec')"), ("S = str\n", "S.format_map('{a}{b}', {'a': 'subprocess_', 'b': 'exec'})"),
+                             ("from builtins import str as S\n", "S.format('{}{}', 'subprocess_', 'exec')"), ("T = type('')\n", "T.join('', ['subprocess_', 'exec'])"),
+                             ("", "make().format('{}{}', 'subprocess_', 'exec')"), ("", "S.format('{}{}', 'subprocess_', 'exec')"),
+                             ("S = str\n", "S.format('{}exec', 'subprocess_')"), ("S = str\n", "S.replace('zzsubprocess_exec', 'zz', '')")):
+            for method in ("subprocess_exec", ):
+                self.assertGreaterEqual(len(self._bad(prefix + self._launch(expr))), 1, (prefix, expr))
+        for prefix, expr in (("S = str\n", "S.format('{}{}', 'sa', 'ps cmd.exe')"), ("S = str\n", "S.join('', ['sa', 'ps cmd.exe'])"), ("", "S.format('{}{}', 'sa', 'ps cmd.exe')")):
+            found, bad = _start_process_violations(prefix + f"script = {expr}\n")
+            self.assertEqual((found, len(bad)), (1, 1), (prefix, expr))
+        for prefix, expr in (("S = str\n", "S.format('{}', a)"), ("S = str\n", "S.lower(name)"), ("", "log.format('{}-{}', 'a', 'b')")):
+            self.assertEqual(self._bad(prefix + self._launch(expr)), [], (prefix, expr))
+
+    def test_pass23_a2_an_operator_function_with_a_mapping_or_tuple_operand_is_read(self):
+        for prefix, expr in (("import operator as op\n", "op.mod('%(a)s%(b)s', {'a': 'subprocess_', 'b': 'exec'})"), ("import operator as op\n", "op.mod('%s%s', ('subprocess_', 'exec'))"),
+                             ("", "ident.mod('%(a)s%(b)s', {'a': 'subprocess_', 'b': 'exec'})"), ("", "mod('%(a)s%(b)s', {'a': 'subprocess_', 'b': 'exec'})"),
+                             ("S = str\n", "S.format_map('{a}{b}', {'a': 'subprocess_', 'b': 'exec'})"), ("import operator as op\n", "op.add(prefix, 'subprocess_exec')"),
+                             ("import operator as op\n", "op.concat('subprocess_', suffix)")):
+            self.assertGreaterEqual(len(self._bad(prefix + self._launch(expr))), 1, (prefix, expr))
+        for expr in ("op.mod('%(a)s%(b)s', {'a': 'sa', 'b': 'ps cmd.exe'})", "op.mod('%s%s', ('sa', 'ps cmd.exe'))", "mod('%(a)s%(b)s', {'a': 'Start-', 'b': 'Process cmd.exe'})"):
+            self.assertEqual(self._ps(expr), (1, 1), expr)
+        for prefix, expr in (("import operator as op\n", "op.mod('%(a)s%(b)s', {'a': 'sub', 'b': 'process'})"), ("import operator as op\n", "op.add(a, b)")):
+            self.assertEqual(self._bad(prefix + self._launch(expr)), [], (prefix, expr))
+
+    def test_pass23_a3_bytes_fragments_and_an_explicit_codec_read_as_the_text_they_spell(self):
+        for expr in ("(b'subprocess_' + b'exec').decode()", "b'subprocess_'.decode('ascii') + b'exec'.decode('ascii')", "(b'subprocess_' + b'exec').decode('utf-8')",
+                     "'subprocess_exec'.encode().decode()", "(b'subprocess_' b'exec').decode()", "bytes.decode(b'subprocess_' + b'exec')", "(b'sub' + b'process_' + b'exec').decode('latin-1')"):
+            self.assertGreaterEqual(len(self._bad(self._launch(expr))), 1, expr)
+        for expr in ("(b'Start-' + b'Process cmd.exe').decode()", "b'saps cmd.exe'.decode('ascii')", "(b'sa' + b'ps cmd.exe').decode('utf-8')"):
+            self.assertEqual(self._ps(expr), (1, 1), expr)
+        for expr in ("(b'value_' + b'x').decode()", "b'abc'.decode('ascii')", "(b'hello' + b' world').decode()"):
+            self.assertEqual(self._bad(self._launch(expr)), [], expr)
+            self.assertEqual(self._ps(expr), (0, 0), expr)
+
+    def test_pass23_a4_a_template_with_an_unknown_part_keeps_the_literal_text_before_its_fields(self):
+        for prefix, expr in (("import os\nprefix = os.environ.get('MLV_PREFIX', '')\n", "(prefix + 'subprocess_exec{tail}').format(tail='')"),
+                             ("", "(prefix + 'subprocess_exec%(tail)s') % {'tail': ''}"), ("", "(prefix + 'subprocess_exec{}').format('')"), ("", "(prefix + 'subprocess_exec%s') % ''"),
+                             ("", "(prefix + 'x{a}subprocess_exec{b}').format(a='', b='')"), ("", "(prefix + '%ssubprocess_exec%s') % ('', '')"),
+                             ("", "(prefix + 'subprocess_exec{tail}').format_map({'tail': ''})"), ("", "(prefix + '{}subprocess_exec').format('')"),
+                             ("", "(prefix + '%(k)ssubprocess_exec') % {'k': ''}")):
+            self.assertGreaterEqual(len(self._bad(prefix + self._launch(expr))), 1, (prefix, expr))
+        for expr in ("(prefix + 'saps cmd.exe{tail}').format(tail='')", "(prefix + 'saps cmd.exe%(tail)s') % {'tail': ''}", "(prefix + '{}saps cmd.exe').format('')"):
+            self.assertEqual(self._ps(expr), (1, 1), expr)
+        for expr in ("(prefix + 'value{tail}').format(tail='')", "(prefix + '{}x').format('')", "(prefix + '%s: %d') % (a, b)", "(prefix + '{} {}').format(a, b)"):
+            self.assertEqual(self._bad(self._launch(expr)), [], expr)
 
     # ---- G16: the docstring names the fold set, not an example of an unread form ----
     def test_g16_the_powershell_limit_points_at_the_fold_set_and_does_not_call_chr_unread(self):
