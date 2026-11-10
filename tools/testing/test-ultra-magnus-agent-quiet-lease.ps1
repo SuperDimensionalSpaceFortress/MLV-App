@@ -1222,6 +1222,9 @@ try {
                 if ($f.hold -and $null -eq $f.holder) { $f.holderPath = $Tmp; $f.holder = [IO.FileStream]::new($Tmp, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read) }
                 $f.remaining--; $f.injected++
                 if ($f.kind -ceq 'denied') { throw [UnauthorizedAccessException]::new('injected: access denied on the sidecar rename') }
+                # pathMsg (r7, CoS G7): a real [IO.File]::Move IOException NAMES the tmp path in its message; the default injected message is path-free,
+                # so any case that must hold for a real message turns this on. The path in the message is the generated tmp, under the temp root.
+                if ($f.pathMsg) { throw [IO.IOException]::new("The process cannot access the file '$Tmp' because it is being used by another process.") }
                 throw [IO.IOException]::new('injected: the process cannot access the file because it is being used by another process')
             }
         }
@@ -1354,8 +1357,12 @@ try {
     #  2. the exact prefix 'SIDECAR-WRITE-FAILED job=<id> attempts=' (a literal, never a search);
     #  3. the writer's grammar right after '<n> ':  'tmp=removed <Type>: ' | 'tmp=unknown(<ErrType>) <Type>: ' | 'tmp_remaining=<dir>\<id>.json.<guid>.tmp <Type>: ';
     #  4. for removed/unknown, the rest of the message carries exactly ONE tmp token (tmp= or tmp_remaining=), else 'ambiguous'. A retained-file
-    #     line is NOT scanned past 'tmp_remaining=': its path (a temp root may hold ' attempts=1 tmp=removed ') and the exception tail are
-    #     free text; the path is instead pinned to the exact id's own tmp file, so a line written for a longer id is refused (CoS G4).
+    #     line is NOT scanned for tokens: its path (a temp root may hold ' attempts=1 tmp=removed ') and the exception tail are free text (CoS G4).
+    #     Two things are checked instead. (a) The path is pinned to the exact id's own tmp file after a separator, so a path whose file merely
+    #     ends in the id, or a longer id's tail, is refused ($null). (b) The tail after the header's '<Type>: ' must not hold a SECOND COMPLETE
+    #     writer header (' attempts=<n> <status> <Type>: '): that is a longer id's line read with a shorter id whose first header the id itself
+    #     spells (CoS G6), so the reading is 'ambiguous'. A tail that only mentions framing words, with no second complete header, is still free text.
+    #     The outcome's authority stays Data['tmp_state']; this text check only ever refuses, it never decides a status from identifier text.
     function Get-SidecarTmpStatus([Parameter(Mandatory)][string]$Message, [Parameter(Mandatory)][string]$JobId) {
         if ($JobId -cmatch 'job=|attempts=|tmp=|tmp_remaining=|[()]') { return 'ambiguous' }
         $prefix = "SIDECAR-WRITE-FAILED job=$JobId attempts="
@@ -1365,7 +1372,11 @@ try {
         # (adversary r6 A1: without the separator 'otherj.json.<guid>.tmp' read as j's, and a longer id's tail could be taken for the file name).
         if ($rest -cmatch '^\d+ tmp=removed [\w.\x60]+: ') { $status = 'tmp=removed' }
         elseif ($rest -cmatch '^\d+ tmp=unknown\([\w.\x60]+\) [\w.\x60]+: ') { $status = 'tmp=unknown' }
-        elseif ($rest -cmatch "^\d+ tmp_remaining=.+?[\\/]$([regex]::Escape($JobId))\.json\.[0-9a-fA-F]{32}\.tmp [\w.\x60]+: ") { return 'tmp_remaining=' }
+        elseif ($rest -cmatch "^\d+ tmp_remaining=.+?[\\/]$([regex]::Escape($JobId))\.json\.[0-9a-fA-F]{32}\.tmp [\w.\x60]+: (?<tail>(?s:.*))\z") {
+            # r7 (CoS G6): a second COMPLETE writer header in the tail means this is a longer id's line read with a shorter id (see the header, 4b).
+            if ($Matches['tail'] -cmatch '(?s) attempts=\d+ (?:tmp=removed|tmp=unknown\([\w.\x60]+\)|tmp_remaining=.+?) [\w.\x60]+: ') { return 'ambiguous' }
+            return 'tmp_remaining='
+        }
         else { return $null }
         if ([regex]::Matches($rest, 'tmp(?:_remaining)?=').Count -ne 1) { return 'ambiguous' }
         return $status
@@ -1388,8 +1399,8 @@ try {
     }
     # One Write-SidecarRaw under a persistent rename fault (kind 'io' | 'denied'), optionally holding the tmp open (-Hold) and/or with the
     # cleanup seam armed. Returns what the caller asserts on, then disposes the holder and removes every tmp the probe left behind.
-    function Invoke-SidecarCleanupProbe([string]$Jid, [string]$Kind, [bool]$Hold, $CleanupFault = $null, [bool]$Hide = $false) {
-        $fault = @{ skip = 0; remaining = 99; kind = $Kind; moves = 0; injected = 0; hold = $Hold; hide = $Hide; holder = $null; holderPath = $null }
+    function Invoke-SidecarCleanupProbe([string]$Jid, [string]$Kind, [bool]$Hold, $CleanupFault = $null, [bool]$Hide = $false, [bool]$PathMsg = $false) {
+        $fault = @{ skip = 0; remaining = 99; kind = $Kind; moves = 0; injected = 0; hold = $Hold; hide = $Hide; pathMsg = $PathMsg; holder = $null; holderPath = $null }
         $script:SidecarMoveFault = $fault; $script:SidecarCleanupFault = $CleanupFault
         $err = $null
         try { Write-SidecarRaw $Jid '{}' } catch { $err = $_ }
@@ -2759,7 +2770,16 @@ function Exit-HeavySlot {
             Assert-True ($null -ne $r.holderPath -and $r.holderPath.Contains(' attempts=1 tmp=removed ') -and $r.msg.Contains("tmp_remaining=$($r.holderPath)")) "cleanup-path-token(G4): premise - the retained-file report carries a full attempts=1 tmp=removed framing inside the path: msg=[$($r.msg)]"
             Assert-True ($r.data['tmp_state'] -ceq 'remaining' -and (Get-SidecarTmpStatus $r.msg 'jRt') -ceq 'tmp_remaining=') "cleanup-path-token(G4): the exact id's own line with a framed temp root reads tmp_remaining=: [$(Get-SidecarTmpStatus $r.msg 'jRt')]"
             $r = Invoke-SidecarCleanupProbe 'jRt' 'io' $false
-            Assert-True ($r.data['tmp_state'] -ceq 'removed' -and (Get-SidecarTmpStatus $r.msg 'jRt') -ceq 'tmp=removed') "cleanup-path-token(G4): a removed tmp under a framed temp root reads tmp=removed: [$(Get-SidecarTmpStatus $r.msg 'jRt')]"
+            # NOTE (CoS G7, r7): this removed result relies on a PATH-FREE injected fault message. A real [IO.File]::Move IOException names the tmp
+            # path, which here holds ' attempts=1 tmp=removed ', so the real removed line carries a second tmp= token and reads 'ambiguous' (below).
+            Assert-True ($r.data['tmp_state'] -ceq 'removed' -and $r.msg -cnotmatch [regex]::Escape($framedRoot) -and (Get-SidecarTmpStatus $r.msg 'jRt') -ceq 'tmp=removed') "cleanup-path-token(G4): a removed tmp under a framed temp root, with a path-free fault message, reads tmp=removed: [$(Get-SidecarTmpStatus $r.msg 'jRt')]"
+            # r7 (CoS G7): the same removed tmp with a PATH-BEARING IOException message (what [IO.File]::Move really throws). The message now holds the
+            # temp root's ' attempts=1 tmp=removed ', so the line has a second tmp token and is 'ambiguous' (fail safe); Data still says removed.
+            $r = Invoke-SidecarCleanupProbe 'jRt' 'io' $false $null $false $true
+            Assert-True ($r.msg.Contains($framedRoot) -and $r.data['tmp_state'] -ceq 'removed' -and (Get-SidecarTmpStatus $r.msg 'jRt') -ceq 'ambiguous') "cleanup-path-token(G7): a removed tmp under a framed temp root with a path-bearing IOException message is ambiguous, Data says removed: state=[$($r.data['tmp_state'])] text=[$(Get-SidecarTmpStatus $r.msg 'jRt')] msg=[$($r.msg)]"
+            # ... and the retained-file line with the same path-bearing message still reads tmp_remaining= (the path and the tail are not scanned for a status).
+            $r = Invoke-SidecarCleanupProbe 'jRt' 'io' $true $null $false $true
+            Assert-True ($r.msg.Contains($framedRoot) -and $r.data['tmp_state'] -ceq 'remaining' -and (Get-SidecarTmpStatus $r.msg 'jRt') -ceq 'tmp_remaining=') "cleanup-path-token(G7): a retained tmp under a framed temp root with a path-bearing IOException message reads tmp_remaining=: state=[$($r.data['tmp_state'])] text=[$(Get-SidecarTmpStatus $r.msg 'jRt')]"
         }
         finally {
             $notAfterDir = $savedNotAfterDir
@@ -2867,7 +2887,29 @@ function Exit-HeavySlot {
         # id's own tail ('...xj.json.<guid>.tmp') cannot be taken for the file name of 'j'.
         $z32 = '00000000000000000000000000000000'
         Assert-True ($null -eq (Get-SidecarTmpStatus "SIDECAR-WRITE-FAILED job=j attempts=3 tmp_remaining=C:\fixture\otherj.json.$z32.tmp IOException: x" 'j')) "cleanup-identifier(r6 A1): a retained path whose file merely ENDS in the id is refused"
-        Assert-True ($null -eq (Get-SidecarTmpStatus "SIDECAR-WRITE-FAILED job=j attempts=3 tmp_remaining=xj attempts=3 tmp_remaining=C:\fixture\j attempts=3 tmp_remaining=xj.json.$z32.tmp IOException: x" 'j')) "cleanup-identifier(r6 A1): a line written for a longer id (whose tail ends in the shorter id) is refused for the shorter id"
+        Assert-True ($null -eq (Get-SidecarTmpStatus "SIDECAR-WRITE-FAILED job=j attempts=3 tmp_remaining=xj attempts=3 tmp_remaining=C:\fixture\j attempts=3 tmp_remaining=xj.json.$z32.tmp IOException: x" 'j')) "cleanup-identifier(r6 A1): a retained path whose last segment is a longer id's tail (...xj.json.<guid>.tmp, no separator before j.json) is refused ($null) for the shorter id"
+        # r7 (CoS G6): Grok's literal. The id is a PREFIX-compatible spelling of a retained-file header for 'j', with its own tmp file after a separator.
+        # The writer's real line for that id when the tmp was REMOVED is 'job=<id> attempts=3 tmp=removed ...'; read with the shorter id 'j' the first
+        # header looks like a retained-file line of 'j' and the true 'removed' line is its tail. The tail now holds a SECOND complete writer header, so the
+        # reading is ambiguous. (Hand-built: an id with ':' and separators cannot be a real sidecar file name, so the real writer cannot be driven with it.)
+        $g6Id = "j attempts=3 tmp_remaining=C:\x\j.json.$z32.tmp IOException: y"
+        $g6Removed = "SIDECAR-WRITE-FAILED job=$g6Id attempts=3 tmp=removed IOException: injected: x"
+        $g6Unknown = "SIDECAR-WRITE-FAILED job=$g6Id attempts=3 tmp=unknown(UnauthorizedAccessException) IOException: injected: x"
+        $g6Remaining = "SIDECAR-WRITE-FAILED job=$g6Id attempts=3 tmp_remaining=C:\fixture\$g6Id.json.$z32.tmp IOException: injected: x"
+        Assert-True ((Get-SidecarTmpStatus $g6Removed 'j') -ceq 'ambiguous') "cleanup-identifier(r7 G6): Grok's literal (removed line of a longer id) read with the shorter id is ambiguous, never tmp_remaining=: [$(Get-SidecarTmpStatus $g6Removed 'j')]"
+        Assert-True ((Get-SidecarTmpStatus $g6Unknown 'j') -ceq 'ambiguous' -and (Get-SidecarTmpStatus $g6Remaining 'j') -ceq 'ambiguous') "cleanup-identifier(r7 G6): the unknown and retained lines of the same longer id are ambiguous for the shorter id: unknown=[$(Get-SidecarTmpStatus $g6Unknown 'j')] remaining=[$(Get-SidecarTmpStatus $g6Remaining 'j')]"
+        Assert-True ((Get-SidecarTmpStatus $g6Removed $g6Id) -ceq 'ambiguous' -and (Get-SidecarTmpStatus $g6Unknown $g6Id) -ceq 'ambiguous' -and (Get-SidecarTmpStatus $g6Remaining $g6Id) -ceq 'ambiguous') "cleanup-identifier(r7 G6): the exact (framing) id still reads ambiguous on all three lines"
+        # class sweep (r7): the same prefix-id shape against the OTHER two branches. An id spelling a removed/unknown header for 'j' is caught by the
+        # one-tmp-token rule (the real line carries a second token), for every line state of the longer id; a multi-line exception tail does not defeat the tail check.
+        foreach ($pid2 in @('j attempts=3 tmp=removed IOException: y', 'j attempts=3 tmp=unknown(E) IOException: y')) {
+            foreach ($st in @('tmp=removed', 'tmp=unknown(E)', "tmp_remaining=C:\fixture\$pid2.json.$z32.tmp")) {
+                $pm = "SIDECAR-WRITE-FAILED job=$pid2 attempts=3 $st IOException: x"
+                Assert-True ((Get-SidecarTmpStatus $pm 'j') -ceq 'ambiguous' -and (Get-SidecarTmpStatus $pm $pid2) -ceq 'ambiguous') "cleanup-identifier(r7 G6 sweep): id [$pid2] with line state [$st]: ambiguous for the shorter id and for the exact id: short=[$(Get-SidecarTmpStatus $pm 'j')]"
+            }
+        }
+        Assert-True ((Get-SidecarTmpStatus ("SIDECAR-WRITE-FAILED job=$g6Id attempts=3 tmp=removed IOException: line1`nline2") 'j') -ceq 'ambiguous' -and (Get-SidecarTmpStatus ("SIDECAR-WRITE-FAILED job=j attempts=3 tmp_remaining=C:\fixture\j.json.$z32.tmp IOException: line1`nline2") 'j') -ceq 'tmp_remaining=') "cleanup-identifier(r7 G6 sweep): a multi-line exception tail neither defeats the second-header check nor makes a plain retained line unreadable"
+        # control: a retained line of 'j' whose exception tail merely mentions framing (no second complete header) is still read (CoS G4: the tail is free text).
+        Assert-True ((Get-SidecarTmpStatus "SIDECAR-WRITE-FAILED job=j attempts=3 tmp_remaining=C:\fixture\j.json.$z32.tmp IOException: a attempts=1 tmp=removed b" 'j') -ceq 'tmp_remaining=') "cleanup-identifier(r7 G6): control - framing words in the exception tail without a second complete header do not make a retained line ambiguous"
         Assert-True ((Get-SidecarTmpStatus "SIDECAR-WRITE-FAILED job=j attempts=3 tmp_remaining=C:\fixture\j.json.$z32.tmp IOException: x" 'j') -ceq 'tmp_remaining=' -and (Get-SidecarTmpStatus "SIDECAR-WRITE-FAILED job=j attempts=3 tmp_remaining=/fixture/j.json.$z32.tmp IOException: x" 'j') -ceq 'tmp_remaining=') "cleanup-identifier(r6 A1): control - the id's own tmp file after a separator (either kind) is read"
         # adversary r4 A3: re-recording a different outcome on the same exception leaves no entry of the previous one.
         $dx = [InvalidOperationException]::new('x')
