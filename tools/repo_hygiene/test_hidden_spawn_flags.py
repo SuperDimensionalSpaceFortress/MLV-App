@@ -27,6 +27,7 @@ from tools.repo_hygiene import hidden_spawn
 
 ROOT = Path(__file__).resolve().parents[2]
 SPAWN_ATTRS = {"run", "Popen", "check_output", "check_call", "call"}
+_CREATE_NO_WINDOW = 0x08000000
 
 # Key3 HIGH-RISK classes (and the frozen in-tree agent-bridge) stay out of this card's diff; each is an OPEN line.
 # Directories end in "/" and match by prefix; files are compared whole against the normalized path, so a path that
@@ -105,6 +106,8 @@ def _spawn_names(tree: ast.AST) -> tuple[set[str], dict[str, str]]:
 
     changed = True
     while changed:  # an alias of an alias (r = subprocess.run; q = r) settles in a few passes
+        # Bindings are only ever ADDED (first binding of a name wins), so `modules` and `funcs` grow monotonically and
+        # the loop ends even when one name is rebound to different spawn functions.
         changed = False
         for node in ast.walk(tree):
             bound: list[tuple[str, ast.AST | None]] = []
@@ -118,11 +121,26 @@ def _spawn_names(tree: ast.AST) -> tuple[set[str], dict[str, str]]:
                 bound = [(arg.arg, d) for arg, d in zip(positional[len(positional) - len(a.defaults):], a.defaults)]
                 bound += [(arg.arg, d) for arg, d in zip(a.kwonlyargs, a.kw_defaults) if d is not None]
             for name, value in bound:
+                if isinstance(value, ast.Name) and value.id in modules and name not in modules:
+                    modules.add(name)  # sp = subprocess
+                    changed = True
                 attr = spawn_attr(value)
-                if attr and funcs.get(name) != attr:
+                if attr and name not in funcs:
                     funcs[name] = attr
                     changed = True
     return modules, funcs
+
+
+def _effective_constant(expr: ast.AST) -> int | None:
+    """The integer value of a flag expression built only from literals (0x20, 0 | 0, -0), else None."""
+    if not all(isinstance(n, (ast.Expression, ast.Constant, ast.BinOp, ast.UnaryOp, ast.operator, ast.unaryop))
+               for n in ast.walk(ast.Expression(body=expr))):
+        return None
+    try:
+        value = eval(compile(ast.fix_missing_locations(ast.Expression(body=expr)), "<flag>", "eval"), {"__builtins__": {}})
+    except Exception:  # noqa: BLE001 - any non-evaluable literal expression is simply "unknown"
+        return None
+    return value if isinstance(value, int) and not isinstance(value, bool) else None
 
 
 def _unflagged_spawns_in_source(source: str, label: str) -> list[str]:
@@ -141,9 +159,10 @@ def _unflagged_spawns_in_source(source: str, label: str) -> list[str]:
         else:
             continue
         flags = [kw for kw in node.keywords if kw.arg == "creationflags"]
-        if flags and not (isinstance(flags[0].value, ast.Constant) and flags[0].value.value == 0):
-            continue
-        why = "creationflags=0 sets no flag" if flags else "has no creationflags="
+        constant = _effective_constant(flags[0].value) if flags else None
+        if flags and (constant is None or constant & _CREATE_NO_WINDOW):
+            continue  # a name or call (_NO_WINDOW, no_window_flags()) is trusted; a literal must carry the bit
+        why = f"creationflags={constant:#x} lacks CREATE_NO_WINDOW" if flags else "has no creationflags="
         bad.append(f"{label}:{node.lineno} {shown}(...) {why}")
     return bad
 
@@ -233,6 +252,26 @@ class ScannerHardeningTests(unittest.TestCase):
 
     def test_assignment_alias_is_resolved(self):
         self.assertEqual(len(self._bad("import subprocess\nr = subprocess.check_output\nr(['x'])\n")), 1)
+
+    def test_scan_terminates_on_a_conflicting_rebinding(self):
+        import threading
+        src = "import subprocess\nr = subprocess.run\nr = subprocess.Popen\nr(['x'], creationflags=0x08000000)\n"
+        out: list = []
+        worker = threading.Thread(target=lambda: out.append(self._bad(src)), daemon=True)
+        worker.start()
+        worker.join(10)
+        self.assertFalse(worker.is_alive(), "alias resolution did not terminate")
+        self.assertEqual(out, [[]])
+
+    def test_a_constant_flag_without_the_hidden_bit_is_flagged(self):
+        for value in ("0x20", "0 | 0", "-0", "0x4000"):
+            src = f"import subprocess\nsubprocess.run(['x'], creationflags={value})\n"
+            self.assertEqual(len(self._bad(src)), 1, value)
+        self.assertEqual(self._bad("import subprocess\nsubprocess.run(['x'], creationflags=0x08000000 | 0x20)\n"), [])
+
+    def test_module_assignment_alias_is_resolved(self):
+        self.assertEqual(len(self._bad("import subprocess\nsp = subprocess\nsp.run(['x'])\n")), 1)
+        self.assertEqual(self._bad("import subprocess\nsp = subprocess\nsp.run(['x'], creationflags=F)\n"), [])
 
     def test_unrelated_names_are_not_flagged(self):
         self.assertEqual(self._bad("def run(a):\n    return a\nrun(1)\nfoo.run(2)\n"), [])
