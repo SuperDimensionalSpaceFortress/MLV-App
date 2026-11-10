@@ -58,6 +58,7 @@ LookAssistStats analyzeLookAssistThumbnail( const unsigned char *rgb, int width,
     int balanceHistogramB[256] = { 0 };
     const int totalSamples = width * height;
     int midtoneSamples = 0;
+    int aboveVideoWhiteSamples = 0;
     double visibleRTotal = 0.0;
     double visibleGTotal = 0.0;
     double visibleBTotal = 0.0;
@@ -78,6 +79,8 @@ LookAssistStats analyzeLookAssistThumbnail( const unsigned char *rgb, int width,
 
         const int maxChannel = qMax( r, qMax( g, b ) );
         const int minChannel = qMin( r, qMin( g, b ) );
+        // Any channel, not luma: a saturated red (255, 0, 0) is luma 53 but is a clipped pixel.
+        if( maxChannel > 235 ) ++aboveVideoWhiteSamples;
         const int saturationProxy = maxChannel - minChannel;
         const double greenAxis = (double)g - ( ( (double)r + (double)b ) * 0.5 );
         if( luma >= 12 )
@@ -145,6 +148,7 @@ LookAssistStats analyzeLookAssistThumbnail( const unsigned char *rgb, int width,
     int clipHigh = histogram[252] + histogram[253] + histogram[254] + histogram[255];
     stats.clipLow = (double)clipLow / (double)totalSamples;
     stats.clipHigh = (double)clipHigh / (double)totalSamples;
+    stats.aboveVideoWhite = (double)aboveVideoWhiteSamples / (double)totalSamples;
     return stats;
 }
 
@@ -368,7 +372,49 @@ QString lookAssistDecisionLogFields( const LookAssistStats &resolved, const Look
                        : QStringLiteral("NA") );
 }
 
-bool lookAssistPictureCorroboratesDaylight( const LookAssistStats &processedAtPlannedExposure )
+LookAssistStats lookAssistDisplayMeterAggregate( const LookAssistStats *rendered, int count )
+{
+    LookAssistStats result;
+    if( !rendered || count <= 0 ) return result;
+    count = qMin( count, 3 );
+    double median[3], p95[3], p99[3], readClip[3], renderedClip[3];
+    int readCount = 0;
+    for( int i = 0; i < count; ++i )
+    {
+        renderedClip[i] = rendered[i].aboveVideoWhite;
+        if( !( rendered[i].median > 0.0 ) ) continue;   // black: rendered, not read
+        median[readCount] = rendered[i].median;
+        p95[readCount] = rendered[i].p95;
+        p99[readCount] = rendered[i].p99;
+        readClip[readCount] = rendered[i].aboveVideoWhite;
+        ++readCount;
+    }
+    if( readCount <= 0 ) return result;
+    std::sort( median, median + readCount );
+    std::sort( p95, p95 + readCount );
+    std::sort( p99, p99 + readCount );
+    std::sort( readClip, readClip + readCount );
+    std::sort( renderedClip, renderedClip + count );
+    result.median = median[readCount / 2];
+    result.p95 = p95[readCount / 2];
+    result.p99 = p99[readCount / 2];
+    result.aboveVideoWhite = qMax( readClip[readCount / 2], renderedClip[count / 2] );
+    result.p05 = result.median;
+    return result;
+}
+
+QString lookAssistDisplayMeterLogFields( int samples, const LookAssistStats &meter, int frame )
+{
+    return QStringLiteral("samples=%1 robust_median=%2 robust_p95=%3 robust_p99=%4 above_video_white=%5 frame=%6")
+        .arg( samples )
+        .arg( meter.median, 0, 'f', 1 )
+        .arg( meter.p95, 0, 'f', 1 )
+        .arg( meter.p99, 0, 'f', 1 )
+        .arg( meter.aboveVideoWhite, 0, 'f', 10 )
+        .arg( frame );
+}
+
+bool lookAssistPictureCorroboratesDaylight(const LookAssistStats &processedAtPlannedExposure )
 {
     // The Shade preset lifts a flat RAW thumbnail towards a mid-grey picture (target median 112). If the
     // exposure is right that the scene is daylight, the RENDERED picture at that lift is a lit picture:
@@ -2122,8 +2168,12 @@ LookAssistPreset presetForLookAssistScene( LookAssistScene scene,
         int displayExposure = 0;
         if( displayStats->median > 1.0 )
             displayExposure = lookAssistExposureForTarget( displayStats->median, (double)displayTarget, 0 );
-        else if( displayStats->p99 > 1.0 )
-            // A median of one code value carries no mid-tone reading, so the highlights govern.
+        else if( displayStats->p99 > 16.0
+              && displayStats->p99 <= 235.0
+              && displayStats->aboveVideoWhite <= 0.002 )
+            // A median of one code value carries no mid-tone reading, so the highlights govern. Not when p99 is at
+            // or below video black (16): that frame is noise and the lift would only raise it. Not when p99 or more
+            // than 0.2% of the display has a channel above video white (235): the lift would push those pixels into clip.
             displayExposure = displayCap;
         displayExposure = qMin( displayExposure, displayCap );
         exposure = qBound( -120, displayExposure, 380 );

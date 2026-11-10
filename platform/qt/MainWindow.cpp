@@ -17937,12 +17937,7 @@ void MainWindow::applyLookAssistToReceipt( ReceiptSettings *receipt,
         decisionTrace.displayMeterRan = true;
         logInteractionEvent(
             QStringLiteral("look_assist.display_meter"),
-            QStringLiteral("samples=%1 robust_median=%2 robust_p95=%3 robust_p99=%4 frame=%5")
-                .arg( displayMeterSamples )
-                .arg( displayStatsUi.median, 0, 'f', 1 )
-                .arg( displayStatsUi.p95, 0, 'f', 1 )
-                .arg( displayStatsUi.p99, 0, 'f', 1 )
-                .arg( analysisFrame ) );
+            lookAssistDisplayMeterLogFields( displayMeterSamples, displayStatsUi, analysisFrame ) );
     }
 
     // [WB-TRACE] env-gated, read-only diagnostic to pin the Look Assist per-scale WB divergence
