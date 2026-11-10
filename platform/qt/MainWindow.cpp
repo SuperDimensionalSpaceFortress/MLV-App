@@ -19284,7 +19284,17 @@ void MainWindow::applyLookAssistToReceipt( ReceiptSettings *receipt,
     const bool pictureDump = canAnalyzeProcessedColor && qEnvironmentVariableIsSet( "MLVAPP_LOOK_ASSIST_PICTURE_DUMP" );
     const QString dumpDir = qEnvironmentVariable( "MLVAPP_LOOK_ASSIST_PICTURE_DUMP" );
     const int preSafetyExposure = preset.exposure;
-    auto dumpLivePicture = [&]( const QString &fileName )
+    bool preSafetyWritten = false;
+    // r2 adversary A1: a dump file never outlives a failed write. The old file is removed first, and the save result is
+    // returned, so a name the picture_dump line binds is this look or the line says none.
+    auto savePictureFresh = [&]( const QImage &image, const QString &fileName ) -> bool
+    {
+        QDir().mkpath( dumpDir );
+        const QString path = QDir( dumpDir ).filePath( fileName );
+        QFile::remove( path );
+        return !QFile::exists( path ) && image.save( path );
+    };
+    auto dumpLivePicture = [&]( const QString &fileName ) -> bool
     {
         QByteArray dumpThumbnail;
         dumpThumbnail.resize( colorWidth * colorHeight * 3 );
@@ -19296,22 +19306,22 @@ void MainWindow::applyLookAssistToReceipt( ReceiptSettings *receipt,
                                                  qMax( 1, mlvappEffectiveWorkerThreadCount() ),
                                                  reinterpret_cast<unsigned char *>( dumpThumbnail.data() ) );
         } );
-        QDir().mkpath( dumpDir );
         const QImage dumpImage( reinterpret_cast<const uchar *>( dumpThumbnail.constData() ),
                                 colorWidth, colorHeight, colorWidth * 3, QImage::Format_RGB888 );
-        dumpImage.save( QDir( dumpDir ).filePath( fileName ) );
+        return savePictureFresh( dumpImage, fileName );
     };
     // The look finally shown, after the safety keep/retreat/revert; finalExposure is the exposure the receipt carries.
     auto dumpFinalPicture = [&]( int finalExposure, const QString &safety )
     {
         if( !pictureDump ) return;
-        dumpLivePicture( lookAssistPictureDumpFileName( true, analysisFrame ) );
+        const bool finalWritten = dumpLivePicture( lookAssistPictureDumpFileName( true, analysisFrame ) );
         logInteractionEvent( QStringLiteral("look_assist.apply.picture_dump"),
-                             lookAssistPictureDumpFields( analysisFrame, preSafetyExposure, finalExposure, safety ) );
+                             lookAssistPictureDumpFields( analysisFrame, preSafetyExposure, preSafetyWritten,
+                                                          finalExposure, finalWritten, safety ) );
     };
     if( pictureDump )
     {
-        dumpLivePicture( lookAssistPictureDumpFileName( false, analysisFrame ) );
+        preSafetyWritten = dumpLivePicture( lookAssistPictureDumpFileName( false, analysisFrame ) );
 
         // Optional: ALSO render explicit looks ("label:exp,contrast,pivot,shadows,highlights,vibrance,temp,tint;...")
         // on a private clone with the GUI slider mapping, so another build's logged result (e.g. master's) can
@@ -19356,7 +19366,7 @@ void MainWindow::applyLookAssistToReceipt( ReceiptSettings *receipt,
             if( !stateRendered ) continue;
             const QImage stateImage( reinterpret_cast<const uchar *>( stateThumbnail.constData() ),
                                      colorWidth, colorHeight, colorWidth * 3, QImage::Format_RGB888 );
-            stateImage.save( QDir( dumpDir ).filePath( QStringLiteral("state-%1.png").arg( label ) ) );
+            savePictureFresh( stateImage, QStringLiteral("state-%1.png").arg( label ) );
         }
     }
 

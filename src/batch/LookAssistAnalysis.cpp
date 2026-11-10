@@ -2467,12 +2467,17 @@ QString lookAssistPictureDumpFileName( bool finalLook, int frame )
                        : QStringLiteral("look-assist-pre-safety-frame%1.png") ).arg( frame );
 }
 
-QString lookAssistPictureDumpFields( int frame, int preSafetyExposure, int finalExposure, const QString &safety )
+QString lookAssistPictureDumpFields( int frame,
+                                     int preSafetyExposure,
+                                     bool preSafetyWritten,
+                                     int finalExposure,
+                                     bool finalWritten,
+                                     const QString &safety )
 {
     return QStringLiteral("pre_safety=%1 pre_safety_exposure=%2 final=%3 final_exposure=%4 safety=%5 frame=%6")
-        .arg( lookAssistPictureDumpFileName( false, frame ) )
+        .arg( preSafetyWritten ? lookAssistPictureDumpFileName( false, frame ) : QStringLiteral("none") )
         .arg( preSafetyExposure )
-        .arg( lookAssistPictureDumpFileName( true, frame ) )
+        .arg( finalWritten ? lookAssistPictureDumpFileName( true, frame ) : QStringLiteral("none") )
         .arg( finalExposure )
         .arg( safety )
         .arg( frame );

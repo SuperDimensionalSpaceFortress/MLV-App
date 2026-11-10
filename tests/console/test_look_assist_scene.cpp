@@ -3992,7 +3992,7 @@ TEST(LookAssistScene, SafetyRetreatOrchestrationFinalPictureReceiptAndDiagnostic
     ASSERT_EQ( 190, out.shownExposure );
     const QString log = lookAssistSafetyRetreatLogFields( QStringLiteral("localized-green-artifact"), 380, 0, out, 3 );
     ASSERT_TRUE( log == QStringLiteral("first_warning=localized-green-artifact applied_exposure=380 baseline_exposure=0 bottom_warning=none bottom_visible_green_axis=5.646 bottom_green_ratio=0.029882 kept_exposure=190 rungs_tried=1 rungs=190:5.646:0.029882 kept_warning=none frame=3") );
-    const QString dump = lookAssistPictureDumpFields( 3, 380, rig.look.exposure, QStringLiteral("retreat") );
+    const QString dump = lookAssistPictureDumpFields( 3, 380, true, rig.look.exposure, true, QStringLiteral("retreat") );
     ASSERT_TRUE( dump == QStringLiteral("pre_safety=look-assist-pre-safety-frame3.png pre_safety_exposure=380 final=look-assist-final-frame3.png final_exposure=190 safety=retreat frame=3") );
     ASSERT_TRUE( lookAssistPictureDumpFileName( true, 0 ) == QStringLiteral("look-assist-final-frame0.png") );   // check_look_assist_profile_states.py
     ASSERT_TRUE( lookAssistPictureDumpFileName( false, 0 ) == QStringLiteral("look-assist-pre-safety-frame0.png") );
@@ -4018,6 +4018,28 @@ TEST(LookAssistScene, SafetyRetreatOrchestrationFinalPictureReceiptAndDiagnostic
     ASSERT_EQ( 1, window.count( QStringLiteral("postColorStats = retreat.shown.stats;") ) );
     ASSERT_EQ( 1, window.count( QStringLiteral("m_lastLookAssistColorCastWarning = retreat.shown.warning;") ) );
     ASSERT_EQ( 1, window.count( QStringLiteral("lookAssistSafetyRetreatLogFields( firstWarning, appliedExposure, baselineExposure, retreat, analysisFrame )") ) );
+}
+
+// r2 adversary A1 (introduced, major; review-adversary-...-r2-c6812c0d): a dump whose write failed is never bound to an
+// exposure. Its input: a look-assist-final-frame0.png left by an earlier run (exposure 380) and held open without write
+// sharing, so this run's save of the retreated look (190) fails; the line must not say that file shows 190.
+TEST(LookAssistScene, SafetyPictureDumpNeverBindsAFileItFailedToWrite)
+{
+    ASSERT_TRUE( lookAssistPictureDumpFields( 0, 380, true, 190, false, QStringLiteral("retreat") )
+                 == QStringLiteral("pre_safety=look-assist-pre-safety-frame0.png pre_safety_exposure=380 final=none final_exposure=190 safety=retreat frame=0") );
+    ASSERT_TRUE( lookAssistPictureDumpFields( 0, 380, false, 380, true, QStringLiteral("keep") )
+                 == QStringLiteral("pre_safety=none pre_safety_exposure=380 final=look-assist-final-frame0.png final_exposure=380 safety=keep frame=0") );
+
+    // The GUI: every dump file (pre-safety, final, and the optional state-<label>.png renders) goes through ONE fresh save
+    // that removes the old file first and returns the save result, and the binding takes both results.
+    const QString window = readRepoFile( QStringLiteral("platform/qt/MainWindow.cpp") );
+    ASSERT_FALSE( window.isEmpty() );
+    ASSERT_EQ( 0, window.count( QStringLiteral(".save( QDir( dumpDir )") ) );
+    ASSERT_EQ( 2, window.count( QStringLiteral("savePictureFresh(") ) );
+    ASSERT_EQ( 1, window.count( QStringLiteral("return !QFile::exists( path ) && image.save( path );") ) );
+    ASSERT_EQ( 1, window.count( QStringLiteral("const bool finalWritten = dumpLivePicture( lookAssistPictureDumpFileName( true, analysisFrame ) );") ) );
+    ASSERT_EQ( 1, window.count( QStringLiteral("preSafetyWritten = dumpLivePicture( lookAssistPictureDumpFileName( false, analysisFrame ) );") ) );
+    ASSERT_EQ( 1, window.count( QStringLiteral("lookAssistPictureDumpFields( analysisFrame, preSafetyExposure, preSafetyWritten,") ) );
 }
 
 // I1 (7) Never more than three measurements (the bottom plus at most two rungs), whatever the exposures and however

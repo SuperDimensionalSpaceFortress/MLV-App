@@ -994,9 +994,15 @@ QString lookAssistSafetyRetreatLogFields( const QString &firstWarning,
 /* ---- The env-gated picture dump (793-F1, MLVAPP_LOOK_ASSIST_PICTURE_DUMP). The look before the safety handling and the
  * look finally shown are two files; look-assist-final-frameN.png is always written AFTER the safety handling. ---- */
 QString lookAssistPictureDumpFileName( bool finalLook, int frame );
-/* The fields of the look_assist.apply.picture_dump line binding each file to the exposure it shows. safety is "keep",
- * "retreat" or "revert". */
-QString lookAssistPictureDumpFields( int frame, int preSafetyExposure, int finalExposure, const QString &safety );
+/* The fields of the look_assist.apply.picture_dump line binding each file to the exposure it shows. A file whose write
+ * failed is bound as "none" (r2 adversary A1: the line never names a file that does not show that exposure). safety is
+ * "keep", "retreat" or "revert". */
+QString lookAssistPictureDumpFields( int frame,
+                                     int preSafetyExposure,
+                                     bool preSafetyWritten,
+                                     int finalExposure,
+                                     bool finalWritten,
+                                     const QString &safety );
 
 } // namespace lookassist
 
