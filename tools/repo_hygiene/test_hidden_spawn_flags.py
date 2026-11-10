@@ -35,7 +35,12 @@ A module bound by ``import x [as y]`` (and a plain alias or literal dynamic impo
 conditional, subscript, return, lambda, class attribute or call argument it is REPORTED, because any module may re-export ``os``; for the
 same reason a dunder attribute read off it (``shutil.__dict__``) and every reflection helper (``globals()``, ``signature``, ``__annotations__``)
 is REPORTED in a file that imports any module. A built string is folded with ``replace`` (and its count), ``strip``/``lower``/``upper``, a
-slice, ``chr(n)``, ``bytes.decode`` and a ``format`` / ``%`` spec (``{:.4s}``), applied the way Python applies them where the fold is exact.
+slice, ``chr(n)``, ``bytes.decode`` / ``str.encode`` (also ``str(b, enc, err)``, ``bytes(s, enc, err)`` and ``codecs.decode`` / ``encode``) and a ``format`` / ``%`` spec
+(``{:.4s}``), applied the way Python applies them where the fold is exact: a standard-library codec (utf-8, ascii, latin-1, utf-16/32, cp1252, the escape
+codecs) with a standard error mode (``ignore``, ``replace``, ``backslashreplace``, ``xmlcharrefreplace``, ``namereplace``, ``surrogateescape``) is run by Python
+itself on the literal (R9-F1). Any other codec or error mode, ``*args``, a call that raises, or a text with an unknown part reads as UNKNOWN (every non-ASCII
+character is any text and the text is padded with a wildcard), never as a literal. A NUL character in a folded text is the wildcard, so the bytes a utf-16 or
+utf-32 encode writes read as unknown pieces (an over-report, never a miss).
 A method called unbound on the type (``str.lower(s)``, ``builtins.str``, ``type('')``, ``''.__class__``) is the bound call, and ``operator.add`` /
 ``concat`` / ``mod`` / ``mul``, ``s.__add__(t)`` and ``''.join(reversed(s))`` are folded like the operators they stand for. A call the fold has no
 arm for hedges its receiver AND every positional argument and keyword value (a call that only looks an attribute up or tests, ``getattr`` and
@@ -355,10 +360,12 @@ _STR_METHODS = frozenset(name for name in dir(str) if not name.startswith("_")) 
 
 _AMBIGUOUS_ACTIVE: set[int] = set()
 _STR_ALIASES: set[str] = set()  # names the file being scanned binds to the str type (`S = str`, `from builtins import str as S`); set per scan by _note_aliases
+_CODEC_ALIASES: set[str] = set()  # names the file being scanned binds to the codecs module (`import codecs as c`); set per scan by _note_aliases
 
 
 def _note_aliases(tree: ast.AST) -> None:
     _STR_ALIASES.clear()
+    _CODEC_ALIASES.clear()
     for n in ast.walk(tree):
         if isinstance(n, ast.Assign) and len(n.targets) == 1 and isinstance(n.targets[0], ast.Name):
             v = n.value
@@ -367,6 +374,13 @@ def _note_aliases(tree: ast.AST) -> None:
                 _STR_ALIASES.add(n.targets[0].id)
         elif isinstance(n, ast.ImportFrom) and n.module == "builtins":
             _STR_ALIASES.update(a.asname or a.name for a in n.names if a.name in ("str", "bytes"))
+        elif isinstance(n, ast.Import):
+            _CODEC_ALIASES.update(a.asname or a.name for a in n.names if a.name == "codecs")
+
+
+def _codecs_like(recv: ast.AST) -> bool:
+    """The ``codecs`` module under any name the file gives it (``codecs``, ``import codecs as c``, ``x.codecs``): ``codecs.decode(b, enc, err)`` is ``b.decode(enc, err)``."""
+    return (isinstance(recv, ast.Name) and (recv.id == "codecs" or recv.id in _CODEC_ALIASES)) or (isinstance(recv, ast.Attribute) and recv.attr == "codecs")
 
 
 def _type_like(recv: ast.AST) -> bool:
@@ -387,6 +401,10 @@ def _bound_form(node: ast.AST, consts: dict[str, str]) -> ast.AST:
     if (isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id in _OPERATOR_BINOPS and len(node.args) == 2 and not node.keywords
             and not any(isinstance(a, ast.Starred) for a in node.args)):  # ``from operator import concat``: concat(a, b)
         return ast.BinOp(left=node.args[0], op=_OPERATOR_BINOPS[node.func.id](), right=node.args[1])
+    if (isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id in ("str", "bytes") and node.args and not isinstance(node.args[0], ast.Starred)
+            and (len(node.args) > 1 or any(k.arg in ("encoding", "errors") for k in node.keywords))):
+        # R9-F1: ``str(b, 'ascii', 'ignore')`` is ``b.decode('ascii', 'ignore')`` and ``bytes(s, 'ascii', 'ignore')`` is ``s.encode(...)``
+        return ast.Call(func=ast.Attribute(value=node.args[0], attr="decode" if node.func.id == "str" else "encode", ctx=ast.Load()), args=node.args[1:], keywords=node.keywords)
     if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)):
         return node
     attr, recv = node.func.attr, node.func.value
@@ -401,7 +419,7 @@ def _bound_form(node: ast.AST, consts: dict[str, str]) -> ast.AST:
             return ast.BinOp(left=node.args[1] if reflected else node.args[0], op=op(), right=node.args[0] if reflected else node.args[1])
         # A string method called on the TYPE: `str`, `builtins.str`, `type(x)`, `x.__class__`. Any other receiver may be an instance (`source.index('needle')`), whose
         # argument is not the text the method works on; those calls stay a call the fallback hedges (their arguments are hedged, never read as a receiver).
-        if node.args and _text_base(node.args[0], consts) and _type_like(recv):  # str.lower(s, ...) is s.lower(...)
+        if node.args and _text_base(node.args[0], consts) and (_type_like(recv) or (attr in ("decode", "encode") and _codecs_like(recv))):  # str.lower(s, ...) is s.lower(...); codecs.decode(b, ...) too
             node = ast.Call(func=ast.Attribute(value=node.args[0], attr=attr, ctx=ast.Load()), args=node.args[1:], keywords=node.keywords)
             recv = node.func.value
     if attr in _DUNDER_BINOPS and len(node.args) == 1 and not node.keywords and plain:
@@ -409,6 +427,45 @@ def _bound_form(node: ast.AST, consts: dict[str, str]) -> ast.AST:
         left, right = (node.args[0], recv) if reflected else (recv, node.args[0])
         return ast.BinOp(left=left, op=op(), right=right)
     return node
+
+
+# R9-F1. A ``decode`` / ``encode`` is run by Python itself where its codec and error mode are plain text names of the standard library (the key is the name
+# with every non-alphanumeric dropped: ``utf_16-LE`` -> ``utf16le``), so the result is exactly Python's. Anything else reads as unknown.
+_CODEC_KEYS = frozenset({"utf8", "u8", "utf", "ascii", "usascii", "646", "latin1", "latin", "l1", "iso88591", "iso8859", "8859", "cp819", "utf16", "utf16le", "utf16be",
+                         "utf32", "utf32le", "utf32be", "cp1252", "windows1252", "utf8sig", "unicodeescape", "rawunicodeescape"})
+_CODEC_ERRORS = frozenset({"strict", "ignore", "replace", "backslashreplace", "xmlcharrefreplace", "namereplace", "surrogateescape", "surrogatepass"})
+_ESCAPE_SEQUENCE_RE = re.compile(r"\\(?:x[0-9a-fA-F]{2}|u[0-9a-fA-F]{4}|U[0-9a-fA-F]{8}|N\{[^}]*\}|[0-7]{1,3}|.)", re.DOTALL)
+
+
+def _fold_codec(node: ast.Call, text: str, known: bool, consts: dict[str, str], depth: int) -> tuple[str, bool]:
+    """``text.decode(...)`` / ``text.encode(...)`` where bytes are read one character per byte (latin-1), so a slice of them cuts where Python cuts.
+
+    A plain codec and error mode over a text with no unknown part are applied by Python itself (``bytes.decode`` / ``str.encode`` on the literal), so
+    ``ignore`` drops the byte, ``replace`` leaves U+FFFD or ``?``, and ``backslashreplace`` / ``xmlcharrefreplace`` / ``namereplace`` /
+    ``surrogateescape`` write what Python writes (R9-F1). Whatever the fold cannot reproduce exactly (an unknown or unlisted codec or error mode,
+    ``*args`` / ``**kw``, a text with an unknown part, a call that raises) reads as UNKNOWN: every non-ASCII character is any text (it may be dropped,
+    replaced, escaped or joined with its neighbours), a codec outside the list also rewrites escape sequences, and the text gets a wildcard on both
+    sides when it has none, so `known` False always comes with the wildcard and the consumers never read a guess as a literal."""
+    slots: dict[str, ast.AST] = dict(zip(("encoding", "errors"), node.args))
+    shape_ok = len(node.args) <= 2 and not any(isinstance(a, ast.Starred) for a in node.args) and all(k.arg in ("encoding", "errors") and k.arg not in slots for k in node.keywords)
+    plan = None
+    if shape_ok:
+        slots.update({k.arg: k.value for k in node.keywords})
+        encoding = _flatten(slots["encoding"], consts, depth + 1) if "encoding" in slots else ("utf-8", True)
+        errors = _flatten(slots["errors"], consts, depth + 1) if "errors" in slots else ("strict", True)
+        if encoding[1] and errors[1] and re.sub(r"[^a-z0-9]", "", encoding[0].lower()) in _CODEC_KEYS and errors[0] in _CODEC_ERRORS:
+            plan = (encoding[0], errors[0])
+    if plan is not None and _WILD not in text:
+        try:
+            if node.func.attr == "decode":
+                return text.encode("latin-1").decode(*plan), known
+            return text.encode(*plan).decode("latin-1"), known
+        except Exception:  # the call raises at run time, or a text the other way round: not a result to read
+            pass
+    unknown = re.sub(r"[^\x00-\x7f]", _WILD, text)
+    if plan is None:  # a codec that rewrites characters (`unicode_escape` turns `\x5f` into `_`) or one the fold cannot read: every escape sequence is any text
+        unknown = _ESCAPE_SEQUENCE_RE.sub(_WILD, unknown)
+    return (unknown if _WILD in unknown else _WILD + unknown + _WILD), False
 
 
 def _flatten(node: ast.AST, consts: dict[str, str], depth: int = 0) -> tuple[str, bool]:
@@ -543,13 +600,7 @@ def _flatten(node: ast.AST, consts: dict[str, str], depth: int = 0) -> tuple[str
         return "".join(_flatten(e, consts, depth + 1)[0] for pair in zip(node.keys, node.values) for e in pair), False  # a mapping: its keys and values side by side
     if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr in ("decode", "encode"):
         text, known = _flatten(node.func.value, consts, depth + 1)  # bytes are read one character per byte (latin-1), so a slice of them cuts where Python cuts
-        codec = _flatten(node.args[0], consts, depth + 1) if node.args else ("utf-8", True)
-        if node.keywords or len(node.args) > 1 or not codec[1] or codec[0].lower().replace("_", "-") not in ("utf-8", "utf8", "ascii", "us-ascii", "latin-1", "latin1", "iso-8859-1"):
-            # a codec that rewrites characters (`unicode_escape` turns `\x5f` into `_`) or one the fold cannot read: every escape sequence is any text
-            return re.sub(r"\\(?:x[0-9a-fA-F]{2}|u[0-9a-fA-F]{4}|U[0-9a-fA-F]{8}|N\{[^}]*\}|[0-7]{1,3}|.)", _WILD, text, flags=re.DOTALL), False
-        if node.func.attr == "decode" and not text.isascii():  # utf-8 would join the bytes of a non-ASCII character into one
-            return re.sub(r"[^\x00-\x7f]", _WILD, text), False
-        return text, known
+        return _fold_codec(node, text, known, consts, depth)
     if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "reversed" and len(node.args) == 1 and not node.keywords:
         text, known = _flatten(node.args[0], consts, depth + 1)  # the characters of a text, backwards (only ever read by a ``''.join``)
         return text[::-1], known
@@ -4183,10 +4234,10 @@ class AdversaryR9Tests(unittest.TestCase):
     # ---- pass 24 (review-adversary-MLV-LANE-CONSOLE-HIDDEN-1-r9-d5971734) A1-A3, as classes ----
     def test_pass24_a1_a_codec_that_rewrites_characters_does_not_hide_a_name(self):
         for expr in ("br'subprocess\\x5fexec'.decode('unicode_escape')", "b'subprocess\\\\x5fexec'.decode('unicode_escape')", "br'subprocess\\u005fexec'.decode(encoding='unicode_escape')",
-                     "br'subprocess\\137exec'.decode('unicode_escape')", "br'sub\\x70rocess_exec'.decode('raw_unicode_escape')", "b'subprocess_exec'.decode('utf-16')",
+                     "br'subprocess\\137exec'.decode('unicode_escape')", "br'sub\\u0070rocess_exec'.decode('raw_unicode_escape')", "b'subprocess_exec'.decode('utf-16')",
                      "'subprocess\\\\x5fexec'.encode().decode('unicode_escape')"):
             self.assertGreaterEqual(len(self._bad(self._launch(expr))), 1, expr)
-        for expr in ("br'Sta\\x72t-Process cmd.exe'.decode('unicode_escape')", "br'saps cmd.exe'.decode('unicode_escape')", "br'sa\\x70s cmd.exe'.decode('raw_unicode_escape')"):
+        for expr in ("br'Sta\\x72t-Process cmd.exe'.decode('unicode_escape')", "br'saps cmd.exe'.decode('unicode_escape')", "br'sa\\u0070s cmd.exe'.decode('raw_unicode_escape')"):
             self.assertEqual(self._ps(expr), (1, 1), expr)
         for expr in ("b'value\\x5fx'.decode('unicode_escape')", "b'abc'.decode('ascii')"):
             self.assertEqual(self._bad(self._launch(expr)), [], expr)
@@ -4237,6 +4288,132 @@ class AdversaryR9Tests(unittest.TestCase):
         for expr in ("'.value_' + kind", "'..'", "'.' + x", "'.subprocess'", "'.run'", "'a..b'", "'.allowed_roots.' + k", "'. ' + x", "'..' + x + '.value'", "'.' + p + '..' + q",
                      "'.loop.' + p", "f'.{p}.{q}'", "'.exec' + kind", "'..exec_' + kind"):
             self.assertEqual(self._bad(self._launch(expr)), [], expr)
+
+
+    # ---- Dot R9-F1: a codec / error-handling call reads as Python reads it, or as unknown ----
+    # (decode errors mode, how the spelling restores the name afterwards) for every transforming error mode a decode or an encode can take
+    _R9_DECODE_MODES = (("ignore", ""), ("replace", ".replace('\\ufffd', '')"), ("backslashreplace", ".replace('\\\\xff', '')"), ("surrogateescape", ".replace('\\udcff', '')"))
+    _R9_ENCODE_MODES = (("ignore", ""), ("replace", ".replace(b'?', b'')"), ("backslashreplace", ".replace(b'\\\\xe9', b'')"),
+                        ("xmlcharrefreplace", ".replace(b'&#233;', b'')"), ("namereplace", ".replace(b'\\\\N{LATIN SMALL LETTER E WITH ACUTE}', b'')"))
+
+    @classmethod
+    def _r9_rows(cls, target: str) -> list[str]:
+        """Every error mode crossed with a non-ASCII byte (or character) at every position of ``target``; each reads as ``target`` once Python has applied it."""
+        rows = []
+        for at in range(len(target) + 1):
+            data = target[:at].encode() + b"\xff" + target[at:].encode()
+            text = target[:at] + "é" + target[at:]
+            for mode, post in cls._R9_DECODE_MODES:
+                enc = "ascii" if mode != "surrogateescape" else "utf-8"
+                rows.append(f"{data!r}.decode({enc!r}, {mode!r}){post}")
+                rows.append(f"{data!r}.decode({enc!r}, errors={mode!r}){post}")
+            rows.append(f"{data!r}.decode(encoding='ascii', errors='ignore')")
+            for mode, post in cls._R9_ENCODE_MODES:
+                rows.append(f"{text!r}.encode('ascii', {mode!r}){post}.decode()")
+                rows.append(f"{text!r}.encode(encoding='ascii', errors={mode!r}){post}.decode('ascii')")
+        return rows
+
+    def test_r9_f1_the_dot_witness_is_reported(self):
+        witness = ("import asyncio\nasync def launch(factory):\n    loop = asyncio.get_running_loop()\n"
+                   "    return await getattr(loop, b'subprocess_\\xffexec'.decode('ascii','ignore'))(factory, 'cmd.exe')\n")
+        self.assertGreaterEqual(len(self._bad(witness)), 1)
+        self.assertEqual(self._bad(witness.replace("'ignore'", "'replace'")), [])  # the replacement character stays: that text is not a method name
+
+    def test_r9_f1_every_error_mode_at_every_position_of_a_method_name_is_reported(self):
+        for target in ("subprocess_exec", "subprocess_shell", "_make_subprocess_transport"):
+            for expr in self._r9_rows(target):
+                self.assertGreaterEqual(len(self._bad(self._launch(expr))), 1, expr)
+                text, known = _flatten(ast.parse(expr, mode="eval").body, {})
+                self.assertEqual(text, target, expr)  # an exact codec result is exact, not a wildcard
+                self.assertTrue(known, expr)
+
+    def test_r9_f1_the_same_rows_on_a_create_subprocess_name_fold_to_that_name(self):
+        for expr in self._r9_rows("create_subprocess_exec"):
+            text, known = _flatten(ast.parse(expr, mode="eval").body, {})
+            self.assertEqual((text, known), ("create_subprocess_exec", True), expr)
+            source = f"import asyncio\nasync def launch():\n    await getattr(asyncio, {expr})('cmd.exe')\n"
+            self.assertGreaterEqual(len(self._bad(source)), 1, expr)
+
+    def test_r9_f1_a_non_ascii_byte_inside_each_launch_word_is_read_as_python_reads_it(self):
+        for launch in ("Start-Process cmd.exe", "saps cmd.exe"):
+            for at in range(len(launch) + 1):
+                data = launch[:at].encode() + b"\xff" + launch[at:].encode()
+                text = launch[:at] + "é" + launch[at:]
+                for expr in (f"{data!r}.decode('ascii', 'ignore')", f"{data!r}.decode('ascii', errors='ignore')",
+                             f"{data!r}.decode('ascii', 'replace').replace('\\ufffd', '')", f"{data!r}.decode('utf-8', 'surrogateescape').replace('\\udcff', '')",
+                             f"{text!r}.encode('ascii', 'ignore').decode()",
+                             f"{text!r}.encode('ascii', 'xmlcharrefreplace').replace(b'&#233;', b'').decode()"):
+                    self.assertEqual(self._ps(expr), (1, 1), expr)
+
+    def test_r9_f1_a_codec_that_maps_to_a_method_name_is_read(self):
+        for expr in ("'subprocess_exec'.encode('utf-16').decode('utf-16')", "'subprocess_exec'.encode('utf-16-le').decode('utf-16-le')", "'subprocess_exec'.encode('utf-32').decode('utf-32')",
+                     "'subprocess_exec'.encode('utf-16-be').decode('utf-16-be', 'strict')", "'subprocess_exec'.encode('latin-1').decode('latin-1', 'ignore')",
+                     "'subprocess_\\u00ffexec'.encode('latin-1').decode('ascii', 'ignore')", "'subprocess_\\u0100exec'.encode('latin-1', 'ignore').decode('latin-1')",
+                     "b'subprocess_\\xffexec'.decode('utf-8', 'ignore')",
+                     "b'\\xff\\xfes\\x00u\\x00b\\x00p\\x00r\\x00o\\x00c\\x00e\\x00s\\x00s\\x00_\\x00e\\x00x\\x00e\\x00c\\x00'.decode('utf-16')",
+                     "'subprocess_exec'.encode('cp1252').decode('cp1252')", "'subprocess_\\u00e9exec'.encode('utf-8').decode('ascii', 'ignore')",
+                     "str(b'subprocess_\\xffexec', 'ascii', 'ignore')", "str(b'subprocess_\\xffexec', encoding='ascii', errors='ignore')",
+                     "bytes('subprocess_\\u00e9exec', 'ascii', 'ignore').decode()",
+                     "bytes.decode(b'subprocess_\\xffexec', 'ascii', 'ignore')", "codecs.decode(b'subprocess_\\xffexec', 'ascii', 'ignore')",
+                     "codecs.encode('subprocess_\\u00e9exec', 'ascii', 'ignore').decode()", "(b'subprocess_' + b'\\xffexec').decode('ascii', 'ignore')",
+                     "(b'sub' + b'\\xff' + b'process_exec').decode('ascii', errors='ignore')", "b'subprocess_\\xffexec'.decode('ascii', ('ig' + 'nore'))"):
+            self.assertGreaterEqual(len(self._bad("import codecs\n" + self._launch(expr))), 1, expr)
+        for expr in ("b'Sta\\xffrt-Process cmd.exe'.decode('ascii', 'ignore')", "str(b'sa\\xffps cmd.exe', 'ascii', 'ignore')", "'saps cmd.exe'.encode('utf-16').decode('utf-16')",
+                     "codecs.decode(b'Start-\\xffProcess cmd.exe', 'ascii', 'ignore')", "bytes('sa\\u00e9ps cmd.exe', 'ascii', 'ignore').decode()"):
+            self.assertEqual(self._ps(expr), (1, 1), expr)
+
+    def test_r9_f1_a_codec_or_error_mode_the_fold_does_not_model_is_unknown_never_a_literal(self):
+        for expr in ("b'subprocess_\\xffexec'.decode('ascii', handler)", "b'subprocess_\\xffexec'.decode('ascii', 'custom_handler')", "b'subprocess_\\xffexec'.decode(enc, 'ignore')",
+                     "b'subprocess_\\xffexec'.decode('rot13_text', 'ignore')", "b'subprocess_\\xffexec'.decode(*args)", "b'subprocess_\\xffexec'.decode('ascii', **kw)",
+                     "'subprocess_exec'.encode('idna')", "'subprocess_exec'.encode('no-such-codec').decode('no-such-codec')", "'subprocess_exec'.encode(enc).decode(enc)",
+                     "b'subprocess_exec'.decode('utf-16')", "b'subprocess_exec\\xff'.decode('ascii')", "b'\\xffsubprocess_exec'.decode()"):
+            text, known = _flatten(ast.parse(expr, mode="eval").body, {})
+            self.assertTrue(known or _WILD in text, (expr, text))  # the invariant: a text without the wildcard is exact
+            self.assertGreaterEqual(len(self._bad(self._launch(expr))), 1, expr)
+
+    def test_r9_f1_the_fold_equals_python_where_it_claims_to_know(self):
+        for data in (b"subprocess_exec", b"sub\xffprocess_exec", b"\xc3\xa9x", b"ab\xe9\xff", b"\xfe\xffa\x00b\x00", b"a\x80b"):
+            for enc in ("ascii", "utf-8", "latin-1", "utf-16", "utf-16-le", "utf-32", "cp1252", "unicode_escape", "raw_unicode_escape", "utf-8-sig"):
+                for err in (None, "strict", "ignore", "replace", "backslashreplace", "surrogateescape"):
+                    call = f"{data!r}.decode({enc!r}" + (f", {err!r})" if err else ")")
+                    try:
+                        real = eval(call)
+                    except (UnicodeError, LookupError):
+                        real = None
+                    text, known = _flatten(ast.parse(call, mode="eval").body, {})
+                    if known and _WILD not in text:
+                        self.assertEqual(text, real, call)
+                    elif not known:
+                        self.assertIn(_WILD, text, call)
+        for text_in in ("subprocess_exec", "subéprocess_exec", "xĀy", "a\U0001f600b"):
+            for enc in ("ascii", "utf-8", "latin-1", "utf-16", "utf-32", "cp1252"):
+                for err in (None, "strict", "ignore", "replace", "backslashreplace", "xmlcharrefreplace", "namereplace"):
+                    call = f"{text_in!r}.encode({enc!r}" + (f", {err!r})" if err else ")")
+                    try:
+                        real = eval(call).decode("latin-1")
+                    except (UnicodeError, LookupError):
+                        real = None
+                    text, known = _flatten(ast.parse(call, mode="eval").body, {})
+                    if known and _WILD not in text:
+                        self.assertEqual(text, real, call)
+                    elif not known:
+                        self.assertIn(_WILD, text, call)
+
+    def test_r9_f1_the_docstring_names_the_codec_fold_and_what_it_leaves_unread(self):
+        doc = " ".join((__doc__ or "").split())
+        self.assertIn("is run by Python itself on the literal (R9-F1)", doc)
+        self.assertIn("reads as UNKNOWN (every non-ASCII character is any text and the text is padded with a wildcard), never as a literal", doc)
+        self.assertIn("A NUL character in a folded text is the wildcard", doc)
+
+    def test_r9_f1_clean_controls_stay_clean(self):
+        for expr in ("b'value_\\xffx'.decode('ascii', 'ignore')", "b'subprocess_\\xffvalue'.decode('ascii', 'ignore')", "b'subprocess_\\xffexec'.decode('ascii', 'replace')",
+                     "b'subprocess_\\xffexec'.decode('ascii', 'backslashreplace')", "'subprocess_\\u00e9exec'.encode('ascii', 'replace').decode()",
+                     "'subprocess_exe'.encode('latin-1').decode('latin-1')", "b'abc'.decode('ascii', 'replace')", "(b'hello' + b' world').decode('ascii', 'strict')",
+                     "'valu\\u00e9'.encode('ascii', 'ignore').decode()", "str(b'value_\\xffx', 'ascii', 'ignore')", "codecs.decode(b'value_x', 'ascii', 'ignore')",
+                     "'.' + b'value_\\xffx'.decode('ascii', 'ignore')", "b'abc'.decode('utf-16', 'ignore')", "'loop.' + 'abc'.encode('latin-1').decode('latin-1')",
+                     "br'sub\\x70rocess_exec'.decode('raw_unicode_escape')"):  # the last: raw_unicode_escape does not read \x70, so Python keeps it as text and it names no method
+            self.assertEqual(self._bad("import codecs\n" + self._launch(expr)), [], expr)
+            self.assertEqual(self._ps(expr), (0, 0), expr)
 
 
 if __name__ == "__main__":
