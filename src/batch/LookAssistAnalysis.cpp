@@ -372,7 +372,43 @@ QString lookAssistDecisionLogFields( const LookAssistStats &resolved, const Look
                        : QStringLiteral("NA") );
 }
 
-bool lookAssistPictureCorroboratesDaylight( const LookAssistStats &processedAtPlannedExposure )
+LookAssistStats lookAssistDisplayMeterAggregate( const LookAssistStats *samples, int count )
+{
+    LookAssistStats result;
+    if( !samples || count <= 0 ) return result;
+    count = qMin( count, 3 );
+    double median[3], p95[3], p99[3], aboveVideoWhite[3];
+    for( int i = 0; i < count; ++i )
+    {
+        median[i] = samples[i].median;
+        p95[i] = samples[i].p95;
+        p99[i] = samples[i].p99;
+        aboveVideoWhite[i] = samples[i].aboveVideoWhite;
+    }
+    std::sort( median, median + count );
+    std::sort( p95, p95 + count );
+    std::sort( p99, p99 + count );
+    std::sort( aboveVideoWhite, aboveVideoWhite + count );
+    result.median = median[count / 2];
+    result.p95 = p95[count / 2];
+    result.p99 = p99[count / 2];
+    result.aboveVideoWhite = aboveVideoWhite[count / 2];
+    result.p05 = result.median;
+    return result;
+}
+
+QString lookAssistDisplayMeterLogFields( int samples, const LookAssistStats &meter, int frame )
+{
+    return QStringLiteral("samples=%1 robust_median=%2 robust_p95=%3 robust_p99=%4 above_video_white=%5 frame=%6")
+        .arg( samples )
+        .arg( meter.median, 0, 'f', 1 )
+        .arg( meter.p95, 0, 'f', 1 )
+        .arg( meter.p99, 0, 'f', 1 )
+        .arg( meter.aboveVideoWhite, 0, 'f', 6 )
+        .arg( frame );
+}
+
+bool lookAssistPictureCorroboratesDaylight(const LookAssistStats &processedAtPlannedExposure )
 {
     // The Shade preset lifts a flat RAW thumbnail towards a mid-grey picture (target median 112). If the
     // exposure is right that the scene is daylight, the RENDERED picture at that lift is a lit picture:

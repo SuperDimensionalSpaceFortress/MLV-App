@@ -208,6 +208,20 @@ QString lookAssistDaylightGateName( const LookAssistStats &resolved, bool pictur
  * Pure; reads nothing it was not given. */
 QString lookAssistDecisionLogFields( const LookAssistStats &resolved, const LookAssistDecisionTrace &trace );
 
+/* The display meter's answer from its per-frame samples (ReceiptApplier::lookAssistDisplayMeter; the GUI and batch call
+ * that one meter). median, p95, p99 and aboveVideoWhite are each sorted on their own and the element at index count / 2
+ * is taken: the middle of three, the upper of two. The fields are independent, so the p99 and the clip share can come
+ * from different frames. One clipped frame of three does not withhold the median-one lift; two do; with two samples
+ * one does. p05 is the median. count <= 0 returns default stats. Pure. */
+LookAssistStats lookAssistDisplayMeterAggregate( const LookAssistStats *samples, int count );
+
+/* The display_meter log fields, shared by the GUI (look_assist.display_meter) and batch ([BATCH] LOOK_ASSIST
+ * display_meter) lines, space separated:
+ *   samples=n robust_median=(1 decimal) robust_p95=(1 decimal) robust_p99=(1 decimal)
+ *   above_video_white=(the aboveVideoWhite fraction, 6 decimals) frame=n
+ * above_video_white is what the median-one lift's 0.002 gate reads; 6 decimals put 0.002000 and 0.002100 apart. Pure. */
+QString lookAssistDisplayMeterLogFields( int samples, const LookAssistStats &meter, int frame );
+
 /* The picture rendered at the exposure the daylight verdict would apply (the Shade preset's lift) is a
  * lit daylight picture: mostly mid-tones around a mid median, not a dark field with a small bright
  * region. The tracked fixture renders median 77-147 with 95-99 % mid-tones at its lift; a moon over a
