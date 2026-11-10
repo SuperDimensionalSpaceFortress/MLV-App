@@ -1093,6 +1093,36 @@ class JobStopSufficiencyExecutedTests(unittest.TestCase):
         self.assertIn("job-stop head", result["presentMonStatusReason"])
         self.assertAlmostEqual(result["headGapMs"], 3200.0, delta=1.0)
 
+    # ---- PRESENTMON-BACHELOR-CUDA-INTERNAL-GAP-1 (PR #788 r2 sol B1): one swap-record reader for both arms ---------------
+
+    SOL_R2_ORIGIN = "2026-11-09T00:00:00.0000000Z"
+    SOL_R2_GOOD = ("playback_smoke.gpu_window_swaps session=1 window_active=1 telemetry_enabled=1 swaps=40 max_gap_ms=1000 "
+                   "first_swap_utc=2026-11-09T00:00:01.000Z last_swap_utc=2026-11-09T00:00:40.000Z")
+    SOL_R2_STAMPLESS = "playback_smoke.gpu_window_swaps session=2 window_active=1 telemetry_enabled=1 swaps=40 max_gap_ms=1000 first_swap_utc= last_swap_utc="
+
+    def _sol_r2(self, log: str) -> dict:
+        # sol r2 B1's literal repro: zero-width trusted bracket at the UTC origin, a job-caused stop, process window [0, 40000] ms, and 40 positive
+        # rows at 1000*k ms for k = 1..40. Only the run log differs between the cases.
+        return self._status([1000.0 * k for k in range(1, 41)], log, stopped_by_job=True, capture_start=self.SOL_R2_ORIGIN, post_spawn=self.SOL_R2_ORIGIN,
+                            result_json=_result_json(start=self.SOL_R2_ORIGIN, end="2026-11-09T00:00:40.0000000Z"))
+
+    def test_sol_r2_b1_the_control_record_alone_is_ok(self) -> None:
+        result = self._sol_r2(self.SOL_R2_GOOD)
+        self.assertEqual(result["presentMonStatus"], "ok", result)
+
+    def test_sol_r2_b1_a_stampless_final_record_never_reuses_an_earlier_sessions_stamps(self) -> None:
+        # on cdb490a9 this read swapWindowParsed=true, jobStopSufficient=true, presentMonStatus=ok from session 1's stamps
+        result = self._sol_r2(self.SOL_R2_GOOD + "\n" + self.SOL_R2_STAMPLESS)
+        self.assertEqual(result["presentMonStatus"], "degraded", result)
+        self.assertIn("job-stop position", result["presentMonStatusReason"])
+
+    def test_sol_r2_b1_stamps_in_a_location_suffix_are_never_the_job_stop_window(self) -> None:
+        # on cdb490a9 the unanchored matcher read the suffix's stamps and said ok
+        log = self.SOL_R2_STAMPLESS + " (C:/build first_swap_utc=2026-11-09T00:00:01.000Z last_swap_utc=2026-11-09T00:00:40.000Z x/MainWindow.cpp:1)"
+        result = self._sol_r2(log)
+        self.assertEqual(result["presentMonStatus"], "degraded", result)
+        self.assertIn("job-stop position", result["presentMonStatusReason"])
+
     # ---- UM-PRESENTMON-STOP-2 r2: the bracket is only as good as the readiness behind it ---------------
 
     def _delayed_origin(self, *, origin_ms: float, late_end_ms: float, trace_ready: bool, stopped_by_job: bool = True) -> dict:

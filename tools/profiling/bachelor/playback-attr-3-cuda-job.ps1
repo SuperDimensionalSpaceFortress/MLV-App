@@ -1024,6 +1024,7 @@ $embeddedFunctions = $embeddedFunctions + "`r`n# HFR-CONFORM-AWARE-RECEIPT-ORACL
 # beside it, which the job-stop arm calls too), spliced inside its own sentinel brackets for the same byte-identity reason as the splices above.
 $embeddedFunctions = $embeddedFunctions + "`r`n# PRESENTMON-BACHELOR-CUDA-INTERNAL-GAP-1 >>>`r`n" + (Get-AttrCudaEmbeddedFunctionSource -Name @(
     'ConvertFrom-AttrCudaSwapStampUtc',
+    'Get-AttrCudaSwapWindowRecord',
     'Get-AttrCudaPlaybackTemporalCoverage'
 )) +"`r`n# PRESENTMON-BACHELOR-CUDA-INTERNAL-GAP-1 <<<"
 $smokeRunnerClosureDigest = Get-AttrCudaClosureDigestHex -Closure $smokeRunnerClosure
@@ -4113,13 +4114,15 @@ if ($presentMonStoppedByJob) {
         }
     }
     # PRESENTMON-BACHELOR-CUDA-INTERNAL-GAP-1 >>>
-    # PRESENTMON-BACHELOR-CUDA-INTERNAL-GAP-1 (PR #788 r1 sol B1, catalogue P-02): the [datetime] casts above accept a truncated, zone-less or
-    # date-only stamp. The same two stamps are re-read through the strict writer-shape reader; anything but yyyy-MM-ddTHH:mm:ss.fffZ is unparsed.
-    if ($swapWindowMatches.Count -gt 0) {
-        $swapFirstUtc = ConvertFrom-AttrCudaSwapStampUtc -Value $swapWindowMatches[$swapWindowMatches.Count - 1].Groups['first'].Value
-        $swapLastUtc = ConvertFrom-AttrCudaSwapStampUtc -Value $swapWindowMatches[$swapWindowMatches.Count - 1].Groups['last'].Value
-        $swapWindowParsed = ($null -ne $swapFirstUtc -and $null -ne $swapLastUtc -and $swapLastUtc -gt $swapFirstUtc)
-    }
+    # PRESENTMON-BACHELOR-CUDA-INTERNAL-GAP-1 (PR #788 r1 sol B1, catalogue P-02; r2 sol B1): the matcher above is unanchored and takes the last
+    # STAMP-BEARING record, so a stampless final record reused an earlier session's stamps and a " (C:/build first_swap_utc=...)" location suffix
+    # supplied them; the [datetime] casts accept a truncated, zone-less or date-only stamp. The window is re-selected here by the SAME reader the
+    # temporal arm uses (Get-AttrCudaSwapWindowRecord: the LAST line-anchored record, its own key=value fields only, strict writer-shape stamps).
+    # A last record without usable stamps is unparsed, so the position arm below refuses: never an earlier record's window.
+    $swapWindowRecord = Get-AttrCudaSwapWindowRecord -LogText $(if ($appSwapTelemetry.source -eq 'gpu_window_swaps') { $rawLog } else { '' })
+    $swapFirstUtc = $swapWindowRecord.firstUtc
+    $swapLastUtc = $swapWindowRecord.lastUtc
+    $swapWindowParsed = ($null -eq $swapWindowRecord.why -and $null -ne $swapFirstUtc -and $null -ne $swapLastUtc -and $swapLastUtc -gt $swapFirstUtc)
     # PRESENTMON-BACHELOR-CUDA-INTERNAL-GAP-1 <<<
     $presentMonJobStopAnchorUncertaintyMs = ($presentMonPostSpawnUtc - $presentMonCaptureStartUtc).TotalMilliseconds
     $pmPresentTimes = @($displayReport.selectedPresentTimesMs | ForEach-Object { [double]$_ } | Sort-Object)
@@ -4347,6 +4350,9 @@ Save-Json ([ordered]@{
     # receipt guard tells an app stall (counted) from lost PresentMon rows (not counted). $null when the swap window was unavailable.
     presentMonTemporalAppSwapMaxGapMs = $presentMonPlaybackTemporal.appSwapMaxGapMs
     presentMonTemporalOverBoundGapCount = $presentMonPlaybackTemporal.overBoundGapCount
+    # CoS G8: whether PresentMon's over-bound internal gap sits where the app's own longest gap is (by its max_gap_before_serial swap ordinal):
+    # $true / $false, or $null when the record has no ordinal or there is no over-bound internal gap.
+    presentMonTemporalOverBoundGapAtAppStall = $presentMonPlaybackTemporal.overBoundGapAtAppStall
     # PRESENTMON-BACHELOR-CUDA-INTERNAL-GAP-1 <<<
     presentMonSufficiency = [ordered]@{
         minIntervalCount=$presentMonSufficiencyMinIntervalCount
