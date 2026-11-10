@@ -19299,9 +19299,14 @@ void MainWindow::applyLookAssistToReceipt( ReceiptSettings *receipt,
         QFile::remove( path );
         if( QFile::exists( path ) ) return QString();
         QFile out( path );
-        if( !out.open( QIODevice::WriteOnly ) || out.write( png ) != png.size() ) return QString();
+        if( !out.open( QIODevice::WriteOnly ) ) return QString();
+        const bool complete = out.write( png ) == png.size();
         out.close();
-        if( out.error() != QFileDevice::NoError ) return QString();
+        if( !complete || out.error() != QFileDevice::NoError )
+        {
+            QFile::remove( path );   // r2 adversary pass 4 A2: no partial file is left under the name
+            return QString();
+        }
         return QString::fromLatin1( QCryptographicHash::hash( png, QCryptographicHash::Sha256 ).toHex() );
     };
     auto dumpLivePicture = [&]( const QString &fileName ) -> QString

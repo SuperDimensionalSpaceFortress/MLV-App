@@ -4048,7 +4048,8 @@ TEST(LookAssistScene, SafetyPictureDumpNeverBindsAFileItFailedToWrite)
     ASSERT_EQ( 0, window.count( QStringLiteral(".save( QDir( dumpDir )") ) );
     ASSERT_EQ( 2, window.count( QStringLiteral("savePictureFresh(") ) );
     ASSERT_EQ( 1, window.count( QStringLiteral("if( QFile::exists( path ) ) return QString();") ) );
-    ASSERT_EQ( 1, window.count( QStringLiteral("if( !out.open( QIODevice::WriteOnly ) || out.write( png ) != png.size() ) return QString();") ) );
+    ASSERT_EQ( 1, window.count( QStringLiteral("const bool complete = out.write( png ) == png.size();") ) );
+    ASSERT_EQ( 1, window.count( QStringLiteral("QFile::remove( path );   // r2 adversary pass 4 A2: no partial file is left under the name") ) );
     ASSERT_EQ( 1, window.count( QStringLiteral("return QString::fromLatin1( QCryptographicHash::hash( png, QCryptographicHash::Sha256 ).toHex() );") ) );
     ASSERT_EQ( 1, window.count( QStringLiteral("const QString finalSha256 = dumpLivePicture( lookAssistPictureDumpFileName( true, analysisFrame ) );") ) );
     ASSERT_EQ( 1, window.count( QStringLiteral("preSafetySha256 = dumpLivePicture( lookAssistPictureDumpFileName( false, analysisFrame ) );") ) );
