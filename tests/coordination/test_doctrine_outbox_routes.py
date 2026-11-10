@@ -3590,3 +3590,74 @@ def test_a_scratch_made_but_whose_pin_could_not_be_recorded_is_still_removed(tmp
         ob.make_exercise_scratch(bus, root)
     assert list(root.iterdir()) == [], "the scratch made before the pin failed was left behind"
     assert not [k for k in ob._SCRATCH_PINS if os.path.normcase(str(root)) in k], ob._SCRATCH_PINS
+
+
+# Adversary pass r5 (head d9b83d99): A2 the private rename and its check take time, and the walk must not start after the deadline;
+# A3 a transient denial on the private name's metadata is retried, not final; A4 a broken stderr never replaces the first failure.
+
+def test_no_walk_starts_after_the_deadline_once_the_private_rename_and_its_check_took_time(tmp_path, monkeypatch):
+    import types
+    root = tmp_path / "scratch"
+    base = root / (ob.ROUTE_SCRATCH_PREFIX + "lateaside")
+    base.mkdir(parents=True)
+    ob._pin_scratch(base, root)
+    clock = [0.0]                                                        # the loop's deadline is ROUTE_SCRATCH_REMOVE_DEADLINE from here
+    walks: list[str] = []
+    real_aside = ob._move_scratch_aside
+
+    def slow_aside(*args, **kwargs):
+        clock[0] = 14.9                                                  # the check at the loop top passed at 0.0; the rename starts ...
+        got = real_aside(*args, **kwargs)
+        clock[0] = ob.ROUTE_SCRATCH_REMOVE_DEADLINE + 0.1                # ... and the rename and its identity check end past the deadline
+        return got
+
+    monkeypatch.setattr(ob, "_move_scratch_aside", slow_aside)
+    monkeypatch.setattr(ob.shutil, "rmtree", lambda path, *a, **k: walks.append(str(path)))
+    monkeypatch.setattr(ob, "time", types.SimpleNamespace(monotonic=lambda: clock[0], sleep=lambda s: clock.__setitem__(0, clock[0] + s)))
+    with pytest.raises(ob.Unknown) as caught:
+        ob.remove_exercise_scratch(base, root)
+    assert caught.value.code == "EXERCISE_SCRATCH_NOT_REMOVED", caught.value
+    assert walks == [], f"a walk started after the deadline: {walks}"
+    assert str(scratch_now(base)) in caught.value.detail, caught.value.detail   # names where the scratch is left
+
+
+def test_a_transient_denial_on_the_private_names_metadata_is_retried_not_final(tmp_path, monkeypatch):
+    root = tmp_path / "scratch"
+    base = root / (ob.ROUTE_SCRATCH_PREFIX + "denyonce")
+    base.mkdir(parents=True)
+    ob._pin_scratch(base, root)                                          # pinned EMPTY, as mkdtemp made it; content comes after
+    (base / "f.txt").write_text("ours", encoding="utf-8")
+    monkeypatch.setattr(ob, "ROUTE_SCRATCH_REMOVE_PAUSE", 0)
+    real_lstat, denied = os.lstat, []
+
+    def lstat(path, *a, **k):
+        if ".rm-" in os.fspath(path) and not denied:
+            denied.append(os.fspath(path))
+            raise PermissionError(13, "Access is denied", os.fspath(path))
+        return real_lstat(path, *a, **k)
+
+    monkeypatch.setattr(ob.os, "lstat", lstat)
+    ob.remove_exercise_scratch(base, root)                               # a single transient denial is ridden out
+    monkeypatch.setattr(ob.os, "lstat", real_lstat)
+    assert denied, "the seam never ran"
+    assert list(root.iterdir()) == [], list(root.iterdir())
+
+
+def test_a_broken_stderr_never_replaces_the_preparations_own_failure(tmp_path, monkeypatch):
+    bus = make_bus(tmp_path)
+
+    def git_fails(*_a, **_k):
+        raise ob.GitError("first failure")
+
+    def broken_stderr(line, stream=None):
+        raise BrokenPipeError(32, "Broken pipe")
+
+    monkeypatch.setattr(ob, "run_isolated_git", git_fails)
+    monkeypatch.setattr(ob.shutil, "rmtree", FlakyScratchRemoval(shutil.rmtree, None))
+    monkeypatch.setattr(ob, "ROUTE_SCRATCH_REMOVE_PAUSE", 0)
+    monkeypatch.setattr(ob, "ROUTE_SCRATCH_REMOVE_DEADLINE", 0.3)
+    monkeypatch.setattr(ob, "_route_say", broken_stderr)
+    with pytest.raises(ob.GitError) as caught:
+        ob.make_exercise_scratch(bus, tmp_path / "scratch")
+    assert "first failure" in str(caught.value)
+    assert any("EXERCISE_SCRATCH_NOT_REMOVED" in note for note in getattr(caught.value, "__notes__", [])), caught.value

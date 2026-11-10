@@ -3969,7 +3969,9 @@ def _pin_scratch(base: pathlib.Path, scratch_root: str | os.PathLike) -> None:
     replacement put there between the reads, which holds something, is never taken for it. An identity that is unreadable, differs
     between the reads or fails that check is recorded as None, which removal never completes from whatever it finds later (the typed
     EXERCISE_SCRATCH_NOT_REMOVED, not an adopted replacement). What remains is an EMPTY ordinary directory swapped in before the
-    first read: no file is lost to it, and Python offers no handle-based identity on Windows to close that instant."""
+    first read (no file is lost to it), and a same-user process that serves the identity reads and the emptiness scan from two
+    different objects by swapping between them: each is its own path lookup, and binding them to one object needs a handle-based
+    identity and listing that Python does not offer on Windows."""
     real = os.path.realpath(scratch_root)
     root_a, work_a = _file_id(real, follow=True), _file_id(base)
     root_b, work_b = _file_id(real, follow=True), _file_id(base)        # back to back, no pause: a swap between two reads shows as a difference
@@ -3986,16 +3988,19 @@ def _move_scratch_aside(work: pathlib.Path, root: pathlib.Path, root_id: tuple[i
     """Rename the scratch `work` to a fresh private random name in the same (pinned) parent, in one atomic rename, and return that
     name only when the object now under it is the pinned scratch: the same file identity, a real directory, no link, junction or
     reparse point, with the root still the pinned root. Anything else is put back under its name when it can be and is the typed
-    EXERCISE_SCRATCH_NOT_REMOVED, with nothing removed. A failed rename (held, gone) is an OSError for the caller's bounded loop."""
+    EXERCISE_SCRATCH_NOT_REMOVED, with nothing removed. A failed rename (held, gone) is an OSError for the caller's bounded loop, and
+    so is an object whose metadata could not be read once it was put back (unknown, retried; never removed, never read as gone)."""
     private = root / f"{work.name}.rm-{os.urandom(8).hex()}"           # keeps the run's prefix; nobody can name it in advance
     os.rename(work, private)
+    unreadable: OSError | None = None
     try:
         info = os.lstat(private)
         same = ((info.st_dev, info.st_ino) == work_id and work_id is not None and root_id is not None
                 and _file_id(root, follow=True) == root_id and stat.S_ISDIR(info.st_mode) and not stat.S_ISLNK(info.st_mode)
                 and not getattr(info, "st_file_attributes", 0) & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400))
-    except (OSError, ValueError):
-        same = False                                                    # unknown is not ours
+    except (OSError, ValueError) as e:
+        same = False                                                    # unknown is not ours: never removed
+        unreadable = e if isinstance(e, OSError) else OSError(str(e))
     if same:
         return private
     try:
@@ -4003,6 +4008,9 @@ def _move_scratch_aside(work: pathlib.Path, root: pathlib.Path, root_id: tuple[i
         where = f"it was put back under {work}"
     except OSError as e:
         where = f"it could not be put back and is left under {private} ({e})"
+    else:
+        if unreadable is not None:                                      # put back where the loop looks again: a transient denial is retried
+            raise OSError(f"{base}: its metadata could not be read under its private name ({unreadable}); it was put back") from unreadable
     raise Unknown("EXERCISE_SCRATCH_NOT_REMOVED",
                   f"{base}: what its name held when removal began is not the scratch this run made (another directory, a link or a "
                   f"junction); nothing was removed and {where}")
@@ -4104,6 +4112,8 @@ def _remove_pinned_scratch(base: pathlib.Path, root: pathlib.Path, root_id: tupl
             try:
                 if target == work:
                     target = _move_scratch_aside(work, root, root_id, work_id, base)   # removal never walks the scratch's own name
+                    if time.monotonic() > deadline:                     # the rename and its check took time: the walk is an attempt too
+                        break
                 walked = target
                 if sys.version_info >= (3, 12):
                     shutil.rmtree(walked, onexc=lambda f, p, e: _writable_retry(f, p, e, walked, deadline, ours))
@@ -4135,9 +4145,12 @@ def _remove_scratch_keeping(failure: BaseException, base: pathlib.Path, scratch_
             failure.detail = f"{failure.detail}; {said}" if failure.detail else said
             failure.args = (f"{failure.code}: {failure.detail}",)
         else:
-            _route_say(said, sys.stderr)
             if hasattr(failure, "add_note"):
                 failure.add_note(said)
+            try:
+                _route_say(said, sys.stderr)
+            except (OSError, ValueError):                               # a closed or broken stderr never replaces the outcome
+                pass
 
 
 def make_exercise_scratch(bus: pathlib.Path, scratch_root: pathlib.Path) -> tuple[pathlib.Path, pathlib.Path, str]:
