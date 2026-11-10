@@ -3475,8 +3475,8 @@ TEST(LookAssistScene, ADisplayMedianOfOneCodeValueLetsTheHighlightsGovernTheExpo
 // the controls the branch must leave alone, and the shared override in the other two scenes.
 // Expected values: displayCap = qRound( log2( 440 / p99 ) * 100 ), then qBound( -120, ., 380 ).
 //   p99 128 -> log2(3.4375)   = 1.7814 -> 178
-//   p99 255 -> log2(1.7255)   = 0.7871 ->  79
-//   p99   2 -> log2(220)      = 7.7814 -> 778 -> bounded to 380
+// r3 (Grok G3) narrows the branch to 16 < p99 <= 235 with at most 0.2% of the meter above 235; p99 255 (was +79)
+// and p99 2 (was +778 -> 380) now keep 0. Their tests follow, each with its rationale.
 namespace {
 LookAssistStats lookAssistMedianOneRaw1457()
 {
@@ -3512,26 +3512,74 @@ TEST(LookAssistScene, ADisplayMedianOfOneWithP99Of128GetsTheUnsaturatedHighlight
     ASSERT_EQ( 178, presetForLookAssistScene( LookAssistScene::Shade, readable, nullptr, &meter ).exposure );
 }
 
-// 792-I1 row 2: median one, p99 255 (the top display code value): the cap is +79.
-TEST(LookAssistScene, ADisplayMedianOfOneWithP99Of255GetsTheUnsaturatedHighlightCap)
+// r3 (Grok G3): median one, p99 255 (the top display code value). At least 1% of the frame is above video white
+// (235), so the lift (the cap was +79 on 27ba24c1) would only push it further into clip: no lift.
+TEST(LookAssistScene, ADisplayMedianOfOneWithP99Of255IsNotLiftedPastVideoWhite)
 {
     const LookAssistStats raw = lookAssistMedianOneRaw1457();
     const LookAssistStats meter = lookAssistMedianOneMeter( 1, 200, 255 );
-    ASSERT_EQ( 79, presetForLookAssistScene( LookAssistScene::Night, raw, nullptr, &meter ).exposure );
-    ASSERT_EQ( 79, presetForLookAssistScene( LookAssistScene::Shade, raw, nullptr, &meter ).exposure );
+    ASSERT_EQ( 0, presetForLookAssistScene( LookAssistScene::Night, raw, nullptr, &meter ).exposure );
+    ASSERT_EQ( 0, presetForLookAssistScene( LookAssistScene::Shade, raw, nullptr, &meter ).exposure );
 }
 
-// 792-I1 row 3: median one, p99 2, the first value past the p99 > 1 guard: the cap (+778) is bounded to +380.
-TEST(LookAssistScene, ADisplayMedianOfOneWithP99OfTwoIsBoundedTo380)
+// r3 (Grok G3): the video-white boundary. p99 235 is at video white, not above it, so it keeps the cap
+// (log2(440/235) = 0.9049 -> +90); p99 236 is above it and gets no lift (it was +90 on 27ba24c1).
+TEST(LookAssistScene, ADisplayMedianOfOneLiftStopsAtAP99AboveVideoWhite)
 {
     const LookAssistStats raw = lookAssistMedianOneRaw1457();
-    const LookAssistStats meter = lookAssistMedianOneMeter( 1, 2, 2 );
-    ASSERT_EQ( 380, presetForLookAssistScene( LookAssistScene::Night, raw, nullptr, &meter ).exposure );
-    ASSERT_EQ( 380, presetForLookAssistScene( LookAssistScene::Shade, raw, nullptr, &meter ).exposure );
+    const LookAssistStats atWhite = lookAssistMedianOneMeter( 1, 200, 235 );
+    const LookAssistStats aboveWhite = lookAssistMedianOneMeter( 1, 200, 236 );
+    ASSERT_EQ( 90, presetForLookAssistScene( LookAssistScene::Night, raw, nullptr, &atWhite ).exposure );
+    ASSERT_EQ( 0, presetForLookAssistScene( LookAssistScene::Night, raw, nullptr, &aboveWhite ).exposure );
+    ASSERT_EQ( 0, presetForLookAssistScene( LookAssistScene::Shade, raw, nullptr, &aboveWhite ).exposure );
+}
+
+// r3 (Grok G3): the clipped-pixel check, measured. A frame whose p99 (120) is well below white can still hold a
+// specular patch above video white; when that share is over 0.2% (the raw path's clip threshold) the lift would clip
+// it, so there is no lift. The meter is the analyzer's own reading of a synthetic display thumbnail: 9000 px at luma
+// 1, 950 at 120 and 50 (0.5%) at 250 -> median 1, p99 120, so 27ba24c1 lifted it by log2(440/120) -> +187.
+// With 10 px (0.1%) at 250 the lift stays.
+TEST(LookAssistScene, ADisplayMedianOfOneLiftIsWithheldWhenTheMeterSeesClippedPixels)
+{
+    const auto thumbnail = []( int whitePixels ) {
+        std::vector<unsigned char> rgb( 10000 * 3, 1 );
+        for( int i = 9000; i < 10000 - whitePixels; ++i )
+            rgb[i * 3 + 0] = rgb[i * 3 + 1] = rgb[i * 3 + 2] = 120;
+        for( int i = 10000 - whitePixels; i < 10000; ++i )
+            rgb[i * 3 + 0] = rgb[i * 3 + 1] = rgb[i * 3 + 2] = 250;
+        return analyzeLookAssistThumbnail( rgb.data(), 100, 100 );
+    };
+    const LookAssistStats raw = lookAssistMedianOneRaw1457();
+    const LookAssistStats clipped = thumbnail( 50 );
+    ASSERT_EQ( 1.0, clipped.median );
+    ASSERT_EQ( 120.0, clipped.p99 );
+    ASSERT_EQ( 0, presetForLookAssistScene( LookAssistScene::Night, raw, nullptr, &clipped ).exposure );
+    ASSERT_EQ( 0, presetForLookAssistScene( LookAssistScene::Shade, raw, nullptr, &clipped ).exposure );
+
+    const LookAssistStats specks = thumbnail( 10 );
+    ASSERT_EQ( 1.0, specks.median );
+    ASSERT_EQ( 120.0, specks.p99 );
+    ASSERT_EQ( 187, presetForLookAssistScene( LookAssistScene::Night, raw, nullptr, &specks ).exposure );
+}
+
+// r3 (Grok G3): the p99 floor. A median-one frame whose p99 is at or below video black (16) has no highlight to
+// meter: lifting it 3.8 stops lifts noise. p99 2 and 16 got +380 on 27ba24c1 and now get no lift; p99 17, the
+// first value past the floor, keeps the cap (log2(440/17) -> +469, bounded to +380).
+TEST(LookAssistScene, ADisplayMedianOfOneWithP99AtOrBelowVideoBlackIsNotLifted)
+{
+    const LookAssistStats raw = lookAssistMedianOneRaw1457();
+    const LookAssistStats two = lookAssistMedianOneMeter( 1, 2, 2 );
+    const LookAssistStats atBlack = lookAssistMedianOneMeter( 1, 12, 16 );
+    const LookAssistStats pastBlack = lookAssistMedianOneMeter( 1, 12, 17 );
+    ASSERT_EQ( 0, presetForLookAssistScene( LookAssistScene::Night, raw, nullptr, &two ).exposure );
+    ASSERT_EQ( 0, presetForLookAssistScene( LookAssistScene::Shade, raw, nullptr, &two ).exposure );
+    ASSERT_EQ( 0, presetForLookAssistScene( LookAssistScene::Night, raw, nullptr, &atBlack ).exposure );
+    ASSERT_EQ( 380, presetForLookAssistScene( LookAssistScene::Night, raw, nullptr, &pastBlack ).exposure );
+    ASSERT_EQ( 380, presetForLookAssistScene( LookAssistScene::Shade, raw, nullptr, &pastBlack ).exposure );
 }
 
 // 792-I1 row 4 (controls, unchanged by the fix): a median of 0 skips the display branch exactly as no meter does,
-// and a black meter (median one, p99 one: at the p99 > 1 guard) keeps exposure 0 in every scene.
+// and a black meter (median one, p99 one: below the p99 floor) keeps exposure 0 in every scene.
 TEST(LookAssistScene, ADisplayMedianOfZeroNullOrBlackMeterKeepsItsFallback)
 {
     LookAssistStats readable;

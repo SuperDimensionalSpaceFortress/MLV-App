@@ -145,6 +145,9 @@ LookAssistStats analyzeLookAssistThumbnail( const unsigned char *rgb, int width,
     int clipHigh = histogram[252] + histogram[253] + histogram[254] + histogram[255];
     stats.clipLow = (double)clipLow / (double)totalSamples;
     stats.clipHigh = (double)clipHigh / (double)totalSamples;
+    int aboveVideoWhite = 0;
+    for( int i = 236; i < 256; ++i ) aboveVideoWhite += histogram[i];
+    stats.aboveVideoWhite = (double)aboveVideoWhite / (double)totalSamples;
     return stats;
 }
 
@@ -2122,8 +2125,12 @@ LookAssistPreset presetForLookAssistScene( LookAssistScene scene,
         int displayExposure = 0;
         if( displayStats->median > 1.0 )
             displayExposure = lookAssistExposureForTarget( displayStats->median, (double)displayTarget, 0 );
-        else if( displayStats->p99 > 1.0 )
-            // A median of one code value carries no mid-tone reading, so the highlights govern.
+        else if( displayStats->p99 > 16.0
+              && displayStats->p99 <= 235.0
+              && displayStats->aboveVideoWhite <= 0.002 )
+            // A median of one code value carries no mid-tone reading, so the highlights govern. Not when p99 is at
+            // or below video black (16): that frame is noise and the lift would only raise it. Not when p99 or more
+            // than 0.2% of the display is above video white (235): the lift would push those pixels into clip.
             displayExposure = displayCap;
         displayExposure = qMin( displayExposure, displayCap );
         exposure = qBound( -120, displayExposure, 380 );

@@ -638,6 +638,7 @@ bool ReceiptApplier::lookAssistDisplayMeter(mlvObject_t *mlvObject,
     double medianSamples[3];
     double p95Samples[3];
     double p99Samples[3];
+    double aboveVideoWhiteSamples[3];
     int valid = 0;
 
     for( int s = 0; s < 3; ++s )
@@ -667,6 +668,7 @@ bool ReceiptApplier::lookAssistDisplayMeter(mlvObject_t *mlvObject,
                 medianSamples[valid] = sampleStats.median;
                 p95Samples[valid] = sampleStats.p95;
                 p99Samples[valid] = sampleStats.p99;
+                aboveVideoWhiteSamples[valid] = sampleStats.aboveVideoWhite;
                 ++valid;
             }
         }
@@ -681,10 +683,12 @@ bool ReceiptApplier::lookAssistDisplayMeter(mlvObject_t *mlvObject,
     std::sort( medianSamples, medianSamples + valid );
     std::sort( p95Samples, p95Samples + valid );
     std::sort( p99Samples, p99Samples + valid );
+    std::sort( aboveVideoWhiteSamples, aboveVideoWhiteSamples + valid );
     LookAssistStats result;
     result.median = medianSamples[valid / 2];
     result.p95 = p95Samples[valid / 2];
     result.p99 = p99Samples[valid / 2];
+    result.aboveVideoWhite = aboveVideoWhiteSamples[valid / 2];
     result.p05 = result.median;
     *out = result;
     return true;

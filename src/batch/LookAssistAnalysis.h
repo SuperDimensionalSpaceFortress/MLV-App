@@ -32,6 +32,8 @@ struct LookAssistStats
     double p99 = 0.0;
     double clipLow = 0.0;
     double clipHigh = 0.0;
+    // Share of samples whose luma is above video white (235).
+    double aboveVideoWhite = 0.0;
     double dynamicRange = 0.0;
     double medianR = 0.0;
     double medianG = 0.0;
