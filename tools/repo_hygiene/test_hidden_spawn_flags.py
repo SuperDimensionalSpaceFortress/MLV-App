@@ -772,17 +772,22 @@ def _fill_unknown_template(template: str, percent: bool) -> tuple[str, bool]:
         # The head of a segment after a wildcard may be the tail of a field the wildcard opened, or may not: BOTH readings are kept (side by side, a wildcard
         # between them), because dropping the head hides the literal text it holds (``(prefix + 'subprocess_exec{tail}').format(tail='')``, pass-23 A4).
         lead = ""
+        fill = _fill_percent if percent else _fill_format
         if i:
             # The head may be the tail of a field the wildcard opened (a key up to its paren, flags, width, precision and ONE conversion character; or up to a
-            # closing brace) or plain text. It is replaced by a wildcard, never deleted, and only as far as a field tail can reach: a literal name that
-            # starts at the head's conversion letter is still supplied by the wildcard, and one after it is kept whole (pass-23 A4).
+            # closing brace) or plain text. BOTH readings are kept: the head as plain text (a literal name in it is a name, ``'subprocess_exec)s'``), then the
+            # rest after the field tail the wildcard may have opened, with a wildcard between (pass-23 A4, pass-27 A1).
+            trimmed = None
             if percent and not seg.startswith("%"):  # a segment that opens with its own field has no tail of an earlier one to shed
-                seg, lead = seg[re.match(r"(?:[^()]*\))?[#0\- +0-9.*hlL]*[A-Za-z%]?", seg).end():], _WILD
+                trimmed = seg[re.match(r"(?:[^()]*\))?[#0\- +0-9.*hlL]*[A-Za-z%]?", seg).end():]
             elif not percent:
                 close = seg.find("}")
                 if close >= 0 and "{" not in seg[:close]:  # a field the wildcard opened closes at this brace; a brace after a '{' closes the segment's OWN field
-                    seg, lead = seg[close + 1:], _WILD
-        out.append(lead + (_fill_percent if percent else _fill_format)(seg, [], {}, False, any_pos=True, any_named=True)[0])
+                    trimmed = seg[close + 1:]
+            if trimmed is not None:
+                lead = _WILD + fill(seg, [], {}, False, any_pos=True, any_named=True)[0] + _WILD
+                seg = trimmed
+        out.append(lead + fill(seg, [], {}, False, any_pos=True, any_named=True)[0])
     return _WILD.join(out), False
 
 
@@ -4581,6 +4586,19 @@ class AdversaryR9Tests(unittest.TestCase):
         # a real comment still ends the line, and an escaped hash inside it changes nothing
         for script in ("Write-Host x # `#; Start-Process cmd.exe", "Write-Host x <# `#; Start-Process cmd.exe #>", "Write-Host x"):
             self.assertEqual(_judge_script(script), (0, 0), script)
+
+    # ---- pass 27 (review-adversary-MLV-LANE-CONSOLE-HIDDEN-1-r10-f770c8e2) A1, as a class ----
+    def test_pass27_a1_the_head_after_a_wildcard_is_also_plain_text_when_it_looks_like_a_field_tail(self):
+        prefix = "import os\nprefix = os.environ.get('MLV_PREFIX', '')\n"
+        rows = ["((prefix + 'subprocess_exec)s') % ())[:-2]", "((prefix + 'subprocess_exec}}s').format())[:-2]", "((prefix + 'subprocess_exec}}s').format_map({}))[:-2]",
+                "((prefix + 'subprocess_shell)s') % {})[:-2]", "((prefix + '_make_subprocess_transport}}s').format())[:-2]", "((prefix + 'subprocess_exec)ds') % ())[:-3]",
+                "((prefix + 'subprocess_exec}x}}').format_map({}))[:-4]", "((prefix + '%(k)ssubprocess_exec)s') % {'k': ''})[:-2]"]
+        for expr in rows:
+            self.assertGreaterEqual(len(self._bad(prefix + self._launch(expr))), 1, expr)
+        for expr in ("(prefix + 'value)s') % ()", "(prefix + 'value}}s').format()", "(prefix + 'subprocess_exe)s') % ()", "(prefix + 'allowed_roots}}s').format_map({})"):
+            self.assertEqual(self._bad(prefix + self._launch(expr)), [], expr)
+        for script in ("(prefix + 'saps cmd.exe)s') % ()", "(prefix + 'Start-Process cmd.exe}}s').format()"):
+            self.assertEqual(self._ps(script), (1, 1), script)
 
 
 if __name__ == "__main__":
