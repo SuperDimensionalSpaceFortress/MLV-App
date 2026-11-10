@@ -33,7 +33,8 @@ paths this scan does not parse is out of scope: the card's promise is that no AC
 deliberate evasion is impossible. The Start-Process check reads string literals, ``+`` chains of them and f-strings whose holes
 hold no string literal (a hole's run-time value is not known); a string built from a ``Start-`` piece by ``%``, ``.format``,
 ``.join`` or an f-string hole holding a literal is REPORTED rather than guessed at; a script assembled any other way (a file
-read at run time, ``chr()``) is not read. A name bound to two different spawn modules or APIs in one file is REPORTED, since
+read at run time, ``chr()``) is not read, and only ``Start-Process`` and its aliases ``start`` / ``saps`` are recognised as the
+launch (``[Diagnostics.Process]::Start``, ``Invoke-Item``, ``cmd /c start``, a command name held in a variable are not). A name bound to two different spawn modules or APIs in one file is REPORTED, since
 the alias map is file-wide, not scoped.
 """
 from __future__ import annotations
@@ -140,6 +141,7 @@ _DUNDER_OK = frozenset({"__name__", "__file__", "__doc__"})
 _IMPORT_FUNCS = frozenset({"import_module", "__import__"})
 # Ways to reach a module's contents or a function's annotations without a followable reference.
 _REFLECTION = frozenset({"__annotations__", "__builtins__", "get_type_hints", "get_annotations", "globals", "locals"})
+_CLASS_SCOPE_IMPORT_ROOTS = frozenset({"subprocess", "os", "asyncio", "nt", "posix", "importlib", "builtins"})
 _MUTATORS = frozenset({"setattr", "delattr"})
 _MUTATING_ATTRS = frozenset({"__dict__", "__setattr__", "__delattr__"})
 
@@ -303,6 +305,8 @@ class _Facts:
                         self._bind_func(a.asname or a.name, (origin, a.name))
                     elif origin == "asyncio" and a.name == "subprocess":
                         self._bind_module(a.asname or a.name, "asyncio.subprocess")
+                    elif a.name in ("os", "subprocess", "asyncio"):  # `from subprocess import os`: the module itself
+                        self._bind_module(a.asname or a.name, a.name)
 
     def _learn(self, name: str, value: ast.AST) -> list[str]:
         learned: list[str] = []
@@ -475,6 +479,24 @@ def _reference_violations(tree: ast.AST, facts: _Facts) -> list[tuple[int, str]]
     for node in ast.walk(tree):
         module: str | None = None
         is_ref = False
+        if isinstance(node, (ast.Import, ast.ImportFrom)):
+            if isinstance(node, ast.ImportFrom):
+                roots = [(node.module or "").split(".")[0]] if node.level == 0 else []
+            else:
+                roots = [a.name.split(".")[0] for a in node.names]
+            if any(r in _CLASS_SCOPE_IMPORT_ROOTS for r in roots) and _in_class_scope(node, parent):
+                out.append((node.lineno, "imports a spawn or import module in a class body, where the name is a class attribute"))
+            if isinstance(node, ast.ImportFrom) and node.level == 0:
+                origin = _MODULE_ALIASES.get(node.module or "", node.module or "")
+                if origin in _STRICT_MODULES:
+                    for a in node.names:
+                        if a.name != "*" and not _attr_ok(origin, a.name):
+                            out.append((node.lineno, f"imports {a.name} from {origin}, which is not a constant or a data type"))
+            continue
+        if isinstance(node, ast.Attribute) and node.attr in _LOOP_SPAWN_METHODS:
+            up = parent.get(id(node))
+            if not (isinstance(up, ast.Call) and up.func is node):  # an alias of loop.subprocess_exec is not followed
+                out.append((node.lineno, f"uses {node.attr} other than by calling it in place"))
         if isinstance(node, ast.Call):
             is_import, module, resolved = facts.import_target(node)
             if is_import and not resolved:
@@ -609,22 +631,26 @@ def _hidden_names(tree: ast.AST, facts: _Facts) -> tuple[set[str], set[str]]:
     if _mutates_modules(tree, receivers | set(binders)):
         receivers = set()
     names = {n for n in _TRUSTED_NAMES if n not in binders}
-    dependants: dict[str, set[str]] = {}
-    for name, values in binders.items():
-        for value in values:
-            if value is not None:
-                for sub in ast.walk(value):
-                    if isinstance(sub, ast.Name):
-                        dependants.setdefault(sub.id, set()).add(name)
-    queue = list(binders)
-    while queue:
-        name = queue.pop()
-        values = binders[name]
-        if name in names or name in facts.imports or any(v is None for v in values):
-            continue  # an import that also assigns the same name is two objects: not provable
-        if all((name in _HIDDEN_NAMES and _is_no_window_definition(v, facts)) or _provably_hidden(v, names, receivers) for v in values):
-            names.add(name)
-            queue.extend(dependants.get(name, ()))
+    eligible = {name for name, values in binders.items() if name not in facts.imports and not any(v is None for v in values)}
+    dependants: dict[str, list[tuple[str, int]]] = {}
+    queue: list[tuple[str, int]] = []
+    for name in eligible:
+        for index, value in enumerate(binders[name]):
+            queue.append((name, index))
+            for sub in ast.walk(value):
+                if isinstance(sub, ast.Name):
+                    dependants.setdefault(sub.id, []).append((name, index))
+    proven: dict[str, set[int]] = {}
+    while queue:  # a binding is re-judged only when a name it mentions became hidden: linear in the source
+        name, index = queue.pop()
+        if name in names or index in proven.get(name, ()):
+            continue
+        value = binders[name][index]
+        if (name in _HIDDEN_NAMES and _is_no_window_definition(value, facts)) or _provably_hidden(value, names, receivers):
+            proven.setdefault(name, set()).add(index)
+            if len(proven[name]) == len(binders[name]):
+                names.add(name)
+                queue.extend(dependants.get(name, ()))
     return names, receivers
 
 
@@ -664,7 +690,7 @@ def _unflagged_spawns_in_source(source: str, label: str) -> list[str]:
 # --- PowerShell fixtures: Start-Process powershell must be hidden, judged per statement ---------------------------------
 
 _WINDOW_STYLE_HIDDEN_RE = re.compile(r"(?<!\S)-WindowStyle[\s:]+(?:'Hidden'|\"Hidden\"|Hidden(?![\w-]))", re.IGNORECASE)
-_START_PROCESS_RE = re.compile(r"(?<![\w-])Start-Process(?![\w-])", re.IGNORECASE)
+_START_PROCESS_RE = re.compile(r"(?<![\w$.-])(Start-Process|saps|start)(?![\w-])", re.IGNORECASE)  # the cmdlet and its aliases
 
 
 def _quoted_spans(text: str) -> list[tuple[int, int]]:
@@ -715,7 +741,7 @@ def _ps_statements(script: str) -> list[str]:
             while i < n and script[i] != "\n":
                 i += 1
             continue
-        if ch in ";|{}\r\n":
+        if ch in ";|&{}\r\n":  # & also backgrounds the command before it
             out.append("".join(cur))
             cur = []
         else:
@@ -743,12 +769,22 @@ def _judge_script(script: str) -> tuple[int, int]:
             if not quoted[k]:
                 depth = depth + 1 if ch == "(" else max(0, depth - 1) if ch == ")" else depth
             depths[k] = depth
+        hole = "\x01" in statement  # a run-time value of unknown text sits in this statement: it could hold a comment or a quote
         for m in _START_PROCESS_RE.finditer(statement):
-            if quoted[m.start()] or "powershell" not in statement[m.start():].lower():
+            word = m.group(1).lower()
+            before = statement[:m.start()].rstrip()
+            span = next(((s, e) for s, e in spans if s <= m.start() <= e), None)
+            if span is not None:  # a quoted command name is a command only as `& 'Start-Process' ...`, and it must be the whole string
+                before = statement[:span[0]].rstrip()
+                if statement[span[0] + 1:span[1]].strip().lower() != word or not (before == "" or before[-1] in "=(&"):
+                    continue
+            elif word != "start-process" and not (before == "" or before[-1] in "=(&"):
+                continue  # `start` / `saps` count only where a command word can stand
+            if "powershell" not in statement[m.start():].lower():
                 continue
             found += 1
-            if not any(not quoted[h.start()] and depths[h.start()] == depths[m.start()]
-                       for h in _WINDOW_STYLE_HIDDEN_RE.finditer(statement, m.start())):
+            if hole or not any(not quoted[h.start()] and depths[h.start()] == depths[m.start()]
+                               for h in _WINDOW_STYLE_HIDDEN_RE.finditer(statement, m.start())):
                 bad += 1
         for s, e in spans:
             inner = statement[s + 1:e]
@@ -796,7 +832,7 @@ def _string_values(tree: ast.AST) -> list[tuple[int, str, bool]]:
             isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr in _STRING_BUILDERS)
         if builds:
             pieces = [c.value for c in ast.walk(node) if isinstance(c, ast.Constant) and isinstance(c.value, str)]
-            if any("start-" in p.lower() for p in pieces):
+            if any("start-" in p.lower() or re.search(r"\bsaps\b", p, re.I) for p in pieces):
                 out.append((node.lineno, "".join(pieces), True))
                 continue
         stack.extend(ast.iter_child_nodes(node))
@@ -818,7 +854,7 @@ def _start_process_violations(py_source: str) -> tuple[int, list[int]]:
             found += 1
             bad.append(lineno)
             continue
-        if "start-process" not in text.lower():
+        if not _START_PROCESS_RE.search(text) and not re.search(r"'\s*(start-process|saps|start)\s*'|\"\s*(start-process|saps|start)\s*\"", text, re.I):
             continue
         text_found, text_bad = _judge_script(text)
         found += text_found
@@ -1548,6 +1584,71 @@ class AdversaryR4Tests(unittest.TestCase):
         # a literal concatenation is still read, and an f-string with no Start- piece is not a Start-Process
         self.assertEqual(_start_process_violations("x = 'Start-Process ' 'powershell.exe ' + '-WindowStyle Hidden'\n"), (1, []))
         self.assertEqual(_start_process_violations("x = f'powershell.exe -File {path}'\n"), (0, []))
+
+    # Pass 8 (review-adversary-MLV-LANE-CONSOLE-HIDDEN-1-r4-02784d27), findings A1-A7.
+    def test_pass8_a1_an_event_loop_spawn_method_is_only_ever_called_in_place(self):
+        for label, src in {
+            "alias exec": "import asyncio\nloop = asyncio.new_event_loop()\nspawn = loop.subprocess_exec\nloop.run_until_complete(spawn(asyncio.SubprocessProtocol, 'cmd.exe'))\n",
+            "alias shell": "import asyncio\nloop = asyncio.new_event_loop()\nspawn = loop.subprocess_shell\nspawn(asyncio.SubprocessProtocol, 'cmd.exe /c exit')\n",
+            "argument": "def f(loop):\n    run(loop.subprocess_exec)\n",
+            "container": "def f(loop):\n    return [loop.subprocess_shell]\n",
+        }.items():
+            self.assertGreaterEqual(len(self._bad(src)), 1, label)
+
+    def test_pass8_a2_a_module_imported_by_from_import_is_tracked(self):
+        for label, src in {
+            "asyncio.subprocess.subprocess": "from asyncio.subprocess import subprocess as sp\nsp.run(['cmd.exe', '/c', 'exit'])\n",
+            "subprocess.os": "from subprocess import os as o\no.system('cmd.exe /c exit')\n",
+            "plain name": "from subprocess import os\nos.system('x')\n",
+            "private name": "from subprocess import _mswindows\n",
+            "sys via subprocess": "from subprocess import sys\n",
+        }.items():
+            self.assertGreaterEqual(len(self._bad(src)), 1, label)
+        self.assertEqual(self._bad("from subprocess import PIPE, CalledProcessError, CREATE_NO_WINDOW, STARTUPINFO\nx = PIPE\n"), [])
+
+    def test_pass8_a3_an_import_in_a_class_body_is_a_class_attribute(self):
+        for label, src in {
+            "import as": "class X:\n    import subprocess as sp\nX.sp.run(['cmd.exe', '/c', 'exit'])\n",
+            "from import": "class X:\n    from subprocess import run as spawn\nX.spawn(['cmd.exe', '/c', 'exit'])\n",
+            "os": "class X:\n    import os\nX.os.system('cmd.exe /c exit')\n",
+            "nested": "class X:\n    if True:\n        import subprocess\nX.subprocess.Popen(['cmd.exe'])\n",
+            "importlib": "class X:\n    import importlib\n",
+        }.items():
+            self.assertGreaterEqual(len(self._bad(src)), 1, label)
+        self.assertEqual(self._bad("class X:\n    import json\n    def m(self):\n        import subprocess\n        subprocess.run(['x'], creationflags=_NO_WINDOW)\n"), [])
+
+    def test_pass8_a4_a5_a6_the_start_process_command_is_found_wherever_it_hides(self):
+        def judge(ps: str) -> tuple[int, int]:
+            found, bad = _start_process_violations("x = " + repr(ps) + "\n")
+            return found, len(bad)
+
+        for ps in (
+            "Start-Process powershell.exe & Write-Output -WindowStyle Hidden\nGet-Job | Wait-Job | Receive-Job",  # A4: & backgrounds the first command
+            "& 'Start-Process' powershell.exe", '& "Start-Process" powershell.exe', "& 'start-process' powershell.exe -ArgumentList x",  # A5
+            "saps powershell.exe", "start powershell.exe", "$p = saps -FilePath powershell.exe -PassThru", "& start powershell.exe",
+            "$x = 1; start powershell.exe -ArgumentList 'a'",
+        ):
+            found, bad = judge(ps)
+            self.assertEqual((found, bad), (1, 1), ps)
+        for ps in ("saps powershell.exe -WindowStyle Hidden", "start powershell.exe -WindowStyle Hidden",
+                   "& 'Start-Process' powershell.exe -WindowStyle Hidden", "$p = start -FilePath powershell.exe -WindowStyle Hidden -PassThru"):
+            self.assertEqual(judge(ps), (1, 0), ps)
+        self.assertEqual(judge("$start = 1; Write-Host start; $o.start()"), (0, 0))
+        # A6: a hole in an f-string inside the Start-Process statement can hold anything, a comment included
+        found, bad = _start_process_violations("extra = '#'\nx = f'Start-Process powershell.exe {extra} -WindowStyle Hidden'\n")
+        self.assertEqual((found, len(bad)), (1, 1))
+        # ...but a hole in another statement of the same script does not make a hidden launch unprovable
+        ok = "x = f'Start-Process powershell.exe -WindowStyle Hidden\\n$n = {count}\\n'\n"
+        self.assertEqual(_start_process_violations(ok), (1, []))
+
+    def test_pass8_a7_hidden_name_resolution_is_linear_for_a_name_with_many_bindings(self):
+        import time
+        for n in (256, 1024, 4096):
+            src = ("".join(f"f{i} = 0x08000000\n" for i in range(n - 1, -1, -1)) + "def bind():\n    global flags\n"
+                   + "".join(f"    flags = f{i}\n" for i in range(n)) + "bind()\nimport subprocess\nsubprocess.run(['x'], creationflags=flags)\n")
+            t0 = time.perf_counter()
+            self.assertEqual(self._bad(src), [])
+            self.assertLess(time.perf_counter() - t0, 4.0, n)
 
     def test_event_loop_spawn_methods_and_os_exec_are_scanned(self):
         for label, src in {
