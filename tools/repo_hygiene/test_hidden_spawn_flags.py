@@ -1182,7 +1182,7 @@ def _reference_violations(tree: ast.AST, facts: _Facts) -> list[tuple[int, str]]
         if (isinstance(node, ast.Constant) and isinstance(node.value, (str, bytes))
                 and _LOOP_METHOD_NAME_RE.fullmatch(node.value if isinstance(node.value, str) else node.value.decode("latin-1"))):  # b'subprocess_exec' too
             out.append((node.lineno, f"names {node.value!r} as a string, which reaches an event-loop spawn method without calling it in place"))
-        if isinstance(node, (ast.BinOp, ast.JoinedStr, ast.Call, ast.Subscript)) and not (isinstance(node, ast.BinOp) and isinstance(parent.get(id(node)), ast.BinOp) and isinstance(parent[id(node)].op, (ast.Add, ast.Mod, ast.Mult)))  # only a parent that folds its operands covers it:
+        if isinstance(node, (ast.BinOp, ast.JoinedStr, ast.Call, ast.Subscript)) and not (isinstance(node, ast.BinOp) and isinstance(parent.get(id(node)), ast.BinOp) and isinstance(parent[id(node)].op, (ast.Add, ast.Mod, ast.Mult))):  # only a parent that folds its operands covers it
             built, known = _flatten(node, facts.consts)  # 'subprocess_' + 'exec', '%sexec' % 'subprocess_', f'subprocess_{"exec"}': the folded name
             if _could_name(built, known, _LOOP_SPAWN_METHODS):  # a wildcard piece can read as the name, so a fold mistake only over-reports
                 out.append((node.lineno, f"names {built.replace(_WILD, '*')!r} as a built string, which can reach an event-loop spawn method without calling it in place"))
