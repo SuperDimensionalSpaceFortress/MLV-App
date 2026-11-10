@@ -173,6 +173,20 @@ elseif ($m -eq 'empty') { [IO.File]::WriteAllText($r, '') }
 elseif ($m -like 'good*') { [IO.File]::WriteAllText($r, (Get-Mac ([string]$env:MLV_CP_NONCE))) }
 Start-Sleep -Seconds 2
 """
+# fixture-clock-DST (sol r1 B1 on b8d9522a, PR 783): a feed row's HWiNFO stamp is local time with no offset, so a fixture that wrote it in the HOST's
+# zone from the run's real launch instant (ToLocalTime) wrote an ambiguous stamp whenever the test ran in a repeated hour (Central: 1:00-2:00 on the
+# first Sunday of November) and the real selector, correctly, refused the row. The fixture instead stamps in a fixed-offset zone with no DST rules (UTC-5,
+# so the selector's local-to-UTC conversion is still exercised) and pins the selector's -Zone to it for the whole child, whatever the host zone or date.
+# The pin is a same-signature wrapper that defaults -Zone and calls the job's real selector (PSDefaultParameterValues is ignored by a simple function);
+# an explicit -Zone still wins, and the real definition is captured once, so running the snippet again (a driver loops over modes) never wraps the wrapper.
+# The selector's own ambiguous/invalid-stamp refusals keep their explicit-zone tests (selA1d*).
+FIXTURE_ZONE_PS = r"""
+$cpFixtureZone = [TimeZoneInfo]::CreateCustomTimeZone('cp-fixture-m0500', [TimeSpan]::FromHours(-5), 'cp fixture UTC-5', 'cp fixture UTC-5')
+if ($null -eq $global:cpRealFeedSelector) { $global:cpRealFeedSelector = ${function:Select-CorePartitionFeedRowsFromStart} }
+function Select-CorePartitionFeedRowsFromStart([string[]]$Lines, $Anchor, $ReadDoneMs, [double]$StampResolutionMs = 1000, $Zone = $null) { & $global:cpRealFeedSelector $Lines $Anchor $ReadDoneMs $StampResolutionMs $(if ($Zone -is [TimeZoneInfo]) { $Zone } else { $cpFixtureZone }) }
+function Format-CpFixtureStamp([DateTime]$UtcInstant) { [TimeZoneInfo]::ConvertTimeFromUtc($UtcInstant, $cpFixtureZone).ToString('d.M.yyyy,H:mm:ss.fff', [Globalization.CultureInfo]::InvariantCulture) }
+"""
+
 MARKER_DRIVER = r"""
 $ErrorActionPreference = 'Stop'
 $job = [IO.File]::ReadAllText($env:CP_JOB) -replace "`r`n", "`n"
@@ -207,7 +221,8 @@ foreach ($mode in ($env:CP_MODES -split ',')) {
     if ($mode -eq 'start-throws') { $env:ProgramFiles = Join-Path $Work 'no-such-program-files' }
     try { . ([scriptblock]::Create($pre)) } finally { $env:ProgramFiles = $pf }
     # r13c (rule (a)): the window row carries its HWiNFO stamp (local time), 400 ms after the measured launch, after the playback start (100 ms)
-    [IO.File]::AppendAllText($env:HEAVY_SLOT_FEED, $corePartitionMeasuredLaunchUtc.AddMilliseconds(400).ToLocalTime().ToString('d.M.yyyy,H:mm:ss.fff', [Globalization.CultureInfo]::InvariantCulture) + ",x,70.0,45.0,No,No`n")
+    __FIXTURE_ZONE_PS__
+    [IO.File]::AppendAllText($env:HEAVY_SLOT_FEED, (Format-CpFixtureStamp $corePartitionMeasuredLaunchUtc.AddMilliseconds(400)) + ",x,70.0,45.0,No,No`n")
     $resultPath = Join-Path $Work 'result.json'
     if ($mode -like 'good*') {
         # r11 B1: the stand-in helper writes no record, so the driver writes the genuine helper's (signed under the job's key, the runner's pid,
@@ -252,6 +267,7 @@ foreach ($mode in ($env:CP_MODES -split ',')) {
 }
 $out | ConvertTo-Json -Compress -Depth 8
 """
+MARKER_DRIVER = MARKER_DRIVER.replace("__FIXTURE_ZONE_PS__", FIXTURE_ZONE_PS)
 
 
 # r14 (sol r13d B1 = r13d OPEN A1, CORE-PARTITION-SINGLE-PUBLICATION-AFTER-SNAPSHOT-1): the job's own regions run for real inside a child pwsh
@@ -285,7 +301,8 @@ try {
 """
 # the MARKER_DRIVER 'good' setup: a window row 400 ms after the measured launch, the runner's result.json, the helper's signed record and log A
 TERMINAL_CHILD_SETUP = r"""
-[IO.File]::AppendAllText($env:HEAVY_SLOT_FEED, $corePartitionMeasuredLaunchUtc.AddMilliseconds(400).ToLocalTime().ToString('d.M.yyyy,H:mm:ss.fff', [Globalization.CultureInfo]::InvariantCulture) + ",x,70.0,45.0,No,No`n")
+__FIXTURE_ZONE_PS__
+[IO.File]::AppendAllText($env:HEAVY_SLOT_FEED, (Format-CpFixtureStamp $corePartitionMeasuredLaunchUtc.AddMilliseconds(400)) + ",x,70.0,45.0,No,No`n")
 $now = [DateTime]::UtcNow
 [IO.File]::WriteAllText($resultPath, ([ordered]@{ process = [ordered]@{ id = 5000; startedAtUtc = $now.AddSeconds(-5).ToString('o'); endedAtUtc = $now.ToString('o') } } | ConvertTo-Json -Depth 3))
 $mb = ((Get-CorePartitionMonoMs) - 150).ToString([Globalization.CultureInfo]::InvariantCulture)
@@ -295,6 +312,7 @@ $rb = [Text.Encoding]::UTF8.GetBytes('{"schema":"mlv-app/core-partition-helper/v
 [IO.File]::WriteAllText("$corePartitionHelperOut.mac", [Convert]::ToHexString([Security.Cryptography.HMACSHA256]::new([Text.Encoding]::UTF8.GetBytes($corePartitionHelperNonce)).ComputeHash($rb)))
 [IO.File]::WriteAllText($runLogPath, '[' + $corePartitionMeasuredLaunchUtc.AddMilliseconds(100).ToString('yyyy-MM-ddTHH:mm:ss.fffZ') + "] [info] [0x1] playback_smoke.start session=1 worker_threads=16`n[" + $corePartitionMeasuredLaunchUtc.AddMilliseconds(110).ToString('yyyy-MM-ddTHH:mm:ss.fffZ') + "] [info] [0x1] playback_smoke.measured_session id=1`n[" + $corePartitionMeasuredLaunchUtc.AddMilliseconds(150).ToString('yyyy-MM-ddTHH:mm:ss.fffZ') + "] [info] [0x1] playback_smoke.summary session=1 reason=play-stop elapsed_ms=50.000 presented_frames=1`n")
 """
+TERMINAL_CHILD_SETUP = TERMINAL_CHILD_SETUP.replace("__FIXTURE_ZONE_PS__", FIXTURE_ZONE_PS)
 TERMINAL_SUCCESS_TAIL = "__METRICS__\nWrite-Output \"PUBLISHWHY=$corePartitionPublishWhy\"\nexit 0\n"
 # terminal class -> (CP_SAVE, the body that follows the smoke-launch finally)
 TERMINALS = {
@@ -346,6 +364,111 @@ foreach ($name in @($terminals.Keys | Sort-Object)) {
         saves = $saves
         status = $(if ($null -ne $st) { [ordered]@{ stage = $st.stage; why = $st.why; startWhy = $st.startWhy; staleRecordOnDisk = $st.staleRecordOnDisk; errors = @($st.errors) } })
         summary = $(if ($null -ne $sm) { [ordered]@{ result = $sm.result; reason = $sm.reason } })
+    }
+}
+$out | ConvertTo-Json -Compress -Depth 8
+"""
+
+
+# CORE-PARTITION-TERMINAL-TEST-REAL-PUBLISHER-1 (ledger 2026-10-28T14:47:12Z, #696 key3 r14b H3, fable r13d CORE-PARTITION-STATUS-REAL-PUBLISHER-TEST-1):
+# TERMINAL_CHILD_HEAD above stubs Save-Json (it throws on a switch, it never publishes) and Publish-AttrCudaText (a bare WriteAllText), so the REAL
+# Save-Json -> Publish-AttrCudaText slot path that writes core-partition.json and core-partition-unpublished.json was never run by any test. These
+# children are the same terminals with neither stub: the driver lifts the job's own Save-Json and Publish-AttrCudaText, and everything they call
+# (Assert-AttrCudaWritableFileSlot, Get-AttrCudaFileId, ...), out of the GENERATED job text by AST, and a name in the work directory is occupied
+# before the child starts (a directory: the slot refuses it; a second hard link: the slot refuses to remove one of two names).
+_STUB_PUBLISH = "function Publish-AttrCudaText { param([string]$Path, [string]$Value) [IO.File]::WriteAllText($Path, $Value) }\n"
+_STUB_SAVE_FROM = "function Save-Json { param($Object, $Path)\n"
+_STUB_SAVE_TO = "function Resolve-AttrCudaSmokeRunLog"
+
+
+def _real_publisher_head(stubbed: str) -> str:
+    """TERMINAL_CHILD_HEAD with its Publish-AttrCudaText stub line and its Save-Json stub block replaced by one placeholder the driver fills."""
+    if stubbed.count(_STUB_PUBLISH) != 1 or stubbed.count(_STUB_SAVE_FROM) != 1 or stubbed.count(_STUB_SAVE_TO) != 1:
+        raise RuntimeError("TERMINAL_CHILD_HEAD no longer has the Publish-AttrCudaText / Save-Json stubs this head is derived from")
+    head = stubbed.replace(_STUB_PUBLISH, "")
+    start, end = head.index(_STUB_SAVE_FROM), head.index(_STUB_SAVE_TO)
+    return head[:start] + "__REAL_FUNCTIONS__\n" + head[end:]
+
+
+REAL_PUBLISHER_CHILD_HEAD = _real_publisher_head(TERMINAL_CHILD_HEAD)
+# the stand-ins the real head still carries (Write-JobTrace, New-AttrCudaDirectory, Resolve-AttrCudaSmokeRunLog): never lifted over them
+REAL_PUBLISHER_KEPT_STUBS = ("Write-JobTrace", "Resolve-AttrCudaSmokeRunLog", "New-AttrCudaDirectory")
+REAL_PUBLISHER_REQUIRED = ("Save-Json", "Publish-AttrCudaText", "Assert-AttrCudaWritableFileSlot")
+OCCUPY_STALE_RECORD = '{"schema":"stale-record","feed":{"summary":{"rows":99},"startWhy":""}}'
+_PRESENTMON_TERMINAL = "Set-LogB\n$rawLog = [IO.File]::ReadAllText($runLogPath)\nWrite-Output 'RESULT=PRESENTMON_UNAVAILABLE'\nexit 23\n"
+_SUCCESS_BODY = "$rawLog = [IO.File]::ReadAllText($runLogPath)\n" + TERMINAL_SUCCESS_TAIL
+# case -> (CP_SAVE (unused by the real head), the body after the smoke-launch finally, {name occupied before the run: 'dir' | 'hardlink'})
+REAL_TERMINALS = {
+    # control: nothing occupied, success whose later read is the same snapshot -> the real path writes core-partition.json once, no status
+    "real-success": ("ok", _SUCCESS_BODY, {}),
+    # only the status name occupied: the record publishes, the status is never needed -> the job is undisturbed
+    "real-status-occupied": ("ok", _SUCCESS_BODY, {"core-partition-unpublished.json": "dir"}),
+    # only the record name occupied (a directory): the real slot refuses it three times, the real status write succeeds -> published as unpublished
+    "real-record-occupied": ("ok", _SUCCESS_BODY, {"core-partition.json": "dir"}),
+    # both occupied: the record refuses and the typed status refuses too -> CORE_PARTITION_UNRECORDED, exit 32, and a failure terminal keeps its own exit
+    "real-both-occupied": ("ok", _SUCCESS_BODY, {"core-partition.json": "dir", "core-partition-unpublished.json": "dir"}),
+    "real-both-occupied-terminal": ("ok", _PRESENTMON_TERMINAL, {"core-partition.json": "dir", "core-partition-unpublished.json": "dir"}),
+    # a stale record of an earlier run holds a second hard link: the slot will not remove one of two names, the stale record stays, the status says so
+    "real-stale-multi-link": ("ok", _SUCCESS_BODY, {"core-partition.json": "hardlink"}),
+}
+REAL_PUBLISHER_DRIVER = r"""
+$ErrorActionPreference = 'Stop'
+$job = [IO.File]::ReadAllText($env:CP_JOB) -replace "`r`n", "`n"
+$regions = @(); $at = 0
+while (($s = $job.IndexOf($env:CP_OPEN, $at)) -ge 0) { $e = $job.IndexOf($env:CP_CLOSE, $s); $regions += $job.Substring($s, $e - $s); $at = $e + 1 }
+$fake = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($env:CP_FAKE_HELPER))
+$pre = [regex]::Replace($regions[0], "(?m)^\`$CorePartitionHelperEncoded = '[^']*'", { "`$CorePartitionHelperEncoded = '$fake'" })
+$pre = [regex]::Replace($pre, '(?m)^\$CorePartitionHelperAffinity = \[int64\]\d+', '$CorePartitionHelperAffinity = [int64]1')
+$fin = $(if ($regions.Count -gt 4) { $regions[4..($regions.Count - 1)] -join "`n" } else { '' })
+# the REAL publisher: Save-Json, Publish-AttrCudaText and everything they call, lifted from the generated job's own text (never rewritten)
+$parsed = [System.Management.Automation.Language.Parser]::ParseInput($job, [ref]$null, [ref]$null)
+$defs = @{}
+foreach ($d in $parsed.FindAll({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] }, $false)) { $defs[$d.Name] = $d }
+$kept = @($env:CP_KEPT_STUBS -split ',')
+$take = [Collections.Generic.List[string]]::new(); $queue = [Collections.Generic.Queue[string]]::new()
+foreach ($n in @($env:CP_REQUIRED -split ',')) { $queue.Enqueue($n) }
+while ($queue.Count -gt 0) {
+    $n = $queue.Dequeue()
+    if (-not $defs.ContainsKey($n) -or $take -contains $n -or $kept -contains $n) { continue }
+    $take.Add($n)
+    foreach ($c in $defs[$n].FindAll({ param($x) $x -is [System.Management.Automation.Language.CommandAst] }, $true)) { $cn = $c.GetCommandName(); if ($cn) { $queue.Enqueue($cn) } }
+}
+$real = (@($take | ForEach-Object { $defs[$_].Extent.Text }) -join "`n")
+$terminals = $env:CP_TERMINALS | ConvertFrom-Json -AsHashtable
+$out = [ordered]@{ '__lifted__' = @($take) }
+foreach ($name in @($terminals.Keys | Sort-Object)) {
+    $dir = Join-Path $env:CP_WORK $name; [void](New-Item -ItemType Directory -Path $dir)
+    $plants = $terminals[$name][2]
+    foreach ($pn in @($plants.Keys)) {
+        $pp = Join-Path $dir $pn
+        if ($plants[$pn] -eq 'dir') { [void](New-Item -ItemType Directory -Path $pp) }
+        elseif ($plants[$pn] -eq 'hardlink') { [IO.File]::WriteAllText($pp, $env:CP_STALE); [void](New-Item -ItemType HardLink -Path "$pp.other-name" -Target $pp) }
+    }
+    $body = ([string]$terminals[$name][1]).Replace('__METRICS__', $regions[2])
+    $kill = '    if ((Test-Path -LiteralPath ''variable:corePartitionHelper'') -and $null -ne $corePartitionHelper -and -not $corePartitionHelper.HasExited) { $corePartitionHelper.Kill() }'
+    $child = $env:CP_HEAD.Replace('__REAL_FUNCTIONS__', $real) + "`n" + $pre + "`n" + $env:CP_SETUP + "`n" + $regions[1] + "`n" + $body + "`n} finally {`n" + $fin + "`n" + $kill + "`n}`n"
+    $childPath = Join-Path $dir 'child.ps1'; [IO.File]::WriteAllText($childPath, $child)
+    $env:CP_TWORK = $dir; $env:CP_SAVE = [string]$terminals[$name][0]
+    $stdout = @(& "$env:ProgramFiles\PowerShell\7\pwsh.exe" -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $childPath 2>&1 | ForEach-Object { [string]$_ })
+    $rc = $LASTEXITCODE
+    $cpPath = Join-Path $dir 'core-partition.json'
+    $cp = $(if (Test-Path -LiteralPath $cpPath -PathType Leaf) { [IO.File]::ReadAllText($cpPath) | ConvertFrom-Json -AsHashtable })
+    $stPath = Join-Path $dir 'core-partition-unpublished.json'
+    $st = $(if (Test-Path -LiteralPath $stPath -PathType Leaf) { [IO.File]::ReadAllText($stPath) | ConvertFrom-Json -AsHashtable })
+    $smPath = Join-Path $dir 'summary.json'
+    $sm = $(if (Test-Path -LiteralPath $smPath -PathType Leaf) { [IO.File]::ReadAllText($smPath) | ConvertFrom-Json -AsHashtable })
+    $occupied = [ordered]@{}
+    foreach ($pn in @($plants.Keys | Sort-Object)) {
+        $pp = Join-Path $dir $pn; $it = Get-Item -LiteralPath $pp -Force -ErrorAction SilentlyContinue
+        $occupied[$pn] = [ordered]@{ exists = ($null -ne $it); isDir = ($null -ne $it -and $it.PSIsContainer); entries = $(if ($null -ne $it -and $it.PSIsContainer) { @(Get-ChildItem -LiteralPath $pp -Force).Count }); text = $(if ($null -ne $it -and -not $it.PSIsContainer) { [IO.File]::ReadAllText($pp) }) }
+    }
+    $out[$name] = [ordered]@{
+        rc = $rc; stdout = $stdout
+        onDisk = $(if ($null -ne $cp) { [ordered]@{ rows = $cp.feed.summary.rows; watts = $cp.feed.summary.pkgWattsMean; startWhy = [string]$cp.feed.startWhy; wattsWhy = $(if ($null -ne $cp.feed.summary.reasons) { [string]$cp.feed.summary.reasons['pkgWattsMean'] }); helper = ($null -ne $cp.helper); schema = [string]$cp.schema } })
+        status = $(if ($null -ne $st) { [ordered]@{ schema = $st.schema; stage = $st.stage; why = $st.why; startWhy = $st.startWhy; staleRecordOnDisk = $st.staleRecordOnDisk; errors = @($st.errors) } })
+        summary = $(if ($null -ne $sm) { [ordered]@{ result = $sm.result; reason = $sm.reason } })
+        occupied = $occupied
+        names = @(Get-ChildItem -LiteralPath $dir -Force | ForEach-Object { $_.Name } | Sort-Object)
     }
 }
 $out | ConvertTo-Json -Compress -Depth 8
@@ -1078,6 +1201,106 @@ class CorePartitionGeneratorTests(unittest.TestCase):
         self.assertIsNotNone(st, control)
         self.assertEqual([st["stage"], st["why"], st["staleRecordOnDisk"]], ["publish", "core-partition-json-unpublished", False], st)
         self.assertEqual(st["errors"].count("publish: save-json-refused-by-test"), 3, st)
+
+    def real_publisher_cases(self) -> dict:
+        """REAL_PUBLISHER_DRIVER's per-case results for job "a": the job's own Save-Json and Publish-AttrCudaText, not the stubs, run once per class."""
+        cls = type(self)
+        if getattr(cls, "_real_publisher", None) is None:
+            self.job("a")
+            work = Path(tempfile.mkdtemp(prefix="real-publisher-work-", dir=self.tmp))
+            driver = self.tmp / "real-publisher-driver.ps1"
+            driver.write_text(REAL_PUBLISHER_DRIVER, encoding="ascii")
+            proc = run_pwsh(["-File", str(driver)], env_extra={"CP_JOB": str(self.out["a"]), "CP_OPEN": OPEN, "CP_CLOSE": CLOSE, "CP_FAKE_HELPER": MARKER_HELPER,
+                                                               "CP_WORK": str(work), "CP_HEAD": REAL_PUBLISHER_CHILD_HEAD, "CP_SETUP": TERMINAL_CHILD_SETUP,
+                                                               "CP_TERMINALS": json.dumps(REAL_TERMINALS), "CP_STALE": OCCUPY_STALE_RECORD,
+                                                               "CP_KEPT_STUBS": ",".join(REAL_PUBLISHER_KEPT_STUBS), "CP_REQUIRED": ",".join(REAL_PUBLISHER_REQUIRED)})
+            self.assertEqual(proc.returncode, 0, proc.stdout[-3000:] + proc.stderr[-3000:])
+            cls._real_publisher = json.loads(proc.stdout.strip().splitlines()[-1])
+        return cls._real_publisher
+
+    def test_real_publisher_is_the_jobs_own_code_not_a_stub(self) -> None:
+        """The stubbed terminal children replace Save-Json and Publish-AttrCudaText; this one's functions are lifted from the generated job by AST.
+        Guard the lift itself: the real slot check must be among them (a stub-free child that silently lost it would pass every case below)."""
+        got = self.real_publisher_cases()
+        for name in REAL_PUBLISHER_REQUIRED:
+            self.assertIn(name, got["__lifted__"], got["__lifted__"])
+        self.assertNotIn("function Publish-AttrCudaText { param([string]$Path, [string]$Value) [IO.File]::WriteAllText", REAL_PUBLISHER_CHILD_HEAD)
+        self.assertNotIn("function Save-Json", REAL_PUBLISHER_CHILD_HEAD)
+        job = lf(self.job("a"))
+        self.assertIn("function Save-Json($Object, [string]$Path) {\n    # Artifact writes go through the slot-checked helper", job)
+        self.assertIn("function Publish-AttrCudaText {", job)
+
+    def test_real_publisher_success_writes_core_partition_json_through_the_real_slot(self) -> None:
+        """Control: nothing occupied -> the real Save-Json -> Publish-AttrCudaText writes core-partition.json (a plain file) with the window the stubbed
+        control publishes, writes no unpublished status, and the job exits as the success terminal does (0). The status name occupied by a directory
+        changes nothing, because a published record never touches it."""
+        got = self.real_publisher_cases()
+        for name in ("real-success", "real-status-occupied"):
+            with self.subTest(case=name):
+                c = got[name]
+                self.assertEqual(c["rc"], 0, c)
+                self.assertIsNotNone(c["onDisk"], f"the real publisher left no core-partition.json: {c}")
+                self.assertEqual([c["onDisk"]["rows"], c["onDisk"]["watts"], c["onDisk"]["startWhy"]], [1, 45.0, ""], c)
+                self.assertTrue(c["onDisk"]["helper"], c)
+                self.assertIn("PUBLISHWHY=", c["stdout"], c)
+                self.assertIsNone(c["status"], c)
+                self.assertIsNone(c["summary"], c)
+                self.assertFalse([n for n in c["names"] if re.search(r"(?i)tmp|partial|\.new$|\.part$", n)], c["names"])
+        occupied = got["real-status-occupied"]["occupied"]["core-partition-unpublished.json"]
+        self.assertEqual([occupied["exists"], occupied["isDir"], occupied["entries"]], [True, True, 0], "the real publisher wrote into the occupied status name")
+
+    def test_real_publisher_refuses_an_occupied_record_slot_and_records_why(self) -> None:
+        """Only the record name occupied by a directory: the real slot check throws ATTRCUDA_SLOT_OCCUPIED on each of the three tries, writes nothing
+        into the directory, and the real status write (the second real publish) lands core-partition-unpublished.json with the three real errors. The
+        directory is not a record claiming success: no core-partition.json file exists, so the status says staleRecordOnDisk false."""
+        c = self.real_publisher_cases()["real-record-occupied"]
+        self.assertEqual(c["rc"], 0, c)
+        self.assertIsNone(c["onDisk"], f"a core-partition.json file claims success although its slot was refused: {c}")
+        self.assertIn("PUBLISHWHY=core-partition-json-unpublished", c["stdout"], c)
+        st = c["status"]
+        self.assertIsNotNone(st, f"the refused record left no status through the real publisher: {c}")
+        self.assertEqual([st["schema"], st["stage"], st["why"], st["staleRecordOnDisk"]],
+                         ["mlv-app/core-partition-unpublished/v1", "publish", "core-partition-json-unpublished", False], st)
+        slot = [e for e in st["errors"] if e.startswith("publish: ATTRCUDA_SLOT_OCCUPIED ")]
+        self.assertEqual(len(slot), 3, st)
+        self.assertFalse([e for e in st["errors"] if "save-json-refused-by-test" in e], st)
+        record = c["occupied"]["core-partition.json"]
+        self.assertEqual([record["exists"], record["isDir"], record["entries"]], [True, True, 0], "the real publisher wrote into the occupied record slot")
+        self.assertFalse([n for n in c["names"] if re.search(r"(?i)tmp|partial|\.new$|\.part$", n)], c["names"])
+
+    def test_real_publisher_unrecorded_run_exits_32_and_leaves_no_record_claiming_success(self) -> None:
+        """Both names occupied by directories: the real record write and the real status write both refuse -> the success terminal ends
+        CORE_PARTITION_UNRECORDED (exit 32, a refusal summary.json written through the real publisher), and a failure terminal keeps its own exit (23)
+        and names CORE_PARTITION_UNRECORDED on the result stream. Neither core-partition.json nor core-partition-unpublished.json exists as a file."""
+        got = self.real_publisher_cases()
+        red = got["real-both-occupied"]
+        self.assertEqual(red["rc"], 32, f"a run whose real record and status writes both refused was not refused: {red}")
+        self.assertTrue(any(ln.startswith("RESULT=CORE_PARTITION_UNRECORDED REASON=core-partition-json-unpublished+unpublished-status-unwritten ARTIFACTS=") for ln in red["stdout"]), red)
+        self.assertEqual(red["summary"], {"result": "CORE_PARTITION_UNRECORDED", "reason": "core-partition-json-unpublished+unpublished-status-unwritten"}, red)
+        self.assertNotIn("PUBLISHWHY=", "\n".join(red["stdout"]), red)
+        term = got["real-both-occupied-terminal"]
+        self.assertEqual(term["rc"], 23, term)
+        self.assertTrue(any(ln.startswith("CORE_PARTITION_UNRECORDED REASON=core-partition-json-unpublished+unpublished-status-unwritten") for ln in term["stdout"]), term)
+        self.assertIsNone(term["summary"], term)
+        for name, c in (("success", red), ("failure-terminal", term)):
+            with self.subTest(terminal=name):
+                self.assertEqual([c["onDisk"], c["status"]], [None, None], c)
+                for slot in ("core-partition.json", "core-partition-unpublished.json"):
+                    occ = c["occupied"][slot]
+                    self.assertEqual([occ["exists"], occ["isDir"], occ["entries"]], [True, True, 0], f"{slot}: the real publisher wrote into the occupied slot: {c}")
+                self.assertFalse([n for n in c["names"] if re.search(r"(?i)tmp|partial|\.new$|\.part$", n)], c["names"])
+
+    def test_real_publisher_will_not_replace_a_stale_record_held_by_a_second_name(self) -> None:
+        """A stale core-partition.json of an earlier run has a second hard link: the real slot check refuses to remove one of two names
+        (ATTRCUDA_SLOT_OCCUPIED_MULTI_LINK, through Get-AttrCudaFileId), so the stale record stays byte for byte, and the real status says so:
+        staleRecordOnDisk true, never a silent success over it."""
+        c = self.real_publisher_cases()["real-stale-multi-link"]
+        self.assertEqual(c["rc"], 0, c)
+        st = c["status"]
+        self.assertIsNotNone(st, c)
+        self.assertEqual([st["why"], st["stage"], st["staleRecordOnDisk"]], ["core-partition-json-unpublished", "publish", True], st)
+        self.assertEqual(len([e for e in st["errors"] if e.startswith("publish: ATTRCUDA_SLOT_OCCUPIED_MULTI_LINK ")]), 3, st)
+        self.assertEqual(c["occupied"]["core-partition.json"]["text"], OCCUPY_STALE_RECORD, "the real publisher wrote through, or replaced, the stale record")
 
     def test_the_jobs_key_reaches_only_the_helper(self) -> None:
         """sol r6 CP-06: the per-job key is drawn at run time, handed to the helper by environment (never the command line), never traced or
@@ -3864,6 +4087,7 @@ function Resolve-AttrCudaSmokeRunLog { param($ResultJsonPath, $ContainingRoot) i
 # and the job's own read: over 250 ms on a loaded hosted runner it moved the start bound (the rows sit 500 ms past the playback start) and the
 # case published feed-no-rows-in-window, or one row fewer, intermittently. CP_WALL_STALL_MS (below) injects exactly that real time.
 function Get-Date { $L.AddMilliseconds($global:cpClk - 1000) }
+__FIXTURE_ZONE_PS__
 $row = "26.10.2026,12:01:00,x,99,99,Yes,Yes`n"
 function Read-CorePartitionFeedSince($Path, $Offset, $Before) {
     $m = $global:cpClk; $global:cpClk += 500
@@ -3889,13 +4113,15 @@ foreach ($k in $cases.Keys) {
     $corePartitionJobProc = [pscustomobject]@{}
     $corePartitionJobProc | Add-Member -MemberType ScriptProperty -Name ProcessorAffinity -Value { [int64]1048575 } -SecondValue { $global:cpClk += $global:cpDelay }
     $corePartitionJobProc | Add-Member -MemberType ScriptMethod -Name Refresh -Value { }
-    $now = [DateTime]::UtcNow
+    # fixture-clock-DST (sol r1 B1, PR 783): CP_FIXTURE_NOW_UTC puts this driver's "now" at a chosen instant (the job's wall clock follows $L through
+    # the Get-Date double below), so a test can drive the feed fixture through a repeated or skipped local hour without touching the host clock
+    $now = $(if ($env:CP_FIXTURE_NOW_UTC) { [DateTime]::Parse($env:CP_FIXTURE_NOW_UTC, [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::AssumeUniversal -bor [Globalization.DateTimeStyles]::AdjustToUniversal) } else { [DateTime]::UtcNow })
     $L = $now.AddMilliseconds(1000 - $c[0])
     if ($env:CP_WALL_STALL_MS) { Start-Sleep -Milliseconds ([int]$env:CP_WALL_STALL_MS) }
     $W = { param([double]$m) $L.AddMilliseconds($m - 1000).Ticks }
     # r13c (CP-FEED-START-ANCHOR, rule (a)): a feed row's HWiNFO stamp (local d.M.yyyy,H:mm:ss.fff) for monotonic $m; the window row is stamped
     # at 2000, after the measured session's playback start (1500)
-    $H = { param([double]$m) [DateTime]::new((& $W $m), [DateTimeKind]::Utc).ToLocalTime().ToString('d.M.yyyy,H:mm:ss.fff', [Globalization.CultureInfo]::InvariantCulture) }
+    $H = { param([double]$m) Format-CpFixtureStamp ([DateTime]::new((& $W $m), [DateTimeKind]::Utc)) }
     $row = (& $H 2000) + ",x,99,99,Yes,Yes`n"
     $corePartitionMeasuredLaunchUtc = $L; $corePartitionPreHelperUtc = $L.AddSeconds(-1)
     $corePartitionClockPairs = [Collections.Generic.List[object]]::new(); $corePartitionClockPairs.Add(@($corePartitionMeasuredLaunchUtc.Ticks, [double]1000))
@@ -3938,6 +4164,9 @@ foreach ($k in $cases.Keys) {
 }
 $out | ConvertTo-Json -Compress -Depth 5
 """
+
+
+R11_CLEANUP = R11_CLEANUP.replace("__FIXTURE_ZONE_PS__", FIXTURE_ZONE_PS)
 
 
 def _r11_helper_base_driver() -> str:
@@ -4100,6 +4329,7 @@ def _r13_start_driver() -> str:
 R13_START_DRIVER = _r13_start_driver()
 
 R13_PURE = r"""
+__FIXTURE_ZONE_PS__
 $L = [DateTime]::new(2026, 10, 27, 21, 0, 0, [DateTimeKind]::Utc)
 function Ln([double]$AfterMs, [string]$Msg) { '[' + $L.AddMilliseconds($AfterMs).ToString('yyyy-MM-ddTHH:mm:ss.fffZ') + '] [info] [0x1a2b] ' + $Msg }
 function Pick($v) { @([string]$v.why, $v.gapMs, $v.session) }
@@ -4150,7 +4380,7 @@ $r.ceilingOverGapPastTeardown = Pick2 (Get-CorePartitionPlaybackStart $real $L.T
 $r.ceilingOverGapWithinTeardown = Pick2 (Get-CorePartitionPlaybackStart $real $L.Ticks 1000 1000 0 74000)
 # r13c: Select-CorePartitionFeedRowsFromStart, pure. A row's HWiNFO stamp (local d.M.yyyy,H:mm:ss[.fff]) is placed on the job's monotonic clock at
 # the measured launch's clock pair (launch UTC $L, mono 1000), as the playback start is; a row counts only at or after the anchor plus the skew
-function Hw([double]$Mono) { $L.AddMilliseconds($Mono - 1000).ToLocalTime().ToString('d.M.yyyy,H:mm:ss.fff', [Globalization.CultureInfo]::InvariantCulture) }
+function Hw([double]$Mono) { Format-CpFixtureStamp $L.AddMilliseconds($Mono - 1000) }
 $anchor = @{ startMonoMs = 24600.0; launchUtcTicks = $L.Ticks; launchMonoMs = 1000.0; skewMs = 0.0 }
 $rows = @('Date,Time,Total CPU Usage [%],CPU Package [C],CPU Package Power [W],Core Thermal Throttling (avg) [Yes/No],Package/Ring Thermal Throttling [Yes/No]', ((Hw 24000) + ',5,30,10,No,No'), ((Hw 24600) + ',5,80,100,No,No'), ((Hw 25600) + ',5,81,101,No,No'), '')
 function PickSel($v) { @([string]$v.why, $v.excluded, @($v.lines).Count) }
@@ -4166,7 +4396,7 @@ $a1c = @{ startMonoMs = 61000.0; launchUtcTicks = $L.Ticks; launchMonoMs = 1000.
 $r.selA1cExcursionBreaksTheOrder = PickSel (Select-CorePartitionFeedRowsFromStart @(((Hw 10500) + ',5,30,10,No,No'), ((Hw 61500) + ',5,30,10,No,No'), ((Hw 12500) + ',5,30,10,No,No'), ((Hw 62000) + ',5,80,100,No,No')) $a1c 92000)
 $r.selA1cInOrderControl = PickSel (Select-CorePartitionFeedRowsFromStart @(((Hw 10500) + ',5,30,10,No,No'), ((Hw 11500) + ',5,30,10,No,No'), ((Hw 12500) + ',5,30,10,No,No'), ((Hw 62000) + ',5,80,100,No,No')) $a1c 92000)
 $r.selSkewExcludesTheBoundaryRow = PickSel (Select-CorePartitionFeedRowsFromStart $rows $sk 26000)
-$r.selSecondsOnly = PickSel (Select-CorePartitionFeedRowsFromStart @(($L.AddSeconds(-60).ToLocalTime().ToString('d.M.yyyy,H:mm:ss', [Globalization.CultureInfo]::InvariantCulture) + ',5,30,10,No,No'), ($L.AddSeconds(60).ToLocalTime().ToString('d.M.yyyy,H:mm:ss', [Globalization.CultureInfo]::InvariantCulture) + ',5,80,100,No,No')) $anchor 62000)
+$r.selSecondsOnly = PickSel (Select-CorePartitionFeedRowsFromStart @((((Format-CpFixtureStamp $L.AddSeconds(-60)) -replace '\.\d{3}$', '') + ',5,30,10,No,No'), (((Format-CpFixtureStamp $L.AddSeconds(60)) -replace '\.\d{3}$', '') + ',5,80,100,No,No')) $anchor 62000)
 $r.selUnparseableStamp = PickSel (Select-CorePartitionFeedRowsFromStart @('10/24/2026,08:00:02,5,80,100,No,No') $anchor 26000)
 $r.selRowFromTheFuture = PickSel (Select-CorePartitionFeedRowsFromStart @(((Hw 24600) + ',5,80,100,No,No'), ((Hw 40000) + ',5,80,100,No,No')) $anchor 26000)
 $r.selNoAnchor = PickSel (Select-CorePartitionFeedRowsFromStart $rows $null 26000)
@@ -4190,6 +4420,7 @@ $ok = Get-CorePartitionStartBoundFeed $feed @{ why = $null }
 $r.passThrough = @($ok.rows, $ok.pkgWattsMean, $ok.reasons.Contains('rows'))
 $r | ConvertTo-Json -Compress -Depth 5
 """
+R13_PURE = R13_PURE.replace("__FIXTURE_ZONE_PS__", FIXTURE_ZONE_PS)
 
 
 # r13c (hosted CI run 40605556724, windows shard 4/8): the feed readers' monoMs is the Stopwatch read taken BEFORE the read, so it can never be
@@ -4225,6 +4456,73 @@ class CorePartitionR13cMonoStampTests(unittest.TestCase):
             self.assertEqual(proc.returncode, 0, proc.stdout[-3000:] + proc.stderr[-3000:])
             got = json.loads(proc.stdout.strip().splitlines()[-1])
         self.assertEqual([got["markLate"], got["sinceLate"]], [0, 0], got)
+
+
+# fixture-clock-DST (sol r1 B1, PR 783): the success fixture's own row, at a launch in the repeated local hour, through the job's real selector.
+# 'old' is the stamp b8d9522a wrote under Central time (the host zone, ToLocalTime): the selector refuses it. 'new' is the fixture's stamp: the
+# selector, with its -Zone pinned by the fixture as in every driver, keeps the row.
+FIXTURE_DST_UNIT = r"""
+$cst = [TimeZoneInfo]::FindSystemTimeZoneById('Central Standard Time')
+__FIXTURE_ZONE_PS__
+$L = [DateTime]::new(2026, 11, 1, 6, 30, 0, [DateTimeKind]::Utc)
+$anchor = @{ startMonoMs = 1100.0; launchUtcTicks = $L.Ticks; launchMonoMs = 1000.0; skewMs = 0.0 }
+$at = $L.AddMilliseconds(400)
+$old = [TimeZoneInfo]::ConvertTimeFromUtc($at, $cst).ToString('d.M.yyyy,H:mm:ss.fff', [Globalization.CultureInfo]::InvariantCulture)
+$new = Format-CpFixtureStamp $at
+function PickSel($v) { @([string]$v.why, @($v.lines).Count) }
+$r = [ordered]@{
+    oldStamp = $old; newStamp = $new
+    oldInCentral = PickSel (Select-CorePartitionFeedRowsFromStart @($old + ',x,70.0,45.0,No,No') $anchor 3000 1000 $cst)
+    newInCentral = PickSel (Select-CorePartitionFeedRowsFromStart @($new + ',x,70.0,45.0,No,No') $anchor 3000 1000 $cst)
+    newPinned = PickSel (Select-CorePartitionFeedRowsFromStart @($new + ',x,70.0,45.0,No,No') $anchor 3000)
+    pinnedZoneId = [string]$cpFixtureZone.Id
+}
+$r | ConvertTo-Json -Compress -Depth 4
+""".replace("__FIXTURE_ZONE_PS__", FIXTURE_ZONE_PS)
+
+
+@requires_windows_pwsh
+class CorePartitionFixtureClockDstTests(unittest.TestCase):
+    """fixture-clock-DST (sol r1 B1 on b8d9522a, PR 783): the feed fixtures name their stamps in a zone they pin, never in the host's."""
+
+    def test_the_success_fixtures_row_in_the_repeated_local_hour_is_kept_by_the_real_selector(self) -> None:
+        """Sol's instant: launch 2026-11-01T06:30:00Z, row 400 ms later. Stamped in Central it reads 1:30:00.400 twice, and the real selector
+        refuses it (feed-row-stamp-ambiguous, zero rows: the case sol reproduced); the fixture's own stamp, read in the zone the fixture pins,
+        names one instant and the row is kept, however the host zone and date fall."""
+        with tempfile.TemporaryDirectory(prefix="core-partition-fixture-dst-") as tmp:
+            script = Path(tmp) / "dst.ps1"
+            script.write_text(LIFT + FIXTURE_DST_UNIT, encoding="utf-8")
+            proc = run_pwsh(["-File", str(script)], env_extra={"CP_GEN": str(GENERATOR), "CP_DIR": tmp})
+            self.assertEqual(proc.returncode, 0, proc.stdout[-3000:] + proc.stderr[-3000:])
+            got = json.loads(proc.stdout.strip().splitlines()[-1])
+        self.assertEqual(got["oldStamp"], "1.11.2026,1:30:00.400", got)
+        self.assertEqual(got["oldInCentral"], ["feed-row-stamp-ambiguous", 0], got)
+        self.assertEqual(got["newStamp"], "1.11.2026,1:30:00.400", got)
+        self.assertEqual(got["newInCentral"], ["feed-row-stamp-ambiguous", 0], got)
+        self.assertEqual(got["pinnedZoneId"], "cp-fixture-m0500", got)
+        self.assertEqual(got["newPinned"], ["", 1], got)
+
+    def test_no_feed_fixture_stamps_in_the_hosts_zone(self) -> None:
+        """The class: every PowerShell snippet constant in this file that touches a feed (derived, never listed: any upper-case str module
+        constant that names a feed file, the feed env var, the feed selector or a feed stamp) is free of ToLocalTime(, and every one that
+        BUILDS a stamp (the d.M.yyyy format or the pinned helper) uses the pinned-zone stamp and pins the selector's zone. ToLocalTime() in
+        one of them brings the repeated-hour failure back for that snippet. No snippet is exempt: the stamp builders Hw and selSecondsOnly
+        (R13_PURE) were the two the first three-driver guard missed (Grok G2 on aed96266)."""
+        touches_feed = re.compile(r"corePartitionFeedPath|feed\.csv|HEAVY_SLOT_FEED|Select-CorePartitionFeedRowsFromStart|d\.M\.yyyy|Format-CpFixtureStamp")
+        builds_stamp = re.compile(r"d\.M\.yyyy|Format-CpFixtureStamp")
+        snippets = {n: v for n, v in globals().items() if n.isupper() and isinstance(v, str) and touches_feed.search(v)}
+        stampers = {n for n, v in snippets.items() if builds_stamp.search(v)}
+        # the derived sets can never shrink below what the narrower guard named (a refactor that stops matching would otherwise pass vacuously)
+        self.assertLessEqual({"MARKER_DRIVER", "TERMINAL_CHILD_SETUP", "R11_CLEANUP", "R13_PURE", "R13_START_DRIVER"}, stampers)
+        self.assertLessEqual(stampers, set(snippets))
+        for name, text in snippets.items():
+            # PowerShell is case-insensitive: .tolocaltime() is the same call (adversary A1 on 476fefe1)
+            self.assertIsNone(re.search(r"(?i)tolocaltime", text), f"{name} builds a feed stamp in the host zone (ToLocalTime)")
+            self.assertNotIn("__FIXTURE_ZONE_PS__", text, name)
+        for name in sorted(stampers):
+            text = snippets[name]
+            self.assertIn("Format-CpFixtureStamp", text, name)
+            self.assertIn("function Select-CorePartitionFeedRowsFromStart(", text, name)
 
 
 @requires_windows_pwsh
@@ -4267,6 +4565,25 @@ class CorePartitionR13StartTests(unittest.TestCase):
             got = self.r_stalled[case]
             self.assertEqual([got["rows"], got["wattsMean"], got["tempMean"], got["why"]], [rows, 100.0, 80.0, ""], got)
         self.assertEqual({k: v["why"] for k, v in self.r_stalled.items()}, {k: v["why"] for k, v in self.r.items()})
+
+    def test_fixture_clock_dst_a_launch_in_the_repeated_local_hour_publishes_the_same_windows(self) -> None:
+        """fixture-clock-DST (sol r1 B1 on b8d9522a, PR 783): the feed fixture stamped its rows in the HOST's zone, so a run during the repeated hour
+        after a fall-back (Central: 2026-11-01T06:00Z..07:00Z reads 1:00..2:00 twice) wrote stamps the real selector correctly refuses as
+        feed-row-stamp-ambiguous, and every case here lost its window. The same driver with its "now" forced to 2026-11-01T06:30:00Z, the
+        instant sol named, must give the outcome of the unforced run for every case: rows, means and reason."""
+        script = self.tmp / "r13-cleanup.ps1"
+        forced = self.tmp / "cleanup-repeated-hour"
+        forced.mkdir()
+        proc = run_pwsh(["-File", str(script)], env_extra={"CP_GEN": str(GENERATOR), "CP_DIR": str(forced), "CP_FIXTURE_NOW_UTC": "2026-11-01T06:30:00Z"})
+        self.assertEqual(proc.returncode, 0, proc.stdout[-3000:] + proc.stderr[-3000:])
+        got = json.loads(proc.stdout.strip().splitlines()[-1])
+        for case, one in got.items():
+            self.assertNotIn("threw", one, f"{case}: {one}")
+
+        def key(d: dict) -> dict:
+            return {k: [v.get("rows"), v.get("wattsMean"), v.get("tempMean"), v.get("why")] for k, v in d.items()}
+
+        self.assertEqual(key(got), key(self.r))
 
     def test_r13c_dot_counterexample_reports_the_playback_means_not_a_refusal(self) -> None:
         """Dot 6452868627 (literal): 60 s of startup rows (10 W / 30 C) then 30 s of playback rows (100 W / 80 C) in a 90 s window that passes the

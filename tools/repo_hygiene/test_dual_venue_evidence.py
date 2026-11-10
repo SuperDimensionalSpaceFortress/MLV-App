@@ -41,6 +41,7 @@ import unittest
 from pathlib import Path
 
 from tools.repo_hygiene.synthetic_mlv import FRAMES_30S_AT_23976, write_synthetic_mlv
+from tools.repo_hygiene.test_leg_play_seconds_within_clip import KNOWN_CLIP_SOURCE
 
 ROOT = Path(__file__).resolve().parents[2]
 DV = ROOT / "tools" / "profiling" / "dual-venue"
@@ -105,6 +106,7 @@ LOOKAHEAD_LEGS = ("legs/m16-1243-pace-cinematic-fullscreen-s4-la3.json",)
 # (LIGHT disables it), so the present that ends a >= 250 ms interval shows its own stage times. Diagnostic only: never a pace number.
 HEAVY_LEGS = ("legs/m16-1243-pace-cinematic-fullscreen-s4-heavy.json",)
 # PLAYBACK-HFR-CONFORM-DEFAULT-1 added the conform legs on the 59.94 fps clip: the scale-1 display cells, cuda only (legsets/hfr-conform.json names them).
+CONFORM_WINDOW_BY_CLIP = {"M16-1456": 15}   # CONFORM-LEG-PLAYSECONDS-WITHIN-CLIP-1: the 16.17 s clip cannot play the display cell's 25 s
 HFR_CONFORM_LEGS = tuple(f"legs/m16-1456-conform-{mode}-s1.json" for mode in ("windowed", "fullscreen"))
 # ... and (PRODUCT-PR-STRANDED-SWEEP-1 r1g) the same two cells on M16-1457, the longer 59.94 fps clip (27.8 s) that meets max(20 s, 25 s window).
 HFR_CONFORM_LEGS_1457 = tuple(f"legs/m16-1457-conform-{mode}-s1.json" for mode in ("windowed", "fullscreen"))
@@ -219,6 +221,15 @@ SHIPPED_LEGS = (*SHIPPED_LEGS, *NATIVE_PACED_LEGS)
 # Each differs from its twin only in its legId (native- -> native-trace-) and generatorArgs.presentTrace true (still paced, LIGHT, Look Assist Cinematic).
 NATIVE_TRACE_LEGS = {rel.replace("/m16-1457-native-", "/m16-1457-native-trace-"): rel for rel in NATIVE_PACED_LEGS}
 SHIPPED_LEGS = (*SHIPPED_LEGS, *NATIVE_TRACE_LEGS)
+# HFR-NATIVE-M16-1457-GUI-PRESENT-CADENCE-1: the D4 cells of the native trace matrix ({fullscreen, windowed} x {s1, s2, s4} x {cuda, cpu}), keyed to the
+# trace cell each one twins (the s2 trace leg of the same display mode). Each differs from it only in legId, scaleFactor, backends and, for a cpu-only
+# leg, the criteria (the cpu lists of m16-1243-pace-cinematic-fullscreen-s4: no gpuFramesTotal).
+NATIVE_TRACE_D4_LEGS = {
+    **{f"legs/m16-1457-native-trace-{mode}-s1.json": f"legs/m16-1457-native-trace-{mode}-s2.json" for mode in ("fullscreen", "windowed")},
+    **{f"legs/m16-1457-native-trace-cpu-{mode}-s{scale}.json": f"legs/m16-1457-native-trace-{mode}-s2.json"
+       for mode in ("fullscreen", "windowed") for scale in (2, 4)},
+}
+SHIPPED_LEGS = (*SHIPPED_LEGS, *NATIVE_TRACE_D4_LEGS)
 # CPU-S1-RECON-CHAIN-ATTRIBUTION-1: the capture-free CPU fullscreen s1 arms that attribute the frame interval: control (c), prep fast path off (p), a worker cap of 12 (t12), Look Assist off (l).
 CHAINATTR_LEGS = tuple(f"legs/m16-1243-chainattr-{arm}-fullscreen-s1.json" for arm in ("c", "p", "t12", "l"))
 SHIPPED_LEGS = (*SHIPPED_LEGS, *CHAINATTR_LEGS)
@@ -480,6 +491,13 @@ class GeneratorByteIdentityAndVariantTests(unittest.TestCase):
     CPU_GL_ENV_CLEAR_OPEN = "PROCESSED8-CPU-LEG-GL-VIEWPORT-ENV-CLEAR-1 >>>"
     CPU_GL_ENV_CLEAR_CLOSE = "PROCESSED8-CPU-LEG-GL-VIEWPORT-ENV-CLEAR-1 <<<"
     CPU_GL_ENV_CLEAR_REGIONS = 3
+    # PRESENTMON-BACHELOR-CUDA-INTERNAL-GAP-1: the PresentMon temporal arm judged over the app's own swap window (Get-AttrCudaPlaybackTemporalCoverage and the job's use of it).
+    # Seven regions in the default job: the report field in Get-AttrCudaPresentMonDisplayReport, the helpers' splice, the template's window block, the job-stop arm's strict
+    # swap-stamp re-read (PR #788 r1 sol B1; after the base parse, which stays verbatim), the failed-arm reason's window suffix, the manifest fields, the summary fields. Absent
+    # from the baseline, whose temporal arm is the process-lifetime Get-AttrCudaTemporalCoverage line (kept verbatim outside the regions).
+    PM_INTERNAL_GAP_OPEN = "PRESENTMON-BACHELOR-CUDA-INTERNAL-GAP-1 >>>"
+    PM_INTERNAL_GAP_CLOSE = "PRESENTMON-BACHELOR-CUDA-INTERNAL-GAP-1 <<<"
+    PM_INTERNAL_GAP_REGIONS = 7
 
     @classmethod
     def strip_regions(cls, text: str) -> tuple[str, dict[str, int]]:
@@ -493,7 +511,8 @@ class GeneratorByteIdentityAndVariantTests(unittest.TestCase):
                     "hfr-conform-oracles": (cls.HFR_CONFORM_OPEN, cls.HFR_CONFORM_CLOSE),
                     "hfr-10s-floor": (cls.HFR_10S_OPEN, cls.HFR_10S_CLOSE),
                     "heavy-frame-log": (cls.HEAVY_FRAME_LOG_OPEN, cls.HEAVY_FRAME_LOG_CLOSE),
-                    "cpu-gl-env-clear": (cls.CPU_GL_ENV_CLEAR_OPEN, cls.CPU_GL_ENV_CLEAR_CLOSE)}
+                    "cpu-gl-env-clear": (cls.CPU_GL_ENV_CLEAR_OPEN, cls.CPU_GL_ENV_CLEAR_CLOSE),
+                    "pm-internal-gap": (cls.PM_INTERNAL_GAP_OPEN, cls.PM_INTERNAL_GAP_CLOSE)}
         kept: list[str] = []
         inside: str | None = None
         counts = {name: 0 for name in families}
@@ -547,6 +566,7 @@ class GeneratorByteIdentityAndVariantTests(unittest.TestCase):
         self.assertEqual(new_counts["heavy-frame-log"], self.HEAVY_FRAME_LOG_REGIONS, "the default (HEAVY) job carries exactly the pinned number of bracketed HEAVY-FRAME-LOG-1 regions")
         self.assertEqual(old_counts["heavy-frame-log"], 0, "the baseline predates the HEAVY frame-log opt-out")
         self.assertEqual((new_counts["cpu-gl-env-clear"], old_counts["cpu-gl-env-clear"]), (0, 0), "a cuda job carries no cpu GL-viewport env-clear region, and neither does the baseline")
+        self.assertEqual((new_counts["pm-internal-gap"], old_counts["pm-internal-gap"]), (self.PM_INTERNAL_GAP_REGIONS, 0), "the default job carries exactly the pinned number of bracketed PRESENTMON-BACHELOR-CUDA-INTERNAL-GAP-1 regions; the baseline predates them")
         self.assertEqual(stripped, old_stripped,
                          "the DEFAULT (bachelor/cuda) emitted job changed outside the bracketed regions -- it must stay byte-identical to the pinned baseline")
 
@@ -3617,25 +3637,67 @@ class EvidenceBoundReceiptTests(EvidenceFactory, ModuleMutationMixin, unittest.T
                     bad.append(f"{name}:{n}")
         return bad
 
+    # The census guards PRODUCTION paths: a script or module that reads a real receipt must re-derive it against the repo root. A test module is
+    # never such a reader -- it runs the validator on fixture receipts in a temp repo (often without -RepoRoot on purpose, see ps_receipt_status)
+    # or pins a production caller's exact line as a string. So test modules are out of the census BY PATH CLASS (tools/repo_hygiene/test_*.py and
+    # tests/**), never by file name; everything else, including a test-looking name outside the class, is still counted.
+    PRODUCTION_RECEIPT_CALLERS = frozenset({"tools/profiling/dual-venue/DualVenueRunner.psm1", "tools/profiling/dual-venue/New-VenueSheetPair.ps1",
+                                            "tools/profiling/dual-venue/New-VenueFlavorPair.ps1", "tools/profiling/dual-venue/Invoke-VenueBaseline.ps1"})
+    PRODUCTION_RECEIPT_READERS = frozenset({"tools/profiling/dual-venue/DualVenueRunner.psm1", "tools/profiling/dual-venue/Invoke-VenueLeg.ps1"})
+
+    @staticmethod
+    def is_test_module(path: str) -> bool:
+        return path.startswith("tests/") or re.fullmatch(r"tools/repo_hygiene/test_[^/]*\.py", path) is not None
+
+    @classmethod
+    def receipt_census(cls, texts: dict[str, str]) -> tuple[set[str], set[str]]:
+        prod = {n: t for n, t in texts.items() if not cls.is_test_module(n)}
+        callers = {n for n, t in prod.items() if re.search(r"Test-DvReceiptValid\s+-", t)}
+        readers = {n for n, t in prod.items() if "dual-venue-receipt/v1" in t or "dual-venue\\receipts" in t or "dual-venue/receipts" in t}
+        return callers, readers
+
     def test_every_in_tree_caller_of_the_validator_passes_the_repo_root_and_the_only_receipt_readers_are_the_known_ones(self) -> None:
         tracked = subprocess.run(["git", "-C", str(ROOT), "ls-files", "*.ps1", "*.psm1", "*.py"], capture_output=True, text=True, check=True).stdout.split()
         texts = {name: (ROOT / name).read_text(encoding="utf-8", errors="replace") for name in tracked if (ROOT / name).is_file()}
-        callers = {n for n, t in texts.items() if re.search(r"Test-DvReceiptValid\s+-", t) and n != "tools/repo_hygiene/test_dual_venue_evidence.py"}
+        callers, readers = self.receipt_census(texts)
         # LOOK-ASSIST-CINEMATIC-BENCH-PAIR-1 added New-VenueFlavorPair.ps1 (the Classic | Cinematic pair), which validates both receipts the same way.
-        self.assertEqual(callers, {"tools/profiling/dual-venue/DualVenueRunner.psm1", "tools/profiling/dual-venue/New-VenueSheetPair.ps1",
-                                   "tools/profiling/dual-venue/New-VenueFlavorPair.ps1", "tools/profiling/dual-venue/Invoke-VenueBaseline.ps1"})
+        self.assertEqual(callers, set(self.PRODUCTION_RECEIPT_CALLERS))
         self.assertEqual(self.readers_without_repo_root({n: texts[n] for n in callers}), [])
         # nothing else in the tree reads a receipt file: a new reader must call the validator (and be added to this list in review)
-        readers = {n for n, t in texts.items() if ("dual-venue-receipt/v1" in t or "dual-venue\\receipts" in t or "dual-venue/receipts" in t)
-                   # (test files hold receipt-shaped fixtures they never read back; test_venue_baseline.py's stub chain writes one for the baseline runner, which IS a caller above)
-                   and n not in ("tools/repo_hygiene/test_dual_venue_evidence.py", "tools/repo_hygiene/test_mlv_never_authorized.py", "tools/repo_hygiene/test_venue_baseline.py")}
-        self.assertEqual(readers, {"tools/profiling/dual-venue/DualVenueRunner.psm1", "tools/profiling/dual-venue/Invoke-VenueLeg.ps1"},
+        self.assertEqual(readers, set(self.PRODUCTION_RECEIPT_READERS),
                          "an unknown reader of dual-venue receipts must call Test-DvReceiptValid -RepoRoot and be named here")
         mutated = texts["tools/profiling/dual-venue/New-VenueSheetPair.ps1"].replace("Test-DvReceiptValid -Receipt $r -RepoRoot $repoRoot", "Test-DvReceiptValid -Receipt $r")
         self.assertNotEqual(mutated, texts["tools/profiling/dual-venue/New-VenueSheetPair.ps1"])
         self.assertEqual(self.readers_without_repo_root({"New-VenueSheetPair.ps1": mutated}), ["New-VenueSheetPair.ps1:" + str(next(
             i for i, l in enumerate(mutated.splitlines(), 1) if "Test-DvReceiptValid" in l and not l.lstrip().startswith("#")))],
             "a reader that drops -RepoRoot is caught by the scan -- so the scan guards item 3")
+
+    def test_the_census_exempts_only_test_modules_so_a_production_caller_without_the_repo_root_still_fails(self) -> None:
+        # PR #788 r4 R1: the test-module exemption is a path class, not a hole -- a non-test caller that omits -RepoRoot is still caught.
+        bare_call, pinned_call = "$v = Test-DvReceiptValid -Receipt $r\n", 'assertIn("Test-DvReceiptValid -Receipt $r -RepoRoot $repoRoot", t)\n'
+        exempt = ["tools/repo_hygiene/test_new_gap.py", "tests/coordination/test_reader.py", "tests/fixtures/reader.ps1"]
+        counted = ["tools/profiling/dual-venue/New-VenueReader.ps1", "tools/profiling/test_reader.ps1", "tools/repo_hygiene/test_reader.ps1",
+                   "tools/repo_hygiene/sub/test_reader.py", "tools/repo_hygiene/helpers_test.py", "attests/reader.ps1", "tools/tests/reader.ps1"]
+        for path in exempt:
+            self.assertTrue(self.is_test_module(path), path)
+            self.assertEqual(self.receipt_census({path: bare_call + pinned_call + "dual-venue/receipts\n"}), (set(), set()), path)
+        for path in counted:
+            self.assertFalse(self.is_test_module(path), path)
+            callers, readers = self.receipt_census({path: bare_call, path + ".r.ps1": "Get-ChildItem dual-venue/receipts\n"})
+            self.assertEqual(callers, {path}, "a non-test caller is in the census, so the known-callers equality fails on it: " + path)
+            self.assertEqual(readers, {path + ".r.ps1"}, path)
+            tree = {n: "Test-DvReceiptValid -Receipt $r -RepoRoot $repoRoot\n" for n in self.PRODUCTION_RECEIPT_CALLERS}
+            self.assertEqual(self.receipt_census(tree)[0], set(self.PRODUCTION_RECEIPT_CALLERS))
+            self.assertNotEqual(self.receipt_census(dict(tree, **{path: bare_call}))[0], set(self.PRODUCTION_RECEIPT_CALLERS), path)
+            self.assertEqual(self.readers_without_repo_root({path: bare_call}), [path + ":1"], "and its missing -RepoRoot is flagged: " + path)
+        # the real tree with one production caller's -RepoRoot dropped: the census still names it and the scan flags it
+        name = "tools/profiling/dual-venue/New-VenueFlavorPair.ps1"
+        text = (ROOT / name).read_text(encoding="utf-8", errors="replace")
+        mutated = re.sub(r"(Test-DvReceiptValid\s+-Receipt\s+\$\w+)\s+-RepoRoot\s+\$\w+", r"\1", text)
+        self.assertNotEqual(mutated, text)
+        callers, _ = self.receipt_census({name: mutated, "tools/repo_hygiene/test_presentmon_playback_window_gap.py": pinned_call})
+        self.assertEqual(callers, {name})
+        self.assertTrue(self.readers_without_repo_root({name: mutated}), "a production caller that drops -RepoRoot fails the census scan")
 
     # -- mutations: each rule's test can fail ----------------------------------------------------------------------------------------
     def test_mutation_trusting_the_consent_blobs_format_a_zero_record_blob_validates(self) -> None:
@@ -7381,6 +7443,9 @@ class LegSpecSchemaTests(unittest.TestCase):
             # r19 (sol r18 B2): plus the measured conform criteria (source_fps band, max_jump 1, no audio sync), appended in both roles
             cell_cuda = dict(cell, criteria={role: {"cuda": per["cuda"] + CONFORM_MEASURED_CRITERIA} for role, per in cell["criteria"].items()})
             cell_cuda["generatorArgs"] = dict(cell["generatorArgs"], playbackConform="on")
+            # CONFORM-LEG-PLAYSECONDS-WITHIN-CLIP-1: the window is the one field fitted to the clip: M16-1456 (16.17 s) plays CONFORM_WINDOW_BY_CLIP's 15 s
+            # (adversary A2 on 22f58b19: pinned, not waived), every other conform cell keeps its display cell's window
+            cell_cuda["playSeconds"] = CONFORM_WINDOW_BY_CLIP.get(leg["clipId"], cell["playSeconds"])
             self.assertEqual(dict(leg, legId=cell["legId"], card=cell["card"], clipId=cell["clipId"], backends=cell["backends"]), cell_cuda, rel)
         for name, clip, legs in (("hfr-conform", "M16-1456", HFR_CONFORM_LEGS), ("hfr-conform-m16-1457", "M16-1457", HFR_CONFORM_LEGS_1457)):
             doc = json.loads((DV / "legsets" / f"{name}.json").read_text(encoding="utf-8"))
@@ -7512,6 +7577,27 @@ class LegSpecSchemaTests(unittest.TestCase):
             self.assertIs(arm["generatorArgs"].pop("presentTrace"), True, rel)
             self.assertEqual(list(arm["generatorArgs"]), list(twin["generatorArgs"]), rel)
             self.assertEqual(dict(arm, legId=twin["legId"]), twin, rel)
+
+    def test_the_native_trace_d4_legs_are_the_trace_cell_with_scale_and_backend_changed(self) -> None:
+        """HFR-NATIVE-M16-1457-GUI-PRESENT-CADENCE-1: a D4 native trace leg differs from the s2 trace leg of its display mode only in legId, scaleFactor,
+        backends and (cpu-only) the criteria, which are then the cpu lists of the owner-shape M16-1243 pace leg. Still paced, traced, LIGHT, Cinematic."""
+        cpu_shape = json.loads((DV / "legs/m16-1243-pace-cinematic-fullscreen-s4.json").read_text(encoding="utf-8"))["criteria"]
+        self.assertEqual(len(NATIVE_TRACE_D4_LEGS), 6)
+        for rel, twin_rel in NATIVE_TRACE_D4_LEGS.items():
+            self.assertIn(twin_rel, NATIVE_TRACE_LEGS, rel)
+            arm = json.loads((DV / rel).read_text(encoding="utf-8"))
+            self.jsonschema.validate(arm, self.schema)
+            twin = json.loads((DV / twin_rel).read_text(encoding="utf-8"))
+            self.assertEqual(arm["legId"], Path(rel).stem, rel)
+            cpu_only = "-cpu-" in arm["legId"]
+            self.assertEqual(arm["backends"], ["cpu"] if cpu_only else ["cuda", "cpu"], rel)
+            self.assertEqual(arm["scaleFactor"], int(arm["legId"][-1]), rel)
+            self.assertEqual(arm["displayMode"], twin["displayMode"], rel)
+            self.assertEqual(arm["generatorArgs"], twin["generatorArgs"], rel)
+            expected_criteria = ({role: {"cpu": lists["cpu"]} for role, lists in cpu_shape.items()} if cpu_only
+                                 else {role: {"cuda": twin["criteria"][role]["cuda"], "cpu": cpu_shape[role]["cpu"]} for role in twin["criteria"]})
+            self.assertEqual(arm["criteria"], expected_criteria, rel)
+            self.assertEqual(dict(arm, legId=twin["legId"], scaleFactor=twin["scaleFactor"], backends=twin["backends"], criteria=twin["criteria"]), twin, rel)
 
     def test_the_identity_legs_are_their_twins_with_the_capture_on(self) -> None:
         """PLAYBACK-STARTUP-WAIT-PREWARM-1: an identity leg differs from its twin only in its legId and generatorArgs.firstPresentCapture true."""
@@ -7662,6 +7748,13 @@ class LegSpecSchemaTests(unittest.TestCase):
                 self.assertRegex(spec["legId"], r"^m16-1457-native-(trace-)?(fullscreen|windowed)-s[24]$", path.name)
                 self.assertEqual(spec["generatorArgs"].get("presentTrace", False), "-trace-" in spec["legId"], path.name)
                 # paced: no unpaced switch and no swap-interval override (the app's own pacing), so the leg measures the shipping shape
+                self.assertNotIn("unpaced", spec["generatorArgs"], path.name)
+                self.assertNotIn("swapInterval", spec["generatorArgs"], path.name)
+            elif spec["card"] == "CUDA-HEADROOM-1" and "legs/" + path.name in NATIVE_TRACE_D4_LEGS:   # the D4 cells of the native trace matrix
+                # (HFR-NATIVE-M16-1457-GUI-PRESENT-CADENCE-1: s1 on cuda and cpu, and the cpu-only s2/s4 cells), paced and traced
+                self.assertEqual(spec["legId"], path.stem, path.name)
+                self.assertRegex(spec["legId"], r"^m16-1457-native-trace-((fullscreen|windowed)-s1|cpu-(fullscreen|windowed)-s[24])$", path.name)
+                self.assertIs(spec["generatorArgs"]["presentTrace"], True, path.name)
                 self.assertNotIn("unpaced", spec["generatorArgs"], path.name)
                 self.assertNotIn("swapInterval", spec["generatorArgs"], path.name)
             elif spec["card"] == "CUDA-HEADROOM-1":   # the unpaced throughput and stage legs, named by clip, kind and cell
@@ -7886,7 +7979,9 @@ class LegSpecSchemaTests(unittest.TestCase):
             spec = json.loads(path.read_text(encoding="utf-8"))
             self.assertNotIn(spec["clipId"], FIXTURE_IDS, path.name)
             self.assertRegex(spec["clipId"], r"^[A-Za-z]\d{2}-\d{3,4}$", f"{path.name} names a consented clip id")
-            self.assertGreaterEqual(spec["playSeconds"], 20, f"{path.name}: the play window is at least the owner's 20 s")
+            # HFR-10S-1 (owner 2026-10-15): 10 s for a clip of >= 50 fps (the 59.94 fps clips whose length the repo tracks), else 20 s
+            floor = 10 if KNOWN_CLIP_SOURCE.get(spec["clipId"], (0, 0))[1] >= 50 else 20
+            self.assertGreaterEqual(spec["playSeconds"], floor, f"{path.name}: the play window is at least the owner's {floor} s")
             self.assertNotRegex(path.read_text(encoding="utf-8"), r"(?i)[a-z]:[\\/]|\.mlv\b", f"{path.name} must name no path")
 
     def test_the_schema_rejects_a_fixture_leg_a_path_and_a_short_window(self) -> None:
@@ -7955,7 +8050,7 @@ NO_PACE_TWIN_BY_DESIGN = {
     # HFR-NATIVE-60FPS-FULLRES-1-MERGE-MASTER r5 (CI-1, Dot 6541731407): the four #420 conform cells. Their pace claim is the conform pace proof
     # (Get-DvConformPaceProof: the playback_smoke.conform line's conform_active and configured playback_fps against the pace guard's pace_fps), which is
     # read from settings, not timed, so a contact-sheet grab cannot move it; no PR cites a measured fps / drop / jitter figure from them.
-    **{f"m16-1456-conform-{mode}-s1": "NOT RUNNABLE (2026-10-30 hub ruling: the 16.2 s M16-1456 clip is shorter than the 25 s window); hfr-conform-m16-1457 replaces it"
+    **{f"m16-1456-conform-{mode}-s1": "conform look cell on the 16.2 s M16-1456 clip (15 s window, CONFORM-LEG-PLAYSECONDS-WITHIN-CLIP-1); its pace claim is the configured-rate conform pace proof, not a timed figure, and no PR cites a measured fps from it, so a capture-free conform twin waits for the first PR that does"
        for mode in ("fullscreen", "windowed")},
     **{f"m16-1457-conform-{mode}-s1": "conform look cell; its pace claim is the configured-rate conform pace proof, not a timed figure, and no PR cites a measured fps from it, so a capture-free conform twin waits for the first PR that does"
        for mode in ("fullscreen", "windowed")},
@@ -8641,6 +8736,9 @@ class LookReceiptGeneratorTests(unittest.TestCase):
                 # PROCESSED8-MEASURED-BRANCH-HEAVY-LEG-SPEC-1 r6: the r5 cpu block is in every cpu job (its three bracketed regions) and in no cuda job; the base predates it.
                 self.assertEqual((new_counts.pop("cpu-gl-env-clear"), old_counts.pop("cpu-gl-env-clear")),
                                  (GeneratorByteIdentityAndVariantTests.CPU_GL_ENV_CLEAR_REGIONS if name.startswith("cpu") else 0, 0), name)
+                # PRESENTMON-BACHELOR-CUDA-INTERNAL-GAP-1's regions: in the new job only (the base predates the app-swap-window temporal arm), at their pinned count.
+                self.assertEqual((new_counts.pop("pm-internal-gap"), old_counts.pop("pm-internal-gap")),
+                                 (GeneratorByteIdentityAndVariantTests.PM_INTERNAL_GAP_REGIONS, 0), name)
                 self.assertEqual(new_counts, old_counts, f"{name}: the job without -LookReceiptPath carries the base generator's bracketed regions")
                 self.assertEqual(kept, old_kept, f"{name}: the job without -LookReceiptPath must be the base generator's bytes")
                 self.assertNotIn(b"LookReceipt", new)

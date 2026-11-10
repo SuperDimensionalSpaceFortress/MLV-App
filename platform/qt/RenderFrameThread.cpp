@@ -7246,8 +7246,9 @@ void RenderFrameThread::drawFrame( int slotIndex,
                                       getMlvLastProcessed8TotalMilliseconds() );
     slot.stageTimingTelemetry.insert( QStringLiteral("processed8_cache_store_ms"),
                                       getMlvLastProcessed8CacheStoreMilliseconds() );
+    // PROCESSED8-DIRECT-PATH-TELEMETRY-STALE-1 (sibling of PROCESSED8-MS-TELEMETRY-STUCK-1): only a draw that ran the processed-8 stage reports its direct-path flag.
     slot.stageTimingTelemetry.insert( QStringLiteral("processed8_direct_path_active"),
-                                      getMlvLastProcessed8DirectPathActive() != 0 );
+                                      renderThreadProcessed8StageRan && getMlvLastProcessed8DirectPathActive() != 0 );
     slot.stageTimingTelemetry.insert( QStringLiteral("processed8_direct_path_reason"),
                                       QString::fromLatin1(
                                           processingGetDirect8IncompatibilityReason(

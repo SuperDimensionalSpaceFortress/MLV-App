@@ -12,9 +12,12 @@ param(
     [string[]]$Only = @(),
     # Overrides the agent under test (the RED run points this at a copy of the base agent).
     [string]$AgentScript = '',
-    # Wall-clock bounds of the two sub-suites -UnitOnly runs (measured 272 s and 48 s); a suite past its bound fails by name.
+    # Wall-clock bounds of the two sub-suites -UnitOnly runs; a suite past its bound fails by name.
+    # QUIET-LEASE-FILE-BOUND-HEADROOM-1 (2026-11-09): the quiet-lease file measured 345.1 s, 388.9 s and 387.3 s on fork/master 9f9439d4
+    # (three sequential runs), and 401 s / 414 s with #781's added cases; 600 s is 1.54x the slowest base run and 1.45x of 414 s.
+    # The outer hang guard (UNIT_RUN_TIMEOUT_SEC in test_bachelor_agent_heavy_slot_gate.py) is pinned above this bound's worst case.
     # The range is refused at binding, before any child exists: -1 or 2147484 would otherwise throw in WaitForExit after the launch.
-    [ValidateRange(1, 3600)][int]$QuietLeaseBoundSec = 400,
+    [ValidateRange(1, 3600)][int]$QuietLeaseBoundSec = 600,
     [ValidateRange(1, 3600)][int]$StageExemptBoundSec = 120
 )
 
