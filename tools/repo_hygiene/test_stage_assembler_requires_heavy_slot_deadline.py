@@ -9,6 +9,14 @@ refuses typed when the deadline is absent: STAGE_NO_HEAVY_SLOT_DEADLINE, exit 27
 The real assembler runs on a synthetic one-commit repository. With the deadline present it stops at the missing DLL pair
 (exit 3, the step after the source archive), which proves the refusal does not touch a caller that sets the deadline.
 No build, no ssh, no heavy slot, no footage.
+
+WINDOWS-ONLY PAST THE GATE (LANE-LOCAL-STAGE-CHAIN-DEADLINE-BYPASS-1 r2, Dot 791-C1). The two tests that run the assembler PAST the
+deadline gate (a deadline given) reach the source-archive step's -OutDir containment check, and that check is Windows-only by contract:
+AttrCudaArtifacts.psm1 Assert-AttrCudaNoLinkBelowRoot compares with a hard-coded backslash (`$full.StartsWith($rootFull + '\')`), so a POSIX
+`.work-<sha>` child of `-OutDir` is ATTRCUDA_PATH_NOT_UNDER_ROOT (exit 1). Hosted CI run 42772002818 (ubuntu shard job 129681744797) failed exactly
+those two tests that way. They are scoped to Windows with that reason named, not skipped silently; WindowsOnlyContractTests pins the cause on every
+host, so a POSIX-correct check turns it red and the two scopes must then be dropped. The refusal tests (no deadline: exit 27 BEFORE any path
+is touched) run on every host.
 """
 from __future__ import annotations
 
@@ -26,6 +34,18 @@ CHAIN = ROOT / "tools" / "profiling" / "dual-venue" / "Invoke-VenueStageChain.ps
 ENV_NAME = "MLV_HEAVY_SLOT_DEADLINE_UTC"
 PWSH = shutil.which("pwsh")
 GIT = shutil.which("git")
+
+WINDOWS_ONLY_REASON = (
+    "the attr3 assembler is Windows-only by contract: Assert-AttrCudaNoLinkBelowRoot (AttrCudaArtifacts.psm1) compares paths with a hard-coded "
+    "backslash, so a POSIX .work-<sha> child of -OutDir is ATTRCUDA_PATH_NOT_UNDER_ROOT (original failure: Tests run 42772002818, ubuntu shard "
+    "job 129681744797); the ATTR-3 host jobs run only on Windows"
+)
+
+
+def windows_only_assembler(test):
+    """Scope a test that runs the assembler PAST the deadline gate to Windows, naming the contract; tagged so a test can list them."""
+    test.windows_only_assembler = True
+    return unittest.skipUnless(os.name == "nt", WINDOWS_ONLY_REASON)(test)
 
 
 @unittest.skipUnless(PWSH and GIT, "needs pwsh and git")
@@ -81,6 +101,7 @@ class AssemblerRequiresHeavySlotDeadlineTests(unittest.TestCase):
                 self.assertIn("STAGE_NO_HEAVY_SLOT_DEADLINE", done.stdout)
                 self.assertEqual(list(self.out_dir.iterdir()), [])
 
+    @windows_only_assembler
     def test_a_caller_that_sets_the_deadline_is_not_changed(self) -> None:
         # Past the new check the run is the pre-existing one: the synthetic repo has no DLL pair, so it ends at exit 3 / dllPairDir.
         done = self._run("2099-01-01T00:00:00Z")
@@ -88,6 +109,7 @@ class AssemblerRequiresHeavySlotDeadlineTests(unittest.TestCase):
         self.assertIn("STEP=dllPairDir", done.stdout)
         self.assertNotIn("STAGE_NO_HEAVY_SLOT_DEADLINE", done.stdout)
 
+    @windows_only_assembler
     def test_an_already_passed_deadline_is_not_a_refusal_here(self) -> None:
         # The deadline's value is the guard's to judge (a passed one is a single --wait 0 attempt, bounded, not the 60 min default); this check is only "was one given".
         done = self._run("2000-01-01T00:00:00Z")
@@ -112,6 +134,68 @@ class AssemblerRequiresHeavySlotDeadlineTests(unittest.TestCase):
         nightly = (ROOT / "tools" / "profiling" / "dual-venue" / "Invoke-VenueStageNightly.ps1").read_text(encoding="utf-8")
         self.assertRegex(nightly, r"Invoke-Child 'assemble' \$Assembler @\([^)]*\) -ChildEnv @\{ MLV_HEAVY_SLOT_DEADLINE_UTC = ")
         self.assertRegex(CHAIN.read_text(encoding="utf-8"), re.escape("$psi.Environment['MLV_HEAVY_SLOT_DEADLINE_UTC']"))
+
+
+PSM1 = ROOT / "tools" / "profiling" / "bachelor" / "AttrCudaArtifacts.psm1"
+
+# Runs the containment condition EXACTLY as the module's source states it (the first `if` of Assert-AttrCudaNoLinkBelowRoot that throws
+# ATTRCUDA_PATH_NOT_UNDER_ROOT), on the two strings the caller gives. GetFullPath is not applied: these ARE the normalised strings the check compares.
+_CONDITION_PROBE = r"""
+param([string]$Psm1, [string]$Root, [string]$Candidate)
+$errs = $null
+$ast = [System.Management.Automation.Language.Parser]::ParseFile($Psm1, [ref]$null, [ref]$errs)
+$fn = $ast.Find({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq 'Assert-AttrCudaNoLinkBelowRoot' }, $true)
+$if = $fn.Body.Find({ param($n) $n -is [System.Management.Automation.Language.IfStatementAst] -and $n.Extent.Text.Contains('ATTRCUDA_PATH_NOT_UNDER_ROOT') }, $true)
+$condition = $if.Clauses[0].Item1.Extent.Text
+$rootFull = $Root.TrimEnd('\')
+$full = $Candidate.TrimEnd('\')
+Write-Output ('CONDITION=' + $condition)
+Write-Output ('REFUSED=' + [bool](Invoke-Expression $condition))
+"""
+
+
+@unittest.skipUnless(PWSH, "needs pwsh")
+class WindowsOnlyContractTests(unittest.TestCase):
+    """Dot 791-C1: the cause of the ubuntu failure, pinned on EVERY host, and the scope of the two tests it forced."""
+
+    # The exact strings of the failing CI run (job 129681744797): -OutDir and its .work-<sha12> child.
+    CI_ROOT = "/tmp/tmpuom648ob/cache-out"
+    CI_CANDIDATE = "/tmp/tmpuom648ob/cache-out/.work-39aeec2b3918"
+
+    def _probe(self, root: str, candidate: str) -> "tuple[str, bool]":
+        with tempfile.TemporaryDirectory() as tmp:
+            script = Path(tmp) / "probe.ps1"
+            script.write_text(_CONDITION_PROBE, encoding="ascii")
+            done = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-File", str(script),
+                                   "-Psm1", str(PSM1), "-Root", root, "-Candidate", candidate], capture_output=True, text=True)
+        out = done.stdout + done.stderr
+        self.assertEqual(done.returncode, 0, out)
+        condition = re.search(r"^CONDITION=(.*)$", done.stdout, re.M)
+        refused = re.search(r"^REFUSED=(True|False)$", done.stdout, re.M)
+        self.assertTrue(condition and refused, out)
+        return condition.group(1), refused.group(1) == "True"
+
+    def test_the_module_refuses_the_posix_work_child_the_ci_run_saw_and_accepts_the_windows_form(self) -> None:
+        # The cause as FOUND: the condition appends a backslash to the root, so a '/'-separated child never starts with it.
+        # On 896acdc9 the two scoped tests ran on ubuntu and failed on exactly this refusal. A POSIX-correct check makes the
+        # first assertion fail -- the signal that the Windows-only scopes can be dropped.
+        condition, refused_posix = self._probe(self.CI_ROOT, self.CI_CANDIDATE)
+        self.assertIn("'\\'", condition, "the compared prefix is rootFull + a backslash literal: " + condition)
+        self.assertTrue(refused_posix, "a POSIX .work-<sha> child is refused by the module's own condition: " + condition)
+        _, refused_windows = self._probe("C:\\work\\cache-out", "C:\\work\\cache-out\\.work-39aeec2b3918")
+        self.assertFalse(refused_windows, "the same shape in the contract's own (Windows) form is accepted")
+
+    def test_exactly_the_tests_that_run_past_the_gate_are_scoped_to_windows(self) -> None:
+        cls = AssemblerRequiresHeavySlotDeadlineTests
+        scoped = sorted(n for n in dir(cls) if getattr(getattr(cls, n), "windows_only_assembler", False))
+        self.assertEqual(scoped, ["test_a_caller_that_sets_the_deadline_is_not_changed",
+                                  "test_an_already_passed_deadline_is_not_a_refusal_here"])
+        for name in scoped:
+            method = getattr(cls, name)
+            if os.name != "nt":
+                self.assertTrue(method.__unittest_skip__, name)
+                self.assertIn("job 129681744797", method.__unittest_skip_why__)
+                self.assertIn("Windows-only by contract", method.__unittest_skip_why__)
 
 
 if __name__ == "__main__":
