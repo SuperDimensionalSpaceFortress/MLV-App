@@ -817,7 +817,8 @@ TEST(PlaybackGpuClockKickWiring, TheKernelIsBoundedByAGlobaltimerDeadlineOnItsOw
     ASSERT_FALSE(end.contains(QStringLiteral("cuda")));
     ASSERT_TRUE(end.contains(QStringLiteral("while (!s->done && now_ms() - waitStart < kClockKickEndWaitMs)")));
     // both live runs end a running kick right after their tile drain, before the CUDA-GL handoff
-    ASSERT_EQ(2, cu.count(QStringLiteral("            probe);\n        stop_clock_kick_for_live_run(backend);\n")));
+    // (r3: the batched tile-drain call now ends with the present stream and its producer event)
+    ASSERT_EQ(2, cu.count(QStringLiteral("            present ? backend->presentProducerDone : nullptr);\n        stop_clock_kick_for_live_run(backend);\n")));
 }
 
 // PLAYBACK-STARTUP-WAIT-S1-FIRST-PRESENT-WARM-OUTPUT-REUSE-1 R2 (PlaybackWarmOutputReusePolicy.h): Play's first recon present
