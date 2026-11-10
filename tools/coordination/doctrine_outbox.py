@@ -3963,12 +3963,22 @@ def _scratch_key(base: pathlib.Path) -> str:
 
 
 def _pin_scratch(base: pathlib.Path, scratch_root: str | os.PathLike) -> None:
-    """Record the identity of the scratch root and of the scratch `base` just made: ONE read of each, straight after the scratch
-    was created, and no pause. A repeated read (a retry after a pause) is itself a window in which another process swaps the root
-    or the scratch, and the replacement's identity would be recorded as the creation pin. A read that fails is recorded as None,
-    which removal never completes from whatever it finds later (the typed EXERCISE_SCRATCH_NOT_REMOVED, not an adopted replacement)."""
+    """Record the identity of the scratch root and of the scratch `base` just made, straight after it was created and with no pause
+    (a retry after a pause is itself a swap window whose second read would be recorded as the creation pin). Each is read twice,
+    back to back, and pinned only when both reads agree; the scratch must also still be EMPTY (what mkdtemp made is), so a
+    replacement put there between the reads, which holds something, is never taken for it. An identity that is unreadable, differs
+    between the reads or fails that check is recorded as None, which removal never completes from whatever it finds later (the typed
+    EXERCISE_SCRATCH_NOT_REMOVED, not an adopted replacement). What remains is an EMPTY ordinary directory swapped in before the
+    first read: no file is lost to it, and Python offers no handle-based identity on Windows to close that instant."""
     real = os.path.realpath(scratch_root)
-    _SCRATCH_PINS[_scratch_key(base)] = (_file_id(real, follow=True), _file_id(base))
+    root_a, work_a = _file_id(real, follow=True), _file_id(base)
+    root_b, work_b = _file_id(real, follow=True), _file_id(base)        # back to back, no pause: a swap between two reads shows as a difference
+    try:
+        with os.scandir(base) as entries:
+            fresh = next(entries, None) is None                         # what mkdtemp just made is EMPTY: a populated one is not ours
+    except OSError:
+        fresh = False
+    _SCRATCH_PINS[_scratch_key(base)] = (root_a if root_a == root_b else None, work_a if work_a == work_b and fresh else None)
 
 
 def remove_exercise_scratch(base: pathlib.Path, scratch_root: pathlib.Path) -> None:

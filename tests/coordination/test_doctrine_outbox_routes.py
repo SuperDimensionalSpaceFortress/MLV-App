@@ -3229,7 +3229,7 @@ def test_a_creation_pin_that_could_not_be_read_is_never_completed_from_a_replace
 
 def test_a_creation_pin_is_one_read_and_an_unreadable_one_stays_unknown(tmp_path, monkeypatch):
     """The pin is the identity of what THIS run just made. A second read after a pause (a retry) is a window in which a process
-    swaps the root or the scratch, and the replacement's identity would be recorded as the creation pin. So: one read of each,
+    swaps the root or the scratch, and the replacement's identity would be recorded as the creation pin. So: two back-to-back reads of each that must agree,
     no pause, and a read that fails is recorded as None, which removal refuses (the typed EXERCISE_SCRATCH_NOT_REMOVED) instead
     of completing the pin from whatever it finds later. (The earlier test of this name pinned the retry itself: it required a
     failing read to be repeated until it succeeded, which is the defect, so replacing it is not a loosening.)"""
@@ -3249,10 +3249,58 @@ def test_a_creation_pin_is_one_read_and_an_unreadable_one_stays_unknown(tmp_path
     monkeypatch.setattr(ob.time, "sleep", no_pause)
     ob._pin_scratch(base, root)
     assert ob._SCRATCH_PINS.pop(ob._scratch_key(base)) == (None, None)
-    assert len(seen) == 2, f"each identity is read exactly once, never retried: {seen}"
+    assert len(seen) == 4, f"each identity is read twice, back to back, and never retried to success: {seen}"
     monkeypatch.setattr(ob, "_file_id", real)
     ob._pin_scratch(base, root)
     assert ob._SCRATCH_PINS.pop(ob._scratch_key(base)) == (real(root, True), real(base))
+
+
+def test_a_replacement_made_between_the_root_read_and_the_scratch_read_is_not_pinned_as_the_creation(tmp_path, monkeypatch):
+    """Adversary r4 A1: the root's identity is read, then another process renames the new scratch aside and puts an ordinary
+    replacement (holding a file) under the same name, then the scratch's identity is read. A fresh scratch is EMPTY, so a
+    populated one is not what this run made: its identity is never pinned, and removal refuses it (typed) instead of deleting it."""
+    root = tmp_path / "scratch"
+    base = root / (ob.ROUTE_SCRATCH_PREFIX + "pinbetween")
+    base.mkdir(parents=True)
+    real, swapped = ob._file_id, [False]
+
+    def swap_after_the_root_read(path, follow=False):
+        got = real(path, follow)
+        if follow and not swapped[0]:
+            swapped[0] = True
+            os.rename(base, tmp_path / "original-aside")
+            base.mkdir()
+            (base / "precious.txt").write_text("not ours", encoding="utf-8")
+        return got
+
+    monkeypatch.setattr(ob, "_file_id", swap_after_the_root_read)
+    ob._pin_scratch(base, root)
+    monkeypatch.setattr(ob, "_file_id", real)
+    monkeypatch.setattr(ob, "ROUTE_SCRATCH_REMOVE_PAUSE", 0)
+    monkeypatch.setattr(ob, "ROUTE_SCRATCH_REMOVE_DEADLINE", 0.3)
+    with pytest.raises(ob.Unknown) as caught:
+        ob.remove_exercise_scratch(base, root)
+    assert caught.value.code == "EXERCISE_SCRATCH_NOT_REMOVED", caught.value
+    assert (base / "precious.txt").exists(), "the replacement made between the two reads was pinned as the creation and removed"
+    assert (tmp_path / "original-aside").exists()
+
+
+def test_a_root_whose_identity_changes_between_the_two_creation_reads_is_not_pinned(tmp_path, monkeypatch):
+    root = tmp_path / "scratch"
+    base = root / (ob.ROUTE_SCRATCH_PREFIX + "pinroot")
+    base.mkdir(parents=True)
+    real, root_reads = ob._file_id, [0]
+
+    def root_changes(path, follow=False):
+        if follow:
+            root_reads[0] += 1
+            return (1, 100 + root_reads[0])                              # a different object on every read
+        return real(path, follow)
+
+    monkeypatch.setattr(ob, "_file_id", root_changes)
+    ob._pin_scratch(base, root)
+    root_id, work_id = ob._SCRATCH_PINS.pop(ob._scratch_key(base))
+    assert root_id is None and work_id == real(base), (root_id, work_id)
 
 
 def test_a_scratch_whose_first_creation_read_failed_is_not_adopted_from_a_replacement_made_during_any_pause(tmp_path, monkeypatch):
