@@ -190,6 +190,120 @@ def _label(expr: ast.AST) -> str:
         return "<expression>"
 
 
+_FORMAT_FIELD_RE = re.compile(r"\{\{|\}\}|\{([^{}!:]*)(?:![rsa])?(?::[^{}]*)?\}")
+_PERCENT_FIELD_RE = re.compile(r"%(?:\(([^)]*)\))?[#0\- +]*(\d+|\*)?(?:\.(?:\d+|\*))?[hlL]?([sraidiouxXeEfFgGc%])")
+_FLATTEN_DEPTH = 48
+
+
+def _flatten(node: ast.AST, consts: dict[str, str], depth: int = 0) -> tuple[str, bool]:
+    """(text, known): what a string expression reads as when every piece is a string literal or a name bound once to one.
+
+    Folds adjacent literals, ``+``, ``%`` and ``.format`` / ``.format_map`` templates, ``.join`` and ``.replace`` over literals, and an
+    f-string whose holes fold. A piece that does not fold contributes NOTHING to the text and makes ``known`` False, so ``'Sta' + name +
+    'rt-Process'`` reads as ``Start-Process`` (the split is visible) while ``known`` says the text is partial. The scan fills the template
+    itself; it never calls ``eval``/``exec`` and never hands scanned text to ``str.format`` (a ``{:>999999999}`` spec must not allocate).
+    """
+    if depth > _FLATTEN_DEPTH:
+        return "", False
+    if isinstance(node, ast.Constant):
+        return (node.value, True) if isinstance(node.value, str) else ("", False)
+    if isinstance(node, ast.Name):
+        value = consts.get(node.id) if isinstance(node.ctx, ast.Load) else None
+        return (value, True) if value is not None else ("", False)
+    if isinstance(node, ast.JoinedStr):
+        parts = [(v.value, True) if isinstance(v, ast.Constant) else _flatten(v.value, consts, depth + 1) if isinstance(v, ast.FormattedValue)
+                 else ("", False) for v in node.values]
+        return "".join(t for t, _ in parts), all(k for _, k in parts)
+    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
+        leaves, todo = [], [node]  # iterative: a long chain must not exhaust the stack
+        while todo:
+            cur = todo.pop()
+            if isinstance(cur, ast.BinOp) and isinstance(cur.op, ast.Add):
+                todo.append(cur.right)
+                todo.append(cur.left)
+            else:
+                leaves.append(cur)
+        parts = [_flatten(leaf, consts, depth + 1) for leaf in leaves]
+        return "".join(t for t, _ in parts), all(k for _, k in parts)
+    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Mod):
+        template, known = _flatten(node.left, consts, depth + 1)
+        right = node.right
+        if isinstance(right, ast.Dict):
+            named = {k.value: _flatten(v, consts, depth + 1) for k, v in zip(right.keys, right.values)
+                     if isinstance(k, ast.Constant) and isinstance(k.value, str)}
+            return _fill_percent(template, [], named, known)
+        args = right.elts if isinstance(right, ast.Tuple) else [right]
+        return _fill_percent(template, [_flatten(a, consts, depth + 1) for a in args], {}, known and not any(isinstance(a, ast.Starred) for a in args))
+    if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
+        method, recv = node.func.attr, node.func.value
+        if method in ("format", "format_map"):
+            template, known = _flatten(recv, consts, depth + 1)
+            if method == "format_map":
+                arg = node.args[0] if node.args else None
+                named = ({k.value: _flatten(v, consts, depth + 1) for k, v in zip(arg.keys, arg.values)
+                          if isinstance(k, ast.Constant) and isinstance(k.value, str)} if isinstance(arg, ast.Dict) else {})
+                return _fill_format(template, [], named, known and isinstance(arg, ast.Dict))
+            ok = known and not any(isinstance(a, ast.Starred) for a in node.args) and all(kw.arg is not None for kw in node.keywords)
+            named = {kw.arg: _flatten(kw.value, consts, depth + 1) for kw in node.keywords if kw.arg is not None}
+            return _fill_format(template, [_flatten(a, consts, depth + 1) for a in node.args], named, ok)
+        if method == "join" and len(node.args) == 1 and isinstance(node.args[0], (ast.List, ast.Tuple, ast.Set)):
+            sep, sep_known = _flatten(recv, consts, depth + 1)
+            parts = [_flatten(e, consts, depth + 1) for e in node.args[0].elts]
+            return sep.join(t for t, _ in parts), sep_known and all(k for _, k in parts)
+        if method == "replace" and len(node.args) >= 2:
+            text, known = _flatten(recv, consts, depth + 1)
+            old, old_known = _flatten(node.args[0], consts, depth + 1)
+            new, new_known = _flatten(node.args[1], consts, depth + 1)
+            return (text.replace(old, new) if old and old_known and new_known else text), known and old_known and new_known
+    return "", False
+
+
+def _fill_format(template: str, positional: list[tuple[str, bool]], named: dict[str, tuple[str, bool]], known: bool) -> tuple[str, bool]:
+    state = {"next": 0, "known": known}
+
+    def field(match: re.Match) -> str:
+        if match.group(0) in ("{{", "}}"):
+            return match.group(0)[0]
+        name = re.match(r"\w*", match.group(1) or "").group(0)
+        if name == "":
+            index, state["next"] = state["next"], state["next"] + 1
+            value = positional[index] if index < len(positional) else None
+        elif name.isdigit():
+            value = positional[int(name)] if int(name) < len(positional) else None
+        else:
+            value = named.get(name)
+        if value is None:
+            state["known"] = False
+            return ""
+        state["known"] = state["known"] and value[1]
+        return value[0]
+
+    return _FORMAT_FIELD_RE.sub(field, template), state["known"]
+
+
+def _fill_percent(template: str, positional: list[tuple[str, bool]], named: dict[str, tuple[str, bool]], known: bool) -> tuple[str, bool]:
+    state = {"next": 0, "known": known}
+
+    def field(match: re.Match) -> str:
+        if match.group(3) == "%":
+            return "%"
+        if match.group(2) == "*":  # a width taken from the arguments: the positions after it are not tracked
+            state["known"] = False
+            return ""
+        if match.group(1) is not None:
+            value = named.get(match.group(1))
+        else:
+            index, state["next"] = state["next"], state["next"] + 1
+            value = positional[index] if index < len(positional) else None
+        if value is None or match.group(3) not in "sra":
+            state["known"] = False
+            return value[0] if value is not None else ""
+        state["known"] = state["known"] and value[1]
+        return value[0]
+
+    return _PERCENT_FIELD_RE.sub(field, template), state["known"]
+
+
 def _tracked(module: str | None) -> frozenset:
     if module is None:
         return frozenset()
@@ -285,6 +399,9 @@ class _Facts:
         self.importers: dict[str, str] = {"__import__": "__import__"}  # names that import a module by string -> which kind
         self.helper_modules: dict[str, str] = {}  # names bound to importlib / builtins
         self.imported: set[str] = set(self.imports)  # names that are an imported module, directly or through a plain alias of one
+        # names bound by `import x [as y]` only (never a from-import, which may bind a class or a function), and plain aliases of them:
+        # the names whose value IS a module, so a flow into a binding the scan cannot follow is a lost module identity
+        self.module_names: set[str] = {n for n, srcs in self.import_src.items() if not any(s.startswith("from ") for s in srcs)}
         for node in ast.walk(tree):
             self._seed(node)
         pairs = [(name, value) for node in ast.walk(tree) for name, value in self._direct(node)]
@@ -403,7 +520,15 @@ class _Facts:
         if name not in self.imported and self._imported_root(value):  # `s = shutil`, `p = os.path`: still an imported module under another name
             self.imported.add(name)
             learned.append(name)
+        if name not in self.module_names and self._is_module_value(value):  # `s = shutil`, `m = __import__('shutil')`
+            self.module_names.add(name)
+            learned.append(name)
         return learned
+
+    def _is_module_value(self, node: ast.AST) -> bool:
+        if isinstance(node, ast.Name):
+            return isinstance(node.ctx, ast.Load) and node.id in self.module_names
+        return isinstance(node, ast.Call) and self.import_target(node)[0]
 
     @staticmethod
     def _direct(node: ast.AST) -> list[tuple[str, ast.AST]]:
@@ -437,12 +562,18 @@ class _Facts:
     @staticmethod
     def _fromlist_state(call: ast.Call) -> bool | None:
         """``__import__(name, ..., fromlist)``: True when the fromlist is a non-empty literal (the NAMED submodule is returned), False when
-        it is absent or an empty literal (the root is returned), None when it is a run-time value (either can be returned)."""
+        it is absent or an empty literal (the root is returned), None when it is a run-time value (either can be returned: both the root and
+        the submodule identity are kept by the caller, which reports the import). A ``*`` in the arguments, a ``**`` in the keywords, or a
+        container made only of starred elements (``[*names]`` expands to anything, empty included) is a run-time value too."""
+        if any(isinstance(a, ast.Starred) for a in call.args) or any(kw.arg is None for kw in call.keywords):
+            return None  # `__import__(*args)`, `__import__('a.b', **kw)`: the fromlist may arrive through the expansion
         arg = call.args[3] if len(call.args) > 3 else next((kw.value for kw in call.keywords if kw.arg == "fromlist"), None)
         if arg is None or (isinstance(arg, ast.Constant) and not arg.value):
             return False
         if isinstance(arg, (ast.List, ast.Tuple)):
-            return bool(arg.elts)
+            if any(not isinstance(e, ast.Starred) for e in arg.elts):
+                return True  # one plain element makes it nonempty whatever a star adds
+            return None if arg.elts else False
         return True if isinstance(arg, ast.Constant) else None
 
     def import_target(self, node: ast.AST) -> tuple[bool, str | None, bool]:
@@ -565,6 +696,24 @@ def _position_ok(node: ast.AST, up: ast.AST | None, module: str | None, parent: 
     return False
 
 
+def _imported_module_position_ok(node: ast.AST, up: ast.AST | None, parent: dict[int, ast.AST], facts: _Facts) -> bool:
+    """May an imported module (not a tracked one) appear here without being followed? Stricter than a read: the value must not flow into a
+    container, conditional, subscript, return, lambda, class attribute or any other binding the scan cannot tie a later call back to."""
+    if isinstance(up, ast.Attribute):
+        return node is up.value  # shutil.which, shutil.os: the attribute is judged at its own node
+    if isinstance(up, (ast.Compare, ast.Expr, ast.UnaryOp, ast.FormattedValue, ast.Assert)):
+        return True
+    if isinstance(up, (ast.If, ast.While, ast.IfExp)) and node is up.test:
+        return True
+    if isinstance(up, ast.BoolOp) and isinstance(up.op, ast.And) and node is not up.values[-1]:
+        return True  # `yaml and yaml.load(x)`: a module is truthy, so the first operand is never the value
+    if (isinstance(up, ast.Call) and node is not up.func and isinstance(up.func, ast.Name) and up.func.id in ("getattr", "hasattr", "setattr", "delattr")
+            and up.args and up.args[0] is node):
+        name = facts.literal(up.args[1]) if len(up.args) > 1 else None  # getattr(shutil, 'which'): the name is fixed and is not a re-export
+        return name is not None and name not in _IMPORT_FUNCS and name not in _SUBMODULE_REEXPORTS and not (name.startswith("__") and name.endswith("__"))
+    return _position_ok(node, up, None, parent)
+
+
 def _named_helper_access(node: ast.AST, up: ast.AST | None, facts: _Facts) -> bool:
     """``setattr(builtins, NAME, v)`` / ``getattr(importlib, 'x')``: the import machinery is named, and the name is not an import function."""
     if not (isinstance(up, ast.Call) and isinstance(up.func, ast.Name) and up.func.id in ("setattr", "delattr", "getattr", "hasattr")):
@@ -613,6 +762,10 @@ def _reference_violations(tree: ast.AST, facts: _Facts) -> list[tuple[int, str]]
             continue
         if isinstance(node, ast.Constant) and isinstance(node.value, str) and _LOOP_METHOD_NAME_RE.fullmatch(node.value):
             out.append((node.lineno, f"names {node.value!r} as a string, which reaches an event-loop spawn method without calling it in place"))
+        if isinstance(node, (ast.BinOp, ast.JoinedStr, ast.Call)) and not (isinstance(node, ast.BinOp) and isinstance(parent.get(id(node)), ast.BinOp)):
+            built, known = _flatten(node, facts.consts)  # 'subprocess_' + 'exec', '%sexec' % 'subprocess_', f'subprocess_{"exec"}': the folded name
+            if known and _LOOP_METHOD_NAME_RE.fullmatch(built):
+                out.append((node.lineno, f"names {built!r} as a built string, which reaches an event-loop spawn method without calling it in place"))
         if isinstance(node, ast.Attribute) and isinstance(node.ctx, (ast.Store, ast.Del)) and facts.module_of(node.value) is not None:
             out.append((node.lineno, f"assigns or deletes the attribute {node.attr} on a spawn module"))  # CREATE_NO_WINDOW, os.name, run ...
         if isinstance(node, ast.Attribute) and node.attr in _LOOP_SPAWN_METHODS:
@@ -645,6 +798,11 @@ def _reference_violations(tree: ast.AST, facts: _Facts) -> list[tuple[int, str]]
             module = facts.modules.get(node.id)
             is_ref = module is not None or node.id in facts.funcs or node.id in facts.importers or node.id in facts.helper_modules
         up = parent.get(id(node))
+        if not is_ref and (
+                (isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load) and node.id in facts.module_names and node.id not in facts.modules)
+                or (isinstance(node, ast.Call) and facts.import_target(node)[0])):
+            if not _imported_module_position_ok(node, up, parent, facts):  # `s, = (shutil,)`, `s = [shutil][0]`, `class X: m = shutil`
+                out.append((node.lineno, "uses an imported module where its calls cannot be followed"))
         # importlib / builtins: `importlib.import_module` is judged at its own node, but the module itself in a container or call
         # argument hides the import function from the scan (`loaders = [importlib]; loaders[0].import_module('subprocess')`).
         helper_receiver = (isinstance(node, ast.Name) and module is None and node.id in facts.helper_modules
@@ -1001,6 +1159,7 @@ def _string_values(tree: ast.AST) -> list[tuple[int, str, bool]]:
     reported as run-time built (fail closed) instead of being guessed at.
     """
     out: list[tuple[int, str, bool]] = []
+    named_strings = _string_consts(_collect_binders(tree)[0])
 
     def literal_text(node: ast.AST) -> str | None:
         """The text of a ``+`` tree whose every leaf is a string literal, in either nesting (``'a' + ('b' + 'c')`` too); else None."""
@@ -1027,7 +1186,12 @@ def _string_values(tree: ast.AST) -> list[tuple[int, str, bool]]:
         if isinstance(node, ast.JoinedStr):  # an f-string whose holes hold no string literal reads as its text with a mark per hole
             holes = [v.value for v in node.values if isinstance(v, ast.FormattedValue)]
             if not any(isinstance(c, ast.Constant) and isinstance(c.value, str) for h in holes for c in ast.walk(h)):
-                out.append((node.lineno, "".join(v.value if isinstance(v, ast.Constant) else "\x01" for v in node.values), False))
+                marked = "".join(v.value if isinstance(v, ast.Constant) else "\x01" for v in node.values)
+                flat, _ = _flatten(node, named_strings)  # the literal pieces joined with the holes dropped: f'Sta{name}rt-Process cmd.exe'
+                if len(_START_PROCESS_RE.findall(flat)) > len(_START_PROCESS_RE.findall(marked)) and _BUILT_LAUNCH_RE.search(flat):
+                    out.append((node.lineno, flat, True))
+                    continue
+                out.append((node.lineno, marked, False))
                 continue
         builds = isinstance(node, (ast.JoinedStr, ast.BinOp)) or (
             isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr in _STRING_BUILDERS)
@@ -1036,7 +1200,8 @@ def _string_values(tree: ast.AST) -> list[tuple[int, str, bool]]:
                             key=lambda c: (c.lineno, c.col_offset))
             pieces = [c.value for c in consts]
             # a launch split across the literal pieces ('Sta' + name + 'rt-Process') reads as one only when they are joined in source order
-            if any(_BUILT_LAUNCH_RE.search(p) for p in pieces + ["".join(pieces)]):
+            flat, _ = _flatten(node, named_strings)  # '{}rt-Process'.format('Sta'), '%srt-Process' % 'Sta': the template filled in
+            if any(_BUILT_LAUNCH_RE.search(p) for p in pieces + ["".join(pieces), flat]):
                 out.append((node.lineno, "".join(pieces), True))
                 continue
         stack.extend(ast.iter_child_nodes(node))
@@ -2284,6 +2449,128 @@ class AdversaryR5Pass10Tests(unittest.TestCase):
         self.assertEqual((found, len(bad)), (1, 1))
         self.assertEqual(_start_process_violations("x = 'Start`-Process cmd.exe -WindowStyle Hidden'\n"), (1, []))  # mid-token: still the command
         self.assertEqual(_start_process_violations("x = 'Start-Process cmd.exe -Window`Style Hidden'\n"), (1, []))
+
+
+class AdversaryR6Tests(unittest.TestCase):
+    """r6: Dot R5-F1 (+ starred residual), Grok G8-G11. Each row is RED on a6f58aef and GREEN on the fix head."""
+
+    def _bad(self, source: str) -> list[str]:
+        return _unflagged_spawns_in_source(source, "synthetic.py")
+
+    # --- Dot R5-F1: a fromlist known only at run time keeps BOTH identities (root and submodule) => the import is reported ---
+    def test_r5_f1_an_unresolved_fromlist_reports_the_root_and_the_submodule_spawn(self):
+        for label, src in {
+            "dot's literal (empty at run time)": "names = []\nm = __import__('asyncio.base_events', fromlist=names)\n"
+                                                 "async def launch():\n    await m.create_subprocess_exec('cmd.exe')\n",
+            "nonempty variable, submodule spawn": "names = ['subprocess']\nm = __import__('asyncio.base_events', fromlist=names)\nm.subprocess.run(['x'])\n",
+            "positional, root spawn": "names = []\nm = __import__('asyncio.base_events', None, None, names)\nm.create_subprocess_shell('x')\n",
+            "keyword, submodule spawn": "m = __import__('asyncio.windows_utils', fromlist=pick())\nm.Popen(['x'])\n",
+            "builtins form": "import builtins\nnames = []\nm = builtins.__import__('asyncio.base_events', fromlist=names)\nm.create_subprocess_exec('x')\n",
+        }.items():
+            self.assertGreaterEqual(len(self._bad(src)), 1, label)
+        # controls: a fromlist that IS resolved keeps one identity, and a flagged call through it is clean
+        self.assertEqual(self._bad("m = __import__('asyncio.windows_utils', fromlist=['Popen'])\nm.Popen(['x'], creationflags=_NO_WINDOW)\n"), [])
+        self.assertEqual(self._bad("m = __import__('asyncio.base_events', fromlist=[])\nm.create_subprocess_exec('x', creationflags=_NO_WINDOW)\n"), [])
+        self.assertGreaterEqual(len(self._bad("m = __import__('asyncio.base_events', fromlist=[])\nm.create_subprocess_exec('x')\n")), 1)
+        self.assertGreaterEqual(len(self._bad("m = __import__('asyncio.windows_utils', fromlist=['Popen'])\nm.Popen(['x'])\n")), 1)
+
+    def test_r5_f1_residual_a_starred_fromlist_has_an_unknown_cardinality(self):
+        for label, src in {
+            "list star": "names = []\nm = __import__('asyncio.base_events', fromlist=[*names])\nm.create_subprocess_exec('cmd.exe')\n",
+            "tuple star": "names = []\nm = __import__('asyncio.base_events', fromlist=(*names,))\nm.create_subprocess_exec('cmd.exe')\n",
+            "positional list star": "names = []\nm = __import__('asyncio.base_events', None, None, [*names])\nm.create_subprocess_exec('x')\n",
+            "two stars": "a = []\nb = []\nm = __import__('asyncio.base_events', fromlist=[*a, *b])\nm.create_subprocess_exec('x')\n",
+            "starred call args": "args = ('asyncio.base_events', None, None, [])\nm = __import__(*args)\nm.create_subprocess_exec('x')\n",
+            "double-star keywords": "kw = {'fromlist': []}\nm = __import__('asyncio.base_events', **kw)\nm.create_subprocess_exec('x')\n",
+            "trailing positional star": "rest = ([],)\nm = __import__('asyncio.base_events', None, None, *rest)\nm.create_subprocess_exec('x')\n",
+        }.items():
+            self.assertGreaterEqual(len(self._bad(src)), 1, label)
+        # controls: one plain element makes it nonempty whatever the star holds; an all-literal empty tuple is the root
+        self.assertEqual(self._bad("m = __import__('asyncio.windows_utils', fromlist=['Popen', *names])\nm.Popen(['x'], creationflags=_NO_WINDOW)\n"), [])
+        self.assertEqual(self._bad("m = __import__('asyncio.base_events', fromlist=())\nm.create_subprocess_exec('x', creationflags=_NO_WINDOW)\n"), [])
+        self.assertEqual(self._bad("m = __import__('json', fromlist=[*names])\nm.dumps(1)\n"), [])  # no dot: one identity either way
+
+    # --- Grok G8: a launch split across the holes of an f-string, a .format() or a % template ---
+    def test_g8_a_start_process_split_by_a_hole_is_reported_in_every_spelling(self):
+        for label, src in {
+            "f-string hole": "x = f'Sta{name}rt-Process cmd.exe'\n",
+            "format, literal arg": "x = '{}rt-Process cmd.exe'.format('Sta')\n",
+            "percent, literal arg": "x = '%srt-Process cmd.exe' % 'Sta'\n",
+            "format, variable arg": "x = 'Sta{}rt-Process cmd.exe'.format(name)\n",
+            "percent, variable arg": "x = 'Sta%srt-Process cmd.exe' % name\n",
+            "format, numbered": "x = '{1}{0}-Process cmd.exe'.format('rt', 'Sta')\n",
+            "format, keyword": "x = '{a}rt-Process cmd.exe'.format(a='Sta')\n",
+            "percent, tuple": "x = '%s%s-Process cmd.exe' % ('Sta', 'rt')\n",
+            "percent, mapping": "x = '%(a)srt-Process cmd.exe' % {'a': 'Sta'}\n",
+            "f-string, alias": "x = f'sa{name}ps cmd.exe'\n",
+            "f-string, two holes": "x = f'S{a}ta{b}rt-Process cmd.exe'\n",
+        }.items():
+            found, bad = _start_process_violations(src)
+            self.assertEqual((found, len(bad)), (1, 1), label)
+        # controls: no launch anywhere in the assembled text
+        for src in ("x = f'Sta{name}rtup cmd.exe'\n", "x = '{}rtup cmd.exe'.format('Sta')\n", "x = '%sged of the line' % 'Sta'\n",
+                    "x = f'the {kind} of it'\n"):
+            self.assertEqual(_start_process_violations(src), (0, []), src)
+        # the unsplit forms keep their old verdicts
+        self.assertEqual(_start_process_violations("x = 'Start-Process cmd.exe -WindowStyle Hidden'\n"), (1, []))
+
+    # --- Grok G9: the event-loop spawn method named by a folded string ---
+    def test_g9_a_loop_method_name_assembled_from_literals_is_reported(self):
+        for method in sorted(_LOOP_SPAWN_METHODS):
+            head, tail = method[: len(method) // 2], method[len(method) // 2:]
+            for label, expr in {
+                "plus": repr(head) + " + " + repr(tail),
+                "plus, three parts": repr(head[:2]) + " + " + repr(head[2:]) + " + " + repr(tail),
+                "percent": repr(head + "%s") + " % " + repr(tail),
+                "format": repr(head + "{}") + ".format(" + repr(tail) + ")",
+                "join": "''.join((" + repr(head) + ", " + repr(tail) + "))",
+                "f-string literal hole": "f" + repr(head + "{'" + tail + "'}"),
+            }.items():
+                with self.subTest(method=method, form=label):
+                    self.assertGreaterEqual(len(self._bad("getattr(loop, " + expr + ")\n")), 1)
+            with self.subTest(method=method, form="constant name"):
+                self.assertGreaterEqual(len(self._bad("H = " + repr(head) + "\ngetattr(loop, H + " + repr(tail) + ")\n")), 1)
+        # controls: a name that is not an event-loop spawn method stays clean
+        self.assertEqual(self._bad("getattr(loop, 'call_' + 'soon')\n"), [])
+        self.assertEqual(self._bad("x = 'subprocess_' + 'helper'\n"), [])
+
+    # --- Grok G10: an imported module flowing into a binding the scan cannot follow ---
+    def test_g10_an_imported_module_in_an_unfollowable_binding_is_reported(self):
+        for label, src in {
+            "tuple unpack": "import shutil\ns, = (shutil,)\ns.os.system('x')\n",
+            "conditional": "import shutil\ns = shutil if True else None\ns.os.system('x')\n",
+            "list subscript": "import shutil\ns = [shutil][0]\ns.os.system('x')\n",
+            "dict value": "import shutil\ns = {'m': shutil}['m']\ns.os.system('x')\n",
+            "or-chain": "import shutil\ns = None or shutil\ns.os.system('x')\n",
+            "star unpack": "import shutil\ns, = [*(shutil,)]\ns.os.system('x')\n",
+            "lambda return": "import shutil\nf = lambda: shutil\nf().os.system('x')\n",
+            "function return": "import shutil\ndef get():\n    return shutil\nget().os.system('x')\n",
+            "dynamic import in a container": "s = [__import__('shutil')][0]\ns.os.system('x')\n",
+            "alias of an alias": "import shutil\nt = shutil\ns, = (t,)\ns.os.system('x')\n",
+        }.items():
+            self.assertGreaterEqual(len(self._bad(src)), 1, label)
+        # controls: a plain alias, an attribute receiver, a flagged call and an unrelated container stay clean
+        self.assertEqual(self._bad("import shutil\ns = shutil\ns.which('z')\n"), [])
+        self.assertEqual(self._bad("import shutil\nx = shutil.which('z')\n"), [])
+        self.assertEqual(self._bad("import os\nvalues = [os.getcwd(), 1]\nprint(values[0])\n"), [])
+        self.assertEqual(self._bad("import json\nx = [json.dumps(1)]\n"), [])
+
+    # --- Grok G11: a class-body binding of an imported module ---
+    def test_g11_a_class_body_binding_of_an_imported_module_is_reported(self):
+        for label, src in {
+            "__import__": "class X:\n    m = __import__('shutil')\nX.m.os.system('x')\n",
+            "import_module": "import importlib\nclass X:\n    m = importlib.import_module('shutil')\nX.m.os.system('x')\n",
+            "plain alias": "import shutil\nclass X:\n    m = shutil\nX.m.os.system('x')\n",
+            "annotated": "import shutil\nclass X:\n    m: object = shutil\nX.m.os.system('x')\n",
+            "nested block": "import shutil\nclass X:\n    if True:\n        m = shutil\nX.m.os.system('x')\n",
+            "alias of alias": "import shutil\nt = shutil\nclass X:\n    m = t\nX.m.os.system('x')\n",
+            "from importlib import": "from importlib import import_module as im\nclass X:\n    m = im('shutil')\nX.m.os.system('x')\n",
+        }.items():
+            self.assertGreaterEqual(len(self._bad(src)), 1, label)
+        # controls: a non-module class attribute, and the same bindings outside a class, stay clean
+        self.assertEqual(self._bad("import shutil\nclass X:\n    n = 1\n    w = shutil.which\n"), [])
+        self.assertEqual(self._bad("import shutil\nm = shutil\nm.which('z')\n"), [])
+        self.assertEqual(self._bad("class X:\n    def f(self):\n        import shutil\n        m = shutil\n        return m.which('z')\n"), [])
 
 
 class SpawnSiteBehaviourTests(unittest.TestCase):
