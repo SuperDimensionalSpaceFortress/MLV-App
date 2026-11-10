@@ -26,6 +26,7 @@ import shutil
 import subprocess
 import tempfile
 import unittest
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -116,6 +117,21 @@ class AssemblerRequiresHeavySlotDeadlineTests(unittest.TestCase):
         self.assertEqual(done.returncode, 3, done.stdout + done.stderr)
         self.assertNotIn("STAGE_NO_HEAVY_SLOT_DEADLINE", done.stdout)
 
+    @windows_only_assembler
+    def test_boundary_malformed_non_utc_offset_and_near_expiry_pass_the_gate_unjudged(self) -> None:
+        # Dot 791-I1 item 2, the ASSEMBLER's layer: the gate asks only "was one given". A malformed, non-UTC-offset or nearly expired value is
+        # not its to judge -- it goes on to the next step (exit 3, STEP=dllPairDir) exactly like a valid one. The layer that refuses a malformed
+        # value is build-guard (BUILD_HEAVY_SLOT_REFUSED reason=invalid-option, exit 2; tests/coordination/test_build_guard.py test_boundary_*)
+        # and, one level up, the tracked chain (STAGE_CHAIN_REFUSED reason=invalid-deadline; test_stage_chain_deadline_boundaries). No layer
+        # refuses a deadline that is merely too close (unproved contract limit, named in the PR body and pinned in the chain tests).
+        soon = (datetime.now(timezone.utc) + timedelta(minutes=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        for name, value in (("malformed", "not-a-date"), ("non-utc-offset", "2099-01-01T05:00:00+05:00"), ("expires-inside-a-minimum-window", soon)):
+            with self.subTest(boundary=name):
+                done = self._run(value)
+                self.assertEqual(done.returncode, 3, done.stdout + done.stderr)
+                self.assertIn("STEP=dllPairDir", done.stdout)
+                self.assertNotIn("STAGE_NO_HEAVY_SLOT_DEADLINE", done.stdout)
+
     def test_the_check_runs_before_the_first_step_that_writes_or_queues(self) -> None:
         text = ASSEMBLER.read_text(encoding="utf-8")
         # Anchor on the EXECUTABLE statement, not the first mention of the token (the exit-code header comment also names it; adversary e7265eea-A1).
@@ -129,11 +145,9 @@ class AssemblerRequiresHeavySlotDeadlineTests(unittest.TestCase):
             self.assertIn(later, text, later)
             self.assertLess(check, text.index(later), f"the refusal must come before: {later}")
 
-    def test_the_tracked_chain_and_nightly_still_hand_the_assembler_a_deadline(self) -> None:
-        # Both tracked callers set the env in the assembler child's own environment; the refusal must never trip them.
-        nightly = (ROOT / "tools" / "profiling" / "dual-venue" / "Invoke-VenueStageNightly.ps1").read_text(encoding="utf-8")
-        self.assertRegex(nightly, r"Invoke-Child 'assemble' \$Assembler @\([^)]*\) -ChildEnv @\{ MLV_HEAVY_SLOT_DEADLINE_UTC = ")
-        self.assertRegex(CHAIN.read_text(encoding="utf-8"), re.escape("$psi.Environment['MLV_HEAVY_SLOT_DEADLINE_UTC']"))
+    # The r1 test here (test_the_tracked_chain_and_nightly_still_hand_the_assembler_a_deadline) matched two regexes against the callers' TEXT. It is
+    # replaced, not kept beside: the callers are now read from the PowerShell syntax tree (test_stage_chain_deadline_boundaries.
+    # TrackedAssemblerCallerAstTests, with widening mutations) and the chain's hand-over is observed at run time (StageChainPropagationTests).
 
 
 PSM1 = ROOT / "tools" / "profiling" / "bachelor" / "AttrCudaArtifacts.psm1"
@@ -189,7 +203,8 @@ class WindowsOnlyContractTests(unittest.TestCase):
         cls = AssemblerRequiresHeavySlotDeadlineTests
         scoped = sorted(n for n in dir(cls) if getattr(getattr(cls, n), "windows_only_assembler", False))
         self.assertEqual(scoped, ["test_a_caller_that_sets_the_deadline_is_not_changed",
-                                  "test_an_already_passed_deadline_is_not_a_refusal_here"])
+                                  "test_an_already_passed_deadline_is_not_a_refusal_here",
+                                  "test_boundary_malformed_non_utc_offset_and_near_expiry_pass_the_gate_unjudged"])
         for name in scoped:
             method = getattr(cls, name)
             if os.name != "nt":
