@@ -236,10 +236,14 @@ def _could_name(built: str, known: bool, names) -> bool:
     if _WILD not in built:  # every uncertainty is a wildcard, so a text without one is exact whatever `known` says
         return any(built == n or re.fullmatch(r"(?:\w+\.)+" + re.escape(n), built) for n in names)
     pieces = [p for p in re.split(re.escape(_WILD) + "+", built)]
-    if not any(len(re.findall(r"\w", p)) >= 3 for p in pieces):
-        return False  # wildcards with (almost) no literal text around them say nothing about the text
     pattern = ".*".join(re.escape(p) for p in pieces)
-    return any(re.fullmatch(pattern, n) or re.fullmatch(pattern, "a." + n) for n in names)
+    lead = pieces[0][:pieces[0].rfind(".") + 1]  # the dotted receiver the text itself spells: 'loop.subprocess_*' -> 'loop.'
+    for prefix in ("", "a.", "a.b.", lead):
+        # the literal text that is not the receiver must say something about the name: 'allowed_roots.*' is a receiver and nothing else
+        core = [pieces[0][len(lead):] if prefix == lead and lead else pieces[0]] + pieces[1:]
+        if any(len(re.findall(r"\w", p)) >= 3 for p in core) and any(re.fullmatch(pattern, prefix + n) for n in names):
+            return True
+    return False
 
 
 def _fold_args(args: list[ast.AST], keywords: list[ast.keyword], consts: dict[str, str], depth: int):
@@ -683,10 +687,12 @@ def _collect_binders(tree: ast.AST) -> tuple[dict[str, list], set[str], set[str]
     return binders, imports, own, import_src
 
 
-def _string_consts(binders: dict[str, list]) -> dict[str, str]:
-    """Names whose ONLY binding is one plain string literal: ``TEST_MODULE = "pkg.mod"``."""
+def _string_consts(binders: dict[str, list], imported: dict[str, set[str]] | None = None) -> dict[str, str]:
+    """Names whose ONLY binding is one plain string literal: ``TEST_MODULE = "pkg.mod"``. An import that binds the name too
+    (``from os import __name__ as name``) is a second binding, so the literal is not its value."""
+    imported = imported or {}
     return {name: values[0].value for name, values in binders.items()
-            if len(values) == 1 and isinstance(values[0], ast.Constant) and isinstance(values[0].value, str)}
+            if len(values) == 1 and isinstance(values[0], ast.Constant) and isinstance(values[0].value, str) and name not in imported}
 
 
 class _Facts:
@@ -699,7 +705,7 @@ class _Facts:
 
     def __init__(self, tree: ast.AST) -> None:
         self.binders, self.imports, self.own, self.import_src = _collect_binders(tree)
-        self.consts = _string_consts(self.binders)
+        self.consts = _string_consts(self.binders, self.import_src)
         self.modules: dict[str, str] = {}
         self.funcs: dict[str, tuple[str, str]] = {}
         self.ambiguous: set[str] = set()
@@ -731,6 +737,15 @@ class _Facts:
                 self.ambiguous.add(name)
             return False
         self.modules[name] = module
+        return True
+
+    def _bind_importer(self, name: str, kind: str) -> bool:
+        """``load`` bound to ``import_module`` and to ``__import__`` returns different modules for the same call: the name is ambiguous, not whichever came first."""
+        if name in self.importers:
+            if self.importers[name] != kind:
+                self.ambiguous.add(name)
+            return False
+        self.importers[name] = kind
         return True
 
     def _bind_func(self, name: str, target: tuple[str, str]) -> bool:
@@ -769,9 +784,9 @@ class _Facts:
             if node.module in ("importlib", "builtins"):
                 for a in node.names:
                     if a.name in _IMPORT_FUNCS:
-                        self.importers.setdefault(a.asname or a.name, a.name)
+                        self._bind_importer(a.asname or a.name, a.name)
                     elif a.name == "*":
-                        self.importers.setdefault("import_module", "import_module")
+                        self._bind_importer("import_module", "import_module")
             if origin in _TRACKED_MODULES:
                 for a in node.names:
                     if a.name == "*":
@@ -809,8 +824,7 @@ class _Facts:
         elif isinstance(value, ast.Name):
             if value.id in self.funcs and self._bind_func(name, self.funcs[value.id]):
                 learned.append(name)
-            if value.id in self.importers and name not in self.importers:
-                self.importers[name] = self.importers[value.id]
+            if value.id in self.importers and self._bind_importer(name, self.importers[value.id]):
                 learned.append(name)
             if value.id in self.helper_modules and name not in self.helper_modules:
                 self.helper_modules[name] = self.helper_modules[value.id]
@@ -821,8 +835,7 @@ class _Facts:
                 if self._bind_func(name, (base, value.attr)):
                     learned.append(name)
             elif (isinstance(value.value, ast.Name) and value.value.id in self.helper_modules
-                  and value.attr in _IMPORT_FUNCS and name not in self.importers):
-                self.importers[name] = value.attr
+                  and value.attr in _IMPORT_FUNCS and self._bind_importer(name, value.attr)):
                 learned.append(name)
         if name not in self.imported and self._imported_root(value):  # `s = shutil`, `p = os.path`: still an imported module under another name
             self.imported.add(name)
@@ -1409,6 +1422,10 @@ def _unescape_ps(script: str) -> str:
                 out.append(nxt)
                 i += 2
                 continue
+            if quote[i] == "" and nxt in " \t":
+                out.append("\x02")  # outside quotes an escaped space is part of the SAME word (`foo` -WindowStyle` Hidden` is one argument): never a boundary
+                i += 2
+                continue
             if quote[i] == '"' and nxt in _PS_ESCAPE_LETTERS:
                 out.append(ch)
             out.append(nxt)
@@ -1509,7 +1526,8 @@ def _string_values(tree: ast.AST) -> list[tuple[int, str, bool]]:
     reported as run-time built (fail closed) instead of being guessed at.
     """
     out: list[tuple[int, str, bool]] = []
-    named_strings = _string_consts(_collect_binders(tree)[0])
+    collected = _collect_binders(tree)
+    named_strings = _string_consts(collected[0], collected[3])
 
     def literal_text(node: ast.AST) -> str | None:
         """The text of a ``+`` tree whose every leaf is a string literal, in either nesting (``'a' + ('b' + 'c')`` too); else None."""
@@ -3228,6 +3246,45 @@ class AdversaryR7Tests(unittest.TestCase):
         for expr in ("'%²subprocess_exec' % 's'", "'%." + "٣" + "subprocess_exec' % 's'", "'%" + digits + "subprocess_exec' % 's'"):
             self._bad(self._launch(expr))  # a `%` field Python itself rejects never yields a string: only that the scan does not crash
             _flatten(ast.parse(expr, mode="eval").body, {})
+
+    # --- pass 17 (review-adversary-MLV-LANE-CONSOLE-HIDDEN-1-r7-43fd2bec) A1-A4, as classes ---
+    def test_pass17_a1_a_name_that_an_import_also_binds_is_not_the_literal_it_was_assigned(self):
+        for label, src in {
+            "dynamic import by name": "name = 'math'\nfrom os import __name__ as name\nm = __import__(name)\nm.system('cmd.exe /c exit')\n",
+            "folded spawn name": "piece = 'wrong'\nfrom os import __name__ as piece\ngetattr(loop, '{}ubprocess_exec'.format(piece[1:]))(factory, 'cmd.exe')\n",
+            "plain import as": "name = 'math'\nimport os as name\nm = __import__(name)\nm.system('x')\n",
+            "import after": "from os import __name__ as name\nname = 'math'\nm = __import__(name)\nm.system('x')\n",
+        }.items():
+            self.assertGreaterEqual(len(self._bad(src)), 1, label)
+        self.assertEqual(self._ps("'sap{} cmd.exe'.format(piece[1:])\nfrom os import __name__ as piece\npiece = 'wrong'"), (1, 1))
+        self.assertEqual(self._bad("name = 'json'\nm = __import__(name)\nm.dumps(1)\n"), [])  # the ordinary once-bound literal is still followed
+
+    def test_pass17_a2_a_wildcard_name_behind_any_dotted_receiver_is_reported(self):
+        for expr in ("'loop.subprocess_' + kind", "'self.loop.subprocess_' + kind", "'{}.subprocess_exec'.format(x)", "f'{a}.{b}.subprocess_exec'",
+                     "'loop.subprocess_%s' % kind", "'loop.' + 'subprocess_' + kind", "'a.b.c.subprocess_' + kind", "'%s.subprocess_' % kind + k2"):
+            self.assertGreaterEqual(len(self._bad(self._launch(expr))), 1, expr)
+        self.assertGreaterEqual(len(self._bad("import asyncio, operator\nasync def f(kind, holder):\n    operator.attrgetter('loop.subprocess_' + kind)(holder)(1)\n")), 1)
+        self.assertEqual(self._bad(self._launch("'loop.value_' + kind")), [])
+
+    def test_pass17_a3_an_escaped_space_outside_quotes_does_not_split_a_word(self):
+        for ps in ("Start-Process cmd.exe -ArgumentList /c` exit` -WindowStyle` Hidden", "saps cmd.exe -ArgumentList foo` -WindowStyle` Hidden",
+                   "start cmd.exe -ArgumentList foo` -WindowStyle` Hidden", "Start-Process cmd.exe -ArgumentList foo` -WindowStyle:Hidden",
+                   "Start-Process cmd.exe foo`\t-WindowStyle Hidden"):
+            self.assertEqual(self._ps(repr(ps)), (1, 1), ps)
+        for ps in ("Start-Process cmd.exe -ArgumentList /c -WindowStyle Hidden", "Start-Process cmd.exe -ArgumentList a`  -WindowStyle Hidden",
+                   "Start-Pro`cess cmd.exe -WindowStyle Hidden", "saps cmd.exe -WindowStyle` Hidden".replace("` ", " ")):
+            self.assertEqual(self._ps(repr(ps)), (1, 0), ps)  # a real parameter still counts
+
+    def test_pass17_a4_a_name_bound_to_two_import_functions_is_reported_not_resolved_by_the_first(self):
+        for label, src in {
+            "alias then rebind": "from importlib import import_module as load\nload = __import__\nm = load('asyncio.base_events', fromlist=[])\nasync def f():\n    await m.create_subprocess_exec('cmd.exe')\n",
+            "two from-imports": "from importlib import import_module as load\nfrom builtins import __import__ as load\nm = load('asyncio.base_events', fromlist=[])\nm.create_subprocess_exec('cmd.exe')\n",
+            "reverse direction": "from builtins import __import__ as load\nfrom importlib import import_module as load\nm = load('asyncio.windows_utils')\nm.Popen(['cmd.exe'])\n",
+            "attribute then name": "import importlib\nload = importlib.import_module\nload = __import__\nm = load('shutil')\nm.os.system('x')\n",
+        }.items():
+            self.assertGreaterEqual(len(self._bad(src)), 1, label)
+        self.assertEqual(self._bad("from importlib import import_module as load\nfrom importlib import import_module as load\nm = load('json')\nm.dumps(1)\n"), [])
+        self.assertEqual(self._bad("import importlib\nload = importlib.import_module\nm = load('json')\nm.dumps(1)\n"), [])
 
     def test_over_reporting_stays_inside_the_names_and_keywords(self):
         for expr in ("'{}ubprocess_exec'.format('z')", "'subprocess_exec_' + 'x'", "f'{name}_value'", "'%s: %d' % (a, b)", "'{}'.format(x)", "''.join({'x'})",
