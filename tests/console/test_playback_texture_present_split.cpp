@@ -444,6 +444,92 @@ TEST(PlaybackTexturePresentSplit, ViewportRecordsAmazePartsAndMainWindowGatesOnT
     ASSERT_NE( std::string::npos, mw.find( "telemetryBoolValue( timing, \"gpu_playback_recon_amaze_texture_present_active\" ) ) )" ) );
 }
 
+// Fix 2, adversary A1 on 3390ee51: Loop on, cut 0..719, presenting 719 while frame 0's lookahead recon already holds
+// its retained Bayer16. Both slots hold a token: another frame's is ready (the old "published frame > presented
+// frame" test said 0 > 719, no).
+TEST(PlaybackTexturePresentSplit, AheadCandidateCountsALoopWrappedLookahead)
+{
+    ASSERT_TRUE( playback_texture_split::aheadCandidateReady( 2, true ) );
+    ASSERT_TRUE( playback_texture_split::aheadCandidateReady( 1, false ) );
+}
+
+// Fix 2, adversary A2 on 3390ee51: frame 101's recon published token 17 and then rejected and released it; the slot
+// count went +1 and -1, so only the presented frame's own token is held: no candidate (the old marker kept 101).
+TEST(PlaybackTexturePresentSplit, AheadCandidateIgnoresAReleasedPublication)
+{
+    int held = 1;   // the presented frame 100's own slot
+    ++held;         // frame 101 publishes token 17 into its slot
+    --held;         // ...which the final validation rejects and releases
+    ASSERT_FALSE( playback_texture_split::aheadCandidateReady( held, true ) );
+    ASSERT_FALSE( playback_texture_split::aheadCandidateReady( 0, false ) );
+}
+
+// The slot count is conserved: every RenderFrameThread site that releases a slot's retained token also takes it off the
+// count, and the one publish site adds it (a new release site without the decrement reds here).
+TEST(PlaybackTexturePresentSplit, RetainedSlotCountTracksEveryPublishAndRelease)
+{
+    const std::string rft = readRepoFile( QStringLiteral( "platform/qt/RenderFrameThread.cpp" ) );
+    const auto count = [&rft]( const std::string &needle )
+    {
+        size_t n = 0;
+        for( size_t at = rft.find( needle ); at != std::string::npos; at = rft.find( needle, at + needle.size() ) ) ++n;
+        return n;
+    };
+    const size_t releases = count( "llrpGpuPlaybackReconReleaseRetainedDeviceBayer16(" );
+    ASSERT_EQ( size_t( 3 ), releases );
+    ASSERT_EQ( releases, count( "m_retainedDeviceBayer16SlotsHeld.fetch_sub( 1, std::memory_order_acq_rel );" ) );
+    ASSERT_EQ( size_t( 1 ), count( "m_retainedDeviceBayer16SlotsHeld.fetch_add( 1, std::memory_order_acq_rel );" ) );
+    const std::string mw = readRepoFile( QStringLiteral( "platform/qt/MainWindow.cpp" ) );
+    ASSERT_NE( std::string::npos, mw.find( "m_pRenderThread->retainedDeviceBayer16SlotsHeld()," ) );
+    ASSERT_NE( std::string::npos, mw.find( "task.gpuPlaybackReconTextureRetainedDeviceToken != 0 ) );" ) );
+}
+
+// Fix 2, adversary A3 on 3390ee51: a fallback present (no texture parts), then the path's FIRST texture present skips a
+// frame as gui_late. The split excludes that first present, so the slip sums must not carry it either.
+TEST(PlaybackTexturePresentSplit, ExcludedFirstTexturePresentIsInNoSlipSum)
+{
+    const double fps = 60.0;
+    playback_slip::SlipHistogram h;
+    h.reset( 0, fps );
+    Aggregator split;
+    int timeline = 0;
+    const auto move = [&]( int pos, double ms )
+    {
+        h.noteTimelineMove( playback_slip::AdvancePath::DropTick, pos, ms, pos - timeline, 0.0 );
+        timeline = pos;
+    };
+    move( 1, 1000.0 );
+    playback_slip::PresentSample fallback;
+    fallback.displayFrame = 0;
+    fallback.presentMs = 1001.0;
+    fallback.readyKnown = true;
+    fallback.readyMs = 999.0;
+    fallback.drawMs = 5.0;
+    fallback.timelinePosition = timeline;
+    fallback.textureKnown = false;
+    h.notePresent( fallback );
+    move( 2, 1016.667 );
+    move( 3, 1033.333 );
+    playback_slip::PresentSample first;
+    first.displayFrame = 2;
+    first.presentMs = 1081.0;
+    first.readyKnown = true;
+    first.readyMs = 1001.0;
+    first.drawMs = 80.0;
+    first.timelinePosition = timeline;
+    first.texture = makeSample( 50.0, 1.0, 80.0 );
+    first.texture.at( Part::Wall ) = 123.5;
+    first.textureKnown = split.note( first.texture );   // as MainWindow does
+    h.notePresent( first );
+    const playback_slip::Summary sum = h.finish( 1100.0, timeline );
+    ASSERT_EQ( 1LL, sum.classFrames[static_cast<int>( playback_slip::SlipClass::GuiLate )] );
+    ASSERT_FALSE( first.textureKnown );
+    ASSERT_EQ( 0, split.path( Path::Window ).frames() );
+    ASSERT_NEAR( 123.5, split.path( Path::Window ).firstWallMs(), 1e-9 );
+    ASSERT_EQ( 0, sum.textureGuiLateSlips[static_cast<size_t>( Path::Window )].events );
+    ASSERT_EQ( 0, sum.textureAllSlips[static_cast<size_t>( Path::Window )].events );
+}
+
 // Source pins: MainWindow feeds the split from values it already has, only in smoke sessions, and prints it.
 TEST(PlaybackTexturePresentSplit, MainWindowWiring)
 {
@@ -452,7 +538,7 @@ TEST(PlaybackTexturePresentSplit, MainWindowWiring)
     ASSERT_NE( mw.find( "const bool textureSplitSampled = m_playbackSmokeActive && m_pRenderThread;" ),
                std::string::npos );
     ASSERT_NE( mw.find( "m_playbackTextureSplit.reset();" ), std::string::npos );
-    ASSERT_NE( mw.find( "m_playbackTextureSplit.note( tx );" ), std::string::npos );
+    ASSERT_NE( mw.find( "slipSample.textureKnown = m_playbackTextureSplit.note( tx );" ), std::string::npos );
     ASSERT_NE( mw.find( "playback_texture_split::formatLine(" ), std::string::npos );
     ASSERT_NE( mw.find( "playback_texture_split::formatSlipFields( r.textureKnown, r.texture )" ), std::string::npos );
 }

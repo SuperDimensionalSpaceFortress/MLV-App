@@ -1390,7 +1390,6 @@ bool RenderFrameThread::isIdleExceptPlaybackLookaheadLocked( int activePlaybackT
 void RenderFrameThread::resetPipelineOverlapMeter( void )
 {
     m_overlapMeter.reset( mlv_stage_timing_now() * 1000.0 );
-    m_retainedDeviceBayer16PublishedFrame.store( -1, std::memory_order_release );
 }
 
 playback_overlap::OverlapSnapshot RenderFrameThread::pipelineOverlapSnapshot( void )
@@ -1844,6 +1843,7 @@ bool RenderFrameThread::acquireReadySlotLocked( ReadyFrame *frame,
             {
                 llrpGpuPlaybackReconReleaseRetainedDeviceBayer16(
                     older.gpuPlaybackReconTextureRetainedDeviceToken );
+                m_retainedDeviceBayer16SlotsHeld.fetch_sub( 1, std::memory_order_acq_rel );   // K1
                 older.gpuPlaybackReconTextureRetainedDeviceBayer16 = nullptr;
                 older.gpuPlaybackReconTextureRetainedDeviceWidth = 0;
                 older.gpuPlaybackReconTextureRetainedDeviceHeight = 0;
@@ -2909,9 +2909,8 @@ void RenderFrameThread::reconFrameForWorker( const ReconQueueEntry &entry,
                 slot.gpuPlaybackReconTextureRetainedDeviceToken =
                     retainedDevice.token;
                 gpuPlaybackReconTextureRetainedDeviceAvailable = true;
-                // K1 (texture-present split): one atomic store, no clock read
-                m_retainedDeviceBayer16PublishedFrame.store(
-                    static_cast<int>( entry.request.frameNumber ), std::memory_order_release );
+                // K1 (texture-present split): the slot now holds a token (one atomic add, no clock read)
+                m_retainedDeviceBayer16SlotsHeld.fetch_add( 1, std::memory_order_acq_rel );
                 if( gpuTexNrOverlapTraceEnabled() )
                 {
                     qInfo().nospace()
@@ -3005,6 +3004,7 @@ void RenderFrameThread::reconFrameForWorker( const ReconQueueEntry &entry,
                 {
                     llrpGpuPlaybackReconReleaseRetainedDeviceBayer16(
                         slot.gpuPlaybackReconTextureRetainedDeviceToken );
+                    m_retainedDeviceBayer16SlotsHeld.fetch_sub( 1, std::memory_order_acq_rel );   // K1
                 }
                 slot.gpuPlaybackReconTextureRetainedDeviceBayer16 = nullptr;
                 slot.gpuPlaybackReconTextureRetainedDeviceWidth = 0;
@@ -3981,6 +3981,7 @@ void RenderFrameThread::releaseSlotLocked( int slotIndex )
     {
         llrpGpuPlaybackReconReleaseRetainedDeviceBayer16(
             slot.gpuPlaybackReconTextureRetainedDeviceToken );
+        m_retainedDeviceBayer16SlotsHeld.fetch_sub( 1, std::memory_order_acq_rel );   // K1
         slot.gpuPlaybackReconTextureRetainedDeviceBayer16 = nullptr;
         slot.gpuPlaybackReconTextureRetainedDeviceWidth = 0;
         slot.gpuPlaybackReconTextureRetainedDeviceHeight = 0;

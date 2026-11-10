@@ -5944,11 +5944,12 @@ void MainWindow::presentPlaybackPreparedFrame( const PlaybackPrepResult &result 
             readyFrame.stageTimingTelemetry.insert(
                 QStringLiteral("gpu_playback_recon_texture_present_recon_in_flight"),
                 playback_overlap::reconRanBetween( textureReconBefore, textureReconAfter ) );
-            // a later frame's retained device Bayer16 was already published when this present returned
+            // another frame's retained device Bayer16 was held by its slot when this present returned (fix 2: token-level)
             readyFrame.stageTimingTelemetry.insert(
                 QStringLiteral("gpu_playback_recon_texture_present_ahead_candidate_ready"),
-                static_cast<qint64>( m_pRenderThread->lastRetainedDeviceBayer16PublishedFrame() )
-                    > static_cast<qint64>( readyFrame.frameNumber ) );   // -1 (none published) is never ahead
+                playback_texture_split::aheadCandidateReady(
+                    m_pRenderThread->retainedDeviceBayer16SlotsHeld(),
+                    task.gpuPlaybackReconTextureRetainedDeviceToken != 0 ) );
             readyFrame.stageTimingTelemetry.insert(
                 QStringLiteral("gpu_playback_recon_texture_present_by_window"),
                 gpuPlaybackReconAmazeTexturePresentedByWindow );
@@ -27880,7 +27881,6 @@ void MainWindow::notePlaybackSmokePresentedFrame(
         {
             using playback_texture_split::Part;
             playback_texture_split::Sample &tx = slipSample.texture;
-            slipSample.textureKnown = true;
             tx.path = telemetryBoolValue( timing, "gpu_playback_recon_texture_present_by_window" )
                 ? playback_texture_split::Path::Window
                 : playback_texture_split::Path::Viewport;
@@ -27911,7 +27911,8 @@ void MainWindow::notePlaybackSmokePresentedFrame(
             tx.reconInFlight = telemetryBoolValue( timing, "gpu_playback_recon_texture_present_recon_in_flight" );
             tx.aheadCandidateReady =
                 telemetryBoolValue( timing, "gpu_playback_recon_texture_present_ahead_candidate_ready" );
-            m_playbackTextureSplit.note( tx );
+            // fix 2 (A3): only a sample the split counted reaches the slip sums (the path's first present is in neither)
+            slipSample.textureKnown = m_playbackTextureSplit.note( tx );
         }
         m_playbackSlipHistogram.notePresent( slipSample );
         if( m_playbackPresentTrace.active() )

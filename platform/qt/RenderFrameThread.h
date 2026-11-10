@@ -421,11 +421,14 @@ public:
     void resetPipelineOverlapMeter( void );
     playback_overlap::OverlapSnapshot pipelineOverlapSnapshot( void );
     /* HFR-NATIVE-M16-1457-GUI-TEXTURE-PRESENT-OFFLOAD-1 K1: lock-free, no clock read (the GUI samples both around one
-     * texture present). The second is the newest frame whose recon published a retained device Bayer16, or -1. */
+     * texture present). The second is how many frame slots hold a retained device Bayer16 token now: +1 where a recon
+     * publishes one into its slot, -1 at every slot release of a token (stale-ready discard, validation reject,
+     * releaseSlotLocked). Fix 2 (adversary A1/A2 on 3390ee51): token-level, so a loop-wrapped lookahead counts and a
+     * rejected or released publication does not. */
     playback_overlap::ReconActivity pipelineReconActivity( void ) const { return m_overlapMeter.reconActivity(); }
-    int lastRetainedDeviceBayer16PublishedFrame( void ) const
+    int retainedDeviceBayer16SlotsHeld( void ) const
     {
-        return m_retainedDeviceBayer16PublishedFrame.load( std::memory_order_acquire );
+        return m_retainedDeviceBayer16SlotsHeld.load( std::memory_order_acquire );
     }
     bool acquireLatestReadyFrame( ReadyFrame *frame );
     bool acquireOldestGpuTextureNoReadbackReadyFrame( ReadyFrame *frame );
@@ -751,7 +754,7 @@ private:
     std::deque<DecodeQueueEntry> m_decodeRequests;
     std::atomic<uint64_t> m_decodeRequestsIssuedCount{ 0 };
     playback_overlap::OverlapMeter m_overlapMeter;
-    std::atomic<int> m_retainedDeviceBayer16PublishedFrame{ -1 };   // K1 (texture-present split); -1 at each reset
+    std::atomic<int> m_retainedDeviceBayer16SlotsHeld{ 0 };   // K1 (texture-present split); never reset (conserved)
     bool downstreamFrameInFlightLocked( int excludeSlotIndex ) const;
     bool upstreamWorkInFlightLocked( int excludeSlotIndex ) const;
     std::deque<ReconQueueEntry> m_reconRequests;

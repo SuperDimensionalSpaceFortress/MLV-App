@@ -96,6 +96,16 @@ inline bool sampleEligible( bool setupTimingKnown, bool amazeTexturePresented )
     return setupTimingKnown && amazeTexturePresented;
 }
 
+/*! Fix 2 (adversary A1/A2 on 3390ee51): a retained device Bayer16 other than this present's own was held by a frame
+ *  slot when this present returned, i.e. a later frame's recon output that an AMaZE-ahead stage could already have
+ *  used. Token-level, so a loop-wrapped lookahead (frame 0 while presenting the last frame) counts, and a publication
+ *  the recon rejected and released, or a stale frame already discarded, does not. \a slotsHoldingRetained:
+ *  RenderFrameThread::retainedDeviceBayer16SlotsHeld(); \a presentHoldsRetained: this present's own slot holds one. */
+inline bool aheadCandidateReady( int slotsHoldingRetained, bool presentHoldsRetained )
+{
+    return slotsHoldingRetained - ( presentHoldsRetained ? 1 : 0 ) > 0;
+}
+
 /*! One texture present, as MainWindow has it after the presenter returned. */
 struct Sample
 {
@@ -154,13 +164,15 @@ inline double percentile( std::vector<double> v, double q )
 class PathAggregator
 {
 public:
-    void note( const Sample &s )
+    /*! Returns whether \a s was counted (false for the path's first present). Fix 2 (adversary A3 on 3390ee51): the
+     *  caller hands ONLY counted samples to the slip histogram, so the excluded first present is in no slip sum. */
+    bool note( const Sample &s )
     {
         if( !m_firstSeen )
         {
             m_firstSeen = true;
             m_firstWallMs = s.at( Part::Wall );
-            return;
+            return false;
         }
         m_sums.add( s );
         if( s.painted ) ++m_painted;
@@ -170,6 +182,7 @@ public:
             if( static_cast<Part>( i ) == Part::TailWindow && !s.tailWindowKnown ) continue;
             m_values[static_cast<size_t>( i )].add( s.ms[static_cast<size_t>( i )] );
         }
+        return true;
     }
 
     bool any() const { return m_firstSeen; }
@@ -209,10 +222,10 @@ class Aggregator
 {
 public:
     void reset() { *this = Aggregator(); }
-    void note( const Sample &s )
+    bool note( const Sample &s )
     {
-        if( s.path == Path::Count ) return;
-        m_paths[static_cast<size_t>( s.path )].note( s );
+        if( s.path == Path::Count ) return false;
+        return m_paths[static_cast<size_t>( s.path )].note( s );
     }
     const PathAggregator &path( Path p ) const { return m_paths[static_cast<size_t>( p )]; }
 
