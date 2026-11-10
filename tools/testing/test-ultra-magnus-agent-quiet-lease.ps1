@@ -1414,7 +1414,9 @@ try {
             # r8/r9: 'complete' = ' attempts=<n> ' then tmp=removed | tmp=unknown(E) | a retained header whose OWN bound path is a well-formed tmp file
             # (<dir>\<name>.json.<32 hex>.tmp), then '<Type>: '. 'tmp_remaining=bogus' and 'tmp_remaining=C:\bad\o.tmp IOException: see C:\y\z.json.<g>.tmp'
             # are free text. Every ' attempts=<n> ' in the tail is a candidate start, so a complete header spelled inside a malformed one still counts.
-            foreach ($cand in $script:SidecarAttemptsStartRx.Matches($rest, $hdr.end)) {
+            # The scan starts ONE character before the header's end: the header's '<Type>: ' consumed the space the next ' attempts=<n> ' needs
+            # (adversary r9 A1: a second header placed directly after the first was invisible).
+            foreach ($cand in $script:SidecarAttemptsStartRx.Matches($rest, $hdr.end - 1)) {
                 $a = $script:SidecarAttemptsRx.Match($rest, $cand.Index)
                 if (-not $a.Success) { continue }
                 $q = $cand.Index + $a.Length
@@ -2981,6 +2983,13 @@ function Exit-HeavySlot {
         # a malformed second header does not hide a COMPLETE header inside its own exception text (every ' attempts=<n> ' is a candidate start).
         $b1Nested = "SIDECAR-WRITE-FAILED job=j attempts=3 $b1Good attempts=3 tmp_remaining=C:\bad\other.tmp IOException: attempts=3 tmp=removed IOException: x"
         Assert-True ((Get-SidecarTmpStatus $b1Nested 'j') -ceq 'ambiguous') "cleanup-identifier(r9 B1): a complete header spelled inside a malformed header's exception text is still a second complete header: [$(Get-SidecarTmpStatus $b1Nested 'j')]"
+        # adversary r9 A1: the first header's own '<Type>: ' ends in the single space the next ' attempts=<n> ' candidate needs, so a second complete
+        # header placed DIRECTLY after the first (one space) is a candidate too; an extra space always was.
+        foreach ($st in @('tmp=removed IOException: x', 'tmp=unknown(E) IOException: x', "tmp_remaining=C:\y\z.json.$z32.tmp IOException: x")) {
+            Assert-True ((Get-SidecarTmpStatus "SIDECAR-WRITE-FAILED job=j attempts=3 tmp_remaining=C:\x\j.json.$z32.tmp IOException: attempts=3 $st" 'j') -ceq 'ambiguous') "cleanup-identifier(r9 A1): a second complete header right after the first header's '<Type>: ' (one space) is ambiguous: [$st]"
+            Assert-True ((Get-SidecarTmpStatus "SIDECAR-WRITE-FAILED job=j attempts=3 tmp_remaining=C:\x\j.json.$z32.tmp IOException:  attempts=3 $st" 'j') -ceq 'ambiguous') "cleanup-identifier(r9 A1): control - the same with an extra space stays ambiguous: [$st]"
+        }
+        Assert-True ((Get-SidecarTmpStatus "SIDECAR-WRITE-FAILED job=j attempts=3 tmp_remaining=C:\x\j.json.$z32.tmp IOException: attempts=3 tmp_remaining=bogus IOException: x" 'j') -ceq 'tmp_remaining=') "cleanup-identifier(r9 A1): control - a bogus second header directly after the first stays free text"
         # the first and second headers are read by ONE helper, so a path the first refuses cannot be accepted by the second: a second header whose own
         # file is a wrong-job-shaped but well-formed tmp path is complete (any job), and one whose path ends only in '.tmp' is not.
         Assert-True ((Get-SidecarTmpStatus "SIDECAR-WRITE-FAILED job=j attempts=3 $b1Good attempts=3 tmp_remaining=C:\y\xj.json.$z32.tmp IOException: x" 'j') -ceq 'ambiguous' -and (Get-SidecarTmpStatus "SIDECAR-WRITE-FAILED job=j attempts=3 $b1Good attempts=3 tmp_remaining=C:\y\z.tmp IOException: x C:\q\z.json.$z32.tmp IOException: y" 'j') -ceq 'tmp_remaining=') "cleanup-identifier(r9 B1): shared binding - any well-formed second path is a complete header; a path that is only '*.tmp' is not, whatever follows it"
