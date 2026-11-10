@@ -1660,6 +1660,21 @@ def _hidden_names(tree: ast.AST, facts: _Facts) -> tuple[set[str], set[str]]:
     return names, receivers
 
 
+def _reported_when_too_deep(on_deep):
+    """A scan that runs out of stack on an expression nested deeper than the fold reads (``'x'`` followed by a thousand ``.lower()``) REPORTS the source
+    (``on_deep``) instead of crashing: a source the scan cannot read is never a clean one (r9 pass-24 A4, r10 pass-27 A2)."""
+    def wrap(scan):
+        @functools.wraps(scan)
+        def guarded(*args, **kwargs):
+            try:
+                return scan(*args, **kwargs)
+            except RecursionError:
+                return on_deep(*args, **kwargs)
+        return guarded
+    return wrap
+
+
+@_reported_when_too_deep(lambda source, label: [f"{label}:1 holds an expression nested too deep for the scan to read, so it is REPORTED"])
 def _unflagged_spawns_in_source(source: str, label: str) -> list[str]:
     tree = ast.parse(source, filename=label)
     _note_aliases(tree)
@@ -2051,6 +2066,7 @@ def _string_values(tree: ast.AST) -> list[tuple[int, str, bool]]:
     return out
 
 
+@_reported_when_too_deep(lambda py_source: (1, [1]))
 def _start_process_violations(py_source: str) -> tuple[int, list[int]]:
     """(number of PowerShell ``Start-Process`` / ``saps`` / ``start`` launch statements, whatever each one starts, python lines of those lacking an outer -WindowStyle Hidden).
 
@@ -4599,6 +4615,23 @@ class AdversaryR9Tests(unittest.TestCase):
             self.assertEqual(self._bad(prefix + self._launch(expr)), [], expr)
         for script in ("(prefix + 'saps cmd.exe)s') % ()", "(prefix + 'Start-Process cmd.exe}}s').format()"):
             self.assertEqual(self._ps(script), (1, 1), script)
+
+    # ---- r9 pass-24 A4 / r10 pass-27 A2: an expression nested deeper than the fold reads is reported, never a crash ----
+    def test_r10_a_deeply_nested_expression_is_reported_not_a_crash(self):
+        for body in ("'SUBPROCESS_EXEC'", "'x'", "'subprocess_exec'", "'xsubprocess_exec'"):
+            for depth, suffix in ((500, ".lower()"), (1000, ".strip()"), (3000, ".lower()")):
+                expr = body + suffix * depth
+                try:
+                    reported = self._bad(self._launch(expr))
+                except RecursionError:
+                    self.fail(f"RecursionError for {body} + {suffix!r} * {depth}")
+                self.assertGreaterEqual(len(reported), 1, (body, suffix, depth))
+        found, bad = _start_process_violations("value = 'x'" + ".strip()" * 1000 + "\n")
+        self.assertEqual((found, len(bad)), (1, 1))
+        # a source of ordinary depth is read as before
+        self.assertEqual(self._bad(self._launch("'SUBPROCESS_EXEC'.lower().strip().lower()")) != [], True)
+        self.assertEqual(self._bad(self._launch("'value'.lower().strip()")), [])
+        self.assertEqual(_start_process_violations("value = 'x'.strip()\n"), (0, []))
 
 
 if __name__ == "__main__":
