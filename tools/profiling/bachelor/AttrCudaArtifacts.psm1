@@ -7218,7 +7218,8 @@ function Get-AttrCudaSwapWindowRecord {
     $lastUtc = $null
     $appSwapMaxGapMs = $null
     $appSwapMaxGapBeforeSerial = $null
-    $swapRecords = @(if (-not [string]::IsNullOrEmpty($LogText)) { [regex]::Matches($LogText, '(?m)^(?:\[[^\]\r\n]*\] \[[A-Za-z]+\] (?:\[0x[0-9A-Fa-f]+\] )?)?playback_smoke\.gpu_window_swaps(?<fields>(?: [A-Za-z_][A-Za-z0-9_]*=[^\s]*)*)') })
+    # adversary r5 A2: the marker ends at whitespace or the end of the text, so a longer record name (gpu_window_swaps_debug) is never this record.
+    $swapRecords = @(if (-not [string]::IsNullOrEmpty($LogText)) { [regex]::Matches($LogText, '(?m)^(?:\[[^\]\r\n]*\] \[[A-Za-z]+\] (?:\[0x[0-9A-Fa-f]+\] )?)?playback_smoke\.gpu_window_swaps(?<fields>(?: [A-Za-z_][A-Za-z0-9_]*=[^\s]*)*)(?!\S)') })
     if ($swapRecords.Count -eq 0) { $why = 'no playback_smoke.gpu_window_swaps line with first_swap_utc/last_swap_utc in the run log' }
     else {
         $fields = $swapRecords[$swapRecords.Count - 1].Groups['fields'].Value
@@ -7268,9 +7269,10 @@ function Get-AttrCudaPlaybackTemporalCoverage {
     per edge kind -- head, tail, empty window -- over MaxGapMs at any origin): Get-DvPresentMonGapVerdict reads both to tell an app stall from
     lost PresentMon rows. The window comes from Get-AttrCudaSwapWindowRecord, the same reader the job-stop arm uses (PR #788 r2 sol B1).
     overBoundGapAtAppStall (PR #788 CoS G8) PLACES the over-bound internal gap, not only sizes it: when the record carries max_gap_before_serial
-    (the ordinal of the app's swap just before its longest gap), the in-window rows before PresentMon's over-bound internal gap, over every origin
-    that shows one, must bracket that ordinal within the job's own 2% count tolerance plus one row ($true placed, $false elsewhere). $null when
-    the record has no ordinal or no origin shows an over-bound internal gap.
+    (the ordinal of the app's swap just before its longest gap) and PresentTimesMs is given, the in-window PRESENTS before PresentMon's over-bound
+    internal gap, over every origin that shows one, must bracket that ordinal within the job's own 2% count tolerance plus one ($true placed,
+    $false elsewhere). Presents, not displayed rows: the display can change at half the swap rate (adversary r5 A1). $null when the record has
+    no ordinal, no presents are given, or no origin shows an over-bound internal gap.
     Cost (CoS G5/G7/G9): the rows are sorted ONCE; every origin is judged by two monotone pointers over the sorted rows (origins ascend, so the
     window only slides one way) and a sparse table of the inter-row gaps (largest gap in any row range in constant time), so no per-origin
     filter or sort; the lists are built by pipeline assignment, and the crossing scan stops as soon as the 1500-origin cap is certain to be
@@ -7301,7 +7303,14 @@ function Get-AttrCudaPlaybackTemporalCoverage {
         [object]$LatestAnchorTrusted,
 
         [Parameter(Mandatory = $true)]
-        [double]$MaxGapMs
+        [double]$MaxGapMs,
+
+        # Every present of the selected chain on PresentMon's clock (the display report's selectedPresentTimesMs), displayed or not: the swap-ordinal
+        # placement counts these, never the displayed rows (adversary r5 A1). Omitted or empty: no placement (overBoundGapAtAppStall $null).
+        [Parameter(Mandatory = $false)]
+        [AllowNull()]
+        [AllowEmptyCollection()]
+        [double[]]$PresentTimesMs = $null
     )
 
     # One typed reason, one return: this body is spliced into the generated job, whose scan admits no dynamic invocation (R3).
@@ -7393,8 +7402,10 @@ function Get-AttrCudaPlaybackTemporalCoverage {
     # order (internal only when strictly larger than the head, tail only when strictly larger than both); zero rows is the whole window, insufficient.
     $loRow = $n
     $hiRow = $n - 1
-    $rowsBeforeMin = $null
-    $rowsBeforeMax = $null
+    $presents = @($PresentTimesMs | Where-Object { $null -ne $_ } | Sort-Object)
+    $presentCount = $presents.Count
+    $presentsBeforeMin = $null
+    $presentsBeforeMax = $null
     $worst = $null
     # PR #788 r1 opus B3: an UPPER BOUND on the gaps over the ceiling that any one permitted origin shows. The app's one max_gap_ms can account for one
     # internal gap at most, so the receipt guard reads a stall as the app's only when this is exactly 1. adversary r3 A1/A2: an edge gap (head, tail, or an
@@ -7443,11 +7454,18 @@ function Get-AttrCudaPlaybackTemporalCoverage {
             if ((($startAtEarliestMs - $intervalLo[$k] + $windowMs) - $sorted[$hiRow]) -gt $MaxGapMs) { $tailOver = $true }
             $internalOver = $overPrefix[$hiRow] - $overPrefix[$loRow]
             if ($internalOver -gt $maxInternalOver) { $maxInternalOver = $internalOver }
-            if ($internalOver -ge 1) {
-                # CoS G8 placement: how many in-window rows precede the largest (over-ceiling) internal gap at this origin
-                $rowsBefore = $widest - $loRow
-                if ($null -eq $rowsBeforeMin -or $rowsBefore -lt $rowsBeforeMin) { $rowsBeforeMin = $rowsBefore }
-                if ($null -eq $rowsBeforeMax -or $rowsBefore -gt $rowsBeforeMax) { $rowsBeforeMax = $rowsBefore }
+            if ($internalOver -ge 1 -and $presentCount -gt 0) {
+                # CoS G8 placement: how many in-window PRESENTS (displayed or not; adversary r5 A1) precede the displayed row that ends the largest
+                # (over-ceiling) internal gap at this origin. Two lower-bound binary searches over the presents sorted once above.
+                $gapEndMs = $sorted[$widest]
+                $lb = 0; $ub = $presentCount
+                while ($lb -lt $ub) { $mid = ($lb + $ub) -shr 1; if ($presents[$mid] -lt $startMs) { $lb = $mid + 1 } else { $ub = $mid } }
+                $fromPresent = $lb
+                $lb = 0; $ub = $presentCount
+                while ($lb -lt $ub) { $mid = ($lb + $ub) -shr 1; if ($presents[$mid] -lt $gapEndMs) { $lb = $mid + 1 } else { $ub = $mid } }
+                $presentsBefore = $lb - $fromPresent
+                if ($null -eq $presentsBeforeMin -or $presentsBefore -lt $presentsBeforeMin) { $presentsBeforeMin = $presentsBefore }
+                if ($null -eq $presentsBeforeMax -or $presentsBefore -gt $presentsBeforeMax) { $presentsBeforeMax = $presentsBefore }
             }
         }
         # adversary r1 A2: an insufficient origin (zero rows is always insufficient) is never outvoted by a sufficient one; then the larger gap wins.
@@ -7461,20 +7479,21 @@ function Get-AttrCudaPlaybackTemporalCoverage {
     $worstRows = @(if ($worst.rows -gt 0) { $sorted[$worst.lo..$worst.hi] })
     $cov = Get-AttrCudaTemporalCoverage -TimeInMsValues $worstRows -WindowStartMs $worstStartMs -WindowEndMs ($worstStartMs + $windowMs) -MaxGapMs $MaxGapMs
     $anchorName = if ($worstOriginMs -eq 0.0) { 'earliest' } elseif ($worstOriginMs -eq $originSpanMs) { 'latest' } else { 'interior' }
-    # CoS G8: the app's longest gap follows its swap number appBeforeSerial; PresentMon's over-ceiling internal gap follows rowsBeforeMin..rowsBeforeMax
-    # in-window rows over the origins that show one. They are the same gap only when those ranges meet within the job's own count tolerance (2%,
-    # playback-attr-3-cuda-job.ps1 $presentMonJobStopMaxCountDeviation) plus one row (a first present PresentMon reports without an interval).
+    # CoS G8: the app's longest gap follows its swap number appBeforeSerial; PresentMon's over-ceiling internal gap follows presentsBeforeMin..Max
+    # in-window PRESENTS over the origins that show one (a present is a swap, displayed or not; the displayed rows can run at half the swap rate,
+    # adversary r5 A1). They are the same gap only when those ranges meet within the job's own present-vs-swap count tolerance (2%,
+    # playback-attr-3-cuda-job.ps1 $presentMonJobStopMaxCountDeviation) plus one present.
     $overBoundGapAtAppStall = $null
-    if ($null -ne $appBeforeSerial -and $null -ne $rowsBeforeMin) {
-        $placementToleranceRows = [Math]::Ceiling(0.02 * $appBeforeSerial) + 1
-        $overBoundGapAtAppStall = (($appBeforeSerial -ge ($rowsBeforeMin - $placementToleranceRows)) -and ($appBeforeSerial -le ($rowsBeforeMax + $placementToleranceRows)))
+    if ($null -ne $appBeforeSerial -and $null -ne $presentsBeforeMin) {
+        $placementTolerance = [Math]::Ceiling(0.02 * $appBeforeSerial) + 1
+        $overBoundGapAtAppStall = (($appBeforeSerial -ge ($presentsBeforeMin - $placementTolerance)) -and ($appBeforeSerial -le ($presentsBeforeMax + $placementTolerance)))
     }
     [pscustomobject]@{
         windowSource = 'app_swap_window'; unavailableReason = $null
         sufficient = [bool]$cov.sufficient; maxGapMs = $cov.maxGapMs; gapKind = $cov.gapKind
         anchor = $anchorName; windowFirstUtc = $firstUtc.ToString('o'); windowLastUtc = $lastUtc.ToString('o'); rowsInWindow = $worst.rows
         appSwapMaxGapMs = $appSwapMaxGapMs; overBoundGapCount = $overBoundGapCount; overBoundGapAtAppStall = $overBoundGapAtAppStall
-        appSwapMaxGapBeforeSerial = $appBeforeSerial; overBoundGapRowsBeforeMin = $rowsBeforeMin; overBoundGapRowsBeforeMax = $rowsBeforeMax
+        appSwapMaxGapBeforeSerial = $appBeforeSerial; overBoundGapPresentsBeforeMin = $presentsBeforeMin; overBoundGapPresentsBeforeMax = $presentsBeforeMax
     }
 }
 

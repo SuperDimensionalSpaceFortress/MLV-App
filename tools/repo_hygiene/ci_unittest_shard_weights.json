@@ -1279,7 +1279,7 @@
    "tools.repo_hygiene.test_presentmon_playback_window_gap.AdversaryR1Tests": 1.9,
    "tools.repo_hygiene.test_presentmon_playback_window_gap.AdversaryR2Tests": 6.3,
    "tools.repo_hygiene.test_presentmon_playback_window_gap.AdversaryR3Tests": 2.4,
-   "tools.repo_hygiene.test_presentmon_playback_window_gap.AppStallAttributionTests": 23.2,
+   "tools.repo_hygiene.test_presentmon_playback_window_gap.AppStallAttributionTests": 29.0,
    "tools.repo_hygiene.test_presentmon_playback_window_gap.JobWiringTests": 0.0,
    "tools.repo_hygiene.test_presentmon_playback_window_gap.PlaybackWindowCoverageTests": 9.8,
    "tools.repo_hygiene.test_presentmon_playback_window_gap.ReceiptGapGuardTests": 12.2,

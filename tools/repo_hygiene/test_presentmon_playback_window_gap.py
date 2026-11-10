@@ -396,20 +396,23 @@ def swap_stamps(values: list[str]) -> list[object]:
     return [None if o == "NULL" else o for o in out]
 
 
-def coverages(cases: list[tuple[list[float], str, str, str]]) -> list[dict]:
-    """Get-AttrCudaPlaybackTemporalCoverage over several (times, log, early, late) cases (late end trusted) in ONE pwsh process (a pwsh start and a
-    module import dominate a case's cost). The cases go through a file: a row list is larger than one environment variable may be."""
+def coverages(cases: list[tuple]) -> list[dict]:
+    """Get-AttrCudaPlaybackTemporalCoverage over several (times, log, early, late[, presents]) cases (late end trusted) in ONE pwsh process (a pwsh
+    start and a module import dominate a case's cost). The cases go through a file: a row list is larger than one environment variable may be.
+    `presents` (every present, displayed or not) is passed as -PresentTimesMs when given."""
     import tempfile
     with tempfile.TemporaryDirectory(prefix="pmg-cov-") as tmp:
         path = Path(tmp) / "cases.json"
         # ("s:" keeps ConvertFrom-Json from turning a bare ISO string into a DateTime, whose [string] form drops the milliseconds)
-        path.write_text(json.dumps([{"t": t, "log": log, "e": "s:" + e, "l": "s:" + l} for t, log, e, l in cases]), encoding="utf-8")
+        path.write_text(json.dumps([{"t": c[0], "log": c[1], "e": "s:" + c[2], "l": "s:" + c[3], "p": (c[4] if len(c) > 4 else None)} for c in cases]),
+                        encoding="utf-8")
         script = (f"Import-Module '{MODULE}' -Force\n"
                   "$rt = [Globalization.DateTimeStyles]::RoundtripKind; $ic = [Globalization.CultureInfo]::InvariantCulture\n"
                   "$out = foreach ($c in @(Get-Content -LiteralPath $env:PMG_CASES -Raw | ConvertFrom-Json)) {\n"
+                  "  $p = if ($null -eq $c.p) { $null } else { [double[]]@($c.p) }\n"
                   "  Get-AttrCudaPlaybackTemporalCoverage -TimeInMsValues ([double[]]@($c.t)) -LogText ([string]$c.log) "
                   "-EarliestAnchorUtc ([datetime]::Parse(([string]$c.e).Substring(2), $ic, $rt)) -LatestAnchorUtc ([datetime]::Parse(([string]$c.l).Substring(2), $ic, $rt)) "
-                  "-LatestAnchorTrusted $true -MaxGapMs 5000.0 }\n"
+                  "-LatestAnchorTrusted $true -MaxGapMs 5000.0 -PresentTimesMs $p }\n"
                   "ConvertTo-Json -InputObject @($out) -Compress -Depth 5\n")
         proc = run_pwsh(["-Command", script], env_extra={"PMG_CASES": str(path)})
     try:
@@ -488,11 +491,15 @@ class StrictSwapStampTests(unittest.TestCase):
         suffix = stampless + " (C:/build first_swap_utc=2026-11-09T00:00:01.000Z last_swap_utc=2026-11-09T00:00:40.000Z x/MainWindow.cpp:1)"
         proc, out = run_pwsh_json(f"Import-Module '{MODULE}' -Force\n"
                                   "$o = foreach ($l in @($env:PMG_LOGS | ConvertFrom-Json)) { Get-AttrCudaSwapWindowRecord -LogText $l }\n"
-                                  "ConvertTo-Json -InputObject @($o) -Compress -Depth 3", PMG_LOGS=json.dumps([good, good + "\n" + stampless, suffix]))
+                                  "ConvertTo-Json -InputObject @($o) -Compress -Depth 3",
+                                  PMG_LOGS=json.dumps([good, good + "\n" + stampless, suffix, good + "\nplayback_smoke.gpu_window_swaps_debug path=x"]))
         self.assertIsNotNone(out, proc.stdout + proc.stderr)
         self.assertIsNone(out[0]["why"], out[0])
         self.assertIsNotNone(out[0]["firstUtc"], out[0])
-        for label, r in zip(("stampless final record", "suffix stamps"), out[1:]):
+        # adversary r5 A2 (minor, introduced): a longer record name after the marker is not this record, so the real one stays the last
+        self.assertIsNone(out[3]["why"], out[3])
+        self.assertEqual(out[3]["firstUtc"], out[0]["firstUtc"], out[3])
+        for label, r in zip(("stampless final record", "suffix stamps"), out[1:3]):
             self.assertIn("carries no first_swap_utc/last_swap_utc", r["why"], (label, r))
             self.assertIsNone(r["firstUtc"], (label, r))
             self.assertIsNone(r["lastUtc"], (label, r))
@@ -646,12 +653,16 @@ class AppStallAttributionTests(unittest.TestCase):
         # The app's longest gap (5050 ms, after swap 161 = the row at 10000 ms) shows in PresentMon as 4990 ms, just under the bound; PresentMon then
         # loses 5100 ms at 30 s, after about 461 rows. Size alone (|5100 - 5050| <= 250, app gap over the bound, one over-bound gap) said APP_SWAP_STALL;
         # by position the over-bound gap is 300 swaps away from the app's. Control: the same record when PresentMon's only over-bound gap IS the app's.
-        # (after the 4990 ms hole the 50 ms grid runs 14990, 15040, ...: the second hole opens after the row at 29990 ms)
-        misplaced = (self.g8_rows([(10000.0, 4990.0), (29990.0, 5100.0)]), self.g8_record("5050.000", "161"), self.G8_T0, self.G8_T0)
-        placed = (self.g8_rows([(10000.0, 5060.0)]), self.g8_record("5050.000", "161"), self.G8_T0, self.G8_T0)
-        no_ordinal = (self.g8_rows([(10000.0, 4990.0), (29990.0, 5100.0)]), self.g8_record("5050.000"), self.G8_T0, self.G8_T0)
-        late = "2026-11-09T00:00:01.3910000Z"   # the r4 leg's 1.39 s bracket: the rows before the gap are a range, and still placed
-        placed_wide = (self.g8_rows([(10000.0, 5060.0)]) + [500.0 + 50.0 * i for i in range(30)], self.g8_record("5050.000", "161"), self.G8_T0, late)
+        # (after the 4990 ms hole the 50 ms grid runs 14990, 15040, ...: the second hole opens after the row at 29990 ms). Every present is displayed
+        # here, so the presents are the rows.
+        lost = self.g8_rows([(10000.0, 4990.0), (29990.0, 5100.0)])
+        stall = self.g8_rows([(10000.0, 5060.0)])
+        misplaced = (lost, self.g8_record("5050.000", "161"), self.G8_T0, self.G8_T0, lost)
+        placed = (stall, self.g8_record("5050.000", "161"), self.G8_T0, self.G8_T0, stall)
+        no_ordinal = (lost, self.g8_record("5050.000"), self.G8_T0, self.G8_T0, lost)
+        late = "2026-11-09T00:00:01.3910000Z"   # the r4 leg's 1.39 s bracket: the presents before the gap are a range, and still placed
+        wide = stall + [500.0 + 50.0 * i for i in range(30)]
+        placed_wide = (wide, self.g8_record("5050.000", "161"), self.G8_T0, late, wide)
         got = coverages([misplaced, placed, no_ordinal, placed_wide])
         self.assertEqual(got[0]["overBoundGapCount"], 1, got[0])
         self.assertIs(got[0]["overBoundGapAtAppStall"], False, got[0])
@@ -666,6 +677,28 @@ class AppStallAttributionTests(unittest.TestCase):
         self.assertIn("at the same swap ordinal", vs[1]["reason"])
         self.assertEqual(vs[2]["verdict"], "APP_SWAP_STALL", (vs[2], "a record without the ordinal stays size-only (every r4 receipt)"))
         self.assertEqual(vs[3]["verdict"], "APP_SWAP_STALL", vs[3])
+
+    def test_r5_6bc472b8_a1_placement_counts_presents_not_displayed_rows(self) -> None:
+        # adversary review-adversary-...-r5-6bc472b8 A1 (introduced, major), its literal input: presents every 50 ms over 2000..10000 and 16000..42000 ms
+        # (682 presents, all retained), the display changing every 100 ms (342 positive-interval rows), one 6000 ms app stall after swap 161, a 100 ms
+        # bracket. On 6bc472b8 displayed-row ordinal 81 was compared with swap ordinal 161: placement false, PRESENTMON_INTERNAL_GAP, the leg refused.
+        presents = [2000.0 + 50.0 * i for i in range(161)] + [16000.0 + 50.0 * i for i in range(521)]
+        displayed = [t for t in presents if t % 100.0 == 0.0]
+        self.assertEqual((len(presents), len(displayed)), (682, 342))
+        log = ("playback_smoke.gpu_window_swaps session=1 window_active=1 telemetry_enabled=1 swaps=682 max_gap_ms=6000.000 "
+               "max_gap_before_serial=161 max_gap_after_serial=162 first_swap_utc=2026-11-09T00:00:02.000Z last_swap_utc=2026-11-09T00:00:42.000Z")
+        r = coverages([(displayed, log, self.G8_T0, "2026-11-09T00:00:00.1000000Z", presents)])[0]
+        self.assertEqual((r["windowSource"], r["gapKind"], r["overBoundGapCount"]), ("app_swap_window", "internal", 1), r)
+        self.assertIs(r["overBoundGapAtAppStall"], True, r)
+        v = verdict(self.as_metrics(r))
+        self.assertEqual(v["verdict"], "APP_SWAP_STALL", v)
+        self.assertFalse(v["blocks"], v)
+        self.assertTrue(v["failsLeg"], v)
+
+    def test_the_job_places_the_gap_by_the_selected_chains_presents(self) -> None:
+        job = JOB.read_text(encoding="utf-8")
+        self.assertIn("-MaxGapMs $presentMonSufficiencyMaxGapMs -PresentTimesMs @($displayReport.selectedPresentTimesMs)\n", job)
+        self.assertIn("presentMonTemporalOverBoundGapAtAppStall = $presentMonPlaybackTemporal.overBoundGapAtAppStall", job)
 
     def test_invoke_venue_leg_counts_an_app_stall_as_fail_and_names_it(self) -> None:
         leg = LEG.read_text(encoding="utf-8")
