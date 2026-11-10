@@ -29,6 +29,7 @@ LEGS = ROOT / "tools" / "profiling" / "dual-venue" / "legs"
 
 # clipId -> (video frames in the MLVI header / VIDF blocks, native fps). Only what the repo itself pins.
 KNOWN_CLIP_SOURCE = {
+    "M16-1243": (937, 23.976),   # test_playback_clip_length_gate.py:177 (937 VIDF blocks are indexed) and :205-206 (39.08 s at 23.976 fps)
     "M16-1456": (969, 59.94),
     "M16-1457": (1667, 59.94),
 }
@@ -85,13 +86,23 @@ class LegPlaySecondsWithinClipTests(unittest.TestCase):
             self.assertGreaterEqual(spec["playSeconds"], 10, spec["legId"])
             self.assertLessEqual(spec["playSeconds"], int(clip_seconds("M16-1456")), spec["legId"])
 
+    def test_every_clip_a_tracked_leg_names_has_a_tracked_length(self) -> None:
+        """Adversary A1 (22f58b19): M16-1243 (106 of the 132 specs) was skipped as 'no tracked length', so a 3000 s window on it passed the guard.
+        The repo does pin it (937 VIDF blocks, 39.08 s at 23.976 fps: test_playback_clip_length_gate.py:177 and :205), so no clip a tracked spec
+        names may be left unchecked."""
+        specs = self.load_specs()
+        self.assertEqual(sorted({s["clipId"] for s in specs.values()} - set(KNOWN_CLIP_SOURCE)), [])
+        spec = dict(specs["m16-1243-speed.json"], playSeconds=3000)
+        self.assertIsNotNone(window_overruns_clip(spec), "a 3000 s window on M16-1243 must be flagged")
+        self.assertIsNone(window_overruns_clip(dict(spec, playSeconds=25)))
+
     def test_the_guard_is_not_vacuous(self) -> None:
         """It flags the pre-fix shape, admits a window that fits, skips an unknown clip and honours a start offset."""
         self.assertIsNotNone(window_overruns_clip({"legId": "x", "clipId": "M16-1456", "playSeconds": 25}))
         self.assertIsNotNone(window_overruns_clip({"legId": "x", "clipId": "M16-1456", "playSeconds": 17}))
         self.assertIsNone(window_overruns_clip({"legId": "x", "clipId": "M16-1456", "playSeconds": 16}))
         self.assertIsNone(window_overruns_clip({"legId": "x", "clipId": "M16-1457", "playSeconds": 25}))
-        self.assertIsNone(window_overruns_clip({"legId": "x", "clipId": "M16-1243", "playSeconds": 3000}))
+        self.assertIsNone(window_overruns_clip({"legId": "x", "clipId": "M16-9999", "playSeconds": 3000}))   # an untracked clip is skipped
         self.assertIsNotNone(window_overruns_clip(
             {"legId": "x", "clipId": "M16-1457", "playSeconds": 25, "generatorArgs": {"startFrame": 169}}))
         self.assertIsNone(window_overruns_clip(

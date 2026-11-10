@@ -106,6 +106,7 @@ LOOKAHEAD_LEGS = ("legs/m16-1243-pace-cinematic-fullscreen-s4-la3.json",)
 # (LIGHT disables it), so the present that ends a >= 250 ms interval shows its own stage times. Diagnostic only: never a pace number.
 HEAVY_LEGS = ("legs/m16-1243-pace-cinematic-fullscreen-s4-heavy.json",)
 # PLAYBACK-HFR-CONFORM-DEFAULT-1 added the conform legs on the 59.94 fps clip: the scale-1 display cells, cuda only (legsets/hfr-conform.json names them).
+CONFORM_WINDOW_BY_CLIP = {"M16-1456": 15}   # CONFORM-LEG-PLAYSECONDS-WITHIN-CLIP-1: the 16.17 s clip cannot play the display cell's 25 s
 HFR_CONFORM_LEGS = tuple(f"legs/m16-1456-conform-{mode}-s1.json" for mode in ("windowed", "fullscreen"))
 # ... and (PRODUCT-PR-STRANDED-SWEEP-1 r1g) the same two cells on M16-1457, the longer 59.94 fps clip (27.8 s) that meets max(20 s, 25 s window).
 HFR_CONFORM_LEGS_1457 = tuple(f"legs/m16-1457-conform-{mode}-s1.json" for mode in ("windowed", "fullscreen"))
@@ -7382,8 +7383,10 @@ class LegSpecSchemaTests(unittest.TestCase):
             # r19 (sol r18 B2): plus the measured conform criteria (source_fps band, max_jump 1, no audio sync), appended in both roles
             cell_cuda = dict(cell, criteria={role: {"cuda": per["cuda"] + CONFORM_MEASURED_CRITERIA} for role, per in cell["criteria"].items()})
             cell_cuda["generatorArgs"] = dict(cell["generatorArgs"], playbackConform="on")
-            # CONFORM-LEG-PLAYSECONDS-WITHIN-CLIP-1: the window is the one field fitted to the clip (M16-1456 is 16.17 s), so it is not compared with the cell's
-            self.assertEqual(dict(leg, legId=cell["legId"], card=cell["card"], clipId=cell["clipId"], backends=cell["backends"], playSeconds=cell["playSeconds"]), cell_cuda, rel)
+            # CONFORM-LEG-PLAYSECONDS-WITHIN-CLIP-1: the window is the one field fitted to the clip: M16-1456 (16.17 s) plays CONFORM_WINDOW_BY_CLIP's 15 s
+            # (adversary A2 on 22f58b19: pinned, not waived), every other conform cell keeps its display cell's window
+            cell_cuda["playSeconds"] = CONFORM_WINDOW_BY_CLIP.get(leg["clipId"], cell["playSeconds"])
+            self.assertEqual(dict(leg, legId=cell["legId"], card=cell["card"], clipId=cell["clipId"], backends=cell["backends"]), cell_cuda, rel)
         for name, clip, legs in (("hfr-conform", "M16-1456", HFR_CONFORM_LEGS), ("hfr-conform-m16-1457", "M16-1457", HFR_CONFORM_LEGS_1457)):
             doc = json.loads((DV / "legsets" / f"{name}.json").read_text(encoding="utf-8"))
             self.assertEqual((doc["legSet"], doc["card"], doc["clipId"], sorted(doc["legs"])), (name, "PLAYBACK-HFR-CONFORM-DEFAULT-1", clip, sorted(legs)))
