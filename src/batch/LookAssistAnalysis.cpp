@@ -58,6 +58,7 @@ LookAssistStats analyzeLookAssistThumbnail( const unsigned char *rgb, int width,
     int balanceHistogramB[256] = { 0 };
     const int totalSamples = width * height;
     int midtoneSamples = 0;
+    int aboveVideoWhiteSamples = 0;
     double visibleRTotal = 0.0;
     double visibleGTotal = 0.0;
     double visibleBTotal = 0.0;
@@ -78,6 +79,8 @@ LookAssistStats analyzeLookAssistThumbnail( const unsigned char *rgb, int width,
 
         const int maxChannel = qMax( r, qMax( g, b ) );
         const int minChannel = qMin( r, qMin( g, b ) );
+        // Any channel, not luma: a saturated red (255, 0, 0) is luma 53 but is a clipped pixel.
+        if( maxChannel > 235 ) ++aboveVideoWhiteSamples;
         const int saturationProxy = maxChannel - minChannel;
         const double greenAxis = (double)g - ( ( (double)r + (double)b ) * 0.5 );
         if( luma >= 12 )
@@ -145,9 +148,7 @@ LookAssistStats analyzeLookAssistThumbnail( const unsigned char *rgb, int width,
     int clipHigh = histogram[252] + histogram[253] + histogram[254] + histogram[255];
     stats.clipLow = (double)clipLow / (double)totalSamples;
     stats.clipHigh = (double)clipHigh / (double)totalSamples;
-    int aboveVideoWhite = 0;
-    for( int i = 236; i < 256; ++i ) aboveVideoWhite += histogram[i];
-    stats.aboveVideoWhite = (double)aboveVideoWhite / (double)totalSamples;
+    stats.aboveVideoWhite = (double)aboveVideoWhiteSamples / (double)totalSamples;
     return stats;
 }
 
@@ -2130,7 +2131,7 @@ LookAssistPreset presetForLookAssistScene( LookAssistScene scene,
               && displayStats->aboveVideoWhite <= 0.002 )
             // A median of one code value carries no mid-tone reading, so the highlights govern. Not when p99 is at
             // or below video black (16): that frame is noise and the lift would only raise it. Not when p99 or more
-            // than 0.2% of the display is above video white (235): the lift would push those pixels into clip.
+            // than 0.2% of the display has a channel above video white (235): the lift would push those pixels into clip.
             displayExposure = displayCap;
         displayExposure = qMin( displayExposure, displayCap );
         exposure = qBound( -120, displayExposure, 380 );

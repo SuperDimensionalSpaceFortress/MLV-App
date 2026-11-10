@@ -32,7 +32,7 @@ struct LookAssistStats
     double p99 = 0.0;
     double clipLow = 0.0;
     double clipHigh = 0.0;
-    // Share of samples whose luma is above video white (235).
+    // Share of samples with any channel above video white (235): a saturated single-channel clip has a low luma.
     double aboveVideoWhite = 0.0;
     double dynamicRange = 0.0;
     double medianR = 0.0;

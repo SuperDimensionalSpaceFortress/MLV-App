@@ -3562,6 +3562,29 @@ TEST(LookAssistScene, ADisplayMedianOfOneLiftIsWithheldWhenTheMeterSeesClippedPi
     ASSERT_EQ( 187, presetForLookAssistScene( LookAssistScene::Night, raw, nullptr, &specks ).exposure );
 }
 
+// r3 adversary A1: a clipped pixel is any channel above 235, not luma above 235. A saturated red (255, 0, 0) is luma
+// 53, green 182 and blue 18, so a luma count missed 0.5% of single-channel clip and lifted the frame +187.
+TEST(LookAssistScene, ADisplayMedianOfOneLiftCountsASaturatedSingleChannelAsClipped)
+{
+    const LookAssistStats raw = lookAssistMedianOneRaw1457();
+    for( int channel = 0; channel < 3; ++channel )
+    {
+        std::vector<unsigned char> rgb( 10000 * 3, 1 );
+        for( int i = 9000; i < 9950; ++i )
+            rgb[i * 3 + 0] = rgb[i * 3 + 1] = rgb[i * 3 + 2] = 120;
+        for( int i = 9950; i < 10000; ++i )
+        {
+            rgb[i * 3 + 0] = rgb[i * 3 + 1] = rgb[i * 3 + 2] = 0;
+            rgb[i * 3 + channel] = 255;
+        }
+        const LookAssistStats meter = analyzeLookAssistThumbnail( rgb.data(), 100, 100 );
+        ASSERT_EQ( 1.0, meter.median );
+        ASSERT_EQ( 120.0, meter.p99 );
+        ASSERT_EQ( 0, presetForLookAssistScene( LookAssistScene::Night, raw, nullptr, &meter ).exposure );
+        ASSERT_EQ( 0, presetForLookAssistScene( LookAssistScene::Shade, raw, nullptr, &meter ).exposure );
+    }
+}
+
 // r3 (Grok G3): the p99 floor. A median-one frame whose p99 is at or below video black (16) has no highlight to
 // meter: lifting it 3.8 stops lifts noise. p99 2 and 16 got +380 on 27ba24c1 and now get no lift; p99 17, the
 // first value past the floor, keeps the cap (log2(440/17) -> +469, bounded to +380).
