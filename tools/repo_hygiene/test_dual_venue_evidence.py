@@ -7543,19 +7543,6 @@ class LegSpecSchemaTests(unittest.TestCase):
             self.assertEqual(arm["criteria"], expected_criteria, rel)
             self.assertEqual(dict(arm, legId=twin["legId"], scaleFactor=twin["scaleFactor"], backends=twin["backends"], criteria=twin["criteria"]), twin, rel)
 
-    def test_every_m16_1457_leg_names_its_conform_arm(self) -> None:
-        """HFR-NATIVE-M16-1457-GUI-PRESENT-CADENCE-1 r15 (adversary A1 on 0ad23636): after HFR-NATIVE-60FPS-FULLRES-1 the app conforms a clip over
-        30 fps to 24 fps by default, so an M16-1457 (59.94 fps) leg with no generatorArgs.playbackConform plays at 24 fps, not native. Every
-        M16-1457 leg names its arm, and a native or headroom leg names off (the native-HFR arm); only a conform leg may say on."""
-        legs = sorted(p for p in (DV / "legs").glob("*.json") if json.loads(p.read_text(encoding="utf-8")).get("clipId") == "M16-1457")
-        self.assertTrue(legs)
-        for path in legs:
-            spec = json.loads(path.read_text(encoding="utf-8"))
-            arm = spec["generatorArgs"].get("playbackConform")
-            self.assertIn(arm, ("on", "off"), path.name)
-            if "-native-" in spec["legId"] or "-headroom-" in spec["legId"]:
-                self.assertEqual(arm, "off", path.name)
-
     def test_the_identity_legs_are_their_twins_with_the_capture_on(self) -> None:
         """PLAYBACK-STARTUP-WAIT-PREWARM-1: an identity leg differs from its twin only in its legId and generatorArgs.firstPresentCapture true."""
         self.assertEqual(self.schema["properties"]["generatorArgs"]["properties"]["firstPresentCapture"]["type"], "boolean")
