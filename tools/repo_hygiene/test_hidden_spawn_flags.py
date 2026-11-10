@@ -14,8 +14,9 @@ Three pins:
      The set is derived by glob, so a NEW unflagged spawn fails here. HIGH-RISK path classes (key3) and the frozen
      in-tree agent-bridge package are listed in EXCLUDED_DIRS / EXCLUDED_FILES and are left to their own cards.
   3. The named test fixtures that the 2026-11-09 evidence points at (the spliced-body-scan runner and the
-     host-load-gate fixtures) spawn hidden, and every ``Start-Process powershell.exe`` statement in the gate's
-     generated run.ps1 bodies carries its own ``-WindowStyle Hidden``.
+     host-load-gate fixtures) spawn hidden, and every ``Start-Process`` / ``saps`` / ``start`` statement in the gate's
+     generated run.ps1 bodies carries its own ``-WindowStyle Hidden``, whatever it starts (powershell, pwsh, cmd.exe, a
+     variable ``-FilePath``): the launch is judged, never its target.
 
 What the scan follows: ``import subprocess [as x]``, ``from subprocess import run [as r]``, ``from ... import *``, plain-name
 aliases (``sp = subprocess``, ``r = subprocess.run``, a default argument), ``asyncio.subprocess``, and a module obtained by
@@ -23,23 +24,40 @@ aliases (``sp = subprocess``, ``r = subprocess.run``, a default argument), ``asy
 when the name is a string literal or a name bound once to one. A dynamic import whose name cannot be resolved is REPORTED, never
 treated as clean. Anywhere else a spawn module or API appears (a container, call argument, return, unpacking, base class,
 ``__dict__`` or other dunder/private attribute, ``getattr`` of a non-constant, ``__annotations__``, ``get_type_hints``,
-``globals()``) it is REPORTED, because the call cannot be tied back to it by syntax.
+``globals()``) it is REPORTED, because the call cannot be tied back to it by syntax. An assignment expression (``:=``) is followed
+only as a statement (``(r := subprocess.run)``); used in place or inside a larger expression it is REPORTED. An attribute stored
+or deleted on a spawn module (``subprocess.CREATE_NO_WINDOW = 0``, ``os.name = ...``) is REPORTED. A submodule of asyncio is the
+module it re-exports (``asyncio.base_events.subprocess`` is ``subprocess``). A name that is the string of an event-loop spawn
+method (``getattr(loop, 'subprocess_exec')``, ``attrgetter``) is REPORTED. The standard ``_NO_WINDOW`` definition is trusted only
+when ``os``, ``subprocess`` and ``getattr`` each come from exactly one ordinary ``import``.
 
-Remaining limits, none silent: the scan is syntactic and static. It does not see source built at run time (``exec``, ``eval``,
-``compile``), a ``ctypes`` / ``win32process`` CreateProcess call, ``multiprocessing``, ``_winapi``, a module loaded by another route (``importlib.util`` loaders, ``runpy``), a non-Python launcher (a ``.ps1`` or
-``.cmd`` that starts a console program), or ``tools/agent-bridge/**`` and the other excluded paths. It does not prove that a
-child of a hidden spawn stays hidden. Hostile source that rebinds builtins, reaches ``sys.modules``, or mutates modules through
-paths this scan does not parse is out of scope: the card's promise is that no ACCIDENTAL unflagged spawn lands, not that a
-deliberate evasion is impossible. The Start-Process check reads string literals, ``+`` chains of them and f-strings whose holes
-hold no string literal (a hole's run-time value is not known); a string built from a ``Start-`` piece by ``%``, ``.format``,
-``.join`` or an f-string hole holding a literal is REPORTED rather than guessed at; a script assembled any other way (a file
-read at run time, ``chr()``) is not read, and only ``Start-Process`` and its aliases ``start`` / ``saps`` are recognised as the
-launch (``[Diagnostics.Process]::Start``, ``Invoke-Item``, ``cmd /c start``, a command name held in a variable are not). A name bound to two different spawn modules or APIs in one file is REPORTED, since
-the alias map is file-wide, not scoped.
+Remaining limits, every one named (r5 rewrite: the scan is syntactic and static, so these are what it does NOT see):
+  * Python source built or loaded at run time: ``exec``, ``eval``, ``compile``, ``runpy``, ``importlib.util`` loaders,
+    ``sys.modules`` lookups, ``importlib.reload``, ``pickle`` / ``marshal``.
+  * A process started without ``subprocess`` / ``asyncio`` / ``os``: ``ctypes`` / ``win32process`` CreateProcess,
+    ``multiprocessing``, ``_winapi``, ``concurrent.futures`` process pools, ``pty``, ``os.startfile``.
+  * A method name assembled at run time (``getattr(loop, 'subprocess_' + kind)``) or held outside a string (``match`` patterns);
+    a spawn name reached by ``getattr`` on an object that is not a tracked module.
+  * Hostile source that rebinds builtins or ``__import__``, or mutates a module through a path this scan does not parse. The
+    card's promise is that no ACCIDENTAL unflagged spawn lands, not that deliberate evasion is impossible.
+  * Any non-Python launcher: a ``.ps1`` / ``.cmd`` / ``.bat`` file that starts a console program is not read at all, and a
+    PowerShell script is read only inside a Python string of the one fixture file. There only ``Start-Process`` and its aliases
+    ``start`` / ``saps`` (also quoted as ``& 'Start-Process'`` or dot-sourced) are recognised as the launch; ``[Diagnostics.Process]::Start``,
+    ``Invoke-Item``, ``Invoke-Expression`` over a built string, ``cmd /c start``, ``& (Get-Command ...)`` and a command name held in a
+    variable are not. A Start-Process written in a string that is assembled any other way than a literal, a ``+`` chain, an f-string,
+    ``%``, ``.format`` or ``.join`` (a file read at run time, ``chr()``) is not read. A built string is REPORTED only when a literal piece
+    reads as ``Start-`` or as ``start`` / ``saps`` where a command word can stand.
+  * Whether a child of a hidden spawn stays hidden, and ``tools/agent-bridge/**`` plus the other excluded paths (EXCLUDED_DIRS /
+    EXCLUDED_FILES), which are left to their own cards.
+  * A name bound to two different spawn modules or APIs in one file is REPORTED rather than followed, since the alias map is
+    file-wide, not scoped. A name that two different ``import`` statements bind is never trusted as a flag or in the standard
+    definition, so a call that depends on it is REPORTED.
 """
 from __future__ import annotations
 
 import ast
+import asyncio
+import pkgutil
 import posixpath
 import re
 import subprocess
@@ -130,7 +148,7 @@ _FORBIDDEN_APIS = {
                      "execl", "execle", "execlp", "execlpe", "execv", "execve", "execvp", "execvpe"}),
 }
 _LOOP_SPAWN_METHODS = frozenset({"subprocess_exec", "subprocess_shell"})  # asyncio event-loop methods; they forward **kwargs to Popen
-_TRACKED_MODULES = frozenset({"subprocess", "os", "asyncio", "asyncio.subprocess"})
+_TRACKED_MODULES = frozenset({"subprocess", "os", "asyncio", "asyncio.subprocess", "asyncio.*"})
 # subprocess and asyncio.subprocess are used for little besides spawning, so only constants and exception/data types may be read
 # off them; os and asyncio are everywhere, so any non-dunder attribute that is not a spawn API may be read off those.
 _STRICT_MODULES = frozenset({"subprocess", "asyncio.subprocess"})
@@ -144,6 +162,15 @@ _REFLECTION = frozenset({"__annotations__", "__builtins__", "get_type_hints", "g
 _CLASS_SCOPE_IMPORT_ROOTS = frozenset({"subprocess", "os", "asyncio", "nt", "posix", "importlib", "builtins"})
 _MUTATORS = frozenset({"setattr", "delattr"})
 _MUTATING_ATTRS = frozenset({"__dict__", "__setattr__", "__delattr__"})
+# Submodules of asyncio (read off the installed package, plus the ones that re-export subprocess/os): ``asyncio.base_events.subprocess``
+# IS the subprocess module, so a submodule reference stays the tracked module "asyncio" and ``.subprocess`` / ``.os`` off it is followed.
+_ASYNCIO_SUBMODULES = frozenset({m.name for m in pkgutil.iter_modules(asyncio.__path__)} | {
+    "base_events", "base_subprocess", "unix_events", "windows_events", "proactor_events", "selector_events", "events"}) - {"subprocess"}
+# "asyncio.*" is any asyncio submodule object. `.subprocess` / `.os` off a submodule (asyncio.base_events.subprocess) are the REAL modules,
+# but `.subprocess` off the asyncio package is asyncio's own wrapper module.
+_SUBMODULE_REEXPORTS = {"subprocess": "subprocess", "os": "os", "nt": "os", "posix": "os"}
+_PACKAGE_REEXPORTS = {"subprocess": "asyncio.subprocess", "os": "os", "nt": "os", "posix": "os"}
+_LOOP_METHOD_NAME_RE = re.compile(r"(?:\w+\.)*subprocess_(?:exec|shell)")
 
 
 def _label(expr: ast.AST) -> str:
@@ -168,8 +195,9 @@ def _attr_ok(module: str, attr: str) -> bool:
     return not (attr.startswith("__") and attr.endswith("__")) or attr in _DUNDER_OK
 
 
-def _collect_binders(tree: ast.AST) -> tuple[dict[str, list], set[str], set[str]]:
-    """(name -> every value bound to it, None for a binding with no plain value; names bound by imports; own-package import names)."""
+def _collect_binders(tree: ast.AST) -> tuple[dict[str, list], set[str], set[str], dict[str, set[str]]]:
+    """(name -> every value bound to it, None for a binding with no plain value; names bound by imports; own-package import names;
+    name -> every import source it is bound from, ``import x`` and ``from m import x`` alike)."""
     binders: dict[str, list[ast.AST | None]] = {}
     imports: set[str] = set()
     own: set[str] = set()
@@ -208,8 +236,12 @@ def _collect_binders(tree: ast.AST) -> tuple[dict[str, list], set[str], set[str]
                     import_src.setdefault(name, set()).add(a.name if a.asname else name)
                     if a.name.split(".")[0] in _OWN_ROOTS:
                         own.add(name)
-                elif own_package:
-                    own.add(name)
+                else:  # `from sys import implementation as os` puts a second object under the name `os`
+                    # keyed on the module's last component: `from .hidden_spawn import x` / `from hidden_spawn import x` (a try/except
+                    # ImportError pair) are one source, `from sys import implementation as os` is not `import os`
+                    import_src.setdefault(name, set()).add(f"from {(node.module or '').rsplit('.', 1)[-1]} import {a.name}")
+                    if own_package:
+                        own.add(name)
                 if name in _TRUSTED_NAMES and not (own_package and a.asname in (None, a.name)):
                     binders.setdefault(name, []).append(None)  # another module's object, or a renamed import
                 else:
@@ -217,7 +249,7 @@ def _collect_binders(tree: ast.AST) -> tuple[dict[str, list], set[str], set[str]
     for name, sources in import_src.items():
         if len(sources) > 1:  # `import os` then `import posixpath as os`: two objects under one name
             binders.setdefault(name, []).append(None)
-    return binders, imports, own
+    return binders, imports, own, import_src
 
 
 def _string_consts(binders: dict[str, list]) -> dict[str, str]:
@@ -235,7 +267,7 @@ class _Facts:
     """
 
     def __init__(self, tree: ast.AST) -> None:
-        self.binders, self.imports, self.own = _collect_binders(tree)
+        self.binders, self.imports, self.own, self.import_src = _collect_binders(tree)
         self.consts = _string_consts(self.binders)
         self.modules: dict[str, str] = {}
         self.funcs: dict[str, tuple[str, str]] = {}
@@ -286,6 +318,8 @@ class _Facts:
                     self.helper_modules.setdefault(a.asname or root, root)
                 if a.asname and a.name in _TRACKED_MODULES:
                     self._bind_module(a.asname, a.name)
+                elif a.asname and root == "asyncio" and a.name.split(".")[1] in _ASYNCIO_SUBMODULES:  # import asyncio.base_events as be
+                    self._bind_module(a.asname, "asyncio.*")
                 elif not a.asname and root in ("subprocess", "os", "asyncio"):
                     self._bind_module(root, root)
         elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
@@ -305,8 +339,15 @@ class _Facts:
                         self._bind_func(a.asname or a.name, (origin, a.name))
                     elif origin == "asyncio" and a.name == "subprocess":
                         self._bind_module(a.asname or a.name, "asyncio.subprocess")
+                    elif origin == "asyncio" and a.name in _ASYNCIO_SUBMODULES:  # `from asyncio import base_events as be`
+                        self._bind_module(a.asname or a.name, "asyncio.*")
                     elif a.name in ("os", "subprocess", "asyncio"):  # `from subprocess import os`: the module itself
                         self._bind_module(a.asname or a.name, a.name)
+            parts = node.module.split(".")
+            if parts[0] == "asyncio" and len(parts) > 1 and parts[1] in _ASYNCIO_SUBMODULES:  # `from asyncio.base_events import subprocess`
+                for a in node.names:
+                    for reexported in (_SUBMODULE_REEXPORTS if a.name == "*" else [a.name] if a.name in _SUBMODULE_REEXPORTS else []):
+                        self._bind_module(reexported if a.name == "*" else a.asname or a.name, _SUBMODULE_REEXPORTS[reexported])
 
     def _learn(self, name: str, value: ast.AST) -> list[str]:
         learned: list[str] = []
@@ -386,14 +427,22 @@ class _Facts:
                 return True, None, False
             name = ".".join(parts[:len(parts) - (dots - 1)] + [name.lstrip(".")])
         name = _MODULE_ALIASES.get(name, name)
+        parts = name.split(".")
+        if parts[0] == "asyncio" and len(parts) > 1 and parts[1] in _ASYNCIO_SUBMODULES:
+            return True, "asyncio.*", True  # import_module('asyncio.base_events'): a submodule that re-exports subprocess and os
         return True, (name if name in _TRACKED_MODULES else None), True
 
     def module_of(self, node: ast.AST) -> str | None:
-        """The tracked module this expression IS (a bound name, ``asyncio.subprocess``, or a literal dynamic import), else None."""
+        """The tracked module this expression IS (a bound name, ``asyncio.subprocess``, a submodule chain, or a literal dynamic import)."""
         if isinstance(node, ast.Name):
             return self.modules.get(node.id) if isinstance(node.ctx, ast.Load) else None
         if isinstance(node, ast.Attribute):
-            return "asyncio.subprocess" if node.attr == "subprocess" and self.module_of(node.value) == "asyncio" else None
+            base = self.module_of(node.value)
+            if base not in ("asyncio", "asyncio.*"):
+                return None
+            # asyncio.subprocess is asyncio's wrapper; asyncio.base_events.subprocess / .os ARE the real modules; a submodule stays "asyncio.*"
+            reexports = _PACKAGE_REEXPORTS if base == "asyncio" else _SUBMODULE_REEXPORTS
+            return reexports.get(node.attr) or ("asyncio.*" if node.attr in _ASYNCIO_SUBMODULES else None)
         if isinstance(node, ast.Call):
             return self.import_target(node)[1]
         return None
@@ -444,8 +493,8 @@ def _position_ok(node: ast.AST, up: ast.AST | None, module: str | None, parent: 
         return node is up.value and all(isinstance(t, ast.Name) for t in up.targets) and not _in_class_scope(up, parent)
     if isinstance(up, ast.AnnAssign):
         return node is up.annotation or (node is up.value and isinstance(up.target, ast.Name) and not _in_class_scope(up, parent))
-    if isinstance(up, ast.NamedExpr):
-        return node is up.value and not _in_class_scope(up, parent)
+    if isinstance(up, ast.NamedExpr):  # `(r := subprocess.run)` as a statement is an alias; inside any larger expression it is not followed
+        return node is up.value and isinstance(parent.get(id(up)), ast.Expr) and not _in_class_scope(up, parent)
     if isinstance(up, ast.arguments):
         return True  # a default argument: bound to its parameter name by _Facts
     if isinstance(up, ast.arg):
@@ -458,6 +507,16 @@ def _position_ok(node: ast.AST, up: ast.AST | None, module: str | None, parent: 
         gp = parent.get(id(up))
         return isinstance(gp, ast.Call) and isinstance(gp.func, ast.Name) and gp.func.id in ("isinstance", "issubclass")
     return False
+
+
+def _named_helper_access(node: ast.AST, up: ast.AST | None, facts: _Facts) -> bool:
+    """``setattr(builtins, NAME, v)`` / ``getattr(importlib, 'x')``: the import machinery is named, and the name is not an import function."""
+    if not (isinstance(up, ast.Call) and isinstance(up.func, ast.Name) and up.func.id in ("setattr", "delattr", "getattr", "hasattr")):
+        return False
+    if len(up.args) < 2 or up.args[0] is not node:
+        return False
+    name = facts.literal(up.args[1])
+    return name is not None and name not in _IMPORT_FUNCS and not (name.startswith("__") and name.endswith("__"))
 
 
 def _reference_violations(tree: ast.AST, facts: _Facts) -> list[tuple[int, str]]:
@@ -493,13 +552,10 @@ def _reference_violations(tree: ast.AST, facts: _Facts) -> list[tuple[int, str]]
                         if a.name != "*" and not _attr_ok(origin, a.name):
                             out.append((node.lineno, f"imports {a.name} from {origin}, which is not a constant or a data type"))
             continue
-        if isinstance(node, ast.NamedExpr):  # `(r := subprocess.run)(...)`: the alias is made and used in one expression, so it is not followed
-            v = node.value
-            base = facts.module_of(v.value) if isinstance(v, ast.Attribute) else None
-            holds_spawn = (facts.module_of(v) is not None or (isinstance(v, ast.Name) and v.id in facts.funcs)
-                           or (base is not None and v.attr in _tracked(base)))
-            if holds_spawn and not isinstance(parent.get(id(node)), ast.Expr):
-                out.append((node.lineno, "binds a spawn module or API with := inside a larger expression"))
+        if isinstance(node, ast.Constant) and isinstance(node.value, str) and _LOOP_METHOD_NAME_RE.fullmatch(node.value):
+            out.append((node.lineno, f"names {node.value!r} as a string, which reaches an event-loop spawn method without calling it in place"))
+        if isinstance(node, ast.Attribute) and isinstance(node.ctx, (ast.Store, ast.Del)) and facts.module_of(node.value) is not None:
+            out.append((node.lineno, f"assigns or deletes the attribute {node.attr} on a spawn module"))  # CREATE_NO_WINDOW, os.name, run ...
         if isinstance(node, ast.Attribute) and node.attr in _LOOP_SPAWN_METHODS:
             up = parent.get(id(node))
             if not (isinstance(up, ast.Call) and up.func is node):  # an alias of loop.subprocess_exec is not followed
@@ -528,8 +584,13 @@ def _reference_violations(tree: ast.AST, facts: _Facts) -> list[tuple[int, str]]
             if node.id in facts.ambiguous:
                 out.append((node.lineno, "uses a name bound to more than one spawn module or API"))
             module = facts.modules.get(node.id)
-            is_ref = module is not None or node.id in facts.funcs or node.id in facts.importers
-        if is_ref and not _position_ok(node, parent.get(id(node)), module, parent):
+            is_ref = module is not None or node.id in facts.funcs or node.id in facts.importers or node.id in facts.helper_modules
+        up = parent.get(id(node))
+        # importlib / builtins: `importlib.import_module` is judged at its own node, but the module itself in a container or call
+        # argument hides the import function from the scan (`loaders = [importlib]; loaders[0].import_module('subprocess')`).
+        helper_receiver = (isinstance(node, ast.Name) and module is None and node.id in facts.helper_modules
+                           and ((isinstance(up, ast.Attribute) and node is up.value) or _named_helper_access(node, up, facts)))
+        if is_ref and not helper_receiver and not _position_ok(node, up, module, parent):
             out.append((node.lineno, "uses a spawn module or API where its calls cannot be followed"))
         if binds_spawn:
             name = node.id if isinstance(node, ast.Name) else node.attr if isinstance(node, ast.Attribute) else None
@@ -608,7 +669,7 @@ def _is_no_window_definition(value: ast.AST | None, facts: _Facts) -> bool:
             and len(test.comparators) == 1 and isinstance(test.comparators[0], ast.Constant) and test.comparators[0].value == "nt"
         )
         zero = isinstance(value.orelse, ast.Constant) and type(value.orelse.value) is int and value.orelse.value == 0
-        if not (is_nt and zero) or facts.modules.get("os") != "os" or "os" in facts.binders:
+        if not (is_nt and zero) or facts.import_src.get("os") != {"os"} or "os" in facts.binders:
             return False
         value = value.body
     return (
@@ -616,6 +677,7 @@ def _is_no_window_definition(value: ast.AST | None, facts: _Facts) -> bool:
         and "getattr" not in facts.binders and "getattr" not in facts.imports
         and len(value.args) == 3 and not value.keywords
         and isinstance(value.args[0], ast.Name) and facts.modules.get(value.args[0].id) == "subprocess"
+        and facts.import_src.get(value.args[0].id) == {"subprocess"}  # one source: `import subprocess [as x]`, never a from-import
         and value.args[0].id not in facts.binders
         and isinstance(value.args[1], ast.Constant) and value.args[1].value == "CREATE_NO_WINDOW"
         and isinstance(value.args[2], ast.Constant) and type(value.args[2].value) is int and value.args[2].value == 0
@@ -758,8 +820,16 @@ def _ps_statements(script: str) -> list[str]:
     return [s for s in out if s.strip()]
 
 
+def _at_command_position(before: str) -> bool:
+    """May a command word stand right after ``before`` (the statement text up to it)? A call operator ``&`` or a dot-source ``.`` may sit between."""
+    b = before.rstrip()
+    while b and b[-1] in "&." and (b[-1] == "&" or len(b) == 1 or b[-2].isspace() or b[-2] in "=({"):
+        b = b[:-1].rstrip()
+    return b == "" or b[-1] in "=("
+
+
 def _judge_script(script: str) -> tuple[int, int]:
-    """(Start-Process-powershell statements, those lacking their own outer -WindowStyle Hidden). Quoted text is a nested script.
+    """(Start-Process / saps / start statements, those lacking their own outer -WindowStyle Hidden). Quoted text is a nested script.
 
     The parameter must be a token of the Start-Process command itself: outside quotes, at the same parenthesis depth, and
     starting a word (``foo-WindowStyle:Hidden`` and ``(Get-ChildArgs -WindowStyle Hidden)`` do not count).
@@ -777,25 +847,26 @@ def _judge_script(script: str) -> tuple[int, int]:
                 depth = depth + 1 if ch == "(" else max(0, depth - 1) if ch == ")" else depth
             depths[k] = depth
         hole = "\x01" in statement  # a run-time value of unknown text sits in this statement: it could hold a comment or a quote
+        command_names = set()  # quoted strings that ARE the command name (`& 'Start-Process' ...`): not a nested script
         for m in _START_PROCESS_RE.finditer(statement):
             word = m.group(1).lower()
             before = statement[:m.start()].rstrip()
             span = next(((s, e) for s, e in spans if s <= m.start() <= e), None)
             if span is not None:  # a quoted command name is a command only as `& 'Start-Process' ...`, and it must be the whole string
                 before = statement[:span[0]].rstrip()
-                if statement[span[0] + 1:span[1]].strip().lower() != word or not (before == "" or before[-1] in "=(&"):
+                if statement[span[0] + 1:span[1]].strip().lower() != word or not _at_command_position(before):
                     continue
-            elif word != "start-process" and not (before == "" or before[-1] in "=(&"):
+                command_names.add(span)
+            elif word != "start-process" and not _at_command_position(before):
                 continue  # `start` / `saps` count only where a command word can stand
-            if "powershell" not in statement[m.start():].lower():
-                continue
+            # Every launch is judged, whatever it starts (powershell, pwsh, cmd.exe, `-FilePath $exe`): the target decides nothing.
             found += 1
             if hole or not any(not quoted[h.start()] and depths[h.start()] == depths[m.start()]
                                for h in _WINDOW_STYLE_HIDDEN_RE.finditer(statement, m.start())):
                 bad += 1
         for s, e in spans:
             inner = statement[s + 1:e]
-            if _START_PROCESS_RE.search(inner):
+            if (s, e) not in command_names and _START_PROCESS_RE.search(inner):
                 inner_found, inner_bad = _judge_script(inner)
                 found += inner_found
                 bad += inner_bad
@@ -803,6 +874,9 @@ def _judge_script(script: str) -> tuple[int, int]:
 
 
 _STRING_BUILDERS = frozenset({"format", "format_map", "join", "replace", "__mod__"})
+# A literal piece of a run-time built string that reads as a launch: a ``Start-`` prefix, or ``start`` / ``saps`` where a command word can
+# stand (the piece's start, or after ; & | ( { = or a dot-source), so 'the start of {}' is prose and 'start {}' is the alias.
+_BUILT_LAUNCH_RE = re.compile(r"start-|(?:^|[;&|({=]|\s\.)\s*(?:start|saps)(?![\w-])", re.IGNORECASE | re.MULTILINE)
 
 
 def _string_values(tree: ast.AST) -> list[tuple[int, str, bool]]:
@@ -839,7 +913,7 @@ def _string_values(tree: ast.AST) -> list[tuple[int, str, bool]]:
             isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr in _STRING_BUILDERS)
         if builds:
             pieces = [c.value for c in ast.walk(node) if isinstance(c, ast.Constant) and isinstance(c.value, str)]
-            if any("start-" in p.lower() or re.search(r"\bsaps\b", p, re.I) for p in pieces):
+            if any(_BUILT_LAUNCH_RE.search(p) for p in pieces):
                 out.append((node.lineno, "".join(pieces), True))
                 continue
         stack.extend(ast.iter_child_nodes(node))
@@ -1281,7 +1355,7 @@ class AdversaryR3Tests(unittest.TestCase):
         ):
             found, bad = judge(ps + "\n")
             self.assertEqual((found, len(bad)), (1, 1), ps)
-        self.assertEqual(judge("Start-Process -FilePath 'notepad.exe'\n"), (0, []))
+        self.assertEqual(judge("Start-Process -FilePath 'notepad.exe'\n"), (1, [1]))  # r5 G6: every launch is judged, whatever it starts
         self.assertEqual(_start_process_violations("# Start-Process powershell.exe without a style\nx = 1\n"), (0, []))
 
     # The default-deny reference rule is O(source): a long chain of attribute/name uses does not blow up.
@@ -1701,8 +1775,223 @@ class AdversaryR4Tests(unittest.TestCase):
     def test_the_docstring_names_what_the_scan_covers_and_its_limits(self):
         module_doc = (ROOT / "tools/repo_hygiene/test_hidden_spawn_flags.py").read_text(encoding="utf-8").split('"""')[1]
         for needle in ("os.system", "os.popen", "getoutput", "create_subprocess_exec", "import_module", "__import__",
-                       "exec", "eval", "ctypes", "CreateProcess", "non-Python", "agent-bridge"):
+                       "exec", "eval", "ctypes", "CreateProcess", "non-Python", "agent-bridge",
+                       # r5: the limits paragraph names each remaining gap
+                       "sys.modules", "runpy", "importlib.util", "multiprocessing", "os.startfile", "attrgetter", "subprocess_' + kind",
+                       "pwsh", "cmd.exe", "-FilePath", "Invoke-Expression", "Invoke-Item", "cmd /c start", "dot-sourced", ":="):
             self.assertIn(needle, module_doc, needle)
+
+
+class AdversaryR5Tests(unittest.TestCase):
+    """MLV-LANE-CONSOLE-HIDDEN-1 r5: r4 pass-9 findings A2-A9 (review-adversary-...-r4-c1c92dd5), Grok G5 and G6, Dot I1 and I2."""
+
+    def _bad(self, source: str) -> list[str]:
+        return _unflagged_spawns_in_source(source, "synthetic.py")
+
+    @staticmethod
+    def _judge(ps: str) -> tuple[int, int]:
+        found, bad = _start_process_violations("x = " + repr(ps) + "\n")
+        return found, len(bad)
+
+    # A2: `os`, `subprocess` and `getattr` are trusted by the standard definition only when each name comes from exactly one `import`.
+    def test_a2_a_from_import_that_rebinds_a_name_the_definition_reads_is_not_trusted(self):
+        std = '_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0\n'
+        use = "subprocess.run(['x'], creationflags=_NO_WINDOW)\n"
+        self.assertEqual(self._bad("import subprocess, os\n" + std + use), [])
+        for label, pre in {
+            "os after import os": "import subprocess, os\nfrom sys import implementation as os\n",
+            "os before import os": "import subprocess\nfrom sys import implementation as os\nimport os\n",
+            "os only from-import": "import subprocess\nfrom sys import implementation as os\n",
+            "os from own package": "import subprocess, os\nfrom tools.repo_hygiene import hidden_spawn as os\n",
+            "subprocess from-import": "import os\nimport subprocess\nfrom sys import implementation as subprocess\n",
+            "getattr from-import": "import subprocess, os\nfrom sys import implementation as getattr\n",
+            "os second alias": "import subprocess\nimport os as _o\nfrom sys import implementation as os\n",
+        }.items():
+            self.assertGreaterEqual(len(self._bad(pre + std + use)), 1, label)
+
+    # A3: a module reached through a submodule attribute chain of a tracked module is the same module.
+    def test_a3_a_spawn_module_reached_through_a_submodule_chain_is_tracked(self):
+        for label, src in {
+            "asyncio.base_events.subprocess": "import asyncio\nasyncio.base_events.subprocess.run(['x'])\n",
+            "asyncio.base_events.os": "import asyncio\nasyncio.base_events.os.system('x')\n",
+            "asyncio.unix_events.subprocess": "import asyncio\nasyncio.unix_events.subprocess.Popen(['x'])\n",
+            "from import": "from asyncio import base_events as be\nbe.subprocess.run(['x'])\n",
+            "import as": "import asyncio.base_events as be\nbe.subprocess.run(['x'])\n",
+            "alias": "import asyncio\nm = asyncio.base_events\nm.subprocess.run(['x'])\n",
+            "dynamic": "import importlib\nimportlib.import_module('asyncio.base_events').subprocess.run(['x'])\n",
+            "dynamic os": "import importlib\nm = importlib.import_module('asyncio.unix_events')\nm.os.system('x')\n",
+            "__import__": "__import__('asyncio.base_events').base_events.subprocess.run(['x'])\n",
+        }.items():
+            self.assertGreaterEqual(len(self._bad(src)), 1, label)
+        self.assertEqual(self._bad("import asyncio.base_events as be\nbe.subprocess.run(['x'], creationflags=_NO_WINDOW)\n"), [])
+        self.assertEqual(self._bad("import asyncio\nx = asyncio.base_events.BaseEventLoop\nasyncio.run(main())\n"), [])
+
+    # A4: nothing may store an attribute on a tracked module: the standard definition reads CREATE_NO_WINDOW and os.name off them.
+    def test_a4_an_attribute_store_on_a_spawn_module_is_reported(self):
+        std = '_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0\n'
+        use = "subprocess.run(['x'], creationflags=_NO_WINDOW)\n"
+        for label, pre in {
+            "store": "subprocess.CREATE_NO_WINDOW = 0\n",
+            "alias store": "sp = subprocess\nsp.CREATE_NO_WINDOW = 0\n",
+            "augmented": "subprocess.CREATE_NO_WINDOW |= 0\n",
+            "annotated": "subprocess.CREATE_NO_WINDOW: int = 0\n",
+            "delete": "del subprocess.CREATE_NO_WINDOW\n",
+            "tuple target": "subprocess.CREATE_NO_WINDOW, other = 0, 1\n",
+            "for target": "for subprocess.CREATE_NO_WINDOW in (0,):\n    pass\n",
+            "with target": "with ctx() as subprocess.CREATE_NO_WINDOW:\n    pass\n",
+            "os.name": "os.name = 'nt'\n",
+            "replace run": "subprocess.run = fake\n",
+            "setattr": "setattr(subprocess, 'CREATE_NO_WINDOW', 0)\n",
+            "dict update": "subprocess.__dict__.update(CREATE_NO_WINDOW=0)\n",
+            "vars": "vars(subprocess)['CREATE_NO_WINDOW'] = 0\n",
+        }.items():
+            self.assertGreaterEqual(len(self._bad("import subprocess, os\n" + pre + std + use)), 1, label)
+        self.assertEqual(self._bad("import subprocess, os\n" + std + use + "os.environ['Q'] = 'x'\nbox.CREATE_NO_WINDOW = 1\n"), [])
+
+    # A5: a dot-sourced command name is a command.
+    def test_a5_a_dot_sourced_command_name_is_judged(self):
+        for ps in (". 'Start-Process' powershell.exe", ".'Start-Process' powershell.exe", '. "Start-Process" powershell.exe',
+                   ". Start-Process powershell.exe", ". start powershell.exe", ". saps powershell.exe", "$p = . 'Start-Process' powershell.exe",
+                   "& . 'Start-Process' powershell.exe", "(. 'Start-Process' powershell.exe)"):
+            self.assertEqual(self._judge(ps), (1, 1), ps)
+        self.assertEqual(self._judge(". 'Start-Process' powershell.exe -WindowStyle Hidden"), (1, 0))
+        self.assertEqual(self._judge("$x = 'a' . 'b'; $o.start()"), (0, 0))
+
+    # A6 and A7: the executable or the alias arrives through a hole or a run-time format, so the launch is read as a launch.
+    def test_a6_a7_a_launch_built_at_run_time_is_reported(self):
+        for src in (
+            "exe = 'powershell.exe'\nx = f'Start-Process {exe}'\n",
+            "x = f'Start-Process -FilePath {exe} -WindowStyle Hidden'\n",
+            "x = 'start {}'.format(exe)\n",
+            "x = 'start %s' % exe\n",
+            "x = 'start ' + exe\n",
+            "x = 'saps ' + exe\n",
+            "x = f'start {exe}'\n",
+            "x = ''.join(['start ', exe])\n",
+            "x = '& start {}'.format(exe)\n",
+            "x = '$p = start {}'.format(exe)\n",
+            "x = 'cmd; start {}'.format(exe)\n",
+        ):
+            found, bad = _start_process_violations(src)
+            self.assertEqual((found, len(bad)), (1, 1), src)
+        for src in ("x = 'the start of {}'.format(n)\n", "x = 'restart {}'.format(n)\n", "x = f'started {n}'\n", "x = 'at the start %s' % n\n"):
+            self.assertEqual(_start_process_violations(src), (0, []), src)
+
+    # A8: an event-loop spawn method reached by name is reported.
+    def test_a8_an_event_loop_spawn_method_reached_by_name_is_reported(self):
+        for label, src in {
+            "getattr": "def f(loop):\n    getattr(loop, 'subprocess_exec')(factory, 'x')\n",
+            "getattr shell": "def f(loop):\n    return getattr(loop, \"subprocess_shell\")(factory, 'x')\n",
+            "getattr default": "def f(loop):\n    getattr(loop, 'subprocess_exec', None)(factory, 'x')\n",
+            "__getattribute__": "def f(loop):\n    loop.__getattribute__('subprocess_exec')(factory, 'x')\n",
+            "attrgetter": "import operator\ndef f(loop):\n    operator.attrgetter('subprocess_exec')(loop)(factory, 'x')\n",
+            "dotted attrgetter": "import operator\ndef f(app):\n    operator.attrgetter('loop.subprocess_shell')(app)(factory, 'x')\n",
+            "methodcaller": "import operator\ndef f(loop):\n    operator.methodcaller('subprocess_exec', factory, 'x')(loop)\n",
+            "vars": "def f(loop):\n    vars(loop)['subprocess_exec'](factory, 'x')\n",
+            "constant held": "NAME = 'subprocess_exec'\n",
+        }.items():
+            self.assertGreaterEqual(len(self._bad(src)), 1, label)
+        self.assertEqual(self._bad("def f(loop):\n    loop.subprocess_exec(factory, 'x', creationflags=_NO_WINDOW)\n"), [])
+        self.assertEqual(self._bad("MSG = 'call loop.subprocess_exec with creationflags'\nsubprocess_exec_count = 1\n"), [])
+
+    # A9: importlib / builtins held in a container (or passed on) is as unfollowable as the spawn module itself.
+    def test_a9_the_import_machinery_held_in_a_container_is_reported(self):
+        for label, src in {
+            "list": "import importlib\nloaders = [importlib]\nloaders[0].import_module('subprocess').run(['x'])\n",
+            "tuple": "import importlib\nloaders = (importlib,)\nloaders[0].import_module('subprocess').run(['x'])\n",
+            "dict": "import importlib\nloaders = {'m': importlib}\nloaders['m'].import_module('subprocess').run(['x'])\n",
+            "builtins": "import builtins\n[builtins][0].__import__('subprocess').run(['x'])\n",
+            "argument": "import importlib\nhelper(importlib)\n",
+            "return": "import importlib\ndef pick():\n    return importlib\n",
+            "conditional": "import importlib\nm = importlib if a else other\nm.import_module('subprocess').run(['x'])\n",
+            "walrus receiver": "import importlib\n(m := importlib).import_module('subprocess').run(['x'])\n",
+            "alias in container": "import importlib\nm = importlib\nloaders = [m]\nloaders[0].import_module('subprocess').run(['x'])\n",
+            "from import in container": "from importlib import import_module\nloaders = [import_module]\nloaders[0]('subprocess').run(['x'])\n",
+        }.items():
+            self.assertGreaterEqual(len(self._bad(src)), 1, label)
+        for src in ("import importlib\nm = importlib.import_module('json')\n", "import importlib\nm = importlib\nn = m.import_module('json')\n",
+                    "import importlib.util\nspec = importlib.util.find_spec('json')\n",
+                    "import builtins\nHOOK = '_PIN_HOOK'\nsetattr(builtins, HOOK, forced)\n"):  # a named, non-import attribute: check_bridge_native_pin
+            self.assertEqual(self._bad(src), [], src)
+        for src in ("import builtins\nsetattr(builtins, '__import__', forced)\n", "import builtins\nsetattr(builtins, name, forced)\n",
+                    "import builtins\nsetattr(builtins, 'import_module', forced)\n", "import importlib\nsetattr(importlib, 'import_module', forced)\n"):
+            self.assertGreaterEqual(len(self._bad(src)), 1, src)
+
+    # G5: an assignment expression whose value is a spawn module or API is followed as a binding or reported, in every position.
+    def test_g5_each_pinned_literal_is_reported_and_an_unrelated_walrus_is_clean(self):
+        for src in ("import subprocess\n(r:=subprocess.run)(['x'])\n", "import subprocess\n(s:=subprocess).run(['x'])\n",
+                    "import os\n(f:=os.system)('x')\n"):
+            self.assertGreaterEqual(len(self._bad(src)), 1, src)
+        self.assertEqual(self._bad("import subprocess\nif (n := len(sys.argv)) > 1:\n    subprocess.run(['x'], creationflags=_NO_WINDOW)\n"), [])
+        self.assertEqual(self._bad("import subprocess\nwhile (line := f.readline()):\n    pass\nsubprocess.run(['x'], creationflags=_NO_WINDOW)\n"), [])
+        self.assertEqual(self._bad("import subprocess\nx = [y for v in data if (y := v + 1)]\n"), [])
+
+    def test_g5_walrus_over_the_import_machinery_and_wrapped_values_is_reported(self):
+        for label, src in {
+            "import_module callee": "import importlib\n(l := importlib.import_module)('subprocess').run(['x'])\n",
+            "__import__ callee": "(l := __import__)('subprocess').run(['x'])\n",
+            "importlib receiver": "import importlib\n(m := importlib).import_module('subprocess').run(['x'])\n",
+            "from import": "from importlib import import_module\n(l := import_module)('subprocess').run(['x'])\n",
+            "conditional value": "import subprocess\n(r := subprocess.run if a else subprocess.Popen)(['x'])\n",
+            "container value": "import subprocess\n(r := [subprocess.run])[0](['x'])\n",
+            "comprehension": "import subprocess\nx = [0 for _ in data if (r := subprocess.run)]\n",
+            "boolean": "import subprocess\n(r := subprocess.run) and r(['x'])\n",
+            "alias module": "import subprocess\nsp = subprocess\n(q := sp).run(['x'])\n",
+            "lambda": "import subprocess\nf = lambda: (r := subprocess.run)(['x'])\n",
+            "asyncio": "import asyncio\n(c := asyncio.create_subprocess_exec)('x')\n",
+        }.items():
+            self.assertGreaterEqual(len(self._bad(src)), 1, label)
+
+    def test_g5_class_sweep_every_binding_form_is_followed_or_reported_for_a_spawn_value(self):
+        followed = {
+            "Assign": "import subprocess\nr = subprocess.run\nr(['x']{flag})\n",
+            "AnnAssign": "import subprocess\nr: object = subprocess.run\nr(['x']{flag})\n",
+            "import as": "import subprocess as r\nr.run(['x']{flag})\n",
+            "from import as": "from subprocess import run as r\nr(['x']{flag})\n",
+            "NamedExpr statement": "import subprocess\n(r := subprocess.run)\nr(['x']{flag})\n",
+        }
+        for label, template in followed.items():
+            self.assertEqual(len(self._bad(template.format(flag=""))), 1, label)
+            self.assertEqual(self._bad(template.format(flag=", creationflags=_NO_WINDOW")), [], label)
+        wrapped = {
+            "AugAssign": "import subprocess\nr = 0\nr |= subprocess.run\nr(['x']{flag})\n",
+            "for target": "import subprocess\nfor r in [subprocess.run]:\n    r(['x']{flag})\n",
+            "with as": "import subprocess, contextlib\nwith contextlib.nullcontext(subprocess.run) as r:\n    r(['x']{flag})\n",
+            "comprehension": "import subprocess\nx = [r(['x']{flag}) for r in (subprocess.run,)]\n",
+        }
+        for label, template in wrapped.items():
+            for flag in ("", ", creationflags=_NO_WINDOW"):
+                self.assertGreaterEqual(len(self._bad(template.format(flag=flag))), 1, (label, flag))
+
+    # G6: every Start-Process / saps / start invocation is judged, whatever it launches.
+    def test_g6_every_start_process_is_judged_whatever_the_target(self):
+        for ps in ("Start-Process pwsh", "Start-Process pwsh.exe -ArgumentList x", "Start-Process cmd.exe", "Start-Process -FilePath $exe",
+                   "Start-Process -FilePath 'notepad.exe'", "Start-Process python.exe", "saps cmd.exe", "start cmd.exe /c exit",
+                   "& 'Start-Process' pwsh", "$p = Start-Process -FilePath $exe -PassThru", "Start-Process -FilePath $exe -WindowStyle Normal",
+                   "Start-Process $exe", "Start-Process"):
+            self.assertEqual(self._judge(ps), (1, 1), ps)
+        for ps in ("Start-Process pwsh -WindowStyle Hidden", "Start-Process cmd.exe -WindowStyle Hidden",
+                   "Start-Process -FilePath $exe -WindowStyle Hidden", "$p = Start-Process -FilePath $exe -PassThru -WindowStyle:Hidden"):
+            self.assertEqual(self._judge(ps), (1, 0), ps)
+        self.assertEqual(self._judge("Start-Process pwsh -WindowStyle Hidden; Start-Process cmd.exe"), (2, 1))
+        self.assertEqual(self._judge("Write-Host 'nothing launched'; Get-Process pwsh"), (0, 0))
+
+    # Dot I1: namespace extraction off a spawn module is reported.
+    def test_dot_i1_namespace_extraction_from_a_spawn_module_is_reported(self):
+        for src in ("import subprocess\nsubprocess.__dict__['run'](['x'])\n", "import subprocess\nvars(subprocess)['run'](['x'])\n",
+                    "import subprocess\nsp = subprocess\nsp.__dict__['Popen'](['x'])\n", "import os\nos.__dict__['system']('x')\n"):
+            self.assertGreaterEqual(len(self._bad(src)), 1, src)
+
+    # Dot I2: each Start-Process owns its own -WindowStyle Hidden.
+    def test_dot_i2_two_start_process_commands_on_one_line_each_need_their_own_style(self):
+        for ps in ("Start-Process powershell.exe -ArgumentList x; Start-Process powershell.exe -WindowStyle Hidden",
+                   "Start-Process powershell.exe && Start-Process powershell.exe -WindowStyle Hidden",
+                   "Start-Process powershell.exe | Out-Null; Start-Process powershell.exe -WindowStyle Hidden",
+                   "Start-Process pwsh -ArgumentList a; Start-Process pwsh -WindowStyle Hidden"):
+            self.assertEqual(self._judge(ps), (2, 1), ps)
+        self.assertEqual(self._judge("Start-Process powershell.exe -WindowStyle Hidden; Start-Process powershell.exe -WindowStyle Hidden"), (2, 0))
+        found, bad = _start_process_violations("x = 'Start-Process powershell.exe; ' 'Start-Process powershell.exe -WindowStyle Hidden'\n")
+        self.assertEqual((found, len(bad)), (2, 1))
 
 
 class SpawnSiteBehaviourTests(unittest.TestCase):
