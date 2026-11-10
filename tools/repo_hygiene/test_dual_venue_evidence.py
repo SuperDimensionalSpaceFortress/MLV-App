@@ -41,6 +41,7 @@ import unittest
 from pathlib import Path
 
 from tools.repo_hygiene.synthetic_mlv import FRAMES_30S_AT_23976, write_synthetic_mlv
+from tools.repo_hygiene.test_leg_play_seconds_within_clip import KNOWN_CLIP_SOURCE
 
 ROOT = Path(__file__).resolve().parents[2]
 DV = ROOT / "tools" / "profiling" / "dual-venue"
@@ -7381,7 +7382,8 @@ class LegSpecSchemaTests(unittest.TestCase):
             # r19 (sol r18 B2): plus the measured conform criteria (source_fps band, max_jump 1, no audio sync), appended in both roles
             cell_cuda = dict(cell, criteria={role: {"cuda": per["cuda"] + CONFORM_MEASURED_CRITERIA} for role, per in cell["criteria"].items()})
             cell_cuda["generatorArgs"] = dict(cell["generatorArgs"], playbackConform="on")
-            self.assertEqual(dict(leg, legId=cell["legId"], card=cell["card"], clipId=cell["clipId"], backends=cell["backends"]), cell_cuda, rel)
+            # CONFORM-LEG-PLAYSECONDS-WITHIN-CLIP-1: the window is the one field fitted to the clip (M16-1456 is 16.17 s), so it is not compared with the cell's
+            self.assertEqual(dict(leg, legId=cell["legId"], card=cell["card"], clipId=cell["clipId"], backends=cell["backends"], playSeconds=cell["playSeconds"]), cell_cuda, rel)
         for name, clip, legs in (("hfr-conform", "M16-1456", HFR_CONFORM_LEGS), ("hfr-conform-m16-1457", "M16-1457", HFR_CONFORM_LEGS_1457)):
             doc = json.loads((DV / "legsets" / f"{name}.json").read_text(encoding="utf-8"))
             self.assertEqual((doc["legSet"], doc["card"], doc["clipId"], sorted(doc["legs"])), (name, "PLAYBACK-HFR-CONFORM-DEFAULT-1", clip, sorted(legs)))
@@ -7886,7 +7888,9 @@ class LegSpecSchemaTests(unittest.TestCase):
             spec = json.loads(path.read_text(encoding="utf-8"))
             self.assertNotIn(spec["clipId"], FIXTURE_IDS, path.name)
             self.assertRegex(spec["clipId"], r"^[A-Za-z]\d{2}-\d{3,4}$", f"{path.name} names a consented clip id")
-            self.assertGreaterEqual(spec["playSeconds"], 20, f"{path.name}: the play window is at least the owner's 20 s")
+            # HFR-10S-1 (owner 2026-10-15): 10 s for a clip of >= 50 fps (the 59.94 fps clips whose length the repo tracks), else 20 s
+            floor = 10 if KNOWN_CLIP_SOURCE.get(spec["clipId"], (0, 0))[1] >= 50 else 20
+            self.assertGreaterEqual(spec["playSeconds"], floor, f"{path.name}: the play window is at least the owner's {floor} s")
             self.assertNotRegex(path.read_text(encoding="utf-8"), r"(?i)[a-z]:[\\/]|\.mlv\b", f"{path.name} must name no path")
 
     def test_the_schema_rejects_a_fixture_leg_a_path_and_a_short_window(self) -> None:
@@ -7955,7 +7959,7 @@ NO_PACE_TWIN_BY_DESIGN = {
     # HFR-NATIVE-60FPS-FULLRES-1-MERGE-MASTER r5 (CI-1, Dot 6541731407): the four #420 conform cells. Their pace claim is the conform pace proof
     # (Get-DvConformPaceProof: the playback_smoke.conform line's conform_active and configured playback_fps against the pace guard's pace_fps), which is
     # read from settings, not timed, so a contact-sheet grab cannot move it; no PR cites a measured fps / drop / jitter figure from them.
-    **{f"m16-1456-conform-{mode}-s1": "NOT RUNNABLE (2026-10-30 hub ruling: the 16.2 s M16-1456 clip is shorter than the 25 s window); hfr-conform-m16-1457 replaces it"
+    **{f"m16-1456-conform-{mode}-s1": "conform look cell on the 16.2 s M16-1456 clip (15 s window, CONFORM-LEG-PLAYSECONDS-WITHIN-CLIP-1); its pace claim is the configured-rate conform pace proof, not a timed figure, and no PR cites a measured fps from it, so a capture-free conform twin waits for the first PR that does"
        for mode in ("fullscreen", "windowed")},
     **{f"m16-1457-conform-{mode}-s1": "conform look cell; its pace claim is the configured-rate conform pace proof, not a timed figure, and no PR cites a measured fps from it, so a capture-free conform twin waits for the first PR that does"
        for mode in ("fullscreen", "windowed")},
