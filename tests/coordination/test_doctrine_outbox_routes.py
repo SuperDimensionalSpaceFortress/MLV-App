@@ -4474,3 +4474,79 @@ def test_r7_e2_a3_a_transient_failure_resolving_an_aliased_scratch_root_at_remov
     monkeypatch.setattr(ob, "_real", realpath_denied_once)
     ob.remove_exercise_scratch(base, alias)
     assert list(real_root.iterdir()) == [], list(real_root.iterdir())
+
+# Adversary pass r7 (head 4ebdeffd): A1 a listing that read any entry before it failed counts as the directory's first listing,
+# so a name added before the retry is refused (fail-closed: a name the failed listing never reached is refused too); A2 the
+# walk's keys are the exact names, never case-folded, so two names differing only in case on a case-sensitive directory stay two.
+
+@pytest.mark.skipif(os.name != "nt", reason="the multi-response FileIdBothDirectoryInfo enumeration is the Windows listing")
+def test_r7_4e_a1_a_name_added_after_a_listing_that_failed_part_way_is_refused(tmp_path, monkeypatch):
+    import ctypes
+    import types
+    root = tmp_path / "scratch"
+    base = root / (ob.ROUTE_SCRATCH_PREFIX + "test")
+    base.mkdir(parents=True)
+    ob._pin_scratch(base, root)
+    (base / "A").mkdir()
+    (base / "A" / "ours.txt").write_text("ours", encoding="utf-8")
+    real_k32, failed, changed = ob._kernel32(), [], []
+
+    class FailTheSecondResponseOnce:
+        def __getattr__(self, name):
+            return getattr(real_k32, name)
+
+        def GetFileInformationByHandleEx(self, handle, info_class, buffer, size):
+            if info_class == 10 and not failed:                         # the first response (A) came back; the next one fails
+                failed.append(handle)
+                ctypes.set_last_error(32)
+                return 0
+            return real_k32.GetFileInformationByHandleEx(handle, info_class, buffer, size)
+
+    proxy = FailTheSecondResponseOnce()
+    real_time = ob.time
+
+    def pause(seconds):                                                  # B (holding precious.txt) is moved in before the retry
+        if failed and not changed:
+            where = scratch_now(base)
+            (where / "B").mkdir()
+            (where / "B" / "precious.txt").write_text("not ours", encoding="utf-8")
+            changed.append(where)
+
+    monkeypatch.setattr(ob, "_kernel32", lambda: proxy)
+    monkeypatch.setattr(ob, "time", types.SimpleNamespace(monotonic=real_time.monotonic, sleep=pause))
+    monkeypatch.setattr(ob, "ROUTE_SCRATCH_REMOVE_PAUSE", 0)
+    monkeypatch.setattr(ob, "ROUTE_SCRATCH_REMOVE_DEADLINE", 0.5)
+    with pytest.raises(ob.Unknown) as caught:
+        ob.remove_exercise_scratch(base, root)
+    assert failed and changed, (failed, changed)
+    assert caught.value.code == "EXERCISE_SCRATCH_NOT_REMOVED", caught.value
+    survivors = list(root.rglob("precious.txt"))
+    assert len(survivors) == 1 and survivors[0].read_text(encoding="utf-8") == "not ours", survivors
+
+
+def test_r7_4e_a2_two_listed_names_that_differ_only_in_case_are_two_entries(tmp_path, monkeypatch):
+    """A case-sensitive directory (NTFS per-directory case sensitivity, or any POSIX volume) lists `A` and `a` as two objects
+    with two identities in ONE listing. The listing is fed that literal input (an `a` beside the real `A`)."""
+    root = tmp_path / "scratch"
+    base = root / (ob.ROUTE_SCRATCH_PREFIX + "test")
+    base.mkdir(parents=True)
+    ob._pin_scratch(base, root)
+    (base / "A").write_text("ours", encoding="utf-8")
+    real_list, fed = ob._list_dir, []
+
+    def with_a_case_twin(path, record=None):
+        got = real_list(path, record)
+        if any(os.path.basename(child) == "A" for child, _i, _d in got) and not fed:
+            twin = os.path.join(path, "a")
+            if record is not None:
+                record(twin, 987654321)                                  # another object: another identity
+            got.append((twin, 987654321, False))
+            fed.append(twin)
+        return got
+
+    monkeypatch.setattr(ob, "_list_dir", with_a_case_twin)
+    if os.name == "nt":                                                  # the twin is gone by the time it is deleted: already removed
+        monkeypatch.setattr(ob, "ROUTE_SCRATCH_REMOVE_DEADLINE", 2)
+    ob.remove_exercise_scratch(base, root)
+    assert fed, "the case twin was never listed"
+    assert list(root.iterdir()) == [], list(root.iterdir())

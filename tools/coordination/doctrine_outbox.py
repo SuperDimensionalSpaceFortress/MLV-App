@@ -4022,7 +4022,7 @@ _SCRATCH_ROOTS: dict[str, str] = {}                                     # scratc
 
 
 def _scratch_key(base: pathlib.Path) -> str:
-    return os.path.normcase(os.path.abspath(base))
+    return os.path.abspath(base)                                        # exact, never case-folded (r7 4ebdeffd A2 sibling)
 
 
 def _real(path: str | os.PathLike, strict: bool = False) -> str:
@@ -4364,9 +4364,12 @@ def _delete_entry(path: str, identity: int | None, is_dir: bool, posix_info: os.
 
 
 class _Listed:
-    """What ONE removal's walk has listed, kept across its attempts (786-D824-B1). `dirs`: the directories listed COMPLETELY once.
-    `ids`: the identity of every entry ANY listing has read, recorded as it is read and before any per-entry step that can fail,
-    so an entry not yet reached when an attempt failed, or read by a listing that failed part-way (r7 A2), stays pinned."""
+    """What ONE removal's walk has listed, kept across its attempts (786-D824-B1), keyed by EXACT name (never case-folded).
+    `dirs`: the directories of which any listing has read an entry. `ids`: the identity of every entry ANY listing has read,
+    recorded as it is read and before any per-entry step that can fail, so an entry not yet reached when an attempt failed, or
+    read by a listing that failed part-way (r7 A2), stays pinned. A relisting of a directory in `dirs` may only drop entries.
+    FAIL-CLOSED: when a listing fails part-way, a name it never reached cannot be told from one added since, so the retry
+    refuses it (the typed EXERCISE_SCRATCH_NOT_REMOVED, nothing more removed); this needs a listing longer than one response."""
 
     def __init__(self) -> None:
         self.dirs: set[str] = set()
@@ -4425,18 +4428,20 @@ def _rename_verified(src: pathlib.Path, dst: pathlib.Path, ident: tuple[int, int
 
 
 def _remove_contents(path: str, listed: _Listed) -> None:
-    here = os.path.normcase(path)
-    complete = here in listed.dirs                                      # listed completely before: a relisting may only DROP entries
+    here = path                                                         # exact names, never case-folded: a case-sensitive directory
+    complete = here in listed.dirs                                      # may hold `A` and `a` as two objects (r7 4ebdeffd A2)
 
     def seen(child: str, identity: int | None) -> None:
-        key = os.path.normcase(child)
-        known = listed.ids.get(key, _UNSEEN)
+        known = listed.ids.get(child, _UNSEEN)
         if known is _UNSEEN:
             if complete:
                 raise _NotOurs(f"{child} was not in the first listing of {path}")
-            listed.ids[key] = identity
+            listed.ids[child] = identity
         elif known != identity:
             raise _NotOurs(f"{child} is not the entry first listed there")
+        listed.dirs.add(here)                                           # one entry read makes this the FIRST listing, even if the
+                                                                        # listing then fails part-way (r7 4ebdeffd A1): a retry may
+                                                                        # only drop entries, so a name it never reached is refused too
 
     entries = _list_dir(path, seen)                                     # every entry checked or recorded before any is acted on
     listed.dirs.add(here)
