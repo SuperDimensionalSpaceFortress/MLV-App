@@ -478,7 +478,7 @@ class AppStallAttributionTests(unittest.TestCase):
 
 @requires_windows_pwsh
 class AdversaryR3Tests(unittest.TestCase):
-    """Adversary review-adversary-...-r3-c81b5332 findings A1-A3 (introduced, major), each fed its literal input."""
+    """Adversary review-adversary-...-r3-c81b5332 findings A1-A3 and ...-r4-d3887f21 A1 (introduced, major), each fed its literal input."""
 
     T0 = "2026-11-09T00:00:00.0000000Z"
 
@@ -505,6 +505,38 @@ class AdversaryR3Tests(unittest.TestCase):
         r = coverages([([999.0, 1999.005], log, self.T0, "2026-11-09T00:00:00.0020000Z")])[0]
         self.assertEqual(r["windowSource"], "app_swap_window", r)
         self.assertFalse(r["sufficient"], r)
+
+    # adversary review-adversary-...-r4-d3887f21 A1 (introduced, major): between two crossings the row set is constant but the edge gaps are not --
+    # the head gap grows toward the interval's upper origin and the tail gap toward its lower one, and that supremum is reached at a crossing
+    # where the row is already inside (inclusive edges), so it was sampled only as an internal gap. Sol's literal input and its mirror.
+    def test_r4_a1_an_edge_gap_reached_only_at_an_interval_end_still_counts(self) -> None:
+        late = "2026-11-09T00:00:05.0000000Z"
+        dense = [26000.0 + 40.0 * k for k in range(451)]
+        head = ("playback_smoke.gpu_window_swaps session=1 window_active=1 telemetry_enabled=1 swaps=452 max_gap_ms=6000 "
+                "first_swap_utc=2026-11-09T00:00:24.000Z last_swap_utc=2026-11-09T00:00:49.000Z")
+        tail = head.replace("00:00:24.000Z", "00:00:26.000Z").replace("00:00:49.000Z", "00:00:51.000Z")
+        got = coverages([([20000.0] + dense, head, self.T0, late), ([50000.0] + dense, tail, self.T0, late)])
+        for label, r in zip(("head (origin 3500 ms: 5500 ms head gap)", "tail (origin 1500 ms: 5500 ms tail gap)"), got):
+            self.assertEqual(r["windowSource"], "app_swap_window", (label, r))
+            self.assertFalse(r["sufficient"], (label, r))
+            self.assertGreaterEqual(r["overBoundGapCount"], 2, (label, r))
+        vs = verdicts([{"presentMonStatus": "degraded", "presentMonTemporalMaxGapMs": r["maxGapMs"], "presentMonTemporalGapKind": r["gapKind"],
+                        "presentMonTemporalWindowSource": r["windowSource"], "presentMonTemporalAppSwapMaxGapMs": r["appSwapMaxGapMs"],
+                        "presentMonTemporalOverBoundGapCount": r["overBoundGapCount"]} for r in got])
+        for r, v in zip(got, vs):
+            self.assertNotEqual(v["verdict"], "APP_SWAP_STALL", (r, v))
+            self.assertTrue(v["blocks"], v)
+
+    def test_r4_a1_an_edge_gap_at_the_ceiling_is_not_over_it(self) -> None:
+        # the supremum is not attained (the open interval never reaches its crossing), so a limit EQUAL to the ceiling is no over-bound edge:
+        # the same shape with the isolated row 5000 ms before the dense run keeps the app's one internal stall attributable
+        late = "2026-11-09T00:00:05.0000000Z"
+        dense = [26000.0 + 40.0 * k for k in range(451)]
+        log = ("playback_smoke.gpu_window_swaps session=1 window_active=1 telemetry_enabled=1 swaps=452 max_gap_ms=5000 "
+               "first_swap_utc=2026-11-09T00:00:24.000Z last_swap_utc=2026-11-09T00:00:49.000Z")
+        r = coverages([([21000.0] + dense, log, self.T0, late)])[0]
+        self.assertTrue(r["sufficient"], r)
+        self.assertEqual(r["overBoundGapCount"], 0, r)
 
 
 @requires_windows_pwsh

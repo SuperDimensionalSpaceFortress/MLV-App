@@ -7305,13 +7305,23 @@ function Get-AttrCudaPlaybackTemporalCoverage {
         }
     }
     $crossings = @($crossings | Sort-Object -Unique)
+    # adversary r4 A1: each origin tried carries the origin interval it stands for -- a crossing stands for itself, a midpoint for the open interval
+    # between its two crossings. Inside that interval the row set is constant but the edge gaps are not: the head gap grows toward the upper end and
+    # the tail gap toward the lower end, and that supremum belongs to the interval's row set, not to the crossing's (where the row is already inside).
     $origins = @()
+    $intervalLo = @()
+    $intervalHi = @()
     for ($i = 0; $i -lt $crossings.Count; $i++) {
         $origins += $crossings[$i]
-        if ($i + 1 -lt $crossings.Count) { $origins += ($crossings[$i] + $crossings[$i + 1]) / 2.0 }
+        $intervalLo += $crossings[$i]
+        $intervalHi += $crossings[$i]
+        if ($i + 1 -lt $crossings.Count) {
+            $origins += ($crossings[$i] + $crossings[$i + 1]) / 2.0
+            $intervalLo += $crossings[$i]
+            $intervalHi += $crossings[$i + 1]
+        }
     }
-    $originList = @($origins | Sort-Object -Unique)
-    if ($originList.Count -gt 1500) {
+    if ($origins.Count -gt 1500) {
         return [pscustomobject]@{
             windowSource = 'unavailable'; unavailableReason = 'the capture-start bracket is too wide to evaluate every PresentMon origin it permits'; sufficient = $null; maxGapMs = $null; gapKind = $null
             anchor = $null; windowFirstUtc = $null; windowLastUtc = $null; rowsInWindow = $null; appSwapMaxGapMs = $null; overBoundGapCount = $null
@@ -7322,25 +7332,28 @@ function Get-AttrCudaPlaybackTemporalCoverage {
     # internal gap at most, so the receipt guard reads a stall as the app's only when this is exactly 1. adversary r3 A1/A2: an edge gap (head, tail, or an
     # empty window) over the ceiling at ANY permitted origin can never be an inter-swap gap, and a head and a tail can both exceed it at an interior origin
     # that no sample need hit, so each edge kind seen over the ceiling anywhere adds one to the most internal over-ceiling gaps at any origin. Counted only
-    # for an insufficient origin (a sufficient one has no gap over the ceiling).
+    # for an insufficient origin (a sufficient one has no gap over the ceiling). adversary r4 A1: the head and tail are judged at their supremum over the
+    # origin's interval (head at its upper end, tail at its lower end, with the interval's own rows), so they count even where the sampled origin is
+    # sufficient; strictly over the ceiling, because the open interval never attains its end.
     $maxInternalOver = 0
     $headOver = $false
     $tailOver = $false
     $emptyOver = $false
-    foreach ($originMs in $originList) {
+    for ($k = 0; $k -lt $origins.Count; $k++) {
+        $originMs = $origins[$k]
         $startMs = $startAtEarliestMs - $originMs
         $endMs = $startMs + $windowMs
         $inWindow = @($values | Where-Object { $_ -ge $startMs -and $_ -le $endMs })
         $cov = Get-AttrCudaTemporalCoverage -TimeInMsValues $inWindow -WindowStartMs $startMs -WindowEndMs $endMs -MaxGapMs $MaxGapMs
-        if (-not $cov.sufficient) {
-            $sortedIn = @($inWindow | Sort-Object)
-            if ($sortedIn.Count -eq 0) { $emptyOver = $true }
-            else {
-                if (($sortedIn[0] - $startMs) -gt $MaxGapMs) { $headOver = $true }
+        $sortedIn = @($inWindow | Sort-Object)
+        if ($sortedIn.Count -eq 0) { if (-not $cov.sufficient) { $emptyOver = $true } }
+        else {
+            if (($sortedIn[0] - ($startAtEarliestMs - $intervalHi[$k])) -gt $MaxGapMs) { $headOver = $true }
+            if ((($startAtEarliestMs - $intervalLo[$k] + $windowMs) - $sortedIn[$sortedIn.Count - 1]) -gt $MaxGapMs) { $tailOver = $true }
+            if (-not $cov.sufficient) {
                 $internalOver = 0
                 for ($i = 1; $i -lt $sortedIn.Count; $i++) { if (($sortedIn[$i] - $sortedIn[$i - 1]) -gt $MaxGapMs) { $internalOver++ } }
                 if ($internalOver -gt $maxInternalOver) { $maxInternalOver = $internalOver }
-                if (($endMs - $sortedIn[$sortedIn.Count - 1]) -gt $MaxGapMs) { $tailOver = $true }
             }
         }
         $anchorName = if ($originMs -eq 0.0) { 'earliest' } elseif ($originMs -eq $originSpanMs) { 'latest' } else { 'interior' }
