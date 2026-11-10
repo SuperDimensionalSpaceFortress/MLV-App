@@ -297,7 +297,7 @@ $ErrorActionPreference = 'Stop'
 $A = 'System.Management.Automation.Language'
 $PathOnly = @('join-path', 'test-path', 'resolve-path', 'split-path', 'get-item', 'get-content', 'get-childitem', 'get-filehash', 'convert-path')
 $isRef = { param($n) (($n -is [System.Management.Automation.Language.StringConstantExpressionAst]) -or ($n -is [System.Management.Automation.Language.ExpandableStringExpressionAst])) -and ($n.Value -match ('(^|[\\/])' + [regex]::Escape($script:Needle) + '\.ps1$')) }
-$blank = { param([string]$t) $x = $t.Trim(); ($x -eq '') -or ($x -eq "''") -or ($x -eq '""') -or ($x -eq '$null') }
+$blank = { param([string]$t) $x = $t.Trim().Trim([char]39, [char]34).Trim(); ($x -eq '') -or ($x -eq '$null') }
 foreach ($file in [IO.File]::ReadAllLines($ListFile)) {
     if (-not $file) { continue }
     $errs = $null
@@ -379,7 +379,10 @@ class TrackedAssemblerCallerAstTests(unittest.TestCase):
     NAME the assembler in a string. It does not cover a name built at run time (concatenation, -f, an env var, a splatted table), Invoke-Expression,
     a remote shell (ssh) command line, an alias, a caller in another language (only an inventory by name, below), or an UNTRACKED run-dir copy
     (the assembler's own exit-27 gate is the backstop there). A tracked chain that reaches the assembler through a stage-one script it does not name
-    (Invoke-VenueStageChain.ps1) is proved by StageChainPropagationTests, not by this scan."""
+    (Invoke-VenueStageChain.ps1) is proved by StageChainPropagationTests, not by this scan. Two more, from the adversary pass on 44f72c7a (minor,
+    advisory): a scoped $env: assignment covers a call by POSITION in the same script block, not by reachability (an `if ($false)` guard, a later
+    clear, or an uncalled function would still count); and a string that is itself a path to the assembler, even in a log call, is counted as a
+    site (conservative: the scan goes red on a harmless line rather than miss a call)."""
 
     def _tracked_powershell_callers(self) -> "list[Path]":
         return [ROOT / rel for rel in _tracked_files_naming_the_assembler()
@@ -423,6 +426,13 @@ class TrackedAssemblerCallerAstTests(unittest.TestCase):
     def test_mutation_blanking_the_deadline_value_goes_red(self) -> None:
         sites = self._mutate(lambda t: t.replace("MLV_HEAVY_SLOT_DEADLINE_UTC = $script:Deadline.ToString('o')", "MLV_HEAVY_SLOT_DEADLINE_UTC = ''", 1))
         self.assertEqual([s["shape"] for s in self._uncovered(sites)], ["ChildEnv-without-a-deadline"])
+
+    def test_mutation_whitespace_deadline_value_goes_red_adversary_a1(self) -> None:
+        # adversary 44f72c7a-A1: '   ' passed the scan as a deadline, but the assembler refuses it (exit 27).
+        for blank in ("'   '", '"  "', "$null", "''"):
+            with self.subTest(value=blank):
+                sites = self._mutate(lambda t: t.replace("MLV_HEAVY_SLOT_DEADLINE_UTC = $script:Deadline.ToString('o')", "MLV_HEAVY_SLOT_DEADLINE_UTC = " + blank, 1))
+                self.assertEqual([s["shape"] for s in self._uncovered(sites)], ["ChildEnv-without-a-deadline"])
 
     def test_mutation_misspelling_the_variable_goes_red(self) -> None:
         sites = self._mutate(lambda t: t.replace("-ChildEnv @{ MLV_HEAVY_SLOT_DEADLINE_UTC =", "-ChildEnv @{ MLV_HEAVY_SLOT_DEADLINE_UTX =", 1))
