@@ -4784,3 +4784,72 @@ def test_r9_a3_a_root_that_resolves_to_a_trailing_dot_name_is_refused_before_any
         ob.make_exercise_scratch(bus, alias)
     assert caught.value.code == "EXERCISE_SCRATCH_ROOT_AMBIGUOUS", caught.value
     assert not made_in, f"a scratch was made in {made_in!r}"
+
+
+# Adversary pass r9 on 4057f489: A1 (major) the mkdir claim of the POSIX put-aside could be swapped for an unrelated directory, which
+# the failure cleanup then removed (and a successful rename replaced); the kernel's no-replace rename is used where it exists and the
+# cleanup removes only the claim this call made. A2 (major) a taskkill that failed or timed out (no Job Object) confirmed nothing
+# yet the tree was reported killed. A3 (major) a reserved DOS device name (`NUL`, `con.txt`) as a root component lost its
+# extended-length prefix and addressed the device.
+
+def test_r9b_a1_a_posix_failure_cleanup_never_removes_a_directory_put_in_place_of_its_claim(tmp_path, monkeypatch):
+    real_os = os
+
+    class PosixOs:
+        name = "posix"
+
+        def __getattr__(self, item):
+            return getattr(real_os, item)
+
+        def rename(self, src, dst):                                      # a concurrent writer swaps the claim for its own directory,
+            real_os.rename(dst, os.fspath(dst) + ".aside")               # then the rename is denied
+            real_os.mkdir(dst)
+            raise PermissionError(13, "denied", dst)
+
+    work, other = tmp_path / "work", tmp_path / "work.rm-0000000000000001"
+    work.mkdir()
+    monkeypatch.setattr(ob, "os", PosixOs())
+    with pytest.raises(PermissionError):
+        ob._rename_verified(work, other, ob._file_id(work))
+    assert other.exists(), "the cleanup removed a directory that is not the claim it made"
+
+
+@pytest.mark.skipif(os.name != "nt", reason="the taskkill fallback is the Windows no-Job-Object path")
+@pytest.mark.parametrize("how", ["exit128", "timeout"])
+def test_r9b_a2_a_taskkill_that_confirms_nothing_is_an_unconfirmed_tree(monkeypatch, how):
+    import types
+
+    class Proc:
+        pid = 4242
+
+        def kill(self):
+            pass
+
+        def wait(self, timeout=None):
+            return 0
+
+    def run(*args, **kwargs):
+        if how == "timeout":
+            raise subprocess.TimeoutExpired(args[0], 30)
+        return types.SimpleNamespace(returncode=128)
+
+    monkeypatch.setattr(ob.subprocess, "run", run)
+    with pytest.raises(ob.Unknown) as caught:
+        ob._kill_route_tree(Proc(), None)
+    assert caught.value.code == "ROUTE_TREE_NOT_EXITED", caught.value
+
+
+@pytest.mark.skipif(os.name != "nt", reason="reserved DOS device names are a Windows path rule")
+@pytest.mark.parametrize("name", ["NUL", "con.txt", "Lpt1"])
+def test_r9b_a3_real_keeps_the_extended_prefix_for_a_reserved_device_name_and_the_root_is_refused(tmp_path, name):
+    literal = "\\\\?\\" + str(tmp_path / name)
+    os.mkdir(literal)
+    try:
+        assert ob._real(literal).startswith("\\\\?\\"), "the prefix was stripped from a reserved device name"
+        bus = tmp_path / "bus"
+        (bus / ".git").mkdir(parents=True)
+        with pytest.raises(ob.Unknown) as caught:
+            ob.make_exercise_scratch(bus, Path(literal))
+        assert caught.value.code == "EXERCISE_SCRATCH_ROOT_AMBIGUOUS", caught.value
+    finally:
+        os.rmdir(literal)

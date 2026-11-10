@@ -3701,10 +3701,11 @@ def _kill_route_tree(proc: subprocess.Popen, job: "_WinJob | None") -> None:
             still_active = job.kill_and_wait(ROUTE_KILL_EXIT_WAIT)      # the tree has exited (bounded) before the caller removes its cwd
             job.close()
         else:
-            try:
-                subprocess.run(["taskkill", "/T", "/F", "/PID", str(proc.pid)], capture_output=True, timeout=30)
+            try:                                                        # no Job Object: taskkill is the only way to reach descendants
+                if subprocess.run(["taskkill", "/T", "/F", "/PID", str(proc.pid)], capture_output=True, timeout=30).returncode != 0:
+                    still_active = None                                 # parent already gone / access denied: descendants unconfirmed (r9 A2)
             except (OSError, subprocess.SubprocessError):
-                pass
+                still_active = None                                     # a failed or timed-out taskkill confirms nothing
     else:
         try:
             os.killpg(proc.pid, signal.SIGKILL)
@@ -4071,6 +4072,21 @@ def _scratch_key(base: pathlib.Path) -> str:
     return os.path.abspath(base)                                        # exact, never case-folded (r7 4ebdeffd A2 sibling)
 
 
+_DEVICE_NAMES = frozenset({"CON", "PRN", "AUX", "NUL", *(f"COM{n}" for n in range(1, 10)), *(f"LPT{n}" for n in range(1, 10))})
+
+
+def _ambiguous_parts(path: str) -> bool:
+    """True when a component of the backslash-separated `path` means another place once the extended-length prefix is gone: a
+    name ending in a dot or a space (trimmed from a bare name) or a reserved DOS device name, with or without an extension
+    (`NUL`, `con.txt`: a bare name addresses the device, not a directory; adversary r9 A3)."""
+    for part in path.split("\\"):
+        if part in (".", ".."):
+            continue
+        if part.endswith((".", " ")) or part.split(".")[0].rstrip(" ").upper() in _DEVICE_NAMES:
+            return True
+    return False
+
+
 def _real(path: str | os.PathLike, strict: bool = False) -> str:
     """os.path.realpath without the extended-length prefix that Windows' realpath KEEPS when its own verification lookup of the
     unprefixed name fails (a transient denial): the prefixed name is the same resolved path, never a different place."""
@@ -4083,7 +4099,7 @@ def _real(path: str | os.PathLike, strict: bool = False) -> str:
         return real
     # The prefix is MEANINGFUL for a name Windows would read as another place: a component ending in a dot or a space is trimmed
     # in a bare name (`C:\bus.` is `C:\bus`, the live bus) but literal after the prefix. Such a name keeps its prefix (r8 A1).
-    if any(part.endswith((".", " ")) and part not in (".", "..") for part in bare.split("\\")):
+    if _ambiguous_parts(bare):
         return real
     return bare
 
@@ -4441,6 +4457,27 @@ class _Listed:
 _UNSEEN = object()
 
 
+def _rename_noreplace(src: pathlib.Path, dst: pathlib.Path) -> bool:
+    """Linux: rename `src` to `dst` with renameat2(RENAME_NOREPLACE), which fails (FileExistsError) when `dst` exists, atomically.
+    True when renamed; False when this platform or filesystem has no such call (the caller claims the name with mkdir instead)."""
+    if not sys.platform.startswith("linux"):
+        return False
+    import ctypes
+    import errno
+    try:
+        renameat2 = ctypes.CDLL(None, use_errno=True).renameat2
+    except (OSError, AttributeError):
+        return False
+    renameat2.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint]
+    renameat2.restype = ctypes.c_int
+    if renameat2(-100, os.fsencode(src), -100, os.fsencode(dst), 1) == 0:   # AT_FDCWD, AT_FDCWD, RENAME_NOREPLACE
+        return True
+    code = ctypes.get_errno()
+    if code in (errno.ENOSYS, errno.EINVAL, errno.ENOTSUP):
+        return False
+    raise OSError(code, os.strerror(code), os.fspath(src), None, os.fspath(dst))
+
+
 def _rename_verified(src: pathlib.Path, dst: pathlib.Path, ident: tuple[int, int] | None) -> None:
     """Rename `src` to `dst`, a name in the SAME directory, only when what is renamed is the real directory pinned as `ident`
     (adversary r7 A1). Windows: `src` is opened (no link followed) for DELETE, its identity is read on THAT handle (os.fstat: the
@@ -4458,12 +4495,16 @@ def _rename_verified(src: pathlib.Path, dst: pathlib.Path, ident: tuple[int, int
         # A name taken between that check and the rename would still be replaced (r9 A2), so the name is CLAIMED atomically first:
         # mkdir fails when anything holds it (FileExistsError, retried under a fresh name), and what rename then replaces is the
         # empty directory this call just made. Removing that claim again when the rename fails leaves nothing behind.
+        if _rename_noreplace(src, dst):                                 # the kernel refuses an existing destination (r9 A1): no claim needed
+            return
         _meta(os.mkdir, dst)
+        claim = _ident(_meta(os.lstat, dst))
         try:
             _meta(os.rename, src, dst)
         except BaseException:
-            try:
-                os.rmdir(dst)
+            try:                                                        # only the claim THIS call made: never a directory put there since
+                if _ident(os.lstat(dst)) == claim:
+                    os.rmdir(dst)
             except OSError:
                 pass
             raise
@@ -4575,15 +4616,13 @@ def make_exercise_scratch(bus: pathlib.Path, scratch_root: pathlib.Path) -> tupl
         raise Unknown("EXERCISE_BUS_NOT_A_REPO", f"{bus} is not a git repository")
     if route_inside(route_real_path(str(scratch_root)), route_real_path(str(bus))):
         raise Unknown("EXERCISE_SCRATCH_INSIDE_BUS", f"scratch root {scratch_root} is inside the bus {bus}; routes never run in the live bus")
-    if os.name == "nt" and any(part.endswith((".", " ")) and part not in (".", "..")
-                               for part in os.fspath(scratch_root).removeprefix("\\\\?\\").split("\\")):
+    if os.name == "nt" and _ambiguous_parts(os.fspath(scratch_root).removeprefix("\\\\?\\")):
         raise Unknown("EXERCISE_SCRATCH_ROOT_AMBIGUOUS",                # a bare `C:\bus.` is `C:\bus`, the live bus; the same name after
                       f"scratch root {scratch_root} has a component ending in a dot or a space, which Windows trims from a "
                       f"bare name; nothing was created")                # `\\?\` is another directory, and tempfile trims it again (r8 A1)
     scratch_root.mkdir(parents=True, exist_ok=True)
     scratch_root = pathlib.Path(_real(scratch_root))                    # a root named through a link or junction: made under its real path
-    if os.name == "nt" and any(part.endswith((".", " ")) and part not in (".", "..")
-                               for part in os.fspath(scratch_root).removeprefix("\\\\?\\").split("\\")):
+    if os.name == "nt" and _ambiguous_parts(os.fspath(scratch_root).removeprefix("\\\\?\\")):
         raise Unknown("EXERCISE_SCRATCH_ROOT_AMBIGUOUS",                # the same check on the RESOLVED root: a link whose target ends in a dot (r9 A3)
                       f"scratch root {scratch_root} (resolved) has a component ending in a dot or a space; nothing was created")
     base =pathlib.Path(tempfile.mkdtemp(prefix=ROUTE_SCRATCH_PREFIX, dir=str(scratch_root)))
