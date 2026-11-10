@@ -223,8 +223,17 @@ def _flatten(node: ast.AST, consts: dict[str, str], depth: int = 0) -> tuple[str
         value = consts.get(node.id) if isinstance(node.ctx, ast.Load) else None
         return (value, True) if value is not None else ("", False)
     if isinstance(node, ast.JoinedStr):
-        parts = [(v.value, True) if isinstance(v, ast.Constant) else _flatten(v.value, consts, depth + 1) if isinstance(v, ast.FormattedValue)
-                 else ("", False) for v in node.values]
+        parts = []
+        for v in node.values:
+            if isinstance(v, ast.Constant):
+                parts.append((v.value, True))
+            elif isinstance(v, ast.FormattedValue):
+                text, known = _flatten(v.value, consts, depth + 1)
+                spec, spec_known = _flatten(v.format_spec, consts, depth + 1) if v.format_spec is not None else (None, True)
+                shown = _apply_spec(text, {115: "s", 114: "r", 97: "a"}.get(v.conversion), spec) if known and spec_known else None
+                parts.append((shown, True) if shown is not None else (text, False))  # an unknown piece contributes its partial text, not a spec'd one
+            else:
+                parts.append(("", False))
         return "".join(t for t, _ in parts), all(k for _, k in parts)
     if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
         leaves, todo = [], [node]  # iterative: a long chain must not exhaust the stack
@@ -330,7 +339,9 @@ def _fill_format(template: str, positional: list[tuple[str, bool]], named: dict[
     def field(match: re.Match) -> str:
         if match.group(0) in ("{{", "}}"):
             return match.group(0)[0]
-        name = re.match(r"\w*", match.group(1) or "").group(0)
+        field_name = match.group(1) or ""
+        name = re.match(r"\w*", field_name).group(0)
+        accessors = field_name[len(name):]  # `0[0]`, `a.real`: indexing is applied to a known text, anything else makes the text unknown
         if name == "":
             index, state["next"] = state["next"], state["next"] + 1
             value = positional[index] if index < len(positional) else None
@@ -338,6 +349,12 @@ def _fill_format(template: str, positional: list[tuple[str, bool]], named: dict[
             value = positional[int(name)] if int(name) < len(positional) else None
         else:
             value = named.get(name)
+        if value is not None and accessors:
+            index = re.fullmatch(r"\[(\d+)\]", accessors)  # str.format reads `[-1]` as the string key '-1', which a str rejects
+            try:
+                value = (value[0][int(index.group(1))], value[1]) if index and value[1] else None
+            except IndexError:
+                value = None
         if value is None:
             state["known"] = False
             return ""
@@ -778,8 +795,10 @@ def _imported_module_position_ok(node: ast.AST, up: ast.AST | None, parent: dict
     container, conditional, subscript, return, lambda, class attribute or any other binding the scan cannot tie a later call back to."""
     if isinstance(up, ast.Attribute):
         return node is up.value  # shutil.which, shutil.os: the attribute is judged at its own node
-    if isinstance(up, (ast.Compare, ast.Expr, ast.UnaryOp, ast.FormattedValue, ast.Assert)):
+    if isinstance(up, (ast.Compare, ast.Expr, ast.UnaryOp, ast.FormattedValue)):
         return True
+    if isinstance(up, ast.Assert):
+        return node is up.test  # `assert shutil` is read and dropped; `assert x, shutil` carries the module away in AssertionError.args
     if isinstance(up, (ast.If, ast.While, ast.IfExp)) and node is up.test:
         return True
     if isinstance(up, ast.BoolOp) and isinstance(up.op, ast.And) and node is not up.values[-1]:
@@ -1197,11 +1216,17 @@ def _judge_script(script: str) -> tuple[int, int]:
         for s, e in spans:
             for k in range(s, e + 1):
                 quoted[k] = True
-        depth, depths = 0, [0] * len(statement)
+        # The id of the innermost parenthesized group each character sits in. A depth number would let `(Start-Process a), (Start-Process b
+        # -WindowStyle Hidden)` give the first launch the second one's parameter: two sibling groups share a depth but not a group.
+        open_groups, next_group, depths = [], 0, [0] * len(statement)
         for k, ch in enumerate(statement):
             if not quoted[k]:
-                depth = depth + 1 if ch == "(" else max(0, depth - 1) if ch == ")" else depth
-            depths[k] = depth
+                if ch == "(":
+                    next_group += 1
+                    open_groups.append(next_group)
+                elif ch == ")" and open_groups:
+                    open_groups.pop()
+            depths[k] = open_groups[-1] if open_groups else 0
         hole = "\x01" in statement  # a run-time value of unknown text sits in this statement: it could hold a comment or a quote
         command_names = set()  # quoted strings that ARE the command name (`& 'Start-Process' ...`): not a nested script
         for m in _START_PROCESS_RE.finditer(statement):
@@ -2771,6 +2796,63 @@ class AdversaryR6Pass13Tests(unittest.TestCase):
         }.items():
             self.assertEqual(self._judge(ps), (1, 0), label)
         self.assertEqual(self._judge("Write-Output “the start of it”"), (0, 0))
+
+
+class AdversaryR6Pass14Tests(unittest.TestCase):
+    """r6 adversary pass 14 (review-adversary-MLV-LANE-CONSOLE-HIDDEN-1-r6-231e0d2d), findings A1-A4 and their siblings, as classes."""
+
+    def _bad(self, source: str) -> list[str]:
+        return _unflagged_spawns_in_source(source, "synthetic.py")
+
+    # A1 / A2: the fold keeps an f-string hole's spec and conversion, and a format field's index
+    def test_a1_a2_the_fold_keeps_fstring_specs_and_format_field_indexes(self):
+        for src in ("f\"{'subprocess_exec_extra':.15s}\"", "f\"{'subprocess_exec':>20}\"", "f\"{'ab'!r}\"", "f\"{'abc':{'.2'}s}\"",
+                    "'{0[0]}ubprocess_exec'.format('sx')", "'{[0]}ubprocess_exec'.format('sx')", "'{a[1]}'.format(a='xs')",
+                    "'{0[0]}{0[1]}'.format('su')", "'{x[0]}ubprocess_exec'.format_map({'x': 'sx'})"):
+            want = eval(src)  # the test's own literal, never scanned text
+            got = _flatten(ast.parse(src, mode="eval").body, {})
+            self.assertEqual(got, (want, True), src)
+        # an accessor the fold cannot apply is unknown, never a wrong known text
+        for src in ("'{0.real}'.format('x')", "'{0[a]}'.format('x')", "'{0[9]}'.format('x')", "'{0[-1]}'.format('x')", "f\"{'x':{width}}\""):
+            self.assertFalse(_flatten(ast.parse(src, mode="eval").body, {})[1], src)
+        for label, src in {
+            "fstring precision": "getattr(loop, f\"{'subprocess_exec_extra':.15s}\")\n",
+            "format index": "getattr(loop, '{0[0]}ubprocess_exec'.format('sx'))\n",
+            "format keyword index": "getattr(loop, '{a[0]}ubprocess_exec'.format(a='sx'))\n",
+            "format_map index": "getattr(loop, '{a[0]}ubprocess_exec'.format_map({'a': 'sx'}))\n",
+            "fstring conversion": "getattr(loop, f\"{'subprocess_exec'!s}\")\n",
+        }.items():
+            self.assertGreaterEqual(len(self._bad(src)), 1, label)
+        found, bad = _start_process_violations("x = f\"{'saps_extra':.4s} cmd.exe\"\n")
+        self.assertEqual((found, len(bad)), (1, 1))
+
+    # A3: a parameter belongs to the parenthesized group its command sits in, not to any group at the same depth
+    def test_a3_a_hidden_parameter_in_a_sibling_group_does_not_count(self):
+        judge = lambda ps: (lambda r: (r[0], len(r[1])))(_start_process_violations("x = " + repr(ps) + "\n"))  # noqa: E731
+        for ps in ("$p = (Start-Process cmd.exe -PassThru), (Start-Process cmd.exe -WindowStyle Hidden -PassThru)",
+                   "@((saps a), (saps b -WindowStyle Hidden))",
+                   "Write-Output (start a) (Get-X -WindowStyle Hidden)",
+                   "(Start-Process cmd.exe) -WindowStyle Hidden",
+                   "$(Start-Process a) + $(Get-Foo -WindowStyle Hidden)"):
+            found, bad = judge(ps)
+            self.assertGreaterEqual(bad, 1, ps)
+        self.assertEqual(judge("$p = (Start-Process cmd.exe -WindowStyle Hidden -PassThru), (Start-Process cmd.exe -WindowStyle Hidden)"), (2, 0))
+        self.assertEqual(judge("$p = (Start-Process a -ArgumentList (Get-Args) -WindowStyle Hidden)"), (1, 0))
+        self.assertEqual(judge("$x = @((saps a -WindowStyle Hidden), (saps b -WindowStyle Hidden))"), (2, 0))
+
+    # A4: the message of an assert is a value the AssertionError carries away
+    def test_a4_an_imported_module_as_an_assert_message_is_reported(self):
+        for label, src in {
+            "assert message": "import shutil\ntry:\n    assert False, shutil\nexcept AssertionError as e:\n    e.args[0].os.system('cmd.exe')\n",
+            "raise argument": "import shutil\ntry:\n    raise ValueError(shutil)\nexcept ValueError as e:\n    e.args[0].os.system('cmd.exe')\n",
+            "raise the module": "import shutil\ntry:\n    raise shutil\nexcept TypeError:\n    pass\n",
+            "match subject": "import shutil\nmatch shutil:\n    case m:\n        m.os.system('x')\n",
+            "with item": "import shutil\nwith shutil as s:\n    s.os.system('x')\n",
+            "await": "import shutil\nasync def f():\n    s = await shutil\n    s.os.system('x')\n",
+            "dynamic import message": "assert False, __import__('shutil')\n",
+        }.items():
+            self.assertGreaterEqual(len(self._bad(src)), 1, label)
+        self.assertEqual(self._bad("import shutil\nassert shutil\nassert shutil.which('x'), 'missing'\n"), [])  # the test of an assert is never carried away
 
 
 class SpawnSiteBehaviourTests(unittest.TestCase):
