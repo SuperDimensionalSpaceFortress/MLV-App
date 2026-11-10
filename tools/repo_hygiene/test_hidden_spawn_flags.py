@@ -32,7 +32,10 @@ run time (a variable, a call, a ``*`` or ``**`` in its arguments, a list of only
 it is REPORTED. A name that is the string of an event-loop spawn method (``getattr(loop, 'subprocess_exec')``, ``attrgetter``) is REPORTED,
 also when it is built from literals (a ``+`` chain, ``%``, ``.format``, ``.join``, ``.replace`` or an f-string whose holes are literals).
 A module bound by ``import x [as y]`` (and a plain alias or literal dynamic import of one) is followed as a value: in a container,
-conditional, subscript, return, lambda, class attribute or call argument it is REPORTED, because any module may re-export ``os``. The standard ``_NO_WINDOW`` definition is trusted only
+conditional, subscript, return, lambda, class attribute or call argument it is REPORTED, because any module may re-export ``os``; for the
+same reason a dunder attribute read off it (``shutil.__dict__``) and every reflection helper (``globals()``, ``signature``, ``__annotations__``)
+is REPORTED in a file that imports any module. A built string is folded with ``replace`` (and its count), ``strip``/``lower``/``upper``, a
+slice, ``chr(n)``, ``bytes.decode`` and a ``format`` / ``%`` spec (``{:.4s}``), applied the way Python applies them. The standard ``_NO_WINDOW`` definition is trusted only
 when ``os``, ``subprocess`` and ``getattr`` each come from exactly one ordinary ``import``.
 
 Remaining limits, every one named (r5 rewrite: the scan is syntactic and static, so these are what it does NOT see):
@@ -49,7 +52,8 @@ Remaining limits, every one named (r5 rewrite: the scan is syntactic and static,
     card's promise is that no ACCIDENTAL unflagged spawn lands, not that deliberate evasion is impossible.
   * Any non-Python launcher: a ``.ps1`` / ``.cmd`` / ``.bat`` file that starts a console program is not read at all, and a
     PowerShell script is read only inside a Python string of the one fixture file. There only ``Start-Process`` and its aliases
-    ``start`` / ``saps`` (also quoted as ``& 'Start-Process'`` or dot-sourced) are recognised as the launch; ``[Diagnostics.Process]::Start``,
+    ``start`` / ``saps`` (also quoted as ``& 'Start-Process'`` or dot-sourced, after ``return`` / ``throw`` / ``exit`` / ``!`` / ``-not``, and with
+    typographic quotes, dashes and a no-break space read as the ASCII ones) are recognised as the launch; ``[Diagnostics.Process]::Start``,
     ``Invoke-Item``, ``Invoke-Expression`` over a built string, ``cmd /c start``, ``& (Get-Command ...)`` and a command name held in a
     variable are not. A Start-Process written in a string that is assembled any other way than a literal, a ``+`` chain, an f-string,
     ``%``, ``.format`` or ``.join`` (a file read at run time, ``chr()``) is not read. A built string is REPORTED only when a literal piece
@@ -196,8 +200,10 @@ def _label(expr: ast.AST) -> str:
         return "<expression>"
 
 
-_FORMAT_FIELD_RE = re.compile(r"\{\{|\}\}|\{([^{}!:]*)(?:![rsa])?(?::[^{}]*)?\}")
-_PERCENT_FIELD_RE = re.compile(r"%(?:\(([^)]*)\))?[#0\- +]*(\d+|\*)?(?:\.(?:\d+|\*))?[hlL]?([sraidiouxXeEfFgGc%])")
+_FORMAT_FIELD_RE = re.compile(r"\{\{|\}\}|\{([^{}!:]*)(?:!([rsa]))?(?::([^{}]*))?\}")
+_PERCENT_FIELD_RE = re.compile(r"%(?:\(([^)]*)\))?([#0\- +]*)(\d+|\*)?(?:\.(\d+|\*))?[hlL]?([sraidiouxXeEfFgGc%])")
+_SPEC_NUMBER_LIMIT = 256  # a width or precision above this is never handed to Python's formatter (no huge allocation)
+_STRING_MAPPERS = frozenset({"lower", "upper", "casefold", "strip", "lstrip", "rstrip", "title", "capitalize", "swapcase"})
 _FLATTEN_DEPTH = 48
 
 
@@ -256,16 +262,70 @@ def _flatten(node: ast.AST, consts: dict[str, str], depth: int = 0) -> tuple[str
             sep, sep_known = _flatten(recv, consts, depth + 1)
             parts = [_flatten(e, consts, depth + 1) for e in node.args[0].elts]
             return sep.join(t for t, _ in parts), sep_known and all(k for _, k in parts)
-        if method == "replace" and len(node.args) >= 2:
+        if method == "replace" and 2 <= len(node.args) + len(node.keywords) <= 3 and len(node.args) >= 2 and all(kw.arg == "count" for kw in node.keywords):
             text, known = _flatten(recv, consts, depth + 1)
             old, old_known = _flatten(node.args[0], consts, depth + 1)
             new, new_known = _flatten(node.args[1], consts, depth + 1)
-            return (text.replace(old, new) if old and old_known and new_known else text), known and old_known and new_known
+            count = -1
+            if len(node.args) + len(node.keywords) == 3:  # 'ssubprocess_exec'.replace('s', '', 1) / count=1: only the first one goes
+                c = node.args[2] if len(node.args) == 3 else node.keywords[0].value
+                count = _int_literal(c)
+                count = count if isinstance(count, int) else None
+            if count is None or not (known and old_known and new_known):
+                return text, False
+            return text.replace(old, new, count), True
+        if method in _STRING_MAPPERS and not node.keywords and len(node.args) <= 1:
+            text, known = _flatten(recv, consts, depth + 1)
+            chars, chars_known = _flatten(node.args[0], consts, depth + 1) if node.args else (None, True)
+            if not (known and chars_known):
+                return text, False
+            if chars is not None:
+                return (getattr(text, method)(chars), True) if method in ("strip", "lstrip", "rstrip") else (text, False)
+            return getattr(text, method)(), True
+    if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "chr" and len(node.args) == 1 and not node.keywords:
+        code = _int_literal(node.args[0])  # chr(115) + 'ubprocess_exec'
+        return (chr(code), True) if isinstance(code, int) and 0 <= code < 0x110000 else ("", False)
+    if (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr == "decode" and not node.args and not node.keywords
+            and isinstance(node.func.value, ast.Constant) and isinstance(node.func.value.value, bytes)):
+        return node.func.value.value.decode("utf-8", "replace"), True  # b'subprocess_exec'.decode()
+    if isinstance(node, ast.Subscript) and isinstance(node.slice, ast.Slice):  # 'xsubprocess_exec'[1:], 'cexe_ssecorpbus'[::-1]
+        text, known = _flatten(node.value, consts, depth + 1)
+        bounds = [_int_literal(p) for p in (node.slice.lower, node.slice.upper, node.slice.step)]
+        if known and "?" not in bounds and bounds[2] != 0:
+            return text[slice(*bounds)], True
+        return text, False
     return "", False
 
 
+def _int_literal(node: ast.AST | None) -> int | None | str:
+    """The int a slice bound spells (``1``, ``-1``), None for an absent bound, ``"?"`` for anything else."""
+    if node is None:
+        return None
+    if isinstance(node, ast.UnaryOp) and isinstance(node.op, (ast.USub, ast.UAdd)):
+        inner = _int_literal(node.operand)
+        return -inner if isinstance(inner, int) and isinstance(node.op, ast.USub) else inner if isinstance(inner, int) else "?"
+    return node.value if isinstance(node, ast.Constant) and type(node.value) is int else "?"
+
+
+def _apply_spec(text: str, conv: str | None, spec: str | None) -> str | None:
+    """``format(text, spec)`` after a ``!r`` / ``!a`` conversion, or None when the spec cannot be applied safely or is not valid for a string."""
+    if conv == "r":
+        text = repr(text)
+    elif conv == "a":
+        text = ascii(text)
+    if not spec:
+        return text
+    if any(int(number) > _SPEC_NUMBER_LIMIT for number in re.findall(r"\d+", spec)):
+        return None
+    try:
+        return format(text, spec)
+    except (ValueError, TypeError):
+        return None
+
+
 def _fill_format(template: str, positional: list[tuple[str, bool]], named: dict[str, tuple[str, bool]], known: bool) -> tuple[str, bool]:
-    state = {"next": 0, "known": known}
+    # a brace left over once every field is removed is a nested field (`{:{}}`): the text is not known
+    state = {"next": 0, "known": known and not re.search(r"[{}]", _FORMAT_FIELD_RE.sub("", template))}
 
     def field(match: re.Match) -> str:
         if match.group(0) in ("{{", "}}"):
@@ -281,8 +341,12 @@ def _fill_format(template: str, positional: list[tuple[str, bool]], named: dict[
         if value is None:
             state["known"] = False
             return ""
+        shown = _apply_spec(value[0], match.group(2), match.group(3)) if value[1] else value[0]
+        if shown is None:
+            state["known"] = False
+            return ""
         state["known"] = state["known"] and value[1]
-        return value[0]
+        return shown
 
     return _FORMAT_FIELD_RE.sub(field, template), state["known"]
 
@@ -291,21 +355,28 @@ def _fill_percent(template: str, positional: list[tuple[str, bool]], named: dict
     state = {"next": 0, "known": known}
 
     def field(match: re.Match) -> str:
-        if match.group(3) == "%":
+        key, flags, width, precision, conv = match.groups()
+        if conv == "%":
             return "%"
-        if match.group(2) == "*":  # a width taken from the arguments: the positions after it are not tracked
+        if "*" in (width, precision):  # a width taken from the arguments: the positions after it are not tracked
             state["known"] = False
             return ""
-        if match.group(1) is not None:
-            value = named.get(match.group(1))
+        if key is not None:
+            value = named.get(key)
         else:
             index, state["next"] = state["next"], state["next"] + 1
             value = positional[index] if index < len(positional) else None
-        if value is None or match.group(3) not in "sra":
+        if value is None or conv not in "sra" or not value[1]:
             state["known"] = False
-            return value[0] if value is not None else ""
-        state["known"] = state["known"] and value[1]
-        return value[0]
+            return value[0] if value is not None and conv in "sra" else ""
+        if any(int(number) > _SPEC_NUMBER_LIMIT for number in (width, precision) if number):
+            state["known"] = False
+            return ""
+        try:
+            return ("%" + flags + (width or "") + ("." + precision if precision else "") + conv) % (value[0],)
+        except (ValueError, TypeError):
+            state["known"] = False
+            return ""
 
     return _PERCENT_FIELD_RE.sub(field, template), state["known"]
 
@@ -745,7 +816,7 @@ def _reference_violations(tree: ast.AST, facts: _Facts) -> list[tuple[int, str]]
         for child in ast.iter_child_nodes(node):
             parent[id(child)] = node
     out: list[tuple[int, str]] = []
-    binds_spawn = bool(facts.modules or facts.funcs)
+    binds_spawn = bool(facts.modules or facts.funcs or facts.module_names)  # any imported module may re-export os / subprocess
     for node in ast.walk(tree):
         module: str | None = None
         is_ref = False
@@ -768,10 +839,14 @@ def _reference_violations(tree: ast.AST, facts: _Facts) -> list[tuple[int, str]]
             continue
         if isinstance(node, ast.Constant) and isinstance(node.value, str) and _LOOP_METHOD_NAME_RE.fullmatch(node.value):
             out.append((node.lineno, f"names {node.value!r} as a string, which reaches an event-loop spawn method without calling it in place"))
-        if isinstance(node, (ast.BinOp, ast.JoinedStr, ast.Call)) and not (isinstance(node, ast.BinOp) and isinstance(parent.get(id(node)), ast.BinOp)):
+        if isinstance(node, (ast.BinOp, ast.JoinedStr, ast.Call, ast.Subscript)) and not (isinstance(node, ast.BinOp) and isinstance(parent.get(id(node)), ast.BinOp)):
             built, known = _flatten(node, facts.consts)  # 'subprocess_' + 'exec', '%sexec' % 'subprocess_', f'subprocess_{"exec"}': the folded name
             if known and _LOOP_METHOD_NAME_RE.fullmatch(built):
                 out.append((node.lineno, f"names {built!r} as a built string, which reaches an event-loop spawn method without calling it in place"))
+        if (isinstance(node, ast.Attribute) and node.attr.startswith("__") and node.attr.endswith("__") and node.attr not in _DUNDER_OK
+                and ((isinstance(node.value, ast.Name) and node.value.id in facts.module_names)
+                     or (isinstance(node.value, ast.Call) and facts.import_target(node.value)[0]))):
+            out.append((node.lineno, f"reads {node.attr} off an imported module, which reaches its contents without a followable reference"))
         if isinstance(node, ast.Attribute) and isinstance(node.ctx, (ast.Store, ast.Del)) and facts.module_of(node.value) is not None:
             out.append((node.lineno, f"assigns or deletes the attribute {node.attr} on a spawn module"))  # CREATE_NO_WINDOW, os.name, run ...
         if isinstance(node, ast.Attribute) and node.attr in _LOOP_SPAWN_METHODS:
@@ -986,6 +1061,10 @@ def _unflagged_spawns_in_source(source: str, label: str) -> list[str]:
 
 _WINDOW_STYLE_HIDDEN_RE = re.compile(r"(?<!\S)-WindowStyle[\s:]+(?:'Hidden'|\"Hidden\"|Hidden(?![\w-]))", re.IGNORECASE)
 _START_PROCESS_RE = re.compile(r"(?<![\w$.-])(Start-Process|saps|start)(?![\w-])", re.IGNORECASE)  # the cmdlet and its aliases
+_PS_COMMAND_PREFIX_RE = re.compile(r"(?<![\w$.-])(?:return|throw|exit|-not)$", re.IGNORECASE)  # a word that ends right before a command name
+# PowerShell reads these typographic characters as the ASCII ones: single and double quotes, the three dashes a parameter may start with, no-break space.
+_PS_CHAR_MAP = str.maketrans({"‘": "'", "’": "'", "‚": "'", "‛": "'", "“": '"', "”": '"', "„": '"',
+                              "–": "-", "—": "-", "―": "-", " ": " ", "\u0085": " "})
 
 
 def _quoted_spans(text: str) -> list[tuple[int, int]]:
@@ -1101,7 +1180,8 @@ def _at_command_position(before: str) -> bool:
     b = before.rstrip()
     while b and b[-1] in "&." and (b[-1] == "&" or len(b) == 1 or b[-2].isspace() or b[-2] in "=({"):
         b = b[:-1].rstrip()
-    return b == "" or b[-1] in "=("
+    # `return saps x`, `throw start x`, `exit saps`, `-not saps x`, `! saps x`: the keyword or operator leaves the next word in command position
+    return b == "" or b[-1] in "=(!" or bool(_PS_COMMAND_PREFIX_RE.search(b))
 
 
 def _judge_script(script: str) -> tuple[int, int]:
@@ -1111,7 +1191,7 @@ def _judge_script(script: str) -> tuple[int, int]:
     starting a word (``foo-WindowStyle:Hidden`` and ``(Get-ChildArgs -WindowStyle Hidden)`` do not count).
     """
     found = bad = 0
-    for statement in _ps_statements(_unescape_ps(script)):
+    for statement in _ps_statements(_unescape_ps(script.translate(_PS_CHAR_MAP))):
         spans = _quoted_spans(statement)
         quoted = [False] * len(statement)
         for s, e in spans:
@@ -1154,7 +1234,8 @@ def _judge_script(script: str) -> tuple[int, int]:
 _STRING_BUILDERS = frozenset({"format", "format_map", "join", "replace", "__mod__"})
 # A literal piece of a run-time built string that reads as a launch: a ``Start-`` prefix, or ``start`` / ``saps`` where a command word can
 # stand (the piece's start, or after ; & | ( { = or a dot-source), so 'the start of {}' is prose and 'start {}' is the alias.
-_BUILT_LAUNCH_RE = re.compile(r"start-|(?:^|[;&|({=]|\s\.)\s*(?:start|saps)(?![\w-])", re.IGNORECASE | re.MULTILINE)
+_BUILT_LAUNCH_RE = re.compile(r"start-|(?:^|[;&|({=!]|\s\.)\s*(?:start|saps)(?![\w-])|(?<![\w$.-])(?:return|throw|exit|-not)\s+(?:start|saps)(?![\w-])",
+                              re.IGNORECASE | re.MULTILINE)
 
 
 def _string_values(tree: ast.AST) -> list[tuple[int, str, bool]]:
@@ -1229,6 +1310,7 @@ def _start_process_violations(py_source: str) -> tuple[int, list[int]]:
             found += 1
             bad.append(lineno)
             continue
+        text = text.translate(_PS_CHAR_MAP)  # typographic quotes and dashes are the ASCII ones to PowerShell
         # a backtick-escaped name (bareword) or a `n boundary (double quotes) must not hide the launch from the filter
         flats = (text, _unescape_ps(text), _dq_value(text)) if "`" in text else (text,)
         if not any(_START_PROCESS_RE.search(flat) for flat in flats) and not re.search(r"'\s*(start-process|saps|start)\s*'|\"\s*(start-process|saps|start)\s*\"", text, re.I):
@@ -2338,7 +2420,9 @@ class AdversaryR5Pass10Tests(unittest.TestCase):
             "closure cell": "import subprocess\ndef outer():\n    def inner():\n        return 1\n    return inner\nouter().__closure__\n",
         }.items():
             self.assertGreaterEqual(len(self._bad(src)), 1, label)
-        self.assertEqual(self._bad("import inspect\ndef launch(a: int): pass\nr = inspect.signature(launch)\n"), [])  # no spawn bound: nothing to hide
+        # r6 (pass 13 A2): any imported module may re-export os, so reflection is reported in a file that imports one; a file that imports nothing has nothing to reach
+        self.assertGreaterEqual(len(self._bad("import inspect\ndef launch(a: int): pass\nr = inspect.signature(launch)\n")), 1)
+        self.assertEqual(self._bad("def launch(a: int): pass\nr = launch.__annotations__\nsignature = 1\n"), [])
 
     # A3: spawn classes re-exported by asyncio submodules (asyncio.windows_utils.Popen forwards to subprocess.Popen) need creationflags.
     def test_a3_asyncio_submodule_spawn_classes_need_an_accepted_flag(self):
@@ -2579,6 +2663,114 @@ class AdversaryR6Tests(unittest.TestCase):
         self.assertEqual(self._bad("import shutil\nclass X:\n    n = 1\n    w = shutil.which\n"), [])
         self.assertEqual(self._bad("import shutil\nm = shutil\nm.which('z')\n"), [])
         self.assertEqual(self._bad("class X:\n    def f(self):\n        import shutil\n        m = shutil\n        return m.which('z')\n"), [])
+
+
+class AdversaryR6Pass13Tests(unittest.TestCase):
+    """r6 adversary pass 13 (review-adversary-MLV-LANE-CONSOLE-HIDDEN-1-r6-f58ea05c), findings A1-A4 and their siblings, as classes."""
+
+    def _bad(self, source: str) -> list[str]:
+        return _unflagged_spawns_in_source(source, "synthetic.py")
+
+    @staticmethod
+    def _judge(ps: str) -> tuple[int, int]:
+        found, bad = _start_process_violations("x = " + repr(ps) + "\n")
+        return found, len(bad)
+
+    # A1: the fold must do what Python does: a replace count, a format precision/width/conversion, a % precision
+    def test_a1_the_fold_applies_replace_counts_and_format_specs_like_python(self):
+        for src in ("'ssubprocess_exec'.replace('s', '', 1)", "'ssubprocess_exec'.replace('s', '')", "'{:.4s} cmd'.format('saps_suffix')",
+                    "'{:>6.4s}'.format('saps_x')", "'{!r}'.format('ab')", "'{0:.5s}{1}'.format('start-x', 'y')", "'%.4s cmd' % 'saps_suffix'",
+                    "'%-6.4s|' % 'saps_x'", "'%r' % 'ab'", "'{{}}{}'.format('a')", "'%%%s' % 'a'"):
+            want = eval(src)  # the test's own literal, never scanned text
+            self.assertEqual(_flatten(ast.parse(src, mode="eval").body, {}), (want, True), src)
+        # a spec the fold cannot apply makes the text unknown rather than wrong; an enormous width is never allocated
+        self.assertEqual(_flatten(ast.parse("'{:>999999999}'.format('x')", mode="eval").body, {})[1], False)
+        self.assertEqual(_flatten(ast.parse("'{:{}}'.format('x', 3)", mode="eval").body, {})[1], False)
+
+    def test_a1_a_replace_count_or_format_precision_cannot_hide_a_loop_method_or_a_launch(self):
+        for label, src in {
+            "replace count": "import asyncio\nloop = asyncio.get_running_loop()\ngetattr(loop, 'ssubprocess_exec'.replace('s', '', 1))\n",
+            "precision on exec": "getattr(loop, '{:.15s}'.format('subprocess_exec_extra'))\n",
+            "precision on shell": "getattr(loop, '%.16s' % 'subprocess_shell_x')\n",
+            "precision on transport": "getattr(loop, '{:.26s}'.format('_make_subprocess_transport_x'))\n",
+            "replace on shell": "getattr(loop, 'subprocess_shellX'.replace('X', ''))\n",
+            "replace count keyword": "getattr(loop, 'ssubprocess_exec'.replace('s', '', count=1))\n",
+            "upper/lower": "getattr(loop, 'SUBPROCESS_EXEC'.lower())\n",
+            "strip": "getattr(loop, '  subprocess_exec '.strip())\n",
+            "slice": "getattr(loop, 'xsubprocess_exec'[1:])\n",
+            "reversed slice": "getattr(loop, 'cexe_ssecorpbus'[::-1])\n",
+            "chr": "getattr(loop, chr(115) + 'ubprocess_exec')\n",
+            "bytes decode": "getattr(loop, b'subprocess_exec'.decode())\n",
+            "format conversion": "getattr(loop, '{!s}'.format('subprocess_exec'))\n",
+        }.items():
+            self.assertGreaterEqual(len(self._bad(src)), 1, label)
+        for label, ps in {
+            "format precision": "x = '{:.4s} cmd.exe'.format('saps_suffix')\n",
+            "percent precision": "x = '%.5s cmd.exe' % 'start_suffix'\n",
+            "replace count": "x = 'ssaps cmd.exe'.replace('s', '', 1)\n",
+        }.items():
+            found, bad = _start_process_violations(ps)
+            self.assertEqual((found, len(bad)), (1, 1), label)
+
+    # A2: reflection reaches any imported module (any module may re-export os), not only a bound spawn module
+    def test_a2_reflection_over_a_file_that_only_imports_a_module_is_reported(self):
+        for label, src in {
+            "globals": "import shutil\nglobals()['shutil'].os.system('cmd.exe')\n",
+            "locals": "import shutil\nlocals()['shutil'].os.system('cmd.exe')\n",
+            "vars of the module": "import shutil\nvars(shutil)['os'].system('cmd.exe')\n",
+            "module __dict__": "import shutil\nshutil.__dict__['os'].system('cmd.exe')\n",
+            "__getattribute__": "import shutil\nshutil.__getattribute__('os').system('cmd.exe')\n",
+            "dunder on a dynamic import": "__import__('shutil').__dict__['os'].system('x')\n",
+            "annotation": "import shutil\ndef f(a: shutil.os): pass\nf.__annotations__['a'].system('x')\n",
+            "signature": "import shutil, inspect\ndef f(a: shutil.os): pass\ninspect.signature(f).parameters['a'].annotation.system('x')\n",
+            "get_type_hints": "import shutil, typing\ndef f(a: shutil.os): pass\ntyping.get_type_hints(f)['a'].system('x')\n",
+        }.items():
+            self.assertGreaterEqual(len(self._bad(src)), 1, label)
+        # controls: a file that reflects over nothing it imported, and a module read by a fixed attribute, stay clean
+        self.assertEqual(self._bad("x = {}\ny = vars()\nz = 1\n"), [])
+        self.assertEqual(self._bad("import shutil\nx = shutil.which('z')\nprint(shutil.__name__)\n"), [])
+        self.assertEqual(self._bad("import json\nprint(json.__doc__)\n"), [])
+
+    # A3: PowerShell keywords that put a command name next to the keyword
+    def test_a3_a_launch_after_return_throw_or_exit_is_judged(self):
+        for kw in ("return", "throw", "exit", "RETURN", "Throw"):
+            for alias in ("saps", "start", "Start-Process"):
+                self.assertEqual(self._judge(f"{kw} {alias} cmd.exe"), (1, 1), f"{kw} {alias}")
+                self.assertEqual(self._judge(f"{kw} {alias} cmd.exe -WindowStyle Hidden"), (1, 0), f"{kw} {alias} hidden")
+        self.assertEqual(self._judge("return (saps cmd.exe)"), (1, 1))
+        self.assertEqual(self._judge("if ($a) { return saps cmd.exe }"), (1, 1))
+        self.assertEqual(self._judge("! saps cmd.exe"), (1, 1))
+        self.assertEqual(self._judge("-not saps cmd.exe"), (1, 1))
+        for src in ("x = 'ret' + 'urn saps cmd.exe'\n", "x = 'throw {} cmd.exe'.format('sa' + 'ps')\n",
+                    "x = 'exit s{}s cmd.exe'.format('ap')\n", "x = 'return %s cmd.exe' % 'start'\n"):
+            found, bad = _start_process_violations(src)
+            self.assertEqual((found, len(bad)), (1, 1), src)
+        # controls: prose that merely contains the words
+        self.assertEqual(self._judge("Write-Output 'return the start of it'"), (0, 0))
+        self.assertEqual(self._judge("return $start"), (0, 0))
+
+    # A4: PowerShell reads typographic quotes, dashes and a no-break space as the ASCII ones
+    def test_a4_typographic_quotes_dashes_and_spaces_are_read_like_ascii(self):
+        for label, ps in {
+            "smart double alias": "& “saps” cmd.exe",
+            "smart single alias": "& ‘saps’ cmd.exe",
+            "smart double start": "& “Start-Process” cmd.exe",
+            "low double": "& „saps” cmd.exe",
+            "single low-9": "& ‚saps’ cmd.exe",
+            "reversed single": "& ‛saps’ cmd.exe",
+            "nested script in smart quotes": "powershell -c “Start-Process cmd.exe”",
+            "no-break space": "Start-Process cmd.exe",
+            "en dash style": "Start-Process cmd.exe –WindowStyle Normal",
+        }.items():
+            self.assertEqual(self._judge(ps), (1, 1), label)
+        for label, ps in {
+            "en dash hidden": "Start-Process cmd.exe –WindowStyle Hidden",
+            "em dash hidden": "Start-Process cmd.exe —WindowStyle Hidden",
+            "smart quoted hidden": "Start-Process cmd.exe -WindowStyle ‘Hidden’",
+            "smart double quoted hidden": "& “saps” cmd.exe -WindowStyle “Hidden”",
+        }.items():
+            self.assertEqual(self._judge(ps), (1, 0), label)
+        self.assertEqual(self._judge("Write-Output “the start of it”"), (0, 0))
 
 
 class SpawnSiteBehaviourTests(unittest.TestCase):
