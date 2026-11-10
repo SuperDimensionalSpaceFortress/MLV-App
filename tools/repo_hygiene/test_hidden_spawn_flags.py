@@ -36,6 +36,10 @@ conditional, subscript, return, lambda, class attribute or call argument it is R
 same reason a dunder attribute read off it (``shutil.__dict__``) and every reflection helper (``globals()``, ``signature``, ``__annotations__``)
 is REPORTED in a file that imports any module. A built string is folded with ``replace`` (and its count), ``strip``/``lower``/``upper``, a
 slice, ``chr(n)``, ``bytes.decode`` and a ``format`` / ``%`` spec (``{:.4s}``), applied the way Python applies them where the fold is exact.
+A method called unbound on the type (``str.lower(s)``, ``builtins.str``, ``type('')``, ``''.__class__``) is the bound call, and ``operator.add`` /
+``concat`` / ``mod`` / ``mul``, ``s.__add__(t)`` and ``''.join(reversed(s))`` are folded like the operators they stand for. A call the fold has no
+arm for hedges its receiver AND every positional argument and keyword value (a call that only looks an attribute up or tests, ``getattr`` and
+``len`` among them, does not return its argument, so it hedges none).
 Any piece the fold cannot read EXACTLY (a number printed through a spec such as ``{115:c}`` or ``%c``, a ``*`` / ``**`` expansion, a mapping
 the scan cannot read key by key, a set whose iteration order is unknown, a spec wider than the fold applies, a run-time name) is a WILDCARD
 that stands for any text, and the built text is matched as a pattern against the spawn-method names and the launch keywords: a fold mistake
@@ -63,9 +67,13 @@ Remaining limits, every one named (r5 rewrite: the scan is syntactic and static,
     ``start`` / ``saps`` (also quoted as ``& 'Start-Process'`` or dot-sourced, after ``return`` / ``throw`` / ``exit`` / ``!`` / ``-not``, and with
     typographic quotes, dashes and a no-break space read as the ASCII ones) are recognised as the launch; ``[Diagnostics.Process]::Start``,
     ``Invoke-Item``, ``Invoke-Expression`` over a built string, ``cmd /c start``, ``& (Get-Command ...)`` and a command name held in a
-    variable are not. A Start-Process written in a string that is assembled any other way than a literal, a ``+`` chain, an f-string,
-    ``%``, ``.format`` or ``.join`` (a file read at run time, ``chr()``) is not read. A built string is REPORTED only when a literal piece
-    reads as ``Start-`` or as ``start`` / ``saps`` where a command word can stand.
+    variable are not. A launch is read through the fold set of ``_flatten``, the one the Python side reads a spawn-method name through (the literal,
+    ``+`` / ``%`` / f-string / ``.format`` / ``.join`` / ``.replace`` / slice / ``strip`` / case-mapper / ``chr`` / ``decode`` folds, their unbound
+    ``str.m(s, ...)`` and ``operator.add`` / ``concat`` / ``mod`` / ``mul`` spellings, ``''.join(reversed(s))``, and a string method with no arm by way of
+    ``_hedge``): a launch in a string built any of those ways is read (G13, G15, G16). A string that is not built in the file (read at run time) is
+    not read, and neither is the text an UNRECOGNISED function returns over its arguments (``run('zz' + 'Start-Process x')``): the Python side
+    hedges every argument of such a call, the PowerShell side does not, because it would report a hidden launch passed to any call as a literal.
+    A built string is REPORTED only when a literal piece reads as ``Start-`` or as ``start`` / ``saps`` where a command word can stand.
   * Whether a child of a hidden spawn stays hidden, and ``tools/agent-bridge/**`` plus the other excluded paths (EXCLUDED_DIRS /
     EXCLUDED_FILES), which are left to their own cards.
   * A name bound to two different spawn modules or APIs in one file is REPORTED rather than followed, since the alias map is
@@ -200,7 +208,7 @@ _ASYNCIO_SUBMODULES = frozenset({m.name for m in pkgutil.iter_modules(asyncio.__
 # but `.subprocess` off the asyncio package is asyncio's own wrapper module.
 _SUBMODULE_REEXPORTS = {"subprocess": "subprocess", "_subprocess": "subprocess", "os": "os", "_os": "os", "nt": "os", "posix": "os"}
 _PACKAGE_REEXPORTS = {"subprocess": "asyncio.subprocess", "os": "os", "nt": "os", "posix": "os"}
-_LOOP_METHOD_NAME_RE = re.compile(r"(?:[^.]+\.)*(?:" + "|".join(sorted(map(re.escape, _LOOP_SPAWN_METHODS))) + ")")
+_LOOP_METHOD_NAME_RE = re.compile(r"(?:[^.]*\.)*(?:" + "|".join(sorted(map(re.escape, _LOOP_SPAWN_METHODS))) + ")")
 
 
 def _label(expr: ast.AST) -> str:
@@ -264,10 +272,8 @@ def _receiver_ok(left: list) -> bool:
     """Can these items (a literal character, or None for any text) read as a dotted receiver, a run of ``segment.`` segments?"""
     if not left:
         return True
-    if left[0] == ".":
-        return False  # an empty first segment; any other character (a hyphen, a space) is part of an attribute name Python looks up as written
-    if any(left[i] == "." and left[i + 1] == "." for i in range(len(left) - 1)):
-        return False  # an empty segment
+    # An empty segment (a leading dot, ``..``) is a segment: ``operator.attrgetter`` splits on dots and looks each piece up as written, and
+    # ``getattr(holder, '')`` can hold an object (R8-F1). Any other character (a hyphen, a space) is part of an attribute name too.
     return left[-1] is None or left[-1] == "."  # the receiver ends in a dot, or in text that can
 
 
@@ -305,7 +311,7 @@ def _could_name_pattern(built: str, names: frozenset) -> bool:
 def _could_name(built: str, known: bool, names) -> bool:
     """Can this folded text (``_WILD`` = any text) read as one of ``names``, possibly behind a dotted receiver (``loop.subprocess_exec``)?"""
     if _WILD not in built:  # every uncertainty is a wildcard, so a text without one is exact whatever `known` says
-        return any(built == n or re.fullmatch(r"(?:[^.]+\.)+" + re.escape(n), built) for n in names)
+        return any(built == n or re.fullmatch(r"(?:[^.]*\.)+" + re.escape(n), built) for n in names)
     return _could_name_pattern(built, frozenset(names))
 
 
@@ -335,6 +341,49 @@ def _fold_mapping(node: ast.AST | None, consts: dict[str, str], depth: int) -> t
     return {k.value: _flatten(v, consts, depth + 1) for k, v in zip(node.keys, node.values)}, False
 
 
+# Calls whose result is not a piece of their argument text (they look an attribute up, test, measure or print): hedging their arguments would report the
+# CONSUMER of a name (``getattr(loop, 'subprocess_exec_x')``) as if it were the name, so only the call that RETURNS the text counts (G15 narrowing).
+_NOT_TEXT_OF_ARGS = frozenset({"getattr", "hasattr", "setattr", "delattr", "attrgetter", "methodcaller", "itemgetter", "isinstance", "issubclass", "len",
+                               "print", "callable", "id", "hash", "bool", "int", "float", "type", "vars", "dir"})
+_OPERATOR_BINOPS = {"add": ast.Add, "concat": ast.Add, "mod": ast.Mod, "mul": ast.Mult}
+_DUNDER_BINOPS = {"__add__": (ast.Add, False), "__radd__": (ast.Add, True), "__mod__": (ast.Mod, False), "__rmod__": (ast.Mod, True),
+                  "__mul__": (ast.Mult, False), "__rmul__": (ast.Mult, True)}
+
+
+def _is_str_type(node: ast.AST) -> bool:
+    """``str``, ``builtins.str``, ``type('')`` and ``''.__class__``: the receiver of an UNBOUND string method (``str.lower('X')``)."""
+    if isinstance(node, ast.Name):
+        return node.id == "str"
+    if isinstance(node, ast.Attribute):
+        return (node.attr == "str" and isinstance(node.value, ast.Name) and node.value.id == "builtins") or node.attr == "__class__"
+    return isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "type" and len(node.args) == 1 and not node.keywords
+
+
+def _bound_form(node: ast.AST) -> ast.AST:
+    """The bound form of a call the fold reads under another spelling (G15): ``str.m(s, ...)`` is ``s.m(...)``, ``operator.concat(a, b)`` and
+    ``a.__add__(b)`` are ``a + b`` (``add`` / ``mod`` / ``mul`` and their reflected forms too), and ``reversed([a, b])`` / ``list([a, b])`` are the
+    list they stand for. Anything else is returned as it came."""
+    if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id in ("reversed", "list", "tuple") and len(node.args) == 1 and not node.keywords:
+        arg = node.args[0]
+        if isinstance(arg, (ast.List, ast.Tuple)) and not any(isinstance(e, ast.Starred) for e in arg.elts):
+            return ast.List(elts=list(reversed(arg.elts)) if node.func.id == "reversed" else list(arg.elts), ctx=ast.Load())
+        return node
+    if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)):
+        return node
+    attr, recv = node.func.attr, node.func.value
+    if (isinstance(recv, ast.Name) and recv.id == "operator" and attr in _OPERATOR_BINOPS and len(node.args) == 2 and not node.keywords
+            and not any(isinstance(a, ast.Starred) for a in node.args)):
+        return ast.BinOp(left=node.args[0], op=_OPERATOR_BINOPS[attr](), right=node.args[1])
+    if _is_str_type(recv) and node.args and not isinstance(node.args[0], ast.Starred):
+        node = ast.Call(func=ast.Attribute(value=node.args[0], attr=attr, ctx=ast.Load()), args=node.args[1:], keywords=node.keywords)
+        recv = node.func.value
+    if attr in _DUNDER_BINOPS and len(node.args) == 1 and not node.keywords and not isinstance(node.args[0], ast.Starred):
+        op, reflected = _DUNDER_BINOPS[attr]
+        left, right = (node.args[0], recv) if reflected else (recv, node.args[0])
+        return ast.BinOp(left=left, op=op(), right=right)
+    return node
+
+
 def _flatten(node: ast.AST, consts: dict[str, str], depth: int = 0) -> tuple[str, bool]:
     """(text, known): what a string expression reads as when every piece is a string literal or a name bound once to one.
 
@@ -346,6 +395,7 @@ def _flatten(node: ast.AST, consts: dict[str, str], depth: int = 0) -> tuple[str
     """
     if depth > _FLATTEN_DEPTH:
         return _WILD, False
+    node = _bound_form(node)
     if isinstance(node, ast.Constant):
         return (node.value, True) if isinstance(node.value, str) else (_WILD, False)  # a number can print as any character (`{115:c}`)
     if isinstance(node, ast.Name):
@@ -396,6 +446,8 @@ def _flatten(node: ast.AST, consts: dict[str, str], depth: int = 0) -> tuple[str
         return (_WILD + texts[0] + _WILD, False) if len(texts) == 1 else (_WILD, False)
     if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
         method, recv = node.func.attr, node.func.value
+        if method == "join" and len(node.args) == 1 and not node.keywords:
+            node = ast.Call(func=node.func, args=[_bound_form(node.args[0])], keywords=[])  # ''.join(reversed(['a', 'b'])) joins the list reversed
         if method in ("format", "format_map"):
             template, known = _flatten(recv, consts, depth + 1)
             if method == "format_map":
@@ -403,6 +455,10 @@ def _flatten(node: ast.AST, consts: dict[str, str], depth: int = 0) -> tuple[str
                 return _fill_format(template, [], named, known, any_pos=False, any_named=any_named)
             positional, named, any_pos, any_named = _fold_args(node.args, node.keywords, consts, depth)
             return _fill_format(template, positional, named, known, any_pos=any_pos, any_named=any_named)
+        if method == "join" and len(node.args) == 1 and not node.keywords and not isinstance(node.args[0], (ast.List, ast.Tuple, ast.Set, ast.Starred)):
+            sep, sep_known = _flatten(recv, consts, depth + 1)
+            if sep == "" and sep_known:
+                return _flatten(node.args[0], consts, depth + 1)  # ''.join(reversed(s)) / ''.join(s): the characters of s put back together
         if method == "join" and len(node.args) == 1 and not node.keywords and isinstance(node.args[0], (ast.List, ast.Tuple, ast.Set)):
             sep, sep_known = _flatten(recv, consts, depth + 1)
             elts = node.args[0].elts
@@ -441,6 +497,9 @@ def _flatten(node: ast.AST, consts: dict[str, str], depth: int = 0) -> tuple[str
             if chars is not None:
                 return (getattr(text, method)(chars), True) if method in ("strip", "lstrip", "rstrip") else (_hedge(text), False)
             return getattr(text, method)(), True
+    if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "reversed" and len(node.args) == 1 and not node.keywords:
+        text, known = _flatten(node.args[0], consts, depth + 1)  # the characters of a text, backwards (only ever read by a ``''.join``)
+        return text[::-1], known
     if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "chr" and len(node.args) == 1 and not node.keywords:
         code = _int_literal(node.args[0])  # chr(115) + 'ubprocess_exec'
         return (chr(code), True) if isinstance(code, int) and 0 <= code < 0x110000 else (_WILD, False)
@@ -453,14 +512,21 @@ def _flatten(node: ast.AST, consts: dict[str, str], depth: int = 0) -> tuple[str
         if known and "?" not in bounds and bounds[2] != 0:
             return text[slice(*bounds)], True
         return _hedge(text), False  # a bound the fold cannot read: some substring of the text, which may be a spawn-method name
-    # A string method the fold has no arm for (`removeprefix`, `partition`, `split`, `splitlines`, anything else) or an index into one: the result is
-    # some piece of the receiver, so the receiver's text is hedged, never dropped. A receiver that reads as nothing (a run-time value) says nothing.
-    receiver = node.func.value if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) else node.value if isinstance(node, ast.Subscript) else None
-    if receiver is not None:
-        text, _ = _flatten(receiver, consts, depth + 1)
+    # A call the fold has no arm for (a string method such as `removeprefix`, `partition`, `split`; an unrecognised function) or an index into one: the
+    # result is some piece of the receiver OR of an argument (``str.removeprefix(s, 'zz')``, ``ident('zz' + s)``), so the text of the receiver and of every
+    # positional argument and keyword value is hedged, never dropped (G14, G15). A piece that reads as nothing (a run-time value) says nothing.
+    if isinstance(node, ast.Call):
+        callee = node.func.id if isinstance(node.func, ast.Name) else node.func.attr if isinstance(node.func, ast.Attribute) else ""
+        parts = ([node.func.value] if isinstance(node.func, ast.Attribute) else []) + (
+            [] if callee in _NOT_TEXT_OF_ARGS else [a for a in node.args if not isinstance(a, ast.Starred)] + [k.value for k in node.keywords])
+    else:
+        parts = [node.value] if isinstance(node, ast.Subscript) else []
+    hedged = []
+    for part in parts:
+        text, _ = _flatten(part, consts, depth + 1)
         if text.replace(_WILD, ""):
-            return _hedge(text), False
-    return _WILD, False
+            hedged.append(_hedge(text))
+    return ("".join(hedged), False) if hedged else (_WILD, False)
 
 
 def _int_literal(node: ast.AST | None) -> int | None | str:
@@ -1410,7 +1476,7 @@ def _unflagged_spawns_in_source(source: str, label: str) -> list[str]:
 
 # --- PowerShell fixtures: any Start-Process / saps / start launch, whatever its target, must be hidden; judged per statement ---
 
-_WINDOW_STYLE_HIDDEN_RE = re.compile(r"(?<!\S)-WindowStyle[\s:]+(?:'Hidden'|\"Hidden\"|Hidden)(?=[\s;)|}&]|\Z)", re.IGNORECASE)  # the value ends at Hidden: `Hidden,Minimized` is another value
+_WINDOW_STYLE_HIDDEN_RE = re.compile(r"(?<!\S)-WindowStyle[\s:]+(?:'Hidden'|\"Hidden\"|Hidden)(?=[\s;)|}&]|\Z)", re.IGNORECASE)  # the value ends at Hidden: `Hidden,Minimized` is another value (a line continuation after it is a space, see _ps_statements)
 _START_PROCESS_RE = re.compile(r"(?<![\w$.-])(Start-Process|saps|start)(?![\w-])", re.IGNORECASE)  # the cmdlet and its aliases
 _PS_COMMAND_PREFIX_RE = re.compile(r"(?<![\w$.-])(?:return|throw|exit|-not)$", re.IGNORECASE)  # a word that ends right before a command name
 # PowerShell reads these typographic characters as the ASCII ones: single and double quotes, the three dashes a parameter may start with, no-break space.
@@ -1449,7 +1515,9 @@ def _quoted_spans(text: str) -> list[tuple[int, int]]:
 
 def _ps_statements(script: str) -> list[str]:
     """Split a PowerShell script into statements: on ; | { } and newlines outside quotes, comments dropped, backtick-newline joined."""
-    script = re.sub(r"(?<=\S)`\r?\n", "\x02", script)  # mid-word: `foo`<LF>-WindowStyle:Hidden` is ONE argument, not a parameter
+    # mid-word: `foo`<LF>-WindowStyle:Hidden` is ONE argument, not a parameter. A continuation whose next line starts with white space is a separator
+    # (`-WindowStyle Hidden`<LF> -Wait` ends the value at Hidden, G18), so only a continuation that glues two non-space characters is marked.
+    script = re.sub(r"(?<=\S)`\r?\n(?=\S)", "\x02", script)
     script = re.sub(r"`\r?\n", " ", script)  # after whitespace: a line continuation
     spans = dict(_quoted_spans(script))
     out, cur, i, n = [], [], 0, len(script)
@@ -1616,6 +1684,7 @@ def _text_base(node: ast.AST, consts: dict[str, str]) -> bool:
     """True when the chain of method calls and subscripts under ``node`` ends in a text ``_flatten`` reads (a string literal, a built string,
     a name bound once to a string)."""
     while True:
+        node = _bound_form(node)
         if isinstance(node, ast.Subscript):
             node = node.value
         elif isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
@@ -1629,6 +1698,7 @@ def _text_base(node: ast.AST, consts: dict[str, str]) -> bool:
 def _folds(node: ast.AST, consts: dict[str, str]) -> bool:
     """True when ``_flatten`` reads this node's text through a fold (the PowerShell side asks exactly this of every node, so it judges everything the
     Python side reads: a slice, a case or strip mapper, ``chr``, ``decode``, and a string method the fold has no arm for, by way of ``_hedge``)."""
+    node = _bound_form(node)  # ``str.m(s, ...)`` / ``operator.concat(a, b)`` are read as ``s.m(...)`` / ``a + b``
     if isinstance(node, (ast.JoinedStr, ast.BinOp)):
         return True
     if isinstance(node, ast.Subscript):
@@ -1720,9 +1790,11 @@ def _start_process_violations(py_source: str) -> tuple[int, list[int]]:
             found += 1
             bad.append(lineno)
             continue
-        text = _unsplice(text.translate(_PS_CHAR_MAP))  # typographic quotes and dashes are the ASCII ones to PowerShell; `Start-"Process"` is Start-Process
-        # a backtick-escaped name (bareword) or a `n boundary (double quotes) must not hide the launch from the filter
-        flats = (text, _unescape_ps(text), _dq_value(text)) if "`" in text else (text,)
+        text = text.translate(_PS_CHAR_MAP)  # typographic quotes and dashes are the ASCII ones to PowerShell
+        # a backtick-escaped name (bareword) or a `n boundary (double quotes) must not hide the launch from the filter; every reading is unspliced AFTER it is
+        # unescaped (the order _judge_script uses), because a backtick is not in a spliced word's class: St`art-Pro'cess' is Start-Process (G17)
+        flats = tuple(_unsplice(flat) for flat in ((text, _unescape_ps(text), _dq_value(text)) if "`" in text else (text,)))
+        text = _unsplice(text)  # `Start-"Process"` is Start-Process
         if not any(_START_PROCESS_RE.search(flat) for flat in flats) and not re.search(r"'\s*(start-process|saps|start)\s*'|\"\s*(start-process|saps|start)\s*\"", text, re.I):
             continue
         text_found, text_bad = _judge_script(text)
@@ -3712,6 +3784,191 @@ class SpawnSiteBehaviourTests(unittest.TestCase):
             self.assertEqual(seen["creationflags"], 0x08004000)
             rfs._spawn(["x"])
             self.assertEqual(seen["creationflags"], 0x08000000)
+
+
+class _Unbind(ast.NodeTransformer):
+    """``X.m(args)`` becomes ``str.m(X, args)``: every method call spelled the unbound way (a test helper; it only rewrites the test's own expressions)."""
+
+    def visit_Call(self, node: ast.Call) -> ast.AST:
+        self.generic_visit(node)
+        if isinstance(node.func, ast.Attribute) and not (isinstance(node.func.value, ast.Name) and node.func.value.id in ("str", "operator", "asyncio", "loop")):
+            return ast.Call(func=ast.Attribute(value=ast.Name(id="str", ctx=ast.Load()), attr=node.func.attr, ctx=ast.Load()),
+                            args=[node.func.value, *node.args], keywords=node.keywords)
+        return node
+
+
+class AdversaryR9Tests(unittest.TestCase):
+    """r9: Grok G15 / G16 / G17 / G18 (head 15d5ded6 / bdf30a13) and Dot 789-R8-F1.
+
+    G15: an unbound ``str.m(s, ...)`` is ``s.m(...)``, ``operator.concat`` / ``__add__`` are ``+``, ``''.join(reversed(s))`` reads, and an unrecognised
+    call hedges the text of every argument (not only a receiver). G16: the module docstring names the fold set. G17: the PowerShell prefilter unsplices
+    after it unescapes. G18: a line continuation right after ``Hidden`` ends the value. R8-F1: an empty attribute segment is a segment.
+    """
+
+    SP = "Start-Process"
+
+    _bad = staticmethod(AdversaryR8Tests._bad)
+    _launch = staticmethod(AdversaryR8Tests._launch)
+    _ps = staticmethod(AdversaryR8Tests._ps)
+
+    @staticmethod
+    def _unbound(expr: str) -> str:
+        return ast.unparse(_Unbind().visit(ast.parse(expr, mode="eval").body))
+
+    # ---- G15: Python side, the seven spellings Grok named ----
+    def g15_python_rows(self) -> list[str]:
+        return ["str.lower('SUBPROCESS_EXEC')", "str.removeprefix('zzsubprocess_exec', 'zz')", "str.__add__('subprocess_', 'exec')",
+                "str.join('', ['subprocess_', 'exec'])", "str.format('{}exec', 'subprocess_')", "operator.concat('subprocess_', 'exec')",
+                "''.join(reversed('cexe_ssecorpbus'))"]
+
+    def test_g15_an_unbound_or_operator_spelling_of_a_spawn_method_name_is_reported(self):
+        for expr in self.g15_python_rows():
+            self.assertGreaterEqual(len(self._bad(self._launch(expr))), 1, expr)
+        # more spellings of the same class
+        for expr in ("str.__radd__('exec', 'subprocess_')", "str.__mod__('%sexec', 'subprocess_')", "operator.mod('%sexec', 'subprocess_')", "operator.add('subprocess_', 'exec')",
+                     "builtins.str.upper('subprocess_exec').lower()", "type('').lower('SUBPROCESS_EXEC')", "''.__class__.strip('zsubprocess_execz', 'z')",
+                     "''.join(reversed(['exec', 'subprocess_']))", "''.join(reversed(('exec', 'subprocess_')))", "''.join(reversed('cexe_ssecorpbus'))[0:]",
+                     "str.join('', reversed(['exec', 'subprocess_']))", "str.replace('zsubprocess_exec', 'z', '')", "str.partition('xsubprocess_exec', 'x')[2]"):
+            self.assertGreaterEqual(len(self._bad(self._launch(expr))), 1, expr)
+
+    def test_g15_the_unbound_form_reads_exactly_as_the_bound_form(self):
+        for bound, want in (("'SUBPROCESS_EXEC'.lower()", "subprocess_exec"), ("''.join(['subprocess_', 'exec'])", "subprocess_exec"),
+                            ("'{}exec'.format('subprocess_')", "subprocess_exec"), ("'zzsubprocess_exec'.strip('z')", "subprocess_exec")):
+            for expr in (bound, self._unbound(bound)):
+                self.assertEqual(_flatten(ast.parse(expr, mode="eval").body, {}), (want, True), expr)
+        for expr in ("str.__add__('subprocess_', 'exec')", "operator.concat('subprocess_', 'exec')", "''.join(reversed('cexe_ssecorpbus'))"):
+            self.assertEqual(_flatten(ast.parse(expr, mode="eval").body, {}), ("subprocess_exec", True), expr)
+
+    # ---- G15: an unrecognised call hedges its arguments ----
+    def test_g15_an_unrecognised_call_keeps_the_text_of_its_arguments(self):
+        for expr in ("ident('zzsubprocess_exec')", "ident('zz' + 'subprocess_exec', 1)", "ident(x='zz' + 'subprocess_exec')", "copy.copy('subprocess_' + 'exec')",
+                     "str('subprocess_exec')", "ident(1, 'subprocess_shell')", "ident(*rest, last='xsubprocess_exec')", "ident(a, b, 'subprocess_exec', c)",
+                     "''.join(list(reversed('cexe_ssecorpbus')))", "ident(ident2('zzsubprocess_exec'))"):
+            text, known = _flatten(ast.parse(expr, mode="eval").body, {})
+            self.assertFalse(known, expr)
+            self.assertGreaterEqual(len(self._bad(self._launch(expr))), 1, expr)
+
+    def test_g15_hedging_every_argument_adds_no_false_positive_to_a_harmless_text(self):
+        for expr in ("ident('value')", "ident('hello', 'world')", "ident(name)", "str.lower(name)", "str.join(', ', names)", "str.format('{}-{}', a, b)", "operator.concat(a, b)",
+                     "str.removeprefix(name, 'x')", "''.join(reversed(name))", "''.join(reversed('abc'))", "str.strip('abc')", "ident('subprocess')", "ident('exec')",
+                     "str.__add__('sub', 'process')", "operator.concat('exec', 'subprocess_')", "''.join(reversed('subprocess_'))", "str.upper('value')"):
+            self.assertEqual(self._bad(self._launch(expr)), [], expr)
+        # the consumer of a name is not the name: getattr / attrgetter / hasattr read their argument, they do not return it
+        for expr in ("'subprocess_exec_' + 'x'", "'subprocess_exec_x'", "'value_' + kind"):
+            self.assertEqual(self._bad(self._launch(expr)), [], expr)
+        self.assertEqual(self._bad("import operator\nasync def f(o):\n    return hasattr(o, 'subprocess_exec_x') and operator.attrgetter('subprocess_exec_y')(o)\n"), [])
+        for expr in ("str.lower('hello')", "str.join(' ', parts)", "ident('hello world')", "str.removeprefix('the end', 'the ')", "''.join(reversed('dlrow'))",
+                     "operator.concat('a', 'b')", "str.__add__('foo', 'bar')"):
+            self.assertEqual(self._ps(expr), (0, 0), expr)
+
+    # ---- G15: PowerShell side ----
+    def g15_ps_rows(self) -> list[str]:
+        sp = self.SP
+        return [f"str.removeprefix('zz{sp} cmd.exe', 'zz')", f"str.__add__('Start-', 'Process cmd.exe')", f"''.join(reversed({(sp + ' cmd.exe')[::-1]!r}))"]
+
+    def test_g15_a_launch_behind_an_unbound_or_operator_fold_is_reported_by_the_powershell_side(self):
+        for expr in self.g15_ps_rows():
+            self.assertEqual(self._ps(expr), (1, 1), expr)
+        for expr in ("operator.concat('Start-', 'Process cmd.exe')", "operator.add('sap', 's cmd.exe')", "str.lower('START-PROCESS cmd.exe')", "str.join('', ['Start-', 'Process cmd.exe'])",
+                     "str.format('{}Process cmd.exe', 'Start-')", "''.join(reversed(['cmd.exe', ' Process-', 'Start']))[0:]", "''.__class__.strip('zStart-Process cmd.exez', 'z')"):
+            self.assertEqual(self._ps(expr), (1, 1), expr)
+        hidden = f"{self.SP} cmd.exe -WindowStyle Hidden"  # a fold that reads exactly is judged as written: a hidden launch stays clean
+        for expr in (f"str.lstrip('zz{hidden}', 'z')", f"str.strip('zz{hidden}zz', 'z')", f"operator.concat('Start-', 'Process cmd.exe -WindowStyle Hidden')",
+                     f"str.__add__('Start-', 'Process cmd.exe -WindowStyle Hidden')"):
+            self.assertEqual(self._ps(expr), (1, 0), expr)
+
+    def test_g15_every_string_mapper_and_builder_reads_unbound_the_way_it_reads_bound(self):
+        """Walks every ``_STRING_MAPPERS`` method and every builder kind ``fold_kinds`` has, spelled bound and unbound, on both sides."""
+        mappers = {}
+        for m in sorted(_STRING_MAPPERS):
+            for target in ("subprocess_exec", f"{self.SP} cmd.exe"):
+                arg = "'z'" if m in ("strip", "lstrip", "rstrip") else ""
+                text = ("zz" + target + "zz") if arg else target
+                mappers[(m, target)] = f"{text!r}.{m}({arg})"
+        kinds = {("kind", k, t): e for t in ("subprocess_exec", f"{self.SP} cmd.exe") for k, e in AdversaryR8Tests.fold_kinds(None, t).items()}
+        changed = 0
+        for key, bound in {**mappers, **kinds}.items():
+            unbound = self._unbound(bound)
+            changed += unbound != bound  # a kind with no method call in it (a literal, a ``+`` chain, ``%``) spells the same either way
+            if unbound == bound:
+                continue
+            self.assertEqual(_flatten(ast.parse(unbound, mode="eval").body, {}), _flatten(ast.parse(bound, mode="eval").body, {}), (key, unbound))
+            if key[-1] == "subprocess_exec":
+                self.assertEqual(len(self._bad(self._launch(unbound))), len(self._bad(self._launch(bound))), (key, unbound))
+                if key[0] in ("lower", "casefold", "strip") or (key[0] == "kind" and key[1] != "upper"):  # the ones whose bound form spells the name back exactly
+                    self.assertGreaterEqual(len(self._bad(self._launch(unbound))), 1, (key, unbound))
+            else:
+                self.assertEqual(self._ps(unbound), self._ps(bound), (key, unbound))
+                if key[0] not in ("lstrip", "rstrip"):  # those two strip only one side of the padding, so neither spelling reads as a launch
+                    self.assertEqual(self._ps(unbound), (1, 1), (key, unbound))
+        self.assertGreater(changed, 40)  # the walk really rewrote the methods
+
+    # ---- G17: a backtick plus a quote splice ----
+    def test_g17_a_backtick_and_a_quote_splice_in_a_launch_word_is_reported(self):
+        for script in ("St`art-Pro'cess' cmd.exe", "Sta`rt-\"Process\" cmd.exe", "s`a'ps' cmd.exe", "`s'tart' cmd.exe", "Start-`P\"roc\"ess cmd.exe"):
+            self.assertEqual(self._ps(repr(script)), (1, 1), script)
+            self.assertEqual(_judge_script(script), (1, 1), script)  # the judge alone always read it; the prefilter in front of it did not
+        self.assertEqual(self._ps(repr("St`art-Pro'cess' cmd.exe -WindowStyle Hidden")), (1, 0))  # a hidden one is still clean
+
+    def test_g17_every_backtick_position_crossed_with_every_quote_splice_position(self):
+        for word in (self.SP, "saps", "start"):
+            seen = 0
+            for j in range(0, len(word)):
+                for k in range(j + 1, len(word) + 1):
+                    for quote in ("'", '"'):
+                        for i in range(1, len(word)):
+                            if i in (j, k) or (j < i < k and quote == "'"):
+                                continue  # a backtick next to a quote escapes the quote; in single quotes it is a plain character
+                            if j < i < k and word[i] in "0abfnrtuv":
+                                continue  # inside double quotes these are real escapes (`n is a newline)
+                            spelled = word[:j] + quote + word[j:k] + quote + word[k:]
+                            at = i + (1 if i > j else 0) + (1 if i > k else 0)
+                            script = spelled[:at] + "`" + spelled[at:] + " cmd.exe"
+                            self.assertEqual(self._ps(repr(script)), self._ps(repr(script.replace("`", ""))), script)  # as read without the backtick
+                            self.assertEqual(self._ps(repr(script)), (1, 1), script)
+                            seen += 1
+            self.assertGreater(seen, 20, word)
+
+    # ---- G18: a line continuation right after Hidden ----
+    def test_g18_a_hidden_launch_that_continues_the_line_after_hidden_is_clean(self):
+        for script in ("Start-Process cmd.exe -WindowStyle Hidden`\n -Wait", "Start-Process cmd.exe -WindowStyle Hidden`\r\n    -Wait", "saps cmd.exe -WindowStyle Hidden`\n -Wait",
+                       "Start-Process cmd.exe -WindowStyle `\n Hidden -Wait", "Start-Process cmd.exe `\n -WindowStyle Hidden`\n -Wait", "start cmd.exe -WindowStyle:Hidden`\n -Wait",
+                       "Start-Process cmd.exe -WindowStyle 'Hidden'`\n -Wait"):
+            self.assertEqual(_judge_script(script), (1, 0), script)
+            self.assertEqual(self._ps(repr(script)), (1, 0), script)
+
+    def test_g18_the_value_still_has_to_end_at_hidden(self):
+        for script in ("Start-Process cmd.exe -WindowStyle Hidden`\n-Wait", "Start-Process cmd.exe -WindowStyle Hidden#x", "Start-Process cmd.exe -WindowStyle Hidden]",
+                       "Start-Process cmd.exe -WindowStyle Hid\"den\"", "Start-Process cmd.exe -WindowStyle \"Hidden\",x", "Start-Process cmd.exe -WindowStyle Hidden` -Wait",
+                       "Start-Process cmd.exe -WindowStyle Hidden,Minimized`\n -Wait", "Start-Process cmd.exe -WindowStyle Hidden`x"):
+            self.assertEqual(_judge_script(script), (1, 1), script)
+
+    # ---- G16: the docstring names the fold set, not an example of an unread form ----
+    def test_g16_the_powershell_limit_points_at_the_fold_set_and_does_not_call_chr_unread(self):
+        doc = " ".join((__doc__ or "").split())
+        self.assertIn("A launch is read through the fold set of ``_flatten``", doc)
+        self.assertNotIn("(a file read at run time, ``chr()``) is not read", doc)
+        self.assertNotIn("``.join`` (a file read at run time, ``chr()``)", doc)
+        self.assertIn("an UNRECOGNISED function returns over its arguments", doc)  # the part of the G15 class that stays unread on the PowerShell side
+        # and the claim holds: chr() is folded on the PowerShell side
+        self.assertEqual(self._ps("chr(83) + 'tart-Process cmd.exe'"), (1, 1))
+
+    # ---- R8-F1: an empty attribute segment ----
+    def test_r8_f1_a_leading_or_internal_empty_segment_does_not_hide_a_spawn_method_name(self):
+        for expr in ("'.subprocess_exec'", "'.subprocess_' + kind", "'.' + 'subprocess_' + kind", "'..subprocess_exec'", "'loop..subprocess_exec'", "'a..b.subprocess_shell'",
+                     "'.' + p + '..subprocess_exec'", "f'.{p}.subprocess_exec'", "'.subprocess_%s' % kind", "'.{}'.format('subprocess_' + kind)", "'.' + p + '.subprocess_exec'",
+                     "'x.' + p + '..subprocess_shell'", "'..' + p + '.' + q + '.subprocess_exec'", "'.sub' + 'process_' + 'exec'", "p + '..subprocess_' + q"):
+            self.assertGreaterEqual(len(self._bad(self._launch(expr))), 1, expr)
+        witness = ("import operator\nasync def launch(holder, factory, kind):\n"
+                   "    return await operator.attrgetter('.subprocess_' + kind)(holder)(factory, 'cmd.exe')\n")
+        self.assertGreaterEqual(len(self._bad(witness)), 1)
+        exact = "import operator\nasync def launch(holder, factory):\n    return await operator.attrgetter('.subprocess_exec')(holder)(factory, 'cmd.exe')\n"
+        self.assertGreaterEqual(len(self._bad(exact)), 1)
+
+    def test_r8_f1_a_receiver_only_text_with_empty_segments_stays_clean(self):
+        for expr in ("'.value_' + kind", "'..'", "'.' + x", "'.subprocess'", "'.run'", "'a..b'", "'.allowed_roots.' + k", "'. ' + x", "'..' + x + '.value'", "'.' + p + '..' + q",
+                     "'.loop.' + p", "f'.{p}.{q}'", "'.exec' + kind", "'..exec_' + kind"):
+            self.assertEqual(self._bad(self._launch(expr)), [], expr)
 
 
 if __name__ == "__main__":
