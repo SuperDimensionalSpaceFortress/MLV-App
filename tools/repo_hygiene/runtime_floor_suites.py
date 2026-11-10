@@ -45,6 +45,11 @@ import sys
 import time
 from pathlib import Path
 
+try:  # imported as tools.repo_hygiene.runtime_floor_suites (tests, CI) or run as a script from this directory
+    from .hidden_spawn import no_window_flags
+except ImportError:
+    from hidden_spawn import no_window_flags
+
 _NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
 
 SCHEMA = "mlv-app/runtime-floors/v1"
@@ -475,9 +480,9 @@ def task_argv(task: dict, worktree: Path) -> list[str]:
 
 def _spawn(argv: list[str], **kwargs):
     """The one place a suite child is started; tests replace it to capture argv and cwd without a real shell."""
-    # OR, never replace: a caller flag (a priority class, a new process group) must not drop the hidden-window bit.
-    # CREATE_NEW_CONSOLE (0x10) is the one caller flag removed: with it Windows ignores CREATE_NO_WINDOW.
-    return subprocess.Popen(argv, creationflags=_NO_WINDOW | (kwargs.pop("creationflags", 0) & ~0x00000010), **kwargs)
+    # no_window_flags ORs the hidden bit into a caller flag (a priority class, a new process group) instead of replacing it,
+    # and drops CREATE_NEW_CONSOLE (0x10), with which Windows ignores CREATE_NO_WINDOW.
+    return subprocess.Popen(argv, creationflags=no_window_flags(kwargs.pop("creationflags", 0)), **kwargs)
 
 
 def _kill_tree(proc) -> None:
