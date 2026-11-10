@@ -365,7 +365,7 @@ def _formatted(node: ast.AST, consts: dict[str, str], depth: int) -> tuple[str, 
         return (text if text.startswith(_WILD) else _WILD + text) + ("" if text.endswith(_WILD) else _WILD), False
     if (known and _WILD not in text and isinstance(shown, ast.Call) and isinstance(shown.func, ast.Attribute) and shown.func.attr == "encode"
             and all(ord(c) < 256 for c in text)):
-        _measured(lambda chunk: repr(chunk.encode("latin-1")), text)  # `\xNN` for each byte: four characters for one (R11-L1)
+        _check_size(_repr_bound(text, True))  # `\xNN` for each byte: four characters for one (R11-L1)
         return repr(text.encode("latin-1")), True  # pass-29 A3: the bytes the fold holds one character per byte print as Python prints them, exactly
     if not any((isinstance(n, ast.Constant) and isinstance(n.value, bytes))
                or (isinstance(n, ast.Call) and ((isinstance(n.func, ast.Attribute) and n.func.attr == "encode")  # pass-29 A3: ``'..'.encode()`` is a bytes value too
@@ -528,8 +528,7 @@ def _fold_codec(node: ast.Call, text: str, known: bool, consts: dict[str, str], 
                 if plan[1] == "backslashreplace":  # a byte the codec rejects is written `\xNN`: four characters for one, so the worst case is checked first (R11-L1)
                     _check_size(4 * len(text))
                 return text.encode("latin-1").decode(*plan), known
-            if plan[1] in ("backslashreplace", "xmlcharrefreplace", "namereplace"):  # up to ten characters for one (`\U0010ffff`, `&#1114111;`), ninety for a `\N{...}` name
-                _measured(lambda chunk: chunk.encode(*plan), text)
+            _check_size(_encoded_bound(text, codec_key, plan[1]))  # up to ten characters for one (`\U0010ffff`, `&#1114111;`), a hundred for a `\N{...}` name; utf-32 four bytes for one
             return text.encode(*plan).decode("latin-1"), known
         except _FoldTooBig:
             raise  # a RecursionError, which the clause below would read as "the call raises at run time"
@@ -590,7 +589,8 @@ def _flatten(node: ast.AST, consts: dict[str, str], depth: int = 0) -> tuple[str
 # (a ``replace`` of one character by 199,999, a ``join`` of many pieces, a template that uses one field many times, an escaping codec, a ``!r``). Every such
 # fold works out the length its result WOULD have and refuses with ``_check_size`` before it builds anything. A fold whose output is never longer than
 # its input (a slice, ``reversed``, ``strip``, ``chr``, a hedge that keeps a wildcard) needs none: its inputs were each checked by ``_flatten``.
-_MEASURE_CHUNK = 256
+_ASCII_RE = re.compile(r"[\x00-\x7f]")
+_PRINTABLE_ASCII_RE = re.compile(r"[ -~]")
 
 
 def _check_size(length: int) -> None:
@@ -605,14 +605,26 @@ def _joined(parts: list[str], sep: str = "") -> str:
     return sep.join(parts)
 
 
-def _measured(shape, text: str) -> int:
-    """The length ``shape(text)`` would have, found one chunk of the text at a time so that only one chunk's result exists at once (a ``repr`` or an escaping
-    codec writes up to ninety characters for one). Refuses as soon as the running total passes the cap."""
-    total = 0
-    for at in range(0, len(text), _MEASURE_CHUNK):
-        total += len(shape(text[at:at + _MEASURE_CHUNK]))
-        _check_size(total)
-    return total
+def _repr_bound(text: str, as_bytes: bool = False) -> int:
+    """An UPPER bound on ``len(repr(text))`` / ``len(ascii(text))`` (or of ``repr(text.encode('latin-1'))`` with ``as_bytes``), worked out from the characters
+    and never by building the result: a character outside printable ASCII is written as at most ten characters (``\\U0010ffff``; four for a byte, ``\\xNN``), and
+    a quote or a backslash gains an escape. A chunk-by-chunk ``repr`` would pick its quote per chunk and miss the escapes of the whole (pass-30 A3)."""
+    per, size = (4, len(text)) if as_bytes else (10, len(text))
+    if per * size + 3 <= _FLATTEN_MAX_CHARS:
+        return per * size + 3  # too short to reach the cap whatever it holds
+    odd = len(_PRINTABLE_ASCII_RE.sub("", text))  # what is left once printable ASCII is taken out: the characters outside it
+    return size + (per - 1) * odd + text.count("'") + text.count("\\") + 3
+
+
+def _encoded_bound(text: str, codec_key: str, errors: str) -> int:
+    """An UPPER bound on ``len(text.encode(codec, errors).decode('latin-1'))``: an ASCII character is one byte (two for ``utf-16`` and the escape codecs, four for
+    ``utf-32``), any other is at most four (UTF-8, a UTF-16 pair, UTF-32) or the escape the error mode writes (ten for ``\\U0010ffff`` and ``&#1114111;``, a
+    hundred for a ``\\N{...}`` name), and a byte-order mark is four more."""
+    non_ascii = len(_ASCII_RE.sub("", text))
+    ascii_count = len(text) - non_ascii
+    ascii_width = 4 if codec_key.startswith("utf32") or "escape" in codec_key else 2 if codec_key.startswith("utf16") else 1  # a control character is `\xNN` under unicode_escape
+    wide = 10 if "escape" in codec_key else max(4, {"backslashreplace": 10, "xmlcharrefreplace": 10, "namereplace": 100}.get(errors, 1))
+    return ascii_width * ascii_count + wide * non_ascii + 4
 
 
 def _replaced(text: str, old: str, new: str, count: int) -> str:
@@ -626,10 +638,10 @@ def _replaced(text: str, old: str, new: str, count: int) -> str:
 
 
 def _mapped(method: str, text: str) -> str:
-    """``text.<method>()`` for a case mapper, ``title`` or ``capitalize``: a character may become up to three (``'ﬃ'.upper()`` is ``'FFI'``), so a long
-    text is measured a chunk at a time before it is mapped. ``strip`` and its kin never lengthen."""
+    """``text.<method>()`` for a case mapper, ``title`` or ``capitalize``: an ASCII character maps to one, any other to at most three (the ligature U+FB03
+    upper-cases to ``FFI``), so the bound is worked out from the characters before the text is mapped (pass-30 A3). ``strip`` and its kin never lengthen."""
     if method not in ("strip", "lstrip", "rstrip") and 3 * len(text) > _FLATTEN_MAX_CHARS:
-        _measured(lambda chunk: getattr(chunk, method)(), text)
+        _check_size(len(text) + 2 * len(_ASCII_RE.sub("", text)))
     return getattr(text, method)()
 
 
@@ -726,7 +738,7 @@ def _flatten_node(node: ast.AST, consts: dict[str, str], depth: int = 0) -> tupl
             finally:
                 _AMBIGUOUS_ACTIVE.discard(id(node.func))
             alt = _flatten(ast.Call(func=ast.Attribute(value=node.args[0], attr=method, ctx=ast.Load()), args=node.args[1:], keywords=node.keywords), consts, depth + 1)[0]
-            return (own if own == alt else own + _WILD + alt), False
+            return (own if own == alt else _joined([own, _WILD, alt])), False
         if method in ("format", "format_map"):
             template, known = _flatten(recv, consts, depth + 1)
             if method == "format_map":
@@ -841,10 +853,9 @@ def _int_literal(node: ast.AST | None) -> int | None | str:
 
 def _apply_spec(text: str, conv: str | None, spec: str | None) -> str | None:
     """``format(text, spec)`` after a ``!r`` / ``!a`` conversion, or None when the spec cannot be applied safely or is not valid for a string."""
-    if conv in ("r", "a"):  # a character may be written as `\U0010ffff` (ten characters): the result is measured a chunk at a time before it is built (R11-L1)
-        convert = repr if conv == "r" else ascii
-        _measured(convert, text)
-        text = convert(text)
+    if conv in ("r", "a"):  # a character may be written as `\U0010ffff` (ten characters): the bound is worked out from the characters before the result is built (R11-L1)
+        _check_size(_repr_bound(text))
+        text = repr(text) if conv == "r" else ascii(text)
     if not spec:
         return text
     if _spec_too_big(re.findall(r"\d+", spec)):  # Python reads any Unicode decimal digit as a width
@@ -894,9 +905,9 @@ def _fill_unknown_template(template: str, percent: bool) -> tuple[str, bool]:
                 if close >= 0 and "{" not in seg[:close]:  # a field the wildcard opened closes at this brace; a brace after a '{' closes the segment's OWN field
                     trimmed = seg[close + 1:]
             if trimmed is not None:
-                lead = _WILD + fill(seg, [], {}, False, any_pos=True, any_named=True)[0] + _WILD
+                lead = _joined([_WILD, fill(seg, [], {}, False, any_pos=True, any_named=True)[0], _WILD])
                 seg = trimmed
-        out.append(lead + fill(seg, [], {}, False, any_pos=True, any_named=True)[0])
+        out.append(_joined([lead, fill(seg, [], {}, False, any_pos=True, any_named=True)[0]]))
     return _joined(out, _WILD), False
 
 
@@ -1024,6 +1035,8 @@ def _fill_percent(template: str, positional: list[tuple[str, bool]], named: dict
             out.append(_WILD)  # `%c` of a number is a character, `%d` a number: neither is a text the fold knows
             ok = False
         elif value[1] and not _spec_too_big((width, precision)):
+            if conv in "ra":  # `%r` / `%a` write up to ten characters for one: the bound is worked out first (pass-30 A2)
+                _check_size(_repr_bound(value[0]) + _SPEC_NUMBER_LIMIT)
             try:
                 out.append(("%" + flags + (width or "") + ("." + precision if precision is not None else "") + conv) % (value[0],))
             except (ValueError, TypeError):
@@ -2162,7 +2175,7 @@ def _string_values(tree: ast.AST) -> list[tuple[int, str, bool]]:
                 texts.append(cur.value)
             else:
                 return None
-        return "".join(texts)
+        return _joined(texts)  # a chain of literals is as long as the source it was read from, but the cap holds for it too (pass-30 A2)
 
     stack = [tree]
     while stack:
@@ -2192,8 +2205,9 @@ def _string_values(tree: ast.AST) -> list[tuple[int, str, bool]]:
                     isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr in _ARGUMENT_FOLDS):
                 out.append((node.lineno, flat, False))  # a slice / strip / case mapper / chr / decode that folds EXACTLY: its text is judged as written
                 continue
-            if any(_BUILT_LAUNCH_RE.search(p) for p in pieces + ["".join(pieces), flat.replace(_WILD, "")]) or _could_launch(flat):
-                out.append((node.lineno, "".join(pieces), True))
+            pieces_joined = _joined(pieces)
+            if any(_BUILT_LAUNCH_RE.search(p) for p in pieces + [pieces_joined, flat.replace(_WILD, "")]) or _could_launch(flat):
+                out.append((node.lineno, pieces_joined, True))
                 continue
         stack.extend(ast.iter_child_nodes(node))
     return out
@@ -4957,6 +4971,54 @@ class AdversaryR9Tests(unittest.TestCase):
             with self.assertRaises(_FoldTooBig):  # the hedge puts the texts side by side, and again backwards
                 _hedge_texts(["a" * 40, "b" * 40])
             self.assertEqual(_hedge_texts(["a" * 20, "b" * 20]), _WILD)
+
+    # ---- pass 30 (review-adversary-MLV-LANE-CONSOLE-HIDDEN-1-r12-7c801e52): A2 / A3, the bounds are upper bounds worked out from the characters ----
+    def test_pass30_a3_the_bounds_never_fall_below_what_python_builds(self):
+        quotes = ("'" * 256 + '"' * 256) * 3
+        texts = ["", "abc", quotes, "it's \\ \"q\"", "\x01" * 40, "\xe9\xff" * 20, "中文" * 20, "\U0010ffff" * 20, "ﬃİA" * 20, "mixed \x00 \x7f \u0085 ퟿"]
+        for text in texts:
+            self.assertGreaterEqual(_repr_bound(text), len(repr(text)), repr(text)[:40])
+            self.assertGreaterEqual(_repr_bound(text), len(ascii(text)), repr(text)[:40])
+            if all(ord(c) < 256 for c in text):
+                self.assertGreaterEqual(_repr_bound(text, True), len(repr(text.encode("latin-1"))), repr(text)[:40])
+            for codec in ("ascii", "latin-1", "utf-8", "utf-16", "utf-16-le", "utf-32", "utf-32-be", "cp1252", "unicode_escape", "raw_unicode_escape"):
+                key = re.sub(r"[^a-z0-9]", "", codec)
+                for errors in ("strict", "ignore", "replace", "backslashreplace", "xmlcharrefreplace", "namereplace", "surrogateescape"):
+                    try:
+                        built = len(text.encode(codec, errors).decode("latin-1"))
+                    except (UnicodeError, LookupError, TypeError):
+                        continue
+                    self.assertGreaterEqual(_encoded_bound(text, key, errors), built, (repr(text)[:30], codec, errors))
+            for method in ("upper", "lower", "casefold", "swapcase", "title", "capitalize"):
+                self.assertGreaterEqual(len(text) + 2 * len(re.sub(r"[\x00-\x7f]", "", text)), len(getattr(text, method)()), (repr(text)[:30], method))
+
+    def test_pass30_a2_a3_witnesses_are_refused_by_their_bound_not_by_building_them(self):
+        quotes = ("'" * 256 + '"' * 256) * 261  # repr writes an escape for each of 66,816 quotes: 200,450 characters, which its per-chunk length (134,676) hid
+        for conv in ("r", "a"):
+            with self.assertRaises(_FoldTooBig, msg=conv):
+                _apply_spec(quotes, conv, None)
+        with self.assertRaises(_FoldTooBig):
+            _fill_percent("%r", [("\x01" * 50_000, True)], {}, True)  # 200,002 characters
+        with self.assertRaises(_FoldTooBig):
+            _fill_percent("%a", [("\U0010ffff" * 20_001, True)], {}, True)
+        with self.assertRaises(_FoldTooBig):
+            _mapped("capitalize", ("İ" + "A" * 255) * 780)  # 200,459 characters, where the per-chunk length said 199,680
+        for expr, text in (("x.encode('utf-32-le')", "a" * 50_001), ("x.encode('unicode_escape')", "\U0010ffff" * 20_001)):
+            with self.assertRaises(_FoldTooBig, msg=expr):
+                _fold_codec(ast.parse(expr, mode="eval").body, text, True, {}, 0)
+        with self.assertRaises(_FoldTooBig):
+            _formatted(ast.parse("'" + "\\x01" * 50_000 + "'.encode('latin-1')", mode="eval").body, {}, 0)  # bytes repr: four characters for each byte
+        self.assertEqual(_apply_spec("abc", "r", None), "'abc'")  # short texts are never refused
+
+    def test_pass30_a2_literal_chains_and_joined_readings_obey_the_cap(self):
+        with mock.patch.dict(globals(), {"_FLATTEN_MAX_CHARS": 64}):
+            with self.assertRaises(_FoldTooBig):
+                _joined(["a" * 40, "b" * 40])
+            chain = "x = " + " + ".join(repr("a" * 30) for _ in range(3)) + "\n"
+            self.assertEqual(_start_process_violations(chain)[0], 1)  # a chain of literals longer than the cap is reported, like every other fold
+            self.assertEqual(_start_process_violations("x = " + " + ".join(repr("a" * 30) for _ in range(2)) + "\n")[0], 0)
+        source = "x = " + " + ".join(repr("a" * 200) for _ in range(1001)) + "\n"  # 200,200 characters of source
+        self.assertEqual(_start_process_violations(source)[0], 1)
 
     def test_r11_l1_a_one_step_growth_in_an_unused_function_is_reported_not_allocated(self):
         with mock.patch.dict(globals(), {"_FLATTEN_MAX_CHARS": 64}):
