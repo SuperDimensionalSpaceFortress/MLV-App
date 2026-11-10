@@ -51,7 +51,8 @@ Remaining limits, every one named (r5 rewrite: the scan is syntactic and static,
     ``multiprocessing``, ``_winapi``, ``concurrent.futures`` process pools, ``pty``, ``os.startfile``.
   * A method name assembled at run time from a value the file does not state (``getattr(loop, 'subprocess_' + kind)``: the wildcard
     pattern ``subprocess_*`` IS reported, and so is a ``.replace`` / slice / ``strip`` with run-time arguments over a text that holds a
-    spawn-method name; but a name whose literal part is under three characters is not reported) or held outside a string (``match`` patterns);
+    spawn-method name; but a name whose literal part is under three characters is not reported; a ``.join`` over anything but a literal list,
+    tuple or set (a slice of one, a generator, ``map(chr, ...)``) is an unreadable text) or held outside a string (``match`` patterns);
     a spawn name reached by ``getattr`` on an object that is not a tracked module.
   * A module that is not bound by ``import x`` (a from-import such as ``from concurrent import futures``, or ``os.path`` taken as a value)
     flowing into a container or return: a from-import may bind a class or function, and an attribute may be either, so it is not followed.
@@ -208,7 +209,7 @@ def _label(expr: ast.AST) -> str:
 
 
 _FORMAT_BODY_RE = re.compile(r"([^!:]*)(?:!([rsa]))?(?::(.*))?", re.DOTALL)
-_PERCENT_FIELD_RE = re.compile(r"%(?:\(([^)]*)\))?([#0\- +]*)([0-9]+|\*)?(?:\.([0-9]+|\*))?[hlL]?([sraidiouxXeEfFgGc%])")  # ASCII digits only: int() meets nothing else
+_PERCENT_SPEC_RE = re.compile(r"([#0\- +]*)([0-9]+|\*)?(?:\.([0-9]+|\*))?[hlL]?([sraidiouxXeEfFgGc%])")  # ASCII digits only: int() meets nothing else
 _PERCENT_TAIL_RE = re.compile(r"(?:[^)]*\))?[#0\- +0-9.*hlL]*[A-Za-z%]?")  # what a field opened before a wildcard may still take: key, flags, width, conversion
 _SPEC_NUMBER_LIMIT = 256  # a width or precision above this is never handed to Python's formatter (no huge allocation)
 _STRING_MAPPERS = frozenset({"lower", "upper", "casefold", "strip", "lstrip", "rstrip", "title", "capitalize", "swapcase"})
@@ -411,6 +412,23 @@ def _apply_spec(text: str, conv: str | None, spec: str | None) -> str | None:
         return None
 
 
+def _percent_field(template: str, at: int):
+    """(key, flags, width, precision, conversion, end) for the ``%`` field at ``at``, or None. A ``%(key)`` key runs to its BALANCED close paren, as
+    Python reads it (``%(a(b))s`` has the key ``a(b)``)."""
+    i, key = at + 1, None
+    if template.startswith("(", i):
+        depth = 0
+        for j in range(i, len(template)):
+            depth += (template[j] == "(") - (template[j] == ")")
+            if depth == 0:
+                key, i = template[i + 1:j], j + 1
+                break
+        else:
+            return None
+    spec = _PERCENT_SPEC_RE.match(template, i)
+    return None if spec is None else (key, *spec.groups(), spec.end())
+
+
 def _fill_unknown_template(template: str, percent: bool) -> tuple[str, bool]:
     """A template that itself holds a wildcard has an unknown structure: the wildcard may open, close or lengthen a field. So every field in
     a literal segment is unknown, and the start of each segment after a wildcard may be the tail of a field the wildcard opened (up to its
@@ -509,13 +527,12 @@ def _fill_percent(template: str, positional: list[tuple[str, bool]], named: dict
             out.append(template[pos:])
             break
         out.append(template[pos:at])
-        match = _PERCENT_FIELD_RE.match(template, at)
-        if match is None:  # a `%` the fold cannot parse: nothing after it is read
+        parsed = _percent_field(template, at)
+        if parsed is None:  # a `%` the fold cannot parse: nothing after it is read
             out.append(_WILD)
             ok = False
             break
-        pos = match.end()
-        key, flags, width, precision, conv = match.groups()
+        key, flags, width, precision, conv, pos = parsed
         if conv == "%":
             out.append("%")
             continue
@@ -1076,7 +1093,8 @@ def _reference_violations(tree: ast.AST, facts: _Facts) -> list[tuple[int, str]]
                         if a.name != "*" and not _attr_ok(origin, a.name):
                             out.append((node.lineno, f"imports {a.name} from {origin}, which is not a constant or a data type"))
             continue
-        if isinstance(node, ast.Constant) and isinstance(node.value, str) and _LOOP_METHOD_NAME_RE.fullmatch(node.value):
+        if (isinstance(node, ast.Constant) and isinstance(node.value, (str, bytes))
+                and _LOOP_METHOD_NAME_RE.fullmatch(node.value if isinstance(node.value, str) else node.value.decode("latin-1"))):  # b'subprocess_exec' too
             out.append((node.lineno, f"names {node.value!r} as a string, which reaches an event-loop spawn method without calling it in place"))
         if isinstance(node, (ast.BinOp, ast.JoinedStr, ast.Call, ast.Subscript)) and not (isinstance(node, ast.BinOp) and isinstance(parent.get(id(node)), ast.BinOp)):
             built, known = _flatten(node, facts.consts)  # 'subprocess_' + 'exec', '%sexec' % 'subprocess_', f'subprocess_{"exec"}': the folded name
@@ -3118,6 +3136,8 @@ class AdversaryR7Tests(unittest.TestCase):
         "('%' + kind + 'ubprocess_exec') % 115", "('{' + field + 'ubprocess_exec').format(115)", "(prefix + '%subprocess_exec') % ('x',)",
         "(prefix + '{}ubprocess_exec').format('s')", "('%(' + key + ')subprocess_exec') % mapping", "('{' + field + '}ubprocess_exec').format_map(m)",
         "('%' + kind + 'subprocess_exec') % 115",
+        # self-probe: a key with nested parentheses reads to its balanced close; a bytes literal of the name
+        "'%(a(b))ssubprocess_exec' % mapping", "str(b'subprocess_exec', 'ascii')", "b'subprocess_exec'.decode()",
         # pass 16 A2: an operand that contributes no characters (a separator with fewer than two pieces) must not make an exact name unknown
         "sep.join([]) + 'sub' + 'process_exec'", "sep.join(()) + 'subprocess_exec'", "sep.join(['sub']) + 'process_exec'",
         "sep.join(('sub',)) + 'process_exec'", "sep.join({'sub'}) + 'process_exec'", "f'{sep.join([])}subprocess_exec'",
