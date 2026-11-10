@@ -818,7 +818,7 @@ def _unflagged_spawns_in_source(source: str, label: str) -> list[str]:
     return bad
 
 
-# --- PowerShell fixtures: Start-Process powershell must be hidden, judged per statement ---------------------------------
+# --- PowerShell fixtures: any Start-Process / saps / start launch, whatever its target, must be hidden; judged per statement ---
 
 _WINDOW_STYLE_HIDDEN_RE = re.compile(r"(?<!\S)-WindowStyle[\s:]+(?:'Hidden'|\"Hidden\"|Hidden(?![\w-]))", re.IGNORECASE)
 _START_PROCESS_RE = re.compile(r"(?<![\w$.-])(Start-Process|saps|start)(?![\w-])", re.IGNORECASE)  # the cmdlet and its aliases
@@ -1044,11 +1044,11 @@ def _string_values(tree: ast.AST) -> list[tuple[int, str, bool]]:
 
 
 def _start_process_violations(py_source: str) -> tuple[int, list[int]]:
-    """(number of PowerShell ``Start-Process ... powershell`` statements, python lines of those lacking an outer -WindowStyle Hidden).
+    """(number of PowerShell ``Start-Process`` / ``saps`` / ``start`` launch statements, whatever each one starts, python lines of those lacking an outer -WindowStyle Hidden).
 
     Reads the module's string expressions (so a comment never counts; implicit concatenation and ``+`` of literals are joined),
-    splits each into PowerShell statements, and judges every statement holding ``Start-Process`` and ``powershell`` on its own
-    text. Quoted text is judged as a nested script, so ``-WindowStyle Hidden`` inside an -ArgumentList value does not satisfy
+    splits each into PowerShell statements, and judges every statement holding a ``Start-Process`` / ``saps`` / ``start`` launch, whatever
+    its target (powershell, pwsh, cmd.exe, a variable ``-FilePath``), on its own text. Quoted text is judged as a nested script, so ``-WindowStyle Hidden`` inside an -ArgumentList value does not satisfy
     the outer statement; a quoted value (``-WindowStyle 'Hidden'``) does. A string built at run time out of a ``Start-`` piece
     (f-string, ``%``, ``.format``, ``.join``) is REPORTED: its text is not known, so it cannot be proven hidden.
     """
@@ -1115,7 +1115,7 @@ class NamedTestFixtureTests(unittest.TestCase):
         src = (ROOT / "tools/repo_hygiene/test_playback_host_load_gate.py").read_text(encoding="utf-8")
         found, bad = _start_process_violations(src)
         self.assertGreaterEqual(found, 3, "expected the three run.ps1 Start-Process fixtures")
-        self.assertEqual(bad, [], "Start-Process powershell.exe without -WindowStyle Hidden at python line(s): " + ", ".join(map(str, bad)))
+        self.assertEqual(bad, [], "Start-Process / saps / start launch (whatever its target) without -WindowStyle Hidden at python line(s): " + ", ".join(map(str, bad)))
 
 
 class ScannerHardeningTests(unittest.TestCase):
