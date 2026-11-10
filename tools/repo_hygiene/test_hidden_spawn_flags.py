@@ -333,14 +333,32 @@ def _fold_args(args: list[ast.AST], keywords: list[ast.keyword], consts: dict[st
         if isinstance(a, ast.Starred):
             any_pos = True  # `*rest` may be any number of arguments: every position from here on is unknown
             break
-        positional.append(_flatten(a, consts, depth + 1))
+        positional.append(_formatted(a, consts, depth))
     named, any_named = {}, False
     for kw in keywords:
         if kw.arg is None:
             any_named = True  # `**rest` may rebind any name
         else:
-            named[kw.arg] = _flatten(kw.value, consts, depth + 1)
+            named[kw.arg] = _formatted(kw.value, consts, depth)
     return positional, named, any_pos, any_named
+
+
+def _padded(text: str) -> str:
+    """The text an unknown text may print as through a conversion (``!r``, ``%a``) or a spec: its literal characters with anything around them."""
+    core = text.strip(_WILD)
+    return _WILD + core + _WILD if core.replace(_WILD, "") else _WILD
+
+
+def _formatted(node: ast.AST, consts: dict[str, str], depth: int) -> tuple[str, bool]:
+    """``_flatten`` of a value that is about to be PRINTED (an f-string field, a ``.format`` / ``%`` argument). Printing a bytes value shows its repr
+    (``b'abc'``), not its characters, and the fold does not track which values are bytes: an expression that holds a bytes literal (and does not
+    decode it back to a text) reads as its text with anything around it (pass-26 A1)."""
+    text, known = _flatten(node, consts, depth + 1)
+    if not any(isinstance(n, ast.Constant) and isinstance(n.value, bytes) for n in ast.walk(node)):
+        return text, known
+    if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr == "decode":
+        return text, known  # a str: printed as it is
+    return (text if text.startswith(_WILD) else _WILD + text) + ("" if text.endswith(_WILD) else _WILD), False
 
 
 def _fold_mapping(node: ast.AST | None, consts: dict[str, str], depth: int) -> tuple[dict, bool]:
@@ -349,7 +367,7 @@ def _fold_mapping(node: ast.AST | None, consts: dict[str, str], depth: int) -> t
         return {}, True
     if any(k is None or not (isinstance(k, ast.Constant) and isinstance(k.value, str)) for k in node.keys):
         return {}, True  # `**other`, a computed key: the dict may rebind any name
-    return {k.value: _flatten(v, consts, depth + 1) for k, v in zip(node.keys, node.values)}, False
+    return {k.value: _formatted(v, consts, depth) for k, v in zip(node.keys, node.values)}, False
 
 
 # Calls whose result is not a piece of their argument text (they look an attribute up, test, measure or print): hedging their arguments would report the
@@ -545,13 +563,16 @@ def _flatten(node: ast.AST, consts: dict[str, str], depth: int = 0) -> tuple[str
             if isinstance(v, ast.Constant):
                 parts.append((v.value, True))
             elif isinstance(v, ast.FormattedValue):
-                text, known = _flatten(v.value, consts, depth + 1)
-                if v.conversion == -1 and v.format_spec is None:
-                    parts.append((text, known))  # `{x}` of a text is that text; a wildcard inside it stays
+                text, known = _formatted(v.value, consts, depth)
+                if v.conversion in (-1, 115) and v.format_spec is None:
+                    parts.append((text, known))  # `{x}` / `{x!s}` of a text is that text; a wildcard inside it stays
                     continue
                 spec, spec_known = _flatten(v.format_spec, consts, depth + 1) if v.format_spec is not None else (None, True)
                 shown = _apply_spec(text, {115: "s", 114: "r", 97: "a"}.get(v.conversion), spec) if known and spec_known else None
-                parts.append((shown, True) if shown is not None else (_WILD, False))
+                if shown is None:  # `!r`, `!a` or a spec of a text with an unknown part: that text, with anything around it (pass-26 A1)
+                    parts.append((_padded(text), False))
+                else:
+                    parts.append((shown, True))
             else:
                 parts.append((_WILD, False))
         return "".join(t for t, _ in parts), all(k for _, k in parts)
@@ -576,7 +597,7 @@ def _flatten(node: ast.AST, consts: dict[str, str], depth: int = 0) -> tuple[str
             positional, _, any_pos, _ = _fold_args(right.elts, [], consts, depth)
             return _fill_percent(template, positional, {}, known, any_pos=any_pos, any_named=False)
         if isinstance(right, (ast.Constant, ast.JoinedStr, ast.BinOp)):
-            return _fill_percent(template, [_flatten(right, consts, depth + 1)], {}, known, any_pos=False, any_named=False)
+            return _fill_percent(template, [_formatted(right, consts, depth)], {}, known, any_pos=False, any_named=False)
         # a name, call or subscript on the right may be a tuple or a mapping at run time: every field is unknown
         return _fill_percent(template, [], {}, known, any_pos=True, any_named=True)
     if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Mult):  # string repetition: `('subprocess_' + kind) * 1` is the text itself, `* n` repeats it
@@ -828,7 +849,7 @@ def _fill_format(template: str, positional: list[tuple[str, bool]], named: dict[
                 out.append(value[0])  # an unknown text printed as it is: its wildcard stays in place
                 ok = False
             else:
-                out.append(_WILD)
+                out.append(_padded(value[0]))  # printed through a conversion or a spec: its text, with anything around it (pass-26 A1)
                 ok = False
         else:
             out.append(ch)
@@ -898,7 +919,7 @@ def _fill_percent(template: str, positional: list[tuple[str, bool]], named: dict
             out.append(value[0])  # an unknown text printed as it is: its wildcard stays in place
             ok = False
         else:
-            out.append(_WILD)
+            out.append(_padded(value[0]) if value is not None and not value[1] else _WILD)  # `%r` of an unknown text: that text, with anything around it (pass-26 A1)
             ok = False
     return "".join(out), ok
 
@@ -1682,7 +1703,7 @@ def _ps_comment_at(text: str, i: int) -> bool:
     """Does a PowerShell ``#`` comment start at ``text[i]``? It does wherever a new token can begin: after white space, a quote that closes a string, a
     bracket, a separator or an operator (``'/c'# -WindowStyle Hidden``, ``(1)# note``), and not inside a bare word (``a#b``). The one predicate the three
     readers share (pass-25 A3): a comment kept as text could supply a ``-WindowStyle Hidden`` the launch does not carry."""
-    return text[i] == "#" and (i == 0 or not (text[i - 1].isalnum() or text[i - 1] in "_-.:/\\$"))
+    return text[i] == "#" and (i == 0 or not (text[i - 1].isalnum() or text[i - 1] in "_-.:/\\$\x02"))  # \x02: a glued or escaped character, part of the same word
 
 
 def _quoted_spans(text: str) -> list[tuple[int, int]]:
@@ -1802,6 +1823,10 @@ def _unescape_ps(script: str) -> str:
                 continue
             if quote[i] == "" and nxt in " \t":
                 out.append("\x02")  # outside quotes an escaped space is part of the SAME word (`foo` -WindowStyle` Hidden` is one argument): never a boundary
+                i += 2
+                continue
+            if quote[i] == "" and (nxt == "#" or (nxt == "<" and script.startswith("#", i + 2))):
+                out.append("\x02")  # an escaped `#` (or the `<` of an escaped `<#`) is a plain character of its word: unescaped it would open a comment that eats the rest (pass-26 A2)
                 i += 2
                 continue
             if quote[i] == '"' and nxt in _PS_ESCAPE_LETTERS:
@@ -4525,6 +4550,37 @@ class AdversaryR9Tests(unittest.TestCase):
         for script in ("Start-Process cmd.exe -ArgumentList '/c' -WindowStyle Hidden # note", "Start-Process cmd.exe -ArgumentList a#b -WindowStyle Hidden",
                        "Start-Process cmd.exe -ArgumentList '/c' -WindowStyle Hidden;# done", "Start-Process cmd.exe -WindowStyle Hidden -ArgumentList '/c'# ok"):
             self.assertEqual(_judge_script(script), (1, 0), script)
+
+    # ---- pass 26 (review-adversary-MLV-LANE-CONSOLE-HIDDEN-1-r10-7eda314f) A1-A2, as classes ----
+    def test_pass26_a1_printing_a_bytes_value_shows_its_repr_not_its_characters(self):
+        for expr in ("f\"{b'xxsubprocess_exec'}\"[4:-1]", "f\"{b'xxsubprocess_exec'!s}\"[4:-1]", "'{}'.format(b'xxsubprocess_exec')[4:-1]", "'{x}'.format(x=b'xxsubprocess_exec')[4:-1]",
+                     "'{x}'.format_map({'x': b'xxsubprocess_exec'})[4:-1]", "('%s' % b'xxsubprocess_exec')[4:-1]", "('%s' % (b'xxsubprocess_exec',))[4:-1]",
+                     "('%(x)s' % {'x': b'xxsubprocess_exec'})[4:-1]", "('%s' % (b'xx' + b'subprocess_exec'))[4:-1]", "f\"{b'xxsubprocess_shell'}\"[4:-1]",
+                     "f\"{b'xx_make_subprocess_transport'}\"[4:-1]", "'{!r}'.format(b'xxsubprocess_exec')[4:-1]", "'{!s}'.format(b'xxsubprocess_exec')[4:-1]",
+                     "('%r' % b'xxsubprocess_exec')[4:-1]", "('%a' % b'xxsubprocess_exec')[4:-1]", "f\"{b'xxsubprocess_exec'!r}\"[4:-1]", "f\"{b'xxsubprocess_exec'!a}\"[4:-1]",
+                     "f\"{b'xx'}{b'subprocess_exec'}\"[7:-1]"):
+            self.assertGreaterEqual(len(self._bad(self._launch(expr))), 1, expr)
+            text, known = _flatten(ast.parse(expr, mode="eval").body, {})
+            self.assertTrue(known or _WILD in text, expr)
+        for expr in ("f\"{b'xxsaps cmd.exe'}\"[4:-1]", "('%s' % b'xxStart-Process cmd.exe')[4:-1]", "'{}'.format(b'xxsaps cmd.exe')[4:-1]"):
+            self.assertEqual(self._ps(expr), (1, 1), expr)
+        for expr in ("f\"{b'abc'}\"[4:-1]", "'{}'.format(b'value')", "'%s' % b'value_x'", "f\"{b'subprocess_exe'.decode()}\"", "'{}'.format(b'subprocess_exe'.decode())",
+                     "f\"{b'xxvalue'}\"[4:-1]"):
+            self.assertEqual(self._bad(self._launch(expr)), [], expr)
+            self.assertEqual(self._ps(expr), (0, 0), expr)
+        self.assertEqual(_flatten(ast.parse("f\"{b'subprocess_exec'.decode()}\"", mode="eval").body, {}), ("subprocess_exec", True))  # a decoded text prints as it is
+
+    def test_pass26_a2_an_escaped_hash_is_a_character_not_a_comment(self):
+        for script in ("Write-Host `#; Start-Process cmd.exe", "Write-Host `#; saps cmd.exe", "Write-Host `<#; Start-Process cmd.exe", "Write-Host a `#b; Start-Process cmd.exe",
+                       "Write-Host `#\nStart-Process cmd.exe", "Write-Host `<#\nsaps cmd.exe", "Write-Host `#`#; Start-Process cmd.exe", "Write-Host `#' it'; Start-Process cmd.exe"):
+            self.assertEqual(_judge_script(script), (1, 1), script)
+            self.assertEqual(self._ps(repr(script)), (1, 1), script)
+        for script in ("Write-Host `#; Start-Process cmd.exe -WindowStyle Hidden", "Write-Host a#b; Start-Process cmd.exe -WindowStyle Hidden",
+                       "Write-Host `<#; saps cmd.exe -WindowStyle Hidden"):
+            self.assertEqual(_judge_script(script), (1, 0), script)
+        # a real comment still ends the line, and an escaped hash inside it changes nothing
+        for script in ("Write-Host x # `#; Start-Process cmd.exe", "Write-Host x <# `#; Start-Process cmd.exe #>", "Write-Host x"):
+            self.assertEqual(_judge_script(script), (0, 0), script)
 
 
 if __name__ == "__main__":
