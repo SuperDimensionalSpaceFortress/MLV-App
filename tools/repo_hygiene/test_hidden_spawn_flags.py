@@ -77,7 +77,6 @@ import ast
 import asyncio
 import pkgutil
 import posixpath
-import itertools
 import re
 import subprocess
 import unittest
@@ -209,7 +208,8 @@ def _label(expr: ast.AST) -> str:
 
 
 _FORMAT_BODY_RE = re.compile(r"([^!:]*)(?:!([rsa]))?(?::(.*))?", re.DOTALL)
-_PERCENT_FIELD_RE = re.compile(r"%(?:\(([^)]*)\))?([#0\- +]*)(\d+|\*)?(?:\.(\d+|\*))?[hlL]?([sraidiouxXeEfFgGc%])")
+_PERCENT_FIELD_RE = re.compile(r"%(?:\(([^)]*)\))?([#0\- +]*)([0-9]+|\*)?(?:\.([0-9]+|\*))?[hlL]?([sraidiouxXeEfFgGc%])")  # ASCII digits only: int() meets nothing else
+_PERCENT_TAIL_RE = re.compile(r"(?:[^)]*\))?[#0\- +0-9.*hlL]*[A-Za-z%]?")  # what a field opened before a wildcard may still take: key, flags, width, conversion
 _SPEC_NUMBER_LIMIT = 256  # a width or precision above this is never handed to Python's formatter (no huge allocation)
 _STRING_MAPPERS = frozenset({"lower", "upper", "casefold", "strip", "lstrip", "rstrip", "title", "capitalize", "swapcase"})
 _CASE_MAPPERS = frozenset({"lower", "upper", "casefold", "swapcase"})  # act character by character, so a wildcard in the text survives them
@@ -232,8 +232,8 @@ def _hedge(text: str) -> str:
 
 def _could_name(built: str, known: bool, names) -> bool:
     """Can this folded text (``_WILD`` = any text) read as one of ``names``, possibly behind a dotted receiver (``loop.subprocess_exec``)?"""
-    if _WILD not in built:
-        return known and any(built == n or re.fullmatch(r"(?:\w+\.)+" + re.escape(n), built) for n in names)
+    if _WILD not in built:  # every uncertainty is a wildcard, so a text without one is exact whatever `known` says
+        return any(built == n or re.fullmatch(r"(?:\w+\.)+" + re.escape(n), built) for n in names)
     pieces = [p for p in re.split(re.escape(_WILD) + "+", built)]
     if not any(len(re.findall(r"\w", p)) >= 3 for p in pieces):
         return False  # wildcards with (almost) no literal text around them say nothing about the text
@@ -343,8 +343,10 @@ def _flatten(node: ast.AST, consts: dict[str, str], depth: int = 0) -> tuple[str
                 # anything else could read in any order (or be a different set altogether)
                 distinct = {t for t, k in parts if k}
                 if len(distinct) == 1 and all(k for _, k in parts):
-                    return distinct.pop(), sep_known
+                    return distinct.pop(), True  # one element: the separator is never written
                 return _WILD, False
+            if len(parts) <= 1:  # nothing to put a separator between: it contributes no characters, so its uncertainty must not leak
+                return (parts[0][0], parts[0][1]) if parts else ("", True)
             return sep.join(t for t, _ in parts), sep_known and all(k for _, k in parts)
         if method == "replace" and 2 <= len(node.args) + len(node.keywords) <= 3 and len(node.args) >= 2 and all(kw.arg == "count" for kw in node.keywords):
             text, known = _flatten(recv, consts, depth + 1)
@@ -401,7 +403,7 @@ def _apply_spec(text: str, conv: str | None, spec: str | None) -> str | None:
         text = ascii(text)
     if not spec:
         return text
-    if _spec_too_big(re.findall(r"\d+", spec)):
+    if _spec_too_big(re.findall(r"[0-9]+", spec)):
         return None
     try:
         return format(text, spec)
@@ -409,10 +411,24 @@ def _apply_spec(text: str, conv: str | None, spec: str | None) -> str | None:
         return None
 
 
+def _fill_unknown_template(template: str, percent: bool) -> tuple[str, bool]:
+    """A template that itself holds a wildcard has an unknown structure: the wildcard may open, close or lengthen a field. So every field in
+    a literal segment is unknown, and the start of each segment after a wildcard may be the tail of a field the wildcard opened (up to its
+    closing brace, or up to its key, flags, width and conversion character): that much of the segment is not trusted, the rest is kept."""
+    out = []
+    for i, seg in enumerate(re.split(re.escape(_WILD) + "+", template)):
+        if i:
+            seg = seg[_PERCENT_TAIL_RE.match(seg).end():] if percent else seg[seg.rfind("}") + 1:]
+        out.append((_fill_percent if percent else _fill_format)(seg, [], {}, False, any_pos=True, any_named=True)[0])
+    return _WILD.join(out), False
+
+
 def _fill_format(template: str, positional: list[tuple[str, bool]], named: dict[str, tuple[str, bool]], known: bool,
                  any_pos: bool = False, any_named: bool = False) -> tuple[str, bool]:
     """Fill a ``str.format`` template field by field. A field the fold cannot read (a missing or unknown argument, a nested field, an
     accessor it does not apply) is the wildcard, never a wrong known text; with ``**`` in play no keyword is trusted."""
+    if _WILD in template:
+        return _fill_unknown_template(template, False)
     out: list[str] = []
     ok = known
     auto, i, n = 0, 0, len(template)
@@ -449,12 +465,12 @@ def _fill_format(template: str, positional: list[tuple[str, bool]], named: dict[
             if name == "":
                 index, auto = auto, auto + 1
                 value = positional[index] if index < len(positional) else None
-            elif name.isdigit():
+            elif re.fullmatch(r"[0-9]{1,4}", name):  # an ASCII index of sane length; anything else (`²`, 5000 digits) is unknown, never int()'d
                 value = positional[int(name)] if int(name) < len(positional) else None
             else:
                 value = None if any_named else named.get(name)
             if value is not None and accessors:
-                index = re.fullmatch(r"\[(\d+)\]", accessors)  # str.format reads `[-1]` as the string key '-1', which a str rejects
+                index = re.fullmatch(r"\[([0-9]{1,4})\]", accessors)  # str.format reads `[-1]` as the string key '-1', which a str rejects
                 try:
                     value = (value[0][int(index.group(1))], True) if index and value[1] else None
                 except IndexError:
@@ -482,6 +498,8 @@ def _fill_percent(template: str, positional: list[tuple[str, bool]], named: dict
                   any_pos: bool = False, any_named: bool = False) -> tuple[str, bool]:
     """Fill a ``%`` template. A field the fold cannot read (a number, a ``*`` width, a missing or unknown argument, a conversion other than
     ``%s`` of a known text) is the wildcard, never a wrong known text; with ``**`` or a run-time right operand no argument is trusted."""
+    if _WILD in template:
+        return _fill_unknown_template(template, True)
     out: list[str] = []
     ok = known
     nxt, lost, pos = 0, False, 0
@@ -532,58 +550,48 @@ def _fill_percent(template: str, positional: list[tuple[str, bool]], named: dict
     return "".join(out), ok
 
 
-_BUILT_LAUNCH_KW_RE = re.compile(r"(?P<a>start-)|(?:^|[;&|({=!]|\s\.)\s*(?P<b>start|saps)(?![\w-])|(?<![\w$.-])(?:return|throw|exit|-not)\s+(?P<c>start|saps)(?![\w-])",
-                                 re.IGNORECASE | re.MULTILINE)  # _BUILT_LAUNCH_RE with the keyword captured, so its span can be compared with the literal text
+_LAUNCH_KEYWORDS = ("start-", "start", "saps")
+_LEFT_OF_LAUNCH_RE = re.compile(r"(?:^|[;&|({=!]|\s\.|(?<![\w$.-])(?:return|throw|exit|-not)\s)\s*\Z", re.IGNORECASE | re.MULTILINE)  # where a command word can stand
 
 
-def _launch_fills(text: str) -> list[tuple[str, list[bool] | None]]:
-    """The ways a folded text (``_WILD`` = any text) could read once its wildcards are filled with pieces of a launch command: (text, mask of
-    the characters that are literal). The first is the text with its wildcards dropped (mask None: the literal pieces joined, as written).
-    The others are a bounded set: each wildcard run alone, all of them with one fill, and every combination when there are few and the
-    literal gaps between them are short."""
-    plain = text.replace(_WILD, "")
+def _could_launch(text: str) -> bool:
+    """Can this folded text (``_WILD`` = any text) read as a PowerShell launch (``Start-`` / ``start`` / ``saps`` where a command word can stand)
+    once its wildcards are filled with something, using characters of BOTH the source and a wildcard? A keyword wholly from the source is the
+    plain text's business, and one wholly from a wildcard says nothing about the text around it. Exact: it tries every way the keyword can
+    lie across the literal characters and the wildcards, so no bound on the number of wildcards or the length of the gaps between them."""
     if _WILD not in text:
-        return [(plain, None)]
-    segs = re.split(re.escape(_WILD) + "+", text)
-    runs = len(segs) - 1
-    words = ("start-process", "saps", "start")
-    fills = {w[a:b] for w in words for a in range(len(w)) for b in range(a, len(w) + 1)} | {";", " ", "&", "|"}
-    out: dict[str, list[bool]] = {}
+        return False
+    items: list[str | None] = []  # a literal character, or None for a run of wildcards
+    for ch in text:
+        if ch != _WILD:
+            items.append(ch)
+        elif not items or items[-1] is not None:
+            items.append(None)
+    n = len(items)
 
-    def add(chosen: list[str]) -> None:
-        built, mask = "", []
-        for i, seg in enumerate(segs):
-            built += seg
-            mask += [True] * len(seg)
-            if i < runs:
-                built += chosen[i]
-                mask += [False] * len(chosen[i])
-        out.setdefault(built, mask)
+    def left_ok(start: int) -> bool:
+        prefix = "".join(_WILD if it is None else it for it in items[:start])
+        return prefix.rstrip(" \t").endswith(_WILD) or _LEFT_OF_LAUNCH_RE.search(prefix) is not None
 
-    for fill in fills:
-        add([fill] * runs)  # every run filled alike
-        for k in range(runs):  # run k filled, the others dropped
-            add([fill if i == k else "" for i in range(runs)])
-    if runs <= 3 and all(len(seg) <= 3 for seg in segs[1:-1]):
-        small = sorted({w[a:b] for w in ("saps", "start") for a in range(len(w)) for b in range(a, len(w) + 1)})
-        for combo in itertools.product(small, repeat=runs):
-            add(list(combo))
-    return [(plain, None)] + sorted(out.items())
+    def right_ok(kw: str, i: int) -> bool:
+        return kw == "start-" or i >= n or items[i] is None or not re.match(r"[\w-]", items[i])
 
+    for kw in _LAUNCH_KEYWORDS:
+        size = len(kw)
 
-def _built_launch(variants: list[tuple[str, list[bool] | None]], marked: str | None = None) -> str | None:
-    """The first variant that reads as a PowerShell launch, or None. A filled variant counts only when the launch keyword mixes characters of
-    the source with characters of a fill (a keyword wholly from the source is the plain variant's business; one wholly from a wildcard says
-    nothing about the text around it). With ``marked``, the launch must also be one more ``Start-Process`` / ``saps`` / ``start`` than the
-    marked text has."""
-    for text, literal in variants:
-        if marked is not None and not len(_START_PROCESS_RE.findall(text)) > len(_START_PROCESS_RE.findall(marked)):
-            continue
-        for m in _BUILT_LAUNCH_KW_RE.finditer(text):
-            if literal is None or any(any(literal[m.start(g):m.end(g)]) and not all(literal[m.start(g):m.end(g)])
-                                      for g in ("a", "b", "c") if m.start(g) >= 0):
-                return text
-    return None
+        def go(start: int, i: int, j: int, wild: bool, lit: bool) -> bool:
+            if j == size:
+                return wild and lit and right_ok(kw, i) and left_ok(start)
+            if i >= n:
+                return False
+            item = items[i]
+            if item is None:  # the wildcard supplies 0..(rest of the keyword) characters
+                return any(go(start, i + 1, j + take, wild or take > 0, lit) for take in range(size - j + 1))
+            return item.lower() == kw[j] and go(start, i + 1, j + 1, wild, True)
+
+        if any(go(a, a, 0, False, False) for a in range(n)):
+            return True
+    return False
 
 
 def _tracked(module: str | None) -> frozenset:
@@ -858,6 +866,15 @@ class _Facts:
             return None if arg.elts else False
         return True if isinstance(arg, ast.Constant) else None
 
+    @staticmethod
+    def _absolute_level(call: ast.Call) -> bool:
+        """``__import__(name, globals, locals, fromlist, level)``: True only when the level is provably 0 (absent, or the literal 0). A level above
+        0 names the module relative to ``globals['__package__']``; a run-time level, or a ``*`` / ``**`` that may carry one, is not provable."""
+        if any(isinstance(a, ast.Starred) for a in call.args) or any(kw.arg is None for kw in call.keywords):
+            return False
+        level = call.args[4] if len(call.args) > 4 else next((kw.value for kw in call.keywords if kw.arg == "level"), None)
+        return level is None or (isinstance(level, ast.Constant) and type(level.value) is int and level.value == 0)
+
     def unresolved_reason(self, call: ast.Call) -> str:
         """Why ``import_target`` could not resolve this dynamic import (its ``resolved`` is False): the module name, the fromlist, or the package."""
         kind = self.import_kind(call)
@@ -867,6 +884,8 @@ class _Facts:
             return "makes a dynamic import whose module name is not a string literal"
         if kind == "__import__" and "." in name and self._fromlist_state(call) is None:
             return "makes a dynamic import whose fromlist is not statically known, so the returned module cannot be followed"
+        if kind == "__import__" and not self._absolute_level(call):
+            return "makes a dynamic import with a relative level that is not provably 0, so the module it names cannot be resolved"
         return "makes a dynamic import of a relative module name whose package is not a string literal"
 
     def import_target(self, node: ast.AST) -> tuple[bool, str | None, bool]:
@@ -880,6 +899,8 @@ class _Facts:
         name = self.literal(arg)
         if name is None:
             return True, None, False
+        if kind == "__import__" and not self._absolute_level(node):
+            return True, None, False  # `__import__('windows_utils', {'__package__': 'asyncio'}, level=1)` is asyncio.windows_utils, not a top-level module
         fromlist = self._fromlist_state(node) if kind == "__import__" else False
         if fromlist is None and "." in name:  # os.path with a fromlist known only at run time is os or os.path: not resolvable, so reported
             return True, None, False
@@ -1499,8 +1520,9 @@ def _string_values(tree: ast.AST) -> list[tuple[int, str, bool]]:
             if not any(isinstance(c, ast.Constant) and isinstance(c.value, str) for h in holes for c in ast.walk(h)):
                 marked = "".join(v.value if isinstance(v, ast.Constant) else "\x01" for v in node.values)
                 flat, _ = _flatten(node, named_strings)  # the literal pieces with a wildcard per hole: f'Sta{name}rt-Process cmd.exe'
-                filled = _built_launch(_launch_fills(flat), marked)  # the holes dropped, then each filled with pieces of a launch (`f'{115:c}aps cmd.exe'`)
-                out.append((node.lineno, filled, True) if filled is not None else (node.lineno, marked, False))
+                plain = flat.replace(_WILD, "")  # the holes dropped: f'Sta{name}rt-Process cmd.exe'
+                built = (len(_START_PROCESS_RE.findall(plain)) > len(_START_PROCESS_RE.findall(marked)) and _BUILT_LAUNCH_RE.search(plain)) or _could_launch(flat)
+                out.append((node.lineno, plain, True) if built else (node.lineno, marked, False))  # ...or filled with pieces of a launch (`f'{115:c}aps cmd.exe'`)
                 continue
                 out.append((node.lineno, marked, False))
                 continue
@@ -1512,7 +1534,7 @@ def _string_values(tree: ast.AST) -> list[tuple[int, str, bool]]:
             pieces = [c.value for c in consts]
             # a launch split across the literal pieces ('Sta' + name + 'rt-Process') reads as one only when they are joined in source order
             flat, _ = _flatten(node, named_strings)  # '{}rt-Process'.format('Sta'), '%srt-Process' % 'Sta': the template filled in
-            if any(_BUILT_LAUNCH_RE.search(p) for p in pieces + ["".join(pieces)]) or _built_launch(_launch_fills(flat)) is not None:
+            if any(_BUILT_LAUNCH_RE.search(p) for p in pieces + ["".join(pieces), flat.replace(_WILD, "")]) or _could_launch(flat):
                 out.append((node.lineno, "".join(pieces), True))
                 continue
         stack.extend(ast.iter_child_nodes(node))
@@ -2824,8 +2846,8 @@ class AdversaryR6Tests(unittest.TestCase):
             found, bad = _start_process_violations(src)
             self.assertEqual((found, len(bad)), (1, 1), label)
         # controls: no launch anywhere in the assembled text
-        for src in ("x = f'Sta{name}rtup cmd.exe'\n", "x = '{}rtup cmd.exe'.format('Sta')\n", "x = '%sged of the line' % 'Sta'\n",
-                    "x = f'the {kind} of it'\n"):
+        # (r7: `f'Sta{name}rtup'` is no longer a control: the hole may hold `rt-`, so `Start-` can be built; the exact fold keeps the known ones clean)
+        for src in ("x = '{}rtup cmd.exe'.format('Sta')\n", "x = '%sged of the line' % 'Sta'\n", "x = f'the {kind} of it'\n"):
             self.assertEqual(_start_process_violations(src), (0, []), src)
         # the unsplit forms keep their old verdicts
         self.assertEqual(_start_process_violations("x = 'Start-Process cmd.exe -WindowStyle Hidden'\n"), (1, []))
@@ -3092,6 +3114,14 @@ class AdversaryR7Tests(unittest.TestCase):
         "'{x}ubprocess_exec'.format_map(mapping)", "'%(x)subprocess_exec' % mapping", "'%subprocess_exec' % args",
         # an operation with run-time arguments over a text that holds the name may leave it whole
         "'subprocess_exec'.replace(a, b)", "'xsubprocess_exec'[n:]", "'subprocess_exec_x'[:n]", "'subprocess_exec'.strip(chars)", "'subprocess_exec'.replace('x', b, 1)",
+        # pass 16 A1: the template itself holds a wildcard, so the wildcard may open, close or lengthen a field
+        "('%' + kind + 'ubprocess_exec') % 115", "('{' + field + 'ubprocess_exec').format(115)", "(prefix + '%subprocess_exec') % ('x',)",
+        "(prefix + '{}ubprocess_exec').format('s')", "('%(' + key + ')subprocess_exec') % mapping", "('{' + field + '}ubprocess_exec').format_map(m)",
+        "('%' + kind + 'subprocess_exec') % 115",
+        # pass 16 A2: an operand that contributes no characters (a separator with fewer than two pieces) must not make an exact name unknown
+        "sep.join([]) + 'sub' + 'process_exec'", "sep.join(()) + 'subprocess_exec'", "sep.join(['sub']) + 'process_exec'",
+        "sep.join(('sub',)) + 'process_exec'", "sep.join({'sub'}) + 'process_exec'", "f'{sep.join([])}subprocess_exec'",
+        "'{}subprocess_exec'.format(sep.join([]))", "'%ssubprocess_exec' % sep.join(())", "'{}'.format(sep.join(['subprocess_exec']))",
         # unknown positions behind a `*` width, a missing argument, a lone brace
         "'%*dsubprocess_exec' % (1, 2)", "'{}{}ubprocess_exec'.format('s')",
     )
@@ -3100,6 +3130,10 @@ class AdversaryR7Tests(unittest.TestCase):
         "'{x}aps cmd.exe'.format_map({'x': 'z', **{'x': 's'}})", "'%(x)saps cmd.exe' % {'x': 'z', **{'x': 's'}}",
         "'{x}aps cmd.exe'.format(**kw)", "'%saps cmd.exe' % (*parts,)", "'{}aps cmd.exe'.format(*parts)",
         "'%c%caps cmd.exe' % (1, 2)", "'sa' + '%c' % 112 + 's cmd.exe'", "f'S{97:c}rt-Process cmd.exe'", "f'{115:c}{116:c}art-Process cmd.exe'",
+        # pass 16 A1 (a wildcard in the template) and A3 (holes far apart: no bound on how many or how long the gaps between them are)
+        "('%' + kind + 'aps cmd.exe') % 115", "('{' + field + 'aps cmd.exe').format(115)", "f'St{a}-Pro{b}ss cmd.exe'", "f'S{a}t{b}a{c}r{d}t-Process cmd.exe'",
+        "f'St{a}rt-Pro{b}ces{c}s cmd.exe'", "f'{a}-Process-and-more-text-between {b}tart-Process cmd.exe'", "f'sa{a}ps cmd.exe'",
+        "f'S{a}t{b}a{c}r{d}t-Pro{e}ce{f}ss cmd.exe'", "'S%st%sa%sr%st-Process cmd.exe' % (a, b, c, d)", "'St{}-Pro{}ss cmd.exe'.format(a, b)",
     )
 
     def test_a1_a2_a3_a_name_hidden_behind_an_unreadable_piece_is_reported(self):
@@ -3129,6 +3163,51 @@ class AdversaryR7Tests(unittest.TestCase):
             self.assertFalse(known, src[:40])
         self.assertGreaterEqual(len(self._bad(self._launch("'{:" + digits + "}ubprocess_exec'.format('s')"))), 1)  # reported, not crashed on
         self.assertEqual(self._ps("'%" + digits + "saps cmd.exe' % 'x'")[0], 1)  # read as a launch, not crashed on
+
+    def test_every_fold_that_is_not_exact_carries_a_wildcard(self):
+        """The invariant the consumers rely on: a text WITHOUT the wildcard is exact, so `known` False always comes with `_WILD` in the text."""
+        for expr in self.HIDDEN_NAME + self.HIDDEN_LAUNCH + ("'a' + n", "f'{n}'", "'%s' % n", "'{}'.format(n)", "sep.join([a, b])", "x[n:]", "x.replace(a, b)"):
+            text, known = _flatten(ast.parse(expr, mode="eval").body, {})
+            self.assertTrue(known or _WILD in text, (expr, text))
+        # a join with fewer than two pieces writes no separator, so an unknown one does not matter
+        for src, want in (("sep.join([])", ""), ("sep.join(['ab'])", "ab"), ("sep.join(('ab',))", "ab"), ("sep.join({'ab'})", "ab"), ("sep.join({'ab', 'ab'})", "ab")):
+            self.assertEqual(_flatten(ast.parse(src, mode="eval").body, {}), (want, True), src)
+
+    def test_a3_a_launch_hidden_across_any_number_of_holes_and_any_gap_is_reported(self):
+        # exact: the matcher lays the keyword across the literal characters and the wildcards, so nothing is bounded
+        self.assertTrue(_could_launch("St\x00-Pro\x00ss cmd.exe"))
+        self.assertTrue(_could_launch("S\x00t\x00a\x00r\x00t-Process"))
+        self.assertTrue(_could_launch("\x00aps cmd.exe") and _could_launch("sa\x00s cmd.exe") and _could_launch("; sa\x00s"))
+        for text in ("\x00", "\x00 \x00", "the \x00 of it", "last\x00", "just\x00 now", "x\x00 y\x00 z", "wait for \x00-art", "\x00start", "restart\x00"):
+            self.assertFalse(_could_launch(text), text)  # no keyword with characters of both the source and a wildcard where a command word stands
+
+    def test_a4_a_dunder_import_with_a_level_is_resolved_relative_to_its_package_or_reported(self):
+        for label, src in {
+            "keyword level and globals": "wu = __import__('windows_utils', globals={'__package__': 'asyncio'}, fromlist=['Popen'], level=1)\nwu.Popen(['cmd.exe', '/c', 'exit'])\n",
+            "positional level": "wu = __import__('windows_utils', {'__package__': 'asyncio'}, None, ['Popen'], 1)\nwu.Popen(['x'])\n",
+            "run-time level": "wu = __import__('windows_utils', fromlist=['Popen'], level=n)\nwu.Popen(['x'])\n",
+            "level by star": "wu = __import__('windows_utils', *args)\nwu.Popen(['x'])\n",
+            "level by double star": "wu = __import__('windows_utils', **kw)\nwu.Popen(['x'])\n",
+            "builtins form": "import builtins\nwu = builtins.__import__('base_events', globals(), None, ['x'], 1)\nwu.subprocess.run(['x'])\n",
+        }.items():
+            self.assertGreaterEqual(len(self._bad(src)), 1, label)
+        # the literal level 0, or none, is the ordinary absolute import
+        self.assertEqual(self._bad("wu = __import__('json', fromlist=['dumps'], level=0)\nwu.dumps(1)\n"), [])
+        self.assertEqual(self._bad("wu = __import__('json', None, None, ['dumps'], 0)\nwu.dumps(1)\n"), [])
+        self.assertEqual(self._bad("wu = __import__('asyncio.windows_utils', fromlist=['Popen'])\nwu.Popen(['x'], creationflags=_NO_WINDOW)\n"), [])
+        got = self._bad("wu = __import__('windows_utils', fromlist=['Popen'], level=1)\n")
+        self.assertTrue(any("relative level" in g for g in got), got)
+
+    def test_a5_a_field_index_that_int_would_reject_or_choke_on_is_unknown_not_a_crash(self):
+        digits = "9" * 5000
+        for expr in ("'{²}ubprocess_exec'.format(**{'²': 's'})", "'{²}ubprocess_exec'.format_map({'²': 's'})", "'{٣}ubprocess_exec'.format('s')",
+                     "'{" + digits + "}ubprocess_exec'.format('s')", "'{0[" + digits + "]}ubprocess_exec'.format('s')", "'{0[²]}ubprocess_exec'.format('s')",
+                     ):
+            self.assertGreaterEqual(len(self._bad(self._launch(expr))), 1, expr[:40])  # reported (the field is unknown), never ValueError
+            _flatten(ast.parse(expr, mode="eval").body, {})
+        for expr in ("'%²subprocess_exec' % 's'", "'%." + "٣" + "subprocess_exec' % 's'", "'%" + digits + "subprocess_exec' % 's'"):
+            self._bad(self._launch(expr))  # a `%` field Python itself rejects never yields a string: only that the scan does not crash
+            _flatten(ast.parse(expr, mode="eval").body, {})
 
     def test_over_reporting_stays_inside_the_names_and_keywords(self):
         for expr in ("'{}ubprocess_exec'.format('z')", "'subprocess_exec_' + 'x'", "f'{name}_value'", "'%s: %d' % (a, b)", "'{}'.format(x)", "''.join({'x'})",
