@@ -188,6 +188,7 @@ _REFLECTION = _REFLECTION_BARE | frozenset({
     "signature", "getfullargspec", "annotation", "return_annotation", "__defaults__", "__kwdefaults__", "__signature__",
     "__globals__", "__closure__", "cell_contents", "f_globals", "get_referrers", "get_objects",
 })
+_REFLECTION_STRINGS = frozenset(n for n in _REFLECTION if n.startswith("__"))  # getattr(f, '__defaults__') reaches what f.__defaults__ does
 _CLASS_SCOPE_IMPORT_ROOTS = frozenset({"subprocess", "os", "asyncio", "nt", "posix", "importlib", "builtins"})
 _MUTATORS = frozenset({"setattr", "delattr"})
 _MUTATING_ATTRS = frozenset({"__dict__", "__setattr__", "__delattr__"})
@@ -199,7 +200,7 @@ _ASYNCIO_SUBMODULES = frozenset({m.name for m in pkgutil.iter_modules(asyncio.__
 # but `.subprocess` off the asyncio package is asyncio's own wrapper module.
 _SUBMODULE_REEXPORTS = {"subprocess": "subprocess", "_subprocess": "subprocess", "os": "os", "_os": "os", "nt": "os", "posix": "os"}
 _PACKAGE_REEXPORTS = {"subprocess": "asyncio.subprocess", "os": "os", "nt": "os", "posix": "os"}
-_LOOP_METHOD_NAME_RE = re.compile(r"(?:\w+\.)*(?:" + "|".join(sorted(map(re.escape, _LOOP_SPAWN_METHODS))) + ")")
+_LOOP_METHOD_NAME_RE = re.compile(r"(?:[^.]+\.)*(?:" + "|".join(sorted(map(re.escape, _LOOP_SPAWN_METHODS))) + ")")
 
 
 def _label(expr: ast.AST) -> str:
@@ -260,12 +261,11 @@ def _flatten_launch(node: ast.AST, consts: dict[str, str]) -> tuple[str, bool]:
 
 
 def _receiver_ok(left: list) -> bool:
-    """Can these items (a literal character, or None for any text) read as a dotted receiver, a run of ``word.`` segments?"""
+    """Can these items (a literal character, or None for any text) read as a dotted receiver, a run of ``segment.`` segments?"""
     if not left:
         return True
-    literals = [it for it in left if it is not None]
-    if any(not (it.isalnum() or it in "_.") for it in literals) or left[0] == ".":
-        return False
+    if left[0] == ".":
+        return False  # an empty first segment; any other character (a hyphen, a space) is part of an attribute name Python looks up as written
     if any(left[i] == "." and left[i + 1] == "." for i in range(len(left) - 1)):
         return False  # an empty segment
     return left[-1] is None or left[-1] == "."  # the receiver ends in a dot, or in text that can
@@ -305,7 +305,7 @@ def _could_name_pattern(built: str, names: frozenset) -> bool:
 def _could_name(built: str, known: bool, names) -> bool:
     """Can this folded text (``_WILD`` = any text) read as one of ``names``, possibly behind a dotted receiver (``loop.subprocess_exec``)?"""
     if _WILD not in built:  # every uncertainty is a wildcard, so a text without one is exact whatever `known` says
-        return any(built == n or re.fullmatch(r"(?:\w+\.)+" + re.escape(n), built) for n in names)
+        return any(built == n or re.fullmatch(r"(?:[^.]+\.)+" + re.escape(n), built) for n in names)
     return _could_name_pattern(built, frozenset(names))
 
 
@@ -1158,6 +1158,7 @@ def _reference_violations(tree: ast.AST, facts: _Facts) -> list[tuple[int, str]]
         for child in ast.iter_child_nodes(node):
             parent[id(child)] = node
     out: list[tuple[int, str]] = []
+    reflection_aliases = {a.asname: a.name for n in ast.walk(tree) if isinstance(n, ast.ImportFrom) for a in n.names if a.asname and a.name in _REFLECTION}
     binds_spawn = bool(facts.modules or facts.funcs or facts.module_names)  # any imported module may re-export os / subprocess
     for node in ast.walk(tree):
         module: str | None = None
@@ -1184,8 +1185,12 @@ def _reference_violations(tree: ast.AST, facts: _Facts) -> list[tuple[int, str]]
             out.append((node.lineno, f"names {node.value!r} as a string, which reaches an event-loop spawn method without calling it in place"))
         if isinstance(node, (ast.BinOp, ast.JoinedStr, ast.Call, ast.Subscript)) and not (isinstance(node, ast.BinOp) and isinstance(parent.get(id(node)), ast.BinOp) and isinstance(parent[id(node)].op, (ast.Add, ast.Mod, ast.Mult))):  # only a parent that folds its operands covers it
             built, known = _flatten(node, facts.consts)  # 'subprocess_' + 'exec', '%sexec' % 'subprocess_', f'subprocess_{"exec"}': the folded name
+            if binds_spawn and _WILD not in built and built in _REFLECTION_STRINGS:
+                out.append((node.lineno, f"builds {built!r} as a string, which can reach a spawn API without a followable reference"))
             if _could_name(built, known, _LOOP_SPAWN_METHODS):  # a wildcard piece can read as the name, so a fold mistake only over-reports
                 out.append((node.lineno, f"names {built.replace(_WILD, '*')!r} as a built string, which can reach an event-loop spawn method without calling it in place"))
+        if binds_spawn and isinstance(node, ast.Constant) and isinstance(node.value, str) and node.value in _REFLECTION_STRINGS:
+            out.append((node.lineno, f"names {node.value!r} as a string, which can reach a spawn API without a followable reference"))
         if (isinstance(node, ast.Attribute) and node.attr.startswith("__") and node.attr.endswith("__") and node.attr not in _DUNDER_OK
                 and ((isinstance(node.value, ast.Name) and node.value.id in facts.module_names)
                      or (isinstance(node.value, ast.Call) and facts.import_target(node.value)[0]))):
@@ -1237,7 +1242,10 @@ def _reference_violations(tree: ast.AST, facts: _Facts) -> list[tuple[int, str]]
             name = node.id if isinstance(node, ast.Name) else node.attr if isinstance(node, ast.Attribute) else None
             # A bare name is reported only for the names that are never an ordinary variable (or when it was imported: `from inspect
             # import signature`); an attribute (`inspect.signature`, `f.__defaults__`, `p.annotation`) is reported whatever it hangs off.
-            named = isinstance(node, ast.Attribute) or name in _REFLECTION_BARE or name in facts.imports
+            local = name
+            if isinstance(node, ast.Name):
+                name = reflection_aliases.get(name, name)  # `from typing import get_type_hints as hints`: hints is get_type_hints
+            named = isinstance(node, ast.Attribute) or name in _REFLECTION_BARE or local in facts.imports
             if name in _REFLECTION and named and (not isinstance(node, ast.Name) or isinstance(node.ctx, ast.Load)):
                 out.append((node.lineno, f"uses {name}, which can reach a spawn API without a followable reference"))
     return sorted(set(out))
@@ -1441,7 +1449,8 @@ def _quoted_spans(text: str) -> list[tuple[int, int]]:
 
 def _ps_statements(script: str) -> list[str]:
     """Split a PowerShell script into statements: on ; | { } and newlines outside quotes, comments dropped, backtick-newline joined."""
-    script = re.sub(r"`\r?\n", " ", script)
+    script = re.sub(r"(?<=\S)`\r?\n", "\x02", script)  # mid-word: `foo`<LF>-WindowStyle:Hidden` is ONE argument, not a parameter
+    script = re.sub(r"`\r?\n", " ", script)  # after whitespace: a line continuation
     spans = dict(_quoted_spans(script))
     out, cur, i, n = [], [], 0, len(script)
     while i < n:
@@ -3588,6 +3597,45 @@ class AdversaryR8Tests(unittest.TestCase):
             self.assertFalse(known, spec)
             text, known = _flatten(ast.parse("f'{\"x\":" + spec + "}'", mode="eval").body, {})
             self.assertFalse(known, spec)
+
+    # ---- pass 19 (review-adversary-MLV-LANE-CONSOLE-HIDDEN-1-r8-fb098bff) A1-A4, as classes ----
+    def test_pass19_a1_a_string_that_spells_a_reflection_attribute_is_reported(self):
+        for label, src in {
+            "getattr defaults": "import subprocess\ndef launch(runner=subprocess.run): pass\ngetattr(launch, '__defaults__')[0](['cmd.exe', '/c', 'exit'])\n",
+            "getattr kwdefaults": "import subprocess\ndef launch(*, runner=subprocess.run): pass\ngetattr(launch, '__kwdefaults__')['runner'](['x'])\n",
+            "getattr globals": "import subprocess\ndef launch(): pass\ngetattr(launch, '__globals__')['subprocess'].run(['x'])\n",
+            "built name": "import subprocess\ndef launch(runner=subprocess.run): pass\ngetattr(launch, '__def' + 'aults__')[0](['x'])\n",
+            "format name": "import subprocess\ndef launch(runner=subprocess.run): pass\ngetattr(launch, '__{}__'.format('defaults'))[0](['x'])\n",
+        }.items():
+            self.assertGreaterEqual(len(self._bad(src)), 1, label)
+        self.assertEqual(self._bad("import subprocess\nname = 'defaults'\nx = getattr(obj, name)\nsubprocess.run(['x'], creationflags=0x08000000)\n"), [])
+
+    def test_pass19_a2_an_aliased_reflection_import_is_reported_by_what_it_imports(self):
+        for label, src in {
+            "typing": "from typing import get_type_hints as hints\nimport subprocess\ndef launch(runner: subprocess.run): pass\nhints(launch)['runner'](['x'])\n",
+            "inspect signature": "from inspect import signature as sig\nimport subprocess\ndef launch(r=subprocess.run): pass\nsig(launch).parameters['r'].default(['x'])\n",
+            "inspect getfullargspec": "from inspect import getfullargspec as spec\nimport subprocess\ndef launch(r=subprocess.run): pass\nspec(launch).defaults[0](['x'])\n",
+            "inspect get_annotations": "from inspect import get_annotations as ann\nimport subprocess\ndef launch(r: subprocess.run): pass\nann(launch)['r'](['x'])\n",
+        }.items():
+            self.assertGreaterEqual(len(self._bad(src)), 1, label)
+        self.assertEqual(self._bad("from os.path import join as hints\nimport subprocess\nhints('a', 'b')\nsubprocess.run(['x'], creationflags=0x08000000)\n"), [])
+
+    def test_pass19_a3_a_receiver_segment_is_any_text_without_a_dot(self):
+        for expr in ("'loop-instance.subprocess_exec'", "'loop instance.subprocess_exec'", "'loop-' + p + '.subprocess_exec'", "'my loop.' + p + '.subprocess_shell'",
+                     "'a-b.' + p + '-c.' + q + '.subprocess_exec'", "'loop:inst.' + p + '.subprocess_exec'", "f'loop-{p}.subprocess_exec'"):
+            src = ("import operator\nasync def launch(holder, p, q, factory):\n"
+                   f"    return await operator.attrgetter({expr})(holder)(factory, 'cmd.exe')\n")
+            self.assertGreaterEqual(len(self._bad(src)), 1, expr)
+        for expr in ("'loop-instance.' + part", "'loop-' + part + '.run'", "'a b.' + p + '.value'", "'loop-instance.' + part + ' failed'"):
+            self.assertEqual(self._bad(self._launch(expr)), [], expr)
+
+    def test_pass19_a4_a_backtick_newline_inside_a_word_is_part_of_the_word(self):
+        for ps in ("Start-Process cmd.exe -ArgumentList foo`\n-WindowStyle:Hidden", "Start-Process cmd.exe -ArgumentList foo`\r\n-WindowStyle Hidden",
+                   "saps cmd.exe -ArgumentList a`\n-WindowStyle:Hidden", "start cmd.exe -ArgumentList /c`\n-WindowStyle Hidden"):
+            self.assertEqual(self._ps(repr(ps)), (1, 1), ps)
+        # a continuation after whitespace, or a word that ends before the next line, still lets the parameter count
+        for ps in ("Start-Process cmd.exe -ArgumentList foo `\n-WindowStyle:Hidden", "Start-Process cmd.exe `\n  -WindowStyle Hidden", "Start-Process cmd.exe -ArgumentList foo`\n -WindowStyle Hidden"):
+            self.assertEqual(self._ps(repr(ps)), (1, 0), ps)
 
     def test_f2_a_receiver_only_text_stays_clean(self):
         for expr in ("'allowed_roots.' + k", "'loop.' + part", "'loop.' + part + '.run'", "part + '.' + other", "'self.loop.' + part", "f'{a}.{b}'",
