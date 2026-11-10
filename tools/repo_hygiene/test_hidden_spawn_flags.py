@@ -16,6 +16,7 @@ Three pins:
 from __future__ import annotations
 
 import ast
+import posixpath
 import re
 import subprocess
 import unittest
@@ -28,18 +29,22 @@ ROOT = Path(__file__).resolve().parents[2]
 SPAWN_ATTRS = {"run", "Popen", "check_output", "check_call", "call"}
 
 # Key3 HIGH-RISK classes (and the frozen in-tree agent-bridge) stay out of this card's diff; each is an OPEN line.
-EXCLUDED_PREFIXES = (
+# Directories end in "/" and match by prefix; files are compared whole against the normalized path, so a path that
+# merely STARTS with an excluded file name (doctrine_outbox.py.bak, brokered_closeout_helper.py) is still scanned.
+EXCLUDED_DIRS = (
     "tools/agent-bridge/",
     "tools/hooks/",
     "tools/gates/",
     "tools/profiling/bachelor/",
     "tools/profiling/dual-venue/",
     "tools/gpu/backend/",
-    "tools/repo_hygiene/brokered_closeout",
+)
+EXCLUDED_FILES = frozenset({
+    "tools/repo_hygiene/brokered_closeout.py",
     # The bus candidate: tests/coordination/test_doctrine_outbox_hooks.py pins its LF digest in doctrine-outbox.config.json,
     # and the fleet steward lands the file on the bus. Its unflagged spawns are an OPEN line for that steward, not edited here.
     "tools/coordination/doctrine_outbox.py",
-)
+})
 EXCLUDED_NAME_RE = re.compile(r"^tools/coordination/merge[^/]*$")
 
 # Test modules whose spawns must be hidden (the evidence chain and the fixtures named by the card).
@@ -49,13 +54,23 @@ NAMED_TEST_MODULES = (
 )
 
 
-def _tracked_py_files() -> list[str]:
-    out = subprocess.run(
-        ["git", "-C", str(ROOT), "ls-files", "--", "tools/*.py"],
-        capture_output=True, text=True, check=True, timeout=60,
+def _normalize(rel: str) -> str:
+    return posixpath.normpath(rel.replace("\\", "/"))
+
+
+def _is_excluded(rel: str) -> bool:
+    norm = _normalize(rel)
+    return norm in EXCLUDED_FILES or norm.startswith(EXCLUDED_DIRS) or bool(EXCLUDED_NAME_RE.match(norm))
+
+
+def _tracked_py_files(root: Path = ROOT) -> list[str]:
+    # -z: with core.quotepath on, a non-ASCII path comes back quoted and escaped, and open() then names nothing on disk.
+    proc = subprocess.run(
+        ["git", "-C", str(root), "ls-files", "-z", "--", "tools/*.py"],
+        capture_output=True, check=True, timeout=60,
         creationflags=hidden_spawn.no_window_flags(),
-    ).stdout.splitlines()
-    return sorted(out)
+    )
+    return sorted(part.decode("utf-8", "surrogateescape") for part in proc.stdout.split(b"\0") if part)
 
 
 def _tool_modules() -> list[str]:
@@ -64,26 +79,77 @@ def _tool_modules() -> list[str]:
         name = rel.rsplit("/", 1)[-1]
         if name.startswith("test_") or name == "conftest.py":
             continue
-        if rel.startswith(EXCLUDED_PREFIXES) or EXCLUDED_NAME_RE.match(rel):
+        if _is_excluded(rel):
             continue
         files.append(rel)
     return files
 
 
-def _unflagged_spawns(rel: str) -> list[str]:
-    tree = ast.parse((ROOT / rel).read_text(encoding="utf-8"), filename=rel)
+def _spawn_names(tree: ast.AST) -> tuple[set[str], dict[str, str]]:
+    """Names bound to the subprocess module and to its spawn functions (imports, aliases, assignments, defaults)."""
+    modules: set[str] = set()
+    funcs: dict[str, str] = {}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            modules.update(a.asname or a.name for a in node.names if a.name == "subprocess")
+        elif isinstance(node, ast.ImportFrom) and node.module == "subprocess":
+            funcs.update({a.asname or a.name: a.name for a in node.names if a.name in SPAWN_ATTRS})
+
+    def spawn_attr(expr: ast.AST | None) -> str | None:
+        if isinstance(expr, ast.Attribute) and expr.attr in SPAWN_ATTRS \
+                and isinstance(expr.value, ast.Name) and expr.value.id in modules:
+            return expr.attr
+        if isinstance(expr, ast.Name):
+            return funcs.get(expr.id)
+        return None
+
+    changed = True
+    while changed:  # an alias of an alias (r = subprocess.run; q = r) settles in a few passes
+        changed = False
+        for node in ast.walk(tree):
+            bound: list[tuple[str, ast.AST | None]] = []
+            if isinstance(node, ast.Assign):
+                bound = [(t.id, node.value) for t in node.targets if isinstance(t, ast.Name)]
+            elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
+                bound = [(node.target.id, node.value)]
+            elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+                a = node.args
+                positional = a.posonlyargs + a.args
+                bound = [(arg.arg, d) for arg, d in zip(positional[len(positional) - len(a.defaults):], a.defaults)]
+                bound += [(arg.arg, d) for arg, d in zip(a.kwonlyargs, a.kw_defaults) if d is not None]
+            for name, value in bound:
+                attr = spawn_attr(value)
+                if attr and funcs.get(name) != attr:
+                    funcs[name] = attr
+                    changed = True
+    return modules, funcs
+
+
+def _unflagged_spawns_in_source(source: str, label: str) -> list[str]:
+    tree = ast.parse(source, filename=label)
+    modules, funcs = _spawn_names(tree)
     bad = []
     for node in ast.walk(tree):
         if not isinstance(node, ast.Call):
             continue
         fn = node.func
-        if not (isinstance(fn, ast.Attribute) and fn.attr in SPAWN_ATTRS
-                and isinstance(fn.value, ast.Name) and fn.value.id == "subprocess"):
+        if isinstance(fn, ast.Attribute) and fn.attr in SPAWN_ATTRS \
+                and isinstance(fn.value, ast.Name) and fn.value.id in modules:
+            shown = f"subprocess.{fn.attr}"
+        elif isinstance(fn, ast.Name) and fn.id in funcs:
+            shown = f"{fn.id} (= subprocess.{funcs[fn.id]})"
+        else:
             continue
-        if any(kw.arg == "creationflags" for kw in node.keywords):
+        flags = [kw for kw in node.keywords if kw.arg == "creationflags"]
+        if flags and not (isinstance(flags[0].value, ast.Constant) and flags[0].value.value == 0):
             continue
-        bad.append(f"{rel}:{node.lineno} subprocess.{fn.attr}(...) has no creationflags=")
+        why = "creationflags=0 sets no flag" if flags else "has no creationflags="
+        bad.append(f"{label}:{node.lineno} {shown}(...) {why}")
     return bad
+
+
+def _unflagged_spawns(rel: str) -> list[str]:
+    return _unflagged_spawns_in_source((ROOT / rel).read_text(encoding="utf-8"), rel)
 
 
 class NoWindowFlagsTests(unittest.TestCase):
@@ -135,6 +201,96 @@ class NamedTestFixtureTests(unittest.TestCase):
             if "-WindowStyle Hidden" not in src[pos:end]:
                 bad.append(f"test_playback_host_load_gate.py:{src.count(chr(10), 0, pos) + 1}")
         self.assertEqual(bad, [], "Start-Process powershell.exe without -WindowStyle Hidden: " + ", ".join(bad))
+
+
+class ScannerHardeningTests(unittest.TestCase):
+    """MLV-LANE-CONSOLE-HIDDEN-1 r2 rows A2 and A3: the scanner itself must not be foolable."""
+
+    def _bad(self, source: str) -> list[str]:
+        return _unflagged_spawns_in_source(source, "synthetic.py")
+
+    def test_literal_zero_creationflags_is_flagged(self):
+        self.assertEqual(len(self._bad("import subprocess\nsubprocess.run(['x'], creationflags=0)\n")), 1)
+
+    def test_a_real_flag_value_passes(self):
+        self.assertEqual(self._bad("import subprocess\nsubprocess.run(['x'], creationflags=_NO_WINDOW)\n"), [])
+        self.assertEqual(self._bad("import subprocess\nsubprocess.run(['x'], creationflags=0x08000000)\n"), [])
+
+    def test_import_subprocess_as_alias_is_resolved(self):
+        self.assertEqual(len(self._bad("import subprocess as sp\nsp.run(['x'])\n")), 1)
+        self.assertEqual(self._bad("import subprocess as sp\nsp.run(['x'], creationflags=F)\n"), [])
+
+    def test_from_import_spawn_names_are_resolved(self):
+        self.assertEqual(len(self._bad("from subprocess import run\nrun(['x'])\n")), 1)
+        self.assertEqual(len(self._bad("from subprocess import Popen as P\nP(['x'])\n")), 1)
+        self.assertEqual(self._bad("from subprocess import run\nrun(['x'], creationflags=F)\n"), [])
+
+    def test_runner_default_argument_alias_is_resolved(self):
+        src = "import subprocess\ndef f(*, runner=subprocess.run):\n    return runner(['x'], capture_output=True)\n"
+        self.assertEqual(len(self._bad(src)), 1)
+        ok = "import subprocess\ndef f(*, runner=subprocess.run):\n    return runner(['x'], creationflags=F)\n"
+        self.assertEqual(self._bad(ok), [])
+
+    def test_assignment_alias_is_resolved(self):
+        self.assertEqual(len(self._bad("import subprocess\nr = subprocess.check_output\nr(['x'])\n")), 1)
+
+    def test_unrelated_names_are_not_flagged(self):
+        self.assertEqual(self._bad("def run(a):\n    return a\nrun(1)\nfoo.run(2)\n"), [])
+
+    def test_exclusion_compares_the_whole_normalized_path(self):
+        self.assertTrue(_is_excluded("tools/coordination/doctrine_outbox.py"))
+        self.assertTrue(_is_excluded("tools\\coordination\\doctrine_outbox.py"))
+        self.assertTrue(_is_excluded("./tools/repo_hygiene/brokered_closeout.py"))
+        self.assertTrue(_is_excluded("tools/gates/output_budget.py"))
+        self.assertFalse(_is_excluded("tools/coordination/doctrine_outbox.py.bak"))
+        self.assertFalse(_is_excluded("tools/coordination/doctrine_outbox_extra.py"))
+        self.assertFalse(_is_excluded("tools/repo_hygiene/brokered_closeout_helper.py"))
+        self.assertFalse(_is_excluded("tools/gates_extra/x.py"))
+
+    def test_ls_files_survives_a_non_ascii_path(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            flags = hidden_spawn.no_window_flags()
+            subprocess.run(["git", "-C", str(repo), "init", "-q"], check=True, timeout=60, creationflags=flags)
+            (repo / "tools").mkdir()
+            names = ["caf\u00e9.py", "plain.py"]
+            for name in names:
+                (repo / "tools" / name).write_text("x = 1\n", encoding="utf-8")
+            subprocess.run(["git", "-C", str(repo), "add", "-A"], check=True, timeout=60, creationflags=flags)
+            self.assertEqual(_tracked_py_files(repo), sorted("tools/" + n for n in names))
+
+
+class SpawnSiteBehaviourTests(unittest.TestCase):
+    """Rows A1 and A4: the two behaviours behind the scanner findings."""
+
+    def test_worktree_live_refusal_passes_the_hidden_flag_to_its_runner(self):
+        from tools.repo_hygiene import core
+        calls = []
+
+        def runner(args, **kw):
+            calls.append(kw)
+            return subprocess.CompletedProcess(args, 0, stdout="FREE\n", stderr="")
+
+        with mock.patch.object(core.shutil, "which", return_value="pwsh"):
+            self.assertIsNone(core.worktree_live_refusal(Path("C:/r"), Path("C:/mlvtmp/lane-X-1"), runner=runner))
+        flags = calls[0].get("creationflags")  # never assert on the whole kwargs dict: it carries the process env
+        self.assertIsNotNone(flags, "worktree_live_refusal spawned its runner without creationflags=")
+        self.assertEqual(flags & core._NO_WINDOW, core._NO_WINDOW)
+
+    def test_runtime_floor_spawn_ors_the_hidden_bit_into_a_caller_flag(self):
+        from tools.repo_hygiene import runtime_floor_suites as rfs
+        seen = {}
+
+        def fake_popen(argv, **kw):
+            seen.update(kw)
+            return object()
+
+        with mock.patch.object(rfs, "_NO_WINDOW", 0x08000000), mock.patch.object(rfs.subprocess, "Popen", fake_popen):
+            rfs._spawn(["x"], creationflags=0x00004000)
+            self.assertEqual(seen["creationflags"], 0x08004000)
+            rfs._spawn(["x"])
+            self.assertEqual(seen["creationflags"], 0x08000000)
 
 
 if __name__ == "__main__":

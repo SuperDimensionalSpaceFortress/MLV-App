@@ -1581,7 +1581,7 @@ def worktree_live_refusal(repo_root: Path, path: Path, *, runner: Any = subproce
               "if ($null -eq $r) { 'FREE' } else { $r | ConvertTo-Json -Compress -Depth 4 }")
     try:
         proc = runner([pwsh, "-NoProfile", "-NonInteractive", "-Command", script],
-                      capture_output=True, text=True, timeout=300, env=env)
+                      capture_output=True, text=True, timeout=300, env=env, creationflags=_NO_WINDOW)
     except (OSError, subprocess.TimeoutExpired) as exc:
         return failed(f"guard did not answer: {exc}")
     if proc.returncode != 0:
