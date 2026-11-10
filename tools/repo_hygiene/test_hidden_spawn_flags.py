@@ -35,7 +35,12 @@ A module bound by ``import x [as y]`` (and a plain alias or literal dynamic impo
 conditional, subscript, return, lambda, class attribute or call argument it is REPORTED, because any module may re-export ``os``; for the
 same reason a dunder attribute read off it (``shutil.__dict__``) and every reflection helper (``globals()``, ``signature``, ``__annotations__``)
 is REPORTED in a file that imports any module. A built string is folded with ``replace`` (and its count), ``strip``/``lower``/``upper``, a
-slice, ``chr(n)``, ``bytes.decode`` and a ``format`` / ``%`` spec (``{:.4s}``), applied the way Python applies them. The standard ``_NO_WINDOW`` definition is trusted only
+slice, ``chr(n)``, ``bytes.decode`` and a ``format`` / ``%`` spec (``{:.4s}``), applied the way Python applies them where the fold is exact.
+Any piece the fold cannot read EXACTLY (a number printed through a spec such as ``{115:c}`` or ``%c``, a ``*`` / ``**`` expansion, a mapping
+the scan cannot read key by key, a set whose iteration order is unknown, a spec wider than the fold applies, a run-time name) is a WILDCARD
+that stands for any text, and the built text is matched as a pattern against the spawn-method names and the launch keywords: a fold mistake
+can only over-report, never hide a spawn (r7). A pattern of wildcards with fewer than three literal characters around them says nothing and
+is not reported. The standard ``_NO_WINDOW`` definition is trusted only
 when ``os``, ``subprocess`` and ``getattr`` each come from exactly one ordinary ``import``.
 
 Remaining limits, every one named (r5 rewrite: the scan is syntactic and static, so these are what it does NOT see):
@@ -44,7 +49,9 @@ Remaining limits, every one named (r5 rewrite: the scan is syntactic and static,
     (``sys._getframe().f_locals``, ``inspect.currentframe``) or out of an object by an attribute the scan does not name.
   * A process started without ``subprocess`` / ``asyncio`` / ``os``: ``ctypes`` / ``win32process`` CreateProcess,
     ``multiprocessing``, ``_winapi``, ``concurrent.futures`` process pools, ``pty``, ``os.startfile``.
-  * A method name assembled at run time (``getattr(loop, 'subprocess_' + kind)``) or held outside a string (``match`` patterns);
+  * A method name assembled at run time from a value the file does not state (``getattr(loop, 'subprocess_' + kind)``: the wildcard
+    pattern ``subprocess_*`` IS reported, and so is a ``.replace`` / slice / ``strip`` with run-time arguments over a text that holds a
+    spawn-method name; but a name whose literal part is under three characters is not reported) or held outside a string (``match`` patterns);
     a spawn name reached by ``getattr`` on an object that is not a tracked module.
   * A module that is not bound by ``import x`` (a from-import such as ``from concurrent import futures``, or ``os.path`` taken as a value)
     flowing into a container or return: a from-import may bind a class or function, and an attribute may be either, so it is not followed.
@@ -70,6 +77,7 @@ import ast
 import asyncio
 import pkgutil
 import posixpath
+import itertools
 import re
 import subprocess
 import unittest
@@ -200,28 +208,81 @@ def _label(expr: ast.AST) -> str:
         return "<expression>"
 
 
-_FORMAT_FIELD_RE = re.compile(r"\{\{|\}\}|\{([^{}!:]*)(?:!([rsa]))?(?::([^{}]*))?\}")
+_FORMAT_BODY_RE = re.compile(r"([^!:]*)(?:!([rsa]))?(?::(.*))?", re.DOTALL)
 _PERCENT_FIELD_RE = re.compile(r"%(?:\(([^)]*)\))?([#0\- +]*)(\d+|\*)?(?:\.(\d+|\*))?[hlL]?([sraidiouxXeEfFgGc%])")
 _SPEC_NUMBER_LIMIT = 256  # a width or precision above this is never handed to Python's formatter (no huge allocation)
 _STRING_MAPPERS = frozenset({"lower", "upper", "casefold", "strip", "lstrip", "rstrip", "title", "capitalize", "swapcase"})
+_CASE_MAPPERS = frozenset({"lower", "upper", "casefold", "swapcase"})  # act character by character, so a wildcard in the text survives them
 _FLATTEN_DEPTH = 48
+# A piece the fold cannot read (a name bound to a run-time value, a number, a spec it does not apply, a set it cannot order) is this
+# character, not nothing: it stands for ANY text, so a fold mistake can only make the scan report more, never less.
+_WILD = "\x00"
+
+
+def _spec_too_big(numbers) -> bool:
+    """A width / precision that is longer than four digits or above the limit; the length test comes first so ``int()`` never meets a 5000-digit string."""
+    return any(len(number) > 4 or int(number) > _SPEC_NUMBER_LIMIT for number in numbers if number)
+
+
+def _hedge(text: str) -> str:
+    """The text an operation the fold cannot apply (a ``replace`` with run-time arguments, a slice with a run-time bound) may leave of ``text``:
+    anything, and, when ``text`` holds an event-loop spawn-method name, that name followed by anything (the operation may leave it whole)."""
+    return next((name + _WILD for name in sorted(_LOOP_SPAWN_METHODS) if name in text), _WILD)
+
+
+def _could_name(built: str, known: bool, names) -> bool:
+    """Can this folded text (``_WILD`` = any text) read as one of ``names``, possibly behind a dotted receiver (``loop.subprocess_exec``)?"""
+    if _WILD not in built:
+        return known and any(built == n or re.fullmatch(r"(?:\w+\.)+" + re.escape(n), built) for n in names)
+    pieces = [p for p in re.split(re.escape(_WILD) + "+", built)]
+    if not any(len(re.findall(r"\w", p)) >= 3 for p in pieces):
+        return False  # wildcards with (almost) no literal text around them say nothing about the text
+    pattern = ".*".join(re.escape(p) for p in pieces)
+    return any(re.fullmatch(pattern, n) or re.fullmatch(pattern, "a." + n) for n in names)
+
+
+def _fold_args(args: list[ast.AST], keywords: list[ast.keyword], consts: dict[str, str], depth: int):
+    """(positional folds, keyword folds, positional unknown past the folds, keywords unknown) for a ``.format`` call."""
+    positional, any_pos = [], False
+    for a in args:
+        if isinstance(a, ast.Starred):
+            any_pos = True  # `*rest` may be any number of arguments: every position from here on is unknown
+            break
+        positional.append(_flatten(a, consts, depth + 1))
+    named, any_named = {}, False
+    for kw in keywords:
+        if kw.arg is None:
+            any_named = True  # `**rest` may rebind any name
+        else:
+            named[kw.arg] = _flatten(kw.value, consts, depth + 1)
+    return positional, named, any_pos, any_named
+
+
+def _fold_mapping(node: ast.AST | None, consts: dict[str, str], depth: int) -> tuple[dict, bool]:
+    """(folds by key, whether any key can be rebound) for a mapping argument; anything but a plain ``{'k': v}`` literal is unknown."""
+    if not isinstance(node, ast.Dict):
+        return {}, True
+    if any(k is None or not (isinstance(k, ast.Constant) and isinstance(k.value, str)) for k in node.keys):
+        return {}, True  # `**other`, a computed key: the dict may rebind any name
+    return {k.value: _flatten(v, consts, depth + 1) for k, v in zip(node.keys, node.values)}, False
 
 
 def _flatten(node: ast.AST, consts: dict[str, str], depth: int = 0) -> tuple[str, bool]:
     """(text, known): what a string expression reads as when every piece is a string literal or a name bound once to one.
 
     Folds adjacent literals, ``+``, ``%`` and ``.format`` / ``.format_map`` templates, ``.join`` and ``.replace`` over literals, and an
-    f-string whose holes fold. A piece that does not fold contributes NOTHING to the text and makes ``known`` False, so ``'Sta' + name +
-    'rt-Process'`` reads as ``Start-Process`` (the split is visible) while ``known`` says the text is partial. The scan fills the template
+    f-string whose holes fold. A piece that does not fold (a name bound to a run-time value, a number, a spec the fold does not apply, a
+    set whose order is unknown) is the wildcard ``_WILD``: ``known`` is then False and the text reads as a pattern in which the wildcard
+    stands for any text, so ``'Sta' + name + 'rt-Process'`` reads as ``Sta<any>rt-Process`` and a fold mistake can only over-report. The scan fills the template
     itself; it never calls ``eval``/``exec`` and never hands scanned text to ``str.format`` (a ``{:>999999999}`` spec must not allocate).
     """
     if depth > _FLATTEN_DEPTH:
-        return "", False
+        return _WILD, False
     if isinstance(node, ast.Constant):
-        return (node.value, True) if isinstance(node.value, str) else ("", False)
+        return (node.value, True) if isinstance(node.value, str) else (_WILD, False)  # a number can print as any character (`{115:c}`)
     if isinstance(node, ast.Name):
         value = consts.get(node.id) if isinstance(node.ctx, ast.Load) else None
-        return (value, True) if value is not None else ("", False)
+        return (value, True) if value is not None else (_WILD, False)
     if isinstance(node, ast.JoinedStr):
         parts = []
         for v in node.values:
@@ -229,11 +290,14 @@ def _flatten(node: ast.AST, consts: dict[str, str], depth: int = 0) -> tuple[str
                 parts.append((v.value, True))
             elif isinstance(v, ast.FormattedValue):
                 text, known = _flatten(v.value, consts, depth + 1)
+                if v.conversion == -1 and v.format_spec is None:
+                    parts.append((text, known))  # `{x}` of a text is that text; a wildcard inside it stays
+                    continue
                 spec, spec_known = _flatten(v.format_spec, consts, depth + 1) if v.format_spec is not None else (None, True)
                 shown = _apply_spec(text, {115: "s", 114: "r", 97: "a"}.get(v.conversion), spec) if known and spec_known else None
-                parts.append((shown, True) if shown is not None else (text, False))  # an unknown piece contributes its partial text, not a spec'd one
+                parts.append((shown, True) if shown is not None else (_WILD, False))
             else:
-                parts.append(("", False))
+                parts.append((_WILD, False))
         return "".join(t for t, _ in parts), all(k for _, k in parts)
     if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
         leaves, todo = [], [node]  # iterative: a long chain must not exhaust the stack
@@ -250,26 +314,37 @@ def _flatten(node: ast.AST, consts: dict[str, str], depth: int = 0) -> tuple[str
         template, known = _flatten(node.left, consts, depth + 1)
         right = node.right
         if isinstance(right, ast.Dict):
-            named = {k.value: _flatten(v, consts, depth + 1) for k, v in zip(right.keys, right.values)
-                     if isinstance(k, ast.Constant) and isinstance(k.value, str)}
-            return _fill_percent(template, [], named, known)
-        args = right.elts if isinstance(right, ast.Tuple) else [right]
-        return _fill_percent(template, [_flatten(a, consts, depth + 1) for a in args], {}, known and not any(isinstance(a, ast.Starred) for a in args))
+            named, any_named = _fold_mapping(right, consts, depth)
+            return _fill_percent(template, [], named, known, any_pos=False, any_named=any_named)
+        if isinstance(right, ast.Tuple):
+            positional, _, any_pos, _ = _fold_args(right.elts, [], consts, depth)
+            return _fill_percent(template, positional, {}, known, any_pos=any_pos, any_named=False)
+        if isinstance(right, (ast.Constant, ast.JoinedStr, ast.BinOp)):
+            return _fill_percent(template, [_flatten(right, consts, depth + 1)], {}, known, any_pos=False, any_named=False)
+        # a name, call or subscript on the right may be a tuple or a mapping at run time: every field is unknown
+        return _fill_percent(template, [], {}, known, any_pos=True, any_named=True)
     if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
         method, recv = node.func.attr, node.func.value
         if method in ("format", "format_map"):
             template, known = _flatten(recv, consts, depth + 1)
             if method == "format_map":
-                arg = node.args[0] if node.args else None
-                named = ({k.value: _flatten(v, consts, depth + 1) for k, v in zip(arg.keys, arg.values)
-                          if isinstance(k, ast.Constant) and isinstance(k.value, str)} if isinstance(arg, ast.Dict) else {})
-                return _fill_format(template, [], named, known and isinstance(arg, ast.Dict))
-            ok = known and not any(isinstance(a, ast.Starred) for a in node.args) and all(kw.arg is not None for kw in node.keywords)
-            named = {kw.arg: _flatten(kw.value, consts, depth + 1) for kw in node.keywords if kw.arg is not None}
-            return _fill_format(template, [_flatten(a, consts, depth + 1) for a in node.args], named, ok)
-        if method == "join" and len(node.args) == 1 and isinstance(node.args[0], (ast.List, ast.Tuple, ast.Set)):
+                named, any_named = _fold_mapping(node.args[0] if node.args else None, consts, depth)
+                return _fill_format(template, [], named, known, any_pos=False, any_named=any_named)
+            positional, named, any_pos, any_named = _fold_args(node.args, node.keywords, consts, depth)
+            return _fill_format(template, positional, named, known, any_pos=any_pos, any_named=any_named)
+        if method == "join" and len(node.args) == 1 and not node.keywords and isinstance(node.args[0], (ast.List, ast.Tuple, ast.Set)):
             sep, sep_known = _flatten(recv, consts, depth + 1)
-            parts = [_flatten(e, consts, depth + 1) for e in node.args[0].elts]
+            elts = node.args[0].elts
+            if any(isinstance(e, ast.Starred) for e in elts):
+                return _WILD, False  # `[*rest]` may hold any number of pieces
+            parts = [_flatten(e, consts, depth + 1) for e in elts]
+            if isinstance(node.args[0], ast.Set):
+                # a set holds each distinct element once, in an order that depends on the hash seed: one distinct known text is exact,
+                # anything else could read in any order (or be a different set altogether)
+                distinct = {t for t, k in parts if k}
+                if len(distinct) == 1 and all(k for _, k in parts):
+                    return distinct.pop(), sep_known
+                return _WILD, False
             return sep.join(t for t, _ in parts), sep_known and all(k for _, k in parts)
         if method == "replace" and 2 <= len(node.args) + len(node.keywords) <= 3 and len(node.args) >= 2 and all(kw.arg == "count" for kw in node.keywords):
             text, known = _flatten(recv, consts, depth + 1)
@@ -281,19 +356,21 @@ def _flatten(node: ast.AST, consts: dict[str, str], depth: int = 0) -> tuple[str
                 count = _int_literal(c)
                 count = count if isinstance(count, int) else None
             if count is None or not (known and old_known and new_known):
-                return text, False
+                return _hedge(text), False
             return text.replace(old, new, count), True
         if method in _STRING_MAPPERS and not node.keywords and len(node.args) <= 1:
             text, known = _flatten(recv, consts, depth + 1)
+            if method in _CASE_MAPPERS and not node.args:
+                return getattr(text, method)(), known  # per character: a wildcard stays one
             chars, chars_known = _flatten(node.args[0], consts, depth + 1) if node.args else (None, True)
             if not (known and chars_known):
-                return text, False
+                return _hedge(text), False
             if chars is not None:
-                return (getattr(text, method)(chars), True) if method in ("strip", "lstrip", "rstrip") else (text, False)
+                return (getattr(text, method)(chars), True) if method in ("strip", "lstrip", "rstrip") else (_hedge(text), False)
             return getattr(text, method)(), True
     if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "chr" and len(node.args) == 1 and not node.keywords:
         code = _int_literal(node.args[0])  # chr(115) + 'ubprocess_exec'
-        return (chr(code), True) if isinstance(code, int) and 0 <= code < 0x110000 else ("", False)
+        return (chr(code), True) if isinstance(code, int) and 0 <= code < 0x110000 else (_WILD, False)
     if (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr == "decode" and not node.args and not node.keywords
             and isinstance(node.func.value, ast.Constant) and isinstance(node.func.value.value, bytes)):
         return node.func.value.value.decode("utf-8", "replace"), True  # b'subprocess_exec'.decode()
@@ -302,8 +379,8 @@ def _flatten(node: ast.AST, consts: dict[str, str], depth: int = 0) -> tuple[str
         bounds = [_int_literal(p) for p in (node.slice.lower, node.slice.upper, node.slice.step)]
         if known and "?" not in bounds and bounds[2] != 0:
             return text[slice(*bounds)], True
-        return text, False
-    return "", False
+        return _hedge(text), False  # a bound the fold cannot read: some substring of the text, which may be a spawn-method name
+    return _WILD, False
 
 
 def _int_literal(node: ast.AST | None) -> int | None | str:
@@ -324,7 +401,7 @@ def _apply_spec(text: str, conv: str | None, spec: str | None) -> str | None:
         text = ascii(text)
     if not spec:
         return text
-    if any(int(number) > _SPEC_NUMBER_LIMIT for number in re.findall(r"\d+", spec)):
+    if _spec_too_big(re.findall(r"\d+", spec)):
         return None
     try:
         return format(text, spec)
@@ -332,70 +409,181 @@ def _apply_spec(text: str, conv: str | None, spec: str | None) -> str | None:
         return None
 
 
-def _fill_format(template: str, positional: list[tuple[str, bool]], named: dict[str, tuple[str, bool]], known: bool) -> tuple[str, bool]:
-    # a brace left over once every field is removed is a nested field (`{:{}}`): the text is not known
-    state = {"next": 0, "known": known and not re.search(r"[{}]", _FORMAT_FIELD_RE.sub("", template))}
-
-    def field(match: re.Match) -> str:
-        if match.group(0) in ("{{", "}}"):
-            return match.group(0)[0]
-        field_name = match.group(1) or ""
-        name = re.match(r"\w*", field_name).group(0)
-        accessors = field_name[len(name):]  # `0[0]`, `a.real`: indexing is applied to a known text, anything else makes the text unknown
-        if name == "":
-            index, state["next"] = state["next"], state["next"] + 1
-            value = positional[index] if index < len(positional) else None
-        elif name.isdigit():
-            value = positional[int(name)] if int(name) < len(positional) else None
+def _fill_format(template: str, positional: list[tuple[str, bool]], named: dict[str, tuple[str, bool]], known: bool,
+                 any_pos: bool = False, any_named: bool = False) -> tuple[str, bool]:
+    """Fill a ``str.format`` template field by field. A field the fold cannot read (a missing or unknown argument, a nested field, an
+    accessor it does not apply) is the wildcard, never a wrong known text; with ``**`` in play no keyword is trusted."""
+    out: list[str] = []
+    ok = known
+    auto, i, n = 0, 0, len(template)
+    while i < n:
+        ch = template[i]
+        if ch == "{" and template.startswith("{{", i):
+            out.append("{")
+            i += 2
+        elif ch == "}" and template.startswith("}}", i):
+            out.append("}")
+            i += 2
+        elif ch == "}":
+            out.append(_WILD)  # a lone `}` is a ValueError at run time
+            ok = False
+            i += 1
+        elif ch == "{":
+            depth, j = 1, i + 1
+            while j < n and depth:
+                depth += (template[j] == "{") - (template[j] == "}")
+                j += 1
+            if depth:  # never closed
+                out.append(_WILD)
+                ok = False
+                break
+            body, i = template[i + 1:j - 1], j
+            match = None if "{" in body else _FORMAT_BODY_RE.fullmatch(body)  # a nested field in the spec is not applied
+            if match is None:
+                out.append(_WILD)
+                ok = False
+                continue
+            field_name, conv, spec = match.group(1), match.group(2), match.group(3)
+            name = re.match(r"\w*", field_name).group(0)
+            accessors = field_name[len(name):]
+            if name == "":
+                index, auto = auto, auto + 1
+                value = positional[index] if index < len(positional) else None
+            elif name.isdigit():
+                value = positional[int(name)] if int(name) < len(positional) else None
+            else:
+                value = None if any_named else named.get(name)
+            if value is not None and accessors:
+                index = re.fullmatch(r"\[(\d+)\]", accessors)  # str.format reads `[-1]` as the string key '-1', which a str rejects
+                try:
+                    value = (value[0][int(index.group(1))], True) if index and value[1] else None
+                except IndexError:
+                    value = None
+            if value is None:
+                out.append(_WILD)
+                ok = False
+            elif value[1]:
+                shown = _apply_spec(value[0], conv, spec)
+                out.append(shown if shown is not None else _WILD)
+                ok = ok and shown is not None
+            elif conv is None and not spec:
+                out.append(value[0])  # an unknown text printed as it is: its wildcard stays in place
+                ok = False
+            else:
+                out.append(_WILD)
+                ok = False
         else:
-            value = named.get(name)
-        if value is not None and accessors:
-            index = re.fullmatch(r"\[(\d+)\]", accessors)  # str.format reads `[-1]` as the string key '-1', which a str rejects
-            try:
-                value = (value[0][int(index.group(1))], value[1]) if index and value[1] else None
-            except IndexError:
-                value = None
-        if value is None:
-            state["known"] = False
-            return ""
-        shown = _apply_spec(value[0], match.group(2), match.group(3)) if value[1] else value[0]
-        if shown is None:
-            state["known"] = False
-            return ""
-        state["known"] = state["known"] and value[1]
-        return shown
-
-    return _FORMAT_FIELD_RE.sub(field, template), state["known"]
+            out.append(ch)
+            i += 1
+    return "".join(out), ok
 
 
-def _fill_percent(template: str, positional: list[tuple[str, bool]], named: dict[str, tuple[str, bool]], known: bool) -> tuple[str, bool]:
-    state = {"next": 0, "known": known}
-
-    def field(match: re.Match) -> str:
+def _fill_percent(template: str, positional: list[tuple[str, bool]], named: dict[str, tuple[str, bool]], known: bool,
+                  any_pos: bool = False, any_named: bool = False) -> tuple[str, bool]:
+    """Fill a ``%`` template. A field the fold cannot read (a number, a ``*`` width, a missing or unknown argument, a conversion other than
+    ``%s`` of a known text) is the wildcard, never a wrong known text; with ``**`` or a run-time right operand no argument is trusted."""
+    out: list[str] = []
+    ok = known
+    nxt, lost, pos = 0, False, 0
+    while True:
+        at = template.find("%", pos)
+        if at < 0:
+            out.append(template[pos:])
+            break
+        out.append(template[pos:at])
+        match = _PERCENT_FIELD_RE.match(template, at)
+        if match is None:  # a `%` the fold cannot parse: nothing after it is read
+            out.append(_WILD)
+            ok = False
+            break
+        pos = match.end()
         key, flags, width, precision, conv = match.groups()
         if conv == "%":
-            return "%"
+            out.append("%")
+            continue
         if "*" in (width, precision):  # a width taken from the arguments: the positions after it are not tracked
-            state["known"] = False
-            return ""
+            lost = True
+            out.append(_WILD)
+            ok = False
+            continue
         if key is not None:
-            value = named.get(key)
+            value = None if any_named else named.get(key)
         else:
-            index, state["next"] = state["next"], state["next"] + 1
-            value = positional[index] if index < len(positional) else None
-        if value is None or conv not in "sra" or not value[1]:
-            state["known"] = False
-            return value[0] if value is not None and conv in "sra" else ""
-        if any(int(number) > _SPEC_NUMBER_LIMIT for number in (width, precision) if number):
-            state["known"] = False
-            return ""
-        try:
-            return ("%" + flags + (width or "") + ("." + precision if precision else "") + conv) % (value[0],)
-        except (ValueError, TypeError):
-            state["known"] = False
-            return ""
+            index, nxt = nxt, nxt + 1
+            value = None if lost or (any_pos and index >= len(positional)) else (positional[index] if index < len(positional) else None)
+        if value is None:
+            out.append(_WILD)
+            ok = False
+        elif conv not in "sra":
+            out.append(_WILD)  # `%c` of a number is a character, `%d` a number: neither is a text the fold knows
+            ok = False
+        elif value[1] and not _spec_too_big((width, precision)):
+            try:
+                out.append(("%" + flags + (width or "") + ("." + precision if precision else "") + conv) % (value[0],))
+            except (ValueError, TypeError):
+                out.append(_WILD)
+                ok = False
+        elif conv == "s" and not flags and not width and not precision:
+            out.append(value[0])  # an unknown text printed as it is: its wildcard stays in place
+            ok = False
+        else:
+            out.append(_WILD)
+            ok = False
+    return "".join(out), ok
 
-    return _PERCENT_FIELD_RE.sub(field, template), state["known"]
+
+_BUILT_LAUNCH_KW_RE = re.compile(r"(?P<a>start-)|(?:^|[;&|({=!]|\s\.)\s*(?P<b>start|saps)(?![\w-])|(?<![\w$.-])(?:return|throw|exit|-not)\s+(?P<c>start|saps)(?![\w-])",
+                                 re.IGNORECASE | re.MULTILINE)  # _BUILT_LAUNCH_RE with the keyword captured, so its span can be compared with the literal text
+
+
+def _launch_fills(text: str) -> list[tuple[str, list[bool] | None]]:
+    """The ways a folded text (``_WILD`` = any text) could read once its wildcards are filled with pieces of a launch command: (text, mask of
+    the characters that are literal). The first is the text with its wildcards dropped (mask None: the literal pieces joined, as written).
+    The others are a bounded set: each wildcard run alone, all of them with one fill, and every combination when there are few and the
+    literal gaps between them are short."""
+    plain = text.replace(_WILD, "")
+    if _WILD not in text:
+        return [(plain, None)]
+    segs = re.split(re.escape(_WILD) + "+", text)
+    runs = len(segs) - 1
+    words = ("start-process", "saps", "start")
+    fills = {w[a:b] for w in words for a in range(len(w)) for b in range(a, len(w) + 1)} | {";", " ", "&", "|"}
+    out: dict[str, list[bool]] = {}
+
+    def add(chosen: list[str]) -> None:
+        built, mask = "", []
+        for i, seg in enumerate(segs):
+            built += seg
+            mask += [True] * len(seg)
+            if i < runs:
+                built += chosen[i]
+                mask += [False] * len(chosen[i])
+        out.setdefault(built, mask)
+
+    for fill in fills:
+        add([fill] * runs)  # every run filled alike
+        for k in range(runs):  # run k filled, the others dropped
+            add([fill if i == k else "" for i in range(runs)])
+    if runs <= 3 and all(len(seg) <= 3 for seg in segs[1:-1]):
+        small = sorted({w[a:b] for w in ("saps", "start") for a in range(len(w)) for b in range(a, len(w) + 1)})
+        for combo in itertools.product(small, repeat=runs):
+            add(list(combo))
+    return [(plain, None)] + sorted(out.items())
+
+
+def _built_launch(variants: list[tuple[str, list[bool] | None]], marked: str | None = None) -> str | None:
+    """The first variant that reads as a PowerShell launch, or None. A filled variant counts only when the launch keyword mixes characters of
+    the source with characters of a fill (a keyword wholly from the source is the plain variant's business; one wholly from a wildcard says
+    nothing about the text around it). With ``marked``, the launch must also be one more ``Start-Process`` / ``saps`` / ``start`` than the
+    marked text has."""
+    for text, literal in variants:
+        if marked is not None and not len(_START_PROCESS_RE.findall(text)) > len(_START_PROCESS_RE.findall(marked)):
+            continue
+        for m in _BUILT_LAUNCH_KW_RE.finditer(text):
+            if literal is None or any(any(literal[m.start(g):m.end(g)]) and not all(literal[m.start(g):m.end(g)])
+                                      for g in ("a", "b", "c") if m.start(g) >= 0):
+                return text
+    return None
 
 
 def _tracked(module: str | None) -> frozenset:
@@ -670,6 +858,17 @@ class _Facts:
             return None if arg.elts else False
         return True if isinstance(arg, ast.Constant) else None
 
+    def unresolved_reason(self, call: ast.Call) -> str:
+        """Why ``import_target`` could not resolve this dynamic import (its ``resolved`` is False): the module name, the fromlist, or the package."""
+        kind = self.import_kind(call)
+        arg = call.args[0] if call.args else next((kw.value for kw in call.keywords if kw.arg == "name"), None)
+        name = self.literal(arg)
+        if name is None:
+            return "makes a dynamic import whose module name is not a string literal"
+        if kind == "__import__" and "." in name and self._fromlist_state(call) is None:
+            return "makes a dynamic import whose fromlist is not statically known, so the returned module cannot be followed"
+        return "makes a dynamic import of a relative module name whose package is not a string literal"
+
     def import_target(self, node: ast.AST) -> tuple[bool, str | None, bool]:
         """(is this a dynamic import, the tracked module it returns or None, whether its module name could be resolved)."""
         if not isinstance(node, ast.Call):
@@ -860,8 +1059,8 @@ def _reference_violations(tree: ast.AST, facts: _Facts) -> list[tuple[int, str]]
             out.append((node.lineno, f"names {node.value!r} as a string, which reaches an event-loop spawn method without calling it in place"))
         if isinstance(node, (ast.BinOp, ast.JoinedStr, ast.Call, ast.Subscript)) and not (isinstance(node, ast.BinOp) and isinstance(parent.get(id(node)), ast.BinOp)):
             built, known = _flatten(node, facts.consts)  # 'subprocess_' + 'exec', '%sexec' % 'subprocess_', f'subprocess_{"exec"}': the folded name
-            if known and _LOOP_METHOD_NAME_RE.fullmatch(built):
-                out.append((node.lineno, f"names {built!r} as a built string, which reaches an event-loop spawn method without calling it in place"))
+            if _could_name(built, known, _LOOP_SPAWN_METHODS):  # a wildcard piece can read as the name, so a fold mistake only over-reports
+                out.append((node.lineno, f"names {built.replace(_WILD, '*')!r} as a built string, which can reach an event-loop spawn method without calling it in place"))
         if (isinstance(node, ast.Attribute) and node.attr.startswith("__") and node.attr.endswith("__") and node.attr not in _DUNDER_OK
                 and ((isinstance(node.value, ast.Name) and node.value.id in facts.module_names)
                      or (isinstance(node.value, ast.Call) and facts.import_target(node.value)[0]))):
@@ -875,7 +1074,7 @@ def _reference_violations(tree: ast.AST, facts: _Facts) -> list[tuple[int, str]]
         if isinstance(node, ast.Call):
             is_import, module, resolved = facts.import_target(node)
             if is_import and not resolved:
-                out.append((node.lineno, "makes a dynamic import whose module name is not a string literal"))
+                out.append((node.lineno, facts.unresolved_reason(node)))
                 continue
             is_ref = module is not None
             f = node.func
@@ -1299,10 +1498,10 @@ def _string_values(tree: ast.AST) -> list[tuple[int, str, bool]]:
             holes = [v.value for v in node.values if isinstance(v, ast.FormattedValue)]
             if not any(isinstance(c, ast.Constant) and isinstance(c.value, str) for h in holes for c in ast.walk(h)):
                 marked = "".join(v.value if isinstance(v, ast.Constant) else "\x01" for v in node.values)
-                flat, _ = _flatten(node, named_strings)  # the literal pieces joined with the holes dropped: f'Sta{name}rt-Process cmd.exe'
-                if len(_START_PROCESS_RE.findall(flat)) > len(_START_PROCESS_RE.findall(marked)) and _BUILT_LAUNCH_RE.search(flat):
-                    out.append((node.lineno, flat, True))
-                    continue
+                flat, _ = _flatten(node, named_strings)  # the literal pieces with a wildcard per hole: f'Sta{name}rt-Process cmd.exe'
+                filled = _built_launch(_launch_fills(flat), marked)  # the holes dropped, then each filled with pieces of a launch (`f'{115:c}aps cmd.exe'`)
+                out.append((node.lineno, filled, True) if filled is not None else (node.lineno, marked, False))
+                continue
                 out.append((node.lineno, marked, False))
                 continue
         builds = isinstance(node, (ast.JoinedStr, ast.BinOp)) or (
@@ -1313,7 +1512,7 @@ def _string_values(tree: ast.AST) -> list[tuple[int, str, bool]]:
             pieces = [c.value for c in consts]
             # a launch split across the literal pieces ('Sta' + name + 'rt-Process') reads as one only when they are joined in source order
             flat, _ = _flatten(node, named_strings)  # '{}rt-Process'.format('Sta'), '%srt-Process' % 'Sta': the template filled in
-            if any(_BUILT_LAUNCH_RE.search(p) for p in pieces + ["".join(pieces), flat]):
+            if any(_BUILT_LAUNCH_RE.search(p) for p in pieces + ["".join(pieces)]) or _built_launch(_launch_fills(flat)) is not None:
                 out.append((node.lineno, "".join(pieces), True))
                 continue
         stack.extend(ast.iter_child_nodes(node))
@@ -2853,6 +3052,115 @@ class AdversaryR6Pass14Tests(unittest.TestCase):
         }.items():
             self.assertGreaterEqual(len(self._bad(src)), 1, label)
         self.assertEqual(self._bad("import shutil\nassert shutil\nassert shutil.which('x'), 'missing'\n"), [])  # the test of an assert is never carried away
+
+
+class AdversaryR7Tests(unittest.TestCase):
+    """r7: adversary pass 15 (review-adversary-MLV-LANE-CONSOLE-HIDDEN-1-r6-95a5f55e) findings A1-A4 and their siblings, as a class, plus Grok G12.
+
+    The string fold no longer re-implements Python's formatting to the last corner: a piece it cannot read exactly (a number, a ``*``/``**``
+    expansion, a set whose order is unknown, a run-time name, a spec it does not apply) is a wildcard, and a built name is matched as a
+    pattern against the spawn-method names and the PowerShell launch keywords. A fold mistake can therefore only over-report.
+    """
+
+    @staticmethod
+    def _bad(source: str) -> list[str]:
+        return _unflagged_spawns_in_source(source, "synthetic.py")
+
+    @staticmethod
+    def _launch(expr: str) -> str:
+        return ("import asyncio\nasync def launch():\n    loop = asyncio.get_running_loop()\n"
+                f"    await getattr(loop, {expr})(asyncio.SubprocessProtocol, 'cmd.exe', '/c', 'exit')\n")
+
+    @staticmethod
+    def _ps(expr: str) -> tuple[int, int]:
+        found, bad = _start_process_violations(f"x = {expr}\n")
+        return found, len(bad)
+
+    # every spelling of the name `subprocess_exec` / the launch `saps cmd.exe` that hides one character behind something the fold cannot read as a text
+    HIDDEN_NAME = (
+        # A1: a set holds each element once, in no fixed order
+        "'subprocess_' + ''.join({'exec', 'exec'})", "'subprocess_' + ''.join({'exec', 'x'})", "'subprocess_' + ''.join({*parts})",
+        "'subprocess_' + ''.join([*parts])", "'subprocess_e' + ''.join({'x', 'x'}) + 'ec'",
+        # A2: a number prints as whatever its spec says
+        "f'{115:c}ubprocess_exec'", "f'{0x73:c}ubprocess_exec'", "f'{115:{\"c\"}}ubprocess_exec'", "'{:c}ubprocess_exec'.format(115)",
+        "'{0:c}ubprocess_exec'.format(115)", "'{x:c}ubprocess_exec'.format(x=115)", "'{x:c}ubprocess_exec'.format_map({'x': 115})",
+        "'%cubprocess_exec' % 115", "'%cubprocess_exec' % (115,)", "'%(x)cubprocess_exec' % {'x': 115}", "'{:c}ubprocess_exec'.format(115.0)",
+        # A3: an expansion rebinds what the literal part of the mapping says
+        "'{x}ubprocess_exec'.format_map({'x': 'z', **{'x': 's'}})", "'%(x)subprocess_exec' % {'x': 'z', **{'x': 's'}}",
+        "'{x}ubprocess_exec'.format(**{'x': 's'})", "'{x}ubprocess_exec'.format(x='z', **kw)", "'{}ubprocess_exec'.format(*['s'])",
+        "'{}{}ubprocess_exec'.format('', *['s'])", "'%subprocess_exec' % (*['s'],)", "'%s%subprocess_exec' % ('', *['s'])",
+        "'{x}ubprocess_exec'.format_map(mapping)", "'%(x)subprocess_exec' % mapping", "'%subprocess_exec' % args",
+        # an operation with run-time arguments over a text that holds the name may leave it whole
+        "'subprocess_exec'.replace(a, b)", "'xsubprocess_exec'[n:]", "'subprocess_exec_x'[:n]", "'subprocess_exec'.strip(chars)", "'subprocess_exec'.replace('x', b, 1)",
+        # unknown positions behind a `*` width, a missing argument, a lone brace
+        "'%*dsubprocess_exec' % (1, 2)", "'{}{}ubprocess_exec'.format('s')",
+    )
+    HIDDEN_LAUNCH = (
+        "'sa' + ''.join({'p', 'p'}) + 's cmd.exe'", "'%caps cmd.exe' % 115", "f'{115:c}aps cmd.exe'", "'{:c}aps cmd.exe'.format(115)",
+        "'{x}aps cmd.exe'.format_map({'x': 'z', **{'x': 's'}})", "'%(x)saps cmd.exe' % {'x': 'z', **{'x': 's'}}",
+        "'{x}aps cmd.exe'.format(**kw)", "'%saps cmd.exe' % (*parts,)", "'{}aps cmd.exe'.format(*parts)",
+        "'%c%caps cmd.exe' % (1, 2)", "'sa' + '%c' % 112 + 's cmd.exe'", "f'S{97:c}rt-Process cmd.exe'", "f'{115:c}{116:c}art-Process cmd.exe'",
+    )
+
+    def test_a1_a2_a3_a_name_hidden_behind_an_unreadable_piece_is_reported(self):
+        for expr in self.HIDDEN_NAME:
+            self.assertGreaterEqual(len(self._bad(self._launch(expr))), 1, expr)
+
+    def test_a1_a2_a3_a_powershell_launch_hidden_behind_an_unreadable_piece_is_reported(self):
+        for expr in self.HIDDEN_LAUNCH:
+            self.assertEqual(self._ps(expr), (1, 1), expr)
+
+    def test_the_fold_gives_a_known_text_only_where_it_equals_pythons(self):
+        for src in ("''.join({'exec', 'exec'})", "''.join({'e'})", "''.join(('a', 'b'))", "'-'.join(['a', 'b'])", "'{}x'.format('s')", "'%sx' % 's'",
+                    "f'{\"a\"!r}'", "'{x}'.format_map({'x': 'a', 'x': 'b'})"):
+            self.assertEqual(_flatten(ast.parse(src, mode="eval").body, {}), (eval(src), True), src)  # the test's own literal, never scanned text
+        # a text the fold cannot guarantee is marked unknown and carries the wildcard
+        for src in ("''.join({'a', 'b'})", "''.join({*x})", "f'{115:c}'", "'{:c}'.format(115)", "'%c' % 115", "'{x}'.format(**kw)", "'{}'.format(*a)",
+                    "'%(x)s' % {**m}", "'{x}'.format_map({**m})", "'%s%s' % (*a,)", "'{:{}}'.format('x', 3)", "'%*d' % (3, 4)", "'a' + n"):
+            text, known = _flatten(ast.parse(src, mode="eval").body, {})
+            self.assertFalse(known, src)
+            self.assertIn(_WILD, text, src)
+
+    def test_a4_a_huge_spec_digit_string_is_never_converted_or_applied(self):
+        digits = "9" * 5000  # int() of this raises ValueError (4300-digit limit) on Python 3.11+
+        for src in (f"f\"{{'x':{digits}}}\"", "'{:" + digits + "}'.format('x')", "'{x:" + digits + "}'.format_map({'x': 'y'})", "'%" + digits + "s' % 'x'",
+                    "'%." + digits + "s' % 'x'", "f\"{'x':.{'" + digits + "'}}\""):
+            text, known = _flatten(ast.parse(src, mode="eval").body, {})
+            self.assertFalse(known, src[:40])
+        self.assertGreaterEqual(len(self._bad(self._launch("'{:" + digits + "}ubprocess_exec'.format('s')"))), 1)  # reported, not crashed on
+        self.assertEqual(self._ps("'%" + digits + "saps cmd.exe' % 'x'")[0], 1)  # read as a launch, not crashed on
+
+    def test_over_reporting_stays_inside_the_names_and_keywords(self):
+        for expr in ("'{}ubprocess_exec'.format('z')", "'subprocess_exec_' + 'x'", "f'{name}_value'", "'%s: %d' % (a, b)", "'{}'.format(x)", "''.join({'x'})",
+                     "'{:c}'.format(115)", "name + 'value'", "'-'.join(parts)", "f'{n:>8}'", "'hello world'.replace(a, b)", "'hello'[n:]"):
+            self.assertEqual(self._bad(self._launch(expr)), [], expr)
+        for expr in ("'{}aps cmd.exe'.format('z')", "f'the {kind} of it'", "'%s: %d' % (a, b)", "'{:c}'.format(115)", "f'{n:c} and {m:c}'",
+                     "'x' + ''.join({'y', 'z'}) + 'x'", "f'{a}; {b}'"):
+            self.assertEqual(self._ps(expr), (0, 0), expr)
+
+    # --- Grok G12: an unresolved fromlist is reported with its own reason ---
+    def test_g12_an_unresolved_fromlist_is_reported_as_a_fromlist_not_a_module_name(self):
+        wanted = "fromlist is not statically known"
+        for label, src in {
+            "name": "names = []\nm = __import__('asyncio.base_events', fromlist=names)\n",
+            "starred list": "names = []\nm = __import__('asyncio.base_events', fromlist=[*names])\n",
+            "starred tuple": "names = []\nm = __import__('asyncio.base_events', fromlist=(*names,))\n",
+            "star args": "a = ()\nm = __import__('asyncio.base_events', *a)\n",
+            "double star": "kw = {}\nm = __import__('asyncio.base_events', **kw)\n",
+            "builtins form": "import builtins\nn = []\nm = builtins.__import__('os.path', fromlist=n)\n",
+        }.items():
+            got = self._bad(src)  # (the builtins form also draws the unrelated "reads __import__ off an imported module" line)
+            self.assertEqual(len([g for g in got if wanted in g]), 1, (label, got))
+            self.assertFalse(any("module name is not a string literal" in g for g in got), (label, got))
+        # the module-name reason keeps its text, and so does the relative-name reason
+        got = self._bad("import importlib\nname = pick()\nm = importlib.import_module(name)\n")
+        self.assertEqual(len(got), 1, got)
+        self.assertIn("module name is not a string literal", got[0])
+        got = self._bad("import importlib\nm = importlib.import_module('.sub', package=pick())\n")
+        self.assertEqual(len(got), 1, got)
+        self.assertIn("relative module name", got[0])
+        # a resolved fromlist is not reported at all
+        self.assertEqual(self._bad("m = __import__('asyncio.windows_utils', fromlist=['Popen'])\n"), [])
 
 
 class SpawnSiteBehaviourTests(unittest.TestCase):
