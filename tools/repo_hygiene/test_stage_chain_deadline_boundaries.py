@@ -221,6 +221,12 @@ class StageChainPropagationTests(unittest.TestCase):
             p.read_text(encoding="utf-8", errors="replace") for p in sorted(box.run.glob("stage-*.out.txt")))
         self.assertNotIn("STAGE_NO_HEAVY_SLOT_DEADLINE", out)
         self.assertNotIn("who=assembler-exit code=27", box.records())
+        # Dot 791-I2: the negatives above would also hold for a syntax error, a launch failure or any early crash. The POSITIVE evidence that the
+        # real assembler ran PAST its gate: it reached its next step, the source-commit check (-RepoRoot is a temp dir, not a git repo, so
+        # `git cat-file -e` fails), and ended with that step's own typed refusal and exit code, recorded by stage-one.
+        self.assertIn("RESULT=ASSEMBLE_FAILED STEP=sourceCommit EXIT=2", out)
+        self.assertIn("who=assembler-exit code=2", box.records())
+        self.assertIn("outcome=ASSEMBLE_FAILED exit=2", out)
 
 
 @windows_chain_only
