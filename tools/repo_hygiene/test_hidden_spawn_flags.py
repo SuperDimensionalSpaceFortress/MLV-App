@@ -427,7 +427,7 @@ def _flatten(node: ast.AST, consts: dict[str, str], depth: int = 0) -> tuple[str
             if len(node.args) + len(node.keywords) == 3:  # 'ssubprocess_exec'.replace('s', '', 1) / count=1: only the first one goes
                 c = node.args[2] if len(node.args) == 3 else node.keywords[0].value
                 count = _int_literal(c)
-                count = count if isinstance(count, int) else None
+                count = (-1 if count < 0 or count > len(text) + 1 else count) if isinstance(count, int) else None  # str.replace takes a C ssize_t: more than the text holds is all
             if count is None or not (known and old_known and new_known):
                 return _hedge(text), False
             return text.replace(old, new, count), True
@@ -1410,7 +1410,7 @@ def _unflagged_spawns_in_source(source: str, label: str) -> list[str]:
 
 # --- PowerShell fixtures: any Start-Process / saps / start launch, whatever its target, must be hidden; judged per statement ---
 
-_WINDOW_STYLE_HIDDEN_RE = re.compile(r"(?<!\S)-WindowStyle[\s:]+(?:'Hidden'|\"Hidden\"|Hidden(?![\w-]))", re.IGNORECASE)
+_WINDOW_STYLE_HIDDEN_RE = re.compile(r"(?<!\S)-WindowStyle[\s:]+(?:'Hidden'|\"Hidden\"|Hidden)(?=[\s;)|}&]|\Z)", re.IGNORECASE)  # the value ends at Hidden: `Hidden,Minimized` is another value
 _START_PROCESS_RE = re.compile(r"(?<![\w$.-])(Start-Process|saps|start)(?![\w-])", re.IGNORECASE)  # the cmdlet and its aliases
 _PS_COMMAND_PREFIX_RE = re.compile(r"(?<![\w$.-])(?:return|throw|exit|-not)$", re.IGNORECASE)  # a word that ends right before a command name
 # PowerShell reads these typographic characters as the ASCII ones: single and double quotes, the three dashes a parameter may start with, no-break space.
@@ -1540,6 +1540,21 @@ def _at_command_position(before: str) -> bool:
     return b == "" or b[-1] in "=(!" or bool(_PS_COMMAND_PREFIX_RE.search(b))
 
 
+_SPLICED_WORD_RE = re.compile(r"(?<![\w$.'\"-])[\w'\"-]*['\"][\w'\"-]*(?![\w$.'\"-])")
+
+
+def _unsplice(script: str) -> str:
+    """``Start-"Process"`` and ``Sta'rt'-Process`` are the command ``Start-Process`` to PowerShell: take the quotes out of a word that, bare, IS a launch
+    word. A word that is one quoted string (``'Start-Process'``) is text, not a splice, and stays."""
+    def bare(m: re.Match) -> str:
+        word = m.group(0)
+        plain = re.sub(r"['\"]", "", word)
+        whole = len(word) >= 2 and word[0] in "'\"" and word[-1] == word[0] and word.count(word[0]) == 2
+        balanced = word.count("'") % 2 == 0 and word.count('"') % 2 == 0  # `'Start-Process` opens a quote that closes in the next word: not a splice
+        return plain if balanced and not whole and plain.lower() in ("start-process", "saps", "start") else word
+    return _SPLICED_WORD_RE.sub(bare, script)
+
+
 def _judge_script(script: str) -> tuple[int, int]:
     """(Start-Process / saps / start statements, those lacking their own outer -WindowStyle Hidden). Quoted text is a nested script.
 
@@ -1547,7 +1562,7 @@ def _judge_script(script: str) -> tuple[int, int]:
     starting a word (``foo-WindowStyle:Hidden`` and ``(Get-ChildArgs -WindowStyle Hidden)`` do not count).
     """
     found = bad = 0
-    for statement in _ps_statements(_unescape_ps(script.translate(_PS_CHAR_MAP))):
+    for statement in _ps_statements(_unsplice(_unescape_ps(script.translate(_PS_CHAR_MAP)))):
         spans = _quoted_spans(statement)
         quoted = [False] * len(statement)
         for s, e in spans:
@@ -1705,7 +1720,7 @@ def _start_process_violations(py_source: str) -> tuple[int, list[int]]:
             found += 1
             bad.append(lineno)
             continue
-        text = text.translate(_PS_CHAR_MAP)  # typographic quotes and dashes are the ASCII ones to PowerShell
+        text = _unsplice(text.translate(_PS_CHAR_MAP))  # typographic quotes and dashes are the ASCII ones to PowerShell; `Start-"Process"` is Start-Process
         # a backtick-escaped name (bareword) or a `n boundary (double quotes) must not hide the launch from the filter
         flats = (text, _unescape_ps(text), _dq_value(text)) if "`" in text else (text,)
         if not any(_START_PROCESS_RE.search(flat) for flat in flats) and not re.search(r"'\s*(start-process|saps|start)\s*'|\"\s*(start-process|saps|start)\s*\"", text, re.I):
@@ -3636,6 +3651,30 @@ class AdversaryR8Tests(unittest.TestCase):
         # a continuation after whitespace, or a word that ends before the next line, still lets the parameter count
         for ps in ("Start-Process cmd.exe -ArgumentList foo `\n-WindowStyle:Hidden", "Start-Process cmd.exe `\n  -WindowStyle Hidden", "Start-Process cmd.exe -ArgumentList foo`\n -WindowStyle Hidden"):
             self.assertEqual(self._ps(repr(ps)), (1, 0), ps)
+
+    # ---- pass 20 (review-adversary-MLV-LANE-CONSOLE-HIDDEN-1-r8-15d5ded6) A1-A3, as classes ----
+    def test_pass20_a1_quotes_spliced_into_a_launch_word_are_the_launch(self):
+        for ps in ('Start-"Process" cmd.exe', "Start-'Process' cmd.exe", 'Sta"rt"-Process cmd.exe', "S'tart-Proc'ess cmd.exe", 's"aps" cmd.exe', "sa'ps' cmd.exe",
+                   '"st"art cmd.exe', 'Start-"Process" cmd.exe -WindowStyle Visible'):
+            self.assertEqual(_start_process_violations("script = " + repr(ps) + "\n"), (1, [1]), ps)
+        self.assertEqual(_start_process_violations("script = " + repr('Start-"Process" cmd.exe -WindowStyle Hidden') + "\n"), (1, []))
+        for ps in ("Get-Item 'a'b", "Write-Host 'hello' world", 'Get-Item "st"art.txt', "Get-Item 'sa'p.txt"):  # a quoted splice that is no launch word
+            self.assertEqual(_start_process_violations("script = " + repr(ps) + "\n"), (0, []), ps)
+
+    def test_pass20_a2_the_hidden_value_must_end_at_hidden(self):
+        for ps in ("Start-Process cmd.exe -WindowStyle Hidden`,Minimized", "Start-Process cmd.exe -WindowStyle Hidden,Minimized", "Start-Process cmd.exe -WindowStyle 'Hidden'x",
+                   "Start-Process cmd.exe -WindowStyle Hidden$x", "Start-Process cmd.exe -WindowStyle Hidden'x'", "Start-Process cmd.exe -WindowStyle:Hidden.x"):
+            self.assertEqual(_start_process_violations("script = " + repr(ps) + "\n"), (1, [1]), ps)
+        for ps in ("Start-Process cmd.exe -WindowStyle Hidden", "Start-Process cmd.exe -WindowStyle 'Hidden' -Wait", "(Start-Process cmd.exe -WindowStyle:Hidden)",
+                   "Start-Process cmd.exe -WindowStyle Hidden; exit", "Start-Process cmd.exe -WindowStyle \"Hidden\"|Out-Null"):
+            self.assertEqual(_start_process_violations("script = " + repr(ps) + "\n"), (1, []), ps)
+
+    def test_pass20_a3_a_replace_count_beyond_a_c_ssize_t_does_not_crash_the_scan(self):
+        for count in ("9223372036854775808", "99999999999999999999999", "-99999999999999999999999"):
+            for src in (f"def unused():\n    return 'x'.replace('x', 'y', {count})\n", f"def unused():\n    return 'x'.replace('x', 'y', count={count})\n"):
+                self._bad(src)
+                _start_process_violations(src)
+        self.assertEqual(_flatten(ast.parse("'xx'.replace('x', 'y', 99999999999999999999)", mode="eval").body, {}), ("yy", True))
 
     def test_f2_a_receiver_only_text_stays_clean(self):
         for expr in ("'allowed_roots.' + k", "'loop.' + part", "'loop.' + part + '.run'", "part + '.' + other", "'self.loop.' + part", "f'{a}.{b}'",
