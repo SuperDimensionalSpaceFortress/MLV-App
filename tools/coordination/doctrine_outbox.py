@@ -3981,22 +3981,76 @@ def _pin_scratch(base: pathlib.Path, scratch_root: str | os.PathLike) -> None:
     _SCRATCH_PINS[_scratch_key(base)] = (root_a if root_a == root_b else None, work_a if work_a == work_b and fresh else None)
 
 
+def _move_scratch_aside(work: pathlib.Path, root: pathlib.Path, root_id: tuple[int, int] | None,
+                        work_id: tuple[int, int] | None, base: pathlib.Path) -> pathlib.Path:
+    """Rename the scratch `work` to a fresh private random name in the same (pinned) parent, in one atomic rename, and return that
+    name only when the object now under it is the pinned scratch: the same file identity, a real directory, no link, junction or
+    reparse point, with the root still the pinned root. Anything else is put back under its name when it can be and is the typed
+    EXERCISE_SCRATCH_NOT_REMOVED, with nothing removed. A failed rename (held, gone) is an OSError for the caller's bounded loop."""
+    private = root / f"{work.name}.rm-{os.urandom(8).hex()}"           # keeps the run's prefix; nobody can name it in advance
+    os.rename(work, private)
+    try:
+        info = os.lstat(private)
+        same = ((info.st_dev, info.st_ino) == work_id and work_id is not None and root_id is not None
+                and _file_id(root, follow=True) == root_id and stat.S_ISDIR(info.st_mode) and not stat.S_ISLNK(info.st_mode)
+                and not getattr(info, "st_file_attributes", 0) & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400))
+    except (OSError, ValueError):
+        same = False                                                    # unknown is not ours
+    if same:
+        return private
+    try:
+        os.rename(private, work)
+        where = f"it was put back under {work}"
+    except OSError as e:
+        where = f"it could not be put back and is left under {private} ({e})"
+    raise Unknown("EXERCISE_SCRATCH_NOT_REMOVED",
+                  f"{base}: what its name held when removal began is not the scratch this run made (another directory, a link or a "
+                  f"junction); nothing was removed and {where}")
+
+
 def remove_exercise_scratch(base: pathlib.Path, scratch_root: pathlib.Path) -> None:
-    """Remove the scratch directory THIS run made, by name: it must sit directly under `scratch_root`, carry the
-    run's prefix and be a real directory (not a link or junction). Anything else is left alone. Every look at it is
-    _scratch_state against the scratch root's real path pinned at the start AND the file identity of the root and of the scratch
-    (pinned when make_exercise_scratch made them, else at the first readable look, before any removal attempt), so "gone" is only
-    ever read through the very root that was pinned: a scratch or root swapped for a link, or renamed away and replaced by another
-    directory or a file under the same name, is never removed through, made writable through or read as a removal. A scratch whose
-    metadata cannot be read (a transient Access-denied included) is retried like a held one, inside the same bounded loop, and is
-    never read as gone. No removal attempt starts after the deadline, the first one included; one still unreadable or held at the
-    deadline is the typed Unknown EXERCISE_SCRATCH_NOT_REMOVED."""
-    root = pathlib.Path(os.path.realpath(scratch_root))                 # pinned: every later look compares against THIS, never a fresh resolve
-    work = root / base.name                                             # what is removed; `base` only names it in messages
-    pinned_at_creation = _scratch_key(base) in _SCRATCH_PINS
-    root_id, work_id = _SCRATCH_PINS.pop(_scratch_key(base), (None, None))
-    if os.path.normcase(os.path.realpath(base.parent)) != os.path.normcase(str(root)):
-        return                                                          # not directly under the scratch root: not ours
+    """Remove the scratch directory THIS run made. It must sit directly under `scratch_root`, carry the run's prefix and be a real
+    directory (not a link or junction); one this run did not make that fails this is not ours and is left alone. The root is resolved
+    once, here, and a scratch pinned at creation whose root resolves to two different places across the two reads at the start is
+    the typed outcome, never a normal return. Every later look is _scratch_state against that pinned real root plus the file identity
+    (device, file index) of the root and of the scratch, pinned when make_exercise_scratch made them (else at the first readable look,
+    before any removal attempt), so "gone" is only ever read through the pinned root. The pin is dropped when this returns or raises.
+
+    Nothing inside is removed by the scratch's own name: it is first renamed, atomically and in the same parent, to a fresh private
+    random name, and only an object found under that name with the pinned identity (a real directory, no link, junction or reparse
+    point, under the pinned root) is removed; anything else is put back when it can be and is the typed outcome, nothing removed. So a
+    scratch (or root) renamed away and replaced by another directory, or swapped for a link or junction, at any moment up to that
+    rename is never removed through, made writable through or read as a removal.
+
+    What this does NOT close (Python offers no handle-based delete on Windows, and rmtree walks by path string): a same-user process
+    that learns the private name and swaps it, or swaps the scratch root or a directory inside the scratch, after the identity check
+    and during the walk. Closing that needs a process able to write inside the private scratch root, as for _writable_retry.
+
+    A scratch that is held (a just-killed process's sharing violation, on the rename or on the walk) or whose metadata cannot be read
+    is retried inside one bounded loop and is never read as gone. No removal attempt starts after the deadline, the first one
+    included; one still held or unreadable at the deadline is the typed Unknown EXERCISE_SCRATCH_NOT_REMOVED naming where it is left."""
+    key = _scratch_key(base)
+    pinned_at_creation = key in _SCRATCH_PINS
+    root_id, work_id = _SCRATCH_PINS.get(key, (None, None))
+    try:
+        root = pathlib.Path(os.path.realpath(scratch_root))             # pinned: every later look compares against THIS
+        parent = os.path.realpath(base.parent)
+        if os.path.normcase(parent) != os.path.normcase(str(root)):
+            if pinned_at_creation:                                      # ours, but its root cannot be pinned: unknown, never "done"
+                raise Unknown("EXERCISE_SCRATCH_NOT_REMOVED",
+                              f"{base}: its scratch root resolved to {root} and then to {parent} at the start of the removal; "
+                              f"nothing was removed and it is left behind")
+            return                                                      # not directly under the scratch root: not ours
+        _remove_pinned_scratch(base, root, root_id, work_id, pinned_at_creation)
+    finally:
+        _SCRATCH_PINS.pop(key, None)                                    # a pin never outlives its removal (CoS G3)
+
+
+def _remove_pinned_scratch(base: pathlib.Path, root: pathlib.Path, root_id: tuple[int, int] | None,
+                           work_id: tuple[int, int] | None, pinned_at_creation: bool) -> None:
+    """The bounded removal loop of remove_exercise_scratch (see there)."""
+    work = root / base.name                                             # the scratch's own name; `base` only names it in messages
+    target = work                                                       # where the scratch is now: `work`, then its private name
     deadline = time.monotonic() + ROUTE_SCRATCH_REMOVE_DEADLINE
     failure: OSError = OSError(f"the {ROUTE_SCRATCH_REMOVE_DEADLINE:g}s deadline passed before a removal attempt could start")
     first = True
@@ -4005,7 +4059,7 @@ def remove_exercise_scratch(base: pathlib.Path, scratch_root: pathlib.Path) -> N
     def look() -> str:
         """_scratch_state, then the identity of the root and of the scratch against their pins."""
         nonlocal root_id, work_id
-        state = "ok" if _scratch_guard_holds(work, root) else _scratch_state(work, root)
+        state = "ok" if _scratch_guard_holds(target, root) else _scratch_state(target, root)
         if state in ("ok", "absent"):
             seen = _file_id(root, follow=True)
             if root_id is None and not attempted and not pinned_at_creation:
@@ -4015,7 +4069,7 @@ def remove_exercise_scratch(base: pathlib.Path, scratch_root: pathlib.Path) -> N
             if seen != root_id:
                 return "foreign"
         if state == "ok":
-            seen = _file_id(work)
+            seen = _file_id(target)
             if work_id is None and not attempted and not pinned_at_creation:
                 work_id = seen
             if seen is None or work_id is None:
@@ -4025,7 +4079,10 @@ def remove_exercise_scratch(base: pathlib.Path, scratch_root: pathlib.Path) -> N
         return state
 
     def ours() -> bool:
-        return root_id is not None and work_id is not None and _file_id(root, follow=True) == root_id and _file_id(work) == work_id
+        return root_id is not None and work_id is not None and _file_id(root, follow=True) == root_id and _file_id(target) == work_id
+
+    def where() -> str:
+        return "" if target == work else f" (under its private name {target})"
 
     while True:
         state = look()
@@ -4035,23 +4092,26 @@ def remove_exercise_scratch(base: pathlib.Path, scratch_root: pathlib.Path) -> N
             if first and not pinned_at_creation:
                 return                                                  # never ours: left alone
             raise Unknown("EXERCISE_SCRATCH_NOT_REMOVED",
-                          f"{base} was replaced by a link or another directory (or its root was) during the removal; "
+                          f"{base}{where()} was replaced by a link or another directory (or its root was) during the removal; "
                           f"it is left alone and behind: {failure}") from failure
         if time.monotonic() > deadline:                                 # the looks themselves took time: no attempt starts after the deadline
             break
         first = False
         if state == "unreadable":
-            failure = OSError(f"{base} cannot be inspected")            # unknown is not gone, and is not touched; look again after the pause
+            failure = OSError(f"{base}{where()} cannot be inspected")   # unknown is not gone, and is not touched; look again after the pause
         else:
             attempted = True
             try:
+                if target == work:
+                    target = _move_scratch_aside(work, root, root_id, work_id, base)   # removal never walks the scratch's own name
+                walked = target
                 if sys.version_info >= (3, 12):
-                    shutil.rmtree(work, onexc=lambda f, p, e: _writable_retry(f, p, e, work, deadline, ours))
+                    shutil.rmtree(walked, onexc=lambda f, p, e: _writable_retry(f, p, e, walked, deadline, ours))
                 else:
-                    shutil.rmtree(work, onerror=lambda f, p, e: _writable_retry(f, p, e, work, deadline, ours))
+                    shutil.rmtree(walked, onerror=lambda f, p, e: _writable_retry(f, p, e, walked, deadline, ours))
                 if look() == "absent":
                     return
-                failure = OSError(f"{base} still exists or cannot be inspected after the removal returned")   # a refused entry is a failure
+                failure = OSError(f"{base}{where()} still exists or cannot be inspected after the removal returned")
             except OSError as e:                                       # a just-killed process still holds it (sharing violation 13/32)
                 if isinstance(e, FileNotFoundError) and look() == "absent":
                     return                                              # the scratch itself is gone; a missing CHILD is only a race, retried
@@ -4061,7 +4121,23 @@ def remove_exercise_scratch(base: pathlib.Path, scratch_root: pathlib.Path) -> N
             break
         time.sleep(ROUTE_SCRATCH_REMOVE_PAUSE)
     raise Unknown("EXERCISE_SCRATCH_NOT_REMOVED",
-                  f"{base} could not be removed within {ROUTE_SCRATCH_REMOVE_DEADLINE:g}s and is left behind: {failure}") from failure
+                  f"{base}{where()} could not be removed within {ROUTE_SCRATCH_REMOVE_DEADLINE:g}s and is left behind: {failure}") from failure
+
+
+def _remove_scratch_keeping(failure: BaseException, base: pathlib.Path, scratch_root: pathlib.Path) -> None:
+    """Remove the scratch while `failure` is already the outcome: a removal failure never replaces it (CoS G2). It is recorded on an
+    Unknown's detail, else printed to stderr and attached as a note to `failure`."""
+    try:
+        remove_exercise_scratch(base, scratch_root)
+    except Exception as leftover:
+        said = f"{leftover.code}: {leftover.detail}" if isinstance(leftover, Unknown) else f"{type(leftover).__name__}: {leftover}"
+        if isinstance(failure, Unknown):
+            failure.detail = f"{failure.detail}; {said}" if failure.detail else said
+            failure.args = (f"{failure.code}: {failure.detail}",)
+        else:
+            _route_say(said, sys.stderr)
+            if hasattr(failure, "add_note"):
+                failure.add_note(said)
 
 
 def make_exercise_scratch(bus: pathlib.Path, scratch_root: pathlib.Path) -> tuple[pathlib.Path, pathlib.Path, str]:
@@ -4075,8 +4151,8 @@ def make_exercise_scratch(bus: pathlib.Path, scratch_root: pathlib.Path) -> tupl
         raise Unknown("EXERCISE_SCRATCH_INSIDE_BUS", f"scratch root {scratch_root} is inside the bus {bus}; routes never run in the live bus")
     scratch_root.mkdir(parents=True, exist_ok=True)
     base = pathlib.Path(tempfile.mkdtemp(prefix=ROUTE_SCRATCH_PREFIX, dir=str(scratch_root)))
-    _pin_scratch(base, scratch_root)                                    # what removal must find again
     try:
+        _pin_scratch(base, scratch_root)                                # what removal must find again; a failure here still removes it
         clone = base / "bus"
         git_bin, refused = route_git_binary(clone)
         if refused:
@@ -4094,14 +4170,7 @@ def make_exercise_scratch(bus: pathlib.Path, scratch_root: pathlib.Path) -> tupl
                 raise GitError(f"git {' '.join(args)} (in {clone}): {proc.stderr.strip()}")
         return base, clone, proc.stdout.strip()
     except BaseException as failure:
-        try:
-            remove_exercise_scratch(base, scratch_root)
-        except Unknown as leftover:                                     # the failure that ended the preparation stays the outcome
-            if isinstance(failure, Unknown):
-                failure.detail = f"{failure.detail}; {leftover.detail}" if failure.detail else leftover.detail
-                failure.args = (f"{failure.code}: {failure.detail}",)
-            else:
-                _route_say(f"{leftover.code}: {leftover.detail}", sys.stderr)
+        _remove_scratch_keeping(failure, base, scratch_root)           # the failure that ended the preparation stays the outcome
         raise
 
 
@@ -4121,8 +4190,8 @@ def run_exercise(entries: list[tuple[str, dict]], bus: pathlib.Path | None, time
         bus = pathlib.Path(env_bus)
     root = scratch_root if scratch_root is not None else pathlib.Path(tempfile.gettempdir())
     bus = bus.resolve()
-    base, clone, tip = make_exercise_scratch(bus, root)
     ok = True
+    base, clone, tip = make_exercise_scratch(bus, root)
     try:
         _route_say(f"ROUTE_BUS {tip[:12]} (scratch clone of {bus.name}; commands run there, never in the bus)")
         git_bin, refused = route_git_binary(clone)
@@ -4138,8 +4207,10 @@ def run_exercise(entries: list[tuple[str, dict]], bus: pathlib.Path | None, time
                 _route_say(f"  {detail}", sys.stderr)
             if status not in ROUTE_PASSING:
                 ok = False
-    finally:
-        remove_exercise_scratch(base, root)
+    except BaseException as failure:
+        _remove_scratch_keeping(failure, base, root)                   # the loop's own failure stays the outcome (CoS G2)
+        raise
+    remove_exercise_scratch(base, root)
     return 0 if ok else 1
 
 
