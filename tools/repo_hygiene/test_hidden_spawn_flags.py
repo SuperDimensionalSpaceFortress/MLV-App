@@ -77,7 +77,6 @@ from __future__ import annotations
 import ast
 import asyncio
 import functools
-import itertools
 import pkgutil
 import posixpath
 import re
@@ -230,47 +229,76 @@ def _spec_too_big(numbers) -> bool:
 # Where a PowerShell launch keyword can begin inside a text some operation the fold cannot apply may cut a substring from: the substring may start
 # at ANY character, so no left boundary is asked of the keyword (``'xsaps cmd.exe'.partition('x')[2]`` is ``saps cmd.exe``).
 _LOOSE_LAUNCH_RE = re.compile(r"start-|(?:start|saps)(?![\w-])", re.IGNORECASE)
+# What an operation the fold cannot apply may leave of a text is read two ways, and one text cannot say both: the Python side asks which spawn-method
+# name it may leave, the PowerShell side which launch keyword. ``_flatten_launch`` reads in the second way.
+_HEDGE_MODE = ["name"]
 
 
 def _hedge(text: str) -> str:
     """The text an operation the fold cannot apply (a ``replace`` with run-time arguments, a slice with a run-time bound, a string method it has no
-    arm for) may leave of ``text``: anything, and, when ``text`` holds an event-loop spawn-method name, that name followed by anything (the
-    operation may leave it whole), and, when it holds a PowerShell launch keyword, anything followed by the text from the keyword on (the
-    operation may cut the text there)."""
-    name = next((name + _WILD for name in sorted(_LOOP_SPAWN_METHODS) if name in text), "")
-    keyword = _LOOSE_LAUNCH_RE.search(text)
-    return (name + (_WILD + text[keyword.start():] if keyword else "")) or _WILD
+    arm for) may leave of ``text``. Name reading: anything around the spawn-method name ``text`` holds (around the longest text the names it holds
+    share, when it holds several, so each of them stays possible). Launch reading: anything followed by the text from its first launch keyword on."""
+    if _HEDGE_MODE[0] == "launch":
+        keyword = _LOOSE_LAUNCH_RE.search(text)
+        return _WILD + text[keyword.start():] if keyword else _WILD
+    held = [name for name in sorted(_LOOP_SPAWN_METHODS) if name in text]
+    if not held:
+        return _WILD
+    common = held[0]
+    for other in held[1:]:
+        common = max((common[i:j] for i in range(len(common)) for j in range(i + 1, len(common) + 1) if common[i:j] in other), key=len, default="")
+    return _WILD + common + _WILD if common else _WILD
 
 
-def _literal_word_characters(pieces) -> int:
-    return sum(len(re.findall(r"\w", p)) for p in pieces)
+def _flatten_launch(node: ast.AST, consts: dict[str, str]) -> tuple[str, bool]:
+    """``_flatten`` read for a PowerShell launch: an operation it cannot apply leaves the text from the launch keyword on."""
+    _HEDGE_MODE[0] = "launch"
+    try:
+        return _flatten(node, consts)
+    finally:
+        _HEDGE_MODE[0] = "name"
+
+
+def _receiver_ok(left: list) -> bool:
+    """Can these items (a literal character, or None for any text) read as a dotted receiver, a run of ``word.`` segments?"""
+    if not left:
+        return True
+    literals = [it for it in left if it is not None]
+    if any(not (it.isalnum() or it in "_.") for it in literals) or left[0] == ".":
+        return False
+    if any(left[i] == "." and left[i + 1] == "." for i in range(len(left) - 1)):
+        return False  # an empty segment
+    return left[-1] is None or left[-1] == "."  # the receiver ends in a dot, or in text that can
 
 
 @functools.lru_cache(maxsize=4096)
 def _could_name_pattern(built: str, names: frozenset) -> bool:
-    pieces = re.split(re.escape(_WILD) + "+", built)
-    lead = pieces[0][:pieces[0].rfind(".") + 1]  # the dotted receiver the text itself spells: 'loop.subprocess_*' -> 'loop.'
-    # The literal text that is not the receiver must say something about the name ('allowed_roots.*' is a receiver and nothing else); the
-    # policy is on the TOTAL of the whole fold, not on one piece: 'su*pr*ce*s_*x*c' spells the name in pieces none of which holds three characters.
-    if _literal_word_characters([pieces[0][len(lead):]] + pieces[1:]) < 3:
-        return False
-    if any(re.search(r"[^\w.]", p) for p in pieces):
-        return False  # a dotted name holds only word characters and dots
-    rx = re.compile(".*".join(re.escape(p) for p in pieces), re.DOTALL)
-    # Match the dotted receiver by structure: the name may sit behind ANY run of `word.` segments, so try every run (up to four segments) of the
-    # WHOLE segments the text itself spells (a segment with a dot on each side inside its piece, or at the start of the text: 'loop' in 'loop.',
-    # 'b' in '.b.') plus two unknown ones. A literal dot after a wildcard (`loop.*.subprocess_exec`) needs a receiver of two segments, which no
-    # sampled prefix of one can give. A segment cut by a wildcard ('value_' in 'loop.value_*') is part of the name, not of the receiver.
-    spelled = [seg for i, p in enumerate(pieces) for seg in (p.split(".")[:-1] if i == 0 else p.split(".")[1:-1]) if seg]
-    tokens = ["a", "b"] + [t for t in dict.fromkeys(spelled) if t not in ("a", "b")][:4]
-    last = pieces[-1]
+    items: list[str | None] = []  # a literal character, or None for a run of wildcards
+    for ch in built:
+        if ch != _WILD:
+            items.append(ch)
+        elif not items or items[-1] is not None:
+            items.append(None)
     for n in names:
-        if last and not (n.endswith(last) or last.endswith(n)):
-            continue  # the text ends with `last`, and the name ends the dotted text
-        for depth in range(0, 5):
-            for run in itertools.product(tokens, repeat=depth):
-                if rx.fullmatch("".join(t + "." for t in run) + n):
-                    return True
+        # The name is the tail of the text; everything before it is a dotted receiver. Try every place it can begin, including inside a wildcard,
+        # and ask of the tail that three of its word characters are literal text: a receiver is not the name, so 'loop.value_*' (a name that must
+        # come wholly from the wildcard) and 'allowed_roots.*' say nothing, while 'su*pr*ce*s_*x*c' and 'root.component_*.subprocess_exec' do.
+        # Exact: no bound on the depth of the receiver or on the number of segments a wildcard completes.
+        splits = []
+        literals = 0
+        for b in range(len(items), -1, -1):
+            if b < len(items) and items[b] is not None:
+                literals += 1
+                if literals > len(n):
+                    break
+            splits.append((items[:b], items[b:]))
+            if b > 0 and items[b - 1] is None:
+                splits.append((items[:b], [None] + items[b:]))  # the wildcard supplies the end of the receiver and the start of the name
+        for left, right in splits:
+            if sum(1 for it in right if it is not None and (it.isalnum() or it == "_")) < 3 or not _receiver_ok(left):
+                continue
+            if re.fullmatch("".join(".*" if it is None else re.escape(it) for it in right), n, re.DOTALL):
+                return True
     return False
 
 
@@ -363,6 +391,9 @@ def _flatten(node: ast.AST, consts: dict[str, str], depth: int = 0) -> tuple[str
             return _fill_percent(template, [_flatten(right, consts, depth + 1)], {}, known, any_pos=False, any_named=False)
         # a name, call or subscript on the right may be a tuple or a mapping at run time: every field is unknown
         return _fill_percent(template, [], {}, known, any_pos=True, any_named=True)
+    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Mult):  # string repetition: `('subprocess_' + kind) * 1` is the text itself, `* n` repeats it
+        texts = [t for t, _ in (_flatten(node.left, consts, depth + 1), _flatten(node.right, consts, depth + 1)) if t.replace(_WILD, "")]
+        return (_WILD + texts[0] + _WILD, False) if len(texts) == 1 else (_WILD, False)
     if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
         method, recv = node.func.attr, node.func.value
         if method in ("format", "format_map"):
@@ -450,7 +481,7 @@ def _apply_spec(text: str, conv: str | None, spec: str | None) -> str | None:
         text = ascii(text)
     if not spec:
         return text
-    if _spec_too_big(re.findall(r"[0-9]+", spec)):
+    if _spec_too_big(re.findall(r"\d+", spec)):  # Python reads any Unicode decimal digit as a width
         return None
     try:
         return format(text, spec)
@@ -1151,7 +1182,7 @@ def _reference_violations(tree: ast.AST, facts: _Facts) -> list[tuple[int, str]]
         if (isinstance(node, ast.Constant) and isinstance(node.value, (str, bytes))
                 and _LOOP_METHOD_NAME_RE.fullmatch(node.value if isinstance(node.value, str) else node.value.decode("latin-1"))):  # b'subprocess_exec' too
             out.append((node.lineno, f"names {node.value!r} as a string, which reaches an event-loop spawn method without calling it in place"))
-        if isinstance(node, (ast.BinOp, ast.JoinedStr, ast.Call, ast.Subscript)) and not (isinstance(node, ast.BinOp) and isinstance(parent.get(id(node)), ast.BinOp)):
+        if isinstance(node, (ast.BinOp, ast.JoinedStr, ast.Call, ast.Subscript)) and not (isinstance(node, ast.BinOp) and isinstance(parent.get(id(node)), ast.BinOp) and isinstance(parent[id(node)].op, (ast.Add, ast.Mod, ast.Mult)))  # only a parent that folds its operands covers it:
             built, known = _flatten(node, facts.consts)  # 'subprocess_' + 'exec', '%sexec' % 'subprocess_', f'subprocess_{"exec"}': the folded name
             if _could_name(built, known, _LOOP_SPAWN_METHODS):  # a wildcard piece can read as the name, so a fold mistake only over-reports
                 out.append((node.lineno, f"names {built.replace(_WILD, '*')!r} as a built string, which can reach an event-loop spawn method without calling it in place"))
@@ -1626,7 +1657,7 @@ def _string_values(tree: ast.AST) -> list[tuple[int, str, bool]]:
             holes = [v.value for v in node.values if isinstance(v, ast.FormattedValue)]
             if not any(isinstance(c, ast.Constant) and isinstance(c.value, str) for h in holes for c in ast.walk(h)):
                 marked = "".join(v.value if isinstance(v, ast.Constant) else "\x01" for v in node.values)
-                flat, _ = _flatten(node, named_strings)  # the literal pieces with a wildcard per hole: f'Sta{name}rt-Process cmd.exe'
+                flat, _ = _flatten_launch(node, named_strings)  # the literal pieces with a wildcard per hole: f'Sta{name}rt-Process cmd.exe'
                 plain = flat.replace(_WILD, "")  # the holes dropped: f'Sta{name}rt-Process cmd.exe'
                 built = (len(_START_PROCESS_RE.findall(plain)) > len(_START_PROCESS_RE.findall(marked)) and _BUILT_LAUNCH_RE.search(plain)) or _could_launch(flat)
                 out.append((node.lineno, plain, True) if built else (node.lineno, marked, False))  # ...or filled with pieces of a launch (`f'{115:c}aps cmd.exe'`)
@@ -1638,7 +1669,7 @@ def _string_values(tree: ast.AST) -> list[tuple[int, str, bool]]:
                             key=lambda c: (c.lineno, c.col_offset))
             pieces = [c.value for c in consts]
             # a launch split across the literal pieces ('Sta' + name + 'rt-Process') reads as one only when they are joined in source order
-            flat, flat_known = _flatten(node, named_strings)  # '{}rt-Process'.format('Sta'), '%srt-Process' % 'Sta': the template filled in
+            flat, flat_known = _flatten_launch(node, named_strings)  # '{}rt-Process'.format('Sta'), '%srt-Process' % 'Sta': the template filled in
             if flat_known and not isinstance(node, (ast.JoinedStr, ast.BinOp)) and not (
                     isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr in _ARGUMENT_FOLDS):
                 out.append((node.lineno, flat, False))  # a slice / strip / case mapper / chr / decode that folds EXACTLY: its text is judged as written
@@ -3518,6 +3549,45 @@ class AdversaryR8Tests(unittest.TestCase):
                      "'loop.%s.subprocess_exec' % p", "'{}.{}.subprocess_exec'.format(p, q)", "f'loop.{p}.subprocess_exec'", "f'self.{p}.loop.{q}.subprocess_exec'",
                      "p + '.' + q + '.subprocess_exec'", "'loop.' + p + '.' + q + '.subprocess_exec'"):
             self.assertGreaterEqual(len(self._bad(self._launch(expr))), 1, expr)
+
+    # ---- pass 18 (review-adversary-MLV-LANE-CONSOLE-HIDDEN-1-r8-6e1a9266) A1-A4, as classes ----
+    def test_pass18_a1_a_receiver_segment_a_wildcard_completes_or_a_deep_receiver_is_reported(self):
+        for expr in ("'root.component_' + part + '.subprocess_exec'", "'root.one.two.three.four.' + part + '.subprocess_exec'",
+                     "'a.b.c.d.e.f.g.' + p + '.subprocess_shell'", "'root.comp_%s.subprocess_exec' % part", "f'root.component_{part}.subprocess_exec'",
+                     "'one.two.' + p + 'three.' + q + '.subprocess_exec'", "p + 'x.' + q + '.subprocess_exec'", "'root.' + p + '_c.' + q + '.subprocess_exec'"):
+            src = ("import operator\nasync def launch(holder, p, q, part, factory):\n"
+                   f"    return await operator.attrgetter({expr})(holder)(factory, 'cmd.exe')\n")
+            self.assertGreaterEqual(len(self._bad(src)), 1, expr)
+        # a receiver, or a segment that is the receiver's, says nothing about the name
+        for expr in ("'root.component_' + part", "'root.component_' + part + '.run'", "'root.one.two.three.four.' + part", "'root.value_' + part + '.x'",
+                     "'root.' + p + '.' + q + '.value'"):
+            self.assertEqual(self._bad(self._launch(expr)), [], expr)
+
+    def test_pass18_a2_an_operation_with_a_run_time_result_over_a_named_text_does_not_hide_it(self):
+        for expr in ("('subprocess_' + kind) * 1", "1 * ('subprocess_' + kind)", "('subprocess_' + kind) * n", "('subprocess_exec') * n", "('subprocess_shell' * n)",
+                     "('_make_subprocess_' + kind) * 1", "('subprocess_' + kind) * 1 + ''", "(('subprocess_' + kind) * 1)[:]"):
+            self.assertGreaterEqual(len(self._bad(self._launch(expr))), 1, expr)
+        for expr in ("('saps cmd.exe' + kind) * 1", "('saps cmd.exe') * n", f"('{self.SP} cmd.exe' + kind) * 1", "2 * ('saps cmd.exe' + kind)"):
+            self.assertEqual(self._ps(expr), (1, 1), expr)
+        for expr in ("('value_' + kind) * 1", "n * m", "('abc' + kind) * 2"):
+            self.assertEqual(self._bad(self._launch(expr)), [], expr)
+
+    def test_pass18_a4_a_hedged_text_holding_two_names_keeps_each_of_them_possible(self):
+        for expr in ("'subprocess_exec;saps'.split(';')[0]", "'subprocess_exec;subprocess_shell'.split(';')[1]", "'subprocess_exec;subprocess_shell'.split(';')[0]",
+                     "'subprocess_exec;_make_subprocess_transport'.split(';')[1]", "'_make_subprocess_transport;subprocess_exec'.split(';')[0]",
+                     "'subprocess_exec;saps'.rstrip(';saps')", "'subprocess_exec;saps'[:n]", "'subprocess_exec;saps'.replace(a, b)",
+                     "'subprocess_exec;saps'.removesuffix(';saps')", "'saps;subprocess_exec'.partition(';')[2]"):
+            self.assertGreaterEqual(len(self._bad(self._launch(expr))), 1, expr)
+        # and the PowerShell side keeps the launch behind the same operations, even when the text also holds a spawn-method name
+        for expr in ("'saps cmd.exe;subprocess_exec'.split(';')[0]", "'subprocess_exec;saps cmd.exe'.split(';')[1]", "'subprocess_exec;saps cmd.exe'[n:]"):
+            self.assertEqual(self._ps(expr), (1, 1), expr)
+
+    def test_pass18_a3_a_unicode_digit_width_is_as_big_as_python_reads_it(self):
+        for spec in ("２５７", "٢٥٧", "１０２４"):  # 257 and 1024 spelled in fullwidth / Arabic-Indic digits
+            text, known = _flatten(ast.parse("'{:" + spec + "}'.format('x')", mode="eval").body, {})
+            self.assertFalse(known, spec)
+            text, known = _flatten(ast.parse("f'{\"x\":" + spec + "}'", mode="eval").body, {})
+            self.assertFalse(known, spec)
 
     def test_f2_a_receiver_only_text_stays_clean(self):
         for expr in ("'allowed_roots.' + k", "'loop.' + part", "'loop.' + part + '.run'", "part + '.' + other", "'self.loop.' + part", "f'{a}.{b}'",
