@@ -49,11 +49,6 @@ EXCLUDED_FILES = frozenset({
 })
 EXCLUDED_NAME_RE = re.compile(r"^tools/coordination/merge[^/]*$")
 
-# A generated PowerShell fixture that starts powershell: any case, quoted or bare, with or without -FilePath, a bare name,
-# a .exe name or a full path.
-_START_PROCESS_POWERSHELL_RE = re.compile(
-    r"Start-Process\s+(?:-FilePath\s+)?(?:'[^']*|\"[^\"]*|[^\s'\"]*)powershell(?:\.exe)?['\"]?(?=\s)", re.IGNORECASE)
-
 # Test modules whose spawns must be hidden (the evidence chain and the fixtures named by the card).
 NAMED_TEST_MODULES = (
     "tools/repo_hygiene/test_attr3_spliced_body_scan.py",
@@ -104,55 +99,13 @@ def _label(expr: ast.AST) -> str:
         return "<expression>"
 
 
-def _store_names(target: ast.AST) -> list[str]:
-    return [n.id for n in ast.walk(target) if isinstance(n, ast.Name)]
+def _spawn_names(tree: ast.AST) -> tuple[set[str], dict[str, str], set[str]]:
+    """Names bound to the subprocess module, to its spawn functions, and the names `from subprocess import` brought in.
 
-
-def _carried(expr: ast.AST | None, modules: set[str], funcs: dict[str, str]) -> list[tuple[str, str]]:
-    """Spawn APIs ('fn', attr) and subprocess module aliases ('mod', name) that ``expr`` can evaluate to.
-
-    Looks through containers, conditionals, ``or``/``and``, subscripts and walrus values; never into a call,
-    so ``subprocess.run(...)`` (a result) is not a carrier but ``(subprocess.run, x)`` and ``a or subprocess.run`` are.
-    Over-approximates on purpose: a name that MIGHT hold a spawn API is checked as one.
-    """
-    found: list[tuple[str, str]] = []
-    stack = [expr]
-    while stack:
-        e = stack.pop()
-        if e is None:
-            continue
-        if isinstance(e, ast.Attribute):
-            if e.attr in SPAWN_ATTRS and any(kind == "mod" for kind, _ in _carried(e.value, modules, funcs)):
-                found.append(("fn", e.attr))  # the receiver may itself be a container or conditional holding the module
-        elif isinstance(e, ast.Name):
-            if e.id in funcs:
-                found.append(("fn", funcs[e.id]))
-            if e.id in modules:
-                found.append(("mod", e.id))
-        elif isinstance(e, (ast.Tuple, ast.List, ast.Set)):
-            stack.extend(e.elts)
-        elif isinstance(e, ast.Dict):
-            stack.extend(k for k in e.keys if k is not None)  # a spawn API used as a key is iterated back out by `for r in d`
-            stack.extend(e.values)
-        elif isinstance(e, (ast.Starred, ast.NamedExpr, ast.Subscript)):
-            stack.append(e.value)
-        elif isinstance(e, ast.IfExp):
-            stack.extend((e.body, e.orelse))
-        elif isinstance(e, ast.BoolOp):
-            stack.extend(e.values)
-        elif isinstance(e, (ast.ListComp, ast.SetComp, ast.GeneratorExp)):
-            stack.append(e.elt)
-    return found
-
-
-def _spawn_names(tree: ast.AST) -> tuple[set[str], dict[str, str], list[int], set[str]]:
-    """Names bound to the subprocess module and to its spawn functions, the lines of bindings that cannot be tracked,
-    and the names `from subprocess import` brought in.
-
-    Resolves imports, aliases, assignments (chained, tuple/list/starred/nested unpacking), walrus, for/comprehension
-    targets, ``with ... as``, match captures and default arguments. A binding whose target is not a plain name
-    (``obj.run = subprocess.run``, ``d['r'] = subprocess.run``) cannot be followed to its calls, so its line is
-    returned and reported: an unresolvable binding is a violation, never clean.
+    Only DIRECT bindings are followed: ``import subprocess [as sp]``, ``from subprocess import run [as r]``, a plain
+    name assigned the module or a spawn API (``sp = subprocess``, ``r = q = subprocess.run``, ``(r := subprocess.run)``),
+    and a default argument (``def f(runner=subprocess.run)``). Every other place a spawn API or the module can appear
+    is reported by ``_reference_violations``, so nothing else needs tracking.
     """
     modules: set[str] = set()
     funcs: dict[str, str] = {}
@@ -169,69 +122,141 @@ def _spawn_names(tree: ast.AST) -> tuple[set[str], dict[str, str], list[int], se
                     funcs[a.asname or a.name] = a.name
                     imported.add(a.asname or a.name)
 
-    def pairs(node: ast.AST) -> list[tuple[ast.AST, ast.AST | None]]:
+    def direct(node: ast.AST) -> list[tuple[str, ast.AST]]:
         if isinstance(node, ast.Assign):
-            return [(t, node.value) for t in node.targets]
-        if isinstance(node, (ast.AnnAssign, ast.AugAssign, ast.NamedExpr)):
-            return [(node.target, node.value)]
-        if isinstance(node, (ast.For, ast.AsyncFor, ast.comprehension)):
-            return [(node.target, node.iter)]
-        if isinstance(node, (ast.With, ast.AsyncWith)):
-            return [(i.optional_vars, i.context_expr) for i in node.items if i.optional_vars is not None]
-        if isinstance(node, ast.Match):
-            captures = [p.name for case in node.cases for p in ast.walk(case.pattern)
-                        if isinstance(p, (ast.MatchAs, ast.MatchStar)) and p.name]
-            captures += [p.rest for case in node.cases for p in ast.walk(case.pattern) if isinstance(p, ast.MatchMapping) and p.rest]
-            return [(ast.Name(id=name, ctx=ast.Store()), node.subject) for name in captures]
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
-            a = node.args
-            positional = a.posonlyargs + a.args
-            out = [(ast.Name(id=arg.arg, ctx=ast.Store()), d) for arg, d in zip(positional[len(positional) - len(a.defaults):], a.defaults)]
-            out += [(ast.Name(id=arg.arg, ctx=ast.Store()), d) for arg, d in zip(a.kwonlyargs, a.kw_defaults) if d is not None]
-            return out
+            return [(t.id, node.value) for t in node.targets if isinstance(t, ast.Name)]
+        if isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name) and node.value is not None:
+            return [(node.target.id, node.value)]
+        if isinstance(node, ast.NamedExpr):
+            return [(node.target.id, node.value)]
+        if isinstance(node, ast.arguments):
+            positional = node.posonlyargs + node.args
+            out = [(arg.arg, d) for arg, d in zip(positional[len(positional) - len(node.defaults):], node.defaults)]
+            return out + [(arg.arg, d) for arg, d in zip(node.kwonlyargs, node.kw_defaults) if d is not None]
         return []
-
-    def bind(target: ast.AST, value: ast.AST | None, record: list[int] | None) -> bool:
-        changed = False
-        if isinstance(target, ast.Name):
-            leaves, refs = [target.id], _carried(value, modules, funcs)
-        elif isinstance(target, (ast.Tuple, ast.List)):
-            same_shape = (
-                isinstance(value, (ast.Tuple, ast.List)) and len(value.elts) == len(target.elts)
-                and not any(isinstance(e, ast.Starred) for e in (*target.elts, *value.elts))
-            )
-            if same_shape:
-                for t, v in zip(target.elts, value.elts):
-                    changed |= bind(t, v, record)
-                return changed
-            leaves, refs = _store_names(target), _carried(value, modules, funcs)  # shape unknown: every name MAY hold it
-        elif isinstance(target, ast.Starred):
-            return bind(target.value, value, record)
-        else:
-            if record is not None and _carried(value, modules, funcs):
-                record.append(getattr(target, "lineno", 0))
-            return False
-        for leaf in leaves:
-            for kind, what in refs:
-                if kind == "mod" and leaf not in modules:
-                    modules.add(leaf)  # sp = subprocess
-                    changed = True
-                elif kind == "fn" and leaf not in funcs:
-                    funcs[leaf] = what  # first binding wins, so `funcs` only grows and the loop below ends
-                    changed = True
-        return changed
 
     changed = True
     while changed:  # an alias of an alias (r = subprocess.run; q = r) settles in a few passes
         changed = False
         for node in ast.walk(tree):
-            for target, value in pairs(node):
-                changed |= bind(target, value, None)
-    unresolved: list[int] = []
+            for name, value in direct(node):
+                if isinstance(value, ast.Name):
+                    if value.id in modules and name not in modules:
+                        modules.add(name)
+                        changed = True
+                    if value.id in funcs and name not in funcs:
+                        funcs[name] = funcs[value.id]  # first binding wins, so `funcs` only grows and the loop ends
+                        changed = True
+                elif isinstance(value, ast.Attribute) and value.attr in SPAWN_ATTRS \
+                        and isinstance(value.value, ast.Name) and value.value.id in modules and name not in funcs:
+                    funcs[name] = value.attr
+                    changed = True
+    return modules, funcs, imported
+
+
+def _position_ok(node: ast.AST, up: ast.AST | None, is_module: bool, parent: dict[int, ast.AST]) -> bool:
+    """May a spawn API (or, if ``is_module``, the subprocess module) appear at this place without being followed?"""
+    if isinstance(up, ast.Call):
+        if node is up.func:
+            return True  # the call itself: judged for creationflags below
+        if is_module:  # getattr(subprocess, "CREATE_NO_WINDOW", 0): reading a NON-spawn constant by name is not an escape
+            return (isinstance(up.func, ast.Name) and up.func.id in ("getattr", "hasattr") and up.args and up.args[0] is node
+                    and len(up.args) >= 2 and isinstance(up.args[1], ast.Constant) and isinstance(up.args[1].value, str)
+                    and up.args[1].value not in SPAWN_ATTRS)
+        return isinstance(up.func, ast.Name) and up.func.id in ("isinstance", "issubclass")
+    if isinstance(up, ast.Attribute):
+        return is_module and node is up.value  # subprocess.PIPE, sp.run, ...
+    if isinstance(up, ast.Assign):
+        return node is up.value and all(isinstance(t, ast.Name) for t in up.targets)
+    if isinstance(up, ast.AnnAssign):
+        return node is up.annotation or (node is up.value and isinstance(up.target, ast.Name))
+    if isinstance(up, ast.NamedExpr):
+        return node is up.value
+    if isinstance(up, ast.arguments):
+        return True  # a default argument: bound to its parameter name by _spawn_names
+    if isinstance(up, ast.arg):
+        return node is up.annotation
+    if isinstance(up, (ast.FunctionDef, ast.AsyncFunctionDef)):
+        return node is up.returns
+    if isinstance(up, ast.Subscript):
+        return not is_module and node is up.value  # subprocess.Popen[bytes]
+    if isinstance(up, ast.Tuple) and not is_module:
+        gp = parent.get(id(up))
+        return isinstance(gp, ast.Call) and isinstance(gp.func, ast.Name) and gp.func.id in ("isinstance", "issubclass")
+    return False
+
+
+def _reference_violations(tree: ast.AST, modules: set[str], funcs: dict[str, str]) -> list[int]:
+    """Lines where the subprocess module or a spawn API appears somewhere the scan cannot follow it.
+
+    Default-deny: a reference is fine only as the callee of a call, the receiver of an attribute, the value of a plain-name
+    assignment or default argument, an annotation, or an isinstance() type. In a container, comprehension, unpacking,
+    call argument, return, yield, lambda body, starred target, ``with``/``match``/``for`` source, base class or
+    attribute target it is REPORTED, because the call that eventually spawns cannot be tied back to it by syntax.
+    """
+    parent: dict[int, ast.AST] = {}
     for node in ast.walk(tree):
-        for target, value in pairs(node):
-            bind(target, value, unresolved)
-    return modules, funcs, sorted(set(unresolved)), imported
+        for child in ast.iter_child_nodes(node):
+            parent[id(child)] = node
+    lines: list[int] = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Attribute):
+            is_ref = node.attr in SPAWN_ATTRS and isinstance(node.value, ast.Name) and node.value.id in modules
+            is_module = False
+        elif isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load):
+            is_module = node.id in modules
+            is_ref = node.id in funcs or is_module
+        else:
+            continue
+        if is_ref and not _position_ok(node, parent.get(id(node)), is_module, parent):
+            lines.append(node.lineno)
+    return sorted(set(lines))
+
+
+def _provably_hidden(expr: ast.AST, names: set[str], module_like: set[str]) -> bool:
+    """True only for a flag built ENTIRELY from accepted parts, at least one of which carries CREATE_NO_WINDOW. Nothing is evaluated.
+
+    Parts joined by ``|``: an int literal without the 0x10 bit (bool is an int, so False/True carry no hidden bit); a name or
+    attribute spelled CREATE_NO_WINDOW / _NO_WINDOW that nothing rebinds (an attribute must hang off an imported module);
+    a ``no_window_flags(...)`` call that nothing rebinds (the helper strips 0x10 itself); a name every binding of which is
+    such a flag; and ``<anything> & ~<literal with the 0x10 bit>``, which cannot carry CREATE_NEW_CONSOLE. Any other
+    part (a variable, a call, other arithmetic) makes the whole flag not provable: Windows ignores CREATE_NO_WINDOW when
+    CREATE_NEW_CONSOLE (0x10) is also set, and an unknown part could carry it.
+    """
+    hidden = False
+    stack = [expr]
+    while stack:
+        e = stack.pop()
+        if isinstance(e, ast.BinOp) and isinstance(e.op, ast.BitOr):
+            stack.extend((e.left, e.right))
+        elif isinstance(e, ast.Constant):
+            if not isinstance(e.value, int) or e.value & _CREATE_NEW_CONSOLE:
+                return False
+            hidden |= bool(e.value & _CREATE_NO_WINDOW)
+        elif isinstance(e, ast.Name):
+            if e.id not in names:
+                return False
+            hidden = True
+        elif isinstance(e, ast.Attribute):
+            if not (e.attr in _HIDDEN_NAMES and e.attr in names and isinstance(e.value, ast.Name) and e.value.id in module_like):
+                return False
+            hidden = True
+        elif isinstance(e, ast.Call):
+            f = e.func
+            helper = (isinstance(f, ast.Name) and f.id == _HELPER_NAME) or (
+                isinstance(f, ast.Attribute) and f.attr == _HELPER_NAME and isinstance(f.value, ast.Name) and f.value.id in module_like)
+            if not (helper and _HELPER_NAME in names):
+                return False
+            hidden = True
+        elif isinstance(e, ast.BinOp) and isinstance(e.op, ast.BitAnd):
+            masks = [o for o in (e.left, e.right) if isinstance(o, ast.UnaryOp) and isinstance(o.op, ast.Invert)
+                     and isinstance(o.operand, ast.Constant) and isinstance(o.operand.value, int)
+                     and o.operand.value & _CREATE_NEW_CONSOLE]
+            if not masks:
+                return False
+        else:
+            return False
+    return hidden
 
 
 def _is_no_window_definition(value: ast.AST | None, modules: set[str]) -> bool:
@@ -257,45 +282,16 @@ def _is_no_window_definition(value: ast.AST | None, modules: set[str]) -> bool:
     )
 
 
-def _provably_hidden(expr: ast.AST, names: set[str]) -> bool:
-    """True only for a form that carries CREATE_NO_WINDOW by syntax alone. No expression is ever evaluated.
+def _hidden_names(tree: ast.AST, modules: set[str]) -> tuple[set[str], set[str]]:
+    """(names whose EVERY binding is provably hidden, names bound ONLY by imports).
 
-    Accepted: an int literal (bool is an int, so False and True carry no bit) with the 0x08000000 bit; a name or
-    attribute spelled CREATE_NO_WINDOW / _NO_WINDOW that nothing in the source rebinds; a call to ``no_window_flags(...)``
-    that nothing in the source rebinds; a ``|`` any operand of which is one of those; a name every binding of which is
-    one of those. Any other arithmetic, variable or call is not provable. A ``|`` that also carries CREATE_NEW_CONSOLE
-    (0x10, a literal or a name) is never hidden: Windows ignores CREATE_NO_WINDOW when that bit is set.
-    """
-    hidden = poisoned = False
-    stack = [expr]
-    while stack:
-        e = stack.pop()
-        if isinstance(e, ast.BinOp) and isinstance(e.op, ast.BitOr):
-            stack.extend((e.left, e.right))
-        elif isinstance(e, ast.Constant):
-            if isinstance(e.value, int):
-                hidden |= bool(e.value & _CREATE_NO_WINDOW)
-                poisoned |= bool(e.value & _CREATE_NEW_CONSOLE)
-        elif isinstance(e, ast.Name):
-            hidden |= e.id in names
-            poisoned |= e.id == "CREATE_NEW_CONSOLE"
-        elif isinstance(e, ast.Attribute):
-            hidden |= e.attr in _HIDDEN_NAMES and e.attr in names
-            poisoned |= e.attr == "CREATE_NEW_CONSOLE"
-        elif isinstance(e, ast.Call):
-            f = e.func
-            if (isinstance(f, ast.Name) and f.id == _HELPER_NAME) or (isinstance(f, ast.Attribute) and f.attr == _HELPER_NAME):
-                hidden |= _HELPER_NAME in names  # the shared helper strips CREATE_NEW_CONSOLE from its argument itself
-    return hidden and not poisoned
-
-
-def _hidden_names(tree: ast.AST, modules: set[str]) -> set[str]:
-    """Names whose EVERY binding in the source is provably hidden (least fixpoint). Any other kind of binding disqualifies.
-
-    The trusted spellings (CREATE_NO_WINDOW, _NO_WINDOW, no_window_flags) are in the result only when nothing in the
-    source rebinds them (other than a plain import of the shared name) or their one definition is the standard one-liner.
+    The trusted spellings (CREATE_NO_WINDOW, _NO_WINDOW, no_window_flags) are in the first set only when nothing in the
+    source rebinds them, by any statement or by an attribute store, other than a plain import of the shared name from this
+    package, or when their one definition is the standard one-liner. The second set is what an attribute receiver
+    (``hidden_spawn.no_window_flags``, ``subprocess.CREATE_NO_WINDOW``) must come from.
     """
     binders: dict[str, list[ast.AST | None]] = {}
+    imports: set[str] = set()
     plain: set[int] = set()
     for node in ast.walk(tree):
         if isinstance(node, ast.Assign):
@@ -309,6 +305,8 @@ def _hidden_names(tree: ast.AST, modules: set[str]) -> set[str]:
     for node in ast.walk(tree):
         if isinstance(node, ast.Name) and isinstance(node.ctx, (ast.Store, ast.Del)) and id(node) not in plain:
             binders.setdefault(node.id, []).append(None)
+        elif isinstance(node, ast.Attribute) and isinstance(node.ctx, (ast.Store, ast.Del)) and node.attr in _TRUSTED_NAMES:
+            binders.setdefault(node.attr, []).append(None)  # hidden_spawn._NO_WINDOW = 0
         elif isinstance(node, ast.arg):
             binders.setdefault(node.arg, []).append(None)
         elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
@@ -320,80 +318,78 @@ def _hidden_names(tree: ast.AST, modules: set[str]) -> set[str]:
         elif isinstance(node, ast.MatchMapping) and node.rest:
             binders.setdefault(node.rest, []).append(None)
         elif isinstance(node, (ast.Import, ast.ImportFrom)):
+            own_package = isinstance(node, ast.ImportFrom) and (
+                node.level > 0 or (node.module or "").split(".")[0] in ("tools", "hidden_spawn", "core"))
             for a in node.names:
                 name = (a.asname or a.name).split(".")[0]
-                shared = name in _TRUSTED_NAMES and (a.asname is None or a.asname == a.name)
-                if not shared:  # a plain import of the shared name is how a module gets it; a renamed import is another object
-                    binders.setdefault(name, []).append(None)
+                if name in _TRUSTED_NAMES and not (own_package and a.asname in (None, a.name)):
+                    binders.setdefault(name, []).append(None)  # another module's object, or a renamed import
+                else:
+                    imports.add(name)
     names = {n for n in _TRUSTED_NAMES if n not in binders}
     changed = True
     while changed:
         changed = False
         for name, values in binders.items():
-            if name in names or any(v is None for v in values):
-                continue
-            if all((name in _HIDDEN_NAMES and _is_no_window_definition(v, modules)) or _provably_hidden(v, names) for v in values):
+            if name in names or name in imports or any(v is None for v in values):
+                continue  # an import that also assigns the same name is two objects: not provable
+            if all((name in _HIDDEN_NAMES and _is_no_window_definition(v, modules)) or _provably_hidden(v, names, imports - set(binders))
+                   for v in values):
                 names.add(name)
                 changed = True
-    return names
-
-
-def _spawn_escapes(tree: ast.AST, modules: set[str], funcs: dict[str, str], imported: set[str]) -> list[int]:
-    """Lines where a spawn API is handed to code whose calls the scan cannot follow.
-
-    Direct references only: ``helper(subprocess.run)``, ``partial(subprocess.run, ...)``, ``runner=subprocess.Popen``,
-    ``return subprocess.call``, a lambda body, and the same for a name imported with ``from subprocess import``.
-    ``isinstance``/``issubclass`` arguments, annotations and base classes are type uses, not escapes. A spawn API that
-    reaches a callee through a parameter or alias name is the scan's stated limit (lexical, one module at a time).
-    """
-    parent: dict[int, ast.AST] = {}
-    for node in ast.walk(tree):
-        for child in ast.iter_child_nodes(node):
-            parent[id(child)] = node
-    lines = []
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Attribute):
-            hit = node.attr in SPAWN_ATTRS and any(kind == "mod" for kind, _ in _carried(node.value, modules, funcs))
-        elif isinstance(node, ast.Name):
-            hit = node.id in imported and isinstance(node.ctx, ast.Load)
-        else:
-            continue
-        if not hit:
-            continue
-        up = parent.get(id(node))
-        if isinstance(up, ast.keyword):
-            up = parent.get(id(up))
-            escapes = isinstance(up, ast.Call)
-        elif isinstance(up, ast.Call):
-            escapes = node is not up.func and not (isinstance(up.func, ast.Name) and up.func.id in ("isinstance", "issubclass"))
-        else:
-            escapes = isinstance(up, (ast.Return, ast.Yield, ast.YieldFrom, ast.Lambda, ast.Await))
-        if escapes:
-            lines.append(node.lineno)
-    return sorted(set(lines))
+    return names, imports - set(binders)
 
 
 def _unflagged_spawns_in_source(source: str, label: str) -> list[str]:
     tree = ast.parse(source, filename=label)
-    modules, funcs, unresolved, imported = _spawn_names(tree)
-    hidden = _hidden_names(tree, modules)
-    bad = [f"{label}:{line} binds a subprocess spawn API where its calls cannot be followed" for line in unresolved]
-    bad += [f"{label}:{line} hands a subprocess spawn API to code whose calls cannot be followed"
-            for line in _spawn_escapes(tree, modules, funcs, imported)]
+    modules, funcs, _imported = _spawn_names(tree)
+    hidden, module_like = _hidden_names(tree, modules)
+    bad = [f"{label}:{line} uses the subprocess module or a spawn API where its calls cannot be followed"
+           for line in _reference_violations(tree, modules, funcs)]
     for node in ast.walk(tree):
         if not isinstance(node, ast.Call):
             continue
-        attrs = [what for kind, what in _carried(node.func, modules, funcs) if kind == "fn"]
-        if not attrs:
+        fn = node.func
+        if isinstance(fn, ast.Attribute) and fn.attr in SPAWN_ATTRS and isinstance(fn.value, ast.Name) and fn.value.id in modules:
+            shown = f"subprocess.{fn.attr}"
+        elif isinstance(fn, ast.Name) and fn.id in funcs:
+            shown = f"{fn.id} (= subprocess.{funcs[fn.id]})"
+        else:
             continue
-        shown = f"subprocess.{attrs[0]}" if isinstance(node.func, ast.Attribute) and node.func.attr == attrs[0] \
-            else f"{_label(node.func)} (= subprocess.{attrs[0]})"
         flags = [kw for kw in node.keywords if kw.arg == "creationflags"]
-        if flags and all(_provably_hidden(kw.value, hidden) for kw in flags):
+        if flags and all(_provably_hidden(kw.value, hidden, module_like) for kw in flags):
             continue
         why = "creationflags= is not provably CREATE_NO_WINDOW" if flags else "has no creationflags="
         bad.append(f"{label}:{node.lineno} {shown}(...) {why}")
     return bad
+
+
+_STRING_QUOTES_RE = re.compile(r"'[^']*'|\"[^\"]*\"")
+_WINDOW_STYLE_HIDDEN_RE = re.compile(r"-WindowStyle[\s:]+Hidden\b", re.IGNORECASE)
+
+
+def _start_process_violations(py_source: str) -> tuple[int, list[int]]:
+    """(number of PowerShell ``Start-Process ... powershell`` statements, lines of those lacking an outer -WindowStyle Hidden).
+
+    Reads the module's string constants (so a comment never counts), splits each into PowerShell lines, and judges every
+    line holding ``Start-Process`` and ``powershell``. Quoted text is blanked before ``-WindowStyle Hidden`` is looked
+    for, so the words inside an -ArgumentList value (``'Write-Host -WindowStyle Hidden'``) do not satisfy the check.
+    """
+    found, bad = 0, []
+    for node in ast.walk(ast.parse(py_source)):
+        if not (isinstance(node, ast.Constant) and isinstance(node.value, str)) or "start-process" not in node.value.lower():
+            continue
+        for ps_line in node.value.split("\n"):
+            lowered = ps_line.lower()
+            at = lowered.find("start-process")
+            while at != -1:
+                statement = ps_line[at:]  # adjacent python string pieces are one constant, so a fixture is one line here
+                if "powershell" in statement.lower():
+                    found += 1
+                    if not _WINDOW_STYLE_HIDDEN_RE.search(_STRING_QUOTES_RE.sub("''", statement)):
+                        bad.append(node.lineno)
+                at = lowered.find("start-process", at + 1)
+    return found, bad
 
 
 def _unflagged_spawns(rel: str) -> list[str]:
@@ -441,15 +437,9 @@ class NamedTestFixtureTests(unittest.TestCase):
 
     def test_host_load_gate_start_process_fixtures_are_hidden(self):
         src = (ROOT / "tools/repo_hygiene/test_playback_host_load_gate.py").read_text(encoding="utf-8")
-        starts = [m.start() for m in _START_PROCESS_POWERSHELL_RE.finditer(src)]
-        self.assertGreaterEqual(len(starts), 3, "expected the three run.ps1 Start-Process fixtures")
-        bad = []
-        for pos in starts:
-            end = src.find("-PassThru", pos)
-            end = end if end != -1 else pos + 400  # a fixture without -PassThru is still checked, over a bounded window
-            if "-WindowStyle Hidden" not in src[pos:end]:
-                bad.append(f"test_playback_host_load_gate.py:{src.count(chr(10), 0, pos) + 1}")
-        self.assertEqual(bad, [], "Start-Process powershell.exe without -WindowStyle Hidden: " + ", ".join(bad))
+        found, bad = _start_process_violations(src)
+        self.assertGreaterEqual(found, 3, "expected the three run.ps1 Start-Process fixtures")
+        self.assertEqual(bad, [], "Start-Process powershell.exe without -WindowStyle Hidden at python line(s): " + ", ".join(map(str, bad)))
 
 
 class ScannerHardeningTests(unittest.TestCase):
@@ -546,12 +536,16 @@ class ScannerFalseCleanTests(unittest.TestCase):
         clean = (
             "0x08000000", "0x08004000", "134217728", "subprocess.CREATE_NO_WINDOW", "_NO_WINDOW", "core._NO_WINDOW",
             "no_window_flags()", "hidden_spawn.no_window_flags(0x20)", "0x20 | subprocess.CREATE_NO_WINDOW",
-            "_NO_WINDOW | kwargs.pop('creationflags', 0)", "(0x20 | 0x4000) | no_window_flags()",
+            "_NO_WINDOW | (kwargs.pop('creationflags', 0) & ~0x10)", "(0x20 | 0x4000) | no_window_flags()",
         )
+        head = "import subprocess\nfrom tools.repo_hygiene import core, hidden_spawn\n"
         for api in sorted(SPAWN_ATTRS):
             for value in clean:
-                src = f"import subprocess\nsubprocess.{api}(['x'], creationflags={value})\n"
+                src = f"{head}subprocess.{api}(['x'], creationflags={value})\n"
                 self.assertEqual(self._bad(src), [], (api, value))
+        for value in ("_NO_WINDOW | kwargs.pop('creationflags', 0)", "_NO_WINDOW | extra", "_NO_WINDOW | f()", "_NO_WINDOW & 0x4000",
+                      "_NO_WINDOW + 0", "_NO_WINDOW | (x & ~0x20)", "_NO_WINDOW | (x & 0x10)"):
+            self.assertEqual(len(self._bad(f"{head}subprocess.run(['x'], creationflags={value})\n")), 1, value)
 
     def test_a_flag_name_is_hidden_only_when_every_binding_of_it_is_hidden(self):
         ok = "import subprocess\nflags = no_window_flags()\nsubprocess.run(['x'], creationflags=flags)\n"
@@ -594,13 +588,27 @@ class ScannerFalseCleanTests(unittest.TestCase):
         }
         for label, src in unhidden.items():
             self.assertGreaterEqual(len(self._bad(src)), 1, label)
-        for label in ("tuple", "list", "chained", "walrus", "for loop", "or", "subscript", "star import"):
+        # Only DIRECT bindings are followed, so only those can be made clean by a hidden flag on the call.
+        for label in ("chained", "walrus", "star import"):
             hidden = unhidden[label].replace("(['x'])", "(['x'], creationflags=_NO_WINDOW)")
             self.assertEqual(self._bad(hidden), [], label)
+        # Anything that wraps the spawn API is reported even when the eventual call is hidden: the call is not tied back by syntax.
+        for label in ("tuple", "list", "for loop", "or", "subscript", "starred", "nested", "dict value", "module in tuple"):
+            wrapped = unhidden[label].replace("(['x'])", "(['x'], creationflags=_NO_WINDOW)")
+            self.assertGreaterEqual(len(self._bad(wrapped)), 1, label)
 
-    def test_a_tuple_binding_does_not_taint_its_other_elements(self):
-        self.assertEqual(self._bad("import subprocess\na, b = subprocess.run, len\nb(['x'])\n"), [])
-        self.assertEqual(self._bad("import subprocess\nx = subprocess.CompletedProcess(['x'], 0)\ny = (x, 1)\n"), [])
+    def test_a_non_spawn_use_of_the_module_is_not_an_escape(self):
+        fine = (
+            "import subprocess\nx = subprocess.CompletedProcess(['x'], 0)\ny = (x, 1)\n",
+            "import subprocess\nhelper(subprocess.PIPE, subprocess.TimeoutExpired)\n",
+            "import subprocess, os\n_NO_WINDOW = getattr(subprocess, 'CREATE_NO_WINDOW', 0) if os.name == 'nt' else 0\n",
+            "import subprocess\ntry:\n    pass\nexcept subprocess.TimeoutExpired:\n    pass\n",
+        )
+        for src in fine:
+            self.assertEqual(self._bad(src), [], src)
+        for src in ("import subprocess\ngetattr(subprocess, 'run')(['x'])\n", "import subprocess\ngetattr(subprocess, name)(['x'])\n",
+                    "import subprocess\nhelper(subprocess)\n", "import subprocess\nmods = [subprocess]\n"):
+            self.assertGreaterEqual(len(self._bad(src)), 1, src)
 
     def test_no_expression_is_ever_evaluated_and_hostile_arithmetic_is_reported_fast(self):
         import builtins
@@ -707,16 +715,15 @@ class AdversaryR3Tests(unittest.TestCase):
             src = f"import subprocess\nflags = 0x08000000\n{rebind}\nsubprocess.run(['x'], creationflags=flags)\n"
             self.assertEqual(len(self._bad(src)), 1, rebind)
 
-    # A5: a module alias held in a container or conditional is still the module.
-    def test_a5_a_module_reached_through_a_container_is_resolved(self):
+    # A5: a module alias held in a container, conditional or call argument is reported (default-deny), never followed.
+    def test_a5_a_module_reached_through_a_container_is_reported(self):
         for recv in ("mods[0]", "[subprocess][0]", "(subprocess or x)", "(subprocess if a else x)", "{'m': subprocess}['m']"):
-            src = f"import subprocess\nmods = [subprocess]\n{recv}.run(['x'])\n"
-            self.assertEqual(len(self._bad(src)), 1, recv)
-            ok = f"import subprocess\nmods = [subprocess]\n{recv}.run(['x'], creationflags=_NO_WINDOW)\n"
-            self.assertEqual(self._bad(ok), [], recv)
+            for call in ("['x']", "['x'], creationflags=_NO_WINDOW"):
+                src = f"import subprocess\nmods = [subprocess]\n{recv}.run({call})\n"
+                self.assertGreaterEqual(len(self._bad(src)), 1, (recv, call))
 
     # A6: spawn APIs that travel by dict key, context manager, match capture, call argument or return are reported.
-    def test_a6_a_spawn_api_that_escapes_is_resolved_or_reported(self):
+    def test_a6_a_spawn_api_that_escapes_is_reported(self):
         escapes = {
             "dict key": "import subprocess\nd = {subprocess.run: 1}\nfor r in d:\n    r(['x'])\n",
             "with item": "import subprocess, contextlib\nwith contextlib.nullcontext(subprocess.run) as r:\n    r(['x'])\n",
@@ -728,6 +735,13 @@ class AdversaryR3Tests(unittest.TestCase):
             "return": "import subprocess\ndef pick():\n    return subprocess.check_output\n",
             "yield": "import subprocess\ndef pick():\n    yield subprocess.call\n",
             "imported name argument": "from subprocess import Popen\nhelper(Popen)\n",
+            "alias passed on": "import subprocess\nr = subprocess.run\nhelper(r)\n",
+            "dict comprehension": "import subprocess\nrunners = {k: subprocess.run for k in ('run',)}\nrunners['run'](['x'])\n",
+            "list argument": "import subprocess\ndef launch(runners):\n    runners[0](['x'])\nlaunch([subprocess.run])\n",
+            "returned dict": "import subprocess\ndef pick():\n    return {'run': subprocess.run}\npick()['run'](['x'])\n",
+            "starred attribute target": "import subprocess\nbox.r, *rest = [subprocess.run]\nbox.r(['x'])\n",
+            "class base": "import subprocess\nclass P(subprocess.Popen):\n    pass\nP(['x'])\n",
+            "lambda body": "import subprocess\nf = lambda: subprocess.run\nf()(['x'])\n",
         }
         for label, src in escapes.items():
             self.assertGreaterEqual(len(self._bad(src)), 1, label)
@@ -735,28 +749,70 @@ class AdversaryR3Tests(unittest.TestCase):
             "isinstance": "import subprocess\nisinstance(p, subprocess.Popen)\n",
             "issubclass": "import subprocess\nissubclass(t, (subprocess.Popen, int))\n",
             "annotation": "import subprocess\ndef f(p: subprocess.Popen) -> subprocess.Popen:\n    q: subprocess.Popen = p\n    return q\n",
-            "module argument": "import subprocess\nhelper(subprocess)\nx = subprocess.CompletedProcess(['x'], 0)\n",
             "non-spawn attribute": "import subprocess\nhelper(subprocess.PIPE, subprocess.TimeoutExpired)\n",
+            "default runner": "import subprocess\ndef f(runner=subprocess.run):\n    return runner(['x'], creationflags=_NO_WINDOW)\n",
         }
         for label, src in fine.items():
             self.assertEqual(self._bad(src), [], label)
 
-    # A1 (scanner side): no accepted expression may carry CREATE_NEW_CONSOLE.
+    # A1 (scanner side): no accepted expression may carry CREATE_NEW_CONSOLE, and an UNKNOWN part is not provably free of it.
     def test_a1_scanner_rejects_create_new_console_in_any_accepted_form(self):
         for value in ("0x08000010", "0x10 | 0x08000000", "subprocess.CREATE_NEW_CONSOLE | subprocess.CREATE_NO_WINDOW",
-                      "CREATE_NEW_CONSOLE | _NO_WINDOW", "_NO_WINDOW | 0x10", "0x08004010", "_NO_WINDOW | CREATE_NEW_CONSOLE | 0x20"):
+                      "CREATE_NEW_CONSOLE | _NO_WINDOW", "_NO_WINDOW | 0x10", "0x08004010", "_NO_WINDOW | CREATE_NEW_CONSOLE | 0x20",
+                      "subprocess.CREATE_NO_WINDOW | extra", "subprocess.CREATE_NO_WINDOW | opts.pop('creationflags', 0)",
+                      "(8 + 8) | _NO_WINDOW", "_NO_WINDOW | (x & 0x10)"):
             self.assertEqual(len(self._run(value)), 1, value)
-        for value in ("no_window_flags(0x10)", "hidden_spawn.no_window_flags(subprocess.CREATE_NEW_CONSOLE)", "_NO_WINDOW | 0x4000"):
-            self.assertEqual(self._run(value), [], value)
+        head = "import subprocess\nfrom tools.repo_hygiene import hidden_spawn\n"
+        for value in ("no_window_flags(0x10)", "hidden_spawn.no_window_flags(subprocess.CREATE_NEW_CONSOLE)", "_NO_WINDOW | 0x4000",
+                      "_NO_WINDOW | (x & ~0x10)"):
+            self.assertEqual(_unflagged_spawns_in_source(f"{head}subprocess.run(['x'], creationflags={value})\n", "s.py"), [], value)
 
-    # A7: the fixture guard finds a Start-Process powershell fixture in any quoting/case/arg-order spelling.
-    def test_a7_the_start_process_fixture_pattern_covers_other_spellings(self):
-        for text in ("Start-Process -FilePath 'powershell.exe' -PassThru", "Start-Process -FilePath PowerShell.exe -PassThru",
-                     'Start-Process -FilePath "powershell" -PassThru', "start-process powershell.exe -PassThru",
-                     "Start-Process -FilePath 'C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe' -PassThru"):
-            self.assertIsNotNone(_START_PROCESS_POWERSHELL_RE.search(text), text)
-        for text in ("Start-Process -FilePath 'notepad.exe'", "# Start-Process lives in this module", "Stop-Process -Name powershell"):
-            self.assertIsNone(_START_PROCESS_POWERSHELL_RE.search(text), text)
+    # Pass-5 reproductions (review-adversary-MLV-LANE-CONSOLE-HIDDEN-1-r3-e8e7da15), verbatim.
+    def test_pass5_reproductions_are_reported(self):
+        cases = {
+            "A1 extra variable": "import subprocess\nextra = 0x10\nsubprocess.run(['cmd.exe', '/c', 'exit'], creationflags=subprocess.CREATE_NO_WINDOW | extra)\n",
+            "A1 popped flag": "import subprocess\nsubprocess.run(['cmd.exe', '/c', 'exit'], creationflags=subprocess.CREATE_NO_WINDOW | opts.pop('creationflags', 0))\n",
+            "A1 arithmetic": "import subprocess\nsubprocess.run(['cmd.exe', '/c', 'exit'], creationflags=subprocess.CREATE_NO_WINDOW | (8 + 8))\n",
+            "A2 namespace": "import subprocess\nfrom types import SimpleNamespace\nflags = SimpleNamespace()\nflags._NO_WINDOW = 0\nsubprocess.run(['cmd.exe', '/c', 'exit'], creationflags=flags._NO_WINDOW)\n",
+            "A2 CREATE_NO_WINDOW attribute": "import subprocess\nfrom types import SimpleNamespace\nflags = SimpleNamespace()\nflags.CREATE_NO_WINDOW = 0\nsubprocess.run(['cmd.exe'], creationflags=flags.CREATE_NO_WINDOW)\n",
+            "A2 helper attribute": "import subprocess\nfrom types import SimpleNamespace\nflags = SimpleNamespace()\nflags.no_window_flags = lambda: 0\nsubprocess.run(['cmd.exe'], creationflags=flags.no_window_flags())\n",
+            "A2 annotated attribute": "import subprocess\nfrom tools.repo_hygiene import hidden_spawn\nhidden_spawn._NO_WINDOW: int = 0\nsubprocess.run(['cmd.exe'], creationflags=hidden_spawn._NO_WINDOW)\n",
+            "A3 dict comprehension": "import subprocess\nrunners = {k: subprocess.run for k in ('run',)}\nrunners['run'](['cmd.exe', '/c', 'exit'])\n",
+            "A4 starred attribute target": "import subprocess\nfrom types import SimpleNamespace\nbox = SimpleNamespace()\nbox.r, *rest = [subprocess.run]\nbox.r(['cmd.exe', '/c', 'exit'])\n",
+            "A5 list argument": "import subprocess\ndef launch(runners):\n    runners[0](['cmd.exe', '/c', 'exit'])\nlaunch([subprocess.run])\n",
+            "A5 returned dict": "import subprocess\ndef pick():\n    return {'run': subprocess.run}\npick()['run'](['cmd.exe', '/c', 'exit'])\n",
+        }
+        for label, src in cases.items():
+            self.assertGreaterEqual(len(self._bad(src)), 1, label)
+
+    # A6 and A7: the Start-Process fixture check reads python string constants, ignores quoted text, and needs the outer parameter.
+    def test_a6_a7_the_start_process_fixture_check_is_not_fooled(self):
+        def judge(ps: str) -> tuple[int, list[int]]:
+            return _start_process_violations("x = " + repr(ps) + "\n")
+
+        self.assertEqual(judge("$p = Start-Process -FilePath 'powershell.exe' -ArgumentList '-c','exit' -WindowStyle Hidden -PassThru\n"), (1, []))
+        self.assertEqual(judge("$p = Start-Process -PassThru -WindowStyle Hidden -FilePath 'powershell.exe'\n"), (1, []))
+        self.assertEqual(judge("Start-Process powershell.exe -windowstyle:hidden\n"), (1, []))
+        for ps in (
+            "Start-Process -PassThru -FilePath 'powershell.exe' -ArgumentList '-NoProfile','-Command','exit'",  # A6: reordered, no style
+            "Start-Process -FilePath 'powershell.exe'",  # A6: ends exactly at the executable
+            "Start-Process -FilePath PowerShell.exe -ArgumentList 'x'",
+            "Start-Process -FilePath 'powershell.exe' -ArgumentList '-NoProfile','-Command','Write-Host -WindowStyle Hidden' -PassThru",  # A7
+            'Start-Process -FilePath "powershell.exe" -ArgumentList "-Command","-WindowStyle Hidden"',
+            "$x = Start-Process -FilePath 'C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe' -PassThru",
+        ):
+            found, bad = judge(ps + "\n")
+            self.assertEqual((found, len(bad)), (1, 1), ps)
+        self.assertEqual(judge("Start-Process -FilePath 'notepad.exe'\n"), (0, []))
+        self.assertEqual(_start_process_violations("# Start-Process powershell.exe without a style\nx = 1\n"), (0, []))
+
+    # The default-deny reference rule is O(source): a long chain of attribute/name uses does not blow up.
+    def test_a_long_source_is_scanned_in_linear_time(self):
+        import time
+        body = "import subprocess\n" + "".join(f"x{i} = subprocess.CompletedProcess(['x'], 0)\n" for i in range(3000))
+        t0 = time.perf_counter()
+        self.assertEqual(self._bad(body), [])
+        self.assertLess(time.perf_counter() - t0, 5.0)
 
 
 class SpawnSiteBehaviourTests(unittest.TestCase):
