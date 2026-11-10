@@ -425,7 +425,7 @@ def _flatten(node: ast.AST, consts: dict[str, str], depth: int = 0) -> tuple[str
     node = _bound_form(node, consts)
     if isinstance(node, ast.Constant):
         if isinstance(node.value, bytes):
-            return node.value.decode("utf-8", "replace"), True  # b'subprocess_' + b'exec' read as the text it spells
+            return node.value.decode("latin-1"), True  # b'subprocess_' + b'exec' read as the text it spells, one character per byte (pass-24 A2)
         return (node.value, True) if isinstance(node.value, str) else (_WILD, False)  # a number can print as any character (`{115:c}`)
     if isinstance(node, ast.Name):
         value = consts.get(node.id) if isinstance(node.ctx, ast.Load) else None
@@ -542,8 +542,14 @@ def _flatten(node: ast.AST, consts: dict[str, str], depth: int = 0) -> tuple[str
     if isinstance(node, ast.Dict) and all(k is not None for k in node.keys):
         return "".join(_flatten(e, consts, depth + 1)[0] for pair in zip(node.keys, node.values) for e in pair), False  # a mapping: its keys and values side by side
     if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr in ("decode", "encode"):
-        text, known = _flatten(node.func.value, consts, depth + 1)  # bytes and text read the same here; an explicit codec may change the characters
-        return text, known and not node.args and not node.keywords
+        text, known = _flatten(node.func.value, consts, depth + 1)  # bytes are read one character per byte (latin-1), so a slice of them cuts where Python cuts
+        codec = _flatten(node.args[0], consts, depth + 1) if node.args else ("utf-8", True)
+        if node.keywords or len(node.args) > 1 or not codec[1] or codec[0].lower().replace("_", "-") not in ("utf-8", "utf8", "ascii", "us-ascii", "latin-1", "latin1", "iso-8859-1"):
+            # a codec that rewrites characters (`unicode_escape` turns `\x5f` into `_`) or one the fold cannot read: every escape sequence is any text
+            return re.sub(r"\\(?:x[0-9a-fA-F]{2}|u[0-9a-fA-F]{4}|U[0-9a-fA-F]{8}|N\{[^}]*\}|[0-7]{1,3}|.)", _WILD, text, flags=re.DOTALL), False
+        if node.func.attr == "decode" and not text.isascii():  # utf-8 would join the bytes of a non-ASCII character into one
+            return re.sub(r"[^\x00-\x7f]", _WILD, text), False
+        return text, known
     if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "reversed" and len(node.args) == 1 and not node.keywords:
         text, known = _flatten(node.args[0], consts, depth + 1)  # the characters of a text, backwards (only ever read by a ``''.join``)
         return text[::-1], known
@@ -1596,8 +1602,35 @@ def _quoted_spans(text: str) -> list[tuple[int, int]]:
     return spans
 
 
+def _comment_continuations_dropped(script: str) -> str:
+    """A backtick at the end of a ``#`` comment line is comment text, not a line continuation: the next line is a new statement (pass-24 A3)."""
+    spans = dict(_quoted_spans(script))
+    out, i, n = [], 0, len(script)
+    while i < n:
+        if i in spans:
+            out.append(script[i:spans[i] + 1])
+            i = spans[i] + 1
+        elif script.startswith("<#", i):
+            end = script.find("#>", i + 2)
+            end = n if end == -1 else end + 2
+            out.append(script[i:end])
+            i = end
+        elif script[i] == "#" and (i == 0 or script[i - 1].isspace() or script[i - 1] in ";|{}("):
+            end = script.find("\n", i)
+            end = n if end == -1 else end
+            line = script[i:end]
+            body = line.rstrip("\r")
+            out.append(body[:-1] + line[len(body):] if body.endswith("`") else line)  # the trailing backtick goes; the newline stays a statement break
+            i = end
+        else:
+            out.append(script[i])
+            i += 1
+    return "".join(out)
+
+
 def _ps_statements(script: str) -> list[str]:
     """Split a PowerShell script into statements: on ; | { } and newlines outside quotes, comments dropped, backtick-newline joined."""
+    script = _comment_continuations_dropped(script)
     # mid-word: `foo`<LF>-WindowStyle:Hidden` is ONE argument, not a parameter. A continuation whose next line starts with white space is a separator
     # (`-WindowStyle Hidden`<LF> -Wait` ends the value at Hidden, G18), so only a continuation that glues two non-space characters is marked.
     script = re.sub(r"(?<=\S)`\r?\n(?=\S)", "\x02", script)
@@ -4146,6 +4179,37 @@ class AdversaryR9Tests(unittest.TestCase):
             self.assertEqual(self._ps(expr), (1, 1), expr)
         for expr in ("(prefix + 'value{tail}').format(tail='')", "(prefix + '{}x').format('')", "(prefix + '%s: %d') % (a, b)", "(prefix + '{} {}').format(a, b)"):
             self.assertEqual(self._bad(self._launch(expr)), [], expr)
+
+    # ---- pass 24 (review-adversary-MLV-LANE-CONSOLE-HIDDEN-1-r9-d5971734) A1-A3, as classes ----
+    def test_pass24_a1_a_codec_that_rewrites_characters_does_not_hide_a_name(self):
+        for expr in ("br'subprocess\\x5fexec'.decode('unicode_escape')", "b'subprocess\\\\x5fexec'.decode('unicode_escape')", "br'subprocess\\u005fexec'.decode(encoding='unicode_escape')",
+                     "br'subprocess\\137exec'.decode('unicode_escape')", "br'sub\\x70rocess_exec'.decode('raw_unicode_escape')", "b'subprocess_exec'.decode('utf-16')",
+                     "'subprocess\\\\x5fexec'.encode().decode('unicode_escape')"):
+            self.assertGreaterEqual(len(self._bad(self._launch(expr))), 1, expr)
+        for expr in ("br'Sta\\x72t-Process cmd.exe'.decode('unicode_escape')", "br'saps cmd.exe'.decode('unicode_escape')", "br'sa\\x70s cmd.exe'.decode('raw_unicode_escape')"):
+            self.assertEqual(self._ps(expr), (1, 1), expr)
+        for expr in ("b'value\\x5fx'.decode('unicode_escape')", "b'abc'.decode('ascii')"):
+            self.assertEqual(self._bad(self._launch(expr)), [], expr)
+
+    def test_pass24_a2_bytes_are_cut_where_python_cuts_them(self):
+        for expr in ("b'\\xc3\\xa9subprocess_exec'[2:].decode()", "b'\\xc3\\xa9subprocess_exec'[2:].decode('utf-8')", "b'\\xffsubprocess_exec'[1:].decode()", "b'\\xff\\xfesubprocess_exec'[2:].decode('latin-1')",
+                     "(b'\\xc3\\xa9subprocess_exec%s' % b'')[2:].decode()", "(b'\\xc3\\xa9{}subprocess_exec').replace(b'{}', b'')[2:].decode()"):
+            self.assertGreaterEqual(len(self._bad(self._launch(expr))), 1, expr)
+        self.assertEqual(_flatten(ast.parse("b'\\xc3\\xa9subprocess_exec'[2:].decode('latin-1')", mode="eval").body, {}), ("subprocess_exec", True))
+        self.assertEqual(self._ps("b'\\xc3\\xa9Start-Process cmd.exe'[2:].decode()"), (1, 1))
+        for expr in ("b'\\xc3\\xa9value'[2:].decode()", "b'abc'[1:].decode()"):
+            self.assertEqual(self._bad(self._launch(expr)), [], expr)
+
+    def test_pass24_a3_a_backtick_at_the_end_of_a_comment_is_not_a_continuation(self):
+        for script in ("# comment `\nStart-Process cmd.exe", "# c `\r\nStart-Process cmd.exe", "<# block #>\n# note `\nsaps cmd.exe", "$x = 1 # trailing `\nStart-Process cmd.exe",
+                       "# a `\n# b `\nStart-Process cmd.exe"):
+            self.assertEqual(_judge_script(script), (1, 1), script)
+            self.assertEqual(self._ps(repr(script)), (1, 1), script)
+        for script in ("# comment `\nStart-Process cmd.exe -WindowStyle Hidden", "Write-Host 'a #b `'\nStart-Process cmd.exe -WindowStyle Hidden"):
+            self.assertEqual(_judge_script(script), (1, 0), script)
+        # a real continuation still joins: the comment character is inside the next line, which is a continuation of this one
+        self.assertEqual(_judge_script("Start-Process cmd.exe `\n -WindowStyle Hidden"), (1, 0))
+        self.assertEqual(_judge_script("Start-Process cmd.exe -WindowStyle Hidden `\n -Wait # done"), (1, 0))
 
     # ---- G16: the docstring names the fold set, not an example of an unread form ----
     def test_g16_the_powershell_limit_points_at_the_fold_set_and_does_not_call_chr_unread(self):
