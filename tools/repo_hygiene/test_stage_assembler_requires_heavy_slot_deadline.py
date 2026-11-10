@@ -89,14 +89,20 @@ class AssemblerRequiresHeavySlotDeadlineTests(unittest.TestCase):
         self.assertNotIn("STAGE_NO_HEAVY_SLOT_DEADLINE", done.stdout)
 
     def test_an_already_passed_deadline_is_not_a_refusal_here(self) -> None:
-        # The deadline's value is the guard's to judge (a passed one is --wait 0); this check is only "was one given".
+        # The deadline's value is the guard's to judge (a passed one is a single --wait 0 attempt, bounded, not the 60 min default); this check is only "was one given".
         done = self._run("2000-01-01T00:00:00Z")
         self.assertEqual(done.returncode, 3, done.stdout + done.stderr)
         self.assertNotIn("STAGE_NO_HEAVY_SLOT_DEADLINE", done.stdout)
 
     def test_the_check_runs_before_the_first_step_that_writes_or_queues(self) -> None:
         text = ASSEMBLER.read_text(encoding="utf-8")
-        check = text.index("STAGE_NO_HEAVY_SLOT_DEADLINE")
+        # Anchor on the EXECUTABLE statement, not the first mention of the token (the exit-code header comment also names it; adversary e7265eea-A1).
+        gate = "if ([string]::IsNullOrWhiteSpace($env:MLV_HEAVY_SLOT_DEADLINE_UTC)) {"
+        self.assertEqual(text.count(gate), 1, "exactly one executable deadline gate")
+        check = text.index(gate)
+        block = text[check:text.index("\n}\n", check)]
+        self.assertIn("STAGE_NO_HEAVY_SLOT_DEADLINE", block)
+        self.assertIn("Complete-Failed 27 'heavySlotDeadline'", block, "the gate ends the run")
         for later in ("New-AttrCudaOwnedRoot", "git -C $RepoRoot archive", "Invoke-BuildGuard -Label", "New-Item -ItemType Directory -Path $OutDir"):
             self.assertIn(later, text, later)
             self.assertLess(check, text.index(later), f"the refusal must come before: {later}")

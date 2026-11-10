@@ -94,8 +94,9 @@ function Complete-Failed([int]$Code, [string]$Step, [string]$Message) {
 # is build-guard's 60 min default, and a refused waiter's retry is a NEW ticket, the youngest in the queue, so the venue starves (2026-11-10: lane-local
 # stage-chain.ps1 / stage-one.ps1 copies called this script without MLV_HEAVY_SLOT_DEADLINE_UTC). So a run without a deadline stops HERE, typed, before
 # it writes anything or takes a ticket. The route is tools\profiling\dual-venue\Invoke-VenueStageChain.ps1 (or the nightly), which set the variable in
-# this process's environment. Only "was one given" is judged here; build-guard judges the value (a passed deadline is --wait 0, an unparsable one is
-# BUILD_HEAVY_SLOT_REFUSED reason=invalid-option, both before any ticket). There is deliberately still no deadline parameter (see the guard call below).
+# this process's environment. Only "was one given" is judged here; build-guard judges the value (an unparsable one is
+# BUILD_HEAVY_SLOT_REFUSED reason=invalid-option before any ticket; a passed one is a single --wait 0 attempt, which still takes a ticket and
+# is admitted only if the slot is free right then: it is bounded, never the 60 min default; adversary e7265eea-A2). There is deliberately still no deadline parameter (see the guard call below).
 if ([string]::IsNullOrWhiteSpace($env:MLV_HEAVY_SLOT_DEADLINE_UTC)) {
     Write-Output 'STAGE_NO_HEAVY_SLOT_DEADLINE reason=env-MLV_HEAVY_SLOT_DEADLINE_UTC-absent-or-blank route=tools\profiling\dual-venue\Invoke-VenueStageChain.ps1'
     Complete-Failed 27 'heavySlotDeadline' 'MLV_HEAVY_SLOT_DEADLINE_UTC is not set: without a deadline the heavy-slot wait is a 60 min default and every retry re-queues as the youngest ticket. Stage through tools\profiling\dual-venue\Invoke-VenueStageChain.ps1 -DeadlineUtc <ISO-8601>, or set MLV_HEAVY_SLOT_DEADLINE_UTC for a manual run.'
