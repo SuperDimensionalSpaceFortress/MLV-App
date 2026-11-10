@@ -47,6 +47,7 @@
 #include <vector>
 
 #include "PlaybackNativePaceGuard.h"
+#include "PlaybackTexturePresentSplit.h"
 
 namespace playback_slip
 {
@@ -238,6 +239,10 @@ struct PresentSample
     double uiLatencyMs = 0.0;       // present UI-signal latency
     int timelinePosition = 0;       // the slider after this present's own early advance
     bool lookaheadCovered = false;  // the presented frame was already requested by the lookahead
+    // HFR-NATIVE-M16-1457-GUI-TEXTURE-PRESENT-OFFLOAD-1 K1: this present's texture-present parts (textureKnown: a
+    // texture presenter ran for it)
+    bool textureKnown = false;
+    playback_texture_split::Sample texture;
 };
 
 struct SlipRecord
@@ -265,6 +270,8 @@ struct SlipRecord
     bool afterGap = false;          // the PREVIOUS present interval was >= kGapIntervalMs (a stall's aftermath)
     double presentMs = 0.0;
     int timelineAdvancedInInterval = 0;
+    bool textureKnown = false;      // K1: the slip's present carries its texture-present parts
+    playback_texture_split::Sample texture;
 };
 
 struct Summary
@@ -329,6 +336,12 @@ struct Summary
     SetupBucket presentSetupMaxBucket = SetupBucket::None;
     int lutRebuildsAfterFirst = 0;
     std::vector<std::pair<std::string, long long>> lutMissFields;   // group -> rebuilds, in first-seen order
+    // HFR-NATIVE-M16-1457-GUI-TEXTURE-PRESENT-OFFLOAD-1 K1: the texture-present parts of the slip presents, per path
+    // (gui_late ones, and every class), over ALL slips (not only the kept slipLines).
+    std::array<playback_texture_split::PartSums, static_cast<int>( playback_texture_split::Path::Count )>
+        textureGuiLateSlips {};
+    std::array<playback_texture_split::PartSums, static_cast<int>( playback_texture_split::Path::Count )>
+        textureAllSlips {};
 };
 
 class SlipHistogram
@@ -498,6 +511,8 @@ public:
             r.presentMs = s.presentMs;
             r.timelineAdvancedInInterval = advanced;
             r.afterGap = m_previousIntervalWasGap;
+            r.textureKnown = s.textureKnown;
+            r.texture = s.texture;
             m_slips.push_back( r );
             slipIndex = static_cast<int>( m_slips.size() ) - 1;
         }
@@ -619,6 +634,12 @@ public:
             {
                 ++out.slipEventsAfterGap;
                 out.slipsAfterGap += r.size;
+            }
+            if( r.textureKnown && r.texture.path != playback_texture_split::Path::Count )
+            {
+                const size_t path = static_cast<size_t>( r.texture.path );
+                out.textureAllSlips[path].add( r.texture );
+                if( r.cls == SlipClass::GuiLate ) out.textureGuiLateSlips[path].add( r.texture );
             }
             if( static_cast<int>( i ) == m_maxIntervalSlipIndex ) out.maxIntervalClass = r.cls;
             if( static_cast<int>( out.slipLines.size() ) < kMaxSlipLines ) out.slipLines.push_back( r );

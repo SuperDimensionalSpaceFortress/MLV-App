@@ -1390,6 +1390,7 @@ bool RenderFrameThread::isIdleExceptPlaybackLookaheadLocked( int activePlaybackT
 void RenderFrameThread::resetPipelineOverlapMeter( void )
 {
     m_overlapMeter.reset( mlv_stage_timing_now() * 1000.0 );
+    m_retainedDeviceBayer16PublishedFrame.store( -1, std::memory_order_release );
 }
 
 playback_overlap::OverlapSnapshot RenderFrameThread::pipelineOverlapSnapshot( void )
@@ -2908,6 +2909,9 @@ void RenderFrameThread::reconFrameForWorker( const ReconQueueEntry &entry,
                 slot.gpuPlaybackReconTextureRetainedDeviceToken =
                     retainedDevice.token;
                 gpuPlaybackReconTextureRetainedDeviceAvailable = true;
+                // K1 (texture-present split): one atomic store, no clock read
+                m_retainedDeviceBayer16PublishedFrame.store(
+                    static_cast<int>( entry.request.frameNumber ), std::memory_order_release );
                 if( gpuTexNrOverlapTraceEnabled() )
                 {
                     qInfo().nospace()

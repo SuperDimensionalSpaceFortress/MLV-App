@@ -5670,6 +5670,11 @@ void MainWindow::presentPlaybackPreparedFrame( const PlaybackPrepResult &result 
             QStringLiteral("gpu_playback_recon_async_h2d_frame_id_mismatch"),
             gpuReconFrameIdMismatch );
         const double texturePresentStart = mlv_stage_timing_now();
+        // HFR-NATIVE-M16-1457-GUI-TEXTURE-PRESENT-OFFLOAD-1 K1: the recon worker's activity around this present
+        // (smoke sessions only; atomic loads, no clock read)
+        const bool textureSplitSampled = m_playbackSmokeActive && m_pRenderThread;
+        const playback_overlap::ReconActivity textureReconBefore =
+            textureSplitSampled ? m_pRenderThread->pipelineReconActivity() : playback_overlap::ReconActivity();
         QString texturePresentReason;
         llrpGpuPlaybackReconTiming_t texturePresentTiming;
         memset( &texturePresentTiming, 0, sizeof( texturePresentTiming ) );
@@ -5933,6 +5938,21 @@ void MainWindow::presentPlaybackPreparedFrame( const PlaybackPrepResult &result 
         }
         const double texturePresentMs =
             (mlv_stage_timing_now() - texturePresentStart) * 1000.0;
+        if( textureSplitSampled )
+        {
+            const playback_overlap::ReconActivity textureReconAfter = m_pRenderThread->pipelineReconActivity();
+            readyFrame.stageTimingTelemetry.insert(
+                QStringLiteral("gpu_playback_recon_texture_present_recon_in_flight"),
+                playback_overlap::reconRanBetween( textureReconBefore, textureReconAfter ) );
+            // a later frame's retained device Bayer16 was already published when this present returned
+            readyFrame.stageTimingTelemetry.insert(
+                QStringLiteral("gpu_playback_recon_texture_present_ahead_candidate_ready"),
+                static_cast<qint64>( m_pRenderThread->lastRetainedDeviceBayer16PublishedFrame() )
+                    > static_cast<qint64>( readyFrame.frameNumber ) );   // -1 (none published) is never ahead
+            readyFrame.stageTimingTelemetry.insert(
+                QStringLiteral("gpu_playback_recon_texture_present_by_window"),
+                gpuPlaybackReconAmazeTexturePresentedByWindow );
+        }
         if( overlapTrace )
         {
             qInfo().nospace()
@@ -27023,6 +27043,7 @@ void MainWindow::beginPlaybackSmokeTelemetry( void )
     m_playbackSmokeStartTime = mlv_stage_timing_now();
     m_playbackPresentTrace.begin( m_playbackSmokeStartTime * 1000.0, 4096 );   // r7 present trace (no-op when off)
     m_playbackSlipHistogram.reset( m_playbackSmokeStartPosition, getPlaybackFramerate() );
+    m_playbackTextureSplit.reset();   // K1 (texture-present split)
     // PLAYBACK-STARTUP-CATCHUP-BURST-1: the timeline owes the wall time since Play only when the legacy startup banks
     // it; otherwise paced playback starts at the first present, and a later skip is a slip, never startup catch-up.
     if( mlvappPlaybackStartupCatchupLegacyRequested() )
@@ -27851,6 +27872,46 @@ void MainWindow::notePlaybackSmokePresentedFrame(
         slipSample.uiLatencyMs = presentUiSignalLatencyMs;
         slipSample.timelinePosition = ui->horizontalSliderPosition->value();
         slipSample.lookaheadCovered = requestContext.playbackLookaheadDepth > 0;
+        // HFR-NATIVE-M16-1457-GUI-TEXTURE-PRESENT-OFFLOAD-1 K1: this present's texture-present parts, from values
+        // already captured (no clock read); only for a present a texture presenter drew.
+        if( timing.contains( QStringLiteral("gpu_playback_recon_texture_present_setup_program_ms") )
+         && telemetryBoolValue( timing, "gpu_playback_recon_texture_present_active" ) )
+        {
+            using playback_texture_split::Part;
+            playback_texture_split::Sample &tx = slipSample.texture;
+            slipSample.textureKnown = true;
+            tx.path = telemetryBoolValue( timing, "gpu_playback_recon_texture_present_by_window" )
+                ? playback_texture_split::Path::Window
+                : playback_texture_split::Path::Viewport;
+            tx.at( Part::Context ) = telemetryDoubleValue( timing, "gpu_playback_recon_texture_present_context_ms" );
+            tx.at( Part::Setup ) = telemetryDoubleValue( timing, "gpu_playback_recon_texture_present_setup_ms" );
+            tx.at( Part::SetupLut ) = telemetryDoubleValue( timing, "gpu_playback_recon_texture_present_setup_lut_ms" );
+            tx.at( Part::SetupBlur ) =
+                telemetryDoubleValue( timing, "gpu_playback_recon_texture_present_setup_blur_drain_ms" )
+                + telemetryDoubleValue( timing, "gpu_playback_recon_texture_present_setup_blur_upload_ms" )
+                + telemetryDoubleValue( timing, "gpu_playback_recon_texture_present_setup_blur_check_ms" );
+            tx.at( Part::AmazeKernel ) =
+                telemetryDoubleValue( timing, "gpu_playback_recon_texture_present_amaze_kernel_ms" );
+            tx.at( Part::AmazeHandoff ) =
+                telemetryDoubleValue( timing, "gpu_playback_recon_texture_present_amaze_download_ms" );
+            tx.at( Part::AmazeWall ) = telemetryDoubleValue( timing, "gpu_playback_recon_texture_present_amaze_wall_ms" );
+            tx.at( Part::ReconWall ) = telemetryDoubleValue( timing, "gpu_playback_recon_texture_present_recon_wall_ms" );
+            tx.at( Part::Post ) = telemetryDoubleValue( timing, "gpu_playback_recon_texture_present_post_ms" );
+            tx.at( Part::Wall ) = telemetryDoubleValue( timing, "gpu_playback_recon_texture_present_wall_ms" );
+            tx.at( Part::HostGap ) = telemetryDoubleValue( timing, "gpu_playback_recon_texture_present_host_gap_ms" );
+            tx.at( Part::DrawTotal ) = drawTotalMs;
+            // the window path's own tail (presentPlaybackPreparedFrame read it for this frame); none on the viewport
+            const GpuPresentTailTiming &tail = m_lastPresentTailTiming;
+            tx.painted = m_lastPresentTailTimingKnown && tail.painted;
+            tx.at( Part::Paint ) = tx.painted ? tail.post_paint_ms : 0.0;
+            tx.at( Part::Swap ) = tx.painted ? tail.post_swap_ms : 0.0;
+            tx.tailWindowKnown = m_lastPresentTailTimingKnown && tail.prev_known;
+            tx.at( Part::TailWindow ) = tx.tailWindowKnown ? tail.swap_return_to_setup_ms : 0.0;
+            tx.reconInFlight = telemetryBoolValue( timing, "gpu_playback_recon_texture_present_recon_in_flight" );
+            tx.aheadCandidateReady =
+                telemetryBoolValue( timing, "gpu_playback_recon_texture_present_ahead_candidate_ready" );
+            m_playbackTextureSplit.note( tx );
+        }
         m_playbackSlipHistogram.notePresent( slipSample );
         if( m_playbackPresentTrace.active() )
         {
@@ -31118,7 +31179,19 @@ void MainWindow::finishPlaybackSmokeTelemetry( const char *reason )
                        .arg( r.paceCreditFrames, 0, 'f', 3 )
                        .arg( ( r.readyKnown && r.deadlineKnown ) ? r.readyMs - r.deadlineMs : 0.0, 0, 'f', 3 )
                        .arg( r.timelineAdvancedInInterval )
-                       .arg( bool01( r.afterGap ) );
+                       .arg( bool01( r.afterGap ) )
+                // HFR-NATIVE-M16-1457-GUI-TEXTURE-PRESENT-OFFLOAD-1 K1: the slip present's texture-present parts
+                + QString::fromStdString( playback_texture_split::formatSlipFields( r.textureKnown, r.texture ) );
+        }
+        // K1: the session's texture-present split, one line per present path that drew (LIGHT, like the lines above)
+        for( int p = 0; p < static_cast<int>( playback_texture_split::Path::Count ); ++p )
+        {
+            const auto path = static_cast<playback_texture_split::Path>( p );
+            const playback_texture_split::PathAggregator &agg = m_playbackTextureSplit.path( path );
+            if( !agg.any() ) continue;
+            qInfo().noquote() << QString::fromStdString( playback_texture_split::formatLine(
+                static_cast<unsigned long long>( m_playbackSmokeSessionId ), path, agg,
+                slip.textureGuiLateSlips[static_cast<size_t>( p )], slip.textureAllSlips[static_cast<size_t>( p )] ) );
         }
     }
 

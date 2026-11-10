@@ -28,6 +28,7 @@
 #ifndef PLAYBACKDECODERENDEROVERLAP_H
 #define PLAYBACKDECODERENDEROVERLAP_H
 
+#include <atomic>
 #include <cstdint>
 #include <mutex>
 
@@ -120,6 +121,20 @@ struct OverlapSnapshot
     }
 };
 
+/*! HFR-NATIVE-M16-1457-GUI-TEXTURE-PRESENT-OFFLOAD-1 K1: the recon worker's activity at one instant. */
+struct ReconActivity
+{
+    unsigned long long starts = 0;   //!< recon starts since construction (monotonic)
+    int active = 0;                  //!< recons running now
+};
+
+/*! True when a recon ran at any point between two samples \a before and \a after: one was running at either
+ *  end, or one started in between (and may have finished before \a after). */
+inline bool reconRanBetween( const ReconActivity &before, const ReconActivity &after )
+{
+    return before.active > 0 || after.active > 0 || after.starts != before.starts;
+}
+
 /*! Thread-safe: the decode worker, the recon worker and the render thread each
  *  report their own spans. Times are milliseconds on one monotonic clock. */
 class OverlapMeter
@@ -142,6 +157,7 @@ public:
                         UpstreamStage stage = UpstreamStage::Recon )
     {
         std::lock_guard<std::mutex> lock( m_mutex );
+        if( stage == UpstreamStage::Recon ) noteReconActivityLocked( true );
         if( !m_armed ) return;
         advanceLocked( nowMs );
         ++m_upstreamActive;
@@ -153,6 +169,7 @@ public:
     void upstreamEnd( double nowMs, UpstreamStage stage = UpstreamStage::Recon )
     {
         std::lock_guard<std::mutex> lock( m_mutex );
+        if( stage == UpstreamStage::Recon ) noteReconActivityLocked( false );
         if( !m_armed ) return;
         advanceLocked( nowMs );
         if( m_upstreamActive > 0 ) --m_upstreamActive;
@@ -191,7 +208,31 @@ public:
         return m_snapshot;
     }
 
+    /*! HFR-NATIVE-M16-1457-GUI-TEXTURE-PRESENT-OFFLOAD-1 K1: the recon worker's activity, read lock-free and with no
+     *  clock read, so the GUI thread can sample it around one texture present. Counted whether or not the meter is
+     *  armed and never reset (a reset while a recon runs would otherwise lose its end). */
+    ReconActivity reconActivity() const
+    {
+        ReconActivity a;
+        a.starts = m_reconStartsTotal.load( std::memory_order_acquire );
+        a.active = m_reconActiveNow.load( std::memory_order_acquire );
+        return a;
+    }
+
 private:
+    void noteReconActivityLocked( bool begin )
+    {
+        if( begin )
+        {
+            m_reconStartsTotal.fetch_add( 1, std::memory_order_acq_rel );
+            m_reconActiveNow.fetch_add( 1, std::memory_order_acq_rel );
+        }
+        else if( m_reconActiveNow.load( std::memory_order_acquire ) > 0 )
+        {
+            m_reconActiveNow.fetch_sub( 1, std::memory_order_acq_rel );   // writers hold m_mutex: no lost update
+        }
+    }
+
     void advanceLocked( double nowMs )
     {
         if( nowMs <= m_lastMs ) return;
@@ -214,6 +255,8 @@ private:
     double m_resetMs = 0.0;
     double m_lastMs = 0.0;
     bool m_armed = false;
+    std::atomic<unsigned long long> m_reconStartsTotal{ 0 };
+    std::atomic<int> m_reconActiveNow{ 0 };
 };
 
 } // namespace playback_overlap

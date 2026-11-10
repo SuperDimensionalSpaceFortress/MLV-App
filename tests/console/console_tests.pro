@@ -88,6 +88,7 @@ SOURCES += \
     $$REPO_ROOT/tests/console/test_playback_due_wake_native.cpp \
     $$REPO_ROOT/platform/qt/PlaybackDueWake.cpp \
     $$REPO_ROOT/tests/console/test_playback_slip_histogram.cpp \
+    $$REPO_ROOT/tests/console/test_playback_texture_present_split.cpp \
     $$REPO_ROOT/tests/console/test_playback_startup_split.cpp \
     $$REPO_ROOT/tests/console/test_playback_audio_start_policy.cpp \
     $$REPO_ROOT/tests/console/test_playback_audio_start_engine.cpp \
@@ -163,6 +164,7 @@ HEADERS += \
     $$REPO_ROOT/platform/qt/LookLabelPolicy.h \
     $$REPO_ROOT/platform/qt/PlaybackScopesDuringPlayback.h \
     $$REPO_ROOT/platform/qt/PlaybackSlipHistogram.h \
+    $$REPO_ROOT/platform/qt/PlaybackTexturePresentSplit.h \
     $$REPO_ROOT/platform/qt/PlaybackStartupSplit.h \
     $$REPO_ROOT/platform/qt/PlaybackAudioStartPolicy.h \
     $$REPO_ROOT/platform/qt/PlaybackAudioGate.h \
