@@ -363,7 +363,13 @@ def _formatted(node: ast.AST, consts: dict[str, str], depth: int) -> tuple[str, 
             or (isinstance(shown, ast.Subscript) and isinstance(shown.slice, ast.Slice) and isinstance(_bound_form(shown.value, consts), (ast.List, ast.Tuple)))):
         # pass-28 A5: printing a container shows its repr (``['abc']``): the brackets, the quotes and the commas are text the fold does not carry
         return (text if text.startswith(_WILD) else _WILD + text) + ("" if text.endswith(_WILD) else _WILD), False
-    if not any(isinstance(n, ast.Constant) and isinstance(n.value, bytes) for n in ast.walk(node)):
+    if (known and _WILD not in text and isinstance(shown, ast.Call) and isinstance(shown.func, ast.Attribute) and shown.func.attr == "encode"
+            and all(ord(c) < 256 for c in text)):
+        return repr(text.encode("latin-1")), True  # pass-29 A3: the bytes the fold holds one character per byte print as Python prints them, exactly
+    if not any((isinstance(n, ast.Constant) and isinstance(n.value, bytes))
+               or (isinstance(n, ast.Call) and ((isinstance(n.func, ast.Attribute) and n.func.attr == "encode")  # pass-29 A3: ``'..'.encode()`` is a bytes value too
+                                                or (isinstance(n.func, ast.Name) and (n.func.id in ("bytes", "bytearray") or n.func.id in _BYTES_ALIASES))))
+               for n in ast.walk(node)):
         return text, known
     if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr == "decode":
         return text, known  # a str: printed as it is
@@ -392,6 +398,7 @@ _STR_METHODS = frozenset(name for name in dir(str) if not name.startswith("_")) 
 
 _AMBIGUOUS_ACTIVE: set[int] = set()
 _STR_ALIASES: set[str] = set()  # names the file being scanned binds to the str type (`S = str`, `from builtins import str as S`); set per scan by _note_aliases
+_BYTES_ALIASES: set[str] = set()  # the subset of _STR_ALIASES bound to the bytes type (`from builtins import bytes as B`): B(s, enc) encodes, str(b, enc) decodes
 _CODEC_ALIASES: set[str] = set()  # names the file being scanned binds to the codecs module (`import codecs as c`); set per scan by _note_aliases
 _CODEC_FUNCS: dict[str, str] = {}  # names the file binds to codecs.decode / codecs.encode (`from codecs import decode as d`), to the method they stand for
 
@@ -402,6 +409,7 @@ _TEXT_BASE_MEMO: dict[tuple[int, int], tuple[ast.AST, dict[str, str], bool]] = {
 def _note_aliases(tree: ast.AST) -> None:
     _TEXT_BASE_MEMO.clear()
     _STR_ALIASES.clear()
+    _BYTES_ALIASES.clear()
     _CODEC_ALIASES.clear()
     _CODEC_FUNCS.clear()
     for n in ast.walk(tree):
@@ -410,8 +418,11 @@ def _note_aliases(tree: ast.AST) -> None:
             if ((isinstance(v, ast.Name) and v.id in ("str", "bytes")) or (isinstance(v, ast.Attribute) and v.attr in ("str", "bytes", "__class__"))
                     or (isinstance(v, ast.Call) and isinstance(v.func, ast.Name) and v.func.id == "type")):
                 _STR_ALIASES.add(n.targets[0].id)
+                if (isinstance(v, ast.Name) and v.id == "bytes") or (isinstance(v, ast.Attribute) and v.attr == "bytes"):
+                    _BYTES_ALIASES.add(n.targets[0].id)
         elif isinstance(n, ast.ImportFrom) and n.module == "builtins":
             _STR_ALIASES.update(a.asname or a.name for a in n.names if a.name in ("str", "bytes"))
+            _BYTES_ALIASES.update(a.asname or a.name for a in n.names if a.name == "bytes")
         elif isinstance(n, ast.Import):
             _CODEC_ALIASES.update(a.asname or a.name for a in n.names if a.name == "codecs")
         if isinstance(n, ast.ImportFrom) and n.module == "codecs":
@@ -448,7 +459,8 @@ def _bound_form(node: ast.AST, consts: dict[str, str]) -> ast.AST:
         # R9-F1: ``str(b, 'ascii', 'ignore')`` is ``b.decode('ascii', 'ignore')`` and ``bytes(s, 'ascii', 'ignore')`` is ``s.encode(...)``; pass-28 A1: the type under any
         # name (``builtins.str``, ``S = str``, ``type('')``, ``''.__class__``) is the same call. A type that is not plainly ``bytes`` is read as ``str`` (``decode``).
         name = node.func.id if isinstance(node.func, ast.Name) else node.func.attr if isinstance(node.func, ast.Attribute) else ""
-        return ast.Call(func=ast.Attribute(value=node.args[0], attr="encode" if name == "bytes" else "decode", ctx=ast.Load()), args=node.args[1:], keywords=node.keywords)
+        return ast.Call(func=ast.Attribute(value=node.args[0], attr="encode" if name == "bytes" or name in _BYTES_ALIASES else "decode", ctx=ast.Load()),
+                        args=node.args[1:], keywords=node.keywords)
     if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)):
         return node
     attr, recv = node.func.attr, node.func.value
@@ -553,7 +565,22 @@ def _unread_codec_text() -> str:
     return _WILD + _WILD.join(sorted(_LOOP_SPAWN_METHODS)) + _WILD
 
 
+_FLATTEN_MAX_CHARS = 200_000
+
+
+class _FoldTooBig(RecursionError):
+    """A fold whose text outgrew ``_FLATTEN_MAX_CHARS`` (``'x'`` followed by 48 ``.replace('x', 'xx')`` is 2**48 characters). A RecursionError, so the scan's
+    existing too-deep guard REPORTS the source instead of the scan allocating it or dying of MemoryError (pass-29 A5)."""
+
+
 def _flatten(node: ast.AST, consts: dict[str, str], depth: int = 0) -> tuple[str, bool]:
+    result = _flatten_node(node, consts, depth)
+    if len(result[0]) > _FLATTEN_MAX_CHARS:
+        raise _FoldTooBig(len(result[0]))
+    return result
+
+
+def _flatten_node(node: ast.AST, consts: dict[str, str], depth: int = 0) -> tuple[str, bool]:
     """(text, known): what a string expression reads as when every piece is a string literal or a name bound once to one.
 
     Folds adjacent literals, ``+``, ``%`` and ``.format`` / ``.format_map`` templates, ``.join`` and ``.replace`` over literals, and an
@@ -1864,6 +1891,10 @@ def _unescape_ps(script: str) -> str:
                 continue
             if quote[i] == "" and nxt in " \t":
                 out.append("\x02")  # outside quotes an escaped space is part of the SAME word (`foo` -WindowStyle` Hidden` is one argument): never a boundary
+                i += 2
+                continue
+            if quote[i] == "" and nxt in "(){}":
+                out.append("\x02")  # an escaped bracket is a plain character of its word: unescaped it would open or close a group and move a -WindowStyle to another command (pass-29 A4)
                 i += 2
                 continue
             if quote[i] == "" and (nxt == "#" or (nxt == "<" and script.startswith("#", i + 2))):
@@ -4730,6 +4761,33 @@ class AdversaryR9Tests(unittest.TestCase):
             self.assertEqual(self._bad(self._launch(expr)), [], expr)
         for script in ("(f\"{['Start-Process cmd.exe']}\")[2:-2]", "('{}'.format(['saps cmd.exe']))[2:-2]"):
             self.assertEqual(self._ps(script), (1, 1), script)
+
+    # ---- pass 29 (review-adversary-MLV-LANE-CONSOLE-HIDDEN-1-r11-9b2d430a); A1 (an unknown slice drops a partial name) stays OPEN, see summary.md ----
+    def test_pass29_a2_an_alias_of_bytes_encodes_and_does_not_decode(self):
+        pre = "from builtins import bytes as B\nT = bytes\n"
+        for ctor in ("B", "T"):
+            expr = f"{ctor}('Ã©subprocess_ex', 'utf8')[4:].decode('utf8') + 'ec'"
+            self.assertGreaterEqual(len(self._bad(pre + self._launch(expr))), 1, expr)
+        self.assertEqual(self._ps("bytes('Ã©sa', 'utf8')[4:].decode('utf8') + 'ps cmd.exe'"), (1, 1))
+
+    def test_pass29_a3_a_bytes_made_by_encode_prints_as_its_repr(self):
+        for expr in ("'{}'.format('xxsubprocess_ex'.encode())[4:-1] + 'ec'", "f\"{'xxsubprocess_ex'.encode()}\"[4:-1] + 'ec'",
+                     "'%s' % ('xxsubprocess_ex'.encode(),)")[:2]:
+            self.assertGreaterEqual(len(self._bad(self._launch(expr))), 1, expr)
+        self.assertEqual(self._ps("'{}'.format('xxsaps cmd.exe'.encode())[4:-1]"), (1, 1))
+
+    def test_pass29_a4_an_escaped_paren_or_brace_is_a_plain_character_of_its_word(self):
+        for launch in ("Start-Process", "saps", "start"):
+            for escaped in ("`(", "`)", "`{", "`}"):
+                script = f"function Emit {{ param($Value,$WindowStyle) }}; Emit ({launch} cmd.exe -ArgumentList {escaped} ) -WindowStyle Hidden"
+                self.assertEqual(_judge_script(script), (1, 1), (launch, escaped))
+        self.assertEqual(_judge_script("Start-Process cmd.exe -ArgumentList `( -WindowStyle Hidden"), (1, 0))
+
+    def test_pass29_a5_a_chain_that_grows_its_text_is_reported_not_materialised(self):
+        for chain in (".replace('x', 'xx')", ".join(['x', 'x', 'x'])"):
+            source = "def unused():\n    return 'x'" + chain * 48 + "\n"
+            self.assertGreaterEqual(len(self._bad(source)), 1, chain)
+            self.assertEqual(_start_process_violations(source)[0], 1, chain)
 
 
 if __name__ == "__main__":
