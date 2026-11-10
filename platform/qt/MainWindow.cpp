@@ -17889,15 +17889,16 @@ void MainWindow::applyLookAssistToReceipt( ReceiptSettings *receipt,
                     reinterpret_cast<unsigned char *>( processedThumbnail.data() ) );
             } );
         }
+        bool processedRendered = renderedAtPresetExposure;
         if( !renderedAtPresetExposure )
         {
             m_lookAssistPump.call( [&]()
             {
-                get_area_average_downscale_thumnail( m_pMlvObject,
+                processedRendered = get_area_average_downscale_thumnail( m_pMlvObject,
                                                      analysisFrame,
                                                      colorDownscaleFactor,
                                                      qMax( 1, mlvappEffectiveWorkerThreadCount() ),
-                                                     reinterpret_cast<unsigned char *>( processedThumbnail.data() ) );
+                                                     reinterpret_cast<unsigned char *>( processedThumbnail.data() ) ) != 0;
             } );
         }
         processedColorStats = analyzeLookAssistThumbnail(
@@ -17905,7 +17906,9 @@ void MainWindow::applyLookAssistToReceipt( ReceiptSettings *receipt,
                     colorWidth,
                     colorHeight );
         const int minColorBalanceSamples = qMax( 32, ( colorWidth * colorHeight ) / 100 );
+        // r3 adversary pass 5 A1 sibling: an unrendered buffer is never the processed colour measurement.
         useProcessedColorStats =
+            processedRendered &&
             processedColorStats.median > 0.0 &&
             processedColorStats.balanceSamples >= minColorBalanceSamples;
     }
@@ -18499,7 +18502,7 @@ void MainWindow::applyLookAssistToReceipt( ReceiptSettings *receipt,
                 {
                     QByteArray asyncPostProcessedThumbnail;
                     asyncPostProcessedThumbnail.resize( r.colorWidth * r.colorHeight * 3 );
-                    get_area_average_downscale_thumnail(
+                    const int asyncPostRendered = get_area_average_downscale_thumnail(
                         m_pMlvObject,
                         r.analysisFrame,
                         r.colorDownscaleFactor,
@@ -18513,8 +18516,10 @@ void MainWindow::applyLookAssistToReceipt( ReceiptSettings *receipt,
                         r.colorHeight );
                     const int minColorBalanceSamples =
                         qMax( 32, ( r.colorWidth * r.colorHeight ) / 100 );
+                    // r3 adversary pass 5 A1 sibling: an unrendered buffer is never a post-applied measurement.
                     asyncPostColorStatsValid =
-                        asyncPostColorStats.median > 0.0
+                        asyncPostRendered != 0
+                        && asyncPostColorStats.median > 0.0
                         && asyncPostColorStats.balanceSamples >= minColorBalanceSamples;
                     if( asyncPostColorStatsValid )
                     {
@@ -18960,14 +18965,21 @@ void MainWindow::applyLookAssistToReceipt( ReceiptSettings *receipt,
     {
         QByteArray postProcessedThumbnail;
         postProcessedThumbnail.resize( colorWidth * colorHeight * 3 );
+        int postRendered = 0;
         m_lookAssistPump.call( [&]()
         {
-            get_area_average_downscale_thumnail( m_pMlvObject,
+            postRendered = get_area_average_downscale_thumnail( m_pMlvObject,
                                                  analysisFrame,
                                                  colorDownscaleFactor,
                                                  qMax( 1, mlvappEffectiveWorkerThreadCount() ),
                                                  reinterpret_cast<unsigned char *>( postProcessedThumbnail.data() ) );
         } );
+        // r3 adversary pass 5 A1: an unrendered buffer (allocation failure) holds stale bytes, never a measurement.
+        if( !postRendered )
+        {
+            postColorStats = LookAssistStats();
+            return false;
+        }
         postColorStats = analyzeLookAssistThumbnail(
                     reinterpret_cast<const unsigned char *>( postProcessedThumbnail.constData() ),
                     colorWidth,
@@ -19313,14 +19325,16 @@ void MainWindow::applyLookAssistToReceipt( ReceiptSettings *receipt,
     {
         QByteArray dumpThumbnail;
         dumpThumbnail.resize( colorWidth * colorHeight * 3 );
+        int dumpRendered = 0;
         m_lookAssistPump.call( [&]()
         {
-            get_area_average_downscale_thumnail( m_pMlvObject,
+            dumpRendered = get_area_average_downscale_thumnail( m_pMlvObject,
                                                  analysisFrame,
                                                  colorDownscaleFactor,
                                                  qMax( 1, mlvappEffectiveWorkerThreadCount() ),
                                                  reinterpret_cast<unsigned char *>( dumpThumbnail.data() ) );
         } );
+        if( !dumpRendered ) return QString();   // r3 adversary pass 5 A1: an unrendered buffer is never encoded or bound
         const QImage dumpImage( reinterpret_cast<const uchar *>( dumpThumbnail.constData() ),
                                 colorWidth, colorHeight, colorWidth * 3, QImage::Format_RGB888 );
         return savePictureFresh( dumpImage, fileName );

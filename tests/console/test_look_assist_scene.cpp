@@ -4098,6 +4098,48 @@ TEST(LookAssistScene, SafetyRetreatOrchestrationReportsTheClampedExposureOnScree
     ASSERT_FALSE( log.contains( QStringLiteral("-401") ) );
 }
 
+// r3 adversary pass 5 A1 (introduced, major; review-adversary-...-r3-df27d7af): applied 380, clean bottom 0, and the
+// rung-190 render fails (the full-resolution malloc in get_area_average_downscale_thumnail_with_processing returns NULL).
+// The void renderer discarded that, the rung's QByteArray still held the bottom's clean pixels, and the GUI measured them
+// as rung 190: unsafe 190 was kept with clean diagnostics. The renderer now returns whether it rendered; a rung whose
+// render failed measures invalid, so the seam never keeps it (here: rung 95 is clean and kept), and no dump binds it.
+TEST(LookAssistScene, SafetyRetreatOrchestrationNeverKeepsARungWhoseRenderFailed)
+{
+    RetreatRig rig;
+    rig.byExposure[0] = retreatClean( 0 );
+    rig.byExposure[190] = retreatMeasured( 190, false, "none", 0.0, 0.0, 0.0 );   // what a failed render now measures
+    rig.byExposure[95] = retreatClean( 95 );
+    const LookAssistRetreatOutcome out = rig.run( 380, 0 );
+    ASSERT_TRUE( out.action == LookAssistSafetyAction::Keep );
+    ASSERT_NE( 190, out.shownExposure );
+    ASSERT_EQ( rig.look.exposure, out.shownExposure );
+
+    // The renderer reports its result (header and C body), and every GUI/headless measurement or dump of its buffer gates
+    // on it (MainWindow.cpp and ReceiptApplier.cpp are not linked into console_tests, so this reads the source as text).
+    const QString header = readRepoFile( QStringLiteral("src/mlv/video_mlv.h") );
+    ASSERT_FALSE( header.isEmpty() );
+    ASSERT_EQ( 1, header.count( QStringLiteral("int get_area_average_downscale_thumnail(mlvObject_t *video,") ) );
+    ASSERT_EQ( 0, header.count( QStringLiteral("void get_area_average_downscale_thumnail(") ) );
+    const QString misc = readRepoFile( QStringLiteral("src/mlv/video_mlv_misc.c") );
+    ASSERT_FALSE( misc.isEmpty() );
+    ASSERT_EQ( 1, misc.count( QStringLiteral("const int rendered = get_area_average_downscale_thumnail_with_processing(video,") ) );
+    ASSERT_EQ( 1, misc.count( QStringLiteral("    return rendered;") ) );
+    const QString window = readRepoFile( QStringLiteral("platform/qt/MainWindow.cpp") );
+    ASSERT_FALSE( window.isEmpty() );
+    ASSERT_EQ( 1, window.count( QStringLiteral("postRendered = get_area_average_downscale_thumnail( m_pMlvObject,") ) );
+    ASSERT_EQ( 1, window.count( QStringLiteral("if( !postRendered )") ) );
+    ASSERT_EQ( 1, window.count( QStringLiteral("dumpRendered = get_area_average_downscale_thumnail( m_pMlvObject,") ) );
+    ASSERT_EQ( 1, window.count( QStringLiteral("if( !dumpRendered ) return QString();") ) );
+    ASSERT_EQ( 1, window.count( QStringLiteral("processedRendered = get_area_average_downscale_thumnail( m_pMlvObject,") ) );
+    ASSERT_EQ( 1, window.count( QStringLiteral("const int asyncPostRendered = get_area_average_downscale_thumnail(") ) );
+    ASSERT_EQ( 1, window.count( QStringLiteral("asyncPostRendered != 0") ) );
+    const QString applier = readRepoFile( QStringLiteral("src/batch/ReceiptApplier.cpp") );
+    ASSERT_FALSE( applier.isEmpty() );
+    ASSERT_EQ( 1, applier.count( QStringLiteral("processedRendered = get_area_average_downscale_thumnail(") ) );
+    // Every measurement site gates on its render: the processed colour measure (GUI and headless) and the async post check.
+    ASSERT_EQ( 2, window.count( QStringLiteral("processedRendered &&") ) + applier.count( QStringLiteral("processedRendered &&") ) );
+}
+
 // I1 (7) Never more than three measurements (the bottom plus at most two rungs), whatever the exposures and however
 // every rung measures; exactly 1 + rungs tried.
 TEST(LookAssistScene, SafetyRetreatOrchestrationMeasuresAtMostThreeTimes)
