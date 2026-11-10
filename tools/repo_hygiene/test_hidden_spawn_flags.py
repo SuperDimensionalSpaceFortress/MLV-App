@@ -76,6 +76,8 @@ from __future__ import annotations
 
 import ast
 import asyncio
+import functools
+import itertools
 import pkgutil
 import posixpath
 import re
@@ -225,25 +227,58 @@ def _spec_too_big(numbers) -> bool:
     return any(len(number) > 4 or int(number) > _SPEC_NUMBER_LIMIT for number in numbers if number)
 
 
+# Where a PowerShell launch keyword can begin inside a text some operation the fold cannot apply may cut a substring from: the substring may start
+# at ANY character, so no left boundary is asked of the keyword (``'xsaps cmd.exe'.partition('x')[2]`` is ``saps cmd.exe``).
+_LOOSE_LAUNCH_RE = re.compile(r"start-|(?:start|saps)(?![\w-])", re.IGNORECASE)
+
+
 def _hedge(text: str) -> str:
-    """The text an operation the fold cannot apply (a ``replace`` with run-time arguments, a slice with a run-time bound) may leave of ``text``:
-    anything, and, when ``text`` holds an event-loop spawn-method name, that name followed by anything (the operation may leave it whole)."""
-    return next((name + _WILD for name in sorted(_LOOP_SPAWN_METHODS) if name in text), _WILD)
+    """The text an operation the fold cannot apply (a ``replace`` with run-time arguments, a slice with a run-time bound, a string method it has no
+    arm for) may leave of ``text``: anything, and, when ``text`` holds an event-loop spawn-method name, that name followed by anything (the
+    operation may leave it whole), and, when it holds a PowerShell launch keyword, anything followed by the text from the keyword on (the
+    operation may cut the text there)."""
+    name = next((name + _WILD for name in sorted(_LOOP_SPAWN_METHODS) if name in text), "")
+    keyword = _LOOSE_LAUNCH_RE.search(text)
+    return (name + (_WILD + text[keyword.start():] if keyword else "")) or _WILD
+
+
+def _literal_word_characters(pieces) -> int:
+    return sum(len(re.findall(r"\w", p)) for p in pieces)
+
+
+@functools.lru_cache(maxsize=4096)
+def _could_name_pattern(built: str, names: frozenset) -> bool:
+    pieces = re.split(re.escape(_WILD) + "+", built)
+    lead = pieces[0][:pieces[0].rfind(".") + 1]  # the dotted receiver the text itself spells: 'loop.subprocess_*' -> 'loop.'
+    # The literal text that is not the receiver must say something about the name ('allowed_roots.*' is a receiver and nothing else); the
+    # policy is on the TOTAL of the whole fold, not on one piece: 'su*pr*ce*s_*x*c' spells the name in pieces none of which holds three characters.
+    if _literal_word_characters([pieces[0][len(lead):]] + pieces[1:]) < 3:
+        return False
+    if any(re.search(r"[^\w.]", p) for p in pieces):
+        return False  # a dotted name holds only word characters and dots
+    rx = re.compile(".*".join(re.escape(p) for p in pieces), re.DOTALL)
+    # Match the dotted receiver by structure: the name may sit behind ANY run of `word.` segments, so try every run (up to four segments) of the
+    # WHOLE segments the text itself spells (a segment with a dot on each side inside its piece, or at the start of the text: 'loop' in 'loop.',
+    # 'b' in '.b.') plus two unknown ones. A literal dot after a wildcard (`loop.*.subprocess_exec`) needs a receiver of two segments, which no
+    # sampled prefix of one can give. A segment cut by a wildcard ('value_' in 'loop.value_*') is part of the name, not of the receiver.
+    spelled = [seg for i, p in enumerate(pieces) for seg in (p.split(".")[:-1] if i == 0 else p.split(".")[1:-1]) if seg]
+    tokens = ["a", "b"] + [t for t in dict.fromkeys(spelled) if t not in ("a", "b")][:4]
+    last = pieces[-1]
+    for n in names:
+        if last and not (n.endswith(last) or last.endswith(n)):
+            continue  # the text ends with `last`, and the name ends the dotted text
+        for depth in range(0, 5):
+            for run in itertools.product(tokens, repeat=depth):
+                if rx.fullmatch("".join(t + "." for t in run) + n):
+                    return True
+    return False
 
 
 def _could_name(built: str, known: bool, names) -> bool:
     """Can this folded text (``_WILD`` = any text) read as one of ``names``, possibly behind a dotted receiver (``loop.subprocess_exec``)?"""
     if _WILD not in built:  # every uncertainty is a wildcard, so a text without one is exact whatever `known` says
         return any(built == n or re.fullmatch(r"(?:\w+\.)+" + re.escape(n), built) for n in names)
-    pieces = [p for p in re.split(re.escape(_WILD) + "+", built)]
-    pattern = ".*".join(re.escape(p) for p in pieces)
-    lead = pieces[0][:pieces[0].rfind(".") + 1]  # the dotted receiver the text itself spells: 'loop.subprocess_*' -> 'loop.'
-    for prefix in ("", "a.", "a.b.", lead):
-        # the literal text that is not the receiver must say something about the name: 'allowed_roots.*' is a receiver and nothing else
-        core = [pieces[0][len(lead):] if prefix == lead and lead else pieces[0]] + pieces[1:]
-        if any(len(re.findall(r"\w", p)) >= 3 for p in core) and any(re.fullmatch(pattern, prefix + n) for n in names):
-            return True
-    return False
+    return _could_name_pattern(built, frozenset(names))
 
 
 def _fold_args(args: list[ast.AST], keywords: list[ast.keyword], consts: dict[str, str], depth: int):
@@ -387,6 +422,13 @@ def _flatten(node: ast.AST, consts: dict[str, str], depth: int = 0) -> tuple[str
         if known and "?" not in bounds and bounds[2] != 0:
             return text[slice(*bounds)], True
         return _hedge(text), False  # a bound the fold cannot read: some substring of the text, which may be a spawn-method name
+    # A string method the fold has no arm for (`removeprefix`, `partition`, `split`, `splitlines`, anything else) or an index into one: the result is
+    # some piece of the receiver, so the receiver's text is hedged, never dropped. A receiver that reads as nothing (a run-time value) says nothing.
+    receiver = node.func.value if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) else node.value if isinstance(node, ast.Subscript) else None
+    if receiver is not None:
+        text, _ = _flatten(receiver, consts, depth + 1)
+        if text.replace(_WILD, ""):
+            return _hedge(text), False
     return _WILD, False
 
 
@@ -1511,7 +1553,36 @@ def _judge_script(script: str) -> tuple[int, int]:
     return found, bad
 
 
-_STRING_BUILDERS = frozenset({"format", "format_map", "join", "replace", "__mod__"})
+# Methods that build a string out of their ARGUMENTS as well as their receiver: they count whatever the receiver is.
+_ARGUMENT_FOLDS = frozenset({"format", "format_map", "join", "replace", "__mod__"})
+
+
+def _text_base(node: ast.AST, consts: dict[str, str]) -> bool:
+    """True when the chain of method calls and subscripts under ``node`` ends in a text ``_flatten`` reads (a string literal, a built string,
+    a name bound once to a string)."""
+    while True:
+        if isinstance(node, ast.Subscript):
+            node = node.value
+        elif isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
+            node = node.func.value
+        else:
+            break
+    return (isinstance(node, ast.Constant) and isinstance(node.value, (str, bytes))) or isinstance(node, (ast.JoinedStr, ast.BinOp)) or (
+        isinstance(node, ast.Name) and node.id in consts)
+
+
+def _folds(node: ast.AST, consts: dict[str, str]) -> bool:
+    """True when ``_flatten`` reads this node's text through a fold (the PowerShell side asks exactly this of every node, so it judges everything the
+    Python side reads: a slice, a case or strip mapper, ``chr``, ``decode``, and a string method the fold has no arm for, by way of ``_hedge``)."""
+    if isinstance(node, (ast.JoinedStr, ast.BinOp)):
+        return True
+    if isinstance(node, ast.Subscript):
+        return _text_base(node.value, consts)
+    if isinstance(node, ast.Call):
+        if isinstance(node.func, ast.Attribute):
+            return node.func.attr in _ARGUMENT_FOLDS or _text_base(node.func.value, consts)
+        return isinstance(node.func, ast.Name) and node.func.id == "chr"
+    return False
 # A literal piece of a run-time built string that reads as a launch: a ``Start-`` prefix, or ``start`` / ``saps`` where a command word can
 # stand (the piece's start, or after ; & | ( { = or a dot-source), so 'the start of {}' is prose and 'start {}' is the alias.
 _BUILT_LAUNCH_RE = re.compile(r"start-|(?:^|[;&|({=!]|\s\.)\s*(?:start|saps)(?![\w-])|(?<![\w$.-])(?:return|throw|exit|-not)\s+(?:start|saps)(?![\w-])",
@@ -1562,14 +1633,16 @@ def _string_values(tree: ast.AST) -> list[tuple[int, str, bool]]:
                 continue
                 out.append((node.lineno, marked, False))
                 continue
-        builds = isinstance(node, (ast.JoinedStr, ast.BinOp)) or (
-            isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr in _STRING_BUILDERS)
-        if builds:
+        if _folds(node, named_strings):
             consts = sorted((c for c in ast.walk(node) if isinstance(c, ast.Constant) and isinstance(c.value, str)),
                             key=lambda c: (c.lineno, c.col_offset))
             pieces = [c.value for c in consts]
             # a launch split across the literal pieces ('Sta' + name + 'rt-Process') reads as one only when they are joined in source order
-            flat, _ = _flatten(node, named_strings)  # '{}rt-Process'.format('Sta'), '%srt-Process' % 'Sta': the template filled in
+            flat, flat_known = _flatten(node, named_strings)  # '{}rt-Process'.format('Sta'), '%srt-Process' % 'Sta': the template filled in
+            if flat_known and not isinstance(node, (ast.JoinedStr, ast.BinOp)) and not (
+                    isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr in _ARGUMENT_FOLDS):
+                out.append((node.lineno, flat, False))  # a slice / strip / case mapper / chr / decode that folds EXACTLY: its text is judged as written
+                continue
             if any(_BUILT_LAUNCH_RE.search(p) for p in pieces + ["".join(pieces), flat.replace(_WILD, "")]) or _could_launch(flat):
                 out.append((node.lineno, "".join(pieces), True))
                 continue
@@ -3317,6 +3390,139 @@ class AdversaryR7Tests(unittest.TestCase):
         self.assertIn("relative module name", got[0])
         # a resolved fromlist is not reported at all
         self.assertEqual(self._bad("m = __import__('asyncio.windows_utils', fromlist=['Popen'])\n"), [])
+
+
+class AdversaryR8Tests(unittest.TestCase):
+    """r8: Grok G13 / G14 and Dot 789-R7-F1 / 789-R7-F2 (head 43fd2bec / d79a3f80).
+
+    G13: the PowerShell side judges the ``_flatten`` text of every node ``_flatten`` can fold (``_folds``), so the two sides cannot drift.
+    G14: a string method the fold does not know hedges its receiver (``_hedge``) instead of dropping it.
+    F1: the minimum-literal policy of ``_could_name`` counts the whole fold, not one piece.
+    F2: a dotted receiver is matched by structure (``loop.*.subprocess_exec``), not by four sampled prefixes.
+    """
+
+    SP = "Start-Process"
+
+    @staticmethod
+    def _bad(source: str) -> list[str]:
+        return _unflagged_spawns_in_source(source, "synthetic.py")
+
+    @staticmethod
+    def _launch(expr: str) -> str:
+        return ("import asyncio\nasync def launch():\n    loop = asyncio.get_running_loop()\n"
+                f"    await getattr(loop, {expr})(asyncio.SubprocessProtocol, 'cmd.exe', '/c', 'exit')\n")
+
+    @staticmethod
+    def _ps(expr: str) -> tuple[int, int]:
+        found, bad = _start_process_violations(f"script = {expr}\n")
+        return found, len(bad)
+
+    # ---- G13: one row per spelling Grok named, each an unhidden launch ----
+    def g13_rows(self) -> list[str]:
+        sp = self.SP
+        return [f"'zz{sp} cmd.exe'[2:]", "'zzsaps cmd.exe'[2:]", f"('zz' + '{sp} cmd.exe')[2:]", f"'zz{sp} cmd.exe'.lstrip('z')",
+                f"'x{sp} cmd.exe'.partition('x')[2]"]
+
+    def test_g13_a_launch_behind_a_fold_the_python_side_reads_is_reported_by_the_powershell_side(self):
+        for expr in self.g13_rows():
+            self.assertEqual(self._ps(expr), (1, 1), expr)
+        self.assertEqual(self._ps(f"'{self.SP} cmd.exe'.upper()"), (1, 1))  # the control: reported before and after
+        # a fold that reads EXACTLY is judged as the text it spells, so a hidden launch behind one is still clean
+        hidden = f"{self.SP} cmd.exe -WindowStyle Hidden"
+        for expr in (f"'zz{hidden}'[2:]", f"'zz{hidden}'.lstrip('z')", f"'{hidden}'.strip()", f"('zz' + '{hidden}')[2:]"):
+            self.assertEqual(self._ps(expr), (1, 0), expr)
+
+    def fold_kinds(self, target: str) -> dict[str, str]:
+        """One expression per fold kind ``_flatten`` supports, each spelling ``target``; the keys name the kind."""
+        pad = "zz" + target
+        half = max(1, len(target) // 2)
+        a, b = target[:half], target[half:]
+        return {
+            "literal": repr(target), "concat": f"{a!r} + {b!r}", "implicit concat": f"{a!r} {b!r}",
+            "fstring const": f"f'{{{a!r}}}{b}'", "fstring plain": f"f'{target}'",
+            "percent tuple": f"'%s{b}' % ({a!r},)", "percent dict": f"'%(a)s{b}' % {{'a': {a!r}}}",
+            "percent scalar": f"'%s{b}' % {a!r}", "format": f"'{{}}{b}'.format({a!r})",
+            "format named": f"'{{a}}{b}'.format(a={a!r})", "format_map": f"'{{a}}{b}'.format_map({{'a': {a!r}}})",
+            "join list": f"''.join([{a!r}, {b!r}])", "join tuple": f"''.join(({a!r}, {b!r}))",
+            "join set": f"''.join({{{target!r}}})", "replace": f"{pad.replace('zz', 'zq')!r}.replace('zq', '')", "replace count": f"{('z' + target)!r}.replace('z', '', 1)",
+            "slice": f"{pad!r}[2:]", "slice step": f"{target[::-1]!r}[::-1]", "slice of concat": f"({'zz'!r} + {target!r})[2:]",
+            "lstrip": f"{pad!r}.lstrip('z')", "rstrip": f"{(target + 'zz')!r}.rstrip('z')", "strip": f"{('zz' + target + 'zz')!r}.strip('z')",
+            "lower": f"{target.upper()!r}.lower()", "upper": f"{target.lower()!r}.upper()", "casefold": f"{target.upper()!r}.casefold()",
+            "swapcase": f"{target.swapcase()!r}.swapcase()", "chr": f"chr({ord(target[0])}) + {target[1:]!r}", "bytes decode": f"{target.encode()!r}.decode()",
+            # G14: methods the fold has no arm for
+            "removeprefix": f"{pad!r}.removeprefix('zz')", "removesuffix": f"{(target + 'zz')!r}.removesuffix('zz')",
+            "partition": f"{('x' + target)!r}.partition('x')[2]", "rpartition": f"{(target + 'x')!r}.rpartition('x')[0]",
+            "split": f"{('x_' + target)!r}.split('_', 1)[1]", "rsplit": f"{(target + '_x')!r}.rsplit('_', 1)[0]",
+            "splitlines": f"{(target + chr(10) + 'x')!r}.splitlines()[0]", "unknown method": f"{target!r}.zzz_unknown_method()",
+            "unknown method chain": f"{('x' + target)!r}.zzz_one().zzz_two('q')[1]",
+        }
+
+    def test_g13_every_fold_kind_is_judged_the_same_by_both_sides(self):
+        """Walks every kind of fold ``_flatten`` supports (and the unknown-method fallback): the Python side reads the spawn-method name through it AND the
+        PowerShell side reports the launch through it. A kind one side lost shows up here by name."""
+        for kind, expr in self.fold_kinds("subprocess_exec").items():
+            if kind != "upper":  # upper-casing the name makes it a different name on the Python side; the PowerShell side is case-insensitive
+                self.assertGreaterEqual(len(self._bad(self._launch(expr))), 1, ("python side", kind, expr))
+        for kind, expr in self.fold_kinds(f"{self.SP} cmd.exe").items():
+            self.assertEqual(self._ps(expr), (1, 1), ("powershell side", kind, expr))
+        for kind, expr in self.fold_kinds("saps cmd.exe").items():
+            self.assertEqual(self._ps(expr), (1, 1), ("powershell side, alias", kind, expr))
+
+    def test_g13_the_exact_kinds_fold_to_the_target_text(self):
+        """The table exercises real fold arms: every kind but the unknown-method ones folds to exactly the target text."""
+        unknown = {"removeprefix", "removesuffix", "partition", "rpartition", "split", "rsplit", "splitlines", "unknown method", "unknown method chain", "join set"}
+        for kind, expr in self.fold_kinds("subprocess_exec").items():
+            text, known = _flatten(ast.parse(expr, mode="eval").body, {})
+            if kind not in unknown:
+                self.assertEqual((text.lower(), known), ("subprocess_exec", True), (kind, expr))
+
+    # ---- G14: a method the fold does not know hedges its receiver ----
+    def test_g14_an_unknown_string_method_keeps_its_receiver_text(self):
+        for expr in ("'zzsubprocess_exec'.removeprefix('zz')", "'subprocess_execzz'.removesuffix('zz')", "'xsubprocess_exec'.partition('x')[2]",
+                     "'subprocess_exec_x'.rpartition('_')[0]", "'x_subprocess_exec'.split('_', 1)[1]", "'subprocess_exec_x'.rsplit('_', 1)[0]",
+                     "'subprocess_exec\\nx'.splitlines()[0]", "'subprocess_exec'.zzz_unknown()", "'zsubprocess_exec'.zzz_a().zzz_b()[1:]"):
+            text, known = _flatten(ast.parse(expr, mode="eval").body, {})
+            self.assertFalse(known, expr)
+            self.assertIn("subprocess_exec", text, expr)  # the receiver's text survives, followed by the wildcard
+            self.assertGreaterEqual(len(self._bad(self._launch(expr))), 1, expr)
+
+    def test_g14_a_hedged_receiver_adds_no_false_positive_to_a_harmless_text(self):
+        for expr in ("'hello'.removeprefix('h')", "'value'.partition('x')[2]", "'a,b'.split(',')[0]", "'path/to/file'.rsplit('/', 1)[1]", "'a\\nb'.splitlines()[0]",
+                     "name.removeprefix('x')", "'abc'.zzz()", "'loop.value'.partition('.')[2]"):
+            self.assertEqual(self._bad(self._launch(expr)), [], expr)
+        for expr in ("'hello world'.partition(' ')[2]", "'a b'.split(' ')[0]", "'the end'.removesuffix('d')", "name.partition('x')[2]", "'plain'.zzz()"):
+            self.assertEqual(self._ps(expr), (0, 0), expr)
+
+    # ---- R7-F1: the minimum-literal policy counts the whole fold ----
+    def test_f1_a_name_spelled_in_fragments_each_too_short_to_count_is_reported(self):
+        for expr in ("f'su{98:c}pr{111:c}ce{115:c}s_{101:c}x{101:c}c'", "'su{}pr{}ce{}s_{}x{}c'.format(98, 111, 115, 101, 101)",
+                     "'su%cpr%cce%cs_%cx%cc' % (98, 111, 115, 101, 101)", "'su{:c}pr{:c}ce{:c}s_{:c}x{:c}c'.format(98, 111, 115, 101, 101)",
+                     "f'su{a}pr{b}ce{c}s_{d}x{e}c'", "f'su{a}pr{b}ce{c}s_{d}x{e}c'.lower()", "'s' + a + 'u' + b + 'b' + c"):
+            self.assertGreaterEqual(len(self._bad(self._launch(expr))), 1, expr)
+        # the end-to-end launch of the finding
+        src = ("import asyncio\nasync def go():\n    loop = asyncio.get_running_loop()\n"
+               "    await getattr(loop, f'su{98:c}pr{111:c}ce{115:c}s_{101:c}x{101:c}c')(asyncio.SubprocessProtocol, 'cmd.exe')\n")
+        self.assertGreaterEqual(len(self._bad(src)), 1)
+
+    def test_f1_the_minimum_literal_policy_keeps_its_controls_clean(self):
+        for expr in ("f'{a}{b}'", "'%s%s' % (a, b)", "'{}-{}'.format(a, b)", "f'x{a}y{b}'", "a + b + c", "f'{a}.{b}'", "'ab' + a", "f'{a}_{b}_{c}'", "f'p{a}q'",
+                     "'allowed_roots.' + k"):
+            self.assertEqual(self._bad(self._launch(expr)), [], expr)
+
+    # ---- R7-F2: a dotted receiver is matched by structure ----
+    def test_f2_a_literal_dot_after_a_wildcard_reads_as_a_dotted_receiver(self):
+        src = ("import operator\nasync def launch(holder, part, factory):\n"
+               "    return await operator.attrgetter('loop.' + part + '.subprocess_exec')(holder)(factory, 'cmd.exe')\n")
+        self.assertGreaterEqual(len(self._bad(src)), 1)
+        for expr in ("'loop.' + p + '.subprocess_exec'", "'a.' + p + '.b.' + q + '.subprocess_exec'", "p + '.loop.' + q + '.subprocess_shell'",
+                     "'loop.%s.subprocess_exec' % p", "'{}.{}.subprocess_exec'.format(p, q)", "f'loop.{p}.subprocess_exec'", "f'self.{p}.loop.{q}.subprocess_exec'",
+                     "p + '.' + q + '.subprocess_exec'", "'loop.' + p + '.' + q + '.subprocess_exec'"):
+            self.assertGreaterEqual(len(self._bad(self._launch(expr))), 1, expr)
+
+    def test_f2_a_receiver_only_text_stays_clean(self):
+        for expr in ("'allowed_roots.' + k", "'loop.' + part", "'loop.' + part + '.run'", "part + '.' + other", "'self.loop.' + part", "f'{a}.{b}'",
+                     "'loop.' + part + '.value'", "p + '.zz.' + q", "'a.' + p + '.b.' + q + '.c'"):
+            self.assertEqual(self._bad(self._launch(expr)), [], expr)
 
 
 class SpawnSiteBehaviourTests(unittest.TestCase):
