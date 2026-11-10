@@ -971,18 +971,20 @@ struct LookAssistRetreatOutcome
     LookAssistSafetyAction action = LookAssistSafetyAction::RevertBaseline;
     LookAssistRetreatMeasurement bottom;
     bool rungKept = false;
-    int shownExposure = 0;                  // the exposure applied last: the one on screen when this returns
+    int shownExposure = 0;                  // the exposure applyExposure last REPORTED applied: the one on screen
     LookAssistRetreatMeasurement shown;     // the measurement of that state (the bottom's own when it was restored)
     QStringList triedRungs;                 // "exposure:visible_green_axis:green_artifact_ratio", in order
     int measurements = 0;                   // renders measured; never more than 3
 };
-/* applyExposure changes the exposure of the live look and nothing else; measure measures the look on screen. Applies the
+/* applyExposure changes the exposure of the live look and nothing else, and returns the exposure it actually applied (the
+ * GUI clamps to the exposure slider's range: r2 adversary pass 4 A1, a rung of -401 shown as -400 must be reported as
+ * -400); measure measures the look on screen. Applies the
  * baseline exposure and measures it (the bottom); when the bottom is valid and warning-free, tries each
  * lookAssistSafetyRetreatRungs rung (apply + measure) and keeps the first that does not fail closed; when none does,
  * re-applies the baseline exposure WITHOUT measuring it again and reports the bottom's measurement. */
 LookAssistRetreatOutcome lookAssistRunSafetyRetreat( int appliedExposure,
                                                      int baselineExposure,
-                                                     const std::function<void( int exposure )> &applyExposure,
+                                                     const std::function<int( int exposure )> &applyExposure,
                                                      const std::function<LookAssistRetreatMeasurement()> &measure );
 /* The fields of the look_assist.apply.safety_retreat line, from the outcome (kept_exposure is "none" on a revert). */
 QString lookAssistSafetyRetreatLogFields( const QString &firstWarning,

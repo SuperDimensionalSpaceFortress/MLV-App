@@ -3848,12 +3848,19 @@ struct RetreatRig
     std::map<int, LookAssistRetreatMeasurement> byExposure;
     QVector<int> applied;
     QVector<int> measured;
+    int sliderMin = -100000;   // the GUI clamps to the exposure slider's range and reports the clamped value
+    int sliderMax = 100000;
     LookAssistRetreatOutcome run( int appliedExposure, int baselineExposure )
     {
         look.exposure = appliedExposure;
         return lookAssistRunSafetyRetreat(
             appliedExposure, baselineExposure,
-            [this]( int exposure ) { look.exposure = exposure; applied.append( exposure ); },
+            [this]( int exposure ) -> int
+            {
+                look.exposure = qBound( sliderMin, exposure, sliderMax );
+                applied.append( look.exposure );
+                return look.exposure;
+            },
             [this]() -> LookAssistRetreatMeasurement
             {
                 measured.append( look.exposure );
@@ -3974,7 +3981,9 @@ TEST(LookAssistScene, SafetyRetreatOrchestrationChangesNothingButTheExposure)
     const QString window = readRepoFile( QStringLiteral("platform/qt/MainWindow.cpp") );
     ASSERT_FALSE( window.isEmpty() );
     ASSERT_EQ( 1, window.count( QStringLiteral("lookAssistRunSafetyRetreat(") ) );
-    ASSERT_EQ( 1, window.count( QStringLiteral("[&]( int exposure ) { preset.exposure = exposure; applyLookAssistValues(); },") ) );
+    ASSERT_EQ( 1, window.count( QStringLiteral("preset.exposure = qBound( ui->horizontalSliderExposure->minimum(), exposure,") ) );
+    ASSERT_EQ( 1, window.count( QStringLiteral("return preset.exposure;\r\n            },") )
+                + window.count( QStringLiteral("return preset.exposure;\n            },") ) );
     // The GUI no longer runs a retreat loop of its own.
     ASSERT_EQ( 0, window.count( QStringLiteral("lookAssistSafetyRetreatRungs(") ) );
 }
@@ -4066,6 +4075,26 @@ TEST(LookAssistScene, SafetyPictureDumpStateLabelsCannotNameAnotherFile)
     const QString window = readRepoFile( QStringLiteral("platform/qt/MainWindow.cpp") );
     ASSERT_FALSE( window.isEmpty() );
     ASSERT_EQ( 1, window.count( QStringLiteral("if( !lookAssistPictureDumpStateLabelValid( label ) || v.size() != 8 ) continue;") ) );
+}
+
+// r2 adversary pass 4 A1 (introduced, major; review-adversary-...-r2-05304cef): an imported receipt's baseline exposure
+// -802 puts the first rung at -401, which the exposure slider shows as -400. The outcome, the safety_retreat line and the
+// final binding must say -400 (what is on screen), never the unclamped rung.
+TEST(LookAssistScene, SafetyRetreatOrchestrationReportsTheClampedExposureOnScreen)
+{
+    RetreatRig rig;
+    rig.sliderMin = -400;
+    rig.sliderMax = 400;
+    rig.byExposure[-400] = retreatClean( -400 );
+    const LookAssistRetreatOutcome out = rig.run( 0, -802 );
+    ASSERT_TRUE( out.action == LookAssistSafetyAction::Keep );
+    ASSERT_TRUE( out.rungKept );
+    ASSERT_EQ( -400, out.shownExposure );
+    ASSERT_EQ( -400, rig.look.exposure );
+    ASSERT_TRUE( out.triedRungs.at( 0 ).startsWith( QStringLiteral("-400:") ) );
+    const QString log = lookAssistSafetyRetreatLogFields( QStringLiteral("localized-green-artifact"), 0, -802, out, 0 );
+    ASSERT_TRUE( log.contains( QStringLiteral(" kept_exposure=-400 ") ) );
+    ASSERT_FALSE( log.contains( QStringLiteral("-401") ) );
 }
 
 // I1 (7) Never more than three measurements (the bottom plus at most two rungs), whatever the exposures and however

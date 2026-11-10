@@ -19587,7 +19587,13 @@ void MainWindow::applyLookAssistToReceipt( ReceiptSettings *receipt,
         const LookAssistRetreatOutcome retreat = lookAssistRunSafetyRetreat(
             appliedExposure,
             baselineExposure,
-            [&]( int exposure ) { preset.exposure = exposure; applyLookAssistValues(); },
+            [&]( int exposure ) -> int   // r2 adversary pass 4 A1: report what the slider shows
+            {
+                preset.exposure = qBound( ui->horizontalSliderExposure->minimum(), exposure,
+                                          ui->horizontalSliderExposure->maximum() );
+                applyLookAssistValues();
+                return preset.exposure;
+            },
             [&]() -> LookAssistRetreatMeasurement
             {
                 LookAssistRetreatMeasurement m;

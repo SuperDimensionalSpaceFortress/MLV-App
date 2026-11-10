@@ -2393,12 +2393,11 @@ QVector<int> lookAssistSafetyRetreatRungs( int appliedExposure, int baselineExpo
 
 LookAssistRetreatOutcome lookAssistRunSafetyRetreat( int appliedExposure,
                                                      int baselineExposure,
-                                                     const std::function<void( int exposure )> &applyExposure,
+                                                     const std::function<int( int exposure )> &applyExposure,
                                                      const std::function<LookAssistRetreatMeasurement()> &measure )
 {
     LookAssistRetreatOutcome out;
-    applyExposure( baselineExposure );
-    out.shownExposure = baselineExposure;
+    out.shownExposure = applyExposure( baselineExposure );
     out.bottom = measure();
     ++out.measurements;
     out.shown = out.bottom;
@@ -2409,12 +2408,11 @@ LookAssistRetreatOutcome lookAssistRunSafetyRetreat( int appliedExposure,
     }
     for( const int rung : lookAssistSafetyRetreatRungs( appliedExposure, baselineExposure ) )
     {
-        applyExposure( rung );
-        out.shownExposure = rung;
+        out.shownExposure = applyExposure( rung );
         const LookAssistRetreatMeasurement m = measure();
         ++out.measurements;
         out.triedRungs.append( QStringLiteral("%1:%2:%3")
-                                   .arg( rung )
+                                   .arg( out.shownExposure )
                                    .arg( m.visibleGreenAxis, 0, 'f', 3 )
                                    .arg( m.valid ? m.stats.greenArtifactRatio : 0.0, 0, 'f', 6 ) );
         if( m.valid
@@ -2432,8 +2430,7 @@ LookAssistRetreatOutcome lookAssistRunSafetyRetreat( int appliedExposure,
     if( !out.rungKept )
     {
         // No rung passed: the baseline exposure is shown, described by its own (identical-settings) measurement.
-        applyExposure( baselineExposure );
-        out.shownExposure = baselineExposure;
+        out.shownExposure = applyExposure( baselineExposure );   // the same (deterministic) exposure the bottom measured
         out.shown = out.bottom;
     }
     out.action = LookAssistSafetyAction::Keep;
