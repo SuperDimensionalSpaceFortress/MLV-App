@@ -297,7 +297,7 @@ $ErrorActionPreference = 'Stop'
 $A = 'System.Management.Automation.Language'
 $PathOnly = @('join-path', 'test-path', 'resolve-path', 'split-path', 'get-item', 'get-content', 'get-childitem', 'get-filehash', 'convert-path')
 $isRef = { param($n) (($n -is [System.Management.Automation.Language.StringConstantExpressionAst]) -or ($n -is [System.Management.Automation.Language.ExpandableStringExpressionAst])) -and ($n.Value -match ('(^|[\\/])' + [regex]::Escape($script:Needle) + '\.ps1$')) }
-$blank = { param([string]$t) $x = ($t -replace '`[tnrs0]', ' ').Trim().Trim([char]39, [char]34, [char]40, [char]41).Trim(); ($x -eq '') -or ($x -eq '$null') -or ($x -eq '@') }
+$blank = { param([string]$t) $x = $t -replace '`u\{[0-9a-fA-F]+\}', '' -replace '`[a-zA-Z0-9]', '' -replace '\[[A-Za-z.]+\]', '' -replace '[\s''"()@{}$]', ''; ($x -eq '') -or ($x -eq 'null') }
 foreach ($file in [IO.File]::ReadAllLines($ListFile)) {
     if (-not $file) { continue }
     $errs = $null
@@ -312,7 +312,7 @@ foreach ($file in [IO.File]::ReadAllLines($ListFile)) {
         param($e)
         if (& $isRef $e) { return $true }
         if ($e -is [System.Management.Automation.Language.VariableExpressionAst]) { return $names.ContainsKey($e.VariablePath.UserPath.ToLowerInvariant()) }
-        if ($e -is [System.Management.Automation.Language.ParenExpressionAst] -or $e -is [System.Management.Automation.Language.SubExpressionAst]) { return [bool]$e.Find($isRef, $true) }
+        if ($e -is [System.Management.Automation.Language.ParenExpressionAst] -or $e -is [System.Management.Automation.Language.SubExpressionAst]) { return [bool]$e.Find({ param($n) (& $isRef $n) -or ($n -is [System.Management.Automation.Language.VariableExpressionAst] -and $names.ContainsKey($n.VariablePath.UserPath.ToLowerInvariant())) }, $true) }
         return $false
     }
     foreach ($cmd in $ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.CommandAst] }, $true)) {
@@ -344,7 +344,7 @@ foreach ($file in [IO.File]::ReadAllLines($ListFile)) {
                 foreach ($as in $scope.FindAll({ param($n) $n -is [System.Management.Automation.Language.AssignmentStatementAst] -and $n.Extent.StartOffset -lt $cmd.Extent.StartOffset }, $true)) {
                     $l = $as.Left
                     $isEnv = ($l -is [System.Management.Automation.Language.VariableExpressionAst] -and $l.VariablePath.UserPath -ieq ('env:' + $EnvName)) -or
-                        ($l -is [System.Management.Automation.Language.IndexExpressionAst] -and $l.Index -is [System.Management.Automation.Language.StringConstantExpressionAst] -and $l.Index.Value -eq $EnvName -and $l.Target.Extent.Text -match 'Environment')
+                        ($l -is [System.Management.Automation.Language.IndexExpressionAst] -and $l.Index -is [System.Management.Automation.Language.StringConstantExpressionAst] -and $l.Index.Value -eq $EnvName -and $l.Target.Extent.Text -match '\.Environment$')
                     if ($isEnv -and -not (& $blank $as.Right.Extent.Text)) { $covered = $true; $shape = 'scoped-env-assignment' }
                 }
             }
@@ -429,7 +429,7 @@ class TrackedAssemblerCallerAstTests(unittest.TestCase):
 
     def test_mutation_whitespace_deadline_value_goes_red_adversary_a1(self) -> None:
         # adversary 44f72c7a-A1: '   ' passed the scan as a deadline, but the assembler refuses it (exit 27).
-        for blank in ("'   '", '"  "', "$null", "''", '"`t"', "($null)", "@()"):
+        for blank in ("'   '", '"  "', "$null", "''", '"`t"', "($null)", "@()", "@( )", "[string]$null", '"`v"', '"`f"', '"`u{0020}"'):
             with self.subTest(value=blank):
                 sites = self._mutate(lambda t: t.replace("MLV_HEAVY_SLOT_DEADLINE_UTC = $script:Deadline.ToString('o')", "MLV_HEAVY_SLOT_DEADLINE_UTC = " + blank, 1))
                 self.assertEqual([s["shape"] for s in self._uncovered(sites)], ["ChildEnv-without-a-deadline"])
@@ -470,6 +470,23 @@ class TrackedAssemblerCallerAstTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "Invoke-Other.ps1"
             path.write_text('param($c)\n& "$PSScriptRoot\\..\\bachelor\\PLAYBACK-ATTR-3-CUDA-ASSEMBLE.ps1" -SourceCommit $c\n', encoding="ascii")
+            sites = _scan([path])
+        self.assertEqual([(s["covered"], s["shape"]) for s in sites], [(False, "none")])
+
+    def test_mutation_calls_through_an_assigned_variable_inside_parens_are_found_adversary_a2(self) -> None:
+        for call in ("& ($a) -SourceCommit $c", "& $($a) -SourceCommit $c"):
+            with self.subTest(call=call):
+                with tempfile.TemporaryDirectory() as tmp:
+                    path = Path(tmp) / "Invoke-Other.ps1"
+                    path.write_text("param($c)\n$a = 'bachelor/playback-attr-3-cuda-assemble.ps1'\n" + call + "\n", encoding="ascii")
+                    sites = _scan([path])
+                self.assertEqual([(s["covered"], s["shape"]) for s in sites], [(False, "none")])
+
+    def test_mutation_a_fake_environment_dictionary_does_not_cover_a_call_adversary_a3(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "Invoke-Other.ps1"
+            path.write_text("param($c)\n$fakeEnvironment = @{}\n$fakeEnvironment['MLV_HEAVY_SLOT_DEADLINE_UTC'] = '2099-01-01T00:00:00Z'\n"
+                            "& 'bachelor/playback-attr-3-cuda-assemble.ps1' -SourceCommit $c\n", encoding="ascii")
             sites = _scan([path])
         self.assertEqual([(s["covered"], s["shape"]) for s in sites], [(False, "none")])
 
