@@ -3468,3 +3468,101 @@ TEST(LookAssistScene, ADisplayMedianOfOneCodeValueLetsTheHighlightsGovernTheExpo
     ASSERT_EQ( 94, presetForLookAssistScene( LookAssistScene::Shade, raw, nullptr, &mid ).exposure );
     ASSERT_EQ( 114, presetForLookAssistScene( LookAssistScene::BrightSun, raw, nullptr, &mid ).exposure );
 }
+
+// LOOK-ASSIST-UNDEREXPOSED-DAYLIGHT-AUTO-EXPOSURE-1 r2 (PR #792, review ask 792-I1): the median-one branch away from
+// the +380 clamp. The test above only reaches it with p99 25/27, where the cap (log2(440/p99)*100, about +410)
+// is clamped to +380, so a wrong cap would still pass. These rows pin the UNSATURATED cap, the p99 > 1 boundary,
+// the controls the branch must leave alone, and the shared override in the other two scenes.
+// Expected values: displayCap = qRound( log2( 440 / p99 ) * 100 ), then qBound( -120, ., 380 ).
+//   p99 128 -> log2(3.4375)   = 1.7814 -> 178
+//   p99 255 -> log2(1.7255)   = 0.7871 ->  79
+//   p99   2 -> log2(220)      = 7.7814 -> 778 -> bounded to 380
+namespace {
+LookAssistStats lookAssistMedianOneRaw1457()
+{
+    // RAW thumbnail statistics shaped like M16-1457 (the same raw the test above uses).
+    LookAssistStats raw;
+    raw.median = 32; raw.p05 = 31; raw.p95 = 33; raw.p99 = 33;
+    raw.dynamicRange = 2; raw.clipLow = 0.0; raw.clipHigh = 0.0;
+    return raw;
+}
+
+LookAssistStats lookAssistMedianOneMeter( double median, double p95, double p99 )
+{
+    LookAssistStats d;
+    d.median = median; d.p95 = p95; d.p99 = p99;
+    return d;
+}
+}
+
+// 792-I1 row 1: median one, p99 128: the cap is unsaturated (+178), and the meter's value replaces the raw path's.
+TEST(LookAssistScene, ADisplayMedianOfOneWithP99Of128GetsTheUnsaturatedHighlightCap)
+{
+    const LookAssistStats raw = lookAssistMedianOneRaw1457();
+    const LookAssistStats meter = lookAssistMedianOneMeter( 1, 96, 128 );
+    ASSERT_EQ( 178, presetForLookAssistScene( LookAssistScene::Night, raw, nullptr, &meter ).exposure );
+    ASSERT_EQ( 178, presetForLookAssistScene( LookAssistScene::Shade, raw, nullptr, &meter ).exposure );
+
+    // A readable Shade raw whose own path gives +78 (median 56 -> target 112 is +100; the p95 100 ceiling 172 caps
+    // at +78): the median-one display meter still governs, at its p99 cap.
+    LookAssistStats readable;
+    readable.median = 56; readable.p05 = 20; readable.p95 = 100; readable.p99 = 120;
+    readable.dynamicRange = 100; readable.clipLow = 0.0; readable.clipHigh = 0.0;
+    ASSERT_EQ( 78, presetForLookAssistScene( LookAssistScene::Shade, readable, nullptr, nullptr ).exposure );
+    ASSERT_EQ( 178, presetForLookAssistScene( LookAssistScene::Shade, readable, nullptr, &meter ).exposure );
+}
+
+// 792-I1 row 2: median one, p99 255 (the top display code value): the cap is +79.
+TEST(LookAssistScene, ADisplayMedianOfOneWithP99Of255GetsTheUnsaturatedHighlightCap)
+{
+    const LookAssistStats raw = lookAssistMedianOneRaw1457();
+    const LookAssistStats meter = lookAssistMedianOneMeter( 1, 200, 255 );
+    ASSERT_EQ( 79, presetForLookAssistScene( LookAssistScene::Night, raw, nullptr, &meter ).exposure );
+    ASSERT_EQ( 79, presetForLookAssistScene( LookAssistScene::Shade, raw, nullptr, &meter ).exposure );
+}
+
+// 792-I1 row 3: median one, p99 2, the first value past the p99 > 1 guard: the cap (+778) is bounded to +380.
+TEST(LookAssistScene, ADisplayMedianOfOneWithP99OfTwoIsBoundedTo380)
+{
+    const LookAssistStats raw = lookAssistMedianOneRaw1457();
+    const LookAssistStats meter = lookAssistMedianOneMeter( 1, 2, 2 );
+    ASSERT_EQ( 380, presetForLookAssistScene( LookAssistScene::Night, raw, nullptr, &meter ).exposure );
+    ASSERT_EQ( 380, presetForLookAssistScene( LookAssistScene::Shade, raw, nullptr, &meter ).exposure );
+}
+
+// 792-I1 row 4 (controls, unchanged by the fix): a median of 0 skips the display branch exactly as no meter does,
+// and a black meter (median one, p99 one: at the p99 > 1 guard) keeps exposure 0 in every scene.
+TEST(LookAssistScene, ADisplayMedianOfZeroNullOrBlackMeterKeepsItsFallback)
+{
+    LookAssistStats readable;
+    readable.median = 56; readable.p05 = 20; readable.p95 = 100; readable.p99 = 120;
+    readable.dynamicRange = 100; readable.clipLow = 0.0; readable.clipHigh = 0.0;
+    const LookAssistStats zero = lookAssistMedianOneMeter( 0, 96, 128 );
+    ASSERT_EQ( 78, presetForLookAssistScene( LookAssistScene::Shade, readable, nullptr, nullptr ).exposure );
+    ASSERT_EQ( 78, presetForLookAssistScene( LookAssistScene::Shade, readable, nullptr, &zero ).exposure );
+
+    const LookAssistStats raw = lookAssistMedianOneRaw1457();
+    const LookAssistScene scenes[] = { LookAssistScene::Night, LookAssistScene::ArtificialLights,
+                                       LookAssistScene::Shade, LookAssistScene::BrightSun };
+    const LookAssistStats black = lookAssistMedianOneMeter( 1, 1, 1 );
+    for( const LookAssistScene scene : scenes )
+    {
+        const LookAssistPreset none = presetForLookAssistScene( scene, raw, nullptr, nullptr );
+        const LookAssistPreset viaZero = presetForLookAssistScene( scene, raw, nullptr, &zero );
+        ASSERT_EQ( none.exposure, viaZero.exposure );
+        ASSERT_EQ( none.highlights, viaZero.highlights );
+        ASSERT_EQ( 0, presetForLookAssistScene( scene, raw, nullptr, &black ).exposure );
+    }
+}
+
+// 792-I1 row 5: the override is shared by every scene. With a median of one there is no mid-tone to bring to the
+// scene's display target (ArtificialLights 82, BrightSun 110), so both get the same p99 cap as Night and Shade.
+// BrightSun's raw path keeps exposure <= 0; the display branch replaces it, as it does at median 50 (+114 above).
+TEST(LookAssistScene, ADisplayMedianOfOneIgnoresTheSceneTargetInArtificialLightsAndBrightSun)
+{
+    const LookAssistStats raw = lookAssistMedianOneRaw1457();
+    const LookAssistStats meter = lookAssistMedianOneMeter( 1, 96, 128 );
+    ASSERT_TRUE( presetForLookAssistScene( LookAssistScene::BrightSun, raw, nullptr, nullptr ).exposure <= 0 );
+    ASSERT_EQ( 178, presetForLookAssistScene( LookAssistScene::ArtificialLights, raw, nullptr, &meter ).exposure );
+    ASSERT_EQ( 178, presetForLookAssistScene( LookAssistScene::BrightSun, raw, nullptr, &meter ).exposure );
+}
