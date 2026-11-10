@@ -3992,8 +3992,9 @@ TEST(LookAssistScene, SafetyRetreatOrchestrationFinalPictureReceiptAndDiagnostic
     ASSERT_EQ( 190, out.shownExposure );
     const QString log = lookAssistSafetyRetreatLogFields( QStringLiteral("localized-green-artifact"), 380, 0, out, 3 );
     ASSERT_TRUE( log == QStringLiteral("first_warning=localized-green-artifact applied_exposure=380 baseline_exposure=0 bottom_warning=none bottom_visible_green_axis=5.646 bottom_green_ratio=0.029882 kept_exposure=190 rungs_tried=1 rungs=190:5.646:0.029882 kept_warning=none frame=3") );
-    const QString dump = lookAssistPictureDumpFields( 3, 380, true, rig.look.exposure, true, QStringLiteral("retreat") );
-    ASSERT_TRUE( dump == QStringLiteral("pre_safety=look-assist-pre-safety-frame3.png pre_safety_exposure=380 final=look-assist-final-frame3.png final_exposure=190 safety=retreat frame=3") );
+    const QString dump = lookAssistPictureDumpFields( 3, 380, QStringLiteral("aa11"), rig.look.exposure, QStringLiteral("bb22"),
+                                                      QStringLiteral("retreat") );
+    ASSERT_TRUE( dump == QStringLiteral("pre_safety=look-assist-pre-safety-frame3.png pre_safety_sha256=aa11 pre_safety_exposure=380 final=look-assist-final-frame3.png final_sha256=bb22 final_exposure=190 safety=retreat frame=3") );
     ASSERT_TRUE( lookAssistPictureDumpFileName( true, 0 ) == QStringLiteral("look-assist-final-frame0.png") );   // check_look_assist_profile_states.py
     ASSERT_TRUE( lookAssistPictureDumpFileName( false, 0 ) == QStringLiteral("look-assist-pre-safety-frame0.png") );
 
@@ -4025,21 +4026,46 @@ TEST(LookAssistScene, SafetyRetreatOrchestrationFinalPictureReceiptAndDiagnostic
 // sharing, so this run's save of the retreated look (190) fails; the line must not say that file shows 190.
 TEST(LookAssistScene, SafetyPictureDumpNeverBindsAFileItFailedToWrite)
 {
-    ASSERT_TRUE( lookAssistPictureDumpFields( 0, 380, true, 190, false, QStringLiteral("retreat") )
-                 == QStringLiteral("pre_safety=look-assist-pre-safety-frame0.png pre_safety_exposure=380 final=none final_exposure=190 safety=retreat frame=0") );
-    ASSERT_TRUE( lookAssistPictureDumpFields( 0, 380, false, 380, true, QStringLiteral("keep") )
-                 == QStringLiteral("pre_safety=none pre_safety_exposure=380 final=look-assist-final-frame0.png final_exposure=380 safety=keep frame=0") );
+    ASSERT_TRUE( lookAssistPictureDumpFields( 0, 380, QStringLiteral("aa11"), 190, QString(), QStringLiteral("retreat") )
+                 == QStringLiteral("pre_safety=look-assist-pre-safety-frame0.png pre_safety_sha256=aa11 pre_safety_exposure=380 final=none final_sha256=none final_exposure=190 safety=retreat frame=0") );
+    ASSERT_TRUE( lookAssistPictureDumpFields( 0, 380, QString(), 380, QStringLiteral("bb22"), QStringLiteral("keep") )
+                 == QStringLiteral("pre_safety=none pre_safety_sha256=none pre_safety_exposure=380 final=look-assist-final-frame0.png final_sha256=bb22 final_exposure=380 safety=keep frame=0") );
 
     // The GUI: every dump file (pre-safety, final, and the optional state-<label>.png renders) goes through ONE fresh save
-    // that removes the old file first and returns the save result, and the binding takes both results.
+    // that removes the old file first, writes the encoded PNG bytes itself and returns their SHA-256 (empty on any
+    // failure), and the binding takes both digests.
     const QString window = readRepoFile( QStringLiteral("platform/qt/MainWindow.cpp") );
     ASSERT_FALSE( window.isEmpty() );
     ASSERT_EQ( 0, window.count( QStringLiteral(".save( QDir( dumpDir )") ) );
     ASSERT_EQ( 2, window.count( QStringLiteral("savePictureFresh(") ) );
-    ASSERT_EQ( 1, window.count( QStringLiteral("return !QFile::exists( path ) && image.save( path );") ) );
-    ASSERT_EQ( 1, window.count( QStringLiteral("const bool finalWritten = dumpLivePicture( lookAssistPictureDumpFileName( true, analysisFrame ) );") ) );
-    ASSERT_EQ( 1, window.count( QStringLiteral("preSafetyWritten = dumpLivePicture( lookAssistPictureDumpFileName( false, analysisFrame ) );") ) );
-    ASSERT_EQ( 1, window.count( QStringLiteral("lookAssistPictureDumpFields( analysisFrame, preSafetyExposure, preSafetyWritten,") ) );
+    ASSERT_EQ( 1, window.count( QStringLiteral("if( QFile::exists( path ) ) return QString();") ) );
+    ASSERT_EQ( 1, window.count( QStringLiteral("if( !out.open( QIODevice::WriteOnly ) || out.write( png ) != png.size() ) return QString();") ) );
+    ASSERT_EQ( 1, window.count( QStringLiteral("return QString::fromLatin1( QCryptographicHash::hash( png, QCryptographicHash::Sha256 ).toHex() );") ) );
+    ASSERT_EQ( 1, window.count( QStringLiteral("const QString finalSha256 = dumpLivePicture( lookAssistPictureDumpFileName( true, analysisFrame ) );") ) );
+    ASSERT_EQ( 1, window.count( QStringLiteral("preSafetySha256 = dumpLivePicture( lookAssistPictureDumpFileName( false, analysisFrame ) );") ) );
+    ASSERT_EQ( 1, window.count( QStringLiteral("lookAssistPictureDumpFields( analysisFrame, preSafetyExposure, preSafetySha256,") ) );
+}
+
+// r2 adversary pass 3 A1 (introduced, major): a state label "x/../look-assist-pre-safety-frame0" resolved to the
+// pre-safety PNG and overwrote it at exposure 0. A label is 1-64 of [A-Za-z0-9_-] now, so state-<label>.png stays in the
+// dump directory and can never name another dump file. A2 (another process replacing the final file between save and
+// binding) is answered by the digest above: the line binds content, so a replaced file no longer matches its sha256.
+TEST(LookAssistScene, SafetyPictureDumpStateLabelsCannotNameAnotherFile)
+{
+    ASSERT_TRUE( lookAssistPictureDumpStateLabelValid( QStringLiteral("master") ) );
+    ASSERT_TRUE( lookAssistPictureDumpStateLabelValid( QStringLiteral("pr-222_r2") ) );
+    ASSERT_TRUE( lookAssistPictureDumpStateLabelValid( QString( 64, QLatin1Char('a') ) ) );
+    ASSERT_FALSE( lookAssistPictureDumpStateLabelValid( QString( 65, QLatin1Char('a') ) ) );
+    ASSERT_FALSE( lookAssistPictureDumpStateLabelValid( QString() ) );
+    ASSERT_FALSE( lookAssistPictureDumpStateLabelValid( QStringLiteral("x/../look-assist-pre-safety-frame0") ) );
+    ASSERT_FALSE( lookAssistPictureDumpStateLabelValid( QStringLiteral("..") ) );
+    ASSERT_FALSE( lookAssistPictureDumpStateLabelValid( QStringLiteral("a\\b") ) );
+    ASSERT_FALSE( lookAssistPictureDumpStateLabelValid( QStringLiteral("C:x") ) );
+    ASSERT_FALSE( lookAssistPictureDumpStateLabelValid( QStringLiteral("a b") ) );
+    ASSERT_FALSE( lookAssistPictureDumpStateLabelValid( QStringLiteral("a.png") ) );
+    const QString window = readRepoFile( QStringLiteral("platform/qt/MainWindow.cpp") );
+    ASSERT_FALSE( window.isEmpty() );
+    ASSERT_EQ( 1, window.count( QStringLiteral("if( !lookAssistPictureDumpStateLabelValid( label ) || v.size() != 8 ) continue;") ) );
 }
 
 // I1 (7) Never more than three measurements (the bottom plus at most two rungs), whatever the exposures and however

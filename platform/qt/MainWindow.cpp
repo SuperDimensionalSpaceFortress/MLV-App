@@ -51,6 +51,7 @@ extern "C" {
 #include <QSignalBlocker>
 #include <QSettings>
 #include <QCryptographicHash>
+#include <QBuffer>
 #include <QDateTime>
 #include <QDebug>
 #if QT_VERSION < QT_VERSION_CHECK(6, 0, 0)
@@ -19284,17 +19285,26 @@ void MainWindow::applyLookAssistToReceipt( ReceiptSettings *receipt,
     const bool pictureDump = canAnalyzeProcessedColor && qEnvironmentVariableIsSet( "MLVAPP_LOOK_ASSIST_PICTURE_DUMP" );
     const QString dumpDir = qEnvironmentVariable( "MLVAPP_LOOK_ASSIST_PICTURE_DUMP" );
     const int preSafetyExposure = preset.exposure;
-    bool preSafetyWritten = false;
-    // r2 adversary A1: a dump file never outlives a failed write. The old file is removed first, and the save result is
-    // returned, so a name the picture_dump line binds is this look or the line says none.
-    auto savePictureFresh = [&]( const QImage &image, const QString &fileName ) -> bool
+    QString preSafetySha256;
+    // r2 adversary A1/A2 (passes 2 and 3): a dump file never outlives a failed write (the old file is removed first), and
+    // the picture_dump line binds the SHA-256 of the exact PNG bytes this process wrote, so a file a failed write, another
+    // label or another process left under the same name never verifies. Empty = not written (the line says none).
+    auto savePictureFresh = [&]( const QImage &image, const QString &fileName ) -> QString
     {
+        QByteArray png;
+        QBuffer pngBuffer( &png );
+        if( !pngBuffer.open( QIODevice::WriteOnly ) || !image.save( &pngBuffer, "PNG" ) ) return QString();
         QDir().mkpath( dumpDir );
         const QString path = QDir( dumpDir ).filePath( fileName );
         QFile::remove( path );
-        return !QFile::exists( path ) && image.save( path );
+        if( QFile::exists( path ) ) return QString();
+        QFile out( path );
+        if( !out.open( QIODevice::WriteOnly ) || out.write( png ) != png.size() ) return QString();
+        out.close();
+        if( out.error() != QFileDevice::NoError ) return QString();
+        return QString::fromLatin1( QCryptographicHash::hash( png, QCryptographicHash::Sha256 ).toHex() );
     };
-    auto dumpLivePicture = [&]( const QString &fileName ) -> bool
+    auto dumpLivePicture = [&]( const QString &fileName ) -> QString
     {
         QByteArray dumpThumbnail;
         dumpThumbnail.resize( colorWidth * colorHeight * 3 );
@@ -19314,14 +19324,14 @@ void MainWindow::applyLookAssistToReceipt( ReceiptSettings *receipt,
     auto dumpFinalPicture = [&]( int finalExposure, const QString &safety )
     {
         if( !pictureDump ) return;
-        const bool finalWritten = dumpLivePicture( lookAssistPictureDumpFileName( true, analysisFrame ) );
+        const QString finalSha256 = dumpLivePicture( lookAssistPictureDumpFileName( true, analysisFrame ) );
         logInteractionEvent( QStringLiteral("look_assist.apply.picture_dump"),
-                             lookAssistPictureDumpFields( analysisFrame, preSafetyExposure, preSafetyWritten,
-                                                          finalExposure, finalWritten, safety ) );
+                             lookAssistPictureDumpFields( analysisFrame, preSafetyExposure, preSafetySha256,
+                                                          finalExposure, finalSha256, safety ) );
     };
     if( pictureDump )
     {
-        preSafetyWritten = dumpLivePicture( lookAssistPictureDumpFileName( false, analysisFrame ) );
+        preSafetySha256 = dumpLivePicture( lookAssistPictureDumpFileName( false, analysisFrame ) );
 
         // Optional: ALSO render explicit looks ("label:exp,contrast,pivot,shadows,highlights,vibrance,temp,tint;...")
         // on a private clone with the GUI slider mapping, so another build's logged result (e.g. master's) can
@@ -19332,7 +19342,7 @@ void MainWindow::applyLookAssistToReceipt( ReceiptSettings *receipt,
         {
             const QString label = state.section( QLatin1Char(':'), 0, 0 );
             const QStringList v = state.section( QLatin1Char(':'), 1 ).split( QLatin1Char(','), Qt::SkipEmptyParts );
-            if( label.isEmpty() || v.size() != 8 ) continue;
+            if( !lookAssistPictureDumpStateLabelValid( label ) || v.size() != 8 ) continue;   // r2 adversary A1 (pass 3)
             processingObject_t *dumpClone = processingCloneForAnalysis( m_pMlvObject->processing );
             if( !dumpClone ) continue;
             mlv_processed_thumbnail_settings_t dumpSettings;

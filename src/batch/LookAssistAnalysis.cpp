@@ -2469,18 +2469,35 @@ QString lookAssistPictureDumpFileName( bool finalLook, int frame )
 
 QString lookAssistPictureDumpFields( int frame,
                                      int preSafetyExposure,
-                                     bool preSafetyWritten,
+                                     const QString &preSafetySha256,
                                      int finalExposure,
-                                     bool finalWritten,
+                                     const QString &finalSha256,
                                      const QString &safety )
 {
-    return QStringLiteral("pre_safety=%1 pre_safety_exposure=%2 final=%3 final_exposure=%4 safety=%5 frame=%6")
-        .arg( preSafetyWritten ? lookAssistPictureDumpFileName( false, frame ) : QStringLiteral("none") )
+    const bool preWritten = !preSafetySha256.isEmpty();
+    const bool finalWritten = !finalSha256.isEmpty();
+    return QStringLiteral("pre_safety=%1 pre_safety_sha256=%2 pre_safety_exposure=%3 final=%4 final_sha256=%5 final_exposure=%6 safety=%7 frame=%8")
+        .arg( preWritten ? lookAssistPictureDumpFileName( false, frame ) : QStringLiteral("none") )
+        .arg( preWritten ? preSafetySha256 : QStringLiteral("none") )
         .arg( preSafetyExposure )
         .arg( finalWritten ? lookAssistPictureDumpFileName( true, frame ) : QStringLiteral("none") )
+        .arg( finalWritten ? finalSha256 : QStringLiteral("none") )
         .arg( finalExposure )
         .arg( safety )
         .arg( frame );
+}
+
+bool lookAssistPictureDumpStateLabelValid( const QString &label )
+{
+    if( label.isEmpty() || label.size() > 64 ) return false;
+    for( const QChar c : label )
+    {
+        const ushort u = c.unicode();
+        const bool ok = ( u >= 'A' && u <= 'Z' ) || ( u >= 'a' && u <= 'z' ) || ( u >= '0' && u <= '9' )
+                     || u == '_' || u == '-';
+        if( !ok ) return false;
+    }
+    return true;
 }
 
 } // namespace lookassist

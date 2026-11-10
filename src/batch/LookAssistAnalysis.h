@@ -994,15 +994,19 @@ QString lookAssistSafetyRetreatLogFields( const QString &firstWarning,
 /* ---- The env-gated picture dump (793-F1, MLVAPP_LOOK_ASSIST_PICTURE_DUMP). The look before the safety handling and the
  * look finally shown are two files; look-assist-final-frameN.png is always written AFTER the safety handling. ---- */
 QString lookAssistPictureDumpFileName( bool finalLook, int frame );
-/* The fields of the look_assist.apply.picture_dump line binding each file to the exposure it shows. A file whose write
- * failed is bound as "none" (r2 adversary A1: the line never names a file that does not show that exposure). safety is
- * "keep", "retreat" or "revert". */
+/* The fields of the look_assist.apply.picture_dump line binding each file to the exposure it shows, BY CONTENT: *Sha256 is
+ * the SHA-256 (hex) of the exact PNG bytes this process wrote, empty when the write failed. A file is named only with its
+ * digest, and an unwritten one is "none" (r2 adversary A1/A2: a failed write, or a file another writer left or replaced
+ * under the same name, never verifies). safety is "keep", "retreat" or "revert". */
 QString lookAssistPictureDumpFields( int frame,
                                      int preSafetyExposure,
-                                     bool preSafetyWritten,
+                                     const QString &preSafetySha256,
                                      int finalExposure,
-                                     bool finalWritten,
+                                     const QString &finalSha256,
                                      const QString &safety );
+/* An MLVAPP_LOOK_ASSIST_PICTURE_DUMP_STATES label names state-<label>.png in the dump directory: 1-64 of [A-Za-z0-9_-],
+ * so it can never leave the directory or name another dump file (r2 adversary A1, pass 3). */
+bool lookAssistPictureDumpStateLabelValid( const QString &label );
 
 } // namespace lookassist
 
