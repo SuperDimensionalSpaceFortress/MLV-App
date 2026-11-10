@@ -7228,7 +7228,7 @@ function Get-AttrCudaSwapWindowRecord {
         $maxGapField = [regex]::Match($fields, '(?:^| )max_gap_ms=(?<v>\S+)')
         if ($maxGapField.Success -and $maxGapField.Groups['v'].Value -cmatch '\A[0-9]+(\.[0-9]+)?\z') { $appSwapMaxGapMs = [double]$maxGapField.Groups['v'].Value }
         $beforeField = [regex]::Match($fields, '(?:^| )max_gap_before_serial=(?<v>\S+)')
-        if ($beforeField.Success -and $beforeField.Groups['v'].Value -cmatch '\A[1-9][0-9]{0,8}\z') { $appSwapMaxGapBeforeSerial = [long]$beforeField.Groups['v'].Value }
+        if ($beforeField.Success -and $beforeField.Groups['v'].Value -cmatch '\A[1-9][0-9]{0,17}\z') { $appSwapMaxGapBeforeSerial = [long]$beforeField.Groups['v'].Value }
         if (-not $firstField.Success -or -not $lastField.Success) {
             $why = 'the last playback_smoke.gpu_window_swaps record carries no first_swap_utc/last_swap_utc stamps'
         }
@@ -7455,17 +7455,29 @@ function Get-AttrCudaPlaybackTemporalCoverage {
             $internalOver = $overPrefix[$hiRow] - $overPrefix[$loRow]
             if ($internalOver -gt $maxInternalOver) { $maxInternalOver = $internalOver }
             if ($internalOver -ge 1 -and $presentCount -gt 0) {
-                # CoS G8 placement: how many in-window PRESENTS (displayed or not; adversary r5 A1) precede the displayed row that ends the largest
-                # (over-ceiling) internal gap at this origin. Two lower-bound binary searches over the presents sorted once above.
+                # CoS G8 placement: the app's ordinal counts swaps up to the one before its longest gap. PresentMon's largest (over-ceiling) gap here
+                # is between two DISPLAYED rows; presents that were not displayed can sit inside it on either side of the stall (adversary r5 A1 on
+                # 6bc472b8 and on 53de9684). So inside [the row before the gap, the row after it] the stall is the largest PRESENT-to-present gap,
+                # and the count is the in-window presents up to and including the present before THAT gap. Lower-bound binary searches over the
+                # presents sorted once above, then a scan of the presents inside the displayed gap only.
+                $gapStartMs = $sorted[$widest - 1]
                 $gapEndMs = $sorted[$widest]
                 $lb = 0; $ub = $presentCount
                 while ($lb -lt $ub) { $mid = ($lb + $ub) -shr 1; if ($presents[$mid] -lt $startMs) { $lb = $mid + 1 } else { $ub = $mid } }
                 $fromPresent = $lb
                 $lb = 0; $ub = $presentCount
-                while ($lb -lt $ub) { $mid = ($lb + $ub) -shr 1; if ($presents[$mid] -lt $gapEndMs) { $lb = $mid + 1 } else { $ub = $mid } }
-                $presentsBefore = $lb - $fromPresent
-                if ($null -eq $presentsBeforeMin -or $presentsBefore -lt $presentsBeforeMin) { $presentsBeforeMin = $presentsBefore }
-                if ($null -eq $presentsBeforeMax -or $presentsBefore -gt $presentsBeforeMax) { $presentsBeforeMax = $presentsBefore }
+                while ($lb -lt $ub) { $mid = ($lb + $ub) -shr 1; if ($presents[$mid] -lt $gapStartMs) { $lb = $mid + 1 } else { $ub = $mid } }
+                $stallBefore = -1
+                $stallMs = -1.0
+                for ($p = $lb; ($p + 1) -lt $presentCount -and $presents[$p + 1] -le $gapEndMs; $p++) {
+                    if (($presents[$p + 1] - $presents[$p]) -gt $stallMs) { $stallMs = $presents[$p + 1] - $presents[$p]; $stallBefore = $p }
+                }
+                # (no two presents inside the displayed gap: nothing to place at this origin, so it adds no evidence either way)
+                if ($stallBefore -ge $fromPresent) {
+                    $presentsBefore = $stallBefore + 1 - $fromPresent
+                    if ($null -eq $presentsBeforeMin -or $presentsBefore -lt $presentsBeforeMin) { $presentsBeforeMin = $presentsBefore }
+                    if ($null -eq $presentsBeforeMax -or $presentsBefore -gt $presentsBeforeMax) { $presentsBeforeMax = $presentsBefore }
+                }
             }
         }
         # adversary r1 A2: an insufficient origin (zero rows is always insufficient) is never outvoted by a sufficient one; then the larger gap wins.

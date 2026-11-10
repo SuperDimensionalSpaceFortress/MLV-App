@@ -492,13 +492,16 @@ class StrictSwapStampTests(unittest.TestCase):
         proc, out = run_pwsh_json(f"Import-Module '{MODULE}' -Force\n"
                                   "$o = foreach ($l in @($env:PMG_LOGS | ConvertFrom-Json)) { Get-AttrCudaSwapWindowRecord -LogText $l }\n"
                                   "ConvertTo-Json -InputObject @($o) -Compress -Depth 3",
-                                  PMG_LOGS=json.dumps([good, good + "\n" + stampless, suffix, good + "\nplayback_smoke.gpu_window_swaps_debug path=x"]))
+                                  PMG_LOGS=json.dumps([good, good + "\n" + stampless, suffix, good + "\nplayback_smoke.gpu_window_swaps_debug path=x",
+                                                       good + " max_gap_before_serial=1000000000"]))
         self.assertIsNotNone(out, proc.stdout + proc.stderr)
         self.assertIsNone(out[0]["why"], out[0])
         self.assertIsNotNone(out[0]["firstUtc"], out[0])
         # adversary r5 A2 (minor, introduced): a longer record name after the marker is not this record, so the real one stays the last
         self.assertIsNone(out[3]["why"], out[3])
         self.assertEqual(out[3]["firstUtc"], out[0]["firstUtc"], out[3])
+        # adversary r5 53de9684 A2 (minor, introduced): a ten-digit ordinal is still a plain positive integer
+        self.assertEqual(out[4]["appSwapMaxGapBeforeSerial"], 1000000000, out[4])
         for label, r in zip(("stampless final record", "suffix stamps"), out[1:3]):
             self.assertIn("carries no first_swap_utc/last_swap_utc", r["why"], (label, r))
             self.assertIsNone(r["firstUtc"], (label, r))
@@ -694,6 +697,26 @@ class AppStallAttributionTests(unittest.TestCase):
         self.assertEqual(v["verdict"], "APP_SWAP_STALL", v)
         self.assertFalse(v["blocks"], v)
         self.assertTrue(v["failsLeg"], v)
+
+    def test_r5_53de9684_a1_undisplayed_presents_inside_the_displayed_gap_never_move_the_stall(self) -> None:
+        # adversary review-adversary-...-r5-53de9684 A1 (introduced, major), its literal input: one present at 2000 ms, the app stalls 6000 ms (swap 1 is
+        # before its longest gap), then presents every 50 ms from 8000 ms; the first four after the stall (8000..8150) are not displayed, so the displayed
+        # gap is 2000 -> 8200. On 53de9684 counting presents before the displayed row that ends the gap gave 5, not 1: placement false, the stall refused.
+        presents = [2000.0] + [8000.0 + 50.0 * k for k in range(681)]
+        displayed = [t for t in presents if t not in (8000.0, 8050.0, 8100.0, 8150.0)]
+        log = ("playback_smoke.gpu_window_swaps session=1 window_active=1 telemetry_enabled=1 swaps=682 max_gap_ms=6000.000 max_gap_before_serial=1 "
+               "max_gap_after_serial=2 first_swap_utc=2026-11-09T00:00:02.000Z last_swap_utc=2026-11-09T00:00:42.000Z")
+        # the mirror: undisplayed presents BEFORE the stall (displayed every other present up to it), so the displayed gap opens early
+        before = [2000.0 + 50.0 * k for k in range(161)] + [16000.0 + 50.0 * k for k in range(521)]
+        before_displayed = [t for t in before if t <= 9900.0 and t % 100.0 == 0.0] + [t for t in before if t >= 16000.0]
+        before_log = log.replace("max_gap_before_serial=1 max_gap_after_serial=2", "max_gap_before_serial=161 max_gap_after_serial=162")
+        got = coverages([(displayed, log, self.G8_T0, self.G8_T0, presents), (before_displayed, before_log, self.G8_T0, self.G8_T0, before)])
+        for label, r in zip(("undisplayed presents after the stall", "undisplayed presents before the stall"), got):
+            self.assertEqual((r["windowSource"], r["gapKind"], r["overBoundGapCount"]), ("app_swap_window", "internal", 1), (label, r))
+            self.assertIs(r["overBoundGapAtAppStall"], True, (label, r))
+        for label, v in zip(("after", "before"), verdicts([self.as_metrics(r) for r in got])):
+            self.assertEqual(v["verdict"], "APP_SWAP_STALL", (label, v))
+            self.assertTrue(v["failsLeg"], (label, v))
 
     def test_the_job_places_the_gap_by_the_selected_chains_presents(self) -> None:
         job = JOB.read_text(encoding="utf-8")
