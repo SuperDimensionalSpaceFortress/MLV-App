@@ -477,6 +477,37 @@ class AppStallAttributionTests(unittest.TestCase):
 
 
 @requires_windows_pwsh
+class AdversaryR3Tests(unittest.TestCase):
+    """Adversary review-adversary-...-r3-c81b5332 findings A1-A3 (introduced, major), each fed its literal input."""
+
+    T0 = "2026-11-09T00:00:00.0000000Z"
+
+    def test_a1_a_permitted_origin_with_an_edge_gap_is_never_explained_as_the_apps_stall(self) -> None:
+        log = ("playback_smoke.gpu_window_swaps session=1 window_active=1 telemetry_enabled=1 swaps=126 max_gap_ms=21000 "
+               "first_swap_utc=2026-11-09T00:00:20.000Z last_swap_utc=2026-11-09T00:00:45.000Z")
+        r = coverages([([20000.0 + 40.0 * i for i in range(101)] + [45000.0], log, self.T0, "2026-11-09T00:00:01.0000000Z")])[0]
+        self.assertGreaterEqual(r["overBoundGapCount"], 2, r)
+        v = verdicts([{"presentMonStatus": "degraded", "presentMonTemporalMaxGapMs": r["maxGapMs"], "presentMonTemporalGapKind": r["gapKind"],
+                       "presentMonTemporalWindowSource": r["windowSource"], "presentMonTemporalAppSwapMaxGapMs": r["appSwapMaxGapMs"],
+                       "presentMonTemporalOverBoundGapCount": r["overBoundGapCount"]}])[0]
+        self.assertNotEqual(v["verdict"], "APP_SWAP_STALL", (r, v))
+        self.assertTrue(v["blocks"], v)
+
+    def test_a2_the_count_covers_head_internal_and_tail_at_one_interior_origin(self) -> None:
+        log = ("playback_smoke.gpu_window_swaps session=1 window_active=1 telemetry_enabled=1 swaps=102 max_gap_ms=6000 "
+               "first_swap_utc=2026-11-09T00:00:05.100Z last_swap_utc=2026-11-09T00:00:25.120Z")
+        r = coverages([([10000.0, 16000.0] + [16000.0 + 40.0 * i for i in range(1, 101)], log, self.T0, "2026-11-09T00:00:00.2200000Z")])[0]
+        self.assertGreaterEqual(r["overBoundGapCount"], 3, r)
+
+    def test_a3_an_origin_between_two_close_crossings_is_evaluated(self) -> None:
+        log = ("playback_smoke.gpu_window_swaps session=1 window_active=1 telemetry_enabled=1 swaps=2 "
+               "first_swap_utc=2026-11-09T00:00:01.000Z last_swap_utc=2026-11-09T00:00:02.000Z")
+        r = coverages([([999.0, 1999.005], log, self.T0, "2026-11-09T00:00:00.0020000Z")])[0]
+        self.assertEqual(r["windowSource"], "app_swap_window", r)
+        self.assertFalse(r["sufficient"], r)
+
+
+@requires_windows_pwsh
 class SharedReaderGapTests(EvidenceFactory, unittest.TestCase):
     """PR #788 r1 sol B2 (= opus/fable A3 hardening): the shared validator Test-DvReceiptValid applies the same gap verdict the writer does, from the
     VERIFIED verbatim metrics, so a PASS/FAIL receipt whose PresentMon gap blocks is INVALID in every reader (Invoke-VenueBaseline, New-VenueSheetPair,

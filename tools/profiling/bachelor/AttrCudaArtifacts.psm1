@@ -7207,7 +7207,8 @@ function Get-AttrCudaPlaybackTemporalCoverage {
     not trusted (trace readiness not observed), the bracket permits too many origins, or the last record has no non-empty swap window in the
     writer's exact stamp shape (ConvertFrom-AttrCudaSwapStampUtc). The caller then falls back to the process-lifetime window and says so.
     appSwapMaxGapMs is that same record's max_gap_ms (the app's own longest inter-swap gap, $null when absent or not a plain decimal) and
-    overBoundGapCount the most gaps over MaxGapMs any permitted origin shows: Get-DvPresentMonGapVerdict reads both to tell an app stall from
+    overBoundGapCount an upper bound on the gaps over MaxGapMs any one permitted origin shows (the most internal ones at any origin, plus one
+    per edge kind -- head, tail, empty window -- over MaxGapMs at any origin): Get-DvPresentMonGapVerdict reads both to tell an app stall from
     lost PresentMon rows.
     #>
     [CmdletBinding()]
@@ -7291,19 +7292,23 @@ function Get-AttrCudaPlaybackTemporalCoverage {
     $values = @($TimeInMsValues | Where-Object { $null -ne $_ })
     # adversary r2 A2: PresentMon's origin may be ANY instant in [EarliestAnchorUtc, LatestAnchorUtc], and the worst gap need not sit at either end:
     # the window slides over the rows as the origin moves, and a hole is inside it only for the origins between the endpoints. The gap as a
-    # function of the origin changes only where a row crosses a window edge, so the origins tried are the two endpoints plus, for every row, the origin
-    # that puts it exactly on the window start and on the window end, each with a 0.01 ms step either side (the edges are inclusive).
+    # function of the origin changes only where a row crosses a window edge. adversary r3 A3: a fixed 0.01 ms step either side of each crossing skipped an
+    # interval narrower than that, so the origins tried are now EXACT: the two endpoints, every crossing (the edges are inclusive, so a row on an edge is
+    # inside), and the midpoint of every interval between consecutive crossings (row membership is constant inside one).
     $originSpanMs = ([datetime]$LatestAnchorUtc - [datetime]$EarliestAnchorUtc).TotalMilliseconds
     $startAtEarliestMs = ($firstUtc - [datetime]$EarliestAnchorUtc).TotalMilliseconds
     $windowMs = ($lastUtc - $firstUtc).TotalMilliseconds
-    $origins = @(0.0, $originSpanMs)
+    $crossings = @(0.0, $originSpanMs)
     foreach ($v in $values) {
         foreach ($edge in @(($startAtEarliestMs - $v), ($startAtEarliestMs + $windowMs - $v))) {
-            foreach ($step in @(-0.01, 0.0, 0.01)) {
-                $o = $edge + $step
-                if ($o -gt 0.0 -and $o -lt $originSpanMs) { $origins += $o }
-            }
+            if ($edge -gt 0.0 -and $edge -lt $originSpanMs) { $crossings += $edge }
         }
+    }
+    $crossings = @($crossings | Sort-Object -Unique)
+    $origins = @()
+    for ($i = 0; $i -lt $crossings.Count; $i++) {
+        $origins += $crossings[$i]
+        if ($i + 1 -lt $crossings.Count) { $origins += ($crossings[$i] + $crossings[$i + 1]) / 2.0 }
     }
     $originList = @($origins | Sort-Object -Unique)
     if ($originList.Count -gt 1500) {
@@ -7313,9 +7318,15 @@ function Get-AttrCudaPlaybackTemporalCoverage {
         }
     }
     $worst = $null
-    # PR #788 r1 opus B3: the most gaps over the ceiling that any permitted origin shows (head, each internal gap, tail). The app's one max_gap_ms can
-    # account for one gap at most, so the receipt guard reads a stall as the app's only when this is exactly 1. Counted only for an insufficient origin.
-    $overBoundGapCount = 0
+    # PR #788 r1 opus B3: an UPPER BOUND on the gaps over the ceiling that any one permitted origin shows. The app's one max_gap_ms can account for one
+    # internal gap at most, so the receipt guard reads a stall as the app's only when this is exactly 1. adversary r3 A1/A2: an edge gap (head, tail, or an
+    # empty window) over the ceiling at ANY permitted origin can never be an inter-swap gap, and a head and a tail can both exceed it at an interior origin
+    # that no sample need hit, so each edge kind seen over the ceiling anywhere adds one to the most internal over-ceiling gaps at any origin. Counted only
+    # for an insufficient origin (a sufficient one has no gap over the ceiling).
+    $maxInternalOver = 0
+    $headOver = $false
+    $tailOver = $false
+    $emptyOver = $false
     foreach ($originMs in $originList) {
         $startMs = $startAtEarliestMs - $originMs
         $endMs = $startMs + $windowMs
@@ -7323,20 +7334,21 @@ function Get-AttrCudaPlaybackTemporalCoverage {
         $cov = Get-AttrCudaTemporalCoverage -TimeInMsValues $inWindow -WindowStartMs $startMs -WindowEndMs $endMs -MaxGapMs $MaxGapMs
         if (-not $cov.sufficient) {
             $sortedIn = @($inWindow | Sort-Object)
-            $over = 0
-            if ($sortedIn.Count -eq 0) { $over = 1 }
+            if ($sortedIn.Count -eq 0) { $emptyOver = $true }
             else {
-                if (($sortedIn[0] - $startMs) -gt $MaxGapMs) { $over++ }
-                for ($i = 1; $i -lt $sortedIn.Count; $i++) { if (($sortedIn[$i] - $sortedIn[$i - 1]) -gt $MaxGapMs) { $over++ } }
-                if (($endMs - $sortedIn[$sortedIn.Count - 1]) -gt $MaxGapMs) { $over++ }
+                if (($sortedIn[0] - $startMs) -gt $MaxGapMs) { $headOver = $true }
+                $internalOver = 0
+                for ($i = 1; $i -lt $sortedIn.Count; $i++) { if (($sortedIn[$i] - $sortedIn[$i - 1]) -gt $MaxGapMs) { $internalOver++ } }
+                if ($internalOver -gt $maxInternalOver) { $maxInternalOver = $internalOver }
+                if (($endMs - $sortedIn[$sortedIn.Count - 1]) -gt $MaxGapMs) { $tailOver = $true }
             }
-            if ($over -gt $overBoundGapCount) { $overBoundGapCount = $over }
         }
         $anchorName = if ($originMs -eq 0.0) { 'earliest' } elseif ($originMs -eq $originSpanMs) { 'latest' } else { 'interior' }
         # adversary r1 A2: an insufficient origin (zero rows is always insufficient) is never outvoted by a sufficient one; then the larger gap wins.
         $worse = ($null -eq $worst) -or ((-not $cov.sufficient) -and $worst.cov.sufficient) -or (([bool]$cov.sufficient -eq [bool]$worst.cov.sufficient) -and $cov.maxGapMs -gt $worst.cov.maxGapMs)
         if ($worse) { $worst = @{ cov = $cov; anchor = $anchorName; rows = $inWindow.Count } }
     }
+    $overBoundGapCount = $maxInternalOver + [int]$headOver + [int]$tailOver + [int]$emptyOver
     [pscustomobject]@{
         windowSource = 'app_swap_window'; unavailableReason = $null
         sufficient = [bool]$worst.cov.sufficient; maxGapMs = $worst.cov.maxGapMs; gapKind = $worst.cov.gapKind
