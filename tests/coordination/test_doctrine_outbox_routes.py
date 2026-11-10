@@ -2705,6 +2705,22 @@ def make_directory_link(link: Path, target: Path) -> str:
         return "junction"
 
 
+def rename_through_os_rename(monkeypatch) -> None:
+    """r7 A1: both renames of the removal go through _rename_verified, which renames BY HANDLE on Windows, so a seam row that
+    hooks os.rename would never see them. This routes _rename_verified through its by-name form (the identity checked by lstat,
+    then os.rename, as the seam rows were written against), keeping each seam and its assertions; the by-handle path itself is
+    covered by every other removal row and by test_r7_e2_a1."""
+    def by_name(src, dst, ident):
+        if ident is None:
+            raise ob._NotOurs(f"{src} has no pinned identity to verify")
+        seen = ob._meta(os.lstat, src)
+        if not ob._plain_dir(seen) or ob._ident(seen) != ident:
+            raise ob._NotOurs(f"{src} is not the scratch directory pinned for it")
+        ob._meta(ob.os.rename, src, dst)
+
+    monkeypatch.setattr(ob, "_rename_verified", by_name)
+
+
 def scratch_now(base: Path) -> Path:
     """Where the scratch `base` is now: its own name, or (r5: removal renames it first) the private `<name>.rm-<hex>` beside it."""
     if os.path.lexists(base):
@@ -3204,6 +3220,7 @@ def test_the_error_hook_never_chmods_or_unlinks_inside_a_scratch_replaced_by_an_
             os.chmod(planted, stat_module.S_IREAD)
 
     monkeypatch.setattr(ob.os, "rename", rename_then_lose_the_scratch_to_a_swap)
+    rename_through_os_rename(monkeypatch)
     monkeypatch.setattr(ob, "_remove_tree", lambda path, *a: (_ for _ in ()).throw(AssertionError(f"walked {path}")))
     with pytest.raises(ob.Unknown) as caught:
         ob.remove_exercise_scratch(base, root)
@@ -3686,6 +3703,7 @@ def test_a_verified_rename_that_ends_past_the_deadline_still_completes_the_remov
         real_walk(path, *args)
 
     monkeypatch.setattr(ob.os, "rename", slow_rename)
+    rename_through_os_rename(monkeypatch)
     monkeypatch.setattr(ob, "_remove_tree", walk)
     monkeypatch.setattr(ob, "time", types.SimpleNamespace(monotonic=lambda: clock[0], sleep=lambda s: clock.__setitem__(0, clock[0] + s)))
     ob.remove_exercise_scratch(base, root)
@@ -3783,6 +3801,7 @@ def test_r6_f1_a_root_swapped_for_a_junction_to_itself_is_never_removed_through(
             return real_rename(src, dst, *args, **kwargs)
 
         monkeypatch.setattr(ob.os, "rename", rename)
+        rename_through_os_rename(monkeypatch)
     else:
         real_hold = ob._DirHold
 
@@ -3890,6 +3909,7 @@ def test_r6_f2_a_single_denied_root_read_after_the_private_rename_is_retried_not
         return real_read(path, *args, **kwargs)
 
     monkeypatch.setattr(ob.os, "rename", rename)
+    rename_through_os_rename(monkeypatch)
     monkeypatch.setattr(ob.os, which.split(".")[1], read)
     ob.remove_exercise_scratch(base, root)                               # never the typed foreign-object outcome for one denial
     monkeypatch.undo()
@@ -3926,6 +3946,7 @@ def test_r6_f2_a_denied_private_read_then_a_held_put_back_is_retried_not_final(t
 
     monkeypatch.setattr(ob.os, "lstat", lstat)
     monkeypatch.setattr(ob.os, "rename", rename)
+    rename_through_os_rename(monkeypatch)
     ob.remove_exercise_scratch(base, root)
     monkeypatch.undo()
     assert faults["lstat"] == 1, faults
@@ -3980,6 +4001,7 @@ def test_r6_f1_a_scratch_moved_off_its_private_name_by_another_process_is_never_
             real_rename(dst, moved)
 
     monkeypatch.setattr(ob.os, "rename", rename)
+    rename_through_os_rename(monkeypatch)
     monkeypatch.setattr(ob, "ROUTE_SCRATCH_REMOVE_PAUSE", 0)
     monkeypatch.setattr(ob, "ROUTE_SCRATCH_REMOVE_DEADLINE", 0.5)
     with pytest.raises(ob.Unknown) as caught:
@@ -4017,6 +4039,7 @@ def test_r6_a6_a_single_denied_metadata_read_right_after_the_private_rename_is_i
         return real_lstat(path, *args, **kwargs)
 
     monkeypatch.setattr(ob.os, "rename", rename)
+    rename_through_os_rename(monkeypatch)
     monkeypatch.setattr(ob.os, "lstat", lstat)
     ob.remove_exercise_scratch(base, root)
     monkeypatch.undo()
@@ -4105,8 +4128,8 @@ def test_r6_a4_a_child_swapped_after_the_listing_is_never_walked_or_deleted(tmp_
     (planted / "precious.txt").write_text("not ours", encoding="utf-8")
     real_list, swapped = ob._list_dir, []
 
-    def list_then_swap(path):
-        got = real_list(path)
+    def list_then_swap(path, record=None):
+        got = real_list(path, record)
         for child, _identity, is_dir in got:
             if is_dir and os.path.basename(child) == "objects" and not swapped:
                 os.rename(child, tmp_path / "objects-aside")
@@ -4315,3 +4338,139 @@ def test_r7_b1_a_relisting_that_only_drops_entries_still_completes(tmp_path, mon
     ob.remove_exercise_scratch(base, root)
     assert len(entered) >= 4, entered
     assert list(root.iterdir()) == [], list(root.iterdir())
+
+# Adversary pass r7 (head e2d403d9): A1 a put-back renames only the very object it verified (by handle); A2 identities read from
+# a listing that failed part-way are kept, so a retry never adopts a replacement of an entry it already saw; A3 the scratch root
+# recorded at creation is used as it is, so a transient failure of a later non-strict resolution is never a refusal.
+
+@pytest.mark.skipif(os.name != "nt", reason="the put-back renames by handle on Windows; elsewhere it is the documented POSIX limit")
+def test_r7_e2_a1_a_put_back_never_moves_a_directory_swapped_in_after_its_verification(tmp_path, monkeypatch):
+    import types
+    root = tmp_path / "scratch"
+    base = root / (ob.ROUTE_SCRATCH_PREFIX + "test")
+    base.mkdir(parents=True)
+    ob._pin_scratch(base, root)
+    for name in ("A", "B"):
+        (base / name).mkdir()
+        (base / name / "ours.txt").write_text("ours", encoding="utf-8")
+    real_hold, failed, swapped = ob._DirHold, [], []
+
+    class FailTheFirstSiblingOnce(real_hold):
+        def __enter__(self):
+            if not failed and os.path.basename(self.path) in ("A", "B"):
+                failed.append(self.path)
+                raise PermissionError(13, "The process cannot access the file because it is being used by another process", self.path)
+            return super().__enter__()
+
+    real_time = ob.time
+
+    def private_now() -> Path:
+        moved = [p for p in root.iterdir() if p.name.startswith(base.name + ".rm-")]
+        assert len(moved) == 1, moved
+        return moved[0]
+
+    def pause(seconds):                                                  # a new entry appears: the relisting refuses (B1)
+        if failed and not (private_now() / "C").exists():
+            (private_now() / "C").mkdir()
+
+    real_lexists = os.path.lexists
+
+    def lexists_then_swap(path):                                         # the put-back's last look: then the private name is swapped
+        got = real_lexists(path)
+        if (os.path.normcase(str(path)) == os.path.normcase(str(base)) and not swapped and failed
+                and (private_now() / "C").exists()):
+            private = private_now()
+            os.rename(private, tmp_path / "scratch-aside")
+            private.mkdir()
+            (private / "precious.txt").write_text("not ours", encoding="utf-8")
+            swapped.append(private)
+        return got
+
+    monkeypatch.setattr(ob, "_DirHold", FailTheFirstSiblingOnce)
+    monkeypatch.setattr(ob, "time", types.SimpleNamespace(monotonic=real_time.monotonic, sleep=pause))
+    monkeypatch.setattr(ob.os.path, "lexists", lexists_then_swap)
+    monkeypatch.setattr(ob, "ROUTE_SCRATCH_REMOVE_PAUSE", 0)
+    monkeypatch.setattr(ob, "ROUTE_SCRATCH_REMOVE_DEADLINE", 0.5)
+    try:
+        with pytest.raises(ob.Unknown) as caught:
+            ob.remove_exercise_scratch(base, root)
+    finally:
+        monkeypatch.setattr(ob.os.path, "lexists", real_lexists)
+    assert swapped, "the swap seam never ran"
+    assert caught.value.code == "EXERCISE_SCRATCH_NOT_REMOVED", caught.value
+    assert not base.exists(), "the directory swapped in after the put-back's verification was moved under the scratch's name"
+    assert (swapped[0] / "precious.txt").exists() and "put back" not in caught.value.detail, caught.value.detail
+    assert (tmp_path / "scratch-aside" / "A").exists() or (tmp_path / "scratch-aside" / "B").exists()
+
+
+@pytest.mark.skipif(os.name != "nt", reason="the multi-response FileIdBothDirectoryInfo enumeration is the Windows listing")
+def test_r7_e2_a2_an_entry_seen_by_a_listing_that_failed_part_way_is_never_adopted_from_a_replacement(tmp_path, monkeypatch):
+    import ctypes
+    import types
+    root = tmp_path / "scratch"
+    base = root / (ob.ROUTE_SCRATCH_PREFIX + "test")
+    base.mkdir(parents=True)
+    ob._pin_scratch(base, root)
+    for name in ("A", "B"):
+        (base / name).mkdir()
+        (base / name / "ours.txt").write_text("ours", encoding="utf-8")
+    real_k32, failed, changed = ob._kernel32(), [], []
+
+    class FailTheSecondResponseOnce:
+        def __getattr__(self, name):
+            return getattr(real_k32, name)
+
+        def GetFileInformationByHandleEx(self, handle, info_class, buffer, size):
+            if info_class == 10 and not failed:                         # the first response (A and B) came back; the next one fails
+                failed.append(handle)
+                ctypes.set_last_error(32)                               # ERROR_SHARING_VIOLATION: transient
+                return 0
+            return real_k32.GetFileInformationByHandleEx(handle, info_class, buffer, size)
+
+    proxy = FailTheSecondResponseOnce()
+    real_time = ob.time
+
+    def pause(seconds):                                                  # B, seen by the failed listing, is replaced by B'
+        if failed and not changed:
+            where = scratch_now(base)
+            os.rename(where / "B", tmp_path / "B-aside")
+            (where / "B").mkdir()
+            (where / "B" / "precious.txt").write_text("not ours", encoding="utf-8")
+            changed.append(where)
+
+    monkeypatch.setattr(ob, "_kernel32", lambda: proxy)
+    monkeypatch.setattr(ob, "time", types.SimpleNamespace(monotonic=real_time.monotonic, sleep=pause))
+    monkeypatch.setattr(ob, "ROUTE_SCRATCH_REMOVE_PAUSE", 0)
+    monkeypatch.setattr(ob, "ROUTE_SCRATCH_REMOVE_DEADLINE", 0.5)
+    with pytest.raises(ob.Unknown) as caught:
+        ob.remove_exercise_scratch(base, root)
+    assert failed and changed, (failed, changed)
+    assert caught.value.code == "EXERCISE_SCRATCH_NOT_REMOVED", caught.value
+    survivors = list(root.rglob("precious.txt"))
+    assert len(survivors) == 1 and survivors[0].read_text(encoding="utf-8") == "not ours", survivors
+    assert (tmp_path / "B-aside" / "ours.txt").exists()
+
+
+def test_r7_e2_a3_a_transient_failure_resolving_an_aliased_scratch_root_at_removal_is_not_a_refusal(tmp_path, monkeypatch):
+    bus = make_bus(tmp_path)
+    real_root = tmp_path / "scratch-real"
+    real_root.mkdir()
+    alias = tmp_path / "scratch-link"
+    make_directory_link(alias, real_root)
+
+    def git_ok(git_bin, args, cwd, clone):
+        return subprocess.CompletedProcess(args, 0, "0123456789abcdef0123456789abcdef01234567\n", "")
+
+    monkeypatch.setattr(ob, "run_isolated_git", git_ok)
+    base, _clone, _tip = ob.make_exercise_scratch(bus, alias)
+    real_real, unresolved = ob._real, []
+
+    def realpath_denied_once(path, strict=False):                        # a sharing violation during the non-strict lookup:
+        if not strict and not unresolved and os.path.normcase(os.fspath(path)) == os.path.normcase(str(alias)):
+            unresolved.append(path)
+            return os.path.abspath(path)                                 # realpath gives the alias back, unresolved
+        return real_real(path, strict)
+
+    monkeypatch.setattr(ob, "_real", realpath_denied_once)
+    ob.remove_exercise_scratch(base, alias)
+    assert list(real_root.iterdir()) == [], list(real_root.iterdir())

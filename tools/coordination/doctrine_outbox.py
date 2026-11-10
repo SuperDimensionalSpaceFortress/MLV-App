@@ -4018,6 +4018,7 @@ class _DirHold:
 
 
 _SCRATCH_PINS: dict[str, tuple[tuple[int, int] | None, tuple[int, int] | None]] = {}   # scratch dir -> (root id, scratch id) at creation
+_SCRATCH_ROOTS: dict[str, str] = {}                                     # scratch dir -> the real root path it was made under
 
 
 def _scratch_key(base: pathlib.Path) -> str:
@@ -4112,9 +4113,14 @@ def remove_exercise_scratch(base: pathlib.Path, scratch_root: pathlib.Path) -> N
     key = _scratch_key(base)
     pinned_at_creation = key in _SCRATCH_PINS
     root_id, work_id = _SCRATCH_PINS.get(key, (None, None))
+    recorded = _SCRATCH_ROOTS.get(key)
     try:
-        root = pathlib.Path(_real(scratch_root))                        # pinned: every later look compares against THIS
-        parent = _real(base.parent)
+        if recorded is not None:                                        # the real root it was made under: used as it is, never
+            root = pathlib.Path(recorded)                               # resolved again (a transient lookup failure is no refusal, r7 A3)
+            parent = os.path.dirname(os.path.abspath(base))
+        else:
+            root = pathlib.Path(_real(scratch_root))                    # pinned: every later look compares against THIS
+            parent = _real(base.parent)
         if os.path.normcase(parent) != os.path.normcase(str(root)):
             if pinned_at_creation:                                      # ours, but its root cannot be pinned: unknown, never "done"
                 raise Unknown("EXERCISE_SCRATCH_NOT_REMOVED",
@@ -4124,6 +4130,7 @@ def remove_exercise_scratch(base: pathlib.Path, scratch_root: pathlib.Path) -> N
         _remove_pinned_scratch(base, root, root_id, work_id, pinned_at_creation)
     finally:
         _SCRATCH_PINS.pop(key, None)                                    # a pin never outlives its removal (CoS G3)
+        _SCRATCH_ROOTS.pop(key, None)
 
 
 def _remove_pinned_scratch(base: pathlib.Path, root: pathlib.Path, root_id: tuple[int, int] | None,
@@ -4179,7 +4186,7 @@ def _remove_pinned_scratch(base: pathlib.Path, root: pathlib.Path, root_id: tupl
             if target == work:                                          # removal never walks the scratch's own name
                 private = root / f"{work.name}.rm-{os.urandom(8).hex()}"   # keeps the run's prefix; nobody can name it in advance
                 renamed = True
-                _meta(os.rename, work, private)
+                _rename_verified(work, private, work_id)                # by handle: only the object just verified is moved (r7 A1)
                 target = private
             held = _DirHold(target)
             with held as reparse:                                       # from here the object under the private name cannot change
@@ -4202,11 +4209,11 @@ def _remove_pinned_scratch(base: pathlib.Path, root: pathlib.Path, root_id: tupl
         if target != work:                                              # leave the data where it was: put it back under its name,
             try:                                                        # but only the pinned scratch, under the pinned root
                 with _DirHold(root) as root_reparse:
-                    seen_root, seen = _meta(os.lstat, root), _meta(os.lstat, target)
-                    if (root_reparse or not _plain_dir(seen_root) or _ident(seen_root) != root_id or not _plain_dir(seen)
-                            or _ident(seen) != work_id or os.path.lexists(work)):
+                    seen_root = _meta(os.lstat, root)
+                    if (root_reparse or not _plain_dir(seen_root) or _ident(seen_root) != root_id or work_id is None
+                            or os.path.lexists(work)):
                         raise _NotOurs(f"what holds {target} now is not known to be it")
-                    _meta(os.rename, target, work)
+                    _rename_verified(target, work, work_id)             # by handle: verified and moved as ONE object (r7 A1)
                 target, put = work, f"it was put back under {work}"
             except (OSError, _NotOurs) as e:
                 put = f"nothing was moved back: it is left under {target} ({e})"
@@ -4258,13 +4265,20 @@ def _remove_tree(top: str | os.PathLike, listed: "_Listed | None" = None) -> Non
     _remove_contents(os.fspath(top), _Listed() if listed is None else listed)
 
 
-def _list_dir(path: str) -> list[tuple[str, int | None, bool]]:
+def _list_dir(path: str, record=None) -> list[tuple[str, int | None, bool]]:
     """(full name, identity, is a real directory) for each entry of the HELD directory `path`, the identity and kind read from the
     listing itself, so a name swapped after the listing never carries the listed identity. Windows: GetFileInformationByHandleEx
-    with FileIdBothDirectoryInfo on a handle of `path` (the 64-bit file id). Elsewhere: os.scandir (the listing's d_ino, d_type)."""
+    with FileIdBothDirectoryInfo on a handle of `path` (the 64-bit file id). Elsewhere: os.scandir (the listing's d_ino, d_type).
+    `record(full name, identity)` is called for each entry AS IT IS READ, so the entries of a listing that fails part-way (a later
+    response of the enumeration raises) are still recorded (adversary r7 A2); it may raise to stop the listing."""
     if os.name != "nt":
+        found = []
         with _meta(os.scandir, path) as listing:
-            return [(entry.path, entry.inode(), entry.is_dir(follow_symlinks=False) and not entry.is_symlink()) for entry in listing]
+            for entry in listing:
+                if record is not None:
+                    record(entry.path, entry.inode())
+                found.append((entry.path, entry.inode(), entry.is_dir(follow_symlinks=False) and not entry.is_symlink()))
+        return found
     import ctypes
     import struct
     k32, found = _kernel32(), []
@@ -4285,6 +4299,8 @@ def _list_dir(path: str) -> list[tuple[str, int | None, bool]]:
                 file_id, = struct.unpack_from("<Q", buffer, offset + 96)
                 name = buffer.raw[offset + 104:offset + 104 + name_bytes].decode("utf-16-le", "surrogatepass")   # NTFS names may hold lone surrogates
                 if name not in (".", ".."):
+                    if record is not None:
+                        record(os.path.join(path, name), file_id)
                     found.append((os.path.join(path, name), file_id, bool(attributes & 0x10) and not attributes & 0x400))
                 if not step:
                     break
@@ -4348,29 +4364,82 @@ def _delete_entry(path: str, identity: int | None, is_dir: bool, posix_info: os.
 
 
 class _Listed:
-    """What ONE removal's walk has listed, kept across its attempts (786-D824-B1). `dirs`: the directories already listed once.
-    `ids`: the identity of EVERY entry of each of those FIRST listings, recorded before any per-entry step that can fail, so an
-    entry not yet reached when an attempt failed is still pinned when the next attempt relists its directory."""
+    """What ONE removal's walk has listed, kept across its attempts (786-D824-B1). `dirs`: the directories listed COMPLETELY once.
+    `ids`: the identity of every entry ANY listing has read, recorded as it is read and before any per-entry step that can fail,
+    so an entry not yet reached when an attempt failed, or read by a listing that failed part-way (r7 A2), stays pinned."""
 
     def __init__(self) -> None:
         self.dirs: set[str] = set()
         self.ids: dict[str, int | None] = {}
 
 
+_UNSEEN = object()
+
+
+def _rename_verified(src: pathlib.Path, dst: pathlib.Path, ident: tuple[int, int] | None) -> None:
+    """Rename `src` to `dst`, a name in the SAME directory, only when what is renamed is the real directory pinned as `ident`
+    (adversary r7 A1). Windows: `src` is opened (no link followed) for DELETE, its identity is read on THAT handle (os.fstat: the
+    same (st_dev, st_ino) os.lstat gives) and that very handle is renamed (FileRenameInfo, never replacing), so no name lookup
+    stands between the check and the rename. Another object is _NotOurs, nothing moved. Elsewhere: lstat, then a rename by name
+    (the documented POSIX limit: no handle)."""
+    if ident is None:
+        raise _NotOurs(f"{src} has no pinned identity to verify")
+    if os.name != "nt":
+        seen = _meta(os.lstat, src)
+        if not _plain_dir(seen) or _ident(seen) != ident:
+            raise _NotOurs(f"{src} is not the scratch directory pinned for it")
+        _meta(os.rename, src, dst)
+        return
+    import ctypes
+    import msvcrt
+    import struct
+    if os.path.normcase(os.path.dirname(os.fspath(src))) != os.path.normcase(os.path.dirname(os.fspath(dst))):
+        raise _NotOurs(f"{dst} is not beside {src}")
+    k32 = _kernel32()
+    handle = k32.CreateFileW(os.fspath(src), 0x00010000 | 0x0080,       # DELETE | FILE_READ_ATTRIBUTES
+                             0x1 | 0x2 | 0x4, None, 3,                   # share read/write/delete; OPEN_EXISTING
+                             0x02000000 | 0x00200000, None)              # BACKUP_SEMANTICS | OPEN_REPARSE_POINT (no link followed)
+    if handle is None or handle == ctypes.c_void_p(-1).value:
+        code = ctypes.get_last_error()
+        raise OSError(None, ctypes.FormatError(code), os.fspath(src), code)
+    try:
+        fd = msvcrt.open_osfhandle(handle, os.O_RDONLY)                 # the fd owns the handle from here
+    except BaseException:
+        k32.CloseHandle(handle)
+        raise
+    try:
+        seen = _meta(os.fstat, fd)
+        if not _plain_dir(seen) or _ident(seen) != ident:
+            raise _NotOurs(f"{src} is not the scratch directory pinned for it")
+        name = os.path.abspath(os.fspath(dst)).encode("utf-16-le", "surrogatepass")   # the FULL path: kernel32 reads a bare
+        ptr = ctypes.sizeof(ctypes.c_void_p)                             # name against the process's current directory
+        head = 2 * ptr + 4                                               # ReplaceIfExists (0, padded), RootDirectory (NULL), FileNameLength
+        info = ctypes.create_string_buffer(max(head + len(name) + 2, 3 * ptr))
+        struct.pack_into("<I", info, 2 * ptr, len(name))
+        ctypes.memmove(ctypes.addressof(info) + head, name, len(name))
+        if not k32.SetFileInformationByHandle(handle, 3, info, len(info)):   # FileRenameInfo, on the handle just verified
+            code = ctypes.get_last_error()
+            raise OSError(None, ctypes.FormatError(code), os.fspath(src), code)
+    finally:
+        os.close(fd)
+
+
 def _remove_contents(path: str, listed: _Listed) -> None:
-    entries = _list_dir(path)
     here = os.path.normcase(path)
-    if here not in listed.dirs:                                         # this directory's FIRST listing: every entry recorded first
-        for child, identity, _ in entries:
-            listed.ids[os.path.normcase(child)] = identity
-        listed.dirs.add(here)
-    else:                                                               # a retry's relisting may only DROP entries (all checked first)
-        for child, identity, _ in entries:
-            key = os.path.normcase(child)
-            if key not in listed.ids:
+    complete = here in listed.dirs                                      # listed completely before: a relisting may only DROP entries
+
+    def seen(child: str, identity: int | None) -> None:
+        key = os.path.normcase(child)
+        known = listed.ids.get(key, _UNSEEN)
+        if known is _UNSEEN:
+            if complete:
                 raise _NotOurs(f"{child} was not in the first listing of {path}")
-            if listed.ids[key] != identity:
-                raise _NotOurs(f"{child} is not the entry first listed there")
+            listed.ids[key] = identity
+        elif known != identity:
+            raise _NotOurs(f"{child} is not the entry first listed there")
+
+    entries = _list_dir(path, seen)                                     # every entry checked or recorded before any is acted on
+    listed.dirs.add(here)
     for child, identity, is_dir in entries:
         if not is_dir:
             _remove_entry(child, identity, False)                       # a file, or a link/junction removed as itself
@@ -4430,6 +4499,7 @@ def make_exercise_scratch(bus: pathlib.Path, scratch_root: pathlib.Path) -> tupl
     scratch_root = pathlib.Path(_real(scratch_root))                    # a root named through a link or junction: made under its real path
     base = pathlib.Path(tempfile.mkdtemp(prefix=ROUTE_SCRATCH_PREFIX, dir=str(scratch_root)))
     _SCRATCH_PINS[_scratch_key(base)] = (None, None)                    # made by THIS run, identity not yet read: never adopted later
+    _SCRATCH_ROOTS[_scratch_key(base)] = str(scratch_root)              # the real root, as made under: removal never re-resolves it
     try:
         _pin_scratch(base, scratch_root)                              # what removal must find again; a pin not completed here leaves
                                                                         # the scratch as the typed EXERCISE_SCRATCH_NOT_REMOVED (fail-closed, G9)
