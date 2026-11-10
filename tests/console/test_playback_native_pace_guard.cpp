@@ -13,6 +13,7 @@
 
 #include "../../platform/qt/PlaybackFrameRange.h"
 #include "../../platform/qt/PlaybackNativePaceGuard.h"
+#include "../../platform/qt/PlaybackDueWake.h"
 
 #include <QFile>
 #include <QRegularExpression>
@@ -943,7 +944,12 @@ TEST(PlaybackUnpacedWiring, ReadOnceAndHonouredOnlyInAutomation)
     ASSERT_EQ(1, source.count(QStringLiteral(
         "m_playbackPaceGuard.grant( getPlaybackFramerate() * (double)timeDiff / 1000.0, paceNowMs, playbackPaceGuardFps() ),")));
     ASSERT_EQ(1, source.count(QStringLiteral("m_playbackPaceGuard.notePresent( mlv_stage_timing_now() * 1000.0, playbackPaceGuardFps() );")));
-    ASSERT_EQ(4, source.count(QStringLiteral("playbackPaceGuardFps()")));   // the four calls, and no other caller
+    // HFR-NATIVE-M16-1457-GUI-PRESENT-CADENCE-1: the due wake (arm and re-arm) reads the same pace, and only hands it to the guard's
+    // msUntilCredit -- never unpaced (the arm refuses a pace that is not positive)
+    ASSERT_EQ(2, source.count(QStringLiteral("const double paceFps = playbackPaceGuardFps();")));
+    ASSERT_EQ(2, source.count(QStringLiteral("if( !( paceFps > 0.0 ) || !m_playbackPaceGuard.armed()")));
+    ASSERT_EQ(2, source.count(QStringLiteral("m_playbackPaceGuard.msUntilCredit( framesNeeded, ")));
+    ASSERT_EQ(6, source.count(QStringLiteral("playbackPaceGuardFps()")));   // the four calls, the due wake's two, and no other caller
     ASSERT_EQ(1, source.count(QStringLiteral("double MainWindow::playbackPaceGuardFps( void )")));
 }
 
@@ -1025,4 +1031,323 @@ TEST(PlaybackNativePaceWiring, TheFirstPresentsCatchUpIsSampledAfterItsAdvanceAn
     ASSERT_TRUE(source.contains(QStringLiteral(
         "    m_playbackSmokeFirstPresentMs = 0.0;\n"
         "    m_playbackSmokeFirstPresentTimelineDeltaAbs = 0;\n")));
+}
+
+// ---- HFR-NATIVE-M16-1457-GUI-PRESENT-CADENCE-1: wake the paced advance at its due time, not the next poll tick ----
+//
+// Measured on Bachelor CUDA (paced M16-1457 native 59.94, s2/s4; PRESENT-TRACE-LEGS-1 r1): the first poll tick after a
+// present lands 10.77 ms (fullscreen) / 14.92 ms (windowed) p50 after presentPlaybackPreparedFrame returns, never 8 ms
+// or less. The shown frame was ready 2.4-2.5 ms after the present, the tick -> draw-start hand-off is 1.3 ms, and the
+// GUI draw is 9.2 ms (s2) / 7.4 ms (s4). Cycle = tick wait + 1.3 + draw > 16.68 ms, so drop-frame steps over a frame.
+// The sim below models exactly that schedule: the CUDA early advance at draw start, a poll whose first tick after a
+// present lands tickLagMs later (then every tickLagMs), and -- when dueWake is on -- a one-shot wake at the guard's
+// msUntilCredit( framesToNextWholeFrame ) + 0.25 ms slack + 0..1.5 ms jitter, with the poll kept as the fallback.
+
+using playback_native_pace::framesToNextWholeFrame;
+
+namespace
+{
+
+struct CadenceRun
+{
+    int presented = 0;
+    double sourceAdvanced = 0.0;
+    double wallMs = 0.0;
+    int wakesFired = 0;
+    double presentedFps() const { return presented * 1000.0 / wallMs; }
+    double timelineFps() const { return sourceAdvanced * 1000.0 / wallMs; }
+    double ratio() const { return presented / ( sourceAdvanced > 0.0 ? sourceAdvanced : 1.0 ); }
+};
+
+CadenceRun simulateCudaPresentCadence( double fps, double drawMs, double tickLagMs, bool dueWake,
+                                       double wallMs = 25000.0 )
+{
+    constexpr double kHandoffMs = 1.3;  // tick -> frameReady -> drawFrameReady -> draw start
+    constexpr double kReadyLagMs = 2.5; // the next frame is rendered (lookahead) this long after a present ends
+    constexpr double kSlackMs = 0.25;
+    NativePaceGuard guard;
+    guard.setStartupCatchupLegacy( false );
+    guard.reset();
+    CadenceRun run;
+    double position = 0.0;
+    long lastDrawn = 0;
+    double lastTime = 0.0;
+    unsigned jitterState = 12345u;
+    const auto jitterMs = [&]()
+    {
+        jitterState = jitterState * 1103515245u + 12345u;
+        return 1.5 * static_cast<double>( ( jitterState >> 8 ) & 0xFFFFu ) / 65535.0;
+    };
+    // the measured draw is a p50: each present's draw varies +-1 ms around it (a fixed draw lets the early advance's
+    // own frame changes hide most skips, which the venue legs do not show)
+    unsigned drawState = 777u;
+    const auto drawThisPresentMs = [&]()
+    {
+        drawState = drawState * 1664525u + 1013904223u;
+        return drawMs + 2.0 * ( static_cast<double>( ( drawState >> 8 ) & 0xFFFFu ) / 65535.0 - 0.5 );
+    };
+    // one timerFrameEvent( predictive ) at t; true when it moved to a new frame (a draw is dispatched)
+    const auto advance = [&]( double t, bool predictive )
+    {
+        const int timeDiff = shapedTickTimeDiffMs( static_cast<int>( t - lastTime ), fps, predictive, true, false );
+        const double granted = guard.grant( fps * timeDiff / 1000.0, t, fps );
+        position += granted;
+        run.sourceAdvanced += granted;
+        lastTime = t;
+        const long frame = static_cast<long>( position ); // the slider's frame: setValue truncates (adversary r1 A2)
+        if( frame == lastDrawn ) return false; // the duplicate-present guard
+        lastDrawn = frame;
+        return true;
+    };
+    // the first frame: drawn at 0, so the clock is armed and the first present ends after one draw
+    guard.grant( 0.0, 0.0, fps );
+    double drawStart = 0.0;
+    while( true )
+    {
+        // draw start: the CUDA texture route's early advance (drawFrameReady -> timerFrameEvent( true ))
+        const bool earlyMoved = advance( drawStart, true );
+        const double presentEnd = drawStart + drawThisPresentMs();
+        if( presentEnd > wallMs ) break;
+        ++run.presented;
+        guard.notePresent( presentEnd, fps );
+        if( earlyMoved )
+        {
+            // the early advance already asked for the next frame: it presents as soon as it is ready
+            drawStart = presentEnd + kReadyLagMs + kHandoffMs;
+            continue;
+        }
+        // the next advance opportunity: the poll tick, or the due wake (armed at present end), whichever is first
+        double nextTick = presentEnd + tickLagMs;
+        double wakeAt = -1.0;
+        int rearms = 0;
+        if( dueWake )
+        {
+            const double due = guard.msUntilCredit( framesToNextWholeFrame( position ), presentEnd, fps );
+            if( due < 1.0e6 ) wakeAt = presentEnd + due + kSlackMs + jitterMs();
+        }
+        double advancedAt = -1.0;
+        while( advancedAt < 0.0 )
+        {
+            const bool wakeFirst = wakeAt >= 0.0 && wakeAt <= nextTick;
+            const double t = wakeFirst ? wakeAt : nextTick;
+            if( t > wallMs ) break;
+            if( wakeFirst ) ++run.wakesFired;
+            if( advance( t, wakeFirst ) )
+            {
+                advancedAt = t;
+                break;
+            }
+            if( wakeFirst )
+            {
+                wakeAt = -1.0;
+                if( rearms < 2 )
+                {
+                    ++rearms;
+                    const double due = guard.msUntilCredit( framesToNextWholeFrame( position ), t, fps );
+                    if( due < 1.0e6 ) wakeAt = t + due + kSlackMs + jitterMs();
+                }
+            }
+            else
+            {
+                nextTick += tickLagMs;
+            }
+        }
+        if( advancedAt < 0.0 ) break;
+        const double readyAt = presentEnd + kReadyLagMs;
+        drawStart = ( advancedAt > readyAt ? advancedAt : readyAt ) + kHandoffMs;
+    }
+    run.wallMs = wallMs;
+    return run;
+}
+
+constexpr double kHfrFps = 60000.0 / 1001.0; // 59.94
+
+bool timelineAtOrUnderNative( const CadenceRun & run, double fps )
+{
+    return run.timelineFps() <= fps * 1.001 + kMaxCarryFrames * 1000.0 / run.wallMs;
+}
+
+} // namespace
+
+TEST(PlaybackDueWake, MsUntilCreditIsZeroWhenUnpacedUnarmedOrAlreadyCovered)
+{
+    NativePaceGuard guard;
+    ASSERT_TRUE(guard.msUntilCredit(1.0, 100.0, kHfrFps) == 0.0);   // never armed
+    guard.grant(0.0, 0.0, kHfrFps);                                // armed, credit 1 (carry)
+    ASSERT_TRUE(guard.msUntilCredit(1.0, 0.0, 0.0) == 0.0);        // unpaced
+    ASSERT_TRUE(guard.msUntilCredit(1.0, 0.0, -1.0) == 0.0);
+    ASSERT_TRUE(guard.msUntilCredit(1.0, 0.0, kHfrFps) == 0.0);    // the carry already covers a whole frame
+    guard.grant(1.0, 0.0, kHfrFps);                                // spend it: credit 0
+    ASSERT_TRUE(guard.msUntilCredit(0.5, 1000.0 * 0.6 / kHfrFps, kHfrFps) == 0.0); // 0.6 accrued covers 0.5
+}
+
+TEST(PlaybackDueWake, MsUntilCreditIsExactForAMidPeriodCredit)
+{
+    for( const double fps : { kHfrFps, kNativeFps } )
+    {
+        NativePaceGuard guard;
+        guard.grant(0.0, 0.0, fps);
+        guard.grant(1.0, 0.0, fps);                       // credit 0 at t=0
+        const double period = 1000.0 / fps;
+        const double now = 0.3 * period;                  // 0.3 frame accrued, not yet granted
+        const double due = guard.msUntilCredit(1.0, now, fps);
+        ASSERT_TRUE(std::fabs(due - 0.7 * period) < 1e-9);
+        const double dueHalf = guard.msUntilCredit(0.45, now, fps);
+        ASSERT_TRUE(std::fabs(dueHalf - 0.15 * period) < 1e-9);
+        // read-only: asking twice gives the same answer and grants nothing
+        ASSERT_TRUE(std::fabs(guard.msUntilCredit(1.0, now, fps) - due) < 1e-12);
+        ASSERT_TRUE(guard.creditFrames() == 0.0);
+        // and the guard grants the whole frame exactly at now + due
+        ASSERT_TRUE(guard.grantWholeFrame(now + due + 1e-9, fps));
+    }
+}
+
+TEST(PlaybackDueWake, MsUntilCreditRespectsTheFirstPresentCarryCap)
+{
+    NativePaceGuard guard;
+    guard.reset();                                    // awaiting this Play's first present
+    guard.grant(0.0, 0.0, kHfrFps);                   // armed with the carry (1)
+    guard.grant(0.75, 0.0, kHfrFps);                  // credit 0.25
+    ASSERT_TRUE(guard.awaitingFirstPresent());
+    const double period = 1000.0 / kHfrFps;
+    ASSERT_TRUE(std::fabs(guard.msUntilCredit(1.0, 0.0, kHfrFps) - 0.75 * period) < 1e-9);
+    // the credit never banks past the carry before the first present: more than the carry is due as soon as the
+    // carry is (it can never be reached), and a long wait reads as covered, not as a negative or huge due
+    ASSERT_TRUE(std::fabs(guard.msUntilCredit(3.0, 0.0, kHfrFps) - 0.75 * period) < 1e-9);
+    ASSERT_TRUE(guard.msUntilCredit(3.0, 10000.0, kHfrFps) == 0.0);
+}
+
+TEST(PlaybackDueWake, AQueryBeforeTheClocksLastAccrualWaitsForThatInstantFirst)
+{
+    // adversary r1 A5: grant(1,100,60); notePresent(100,60); msUntilCredit(1,90,60). The guard accrues nothing until 100 ms,
+    // so a whole frame is due at 100 + 16.667 ms, i.e. 26.667 ms after 90 -- not 16.667.
+    NativePaceGuard guard;
+    guard.grant(1.0, 100.0, 60.0);
+    guard.notePresent(100.0, 60.0);
+    ASSERT_TRUE(std::fabs(guard.msUntilCredit(1.0, 90.0, 60.0) - (10.0 + 1000.0 / 60.0)) < 1e-9);
+    ASSERT_FALSE(guard.grantWholeFrame(90.0 + 1000.0 / 60.0, 60.0));
+}
+
+TEST(PlaybackDueWakeWiring, ATailTickThatDidNotReachANewFrameStillArmsTheWake)
+{
+    // adversary r1 A1 input: CPU route, drop frame, credit 0.9 at 1000 ms, position 10.2, slider 10, a non-predictive tail tick at
+    // 1001 ms with timeDiff 1 advances only to 10.26 and dispatches no frame. The next frame then needs 0.74 <= 0.9 credit: due 0.
+    NativePaceGuard guard;
+    guard.grant(0.0, 0.0, 60.0);
+    guard.grant(60.1, 1000.0, 60.0);                          // 61 frames accrued by 1000 ms: leaves the credit at 0.9
+    ASSERT_TRUE(std::fabs(guard.creditFrames() - 0.9) < 1e-9);
+    const double granted = guard.grant(60.0 * 1.0 / 1000.0, 1001.0, 60.0);   // the tail tick: 0.06 frame
+    const double position = 10.2 + granted;
+    ASSERT_EQ(10, static_cast<int>(position));                 // no new frame dispatched
+    ASSERT_TRUE(guard.msUntilCredit(framesToNextWholeFrame(position), 1001.0, 60.0) == 0.0);
+    // so the arm must not skip on "the tail tick ran": only a tail advance that reached a new frame has nothing left to wake for
+    const QString source = mainWindowSource();
+    ASSERT_EQ(0, source.count(QStringLiteral("m_playbackTailAdvanceRan")));
+    ASSERT_EQ(1, source.count(QStringLiteral("if( !( dueMs > 0.0 ) && m_playbackTailAdvanceMovedFrame ) return;")));
+    ASSERT_EQ(1, source.count(QStringLiteral(
+        "m_playbackTailAdvanceMovedFrame = ui->horizontalSliderPosition->value() != tailAdvancePositionBefore;")));
+    const int tail = source.indexOf(QStringLiteral(
+        "m_playbackTailAdvanceMovedFrame = ui->horizontalSliderPosition->value() != tailAdvancePositionBefore;"));
+    const int call = source.lastIndexOf(QStringLiteral("            timerFrameEvent();\n"), tail);
+    ASSERT_TRUE(call > 0 && tail - call < 200);                // set right after the tail's own timerFrameEvent()
+}
+
+TEST(PlaybackDueWakeWiring, TheWakeHonoursTheStillDrawingFlagLikeThePollAndNeverRecomputesIt)
+{
+    // adversary r1 pass 2 A1 input: every-frame CPU playback, frame 10 requested (slider 10, stillDrawing true), the wake delivered
+    // at 1017 ms before frame 10's queued ready notification. Recomputing the flag from the idle renderer read "not busy", granted
+    // a frame and requested 11 over the unpresented 10. The poll tick keeps the flag, so the wake must too.
+    const QString source = mainWindowSource();
+    const int begin = source.indexOf(QStringLiteral("void MainWindow::onPlaybackDueWake( void )"));
+    const int end = source.indexOf(QStringLiteral("void MainWindow::cancelPlaybackDueWake( void )"));
+    ASSERT_TRUE(begin > 0 && end > begin);
+    const QString body = source.mid(begin, end - begin);
+    ASSERT_FALSE(body.contains(QStringLiteral("m_frameStillDrawing =")));
+    ASSERT_FALSE(body.contains(QStringLiteral("renderThreadBusyForPlaybackAdvance")));
+    // r3: the busy gate is the first branch of playbackDueWakeOutcome, fed the poll tick's own flag; busy leaves the advance pending
+    const int gate = body.indexOf(QStringLiteral("playbackDueWakeOutcome( m_frameStillDrawing,"));
+    const int advance = body.indexOf(QStringLiteral("timerFrameEvent( true );"));
+    ASSERT_TRUE(gate > 0 && advance > gate);            // the busy gate comes before the advance
+    ASSERT_TRUE(body.mid(gate, advance - gate).contains(
+        QStringLiteral("if( playbackDueWakeOutcomeLeavesPendingAdvance( outcome ) ) m_playbackFrameAdvancePending = true;")));
+    ASSERT_TRUE(playbackDueWakeOutcome(true, false, 10, 10) == PlaybackDueWakeOutcome::DeferBusy);
+    ASSERT_TRUE(playbackDueWakeOutcome(true, true, 10, 11) == PlaybackDueWakeOutcome::DeferBusy);
+    ASSERT_TRUE(playbackDueWakeOutcomeLeavesPendingAdvance(PlaybackDueWakeOutcome::DeferBusy));
+}
+
+TEST(PlaybackDueWakeWiring, TheSummaryReportsTheResolutionThePlayRanAt)
+{
+    // adversary r1 A4: endPlay() drops the raised resolution before finishPlaybackSmokeTelemetry() prints the line, so the line
+    // reports what the wake ran on when it was armed, not what is left after Play stopped
+    const QString source = mainWindowSource();
+    ASSERT_EQ(1, source.count(QStringLiteral("m_playbackDueWakeHiRes = m_playbackDueWake->hiResActive();")));
+    ASSERT_EQ(1, source.count(QStringLiteral(".arg( m_playbackDueWakeHiRes ? 1 : 0 )")));
+}
+
+TEST(PlaybackDueWake, FramesToNextWholeFrameCoversIntegerFractionalAndNearInteger)
+{
+    ASSERT_TRUE(framesToNextWholeFrame(0.0) == 1.0);
+    ASSERT_TRUE(framesToNextWholeFrame(7.0) == 1.0);
+    ASSERT_TRUE(std::fabs(framesToNextWholeFrame(7.25) - 0.75) < 1e-12);
+    ASSERT_TRUE(std::fabs(framesToNextWholeFrame(7.999) - 0.001) < 1e-9);
+    // adversary r1 A2: the boundary is the slider's, which TRUNCATES m_newPosDropMode (setValue / currentPlaybackAdvanceTarget's
+    // static_cast<int>): 7.9999999999 shows frame 7 and is 1e-10 from frame 8, not a whole frame away
+    ASSERT_TRUE(std::fabs(framesToNextWholeFrame(7.9999999999) - 1e-10) < 1e-9);
+    for( double p = 0.0; p < 5.0; p += 0.037 )
+    {
+        const double need = framesToNextWholeFrame(p);
+        ASSERT_TRUE(need > 0.0 && need <= 1.0 + 1e-9);
+    }
+    for( const double p : { 0.0, 0.5, 6.9999999999, 7.0, 7.0000000001, 7.9999999999, 41.25 } )
+    {
+        // advancing by exactly the helper's frames lands on the slider's next frame, never short of it and never past it
+        const double need = framesToNextWholeFrame(p);
+        ASSERT_EQ(static_cast<int>(p) + 1, static_cast<int>(p + need + 1e-12));
+        ASSERT_EQ(static_cast<int>(p), static_cast<int>(p + need * 0.5));
+    }
+}
+
+TEST(PlaybackDueWake, ThePollTickWaitReproducesTheMeasuredSkipShape)
+{
+    // RED observable: without the due wake the Bachelor schedule presents well under its timeline
+    // (measured: timeline 59.4-59.7, presented 44-55)
+    struct Cell { double drawMs; double tickLagMs; };
+    for( const Cell c : { Cell{9.2, 10.7}, Cell{7.4, 10.7}, Cell{9.2, 15.6}, Cell{7.4, 15.6} } )
+    {
+        const CadenceRun poll = simulateCudaPresentCadence(kHfrFps, c.drawMs, c.tickLagMs, false);
+        ASSERT_TRUE(poll.ratio() < 0.95);
+        ASSERT_TRUE(poll.presentedFps() > 35.0 && poll.presentedFps() < 56.0);
+        ASSERT_TRUE(poll.timelineFps() > 59.0);
+        ASSERT_TRUE(timelineAtOrUnderNative(poll, kHfrFps));
+    }
+}
+
+TEST(PlaybackDueWake, TheDueWakePresentsEveryTimelineFrameAndNeverOutrunsNative)
+{
+    struct Cell { double drawMs; double tickLagMs; };
+    for( const Cell c : { Cell{9.2, 10.7}, Cell{7.4, 10.7}, Cell{9.2, 15.6}, Cell{7.4, 15.6} } )
+    {
+        const CadenceRun wake = simulateCudaPresentCadence(kHfrFps, c.drawMs, c.tickLagMs, true);
+        ASSERT_TRUE(wake.ratio() >= 0.99);
+        ASSERT_TRUE(wake.presentedFps() >= 59.0);
+        ASSERT_TRUE(timelineAtOrUnderNative(wake, kHfrFps));
+        ASSERT_TRUE(wake.wakesFired <= 3 * wake.presented);
+        // windowed vs fullscreen: the poll grid no longer matters
+        const CadenceRun fs = simulateCudaPresentCadence(kHfrFps, c.drawMs, 10.7, true);
+        const CadenceRun win = simulateCudaPresentCadence(kHfrFps, c.drawMs, 15.6, true);
+        ASSERT_TRUE(std::fabs(fs.presentedFps() - win.presentedFps()) <= 2.0);
+    }
+}
+
+TEST(PlaybackDueWake, A23976ClipDoesNotRegress)
+{
+    for( const double tickLagMs : { 10.7, 15.6 } )
+    {
+        const CadenceRun poll = simulateCudaPresentCadence(kNativeFps, 7.4, tickLagMs, false);
+        const CadenceRun wake = simulateCudaPresentCadence(kNativeFps, 7.4, tickLagMs, true);
+        ASSERT_TRUE(wake.presentedFps() >= poll.presentedFps() - 0.3);
+        ASSERT_TRUE(timelineAtOrUnderNative(wake, kNativeFps));
+        ASSERT_TRUE(std::fabs(wake.timelineFps() - kNativeFps) < 0.1);
+        ASSERT_TRUE(wake.wakesFired <= 3 * wake.presented);
+    }
 }

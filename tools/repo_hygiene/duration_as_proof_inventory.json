@@ -2663,6 +2663,127 @@
       ]
     },
     {
+      "path": "platform/qt/MainWindow.cpp",
+      "anchor": "if ( ! ( dueMs > 0.0 ) && m_playbackTailAdvanceMovedFrame ) return ;",
+      "class": "value_fallback_select",
+      "clock": "other",
+      "justification": "HFR-NATIVE-M16-1457-GUI-PRESENT-CADENCE-1 armPlaybackDueWake: dueMs is a FUTURE wait computed by NativePaceGuard::msUntilCredit (how long until the pace credit covers the next frame), not a measured duration. A non-positive wait means the credit already covers the frame; with the tail advance having reached a new frame (the completed-flag m_playbackTailAdvanceMovedFrame) nothing is left to wake for, so the wake is not armed. A scheduling decision; it never proves a stage ran.",
+      "lines": [
+        19552
+      ]
+    },
+    {
+      "path": "platform/qt/PlaybackDueWake.cpp",
+      "anchor": "if ( ! ( dueMs > 0.0 ) ) dueMs = 0.0 ;",
+      "class": "value_fallback_select",
+      "clock": "other",
+      "justification": "HFR-NATIVE-M16-1457-GUI-PRESENT-CADENCE-1 PlaybackDueWake::arm: clamps a requested FUTURE wait (negative or NaN) to 'fire now' before it is converted to a waitable-timer due time. Input sanitising of a timer argument, not a measured duration and never a run-proof.",
+      "lines": [
+        264
+      ]
+    },
+    {
+      "path": "tests/console/test_playback_native_pace_guard.cpp",
+      "anchor": "ASSERT_EQ ( 1 , source . count ( QStringLiteral ( \"if( !( dueMs > 0.0 ) && m_playbackTailAdvanceMovedFrame ) return;\" ) ) ) ;",
+      "class": "not_run_proof_structural",
+      "clock": "other",
+      "justification": "Source-text wiring test (adversary r1 A1 of HFR-NATIVE-M16-1457-GUI-PRESENT-CADENCE-1) that counts the armPlaybackDueWake line pinned in the MainWindow.cpp row above; no duration is compared at run time, the scanner matches the quoted source inside the string literal.",
+      "lines": [
+        1244
+      ]
+    },
+    {
+      "path": "platform/qt/MainWindow.cpp",
+      "anchor": "if ( postMs >= 0.0 )",
+      "class": "value_fallback_select",
+      "clock": "qpc_stage_clock",
+      "justification": "HFR-NATIVE-M16-1457-GUI-PRESENT-CADENCE-1 r3 onPlaybackDueWake: postMs is a TIMESTAMP (the QPC post time the wait thread stamped in the native message, PlaybackDueWake::lastDeliveryPostMs), not a duration; a negative value is the 'this delivery carried no post time' sentinel (notifier / qtimer path). The check filters that sentinel before the due-to-post / post-to-receive samples are recorded. Telemetry only; it never proves a stage ran.",
+      "lines": [
+        19598
+      ]
+    },
+    {
+      "path": "tests/console/test_playback_due_wake_native.cpp",
+      "anchor": "ASSERT_TRUE ( wake . lastDeliveryPostMs ( ) < 0.0 ) ;",
+      "class": "not_run_proof_structural",
+      "clock": "qpc_stage_clock",
+      "justification": "HFR-NATIVE-M16-1457-GUI-PRESENT-CADENCE-1 r3: lastDeliveryPostMs() is a timestamp getter whose negative value is the 'no delivery firing now' sentinel; the assert checks the sentinel outside the fire callback. The delivery itself is proven by pumpDueWakeMessages returning 1 and the callback's captured post/receive times.",
+      "lines": [
+        410
+      ]
+    },
+    {
+      "path": "tests/console/test_playback_due_wake_native.cpp",
+      "anchor": "ASSERT_TRUE ( notifierWake . lastDeliveryPostMs ( ) < 0.0 ) ;",
+      "class": "not_run_proof_structural",
+      "clock": "qpc_stage_clock",
+      "justification": "HFR-NATIVE-M16-1457-GUI-PRESENT-CADENCE-1 r3: the notifier fallback carries no post time, so its timestamp getter reads the negative sentinel; a structural check of the fallback's contract, no duration compared.",
+      "lines": [
+        414
+      ]
+    },
+    {
+      "path": "tests/console/test_playback_due_wake_native.cpp",
+      "anchor": "ASSERT_TRUE ( ( postMs >= 0.0 ) != unsplit ) ;",
+      "class": "not_run_proof_structural",
+      "clock": "qpc_stage_clock",
+      "justification": "HFR-NATIVE-M16-1457-GUI-PRESENT-CADENCE-1 r5 (adversary pass 9 A1): postMs is a TIMESTAMP (PostMessageW's return time from lastDeliveryPostMs), and a negative value is the 'not published, unsplit' sentinel. The assert checks that a native delivery is exactly one of split or unsplit. That is the sentinel's contract; no duration is compared and nothing is proven to have run.",
+      "lines": [
+        454,
+        926
+      ]
+    },
+    {
+      "path": "tests/console/test_playback_due_wake_native.cpp",
+      "anchor": "if ( postMs >= 0.0 ) break ;",
+      "class": "not_run_proof_structural",
+      "clock": "qpc_stage_clock",
+      "justification": "HFR-NATIVE-M16-1457-GUI-PRESENT-CADENCE-1 r5 (adversary pass 9 A1): the retry loop stops at the first delivery whose post-return TIMESTAMP was published (sentinel < 0 = unsplit). It reads a sentinel and compares no duration. The delivery itself is proven by pumpDueWakeMessages returning 1.",
+      "lines": [
+        455
+      ]
+    },
+    {
+      "path": "tests/console/test_playback_due_wake_native.cpp",
+      "anchor": "if ( postMs >= 0.0 )",
+      "class": "not_run_proof_structural",
+      "clock": "qpc_stage_clock",
+      "justification": "HFR-NATIVE-M16-1457-GUI-PRESENT-CADENCE-1 r5 (adversary pass 9 A1): it selects a split delivery (post-return TIMESTAMP published, sentinel < 0 otherwise) before comparing that timestamp with the message's first stamp. It reads a sentinel, never a duration, and the delivery is proven by handleNativeMessage returning true.",
+      "lines": [
+        927
+      ]
+    },
+    {
+      "path": "tests/console/test_playback_due_wake_native.cpp",
+      "anchor": "ASSERT_TRUE ( firstMs < 0.0 ) ;",
+      "class": "not_run_proof_structural",
+      "clock": "qpc_stage_clock",
+      "justification": "HFR-NATIVE-M16-1457-GUI-PRESENT-CADENCE-1 r6 (adversary pass 10 A2): firstMs is a TIMESTAMP (the first stamp from lastDeliveryPostFirstMs), and a negative value is the 'unsplit, no post interval' sentinel. The assert checks the sentinel on an unsplit delivery; no duration is compared and nothing is proven to have run (handleNativeMessage returning true proves the delivery).",
+      "lines": [
+        958
+      ]
+    },
+    {
+      "path": "tests/console/test_playback_due_wake_native.cpp",
+      "anchor": "ASSERT_EQ ( 0.0 , late . dueToPostLoMs ) ;",
+      "class": "not_run_proof_structural",
+      "clock": "other",
+      "justification": "HFR-NATIVE-M16-1457-GUI-PRESENT-CADENCE-1 r6 (adversary pass 10 A2): a pure arithmetic check of playbackDueWakeSplitBounds on the finding's synthetic input (due 100, first stamp 100, return stamp 140, receive 150 ms): the lower due-to-post bound is exactly 0. Constant inputs, no clock read, never a run-proof.",
+      "lines": [
+        1071
+      ]
+    },
+    {
+      "path": "tests/console/test_playback_due_wake_native.cpp",
+      "anchor": "ASSERT_TRUE ( late . dueToPostLoMs <= 0.0 && 0.0 <= late . dueToPostHiMs ) ;",
+      "class": "not_run_proof_structural",
+      "clock": "other",
+      "justification": "HFR-NATIVE-M16-1457-GUI-PRESENT-CADENCE-1 r6 (adversary pass 10 A2): checks that the true due-to-post (0 ms) of the finding's synthetic input lies inside the [lo, hi] bounds playbackDueWakeSplitBounds computed. Constant inputs, no clock read, never a run-proof.",
+      "lines": [
+        1076
+      ]
+    },
+    {
       "path": "tests/pipeline/test_dualiso_gpu_split_timing.cpp",
       "anchor": "ASSERT_TRUE ( s . mutex_wait_ms >= 0.0 ) ;",
       "class": "not_run_proof_structural",
@@ -2822,6 +2943,76 @@
       "justification": "CUDA-RECON-DUALISO-TIMER-SPLIT-1 r2 test seam (adversary r1 passes 4-5 A1 RED test), not an elapsed-time inference: delay_ms is a requested sleep set only by llrpSetFakeGpuBackendLastTimingDelayMsForTesting for the in-process fake backend's timing getter (0 by default and always in the app). The comparison selects whether the fake sleeps at all (0 skips Sleep so the default fake never yields); it measures nothing and proves no run (backend_calls and rc do).",
       "lines": [
         1504
+      ]
+    },
+    {
+      "path": "platform/qt/PlaybackDueWake.cpp",
+      "anchor": "if ( answerDelayMs > 0 ) Sleep ( static_cast < DWORD > ( answerDelayMs ) ) ;",
+      "class": "value_fallback_select",
+      "clock": "other",
+      "justification": "HFR-NATIVE-M16-1457-GUI-PRESENT-CADENCE-1 r8 (adversary pass 18 A1 RED-test seam), not an elapsed-time inference: answerDelayMs is a requested pause set only by setSettleAnswerDelayMsForTest (0 by default and always in the app). The comparison selects whether the wait thread pauses at all; it measures nothing and proves no run (settleAck and postFailures do).",
+      "lines": [
+        219
+      ]
+    },
+    {
+      "path": "platform/qt/PlaybackDueWake.cpp",
+      "anchor": "if ( retryWaitMs == 0 ) break ;",
+      "class": "not_run_proof_structural",
+      "clock": "other",
+      "justification": "HFR-NATIVE-M16-1457-GUI-PRESENT-CADENCE-1 r8 (adversary pass 17 A2): retryWaitMs is the NEXT wait playbackDueWakeSliceWaitMs computed from GetTickCount64 and the retry deadline (time left, clamped to 1 ms); 0 means the retry budget is spent, so the loop starts no further wait or attempt. A budget bound, not a proof that anything ran (postRefusals / postFailures count what happened).",
+      "lines": [
+        255
+      ]
+    },
+    {
+      "path": "platform/qt/PlaybackDueWake.cpp",
+      "anchor": "if ( settleWaitMs == 0 ) return d -> settleAck . load ( ) >= request ;",
+      "class": "not_run_proof_structural",
+      "clock": "other",
+      "justification": "HFR-NATIVE-M16-1457-GUI-PRESENT-CADENCE-1 r8 (adversary pass 17 A2 sibling): settleWaitMs is the next settle wait (time left to the GetTickCount64 deadline, clamped to kSettleSliceMs); 0 means the deadline passed. The return value is the acknowledgement counter (settleAck >= request), never the duration: the duration only ends the wait.",
+      "lines": [
+        626
+      ]
+    },
+    {
+      "path": "tests/console/test_playback_due_wake_native.cpp",
+      "anchor": "ASSERT_EQ ( 0u , playbackDueWakeSliceWaitMs ( 100 , 100 , 1 ) ) ;",
+      "class": "not_run_proof_structural",
+      "clock": "other",
+      "justification": "HFR-NATIVE-M16-1457-GUI-PRESENT-CADENCE-1 r8 (adversary pass 17 A2): pure arithmetic check of playbackDueWakeSliceWaitMs on the finding's synthetic input (now == deadline 100 ms): no wait is left. Constant inputs, no clock read, never a run-proof.",
+      "lines": [
+        1623
+      ]
+    },
+    {
+      "path": "tests/console/test_playback_due_wake_native.cpp",
+      "anchor": "ASSERT_EQ ( 0u , playbackDueWakeSliceWaitMs ( 150 , 100 , 1 ) ) ;",
+      "class": "not_run_proof_structural",
+      "clock": "other",
+      "justification": "HFR-NATIVE-M16-1457-GUI-PRESENT-CADENCE-1 r8 (adversary pass 17 A2): pure arithmetic check on the finding's input (the worker resumes at 150 ms past a 100 ms budget): 0, so no attempt starts. Constant inputs, no clock read, never a run-proof.",
+      "lines": [
+        1624
+      ]
+    },
+    {
+      "path": "tests/console/test_playback_due_wake_native.cpp",
+      "anchor": "ASSERT_EQ ( 0u , playbackDueWakeSliceWaitMs ( 1500 , 1100 , PlaybackDueWake :: kSettleSliceMs ) ) ;",
+      "class": "not_run_proof_structural",
+      "clock": "other",
+      "justification": "HFR-NATIVE-M16-1457-GUI-PRESENT-CADENCE-1 r8 (adversary pass 17 A2 sibling): pure arithmetic check on the finding's input (the settle resumes at 1500 ms past its 1100 ms deadline): 0, no stale relative wait. Constant inputs, no clock read, never a run-proof.",
+      "lines": [
+        1628
+      ]
+    },
+    {
+      "path": "tests/console/test_playback_due_wake_native.cpp",
+      "anchor": "const int retrySpent = source . indexOf ( QStringLiteral ( \"if( retryWaitMs == 0 ) break;\" ) , retryWait ) ;",
+      "class": "not_run_proof_structural",
+      "clock": "other",
+      "justification": "HFR-NATIVE-M16-1457-GUI-PRESENT-CADENCE-1 r8 (adversary pass 17 A2): a source-text pin (QString::indexOf over PlaybackDueWake.cpp) that the retry loop stops when the computed wait is 0; the duration token is inside a string literal. Nothing is timed or proven to have run.",
+      "lines": [
+        1637
       ]
     },
     {
