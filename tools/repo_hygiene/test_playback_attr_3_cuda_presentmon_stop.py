@@ -873,7 +873,13 @@ def _iso(ms: float) -> str:
     return (_BASE + timedelta(milliseconds=ms)).strftime("%Y-%m-%dT%H:%M:%S.%f") + "0Z"
 
 
-def _swap_window_log(swaps: int, *, first: str = "2026-01-01T00:00:02.0000000Z", last: str = "2026-01-01T00:00:42.0000000Z") -> str:
+def _swap_iso(ms: float) -> str:
+    """The same instant in the ONE shape the app writes swap stamps in: Qt::ISODateWithMs UTC, yyyy-MM-ddTHH:mm:ss.fffZ (GpuDisplayWindow.cpp:319).
+    PRESENTMON-BACHELOR-CUDA-INTERNAL-GAP-1 (PR #788 r1 sol B1): the job reads first_swap_utc / last_swap_utc only in that shape."""
+    return (_BASE + timedelta(milliseconds=ms)).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
+
+
+def _swap_window_log(swaps: int, *, first: str = "2026-01-01T00:00:02.000Z", last: str = "2026-01-01T00:00:42.000Z") -> str:
     # The real playback_smoke.gpu_window_swaps field set (MainWindow.cpp). `swaps` is the app's count of
     # swaps INSIDE first_swap_utc..last_swap_utc (the session window), not a process-lifetime count.
     return (
@@ -983,7 +989,7 @@ class JobStopSufficiencyExecutedTests(unittest.TestCase):
 
     def _venue(self, times: list[float], swaps: int = VENUE_SWAPS, *, stopped_by_job: bool = True) -> dict:
         return self._status(
-            times, _swap_window_log(swaps, first=_iso(VENUE_FIRST_SWAP), last=_iso(VENUE_LAST_SWAP)),
+            times, _swap_window_log(swaps, first=_swap_iso(VENUE_FIRST_SWAP), last=_swap_iso(VENUE_LAST_SWAP)),
             stopped_by_job=stopped_by_job, capture_start=VENUE_CAPTURE_START, post_spawn=VENUE_POST_SPAWN,
             result_json=VENUE_PROCESS,
         )
@@ -1012,7 +1018,7 @@ class JobStopSufficiencyExecutedTests(unittest.TestCase):
         # The old length difference read -950 ms and 0.55% and said ok with the last 4 s of the swap
         # window empty; by position the last row (38000) is 4000 ms short of last_swap (42000).
         times = self._rows_through(38000.0, count=720)
-        log = _swap_window_log(724, first="2026-01-01T00:00:07.0000000Z")
+        log = _swap_window_log(724, first="2026-01-01T00:00:07.000Z")
         result = self._status(times, log, stopped_by_job=True)
         self.assertEqual(result["presentMonStatus"], "degraded", result)
         self.assertIn("job-stop tail", result["presentMonStatusReason"])
@@ -1025,7 +1031,7 @@ class JobStopSufficiencyExecutedTests(unittest.TestCase):
         # (shortfall 960 ms < 1000 ms, deviation 1.6% < 2%) and the reported p99 fell from 70 ms to 50 ms.
         full = _span(2000.0, 41000.0, 50.0) + [41000.0 + 70.0 * k for k in range(1, 14)]
         self.assertEqual(len(full), 794)
-        log = _swap_window_log(794, first=_iso(2000), last=_iso(41910))
+        log = _swap_window_log(794, first=_swap_iso(2000), last=_swap_iso(41910))
         complete = self._status(full, log, stopped_by_job=True)
         self.assertEqual(complete["presentMonStatus"], "ok", complete)
         lost = self._status(full[:781], log, stopped_by_job=True)
@@ -1050,7 +1056,7 @@ class JobStopSufficiencyExecutedTests(unittest.TestCase):
         # Startup presents (47 of them) cancel the lost 2.5 s of tail in the old length arm: shortfall is
         # negative, the lifetime count 498 is within 1% of 501 swaps, the temporal arm sees 4000 ms.
         times = _venue_times(pre_step=300.0, play_end=42500.0, post=False)
-        log = _swap_window_log(VENUE_SWAPS, first=_iso(VENUE_FIRST_SWAP), last=_iso(VENUE_LAST_SWAP))
+        log = _swap_window_log(VENUE_SWAPS, first=_swap_iso(VENUE_FIRST_SWAP), last=_swap_iso(VENUE_LAST_SWAP))
         short_process = _result_json(start=_iso(5000), end=_iso(45500))
         gated = self._status(
             times, log, stopped_by_job=True, capture_start=VENUE_CAPTURE_START, post_spawn=VENUE_POST_SPAWN,
@@ -1069,7 +1075,7 @@ class JobStopSufficiencyExecutedTests(unittest.TestCase):
         # 1.5 s of tail lost on a 3 s wide bracket: converted at the LATE end the last row would look 1.5 s
         # AFTER the last swap and pass. The tail claim must hold at the EARLY end, where it is 1.5 s short.
         times = _venue_times(pre_step=300.0, play_end=43500.0, post=False)
-        log = _swap_window_log(VENUE_SWAPS, first=_iso(VENUE_FIRST_SWAP), last=_iso(VENUE_LAST_SWAP))
+        log = _swap_window_log(VENUE_SWAPS, first=_swap_iso(VENUE_FIRST_SWAP), last=_swap_iso(VENUE_LAST_SWAP))
         result = self._status(
             times, log, stopped_by_job=True, capture_start=VENUE_CAPTURE_START, post_spawn=VENUE_POST_SPAWN,
             result_json=_result_json(start=_iso(5000), end=_iso(45500)),
@@ -1087,6 +1093,36 @@ class JobStopSufficiencyExecutedTests(unittest.TestCase):
         self.assertIn("job-stop head", result["presentMonStatusReason"])
         self.assertAlmostEqual(result["headGapMs"], 3200.0, delta=1.0)
 
+    # ---- PRESENTMON-BACHELOR-CUDA-INTERNAL-GAP-1 (PR #788 r2 sol B1): one swap-record reader for both arms ---------------
+
+    SOL_R2_ORIGIN = "2026-11-09T00:00:00.0000000Z"
+    SOL_R2_GOOD = ("playback_smoke.gpu_window_swaps session=1 window_active=1 telemetry_enabled=1 swaps=40 max_gap_ms=1000 "
+                   "first_swap_utc=2026-11-09T00:00:01.000Z last_swap_utc=2026-11-09T00:00:40.000Z")
+    SOL_R2_STAMPLESS = "playback_smoke.gpu_window_swaps session=2 window_active=1 telemetry_enabled=1 swaps=40 max_gap_ms=1000 first_swap_utc= last_swap_utc="
+
+    def _sol_r2(self, log: str) -> dict:
+        # sol r2 B1's literal repro: zero-width trusted bracket at the UTC origin, a job-caused stop, process window [0, 40000] ms, and 40 positive
+        # rows at 1000*k ms for k = 1..40. Only the run log differs between the cases.
+        return self._status([1000.0 * k for k in range(1, 41)], log, stopped_by_job=True, capture_start=self.SOL_R2_ORIGIN, post_spawn=self.SOL_R2_ORIGIN,
+                            result_json=_result_json(start=self.SOL_R2_ORIGIN, end="2026-11-09T00:00:40.0000000Z"))
+
+    def test_sol_r2_b1_the_control_record_alone_is_ok(self) -> None:
+        result = self._sol_r2(self.SOL_R2_GOOD)
+        self.assertEqual(result["presentMonStatus"], "ok", result)
+
+    def test_sol_r2_b1_a_stampless_final_record_never_reuses_an_earlier_sessions_stamps(self) -> None:
+        # on cdb490a9 this read swapWindowParsed=true, jobStopSufficient=true, presentMonStatus=ok from session 1's stamps
+        result = self._sol_r2(self.SOL_R2_GOOD + "\n" + self.SOL_R2_STAMPLESS)
+        self.assertEqual(result["presentMonStatus"], "degraded", result)
+        self.assertIn("job-stop position", result["presentMonStatusReason"])
+
+    def test_sol_r2_b1_stamps_in_a_location_suffix_are_never_the_job_stop_window(self) -> None:
+        # on cdb490a9 the unanchored matcher read the suffix's stamps and said ok
+        log = self.SOL_R2_STAMPLESS + " (C:/build first_swap_utc=2026-11-09T00:00:01.000Z last_swap_utc=2026-11-09T00:00:40.000Z x/MainWindow.cpp:1)"
+        result = self._sol_r2(log)
+        self.assertEqual(result["presentMonStatus"], "degraded", result)
+        self.assertIn("job-stop position", result["presentMonStatusReason"])
+
     # ---- UM-PRESENTMON-STOP-2 r2: the bracket is only as good as the readiness behind it ---------------
 
     def _delayed_origin(self, *, origin_ms: float, late_end_ms: float, trace_ready: bool, stopped_by_job: bool = True) -> dict:
@@ -1097,7 +1133,7 @@ class JobStopSufficiencyExecutedTests(unittest.TestCase):
         utc = [float(u) for u in range(5000, 6001, 200)] + [float(u) for u in range(6100, 45001, 100)]
         utc += [float(u) for u in range(45100, 52001, 100)]
         times = [u - origin_ms for u in utc if u >= origin_ms]
-        log = _swap_window_log(396, first=_iso(5000), last=_iso(45000))
+        log = _swap_window_log(396, first=_swap_iso(5000), last=_swap_iso(45000))
         return self._status(
             times, log, stopped_by_job=stopped_by_job, capture_start=_iso(0), post_spawn=_iso(late_end_ms),
             result_json=_result_json(start=_iso(3100), end=_iso(52000)), trace_ready=trace_ready,
@@ -1128,7 +1164,7 @@ class JobStopSufficiencyExecutedTests(unittest.TestCase):
 
     def test_a_complete_venue_capture_is_still_not_ok_after_a_job_stop_when_readiness_was_not_verified(self) -> None:
         result = self._status(
-            _venue_times(), _swap_window_log(VENUE_SWAPS, first=_iso(VENUE_FIRST_SWAP), last=_iso(VENUE_LAST_SWAP)),
+            _venue_times(), _swap_window_log(VENUE_SWAPS, first=_swap_iso(VENUE_FIRST_SWAP), last=_swap_iso(VENUE_LAST_SWAP)),
             stopped_by_job=True, capture_start=VENUE_CAPTURE_START, post_spawn=VENUE_POST_SPAWN,
             result_json=VENUE_PROCESS, trace_ready=False,
         )
@@ -1183,7 +1219,7 @@ class JobStopSufficiencyExecutedTests(unittest.TestCase):
     def test_an_inverted_capture_start_bracket_cannot_anchor_the_rows_so_the_stop_is_not_ok(self) -> None:
         # Item 3: when the conversion cannot be trusted the safe answer is degraded, never ok.
         result = self._status(
-            _venue_times(), _swap_window_log(VENUE_SWAPS, first=_iso(VENUE_FIRST_SWAP), last=_iso(VENUE_LAST_SWAP)),
+            _venue_times(), _swap_window_log(VENUE_SWAPS, first=_swap_iso(VENUE_FIRST_SWAP), last=_swap_iso(VENUE_LAST_SWAP)),
             stopped_by_job=True, capture_start=_iso(3000), post_spawn=_iso(0), result_json=VENUE_PROCESS,
         )
         self.assertEqual(result["presentMonStatus"], "degraded", result)

@@ -2692,6 +2692,9 @@ MainWindow::~MainWindow()
     playback_paint_credit::setSink( nullptr, nullptr );
     killTimer( m_timerId );
     killTimer( m_timerCacheId );
+    // HFR-NATIVE-M16-1457-GUI-PRESENT-CADENCE-1 r2: join the due wake's wait thread and drop its window and native
+    // filter first, while every object its callback touches is still alive
+    m_playbackDueWake.reset();
     flushPhase3PlaybackTime( true );
 
     //Stop playback-prep worker before tearing down render state it may reference.
@@ -3204,6 +3207,10 @@ void MainWindow::timerEvent(QTimerEvent *t)
     //Main timer
     if( t->timerId() == m_timerId )
     {
+        // HFR-NATIVE-M16-1457-GUI-PRESENT-CADENCE-1 r7 (adversary passes 13/14 A1): a due wake whose native post a full queue
+        // refused past the wait thread's retry budget is delivered here, once. The wake counts it (post_rescued) before its
+        // callback runs: a rescued wake that stops Play prints the summary line from inside that callback (pass 15 A1)
+        if( m_playbackDueWake ) m_playbackDueWake->deliverLostPost();
         timerFrameEvent();
         return;
     }
@@ -7038,6 +7045,13 @@ void MainWindow::presentPlaybackPreparedFrame( const PlaybackPrepResult &result 
     if( ui->actionPlay->isChecked() )
         m_playbackPaceGuard.notePresent( mlv_stage_timing_now() * 1000.0, playbackPaceGuardFps() );
     m_frameStillDrawing = renderThreadBusyForPlaybackAdvance( currentPlaybackAdvanceTarget() );
+    // r2 adversary pass 4 A1: the frame the due wake may advance past is the one whose present ENDED here, not the one
+    // drawFrameReady accepted (m_lastPresentedPlaybackFrame is set before background preparation, which a newer request
+    // can still replace before it presents)
+    m_playbackDueWakePresentedFrame = static_cast<long long>( display_frame );
+    // HFR-NATIVE-M16-1457-GUI-PRESENT-CADENCE-1: the next advance is due when the pace credit covers the next whole
+    // frame, not at the next poll tick (10-16 ms later on Windows).
+    armPlaybackDueWake();
     if( m_playbackPresentTrace.active() )
         m_playbackPresentTrace.notePresentEnd( mlv_stage_timing_now() * 1000.0 );   // r7 present trace
 }
@@ -12598,6 +12612,7 @@ void MainWindow::playbackHandling(int timeDiff)
         m_newPosDropMode = ui->horizontalSliderPosition->value(); //track it also when playback is off
         m_playbackPaceGuard.reset();
         m_conformDropDebtFrames = 0.0;
+        cancelPlaybackDueWake();   // HFR-NATIVE-M16-1457-GUI-PRESENT-CADENCE-1: a wake is only due against this clock
     }
 }
 
@@ -20528,6 +20543,263 @@ void MainWindow::applyPlaybackConformSettings( bool persist )
 double MainWindow::playbackPaceGuardFps( void )
 {
     return playback_native_pace::guardPaceFps( getPlaybackFramerate(), m_automationPacingIsolated && mlvappPlaybackUnpacedRequested() );
+}
+
+// HFR-NATIVE-M16-1457-GUI-PRESENT-CADENCE-1: MLVAPP_PLAYBACK_DUE_WAKE=0 turns the due wake off (the poll tick alone
+// advances, as before). Default on.
+static bool mlvappPlaybackDueWakeEnabled()
+{
+    // read once: PlaybackDueWake::enabledByEnvironment() is the parse (pinned by the console tests)
+    static const bool enabled = PlaybackDueWake::enabledByEnvironment();
+    return enabled;
+}
+
+// HFR-NATIVE-M16-1457-GUI-PRESENT-CADENCE-1 r2: MLVAPP_PLAYBACK_DUE_WAKE_DELIVERY=notifier keeps r1's QWinEventNotifier
+// delivery (an isolation arm); anything else uses the native-message wait thread, with the notifier as its fallback.
+static bool mlvappPlaybackDueWakePreferNativeMessage()
+{
+    static const bool preferNative =
+        qEnvironmentVariable( "MLVAPP_PLAYBACK_DUE_WAKE_DELIVERY" ).trimmed().compare( QStringLiteral( "notifier" ),
+                                                                                         Qt::CaseInsensitive ) != 0;
+    return preferNative;
+}
+
+// The wake lands this long after the credit covers the frame, so the guard's grant at the wake is never a hair short.
+static constexpr double kPlaybackDueWakeSlackMs = 0.25;
+// A wake that found the credit still short (a poll tick took it, or the clock was re-armed) may re-arm this often.
+static constexpr int kPlaybackDueWakeMaxRearms = 2;
+
+// HFR-NATIVE-M16-1457-GUI-PRESENT-CADENCE-1: called at the end of every present. On Bachelor CUDA (Qt 6.10.2) the
+// advance after a present waited for the next poll tick, 10.77 ms (fullscreen) / 14.92 ms (windowed) p50 later and
+// never 8 ms or less, while the next frame was ready 2.5 ms after the present; with a ~9 ms draw the cycle was over a
+// frame period, so drop-frame mode stepped over a frame. The wake is armed for when the pace credit covers the next
+// whole frame; the guard still caps the grant, so it can never outrun native.
+void MainWindow::armPlaybackDueWake( void )
+{
+    if( !ui->actionPlay->isChecked() ) return;
+    if( !mlvappPlaybackDueWakeEnabled() ) return;
+    const double paceFps = playbackPaceGuardFps();
+    if( !( paceFps > 0.0 ) || !m_playbackPaceGuard.armed() ) return;   // never when unpaced
+    m_playbackDueWakeRearmsThisPresent = 0;
+    // the wrap at the cut range's last frame (either mode) and every-frame mode both need a whole frame of credit
+    const bool atCutOut = ui->horizontalSliderPosition->value() >= ui->spinBoxCutOut->value() - 1;
+    const double framesNeeded = ( ui->actionDropFrameMode->isChecked() && !atCutOut )
+        ? playback_native_pace::framesToNextWholeFrame( m_newPosDropMode )
+        : 1.0;
+    const double nowMs = mlv_stage_timing_now() * 1000.0;
+    const double dueMs = m_playbackPaceGuard.msUntilCredit( framesNeeded, nowMs, paceFps );
+    // already covered and this present's tail advance already reached a new frame (its render is in flight): nothing is
+    // waiting on a tick. A tail tick that ran but stayed on its frame still needs the wake (adversary r1 A1).
+    if( !( dueMs > 0.0 ) && m_playbackTailAdvanceMovedFrame ) return;
+    if( !m_playbackDueWake )
+    {
+        m_playbackDueWake.reset( new PlaybackDueWake( this, [this]() { onPlaybackDueWake(); },
+                                                      mlvappPlaybackDueWakePreferNativeMessage() ) );
+        m_playbackDueWake->beginPlay();   // created inside a Play: on_actionPlay_toggled could not begin it
+    }
+    // r2 adversary pass 5 A1: the delivery and resolution are recorded per ARM (notePlaybackDueWakeArmMechanism), not here
+    m_playbackDueWakeDueAtMs = nowMs + dueMs + kPlaybackDueWakeSlackMs;
+    m_playbackDueWake->arm( dueMs + kPlaybackDueWakeSlackMs );
+    ++m_playbackDueWakeArmed;
+    // adversary r1 A4 + r2 pass 5 A1: what this arm actually ran on (a SetWaitableTimer failure falls back to a QTimer)
+    notePlaybackDueWakeArmMechanism();
+}
+
+// r2 adversary pass 5 A1: after every arm, record what it ACTUALLY ran on. One arm that fell back to a QTimer (SetWaitableTimer
+// failed) shows in the Play's line as "<path>+qtimer" and hires=0, so the line never reports a mechanism no arm used.
+void MainWindow::notePlaybackDueWakeArmMechanism( void )
+{
+    if( !m_playbackDueWake ) return;
+    const bool firstArmThisPlay = !m_playbackDueWakeMechanismSeen;
+    const bool hiResSoFar = firstArmThisPlay || m_playbackDueWakeHiRes;
+    // adversary r1 A4: what the wake runs on during this Play (endPlay() drops a raised resolution before the summary line)
+    m_playbackDueWakeHiRes = m_playbackDueWake->hiResActive();
+    m_playbackDueWakeHiRes = m_playbackDueWakeHiRes && hiResSoFar;
+    const QString used = QString::fromLatin1( PlaybackDueWake::deliveryName( m_playbackDueWake->lastArmDelivery() ) );
+    if( firstArmThisPlay )
+        m_playbackDueWakeDelivery = used;
+    else if( !m_playbackDueWakeDelivery.split( QLatin1Char( '+' ) ).contains( used ) )
+        m_playbackDueWakeDelivery += QLatin1Char( '+' ) + used;
+    m_playbackDueWakeMechanismSeen = true;
+}
+
+void MainWindow::onPlaybackDueWake( void )
+{
+    if( !ui->actionPlay->isChecked() ) return;
+    const double nowMs = mlv_stage_timing_now() * 1000.0;
+    ++m_playbackDueWakeFired;
+    // r4 (Dot B1): every ordinary Play feeds these, so the storage is bounded (PlaybackDueWakeSamples), not a growing vector
+    m_playbackDueWakeLatenessMs.add( nowMs - m_playbackDueWakeDueAtMs );
+    // r3: split the lateness at the post (native-message deliveries carry their post time): due-to-post is the timer and the
+    // wait thread, post-to-receive is the GUI thread's queue (delivery vs GUI-thread occupancy)
+    // r6 adversary pass 10 A2: the post lies in [first stamp, return stamp] (a deschedule before PostMessageW or after it returns
+    // cannot be told apart), so the split is recorded as the bounds both stamps support, never a point
+    const double postMs = m_playbackDueWake ? m_playbackDueWake->lastDeliveryPostMs() : -1.0;
+    const double firstStampMs = m_playbackDueWake ? m_playbackDueWake->lastDeliveryPostFirstMs() : -1.0;
+    if( postMs >= 0.0 )
+    {
+        const PlaybackDueWakeSplitBounds bounds =
+            playbackDueWakeSplitBounds( m_playbackDueWakeDueAtMs, firstStampMs, postMs, nowMs );
+        m_playbackDueWakeDueToPostLoMs.add( bounds.dueToPostLoMs );
+        m_playbackDueWakeDueToPostHiMs.add( bounds.dueToPostHiMs );
+        m_playbackDueWakePostToReceiveLoMs.add( bounds.postToReceiveLoMs );
+        m_playbackDueWakePostToReceiveHiMs.add( bounds.postToReceiveHiMs );
+        m_playbackDueWakePostCallMs.add( bounds.postCallMs );
+    }
+    // r5 adversary pass 9 A1: postMs is PostMessageW's return time; a native delivery taken before the wait thread published
+    // it is in neither split set (post_unsplit), never split at the first stamp
+    else if( m_playbackDueWake && m_playbackDueWake->lastDeliveryUnsplit() )
+        ++m_playbackDueWakePostUnsplit;
+    // adversary r1 pass 2 A1: the wake honours m_frameStillDrawing exactly as the poll tick does and never recomputes it from the
+    // render thread -- an idle renderer with a Ready frame whose notification is still queued would read as not busy, and the
+    // advance would request the next frame over it (every-frame mode, CPU latest-ready acquisition: a skipped frame).
+    // adversary r1 pass 3 A1: every-frame mode advances only past the frame on screen (the frame whose present ENDED).
+    // r2 adversary pass 6 A1: a wake held for an unpresented frame leaves NO pending advance. The empty-frameReady and
+    // lookahead-drop paths took that flag while the frame's preparation was still queued and advanced over it; the present
+    // that ends re-arms the wake (presentPlaybackPreparedFrame) and its tail advance moves on.
+    const PlaybackDueWakeOutcome outcome =
+        playbackDueWakeOutcome( m_frameStillDrawing, ui->actionDropFrameMode->isChecked(),
+                                m_playbackDueWakePresentedFrame, ui->horizontalSliderPosition->value() );
+    if( outcome != PlaybackDueWakeOutcome::Advance )
+    {
+        // only a busy renderer leaves the advance pending for the frameReady / drawFrameReady paths
+        if( playbackDueWakeOutcomeLeavesPendingAdvance( outcome ) ) m_playbackFrameAdvancePending = true;
+        if( outcome == PlaybackDueWakeOutcome::DeferBusy )
+            ++m_playbackDueWakeBusyDeferred;
+        else
+            ++m_playbackDueWakeUnpresentedDeferred;
+        return;
+    }
+    const int positionBefore = ui->horizontalSliderPosition->value();
+    m_skipImmediateTimecodeLabel = true;
+    // predictive: the tick shaping asks for at least a frame period, and the pace guard caps it to the credit
+    timerFrameEvent( true );
+    m_skipImmediateTimecodeLabel = false;
+    if( ui->horizontalSliderPosition->value() != positionBefore )
+    {
+        ++m_playbackDueWakeAdvanced;
+        return;
+    }
+    // still short of the next whole frame (a poll tick spent the credit first, or rounding): wake again when it is due
+    if( m_playbackDueWakeRearmsThisPresent >= kPlaybackDueWakeMaxRearms || !m_playbackDueWake ) return;
+    const double paceFps = playbackPaceGuardFps();
+    if( !( paceFps > 0.0 ) || !m_playbackPaceGuard.armed() || !ui->actionPlay->isChecked() ) return;
+    const bool atCutOut = ui->horizontalSliderPosition->value() >= ui->spinBoxCutOut->value() - 1;
+    const double framesNeeded = ( ui->actionDropFrameMode->isChecked() && !atCutOut )
+        ? playback_native_pace::framesToNextWholeFrame( m_newPosDropMode )
+        : 1.0;
+    const double rearmNowMs = mlv_stage_timing_now() * 1000.0;
+    const double dueMs = m_playbackPaceGuard.msUntilCredit( framesNeeded, rearmNowMs, paceFps );
+    ++m_playbackDueWakeRearmsThisPresent;
+    ++m_playbackDueWakeRearmed;
+    m_playbackDueWakeDueAtMs = rearmNowMs + dueMs + kPlaybackDueWakeSlackMs;
+    m_playbackDueWake->arm( dueMs + kPlaybackDueWakeSlackMs );
+    notePlaybackDueWakeArmMechanism();   // r2 adversary pass 5 A1: a re-arm can fall back too
+}
+
+void MainWindow::cancelPlaybackDueWake( void )
+{
+    if( m_playbackDueWake && m_playbackDueWake->armed() ) m_playbackDueWake->cancel();
+}
+
+void MainWindow::resetPlaybackDueWakeCounters( void )
+{
+    m_playbackDueWakeRearmsThisPresent = 0;
+    m_playbackDueWakeArmed = 0;
+    m_playbackDueWakeFired = 0;
+    m_playbackDueWakeAdvanced = 0;
+    m_playbackDueWakeRearmed = 0;
+    m_playbackDueWakeBusyDeferred = 0;
+    m_playbackDueWakeUnpresentedDeferred = 0;
+    m_playbackDueWakePostUnsplit = 0;
+    // r7 (adversary passes 13/14 A1): the wake's post counters are cumulative; the line reports this Play's share.
+    // r7 pass 16 A1: settled first, so a failure of the previous Play's last arm is never taken into this Play's share
+    // r8 (adversary pass 17 A1): a false (the wait thread did not answer in time) is carried, so a late failure of the previous
+    // Play that lands after this baseline is printed as post_counts_settled=0, never as a settled count of this Play
+    m_playbackDueWakePostBaselineSettled = m_playbackDueWake ? m_playbackDueWake->settlePostCounters() : true;
+    m_playbackDueWakePostRefusedBase = m_playbackDueWake ? m_playbackDueWake->postRefusals() : 0;
+    m_playbackDueWakePostFailedBase = m_playbackDueWake ? m_playbackDueWake->postFailures() : 0;
+    m_playbackDueWakePostRescuedBase = m_playbackDueWake ? m_playbackDueWake->postRescued() : 0;
+    m_playbackDueWakePresentedFrame = -1;   // nothing presented in this Play yet
+    m_playbackDueWakeHiRes = false;
+    m_playbackDueWakeDelivery = QStringLiteral( "none" );
+    m_playbackDueWakeMechanismSeen = false;
+    // r4 (Dot B1): reset() releases the capacity (clear() kept it)
+    m_playbackDueWakeLatenessMs.reset();
+    m_playbackDueWakeDueToPostLoMs.reset();
+    m_playbackDueWakeDueToPostHiMs.reset();
+    m_playbackDueWakePostToReceiveLoMs.reset();
+    m_playbackDueWakePostToReceiveHiMs.reset();
+    m_playbackDueWakePostCallMs.reset();
+}
+
+// One line per measured Play, logged after the timed window has closed (finishPlaybackSmokeTelemetry).
+QString MainWindow::playbackDueWakeSummaryLine( void ) const
+{
+    // r4 (Dot B1): the same nearest-rank percentiles, from bounded storage (exact up to kExactCapacity samples per Play)
+    // r5 (Dot B2): every percentile goes through playbackDueWakePercentileText, so a binned rank outside the histogram range
+    // prints CENSORED ("<=-20.000" / ">=80.000"), never the edge bin's centre as a measured value
+    const QString p50 = playbackDueWakePercentileText( m_playbackDueWakeLatenessMs, 0.50 );
+    const QString p95 = playbackDueWakePercentileText( m_playbackDueWakeLatenessMs, 0.95 );
+    // r3: the lateness split at the post (post_stamped = how many fired wakes carried a post time; the rest are 0.000)
+    // r6 (adversary pass 10 A2): each split percentile is printed as the [lo, hi] pair the two stamps support (the p-th lower
+    // bound <= the true p-th value <= the p-th upper bound), plus the post-call span that separates them; no point split
+    const QString split = QStringLiteral( " post_stamped=%1 due_to_post_p50_lo_ms=%2 due_to_post_p50_hi_ms=%3 "
+                                          "due_to_post_p95_lo_ms=%4 due_to_post_p95_hi_ms=%5 "
+                                          "post_to_receive_p50_lo_ms=%6 post_to_receive_p50_hi_ms=%7 "
+                                          "post_to_receive_p95_lo_ms=%8 post_to_receive_p95_hi_ms=%9 "
+                                          "post_call_p50_ms=%10 post_call_p95_ms=%11" )
+        .arg( static_cast<qulonglong>( m_playbackDueWakePostCallMs.size() ) )
+        // r6 adversary pass 11 A1: the bounds are rounded OUTWARD (bin edge, floor / ceil to 0.001), never to the bin centre
+        .arg( playbackDueWakePercentileBoundText( m_playbackDueWakeDueToPostLoMs, 0.50, PlaybackDueWakeBoundSide::Lower ) )
+        .arg( playbackDueWakePercentileBoundText( m_playbackDueWakeDueToPostHiMs, 0.50, PlaybackDueWakeBoundSide::Upper ) )
+        .arg( playbackDueWakePercentileBoundText( m_playbackDueWakeDueToPostLoMs, 0.95, PlaybackDueWakeBoundSide::Lower ) )
+        .arg( playbackDueWakePercentileBoundText( m_playbackDueWakeDueToPostHiMs, 0.95, PlaybackDueWakeBoundSide::Upper ) )
+        .arg( playbackDueWakePercentileBoundText( m_playbackDueWakePostToReceiveLoMs, 0.50, PlaybackDueWakeBoundSide::Lower ) )
+        .arg( playbackDueWakePercentileBoundText( m_playbackDueWakePostToReceiveHiMs, 0.50, PlaybackDueWakeBoundSide::Upper ) )
+        .arg( playbackDueWakePercentileBoundText( m_playbackDueWakePostToReceiveLoMs, 0.95, PlaybackDueWakeBoundSide::Lower ) )
+        .arg( playbackDueWakePercentileBoundText( m_playbackDueWakePostToReceiveHiMs, 0.95, PlaybackDueWakeBoundSide::Upper ) )
+        .arg( playbackDueWakePercentileText( m_playbackDueWakePostCallMs, 0.50 ) )
+        .arg( playbackDueWakePercentileText( m_playbackDueWakePostCallMs, 0.95 ) );
+    // r4 (Dot B1): binned=1 when a set outgrew its exact store this Play. r5 (Dot B2): a binned percentile is within 0.005 ms
+    // (bin centre) for IN-RANGE ranks only; each set discloses its exactness, its underflow / overflow counts and the range
+    const bool binned = !m_playbackDueWakeLatenessMs.exact() || !m_playbackDueWakeDueToPostLoMs.exact()
+        || !m_playbackDueWakeDueToPostHiMs.exact() || !m_playbackDueWakePostToReceiveLoMs.exact()
+        || !m_playbackDueWakePostToReceiveHiMs.exact() || !m_playbackDueWakePostCallMs.exact();
+    // r7 (adversary pass 16 A1): every timer signal of this Play is counted before the post counters are read
+    // (post_counts_settled=0: the wait thread did not answer within its retry budget plus slack, and they may still move)
+    // r8 (adversary pass 17 A1): ...at this line, OR at this Play's baseline (resetPlaybackDueWakeCounters); either one leaves
+    // the differences below open to another Play's late count
+    const bool postCountsSettled = ( m_playbackDueWake ? m_playbackDueWake->settlePostCounters() : true )
+        && m_playbackDueWakePostBaselineSettled;
+    const QString bound = QStringLiteral( " samples_binned=%1" ).arg( binned ? 1 : 0 )
+        + QStringLiteral( " post_unsplit=%1" ).arg( m_playbackDueWakePostUnsplit )   // r5 pass 9 A1
+        // r7 (adversary passes 13/14 A1): refused PostMessageW calls, posts given up after the retry budget, and lost posts the
+        // poll tick delivered; post_failed > post_rescued means a lost post's arm was cancelled or replaced before a tick
+        + QStringLiteral( " post_refused=%1 post_failed=%2 post_rescued=%3 post_counts_settled=%4" )
+              .arg( static_cast<qulonglong>( m_playbackDueWake ? m_playbackDueWake->postRefusals() - m_playbackDueWakePostRefusedBase : 0 ) )
+              .arg( static_cast<qulonglong>( m_playbackDueWake ? m_playbackDueWake->postFailures() - m_playbackDueWakePostFailedBase : 0 ) )
+              .arg( static_cast<qulonglong>( m_playbackDueWake ? m_playbackDueWake->postRescued() - m_playbackDueWakePostRescuedBase : 0 ) )
+              .arg( postCountsSettled ? 1 : 0 )
+        + playbackDueWakeRangeFields( m_playbackDueWakeLatenessMs, "late" )
+        + playbackDueWakeRangeFields( m_playbackDueWakeDueToPostLoMs, "due_to_post_lo" )
+        + playbackDueWakeRangeFields( m_playbackDueWakeDueToPostHiMs, "due_to_post_hi" )
+        + playbackDueWakeRangeFields( m_playbackDueWakePostToReceiveLoMs, "post_to_receive_lo" )
+        + playbackDueWakeRangeFields( m_playbackDueWakePostToReceiveHiMs, "post_to_receive_hi" )
+        + playbackDueWakeRangeFields( m_playbackDueWakePostCallMs, "post_call" );
+    return QStringLiteral( "playback_due_wake armed=%1 fired=%2 advanced=%3 rearmed=%4 busy_deferred=%5 "
+                           "late_p50_ms=%6 late_p95_ms=%7 hires=%8 disabled=%9 delivery=%10 unpresented_deferred=%11" )
+        .arg( m_playbackDueWakeArmed )
+        .arg( m_playbackDueWakeFired )
+        .arg( m_playbackDueWakeAdvanced )
+        .arg( m_playbackDueWakeRearmed )
+        .arg( m_playbackDueWakeBusyDeferred )
+        .arg( p50 )
+        .arg( p95 )
+        .arg( m_playbackDueWakeHiRes ? 1 : 0 )
+        .arg( mlvappPlaybackDueWakeEnabled() ? 0 : 1 )
+        .arg( m_playbackDueWakeDelivery.isEmpty() ? QStringLiteral( "none" ) : m_playbackDueWakeDelivery )
+        .arg( m_playbackDueWakeUnpresentedDeferred ) + split + bound;
 }
 
 //Paint the Audio Track Wave to GUI
@@ -30559,6 +30831,8 @@ void MainWindow::finishPlaybackSmokeTelemetry( const char *reason )
                          elapsedMs, m_playbackSmokeFirstPresentMs, m_playbackSmokePresentedFrames ), 0, 'f', 3 )
                .arg( m_playPaceFps, 0, 'f', 3 )
                .arg( m_playbackSmokeFirstPresentTimelineDeltaAbs );
+    // HFR-NATIVE-M16-1457-GUI-PRESENT-CADENCE-1: what the due wake did this Play (elapsedMs is already sampled).
+    qInfo().noquote() << playbackDueWakeSummaryLine();
 
     // PLAYBACK-STARTUP-CATCHUP-BURST-1: Play -> first present, and what the first 2 s skipped for it.
     qInfo().noquote()
@@ -32046,6 +32320,18 @@ void MainWindow::on_actionPlay_toggled(bool checked)
     // PLAYBACK-CUDA-NATIVE-PACE-1: the pace clock re-arms at this Play's first engine tick.
     m_playbackPaceGuard.reset();
     if( checked ) m_conformDropDebtFrames = 0.0;   // HFR-NATIVE-60FPS-FULLRES-1 r24: no held conform frame survives a Play start
+    // HFR-NATIVE-M16-1457-GUI-PRESENT-CADENCE-1: a pending due wake belongs to the clock just reset; the counters are
+    // per Play, and only the fallback timer raises the timer resolution, for the duration of Play.
+    cancelPlaybackDueWake();
+    if( checked )
+    {
+        resetPlaybackDueWakeCounters();
+        if( m_playbackDueWake ) m_playbackDueWake->beginPlay();
+    }
+    else if( m_playbackDueWake )
+    {
+        m_playbackDueWake->endPlay();
+    }
     logInteractionEvent(
         QStringLiteral("play.toggled.begin"),
         QStringLiteral("checked=%1 file_loaded=%2 position=%3 cut_in=%4 cut_out=%5 frame_changed=%6 still_drawing=%7 pending_advance=%8")
@@ -34241,6 +34527,7 @@ void MainWindow::finishPresentedFrame( uint64_t displayFrame,
     if( m_pRenderThread && !releasePresentedFrameEarly )
         m_pRenderThread->releasePresentedFrameForRequestSerial( readyFrame.requestSerial );
     m_frameStillDrawing = renderThreadBusyForPlaybackAdvance( currentPlaybackAdvanceTarget() );
+    m_playbackTailAdvanceMovedFrame = false;   // HFR-NATIVE-M16-1457-GUI-PRESENT-CADENCE-1: read by armPlaybackDueWake()
     if( ui->actionPlay->isChecked() )
     {
         const bool suppressTailAdvanceAfterGpuTexNrEarlyAdvance =
@@ -34272,7 +34559,9 @@ void MainWindow::finishPresentedFrame( uint64_t displayFrame,
                     readyFrame.frameReadyEmitStageTime;
                 m_playbackTimelineSourceDrawBeginStageTime = displayStart;
             }
+            const int tailAdvancePositionBefore = ui->horizontalSliderPosition->value();
             timerFrameEvent();
+            m_playbackTailAdvanceMovedFrame = ui->horizontalSliderPosition->value() != tailAdvancePositionBefore;
             const double advance_return = mlv_stage_timing_now();
             m_lastDrawFrameReadyAdvanceMs =
                 (advance_return - advance_start) * 1000.0;
@@ -34594,9 +34883,13 @@ void MainWindow::drawFrameReady()
                     .arg( ui->horizontalSliderPosition->value() ),
                 true );
         }
-        if( !m_frameStillDrawing
-         && ui->actionPlay->isChecked()
-         && m_playbackFrameAdvancePending )
+        // r2 adversary pass 6 A1 (sibling): in every-frame mode the pending advance is taken here only past the frame whose
+        // present ENDED. A lookahead frame's frameReady while the slider's frame is still queued for preparation advanced
+        // over it (9 -> 10, preparation 110 replaced 109); the flag stays for that present's tail advance.
+        if( playbackPendingAdvanceMayBeTaken( mlvappPlaybackDueWakeEnabled(), ui->actionPlay->isChecked(),
+                                              m_playbackFrameAdvancePending,
+                                              m_frameStillDrawing, ui->actionDropFrameMode->isChecked(),
+                                              m_playbackDueWakePresentedFrame, ui->horizontalSliderPosition->value() ) )
         {
             m_skipImmediateTimecodeLabel = true;
             const double advance_start = mlv_stage_timing_now();
@@ -34689,7 +34982,13 @@ void MainWindow::drawFrameReady()
                     }
                     m_frameStillDrawing =
                         renderThreadBusyForPlaybackAdvance( currentPlaybackAdvanceTarget() );
-                    if( m_frameStillDrawing ) return;
+                    // r2 adversary pass 6 A1 (sibling): the same every-frame rule as the empty-frameReady advance
+                    if( !playbackPendingAdvanceMayBeTaken( mlvappPlaybackDueWakeEnabled(), ui->actionPlay->isChecked(),
+                                                           m_playbackFrameAdvancePending,
+                                                           m_frameStillDrawing, ui->actionDropFrameMode->isChecked(),
+                                                           m_playbackDueWakePresentedFrame,
+                                                           ui->horizontalSliderPosition->value() ) )
+                        return;
 
                     m_skipImmediateTimecodeLabel = true;
                     const double advance_start = mlv_stage_timing_now();
