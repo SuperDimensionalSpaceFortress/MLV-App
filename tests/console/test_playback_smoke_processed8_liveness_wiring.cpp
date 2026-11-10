@@ -177,6 +177,24 @@ TEST(Processed8TelemetryLiveness, DrawFrameMeasuredFlagsCarryTheStageRanState)
     ASSERT_EQ(1, body.count(QStringLiteral("QStringLiteral(\"processed16_stage_measured\")")));
 }
 
+TEST(Processed8TelemetryLiveness, DrawFrameDirectPathFlagIsGatedOnTheStageRanFlag)
+{
+    // PROCESSED8-DIRECT-PATH-TELEMETRY-STALE-1: the direct-path getter reads a thread-local
+    // only the getMlvProcessedFrame8*/16 entries write. The OutputDebayered16 branch runs none
+    // of them, so an ungated copy reports the last processed-8 frame's flag on every debayered-16
+    // frame (processed8_direct_path_frames ~= presented with processed8_measured_frames = 0).
+    const QString body = drawFrameBody();
+    ASSERT_FALSE(body.isEmpty());
+    ASSERT_TRUE(QRegularExpression(QStringLiteral(
+        "insert\\(\\s*QStringLiteral\\(\"processed8_direct_path_active\"\\),\\s*"
+        "renderThreadProcessed8StageRan\\s*&&\\s*getMlvLastProcessed8DirectPathActive\\(\\)\\s*!=\\s*0\\s*\\);"))
+        .match(body).hasMatch());
+    // No ungated read of the getter anywhere else in drawFrame.
+    ASSERT_EQ(1, body.count(QStringLiteral("getMlvLastProcessed8DirectPathActive()")));
+    // The gated copy plus the GPU no-readback branch's constant false; nothing else writes it.
+    ASSERT_EQ(2, body.count(QStringLiteral("QStringLiteral(\"processed8_direct_path_active\")")));
+}
+
 TEST(Processed8TelemetryLiveness, PresentedFrameReadsTheMeasuredFlags)
 {
     const QString body = notePresentedFrameBody();

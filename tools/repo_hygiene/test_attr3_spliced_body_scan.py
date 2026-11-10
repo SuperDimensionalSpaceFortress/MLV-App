@@ -111,6 +111,11 @@ INERT_INSTANCE |= frozenset("""
 .Close() .Dispose() .EndInvoke() .Flush() .Read() .ReadByte() .ReadLine() .ReadToEndAsync() .Seek() .Set()
 .Stop() .Wait() .WaitOne()
 """.split())
+# HFR-NATIVE-60FPS-FULLRES-1-MERGE-MASTER r5 (CI-3, Dot 6542725503): double::IsNaN is the same pure value predicate as double::IsInfinity
+# and double::IsFinite above (a bool from a double; no file, process, registry or network). The conform-aware AttrCuda oracle uses
+# IsNaN / IsInfinity because Windows PowerShell 5.1 has no double::IsFinite. A side-effecting call in the same body is still a finding
+# (test_a_raw_pub_write_added_to_a_real_spliced_helper_is_caught; ...IsNaNIsAPurePredicateButAWriteBesideItIsStillCaught below).
+INERT_STATIC |= frozenset("double::IsNaN".split())
 # Read-only: they return data and cannot create, write, move or delete anything.
 INERT_STATIC |= frozenset("""
 Environment::GetFolderPath IO.DriveInfo::new IO.File::OpenRead IO.File::ReadAllBytes IO.File::ReadAllLines
@@ -564,6 +569,30 @@ class SplicedBodyScanOnRealSourcesTests(unittest.TestCase):
         main_job = BACHELOR / "playback-attr-3-cuda-job.ps1"
         # The template-only scan of the real job over the mutated module: blind to it.
         self.assertEqual(run_scan(generators=[main_job], modules=modules)["violations"], [])
+        found = in_scope([v for v in run_scan(generators=[main_job], modules=modules, splice_sources=[main_job])["splicedViolations"]
+                          if v["rule"] != "splice"])
+        unlisted, _, _ = apply_allowlist(found)
+        self.assertEqual([(f["function"], f["rule"], f["token"]) for f in unlisted], [(victim, "R2", "New-Item")], describe(unlisted))
+
+    def test_is_nan_is_a_pure_predicate_but_a_write_beside_it_is_still_caught(self) -> None:
+        # MERGE-MASTER r5 (CI-3): double::IsNaN joined INERT_STATIC; the conform-aware oracle that calls it five times gains a raw write
+        # into $Pub, and that write -- only that -- is still an unlisted finding.
+        victim = "Get-AttrCudaConformAwareSourceFramesVerdict"
+        module = BACHELOR / "AttrCudaArtifacts.psm1"
+        text = module.read_text(encoding="utf-8")
+        body = re.search(r"(?ms)^function\s+" + re.escape(victim) + r"\s*\{.*?^\}", text)
+        self.assertIsNotNone(body, f"{victim} moved")
+        self.assertEqual(body.group(0).count("[double]::IsNaN("), 5, "the five IsNaN calls this test was written against")
+        tmp = _long_path(Path(tempfile.mkdtemp(prefix="attr3-splice-isnan-")))
+        self.addCleanup(shutil.rmtree, tmp, True)
+        mutated = tmp / "AttrCudaArtifacts.psm1"
+        at = body.end() - 1
+        mutated.write_text(
+            text[:at] + "    New-Item -ItemType Directory -Path (Join-Path $Pub 'sneaky') -Force | Out-Null\n" + text[at:],
+            encoding="utf-8",
+        )
+        modules = (mutated, BACHELOR / "AttrCudaOwnerFootage.psm1", ROOT / "tools" / "profiling" / "gui-smoke-display-identity.ps1")
+        main_job = BACHELOR / "playback-attr-3-cuda-job.ps1"
         found = in_scope([v for v in run_scan(generators=[main_job], modules=modules, splice_sources=[main_job])["splicedViolations"]
                           if v["rule"] != "splice"])
         unlisted, _, _ = apply_allowlist(found)

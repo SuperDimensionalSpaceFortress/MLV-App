@@ -283,9 +283,24 @@ the child and waits for each process it saw before the kill. The wait is on the 
 stopwatch. It is bounded at 15 s, or by what is left of the lane's budget, with a 5 s floor.
 
 A process snapshot only names pids, and a pid can change hands before it is opened. So a
-candidate is killed only after the parent read from its own kept handle matches the parent being
+candidate is killed only after the parent read from its own handle matches the parent being
 walked, and it does not read older than that parent (r15). A process whose parent does not match
-is left alone. The receipt's `codexDirectChildStop` is present only in this case:
+is left alone. The reads use a handle with only `PROCESS_QUERY_LIMITED_INFORMATION`, and that
+handle stays open until the member's own handle, the one the kill and the wait use, is open, so
+the pid cannot change hands in between (CONTAINMENT-KID-READ-ACCESS-DENIED-1). Before that fix the
+reads went through `Process.Handle`, which asks for `PROCESS_ALL_ACCESS`. Hosted CI read
+`ancestry-unreadable:kid-read:5` (PR 420 job 128859524832, PR 766 job 128492230194, PR 775 job
+128881183190). The process it read is UNKNOWN: no receipt or log names it. One possible
+mechanism, shown only by an injected test: a protected process refuses `PROCESS_ALL_ACCESS` with 5,
+even to an elevated, debug-privileged account, and every Windows host keeps some whose parent pid is
+free (csrss, wininit: their smss instance has exited), so a lane process handed that recycled pid
+can have one listed under it. The tests model that refusal with a seam at the walk's one candidate
+open, because on an elevated host a process DACL does not bind a reader whose SeDebugPrivilege .NET
+enabled (r2: hosted run 42538300582 read `killed` where a no-grant DACL was meant to refuse). A candidate whose
+kernel process number (`ProcessSequenceNumber`, which follows creation order whatever the clock
+does) is below its parent's existed before that parent, so it is not its child: it is left alone
+and adds no uncertainty. When either number cannot be read, this rule says nothing. The receipt's
+`codexDirectChildStop` is present only in this case:
 
 - `killed`: the child and every descendant shown to be in the tree before the kill were each seen
   to exit in time.
@@ -295,14 +310,17 @@ is left alone. The receipt's `codexDirectChildStop` is present only in this case
   descendant may still be alive.
 - `uncertain:ancestry-unreadable:<site>:<code>`: a candidate or a parent could not be read, so it
   was not killed by the lane's own loop. `<site>` is `parent-read` (the parent's creation time),
-  `kid-open` (opening the candidate by pid) or `kid-read` (its parent pid or creation time), and
-  `<code>` is the error code of the failed read: a Win32 error for `parent-read`, `kid-open` and the
-  creation-time read of `kid-read` (5 is access denied), but the raw signed NTSTATUS for the parent-pid
-  read of `kid-read` (`NtQueryInformationProcess`; access denied is -1073741790, 0xC0000022). The outcome
-  is the same for every site and code; the suffix only says which read failed.
-- `uncertain:older-than-parent`: the parent matches and the child reads older. A backward clock
-  step and a reused parent pid look the same, so it was not killed by the lane's own loop, and
-  it may still be alive.
+  `kid-open` (opening the candidate by pid) or `kid-read` (the query-limited open, its parent pid or
+  creation time, or a member's own handle), and `<code>` is the error code of the failed read: a
+  Win32 error for `parent-read`, `kid-open`, the opens and the creation-time read of `kid-read` (5 is
+  access denied), but the raw signed NTSTATUS for the parent-pid read of `kid-read`
+  (`NtQueryInformationProcess`; access denied is -1073741790, 0xC0000022). The outcome is the same
+  for every site and code; the suffix only says which read failed. A process that refuses even the
+  query-limited open still reads `kid-read:5` and is still not killed.
+- `uncertain:older-than-parent`: the parent matches and the child reads older by the clock, and the
+  kernel's process numbers do not show it was created first (they were unread, or they put it after
+  the parent). A backward clock step and a reused parent pid can then look the same, so it was not
+  killed by the lane's own loop, and it may still be alive.
 - `uncertain:descendant-unreachable`: the snapshot saw a process under a pid whose holder has
   since gone, so that process cannot be shown to be in the tree, or to be gone.
 

@@ -11,6 +11,7 @@
 #include "GpuDebayer.h"
 #include "ZebraThresholds.h"
 #include "GpuPreviewProcessing.h"
+#include "PlaybackSourceAdvanceTracker.h"
 #include "../../src/mlv/llrawproc/llrawproc.h"
 #include <QImage>
 #include <QOpenGLFunctions>
@@ -69,6 +70,10 @@ public:
      * (a cheap read, no readback). False when no viewport is installed, the last paint drew no frame, or the
      * route did not supply a serial. */
     static bool paintedSerialFor(const QGraphicsView *view, quint64 *serial);
+    /* HFR-NATIVE-60FPS-FULLRES-1 r28 (adversary A1 on e052947c): whether this viewport was handed a frame with
+     * presentationSerial >= serial that its paintGL() has not drawn yet (a deferred paint still to come). False when no
+     * viewport is installed, serial is 0, or the viewport was never handed that frame. */
+    static bool paintPendingForSerial(const QGraphicsView *view, quint64 serial);
     static SamplingMode samplingModeFor(const QGraphicsView *view);
     static QString rendererDescriptionFor(const QGraphicsView *view);
     static bool readPresentedBayer16Texture(QGraphicsView *view,
@@ -228,6 +233,9 @@ private:
     GpuPresentSetupTiming m_lastPresentSetupTiming;
     quint64 m_paintedSerial;
     bool m_paintedSerialValid;
+    // HFR-NATIVE-60FPS-FULLRES-1 r30 (adversary A1 on 71104385): the serial last painted ON SCREEN (never by an offscreen grab);
+    // paintPendingForSerial reads it
+    playback_paint_credit::ComposedPaintSerial m_composedPaint;
 };
 
 #endif // GPUDISPLAYVIEWPORT_H

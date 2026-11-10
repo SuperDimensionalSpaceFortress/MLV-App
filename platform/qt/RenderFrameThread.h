@@ -176,6 +176,13 @@ public:
             GpuPreviewProcessingConfig gpuPreviewProcessingConfig;
             uint64_t gpuPreviewProcessingConfigGeneration = 0;
             QString playbackProcessingReason;
+            /* HFR-NATIVE-60FPS-FULLRES-1-MERGE-MASTER r17 (adversary A1 on 6451a8d9): the engine's loop-wrap
+             * count (PlaybackWrapRecorder::engineWraps) when this frame was REQUESTED. A frame requested before a
+             * wrap is presented after it whenever the draw's own early/tail advance wraps the engine first, so
+             * the source-advance tracker reads this beside the live count (presentationLoopWraps). A lookahead
+             * request copies its base request's count, and r20: MainWindow::drawFrameReady raises it to the live count
+             * when it accepts the frame as the engine's target (presentationAcceptedLookaheadStamp). */
+            int engineWrapsAtRequest = 0;
             bool playbackActive = false;
             bool dropFramePlaybackActive = false;
             bool renderThreadUsing16BitPreview = false;
@@ -429,6 +436,10 @@ public:
     bool hasPlaybackLookaheadRequest( uint32_t frameNumber,
                                       uint64_t activeGeneration );
     bool hasReadyPlaybackLookaheadFrame( uint32_t frameNumber,
+                                         uint64_t activeGeneration );
+    /* HFR-NATIVE-60FPS-FULLRES-1 r27 fix iteration 2: a published Ready frame for
+     * frameNumber in activeGeneration, lookahead or not (not yet acquired). */
+    bool hasReadyFrameForPlaybackTarget( uint32_t frameNumber,
                                          uint64_t activeGeneration );
     int prunePlaybackLookaheadOutsideForwardWindow( int activePlaybackTarget,
                                                     uint64_t activeGeneration,

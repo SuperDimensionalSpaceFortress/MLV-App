@@ -1935,6 +1935,10 @@ if (-not $asideResult.ok) {
     exit 43
 }
 $startUtc = [datetime]::UtcNow
+# CORE-PARTITION-PREDECESSOR-CLOCK-STEP-1 r3 (adversary f5182886 A1): the launch on the monotonic clock too, read right after the wall launch stamp, so
+# the receipt's elapsedMonoMs (launch..end, monotonic) lets a reader check the two wall stamps against each other: a wall-clock excursion that lands
+# on only one of startedAtUtc / endedAtUtc shows as a disagreement between the wall launch..end and elapsedMonoMs.
+$startTimestamp = [System.Diagnostics.Stopwatch]::GetTimestamp()
 $process = [System.Diagnostics.Process]::Start($startInfo)
 $screenshotCapture = $null
 $windowScreenshotCapture = $null
@@ -2008,6 +2012,12 @@ $stdout = $processBoundary.stdout
 $stderr = $processBoundary.stderr
 $processExitCode = [int]$processBoundary.exitCode
 $captureBindingFailures += @($processBoundary.failures)
+# CORE-PARTITION-PREDECESSOR-CLOCK-STEP-1 r2: the end on the monotonic clock, so the receipt's exitToEndMs (the stream drain after the confirmed
+# exit) is a monotonic duration, never the difference of two wall-clock readings. Read BEFORE endedAtUtc (adversary 56b25d8b A1): a DELAY between
+# the two reads can only shorten exitToEndMs, which moves the job's derived exit (endedAtUtc - exitToEndMs) later. That holds for a delay only, not
+# for a wall-clock step: r3 (adversary f5182886 A1): an excursion that lands on the endedAtUtc read moves the derived exit by its size, either way.
+# The receipt's elapsedMonoMs (launch..end on this monotonic clock) is what the job checks endedAtUtc - startedAtUtc against.
+$endTimestamp = [System.Diagnostics.Stopwatch]::GetTimestamp()
 $endUtc = [datetime]::UtcNow
 # round 7: -SubjectProcess is now passed to the AFTER snapshot too (it previously was not passed
 # at all). Under the new interval-based verdict (Get-HostLoadVerdict computes each interval's
@@ -2933,6 +2943,15 @@ $result = [pscustomobject]@{
         stderrDrained = [bool]$processBoundary.stderrDrained
         startedAtUtc = $startUtc.ToString("o")
         endedAtUtc = $endUtc.ToString("o")
+        # CORE-PARTITION-PREDECESSOR-CLOCK-STEP-1 r2 (Dot pr-780 S1): endedAtUtc is stamped after the stdout/stderr drain. exitToEndMs is how long
+        # before endedAtUtc the process's termination was confirmed (Wait-GuiSmokeProcessBounded's exitObservedTimestamp), measured on the monotonic
+        # clock, so endedAtUtc - exitToEndMs is the exit with no second wall-clock reading in it; exitObservedAtUtc is that moment's wall-clock
+        # reading, for people only. Both null when termination was never confirmed.
+        exitObservedAtUtc = $(if ($null -ne $processBoundary.exitObservedAtUtc) { ([datetime]$processBoundary.exitObservedAtUtc).ToString("o") } else { $null })
+        exitToEndMs = $(if ($null -ne $processBoundary.exitObservedTimestamp) { [math]::Round(([double]($endTimestamp - [int64]$processBoundary.exitObservedTimestamp)) * 1000.0 / [System.Diagnostics.Stopwatch]::Frequency, 3) } else { $null })
+        # r3 (adversary f5182886 A1): launch..end on the monotonic clock (the stamps read beside startedAtUtc and endedAtUtc); the job refuses a run
+        # whose endedAtUtc - startedAtUtc disagrees with it by more than its clock tolerance and widens its slack by the disagreement under it.
+        elapsedMonoMs = [math]::Round(([double]($endTimestamp - $startTimestamp)) * 1000.0 / [System.Diagnostics.Stopwatch]::Frequency, 3)
         stdout = $stdout.Trim()
         stderr = $stderr.Trim()
     }

@@ -27,6 +27,7 @@ BUILD_RELEASE = REPO_ROOT / "tools" / "build-release.ps1"
 STAGE_PROBE = REPO_ROOT / "tools" / "profiling" / "qscreen-probe" / "stage-probe-and-job.ps1"
 ATTR3_ASSEMBLE = REPO_ROOT / "tools" / "profiling" / "bachelor" / "playback-attr-3-cuda-assemble.ps1"
 ROUTED_LAUNCHERS = (BUILD_RELEASE, STAGE_PROBE, ATTR3_ASSEMBLE)
+STAGE_CHAIN = REPO_ROOT / "tools" / "profiling" / "dual-venue" / "Invoke-VenueStageChain.ps1"
 
 PWSH = shutil.which("pwsh.exe") or shutil.which("pwsh")
 
@@ -50,6 +51,7 @@ FAST = ["-PollSeconds", "0.2"]
 def _env(exempt=None, heavy_slot: Path = NO_HEAVY_SLOT, extra: dict = None) -> dict:
     env = dict(os.environ)
     env.pop("MLV_BUILD_GUARD_EXEMPT", None)
+    env.pop("MLV_HEAVY_SLOT_DEADLINE_UTC", None)  # a staging driver's deadline never leaks into a test from the machine that runs it
     for name in ("HEAVY_SLOT_HELD", "HEAVY_SLOT_HELD_START", "HEAVY_SLOT_HELD_NAME", "MLV_LANE_RUN_DIR"):
         env.pop(name, None)
     # The stub's options are opt-ins: a test gets one only through `extra`, never from the machine that runs the suite.
@@ -877,10 +879,12 @@ def test_a_marker_for_a_non_heavy_slot_code_is_never_a_requeue(box) -> None:
 
 
 def _library_driver(box: dict, body: str, lock: str, cwd: Path = None, extra: dict = None,
-                    host_tail: str = None) -> subprocess.CompletedProcess:
+                    host_tail: str = None, prelude: str = "") -> subprocess.CompletedProcess:
+    # prelude runs BEFORE the guard is dot-sourced: what a Library caller already holds in its session when it loads the guard.
     driver = box["dir"] / "lib-driver.ps1"
     driver.write_text(
         "param([string]$Guard, [string]$Lock, [string]$Mem, [string]$Table, [string]$Sha)\n"
+        + prelude +
         ". $Guard -Library\n"
         "$opts = @{ LockPath = $Lock; MemoryProbeFile = $Mem; ProcessTableFile = $Table; HeavySlotSha256 = $Sha; PollSeconds = 0.2 }\n"
         + body,
@@ -949,6 +953,914 @@ def test_a_pin_mismatch_refuses_before_anything_runs(box) -> None:
     assert f"expected={PINNED_HEAVY_SLOT_SHA} actual={_stub_sha()}" in done.stdout
     assert _stub_calls(box) == [], "heavy-slot is never called"
     assert not box["marker"].exists() and not box["lock"].exists()
+
+
+# --- STAGE-BUILD-HEAVY-SLOT-TIMEOUT-LOSES-TURN-1: a staging build's wait is bounded by its driver's deadline -------------
+# 2026-11-08: a venue staging build waited the default 60 min on the machine slot, was refused (heavy-slot code 75), and the
+# stage chain re-queued 300 s later as the YOUNGEST ticket (#2 of 6 behind other projects' work). The slot admits oldest first,
+# so the turn was lost on our side. The scripted queue ('queued' stub mode) admits a ticket whose --wait covers the minutes of
+# work ahead of it; no real time passes and the real machine slot is never touched.
+
+STAGE_QUEUE_ENV = {"STUB_HEAVY_SLOT_MODE": "queued", "STUB_HEAVY_SLOT_QUEUE_MIN": "130"}
+
+
+def _stage_attempt(box: dict, deadline_expr: str = None, opts_line: str = "", extra: dict = None,
+                   prelude: str = "") -> subprocess.CompletedProcess:
+    deadline = f"$opts.HeavySlotDeadlineUtc = {deadline_expr}\n" if deadline_expr else ""
+    return _library_driver(
+        box,
+        f"{deadline}{opts_line}"
+        f"Invoke-BuildGuard -Label 'attr3-assemble:abc' -Options $opts -Action {{ param($Jobs) Set-Content -LiteralPath '{box['marker']}' -Value ran -Encoding ascii }}\n",
+        str(box["lock"]),
+        extra={**STAGE_QUEUE_ENV, **(extra or {})},
+        prelude=prelude,
+    )
+
+
+def _wait_minutes(call: dict) -> float:
+    value = call["argv"][call["argv"].index("--wait") + 1]
+    assert value.endswith("m"), value
+    return float(value[:-1])
+
+
+def test_a_staging_deadline_bounds_the_wait_so_the_first_ticket_is_admitted(box) -> None:
+    # RED on fork/master 0a553b4e: the wait was the 60 min default, shorter than the 130 min of work ahead, so the ticket was
+    # refused and a retry would have been a fresh one. With the driver's deadline 240 min out the wait covers the queue.
+    done = _stage_attempt(box, "([DateTime]::UtcNow.AddMinutes(240)).ToString('o')")
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert box["marker"].exists(), "the build ran on the first ticket"
+    [call] = _stub_calls(box)
+    assert 239 < _wait_minutes(call) <= 240, call["argv"]
+    assert "BUILD_HEAVY_SLOT_REQUEUE" not in done.stdout
+    bound = [line for line in done.stdout.splitlines() if line.startswith("BUILD_HEAVY_SLOT_WAIT_BOUND ")]
+    assert len(bound) == 1, done.stdout
+    assert "label=attr3-assemble:abc" in bound[0] and " source=deadline " in bound[0] and " wait=2" in bound[0], bound[0]
+    assert re.search(r" deadline=\d{4}-\d\d-\d\dT[\d:.]+Z ", bound[0]), bound[0]
+
+
+def test_without_a_deadline_the_wait_stays_60_and_a_refusal_is_followed_by_a_fresh_ticket(box) -> None:
+    # The unchanged default (and today's failure shape): 60 min is shorter than the queue, so attempt 1 is refused and attempt 2
+    # is a NEW ticket. This passes before and after the fix; it pins that only a deadline changes the wait.
+    first = _stage_attempt(box)
+    second = _stage_attempt(box)
+    for done in (first, second):
+        assert done.returncode == 3, done.stdout + done.stderr
+        assert "BUILD_HEAVY_SLOT_REQUEUE label=attr3-assemble:abc code=75 ticket=stub-" in done.stdout
+        assert "BUILD_HEAVY_SLOT_WAIT_BOUND" not in done.stdout, "no deadline, no bound line"
+    calls = _stub_calls(box)
+    assert [_wait_minutes(c) for c in calls] == [60.0, 60.0]
+    tickets = [re.search(r"ticket=(\S+)", d.stdout).group(1) for d in (first, second)]
+    assert tickets[0] != tickets[1], "a refused waiter that retries gets a fresh ticket"
+    assert not box["marker"].exists()
+
+
+@pytest.mark.parametrize("frozen, given", [
+    ("New-Variable raw -Value '2099-01-01T00:00:00Z' -Option AllScope,ReadOnly", "'2000-01-01T00:00:00Z'"),
+    ("New-Variable raw -Value '2099-01-01T00:00:00Z' -Option AllScope,ReadOnly", "'not-a-date'"),
+    ("New-Variable raw -Value '' -Option AllScope,ReadOnly", "'2000-01-01T00:00:00Z'"),
+    ("New-Variable deadline -Value ([DateTime]::SpecifyKind([DateTime]'2099-01-01', [DateTimeKind]::Utc)) -Option AllScope,ReadOnly",
+     "'2000-01-01T00:00:00Z'"),
+    ("New-Variable waitMin -Value 10080 -Option AllScope,ReadOnly", "'2000-01-01T00:00:00Z'"),
+], ids=["raw-expired", "raw-invalid", "raw-empty", "deadline-datetime", "waitMin"])
+def test_an_allscope_read_only_library_caller_variable_never_replaces_the_given_deadline(box, frozen, given) -> None:
+    # adversary 398e451f-A1 (its input is raw-expired and raw-invalid): in Library mode a caller's read-only AllScope $raw is shared with
+    # Get-HeavySlotDeadline, whose assignments then fail under Continue, so an expired or invalid HeavySlotDeadlineUtc became the caller's
+    # 2099 (wait=10080m) or, frozen empty, no deadline at all (60m); a frozen $deadline in Enter-HeavySlot did the same. Every variable of
+    # the deadline path is now refused when a caller holds it AllScope, before anything is taken or launched.
+    done = _stage_attempt(box, given, opts_line="$ErrorActionPreference = 'Continue'\n" + frozen + "\n")
+    name = frozen.split()[1]
+    assert done.returncode == 2, done.stdout + done.stderr
+    assert f"BUILD_HEAVY_SLOT_REFUSED label=attr3-assemble:abc reason=caller-allscope-variable name={name} " in done.stdout, done.stdout + done.stderr
+    assert _stub_calls(box) == [] and not box["marker"].exists()
+
+
+# --- r5 (adversary pass on c0a8936e: A1 and A2, both introduced majors) ---------------------------------------------------------------
+
+_FROZEN_CAP = "$ErrorActionPreference = 'Continue'\nNew-Variable HeavySlotMaxMinutes -Value 20000 -Option AllScope,ReadOnly\n"
+
+
+@pytest.mark.parametrize("site, prelude, deadline, opts_line", [
+    # The adversary's input (build-guard.ps1:1002 via :1097 and :1153): a caller froze the cap before loading the guard, and a far deadline.
+    ("far-deadline", _FROZEN_CAP, "'2099-01-01T00:00:00Z'", ""),
+    # :1101, the same cap read by the range check: an explicit 20000 min wait with no deadline.
+    ("explicit-wait", _FROZEN_CAP, None, "$opts.HeavySlotWaitMinutes = 20000\n"),
+])
+def test_a_library_callers_frozen_cap_never_lifts_the_one_week_wait(box, site, prelude, deadline, opts_line) -> None:
+    # adversary c0a8936e-A1: the guard's `$script:HeavySlotMaxMinutes = 10080` (:191) failed against the caller's read-only AllScope 20000, so
+    # the deadline wait was clamped to 20000 (:1002), the range check accepted it (:1101) and heavy-slot got --wait 20000m with a 20015 min
+    # hung-tool bound. The cap is now a literal inside Enter-HeavySlot: no name a caller can pre-seed is read for it.
+    done = _stage_attempt(box, deadline, opts_line=opts_line, prelude=prelude)
+    calls = _stub_calls(box)
+    assert all(_wait_minutes(c) <= 10080 for c in calls), [c["argv"] for c in calls]
+    if site == "far-deadline":
+        assert done.returncode == 0, done.stdout + done.stderr
+        [call] = calls
+        assert _wait_minutes(call) == 10080.0, call["argv"]
+    else:
+        assert done.returncode == 2, done.stdout + done.stderr
+        assert "BUILD_HEAVY_SLOT_REFUSED label=attr3-assemble:abc reason=invalid-option " in done.stdout and "from 0 to 10080" in done.stdout, done.stdout
+        assert calls == [] and not box["marker"].exists()
+
+
+@pytest.mark.parametrize("prelude, name, reason", [
+    # :1156 (and :191's sibling): the hung-tool slack the caller froze, AllScope or only read-only in the scope the guard is loaded into.
+    ("New-Variable HeavySlotGiveUpSlackMinutes -Value 20000 -Option AllScope,ReadOnly\n", "HeavySlotGiveUpSlackMinutes", "caller-frozen-variable"),
+    ("New-Variable HeavySlotGiveUpSlackMinutes -Value 20000 -Option ReadOnly\n", "HeavySlotGiveUpSlackMinutes", "caller-frozen-variable"),
+    # :1014, the guard list omitted every local but the deadline's: a frozen de-DE $inv made the launch-time wait a silent 0m (key3 sweep).
+    ("New-Variable inv -Value ([Globalization.CultureInfo]::GetCultureInfo('de-DE')) -Option AllScope,ReadOnly\n", "inv", "caller-allscope-variable"),
+    ("New-Variable maxMin -Value 20000 -Option AllScope,ReadOnly\n", "maxMin", "caller-allscope-variable"),
+], ids=["slack-allscope", "slack-readonly", "inv-allscope", "maxMin-allscope"])
+def test_a_library_callers_frozen_variable_of_the_wait_path_is_refused_before_anything_is_taken(box, prelude, name, reason) -> None:
+    # adversary c0a8936e-A1, the class: every variable the wait path reads is either this function's own (refused when a caller holds the name
+    # AllScope) or a script variable the guard set at load (refused when the caller froze it first, so the guard's own value never landed).
+    done = _stage_attempt(box, "([DateTime]::UtcNow.AddMinutes(200.5)).ToString('o')", prelude="$ErrorActionPreference = 'Continue'\n" + prelude)
+    assert done.returncode == 2, done.stdout + done.stderr
+    assert f"BUILD_HEAVY_SLOT_REFUSED label=attr3-assemble:abc reason={reason} name={name} " in done.stdout, done.stdout + done.stderr
+    assert _stub_calls(box) == [] and not box["marker"].exists()
+
+
+@pytest.mark.parametrize("alias, deadline, expect_rc, low, high", [
+    # build-guard.ps1:1017: an aliased deadline reader returned the options table, so an expired deadline became the ordinary 60 min wait.
+    ("Get-HeavySlotDeadline", "'2000-01-01T00:00:00Z'", 3, 0.0, 0.0),
+    # :1097 and :1153: an aliased wait helper.
+    ("Get-HeavySlotWaitFromDeadline", "([DateTime]::UtcNow.AddMinutes(200)).ToString('o')", 0, 199.0, 200.0),
+])
+def test_a_library_callers_alias_never_replaces_the_deadline_path(box, alias, deadline, expect_rc, low, high) -> None:
+    # adversary c0a8936e-A2 (its sibling input): a caller's alias outranks a function of the dot-sourced guard. The deadline path now calls no
+    # helper by name: it is read and turned into the wait inside Enter-HeavySlot.
+    prelude = f"Set-Alias -Name {alias} -Value Write-Output -Scope Global\n"
+    done = _stage_attempt(box, deadline, prelude=prelude)
+    assert done.returncode == expect_rc, done.stdout + done.stderr
+    [call] = _stub_calls(box)
+    assert low <= _wait_minutes(call) <= high, call["argv"]
+
+
+def test_a_deadline_that_passes_while_the_holder_is_built_launches_with_zero_wait(box) -> None:
+    # adversary 0919ae2e-A1 (its input): the launch-time sample of the deadline came BEFORE the holder command was built (:1168, whose
+    # Get-Process is :679), so a holder step that ran past the deadline launched heavy-slot with a stale positive wait. The holder is now
+    # built first; the sample is the last step before the launch.
+    opts_line = ("$savedHolder = ${function:New-HeavySlotHolder}\n"
+                 "function New-HeavySlotHolder { param([string]$ReadyFile, [string]$StopFile) [Threading.Thread]::Sleep(9000); & $savedHolder $ReadyFile $StopFile }\n")
+    done = _stage_attempt(box, "[DateTime]::UtcNow.AddSeconds(4)", opts_line=opts_line)
+    [call] = _stub_calls(box)
+    assert _wait_minutes(call) == 0.0, call["argv"]
+    assert done.returncode == 3, done.stdout + done.stderr
+    assert "BUILD_HEAVY_SLOT_REQUEUE label=attr3-assemble:abc code=75 " in done.stdout, done.stdout
+
+
+def test_a_holder_whose_tostring_is_slow_is_converted_before_the_deadline_sample(box) -> None:
+    # adversary 9b7006d5-A2 (its input): the holder value was converted to text by the quoting AFTER the launch-time sample, so an object whose
+    # ToString sleeps launched an expired deadline with a stale positive wait. Every argument is a [string] before the sample.
+    opts_line = ("$savedHolder = ${function:New-HeavySlotHolder}\n"
+                 "function New-HeavySlotHolder { param([string]$ReadyFile, [string]$StopFile) $o = [pscustomobject]@{ Encoded = (& $savedHolder $ReadyFile $StopFile) }\n"
+                 "  $o | Add-Member -MemberType ScriptMethod -Name ToString -Value { [Threading.Thread]::Sleep(9000); $this.Encoded } -Force; $o }\n")
+    done = _stage_attempt(box, "[DateTime]::UtcNow.AddSeconds(4)", opts_line=opts_line)
+    [call] = _stub_calls(box)
+    assert _wait_minutes(call) == 0.0, call["argv"]
+    assert done.returncode == 3, done.stdout + done.stderr
+
+
+# --- r6 (adversary pass on 84f4e8af: A1 and A2, both introduced majors; HUB-TICK 20261108T2350Z items 2 and 3) ----------------------
+
+# Each case: the caller's session before the call, and how it calls the chain. The deadline is OMITTED on every call, so the chain must refuse
+# it as missing (invalid-deadline DeadlineUtc=''): a caller's parameter default never supplies it, under any key.
+_CHAIN_DEFAULT_CASES = {
+    # adversary 9b7006d5-A1 (the r5 input): the plain entry under the chain's own name.
+    "real-name": ("$PSDefaultParameterValues = @{{ 'Invoke-VenueStageChain.ps1:DeadlineUtc' = '2099-01-01T00:00:00Z' }}\n", "& '{chain}'"),
+    # adversary 84f4e8af-A1 (its input): an alias of the chain, and the default under the alias's name.
+    "alias": ("Set-Alias StartStage '{chain}'\n$PSDefaultParameterValues = @{{ 'StartStage:DeadlineUtc' = '2099-01-01T00:00:00Z' }}\n", "StartStage"),
+    # its second input: a script-block default under the real name that empties the table while it binds, so a scan of the table made after
+    # binding (the r5 refusal) finds nothing and the 2099 deadline is accepted.
+    "scriptblock-clears": ("$PSDefaultParameterValues = @{{ 'Invoke-VenueStageChain.ps1:DeadlineUtc' = {{ $PSDefaultParameterValues.Clear(); "
+                           "'2099-01-01T00:00:00Z' }} }}\n", "& '{chain}'"),
+    # the same class under a wildcard key and a parameter-name wildcard.
+    "scriptblock-wildcard": ("$PSDefaultParameterValues = @{{ '*:Dead*' = {{ '2099-01-01T00:00:00Z' }} }}\n", "& '{chain}'"),
+}
+
+
+@pytest.mark.parametrize("case", list(_CHAIN_DEFAULT_CASES))
+def test_no_caller_parameter_default_ever_supplies_the_chain_deadline(box, case) -> None:
+    # adversary 9b7006d5-A1 and 84f4e8af-A1: the r5 refusal compared each key's command part with the script's own name, after binding. An alias
+    # key, or a script-block default that cleared the table while it bound, got past it, and both phases ran on the caller's 2099. The chain is
+    # now a plain script (no [CmdletBinding()], no [Parameter()]): PowerShell applies $PSDefaultParameterValues only to cmdlets and advanced
+    # functions or scripts, so no default binds any parameter of it, and no script-block default even runs.
+    run, stage_one_path, env = _chain_box(box, 61)
+    ran = box["dir"] / "child-ran.txt"
+    stage_one_path.write_text(f"param([string]$Sha, [string]$Phase)\nAdd-Content -LiteralPath '{ran}' -Value $Phase\nexit 0\n", encoding="ascii")
+    setup, call = _CHAIN_DEFAULT_CASES[case]
+    script = (setup.format(chain=STAGE_CHAIN)
+              + f"{call.format(chain=STAGE_CHAIN)} -Sha {_CHAIN_SHA} -StageOne '{stage_one_path}' -RetrySec 0 -MaxAttempts 1\n"
+              "Write-Output \"rc=$LASTEXITCODE\"\n")
+    done = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script],
+                          capture_output=True, text=True, timeout=180, env=env, check=False)
+    assert not ran.exists(), "a child ran on the caller's default deadline: " + done.stdout
+    assert "rc=2" in done.stdout, done.stdout + done.stderr
+    assert "STAGE_CHAIN_REFUSED reason=invalid-deadline DeadlineUtc='' is not" in done.stdout, done.stdout + done.stderr
+
+
+def _param_attributes(path: Path) -> list:
+    script = (f"$a = [System.Management.Automation.Language.Parser]::ParseFile('{path}', [ref]$null, [ref]$null)\n"
+              "@($a.ParamBlock.Attributes) | ForEach-Object { 'BLOCK ' + $_.TypeName.FullName }\n"
+              "@($a.ParamBlock.Parameters) | ForEach-Object { $p = $_.Name.VariablePath.UserPath; 'PARAM ' + $p; "
+              "@($_.Attributes) | ForEach-Object { 'ATTR ' + $p + ' ' + $_.TypeName.FullName } }\n")
+    done = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script],
+                          capture_output=True, text=True, timeout=60, check=False)
+    assert done.returncode == 0, done.stderr
+    return [l.strip() for l in done.stdout.splitlines() if l.strip()]
+
+
+def test_the_chain_is_a_plain_script_so_no_parameter_default_applies_to_it() -> None:
+    # adversary 84f4e8af-A1, the class: any [CmdletBinding()] or [Parameter()] makes the chain an advanced script, and every parameter of an
+    # advanced script takes the caller's defaults again. The checks Mandatory made are explicit refusals instead (the tests below).
+    lines = _param_attributes(STAGE_CHAIN)
+    assert any(l == "PARAM DeadlineUtc" for l in lines), lines
+    advanced = [l for l in lines if (l.startswith("BLOCK ") or l.startswith("ATTR "))
+                and l.split()[-1].lower().split(".")[-1] in ("cmdletbinding", "cmdletbindingattribute", "parameter", "parameterattribute")]
+    assert advanced == [], advanced
+
+
+@pytest.mark.parametrize("argv, reason", [
+    (["-DeadlineUtc", "2099-01-01T00:00:00Z", "-StageOne", "{one}"], "invalid-sha"),
+    (["-Sha", "0123456789abcdef0123456789abcdef01234567", "-DeadlineUtc", "2099-01-01T00:00:00Z", "-StageOne", "{one}",
+      "-Bogus", "1"], "unknown-argument"),
+    (["-Sha", "0123456789abcdef0123456789abcdef01234567", "-DeadlineUtc", "2099-01-01T00:00:00Z", "-StageOne", "{one}", "-Verbose"], "unknown-argument"),
+], ids=["missing-sha", "unknown-parameter", "common-parameter"])
+def test_a_plain_chain_still_refuses_a_missing_sha_and_any_unknown_argument(box, argv, reason) -> None:
+    # What [Parameter(Mandatory)] and an advanced script's strict binding did, done explicitly: a missing -Sha and an argument the chain does not
+    # declare (a typo, or a common parameter it no longer takes) are refused before anything runs.
+    run, stage_one_path, env = _chain_box(box, 61)
+    ran = box["dir"] / "child-ran.txt"
+    stage_one_path.write_text(f"param([string]$Sha, [string]$Phase)\nAdd-Content -LiteralPath '{ran}' -Value $Phase\nexit 0\n", encoding="ascii")
+    done = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-File", str(STAGE_CHAIN),
+                           *[a.format(one=stage_one_path) for a in argv], "-RetrySec", "0", "-MaxAttempts", "1"],
+                          capture_output=True, text=True, timeout=180, env=env, check=False)
+    assert done.returncode == 2, done.stdout + done.stderr
+    assert f"STAGE_CHAIN_REFUSED reason={reason}" in done.stdout, done.stdout + done.stderr
+    assert not ran.exists() and _chain_status(run) == []
+
+
+@pytest.mark.parametrize("which, mode", [("run-dir", "in-process"), ("run-dir", "file"), ("stage-one", "in-process")])
+def test_a_path_on_another_provider_is_refused_never_read_against_the_process_directory(box, which, mode) -> None:
+    # adversary 38afcbb2-A1 (its input is run-dir in-process; sibling :108 is stage-one): -RunDir Env:\tools resolved through the Environment
+    # provider to the bare text 'tools', which [IO.Directory]::Exists read against the PROCESS directory, so the status file was written into
+    # <process cwd>\tools. A path must resolve through the FileSystem provider to a fully qualified path, or the chain refuses it.
+    run, stage_one_path, env = _chain_box(box, 61)
+    ran = box["dir"] / "child-ran.txt"
+    stage_one_path.write_text(f"param([string]$Sha, [string]$Phase)\nAdd-Content -LiteralPath '{ran}' -Value $Phase\nexit 0\n", encoding="ascii")
+    proc_cwd = box["dir"] / "proc-cwd"
+    (proc_cwd / "tools").mkdir(parents=True)
+    (proc_cwd / "stage-one.ps1").write_text(stage_one_path.read_text(encoding="ascii"), encoding="ascii")
+    args = (["-StageOne", str(stage_one_path), "-RunDir", "Env:\\tools"] if which == "run-dir"
+            else ["-StageOne", "Env:\\stage-one.ps1", "-RunDir", str(run)])
+    common = ["-Sha", _CHAIN_SHA, "-DeadlineUtc", "2099-01-01T00:00:00Z", *args, "-RetrySec", "0", "-MaxAttempts", "1"]
+    if mode == "file":
+        argv = [PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-File", str(STAGE_CHAIN), *common]
+    else:
+        quoted = " ".join(a if a.startswith("-") else "'" + a + "'" for a in common)
+        argv = [PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command",
+                f"Set-Location -LiteralPath '{box['dir']}'\n& '{STAGE_CHAIN}' {quoted}\nWrite-Output \"rc=$LASTEXITCODE\"\n"]
+    done = subprocess.run(argv, capture_output=True, text=True, timeout=180, env=env, check=False, cwd=str(proc_cwd))
+    reason = "run-dir-missing" if which == "run-dir" else "stage-one-missing"
+    assert f"STAGE_CHAIN_REFUSED reason={reason}" in done.stdout, done.stdout + done.stderr
+    assert (done.returncode == 2) if mode == "file" else ("rc=2" in done.stdout), done.stdout + done.stderr
+    assert list((proc_cwd / "tools").iterdir()) == [], "the chain wrote into the process directory"
+    assert not ran.exists() and _chain_status(run) == []
+
+
+def test_the_assembler_takes_no_deadline_parameter_so_no_caller_default_can_supply_one() -> None:
+    # adversary 84f4e8af-A1 sibling (playback-attr-3-cuda-assemble.ps1:240): the assembler is an advanced script, so an alias-keyed or
+    # script-block caller default could bind -HeavySlotDeadlineUtc past the r5 key scan and replace the expired deadline the caller's environment
+    # carried. No caller in the repo passed that parameter (the nightly and the chain hand the deadline over in the child's environment), so it
+    # is gone: the deadline reaches the guard only as MLV_HEAVY_SLOT_DEADLINE_UTC, which no parameter default can touch.
+    lines = _param_attributes(ATTR3_ASSEMBLE)
+    params = [l.split()[1] for l in lines if l.startswith("PARAM ")]
+    assert "SourceCommit" in params, lines
+    assert [p for p in params if "deadline" in p.lower()] == [], params
+    text = ATTR3_ASSEMBLE.read_text(encoding="utf-8")
+    assert "HeavySlotDeadlineUtc" not in text and "caller-parameter-default" not in text
+    assert re.search(r"\$guardOptions = @\{\}\r?\nInvoke-BuildGuard -Label \"attr3-assemble:\$\(\$names\.shortSha\)\" -RequestedJobs \$MakeJobs "
+                     r"-Options \$guardOptions -Action", text), "the build runs under the guard with no deadline option of its own"
+
+
+# adversary 84f4e8af-A2 (its input): a Library caller's ETS ToString on System.Double, which only the guard's own format string meets.
+_ETS_DOUBLE_TOSTRING = (
+    "Update-TypeData -TypeName System.Double -MemberType ScriptMethod -MemberName ToString -Force -Value {\n"
+    "  if ($args.Count -ge 1 -and [string]$args[0] -ceq '0.##########') { return '20000' }\n"
+    "  if ($args.Count -ge 2) { return [string]::Format([IFormatProvider]$args[1], '{0:' + [string]$args[0] + '}', [double]$this) }\n"
+    "  if ($args.Count -eq 1) { return [string]::Format('{0:' + [string]$args[0] + '}', [double]$this) }\n"
+    "  [string]::Format([Globalization.CultureInfo]::InvariantCulture, '{0}', [double]$this) }\n"
+)
+
+
+@pytest.mark.parametrize("deadline, low, high", [
+    # build-guard.ps1:1169, the launch-time wait (and :1112, the first one).
+    ("([DateTime]::UtcNow.AddMinutes(240)).ToString('o')", 239.0, 240.0),
+    # :1112 and :1113 with no deadline: the 60 min default and the eta.
+    (None, 60.0, 60.0),
+], ids=["deadline", "default-wait"])
+def test_a_callers_ets_tostring_on_double_never_changes_the_wait_or_eta(box, deadline, low, high) -> None:
+    # adversary 84f4e8af-A2: --wait and --eta were written with $x.ToString(...), which a Library caller's Update-TypeData can replace, so
+    # --wait 20000m (twice the one-week cap) reached heavy-slot with a 240 min deadline. They are written with [string]::Format now, which
+    # ETS never sees, and each text is read back and must equal the minutes computed (within 0.01) and stay within the cap.
+    done = _stage_attempt(box, deadline, prelude=_ETS_DOUBLE_TOSTRING)
+    [call] = _stub_calls(box)
+    assert low <= _wait_minutes(call) <= high, call["argv"]
+    eta = call["argv"][call["argv"].index("--eta") + 1]
+    assert eta != "20000m" and float(eta[:-1]) <= 10080, call["argv"]
+    assert done.returncode in (0, 3), done.stdout + done.stderr
+
+
+def test_nothing_but_net_calls_runs_between_the_deadline_sample_and_the_launch() -> None:
+    # adversary 0919ae2e-A1, the class (siblings :1169 ForEach-Object and :679 Get-Process): any command between the launch-time sample and
+    # Process.Start can take arbitrary time (or be a caller's), so the wait given would be stale. None is there.
+    script = (f"$a = [System.Management.Automation.Language.Parser]::ParseFile('{GUARD}', [ref]$null, [ref]$null)\n"
+              "$f = $a.Find({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq 'Enter-HeavySlot' }, $true)\n"
+              "$sample = @($f.Body.FindAll({ param($n) $n -is [System.Management.Automation.Language.IfStatementAst] -and "
+              "$n.Clauses[0].Item1.Extent.Text -eq '$deadline.At' }, $true))[-1]\n"
+              "$start = $f.Body.Find({ param($n) $n -is [System.Management.Automation.Language.InvokeMemberExpressionAst] -and "
+              "$n.Extent.Text -like '*Diagnostics.Process]::Start($psi)*' }, $true)\n"
+              "Write-Output ('SAMPLE ' + $sample.Extent.StartOffset + ' ' + ($sample.Extent.Text -match 'UtcNow'))\n"
+              "Write-Output ('START ' + $start.Extent.StartOffset)\n"
+              "$f.Body.FindAll({ param($n) $n -is [System.Management.Automation.Language.CommandAst] }, $true) | "
+              "Where-Object { $_.Extent.StartOffset -gt $sample.Extent.StartOffset -and $_.Extent.StartOffset -lt $start.Extent.StartOffset } | "
+              "ForEach-Object { 'CMD ' + $_.Extent.Text }\n")
+    done = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script],
+                          capture_output=True, text=True, timeout=60, check=False)
+    assert done.returncode == 0, done.stderr
+    lines = done.stdout.splitlines()
+    assert any(l.startswith("SAMPLE ") and l.endswith(" True") for l in lines), done.stdout
+    assert any(l.startswith("START ") and int(l.split()[1]) > 0 for l in lines), done.stdout
+    assert [l for l in lines if l.startswith("CMD ")] == [], done.stdout
+
+
+def _function_ast_names(path: Path, function: str) -> tuple:
+    script = (f"$a = [System.Management.Automation.Language.Parser]::ParseFile('{path}', [ref]$null, [ref]$null)\n"
+              f"$f = $a.Find({{ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq '{function}' }}, $true)\n"
+              "$f.Body.FindAll({ param($n) $n -is [System.Management.Automation.Language.VariableExpressionAst] }, $true) | "
+              "ForEach-Object { 'V ' + $_.VariablePath.UserPath }\n"
+              "$f.Body.FindAll({ param($n) $n -is [System.Management.Automation.Language.CommandAst] }, $true) | ForEach-Object { 'C ' + $_.GetCommandName() }\n")
+    done = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script],
+                          capture_output=True, text=True, timeout=60, check=False)
+    assert done.returncode == 0, done.stderr
+    lines = [l.strip() for l in done.stdout.splitlines() if l.strip()]
+    return {l[2:] for l in lines if l.startswith("V ")}, {l[2:] for l in lines if l.startswith("C ")}
+
+
+def test_the_heavy_slot_guard_lists_cover_every_variable_enter_heavyslot_reads() -> None:
+    # adversary c0a8936e-A1, the whole class: the first guard list must name every variable of Enter-HeavySlot, the second every script variable
+    # it reads; the cap is a literal; and the removed helpers are called nowhere (adversary c0a8936e-A2).
+    variables, commands = _function_ast_names(GUARD, "Enter-HeavySlot")
+    text = GUARD.read_text(encoding="utf-8")
+    guard = re.search(r"# CALLER-SHADOW GUARD, before that.*?\n\s*@\(([^)]*)\)\.Where\(.*?\n\s*@\(([^)]*)\)\.Where\(", text, re.S)
+    assert guard, "the guard lists are missing"
+    local_list = {n.strip().strip("'").lower() for n in guard.group(1).replace("\n", " ").split(",") if n.strip()}
+    script_list = {n.strip().strip("'").lower() for n in guard.group(2).split(",") if n.strip()}
+    automatic = {"_", "pid", "null", "true", "false", "executioncontext"}
+    used_local = {v.lower() for v in variables if ":" not in v} - automatic
+    used_script = {v.split(":", 1)[1].lower() for v in variables if v.lower().startswith("script:")}
+    assert used_local - local_list == set(), sorted(used_local - local_list)
+    assert used_script - script_list == set(), sorted(used_script - script_list)
+    assert "HeavySlotMaxMinutes" not in text, "the one-week cap is a literal, never a script variable"
+    assert not {"Get-HeavySlotDeadline", "Get-HeavySlotWaitFromDeadline"} & commands
+    assert "function Get-HeavySlotDeadline" not in text and "function Get-HeavySlotWaitFromDeadline" not in text
+
+
+def test_the_deadline_can_come_from_the_environment(box) -> None:
+    deadline = "2099-01-01T00:00:00Z"
+    done = _stage_attempt(box, extra={"MLV_HEAVY_SLOT_DEADLINE_UTC": deadline})
+    assert done.returncode == 0, done.stdout + done.stderr
+    [call] = _stub_calls(box)
+    assert _wait_minutes(call) == 10080.0, "a far deadline is clamped to heavy-slot's one-week maximum"
+    assert "deadline=2099-01-01T00:00:00" in done.stdout and " wait=10080m " in done.stdout, done.stdout
+
+
+def test_an_options_deadline_outranks_the_environment(box) -> None:
+    done = _stage_attempt(box, "([DateTime]::UtcNow.AddMinutes(200)).ToString('o')", extra={"MLV_HEAVY_SLOT_DEADLINE_UTC": "2099-01-01T00:00:00Z"})
+    assert done.returncode == 0, done.stdout + done.stderr
+    [call] = _stub_calls(box)
+    assert 199 < _wait_minutes(call) <= 200, call["argv"]
+
+
+def test_a_deadline_that_has_passed_waits_zero_and_is_still_a_typed_requeue(box) -> None:
+    done = _stage_attempt(box, "([DateTime]::UtcNow.AddMinutes(-5)).ToString('o')")
+    assert done.returncode == 3, done.stdout + done.stderr
+    [call] = _stub_calls(box)
+    assert _wait_minutes(call) == 0.0, call["argv"]
+    assert "BUILD_HEAVY_SLOT_REQUEUE label=attr3-assemble:abc code=75 " in done.stdout
+    assert " wait=0m " in done.stdout and " source=deadline " in done.stdout
+    assert not box["marker"].exists()
+
+
+def test_a_deadline_given_as_a_datetime_is_bounded_too(box) -> None:
+    done = _stage_attempt(box, "[DateTime]::UtcNow.AddMinutes(180)")
+    assert done.returncode == 0, done.stdout + done.stderr
+    [call] = _stub_calls(box)
+    assert 179 < _wait_minutes(call) <= 180, call["argv"]
+
+
+@pytest.mark.parametrize("bad", ["not-a-date", "   x", "2026-13-45T99:00:00Z"])
+def test_a_deadline_that_is_not_an_instant_is_refused_before_heavy_slot_starts(box, bad) -> None:
+    done = _stage_attempt(box, f"'{bad}'")
+    assert done.returncode == 2, done.stdout + done.stderr
+    assert "BUILD_HEAVY_SLOT_REFUSED label=attr3-assemble:abc reason=invalid-option" in done.stdout
+    assert "HeavySlotDeadlineUtc" in done.stdout
+    assert _stub_calls(box) == [], "heavy-slot is never called"
+    assert not box["marker"].exists()
+
+
+def test_an_unspecified_kind_datetime_deadline_is_utc_not_the_hosts_local_time(box) -> None:
+    # adversary cd45eeb5-A1: ConvertFrom-Json turns '2026-11-08T11:59:00' into an Unspecified [DateTime]; ToUniversalTime read it as LOCAL
+    # time, so on a UTC-6 host a deadline a minute ago waited 359 min while the identical text waited 0.
+    done = _stage_attempt(box, "[DateTime]::SpecifyKind([DateTime]::UtcNow.AddMinutes(-1), [DateTimeKind]::Unspecified)")
+    assert done.returncode == 3, done.stdout + done.stderr
+    [call] = _stub_calls(box)
+    assert _wait_minutes(call) == 0.0, call["argv"]
+    from_text = _stage_attempt(box, "([DateTime]::UtcNow.AddMinutes(-1)).ToString('yyyy-MM-ddTHH:mm:ss')")
+    assert from_text.returncode == 3, from_text.stdout + from_text.stderr
+    assert _wait_minutes(_stub_calls(box)[1]) == 0.0, "the same instant as zone-less text agrees"
+
+
+def test_a_garbage_deadline_is_refused_even_when_the_shim_is_missing(box) -> None:
+    # adversary cd45eeb5-A2: a named shim that does not exist failed the guard open BEFORE the deadline was read, so a garbage deadline
+    # was silently ignored and the build ran without the bound (and without the machine slot).
+    missing = str(box["dir"] / "no-such-dir" / "heavy-slot.cmd")
+    done = _stage_attempt(box, "'not-a-date'", opts_line=f"$opts.HeavySlotCmd = '{missing}'\n")
+    assert done.returncode == 2, done.stdout + done.stderr
+    assert "BUILD_HEAVY_SLOT_REFUSED label=attr3-assemble:abc reason=invalid-option" in done.stdout and "HeavySlotDeadlineUtc" in done.stdout
+    assert not box["marker"].exists() and _stub_calls(box) == []
+    # control: a GOOD deadline with the same missing shim is still the documented fail-open build
+    ok = _stage_attempt(box, "([DateTime]::UtcNow.AddMinutes(30)).ToString('o')", opts_line=f"$opts.HeavySlotCmd = '{missing}'\n")
+    assert ok.returncode == 0, ok.stdout + ok.stderr
+    assert box["marker"].exists() and "HEAVY_SLOT_WARN" in ok.stderr
+
+
+def test_the_wait_is_taken_from_the_deadline_at_launch_not_before_a_slow_diagnostic(box) -> None:
+    # adversary cd45eeb5-A3: the wait was computed, then a diagnostic or probe could take seconds, then heavy-slot started with the stale
+    # figure, so its queue timeout landed after the driver's deadline. Here the held-slot probe takes 3 s; the deadline is 4 s out, so
+    # the wait given to heavy-slot must be about 1 s (0.017 min), not 4 s (0.067 min).
+    done = _stage_attempt(
+        box, "[DateTime]::UtcNow.AddSeconds(4)",
+        opts_line="function Test-HeavySlotHeldCanonical { param($h) Start-Sleep -Seconds 3; return '' }\n",
+        extra={"HEAVY_SLOT_HELD": "stub-1:1"},
+    )
+    assert done.returncode in (0, 3), done.stdout + done.stderr
+    [call] = _stub_calls(box)
+    assert _wait_minutes(call) < 0.04, call["argv"]
+    # A loaded host can spend the remaining second before the sample, so a correct figure is 0m as well as 0.0Nm (Dot I1, 8793a97).
+    assert re.search(r" wait=(?:0|0\.0\d+)m ", done.stdout), done.stdout
+
+
+@pytest.mark.parametrize("deadline_expr", ["[DateTime]::UtcNow.AddSeconds(2)", "[DateTime]::UtcNow.AddMinutes(-5)"])
+def test_a_deadline_that_has_passed_by_the_launch_gets_exactly_a_zero_wait(box, deadline_expr) -> None:
+    # Dot I1 (8793a97): the deterministic form of the slow-diagnostic test. The held-slot probe takes 3 s, so a deadline 2 s out has
+    # passed whatever the host speed, and the wait handed to heavy-slot must be exactly 0m. A wait computed BEFORE the probe (the
+    # stale sample the test above exists to catch) is still positive for the 2 s deadline and fails here; the -5 min deadline is the
+    # driver's deadline already in the past, which every ordering reads as 0m.
+    done = _stage_attempt(
+        box, deadline_expr,
+        opts_line="function Test-HeavySlotHeldCanonical { param($h) Start-Sleep -Seconds 3; return '' }\n",
+        extra={"HEAVY_SLOT_HELD": "stub-1:1"},
+    )
+    assert done.returncode in (0, 3), done.stdout + done.stderr
+    [call] = _stub_calls(box)
+    assert call["argv"][call["argv"].index("--wait") + 1] == "0m", call["argv"]
+    assert re.search(r" wait=0m source=deadline ", done.stdout), done.stdout
+
+
+def test_a_blank_deadline_option_changes_nothing(box) -> None:
+    done = _stage_attempt(box, "''")
+    assert done.returncode == 3, done.stdout + done.stderr
+    [call] = _stub_calls(box)
+    assert _wait_minutes(call) == 60.0
+    assert "BUILD_HEAVY_SLOT_WAIT_BOUND" not in done.stdout
+
+
+def test_the_attr3_assembler_hands_its_deadline_to_the_guard() -> None:
+    # r6 (adversary 84f4e8af-A1 sibling): the deadline reaches the guard through the environment only (MLV_HEAVY_SLOT_DEADLINE_UTC, which
+    # the guard reads itself); the assembler's -HeavySlotDeadlineUtc parameter is gone, so no caller default can supply one.
+    text = ATTR3_ASSEMBLE.read_text(encoding="utf-8")
+    assert "HeavySlotDeadlineUtc" not in text, "the assembler declares and sets no deadline of its own"
+    assert re.search(r"Invoke-BuildGuard -Label \"attr3-assemble:\$\(\$names\.shortSha\)\" -RequestedJobs \$MakeJobs -Options \$guardOptions -Action", text), \
+        "the build runs under the guard"
+    assert "$env:MLV_HEAVY_SLOT_DEADLINE_UTC" in GUARD.read_text(encoding="utf-8"), "the guard reads the inherited deadline itself"
+
+
+# --- r3 (sol key on d2543b8a, blocker): the FULL staging chain, driver -> stage chain -> stage one -> assembler -> build-guard ------
+# The incident chain (lane-HFR-NATIVE-60FPS-FULLRES-1-r31): venue-driver.ps1:24 passed -DeadlineUtc to its stage-chain copy, which
+# called stage-one.ps1 without it (:17), which called the assembler without it (:78), so the guard waited its 60 min default, was
+# refused, and stage-chain.ps1:22 asked for a FRESH ticket 300 s later. The fixtures below are that shape: the stage-one copy and the
+# assembler omit the deadline exactly as the incident's did, and the assembler takes the real guard the way the tracked one does.
+# Only heavy-slot is a stub (the scripted 'queued' mode: no real time passes, the real machine slot is never touched).
+
+_CHAIN_SHA = "0123456789abcdef0123456789abcdef01234567"
+
+_FIX_ASSEMBLER = (
+    # r6: like the tracked assembler, no deadline parameter; the guard reads the inherited MLV_HEAVY_SLOT_DEADLINE_UTC.
+    "param([string]$SourceCommit, [string]$DllPairDir, [string]$OutDir, [switch]$SkipLaunchProbe)\n"
+    ". $env:FIX_GUARD -Library\n"
+    "$guardOptions = @{ LockPath = $env:FIX_LOCK; MemoryProbeFile = $env:FIX_MEM; ProcessTableFile = $env:FIX_TABLE; HeavySlotSha256 = $env:FIX_SHA; PollSeconds = 0.2 }\n"
+    "Invoke-BuildGuard -Label 'attr3-assemble:0123456789ab' -Options $guardOptions -Action { param($Jobs) "
+    "Write-Output \"RESULT=ASSEMBLE_OK SOURCE=$SourceCommit\" }\n"
+)
+
+# The incident's stage-one.ps1 shape: param(Sha, Phase), no deadline anywhere; the assembler call of its line 78, the refusal regex of :81.
+_FIX_STAGE_ONE = (
+    "param([Parameter(Mandatory = $true)][string]$Sha, [Parameter(Mandatory = $true)][ValidateSet('dll', 'stage')][string]$Phase)\n"
+    "$ErrorActionPreference = 'Stop'\n"
+    "function Done([string]$Outcome, [int]$Code, [string]$Extra = '') { [Console]::Out.WriteLine(\"STAGE_ONE_RESULT phase=$Phase sha=$Sha outcome=$Outcome $Extra\".Trim()); exit $Code }\n"
+    "Add-Content -LiteralPath $env:FIX_STAGE_ONE_LOG -Value \"phase=$Phase hsdeadline=$env:MLV_HEAVY_SLOT_DEADLINE_UTC param=$($PSBoundParameters.ContainsKey('DeadlineUtc'))\"\n"
+    "if ($Phase -eq 'dll') { Done 'DLLPAIR_HARVESTED' 0 'dir=fixture' }\n"
+    "$out = & $env:FIX_PWSH -NoProfile -NonInteractive -File $env:FIX_ASSEMBLER -SourceCommit $Sha -DllPairDir 'fixture' -OutDir 'fixture' -SkipLaunchProbe 2>&1 | ForEach-Object { [string]$_ }\n"
+    "$ax = $LASTEXITCODE\n"
+    "$out | ForEach-Object { [Console]::Out.WriteLine($_) }\n"
+    "$guard = @($out | Where-Object { $_ -match '^(BUILD_MEM_REFUSED|BUILD_SLOT_BUSY|BUILD_HEAVY_SLOT_REQUEUE|BUILD_HEAVY_SLOT_COULD_NOT_CHECK)\\b' })\n"
+    "if ($guard.Count -gt 0 -and $ax -ne 0) { Done 'BUILD_GUARD_REFUSED' 3 }\n"
+    "if ($ax -ne 0) { Done 'ASSEMBLE_FAILED' 1 \"exit=$ax\" }\n"
+    "Done 'STAGE_OK' 0 ('manifest=' + ('a' * 64))\n"
+)
+
+
+def _chain_box(box: dict, queue_min: int, stage_one: str = _FIX_STAGE_ONE, extra: dict = None) -> tuple:
+    run = box["dir"] / "run"
+    run.mkdir(exist_ok=True)
+    assembler = box["dir"] / "assemble.ps1"
+    assembler.write_text(_FIX_ASSEMBLER, encoding="ascii")
+    stage_one_path = run / "stage-one.ps1"
+    stage_one_path.write_text(stage_one, encoding="ascii")
+    env = _env(heavy_slot=HEAVY_STUB, extra={
+        "STUB_HEAVY_SLOT_MODE": "queued", "STUB_HEAVY_SLOT_QUEUE_MIN": str(queue_min), "STUB_HEAVY_SLOT_LOG": str(box["dir"] / "stub.log"),
+        "FIX_GUARD": str(GUARD), "FIX_LOCK": str(box["lock"]), "FIX_MEM": _write_json(box["dir"] / "memory.json", OK_MEMORY),
+        "FIX_TABLE": _write_json(box["dir"] / "table.json", []), "FIX_SHA": _stub_sha(), "FIX_PWSH": PWSH,
+        "FIX_ASSEMBLER": str(assembler), "FIX_STAGE_ONE_LOG": str(box["dir"] / "stage-one.calls"),
+        **(extra or {}),
+    })
+    return run, stage_one_path, env
+
+
+def _run_chain(box: dict, queue_min: int, deadline: str, stage_one: str = _FIX_STAGE_ONE, extra: dict = None,
+               chain_args: list = ()) -> tuple:
+    # The venue driver's call (venue-driver.ps1:24), aimed at the TRACKED chain instead of a run-dir copy.
+    run, stage_one_path, env = _chain_box(box, queue_min, stage_one, extra)
+    done = subprocess.run(
+        [PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-File", str(STAGE_CHAIN), "-Sha", _CHAIN_SHA, "-DeadlineUtc", deadline,
+         "-StageOne", str(stage_one_path), "-RetrySec", "0", "-MaxAttempts", "2", *chain_args],
+        capture_output=True, text=True, timeout=180, env=env, check=False,
+    )
+    return done, run
+
+
+def _chain_status(run: Path) -> list:
+    status = run / f"stage-status-{_CHAIN_SHA[:8]}.txt"
+    return status.read_text(encoding="utf-8").splitlines() if status.exists() else []
+
+
+def _chain_stage_logs(run: Path) -> str:
+    return "\n".join(p.read_text(encoding="utf-8", errors="replace") for p in sorted(run.glob(f"stage-{_CHAIN_SHA[:8]}-stage-*.out.txt")))
+
+
+def _future(minutes: int) -> str:
+    from datetime import datetime, timedelta, timezone
+    return (datetime.now(timezone.utc) + timedelta(minutes=minutes)).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+@pytest.mark.parametrize("queue_min", [61, 130, 180])
+def test_the_driver_deadline_reaches_the_first_heavy_slot_ticket_through_the_full_stage_chain(box, queue_min) -> None:
+    # RED on d2543b8a: there is no tracked chain, and the incident's copy dropped the deadline (control below). GREEN: the stage-one copy
+    # and the assembler still omit it, yet the guard's first ticket waits what is left of the driver's deadline, not 60 min.
+    done, run = _run_chain(box, queue_min, _future(240))
+    status = _chain_status(run)
+    assert done.returncode == 0, done.stdout + done.stderr + "\n".join(status)
+    assert status and status[-1].endswith("STAGE_CHAIN_DONE"), status
+    assert any(f"sha={_CHAIN_SHA} outcome=STAGE_OK manifest=" + "a" * 64 in line for line in status), status
+    [call] = _stub_calls(box)  # ONE ticket: never discarded for a fresh one
+    assert 239 < _wait_minutes(call) <= 240, call["argv"]
+    logs = _chain_stage_logs(run)
+    bound = [line for line in logs.splitlines() if line.startswith("BUILD_HEAVY_SLOT_WAIT_BOUND ")]
+    assert len(bound) == 1 and " source=deadline " in bound[0] and " default=60m " in bound[0], logs
+    assert "BUILD_HEAVY_SLOT_REQUEUE" not in logs, logs
+
+
+@pytest.mark.parametrize("queue_min", [61, 130, 180])
+def test_no_deadline_control_the_incident_stage_one_alone_keeps_the_60m_default_and_loses_the_ticket(box, queue_min) -> None:
+    # The incident's stage-chain.ps1:17 call: stage-one with no deadline and nothing exported. Unchanged by this card: 60 min, refused
+    # (heavy-slot 75), a typed capacity exit 3, which the incident's copy turned into a 300 s sleep and a FRESH ticket.
+    run, stage_one_path, env = _chain_box(box, queue_min)
+    done = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-File", str(stage_one_path), "-Sha", _CHAIN_SHA, "-Phase", "stage"],
+                          capture_output=True, text=True, timeout=180, env=env, check=False)
+    assert done.returncode == 3, done.stdout + done.stderr
+    assert "BUILD_HEAVY_SLOT_REQUEUE label=attr3-assemble:0123456789ab code=75 " in done.stdout
+    assert "STAGE_ONE_RESULT phase=stage sha=" + _CHAIN_SHA + " outcome=BUILD_GUARD_REFUSED" in done.stdout
+    assert "BUILD_HEAVY_SLOT_WAIT_BOUND" not in done.stdout
+    [call] = _stub_calls(box)
+    assert _wait_minutes(call) == 60.0, call["argv"]
+
+
+def test_the_chain_deadline_replaces_an_ambient_one_and_reaches_a_stage_one_that_declares_it(box) -> None:
+    # An inherited value from some other caller (here long past) must not bound this chain's build; a stage-one that declares
+    # -DeadlineUtc is also handed it as a parameter (one with a fixed param list, as above, is not: that would not bind).
+    declares = _FIX_STAGE_ONE.replace("[string]$Phase)\n", "[string]$Phase, [string]$DeadlineUtc = '')\n", 1)
+    deadline = _future(200)
+    done, run = _run_chain(box, 130, deadline, stage_one=declares, extra={"MLV_HEAVY_SLOT_DEADLINE_UTC": "2000-01-01T00:00:00Z"})
+    assert done.returncode == 0, done.stdout + done.stderr + "\n".join(_chain_status(run))
+    [call] = _stub_calls(box)
+    assert 199 < _wait_minutes(call) <= 200, call["argv"]
+    calls = (box["dir"] / "stage-one.calls").read_text(encoding="utf-8").splitlines()
+    assert len(calls) == 2 and all(" param=True" in c and f"hsdeadline={deadline[:19]}" in c for c in calls), calls
+
+
+def test_the_chain_restores_the_callers_environment_when_run_in_process(box) -> None:
+    run, stage_one_path, env = _chain_box(box, 61, extra={"MLV_HEAVY_SLOT_DEADLINE_UTC": "keep-me"})
+    script = (f"& '{STAGE_CHAIN}' -Sha {_CHAIN_SHA} -DeadlineUtc '{_future(120)}' -StageOne '{stage_one_path}' -RetrySec 0 -MaxAttempts 1\n"
+              "Write-Output \"after=$env:MLV_HEAVY_SLOT_DEADLINE_UTC rc=$LASTEXITCODE\"\n")
+    done = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script],
+                          capture_output=True, text=True, timeout=180, env=env, check=False)
+    assert "after=keep-me rc=0" in done.stdout, done.stdout + done.stderr
+
+
+def test_the_nightly_hands_its_deadline_to_the_assembler_child_only_never_its_own_process() -> None:
+    # adversary 8eb98036-A3 sibling (Invoke-VenueStageNightly.ps1:581): the nightly set the deadline in its own process environment around
+    # the assembler call, the same shared-state shape as the chain; it is now a per-child environment entry of Invoke-Child.
+    text = (REPO_ROOT / "tools" / "profiling" / "dual-venue" / "Invoke-VenueStageNightly.ps1").read_text(encoding="utf-8")
+    assert not re.search(r"\$env:MLV_HEAVY_SLOT_DEADLINE_UTC\s*=", text), "no process-wide assignment"
+    assert "SetEnvironmentVariable('MLV_HEAVY_SLOT_DEADLINE_UTC'" not in text
+    assert re.search(r"Invoke-Child 'assemble' \$Assembler @\([^)]*\) -ChildEnv @\{ MLV_HEAVY_SLOT_DEADLINE_UTC = ", text), "the assembler child gets it"
+    chain = STAGE_CHAIN.read_text(encoding="utf-8")
+    assert not re.search(r"\$env:MLV_HEAVY_SLOT_DEADLINE_UTC\s*=", chain)
+
+
+def test_the_chain_leaves_the_callers_environment_alone_even_when_remove_item_is_whatif(box) -> None:
+    # adversary 8eb98036-A2: the restore was Remove-Item Env:..., which an inherited $PSDefaultParameterValues['Remove-Item:WhatIf'] turns into
+    # a no-op, so the chain's deadline stayed in the caller and its next ordinary guard call waited a week instead of 60 min.
+    run, stage_one_path, env = _chain_box(box, 61)
+    script = ("$PSDefaultParameterValues['Remove-Item:WhatIf'] = $true\n"
+              f"& '{STAGE_CHAIN}' -Sha {_CHAIN_SHA} -DeadlineUtc '{_future(120)}' -StageOne '{stage_one_path}' -RetrySec 0 -MaxAttempts 1\n"
+              "Write-Output \"after=[$([Environment]::GetEnvironmentVariable('MLV_HEAVY_SLOT_DEADLINE_UTC'))] rc=$LASTEXITCODE\"\n")
+    done = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script],
+                          capture_output=True, text=True, timeout=180, env=env, check=False)
+    assert "after=[] rc=0" in done.stdout, done.stdout + done.stderr
+
+
+def test_the_chain_deadline_is_never_visible_to_another_runspace_of_the_callers_process(box) -> None:
+    # adversary 8eb98036-A3: the deadline was set in the PROCESS environment for the whole run, so a second chain (or any child) started from
+    # another runspace of the same host inherited THIS chain's deadline. It is now set only in each stage-one child's own environment.
+    run, stage_one_path, env = _chain_box(box, 61)
+    flag = box["dir"] / "chain-done.flag"
+    script = (
+        "$job = Start-ThreadJob -ScriptBlock { param($flag) $seen = 0; $end = (Get-Date).AddSeconds(120)\n"
+        "  while (-not (Test-Path -LiteralPath $flag) -and (Get-Date) -lt $end) { if ([Environment]::GetEnvironmentVariable('MLV_HEAVY_SLOT_DEADLINE_UTC')) { $seen++ }; Start-Sleep -Milliseconds 20 }\n"
+        "  $seen } -ArgumentList '" + str(flag) + "'\n"
+        f"& '{STAGE_CHAIN}' -Sha {_CHAIN_SHA} -DeadlineUtc '{_future(120)}' -StageOne '{stage_one_path}' -RetrySec 0 -MaxAttempts 1\n"
+        "$rc = $LASTEXITCODE\n"
+        f"New-Item -ItemType File -Path '{flag}' | Out-Null\n"
+        "Write-Output \"seen=$(Receive-Job $job -Wait -AutoRemoveJob) rc=$rc\"\n"
+    )
+    done = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script],
+                          capture_output=True, text=True, timeout=240, env=env, check=False)
+    assert "seen=0 rc=0" in done.stdout, done.stdout + done.stderr
+    [call] = _stub_calls(box)
+    assert 119 < _wait_minutes(call) <= 120, "the child still got the deadline"
+
+
+def test_a_relative_run_dir_is_the_powershell_location_not_the_process_directory(box) -> None:
+    # adversary 3c9ea703-A1: Test-Path accepted -RunDir '.' against PowerShell's location, but the status and log paths reached .NET relative
+    # and landed in the PROCESS working directory, so the chain could exit 0 with its evidence somewhere the driver never reads.
+    run, stage_one_path, env = _chain_box(box, 61)
+    script = (f"Set-Location -LiteralPath '{run}'\n"
+              f"& '{STAGE_CHAIN}' -Sha {_CHAIN_SHA} -DeadlineUtc '{_future(120)}' -StageOne '{stage_one_path}' -RunDir '.' -RetrySec 0 -MaxAttempts 1\n"
+              "Write-Output \"rc=$LASTEXITCODE\"\n")
+    done = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script],
+                          capture_output=True, text=True, timeout=180, env=env, check=False, cwd=str(box["dir"]))
+    assert "rc=0" in done.stdout, done.stdout + done.stderr
+    assert _chain_status(run) and _chain_status(run)[-1].endswith("STAGE_CHAIN_DONE"), done.stdout
+    assert not list(box["dir"].glob(f"stage-status-*")) and not list(box["dir"].glob(f"stage-{_CHAIN_SHA[:8]}-*")), \
+        "nothing written in the process directory"
+
+
+def test_each_attempt_log_is_created_new_under_a_unique_name() -> None:
+    # adversary 3c9ea703-A2: two chains on one run dir and sha that sample the same millisecond chose the same log name; one overwrote the
+    # other's output and could record the other's manifest beside its own exit code. The name now carries this process and a fresh GUID, and
+    # the file is created with CreateNew, so a collision is a failure (STAGE_CHAIN_FAILED), never a shared file.
+    text = STAGE_CHAIN.read_text(encoding="utf-8")
+    assert "[Guid]::NewGuid().ToString('N')" in text and "$PID" in text
+    assert "[IO.FileMode]::CreateNew" in text
+
+
+def test_a_run_dir_the_chain_cannot_write_is_refused_not_reported_staged(box) -> None:
+    # adversary 8eb98036-A1: with the status file and the stage logs unwritable, neither child started, $LASTEXITCODE was the caller's stale 0,
+    # and the chain returned 0 for a build that never ran. The run dir denies file creation here; the stage-one would exit 9 if it ran.
+    run, stage_one_path, env = _chain_box(box, 61, stage_one="param([string]$Sha, [string]$Phase)\nexit 9\n")
+    user = os.environ.get("USERNAME")
+    subprocess.run(["icacls", str(run), "/deny", f"{user}:(WD,AD)"], capture_output=True, check=True)
+    try:
+        script = (f"$global:LASTEXITCODE = 0\n& '{STAGE_CHAIN}' -Sha {_CHAIN_SHA} -DeadlineUtc '2099-01-01T00:00:00Z' -StageOne '{stage_one_path}' "
+                  "-RetrySec 0 -MaxAttempts 1\nWrite-Output \"rc=$LASTEXITCODE\"\n")
+        done = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script],
+                              capture_output=True, text=True, timeout=180, env=env, check=False)
+    finally:
+        subprocess.run(["icacls", str(run), "/remove:d", user], capture_output=True, check=False)
+    assert "rc=0" not in done.stdout, done.stdout + done.stderr
+    assert re.search(r"rc=[12]\b", done.stdout), done.stdout + done.stderr
+    assert "STAGE_CHAIN_REFUSED reason=run-dir-unwritable" in done.stdout or "STAGE_CHAIN_FAILED" in done.stdout, done.stdout + done.stderr
+
+
+@pytest.mark.parametrize("bad", ["not-a-date", "11/8/2026", "15:30", "", "2099-01-01T00:00:00.Z", "2099-01-01T00:00:00Z junk"])
+def test_a_chain_deadline_that_is_not_an_iso_instant_is_refused_before_anything_runs(box, bad) -> None:
+    done, run = _run_chain(box, 61, bad)
+    assert done.returncode == 2, done.stdout + done.stderr
+    assert "STAGE_CHAIN_REFUSED reason=invalid-deadline" in done.stdout + done.stderr
+    assert not (box["dir"] / "stage-one.calls").exists() and _stub_calls(box) == []
+
+
+def test_no_attempt_starts_once_the_chain_deadline_has_passed(box) -> None:
+    done, run = _run_chain(box, 61, "2000-01-01T00:00:00Z")
+    assert done.returncode == 3, done.stdout + done.stderr
+    assert any("STAGE_FAILED deadline-passed phase=dll" in line for line in _chain_status(run)), _chain_status(run)
+    assert not (box["dir"] / "stage-one.calls").exists() and _stub_calls(box) == []
+
+
+def test_a_capacity_refusal_is_retried_and_ends_typed_after_max_attempts(box) -> None:
+    # The retry rule of the incident copy (exit 3 = capacity, retry until the deadline) is kept; -MaxAttempts bounds it. A deadline
+    # shorter than the queue is still refused on its first ticket (the bound is the deadline, the queue is longer).
+    done, run = _run_chain(box, 180, _future(90))
+    assert done.returncode == 3, done.stdout + done.stderr
+    status = _chain_status(run)
+    assert any("STAGE_FAILED capacity-attempts-exhausted phase=stage attempts=2" in line for line in status), status
+    calls = _stub_calls(box)
+    assert len(calls) == 2 and all(88 < _wait_minutes(c) <= 90 for c in calls), [c["argv"] for c in calls]
+
+
+# --- r4 (adversary pass on 9528e35b: A1, A2, both introduced majors) --------------------------------------------------------------
+
+def test_a_deadline_that_passes_while_the_attempt_log_is_made_starts_no_child(box) -> None:
+    # adversary 9528e35b-A1: the loop checked the deadline (:102), then built the log path and created the log (:104, :80), then launched the
+    # child (:81) with no second check, so prelaunch work that ran past the deadline (a slow share) still started an attempt after it.
+    # r5: the delay was a caller's global Join-Path, which the chain no longer calls (adversary c0a8936e-A2), and sat BEFORE the log was
+    # created, so a check moved above the create stayed green (Dot nit; sol and key3 hardening). The chain's own test seam now holds the
+    # attempt AFTER its log is created: the deadline check must come after the create, as the last step before the launch.
+    run, stage_one_path, env = _chain_box(box, 61)
+    ran = box["dir"] / "child-ran.txt"
+    stage_one_path.write_text(f"param([string]$Sha, [string]$Phase)\nAdd-Content -LiteralPath '{ran}' -Value $Phase\nexit 0\n", encoding="ascii")
+    script = (
+        "$d = [DateTime]::UtcNow.AddSeconds(6)\n"
+        f"& '{STAGE_CHAIN}' -Sha {_CHAIN_SHA} -DeadlineUtc $d.ToString('o') -StageOne '{stage_one_path}' -RetrySec 0 -MaxAttempts 1 -HoldAfterLogMsForTest 9000\n"
+        "Write-Output \"rc=$LASTEXITCODE\"\n"
+    )
+    done = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script],
+                          capture_output=True, text=True, timeout=180, env=env, check=False)
+    status = _chain_status(run)
+    assert list(run.glob(f"stage-{_CHAIN_SHA[:8]}-dll-*.out.txt")), "the attempt log was never created, so the hold proves nothing: " + done.stdout + done.stderr
+    assert not ran.exists(), "a child started after the deadline: " + ran.read_text(encoding="utf-8")
+    assert "rc=3" in done.stdout, done.stdout + done.stderr + "\n".join(status)
+    assert any("STAGE_FAILED deadline-passed-before-launch phase=dll attempt=1" in line for line in status), status
+    assert not any("STAGE_CHAIN_DONE" in line for line in status), status
+
+
+@pytest.mark.parametrize("name, value, refused", [
+    ("rc", "0", False), ("MlvStageChainExitCode", "0", True), ("code", "0", True), ("phaseDone", "$true", True)])
+def test_an_allscope_read_only_caller_variable_never_masks_a_failing_child(box, name, value, refused) -> None:
+    # adversary 9528e35b-A2 (its input is the rc case): an in-process caller's `New-Variable rc -Value 0 -Option AllScope,ReadOnly` was copied
+    # into the chain's scope, so `$rc = 1` failed under Continue and the chain exited 0 after its stage-one exited 9. The chain no longer has an
+    # $rc: the exit code is $script:MlvStageChainExitCode, and that name, like `code` (the child's exit) and `phaseDone`, is refused before
+    # anything runs when a caller holds it AllScope. A failing child is never reported as a success either way.
+    run, stage_one_path, env = _chain_box(box, 61, stage_one="param([string]$Sha, [string]$Phase)\nexit 9\n")
+    script = (f"New-Variable -Name {name} -Value {value} -Option AllScope,ReadOnly\n"
+              f"& '{STAGE_CHAIN}' -Sha {_CHAIN_SHA} -DeadlineUtc '2099-01-01T00:00:00Z' -StageOne '{stage_one_path}' -RetrySec 0 -MaxAttempts 1\n"
+              "Write-Output \"rc=$LASTEXITCODE\"\n")
+    done = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script],
+                          capture_output=True, text=True, timeout=180, env=env, check=False)
+    status = _chain_status(run)
+    assert not any("STAGE_CHAIN_DONE" in line for line in status), status
+    if refused:
+        assert "rc=2" in done.stdout, done.stdout + done.stderr + "\n".join(status)
+        assert f"STAGE_CHAIN_REFUSED reason=caller-allscope-variable name={name} " in done.stdout, done.stdout + done.stderr
+        assert status == [], "refused before the status file is written"
+    else:
+        assert "rc=1" in done.stdout, done.stdout + done.stderr + "\n".join(status)
+        assert any("STAGE_FAILED phase=dll" in line for line in status), status
+
+
+def test_caller_parameter_defaults_never_hide_an_allscope_deadline_from_the_guard(box) -> None:
+    # adversary f05a6892-A1 (its input): $PSDefaultParameterValues['Get-Variable:ValueOnly'] made the guard's Get-Variable return the bare value,
+    # so the AllScope option was never seen; the read-only caller $deadline (2099) then survived the chain's own assignment, and a deadline
+    # passed as 2000-01-01 ran both phases and returned 0. The guard now reads the session state directly and calls no cmdlet.
+    run, stage_one_path, env = _chain_box(box, 61)
+    ran = box["dir"] / "child-ran.txt"
+    stage_one_path.write_text(f"param([string]$Sha, [string]$Phase)\nAdd-Content -LiteralPath '{ran}' -Value $Phase\nexit 0\n", encoding="ascii")
+    script = ("$PSDefaultParameterValues['Get-Variable:ValueOnly'] = $true\n"
+              "New-Variable deadline -Value ([DateTime]::SpecifyKind([DateTime]'2099-01-01', [DateTimeKind]::Utc)) -Option AllScope,ReadOnly\n"
+              f"& '{STAGE_CHAIN}' -Sha {_CHAIN_SHA} -DeadlineUtc '2000-01-01T00:00:00Z' -StageOne '{stage_one_path}' -RunDir '{run}' -RetrySec 0 -MaxAttempts 1\n"
+              "Write-Output \"rc=$LASTEXITCODE\"\n")
+    done = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script],
+                          capture_output=True, text=True, timeout=180, env=env, check=False)
+    assert not ran.exists(), "a child ran past the supplied deadline: " + ran.read_text(encoding="utf-8")
+    assert "rc=2" in done.stdout, done.stdout + done.stderr + "\n".join(_chain_status(run))
+    assert "STAGE_CHAIN_REFUSED reason=caller-allscope-variable name=deadline " in done.stdout, done.stdout + done.stderr
+
+
+def test_a_dot_sourced_chain_is_refused_before_it_assigns_anything(box) -> None:
+    # adversary f05a6892-A1 (its dot-source note): dot-sourced, the chain's variables are the caller's, so a read-only caller $deadline that is NOT
+    # AllScope still froze it. That is refused before anything runs.
+    run, stage_one_path, env = _chain_box(box, 61)
+    ran = box["dir"] / "child-ran.txt"
+    stage_one_path.write_text(f"param([string]$Sha, [string]$Phase)\nAdd-Content -LiteralPath '{ran}' -Value $Phase\nexit 0\n", encoding="ascii")
+    script = ("New-Variable deadline -Value ([DateTime]::SpecifyKind([DateTime]'2099-01-01', [DateTimeKind]::Utc)) -Option ReadOnly\n"
+              f". '{STAGE_CHAIN}' -Sha {_CHAIN_SHA} -DeadlineUtc '2000-01-01T00:00:00Z' -StageOne '{stage_one_path}' -RunDir '{run}' -RetrySec 0 -MaxAttempts 1\n"
+              "Write-Output \"rc=$LASTEXITCODE\"\n")
+    done = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script],
+                          capture_output=True, text=True, timeout=180, env=env, check=False)
+    assert not ran.exists(), "a child ran past the supplied deadline: " + ran.read_text(encoding="utf-8")
+    assert "rc=2" in done.stdout, done.stdout + done.stderr + "\n".join(_chain_status(run))
+    assert "STAGE_CHAIN_REFUSED reason=dot-sourced " in done.stdout, done.stdout + done.stderr
+
+
+def test_the_chain_caller_shadow_guard_covers_every_variable_the_chain_uses() -> None:
+    # adversary 9528e35b-A2, the whole class: any variable of the chain that an in-process caller holds AllScope is shared with (or, when
+    # read-only, frozen by) that caller. The guard refuses every such name before anything runs, so its list must name every variable the
+    # chain itself uses. Automatic variables and the $script:/$env: ones are the only exceptions.
+    script = (f"$a = [System.Management.Automation.Language.Parser]::ParseFile('{STAGE_CHAIN}', [ref]$null, [ref]$null)\n"
+              "$a.FindAll({ param($n) $n -is [System.Management.Automation.Language.VariableExpressionAst] }, $true) | "
+              "ForEach-Object { $_.VariablePath.UserPath } | Sort-Object -Unique\n")
+    done = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script],
+                          capture_output=True, text=True, timeout=60, check=False)
+    assert done.returncode == 0, done.stderr
+    automatic = {"_", "pid", "pshome", "iswindows", "null", "true", "false", "executioncontext", "myinvocation"}
+    used = {n.strip().lower() for n in done.stdout.splitlines() if n.strip() and ":" not in n} - automatic
+    guard = re.search(r"# CALLER-SHADOW GUARD\b.*?\n@\(([^)]*)\)\.Where\(", STAGE_CHAIN.read_text(encoding="utf-8"), re.S)
+    assert guard, "the guard list is missing"
+    listed = {n.strip().strip("'").lower() for n in guard.group(1).split(",") if n.strip()}
+    assert used - listed == set(), sorted(used - listed)
+    text = STAGE_CHAIN.read_text(encoding="utf-8")
+    assert not re.search(r"(?<![:\w])\$rc\b", text), "the exit code is carried only in the uniquely named script variable"
+    assert "exit $script:MlvStageChainExitCode" in text
+
+
+# Every command name the chain called through c0a8936e: its own four functions and the cmdlets it used.
+_CHAIN_SHADOWED = ["Set-ChainExit", "Log", "Refuse", "Invoke-StageOne", "Join-Path", "Test-Path", "Resolve-Path", "Split-Path",
+                   "Where-Object", "Select-Object", "Start-Sleep"]
+
+
+@pytest.mark.parametrize("site", ["child-fails", "deadline-passed", "before-launch", "capacity-attempts", "capacity-wait", "chain-throws"])
+def test_a_callers_alias_never_turns_a_failing_chain_into_exit_0(box, site) -> None:
+    # adversary c0a8936e-A2 (its input is child-fails: Set-Alias Set-ChainExit Write-Output, stage-one exits 9): an in-process caller's alias
+    # outranked the chain's own exit setter, so both setter calls only printed their argument and `exit $null` returned 0. One case per
+    # setter site (:136/:150, :142, :146, :151, :152, :161), with every command the chain used to call aliased to Write-Output. The chain now
+    # calls no command by name, so each still ends with its own non-zero exit.
+    exit_code = {"capacity-attempts": 3, "capacity-wait": 3}.get(site, 9 if site in ("child-fails", "chain-throws") else 0)
+    run, stage_one_path, env = _chain_box(box, 61, stage_one=f"param([string]$Sha, [string]$Phase)\nexit {exit_code}\n")
+    deadline = {"deadline-passed": "'2000-01-01T00:00:00Z'", "before-launch": "$d.ToString('o')", "capacity-wait": "$h.ToString('o')"}.get(
+        site, "'2099-01-01T00:00:00Z'")
+    extra = {"before-launch": "-HoldAfterLogMsForTest 9000 -MaxAttempts 1", "capacity-wait": "-RetrySec 86400 -MaxAttempts 0"}.get(
+        site, "-MaxAttempts 1")
+    retry = "" if site == "capacity-wait" else "-RetrySec 0"
+    expect = {"child-fails": 1, "chain-throws": 1}.get(site, 3)
+    user = os.environ.get("USERNAME")
+    if site == "chain-throws":
+        # The status file exists and stays writable; the run dir denies creating the attempt log, so the loop throws into the catch (:161).
+        (run / f"stage-status-{_CHAIN_SHA[:8]}.txt").write_text("", encoding="ascii")
+        subprocess.run(["icacls", str(run), "/deny", f"{user}:(AD,WD)"], capture_output=True, check=True)
+    aliases = "".join(f"Set-Alias -Name {n} -Value Write-Output -Scope Global\n" for n in _CHAIN_SHADOWED)
+    script = (f"{aliases}$d = [DateTime]::UtcNow.AddSeconds(6); $h = [DateTime]::UtcNow.AddHours(1); $global:LASTEXITCODE = 0\n"
+              f"& '{STAGE_CHAIN}' -Sha {_CHAIN_SHA} -DeadlineUtc {deadline} -StageOne '{stage_one_path}' {retry} {extra}\n"
+              "Write-Output \"rc=$LASTEXITCODE\"\n")
+    try:
+        done = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script],
+                              capture_output=True, text=True, timeout=180, env=env, check=False)
+    finally:
+        if site == "chain-throws":
+            subprocess.run(["icacls", str(run), "/remove:d", user], capture_output=True, check=False)
+    status = _chain_status(run)
+    assert f"rc={expect}" in done.stdout, done.stdout + done.stderr + "\n".join(status)
+    assert not any("STAGE_CHAIN_DONE" in line for line in status), status
+
+
+def test_the_chain_calls_no_command_by_name() -> None:
+    # adversary c0a8936e-A2, the whole class: a caller's alias or function outranks any command the chain names, its own functions and the
+    # built-in cmdlets alike. The chain names none: every command it runs is one of its own script blocks, invoked as `& $Helper`.
+    script = (f"$a = [System.Management.Automation.Language.Parser]::ParseFile('{STAGE_CHAIN}', [ref]$null, [ref]$null)\n"
+              "$a.FindAll({ param($n) $n -is [System.Management.Automation.Language.CommandAst] }, $true) | "
+              "ForEach-Object { $_.CommandElements[0].GetType().Name + ' ' + $_.CommandElements[0].Extent.Text }\n"
+              "$a.FindAll({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] }, $true) | ForEach-Object { 'FUNCTION ' + $_.Name }\n")
+    done = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script],
+                          capture_output=True, text=True, timeout=60, check=False)
+    assert done.returncode == 0, done.stderr
+    lines = [l.strip() for l in done.stdout.splitlines() if l.strip()]
+    assert lines, "no command found at all: the parse proves nothing"
+    named = [l for l in lines if not l.startswith("VariableExpressionAst ")]
+    assert named == [], named
+
+
+def test_a_sha_with_a_trailing_newline_is_refused_before_anything_runs(box) -> None:
+    # adversary advisory 9528e35b-A3: ValidatePattern('^[0-9a-f]{40}$') accepted '<40 hex>\n' ('$' matches before a final newline), which then
+    # reached the child's argv and the status lines. The pattern is anchored with \A and \z.
+    run, stage_one_path, env = _chain_box(box, 61)
+    ran = box["dir"] / "child-ran.txt"
+    stage_one_path.write_text(f"param([string]$Sha, [string]$Phase)\nAdd-Content -LiteralPath '{ran}' -Value $Phase\nexit 0\n", encoding="ascii")
+    script = (f"try {{ & '{STAGE_CHAIN}' -Sha (\"{_CHAIN_SHA}\" + \"`n\") -DeadlineUtc '2099-01-01T00:00:00Z' -StageOne '{stage_one_path}' -RetrySec 0 "
+              "-MaxAttempts 1; Write-Output \"ran rc=$LASTEXITCODE\" } catch { Write-Output \"refused=$($_.FullyQualifiedErrorId)\" }\n")
+    done = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script],
+                          capture_output=True, text=True, timeout=180, env=env, check=False)
+    assert "refused=ParameterArgumentValidationError" in done.stdout, done.stdout + done.stderr
+    assert not ran.exists() and _chain_status(run) == []
 
 
 def test_print_jobs_takes_no_heavy_slot(box) -> None:

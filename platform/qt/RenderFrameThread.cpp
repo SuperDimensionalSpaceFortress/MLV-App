@@ -1636,6 +1636,28 @@ bool RenderFrameThread::hasReadyPlaybackLookaheadFrame( uint32_t frameNumber,
     return false;
 }
 
+// HFR-NATIVE-60FPS-FULLRES-1 r27 fix iteration 2 (adversary A1 on 9e88a583): isIdle() and isIdleExceptPlaybackLookahead()
+// omit Ready slots, so a frame published for the conform target but not yet acquired (the CPU path with lookahead 0 is a
+// non-lookahead slot) is still a present that is coming. No lookahead filter here. r28 (adversary A1 on c4efe7e3): "published"
+// is slot.ready alone, the predicate findLatestReadySlotLocked/findOldestReadySlotLocked acquire by -- with Phase3Mode::Disabled
+// publishRenderedSlot sets ready=true and leaves the state Idle, so a Ready-state check missed the published target.
+bool RenderFrameThread::hasReadyFrameForPlaybackTarget( uint32_t frameNumber,
+                                                        uint64_t activeGeneration )
+{
+    QMutexLocker locker(&m_mutex);
+    for( int i = 0; i < static_cast<int>( m_frameSlots.size() ); ++i )
+    {
+        const FrameSlot &slot = m_frameSlots[i];
+        if( !slot.ready ) continue;
+        if( slot.frameNumber == frameNumber
+         && slot.presentationContext.presentationGeneration == activeGeneration )
+        {
+            return true;
+        }
+    }
+    return false;
+}
+
 int RenderFrameThread::prunePlaybackLookaheadOutsideForwardWindow(
     int activePlaybackTarget,
     uint64_t activeGeneration,
@@ -7213,8 +7235,9 @@ void RenderFrameThread::drawFrame( int slotIndex,
                                       getMlvLastProcessed8TotalMilliseconds() );
     slot.stageTimingTelemetry.insert( QStringLiteral("processed8_cache_store_ms"),
                                       getMlvLastProcessed8CacheStoreMilliseconds() );
+    // PROCESSED8-DIRECT-PATH-TELEMETRY-STALE-1 (sibling of PROCESSED8-MS-TELEMETRY-STUCK-1): only a draw that ran the processed-8 stage reports its direct-path flag.
     slot.stageTimingTelemetry.insert( QStringLiteral("processed8_direct_path_active"),
-                                      getMlvLastProcessed8DirectPathActive() != 0 );
+                                      renderThreadProcessed8StageRan && getMlvLastProcessed8DirectPathActive() != 0 );
     slot.stageTimingTelemetry.insert( QStringLiteral("processed8_direct_path_reason"),
                                       QString::fromLatin1(
                                           processingGetDirect8IncompatibilityReason(

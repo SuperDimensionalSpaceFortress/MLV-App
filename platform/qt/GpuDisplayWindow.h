@@ -167,6 +167,10 @@ public:
      * promoted (m_presentedSerial) -- a cheap read, no paint and no readback. Returns its validity; false when
      * no window is active. */
     static bool presentedSerialIfActive(quint64 *presentedSerial);
+    /* HFR-NATIVE-60FPS-FULLRES-1 r28 (adversary A1 on e052947c): whether the active window was handed a frame with
+     * presentationSerial >= serial that its paintGL() has not drawn yet (a deferred paint still to come). False when no
+     * window is active, serial is 0, or this window was never handed that frame. */
+    static bool paintPendingForSerialIfActive(quint64 serial);
     /* Same, after first painting a pending frame synchronously (paintGL() + swap, the grab idiom without its
      * readback) when one is waiting on Qt's deferred update(); a frame already painted is not painted again.
      * GUI-thread only. */
@@ -400,6 +404,9 @@ private:
     bool m_pendingPresentationSerialValid;
     quint64 m_presentedSerial;
     bool m_presentedSerialValid;
+    // HFR-NATIVE-60FPS-FULLRES-1 r30 (adversary A1 on 71104385): the serial last put ON SCREEN -- a paintGL outside an offscreen scope,
+    // or the capture's swap after a successful readback; paintPendingForSerialIfActive reads it, never m_presentedSerial
+    playback_paint_credit::ComposedPaintSerial m_composedPaint;
     /* Set only for the duration of a synchronous grabPresentedFramebufferIfActive()
      * call: tells paintGL() to glReadPixels into m_captureReadback* right after it
      * finishes drawing, so the readback and the draw it reads back are the same call. */

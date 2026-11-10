@@ -10,6 +10,9 @@
 #   readyexit  stands in for a holder that wrote its ready file and then ended: write the ready file named in the
 #              holder's -EncodedCommand, wait STUB_HEAVY_SLOT_HOLD_S seconds (default 0), exit STUB_HEAVY_SLOT_CODE (default 0)
 #   pinwarn    print heavy-slot's own PIN MISMATCH warning, then behave as run
+#   queued     a scripted queue with NO real time passing: STUB_HEAVY_SLOT_QUEUE_MIN is how many minutes of other work stand ahead of this
+#              ticket. A --wait of at least that many minutes is admitted (behaves as run); a shorter one is the timed-out refusal (behaves
+#              as marked75). Each call is a NEW ticket, as in the real CLI, so a refused caller that retries starts at the back.
 #   readyorphan  a holder child writes the ready file and ends (after STUB_HEAVY_SLOT_CHILD_S seconds, default 0), while
 #              heavy-slot itself stays up STUB_HEAVY_SLOT_HOLD_S
 #              seconds (its release work after the child), then exits STUB_HEAVY_SLOT_CODE (default 0).
@@ -52,6 +55,14 @@ function Get-StubReadyPath {
     $encoded = $command[[array]::IndexOf($command, '-EncodedCommand') + 1]
     $holder = [Text.Encoding]::Unicode.GetString([Convert]::FromBase64String($encoded))
     if ($holder -match "(?m)^Set-Content -LiteralPath '((?:[^']|'')+)'") { return ($Matches[1] -replace "''", "'") }
+}
+if ($mode -eq 'queued') {
+    $waitMin = 0.0
+    for ($i = 0; $i -lt $argv.Count; $i++) {
+        if ($argv[$i] -eq '--wait' -and $argv[$i + 1] -match '^(\d+(\.\d+)?)m$') { $waitMin = [double]::Parse($Matches[1], [Globalization.CultureInfo]::InvariantCulture) }
+    }
+    $mode = if ($waitMin -ge [double]::Parse($env:STUB_HEAVY_SLOT_QUEUE_MIN, [Globalization.CultureInfo]::InvariantCulture)) { 'run' } else { 'marked75' }
+    $record.mode = "queued->$mode"
 }
 switch ($mode) {
     'marked75' { Write-StubMarker $nonce; $code = 75 }

@@ -32,6 +32,7 @@ import unittest
 from pathlib import Path
 
 from tools.repo_hygiene.app_play_scan import (
+    PINNED_COUNTER_READS,
     PINNED_COUNTER_WRITES,
     PLAY_SOURCES,
     find_raw_app_settings,
@@ -812,6 +813,57 @@ class CounterWritePinTests(unittest.TestCase):
         for name, (statement, needle) in injections.items():
             with self.subTest(name):
                 self.assert_caught(self.inject_in_smoke(statement), needle)
+
+    def test_r30_reads_of_armed_and_the_high_water_mark_are_free_and_writes_are_not(self) -> None:
+        """HFR-NATIVE-60FPS-FULLRES-1 r30: the conform line prints engine_target from `m_sourceAdvance.armed ? m_sourceAdvance.highWater : -1 )`
+        (r29) in finishPlaybackSmokeTelemetry: that one pinned read is reviewed (the real sources are clean). Fix iteration 2 (adversary A1 on
+        aa598479): a widened read rule let `(m_sourceAdvance.highWater) += 1500;`, `<<=`, `>>=` and `(m_sourceAdvance.armed) = false;` through, so
+        every other use of .armed / .highWater -- the same expression elsewhere and a plain read included -- stays unreviewed."""
+        self.assertEqual(scan_app_play_sources(self.sources), [])
+        for name, statement in (("armed assigned", "m_sourceAdvance.armed = false;"), ("high water compound-assigned", "m_sourceAdvance.highWater += 5;"),
+                                ("high water incremented", "m_sourceAdvance.highWater++;"), ("armed or-assigned", "m_sourceAdvance.armed |= true;"),
+                                ("adversary: parenthesised compound write", "(m_sourceAdvance.highWater) += 1500;"),
+                                ("adversary: shift-left write", "m_sourceAdvance.highWater <<= 10;"),
+                                ("adversary: shift-right write", "m_sourceAdvance.highWater >>= 1;"),
+                                ("adversary: parenthesised armed write", "(m_sourceAdvance.armed) = false;"),
+                                ("a plain read outside the pinned site", "const bool advArmed = m_sourceAdvance.armed;"),
+                                ("the pinned expression outside its function", "const long long advHigh = ( m_sourceAdvance.armed ? m_sourceAdvance.highWater : -1 );")):
+            with self.subTest(name):
+                self.assert_caught(self.inject_in_smoke(statement), "unreviewed use of m_sourceAdvance")
+        self.assertEqual(PINNED_COUNTER_READS, {"MainWindow::finishPlaybackSmokeTelemetry": 1})
+
+    def test_r31_every_compound_and_parenthesised_write_is_a_write(self) -> None:
+        """HFR-NATIVE-60FPS-FULLRES-1 r31 (Dot M2 on aa598479, the class): the read rule for .startFrame and the write rule for
+        m_playRequiredSourceFrames refused `=`, `op=`, `++` and `--` but not `<<=` / `>>=`, and a closing parenthesis before the operator hid
+        any write. Every shift-assignment and every parenthesised write of .startFrame, .highWater, .armed and the requirement is caught;
+        a plain .startFrame read and an `==` comparison stay free (the real sources are clean)."""
+        self.assertEqual(scan_app_play_sources(self.sources), [])
+        adv = "unreviewed use of m_sourceAdvance"
+        req = "m_playRequiredSourceFrames written"
+        cases = []
+        for member in ("startFrame", "highWater", "armed"):
+            for op in ("=", "+=", "-=", "*=", "|=", "<<=", ">>="):
+                cases.append((f"{member} {op}", f"m_sourceAdvance.{member} {op} 1;", adv))
+                cases.append((f"({member}) {op}", f"(m_sourceAdvance.{member}) {op} 1;", adv))
+            cases.append((f"{member}++", f"m_sourceAdvance.{member}++;", adv))
+            cases.append((f"({member})--", f"(m_sourceAdvance.{member})--;", adv))
+        for op in ("<<=", ">>="):
+            cases.append((f"requirement {op}", f"m_playRequiredSourceFrames {op} 1;", req))
+            cases.append((f"(requirement) {op}", f"(m_playRequiredSourceFrames) {op} 1;", req))
+        cases.append(("(requirement) =", "(m_playRequiredSourceFrames) = 1;", req))
+        # the sibling budget check (_SCALAR_WRITE_AFTER) shares the rule: a parenthesised budget / pace write is a write
+        budget = "other than the reviewed assignment"
+        cases.append(("(budget) =", "(m_playRequestedSeconds) = 3600;", budget))
+        cases.append(("(pace) <<=", "(m_playPaceFps) <<= 1;", budget))
+        for name, statement, needle in cases:
+            with self.subTest(name):
+                self.assert_caught(self.inject_in_smoke(statement), needle)
+        for name, statement in (("a startFrame read", "const long long advStart = m_sourceAdvance.startFrame;"),
+                                ("a startFrame comparison", "const bool advAtZero = ( m_sourceAdvance.startFrame ) == 0;"),
+                                ("a requirement comparison", "const bool reqZero = ( m_playRequiredSourceFrames ) == 0;"),
+                                ("a requirement shift read", "const long long reqHalf = m_playRequiredSourceFrames >> 1;")):
+            with self.subTest(name):
+                self.assertEqual(scan_app_play_sources(self.inject_in_smoke(statement)), [])
 
     def test_a_removed_or_extra_pinned_write_is_caught(self) -> None:
         self.assert_caught(self.mutated("m_sourceAdvance.begin( ui->horizontalSliderPosition->value() );\n        // CUDA-PERF",
