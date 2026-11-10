@@ -493,6 +493,13 @@ def _reference_violations(tree: ast.AST, facts: _Facts) -> list[tuple[int, str]]
                         if a.name != "*" and not _attr_ok(origin, a.name):
                             out.append((node.lineno, f"imports {a.name} from {origin}, which is not a constant or a data type"))
             continue
+        if isinstance(node, ast.NamedExpr):  # `(r := subprocess.run)(...)`: the alias is made and used in one expression, so it is not followed
+            v = node.value
+            base = facts.module_of(v.value) if isinstance(v, ast.Attribute) else None
+            holds_spawn = (facts.module_of(v) is not None or (isinstance(v, ast.Name) and v.id in facts.funcs)
+                           or (base is not None and v.attr in _tracked(base)))
+            if holds_spawn and not isinstance(parent.get(id(node)), ast.Expr):
+                out.append((node.lineno, "binds a spawn module or API with := inside a larger expression"))
         if isinstance(node, ast.Attribute) and node.attr in _LOOP_SPAWN_METHODS:
             up = parent.get(id(node))
             if not (isinstance(up, ast.Call) and up.func is node):  # an alias of loop.subprocess_exec is not followed
@@ -1649,6 +1656,22 @@ class AdversaryR4Tests(unittest.TestCase):
             t0 = time.perf_counter()
             self.assertEqual(self._bad(src), [])
             self.assertLess(time.perf_counter() - t0, 4.0, n)
+
+    # Grok CoS ask G5 and pass 9 A1 (review-adversary-MLV-LANE-CONSOLE-HIDDEN-1-r4-c1c92dd5).
+    def test_g5_an_assignment_expression_used_in_place_is_reported(self):
+        for label, src in {
+            "callee": "import subprocess\n(r:=subprocess.run)(['x'])\n",
+            "module receiver": "import subprocess\n(s:=subprocess).run(['x'])\n",
+            "os": "import os\n(f:=os.system)('x')\n",
+            "named": "import subprocess\n(spawn := subprocess.run)(['cmd.exe', '/c', 'exit'])\n",
+            "from import": "from subprocess import Popen\n(p := Popen)(['x'])\n",
+            "alias callee": "import subprocess\nr = subprocess.run\n(q := r)(['x'])\n",
+            "if test": "import subprocess\nif (r:=subprocess.run):\n    r(['x'])\n",
+        }.items():
+            self.assertGreaterEqual(len(self._bad(src)), 1, label)
+        # the statement form is still followed as an alias: the later call must carry the flag
+        self.assertEqual(self._bad("import subprocess\n(r:=subprocess.run)\nr(['x'], creationflags=_NO_WINDOW)\n"), [])
+        self.assertEqual(len(self._bad("import subprocess\n(r:=subprocess.run)\nr(['x'])\n")), 1)
 
     def test_event_loop_spawn_methods_and_os_exec_are_scanned(self):
         for label, src in {
