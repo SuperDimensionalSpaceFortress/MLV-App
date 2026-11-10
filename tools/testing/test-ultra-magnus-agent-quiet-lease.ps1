@@ -1246,7 +1246,8 @@ try {
         try { Invoke-SidecarTmpRemove $Tmp } catch { }
         # SidecarCleanupFault.outcome (test seam, sol r4 B2): when present it REPLACES the observed outcome, so the cases can feed the call sites a malformed one.
         $cf = $script:SidecarCleanupFault
-        if ($null -ne $cf -and $cf.ContainsKey('outcome')) { return $cf.outcome }
+        # .Contains (hashtable AND [ordered]; ContainsKey is hashtable-only, adversary r5 A3); the unary comma keeps a one-element array an array (A2).
+        if ($null -ne $cf -and $cf.Contains('outcome')) { return , $cf.outcome }
         try { $exists = Test-SidecarTmpExists $Tmp }
         catch { return @{ state = 'unknown'; error = $_.Exception.GetType().Name } }
         return @{ state = $(if ($exists) { 'remaining' } else { 'removed' }); error = $null }
@@ -1334,8 +1335,9 @@ try {
         # r5 (sol r4 B1): REFUSE AN AMBIGUOUS LINE. If, after the first token, the message carries ANOTHER ' attempts=<n> <status>' framing, the same
         # line also parses with a longer job id (the id handed in is then only a prefix of the real one) and the token read here could be identifier text.
         # A line with exactly one framing after the exact-id prefix has one reading; any other yields $null, never a guess. The exact id is masked
-        # in the tail first: the writer's own tmp path embeds it (<dir>\<id>.json.<guid>.tmp), which is not a second framing.
-        $tail = $rest.Substring($Matches[0].Length).Replace($JobId, '<id>')
+        # in the tail first, but only in the writer's own tmp-file form (<id>.json.<guid>.tmp), which is not a second framing; masking every
+        # occurrence of the id would erase the framing when the id is itself one of its words ('attempts', '3', 'tmp'; adversary r5 A1).
+        $tail = [regex]::Replace($rest.Substring($Matches[0].Length), "$([regex]::Escape($JobId))\.json\.[0-9a-fA-F]{32}\.tmp", '<tmp>')
         if ($tail -cmatch ' attempts=\d+ (?:tmp=removed(?= )|tmp_remaining=(?=\S)|tmp=unknown(?=\())') { return $null }
         return $status
     }
@@ -2813,13 +2815,28 @@ function Exit-HeavySlot {
             Assert-True ($null -eq $thrown -and $dx.Data['tmp_state'] -ceq $okv.state) "cleanup-state: the valid state [$($okv.state)] is still recorded: thrown=[$thrown]"
         }
         # The two call sites: a forged malformed outcome from the cleanup step (seam: CleanupFault.outcome) on the IOException and the non-IOException path.
-        foreach ($forged in @(@{ state = @('remaining', 'unknown'); error = 'E' }, @{ state = @(); error = $null })) {
+        # adversary r5 A2: a one-element array holding a VALID table is still not a table (the seam must not unwrap it into a valid outcome).
+        $forgedList = [Collections.Generic.List[object]]::new()
+        $forgedList.Add(@{ state = @('remaining', 'unknown'); error = 'E' }); $forgedList.Add(@{ state = @(); error = $null })
+        $forgedList.Add([object[]]@(@{ state = 'removed'; error = $null }))   # exactly Object[1] holding a valid table
+        foreach ($forged in $forgedList) {
             $r = Invoke-SidecarCleanupProbe 'jRs' 'io' $false @{ outcome = $forged }
             Assert-True ($null -ne $r.err -and $r.err.Exception -is [InvalidOperationException] -and $r.msg -like 'SIDECAR-WRITE-FAILED job=jRs attempts=3*' -and $r.moves -eq 3) "cleanup-state: IOException path with a malformed outcome still surfaces the typed failure: [$($r.msg)]"
             Assert-True ($r.data['tmp_state'] -ceq 'unknown' -and $r.data['tmp_state_error'] -ceq 'InvalidCleanupOutcome' -and -not $r.data.ContainsKey('tmp_remaining') -and (Get-SidecarTmpStatus $r.msg 'jRs') -ceq 'tmp=unknown') "cleanup-state: IOException path degrades a malformed outcome to ONE unknown(InvalidCleanupOutcome), no contradictory fields: state=$($r.data['tmp_state']) error=$($r.data['tmp_state_error']) keys=[$($r.data.Keys -join ',')]"
             $r = Invoke-SidecarCleanupProbe 'jRs' 'denied' $false @{ outcome = $forged }
             Assert-True ($null -ne $r.err -and $r.err.Exception -is [UnauthorizedAccessException] -and $r.moves -eq 1) "cleanup-state: non-IOException path with a malformed outcome keeps the ORIGINAL exception: [$(if ($null -ne $r.err) { $r.err.Exception.GetType().Name })]"
             Assert-True ($r.data['tmp_state'] -ceq 'unknown' -and $r.data['tmp_state_error'] -ceq 'InvalidCleanupOutcome' -and -not $r.data.ContainsKey('tmp_remaining')) "cleanup-state: non-IOException path degrades a malformed outcome to ONE unknown(InvalidCleanupOutcome): state=$($r.data['tmp_state']) error=$($r.data['tmp_state_error'])"
+        }
+        # adversary r5 A3: the seam table may be any dictionary (an [ordered] one has no ContainsKey); a cleanup step must never throw over the primary failure.
+        foreach ($kind in 'io', 'denied') {
+            $r = Invoke-SidecarCleanupProbe 'jRs' $kind $false ([ordered]@{ remove = $true; test = $true })
+            $want = $(if ($kind -ceq 'io') { [InvalidOperationException] } else { [UnauthorizedAccessException] })
+            Assert-True ($null -ne $r.err -and $r.err.Exception -is $want -and $r.data['tmp_state'] -ceq 'unknown' -and $r.data['tmp_state_error'] -ceq 'UnauthorizedAccessException') "cleanup-state: [$kind] an [ordered] cleanup-fault table still yields the primary failure with unknown state: err=[$(if ($null -ne $r.err) { $r.err.Exception.GetType().Name })] state=[$($r.data['tmp_state'])]"
+        }
+        # adversary r5 A1: the exact-id mask must not erase the framing when the id is itself one of its words ('attempts', '3', 'tmp').
+        foreach ($wid in 'attempts', '3', 'tmp') {
+            $wl = "SIDECAR-WRITE-FAILED job=$wid attempts=3 tmp=removed x attempts=3 tmp_remaining=C:\fixture\retained.tmp IOException: x"
+            Assert-True ($null -eq (Get-SidecarTmpStatus $wl $wid)) "cleanup-state: an ambiguous line is refused for the framing-word id [$wid]: [$(Get-SidecarTmpStatus $wl $wid)]"
         }
         $results.livenessRenewHookWriteRetryCleanupState = [ordered]@{ refused = $bad.Count; callSites = 2 }
     }
