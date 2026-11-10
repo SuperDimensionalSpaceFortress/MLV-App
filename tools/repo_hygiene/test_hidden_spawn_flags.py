@@ -180,7 +180,7 @@ _ASYNCIO_SUBMODULES = frozenset({m.name for m in pkgutil.iter_modules(asyncio.__
 # but `.subprocess` off the asyncio package is asyncio's own wrapper module.
 _SUBMODULE_REEXPORTS = {"subprocess": "subprocess", "_subprocess": "subprocess", "os": "os", "_os": "os", "nt": "os", "posix": "os"}
 _PACKAGE_REEXPORTS = {"subprocess": "asyncio.subprocess", "os": "os", "nt": "os", "posix": "os"}
-_LOOP_METHOD_NAME_RE = re.compile(r"(?:\w+\.)*subprocess_(?:exec|shell)")
+_LOOP_METHOD_NAME_RE = re.compile(r"(?:\w+\.)*(?:" + "|".join(sorted(map(re.escape, _LOOP_SPAWN_METHODS))) + ")")
 
 
 def _label(expr: ast.AST) -> str:
@@ -284,6 +284,7 @@ class _Facts:
         self.ambiguous: set[str] = set()
         self.importers: dict[str, str] = {"__import__": "__import__"}  # names that import a module by string -> which kind
         self.helper_modules: dict[str, str] = {}  # names bound to importlib / builtins
+        self.imported: set[str] = set(self.imports)  # names that are an imported module, directly or through a plain alias of one
         for node in ast.walk(tree):
             self._seed(node)
         pairs = [(name, value) for node in ast.walk(tree) for name, value in self._direct(node)]
@@ -389,6 +390,9 @@ class _Facts:
                   and value.attr in _IMPORT_FUNCS and name not in self.importers):
                 self.importers[name] = value.attr
                 learned.append(name)
+        if name not in self.imported and self._imported_root(value):  # `s = shutil`, `p = os.path`: still an imported module under another name
+            self.imported.add(name)
+            learned.append(name)
         return learned
 
     @staticmethod
@@ -420,6 +424,14 @@ class _Facts:
             return self.consts.get(arg.id)
         return None
 
+    @staticmethod
+    def _fromlist_given(call: ast.Call) -> bool:
+        """Does ``__import__(name, ..., fromlist)`` carry a fromlist that could be non-empty? Then it returns the NAMED submodule, not the root."""
+        arg = call.args[3] if len(call.args) > 3 else next((kw.value for kw in call.keywords if kw.arg == "fromlist"), None)
+        if arg is None or (isinstance(arg, ast.Constant) and not arg.value):
+            return False
+        return not (isinstance(arg, (ast.List, ast.Tuple)) and not arg.elts)
+
     def import_target(self, node: ast.AST) -> tuple[bool, str | None, bool]:
         """(is this a dynamic import, the tracked module it returns or None, whether its module name could be resolved)."""
         if not isinstance(node, ast.Call):
@@ -431,7 +443,7 @@ class _Facts:
         name = self.literal(arg)
         if name is None:
             return True, None, False
-        if kind == "__import__":  # without a fromlist __import__('os.path') returns os; the root is the safe superset
+        if kind == "__import__" and not self._fromlist_given(node):  # without a fromlist __import__('os.path') returns os; the root is the safe superset
             root = name.split(".")[0]
             root = _MODULE_ALIASES.get(root, root)
             return True, (root if root in _TRACKED_MODULES else None), True
@@ -449,10 +461,13 @@ class _Facts:
         return True, (name if name in _TRACKED_MODULES else None), True
 
     def _imported_root(self, node: ast.AST) -> bool:
-        """Does this attribute chain start at a name an ``import`` bound (or a tracked module)?"""
+        """Does this attribute chain start at an imported module: a name an ``import`` bound (or a plain alias of one), a tracked module,
+        or a literal dynamic import (``importlib.import_module('shutil').os``)?"""
         while isinstance(node, ast.Attribute):
             node = node.value
-        return isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load) and (node.id in self.imports or node.id in self.modules)
+        if isinstance(node, ast.Call):
+            return self.import_target(node)[0]
+        return isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load) and (node.id in self.imported or node.id in self.modules)
 
     def module_of(self, node: ast.AST) -> str | None:
         """The tracked module this expression IS (a bound name, ``asyncio.subprocess``, a submodule chain, or a literal dynamic import)."""
@@ -964,13 +979,19 @@ def _string_values(tree: ast.AST) -> list[tuple[int, str, bool]]:
     out: list[tuple[int, str, bool]] = []
 
     def literal_text(node: ast.AST) -> str | None:
-        operands = []
-        while isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):  # iterative: a long chain must not exhaust the stack
-            operands.append(node.right)
-            node = node.left
-        operands.append(node)
-        texts = [o.value if isinstance(o, ast.Constant) and isinstance(o.value, str) else None for o in reversed(operands)]
-        return None if any(t is None for t in texts) else "".join(texts)
+        """The text of a ``+`` tree whose every leaf is a string literal, in either nesting (``'a' + ('b' + 'c')`` too); else None."""
+        texts: list[str] = []
+        todo = [node]  # iterative: a long chain must not exhaust the stack
+        while todo:
+            cur = todo.pop()
+            if isinstance(cur, ast.BinOp) and isinstance(cur.op, ast.Add):
+                todo.append(cur.right)
+                todo.append(cur.left)  # popped first, so leaves come out left to right
+            elif isinstance(cur, ast.Constant) and isinstance(cur.value, str):
+                texts.append(cur.value)
+            else:
+                return None
+        return "".join(texts)
 
     stack = [tree]
     while stack:
@@ -987,8 +1008,11 @@ def _string_values(tree: ast.AST) -> list[tuple[int, str, bool]]:
         builds = isinstance(node, (ast.JoinedStr, ast.BinOp)) or (
             isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr in _STRING_BUILDERS)
         if builds:
-            pieces = [c.value for c in ast.walk(node) if isinstance(c, ast.Constant) and isinstance(c.value, str)]
-            if any(_BUILT_LAUNCH_RE.search(p) for p in pieces):
+            consts = sorted((c for c in ast.walk(node) if isinstance(c, ast.Constant) and isinstance(c.value, str)),
+                            key=lambda c: (c.lineno, c.col_offset))
+            pieces = [c.value for c in consts]
+            # a launch split across the literal pieces ('Sta' + name + 'rt-Process') reads as one only when they are joined in source order
+            if any(_BUILT_LAUNCH_RE.search(p) for p in pieces + ["".join(pieces)]):
                 out.append((node.lineno, "".join(pieces), True))
                 continue
         stack.extend(ast.iter_child_nodes(node))
@@ -2149,6 +2173,53 @@ class AdversaryR5Pass10Tests(unittest.TestCase):
         self.assertEqual(self._judge("Write-Host 'Start-Proce`ss'"), (0, 0))
         self.assertEqual(self._judge("Write-Host 'a`b'; Get-Date"), (0, 0))
         self.assertEqual(_start_process_violations("x = 'Start-Proce`' + 'ss cmd.exe'\n"), (1, [1]))
+
+    # Pass 11 (review-adversary-MLV-LANE-CONSOLE-HIDDEN-1-r5-ce82dba3), findings A1-A4.
+    def test_pass11_a1_dunder_import_with_a_fromlist_returns_the_submodule(self):
+        for label, src in {
+            "fromlist keyword": "wu = __import__('asyncio.windows_utils', fromlist=['Popen'])\nwu.Popen(['cmd.exe', '/c', 'exit'])\n",
+            "fromlist positional": "wu = __import__('asyncio.windows_utils', globals(), locals(), ['Popen'])\nwu.Popen(['x'])\n",
+            "fromlist star": "import builtins\nwu = builtins.__import__('asyncio.base_events', fromlist=['*'])\nwu.subprocess.run(['x'])\n",
+            "fromlist unknown": "wu = __import__('asyncio.windows_utils', fromlist=names)\nwu.Popen(['x'])\n",
+        }.items():
+            self.assertGreaterEqual(len(self._bad(src)), 1, label)
+        self.assertEqual(self._bad("wu = __import__('asyncio.windows_utils', fromlist=['Popen'])\nwu.Popen(['x'], creationflags=_NO_WINDOW)\n"), [])
+        self.assertGreaterEqual(len(self._bad("m = __import__('asyncio.windows_utils')\nm.windows_utils.Popen(['x'])\n")), 1)  # no fromlist: the root
+
+    def test_pass11_a2_a_private_loop_spawn_method_reached_by_name_is_reported(self):
+        for label, src in {
+            "getattr": "import asyncio\nasync def main():\n    loop = asyncio.get_running_loop()\n"
+                       "    await getattr(loop, '_make_subprocess_transport')(asyncio.SubprocessProtocol(), ['cmd.exe'], False, None, None, None, 0)\n",
+            "attrgetter": "import operator\ndef f(loop):\n    operator.attrgetter('_make_subprocess_transport')(loop)\n",
+            "dotted": "import operator\ndef f(a):\n    operator.attrgetter('loop._make_subprocess_transport')(a)\n",
+            "alias": "def f(loop):\n    t = loop._make_subprocess_transport\n    t(proto, ['x'], False, None, None, None, 0)\n",
+        }.items():
+            self.assertGreaterEqual(len(self._bad(src)), 1, label)
+        for name in sorted(_LOOP_SPAWN_METHODS):  # every method the direct-call rule tracks is also reported when named as a string
+            self.assertGreaterEqual(len(self._bad(f"def f(loop):\n    getattr(loop, {name!r})\n")), 1, name)
+
+    def test_pass11_a3_a_launch_split_over_a_nested_concatenation_is_read(self):
+        for src in ("x = 'Sta' + ('rt-Pro' + 'cess cmd.exe')\n", "x = ('Sta' + 'rt-') + ('Pro' + 'cess cmd.exe')\n",
+                    "x = 'a; ' + ('Start-' + ('Process ' + 'cmd.exe'))\n", "x = 'Sta' + name + 'rt-Process cmd.exe'\n",
+                    "x = 'Sta' + (name + 'rt-Process cmd.exe')\n", "x = 'sta' + name + 'rt cmd.exe'\n"):
+            found, bad = _start_process_violations(src)
+            self.assertEqual((found, len(bad)), (1, 1), src)
+        self.assertEqual(_start_process_violations("x = 'Sta' + ('rt-Pro' + 'cess cmd.exe -WindowStyle Hidden')\n"), (1, []))
+        self.assertEqual(_start_process_violations("x = 'the ' + (name + ' list')\n"), (0, []))
+
+    def test_pass11_a4_an_alias_or_dynamic_import_of_an_imported_module_keeps_its_identity(self):
+        for label, src in {
+            "alias": "import shutil\ns = shutil\ns.os.system('cmd.exe /c exit')\n",
+            "alias of alias": "import shutil\ns = shutil\nt = s\nt.os.system('x')\n",
+            "annotated alias": "import shutil\ns: object = shutil\ns.os.system('x')\n",
+            "walrus statement": "import shutil\n(s := shutil)\ns.os.system('x')\n",
+            "attribute alias": "import os\np = os.path\np.os.system('x')\n",
+            "dynamic": "import importlib\nimportlib.import_module('shutil').os.system('x')\n",
+            "dynamic __import__": "__import__('platform').subprocess.run(['x'])\n",
+            "dynamic alias": "import importlib\ns = importlib.import_module('tempfile')\ns._os.system('x')\n",
+        }.items():
+            self.assertGreaterEqual(len(self._bad(src)), 1, label)
+        self.assertEqual(self._bad("import shutil\ns = shutil\ns.which('z')\nself.os = 1\n"), [])
 
 
 class SpawnSiteBehaviourTests(unittest.TestCase):
