@@ -2304,22 +2304,41 @@ LookAssistSafetyAction lookAssistSafetyAction( const QString &warning,
                                                int baselineExposure,
                                                double postNeutralGreenAxis )
 {
-    Q_UNUSED( appliedExposure );
-    Q_UNUSED( baselineExposure );
-    Q_UNUSED( postNeutralGreenAxis );
     if( !lookAssistColorCastShouldFailClosed( warning, greenArtifactRatio, greenArtifactMeanAxis,
                                               visibleGreenAxis, postAppliedStats ) )
     {
         return LookAssistSafetyAction::Keep;
+    }
+    // Every green threshold is an absolute code-value distance, so an exposure the analysis raised can carry green
+    // CONTENT (foliage) over them while the neutral samples stay neutral (M16-1456: +3.8 stops, neutral green axis
+    // 5.0, visible green axis 5.6 -> 15.9). Only then is the exposure retreated rather than the whole look: a green
+    // warning, post-applied stats, a raised exposure and a neutral that does not itself lean green. A magenta,
+    // floor-lifted or unstable warning, or a green neutral (a real cast, or dual-ISO green corruption), reverts as before.
+    const bool greenWarning = warning == QStringLiteral("localized-green-artifact")
+                           || warning == QStringLiteral("global-green-cast");
+    if( greenWarning
+     && postAppliedStats
+     && appliedExposure > baselineExposure
+     && postNeutralGreenAxis <= 8.0 )
+    {
+        return LookAssistSafetyAction::RetreatExposure;
     }
     return LookAssistSafetyAction::RevertBaseline;
 }
 
 QVector<int> lookAssistSafetyRetreatRungs( int appliedExposure, int baselineExposure )
 {
-    Q_UNUSED( appliedExposure );
-    Q_UNUSED( baselineExposure );
-    return QVector<int>();
+    QVector<int> rungs;
+    if( appliedExposure <= baselineExposure ) return rungs;
+    const qint64 excess = static_cast<qint64>( appliedExposure ) - baselineExposure;   // no int overflow
+    const int candidates[] = { static_cast<int>( baselineExposure + excess / 2 ),
+                               static_cast<int>( baselineExposure + excess / 4 ) };
+    for( const int rung : candidates )
+    {
+        if( rung == appliedExposure || rung == baselineExposure || rungs.contains( rung ) ) continue;
+        rungs.append( rung );
+    }
+    return rungs;
 }
 
 } // namespace lookassist

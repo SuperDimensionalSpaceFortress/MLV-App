@@ -18957,30 +18957,32 @@ void MainWindow::applyLookAssistToReceipt( ReceiptSettings *receipt,
     const int initialTintDelta = preset.tintDelta;
     int postTemperatureDelta = 0;
     int postTintDelta = 0;
+    // Declared outside the walk below so the safety retreat (after the warning) can re-measure with it. Only ever called
+    // when canAnalyzeProcessedColor holds.
+    const int minColorBalanceSamples = qMax( 32, ( colorWidth * colorHeight ) / 100 );
+    auto analyzePostAppliedLook = [&]() -> bool
+    {
+        QByteArray postProcessedThumbnail;
+        postProcessedThumbnail.resize( colorWidth * colorHeight * 3 );
+        m_lookAssistPump.call( [&]()
+        {
+            get_area_average_downscale_thumnail( m_pMlvObject,
+                                                 analysisFrame,
+                                                 colorDownscaleFactor,
+                                                 qMax( 1, mlvappEffectiveWorkerThreadCount() ),
+                                                 reinterpret_cast<unsigned char *>( postProcessedThumbnail.data() ) );
+        } );
+        postColorStats = analyzeLookAssistThumbnail(
+                    reinterpret_cast<const unsigned char *>( postProcessedThumbnail.constData() ),
+                    colorWidth,
+                    colorHeight );
+        return postColorStats.median > 0.0
+            && postColorStats.balanceSamples >= minColorBalanceSamples;
+    };
     if( canAnalyzeProcessedColor )
     {
         const look_assist_pump::SegmentClock segment( &m_lookAssistApplyTiming.walkMs );
-        const int minColorBalanceSamples = qMax( 32, ( colorWidth * colorHeight ) / 100 );
         const int postTintCap = lookAssistAutoTintCap( scene, useProcessedColorStats );
-        auto analyzePostAppliedLook = [&]() -> bool
-        {
-            QByteArray postProcessedThumbnail;
-            postProcessedThumbnail.resize( colorWidth * colorHeight * 3 );
-            m_lookAssistPump.call( [&]()
-            {
-                get_area_average_downscale_thumnail( m_pMlvObject,
-                                                     analysisFrame,
-                                                     colorDownscaleFactor,
-                                                     qMax( 1, mlvappEffectiveWorkerThreadCount() ),
-                                                     reinterpret_cast<unsigned char *>( postProcessedThumbnail.data() ) );
-            } );
-            postColorStats = analyzeLookAssistThumbnail(
-                        reinterpret_cast<const unsigned char *>( postProcessedThumbnail.constData() ),
-                        colorWidth,
-                        colorHeight );
-            return postColorStats.median > 0.0
-                && postColorStats.balanceSamples >= minColorBalanceSamples;
-        };
         // The shared score (LookAssistAnalysis): the one keep-or-revert measure for every refinement.
         auto postBalanceScore = []( const LookAssistStats &candidate ) -> double
         {
@@ -19404,49 +19406,57 @@ void MainWindow::applyLookAssistToReceipt( ReceiptSettings *receipt,
     m_lastLookAssistPostGreenArtifactMeanAxis = postColorStatsValid
                                               ? postColorStats.greenArtifactMeanAxis
                                               : 0.0;
-    m_lastLookAssistPostVisibleGreenAxis = postColorStatsValid
-                                         ? postColorStats.visibleMeanG
-                                           - ( ( postColorStats.visibleMeanR
-                                               + postColorStats.visibleMeanB ) * 0.5 )
-                                         : 0.0;
+    // The visible green axis and the whole warning block for ONE post-applied measurement. The first look and every
+    // safety-retreat rung (below) are judged by exactly this.
+    auto postVisibleGreenAxisOf = []( bool statsValid, const LookAssistStats &shown ) -> double
+    {
+        return statsValid
+             ? shown.visibleMeanG - ( ( shown.visibleMeanR + shown.visibleMeanB ) * 0.5 )
+             : 0.0;
+    };
+    auto postColorCastWarningOf = [&]( bool statsValid, const LookAssistStats &shown ) -> QString
+    {
+        const double shownBlueAmberAxis = statsValid
+                                        ? shown.balanceB - shown.balanceR
+                                        : 0.0;
+        QString warning =
+            lookAssistColorCastWarning( statsValid,
+                                        shown,
+                                        postVisibleGreenAxisOf( statsValid, shown ),
+                                        temperature,
+                                        shownBlueAmberAxis );
+        if( warning == QStringLiteral("none")
+         && lookAssistProcessedFloorLiftedAutoWhiteBalanceShouldFailClosed(
+                floorLiftedNightThumbnail,
+                useProcessedColorStats,
+                autoWhiteBalanceValid,
+                baseTemperature,
+                baseTint,
+                temperature,
+                tint ) )
+        {
+            warning = QStringLiteral("processed-floor-lifted-awb-risk");
+        }
+        else if( warning == QStringLiteral("none")
+         && lookAssistProcessedFloorLiftedPostInvalidShouldFailClosed(
+                floorLiftedNightThumbnail,
+                canAnalyzeProcessedColor,
+                statsValid,
+                m_lastLookAssistChromaSmoothAutoApplied,
+                receipt->rawWhite() != -1
+                    ? receipt->rawWhite()
+                    : ui->horizontalSliderRawWhite->value(),
+                m_pMlvObject ? (int)getMlvOriginalWhiteLevel( m_pMlvObject ) : -1 ) )
+        {
+            warning = QStringLiteral("processed-floor-lifted-post-invalid");
+        }
+        return warning;
+    };
+    m_lastLookAssistPostVisibleGreenAxis = postVisibleGreenAxisOf( postColorStatsValid, postColorStats );
     m_lastLookAssistPostTemperatureDelta = postTemperatureDelta;
     m_lastLookAssistPostTintDelta = postTintDelta;
     m_lastLookAssistChromaSmooth = toolButtonChromaSmoothCurrentIndex();
-    const double postBlueAmberAxis = postColorStatsValid
-                                   ? postColorStats.balanceB - postColorStats.balanceR
-                                   : 0.0;
-    m_lastLookAssistColorCastWarning =
-        lookAssistColorCastWarning( postColorStatsValid,
-                                    postColorStats,
-                                    m_lastLookAssistPostVisibleGreenAxis,
-                                    temperature,
-                                    postBlueAmberAxis );
-    if( m_lastLookAssistColorCastWarning == QStringLiteral("none")
-     && lookAssistProcessedFloorLiftedAutoWhiteBalanceShouldFailClosed(
-            floorLiftedNightThumbnail,
-            useProcessedColorStats,
-            autoWhiteBalanceValid,
-            baseTemperature,
-            baseTint,
-            temperature,
-            tint ) )
-    {
-        m_lastLookAssistColorCastWarning = QStringLiteral("processed-floor-lifted-awb-risk");
-    }
-    else if( m_lastLookAssistColorCastWarning == QStringLiteral("none")
-     && lookAssistProcessedFloorLiftedPostInvalidShouldFailClosed(
-            floorLiftedNightThumbnail,
-            canAnalyzeProcessedColor,
-            postColorStatsValid,
-            m_lastLookAssistChromaSmoothAutoApplied,
-            receipt->rawWhite() != -1
-                ? receipt->rawWhite()
-                : ui->horizontalSliderRawWhite->value(),
-            m_pMlvObject ? (int)getMlvOriginalWhiteLevel( m_pMlvObject ) : -1 ) )
-    {
-        m_lastLookAssistColorCastWarning =
-            QStringLiteral("processed-floor-lifted-post-invalid");
-    }
+    m_lastLookAssistColorCastWarning = postColorCastWarningOf( postColorStatsValid, postColorStats );
     m_lastLookAssistSafetyFallback = false;
 
     logInteractionEvent(
@@ -19515,7 +19525,7 @@ void MainWindow::applyLookAssistToReceipt( ReceiptSettings *receipt,
             .arg( bool01( m_lastLookAssistChromaSmoothAutoApplied ) ) );
 
     // The shared safety decision (LookAssistAnalysis). The neutral green axis is the failing post stats' own.
-    const LookAssistSafetyAction safetyAction = lookAssistSafetyAction(
+    LookAssistSafetyAction safetyAction = lookAssistSafetyAction(
             m_lastLookAssistColorCastWarning,
             m_lastLookAssistPostGreenArtifactRatio,
             m_lastLookAssistPostGreenArtifactMeanAxis,
@@ -19526,6 +19536,98 @@ void MainWindow::applyLookAssistToReceipt( ReceiptSettings *receipt,
             m_lastLookAssistPostBalanceValid
                 ? m_lastLookAssistPostBalanceG - ( ( m_lastLookAssistPostBalanceR + m_lastLookAssistPostBalanceB ) * 0.5 )
                 : 0.0 );
+    if( safetyAction == LookAssistSafetyAction::RetreatExposure && !canAnalyzeProcessedColor )
+    {
+        safetyAction = LookAssistSafetyAction::RevertBaseline;   // nothing to re-measure with (post stats imply it; defensive)
+    }
+    if( safetyAction == LookAssistSafetyAction::RetreatExposure )
+    {
+        // LOOK-ASSIST-GREEN-ARTIFACT-FALLBACK-AT-LIFTED-EXPOSURE-1: a green warning over a neutral that stays neutral, at an
+        // exposure the analysis raised. Only the exposure moves; every other slider, the flavor deltas and the film grade
+        // stay as applied. At most three renders: the baseline exposure (the bottom check), then up to two rungs.
+        const look_assist_pump::SegmentClock retreatSegment( &m_lookAssistApplyTiming.walkMs );
+        const QString firstWarning = m_lastLookAssistColorCastWarning;
+        const int appliedExposure = preset.exposure;
+        const int baselineExposure = receipt->lookAssistBaselineExposure();
+
+        preset.exposure = baselineExposure;
+        applyLookAssistValues();
+        const bool bottomValid = analyzePostAppliedLook();
+        const LookAssistStats bottomStats = postColorStats;
+        const QString bottomWarning = postColorCastWarningOf( bottomValid, bottomStats );
+        const double bottomVisible = postVisibleGreenAxisOf( bottomValid, bottomStats );
+
+        QStringList triedRungs;
+        QString keptExposure = QStringLiteral("none");
+        if( bottomValid && bottomWarning == QStringLiteral("none") )
+        {
+            bool rungKept = false;
+            for( const int rung : lookAssistSafetyRetreatRungs( appliedExposure, baselineExposure ) )
+            {
+                preset.exposure = rung;
+                applyLookAssistValues();
+                const bool rungValid = analyzePostAppliedLook();
+                const QString rungWarning = postColorCastWarningOf( rungValid, postColorStats );
+                const double rungVisible = postVisibleGreenAxisOf( rungValid, postColorStats );
+                triedRungs.append( QStringLiteral("%1:%2:%3")
+                                       .arg( rung )
+                                       .arg( rungVisible, 0, 'f', 3 )
+                                       .arg( rungValid ? postColorStats.greenArtifactRatio : 0.0, 0, 'f', 6 ) );
+                if( rungValid
+                 && !lookAssistColorCastShouldFailClosed( rungWarning,
+                                                          postColorStats.greenArtifactRatio,
+                                                          postColorStats.greenArtifactMeanAxis,
+                                                          rungVisible,
+                                                          true ) )
+                {
+                    postColorStatsValid = true;
+                    rungKept = true;
+                    break;
+                }
+            }
+            if( !rungKept )
+            {
+                // No rung passed: the baseline exposure is shown, described by its own (identical-settings) measurement.
+                preset.exposure = baselineExposure;
+                applyLookAssistValues();
+                postColorStats = bottomStats;
+                postColorStatsValid = bottomValid;
+            }
+            keptExposure = QString::number( preset.exposure );
+            // Every diagnostic that describes the shown look now describes the kept rung.
+            m_lastLookAssistExposure = preset.exposure;
+            m_lastLookAssistPostBalanceValid = postColorStatsValid;
+            m_lastLookAssistPostBalanceR = postColorStatsValid ? postColorStats.balanceR : 0.0;
+            m_lastLookAssistPostBalanceG = postColorStatsValid ? postColorStats.balanceG : 0.0;
+            m_lastLookAssistPostBalanceB = postColorStatsValid ? postColorStats.balanceB : 0.0;
+            m_lastLookAssistPostBalanceSamples = postColorStatsValid ? postColorStats.balanceSamples : 0;
+            m_lastLookAssistPostGreenArtifactRatio = postColorStatsValid ? postColorStats.greenArtifactRatio : 0.0;
+            m_lastLookAssistPostGreenArtifactMeanAxis = postColorStatsValid ? postColorStats.greenArtifactMeanAxis : 0.0;
+            m_lastLookAssistPostVisibleGreenAxis = postVisibleGreenAxisOf( postColorStatsValid, postColorStats );
+            m_lastLookAssistColorCastWarning = postColorCastWarningOf( postColorStatsValid, postColorStats );
+            safetyAction = LookAssistSafetyAction::Keep;
+        }
+        else
+        {
+            // The baseline exposure is not clean either: the green is not the lift's. Revert exactly as before; the
+            // diagnostics keep describing the first (failing) look.
+            safetyAction = LookAssistSafetyAction::RevertBaseline;
+        }
+        logInteractionEvent(
+            QStringLiteral("look_assist.apply.safety_retreat"),
+            QStringLiteral("first_warning=%1 applied_exposure=%2 baseline_exposure=%3 bottom_warning=%4 bottom_visible_green_axis=%5 bottom_green_ratio=%6 kept_exposure=%7 rungs_tried=%8 rungs=%9 kept_warning=%10 frame=%11")
+                .arg( firstWarning )
+                .arg( appliedExposure )
+                .arg( baselineExposure )
+                .arg( bottomWarning )
+                .arg( bottomVisible, 0, 'f', 3 )
+                .arg( bottomValid ? bottomStats.greenArtifactRatio : 0.0, 0, 'f', 6 )
+                .arg( keptExposure )
+                .arg( triedRungs.size() )
+                .arg( triedRungs.isEmpty() ? QStringLiteral("none") : triedRungs.join( QLatin1Char(',') ) )
+                .arg( safetyAction == LookAssistSafetyAction::Keep ? m_lastLookAssistColorCastWarning : QStringLiteral("reverted") )
+                .arg( analysisFrame ) );
+    }
     if( safetyAction == LookAssistSafetyAction::RevertBaseline )
     {
         const int safeChromaSmooth = m_lastLookAssistChromaSmooth;
