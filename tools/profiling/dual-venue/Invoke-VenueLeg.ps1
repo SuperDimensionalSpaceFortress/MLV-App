@@ -971,7 +971,7 @@ if ($outcome -in @('PASS', 'FAIL') -and $display.blocks) {
 # PR #788 r1 opus B3: a gap the app's OWN swap record accounts for (APP_SWAP_STALL) is not PresentMon's: it is a real playback stall, counted as a FAIL with
 # the stall named, never INVALID. Test-DvReceiptValid re-derives both from the verified metrics.
 if ($null -ne $receipt.metrics) {
-    $presentMonGapVerdict = Get-DvPresentMonGapVerdict -Metrics $receipt.metrics
+    $presentMonGapVerdict = Get-DvPresentMonGapVerdict -Metrics $receipt.metrics -Backend $Backend
     $receipt['presentMonGap'] = $presentMonGapVerdict
     if ($outcome -in @('PASS', 'FAIL') -and $presentMonGapVerdict.blocks) {
         $detail = "INVALID: the job result was $outcome ($detail) but $($presentMonGapVerdict.reason). A leg whose PresentMon gap the app's own swap record does not explain is not counted"

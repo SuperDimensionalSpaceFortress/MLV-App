@@ -3680,7 +3680,8 @@ function Test-DvReceiptValid {
         # that predates the field keeps the classification it had (its gap was never judged by the writer either).
         $presentMonGap = $null
         if ($null -ne (Get-DvProp $metrics 'presentMonTemporalWindowSource')) {
-            $presentMonGap = Get-DvPresentMonGapVerdict -Metrics $metrics
+            # adversary r4 A1: the backend the HASHED summary derives in production (never a receipt field); a receipt with none is INVALID above
+            $presentMonGap = Get-DvPresentMonGapVerdict -Metrics $metrics -Backend $(if ($production) { $derivedBackend } else { $backend })
             if ($presentMonGap.blocks) { $invalid.Add("$($presentMonGap.reason). A leg whose PresentMon gap the app's own swap record does not explain is not counted") }
         }
 
@@ -4167,8 +4168,14 @@ function Get-DvPresentMonGapVerdict {
                                  The gap may be the app's own pre-roll, but nothing places it outside playback, so it is not counted;
       WITHIN_BOUND               no block.
     Pure: the runner gates on it after the verbatim metrics are copied, and Test-DvReceiptValid re-derives it from the verified metrics.
+    adversary r4 (78b6b9b2) A1: -Backend is mandatory. On the cpu backend PresentMon is informational and never gating, whatever status the job
+    published (its cpu override rewrites only a non-OK display report, so a 'degraded' capture can reach here): NOT_APPLICABLE. Any other
+    backend, including a missing one, is judged (fail closed). The writer passes the leg's backend; the validator the one the hashed summary derives.
     #>
-    param([AllowNull()]$Metrics)
+    param(
+        [AllowNull()]$Metrics,
+        [Parameter(Mandatory = $true)][AllowNull()][AllowEmptyString()][string]$Backend
+    )
     $bound = $script:PresentMonGapBoundMs
     $tolerance = $script:PresentMonAppStallToleranceMs
     $status = [string](Get-DvProp $Metrics 'presentMonStatus')
@@ -4191,7 +4198,11 @@ function Get-DvPresentMonGapVerdict {
     if ($rawOverCount -is [int] -or $rawOverCount -is [long]) { $overCount = [long]$rawOverCount }
     $verdict = 'WITHIN_BOUND'
     $reason = $null
-    if ($status -cnotin @('ok', 'degraded')) {
+    if ($Backend -ceq 'cpu') {
+        $verdict = 'NOT_APPLICABLE'
+        $reason = "the leg ran on the cpu backend, where PresentMon is informational and never gating (presentMonStatus '$status')"
+    }
+    elseif ($status -cnotin @('ok', 'degraded')) {
         $verdict = 'NOT_APPLICABLE'
         $reason = "presentMonStatus is '$status', not ok or degraded: no PresentMon cadence to bound"
     }

@@ -207,17 +207,15 @@ class JobWiringTests(unittest.TestCase):
         self.assertIn("Get-AttrCudaPlaybackTemporalCoverage", exports)
 
 
-def verdict(metrics: dict) -> dict:
-    proc, out = run_pwsh_json("$m = $env:PMG_M | ConvertFrom-Json\n(Get-DvPresentMonGapVerdict -Metrics $m) | ConvertTo-Json -Compress", PMG_M=json.dumps(metrics))
-    if out is None:
-        raise AssertionError(proc.stdout + proc.stderr)
-    return out
+def verdict(metrics: dict, backend: str | None = "cuda") -> dict:
+    return verdicts([metrics], [backend])[0]
 
 
-def verdicts(metrics: list[dict]) -> list[dict]:
-    """Get-DvPresentMonGapVerdict over several metrics blocks in ONE pwsh process."""
-    proc, out = run_pwsh_json("$o = foreach ($m in @($env:PMG_M | ConvertFrom-Json)) { Get-DvPresentMonGapVerdict -Metrics $m }\n"
-                              "ConvertTo-Json -InputObject @($o) -Compress -Depth 4", PMG_M=json.dumps(metrics))
+def verdicts(metrics: list[dict], backends: list[str | None] | None = None) -> list[dict]:
+    """Get-DvPresentMonGapVerdict over several metrics blocks in ONE pwsh process (backend 'cuda' unless given; None passes $null)."""
+    cases = [{"m": m, "b": b} for m, b in zip(metrics, backends or ["cuda"] * len(metrics))]
+    proc, out = run_pwsh_json("$o = foreach ($c in @($env:PMG_M | ConvertFrom-Json)) { Get-DvPresentMonGapVerdict -Metrics $c.m -Backend $c.b }\n"
+                              "ConvertTo-Json -InputObject @($o) -Compress -Depth 4", PMG_M=json.dumps(cases))
     if out is None or len(out) != len(metrics):
         raise AssertionError(proc.stdout + proc.stderr)
     return out
@@ -259,6 +257,29 @@ class ReceiptGapGuardTests(unittest.TestCase):
             self.assertEqual(v["verdict"], "PRESENTMON_GAP_UNMEASURED", v)
             self.assertTrue(v["blocks"])
 
+    def test_r4_78b6b9b2_a1_presentmon_never_gates_a_cpu_leg(self) -> None:
+        # adversary review-adversary-...-r4-78b6b9b2 A1 (introduced, major): sol's literal cpu metrics (process-lifetime fallback, 10 s head gap)
+        sol = {"presentMonStatus": "degraded", "presentMonTemporalWindowSource": "process_lifetime", "presentMonTemporalMaxGapMs": 10000,
+               "presentMonTemporalGapKind": "head", "presentMonTemporalAppSwapMaxGapMs": None, "presentMonTemporalOverBoundGapCount": None}
+        stall = {"presentMonStatus": "degraded", "presentMonTemporalMaxGapMs": 21359.5, "presentMonTemporalGapKind": "internal",
+                 "presentMonTemporalWindowSource": "app_swap_window", "presentMonTemporalAppSwapMaxGapMs": 21359.466, "presentMonTemporalOverBoundGapCount": 1}
+        unmeasured = {"presentMonStatus": "ok", "presentMonTemporalMaxGapMs": None, "presentMonTemporalWindowSource": "app_swap_window"}
+        got = verdicts([sol, stall, unmeasured, sol, sol, sol, sol], ["cpu", "cpu", "cpu", "cuda", None, "", "CPU"])
+        for v in got[:3]:
+            self.assertEqual(v["verdict"], "NOT_APPLICABLE", v)
+            self.assertFalse(v["blocks"], v)
+            self.assertFalse(v["failsLeg"], v)
+            self.assertIn("cpu backend", v["reason"])
+        # a cuda leg, and a backend that is missing or not spelled exactly 'cpu', are still judged (fail closed)
+        for v in got[3:]:
+            self.assertEqual(v["verdict"], "PRESENTMON_GAP_UNLOCATED", v)
+            self.assertTrue(v["blocks"], v)
+
+    def test_the_backend_is_mandatory(self) -> None:
+        proc, out = run_pwsh_json("$m = [pscustomobject]@{ presentMonStatus = 'ok' }\n"
+                                  "try { $null = Get-DvPresentMonGapVerdict -Metrics $m -ErrorAction Stop; 'null' } catch { ConvertTo-Json 'REFUSED' }")
+        self.assertEqual(out, "REFUSED", proc.stdout + proc.stderr)
+
     def test_the_bound_is_the_jobs_own_temporal_ceiling(self) -> None:
         job = JOB.read_text(encoding="utf-8")
         ceiling = float(re.search(r"^\$presentMonSufficiencyMaxGapMs = ([\d.]+)$", job, re.M).group(1))
@@ -268,7 +289,10 @@ class ReceiptGapGuardTests(unittest.TestCase):
 class ReceiptGuardWiringTests(unittest.TestCase):
     def test_invoke_venue_leg_records_the_verdict_and_fails_closed(self) -> None:
         leg = LEG.read_text(encoding="utf-8")
-        self.assertIn("$presentMonGapVerdict = Get-DvPresentMonGapVerdict -Metrics $receipt.metrics", leg)
+        self.assertIn("$presentMonGapVerdict = Get-DvPresentMonGapVerdict -Metrics $receipt.metrics -Backend $Backend", leg)
+        # (adversary r4 78b6b9b2 A1: the leg's backend is resolved from the spec before the gate, so a cpu leg never reaches it with '')
+        self.assertLess(leg.index("if ([string]::IsNullOrWhiteSpace($Backend)) { $Backend = [string]@($spec.backends)[0] }"),
+                        leg.index("$presentMonGapVerdict = Get-DvPresentMonGapVerdict"))
         self.assertIn("$receipt['presentMonGap'] = $presentMonGapVerdict", leg)
         self.assertIn("if ($outcome -in @('PASS', 'FAIL') -and $presentMonGapVerdict.blocks) {", leg)
         gate = leg.index("if ($outcome -in @('PASS', 'FAIL') -and $presentMonGapVerdict.blocks) {")
@@ -573,6 +597,19 @@ class SharedReaderGapTests(EvidenceFactory, unittest.TestCase):
         self.expect(got[3], "INVALID", "an app swap stall claimed as a PASS", "OUTCOME_NOT_DERIVED")
         self.expect(got[4], "ADVISORY", "an app swap stall is a counted FAIL")
         self.expect(got[5], "ADVISORY", "a healthy leg of the new shape")
+
+    def test_r4_78b6b9b2_a1_the_validator_never_gates_a_cpu_receipt_on_presentmon(self) -> None:
+        # adversary r4 A1 (introduced, major): the shared validator judged a cpu receipt's PresentMon gap too, so every reader refused a cpu figure the
+        # writer would (now) count. The backend is the one the HASHED summary derives (cpuFrames > 0, gpuFramesTotal 0), never a receipt field.
+        repo = self.prod_repo()
+        sol = {"presentMonStatus": "degraded", "presentMonTemporalWindowSource": "process_lifetime", "presentMonTemporalMaxGapMs": 10000.0,
+               "presentMonTemporalGapKind": "head"}
+        ev_cpu = self.evidence("cpu-gap", backend="cpu", summary=sol)
+        ev_cuda = self.evidence("cuda-gap", summary=sol)
+        got = self.status_batch(repo, [(self.receipt_for(repo, ev_cpu, backend="cpu", outcome="PASS"), None),
+                                       (self.receipt_for(repo, ev_cuda, outcome="PASS"), None)])
+        self.expect(got[0], "ADVISORY", "a cpu receipt's PresentMon gap is informational")
+        self.expect(got[1], "INVALID", "the same gap on a cuda receipt still blocks", "PRESENTMON_GAP_UNLOCATED")
 
     def test_every_reader_gates_figures_on_the_validator_status(self) -> None:
         dv = ROOT / "tools" / "profiling" / "dual-venue"
