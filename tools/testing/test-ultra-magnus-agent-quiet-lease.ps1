@@ -1183,7 +1183,7 @@ try {
         'notafter-queuedjob-pregate', 'notafter-queuedjob-gate', 'notafter-queuedjob-post-admission', 'notafter-prelaunch-marker',
         'notafter-prelaunch-confirm', 'notafter-renew-in-light-job', 'notafter-meta-unreadable',
         'queuedjob-cancel-post-admission', 'notafter-renew-crosses-deadline', 'notafter-meta-sticky',
-        'liveness-dead-before-request', 'liveness-lapses-while-pending', 'liveness-lapses-at-active', 'liveness-renewed-across-exit75', 'liveness-renewed-across-stall', 'liveness-renewal-stops-lapses', 'liveness-renewed-post-renewal-pause', 'liveness-renewal-stops-lapses-post-pause', 'liveness-renew-stall-override-bound', 'liveness-renew-hook-write-retry', 'liveness-renew-hook-write-retry-gate', 'liveness-renew-hook-write-retry-cleanup-io', 'liveness-renew-hook-write-retry-cleanup-other', 'liveness-renew-hook-write-retry-cleanup-path-token', 'liveness-renew-hook-write-retry-cleanup-unknown', 'liveness-renew-hook-write-retry-cleanup-identifier', 'liveness-renew-hook-write-retry-cleanup-census',
+        'liveness-dead-before-request', 'liveness-lapses-while-pending', 'liveness-lapses-at-active', 'liveness-renewed-across-exit75', 'liveness-renewed-across-stall', 'liveness-renewal-stops-lapses', 'liveness-renewed-post-renewal-pause', 'liveness-renewal-stops-lapses-post-pause', 'liveness-renew-stall-override-bound', 'liveness-renew-hook-write-retry', 'liveness-renew-hook-write-retry-gate', 'liveness-renew-hook-write-retry-cleanup-io', 'liveness-renew-hook-write-retry-cleanup-other', 'liveness-renew-hook-write-retry-cleanup-path-token', 'liveness-renew-hook-write-retry-cleanup-unknown', 'liveness-renew-hook-write-retry-cleanup-identifier', 'liveness-renew-hook-write-retry-cleanup-state', 'liveness-renew-hook-write-retry-cleanup-census',
         'liveness-absent-unchanged', 'liveness-unparseable-expired', 'liveness-pure', 'liveness-reader', 'liveness-ast-guard', 'liveness-queuedjob',
         'liveness-root-shape', 'liveness-lapse-latched',
         'queuedjob-queue-expired-post-admission', 'queuedjob-holder-lost-prelaunch', 'exit-release-pin',
@@ -1244,13 +1244,38 @@ try {
     # type name) when the query itself threw. NEVER throws: a cleanup failure must not replace the failure that sent us here (sol r2 B2).
     function Remove-SidecarTmp([string]$Tmp) {
         try { Invoke-SidecarTmpRemove $Tmp } catch { }
+        # SidecarCleanupFault.outcome (test seam, sol r4 B2): when present it REPLACES the observed outcome, so the cases can feed the call sites a malformed one.
+        $cf = $script:SidecarCleanupFault
+        if ($null -ne $cf -and $cf.ContainsKey('outcome')) { return $cf.outcome }
         try { $exists = Test-SidecarTmpExists $Tmp }
         catch { return @{ state = 'unknown'; error = $_.Exception.GetType().Name } }
         return @{ state = $(if ($exists) { 'remaining' } else { 'removed' }); error = $null }
     }
+    # The fault in a cleanup outcome, or $null when it is well formed: ONE scalar string state from {removed, remaining, unknown}, and for
+    # 'unknown' a non-empty scalar string error type. An array (empty or not), $null, another word or case, or a non-table is a fault (sol r4 B2).
+    function Get-SidecarCleanupOutcomeFault($Cleanup) {
+        if ($Cleanup -isnot [System.Collections.IDictionary]) { return 'outcome is not a table' }
+        $s = $Cleanup['state']
+        if ($s -isnot [string]) { return 'state is not one scalar string' }
+        if ($s -cnotin @('removed', 'remaining', 'unknown')) { return "state [$s] is not removed|remaining|unknown" }
+        if ($s -ceq 'unknown') {
+            $e = $Cleanup['error']
+            if ($e -isnot [string] -or $e.Length -eq 0) { return 'unknown needs a non-empty scalar error type' }
+        }
+        return $null
+    }
+    # The writer's own call sites use this: a malformed outcome degrades to unknown(InvalidCleanupOutcome) so the PRIMARY failure still propagates
+    # and the record is never contradictory. Set-SidecarTmpData itself refuses (below); a malformed outcome is a defect, reported, never recorded.
+    function Resolve-SidecarCleanupOutcome($Cleanup) {
+        if ($null -eq (Get-SidecarCleanupOutcomeFault $Cleanup)) { return $Cleanup }
+        return @{ state = 'unknown'; error = 'InvalidCleanupOutcome' }
+    }
     # Records the cleanup outcome on an exception's Data (never throws): tmp_state always, tmp_remaining only for a checked 'remaining',
     # tmp_state_error only for 'unknown'. The cases assert on these entries, not on a substring of the message (sol r2 B1).
     function Set-SidecarTmpData($Exception, [string]$Tmp, $Cleanup) {
+        # r5 (sol r4 B2): validated BEFORE the guarded block, so a malformed outcome is refused (typed) and nothing is recorded.
+        $fault = Get-SidecarCleanupOutcomeFault $Cleanup
+        if ($null -ne $fault) { throw [ArgumentException]::new("malformed sidecar cleanup outcome: $fault", 'Cleanup') }
         try {
             foreach ($k in 'tmp_remaining', 'tmp_state_error') { $Exception.Data.Remove($k) }   # adversary r4 A3: a re-recorded outcome drops the previous one's entries
             $Exception.Data['tmp_state'] = [string]$Cleanup.state
@@ -1279,13 +1304,13 @@ try {
                 if ($ex -isnot [IO.IOException]) {
                     # The original exception keeps its type; the cleanup outcome rides on its Data, never replacing it. No warning/stream
                     # output: under `pwsh -File` the warning stream lands on STDOUT ahead of the JSON the FIFO aggregate parses (sol r2 A1).
-                    $cleanup = Remove-SidecarTmp $tmp
+                    $cleanup = Resolve-SidecarCleanupOutcome (Remove-SidecarTmp $tmp)
                     foreach ($d in @($_.Exception, $ex)) { Set-SidecarTmpData $d $tmp $cleanup }
                     throw
                 }
                 if ($attempt -ge $maxAttempts) {
-                    $cleanup = Remove-SidecarTmp $tmp
-                    $tmpState = if ($cleanup.state -ceq 'removed') { 'tmp=removed' } elseif ($cleanup.state -ceq 'remaining') { "tmp_remaining=$tmp" } else { "tmp=unknown($($cleanup.error))" }
+                    $cleanup = Resolve-SidecarCleanupOutcome (Remove-SidecarTmp $tmp)
+                    $tmpState =if ($cleanup.state -ceq 'removed') { 'tmp=removed' } elseif ($cleanup.state -ceq 'remaining') { "tmp_remaining=$tmp" } else { "tmp=unknown($($cleanup.error))" }
                     $failure = [InvalidOperationException]::new("SIDECAR-WRITE-FAILED job=$JobId attempts=$attempt $tmpState $($ex.GetType().Name): $($ex.Message)", $ex)
                     Set-SidecarTmpData $failure $tmp $cleanup
                     throw $failure
@@ -1303,8 +1328,16 @@ try {
         $prefix = "SIDECAR-WRITE-FAILED job=$JobId attempts="
         if (-not $Message.StartsWith($prefix, [StringComparison]::Ordinal)) { return $null }
         # A COMPLETE token (adversary r3 A1): tmp=removed then a space, tmp_remaining= then a non-space (the path), tmp=unknown then '('.
-        if ($Message.Substring($prefix.Length) -cmatch '^\d+ (tmp=removed(?= )|tmp_remaining=(?=\S)|tmp=unknown(?=\())') { return $Matches[1] }
-        return $null
+        $rest = $Message.Substring($prefix.Length)
+        if ($rest -cnotmatch '^\d+ (tmp=removed(?= )|tmp_remaining=(?=\S)|tmp=unknown(?=\())') { return $null }
+        $status = $Matches[1]
+        # r5 (sol r4 B1): REFUSE AN AMBIGUOUS LINE. If, after the first token, the message carries ANOTHER ' attempts=<n> <status>' framing, the same
+        # line also parses with a longer job id (the id handed in is then only a prefix of the real one) and the token read here could be identifier text.
+        # A line with exactly one framing after the exact-id prefix has one reading; any other yields $null, never a guess. The exact id is masked
+        # in the tail first: the writer's own tmp path embeds it (<dir>\<id>.json.<guid>.tmp), which is not a second framing.
+        $tail = $rest.Substring($Matches[0].Length).Replace($JobId, '<id>')
+        if ($tail -cmatch ' attempts=\d+ (?:tmp=removed(?= )|tmp_remaining=(?=\S)|tmp=unknown(?=\())') { return $null }
+        return $status
     }
     # The residue census of one probe job: every tmp the writer generated for $Jid in the sidecar directory, HIDDEN ones included (-Force) and
     # with enumeration errors surfaced, never suppressed (r4, sol r3 B2). Returns @{ paths; error }: error = the enumeration error's type name,
@@ -2733,6 +2766,18 @@ function Exit-HeavySlot {
         # the reader itself: a message that embeds the spoofing id is read from AFTER the exact-id prefix, and a longer word is still no status.
         $spoof = 'jRt attempts=3 tmp=removed x'
         Assert-True ((Get-SidecarTmpStatus "SIDECAR-WRITE-FAILED job=$spoof attempts=3 tmp_remaining=C:\p\q.tmp IOException: x" $spoof) -ceq 'tmp_remaining=' -and $null -eq (Get-SidecarTmpStatus "SIDECAR-WRITE-FAILED job=$spoof attempts=3 tmp=removedness IOException: x" $spoof)) "cleanup-identifier: the pure reader keys on the exact job id"
+        # r5 (sol r4 B1): the reader is handed an id that is only a PREFIX of the id the line was written with. The line is ambiguous (it also
+        # parses as the longer id, whose status is tmp_remaining=), so it is refused; identifier text is never classified as cleanup status.
+        $ambig = 'SIDECAR-WRITE-FAILED job=jRt attempts=3 tmp=removed x attempts=3 tmp_remaining=C:\fixture\retained.tmp IOException: x'
+        Assert-True ($null -eq (Get-SidecarTmpStatus $ambig 'jRt')) "cleanup-identifier: an ambiguous line read with the shorter id is refused, never classified from identifier text: [$(Get-SidecarTmpStatus $ambig 'jRt')]"
+        Assert-True ((Get-SidecarTmpStatus $ambig 'jRt attempts=3 tmp=removed x') -ceq 'tmp_remaining=') "cleanup-identifier: the same line read with the exact (longer) id is still tmp_remaining="
+        $rl = Invoke-SidecarCleanupProbe 'jRt attempts=3 tmp=removed x' 'io' $false @{ remove = $true; test = $false }
+        Assert-True ($null -eq (Get-SidecarTmpStatus $rl.msg 'jRt') -and (Get-SidecarTmpStatus $rl.msg 'jRt attempts=3 tmp=removed x') -ceq 'tmp_remaining=') "cleanup-identifier: the REAL retained-file line of the longer id is refused for the shorter id and read for the exact one: [$($rl.msg)]"
+        foreach ($amb in @(
+            @('SIDECAR-WRITE-FAILED job=jRt attempts=3 tmp=unknown(E) attempts=7 tmp_remaining=C:\p.tmp IOException: x', 'jRt'),
+            @('SIDECAR-WRITE-FAILED job=jRt attempts=3 tmp_remaining=C:\a.tmp attempts=3 tmp=removed IOException: x', 'jRt'))) {
+            Assert-True ($null -eq (Get-SidecarTmpStatus $amb[0] $amb[1])) "cleanup-identifier: a line that carries a second attempts=<n> <status> framing is refused: [$($amb[0])]"
+        }
         # adversary r4 A3: re-recording a different outcome on the same exception leaves no entry of the previous one.
         $dx = [InvalidOperationException]::new('x')
         Set-SidecarTmpData $dx 'old.tmp' @{ state = 'remaining'; error = $null }
@@ -2740,6 +2785,43 @@ function Exit-HeavySlot {
         Set-SidecarTmpData $dx 'new.tmp' @{ state = 'removed'; error = $null }
         Assert-True ($dx.Data['tmp_state'] -ceq 'removed' -and -not $dx.Data.Contains('tmp_remaining') -and -not $dx.Data.Contains('tmp_state_error')) "cleanup-identifier: a later 'removed' outcome carries no tmp_remaining / tmp_state_error from an earlier one"
         $results.livenessRenewHookWriteRetryCleanupIdentifier = [ordered]@{ ids = 3 }
+    }
+    # (state) sol r4 B2: Set-SidecarTmpData must record ONE scalar state from {removed, remaining, unknown}. An array, an empty array, $null, an
+    # unlisted word, or an unknown without a scalar error type is refused (typed ArgumentException) and records nothing; the writer's two call
+    # sites validate the outcome before using it, so a malformed one degrades to unknown(InvalidCleanupOutcome) and the primary failure still propagates.
+    if (Test-Case 'liveness-renew-hook-write-retry-cleanup-state') {
+        $bad = @(
+            @{ n = 'array of two'; v = @{ state = @('remaining', 'unknown'); error = 'E' } },
+            @{ n = 'empty array'; v = @{ state = @(); error = $null } },
+            @{ n = 'one-element array'; v = @{ state = @('removed'); error = $null } },
+            @{ n = 'null state'; v = @{ state = $null; error = $null } },
+            @{ n = 'unlisted word'; v = @{ state = 'gone'; error = $null } },
+            @{ n = 'wrong case'; v = @{ state = 'Removed'; error = $null } },
+            @{ n = 'unknown without an error'; v = @{ state = 'unknown'; error = $null } },
+            @{ n = 'unknown with an array error'; v = @{ state = 'unknown'; error = @('A', 'B') } },
+            @{ n = 'not a table'; v = 'remaining' },
+            @{ n = 'null outcome'; v = $null })
+        foreach ($b in $bad) {
+            $dx = [InvalidOperationException]::new('x'); $thrown = $null
+            try { Set-SidecarTmpData $dx 'p.tmp' $b.v } catch { $thrown = $_.Exception }
+            Assert-True ($null -ne $thrown -and $thrown -is [ArgumentException]) "cleanup-state: [$($b.n)] is refused with a typed ArgumentException, not recorded: thrown=[$(if ($null -ne $thrown) { $thrown.GetType().Name })] state=[$($dx.Data['tmp_state'])]"
+            Assert-True ($dx.Data.Count -eq 0) "cleanup-state: [$($b.n)] records nothing on the exception: keys=[$(@($dx.Data.Keys) -join ',')]"
+        }
+        foreach ($okv in @(@{ state = 'removed'; error = $null }, @{ state = 'remaining'; error = $null }, @{ state = 'unknown'; error = 'UnauthorizedAccessException' })) {
+            $dx = [InvalidOperationException]::new('x'); $thrown = $null
+            try { Set-SidecarTmpData $dx 'p.tmp' $okv } catch { $thrown = $_.Exception }
+            Assert-True ($null -eq $thrown -and $dx.Data['tmp_state'] -ceq $okv.state) "cleanup-state: the valid state [$($okv.state)] is still recorded: thrown=[$thrown]"
+        }
+        # The two call sites: a forged malformed outcome from the cleanup step (seam: CleanupFault.outcome) on the IOException and the non-IOException path.
+        foreach ($forged in @(@{ state = @('remaining', 'unknown'); error = 'E' }, @{ state = @(); error = $null })) {
+            $r = Invoke-SidecarCleanupProbe 'jRs' 'io' $false @{ outcome = $forged }
+            Assert-True ($null -ne $r.err -and $r.err.Exception -is [InvalidOperationException] -and $r.msg -like 'SIDECAR-WRITE-FAILED job=jRs attempts=3*' -and $r.moves -eq 3) "cleanup-state: IOException path with a malformed outcome still surfaces the typed failure: [$($r.msg)]"
+            Assert-True ($r.data['tmp_state'] -ceq 'unknown' -and $r.data['tmp_state_error'] -ceq 'InvalidCleanupOutcome' -and -not $r.data.ContainsKey('tmp_remaining') -and (Get-SidecarTmpStatus $r.msg 'jRs') -ceq 'tmp=unknown') "cleanup-state: IOException path degrades a malformed outcome to ONE unknown(InvalidCleanupOutcome), no contradictory fields: state=$($r.data['tmp_state']) error=$($r.data['tmp_state_error']) keys=[$($r.data.Keys -join ',')]"
+            $r = Invoke-SidecarCleanupProbe 'jRs' 'denied' $false @{ outcome = $forged }
+            Assert-True ($null -ne $r.err -and $r.err.Exception -is [UnauthorizedAccessException] -and $r.moves -eq 1) "cleanup-state: non-IOException path with a malformed outcome keeps the ORIGINAL exception: [$(if ($null -ne $r.err) { $r.err.Exception.GetType().Name })]"
+            Assert-True ($r.data['tmp_state'] -ceq 'unknown' -and $r.data['tmp_state_error'] -ceq 'InvalidCleanupOutcome' -and -not $r.data.ContainsKey('tmp_remaining')) "cleanup-state: non-IOException path degrades a malformed outcome to ONE unknown(InvalidCleanupOutcome): state=$($r.data['tmp_state']) error=$($r.data['tmp_state_error'])"
+        }
+        $results.livenessRenewHookWriteRetryCleanupState = [ordered]@{ refused = $bad.Count; callSites = 2 }
     }
     # (census) sol r3 B2: the probe's residue census must not pass silently when the enumeration fails or cannot see a hidden tmp.
     if (Test-Case 'liveness-renew-hook-write-retry-cleanup-census') {
