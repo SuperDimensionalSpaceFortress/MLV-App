@@ -1666,19 +1666,24 @@ void run_frame_to_device_rgb16_bayer16_post_wb_batched(
     /* HFR-NATIVE-M16-1457-GUI-TEXTURE-PRESENT-OFFLOAD-1 r3: the GUI present stream's H-Nyquist / pack / GL copy read
      * what these tiles wrote. The tile launch stays on its own non-blocking streams (it never used stream 0) and is
      * ORDERED BY AN EVENT: one record per tile stream this frame used, each waited on by the present stream, on the
-     * device. Only while the present stream is on (both null otherwise: no call). */
+     * device. Only while the present stream is on (both null otherwise: no call).
+     * The record / wait only CAPTURE their code (CK throws): every tile stream is drained first, and an ordering
+     * failure is raised after the drain loop, so no exit returns with tiles still writing the live buffers
+     * (adversary A1 on fe115de4). The first failure stops further records. */
+    cudaError_t presentOrderRc = cudaSuccess;
     if (presentStream && presentProducerDone)
     {
-        for (std::size_t slot = 0; slot < active; ++slot)
+        for (std::size_t slot = 0; slot < active && presentOrderRc == cudaSuccess; ++slot)
         {
-            CK(cudaEventRecord(presentProducerDone, streams[slot]));
-            CK(cudaStreamWaitEvent(presentStream, presentProducerDone, 0));
+            presentOrderRc = cudaEventRecord(presentProducerDone, streams[slot]);
+            if (presentOrderRc == cudaSuccess) presentOrderRc = cudaStreamWaitEvent(presentStream, presentProducerDone, 0);
         }
     }
     for (std::size_t slot = 0; slot < active; ++slot)
     {
         CK(IGPU_LT_SYNC_CALL("tiles:drain_sync", cudaStreamSynchronize(streams[slot])));
     }
+    CK(presentOrderRc);
 }
 
 void run_frame_to_device_rgb16_batched(const float * dRaw,

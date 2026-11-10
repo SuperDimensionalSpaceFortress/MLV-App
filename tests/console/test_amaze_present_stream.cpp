@@ -117,8 +117,9 @@ TEST(AmazePresentStream, TheTileLaunchIsOrderedByAnEventIntoThePresentStream)
 {
     const QString cu = amazeSource();
     const QString batch = functionBody(cu, QStringLiteral("void run_frame_to_device_rgb16_bayer16_post_wb_batched("));
-    const int record = batch.indexOf(QStringLiteral("CK(cudaEventRecord(presentProducerDone, streams[slot]));"));
-    const int wait = batch.indexOf(QStringLiteral("CK(cudaStreamWaitEvent(presentStream, presentProducerDone, 0));"));
+    const int record = batch.indexOf(QStringLiteral("presentOrderRc = cudaEventRecord(presentProducerDone, streams[slot]);"));
+    const int wait = batch.indexOf(QStringLiteral(
+        "if (presentOrderRc == cudaSuccess) presentOrderRc = cudaStreamWaitEvent(presentStream, presentProducerDone, 0);"));
     const int gate = batch.indexOf(QStringLiteral("if (presentStream && presentProducerDone)"));
     const int drain = batch.indexOf(QStringLiteral("CK(IGPU_LT_SYNC_CALL(\"tiles:drain_sync\", cudaStreamSynchronize(streams[slot])));"));
     ASSERT_TRUE(gate >= 0);
@@ -128,6 +129,28 @@ TEST(AmazePresentStream, TheTileLaunchIsOrderedByAnEventIntoThePresentStream)
     // The tile streams themselves stay non-blocking (they never used stream 0).
     ASSERT_TRUE(cu.contains(QStringLiteral("            &backend->liveTileStreams[static_cast<std::size_t>(index)],\n"
                                            "            cudaStreamNonBlocking));")));
+}
+
+TEST(AmazePresentStream, AnOrderingFailureStillDrainsEveryTileStreamBeforeItThrows)
+{
+    // Adversary A1 on fe115de4: CK throws, so a CK'd record/wait that failed before the tile drain returned with the
+    // tiles still writing the live buffers. The record/wait now only capture their code; every tile stream is drained;
+    // the code is raised after the drain loop. No CK on either call, and the first failure stops further records.
+    const QString cu = amazeSource();
+    const QString batch = functionBody(cu, QStringLiteral("void run_frame_to_device_rgb16_bayer16_post_wb_batched("));
+    ASSERT_FALSE(batch.contains(QStringLiteral("CK(cudaEventRecord(presentProducerDone")));
+    ASSERT_FALSE(batch.contains(QStringLiteral("CK(cudaStreamWaitEvent(presentStream")));
+    const int declared = batch.indexOf(QStringLiteral("cudaError_t presentOrderRc = cudaSuccess;"));
+    const int loop = batch.indexOf(QStringLiteral("for (std::size_t slot = 0; slot < active && presentOrderRc == cudaSuccess; ++slot)"));
+    const int drain = batch.indexOf(QStringLiteral("CK(IGPU_LT_SYNC_CALL(\"tiles:drain_sync\", cudaStreamSynchronize(streams[slot])));"));
+    const int raised = batch.indexOf(QStringLiteral("CK(presentOrderRc);"));
+    ASSERT_TRUE(declared >= 0);
+    ASSERT_TRUE(loop > declared);
+    ASSERT_TRUE(drain > loop);
+    ASSERT_TRUE(raised > drain);
+    ASSERT_EQ(1, (int)batch.count(QStringLiteral("CK(presentOrderRc);")));
+    // Between the ordering block and the drain loop nothing can throw: no CK at all.
+    ASSERT_FALSE(batch.mid(loop, drain - loop).contains(QStringLiteral("CK(")));
 }
 
 TEST(AmazePresentStream, BothLiveEntriesRunTheHandoffOnThePresentStream)
