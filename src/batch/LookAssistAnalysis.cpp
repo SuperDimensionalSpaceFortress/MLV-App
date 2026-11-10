@@ -2224,4 +2224,102 @@ LookAssistPreset presetForLookAssistScene( LookAssistScene scene,
     return preset;
 }
 
+// Moved verbatim from platform/qt/MainWindow.cpp (LOOK-ASSIST-GREEN-ARTIFACT-FALLBACK-AT-LIFTED-EXPOSURE-1).
+QString lookAssistColorCastWarning(
+        bool postColorStatsValid,
+        const LookAssistStats &postColorStats,
+        double postVisibleGreenAxis,
+        int finalTemperature,
+        double postBlueAmberAxis )
+{
+    if( postColorStatsValid )
+    {
+        if( postColorStats.greenArtifactRatio >= 0.10
+         && postColorStats.greenArtifactMeanAxis >= 25.0 )
+        {
+            return QStringLiteral("localized-green-artifact");
+        }
+        if( postVisibleGreenAxis >= 8.0 )
+        {
+            return QStringLiteral("global-green-cast");
+        }
+        if( postVisibleGreenAxis <= -8.0 )
+        {
+            return QStringLiteral("global-magenta-cast");
+        }
+        if( finalTemperature <= 5200 && postBlueAmberAxis >= 4.0 )
+        {
+            return QStringLiteral("cool-blue-cast");
+        }
+        if( finalTemperature >= 6800 && postBlueAmberAxis <= -4.0 )
+        {
+            return QStringLiteral("warm-amber-cast");
+        }
+    }
+    return QStringLiteral("none");
+}
+
+// Moved verbatim from platform/qt/MainWindow.cpp (LOOK-ASSIST-GREEN-ARTIFACT-FALLBACK-AT-LIFTED-EXPOSURE-1).
+bool lookAssistColorCastShouldFailClosed( const QString &warning,
+                                          double greenArtifactRatio,
+                                          double greenArtifactMeanAxis,
+                                          double visibleGreenAxis,
+                                          bool postAppliedStats )
+{
+    if( warning == QStringLiteral("rejected-unstable-floor-lifted") )
+    {
+        return true;
+    }
+    if( warning == QStringLiteral("processed-floor-lifted-awb-risk") )
+    {
+        return true;
+    }
+    if( warning == QStringLiteral("processed-floor-lifted-post-invalid") )
+    {
+        return true;
+    }
+    if( warning == QStringLiteral("global-green-cast")
+     || warning == QStringLiteral("global-magenta-cast") )
+    {
+        return postAppliedStats;
+    }
+    if( warning == QStringLiteral("localized-green-artifact") )
+    {
+        if( !postAppliedStats )
+        {
+            return false;
+        }
+        return visibleGreenAxis >= 14.0
+            || ( greenArtifactRatio >= 0.28 && greenArtifactMeanAxis >= 42.0 );
+    }
+    return false;
+}
+
+LookAssistSafetyAction lookAssistSafetyAction( const QString &warning,
+                                               double greenArtifactRatio,
+                                               double greenArtifactMeanAxis,
+                                               double visibleGreenAxis,
+                                               bool postAppliedStats,
+                                               int appliedExposure,
+                                               int baselineExposure,
+                                               double postNeutralGreenAxis )
+{
+    Q_UNUSED( appliedExposure );
+    Q_UNUSED( baselineExposure );
+    Q_UNUSED( postNeutralGreenAxis );
+    if( !lookAssistColorCastShouldFailClosed( warning, greenArtifactRatio, greenArtifactMeanAxis,
+                                              visibleGreenAxis, postAppliedStats ) )
+    {
+        return LookAssistSafetyAction::Keep;
+    }
+    return LookAssistSafetyAction::RevertBaseline;
+}
+
+QVector<int> lookAssistSafetyRetreatRungs( int appliedExposure, int baselineExposure )
+{
+    Q_UNUSED( appliedExposure );
+    Q_UNUSED( baselineExposure );
+    return QVector<int>();
+}
+
 } // namespace lookassist

@@ -2,6 +2,7 @@
 #define LOOKASSISTANALYSIS_H
 
 #include <QString>
+#include <QVector>
 
 #include <functional>
 #include <vector>
@@ -891,6 +892,44 @@ LookAssistPreset presetForLookAssistScene( LookAssistScene scene,
                                            const LookAssistStats *colorStats = nullptr,
                                            const LookAssistStats *displayStats = nullptr,
                                            LookAssistFlavor flavor = LookAssistFlavor::Classic );
+
+/* ---- The GUI's post-applied colour-cast safety (moved verbatim from platform/qt/MainWindow.cpp,
+ * LOOK-ASSIST-GREEN-ARTIFACT-FALLBACK-AT-LIFTED-EXPOSURE-1). ----
+ * The warning the post-applied picture carries ("none" when the stats are invalid). Every threshold is an absolute 8-bit
+ * code-value distance. */
+QString lookAssistColorCastWarning( bool postColorStatsValid,
+                                    const LookAssistStats &postColorStats,
+                                    double postVisibleGreenAxis,
+                                    int finalTemperature,
+                                    double postBlueAmberAxis );
+
+/* True when the warning must not be shown over the applied look. */
+bool lookAssistColorCastShouldFailClosed( const QString &warning,
+                                          double greenArtifactRatio,
+                                          double greenArtifactMeanAxis,
+                                          double visibleGreenAxis,
+                                          bool postAppliedStats );
+
+/* What the GUI's sync path does with a post-applied warning: keep the look, retreat only the exposure the analysis
+ * raised, or revert to the baseline sliders. postNeutralGreenAxis = balanceG - (balanceR + balanceB) / 2 of the same
+ * (failing) post-applied stats. */
+enum class LookAssistSafetyAction
+{
+    Keep,
+    RetreatExposure,
+    RevertBaseline
+};
+LookAssistSafetyAction lookAssistSafetyAction( const QString &warning,
+                                               double greenArtifactRatio,
+                                               double greenArtifactMeanAxis,
+                                               double visibleGreenAxis,
+                                               bool postAppliedStats,
+                                               int appliedExposure,
+                                               int baselineExposure,
+                                               double postNeutralGreenAxis );
+
+/* The exposures a RetreatExposure tries between the applied and the baseline exposure, highest first. */
+QVector<int> lookAssistSafetyRetreatRungs( int appliedExposure, int baselineExposure );
 
 } // namespace lookassist
 

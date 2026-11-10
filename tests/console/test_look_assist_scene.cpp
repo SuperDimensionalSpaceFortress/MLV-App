@@ -23,6 +23,7 @@
 #include <QString>
 #include <QStringList>
 #include <QTextStream>
+#include <QVector>
 
 #include <cmath>
 #include <cstdio>
@@ -3565,4 +3566,161 @@ TEST(LookAssistScene, ADisplayMedianOfOneIgnoresTheSceneTargetInArtificialLights
     ASSERT_TRUE( presetForLookAssistScene( LookAssistScene::BrightSun, raw, nullptr, nullptr ).exposure <= 0 );
     ASSERT_EQ( 178, presetForLookAssistScene( LookAssistScene::ArtificialLights, raw, nullptr, &meter ).exposure );
     ASSERT_EQ( 178, presetForLookAssistScene( LookAssistScene::BrightSun, raw, nullptr, &meter ).exposure );
+}
+// ---- LOOK-ASSIST-GREEN-ARTIFACT-FALLBACK-AT-LIFTED-EXPOSURE-1: the GUI's safety decision, moved into the shared TU. ----
+// Every number below is a logged look_assist.apply.post_balance value (dual-venue evidence on Bachelor CUDA):
+//   M16-1456 after  022e23bd:55  warning=localized-green-artifact balance 182/176/160 visible 15.936 ratio 0.264442 axis 45.833
+//   M16-1456 before f26387ad     warning=none balance 38/38/30 visible 5.646 ratio 0.029882 axis 31.326 (exposure 0)
+//   M16-1457 after  cef7b02c:56  warning=none balance 76/81/81 visible 2.847 ratio 0.090065 axis 40.170 (preset_exp 380)
+//   M16-1243 cin.   792bf56c:58  warning=localized-green-artifact balance 130/142/127 visible 7.103 ratio 0.115235 axis 57.443
+// postNeutralGreenAxis is balanceG - (balanceR + balanceB) / 2 of the same line.
+namespace
+{
+int safetyAction( const char *warning, double ratio, double axis, double visible, bool post,
+                  int applied, int baseline, double neutralGreenAxis )
+{
+    return static_cast<int>( lookAssistSafetyAction( QString::fromLatin1( warning ), ratio, axis, visible, post,
+                                                     applied, baseline, neutralGreenAxis ) );
+}
+const int kKeep = static_cast<int>( LookAssistSafetyAction::Keep );
+const int kRetreat = static_cast<int>( LookAssistSafetyAction::RetreatExposure );
+const int kRevert = static_cast<int>( LookAssistSafetyAction::RevertBaseline );
+}
+
+// (a) M16-1456 at #792's lifted exposure: a green warning over a neutral that stays neutral (green_axis 5.0) and an
+// exposure the analysis raised (0 -> 380). The exposure is retreated, not the whole look.
+TEST(LookAssistScene, SafetyRetreatsTheExposureOfM16_1456LiftedGreenArtifact)
+{
+    ASSERT_EQ( kRetreat, safetyAction( "localized-green-artifact", 0.264442, 45.833, 15.936, true, 380, 0,
+                                       176.0 - ( 182.0 + 160.0 ) * 0.5 ) );
+}
+
+// (a') The neutral gate's boundary (8.0 inclusive) and the global green cast, which takes the same retreat.
+TEST(LookAssistScene, SafetyRetreatNeutralGateIsEightInclusive)
+{
+    ASSERT_EQ( kRetreat, safetyAction( "localized-green-artifact", 0.264442, 45.833, 15.936, true, 380, 0, 8.0 ) );
+    ASSERT_EQ( kRevert, safetyAction( "localized-green-artifact", 0.264442, 45.833, 15.936, true, 380, 0, 8.001 ) );
+    ASSERT_EQ( kRetreat, safetyAction( "global-green-cast", 0.05, 20.0, 9.0, true, 380, 0, 5.0 ) );
+    ASSERT_EQ( kRevert, safetyAction( "global-green-cast", 0.05, 20.0, 9.0, true, 380, 0, 8.5 ) );
+}
+
+// (b) The rungs: half and a quarter of the excess over the baseline, descending, never the applied or the baseline
+// exposure and never twice the same value.
+TEST(LookAssistScene, SafetyRetreatRungsAreHalfThenQuarterOfTheExcess)
+{
+    const QVector<int> m1456 = lookAssistSafetyRetreatRungs( 380, 0 );
+    ASSERT_EQ( 2, m1456.size() );
+    ASSERT_EQ( 190, m1456.at( 0 ) );
+    ASSERT_EQ( 95, m1456.at( 1 ) );
+
+    const QVector<int> small = lookAssistSafetyRetreatRungs( 5, 0 );
+    ASSERT_EQ( 2, small.size() );
+    ASSERT_EQ( 2, small.at( 0 ) );
+    ASSERT_EQ( 1, small.at( 1 ) );
+
+    const QVector<int> two = lookAssistSafetyRetreatRungs( 2, 0 );   // 1 and 0: 0 is the baseline
+    ASSERT_EQ( 1, two.size() );
+    ASSERT_EQ( 1, two.at( 0 ) );
+
+    const QVector<int> offset = lookAssistSafetyRetreatRungs( 300, 100 );
+    ASSERT_EQ( 2, offset.size() );
+    ASSERT_EQ( 200, offset.at( 0 ) );
+    ASSERT_EQ( 150, offset.at( 1 ) );
+
+    ASSERT_EQ( 0, lookAssistSafetyRetreatRungs( 1, 0 ).size() );
+    ASSERT_EQ( 0, lookAssistSafetyRetreatRungs( 0, 0 ).size() );
+    ASSERT_EQ( 0, lookAssistSafetyRetreatRungs( 0, 380 ).size() );
+}
+
+// (c) M16-1456 before the lift (exposure 0): the same frame reads no warning, so the bottom rung of the retreat is clean.
+TEST(LookAssistScene, SafetyM16_1456AtBaselineExposureHasNoWarning)
+{
+    LookAssistStats s;
+    s.greenArtifactRatio = 0.029882;
+    s.greenArtifactMeanAxis = 31.326;
+    s.balanceR = 38.0;
+    s.balanceG = 38.0;
+    s.balanceB = 30.0;
+    ASSERT_TRUE( lookAssistColorCastWarning( true, s, 5.646, 5500, s.balanceB - s.balanceR ) == QStringLiteral("none") );
+}
+
+// (d) M16-1457 after #792: no warning, kept. (e) M16-1243 Cinematic: a localized green warning below the fail-closed
+// line, kept. Neither is touched by the retreat.
+TEST(LookAssistScene, SafetyKeepsM16_1457AndM16_1243Cinematic)
+{
+    ASSERT_EQ( kKeep, safetyAction( "none", 0.090065, 40.170, 2.847, true, 380, 0, 81.0 - ( 76.0 + 81.0 ) * 0.5 ) );
+    ASSERT_EQ( kKeep, safetyAction( "localized-green-artifact", 0.115235, 57.443, 7.103, true, 380, 0,
+                                    142.0 - ( 130.0 + 127.0 ) * 0.5 ) );
+}
+
+// (f) An M16-1243-shaped picture over the fail-closed line: its neutral leans green (13.5), so the green is not only
+// content. The neutral gate holds and the look reverts exactly as before.
+TEST(LookAssistScene, SafetyRevertsWhenTheNeutralItselfLeansGreen)
+{
+    ASSERT_EQ( kRevert, safetyAction( "localized-green-artifact", 0.115235, 57.443, 15.0, true, 380, 0, 13.5 ) );
+}
+
+// (g) Every other fail-closed warning reverts, whatever the exposure: the retreat is for green only.
+TEST(LookAssistScene, SafetyRevertsEveryNonGreenFailClosedWarning)
+{
+    const char *warnings[] = { "rejected-unstable-floor-lifted", "processed-floor-lifted-awb-risk",
+                               "processed-floor-lifted-post-invalid", "global-magenta-cast" };
+    for( const char *warning : warnings )
+    {
+        ASSERT_EQ( kRevert, safetyAction( warning, 0.0, 0.0, -9.0, true, 380, 0, 0.0 ) );
+    }
+}
+
+// (h) No retreat without a raised exposure or without post-applied stats.
+TEST(LookAssistScene, SafetyNeverRetreatsWithoutARaisedExposureOrPostStats)
+{
+    const char *warnings[] = { "localized-green-artifact", "global-green-cast" };
+    for( const char *warning : warnings )
+    {
+        ASSERT_EQ( kRevert, safetyAction( warning, 0.264442, 45.833, 15.936, true, 380, 380, 5.0 ) );
+        ASSERT_EQ( kRevert, safetyAction( warning, 0.264442, 45.833, 15.936, true, 0, 380, 5.0 ) );
+        ASSERT_NE( kRetreat, safetyAction( warning, 0.264442, 45.833, 15.936, false, 380, 0, 5.0 ) );
+        ASSERT_EQ( kKeep, safetyAction( warning, 0.264442, 45.833, 15.936, false, 380, 0, 5.0 ) );
+    }
+}
+
+// (i) The verbatim move: today's fail-closed truth table and warning ladder, pinned at their boundaries.
+TEST(LookAssistScene, SafetyColorCastShouldFailClosedTruthTable)
+{
+    const QString localized = QStringLiteral("localized-green-artifact");
+    ASSERT_TRUE( lookAssistColorCastShouldFailClosed( localized, 0.10, 25.0, 14.0, true ) );
+    ASSERT_FALSE( lookAssistColorCastShouldFailClosed( localized, 0.10, 25.0, 13.999, true ) );
+    ASSERT_TRUE( lookAssistColorCastShouldFailClosed( localized, 0.28, 42.0, 2.0, true ) );
+    ASSERT_FALSE( lookAssistColorCastShouldFailClosed( localized, 0.2799, 42.0, 2.0, true ) );
+    ASSERT_FALSE( lookAssistColorCastShouldFailClosed( localized, 0.28, 41.999, 2.0, true ) );
+    ASSERT_FALSE( lookAssistColorCastShouldFailClosed( localized, 0.5, 60.0, 20.0, false ) );
+    ASSERT_FALSE( lookAssistColorCastShouldFailClosed( localized, 0.264442, 45.833, 13.9, true ) );   // 0.264 < 0.28
+    ASSERT_TRUE( lookAssistColorCastShouldFailClosed( QStringLiteral("global-green-cast"), 0.0, 0.0, 8.0, true ) );
+    ASSERT_FALSE( lookAssistColorCastShouldFailClosed( QStringLiteral("global-green-cast"), 0.0, 0.0, 8.0, false ) );
+    ASSERT_TRUE( lookAssistColorCastShouldFailClosed( QStringLiteral("global-magenta-cast"), 0.0, 0.0, -8.0, true ) );
+    ASSERT_FALSE( lookAssistColorCastShouldFailClosed( QStringLiteral("global-magenta-cast"), 0.0, 0.0, -8.0, false ) );
+    ASSERT_TRUE( lookAssistColorCastShouldFailClosed( QStringLiteral("rejected-unstable-floor-lifted"), 0.0, 0.0, 0.0, false ) );
+    ASSERT_TRUE( lookAssistColorCastShouldFailClosed( QStringLiteral("processed-floor-lifted-awb-risk"), 0.0, 0.0, 0.0, false ) );
+    ASSERT_TRUE( lookAssistColorCastShouldFailClosed( QStringLiteral("processed-floor-lifted-post-invalid"), 0.0, 0.0, 0.0, false ) );
+    ASSERT_FALSE( lookAssistColorCastShouldFailClosed( QStringLiteral("cool-blue-cast"), 0.5, 60.0, 20.0, true ) );
+    ASSERT_FALSE( lookAssistColorCastShouldFailClosed( QStringLiteral("warm-amber-cast"), 0.5, 60.0, 20.0, true ) );
+    ASSERT_FALSE( lookAssistColorCastShouldFailClosed( QStringLiteral("none"), 0.5, 60.0, 20.0, true ) );
+}
+
+TEST(LookAssistScene, SafetyColorCastWarningLadder)
+{
+    LookAssistStats s;
+    s.greenArtifactRatio = 0.10;
+    s.greenArtifactMeanAxis = 25.0;
+    ASSERT_TRUE( lookAssistColorCastWarning( true, s, 0.0, 5500, 0.0 ) == QStringLiteral("localized-green-artifact") );
+    ASSERT_TRUE( lookAssistColorCastWarning( false, s, 20.0, 5500, 0.0 ) == QStringLiteral("none") );
+    s.greenArtifactMeanAxis = 24.999;
+    ASSERT_TRUE( lookAssistColorCastWarning( true, s, 0.0, 5500, 0.0 ) == QStringLiteral("none") );
+    ASSERT_TRUE( lookAssistColorCastWarning( true, s, 8.0, 5500, 0.0 ) == QStringLiteral("global-green-cast") );
+    ASSERT_TRUE( lookAssistColorCastWarning( true, s, 7.999, 5500, 0.0 ) == QStringLiteral("none") );
+    ASSERT_TRUE( lookAssistColorCastWarning( true, s, -8.0, 5500, 0.0 ) == QStringLiteral("global-magenta-cast") );
+    ASSERT_TRUE( lookAssistColorCastWarning( true, s, 0.0, 5200, 4.0 ) == QStringLiteral("cool-blue-cast") );
+    ASSERT_TRUE( lookAssistColorCastWarning( true, s, 0.0, 5201, 4.0 ) == QStringLiteral("none") );
+    ASSERT_TRUE( lookAssistColorCastWarning( true, s, 0.0, 6800, -4.0 ) == QStringLiteral("warm-amber-cast") );
+    ASSERT_TRUE( lookAssistColorCastWarning( true, s, 0.0, 6799, -4.0 ) == QStringLiteral("none") );
 }

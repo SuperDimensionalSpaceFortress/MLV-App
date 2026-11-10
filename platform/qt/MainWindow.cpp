@@ -1484,75 +1484,6 @@ static void logLookAssistDaylightRefine( const LookAssistWhiteBalanceResolution 
             .arg( wb.initialPatchFinalChroma, 0, 'f', 2 ) );
 }
 
-static QString lookAssistColorCastWarning(
-        bool postColorStatsValid,
-        const LookAssistStats &postColorStats,
-        double postVisibleGreenAxis,
-        int finalTemperature,
-        double postBlueAmberAxis )
-{
-    if( postColorStatsValid )
-    {
-        if( postColorStats.greenArtifactRatio >= 0.10
-         && postColorStats.greenArtifactMeanAxis >= 25.0 )
-        {
-            return QStringLiteral("localized-green-artifact");
-        }
-        if( postVisibleGreenAxis >= 8.0 )
-        {
-            return QStringLiteral("global-green-cast");
-        }
-        if( postVisibleGreenAxis <= -8.0 )
-        {
-            return QStringLiteral("global-magenta-cast");
-        }
-        if( finalTemperature <= 5200 && postBlueAmberAxis >= 4.0 )
-        {
-            return QStringLiteral("cool-blue-cast");
-        }
-        if( finalTemperature >= 6800 && postBlueAmberAxis <= -4.0 )
-        {
-            return QStringLiteral("warm-amber-cast");
-        }
-    }
-    return QStringLiteral("none");
-}
-
-static bool lookAssistColorCastShouldFailClosed( const QString &warning,
-                                                 double greenArtifactRatio,
-                                                 double greenArtifactMeanAxis,
-                                                 double visibleGreenAxis,
-                                                 bool postAppliedStats )
-{
-    if( warning == QStringLiteral("rejected-unstable-floor-lifted") )
-    {
-        return true;
-    }
-    if( warning == QStringLiteral("processed-floor-lifted-awb-risk") )
-    {
-        return true;
-    }
-    if( warning == QStringLiteral("processed-floor-lifted-post-invalid") )
-    {
-        return true;
-    }
-    if( warning == QStringLiteral("global-green-cast")
-     || warning == QStringLiteral("global-magenta-cast") )
-    {
-        return postAppliedStats;
-    }
-    if( warning == QStringLiteral("localized-green-artifact") )
-    {
-        if( !postAppliedStats )
-        {
-            return false;
-        }
-        return visibleGreenAxis >= 14.0
-            || ( greenArtifactRatio >= 0.28 && greenArtifactMeanAxis >= 42.0 );
-    }
-    return false;
-}
-
 static bool lookAssistProcessedFloorLiftedAutoWhiteBalanceShouldFailClosed(
         bool floorLifted,
         bool useProcessedColorStats,
@@ -19583,11 +19514,19 @@ void MainWindow::applyLookAssistToReceipt( ReceiptSettings *receipt,
             .arg( m_lastLookAssistChromaSmooth )
             .arg( bool01( m_lastLookAssistChromaSmoothAutoApplied ) ) );
 
-    if( lookAssistColorCastShouldFailClosed( m_lastLookAssistColorCastWarning,
-                                             m_lastLookAssistPostGreenArtifactRatio,
-                                             m_lastLookAssistPostGreenArtifactMeanAxis,
-                                             m_lastLookAssistPostVisibleGreenAxis,
-                                             m_lastLookAssistPostBalanceValid ) )
+    // The shared safety decision (LookAssistAnalysis). The neutral green axis is the failing post stats' own.
+    const LookAssistSafetyAction safetyAction = lookAssistSafetyAction(
+            m_lastLookAssistColorCastWarning,
+            m_lastLookAssistPostGreenArtifactRatio,
+            m_lastLookAssistPostGreenArtifactMeanAxis,
+            m_lastLookAssistPostVisibleGreenAxis,
+            m_lastLookAssistPostBalanceValid,
+            preset.exposure,
+            receipt->lookAssistBaselineValid() ? receipt->lookAssistBaselineExposure() : preset.exposure,
+            m_lastLookAssistPostBalanceValid
+                ? m_lastLookAssistPostBalanceG - ( ( m_lastLookAssistPostBalanceR + m_lastLookAssistPostBalanceB ) * 0.5 )
+                : 0.0 );
+    if( safetyAction == LookAssistSafetyAction::RevertBaseline )
     {
         const int safeChromaSmooth = m_lastLookAssistChromaSmooth;
         const bool safeChromaSmoothAuto = m_lastLookAssistChromaSmoothAutoApplied;
