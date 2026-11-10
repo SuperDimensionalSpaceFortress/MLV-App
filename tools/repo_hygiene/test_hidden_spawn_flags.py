@@ -365,6 +365,7 @@ def _formatted(node: ast.AST, consts: dict[str, str], depth: int) -> tuple[str, 
         return (text if text.startswith(_WILD) else _WILD + text) + ("" if text.endswith(_WILD) else _WILD), False
     if (known and _WILD not in text and isinstance(shown, ast.Call) and isinstance(shown.func, ast.Attribute) and shown.func.attr == "encode"
             and all(ord(c) < 256 for c in text)):
+        _measured(lambda chunk: repr(chunk.encode("latin-1")), text)  # `\xNN` for each byte: four characters for one (R11-L1)
         return repr(text.encode("latin-1")), True  # pass-29 A3: the bytes the fold holds one character per byte print as Python prints them, exactly
     if not any((isinstance(n, ast.Constant) and isinstance(n.value, bytes))
                or (isinstance(n, ast.Call) and ((isinstance(n.func, ast.Attribute) and n.func.attr == "encode")  # pass-29 A3: ``'..'.encode()`` is a bytes value too
@@ -524,8 +525,14 @@ def _fold_codec(node: ast.Call, text: str, known: bool, consts: dict[str, str], 
     if plan is not None and _WILD not in text:
         try:
             if node.func.attr == "decode":
+                if plan[1] == "backslashreplace":  # a byte the codec rejects is written `\xNN`: four characters for one, so the worst case is checked first (R11-L1)
+                    _check_size(4 * len(text))
                 return text.encode("latin-1").decode(*plan), known
+            if plan[1] in ("backslashreplace", "xmlcharrefreplace", "namereplace"):  # up to ten characters for one (`\U0010ffff`, `&#1114111;`), ninety for a `\N{...}` name
+                _measured(lambda chunk: chunk.encode(*plan), text)
             return text.encode(*plan).decode("latin-1"), known
+        except _FoldTooBig:
+            raise  # a RecursionError, which the clause below would read as "the call raises at run time"
         except Exception:  # the call raises at run time, or a text the other way round: not a result to read
             pass
     unknown = re.sub(r"[^\x00-\x7f]", _WILD, text)
@@ -575,9 +582,69 @@ class _FoldTooBig(RecursionError):
 
 def _flatten(node: ast.AST, consts: dict[str, str], depth: int = 0) -> tuple[str, bool]:
     result = _flatten_node(node, consts, depth)
-    if len(result[0]) > _FLATTEN_MAX_CHARS:
-        raise _FoldTooBig(len(result[0]))
+    _check_size(len(result[0]))
     return result
+
+
+# R11-L1. The check above runs AFTER a fold built its text, which is too late for a fold that can make a text far longer than its inputs in one step
+# (a ``replace`` of one character by 199,999, a ``join`` of many pieces, a template that uses one field many times, an escaping codec, a ``!r``). Every such
+# fold works out the length its result WOULD have and refuses with ``_check_size`` before it builds anything. A fold whose output is never longer than
+# its input (a slice, ``reversed``, ``strip``, ``chr``, a hedge that keeps a wildcard) needs none: its inputs were each checked by ``_flatten``.
+_MEASURE_CHUNK = 256
+
+
+def _check_size(length: int) -> None:
+    """Raise ``_FoldTooBig`` for a text of this length that has NOT been built (or has just been, by a fold that cannot grow past a small multiple)."""
+    if length > _FLATTEN_MAX_CHARS:
+        raise _FoldTooBig(length)
+
+
+def _joined(parts: list[str], sep: str = "") -> str:
+    """``sep.join(parts)`` refused before it builds anything: the pieces and the separators between them are added up first."""
+    _check_size(sum(map(len, parts)) + len(sep) * max(len(parts) - 1, 0))
+    return sep.join(parts)
+
+
+def _measured(shape, text: str) -> int:
+    """The length ``shape(text)`` would have, found one chunk of the text at a time so that only one chunk's result exists at once (a ``repr`` or an escaping
+    codec writes up to ninety characters for one). Refuses as soon as the running total passes the cap."""
+    total = 0
+    for at in range(0, len(text), _MEASURE_CHUNK):
+        total += len(shape(text[at:at + _MEASURE_CHUNK]))
+        _check_size(total)
+    return total
+
+
+def _replaced(text: str, old: str, new: str, count: int) -> str:
+    """``text.replace(old, new, count)`` refused before ``str.replace`` runs: the result is ``len(text) + n * (len(new) - len(old))`` characters, where ``n``
+    is how many places it replaces (``text.count(old)``, or ``len(text) + 1`` insertion points for an empty ``old``, and no more than ``count`` when it is >= 0)."""
+    places = len(text) + 1 if not old else text.count(old)
+    if count >= 0:
+        places = min(places, count)
+    _check_size(len(text) + places * (len(new) - len(old)))
+    return text.replace(old, new, count)
+
+
+def _mapped(method: str, text: str) -> str:
+    """``text.<method>()`` for a case mapper, ``title`` or ``capitalize``: a character may become up to three (``'ﬃ'.upper()`` is ``'FFI'``), so a long
+    text is measured a chunk at a time before it is mapped. ``strip`` and its kin never lengthen."""
+    if method not in ("strip", "lstrip", "rstrip") and 3 * len(text) > _FLATTEN_MAX_CHARS:
+        _measured(lambda chunk: getattr(chunk, method)(), text)
+    return getattr(text, method)()
+
+
+class _SizedOut(list):
+    """The pieces of a template being filled, with a running length: a piece that takes the total past the cap raises when it is added, before the pieces are
+    joined (and before a padded copy of one field is added a hundred times over)."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.size = 0
+
+    def append(self, piece: str) -> None:
+        self.size += len(piece)
+        _check_size(self.size)
+        super().append(piece)
 
 
 def _flatten_node(node: ast.AST, consts: dict[str, str], depth: int = 0) -> tuple[str, bool]:
@@ -617,7 +684,7 @@ def _flatten_node(node: ast.AST, consts: dict[str, str], depth: int = 0) -> tupl
                     parts.append((shown, True))
             else:
                 parts.append((_WILD, False))
-        return "".join(t for t, _ in parts), all(k for _, k in parts)
+        return _joined([t for t, _ in parts]), all(k for _, k in parts)
     if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
         leaves, todo = [], [node]  # iterative: a long chain must not exhaust the stack
         while todo:
@@ -628,7 +695,7 @@ def _flatten_node(node: ast.AST, consts: dict[str, str], depth: int = 0) -> tupl
             else:
                 leaves.append(cur)
         parts = [_flatten(leaf, consts, depth + 1) for leaf in leaves]
-        return "".join(t for t, _ in parts), all(k for _, k in parts)
+        return _joined([t for t, _ in parts]), all(k for _, k in parts)
     if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Mod):
         template, known = _flatten(node.left, consts, depth + 1)
         right = node.right
@@ -686,7 +753,7 @@ def _flatten_node(node: ast.AST, consts: dict[str, str], depth: int = 0) -> tupl
                 return _WILD, False
             if len(parts) <= 1:  # nothing to put a separator between: it contributes no characters, so its uncertainty must not leak
                 return (parts[0][0], parts[0][1]) if parts else ("", True)
-            return sep.join(t for t, _ in parts), sep_known and all(k for _, k in parts)
+            return _joined([t for t, _ in parts], sep), sep_known and all(k for _, k in parts)
         if method == "replace" and 2 <= len(node.args) + len(node.keywords) <= 3 and len(node.args) >= 2 and all(kw.arg == "count" for kw in node.keywords):
             text, known = _flatten(recv, consts, depth + 1)
             old, old_known = _flatten(node.args[0], consts, depth + 1)
@@ -698,23 +765,23 @@ def _flatten_node(node: ast.AST, consts: dict[str, str], depth: int = 0) -> tupl
                 count = (-1 if count < 0 or count > len(text) + 1 else count) if isinstance(count, int) else None  # str.replace takes a C ssize_t: more than the text holds is all
             if count is None or not (known and old_known and new_known):
                 return _hedge_texts([text, old, new]), False  # an unknown receiver (`S.replace(s, a, b)` through an alias of str) leaves its arguments as the text
-            return text.replace(old, new, count), True
+            return _replaced(text, old, new, count), True  # refused BEFORE str.replace builds anything (R11-L1)
         if method in _STRING_MAPPERS and not node.keywords and len(node.args) <= 1:
             text, known = _flatten(recv, consts, depth + 1)
             if method in _CASE_MAPPERS and not node.args:
                 text, known = _bytes_or_text(text, known)
-                return getattr(text, method)(), known  # per character: a wildcard stays one
+                return _mapped(method, text), known  # per character: a wildcard stays one
             chars, chars_known = _flatten(node.args[0], consts, depth + 1) if node.args else (None, True)
             if not (known and chars_known):
                 return _hedge_texts([text, chars or ""]), False  # `S.lower('SUBPROCESS_EXEC')` with S an alias of str: the receiver reads as nothing, the argument is the text
             if chars is not None:
                 return (getattr(text, method)(chars), True) if method in ("strip", "lstrip", "rstrip") else (_hedge_texts([text, chars]), False)
             text, known = _bytes_or_text(text, True)  # the default strip takes the whitespace of a str: more than the whitespace of bytes
-            return getattr(text, method)(), known
+            return _mapped(method, text), known
     if isinstance(node, (ast.List, ast.Tuple, ast.Set)) and not any(isinstance(e, ast.Starred) for e in node.elts):
-        return "".join(_flatten(e, consts, depth + 1)[0] for e in node.elts), False  # a list of texts read as the texts side by side (read only as an argument of a call the fold has no arm for)
+        return _joined([_flatten(e, consts, depth + 1)[0] for e in node.elts]), False  # a list of texts read as the texts side by side (read only as an argument of a call the fold has no arm for)
     if isinstance(node, ast.Dict) and all(k is not None for k in node.keys):
-        return "".join(_flatten(e, consts, depth + 1)[0] for pair in zip(node.keys, node.values) for e in pair), False  # a mapping: its keys and values side by side
+        return _joined([_flatten(e, consts, depth + 1)[0] for pair in zip(node.keys, node.values) for e in pair]), False  # a mapping: its keys and values side by side
     if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr in ("decode", "encode"):
         text, known = _flatten(node.func.value, consts, depth + 1)  # bytes are read one character per byte (latin-1), so a slice of them cuts where Python cuts
         return _fold_codec(node, text, known, consts, depth)
@@ -752,14 +819,14 @@ def _hedge_texts(texts: list[str]) -> str:
         return _WILD
     # What the call returns may be any one of its texts, OR the texts put together in either order or read backwards (an aliased ``op.concat(a, b)``,
     # ``fmt(a, b)``, ``rv(s)``): each piece alone is hedged, and so is the whole joined both ways and reversed (pass-22 A3).
-    joined = "".join(texts)
+    joined = _joined(texts)  # refused past the cap before it is built (R11-L1); the reversed copies are the same length
     variants = [*texts, joined, "".join(reversed(texts)), joined[::-1]]
     if len(texts) >= 2:  # a function that fills a template (``fmt('%sexec', 'subprocess_')``): the first or the last text filled with the others
         for at in (0, len(texts) - 1):
             rest = [(t, True) for i, t in enumerate(texts) if i != at]
             variants.append(_fill_percent(texts[at], rest, {}, True)[0])
             variants.append(_fill_format(texts[at], rest, {}, True)[0])
-    return "".join(dict.fromkeys(_hedge(v) for v in variants))
+    return _joined(list(dict.fromkeys(_hedge(v) for v in variants)))  # the launch reading keeps the tail of each variant: up to one text per variant
 
 
 def _int_literal(node: ast.AST | None) -> int | None | str:
@@ -774,10 +841,10 @@ def _int_literal(node: ast.AST | None) -> int | None | str:
 
 def _apply_spec(text: str, conv: str | None, spec: str | None) -> str | None:
     """``format(text, spec)`` after a ``!r`` / ``!a`` conversion, or None when the spec cannot be applied safely or is not valid for a string."""
-    if conv == "r":
-        text = repr(text)
-    elif conv == "a":
-        text = ascii(text)
+    if conv in ("r", "a"):  # a character may be written as `\U0010ffff` (ten characters): the result is measured a chunk at a time before it is built (R11-L1)
+        convert = repr if conv == "r" else ascii
+        _measured(convert, text)
+        text = convert(text)
     if not spec:
         return text
     if _spec_too_big(re.findall(r"\d+", spec)):  # Python reads any Unicode decimal digit as a width
@@ -830,7 +897,7 @@ def _fill_unknown_template(template: str, percent: bool) -> tuple[str, bool]:
                 lead = _WILD + fill(seg, [], {}, False, any_pos=True, any_named=True)[0] + _WILD
                 seg = trimmed
         out.append(lead + fill(seg, [], {}, False, any_pos=True, any_named=True)[0])
-    return _WILD.join(out), False
+    return _joined(out, _WILD), False
 
 
 def _fill_format(template: str, positional: list[tuple[str, bool]], named: dict[str, tuple[str, bool]], known: bool,
@@ -839,7 +906,7 @@ def _fill_format(template: str, positional: list[tuple[str, bool]], named: dict[
     accessor it does not apply) is the wildcard, never a wrong known text; with ``**`` in play no keyword is trusted."""
     if _WILD in template:
         return _fill_unknown_template(template, False)
-    out: list[str] = []
+    out = _SizedOut()  # a running length: a piece that takes it past the cap raises before the pieces are joined (R11-L1)
     ok = known
     auto, i, n = 0, 0, len(template)
     while i < n:
@@ -910,7 +977,7 @@ def _fill_percent(template: str, positional: list[tuple[str, bool]], named: dict
     ``%s`` of a known text) is the wildcard, never a wrong known text; with ``**`` or a run-time right operand no argument is trusted."""
     if _WILD in template:
         return _fill_unknown_template(template, True)
-    out: list[str] = []
+    out = _SizedOut()  # (R11-L1)
     ok = known
     nxt, lost, pos = 0, False, 0
     while True:
@@ -4788,6 +4855,116 @@ class AdversaryR9Tests(unittest.TestCase):
             source = "def unused():\n    return 'x'" + chain * 48 + "\n"
             self.assertGreaterEqual(len(self._bad(source)), 1, chain)
             self.assertEqual(_start_process_violations(source)[0], 1, chain)
+
+    # ---- r12: Dot R11-L1 -- a fold that can grow its text in ONE step is bounded BEFORE it allocates (the cap was only checked after the fact) ----
+    # No test here builds a large result: the cap is patched down to a few dozen characters, or (at the real cap) only the PROJECTION is computed and refused.
+    class _SpyStr(str):
+        """A str whose ``replace`` / ``join`` record that they ran: bound to a name in ``consts`` it is the receiver the fold works on, with no seam in the fold."""
+        def __new__(cls, value, calls):
+            obj = super().__new__(cls, value)
+            obj.calls = calls
+            return obj
+
+        def replace(self, *args):
+            self.calls.append("replace")
+            return super().replace(*args)
+
+        def join(self, parts):
+            self.calls.append("join")
+            return super().join(parts)
+
+    def _spied(self, expr: str, cap: int | None = None, **names: str):
+        """(outcome, calls): the fold of ``expr`` with each name bound to a spying str, under a patched cap. outcome is the (text, known) or the _FoldTooBig."""
+        calls: list[str] = []
+        consts = {name: self._SpyStr(value, calls) for name, value in names.items()}
+        with mock.patch.dict(globals(), {"_FLATTEN_MAX_CHARS": cap} if cap is not None else {}):
+            try:
+                outcome = _flatten(ast.parse(expr, mode="eval").body, consts)
+            except _FoldTooBig as exc:
+                outcome = exc
+        return outcome, calls
+
+    def test_r11_l1_replace_refuses_a_one_step_expansion_before_str_replace_runs(self):
+        for expr in ("R.replace('a', 'bbb')",          # 30 + 30*2 = 90
+                     "R.replace('', 'xx')",            # an empty old matches at len+1 points: 30 + 31*2 = 92
+                     "R.replace('a', 'bbb', 40)",      # a count past the text is all of them
+                     "R.replace('a', 'bbb', count=-1)",
+                     "R.replace('a', 'bbbb', 25)"):    # 30 + 25*3 = 105
+            outcome, calls = self._spied(expr, 64, R="a" * 30)
+            self.assertIsInstance(outcome, _FoldTooBig, expr)
+            self.assertEqual(calls, [], expr)  # str.replace never ran: nothing was allocated
+
+    def test_r11_l1_replace_allows_what_fits_and_what_shrinks(self):
+        for expr, expected in (("R.replace('a', 'bb')", "bb" * 32),          # exactly the cap: 64
+                               ("R.replace('a', 'bbb', 9)", "bbb" * 9 + "a" * 23),  # count caps the growth: 32 + 9*2 = 50
+                               ("R.replace('a', '')", ""),
+                               ("R.replace('a', 'b')", "b" * 32),
+                               ("R.replace('zz', 'yyyyyyyy')", "a" * 32),     # nothing to replace: 0 growth
+                               ("R.replace('a', 'bbb', 0)", "a" * 32)):
+            outcome, calls = self._spied(expr, 64, R="a" * 32)
+            self.assertEqual(outcome, (expected, True), expr)
+            self.assertEqual(calls, ["replace"], expr)
+        outcome, _ = self._spied("R.replace('a', 'bb')", 64, R="a" * 33)  # one past the cap: 66
+        self.assertIsInstance(outcome, _FoldTooBig)
+
+    def test_r11_l1_replace_projection_at_the_real_cap_is_analytic(self):
+        cap = _FLATTEN_MAX_CHARS
+        self.assertEqual(cap, 200_000)  # the rows below are written for this cap
+        for expr, receiver in (("R.replace('a', 'x' + 'xx')", "a" * 199_999),            # 199,999 * 3
+                               ("R.replace('ab', 'xxxxx')", "ab" * 99_999),               # 199,998 + 99,999 * 3
+                               ("R.replace('', 'xx')", "a" * 100_000)):                   # 100,000 + 100,001 * 2
+            outcome, calls = self._spied(expr, None, R=receiver)
+            self.assertIsInstance(outcome, _FoldTooBig, expr)
+            self.assertEqual(calls, [], expr)  # the 600,000-character result was never built
+        outcome, calls = self._spied("R.replace('a', 'x')", None, R="a" * 199_999)  # the projection fits (199,999): it runs
+        self.assertEqual((outcome, calls), (("x" * 199_999, True), ["replace"]))
+
+    def test_r11_l1_join_refuses_before_str_join_runs(self):
+        piece = repr("a" * 30)
+        outcome, calls = self._spied(f"S.join([{piece}, {piece}])", 64, S="-" * 10)  # 60 + 10
+        self.assertIsInstance(outcome, _FoldTooBig)
+        self.assertEqual(calls, [])
+        outcome, calls = self._spied(f"S.join([{piece}, {piece}, {piece}])", 64, S="")  # 90 with no separator at all
+        self.assertIsInstance(outcome, _FoldTooBig)
+        self.assertEqual(calls, [])
+        outcome, calls = self._spied(f"S.join([{piece}, {piece}])", 64, S="-" * 4)  # 64: exactly the cap
+        self.assertEqual((outcome, calls), (("a" * 30 + "----" + "a" * 30, True), ["join"]))
+
+    def test_r11_l1_templates_and_codecs_and_conversions_are_bounded_where_they_build(self):
+        with mock.patch.dict(globals(), {"_FLATTEN_MAX_CHARS": 64}):
+            thirty = ("a" * 30, True)
+            with self.assertRaises(_FoldTooBig):  # one named field used three times: 90
+                _fill_percent("%(x)s%(x)s%(x)s", [], {"x": thirty}, True)
+            with self.assertRaises(_FoldTooBig):
+                _fill_format("{0}{0}{0}", [thirty], {}, True)
+            with self.assertRaises(_FoldTooBig):  # the padded copies of ONE field (width 40) add up before the join
+                _fill_percent("%40s%40s", [thirty, thirty], {}, True)
+            self.assertEqual(_fill_percent("%s%s", [thirty, thirty], {}, True), ("a" * 60, True))  # 60 fits
+            self.assertEqual(_fill_format("{}{}", [thirty, thirty], {}, True), ("a" * 60, True))
+            with self.assertRaises(_FoldTooBig):  # `!r` writes a four-to-ten-character escape for each character of 8 of them
+                _apply_spec("\U0010ffff" * 8, "r", None)
+            with self.assertRaises(_FoldTooBig):
+                _apply_spec("\U0010ffff" * 8, "a", None)
+            self.assertEqual(_apply_spec("abc", "r", None), "'abc'")
+            for errors in ("backslashreplace", "xmlcharrefreplace"):  # ten characters out for each one in, and `namereplace` up to ninety
+                call = ast.parse(f"x.encode('ascii', '{errors}')", mode="eval").body
+                with self.assertRaises(_FoldTooBig, msg=errors):
+                    _fold_codec(call, "\U0010ffff" * 8, True, {}, 0)
+            call = ast.parse("x.decode('ascii', 'backslashreplace')", mode="eval").body  # a byte out of range becomes `\xNN`: four characters
+            with self.assertRaises(_FoldTooBig):
+                _fold_codec(call, "\xff" * 17, True, {}, 0)
+            self.assertEqual(_fold_codec(ast.parse("x.encode('ascii', 'backslashreplace')", mode="eval").body, "ab\xe9", True, {}, 0), ("ab\\xe9", True))
+            with self.assertRaises(_FoldTooBig):  # the hedge puts the texts side by side, and again backwards
+                _hedge_texts(["a" * 40, "b" * 40])
+            self.assertEqual(_hedge_texts(["a" * 20, "b" * 20]), _WILD)
+
+    def test_r11_l1_a_one_step_growth_in_an_unused_function_is_reported_not_allocated(self):
+        with mock.patch.dict(globals(), {"_FLATTEN_MAX_CHARS": 64}):
+            for tail in (".replace('a', 'bbb')", ".replace('', 'xx')"):
+                source = "def unused():\n    return " + repr("a" * 30) + tail + "\n"
+                self.assertGreaterEqual(len(self._bad(source)), 1, tail)
+                self.assertEqual(_start_process_violations(source)[0], 1, tail)
+            self.assertEqual(self._bad("def unused():\n    return " + repr("a" * 30) + ".replace('a', 'b')\n"), [])
 
 
 if __name__ == "__main__":
