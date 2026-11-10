@@ -772,8 +772,8 @@ class PresentMonStatusFixtureTests(_ReportCase):
             "playback_smoke.gpu_window_swaps session=1 window_active=1 telemetry_enabled=1 "
             f"swaps={swaps} swap_fps=1.0 max_gap_ms=1.0 max_gap_before_serial=1 "
             f"max_gap_after_serial=2 frames_presented={swaps} swaps_minus_frames_presented=0 "
-            "head_gap_ms=1.0 tail_gap_ms=1.0 first_swap_utc=2026-01-01T00:00:02.0000000Z "
-            "last_swap_utc=2026-01-01T00:00:42.0000000Z"
+            "head_gap_ms=1.0 tail_gap_ms=1.0 first_swap_utc=2026-01-01T00:00:02.000Z "
+            "last_swap_utc=2026-01-01T00:00:42.000Z"
         )
 
     @staticmethod
