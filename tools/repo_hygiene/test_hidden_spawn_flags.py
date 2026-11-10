@@ -343,6 +343,9 @@ def _fold_args(args: list[ast.AST], keywords: list[ast.keyword], consts: dict[st
     return positional, named, any_pos, any_named
 
 
+_CONTAINER_BUILDERS = frozenset({"list", "tuple", "set", "frozenset", "dict", "sorted", "reversed", "enumerate", "zip", "map", "filter", "iter"})
+
+
 def _padded(text: str) -> str:
     """The text an unknown text may print as through a conversion (``!r``, ``%a``) or a spec: its literal characters with anything around them."""
     core = text.strip(_WILD)
@@ -354,6 +357,12 @@ def _formatted(node: ast.AST, consts: dict[str, str], depth: int) -> tuple[str, 
     (``b'abc'``), not its characters, and the fold does not track which values are bytes: an expression that holds a bytes literal (and does not
     decode it back to a text) reads as its text with anything around it (pass-26 A1)."""
     text, known = _flatten(node, consts, depth + 1)
+    shown = _bound_form(node, consts)
+    if (isinstance(shown, (ast.List, ast.Tuple, ast.Set, ast.Dict, ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp))
+            or (isinstance(shown, ast.Call) and isinstance(shown.func, ast.Name) and shown.func.id in _CONTAINER_BUILDERS)
+            or (isinstance(shown, ast.Subscript) and isinstance(shown.slice, ast.Slice) and isinstance(_bound_form(shown.value, consts), (ast.List, ast.Tuple)))):
+        # pass-28 A5: printing a container shows its repr (``['abc']``): the brackets, the quotes and the commas are text the fold does not carry
+        return (text if text.startswith(_WILD) else _WILD + text) + ("" if text.endswith(_WILD) else _WILD), False
     if not any(isinstance(n, ast.Constant) and isinstance(n.value, bytes) for n in ast.walk(node)):
         return text, known
     if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr == "decode":
@@ -387,7 +396,11 @@ _CODEC_ALIASES: set[str] = set()  # names the file being scanned binds to the co
 _CODEC_FUNCS: dict[str, str] = {}  # names the file binds to codecs.decode / codecs.encode (`from codecs import decode as d`), to the method they stand for
 
 
+_TEXT_BASE_MEMO: dict[tuple[int, int], tuple[ast.AST, dict[str, str], bool]] = {}  # per scan: (id(node), id(consts)) -> (node, consts, answer); cleared by _note_aliases
+
+
 def _note_aliases(tree: ast.AST) -> None:
+    _TEXT_BASE_MEMO.clear()
     _STR_ALIASES.clear()
     _CODEC_ALIASES.clear()
     _CODEC_FUNCS.clear()
@@ -430,10 +443,12 @@ def _bound_form(node: ast.AST, consts: dict[str, str]) -> ast.AST:
         return ast.BinOp(left=node.args[0], op=_OPERATOR_BINOPS[node.func.id](), right=node.args[1])
     if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id in _CODEC_FUNCS and node.args and not isinstance(node.args[0], ast.Starred):
         return ast.Call(func=ast.Attribute(value=node.args[0], attr=_CODEC_FUNCS[node.func.id], ctx=ast.Load()), args=node.args[1:], keywords=node.keywords)
-    if (isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id in ("str", "bytes") and node.args and not isinstance(node.args[0], ast.Starred)
+    if (isinstance(node, ast.Call) and _type_like(node.func) and node.args and not isinstance(node.args[0], ast.Starred)
             and (len(node.args) > 1 or any(k.arg in ("encoding", "errors") for k in node.keywords))):
-        # R9-F1: ``str(b, 'ascii', 'ignore')`` is ``b.decode('ascii', 'ignore')`` and ``bytes(s, 'ascii', 'ignore')`` is ``s.encode(...)``
-        return ast.Call(func=ast.Attribute(value=node.args[0], attr="decode" if node.func.id == "str" else "encode", ctx=ast.Load()), args=node.args[1:], keywords=node.keywords)
+        # R9-F1: ``str(b, 'ascii', 'ignore')`` is ``b.decode('ascii', 'ignore')`` and ``bytes(s, 'ascii', 'ignore')`` is ``s.encode(...)``; pass-28 A1: the type under any
+        # name (``builtins.str``, ``S = str``, ``type('')``, ``''.__class__``) is the same call. A type that is not plainly ``bytes`` is read as ``str`` (``decode``).
+        name = node.func.id if isinstance(node.func, ast.Name) else node.func.attr if isinstance(node.func, ast.Attribute) else ""
+        return ast.Call(func=ast.Attribute(value=node.args[0], attr="encode" if name == "bytes" else "decode", ctx=ast.Load()), args=node.args[1:], keywords=node.keywords)
     if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)):
         return node
     attr, recv = node.func.attr, node.func.value
@@ -1719,6 +1734,12 @@ _PS_CHAR_MAP = str.maketrans({"‘": "'", "’": "'", "‚": "'", "‛": "'", "�
                               "–": "-", "—": "-", "―": "-", " ": " ", "\u0085": " "})
 
 
+def _ps_text(text: str) -> str:
+    """The text as PowerShell's tokenizer reads its characters: typographic quotes and dashes are ASCII, and a line ends at CR, LF or CRLF alike (pass-28 A2:
+    a comment ends at a bare CR, which the readers below, that look for LF, did not know). Every reader of a script starts from this."""
+    return re.sub(r"\r\n?", "\n", text.translate(_PS_CHAR_MAP))
+
+
 def _ps_comment_at(text: str, i: int) -> bool:
     """Does a PowerShell ``#`` comment start at ``text[i]``? It does wherever a new token can begin: after white space, a quote that closes a string, a
     bracket, a separator or an operator (``'/c'# -WindowStyle Hidden``, ``(1)# note``), and not inside a bare word (``a#b``). The one predicate the three
@@ -1849,6 +1870,10 @@ def _unescape_ps(script: str) -> str:
                 out.append("\x02")  # an escaped `#` (or the `<` of an escaped `<#`) is a plain character of its word: unescaped it would open a comment that eats the rest (pass-26 A2)
                 i += 2
                 continue
+            if nxt == "`":
+                out.append("\x02")  # an escaped backtick is a plain character of its word: left as one backtick it would join with a newline after it into a line continuation (pass-28 A3)
+                i += 2
+                continue
             if quote[i] == '"' and nxt in _PS_ESCAPE_LETTERS:
                 out.append(ch)
             out.append(nxt)
@@ -1908,7 +1933,7 @@ def _might_launch(text: str, nested_value: bool = True) -> bool:
     command parameter that parses it (``Write-Host 'Start-Proce`ss'``) is text, so its backtick stays a plain character there (``nested_value`` False)."""
     if not nested_value:
         return bool(_START_PROCESS_RE.search(text))
-    text = text.translate(_PS_CHAR_MAP)
+    text = _ps_text(text)
     readings = (text, _unescape_ps(text), _dq_value(text)) if "`" in text else (text,)
     return any(_START_PROCESS_RE.search(r) or _QUOTED_LAUNCH_RE.search(r) for r in (*readings, *(_unsplice(r) for r in readings)))
 
@@ -1920,7 +1945,7 @@ def _judge_script(script: str) -> tuple[int, int]:
     starting a word (``foo-WindowStyle:Hidden`` and ``(Get-ChildArgs -WindowStyle Hidden)`` do not count).
     """
     found = bad = 0
-    for statement in _ps_statements(_unsplice(_unescape_ps(script.translate(_PS_CHAR_MAP)))):
+    for statement in _ps_statements(_unsplice(_unescape_ps(_ps_text(script)))):
         spans = _quoted_spans(statement)
         quoted = [False] * len(statement)
         for s, e in spans:
@@ -1973,7 +1998,15 @@ _ARGUMENT_FOLDS = frozenset({"format", "format_map", "join", "replace", "__mod__
 
 def _text_base(node: ast.AST, consts: dict[str, str]) -> bool:
     """True when the chain of method calls and subscripts under ``node`` ends in a text ``_flatten`` reads (a string literal, a built string,
-    a name bound once to a string)."""
+    a name bound once to a string).
+
+    Memoised per scan (pass-28 A4): ``_bound_form`` asks ``_text_base`` of the receiver and this loop then walks the same receiver again, so an
+    unmemoised chain of n calls cost 2**n. The entry keeps the node alive, so its ``id`` cannot be reused by a node ``_bound_form`` builds later."""
+    key = (id(node), id(consts))
+    hit = _TEXT_BASE_MEMO.get(key)
+    if hit is not None:
+        return hit[2]
+    start = node
     while True:
         node = _bound_form(node, consts)
         if isinstance(node, ast.Subscript):
@@ -1982,8 +2015,10 @@ def _text_base(node: ast.AST, consts: dict[str, str]) -> bool:
             node = node.func.value
         else:
             break
-    return (isinstance(node, ast.Constant) and isinstance(node.value, (str, bytes))) or isinstance(node, (ast.JoinedStr, ast.BinOp)) or (
+    result = (isinstance(node, ast.Constant) and isinstance(node.value, (str, bytes))) or isinstance(node, (ast.JoinedStr, ast.BinOp)) or (
         isinstance(node, ast.Name) and node.id in consts)
+    _TEXT_BASE_MEMO[key] = (start, consts, result)
+    return result
 
 
 def _folds(node: ast.AST, consts: dict[str, str]) -> bool:
@@ -2084,7 +2119,7 @@ def _start_process_violations(py_source: str) -> tuple[int, list[int]]:
             found += 1
             bad.append(lineno)
             continue
-        text = text.translate(_PS_CHAR_MAP)  # typographic quotes and dashes are the ASCII ones to PowerShell
+        text = _ps_text(text)  # typographic quotes and dashes are the ASCII ones to PowerShell
         # a backtick-escaped name (bareword) or a `n boundary (double quotes) must not hide the launch from the filter; every reading is unspliced AFTER it is
         # unescaped (the order _judge_script uses), because a backtick is not in a spliced word's class: St`art-Pro'cess' is Start-Process (G17)
         if not _might_launch(text):
@@ -4632,6 +4667,69 @@ class AdversaryR9Tests(unittest.TestCase):
         self.assertEqual(self._bad(self._launch("'SUBPROCESS_EXEC'.lower().strip().lower()")) != [], True)
         self.assertEqual(self._bad(self._launch("'value'.lower().strip()")), [])
         self.assertEqual(_start_process_violations("value = 'x'.strip()\n"), (0, []))
+
+    # ---- pass 28 (review-adversary-MLV-LANE-CONSOLE-HIDDEN-1-r11-bddda880) ----
+    def test_pass28_a1_a_qualified_or_aliased_str_bytes_constructor_with_a_codec_reads_as_the_decode(self):
+        pre = "import builtins\nfrom builtins import str as T\nS = str\n"
+        rows = ["builtins.str(b'subprocess_ex', 'ascii') + 'ec'", "T(b'subprocess_ex', 'ascii') + 'ec'", "S(b'subprocess_ex', 'ascii') + 'ec'",
+                "type('')(b'subprocess_ex', 'ascii') + 'ec'", "''.__class__(b'subprocess_ex', 'ascii') + 'ec'", "builtins.str(b'subprocess_ex', encoding='ascii') + 'ec'",
+                "builtins.bytes('subprocess_ex', 'ascii').decode() + 'ec'", "builtins.str(b'subprocess_exec', 'ascii')"]
+        for expr in rows:
+            self.assertGreaterEqual(len(self._bad(pre + self._launch(expr))), 1, expr)
+        for script in ("builtins.str(b'Start-Process cmd.exe', 'ascii')", "type('')(b'saps cmd.exe', 'ascii')", "''.__class__(b'Start-Process cmd.exe', encoding='ascii')"):
+            self.assertEqual(self._ps(script)[0], 1, script)
+            self.assertEqual(self._ps(script)[1], 1, script)
+        self.assertEqual(self._bad(pre + self._launch("builtins.str(b'value', 'ascii') + 'ec'")), [])
+
+    def test_pass28_a2_a_bare_cr_or_unicode_newline_ends_a_powershell_comment(self):
+        for newline in ("\r",):  # checked against Parser.ParseInput: U+0085 / U+2028 / U+2029 do NOT end a comment, only CR, LF and CRLF do
+            for launch in ("Start-Process cmd.exe", "saps cmd.exe", "start cmd.exe"):
+                script = f"Write-Host x # comment{newline}{launch}"
+                self.assertEqual(_judge_script(script), (1, 1), (newline, launch))
+                self.assertEqual(self._ps(repr(script)), (1, 1), (newline, launch))
+            script = f"Write-Host x # comment{newline}Start-Process cmd.exe -WindowStyle Hidden"
+            self.assertEqual(_judge_script(script), (1, 0), newline)
+        for script in ("Write-Host x # comment\nStart-Process cmd.exe", "Write-Host x # comment\r\nStart-Process cmd.exe"):
+            self.assertEqual(_judge_script(script), (1, 1), script)
+        self.assertEqual(_judge_script("Write-Host x # Start-Process cmd.exe"), (0, 0))
+
+    def test_pass28_a3_an_escaped_backtick_before_a_newline_does_not_join_two_commands(self):
+        for ticks in ("``", "````", "``````"):
+            for newline in ("\n", "\r\n", "\r"):
+                for launch in ("Start-Process", "saps", "start"):
+                    script = f"{launch} cmd.exe {ticks}{newline}Write-Host x -WindowStyle Hidden"
+                    self.assertEqual(_judge_script(script), (1, 1), (ticks, newline, launch))
+                    self.assertEqual(self._ps(repr(script)), (1, 1), (ticks, newline, launch))
+        # an odd number of backticks IS a continuation: one command, hidden
+        self.assertEqual(_judge_script("Start-Process cmd.exe `\nWrite-Host x -WindowStyle Hidden"), (1, 0))
+        self.assertEqual(_judge_script("Start-Process cmd.exe ```\nWrite-Host x -WindowStyle Hidden"), (1, 0))
+        self.assertEqual(_judge_script("Start-Process cmd.exe -WindowStyle Hidden ``\nWrite-Host x"), (1, 0))
+
+    def test_pass28_a4_a_method_chain_is_read_in_time_linear_in_its_length(self):
+        import time
+        for body in ("'value'", "'SUBPROCESS_EXEC'"):
+            for depth in (20, 48, 200):
+                source = f"x = {body}" + ".lower()" * depth + "\n"
+                started = time.monotonic()
+                try:
+                    self._bad(source)
+                    _start_process_violations(source)
+                except RecursionError:
+                    self.fail(f"RecursionError for {body} * {depth}")
+                self.assertLess(time.monotonic() - started, 5.0, (body, depth))
+        reported = self._bad(self._launch("'SUBPROCESS_EXEC'" + ".lower()" * 48))
+        self.assertGreaterEqual(len(reported), 1)
+
+    def test_pass28_a5_a_container_printed_inside_a_text_shows_its_repr_not_its_texts(self):
+        rows = ["(f\"{['subprocess_ex']}\")[2:-2] + 'ec'", "(f\"{('subprocess_ex',)}\")[2:-3] + 'ec'", "('{}'.format(['subprocess_ex']))[2:-2] + 'ec'",
+                "('{}'.format({'subprocess_ex': 1}))[2:-5] + 'ec'", "(f\"{{'subprocess_ex'}}\")[2:-2] + 'ec'",
+                "('%s' % (['subprocess_ex'],))[2:-2] + 'ec'", "(f\"{list(['subprocess_ex'])}\")[2:-2] + 'ec'", "(f\"{reversed(['subprocess_ex'])}\")[2:-2] + 'ec'"]
+        for expr in rows:
+            self.assertGreaterEqual(len(self._bad(self._launch(expr))), 1, expr)
+        for expr in ("(f\"{['value']}\")[2:-2] + 'ec'", "(f\"{['allowed_roots']}\")[2:-2]"):
+            self.assertEqual(self._bad(self._launch(expr)), [], expr)
+        for script in ("(f\"{['Start-Process cmd.exe']}\")[2:-2]", "('{}'.format(['saps cmd.exe']))[2:-2]"):
+            self.assertEqual(self._ps(script), (1, 1), script)
 
 
 if __name__ == "__main__":
