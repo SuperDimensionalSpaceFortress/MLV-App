@@ -5,12 +5,15 @@
 
 #include "../../platform/qt/PlaybackDecodeRenderOverlap.h"
 #include "../../platform/qt/PlaybackSlipHistogram.h"
+#include "../../platform/qt/PlaybackStrideSampler.h"
 #include "../../platform/qt/PlaybackTexturePresentSplit.h"
 
 #include <QFile>
 #include <QString>
 
+#include <atomic>
 #include <string>
+#include <thread>
 
 using playback_texture_split::Aggregator;
 using playback_texture_split::Part;
@@ -285,6 +288,160 @@ TEST(PlaybackTexturePresentSplit, ReconActivityCountsAroundAPresent)
     ASSERT_EQ( meter.reconActivity().active, 0 );
     meter.upstreamEnd( 8.0, playback_overlap::UpstreamStage::Recon );   // an unmatched end never goes below 0
     ASSERT_EQ( meter.reconActivity().active, 0 );
+}
+
+// Adversary A2 on 2f1ec397: a begin is ONE atomic step (a start and an active recon at once), so no reader sees a
+// start counted with its recon not yet active, and the adversary's interleaving (before=(0,0), worker half way, a
+// whole recon during the present, after=(1,0)) cannot occur: the half-way state is not representable.
+TEST(PlaybackTexturePresentSplit, ReconActivityBeginIsOneAtomicStep)
+{
+    using namespace playback_overlap;
+    const ReconActivity afterBegin = unpackReconActivity( packReconActivity( 0, 0 ) + kReconActivityBeginDelta );
+    ASSERT_EQ( 1ull, afterBegin.starts );
+    ASSERT_EQ( 1, afterBegin.active );
+    const ReconActivity afterEnd = unpackReconActivity( packReconActivity( 1, 1 ) - 1 );
+    ASSERT_EQ( 1ull, afterEnd.starts );
+    ASSERT_EQ( 0, afterEnd.active );
+    const ReconActivity big = unpackReconActivity( packReconActivity( 123456789ull, 3 ) );
+    ASSERT_EQ( 123456789ull, big.starts );
+    ASSERT_EQ( 3, big.active );
+    // the adversary's input: a recon that starts and ends between the two samples is seen
+    ASSERT_TRUE( reconRanBetween( unpackReconActivity( packReconActivity( 0, 0 ) ),
+                                  unpackReconActivity( packReconActivity( 1, 0 ) ) ) );
+    // and the meter itself goes through those states only
+    OverlapMeter meter;
+    meter.upstreamBegin( 1.0, false, UpstreamStage::Recon );
+    ASSERT_EQ( 1ull, meter.reconActivity().starts );
+    ASSERT_EQ( 1, meter.reconActivity().active );
+}
+
+// A2, observed: one worker begins and ends recons while a reader samples. Every sample must be a state the worker
+// passed through: completed = starts - active never decreases and active is 0 or 1. With the old two-word counter a
+// sample between the two increments read (starts=n+1, active=0) and the next one (n+1, 1): completed went back.
+TEST(PlaybackTexturePresentSplit, ReconActivitySamplesAreConsistentUnderConcurrency)
+{
+    playback_overlap::OverlapMeter meter;
+    std::atomic<bool> stop{ false };
+    std::thread worker( [&]()
+    {
+        for( int i = 0; i < 200000 && !stop.load(); ++i )
+        {
+            meter.upstreamBegin( 0.0, false, playback_overlap::UpstreamStage::Recon );
+            meter.upstreamEnd( 0.0, playback_overlap::UpstreamStage::Recon );
+        }
+        stop.store( true );
+    } );
+    long long lastCompleted = 0;
+    bool consistent = true;
+    while( !stop.load() )
+    {
+        const playback_overlap::ReconActivity a = meter.reconActivity();
+        const long long completed = static_cast<long long>( a.starts ) - a.active;
+        if( a.active < 0 || a.active > 1 || completed < lastCompleted ) consistent = false;
+        lastCompleted = completed;
+    }
+    worker.join();
+    ASSERT_TRUE( consistent );
+    ASSERT_EQ( 200000ull, meter.reconActivity().starts );
+    ASSERT_EQ( 0, meter.reconActivity().active );
+}
+
+// Adversary A3 on 2f1ec397: the AMaZE presenter ran and failed, and a fallback presented the frame. The failed
+// attempt's setup keys must not enter the split.
+TEST(PlaybackTexturePresentSplit, FailedAmazePresenterWithFallbackIsNotSampled)
+{
+    ASSERT_FALSE( playback_texture_split::sampleEligible( true, false ) );   // setup keys left, AMaZE presenter failed
+    ASSERT_FALSE( playback_texture_split::sampleEligible( false, true ) );
+    ASSERT_FALSE( playback_texture_split::sampleEligible( false, false ) );
+    ASSERT_TRUE( playback_texture_split::sampleEligible( true, true ) );
+}
+
+// Adversary A4 on 2f1ec397: past the sampler cap the percentiles describe the whole session, not its prefix.
+TEST(PlaybackTexturePresentSplit, PercentilesCoverTheWholeSessionPastTheCap)
+{
+    PathAggregator agg;
+    agg.note( makeSample( 1.0, 1.0, 1.0 ) );   // excluded first present
+    for( int i = 0; i < 100000; ++i ) agg.note( makeSample( 1.0, 1.0, 1.0 ) );
+    for( int i = 0; i < 100001; ++i ) agg.note( makeSample( 1.0, 1.0, 10.0 ) );
+    ASSERT_EQ( 200001, agg.frames() );
+    ASSERT_NEAR( 10.0, agg.median( Part::DrawTotal ), 1e-9 );
+    ASSERT_NEAR( 10.0, agg.p95( Part::DrawTotal ), 1e-9 );
+    ASSERT_TRUE( agg.percentileStride() > 1ull );
+}
+
+TEST(PlaybackTexturePresentSplit, StrideSamplerKeepsEveryValueBelowTheCapAndAUniformSampleAbove)
+{
+    playback_sampling::StrideSampler s( 8 );
+    for( int i = 0; i < 7; ++i ) s.add( i );
+    ASSERT_EQ( size_t( 7 ), s.size() );   // below the cap: every value, in order
+    ASSERT_EQ( 1ull, s.stride() );
+    s.add( 7 );                            // reaches the cap: keeps 0,2,4,6 and strides 2
+    ASSERT_EQ( size_t( 4 ), s.size() );
+    ASSERT_EQ( 2ull, s.stride() );
+    for( int i = 8; i < 100; ++i ) s.add( i );
+    ASSERT_TRUE( s.size() < s.cap() );
+    ASSERT_EQ( 100ull, s.seen() );
+    // every kept value is a multiple of the stride, starting at 0, with none skipped in between
+    for( size_t k = 0; k < s.size(); ++k )
+        ASSERT_NEAR( static_cast<double>( k * s.stride() ), s.values()[k], 1e-12 );
+    // the last kept value is within one stride of the session's end: the sample spans the whole session
+    ASSERT_TRUE( s.values().back() + static_cast<double>( s.stride() ) >= 99.0 );
+}
+
+// A4 siblings: the slip histogram's upstream-stage medians follow the whole session too.
+TEST(PlaybackTexturePresentSplit, SlipStageMediansCoverTheWholeSessionPastTheCap)
+{
+    const double fps = 60000.0 / 1001.0;
+    const double period = 1000.0 / fps;
+    playback_slip::SlipHistogram h;
+    h.reset( 0, fps );
+    const int prefix = playback_slip::kMaxStageSamples;   // the first cap's worth is cheap: the old prefix median is 1
+    const int n = 3 * playback_slip::kMaxStageSamples + 3;  // two thirds of the session are not: its median is 10
+    int timeline = 0;
+    double t = 1000.0;
+    for( int k = 0; k < n; ++k )
+    {
+        h.noteTimelineMove( playback_slip::AdvancePath::DropTick, k + 1, t, 1.0, 0.0 );
+        timeline = k + 1;
+        playback_slip::PresentSample s;
+        s.displayFrame = k;
+        s.presentMs = t + 1.0;
+        s.readyKnown = true;
+        s.readyMs = t - 1.0;
+        s.decodeMs = k < prefix ? 1.0 : 10.0;
+        s.drawMs = 5.0;
+        s.timelinePosition = timeline;
+        s.lookaheadCovered = true;
+        // one upstream-late slip at the very end: its decode (12) is over 2x the median only if the median is the
+        // PREFIX's (1.0); against the whole session's median (10.0) it is not
+        if( k == n - 1 )
+        {
+            h.noteTimelineMove( playback_slip::AdvancePath::DropTick, k + 2, t + period, 1.0, 0.0 );
+            timeline = k + 2;
+            s.displayFrame = k + 1;
+            s.presentMs = t + period + 1.0;
+            s.readyMs = t + period + 0.5;
+            s.decodeMs = 12.0;
+            s.timelinePosition = timeline;
+        }
+        h.notePresent( s );
+        t += period;
+    }
+    const playback_slip::Summary sum = h.finish( t, timeline );
+    ASSERT_EQ( 1LL, sum.classFrames[static_cast<int>( playback_slip::SlipClass::UpstreamLate )] );
+    ASSERT_EQ( 0LL, sum.upstreamStageFrames[static_cast<int>( playback_slip::UpstreamStage::Decode )] );
+    ASSERT_EQ( 1LL, sum.upstreamStageFrames[static_cast<int>( playback_slip::UpstreamStage::None )] );
+}
+
+// A1 on 2f1ec397 (GpuDisplayViewport needs a GL build, so its source is pinned): the viewport AMaZE presenter records
+// its AMaZE-only parts like GpuDisplayWindow, and MainWindow samples only the AMaZE presenter's own presents (A3).
+TEST(PlaybackTexturePresentSplit, ViewportRecordsAmazePartsAndMainWindowGatesOnTheAmazePresenter)
+{
+    const std::string vp = readRepoFile( QStringLiteral( "platform/qt/GpuDisplayViewport.cpp" ) );
+    ASSERT_NE( std::string::npos, vp.find( "        setupTiming.amaze_kernel_ms = amazeTiming.kernelMs;" ) );
+    ASSERT_NE( std::string::npos, vp.find( "        setupTiming.amaze_download_ms = amazeTiming.downloadMs;" ) );
+    const std::string mw = readRepoFile( QStringLiteral( "platform/qt/MainWindow.cpp" ) );
+    ASSERT_NE( std::string::npos, mw.find( "telemetryBoolValue( timing, \"gpu_playback_recon_amaze_texture_present_active\" ) ) )" ) );
 }
 
 // Source pins: MainWindow feeds the split from values it already has, only in smoke sessions, and prints it.

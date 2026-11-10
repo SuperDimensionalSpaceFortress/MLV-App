@@ -42,10 +42,12 @@
 #include <string>
 #include <vector>
 
+#include "PlaybackStrideSampler.h"
+
 namespace playback_texture_split
 {
 
-inline constexpr int kMaxSamples = 100000;   // per part, per path (about 28 min at 59.94)
+inline constexpr int kMaxSamples = 100000;   // per part, per path: the sampler's cap (it strides beyond it, A4)
 
 enum class Part
 {
@@ -82,6 +84,16 @@ enum class Path { Window = 0, Viewport, Count };
 inline const char *pathName( Path p )
 {
     return p == Path::Window ? "window" : p == Path::Viewport ? "viewport" : "none";
+}
+
+/*! Adversary A3 on 2f1ec397: a present enters the split only when the AMaZE texture presenter itself drew it. A
+ *  presenter that ran and FAILED still leaves its setup keys behind, and a later fallback (the bilinear R16 texture or
+ *  the readback RGB16 present) then marks the frame presented: those parts describe a failed attempt, not this
+ *  present. \a setupTimingKnown: the setup keys are in the frame's telemetry; \a amazeTexturePresented:
+ *  gpu_playback_recon_amaze_texture_present_active (the AMaZE presenter's own return). */
+inline bool sampleEligible( bool setupTimingKnown, bool amazeTexturePresented )
+{
+    return setupTimingKnown && amazeTexturePresented;
 }
 
 /*! One texture present, as MainWindow has it after the presenter returned. */
@@ -153,11 +165,10 @@ public:
         m_sums.add( s );
         if( s.painted ) ++m_painted;
         if( s.aheadCandidateReady ) ++m_aheadCandidateReady;
-        if( static_cast<int>( m_values[0].size() ) >= kMaxSamples ) return;
         for( int i = 0; i < kPartCount; ++i )
         {
             if( static_cast<Part>( i ) == Part::TailWindow && !s.tailWindowKnown ) continue;
-            m_values[static_cast<size_t>( i )].push_back( s.ms[static_cast<size_t>( i )] );
+            m_values[static_cast<size_t>( i )].add( s.ms[static_cast<size_t>( i )] );
         }
     }
 
@@ -169,16 +180,28 @@ public:
     int tailWindowKnown() const { return m_sums.tailWindowEvents; }
     double firstWallMs() const { return m_firstWallMs; }
     double avg( Part p ) const { return m_sums.avg( p ); }
-    double p95( Part p ) const { return percentile( m_values[static_cast<size_t>( p )], 0.95 ); }
-    double median( Part p ) const { return percentile( m_values[static_cast<size_t>( p )], 0.50 ); }
+    double p95( Part p ) const { return percentile( m_values[static_cast<size_t>( p )].values(), 0.95 ); }
+    double median( Part p ) const { return percentile( m_values[static_cast<size_t>( p )].values(), 0.50 ); }
+    /*! The draw_total sampler's stride: 1 = every present is in the percentiles (A4). */
+    unsigned long long percentileStride() const
+    {
+        return m_values[static_cast<size_t>( Part::DrawTotal )].stride();
+    }
 
 private:
+    static std::array<playback_sampling::StrideSampler, kPartCount> makeSamplers()
+    {
+        std::array<playback_sampling::StrideSampler, kPartCount> a;
+        for( auto &s : a ) s = playback_sampling::StrideSampler( static_cast<size_t>( kMaxSamples ) );
+        return a;
+    }
+
     bool m_firstSeen = false;
     double m_firstWallMs = 0.0;
     PartSums m_sums;
     int m_painted = 0;
     int m_aheadCandidateReady = 0;
-    std::array<std::vector<double>, kPartCount> m_values;
+    std::array<playback_sampling::StrideSampler, kPartCount> m_values = makeSamplers();
 };
 
 /*! The session: one aggregator per path. */
@@ -224,6 +247,7 @@ inline std::string formatLine( unsigned long long session, Path path, const Path
     appendInt( out, "painted", agg.painted() );
     appendInt( out, "tail_window_known", agg.tailWindowKnown() );
     appendInt( out, "recon_in_flight", agg.reconInFlight() );
+    appendInt( out, "pct_stride", static_cast<long long>( agg.percentileStride() ) );
     {
         char buf[64];
         std::snprintf( buf, sizeof( buf ), " first_wall_ms=%.3f", agg.firstWallMs() );

@@ -47,6 +47,7 @@
 #include <vector>
 
 #include "PlaybackNativePaceGuard.h"
+#include "PlaybackStrideSampler.h"
 #include "PlaybackTexturePresentSplit.h"
 
 namespace playback_slip
@@ -411,13 +412,11 @@ public:
 
     void notePresent( const PresentSample &s )
     {
-        if( static_cast<int>( m_decode.size() ) < kMaxStageSamples )
-        {
-            m_decode.push_back( s.decodeMs );
-            m_recon.push_back( s.reconMs );
-            m_render.push_back( s.renderMs );
-            m_queue.push_back( s.queueMs );
-        }
+        // A4 (texture-present split card): a session-uniform sample past the cap, never the session's prefix
+        m_decode.add( s.decodeMs );
+        m_recon.add( s.reconMs );
+        m_render.add( s.renderMs );
+        m_queue.add( s.queueMs );
         if( m_presents == 0 )
         {
             m_presents = 1;
@@ -612,10 +611,10 @@ public:
         out.advanceByPath[static_cast<int>( AdvancePath::Other )] +=
             static_cast<long long>( endPosition - m_startPosition ) - explained;
 
-        const double medDecode = median( m_decode );
-        const double medRecon = median( m_recon );
-        const double medRender = median( m_render );
-        const double medQueue = median( m_queue );
+        const double medDecode = median( m_decode.values() );
+        const double medRecon = median( m_recon.values() );
+        const double medRender = median( m_render.values() );
+        const double medQueue = median( m_queue.values() );
 
         for( size_t i = 0; i < m_slips.size(); ++i )
         {
@@ -848,10 +847,10 @@ private:
     std::array<long long, static_cast<int>( AdvancePath::Count )> m_advanceByPath {};
     std::array<Deadline, kDeadlineRingSize> m_deadlines {};
     std::vector<SlipRecord> m_slips;
-    std::vector<double> m_decode;
-    std::vector<double> m_recon;
-    std::vector<double> m_render;
-    std::vector<double> m_queue;
+    playback_sampling::StrideSampler m_decode { static_cast<size_t>( kMaxStageSamples ) };
+    playback_sampling::StrideSampler m_recon { static_cast<size_t>( kMaxStageSamples ) };
+    playback_sampling::StrideSampler m_render { static_cast<size_t>( kMaxStageSamples ) };
+    playback_sampling::StrideSampler m_queue { static_cast<size_t>( kMaxStageSamples ) };
 };
 
 } // namespace playback_slip

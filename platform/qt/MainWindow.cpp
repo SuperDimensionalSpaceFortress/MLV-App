@@ -27873,9 +27873,10 @@ void MainWindow::notePlaybackSmokePresentedFrame(
         slipSample.timelinePosition = ui->horizontalSliderPosition->value();
         slipSample.lookaheadCovered = requestContext.playbackLookaheadDepth > 0;
         // HFR-NATIVE-M16-1457-GUI-TEXTURE-PRESENT-OFFLOAD-1 K1: this present's texture-present parts, from values
-        // already captured (no clock read); only for a present a texture presenter drew.
-        if( timing.contains( QStringLiteral("gpu_playback_recon_texture_present_setup_program_ms") )
-         && telemetryBoolValue( timing, "gpu_playback_recon_texture_present_active" ) )
+        // already captured (no clock read); only for a present the AMaZE texture presenter itself drew (A3).
+        if( playback_texture_split::sampleEligible(
+                timing.contains( QStringLiteral("gpu_playback_recon_texture_present_setup_program_ms") ),
+                telemetryBoolValue( timing, "gpu_playback_recon_amaze_texture_present_active" ) ) )
         {
             using playback_texture_split::Part;
             playback_texture_split::Sample &tx = slipSample.texture;

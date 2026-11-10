@@ -165,6 +165,7 @@ HEADERS += \
     $$REPO_ROOT/platform/qt/PlaybackScopesDuringPlayback.h \
     $$REPO_ROOT/platform/qt/PlaybackSlipHistogram.h \
     $$REPO_ROOT/platform/qt/PlaybackTexturePresentSplit.h \
+    $$REPO_ROOT/platform/qt/PlaybackStrideSampler.h \
     $$REPO_ROOT/platform/qt/PlaybackStartupSplit.h \
     $$REPO_ROOT/platform/qt/PlaybackAudioStartPolicy.h \
     $$REPO_ROOT/platform/qt/PlaybackAudioGate.h \
