@@ -35,9 +35,10 @@
 # Exit codes: 2 source, 3 DLL-pair manifest missing, 4 DLL-pair manifest does not bind,
 # 12 qmake discovery, 13 qmake, 14 mingw32-make discovery, 15 make, 16 release exe missing,
 # 17 windeployqt discovery, 18 windeployqt, 19 DLL-pair deploy, 21 MinGW runtime deploy,
-# 23 launch probe, 20 packaging, 24 publish partials, 25 publish rename, 26 publish manifest.
+# 23 launch probe, 20 packaging, 24 publish partials, 25 publish rename, 26 publish manifest,
+# 27 no heavy-slot deadline (STAGE_NO_HEAVY_SLOT_DEADLINE: MLV_HEAVY_SLOT_DEADLINE_UTC absent or blank; nothing written, no ticket taken).
 #
-# Usage:
+# Usage (MLV_HEAVY_SLOT_DEADLINE_UTC must be set: Invoke-VenueStageChain.ps1 and the nightly set it; for a manual run set it yourself, ISO-8601):
 #   pwsh -NoProfile -File tools\profiling\bachelor\playback-attr-3-cuda-assemble.ps1 `
 #       -SourceCommit <40-hex> -DllPairDir <dir> -OutDir <dir>
 
@@ -87,6 +88,17 @@ function Complete-Failed([int]$Code, [string]$Step, [string]$Message) {
     Write-Host "[attr3-assemble] FAIL step=$Step exit=$Code $Message" -ForegroundColor Red
     Write-Output "RESULT=ASSEMBLE_FAILED STEP=$Step EXIT=$Code"
     exit $Code
+}
+
+# LANE-LOCAL-STAGE-CHAIN-DEADLINE-BYPASS-1: this script ends in the machine heavy-slot wait (Invoke-BuildGuard below). With no driver deadline that wait
+# is build-guard's 60 min default, and a refused waiter's retry is a NEW ticket, the youngest in the queue, so the venue starves (2026-11-10: lane-local
+# stage-chain.ps1 / stage-one.ps1 copies called this script without MLV_HEAVY_SLOT_DEADLINE_UTC). So a run without a deadline stops HERE, typed, before
+# it writes anything or takes a ticket. The route is tools\profiling\dual-venue\Invoke-VenueStageChain.ps1 (or the nightly), which set the variable in
+# this process's environment. Only "was one given" is judged here; build-guard judges the value (a passed deadline is --wait 0, an unparsable one is
+# BUILD_HEAVY_SLOT_REFUSED reason=invalid-option, both before any ticket). There is deliberately still no deadline parameter (see the guard call below).
+if ([string]::IsNullOrWhiteSpace($env:MLV_HEAVY_SLOT_DEADLINE_UTC)) {
+    Write-Output 'STAGE_NO_HEAVY_SLOT_DEADLINE reason=env-MLV_HEAVY_SLOT_DEADLINE_UTC-absent-or-blank route=tools\profiling\dual-venue\Invoke-VenueStageChain.ps1'
+    Complete-Failed 27 'heavySlotDeadline' 'MLV_HEAVY_SLOT_DEADLINE_UTC is not set: without a deadline the heavy-slot wait is a 60 min default and every retry re-queues as the youngest ticket. Stage through tools\profiling\dual-venue\Invoke-VenueStageChain.ps1 -DeadlineUtc <ISO-8601>, or set MLV_HEAVY_SLOT_DEADLINE_UTC for a manual run.'
 }
 
 $names = Get-AttrCudaArtifactNames -SourceCommit $SourceCommit
