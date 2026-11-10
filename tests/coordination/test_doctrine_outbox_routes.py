@@ -3247,32 +3247,64 @@ def test_a_creation_pin_that_could_not_be_read_is_never_completed_from_a_replace
         assert (tmp_path / "scratch-saved" / base.name / "f.txt").exists(), "absence behind a replaced root was read as a removal"
 
 
-def test_a_creation_pin_is_one_read_and_an_unreadable_one_stays_unknown(tmp_path, monkeypatch):
-    """The pin is the identity of what THIS run just made. A second read after a pause (a retry) is a window in which a process
-    swaps the root or the scratch, and the replacement's identity would be recorded as the creation pin. So: two back-to-back reads of each that must agree,
-    no pause, and a read that fails is recorded as None, which removal refuses (the typed EXERCISE_SCRATCH_NOT_REMOVED) instead
-    of completing the pin from whatever it finds later. (The earlier test of this name pinned the retry itself: it required a
-    failing read to be repeated until it succeeded, which is the defect, so replacing it is not a loosening.)"""
+@pytest.mark.parametrize("which,nth", [("scratch", 1), ("scratch", 2), ("root", 1), ("root", 2)])
+def test_r7_g4_one_transient_failed_creation_read_is_read_again_under_the_hold_and_the_scratch_is_removed(tmp_path, monkeypatch, which, nth):
+    """CoS G4 (6763384196), literal: one identity read at creation fails once (the scratch's first read, as in the repro, and each
+    other read). It is read again AT ONCE, under the same _DirHold(base) and with no pause, so the pin is completed and the scratch
+    removed, never leaked as EXERCISE_SCRATCH_NOT_REMOVED. (Replaces test_a_creation_pin_is_one_read_and_an_unreadable_one_stays_unknown,
+    which pinned the leak for a single failure; a failure that repeats is the residual row below.)"""
     root = tmp_path / "scratch"
     base = root / (ob.ROUTE_SCRATCH_PREFIX + "pinonce")
+    base.mkdir(parents=True)
+    real, seen, failed = ob._file_id, [], []
+
+    def fails_once(path, follow=False):
+        seen.append(follow)                                             # follow=True is the root's read, False the scratch's
+        if not failed and seen.count(which == "root") == nth:
+            failed.append(path)
+            return None                                                 # one transient failure of exactly this read
+        return real(path, follow)
+
+    def no_pause(seconds):
+        raise AssertionError(f"the pin paused {seconds}s: a pause is a swap window")
+
+    monkeypatch.setattr(ob, "_file_id", fails_once)
+    monkeypatch.setattr(ob.time, "sleep", no_pause)
+    ob._pin_scratch(base, root)
+    monkeypatch.setattr(ob, "_file_id", real)
+    assert failed, "the injected failure never ran"
+    assert ob._SCRATCH_PINS[ob._scratch_key(base)] == (real(ob._real(root), True), real(base)), ob._SCRATCH_PINS[ob._scratch_key(base)]
+    ob.remove_exercise_scratch(base, root)
+    assert list(root.iterdir()) == [], list(root.iterdir())
+
+
+def test_r7_g9_a_creation_read_that_fails_twice_in_a_row_stays_unknown_and_the_scratch_is_the_typed_leftover(tmp_path, monkeypatch):
+    """The named fail-closed residue of G4 (G9): an identity that cannot be read on its immediate re-read either is recorded as
+    None, never completed later; removal leaves the scratch as the typed EXERCISE_SCRATCH_NOT_REMOVED. Still no pause."""
+    root = tmp_path / "scratch"
+    base = root / (ob.ROUTE_SCRATCH_PREFIX + "pintwice")
     base.mkdir(parents=True)
     real, seen = ob._file_id, []
 
     def failing_read(path, follow=False):
-        seen.append(os.path.normcase(str(path)))
-        return None                                                     # every read fails: the pin must not be completed later
+        seen.append(follow)
+        return None                                                     # every read fails, so each re-read fails too
 
     def no_pause(seconds):
-        raise AssertionError(f"the pin paused {seconds}s between reads: that pause is a swap window")
+        raise AssertionError(f"the pin paused {seconds}s: a pause is a swap window")
 
     monkeypatch.setattr(ob, "_file_id", failing_read)
     monkeypatch.setattr(ob.time, "sleep", no_pause)
     ob._pin_scratch(base, root)
-    assert ob._SCRATCH_PINS.pop(ob._scratch_key(base)) == (None, None)
-    assert len(seen) == 4, f"each identity is read twice, back to back, and never retried to success: {seen}"
     monkeypatch.setattr(ob, "_file_id", real)
-    ob._pin_scratch(base, root)
-    assert ob._SCRATCH_PINS.pop(ob._scratch_key(base)) == (real(root, True), real(base))
+    assert ob._SCRATCH_PINS[ob._scratch_key(base)] == (None, None)
+    assert len(seen) == 8, f"each of the four reads is made once and re-read once, never more: {seen}"
+    monkeypatch.setattr(ob, "ROUTE_SCRATCH_REMOVE_PAUSE", 0)
+    monkeypatch.setattr(ob, "ROUTE_SCRATCH_REMOVE_DEADLINE", 0.3)
+    with pytest.raises(ob.Unknown) as caught:
+        ob.remove_exercise_scratch(base, root)
+    assert caught.value.code == "EXERCISE_SCRATCH_NOT_REMOVED", caught.value
+    assert base.is_dir(), "an unpinned scratch was removed"
 
 
 def test_a_replacement_made_between_the_root_read_and_the_scratch_read_is_not_pinned_as_the_creation(tmp_path, monkeypatch):
@@ -3333,36 +3365,51 @@ def test_a_root_whose_identity_changes_between_the_two_creation_reads_is_not_pin
     assert root_id is None and work_id == real(base), (root_id, work_id)
 
 
-def test_a_scratch_whose_first_creation_read_failed_is_not_adopted_from_a_replacement_made_during_any_pause(tmp_path, monkeypatch):
-    """The finding's input: the new scratch's first identity read raises, and while the pin pauses another process renames the
-    scratch aside and creates a replacement (with a file in it) under the same name. Nothing may be adopted and removed."""
+def test_a_scratch_whose_first_creation_read_failed_is_not_adopted_from_a_replacement_made_before_its_re_read(tmp_path, monkeypatch):
+    """CoS G5: the swap is driven at the REAL seam (the earlier version swapped in a pause the pin never takes, so it never ran).
+    The new scratch's first identity read fails, and in that instant, between the failure and its one immediate re-read (r7 G4),
+    another process tries to rename the scratch aside and put a populated replacement under its name. The pin never sleeps.
+    Windows: the pin holds the scratch (_DirHold), so the rename is refused, the pin is the scratch itself and it is removed.
+    Elsewhere (no hold): the swap happens, the replacement is not empty, so it is never pinned and its file survives a typed refusal."""
     root = tmp_path / "scratch"
     base = root / (ob.ROUTE_SCRATCH_PREFIX + "pinswap")
     base.mkdir(parents=True)
-    (base / "f.txt").write_text("original", encoding="utf-8")
-    real, reads = ob._file_id, [0]
+    real, swapped = ob._file_id, []
 
-    def read_that_fails_once_for_the_scratch(path, follow=False):
-        reads[0] += 1
-        return None if (reads[0] == 2 and not follow) else real(path, follow)
-
-    def swap_in_the_pause(seconds):
-        os.rename(base, tmp_path / "saved")
+    def fail_the_first_scratch_read_and_swap(path, follow=False):
+        if follow or swapped:
+            return real(path, follow)
+        try:
+            os.rename(base, tmp_path / "saved")
+        except PermissionError as refused:                              # held by the pin: the swap is refused
+            swapped.append(refused)
+            return None
         base.mkdir()
         (base / "precious.txt").write_text("not ours", encoding="utf-8")
+        swapped.append(True)
+        return None
 
-    monkeypatch.setattr(ob, "_file_id", read_that_fails_once_for_the_scratch)
-    monkeypatch.setattr(ob.time, "sleep", swap_in_the_pause)
+    def no_pause(seconds):
+        raise AssertionError(f"the pin paused {seconds}s: a pause is a swap window")
+
+    monkeypatch.setattr(ob, "_file_id", fail_the_first_scratch_read_and_swap)
+    monkeypatch.setattr(ob.time, "sleep", no_pause)
     ob._pin_scratch(base, root)
     monkeypatch.setattr(ob, "_file_id", real)
-    monkeypatch.setattr(ob.time, "sleep", lambda s: None)               # the swap happens only inside the pin, never in the removal's own pauses
     monkeypatch.setattr(ob, "ROUTE_SCRATCH_REMOVE_PAUSE", 0)
     monkeypatch.setattr(ob, "ROUTE_SCRATCH_REMOVE_DEADLINE", 0.3)
-    swapped = (base / "precious.txt").exists()                          # True only when the pin paused
+    assert swapped, "the swap seam never ran"
+    if os.name == "nt":
+        assert isinstance(swapped[0], PermissionError), swapped         # the hold refused the rename: nothing was swapped
+        ob.remove_exercise_scratch(base, root)
+        assert list(root.iterdir()) == [], list(root.iterdir())
+        return
+    assert swapped[0] is True, swapped
     with pytest.raises(ob.Unknown) as caught:
         ob.remove_exercise_scratch(base, root)
     assert caught.value.code == "EXERCISE_SCRATCH_NOT_REMOVED", caught.value
-    assert (base / "precious.txt").exists() if swapped else (base / "f.txt").exists(), "a replacement was adopted as the creation pin and removed"
+    assert (base / "precious.txt").exists(), "a replacement made before the re-read was pinned as the creation and removed"
+    assert (tmp_path / "saved").is_dir()
 
 
 def stale_bus_pair(tmp_path: Path, name: str, behind: bool) -> Path:
@@ -4189,3 +4236,82 @@ def test_r6_bc_a5_a_tree_nested_deeper_than_the_walk_can_hold_is_a_typed_refusal
         sys.setrecursionlimit(limit)
     assert caught.value.code == "EXERCISE_SCRATCH_NOT_REMOVED", caught.value
     assert (scratch_now(base).joinpath(*["a"] * 40) / "f.txt").exists()
+
+# r7: Dot 786-D824-B1. The walk recorded a sibling's identity only when its own iteration began, so a transient failure on the
+# first sibling A, then the not-yet-processed sibling B replaced by an ordinary B' during the retry pause, let the next listing
+# adopt B' and delete its data. Every entry of a directory's FIRST listing is now recorded before any fallible per-entry step, and
+# a relisting may only drop entries: a new name, or a listed name with another identity, is a typed refusal with the data left.
+@pytest.mark.parametrize("change", ["replaced", "added"])
+def test_r7_b1_a_sibling_changed_during_a_retry_pause_is_refused_and_never_adopted(tmp_path, monkeypatch, change):
+    import types
+    root = tmp_path / "scratch"
+    base = root / (ob.ROUTE_SCRATCH_PREFIX + "test")
+    base.mkdir(parents=True)
+    ob._pin_scratch(base, root)                                          # pinned EMPTY, as mkdtemp made it; content comes after
+    for name in ("A", "B"):
+        (base / name).mkdir()
+        (base / name / "ours.txt").write_text("ours", encoding="utf-8")
+    real_hold, failed, changed = ob._DirHold, [], []
+
+    class FailTheFirstSiblingOnce(real_hold):
+        def __enter__(self):
+            if not failed and os.path.basename(self.path) in ("A", "B"):
+                failed.append(os.path.basename(self.path))               # whichever sibling the walk enters first fails, once
+                raise PermissionError(13, "The process cannot access the file because it is being used by another process", self.path)
+            return super().__enter__()
+
+    real_time = ob.time
+
+    def pause(seconds):                                                  # the retry pause: the sibling not yet processed changes
+        if failed and not changed:
+            where = scratch_now(base)
+            other = "B" if failed[0] == "A" else "A"
+            if change == "replaced":
+                os.rename(where / other, tmp_path / "other-aside")
+                (where / other).mkdir()
+                (where / other / "precious.txt").write_text("not ours", encoding="utf-8")
+            else:
+                (where / "C").mkdir()
+                (where / "C" / "precious.txt").write_text("not ours", encoding="utf-8")
+            changed.append(other)
+
+    monkeypatch.setattr(ob, "_DirHold", FailTheFirstSiblingOnce)
+    monkeypatch.setattr(ob, "time", types.SimpleNamespace(monotonic=real_time.monotonic, sleep=pause))
+    monkeypatch.setattr(ob, "ROUTE_SCRATCH_REMOVE_PAUSE", 0)
+    monkeypatch.setattr(ob, "ROUTE_SCRATCH_REMOVE_DEADLINE", 0.5)
+    with pytest.raises(ob.Unknown) as caught:
+        ob.remove_exercise_scratch(base, root)
+    assert failed and changed, (failed, changed)
+    assert caught.value.code == "EXERCISE_SCRATCH_NOT_REMOVED", caught.value
+    survivors = list(root.rglob("precious.txt"))
+    assert len(survivors) == 1 and survivors[0].read_text(encoding="utf-8") == "not ours", survivors
+    if change == "replaced":
+        assert (tmp_path / "other-aside" / "ours.txt").exists()
+
+
+def test_r7_b1_a_relisting_that_only_drops_entries_still_completes(tmp_path, monkeypatch):
+    """The other side of B1: entries removed before a transient failure are simply absent from the relisting, which is allowed,
+    so a retried walk still finishes the removal."""
+    root = tmp_path / "scratch"
+    base = root / (ob.ROUTE_SCRATCH_PREFIX + "test")
+    base.mkdir(parents=True)
+    ob._pin_scratch(base, root)
+    for name in ("A", "B", "C"):
+        (base / name).mkdir()
+        (base / name / "ours.txt").write_text("ours", encoding="utf-8")
+    real_hold, entered = ob._DirHold, []
+
+    class FailTheSecondSiblingOnce(real_hold):
+        def __enter__(self):
+            if os.path.basename(self.path) in ("A", "B", "C"):
+                entered.append(os.path.basename(self.path))
+                if len(entered) == 2:                                    # one sibling is already removed when the next one fails
+                    raise PermissionError(13, "The process cannot access the file because it is being used by another process", self.path)
+            return super().__enter__()
+
+    monkeypatch.setattr(ob, "_DirHold", FailTheSecondSiblingOnce)
+    monkeypatch.setattr(ob, "ROUTE_SCRATCH_REMOVE_PAUSE", 0)
+    monkeypatch.setattr(ob, "ROUTE_SCRATCH_REMOVE_DEADLINE", 2)
+    ob.remove_exercise_scratch(base, root)
+    assert len(entered) >= 4, entered
+    assert list(root.iterdir()) == [], list(root.iterdir())

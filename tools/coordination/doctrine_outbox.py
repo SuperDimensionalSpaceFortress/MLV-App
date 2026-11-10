@@ -3929,8 +3929,9 @@ _REPARSE = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
 def _file_id(path: str | os.PathLike, follow: bool = False) -> tuple[int, int] | None:
     """The identity (device, file index) of what `path` is right now, or None when it cannot be read. A path STRING cannot tell a
     directory from the one that was renamed away and replaced under the same name; this can. `follow` reads the target of a link
-    (the scratch root, already resolved), not the link. Only the creation pin reads through this (an unreadable pin is None, which
-    removal never completes from); the removal itself reads through _meta, where an unreadable identity is an error, never None."""
+    (the scratch root, already resolved), not the link. Only the creation pin reads through this (a failed read is read again once,
+    at once, under its hold; one still unreadable pins None, which removal never completes from); the removal itself reads through
+    _meta, where an unreadable identity is an error, never None."""
     try:
         info = os.stat(path) if follow else os.lstat(path)
     except (OSError, ValueError):
@@ -4039,23 +4040,36 @@ def _in_place(path: str | os.PathLike) -> bool:
 
 
 def _pin_scratch(base: pathlib.Path, scratch_root: str | os.PathLike) -> None:
-    """Record the identity of the scratch root and of the scratch `base` just made, straight after it was created and with no pause
-    (a retry after a pause is itself a swap window whose second read would be recorded as the creation pin). The reads are made
-    while `base` is HELD (_DirHold): from the moment the hold is open neither `base` nor its root can be renamed or removed, so its
-    identity reads and its emptiness scan all describe the one object the hold names, which must be a real directory (no link or
-    junction) that resolves to its own name directly under the real root. It must also be EMPTY (what mkdtemp made is): a populated
-    replacement swapped in before the hold opened is never taken for it. Each identity is still read twice, around the scan. An
-    identity that is unreadable, differs between the reads or fails a check is recorded as None, which removal never completes
-    from (the typed EXERCISE_SCRATCH_NOT_REMOVED, nothing removed). What remains on Windows is an EMPTY ordinary directory swapped
-    in before the hold opened (no file is lost to it); where no hold exists (not Windows) the reads rest on path lookups alone."""
+    """Record the identity of the scratch root and of the scratch `base` just made, straight after it was created and with NO
+    pause (a pause is a swap window whose later read would be recorded as the creation pin). The reads are made while `base` is
+    HELD (_DirHold): from the moment the hold is open neither `base` nor its root can be renamed or removed, so its identity reads
+    and its emptiness scan all describe the one object the hold names, which must be a real directory (no link or junction) that
+    resolves to its own name directly under the real root. It must also be EMPTY (what mkdtemp made is): a populated replacement
+    swapped in before the hold opened is never taken for it. Each identity is read twice, around the scan, and the two must agree.
+    A read that fails is read again ONCE, at once, under the same hold (CoS G4): the hold keeps the name on the same object, so the
+    re-read describes what the failed read would have. An identity still unreadable, differing between the reads or failing a
+    check is recorded as None, which removal never completes from. What remains on Windows is an EMPTY ordinary directory swapped
+    in before the hold opened (no file is lost to it); where no hold exists (not Windows) the reads rest on path lookups alone.
+
+    FAIL-CLOSED LEAKS (deliberate: r6 A3 traded CoS G3's "a scratch whose pin fails is still removed" for the threat model, since
+    an identity never pinned may name a replacement). The scratch is NOT removed, and stays as the typed
+    EXERCISE_SCRATCH_NOT_REMOVED naming it, when: (1) the pin fails as a whole (the hold cannot be opened, the root cannot be
+    resolved, any read or the scan raises), make_exercise_scratch having recorded (None, None) before this runs; (2) an identity
+    read fails on its immediate re-read too (G4's residue: two failed reads in a row); (3) the two reads of an identity differ, or
+    the scratch is not empty, is a link or junction, or is not directly under the real root."""
     pin: tuple[tuple[int, int] | None, tuple[int, int] | None] = (None, None)
+
+    def read(path: str | os.PathLike, follow: bool = False) -> tuple[int, int] | None:
+        got = _file_id(path, follow)
+        return got if got is not None else _file_id(path, follow)       # one immediate re-read under the same hold (G4), no pause
+
     try:
         real = _real(scratch_root)
         with _DirHold(base) as reparse:
-            root_a, work_a = _file_id(real, follow=True), _file_id(base)
+            root_a, work_a = read(real, follow=True), read(base)
             with os.scandir(base) as entries:
                 fresh = next(entries, None) is None                     # what mkdtemp just made is EMPTY: a populated one is not ours
-            root_b, work_b = _file_id(real, follow=True), _file_id(base)    # around the scan: a swap between the reads shows as a difference
+            root_b, work_b = read(real, follow=True), read(base)        # around the scan: a swap between the reads shows as a difference
             bound = (reparse is not True and _in_place(base)
                      and os.path.normcase(os.path.dirname(os.path.abspath(base))) == os.path.normcase(real))
             pin = (root_a if root_a == root_b and bound else None, work_a if work_a == work_b and fresh and bound else None)
@@ -4079,6 +4093,8 @@ def remove_exercise_scratch(base: pathlib.Path, scratch_root: pathlib.Path) -> N
     or junction, must never delete a tree whose identity it did not pin, and must never report `removed` unless the tree is gone. A
     concurrent actor that swaps a directory between two system calls cannot be fully excluded without OS handle-based deletion.
     Against that actor the guarantee is FAIL-SAFE: refuse and leave data in place, with a typed reason. It is never "removed".
+    Verbatim (r6 HUB RULING): FAIL-SAFE against a concurrent swapper: refuse and leave data in place with a typed reason; never
+    delete through a link/junction, never delete a tree whose identity was not pinned, never report `removed` unless the tree is gone.
 
     How (see _remove_pinned_scratch): each attempt HOLDS the pinned root (_DirHold) for its whole length, so neither the root nor
     any directory above it can be renamed or replaced while it runs, and checks it is a real directory with the pinned identity.
@@ -4120,7 +4136,7 @@ def _remove_pinned_scratch(base: pathlib.Path, root: pathlib.Path, root_id: tupl
     first = True
     renamed = False                                                     # an identity is adopted only before the first rename
     emptied = False                                                     # this removal's own rmdir of the private name succeeded
-    listed: dict[str, int | None] = {}                                  # every entry's identity as FIRST listed, across attempts
+    listed = _Listed()                                                  # every entry's identity as FIRST listed, across attempts
 
     def where() -> str:
         return "" if target == work else f" (under its private name {target})"
@@ -4228,7 +4244,7 @@ def _remove_pinned_scratch(base: pathlib.Path, root: pathlib.Path, root_id: tupl
                   f"{base}{where()} could not be removed within {ROUTE_SCRATCH_REMOVE_DEADLINE:g}s and is left behind: {failure}") from failure
 
 
-def _remove_tree(top: str | os.PathLike, listed: dict[str, int | None] | None = None) -> None:
+def _remove_tree(top: str | os.PathLike, listed: "_Listed | None" = None) -> None:
     """Remove everything INSIDE the scratch directory `top` (not `top` itself: its holder cannot remove it), which the caller holds
     and has verified as the pinned scratch. Each entry's identity is taken from the LISTING itself (_list_dir: on Windows the file
     id the directory hands out with each name, on POSIX the listing's inode), never from a later lookup of the name. Every directory
@@ -4236,8 +4252,10 @@ def _remove_tree(top: str | os.PathLike, listed: dict[str, int | None] | None = 
     reparse point) that resolves to its own name and carries the listed identity; every entry is deleted by _delete_entry, which on
     Windows opens it (never through a link) and deletes THAT handle only when it carries the listed identity. Anything else stops
     the walk (_NotOurs) with nothing more removed. A link or junction inside is removed as itself, never followed. A held entry is
-    an OSError for the caller's bounded loop."""
-    _remove_contents(os.fspath(top), {} if listed is None else listed)
+    an OSError for the caller's bounded loop. `listed` (kept by the caller across its attempts) records every entry of each
+    directory's FIRST listing before anything in it is acted on; a retry's relisting may only drop entries, and a new name or a
+    listed name with another identity is _NotOurs before anything in that directory is touched (786-D824-B1)."""
+    _remove_contents(os.fspath(top), _Listed() if listed is None else listed)
 
 
 def _list_dir(path: str) -> list[tuple[str, int | None, bool]]:
@@ -4329,10 +4347,31 @@ def _delete_entry(path: str, identity: int | None, is_dir: bool, posix_info: os.
         k32.CloseHandle(handle)
 
 
-def _remove_contents(path: str, listed: dict[str, int | None]) -> None:
-    for child, identity, is_dir in _list_dir(path):
-        if listed.setdefault(os.path.normcase(child), identity) != identity:   # a retry relists: a name is never re-pinned
-            raise _NotOurs(f"{child} is not the entry first listed there")
+class _Listed:
+    """What ONE removal's walk has listed, kept across its attempts (786-D824-B1). `dirs`: the directories already listed once.
+    `ids`: the identity of EVERY entry of each of those FIRST listings, recorded before any per-entry step that can fail, so an
+    entry not yet reached when an attempt failed is still pinned when the next attempt relists its directory."""
+
+    def __init__(self) -> None:
+        self.dirs: set[str] = set()
+        self.ids: dict[str, int | None] = {}
+
+
+def _remove_contents(path: str, listed: _Listed) -> None:
+    entries = _list_dir(path)
+    here = os.path.normcase(path)
+    if here not in listed.dirs:                                         # this directory's FIRST listing: every entry recorded first
+        for child, identity, _ in entries:
+            listed.ids[os.path.normcase(child)] = identity
+        listed.dirs.add(here)
+    else:                                                               # a retry's relisting may only DROP entries (all checked first)
+        for child, identity, _ in entries:
+            key = os.path.normcase(child)
+            if key not in listed.ids:
+                raise _NotOurs(f"{child} was not in the first listing of {path}")
+            if listed.ids[key] != identity:
+                raise _NotOurs(f"{child} is not the entry first listed there")
+    for child, identity, is_dir in entries:
         if not is_dir:
             _remove_entry(child, identity, False)                       # a file, or a link/junction removed as itself
             continue
@@ -4392,7 +4431,8 @@ def make_exercise_scratch(bus: pathlib.Path, scratch_root: pathlib.Path) -> tupl
     base = pathlib.Path(tempfile.mkdtemp(prefix=ROUTE_SCRATCH_PREFIX, dir=str(scratch_root)))
     _SCRATCH_PINS[_scratch_key(base)] = (None, None)                    # made by THIS run, identity not yet read: never adopted later
     try:
-        _pin_scratch(base, scratch_root)                              # what removal must find again; a failure here still removes it
+        _pin_scratch(base, scratch_root)                              # what removal must find again; a pin not completed here leaves
+                                                                        # the scratch as the typed EXERCISE_SCRATCH_NOT_REMOVED (fail-closed, G9)
         clone = base / "bus"
         git_bin, refused = route_git_binary(clone)
         if refused:
