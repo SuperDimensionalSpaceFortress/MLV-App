@@ -476,7 +476,8 @@ def task_argv(task: dict, worktree: Path) -> list[str]:
 def _spawn(argv: list[str], **kwargs):
     """The one place a suite child is started; tests replace it to capture argv and cwd without a real shell."""
     # OR, never replace: a caller flag (a priority class, a new process group) must not drop the hidden-window bit.
-    return subprocess.Popen(argv, creationflags=_NO_WINDOW | kwargs.pop("creationflags", 0), **kwargs)
+    # CREATE_NEW_CONSOLE (0x10) is the one caller flag removed: with it Windows ignores CREATE_NO_WINDOW.
+    return subprocess.Popen(argv, creationflags=_NO_WINDOW | (kwargs.pop("creationflags", 0) & ~0x00000010), **kwargs)
 
 
 def _kill_tree(proc) -> None:
