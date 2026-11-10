@@ -635,7 +635,8 @@ bool ReceiptApplier::lookAssistDisplayMeter(mlvObject_t *mlvObject,
     const double samplePcts[3] = { 0.15, 0.5, 0.85 };
     QByteArray displayThumb;
     displayThumb.resize( width * height * 3 );
-    LookAssistStats samples[3];
+    LookAssistStats rendered[3];
+    int renderedCount = 0;
     int valid = 0;
 
     for( int s = 0; s < 3; ++s )
@@ -656,12 +657,14 @@ bool ReceiptApplier::lookAssistDisplayMeter(mlvObject_t *mlvObject,
                 &displaySettings,
                 reinterpret_cast<unsigned char *>( displayThumb.data() ) ) )
         {
-            const LookAssistStats sampleStats = analyzeLookAssistThumbnail(
+            // Every rendered frame goes to the aggregate: a black (median 0) frame is not read for the exposure, but its
+            // clipped pixels still count against the median-one lift (r4 adversary A1).
+            rendered[renderedCount] = analyzeLookAssistThumbnail(
                 reinterpret_cast<const unsigned char *>( displayThumb.constData() ),
                 width,
                 height );
-            if( sampleStats.median > 0.0 )
-                samples[valid++] = sampleStats;
+            if( rendered[renderedCount].median > 0.0 ) ++valid;
+            ++renderedCount;
         }
 
         if( totalFrames <= 1 ) break;
@@ -671,7 +674,7 @@ bool ReceiptApplier::lookAssistDisplayMeter(mlvObject_t *mlvObject,
     if( validSamples ) *validSamples = valid;
     if( valid <= 0 ) return false;
 
-    *out = lookAssistDisplayMeterAggregate( samples, valid );
+    *out = lookAssistDisplayMeterAggregate( rendered, renderedCount );
     return true;
 }
 

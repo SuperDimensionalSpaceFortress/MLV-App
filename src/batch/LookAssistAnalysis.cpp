@@ -372,27 +372,33 @@ QString lookAssistDecisionLogFields( const LookAssistStats &resolved, const Look
                        : QStringLiteral("NA") );
 }
 
-LookAssistStats lookAssistDisplayMeterAggregate( const LookAssistStats *samples, int count )
+LookAssistStats lookAssistDisplayMeterAggregate( const LookAssistStats *rendered, int count )
 {
     LookAssistStats result;
-    if( !samples || count <= 0 ) return result;
+    if( !rendered || count <= 0 ) return result;
     count = qMin( count, 3 );
-    double median[3], p95[3], p99[3], aboveVideoWhite[3];
+    double median[3], p95[3], p99[3], readClip[3], renderedClip[3];
+    int readCount = 0;
     for( int i = 0; i < count; ++i )
     {
-        median[i] = samples[i].median;
-        p95[i] = samples[i].p95;
-        p99[i] = samples[i].p99;
-        aboveVideoWhite[i] = samples[i].aboveVideoWhite;
+        renderedClip[i] = rendered[i].aboveVideoWhite;
+        if( !( rendered[i].median > 0.0 ) ) continue;   // black: rendered, not read
+        median[readCount] = rendered[i].median;
+        p95[readCount] = rendered[i].p95;
+        p99[readCount] = rendered[i].p99;
+        readClip[readCount] = rendered[i].aboveVideoWhite;
+        ++readCount;
     }
-    std::sort( median, median + count );
-    std::sort( p95, p95 + count );
-    std::sort( p99, p99 + count );
-    std::sort( aboveVideoWhite, aboveVideoWhite + count );
-    result.median = median[count / 2];
-    result.p95 = p95[count / 2];
-    result.p99 = p99[count / 2];
-    result.aboveVideoWhite = aboveVideoWhite[count / 2];
+    if( readCount <= 0 ) return result;
+    std::sort( median, median + readCount );
+    std::sort( p95, p95 + readCount );
+    std::sort( p99, p99 + readCount );
+    std::sort( readClip, readClip + readCount );
+    std::sort( renderedClip, renderedClip + count );
+    result.median = median[readCount / 2];
+    result.p95 = p95[readCount / 2];
+    result.p99 = p99[readCount / 2];
+    result.aboveVideoWhite = qMax( readClip[readCount / 2], renderedClip[count / 2] );
     result.p05 = result.median;
     return result;
 }
@@ -404,7 +410,7 @@ QString lookAssistDisplayMeterLogFields( int samples, const LookAssistStats &met
         .arg( meter.median, 0, 'f', 1 )
         .arg( meter.p95, 0, 'f', 1 )
         .arg( meter.p99, 0, 'f', 1 )
-        .arg( meter.aboveVideoWhite, 0, 'f', 6 )
+        .arg( meter.aboveVideoWhite, 0, 'f', 10 )
         .arg( frame );
 }
 

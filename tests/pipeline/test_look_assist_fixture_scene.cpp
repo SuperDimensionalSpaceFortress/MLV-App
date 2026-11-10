@@ -894,8 +894,9 @@ bool masterDisplayMeterAsWrittenInTheGui( mlvObject_t *video, int analysisFrame,
     const int totalFramesForMeter = static_cast<int>( getMlvFrames( video ) );
     const double samplePcts[3] = { 0.15, 0.5, 0.85 };
     std::vector<unsigned char> displayThumb( static_cast<size_t>( width ) * height * 3 );
-    double medianSamples[3], p95Samples[3], p99Samples[3], aboveVideoWhiteSamples[3];
+    double medianSamples[3], p95Samples[3], p99Samples[3], aboveVideoWhiteSamples[3], renderedAboveVideoWhite[3];
     int validSamples = 0;
+    int renderedSamples = 0;
     for( int s = 0; s < 3; ++s )
     {
         int sampleFrame = analysisFrame;
@@ -909,6 +910,8 @@ bool masterDisplayMeterAsWrittenInTheGui( mlvObject_t *video, int analysisFrame,
                 displayThumb.data() ) )
         {
             const LookAssistStats sampleStats = analyzeLookAssistThumbnail( displayThumb.data(), width, height );
+            // r4 adversary A1: a black frame is not read, but its clip share still counts (the larger of the two medians).
+            renderedAboveVideoWhite[renderedSamples++] = sampleStats.aboveVideoWhite;
             if( sampleStats.median > 0.0 )
             {
                 medianSamples[validSamples] = sampleStats.median;
@@ -927,10 +930,11 @@ bool masterDisplayMeterAsWrittenInTheGui( mlvObject_t *video, int analysisFrame,
         std::sort( p95Samples, p95Samples + validSamples );
         std::sort( p99Samples, p99Samples + validSamples );
         std::sort( aboveVideoWhiteSamples, aboveVideoWhiteSamples + validSamples );
+        std::sort( renderedAboveVideoWhite, renderedAboveVideoWhite + renderedSamples );
         out->median = medianSamples[validSamples / 2];
         out->p95 = p95Samples[validSamples / 2];
         out->p99 = p99Samples[validSamples / 2];
-        out->aboveVideoWhite = aboveVideoWhiteSamples[validSamples / 2];
+        out->aboveVideoWhite = std::max( aboveVideoWhiteSamples[validSamples / 2], renderedAboveVideoWhite[renderedSamples / 2] );
         out->p05 = out->median;
         ok = true;
     }

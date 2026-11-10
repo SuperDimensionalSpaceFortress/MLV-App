@@ -85,13 +85,13 @@ class CompareLookAssistApply(unittest.TestCase):
     def test_the_display_meter_above_video_white_field_is_read_and_compared(self):
         # LOOK-ASSIST-UNDEREXPOSED-DAYLIGHT-AUTO-EXPOSURE-1 r4 (Grok G4a): both display_meter lines print
         # above_video_white, the clip share the median-one lift's 0.002 gate reads. An arm on the other side of the gate
-        # must read as a different analysis, by name, and the 6-decimal value is parsed whole.
+        # must read as a different analysis, by name, and the 10-decimal value is parsed whole.
         meter = "samples=3 robust_median=1.0 robust_p95=21.0 robust_p99=27.0 above_video_white=%s frame=0"
-        rows = compare.parse_log(arm(meter_line=meter % "0.002000"))
+        rows = compare.parse_log(arm(meter_line=meter % "0.0020000000"))
         fields = [f for _n, _s, event, f in rows if event == "look_assist.display_meter"]
-        self.assertEqual(fields[0]["above_video_white"], "0.002000")
-        self.assertEqual(compare.run(arm(meter_line=meter % "0.002000"), arm(meter_line=meter % "0.002000"))["verdict"], "identical")
-        report = compare.run(arm(meter_line=meter % "0.002000"), arm(meter_line=meter % "0.002100"))
+        self.assertEqual(fields[0]["above_video_white"], "0.0020000000")
+        self.assertEqual(compare.run(arm(meter_line=meter % "0.0020000000"), arm(meter_line=meter % "0.0020000000"))["verdict"], "identical")
+        report = compare.run(arm(meter_line=meter % "0.0020000000"), arm(meter_line=meter % "0.0020000396"))
         self.assertEqual(report["verdict"], "differs")
         self.assertTrue(any("display_meter[0].above_video_white" in d for d in report["differences"]), report)
 

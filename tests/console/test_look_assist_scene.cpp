@@ -3740,17 +3740,89 @@ TEST(LookAssistScene, TheDisplayMeterTakesTheMedianOfItsPerFrameClipShares)
     ASSERT_EQ( 0.0, lookAssistDisplayMeterAggregate( nullptr, 3 ).median );
 }
 
+// r4 adversary A1 (d411d205, major): the meter does not READ a black frame (display median 0), but it rendered it, and its
+// clipped pixels must still count. Frames 15% and 85% are 9000 px black, 950 at 120 and 50 (0.5%) saturated red: median 0,
+// so d411d205 dropped them with their 0.005 clip share and lifted the clean 50% frame by +187. The clip share is now the
+// larger of the median over read frames and the median over rendered frames: two clipped frames of three withhold the
+// lift whether or not the meter reads them, and two clean black frames do not dilute a read frame's clip.
+TEST(LookAssistScene, TheDisplayMeterCountsTheClipOfAFrameItRenderedButDidNotRead)
+{
+    const LookAssistStats raw = lookAssistMedianOneRaw1457();
+    std::vector<unsigned char> blackClipped( 10000 * 3, 0 );
+    for( int i = 9000; i < 9950; ++i )
+        blackClipped[i * 3 + 0] = blackClipped[i * 3 + 1] = blackClipped[i * 3 + 2] = 120;
+    for( int i = 9950; i < 10000; ++i )
+        blackClipped[i * 3 + 0] = 255;
+    std::vector<unsigned char> clean( 10000 * 3, 1 );
+    for( int i = 9000; i < 10000; ++i )
+        clean[i * 3 + 0] = clean[i * 3 + 1] = clean[i * 3 + 2] = 120;
+    const LookAssistStats skipped = analyzeLookAssistThumbnail( blackClipped.data(), 100, 100 );
+    const LookAssistStats read = analyzeLookAssistThumbnail( clean.data(), 100, 100 );
+    ASSERT_EQ( 0.0, skipped.median );
+    ASSERT_EQ( 0.005, skipped.aboveVideoWhite );
+    ASSERT_EQ( 1.0, read.median );
+    ASSERT_EQ( 120.0, read.p99 );
+    ASSERT_EQ( 0.0, read.aboveVideoWhite );
+
+    // The adversary's clip: clipped black, clean, clipped black. The exposure statistics are the read frame's; the clip
+    // share is the rendered frames' median, 0.005; no lift (d411d205: median 0 here, then +187 through the meter).
+    const LookAssistStats adversary[3] = { skipped, read, skipped };
+    const LookAssistStats meter = lookAssistDisplayMeterAggregate( adversary, 3 );
+    ASSERT_EQ( 1.0, meter.median );
+    ASSERT_EQ( 120.0, meter.p99 );
+    ASSERT_EQ( 0.005, meter.aboveVideoWhite );
+    ASSERT_EQ( 0, presetForLookAssistScene( LookAssistScene::Night, raw, nullptr, &meter ).exposure );
+    ASSERT_EQ( 0, presetForLookAssistScene( LookAssistScene::Shade, raw, nullptr, &meter ).exposure );
+
+    // One clipped black frame of three does not withhold the lift (the same one-of-three tolerance as read frames).
+    const LookAssistStats oneOfThree[3] = { skipped, read, read };
+    const LookAssistStats tolerated = lookAssistDisplayMeterAggregate( oneOfThree, 3 );
+    ASSERT_EQ( 0.0, tolerated.aboveVideoWhite );
+    ASSERT_EQ( 187, presetForLookAssistScene( LookAssistScene::Night, raw, nullptr, &tolerated ).exposure );
+
+    // Dilution: a clipped READ frame between two clean black frames keeps its own clip share (0.01), not the rendered
+    // median 0.
+    LookAssistStats readClipped = read;
+    readClipped.aboveVideoWhite = 0.01;
+    LookAssistStats blackClean;
+    blackClean.median = 0.0;
+    blackClean.aboveVideoWhite = 0.0;
+    const LookAssistStats diluted[3] = { blackClean, readClipped, blackClean };
+    const LookAssistStats undiluted = lookAssistDisplayMeterAggregate( diluted, 3 );
+    ASSERT_EQ( 1.0, undiluted.median );
+    ASSERT_EQ( 0.01, undiluted.aboveVideoWhite );
+    ASSERT_EQ( 0, presetForLookAssistScene( LookAssistScene::Night, raw, nullptr, &undiluted ).exposure );
+
+    // Nothing read: default stats (median 0), and the caller reports no meter.
+    const LookAssistStats allBlack[2] = { skipped, blackClean };
+    ASSERT_EQ( 0.0, lookAssistDisplayMeterAggregate( allBlack, 2 ).median );
+}
+
 // r4 (Grok G4a): the lift gate is visible. Both display_meter lines (GUI look_assist.display_meter, batch
-// [BATCH] LOOK_ASSIST display_meter) print above_video_white with 6 decimals, so a venue receipt shows why a clip did
-// or did not get the median-one lift: 0.002000 (lifts) and 0.002100 (does not) read apart.
+// [BATCH] LOOK_ASSIST display_meter) print above_video_white with 10 decimals, so a venue receipt shows why a clip did
+// or did not get the median-one lift: 0.0020000000 (lifts) and 0.0021000000 (does not) read apart.
+// r4 adversary A2 (d411d205, minor): at 6 decimals a 279x181 thumbnail with 101 clipped px (101/50499 = 0.0020000396,
+// over the gate, exposure 0) printed 0.002000, the lifting boundary. At 10 decimals it prints above 0.0020000000.
 TEST(LookAssistScene, BothDisplayMeterLinesPrintTheClipShareTheLiftGateReads)
 {
     LookAssistStats meter = lookAssistMedianOneMeter( 1, 21, 27 );
     meter.aboveVideoWhite = 0.0021;
-    ASSERT_EQ( std::string( "samples=3 robust_median=1.0 robust_p95=21.0 robust_p99=27.0 above_video_white=0.002100 frame=42" ),
+    ASSERT_EQ( std::string( "samples=3 robust_median=1.0 robust_p95=21.0 robust_p99=27.0 above_video_white=0.0021000000 frame=42" ),
                lookAssistDisplayMeterLogFields( 3, meter, 42 ).toStdString() );
     meter.aboveVideoWhite = 0.002;
-    ASSERT_TRUE( lookAssistDisplayMeterLogFields( 3, meter, 42 ).contains( QStringLiteral(" above_video_white=0.002000 ") ) );
+    ASSERT_TRUE( lookAssistDisplayMeterLogFields( 3, meter, 42 ).contains( QStringLiteral(" above_video_white=0.0020000000 ") ) );
+
+    // A2's thumbnail, measured: 45000 px at 1, 5398 at 120 and 101 at 250 in 279x181.
+    std::vector<unsigned char> rgb( 279 * 181 * 3, 1 );
+    for( int i = 45000; i < 45000 + 5398; ++i )
+        rgb[i * 3 + 0] = rgb[i * 3 + 1] = rgb[i * 3 + 2] = 120;
+    for( int i = 45000 + 5398; i < 279 * 181; ++i )
+        rgb[i * 3 + 0] = rgb[i * 3 + 1] = rgb[i * 3 + 2] = 250;
+    const LookAssistStats a2 = analyzeLookAssistThumbnail( rgb.data(), 279, 181 );
+    ASSERT_EQ( 101.0 / 50499.0, a2.aboveVideoWhite );
+    ASSERT_TRUE( a2.aboveVideoWhite > 0.002 );
+    ASSERT_EQ( 0, presetForLookAssistScene( LookAssistScene::Night, lookAssistMedianOneRaw1457(), nullptr, &a2 ).exposure );
+    ASSERT_TRUE( lookAssistDisplayMeterLogFields( 3, a2, 0 ).contains( QStringLiteral(" above_video_white=0.0020000396 ") ) );
     meter.aboveVideoWhite = 0.0;
     const QString zero = lookAssistDisplayMeterLogFields( 1, meter, 0 );
     ASSERT_TRUE( QRegularExpression( QStringLiteral(" above_video_white=\\d+\\.\\d{4,} ") ).match( zero ).hasMatch() );
@@ -3766,5 +3838,8 @@ TEST(LookAssistScene, BothDisplayMeterLinesPrintTheClipShareTheLiftGateReads)
     ASSERT_FALSE( applier.contains( QStringLiteral("robust_p99=%") ) );
     ASSERT_FALSE( window.contains( QStringLiteral("robust_p99=%") ) );
     // And the meter itself aggregates through the pinned policy above.
-    ASSERT_EQ( 1, applier.count( QStringLiteral("*out = lookAssistDisplayMeterAggregate( samples, valid );") ) );
+    // Every rendered frame reaches the aggregate (r4 adversary A1), not only the read ones.
+    ASSERT_EQ( 1, applier.count( QStringLiteral("*out = lookAssistDisplayMeterAggregate( rendered, renderedCount );") ) );
+    ASSERT_EQ( 1, applier.count( QStringLiteral("if( rendered[renderedCount].median > 0.0 ) ++valid;") ) );
+    ASSERT_EQ( 1, applier.count( QStringLiteral("++renderedCount;") ) );
 }

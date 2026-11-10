@@ -208,18 +208,24 @@ QString lookAssistDaylightGateName( const LookAssistStats &resolved, bool pictur
  * Pure; reads nothing it was not given. */
 QString lookAssistDecisionLogFields( const LookAssistStats &resolved, const LookAssistDecisionTrace &trace );
 
-/* The display meter's answer from its per-frame samples (ReceiptApplier::lookAssistDisplayMeter; the GUI and batch call
- * that one meter). median, p95, p99 and aboveVideoWhite are each sorted on their own and the element at index count / 2
- * is taken: the middle of three, the upper of two. The fields are independent, so the p99 and the clip share can come
- * from different frames. One clipped frame of three does not withhold the median-one lift; two do; with two samples
- * one does. p05 is the median. count <= 0 returns default stats. Pure. */
-LookAssistStats lookAssistDisplayMeterAggregate( const LookAssistStats *samples, int count );
+/* The display meter's answer from EVERY frame it rendered, up to three (ReceiptApplier::lookAssistDisplayMeter; the GUI
+ * and batch call that one meter). The meter READS a frame whose median is above 0; a black frame is rendered but not read.
+ * median, p95 and p99 are each sorted on their own over the read frames, and the element at index n / 2 is taken: the
+ * middle of three, the upper of two. The clip share (aboveVideoWhite) is the LARGER of two such medians, one over the read
+ * frames and one over every rendered frame. So a frame skipped as black still counts its clipped pixels (r4 adversary A1:
+ * two clipped black-median frames of three withhold the lift), and a clean black frame never dilutes the clip of a frame
+ * the meter reads. When every rendered frame is read, one clipped frame of three does not withhold the median-one lift,
+ * two do, and one of two does. The fields are independent, so the p99 and the clip share can come from different frames.
+ * p05 is the median. No read frame (or count <= 0) returns default stats, median 0. Pure. */
+LookAssistStats lookAssistDisplayMeterAggregate( const LookAssistStats *rendered, int count );
 
 /* The display_meter log fields, shared by the GUI (look_assist.display_meter) and batch ([BATCH] LOOK_ASSIST
  * display_meter) lines, space separated:
  *   samples=n robust_median=(1 decimal) robust_p95=(1 decimal) robust_p99=(1 decimal)
- *   above_video_white=(the aboveVideoWhite fraction, 6 decimals) frame=n
- * above_video_white is what the median-one lift's 0.002 gate reads; 6 decimals put 0.002000 and 0.002100 apart. Pure. */
+ *   above_video_white=(the aboveVideoWhite fraction, 10 decimals) frame=n
+ * above_video_white is what the median-one lift's 0.002 gate reads. It is one frame's k / N (N = thumbnail pixels), which
+ * is either exactly 0.002 or at least 1 / (500 N) away from it, so 10 decimals print it on the correct side of
+ * 0.0020000000 for any N below 4e7 (r4 adversary A2: 101 / 50499 printed 0.002000 at 6 decimals). Pure. */
 QString lookAssistDisplayMeterLogFields( int samples, const LookAssistStats &meter, int frame );
 
 /* The picture rendered at the exposure the daylight verdict would apply (the Shade preset's lift) is a
