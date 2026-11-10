@@ -40,7 +40,11 @@ slice, ``chr(n)``, ``bytes.decode`` / ``str.encode`` (also ``str(b, enc, err)``,
 codecs) with a standard error mode (``ignore``, ``replace``, ``backslashreplace``, ``xmlcharrefreplace``, ``namereplace``, ``surrogateescape``) is run by Python
 itself on the literal (R9-F1). Any other codec or error mode, ``*args``, a call that raises, or a text with an unknown part reads as UNKNOWN (every non-ASCII
 character is any text and the text is padded with a wildcard), never as a literal. A NUL character in a folded text is the wildcard, so the bytes a utf-16 or
-utf-32 encode writes read as unknown pieces (an over-report, never a miss).
+utf-32 encode writes read as unknown pieces (an over-report, never a miss). A literal read through a codec Python knows but the fold does not run
+(``rot_13``, ``base64``, ``hex``, ``zlib``) or through a codec named by a run-time value reads as every spawn-method name and as a launch word, so it is REPORTED
+(pass-25 A2); a case mapper or the default strip does not map a character from U+0080 to U+00FF, which may be a byte of a bytes literal (A1). What stays unread is
+a codec reached through a function the fold does not follow (``functools.partial(codecs.decode, ...)``, a wrapper of your own): the text such a function returns
+over its arguments is hedged only for the names the arguments hold.
 A method called unbound on the type (``str.lower(s)``, ``builtins.str``, ``type('')``, ``''.__class__``) is the bound call, and ``operator.add`` /
 ``concat`` / ``mod`` / ``mul``, ``s.__add__(t)`` and ``''.join(reversed(s))`` are folded like the operators they stand for. A call the fold has no
 arm for hedges its receiver AND every positional argument and keyword value (a call that only looks an attribute up or tests, ``getattr`` and
@@ -89,6 +93,7 @@ from __future__ import annotations
 
 import ast
 import asyncio
+import codecs
 import functools
 import pkgutil
 import posixpath
@@ -361,11 +366,13 @@ _STR_METHODS = frozenset(name for name in dir(str) if not name.startswith("_")) 
 _AMBIGUOUS_ACTIVE: set[int] = set()
 _STR_ALIASES: set[str] = set()  # names the file being scanned binds to the str type (`S = str`, `from builtins import str as S`); set per scan by _note_aliases
 _CODEC_ALIASES: set[str] = set()  # names the file being scanned binds to the codecs module (`import codecs as c`); set per scan by _note_aliases
+_CODEC_FUNCS: dict[str, str] = {}  # names the file binds to codecs.decode / codecs.encode (`from codecs import decode as d`), to the method they stand for
 
 
 def _note_aliases(tree: ast.AST) -> None:
     _STR_ALIASES.clear()
     _CODEC_ALIASES.clear()
+    _CODEC_FUNCS.clear()
     for n in ast.walk(tree):
         if isinstance(n, ast.Assign) and len(n.targets) == 1 and isinstance(n.targets[0], ast.Name):
             v = n.value
@@ -376,6 +383,8 @@ def _note_aliases(tree: ast.AST) -> None:
             _STR_ALIASES.update(a.asname or a.name for a in n.names if a.name in ("str", "bytes"))
         elif isinstance(n, ast.Import):
             _CODEC_ALIASES.update(a.asname or a.name for a in n.names if a.name == "codecs")
+        if isinstance(n, ast.ImportFrom) and n.module == "codecs":
+            _CODEC_FUNCS.update({a.asname or a.name: a.name for a in n.names if a.name in ("decode", "encode")})  # from codecs import decode as d
 
 
 def _codecs_like(recv: ast.AST) -> bool:
@@ -401,6 +410,8 @@ def _bound_form(node: ast.AST, consts: dict[str, str]) -> ast.AST:
     if (isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id in _OPERATOR_BINOPS and len(node.args) == 2 and not node.keywords
             and not any(isinstance(a, ast.Starred) for a in node.args)):  # ``from operator import concat``: concat(a, b)
         return ast.BinOp(left=node.args[0], op=_OPERATOR_BINOPS[node.func.id](), right=node.args[1])
+    if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id in _CODEC_FUNCS and node.args and not isinstance(node.args[0], ast.Starred):
+        return ast.Call(func=ast.Attribute(value=node.args[0], attr=_CODEC_FUNCS[node.func.id], ctx=ast.Load()), args=node.args[1:], keywords=node.keywords)
     if (isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id in ("str", "bytes") and node.args and not isinstance(node.args[0], ast.Starred)
             and (len(node.args) > 1 or any(k.arg in ("encoding", "errors") for k in node.keywords))):
         # R9-F1: ``str(b, 'ascii', 'ignore')`` is ``b.decode('ascii', 'ignore')`` and ``bytes(s, 'ascii', 'ignore')`` is ``s.encode(...)``
@@ -449,12 +460,22 @@ def _fold_codec(node: ast.Call, text: str, known: bool, consts: dict[str, str], 
     slots: dict[str, ast.AST] = dict(zip(("encoding", "errors"), node.args))
     shape_ok = len(node.args) <= 2 and not any(isinstance(a, ast.Starred) for a in node.args) and all(k.arg in ("encoding", "errors") and k.arg not in slots for k in node.keywords)
     plan = None
+    codec_key = None  # the listed codec the call names, or None
+    not_a_codec = False  # the call names a text that is no codec at all (`replace`): it raises, so it reads nothing
     if shape_ok:
         slots.update({k.arg: k.value for k in node.keywords})
         encoding = _flatten(slots["encoding"], consts, depth + 1) if "encoding" in slots else ("utf-8", True)
         errors = _flatten(slots["errors"], consts, depth + 1) if "errors" in slots else ("strict", True)
-        if encoding[1] and errors[1] and re.sub(r"[^a-z0-9]", "", encoding[0].lower()) in _CODEC_KEYS and errors[0] in _CODEC_ERRORS:
-            plan = (encoding[0], errors[0])
+        if encoding[1] and re.sub(r"[^a-z0-9]", "", encoding[0].lower()) in _CODEC_KEYS:
+            codec_key = re.sub(r"[^a-z0-9]", "", encoding[0].lower())
+            if errors[1] and errors[0] in _CODEC_ERRORS:
+                plan = (encoding[0], errors[0])
+        else:
+            not_a_codec = encoding[1] and not _is_codec(encoding[0])
+    if codec_key is None and not not_a_codec and text.replace(_WILD, ""):
+        # A codec the fold does not read (`rot_13`, `base64`, `hex`, one named by a run-time value, `*args`) may rewrite every letter of a LITERAL, so the result
+        # may be any text, a method name or a launch word among them: it reads as every one of them (pass-25 A2). A run-time receiver says nothing.
+        return _unread_codec_text(), False
     if plan is not None and _WILD not in text:
         try:
             if node.func.attr == "decode":
@@ -463,9 +484,40 @@ def _fold_codec(node: ast.Call, text: str, known: bool, consts: dict[str, str], 
         except Exception:  # the call raises at run time, or a text the other way round: not a result to read
             pass
     unknown = re.sub(r"[^\x00-\x7f]", _WILD, text)
-    if plan is None:  # a codec that rewrites characters (`unicode_escape` turns `\x5f` into `_`) or one the fold cannot read: every escape sequence is any text
+    if codec_key in (None, "unicodeescape", "rawunicodeescape"):  # a codec that rewrites characters (`unicode_escape` turns `\x5f` into `_`): every escape sequence is any text
         unknown = _ESCAPE_SEQUENCE_RE.sub(_WILD, unknown)
     return (unknown if _WILD in unknown else _WILD + unknown + _WILD), False
+
+
+@functools.lru_cache(maxsize=256)
+def _is_codec(name: str) -> bool:
+    """Does Python know a codec by this name? (Looked up by the standard library; a name that is not one makes the call raise, so it reads nothing.)"""
+    if len(name) > 64 or not name.isascii() or "\x00" in name:
+        return True  # not a name to look up: read it as the worst case
+    try:
+        codecs.lookup(name)
+    except LookupError:
+        return False
+    except Exception:
+        return True
+    return True
+
+
+def _bytes_or_text(text: str, known: bool) -> tuple[str, bool]:
+    """A character from U+0080 to U+00FF is a byte of a bytes literal (read as latin-1) or a character of a str, and a case mapper or the default strip treats
+    the two differently (``b'\\xdf'.upper()`` is ``b'\\xdf'``, ``'\\xdf'.upper()`` is ``'SS'``; ``b'\\xa0'.strip()`` keeps its byte, ``'\\xa0'.strip()`` does not).
+    The fold does not track which it is reading, so such a character reads as any text (pass-25 A1)."""
+    if re.search(r"[\x80-\xff]", text):
+        return re.sub(r"[\x80-\xff]", _WILD, text), False
+    return text, known
+
+
+def _unread_codec_text() -> str:
+    """What a literal read through a codec the fold does not know may be: a text that reads as EVERY spawn-method name (Python side) or as a launch word
+    (PowerShell side), so a consumer reports it. A pattern that is only wildcards says nothing, and this one is not."""
+    if _HEDGE_MODE[0] == "launch":
+        return _WILD + "Start-Process" + _WILD
+    return _WILD + _WILD.join(sorted(_LOOP_SPAWN_METHODS)) + _WILD
 
 
 def _flatten(node: ast.AST, consts: dict[str, str], depth: int = 0) -> tuple[str, bool]:
@@ -587,13 +639,15 @@ def _flatten(node: ast.AST, consts: dict[str, str], depth: int = 0) -> tuple[str
         if method in _STRING_MAPPERS and not node.keywords and len(node.args) <= 1:
             text, known = _flatten(recv, consts, depth + 1)
             if method in _CASE_MAPPERS and not node.args:
+                text, known = _bytes_or_text(text, known)
                 return getattr(text, method)(), known  # per character: a wildcard stays one
             chars, chars_known = _flatten(node.args[0], consts, depth + 1) if node.args else (None, True)
             if not (known and chars_known):
                 return _hedge_texts([text, chars or ""]), False  # `S.lower('SUBPROCESS_EXEC')` with S an alias of str: the receiver reads as nothing, the argument is the text
             if chars is not None:
                 return (getattr(text, method)(chars), True) if method in ("strip", "lstrip", "rstrip") else (_hedge_texts([text, chars]), False)
-            return getattr(text, method)(), True
+            text, known = _bytes_or_text(text, True)  # the default strip takes the whitespace of a str: more than the whitespace of bytes
+            return getattr(text, method)(), known
     if isinstance(node, (ast.List, ast.Tuple, ast.Set)) and not any(isinstance(e, ast.Starred) for e in node.elts):
         return "".join(_flatten(e, consts, depth + 1)[0] for e in node.elts), False  # a list of texts read as the texts side by side (read only as an argument of a call the fold has no arm for)
     if isinstance(node, ast.Dict) and all(k is not None for k in node.keys):
@@ -1624,6 +1678,13 @@ _PS_CHAR_MAP = str.maketrans({"‘": "'", "’": "'", "‚": "'", "‛": "'", "�
                               "–": "-", "—": "-", "―": "-", " ": " ", "\u0085": " "})
 
 
+def _ps_comment_at(text: str, i: int) -> bool:
+    """Does a PowerShell ``#`` comment start at ``text[i]``? It does wherever a new token can begin: after white space, a quote that closes a string, a
+    bracket, a separator or an operator (``'/c'# -WindowStyle Hidden``, ``(1)# note``), and not inside a bare word (``a#b``). The one predicate the three
+    readers share (pass-25 A3): a comment kept as text could supply a ``-WindowStyle Hidden`` the launch does not carry."""
+    return text[i] == "#" and (i == 0 or not (text[i - 1].isalnum() or text[i - 1] in "_-.:/\\$"))
+
+
 def _quoted_spans(text: str) -> list[tuple[int, int]]:
     """(start, end) of every PowerShell quoted string, both quotes included. A doubled quote escapes itself."""
     spans, i, n = [], 0, len(text)
@@ -1633,7 +1694,7 @@ def _quoted_spans(text: str) -> list[tuple[int, int]]:
             end = text.find("#>", i + 2)
             i = n if end == -1 else end + 2
             continue
-        if quote == "#" and (i == 0 or text[i - 1].isspace() or text[i - 1] in ";|{}("):
+        if _ps_comment_at(text, i):
             while i < n and text[i] != "\n":
                 i += 1
             continue
@@ -1666,7 +1727,7 @@ def _comment_continuations_dropped(script: str) -> str:
             end = n if end == -1 else end + 2
             out.append(script[i:end])
             i = end
-        elif script[i] == "#" and (i == 0 or script[i - 1].isspace() or script[i - 1] in ";|{}("):
+        elif _ps_comment_at(script, i):
             end = script.find("\n", i)
             end = n if end == -1 else end
             line = script[i:end]
@@ -1698,7 +1759,7 @@ def _ps_statements(script: str) -> list[str]:
             end = script.find("#>", i + 2)
             i = n if end == -1 else end + 2
             continue
-        if ch == "#" and (i == 0 or script[i - 1].isspace() or script[i - 1] in ";|{}("):
+        if _ps_comment_at(script, i):
             while i < n and script[i] != "\n":
                 i += 1
             continue
@@ -4404,6 +4465,8 @@ class AdversaryR9Tests(unittest.TestCase):
         self.assertIn("is run by Python itself on the literal (R9-F1)", doc)
         self.assertIn("reads as UNKNOWN (every non-ASCII character is any text and the text is padded with a wildcard), never as a literal", doc)
         self.assertIn("A NUL character in a folded text is the wildcard", doc)
+        self.assertIn("reads as every spawn-method name and as a launch word, so it is REPORTED (pass-25 A2)", doc)
+        self.assertIn("What stays unread is a codec reached through a function the fold does not follow", doc)
 
     def test_r9_f1_clean_controls_stay_clean(self):
         for expr in ("b'value_\\xffx'.decode('ascii', 'ignore')", "b'subprocess_\\xffvalue'.decode('ascii', 'ignore')", "b'subprocess_\\xffexec'.decode('ascii', 'replace')",
@@ -4414,6 +4477,54 @@ class AdversaryR9Tests(unittest.TestCase):
                      "br'sub\\x70rocess_exec'.decode('raw_unicode_escape')"):  # the last: raw_unicode_escape does not read \x70, so Python keeps it as text and it names no method
             self.assertEqual(self._bad("import codecs\n" + self._launch(expr)), [], expr)
             self.assertEqual(self._ps(expr), (0, 0), expr)
+
+
+    # ---- pass 25 (review-adversary-MLV-LANE-CONSOLE-HIDDEN-1-r10-0f30bb2d) A1-A3, as classes ----
+    def test_pass25_a1_a_bytes_method_is_not_read_as_the_str_method_on_a_latin1_character(self):
+        # bytes.upper / swapcase / capitalize / strip leave a byte above 0x7f alone; str maps or strips the same character (sharp s -> SS, no-break space)
+        for expr in ("b'\\xdfsubprocess_exec'.upper()[1:].decode('ascii').lower()", "b'\\xdfSUBPROCESS_EXEC'.swapcase()[1:].decode('ascii')",
+                     "b'\\xdfsubprocess_exec'.lower()[1:].decode('ascii')", "b'\\xdfsubprocess_exec'.capitalize()[1:].decode('ascii')",
+                     "b'\\xa0subprocess_exec'.strip()[1:].decode('ascii')", "b'\\xa0subprocess_exec'.lstrip()[1:].decode('ascii')",
+                     "b'subprocess_exec\\xa0'.rstrip()[:-1].decode('ascii')", "b'\\x85subprocess_shell'.strip()[1:].decode('ascii')",
+                     "b'\\xdf_make_subprocess_transport'.upper()[1:].decode('ascii').lower()", "b'\\xdfsubprocess_shell'.casefold()[1:].decode('ascii')"):
+            self.assertGreaterEqual(len(self._bad(self._launch(expr))), 1, expr)
+        for expr in ("b'\\xdfsaps cmd.exe'.upper()[1:].decode('ascii').lower()", "b'\\xa0saps cmd.exe'.strip()[1:].decode('ascii')",
+                     "b'\\xdfSAPS CMD.EXE'.swapcase()[1:].decode('ascii')", "b'\\xa0Start-Process cmd.exe'.lstrip()[1:].decode('ascii')"):
+            self.assertEqual(self._ps(expr), (1, 1), expr)
+        for expr in ("b'\\xdfvalue'.upper()[1:].decode('ascii').lower()", "'\\u00dfvalue'.upper()", "b'\\xa0value_x'.strip()[1:].decode('ascii')", "'\\u00dfsubprocess_exe'.upper().lower()"):
+            self.assertEqual(self._bad(self._launch(expr)), [], expr)
+            self.assertEqual(self._ps(expr), (0, 0), expr)
+
+    def test_pass25_a2_a_codec_the_fold_does_not_read_may_rewrite_every_letter_of_a_literal(self):
+        for prefix, expr in (("import codecs\n", "codecs.decode('fhocebprff_rkrp', 'rot_13')"), ("import codecs\n", "codecs.decode('fhocebprff_rkrp', 'rot13')"),
+                             ("import codecs\n", "codecs.decode('fhocebprff_funyy', encoding='rot_13')"), ("import codecs\n", "codecs.decode('_znxr_fhocebprff_genafcbeg', 'rot-13')"),
+                             ("import codecs\n", "codecs.decode(b'c3VicHJvY2Vzc19leGVj', 'base64').decode('ascii')"), ("import codecs\n", "codecs.decode(b'7375627072', 'hex').decode()"),
+                             ("import codecs as c\n", "c.decode('fhocebprff_rkrp', 'rot_13')"), ("from codecs import decode as d\n", "d('fhocebprff_rkrp', 'rot_13')"),
+                             ("from codecs import decode\n", "decode(b'c3VicHJvY2Vzc19leGVj', 'base64').decode()"), ("import codecs\n", "codecs.decode('fhocebprff_rkrp', *args)"),
+                             ("", "b'c3VicHJvY2Vzc19leGVj'.decode(enc)"), ("", "'fhocebprff_rkrp'.encode(codec_name)"), ("", "b'x'.decode('zlib_codec')"),
+                             ("import codecs\n", "codecs.encode('subprocess_exec', 'rot_13').lower()")):
+            self.assertGreaterEqual(len(self._bad(prefix + self._launch(expr))), 1, (prefix, expr))
+            text, known = _flatten(ast.parse(expr, mode="eval").body, {})
+            self.assertTrue(known or _WILD in text, expr)
+        for expr in ("codecs.decode('Fgneg-Cebprff pzq.rkr', 'rot_13')", "codecs.decode(b'U3RhcnQtUHJvY2VzcyBjbWQuZXhl', 'base64').decode()", "codecs.decode('fnCF pzq.rkr', 'rot13')"):
+            self.assertEqual(self._ps(expr), (1, 1), expr)
+        for prefix, expr in (("import codecs\n", "codecs.decode(data, 'rot_13')"), ("", "payload.decode(enc)"), ("import codecs\n", "codecs.decode(b'abc', 'ascii')"),
+                             ("import codecs\n", "codecs.decode(read_bytes(), 'utf-8', 'replace')"), ("", "b''.decode(enc)"), ("", "'\\x00'.encode(enc)")):
+            self.assertEqual(self._bad(prefix + self._launch(expr)), [], (prefix, expr))
+            self.assertEqual(self._ps(expr), (0, 0), expr)
+
+    def test_pass25_a3_a_powershell_comment_is_a_comment_wherever_a_token_can_start(self):
+        for script in ("Start-Process cmd.exe -ArgumentList '/c'# -WindowStyle Hidden", "Start-Process cmd.exe -ArgumentList ('/c')# -WindowStyle Hidden",
+                       "Start-Process cmd.exe -ArgumentList @('/c')# -WindowStyle Hidden", "Start-Process cmd.exe -ArgumentList \"/c\"# -WindowStyle Hidden",
+                       "Start-Process cmd.exe -ArgumentList $a[0]# -WindowStyle Hidden", "Start-Process cmd.exe -ArgumentList '/c'# it's -WindowStyle Hidden",
+                       "saps cmd.exe -ArgumentList '/c'#-WindowStyle Hidden", "Start-Process cmd.exe -ArgumentList '/c'# -WindowStyle Hidden `\n -Wait",
+                       "Start-Process cmd.exe -ArgumentList (1)# `\nsaps cmd.exe -WindowStyle Hidden"):
+            self.assertEqual(_judge_script(script)[0], 1 + script.count("\nsaps"), script)
+            self.assertGreaterEqual(_judge_script(script)[1], 1, script)
+            self.assertGreaterEqual(self._ps(repr(script))[1], 1, script)
+        for script in ("Start-Process cmd.exe -ArgumentList '/c' -WindowStyle Hidden # note", "Start-Process cmd.exe -ArgumentList a#b -WindowStyle Hidden",
+                       "Start-Process cmd.exe -ArgumentList '/c' -WindowStyle Hidden;# done", "Start-Process cmd.exe -WindowStyle Hidden -ArgumentList '/c'# ok"):
+            self.assertEqual(_judge_script(script), (1, 0), script)
 
 
 if __name__ == "__main__":
