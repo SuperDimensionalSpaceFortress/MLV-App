@@ -7326,6 +7326,73 @@ TEST(DualIsoPipeline, MixChromaAvx2ProofSurvivesAConsumedWorkerRecon)
     ASSERT_TRUE(recon_worker_split::mixChromaAvx2Used(own));
 }
 
+// Adversary e4160976 A1: a processed8 cache hit (video_mlv.c getMlvProcessedFrame8 goto cleanup), a
+// processed16 cache hit, or a debayered-cache copy skips llrawproc and leaves the thread's last-run
+// full20 record as the previous run left it. drawFrame read that record and published its stale
+// mix_chroma_avx2_used=true for a frame no recon produced. The render thread's flag is now scoped to
+// this frame: it counts only when an llrawproc run started on the thread inside drawFrame.
+TEST(DualIsoPipeline, MixChromaAvx2RenderProofIsFrameScoped)
+{
+    // The run count ticks once per llrawproc run (both entries, even one that returns early), not on
+    // a read and not on a consumer's reset of the last-run records.
+    const quint64 g0 = static_cast<quint64>(llrpGetRunGenerationForCurrentThread());
+    ASSERT_EQ(g0, static_cast<quint64>(llrpGetRunGenerationForCurrentThread()));
+    applyLLRawProcObject(nullptr, nullptr, 0);
+    const quint64 g1 = static_cast<quint64>(llrpGetRunGenerationForCurrentThread());
+    ASSERT_EQ(g0 + 1, g1);
+    (void)applyLLRawProcObject_with_dims(nullptr, nullptr, 0, 0, 0);
+    const quint64 g2 = static_cast<quint64>(llrpGetRunGenerationForCurrentThread());
+    ASSERT_EQ(g1 + 1, g2);
+    llrpResetLastRunTimingForCurrentThread();
+    ASSERT_EQ(g2, static_cast<quint64>(llrpGetRunGenerationForCurrentThread()));
+
+    // The decision drawFrame publishes. A stale true from an earlier run with no run this frame (the
+    // cache-hit frame) is false; a run this frame keeps its own flag, true or false.
+    ASSERT_FALSE(recon_worker_split::renderThreadMixChromaAvx2Used(true, g2, g2));
+    ASSERT_TRUE(recon_worker_split::renderThreadMixChromaAvx2Used(true, g1, g2));
+    ASSERT_FALSE(recon_worker_split::renderThreadMixChromaAvx2Used(false, g1, g2));
+
+    // Through MainWindow's counter: the cache-hit frame carries no worker split, so the render
+    // thread's published flag is what counts, and it must be false.
+    QJsonObject cacheHit;
+    cacheHit.insert(QStringLiteral("dual_iso_full20_valid"), true);
+    cacheHit.insert(recon_worker_split::mixChromaAvx2UsedKey(),
+                    recon_worker_split::renderThreadMixChromaAvx2Used(true, g2, g2));
+    ASSERT_FALSE(recon_worker_split::mixChromaAvx2Used(cacheHit));
+
+    // Wiring: drawFrame takes the count at entry, before any render call, and every render-thread
+    // publish of the flag goes through the frame-scoped decision (never the raw last-run record).
+    QFile file(repo_file_path(QStringLiteral("platform/qt/RenderFrameThread.cpp")));
+    ASSERT_TRUE(file.open(QIODevice::ReadOnly | QIODevice::Text));
+    const QString source = QString::fromUtf8(file.readAll());
+    const qsizetype drawFrame = source.indexOf(QStringLiteral("void RenderFrameThread::drawFrame("));
+    ASSERT_TRUE(drawFrame >= 0);
+    const qsizetype capture = source.indexOf(
+        QStringLiteral("const quint64 llrpRunGenerationAtDrawFrameEntry ="), drawFrame);
+    const qsizetype firstRenderCall = source.indexOf(QStringLiteral("getMlv"), drawFrame);
+    std::fprintf(stderr, "[mix-chroma-proof] case=frame-scoped drawFrame=%lld capture=%lld first_getMlv=%lld\n",
+                 static_cast<long long>(drawFrame), static_cast<long long>(capture),
+                 static_cast<long long>(firstRenderCall));
+    ASSERT_TRUE(capture > drawFrame);
+    ASSERT_TRUE(firstRenderCall < 0 || capture < firstRenderCall);
+    const QString publish =
+        QStringLiteral("slot.stageTimingTelemetry.insert( QStringLiteral(\"dual_iso_full20_mix_chroma_avx2_used\"),");
+    int publishes = 0;
+    for (qsizetype at = source.indexOf(publish); at >= 0; at = source.indexOf(publish, at + 1))
+    {
+        const qsizetype end = source.indexOf(QStringLiteral(");"), at);
+        ASSERT_TRUE(end > at);
+        const QString call = source.mid(at, end - at);
+        std::fprintf(stderr, "[mix-chroma-proof] case=frame-scoped publish_at=%lld scoped=%d\n",
+                     static_cast<long long>(at),
+                     call.contains(QStringLiteral("recon_worker_split::renderThreadMixChromaAvx2Used(")) ? 1 : 0);
+        ASSERT_TRUE(call.contains(QStringLiteral("recon_worker_split::renderThreadMixChromaAvx2Used(")));
+        ASSERT_TRUE(call.contains(QStringLiteral("llrpRunGenerationAtDrawFrameEntry")));
+        ++publishes;
+    }
+    ASSERT_EQ(1, publishes);
+}
+
 // Adversary 457eb203 A1: a frame too narrow to hold a 2x2 cell (ncx = 0) is a plain copy on
 // the fast route; the AVX2 path proof must stay 0 for it.
 TEST(DualIsoPipeline, MixChromaAvx2ProofIsZeroForACelllessPlane)

@@ -80,6 +80,13 @@ static MLV_THREAD_LOCAL int g_llrawproc_last_pre_dualiso_fix_completed = 0;
 static MLV_THREAD_LOCAL double g_llrawproc_last_dual_iso_ms = 0.0;
 static MLV_THREAD_LOCAL double g_llrawproc_last_chroma_smooth_ms = 0.0;
 static MLV_THREAD_LOCAL dualiso_full20bit_timing_t g_llrawproc_last_dual_iso_full20bit_timing = {0};
+/* CPU-S1-DUALISO-MIX-CHROMA-LEVER-2 r3 (adversary e4160976 A1): counts the
+ * llrawproc runs that started on this thread. Only a run rewrites the last-run
+ * records above; a render that skips llrawproc (a processed8/16 or debayered
+ * cache hit) leaves them as the previous run left them. A caller that compares
+ * the count across one frame knows whether the records describe that frame.
+ * Never saved, restored or reset (llrpGetRunGenerationForCurrentThread). */
+static MLV_THREAD_LOCAL uint64_t g_llrawproc_run_generation = 0;
 static MLV_THREAD_LOCAL llrpResidualSubstageTiming_t g_llrawproc_last_residual = {0};
 /* CUDA-RECON-DUALISO-TIMER-SPLIT-1: inside the dual_iso timer (llrawproc.h). */
 static MLV_THREAD_LOCAL llrpDualIsoGpuSplitTiming_t g_llrawproc_last_dual_iso_gpu_split = {0};
@@ -4842,6 +4849,7 @@ void applyLLRawProcObjectWorker(mlvObject_t * video,
     memset(&g_llrawproc_last_residual, 0, sizeof(g_llrawproc_last_residual));
     memset(&g_llrawproc_last_dual_iso_gpu_split, 0, sizeof(g_llrawproc_last_dual_iso_gpu_split));
     llrawproc_reset_dual_iso_full20bit_timing();
+    g_llrawproc_run_generation++;
     g_llrawproc_last_preview_histogram_ms = 0.0;
     g_llrawproc_last_preview_regression_ms = 0.0;
     g_llrawproc_last_preview_rowscale_ms = 0.0;
@@ -6427,6 +6435,7 @@ static int llrawproc_apply_with_dims_internal(mlvObject_t * video,
     memset(&g_llrawproc_last_residual, 0, sizeof(g_llrawproc_last_residual));
     memset(&g_llrawproc_last_dual_iso_gpu_split, 0, sizeof(g_llrawproc_last_dual_iso_gpu_split));
     llrawproc_reset_dual_iso_full20bit_timing();
+    g_llrawproc_run_generation++;
     g_llrawproc_last_preview_histogram_ms = 0.0;
     g_llrawproc_last_preview_regression_ms = 0.0;
     g_llrawproc_last_preview_rowscale_ms = 0.0;
@@ -7044,6 +7053,11 @@ void llrpGetLastDualIsoFull20bitTiming(dualiso_full20bit_timing_t * timing)
 {
     if (!timing) return;
     *timing = g_llrawproc_last_dual_iso_full20bit_timing;
+}
+
+uint64_t llrpGetRunGenerationForCurrentThread(void)
+{
+    return g_llrawproc_run_generation;
 }
 
 double llrpGetLastDualIsoPreviewHistogramMilliseconds(void)
