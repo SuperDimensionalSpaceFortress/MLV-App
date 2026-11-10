@@ -1394,6 +1394,87 @@ def test_a_garbage_deadline_is_refused_even_when_the_shim_is_missing(box) -> Non
     assert box["marker"].exists() and "HEAVY_SLOT_WARN" in ok.stderr
 
 
+# --- LANE-LOCAL-STAGE-CHAIN-DEADLINE-BYPASS-1 r2 (Dot 791-I1 item 2): the deadline's BOUNDARIES at the GUARD layer, via the ENVIRONMENT -----------
+# The assembler and the stage chain hand the guard MLV_HEAVY_SLOT_DEADLINE_UTC (not the -HeavySlotDeadlineUtc option the tests above set), so each
+# boundary is pinned on that path. The other layers' rows: tools/repo_hygiene/test_stage_assembler_requires_heavy_slot_deadline.py (absent/blank are
+# STAGE_NO_HEAVY_SLOT_DEADLINE, exit 27; the rest pass the gate unjudged) and test_stage_chain_deadline_boundaries.py (the chain's invalid-deadline
+# refusal and its UTC hand-over). This layer REFUSES only a malformed value; absent/blank is "no deadline" here (the assembler's gate refuses it
+# upstream), and no layer refuses a deadline that is merely too close. build-guard.ps1 is not changed by this card.
+
+def _env_deadline_attempt(box: dict, value: str) -> subprocess.CompletedProcess:
+    return _stage_attempt(box, extra={"MLV_HEAVY_SLOT_DEADLINE_UTC": value})
+
+
+def _wait_bound_line(done: subprocess.CompletedProcess) -> str:
+    [line] = [l for l in done.stdout.splitlines() if l.startswith("BUILD_HEAVY_SLOT_WAIT_BOUND ")]
+    return line
+
+
+def test_boundary_absent_is_not_judged_by_the_guard_it_keeps_the_60_minute_default(box) -> None:
+    done = _stage_attempt(box)
+    assert done.returncode == 3, done.stdout + done.stderr
+    assert "BUILD_HEAVY_SLOT_WAIT_BOUND" not in done.stdout
+    assert [_wait_minutes(c) for c in _stub_calls(box)] == [60.0]
+
+
+@pytest.mark.parametrize("blank", ["", "   ", "\t"], ids=["empty", "spaces", "tab"])
+def test_boundary_blank_or_whitespace_is_read_as_none_by_the_guard(box, blank) -> None:
+    done = _env_deadline_attempt(box, blank)
+    assert done.returncode == 3, done.stdout + done.stderr
+    assert "BUILD_HEAVY_SLOT_WAIT_BOUND" not in done.stdout
+    assert [_wait_minutes(c) for c in _stub_calls(box)] == [60.0]
+
+
+@pytest.mark.parametrize("bad", ["not-a-date", "2026-13-45T99:00:00Z", "tomorrow"])
+def test_boundary_malformed_is_refused_by_the_guard_with_invalid_option_exit_2(box, bad) -> None:
+    done = _env_deadline_attempt(box, bad)
+    assert done.returncode == 2, done.stdout + done.stderr
+    assert "BUILD_HEAVY_SLOT_REFUSED label=attr3-assemble:abc reason=invalid-option " in done.stdout
+    assert f"HeavySlotDeadlineUtc '{bad}' is not a UTC instant" in done.stdout
+    assert _stub_calls(box) == [] and not box["marker"].exists(), "nothing taken, nothing built"
+
+
+def test_boundary_non_utc_offset_is_accepted_and_bounds_the_wait_by_the_same_instant(box) -> None:
+    from datetime import datetime, timedelta, timezone
+    instant = datetime.now(timezone.utc) + timedelta(minutes=240)
+    local = instant.astimezone(timezone(timedelta(hours=5))).strftime("%Y-%m-%dT%H:%M:%S+05:00")
+    done = _env_deadline_attempt(box, local)
+    assert done.returncode == 0, done.stdout + done.stderr
+    [call] = _stub_calls(box)
+    assert 238 < _wait_minutes(call) <= 240, call["argv"]
+    bound = _wait_bound_line(done)
+    assert instant.strftime("%Y-%m-%dT%H:%M:") in bound and "Z " in bound, (instant, bound)
+
+
+def test_boundary_already_expired_is_one_zero_wait_attempt_never_the_60_minute_default(box) -> None:
+    done = _env_deadline_attempt(box, "2000-01-01T00:00:00Z")
+    assert done.returncode == 3, done.stdout + done.stderr
+    assert [_wait_minutes(c) for c in _stub_calls(box)] == [0.0]
+    assert " wait=0m " in done.stdout and " source=deadline " in done.stdout
+    assert not box["marker"].exists()
+
+
+def test_boundary_expiring_inside_a_minimum_build_window_is_not_refused_unproved_contract_limit(box) -> None:
+    # UNPROVED CONTRACT LIMIT, pinned as it is: nothing enforces a minimum build window. A deadline two minutes out is a ~2 min wait, not a refusal;
+    # a build that cannot finish by then simply loses its turn or runs past the deadline. A layer that starts refusing turns this test red.
+    from datetime import datetime, timedelta, timezone
+    soon = (datetime.now(timezone.utc) + timedelta(minutes=2)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    done = _env_deadline_attempt(box, soon)
+    assert "BUILD_HEAVY_SLOT_REFUSED" not in done.stdout, done.stdout
+    [call] = _stub_calls(box)
+    assert 0 < _wait_minutes(call) <= 2, call["argv"]
+
+
+def test_boundary_valid_passes_through_unchanged_and_the_first_ticket_is_admitted(box) -> None:
+    from datetime import datetime, timedelta, timezone
+    deadline = (datetime.now(timezone.utc) + timedelta(minutes=240)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    done = _env_deadline_attempt(box, deadline)
+    assert done.returncode == 0, done.stdout + done.stderr
+    [call] = _stub_calls(box)
+    assert 239 < _wait_minutes(call) <= 240, call["argv"]
+    assert f" deadline={deadline[:-1]}" in _wait_bound_line(done) and box["marker"].exists()
+
+
 def test_the_wait_is_taken_from_the_deadline_at_launch_not_before_a_slow_diagnostic(box) -> None:
     # adversary cd45eeb5-A3: the wait was computed, then a diagnostic or probe could take seconds, then heavy-slot started with the stale
     # figure, so its queue timeout landed after the driver's deadline. Here the held-slot probe takes 3 s; the deadline is 4 s out, so

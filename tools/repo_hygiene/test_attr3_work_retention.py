@@ -413,7 +413,9 @@ class AssemblerSourceArchiveTests(_PwshCase):
             [shutil.which("pwsh"), "-NoLogo", "-NoProfile", "-NonInteractive", "-File", str(ASSEMBLER),
              "-SourceCommit", sha, "-DllPairDir", str(self.tmp / "no-such-dll-pair"), "-OutDir", str(out_dir),
              "-RepoRoot", str(repo)],
-            capture_output=True, text=True)
+            capture_output=True, text=True,
+            # LANE-LOCAL-STAGE-CHAIN-DEADLINE-BYPASS-1: the assembler refuses (exit 27) without a heavy-slot deadline; this run stops at the DLL pair, before any wait.
+            env={**os.environ, "MLV_HEAVY_SLOT_DEADLINE_UTC": "2099-01-01T00:00:00Z"})
 
     def test_the_source_archive_is_gone_after_a_failed_run_and_its_tree_was_built_from_it(self) -> None:
         repo = self.tmp / "tiny-repo"
