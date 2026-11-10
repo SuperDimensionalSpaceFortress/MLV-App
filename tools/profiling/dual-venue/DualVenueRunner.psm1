@@ -3673,6 +3673,18 @@ function Test-DvReceiptValid {
             if ($conformArm.blocks) { $invalid.Add("CONFORM_ARM_NOT_HONOURED: $($conformArm.reason); a leg that did not play under the conform arm it names is not a valid measurement") }
         }
 
+        # ---- the PRESENTMON GAP: re-derived from the VERIFIED verbatim metrics, the writer's own verdict (PRESENTMON-BACHELOR-CUDA-INTERNAL-GAP-1) --------
+        # PR #788 r1 sol B2: a reader must never count what the writer would refuse. A receipt whose job published presentMonTemporalWindowSource (this card's
+        # job) is judged by the same Get-DvPresentMonGapVerdict Invoke-VenueLeg applies: a blocking verdict is INVALID here (so every reader that gates on this
+        # status -- Invoke-VenueBaseline, New-VenueSheetPair, New-VenueFlavorPair -- counts no figure), and an APP_SWAP_STALL derives FAIL below. A receipt
+        # that predates the field keeps the classification it had (its gap was never judged by the writer either).
+        $presentMonGap = $null
+        if ($null -ne (Get-DvProp $metrics 'presentMonTemporalWindowSource')) {
+            # adversary r4 A1: the backend the HASHED summary derives in production (never a receipt field); a receipt with none is INVALID above
+            $presentMonGap = Get-DvPresentMonGapVerdict -Metrics $metrics -Backend $(if ($production) { $derivedBackend } else { $backend })
+            if ($presentMonGap.blocks) { $invalid.Add("$($presentMonGap.reason). A leg whose PresentMon gap the app's own swap record does not explain is not counted") }
+        }
+
         # ---- the OUTCOME: re-derived from the job's result, its exit code, the verbatim metrics and the COMMITTED criteria -----------
         $resolved = $null
         if ($null -ne $exit) {
@@ -3704,6 +3716,8 @@ function Test-DvReceiptValid {
                     }
                 }
                 $expected = $(if (-not $sheetOk) { 'FAIL' } elseif ($verdict.pass) { 'PASS' } else { 'FAIL' })
+                # PR #788 r1 opus B3: the app's own swap stall is counted, as a FAIL (the writer's order: after the criteria, before the scale override)
+                if ($expected -ceq 'PASS' -and $null -ne $presentMonGap -and $presentMonGap.failsLeg) { $expected = 'FAIL' }
                 # a capture that did not render at the scale the leg asked for (or declared) is no signal either way (the runner's own order: scale first)
                 if (-not $scaleVerdict.honoured) { $expected = 'SCALE_NOT_HONOURED' }
             }
@@ -4121,6 +4135,114 @@ function Test-DvCriteria {
     [pscustomobject]@{ pass = ($failures.Count -eq 0); informational = $false; failures = @($failures) }
 }
 
+# PRESENTMON-BACHELOR-CUDA-INTERNAL-GAP-1: the receipt-level PresentMon gap bound. It is the job's own temporal ceiling
+# (playback-attr-3-cuda-job.ps1 $presentMonSufficiencyMaxGapMs, PRESENTMON-HARNESS-ROBUSTNESS-2 r1b; test_presentmon_playback_window_gap.py pins
+# the two equal). Measured inside the app's swap window, 12 sampled Bachelor CUDA legs read 70-184 ms (worst bracket end) and the app's
+# own largest swap gap there and on the r4 stalled leg was 96.4 ms, so the bound never trips on a healthy leg. A gap past it is EITHER the app's own
+# playback stall (PR #788 r1 opus B3: 13 of 2,889 local run logs carry an app max_gap_ms >= 5000 inside the swap window, e.g. 21359.466 ms) OR lost
+# PresentMon rows. The same swap record's max_gap_ms tells them apart: a gap it accounts for is a real stall that is counted (the leg FAILs);
+# only a gap it does not account for is PresentMon's, and then GPU timing on the presents in it is unreachable, so the leg is no measurement.
+$script:PresentMonGapBoundMs = 5000.0
+# How far the PresentMon gap may sit from the app's own max_gap_ms and still be the same stall. PresentMon's rows here are the DISPLAYED presents
+# (msBetweenDisplayChange > 0), so a present beside the stall that was not displayed widens the PresentMon gap by one frame interval (41.7 ms at
+# 24 fps), and a present call's timestamp sits a few ms from the app's swap stamp. 250 ms (six 24 fps frames) is the job's own tolerance for
+# matching PresentMon present rows to the app's swap stamps (playback-attr-3-cuda-job.ps1 $presentMonJobStopMaxEdgeGapMs), 5% of the bound.
+$script:PresentMonAppStallToleranceMs = 250.0
+
+function Get-DvPresentMonGapVerdict {
+    <#
+    .SYNOPSIS
+    PRESENTMON-BACHELOR-CUDA-INTERNAL-GAP-1: does this leg's PresentMon capture have a gap longer than the bound? Read from the receipt's verbatim
+    metrics only: presentMonStatus, presentMonTemporalMaxGapMs, presentMonTemporalGapKind, presentMonTemporalWindowSource.
+    NOT_APPLICABLE (no block) when presentMonStatus is not 'ok' or 'degraded'. A CPU leg's PresentMon is informational and reads 'unavailable',
+    and the DISPLAY_ASLEEP override reads 'unavailable' too. Otherwise FAIL CLOSED:
+      PRESENTMON_METRICS_UNTYPED (PR #788 r2 sol A2) presentMonStatus, presentMonTemporalGapKind or presentMonTemporalWindowSource present but not a
+                                 [string], or presentMonTemporalOverBoundGapAtAppStall present but not a [bool]: nothing is compared, it blocks;
+      PRESENTMON_GAP_UNMEASURED  a usable status with no finite non-negative gap;
+      APP_SWAP_STALL             (PR #788 r1 opus B3) a gap over the bound inside the app's swap window that the app's own swap record accounts for:
+                                 the gap is internal (between two presents; a head or tail gap is never an inter-swap gap), it is the only gap
+                                 over the bound at every permitted origin (presentMonTemporalOverBoundGapCount = 1: one max_gap_ms explains one
+                                 gap), it is within $script:PresentMonAppStallToleranceMs of presentMonTemporalAppSwapMaxGapMs, that app gap is
+                                 itself over the bound (CoS G8), and presentMonTemporalOverBoundGapAtAppStall is not $false (the gap sits at the
+                                 app's own longest-gap swap ordinal when the record carries one; $null is size-only). A real
+                                 playback stall: blocks = $false, failsLeg = $true (the leg is counted, as a FAIL);
+      PRESENTMON_INTERNAL_GAP    a gap over the bound inside the app's swap window that the app's record does not account for (no, or an
+                                 unparseable, app max gap fails closed here: it is never assumed to explain the gap);
+      PRESENTMON_GAP_UNLOCATED   a gap over the bound measured over the process lifetime (no swap window, or a job before this card).
+                                 The gap may be the app's own pre-roll, but nothing places it outside playback, so it is not counted;
+      WITHIN_BOUND               no block.
+    Pure: the runner gates on it after the verbatim metrics are copied, and Test-DvReceiptValid re-derives it from the verified metrics.
+    adversary r4 (78b6b9b2) A1: -Backend is mandatory. On the cpu backend PresentMon is informational and never gating, whatever status the job
+    published (its cpu override rewrites only a non-OK display report, so a 'degraded' capture can reach here): NOT_APPLICABLE. Any other
+    backend, including a missing one, is judged (fail closed). The writer passes the leg's backend; the validator the one the hashed summary derives.
+    #>
+    param(
+        [AllowNull()]$Metrics,
+        [Parameter(Mandatory = $true)][AllowNull()][AllowEmptyString()][string]$Backend
+    )
+    $bound = $script:PresentMonGapBoundMs
+    $tolerance = $script:PresentMonAppStallToleranceMs
+    $rawStatus = Get-DvProp $Metrics 'presentMonStatus'
+    $status = [string]$rawStatus
+    $rawGap = Get-DvProp $Metrics 'presentMonTemporalMaxGapMs'
+    $kind = Get-DvProp $Metrics 'presentMonTemporalGapKind'
+    $source = Get-DvProp $Metrics 'presentMonTemporalWindowSource'
+    $rawAppGap = Get-DvProp $Metrics 'presentMonTemporalAppSwapMaxGapMs'
+    $rawOverCount = Get-DvProp $Metrics 'presentMonTemporalOverBoundGapCount'
+    $atAppStall = Get-DvProp $Metrics 'presentMonTemporalOverBoundGapAtAppStall'
+    # PR #788 r2 sol A2 (fable hardening DV-PRESENTMON-GAP-VERDICT-STRING-TYPED-OPERANDS-1): a Boolean or number on the LEFT of -ceq converts the
+    # right operand to its own type, so a JSON true in source or kind read as 'app_swap_window' / 'internal'. Every string field this verdict reads
+    # must be a [string] (or absent), and the placement field a [bool] (or absent); anything else is a blocking typed refusal, never compared.
+    $untyped = @(foreach ($field in @(@('presentMonStatus', $rawStatus), @('presentMonTemporalGapKind', $kind), @('presentMonTemporalWindowSource', $source))) {
+        if ($null -ne $field[1] -and -not ($field[1] -is [string])) { "$($field[0]) is a $($field[1].GetType().Name) ('$($field[1])'), not a string" }
+    })
+    if ($null -ne $atAppStall -and -not ($atAppStall -is [bool])) { $untyped += "presentMonTemporalOverBoundGapAtAppStall is a $($atAppStall.GetType().Name) ('$atAppStall'), not a Boolean" }
+    $gap = $null
+    if ($rawGap -is [double] -or $rawGap -is [int] -or $rawGap -is [long] -or $rawGap -is [decimal]) {
+        $d = [double]$rawGap
+        if (-not [double]::IsNaN($d) -and -not [double]::IsInfinity($d) -and $d -ge 0) { $gap = $d }
+    }
+    $appGap = $null
+    if ($rawAppGap -is [double] -or $rawAppGap -is [int] -or $rawAppGap -is [long] -or $rawAppGap -is [decimal]) {
+        $d = [double]$rawAppGap
+        if (-not [double]::IsNaN($d) -and -not [double]::IsInfinity($d) -and $d -ge 0) { $appGap = $d }
+    }
+    $overCount = $null
+    if ($rawOverCount -is [int] -or $rawOverCount -is [long]) { $overCount = [long]$rawOverCount }
+    $verdict = 'WITHIN_BOUND'
+    $reason = $null
+    if ($Backend -ceq 'cpu') {
+        $verdict = 'NOT_APPLICABLE'
+        $reason = "the leg ran on the cpu backend, where PresentMon is informational and never gating (presentMonStatus '$status')"
+    }
+    elseif ($untyped.Count -gt 0) {
+        $verdict = 'PRESENTMON_METRICS_UNTYPED'
+        $reason = "PRESENTMON_METRICS_UNTYPED: $($untyped -join '; '), so the gap's window and kind are not established and it is not judged"
+    }
+    elseif ($status -cnotin @('ok', 'degraded')) {
+        $verdict = 'NOT_APPLICABLE'
+        $reason = "presentMonStatus is '$status', not ok or degraded: no PresentMon cadence to bound"
+    }
+    elseif ($null -eq $gap) {
+        $verdict = 'PRESENTMON_GAP_UNMEASURED'
+        $reason = "PRESENTMON_GAP_UNMEASURED: presentMonStatus is '$status' but presentMonTemporalMaxGapMs is '$rawGap', not a finite non-negative number"
+    }
+    elseif ($gap -gt $bound -and $source -ceq 'app_swap_window' -and $kind -ceq 'internal' -and $overCount -eq 1 -and $null -ne $appGap -and $appGap -gt $bound -and [math]::Abs($gap - $appGap) -le $tolerance -and $atAppStall -ne $false) {
+        # CoS G8: the app's own gap must itself be over the bound (a sub-bound app stall is not the one over-bound gap, whatever its size), and when the
+        # record places it (max_gap_before_serial) PresentMon's gap must sit there ($false refuses; $null, a record without the ordinal, is size-only).
+        $verdict = 'APP_SWAP_STALL'
+        $reason = "APP_SWAP_STALL: a $([math]::Round($gap, 1)) ms internal PresentMon gap inside the app's swap window is the app's own stall: its swap record's max_gap_ms is $([math]::Round($appGap, 1)) ms (over the bound, within $([math]::Round($tolerance)) ms)$(if ($atAppStall -eq $true) { ' at the same swap ordinal' } else { '' }) and it is the only gap over the $([math]::Round($bound)) ms bound, so PresentMon lost nothing and the leg is counted as a playback stall"
+    }
+    elseif ($gap -gt $bound) {
+        $appNote = $(if ($source -cne 'app_swap_window') { '' } elseif ($null -eq $appGap) { "; the app's swap record carries no usable max_gap_ms ('$rawAppGap'), so nothing explains it" } else { "; the app's own swap record does not account for it (max_gap_ms $([math]::Round($appGap, 1)) ms$(if ($appGap -le $bound) { ' is not over the bound' } else { '' }), gap kind '$kind', $(if ($null -eq $overCount) { 'no' } else { $overCount }) gap(s) over the bound$(if ($atAppStall -eq $false) { ', not at the app''s own longest-gap swap ordinal' } else { '' }))" })
+        $where = $(if ($source -ceq 'app_swap_window') { "inside the app's swap window" } else { "over the MLVApp process lifetime (window source '$source'), so nothing places it outside playback" })
+        $verdict = $(if ($source -ceq 'app_swap_window') { 'PRESENTMON_INTERNAL_GAP' } else { 'PRESENTMON_GAP_UNLOCATED' })
+        $reason = "${verdict}: a $([math]::Round($gap, 1)) ms $kind PresentMon gap $where exceeds the $([math]::Round($bound)) ms bound$appNote; GPU timing on the presents in it is unreachable"
+    }
+    [ordered]@{ verdict = $verdict; blocks = ($verdict -cin @('PRESENTMON_METRICS_UNTYPED', 'PRESENTMON_GAP_UNMEASURED', 'PRESENTMON_INTERNAL_GAP', 'PRESENTMON_GAP_UNLOCATED')); failsLeg = ($verdict -ceq 'APP_SWAP_STALL')
+        boundMs = $bound; gapMs = $gap; gapKind = $kind; windowSource = $source; appSwapMaxGapMs = $appGap; overBoundGapCount = $overCount; overBoundGapAtAppStall = $atAppStall; reason = $reason }
+}
+
 function Get-DvVerbatimMetrics {
     <#
     .SYNOPSIS
@@ -4363,4 +4485,4 @@ Export-ModuleMember -Function Get-DvOutcomeEnum, ConvertTo-DvCanonicalJson, Get-
     Test-DvUnderClaudeState, Test-DvLocalReceiptRoot, Read-DvClipConsent, Get-DvClipAdmission, Get-DvSmokeSummaryFields, Get-DvConformPaceProof, Get-DvConformArmVerdict, Get-DvMinPlaySeconds, Get-DvPlaybackProblems,
     Get-DvPlaybackEvidence, Get-DvScaleEvidence, Get-DvScaleLabel, Get-DvDisplayEvidence, Get-DvUnpacedEvidence, Get-DvLookLabelEvidence, Get-DvWorkerThreadsEvidence, Get-DvPrepConflatedMoveEvidence, Get-DvLookAssistEvidence, Get-DvLegSetPlan, Get-DvSmokeSessionLineFields, Get-DvSmokeSessionLineRead, Get-DvLogRecordBody, Get-DvMatrixRates, Get-DvMatrixRow, Get-DvMedian, ConvertTo-DvMatrixTable, Get-DvBlobById, Find-DvCommittedLegSpec, Read-DvCommittedLookReceipt, Read-DvEvidenceSet, Test-DvJsonEquivalent, Test-DvReceiptValid, Get-DvJobNotAfter, Get-DvUmRunNotAfterArgs, Get-DvUmRunDropVisibleUtc, Get-DvUmRunDropNotAfter, Test-DvNotAfterCoversDrop, Get-DvHealthVerdict,
     New-DvHealthProbeJobText, ConvertFrom-DvProbeStdout,
-    Get-DvResultToken, Resolve-DvJobOutcome, Test-DvCriteria, Get-DvVerbatimMetrics, Get-DvCriteriaMetrics, New-DvReceipt, Write-DvReceipt
+    Get-DvResultToken, Resolve-DvJobOutcome, Test-DvCriteria, Get-DvPresentMonGapVerdict, Get-DvVerbatimMetrics, Get-DvCriteriaMetrics, New-DvReceipt, Write-DvReceipt

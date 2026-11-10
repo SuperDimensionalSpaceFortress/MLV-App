@@ -91,6 +91,15 @@ inline int skippedFrames( double fromPosition, double toPosition )
     return skipped > 0 ? skipped : 0;
 }
 
+/*! HFR-NATIVE-M16-1457-GUI-PRESENT-CADENCE-1: the drop-frame advance that puts \a position (m_newPosDropMode) on
+ *  the next whole source frame, in (0, 1]. A position on a whole frame needs a whole frame. */
+inline double framesToNextWholeFrame( double position )
+{
+    // adversary r1 A2: no epsilon -- the slider truncates m_newPosDropMode (setValue, currentPlaybackAdvanceTarget), so
+    // 7.9999999999 shows frame 7 and is 1e-10 from frame 8
+    return std::floor( position ) + 1.0 - position;
+}
+
 /*! CUDA-HEADROOM-1: the pace handed to the guard. A pace of 0 or less is already "unknown, leave the request
  *  unchanged" in grant()/grantWholeFrame(), so unpaced means the guard limits nothing (the throughput legs). */
 inline double guardPaceFps( double paceFps, bool unpaced ) { return unpaced ? 0.0 : paceFps; }
@@ -130,6 +139,29 @@ public:
     bool armed() const { return m_armed; }
     bool awaitingFirstPresent() const { return m_awaitingFirstPresent; }
     double creditFrames() const { return m_creditFrames; }
+
+    /*! HFR-NATIVE-M16-1457-GUI-PRESENT-CADENCE-1: the wall ms from \a nowMs until the credit covers \a framesNeeded,
+     *  i.e. when the next advance is due. 0 when the pace is not positive (unpaced: nothing to wait for), when the
+     *  clock is not armed, or when the credit (with the accrual up to \a nowMs) already covers it. Read-only: it
+     *  accrues nothing, and before this Play's first present it honours the carry cap exactly as accrue() does. */
+    double msUntilCredit( double framesNeeded, double nowMs, double paceFps ) const
+    {
+        if( !( paceFps > 0.0 ) || !m_armed ) return 0.0;
+        double credit = m_creditFrames;
+        if( nowMs > m_lastMs ) credit += ( nowMs - m_lastMs ) * paceFps / 1000.0;
+        double needed = framesNeeded;
+        if( m_awaitingFirstPresent )
+        {
+            // accrue() banks no more than the carry before this Play's first present, so the credit stops there and
+            // the most a wake can wait for is the carry itself
+            if( credit > kMaxCarryFrames ) credit = kMaxCarryFrames;
+            if( needed > kMaxCarryFrames ) needed = kMaxCarryFrames;
+        }
+        if( credit + kEpsilonFrames >= needed ) return 0.0;
+        // adversary r1 A5: before the clock's last accrual nothing accrues, so a query from earlier waits for that instant first
+        const double notYetAccruingMs = nowMs < m_lastMs ? m_lastMs - nowMs : 0.0;
+        return notYetAccruingMs + ( needed - credit ) * 1000.0 / paceFps;
+    }
 
     /*! Drop-frame mode: the share of \a requestedFrames (a fractional source-frame
      *  advance) the wall clock allows at \a nowMs, spent from the credit. A pace
