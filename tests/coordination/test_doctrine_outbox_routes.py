@@ -4550,3 +4550,87 @@ def test_r7_4e_a2_two_listed_names_that_differ_only_in_case_are_two_entries(tmp_
     ob.remove_exercise_scratch(base, root)
     assert fed, "the case twin was never listed"
     assert list(root.iterdir()) == [], list(root.iterdir())
+
+
+# Adversary pass r8 (head a18ce4a8): A1 (blocker) a delete or a rename that opens an entry by NAME follows a directory junction put
+# on an INTERMEDIATE component after the walk verified it, so the handle's identity can match the listed one while the object is
+# OUTSIDE the scratch (a hardlink to a file elsewhere); the handle's own final path must be the path asked for. A2 (major) a
+# POSIX retry after a permission denial is bound to the listed entry's identity, not only to "still a plain entry".
+
+def _outside_file_and_junction(tmp_path):
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    precious = outside / "precious.txt"
+    precious.write_text("not ours", encoding="utf-8")
+    scratch = tmp_path / "scratch"
+    scratch.mkdir()
+    made = subprocess.run(["cmd", "/c", "mklink", "/J", str(scratch / "D"), str(outside)], capture_output=True, text=True)
+    assert made.returncode == 0, made.stdout + made.stderr
+    return precious, scratch / "D"
+
+
+@pytest.mark.skipif(os.name != "nt", reason="a directory junction on an intermediate component is a Windows thing")
+def test_r8_a1_delete_by_name_never_deletes_through_a_junction_on_an_intermediate_component(tmp_path):
+    precious, junction = _outside_file_and_junction(tmp_path)
+    listed_id = os.lstat(precious).st_ino                                # the identity the walk listed under D\precious.txt
+    with pytest.raises(ob._NotOurs):
+        ob._delete_entry(str(junction / "precious.txt"), listed_id, False)
+    assert precious.read_text(encoding="utf-8") == "not ours", "a file outside the scratch was deleted through a junction"
+
+
+@pytest.mark.skipif(os.name != "nt", reason="a directory junction on an intermediate component is a Windows thing")
+def test_r8_a1_sibling_rename_by_handle_never_moves_a_directory_reached_through_a_junction(tmp_path):
+    root = tmp_path / "root"
+    work = root / "work"
+    work.mkdir(parents=True)
+    link = tmp_path / "rootlink"
+    made = subprocess.run(["cmd", "/c", "mklink", "/J", str(link), str(root)], capture_output=True, text=True)
+    assert made.returncode == 0, made.stdout + made.stderr
+    ident = ob._file_id(work)
+    with pytest.raises(ob._NotOurs):
+        ob._rename_verified(link / "work", link / "work2", ident)
+    assert work.exists() and not (root / "work2").exists(), "a directory was renamed through a junction on its parent"
+
+
+@pytest.mark.parametrize("is_dir", [False, True])
+def test_r8_a2_a_posix_retry_after_a_denial_never_acts_on_a_replacement_of_the_listed_entry(tmp_path, monkeypatch, is_dir):
+    """The first unlink/rmdir is denied; before the retry the listed entry is moved aside and a stable ordinary replacement
+    is put under the same name. The retry must not delete the replacement."""
+    real_os = os
+
+    class PosixOs:
+        name = "posix"
+        denied: list = []
+
+        def __getattr__(self, item):
+            return getattr(real_os, item)
+
+        def _first_call_is_denied(self, real, path):
+            if not self.denied:
+                self.denied.append(path)
+                real_os.rename(path, path + ".aside")                    # the listed entry moves away ...
+                if is_dir:                                               # ... and a replacement takes the name
+                    real_os.mkdir(path)
+                else:
+                    Path(path).write_text("not ours", encoding="utf-8")
+                raise PermissionError(13, "denied", path)
+            return real(path)
+
+        def unlink(self, path):
+            return self._first_call_is_denied(real_os.unlink, path)
+
+        def rmdir(self, path):
+            return self._first_call_is_denied(real_os.rmdir, path)
+
+    entry = tmp_path / "entry"
+    if is_dir:
+        entry.mkdir()
+    else:
+        entry.write_text("ours", encoding="utf-8")
+    listed = os.lstat(entry)
+    monkeypatch.setattr(ob, "os", PosixOs())
+    with pytest.raises((PermissionError, ob._NotOurs)):
+        ob._delete_entry(str(entry), listed.st_ino, is_dir)
+    assert entry.exists(), "the retry removed a replacement of the listed entry"
+    assert PosixOs.denied, "the denial seam never ran"
+    assert (tmp_path / "entry.aside").exists(), "the listed entry was not the one moved aside"

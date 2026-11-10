@@ -3977,7 +3977,47 @@ def _kernel32():
     k32.SetFileInformationByHandle.argtypes = [wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD]
     k32.CloseHandle.restype = wintypes.BOOL
     k32.CloseHandle.argtypes = [wintypes.HANDLE]
+    k32.GetFinalPathNameByHandleW.restype = wintypes.DWORD
+    k32.GetFinalPathNameByHandleW.argtypes = [wintypes.HANDLE, wintypes.LPWSTR, wintypes.DWORD, wintypes.DWORD]
+    k32.GetLongPathNameW.restype = wintypes.DWORD
+    k32.GetLongPathNameW.argtypes = [wintypes.LPCWSTR, wintypes.LPWSTR, wintypes.DWORD]
     return k32
+
+
+def _at_its_own_name(handle, path: str) -> bool:
+    """Windows: True when the object the open HANDLE refers to has, as its own final path, the name `path` was opened by. CreateFileW
+    with FILE_FLAG_OPEN_REPARSE_POINT refuses a link only at the LAST component; a junction on any directory above it (put there
+    after the walk verified that directory) is followed, and the handle then carries the identity of an object elsewhere (a
+    hardlink to a file outside the scratch has the same file id under both names). The handle's final path is that of the object
+    itself, so a handle reached through a junction names another directory and is refused (adversary r8 A1). `path` is compared
+    after the same long-name expansion and case folding Windows applies (8.3 names, drive-letter case), never after resolution."""
+    import ctypes
+    k32 = _kernel32()
+
+    def text(call) -> str | None:
+        size = 1024
+        while True:
+            buffer = ctypes.create_unicode_buffer(size)
+            got = call(buffer, size)
+            if not got:
+                return None
+            if got < size:
+                return buffer.value
+            size = got + 1
+
+    final = text(lambda buffer, size: k32.GetFinalPathNameByHandleW(handle, buffer, size, 0))
+    if final is None:
+        raise OSError(None, ctypes.FormatError(ctypes.get_last_error()), path, ctypes.get_last_error())
+    wanted = os.path.abspath(path)
+    wanted = text(lambda buffer, size: k32.GetLongPathNameW(wanted, buffer, size)) or wanted
+
+    def plain(name: str) -> str:
+        if name.startswith("\\\\?\\UNC\\"):
+            name = "\\\\" + name[8:]
+        elif name.startswith("\\\\?\\"):
+            name = name[4:]
+        return os.path.normcase(name)
+    return plain(final) == plain(wanted)
 
 
 class _DirHold:
@@ -4315,14 +4355,22 @@ def _delete_entry(path: str, identity: int | None, is_dir: bool, posix_info: os.
     and the delete. A different object is _NotOurs, nothing deleted. A non-empty directory or a held entry is an OSError (retried).
     Elsewhere: rmdir/unlink by name after an lstat identity check (the window between them is the documented POSIX limit)."""
     if os.name != "nt":
-        if identity is not None or posix_info is not None:
+        def listed_one() -> bool:                                       # the entry under `path` is the listed object (r8 A2)
             now = _meta(os.lstat, path)
-            if (identity is not None and now.st_ino != identity) or (posix_info is not None and _ident(now) != _ident(posix_info)):
-                raise _NotOurs(f"{path} is not the entry listed there")
+            return not ((identity is not None and now.st_ino != identity)
+                        or (posix_info is not None and _ident(now) != _ident(posix_info)))
+
+        if (identity is not None or posix_info is not None) and not listed_one():
+            raise _NotOurs(f"{path} is not the entry listed there")
         try:
             _meta(os.rmdir if is_dir else os.unlink, path)
         except PermissionError as denied:
-            _writable_retry(os.rmdir if is_dir else os.unlink, path, None, os.path.dirname(path))
+            def still_listed() -> bool:                                 # asked before the chmod and before the retry: a replacement
+                try:                                                    # moved in after the denial is never chmodded or unlinked (r8 A2)
+                    return identity is None and posix_info is None or listed_one()
+                except OSError:
+                    return False
+            _writable_retry(os.rmdir if is_dir else os.unlink, path, None, os.path.dirname(path), ours=still_listed)
             try:
                 _meta(os.lstat, path)                                   # strict: an unreadable entry is not a removed one
             except (FileNotFoundError, NotADirectoryError):
@@ -4342,8 +4390,8 @@ def _delete_entry(path: str, identity: int | None, is_dir: bool, posix_info: os.
         if not k32.GetFileInformationByHandle(handle, ctypes.byref(info)):
             code = ctypes.get_last_error()
             raise OSError(None, ctypes.FormatError(code), path, code)
-        if identity is None or ((info[11] << 32) | info[12]) != identity:
-            raise _NotOurs(f"{path} is not the entry listed there")
+        if identity is None or ((info[11] << 32) | info[12]) != identity or not _at_its_own_name(handle, path):
+            raise _NotOurs(f"{path} is not the entry listed there")        # a junction above it leads elsewhere (r8 A1)
         flags = ctypes.c_uint32(0x1 | 0x2 | 0x10)                         # DELETE | POSIX_SEMANTICS | IGNORE_READONLY_ATTRIBUTE
         if k32.SetFileInformationByHandle(handle, 21, ctypes.byref(flags), 4):   # FileDispositionInfoEx
             return
@@ -4412,8 +4460,8 @@ def _rename_verified(src: pathlib.Path, dst: pathlib.Path, ident: tuple[int, int
         raise
     try:
         seen = _meta(os.fstat, fd)
-        if not _plain_dir(seen) or _ident(seen) != ident:
-            raise _NotOurs(f"{src} is not the scratch directory pinned for it")
+        if not _plain_dir(seen) or _ident(seen) != ident or not _at_its_own_name(handle, os.fspath(src)):
+            raise _NotOurs(f"{src} is not the scratch directory pinned for it")   # or it was reached through a junction (r8 A1)
         name = os.path.abspath(os.fspath(dst)).encode("utf-16-le", "surrogatepass")   # the FULL path: kernel32 reads a bare
         ptr = ctypes.sizeof(ctypes.c_void_p)                             # name against the process's current directory
         head = 2 * ptr + 4                                               # ReplaceIfExists (0, padded), RootDirectory (NULL), FileNameLength
