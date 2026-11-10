@@ -45,6 +45,8 @@ import sys
 import time
 from pathlib import Path
 
+_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
+
 SCHEMA = "mlv-app/runtime-floors/v1"
 DEFAULT_MANIFEST = "tools/coordination/runtime-floors.json"
 PS_RUNTIMES = ("powershell-5.1", "pwsh")
@@ -285,7 +287,7 @@ def snapshot_report(snapshot: list[tuple]) -> list[str]:
 
 def _probe(argv: list[str], timeout: int = 60) -> str | None:
     try:
-        done = subprocess.run(argv, capture_output=True, text=True, timeout=timeout)
+        done = subprocess.run(argv, capture_output=True, text=True, timeout=timeout, creationflags=_NO_WINDOW)
     except (OSError, subprocess.TimeoutExpired):
         return None
     return done.stdout.strip() if done.returncode == 0 else None
@@ -326,7 +328,7 @@ def _git(worktree: Path, *args: str, nul: bool = False) -> list[str]:
     quote, tab, newline or non-ASCII character is returned as written, never as a quoted escape string."""
     try:
         done = subprocess.run(["git", "-C", str(worktree), "-c", "core.quotepath=off", *args],
-                              capture_output=True, timeout=120)
+                              capture_output=True, timeout=120, creationflags=_NO_WINDOW)
     except (OSError, subprocess.TimeoutExpired) as exc:
         raise Undecidable(f"git {' '.join(args)} could not run: {exc}") from exc
     if done.returncode != 0:
@@ -473,7 +475,7 @@ def task_argv(task: dict, worktree: Path) -> list[str]:
 
 def _spawn(argv: list[str], **kwargs):
     """The one place a suite child is started; tests replace it to capture argv and cwd without a real shell."""
-    return subprocess.Popen(argv, **kwargs)
+    return subprocess.Popen(argv, creationflags=kwargs.pop("creationflags", _NO_WINDOW), **kwargs)
 
 
 def _kill_tree(proc) -> None:
@@ -482,7 +484,7 @@ def _kill_tree(proc) -> None:
     if _IS_NT:
         try:
             subprocess.run(["taskkill.exe", "/PID", str(proc.pid), "/T", "/F"], capture_output=True,
-                           timeout=TASKKILL_TIMEOUT)
+                           timeout=TASKKILL_TIMEOUT, creationflags=_NO_WINDOW)
             return
         except (OSError, subprocess.TimeoutExpired):
             pass

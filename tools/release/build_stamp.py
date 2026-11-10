@@ -4,6 +4,9 @@ from __future__ import annotations
 import argparse, hashlib, json, re, subprocess, sys
 from datetime import datetime, timezone
 from pathlib import Path
+import os
+
+_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
 
 SHA = re.compile(r"^[0-9a-f]{40}$")
 MARKER = b"MLVAPP_BUILDSTAMP_v1|"
@@ -12,7 +15,7 @@ STAMP = re.compile(rb"MLVAPP_BUILDSTAMP_v1\|sha=([0-9a-f]{40})\|dirty=([01])(?=\
 def git(root: Path, *args: str) -> str:
     try:
         p = subprocess.run(["git", "-C", str(root), *args], check=True,
-                           stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                           stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, creationflags=_NO_WINDOW)
     except (OSError, subprocess.CalledProcessError) as e:
         raise RuntimeError(f"git {' '.join(args)} failed") from e
     return p.stdout

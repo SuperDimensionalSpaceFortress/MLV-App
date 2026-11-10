@@ -36,6 +36,8 @@ import sys
 from datetime import datetime, timezone
 from typing import List, Optional, Tuple
 
+_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
+
 DEFAULT_REPO = "layibabalola/softwarefactory-fleet-doctrine"
 DEFAULT_REF = "master"
 CANDIDATE_ZERO = "agent-bridge-sot-suspend-mlv-in-tree-20260909.md"
@@ -97,7 +99,7 @@ def _gh_api(path: str) -> dict:
             ["gh", "api", path],
             capture_output=True,
             text=True,
-            check=False,
+            check=False, creationflags=_NO_WINDOW,
         )
     except FileNotFoundError as exc:
         raise RuntimeError("gh-not-found: %s" % exc) from exc

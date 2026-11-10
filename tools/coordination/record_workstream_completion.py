@@ -3,6 +3,8 @@ import argparse, hashlib, json, math, os, subprocess, sys, tempfile
 from datetime import datetime, timezone
 from pathlib import PurePosixPath
 
+_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
+
 SCHEMA='mlv-app/workstream-completion/v1'
 LANE='mlv-app/fleet-lane-receipt/v1'
 REVIEW='mlv-app/workstream-review/v1'
@@ -94,7 +96,7 @@ def required(obj,keys,code):
 
 def git(worktree,*args,allow_failure=False):
     try:
-        proc=subprocess.run(['git','-C',worktree,*args],stdout=subprocess.PIPE,stderr=subprocess.PIPE,timeout=30,check=False)
+        proc=subprocess.run(['git','-C',worktree,*args],stdout=subprocess.PIPE,stderr=subprocess.PIPE,timeout=30,check=False, creationflags=_NO_WINDOW)
     except subprocess.TimeoutExpired: fail('git-timeout',' '.join(args))
     except OSError as exc: fail('git-unavailable',exc)
     if proc.returncode and not allow_failure:

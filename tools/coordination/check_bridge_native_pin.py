@@ -70,6 +70,8 @@ import sys
 import tarfile
 import tempfile
 
+_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
+
 AGENT_DIR = "tools/agent-bridge"
 TEST_FILE = "test_server_wrapper_phase2.py"
 SERVER_FILE = "server.py"
@@ -412,7 +414,7 @@ def _replace(path, source):
 def _parent(ref, test_source, server_source):
     """Return (verdict line, exit code). Printing is main()'s job, after cleanup has been attempted."""
     env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_TRACE")}
-    data = subprocess.check_output(["git", "archive", ref, AGENT_DIR], env=env)
+    data = subprocess.check_output(["git", "archive", ref, AGENT_DIR], env=env, creationflags=_NO_WINDOW)
     kwargs = {"ignore_cleanup_errors": True} if sys.version_info >= (3, 10) else {}
     with tempfile.TemporaryDirectory(**kwargs) as tmp:
         with tarfile.open(fileobj=io.BytesIO(data)) as tar:
@@ -435,7 +437,7 @@ def _parent(ref, test_source, server_source):
             f.write(FORCING_STUB)
         nonce = secrets.token_hex(16)
         proc = subprocess.run([sys.executable, "-I", os.path.abspath(__file__), CHILD_FLAG, agent_dir],
-                              input=nonce + "\n", cwd=tmp, env=env, capture_output=True, text=True, timeout=300)
+                              input=nonce + "\n", cwd=tmp, env=env, capture_output=True, text=True, timeout=300, creationflags=_NO_WINDOW)
     prefix = "RESULT %s " % nonce
     verdicts = [l[len(prefix):] for l in proc.stdout.splitlines() if l.startswith(prefix)]
     if len(verdicts) == 1 and verdicts[0].split(" ")[0] in VERDICT_CODE \

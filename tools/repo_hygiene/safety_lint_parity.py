@@ -103,6 +103,8 @@ import sys
 import tempfile
 from pathlib import Path
 
+_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
+
 ROOT = Path(__file__).resolve().parents[2]
 HERE = Path(__file__).resolve().parent
 HOOK_REL = "tools/hooks/mlv-never-authorized.py"
@@ -140,7 +142,7 @@ class ParityError(Exception):
 
 def git(root: Path, *args: str) -> str:
     try:
-        done = subprocess.run(["git", "-C", str(root), *args], capture_output=True, timeout=120)
+        done = subprocess.run(["git", "-C", str(root), *args], capture_output=True, timeout=120, creationflags=_NO_WINDOW)
     except (OSError, subprocess.TimeoutExpired) as exc:
         raise ParityError(f"git {' '.join(args)} could not run: {exc}") from exc
     if done.returncode != 0 or not done.stdout:
@@ -275,7 +277,7 @@ def git_path_exists(root: Path, ref: str, rel: str) -> bool:
     """True when `rel` is in the tree of `ref`. A git failure raises ParityError (it is never read as 'absent')."""
     try:
         # DG-GIT-PATHLIST (r7): quotepath off, so a non-ASCII path is never read back in its quoted form (only emptiness is tested here).
-        done = subprocess.run(["git", "-C", str(root), "-c", "core.quotepath=false", "ls-tree", "--name-only", ref, "--", rel], capture_output=True, timeout=120)
+        done = subprocess.run(["git", "-C", str(root), "-c", "core.quotepath=false", "ls-tree", "--name-only", ref, "--", rel], capture_output=True, timeout=120, creationflags=_NO_WINDOW)
     except (OSError, subprocess.TimeoutExpired) as exc:
         raise ParityError(f"git ls-tree {ref} -- {rel} could not run: {exc}") from exc
     if done.returncode != 0:
@@ -807,7 +809,7 @@ def playback_probe_counts(pb, lint: Path, texts: list[str], work: Path, tag: str
         "}\n",
     )
     proc = subprocess.Popen([pb.PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-File", str(probe)],
-                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, creationflags=_NO_WINDOW)
     try:
         out, err = proc.communicate(timeout=1500)
     except subprocess.TimeoutExpired:

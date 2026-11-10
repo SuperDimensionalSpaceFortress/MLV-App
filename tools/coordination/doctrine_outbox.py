@@ -163,6 +163,8 @@ from collections.abc import Iterable
 from datetime import datetime, timedelta, timezone
 from typing import NamedTuple
 
+_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
+
 # ---------- constants that are fleet-wide, not per project ----------
 
 GUARD_MARKER = "# doctrine-outbox-guard"
@@ -517,7 +519,7 @@ _GIT_VERSION_RE = re.compile(r"^git version (\d+)\.(\d+)(?:\.(\d+))?")
 @functools.lru_cache(maxsize=1)
 def git_version_text() -> str:
     """`git --version`, probed once per process (the seam the tests replace). A git that cannot be run raises OSError."""
-    return subprocess.run(["git", "--version"], capture_output=True, text=True, timeout=30).stdout
+    return subprocess.run(["git", "--version"], capture_output=True, text=True, timeout=30, creationflags=_NO_WINDOW).stdout
 
 
 def parse_git_version(text: str) -> tuple[int, int, int] | None:
@@ -559,7 +561,7 @@ def _run_git(repo: pathlib.Path, args: list[str], input_text: str | None = None,
     return subprocess.run(
         ["git", "-C", str(repo), "-c", "core.autocrlf=false", "-c", "core.safecrlf=false", *args],
         capture_output=True, text=True, encoding="utf-8", errors="replace",
-        input=input_text, timeout=120, env=env,
+        input=input_text, timeout=120, env=env, creationflags=_NO_WINDOW,
     )
 
 
@@ -596,7 +598,8 @@ def cat_file_blob(repo: pathlib.Path, ref: str, path: str, extra_env: dict[str, 
     None leaves the environment untouched."""
     proc = subprocess.run(
         ["git", "-C", str(repo), "cat-file", "blob", f"{ref}:{path}"],
-        capture_output=True, timeout=120, **({"env": {**os.environ, **extra_env}} if extra_env else {}),
+        capture_output=True, timeout=120, creationflags=_NO_WINDOW,
+        **({"env": {**os.environ, **extra_env}} if extra_env else {}),
     )
     if proc.returncode == 0:
         return proc.stdout
@@ -1312,7 +1315,7 @@ def validate_cards_file(wt: pathlib.Path, cards_file: pathlib.Path | None = None
             proc = subprocess.run(
                 [node, str(wt / CARD_VALIDATOR_REL), "--bus", str(wt), "--file", str(cards_file or wt / CARDS_TARGET), "--project", PROJECT],
                 capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=CARD_VALIDATOR_TIMEOUT_S, env=env,
-                cwd=child_cwd,
+                cwd=child_cwd, creationflags=_NO_WINDOW,
             )
     except (OSError, subprocess.TimeoutExpired) as e:
         raise Refusal("CARD_VALIDATOR_FAILED", type(e).__name__) from e
@@ -3662,7 +3665,7 @@ def _kill_route_tree(proc: subprocess.Popen, job: "_WinJob | None") -> None:
             job.close()
         else:
             try:
-                subprocess.run(["taskkill", "/T", "/F", "/PID", str(proc.pid)], capture_output=True, timeout=30)
+                subprocess.run(["taskkill", "/T", "/F", "/PID", str(proc.pid)], capture_output=True, timeout=30, creationflags=_NO_WINDOW)
             except (OSError, subprocess.SubprocessError):
                 pass
     else:
@@ -3709,7 +3712,7 @@ def run_bounded_process(argv: list[str], cwd: pathlib.Path, env: dict[str, str],
     last ROUTE_OUTPUT_CAP_BYTES of each stream are kept."""
     extra = {"start_new_session": True} if os.name != "nt" else {}
     proc = subprocess.Popen(argv, cwd=str(cwd), stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                            env=env, bufsize=0, **extra)
+                            env=env, bufsize=0, creationflags=_NO_WINDOW, **extra)
     job = None
     if os.name == "nt":
         try:

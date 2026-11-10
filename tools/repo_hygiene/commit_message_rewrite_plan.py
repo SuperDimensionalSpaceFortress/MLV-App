@@ -9,6 +9,9 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence
+import os
+
+_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
 
 
 VAGUE_SUBJECT_PATTERNS = [
@@ -46,7 +49,7 @@ def run_git(repo_root: Path, args: Sequence[str]) -> str:
         encoding="utf-8",
         errors="replace",
         stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
+        stderr=subprocess.PIPE, creationflags=_NO_WINDOW,
     )
     return result.stdout
 

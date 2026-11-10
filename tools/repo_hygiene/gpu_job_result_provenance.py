@@ -31,6 +31,9 @@ import subprocess
 import sys
 from pathlib import Path
 from typing import Any, Protocol
+import os
+
+_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
 
 
 DEFAULT_LLRAWPROC_PATH = "src/mlv/llrawproc/llrawproc.c"
@@ -58,7 +61,7 @@ class SubprocessGitWitness:
         result = subprocess.run(
             ["git", "-C", str(self.repo_root), *args],
             capture_output=True,
-            check=False,
+            check=False, creationflags=_NO_WINDOW,
         )
         if result.returncode not in allowed_returncodes:
             stderr = result.stderr.decode("utf-8", errors="replace").strip()
@@ -69,7 +72,7 @@ class SubprocessGitWitness:
         result = subprocess.run(
             ["git", "-C", str(self.repo_root), "cat-file", "-e", f"{commit}^{{commit}}"],
             capture_output=True,
-            check=False,
+            check=False, creationflags=_NO_WINDOW,
         )
         return result.returncode == 0
 
