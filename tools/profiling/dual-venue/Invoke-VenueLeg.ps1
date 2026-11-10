@@ -968,12 +968,18 @@ if ($outcome -in @('PASS', 'FAIL') -and $display.blocks) {
 # PRESENTMON-BACHELOR-CUDA-INTERNAL-GAP-1, FAIL CLOSED: a leg with a usable PresentMon status whose capture has a gap longer than the bound (5000 ms, the job's own temporal
 # ceiling) inside the app's swap window, or a gap that only the process-lifetime window measured, is no measurement: GPU timing on the presents in that gap is
 # unreachable. A typed INVALID (PRESENTMON_INTERNAL_GAP / PRESENTMON_GAP_UNLOCATED / PRESENTMON_GAP_UNMEASURED), never a PASS or FAIL. The verdict is recorded on every receipt with metrics.
+# PR #788 r1 opus B3: a gap the app's OWN swap record accounts for (APP_SWAP_STALL) is not PresentMon's: it is a real playback stall, counted as a FAIL with
+# the stall named, never INVALID. Test-DvReceiptValid re-derives both from the verified metrics.
 if ($null -ne $receipt.metrics) {
     $presentMonGapVerdict = Get-DvPresentMonGapVerdict -Metrics $receipt.metrics
     $receipt['presentMonGap'] = $presentMonGapVerdict
     if ($outcome -in @('PASS', 'FAIL') -and $presentMonGapVerdict.blocks) {
-        $detail = "INVALID: the job result was $outcome ($detail) but $($presentMonGapVerdict.reason). A leg whose PresentMon capture lost that span is not counted"
+        $detail = "INVALID: the job result was $outcome ($detail) but $($presentMonGapVerdict.reason). A leg whose PresentMon gap the app's own swap record does not explain is not counted"
         $outcome = 'INVALID'
+    }
+    elseif ($outcome -in @('PASS', 'FAIL') -and $presentMonGapVerdict.failsLeg) {
+        $detail = "FAIL: the job result was $outcome ($detail) but $($presentMonGapVerdict.reason). A real playback stall fails the leg"
+        $outcome = 'FAIL'
     }
 }
 # HFR-NATIVE-60FPS-FULLRES-1, FAIL CLOSED: a leg that names a conform arm (generatorArgs.playbackConform) and whose run log does not prove the app played under it is no

@@ -481,11 +481,12 @@ class GeneratorByteIdentityAndVariantTests(unittest.TestCase):
     CPU_GL_ENV_CLEAR_CLOSE = "PROCESSED8-CPU-LEG-GL-VIEWPORT-ENV-CLEAR-1 <<<"
     CPU_GL_ENV_CLEAR_REGIONS = 3
     # PRESENTMON-BACHELOR-CUDA-INTERNAL-GAP-1: the PresentMon temporal arm judged over the app's own swap window (Get-AttrCudaPlaybackTemporalCoverage and the job's use of it).
-    # Six regions in the default job: the report field in Get-AttrCudaPresentMonDisplayReport, the helper's splice, the template's window block, the failed-arm reason's window suffix, the manifest fields, the summary fields. Absent
+    # Seven regions in the default job: the report field in Get-AttrCudaPresentMonDisplayReport, the helpers' splice, the template's window block, the job-stop arm's strict
+    # swap-stamp re-read (PR #788 r1 sol B1; after the base parse, which stays verbatim), the failed-arm reason's window suffix, the manifest fields, the summary fields. Absent
     # from the baseline, whose temporal arm is the process-lifetime Get-AttrCudaTemporalCoverage line (kept verbatim outside the regions).
     PM_INTERNAL_GAP_OPEN = "PRESENTMON-BACHELOR-CUDA-INTERNAL-GAP-1 >>>"
     PM_INTERNAL_GAP_CLOSE = "PRESENTMON-BACHELOR-CUDA-INTERNAL-GAP-1 <<<"
-    PM_INTERNAL_GAP_REGIONS = 6
+    PM_INTERNAL_GAP_REGIONS = 7
 
     @classmethod
     def strip_regions(cls, text: str) -> tuple[str, dict[str, int]]:

@@ -23,7 +23,7 @@ import re
 import unittest
 from pathlib import Path
 
-from tools.repo_hygiene.test_dual_venue_evidence import requires_windows_pwsh, run_pwsh, run_pwsh_json
+from tools.repo_hygiene.test_dual_venue_evidence import EvidenceFactory, requires_windows_pwsh, run_pwsh, run_pwsh_json
 
 ROOT = Path(__file__).resolve().parents[2]
 MODULE = ROOT / "tools" / "profiling" / "bachelor" / "AttrCudaArtifacts.psm1"
@@ -123,7 +123,7 @@ class AdversaryR1Tests(unittest.TestCase):
 
     def test_a1_a_swap_marker_quoted_in_another_records_location_suffix_is_never_the_window(self) -> None:
         log = ("[2026-11-09T00:00:30Z] [INFO] [0x1] playback_smoke.gpu_window_swaps session=1 window_active=1 telemetry_enabled=1 swaps=30 "
-               "first_swap_utc=2026-11-09T00:00:01Z last_swap_utc=2026-11-09T00:00:30Z\n"
+               "first_swap_utc=2026-11-09T00:00:01.000Z last_swap_utc=2026-11-09T00:00:30.000Z\n"
                "[2026-11-09T00:00:31Z] [INFO] [0x1] harmless record (C:/b playback_smoke.gpu_window_swaps first_swap_utc=2026-11-08 "
                "last_swap_utc=2026-11-09 x/MainWindow.cpp:1)\n")
         r = coverage([1000.0 * i for i in range(1, 31)], log, early="2026-11-09T00:00:00.0000000Z", late="2026-11-09T00:00:00.0000000Z")["r"]
@@ -133,7 +133,7 @@ class AdversaryR1Tests(unittest.TestCase):
 
     def test_a2_an_endpoint_with_zero_rows_is_never_outvoted_by_a_sufficient_one(self) -> None:
         log = ("playback_smoke.gpu_window_swaps session=1 window_active=1 telemetry_enabled=1 swaps=30 "
-               "first_swap_utc=2026-11-09T00:00:01Z last_swap_utc=2026-11-09T00:00:02Z")
+               "first_swap_utc=2026-11-09T00:00:01.000Z last_swap_utc=2026-11-09T00:00:02.000Z")
         r = coverage([2000.0 + i for i in range(30)], log, early="2026-11-09T00:00:00.0000000Z", late="2026-11-09T00:00:01.0000000Z")["r"]
         self.assertFalse(r["sufficient"], r)
 
@@ -151,7 +151,7 @@ class AdversaryR2Tests(unittest.TestCase):
 
     EARLY = "2026-11-09T00:00:00.0000000Z"
     GOOD = ("playback_smoke.gpu_window_swaps session=1 window_active=1 telemetry_enabled=1 swaps=30 "
-            "first_swap_utc=2026-11-09T00:00:01Z last_swap_utc=2026-11-09T00:00:30Z")
+            "first_swap_utc=2026-11-09T00:00:01.000Z last_swap_utc=2026-11-09T00:00:30.000Z")
     EMPTY = "playback_smoke.gpu_window_swaps session=2 window_active=1 telemetry_enabled=1 swaps=0 first_swap_utc= last_swap_utc= superseded_before_paint=0"
 
     def test_a1_a_last_record_without_stamps_is_unavailable_never_an_earlier_sessions_window(self) -> None:
@@ -166,7 +166,7 @@ class AdversaryR2Tests(unittest.TestCase):
 
     def test_a2_a_gap_the_bracket_permits_between_the_endpoints_is_never_admitted(self) -> None:
         log = ("playback_smoke.gpu_window_swaps session=1 window_active=1 telemetry_enabled=1 swaps=162 "
-               "first_swap_utc=2026-11-09T00:01:00Z last_swap_utc=2026-11-09T00:01:25Z")
+               "first_swap_utc=2026-11-09T00:01:00.000Z last_swap_utc=2026-11-09T00:01:25.000Z")
         times = [38000.0 + 250.0 * i for i in range(81)] + [65000.0 + 250.0 * i for i in range(81)]
         r = coverage(times, log, early=self.EARLY, late="2026-11-09T00:00:22.0000000Z")["r"]
         # An origin 11 s into the bracket puts a 7 s hole inside the window: sufficient must be false (or the arm unavailable, never a pass).
@@ -187,7 +187,7 @@ class JobWiringTests(unittest.TestCase):
 
     def test_the_job_embeds_and_calls_the_playback_window_coverage(self) -> None:
         # Its own bracketed splice (the dual-venue byte-identity strip removes the card's text with the region), not a name in the base -Name list.
-        self.assertIn("(Get-AttrCudaEmbeddedFunctionSource -Name @(\n    'Get-AttrCudaPlaybackTemporalCoverage'\n))", self.job)
+        self.assertIn("(Get-AttrCudaEmbeddedFunctionSource -Name @(\n    'ConvertFrom-AttrCudaSwapStampUtc',\n    'Get-AttrCudaPlaybackTemporalCoverage'\n))", self.job)
         self.assertIn("# PRESENTMON-BACHELOR-CUDA-INTERNAL-GAP-1 >>>", self.job)
         self.assertIn("$presentMonPlaybackTemporal = Get-AttrCudaPlaybackTemporalCoverage -TimeInMsValues @($displayReport.targetPositiveIntervalTimesMs) "
                       "-LogText $rawLog -EarliestAnchorUtc $presentMonCaptureStartUtc -LatestAnchorUtc $presentMonPostSpawnUtc "
@@ -210,6 +210,15 @@ class JobWiringTests(unittest.TestCase):
 def verdict(metrics: dict) -> dict:
     proc, out = run_pwsh_json("$m = $env:PMG_M | ConvertFrom-Json\n(Get-DvPresentMonGapVerdict -Metrics $m) | ConvertTo-Json -Compress", PMG_M=json.dumps(metrics))
     if out is None:
+        raise AssertionError(proc.stdout + proc.stderr)
+    return out
+
+
+def verdicts(metrics: list[dict]) -> list[dict]:
+    """Get-DvPresentMonGapVerdict over several metrics blocks in ONE pwsh process."""
+    proc, out = run_pwsh_json("$o = foreach ($m in @($env:PMG_M | ConvertFrom-Json)) { Get-DvPresentMonGapVerdict -Metrics $m }\n"
+                              "ConvertTo-Json -InputObject @($o) -Compress -Depth 4", PMG_M=json.dumps(metrics))
+    if out is None or len(out) != len(metrics):
         raise AssertionError(proc.stdout + proc.stderr)
     return out
 
@@ -265,6 +274,252 @@ class ReceiptGuardWiringTests(unittest.TestCase):
         gate = leg.index("if ($outcome -in @('PASS', 'FAIL') -and $presentMonGapVerdict.blocks) {")
         self.assertIn("$outcome = 'INVALID'", leg[gate:gate + 600])
         self.assertLess(leg.index("$receipt.metrics = Get-DvVerbatimMetrics"), leg.index("$presentMonGapVerdict = Get-DvPresentMonGapVerdict"))
+
+
+def swap_stamps(values: list[str]) -> list[object]:
+    """ConvertFrom-AttrCudaSwapStampUtc on each raw stamp, in ONE pwsh process: 'KIND=<kind> <ISO round-trip>' of the instant, or None."""
+    script = (f"Import-Module '{MODULE}' -Force\n"
+              "foreach ($v in @($env:PMG_S | ConvertFrom-Json)) { $d = ConvertFrom-AttrCudaSwapStampUtc -Value ([string]$v).Substring(2)\n"
+              "  if ($null -eq $d) { 'NULL' } else { 'KIND=' + $d.Kind + ' ' + $d.ToString('o') } }\n")
+    # ("s:" keeps ConvertFrom-Json from turning a bare ISO string into a DateTime before the reader sees the raw text)
+    proc = run_pwsh(["-Command", script], env_extra={"PMG_S": json.dumps(["s:" + v for v in values])})
+    out = [line.strip() for line in proc.stdout.splitlines() if line.strip()]
+    if len(out) != len(values):
+        raise AssertionError(proc.stdout + proc.stderr)
+    return [None if o == "NULL" else o for o in out]
+
+
+def coverages(cases: list[tuple[list[float], str, str, str]]) -> list[dict]:
+    """Get-AttrCudaPlaybackTemporalCoverage over several (times, log, early, late) cases (late end trusted) in ONE pwsh process (a pwsh start and a
+    module import dominate a case's cost). The cases go through a file: a row list is larger than one environment variable may be."""
+    import tempfile
+    with tempfile.TemporaryDirectory(prefix="pmg-cov-") as tmp:
+        path = Path(tmp) / "cases.json"
+        # ("s:" keeps ConvertFrom-Json from turning a bare ISO string into a DateTime, whose [string] form drops the milliseconds)
+        path.write_text(json.dumps([{"t": t, "log": log, "e": "s:" + e, "l": "s:" + l} for t, log, e, l in cases]), encoding="utf-8")
+        script = (f"Import-Module '{MODULE}' -Force\n"
+                  "$rt = [Globalization.DateTimeStyles]::RoundtripKind; $ic = [Globalization.CultureInfo]::InvariantCulture\n"
+                  "$out = foreach ($c in @(Get-Content -LiteralPath $env:PMG_CASES -Raw | ConvertFrom-Json)) {\n"
+                  "  Get-AttrCudaPlaybackTemporalCoverage -TimeInMsValues ([double[]]@($c.t)) -LogText ([string]$c.log) "
+                  "-EarliestAnchorUtc ([datetime]::Parse(([string]$c.e).Substring(2), $ic, $rt)) -LatestAnchorUtc ([datetime]::Parse(([string]$c.l).Substring(2), $ic, $rt)) "
+                  "-LatestAnchorTrusted $true -MaxGapMs 5000.0 }\n"
+                  "ConvertTo-Json -InputObject @($out) -Compress -Depth 5\n")
+        proc = run_pwsh(["-Command", script], env_extra={"PMG_CASES": str(path)})
+    try:
+        got = json.loads(proc.stdout)
+    except ValueError:
+        raise AssertionError(proc.stdout + proc.stderr)
+    if len(got) != len(cases):
+        raise AssertionError(proc.stdout + proc.stderr)
+    return got
+
+
+@requires_windows_pwsh
+class StrictSwapStampTests(unittest.TestCase):
+    """PR #788 r1 sol B1 (= opus/fable P-02 hardening): the swap-window stamps are read ONLY in the writer's shape, Qt::ISODateWithMs in UTC
+    (GpuDisplayWindow.cpp:319, yyyy-MM-ddTHH:mm:ss.fffZ). Anything else is typed unavailable, never a shortened or widened window."""
+
+    EARLY = "2026-11-09T23:59:00.0000000Z"
+    ROWS = [30000.0 + 1000.0 * i for i in range(31)]
+
+    def record(self, first: str, last: str) -> str:
+        return ("playback_smoke.gpu_window_swaps session=1 window_active=1 telemetry_enabled=1 swaps=60 "
+                f"first_swap_utc={first} last_swap_utc={last}")
+
+    SHAPES = (("2026-11-09T23:59:30.000Z", "2026-11-10T00:00"),                        # sol's literal input: minute-truncated last stamp
+              ("2026-11-09T23:59:30.000", "2026-11-10T00:00:29.000"),                  # zone-less
+              ("2026-11-09", "2026-11-10"),                                            # date-only
+              ("2026-11-09T23:59:30Z", "2026-11-10T00:00:29Z"),                        # no milliseconds
+              ("2026-11-09T23:59:30.000+00:00", "2026-11-10T00:00:29.000+00:00"),      # an offset, not the writer's Z
+              ("2026-11-09T23:59:30.000Z", "2026-11-10T00:00:29.000Z"))                # control: the writer's own shape
+
+    def test_sol_b1_truncated_zone_less_and_date_only_stamps_are_unavailable_and_the_writer_shape_exposes_the_tail(self) -> None:
+        got = coverages([(self.ROWS, self.record(first, last), self.EARLY, self.EARLY) for first, last in self.SHAPES])
+        # sol's literal input: on 503dfe78 this read app_swap_window, sufficient=true, maxGapMs=1000 (WITHIN_BOUND) and hid a 29 s tail.
+        self.assertEqual(got[0]["windowSource"], "unavailable", got[0])
+        self.assertIsNone(got[0]["sufficient"], got[0])
+        self.assertIn("yyyy-MM-ddTHH:mm:ss.fffZ", got[0]["unavailableReason"])
+        for shape, r in zip(self.SHAPES[1:-1], got[1:-1]):
+            self.assertEqual(r["windowSource"], "unavailable", (shape, r))
+        control = got[-1]
+        self.assertEqual(control["windowSource"], "app_swap_window", control)
+        self.assertFalse(control["sufficient"], control)
+        self.assertEqual(control["gapKind"], "tail", control)
+
+    def test_the_stamp_reader_accepts_only_the_writer_shape(self) -> None:
+        bad = ["2026-11-10T00:00", "2026-11-10", "2026-11-10T00:00:29Z", "2026-11-10T00:00:29.000", "2026-11-10T00:00:29.0000Z",
+               "2026-11-10T00:00:29.000+01:00", "2026-13-10T00:00:29.000Z", " 2026-11-10T00:00:29.000Z", "2026-11-10t00:00:29.000z", "x", ""]
+        got = swap_stamps(["2026-11-10T00:00:29.000Z"] + bad)
+        self.assertEqual(got[0], "KIND=Utc 2026-11-10T00:00:29.0000000Z")
+        for value, out in zip(bad, got[1:]):
+            self.assertIsNone(out, value)
+
+    def test_the_job_stop_sibling_re_reads_its_stamps_through_the_same_strict_reader(self) -> None:
+        job = JOB.read_text(encoding="utf-8")
+        self.assertIn("(Get-AttrCudaEmbeddedFunctionSource -Name @(\n    'ConvertFrom-AttrCudaSwapStampUtc',\n    'Get-AttrCudaPlaybackTemporalCoverage'\n))", job)
+        base = job.index("            $swapWindowParsed = ($swapLastUtc -gt $swapFirstUtc)")
+        region = job.index("# PRESENTMON-BACHELOR-CUDA-INTERNAL-GAP-1 >>>", base)
+        body = job[region:job.index("# PRESENTMON-BACHELOR-CUDA-INTERNAL-GAP-1 <<<", region)]
+        self.assertLess(region - base, 400, "the strict re-read follows the base parse directly")
+        self.assertIn("$swapFirstUtc = ConvertFrom-AttrCudaSwapStampUtc -Value $swapWindowMatches[$swapWindowMatches.Count - 1].Groups['first'].Value", body)
+        self.assertIn("$swapLastUtc = ConvertFrom-AttrCudaSwapStampUtc -Value $swapWindowMatches[$swapWindowMatches.Count - 1].Groups['last'].Value", body)
+        self.assertIn("$swapWindowParsed = ($null -ne $swapFirstUtc -and $null -ne $swapLastUtc -and $swapLastUtc -gt $swapFirstUtc)", body)
+        self.assertLess(job.index("# PRESENTMON-BACHELOR-CUDA-INTERNAL-GAP-1 <<<", region), job.index("$presentMonJobStopAnchorUncertaintyMs = ($presentMonPostSpawnUtc"))
+
+    def test_the_module_exports_the_stamp_reader(self) -> None:
+        exports = MODULE.read_text(encoding="utf-8").split("Export-ModuleMember", 1)[1]
+        self.assertIn("ConvertFrom-AttrCudaSwapStampUtc", exports)
+
+
+# evidence 3e1b442a smoke-run.log:130 (as quoted by opus r1; no owner footage read): the app's own swap record for a fullscreen CUDA look leg
+STALL_RECORD = ("[2026-10-10T17:26:31.400Z] [INFO] [0x2a10] playback_smoke.gpu_window_swaps session=1 window_active=1 telemetry_enabled=1 swaps=551 "
+                "swap_fps=10.981 max_gap_ms=21359.466 new_frame_max_gap_ms=21359.466 frames_presented=545 "
+                "first_swap_utc=2026-10-10T17:25:41.176Z last_swap_utc=2026-10-10T17:26:31.355Z superseded_before_swap=0")
+STALL_EARLY = "2026-10-10T17:25:00.0000000Z"
+STALL_LATE = "2026-10-10T17:25:01.3910000Z"
+
+
+def stall_rows(extra_hole: tuple[float, float] | None = None) -> list[float]:
+    """PresentMon rows for that leg (origin at STALL_EARLY): presents every 41.7 ms over the swap window 41176..91355 ms, except a 21.36 s
+    no-swap stretch from 60000 ms (the app's own stall); `extra_hole` drops more rows (a PresentMon loss the app's record does not explain)."""
+    t = [40000.0 + 41.7 * i for i in range(int((60000.0 - 40000.0) / 41.7) + 1)]
+    resume = t[-1] + 21359.466
+    t += [resume + 41.7 * i for i in range(int((93000.0 - resume) / 41.7) + 1)]
+    if extra_hole:
+        t = [x for x in t if not (extra_hole[0] < x < extra_hole[1])]
+    return t
+
+
+def app_stall_metrics(**over: object) -> dict:
+    m = {"presentMonStatus": "degraded", "presentMonTemporalMaxGapMs": 21359.5, "presentMonTemporalGapKind": "internal",
+         "presentMonTemporalWindowSource": "app_swap_window", "presentMonTemporalAppSwapMaxGapMs": 21359.466, "presentMonTemporalOverBoundGapCount": 1}
+    m.update(over)
+    return {k: v for k, v in m.items() if v is not ...}
+
+
+@requires_windows_pwsh
+class AppStallAttributionTests(unittest.TestCase):
+    """PR #788 r1 opus B3: an over-bound in-window PresentMon gap that the app's OWN swap record accounts for is a real playback stall
+    (APP_SWAP_STALL: counted, the leg FAILs), never PRESENTMON_INTERNAL_GAP (INVALID, blamed on the instrument). Only a gap the app's record
+    does not explain is PresentMon's."""
+
+    def test_the_arm_carries_the_apps_swap_max_gap_from_the_record_it_selects_and_counts_every_over_bound_hole(self) -> None:
+        no_max = STALL_RECORD.replace("max_gap_ms=21359.466 new_frame", "new_frame")
+        got = coverages([
+            (stall_rows(), STALL_RECORD, STALL_EARLY, STALL_LATE),
+            (stall_rows(extra_hole=(82000.0, 88500.0)), STALL_RECORD, STALL_EARLY, STALL_LATE),
+            (stall_rows(), no_max, STALL_EARLY, STALL_LATE),                                                       # absent
+            (stall_rows(), STALL_RECORD.replace("max_gap_ms=21359.466 new_frame", "max_gap_ms=nan new_frame"), STALL_EARLY, STALL_LATE),
+            (stall_rows(), STALL_RECORD.replace("max_gap_ms=21359.466 new_frame", "max_gap_ms=-1 new_frame"), STALL_EARLY, STALL_LATE),
+            (stall_rows(), STALL_RECORD.replace("max_gap_ms=21359.466 new_frame", "max_gap_ms=1e4 new_frame"), STALL_EARLY, STALL_LATE),
+        ])
+        r = got[0]
+        self.assertEqual(r["windowSource"], "app_swap_window", r)
+        self.assertFalse(r["sufficient"], r)
+        self.assertEqual(r["gapKind"], "internal", r)
+        self.assertAlmostEqual(r["maxGapMs"], 21359.466, delta=1.0)
+        self.assertEqual(r["appSwapMaxGapMs"], 21359.466, r)
+        self.assertEqual(r["overBoundGapCount"], 1, r)
+        self.assertEqual(got[1]["overBoundGapCount"], 2, got[1])
+        # absent (new_frame_max_gap_ms is never read as the swap max gap), NaN, negative, exponent: $null, never assumed
+        for case in got[2:]:
+            self.assertEqual(case["windowSource"], "app_swap_window", case)
+            self.assertIsNone(case["appSwapMaxGapMs"], case)
+
+    def test_opus_b3_the_3e1b442a_shape_is_an_app_swap_stall_that_fails_the_leg_not_a_presentmon_gap(self) -> None:
+        v = verdict(app_stall_metrics())
+        self.assertEqual(v["verdict"], "APP_SWAP_STALL", v)
+        self.assertFalse(v["blocks"], v)
+        self.assertTrue(v["failsLeg"], v)
+        self.assertIn("21359.5 ms", v["reason"])
+        self.assertEqual(v["appSwapMaxGapMs"], 21359.466)
+
+    def test_a_gap_the_apps_record_does_not_explain_stays_presentmon_internal_gap(self) -> None:
+        unexplained = (("app max gap absent", app_stall_metrics(presentMonTemporalAppSwapMaxGapMs=...)),
+                       ("app max gap null", app_stall_metrics(presentMonTemporalAppSwapMaxGapMs=None)),
+                       ("app max gap a string", app_stall_metrics(presentMonTemporalAppSwapMaxGapMs="21359.466")),
+                       ("app max gap negative", app_stall_metrics(presentMonTemporalAppSwapMaxGapMs=-1.0)),
+                       ("healthy app (r4 leg)", app_stall_metrics(presentMonTemporalAppSwapMaxGapMs=96.372)),
+                       ("PresentMon longer than the app's stall", app_stall_metrics(presentMonTemporalMaxGapMs=21359.466 + 250.1)),
+                       ("PresentMon shorter than the app's stall", app_stall_metrics(presentMonTemporalMaxGapMs=21359.466 - 250.1)),
+                       ("a tail gap is never an inter-swap gap", app_stall_metrics(presentMonTemporalGapKind="tail")),
+                       ("two over-bound holes", app_stall_metrics(presentMonTemporalOverBoundGapCount=2)),
+                       ("hole count absent", app_stall_metrics(presentMonTemporalOverBoundGapCount=...)),
+                       ("hole count not an integer", app_stall_metrics(presentMonTemporalOverBoundGapCount=1.0)),
+                       ("process-lifetime window", app_stall_metrics(presentMonTemporalWindowSource="process_lifetime")))
+        explained = (app_stall_metrics(presentMonTemporalMaxGapMs=21359.466 + 249.9), app_stall_metrics(presentMonTemporalMaxGapMs=21359.466 - 249.9))
+        quiet = (app_stall_metrics(presentMonTemporalMaxGapMs=96.4), {"presentMonStatus": "unavailable"})
+        got = verdicts([m for _, m in unexplained] + list(explained) + list(quiet))
+        for (label, _), v in zip(unexplained, got):
+            self.assertTrue(v["blocks"], (label, v))
+            self.assertFalse(v["failsLeg"], (label, v))
+            self.assertIn(v["verdict"], ("PRESENTMON_INTERNAL_GAP", "PRESENTMON_GAP_UNLOCATED"), (label, v))
+        for v in got[len(unexplained):len(unexplained) + len(explained)]:
+            self.assertEqual(v["verdict"], "APP_SWAP_STALL", v)
+        # within the bound, and no usable PresentMon status, never fail the leg
+        for v in got[len(unexplained) + len(explained):]:
+            self.assertFalse(v["blocks"], v)
+            self.assertFalse(v["failsLeg"], v)
+
+    def test_invoke_venue_leg_counts_an_app_stall_as_fail_and_names_it(self) -> None:
+        leg = LEG.read_text(encoding="utf-8")
+        self.assertNotIn("A leg whose PresentMon capture lost that span is not counted", leg)
+        gate = leg.index("if ($outcome -in @('PASS', 'FAIL') -and $presentMonGapVerdict.blocks) {")
+        tail = leg[gate:gate + 1400]
+        self.assertIn("elseif ($outcome -in @('PASS', 'FAIL') -and $presentMonGapVerdict.failsLeg) {", tail)
+        self.assertIn("$outcome = 'FAIL'", tail)
+
+    def test_the_job_publishes_the_apps_swap_max_gap_and_the_hole_count(self) -> None:
+        job = JOB.read_text(encoding="utf-8")
+        for field in ("presentMonTemporalAppSwapMaxGapMs = $presentMonPlaybackTemporal.appSwapMaxGapMs",
+                      "presentMonTemporalOverBoundGapCount = $presentMonPlaybackTemporal.overBoundGapCount"):
+            self.assertIn(field, job)
+
+
+@requires_windows_pwsh
+class SharedReaderGapTests(EvidenceFactory, unittest.TestCase):
+    """PR #788 r1 sol B2 (= opus/fable A3 hardening): the shared validator Test-DvReceiptValid applies the same gap verdict the writer does, from the
+    VERIFIED verbatim metrics, so a PASS/FAIL receipt whose PresentMon gap blocks is INVALID in every reader (Invoke-VenueBaseline, New-VenueSheetPair,
+    New-VenueFlavorPair all gate on its status). A receipt that predates this card's job (no presentMonTemporalWindowSource) keeps today's classification."""
+
+    def setUp(self) -> None:
+        self.make_harness()
+
+    def test_sol_b2_a_blocking_gap_is_invalid_in_the_validator_and_a_legacy_receipt_is_unchanged(self) -> None:
+        repo = self.prod_repo()
+        sol = {"presentMonStatus": "degraded", "presentMonTemporalMaxGapMs": 6000.5, "presentMonTemporalGapKind": "internal",
+               "presentMonTemporalWindowSource": "app_swap_window"}
+        legacy = {k: v for k, v in sol.items() if k != "presentMonTemporalWindowSource"}
+        healthy = app_stall_metrics(presentMonStatus="ok", presentMonTemporalMaxGapMs=96.4, presentMonTemporalAppSwapMaxGapMs=96.372,
+                                    presentMonTemporalOverBoundGapCount=0)
+        ev_sol = self.evidence("sol", summary=sol)
+        ev_legacy = self.evidence("legacy", summary=legacy)
+        ev_stall = self.evidence("stall", summary=app_stall_metrics())
+        ev_healthy = self.evidence("healthy", summary=healthy)
+        got = self.status_batch(repo, [
+            (self.receipt_for(repo, ev_sol, outcome="PASS"), None),
+            (self.receipt_for(repo, ev_sol, outcome="FAIL"), None),
+            (self.receipt_for(repo, ev_legacy, outcome="PASS"), None),
+            (self.receipt_for(repo, ev_stall, outcome="PASS"), None),
+            (self.receipt_for(repo, ev_stall, outcome="FAIL"), None),
+            (self.receipt_for(repo, ev_healthy, outcome="PASS"), None),
+        ])
+        self.expect(got[0], "INVALID", "sol's literal receipt, PASS", "PRESENTMON_INTERNAL_GAP")
+        self.expect(got[1], "INVALID", "sol's literal receipt, FAIL", "PRESENTMON_INTERNAL_GAP")
+        self.expect(got[2], "ADVISORY", "a receipt that predates the window-source field keeps today's classification")
+        self.expect(got[3], "INVALID", "an app swap stall claimed as a PASS", "OUTCOME_NOT_DERIVED")
+        self.expect(got[4], "ADVISORY", "an app swap stall is a counted FAIL")
+        self.expect(got[5], "ADVISORY", "a healthy leg of the new shape")
+
+    def test_every_reader_gates_figures_on_the_validator_status(self) -> None:
+        dv = ROOT / "tools" / "profiling" / "dual-venue"
+        baseline = (dv / "Invoke-VenueBaseline.ps1").read_text(encoding="utf-8")
+        self.assertIn("else { Test-DvReceiptValid -Receipt $rc -RepoRoot $repo }", baseline)
+        self.assertIn("if ($f.verification.status -cnotin @('ADVISORY', 'NO_SIGNAL', 'VERIFIED', 'VERIFIED_OFFLINE_TEST')) { $f.rejected = $f.verification.status; return $f }", baseline)
+        for name in ("New-VenueSheetPair.ps1", "New-VenueFlavorPair.ps1"):
+            text = (dv / name).read_text(encoding="utf-8")
+            self.assertIn("$validity = Test-DvReceiptValid -Receipt $r -RepoRoot $repoRoot", text)
+            self.assertIn("if ($validity.status -cne 'ADVISORY') { throw", text)
 
 
 if __name__ == "__main__":

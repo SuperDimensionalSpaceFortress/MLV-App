@@ -7164,6 +7164,32 @@ function Get-AttrCudaTemporalCoverage {
     }
 }
 
+function ConvertFrom-AttrCudaSwapStampUtc {
+    <#
+    .SYNOPSIS
+    One playback_smoke.gpu_window_swaps first_swap_utc / last_swap_utc stamp as a UTC DateTime, or $null when it is not the writer's shape.
+    .DESCRIPTION
+    PRESENTMON-BACHELOR-CUDA-INTERNAL-GAP-1 (PR #788 r1 sol B1, catalogue P-02): the app writes these stamps with
+    QDateTime::currentDateTimeUtc().toString(Qt::ISODateWithMs) (GpuDisplayWindow.cpp:319), always yyyy-MM-ddTHH:mm:ss.fffZ. A permissive parse
+    supplied missing seconds and zones (last_swap_utc=2026-11-10T00:00 read as a shortened healthy window that hid a 29 s tail), so the shape is
+    matched EXACTLY first (anchored, case-sensitive, Z only) and only then converted; anything else (zone-less, date-only, no or other-length
+    milliseconds, an offset, an impossible date) is $null and the caller types the window unavailable. (An anchored shape match plus TryParse,
+    not ParseExact: this body is spliced into the generated job, whose spliced-body scan admits datetime::TryParse and not ParseExact.)
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [AllowNull()]
+        [AllowEmptyString()]
+        [string]$Value
+    )
+    $parsed = [datetime]::MinValue
+    $styles = [System.Globalization.DateTimeStyles]::AdjustToUniversal -bor [System.Globalization.DateTimeStyles]::AssumeUniversal
+    if ([string]::IsNullOrEmpty($Value) -or $Value -cnotmatch '\A[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\.[0-9]{3}Z\z') { return $null }
+    if (-not [datetime]::TryParse($Value, [System.Globalization.CultureInfo]::InvariantCulture, $styles, [ref]$parsed)) { return $null }
+    return $parsed
+}
+
 function Get-AttrCudaPlaybackTemporalCoverage {
     <#
     .SYNOPSIS
@@ -7175,10 +7201,14 @@ function Get-AttrCudaPlaybackTemporalCoverage {
     (before playback_smoke.start), and the longest gap inside the swap window was 96.5 ms; PresentMon lost no events.
     This runs Get-AttrCudaTemporalCoverage (no second gap scan) over the last playback_smoke.gpu_window_swaps line's
     first_swap_utc..last_swap_utc, on PresentMon's clock. PresentMon's origin is only known to lie inside the capture-start bracket
-    [EarliestAnchorUtc, LatestAnchorUtc], so the window is converted under BOTH ends; the result with the larger gap is kept (anchor names
-    which end). windowSource is 'app_swap_window' on success. It is 'unavailable', with a typed unavailableReason and $null
-    sufficient/maxGapMs/gapKind, when there is no bracket, it is inverted, the late end is not trusted (trace readiness not observed), or
-    there is no parseable non-empty swap window. The caller then falls back to the process-lifetime window and says so.
+    [EarliestAnchorUtc, LatestAnchorUtc], so the window is converted under every origin the bracket permits (both ends and every row-crossing
+    between them); the worst result is kept (anchor: earliest | latest | interior). windowSource is 'app_swap_window' on success. It is
+    'unavailable', with a typed unavailableReason and $null sufficient/maxGapMs/gapKind, when there is no bracket, it is inverted, the late end is
+    not trusted (trace readiness not observed), the bracket permits too many origins, or the last record has no non-empty swap window in the
+    writer's exact stamp shape (ConvertFrom-AttrCudaSwapStampUtc). The caller then falls back to the process-lifetime window and says so.
+    appSwapMaxGapMs is that same record's max_gap_ms (the app's own longest inter-swap gap, $null when absent or not a plain decimal) and
+    overBoundGapCount the most gaps over MaxGapMs any permitted origin shows: Get-DvPresentMonGapVerdict reads both to tell an app stall from
+    lost PresentMon rows.
     #>
     [CmdletBinding()]
     param(
@@ -7212,6 +7242,7 @@ function Get-AttrCudaPlaybackTemporalCoverage {
     $why = $null
     $firstUtc = [datetime]::MinValue
     $lastUtc = [datetime]::MinValue
+    $appSwapMaxGapMs = $null
     if ($null -eq $EarliestAnchorUtc -or $null -eq $LatestAnchorUtc) { $why = 'no capture-start bracket' }
     elseif ([datetime]$LatestAnchorUtc -lt [datetime]$EarliestAnchorUtc) { $why = 'the capture-start bracket is inverted' }
     elseif (-not ($LatestAnchorTrusted -is [bool] -and $LatestAnchorTrusted)) {
@@ -7228,21 +7259,32 @@ function Get-AttrCudaPlaybackTemporalCoverage {
             $fields = $swapRecords[$swapRecords.Count - 1].Groups['fields'].Value
             $firstField = [regex]::Match($fields, '(?:^| )first_swap_utc=(?<v>\S+)')
             $lastField = [regex]::Match($fields, '(?:^| )last_swap_utc=(?<v>\S+)')
-            $inv = [System.Globalization.CultureInfo]::InvariantCulture
-            $styles = [System.Globalization.DateTimeStyles]::AdjustToUniversal -bor [System.Globalization.DateTimeStyles]::AssumeUniversal
+            # PR #788 r1 opus B3: the app's own largest inter-swap gap inside this same window (this record's max_gap_ms; never new_frame_max_gap_ms,
+            # which counts repeat swaps as gaps although each one is a present). A plain non-negative decimal or $null: never assumed.
+            $maxGapField = [regex]::Match($fields, '(?:^| )max_gap_ms=(?<v>\S+)')
+            if ($maxGapField.Success -and $maxGapField.Groups['v'].Value -cmatch '\A[0-9]+(\.[0-9]+)?\z') { $appSwapMaxGapMs = [double]$maxGapField.Groups['v'].Value }
             if (-not $firstField.Success -or -not $lastField.Success) {
                 $why = 'the last playback_smoke.gpu_window_swaps record carries no first_swap_utc/last_swap_utc stamps'
             }
-            elseif (-not [datetime]::TryParse($firstField.Groups['v'].Value, $inv, $styles, [ref]$firstUtc) -or -not [datetime]::TryParse($lastField.Groups['v'].Value, $inv, $styles, [ref]$lastUtc)) {
-                $why = 'the gpu_window_swaps first_swap_utc/last_swap_utc stamps are unparseable'
+            else {
+                # PR #788 r1 sol B1: only the writer's exact shape (Qt::ISODateWithMs, UTC); a truncated, zone-less or date-only stamp is unavailable.
+                $firstParsed = ConvertFrom-AttrCudaSwapStampUtc -Value $firstField.Groups['v'].Value
+                $lastParsed = ConvertFrom-AttrCudaSwapStampUtc -Value $lastField.Groups['v'].Value
+                if ($null -eq $firstParsed -or $null -eq $lastParsed) {
+                    $why = 'the gpu_window_swaps first_swap_utc/last_swap_utc stamps are not the writer''s yyyy-MM-ddTHH:mm:ss.fffZ UTC shape'
+                }
+                else {
+                    $firstUtc = [datetime]$firstParsed
+                    $lastUtc = [datetime]$lastParsed
+                    if ($lastUtc -le $firstUtc) { $why = 'the gpu_window_swaps window is empty or reversed' }
+                }
             }
-            elseif ($lastUtc -le $firstUtc) { $why = 'the gpu_window_swaps window is empty or reversed' }
         }
     }
     if ($null -ne $why) {
         return [pscustomobject]@{
             windowSource = 'unavailable'; unavailableReason = $why; sufficient = $null; maxGapMs = $null; gapKind = $null
-            anchor = $null; windowFirstUtc = $null; windowLastUtc = $null; rowsInWindow = $null
+            anchor = $null; windowFirstUtc = $null; windowLastUtc = $null; rowsInWindow = $null; appSwapMaxGapMs = $null; overBoundGapCount = $null
         }
     }
 
@@ -7267,15 +7309,29 @@ function Get-AttrCudaPlaybackTemporalCoverage {
     if ($originList.Count -gt 1500) {
         return [pscustomobject]@{
             windowSource = 'unavailable'; unavailableReason = 'the capture-start bracket is too wide to evaluate every PresentMon origin it permits'; sufficient = $null; maxGapMs = $null; gapKind = $null
-            anchor = $null; windowFirstUtc = $null; windowLastUtc = $null; rowsInWindow = $null
+            anchor = $null; windowFirstUtc = $null; windowLastUtc = $null; rowsInWindow = $null; appSwapMaxGapMs = $null; overBoundGapCount = $null
         }
     }
     $worst = $null
+    # PR #788 r1 opus B3: the most gaps over the ceiling that any permitted origin shows (head, each internal gap, tail). The app's one max_gap_ms can
+    # account for one gap at most, so the receipt guard reads a stall as the app's only when this is exactly 1. Counted only for an insufficient origin.
+    $overBoundGapCount = 0
     foreach ($originMs in $originList) {
         $startMs = $startAtEarliestMs - $originMs
         $endMs = $startMs + $windowMs
         $inWindow = @($values | Where-Object { $_ -ge $startMs -and $_ -le $endMs })
         $cov = Get-AttrCudaTemporalCoverage -TimeInMsValues $inWindow -WindowStartMs $startMs -WindowEndMs $endMs -MaxGapMs $MaxGapMs
+        if (-not $cov.sufficient) {
+            $sortedIn = @($inWindow | Sort-Object)
+            $over = 0
+            if ($sortedIn.Count -eq 0) { $over = 1 }
+            else {
+                if (($sortedIn[0] - $startMs) -gt $MaxGapMs) { $over++ }
+                for ($i = 1; $i -lt $sortedIn.Count; $i++) { if (($sortedIn[$i] - $sortedIn[$i - 1]) -gt $MaxGapMs) { $over++ } }
+                if (($endMs - $sortedIn[$sortedIn.Count - 1]) -gt $MaxGapMs) { $over++ }
+            }
+            if ($over -gt $overBoundGapCount) { $overBoundGapCount = $over }
+        }
         $anchorName = if ($originMs -eq 0.0) { 'earliest' } elseif ($originMs -eq $originSpanMs) { 'latest' } else { 'interior' }
         # adversary r1 A2: an insufficient origin (zero rows is always insufficient) is never outvoted by a sufficient one; then the larger gap wins.
         $worse = ($null -eq $worst) -or ((-not $cov.sufficient) -and $worst.cov.sufficient) -or (([bool]$cov.sufficient -eq [bool]$worst.cov.sufficient) -and $cov.maxGapMs -gt $worst.cov.maxGapMs)
@@ -7285,6 +7341,7 @@ function Get-AttrCudaPlaybackTemporalCoverage {
         windowSource = 'app_swap_window'; unavailableReason = $null
         sufficient = [bool]$worst.cov.sufficient; maxGapMs = $worst.cov.maxGapMs; gapKind = $worst.cov.gapKind
         anchor = $worst.anchor; windowFirstUtc = $firstUtc.ToString('o'); windowLastUtc = $lastUtc.ToString('o'); rowsInWindow = $worst.rows
+        appSwapMaxGapMs = $appSwapMaxGapMs; overBoundGapCount = $overBoundGapCount
     }
 }
 
@@ -7608,6 +7665,7 @@ Export-ModuleMember -Function `
     Get-AttrCudaForegroundVerification, `
     Get-AttrCudaTemporalCoverage, `
     Get-AttrCudaPlaybackTemporalCoverage, `
+    ConvertFrom-AttrCudaSwapStampUtc, `
     ConvertTo-AttrCudaResultLineSafeText, `
     Register-AttrCudaDisplayWakeNativeMethods, `
     Get-AttrCudaScreensaverRunning, `

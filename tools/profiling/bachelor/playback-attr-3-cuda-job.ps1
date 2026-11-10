@@ -1020,9 +1020,10 @@ $embeddedFunctions = $embeddedFunctions + "`r`n# VENUE-SESSION-LOCKED-REFUSAL-1 
 $embeddedFunctions = $embeddedFunctions + "`r`n# HFR-CONFORM-AWARE-RECEIPT-ORACLES-1 >>>`r`n" + (Get-AttrCudaEmbeddedFunctionSource -Name @(
     'Get-AttrCudaConformAwareSourceFramesVerdict'
 )) +"`r`n# HFR-CONFORM-AWARE-RECEIPT-ORACLES-1 <<<"
-# PRESENTMON-BACHELOR-CUDA-INTERNAL-GAP-1: the temporal arm over the app's swap window (it calls the embedded Get-AttrCudaTemporalCoverage only), spliced inside its own sentinel
-# brackets for the same byte-identity reason as the splices above.
+# PRESENTMON-BACHELOR-CUDA-INTERNAL-GAP-1: the temporal arm over the app's swap window (it calls the embedded Get-AttrCudaTemporalCoverage and the strict swap-stamp reader
+# beside it, which the job-stop arm calls too), spliced inside its own sentinel brackets for the same byte-identity reason as the splices above.
 $embeddedFunctions = $embeddedFunctions + "`r`n# PRESENTMON-BACHELOR-CUDA-INTERNAL-GAP-1 >>>`r`n" + (Get-AttrCudaEmbeddedFunctionSource -Name @(
+    'ConvertFrom-AttrCudaSwapStampUtc',
     'Get-AttrCudaPlaybackTemporalCoverage'
 )) +"`r`n# PRESENTMON-BACHELOR-CUDA-INTERNAL-GAP-1 <<<"
 $smokeRunnerClosureDigest = Get-AttrCudaClosureDigestHex -Closure $smokeRunnerClosure
@@ -4111,6 +4112,15 @@ if ($presentMonStoppedByJob) {
             $swapWindowParsed = $false
         }
     }
+    # PRESENTMON-BACHELOR-CUDA-INTERNAL-GAP-1 >>>
+    # PRESENTMON-BACHELOR-CUDA-INTERNAL-GAP-1 (PR #788 r1 sol B1, catalogue P-02): the [datetime] casts above accept a truncated, zone-less or
+    # date-only stamp. The same two stamps are re-read through the strict writer-shape reader; anything but yyyy-MM-ddTHH:mm:ss.fffZ is unparsed.
+    if ($swapWindowMatches.Count -gt 0) {
+        $swapFirstUtc = ConvertFrom-AttrCudaSwapStampUtc -Value $swapWindowMatches[$swapWindowMatches.Count - 1].Groups['first'].Value
+        $swapLastUtc = ConvertFrom-AttrCudaSwapStampUtc -Value $swapWindowMatches[$swapWindowMatches.Count - 1].Groups['last'].Value
+        $swapWindowParsed = ($null -ne $swapFirstUtc -and $null -ne $swapLastUtc -and $swapLastUtc -gt $swapFirstUtc)
+    }
+    # PRESENTMON-BACHELOR-CUDA-INTERNAL-GAP-1 <<<
     $presentMonJobStopAnchorUncertaintyMs = ($presentMonPostSpawnUtc - $presentMonCaptureStartUtc).TotalMilliseconds
     $pmPresentTimes = @($displayReport.selectedPresentTimesMs | ForEach-Object { [double]$_ } | Sort-Object)
     # UM-PRESENTMON-STOP-2 r2 (sol blocker): the late end of the bracket is an upper bound for PresentMon's origin
@@ -4333,6 +4343,10 @@ Save-Json ([ordered]@{
     presentMonTemporalWindowSource = $presentMonTemporalWindowSource
     presentMonCaptureTemporalMaxGapMs = $presentMonCaptureTemporal.maxGapMs
     presentMonCaptureTemporalGapKind = $presentMonCaptureTemporal.gapKind
+    # PR #788 r1 opus B3: the app's own max inter-swap gap from the same swap record, and the most over-ceiling gaps any permitted origin shows, so the
+    # receipt guard tells an app stall (counted) from lost PresentMon rows (not counted). $null when the swap window was unavailable.
+    presentMonTemporalAppSwapMaxGapMs = $presentMonPlaybackTemporal.appSwapMaxGapMs
+    presentMonTemporalOverBoundGapCount = $presentMonPlaybackTemporal.overBoundGapCount
     # PRESENTMON-BACHELOR-CUDA-INTERNAL-GAP-1 <<<
     presentMonSufficiency = [ordered]@{
         minIntervalCount=$presentMonSufficiencyMinIntervalCount
