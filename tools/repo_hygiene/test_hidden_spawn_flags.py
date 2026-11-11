@@ -149,7 +149,7 @@ def _is_excluded(rel: str) -> bool:
 def _tracked_py_files(root: Path = ROOT) -> list[str]:
     # -z: with core.quotepath on, a non-ASCII path comes back quoted and escaped, and open() then names nothing on disk.
     proc = subprocess.run(
-        ["git", "-C", str(root), "ls-files", "-z", "--", "tools/*.py"],
+        ["git", "-C", str(root), "ls-files", "-z", "--", "tools/*.py", "tools/*.pyw"],  # a .pyw is run by pythonw.exe and starts a console child the same way (pass-32 A2)
         capture_output=True, check=True, timeout=60,
         creationflags=hidden_spawn.no_window_flags(),
     )
@@ -1863,6 +1863,7 @@ def _unflagged_spawns_in_source(source: str, label: str) -> list[str]:
 # --- PowerShell fixtures: any Start-Process / saps / start launch, whatever its target, must be hidden; judged per statement ---
 
 _WINDOW_STYLE_HIDDEN_RE = re.compile(r"(?<!\S)-WindowStyle[\s:]+(?:'Hidden'|\"Hidden\"|Hidden)(?=[\s;)|}&]|\Z)", re.IGNORECASE)  # the value ends at Hidden: `Hidden,Minimized` is another value (a line continuation after it is a space, see _ps_statements)
+_REDIRECT_TARGET_BEFORE_RE = re.compile(r">[ \t]*\Z")  # matched against the statement up to a word: the previous thing is a redirection operator (`>`, `>>`, `2>`, `*>`), so the word is its target
 _START_PROCESS_RE = re.compile(r"(?<![\w$.-])(Start-Process|saps|start)(?![\w-])", re.IGNORECASE)  # the cmdlet and its aliases
 _PS_COMMAND_PREFIX_RE = re.compile(r"(?<![\w$.-])(?:return|throw|exit|-not)$", re.IGNORECASE)  # a word that ends right before a command name
 # PowerShell reads these typographic characters as the ASCII ones: single and double quotes, the three dashes a parameter may start with, no-break space.
@@ -2117,7 +2118,8 @@ def _judge_script(script: str) -> tuple[int, int]:
                 continue  # `start` / `saps` count only where a command word can stand
             # Every launch is judged, whatever it starts (powershell, pwsh, cmd.exe, `-FilePath $exe`): the target decides nothing.
             found += 1
-            if hole or not any(not quoted[h.start()] and depths[h.start()] == depths[m.start()]
+            # `> -WindowStyle Hidden` writes the output to a file NAMED `-WindowStyle`: a word right after a redirection operator is its target, not a parameter (pass-32 A1)
+            if hole or not any(not quoted[h.start()] and depths[h.start()] == depths[m.start()] and not _REDIRECT_TARGET_BEFORE_RE.search(statement, 0, h.start())
                                for h in _WINDOW_STYLE_HIDDEN_RE.finditer(statement, m.start())):
                 bad += 1
         for s, e in spans:
@@ -5132,6 +5134,32 @@ class AdversaryR9Tests(unittest.TestCase):
                 except (UnicodeError, LookupError, TypeError):
                     continue
                 self.assertLessEqual(built, 4 * len(text), (name, errors))
+
+    # ---- pass 32 (review-adversary-MLV-LANE-CONSOLE-HIDDEN-1-r13-373ed986): A1 / A2 ----
+    def test_r13_pass32_a1_a_redirection_target_is_not_a_window_style_parameter(self):
+        # `Start-Process cmd.exe > -WindowStyle Hidden` writes the output to a FILE named `-WindowStyle`; the launch has no -WindowStyle parameter at all.
+        for op in (">", ">>", "2>", "2>>", "*>", "3>>", "1>"):
+            for gap in (" ", "\t", "   "):
+                source = f"script = 'Start-Process cmd.exe {op}{gap}-WindowStyle Hidden'\n"
+                self.assertEqual(_start_process_violations(source), (1, [1]), source)
+        for clean in ("Start-Process cmd.exe -WindowStyle Hidden",                      # the parameter itself
+                      "Start-Process cmd.exe > out.txt -WindowStyle Hidden",             # a parameter may follow a redirection
+                      'Start-Process cmd.exe -ArgumentList "a>" -WindowStyle Hidden',    # a quoted `>` redirects nothing
+                      "Start-Process cmd.exe -WindowStyle Hidden > out.txt"):
+            self.assertEqual(_start_process_violations(f"script = '{clean}'\n"), (1, []), clean)
+
+    def test_r13_pass32_a2_a_pyw_launcher_is_enumerated_and_judged_like_a_py_file(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            flags = hidden_spawn.no_window_flags()
+            subprocess.run(["git", "-C", str(repo), "init", "-q"], check=True, timeout=60, creationflags=flags)
+            (repo / "tools").mkdir()
+            for name in ("launch_probe.pyw", "plain.py", "notes.txt"):
+                (repo / "tools" / name).write_text("x = 1\n", encoding="utf-8")
+            subprocess.run(["git", "-C", str(repo), "add", "-A"], check=True, timeout=60, creationflags=flags)
+            self.assertEqual(_tracked_py_files(repo), ["tools/launch_probe.pyw", "tools/plain.py"])
+        self.assertEqual(len(_unflagged_spawns_in_source("import subprocess\nsubprocess.run(['cmd.exe', '/c', 'exit'])\n", "tools/launch_probe.pyw")), 1)
 
     def test_pass30_a2_literal_chains_and_joined_readings_obey_the_cap(self):
         with mock.patch.dict(globals(), {"_FLATTEN_MAX_CHARS": 64}):
