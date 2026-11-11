@@ -103,9 +103,12 @@ Numbers are computed from the VIDEO VIEWPORT only -- the window's timecode and f
   `exposureBandSource` and `exposureBandNote`. The band is the clip's row in `tools/profiling/dual-venue/exposure-bands.json`, else the
   absolute fallback: median luma >= 16, median near-black fraction <= 0.60, median clipped fraction <= 0.05. The file ships with
   **no clip rows**; they are seeded from the grade corpus by a follow-up (VISUAL-GATE-EXPOSURE-BANDS-SEED-1; HUB RULING 2026-11-10T07:14:03Z
-  item 3). A missing, empty or malformed file (or row) is judged on the fallback and says so in `exposureBandNote` and the reason
-  (`exposureBandSource` `fallback-missing` / `fallback-empty` / `fallback-malformed`), never a silent OK; a clip with no row is `fallback-no-row`
-  (no note). The file is parsed with System.Text.Json and validated WHOLE, every row, before any row is chosen (also when the clip has no row):
+  item 3). A missing, unreadable, empty or malformed file (or row) is judged on the fallback and says so in `exposureBandNote` and the reason
+  (`exposureBandSource` `fallback-missing` / `fallback-unreadable` / `fallback-empty` / `fallback-malformed`), never a silent OK; a clip with no row is
+  `fallback-no-row` (no note). `fallback-unreadable` is a file that exists but cannot be probed or read (access denied, locked, an unusable path),
+  and `fallback-missing` also covers one that went away between the existence check and the read. The runner runs under
+  `$ErrorActionPreference = 'Stop'`, so the probe, the path resolve and the read share one guard: unreadable exposure-band metadata under Stop
+  yields the reported fallback, never an escaped exception or `RUNNER_ERROR`, and the leg stays measured. The file is parsed with System.Text.Json and validated WHOLE, every row, before any row is chosen (also when the clip has no row):
   the root must be a JSON object (a one-element array is malformed, not unwrapped), clip ids match exactly (`M16-1457` and `m16-1457` are two
   clips), a duplicate root key, `clips`, clip row or field is malformed, and so is any row, selected or not, that is not an object, repeats a
   field, has a field other than the four caps (a misspelt cap would silently take the fallback's value), or has an unusable value. The medians and fractions are

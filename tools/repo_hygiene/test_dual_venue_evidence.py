@@ -29,9 +29,11 @@ from __future__ import annotations
 
 import ast
 import concurrent.futures
+import contextlib
 import hashlib
 import io
 import json
+import os
 import re
 import shutil
 import subprocess
@@ -9536,6 +9538,82 @@ class VisualExposureFloorTests(unittest.TestCase):
             proc, out = run_pwsh_json(f"Set-Location -LiteralPath '{d}'; Get-DvExposureBand -ClipId 'c' -Path 'absent.json' | ConvertTo-Json -Depth 4 -Compress")
             self.assertEqual((out["source"], out["note"] is not None), ("fallback-missing", True), out)
 
+    # r3 (sol r2 B1, fable N1): the runner runs under $ErrorActionPreference = 'Stop', so a probe that throws before the guard ended the leg (RUNNER_ERROR)
+    NUL_BAND_PATH = "('C:\\absent-dir\\band' + [char]0 + '.json')"   # Test-Path -LiteralPath throws ArgumentException on an embedded NUL, on every OS
+
+    @contextlib.contextmanager
+    def unreadable_band_file(self):
+        """A band file the current user may not read (an ACL deny, removed again on exit)."""
+        user = os.environ.get("USERNAME") or ""
+        with tempfile.TemporaryDirectory(prefix="vis-exp-band-", ignore_cleanup_errors=True) as d:
+            path = Path(d) / "bands.json"
+            path.write_text('{"clips": {"c": {"minMedianLuma": 0, "maxNearBlackFraction": 1}}}', encoding="utf-8")
+            denied = subprocess.run(["icacls", str(path), "/deny", f"{user}:(R)"], capture_output=True, text=True)
+            self.assertEqual(denied.returncode, 0, denied.stdout + denied.stderr)
+            try:
+                yield path
+            finally:
+                subprocess.run(["icacls", str(path), "/remove:d", user], capture_output=True, text=True)
+
+    def test_the_visual_exposure_band_probe_that_throws_under_stop_is_the_reported_fallback(self) -> None:
+        # sol r2 B1: the existence probe sat outside the guard, so a path it throws on ended the call (and the measured leg) instead of the reported fallback
+        proc, out = run_pwsh_json("$ErrorActionPreference = 'Stop'; $r = Get-DvExposureBand -ClipId 'c' -Path " + self.NUL_BAND_PATH + "; "
+                                  "$r | ConvertTo-Json -Depth 4 -Compress")
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIsNotNone(out, "Get-DvExposureBand returned nothing under Stop: " + proc.stdout + proc.stderr)
+        self.assertEqual(out["source"], "fallback-unreadable", out)
+        self.assertEqual((out["band"]["minMedianLuma"], out["band"]["maxNearBlackFraction"]), (16, 0.6), out)
+        self.assertIn("cannot be read", out["note"])
+        self.assertIn("ArgumentException", out["note"], "the note names what failed")
+
+    @requires_windows_pwsh
+    def test_the_visual_exposure_band_file_that_is_access_denied_is_unreadable_not_malformed(self) -> None:
+        # fable N1: a file that exists but cannot be read is not a malformed file (and not a missing one): it has its own truthful label, under Stop too
+        with self.unreadable_band_file() as path:
+            proc, out = run_pwsh_json(f"$ErrorActionPreference = 'Stop'; Get-DvExposureBand -ClipId 'c' -Path '{path}' | ConvertTo-Json -Depth 4 -Compress")
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            self.assertIsNotNone(out, proc.stdout + proc.stderr)
+            self.assertEqual(out["source"], "fallback-unreadable", out)
+            self.assertEqual(out["band"]["minMedianLuma"], 16, "the clip's relaxed row is not applied: the absolute fallback judges")
+            self.assertIn("cannot be read", out["note"])
+            self.assertIn("UnauthorizedAccessException", out["note"])
+
+    def test_the_visual_exposure_band_file_that_goes_away_after_the_probe_is_missing_not_malformed(self) -> None:
+        # fable N1: the probe says "there" and the read finds nothing (a function named Test-Path in the caller's scope answers the probe, the way a race would)
+        proc, out = run_pwsh_json("$ErrorActionPreference = 'Stop'; function Test-Path { $true }; "
+                                  "$r = Get-DvExposureBand -ClipId 'c' -Path 'C:\\absent-dir\\bands.json'; $r | ConvertTo-Json -Depth 4 -Compress")
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIsNotNone(out, proc.stdout + proc.stderr)
+        self.assertEqual(out["source"], "fallback-missing", out)
+        self.assertIn("went away", out["note"])
+
+    @requires_windows_imaging
+    def test_the_visual_reader_keeps_the_leg_measured_when_the_band_file_is_unreadable_under_stop(self) -> None:
+        # sol r2 B1, runner level: the reader is what Invoke-VenueLeg calls on the measured run and on a self-heal pre-launch; an unreadable band file there
+        # was a RUNNER_ERROR. Now the leg keeps its verdict (here the underexposed picture is still flagged by the fallback) and says why.
+        with tempfile.TemporaryDirectory(prefix="vis-exp-read-", ignore_cleanup_errors=True) as d:
+            self.dark_captures(Path(d) / "artifacts" / "visual", 4)
+            nul = self.read(d, "-ClipId 'dark-clip' -ExposureBandPath " + self.NUL_BAND_PATH, stop=True)
+            self.assertEqual((nul["verdict"], nul["counted"], nul["exposureBandSource"]), ("EXPOSURE_OUT_OF_RANGE", True, "fallback-unreadable"), nul["reason"])
+            self.assertIn("cannot be read", nul["exposureBandNote"])
+            self.assertIn("cannot be read", nul["reason"], "reported beside the verdict")
+            self.assertEqual(nul["exposureFrames"], 6, "the leg is still measured")
+            with self.unreadable_band_file() as path:
+                denied = self.read(d, f"-ClipId 'dark-clip' -ExposureBandPath '{path}'", stop=True)
+                self.assertEqual((denied["verdict"], denied["counted"], denied["exposureBandSource"]), ("EXPOSURE_OUT_OF_RANGE", True, "fallback-unreadable"), denied["reason"])
+            normal = Path(d) / "normal"
+            write_visual_captures(normal / "artifacts" / "visual", "ok")
+            ok = self.read(str(normal), "-ClipId 'unit-clip' -ExposureBandPath " + self.NUL_BAND_PATH, stop=True)
+            self.assertEqual((ok["verdict"], ok["counted"], ok["exposureBandSource"]), ("OK", True, "fallback-unreadable"), ok["reason"])
+            self.assertIn("cannot be read", ok["reason"], "an OK leg says its band file was unusable")
+
+    def test_the_visual_exposure_band_catalogue_names_the_unreadable_source(self) -> None:
+        doc = (ROOT / "docs" / "dual-venue-visual-capture.md").read_text(encoding="utf-8")
+        self.assertIn("fallback-unreadable", doc)
+        self.assertIn("unreadable exposure-band metadata under Stop", doc)
+        psm1 = (DV / "DualVenueRunner.psm1").read_text(encoding="utf-8")
+        self.assertIn("fallback-unreadable", psm1.split("function Get-DvExposureBand", 1)[1].split("function Get-DvVisualVerdict", 1)[0])
+
     @requires_windows_imaging
     def test_the_visual_reader_keeps_a_not_captured_reason_beside_an_unusable_band_file(self) -> None:
         # r2 (fable H2): the band-file note was pre-set as block.reason, which displaced the NOT_CAPTURED verdict's own reason
@@ -9625,8 +9703,9 @@ function New-DarkPng([string]$Path, [int]$Seed, [int]$Base) {
         proc = run_pwsh(["-Command", self.DARK_PNG_PS + "\n".join(calls)])
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
 
-    def read(self, d: str, extra: str = "") -> dict:
-        proc, out = run_pwsh_json(f"Read-DvVisualCaptures -Requested $true -ArtifactsDir '{Path(d) / 'artifacts'}' -EvidenceDir '{Path(d) / 'evidence'}' "
+    def read(self, d: str, extra: str = "", stop: bool = False) -> dict:
+        # stop: the runner's own error preference (Invoke-VenueLeg.ps1 sets $ErrorActionPreference = 'Stop'); the default test shell's Continue hides a throw
+        proc, out = run_pwsh_json(("$ErrorActionPreference = 'Stop'; " if stop else "") + f"Read-DvVisualCaptures -Requested $true -ArtifactsDir '{Path(d) / 'artifacts'}' -EvidenceDir '{Path(d) / 'evidence'}' "
                                   f"-LegId 'unit-leg' -Header 'unit' {extra} | ConvertTo-Json -Depth 8 -Compress")
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         self.assertIsNotNone(out, proc.stdout + proc.stderr)

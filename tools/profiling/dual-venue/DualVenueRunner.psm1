@@ -3016,8 +3016,9 @@ function Get-DvExposureBand {
     .SYNOPSIS
     The exposure band a clip's legs are judged against: its row in exposure-bands.json, else the absolute fallback band. Returns
     [pscustomobject]@{ band; source; note }. source: clip (the clip's row) | fallback-no-row (the file is valid and has no row for the clip, or no clip
-    id was given) | fallback-empty (the file is empty) | fallback-missing | fallback-malformed. note is $null unless the file could not be used
-    (missing, empty or malformed): that is REPORTED, never a silent OK. A row names any of minMedianLuma, maxMedianLuma, maxNearBlackFraction,
+    id was given) | fallback-empty (the file is empty) | fallback-missing (absent, or gone after it was found) | fallback-unreadable (it exists but cannot be
+    probed or read: access denied, locked, an unusable path; r3, sol r2 B1: never an escaped exception under $ErrorActionPreference = 'Stop') | fallback-malformed
+    (read, but not a usable band file). note is $null unless the file could not be used (missing, unreadable, empty or malformed): that is REPORTED, never a silent OK. A row names any of minMedianLuma, maxMedianLuma, maxNearBlackFraction,
     maxClippedFraction and nothing else; a field it leaves out takes the fallback's value. A row with an unusable field (not a number, out of range, min
     above max), a field it repeats or does not know, or with none of the four, is malformed and the fallback band judges instead. Clip ids match exactly
     (case-sensitive). r2 (sol B1, Dot 796-D1): the file is validated WHOLE, every row, before any row is selected (and whether or not the clip has one):
@@ -3026,11 +3027,27 @@ function Get-DvExposureBand {
     param([string]$ClipId, [string]$Path = $script:ExposureBandsPath)
     $fallback = $script:ExposureFallbackBand
     $result = { param($source, $note, $band) [pscustomobject]@{ band = $band; source = $source; note = $note } }
-    if ([string]::IsNullOrWhiteSpace($Path) -or -not (Test-Path -LiteralPath $Path -PathType Leaf)) {
+    $unreadable = { param($e) (& $result 'fallback-unreadable' "the exposure band file cannot be read ($($e.GetType().Name)): the absolute fallback band judges" $fallback) }
+    if ([string]::IsNullOrWhiteSpace($Path)) {
+        return (& $result 'fallback-missing' "the exposure band file is missing ($Path): the absolute fallback band judges" $fallback)
+    }
+    # r3 (sol r2 B1): the existence probe is inside the guard. The runner runs under $ErrorActionPreference = 'Stop', where Test-Path throws on a path it cannot
+    # check (access denied, an embedded NUL, ...): that escaped this function, so the measured leg ended as RUNNER_ERROR instead of the reported fallback.
+    try { $isFile = [bool](Test-Path -LiteralPath $Path -PathType Leaf -ErrorAction Stop) } catch { return (& $unreadable $_.Exception) }
+    if (-not $isFile) {
         return (& $result 'fallback-missing' "the exposure band file is missing ($Path): the absolute fallback band judges" $fallback)
     }
     # a relative path resolves the way Test-Path just did (against the PowerShell location), not against the process directory ReadAllText uses (adversary fc152c48 A2)
-    try { $Path = (Resolve-Path -LiteralPath $Path -ErrorAction Stop).ProviderPath; $text = [IO.File]::ReadAllText($Path) } catch { return (& $result 'fallback-malformed' "the exposure band file cannot be read ($($_.Exception.GetType().Name)): the absolute fallback band judges" $fallback) }
+    try { $Path = (Resolve-Path -LiteralPath $Path -ErrorAction Stop).ProviderPath; $text = [IO.File]::ReadAllText($Path) } catch {
+        # r3 (fable N1): a file that went away between the probe and the read is missing (not malformed); one that exists but cannot be read (access denied, locked) is unreadable
+        $e = $_.Exception
+        # (PowerShell wraps a .NET method's exception in a MethodInvocationException: the real cause is inside)
+        while ($e -is [System.Management.Automation.MethodInvocationException] -and $null -ne $e.InnerException) { $e = $e.InnerException }
+        if ($e -is [System.Management.Automation.ItemNotFoundException] -or $e -is [System.IO.FileNotFoundException] -or $e -is [System.IO.DirectoryNotFoundException]) {
+            return (& $result 'fallback-missing' "the exposure band file is missing ($Path; it went away after it was found): the absolute fallback band judges" $fallback)
+        }
+        return (& $unreadable $e)
+    }
     if ([string]::IsNullOrWhiteSpace($text)) { return (& $result 'fallback-empty' "the exposure band file is empty ($Path): the absolute fallback band judges" $fallback) }
     # System.Text.Json, not ConvertFrom-Json: that unwraps a one-element array root ([{"clips": ...}] reads as the object, so a non-object file would pick a
     # row), and rejects keys that differ only in case ({"M16-1457": ..., "m16-1457": ...} is valid JSON and clip ids match exactly)
