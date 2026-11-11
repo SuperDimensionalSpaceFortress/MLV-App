@@ -455,7 +455,9 @@ class AssemblerLegacyScratchTests(_Synthetic):
             [shutil.which("pwsh"), "-NoLogo", "-NoProfile", "-NonInteractive", "-File", str(ASSEMBLER),
              "-SourceCommit", sha, "-DllPairDir", str(self.tmp / "no-such-dll-pair"), "-OutDir", str(out_dir),
              "-RepoRoot", str(repo)],
-            capture_output=True, text=True)
+            capture_output=True, text=True,
+            # LANE-LOCAL-STAGE-CHAIN-DEADLINE-BYPASS-1: the assembler refuses (exit 27) without a heavy-slot deadline; this run stops at the DLL pair, before any wait.
+            env={**os.environ, "MLV_HEAVY_SLOT_DEADLINE_UTC": "2099-01-01T00:00:00Z"})
 
         self.assertEqual(proc.returncode, 3, f"{proc.stdout}\n{proc.stderr}")
         self.assertIn("STEP=dllPairDir", proc.stdout)
@@ -480,11 +482,13 @@ class AssemblerLegacyScratchTests(_Synthetic):
         argv = [shutil.which("pwsh"), "-NoLogo", "-NoProfile", "-NonInteractive", "-File", str(ASSEMBLER),
                 "-SourceCommit", sha, "-DllPairDir", str(self.tmp / "no-such-dll-pair"), "-OutDir", str(out_dir),
                 "-RepoRoot", str(repo)]
-        first = subprocess.run(argv, capture_output=True, text=True)
+        # LANE-LOCAL-STAGE-CHAIN-DEADLINE-BYPASS-1: a deadline in the environment, or the assembler refuses (exit 27) before the DLL pair.
+        deadline_env = {**os.environ, "MLV_HEAVY_SLOT_DEADLINE_UTC": "2099-01-01T00:00:00Z"}
+        first = subprocess.run(argv, capture_output=True, text=True, env=deadline_env)
         self.assertEqual(first.returncode, 3, f"{first.stdout}\n{first.stderr}")
         marker = out_dir / f".work-{sha[:12]}" / "from-the-first-run.txt"
         marker.write_text("x", encoding="utf-8")
-        second = subprocess.run(argv, capture_output=True, text=True)
+        second = subprocess.run(argv, capture_output=True, text=True, env=deadline_env)
         self.assertEqual(second.returncode, 3, f"{second.stdout}\n{second.stderr}")
         self.assertFalse(marker.exists(), "the first run's own tree was not swept")
         self.assertEqual([p.name for p in out_dir.iterdir() if ".unproven-" in p.name], [], "a tree this code recorded was quarantined instead of swept")
