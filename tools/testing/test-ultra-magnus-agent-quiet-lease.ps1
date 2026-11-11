@@ -3008,7 +3008,7 @@ function Exit-HeavySlot {
         # r10 (sol r9 B1): THE GRAMMAR TABLE. Every accepted and refused shape of Get-SidecarTmpStatus from r6-r10, one row each, read through the one
         # recognizer. Columns: name; message tail after 'SIDECAR-WRITE-FAILED job=<id> attempts=3 '; the id; the expected result ('NULL' = $null).
         # A retained path is the token right after its own 'tmp_remaining=': an absolute path (drive + separator, or a leading separator) with no
-        # ':' '*' '?' '"' '<' '>' '|' in it, ending at the FIRST '.tmp <Type>: '; text after that token is never searched to make it valid.
+        # ':' '*' '?' '"' '<' '>' '|' or control character (0x00-0x1f) in it, ending at the FIRST '.tmp <Type>: '; text after that token is never searched to make it valid.
         $gr = @(
             @{ n = 'r6 own file, backslash'; m = "tmp_remaining=C:\x\j.json.$z32.tmp IOException: x"; id = 'j'; want = 'tmp_remaining=' },
             @{ n = 'r6 own file, forward slash'; m = "tmp_remaining=/x/j.json.$z32.tmp IOException: x"; id = 'j'; want = 'tmp_remaining=' },
