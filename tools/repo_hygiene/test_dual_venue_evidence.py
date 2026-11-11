@@ -10759,7 +10759,10 @@ def _ident_run_reaped(cmd: list, timeout: float, env: dict | None = None) -> sub
         out, err = proc.communicate(timeout=timeout)
     except BaseException:
         if proc.poll() is None:
-            subprocess.run(["taskkill", "/F", "/T", "/PID", str(proc.pid)], capture_output=True, timeout=60)
+            try:
+                subprocess.run(["taskkill", "/F", "/T", "/PID", str(proc.pid)], capture_output=True, timeout=60)
+            except (subprocess.TimeoutExpired, OSError):   # r2 (sol hardening): a taskkill that itself hangs or fails must not skip the bounded drain and the fallback kill below
+                pass
         try:
             proc.communicate(timeout=60)
         except subprocess.TimeoutExpired:
@@ -10769,12 +10772,26 @@ def _ident_run_reaped(cmd: list, timeout: float, env: dict | None = None) -> sub
     return subprocess.CompletedProcess(cmd, proc.returncode, out, err)
 
 
+def _parse_probe_timing(stderr: str):
+    """CI-FLAKE-VENUE-PROBE-GETOWNER-DEADLINE-1 r2: the probe's one stderr timing line, `VENUE_PROBE_INTERNAL_MS=<ms> abandoned=<n>`, where <ms> is ONE monotonic Stopwatch started at probe
+    entry. None = no marker at all. A marker that is present but not a non-negative integer comes back with probe_ms=None and a `bad` reason, so a clock fault is a typed failure and never
+    reads as a missing marker."""
+    m = re.search(r"VENUE_PROBE_INTERNAL_MS=(\S*) abandoned=(\d+)", stderr)
+    if not m:
+        return None
+    raw = m.group(1)
+    if re.fullmatch(r"\d+", raw):
+        return {"probe_ms": int(raw), "abandoned": int(m.group(2))}
+    return {"probe_ms": None, "abandoned": int(m.group(2)), "bad": f"VENUE_PROBE_INTERNAL_MS={raw!r} is not a non-negative integer (a civil clock was subtracted from a monotonic one?)"}
+
+
 class IdentityProbeMixin:
     """Runs the REAL probe body (12 s sleeps -> 0) against canned process, counter and CIM data."""
 
     def run_identity_probe(self, procs: list, cim: list, owners: dict | None = None, gpu: list | None = None, throw: bool = False, cpus: int = 4,
                            body: str | None = None, old_counter_shadow: bool = False, after_start_ft: dict | None = None,
-                           delays: dict | None = None, call_ms: int | None = None, tel: dict | None = None, env: dict | None = None, timing: bool = False) -> dict:
+                           delays: dict | None = None, call_ms: int | None = None, tel: dict | None = None, env: dict | None = None, timing: bool = False,
+                           civil_step_s: int = 0, probe_s: int = 0, exit_hold_s: int = 0) -> dict:
         delays = delays or {}
         body = (_ident_probe_body() if body is None else body).replace("[Environment]::ProcessorCount", str(cpus)).replace("Start-Sleep -Seconds 12", "Start-Sleep -Seconds 0")
         if call_ms is not None:
@@ -10812,14 +10829,25 @@ class IdentityProbeMixin:
         if timing:   # CI-FLAKE-VENUE-PROBE-GETOWNER-DEADLINE-1: the probe reports its own elapsed time on stderr (the seam is $false in production)
             self.assertEqual(body.count("$ProbeTimingSeam = $false"), 1)
             body = body.replace("$ProbeTimingSeam = $false", "$ProbeTimingSeam = $true")
+        # r2 fault injection, test copy only (needs timing=True): a civil-clock STEP (NTP / VM resume / manual change) is every `[DateTime]::Now` read taking a +/-N s offset; a probe that
+        # spends probe_s seconds before its marker; a process exit held exit_hold_s seconds after the marker. A probe whose timing leaves one monotonic Stopwatch is moved by the step.
+        if civil_step_s or probe_s or exit_hold_s:
+            self.assertTrue(timing, "fault injection rides on the timing seam")
+        if civil_step_s:
+            body = body.replace("[DateTime]::Now", f"[DateTime]::Now.AddSeconds({civil_step_s})")
+        if probe_s:
+            anchor = "$script:ProbeSw = [Diagnostics.Stopwatch]::StartNew()"
+            self.assertEqual(body.count(anchor), 1)
+            body = body.replace(anchor, anchor + f"\nStart-Sleep -Seconds {probe_s}")
+        if exit_hold_s:
+            body = body + f"\nStart-Sleep -Seconds {exit_hold_s}"
         job = self.tmp / "identity-probe-job.ps1"
         job.write_text(prelude + body, encoding="utf-8")
         wall_started = _ident_time.monotonic()
         proc = _ident_run_reaped([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-File", str(job)], timeout=240, env=env)
         self.last_wall_s = _ident_time.monotonic() - wall_started
         self.last_stderr = proc.stderr
-        m = re.search(r"VENUE_PROBE_INTERNAL_MS=(\d+) script_ms=(\d+) abandoned=(\d+)", proc.stderr)
-        self.last_timing = {"since_process_start_ms": int(m.group(1)), "script_ms": int(m.group(2)), "abandoned": int(m.group(3))} if m else None
+        self.last_timing = _parse_probe_timing(proc.stderr)
         lines = [ln for ln in proc.stdout.splitlines() if ln.startswith("VENUE_QUIET=")]
         self.assertEqual(len(lines), 1, proc.stdout + proc.stderr)
         self.last_line = lines[0][len("VENUE_QUIET="):]   # the line exactly as the gate retains it (Wait-VenueQuiet.ps1 RAW RETENTION)
@@ -11498,7 +11526,7 @@ class VenueProbeIdentityCallDeadlineTests(IdentityProbeMixin, unittest.TestCase)
     DELAY_MS = 120000
     CALL_MS = 1500
     WALL_LIMIT_S = 60.0       # about twice the worst load-only wall measured; half the delay
-    EXIT_HOLD_LIMIT_S = 15.0  # wall minus the probe's own time since its process started: spawn + exit only (measured <= 1.5 s under the same load)
+    EXIT_HOLD_LIMIT_S = 15.0  # wall minus the probe's own monotonic Stopwatch: process spawn + exit only (measured <= 1.5 s under the same load); r2: no civil clock is in this arithmetic
 
     def setUp(self) -> None:
         tmp = tempfile.TemporaryDirectory(prefix="venue-probe-deadline-")
@@ -11529,15 +11557,21 @@ class VenueProbeIdentityCallDeadlineTests(IdentityProbeMixin, unittest.TestCase)
 
     def timing_text(self) -> str:
         t = self.last_timing
-        return "no VENUE_PROBE_INTERNAL_MS line on stderr" if t is None else f"probe process {t['since_process_start_ms'] / 1000.0:.1f} s, script {t['script_ms'] / 1000.0:.1f} s, {t['abandoned']} call(s) abandoned"
+        if t is None:
+            return "no VENUE_PROBE_INTERNAL_MS line on stderr"
+        if t["probe_ms"] is None:
+            return t["bad"]
+        return f"probe stopwatch {t['probe_ms'] / 1000.0:.1f} s, {t['abandoned']} call(s) abandoned"
 
-    def assert_no_exit_hold(self) -> None:
+    def assert_no_exit_hold(self, require_abandoned: bool = True) -> None:
         """The probe's own stopwatch against the wall clock the test saw: whatever the probe did before it ended, nothing may hold the PROCESS afterwards (an abandoned worker's
         runspace must not keep it alive)."""
         t = self.last_timing
         self.assertIsNotNone(t, "the timing seam printed nothing: " + self.last_stderr)
-        self.assertGreaterEqual(t["abandoned"], 1, "the slow call was not abandoned, so this case proves nothing")
-        gap = self.last_wall_s - t["since_process_start_ms"] / 1000.0
+        self.assertIsNotNone(t["probe_ms"], "typed failure, not a missing marker: " + t.get("bad", ""))
+        if require_abandoned:
+            self.assertGreaterEqual(t["abandoned"], 1, "the slow call was not abandoned, so this case proves nothing")
+        gap = self.last_wall_s - t["probe_ms"] / 1000.0
         self.assertLess(gap, self.EXIT_HOLD_LIMIT_S, f"the process outlived the probe by {gap:.1f} s: an abandoned call held the exit ({self.timing_text()}, wall {self.last_wall_s:.1f} s)")
 
     def test_a_slow_gpu_read_times_out_into_a_status_and_the_rest_of_identity_is_still_filled(self) -> None:
@@ -11569,6 +11603,70 @@ class VenueProbeIdentityCallDeadlineTests(IdentityProbeMixin, unittest.TestCase)
         self.run_identity_probe(self.procs, self.cim, CHAIN_OWNERS)
         self.assertIsNone(self.last_timing)
         self.assertNotIn("VENUE_PROBE_INTERNAL_MS", self.last_stderr)
+
+    # r2 (Dot 797-I1, sol CR on 51ace353): the probe's timing is ONE monotonic Stopwatch. A civil-clock step (+/-20 s, injected into every [DateTime]::Now read of the test copy) must neither
+    # hide an exit hold nor fake one, and the exit hold is injected for real (the process sleeps after its marker), so the gap assertion is reached on its own.
+    def test_a_forward_civil_clock_step_cannot_hide_a_20_second_exit_hold(self) -> None:
+        self.run_identity_probe(self.procs, self.cim, CHAIN_OWNERS, timing=True, probe_s=10, civil_step_s=20, exit_hold_s=20)
+        self.assertGreaterEqual(self.last_wall_s - self.last_timing["probe_ms"] / 1000.0, 19.0, self.timing_text())
+        with self.assertRaises(AssertionError) as ctx:
+            self.assert_no_exit_hold(require_abandoned=False)
+        self.assertIn("outlived the probe", str(ctx.exception))
+
+    def test_a_backward_civil_clock_step_cannot_fake_an_exit_hold_or_a_missing_marker(self) -> None:
+        self.run_identity_probe(self.procs, self.cim, CHAIN_OWNERS, timing=True, probe_s=30, civil_step_s=-20)
+        self.assertGreaterEqual(self.last_timing["probe_ms"], 30000, self.timing_text())
+        self.assert_no_exit_hold(require_abandoned=False)   # no hold: 30 s of probe work, whatever the civil clock did
+
+    def test_a_negative_or_unreadable_timing_marker_is_a_typed_failure_and_never_a_missing_marker(self) -> None:
+        for raw in ("-10000", "1.5", "NaN", ""):
+            t = _parse_probe_timing(f"VENUE_PROBE_INTERNAL_MS={raw} abandoned=1\n")
+            self.assertIsNotNone(t, raw)
+            self.assertIsNone(t["probe_ms"], raw)
+            self.assertIn("not a non-negative integer", t["bad"])
+            self.last_timing, self.last_stderr, self.last_wall_s = t, "", 30.5
+            with self.assertRaises(AssertionError) as ctx:
+                self.assert_no_exit_hold()
+            self.assertIn("typed failure", str(ctx.exception), raw)
+        self.assertEqual(_parse_probe_timing("VENUE_PROBE_INTERNAL_MS=10000 abandoned=1"), {"probe_ms": 10000, "abandoned": 1})
+        self.assertIsNone(_parse_probe_timing("no marker here"))
+
+    def test_the_timing_marker_is_read_from_one_monotonic_stopwatch_and_no_civil_clock(self) -> None:
+        body = _ident_probe_body()
+        line = next(ln for ln in body.splitlines() if "WriteLine('VENUE_PROBE_INTERNAL_MS=" in ln)
+        self.assertIn("$script:ProbeSw.ElapsedMilliseconds", line)
+        for banned in ("[DateTime]", "Get-Date", ".StartTime", "GetCurrentProcess"):
+            self.assertNotIn(banned, line, "a civil-clock read in the timing marker lets a clock step move the exit-hold arithmetic")
+
+    def test_the_test_reaper_still_drains_and_kills_when_taskkill_itself_times_out(self) -> None:
+        from unittest import mock
+
+        class FakeProc:
+            pid = 4242
+
+            def __init__(self) -> None:
+                self.calls = []
+
+            def communicate(self, timeout=None):
+                self.calls.append("communicate")
+                raise subprocess.TimeoutExpired("probe", timeout)
+
+            def poll(self):
+                return None
+
+            def kill(self):
+                self.calls.append("kill")
+
+            def wait(self, timeout=None):
+                self.calls.append("wait")
+                return 0
+
+        fake = FakeProc()
+        with mock.patch.object(subprocess, "Popen", return_value=fake), \
+                mock.patch.object(subprocess, "run", side_effect=subprocess.TimeoutExpired("taskkill", 60)):
+            with self.assertRaises(subprocess.TimeoutExpired):
+                _ident_run_reaped(["probe"], timeout=1)
+        self.assertEqual(fake.calls, ["communicate", "communicate", "kill", "wait"], "taskkill failing must fall through to the bounded drain and the fallback kill")
 
     def test_the_call_deadline_is_a_pinned_literal_inside_the_identity_budget_arithmetic(self) -> None:
         body = _ident_probe_body()
