@@ -513,7 +513,8 @@ class PictureDumpBindingAdversaryR1(unittest.TestCase):
                 root = self.bound(lambda sha, result=result: AUTO_WB_LINE + dump_line(sha) + result)
                 code, text = run_checker([root, "--tag", "t"])
                 self.assertEqual(1, code, text)
-                self.assertIn("STALE", text)
+                # a key given twice is rejected as "no complete apply" before the binding is reached (r2 A3)
+                self.assertRegex(text, "STALE|no complete Look Assist apply")
         # an async application owns its dump the same way
         root = self.bound(lambda sha: DISPATCH_LINE + dump_line(sha) + ASYNC_APPLIED_LINE.replace("frame=0", "frame=-1"))
         self.assertEqual(1, run_checker([root, "--tag", "t"])[0])
@@ -677,6 +678,63 @@ class PictureDumpBindingAdversaryR3(unittest.TestCase):
         self.assertEqual(1, code, text)
         self.assertIn("skipped", text)
         self.assertNotIn("safety fallback", text)
+
+    # ---- adversary pass on 85b1d8b3 (A1, A2, A3, A6): each input below passed the r2 first cut ----
+    def test_p4_a1_a_markerless_result_discards_the_pending_dump_so_a_later_result_cannot_inherit_it(self):
+        def markerless(line):
+            return line.replace("interaction_trace event=", "note=event=")
+        later = result_line().replace("final_temp=8950 final_tint=-35", "final_temp=5840 final_tint=7")
+        sync = lambda sha: AUTO_WB_LINE + dump_line(sha) + markerless(result_line()) + later
+        asyn = lambda sha: (DISPATCH_LINE + dump_line(sha) + markerless(ASYNC_APPLIED_LINE) + ASYNC_APPLIED_LINE)
+        for label, trace_for in (("sync", sync), ("async", asyn)):
+            with self.subTest(label):
+                code, text = run_checker([self.bound(trace_for), "--tag", "t"])
+                self.assertEqual(1, code, text)
+                self.assertNotIn("picture_dump-bound", text)
+
+    def test_p4_a2_the_event_is_what_follows_the_first_interaction_trace_tag_even_when_it_is_empty(self):
+        stamp = "[2026-10-02T01:56:36.037Z] [INFO] [0x2e638] "
+        empty_first = lambda line: stamp + "interaction_trace event= " + line
+        no_event_first = lambda line: stamp + "interaction_trace note=x " + line
+        for name, wrap in (("empty event", empty_first), ("tag without event", no_event_first)):
+            cases = {
+                "result": lambda sha: AUTO_WB_LINE + dump_line(sha) + wrap(result_line()),
+                "dump": lambda sha: AUTO_WB_LINE + wrap(dump_line(sha)) + result_line(),
+                "auto_wb": lambda sha: wrap(AUTO_WB_LINE) + dump_line(sha) + result_line(),
+                "async applied": lambda sha: DISPATCH_LINE + dump_line(sha) + wrap(ASYNC_APPLIED_LINE),
+                "async dispatch": lambda sha: wrap(DISPATCH_LINE) + dump_line(sha) + ASYNC_APPLIED_LINE,
+            }
+            for label, trace_for in cases.items():
+                with self.subTest("%s / %s" % (name, label)):
+                    code, text = run_checker([self.bound(trace_for), "--tag", "t"])
+                    self.assertEqual(1, code, text)
+                    self.assertNotIn("picture_dump-bound", text)
+
+    def test_p4_a3_a_key_given_twice_on_an_event_line_is_ambiguous_and_no_apply(self):
+        cases = {
+            "async valid twice": lambda sha: DISPATCH_LINE + dump_line(sha) + ASYNC_APPLIED_LINE.replace("valid=1", "valid=1 valid=0"),
+            "result analysis twice": lambda sha: AUTO_WB_LINE + dump_line(sha) + result_line().replace("analysis=raw", "analysis=raw analysis=raw"),
+            "auto_wb damping twice": lambda sha: AUTO_WB_LINE.replace("damping=1.000", "damping=1.000 damping=0.500") + dump_line(sha) + result_line(),
+            "dispatch generation twice": lambda sha: DISPATCH_LINE.replace("generation=3", "generation=3 generation=4") + dump_line(sha) + ASYNC_APPLIED_LINE,
+        }
+        for label, trace_for in cases.items():
+            with self.subTest(label):
+                code, text = run_checker([self.bound(trace_for), "--tag", "t"])
+                self.assertEqual(1, code, text)
+                self.assertNotIn("picture_dump-bound", text)
+
+    def test_p4_a6_a_new_applications_auto_wb_does_not_inherit_the_previous_results_receipt(self):
+        other_wb = AUTO_WB_LINE.replace("source=rendered-neutral-patch", "source=processed-neutral-patch")
+        root = self.bound(lambda sha: AUTO_WB_LINE + result_line() + other_wb)       # the log ends right after the new auto_wb
+        for argv in (["--decisions-only"], ["--decisions-only", "--allow-unbound-legacy"]):
+            with self.subTest(argv):
+                code, text = run_checker([root, "--tag", "t"] + argv)
+                self.assertEqual(1, code, text)
+                self.assertIn("no complete Look Assist apply", text)
+        # control: an async flow keeps the dispatch's scene for its own auto_wb and applied lines
+        root = self.bound(lambda sha: AUTO_WB_LINE + result_line() + DISPATCH_LINE + other_wb + dump_line(sha) + ASYNC_APPLIED_LINE)
+        code, text = run_checker([root, "--tag", "t"])
+        self.assertEqual(0, code, text)
 
     def test_a5_a_corrupt_png_is_exit_2_not_a_crash(self):
         import struct

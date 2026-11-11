@@ -74,13 +74,25 @@ FALLBACK_EVENT = "look_assist.daylight_fallback_to_master"
 EVENT_NAME = {name: re.compile(re.escape(name) + r"\b") for name in (
     RESULT_EVENT, ASYNC_APPLIED_EVENT, AUTO_WB_EVENT, ASYNC_DISPATCH_EVENT, SAFETY_FALLBACK_EVENT, SKIP_EVENT, FALLBACK_EVENT)}
 INT_FIELD = re.compile(r"-?[0-9]{1,9}")
+RESULT_KEYS = ("scene", "exposure", "temperature", "tint", "frame", "picture_dump", "source", "decision")   # what one application's result sets
 BUILD_SHA = re.compile(r'"build_sha"\s*:\s*"([^"]*)"')
 # The app's own binding of the final PNG (PR #793 head cc3205de, src/batch/LookAssistAnalysis.cpp lookAssistPictureDumpFields):
 #   look_assist.apply.picture_dump pre_safety=<name|none> pre_safety_sha256=<hex|none> pre_safety_exposure=<n>
 #       final=<look-assist-final-frameN.png|none> final_sha256=<hex of the exact PNG bytes|none> final_exposure=<n>
 #       safety=<keep|retreat|revert> frame=<n>
 # It is logged after the application's last look change and BEFORE that application's look_assist.apply.result line.
-EVENT = re.compile(r"\binteraction_trace event=(\S+)")     # the event a log line IS: its first such token
+TRACE_TAG = re.compile(r"\binteraction_trace\b")      # the FIRST such tag on a line is its interaction_trace marker
+TRACE_EVENT = re.compile(r"\s+event=(\S*)")           # what must follow it; an empty or absent event is NO event, never the next marker
+
+
+def line_event(line):
+    """-> (event, fields_start). event is None for a line with no interaction_trace tag at all (the old back-compat
+    reading), and "" for a tag not followed by a non-empty event=: such a line is no event of ours."""
+    tag = TRACE_TAG.search(line)
+    if not tag:
+        return None, 0
+    named = TRACE_EVENT.match(line, tag.end())
+    return (named.group(1), named.end()) if named else ("", tag.end())
 DUMP_EVENT = "look_assist.apply.picture_dump"
 FIELD = re.compile(r"(?<!\S)([a-z_0-9]+)=(\S*)")
 LOG_FRAME = re.compile(r"(?<!\S)frame=(\S*)")      # the whitespace-delimited key: last_frame=<n> is another field
@@ -104,16 +116,17 @@ def parse_log_text(text):
     newest_dump = None       # the newest picture_dump line anywhere in the log
     dump_lines = 0
     for line in text.splitlines():
-        head = EVENT.search(line)
-        event = head.group(1) if head else None
-        pairs = FIELD.findall(line[head.end():] if head else line)
+        event, start = line_event(line)
+        marked = event is not None          # False: no interaction_trace tag (back-compat reading, never owns a dump)
+        pairs = FIELD.findall(line[start:])
+        ambiguous = len({key for key, _ in pairs}) != len(pairs)      # a key given twice: no field of the line is trusted
 
         def is_event(name):
-            return event == name if head else bool(EVENT_NAME[name].search(line))
+            return event == name if marked else bool(EVENT_NAME[name].search(line))
 
         def once(key):
             values = [value for found, value in pairs if found == key]
-            return values[0] if len(values) == 1 else None
+            return values[0] if len(values) == 1 and not ambiguous else None
 
         def int_once(key):
             value = once(key)
@@ -148,7 +161,10 @@ def parse_log_text(text):
             if valid is None or not re.fullmatch(r"[0-9]", valid) or not source or not decision:
                 receipt = {"malformed_event": AUTO_WB_EVENT}
             else:
-                receipt = dict(receipt or {}, source=source, decision=decision)
+                base = receipt or {}
+                if "exposure" in base:      # a complete application stands behind us: this auto_wb begins a NEW one, which
+                    base = {k: v for k, v in base.items() if k not in RESULT_KEYS}      # inherits none of its result
+                receipt = dict(base, source=source, decision=decision)
                 receipt.pop("malformed_event", None)
             receipt.pop("picture_dump", None)        # a new application began: the earlier result's dump is not its
             pending_dump = None                     # auto_wb precedes the dump of its own application
@@ -162,11 +178,11 @@ def parse_log_text(text):
             receipt = dict(receipt or {}, scene=scene, exposure=exposure, temperature=temperature, tint=tint)
             receipt.pop("malformed_event", None)
             receipt["frame"] = LOG_FRAME.findall(line)     # raw tokens: validated where the picture is bound
-            if head:
+            if marked:
                 receipt["picture_dump"], pending_dump = pending_dump, None    # this application owns the dump before it
             else:
-                receipt["picture_dump"] = None          # no event marker: decisions only, it never owns a dump
-            continue
+                receipt["picture_dump"], pending_dump = None, None    # no event marker: decisions only; it owns no dump and
+            continue                                                  # a dump it ends is spent, never inherited by a later result
         if is_event(ASYNC_APPLIED_EVENT):
             source, decision = once("source"), once("decision")
             temperature, tint, exposure = int_once("final_temp"), int_once("final_tint"), int_once("preset_exp")
@@ -177,10 +193,10 @@ def parse_log_text(text):
             receipt = dict(receipt or {}, source=source, decision=decision, temperature=temperature, tint=tint, exposure=exposure)
             receipt.pop("malformed_event", None)
             receipt["frame"] = LOG_FRAME.findall(line)     # raw tokens: validated where the picture is bound
-            if head:
+            if marked:
                 receipt["picture_dump"], pending_dump = pending_dump, None
             else:
-                receipt["picture_dump"] = None
+                receipt["picture_dump"], pending_dump = None, None
     if skipped:
         receipt = dict(receipt or {}, skipped=skipped)
     if receipt is not None and dump_lines:
