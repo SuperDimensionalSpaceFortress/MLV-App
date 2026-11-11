@@ -488,44 +488,55 @@ def _type_kind(node: ast.AST) -> str | None:
     return "str" if isinstance(operand, ast.JoinedStr) else None
 
 
+def _bound_names(n: ast.AST) -> list[str]:
+    """Every name the node binds, by any mechanism (assignment, loop / with / walrus / comprehension target, parameter, def, class, import, ``except as``, match capture)."""
+    if isinstance(n, ast.Name):
+        return [n.id] if isinstance(n.ctx, (ast.Store, ast.Del)) else []
+    if isinstance(n, ast.arg):
+        return [n.arg]
+    if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+        return [n.name]
+    if isinstance(n, (ast.Import, ast.ImportFrom)):
+        return [a.asname or a.name.split(".")[0] for a in n.names]
+    return [x for x in (getattr(n, "name", None), getattr(n, "rest", None)) if isinstance(x, str)] if isinstance(n, (ast.ExceptHandler, ast.MatchAs, ast.MatchStar, ast.MatchMapping)) else []
+
+
 def _note_aliases(tree: ast.AST) -> None:
+    """r16 (pass 39, one class): a name stands for the module / function / type only while the file binds it EXACTLY ONCE (the import or the alias assignment itself): a parameter, a
+    rebinding, a second import, a loop variable or a class attribute of the same name is something else, and the scan then reads the call as unknown (reported), never as the standard one."""
     _TEXT_BASE_MEMO.clear()
-    _STR_ALIASES.clear()
-    _BYTES_ALIASES.clear()
-    _STR_KIND_ALIASES.clear()
-    _BUILTINS_NAMES.clear()
-    _OPERATOR_MODULES.clear()
-    _OPERATOR_FUNCS.clear()
-    _REBOUND_TYPES.clear()
-    _CODEC_ALIASES.clear()
-    _CODEC_FUNCS.clear()
-    for n in ast.walk(tree):  # the names an import gives the types come first: an alias of one (`C = B`) is read against them
-        if isinstance(n, ast.ImportFrom) and n.module == "builtins":
-            _STR_ALIASES.update(a.asname or a.name for a in n.names if a.name in ("str", "bytes"))
-            _BYTES_ALIASES.update(a.asname or a.name for a in n.names if a.name == "bytes")
-            _STR_KIND_ALIASES.update(a.asname or a.name for a in n.names if a.name == "str")
-        elif isinstance(n, ast.Import):
-            _CODEC_ALIASES.update(a.asname or a.name for a in n.names if a.name == "codecs")
-            _BUILTINS_NAMES.update(a.asname or a.name for a in n.names if a.name == "builtins")
-            _OPERATOR_MODULES.update(a.asname or a.name for a in n.names if a.name == "operator")
-        if isinstance(n, ast.ImportFrom) and n.module == "operator":
-            _OPERATOR_FUNCS.update({a.asname or a.name: a.name for a in n.names if a.name in _OPERATOR_BINOPS})
-        if isinstance(n, ast.ImportFrom) and n.module == "codecs":
-            _CODEC_FUNCS.update({a.asname or a.name: a.name for a in n.names if a.name in ("decode", "encode")})  # from codecs import decode as d
+    for table in (_STR_ALIASES, _BYTES_ALIASES, _STR_KIND_ALIASES, _BUILTINS_NAMES, _OPERATOR_MODULES, _OPERATOR_FUNCS, _REBOUND_TYPES, _CODEC_ALIASES, _CODEC_FUNCS):
+        table.clear()
+    counts: dict[str, int] = {}
     for n in ast.walk(tree):
-        bound = ([t.id for t in n.targets if isinstance(t, ast.Name)] if isinstance(n, ast.Assign) else [n.target.id] if isinstance(n, (ast.AnnAssign, ast.AugAssign)) and isinstance(n.target, ast.Name)
-                 else [n.name] if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) else [n.arg] if isinstance(n, ast.arg)
-                 else [a.asname or a.name.split(".")[0] for a in n.names if not (isinstance(n, ast.ImportFrom) and n.module == "builtins" and a.name in ("str", "bytes") and not a.asname)]
-                 if isinstance(n, (ast.Import, ast.ImportFrom)) else [])
-        _REBOUND_TYPES.update(name for name in bound if name in ("str", "bytes"))
-        if isinstance(n, ast.Import):
-            continue
-        _BUILTINS_NAMES.difference_update(name for name in bound if name == "builtins")  # `builtins = Fake` is not the module
+        for name in _bound_names(n):
+            counts[name] = counts.get(name, 0) + 1
+    once = lambda name: counts.get(name) == 1  # noqa: E731
+    for n in ast.walk(tree):  # the names an import gives the types come first: an alias of one (`C = B`) is read against them
+        mod = n.module if isinstance(n, ast.ImportFrom) and not n.level else None
+        for a in n.names if isinstance(n, (ast.Import, ast.ImportFrom)) else ():
+            name = a.asname or a.name
+            if not once(name):
+                continue
+            if mod == "builtins" and a.name in ("str", "bytes"):
+                _STR_ALIASES.add(name)
+                (_BYTES_ALIASES if a.name == "bytes" else _STR_KIND_ALIASES).add(name)
+            elif isinstance(n, ast.Import) and a.name in ("codecs", "builtins", "operator"):
+                {"codecs": _CODEC_ALIASES, "builtins": _BUILTINS_NAMES, "operator": _OPERATOR_MODULES}[a.name].add(name)
+            elif mod == "operator" and a.name in _OPERATOR_BINOPS:
+                _OPERATOR_FUNCS[name] = a.name
+            elif mod == "codecs" and a.name in ("decode", "encode"):
+                _CODEC_FUNCS[name] = a.name  # from codecs import decode as d
+    # the builtin NAME `str` / `bytes` is rebound by any binding of it other than `from builtins import str`
+    plain = {a.name for n in ast.walk(tree) if isinstance(n, ast.ImportFrom) and n.module == "builtins" and not n.level for a in n.names if a.asname is None and a.name in ("str", "bytes")}
+    _REBOUND_TYPES.update(name for name in ("str", "bytes") if counts.get(name, 0) > (1 if name in plain else 0))
     binds = [(n.targets[0].id, n.value) for n in ast.walk(tree) if isinstance(n, ast.Assign) and len(n.targets) == 1 and isinstance(n.targets[0], ast.Name)]
     binds += [(n.target.id, n.value) for n in ast.walk(tree) if isinstance(n, ast.AnnAssign) and isinstance(n.target, ast.Name) and n.value is not None]  # `B: type = bytes` (pass-35 A3)
     for _ in range(len(binds) + 1):  # an alias of an alias (`C = B`) is read once `B` is known; repeated until nothing new is learnt
         known = (len(_STR_ALIASES), len(_BYTES_ALIASES), len(_STR_KIND_ALIASES), len(_OPERATOR_MODULES))
         for name, v in binds:
+            if not once(name):
+                continue
             if isinstance(v, ast.Name) and v.id in _OPERATOR_MODULES:
                 _OPERATOR_MODULES.add(name)  # `op = operator`
             kind = _type_kind(v)  # r15 (A3): a name is an alias of a type only when the value PROVES the type; `C = T.str` / `C = type(x)` bind an unknown
@@ -540,8 +551,9 @@ def _note_aliases(tree: ast.AST) -> None:
 
 
 def _codecs_like(recv: ast.AST) -> bool:
-    """The ``codecs`` module under any name the file gives it (``codecs``, ``import codecs as c``, ``x.codecs``): ``codecs.decode(b, enc, err)`` is ``b.decode(enc, err)``."""
-    return (isinstance(recv, ast.Name) and (recv.id == "codecs" or recv.id in _CODEC_ALIASES)) or (isinstance(recv, ast.Attribute) and recv.attr == "codecs")
+    """The ``codecs`` module under a name the file imported it as, once (``import codecs``, ``import codecs as c``): ``codecs.decode(b, enc, err)`` is ``b.decode(enc, err)``.
+    An attribute (``x.codecs``) or a name nothing proves is not it (r16 pass-39 A1)."""
+    return isinstance(recv, ast.Name) and recv.id in _CODEC_ALIASES
 
 
 def _type_like(recv: ast.AST) -> bool:
@@ -581,7 +593,7 @@ def _bound_form(node: ast.AST, consts: dict[str, str]) -> ast.AST:
         # operator function, a dunder or a string method through it is read by its method name, never by the spelling of the receiver (pass-22 A3).
         if attr in _OPERATOR_BINOPS and isinstance(recv, ast.Name) and recv.id in _OPERATOR_MODULES and len(node.args) == 2 and not node.keywords:  # (mod's second operand may be a tuple or a mapping)
             return ast.BinOp(left=node.args[0], op=_OPERATOR_BINOPS[attr](), right=node.args[1])
-        if attr in _DUNDER_BINOPS and len(node.args) == 2 and not node.keywords:  # str.__add__(a, b)
+        if attr in _DUNDER_BINOPS and len(node.args) == 2 and not node.keywords and _type_like(recv):  # str.__add__(a, b); `Builder.__add__(a, b)` is Builder's (pass-39 A3)
             op, reflected = _DUNDER_BINOPS[attr]
             return ast.BinOp(left=node.args[1] if reflected else node.args[0], op=op(), right=node.args[0] if reflected else node.args[1])
         # A string method called on the TYPE: `str`, `builtins.str`, `type(x)`, `x.__class__`. Any other receiver may be an instance (`source.index('needle')`), whose
@@ -4674,8 +4686,10 @@ class AdversaryR9Tests(unittest.TestCase):
         for label, (prefix, exprs) in aliases.items():
             for expr in exprs:
                 self.assertGreaterEqual(len(self._bad(prefix + self._launch(expr))), 1, (label, expr))
-        for expr in ("op.concat('Start-', 'Process cmd.exe')", "type('').join('', ['sap', 's cmd.exe'])", "S.__add__('Start-', 'Process cmd.exe')", "add('sap', 's cmd.exe')", "mod('%saps cmd.exe', 's')"):
+        for expr in ("op.concat('Start-', 'Process cmd.exe')", "type('').join('', ['sap', 's cmd.exe'])", "add('sap', 's cmd.exe')", "mod('%saps cmd.exe', 's')"):
             self.assertEqual(self._psop(expr), (1, 1), expr)
+        found, bad = _start_process_violations("S = str\nx = S.__add__('Start-', 'Process cmd.exe')\n")  # r16 (pass-39 A3): the type name is proof only where the file binds it
+        self.assertEqual((found, len(bad)), (1, 1))
         for expr in ("b.str.lower('START-PROCESS cmd.exe')", "b.str.removeprefix('zzStart-Process cmd.exe', 'zz')"):  # r15 (A3): `b` is the builtins module only where the file imports it
             self.assertEqual(_start_process_violations("import builtins as b\nx = " + expr + "\n")[0], 1, expr)
         # an INSTANCE method with a launch word as its argument is a call on something else: the fixture line `source.index("...Process]::Start(...)")`
@@ -4953,7 +4967,8 @@ class AdversaryR9Tests(unittest.TestCase):
             text, known = _flatten(ast.parse(expr, mode="eval").body, {})
             self.assertTrue(known or _WILD in text, expr)
         for expr in ("codecs.decode('Fgneg-Cebprff pzq.rkr', 'rot_13')", "codecs.decode(b'U3RhcnQtUHJvY2VzcyBjbWQuZXhl', 'base64').decode()", "codecs.decode('fnCF pzq.rkr', 'rot13')"):
-            self.assertEqual(self._ps(expr), (1, 1), expr)
+            found, bad = _start_process_violations("import codecs\nscript = " + expr + "\n")  # r16 (pass-39 A1): `codecs` is the module only where the file imports it
+            self.assertEqual((found, len(bad)), (1, 1), expr)
         for prefix, expr in (("import codecs\n", "codecs.decode(data, 'rot_13')"), ("", "payload.decode(enc)"), ("import codecs\n", "codecs.decode(b'abc', 'ascii')"),
                              ("import codecs\n", "codecs.decode(read_bytes(), 'utf-8', 'replace')"), ("", "b''.decode(enc)"), ("", "'\\x00'.encode(enc)")):
             self.assertEqual(self._bad(prefix + self._named(expr)), [], (prefix, expr))
@@ -5599,6 +5614,42 @@ class AdversaryR9Tests(unittest.TestCase):
                 self.assertGreaterEqual(len(_unflagged_spawns(rel)), 1, rel)  # and so is a new over-cap text
         for rel in (*_GETATTR_REVIEWED, *_PATTERN_CAP_REVIEWED):
             self.assertEqual(_unflagged_spawns(rel), [], rel)  # the reviewed lines themselves stay allowed
+
+    # ---- r16 pass 39 (review-adversary-MLV-LANE-CONSOLE-HIDDEN-1-r16-b73f0fea): A1-A3, one class: a name or a spelling proves an identity only while nothing else can be that name ----
+    def test_r16_pass39_a1_a_codecs_attribute_or_shadowed_codecs_name_is_not_the_codecs_module(self):
+        launch = "async def launch({params}):\n    loop = asyncio.get_running_loop()\n    await getattr(loop, {name})(asyncio.SubprocessProtocol, 'cmd.exe')\n"
+        decoder = "import asyncio\nclass Decoder:\n    @staticmethod\n    def decode(value, encoding):\n        return value.decode(encoding) + 'c'\n"
+        for head, params, name in ((decoder + "class Settings:\n    codecs = Decoder\n", "", "Settings.codecs.decode(b'subprocess_exe', 'ascii')"),
+                                   (decoder + "import codecs\ncodecs = Decoder\n", "", "codecs.decode(b'subprocess_exe', 'ascii')"),
+                                   (decoder + "import codecs as c\n", "c=Decoder", "c.decode(b'subprocess_exe', 'ascii')")):
+            self.assertGreaterEqual(len(_unflagged_spawns_in_source(head + launch.format(params=params, name=name), "probe.py")), 1, name)
+        _note_aliases(ast.parse("import codecs\n"))
+        self.assertEqual(self._fold_text("codecs.decode(b'subprocess_exec', 'ascii')"), ("subprocess_exec", True))  # the real, unshadowed module keeps its fold
+        _note_aliases(ast.parse("x = 1\n"))
+
+    def test_r16_pass39_a2_an_alias_is_proof_only_while_it_is_bound_once(self):
+        launch = "async def launch({params}):\n    loop = asyncio.get_running_loop()\n    await getattr(loop, {name})(asyncio.SubprocessProtocol, 'cmd.exe')\n"
+        builder = "class Builder:\n    def add(self, left, right):\n        return right + left\n    def decode(self, v, e):\n        return v.decode(e) + 'c'\n"
+        for head, params, name in (("import asyncio\nimport operator as op\n" + builder, "op=Builder()", "op.add('exec', 'subprocess_')"),  # a parameter shadows the module
+                                   ("import asyncio\nimport operator as op\n" + builder + "op = Builder()\n", "", "op.add('exec', 'subprocess_')"),  # a rebinding
+                                   ("import asyncio\nfrom operator import concat\n" + builder, "concat=Builder().add", "concat('exec', 'subprocess_')"),
+                                   ("import asyncio\nimport operator as op\n" + builder, "", "[op for op in [Builder()]][0].add('exec', 'subprocess_')"),
+                                   ("import asyncio\nfrom codecs import decode\n" + builder, "decode=Builder().decode", "decode(b'subprocess_exe', 'ascii')"),
+                                   ("import asyncio\nimport builtins as b\n" + builder, "b=Builder()", "b.str(b'subprocess_exe', 'ascii')"),
+                                   ("import asyncio\nfrom builtins import str as S\n" + builder, "S=Builder().decode", "S(b'subprocess_exe', 'ascii')"),
+                                   ("import asyncio\nimport operator as op\nimport json as op\n" + builder, "", "op.add('exec', 'subprocess_')")):  # two imports, one name
+            self.assertGreaterEqual(len(_unflagged_spawns_in_source(head + launch.format(params=params, name=name), "probe.py")), 1, name)
+        _note_aliases(ast.parse("import operator as op\nfrom operator import concat\n"))
+        self.assertEqual(self._fold_text("op.add('subprocess_', 'exec')"), ("subprocess_exec", True))  # bound once: the exact fold stays
+        _note_aliases(ast.parse("x = 1\n"))
+
+    def test_r16_pass39_a3_a_dunder_called_on_a_receiver_that_is_not_proven_to_be_a_string_is_no_operator(self):
+        launch = ("import asyncio\nclass Builder:\n    def __add__(left, right):\n        return right + left\n    def __mod__(left, right):\n        return right % left\n"
+                  "    def __radd__(left, right):\n        return left + right\nasync def launch():\n    loop = asyncio.get_running_loop()\n"
+                  "    await getattr(loop, {name})(asyncio.SubprocessProtocol, 'cmd.exe')\n")
+        for name in ("Builder.__add__('exec', 'subprocess_')", "Builder.__mod__('subprocess_%s', 'exec')", "Builder.__rmod__('exec', 'subprocess_%s')", "Builder.__radd__('subprocess_', 'exec')"):
+            self.assertGreaterEqual(len(_unflagged_spawns_in_source(launch.format(name=name), "probe.py")), 1, name)
+        self.assertEqual(self._fold_text("str.__add__('subprocess_', 'exec')"), ("subprocess_exec", True))  # the proven type keeps its fold
 
     def test_r15_conservative_flips_a_name_that_is_not_a_constant_is_reported_in_a_getattr_name_position(self):
         # every one of these read clean before r15 (a matcher ruled the partial text out); the class rule reports them: a false positive is allowlisted by a reviewer, a false negative is not
