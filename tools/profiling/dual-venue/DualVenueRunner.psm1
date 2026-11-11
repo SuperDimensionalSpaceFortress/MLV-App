@@ -2952,6 +2952,18 @@ function Get-DvVisualExposureStats {
     }
 }
 
+function Test-DvOrdinalEqual($A, $B) {
+    # exact (code-unit) string equality: PowerShell's -ceq is a culture comparison that ignores embedded NULs and zero-width characters
+    [string]::Equals([string]$A, [string]$B, [System.StringComparison]::Ordinal)
+}
+
+function Get-DvJsonRepeatedKey($Element) {
+    # the first property name (ordinal) that a System.Text.Json object element gives twice, else $null
+    $seen = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::Ordinal)
+    foreach ($p in $Element.EnumerateObject()) { if (-not $seen.Add([string]$p.Name)) { return [string]$p.Name } }
+    $null
+}
+
 function ConvertTo-DvExposureLimit($Element, [double]$Min, [double]$Max) {
     # a System.Text.Json element that is a real JSON number inside [Min, Max] -> that double; anything else (a string "16", a bool, null, out of range) -> $null
     if ($Element.ValueKind -ne [System.Text.Json.JsonValueKind]::Number) { return $null }
@@ -2987,24 +2999,29 @@ function Get-DvExposureBand {
         $root = $json.RootElement
         $bad = { param($why) (& $result 'fallback-malformed' "the exposure band file is unusable ($why): the absolute fallback band judges" $fallback) }
         if ($root.ValueKind -ne [System.Text.Json.JsonValueKind]::Object) { return (& $bad 'the root is not a JSON object') }
-        $clipsProps = @($root.EnumerateObject() | Where-Object { $_.Name -ceq 'clips' })
+        # (names are compared ORDINALLY, never with -ceq: that is a culture comparison, and "M16-1457<NUL>" -ceq "M16-1457" is true)
+        # a key given twice at the root or in clips is ambiguous whatever its name: the file is malformed, not "the first one" and not "the other rows"
+        $repeated = Get-DvJsonRepeatedKey $root
+        if ($null -ne $repeated) { return (& $bad "the root repeats the key '$repeated'") }
+        $clipsProps = @($root.EnumerateObject() | Where-Object { Test-DvOrdinalEqual $_.Name 'clips' })
         if ($clipsProps.Count -eq 0) { return (& $result 'fallback-no-row' $null $fallback) }
-        if ($clipsProps.Count -gt 1) { return (& $bad 'clips is given more than once') }
         $clips = $clipsProps[0].Value
         if ($clips.ValueKind -eq [System.Text.Json.JsonValueKind]::Null) { return (& $result 'fallback-no-row' $null $fallback) }
         if ($clips.ValueKind -ne [System.Text.Json.JsonValueKind]::Object) { return (& $bad 'clips is not a JSON object') }
-        $rowProps = @(if (-not [string]::IsNullOrWhiteSpace($ClipId)) { $clips.EnumerateObject() | Where-Object { $_.Name -ceq $ClipId } })
+        $repeated = Get-DvJsonRepeatedKey $clips
+        if ($null -ne $repeated) { return (& $bad "clips repeats the clip id '$repeated'") }
+        $rowProps = @(if (-not [string]::IsNullOrWhiteSpace($ClipId)) { $clips.EnumerateObject() | Where-Object { Test-DvOrdinalEqual $_.Name $ClipId } })
         if ($rowProps.Count -eq 0) { return (& $result 'fallback-no-row' $null $fallback) }
         $badRow = { param($why) (& $result 'fallback-malformed' "the exposure band row for clip '$ClipId' is malformed ($why): the absolute fallback band judges" $fallback) }
-        if ($rowProps.Count -gt 1) { return (& $badRow 'the clip has more than one row') }
         $row = $rowProps[0].Value
         if ($row.ValueKind -ne [System.Text.Json.JsonValueKind]::Object) { return (& $badRow 'not an object') }
+        $repeated = Get-DvJsonRepeatedKey $row
+        if ($null -ne $repeated) { return (& $badRow "the row repeats the field '$repeated'") }
         $limits = [ordered]@{ minMedianLuma = @(0.0, 255.0); maxMedianLuma = @(0.0, 255.0); maxNearBlackFraction = @(0.0, 1.0); maxClippedFraction = @(0.0, 1.0) }
         $band = [ordered]@{}; $named = 0
         foreach ($name in $limits.Keys) {
-            $fields = @($row.EnumerateObject() | Where-Object { $_.Name -ceq $name })
+            $fields = @($row.EnumerateObject() | Where-Object { Test-DvOrdinalEqual $_.Name $name })
             if ($fields.Count -eq 0) { $band[$name] = $fallback.$name; continue }
-            if ($fields.Count -gt 1) { return (& $badRow "$name is given more than once") }
             $value = ConvertTo-DvExposureLimit $fields[0].Value $limits[$name][0] $limits[$name][1]
             if ($null -eq $value) { return (& $badRow "$name must be a number in $($limits[$name][0])..$($limits[$name][1])") }
             $band[$name] = [double]$value; $named++

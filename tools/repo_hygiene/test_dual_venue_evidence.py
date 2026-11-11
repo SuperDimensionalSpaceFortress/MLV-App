@@ -9399,6 +9399,16 @@ class VisualExposureFloorTests(unittest.TestCase):
             ('{"clips": {"c": {"minMedianLuma": 4}},}', "c", "fallback-malformed", 16),
             ('{"clips": {"c": {"minMedianLuma": 4}}} trailing', "c", "fallback-malformed", 16),
             ('﻿{"clips": {"c": {"minMedianLuma": 4}}}', "c", "clip", 4),
+            # adversary a32b95c6 A1: -ceq is a culture comparison that ignores an embedded NUL, so "c<NUL>" was the row of "c"; names compare ordinally
+            ('{"clips": {"c\\u0000": {"minMedianLuma": 4}}}', "c", "fallback-no-row", 16),
+            ('{"clips\\u0000": {"c": {"minMedianLuma": 4}}}', "c", "fallback-no-row", 16),
+            ('{"clips": {"c": {"minMedianLuma\\u0000": 4, "maxClippedFraction": 0.5}}}', "c", "clip", 16),
+            ('{"clips": {"c\\u200b": {"minMedianLuma": 4}, "c": {"minMedianLuma": 6}}}', "c", "clip", 6),
+            # adversary a32b95c6 A2: a repeated key is ambiguous whoever it belongs to (another clip's row, an unknown field, an unrelated root key)
+            ('{"clips": {"c": {"minMedianLuma": 4}, "other": {"minMedianLuma": 4}, "other": {"minMedianLuma": 5}}}', "c", "fallback-malformed", 16),
+            ('{"clips": {"c": {"minMedianLuma": 4, "zzz": 1, "zzz": 2}}}', "c", "fallback-malformed", 16),
+            ('{"schema": "a", "schema": "b", "clips": {"c": {"minMedianLuma": 4}}}', "c", "fallback-malformed", 16),
+            ('{"clips": {"c": {"minMedianLuma": 4}, "c\\u0000": {"minMedianLuma": 5}}}', "c", "clip", 4),
         ]
         with tempfile.TemporaryDirectory(prefix="vis-exp-band-") as d:
             for n, (text, clip, source, minimum) in enumerate(rows):
