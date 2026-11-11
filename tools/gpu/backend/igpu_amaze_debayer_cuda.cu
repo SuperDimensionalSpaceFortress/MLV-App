@@ -1022,13 +1022,15 @@ cudaError_t drain_present_stream(cudaStream_t stream, const char * stage)
 
 /* r3: after a live run that failed or threw, whatever it queued on the present stream (the H-Nyquist filter, the
  * pack, a copy) completes before the live buffers are left to the next frame. The drain's own code is noted at
- * `site`. No call while the switch is off. */
+ * `site`. No call while the switch is off.
+ * r5 (adversary A1 on bed868b9): this runs only after the run already failed, so its code is a SECONDARY note: it
+ * never evicts (a full ring counts it as dropped), and cannot push the run's first failure out of the ring. */
 void drain_present_stream_after_failure(cudaStream_t stream, const char * site)
 {
     const cudaError_t rc = drain_present_stream(stream, site);
     if (rc != cudaSuccess)
     {
-        IGPU_CUDA_ERROR_NOTE(rc, site);
+        IGPU_CUDA_ERROR_NOTE_IF_ROOM(rc, site);
     }
 }
 

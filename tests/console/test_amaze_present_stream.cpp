@@ -379,6 +379,32 @@ TEST(AmazePresentStream, SlotKeepsTheFirstDrainFailureWhenLaterOnesOverflowTheRi
     ASSERT_EQ(0, drainSlot(out, dropped));
 }
 
+TEST(AmazePresentStream, TheFailurePathPresentDrainIsANonEvictingSecondaryNote)
+{
+    // r5 (adversary A1 on bed868b9, its input: the ordering record fails with 700, all nine final tile syncs fail with
+    // 700, and the enclosing catch's present-stream drain fails with 700). The catch's drain note runs only after the
+    // run failed, so it must not evict the run's first note (tiles:present_order).
+    const QString cu = amazeSource();
+    const QString after = functionBody(cu, QStringLiteral("void drain_present_stream_after_failure(cudaStream_t stream, const char * site)"));
+    ASSERT_TRUE(after.contains(QStringLiteral("    if (rc != cudaSuccess)\n    {\n        IGPU_CUDA_ERROR_NOTE_IF_ROOM(rc, site);\n    }")));
+    ASSERT_FALSE(after.contains(QStringLiteral("IGPU_CUDA_ERROR_NOTE(")));
+
+    // The same sequence on the real slot: ordering note, nine drain failures (the .cu's callback), the catch drain.
+    std::vector<igpu_cuda_error_t> out;
+    unsigned long long dropped = 0;
+    drainSlot(out, dropped); // start empty
+    const int n = IGPU_CUDA_ERROR_PENDING_MAX + 1;
+    const std::vector<int> streams = tileStreams(n);
+    igpu_cuda_error_slot::note(700, "stub", "tiles:present_order");
+    const int rc = igpu_amaze_present::drain_every_stream(
+        streams, streams.size(), 700, 0, [&](int) { return 700; }, slotNote);
+    ASSERT_EQ(700, rc);
+    igpu_cuda_error_slot::note_if_room(700, "stub", "live_device:present_drain"); // drain_present_stream_after_failure
+    ASSERT_EQ(IGPU_CUDA_ERROR_PENDING_MAX, drainSlot(out, dropped));
+    ASSERT_EQ(std::string("tiles:present_order"), std::string(out[0].site)); // still the primary
+    ASSERT_EQ(3ULL, dropped); // 1 + 9 + 1 notes for 8 places
+}
+
 TEST(AmazePresentStream, SlotNoteIfRoomNeverEvictsButNoteStillDoes)
 {
     // note() keeps its pre-r4 behaviour (a full ring drops its oldest); note_if_room() never evicts.

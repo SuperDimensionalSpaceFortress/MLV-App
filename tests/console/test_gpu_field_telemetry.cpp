@@ -291,7 +291,8 @@ int noteSites(const QString & source)
 // r4 fix 2 (adversary A1 on f0058f46): AMaZE 55 = 20 macro notes (+2: the batched tile drain's tiles:present_order and
 // tiles:drain_sync, so every evaluated failure of the best-effort drain is noted once) + the same 35 evaluated entries.
 // r4 fix 3 (adversary A1 on fa4699ca): AMaZE 56 = 20 macro notes + 1 non-evicting secondary (tiles:drain_sync, the
-// later drain failures) + 35 evaluated entries.
+// later drain failures) + 35 evaluated entries. r5 (adversary A1 on bed868b9): 56 = 19 + 2 (the failure-path present
+// drain is a non-evicting secondary too) + 35.
 constexpr int kReconNotes = 27;
 constexpr int kAmazeNotes = 56;
 
@@ -968,7 +969,8 @@ TEST(GpuFieldTelemetry, FailureCensusIsExactAndBraceScoped)
     ASSERT_EQ(kReconNotes, noteSites(recon));
     ASSERT_EQ(kAmazeNotes, noteSites(amaze));
     ASSERT_EQ(24, (int)recon.count(QStringLiteral("IGPU_CUDA_ERROR_NOTE(")));  // r8: + 3 evaluated entries
-    ASSERT_EQ(20, (int)amaze.count(QStringLiteral("IGPU_CUDA_ERROR_NOTE(")));  // + 35 evaluated entries (r8 6; FIRST-AMAZE-AT-PLAY-1 +11; r3 present stream +1; r4 tile drain +2)
+    ASSERT_EQ(19, (int)amaze.count(QStringLiteral("IGPU_CUDA_ERROR_NOTE(")));  // + 35 evaluated entries (r8 6; FIRST-AMAZE-AT-PLAY-1 +11; r3 present stream +1; r4 tile drain +2; r5 failure-path drain -> IF_ROOM -1)
+    ASSERT_EQ(2, (int)amaze.count(QStringLiteral("IGPU_CUDA_ERROR_NOTE_IF_ROOM(")));  // r4 later drain failures; r5 the failure-path present drain
     ASSERT_EQ(std::string(), failureCensus(recon, amaze).join(QStringLiteral("; ")).toStdString());
 
     // Mutation 1 (sol's replay): drop the preupload:submit note -> recon count 26.
