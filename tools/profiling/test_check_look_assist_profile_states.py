@@ -813,6 +813,32 @@ class PictureDumpBindingAdversaryR3(unittest.TestCase):
                 code, text = run_checker([self.bound(trace_for), "--tag", "t"])
                 self.assertEqual(0, code, text)
 
+    # ---- adversary pass on 5cb9b1a9 (A1): each input below passed the fourth cut ----
+    def test_p7_a1_every_field_the_apps_dispatch_and_applied_lines_always_carry_is_validated(self):
+        cases = {}
+        for bad in ("1.5", "", "true", "{}", "1234567890", "x"):
+            cases["applied valid=%r" % bad] = lambda sha, bad=bad: DISPATCH_LINE + dump_line(sha) + ASYNC_APPLIED_LINE.replace("valid=1", "valid=" + bad)
+        cases["applied valid absent"] = lambda sha: DISPATCH_LINE + dump_line(sha) + ASYNC_APPLIED_LINE.replace("valid=1 ", "")
+        for bad in ("0.5", "bad", "", "1234567890"):
+            cases["dispatch frame=%r" % bad] = lambda sha, bad=bad: DISPATCH_LINE.replace("frame=0", "frame=" + bad) + dump_line(sha) + ASYNC_APPLIED_LINE
+        cases["dispatch frame absent"] = lambda sha: DISPATCH_LINE.replace(" frame=0", "") + dump_line(sha) + ASYNC_APPLIED_LINE
+        for bad in ("awb_temp=x", "awb_tint=1.5", "awb_temp="):
+            key = bad.split("=")[0]
+            cases["applied " + bad] = lambda sha, key=key, bad=bad: (DISPATCH_LINE + dump_line(sha) + ASYNC_APPLIED_LINE.replace(
+                {"awb_temp": "awb_temp=9990", "awb_tint": "awb_tint=-35"}[key], bad))
+        for label, trace_for in cases.items():
+            root = self.bound(trace_for)
+            for argv in ([], ["--decisions-only"]):
+                with self.subTest("%s %s" % (label, argv)):
+                    code, text = run_checker([root, "--tag", "t"] + argv)
+                    self.assertEqual(1, code, text)
+                    self.assertNotIn("picture_dump-bound", text)
+        # control: valid=0 is a well-formed flag, and a clean pair still binds
+        for flag in ("0", "1"):
+            with self.subTest("control valid=" + flag):
+                trace_for = lambda sha, flag=flag: DISPATCH_LINE + dump_line(sha) + ASYNC_APPLIED_LINE.replace("valid=1", "valid=" + flag)
+                self.assertEqual(0, run_checker([self.bound(trace_for), "--tag", "t"])[0])
+
     def test_a5_a_corrupt_png_is_exit_2_not_a_crash(self):
         import struct
         import zlib

@@ -163,8 +163,9 @@ def parse_log_text(text):
         if is_event(ASYNC_DISPATCH_EVENT):
             scene, generation = once("scene"), once("generation")
             # a new application: nothing of the previous one survives. Its generation (None when it logs none) is what its
-            # applied event must repeat: another generation's application is not this dispatch's (adversary r3 A2).
-            if scene and (generation is None or INT_FIELD.fullmatch(generation)):
+            # applied event must repeat: another generation's application is not this dispatch's (adversary r3 A2). The
+            # app always logs the analysed frame as an integer (adversary r3 A1, pass on 5cb9b1a9).
+            if scene and int_once("frame") is not None and (generation is None or INT_FIELD.fullmatch(generation)):
                 receipt = {"scene": scene, "generation": generation}
             else:
                 receipt = {"malformed_event": ASYNC_DISPATCH_EVENT}
@@ -201,7 +202,9 @@ def parse_log_text(text):
             source, decision = once("source"), once("decision")
             temperature, tint, exposure = int_once("final_temp"), int_once("final_tint"), int_once("preset_exp")
             base = open_base(receipt)
+            valid = once("valid")      # the 0/1 flag, as auto_wb's; and the awb_* pair the app always logs, as integers
             if (not source or not decision or None in (temperature, tint, exposure)
+                    or valid is None or not re.fullmatch(r"[0-9]", valid) or None in (int_once("awb_temp"), int_once("awb_tint"))
                     or base.get("generation") != once("generation")):      # the generation of ITS OWN dispatch, each given once
                 receipt = {"malformed_event": ASYNC_APPLIED_EVENT}
                 pending_dump = None
