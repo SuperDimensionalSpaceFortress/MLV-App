@@ -839,6 +839,42 @@ class PictureDumpBindingAdversaryR3(unittest.TestCase):
                 trace_for = lambda sha, flag=flag: DISPATCH_LINE + dump_line(sha) + ASYNC_APPLIED_LINE.replace("valid=1", "valid=" + flag)
                 self.assertEqual(0, run_checker([self.bound(trace_for), "--tag", "t"])[0])
 
+    # ---- adversary pass on 7e0cb505 (A1, A2): each input below passed the fifth cut ----
+    def test_p8_a1_the_applied_event_repeats_the_frame_its_dispatch_analysed(self):
+        cases = {
+            "dispatch frame=1, applied and dump frame=0": lambda sha: DISPATCH_LINE.replace("frame=0", "frame=1") + dump_line(sha) + ASYNC_APPLIED_LINE,
+            "dispatch frame=0, applied frame=1": lambda sha: DISPATCH_LINE + dump_line(sha) + ASYNC_APPLIED_LINE.replace("frame=0", "frame=1"),
+            "dispatch frame=00": lambda sha: DISPATCH_LINE.replace("frame=0", "frame=00") + dump_line(sha) + ASYNC_APPLIED_LINE,
+        }
+        for label, trace_for in cases.items():
+            root = self.bound(trace_for)
+            for argv in ([], ["--decisions-only"]):
+                with self.subTest("%s %s" % (label, argv)):
+                    code, text = run_checker([root, "--tag", "t"] + argv)
+                    self.assertEqual(1, code, text)
+                    self.assertNotIn("picture_dump-bound", text)
+        # controls: the same frame binds (frame 0), and decisions-only accepts another frame when both lines agree
+        self.assertEqual(0, run_checker([self.bound(lambda sha: DISPATCH_LINE + dump_line(sha) + ASYNC_APPLIED_LINE), "--tag", "t"])[0])
+        agree = lambda sha: DISPATCH_LINE.replace("frame=0", "frame=1") + ASYNC_APPLIED_LINE.replace("frame=0", "frame=1")
+        self.assertEqual(0, run_checker([self.bound(agree), "--tag", "t", "--decisions-only"])[0])
+
+    def test_p8_a2_the_valid_flag_is_zero_or_one_as_the_app_logs_it(self):
+        cases = {}
+        for bad in ("9", "2", "10", "-1"):
+            cases["applied valid=" + bad] = lambda sha, bad=bad: DISPATCH_LINE + dump_line(sha) + ASYNC_APPLIED_LINE.replace("valid=1", "valid=" + bad)
+            cases["auto_wb valid=" + bad] = lambda sha, bad=bad: AUTO_WB_LINE.replace("valid=1", "valid=" + bad) + dump_line(sha) + result_line()
+        for label, trace_for in cases.items():
+            root = self.bound(trace_for)
+            for argv in ([], ["--decisions-only"]):
+                with self.subTest("%s %s" % (label, argv)):
+                    code, text = run_checker([root, "--tag", "t"] + argv)
+                    self.assertEqual(1, code, text)
+                    self.assertNotIn("picture_dump-bound", text)
+        for flag in ("0", "1"):         # controls
+            with self.subTest("control auto_wb valid=" + flag):
+                trace_for = lambda sha, flag=flag: AUTO_WB_LINE.replace("valid=1", "valid=" + flag) + dump_line(sha) + result_line()
+                self.assertEqual(0, run_checker([self.bound(trace_for), "--tag", "t"])[0])
+
     def test_a5_a_corrupt_png_is_exit_2_not_a_crash(self):
         import struct
         import zlib

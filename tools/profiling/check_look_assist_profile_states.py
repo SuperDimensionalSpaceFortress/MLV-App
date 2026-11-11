@@ -77,7 +77,7 @@ INT_FIELD = re.compile(r"-?[0-9]{1,9}")
 # What one application's result sets, plus the two markers of its identity: "closed" (a result / applied line completed it, so
 # the next one must bring its own evidence, never borrow this one's) and "generation" (the dispatch's, which the applied event
 # of the same application must repeat). A new application (auto_wb, dispatch) starts without any of them.
-RESULT_KEYS = ("scene", "exposure", "temperature", "tint", "frame", "picture_dump", "source", "decision", "closed", "generation")
+RESULT_KEYS = ("scene", "exposure", "temperature", "tint", "frame", "picture_dump", "source", "decision", "closed", "generation", "dispatch_frame")
 BUILD_SHA = re.compile(r'"build_sha"\s*:\s*"([^"]*)"')
 # The app's own binding of the final PNG (PR #793 head cc3205de, src/batch/LookAssistAnalysis.cpp lookAssistPictureDumpFields):
 #   look_assist.apply.picture_dump pre_safety=<name|none> pre_safety_sha256=<hex|none> pre_safety_exposure=<n>
@@ -165,15 +165,16 @@ def parse_log_text(text):
             # a new application: nothing of the previous one survives. Its generation (None when it logs none) is what its
             # applied event must repeat: another generation's application is not this dispatch's (adversary r3 A2). The
             # app always logs the analysed frame as an integer (adversary r3 A1, pass on 5cb9b1a9).
-            if scene and int_once("frame") is not None and (generation is None or INT_FIELD.fullmatch(generation)):
-                receipt = {"scene": scene, "generation": generation}
+            frame = once("frame")
+            if scene and frame is not None and INT_FIELD.fullmatch(frame) and (generation is None or INT_FIELD.fullmatch(generation)):
+                receipt = {"scene": scene, "generation": generation, "dispatch_frame": frame}      # the applied event repeats both
             else:
                 receipt = {"malformed_event": ASYNC_DISPATCH_EVENT}
             pending_dump = None
             continue
         if is_event(AUTO_WB_EVENT):
             valid, source, decision = once("valid"), once("source"), once("decision")
-            if valid is None or not re.fullmatch(r"[0-9]", valid) or not source or not decision:
+            if valid not in ("0", "1") or not source or not decision:      # bool01: the app logs 0 or 1, nothing else
                 receipt = {"malformed_event": AUTO_WB_EVENT}
             else:
                 base = receipt or {}
@@ -202,9 +203,10 @@ def parse_log_text(text):
             source, decision = once("source"), once("decision")
             temperature, tint, exposure = int_once("final_temp"), int_once("final_tint"), int_once("preset_exp")
             base = open_base(receipt)
-            valid = once("valid")      # the 0/1 flag, as auto_wb's; and the awb_* pair the app always logs, as integers
+            valid = once("valid")      # the 0/1 flag the app logs (bool01), as auto_wb's; and the awb_* pair, as integers
             if (not source or not decision or None in (temperature, tint, exposure)
-                    or valid is None or not re.fullmatch(r"[0-9]", valid) or None in (int_once("awb_temp"), int_once("awb_tint"))
+                    or valid not in ("0", "1") or None in (int_once("awb_temp"), int_once("awb_tint"))
+                    or base.get("dispatch_frame") != once("frame")      # the frame its own dispatch analysed, each given once
                     or base.get("generation") != once("generation")):      # the generation of ITS OWN dispatch, each given once
                 receipt = {"malformed_event": ASYNC_APPLIED_EVENT}
                 pending_dump = None
