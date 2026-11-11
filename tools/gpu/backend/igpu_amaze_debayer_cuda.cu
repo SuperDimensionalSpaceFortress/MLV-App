@@ -1667,9 +1667,12 @@ void run_frame_to_device_rgb16_bayer16_post_wb_batched(
      * what these tiles wrote. The tile launch stays on its own non-blocking streams (it never used stream 0) and is
      * ORDERED BY AN EVENT: one record per tile stream this frame used, each waited on by the present stream, on the
      * device. Only while the present stream is on (both null otherwise: no call).
-     * The record / wait only CAPTURE their code (CK throws): every tile stream is drained first, and an ordering
-     * failure is raised after the drain loop, so no exit returns with tiles still writing the live buffers
-     * (adversary A1 on fe115de4). The first failure stops further records. */
+     * The record / wait only CAPTURE their code (CK throws), and the first failure stops further records
+     * (adversary A1 on fe115de4).
+     * r4 (795-R3-I1): the drain is best effort. igpu_amaze_present::drain_every_stream synchronizes EVERY active
+     * tile stream even after one of those syncs failed, and keeps the first failing code (the ordering code
+     * first). CK raises it once, after the loop. So an ordering or drain failure never skips the drain of a later
+     * tile stream; a stream whose own sync failed is reported, not waited on again. */
     cudaError_t presentOrderRc = cudaSuccess;
     if (presentStream && presentProducerDone)
     {
@@ -1679,11 +1682,11 @@ void run_frame_to_device_rgb16_bayer16_post_wb_batched(
             if (presentOrderRc == cudaSuccess) presentOrderRc = cudaStreamWaitEvent(presentStream, presentProducerDone, 0);
         }
     }
-    for (std::size_t slot = 0; slot < active; ++slot)
-    {
-        CK(IGPU_LT_SYNC_CALL("tiles:drain_sync", cudaStreamSynchronize(streams[slot])));
-    }
-    CK(presentOrderRc);
+    const cudaError_t tileDrainRc = igpu_amaze_present::drain_every_stream(
+        streams, active, presentOrderRc, cudaSuccess, [&](cudaStream_t tile) -> cudaError_t {
+            return IGPU_LT_SYNC_CALL("tiles:drain_sync", cudaStreamSynchronize(tile));
+        });
+    CK(tileDrainRc);
 }
 
 void run_frame_to_device_rgb16_batched(const float * dRaw,

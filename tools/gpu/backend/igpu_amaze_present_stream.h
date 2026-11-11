@@ -18,8 +18,27 @@
 
 #define IGPU_AMAZE_PRESENT_STREAM_ENV "MLVAPP_CUDA_AMAZE_PRESENT_STREAM"
 
+#include <cstddef>
+
 namespace igpu_amaze_present
 {
+
+/* r4 (795-R3-I1): the best-effort tile drain at the end of run_frame_to_device_rgb16_bayer16_post_wb_batched.
+ * Calls sync(streams[slot]) for EVERY slot in [0, active), whatever an earlier call returned, and returns the
+ * first code that is not `success`: `firstRc` itself when it already failed (the present-ordering code), else
+ * the first failing sync. Nothing here throws, so one failed drain cannot skip the later ones; the caller
+ * raises the returned code once, after the loop. A template over the error and stream types (no CUDA types),
+ * so tests/console drives it with a host-side stub sync that fails on a chosen stream. */
+template <typename Rc, typename Streams, typename Sync>
+Rc drain_every_stream(const Streams & streams, std::size_t active, Rc firstRc, Rc success, Sync && sync)
+{
+    for (std::size_t slot = 0; slot < active; ++slot)
+    {
+        const Rc rc = sync(streams[slot]);
+        if (firstRc == success && rc != success) firstRc = rc;
+    }
+    return firstRc;
+}
 
 /* true = the GUI present path uses its own non-blocking stream; false = legacy stream 0. */
 inline bool present_stream_enabled(const char * value)

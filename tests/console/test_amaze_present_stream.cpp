@@ -1,7 +1,8 @@
 // HFR-NATIVE-M16-1457-GUI-TEXTURE-PRESENT-OFFLOAD-1 r3 (the stream-0 clause): the GUI present path of the CUDA AMaZE
 // backend runs its GL handoff on its own cudaStreamNonBlocking stream, ordered after the frame's AMaZE tile streams by
-// an event, behind the kill switch MLVAPP_CUDA_AMAZE_PRESENT_STREAM (default ON). No GPU: the switch's parse, and
-// source pins on the stream / event ownership seam in tools/gpu/backend/igpu_amaze_debayer_cuda.cu.
+// an event, behind the kill switch MLVAPP_CUDA_AMAZE_PRESENT_STREAM (default ON). No GPU: the switch's parse, source
+// pins on the stream / event ownership seam in tools/gpu/backend/igpu_amaze_debayer_cuda.cu, and (r4, 795-R3-I1) a
+// host-side stub that injects a failed sync into the best-effort tile drain helper the .cu calls.
 #include "../common/minitest.h"
 #include "../common/repo_paths.h"
 #include "../../tools/gpu/backend/igpu_amaze_present_stream.h"
@@ -11,6 +12,8 @@
 #include <QString>
 #include <QStringList>
 #include <QTextStream>
+
+#include <vector>
 
 namespace
 {
@@ -121,7 +124,7 @@ TEST(AmazePresentStream, TheTileLaunchIsOrderedByAnEventIntoThePresentStream)
     const int wait = batch.indexOf(QStringLiteral(
         "if (presentOrderRc == cudaSuccess) presentOrderRc = cudaStreamWaitEvent(presentStream, presentProducerDone, 0);"));
     const int gate = batch.indexOf(QStringLiteral("if (presentStream && presentProducerDone)"));
-    const int drain = batch.indexOf(QStringLiteral("CK(IGPU_LT_SYNC_CALL(\"tiles:drain_sync\", cudaStreamSynchronize(streams[slot])));"));
+    const int drain = batch.indexOf(QStringLiteral("igpu_amaze_present::drain_every_stream("));
     ASSERT_TRUE(gate >= 0);
     ASSERT_TRUE(record > gate);
     ASSERT_TRUE(wait > record);
@@ -142,15 +145,107 @@ TEST(AmazePresentStream, AnOrderingFailureStillDrainsEveryTileStreamBeforeItThro
     ASSERT_FALSE(batch.contains(QStringLiteral("CK(cudaStreamWaitEvent(presentStream")));
     const int declared = batch.indexOf(QStringLiteral("cudaError_t presentOrderRc = cudaSuccess;"));
     const int loop = batch.indexOf(QStringLiteral("for (std::size_t slot = 0; slot < active && presentOrderRc == cudaSuccess; ++slot)"));
-    const int drain = batch.indexOf(QStringLiteral("CK(IGPU_LT_SYNC_CALL(\"tiles:drain_sync\", cudaStreamSynchronize(streams[slot])));"));
-    const int raised = batch.indexOf(QStringLiteral("CK(presentOrderRc);"));
+    const int drain = batch.indexOf(QStringLiteral("igpu_amaze_present::drain_every_stream("));
+    const int raised = batch.indexOf(QStringLiteral("CK(tileDrainRc);"));
     ASSERT_TRUE(declared >= 0);
     ASSERT_TRUE(loop > declared);
     ASSERT_TRUE(drain > loop);
     ASSERT_TRUE(raised > drain);
-    ASSERT_EQ(1, (int)batch.count(QStringLiteral("CK(presentOrderRc);")));
-    // Between the ordering block and the drain loop nothing can throw: no CK at all.
-    ASSERT_FALSE(batch.mid(loop, drain - loop).contains(QStringLiteral("CK(")));
+    ASSERT_EQ(1, (int)batch.count(QStringLiteral("CK(tileDrainRc);")));
+    // Between the ordering block and the raise nothing can throw: no CK at all.
+    ASSERT_FALSE(batch.mid(loop, raised - loop).contains(QStringLiteral("CK(")));
+}
+
+TEST(AmazePresentStream, TheTileDrainIsBestEffortAndTheOrderingCodeIsRaisedFirst)
+{
+    // 795-R3-I1 (r4): the drain hands EVERY active tile stream to the shared best-effort helper, seeded with the
+    // ordering code, through the timed sync wrapper; CK raises the one result after the call. No throwing CK is
+    // left on any tile-stream sync after the launch loop (the slot-reuse sync inside the launch loop is pre-r3).
+    const QString cu = amazeSource();
+    const QString batch = functionBody(cu, QStringLiteral("void run_frame_to_device_rgb16_bayer16_post_wb_batched("));
+    ASSERT_TRUE(batch.contains(QStringLiteral(
+        "    const cudaError_t tileDrainRc = igpu_amaze_present::drain_every_stream(\n"
+        "        streams, active, presentOrderRc, cudaSuccess, [&](cudaStream_t tile) -> cudaError_t {\n"
+        "            return IGPU_LT_SYNC_CALL(\"tiles:drain_sync\", cudaStreamSynchronize(tile));\n"
+        "        });\n"
+        "    CK(tileDrainRc);")));
+    const int afterLaunch = batch.indexOf(QStringLiteral("const std::size_t active = std::min(inFlight, batchSize);"));
+    ASSERT_TRUE(afterLaunch >= 0);
+    ASSERT_FALSE(batch.mid(afterLaunch).contains(QStringLiteral("CK(IGPU_LT_SYNC_CALL(")));
+    ASSERT_FALSE(batch.contains(QStringLiteral("CK(presentOrderRc)")));
+    // The batch body has no device-wide sync either.
+    ASSERT_FALSE(batch.contains(QStringLiteral("cudaDeviceSynchronize")));
+    ASSERT_FALSE(batch.contains(QStringLiteral("cudaStreamSynchronize(0)")));
+}
+
+namespace
+{
+
+// Host-side stub for the drain helper: a fake stream is its slot index, a fake error code is an int (0 = success).
+// failAt maps a slot to the code its sync returns; every call is recorded in order.
+struct StubSync
+{
+    std::vector<int> failAt;     // per slot: 0 = the sync succeeds, otherwise the code it returns
+    std::vector<int> synced;     // the slots synchronized, in call order
+    int operator()(int stream)
+    {
+        synced.push_back(stream);
+        return failAt[static_cast<std::size_t>(stream)];
+    }
+};
+
+std::vector<int> tileStreams(int n)
+{
+    std::vector<int> out;
+    for (int i = 0; i < n; ++i) out.push_back(i);
+    return out;
+}
+
+} // namespace
+
+TEST(AmazePresentStream, StubDrainSyncsEveryStreamAfterAFailedSyncAndReturnsTheFirstError)
+{
+    using igpu_amaze_present::drain_every_stream;
+    const std::vector<int> streams = tileStreams(6);
+    // Stream k fails (for each k), with a second, later failure where there is room: every stream is still
+    // synchronized exactly once, in order, and the FIRST failure is the code returned.
+    for (int k = 0; k < 6; ++k)
+    {
+        StubSync stub{std::vector<int>(6, 0), {}};
+        stub.failAt[static_cast<std::size_t>(k)] = 700 + k;
+        if (k + 2 < 6) stub.failAt[static_cast<std::size_t>(k + 2)] = 900;
+        const int rc = drain_every_stream(streams, streams.size(), 0, 0, [&](int s) { return stub(s); });
+        ASSERT_EQ(700 + k, rc);
+        ASSERT_TRUE(stub.synced == streams);
+    }
+    // Every stream fails: still six syncs, the first code wins.
+    {
+        StubSync stub{{11, 12, 13, 14, 15, 16}, {}};
+        ASSERT_EQ(11, drain_every_stream(streams, streams.size(), 0, 0, [&](int s) { return stub(s); }));
+        ASSERT_TRUE(stub.synced == streams);
+    }
+}
+
+TEST(AmazePresentStream, StubDrainKeepsAnEarlierOrderingErrorAndStillDrainsEveryStream)
+{
+    using igpu_amaze_present::drain_every_stream;
+    const std::vector<int> streams = tileStreams(4);
+    // The ordering code is already set: it is the one returned, even when a drain fails too, and no stream is
+    // skipped.
+    StubSync stub{{0, 55, 0, 66}, {}};
+    ASSERT_EQ(400, drain_every_stream(streams, streams.size(), 400, 0, [&](int s) { return stub(s); }));
+    ASSERT_TRUE(stub.synced == streams);
+    // All clean: success, every stream synchronized once.
+    StubSync clean{{0, 0, 0, 0}, {}};
+    ASSERT_EQ(0, drain_every_stream(streams, streams.size(), 0, 0, [&](int s) { return clean(s); }));
+    ASSERT_TRUE(clean.synced == streams);
+    // Only the active prefix is drained (fewer tiles than streams this frame), and zero active syncs nothing.
+    StubSync prefix{{0, 0, 9, 0}, {}};
+    ASSERT_EQ(0, drain_every_stream(streams, 2, 0, 0, [&](int s) { return prefix(s); }));
+    ASSERT_TRUE(prefix.synced == tileStreams(2));
+    StubSync none{{5, 5, 5, 5}, {}};
+    ASSERT_EQ(0, drain_every_stream(streams, 0, 0, 0, [&](int s) { return none(s); }));
+    ASSERT_TRUE(none.synced.empty());
 }
 
 TEST(AmazePresentStream, BothLiveEntriesRunTheHandoffOnThePresentStream)
