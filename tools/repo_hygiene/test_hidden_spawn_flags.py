@@ -230,7 +230,7 @@ def _label(expr: ast.AST) -> str:
 
 
 _FORMAT_BODY_RE = re.compile(r"([^!:]*)(?:!([rsa]))?(?::(.*))?", re.DOTALL)
-_PERCENT_SPEC_RE = re.compile(r"([#0\- +]*)([0-9]+|\*)?(?:\.([0-9]*|\*))?[hlL]?([sraidiouxXeEfFgGc%])")  # ASCII digits only: int() meets nothing else; `%.s` is precision 0 (pass-22 A1)
+_PERCENT_SPEC_RE = re.compile(r"([#0\- +]*)([0-9]+|\*)?(?:\.([0-9]*|\*))?[hlL]?([sraidiouxXeEfFgGcb%])")  # ASCII digits only: int() meets nothing else; `%.s` is precision 0 (pass-22 A1)
 _PERCENT_TAIL_RE = re.compile(r"(?:[^)]*\))?[#0\- +0-9.*hlL]*[A-Za-z%]?")  # what a field opened before a wildcard may still take: key, flags, width, conversion
 _PERCENT_UNPARSED_RE = re.compile(r"[#0\- +0-9.*hlL]*")  # the flags, width and precision of a `%` field the fold could not parse; the letter after them stays literal, so no name is cut
 _SPEC_NUMBER_LIMIT = 256  # a width or precision above this is never handed to Python's formatter (no huge allocation)
@@ -351,6 +351,14 @@ def _padded(text: str) -> str:
     """The text an unknown text may print as through a conversion (``!r``, ``%a``) or a spec: its literal characters with anything around them."""
     core = text.strip(_WILD)
     return _WILD + core + _WILD if core.replace(_WILD, "") else _WILD
+
+
+def _padded_by(text: str, spec: str | None) -> str:
+    """``_padded`` for a value printed through a format spec: a PRECISION (``.0``, ``.3``, ``%.s``) keeps only a prefix of the value, so the text is not there to
+    be relied on; a spec with a wildcard or a nested field (``{:{}}``) may hold one. Either reads as any text (pass-33 A2)."""
+    if spec is not None and ("." in spec or "{" in spec or _WILD in spec):
+        return _WILD
+    return _padded(text)
 
 
 def _formatted(node: ast.AST, consts: dict[str, str], depth: int) -> tuple[str, bool]:
@@ -720,7 +728,7 @@ def _flatten_node(node: ast.AST, consts: dict[str, str], depth: int = 0) -> tupl
                 spec, spec_known = _flatten(v.format_spec, consts, depth + 1) if v.format_spec is not None else (None, True)
                 shown = _apply_spec(text, {115: "s", 114: "r", 97: "a"}.get(v.conversion), spec) if known and spec_known else None
                 if shown is None:  # `!r`, `!a` or a spec of a text with an unknown part: that text, with anything around it (pass-26 A1)
-                    parts.append((_padded(text), False))
+                    parts.append((_padded_by(text, spec), False))
                 else:
                     parts.append((shown, True))
             else:
@@ -1003,7 +1011,7 @@ def _fill_format(template: str, positional: list[tuple[str, bool]], named: dict[
                 out.append(value[0])  # an unknown text printed as it is: its wildcard stays in place
                 ok = False
             else:
-                out.append(_padded(value[0]))  # printed through a conversion or a spec: its text, with anything around it (pass-26 A1)
+                out.append(_padded_by(value[0], spec))  # printed through a conversion or a spec: its text, with anything around it (pass-26 A1), or any text under a precision (pass-33 A2)
                 ok = False
         else:
             out.append(ch)
@@ -1047,6 +1055,8 @@ def _fill_percent(template: str, positional: list[tuple[str, bool]], named: dict
         if conv == "%":
             out.append("%")
             continue
+        if conv == "b":  # a bytes template's `%b` writes the bytes of its argument, as `%s` of the text the fold reads them as (pass-33 A1)
+            conv = "s"
         if "*" in (width, precision):  # a width taken from the arguments: the positions after it are not tracked
             lost = True
             out.append(_WILD)
@@ -1071,11 +1081,12 @@ def _fill_percent(template: str, positional: list[tuple[str, bool]], named: dict
             except (ValueError, TypeError):
                 out.append(_WILD)
                 ok = False
-        elif conv == "s" and not flags and not width and not precision:
+        elif conv == "s" and not flags and not width and precision is None:  # `%.s` has an EMPTY precision, which is zero: it prints nothing (pass-33 A2)
             out.append(value[0])  # an unknown text printed as it is: its wildcard stays in place
             ok = False
         else:
-            out.append(_padded(value[0]) if value is not None and not value[1] else _WILD)  # `%r` of an unknown text: that text, with anything around it (pass-26 A1)
+            # `%r` of an unknown text: that text, with anything around it (pass-26 A1); under a precision (`%.0r`) only a prefix of it is written: any text (pass-33 A2)
+            out.append(_padded(value[0]) if value is not None and not value[1] and precision is None else _WILD)
             ok = False
     return "".join(out), ok
 
@@ -5160,6 +5171,35 @@ class AdversaryR9Tests(unittest.TestCase):
             subprocess.run(["git", "-C", str(repo), "add", "-A"], check=True, timeout=60, creationflags=flags)
             self.assertEqual(_tracked_py_files(repo), ["tools/launch_probe.pyw", "tools/plain.py"])
         self.assertEqual(len(_unflagged_spawns_in_source("import subprocess\nsubprocess.run(['cmd.exe', '/c', 'exit'])\n", "tools/launch_probe.pyw")), 1)
+
+    # ---- pass 33 (review-adversary-MLV-LANE-CONSOLE-HIDDEN-1-r13-5179ef24): A1 / A2 ----
+    _P33_HEAD = "import asyncio\nasync def launch(p):\n    loop = asyncio.get_running_loop()\n    return await getattr(loop, {name})(asyncio.SubprocessProtocol, 'cmd.exe', '/c', 'exit')\n"
+
+    @staticmethod
+    def _fold_text(expr: str) -> tuple[str, bool]:
+        return _flatten(ast.parse(expr, mode="eval").body, {})  # a name that is not bound is a run-time value of unknown text
+
+    def test_r13_pass33_a1_percent_b_of_a_bytes_template_is_a_field_not_literal_text(self):
+        # `b'%bexec' % b'subprocess_'` is b'subprocess_exec': `%b` is the bytes conversion for a text, so the `b` is not left in the name.
+        self.assertGreaterEqual(len(self._bad(self._P33_HEAD.format(name="(b'%bexec' % b'subprocess_').decode()"))), 1)
+        self.assertEqual(_start_process_violations("script = (b'%b-Process cmd.exe' % b'Start').decode()\n")[0], 1)
+        text, _ = self._fold_text("b'%bexec' % b'subprocess_'")
+        self.assertNotIn("bexec", text)  # the `b` was read as a conversion, not kept as the name's second letter
+
+    def test_r13_pass33_a2_a_precision_keeps_a_prefix_so_the_text_it_cuts_is_not_mandatory(self):
+        # `'subprocess_ex%.0s' % x + 'ec'` is subprocess_exec whatever x is: a precision drops the end of the value, so the value is any text, not a substring that must be there.
+        for name in ("('subprocess_ex%.0s' % b'junk') + 'ec'", "('subprocess_ex%.0s' % (p + 'junk')) + 'ec'", "('subprocess_ex%.0r' % (p + 'junk')) + 'ec'",
+                     "('subprocess_ex%.0a' % (p + 'junk')) + 'ec'", "('subprocess_ex%.s' % (p + 'junk')) + 'ec'", "f\"subprocess_ex{(p + 'junk'):.0}ec\"",
+                     "f\"subprocess_ex{(p + 'junk')!r:.0}ec\"", "'subprocess_ex{:.0}ec'.format(p + 'junk')", "'subprocess_ex{!r:.0}ec'.format(p + 'junk')",
+                     "'subprocess_ex{x:.0}ec'.format_map({'x': p + 'junk'})", "'subprocess_ex{:.{}}ec'.format(p + 'junk', 0)", "'subprocess_ex{:{}}ec'.format(p + 'junk', '.0')"):
+            self.assertGreaterEqual(len(self._bad(self._P33_HEAD.format(name=name))), 1, name)
+        for script in ("'sa%.0sps cmd.exe' % b'junk'", "'sa%.0sps cmd.exe' % (p + 'junk')", "f\"sa{(p + 'junk'):.0}ps cmd.exe\""):
+            self.assertEqual(_start_process_violations(f"script = {script}\n")[0], 1, script)
+
+    def test_r13_pass33_a2_a_value_through_a_conversion_without_a_precision_is_still_a_substring(self):
+        # The sibling that must NOT widen: with no precision the whole value is printed (padded), so its literal text is still mandatory and a clean source stays clean.
+        for expr in ("'x%rx' % (p + 'junk')", "f\"x{(p + 'junk')!r}x\"", "'x{!r:>9}x'.format(p + 'junk')"):
+            self.assertIn("junk", self._fold_text(expr)[0], expr)
 
     def test_pass30_a2_literal_chains_and_joined_readings_obey_the_cap(self):
         with mock.patch.dict(globals(), {"_FLATTEN_MAX_CHARS": 64}):
