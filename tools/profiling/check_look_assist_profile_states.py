@@ -32,6 +32,9 @@ than master in any render state":
   LAST application (it precedes that application's result line), final=none is STALE (the file on disk is another run's),
   the SHA-256 of the PNG bytes equals final_sha256, and the frame and exposure match the application. An arm with no
   picture_dump line at all is UNBOUND_LEGACY: a failure unless --allow-unbound-legacy, which reports it as such, never PASS.
+  A log line is the event named by its first `interaction_trace event=` token, its fields are its whitespace-delimited
+  key=value pairs taken exactly once (integers -?[0-9]{1,9}); an incomplete or ambiguous result is "no complete apply", and
+  a line with no event marker keeps its decision reading but never owns a picture_dump line.
 
 usage: check_look_assist_profile_states.py <root> --tag TAG [--clips a,b] [--deck-chroma-max X] [--require-daylight]
            [--master-tolerance X] [--subject-sha SHA] [--exe PATH] [--decisions-only] [--allow-unbound-legacy]
@@ -53,15 +56,24 @@ MODES = ("sync", "async")
 APPLIED_PICTURE = os.path.join("pic", "look-assist-final-frame0.png")
 MASTER_PICTURE = os.path.join("pic", "state-master.png")
 
-RESULT = re.compile(r"look_assist\.apply\.result\b.*?\bscene=(\S+).*?\bpreset_exp=(-?\d+).*?\bfinal_temp=(-?\d+) final_tint=(-?\d+)")
-ASYNC_APPLIED = re.compile(r"look_assist\.apply\.auto_wb_async_applied\b.*?\bsource=(\S+) decision=(\S+).*?\bfinal_temp=(-?\d+) final_tint=(-?\d+) preset_exp=(-?\d+)")
-AUTO_WB = re.compile(r"look_assist\.apply\.auto_wb\b.*?\bvalid=(\d) source=(\S+) decision=(\S+)")
-ASYNC_DISPATCH = re.compile(r"look_assist\.apply\.async_dispatch\b.*?\bscene=(\S+)")
-SAFETY_FALLBACK = re.compile(r"look_assist\.apply\.safety_fallback\b")
+# A line IS the event named by its first `interaction_trace event=` token (EVENT below), and only that event's reading
+# applies to it: a name spelled out inside another event's field is no evidence (adversary r2 A3). A line with NO such
+# marker (event=None, the back-compat reading) is read by the name appearing in it: it keeps its decision reading but
+# never owns a picture_dump line (adversary r2 A1). The fields of a line are its whitespace-delimited key=value pairs,
+# each taken exactly once, integers as -?[0-9]{1,9}; anything else is "no complete apply" (fail closed), never the
+# parse of a prefix or a shadow token (adversary r2 A2/A6).
+RESULT_EVENT = "look_assist.apply.result"
+ASYNC_APPLIED_EVENT = "look_assist.apply.auto_wb_async_applied"
+AUTO_WB_EVENT = "look_assist.apply.auto_wb"
+ASYNC_DISPATCH_EVENT = "look_assist.apply.async_dispatch"
+SAFETY_FALLBACK_EVENT = "look_assist.apply.safety_fallback"
 # EVERY skip event, with or without a reason: the app's env-disabled / file / receipt / enabled skip is logged as
 # "file_loaded=1 mlv=1 receipt=1 enabled=1" and has no reason= at all (sol, PR #222 r2).
-APPLY_SKIP = re.compile(r"look_assist\.apply\.skip\b(?:.*?\breason=(\S+))?")
-FALLBACK_TO_MASTER = re.compile(r"look_assist\.daylight_fallback_to_master\b")
+SKIP_EVENT = "look_assist.apply.skip"
+FALLBACK_EVENT = "look_assist.daylight_fallback_to_master"
+EVENT_NAME = {name: re.compile(re.escape(name) + r"\b") for name in (
+    RESULT_EVENT, ASYNC_APPLIED_EVENT, AUTO_WB_EVENT, ASYNC_DISPATCH_EVENT, SAFETY_FALLBACK_EVENT, SKIP_EVENT, FALLBACK_EVENT)}
+INT_FIELD = re.compile(r"-?[0-9]{1,9}")
 BUILD_SHA = re.compile(r'"build_sha"\s*:\s*"([^"]*)"')
 # The app's own binding of the final PNG (PR #793 head cc3205de, src/batch/LookAssistAnalysis.cpp lookAssistPictureDumpFields):
 #   look_assist.apply.picture_dump pre_safety=<name|none> pre_safety_sha256=<hex|none> pre_safety_exposure=<n>
@@ -92,52 +104,83 @@ def parse_log_text(text):
     newest_dump = None       # the newest picture_dump line anywhere in the log
     dump_lines = 0
     for line in text.splitlines():
-        if SAFETY_FALLBACK.search(line):
+        head = EVENT.search(line)
+        event = head.group(1) if head else None
+        pairs = FIELD.findall(line[head.end():] if head else line)
+
+        def is_event(name):
+            return event == name if head else bool(EVENT_NAME[name].search(line))
+
+        def once(key):
+            values = [value for found, value in pairs if found == key]
+            return values[0] if len(values) == 1 else None
+
+        def int_once(key):
+            value = once(key)
+            return int(value) if value is not None and INT_FIELD.fullmatch(value) else None
+
+        if is_event(SAFETY_FALLBACK_EVENT):
             receipt = {"safety_fallback": True}
             pending_dump = None
             continue
-        skip = APPLY_SKIP.search(line)
-        if skip:
-            skipped = skipped or skip.group(1) or "no reason logged"   # arm-level marker: the first skip is named
+        if is_event(SKIP_EVENT):
+            skipped = skipped or once("reason") or "no reason logged"   # arm-level marker: the first skip is named
             continue
-        head = EVENT.search(line)
-        event = head.group(1) if head else None
         if event == DUMP_EVENT:
-            pairs = FIELD.findall(line[head.end():])
             fields = dict(pairs)
             if len(fields) != len(pairs):
                 fields["_duplicate_key"] = "1"      # a key given twice is ambiguous, never a binding
             pending_dump = newest_dump = fields
             dump_lines += 1
             continue
-        if FALLBACK_TO_MASTER.search(line):
+        if is_event(FALLBACK_EVENT):
             receipt = {"fell_back": True}
             pending_dump = None
             continue
-        dispatch = ASYNC_DISPATCH.search(line)
-        if dispatch:
-            receipt = {"scene": dispatch.group(1)}   # a new application: nothing of the previous one survives
+        if is_event(ASYNC_DISPATCH_EVENT):
+            scene = once("scene")
+            # a new application: nothing of the previous one survives
+            receipt = {"scene": scene} if scene else {"malformed_event": ASYNC_DISPATCH_EVENT}
             pending_dump = None
             continue
-        wb = AUTO_WB.search(line)
-        if wb:
-            receipt = dict(receipt or {}, source=wb.group(2), decision=wb.group(3))
+        if is_event(AUTO_WB_EVENT):
+            valid, source, decision = once("valid"), once("source"), once("decision")
+            if valid is None or not re.fullmatch(r"[0-9]", valid) or not source or not decision:
+                receipt = {"malformed_event": AUTO_WB_EVENT}
+            else:
+                receipt = dict(receipt or {}, source=source, decision=decision)
+                receipt.pop("malformed_event", None)
             receipt.pop("picture_dump", None)        # a new application began: the earlier result's dump is not its
             pending_dump = None                     # auto_wb precedes the dump of its own application
             continue
-        result = RESULT.search(line) if event in (None, "look_assist.apply.result") else None
-        if result:
-            receipt = dict(receipt or {}, scene=result.group(1), exposure=int(result.group(2)),
-                           temperature=int(result.group(3)), tint=int(result.group(4)))
+        if is_event(RESULT_EVENT):
+            scene, exposure, temperature, tint = once("scene"), int_once("preset_exp"), int_once("final_temp"), int_once("final_tint")
+            if not scene or None in (exposure, temperature, tint):
+                receipt = {"malformed_event": RESULT_EVENT}     # an incomplete result is no apply, never an earlier receipt
+                pending_dump = None
+                continue
+            receipt = dict(receipt or {}, scene=scene, exposure=exposure, temperature=temperature, tint=tint)
+            receipt.pop("malformed_event", None)
             receipt["frame"] = LOG_FRAME.findall(line)     # raw tokens: validated where the picture is bound
-            receipt["picture_dump"], pending_dump = pending_dump, None    # this application owns the dump before it
+            if head:
+                receipt["picture_dump"], pending_dump = pending_dump, None    # this application owns the dump before it
+            else:
+                receipt["picture_dump"] = None          # no event marker: decisions only, it never owns a dump
             continue
-        applied = ASYNC_APPLIED.search(line) if event in (None, "look_assist.apply.auto_wb_async_applied") else None
-        if applied:
-            receipt = dict(receipt or {}, source=applied.group(1), decision=applied.group(2),
-                           temperature=int(applied.group(3)), tint=int(applied.group(4)), exposure=int(applied.group(5)))
+        if is_event(ASYNC_APPLIED_EVENT):
+            source, decision = once("source"), once("decision")
+            temperature, tint, exposure = int_once("final_temp"), int_once("final_tint"), int_once("preset_exp")
+            if not source or not decision or None in (temperature, tint, exposure):
+                receipt = {"malformed_event": ASYNC_APPLIED_EVENT}
+                pending_dump = None
+                continue
+            receipt = dict(receipt or {}, source=source, decision=decision, temperature=temperature, tint=tint, exposure=exposure)
+            receipt.pop("malformed_event", None)
             receipt["frame"] = LOG_FRAME.findall(line)     # raw tokens: validated where the picture is bound
-            receipt["picture_dump"], pending_dump = pending_dump, None
+            if head:
+                receipt["picture_dump"], pending_dump = pending_dump, None
+            else:
+                receipt["picture_dump"] = None
     if skipped:
         receipt = dict(receipt or {}, skipped=skipped)
     if receipt is not None and dump_lines:

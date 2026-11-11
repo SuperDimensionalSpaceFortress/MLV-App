@@ -22,7 +22,15 @@ def read_png_rgb(path):
 
 def decode_png_rgb(data, path):
     """read_png_rgb over bytes already in memory (path is only the name used in error messages), so a caller can hash
-    and measure the SAME bytes (check_look_assist_profile_states.py binds the picture it measures by content)."""
+    and measure the SAME bytes (check_look_assist_profile_states.py binds the picture it measures by content).
+    A corrupt file is a ValueError, never the struct.error / zlib.error / IndexError the decoder raised on it."""
+    try:
+        return _decode_png_rgb(data, path)
+    except (struct.error, zlib.error, IndexError) as error:
+        raise ValueError("%s: corrupt PNG (%s: %s)" % (path, type(error).__name__, error)) from error
+
+
+def _decode_png_rgb(data, path):
     if data[:8] != _SIGNATURE:
         raise ValueError("%s: not a PNG" % path)
     pos = 8

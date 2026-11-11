@@ -605,6 +605,102 @@ class PictureDumpBindingAdversaryR2(unittest.TestCase):
         self.assertIn("STALE", text)
 
 
+class PictureDumpBindingAdversaryR3(unittest.TestCase):
+    """Adversary pass 3 on 8c6a72e1 (A1, A2) and its same-path advisories (A3 event anchor, A5 corrupt PNG, A6 digit bound)."""
+
+    def bound(self, trace_for):
+        root = tempfile.TemporaryDirectory()
+        self.addCleanup(root.cleanup)
+        make_bound_set(root.name, trace_for)
+        return root.name
+
+    def test_a1_a_result_or_applied_line_without_the_event_marker_never_owns_a_dump(self):
+        def markerless(line):
+            return line.replace("interaction_trace event=", "note=event=")
+        sync = lambda sha: AUTO_WB_LINE + dump_line(sha) + markerless(result_line())
+        asyn = lambda sha: DISPATCH_LINE + dump_line(sha) + markerless(ASYNC_APPLIED_LINE)
+        everything = lambda sha: markerless(AUTO_WB_LINE + dump_line(sha) + result_line())
+        for label, trace_for in (("sync", sync), ("async", asyn)):
+            with self.subTest(label):
+                code, text = run_checker([self.bound(trace_for), "--tag", "t"])
+                self.assertEqual(1, code, text)
+                self.assertIn("STALE", text)
+                self.assertNotIn("picture_dump-bound", text)
+        with self.subTest("every line markerless"):
+            self.assertEqual(1, run_checker([self.bound(everything), "--tag", "t"])[0])
+        # a markerless line keeps its DECISION reading (back-compat) when the arm is opted in as legacy
+        legacy = self.bound(lambda sha: markerless(AUTO_WB_LINE + result_line()))
+        self.assertEqual(0, main_legacy([legacy, "--tag", "t"]))
+
+    def test_a2_the_result_fields_are_whitespace_delimited_pairs_given_once_as_integers(self):
+        good_dump = lambda sha: AUTO_WB_LINE + dump_line(sha)
+        cases = {
+            "prefix token previous-preset_exp=160 before preset_exp=380":
+                result_line().replace("preset_exp=160", "previous-preset_exp=160 preset_exp=380"),
+            "preset_exp=160.5": result_line().replace("preset_exp=160", "preset_exp=160.5"),
+            "preset_exp given twice": result_line().replace("preset_exp=160", "preset_exp=160 preset_exp=160"),
+            "final_temp=8950.5": result_line().replace("final_temp=8950", "final_temp=8950.5"),
+            "final_tint=-35.5": result_line().replace("final_tint=-35", "final_tint=-35.5"),
+            "shadow x-final_tint": result_line().replace("final_tint=-35", "x-final_tint=-35"),
+            "scene given twice": result_line().replace("scene=shade", "scene=shade scene=night"),
+            "4301-digit preset_exp": result_line().replace("preset_exp=160", "preset_exp=" + "1" * 4301),
+        }
+        for label, result in cases.items():
+            with self.subTest(label):
+                code, text = run_checker([self.bound(lambda sha, result=result: good_dump(sha) + result), "--tag", "t"])
+                self.assertEqual(1, code, text)
+                self.assertNotIn("picture_dump-bound", text)
+        for label, applied in (("async preset_exp=160.5", ASYNC_APPLIED_LINE.replace("preset_exp=160", "preset_exp=160.5")),
+                               ("async prefix token", ASYNC_APPLIED_LINE.replace("preset_exp=160", "previous-preset_exp=160 preset_exp=380")),
+                               ("async 4301-digit final_temp", ASYNC_APPLIED_LINE.replace(" final_temp=9990", " final_temp=" + "9" * 4301))):
+            with self.subTest(label):
+                root = self.bound(lambda sha, applied=applied: DISPATCH_LINE + dump_line(sha) + applied)
+                code, text = run_checker([root, "--tag", "t"])
+                self.assertEqual(1, code, text)
+                self.assertNotIn("picture_dump-bound", text)
+        # a LATER malformed result is not ignored in favour of an earlier receipt
+        root = self.bound(lambda sha: good_dump(sha) + result_line() + AUTO_WB_LINE + dump_line(sha)
+                          + result_line().replace("final_temp=8950", "final_temp="))
+        self.assertEqual(1, run_checker([root, "--tag", "t"])[0])
+        # control: well-formed fields still bind
+        code, text = run_checker([self.bound(lambda sha: good_dump(sha) + result_line()), "--tag", "t"])
+        self.assertEqual(0, code, text)
+
+    def test_a3_only_the_named_event_counts_as_wb_evidence_and_a_skip_is_never_a_safety_fallback(self):
+        forged_wb = PREFIX + ("look_assist.apply.post_balance note=look_assist.apply.auto_wb valid=1 "
+                              "source=rendered-neutral-patch decision=accepted\n")
+        code, text = run_checker([self.bound(lambda sha: forged_wb + dump_line(sha) + result_line()), "--tag", "t"])
+        self.assertEqual(1, code, text)
+        self.assertNotIn("picture_dump-bound", text)
+        skip = PREFIX + "look_assist.apply.skip reason=look_assist.apply.safety_fallback\n"
+        code, text = run_checker([self.bound(lambda sha: skip + AUTO_WB_LINE + dump_line(sha) + result_line()), "--tag", "t"])
+        self.assertEqual(1, code, text)
+        self.assertIn("skipped", text)
+        self.assertNotIn("safety fallback", text)
+
+    def test_a5_a_corrupt_png_is_exit_2_not_a_crash(self):
+        import struct
+        import zlib
+
+        def chunk(kind, body):
+            return struct.pack(">I", len(body)) + kind + body + struct.pack(">I", zlib.crc32(kind + body) & 0xffffffff)
+        sig = b"\x89PNG\r\n\x1a\n"
+        ihdr = struct.pack(">IIBBBBB", 80, 40, 8, 2, 0, 0, 0)
+        corrupt = {
+            "not a zlib stream": sig + chunk(b"IHDR", ihdr) + chunk(b"IDAT", b"this is not zlib") + chunk(b"IEND", b""),
+            "short IHDR": sig + chunk(b"IHDR", b"\x00\x00") + chunk(b"IDAT", zlib.compress(b"x")) + chunk(b"IEND", b""),
+            "truncated chunk header": sig + b"\x00\x00\x00",
+        }
+        for label, data in corrupt.items():
+            with self.subTest(label):
+                root = self.bound(lambda sha: AUTO_WB_LINE + dump_line(sha) + result_line())
+                with open(os.path.join(root, "t-tiny_dual_iso-sync", chk.APPLIED_PICTURE), "wb") as handle:
+                    handle.write(data)
+                code, text = run_checker([root, "--tag", "t"])
+                self.assertEqual(2, code, text)
+                self.assertIn("cannot read a picture", text)
+
+
 class PngReader(unittest.TestCase):
     def test_every_png_filter_decodes_to_the_same_pixels(self):
         with tempfile.TemporaryDirectory() as root:
