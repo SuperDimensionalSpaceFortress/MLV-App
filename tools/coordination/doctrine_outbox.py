@@ -4506,6 +4506,7 @@ def _rename_verified(src: pathlib.Path, dst: pathlib.Path, ident: tuple[int, int
         # mkdir-claim fallback that stood in for it was itself racy (r10 A1/A2) and is deleted: the named flake is Windows.
         if not _rename_noreplace(src, dst):
             raise _NoAtomicRename(f"this platform has no atomic no-replace rename to put {src} aside with")
+        return                                                          # renamed: the Windows handle path below is not for POSIX (r11 B1)
     import ctypes
     import msvcrt
     import struct

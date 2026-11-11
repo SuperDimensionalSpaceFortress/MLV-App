@@ -4899,3 +4899,90 @@ def test_r9b_a3_real_keeps_the_extended_prefix_for_a_reserved_device_name_and_th
         assert caught.value.code == "EXERCISE_SCRATCH_ROOT_AMBIGUOUS", caught.value
     finally:
         os.rmdir(literal)
+
+
+# Adversary keys on 3cbf6c53 (opus 6784978542 B1, sol 6785058834 B1, Dot 786-R10-F1): the POSIX branch of _rename_verified raised
+# _NoAtomicRename when _rename_noreplace was False but had NO `return` when it was True, so a SUCCESSFUL native no-replace rename
+# fell through to `import msvcrt` after the scratch had already moved. ModuleNotFoundError is not an OSError, so it escaped the
+# caller's handler with `renamed = True` and `target` still the old name. These rows drive the SUCCESSFUL POSIX branch, with
+# `msvcrt` unimportable, through the helper and through BOTH of its callers.
+
+def _posix_with_native_noreplace(monkeypatch, record):
+    real_os = os
+
+    class PosixOs:
+        name = "posix"
+
+        def __getattr__(self, item):
+            return getattr(real_os, item)
+
+    def native_noreplace(src, dst):                                     # what renameat2(RENAME_NOREPLACE) does on success
+        record.append((os.fspath(src), os.fspath(dst)))
+        if real_os.path.lexists(dst):
+            raise FileExistsError(17, "the destination already exists", os.fspath(dst))
+        real_os.rename(src, dst)
+        return True
+
+    monkeypatch.setattr(ob, "os", PosixOs())
+    monkeypatch.setattr(ob, "_rename_noreplace", native_noreplace)
+    monkeypatch.setitem(sys.modules, "msvcrt", None)                    # `import msvcrt` raises ModuleNotFoundError, as on Linux
+
+
+@pytest.mark.parametrize("direction", ["put_aside", "put_back"])
+def test_r11_b1_a_successful_linux_native_no_replace_rename_must_return_before_windows_imports(tmp_path, monkeypatch, direction):
+    record: list = []
+    named, private = tmp_path / "work", tmp_path / "work.rm-0000000000000011"
+    src, dst = (named, private) if direction == "put_aside" else (private, named)
+    src.mkdir()
+    (src / "f.txt").write_text("keep", encoding="utf-8")
+    ident = ob._file_id(src)
+    _posix_with_native_noreplace(monkeypatch, record)
+    ob._rename_verified(src, dst, ident)                                # must return: no ImportError / ModuleNotFoundError
+    assert record == [(os.fspath(src), os.fspath(dst))], record
+    assert not os.path.lexists(src) and (dst / "f.txt").read_text(encoding="utf-8") == "keep", "the scratch did not end at the destination"
+
+
+def _pinned_scratch(tmp_path):
+    base = Path(ob.tempfile.mkdtemp(prefix=ob.ROUTE_SCRATCH_PREFIX, dir=str(tmp_path)))
+    ob._SCRATCH_PINS[ob._scratch_key(base)] = (ob._file_id(tmp_path, True), ob._file_id(base))
+    ob._SCRATCH_ROOTS[ob._scratch_key(base)] = str(tmp_path)
+    (base / "f.txt").write_text("keep", encoding="utf-8")
+    return base
+
+
+def test_r11_b1_caller_the_private_put_aside_of_a_removal_completes_on_a_native_no_replace_rename(tmp_path, monkeypatch):
+    record: list = []
+    base = _pinned_scratch(tmp_path)
+    _posix_with_native_noreplace(monkeypatch, record)
+    ob.remove_exercise_scratch(base, tmp_path)                          # no ModuleNotFoundError, no typed refusal
+    assert len(record) == 1 and record[0][0] == os.fspath(base) and ".rm-" in record[0][1], record
+    assert not [p for p in tmp_path.iterdir() if p.name.startswith(base.name)], "the scratch or its private name was left behind"
+
+
+def test_r11_b1_caller_the_refusal_put_back_returns_the_scratch_to_its_own_name(tmp_path, monkeypatch):
+    record: list = []
+    base = _pinned_scratch(tmp_path)
+    _posix_with_native_noreplace(monkeypatch, record)
+
+    def not_ours(*a, **k):                                              # after the put-aside, the walk finds it is not the scratch
+        raise ob._NotOurs("another directory took its name during the removal")
+
+    monkeypatch.setattr(ob, "_remove_tree", not_ours)
+    with pytest.raises(ob.Unknown) as caught:
+        ob.remove_exercise_scratch(base, tmp_path)
+    assert caught.value.code == "EXERCISE_SCRATCH_NOT_REMOVED", caught.value
+    assert "it was put back under" in str(caught.value), caught.value
+    assert len(record) == 2 and record[0][0] == os.fspath(base) and record[1][1] == os.fspath(base), record   # put aside, then put back
+    assert (base / "f.txt").read_text(encoding="utf-8") == "keep"
+    assert not [p for p in tmp_path.iterdir() if ".rm-" in p.name], "a private name was left behind"
+
+
+def test_r11_b1_retained_a_missing_native_no_replace_rename_is_still_the_typed_refusal_without_a_windows_import(tmp_path, monkeypatch):
+    record: list = []
+    base = _pinned_scratch(tmp_path)
+    _posix_without_noreplace(monkeypatch, record)
+    monkeypatch.setitem(sys.modules, "msvcrt", None)
+    with pytest.raises(ob.Unknown) as caught:
+        ob.remove_exercise_scratch(base, tmp_path)
+    assert caught.value.code == "EXERCISE_SCRATCH_NOT_REMOVED", caught.value
+    assert (base / "f.txt").read_text(encoding="utf-8") == "keep" and not record, record
