@@ -101,7 +101,10 @@ Numbers are computed from the VIDEO VIEWPORT only -- the window's timecode and f
   absolute fallback: median luma >= 16, median near-black fraction <= 0.60, median clipped fraction <= 0.05. The file ships with
   **no clip rows**; they are derived from accepted legs by a follow-up (VISUAL-GATE-EXPOSURE-BANDS-SEED-1). A missing or malformed file
   (or row) is judged on the fallback and says so in `exposureBandNote` and the reason (`exposureBandSource` `fallback-missing` /
-  `fallback-malformed`), never a silent OK; an empty file or a clip with no row is `fallback-empty` / `fallback-no-row`.
+  `fallback-malformed`), never a silent OK; an empty file or a clip with no row is `fallback-empty` / `fallback-no-row`. The file is parsed
+  with System.Text.Json: the root must be a JSON object (a one-element array is malformed, not unwrapped), clip ids match exactly
+  (`M16-1457` and `m16-1457` are two clips), and a duplicate `clips`, clip row or field is malformed. The medians and fractions are
+  stored unrounded (the reason rounds to 6 places for display), so a cap such as `maxClippedFraction` 0.00042 flags one clipped pixel in 2304.
 
 | verdict | when | counted |
 |---|---|---|
@@ -113,7 +116,7 @@ Numbers are computed from the VIDEO VIEWPORT only -- the window's timecode and f
 | `VISUAL_DIVERGENCE` | the playback frame is further than the threshold from its paused full-quality re-render | yes, and the detail says so |
 | `CAPTURE_BLANK` | every play frame's viewport is flat (std < 1): the capture judges nothing | yes |
 | `NOT_CAPTURED` / `NOT_REQUESTED` | nothing published (an old build, a failed run) / the spec opts out | yes |
-| `EXPOSURE_OUT_OF_RANGE` | none of the verdicts above, but the leg's median luma, near-black fraction or clipped fraction is outside its band (see Exposure above); the reason quotes the three numbers and the band | yes, and the detail says so (a flag, never an exclusion; judged after every other verdict) |
+| `EXPOSURE_OUT_OF_RANGE` | none of the verdicts above, but the leg's median luma, near-black fraction or clipped fraction is outside its band (see Exposure above); the reason quotes the three numbers and the band | yes, and the detail says so (a flag, never an exclusion; judged after every other verdict; a self-heal pre-launch may show it too, where every other non-OK verdict still makes the leg `INVALID`) |
 | `OK` | none of the above | yes |
 
 `sourceDifference` is derived from the app's own per-frame records over the SAME frames the picture is judged over (the play

@@ -1105,10 +1105,17 @@ if ($outcome -in @('PASS', 'FAIL') -and $selfHealLaunches.Count -gt 0) {
         $entry = $(if ($null -ne $receipt['selfHealVisual'] -and $receipt['selfHealVisual'].Contains($launch)) { $receipt['selfHealVisual'][$launch] } else { $null })
         if ($null -eq $entry -or [string]::IsNullOrWhiteSpace([string]$entry.verdict)) {
             "NO_VISUAL_ENTRY on self-heal pre-launch $($launch): the leg ran it but the receipt holds no visual verdict for it"
-        } elseif ([string]$entry.verdict -cne 'OK') {
+        } elseif ([string]$entry.verdict -cne 'OK' -and [string]$entry.verdict -cne 'EXPOSURE_OUT_OF_RANGE') {
             "$([string]$entry.verdict) on self-heal pre-launch $($launch): $($entry.reason)"
         }
     })
+    # VISUAL-GATE-EXPOSURE-FLOOR-1: EXPOSURE_OUT_OF_RANGE is a flag, never an exclusion (hub ruling), so it is the one non-OK verdict a pre-launch may show: it is
+    # counted and said in the detail, like the measured run's own divergence, and does not make the leg INVALID.
+    $exposureLaunches = @(foreach ($launch in $selfHealLaunches) {
+        $entry = $(if ($null -ne $receipt['selfHealVisual'] -and $receipt['selfHealVisual'].Contains($launch)) { $receipt['selfHealVisual'][$launch] } else { $null })
+        if ($null -ne $entry -and [string]$entry.verdict -ceq 'EXPOSURE_OUT_OF_RANGE') { "EXPOSURE_OUT_OF_RANGE on self-heal pre-launch $($launch) (counted, surfaced for review): $($entry.reason)" }
+    })
+    if ($exposureLaunches.Count -gt 0) { $detail += '; ' + ($exposureLaunches -join '; ') }
     if ($badLaunches.Count -gt 0) {
         $detail = "INVALID: the job result was $outcome ($detail) but " + ($badLaunches -join '; ') + '. A fallback run whose picture is not OK is not counted, whatever the measured run says'
         $outcome = 'INVALID'

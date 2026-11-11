@@ -2900,8 +2900,9 @@ $script:ExposureLetterboxRowMean = 2    # a viewport row whose full-width mean l
 $script:ExposureFallbackBand = [pscustomobject]@{ minMedianLuma = 16.0; maxMedianLuma = 255.0; maxNearBlackFraction = 0.60; maxClippedFraction = 0.05 }
 $script:ExposureBandsPath = Join-Path $PSScriptRoot 'exposure-bands.json'
 
-function Get-DvMedian {
-    <# The median of a list of numbers (the mean of the middle two when the count is even); $null for an empty list. #>
+function Get-DvExposureMedian {
+    <# The median of a list of frame measurements (the mean of the middle two when the count is even); $null for an empty list. (Not Get-DvMedian: that is the
+       matrix table's helper, which skips missing values; a frame without a measurement is never counted as a zero here either, the caller filters it.) #>
     param([double[]]$Values = @())
     $v = @($Values | Sort-Object)
     if ($v.Count -eq 0) { return $null }
@@ -2916,7 +2917,9 @@ function Get-DvVisualExposureStats {
     The exposure numbers of one frame's picture area (pure): from packed R,G,B bytes (-Width x -Height, the viewport already cut out), the BT.709 mean
     luma (0..255), the near-black fraction (luma < 16) and the clipped fraction (luma > 235). Rows whose full-width mean luma is under 2 are letterbox
     bars, not picture, and are left out (letterboxRowsDropped); when EVERY row is that dark the picture itself is black, so all rows are measured (a
-    black frame must read as black, never as "no picture to judge"). Returns $null for an empty or mis-sized array.
+    black frame must read as black, never as "no picture to judge"). Returns $null for an empty or mis-sized array. The numbers are NOT rounded: the
+    verdict compares them to a band whose caps are the owner's to choose (a cap of 0.00042 must flag one clipped pixel in 2304), so only the
+    reason text rounds, for display.
     #>
     param([Parameter(Mandatory)][byte[]]$Rgb, [Parameter(Mandatory)][int]$Width, [Parameter(Mandatory)][int]$Height)
     if ($Width -le 0 -or $Height -le 0 -or $Rgb.Length -ne $Width * $Height * 3) { return $null }
@@ -2944,16 +2947,18 @@ function Get-DvVisualExposureStats {
     }
     $n = $keep.Count * $Width
     [pscustomobject]@{
-        lumaMean = [math]::Round($sum / $n, 3); nearBlackFraction = [math]::Round($nearBlack / $n, 4); clippedFraction = [math]::Round($clipped / $n, 4)
+        lumaMean = $sum / $n; nearBlackFraction = $nearBlack / $n; clippedFraction = $clipped / $n
         rows = $Height; letterboxRowsDropped = $Height - $keep.Count
     }
 }
 
-function Test-DvExposureNumber($Value, [double]$Min, [double]$Max) {
-    # a real JSON number inside [Min, Max]: not a string ("16"), not a bool, not NaN / Infinity
-    if ($Value -isnot [int] -and $Value -isnot [long] -and $Value -isnot [double] -and $Value -isnot [decimal]) { return $false }
-    $d = [double]$Value
-    (-not [double]::IsNaN($d)) -and (-not [double]::IsInfinity($d)) -and $d -ge $Min -and $d -le $Max
+function ConvertTo-DvExposureLimit($Element, [double]$Min, [double]$Max) {
+    # a System.Text.Json element that is a real JSON number inside [Min, Max] -> that double; anything else (a string "16", a bool, null, out of range) -> $null
+    if ($Element.ValueKind -ne [System.Text.Json.JsonValueKind]::Number) { return $null }
+    $d = 0.0
+    if (-not $Element.TryGetDouble([ref]$d)) { return $null }
+    if ([double]::IsNaN($d) -or [double]::IsInfinity($d) -or $d -lt $Min -or $d -gt $Max) { return $null }
+    $d
 }
 
 function Get-DvExposureBand {
@@ -2974,28 +2979,40 @@ function Get-DvExposureBand {
     }
     try { $text = [IO.File]::ReadAllText($Path) } catch { return (& $result 'fallback-malformed' "the exposure band file cannot be read ($($_.Exception.GetType().Name)): the absolute fallback band judges" $fallback) }
     if ([string]::IsNullOrWhiteSpace($text)) { return (& $result 'fallback-empty' $null $fallback) }
-    try { $doc = $text | ConvertFrom-Json -ErrorAction Stop } catch { return (& $result 'fallback-malformed' 'the exposure band file is not valid JSON: the absolute fallback band judges' $fallback) }
-    # (the full type name: `-is [pscustomobject]` is the PSObject accelerator, true of a string or a number too)
-    if ($doc -isnot [System.Management.Automation.PSCustomObject]) { return (& $result 'fallback-malformed' 'the exposure band file is not a JSON object: the absolute fallback band judges' $fallback) }
-    $clipsProp = $doc.PSObject.Properties['clips']
-    if ($null -eq $clipsProp -or $null -eq $clipsProp.Value) { return (& $result 'fallback-no-row' $null $fallback) }
-    if ($clipsProp.Value -isnot [System.Management.Automation.PSCustomObject]) { return (& $result 'fallback-malformed' 'the exposure band file''s clips is not a JSON object: the absolute fallback band judges' $fallback) }
-    $rowProp = $(if ([string]::IsNullOrWhiteSpace($ClipId)) { $null } else { @($clipsProp.Value.PSObject.Properties | Where-Object { $_.Name -ceq $ClipId }) | Select-Object -First 1 })
-    if ($null -eq $rowProp) { return (& $result 'fallback-no-row' $null $fallback) }
-    $row = $rowProp.Value
-    $bad = { param($why) (& $result 'fallback-malformed' "the exposure band row for clip '$ClipId' is malformed ($why): the absolute fallback band judges" $fallback) }
-    if ($row -isnot [System.Management.Automation.PSCustomObject]) { return (& $bad 'not an object') }
-    $limits = [ordered]@{ minMedianLuma = @(0.0, 255.0); maxMedianLuma = @(0.0, 255.0); maxNearBlackFraction = @(0.0, 1.0); maxClippedFraction = @(0.0, 1.0) }
-    $band = [ordered]@{}; $named = 0
-    foreach ($name in $limits.Keys) {
-        $p = $row.PSObject.Properties[$name]
-        if ($null -eq $p) { $band[$name] = $fallback.$name; continue }
-        if (-not (Test-DvExposureNumber $p.Value $limits[$name][0] $limits[$name][1])) { return (& $bad "$name must be a number in $($limits[$name][0])..$($limits[$name][1])") }
-        $band[$name] = [double]$p.Value; $named++
-    }
-    if ($named -eq 0) { return (& $bad 'it names none of minMedianLuma, maxMedianLuma, maxNearBlackFraction, maxClippedFraction') }
-    if ($band.minMedianLuma -gt $band.maxMedianLuma) { return (& $bad 'minMedianLuma is above maxMedianLuma') }
-    & $result 'clip' $null ([pscustomobject]$band)
+    # System.Text.Json, not ConvertFrom-Json: that unwraps a one-element array root ([{"clips": ...}] reads as the object, so a non-object file would pick a
+    # row), and rejects keys that differ only in case ({"M16-1457": ..., "m16-1457": ...} is valid JSON and clip ids match exactly)
+    $json = $null
+    try { $json = [System.Text.Json.JsonDocument]::Parse($text) } catch { return (& $result 'fallback-malformed' 'the exposure band file is not valid JSON: the absolute fallback band judges' $fallback) }
+    try {
+        $root = $json.RootElement
+        $bad = { param($why) (& $result 'fallback-malformed' "the exposure band file is unusable ($why): the absolute fallback band judges" $fallback) }
+        if ($root.ValueKind -ne [System.Text.Json.JsonValueKind]::Object) { return (& $bad 'the root is not a JSON object') }
+        $clipsProps = @($root.EnumerateObject() | Where-Object { $_.Name -ceq 'clips' })
+        if ($clipsProps.Count -eq 0) { return (& $result 'fallback-no-row' $null $fallback) }
+        if ($clipsProps.Count -gt 1) { return (& $bad 'clips is given more than once') }
+        $clips = $clipsProps[0].Value
+        if ($clips.ValueKind -eq [System.Text.Json.JsonValueKind]::Null) { return (& $result 'fallback-no-row' $null $fallback) }
+        if ($clips.ValueKind -ne [System.Text.Json.JsonValueKind]::Object) { return (& $bad 'clips is not a JSON object') }
+        $rowProps = @(if (-not [string]::IsNullOrWhiteSpace($ClipId)) { $clips.EnumerateObject() | Where-Object { $_.Name -ceq $ClipId } })
+        if ($rowProps.Count -eq 0) { return (& $result 'fallback-no-row' $null $fallback) }
+        $badRow = { param($why) (& $result 'fallback-malformed' "the exposure band row for clip '$ClipId' is malformed ($why): the absolute fallback band judges" $fallback) }
+        if ($rowProps.Count -gt 1) { return (& $badRow 'the clip has more than one row') }
+        $row = $rowProps[0].Value
+        if ($row.ValueKind -ne [System.Text.Json.JsonValueKind]::Object) { return (& $badRow 'not an object') }
+        $limits = [ordered]@{ minMedianLuma = @(0.0, 255.0); maxMedianLuma = @(0.0, 255.0); maxNearBlackFraction = @(0.0, 1.0); maxClippedFraction = @(0.0, 1.0) }
+        $band = [ordered]@{}; $named = 0
+        foreach ($name in $limits.Keys) {
+            $fields = @($row.EnumerateObject() | Where-Object { $_.Name -ceq $name })
+            if ($fields.Count -eq 0) { $band[$name] = $fallback.$name; continue }
+            if ($fields.Count -gt 1) { return (& $badRow "$name is given more than once") }
+            $value = ConvertTo-DvExposureLimit $fields[0].Value $limits[$name][0] $limits[$name][1]
+            if ($null -eq $value) { return (& $badRow "$name must be a number in $($limits[$name][0])..$($limits[$name][1])") }
+            $band[$name] = [double]$value; $named++
+        }
+        if ($named -eq 0) { return (& $badRow 'it names none of minMedianLuma, maxMedianLuma, maxNearBlackFraction, maxClippedFraction') }
+        if ($band.minMedianLuma -gt $band.maxMedianLuma) { return (& $badRow 'minMedianLuma is above maxMedianLuma') }
+        & $result 'clip' $null ([pscustomobject]$band)
+    } finally { $json.Dispose() }
 }
 
 function Get-DvVisualVerdict {
@@ -3060,14 +3077,19 @@ function Get-DvVisualVerdict {
     $waivedReason = $(if ($DistinctContentHashes -eq 1 -and $AppDistinctDisplayFrames -gt 1 -and $SourceDifference -ceq 'known-identical') { 'one picture; the app records the source frames as identical: a static clip' } else { $null })
     # VISUAL-GATE-EXPOSURE-FLOOR-1: last, so every other verdict keeps its precedence; counted, a flag and never an exclusion
     if ($null -ne $ExposureBand -and $null -ne $ExposureMedianLuma -and $null -ne $ExposureMedianNearBlackFraction -and $null -ne $ExposureMedianClippedFraction) {
+        # compared UNROUNDED; the reason rounds to 6 places for display (a median 0.000434 against a cap of 0.00042 is over, and reads as 0.000434)
+        $show = { param($n) ([double]$n).ToString('0.######', [System.Globalization.CultureInfo]::InvariantCulture) }
+        $lumaMedian = [double]$ExposureMedianLuma; $nearBlackMedian = [double]$ExposureMedianNearBlackFraction; $clippedMedian = [double]$ExposureMedianClippedFraction
+        $notNumbers = @($lumaMedian, $nearBlackMedian, $clippedMedian | Where-Object { [double]::IsNaN($_) -or [double]::IsInfinity($_) })
         $broken = @(
-            if ([double]$ExposureMedianLuma -lt [double]$ExposureBand.minMedianLuma) { "median luma $ExposureMedianLuma is under the band minimum $($ExposureBand.minMedianLuma)" }
-            if ([double]$ExposureMedianLuma -gt [double]$ExposureBand.maxMedianLuma) { "median luma $ExposureMedianLuma is over the band maximum $($ExposureBand.maxMedianLuma)" }
-            if ([double]$ExposureMedianNearBlackFraction -gt [double]$ExposureBand.maxNearBlackFraction) { "median near-black fraction $ExposureMedianNearBlackFraction is over the band maximum $($ExposureBand.maxNearBlackFraction)" }
-            if ([double]$ExposureMedianClippedFraction -gt [double]$ExposureBand.maxClippedFraction) { "median clipped fraction $ExposureMedianClippedFraction is over the band maximum $($ExposureBand.maxClippedFraction)" })
+            if ($notNumbers.Count -gt 0) { 'a median is not a finite number' }
+            if ($lumaMedian -lt [double]$ExposureBand.minMedianLuma) { "median luma $(& $show $lumaMedian) is under the band minimum $(& $show $ExposureBand.minMedianLuma)" }
+            if ($lumaMedian -gt [double]$ExposureBand.maxMedianLuma) { "median luma $(& $show $lumaMedian) is over the band maximum $(& $show $ExposureBand.maxMedianLuma)" }
+            if ($nearBlackMedian -gt [double]$ExposureBand.maxNearBlackFraction) { "median near-black fraction $(& $show $nearBlackMedian) is over the band maximum $(& $show $ExposureBand.maxNearBlackFraction)" }
+            if ($clippedMedian -gt [double]$ExposureBand.maxClippedFraction) { "median clipped fraction $(& $show $clippedMedian) is over the band maximum $(& $show $ExposureBand.maxClippedFraction)" })
         if ($broken.Count -gt 0) {
             $bandSource = $(if ($ExposureBandSource) { " [band: $ExposureBandSource]" } else { '' })
-            $exposureReason = "the picture area is outside its exposure band over the $PlayFrames judged play frames (median luma $ExposureMedianLuma/255, near-black fraction $ExposureMedianNearBlackFraction, clipped fraction $ExposureMedianClippedFraction; band luma $($ExposureBand.minMedianLuma)..$($ExposureBand.maxMedianLuma), near-black <= $($ExposureBand.maxNearBlackFraction), clipped <= $($ExposureBand.maxClippedFraction))${bandSource}: $($broken -join '; ')"
+            $exposureReason = "the picture area is outside its exposure band over the $PlayFrames judged play frames (median luma $(& $show $lumaMedian)/255, near-black fraction $(& $show $nearBlackMedian), clipped fraction $(& $show $clippedMedian); band luma $(& $show $ExposureBand.minMedianLuma)..$(& $show $ExposureBand.maxMedianLuma), near-black <= $(& $show $ExposureBand.maxNearBlackFraction), clipped <= $(& $show $ExposureBand.maxClippedFraction))${bandSource}: $($broken -join '; ')"
             return [pscustomobject]@{ verdict = 'EXPOSURE_OUT_OF_RANGE'; counted = $true; reason = $(if ($waivedReason) { "$exposureReason; $waivedReason" } else { $exposureReason }) }
         }
     }
@@ -3244,6 +3266,8 @@ function Read-DvVisualCaptures {
         if ($v.verdict -ceq 'NOT_CAPTURED' -and $stripNote) { $block.reason = (@($v.reason, $reasonBeforeStrip, $stripNote) | Where-Object { $_ }) -join '; ' }
         elseif ($null -ne $v.reason -and -not ($v.verdict -ceq 'NOT_CAPTURED' -and $null -ne $block.reason)) { $block.reason = $(if ($notes) { "$($v.reason); $notes" } else { $v.reason }) }
         elseif ($null -eq $v.reason -and $crossCheckNote -and (-not $block.reason -or $block.reason -ceq $notJudgedNote)) { $block.reason = (@($notJudgedNote, $crossCheckNote) | Where-Object { $_ }) -join '; ' }   # no gate reason: the cross-check note stands beside the not-judged note
+        # an unusable exposure band file is always said in the reason, beside whatever note or verdict reason is already there (the first-wins rule above would drop it)
+        if ($exposureNote -and -not ([string]$block.reason).Contains($exposureNote)) { $block.reason = (@($block.reason, $exposureNote) | Where-Object { $_ }) -join '; ' }
         $block.verdict = $v.verdict; $block.counted = $v.counted
         $block
     }
@@ -3384,9 +3408,10 @@ function Read-DvVisualCaptures {
     $measured = @($play | Where-Object { $null -ne $_.exposureLumaMean })
     if ($measured.Count -gt 0) {
         $block.exposureFrames = $measured.Count
-        $block.exposureMedianLuma = [math]::Round((Get-DvMedian ([double[]]@($measured | ForEach-Object { [double]$_.exposureLumaMean }))), 3)
-        $block.exposureMedianNearBlackFraction = [math]::Round((Get-DvMedian ([double[]]@($measured | ForEach-Object { [double]$_.exposureNearBlackFraction }))), 4)
-        $block.exposureMedianClippedFraction = [math]::Round((Get-DvMedian ([double[]]@($measured | ForEach-Object { [double]$_.exposureClippedFraction }))), 4)
+        # (unrounded: the verdict compares these to the band's caps; the reason text rounds for display)
+        $block.exposureMedianLuma = Get-DvExposureMedian ([double[]]@($measured | ForEach-Object { [double]$_.exposureLumaMean }))
+        $block.exposureMedianNearBlackFraction = Get-DvExposureMedian ([double[]]@($measured | ForEach-Object { [double]$_.exposureNearBlackFraction }))
+        $block.exposureMedianClippedFraction = Get-DvExposureMedian ([double[]]@($measured | ForEach-Object { [double]$_.exposureClippedFraction }))
         $bandInfo = Get-DvExposureBand -ClipId $ClipId -Path $ExposureBandPath
         $block.exposureBand = $bandInfo.band; $block.exposureBandSource = $bandInfo.source; $block.exposureBandNote = $bandInfo.note
         if ($bandInfo.note) {
@@ -3455,7 +3480,7 @@ function Read-DvVisualCaptures {
             -AppDistinctDisplayFrames ([int]$block.appDistinctDisplayFrames) -FlatPlayFrames ([int]$block.flatPlayFrames) -PlayVsPausedMeanAbsDiff $block.playVsPausedMeanAbsDiff -SamePosition ([bool]$block.samePosition) `
             -SourceDifference ([string]$block.sourceDifference) -ViewportUnavailablePlayFrames ([int]$block.viewportUnavailablePlayFrames) -LabelBound $block.labelBound `
             -PausedLabelBound $block.pausedLabelBound -ObserverPaintedPlayFrames ([int]$block.observerPaintedPlayFrames) -RepeatedPlayFrames ([int]$block.repeatedPlayFramesSourceDiffer) @exArgs
-        $head ="$Header  visual=$($v.verdict)  distinct=$($block.distinctContentHashes)/$($block.playFrames)  play-vs-paused=$($block.playVsPausedMeanAbsDiff)$(if ($null -ne $block.exposureMedianLuma) { "  luma=$($block.exposureMedianLuma)  near-black=$($block.exposureMedianNearBlackFraction)  clipped=$($block.exposureMedianClippedFraction)" })"
+        $head ="$Header  visual=$($v.verdict)  distinct=$($block.distinctContentHashes)/$($block.playFrames)  play-vs-paused=$($block.playVsPausedMeanAbsDiff)$(if ($null -ne $block.exposureMedianLuma) { "  luma=$([math]::Round([double]$block.exposureMedianLuma, 2))  near-black=$([math]::Round([double]$block.exposureMedianNearBlackFraction, 4))  clipped=$([math]::Round([double]$block.exposureMedianClippedFraction, 4))" })"
         try {
             $block.stripPath = New-DvVisualStrip -Tiles $tiles -OutPath (Join-Path $dir "$LegId-strip.png") -Header $head.Trim()
             $block.stripSha256 = Get-DvSha256OfFile $block.stripPath
@@ -4640,7 +4665,7 @@ function Write-DvReceipt {
 
 Export-ModuleMember -Function Get-DvOutcomeEnum, ConvertTo-DvCanonicalJson, Get-DvSha256OfBytes, Get-DvSha256OfText, Get-DvSha256OfFile,
     ConvertTo-DvLfBytes, Get-DvLegSpecSha256, Get-DvDerivedBackend, Get-DvBackendNotDerivable, Read-DvContactFrames, Get-DvLegSpecShapeRefusal, Get-DvPngImageProblem, Get-DvPairedSeekVerdict, Get-DvSubjectDigest,
-    Get-DvVisualViewportPixels, Get-DvVisualMeanAbsDiff, Get-DvMedian, Get-DvVisualExposureStats, Get-DvExposureBand, Get-DvVisualVerdict, Get-DvVisualSourceDifference, Get-DvFrameNumber, New-DvVisualStrip, Read-DvVisualCaptures, Get-DvVisualCaptureRequest, Read-DvVenueTable, ConvertFrom-DvVenueTableText, Get-DvVenueRole, Get-DvProp, Get-DvCommittedFile, Resolve-DvAdmissionSources,
+    Get-DvVisualViewportPixels, Get-DvVisualMeanAbsDiff, Get-DvExposureMedian, Get-DvVisualExposureStats, Get-DvExposureBand, Get-DvVisualVerdict, Get-DvVisualSourceDifference, Get-DvFrameNumber, New-DvVisualStrip, Read-DvVisualCaptures, Get-DvVisualCaptureRequest, Read-DvVenueTable, ConvertFrom-DvVenueTableText, Get-DvVenueRole, Get-DvProp, Get-DvCommittedFile, Resolve-DvAdmissionSources,
     Test-DvUnderClaudeState, Test-DvLocalReceiptRoot, Read-DvClipConsent, Get-DvClipAdmission, Get-DvSmokeSummaryFields, Get-DvConformPaceProof, Get-DvConformArmVerdict, Get-DvMinPlaySeconds, Get-DvPlaybackProblems,
     Get-DvPlaybackEvidence, Get-DvScaleEvidence, Get-DvScaleLabel, Get-DvDisplayEvidence, Get-DvUnpacedEvidence, Get-DvLookLabelEvidence, Get-DvWorkerThreadsEvidence, Get-DvPrepConflatedMoveEvidence, Get-DvLookAssistEvidence, Get-DvLegSetPlan, Get-DvSmokeSessionLineFields, Get-DvSmokeSessionLineRead, Get-DvLogRecordBody, Get-DvMatrixRates, Get-DvMatrixRow, Get-DvMedian, ConvertTo-DvMatrixTable, Get-DvBlobById, Find-DvCommittedLegSpec, Read-DvCommittedLookReceipt, Read-DvEvidenceSet, Test-DvJsonEquivalent, Test-DvReceiptValid, Get-DvJobNotAfter, Get-DvUmRunNotAfterArgs, Get-DvUmRunDropVisibleUtc, Get-DvUmRunDropNotAfter, Test-DvNotAfterCoversDrop, Get-DvHealthVerdict,
     New-DvHealthProbeJobText, ConvertFrom-DvProbeStdout,

@@ -9178,6 +9178,11 @@ class VisualExposureFloorTests(unittest.TestCase):
     def luma(r: int, g: int, b: int) -> float:
         return 0.2126 * r + 0.7152 * g + 0.0722 * b
 
+    @staticmethod
+    def shown(value: float) -> str:
+        """How the verdict reason prints a number: rounded to 6 places, trailing zeros dropped (the PowerShell '0.######')."""
+        return ("%.6f" % value).rstrip("0").rstrip(".")
+
     def rgb(self, pixel) -> str:
         """A W x H frame as base64 packed R,G,B; pixel(x, y, i) -> (r, g, b)."""
         import base64
@@ -9219,7 +9224,8 @@ class VisualExposureFloorTests(unittest.TestCase):
 
     def test_the_visual_exposure_numbers_drop_letterbox_rows_and_read_black_and_clipped_frames(self) -> None:
         bars = self.exposure(self.rgb(lambda x, y, i: (0, 0, 0) if y < 4 or y >= self.H - 4 else (128, 128, 128)))["stats"]
-        self.assertEqual((bars["lumaMean"], bars["nearBlackFraction"], bars["clippedFraction"], bars["letterboxRowsDropped"]), (128.0, 0, 0, 8))
+        self.assertAlmostEqual(bars["lumaMean"], 128.0, places=6)
+        self.assertEqual((bars["nearBlackFraction"], bars["clippedFraction"], bars["letterboxRowsDropped"]), (0, 0, 8))
         # a row whose full-width mean is 2 or more is picture (a dark one), not a bar
         dim = self.exposure(self.rgb(lambda x, y, i: (3, 3, 3) if y < 4 else (128, 128, 128)))["stats"]
         self.assertEqual(dim["letterboxRowsDropped"], 0)
@@ -9227,7 +9233,8 @@ class VisualExposureFloorTests(unittest.TestCase):
         black = self.exposure(self.rgb(lambda x, y, i: (0, 0, 0)))["stats"]
         self.assertEqual((black["lumaMean"], black["nearBlackFraction"], black["clippedFraction"], black["letterboxRowsDropped"]), (0, 1, 0, 0))
         white = self.exposure(self.rgb(lambda x, y, i: (250, 250, 250)))["stats"]
-        self.assertEqual((white["lumaMean"], white["nearBlackFraction"], white["clippedFraction"]), (250.0, 0, 1))
+        self.assertAlmostEqual(white["lumaMean"], 250.0, places=6)
+        self.assertEqual((white["nearBlackFraction"], white["clippedFraction"]), (0, 1))
 
     def test_the_visual_exposure_numbers_of_a_mis_sized_frame_are_null(self) -> None:
         proc, out = run_pwsh_json("[byte[]]$b = 1..30; $r = Get-DvVisualExposureStats -Rgb $b -Width 64 -Height 36; ConvertTo-Json -Compress -InputObject $r")
@@ -9242,7 +9249,7 @@ class VisualExposureFloorTests(unittest.TestCase):
             self.assertEqual((v["verdict"], v["counted"]), ("EXPOSURE_OUT_OF_RANGE", True), v["reason"])
             s = out["stats"]
             # the reason quotes the three numbers and the band limits they broke
-            for text in (f"median luma {s['lumaMean']:g}", f"near-black fraction {s['nearBlackFraction']:g}", f"clipped fraction {s['clippedFraction']:g}",
+            for text in (f"median luma {self.shown(s['lumaMean'])}", f"near-black fraction {self.shown(s['nearBlackFraction'])}", f"clipped fraction {self.shown(s['clippedFraction'])}",
                          "band luma 16..255", "near-black <= 0.6", "clipped <= 0.05", "is under the band minimum 16", "is over the band maximum 0.6"):
                 self.assertIn(text, v["reason"])
             self.assertNotIn("clipped fraction 0 is over", v["reason"])
@@ -9368,6 +9375,95 @@ class VisualExposureFloorTests(unittest.TestCase):
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         self.assertEqual((out["source"], out["note"]), ("fallback-no-row", None))
 
+    def test_the_visual_exposure_work_leaves_the_matrix_median_alone(self) -> None:
+        # adversary dfb973a0 A1: a second Get-DvMedian (double[] parameter) shadowed the matrix table's, which skips missing values, so a missing timing read as 0
+        source = (DV / "DualVenueRunner.psm1").read_text(encoding="utf-8")
+        self.assertEqual(source.count("function Get-DvMedian {"), 1, "the exposure median has its own name (Get-DvExposureMedian)")
+        proc, out = run_pwsh_json("[pscustomobject]@{ a = Get-DvMedian @($null, 20); b = Get-DvMedian @($null, $null); c = Get-DvMedian @(10, 30, $null) "
+                                  "; d = Get-DvExposureMedian ([double[]]@(10, 30, 20, 40)) } | ConvertTo-Json -Compress")
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertEqual(out, {"a": 20, "b": None, "c": 20, "d": 25})
+
+    def test_the_visual_exposure_band_file_is_parsed_strictly(self) -> None:
+        # adversary dfb973a0 A2 / A6: ConvertFrom-Json unwraps a one-element array root and refuses keys that differ only in case
+        fallback = {"minMedianLuma": 16, "maxMedianLuma": 255, "maxNearBlackFraction": 0.6, "maxClippedFraction": 0.05}
+        rows = [  # file text, clip asked, expected source, expected minMedianLuma
+            ('[{"clips": {"c": {"minMedianLuma": 0, "maxNearBlackFraction": 1}}}]', "c", "fallback-malformed", 16),
+            ('[[{"clips": {"c": {"minMedianLuma": 4}}}]]', "c", "fallback-malformed", 16),
+            ('{"clips": {"c": {"minMedianLuma": 4}, "C": {"minMedianLuma": 20}}}', "c", "clip", 4),
+            ('{"clips": {"c": {"minMedianLuma": 4}, "C": {"minMedianLuma": 20}}}', "C", "clip", 20),
+            ('{"clips": {"c": {"minMedianLuma": 4}, "C": {"minMedianLuma": 20}}}', "cc", "fallback-no-row", 16),
+            ('{"clips": {"c": {"minMedianLuma": 4}, "c": {"minMedianLuma": 5}}}', "c", "fallback-malformed", 16),
+            ('{"clips": {"c": {"minMedianLuma": 4, "minMedianLuma": 5}}}', "c", "fallback-malformed", 16),
+            ('{"clips": {}, "clips": {"c": {"minMedianLuma": 4}}}', "c", "fallback-malformed", 16),
+            ('{"clips": {"c": {"minMedianLuma": 4}},}', "c", "fallback-malformed", 16),
+            ('{"clips": {"c": {"minMedianLuma": 4}}} trailing', "c", "fallback-malformed", 16),
+            ('﻿{"clips": {"c": {"minMedianLuma": 4}}}', "c", "clip", 4),
+        ]
+        with tempfile.TemporaryDirectory(prefix="vis-exp-band-") as d:
+            for n, (text, clip, source, minimum) in enumerate(rows):
+                with self.subTest(text=text, clip=clip):
+                    path = Path(d) / f"strict-{n}.json"
+                    path.write_text(text, encoding="utf-8")
+                    proc, out = run_pwsh_json(f"Get-DvExposureBand -ClipId '{clip}' -Path '{path}' | ConvertTo-Json -Depth 4 -Compress")
+                    self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+                    self.assertEqual((out["source"], out["band"]["minMedianLuma"]), (source, minimum), out)
+                    self.assertEqual(out["note"] is not None, source == "fallback-malformed")
+                    if source != "clip":
+                        self.assertEqual(out["band"], fallback)
+            # the relaxed band of the unwrapped array would have passed the under-exposed frame; the fallback must flag it
+            path = Path(d) / "strict-0.json"
+            self.assertEqual(self.exposure(self.underexposed(), str(path))["verdict"]["verdict"], "EXPOSURE_OUT_OF_RANGE")
+            both = Path(d) / "strict-3.json"
+            self.assertEqual(self.exposure(self.underexposed(), str(both), clip="c")["verdict"]["verdict"], "EXPOSURE_OUT_OF_RANGE", "c's row (min 4) still holds near-black 0.84 over the 0.6 fallback cap")
+
+    def test_the_visual_exposure_numbers_are_compared_unrounded(self) -> None:
+        # adversary dfb973a0 A3: one clipped pixel in 2304 is 0.000434; rounded to 4 places it read 0.0004 and passed a cap of 0.00042
+        one = self.rgb(lambda x, y, i: (255, 255, 255) if i == 0 else (100, 100, 100))
+        with tempfile.TemporaryDirectory(prefix="vis-exp-band-") as d:
+            path = Path(d) / "bands.json"
+            path.write_text('{"clips": {"c": {"maxClippedFraction": 0.00042}}}', encoding="utf-8")
+            out = self.exposure(one, str(path))
+            self.assertAlmostEqual(out["stats"]["clippedFraction"], 1 / 2304, places=12)
+            self.assertEqual(out["verdict"]["verdict"], "EXPOSURE_OUT_OF_RANGE", out["verdict"]["reason"])
+            self.assertIn("clipped fraction 0.000434 is over the band maximum 0.00042", out["verdict"]["reason"])
+            path.write_text('{"clips": {"c": {"maxClippedFraction": 0.00044}}}', encoding="utf-8")
+            self.assertEqual(self.exposure(one, str(path))["verdict"]["verdict"], "OK")
+
+    def test_the_visual_exposure_verdict_refuses_a_median_that_is_not_a_number(self) -> None:
+        for bad in ("[double]::NaN", "[double]::PositiveInfinity"):
+            with self.subTest(bad=bad):
+                proc, out = run_pwsh_json("$band = [pscustomobject]@{ minMedianLuma = 16.0; maxMedianLuma = 255.0; maxNearBlackFraction = 0.6; maxClippedFraction = 0.05 }; "
+                                          "Get-DvVisualVerdict -Requested $true -Captured $true -PlayFrames 6 -DistinctContentHashes 6 -AppDistinctDisplayFrames 6 -FlatPlayFrames 0 "
+                                          f"-PlayVsPausedMeanAbsDiff 1.0 -SamePosition $true -ExposureMedianLuma ({bad}) -ExposureMedianNearBlackFraction 0 -ExposureMedianClippedFraction 0 "
+                                          "-ExposureBand $band | ConvertTo-Json -Compress")
+                self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+                self.assertEqual(out["verdict"], "EXPOSURE_OUT_OF_RANGE", out["reason"])
+                self.assertIn("not a finite number", out["reason"])
+
+    @requires_windows_imaging
+    def test_the_visual_reader_says_an_unusable_band_file_beside_an_earlier_note(self) -> None:
+        # adversary dfb973a0 A5: `reason` keeps its first note, so the band-file warning of an OK leg was only in exposureBandNote
+        with tempfile.TemporaryDirectory(prefix="vis-exp-read-") as d:
+            write_visual_captures(Path(d) / "artifacts" / "visual", "partial-ok")
+            out = self.read(d, f"-ClipId 'unit-clip' -ExposureBandPath '{Path(d) / 'absent.json'}'")
+            self.assertEqual(out["verdict"], "OK", out["reason"])
+            self.assertIn("no usable viewport rectangle", out["reason"])
+            self.assertIn("exposure band file is missing", out["reason"])
+            self.assertIn("exposure band file is missing", out["exposureBandNote"])
+            clean = self.read(d, f"-ClipId 'unit-clip'")   # the committed file: valid, no note, the reason is what it always was
+            self.assertIsNone(clean["exposureBandNote"])
+            self.assertNotIn("exposure band", clean["reason"])
+
+    def test_the_visual_self_heal_gate_lets_a_pre_launch_carry_the_exposure_flag(self) -> None:
+        # adversary dfb973a0 A4: "never an exclusion" holds for a self-heal pre-launch too; every other non-OK verdict there still makes the leg INVALID
+        runner = (DV / "Invoke-VenueLeg.ps1").read_text(encoding="utf-8")
+        self.assertIn("elseif ([string]$entry.verdict -cne 'OK' -and [string]$entry.verdict -cne 'EXPOSURE_OUT_OF_RANGE') {", runner)
+        self.assertIn("EXPOSURE_OUT_OF_RANGE on self-heal pre-launch", runner)
+        self.assertEqual(runner.count("-cne 'EXPOSURE_OUT_OF_RANGE'"), 1)
+        doc = (ROOT / "docs" / "dual-venue-visual-capture.md").read_text(encoding="utf-8")
+        self.assertIn("a self-heal pre-launch may show it too", doc)
+
     def test_the_visual_leg_runner_passes_the_clip_and_surfaces_the_exposure_verdict(self) -> None:
         runner = (DV / "Invoke-VenueLeg.ps1").read_text(encoding="utf-8")
         calls = re.findall(r"Read-DvVisualCaptures -Requested \$true -ArtifactsDir[^\n]*\n[^\n]*\n", runner)
@@ -9437,8 +9533,8 @@ function New-DarkPng([string]$Path, [int]$Seed, [int]$Base) {
             self.assertEqual((out["verdict"], out["counted"]), ("EXPOSURE_OUT_OF_RANGE", True), out["reason"])
             self.assertLess(out["exposureMedianLuma"], 8)
             self.assertGreater(out["exposureMedianNearBlackFraction"], 0.9)
-            self.assertIn(f"median luma {out['exposureMedianLuma']:g}", out["reason"])
-            self.assertIn(f"near-black fraction {out['exposureMedianNearBlackFraction']:g}", out["reason"])
+            self.assertIn(f"median luma {self.shown(out['exposureMedianLuma'])}", out["reason"])
+            self.assertIn(f"near-black fraction {self.shown(out['exposureMedianNearBlackFraction'])}", out["reason"])
             self.assertIn("band luma 16..255", out["reason"])
             self.assertTrue((Path(d) / "evidence" / "visual" / "app-visual.json").is_file())
             self.assertTrue(Path(out["stripPath"]).is_file(), "the strip is composed")
