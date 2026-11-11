@@ -299,6 +299,11 @@ function Wait-QueueGate([string]$Name) {
 # comparable with \Processor(_Total)\% Processor Time (which the gate decides on). All v2 values are means over the samples that are VALID for that instance (see the gate header).
 $probeText = @'
 $ErrorActionPreference = 'Stop'
+# TEST SEAM (CI-FLAKE-VENUE-PROBE-GETOWNER-DEADLINE-1): $false in production; only a test rewrites this literal in its own copy of the job. When $true the job writes ONE stderr line
+# `VENUE_PROBE_INTERNAL_MS=<ms since this process started> script_ms=<ms since the script started> abandoned=<n>` just before it ends, so a test can compare the wall clock it saw
+# with the time the probe itself used and prove that nothing holds the process after the probe is done. Nothing on the host (no environment variable, no file) can set it.
+$ProbeTimingSeam = $false
+$script:ProbeSw = [Diagnostics.Stopwatch]::StartNew()
 $cpuCount = [Environment]::ProcessorCount
 $groups = [ordered]@{
     processor = @('\Processor(_Total)\% Processor Time', '\Processor(_Total)\% Privileged Time', '\Processor(_Total)\% User Time', '\Processor(_Total)\% DPC Time', '\Processor(_Total)\% Interrupt Time')
@@ -1186,6 +1191,7 @@ Write-Output ('VENUE_QUIET=' + ([ordered]@{
     identity = $identity
 } | ConvertTo-Json -Compress -Depth 6))
 # an abandoned worker may still be inside a native call, and a runspace thread is a foreground thread: end the process now that the line is written
+if ($ProbeTimingSeam) { [Console]::Error.WriteLine('VENUE_PROBE_INTERNAL_MS=' + [int64]([DateTime]::Now - [Diagnostics.Process]::GetCurrentProcess().StartTime).TotalMilliseconds + ' script_ms=' + [int64]$script:ProbeSw.ElapsedMilliseconds + ' abandoned=' + ($script:IdentAbandoned + $script:TelAbandoned)) }
 if ($script:IdentAbandoned -gt 0 -or $script:TelAbandoned -gt 0) { [Console]::Out.Flush(); [Environment]::Exit(0) }
 '@
 

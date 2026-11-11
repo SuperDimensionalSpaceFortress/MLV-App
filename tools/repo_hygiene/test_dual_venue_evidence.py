@@ -10677,6 +10677,7 @@ class VisualCaptureSpecAndAppSourceTests(unittest.TestCase):
 # Get-Counter / Get-Process / Get-CimInstance / Invoke-CimMethod shadows, so identity is proved on exact values, not on whatever the test host is running.
 import base64 as _ident_base64
 import datetime as _ident_dt
+import time as _ident_time
 
 IDENT_SCHEMA = "mlv-app/venue-quiet-probe-identity/v1"
 IDENT_T0 = _ident_dt.datetime(2026, 10, 24, 1, 2, 3, tzinfo=_ident_dt.timezone.utc)
@@ -10773,7 +10774,7 @@ class IdentityProbeMixin:
 
     def run_identity_probe(self, procs: list, cim: list, owners: dict | None = None, gpu: list | None = None, throw: bool = False, cpus: int = 4,
                            body: str | None = None, old_counter_shadow: bool = False, after_start_ft: dict | None = None,
-                           delays: dict | None = None, call_ms: int | None = None, tel: dict | None = None, env: dict | None = None) -> dict:
+                           delays: dict | None = None, call_ms: int | None = None, tel: dict | None = None, env: dict | None = None, timing: bool = False) -> dict:
         delays = delays or {}
         body = (_ident_probe_body() if body is None else body).replace("[Environment]::ProcessorCount", str(cpus)).replace("Start-Sleep -Seconds 12", "Start-Sleep -Seconds 0")
         if call_ms is not None:
@@ -10808,9 +10809,17 @@ class IdentityProbeMixin:
         worker_b64 = _ident_base64.b64encode((cim_prelude + worker_counter).encode("utf-8")).decode("ascii")
         body = body.replace("$IdentityWorkerPrelude = ''", f"$IdentityWorkerPrelude = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('{worker_b64}'))")
         body = _tel_hermetic(body, self.tmp, tel)   # VENUE-PROBE-HEAT-GPU-TELEMETRY-1: the heat feed, dGPU and agent log are canned too, never the test host's
+        if timing:   # CI-FLAKE-VENUE-PROBE-GETOWNER-DEADLINE-1: the probe reports its own elapsed time on stderr (the seam is $false in production)
+            self.assertEqual(body.count("$ProbeTimingSeam = $false"), 1)
+            body = body.replace("$ProbeTimingSeam = $false", "$ProbeTimingSeam = $true")
         job = self.tmp / "identity-probe-job.ps1"
         job.write_text(prelude + body, encoding="utf-8")
+        wall_started = _ident_time.monotonic()
         proc = _ident_run_reaped([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-File", str(job)], timeout=240, env=env)
+        self.last_wall_s = _ident_time.monotonic() - wall_started
+        self.last_stderr = proc.stderr
+        m = re.search(r"VENUE_PROBE_INTERNAL_MS=(\d+) script_ms=(\d+) abandoned=(\d+)", proc.stderr)
+        self.last_timing = {"since_process_start_ms": int(m.group(1)), "script_ms": int(m.group(2)), "abandoned": int(m.group(3))} if m else None
         lines = [ln for ln in proc.stdout.splitlines() if ln.startswith("VENUE_QUIET=")]
         self.assertEqual(len(lines), 1, proc.stdout + proc.stderr)
         self.last_line = lines[0][len("VENUE_QUIET="):]   # the line exactly as the gate retains it (Wait-VenueQuiet.ps1 RAW RETENTION)
@@ -11483,8 +11492,13 @@ class VenueProbeIdentityRedactionR2Tests(IdentityProbeMixin, unittest.TestCase):
 # timeout). The forced-slow call is an UNINTERRUPTIBLE .NET sleep in the shadow (what a hung native call looks like), not an already-expired budget.
 @requires_windows_pwsh
 class VenueProbeIdentityCallDeadlineTests(IdentityProbeMixin, unittest.TestCase):
-    DELAY_MS = 20000
+    # CI-FLAKE-VENUE-PROBE-GETOWNER-DEADLINE-1: the slow call sleeps far longer than any wall a loaded host can need for the whole probe. The abandoned worker dies with the process, so a
+    # probe that bounds the call ends in seconds whatever the delay is; a probe that waited for it would need DELAY_MS. At 20 s the old limit (18 s) sat INSIDE what a starved runner
+    # needs for the probe alone (measured 28-30 s of pure load, no wait at all, with 40 busy processes on 16 cores), so the assertion could not tell load from a wait.
+    DELAY_MS = 120000
     CALL_MS = 1500
+    WALL_LIMIT_S = 60.0       # about twice the worst load-only wall measured; half the delay
+    EXIT_HOLD_LIMIT_S = 15.0  # wall minus the probe's own time since its process started: spawn + exit only (measured <= 1.5 s under the same load)
 
     def setUp(self) -> None:
         tmp = tempfile.TemporaryDirectory(prefix="venue-probe-deadline-")
@@ -11502,14 +11516,29 @@ class VenueProbeIdentityCallDeadlineTests(IdentityProbeMixin, unittest.TestCase)
     def slow(self, which: str) -> tuple:
         import time
         started = time.monotonic()
-        p = self.run_identity_probe(self.procs, self.cim, CHAIN_OWNERS, gpu=[(16892, 0, 40.0)], delays={which: self.DELAY_MS}, call_ms=self.CALL_MS)
+        p = self.run_identity_probe(self.procs, self.cim, CHAIN_OWNERS, gpu=[(16892, 0, 40.0)], delays={which: self.DELAY_MS}, call_ms=self.CALL_MS, timing=True)
         return p, time.monotonic() - started
 
     def assert_measurement_unchanged(self, p: dict, elapsed: float) -> None:
+        # the timing of the SLOW run is read first: reference() runs another probe, which replaces last_timing / last_wall_s
+        self.assertLess(elapsed, self.WALL_LIMIT_S, f"the probe waited for the slow call instead of bounding it ({elapsed:.1f} s; {self.timing_text()})")
+        self.assert_no_exit_hold()
         ref = self.reference()
         for k, v in ref.items():
             self.assertEqual(p[k], v, f"{k} changed because an identity call was slow")
-        self.assertLess(elapsed, self.DELAY_MS / 1000.0 - 2, f"the probe waited for the slow call instead of bounding it ({elapsed:.1f} s)")
+
+    def timing_text(self) -> str:
+        t = self.last_timing
+        return "no VENUE_PROBE_INTERNAL_MS line on stderr" if t is None else f"probe process {t['since_process_start_ms'] / 1000.0:.1f} s, script {t['script_ms'] / 1000.0:.1f} s, {t['abandoned']} call(s) abandoned"
+
+    def assert_no_exit_hold(self) -> None:
+        """The probe's own stopwatch against the wall clock the test saw: whatever the probe did before it ended, nothing may hold the PROCESS afterwards (an abandoned worker's
+        runspace must not keep it alive)."""
+        t = self.last_timing
+        self.assertIsNotNone(t, "the timing seam printed nothing: " + self.last_stderr)
+        self.assertGreaterEqual(t["abandoned"], 1, "the slow call was not abandoned, so this case proves nothing")
+        gap = self.last_wall_s - t["since_process_start_ms"] / 1000.0
+        self.assertLess(gap, self.EXIT_HOLD_LIMIT_S, f"the process outlived the probe by {gap:.1f} s: an abandoned call held the exit ({self.timing_text()}, wall {self.last_wall_s:.1f} s)")
 
     def test_a_slow_gpu_read_times_out_into_a_status_and_the_rest_of_identity_is_still_filled(self) -> None:
         p, elapsed = self.slow("gpu")
@@ -11531,6 +11560,15 @@ class VenueProbeIdentityCallDeadlineTests(IdentityProbeMixin, unittest.TestCase)
         self.assertEqual(set(p["identity"]), {"schema", "error"}, p["identity"])
         self.assertIn("timed out", p["identity"]["error"])
         self.assert_measurement_unchanged(p, elapsed)
+
+    def test_the_timing_seam_is_off_in_production_and_prints_nothing_unless_a_test_rewrites_it(self) -> None:
+        body = _ident_probe_body()
+        self.assertEqual(body.count("$ProbeTimingSeam = $false"), 1)
+        self.assertEqual(len(re.findall(r"(?m)^\$ProbeTimingSeam = ", body)), 1, "one assignment: nothing on the host can switch it on")
+        self.assertNotIn("$env:", body[body.index("$ProbeTimingSeam"):body.index("$ProbeTimingSeam") + 400])
+        self.run_identity_probe(self.procs, self.cim, CHAIN_OWNERS)
+        self.assertIsNone(self.last_timing)
+        self.assertNotIn("VENUE_PROBE_INTERNAL_MS", self.last_stderr)
 
     def test_the_call_deadline_is_a_pinned_literal_inside_the_identity_budget_arithmetic(self) -> None:
         body = _ident_probe_body()
