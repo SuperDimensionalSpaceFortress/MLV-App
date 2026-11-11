@@ -4765,7 +4765,7 @@ def test_r9_a2_a_posix_put_aside_never_replaces_a_destination_created_after_the_
     work, other = tmp_path / "work", tmp_path / "work.rm-0000000000000000"
     work.mkdir()
     monkeypatch.setattr(ob, "os", PosixOs())
-    with pytest.raises(OSError):
+    with pytest.raises((OSError, ob._NoAtomicRename)):                   # r10: no atomic no-replace rename off Linux: refused, not replaced
         ob._rename_verified(work, other, ob._file_id(work))
     assert work.exists(), "the pinned directory was moved onto a destination another process created"
 
@@ -4792,7 +4792,12 @@ def test_r9_a3_a_root_that_resolves_to_a_trailing_dot_name_is_refused_before_any
 # yet the tree was reported killed. A3 (major) a reserved DOS device name (`NUL`, `con.txt`) as a root component lost its
 # extended-length prefix and addressed the device.
 
-def test_r9b_a1_a_posix_failure_cleanup_never_removes_a_directory_put_in_place_of_its_claim(tmp_path, monkeypatch):
+# Adversary pass r10 on bc264d25: A1/A2 (major) the mkdir-claim fallback of the POSIX put-aside could still replace or remove an
+# unrelated directory, or leak its claim when its own lstat failed. Narrowed, not hardened: the fallback is DELETED. Without a
+# kernel no-replace rename the scratch is not put aside at all. A3 (major) the reserved-name set missed COM/LPT with a superscript
+# digit, CONIN$ and CONOUT$.
+
+def _posix_without_noreplace(monkeypatch, record):
     real_os = os
 
     class PosixOs:
@@ -4801,17 +4806,58 @@ def test_r9b_a1_a_posix_failure_cleanup_never_removes_a_directory_put_in_place_o
         def __getattr__(self, item):
             return getattr(real_os, item)
 
-        def rename(self, src, dst):                                      # a concurrent writer swaps the claim for its own directory,
-            real_os.rename(dst, os.fspath(dst) + ".aside")               # then the rename is denied
-            real_os.mkdir(dst)
-            raise PermissionError(13, "denied", dst)
+        def mkdir(self, path, *a, **k):                                  # the deleted fallback made a claim directory here
+            record.append(("mkdir", os.fspath(path)))
+            return real_os.mkdir(path, *a, **k)
 
+        def rmdir(self, path, *a, **k):
+            record.append(("rmdir", os.fspath(path)))
+            return real_os.rmdir(path, *a, **k)
+
+        def rename(self, src, dst):
+            record.append(("rename", os.fspath(src), os.fspath(dst)))
+            return real_os.rename(src, dst)
+
+    monkeypatch.setattr(ob, "os", PosixOs())
+    monkeypatch.setattr(ob, "_rename_noreplace", lambda src, dst: False)
+
+
+def test_r10_a1_without_a_kernel_no_replace_rename_the_put_aside_makes_no_claim_and_moves_nothing(tmp_path, monkeypatch):
+    record: list = []
     work, other = tmp_path / "work", tmp_path / "work.rm-0000000000000001"
     work.mkdir()
-    monkeypatch.setattr(ob, "os", PosixOs())
-    with pytest.raises(PermissionError):
+    _posix_without_noreplace(monkeypatch, record)
+    with pytest.raises(ob._NoAtomicRename):
         ob._rename_verified(work, other, ob._file_id(work))
-    assert other.exists(), "the cleanup removed a directory that is not the claim it made"
+    assert work.exists() and not os.path.lexists(other), "the scratch was moved, or a claim directory was left"
+    assert not record, f"a claim, rename or removal was attempted: {record}"
+
+
+def test_r10_a2_sibling_a_removal_without_a_no_replace_rename_leaves_the_scratch_under_its_name_as_the_typed_outcome(tmp_path, monkeypatch):
+    record: list = []
+    bus = tmp_path / "bus"
+    (bus / ".git").mkdir(parents=True)
+    base = Path(ob.tempfile.mkdtemp(prefix=ob.ROUTE_SCRATCH_PREFIX, dir=str(tmp_path)))
+    ob._SCRATCH_PINS[ob._scratch_key(base)] = (ob._file_id(tmp_path, True), ob._file_id(base))
+    ob._SCRATCH_ROOTS[ob._scratch_key(base)] = str(tmp_path)
+    (base / "f.txt").write_text("keep", encoding="utf-8")
+    _posix_without_noreplace(monkeypatch, record)
+    with pytest.raises(ob.Unknown) as caught:
+        ob.remove_exercise_scratch(base, tmp_path)
+    assert caught.value.code == "EXERCISE_SCRATCH_NOT_REMOVED", caught.value
+    assert (base / "f.txt").read_text(encoding="utf-8") == "keep", "contents were removed although the scratch was not put aside"
+    assert not [p for p in tmp_path.iterdir() if ".rm-" in p.name], "a private name or claim directory was left behind"
+    assert not record, record
+
+
+@pytest.mark.parametrize("name", ["COM\u00b9", "LPT\u00b2.txt", "com\u00b3", "CONIN$", "CONOUT$", "NUL:stream", "NUL", "con.txt", "Lpt1"])
+def test_r10_a3_the_ambiguity_check_names_every_reserved_device_name(name):
+    assert ob._ambiguous_parts("C:\\scratch\\" + name), f"{name!r} was taken for an ordinary directory name"
+
+
+@pytest.mark.parametrize("name", ["scratch", "COM10", "COMX", "console", "C:", "CONIN", "bus-1"])
+def test_r10_a3_sibling_the_ambiguity_check_leaves_ordinary_names_alone(name):
+    assert not ob._ambiguous_parts("C:\\scratch\\" + name), f"{name!r} was refused"
 
 
 @pytest.mark.skipif(os.name != "nt", reason="the taskkill fallback is the Windows no-Job-Object path")
@@ -4840,7 +4886,7 @@ def test_r9b_a2_a_taskkill_that_confirms_nothing_is_an_unconfirmed_tree(monkeypa
 
 
 @pytest.mark.skipif(os.name != "nt", reason="reserved DOS device names are a Windows path rule")
-@pytest.mark.parametrize("name", ["NUL", "con.txt", "Lpt1"])
+@pytest.mark.parametrize("name", ["NUL", "con.txt", "Lpt1", "COM¹", "LPT².txt", "CONIN$", "CONOUT$"])
 def test_r9b_a3_real_keeps_the_extended_prefix_for_a_reserved_device_name_and_the_root_is_refused(tmp_path, name):
     literal = "\\\\?\\" + str(tmp_path / name)
     os.mkdir(literal)

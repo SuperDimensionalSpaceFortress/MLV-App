@@ -4072,7 +4072,8 @@ def _scratch_key(base: pathlib.Path) -> str:
     return os.path.abspath(base)                                        # exact, never case-folded (r7 4ebdeffd A2 sibling)
 
 
-_DEVICE_NAMES = frozenset({"CON", "PRN", "AUX", "NUL", *(f"COM{n}" for n in range(1, 10)), *(f"LPT{n}" for n in range(1, 10))})
+_DEVICE_NAMES = frozenset({"CON", "PRN", "AUX", "NUL", "CONIN$", "CONOUT$",           # ntpath.isreserved's set (r10 A3), written out
+                           *(f"COM{n}" for n in "123456789¹²³"), *(f"LPT{n}" for n in "123456789¹²³")})
 
 
 def _ambiguous_parts(path: str) -> bool:
@@ -4082,7 +4083,7 @@ def _ambiguous_parts(path: str) -> bool:
     for part in path.split("\\"):
         if part in (".", ".."):
             continue
-        if part.endswith((".", " ")) or part.split(".")[0].rstrip(" ").upper() in _DEVICE_NAMES:
+        if part.endswith((".", " ")) or part.partition(":")[0].split(".")[0].rstrip(" ").upper() in _DEVICE_NAMES:
             return True
     return False
 
@@ -4147,6 +4148,11 @@ def _pin_scratch(base: pathlib.Path, scratch_root: str | os.PathLike) -> None:
     except (OSError, ValueError):
         pass                                                            # unreadable: (None, None), never completed from
     _SCRATCH_PINS[_scratch_key(base)] = pin
+
+
+class _NoAtomicRename(Exception):
+    """No kernel rename that refuses an existing destination exists here (not Linux, or no renameat2), so the scratch is not put
+    aside: nothing was moved, and the removal ends as the typed EXERCISE_SCRATCH_NOT_REMOVED."""
 
 
 class _NotOurs(Exception):
@@ -4285,7 +4291,7 @@ def _remove_pinned_scratch(base: pathlib.Path, root: pathlib.Path, root_id: tupl
                         raise _NotOurs(f"what holds {target} now is not known to be it")
                     _rename_verified(target, work, work_id)             # by handle: verified and moved as ONE object (r7 A1)
                 target, put = work, f"it was put back under {work}"
-            except (OSError, _NotOurs) as e:
+            except (OSError, _NotOurs, _NoAtomicRename) as e:
                 put = f"nothing was moved back: it is left under {target} ({e})"
         else:
             put = f"it is left under {work}"
@@ -4296,6 +4302,8 @@ def _remove_pinned_scratch(base: pathlib.Path, root: pathlib.Path, root_id: tupl
             outcome = attempt()
         except RecursionError:                                         # deeper than the walk can hold open: refused, nothing more removed
             raise refuse("it is nested too deeply to walk with every directory held") from None
+        except _NoAtomicRename as unsupported:                          # nothing was moved: left under its own name, typed, not retried
+            raise refuse(f"{unsupported}") from None
         except _NotOurs as swapped:
             raise refuse(f"{swapped}: a link, a junction or another directory took its name during the removal") from None
         except OSError as e:                                            # held (sharing violation 13/32) or unreadable: retried
@@ -4482,8 +4490,8 @@ def _rename_verified(src: pathlib.Path, dst: pathlib.Path, ident: tuple[int, int
     """Rename `src` to `dst`, a name in the SAME directory, only when what is renamed is the real directory pinned as `ident`
     (adversary r7 A1). Windows: `src` is opened (no link followed) for DELETE, its identity is read on THAT handle (os.fstat: the
     same (st_dev, st_ino) os.lstat gives) and that very handle is renamed (FileRenameInfo, never replacing), so no name lookup
-    stands between the check and the rename. Another object is _NotOurs, nothing moved. Elsewhere: lstat, then a rename by name
-    (the documented POSIX limit: no handle)."""
+    stands between the check and the rename. Another object is _NotOurs, nothing moved. Linux: lstat, then renameat2 with
+    RENAME_NOREPLACE by name (the documented POSIX limit: no handle). Any other POSIX platform: _NoAtomicRename, nothing moved."""
     if ident is None:
         raise _NotOurs(f"{src} has no pinned identity to verify")
     if os.name != "nt":
@@ -4492,23 +4500,12 @@ def _rename_verified(src: pathlib.Path, dst: pathlib.Path, ident: tuple[int, int
             raise _NotOurs(f"{src} is not the scratch directory pinned for it")
         if os.path.lexists(dst):                                        # rename(2) replaces an empty directory silently (r8 A2):
             raise FileExistsError(17, "the destination already exists", os.fspath(dst))   # retried under a fresh name
-        # A name taken between that check and the rename would still be replaced (r9 A2), so the name is CLAIMED atomically first:
-        # mkdir fails when anything holds it (FileExistsError, retried under a fresh name), and what rename then replaces is the
-        # empty directory this call just made. Removing that claim again when the rename fails leaves nothing behind.
-        if _rename_noreplace(src, dst):                                 # the kernel refuses an existing destination (r9 A1): no claim needed
-            return
-        _meta(os.mkdir, dst)
-        claim = _ident(_meta(os.lstat, dst))
-        try:
-            _meta(os.rename, src, dst)
-        except BaseException:
-            try:                                                        # only the claim THIS call made: never a directory put there since
-                if _ident(os.lstat(dst)) == claim:
-                    os.rmdir(dst)
-            except OSError:
-                pass
-            raise
-        return
+        # Only a rename the KERNEL refuses to make onto an existing name is used (renameat2 RENAME_NOREPLACE): a name taken between
+        # the check above and a plain rename(2) would be replaced silently (r9 A2). Where there is none (not Linux, or no
+        # renameat2) the scratch is NOT put aside and stays under its own name as the typed EXERCISE_SCRATCH_NOT_REMOVED. The
+        # mkdir-claim fallback that stood in for it was itself racy (r10 A1/A2) and is deleted: the named flake is Windows.
+        if not _rename_noreplace(src, dst):
+            raise _NoAtomicRename(f"this platform has no atomic no-replace rename to put {src} aside with")
     import ctypes
     import msvcrt
     import struct
