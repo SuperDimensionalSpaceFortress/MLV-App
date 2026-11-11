@@ -2982,7 +2982,12 @@ function Get-DvJsonRepeatedKey($Element) {
     $null
 }
 
-function ConvertTo-DvExposureLimit($Element, [double]$Min, [double]$Max) {
+function ConvertTo-DvExposureLimit($Element, [double]$Min, [double]$Max, [int]$MaxPlaces = 6) {
+    # -MaxPlaces: the most decimal places a limit may carry (r3, adversary c9ac4917 A1/A2). A measurement is a ratio of whole numbers (pixel counts over at most
+    # 64 x 36 = 2304 pixels, a luma sum over 10000ths of that, medians of two such): it is a double rounded from that ratio, so a limit finer than the
+    # measurement can resolve (0.00043402777777777775 against 1/2304, 100.00043402777777 against a luma mean) rounds to the SAME double as an outside
+    # measurement and reads in band. A limit of at most 6 places (fractions) or 4 (luma) differs from every possible measurement by far more than a double's
+    # rounding (>= 2.2e-10 and >= 2.2e-12 against errors under 1e-13), so a tie in doubles is a tie in the numbers. Finer is refused, never rounded.
     # a System.Text.Json element that is a real JSON number inside [Min, Max] -> that double; anything else (a string "16", a bool, null, out of range) -> $null
     if ($Element.ValueKind -ne [System.Text.Json.JsonValueKind]::Number) { return $null }
     $d = 0.0
@@ -2992,7 +2997,11 @@ function ConvertTo-DvExposureLimit($Element, [double]$Min, [double]$Max) {
     # r3 (adversary 6256c193 A1): the double must carry EXACTLY what the file says. TryGetDouble rounds 1.0000000000000001 to 1.0 (in range) and
     # 16.000000000000001 to 16.0 (so min <= max held), though the file states a value above its maximum; a limit whose double reads back as another number
     # is refused, never silently rounded into range. (The shortest round-trip text of the double names the same number as the file's text, or it is refused.)
-    if ((ConvertTo-DvDecimalKey $Element.GetRawText()) -cne (ConvertTo-DvDecimalKey $d.ToString('R', [System.Globalization.CultureInfo]::InvariantCulture))) { return $null }
+    $rawKey = ConvertTo-DvDecimalKey $Element.GetRawText()
+    if ($rawKey -cne (ConvertTo-DvDecimalKey $d.ToString('R', [System.Globalization.CultureInfo]::InvariantCulture))) { return $null }
+    # ...and carry no more places than a measurement can resolve (a key is "sign+digits|exponent": a negative exponent counts places)
+    $exponent = [System.Numerics.BigInteger]::Parse($rawKey.Split('|')[1], [System.Globalization.CultureInfo]::InvariantCulture)
+    if ($exponent -lt -$MaxPlaces) { return $null }
     $d
 }
 
@@ -3020,7 +3029,7 @@ function ConvertTo-DvExposureRow($Row, $Fallback) {
     if ($Row.ValueKind -ne [System.Text.Json.JsonValueKind]::Object) { return (& $fail 'not an object') }
     $repeated = Get-DvJsonRepeatedKey $Row
     if ($null -ne $repeated) { return (& $fail "the row repeats the field '$repeated'") }
-    $limits = [ordered]@{ minMedianLuma = @(0.0, 255.0); maxMedianLuma = @(0.0, 255.0); maxNearBlackFraction = @(0.0, 1.0); maxClippedFraction = @(0.0, 1.0) }
+    $limits = [ordered]@{ minMedianLuma = @(0.0, 255.0, 4); maxMedianLuma = @(0.0, 255.0, 4); maxNearBlackFraction = @(0.0, 1.0, 6); maxClippedFraction = @(0.0, 1.0, 6) }   # (range min, range max, most decimal places)
     # a field this gate does not know (a misspelt cap beside a valid one) must not silently take the fallback's value (names compare ordinally)
     foreach ($property in $Row.EnumerateObject()) {
         if (@($limits.Keys | Where-Object { Test-DvOrdinalEqual $_ $property.Name }).Count -eq 0) { return (& $fail "the row has the unknown field '$($property.Name)'") }
@@ -3029,8 +3038,8 @@ function ConvertTo-DvExposureRow($Row, $Fallback) {
     foreach ($name in $limits.Keys) {
         $fields = @($Row.EnumerateObject() | Where-Object { Test-DvOrdinalEqual $_.Name $name })
         if ($fields.Count -eq 0) { $band[$name] = $Fallback.$name; continue }
-        $value = ConvertTo-DvExposureLimit $fields[0].Value $limits[$name][0] $limits[$name][1]
-        if ($null -eq $value) { return (& $fail "$name must be a number in $($limits[$name][0])..$($limits[$name][1])") }
+        $value = ConvertTo-DvExposureLimit $fields[0].Value $limits[$name][0] $limits[$name][1] $limits[$name][2]
+        if ($null -eq $value) { return (& $fail "$name must be a number in $($limits[$name][0])..$($limits[$name][1]) with at most $($limits[$name][2]) decimal places") }
         $band[$name] = [double]$value; $named++
     }
     if ($named -eq 0) { return (& $fail 'it names none of minMedianLuma, maxMedianLuma, maxNearBlackFraction, maxClippedFraction') }

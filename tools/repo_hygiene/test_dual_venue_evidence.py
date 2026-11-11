@@ -9558,7 +9558,18 @@ class VisualExposureFloorTests(unittest.TestCase):
             ('{"clips": {"c": {"maxClippedFraction": 1e-5}}}', "c", "clip"),
             ('{"clips": {"c": {"minMedianLuma": 255.0, "maxMedianLuma": 255}}}', "c", "clip"),
             ('{"clips": {"c": {"minMedianLuma": 0, "maxMedianLuma": 0.0}}}', "c", "clip"),
-            ('{"clips": {"c": {"minMedianLuma": 16.000000000000004, "maxMedianLuma": 16.000000000000004}}}', "c", "clip"),   # the neighbouring double, written in full
+            ('{"clips": {"c": {"maxClippedFraction": 0.000001, "minMedianLuma": 99.9999, "maxMedianLuma": 100.0004, "maxNearBlackFraction": 0.999999}}}', "c", "clip"),   # the finest limits: 6 places (fractions), 4 (luma)
+            # adversary c9ac4917 A2: a limit finer than a measurement can resolve rounds to the same double as an OUTSIDE measurement (1/2304 = 0.000434027777...,
+            # and a luma mean one 10000th of a level over 100), so it is refused, never compared
+            ('{"clips": {"c": {"maxClippedFraction": 0.00043402777777777775}}}', "c", "fallback-malformed"),   # the adversary's input: 1 clipped pixel in 2304 vs this cap
+            ('{"clips": {"c": {"maxNearBlackFraction": 0.00043402777777777775}}}', "c", "fallback-malformed"),
+            ('{"clips": {"c": {"maxMedianLuma": 100.00043402777777}}}', "c", "fallback-malformed"),
+            ('{"clips": {"c": {"minMedianLuma": 99.99956597222223}}}', "c", "fallback-malformed"),
+            ('{"clips": {"c": {"maxClippedFraction": 0.0000001}}}', "c", "fallback-malformed"),   # 7 places
+            ('{"clips": {"c": {"maxMedianLuma": 100.00001}}}', "c", "fallback-malformed"),   # 5 places on a luma limit
+            # adversary c9ac4917 A1 (DISTINGUISH): a limit written as an exact double expansion (0.5 + 2^-53, 53 places) is far finer than any measurement
+            ('{"clips": {"c": {"maxClippedFraction": 0.50000000000000011102230246251565404236316680908203125}}}', "c", "fallback-malformed"),
+            ('{"clips": {"c": {"minMedianLuma": 16.000000000000004, "maxMedianLuma": 16.000000000000004}}}', "c", "fallback-malformed"),   # the neighbouring double of 16, written in full
         ]
         with tempfile.TemporaryDirectory(prefix="vis-exp-band-") as d:
             for n, (text, clip, source) in enumerate(rows):
