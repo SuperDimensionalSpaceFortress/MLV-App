@@ -256,15 +256,18 @@ _HEDGE_MODE = ["name"]
 
 
 _PATTERN_CAP_REASON = "builds a text past the pattern cap, which the scan does not search, so it is REPORTED"
-# Reviewed sites, by file: only THIS report is dropped for them, never any other finding. A text past the cap (a template with holes):
+# Reviewed sites, by file and by the stripped text of the one source line: only THIS report on THIS line is dropped, never another finding or another line (r15 A4). A text past the cap:
 _PATTERN_CAP_REVIEWED = {
-    "tools/repo_hygiene/candidate_acceptance.py": "a 38k-character PowerShell script literal passed to the bounded runner; it holds no spawn-method name",
-    "tools/repo_hygiene/closeout_dashboard.py": "the 27k-character HTML dashboard template (an f-string with holes); it holds no spawn-method name",
+    "tools/repo_hygiene/candidate_acceptance.py": ("a 38k-character PowerShell script literal passed to the bounded runner; it holds no spawn-method name", frozenset({"completed = run_bounded_closeout_process("})),
+    "tools/repo_hygiene/closeout_dashboard.py": ("the 27k-character HTML dashboard template (an f-string with holes); it holds no spawn-method name", frozenset({'return f"""<!doctype html>'})),
 }
 _GETATTR_REASON = "reads an attribute named by a run-time text, which can reach an event-loop spawn method"
 # A getattr over a run-time name on an os-like object:
 _GETATTR_REVIEWED = {
-    "tools/release/release_evidence.py": "getattr over a fixed tuple of st_* field names of os.stat results (identity_fields); no spawn method is reachable from a stat result",
+    "tools/release/release_evidence.py": ("getattr over a fixed tuple of st_* field names of os.stat results (identity_fields); no spawn method is reachable from a stat result", frozenset({
+        "if any(getattr(before, field) != getattr(opened, field) for field in identity_fields) or any(",
+        "getattr(opened, field) != getattr(after_open, field) for field in identity_fields",
+        ") or any(getattr(after_open, field) != getattr(after_path, field) for field in identity_fields) or any("})),
 }
 _PATTERN_ITEM_CAP = 20_000  # a pattern of more literal characters and wildcard runs than this is not searched: the scan REPORTS it (a `_FoldTooBig`), never reads it as clean
 
@@ -452,6 +455,8 @@ _AMBIGUOUS_ACTIVE: set[int] = set()
 _STR_ALIASES: set[str] = set()  # names the file being scanned binds to the str type (`S = str`, `from builtins import str as S`); set per scan by _note_aliases
 _BYTES_ALIASES: set[str] = set()  # the subset of _STR_ALIASES bound to the bytes type (`from builtins import bytes as B`): B(s, enc) encodes, str(b, enc) decodes
 _STR_KIND_ALIASES: set[str] = set()  # the subset of _STR_ALIASES bound to a type that is provably str (`S = str`, `T = type('')`); an alias in neither kind set is of unproven type
+_OPERATOR_MODULES: set[str] = set()  # names the file binds to the operator module (`import operator as op`, `op2 = op`); `x.add(a, b)` is `a + b` only through one (r15 A1)
+_OPERATOR_FUNCS: dict[str, str] = {}  # names the file imports FROM operator (`from operator import concat as c`), to the function they stand for
 _BUILTINS_NAMES: set[str] = set()  # names the file binds to the builtins module (`import builtins`, `import builtins as b`) and nothing else; `b.str` is the builtin str only through one
 _REBOUND_TYPES: set[str] = set()  # `str` / `bytes` the file binds to something other than the builtin (`str = bytes`, `def str`, `class bytes`, an argument): the bare name proves nothing
 _CODEC_ALIASES: set[str] = set()  # names the file being scanned binds to the codecs module (`import codecs as c`); set per scan by _note_aliases
@@ -489,6 +494,8 @@ def _note_aliases(tree: ast.AST) -> None:
     _BYTES_ALIASES.clear()
     _STR_KIND_ALIASES.clear()
     _BUILTINS_NAMES.clear()
+    _OPERATOR_MODULES.clear()
+    _OPERATOR_FUNCS.clear()
     _REBOUND_TYPES.clear()
     _CODEC_ALIASES.clear()
     _CODEC_FUNCS.clear()
@@ -500,6 +507,9 @@ def _note_aliases(tree: ast.AST) -> None:
         elif isinstance(n, ast.Import):
             _CODEC_ALIASES.update(a.asname or a.name for a in n.names if a.name == "codecs")
             _BUILTINS_NAMES.update(a.asname or a.name for a in n.names if a.name == "builtins")
+            _OPERATOR_MODULES.update(a.asname or a.name for a in n.names if a.name == "operator")
+        if isinstance(n, ast.ImportFrom) and n.module == "operator":
+            _OPERATOR_FUNCS.update({a.asname or a.name: a.name for a in n.names if a.name in _OPERATOR_BINOPS})
         if isinstance(n, ast.ImportFrom) and n.module == "codecs":
             _CODEC_FUNCS.update({a.asname or a.name: a.name for a in n.names if a.name in ("decode", "encode")})  # from codecs import decode as d
     for n in ast.walk(tree):
@@ -514,8 +524,10 @@ def _note_aliases(tree: ast.AST) -> None:
     binds = [(n.targets[0].id, n.value) for n in ast.walk(tree) if isinstance(n, ast.Assign) and len(n.targets) == 1 and isinstance(n.targets[0], ast.Name)]
     binds += [(n.target.id, n.value) for n in ast.walk(tree) if isinstance(n, ast.AnnAssign) and isinstance(n.target, ast.Name) and n.value is not None]  # `B: type = bytes` (pass-35 A3)
     for _ in range(len(binds) + 1):  # an alias of an alias (`C = B`) is read once `B` is known; repeated until nothing new is learnt
-        known = (len(_STR_ALIASES), len(_BYTES_ALIASES), len(_STR_KIND_ALIASES))
+        known = (len(_STR_ALIASES), len(_BYTES_ALIASES), len(_STR_KIND_ALIASES), len(_OPERATOR_MODULES))
         for name, v in binds:
+            if isinstance(v, ast.Name) and v.id in _OPERATOR_MODULES:
+                _OPERATOR_MODULES.add(name)  # `op = operator`
             kind = _type_kind(v)  # r15 (A3): a name is an alias of a type only when the value PROVES the type; `C = T.str` / `C = type(x)` bind an unknown
             if kind == "bytes":
                 _STR_ALIASES.add(name)
@@ -523,7 +535,7 @@ def _note_aliases(tree: ast.AST) -> None:
             elif kind == "str":
                 _STR_ALIASES.add(name)
                 _STR_KIND_ALIASES.add(name)
-        if known == (len(_STR_ALIASES), len(_BYTES_ALIASES), len(_STR_KIND_ALIASES)):
+        if known == (len(_STR_ALIASES), len(_BYTES_ALIASES), len(_STR_KIND_ALIASES), len(_OPERATOR_MODULES)):
             break
 
 
@@ -546,9 +558,9 @@ def _bound_form(node: ast.AST, consts: dict[str, str]) -> ast.AST:
         if isinstance(arg, (ast.List, ast.Tuple)) and not any(isinstance(e, ast.Starred) for e in arg.elts):
             return ast.List(elts=list(reversed(arg.elts)) if node.func.id == "reversed" else list(arg.elts), ctx=ast.Load())
         return node
-    if (isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id in _OPERATOR_BINOPS and len(node.args) == 2 and not node.keywords
+    if (isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id in _OPERATOR_FUNCS and len(node.args) == 2 and not node.keywords
             and not any(isinstance(a, ast.Starred) for a in node.args)):  # ``from operator import concat``: concat(a, b)
-        return ast.BinOp(left=node.args[0], op=_OPERATOR_BINOPS[node.func.id](), right=node.args[1])
+        return ast.BinOp(left=node.args[0], op=_OPERATOR_BINOPS[_OPERATOR_FUNCS[node.func.id]](), right=node.args[1])
     if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id in _CODEC_FUNCS and node.args and not isinstance(node.args[0], ast.Starred):
         return ast.Call(func=ast.Attribute(value=node.args[0], attr=_CODEC_FUNCS[node.func.id], ctx=ast.Load()), args=node.args[1:], keywords=node.keywords)
     if (isinstance(node, ast.Call) and _type_like(node.func) and node.args and not isinstance(node.args[0], ast.Starred)
@@ -567,7 +579,7 @@ def _bound_form(node: ast.AST, consts: dict[str, str]) -> ast.AST:
     if plain and not _text_base(recv, consts):
         # The receiver is a module or a type under ANY name (``op = operator``, ``import builtins as b``, ``S = str``, ``type('')``, ``''.__class__``): a call of an
         # operator function, a dunder or a string method through it is read by its method name, never by the spelling of the receiver (pass-22 A3).
-        if attr in _OPERATOR_BINOPS and len(node.args) == 2 and not node.keywords:  # (mod's second operand may be a tuple or a mapping)
+        if attr in _OPERATOR_BINOPS and isinstance(recv, ast.Name) and recv.id in _OPERATOR_MODULES and len(node.args) == 2 and not node.keywords:  # (mod's second operand may be a tuple or a mapping)
             return ast.BinOp(left=node.args[0], op=_OPERATOR_BINOPS[attr](), right=node.args[1])
         if attr in _DUNDER_BINOPS and len(node.args) == 2 and not node.keywords:  # str.__add__(a, b)
             op, reflected = _DUNDER_BINOPS[attr]
@@ -577,7 +589,7 @@ def _bound_form(node: ast.AST, consts: dict[str, str]) -> ast.AST:
         if node.args and _text_base(node.args[0], consts) and (_type_like(recv) or (attr in ("decode", "encode") and _codecs_like(recv))):  # str.lower(s, ...) is s.lower(...); codecs.decode(b, ...) too
             node = ast.Call(func=ast.Attribute(value=node.args[0], attr=attr, ctx=ast.Load()), args=node.args[1:], keywords=node.keywords)
             recv = node.func.value
-    if attr in _DUNDER_BINOPS and len(node.args) == 1 and not node.keywords and plain:
+    if attr in _DUNDER_BINOPS and len(node.args) == 1 and not node.keywords and plain and _text_base(recv, consts):  # r15 A1: an object's own `__add__` is no `+`
         op, reflected = _DUNDER_BINOPS[attr]
         left, right = (node.args[0], recv) if reflected else (recv, node.args[0])
         return ast.BinOp(left=left, op=op(), right=right)
@@ -2011,7 +2023,7 @@ _START_PROCESS_RE = re.compile(r"(?<![\w$.-])(Start-Process|saps|start)(?![\w-])
 _PS_COMMAND_PREFIX_RE = re.compile(r"(?<![\w$.-])(?:return|throw|exit|-not)$", re.IGNORECASE)  # a word that ends right before a command name
 # PowerShell reads these typographic characters as the ASCII ones: single and double quotes, the three dashes a parameter may start with, no-break space.
 _PS_CHAR_MAP = str.maketrans({"‘": "'", "’": "'", "‚": "'", "‛": "'", "“": '"', "”": '"', "„": '"',
-                              "–": "-", "—": "-", "―": "-", " ": " ", "\u0085": " "})
+                              "–": "-", "—": "-", "―": "-", " ": " ", "\u0085": " ", **{chr(c): "\x02" for c in range(0x1c, 0x20)}})  # r15 A2: FS/GS/RS/US are no PowerShell white space
 
 
 def _ps_text(text: str) -> str:
@@ -2024,7 +2036,8 @@ def _ps_comment_at(text: str, i: int) -> bool:
     """Does a PowerShell ``#`` comment start at ``text[i]``? It does wherever a new token can begin: after white space, a quote that closes a string, a
     bracket, a separator or an operator (``'/c'# -WindowStyle Hidden``, ``(1)# note``), and not inside a bare word (``a#b``). The one predicate the three
     readers share (pass-25 A3): a comment kept as text could supply a ``-WindowStyle Hidden`` the launch does not carry."""
-    return text[i] == "#" and (i == 0 or not (text[i - 1].isalnum() or text[i - 1] in "_-.:/\\$\x02<"))  # \x02: a glued or escaped character, part of the same word; `<`: a `<#` that opened no block comment is a bare word (r15 A4)
+    return text[i] == "#" and (i == 0 or text[i - 1].isspace() or text[i - 1] in _PS_BLOCK_COMMENT_AFTER
+                               or (_COMMENT_LOOSE[0] and not (text[i - 1].isalnum() or text[i - 1] in "_-.:/\\$\x02<")))  # \x02: a glued or escaped character, part of the same word; `<`: a `<#` that opened no block comment is a bare word (r15 A4)
 
 
 _PS_BLOCK_COMMENT_AFTER = frozenset(";|&{}(),'\"")  # besides white space, what always ends a token before a `<#` that opens a block comment (measured against Parser.ParseInput, r15 A4)
@@ -2451,8 +2464,16 @@ def _start_process_violations(py_source: str) -> tuple[int, list[int]]:
 
 
 def _unflagged_spawns(rel: str) -> list[str]:
-    bad = _unflagged_spawns_in_source((ROOT / rel).read_text(encoding="utf-8"), rel)
-    return [b for b in bad if not ((rel in _PATTERN_CAP_REVIEWED and b.endswith(_PATTERN_CAP_REASON)) or (rel in _GETATTR_REVIEWED and b.endswith(_GETATTR_REASON)))]  # reviewed sites; every other finding stays
+    source = (ROOT / rel).read_text(encoding="utf-8")
+    lines = source.split("\n")
+
+    def reviewed(finding: str) -> bool:
+        for table, reason in ((_PATTERN_CAP_REVIEWED, _PATTERN_CAP_REASON), (_GETATTR_REVIEWED, _GETATTR_REASON)):
+            at = re.match(r".*?:(\d+) ", finding)
+            if rel in table and finding.endswith(reason) and at and lines[int(at.group(1)) - 1].strip() in table[rel][1]:
+                return True
+        return False
+    return [b for b in _unflagged_spawns_in_source(source, rel) if not reviewed(b)]  # reviewed lines; every other finding stays
 
 
 class NoWindowFlagsTests(unittest.TestCase):
@@ -4472,6 +4493,12 @@ class AdversaryR9Tests(unittest.TestCase):
     _bad = staticmethod(AdversaryR8Tests._bad)
     _launch = staticmethod(AdversaryR8Tests._launch)
     _named = staticmethod(AdversaryR8Tests._named)
+
+    @staticmethod
+    def _psop(expr: str) -> tuple[int, int]:
+        """``_ps`` with the operator module imported under the names the rows spell it (r15 A1: `op.add` is the operator only where the file imports it)."""
+        found, bad = _start_process_violations("import operator\nimport operator as op\nfrom operator import add, mod, concat\nx = " + expr + "\n")
+        return found, len(bad)
     _ps = staticmethod(AdversaryR8Tests._ps)
 
     @staticmethod
@@ -4499,6 +4526,7 @@ class AdversaryR9Tests(unittest.TestCase):
                             ("'{}exec'.format('subprocess_')", "subprocess_exec"), ("'zzsubprocess_exec'.strip('z')", "subprocess_exec")):
             for expr in (bound, self._unbound(bound)):
                 self.assertEqual(_flatten(ast.parse(expr, mode="eval").body, {}), (want, True), expr)
+        _note_aliases(ast.parse("import operator\n"))
         for expr in ("str.__add__('subprocess_', 'exec')", "operator.concat('subprocess_', 'exec')", "''.join(reversed('cexe_ssecorpbus'))"):
             self.assertEqual(_flatten(ast.parse(expr, mode="eval").body, {}), ("subprocess_exec", True), expr)
 
@@ -4514,7 +4542,7 @@ class AdversaryR9Tests(unittest.TestCase):
     def test_g15_hedging_every_argument_adds_no_false_positive_to_a_harmless_text(self):
         for expr in ("ident('value')", "ident('hello', 'world')", "ident(name)", "str.lower(name)", "str.join(', ', names)", "str.format('{}-{}', a, b)", "operator.concat(a, b)",
                      "str.removeprefix(name, 'x')", "''.join(reversed(name))", "''.join(reversed('abc'))", "str.strip('abc')", "ident('subprocess')", "ident('exec')",
-                     "str.__add__('sub', 'process')", "operator.concat('exec', 'subprocess_')", "''.join(reversed('subprocess_'))", "str.upper('value')"):
+                     "str.__add__('sub', 'process')", "''.join(reversed('subprocess_'))", "str.upper('value')"):  # r15 A1: `operator.concat('exec', 'subprocess_')` is no operator without the import, so it reports
             self.assertEqual(self._bad(self._named(expr)), [], expr)
         # the consumer of a name is not the name: getattr / attrgetter / hasattr read their argument, they do not return it
         for expr in ("'subprocess_exec_' + 'x'", "'subprocess_exec_x'"):
@@ -4532,14 +4560,14 @@ class AdversaryR9Tests(unittest.TestCase):
 
     def test_g15_a_launch_behind_an_unbound_or_operator_fold_is_reported_by_the_powershell_side(self):
         for expr in self.g15_ps_rows():
-            self.assertEqual(self._ps(expr), (1, 1), expr)
+            self.assertEqual(self._psop(expr), (1, 1), expr)
         for expr in ("operator.concat('Start-', 'Process cmd.exe')", "operator.add('sap', 's cmd.exe')", "str.lower('START-PROCESS cmd.exe')", "str.join('', ['Start-', 'Process cmd.exe'])",
                      "str.format('{}Process cmd.exe', 'Start-')", "''.join(reversed(['cmd.exe', ' Process-', 'Start']))[0:]", "''.__class__.strip('zStart-Process cmd.exez', 'z')"):
-            self.assertEqual(self._ps(expr), (1, 1), expr)
+            self.assertEqual(self._psop(expr), (1, 1), expr)
         hidden = f"{self.SP} cmd.exe -WindowStyle Hidden"  # a fold that reads exactly is judged as written: a hidden launch stays clean
         for expr in (f"str.lstrip('zz{hidden}', 'z')", f"str.strip('zz{hidden}zz', 'z')", f"operator.concat('Start-', 'Process cmd.exe -WindowStyle Hidden')",
                      f"str.__add__('Start-', 'Process cmd.exe -WindowStyle Hidden')"):
-            self.assertEqual(self._ps(expr), (1, 0), expr)
+            self.assertEqual(self._psop(expr), (1, 0), expr)
 
     def test_g15_every_string_mapper_and_builder_reads_unbound_the_way_it_reads_bound(self):
         """Walks every ``_STRING_MAPPERS`` method and every builder kind ``fold_kinds`` has, spelled bound and unbound, on both sides."""
@@ -4647,7 +4675,7 @@ class AdversaryR9Tests(unittest.TestCase):
             for expr in exprs:
                 self.assertGreaterEqual(len(self._bad(prefix + self._launch(expr))), 1, (label, expr))
         for expr in ("op.concat('Start-', 'Process cmd.exe')", "type('').join('', ['sap', 's cmd.exe'])", "S.__add__('Start-', 'Process cmd.exe')", "add('sap', 's cmd.exe')", "mod('%saps cmd.exe', 's')"):
-            self.assertEqual(self._ps(expr), (1, 1), expr)
+            self.assertEqual(self._psop(expr), (1, 1), expr)
         for expr in ("b.str.lower('START-PROCESS cmd.exe')", "b.str.removeprefix('zzStart-Process cmd.exe', 'zz')"):  # r15 (A3): `b` is the builtins module only where the file imports it
             self.assertEqual(_start_process_violations("import builtins as b\nx = " + expr + "\n")[0], 1, expr)
         # an INSTANCE method with a launch word as its argument is a call on something else: the fixture line `source.index("...Process]::Start(...)")`
@@ -4684,7 +4712,7 @@ class AdversaryR9Tests(unittest.TestCase):
                              ("import operator as op\n", "op.concat('subprocess_', suffix)")):
             self.assertGreaterEqual(len(self._bad(prefix + self._launch(expr))), 1, (prefix, expr))
         for expr in ("op.mod('%(a)s%(b)s', {'a': 'sa', 'b': 'ps cmd.exe'})", "op.mod('%s%s', ('sa', 'ps cmd.exe'))", "mod('%(a)s%(b)s', {'a': 'Start-', 'b': 'Process cmd.exe'})"):
-            self.assertEqual(self._ps(expr), (1, 1), expr)
+            self.assertEqual(self._psop(expr), (1, 1), expr)
         for prefix, expr in (("import operator as op\n", "op.mod('%(a)s%(b)s', {'a': 'sub', 'b': 'process'})"), ("import operator as op\n", "op.add(a, b)")):
             self.assertEqual(self._bad(prefix + self._named(expr)), [], (prefix, expr))
 
@@ -4937,8 +4965,8 @@ class AdversaryR9Tests(unittest.TestCase):
                        "Start-Process cmd.exe -ArgumentList $a[0]# -WindowStyle Hidden", "Start-Process cmd.exe -ArgumentList '/c'# it's -WindowStyle Hidden",
                        "saps cmd.exe -ArgumentList '/c'#-WindowStyle Hidden", "Start-Process cmd.exe -ArgumentList '/c'# -WindowStyle Hidden `\n -Wait",
                        "Start-Process cmd.exe -ArgumentList (1)# `\nsaps cmd.exe -WindowStyle Hidden"):
-            self.assertEqual(_judge_script(script)[0], 1 + script.count("\nsaps"), script)
-            self.assertGreaterEqual(_judge_script(script)[1], 1, script)
+            self.assertEqual(_judge_both(script)[0], 1 + script.count("\nsaps"), script)
+            self.assertGreaterEqual(_judge_both(script)[1], 1, script)
             self.assertGreaterEqual(self._ps(repr(script))[1], 1, script)
         for script in ("Start-Process cmd.exe -ArgumentList '/c' -WindowStyle Hidden # note", "Start-Process cmd.exe -ArgumentList a#b -WindowStyle Hidden",
                        "Start-Process cmd.exe -ArgumentList '/c' -WindowStyle Hidden;# done", "Start-Process cmd.exe -WindowStyle Hidden -ArgumentList '/c'# ok"):
@@ -5538,6 +5566,39 @@ class AdversaryR9Tests(unittest.TestCase):
             self.assertEqual(len(_start_process_violations(f"script = {script!r}\n")[1]), 1, script)
         self.assertEqual(_start_process_violations("script = 'Start-Process cmd.exe -WindowStyle Hidden <# note #>'\n"), (1, []))  # a real comment beside the flag is harmless
         self.assertEqual(_start_process_violations("script = 'Write-Host a<#; Start-Process cmd.exe; #>'\n")[0], 1)  # and the bare word of A4 is still read as code
+
+    # ---- r15 pass 38 (review-adversary-MLV-LANE-CONSOLE-HIDDEN-1-r15-7d8a7be5): A1-A4 ----
+    def test_r15_pass38_a1_an_operator_name_is_the_operator_only_through_the_operator_module(self):
+        head = "import asyncio\nclass Builder:\n    def add(self, left, right):\n        return right + left\nasync def launch():\n    loop = asyncio.get_running_loop()\n    name = {name}\n"
+        for name in ("Builder().add('exec', 'subprocess_')", "add('exec', 'subprocess_')"):
+            self.assertGreaterEqual(len(self._bad(head.format(name=name) + "    await loop.run_in_executor(None, print, name)\n")), 1, name)
+        _note_aliases(ast.parse("import operator as op\nfrom operator import concat\n"))
+        self.assertEqual(self._fold_text("op.add('subprocess_', 'exec')"), ("subprocess_exec", True))  # the real module keeps its exact fold
+        self.assertEqual(self._fold_text("concat('subprocess_', 'exec')"), ("subprocess_exec", True))
+        _note_aliases(ast.parse("x = 1\n"))
+
+    def test_r15_pass38_a2_a_separator_control_character_is_not_white_space_to_powershell(self):
+        for ch in ("\x1c", "\x1d", "\x1e", "\x1f"):
+            for word in ("Start-Process", "saps", "start"):
+                self.assertEqual(_start_process_violations(f"script = {(word + ' cmd.exe arg' + ch + '-WindowStyle' + ch + 'Hidden')!r}\n"), (1, [1]), (word, ch))
+        self.assertEqual(_start_process_violations("script = 'Start-Process cmd.exe arg -WindowStyle Hidden'\n"), (1, []))
+
+    def test_r15_pass38_a3_a_hash_after_an_operator_character_is_a_bare_word_or_a_comment_and_both_are_judged(self):
+        for op in ("+", "*", "?", "%", "!"):
+            for word in ("Start-Process", "saps", "start"):
+                self.assertEqual(_start_process_violations(f"script = {('Write-Output a' + op + '# ; ' + word + ' cmd.exe')!r}\n")[0], 1, (op, word))
+        self.assertEqual(_start_process_violations("script = 'Start-Process cmd.exe -WindowStyle Hidden # note'\n"), (1, []))  # a real comment after the flag is harmless
+
+    def test_r15_pass38_a4_a_reviewed_site_is_one_line_not_the_whole_file(self):
+        src = "import asyncio\nasync def launch(name):\n    loop = asyncio.get_running_loop()\n    await getattr(loop, name)(asyncio.SubprocessProtocol, 'cmd.exe')\n"
+        for rel in _GETATTR_REVIEWED:
+            with mock.patch.object(Path, "read_text", return_value=src):
+                self.assertGreaterEqual(len(_unflagged_spawns(rel)), 1, rel)  # a NEW getattr in a reviewed file is still reported
+        for rel in _PATTERN_CAP_REVIEWED:
+            with mock.patch.object(Path, "read_text", return_value="def f(p):\n    x = " + repr("a" * _PATTERN_ITEM_CAP) + " + p\n"):
+                self.assertGreaterEqual(len(_unflagged_spawns(rel)), 1, rel)  # and so is a new over-cap text
+        for rel in (*_GETATTR_REVIEWED, *_PATTERN_CAP_REVIEWED):
+            self.assertEqual(_unflagged_spawns(rel), [], rel)  # the reviewed lines themselves stay allowed
 
     def test_r15_conservative_flips_a_name_that_is_not_a_constant_is_reported_in_a_getattr_name_position(self):
         # every one of these read clean before r15 (a matcher ruled the partial text out); the class rule reports them: a false positive is allowlisted by a reviewer, a false negative is not
