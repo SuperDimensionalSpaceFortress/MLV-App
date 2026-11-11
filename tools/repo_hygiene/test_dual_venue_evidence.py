@@ -9510,6 +9510,32 @@ class VisualExposureFloorTests(unittest.TestCase):
                 self.assertEqual(got["band"]["source"], "fallback-malformed")
                 self.assertIn("exposure band file is unusable", got["verdict"]["reason"] + str(got["band"]["note"]))
 
+    def test_the_visual_exposure_band_file_refuses_a_negative_limit_that_underflows_to_zero(self) -> None:
+        # adversary fc152c48 A1: TryGetDouble reads -1e-400 as -0.0, which is not under 0, so a negative limit in an unselected row passed the range check
+        with tempfile.TemporaryDirectory(prefix="vis-exp-band-") as d:
+            rows = [("-1e-400", "fallback-malformed"), ("-0", "fallback-malformed"), ("-0.0", "fallback-malformed"), ("-0.001", "fallback-malformed"),
+                    ("1e-400", "clip"), ("0", "clip"), ("0.5", "clip")]
+            for n, (number, source) in enumerate(rows):
+                for field in ("minMedianLuma", "maxClippedFraction"):
+                    with self.subTest(number=number, field=field):
+                        path = Path(d) / f"neg-{n}-{field}.json"
+                        path.write_text('{"clips": {"c": {"minMedianLuma": 0, "maxNearBlackFraction": 1}, "other": {"' + field + '": ' + number + '}}}', encoding="utf-8")
+                        proc, out = run_pwsh_json(f"Get-DvExposureBand -ClipId 'c' -Path '{path}' | ConvertTo-Json -Depth 4 -Compress")
+                        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+                        self.assertEqual(out["source"], source, out)
+                        self.assertEqual(out["note"] is not None, source == "fallback-malformed", out)
+
+    def test_the_visual_exposure_band_path_resolves_against_the_powershell_location(self) -> None:
+        # adversary fc152c48 A2: Test-Path resolves a relative path against the PowerShell location and [IO.File]::ReadAllText against the process directory,
+        # so an existing band file given by a relative path read as a malformed file (and a valid clip row was replaced by the fallback)
+        with tempfile.TemporaryDirectory(prefix="vis-exp-band-") as d:
+            (Path(d) / "bands.json").write_text('{"clips": {"c": {"minMedianLuma": 0, "maxNearBlackFraction": 1}}}', encoding="utf-8")
+            proc, out = run_pwsh_json(f"Set-Location -LiteralPath '{d}'; Get-DvExposureBand -ClipId 'c' -Path 'bands.json' | ConvertTo-Json -Depth 4 -Compress")
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            self.assertEqual((out["source"], out["band"]["minMedianLuma"], out["note"]), ("clip", 0, None), out)
+            proc, out = run_pwsh_json(f"Set-Location -LiteralPath '{d}'; Get-DvExposureBand -ClipId 'c' -Path 'absent.json' | ConvertTo-Json -Depth 4 -Compress")
+            self.assertEqual((out["source"], out["note"] is not None), ("fallback-missing", True), out)
+
     @requires_windows_imaging
     def test_the_visual_reader_keeps_a_not_captured_reason_beside_an_unusable_band_file(self) -> None:
         # r2 (fable H2): the band-file note was pre-set as block.reason, which displaced the NOT_CAPTURED verdict's own reason

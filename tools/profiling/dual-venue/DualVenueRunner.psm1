@@ -2980,7 +2980,8 @@ function ConvertTo-DvExposureLimit($Element, [double]$Min, [double]$Max) {
     if ($Element.ValueKind -ne [System.Text.Json.JsonValueKind]::Number) { return $null }
     $d = 0.0
     if (-not $Element.TryGetDouble([ref]$d)) { return $null }
-    if ([double]::IsNaN($d) -or [double]::IsInfinity($d) -or $d -lt $Min -or $d -gt $Max) { return $null }
+    # (IsNegative, not "-lt 0": TryGetDouble reads -1e-400 as -0.0, which is not under 0 but is a negative limit; adversary fc152c48 A1)
+    if ([double]::IsNaN($d) -or [double]::IsInfinity($d) -or [double]::IsNegative($d) -or $d -lt $Min -or $d -gt $Max) { return $null }
     $d
 }
 
@@ -3028,7 +3029,8 @@ function Get-DvExposureBand {
     if ([string]::IsNullOrWhiteSpace($Path) -or -not (Test-Path -LiteralPath $Path -PathType Leaf)) {
         return (& $result 'fallback-missing' "the exposure band file is missing ($Path): the absolute fallback band judges" $fallback)
     }
-    try { $text = [IO.File]::ReadAllText($Path) } catch { return (& $result 'fallback-malformed' "the exposure band file cannot be read ($($_.Exception.GetType().Name)): the absolute fallback band judges" $fallback) }
+    # a relative path resolves the way Test-Path just did (against the PowerShell location), not against the process directory ReadAllText uses (adversary fc152c48 A2)
+    try { $Path = (Resolve-Path -LiteralPath $Path -ErrorAction Stop).ProviderPath; $text = [IO.File]::ReadAllText($Path) } catch { return (& $result 'fallback-malformed' "the exposure band file cannot be read ($($_.Exception.GetType().Name)): the absolute fallback band judges" $fallback) }
     if ([string]::IsNullOrWhiteSpace($text)) { return (& $result 'fallback-empty' "the exposure band file is empty ($Path): the absolute fallback band judges" $fallback) }
     # System.Text.Json, not ConvertFrom-Json: that unwraps a one-element array root ([{"clips": ...}] reads as the object, so a non-object file would pick a
     # row), and rejects keys that differ only in case ({"M16-1457": ..., "m16-1457": ...} is valid JSON and clip ids match exactly)
