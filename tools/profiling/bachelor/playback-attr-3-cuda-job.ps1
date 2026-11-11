@@ -466,6 +466,10 @@ param(
     # slot (MLVAPP_PLAYBACK_PREP_CONFLATED_MOVE=1; the app reads it as set-and-not-0), so one staged build measures both queues. The OFF arm is this switch
     # absent: nothing is set and the emitted job is the text it was before this parameter.
     [switch]$PrepConflatedMove,
+    # HFR-NATIVE-M16-1457-GUI-TEXTURE-PRESENT-OFFLOAD-1 r7: the deferred retained-token release's kill switch (MLVAPP_GPU_RECON_RELEASE_DEFERRED=0: the
+    # GUI thread's slot release waits for the recon backend mutex, as before r7), the isolation arm of a same-binary A/B. Absent: nothing is set and the
+    # emitted job is the text it was before this parameter.
+    [switch]$DisableReconReleaseDeferred,
 
     # PLAYBACK-SCOPES-OPTION-1: the live scope the smoke forces on (the smoke runner's -Scope -> the app's --scope, which also shows the
     # edit area). '' or 'none' (the default) keeps -Scope none: the emitted job is the text it was before this parameter.
@@ -6391,6 +6395,18 @@ if ($PrepConflatedMove) {
     })
 }
 
+# HFR-NATIVE-M16-1457-GUI-TEXTURE-PRESENT-OFFLOAD-1 r7: the deferred-release kill-switch arm adds MLVAPP_GPU_RECON_RELEASE_DEFERRED=0 at the same env-list
+# site, only when asked. The anchor must match exactly once, or the generator throws (the runner also requires the app's own playback_smoke.recon_release
+# deferred_enabled=0 before the leg counts).
+if ($DisableReconReleaseDeferred) {
+    $releaseDeferredEnvAnchor = [regex]"(?<ind>[ \t]*)'MLVAPP_PLAYBACK_PHASE3_UNATTENDED=1',(?<nl>\r?\n)"
+    if ($releaseDeferredEnvAnchor.Matches($text).Count -ne 1) { throw 'DUAL_VENUE_RECON_RELEASE_DEFERRED_ANCHOR_MISSING the job template has no single env-list site to add MLVAPP_GPU_RECON_RELEASE_DEFERRED to' }
+    $text = $releaseDeferredEnvAnchor.Replace($text, [System.Text.RegularExpressions.MatchEvaluator]{
+        param($m)
+        $m.Value + $m.Groups['ind'].Value + "'MLVAPP_GPU_RECON_RELEASE_DEFERRED=0'," + $m.Groups['nl'].Value
+    })
+}
+
 # PLAYBACK-VISUAL-INSPECTION-1: a visual-capture leg gains three bracketed regions, on the expanded text and only when asked (like --windowed
 # above), so every other job is the text it always was. Each anchor must match exactly once (Edit-DualVenueTemplate throws otherwise):
 #   1. before PresentMon starts: the four module helpers (spliced here, not into the default embed list) and the feature probe + argument;
@@ -7835,6 +7851,7 @@ $clipContentSha256 = if ($isFixtureRehearsal) {
     unpaced = [bool]$Unpaced
     disablePrepPointwiseFast = [bool]$DisablePrepPointwiseFast
     prepConflatedMove = [bool]$PrepConflatedMove
+    disableReconReleaseDeferred = [bool]$DisableReconReleaseDeferred
     scope =$(if ([string]::IsNullOrEmpty($Scope)) { 'none' } else { $Scope })
     scopeIntervalMs = $(if ($ScopeIntervalMs -ge 0) { $ScopeIntervalMs } else { $null })
     scopesDuringPlayback = $(if ([string]::IsNullOrEmpty($ScopesDuringPlayback)) { $null } else { $ScopesDuringPlayback })

@@ -230,6 +230,10 @@ NATIVE_TRACE_D4_LEGS = {
        for mode in ("fullscreen", "windowed") for scale in (2, 4)},
 }
 SHIPPED_LEGS = (*SHIPPED_LEGS, *NATIVE_TRACE_D4_LEGS)
+# HFR-NATIVE-M16-1457-GUI-TEXTURE-PRESENT-OFFLOAD-1 r7: the isolation arm of the deferred-release A/B (generatorArgs.disableReconReleaseDeferred true ->
+# MLVAPP_GPU_RECON_RELEASE_DEFERRED=0), keyed to the paced cell it twins (legId and that key are the only differences). The head arm is the cell itself.
+RELEASE_SYNC_LEGS = {"legs/m16-1457-native-fullscreen-s2-release-sync.json": "legs/m16-1457-native-fullscreen-s2.json"}
+SHIPPED_LEGS = (*SHIPPED_LEGS, *RELEASE_SYNC_LEGS)
 # CPU-S1-RECON-CHAIN-ATTRIBUTION-1: the capture-free CPU fullscreen s1 arms that attribute the frame interval: control (c), prep fast path off (p), a worker cap of 12 (t12), Look Assist off (l).
 CHAINATTR_LEGS = tuple(f"legs/m16-1243-chainattr-{arm}-fullscreen-s1.json" for arm in ("c", "p", "t12", "l"))
 SHIPPED_LEGS = (*SHIPPED_LEGS, *CHAINATTR_LEGS)
@@ -1079,6 +1083,28 @@ class GeneratorByteIdentityAndVariantTests(unittest.TestCase):
                         "the mapping must sit outside the forceLookAssist branch")
         schema = json.loads((DV / "leg-spec.schema.json").read_text(encoding="utf-8"))
         self.assertEqual(schema["properties"]["generatorArgs"]["properties"]["prepConflatedMove"]["const"], True)
+
+    def test_the_recon_release_kill_switch_reaches_the_apps_env_only_when_asked(self) -> None:
+        """HFR-NATIVE-M16-1457-GUI-TEXTURE-PRESENT-OFFLOAD-1 r7: -DisableReconReleaseDeferred adds MLVAPP_GPU_RECON_RELEASE_DEFERRED=0 to the app's env list
+        exactly once; absent, the job is the text it was (the head arm sets nothing: the app's default is the deferred release). The runner maps
+        generatorArgs.disableReconReleaseDeferred true for any leg (outside the forceLookAssist branch); the schema types it as a boolean."""
+        plain = self.generate(GENERATOR, "rrd-plain.job.ps1", []).read_text(encoding="utf-8").replace("\r\n", "\n")
+        self.assertNotIn("MLVAPP_GPU_RECON_RELEASE_DEFERRED", plain)
+        job = self.generate(GENERATOR, "rrd-off.job.ps1", ["-DisableReconReleaseDeferred"])
+        self.assertEqual(self.parse_errors(job), 0)
+        text = job.read_text(encoding="utf-8").replace("\r\n", "\n")
+        line = "    'MLVAPP_GPU_RECON_RELEASE_DEFERRED=0',\n"
+        self.assertEqual(text.count("MLVAPP_GPU_RECON_RELEASE_DEFERRED"), 1)
+        self.assertIn("'MLVAPP_PLAYBACK_PHASE3_UNATTENDED=1',\n" + line, text)
+        self.assertEqual(text.replace(line, ""), plain, "the switch is the only difference from the plain job")
+        runner = (DV / "Invoke-VenueLeg.ps1").read_text(encoding="utf-8")
+        mapping = ("if ($spec.generatorArgs.PSObject.Properties['disableReconReleaseDeferred'] -and $spec.generatorArgs.disableReconReleaseDeferred -is [bool] "
+                   "-and $spec.generatorArgs.disableReconReleaseDeferred) { $gen['DisableReconReleaseDeferred'] = $true }")
+        self.assertEqual(runner.count(mapping), 1)
+        self.assertLess(runner.index(mapping), runner.index("if (-not $isLook -and $spec.generatorArgs.PSObject.Properties['forceLookAssist']"),
+                        "the mapping must sit outside the forceLookAssist branch")
+        schema = json.loads((DV / "leg-spec.schema.json").read_text(encoding="utf-8"))
+        self.assertEqual(schema["properties"]["generatorArgs"]["properties"]["disableReconReleaseDeferred"]["type"], "boolean")
 
     def test_the_runner_passes_a_legs_swap_interval_to_the_generator(self) -> None:
         runner = (DV / "Invoke-VenueLeg.ps1").read_text(encoding="utf-8")
@@ -7691,11 +7717,13 @@ class LegSpecSchemaTests(unittest.TestCase):
                 self.assertRegex(spec["legId"], r"^m16-1243-cpu-reduced-(fullscreen|windowed)-s[24]$", path.name)
                 self.assertEqual(spec["backends"], ["cpu"], path.name)
                 self.assertEqual(spec["generatorArgs"]["playbackProcessing"], "receipt", path.name)
-            elif spec["card"] == "CUDA-HEADROOM-1" and "legs/" + path.name in (*NATIVE_PACED_LEGS, *NATIVE_TRACE_LEGS):   # the PACED M16-1457 native s2/s4 legs (r2 of the LUT-keep card)
-                # and their per-present trace twins (HFR-NATIVE-M16-1457-PRESENT-TRACE-LEGS-1, NATIVE_TRACE_LEGS; presentTrace only on a -trace- leg)
+            elif spec["card"] == "CUDA-HEADROOM-1" and "legs/" + path.name in (*NATIVE_PACED_LEGS, *NATIVE_TRACE_LEGS, *RELEASE_SYNC_LEGS):   # the PACED M16-1457 native s2/s4 legs (r2 of the LUT-keep card)
+                # and their per-present trace twins (HFR-NATIVE-M16-1457-PRESENT-TRACE-LEGS-1, NATIVE_TRACE_LEGS; presentTrace only on a -trace- leg), and the
+                # deferred-release isolation twin (HFR-NATIVE-M16-1457-GUI-TEXTURE-PRESENT-OFFLOAD-1 r7, RELEASE_SYNC_LEGS; the kill switch only on a -release-sync leg)
                 self.assertEqual(spec["legId"], path.stem, path.name)
-                self.assertRegex(spec["legId"], r"^m16-1457-native-(trace-)?(fullscreen|windowed)-s[24]$", path.name)
+                self.assertRegex(spec["legId"], r"^m16-1457-native-(trace-)?(fullscreen|windowed)-s[24](-release-sync)?$", path.name)
                 self.assertEqual(spec["generatorArgs"].get("presentTrace", False), "-trace-" in spec["legId"], path.name)
+                self.assertEqual(spec["generatorArgs"].get("disableReconReleaseDeferred", False), spec["legId"].endswith("-release-sync"), path.name)
                 # paced: no unpaced switch and no swap-interval override (the app's own pacing), so the leg measures the shipping shape
                 self.assertNotIn("unpaced", spec["generatorArgs"], path.name)
                 self.assertNotIn("swapInterval", spec["generatorArgs"], path.name)
@@ -12494,6 +12522,136 @@ class WorkerThreadsReceiptBlockIsReDerivedTests(EvidenceFactory, unittest.TestCa
         for variable in ("playback_max_threads", "force_threads", "omp_num_threads", "raw_uint16_prefetch_decoders", "disable_raw_uint16_prefetch"):
             repo, receipt = self.uncapped_under("unset", variable)
             self.assertAdvisory(receipt, repo)
+
+
+class ReconReleaseDeferredLegSpecTests(unittest.TestCase):
+    """HFR-NATIVE-M16-1457-GUI-TEXTURE-PRESENT-OFFLOAD-1 r7: the isolation arm of the deferred-release A/B is a named generatorArgs key; the one isolation twin
+    differs from the cell it twins only in legId and that key, so no receipted cell changes a byte."""
+
+    def setUp(self) -> None:
+        try:
+            import jsonschema
+        except ImportError:
+            self.skipTest("jsonschema is required")
+        self.jsonschema = jsonschema
+        self.schema = json.loads((DV / "leg-spec.schema.json").read_text(encoding="utf-8"))
+
+    def test_the_isolation_twin_differs_from_its_cell_only_in_the_leg_id_and_the_key(self) -> None:
+        self.assertEqual(len(RELEASE_SYNC_LEGS), 1, "one isolation twin: m16-1457 fullscreen s2, the card's gate cell")
+        for rel, cell_rel in RELEASE_SYNC_LEGS.items():
+            with self.subTest(leg=rel):
+                twin = json.loads((DV / rel).read_text(encoding="utf-8"))
+                cell = json.loads((DV / cell_rel).read_text(encoding="utf-8"))
+                self.jsonschema.validate(twin, self.schema)
+                self.assertNotIn("disableReconReleaseDeferred", cell["generatorArgs"], cell_rel)
+                self.assertEqual(twin["legId"], cell["legId"] + "-release-sync")
+                self.assertIs(twin["generatorArgs"].pop("disableReconReleaseDeferred"), True)
+                self.assertEqual(dict(twin, legId=cell["legId"]), cell)
+                self.assertEqual(list(twin), list(cell), "the cell's keys in the cell's order")
+
+    def test_no_other_leg_sets_the_key(self) -> None:
+        for path in sorted((DV / "legs").glob("*.json")):
+            if "legs/" + path.name in RELEASE_SYNC_LEGS:
+                continue
+            with self.subTest(leg=path.name):
+                self.assertNotIn("disableReconReleaseDeferred", json.loads(path.read_text(encoding="utf-8")).get("generatorArgs") or {})
+
+    def test_the_key_must_be_a_json_boolean(self) -> None:
+        twin = json.loads((DV / next(iter(RELEASE_SYNC_LEGS))).read_text(encoding="utf-8"))
+        for bad in (0, 1, "1", "true", None):
+            with self.subTest(value=repr(bad)):
+                with self.assertRaises(self.jsonschema.ValidationError):
+                    self.jsonschema.validate(dict(twin, generatorArgs=dict(twin["generatorArgs"], disableReconReleaseDeferred=bad)), self.schema)
+
+    def test_the_runner_and_the_validator_both_gate_on_the_apps_own_readback(self) -> None:
+        module = (DV / "DualVenueRunner.psm1").read_text(encoding="utf-8")
+        self.assertIn("$reconReleaseVerdict = Get-DvReconReleaseDeferredEvidence -Spec $spec -LogText $ev.logText", module)
+        self.assertIn('if ($reconReleaseVerdict.blocks) { $invalid.Add("RECON_RELEASE_DEFERRED_NOT_HONOURED:', module)
+        self.assertIn("Get-DvReconReleaseDeferredEvidence", module.split("Export-ModuleMember", 1)[1])
+        runner = (DV / "Invoke-VenueLeg.ps1").read_text(encoding="utf-8")
+        self.assertIn("$reconReleaseVerdict = Get-DvReconReleaseDeferredEvidence -Spec $spec -LogText $runLogText", runner)
+        self.assertIn("RECON_RELEASE_DEFERRED_NOT_HONOURED", runner)
+        # the app emits the record the gate reads, once per smoke session, in this exact field order
+        mw = (ROOT / "platform" / "qt" / "MainWindow.cpp").read_text(encoding="utf-8")
+        self.assertIn('"playback_smoke.recon_release session=%1 deferred_enabled=%2 deferred=%3 sync=%4 "\n'
+                      '                   "drained=%5 max_depth=%6 outstanding_at_stop=%7" )', mw.replace("\r\n", "\n"))
+
+
+@requires_windows_pwsh
+class ReconReleaseDeferredEvidenceTests(unittest.TestCase):
+    """Get-DvReconReleaseDeferredEvidence, pure: a leg that asks for the deferred-release kill switch counts only when the measured session's own
+    playback_smoke.recon_release record reports deferred_enabled=0. A switch value in the launcher's env block is a request, not engagement, and a binary
+    before r7 emits no such record, so an isolation leg on it is NOT_HONOURED rather than an unproven PASS."""
+
+    OFF = {"generatorArgs": {"disableReconReleaseDeferred": True}}
+    START = "playback_smoke.start session=3 position=0 scale_request=2 quality_mode=0 worker_threads=12 start_serial=2 env_force_threads=0"
+    PREFIX = "[2026-11-11T00:00:00.000Z] [INFO] [0x1a2b] "
+
+    def verdict(self, spec: dict, log: str) -> dict:
+        proc, out = run_pwsh_json("$s = $env:DVE_SPEC | ConvertFrom-Json\n(Get-DvReconReleaseDeferredEvidence -Spec $s -LogText $env:DVE_LOG) | ConvertTo-Json -Compress -Depth 4",
+                                  DVE_SPEC=json.dumps(spec), DVE_LOG=log)
+        self.assertIsNotNone(out, proc.stdout + proc.stderr)
+        return out
+
+    @classmethod
+    def log(cls, *records: str, start: str | None = None) -> str:
+        return "\n".join(["playback_smoke.measured_session id=3", start or cls.START, *records, "playback_smoke.summary session=3 reason=reached presented_frames=600"]) + "\n"
+
+    @staticmethod
+    def record(enabled: str, session: int = 3, deferred: str = "412") -> str:
+        return (f"playback_smoke.recon_release session={session} deferred_enabled={enabled} deferred={deferred} sync=1090 drained=412 max_depth=2"
+                " outstanding_at_stop=0")
+
+    def test_honoured_only_when_the_measured_session_reports_the_lever_off(self) -> None:
+        for name, record in (("bare", self.record("0", deferred="0")), ("crash-forensics prefix", self.PREFIX + self.record("0", deferred="0")),
+                             ("prefix and Qt location", self.PREFIX + self.record("0", deferred="0") + " (MainWindow.cpp:31700)")):
+            with self.subTest(case=name):
+                v = self.verdict(self.OFF, self.log(record))
+                self.assertEqual((v["requested"], v["observed"], v["verdict"], v["blocks"]), (True, 0, "HONOURED", False))
+                self.assertEqual(v["counts"]["deferred"], 0)
+                self.assertEqual(v["counts"]["sync"], 1090)
+
+    def test_a_binary_that_emits_no_record_is_not_engaged(self) -> None:
+        v = self.verdict(self.OFF, self.log())
+        self.assertEqual((v["verdict"], v["blocks"]), ("NOT_HONOURED", True), v)
+        self.assertIn("ROUTE_NOT_ENGAGED", v["reason"])
+
+    def test_any_other_report_blocks_never_passes(self) -> None:
+        for name, log in (("lever on", self.log(self.record("1"))),
+                          ("not a number", self.log(self.record("no"))),
+                          ("a count with a sign", self.log(self.record("0", deferred="+1"))),
+                          ("a trailing field", self.log(self.record("0") + " extra=1")),
+                          ("a field missing", self.log(self.record("0").replace(" max_depth=2", ""))),
+                          ("another session's record", self.log(self.record("0", session=2))),
+                          ("two records", self.log(self.record("0"), self.record("0"))),
+                          ("a start-line field is not a record", self.log(start=self.START + " deferred_enabled=0")),
+                          ("embedded in another record", self.log(start=self.START + " env_x=1 | " + self.record("0"))),
+                          ("no log", "")):
+            with self.subTest(case=name):
+                v = self.verdict(self.OFF, log)
+                self.assertEqual((v["verdict"], v["blocks"]), ("NOT_HONOURED", True), v)
+
+    def test_a_leg_that_does_not_ask_is_unchanged_unless_the_app_reports_the_lever_off(self) -> None:
+        for spec in ({}, {"generatorArgs": {"unpaced": True}}, {"generatorArgs": {"disableReconReleaseDeferred": False}}):
+            for name, log in (("control binary, no record", self.log()),
+                              ("lever on", self.log(self.record("1"))),
+                              ("lever on, nothing deferred (a cpu leg)", self.log(self.record("1", deferred="0"))),
+                              ("no log", "")):
+                with self.subTest(spec=spec, case=name):
+                    v = self.verdict(spec, log)
+                    self.assertEqual((v["requested"], v["verdict"], v["blocks"]), (False, "NOT_REQUESTED", False), v)
+            with self.subTest(spec=spec, case="inherited"):
+                v = self.verdict(spec, self.log(self.record("0")))
+                self.assertEqual((v["requested"], v["verdict"], v["blocks"]), (False, "NOT_HONOURED", True), v)
+                self.assertIn("RECON_RELEASE_DEFERRED_INHERITED", v["reason"])
+            with self.subTest(spec=spec, case="unreadable"):
+                v = self.verdict(spec, self.log(self.record("1") + " extra=1"))
+                self.assertEqual((v["verdict"], v["blocks"]), ("NOT_HONOURED", True), v)
+
+    def test_the_head_arm_reads_its_counts(self) -> None:
+        v = self.verdict({}, self.log(self.record("1", deferred="412")))
+        self.assertEqual(v["observed"], 1)
+        self.assertEqual((v["counts"]["deferred"], v["counts"]["drained"], v["counts"]["maxDepth"], v["counts"]["outstandingAtStop"]), (412, 412, 2, 0))
 
 
 class PrepConflatedMoveLegSpecTests(unittest.TestCase):
