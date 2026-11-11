@@ -68,10 +68,11 @@ BUILD_SHA = re.compile(r'"build_sha"\s*:\s*"([^"]*)"')
 #       final=<look-assist-final-frameN.png|none> final_sha256=<hex of the exact PNG bytes|none> final_exposure=<n>
 #       safety=<keep|retreat|revert> frame=<n>
 # It is logged after the application's last look change and BEFORE that application's look_assist.apply.result line.
-PICTURE_DUMP = re.compile(r"\binteraction_trace event=look_assist\.apply\.picture_dump(?:\s(.*))?$")
+EVENT = re.compile(r"\binteraction_trace event=(\S+)")     # the event a log line IS: its first such token
+DUMP_EVENT = "look_assist.apply.picture_dump"
 FIELD = re.compile(r"(?<!\S)([a-z_0-9]+)=(\S*)")
 LOG_FRAME = re.compile(r"(?<!\S)frame=(\S*)")      # the whitespace-delimited key: last_frame=<n> is another field
-DIGITS = re.compile(r"[0-9]+")
+DIGITS = re.compile(r"[0-9]{1,9}")      # a frame number; never an arbitrarily long digit string
 FINAL_PICTURE_NAME = re.compile(r"^look-assist-final-frame(\d+)\.png$")
 
 
@@ -99,9 +100,10 @@ def parse_log_text(text):
         if skip:
             skipped = skipped or skip.group(1) or "no reason logged"   # arm-level marker: the first skip is named
             continue
-        dump = PICTURE_DUMP.search(line)
-        if dump:
-            pairs = FIELD.findall(dump.group(1) or "")
+        head = EVENT.search(line)
+        event = head.group(1) if head else None
+        if event == DUMP_EVENT:
+            pairs = FIELD.findall(line[head.end():])
             fields = dict(pairs)
             if len(fields) != len(pairs):
                 fields["_duplicate_key"] = "1"      # a key given twice is ambiguous, never a binding
@@ -123,14 +125,14 @@ def parse_log_text(text):
             receipt.pop("picture_dump", None)        # a new application began: the earlier result's dump is not its
             pending_dump = None                     # auto_wb precedes the dump of its own application
             continue
-        result = RESULT.search(line)
+        result = RESULT.search(line) if event in (None, "look_assist.apply.result") else None
         if result:
             receipt = dict(receipt or {}, scene=result.group(1), exposure=int(result.group(2)),
                            temperature=int(result.group(3)), tint=int(result.group(4)))
             receipt["frame"] = LOG_FRAME.findall(line)     # raw tokens: validated where the picture is bound
             receipt["picture_dump"], pending_dump = pending_dump, None    # this application owns the dump before it
             continue
-        applied = ASYNC_APPLIED.search(line)
+        applied = ASYNC_APPLIED.search(line) if event in (None, "look_assist.apply.auto_wb_async_applied") else None
         if applied:
             receipt = dict(receipt or {}, source=applied.group(1), decision=applied.group(2),
                            temperature=int(applied.group(3)), tint=int(applied.group(4)), exposure=int(applied.group(5)))

@@ -573,6 +573,38 @@ class PictureDumpBindingAdversaryR1(unittest.TestCase):
         self.assertEqual(2, code, text)
 
 
+class PictureDumpBindingAdversaryR2(unittest.TestCase):
+    """Adversary pass r1 on b9106c64 (A1, A2)."""
+
+    def bound(self, trace_for):
+        root = tempfile.TemporaryDirectory()
+        self.addCleanup(root.cleanup)
+        make_bound_set(root.name, trace_for)
+        return root.name
+
+    def test_a1_an_event_spelled_out_inside_another_events_field_is_not_a_dump_or_a_result(self):
+        embedded_dump = lambda sha: AUTO_WB_LINE + dump_line(sha).replace(
+            "event=look_assist.apply.picture_dump",
+            "event=look_assist.apply.post_balance note=interaction_trace event=look_assist.apply.picture_dump") + result_line()
+        root = self.bound(embedded_dump)
+        code, text = run_checker([root, "--tag", "t"])
+        self.assertEqual(1, code, text)
+        self.assertIn("UNBOUND_LEGACY", text)
+        self.assertNotIn("picture_dump-bound", text)
+        # a genuine bound application, then another event that spells a result out in a field: the result stands
+        forged = PREFIX + "look_assist.apply.post_balance note=interaction_trace event=look_assist.apply.result scene=night preset_exp=999 final_temp=1 final_tint=1\n"
+        root = self.bound(lambda sha: AUTO_WB_LINE + dump_line(sha) + result_line() + forged)
+        code, text = run_checker([root, "--tag", "t"])
+        self.assertEqual(0, code, text)
+        self.assertIn("picture_dump-bound", text)
+
+    def test_a2_an_absurdly_long_frame_is_stale_not_a_crash(self):
+        root = self.bound(lambda sha: AUTO_WB_LINE + dump_line(sha) + result_line().replace("frame=0", "frame=" + "9" * 4301))
+        code, text = run_checker([root, "--tag", "t"])
+        self.assertEqual(1, code, text)
+        self.assertIn("STALE", text)
+
+
 class PngReader(unittest.TestCase):
     def test_every_png_filter_decodes_to_the_same_pixels(self):
         with tempfile.TemporaryDirectory() as root:
