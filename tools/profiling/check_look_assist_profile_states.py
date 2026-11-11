@@ -45,6 +45,7 @@ import re
 import sys
 
 import check_look_assist_sidecars as sidecars
+import look_assist_png
 import verify_exe_stamp
 
 DEFAULT_CLIPS = ("tiny_dual_iso", "large_dual_iso")
@@ -67,9 +68,10 @@ BUILD_SHA = re.compile(r'"build_sha"\s*:\s*"([^"]*)"')
 #       final=<look-assist-final-frameN.png|none> final_sha256=<hex of the exact PNG bytes|none> final_exposure=<n>
 #       safety=<keep|retreat|revert> frame=<n>
 # It is logged after the application's last look change and BEFORE that application's look_assist.apply.result line.
-PICTURE_DUMP = re.compile(r"look_assist\.apply\.picture_dump\b(.*)")
-FIELD = re.compile(r"\b([a-z_0-9]+)=(\S+)")
-LOG_FRAME = re.compile(r"(?<![\w])frame=(\d+)")
+PICTURE_DUMP = re.compile(r"\binteraction_trace event=look_assist\.apply\.picture_dump(?:\s(.*))?$")
+FIELD = re.compile(r"(?<!\S)([a-z_0-9]+)=(\S*)")
+LOG_FRAME = re.compile(r"(?<!\S)frame=(\S*)")      # the whitespace-delimited key: last_frame=<n> is another field
+DIGITS = re.compile(r"[0-9]+")
 FINAL_PICTURE_NAME = re.compile(r"^look-assist-final-frame(\d+)\.png$")
 
 
@@ -89,11 +91,6 @@ def parse_log_text(text):
     newest_dump = None       # the newest picture_dump line anywhere in the log
     dump_lines = 0
     for line in text.splitlines():
-        dump = PICTURE_DUMP.search(line)
-        if dump:
-            pending_dump = newest_dump = dict(FIELD.findall(dump.group(1)))
-            dump_lines += 1
-            continue
         if SAFETY_FALLBACK.search(line):
             receipt = {"safety_fallback": True}
             pending_dump = None
@@ -101,6 +98,15 @@ def parse_log_text(text):
         skip = APPLY_SKIP.search(line)
         if skip:
             skipped = skipped or skip.group(1) or "no reason logged"   # arm-level marker: the first skip is named
+            continue
+        dump = PICTURE_DUMP.search(line)
+        if dump:
+            pairs = FIELD.findall(dump.group(1) or "")
+            fields = dict(pairs)
+            if len(fields) != len(pairs):
+                fields["_duplicate_key"] = "1"      # a key given twice is ambiguous, never a binding
+            pending_dump = newest_dump = fields
+            dump_lines += 1
             continue
         if FALLBACK_TO_MASTER.search(line):
             receipt = {"fell_back": True}
@@ -121,20 +127,14 @@ def parse_log_text(text):
         if result:
             receipt = dict(receipt or {}, scene=result.group(1), exposure=int(result.group(2)),
                            temperature=int(result.group(3)), tint=int(result.group(4)))
-            receipt.pop("frame", None)
-            frame = LOG_FRAME.search(line)
-            if frame:
-                receipt["frame"] = int(frame.group(1))
+            receipt["frame"] = LOG_FRAME.findall(line)     # raw tokens: validated where the picture is bound
             receipt["picture_dump"], pending_dump = pending_dump, None    # this application owns the dump before it
             continue
         applied = ASYNC_APPLIED.search(line)
         if applied:
             receipt = dict(receipt or {}, source=applied.group(1), decision=applied.group(2),
                            temperature=int(applied.group(3)), tint=int(applied.group(4)), exposure=int(applied.group(5)))
-            receipt.pop("frame", None)
-            frame = LOG_FRAME.search(line)
-            if frame:
-                receipt["frame"] = int(frame.group(1))
+            receipt["frame"] = LOG_FRAME.findall(line)     # raw tokens: validated where the picture is bound
             receipt["picture_dump"], pending_dump = pending_dump, None
     if skipped:
         receipt = dict(receipt or {}, skipped=skipped)
@@ -214,16 +214,8 @@ def check_subject(name, directory, subject_sha):
     return []
 
 
-def file_sha256(path):
-    digest = hashlib.sha256()
-    with open(path, "rb") as handle:
-        for block in iter(lambda: handle.read(1 << 20), b""):
-            digest.update(block)
-    return digest.hexdigest()
-
-
-def check_picture_binding(name, receipt, png_path, allow_legacy=False):
-    """-> (state, failures). state is 'bound' (the newest picture_dump line names exactly this PNG, by content, for the
+def check_picture_binding(name, receipt, png_path, png_bytes, allow_legacy=False):
+    """-> (state, failures); png_bytes are the bytes of png_path that are also measured (one read). state is 'bound' (the newest picture_dump line names exactly this PNG, by content, for the
     last application), 'legacy' (the arm's log has no picture_dump line at all: UNBOUND_LEGACY, a failure unless
     allow_legacy), 'stale' (a picture_dump line exists and does not bind this PNG) or None (no usable receipt: the
     decision gate already failed the arm). 793-I2: a readable PNG left by an earlier run must not pass."""
@@ -250,18 +242,21 @@ def check_picture_binding(name, receipt, png_path, allow_legacy=False):
     wanted = FINAL_PICTURE_NAME.match(os.path.basename(png_path))
     named = FINAL_PICTURE_NAME.match(dump["final"])
     failures = []
+    if dump.get("_duplicate_key"):
+        failures.append("%s: STALE - the picture_dump line gives a key twice" % name)
     if not named or dump["final"] != os.path.basename(png_path):
         failures.append("%s: STALE - picture_dump names final=%r, the gate reads %s" % (name, dump["final"], os.path.basename(png_path)))
-    if not dump["frame"].isdigit() or (wanted and wanted.group(1) != dump["frame"]) or (named and named.group(1) != dump["frame"]):
+    result_frames = receipt.get("frame") or []
+    if not DIGITS.fullmatch(dump["frame"]) or (wanted and wanted.group(1) != dump["frame"]) or (named and named.group(1) != dump["frame"]):
         failures.append("%s: STALE - picture_dump frame=%s does not match the picture under test (%s)"
                         % (name, dump["frame"], os.path.basename(png_path)))
-    elif "frame" in receipt and receipt["frame"] != int(dump["frame"]):
-        failures.append("%s: STALE - picture_dump frame=%s but the application's result is frame=%d"
-                        % (name, dump["frame"], receipt["frame"]))
+    elif len(result_frames) != 1 or not DIGITS.fullmatch(result_frames[0]) or int(result_frames[0]) != int(dump["frame"]):
+        failures.append("%s: STALE - the application's result must carry exactly one frame=<digits> equal to picture_dump "
+                        "frame=%s (got %r)" % (name, dump["frame"], result_frames))
     if dump["final_exposure"] != str(receipt["exposure"]):
         failures.append("%s: STALE - picture_dump final_exposure=%s but the application's receipt exposure is %d"
                         % (name, dump["final_exposure"], receipt["exposure"]))
-    actual = file_sha256(png_path)
+    actual = hashlib.sha256(png_bytes).hexdigest()
     if actual != dump["final_sha256"].lower():
         failures.append("%s: STALE - sha256 of %s is %s, picture_dump final_sha256=%s (the file is not the picture the app wrote)"
                         % (name, os.path.basename(png_path), actual, dump["final_sha256"]))
@@ -339,14 +334,16 @@ def main(argv=None):
                                 % (name, ", ".join(os.path.relpath(p, directory) for p in missing)))
                 continue
             try:
-                chroma = sidecars.deck_cast_chroma(applied_png)
+                with open(applied_png, "rb") as handle:
+                    applied_bytes = handle.read()        # ONE read: the bytes hashed below are the bytes measured here
+                chroma = look_assist_png.deck_cast_chroma(applied_png, applied_bytes)
                 master = sidecars.deck_cast_chroma(master_png)
             except (OSError, ValueError) as error:
                 print("cannot read a picture of %s: %s" % (name, error))
                 return 2
             klass = receipt_class(receipts[(clip, mode)]) or "?"
             tolerance = args.master_tolerance if klass == "master" else 0.0
-            state, binding_failures = check_picture_binding(name, receipts[(clip, mode)], applied_png, args.allow_unbound_legacy)
+            state, binding_failures = check_picture_binding(name, receipts[(clip, mode)], applied_png, applied_bytes, args.allow_unbound_legacy)
             failures += binding_failures
             if state == "legacy":
                 legacy.append(name)

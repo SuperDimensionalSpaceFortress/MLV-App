@@ -475,6 +475,104 @@ class PictureDumpBinding(unittest.TestCase):
             self.assertIn("UNBOUND_LEGACY", text)
 
 
+class PictureDumpBindingAdversaryR1(unittest.TestCase):
+    """Adversary pass r1 on 7404a9ca (A1-A4): each input below passed the first cut of the binding."""
+
+    def bound(self, trace_for):
+        root = tempfile.TemporaryDirectory()
+        self.addCleanup(root.cleanup)
+        make_bound_set(root.name, trace_for)
+        return root.name
+
+    def test_a1_a_picture_dump_token_inside_a_skip_or_fallback_event_never_hides_it(self):
+        good = lambda sha: AUTO_WB_LINE + dump_line(sha) + result_line()
+        for label, extra in (("skip", PREFIX + "look_assist.apply.skip reason=look_assist.apply.picture_dump\n"),
+                             ("safety_fallback", PREFIX + "look_assist.apply.safety_fallback warning=look_assist.apply.picture_dump\n")):
+            with self.subTest(label):
+                root = self.bound(lambda sha, extra=extra: extra + good(sha))
+                code, text = run_checker([root, "--tag", "t"])
+                self.assertEqual(1, code, text)
+                self.assertTrue("skipped" in text or "safety fallback" in text, text)
+        # and the token as a FIELD of another event is not a picture_dump line at all
+        root = self.bound(lambda sha: AUTO_WB_LINE + PREFIX + "look_assist.apply.post_balance note=look_assist.apply.picture_dump final=none\n"
+                          + dump_line(sha) + result_line())
+        self.assertEqual(0, run_checker([root, "--tag", "t"])[0])
+
+    def test_a2_the_result_must_carry_exactly_one_frame_equal_to_the_dumps(self):
+        no_frame = PREFIX + ("look_assist.apply.result analysis=raw scene=shade median=37.000 preset_exp=160 preset_contrast=15 "
+                             "final_temp=8950 final_tint=-35 thumb=180x226\n")
+        for label, result in (("-1", result_line().replace("frame=0", "frame=-1")),
+                              ("missing", no_frame),
+                              ("0.5", result_line().replace("frame=0", "frame=0.5")),
+                              ("0x10", result_line().replace("frame=0", "frame=0x10")),
+                              ("empty", result_line().replace("frame=0", "frame=")),
+                              ("last-frame=0 frame=1", result_line().replace("frame=0", "last-frame=0 frame=1")),
+                              ("frame given twice", result_line().rstrip("\n") + " frame=0\n"),
+                              ("another frame", result_line(frame=2))):
+            with self.subTest(label):
+                root = self.bound(lambda sha, result=result: AUTO_WB_LINE + dump_line(sha) + result)
+                code, text = run_checker([root, "--tag", "t"])
+                self.assertEqual(1, code, text)
+                self.assertIn("STALE", text)
+        # an async application owns its dump the same way
+        root = self.bound(lambda sha: DISPATCH_LINE + dump_line(sha) + ASYNC_APPLIED_LINE.replace("frame=0", "frame=-1"))
+        self.assertEqual(1, run_checker([root, "--tag", "t"])[0])
+        root = self.bound(lambda sha: DISPATCH_LINE + dump_line(sha) + ASYNC_APPLIED_LINE)
+        code, text = run_checker([root, "--tag", "t"])
+        self.assertEqual(0, code, text)
+        self.assertIn("picture_dump-bound", text)
+
+    def test_a_key_given_twice_in_the_dump_line_is_ambiguous_and_stale(self):
+        root = self.bound(lambda sha: AUTO_WB_LINE + dump_line(sha).rstrip("\n") + " final_exposure=160\n" + result_line())
+        code, text = run_checker([root, "--tag", "t"])
+        self.assertEqual(1, code, text)
+        self.assertIn("twice", text)
+
+    def test_a3_the_measured_picture_and_the_hashed_picture_are_one_read(self):
+        import builtins
+        from unittest import mock
+        root = self.bound(lambda sha: AUTO_WB_LINE + dump_line(sha) + result_line())
+        real_open = builtins.open
+        reads = []
+
+        def counting_open(path, *args, **kwargs):
+            if os.path.basename(str(path)) == os.path.basename(chk.APPLIED_PICTURE) and "tiny_dual_iso-sync" in str(path):
+                reads.append(str(path))
+            return real_open(path, *args, **kwargs)
+
+        with mock.patch("builtins.open", counting_open):
+            code, text = run_checker([root, "--tag", "t"])
+        self.assertEqual(0, code, text)
+        self.assertEqual(1, len(reads), reads)
+
+    def test_a4_a_picture_that_cannot_be_read_is_exit_2_never_a_crash(self):
+        import builtins
+        from unittest import mock
+        root = self.bound(lambda sha: AUTO_WB_LINE + dump_line(sha) + result_line())
+        real_open = builtins.open
+        seen = []
+
+        def locked_after_first(path, *args, **kwargs):
+            if "tiny_dual_iso-sync" in str(path) and os.path.basename(str(path)) == os.path.basename(chk.APPLIED_PICTURE):
+                seen.append(1)
+                if len(seen) > 1:
+                    raise PermissionError(13, "sharing violation", str(path))
+            return real_open(path, *args, **kwargs)
+
+        with mock.patch("builtins.open", locked_after_first):
+            code, text = run_checker([root, "--tag", "t"])           # a lock after the single read changes nothing
+        self.assertEqual(0, code, text)
+
+        def locked(path, *args, **kwargs):
+            if "tiny_dual_iso-sync" in str(path) and os.path.basename(str(path)) == os.path.basename(chk.APPLIED_PICTURE):
+                raise PermissionError(13, "sharing violation", str(path))
+            return real_open(path, *args, **kwargs)
+
+        with mock.patch("builtins.open", locked):
+            code, text = run_checker([root, "--tag", "t"])
+        self.assertEqual(2, code, text)
+
+
 class PngReader(unittest.TestCase):
     def test_every_png_filter_decodes_to_the_same_pixels(self):
         with tempfile.TemporaryDirectory() as root:

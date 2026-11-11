@@ -17,6 +17,12 @@ def read_png_rgb(path):
     """-> (width, height, rows) with rows a list of bytes objects of width*3 RGB bytes. ValueError if unsupported."""
     with open(path, "rb") as handle:
         data = handle.read()
+    return decode_png_rgb(data, path)
+
+
+def decode_png_rgb(data, path):
+    """read_png_rgb over bytes already in memory (path is only the name used in error messages), so a caller can hash
+    and measure the SAME bytes (check_look_assist_profile_states.py binds the picture it measures by content)."""
     if data[:8] != _SIGNATURE:
         raise ValueError("%s: not a PNG" % path)
     pos = 8
@@ -79,9 +85,10 @@ def read_png_rgb(path):
     return width, height, rows
 
 
-def deck_region_mean_rgb(path):
-    """Mean colour of the deck region of one frame (same region as the real-app sheet metrics)."""
-    width, height, rows = read_png_rgb(path)
+def deck_region_mean_rgb(path, data=None):
+    """Mean colour of the deck region of one frame (same region as the real-app sheet metrics). data = the PNG bytes
+    when the caller already holds them (path is then only a name)."""
+    width, height, rows = read_png_rgb(path) if data is None else decode_png_rgb(data, path)
     x0, x1 = int(width * 0.02), int(width * 0.25)
     y0, y1 = int(height * 0.65), int(height * 0.98)
     totals = [0, 0, 0]
@@ -115,7 +122,7 @@ def lab_chroma(mean_rgb):
     return (a * a + b * b) ** 0.5
 
 
-def deck_cast_chroma(path):
+def deck_cast_chroma(path, data=None):
     """CIELAB chroma of the mean deck colour of one frame; inf when the region is empty."""
-    mean = deck_region_mean_rgb(path)
+    mean = deck_region_mean_rgb(path, data)
     return float("inf") if mean is None else lab_chroma(mean)
