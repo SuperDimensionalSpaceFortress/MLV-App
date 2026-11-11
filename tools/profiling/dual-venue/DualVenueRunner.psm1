@@ -2894,7 +2894,8 @@ function Get-DvVisualMeanAbsDiff {
 # area and the verdict flags a leg whose median numbers leave a band. A measurement, not a look: nothing here changes a pixel the app renders.
 $script:ExposureNearBlackLuma = 16      # luma (0..255) under which a pixel is near-black
 $script:ExposureClippedLuma = 235       # luma (0..255) over which a pixel is clipped
-$script:ExposureLetterboxRowMean = 2    # a viewport row whose full-width mean luma is under this is letterbox, not picture
+$script:ExposureLetterboxRowMean = 2    # a viewport row whose full-width mean luma is under this is a dark row; dark rows are letterbox only as a symmetric pair of edge bars
+$script:ExposureLetterboxMaxEdgeFraction = 0.25   # ... and at most this fraction of the rows per edge: a deeper bar pair is mostly picture
 # The absolute band used when a clip has no row in exposure-bands.json (or the file is missing / empty / malformed): median mean luma >= 16, median
 # near-black fraction <= 0.60, median clipped fraction <= 0.05. The upper luma limit is the scale's own end, so it never trips by default.
 $script:ExposureFallbackBand = [pscustomobject]@{ minMedianLuma = 16.0; maxMedianLuma = 255.0; maxNearBlackFraction = 0.60; maxClippedFraction = 0.05 }
@@ -2915,9 +2916,12 @@ function Get-DvVisualExposureStats {
     <#
     .SYNOPSIS
     The exposure numbers of one frame's picture area (pure): from packed R,G,B bytes (-Width x -Height, the viewport already cut out), the BT.709 mean
-    luma (0..255), the near-black fraction (luma < 16) and the clipped fraction (luma > 235). Rows whose full-width mean luma is under 2 are letterbox
-    bars, not picture, and are left out (letterboxRowsDropped); when EVERY row is that dark the picture itself is black, so all rows are measured (a
-    black frame must read as black, never as "no picture to judge"). Returns $null for an empty or mis-sized array. The numbers are NOT rounded: the
+    luma (0..255), the near-black fraction (luma < 16) and the clipped fraction (luma > 235). A letterbox is a run of dark rows (full-width mean luma
+    under 2) at BOTH the top and the bottom edge: the matching depth of the two runs, at most a quarter of the rows per edge, is left out
+    (letterboxRowsDropped). Every other dark row is picture: a dark band in the middle, a dark run at only one edge, or the part of a deeper bar beyond
+    the cap is a crushed picture (r2, fable B1 / Dot 796-I1: dropping every dark row wherever it sat measured a banded dark frame on its bright rows
+    only and read it OK). When EVERY row is that dark the picture itself is black, so all rows are measured (a black frame must read as black, never as
+    "no picture to judge"). Returns $null for an empty or mis-sized array. The numbers are NOT rounded: the
     verdict compares them to a band whose caps are the owner's to choose (a cap of 0.00042 must flag one clipped pixel in 2304), so only the
     reason text rounds, for display.
     #>
@@ -2934,8 +2938,15 @@ function Get-DvVisualExposureStats {
         }
         $rowMean[$y] = $rowSum / $Width
     }
-    $keep = @(0..($Height - 1) | Where-Object { $rowMean[$_] -ge $script:ExposureLetterboxRowMean })
-    if ($keep.Count -eq 0) { $keep = @(0..($Height - 1)) }
+    $top = 0
+    while ($top -lt $Height -and $rowMean[$top] -lt $script:ExposureLetterboxRowMean) { $top++ }
+    $drop = 0
+    if ($top -lt $Height) {   # (an all-dark frame is a black picture: nothing is a bar)
+        $bottom = 0
+        while ($rowMean[$Height - 1 - $bottom] -lt $script:ExposureLetterboxRowMean) { $bottom++ }   # ($top < $Height, so a bright row ends this walk)
+        $drop = [math]::Min([math]::Min($top, $bottom), [int][math]::Floor($Height * $script:ExposureLetterboxMaxEdgeFraction))
+    }
+    $keep = @($drop..($Height - 1 - $drop))
     $sum = 0.0; $nearBlack = 0; $clipped = 0
     foreach ($y in $keep) {
         for ($x = 0; $x -lt $Width; $x++) {
@@ -2973,15 +2984,43 @@ function ConvertTo-DvExposureLimit($Element, [double]$Min, [double]$Max) {
     $d
 }
 
+function ConvertTo-DvExposureRow($Row, $Fallback) {
+    # one clip row (a System.Text.Json element) -> [pscustomobject]@{ band; why }: band is the row's band with a left-out field taking the fallback's value,
+    # why is $null; or band is $null and why says what is wrong with the row (not an object, a repeated or unknown field, an unusable value, none of the
+    # four fields, min above max)
+    $fail = { param($why) [pscustomobject]@{ band = $null; why = $why } }
+    if ($Row.ValueKind -ne [System.Text.Json.JsonValueKind]::Object) { return (& $fail 'not an object') }
+    $repeated = Get-DvJsonRepeatedKey $Row
+    if ($null -ne $repeated) { return (& $fail "the row repeats the field '$repeated'") }
+    $limits = [ordered]@{ minMedianLuma = @(0.0, 255.0); maxMedianLuma = @(0.0, 255.0); maxNearBlackFraction = @(0.0, 1.0); maxClippedFraction = @(0.0, 1.0) }
+    # a field this gate does not know (a misspelt cap beside a valid one) must not silently take the fallback's value (names compare ordinally)
+    foreach ($property in $Row.EnumerateObject()) {
+        if (@($limits.Keys | Where-Object { Test-DvOrdinalEqual $_ $property.Name }).Count -eq 0) { return (& $fail "the row has the unknown field '$($property.Name)'") }
+    }
+    $band = [ordered]@{}; $named = 0
+    foreach ($name in $limits.Keys) {
+        $fields = @($Row.EnumerateObject() | Where-Object { Test-DvOrdinalEqual $_.Name $name })
+        if ($fields.Count -eq 0) { $band[$name] = $Fallback.$name; continue }
+        $value = ConvertTo-DvExposureLimit $fields[0].Value $limits[$name][0] $limits[$name][1]
+        if ($null -eq $value) { return (& $fail "$name must be a number in $($limits[$name][0])..$($limits[$name][1])") }
+        $band[$name] = [double]$value; $named++
+    }
+    if ($named -eq 0) { return (& $fail 'it names none of minMedianLuma, maxMedianLuma, maxNearBlackFraction, maxClippedFraction') }
+    if ($band.minMedianLuma -gt $band.maxMedianLuma) { return (& $fail 'minMedianLuma is above maxMedianLuma') }
+    [pscustomobject]@{ band = [pscustomobject]$band; why = $null }
+}
+
 function Get-DvExposureBand {
     <#
     .SYNOPSIS
     The exposure band a clip's legs are judged against: its row in exposure-bands.json, else the absolute fallback band. Returns
     [pscustomobject]@{ band; source; note }. source: clip (the clip's row) | fallback-no-row (the file is valid and has no row for the clip, or no clip
     id was given) | fallback-empty (the file is empty) | fallback-missing | fallback-malformed. note is $null unless the file could not be used
-    (missing or malformed): that is REPORTED, never a silent OK. A row names any of minMedianLuma, maxMedianLuma, maxNearBlackFraction,
-    maxClippedFraction; a field it leaves out takes the fallback's value. A row with an unusable field (not a number, out of range, min above max), or
-    with none of the four, is malformed and the fallback band judges instead. Clip ids match exactly (case-sensitive).
+    (missing, empty or malformed): that is REPORTED, never a silent OK. A row names any of minMedianLuma, maxMedianLuma, maxNearBlackFraction,
+    maxClippedFraction and nothing else; a field it leaves out takes the fallback's value. A row with an unusable field (not a number, out of range, min
+    above max), a field it repeats or does not know, or with none of the four, is malformed and the fallback band judges instead. Clip ids match exactly
+    (case-sensitive). r2 (sol B1, Dot 796-D1): the file is validated WHOLE, every row, before any row is selected (and whether or not the clip has one):
+    a malformed row anywhere makes the file malformed, so a relaxed row can never be picked from a file that has an ambiguous row beside it.
     #>
     param([string]$ClipId, [string]$Path = $script:ExposureBandsPath)
     $fallback = $script:ExposureFallbackBand
@@ -2990,7 +3029,7 @@ function Get-DvExposureBand {
         return (& $result 'fallback-missing' "the exposure band file is missing ($Path): the absolute fallback band judges" $fallback)
     }
     try { $text = [IO.File]::ReadAllText($Path) } catch { return (& $result 'fallback-malformed' "the exposure band file cannot be read ($($_.Exception.GetType().Name)): the absolute fallback band judges" $fallback) }
-    if ([string]::IsNullOrWhiteSpace($text)) { return (& $result 'fallback-empty' $null $fallback) }
+    if ([string]::IsNullOrWhiteSpace($text)) { return (& $result 'fallback-empty' "the exposure band file is empty ($Path): the absolute fallback band judges" $fallback) }
     # System.Text.Json, not ConvertFrom-Json: that unwraps a one-element array root ([{"clips": ...}] reads as the object, so a non-object file would pick a
     # row), and rejects keys that differ only in case ({"M16-1457": ..., "m16-1457": ...} is valid JSON and clip ids match exactly)
     $json = $null
@@ -3010,25 +3049,18 @@ function Get-DvExposureBand {
         if ($clips.ValueKind -ne [System.Text.Json.JsonValueKind]::Object) { return (& $bad 'clips is not a JSON object') }
         $repeated = Get-DvJsonRepeatedKey $clips
         if ($null -ne $repeated) { return (& $bad "clips repeats the clip id '$repeated'") }
-        $rowProps = @(if (-not [string]::IsNullOrWhiteSpace($ClipId)) { $clips.EnumerateObject() | Where-Object { Test-DvOrdinalEqual $_.Name $ClipId } })
-        if ($rowProps.Count -eq 0) { return (& $result 'fallback-no-row' $null $fallback) }
-        $badRow = { param($why) (& $result 'fallback-malformed' "the exposure band row for clip '$ClipId' is malformed ($why): the absolute fallback band judges" $fallback) }
-        $row = $rowProps[0].Value
-        if ($row.ValueKind -ne [System.Text.Json.JsonValueKind]::Object) { return (& $badRow 'not an object') }
-        $repeated = Get-DvJsonRepeatedKey $row
-        if ($null -ne $repeated) { return (& $badRow "the row repeats the field '$repeated'") }
-        $limits = [ordered]@{ minMedianLuma = @(0.0, 255.0); maxMedianLuma = @(0.0, 255.0); maxNearBlackFraction = @(0.0, 1.0); maxClippedFraction = @(0.0, 1.0) }
-        $band = [ordered]@{}; $named = 0
-        foreach ($name in $limits.Keys) {
-            $fields = @($row.EnumerateObject() | Where-Object { Test-DvOrdinalEqual $_.Name $name })
-            if ($fields.Count -eq 0) { $band[$name] = $fallback.$name; continue }
-            $value = ConvertTo-DvExposureLimit $fields[0].Value $limits[$name][0] $limits[$name][1]
-            if ($null -eq $value) { return (& $badRow "$name must be a number in $($limits[$name][0])..$($limits[$name][1])") }
-            $band[$name] = [double]$value; $named++
+        # every row is checked BEFORE one is chosen (and also when the clip has none): a malformed row anywhere is a malformed file
+        $selected = $null
+        foreach ($rowProperty in $clips.EnumerateObject()) {
+            $parsed = ConvertTo-DvExposureRow $rowProperty.Value $fallback
+            if ($null -ne $parsed.why) { return (& $bad "the row for clip '$($rowProperty.Name)' is malformed: $($parsed.why)") }
+            if (-not [string]::IsNullOrWhiteSpace($ClipId) -and (Test-DvOrdinalEqual $rowProperty.Name $ClipId)) { $selected = $parsed.band }
         }
-        if ($named -eq 0) { return (& $badRow 'it names none of minMedianLuma, maxMedianLuma, maxNearBlackFraction, maxClippedFraction') }
-        if ($band.minMedianLuma -gt $band.maxMedianLuma) { return (& $badRow 'minMedianLuma is above maxMedianLuma') }
-        & $result 'clip' $null ([pscustomobject]$band)
+        if ($null -eq $selected) { return (& $result 'fallback-no-row' $null $fallback) }
+        & $result 'clip' $null $selected
+    } catch {
+        # a document the walk above cannot read (a key that is not valid text, say) is malformed, never a throw that ends the leg
+        return (& $result 'fallback-malformed' "the exposure band file cannot be read ($($_.Exception.GetType().Name)): the absolute fallback band judges" $fallback)
     } finally { $json.Dispose() }
 }
 
@@ -3431,10 +3463,8 @@ function Read-DvVisualCaptures {
         $block.exposureMedianClippedFraction = Get-DvExposureMedian ([double[]]@($measured | ForEach-Object { [double]$_.exposureClippedFraction }))
         $bandInfo = Get-DvExposureBand -ClipId $ClipId -Path $ExposureBandPath
         $block.exposureBand = $bandInfo.band; $block.exposureBandSource = $bandInfo.source; $block.exposureBandNote = $bandInfo.note
-        if ($bandInfo.note) {
-            $exposureNote = $bandInfo.note
-            if (-not $block.reason) { $block.reason = $exposureNote }
-        }
+        # (never pre-set as block.reason, r2 fable H2: that displaced a NOT_CAPTURED verdict's own reason; the finish clause appends it to every reason)
+        if ($bandInfo.note) { $exposureNote = $bandInfo.note }
     }
     if ($judgeKind -ceq 'play_unbound' -and $block.distinctContentHashes -eq 1 -and [int]$block.forcedPlayDistinctContentHashes -gt 1) {
         $maskNote = "the forced play captures show $($block.forcedPlayDistinctContentHashes) distinct pictures where the unforced ones show one: the force-paint would have masked this"

@@ -9299,8 +9299,8 @@ class VisualExposureFloorTests(unittest.TestCase):
         fallback = {"minMedianLuma": 16, "maxMedianLuma": 255, "maxNearBlackFraction": 0.6, "maxClippedFraction": 0.05}
         rows = [  # file text (None = absent), clip asked, expected source, band, whether a note is reported
             (None, "c", "fallback-missing", fallback, True),
-            ("", "c", "fallback-empty", fallback, False),
-            ("   \n", "c", "fallback-empty", fallback, False),
+            ("", "c", "fallback-empty", fallback, True),   # r2 (fable H5): an empty or truncated file is reported, never silent
+            ("   \n", "c", "fallback-empty", fallback, True),
             ("{}", "c", "fallback-no-row", fallback, False),
             ('{"clips": {}}', "c", "fallback-no-row", fallback, False),
             ('{"clips": null}', "c", "fallback-no-row", fallback, False),
@@ -9355,7 +9355,7 @@ class VisualExposureFloorTests(unittest.TestCase):
     def test_the_visual_exposure_gate_takes_a_clip_row_over_the_fallback(self) -> None:
         with tempfile.TemporaryDirectory(prefix="vis-exp-band-") as d:
             path = Path(d) / "bands.json"
-            # a deliberately dark clip: its accepted legs sit near luma 6, 84% near-black, so its own band admits them
+            # a deliberately dark clip: its legs sit near luma 6, 84% near-black, so its own band admits them
             path.write_text('{"schema": "mlv-app/dual-venue-exposure-bands/v1", "clips": {"dark-clip": {"minMedianLuma": 3, "maxMedianLuma": 30, "maxNearBlackFraction": 0.9}}}',
                             encoding="utf-8")
             row = self.exposure(self.underexposed(), str(path), clip="dark-clip")
@@ -9370,7 +9370,7 @@ class VisualExposureFloorTests(unittest.TestCase):
     def test_the_visual_exposure_bands_file_is_committed_with_no_clip_rows(self) -> None:
         doc = json.loads((DV / "exposure-bands.json").read_text(encoding="utf-8"))
         self.assertEqual(doc["schema"], "mlv-app/dual-venue-exposure-bands/v1")
-        self.assertEqual(doc["clips"], {}, "rows are seeded from accepted legs by VISUAL-GATE-EXPOSURE-BANDS-SEED-1, not here")
+        self.assertEqual(doc["clips"], {}, "rows are seeded from the grade corpus by VISUAL-GATE-EXPOSURE-BANDS-SEED-1, not here")
         proc, out = run_pwsh_json("Get-DvExposureBand -ClipId 'M16-1457' | ConvertTo-Json -Depth 4 -Compress")
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         self.assertEqual((out["source"], out["note"]), ("fallback-no-row", None))
@@ -9402,7 +9402,7 @@ class VisualExposureFloorTests(unittest.TestCase):
             # adversary a32b95c6 A1: -ceq is a culture comparison that ignores an embedded NUL, so "c<NUL>" was the row of "c"; names compare ordinally
             ('{"clips": {"c\\u0000": {"minMedianLuma": 4}}}', "c", "fallback-no-row", 16),
             ('{"clips\\u0000": {"c": {"minMedianLuma": 4}}}', "c", "fallback-no-row", 16),
-            ('{"clips": {"c": {"minMedianLuma\\u0000": 4, "maxClippedFraction": 0.5}}}', "c", "clip", 16),
+            ('{"clips": {"c": {"minMedianLuma\\u0000": 4, "maxClippedFraction": 0.5}}}', "c", "fallback-malformed", 16),   # r2 (fable H4): the NUL field is an unknown field, so the row is malformed
             ('{"clips": {"c\\u200b": {"minMedianLuma": 4}, "c": {"minMedianLuma": 6}}}', "c", "clip", 6),
             # adversary a32b95c6 A2: a repeated key is ambiguous whoever it belongs to (another clip's row, an unknown field, an unrelated root key)
             ('{"clips": {"c": {"minMedianLuma": 4}, "other": {"minMedianLuma": 4}, "other": {"minMedianLuma": 5}}}', "c", "fallback-malformed", 16),
@@ -9426,6 +9426,102 @@ class VisualExposureFloorTests(unittest.TestCase):
             self.assertEqual(self.exposure(self.underexposed(), str(path))["verdict"]["verdict"], "EXPOSURE_OUT_OF_RANGE")
             both = Path(d) / "strict-3.json"
             self.assertEqual(self.exposure(self.underexposed(), str(both), clip="c")["verdict"]["verdict"], "EXPOSURE_OUT_OF_RANGE", "c's row (min 4) still holds near-black 0.84 over the 0.6 fallback cap")
+
+    # ---- r2 (PR #796): sol B1 / Dot 796-D1, fable B1 / Dot 796-I1, fable H2-H5 ----------------------------------------------------------------------------
+
+    def test_the_visual_exposure_numbers_drop_only_symmetric_edge_bars(self) -> None:
+        # r2 (fable B1, Dot 796-I1, opus hardening): the old filter dropped EVERY full-width row with mean luma < 2 wherever it sat, so a banded dark picture
+        # was measured on its bright rows only. Only a dark run at BOTH the top and the bottom edge is a letterbox, and at most a quarter of the rows per edge.
+        black, dim = (0, 0, 0), (40, 40, 40)
+        fallback_flags = "EXPOSURE_OUT_OF_RANGE"
+        cases = [  # name, pixel(y), rows dropped, verdict on the fallback band
+            ("fable B1: rows 0-5 dim, rows 6-35 crushed (the M16-1457 numbers)", lambda y: dim if y < 6 else black, 0, fallback_flags),
+            ("Dot I1: six separated dim rows among 30 black rows", lambda y: (60, 60, 60) if y in (2, 8, 14, 20, 26, 32) else black, 4, fallback_flags),
+            ("35 black rows and one bright row in the middle", lambda y: (200, 200, 200) if y == 18 else black, 18, fallback_flags),
+            ("35 black rows and one bright row at the top", lambda y: (200, 200, 200) if y == 0 else black, 0, fallback_flags),
+            ("35 black rows and one bright row at the bottom", lambda y: (200, 200, 200) if y == 35 else black, 0, fallback_flags),
+            ("an interior dark band under a bright top and bottom", lambda y: black if 6 <= y < 30 else (90, 90, 90), 0, fallback_flags),
+        ]
+        for name, pixel, dropped, verdict in cases:
+            with self.subTest(name):
+                out = self.exposure(self.rgb(lambda x, y, i: pixel(y)))
+                px = [self.luma(*pixel(i // self.W)) for i in range(self.W * self.H)]
+                if dropped == 0:
+                    self.assertEqual(out["stats"]["letterboxRowsDropped"], 0, out["stats"])
+                    self.assertAlmostEqual(out["stats"]["lumaMean"], sum(px) / len(px), places=3)
+                else:
+                    self.assertEqual(out["stats"]["letterboxRowsDropped"], dropped, out["stats"])
+                self.assertEqual(out["verdict"]["verdict"], verdict, out["verdict"]["reason"])
+        # a symmetric pair of bars is still dropped, up to a quarter of the rows per edge; a bar pair of 12 rows each is cut to 9 and the rest is picture
+        wide = self.exposure(self.rgb(lambda x, y, i: (0, 0, 0) if y < 12 or y >= self.H - 12 else (128, 128, 128)))
+        self.assertEqual(wide["stats"]["letterboxRowsDropped"], 18)
+        self.assertEqual(wide["verdict"]["verdict"], "OK", wide["verdict"]["reason"])
+        # bars of different depth: only the matching depth is dropped, the rest of the deeper bar is picture
+        uneven = self.exposure(self.rgb(lambda x, y, i: (0, 0, 0) if y < 4 or y >= self.H - 2 else (128, 128, 128)))["stats"]
+        self.assertEqual(uneven["letterboxRowsDropped"], 4)
+
+    def test_the_visual_exposure_band_file_validates_every_row_before_selecting_one(self) -> None:
+        # r2 (sol B1, Dot 796-D1): a repeated field in ANY clip row (not only the selected one), and the absent-clip sibling, make the file malformed
+        fallback = {"minMedianLuma": 16, "maxMedianLuma": 255, "maxNearBlackFraction": 0.6, "maxClippedFraction": 0.05}
+        relaxed = '"c": {"minMedianLuma": 0, "maxNearBlackFraction": 1}'
+        rows = [  # file text, clip asked, expected source
+            ('{"clips": {' + relaxed + ', "other": {"minMedianLuma": 4, "minMedianLuma": 5}}}', "c", "fallback-malformed"),   # sol's repro, verbatim
+            ('{"clips": {' + relaxed + ', "other": {"minMedianLuma": 4, "minMedianLuma": 5}}}', "other", "fallback-malformed"),
+            ('{"clips": {' + relaxed + ', "other": {"minMedianLuma": 4, "minMedianLuma": 5}}}', "absent", "fallback-malformed"),
+            ('{"clips": {' + relaxed + ', "other": {"minMedianLuma": 4, "minMedianLuma": 5}}}', "", "fallback-malformed"),
+            ('{"clips": {"other": {"x": 1, "x": 2}}}', "absent", "fallback-malformed"),
+            ('{"clips": {"other": {"minMedianLuma": 4, "minMedianLuma": 4}}}', "absent", "fallback-malformed"),   # a repeat of the same value is still a repeat
+            # every other per-row check, on a row that is NOT the selected one
+            ('{"clips": {' + relaxed + ', "other": 5}}', "c", "fallback-malformed"),
+            ('{"clips": {' + relaxed + ', "other": []}}', "c", "fallback-malformed"),
+            ('{"clips": {' + relaxed + ', "other": null}}', "c", "fallback-malformed"),
+            ('{"clips": {' + relaxed + ', "other": {}}}', "c", "fallback-malformed"),
+            ('{"clips": {' + relaxed + ', "other": {"minMedianLuma": "4"}}}', "c", "fallback-malformed"),
+            ('{"clips": {' + relaxed + ', "other": {"minMedianLuma": 300}}}', "c", "fallback-malformed"),
+            ('{"clips": {' + relaxed + ', "other": {"minMedianLuma": 50, "maxMedianLuma": 20}}}', "c", "fallback-malformed"),
+            ('{"clips": {' + relaxed + ', "other": {"minMedianLuma": 4, "zzz": 1}}}', "c", "fallback-malformed"),
+            ('{"clips": {"other": {"minMedianLuma": 50, "maxMedianLuma": 20}}}', "absent", "fallback-malformed"),
+            # fable H4: a misspelt field beside a valid one must not silently take the fallback's value
+            ('{"clips": {"c": {"minMedianLuma": 3, "maxNearBlackFration": 0.9}}}', "c", "fallback-malformed"),
+            # fable H3: a lone-surrogate key is read without a throw (it is a clip id no real clip has, so the clip has no row); inside a row it is an unknown field
+            ('{"clips": {"\\ud800": {"minMedianLuma": 4}}}', "c", "fallback-no-row"),
+            ('{"clips": {"c": {"minMedianLuma": 4}, "d": {"\\ud800": 4}}}', "c", "fallback-malformed"),
+            # controls: valid rows beside the selected one change nothing
+            ('{"clips": {"c": {"minMedianLuma": 4}, "other": {"maxClippedFraction": 0.5}}}', "c", "clip"),
+            ('{"clips": {"c": {"minMedianLuma": 4}, "other": {"maxClippedFraction": 0.5}}}', "absent", "fallback-no-row"),
+        ]
+        with tempfile.TemporaryDirectory(prefix="vis-exp-band-") as d:
+            for n, (text, clip, source) in enumerate(rows):
+                with self.subTest(text=text, clip=clip):
+                    path = Path(d) / f"rows-{n}.json"
+                    path.write_text(text, encoding="utf-8")
+                    proc, out = run_pwsh_json(f"Get-DvExposureBand -ClipId '{clip}' -Path '{path}' | ConvertTo-Json -Depth 4 -Compress")
+                    self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+                    self.assertIsNotNone(out, proc.stdout + proc.stderr)
+                    self.assertEqual(out["source"], source, out)
+                    self.assertEqual(out["note"] is not None, source == "fallback-malformed", out)
+                    if source == "fallback-malformed":
+                        self.assertEqual(out["band"], fallback)
+            # the verdict: sol's relaxed band would have read the under-exposed frame as OK
+            path = Path(d) / "rows-0.json"
+            for clip in ("c", "absent"):
+                got = self.exposure(self.underexposed(), str(path), clip=clip)
+                self.assertEqual(got["verdict"]["verdict"], "EXPOSURE_OUT_OF_RANGE", got["verdict"]["reason"])
+                self.assertEqual(got["band"]["source"], "fallback-malformed")
+                self.assertIn("exposure band file is unusable", got["verdict"]["reason"] + str(got["band"]["note"]))
+
+    @requires_windows_imaging
+    def test_the_visual_reader_keeps_a_not_captured_reason_beside_an_unusable_band_file(self) -> None:
+        # r2 (fable H2): the band-file note was pre-set as block.reason, which displaced the NOT_CAPTURED verdict's own reason
+        with tempfile.TemporaryDirectory(prefix="vis-exp-read-") as d:
+            visual = Path(d) / "artifacts" / "visual"
+            write_visual_captures(visual, "ok")
+            for k in range(1, 6):
+                (visual / f"play-{k}.png").unlink()
+            out = self.read(d, f"-ClipId 'unit-clip' -ExposureBandPath '{Path(d) / 'absent.json'}'")
+            self.assertEqual(out["verdict"], "NOT_CAPTURED", out["reason"])
+            self.assertIn("only 1 play frame(s) were captured", out["reason"])
+            self.assertIn("exposure band file is missing", out["reason"], "the band-file warning is beside the verdict's reason, not instead of it")
 
     def test_the_visual_exposure_numbers_are_compared_unrounded(self) -> None:
         # adversary dfb973a0 A3: one clipped pixel in 2304 is 0.000434; rounded to 4 places it read 0.0004 and passed a cap of 0.00042
@@ -10501,6 +10597,50 @@ class VisualCaptureRunnerTests(RunnerHarness, unittest.TestCase):
         self.assertEqual(receipt["outcome"], "INVALID", receipt["outcomeDetail"])
         self.assertIn("VISUAL_DIVERGENCE on self-heal pre-launch pre-1", receipt["outcomeDetail"])
         self.assertNotIn("pre-2", receipt["outcomeDetail"])
+
+    def darken(self, visual_dir: Path, base: int) -> None:
+        """Repaint a write_visual_captures('ok') directory dark (a flat 'base' with a moving brighter bar): every other check still passes, only the exposure is wrong."""
+        calls = [f"New-DarkPng '{visual_dir / f'play-{k}.png'}' {k} {base}" for k in range(6)]
+        calls += [f"New-DarkPng '{visual_dir / name}' 5 {base}" for name in ("stop.png", "paused.png")]
+        proc = run_pwsh(["-Command", VisualExposureFloorTests.DARK_PNG_PS + "\n".join(calls)])
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+
+    def run_dark_self_heal(self, launches: dict):
+        """launches: pre-<n> -> 'dark' (an OK-shaped capture repainted dark) or a write_visual_captures mode; the measured run's own captures are fine."""
+        self.write_artifacts()
+        write_visual_captures(self.artifacts / "visual", "ok")
+        shutil.rmtree(self.artifacts / "self-heal", ignore_errors=True)
+        for name, mode in launches.items():
+            dest = self.artifacts / "self-heal" / name / "visual"
+            write_visual_captures(dest, "ok" if mode == "dark" else mode)
+            if mode == "dark":
+                self.darken(dest, 4)
+        return self.run_leg("ultra-magnus", self.write_spec(), extra=["-Backend", "cpu"])
+
+    @requires_windows_imaging
+    def test_the_leg_runner_counts_and_surfaces_a_dark_measured_picture(self) -> None:
+        """r2 (fable H7): the Invoke-VenueLeg wiring pinned by BEHAVIOUR, not source text -- a leg whose pictures move and match but are crushed dark is
+        counted (PASS, never INVALID) and says EXPOSURE_OUT_OF_RANGE in its detail."""
+        self.write_artifacts()
+        write_visual_captures(self.artifacts / "visual", "ok")
+        self.darken(self.artifacts / "visual", 4)
+        _, receipt, _ = self.run_leg("ultra-magnus", self.write_spec(), extra=["-Backend", "cpu"])
+        self.assertEqual((receipt["visual"]["verdict"], receipt["visual"]["counted"]), ("EXPOSURE_OUT_OF_RANGE", True), receipt["visual"]["reason"])
+        self.assertEqual(receipt["outcome"], "PASS", receipt["outcomeDetail"])
+        self.assertIn("EXPOSURE_OUT_OF_RANGE (counted for speed, surfaced for review)", receipt["outcomeDetail"])
+
+    @requires_windows_imaging
+    def test_a_dark_self_heal_pre_launch_is_counted_and_surfaced_but_every_other_non_ok_one_still_voids_the_leg(self) -> None:
+        """r2 (fable H7): the self-heal exemption by behaviour. A dark pre-launch is the one non-OK verdict that does not void the leg; it is in the detail."""
+        _, receipt, _ = self.run_dark_self_heal({"pre-1": "dark", "pre-2": "ok"})
+        self.assertEqual(receipt["selfHealVisual"]["pre-1"]["verdict"], "EXPOSURE_OUT_OF_RANGE")
+        self.assertEqual(receipt["outcome"], "PASS", receipt["outcomeDetail"])
+        self.assertIn("EXPOSURE_OUT_OF_RANGE on self-heal pre-launch pre-1 (counted, surfaced for review)", receipt["outcomeDetail"])
+        self.assertNotIn("pre-2", receipt["outcomeDetail"])
+        # the same dark pre-launch beside a frozen one: the frozen one still voids the leg
+        _, receipt, _ = self.run_dark_self_heal({"pre-1": "dark", "pre-2": "frozen"})
+        self.assertEqual(receipt["outcome"], "INVALID", receipt["outcomeDetail"])
+        self.assertIn("FROZEN_DISPLAY on self-heal pre-launch pre-2", receipt["outcomeDetail"])
 
     def test_a_self_heal_pre_launch_with_no_captures_makes_the_leg_invalid(self) -> None:
         """GPU-DEVICE-LOSS-SELF-HEAL-1 r7: pre-2 published its self-heal\\pre-2 but no visual\\ (captured=false): NOT_CAPTURED is no picture of the fallback."""

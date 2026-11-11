@@ -93,17 +93,22 @@ Numbers are computed from the VIDEO VIEWPORT only -- the window's timecode and f
   picture that is equally wrong in both arms passed (M16-1457: "visual OK 6/6" at mean luma 6.9/255, 84 % near-black). Each frame's
   entry now carries `exposureLumaMean` (BT.709, 0..255), `exposureNearBlackFraction` (luma < 16) and `exposureClippedFraction`
   (luma > 235), measured on the picture area (the same viewport rectangle and 64x36 pixels the picture is hashed on) after dropping
-  letterbox rows (a row whose full-width mean luma is under 2; `exposureLetterboxRowsDropped`; a frame with no row above that is
-  measured whole, so a black frame reads as black). The block carries the MEDIANS over the judged play frames:
+  letterbox rows. A letterbox is a run of dark rows (full-width mean luma under 2) at BOTH the top and the bottom edge: the matching depth
+  of the two runs, at most a quarter of the rows per edge, is dropped (`exposureLetterboxRowsDropped`). Every other dark row is picture, so a
+  banded or crushed dark frame is measured on all its rows and reads dark (a dark run at one edge only, or a dark band in the middle, is not
+  a bar); a frame whose every row is dark is measured whole, so a black frame reads as black. The block carries the MEDIANS over the judged
+  play frames:
   `exposureMedianLuma`, `exposureMedianNearBlackFraction`, `exposureMedianClippedFraction` (and `exposureFrames`, how many), and the band
   they were judged against: `exposureBand` (`minMedianLuma`, `maxMedianLuma`, `maxNearBlackFraction`, `maxClippedFraction`),
   `exposureBandSource` and `exposureBandNote`. The band is the clip's row in `tools/profiling/dual-venue/exposure-bands.json`, else the
   absolute fallback: median luma >= 16, median near-black fraction <= 0.60, median clipped fraction <= 0.05. The file ships with
-  **no clip rows**; they are derived from accepted legs by a follow-up (VISUAL-GATE-EXPOSURE-BANDS-SEED-1). A missing or malformed file
-  (or row) is judged on the fallback and says so in `exposureBandNote` and the reason (`exposureBandSource` `fallback-missing` /
-  `fallback-malformed`), never a silent OK; an empty file or a clip with no row is `fallback-empty` / `fallback-no-row`. The file is parsed
-  with System.Text.Json: the root must be a JSON object (a one-element array is malformed, not unwrapped), clip ids match exactly
-  (`M16-1457` and `m16-1457` are two clips), and a duplicate `clips`, clip row or field is malformed. The medians and fractions are
+  **no clip rows**; they are seeded from the grade corpus by a follow-up (VISUAL-GATE-EXPOSURE-BANDS-SEED-1; HUB RULING 2026-11-10T07:14:03Z
+  item 3). A missing, empty or malformed file (or row) is judged on the fallback and says so in `exposureBandNote` and the reason
+  (`exposureBandSource` `fallback-missing` / `fallback-empty` / `fallback-malformed`), never a silent OK; a clip with no row is `fallback-no-row`
+  (no note). The file is parsed with System.Text.Json and validated WHOLE, every row, before any row is chosen (also when the clip has no row):
+  the root must be a JSON object (a one-element array is malformed, not unwrapped), clip ids match exactly (`M16-1457` and `m16-1457` are two
+  clips), a duplicate root key, `clips`, clip row or field is malformed, and so is any row, selected or not, that is not an object, repeats a
+  field, has a field other than the four caps (a misspelt cap would silently take the fallback's value), or has an unusable value. The medians and fractions are
   stored unrounded (the reason rounds to 6 places for display), so a cap such as `maxClippedFraction` 0.00042 flags one clipped pixel in 2304.
 
 | verdict | when | counted |

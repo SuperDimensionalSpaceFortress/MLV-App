@@ -1089,7 +1089,8 @@ if ($outcome -in @('PASS', 'FAIL') -and $null -ne $receipt.visual) {
     }
 }
 # GPU-DEVICE-LOSS-SELF-HEAL-1 r7 (sol r6 blocker; ledger scope 2026-10-15T08:05:36Z): every self-heal pre-launch the leg ran must show an OK picture. The fallback
-# runs L1-L3 ARE what the leg proves, so a PASS/FAIL leg is INVALID when any pre-launch's visual verdict is anything but OK -- FROZEN_DISPLAY, VISUAL_DIVERGENCE,
+# runs L1-L3 ARE what the leg proves, so a PASS/FAIL leg is INVALID when any pre-launch's visual verdict is anything but OK or EXPOSURE_OUT_OF_RANGE (the one
+# flag that is never an exclusion, VISUAL-GATE-EXPOSURE-FLOOR-1: counted and said in the detail) -- FROZEN_DISPLAY, VISUAL_DIVERGENCE,
 # NOT_CAPTURED, CAPTURE_BLANK, NOT_REQUESTED or a verdict this gate does not know -- or when a pre-launch the leg ran (pre-1..pre-<n> for the n entries of
 # generatorArgs.gpuPreLaunches, plus any pre-<n> it published) has no selfHealVisual entry or an entry with no verdict. The detail names every offending launch
 # and its verdict. (The measured run's own gate above, shared by every leg, is unchanged: there a divergence stays counted.)
