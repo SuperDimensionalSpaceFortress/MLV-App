@@ -736,6 +736,33 @@ class PictureDumpBindingAdversaryR3(unittest.TestCase):
         code, text = run_checker([root, "--tag", "t"])
         self.assertEqual(0, code, text)
 
+    # ---- adversary pass on 2c000780 (A1, A2): each input below passed the second cut ----
+    def test_p5_a1_the_results_frame_is_a_field_of_its_own_event_body_not_a_token_before_the_marker(self):
+        no_frame = lambda line: line.replace(" frame=0", "")
+        cases = {
+            "result": lambda sha: AUTO_WB_LINE + dump_line(sha) + "frame=0 " + no_frame(result_line()),
+            "async applied": lambda sha: DISPATCH_LINE + dump_line(sha) + "frame=0 " + no_frame(ASYNC_APPLIED_LINE),
+            "result with frame=1 before the marker too": lambda sha: AUTO_WB_LINE + dump_line(sha) + "frame=1 " + result_line(),
+        }
+        for label, trace_for in cases.items():
+            with self.subTest(label):
+                code, text = run_checker([self.bound(trace_for), "--tag", "t"])
+                if label.startswith("result with"):
+                    self.assertEqual(0, code, text)      # control: the body's own single frame=0 is what counts
+                else:
+                    self.assertEqual(1, code, text)
+                    self.assertNotIn("picture_dump-bound", text)
+
+    def test_p5_a2_the_interaction_trace_tag_is_a_standalone_token_not_a_suffix_or_a_field_value(self):
+        for label, forged in (("hyphen", "not-interaction_trace event="), ("field value", "note=interaction_trace event="),
+                              ("underscore suffix", "x_interaction_trace event=")):
+            with self.subTest(label):
+                root = self.bound(lambda sha, forged=forged: (AUTO_WB_LINE + dump_line(sha) + result_line()).replace(
+                    "interaction_trace event=", forged))
+                code, text = run_checker([root, "--tag", "t"])
+                self.assertEqual(1, code, text)
+                self.assertNotIn("picture_dump-bound", text)
+
     def test_a5_a_corrupt_png_is_exit_2_not_a_crash(self):
         import struct
         import zlib

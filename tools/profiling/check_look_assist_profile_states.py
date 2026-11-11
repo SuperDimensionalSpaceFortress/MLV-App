@@ -81,7 +81,7 @@ BUILD_SHA = re.compile(r'"build_sha"\s*:\s*"([^"]*)"')
 #       final=<look-assist-final-frameN.png|none> final_sha256=<hex of the exact PNG bytes|none> final_exposure=<n>
 #       safety=<keep|retreat|revert> frame=<n>
 # It is logged after the application's last look change and BEFORE that application's look_assist.apply.result line.
-TRACE_TAG = re.compile(r"\binteraction_trace\b")      # the FIRST such tag on a line is its interaction_trace marker
+TRACE_TAG = re.compile(r"(?<!\S)interaction_trace(?!\S)")      # a standalone token (not a suffix or a field value); the FIRST is the marker
 TRACE_EVENT = re.compile(r"\s+event=(\S*)")           # what must follow it; an empty or absent event is NO event, never the next marker
 
 
@@ -95,7 +95,6 @@ def line_event(line):
     return (named.group(1), named.end()) if named else ("", tag.end())
 DUMP_EVENT = "look_assist.apply.picture_dump"
 FIELD = re.compile(r"(?<!\S)([a-z_0-9]+)=(\S*)")
-LOG_FRAME = re.compile(r"(?<!\S)frame=(\S*)")      # the whitespace-delimited key: last_frame=<n> is another field
 DIGITS = re.compile(r"[0-9]{1,9}")      # a frame number; never an arbitrarily long digit string
 FINAL_PICTURE_NAME = re.compile(r"^look-assist-final-frame(\d+)\.png$")
 
@@ -177,7 +176,7 @@ def parse_log_text(text):
                 continue
             receipt = dict(receipt or {}, scene=scene, exposure=exposure, temperature=temperature, tint=tint)
             receipt.pop("malformed_event", None)
-            receipt["frame"] = LOG_FRAME.findall(line)     # raw tokens: validated where the picture is bound
+            receipt["frame"] = [value for key, value in pairs if key == "frame"]    # this event's own body fields; validated at the binding
             if marked:
                 receipt["picture_dump"], pending_dump = pending_dump, None    # this application owns the dump before it
             else:
@@ -192,7 +191,7 @@ def parse_log_text(text):
                 continue
             receipt = dict(receipt or {}, source=source, decision=decision, temperature=temperature, tint=tint, exposure=exposure)
             receipt.pop("malformed_event", None)
-            receipt["frame"] = LOG_FRAME.findall(line)     # raw tokens: validated where the picture is bound
+            receipt["frame"] = [value for key, value in pairs if key == "frame"]    # this event's own body fields; validated at the binding
             if marked:
                 receipt["picture_dump"], pending_dump = pending_dump, None
             else:
