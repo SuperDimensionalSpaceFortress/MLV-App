@@ -1382,7 +1382,7 @@ try {
     # 'cleanup-identifier' case lists every accepted and refused shape of r6-r10):
     #   header := 'tmp_remaining=' PATH ' ' TYPE ': '
     #   PATH   := an ABSOLUTE path that STARTS the token: a drive and a separator ('C:\' or 'C:/') or a leading separator ('/x', '\\srv'); then
-    #             any run of characters legal in a Windows path, i.e. none of  : * ? " < > |  and no line break (spaces and '=' are fine);
+    #             any run of characters legal in a Windows path, i.e. none of  : * ? " < > |  and no control character (0x00-0x1f, so no line break or tab; spaces and '=' are fine);
     #             it ENDS at the FIRST '.tmp' that is followed by ' ' TYPE ': '.    TYPE := [\w.`]+ (a .NET type name).
     # The path is delimited by ITS OWN token and nothing after that token's end is ever searched: ':' cannot occur inside a legal path, so the
     # lazy match cannot run on through 'IOException: see C:\y\j.json.<g>.tmp' to borrow a later filename; a token that does not start as an
@@ -1390,7 +1390,7 @@ try {
     # (Read-SidecarRetainedHeader): it must end in a separator, then '<name>.json.<32 hex>.tmp', <name> = the exact id when one is given.
     # Refused on purpose (conservative; never a status): a long-path prefix and a ':' in a directory name. The writer's temp root is a plain
     # drive or UNC path, and a refusal degrades to $null, like any other header this check cannot attribute to the id.
-    $script:SidecarRetainedRx = [regex]::new('\Gtmp_remaining=(?<path>(?:[A-Za-z]:[\\/]|[\\/])[^:*?"<>|\r\n]*?\.tmp) [\w.\x60]+: ')
+    $script:SidecarRetainedRx = [regex]::new('\Gtmp_remaining=(?<path>(?:[A-Za-z]:[\\/]|[\\/])[^:*?"<>|\x00-\x1f]*?\.tmp) [\w.\x60]+: ')
     $script:SidecarAttemptsStartRx = [regex]::new('(?= attempts=\d+ )')
     $script:SidecarAttemptsRx = [regex]::new('\G attempts=\d+ ')
     $script:SidecarStatusRx = [regex]::new('\G(?:tmp=removed|tmp=unknown\([\w.\x60]+\)) [\w.\x60]+: ')
@@ -3034,6 +3034,11 @@ function Exit-HeavySlot {
             @{ n = 'r10 first starts with a separator but holds a colon'; m = "tmp_remaining=/ bogus IOException: see /y/j.json.$z32.tmp IOException: x"; id = 'j'; want = 'NULL' },
             @{ n = 'r10 first path with a colon inside a directory'; m = "tmp_remaining=C:\a:b\j.json.$z32.tmp IOException: x"; id = 'j'; want = 'NULL' },
             @{ n = 'r10 first path with no separator before the file'; m = "tmp_remaining=j.json.$z32.tmp IOException: x"; id = 'j'; want = 'NULL' },
+            @{ n = 'adversary r10 A1 first path with a NUL'; m = "tmp_remaining=C:\a$([char]0)b\j.json.$z32.tmp IOException: x"; id = 'j'; want = 'NULL' },
+            @{ n = 'adversary r10 A1 first path with a tab'; m = "tmp_remaining=C:\a$([char]9)b\j.json.$z32.tmp IOException: x"; id = 'j'; want = 'NULL' },
+            @{ n = 'adversary r10 A1 first path with 0x1f'; m = "tmp_remaining=C:\a$([char]31)b\j.json.$z32.tmp IOException: x"; id = 'j'; want = 'NULL' },
+            @{ n = 'adversary r10 A1 second path with a NUL stays free text'; m = "tmp_remaining=C:\x\j.json.$z32.tmp IOException: x attempts=3 tmp_remaining=C:\a$([char]0)b\z.json.$z32.tmp IOException: x"; id = 'j'; want = 'tmp_remaining=' },
+            @{ n = 'adversary r10 A1 second path with a tab stays free text'; m = "tmp_remaining=C:\x\j.json.$z32.tmp IOException: x attempts=3 tmp_remaining=C:\a$([char]9)b\z.json.$z32.tmp IOException: x"; id = 'j'; want = 'tmp_remaining=' },
             @{ n = 'r8 complete second retained header'; m = "tmp_remaining=C:\x\j.json.$z32.tmp IOException: x attempts=3 tmp_remaining=C:\y\z.json.$z32.tmp IOException: x"; id = 'j'; want = 'ambiguous' },
             @{ n = 'r9 A1 complete second right after first (removed)'; m = "tmp_remaining=C:\x\j.json.$z32.tmp IOException: attempts=3 tmp=removed IOException: x"; id = 'j'; want = 'ambiguous' },
             @{ n = 'r9 A1 complete second right after first (unknown)'; m = "tmp_remaining=C:\x\j.json.$z32.tmp IOException: attempts=3 tmp=unknown(E) IOException: x"; id = 'j'; want = 'ambiguous' },
