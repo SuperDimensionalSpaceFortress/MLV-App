@@ -10756,8 +10756,12 @@ def _ident_probe_body() -> str:
 _IDENT_AFTER_REAP_DELAY_S = 0.0
 
 
-_IDENT_PAIR_TIGHT_NS = 100_000_000   # a (QPC, FILETIME) pair is believed only when the QPC reads on both sides of the FILETIME read are within 100 ms of each other
-_IDENT_CIVIL_STEP_TOLERANCE_S = 1.0   # over a run, civil elapsed and monotonic elapsed may differ by this much (slew, read granularity); more is a clock STEP
+_IDENT_PAIR_TIGHT_NS = 50_000_000   # a (QPC, FILETIME) pair is believed only when the QPC reads on both sides of the FILETIME read are within 50 ms of each other (error <= 25 ms)
+_IDENT_CIVIL_STEP_TOLERANCE_S = 0.5   # over a run, civil elapsed and monotonic elapsed may differ by this much (slew, read granularity); more is a clock STEP
+# MEASUREMENT UNCERTAINTY of the OS-exit estimate (pass-2 adversary A2): the two read pairs bound at most 2 * 25 ms, and a civil/monotonic disagreement under the tolerance is not seen, so a figure
+# is good to about this much. The limit sits 5 s under the injected 20 s holds and 15 s over a prompt exit, so a verdict is never decided inside it; a hold that lands within it of the limit may
+# classify either way, which is true of every threshold. A civil clock that steps one way and back inside ONE run (two opposite steps that cancel at the endpoints) is not seen at all: OPEN, see the PR body.
+_IDENT_EXIT_ESTIMATE_UNCERTAINTY_S = _IDENT_CIVIL_STEP_TOLERANCE_S + 2 * _IDENT_PAIR_TIGHT_NS / 2e9
 
 
 def _ident_win32_clock():
@@ -10876,10 +10880,12 @@ def _parse_probe_timing(stderr: str):
     None = no marker token at all. r4 (VENUE-PROBE-TIMING-PARSER-FULL-TOKEN-1): a line that carries the token is a PRESENT marker; it must match the whole line shape with plain integers of at
     most 18 digits (a longer, junk-suffixed or junk-PREFIXED field, or a line of another shape, is a typed `bad` failure, never a missing marker and never a ValueError) and anything else comes back with
     probe_ms=None and a `bad` reason, so a clock fault is a typed failure. end_qpc / qpc_hz are None when absent."""
-    m = re.search(r"^[^\r\n]*VENUE_PROBE_INTERNAL_MS=[^\r\n]*", stderr, re.M)
-    if not m:
+    if "VENUE_PROBE_INTERNAL_MS=" not in stderr:
         return None
-    line = m.group(0)
+    hits = [ln for ln in re.split(r"[\r\n]+", stderr) if "VENUE_PROBE_INTERNAL_MS=" in ln]
+    if len(hits) != 1:   # adversary A4: a second marker is never silently ignored
+        return {"probe_ms": None, "abandoned": None, "end_qpc": None, "qpc_hz": None, "bad": f"{len(hits)} timing marker lines on stderr, not exactly one: {[h[:60] for h in hits]!r}"}
+    line = hits[0]
     f = re.fullmatch(r"VENUE_PROBE_INTERNAL_MS=(\S*)\s+abandoned=(\d{1,9})(?:\s+end_qpc=(\d{1,18})\s+qpc_hz=(\d{1,18}))?\s*", line)
     if f is None:
         return {"probe_ms": None, "abandoned": None, "end_qpc": None, "qpc_hz": None,
@@ -11903,6 +11909,20 @@ class VenueProbeIdentityCallDeadlineTests(IdentityProbeMixin, unittest.TestCase)
         self.assertIn("typed failure", str(ctx.exception))
         self.assertNotIn("held the exit", str(ctx.exception))
 
+    def test_the_exit_estimate_tolerances_are_small_against_the_limit_and_enforced(self) -> None:
+        # adversary A2 (pass 2): the estimate's uncertainty is named, is well inside the margin between the limit and the injected hold, and the tolerances are what the pair read and the step check enforce
+        S, B = 10_000_000, 5_000_000_000_000
+        self.assertLess(_IDENT_EXIT_ESTIMATE_UNCERTAINTY_S, 1.0)
+        self.assertLess(_IDENT_EXIT_ESTIMATE_UNCERTAINTY_S, (20.0 - self.EXIT_HOLD_LIMIT_S) / 4, "far inside the 5 s between the injected hold and the limit")
+        pair0 = (90 * 10**9, B + 90 * S)
+        for step_s, believed in ((0.3, True), (-0.3, True), (0.7, False), (-0.7, False)):
+            ns, note = _ident_exit_from_pairs(pair0, (136 * 10**9, B + int((136 + step_s) * S)), B + 120 * S)
+            self.assertEqual(ns is not None, believed, (step_s, note))
+        loose = (100 * 10**9, B + 100 * S, 100 * 10**9 + _IDENT_PAIR_TIGHT_NS + 1_000_000)
+        self.assertIsNone(_ident_clock_pair(read_once=lambda: loose, tries=3), "a pair read wider than the tight bound is thrown away")
+        inside = (100 * 10**9, B + 100 * S, 100 * 10**9 + _IDENT_PAIR_TIGHT_NS - 1_000_000)
+        self.assertIsNotNone(_ident_clock_pair(read_once=lambda: inside, tries=3))
+
     def test_a_parent_stalled_inside_the_clock_pair_read_does_not_move_the_childs_exit(self) -> None:
         # adversary A2: the FILETIME is sampled at 100.1 s, the parent is descheduled 32 s, the second QPC read says 132.1 s. The midpoint (116.1 s) is 16 s wrong, so that pair is thrown away
         S, B = 10_000_000, 5_000_000_000_000
@@ -11994,12 +12014,16 @@ class VenueProbeIdentityCallDeadlineTests(IdentityProbeMixin, unittest.TestCase)
         for line in ("VENUE_PROBE_INTERNAL_MS= NaN abandoned=1", "VENUE_PROBE_INTERNAL_MS=10 abandoned=1 end_qpc=5 qpc_hz=10000000junk", "VENUE_PROBE_INTERNAL_MS=10 abandoned=1 end_qpc=5x qpc_hz=10",
                      f"VENUE_PROBE_INTERNAL_MS={digits} abandoned=1", f"VENUE_PROBE_INTERNAL_MS=10 abandoned={digits}", f"VENUE_PROBE_INTERNAL_MS=10 abandoned=1 end_qpc={digits} qpc_hz=10",
                      "VENUE_PROBE_INTERNAL_MS=10 abandoned=1 end_qpc=5", "VENUE_PROBE_INTERNAL_MS=10", "VENUE_PROBE_INTERNAL_MS=10 abandoned=1 trailing", "VENUE_PROBE_INTERNAL_MS=1e3 abandoned=1",
-                     "noiseVENUE_PROBE_INTERNAL_MS=1500 abandoned=1 end_qpc=1000000000 qpc_hz=10000000"):   # adversary A4: a prefix is not a clean marker line
+                     "noiseVENUE_PROBE_INTERNAL_MS=1500 abandoned=1 end_qpc=1000000000 qpc_hz=10000000",   # adversary A4: a prefix is not a clean marker line
+                     "VENUE_PROBE_INTERNAL_MS=1500 abandoned=1 end_qpc=1000000000 qpc_hz=10000000\nVENUE_PROBE_INTERNAL_MS=NaN abandoned=1",   # A4 pass 2: a second marker is not ignored
+                     "VENUE_PROBE_INTERNAL_MS=1500 abandoned=1 end_qpc=1000000000 qpc_hz=10000000\nVENUE_PROBE_INTERNAL_MS=1500 abandoned=1 end_qpc=1000000000 qpc_hz=10000000"):
             t = _parse_probe_timing(line + "\n")
             self.assertIsNotNone(t, line[:80])
             self.assertIsNone(t["probe_ms"], line[:80])
             self.assertTrue(t["bad"], line[:80])
         t = _parse_probe_timing("noise\r\nVENUE_PROBE_INTERNAL_MS=1500 abandoned=0 end_qpc=1000000000 qpc_hz=10000000\r\n")
+        self.assertEqual(t, {"probe_ms": 1500, "abandoned": 0, "end_qpc": 1000000000, "qpc_hz": 10000000})
+        t = _parse_probe_timing("\rVENUE_PROBE_INTERNAL_MS=1500 abandoned=0 end_qpc=1000000000 qpc_hz=10000000")   # A4 pass 2: a lone carriage return before the line is still a present, clean marker
         self.assertEqual(t, {"probe_ms": 1500, "abandoned": 0, "end_qpc": 1000000000, "qpc_hz": 10000000})
 
     def test_the_timing_marker_is_read_from_monotonic_clocks_and_no_civil_clock(self) -> None:
