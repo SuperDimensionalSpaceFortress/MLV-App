@@ -10776,7 +10776,7 @@ def _parse_probe_timing(stderr: str):
     """CI-FLAKE-VENUE-PROBE-GETOWNER-DEADLINE-1 r2: the probe's one stderr timing line, `VENUE_PROBE_INTERNAL_MS=<ms> abandoned=<n>`, where <ms> is ONE monotonic Stopwatch started at probe
     entry. None = no marker at all. A marker that is present but not a non-negative integer comes back with probe_ms=None and a `bad` reason, so a clock fault is a typed failure and never
     reads as a missing marker."""
-    m = re.search(r"VENUE_PROBE_INTERNAL_MS=(\S*) abandoned=(\d+)", stderr)
+    m = re.search(r"VENUE_PROBE_INTERNAL_MS=(\S*)\s+abandoned=(\d+)", stderr)
     if not m:
         return None
     raw = m.group(1)
@@ -10839,8 +10839,10 @@ class IdentityProbeMixin:
             anchor = "$script:ProbeSw = [Diagnostics.Stopwatch]::StartNew()"
             self.assertEqual(body.count(anchor), 1)
             body = body.replace(anchor, anchor + f"\nStart-Sleep -Seconds {probe_s}")
-        if exit_hold_s:
-            body = body + f"\nStart-Sleep -Seconds {exit_hold_s}"
+        if exit_hold_s:   # between the marker and the end of the process, so an abandoned call's Environment.Exit does not skip it (adversary A2)
+            exit_anchor = "if ($script:IdentAbandoned -gt 0 -or $script:TelAbandoned -gt 0) {"
+            self.assertEqual(body.count(exit_anchor), 1)
+            body = body.replace(exit_anchor, f"Start-Sleep -Seconds {exit_hold_s}\n" + exit_anchor)
         job = self.tmp / "identity-probe-job.ps1"
         job.write_text(prelude + body, encoding="utf-8")
         wall_started = _ident_time.monotonic()
@@ -11613,6 +11615,14 @@ class VenueProbeIdentityCallDeadlineTests(IdentityProbeMixin, unittest.TestCase)
             self.assert_no_exit_hold(require_abandoned=False)
         self.assertIn("outlived the probe", str(ctx.exception))
 
+    def test_an_exit_hold_is_rejected_when_a_slow_call_was_abandoned_too(self) -> None:
+        # adversary A2: the abandoned-call path ends in Environment.Exit, and the injected hold must still sit before it
+        self.run_identity_probe(self.procs, self.cim, CHAIN_OWNERS, delays={"cim": self.DELAY_MS}, call_ms=self.CALL_MS, timing=True, exit_hold_s=20)
+        self.assertGreaterEqual(self.last_timing["abandoned"], 1, self.timing_text())
+        with self.assertRaises(AssertionError) as ctx:
+            self.assert_no_exit_hold()
+        self.assertIn("outlived the probe", str(ctx.exception))
+
     def test_a_backward_civil_clock_step_cannot_fake_an_exit_hold_or_a_missing_marker(self) -> None:
         self.run_identity_probe(self.procs, self.cim, CHAIN_OWNERS, timing=True, probe_s=30, civil_step_s=-20)
         self.assertGreaterEqual(self.last_timing["probe_ms"], 30000, self.timing_text())
@@ -11621,6 +11631,8 @@ class VenueProbeIdentityCallDeadlineTests(IdentityProbeMixin, unittest.TestCase)
     def test_a_negative_or_unreadable_timing_marker_is_a_typed_failure_and_never_a_missing_marker(self) -> None:
         for raw in ("-10000", "1.5", "NaN", ""):
             t = _parse_probe_timing(f"VENUE_PROBE_INTERNAL_MS={raw} abandoned=1\n")
+            self.assertIsNotNone(t, raw)
+            t = _parse_probe_timing(f"VENUE_PROBE_INTERNAL_MS={raw}  abandoned=1\n")   # adversary A1: stray spacing is still a PRESENT marker
             self.assertIsNotNone(t, raw)
             self.assertIsNone(t["probe_ms"], raw)
             self.assertIn("not a non-negative integer", t["bad"])
