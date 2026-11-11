@@ -302,8 +302,9 @@ $ErrorActionPreference = 'Stop'
 # TEST SEAM (CI-FLAKE-VENUE-PROBE-GETOWNER-DEADLINE-1): $false in production; only a test rewrites this literal in its own copy of the job. When $true the job writes ONE stderr line
 # `VENUE_PROBE_INTERNAL_MS=<ms> abandoned=<n> end_qpc=<ticks> qpc_hz=<hz>` just before it ends. <ms> is read from ONE monotonic Stopwatch started at probe entry (r2: never a civil-clock
 # subtraction, which a clock step moves) and is a diagnostic only. r3: the exit-hold figure is NOT wall minus <ms> (that contains pwsh start-up, script parse and the test prelude, so a slow
-# start-up read as "held the exit"): <ticks> is Stopwatch.GetTimestamp() at the marker, i.e. the OS monotonic QueryPerformanceCounter, the clock the test reads with time.perf_counter_ns, so
-# the test measures marker -> process end, which is the exit and nothing before it. Nothing on the host (no environment variable, no file) can set the seam.
+# start-up read as "held the exit"): <ticks> is Stopwatch.GetTimestamp() at the marker, i.e. the OS monotonic QueryPerformanceCounter, the clock the test reads with time.perf_counter_ns. r4: the
+# test measures marker -> the child's OWN exit time (the OS-recorded ExitTime, moved onto that same axis), never the moment the parent resumed after reaping, so a starved parent is no exit hold.
+# Nothing on the host (no environment variable, no file) can set the seam.
 $ProbeTimingSeam = $false
 $script:ProbeSw = [Diagnostics.Stopwatch]::StartNew()
 $cpuCount = [Environment]::ProcessorCount
