@@ -2027,13 +2027,28 @@ def _ps_comment_at(text: str, i: int) -> bool:
     return text[i] == "#" and (i == 0 or not (text[i - 1].isalnum() or text[i - 1] in "_-.:/\\$\x02<"))  # \x02: a glued or escaped character, part of the same word; `<`: a `<#` that opened no block comment is a bare word (r15 A4)
 
 
-_PS_BLOCK_COMMENT_AFTER = frozenset(" \t\n;|&{}(),'\"")  # what may stand right before a `<#` that opens a block comment: a token has ended (measured against Parser.ParseInput, r15 A4)
+_PS_BLOCK_COMMENT_AFTER = frozenset(";|&{}(),'\"")  # besides white space, what always ends a token before a `<#` that opens a block comment (measured against Parser.ParseInput, r15 A4)
+_COMMENT_LOOSE = [False]  # set while a script is read the second way: every `<#` is a comment (`_judge_both`)
 
 
 def _ps_block_comment_at(text: str, i: int) -> bool:
-    """Does a PowerShell ``<#`` block comment start at ``text[i]``? Only where a token can begin (the start of the text, after white space, a separator, a bracket, a comma or
-    a quote that closes a string): ``a<#`` is a bare word, and the launch after it is code (r15 A4; ``Parser.ParseInput`` reads ``Write-Host a<#; Start-Process cmd.exe; #>`` as two commands)."""
-    return text.startswith("<#", i) and (i == 0 or text[i - 1] in _PS_BLOCK_COMMENT_AFTER)
+    """Does a PowerShell ``<#`` block comment start at ``text[i]``? Where a token can begin (the start of the text, after white space, a separator, a bracket, a comma or a quote
+    that closes a string): ``a<#`` is a bare word and the launch after it is code (r15 A4), but ``$a[0]<#`` is a comment, so a character the parser reads either way is judged both."""
+    return text.startswith("<#", i) and (_COMMENT_LOOSE[0] or i == 0 or text[i - 1].isspace() or text[i - 1] in _PS_BLOCK_COMMENT_AFTER)
+
+
+def _judge_both(script: str) -> tuple[int, int]:
+    """``_judge_script`` read with a ``<#`` that follows a non-separator as a bare word, and again as a comment: the worse reading counts (r15 A2; no per-character table of the parser's modes)."""
+    strict = _judge_script(script)
+    _COMMENT_LOOSE[0] = True
+    try:
+        loose = _judge_script(script)
+    finally:
+        _COMMENT_LOOSE[0] = False
+    return max(strict[0], loose[0]), max(strict[1], loose[1])
+
+
+_HERE_OPEN_RE = re.compile(r"@(['\"])[ \t]*\n")  # the opening of a here-string: `@"` or `@'` and the end of the line
 
 
 def _quoted_spans(text: str) -> list[tuple[int, int]]:
@@ -2041,6 +2056,13 @@ def _quoted_spans(text: str) -> list[tuple[int, int]]:
     spans, i, n = [], 0, len(text)
     while i < n:
         quote = text[i]
+        here = _HERE_OPEN_RE.match(text, i) if quote == "@" else None
+        if here:  # r15 (A1): a here-string holds quotes and is closed only by a quote and `@` at the start of a line
+            close = text.find("\n" + here.group(1) + "@", here.end() - 1)
+            end = n - 1 if close == -1 else close + 2
+            spans.append((i, end))
+            i = end + 1
+            continue
         if _ps_block_comment_at(text, i):  # a comment may hold an apostrophe; it must not open a string
             end = text.find("#>", i + 2)
             i = n if end == -1 else end + 2
@@ -2140,7 +2162,7 @@ def _unescape_ps(script: str) -> str:
     quote = [""] * len(script)
     for s, e in _quoted_spans(script):
         for k in range(s, e + 1):
-            quote[k] = script[s]
+            quote[k] = script[s + 1] if script[s] == "@" else script[s]  # a here-string takes its escapes from the quote after the `@`
     out, i, n = [], 0, len(script)
     while i < n:
         ch = script[i]
@@ -2422,7 +2444,7 @@ def _start_process_violations(py_source: str) -> tuple[int, list[int]]:
         if not _might_launch(text):
             continue
         text = _unsplice(text)  # `Start-"Process"` is Start-Process
-        text_found, text_bad = _judge_script(text)
+        text_found, text_bad = _judge_both(text)
         found += text_found
         bad.extend([lineno] * text_bad)
     return found, bad
@@ -5500,6 +5522,22 @@ class AdversaryR9Tests(unittest.TestCase):
             self.assertEqual(len(self._bad("def f(p):\n    x = " + repr("a" * size) + " + p\n")) >= 1, reported, size)
             self.assertEqual(_start_process_violations("def f(p):\n    script = f'" + "a" * size + "{p}'\n")[0] == 1, reported, size)
         self.assertGreaterEqual(len(self._bad("def f(p):\n    return getattr(loop, " + repr("a" * _PATTERN_ITEM_CAP) + " + p)()\n")), 1)  # the shape the adversary ran
+
+    # ---- r15 pass 37 (review-adversary-MLV-LANE-CONSOLE-HIDDEN-1-r15-11b17241): A1 / A2, both in the PowerShell readers ----
+    def test_r15_pass37_a1_a_here_string_is_one_quoted_span_that_cannot_supply_the_outer_flag(self):
+        for script in ('Start-Process cmd.exe -ArgumentList @"\nx " -WindowStyle Hidden "\n"@', "Start-Process cmd.exe -ArgumentList @'\nx ' -WindowStyle Hidden '\n'@",
+                       'saps cmd.exe -ArgumentList @"\nx " -WindowStyle Hidden "\n"@', 'Start-Process cmd.exe -ArgumentList @"   \nx " -WindowStyle Hidden "\n"@'):
+            self.assertEqual(_start_process_violations(f"script = {script!r}\n"), (1, [1]), script)
+        for script in ('Start-Process cmd.exe -WindowStyle Hidden -ArgumentList @"\nx\n"@', "Start-Process cmd.exe -ArgumentList @'\nit''s\n'@ -WindowStyle Hidden"):
+            self.assertEqual(_start_process_violations(f"script = {script!r}\n"), (1, []), script)  # the outer flag, with a here-string beside it, still counts
+
+    def test_r15_pass37_a2_a_block_comment_after_a_bracket_or_any_white_space_is_a_comment_that_supplies_no_flag(self):
+        for script in ("$a = @('/c', 'exit'); Start-Process cmd.exe -ArgumentList $a[0]<# -WindowStyle Hidden #>", "Start-Process cmd.exe -ArgumentList (1)<# -WindowStyle Hidden #>",
+                       *(f"Start-Process cmd.exe{ws}<# -WindowStyle Hidden #>" for ws in ("\x0b", "\x0c", " ", " ", " "))):
+            self.assertEqual(_start_process_violations(f"script = {script!r}\n")[0], 1, script)
+            self.assertEqual(len(_start_process_violations(f"script = {script!r}\n")[1]), 1, script)
+        self.assertEqual(_start_process_violations("script = 'Start-Process cmd.exe -WindowStyle Hidden <# note #>'\n"), (1, []))  # a real comment beside the flag is harmless
+        self.assertEqual(_start_process_violations("script = 'Write-Host a<#; Start-Process cmd.exe; #>'\n")[0], 1)  # and the bare word of A4 is still read as code
 
     def test_r15_conservative_flips_a_name_that_is_not_a_constant_is_reported_in_a_getattr_name_position(self):
         # every one of these read clean before r15 (a matcher ruled the partial text out); the class rule reports them: a false positive is allowlisted by a reviewer, a false negative is not
