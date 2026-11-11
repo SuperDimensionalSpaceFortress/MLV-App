@@ -255,14 +255,96 @@ _LOOSE_LAUNCH_RE = re.compile(r"start-|(?:start|saps)(?![\w-])", re.IGNORECASE)
 _HEDGE_MODE = ["name"]
 
 
+_PATTERN_ITEM_CAP = 20_000  # a pattern of more literal characters and wildcard runs than this is not searched: the scan REPORTS it (a `_FoldTooBig`), never reads it as clean
+
+
+def _pattern_items(text: str) -> list[str | None]:
+    """``text`` as literal characters and ``None`` for a run of wildcards. Refused past ``_PATTERN_ITEM_CAP`` before it is searched (r14: a partial text is searched
+    for the names it could hold, so its size is bounded the way every other fold is)."""
+    if len(text) > _PATTERN_ITEM_CAP:
+        raise _FoldTooBig(len(text))
+    items: list[str | None] = []
+    for ch in text:
+        if ch != _WILD:
+            items.append(ch)
+        elif not items or items[-1] is not None:
+            items.append(None)
+    return items
+
+
+def _pattern_window_reaches(items: list[str | None], target: str, min_literals: int | None = None) -> bool:
+    """r14 (sol r13 pass-35 A4). Can some WINDOW of this pattern (a run of its items, cut anywhere at either end) read as ``target`` once its wildcards are filled? Every
+    operation that returns a piece of its text (a strip, a slice, ``removesuffix``, ``partition``, ``split``) returns such a window; a window needs ``min_literals`` word
+    characters of literal text (half of the target's by default), so a wildcard that supplies most of a name says nothing. Exact: a set of (position in the target,
+    literals counted) states, advanced item by item."""
+    size = len(target)
+    min_literals = (size + 1) // 2 if min_literals is None else min_literals
+    states: set[tuple[int, int]] = set()
+    for item in items:
+        advanced: set[tuple[int, int]] = set()
+        for j, k in states | {(0, 0)}:
+            if item is None:
+                advanced.update((end, k) for end in range(j, size + 1))
+            elif j < size and target[j] == item:
+                advanced.add((j + 1, min(k + 1, min_literals) if item.isalnum() or item == "_" else k))
+        states = advanced
+        if (size, min_literals) in states:
+            return True
+    return False
+
+
+def _pattern_subsequence_reaches(items: list[str | None], target: str) -> bool:
+    """r14 (sol r13 pass-35 A1). Can ``target`` be had from this pattern by DELETING characters (``text.replace(p, '')`` with a run-time ``p``, which may delete any
+    characters at all) once its wildcards are filled? A wildcard may supply any of the target's characters, so the test asks that at least half of them stand as literal text."""
+    size = len(target)
+    best = [-1] * (size + 1)
+    best[0] = 0
+    for item in items:
+        nxt = best[:]
+        if item is None:
+            top = -1
+            for j in range(size + 1):
+                top = max(top, best[j])
+                nxt[j] = max(nxt[j], top)
+        else:
+            for j in range(size):
+                if best[j] >= 0 and target[j] == item:
+                    nxt[j + 1] = max(nxt[j + 1], best[j] + 1)
+        best = nxt
+    return best[size] >= (size + 1) // 2
+
+
+def _deletion_hedge(text: str) -> str | None:
+    """What ``text.replace(old, new)`` may leave when ``old`` is empty, partial or a run-time value (so it may delete any characters): the spawn-method name (or the
+    launch keyword, in the launch reading) that deleting characters from ``text`` can reach, as ``*name*``; None when it can reach none."""
+    launch = _HEDGE_MODE[0] == "launch"
+    targets = _LAUNCH_KEYWORDS if launch else sorted(_LOOP_SPAWN_METHODS)
+    items = _pattern_items(text.lower())
+    for target in targets:
+        if _pattern_subsequence_reaches(items, target):
+            return _WILD + target[:1] + _WILD + target[1:] + _WILD if launch else _WILD + target + _WILD  # a keyword split by a wildcard reads as source AND wildcard
+    return None
+
+
 def _hedge(text: str) -> str:
     """The text an operation the fold cannot apply (a ``replace`` with run-time arguments, a slice with a run-time bound, a string method it has no
     arm for) may leave of ``text``. Name reading: anything around the spawn-method name ``text`` holds (around the longest text the names it holds
-    share, when it holds several, so each of them stays possible). Launch reading: anything followed by the text from its first launch keyword on."""
+    share, when it holds several, so each of them stays possible). Launch reading: anything followed by the text from its first launch keyword on.
+    r14: a PARTIAL text holds a name (a keyword) when some window of its pattern can read as one, so the wildcard in it never drops the pattern."""
     if _HEDGE_MODE[0] == "launch":
         keyword = _LOOSE_LAUNCH_RE.search(text)
-        return _WILD + text[keyword.start():] if keyword else _WILD
-    held = [name for name in sorted(_LOOP_SPAWN_METHODS) if name in text.lower()]  # an unknown function may lower-case what it was given
+        if keyword:
+            return _WILD + text[keyword.start():]
+        if _WILD in text:
+            items = _pattern_items(text.lower())
+            if any(_pattern_window_reaches(items, kw) for kw in _LAUNCH_KEYWORDS):
+                return _WILD + text  # the keyword lies across the source and a wildcard: `_could_launch` reads it from the whole text
+        return _WILD
+    if _WILD in text:
+        items = _pattern_items(text.lower())
+        held = [name for name in sorted(_LOOP_SPAWN_METHODS) if _pattern_window_reaches(items, name)]
+    else:
+        held = [name for name in sorted(_LOOP_SPAWN_METHODS) if name in text.lower()]  # an unknown function may lower-case what it was given
     if not held:
         return _WILD
     common = held[0]
@@ -444,18 +526,8 @@ def _note_aliases(tree: ast.AST) -> None:
     _STR_KIND_ALIASES.clear()
     _CODEC_ALIASES.clear()
     _CODEC_FUNCS.clear()
-    for n in ast.walk(tree):
-        if isinstance(n, ast.Assign) and len(n.targets) == 1 and isinstance(n.targets[0], ast.Name):
-            v = n.value
-            if ((isinstance(v, ast.Name) and v.id in ("str", "bytes")) or (isinstance(v, ast.Attribute) and v.attr in ("str", "bytes", "__class__"))
-                    or (isinstance(v, ast.Call) and isinstance(v.func, ast.Name) and v.func.id == "type")):
-                _STR_ALIASES.add(n.targets[0].id)
-                kind = _type_kind(v)
-                if kind == "bytes":
-                    _BYTES_ALIASES.add(n.targets[0].id)  # `B = bytes`, `B = type(b'')`, `B = b''.__class__`
-                elif kind == "str":
-                    _STR_KIND_ALIASES.add(n.targets[0].id)
-        elif isinstance(n, ast.ImportFrom) and n.module == "builtins":
+    for n in ast.walk(tree):  # the names an import gives the types come first: an alias of one (`C = B`) is read against them
+        if isinstance(n, ast.ImportFrom) and n.module == "builtins":
             _STR_ALIASES.update(a.asname or a.name for a in n.names if a.name in ("str", "bytes"))
             _BYTES_ALIASES.update(a.asname or a.name for a in n.names if a.name == "bytes")
             _STR_KIND_ALIASES.update(a.asname or a.name for a in n.names if a.name == "str")
@@ -463,6 +535,21 @@ def _note_aliases(tree: ast.AST) -> None:
             _CODEC_ALIASES.update(a.asname or a.name for a in n.names if a.name == "codecs")
         if isinstance(n, ast.ImportFrom) and n.module == "codecs":
             _CODEC_FUNCS.update({a.asname or a.name: a.name for a in n.names if a.name in ("decode", "encode")})  # from codecs import decode as d
+    binds = [(n.targets[0].id, n.value) for n in ast.walk(tree) if isinstance(n, ast.Assign) and len(n.targets) == 1 and isinstance(n.targets[0], ast.Name)]
+    binds += [(n.target.id, n.value) for n in ast.walk(tree) if isinstance(n, ast.AnnAssign) and isinstance(n.target, ast.Name) and n.value is not None]  # `B: type = bytes` (pass-35 A3)
+    for _ in range(len(binds) + 1):  # an alias of an alias (`C = B`) is read once `B` is known; repeated until nothing new is learnt
+        known = (len(_STR_ALIASES), len(_BYTES_ALIASES), len(_STR_KIND_ALIASES))
+        for name, v in binds:
+            if ((isinstance(v, ast.Name) and (v.id in ("str", "bytes") or v.id in _STR_ALIASES)) or (isinstance(v, ast.Attribute) and v.attr in ("str", "bytes", "__class__"))
+                    or (isinstance(v, ast.Call) and isinstance(v.func, ast.Name) and v.func.id == "type")):
+                _STR_ALIASES.add(name)
+                kind = _type_kind(v)
+                if kind == "bytes":
+                    _BYTES_ALIASES.add(name)  # `B = bytes`, `B = type(b'')`, `B = b''.__class__`, `C = B`
+                elif kind == "str":
+                    _STR_KIND_ALIASES.add(name)
+        if known == (len(_STR_ALIASES), len(_BYTES_ALIASES), len(_STR_KIND_ALIASES)):
+            break
 
 
 def _codecs_like(recv: ast.AST) -> bool:
@@ -720,12 +807,12 @@ def _replace_masked(text: str, old: str) -> str | None:
     None when ``text`` holds no literal character: there is no shape to keep, and the caller hedges the arguments."""
     if not text.replace(_WILD, ""):
         return None
-    if _WILD not in text:
-        return text.replace(old, _WILD) if old and _WILD not in old else None  # an exact text is only ever cut at the places `old` stands
     if old and _WILD not in old:
+        if _WILD not in text:
+            return text.replace(old, _WILD)  # an exact text is only ever cut at the places `old` stands
         touched = set(old)  # a match can start in a wildcard and end on these characters, or the reverse
         return "".join(_WILD if ch in touched else ch for ch in text)
-    return _joined(list(text), _WILD)  # an empty or unknown `old` can match between any two characters, or none
+    return _deletion_hedge(text)  # an empty or unknown `old` may delete any characters (sol r13 pass-35 A1): the name those deletions can reach, else the legacy hedge
 
 
 def _mapped(method: str, text: str) -> str:
@@ -760,7 +847,10 @@ def _flatten_node(node: ast.AST, consts: dict[str, str], depth: int = 0) -> tupl
     itself; it never calls ``eval``/``exec`` and never hands scanned text to ``str.format`` (a ``{:>999999999}`` spec must not allocate).
     """
     if depth > _FLATTEN_DEPTH:
-        return _WILD, False
+        # r14 (pass-35 A2): an expression nested deeper than the fold reads is not read as NOTHING (a `.lower()` chain 49 deep would turn a spawn name into a clean source): it reads as
+        # the literal text it holds, in source order, with a wildcard on each side, so it is reported exactly when those literals can name a spawn method or a launch.
+        pieces = sorted((c for c in ast.walk(node) if isinstance(c, ast.Constant) and isinstance(c.value, (str, bytes))), key=lambda c: (c.lineno, c.col_offset))
+        return _WILD + _joined([c.value if isinstance(c.value, str) else c.value.decode("latin-1") for c in pieces]) + _WILD, False
     node = _bound_form(node, consts)
     if isinstance(node, ast.Constant):
         if isinstance(node.value, bytes):
@@ -5312,6 +5402,55 @@ class AdversaryR9Tests(unittest.TestCase):
         self.assertEqual(self._fold_text("type(p)(b'subprocess_ex', 'ascii') + 'ec'")[0], "subprocess_exec")
         self.assertGreaterEqual(len(self._bad(self._P34_BYTES.format(setup="", name="type(p)('subprocess_exe', 'utf-16-le').decode('utf-16-le') + 'c'"))), 1)
         self.assertEqual(self._fold_text("type('')(b'subprocess_ex', 'ascii') + 'ec'")[0], "subprocess_exec")  # the str decode keeps its exact result
+
+    # ---- r14 pass 35 (review-adversary-MLV-LANE-CONSOLE-HIDDEN-1-r14-0aae55d2): A1-A4, fixed as classes ----
+    def test_r14_pass35_a1_a_replace_with_a_run_time_old_may_delete_any_characters(self):
+        for name in ("'subprzocess_exec'.replace(p, '')", "'subprzocess_exec'.replace(p, '', 1)", "('subpr' + p + 'zocess_exec').replace(q, '')",
+                     "'subprzocess_exec'.replace(p + q, '')", "'subprzocess_exec'.replace(p, q)"):
+            self.assertGreaterEqual(len(self._bad(self._P33_HEAD.format(name=name))), 1, name)
+        for script in ("'Stazrt-Process cmd.exe'.replace(p, '')", "('saz' + q + 'ps cmd.exe').replace(p, '')", "('Staz' + p + 'rt-Process cmd.exe').replace(q, '')"):
+            self.assertEqual(_start_process_violations(f"def f(p, q):\n    script = {script}\n")[0], 1, script)
+        for name in ("'abc'.replace(p, '')", "'some_path_text'.replace(p, q)", "('log-' + p).replace(q, '_')"):  # no name is reachable by deleting characters: clean
+            self.assertEqual(self._bad(self._P33_HEAD.format(name=name)), [], name)
+        self.assertEqual(_start_process_violations("def f(p):\n    script = 'log-file.txt'.replace(p, '')\n")[0], 0)
+
+    def test_r14_pass35_a2_an_expression_nested_past_the_fold_depth_is_reported(self):
+        for depth in (49, 60, 200):
+            self.assertGreaterEqual(len(self._bad(self._P33_HEAD.format(name="'subprocess_exe'" + ".lower()" * depth + " + 'c'"))), 1, depth)
+            self.assertEqual(_start_process_violations("script = '{}ps cmd.exe'" + ".lower()" * depth + ".format('sa')\n")[0], 1, depth)
+        self.assertEqual(self._bad(self._P33_HEAD.format(name="'abc'" + ".lower()" * 5)), [])  # a shallow benign chain stays clean
+
+    def test_r14_pass35_a3_a_type_alias_is_followed_through_an_annotation_and_through_another_alias(self):
+        for setup, ctor in (("    B: type = bytes\n", "B"), ("    B = bytes\n    C = B\n", "C"), ("    B = type(b'')\n    C = B\n    D = C\n", "D"),
+                            ("    B: type = type(b'')\n", "B"), ("    C = B\n    B = bytes\n", "C")):
+            name = f"{ctor}('subprocess_exe', 'utf-16-le').decode('utf-16-le') + 'c'"
+            self.assertGreaterEqual(len(self._bad(self._P34_BYTES.format(setup=setup, name=name))), 1, (setup, ctor))
+        self.assertGreaterEqual(len(self._bad("from builtins import bytes as B\n" + self._P34_BYTES.format(setup="    C = B\n", name="C('subprocess_exe', 'utf-16-le').decode('utf-16-le') + 'c'"))), 1)
+        for setup in ("    S: type = str\n", "    B = str\n    S = B\n"):  # the str spellings keep the decode
+            self.assertEqual(self._bad(self._P34_BYTES.format(setup=setup, name="S(b'subprocess_ex', 'ascii') + 'e'")), [], setup)  # `subprocess_ex` + `e` is no name
+            self.assertGreaterEqual(len(self._bad(self._P34_BYTES.format(setup=setup, name="S(b'subprocess_ex', 'ascii') + 'ec'"))), 1, setup)
+
+    def test_r14_pass35_a4_a_partial_text_through_a_cut_keeps_the_name_a_window_of_it_could_read_as(self):
+        for name in ("('subpr' + p + 'ocess_execZ').rstrip('Z')", "('subpr' + p + 'ocess_execZ').strip('Z')", "('subpr' + p + 'ocess_execZ')[:-1]",
+                     "('subpr' + p + 'ocess_execZ').removesuffix('Z')", "('subpr' + p + 'ocess_execZ').partition('Z')[0]", "('subpr' + p + 'ocess_execZ').split('Z')[0]",
+                     "('subpr' + p + 'ocess_execZ').rsplit('Z', 1)[0]", "('ZZsubpr' + p + 'ocess_exec').lstrip('Z')", "('SUBPR' + p + 'OCESS_EXEC').capitalize().lower()",
+                     "('SUBPR' + p + 'OCESS_EXEC').title().lower()", "('xsubpr' + p + 'ocess_exec')[p:]"):
+            self.assertGreaterEqual(len(self._bad(self._P33_HEAD.format(name=name))), 1, name)
+        for script in ("('Sta' + p + 'rt-Process cmd.exeZ').rstrip('Z')", "('ZSta' + p + 'rt-Process cmd.exe').lstrip('Z')", "('Sta' + p + 'rt-Process cmd.exeZ')[:-1]"):
+            self.assertEqual(_start_process_violations(f"def f(p):\n    script = {script}\n")[0], 1, script)
+        for name in ("('abc' + p + 'def').rstrip('f')", "('log-' + p + '.txt')[:-1]", "('x_' + p + '_y').strip('_')"):  # no window reads as a name: clean
+            self.assertEqual(self._bad(self._P33_HEAD.format(name=name)), [], name)
+
+    def test_r14_pass35_the_pattern_searches_are_exact_on_small_cases(self):
+        items = _pattern_items("subpr" + _WILD + "ocess_execZ".lower())
+        self.assertTrue(_pattern_window_reaches(items, "subprocess_exec"))
+        self.assertFalse(_pattern_window_reaches(_pattern_items("abc" + _WILD + "def"), "subprocess_exec"))
+        self.assertFalse(_pattern_window_reaches(_pattern_items("subpr"), "subprocess_exec"))  # no wildcard to supply the rest
+        self.assertTrue(_pattern_subsequence_reaches(_pattern_items("subprzocess_exec"), "subprocess_exec"))
+        self.assertFalse(_pattern_subsequence_reaches(_pattern_items("subprocess_exe"), "subprocess_exec"))  # a missing character is not supplied by anything
+        self.assertTrue(_pattern_subsequence_reaches(_pattern_items("subpr" + _WILD + "ocess_exec"), "subprocess_exec"))
+        with self.assertRaises(_FoldTooBig):
+            _pattern_items("a" * (_PATTERN_ITEM_CAP + 1))
 
     def test_r11_l1_a_one_step_growth_in_an_unused_function_is_reported_not_allocated(self):
         with mock.patch.dict(globals(), {"_FLATTEN_MAX_CHARS": 64}):
