@@ -2927,38 +2927,45 @@ function Get-DvVisualExposureStats {
     #>
     param([Parameter(Mandatory)][byte[]]$Rgb, [Parameter(Mandatory)][int]$Width, [Parameter(Mandatory)][int]$Height)
     if ($Width -le 0 -or $Height -le 0 -or $Rgb.Length -ne $Width * $Height * 3) { return $null }
-    $rowMean = [double[]]::new($Height)
-    $luma = [double[]]::new($Width * $Height)
+    # r3 (adversary 6256c193 A2): luma is held in whole ten-thousandths (2126 R + 7152 G + 722 B, the BT.709 weights x 10000), so every threshold compare is
+    # EXACT integer arithmetic. In floating point a row whose true mean is exactly 2 summed to 1.9999999999999996, read as a dark bar and was dropped, and
+    # a pixel of luma exactly 16 or 235 could fall either side of its own limit.
+    $scale = 10000L
+    $rowSum = [long[]]::new($Height)
+    $luma = [long[]]::new($Width * $Height)
     for ($y = 0; $y -lt $Height; $y++) {
-        $rowSum = 0.0
+        [long]$sumRow = 0
         for ($x = 0; $x -lt $Width; $x++) {
             $i = ($y * $Width + $x) * 3
-            $l = 0.2126 * $Rgb[$i] + 0.7152 * $Rgb[$i + 1] + 0.0722 * $Rgb[$i + 2]
-            $luma[$y * $Width + $x] = $l; $rowSum += $l
+            [long]$l = 2126L * $Rgb[$i] + 7152L * $Rgb[$i + 1] + 722L * $Rgb[$i + 2]
+            $luma[$y * $Width + $x] = $l; $sumRow += $l
         }
-        $rowMean[$y] = $rowSum / $Width
+        $rowSum[$y] = $sumRow
     }
+    # a row is dark when its full-width mean is under the limit: rowSum / (Width * scale) < limit  <=>  rowSum < limit * Width * scale
+    $darkBelow = [long]$script:ExposureLetterboxRowMean * $Width * $scale
     $top = 0
-    while ($top -lt $Height -and $rowMean[$top] -lt $script:ExposureLetterboxRowMean) { $top++ }
+    while ($top -lt $Height -and $rowSum[$top] -lt $darkBelow) { $top++ }
     $drop = 0
     if ($top -lt $Height) {   # (an all-dark frame is a black picture: nothing is a bar)
         $bottom = 0
-        while ($rowMean[$Height - 1 - $bottom] -lt $script:ExposureLetterboxRowMean) { $bottom++ }   # ($top < $Height, so a bright row ends this walk)
+        while ($rowSum[$Height - 1 - $bottom] -lt $darkBelow) { $bottom++ }   # ($top < $Height, so a bright row ends this walk)
         $drop = [math]::Min([math]::Min($top, $bottom), [int][math]::Floor($Height * $script:ExposureLetterboxMaxEdgeFraction))
     }
     $keep = @($drop..($Height - 1 - $drop))
-    $sum = 0.0; $nearBlack = 0; $clipped = 0
+    [long]$sum = 0; $nearBlack = 0; $clipped = 0
+    $nearBlackBelow = [long]$script:ExposureNearBlackLuma * $scale; $clippedAbove = [long]$script:ExposureClippedLuma * $scale
     foreach ($y in $keep) {
         for ($x = 0; $x -lt $Width; $x++) {
             $l = $luma[$y * $Width + $x]
             $sum += $l
-            if ($l -lt $script:ExposureNearBlackLuma) { $nearBlack++ }
-            if ($l -gt $script:ExposureClippedLuma) { $clipped++ }
+            if ($l -lt $nearBlackBelow) { $nearBlack++ }
+            if ($l -gt $clippedAbove) { $clipped++ }
         }
     }
     $n = $keep.Count * $Width
     [pscustomobject]@{
-        lumaMean = $sum / $n; nearBlackFraction = $nearBlack / $n; clippedFraction = $clipped / $n
+        lumaMean = [double]$sum / ([double]$n * $scale); nearBlackFraction = $nearBlack / $n; clippedFraction = $clipped / $n
         rows = $Height; letterboxRowsDropped = $Height - $keep.Count
     }
 }
@@ -2982,7 +2989,27 @@ function ConvertTo-DvExposureLimit($Element, [double]$Min, [double]$Max) {
     if (-not $Element.TryGetDouble([ref]$d)) { return $null }
     # (IsNegative, not "-lt 0": TryGetDouble reads -1e-400 as -0.0, which is not under 0 but is a negative limit; adversary fc152c48 A1)
     if ([double]::IsNaN($d) -or [double]::IsInfinity($d) -or [double]::IsNegative($d) -or $d -lt $Min -or $d -gt $Max) { return $null }
+    # r3 (adversary 6256c193 A1): the double must carry EXACTLY what the file says. TryGetDouble rounds 1.0000000000000001 to 1.0 (in range) and
+    # 16.000000000000001 to 16.0 (so min <= max held), though the file states a value above its maximum; a limit whose double reads back as another number
+    # is refused, never silently rounded into range. (The shortest round-trip text of the double names the same number as the file's text, or it is refused.)
+    if ((ConvertTo-DvDecimalKey $Element.GetRawText()) -cne (ConvertTo-DvDecimalKey $d.ToString('R', [System.Globalization.CultureInfo]::InvariantCulture))) { return $null }
     $d
+}
+
+function ConvertTo-DvDecimalKey([string]$Text) {
+    # the exact value of a JSON / .NET number literal ([-]digits[.digits][e[+-]digits]) as a normalised "sign+digits|exponent" key (no leading or trailing zeros in the
+    # digits, so 1.0, 1 and 10e-1 are one key); $null when it is not such a literal. Pure string and BigInteger arithmetic: no rounding anywhere.
+    $m = [regex]::Match($Text, '^(-?)([0-9]+)(?:\.([0-9]+))?(?:[eE]([+-]?[0-9]+))?$')
+    if (-not $m.Success) { return $null }
+    $fraction = $m.Groups[3].Value
+    $exponent = [System.Numerics.BigInteger]::Zero
+    if ($m.Groups[4].Success) { $exponent = [System.Numerics.BigInteger]::Parse($m.Groups[4].Value, [System.Globalization.CultureInfo]::InvariantCulture) }
+    $exponent = $exponent - $fraction.Length
+    $digits = ($m.Groups[2].Value + $fraction).TrimStart('0')
+    if ($digits.Length -eq 0) { return '0|0' }
+    $trimmed = $digits.TrimEnd('0')
+    $exponent = $exponent + ($digits.Length - $trimmed.Length)
+    "$($m.Groups[1].Value)$trimmed|$exponent"
 }
 
 function ConvertTo-DvExposureRow($Row, $Fallback) {

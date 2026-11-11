@@ -9516,7 +9516,8 @@ class VisualExposureFloorTests(unittest.TestCase):
         # adversary fc152c48 A1: TryGetDouble reads -1e-400 as -0.0, which is not under 0, so a negative limit in an unselected row passed the range check
         with tempfile.TemporaryDirectory(prefix="vis-exp-band-") as d:
             rows = [("-1e-400", "fallback-malformed"), ("-0", "fallback-malformed"), ("-0.0", "fallback-malformed"), ("-0.001", "fallback-malformed"),
-                    ("1e-400", "clip"), ("0", "clip"), ("0.5", "clip")]
+                    # r3 (adversary 6256c193 A1): a positive limit that underflows to 0.0 is no longer in range either; the double is not the number the file states
+                    ("1e-400", "fallback-malformed"), ("0", "clip"), ("0.5", "clip")]
             for n, (number, source) in enumerate(rows):
                 for field in ("minMedianLuma", "maxClippedFraction"):
                     with self.subTest(number=number, field=field):
@@ -9537,6 +9538,54 @@ class VisualExposureFloorTests(unittest.TestCase):
             self.assertEqual((out["source"], out["band"]["minMedianLuma"], out["note"]), ("clip", 0, None), out)
             proc, out = run_pwsh_json(f"Set-Location -LiteralPath '{d}'; Get-DvExposureBand -ClipId 'c' -Path 'absent.json' | ConvertTo-Json -Depth 4 -Compress")
             self.assertEqual((out["source"], out["note"] is not None), ("fallback-missing", True), out)
+
+    def test_the_visual_exposure_band_limit_must_be_exactly_what_the_file_says(self) -> None:
+        # adversary 6256c193 A1: TryGetDouble rounds 1.0000000000000001 to 1.0, so a cap above its maximum read as in range (and, in an unselected row, let a
+        # relaxed row beside it be chosen); 16.000000000000001 / 16 read as min <= max. A limit whose double is not the number the file states is malformed.
+        rows = [
+            ('{"clips": {"M16-1457": {"minMedianLuma": 0, "maxNearBlackFraction": 1}, "other": {"maxClippedFraction": 1.0000000000000001}}}', "M16-1457", "fallback-malformed"),   # the adversary's input
+            ('{"clips": {"c": {"maxNearBlackFraction": 1.0000000000000001}}}', "c", "fallback-malformed"),
+            ('{"clips": {"c": {"maxClippedFraction": 1.00000000000000000000000000001}}}', "c", "fallback-malformed"),
+            ('{"clips": {"c": {"maxMedianLuma": 255.00000000000001}}}', "c", "fallback-malformed"),
+            ('{"clips": {"c": {"minMedianLuma": 16.000000000000001, "maxMedianLuma": 16}}}', "c", "fallback-malformed"),
+            ('{"clips": {"c": {"minMedianLuma": 1e-400}}}', "c", "fallback-malformed"),   # an underflow to 0.0 is not the number the file states
+            # a limit that is exact in the file's own digits stays valid, whatever its spelling
+            ('{"clips": {"c": {"maxNearBlackFraction": 1.0}}}', "c", "clip"),
+            ('{"clips": {"c": {"maxNearBlackFraction": 1}}}', "c", "clip"),
+            ('{"clips": {"c": {"maxNearBlackFraction": 10e-1}}}', "c", "clip"),
+            ('{"clips": {"c": {"maxClippedFraction": 0.00042}}}', "c", "clip"),
+            ('{"clips": {"c": {"maxClippedFraction": 0.6}}}', "c", "clip"),
+            ('{"clips": {"c": {"maxClippedFraction": 1e-5}}}', "c", "clip"),
+            ('{"clips": {"c": {"minMedianLuma": 255.0, "maxMedianLuma": 255}}}', "c", "clip"),
+            ('{"clips": {"c": {"minMedianLuma": 0, "maxMedianLuma": 0.0}}}', "c", "clip"),
+            ('{"clips": {"c": {"minMedianLuma": 16.000000000000004, "maxMedianLuma": 16.000000000000004}}}', "c", "clip"),   # the neighbouring double, written in full
+        ]
+        with tempfile.TemporaryDirectory(prefix="vis-exp-band-") as d:
+            for n, (text, clip, source) in enumerate(rows):
+                with self.subTest(text=text):
+                    path = Path(d) / f"bands-{n}.json"
+                    path.write_text(text, encoding="utf-8")
+                    proc, out = run_pwsh_json(f"Get-DvExposureBand -ClipId '{clip}' -Path '{path}' | ConvertTo-Json -Depth 4 -Compress")
+                    self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+                    self.assertIsNotNone(out, proc.stdout + proc.stderr)
+                    self.assertEqual(out["source"], source, out)
+                    self.assertEqual(out["note"] is not None, source == "fallback-malformed", out)
+
+    def test_the_visual_exposure_numbers_are_exact_at_the_letterbox_and_pixel_limits(self) -> None:
+        # adversary 6256c193 A2: a dark edge row whose true mean luma is exactly 2 summed to 1.9999999999999996 in floating point, read as a bar and was dropped,
+        # so a picture the gate must judge in full read as its bright middle only
+        def edge(x: int, y: int, i: int) -> tuple[int, int, int]:
+            if y < 9 or y >= 27:   # rows 0..8 and 27..35: 8 px each of (16,0,0), (0,16,0), (0,0,16), the rest black: full-width mean luma exactly 2.0
+                return (16, 0, 0) if x < 8 else (0, 16, 0) if x < 16 else (0, 0, 16) if x < 24 else (0, 0, 0)
+            return (27, 27, 27) if (x, y) == (0, 10) else (26, 26, 26)
+        out = self.exposure(self.rgb(edge))["stats"]
+        self.assertEqual(out["letterboxRowsDropped"], 0, out)
+        self.assertAlmostEqual(out["lumaMean"], (18 * 2.0 + 18 * 26.0 + 1 / 64) / 36, places=6)   # all 36 rows are the picture
+        # a pixel of luma exactly 16 is not near-black (under 16) and exactly 235 is not clipped (over 235)
+        limits = self.exposure(self.rgb(lambda x, y, i: (16, 16, 16) if i % 2 == 0 else (235, 235, 235)))["stats"]
+        self.assertEqual((limits["nearBlackFraction"], limits["clippedFraction"]), (0, 0), limits)
+        under = self.exposure(self.rgb(lambda x, y, i: (15, 15, 15) if i % 2 == 0 else (236, 236, 236)))["stats"]
+        self.assertEqual((under["nearBlackFraction"], under["clippedFraction"]), (0.5, 0.5), under)
 
     # r3 (sol r2 B1, fable N1): the runner runs under $ErrorActionPreference = 'Stop', so a probe that throws before the guard ended the leg (RUNNER_ERROR)
     NUL_BAND_PATH = "('C:\\absent-dir\\band' + [char]0 + '.json')"   # Test-Path -LiteralPath throws ArgumentException on an embedded NUL, on every OS
