@@ -4986,3 +4986,61 @@ def test_r11_b1_retained_a_missing_native_no_replace_rename_is_still_the_typed_r
         ob.remove_exercise_scratch(base, tmp_path)
     assert caught.value.code == "EXERCISE_SCRATCH_NOT_REMOVED", caught.value
     assert (base / "f.txt").read_text(encoding="utf-8") == "keep" and not record, record
+
+
+# Adversary pass r10 on 118d6daa (card round r11): A1 (blocker, introduced) off Windows the removal's directory listing was
+# os.scandir(NAME): a directory swapped for a link to another tree between the identity check and the listing was FOLLOWED, its
+# entries recorded as the listed truth, and unlinked. The listing now opens the directory with O_NOFOLLOW and scans that descriptor,
+# so a link at the name is ELOOP (an OSError: retried, then the typed refusal). Narrow: this is the one named step; the documented
+# POSIX limit (no handle held across the walk) is unchanged. The shim stands in for Linux (a Windows host has no O_NOFOLLOW).
+
+def _posix_listing_by_descriptor(monkeypatch, opened):
+    import errno
+    real_os, fds = os, {}
+
+    class PosixOs:
+        name = "posix"
+        O_NOFOLLOW, O_DIRECTORY = 0x20000, 0x10000
+
+        def __getattr__(self, item):
+            return getattr(real_os, item)
+
+        def open(self, path, flags, *a):
+            opened.append((real_os.fspath(path), flags))
+            if flags & self.O_NOFOLLOW and not ob._plain_dir(real_os.lstat(path)):
+                raise OSError(errno.ELOOP, "Too many levels of symbolic links", real_os.fspath(path))
+            fds[1000 + len(fds)] = real_os.fspath(path)
+            return 1000 + len(fds) - 1
+
+        def scandir(self, arg="."):
+            return real_os.scandir(fds[arg] if isinstance(arg, int) else arg)
+
+        def close(self, fd):
+            fds.pop(fd, None) if fd in fds else real_os.close(fd)
+
+    monkeypatch.setattr(ob, "os", PosixOs())
+
+
+def test_r11_a1_the_posix_listing_never_follows_a_link_swapped_in_at_the_directory_name(tmp_path, monkeypatch):
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "precious.txt").write_text("not ours", encoding="utf-8")
+    link = tmp_path / "D"
+    make_directory_link(link, outside)
+    opened, recorded = [], []
+    _posix_listing_by_descriptor(monkeypatch, opened)
+    with pytest.raises(OSError):
+        ob._list_dir(os.fspath(link), lambda name, ident: recorded.append(name))
+    assert not recorded, f"the listing followed the link and read {recorded!r}"
+
+
+def test_r11_a1_sibling_the_posix_listing_of_a_real_directory_opens_it_without_following_and_lists_its_entries(tmp_path, monkeypatch):
+    real = tmp_path / "D"
+    (real / "sub").mkdir(parents=True)
+    (real / "f.txt").write_text("x", encoding="utf-8")
+    opened, recorded = [], []
+    _posix_listing_by_descriptor(monkeypatch, opened)
+    got = ob._list_dir(os.fspath(real), lambda name, ident: recorded.append(name))
+    assert opened and opened[0][1] & 0x20000, f"not opened with O_NOFOLLOW: {opened}"
+    assert sorted((os.path.basename(n), is_dir) for n, _i, is_dir in got) == [("f.txt", False), ("sub", True)], got
+    assert sorted(os.path.basename(n) for n in recorded) == ["f.txt", "sub"], recorded

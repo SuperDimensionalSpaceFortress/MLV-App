@@ -4351,11 +4351,26 @@ def _list_dir(path: str, record=None) -> list[tuple[str, int | None, bool]]:
     response of the enumeration raises) are still recorded (adversary r7 A2); it may raise to stop the listing."""
     if os.name != "nt":
         found = []
-        with _meta(os.scandir, path) as listing:
-            for entry in listing:
-                if record is not None:
-                    record(entry.path, entry.inode())
-                found.append((entry.path, entry.inode(), entry.is_dir(follow_symlinks=False) and not entry.is_symlink()))
+        nofollow = getattr(os, "O_NOFOLLOW", None)
+        if nofollow is None:                                            # no such flag here: the listing rests on the name alone
+            listing, fd = _meta(os.scandir, path), None
+        else:                                                           # a link swapped in at the name after the checks is ELOOP, never
+            fd = _meta(os.open, path, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | nofollow)   # followed and listed (r11 A1)
+            try:
+                listing = _meta(os.scandir, fd)                         # the entries of THE directory just opened, by its descriptor
+            except BaseException:
+                os.close(fd)
+                raise
+        try:
+            with listing:
+                for entry in listing:
+                    full = os.path.join(path, entry.name)
+                    if record is not None:
+                        record(full, entry.inode())
+                    found.append((full, entry.inode(), entry.is_dir(follow_symlinks=False) and not entry.is_symlink()))
+        finally:
+            if fd is not None:
+                os.close(fd)
         return found
     import ctypes
     import struct
