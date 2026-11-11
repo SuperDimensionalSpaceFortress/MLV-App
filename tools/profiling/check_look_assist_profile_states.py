@@ -27,13 +27,19 @@ than master in any render state":
   * --subject-sha: every arm's log records the build it ran under (run_metadata "build_sha") and it is the subject;
     --exe: the executable carries the subject's build stamp (verify_exe_stamp.py).
   --require-daylight turns the master-analysis outcome into a failure: the improvement gate, not the safety one.
+  Picture binding (793-I2): the applied picture is the file the newest look_assist.apply.picture_dump line of the arm's
+  log names (final=look-assist-final-frameN.png final_sha256=<hex> final_exposure=<n> frame=<n>), that line belongs to the
+  LAST application (it precedes that application's result line), final=none is STALE (the file on disk is another run's),
+  the SHA-256 of the PNG bytes equals final_sha256, and the frame and exposure match the application. An arm with no
+  picture_dump line at all is UNBOUND_LEGACY: a failure unless --allow-unbound-legacy, which reports it as such, never PASS.
 
 usage: check_look_assist_profile_states.py <root> --tag TAG [--clips a,b] [--deck-chroma-max X] [--require-daylight]
-           [--master-tolerance X] [--subject-sha SHA] [--exe PATH] [--decisions-only]
+           [--master-tolerance X] [--subject-sha SHA] [--exe PATH] [--decisions-only] [--allow-unbound-legacy]
 exit 0 = pass, 1 = a gate failed, 2 = nothing usable (no run directories / unreadable picture).
 """
 import argparse
 import glob
+import hashlib
 import os
 import re
 import sys
@@ -56,6 +62,15 @@ SAFETY_FALLBACK = re.compile(r"look_assist\.apply\.safety_fallback\b")
 APPLY_SKIP = re.compile(r"look_assist\.apply\.skip\b(?:.*?\breason=(\S+))?")
 FALLBACK_TO_MASTER = re.compile(r"look_assist\.daylight_fallback_to_master\b")
 BUILD_SHA = re.compile(r'"build_sha"\s*:\s*"([^"]*)"')
+# The app's own binding of the final PNG (PR #793 head cc3205de, src/batch/LookAssistAnalysis.cpp lookAssistPictureDumpFields):
+#   look_assist.apply.picture_dump pre_safety=<name|none> pre_safety_sha256=<hex|none> pre_safety_exposure=<n>
+#       final=<look-assist-final-frameN.png|none> final_sha256=<hex of the exact PNG bytes|none> final_exposure=<n>
+#       safety=<keep|retreat|revert> frame=<n>
+# It is logged after the application's last look change and BEFORE that application's look_assist.apply.result line.
+PICTURE_DUMP = re.compile(r"look_assist\.apply\.picture_dump\b(.*)")
+FIELD = re.compile(r"\b([a-z_0-9]+)=(\S+)")
+LOG_FRAME = re.compile(r"(?<![\w])frame=(\d+)")
+FINAL_PICTURE_NAME = re.compile(r"^look-assist-final-frame(\d+)\.png$")
 
 
 def parse_log_text(text):
@@ -70,9 +85,18 @@ def parse_log_text(text):
     """
     receipt = None
     skipped = None
+    pending_dump = None      # the picture_dump line the NEXT result will own (it precedes its own result line)
+    newest_dump = None       # the newest picture_dump line anywhere in the log
+    dump_lines = 0
     for line in text.splitlines():
+        dump = PICTURE_DUMP.search(line)
+        if dump:
+            pending_dump = newest_dump = dict(FIELD.findall(dump.group(1)))
+            dump_lines += 1
+            continue
         if SAFETY_FALLBACK.search(line):
             receipt = {"safety_fallback": True}
+            pending_dump = None
             continue
         skip = APPLY_SKIP.search(line)
         if skip:
@@ -80,26 +104,45 @@ def parse_log_text(text):
             continue
         if FALLBACK_TO_MASTER.search(line):
             receipt = {"fell_back": True}
+            pending_dump = None
             continue
         dispatch = ASYNC_DISPATCH.search(line)
         if dispatch:
             receipt = {"scene": dispatch.group(1)}   # a new application: nothing of the previous one survives
+            pending_dump = None
             continue
         wb = AUTO_WB.search(line)
         if wb:
             receipt = dict(receipt or {}, source=wb.group(2), decision=wb.group(3))
+            receipt.pop("picture_dump", None)        # a new application began: the earlier result's dump is not its
+            pending_dump = None                     # auto_wb precedes the dump of its own application
             continue
         result = RESULT.search(line)
         if result:
             receipt = dict(receipt or {}, scene=result.group(1), exposure=int(result.group(2)),
                            temperature=int(result.group(3)), tint=int(result.group(4)))
+            receipt.pop("frame", None)
+            frame = LOG_FRAME.search(line)
+            if frame:
+                receipt["frame"] = int(frame.group(1))
+            receipt["picture_dump"], pending_dump = pending_dump, None    # this application owns the dump before it
             continue
         applied = ASYNC_APPLIED.search(line)
         if applied:
             receipt = dict(receipt or {}, source=applied.group(1), decision=applied.group(2),
                            temperature=int(applied.group(3)), tint=int(applied.group(4)), exposure=int(applied.group(5)))
+            receipt.pop("frame", None)
+            frame = LOG_FRAME.search(line)
+            if frame:
+                receipt["frame"] = int(frame.group(1))
+            receipt["picture_dump"], pending_dump = pending_dump, None
     if skipped:
         receipt = dict(receipt or {}, skipped=skipped)
+    if receipt is not None and dump_lines:
+        # Only the NEWEST picture_dump line can bind the final PNG now on disk, and only when it belongs to the LAST
+        # application. receipt["picture_dump"] is None when the last application owns no dump line.
+        receipt["picture_dump_lines"] = dump_lines
+        receipt["picture_dump_is_newest"] = receipt.get("picture_dump") is newest_dump
     return receipt
 
 
@@ -171,6 +214,60 @@ def check_subject(name, directory, subject_sha):
     return []
 
 
+def file_sha256(path):
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        for block in iter(lambda: handle.read(1 << 20), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def check_picture_binding(name, receipt, png_path, allow_legacy=False):
+    """-> (state, failures). state is 'bound' (the newest picture_dump line names exactly this PNG, by content, for the
+    last application), 'legacy' (the arm's log has no picture_dump line at all: UNBOUND_LEGACY, a failure unless
+    allow_legacy), 'stale' (a picture_dump line exists and does not bind this PNG) or None (no usable receipt: the
+    decision gate already failed the arm). 793-I2: a readable PNG left by an earlier run must not pass."""
+    if not receipt or not all(k in receipt for k in ("scene", "source", "decision", "temperature", "tint", "exposure")):
+        return None, []
+    lines = receipt.get("picture_dump_lines", 0)
+    if not lines:
+        if allow_legacy:
+            return "legacy", []
+        return "legacy", ["%s: UNBOUND_LEGACY - the log has no look_assist.apply.picture_dump line, so %s is not tied to this "
+                          "application (only --allow-unbound-legacy accepts that, and reports it as UNBOUND_LEGACY, never as PASS)"
+                          % (name, os.path.basename(png_path))]
+    dump = receipt.get("picture_dump")
+    if dump is None or not receipt.get("picture_dump_is_newest"):
+        return "stale", ["%s: STALE - the newest look_assist.apply.picture_dump line does not belong to the last application "
+                         "(it precedes an earlier application's result or follows the last result), so %s is not its picture"
+                         % (name, os.path.basename(png_path))]
+    missing = [k for k in ("final", "final_sha256", "final_exposure", "frame") if k not in dump]
+    if missing:
+        return "stale", ["%s: STALE - the picture_dump line lacks %s" % (name, ", ".join(missing))]
+    if dump["final"] == "none" or dump["final_sha256"] == "none":
+        return "stale", ["%s: STALE - the picture_dump line says final=none: the app wrote no %s for this application, so a "
+                         "readable file of that name is left over from another run" % (name, os.path.basename(png_path))]
+    wanted = FINAL_PICTURE_NAME.match(os.path.basename(png_path))
+    named = FINAL_PICTURE_NAME.match(dump["final"])
+    failures = []
+    if not named or dump["final"] != os.path.basename(png_path):
+        failures.append("%s: STALE - picture_dump names final=%r, the gate reads %s" % (name, dump["final"], os.path.basename(png_path)))
+    if not dump["frame"].isdigit() or (wanted and wanted.group(1) != dump["frame"]) or (named and named.group(1) != dump["frame"]):
+        failures.append("%s: STALE - picture_dump frame=%s does not match the picture under test (%s)"
+                        % (name, dump["frame"], os.path.basename(png_path)))
+    elif "frame" in receipt and receipt["frame"] != int(dump["frame"]):
+        failures.append("%s: STALE - picture_dump frame=%s but the application's result is frame=%d"
+                        % (name, dump["frame"], receipt["frame"]))
+    if dump["final_exposure"] != str(receipt["exposure"]):
+        failures.append("%s: STALE - picture_dump final_exposure=%s but the application's receipt exposure is %d"
+                        % (name, dump["final_exposure"], receipt["exposure"]))
+    actual = file_sha256(png_path)
+    if actual != dump["final_sha256"].lower():
+        failures.append("%s: STALE - sha256 of %s is %s, picture_dump final_sha256=%s (the file is not the picture the app wrote)"
+                        % (name, os.path.basename(png_path), actual, dump["final_sha256"]))
+    return ("stale" if failures else "bound"), failures
+
+
 def find_runs(root, tag):
     runs = {}
     for directory in sorted(glob.glob(os.path.join(root, tag + "-*"))):
@@ -192,6 +289,10 @@ def main(argv=None):
     parser.add_argument("--subject-sha", default=None)
     parser.add_argument("--exe", default=None)
     parser.add_argument("--decisions-only", action="store_true", help="skip the picture gate (the pictures are then NOT required)")
+    parser.add_argument("--allow-unbound-legacy", action="store_true",
+                        help="accept an arm whose log has no look_assist.apply.picture_dump line (evidence from a build that "
+                             "does not emit it): reported as UNBOUND_LEGACY, never as PASS. A line that is present and does "
+                             "not bind the picture is STALE and always fails.")
     args = parser.parse_args(argv)
 
     runs = find_runs(args.root, args.tag)
@@ -201,6 +302,7 @@ def main(argv=None):
 
     failures = []
     notes = []
+    legacy = []
     for clip in [c for c in args.clips.split(",") if c]:
         for mode in MODES:
             if (clip, mode) not in runs:
@@ -244,7 +346,12 @@ def main(argv=None):
                 return 2
             klass = receipt_class(receipts[(clip, mode)]) or "?"
             tolerance = args.master_tolerance if klass == "master" else 0.0
-            notes.append("%s [%s] deck chroma %.2f (master's look %.2f)" % (name, klass, chroma, master))
+            state, binding_failures = check_picture_binding(name, receipts[(clip, mode)], applied_png, args.allow_unbound_legacy)
+            failures += binding_failures
+            if state == "legacy":
+                legacy.append(name)
+            notes.append("%s [%s] deck chroma %.2f (master's look %.2f)%s"
+                         % (name, klass, chroma, master, {"bound": " picture_dump-bound", "legacy": " UNBOUND_LEGACY"}.get(state, "")))
             if args.deck_chroma_max is not None and chroma > args.deck_chroma_max:
                 failures.append("%s: deck chroma %.2f > %.2f" % (name, chroma, args.deck_chroma_max))
             if chroma > master + tolerance:
@@ -253,7 +360,11 @@ def main(argv=None):
 
     for failure in failures:
         print("FAIL " + failure)
-    if not failures:
+    if not failures and legacy:
+        # Accepted only by --allow-unbound-legacy, and never labelled PASS: the picture is not tied to the application.
+        print("UNBOUND_LEGACY-ACCEPTED %d run(s), %d arm(s) with no picture_dump binding (%s): %s"
+              % (len(runs), len(legacy), ", ".join(legacy), "; ".join(notes)))
+    elif not failures:
         print("PASS %d run(s): %s" % (len(runs), "; ".join(notes) if notes else "decisions + sync/async parity"))
     return 1 if failures else 0
 

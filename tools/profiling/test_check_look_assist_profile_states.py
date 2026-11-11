@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """Falsifier tests for check_look_assist_profile_states.py and its helpers (stdlib only: synthetic traces and
 synthetic PNGs written with zlib), plus the recorded app run the hosted CI replays."""
+import contextlib
+import hashlib
+import io
 import json
 import os
 import struct
@@ -46,6 +49,12 @@ def make_run(root, tag, clip, mode, trace, sha=SHA):
     with open(os.path.join(directory, "logs", "mlvapp.log"), "w", encoding="utf-8") as handle:
         handle.write((build_sha_line(sha) if sha else "") + trace)
     return directory
+
+
+def main_legacy(argv):
+    """The pre-793-I2 tests build evidence with no picture_dump line (and the recorded run predates the emitter): they opt in
+    to UNBOUND_LEGACY explicitly, as the recorded-run gate does."""
+    return chk.main(list(argv) + ["--allow-unbound-legacy"])
 
 
 def write_png(path, width, height, rgb, filter_type=0):
@@ -97,25 +106,25 @@ class DecisionGate(unittest.TestCase):
     def test_the_refined_daylight_decision_passes_in_both_modes(self):
         with tempfile.TemporaryDirectory() as root:
             make_full_set(root)
-            self.assertEqual(0, chk.main([root, "--tag", "t"]))
+            self.assertEqual(0, main_legacy([root, "--tag", "t"]))
 
     def test_masters_own_analysis_passes_the_safety_gate_but_not_the_improvement_gate(self):
         with tempfile.TemporaryDirectory() as root:
             make_full_set(root, MASTER_TRACE, applied=(140, 146, 170), master=(140, 146, 170))
-            self.assertEqual(0, chk.main([root, "--tag", "t"]))
-            self.assertEqual(1, chk.main([root, "--tag", "t", "--require-daylight"]))
+            self.assertEqual(0, main_legacy([root, "--tag", "t"]))
+            self.assertEqual(1, main_legacy([root, "--tag", "t", "--require-daylight"]))
 
     def test_r2_as_shot_prior_at_the_base_balance_fails(self):
         # PR #221 r2, sol + fable: shade / as-shot-prior / 6000 K / 0 in the profile-settle state.
         with tempfile.TemporaryDirectory() as root:
             make_full_set(root, R2_TRACE)
-            self.assertEqual(1, chk.main([root, "--tag", "t", "--decisions-only"]))
+            self.assertEqual(1, main_legacy([root, "--tag", "t", "--decisions-only"]))
 
     def test_the_shade_scene_with_masters_balance_fails(self):
         # PR #222 r1's no-surface state: it measured worse than master's look, so no label may launder it.
         with tempfile.TemporaryDirectory() as root:
             make_full_set(root, HALF_STATE_TRACE)
-            self.assertEqual(1, chk.main([root, "--tag", "t", "--decisions-only"]))
+            self.assertEqual(1, main_legacy([root, "--tag", "t", "--decisions-only"]))
 
     def test_sync_and_async_must_land_on_the_same_receipt(self):
         with tempfile.TemporaryDirectory() as root:
@@ -124,42 +133,42 @@ class DecisionGate(unittest.TestCase):
                 path = os.path.join(root, "t-%s-async" % clip, "logs", "mlvapp.log")
                 with open(path, "w", encoding="utf-8") as handle:
                     handle.write(build_sha_line() + sync_trace(temperature=5840, tint=7))   # the worker's other picture
-            self.assertEqual(1, chk.main([root, "--tag", "t"]))
+            self.assertEqual(1, main_legacy([root, "--tag", "t"]))
 
     def test_outside_the_daylight_window_fails(self):
         with tempfile.TemporaryDirectory() as root:
             make_full_set(root, sync_trace(temperature=3200))
-            self.assertEqual(1, chk.main([root, "--tag", "t", "--decisions-only"]))
+            self.assertEqual(1, main_legacy([root, "--tag", "t", "--decisions-only"]))
 
     def test_an_unsettled_run_fails_and_no_runs_is_unusable(self):
         with tempfile.TemporaryDirectory() as root:
             make_full_set(root, PREFIX + "look_assist.daylight_evidence_render stops=1.60\n")
-            self.assertEqual(1, chk.main([root, "--tag", "t", "--decisions-only"]))
+            self.assertEqual(1, main_legacy([root, "--tag", "t", "--decisions-only"]))
         with tempfile.TemporaryDirectory() as empty:
-            self.assertEqual(2, chk.main([empty, "--tag", "t"]))
+            self.assertEqual(2, main_legacy([empty, "--tag", "t"]))
 
     def test_a_missing_sync_or_async_partner_fails(self):
         # sol: a mocked directory view holding only one arm used to exit 0.
         with tempfile.TemporaryDirectory() as root:
             directory = make_run(root, "t", "large_dual_iso", "async", sync_trace())
             pictures(directory, (132, 132, 134), (140, 146, 170))
-            self.assertEqual(1, chk.main([root, "--tag", "t", "--clips", "large_dual_iso"]))
+            self.assertEqual(1, main_legacy([root, "--tag", "t", "--clips", "large_dual_iso"]))
         with tempfile.TemporaryDirectory() as root:
             make_full_set(root)
             os.rename(os.path.join(root, "t-tiny_dual_iso-async"), os.path.join(root, "x-tiny_dual_iso-async"))
-            self.assertEqual(1, chk.main([root, "--tag", "t"]))
+            self.assertEqual(1, main_legacy([root, "--tag", "t"]))
 
     def test_missing_pictures_fail_unless_decisions_only(self):
         with tempfile.TemporaryDirectory() as root:
             for clip in chk.DEFAULT_CLIPS:
                 for mode in chk.MODES:
                     make_run(root, "t", clip, mode, sync_trace())
-            self.assertEqual(1, chk.main([root, "--tag", "t"]))
-            self.assertEqual(0, chk.main([root, "--tag", "t", "--decisions-only"]))
+            self.assertEqual(1, main_legacy([root, "--tag", "t"]))
+            self.assertEqual(0, main_legacy([root, "--tag", "t", "--decisions-only"]))
         with tempfile.TemporaryDirectory() as root:
             make_full_set(root)
             os.remove(os.path.join(root, "t-large_dual_iso-sync", chk.MASTER_PICTURE))   # master's look is half the gate
-            self.assertEqual(1, chk.main([root, "--tag", "t"]))
+            self.assertEqual(1, main_legacy([root, "--tag", "t"]))
 
     def test_an_accepted_receipt_is_not_kept_by_a_later_failed_application(self):
         # sol: an accepted sync trace followed by async_dispatch and safety_fallback retained the earlier receipt.
@@ -205,17 +214,17 @@ class DecisionGate(unittest.TestCase):
         reasonless = PREFIX + "look_assist.apply.skip file_loaded=1 mlv=1 receipt=1 enabled=1\n"
         with tempfile.TemporaryDirectory() as root:
             make_full_set(root)
-            self.assertEqual(0, chk.main([root, "--tag", "t", "--subject-sha", SHA]))
+            self.assertEqual(0, main_legacy([root, "--tag", "t", "--subject-sha", SHA]))
             path = os.path.join(root, "t-large_dual_iso-sync", "logs", "mlvapp.log")
             with open(path, "a", encoding="utf-8") as handle:
                 handle.write(reasonless)
-            self.assertEqual(1, chk.main([root, "--tag", "t", "--subject-sha", SHA]))
+            self.assertEqual(1, main_legacy([root, "--tag", "t", "--subject-sha", SHA]))
         with tempfile.TemporaryDirectory() as root:
             make_full_set(root, MASTER_TRACE, applied=(140, 146, 170), master=(140, 146, 170))
             path = os.path.join(root, "t-tiny_dual_iso-async", "logs", "mlvapp.log")
             with open(path, "a", encoding="utf-8") as handle:
                 handle.write(reasonless)
-            self.assertEqual(1, chk.main([root, "--tag", "t"]))
+            self.assertEqual(1, main_legacy([root, "--tag", "t"]))
 
     def test_a_skip_invalidates_the_arm_whatever_rebuilds_the_receipt_after_it(self):
         # sol, PR #224 r1: a master fallback and an async dispatch each REPLACE the receipt dictionary, which used to
@@ -260,26 +269,26 @@ class DecisionGate(unittest.TestCase):
                             source = os.path.join(RECORDED, name)
                             if os.path.isdir(source):
                                 shutil.copytree(source, os.path.join(root, name))
-                        self.assertEqual(0, chk.main([root, "--tag", "rec", "--subject-sha", manifest_sha]))
+                        self.assertEqual(0, main_legacy([root, "--tag", "rec", "--subject-sha", manifest_sha]))
                         logs = os.path.join(root, "rec-%s-%s" % (clip, mode), "logs")
                         path = os.path.join(logs, sorted(os.listdir(logs))[0])
                         with open(path, "r", encoding="utf-8", errors="replace", newline="") as handle:
                             original = handle.read()
                         with open(path, "w", encoding="utf-8", newline="") as handle:
                             handle.write(PREFIX + skip + original)
-                        self.assertEqual(1, chk.main([root, "--tag", "rec", "--subject-sha", manifest_sha]),
+                        self.assertEqual(1, main_legacy([root, "--tag", "rec", "--subject-sha", manifest_sha]),
                                          "%s/%s %s" % (clip, mode, skip))
         # a skip prepended to a synthetic arm that ends on a master fallback, sync and async
         with tempfile.TemporaryDirectory() as root:
             fallback = PREFIX + "look_assist.daylight_fallback_to_master reason=no_verified_surface frame=0\n"
             make_full_set(root, fallback + MASTER_TRACE, applied=(140, 146, 170), master=(140, 146, 170))
-            self.assertEqual(0, chk.main([root, "--tag", "t", "--subject-sha", SHA]))
+            self.assertEqual(0, main_legacy([root, "--tag", "t", "--subject-sha", SHA]))
             path = os.path.join(root, "t-tiny_dual_iso-sync", "logs", "mlvapp.log")
             with open(path, "r", encoding="utf-8") as handle:
                 original = handle.read()
             with open(path, "w", encoding="utf-8") as handle:
                 handle.write(PREFIX + "look_assist.apply.skip file_loaded=1 mlv=1 receipt=1 enabled=1\n" + original)
-            self.assertEqual(1, chk.main([root, "--tag", "t", "--subject-sha", SHA]))
+            self.assertEqual(1, main_legacy([root, "--tag", "t", "--subject-sha", SHA]))
 
     def test_async_receipt_is_read_from_the_async_applied_event(self):
         text = (PREFIX + "look_assist.apply.async_dispatch generation=3 frame=0 scene=shade floor_lifted=0\n"
@@ -294,11 +303,11 @@ class SubjectBinding(unittest.TestCase):
     def test_every_arm_must_report_the_subject_build(self):
         with tempfile.TemporaryDirectory() as root:
             make_full_set(root)
-            self.assertEqual(0, chk.main([root, "--tag", "t", "--subject-sha", SHA]))
-            self.assertEqual(1, chk.main([root, "--tag", "t", "--subject-sha", "b" * 40]))     # an older build's logs
+            self.assertEqual(0, main_legacy([root, "--tag", "t", "--subject-sha", SHA]))
+            self.assertEqual(1, main_legacy([root, "--tag", "t", "--subject-sha", "b" * 40]))     # an older build's logs
         with tempfile.TemporaryDirectory() as root:
             make_full_set(root, sha=None)                                                       # no build_sha at all
-            self.assertEqual(1, chk.main([root, "--tag", "t", "--subject-sha", SHA]))
+            self.assertEqual(1, main_legacy([root, "--tag", "t", "--subject-sha", SHA]))
 
     def test_the_executable_must_carry_the_subjects_stamp(self):
         with tempfile.TemporaryDirectory() as root:
@@ -320,21 +329,150 @@ class PictureGate(unittest.TestCase):
     def test_neutral_deck_passes_and_a_cast_deck_or_one_worse_than_master_fails(self):
         with tempfile.TemporaryDirectory() as root:
             make_full_set(root, applied=(132, 132, 134), master=(140, 146, 170))
-            self.assertEqual(0, chk.main([root, "--tag", "t", "--deck-chroma-max", "6"]))
+            self.assertEqual(0, main_legacy([root, "--tag", "t", "--deck-chroma-max", "6"]))
         with tempfile.TemporaryDirectory() as root:
             make_full_set(root, applied=(124, 132, 165), master=(140, 146, 170))             # the r2 picture, still worse than master? no
-            self.assertEqual(1, chk.main([root, "--tag", "t", "--deck-chroma-max", "6"]))   # but not within 6
+            self.assertEqual(1, main_legacy([root, "--tag", "t", "--deck-chroma-max", "6"]))   # but not within 6
         with tempfile.TemporaryDirectory() as root:
             make_full_set(root, applied=(132, 132, 140), master=(132, 132, 134))             # master's look is better here
-            self.assertEqual(1, chk.main([root, "--tag", "t", "--deck-chroma-max", "9"]))
+            self.assertEqual(1, main_legacy([root, "--tag", "t", "--deck-chroma-max", "9"]))
 
     def test_a_master_analysis_arm_gets_the_two_path_tolerance_and_no_more(self):
         with tempfile.TemporaryDirectory() as root:
             make_full_set(root, MASTER_TRACE, applied=(140, 146, 170), master=(140, 146, 170))
-            self.assertEqual(0, chk.main([root, "--tag", "t"]))
+            self.assertEqual(0, main_legacy([root, "--tag", "t"]))
         with tempfile.TemporaryDirectory() as root:
             make_full_set(root, MASTER_TRACE, applied=(124, 132, 165), master=(140, 146, 170))   # r2's picture under master's label
-            self.assertEqual(1, chk.main([root, "--tag", "t"]))
+            self.assertEqual(1, main_legacy([root, "--tag", "t"]))
+
+
+def dump_line(sha, exposure=160, frame=0, final=None, final_sha=None, final_exposure=None, safety="keep"):
+    """The look_assist.apply.picture_dump line exactly as src/batch/LookAssistAnalysis.cpp lookAssistPictureDumpFields
+    formats it at cc3205de (PR #793): final=none / final_sha256=none when the final PNG was not written."""
+    final_name = "look-assist-final-frame%d.png" % frame if final is None else final
+    return (PREFIX + "look_assist.apply.picture_dump pre_safety=look-assist-pre-safety-frame%d.png pre_safety_sha256=%s "
+                     "pre_safety_exposure=%d final=%s final_sha256=%s final_exposure=%d safety=%s frame=%d\n"
+            % (frame, "c" * 64, exposure, final_name, sha if final_sha is None else final_sha,
+               exposure if final_exposure is None else final_exposure, safety, frame))
+
+
+def result_line(exposure=160, frame=0):
+    return (PREFIX + "look_assist.apply.result analysis=raw scene=shade median=37.000 preset_exp=%d preset_contrast=15 "
+                     "final_temp=8950 final_tint=-35 thumb=180x226 frame=%d\n" % (exposure, frame))
+
+
+AUTO_WB_LINE = PREFIX + "look_assist.apply.auto_wb valid=1 source=rendered-neutral-patch decision=accepted damping=1.000\n"
+DISPATCH_LINE = PREFIX + "look_assist.apply.async_dispatch generation=3 frame=0 scene=shade floor_lifted=0\n"
+ASYNC_APPLIED_LINE = (PREFIX + "look_assist.apply.auto_wb_async_applied generation=3 valid=1 source=processed-neutral-patch "
+                               "decision=accepted damping=1.000 awb_temp=9990 awb_tint=-35 final_temp=9990 final_tint=-35 "
+                               "preset_exp=160 frame=0\n")
+
+
+def run_checker(argv):
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        code = chk.main(argv)
+    return code, out.getvalue()
+
+
+def make_bound_set(root, trace_for, applied=(132, 132, 134), master=(140, 146, 170)):
+    """Every arm's log is built AFTER its picture exists, so trace_for(sha) can bind the PNG's real bytes."""
+    for clip in chk.DEFAULT_CLIPS:
+        for mode in chk.MODES:
+            directory = make_run(root, "t", clip, mode, "", SHA)
+            pictures(directory, applied, master)
+            with open(os.path.join(directory, chk.APPLIED_PICTURE), "rb") as handle:
+                sha = hashlib.sha256(handle.read()).hexdigest()
+            with open(os.path.join(directory, "logs", "mlvapp.log"), "a", encoding="utf-8") as handle:
+                handle.write(trace_for(sha))
+
+
+class PictureDumpBinding(unittest.TestCase):
+    """LOOK-ASSIST-PROFILE-STATES-VERIFY-PICTURE-DUMP-BINDING-1 (Dot 793-I2): the picture the gate measures must be the
+    one the application's own look_assist.apply.picture_dump line names, by content, for the application under test."""
+
+    def test_a_stale_readable_png_with_final_none_fails_closed(self):
+        with tempfile.TemporaryDirectory() as root:
+            make_bound_set(root, lambda sha: AUTO_WB_LINE + dump_line(sha, final="none", final_sha="none") + result_line())
+            code, text = run_checker([root, "--tag", "t"])
+            self.assertEqual(1, code, text)
+            self.assertIn("STALE", text)
+            self.assertIn("final=none", text)
+
+    def test_a_png_whose_bytes_do_not_match_final_sha256_fails(self):
+        with tempfile.TemporaryDirectory() as root:
+            make_bound_set(root, lambda sha: AUTO_WB_LINE + dump_line(sha, final_sha="b" * 64) + result_line())
+            code, text = run_checker([root, "--tag", "t"])
+            self.assertEqual(1, code, text)
+            self.assertIn("sha256", text)
+
+    def test_a_dump_for_another_application_frame_or_exposure_fails(self):
+        cases = {
+            "frame": lambda sha: AUTO_WB_LINE + dump_line(sha, frame=3) + result_line(frame=3),
+            "frame (final names another frame's file)": lambda sha: AUTO_WB_LINE + dump_line(sha, final="look-assist-final-frame3.png") + result_line(),
+            "exposure": lambda sha: AUTO_WB_LINE + dump_line(sha, final_exposure=380) + result_line(exposure=160),
+            "application (the dump precedes an earlier result, a later async application has none)":
+                lambda sha: AUTO_WB_LINE + dump_line(sha) + result_line() + DISPATCH_LINE + ASYNC_APPLIED_LINE,
+            "application (the dump follows the last result)": lambda sha: AUTO_WB_LINE + result_line() + dump_line(sha),
+        }
+        for label, trace_for in cases.items():
+            with self.subTest(label), tempfile.TemporaryDirectory() as root:
+                make_bound_set(root, trace_for)
+                code, text = run_checker([root, "--tag", "t"])
+                self.assertEqual(1, code, text)
+                self.assertIn("STALE", text)
+
+    def test_legacy_unbound_evidence_fails_unless_opted_in_and_is_never_reported_as_pass(self):
+        with tempfile.TemporaryDirectory() as root:
+            make_bound_set(root, lambda sha: AUTO_WB_LINE + result_line())     # no picture_dump line at all
+            code, text = run_checker([root, "--tag", "t"])
+            self.assertEqual(1, code, text)
+            self.assertIn("UNBOUND_LEGACY", text)
+            code, text = run_checker([root, "--tag", "t", "--allow-unbound-legacy"])
+            self.assertEqual(0, code, text)
+            self.assertIn("UNBOUND_LEGACY", text)
+            self.assertNotIn("\nPASS", "\n" + text)
+
+    # ---- controls: bound and correct evidence keeps every verdict it had ----
+    def test_bound_and_correct_evidence_passes_and_says_it_is_bound(self):
+        for safety in ("keep", "retreat"):
+            with self.subTest(safety), tempfile.TemporaryDirectory() as root:
+                make_bound_set(root, lambda sha: AUTO_WB_LINE + dump_line(sha, safety=safety) + result_line())
+                code, text = run_checker([root, "--tag", "t"])
+                self.assertEqual(0, code, text)
+                self.assertIn("PASS", text)
+                self.assertNotIn("UNBOUND_LEGACY", text)
+                self.assertIn("bound", text)
+
+    def test_the_newest_picture_dump_line_governs(self):
+        stale_then_good = lambda sha: (AUTO_WB_LINE + dump_line(sha, final="none", final_sha="none") + result_line()
+                                       + AUTO_WB_LINE + dump_line(sha) + result_line())
+        good_then_stale = lambda sha: (AUTO_WB_LINE + dump_line(sha) + result_line()
+                                       + AUTO_WB_LINE + dump_line(sha, final="none", final_sha="none") + result_line())
+        with tempfile.TemporaryDirectory() as root:
+            make_bound_set(root, stale_then_good)
+            self.assertEqual(0, run_checker([root, "--tag", "t"])[0])
+        with tempfile.TemporaryDirectory() as root:
+            make_bound_set(root, good_then_stale)
+            code, text = run_checker([root, "--tag", "t"])
+            self.assertEqual(1, code, text)
+            self.assertIn("STALE", text)
+
+    def test_decisions_only_never_reads_the_picture_so_it_needs_no_binding(self):
+        with tempfile.TemporaryDirectory() as root:
+            make_bound_set(root, lambda sha: AUTO_WB_LINE + result_line())
+            self.assertEqual(0, run_checker([root, "--tag", "t", "--decisions-only"])[0])
+
+    def test_a_bound_line_in_one_arm_does_not_excuse_an_unbound_partner(self):
+        with tempfile.TemporaryDirectory() as root:
+            make_bound_set(root, lambda sha: AUTO_WB_LINE + dump_line(sha) + result_line())
+            path = os.path.join(root, "t-tiny_dual_iso-async", "logs", "mlvapp.log")
+            with open(path, "w", encoding="utf-8") as handle:
+                handle.write(build_sha_line() + AUTO_WB_LINE + result_line())
+            code, text = run_checker([root, "--tag", "t"])
+            self.assertEqual(1, code, text)
+            self.assertIn("tiny_dual_iso/async", text)
+            self.assertIn("UNBOUND_LEGACY", text)
 
 
 class PngReader(unittest.TestCase):
@@ -394,10 +532,19 @@ class RecordedAppRun(unittest.TestCase):
                     self.assertIn("rec-%s-%s/%s" % (clip, mode, picture.replace(os.sep, "/")), pictures_listed)
 
     def test_the_recorded_run_passes_the_gate_bound_to_its_subject(self):
-        self.assertEqual(0, chk.main([RECORDED, "--tag", "rec", "--subject-sha", self.manifest["subject_sha"]]))
+        self.assertEqual(0, main_legacy([RECORDED, "--tag", "rec", "--subject-sha", self.manifest["subject_sha"]]))
+
+    def test_the_recorded_run_is_unbound_legacy_and_says_so_only_when_opted_in(self):
+        # It predates the picture_dump emitter (and its pictures are downscaled copies): without the explicit opt-in it fails.
+        code, text = run_checker([RECORDED, "--tag", "rec", "--subject-sha", self.manifest["subject_sha"]])
+        self.assertEqual(1, code, text)
+        self.assertIn("UNBOUND_LEGACY", text)
+        code, text = run_checker([RECORDED, "--tag", "rec", "--subject-sha", self.manifest["subject_sha"], "--allow-unbound-legacy"])
+        self.assertEqual(0, code, text)
+        self.assertTrue(text.startswith("UNBOUND_LEGACY-ACCEPTED"), text)
 
     def test_the_recorded_run_fails_if_it_is_claimed_for_another_commit(self):
-        self.assertEqual(1, chk.main([RECORDED, "--tag", "rec", "--subject-sha", "0" * 40]))
+        self.assertEqual(1, main_legacy([RECORDED, "--tag", "rec", "--subject-sha", "0" * 40]))
 
     def test_the_gate_refuses_the_recorded_run_with_an_arm_removed(self):
         import shutil
@@ -406,7 +553,7 @@ class RecordedAppRun(unittest.TestCase):
                 source = os.path.join(RECORDED, name)
                 if os.path.isdir(source) and name != "rec-large_dual_iso-async":
                     shutil.copytree(source, os.path.join(root, name))
-            self.assertEqual(1, chk.main([root, "--tag", "rec"]))
+            self.assertEqual(1, main_legacy([root, "--tag", "rec"]))
 
 
 if __name__ == "__main__":
