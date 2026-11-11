@@ -625,6 +625,55 @@ TEST(PlaybackTexturePresentSplit, ExcludedFirstTexturePresentIsInNoSlipSum)
     ASSERT_EQ( 0, sum.textureAllSlips[static_cast<size_t>( Path::Window )].events );
 }
 
+// r7 Step 1: the early slot release is its own part. It aggregates like the others (avg / p95 / slip_avg) and every
+// slip line carries it, so G-MECH can compare slip_avg_release_ms with avg_release_ms.
+TEST(PlaybackTexturePresentSplit, R7ReleasePartAggregatesAndIsOnTheSlipLine)
+{
+    ASSERT_EQ( std::string( "release" ), std::string( playback_texture_split::partName( Part::Release ) ) );
+    PathAggregator agg;
+    agg.note( makeSample( 1.0, 1.0, 5.0 ) );   // excluded first present
+    for( int i = 1; i <= 20; ++i )
+    {
+        Sample s = makeSample( 1.0, 1.0, 9.0 );
+        s.at( Part::Release ) = ( i == 20 ) ? 8.0 : 0.1;   // one present waited on the backend mutex
+        agg.note( s );
+    }
+    ASSERT_NEAR( ( 19 * 0.1 + 8.0 ) / 20.0, agg.avg( Part::Release ), 1e-9 );
+    ASSERT_NEAR( 0.1, agg.p95( Part::Release ), 1e-9 );   // nearest rank 19 of 20
+    PartSums guiLate;
+    Sample slip = makeSample( 1.0, 1.0, 18.0 );
+    slip.at( Part::Release ) = 8.0;
+    guiLate.add( slip );
+    const std::string line = playback_texture_split::formatLine( 3, Path::Window, agg, guiLate, guiLate );
+    ASSERT_EQ( std::string( "0.495" ), field( line, "avg_release_ms" ) );
+    ASSERT_EQ( std::string( "0.100" ), field( line, "p95_release_ms" ) );
+    ASSERT_EQ( std::string( "8.000" ), field( line, "slip_avg_release_ms" ) );
+    const std::string known = playback_texture_split::formatSlipFields( true, slip );
+    ASSERT_EQ( std::string( "8.000" ), field( known, "present_release_ms" ) );
+    ASSERT_EQ( std::string( "window" ), field( known, "present_path" ) );   // the field after it still parses
+    const std::string unknown = playback_texture_split::formatSlipFields( false, slip );
+    ASSERT_EQ( std::string( "0.000" ), field( unknown, "present_release_ms" ) );
+    ASSERT_EQ( std::string( "-1" ), field( unknown, "recon_in_flight" ) );
+}
+
+// r7 Step 1 source pins: the release call at the safe-after-texture gate is timed only in smoke sessions and feeds
+// Part::Release from the frame's telemetry.
+TEST(PlaybackTexturePresentSplit, R7ReleaseTimerWiring)
+{
+    const std::string mw = readRepoFile( QStringLiteral( "platform/qt/MainWindow.cpp" ) );
+    ASSERT_FALSE( mw.empty() );
+    const size_t start = mw.find( "const double releaseStartS = m_playbackSmokeActive ? mlv_stage_timing_now() : 0.0;" );
+    ASSERT_NE( std::string::npos, start );
+    const size_t call = mw.find( "m_pRenderThread->releasePresentedFrameForRequestSerial(", start );
+    const size_t stop = mw.find( "QStringLiteral(\"gpu_playback_recon_texture_present_release_ms\")", start );
+    ASSERT_NE( std::string::npos, call );
+    ASSERT_NE( std::string::npos, stop );
+    ASSERT_TRUE( call < stop );
+    ASSERT_TRUE( stop - start < 600 );
+    ASSERT_NE( std::string::npos,
+               mw.find( "tx.at( Part::Release ) = telemetryDoubleValue( timing, \"gpu_playback_recon_texture_present_release_ms\" );" ) );
+}
+
 // Source pins: MainWindow feeds the split from values it already has, only in smoke sessions, and prints it.
 TEST(PlaybackTexturePresentSplit, MainWindowWiring)
 {

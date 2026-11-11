@@ -6561,8 +6561,17 @@ void MainWindow::presentPlaybackPreparedFrame( const PlaybackPrepResult &result 
             gpuTexNrCanReleaseSlotAfterTexturePresent );
         if( gpuTexNrCanReleaseSlotAfterTexturePresent )
         {
+            // HFR-NATIVE-M16-1457-GUI-TEXTURE-PRESENT-OFFLOAD-1 r7: the release's GUI-thread wall (it can wait on the
+            // recon backend mutex), smoke sessions only: two clock reads per present.
+            const double releaseStartS = m_playbackSmokeActive ? mlv_stage_timing_now() : 0.0;
             m_pRenderThread->releasePresentedFrameForRequestSerial(
                 readyFrame.requestSerial );
+            if( m_playbackSmokeActive )
+            {
+                readyFrame.stageTimingTelemetry.insert(
+                    QStringLiteral("gpu_playback_recon_texture_present_release_ms"),
+                    ( mlv_stage_timing_now() - releaseStartS ) * 1000.0 );
+            }
             releasePresentedFrameEarly = true;
             readyFrame.stageTimingTelemetry.insert(
                 QStringLiteral("playback_prep_gpu_tex_nr_release_before_present"),
@@ -27895,6 +27904,8 @@ void MainWindow::notePlaybackSmokePresentedFrame(
             tx.at( Part::Wall ) = telemetryDoubleValue( timing, "gpu_playback_recon_texture_present_wall_ms" );
             tx.at( Part::HostGap ) = telemetryDoubleValue( timing, "gpu_playback_recon_texture_present_host_gap_ms" );
             tx.at( Part::DrawTotal ) = drawTotalMs;
+            // r7: the early slot release's wall (0 when this present did not release early)
+            tx.at( Part::Release ) = telemetryDoubleValue( timing, "gpu_playback_recon_texture_present_release_ms" );
             // the window path's own tail (presentPlaybackPreparedFrame read it for this frame); none on the viewport
             const GpuPresentTailTiming &tail = m_lastPresentTailTiming;
             tx.painted = m_lastPresentTailTimingKnown && tail.painted;

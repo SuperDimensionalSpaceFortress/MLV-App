@@ -34,6 +34,8 @@
  *   host_gap       wall minus the backend's timed total
  *   tail_window    previous present's swap return -> this setup (only when the window is known)
  *   draw_total     drawFrameReady's whole draw for this present
+ *   release        r7: the early slot release after the texture present (releasePresentedFrameForRequestSerial), outside
+ *                  the presenter wall; it can wait on the recon backend mutex. 0 when the present did not release early.
  */
 
 #ifndef PLAYBACKTEXTUREPRESENTSPLIT_H
@@ -56,7 +58,7 @@ inline constexpr int kMaxSamples = 100000;   // per part, per path: the sampler'
 enum class Part
 {
     Context = 0, Setup, SetupLut, SetupBlur, AmazeKernel, AmazeHandoff, AmazeWall, ReconWall,
-    Paint, Swap, Post, Wall, HostGap, TailWindow, DrawTotal, Count
+    Paint, Swap, Post, Wall, HostGap, TailWindow, DrawTotal, Release, Count
 };
 inline constexpr int kPartCount = static_cast<int>( Part::Count );
 
@@ -79,6 +81,7 @@ inline const char *partName( Part p )
     case Part::HostGap: return "host_gap";
     case Part::TailWindow: return "tail_window";
     case Part::DrawTotal: return "draw_total";
+    case Part::Release: return "release";
     default: return "none";
     }
 }
@@ -276,11 +279,11 @@ inline std::string formatLine( unsigned long long session, Path path, const Path
  *  texture presenter, and every field reads 0 / -1). */
 inline std::string formatSlipFields( bool known, const Sample &s )
 {
-    char buf[320];
+    char buf[384];
     std::snprintf( buf, sizeof( buf ),
                    " amaze_kernel_ms=%.3f amaze_handoff_ms=%.3f amaze_wall_ms=%.3f present_setup_ms=%.3f"
-                   " present_paint_ms=%.3f present_swap_ms=%.3f present_wall_ms=%.3f recon_in_flight=%d"
-                   " present_path=%s",
+                   " present_paint_ms=%.3f present_swap_ms=%.3f present_wall_ms=%.3f present_release_ms=%.3f"
+                   " recon_in_flight=%d present_path=%s",
                    known ? s.at( Part::AmazeKernel ) : 0.0,
                    known ? s.at( Part::AmazeHandoff ) : 0.0,
                    known ? s.at( Part::AmazeWall ) : 0.0,
@@ -288,6 +291,7 @@ inline std::string formatSlipFields( bool known, const Sample &s )
                    known ? s.at( Part::Paint ) : 0.0,
                    known ? s.at( Part::Swap ) : 0.0,
                    known ? s.at( Part::Wall ) : 0.0,
+                   known ? s.at( Part::Release ) : 0.0,
                    known ? ( s.reconInFlight ? 1 : 0 ) : -1,
                    known ? pathName( s.path ) : "none" );
     return buf;
