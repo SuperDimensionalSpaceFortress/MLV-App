@@ -89,6 +89,19 @@ Numbers are computed from the VIDEO VIEWPORT only -- the window's timecode and f
   a pair whose ids are equal is the source repeating its picture and is no repeat; a pair with a missing or malformed id is
   counted but proves nothing;
 * `repeatedPlayFramesSourceDiffer`: the repeats whose own pair's source ids differ, the only ones that can make `PARTIAL_FREEZE`.
+* Exposure (VISUAL-GATE-EXPOSURE-FLOOR-1). Every other check asks whether the pictures move, tear and match across the A/B arms, so a
+  picture that is equally wrong in both arms passed (M16-1457: "visual OK 6/6" at mean luma 6.9/255, 84 % near-black). Each frame's
+  entry now carries `exposureLumaMean` (BT.709, 0..255), `exposureNearBlackFraction` (luma < 16) and `exposureClippedFraction`
+  (luma > 235), measured on the picture area (the same viewport rectangle and 64x36 pixels the picture is hashed on) after dropping
+  letterbox rows (a row whose full-width mean luma is under 2; `exposureLetterboxRowsDropped`; a frame with no row above that is
+  measured whole, so a black frame reads as black). The block carries the MEDIANS over the judged play frames:
+  `exposureMedianLuma`, `exposureMedianNearBlackFraction`, `exposureMedianClippedFraction` (and `exposureFrames`, how many), and the band
+  they were judged against: `exposureBand` (`minMedianLuma`, `maxMedianLuma`, `maxNearBlackFraction`, `maxClippedFraction`),
+  `exposureBandSource` and `exposureBandNote`. The band is the clip's row in `tools/profiling/dual-venue/exposure-bands.json`, else the
+  absolute fallback: median luma >= 16, median near-black fraction <= 0.60, median clipped fraction <= 0.05. The file ships with
+  **no clip rows**; they are derived from accepted legs by a follow-up (VISUAL-GATE-EXPOSURE-BANDS-SEED-1). A missing or malformed file
+  (or row) is judged on the fallback and says so in `exposureBandNote` and the reason (`exposureBandSource` `fallback-missing` /
+  `fallback-malformed`), never a silent OK; an empty file or a clip with no row is `fallback-empty` / `fallback-no-row`.
 
 | verdict | when | counted |
 |---|---|---|
@@ -100,6 +113,7 @@ Numbers are computed from the VIDEO VIEWPORT only -- the window's timecode and f
 | `VISUAL_DIVERGENCE` | the playback frame is further than the threshold from its paused full-quality re-render | yes, and the detail says so |
 | `CAPTURE_BLANK` | every play frame's viewport is flat (std < 1): the capture judges nothing | yes |
 | `NOT_CAPTURED` / `NOT_REQUESTED` | nothing published (an old build, a failed run) / the spec opts out | yes |
+| `EXPOSURE_OUT_OF_RANGE` | none of the verdicts above, but the leg's median luma, near-black fraction or clipped fraction is outside its band (see Exposure above); the reason quotes the three numbers and the band | yes, and the detail says so (a flag, never an exclusion; judged after every other verdict) |
 | `OK` | none of the above | yes |
 
 `sourceDifference` is derived from the app's own per-frame records over the SAME frames the picture is judged over (the play

@@ -1,0 +1,5 @@
+{
+  "schema": "mlv-app/dual-venue-exposure-bands/v1",
+  "note": "Per-clip exposure bands for the dual-venue visual gate (VISUAL-GATE-EXPOSURE-FLOOR-1). clips maps a clip id to { minMedianLuma, maxMedianLuma (0..255), maxNearBlackFraction, maxClippedFraction (0..1) }, judged against the MEDIAN over a leg's judged play frames; a field a row leaves out takes the absolute fallback's value. A clip with no row (every clip today: rows are derived from accepted legs by VISUAL-GATE-EXPOSURE-BANDS-SEED-1) is judged against the fallback band in DualVenueRunner.psm1: median luma >= 16, near-black fraction <= 0.60, clipped fraction <= 0.05. A missing or malformed file falls back the same way and is reported in the receipt.",
+  "clips": {}
+}
