@@ -146,12 +146,12 @@ TEST(AmazePresentStream, AnOrderingFailureStillDrainsEveryTileStreamBeforeItThro
     const int declared = batch.indexOf(QStringLiteral("cudaError_t presentOrderRc = cudaSuccess;"));
     const int loop = batch.indexOf(QStringLiteral("for (std::size_t slot = 0; slot < active && presentOrderRc == cudaSuccess; ++slot)"));
     const int drain = batch.indexOf(QStringLiteral("igpu_amaze_present::drain_every_stream("));
-    const int raised = batch.indexOf(QStringLiteral("CK(tileDrainRc);"));
+    const int raised = batch.indexOf(QStringLiteral("raise_noted_cuda(tileDrainRc, \"tileDrainRc\", __FILE__, __LINE__);"));
     ASSERT_TRUE(declared >= 0);
     ASSERT_TRUE(loop > declared);
     ASSERT_TRUE(drain > loop);
     ASSERT_TRUE(raised > drain);
-    ASSERT_EQ(1, (int)batch.count(QStringLiteral("CK(tileDrainRc);")));
+    ASSERT_EQ(1, (int)batch.count(QStringLiteral("raise_noted_cuda(")));
     // Between the ordering block and the raise nothing can throw: no CK at all.
     ASSERT_FALSE(batch.mid(loop, raised - loop).contains(QStringLiteral("CK(")));
 }
@@ -159,40 +159,88 @@ TEST(AmazePresentStream, AnOrderingFailureStillDrainsEveryTileStreamBeforeItThro
 TEST(AmazePresentStream, TheTileDrainIsBestEffortAndTheOrderingCodeIsRaisedFirst)
 {
     // 795-R3-I1 (r4): the drain hands EVERY active tile stream to the shared best-effort helper, seeded with the
-    // ordering code, through the timed sync wrapper; CK raises the one result after the call. No throwing CK is
+    // ordering code, through the timed sync wrapper, and raises the one result after the call. No throwing CK is
     // left on any tile-stream sync after the launch loop (the slot-reuse sync inside the launch loop is pre-r3).
+    // r4 fix 2 (adversary A1 on f0058f46): each evaluated failure is noted once, in call order, at its own site (the
+    // ordering code before the drain, each failed sync as it returns), and the raise does not note again.
     const QString cu = amazeSource();
     const QString batch = functionBody(cu, QStringLiteral("void run_frame_to_device_rgb16_bayer16_post_wb_batched("));
     ASSERT_TRUE(batch.contains(QStringLiteral(
+        "            if (presentOrderRc == cudaSuccess) presentOrderRc = cudaStreamWaitEvent(presentStream, presentProducerDone, 0);\n"
+        "        }\n"
+        "        if (presentOrderRc != cudaSuccess)\n"
+        "        {\n"
+        "            IGPU_CUDA_ERROR_NOTE(presentOrderRc, \"tiles:present_order\");\n"
+        "        }\n"
+        "    }\n"
         "    const cudaError_t tileDrainRc = igpu_amaze_present::drain_every_stream(\n"
-        "        streams, active, presentOrderRc, cudaSuccess, [&](cudaStream_t tile) -> cudaError_t {\n"
+        "        streams,\n"
+        "        active,\n"
+        "        presentOrderRc,\n"
+        "        cudaSuccess,\n"
+        "        [&](cudaStream_t tile) -> cudaError_t {\n"
         "            return IGPU_LT_SYNC_CALL(\"tiles:drain_sync\", cudaStreamSynchronize(tile));\n"
+        "        },\n"
+        "        [](cudaError_t rc) {\n"
+        "            if (rc != cudaSuccess)\n"
+        "            {\n"
+        "                IGPU_CUDA_ERROR_NOTE(rc, \"tiles:drain_sync\");\n"
+        "            }\n"
         "        });\n"
-        "    CK(tileDrainRc);")));
+        "    raise_noted_cuda(tileDrainRc, \"tileDrainRc\", __FILE__, __LINE__);")));
     const int afterLaunch = batch.indexOf(QStringLiteral("const std::size_t active = std::min(inFlight, batchSize);"));
     ASSERT_TRUE(afterLaunch >= 0);
-    ASSERT_FALSE(batch.mid(afterLaunch).contains(QStringLiteral("CK(IGPU_LT_SYNC_CALL(")));
-    ASSERT_FALSE(batch.contains(QStringLiteral("CK(presentOrderRc)")));
+    ASSERT_FALSE(batch.mid(afterLaunch).contains(QStringLiteral("CK(")));
     // The batch body has no device-wide sync either.
     ASSERT_FALSE(batch.contains(QStringLiteral("cudaDeviceSynchronize")));
     ASSERT_FALSE(batch.contains(QStringLiteral("cudaStreamSynchronize(0)")));
+}
+
+TEST(AmazePresentStream, TheNotedRaiseThrowsCheckCudasErrorWithoutASecondNote)
+{
+    // r4 fix 2: raise_noted_cuda is check_cuda's library throw (same type, same message shape) minus its note.
+    const QString cu = amazeSource();
+    const QString raise = functionBody(cu, QStringLiteral("void raise_noted_cuda(cudaError_t rc, const char * call, const char * file, int line)"));
+    ASSERT_TRUE(raise.contains(QStringLiteral("    if (rc == cudaSuccess) return;\n    throw CudaStageProbeError(\n"
+                                              "        std::string(\"CUDA error \") + call + \" @ \" + file + \":\" +\n"
+                                              "        std::to_string(line) + \": \" + cudaGetErrorString(rc));")));
+    ASSERT_FALSE(raise.contains(QStringLiteral("IGPU_CUDA_ERROR_NOTE")));
+    const QString probe = readRepoFile(QStringLiteral("tools/gpu/cuda_amaze_debayer_stage_probe.cu"));
+    ASSERT_TRUE(probe.contains(QStringLiteral("    IGPU_CUDA_ERROR_NOTE(rc, call);\n    throw CudaStageProbeError(\n"
+                                              "        std::string(\"CUDA error \") + call + \" @ \" + file + \":\" +\n"
+                                              "        std::to_string(line) + \": \" + cudaGetErrorString(rc));")));
 }
 
 namespace
 {
 
 // Host-side stub for the drain helper: a fake stream is its slot index, a fake error code is an int (0 = success).
-// failAt maps a slot to the code its sync returns; every call is recorded in order.
+// failAt maps a slot to the code its sync returns; every sync and every note is recorded in call order, in one
+// shared event log (a sync is +slot+1000, a note is the code itself).
 struct StubSync
 {
     std::vector<int> failAt;     // per slot: 0 = the sync succeeds, otherwise the code it returns
     std::vector<int> synced;     // the slots synchronized, in call order
+    std::vector<int> noted;      // the codes handed to note(), in call order
+    std::vector<int> events;     // syncs and notes interleaved
     int operator()(int stream)
     {
         synced.push_back(stream);
+        events.push_back(1000 + stream);
         return failAt[static_cast<std::size_t>(stream)];
     }
+    void note(int rc)
+    {
+        noted.push_back(rc);
+        events.push_back(rc);
+    }
 };
+
+int drainWith(StubSync & stub, const std::vector<int> & streams, std::size_t active, int seed)
+{
+    return igpu_amaze_present::drain_every_stream(streams, active, seed, 0, [&](int s) { return stub(s); },
+                                                  [&](int rc) { stub.note(rc); });
+}
 
 std::vector<int> tileStreams(int n)
 {
@@ -205,47 +253,69 @@ std::vector<int> tileStreams(int n)
 
 TEST(AmazePresentStream, StubDrainSyncsEveryStreamAfterAFailedSyncAndReturnsTheFirstError)
 {
-    using igpu_amaze_present::drain_every_stream;
     const std::vector<int> streams = tileStreams(6);
     // Stream k fails (for each k), with a second, later failure where there is room: every stream is still
     // synchronized exactly once, in order, and the FIRST failure is the code returned.
     for (int k = 0; k < 6; ++k)
     {
-        StubSync stub{std::vector<int>(6, 0), {}};
+        StubSync stub{std::vector<int>(6, 0), {}, {}, {}};
         stub.failAt[static_cast<std::size_t>(k)] = 700 + k;
         if (k + 2 < 6) stub.failAt[static_cast<std::size_t>(k + 2)] = 900;
-        const int rc = drain_every_stream(streams, streams.size(), 0, 0, [&](int s) { return stub(s); });
-        ASSERT_EQ(700 + k, rc);
+        ASSERT_EQ(700 + k, drainWith(stub, streams, streams.size(), 0));
         ASSERT_TRUE(stub.synced == streams);
     }
     // Every stream fails: still six syncs, the first code wins.
     {
-        StubSync stub{{11, 12, 13, 14, 15, 16}, {}};
-        ASSERT_EQ(11, drain_every_stream(streams, streams.size(), 0, 0, [&](int s) { return stub(s); }));
+        StubSync stub{{11, 12, 13, 14, 15, 16}, {}, {}, {}};
+        ASSERT_EQ(11, drainWith(stub, streams, streams.size(), 0));
         ASSERT_TRUE(stub.synced == streams);
     }
 }
 
 TEST(AmazePresentStream, StubDrainKeepsAnEarlierOrderingErrorAndStillDrainsEveryStream)
 {
-    using igpu_amaze_present::drain_every_stream;
     const std::vector<int> streams = tileStreams(4);
     // The ordering code is already set: it is the one returned, even when a drain fails too, and no stream is
     // skipped.
-    StubSync stub{{0, 55, 0, 66}, {}};
-    ASSERT_EQ(400, drain_every_stream(streams, streams.size(), 400, 0, [&](int s) { return stub(s); }));
+    StubSync stub{{0, 55, 0, 66}, {}, {}, {}};
+    ASSERT_EQ(400, drainWith(stub, streams, streams.size(), 400));
     ASSERT_TRUE(stub.synced == streams);
-    // All clean: success, every stream synchronized once.
-    StubSync clean{{0, 0, 0, 0}, {}};
-    ASSERT_EQ(0, drain_every_stream(streams, streams.size(), 0, 0, [&](int s) { return clean(s); }));
+    // All clean: success, every stream synchronized once, nothing noted.
+    StubSync clean{{0, 0, 0, 0}, {}, {}, {}};
+    ASSERT_EQ(0, drainWith(clean, streams, streams.size(), 0));
     ASSERT_TRUE(clean.synced == streams);
+    ASSERT_TRUE(clean.noted.empty());
     // Only the active prefix is drained (fewer tiles than streams this frame), and zero active syncs nothing.
-    StubSync prefix{{0, 0, 9, 0}, {}};
-    ASSERT_EQ(0, drain_every_stream(streams, 2, 0, 0, [&](int s) { return prefix(s); }));
+    StubSync prefix{{0, 0, 9, 0}, {}, {}, {}};
+    ASSERT_EQ(0, drainWith(prefix, streams, 2, 0));
     ASSERT_TRUE(prefix.synced == tileStreams(2));
-    StubSync none{{5, 5, 5, 5}, {}};
-    ASSERT_EQ(0, drain_every_stream(streams, 0, 0, 0, [&](int s) { return none(s); }));
+    ASSERT_TRUE(prefix.noted.empty());
+    StubSync none{{5, 5, 5, 5}, {}, {}, {}};
+    ASSERT_EQ(0, drainWith(none, streams, 0, 0));
     ASSERT_TRUE(none.synced.empty());
+    ASSERT_TRUE(none.noted.empty());
+}
+
+TEST(AmazePresentStream, StubDrainNotesEveryFailedSyncOnceInCallOrder)
+{
+    // r4 fix 2 (adversary A1 on f0058f46, its input: two active streams, both final syncs fail with 700): both
+    // failures are noted, each right after its own sync, the returned one first, so field telemetry gets a primary
+    // and a secondary record instead of one.
+    const std::vector<int> two = tileStreams(2);
+    StubSync both{{700, 700}, {}, {}, {}};
+    ASSERT_EQ(700, drainWith(both, two, two.size(), 0));
+    ASSERT_TRUE(both.noted == (std::vector<int>{700, 700}));
+    ASSERT_TRUE(both.events == (std::vector<int>{1000, 700, 1001, 700}));
+    // Mixed: the notes follow the syncs in call order and only failures are noted.
+    const std::vector<int> five = tileStreams(5);
+    StubSync mixed{{0, 21, 0, 23, 24}, {}, {}, {}};
+    ASSERT_EQ(21, drainWith(mixed, five, five.size(), 0));
+    ASSERT_TRUE(mixed.events == (std::vector<int>{1000, 1001, 21, 1002, 1003, 23, 1004, 24}));
+    // A failed seed (the ordering code, noted by the caller before the call) is returned but not noted again; the
+    // drain failures after it are still each noted once.
+    StubSync seeded{{0, 31, 32}, {}, {}, {}};
+    ASSERT_EQ(400, drainWith(seeded, tileStreams(3), 3, 400));
+    ASSERT_TRUE(seeded.noted == (std::vector<int>{31, 32}));
 }
 
 TEST(AmazePresentStream, BothLiveEntriesRunTheHandoffOnThePresentStream)

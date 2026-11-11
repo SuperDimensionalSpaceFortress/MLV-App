@@ -29,15 +29,24 @@ namespace igpu_amaze_present
  * the first failing sync. A failure is a RETURNED code: the helper adds no throw of its own, so a sync that
  * returns an error cannot skip the later ones, and the caller raises the returned code once, after the loop.
  * It does not catch: `sync` must report by return code, not by throwing (the .cu passes the timed
- * cudaStreamSynchronize wrapper, which returns its cudaError_t). A template over the error and stream types (no CUDA types),
- * so tests/console drives it with a host-side stub sync that fails on a chosen stream. */
-template <typename Rc, typename Streams, typename Sync>
-Rc drain_every_stream(const Streams & streams, std::size_t active, Rc firstRc, Rc success, Sync && sync)
+ * cudaStreamSynchronize wrapper, which returns its cudaError_t).
+ * r4 fix 2 (adversary A1 on f0058f46): EVERY failing sync code is handed to note(rc) at once, in call order, the
+ * returned one included, so field telemetry (which takes the oldest note as the primary fault) gets one record
+ * per evaluated failure, the first one first. The caller notes a failed `firstRc` itself, before the call, and
+ * raises the returned code without noting it again.
+ * A template over the error and stream types (no CUDA types), so tests/console drives it with a host-side stub
+ * sync that fails on a chosen stream. */
+template <typename Rc, typename Streams, typename Sync, typename Note>
+Rc drain_every_stream(const Streams & streams, std::size_t active, Rc firstRc, Rc success, Sync && sync, Note && note)
 {
     for (std::size_t slot = 0; slot < active; ++slot)
     {
         const Rc rc = sync(streams[slot]);
-        if (firstRc == success && rc != success) firstRc = rc;
+        if (rc != success)
+        {
+            note(rc);
+            if (firstRc == success) firstRc = rc;
+        }
     }
     return firstRc;
 }

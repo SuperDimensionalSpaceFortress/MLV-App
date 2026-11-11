@@ -1032,6 +1032,17 @@ void drain_present_stream_after_failure(cudaStream_t stream, const char * site)
     }
 }
 
+/* HFR-NATIVE-M16-1457-GUI-TEXTURE-PRESENT-OFFLOAD-1 r4 fix 2: CK's exception (CudaStageProbeError, check_cuda's
+ * "CUDA error <call> @ <file>:<line>: <text>" message) for a code that is ALREADY noted at its own site. check_cuda
+ * notes before it throws, so raising an already-noted code through CK would note it twice. No-op on success. */
+void raise_noted_cuda(cudaError_t rc, const char * call, const char * file, int line)
+{
+    if (rc == cudaSuccess) return;
+    throw CudaStageProbeError(
+        std::string("CUDA error ") + call + " @ " + file + ":" +
+        std::to_string(line) + ": " + cudaGetErrorString(rc));
+}
+
 void free_present_stream(igpu_amaze_debayer_backend * backend)
 {
     if (!backend) return;
@@ -1671,8 +1682,11 @@ void run_frame_to_device_rgb16_bayer16_post_wb_batched(
      * (adversary A1 on fe115de4).
      * r4 (795-R3-I1): the drain is best effort. igpu_amaze_present::drain_every_stream synchronizes EVERY active
      * tile stream even after one of those syncs failed, and keeps the first failing code (the ordering code
-     * first). CK raises it once, after the loop. So an ordering or drain failure never skips the drain of a later
-     * tile stream; a stream whose own sync failed is reported, not waited on again. */
+     * first). It is raised once, after the loop. So an ordering or drain failure never skips the drain of a later
+     * tile stream; a stream whose own sync failed is reported, not waited on again.
+     * r4 fix 2 (adversary A1 on f0058f46): every evaluated failure is noted once, in call order, at its own site: a
+     * failed ordering code at tiles:present_order before the drain, each failed sync at tiles:drain_sync as it
+     * returns. raise_noted_cuda then throws CK's exception for the first one without a second note. */
     cudaError_t presentOrderRc = cudaSuccess;
     if (presentStream && presentProducerDone)
     {
@@ -1681,12 +1695,26 @@ void run_frame_to_device_rgb16_bayer16_post_wb_batched(
             presentOrderRc = cudaEventRecord(presentProducerDone, streams[slot]);
             if (presentOrderRc == cudaSuccess) presentOrderRc = cudaStreamWaitEvent(presentStream, presentProducerDone, 0);
         }
+        if (presentOrderRc != cudaSuccess)
+        {
+            IGPU_CUDA_ERROR_NOTE(presentOrderRc, "tiles:present_order");
+        }
     }
     const cudaError_t tileDrainRc = igpu_amaze_present::drain_every_stream(
-        streams, active, presentOrderRc, cudaSuccess, [&](cudaStream_t tile) -> cudaError_t {
+        streams,
+        active,
+        presentOrderRc,
+        cudaSuccess,
+        [&](cudaStream_t tile) -> cudaError_t {
             return IGPU_LT_SYNC_CALL("tiles:drain_sync", cudaStreamSynchronize(tile));
+        },
+        [](cudaError_t rc) {
+            if (rc != cudaSuccess)
+            {
+                IGPU_CUDA_ERROR_NOTE(rc, "tiles:drain_sync");
+            }
         });
-    CK(tileDrainRc);
+    raise_noted_cuda(tileDrainRc, "tileDrainRc", __FILE__, __LINE__);
 }
 
 void run_frame_to_device_rgb16_batched(const float * dRaw,

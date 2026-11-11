@@ -285,8 +285,10 @@ int noteSites(const QString & source)
 // HFR-NATIVE-M16-1457-GUI-TEXTURE-PRESENT-OFFLOAD-1 r3 (the present stream): AMaZE 53 = 18 macro notes (+1: the
 // live entries' failure-path drain, drain_present_stream_after_failure) + 35 evaluated entries (+3: each live GL
 // copy's present_drain, after its unmap).
+// r4 fix 2 (adversary A1 on f0058f46): AMaZE 55 = 20 macro notes (+2: the batched tile drain's tiles:present_order and
+// tiles:drain_sync, so every evaluated failure of the best-effort drain is noted once) + the same 35 evaluated entries.
 constexpr int kReconNotes = 27;
-constexpr int kAmazeNotes = 53;
+constexpr int kAmazeNotes = 55;
 
 QStringList failureCensus(const QString & recon, const QString & amaze)
 {
@@ -730,7 +732,7 @@ TEST(GpuFieldTelemetry, CudaFailureBranchesNoteTheCodeAndAddNoSync)
         ASSERT_TRUE(amaze.contains(QString::fromLatin1(note)));
     // PLAYBACK-STARTUP-WAIT-S1-FIRST-AMAZE-AT-PLAY-1: + 11 macro notes (probe:* x7, clock_kick:* x4), each in its
     // rc != cudaSuccess branch
-    ASSERT_EQ(53, noteSites(amaze)); // exact (r3 present stream +4; r8 38, r7 22)
+    ASSERT_EQ(55, noteSites(amaze)); // exact (r4 tile drain +2; r3 present stream +4; r8 38, r7 22)
     ASSERT_EQ(27, noteSites(recon)); // r8: exact (r7 17)
     // r3: the exact counts and the brace-scope check (FailureCensusIsExactAndBraceScoped).
     ASSERT_EQ(std::string(), failureCensus(recon, amaze).join(QStringLiteral("; ")).toStdString());
@@ -961,7 +963,7 @@ TEST(GpuFieldTelemetry, FailureCensusIsExactAndBraceScoped)
     ASSERT_EQ(kReconNotes, noteSites(recon));
     ASSERT_EQ(kAmazeNotes, noteSites(amaze));
     ASSERT_EQ(24, (int)recon.count(QStringLiteral("IGPU_CUDA_ERROR_NOTE(")));  // r8: + 3 evaluated entries
-    ASSERT_EQ(18, (int)amaze.count(QStringLiteral("IGPU_CUDA_ERROR_NOTE(")));  // + 35 evaluated entries (r8 6; FIRST-AMAZE-AT-PLAY-1 +11; r3 present stream +1)
+    ASSERT_EQ(20, (int)amaze.count(QStringLiteral("IGPU_CUDA_ERROR_NOTE(")));  // + 35 evaluated entries (r8 6; FIRST-AMAZE-AT-PLAY-1 +11; r3 present stream +1; r4 tile drain +2)
     ASSERT_EQ(std::string(), failureCensus(recon, amaze).join(QStringLiteral("; ")).toStdString());
 
     // Mutation 1 (sol's replay): drop the preupload:submit note -> recon count 26.
@@ -969,7 +971,7 @@ TEST(GpuFieldTelemetry, FailureCensusIsExactAndBraceScoped)
     ASSERT_EQ(std::string("recon notes 26 != 27"), failureCensus(noSubmit, amaze).join(QStringLiteral("; ")).toStdString());
     // Mutation 2: drop one AMaZE note -> one short (r8: the register note; the map note is an evaluated entry).
     const QString noMap = replacedOnce(amaze, QStringLiteral("            IGPU_CUDA_ERROR_NOTE(rc, \"gl_r16_in:register\");\n"), QString());
-    ASSERT_EQ(std::string("amaze notes 52 != 53"), failureCensus(recon, noMap).join(QStringLiteral("; ")).toStdString());
+    ASSERT_EQ(std::string("amaze notes 54 != 55"), failureCensus(recon, noMap).join(QStringLiteral("; ")).toStdString());
     // Mutation 3 (fable's repro): the note moved after an early-return failure check, into the
     // success path. Same count; the old 4-line context check accepted it.
     const QString earlyReturn = replacedOnce(recon,
