@@ -82,8 +82,10 @@ inline void copy_text(char * out, std::size_t cap, const char * text)
 }
 
 /* HFR-NATIVE-M16-1457-GUI-TEXTURE-PRESENT-OFFLOAD-1 r4 fix 3: one body for note() and note_if_room(). evict=true is
- * note() exactly as before. evict=false: when the site's channel ring is full, nothing is queued and `last` is left
- * alone; the note is counted in the ring's dropped total instead (drain() reports it). Returns true if queued. */
+ * note() exactly as before. evict=false: when the site's channel ring is full, nothing is queued; the note is counted
+ * in the ring's dropped total instead (drain() reports it). Returns true if queued.
+ * r5 fix 1 (adversary A1 on ff5a4f99): `last` (the exported last-error slot) is updated for EVERY note, queued or
+ * dropped, so it always holds the most recent code a failure branch observed; only the ring keeps its older notes. */
 inline bool note_into(int code, const char * name, const char * site, bool evict)
 {
     if (code == 0) return false;
@@ -91,11 +93,6 @@ inline bool note_into(int code, const char * name, const char * site, bool evict
         std::chrono::system_clock::now().time_since_epoch()).count();
     Slot & s = slot();
     std::lock_guard<std::mutex> lock(s.mutex);
-    if (!evict && s.pending[channel_of(site)].size == kPending)
-    {
-        ++s.pending[channel_of(site)].dropped;
-        return false;
-    }
     s.last.code = code;
     copy_text(s.last.name, sizeof(s.last.name), name);
     copy_text(s.last.site, sizeof(s.last.site), site);
@@ -103,6 +100,11 @@ inline bool note_into(int code, const char * name, const char * site, bool evict
     s.last.count += 1;
     const int channel = channel_of(site);
     Ring & r = s.pending[channel];
+    if (!evict && r.size == kPending)
+    {
+        ++r.dropped;
+        return false;
+    }
     if (r.size == kPending)
     {
         r.oldest = (r.oldest + 1) % kPending;
@@ -122,7 +124,7 @@ inline void note(int code, const char * name, const char * site)
 
 /* r4 fix 3 (adversary A1 on fa4699ca): a SECONDARY note of a failed call (another code the same call evaluated after
  * its first failure) never evicts: a full ring keeps the older notes, so a burst of secondaries cannot push out the
- * call's primary (the oldest note), and the skipped note is counted as dropped. */
+ * call's primary (the oldest note), and the skipped note is counted as dropped. It still becomes `last` (r5 fix 1). */
 inline bool note_if_room(int code, const char * name, const char * site)
 {
     return note_into(code, name, site, false);

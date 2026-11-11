@@ -425,6 +425,34 @@ TEST(AmazePresentStream, SlotNoteIfRoomNeverEvictsButNoteStillDoes)
     ASSERT_EQ(0ULL, dropped);
 }
 
+TEST(AmazePresentStream, ADroppedSecondaryNoteStillUpdatesTheLastErrorExport)
+{
+    // r5 fix 1 (adversary A1 on ff5a4f99, its input: the ordering record, nine final tile syncs and the catch's
+    // present drain all fail with 700, then igpu_amaze_debayer_last_cuda_error). The exported last-error slot holds the
+    // most recent code a failure branch observed, so a secondary dropped by a full ring still becomes `last`; only
+    // the ring keeps its older notes.
+    std::vector<igpu_cuda_error_t> out;
+    unsigned long long dropped = 0;
+    drainSlot(out, dropped); // start empty
+    igpu_cuda_error_t before{};
+    ASSERT_EQ(0, igpu_cuda_error_slot::copy_last(&before));
+    const int n = IGPU_CUDA_ERROR_PENDING_MAX + 1;
+    const std::vector<int> streams = tileStreams(n);
+    igpu_cuda_error_slot::note(700, "stub", "tiles:present_order");
+    const int rc = igpu_amaze_present::drain_every_stream(
+        streams, streams.size(), 700, 0, [&](int) { return 700; }, slotNote);
+    ASSERT_EQ(700, rc);
+    ASSERT_FALSE(igpu_cuda_error_slot::note_if_room(701, "stub", "live_device:present_drain")); // ring full: dropped
+    igpu_cuda_error_t last{};
+    ASSERT_EQ(0, igpu_cuda_error_slot::copy_last(&last));
+    ASSERT_EQ(701, last.code);
+    ASSERT_EQ(std::string("live_device:present_drain"), std::string(last.site));
+    ASSERT_EQ(before.count + 1ULL + (unsigned long long)n + 1ULL, (unsigned long long)last.count); // every note counts
+    ASSERT_EQ(IGPU_CUDA_ERROR_PENDING_MAX, drainSlot(out, dropped));
+    ASSERT_EQ(std::string("tiles:present_order"), std::string(out[0].site)); // the ring still keeps the primary
+    ASSERT_EQ(3ULL, dropped);
+}
+
 TEST(AmazePresentStream, BothLiveEntriesRunTheHandoffOnThePresentStream)
 {
     const QString cu = amazeSource();
