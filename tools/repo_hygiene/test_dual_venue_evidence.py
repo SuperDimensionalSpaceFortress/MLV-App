@@ -10756,45 +10756,97 @@ def _ident_probe_body() -> str:
 _IDENT_AFTER_REAP_DELAY_S = 0.0
 
 
-def _ident_child_exit_ns(proc, started_ns: int) -> tuple:
+_IDENT_PAIR_TIGHT_NS = 100_000_000   # a (QPC, FILETIME) pair is believed only when the QPC reads on both sides of the FILETIME read are within 100 ms of each other
+_IDENT_CIVIL_STEP_TOLERANCE_S = 1.0   # over a run, civil elapsed and monotonic elapsed may differ by this much (slew, read granularity); more is a clock STEP
+
+
+def _ident_win32_clock():
+    """kernel32 with typed signatures for the two clock calls and GetProcessTimes, or None off Windows."""
+    if sys.platform != "win32":
+        return None
+    import ctypes
+    from ctypes import wintypes
+    k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    ptr = ctypes.POINTER(wintypes.FILETIME)
+    k32.GetProcessTimes.argtypes = [wintypes.HANDLE, ptr, ptr, ptr, ptr]
+    k32.GetProcessTimes.restype = wintypes.BOOL
+    k32.GetSystemTimePreciseAsFileTime.argtypes = [ptr]
+    k32.GetSystemTimePreciseAsFileTime.restype = None
+    return ctypes, wintypes, k32
+
+
+def _ident_ft_int(f) -> int:
+    return (f.dwHighDateTime << 32) | f.dwLowDateTime
+
+
+def _ident_read_pair_once() -> tuple:
+    ctypes, wintypes, k32 = _ident_win32_clock()
+    now = wintypes.FILETIME()
+    q0 = _ident_time.perf_counter_ns()
+    k32.GetSystemTimePreciseAsFileTime(ctypes.byref(now))
+    q1 = _ident_time.perf_counter_ns()
+    return q0, _ident_ft_int(now), q1
+
+
+def _ident_clock_pair(read_once=None, tries: int = 50):
+    """(qpc_ns, filetime_100ns) taken at ONE instant, or None. r4 (adversary A2): the QPC reads on both sides of the FILETIME read must be within _IDENT_PAIR_TIGHT_NS; a parent that is
+    descheduled between them makes the midpoint wrong by half the stall, so a loose read is thrown away and taken again, and a run of loose reads is no pair at all."""
+    read_once = read_once or _ident_read_pair_once
+    for _ in range(tries):
+        q0, ft, q1 = read_once()
+        if 0 <= q1 - q0 <= _IDENT_PAIR_TIGHT_NS:
+            return (q0 + q1) // 2, ft
+    return None
+
+
+def _ident_launch_pair():
+    try:
+        return _ident_clock_pair() if sys.platform == "win32" else None
+    except Exception:
+        return None
+
+
+def _ident_exit_from_pairs(pair0: tuple, pair1: tuple, exit_ft: int) -> tuple:
+    """PURE core of the child's exit time: pair0 / pair1 are (qpc_ns, filetime_100ns) pairs taken at launch and at the read, exit_ft the OS-recorded ExitTime (100 ns FILETIME). Returns (ns on
+    the QPC axis, "ok"), or (None, reason). The OS exit time is on the civil clock, so it is believed only when the civil clock and the monotonic clock agree over the whole run: a civil step
+    (NTP, VM resume, manual change) between the child's exit and the read would move the figure by the step, hiding a real hold or faking one, and is a typed failure instead (adversary A1)."""
+    step_s = ((pair1[1] - pair0[1]) * 100 - (pair1[0] - pair0[0])) / 1e9
+    if abs(step_s) > _IDENT_CIVIL_STEP_TOLERANCE_S:
+        return None, f"the civil clock moved {step_s:+.1f} s against the monotonic clock during the run, so the OS exit time cannot be placed on the monotonic axis"
+    exit_ns = pair1[0] - (pair1[1] - exit_ft) * 100
+    if not (pair0[0] - 1_000_000_000 <= exit_ns <= pair1[0] + 1_000_000_000):
+        return None, f"the child's exit time lands {(exit_ns - pair1[0]) / 1e9:+.1f} s from the run window"
+    return exit_ns, "ok"
+
+
+def _ident_child_exit_ns(proc, pair0) -> tuple:
     """r4 (sol r3 blocker): when the CHILD process exited, on the test's perf_counter (QueryPerformanceCounter) axis, as (ns, note); ns is None when it cannot be formed, with the reason in note.
-    The parent's own clock read after the reap is the moment the parent was SCHEDULED again, which on a starved runner is far later than the child's exit. So the end of the child is the exit time
-    the OS recorded for it (GetProcessTimes ExitTime, read from the Popen handle, which stays open until the object is collected). That is a system-time FILETIME, so it is moved onto the QPC axis
-    through ONE same-instant pair read here (perf_counter_ns beside GetSystemTimePreciseAsFileTime): exit = pair_qpc - (pair_filetime - exit_filetime), so the time the parent spent not running
-    cancels out. A civil-clock step between the child's exit and this read would move the figure by the step; that window is the parent's delay, and a result outside the run is typed, not believed."""
+    The parent's own clock read after the reap is the moment the parent was SCHEDULED again, which on a starved runner is far later than the child's exit. So the end of the child is the exit
+    time the OS recorded for it (GetProcessTimes ExitTime, read from the Popen handle, which stays open until the object is collected), moved onto the QPC axis through a tight same-instant
+    pair read here (see _ident_exit_from_pairs): exit = pair_qpc - (pair_filetime - exit_filetime), so the time the parent spent not running cancels out."""
     if sys.platform != "win32":
         return None, "no child-side exit clock on this platform (GetProcessTimes is Windows-only)"
+    if pair0 is None:
+        return None, "no tight clock pair could be taken at launch"
     try:
-        import ctypes
-        from ctypes import wintypes
-        k32 = ctypes.WinDLL("kernel32", use_last_error=True)
-        ptr = ctypes.POINTER(wintypes.FILETIME)
-        k32.GetProcessTimes.argtypes = [wintypes.HANDLE, ptr, ptr, ptr, ptr]
-        k32.GetProcessTimes.restype = wintypes.BOOL
-        k32.GetSystemTimePreciseAsFileTime.argtypes = [ptr]
-        k32.GetSystemTimePreciseAsFileTime.restype = None
-        created, exited, kernel, user, now = (wintypes.FILETIME() for _ in range(5))
-        q0 = _ident_time.perf_counter_ns()
-        k32.GetSystemTimePreciseAsFileTime(ctypes.byref(now))
-        q1 = _ident_time.perf_counter_ns()
+        ctypes, wintypes, k32 = _ident_win32_clock()
+        created, exited, kernel, user = (wintypes.FILETIME() for _ in range(4))
         if not k32.GetProcessTimes(int(proc._handle), ctypes.byref(created), ctypes.byref(exited), ctypes.byref(kernel), ctypes.byref(user)):
             return None, f"GetProcessTimes failed (winerror {ctypes.get_last_error()})"
+        pair1 = _ident_clock_pair()
     except Exception as exc:   # a typed reason, never a crash inside the harness
         return None, f"{type(exc).__name__}: {exc}"
-    ft = lambda f: (f.dwHighDateTime << 32) | f.dwLowDateTime
-    if ft(exited) == 0:
+    if _ident_ft_int(exited) == 0:
         return None, "GetProcessTimes reports no exit time: the process had not exited"
-    pair_ns = (q0 + q1) // 2
-    exit_ns = pair_ns - (ft(now) - ft(exited)) * 100
-    if not (started_ns - 1_000_000_000 <= exit_ns <= q1 + 1_000_000_000):
-        return None, f"the child's exit time lands {(exit_ns - q1) / 1e9:.1f} s from the run window: the civil clock stepped between the exit and the read"
-    return exit_ns, "ok"
+    if pair1 is None:
+        return None, "no tight clock pair could be taken at the read: the parent was descheduled around every attempt"
+    return _ident_exit_from_pairs(pair0, pair1, _ident_ft_int(exited))
 
 
 def _ident_run_reaped(cmd: list, timeout: float, env: dict | None = None) -> subprocess.CompletedProcess:
     """subprocess.run, except that a child still alive at the timeout (or on any error) is killed WITH its process tree (r5: an r4 probe child outlived its test).
     r6: the final drain is bounded too, so a grandchild that still holds the pipes cannot hold the test. r4: the result also carries child_exit_ns / child_exit_note (see _ident_child_exit_ns)."""
-    started_ns = _ident_time.perf_counter_ns()
+    pair0 = _ident_launch_pair()   # r4: the civil clock and the monotonic clock side by side at launch (see _ident_exit_from_pairs)
     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env)
     try:
         out, err = proc.communicate(timeout=timeout)
@@ -10813,7 +10865,7 @@ def _ident_run_reaped(cmd: list, timeout: float, env: dict | None = None) -> sub
     if _IDENT_AFTER_REAP_DELAY_S:
         _ident_time.sleep(_IDENT_AFTER_REAP_DELAY_S)
     done = subprocess.CompletedProcess(cmd, proc.returncode, out, err)
-    done.child_exit_ns, done.child_exit_note = _ident_child_exit_ns(proc, started_ns)
+    done.child_exit_ns, done.child_exit_note = _ident_child_exit_ns(proc, pair0)
     return done
 
 
@@ -10822,9 +10874,9 @@ def _parse_probe_timing(stderr: str):
     Stopwatch started at probe entry (a diagnostic). <ticks> is Stopwatch.GetTimestamp() at the marker, the OS monotonic QueryPerformanceCounter: the exit-hold figure is (the child's OS exit
     time on that same QueryPerformanceCounter axis, see _ident_child_exit_ns) - (<ticks> as ns), which contains neither pwsh start-up, script parse nor the parent's own scheduling delay.
     None = no marker token at all. r4 (VENUE-PROBE-TIMING-PARSER-FULL-TOKEN-1): a line that carries the token is a PRESENT marker; it must match the whole line shape with plain integers of at
-    most 18 digits (a longer or junk-suffixed field, or a line of another shape, is a typed `bad` failure, never a missing marker and never a ValueError) and anything else comes back with
+    most 18 digits (a longer, junk-suffixed or junk-PREFIXED field, or a line of another shape, is a typed `bad` failure, never a missing marker and never a ValueError) and anything else comes back with
     probe_ms=None and a `bad` reason, so a clock fault is a typed failure. end_qpc / qpc_hz are None when absent."""
-    m = re.search(r"VENUE_PROBE_INTERNAL_MS=[^\r\n]*", stderr)
+    m = re.search(r"^[^\r\n]*VENUE_PROBE_INTERNAL_MS=[^\r\n]*", stderr, re.M)
     if not m:
         return None
     line = m.group(0)
@@ -10854,6 +10906,11 @@ def _probe_seam_violations(body: str) -> list:
         for banned in ("$env:", "Get-Content", "Test-Path", "GetEnvironmentVariable", "-or", "-and"):
             if banned in ln:
                 bad.append(f"a host input can reach the seam ({banned!r}): {ln}")
+    # r4 (adversary A3): a variable whose NAME is built at run time (`Set-Variable -Name ('Probe' + 'TimingSeam')`) names the seam in no spelling at all, so the probe body must have no
+    # dynamic-variable or dynamic-code verb anywhere (it has none today)
+    for ln in body.splitlines():
+        if not ln.lstrip().startswith("#") and re.search(r"\b(?:Set|New|Get|Clear)-Variable\b|\bVariable:|\bInvoke-Expression\b|\biex\b|\bSet-Item\b", ln, re.I):
+            bad.append(f"a dynamic variable / code verb in the probe body: {ln.strip()[:100]}")
     return bad
 
 
@@ -11680,19 +11737,25 @@ class VenueProbeIdentityCallDeadlineTests(IdentityProbeMixin, unittest.TestCase)
         return f"probe stopwatch {t['probe_ms'] / 1000.0:.1f} s, {t['abandoned']} call(s) abandoned"
 
     def exit_hold_s(self) -> float:
-        """r3/r4: seconds from the probe's end marker to the CHILD's exit, on the OS monotonic QueryPerformanceCounter axis: the marker is the probe's Stopwatch.GetTimestamp() ticks, the exit is
-        the exit time the OS recorded for the child process (see _ident_child_exit_ns), NOT the moment the parent resumed after reaping it (a starved parent resumes late, and that is no hold).
-        Whatever the probe did before its marker, however long pwsh took to start, and however long the parent was not scheduled, is not in it. A figure that cannot be formed is a typed failure
-        of its own (no marker, no end timestamp, unreadable marker, no child exit time, or a probe clock that is not the test's clock) and never reads as an exit hold."""
+        """r3/r4: seconds from the probe's end marker to the CHILD's exit, on the OS monotonic QueryPerformanceCounter axis (the marker is the probe's Stopwatch.GetTimestamp() ticks).
+        The parent's end read (also QPC) is an UPPER BOUND on it: the child cannot have exited after the parent saw it gone. A bound under the limit settles the question with no civil clock
+        at all. Past the limit the bound may be the parent's own scheduling delay, so the child's OS-recorded exit time (see _ident_child_exit_ns) refines it, never above the bound; when
+        that cannot be formed (no exit time, or a civil clock step during the run) the gap is NOT judged: it is a typed failure and never reads as an exit hold. Whatever the probe did before
+        its marker, however long pwsh took to start, and however long the parent was not scheduled, is not in the figure."""
         t = self.last_timing
         self.assertIsNotNone(t, "the timing seam printed nothing: " + self.last_stderr)
         self.assertIsNotNone(t["probe_ms"], "typed failure, not a missing marker: " + t.get("bad", ""))
         self.assertTrue(t.get("end_qpc") is not None and t.get("qpc_hz"), "typed failure, not an exit hold: the marker carries no end_qpc / qpc_hz timestamp: " + self.last_stderr)
+        marker_ns = t["end_qpc"] * 1_000_000_000 // t["qpc_hz"]
+        upper = (self.last_wall_end_ns - marker_ns) / 1e9
+        self.assertGreater(upper, -1.0, f"typed failure, not an exit hold: the probe's end marker is {-upper:.1f} s AFTER the test saw the process end, so the two are not the same monotonic clock")
+        if upper < self.EXIT_HOLD_LIMIT_S:
+            return upper
         child_exit_ns = getattr(self, "last_child_exit_ns", None)
-        self.assertIsNotNone(child_exit_ns, "typed failure, not an exit hold: the child's own OS exit time is unavailable (" + str(getattr(self, "last_child_exit_note", "")) + "); the parent's end read is not a substitute")
-        gap = (child_exit_ns - t["end_qpc"] * 1_000_000_000 // t["qpc_hz"]) / 1e9
-        self.assertGreater(gap, -1.0, f"typed failure, not an exit hold: the probe's end marker is {-gap:.1f} s AFTER the child exited, so the two are not the same monotonic clock")
-        return gap
+        self.assertIsNotNone(child_exit_ns, f"typed failure, not an exit hold: the parent's end read is {upper:.1f} s after the marker, past the limit, and the child's own exit time cannot be used ({getattr(self, 'last_child_exit_note', '')}); the gap may be the parent's scheduling delay, so it is not judged")
+        hold = min(upper, (child_exit_ns - marker_ns) / 1e9)
+        self.assertGreater(hold, -1.0, f"typed failure, not an exit hold: the child's exit is {-hold:.1f} s BEFORE the probe's end marker, so the two are not the same monotonic clock")
+        return hold
 
     def assert_no_exit_hold(self, require_abandoned: bool = True) -> None:
         """Nothing may hold the PROCESS after the probe's end marker (an abandoned worker's runspace must not keep it alive). Start-up is not measured: see exit_hold_s."""
@@ -11729,10 +11792,18 @@ class VenueProbeIdentityCallDeadlineTests(IdentityProbeMixin, unittest.TestCase)
         self.assertIsNone(self.last_timing)
         self.assertNotIn("VENUE_PROBE_INTERNAL_MS", self.last_stderr)
 
+    def test_a_hostile_environment_cannot_switch_the_production_seam_on(self) -> None:
+        # r4 (adversary A3): the behavioural half of the pin. The UNREWRITTEN probe, with the seam spelled as an environment variable and truthy values around it, prints no marker
+        import os
+        self.run_identity_probe(self.procs, self.cim, CHAIN_OWNERS, env=dict(os.environ, ProbeTimingSeam="1", X="1", PROBETIMINGSEAM="true"))
+        self.assertIsNone(self.last_timing)
+        self.assertNotIn("VENUE_PROBE_INTERNAL_MS", self.last_stderr)
+
     def test_the_seam_pin_catches_every_spelling_of_a_write_to_the_seam(self) -> None:
         body = _ident_probe_body()
         for extra in ("Set-Variable ProbeTimingSeam $true", "Set-Variable -Name probetimingseam -Value $true", "${ProbeTimingSeam} = $true", "$ProbeTimingSeam = $env:X",
-                      "New-Variable -Name ProbeTimingSeam -Value $true -Force"):
+                      "New-Variable -Name ProbeTimingSeam -Value $true -Force", "Set-Variable -Name ('Probe' + 'TimingSeam') -Value ([bool]$env:X)", "Set-Item Variable:\\ProbeTimingSeam $true",
+                      "Invoke-Expression ('$Probe' + 'TimingSeam = $true')"):
             self.assertNotEqual(_probe_seam_violations(body + "\n" + extra), [], extra)
         self.assertNotEqual(_probe_seam_violations(body.replace("$ProbeTimingSeam = $false", "$ProbeTimingSeam = $true")), [])
 
@@ -11808,6 +11879,43 @@ class VenueProbeIdentityCallDeadlineTests(IdentityProbeMixin, unittest.TestCase)
         self._set_clocks(marker_s=100.0, child_exit_s=100.05, parent_end_s=116.05)   # sol: child exits 0.05 s after its marker, the parent resumes 16 s later
         self.assert_no_exit_hold()
         self.assertAlmostEqual(self.exit_hold_s(), 0.05, places=3)
+
+    def test_a_civil_clock_step_after_the_childs_exit_is_a_typed_failure_never_a_hidden_or_a_faked_hold(self) -> None:
+        # adversary A1: launch at qpc 90 s; marker 100 s; the child exits at 120 s (a 20 s hold); the read pair is at qpc 136 s
+        S, B = 10_000_000, 5_000_000_000_000
+        pair0 = (90 * 10**9, B + 90 * S)
+        exit_ft = B + 120 * S
+        ns, note = _ident_exit_from_pairs(pair0, (136 * 10**9, B + 136 * S), exit_ft)
+        self.assertEqual((ns, note), (120 * 10**9, "ok"), "no step: the exit lands on the monotonic axis at 120 s")
+        for step_s in (20, -20):   # +20 s would map the 20 s hold to 0 s (hidden); -20 s would map a prompt exit to a 20 s hold (faked)
+            ns, note = _ident_exit_from_pairs(pair0, (136 * 10**9, B + (136 + step_s) * S), exit_ft)
+            self.assertIsNone(ns, step_s)
+            self.assertIn("civil clock moved", note)
+        ns, note = _ident_exit_from_pairs(pair0, (136 * 10**9, B + 136 * S), B + 500 * S)
+        self.assertIsNone(ns, "an exit after the read is outside the run")
+        # in the harness: a step makes the OS exit time unusable. A bound already under the limit still passes (a prompt exit cannot be FAKED into a hold) and a bound past it is not judged (a hold cannot be HIDDEN)
+        self._set_clocks(100.0, None, 100.1)
+        self.last_child_exit_note = note
+        self.assert_no_exit_hold()
+        self._set_clocks(100.0, None, 120.1)
+        with self.assertRaises(AssertionError) as ctx:
+            self.assert_no_exit_hold()
+        self.assertIn("typed failure", str(ctx.exception))
+        self.assertNotIn("held the exit", str(ctx.exception))
+
+    def test_a_parent_stalled_inside_the_clock_pair_read_does_not_move_the_childs_exit(self) -> None:
+        # adversary A2: the FILETIME is sampled at 100.1 s, the parent is descheduled 32 s, the second QPC read says 132.1 s. The midpoint (116.1 s) is 16 s wrong, so that pair is thrown away
+        S, B = 10_000_000, 5_000_000_000_000
+        loose = (int(100.1 * 1e9), B + int(100.1 * S), int(132.1 * 1e9))
+        tight = (int(140.0 * 1e9), B + 140 * S, int(140.0 * 1e9) + 2_000_000)
+        reads = iter([loose, loose, tight])
+        pair1 = _ident_clock_pair(read_once=lambda: next(reads))
+        self.assertEqual(pair1, ((tight[0] + tight[2]) // 2, tight[1]))
+        pair0 = (90 * 10**9, B + 90 * S)
+        ns, note = _ident_exit_from_pairs(pair0, pair1, B + int(100.05 * S))   # the child exited 0.05 s after its marker at 100 s; the parent stalled; the read is at 140 s
+        self.assertEqual(note, "ok")
+        self.assertAlmostEqual((ns - 100 * 10**9) / 1e9, 0.05, places=2)
+        self.assertIsNone(_ident_clock_pair(read_once=lambda: loose, tries=5), "a run of loose reads is no pair at all")
 
     def test_a_real_hold_is_rejected_whatever_the_parent_delay_and_an_unknown_child_exit_is_a_typed_failure(self) -> None:
         for child_exit_s, parent_end_s in ((120.0, 120.1), (120.0, 136.0)):   # held 20 s; held 20 s and then the parent stalled 16 s
@@ -11885,7 +11993,8 @@ class VenueProbeIdentityCallDeadlineTests(IdentityProbeMixin, unittest.TestCase)
         digits = "9" * 5000
         for line in ("VENUE_PROBE_INTERNAL_MS= NaN abandoned=1", "VENUE_PROBE_INTERNAL_MS=10 abandoned=1 end_qpc=5 qpc_hz=10000000junk", "VENUE_PROBE_INTERNAL_MS=10 abandoned=1 end_qpc=5x qpc_hz=10",
                      f"VENUE_PROBE_INTERNAL_MS={digits} abandoned=1", f"VENUE_PROBE_INTERNAL_MS=10 abandoned={digits}", f"VENUE_PROBE_INTERNAL_MS=10 abandoned=1 end_qpc={digits} qpc_hz=10",
-                     "VENUE_PROBE_INTERNAL_MS=10 abandoned=1 end_qpc=5", "VENUE_PROBE_INTERNAL_MS=10", "VENUE_PROBE_INTERNAL_MS=10 abandoned=1 trailing", "VENUE_PROBE_INTERNAL_MS=1e3 abandoned=1"):
+                     "VENUE_PROBE_INTERNAL_MS=10 abandoned=1 end_qpc=5", "VENUE_PROBE_INTERNAL_MS=10", "VENUE_PROBE_INTERNAL_MS=10 abandoned=1 trailing", "VENUE_PROBE_INTERNAL_MS=1e3 abandoned=1",
+                     "noiseVENUE_PROBE_INTERNAL_MS=1500 abandoned=1 end_qpc=1000000000 qpc_hz=10000000"):   # adversary A4: a prefix is not a clean marker line
             t = _parse_probe_timing(line + "\n")
             self.assertIsNotNone(t, line[:80])
             self.assertIsNone(t["probe_ms"], line[:80])
