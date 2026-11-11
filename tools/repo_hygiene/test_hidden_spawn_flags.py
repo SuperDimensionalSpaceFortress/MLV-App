@@ -100,6 +100,7 @@ import posixpath
 import re
 import subprocess
 import unittest
+import warnings
 from pathlib import Path
 from unittest import mock
 
@@ -528,7 +529,7 @@ def _fold_codec(node: ast.Call, text: str, known: bool, consts: dict[str, str], 
                 if plan[1] == "backslashreplace":  # a byte the codec rejects is written `\xNN`: four characters for one, so the worst case is checked first (R11-L1)
                     _check_size(4 * len(text))
                 return text.encode("latin-1").decode(*plan), known
-            _check_size(_encoded_bound(text, codec_key, plan[1]))  # up to ten characters for one (`\U0010ffff`, `&#1114111;`), a hundred for a `\N{...}` name; utf-32 four bytes for one
+            _check_size(_encoded_bound(text, encoding[0], plan[1]))  # a ValueError (a codec or mode with no proven row) is read as unknown below, before `encode` runs (R13)
             return text.encode(*plan).decode("latin-1"), known
         except _FoldTooBig:
             raise  # a RecursionError, which the clause below would read as "the call raises at run time"
@@ -616,15 +617,43 @@ def _repr_bound(text: str, as_bytes: bool = False) -> int:
     return size + (per - 1) * odd + text.count("'") + text.count("\\") + 3
 
 
-def _encoded_bound(text: str, codec_key: str, errors: str) -> int:
-    """An UPPER bound on ``len(text.encode(codec, errors).decode('latin-1'))``: an ASCII character is one byte (two for ``utf-16`` and the escape codecs, four for
-    ``utf-32``), any other is at most four (UTF-8, a UTF-16 pair, UTF-32) or the escape the error mode writes (ten for ``\\U0010ffff`` and ``&#1114111;``, a
-    hundred for a ``\\N{...}`` name), and a byte-order mark is four more."""
+# R13 (sol r12 blocker). The rows `_encoded_bound` is PROVEN for, keyed by the codec's canonical name (``codecs.lookup(name).name``, so ``utf16``, ``UTF_16``, ``u16``
+# land on ``utf-16``): the width in bytes of one code unit the codec writes. The text an error mode writes in place of a character it cannot encode (``\ud800``,
+# ``&#55296;``) is encoded BY THE CODEC like any other text, so it takes this many bytes for each of its characters: two under UTF-16, four under UTF-32.
+_CODEC_UNIT_BYTES = {"ascii": 1, "iso8859-1": 1, "cp1252": 1, "utf-8": 1, "utf-8-sig": 1, "utf-16": 2, "utf-16-le": 2, "utf-16-be": 2,
+                     "utf-32": 4, "utf-32-le": 4, "utf-32-be": 4}
+_ESCAPE_CODEC_NAMES = frozenset({"unicode-escape", "raw-unicode-escape"})  # never consult an error mode: a character is `\xNN`, `\uNNNN` or `\UNNNNNNNN`
+# The most characters an error mode writes for ONE code point: `\U0010ffff` and `&#1114111;` are ten, a `\N{...}` name up to a hundred (a name is at most ~90); the other
+# modes write one (`replace` -> `?`), drop it (`ignore`), or write one byte (`surrogateescape`, `surrogatepass` at most four, covered by the floor below).
+_HANDLER_REPLACEMENT_CHARS = {"strict": 1, "ignore": 1, "replace": 1, "surrogateescape": 1, "surrogatepass": 1, "backslashreplace": 10, "xmlcharrefreplace": 10, "namereplace": 100}
+
+
+def _encoded_bound(text: str, encoding: str, errors: str) -> int:
+    """An UPPER bound on ``len(text.encode(encoding, errors).decode('latin-1'))``, worked out from the characters and never by building the result. Raises
+    ``ValueError`` for a codec or an error mode it has no proven row for, so the caller reads the call as unknown BEFORE ``encode`` runs.
+
+    Per character: an ASCII one takes one code unit (``\\xNN``, four bytes, for a control character under the escape codecs); any other takes at most four bytes
+    (UTF-8, a UTF-16 pair, UTF-32) or, when the codec cannot encode it (a lone surrogate under UTF-8 / UTF-16 / UTF-32, anything outside the table under ASCII /
+    latin-1 / cp1252), the longest text the error mode writes for one code point TIMES the codec's code unit (``\\U0010ffff`` is ten characters, so 20 bytes under UTF-16
+    and 40 under UTF-32). The escape codecs write at most ten bytes for one. A byte-order mark is up to four more. Every character is costed as the worst of those,
+    so the sum cannot fall below what Python builds."""
+    if not isinstance(encoding, str) or len(encoding) > 64 or not encoding.isascii() or "\x00" in encoding:
+        raise ValueError(f"no bound row for the codec {encoding!r}")
+    try:
+        name = codecs.lookup(encoding).name
+    except LookupError as exc:
+        raise ValueError(f"no bound row for the codec {encoding!r}") from exc
+    replacement_chars = _HANDLER_REPLACEMENT_CHARS.get(errors)
+    if replacement_chars is None:
+        raise ValueError(f"no bound row for the error mode {errors!r}")
     non_ascii = len(_ASCII_RE.sub("", text))
     ascii_count = len(text) - non_ascii
-    ascii_width = 4 if codec_key.startswith("utf32") or "escape" in codec_key else 2 if codec_key.startswith("utf16") else 1  # a control character is `\xNN` under unicode_escape
-    wide = 10 if "escape" in codec_key else max(4, {"backslashreplace": 10, "xmlcharrefreplace": 10, "namereplace": 100}.get(errors, 1))
-    return ascii_width * ascii_count + wide * non_ascii + 4
+    if name in _ESCAPE_CODEC_NAMES:
+        return 4 * ascii_count + 10 * non_ascii + 4
+    unit = _CODEC_UNIT_BYTES.get(name)
+    if unit is None:
+        raise ValueError(f"no bound row for the codec {encoding!r} ({name})")
+    return unit * ascii_count + max(4, replacement_chars * unit) * non_ascii + 4
 
 
 def _replaced(text: str, old: str, new: str, count: int) -> str:
@@ -4887,6 +4916,10 @@ class AdversaryR9Tests(unittest.TestCase):
             self.calls.append("join")
             return super().join(parts)
 
+        def encode(self, *args, **kwargs):
+            self.calls.append("encode")
+            return super().encode(*args, **kwargs)
+
     def _spied(self, expr: str, cap: int | None = None, **names: str):
         """(outcome, calls): the fold of ``expr`` with each name bound to a spying str, under a patched cap. outcome is the (text, known) or the _FoldTooBig."""
         calls: list[str] = []
@@ -4982,13 +5015,12 @@ class AdversaryR9Tests(unittest.TestCase):
             if all(ord(c) < 256 for c in text):
                 self.assertGreaterEqual(_repr_bound(text, True), len(repr(text.encode("latin-1"))), repr(text)[:40])
             for codec in ("ascii", "latin-1", "utf-8", "utf-16", "utf-16-le", "utf-32", "utf-32-be", "cp1252", "unicode_escape", "raw_unicode_escape"):
-                key = re.sub(r"[^a-z0-9]", "", codec)
                 for errors in ("strict", "ignore", "replace", "backslashreplace", "xmlcharrefreplace", "namereplace", "surrogateescape"):
                     try:
                         built = len(text.encode(codec, errors).decode("latin-1"))
                     except (UnicodeError, LookupError, TypeError):
                         continue
-                    self.assertGreaterEqual(_encoded_bound(text, key, errors), built, (repr(text)[:30], codec, errors))
+                    self.assertGreaterEqual(_encoded_bound(text, codec, errors), built, (repr(text)[:30], codec, errors))
             for method in ("upper", "lower", "casefold", "swapcase", "title", "capitalize"):
                 self.assertGreaterEqual(len(text) + 2 * len(re.sub(r"[\x00-\x7f]", "", text)), len(getattr(text, method)()), (repr(text)[:30], method))
 
@@ -5009,6 +5041,97 @@ class AdversaryR9Tests(unittest.TestCase):
         with self.assertRaises(_FoldTooBig):
             _formatted(ast.parse("'" + "\\x01" * 50_000 + "'.encode('latin-1')", mode="eval").body, {}, 0)  # bytes repr: four characters for each byte
         self.assertEqual(_apply_spec("abc", "r", None), "'abc'")  # short texts are never refused
+
+    # ---- r13: sol r12 blocker -- `_encoded_bound` is an UPPER bound under the multi-byte codecs, and a codec without a proven row is hedged before `encode` runs ----
+    # Safely bounded: the cap is patched down to 64 and ``str.encode`` is spied on, so a refusal that came AFTER the allocation fails the test. The one case at the real
+    # cap only computes the bound.
+    _WIDE_CODECS = ("utf-16", "utf-16-le", "utf-16-be", "utf-32", "utf-32-le", "utf-32-be")
+    _R13_HANDLERS = ("strict", "ignore", "replace", "backslashreplace", "xmlcharrefreplace", "namereplace", "surrogateescape", "surrogatepass")
+
+    @staticmethod
+    def _encode_call(codec: str, errors: str | None = None):
+        args = repr(codec) + (f", {errors!r}" if errors is not None else "")
+        return ast.parse(f"x.encode({args})", mode="eval").body
+
+    def test_r13_utf16_utf32_replacement_text_is_refused_before_str_encode_runs(self):
+        for codec in self._WIDE_CODECS:
+            for errors in ("backslashreplace", "xmlcharrefreplace"):
+                calls: list[str] = []
+                with mock.patch.dict(globals(), {"_FLATTEN_MAX_CHARS": 64}):
+                    with self.assertRaises(_FoldTooBig, msg=(codec, errors)):
+                        _fold_codec(self._encode_call(codec, errors), self._SpyStr("\ud800" * 4, calls), True, {}, 0)
+                self.assertNotIn("encode", calls, (codec, errors))  # nothing was allocated: the refusal came first
+
+    def test_r13_sol_cap_64_witness_utf32_le_xmlcharrefreplace(self):
+        calls: list[str] = []
+        with mock.patch.dict(globals(), {"_FLATTEN_MAX_CHARS": 64}):
+            self.assertEqual(len(("\ud800" * 3).encode("utf-32-le", "xmlcharrefreplace")), 96)  # what Python builds: past the cap of 64
+            with self.assertRaises(_FoldTooBig):
+                _fold_codec(self._encode_call("utf-32-le", "xmlcharrefreplace"), self._SpyStr("\ud800" * 3, calls), True, {}, 0)
+        self.assertNotIn("encode", calls)
+
+    def test_r13_opus_19999_surrogate_literal_is_projected_not_built(self):
+        text = "\ud800" * 19_999  # a written-out literal; the old bound said 199,994, under the cap, and utf-32 + xmlcharrefreplace builds 639,968 bytes
+        self.assertEqual(_FLATTEN_MAX_CHARS, 200_000)  # written for the real cap
+        self.assertGreater(_encoded_bound(text, "utf-32", "xmlcharrefreplace"), _FLATTEN_MAX_CHARS)
+        calls: list[str] = []
+        with self.assertRaises(_FoldTooBig):
+            _fold_codec(self._encode_call("utf-32", "xmlcharrefreplace"), self._SpyStr(text, calls), True, {}, 0)
+        self.assertNotIn("encode", calls)
+
+    def test_r13_ascii_literal_under_utf16_still_folds_to_its_known_value(self):
+        for codec in ("utf-16", "utf-16-le", "utf-32-be"):
+            for errors in (None, "backslashreplace", "xmlcharrefreplace"):
+                calls: list[str] = []
+                outcome = _fold_codec(self._encode_call(codec, errors), self._SpyStr("Start", calls), True, {}, 0)
+                self.assertEqual(outcome, ("Start".encode(codec).decode("latin-1"), True), (codec, errors))
+                self.assertEqual(calls, ["encode"])
+
+    def test_r13_encoded_bound_is_an_upper_bound_for_every_admitted_codec_and_handler(self):
+        texts = ["", "abc", "\ud800" * 5, "\udc80\udcff\udbff" * 3, "\U0010ffff" * 5, "\xe9\xff\x80", "中文€", "\x00\x01\\'\"\x7f", "a\ud800b\U0001f600\xe9",
+                 "￾￿﷐", "ﬃİ\u0085"]
+        checked = 0
+        for name in sorted(_CODEC_KEYS | {"UTF-16LE", "utf_32_be", "UTF-8-SIG", "latin_1", "Unicode-Escape", "raw_unicode_escape", "u16", "u32"}):
+            try:
+                codecs.lookup(name)
+            except LookupError:
+                continue  # a key that is no codec (`utf8sig`): the call raises, and the fold reads it as unknown
+            for errors in self._R13_HANDLERS:
+                for text in texts:
+                    try:
+                        built = len(text.encode(name, errors).decode("latin-1"))
+                    except (UnicodeError, LookupError, TypeError):
+                        continue
+                    self.assertGreaterEqual(_encoded_bound(text, name, errors), built, (name, errors, text[:12]))
+                    checked += 1
+        self.assertGreater(checked, 500)
+
+    def test_r13_aliases_land_on_one_row_and_a_codec_without_a_row_is_hedged_before_encode(self):
+        for alias in ("utf16", "UTF-16", "utf_16", "U16"):
+            self.assertEqual(_encoded_bound("\ud800" * 5, alias, "backslashreplace"), _encoded_bound("\ud800" * 5, "utf-16", "backslashreplace"), alias)
+        self.assertEqual(_encoded_bound("\ud800", "u32", "xmlcharrefreplace"), _encoded_bound("\ud800", "utf-32", "xmlcharrefreplace"))
+        for name, errors in (("base64", "strict"), ("rot13", "strict"), ("utf-16", "no-such-handler"), ("\x00", "strict"), ("é", "strict")):
+            with self.assertRaises(ValueError, msg=(name, errors)):
+                _encoded_bound("abc", name, errors)
+        calls: list[str] = []
+        with mock.patch.dict(_CODEC_UNIT_BYTES):
+            del _CODEC_UNIT_BYTES["utf-16"]  # a codec the table has no proven row for
+            text, known = _fold_codec(self._encode_call("utf-16", "replace"), self._SpyStr("ab\xe9", calls), True, {}, 0)
+        self.assertFalse(known)
+        self.assertIn(_WILD, text)  # the wildcard: the consumers never read a guess as a literal
+        self.assertNotIn("encode", calls)
+
+    def test_r13_decode_stays_within_four_characters_for_each_byte(self):
+        text = "".join(chr(i) for i in range(256)) * 2
+        for name in ("utf-8", "ascii", "latin-1", "utf-16", "utf-16-le", "utf-32", "utf-32-be", "cp1252", "unicode_escape", "raw_unicode_escape"):
+            for errors in ("ignore", "replace", "backslashreplace", "surrogateescape", "surrogatepass"):
+                try:
+                    with warnings.catch_warnings():
+                        warnings.simplefilter("ignore", DeprecationWarning)  # unicode_escape reads `]` as an invalid escape
+                        built = len(text.encode("latin-1").decode(name, errors))
+                except (UnicodeError, LookupError, TypeError):
+                    continue
+                self.assertLessEqual(built, 4 * len(text), (name, errors))
 
     def test_pass30_a2_literal_chains_and_joined_readings_obey_the_cap(self):
         with mock.patch.dict(globals(), {"_FLATTEN_MAX_CHARS": 64}):
