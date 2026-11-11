@@ -409,6 +409,7 @@ _STR_METHODS = frozenset(name for name in dir(str) if not name.startswith("_")) 
 _AMBIGUOUS_ACTIVE: set[int] = set()
 _STR_ALIASES: set[str] = set()  # names the file being scanned binds to the str type (`S = str`, `from builtins import str as S`); set per scan by _note_aliases
 _BYTES_ALIASES: set[str] = set()  # the subset of _STR_ALIASES bound to the bytes type (`from builtins import bytes as B`): B(s, enc) encodes, str(b, enc) decodes
+_STR_KIND_ALIASES: set[str] = set()  # the subset of _STR_ALIASES bound to a type that is provably str (`S = str`, `T = type('')`); an alias in neither kind set is of unproven type
 _CODEC_ALIASES: set[str] = set()  # names the file being scanned binds to the codecs module (`import codecs as c`); set per scan by _note_aliases
 _CODEC_FUNCS: dict[str, str] = {}  # names the file binds to codecs.decode / codecs.encode (`from codecs import decode as d`), to the method they stand for
 
@@ -416,10 +417,31 @@ _CODEC_FUNCS: dict[str, str] = {}  # names the file binds to codecs.decode / cod
 _TEXT_BASE_MEMO: dict[tuple[int, int], tuple[ast.AST, dict[str, str], bool]] = {}  # per scan: (id(node), id(consts)) -> (node, consts, answer); cleared by _note_aliases
 
 
+def _type_kind(node: ast.AST) -> str | None:
+    """r14 (sol r13 B2): which type a callee provably is. ``"bytes"`` for ``bytes``, ``builtins.bytes``, an alias bound to one, ``type(b'..')`` and ``b'..'.__class__``;
+    ``"str"`` for the same four spellings of str (``type('..')``, ``'..'.__class__``); None for any type the fold cannot prove (``type(x)``, ``x.__class__`` of a
+    name, an alias of an unproven type). A bytes type is never read as the str decoder: its constructor ENCODES."""
+    if isinstance(node, ast.Name):
+        is_bytes, is_str = node.id == "bytes" or node.id in _BYTES_ALIASES, node.id == "str" or node.id in _STR_KIND_ALIASES
+        return "bytes" if is_bytes and not is_str else "str" if is_str and not is_bytes else None  # a name bound to both is of unproven type
+    if isinstance(node, ast.Attribute):
+        if node.attr in ("str", "bytes"):
+            return node.attr
+        operand = node.value if node.attr == "__class__" else None
+    elif isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "type" and len(node.args) == 1 and not node.keywords:
+        operand = node.args[0]
+    else:
+        return None
+    if isinstance(operand, ast.Constant):
+        return "bytes" if isinstance(operand.value, bytes) else "str" if isinstance(operand.value, str) else None
+    return "str" if isinstance(operand, ast.JoinedStr) else None
+
+
 def _note_aliases(tree: ast.AST) -> None:
     _TEXT_BASE_MEMO.clear()
     _STR_ALIASES.clear()
     _BYTES_ALIASES.clear()
+    _STR_KIND_ALIASES.clear()
     _CODEC_ALIASES.clear()
     _CODEC_FUNCS.clear()
     for n in ast.walk(tree):
@@ -428,11 +450,15 @@ def _note_aliases(tree: ast.AST) -> None:
             if ((isinstance(v, ast.Name) and v.id in ("str", "bytes")) or (isinstance(v, ast.Attribute) and v.attr in ("str", "bytes", "__class__"))
                     or (isinstance(v, ast.Call) and isinstance(v.func, ast.Name) and v.func.id == "type")):
                 _STR_ALIASES.add(n.targets[0].id)
-                if (isinstance(v, ast.Name) and v.id == "bytes") or (isinstance(v, ast.Attribute) and v.attr == "bytes"):
-                    _BYTES_ALIASES.add(n.targets[0].id)
+                kind = _type_kind(v)
+                if kind == "bytes":
+                    _BYTES_ALIASES.add(n.targets[0].id)  # `B = bytes`, `B = type(b'')`, `B = b''.__class__`
+                elif kind == "str":
+                    _STR_KIND_ALIASES.add(n.targets[0].id)
         elif isinstance(n, ast.ImportFrom) and n.module == "builtins":
             _STR_ALIASES.update(a.asname or a.name for a in n.names if a.name in ("str", "bytes"))
             _BYTES_ALIASES.update(a.asname or a.name for a in n.names if a.name == "bytes")
+            _STR_KIND_ALIASES.update(a.asname or a.name for a in n.names if a.name == "str")
         elif isinstance(n, ast.Import):
             _CODEC_ALIASES.update(a.asname or a.name for a in n.names if a.name == "codecs")
         if isinstance(n, ast.ImportFrom) and n.module == "codecs":
@@ -468,8 +494,19 @@ def _bound_form(node: ast.AST, consts: dict[str, str]) -> ast.AST:
             and (len(node.args) > 1 or any(k.arg in ("encoding", "errors") for k in node.keywords))):
         # R9-F1: ``str(b, 'ascii', 'ignore')`` is ``b.decode('ascii', 'ignore')`` and ``bytes(s, 'ascii', 'ignore')`` is ``s.encode(...)``; pass-28 A1: the type under any
         # name (``builtins.str``, ``S = str``, ``type('')``, ``''.__class__``) is the same call. A type that is not plainly ``bytes`` is read as ``str`` (``decode``).
-        name = node.func.id if isinstance(node.func, ast.Name) else node.func.attr if isinstance(node.func, ast.Attribute) else ""
-        return ast.Call(func=ast.Attribute(value=node.args[0], attr="encode" if name == "bytes" or name in _BYTES_ALIASES else "decode", ctx=ast.Load()),
+        # r14 (sol r13 B2): the constructor is read by the type it PROVABLY is (`_type_kind`): bytes encodes, str decodes. A type it cannot prove (`type(x)`) is told
+        # by its first argument, which Python itself restricts: ``bytes(s, enc)`` needs a str, ``str(b, enc)`` needs bytes, so a str argument means the constructor
+        # encodes. Anything else is no call the fold models, and the generic fallback hedges it.
+        kind = _type_kind(node.func)
+        first = node.args[0]
+        if kind is None:
+            if isinstance(first, ast.Constant) and isinstance(first.value, bytes):
+                kind = "str"
+            elif (isinstance(first, ast.Constant) and isinstance(first.value, str)) or isinstance(first, ast.JoinedStr) or (isinstance(first, ast.Name) and first.id in consts):
+                kind = "bytes"
+        if kind is None:
+            return node
+        return ast.Call(func=ast.Attribute(value=first, attr="encode" if kind == "bytes" else "decode", ctx=ast.Load()),
                         args=node.args[1:], keywords=node.keywords)
     if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)):
         return node
@@ -674,6 +711,23 @@ def _replaced(text: str, old: str, new: str, count: int) -> str:
     return text.replace(old, new, count)
 
 
+def _replace_masked(text: str, old: str) -> str | None:
+    """r14 (sol r13 B1, the design rule: fail CONSERVATIVE, add no exact evaluation). What ``text.replace(old, new[, count])`` may leave when the fold cannot apply
+    it exactly (the text has a wildcard in it, the new text has, the count is not a literal): a text that KEEPS the shape of ``text`` and turns every place the
+    replace could touch into a wildcard, so the pattern covers the result for any new text and any count, and a partial spawn-name pattern is never dropped
+    (``('subpr' + p + 'zcess_exec').replace('z', 'o')`` is ``subpr**cess_exec``, which can read as ``subprocess_exec``). Never longer than ``text`` except for an
+    empty or unknown ``old`` on a partial text, which gets a wildcard between its characters (at most twice as long, refused past the cap before it is built).
+    None when ``text`` holds no literal character: there is no shape to keep, and the caller hedges the arguments."""
+    if not text.replace(_WILD, ""):
+        return None
+    if _WILD not in text:
+        return text.replace(old, _WILD) if old and _WILD not in old else None  # an exact text is only ever cut at the places `old` stands
+    if old and _WILD not in old:
+        touched = set(old)  # a match can start in a wildcard and end on these characters, or the reverse
+        return "".join(_WILD if ch in touched else ch for ch in text)
+    return _joined(list(text), _WILD)  # an empty or unknown `old` can match between any two characters, or none
+
+
 def _mapped(method: str, text: str) -> str:
     """``text.<method>()`` for a case mapper, ``title`` or ``capitalize``: an ASCII character maps to one, any other to at most three (the ligature U+FB03
     upper-cases to ``FFI``), so the bound is worked out from the characters before the text is mapped (pass-30 A3). ``strip`` and its kin never lengthen."""
@@ -813,6 +867,9 @@ def _flatten_node(node: ast.AST, consts: dict[str, str], depth: int = 0) -> tupl
                 count = _int_literal(c)
                 count = (-1 if count < 0 or count > len(text) + 1 else count) if isinstance(count, int) else None  # str.replace takes a C ssize_t: more than the text holds is all
             if count is None or not (known and old_known and new_known):
+                masked = _replace_masked(text, old)  # r14: a partial or inexact replace keeps the shape of the text it could not apply; it never reads as nothing
+                if masked is not None:
+                    return masked, False
                 return _hedge_texts([text, old, new]), False  # an unknown receiver (`S.replace(s, a, b)` through an alias of str) leaves its arguments as the text
             return _replaced(text, old, new, count), True  # refused BEFORE str.replace builds anything (R11-L1)
         if method in _STRING_MAPPERS and not node.keywords and len(node.args) <= 1:
@@ -5210,6 +5267,51 @@ class AdversaryR9Tests(unittest.TestCase):
             self.assertEqual(_start_process_violations("x = " + " + ".join(repr("a" * 30) for _ in range(2)) + "\n")[0], 0)
         source = "x = " + " + ".join(repr("a" * 200) for _ in range(1001)) + "\n"  # 200,200 characters of source
         self.assertEqual(_start_process_violations(source)[0], 1)
+
+    # ---- r14 (sol r13 on 199e9d56, the PR body's pass-34 A1 / A2): B1 a replace drops a partial pattern, B2 a bytes-type constructor reads as a str decoder ----
+    # HUB RULING for this round: fail CONSERVATIVE, add no exact evaluation. A partial text through a replace keeps its shape; a bytes constructor encodes.
+    _P34_BYTES = ("import asyncio\nasync def launch(p):\n    loop = asyncio.get_running_loop()\n{setup}    return await getattr(loop, {name})"
+                  "(asyncio.SubprocessProtocol, 'cmd.exe', '/c', 'exit')\n")
+
+    def test_r14_b1_a_replace_of_a_partial_text_keeps_the_pattern_it_could_not_apply(self):
+        for name in ("('subpr' + p + 'zcess_exec').replace('z', 'o')", "('subpr' + p + 'zcess_exec').replace('z', 'o', 1)",
+                     "('subpr' + p + 'ocess_ezec').replace('z', 'x')", "('subpr' + p + 'zcess_exec').replace('z', 'o', count=1)",
+                     "('subpr' + p + 'zcess_exec').replace('z', p)", "('subpr' + p + 'ocess_exec').replace('', '')",
+                     "('subpr' + p + 'ocess_exec').replace(p, 'q')", "'subprzcess_exec'.replace('z', p)",
+                     "str.replace('subpr' + p + 'zcess_exec', 'z', 'o')"):
+            self.assertGreaterEqual(len(self._bad(self._P33_HEAD.format(name=name))), 1, name)
+
+    def test_r14_b1_the_powershell_sibling_keeps_a_partial_launch_through_a_replace(self):
+        for script in ("('Staz' + p + 'rt-Process cmd.exe').replace('z', '')", "('Staz' + p + 'rt-Process cmd.exe').replace('z', '', 1)",
+                       "('Sta' + p + 'qrt-Process cmd.exe').replace('q', '')", "('saz' + p + 'ps cmd.exe').replace('z', '')"):
+            self.assertEqual(_start_process_violations(f"def f(p):\n    script = {script}\n")[0], 1, script)
+
+    def test_r14_b1_the_controls_keep_their_result(self):
+        for name in ("('xsubpr' + p + 'ocess_exec').strip('x')", "('xsubpr' + p + 'ocess_exec')[1:]"):  # strip and slice controls stay reported
+            self.assertGreaterEqual(len(self._bad(self._P33_HEAD.format(name=name))), 1, name)
+        self.assertEqual(self._fold_text("'subprzcess_exec'.replace('z', 'o')"), ("subprocess_exec", True))  # a fully known replace is exact, as before
+        self.assertEqual(self._fold_text("'subprzcess_exec'.replace('z', 'o', 1)"), ("subprocess_exec", True))
+        for name in ("'abc'.replace('a', 'b')", "('abc' + p + 'def').replace('x', 'y')", "('path/' + p).replace('/', '\\\\')"):  # no spawn name can come out: still clean
+            self.assertEqual(self._bad(self._P33_HEAD.format(name=name)), [], name)
+        self.assertEqual(_start_process_violations("def f(p):\n    script = ('log-' + p + '.txt').replace('-', '_')\n")[0], 0)
+
+    def test_r14_b2_a_bytes_type_constructor_encodes_whatever_spelling_names_the_type(self):
+        for setup, ctor in (("    B = type(b'')\n", "B"), ("    B = b''.__class__\n", "B"), ("", "type(b'')"), ("", "b''.__class__"), ("    B = bytes\n", "B"),
+                            ("", "bytes"), ("    B = type(b'x')\n", "B"), ("    B = b'x'.__class__\n", "B")):
+            name = f"{ctor}('subprocess_exe', 'utf-16-le').decode('utf-16-le') + 'c'"
+            self.assertGreaterEqual(len(self._bad(self._P34_BYTES.format(setup=setup, name=name))), 1, (setup, ctor))
+        for setup, ctor in (("    B = type(b'')\n", "B"), ("", "type(b'')")):  # utf-32 and a keyword codec take the same road
+            name = f"{ctor}('subprocess_exe', encoding='utf-32-le').decode('utf-32-le') + 'c'"
+            self.assertGreaterEqual(len(self._bad(self._P34_BYTES.format(setup=setup, name=name))), 1, (setup, ctor, "utf-32"))
+
+    def test_r14_b2_the_type_a_name_proves_is_the_type_it_reads_as(self):
+        for src, kind in (("bytes", "bytes"), ("str", "str"), ("type(b'')", "bytes"), ("type('')", "str"), ("b''.__class__", "bytes"), ("''.__class__", "str"),
+                          ("builtins.bytes", "bytes"), ("builtins.str", "str"), ("type(p)", None), ("p.__class__", None), ("type(b'', 1)", None)):
+            self.assertEqual(_type_kind(ast.parse(src, mode="eval").body), kind, src)
+        # an unproven `type(x)` is told by its first argument, which Python restricts: bytes(s, enc) takes a str, str(b, enc) takes bytes
+        self.assertEqual(self._fold_text("type(p)(b'subprocess_ex', 'ascii') + 'ec'")[0], "subprocess_exec")
+        self.assertGreaterEqual(len(self._bad(self._P34_BYTES.format(setup="", name="type(p)('subprocess_exe', 'utf-16-le').decode('utf-16-le') + 'c'"))), 1)
+        self.assertEqual(self._fold_text("type('')(b'subprocess_ex', 'ascii') + 'ec'")[0], "subprocess_exec")  # the str decode keeps its exact result
 
     def test_r11_l1_a_one_step_growth_in_an_unused_function_is_reported_not_allocated(self):
         with mock.patch.dict(globals(), {"_FLATTEN_MAX_CHARS": 64}):
