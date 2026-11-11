@@ -74,7 +74,10 @@ FALLBACK_EVENT = "look_assist.daylight_fallback_to_master"
 EVENT_NAME = {name: re.compile(re.escape(name) + r"\b") for name in (
     RESULT_EVENT, ASYNC_APPLIED_EVENT, AUTO_WB_EVENT, ASYNC_DISPATCH_EVENT, SAFETY_FALLBACK_EVENT, SKIP_EVENT, FALLBACK_EVENT)}
 INT_FIELD = re.compile(r"-?[0-9]{1,9}")
-RESULT_KEYS = ("scene", "exposure", "temperature", "tint", "frame", "picture_dump", "source", "decision")   # what one application's result sets
+# What one application's result sets, plus the two markers of its identity: "closed" (a result / applied line completed it, so
+# the next one must bring its own evidence, never borrow this one's) and "generation" (the dispatch's, which the applied event
+# of the same application must repeat). A new application (auto_wb, dispatch) starts without any of them.
+RESULT_KEYS = ("scene", "exposure", "temperature", "tint", "frame", "picture_dump", "source", "decision", "closed", "generation")
 BUILD_SHA = re.compile(r'"build_sha"\s*:\s*"([^"]*)"')
 # The app's own binding of the final PNG (PR #793 head cc3205de, src/batch/LookAssistAnalysis.cpp lookAssistPictureDumpFields):
 #   look_assist.apply.picture_dump pre_safety=<name|none> pre_safety_sha256=<hex|none> pre_safety_exposure=<n>
@@ -97,6 +100,14 @@ DUMP_EVENT = "look_assist.apply.picture_dump"
 FIELD = re.compile(r"(?<!\S)([a-z_0-9]+)=(\S*)")
 DIGITS = re.compile(r"[0-9]{1,9}")      # a frame number; never an arbitrarily long digit string
 FINAL_PICTURE_NAME = re.compile(r"^look-assist-final-frame(\d+)\.png$")
+
+
+def open_base(receipt):
+    """What a result / applied event may build on: the receipt a dispatch or auto_wb opened. A receipt a result or applied
+    event already completed is CLOSED: the next such event starts from nothing and must bring its own scene, source and
+    decision, or it is "no complete apply" -- never a composite of two applications (adversary r3 A1)."""
+    receipt = receipt or {}
+    return {} if receipt.get("closed") else receipt
 
 
 def parse_log_text(text):
@@ -150,9 +161,13 @@ def parse_log_text(text):
             pending_dump = None
             continue
         if is_event(ASYNC_DISPATCH_EVENT):
-            scene = once("scene")
-            # a new application: nothing of the previous one survives
-            receipt = {"scene": scene} if scene else {"malformed_event": ASYNC_DISPATCH_EVENT}
+            scene, generation = once("scene"), once("generation")
+            # a new application: nothing of the previous one survives. Its generation (None when it logs none) is what its
+            # applied event must repeat: another generation's application is not this dispatch's (adversary r3 A2).
+            if scene and (generation is None or INT_FIELD.fullmatch(generation)):
+                receipt = {"scene": scene, "generation": generation}
+            else:
+                receipt = {"malformed_event": ASYNC_DISPATCH_EVENT}
             pending_dump = None
             continue
         if is_event(AUTO_WB_EVENT):
@@ -174,7 +189,7 @@ def parse_log_text(text):
                 receipt = {"malformed_event": RESULT_EVENT}     # an incomplete result is no apply, never an earlier receipt
                 pending_dump = None
                 continue
-            receipt = dict(receipt or {}, scene=scene, exposure=exposure, temperature=temperature, tint=tint)
+            receipt = dict(open_base(receipt), scene=scene, exposure=exposure, temperature=temperature, tint=tint, closed=True)
             receipt.pop("malformed_event", None)
             receipt["frame"] = [value for key, value in pairs if key == "frame"]    # this event's own body fields; validated at the binding
             if marked:
@@ -185,11 +200,13 @@ def parse_log_text(text):
         if is_event(ASYNC_APPLIED_EVENT):
             source, decision = once("source"), once("decision")
             temperature, tint, exposure = int_once("final_temp"), int_once("final_tint"), int_once("preset_exp")
-            if not source or not decision or None in (temperature, tint, exposure):
+            base = open_base(receipt)
+            if (not source or not decision or None in (temperature, tint, exposure)
+                    or base.get("generation") != once("generation")):      # the generation of ITS OWN dispatch, each given once
                 receipt = {"malformed_event": ASYNC_APPLIED_EVENT}
                 pending_dump = None
                 continue
-            receipt = dict(receipt or {}, source=source, decision=decision, temperature=temperature, tint=tint, exposure=exposure)
+            receipt = dict(base, source=source, decision=decision, temperature=temperature, tint=tint, exposure=exposure, closed=True)
             receipt.pop("malformed_event", None)
             receipt["frame"] = [value for key, value in pairs if key == "frame"]    # this event's own body fields; validated at the binding
             if marked:

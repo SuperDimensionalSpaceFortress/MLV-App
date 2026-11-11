@@ -763,6 +763,56 @@ class PictureDumpBindingAdversaryR3(unittest.TestCase):
                 self.assertEqual(1, code, text)
                 self.assertNotIn("picture_dump-bound", text)
 
+    # ---- adversary pass on 5ebbea40 (A1, A2): each input below passed the third cut ----
+    def test_p6_a1_a_complete_application_closes_the_receipt_so_a_later_result_cannot_be_a_composite(self):
+        later = result_line().replace("final_temp=8950", "final_temp=5840")
+        cases = {
+            "result after result": lambda sha: AUTO_WB_LINE + result_line() + dump_line(sha) + later,
+            "applied after result": lambda sha: AUTO_WB_LINE + result_line() + dump_line(sha) + ASYNC_APPLIED_LINE,
+            "result after applied": lambda sha: DISPATCH_LINE + ASYNC_APPLIED_LINE + dump_line(sha) + later,
+            "applied after applied": lambda sha: (DISPATCH_LINE + ASYNC_APPLIED_LINE + dump_line(sha)
+                                                  + ASYNC_APPLIED_LINE.replace("final_temp=9990", "final_temp=5840")),
+        }
+        for label, trace_for in cases.items():
+            root = self.bound(trace_for)
+            for argv in ([], ["--decisions-only"]):
+                with self.subTest("%s %s" % (label, argv)):
+                    code, text = run_checker([root, "--tag", "t"] + argv)
+                    self.assertEqual(1, code, text)
+                    self.assertNotIn("picture_dump-bound", text)
+        # controls: a NEW application (auto_wb, or a dispatch) opens a fresh base and binds its own dump
+        for label, trace_for in (
+                ("sync then sync", lambda sha: AUTO_WB_LINE + result_line() + AUTO_WB_LINE + dump_line(sha) + result_line()),
+                ("sync then async", lambda sha: AUTO_WB_LINE + result_line() + DISPATCH_LINE + dump_line(sha) + ASYNC_APPLIED_LINE),
+                ("async then async", lambda sha: DISPATCH_LINE + ASYNC_APPLIED_LINE + DISPATCH_LINE + dump_line(sha) + ASYNC_APPLIED_LINE)):
+            with self.subTest("control " + label):
+                code, text = run_checker([self.bound(trace_for), "--tag", "t"])
+                self.assertEqual(0, code, text)
+
+    def test_p6_a2_an_applied_event_must_carry_the_generation_of_its_own_dispatch(self):
+        cases = {
+            "applied of another generation": lambda sha: DISPATCH_LINE + dump_line(sha) + ASYNC_APPLIED_LINE.replace("generation=3", "generation=4"),
+            "applied with no generation": lambda sha: DISPATCH_LINE + dump_line(sha) + ASYNC_APPLIED_LINE.replace("generation=3 ", ""),
+            "dispatch with no generation, applied with one": lambda sha: DISPATCH_LINE.replace("generation=3 ", "") + dump_line(sha) + ASYNC_APPLIED_LINE,
+            "dispatch of another generation after the first": lambda sha: DISPATCH_LINE + DISPATCH_LINE.replace("generation=3", "generation=4") + dump_line(sha) + ASYNC_APPLIED_LINE,
+        }
+        for label, trace_for in cases.items():
+            root = self.bound(trace_for)
+            for argv in ([], ["--decisions-only"]):
+                with self.subTest("%s %s" % (label, argv)):
+                    code, text = run_checker([root, "--tag", "t"] + argv)
+                    self.assertEqual(1, code, text)
+                    self.assertNotIn("picture_dump-bound", text)
+        # controls: the same generation binds, and a dispatch and an applied that BOTH carry no generation keep the old reading
+        for label, trace_for in (
+                ("matching generation 4", lambda sha: DISPATCH_LINE.replace("generation=3", "generation=4") + dump_line(sha)
+                                          + ASYNC_APPLIED_LINE.replace("generation=3", "generation=4")),
+                ("neither carries one", lambda sha: DISPATCH_LINE.replace("generation=3 ", "") + dump_line(sha)
+                                        + ASYNC_APPLIED_LINE.replace("generation=3 ", ""))):
+            with self.subTest("control " + label):
+                code, text = run_checker([self.bound(trace_for), "--tag", "t"])
+                self.assertEqual(0, code, text)
+
     def test_a5_a_corrupt_png_is_exit_2_not_a_crash(self):
         import struct
         import zlib
