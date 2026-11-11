@@ -1441,6 +1441,10 @@ private:
     int m_playbackSmokePresentIntervalOverBudget[4] = { 0, 0, 0, 0 };
     uint64_t m_playbackSmokeStartGpuSetClipCount = 0;
     uint64_t m_playbackSmokeStartGpuSetLutsCount = 0;
+    // HFR-NATIVE-M16-1457-GUI-TEXTURE-PRESENT-OFFLOAD-1 r7: deferred-release baselines (playback_smoke.recon_release).
+    uint64_t m_playbackSmokeStartReconReleaseDeferred = 0;
+    uint64_t m_playbackSmokeStartReconReleaseSync = 0;
+    uint64_t m_playbackSmokeStartReconReleaseDrained = 0;
     quint64 m_playbackSmokeStartPresentTextureReallocs = 0;
     double m_playbackSmokeRenderTotalSumMs = 0.0;
     double m_playbackSmokeRenderTotalMaxMs = 0.0;

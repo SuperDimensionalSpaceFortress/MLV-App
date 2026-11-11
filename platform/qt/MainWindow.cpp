@@ -26977,6 +26977,14 @@ void MainWindow::beginPlaybackSmokeTelemetry( void )
     gpuPresentEventSetContext( m_playbackSmokeSessionId, -1 );
     m_playbackSmokeStartGpuSetClipCount = llrpGpuPlaybackReconSetClipCount();
     m_playbackSmokeStartGpuSetLutsCount = llrpGpuPlaybackReconSetLutsCount();
+    {
+        // r7: the deferred-release lever's baselines; max_depth restarts for this session
+        llrpGpuReconReleaseStats_t releaseStats;
+        llrpGpuPlaybackReconReleaseStats( &releaseStats, 1 );
+        m_playbackSmokeStartReconReleaseDeferred = releaseStats.deferred;
+        m_playbackSmokeStartReconReleaseSync = releaseStats.sync;
+        m_playbackSmokeStartReconReleaseDrained = releaseStats.drained;
+    }
     m_playbackSmokeStartPresentTextureReallocs = gpuPresentEventTextureReallocCount();
     m_playbackSmokePresentedIntervalMaxFrame = -1;
     for( int &bucket : m_playbackSmokePresentIntervalOverBudget ) bucket = 0;
@@ -31667,6 +31675,26 @@ void MainWindow::finishPlaybackSmokeTelemetry( const char *reason )
                .arg( m_playbackSmokeGpuDualIsoReconFallbackReasonLast )
                .arg( static_cast<qulonglong>( llrpGpuPlaybackReconClipDimsChangeRefusals() ) )
                .arg( llrpGpuPlaybackReconRetainedOutstandingCount() );
+
+    /* HFR-NATIVE-M16-1457-GUI-TEXTURE-PRESENT-OFFLOAD-1 r7: the deferred-release
+     * lever's engagement, this session's deltas. outstanding_at_stop is read first
+     * (it runs any queued release), so drained includes what it ran. */
+    {
+        const int outstandingAtStop = llrpGpuPlaybackReconRetainedOutstandingCount();
+        llrpGpuReconReleaseStats_t releaseStats;
+        llrpGpuPlaybackReconReleaseStats( &releaseStats, 0 );
+        qInfo().noquote()
+            << QStringLiteral(
+                   "playback_smoke.recon_release session=%1 deferred_enabled=%2 deferred=%3 sync=%4 "
+                   "drained=%5 max_depth=%6 outstanding_at_stop=%7" )
+                   .arg( static_cast<qulonglong>( m_playbackSmokeSessionId ) )
+                   .arg( releaseStats.enabled ? 1 : 0 )
+                   .arg( static_cast<qulonglong>( releaseStats.deferred - m_playbackSmokeStartReconReleaseDeferred ) )
+                   .arg( static_cast<qulonglong>( releaseStats.sync - m_playbackSmokeStartReconReleaseSync ) )
+                   .arg( static_cast<qulonglong>( releaseStats.drained - m_playbackSmokeStartReconReleaseDrained ) )
+                   .arg( releaseStats.max_depth )
+                   .arg( outstandingAtStop );
+    }
 
     /* PLAYBACK-CUDA-HONOUR-SCALE-1 r2: present-gap attribution. Counts are this
      * session's deltas; max_present_interval_frame is the display frame whose

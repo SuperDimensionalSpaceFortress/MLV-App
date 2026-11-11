@@ -331,6 +331,24 @@ int llrpGpuPlaybackReconReleaseRetainedDeviceBayer16(uint64_t token);
 /* PLAYBACK-CUDA-HONOUR-SCALE-1: retained outputs not yet released, and how
  * many runs were refused because they needed new clip dimensions meanwhile. */
 int llrpGpuPlaybackReconRetainedOutstandingCount(void);
+/* HFR-NATIVE-M16-1457-GUI-TEXTURE-PRESENT-OFFLOAD-1 r7: the deferred-release
+ * lever's engagement. A release that finds the backend mutex busy is queued
+ * (deferred) and run by the next mutex holder (drained); one that takes the
+ * mutex itself, or that the lever is off for, or that finds the queue full, is
+ * sync. Counters are cumulative for the process; max_depth is the deepest the
+ * queue has been since the last call with reset_max_depth=1 (which restarts it
+ * at the current depth); pending is the queue now. enabled is
+ * MLVAPP_GPU_RECON_RELEASE_DEFERRED (read once; default 1, 0 = blocking). */
+typedef struct
+{
+    int enabled;
+    uint64_t deferred;
+    uint64_t sync;
+    uint64_t drained;
+    int max_depth;
+    int pending;
+} llrpGpuReconReleaseStats_t;
+void llrpGpuPlaybackReconReleaseStats(llrpGpuReconReleaseStats_t * out, int reset_max_depth);
 uint64_t llrpGpuPlaybackReconClipDimsChangeRefusals(void);
 /* PLAYBACK-CUDA-HONOUR-SCALE-1 r2: 1 when the loaded recon backend exports
  * igpu_recon_set_reduced_iso_notch, 0 when a loaded backend lacks it, -1 when

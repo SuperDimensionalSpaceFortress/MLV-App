@@ -59,6 +59,10 @@
 #include <string>
 #include <vector>
 
+#include <atomic>
+#include <chrono>
+#include <thread>
+
 #ifdef _WIN32
 #define GPU_DUALISO_TEST_SETENV(name, value) _putenv_s((name), (value))
 #define GPU_DUALISO_TEST_UNSETENV(name) _putenv_s((name), "")
@@ -75,6 +79,10 @@ extern "C" void llrpFakeGpuBackendReducedIsoNotchStateForTesting(int * last_run_
                                                                  uint64_t * runs_with_notch,
                                                                  uint64_t * runs_without_notch,
                                                                  uint64_t * set_calls);
+extern "C" void llrpHoldGpuReconBackendMutexForTesting(int hold);
+extern "C" int llrpReinitGpuReconReleaseDeferredForTesting(void);
+extern "C" uint64_t llrpFakeGpuBackendReleaseCallsForTesting(void);
+extern "C" int llrpFakeGpuBackendFailCreateForTesting(void);
 
 namespace {
 
@@ -3043,4 +3051,291 @@ TEST(GpuPlaybackReconWarmRun, TheUncachedDecodeEqualsAPrefetchRingHit)
     ASSERT_TRUE(source == MLV_RAW_UINT16_SOURCE_HIT || source == MLV_RAW_UINT16_SOURCE_INFLIGHT_WAIT_HIT);
     ASSERT_TRUE(uncached == cached);
     mlvCancelPreviewPrefetch(video);
+}
+
+// HFR-NATIVE-M16-1457-GUI-TEXTURE-PRESENT-OFFLOAD-1 r7: deferred retained-token releases. The GUI thread's early
+// slot release used to wait for the backend mutex, which a recon run holds for its whole run (GPU wait included).
+// With the lever on (MLVAPP_GPU_RECON_RELEASE_DEFERRED unset or 1), a release that finds the mutex busy is queued
+// and the next holder of the mutex runs it. A thread holding the mutex via llrpHoldGpuReconBackendMutexForTesting
+// stands in for the run in flight.
+namespace {
+
+// Holds the backend mutex on its own thread (the owner must unlock it) until release().
+class BackendMutexHolder
+{
+public:
+    BackendMutexHolder()
+        : m_thread([this]() {
+              llrpHoldGpuReconBackendMutexForTesting(1);
+              m_held.store(true);
+              while (!m_go.load()) std::this_thread::sleep_for(std::chrono::microseconds(200));
+              llrpHoldGpuReconBackendMutexForTesting(0);
+          })
+    {
+        while (!m_held.load()) std::this_thread::yield();
+    }
+    ~BackendMutexHolder() { release(); }
+    void release()
+    {
+        m_go.store(true);
+        if (m_thread.joinable()) m_thread.join();
+    }
+
+private:
+    std::atomic<bool> m_held{false};
+    std::atomic<bool> m_go{false};
+    std::thread m_thread;
+};
+
+// Releases tokens on its own thread, as the GUI thread does, so a release that blocks never hangs the test.
+class AsyncRelease
+{
+public:
+    explicit AsyncRelease(std::vector<uint64_t> tokens)
+        : m_tokens(std::move(tokens)),
+          m_thread([this]() {
+              const auto t0 = std::chrono::steady_clock::now();
+              for (uint64_t token : m_tokens)
+                  if (llrpGpuPlaybackReconReleaseRetainedDeviceBayer16(token) != 0) m_ok.fetch_add(1);
+              m_ms.store(std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
+              m_done.store(true);
+          })
+    {
+    }
+    ~AsyncRelease() { join(); }
+    bool doneWithin(int ms)
+    {
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(ms);
+        while (!m_done.load() && std::chrono::steady_clock::now() < deadline)
+            std::this_thread::sleep_for(std::chrono::microseconds(200));
+        return m_done.load();
+    }
+    void join()
+    {
+        if (m_thread.joinable()) m_thread.join();
+    }
+    double ms() const { return m_ms.load(); }
+    int ok() const { return m_ok.load(); }
+
+private:
+    std::vector<uint64_t> m_tokens;
+    std::atomic<bool> m_done{false};
+    std::atomic<double> m_ms{0.0};
+    std::atomic<int> m_ok{0};
+    std::thread m_thread;
+};
+
+struct ReleaseDeferredEnv
+{
+    explicit ReleaseDeferredEnv(const char * value)
+    {
+        if (value) GPU_DUALISO_TEST_SETENV("MLVAPP_GPU_RECON_RELEASE_DEFERRED", value);
+        else GPU_DUALISO_TEST_UNSETENV("MLVAPP_GPU_RECON_RELEASE_DEFERRED");
+        llrpReinitGpuReconReleaseDeferredForTesting();
+    }
+    ~ReleaseDeferredEnv()
+    {
+        GPU_DUALISO_TEST_UNSETENV("MLVAPP_GPU_RECON_RELEASE_DEFERRED");
+        llrpReinitGpuReconReleaseDeferredForTesting();
+    }
+};
+
+uint64_t retainOneForRelease(uint64_t frameId)
+{
+    const int w = 16, h = 16;
+    std::vector<uint16_t> input(static_cast<size_t>(w) * h, 100u);
+    llrpGpuPlaybackReconState_t state = validatedState(frameId, w, h);
+    llrpGpuPlaybackReconTiming_t timing = {};
+    llrpGpuPlaybackRetainedDeviceBayer16_t retained = {};
+    int rc = -1;
+    if (!llrpGpuPlaybackReconRunRetainedDeviceBayer16(&state, input.data(), input.size() * sizeof(uint16_t),
+                                                      &retained, &rc, &timing)
+        || !retained.valid)
+    {
+        return 0;
+    }
+    return retained.token;
+}
+
+llrpGpuReconReleaseStats_t releaseStats()
+{
+    llrpGpuReconReleaseStats_t s;
+    llrpGpuPlaybackReconReleaseStats(&s, 0);
+    return s;
+}
+
+} // namespace
+
+// (a) RED first: a release while a run holds the backend mutex returns at once, the token stays outstanding (the
+// backend's release has not run), and the next holder of the mutex runs it. The blocking release (before r7) waits
+// for the holder and fails the first assertion; the holder is let go before any assertion so the test never hangs.
+TEST(GpuDualIsoPreviewScale, R7ReleaseWhileARunHoldsTheMutexReturnsAtOnceAndTheNextHolderRunsIt)
+{
+    GpuReconEnv env(true);
+    const FakeGpuBackendScope fake;
+    const ReleaseDeferredEnv deferred(nullptr);   // the default: on
+    const uint64_t token = retainOneForRelease(1);
+    ASSERT_NE(0u, token);
+    ASSERT_EQ(1, llrpGpuPlaybackReconRetainedOutstandingCount());
+    const uint64_t callsBefore = llrpFakeGpuBackendReleaseCallsForTesting();
+
+    BackendMutexHolder run;
+    AsyncRelease gui({token});
+    const bool returnedWhileHeld = gui.doneWithin(2000);
+    const uint64_t callsWhileHeld = llrpFakeGpuBackendReleaseCallsForTesting();
+    const llrpGpuReconReleaseStats_t whileHeld = releaseStats();
+    run.release();
+    gui.join();
+    std::printf("[r7-deferred-release] returned_while_held=%d release_ms=%.3f pending_while_held=%d\n",
+                returnedWhileHeld ? 1 : 0, gui.ms(), whileHeld.pending);
+
+    ASSERT_TRUE(returnedWhileHeld);
+    ASSERT_TRUE(gui.ms() < 250.0);                 // trylock + a queue push; microseconds, bounded loosely for CI
+    ASSERT_EQ(1, gui.ok());
+    ASSERT_EQ(callsBefore, callsWhileHeld);         // not released earlier than the blocking release would be
+    ASSERT_EQ(1, whileHeld.pending);
+    ASSERT_EQ(0, llrpGpuPlaybackReconRetainedOutstandingCount());   // the next holder ran it
+    ASSERT_EQ(callsBefore + 1, llrpFakeGpuBackendReleaseCallsForTesting());
+}
+
+// (b) The kill switch: MLVAPP_GPU_RECON_RELEASE_DEFERRED=0 waits for the holder, as before r7, and queues nothing.
+TEST(GpuDualIsoPreviewScale, R7KillSwitchZeroKeepsTheBlockingRelease)
+{
+    GpuReconEnv env(true);
+    const FakeGpuBackendScope fake;
+    const ReleaseDeferredEnv deferred("0");
+    const uint64_t token = retainOneForRelease(1);
+    ASSERT_NE(0u, token);
+    const llrpGpuReconReleaseStats_t before = releaseStats();
+    ASSERT_EQ(0, before.enabled);
+
+    BackendMutexHolder run;
+    AsyncRelease gui({token});
+    const bool returnedWhileHeld = gui.doneWithin(200);
+    run.release();
+    gui.join();
+
+    ASSERT_FALSE(returnedWhileHeld);
+    ASSERT_EQ(1, gui.ok());
+    ASSERT_EQ(0, llrpGpuPlaybackReconRetainedOutstandingCount());
+    const llrpGpuReconReleaseStats_t after = releaseStats();
+    ASSERT_EQ(before.deferred, after.deferred);
+    ASSERT_EQ(before.sync + 1, after.sync);
+    ASSERT_EQ(0, after.pending);
+}
+
+// (c) Release-once: each queued token reaches the backend exactly once, later mutex holders find nothing queued,
+// and the outstanding count returns to 0.
+TEST(GpuDualIsoPreviewScale, R7QueuedReleasesRunOnceEach)
+{
+    GpuReconEnv env(true);
+    const FakeGpuBackendScope fake;
+    const ReleaseDeferredEnv deferred(nullptr);
+    const uint64_t first = retainOneForRelease(1);
+    const uint64_t second = retainOneForRelease(2);
+    ASSERT_NE(0u, first);
+    ASSERT_NE(0u, second);
+    ASSERT_EQ(2, llrpGpuPlaybackReconRetainedOutstandingCount());
+    const uint64_t calls0 = llrpFakeGpuBackendReleaseCallsForTesting();
+    const llrpGpuReconReleaseStats_t before = releaseStats();
+
+    BackendMutexHolder run;
+    AsyncRelease gui({first, second});
+    ASSERT_TRUE(gui.doneWithin(2000));
+    ASSERT_EQ(2, releaseStats().pending);
+    run.release();
+
+    ASSERT_EQ(0, llrpGpuPlaybackReconRetainedOutstandingCount());
+    ASSERT_EQ(calls0 + 2, llrpFakeGpuBackendReleaseCallsForTesting());
+    (void)llrpGpuPlaybackReconClipDimsChangeRefusals();   // more holders: nothing left to run
+    (void)llrpGpuPlaybackReconRetainedOutstandingCount();
+    ASSERT_EQ(calls0 + 2, llrpFakeGpuBackendReleaseCallsForTesting());
+    const llrpGpuReconReleaseStats_t after = releaseStats();
+    ASSERT_EQ(before.deferred + 2, after.deferred);
+    ASSERT_EQ(before.drained + 2, after.drained);
+    ASSERT_EQ(0, after.pending);
+    ASSERT_TRUE(after.max_depth >= 2);
+    // A later run retains and releases as before.
+    const uint64_t third = retainOneForRelease(3);
+    ASSERT_NE(0u, third);
+    ASSERT_EQ(1, llrpGpuPlaybackReconRetainedOutstandingCount());
+    ASSERT_NE(0, llrpGpuPlaybackReconReleaseRetainedDeviceBayer16(third));
+    ASSERT_EQ(0, llrpGpuPlaybackReconRetainedOutstandingCount());
+    ASSERT_EQ(calls0 + 3, llrpFakeGpuBackendReleaseCallsForTesting());
+}
+
+// (d) A full queue falls back to the blocking release: the token is never dropped, and the queue runs first.
+TEST(GpuDualIsoPreviewScale, R7FullQueueFallsBackToTheBlockingRelease)
+{
+    GpuReconEnv env(true);
+    const FakeGpuBackendScope fake;
+    const ReleaseDeferredEnv deferred(nullptr);
+    const int capacity = LLRP_GPU_RETAINED_OUTSTANDING_MAX;
+    std::vector<uint64_t> queued;
+    for (int i = 0; i < capacity; ++i) queued.push_back(1000u + static_cast<uint64_t>(i));
+    const uint64_t calls0 = llrpFakeGpuBackendReleaseCallsForTesting();
+    const llrpGpuReconReleaseStats_t before = releaseStats();
+
+    BackendMutexHolder run;
+    AsyncRelease fill(queued);
+    ASSERT_TRUE(fill.doneWithin(2000));
+    ASSERT_EQ(capacity, releaseStats().pending);
+    AsyncRelease overflow({2000u});
+    const bool overflowReturnedWhileHeld = overflow.doneWithin(200);
+    run.release();
+    overflow.join();
+
+    ASSERT_FALSE(overflowReturnedWhileHeld);
+    ASSERT_EQ(capacity, fill.ok());
+    ASSERT_EQ(1, overflow.ok());
+    ASSERT_EQ(calls0 + static_cast<uint64_t>(capacity) + 1, llrpFakeGpuBackendReleaseCallsForTesting());
+    const llrpGpuReconReleaseStats_t after = releaseStats();
+    ASSERT_EQ(before.deferred + static_cast<uint64_t>(capacity), after.deferred);
+    ASSERT_EQ(before.drained + static_cast<uint64_t>(capacity), after.drained);
+    ASSERT_EQ(before.sync + 1, after.sync);
+    ASSERT_EQ(capacity, after.max_depth);
+    ASSERT_EQ(0, after.pending);
+}
+
+// (e) Suppression and device loss: a queued release is not gated, exactly like the blocking release (which ran
+// under suppression too), and a token drained after the backend is gone gets rc -3 and never reaches a backend.
+TEST(GpuDualIsoPreviewScale, R7QueuedReleaseKeepsTheBlockingOutcomeUnderSuppressionAndLoss)
+{
+    GpuReconEnv env(true);
+    const FakeGpuBackendScope fake;
+    const ReleaseDeferredEnv deferred(nullptr);
+    struct SuppressedScope
+    {
+        SuppressedScope() { llrpSetGpuCudaSuppressed(1); }
+        ~SuppressedScope() { llrpSetGpuCudaSuppressed(0); }
+    };
+    const uint64_t token = retainOneForRelease(1);
+    ASSERT_NE(0u, token);
+    const uint64_t calls0 = llrpFakeGpuBackendReleaseCallsForTesting();
+    {
+        const SuppressedScope suppressed;
+        BackendMutexHolder run;
+        AsyncRelease gui({token});
+        ASSERT_TRUE(gui.doneWithin(2000));
+        run.release();
+        ASSERT_EQ(0, llrpGpuPlaybackReconRetainedOutstandingCount());
+        ASSERT_EQ(calls0 + 1, llrpFakeGpuBackendReleaseCallsForTesting());
+    }
+    // The backend is lost (its outstanding list goes with it); a release queued after that drains to rc -3.
+    const uint64_t lost = retainOneForRelease(2);
+    ASSERT_NE(0u, lost);
+    ASSERT_EQ(1, llrpFakeGpuBackendFailCreateForTesting());
+    const uint64_t calls1 = llrpFakeGpuBackendReleaseCallsForTesting();
+    const llrpGpuReconReleaseStats_t before = releaseStats();
+    {
+        BackendMutexHolder run;
+        AsyncRelease gui({lost});
+        ASSERT_TRUE(gui.doneWithin(2000));
+        run.release();
+    }
+    ASSERT_EQ(0, llrpGpuPlaybackReconRetainedOutstandingCount());
+    ASSERT_EQ(calls1, llrpFakeGpuBackendReleaseCallsForTesting());
+    ASSERT_EQ(before.drained + 1, releaseStats().drained);
+    // ...and the blocking release of the same lost token reports the failure, as before r7.
+    ASSERT_EQ(0, llrpGpuPlaybackReconReleaseRetainedDeviceBayer16(lost));
 }
