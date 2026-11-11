@@ -243,7 +243,8 @@ QStringList notesOutsideFailureBranch(const QString & source, const QString & la
 {
     const QString code = codeOnly(source);
     QStringList bad;
-    for (const QString & needle : {QStringLiteral("IGPU_CUDA_ERROR_NOTE("), QStringLiteral("IGPU_CUDA_ERROR_NOTE_EVALUATED(")})
+    for (const QString & needle : {QStringLiteral("IGPU_CUDA_ERROR_NOTE("), QStringLiteral("IGPU_CUDA_ERROR_NOTE_EVALUATED("),
+                                   QStringLiteral("IGPU_CUDA_ERROR_NOTE_IF_ROOM(")})
     {
         for (int pos = source.indexOf(needle); pos >= 0; pos = source.indexOf(needle, pos + 1))
         {
@@ -262,10 +263,12 @@ const QRegularExpression & evaluatedEntry()
     return re;
 }
 
-// Note sites: each IGPU_CUDA_ERROR_NOTE( plus (r7) each evaluated entry.
+// Note sites: each IGPU_CUDA_ERROR_NOTE( plus (r7) each evaluated entry, plus (HFR-NATIVE-M16-1457 r4 fix 3) each
+// non-evicting IGPU_CUDA_ERROR_NOTE_IF_ROOM(.
 int noteSites(const QString & source)
 {
     int sites = (int)source.count(QStringLiteral("IGPU_CUDA_ERROR_NOTE("));
+    sites += (int)source.count(QStringLiteral("IGPU_CUDA_ERROR_NOTE_IF_ROOM("));
     for (QRegularExpressionMatchIterator it = evaluatedEntry().globalMatch(source); it.hasNext(); it.next()) ++sites;
     return sites;
 }
@@ -287,8 +290,10 @@ int noteSites(const QString & source)
 // copy's present_drain, after its unmap).
 // r4 fix 2 (adversary A1 on f0058f46): AMaZE 55 = 20 macro notes (+2: the batched tile drain's tiles:present_order and
 // tiles:drain_sync, so every evaluated failure of the best-effort drain is noted once) + the same 35 evaluated entries.
+// r4 fix 3 (adversary A1 on fa4699ca): AMaZE 56 = 20 macro notes + 1 non-evicting secondary (tiles:drain_sync, the
+// later drain failures) + 35 evaluated entries.
 constexpr int kReconNotes = 27;
-constexpr int kAmazeNotes = 55;
+constexpr int kAmazeNotes = 56;
 
 QStringList failureCensus(const QString & recon, const QString & amaze)
 {
@@ -732,7 +737,7 @@ TEST(GpuFieldTelemetry, CudaFailureBranchesNoteTheCodeAndAddNoSync)
         ASSERT_TRUE(amaze.contains(QString::fromLatin1(note)));
     // PLAYBACK-STARTUP-WAIT-S1-FIRST-AMAZE-AT-PLAY-1: + 11 macro notes (probe:* x7, clock_kick:* x4), each in its
     // rc != cudaSuccess branch
-    ASSERT_EQ(55, noteSites(amaze)); // exact (r4 tile drain +2; r3 present stream +4; r8 38, r7 22)
+    ASSERT_EQ(56, noteSites(amaze)); // exact (r4 tile drain +3; r3 present stream +4; r8 38, r7 22)
     ASSERT_EQ(27, noteSites(recon)); // r8: exact (r7 17)
     // r3: the exact counts and the brace-scope check (FailureCensusIsExactAndBraceScoped).
     ASSERT_EQ(std::string(), failureCensus(recon, amaze).join(QStringLiteral("; ")).toStdString());
@@ -971,7 +976,7 @@ TEST(GpuFieldTelemetry, FailureCensusIsExactAndBraceScoped)
     ASSERT_EQ(std::string("recon notes 26 != 27"), failureCensus(noSubmit, amaze).join(QStringLiteral("; ")).toStdString());
     // Mutation 2: drop one AMaZE note -> one short (r8: the register note; the map note is an evaluated entry).
     const QString noMap = replacedOnce(amaze, QStringLiteral("            IGPU_CUDA_ERROR_NOTE(rc, \"gl_r16_in:register\");\n"), QString());
-    ASSERT_EQ(std::string("amaze notes 54 != 55"), failureCensus(recon, noMap).join(QStringLiteral("; ")).toStdString());
+    ASSERT_EQ(std::string("amaze notes 55 != 56"), failureCensus(recon, noMap).join(QStringLiteral("; ")).toStdString());
     // Mutation 3 (fable's repro): the note moved after an early-return failure check, into the
     // success path. Same count; the old 4-line context check accepted it.
     const QString earlyReturn = replacedOnce(recon,

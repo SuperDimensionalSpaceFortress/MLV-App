@@ -81,13 +81,21 @@ inline void copy_text(char * out, std::size_t cap, const char * text)
     out[n] = '\0';
 }
 
-inline void note(int code, const char * name, const char * site)
+/* HFR-NATIVE-M16-1457-GUI-TEXTURE-PRESENT-OFFLOAD-1 r4 fix 3: one body for note() and note_if_room(). evict=true is
+ * note() exactly as before. evict=false: when the site's channel ring is full, nothing is queued and `last` is left
+ * alone; the note is counted in the ring's dropped total instead (drain() reports it). Returns true if queued. */
+inline bool note_into(int code, const char * name, const char * site, bool evict)
 {
-    if (code == 0) return;
+    if (code == 0) return false;
     const double utc_ms = std::chrono::duration<double, std::milli>(
         std::chrono::system_clock::now().time_since_epoch()).count();
     Slot & s = slot();
     std::lock_guard<std::mutex> lock(s.mutex);
+    if (!evict && s.pending[channel_of(site)].size == kPending)
+    {
+        ++s.pending[channel_of(site)].dropped;
+        return false;
+    }
     s.last.code = code;
     copy_text(s.last.name, sizeof(s.last.name), name);
     copy_text(s.last.site, sizeof(s.last.site), site);
@@ -104,6 +112,20 @@ inline void note(int code, const char * name, const char * site)
     r.note[(r.oldest + r.size) % kPending] = s.last;
     ++r.size;
     s.pending_size[channel].store(r.size, std::memory_order_relaxed);
+    return true;
+}
+
+inline void note(int code, const char * name, const char * site)
+{
+    note_into(code, name, site, true);
+}
+
+/* r4 fix 3 (adversary A1 on fa4699ca): a SECONDARY note of a failed call (another code the same call evaluated after
+ * its first failure) never evicts: a full ring keeps the older notes, so a burst of secondaries cannot push out the
+ * call's primary (the oldest note), and the skipped note is counted as dropped. */
+inline bool note_if_room(int code, const char * name, const char * site)
+{
+    return note_into(code, name, site, false);
 }
 
 inline int take(int channel, igpu_cuda_error_t * out)
@@ -199,6 +221,10 @@ inline int note_evaluated(const Evaluated * calls, int n, const char * (*name_of
 
 #define IGPU_CUDA_ERROR_NOTE(e, site) \
     igpu_cuda_error_slot::note((int)(e), cudaGetErrorName(e), (site))
+
+/* r4 fix 3: a secondary note that never evicts (note_if_room). */
+#define IGPU_CUDA_ERROR_NOTE_IF_ROOM(e, site) \
+    igpu_cuda_error_slot::note_if_room((int)(e), cudaGetErrorName(e), (site))
 
 /* r7: `calls` is a local igpu_cuda_error_slot::Evaluated array. */
 #define IGPU_CUDA_ERROR_NOTE_EVALUATED(calls) \

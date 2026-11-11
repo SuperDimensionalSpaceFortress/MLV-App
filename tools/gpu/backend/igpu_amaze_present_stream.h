@@ -34,6 +34,9 @@ namespace igpu_amaze_present
  * returned one included, so field telemetry (which takes the oldest note as the primary fault) gets one record
  * per evaluated failure, the first one first. The caller notes a failed `firstRc` itself, before the call, and
  * raises the returned code without noting it again.
+ * r4 fix 3 (adversary A1 on fa4699ca): note(rc, first) also says whether rc is the FIRST failure (no failed seed and
+ * no failed sync before it). The caller notes the first one normally and every later one without eviction, so a
+ * burst of later failures larger than the note ring cannot push the first one out.
  * A template over the error and stream types (no CUDA types), so tests/console drives it with a host-side stub
  * sync that fails on a chosen stream. */
 template <typename Rc, typename Streams, typename Sync, typename Note>
@@ -44,8 +47,9 @@ Rc drain_every_stream(const Streams & streams, std::size_t active, Rc firstRc, R
         const Rc rc = sync(streams[slot]);
         if (rc != success)
         {
-            note(rc);
-            if (firstRc == success) firstRc = rc;
+            const bool first = firstRc == success;
+            note(rc, first);
+            if (first) firstRc = rc;
         }
     }
     return firstRc;

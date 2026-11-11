@@ -1686,7 +1686,10 @@ void run_frame_to_device_rgb16_bayer16_post_wb_batched(
      * tile stream; a stream whose own sync failed is reported, not waited on again.
      * r4 fix 2 (adversary A1 on f0058f46): every evaluated failure is noted once, in call order, at its own site: a
      * failed ordering code at tiles:present_order before the drain, each failed sync at tiles:drain_sync as it
-     * returns. raise_noted_cuda then throws CK's exception for the first one without a second note. */
+     * returns. raise_noted_cuda then throws CK's exception for the first one without a second note.
+     * r4 fix 3 (adversary A1 on fa4699ca): only the first failure is noted with eviction; every later one is a
+     * secondary that never evicts (the _IF_ROOM note), so more failures than the 8-note ring holds cannot push the
+     * first one out: the overflow is counted as dropped. */
     cudaError_t presentOrderRc = cudaSuccess;
     if (presentStream && presentProducerDone)
     {
@@ -1708,10 +1711,14 @@ void run_frame_to_device_rgb16_bayer16_post_wb_batched(
         [&](cudaStream_t tile) -> cudaError_t {
             return IGPU_LT_SYNC_CALL("tiles:drain_sync", cudaStreamSynchronize(tile));
         },
-        [](cudaError_t rc) {
-            if (rc != cudaSuccess)
+        [](cudaError_t rc, bool first) {
+            if (rc != cudaSuccess && first)
             {
                 IGPU_CUDA_ERROR_NOTE(rc, "tiles:drain_sync");
+            }
+            if (rc != cudaSuccess && !first)
+            {
+                IGPU_CUDA_ERROR_NOTE_IF_ROOM(rc, "tiles:drain_sync");
             }
         });
     raise_noted_cuda(tileDrainRc, "tileDrainRc", __FILE__, __LINE__);

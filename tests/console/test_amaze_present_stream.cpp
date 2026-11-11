@@ -6,6 +6,7 @@
 #include "../common/minitest.h"
 #include "../common/repo_paths.h"
 #include "../../tools/gpu/backend/igpu_amaze_present_stream.h"
+#include "../../tools/gpu/backend/igpu_cuda_error_slot.h"
 
 #include <QFile>
 #include <QRegularExpression>
@@ -181,10 +182,14 @@ TEST(AmazePresentStream, TheTileDrainIsBestEffortAndTheOrderingCodeIsRaisedFirst
         "        [&](cudaStream_t tile) -> cudaError_t {\n"
         "            return IGPU_LT_SYNC_CALL(\"tiles:drain_sync\", cudaStreamSynchronize(tile));\n"
         "        },\n"
-        "        [](cudaError_t rc) {\n"
-        "            if (rc != cudaSuccess)\n"
+        "        [](cudaError_t rc, bool first) {\n"
+        "            if (rc != cudaSuccess && first)\n"
         "            {\n"
         "                IGPU_CUDA_ERROR_NOTE(rc, \"tiles:drain_sync\");\n"
+        "            }\n"
+        "            if (rc != cudaSuccess && !first)\n"
+        "            {\n"
+        "                IGPU_CUDA_ERROR_NOTE_IF_ROOM(rc, \"tiles:drain_sync\");\n"
         "            }\n"
         "        });\n"
         "    raise_noted_cuda(tileDrainRc, \"tileDrainRc\", __FILE__, __LINE__);")));
@@ -223,23 +228,25 @@ struct StubSync
     std::vector<int> synced;     // the slots synchronized, in call order
     std::vector<int> noted;      // the codes handed to note(), in call order
     std::vector<int> events;     // syncs and notes interleaved
+    std::vector<bool> firsts;    // per note: the helper's `first` flag
     int operator()(int stream)
     {
         synced.push_back(stream);
         events.push_back(1000 + stream);
         return failAt[static_cast<std::size_t>(stream)];
     }
-    void note(int rc)
+    void note(int rc, bool first)
     {
         noted.push_back(rc);
         events.push_back(rc);
+        firsts.push_back(first);
     }
 };
 
 int drainWith(StubSync & stub, const std::vector<int> & streams, std::size_t active, int seed)
 {
     return igpu_amaze_present::drain_every_stream(streams, active, seed, 0, [&](int s) { return stub(s); },
-                                                  [&](int rc) { stub.note(rc); });
+                                                  [&](int rc, bool first) { stub.note(rc, first); });
 }
 
 std::vector<int> tileStreams(int n)
@@ -306,16 +313,90 @@ TEST(AmazePresentStream, StubDrainNotesEveryFailedSyncOnceInCallOrder)
     ASSERT_EQ(700, drainWith(both, two, two.size(), 0));
     ASSERT_TRUE(both.noted == (std::vector<int>{700, 700}));
     ASSERT_TRUE(both.events == (std::vector<int>{1000, 700, 1001, 700}));
+    ASSERT_TRUE(both.firsts == (std::vector<bool>{true, false}));
     // Mixed: the notes follow the syncs in call order and only failures are noted.
     const std::vector<int> five = tileStreams(5);
     StubSync mixed{{0, 21, 0, 23, 24}, {}, {}, {}};
     ASSERT_EQ(21, drainWith(mixed, five, five.size(), 0));
     ASSERT_TRUE(mixed.events == (std::vector<int>{1000, 1001, 21, 1002, 1003, 23, 1004, 24}));
+    ASSERT_TRUE(mixed.firsts == (std::vector<bool>{true, false, false}));
     // A failed seed (the ordering code, noted by the caller before the call) is returned but not noted again; the
-    // drain failures after it are still each noted once.
+    // drain failures after it are still each noted once, none of them first.
     StubSync seeded{{0, 31, 32}, {}, {}, {}};
     ASSERT_EQ(400, drainWith(seeded, tileStreams(3), 3, 400));
     ASSERT_TRUE(seeded.noted == (std::vector<int>{31, 32}));
+    ASSERT_TRUE(seeded.firsts == (std::vector<bool>{false, false}));
+}
+
+namespace
+{
+
+// The .cu's note callback, on the real host-only slot (igpu_cuda_error_slot.h) with a fake name: the first failure is
+// an ordinary note, every later one a note_if_room.
+void slotNote(int rc, bool first)
+{
+    if (first) igpu_cuda_error_slot::note(rc, "stub", "tiles:drain_sync");
+    else igpu_cuda_error_slot::note_if_room(rc, "stub", "tiles:drain_sync");
+}
+
+int drainSlot(std::vector<igpu_cuda_error_t> & out, unsigned long long & dropped)
+{
+    out.assign(IGPU_CUDA_ERROR_PENDING_MAX, igpu_cuda_error_t());
+    return igpu_cuda_error_slot::drain(IGPU_CUDA_ERROR_CHANNEL_RENDER, out.data(), (int)out.size(), &dropped);
+}
+
+} // namespace
+
+TEST(AmazePresentStream, SlotKeepsTheFirstDrainFailureWhenLaterOnesOverflowTheRing)
+{
+    // r4 fix 3 (adversary A1 on fa4699ca, its input: nine active tile streams, all nine final syncs return 700). The
+    // ring holds IGPU_CUDA_ERROR_PENDING_MAX (8) notes. The first failure must stay the oldest note (telemetry's
+    // primary) and the overflow must be counted, not evict it.
+    std::vector<igpu_cuda_error_t> out;
+    unsigned long long dropped = 0;
+    drainSlot(out, dropped); // start empty
+    const int n = IGPU_CUDA_ERROR_PENDING_MAX + 1;
+    std::vector<int> fails(static_cast<std::size_t>(n), 0);
+    for (int i = 0; i < n; ++i) fails[static_cast<std::size_t>(i)] = 700 + i; // distinct, so order is visible
+    const std::vector<int> streams = tileStreams(n);
+    const int rc = igpu_amaze_present::drain_every_stream(
+        streams, streams.size(), 0, 0, [&](int s) { return fails[static_cast<std::size_t>(s)]; }, slotNote);
+    ASSERT_EQ(700, rc);
+    ASSERT_EQ(IGPU_CUDA_ERROR_PENDING_MAX, drainSlot(out, dropped));
+    ASSERT_EQ(700, out[0].code);   // the first failure is still the oldest: primary
+    for (int i = 1; i < IGPU_CUDA_ERROR_PENDING_MAX; ++i) ASSERT_EQ(700 + i, out[static_cast<std::size_t>(i)].code);
+    ASSERT_EQ(1ULL, dropped);      // the ninth was counted, not queued
+
+    // A failed ordering code noted first (ordinary note), then nine failed syncs: the ordering code stays primary.
+    igpu_cuda_error_slot::note(400, "stub", "tiles:present_order");
+    const int seeded = igpu_amaze_present::drain_every_stream(
+        streams, streams.size(), 400, 0, [&](int s) { return fails[static_cast<std::size_t>(s)]; }, slotNote);
+    ASSERT_EQ(400, seeded);
+    ASSERT_EQ(IGPU_CUDA_ERROR_PENDING_MAX, drainSlot(out, dropped));
+    ASSERT_EQ(400, out[0].code);
+    ASSERT_EQ(700, out[1].code);
+    ASSERT_EQ(2ULL, dropped);      // 1 + 9 notes for 8 places
+    ASSERT_EQ(0, drainSlot(out, dropped));
+}
+
+TEST(AmazePresentStream, SlotNoteIfRoomNeverEvictsButNoteStillDoes)
+{
+    // note() keeps its pre-r4 behaviour (a full ring drops its oldest); note_if_room() never evicts.
+    std::vector<igpu_cuda_error_t> out;
+    unsigned long long dropped = 0;
+    drainSlot(out, dropped);
+    for (int i = 0; i < IGPU_CUDA_ERROR_PENDING_MAX; ++i) igpu_cuda_error_slot::note(100 + i, "stub", "tiles:x");
+    ASSERT_FALSE(igpu_cuda_error_slot::note_if_room(999, "stub", "tiles:x"));
+    igpu_cuda_error_slot::note(200, "stub", "tiles:x");
+    ASSERT_EQ(IGPU_CUDA_ERROR_PENDING_MAX, drainSlot(out, dropped));
+    ASSERT_EQ(101, out[0].code);   // note() evicted 100
+    ASSERT_EQ(200, out[static_cast<std::size_t>(IGPU_CUDA_ERROR_PENDING_MAX - 1)].code);
+    ASSERT_EQ(2ULL, dropped);      // the skipped 999 and the evicted 100
+    ASSERT_TRUE(igpu_cuda_error_slot::note_if_room(5, "stub", "tiles:x"));
+    ASSERT_FALSE(igpu_cuda_error_slot::note_if_room(0, "stub", "tiles:x"));
+    ASSERT_EQ(1, drainSlot(out, dropped));
+    ASSERT_EQ(5, out[0].code);
+    ASSERT_EQ(0ULL, dropped);
 }
 
 TEST(AmazePresentStream, BothLiveEntriesRunTheHandoffOnThePresentStream)
