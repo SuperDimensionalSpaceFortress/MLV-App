@@ -11573,11 +11573,15 @@ def _ident_gap_verdict(mono_s: float, child_s, limit_s: float, civil_s=None, civ
     "pass": the upper bound is under the limit. "over": the lower bound is at or over the limit, so the real gap is too; the figure is the lower bound. "inconclusive" (a typed skip, never a pass and
     never an over verdict): anything else, including no child stamp. `civil_s` (the OS FILETIME estimate, _ident_exit_from_pairs, good to +/-`civil_u_s`) is a CROSS-CHECK printed in the reason
     only: a civil step shorter than the sampler's interval is seen by no pair (adversary A1 on fae72991), so the civil clock never decides a verdict."""
-    if child_s is not None and child_s > mono_s:   # sol r1 on 9265be72 B1: the child's run is INSIDE the parent's wall, so a lower bound above the upper bound is no measurement of either
+    # r5 (sol r4 on a7ddf486 B1): every comparison below is on the EXACT figure (`_ident_exact_s`), never on a float of it: a wall of 60 - 10^-18 s rounds to 60.0, which is AT the limit, and turned a
+    # pass into a typed skip. The floats are only what is returned and printed.
+    mono_x, child_x = _ident_exact_s(mono_s), None if child_s is None else _ident_exact_s(child_s)
+    mono_s, child_s = float(mono_s), None if child_s is None else float(child_s)
+    if child_x is not None and child_x > mono_x:   # sol r1 on 9265be72 B1: the child's run is INSIDE the parent's wall, so a lower bound above the upper bound is no measurement of either
         raise AssertionError(f"typed failure, not a verdict: the child's own monotonic figure {child_s:.6f} s (a lower bound) exceeds the parent's {mono_s:.6f} s (an upper bound), so the two are not the same monotonic clock")
-    if mono_s < limit_s:
+    if mono_x < _IdentFraction(limit_s):
         return "pass", mono_s, ""
-    if child_s is not None and child_s >= limit_s:
+    if child_x is not None and child_x >= _IdentFraction(limit_s):
         return "over", child_s, ""
     why = f"the monotonic gap {mono_s:.2f} s is over the {limit_s:.0f} s limit but " + (
         f"the child's own monotonic stamp {child_s:.2f} s (a lower bound) does not reach it" if child_s is not None else "the child left no monotonic stamp to bound it from below")
@@ -11644,6 +11648,11 @@ def _ident_wall_ns(wall_s) -> "_IdentFraction":
     if isinstance(wall_s, (int, _IdentFraction)):
         return _IdentFraction(wall_s) * 1_000_000_000
     return _IdentFraction(repr(float(wall_s))) * 1_000_000_000
+
+
+def _ident_exact_s(figure_s) -> "_IdentFraction":
+    """r5 (sol r4 B1): a figure of seconds as the exact rational it stands for (see _ident_wall_ns: a `_IdentWallS`, an int or a Fraction as it is, a plain float as the decimal it prints as)."""
+    return _ident_wall_ns(figure_s) / 1_000_000_000
 
 
 def _ident_exact_stamps(child: tuple) -> tuple:
@@ -12716,7 +12725,7 @@ class VenueProbeIdentityCallDeadlineTests(IdentityProbeMixin, unittest.TestCase)
         if child is not None:   # adversary A1 on 99868f47: the run is INSIDE the parent's wall, judged on the EXACT stamps (the integer bounds above can round a 0.5 ns excess into an equality)
             start_exact, exit_exact = _ident_exact_stamps(child)
             self.assertLessEqual(exit_exact - start_exact, _ident_wall_ns(wall_s), f"typed failure, not a verdict: the child's own monotonic run exceeds the parent's wall {wall_s!r} s that contains it, so the two are not the same monotonic clock")
-        out =[("wall", *_ident_gap_verdict(float(wall_s), child_run_s, self.WALL_LIMIT_S, civil_run_s, _IDENT_WALL_ESTIMATE_UNCERTAINTY_S))]
+        out =[("wall", *_ident_gap_verdict(wall_s, child_run_s, self.WALL_LIMIT_S, civil_run_s, _IDENT_WALL_ESTIMATE_UNCERTAINTY_S))]
         hold = self.exit_hold_verdict()
         if require_abandoned:
             self.assertGreaterEqual(self.last_timing["abandoned"], 1, "the slow call was not abandoned, so this case proves nothing")
@@ -13266,6 +13275,24 @@ class VenueProbeIdentityCallDeadlineTests(IdentityProbeMixin, unittest.TestCase)
         self.assertIn("not the same monotonic clock", str(ctx.exception))
         # a wall one ns longer holds the same run again
         self.assertEqual({what: kind for what, kind, _f, _r in self.timing_verdicts(0.100000001)}["wall"], "pass")
+
+    def test_r5_b1_an_exact_wall_under_the_deadline_is_judged_as_the_exact_figure_never_as_its_float(self) -> None:
+        # sol r4 on a7ddf486 B1: wall_s = 60 - 10^-18 s is an accepted exact figure (the child/wall order check passes on it), but float() rounds it to 60.0, which is AT the deadline, so the verdict
+        # said inconclusive (a typed skip) on a run whose exact upper bound is under it. The verdict compares the exact figure; the float is only a printed figure.
+        self._set_clocks_from_stamps("900000000 10000000", "910000000", 905_000_000, 10_000_000, 100 * 10**9)
+        under = _IdentFraction(60) - _IdentFraction(1, 10**18)
+        verdicts = {what: kind for what, kind, _f, _r in self.timing_verdicts(under)}
+        self.assertEqual(verdicts["wall"], "pass", "an exact upper bound under the deadline is a pass, never rounded onto it")
+        self.assertEqual(verdicts["exit hold"], "pass")
+        self.assert_timing(under)   # no typed skip either
+        self.assertEqual(_ident_gap_verdict(under, None, 60.0)[0], "pass", "the shared helper judges the exact figure")
+        self.assertEqual(_ident_gap_verdict(under, 59.0, 60.0)[0], "pass")
+        # the controls on the other side: AT the deadline, or a hair over it, is still not a pass (a child run under the limit => inconclusive, never a pass)
+        for wall in (_IdentFraction(60), _IdentFraction(60) + _IdentFraction(1, 10**18), 60.0):
+            self.assertEqual({what: kind for what, kind, _f, _r in self.timing_verdicts(wall)}["wall"], "inconclusive", wall)
+        # class sibling: the child's figure is judged as the decimal count it came from, so a child run equal to the exact wall is not a reversal whatever its binary float is
+        self.assertEqual(_ident_gap_verdict(_IdentFraction(10_000_000_100, 10**9), 10_000_000_100 / 1e9, 60.0)[0], "pass")
+        self.assertEqual(_ident_gap_verdict(_IdentWallS.of_ns(60_000_000_000), 60_000_000_000 / 1e9, 60.0)[:2], ("over", 60.0))
 
     def test_r4_b2_a_marker_frequency_that_disagrees_with_the_childs_is_a_typed_failure_never_a_hold(self) -> None:
         # sol r3 on 5092ebcd B2: both records are well formed, so both readers accept them, but they describe two different QPC frequencies. On the marker's 20 MHz the gap is 15 s (a HOLD);
