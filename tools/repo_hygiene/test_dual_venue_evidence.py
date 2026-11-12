@@ -12720,7 +12720,7 @@ class VenueProbeIdentityCallDeadlineTests(IdentityProbeMixin, unittest.TestCase)
         self.assertTrue(t.get("end_qpc") is not None and t.get("qpc_hz"), "typed failure, not an exit hold: the marker carries no end_qpc / qpc_hz timestamp: " + self.last_stderr)
         marker_ns = _ident_marker_ns(t["end_qpc"], t["qpc_hz"])
         upper = (self.last_wall_end_ns - marker_ns) / 1e9
-        self.assertGreater(upper, -1.0, f"typed failure, not an exit hold: the probe's end marker is {-upper:.1f} s AFTER the test saw the process end, so the two are not the same monotonic clock")
+        self.assertGreaterEqual(upper, 0, f"typed failure, not an exit hold: the probe's end marker is {-upper:.3f} s AFTER the test saw the process end, so the two are not the same monotonic clock")   # r2 (adversary A3): no tolerance, like the child stamps below
         child_exit_ns = getattr(self, "last_child_exit_ns", None)
         civil_s = None if child_exit_ns is None else (child_exit_ns - marker_ns) / 1e9
         # VENUE-PROBE-CHILD-SIDE-MONOTONIC-EXIT-STAMP-1: the LOWER bound is the child's own ProcessExit QPC stamp; the civil estimate above is a cross-check only (adversary A1 on fae72991)
@@ -12730,7 +12730,9 @@ class VenueProbeIdentityCallDeadlineTests(IdentityProbeMixin, unittest.TestCase)
             # sol r1 on 9265be72 B1: the order is marker <= the child's ProcessExit stamp <= the parent's end read, with NO tolerance (one system-wide QPC; each stamp is floored, which keeps a true order true)
             self.assertLessEqual(child[1], self.last_wall_end_ns, f"typed failure, not an exit hold: the child's exit stamp is {(child[1] - self.last_wall_end_ns) / 1e9:.3f} s AFTER the test saw the process end, so the two are not the same monotonic clock")
             self.assertGreaterEqual(child[1], marker_ns, f"typed failure, not an exit hold: the child's exit stamp is {(marker_ns - child[1]) / 1e9:.3f} s BEFORE its own end marker")
-            child_s = (child[1] - _ident_marker_ns(t["end_qpc"], t["qpc_hz"], up=True)) / 1e9   # a LOWER bound: the marker rounds up here
+            marker_up_ns = _ident_marker_ns(t["end_qpc"], t["qpc_hz"], up=True)
+            self.assertLessEqual(child[0], marker_up_ns, f"typed failure, not an exit hold: the child's first statement is {(child[0] - marker_up_ns) / 1e9:.3f} s AFTER its own end marker")   # r2 (adversary A1): start <= marker (start rounds up, so it is compared with the marker rounded up)
+            child_s = (child[1] - marker_up_ns) / 1e9   # a LOWER bound: the marker rounds up here
         kind, figure, reason = _ident_gap_verdict(upper, child_s, self.EXIT_HOLD_LIMIT_S, civil_s)
         if kind == "inconclusive":
             reason += "".join(f" ({note})" for absent, note in ((child is None, getattr(self, "last_child_qpc_note", "")), (civil_s is None, getattr(self, "last_child_exit_note", ""))) if absent and note)
@@ -13148,6 +13150,22 @@ class VenueProbeIdentityCallDeadlineTests(IdentityProbeMixin, unittest.TestCase)
         self.assertIn("typed failure", str(ctx.exception))
         self.assertIn("BEFORE its own end marker", str(ctx.exception))
 
+    def test_r2_adversary_a1_a3_the_rest_of_the_event_order_is_a_typed_failure_too(self) -> None:
+        # adversary A1 on 8afca421: the child's FIRST statement (start 101 s) cannot come after the end marker it printed (100 s)
+        self._set_clocks_from_stamps("1010000000 10000000", "1200000000", 1_000_000_000, 10_000_000, 136 * 10**9)
+        with self.assertRaises(AssertionError) as ctx:
+            self.exit_hold_verdict()
+        self.assertIn("typed failure", str(ctx.exception))
+        self.assertIn("AFTER its own end marker", str(ctx.exception))
+        # adversary A3 (pre-existing sibling of B1): the end marker 0.5 s AFTER the parent saw the process end, with no child stamp at all, is no measurement (it passed the old -1 s tolerance)
+        self._set_clocks(100.0, None, 100.0)
+        self.last_timing = _parse_probe_timing("VENUE_PROBE_INTERNAL_MS=1500 abandoned=1 end_qpc=1005000000 qpc_hz=10000000")
+        self.last_wall_end_ns, self.last_child_qpc = 100 * 10**9, None
+        with self.assertRaises(AssertionError) as ctx:
+            self.exit_hold_verdict()
+        self.assertIn("typed failure", str(ctx.exception))
+        self.assertIn("not the same monotonic clock", str(ctx.exception))
+
     def test_r2_b1_a_child_run_longer_than_the_parents_own_wall_is_a_typed_failure(self) -> None:
         # the wall bounds: a LOWER bound (the child's run) above the UPPER bound (the parent's wall, which contains it) cannot come from one monotonic clock
         with self.assertRaises(AssertionError) as ctx:
@@ -13172,7 +13190,7 @@ class VenueProbeIdentityCallDeadlineTests(IdentityProbeMixin, unittest.TestCase)
         start.write_text("380000000001 2000000000", encoding="ascii")
         end.write_text("500000000000", encoding="ascii")
         self.assertEqual(_ident_read_child_stamps(start, end), ((190_000_000_001, 250_000_000_000), "ok"))
-        self._set_clocks_from_stamps("380000000001 2000000000", "500000000000", 380_000_000_000, 2_000_000_000, 251 * 10**9)
+        self._set_clocks_from_stamps("380000000001 2000000000", "500000000000", 380_000_000_002, 2_000_000_000, 251 * 10**9)   # the marker is just after the child's first statement
         verdicts = {what: (kind, figure) for what, kind, figure, _r in self.timing_verdicts(61.0)}
         self.assertNotEqual(verdicts["wall"][0], "over", f"a 59.9999999995 s child run reported as a {verdicts['wall'][1]!r} s slow-call wait")
         self.assertEqual(verdicts["wall"][0], "inconclusive")
