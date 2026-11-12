@@ -2889,6 +2889,251 @@ function Get-DvVisualMeanAbsDiff {
     @([math]::Round($sums[0] / $px, 3), [math]::Round($sums[1] / $px, 3), [math]::Round($sums[2] / $px, 3))
 }
 
+# VISUAL-GATE-EXPOSURE-FLOOR-1: the gate used to ask only whether the pictures move, tear and match across the A/B arms. A picture that is equally
+# wrong in both arms passed (M16-1457: "visual OK 6/6" at mean luma 6.9/255, 84% near-black). The capture step now MEASURES exposure on the picture
+# area and the verdict flags a leg whose median numbers leave a band. A measurement, not a look: nothing here changes a pixel the app renders.
+$script:ExposureNearBlackLuma = 16      # luma (0..255) under which a pixel is near-black
+$script:ExposureClippedLuma = 235       # luma (0..255) over which a pixel is clipped
+$script:ExposureLetterboxRowMean = 2    # a viewport row whose full-width mean luma is under this is a dark row; dark rows are letterbox only as a symmetric pair of edge bars
+$script:ExposureLetterboxMaxEdgeFraction = 0.25   # ... and at most this fraction of the rows per edge: a deeper bar pair is mostly picture
+# The absolute band used when a clip has no row in exposure-bands.json (or the file is missing / empty / malformed): median mean luma >= 16, median
+# near-black fraction <= 0.60, median clipped fraction <= 0.05. The upper luma limit is the scale's own end, so it never trips by default.
+$script:ExposureFallbackBand = [pscustomobject]@{ minMedianLuma = 16.0; maxMedianLuma = 255.0; maxNearBlackFraction = 0.60; maxClippedFraction = 0.05 }
+$script:ExposureBandsPath = Join-Path $PSScriptRoot 'exposure-bands.json'
+
+function Get-DvExposureMedian {
+    <# The median of a list of frame measurements (the mean of the middle two when the count is even); $null for an empty list. (Not Get-DvMedian: that is the
+       matrix table's helper, which skips missing values; a frame without a measurement is never counted as a zero here either, the caller filters it.) #>
+    param([double[]]$Values = @())
+    $v = @($Values | Sort-Object)
+    if ($v.Count -eq 0) { return $null }
+    $mid = [int][math]::Floor($v.Count / 2)
+    $median = $(if ($v.Count % 2 -eq 1) { [double]$v[$mid] } else { ([double]$v[$mid - 1] + [double]$v[$mid]) / 2.0 })
+    # r4 (adversary 099c3eac A1, 288559f1 A1): the verdict's limits are inclusive, and a median that sits exactly ON one must compare equal to it. Binary floating
+    # point cannot do that unaided: (0.4 + 0.8) / 2.0 is 0.6000000000000001, and the middle two of 389/1920 and 1915/1920 average to 0.6000000000000005 (an
+    # exact 0.6), a luma median of exactly 40 to 39.99999999999998. The median rounds to 12 decimal places, which absorbs that noise (a few 1e-16 on a fraction,
+    # a few 1e-14 on a luma) and keeps every real difference: a limit has at most 6 (fraction) or 4 (luma) places, so a median that is not ON a limit is
+    # at least 1/(2 * pixels * 10^6) from it, far above 1e-12 for any picture the gate measures (a cap of 0.00042 still flags one clipped pixel in 2304).
+    # NaN, infinity and a magnitude outside 1e-12..1e12 (other than zero) stay as they are, so the verdict's 'a median is not a finite number' still fires.
+    if (-not [double]::IsNaN($median) -and -not [double]::IsInfinity($median) -and ($median -eq 0.0 -or ([math]::Abs($median) -ge 1e-12 -and [math]::Abs($median) -le 1e12))) {
+        return [math]::Round($median, 12)
+    }
+    $median
+}
+
+function Get-DvVisualExposureStats {
+    <#
+    .SYNOPSIS
+    The exposure numbers of one frame's picture area (pure): from packed R,G,B bytes (-Width x -Height, the viewport already cut out), the BT.709 mean
+    luma (0..255), the near-black fraction (luma < 16) and the clipped fraction (luma > 235). A letterbox is a run of dark rows (full-width mean luma
+    under 2) at BOTH the top and the bottom edge: the matching depth of the two runs, at most a quarter of the rows per edge, is left out
+    (letterboxRowsDropped). Every other dark row is picture: a dark band in the middle, a dark run at only one edge, or the part of a deeper bar beyond
+    the cap is a crushed picture (r2, fable B1 / Dot 796-I1: dropping every dark row wherever it sat measured a banded dark frame on its bright rows
+    only and read it OK). When EVERY row is that dark the picture itself is black, so all rows are measured (a black frame must read as black, never as
+    "no picture to judge"). Returns $null for an empty or mis-sized array. The numbers are NOT rounded: the
+    verdict compares them to a band whose caps are the owner's to choose (a cap of 0.00042 must flag one clipped pixel in 2304), so only the
+    reason text rounds, for display.
+    #>
+    param([Parameter(Mandatory)][byte[]]$Rgb, [Parameter(Mandatory)][int]$Width, [Parameter(Mandatory)][int]$Height)
+    if ($Width -le 0 -or $Height -le 0 -or $Rgb.Length -ne $Width * $Height * 3) { return $null }
+    # r3 (adversary 6256c193 A2): luma is held in whole ten-thousandths (2126 R + 7152 G + 722 B, the BT.709 weights x 10000), so every threshold compare is
+    # EXACT integer arithmetic. In floating point a row whose true mean is exactly 2 summed to 1.9999999999999996, read as a dark bar and was dropped, and
+    # a pixel of luma exactly 16 or 235 could fall either side of its own limit.
+    $scale = 10000L
+    $rowSum = [long[]]::new($Height)
+    $luma = [long[]]::new($Width * $Height)
+    for ($y = 0; $y -lt $Height; $y++) {
+        [long]$sumRow = 0
+        for ($x = 0; $x -lt $Width; $x++) {
+            $i = ($y * $Width + $x) * 3
+            [long]$l = 2126L * $Rgb[$i] + 7152L * $Rgb[$i + 1] + 722L * $Rgb[$i + 2]
+            $luma[$y * $Width + $x] = $l; $sumRow += $l
+        }
+        $rowSum[$y] = $sumRow
+    }
+    # a row is dark when its full-width mean is under the limit: rowSum / (Width * scale) < limit  <=>  rowSum < limit * Width * scale
+    $darkBelow = [long]$script:ExposureLetterboxRowMean * $Width * $scale
+    $top = 0
+    while ($top -lt $Height -and $rowSum[$top] -lt $darkBelow) { $top++ }
+    $drop = 0
+    if ($top -lt $Height) {   # (an all-dark frame is a black picture: nothing is a bar)
+        $bottom = 0
+        while ($rowSum[$Height - 1 - $bottom] -lt $darkBelow) { $bottom++ }   # ($top < $Height, so a bright row ends this walk)
+        $drop = [math]::Min([math]::Min($top, $bottom), [int][math]::Floor($Height * $script:ExposureLetterboxMaxEdgeFraction))
+    }
+    $keep = @($drop..($Height - 1 - $drop))
+    [long]$sum = 0; $nearBlack = 0; $clipped = 0
+    $nearBlackBelow = [long]$script:ExposureNearBlackLuma * $scale; $clippedAbove = [long]$script:ExposureClippedLuma * $scale
+    foreach ($y in $keep) {
+        for ($x = 0; $x -lt $Width; $x++) {
+            $l = $luma[$y * $Width + $x]
+            $sum += $l
+            if ($l -lt $nearBlackBelow) { $nearBlack++ }
+            if ($l -gt $clippedAbove) { $clipped++ }
+        }
+    }
+    $n = $keep.Count * $Width
+    [pscustomobject]@{
+        lumaMean = [double]$sum / ([double]$n * $scale); nearBlackFraction = $nearBlack / $n; clippedFraction = $clipped / $n
+        rows = $Height; letterboxRowsDropped = $Height - $keep.Count
+    }
+}
+
+function Test-DvOrdinalEqual($A, $B) {
+    # exact (code-unit) string equality: PowerShell's -ceq is a culture comparison that ignores embedded NULs and zero-width characters
+    [string]::Equals([string]$A, [string]$B, [System.StringComparison]::Ordinal)
+}
+
+function Get-DvJsonRepeatedKey($Element) {
+    # the first property name (ordinal) that a System.Text.Json object element gives twice, else $null
+    $seen = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::Ordinal)
+    foreach ($p in $Element.EnumerateObject()) { if (-not $seen.Add([string]$p.Name)) { return [string]$p.Name } }
+    $null
+}
+
+function ConvertTo-DvExposureLimit($Element, [double]$Min, [double]$Max, [int]$MaxPlaces = 6) {
+    # -MaxPlaces: the most decimal places a limit may carry (r3, adversary c9ac4917 A1/A2). A measurement is a ratio of whole numbers (pixel counts over at most
+    # 64 x 36 = 2304 pixels, a luma sum over 10000ths of that, medians of two such): it is a double rounded from that ratio, so a limit finer than the
+    # measurement can resolve (0.00043402777777777775 against 1/2304, 100.00043402777777 against a luma mean) rounds to the SAME double as an outside
+    # measurement and reads in band. A limit of at most 6 places (fractions) or 4 (luma) differs from every possible measurement by far more than a double's
+    # rounding (>= 2.2e-10 and >= 2.2e-12 against errors under 1e-13), so a tie in doubles is a tie in the numbers. Finer is refused, never rounded.
+    # a System.Text.Json element that is a real JSON number inside [Min, Max] -> that double; anything else (a string "16", a bool, null, out of range) -> $null
+    if ($Element.ValueKind -ne [System.Text.Json.JsonValueKind]::Number) { return $null }
+    $d = 0.0
+    if (-not $Element.TryGetDouble([ref]$d)) { return $null }
+    # (IsNegative, not "-lt 0": TryGetDouble reads -1e-400 as -0.0, which is not under 0 but is a negative limit; adversary fc152c48 A1)
+    if ([double]::IsNaN($d) -or [double]::IsInfinity($d) -or [double]::IsNegative($d) -or $d -lt $Min -or $d -gt $Max) { return $null }
+    # r3 (adversary 6256c193 A1): the double must carry EXACTLY what the file says. TryGetDouble rounds 1.0000000000000001 to 1.0 (in range) and
+    # 16.000000000000001 to 16.0 (so min <= max held), though the file states a value above its maximum; a limit whose double reads back as another number
+    # is refused, never silently rounded into range. (The shortest round-trip text of the double names the same number as the file's text, or it is refused.)
+    $rawKey = ConvertTo-DvDecimalKey $Element.GetRawText()
+    if ($rawKey -cne (ConvertTo-DvDecimalKey $d.ToString('R', [System.Globalization.CultureInfo]::InvariantCulture))) { return $null }
+    # ...and carry no more places than a measurement can resolve (a key is "sign+digits|exponent": a negative exponent counts places)
+    $exponent = [System.Numerics.BigInteger]::Parse($rawKey.Split('|')[1], [System.Globalization.CultureInfo]::InvariantCulture)
+    if ($exponent -lt -$MaxPlaces) { return $null }
+    $d
+}
+
+function ConvertTo-DvDecimalKey([string]$Text) {
+    # the exact value of a JSON / .NET number literal ([-]digits[.digits][e[+-]digits]) as a normalised "sign+digits|exponent" key (no leading or trailing zeros in the
+    # digits, so 1.0, 1 and 10e-1 are one key); $null when it is not such a literal. Pure string and BigInteger arithmetic: no rounding anywhere.
+    $m = [regex]::Match($Text, '^(-?)([0-9]+)(?:\.([0-9]+))?(?:[eE]([+-]?[0-9]+))?$')
+    if (-not $m.Success) { return $null }
+    $fraction = $m.Groups[3].Value
+    $exponent = [System.Numerics.BigInteger]::Zero
+    if ($m.Groups[4].Success) { $exponent = [System.Numerics.BigInteger]::Parse($m.Groups[4].Value, [System.Globalization.CultureInfo]::InvariantCulture) }
+    $exponent = $exponent - $fraction.Length
+    $digits = ($m.Groups[2].Value + $fraction).TrimStart('0')
+    if ($digits.Length -eq 0) { return '0|0' }
+    $trimmed = $digits.TrimEnd('0')
+    $exponent = $exponent + ($digits.Length - $trimmed.Length)
+    "$($m.Groups[1].Value)$trimmed|$exponent"
+}
+
+function ConvertTo-DvExposureRow($Row, $Fallback) {
+    # one clip row (a System.Text.Json element) -> [pscustomobject]@{ band; why }: band is the row's band with a left-out field taking the fallback's value,
+    # why is $null; or band is $null and why says what is wrong with the row (not an object, a repeated or unknown field, an unusable value, none of the
+    # four fields, min above max)
+    $fail = { param($why) [pscustomobject]@{ band = $null; why = $why } }
+    if ($Row.ValueKind -ne [System.Text.Json.JsonValueKind]::Object) { return (& $fail 'not an object') }
+    $repeated = Get-DvJsonRepeatedKey $Row
+    if ($null -ne $repeated) { return (& $fail "the row repeats the field '$repeated'") }
+    $limits = [ordered]@{ minMedianLuma = @(0.0, 255.0, 4); maxMedianLuma = @(0.0, 255.0, 4); maxNearBlackFraction = @(0.0, 1.0, 6); maxClippedFraction = @(0.0, 1.0, 6) }   # (range min, range max, most decimal places)
+    # a field this gate does not know (a misspelt cap beside a valid one) must not silently take the fallback's value (names compare ordinally)
+    foreach ($property in $Row.EnumerateObject()) {
+        if (@($limits.Keys | Where-Object { Test-DvOrdinalEqual $_ $property.Name }).Count -eq 0) { return (& $fail "the row has the unknown field '$($property.Name)'") }
+    }
+    $band = [ordered]@{}; $named = 0
+    foreach ($name in $limits.Keys) {
+        $fields = @($Row.EnumerateObject() | Where-Object { Test-DvOrdinalEqual $_.Name $name })
+        if ($fields.Count -eq 0) { $band[$name] = $Fallback.$name; continue }
+        $value = ConvertTo-DvExposureLimit $fields[0].Value $limits[$name][0] $limits[$name][1] $limits[$name][2]
+        if ($null -eq $value) { return (& $fail "$name must be a number in $($limits[$name][0])..$($limits[$name][1]) with at most $($limits[$name][2]) decimal places") }
+        $band[$name] = [double]$value; $named++
+    }
+    if ($named -eq 0) { return (& $fail 'it names none of minMedianLuma, maxMedianLuma, maxNearBlackFraction, maxClippedFraction') }
+    if ($band.minMedianLuma -gt $band.maxMedianLuma) { return (& $fail 'minMedianLuma is above maxMedianLuma') }
+    [pscustomobject]@{ band = [pscustomobject]$band; why = $null }
+}
+
+function Get-DvExposureBand {
+    <#
+    .SYNOPSIS
+    The exposure band a clip's legs are judged against: its row in exposure-bands.json, else the absolute fallback band. Returns
+    [pscustomobject]@{ band; source; note }. source: clip (the clip's row) | fallback-no-row (the file is valid and has no row for the clip, or no clip
+    id was given) | fallback-empty (the file is empty) | fallback-missing (absent, or gone after it was found) | fallback-unreadable (it exists but cannot be
+    probed or read: access denied, locked, an unusable path; r3, sol r2 B1: never an escaped exception under $ErrorActionPreference = 'Stop') | fallback-malformed
+    (read, but not a usable band file). note is $null unless the file could not be used (missing, unreadable, empty or malformed): that is REPORTED, never a silent OK. A row names any of minMedianLuma, maxMedianLuma, maxNearBlackFraction,
+    maxClippedFraction and nothing else; a field it leaves out takes the fallback's value. A row with an unusable field (not a number, out of range, min
+    above max), a field it repeats or does not know, or with none of the four, is malformed and the fallback band judges instead. Clip ids match exactly
+    (case-sensitive). r2 (sol B1, Dot 796-D1): the file is validated WHOLE, every row, before any row is selected (and whether or not the clip has one):
+    a malformed row anywhere makes the file malformed, so a relaxed row can never be picked from a file that has an ambiguous row beside it.
+    #>
+    param([string]$ClipId, [string]$Path = $script:ExposureBandsPath)
+    # r5 (adversary 288559f1/a7424c18 A1): a FRESH band per call, copied field by field from the constant. Handing back the script-scope object itself let a
+    # caller that edited one result's .band (a floor of 0, a ceiling of 255) change the fallback every later clip is judged against. A row from the file is
+    # already built per call (ConvertTo-DvExposureRow); every fallback-* result below returns this copy, never the constant.
+    $fallback = [pscustomobject]@{
+        minMedianLuma = [double]$script:ExposureFallbackBand.minMedianLuma; maxMedianLuma = [double]$script:ExposureFallbackBand.maxMedianLuma
+        maxNearBlackFraction = [double]$script:ExposureFallbackBand.maxNearBlackFraction; maxClippedFraction = [double]$script:ExposureFallbackBand.maxClippedFraction
+    }
+    $result ={ param($source, $note, $band) [pscustomobject]@{ band = $band; source = $source; note = $note } }
+    $unreadable = { param($e) (& $result 'fallback-unreadable' "the exposure band file cannot be read ($($e.GetType().Name)): the absolute fallback band judges" $fallback) }
+    if ([string]::IsNullOrWhiteSpace($Path)) {
+        return (& $result 'fallback-missing' "the exposure band file is missing ($Path): the absolute fallback band judges" $fallback)
+    }
+    # r3 (sol r2 B1): the existence probe is inside the guard. The runner runs under $ErrorActionPreference = 'Stop', where Test-Path throws on a path it cannot
+    # check (access denied, an embedded NUL, ...): that escaped this function, so the measured leg ended as RUNNER_ERROR instead of the reported fallback.
+    try { $isFile = [bool](Test-Path -LiteralPath $Path -PathType Leaf -ErrorAction Stop) } catch { return (& $unreadable $_.Exception) }
+    if (-not $isFile) {
+        return (& $result 'fallback-missing' "the exposure band file is missing ($Path): the absolute fallback band judges" $fallback)
+    }
+    # a relative path resolves the way Test-Path just did (against the PowerShell location), not against the process directory ReadAllText uses (adversary fc152c48 A2)
+    try { $Path = (Resolve-Path -LiteralPath $Path -ErrorAction Stop).ProviderPath; $text = [IO.File]::ReadAllText($Path) } catch {
+        # r3 (fable N1): a file that went away between the probe and the read is missing (not malformed); one that exists but cannot be read (access denied, locked) is unreadable
+        $e = $_.Exception
+        # (PowerShell wraps a .NET method's exception in a MethodInvocationException: the real cause is inside)
+        while ($e -is [System.Management.Automation.MethodInvocationException] -and $null -ne $e.InnerException) { $e = $e.InnerException }
+        if ($e -is [System.Management.Automation.ItemNotFoundException] -or $e -is [System.IO.FileNotFoundException] -or $e -is [System.IO.DirectoryNotFoundException]) {
+            return (& $result 'fallback-missing' "the exposure band file is missing ($Path; it went away after it was found): the absolute fallback band judges" $fallback)
+        }
+        return (& $unreadable $e)
+    }
+    if ([string]::IsNullOrWhiteSpace($text)) { return (& $result 'fallback-empty' "the exposure band file is empty ($Path): the absolute fallback band judges" $fallback) }
+    # System.Text.Json, not ConvertFrom-Json: that unwraps a one-element array root ([{"clips": ...}] reads as the object, so a non-object file would pick a
+    # row), and rejects keys that differ only in case ({"M16-1457": ..., "m16-1457": ...} is valid JSON and clip ids match exactly)
+    $json = $null
+    try { $json = [System.Text.Json.JsonDocument]::Parse($text) } catch { return (& $result 'fallback-malformed' 'the exposure band file is not valid JSON: the absolute fallback band judges' $fallback) }
+    try {
+        $root = $json.RootElement
+        $bad = { param($why) (& $result 'fallback-malformed' "the exposure band file is unusable ($why): the absolute fallback band judges" $fallback) }
+        if ($root.ValueKind -ne [System.Text.Json.JsonValueKind]::Object) { return (& $bad 'the root is not a JSON object') }
+        # (names are compared ORDINALLY, never with -ceq: that is a culture comparison, and "M16-1457<NUL>" -ceq "M16-1457" is true)
+        # a key given twice at the root or in clips is ambiguous whatever its name: the file is malformed, not "the first one" and not "the other rows"
+        $repeated = Get-DvJsonRepeatedKey $root
+        if ($null -ne $repeated) { return (& $bad "the root repeats the key '$repeated'") }
+        $clipsProps = @($root.EnumerateObject() | Where-Object { Test-DvOrdinalEqual $_.Name 'clips' })
+        if ($clipsProps.Count -eq 0) { return (& $result 'fallback-no-row' $null $fallback) }
+        $clips = $clipsProps[0].Value
+        if ($clips.ValueKind -eq [System.Text.Json.JsonValueKind]::Null) { return (& $result 'fallback-no-row' $null $fallback) }
+        if ($clips.ValueKind -ne [System.Text.Json.JsonValueKind]::Object) { return (& $bad 'clips is not a JSON object') }
+        $repeated = Get-DvJsonRepeatedKey $clips
+        if ($null -ne $repeated) { return (& $bad "clips repeats the clip id '$repeated'") }
+        # every row is checked BEFORE one is chosen (and also when the clip has none): a malformed row anywhere is a malformed file
+        $selected = $null
+        foreach ($rowProperty in $clips.EnumerateObject()) {
+            $parsed = ConvertTo-DvExposureRow $rowProperty.Value $fallback
+            if ($null -ne $parsed.why) { return (& $bad "the row for clip '$($rowProperty.Name)' is malformed: $($parsed.why)") }
+            if (-not [string]::IsNullOrWhiteSpace($ClipId) -and (Test-DvOrdinalEqual $rowProperty.Name $ClipId)) { $selected = $parsed.band }
+        }
+        if ($null -eq $selected) { return (& $result 'fallback-no-row' $null $fallback) }
+        & $result 'clip' $null $selected
+    } catch {
+        # a document the walk above cannot read (a key that is not valid text, say) is malformed, never a throw that ends the leg
+        return (& $result 'fallback-malformed' "the exposure band file cannot be read ($($_.Exception.GetType().Name)): the absolute fallback band judges" $fallback)
+    } finally { $json.Dispose() }
+}
+
 function Get-DvVisualVerdict {
     <#
     .SYNOPSIS
@@ -2914,11 +3159,17 @@ function Get-DvVisualVerdict {
     before them while the app's label advanced (-RepeatedPlayFrames) AND the source frames are known to differ: the display's own paint stopped
     landing for part of the tail. Counted and surfaced, never OK; the whole-tail FROZEN_DISPLAY outranks it. Over an unknown source a repeat may be
     the source's own picture, so it stays a note on an OK block (the reader's repeatedPlayFramesNote); one repeat alone is OK.
+    VISUAL-GATE-EXPOSURE-FLOOR-1: EXPOSURE_OUT_OF_RANGE -- the leg's MEDIAN picture-area mean luma, near-black fraction or clipped fraction (-ExposureMedianLuma,
+    -ExposureMedianNearBlackFraction, -ExposureMedianClippedFraction; Get-DvVisualExposureStats) is outside -ExposureBand (Get-DvExposureBand: the clip's row,
+    else the absolute fallback band). Counted and surfaced like VISUAL_DIVERGENCE, never an exclusion, and judged after every other verdict: a picture that
+    is equally wrong in both A/B arms (M16-1457: mean luma 6.9/255, 84% near-black) used to be a plain OK. The reason quotes the three numbers and the band
+    limits they broke. Without -ExposureBand, or without the three medians, nothing is judged on exposure and every verdict is what it was.
     #>
     param([bool]$Requested, [bool]$Captured, [int]$PlayFrames, [int]$DistinctContentHashes, [int]$AppDistinctDisplayFrames, [int]$FlatPlayFrames,
           $PlayVsPausedMeanAbsDiff, [bool]$SamePosition, [double]$Threshold = $script:VisualDivergenceThreshold,
           [ValidateSet('known-differ', 'known-identical', 'unknown')][string]$SourceDifference = 'unknown', [int]$ViewportUnavailablePlayFrames = 0, $LabelBound = $null,
-          $PausedLabelBound = $null, [int]$ObserverPaintedPlayFrames = 0, [int]$RepeatedPlayFrames = 0)
+          $PausedLabelBound = $null, [int]$ObserverPaintedPlayFrames = 0, [int]$RepeatedPlayFrames = 0,
+          $ExposureMedianLuma = $null, $ExposureMedianNearBlackFraction = $null, $ExposureMedianClippedFraction = $null, $ExposureBand = $null, [string]$ExposureBandSource = '')
     if (-not $Requested) { return [pscustomobject]@{ verdict = 'NOT_REQUESTED'; counted = $true; reason = 'the leg spec opts out of window captures' } }
     if ($ViewportUnavailablePlayFrames -gt 0 -and $PlayFrames -lt 2) { return [pscustomobject]@{ verdict = 'VISUAL_ASSESSMENT_UNAVAILABLE'; counted = $true; reason = "$ViewportUnavailablePlayFrames play frame(s) have no usable viewport rectangle (visual.json), leaving $PlayFrames judged, so the picture cannot be told from the window's timecode and chrome: no visual assessment" } }
     if ($ObserverPaintedPlayFrames -gt 0 -and $PlayFrames -lt 2) { return [pscustomobject]@{ verdict = 'VISUAL_ASSESSMENT_UNAVAILABLE'; counted = $true; reason = "$ObserverPaintedPlayFrames unforced play frame(s) were taken after a forced paint their predecessor did not see, or do not record how many forced paints preceded them (forced_paints_before), leaving $PlayFrames judged: a forced paint stays on screen when the display's own paint is stuck, so those pictures cannot tell a moving display from a frozen one: no visual assessment" } }
@@ -2943,6 +3194,24 @@ function Get-DvVisualVerdict {
     }
     # one picture over source frames the app itself records as identical: the frozen check was waived on its word, so the receipt says so
     $waivedReason = $(if ($DistinctContentHashes -eq 1 -and $AppDistinctDisplayFrames -gt 1 -and $SourceDifference -ceq 'known-identical') { 'one picture; the app records the source frames as identical: a static clip' } else { $null })
+    # VISUAL-GATE-EXPOSURE-FLOOR-1: last, so every other verdict keeps its precedence; counted, a flag and never an exclusion
+    if ($null -ne $ExposureBand -and $null -ne $ExposureMedianLuma -and $null -ne $ExposureMedianNearBlackFraction -and $null -ne $ExposureMedianClippedFraction) {
+        # compared UNROUNDED; the reason rounds to 6 places for display (a median 0.000434 against a cap of 0.00042 is over, and reads as 0.000434)
+        $show = { param($n) ([double]$n).ToString('0.######', [System.Globalization.CultureInfo]::InvariantCulture) }
+        $lumaMedian = [double]$ExposureMedianLuma; $nearBlackMedian = [double]$ExposureMedianNearBlackFraction; $clippedMedian = [double]$ExposureMedianClippedFraction
+        $notNumbers = @($lumaMedian, $nearBlackMedian, $clippedMedian | Where-Object { [double]::IsNaN($_) -or [double]::IsInfinity($_) })
+        $broken = @(
+            if ($notNumbers.Count -gt 0) { 'a median is not a finite number' }
+            if ($lumaMedian -lt [double]$ExposureBand.minMedianLuma) { "median luma $(& $show $lumaMedian) is under the band minimum $(& $show $ExposureBand.minMedianLuma)" }
+            if ($lumaMedian -gt [double]$ExposureBand.maxMedianLuma) { "median luma $(& $show $lumaMedian) is over the band maximum $(& $show $ExposureBand.maxMedianLuma)" }
+            if ($nearBlackMedian -gt [double]$ExposureBand.maxNearBlackFraction) { "median near-black fraction $(& $show $nearBlackMedian) is over the band maximum $(& $show $ExposureBand.maxNearBlackFraction)" }
+            if ($clippedMedian -gt [double]$ExposureBand.maxClippedFraction) { "median clipped fraction $(& $show $clippedMedian) is over the band maximum $(& $show $ExposureBand.maxClippedFraction)" })
+        if ($broken.Count -gt 0) {
+            $bandSource = $(if ($ExposureBandSource) { " [band: $ExposureBandSource]" } else { '' })
+            $exposureReason = "the picture area is outside its exposure band over the $PlayFrames judged play frames (median luma $(& $show $lumaMedian)/255, near-black fraction $(& $show $nearBlackMedian), clipped fraction $(& $show $clippedMedian); band luma $(& $show $ExposureBand.minMedianLuma)..$(& $show $ExposureBand.maxMedianLuma), near-black <= $(& $show $ExposureBand.maxNearBlackFraction), clipped <= $(& $show $ExposureBand.maxClippedFraction))${bandSource}: $($broken -join '; ')"
+            return [pscustomobject]@{ verdict = 'EXPOSURE_OUT_OF_RANGE'; counted = $true; reason = $(if ($waivedReason) { "$exposureReason; $waivedReason" } else { $exposureReason }) }
+        }
+    }
     [pscustomobject]@{ verdict = 'OK'; counted = $true; reason = $waivedReason }
 }
 
@@ -3070,7 +3339,8 @@ function Read-DvVisualCaptures {
     and only it reaches the gate's -RepeatedPlayFrames. A pair with equal ids is not a repeat; one with a missing id is counted, never decisive.
     Never throws for a missing or broken capture: the block says what is missing (a capture is evidence about the leg, not the leg itself).
     #>
-    param([bool]$Requested, [string]$OptOutReason, [string]$ArtifactsDir, [string]$EvidenceDir, [Parameter(Mandatory)][string]$LegId, [string]$Header = '')
+    param([bool]$Requested, [string]$OptOutReason, [string]$ArtifactsDir, [string]$EvidenceDir, [Parameter(Mandatory)][string]$LegId, [string]$Header = '',
+          [string]$ClipId = '', [string]$ExposureBandPath = $script:ExposureBandsPath)
     $block = [ordered]@{
         schema = $script:VisualSchema; requested = $Requested; optOutReason = $(if ($Requested) { $null } else { $OptOutReason })
         method = $null; forwarded = $null; probe = $null; probeReason = $null; captured = $false
@@ -3084,6 +3354,8 @@ function Read-DvVisualCaptures {
         frozenJudgedOn = 'play'; forcedPlayDistinctContentHashes = $null
         observerPaintedPlayFrames = $null; stopUnboundObserverClean = $null; repeatedPlayFrames = $null; repeatedPlayFramesSourceDiffer = $null; repeatedPlayFramesNote = $null
         tailBeginUtc = $null; tailEndUtc = $null; presentMonWindowEndUtc = $null
+        exposureFrames = 0; exposureMedianLuma = $null; exposureMedianNearBlackFraction = $null; exposureMedianClippedFraction = $null
+        exposureBand = $null; exposureBandSource = $null; exposureBandNote = $null
         stripPath = $null; stripSha256 = $null; stripCopyPath = $null
         verdict = $null; counted = $true; reason = $null; appError = $null
     }
@@ -3094,20 +3366,27 @@ function Read-DvVisualCaptures {
     $repeatNote = $null      # set when judged unforced captures repeat their predecessor's picture while the label advanced; kept the same way
     $stripNote = $null      # set when the strip cannot be composed; kept the same way, after the not-judged note
     $reasonBeforeStrip = $null   # the step reason standing when the strip failed (a NOT_CAPTURED leg keeps it between the capture count and the strip failure)
+    $exposureNote = $null    # set when the exposure band file could not be used (missing / malformed): reported beside the verdict, never silently OK
+    # the exposure inputs of the verdict, read from the block when the verdict is taken (all $null until the judged frames are measured)
+    $exposureArgs = { @{ ExposureMedianLuma = $block.exposureMedianLuma; ExposureMedianNearBlackFraction = $block.exposureMedianNearBlackFraction
+                         ExposureMedianClippedFraction = $block.exposureMedianClippedFraction; ExposureBand = $block.exposureBand; ExposureBandSource = [string]$block.exposureBandSource } }
     $finish = {
+        $exArgs = & $exposureArgs
         $v = Get-DvVisualVerdict -Requested $Requested -Captured ([bool]$block.captured) -PlayFrames ([int]$block.playFrames) -DistinctContentHashes ([int]$block.distinctContentHashes) `
             -AppDistinctDisplayFrames ([int]$block.appDistinctDisplayFrames) -FlatPlayFrames ([int]$block.flatPlayFrames) -PlayVsPausedMeanAbsDiff $block.playVsPausedMeanAbsDiff -SamePosition ([bool]$block.samePosition) `
             -SourceDifference ([string]$block.sourceDifference) -ViewportUnavailablePlayFrames ([int]$block.viewportUnavailablePlayFrames) -LabelBound $block.labelBound `
-            -PausedLabelBound $block.pausedLabelBound -ObserverPaintedPlayFrames ([int]$block.observerPaintedPlayFrames) -RepeatedPlayFrames ([int]$block.repeatedPlayFramesSourceDiffer)
+            -PausedLabelBound $block.pausedLabelBound -ObserverPaintedPlayFrames ([int]$block.observerPaintedPlayFrames) -RepeatedPlayFrames ([int]$block.repeatedPlayFramesSourceDiffer) @exArgs
         # a gate reason replaces a step's reason, except that a NOT_CAPTURED leg keeps the step that says WHY nothing was captured
         # (the verdict reason comes first, then the notes that some saved play frames were not judged, then the masking and repeat notes, then the strip failure;
         # a PARTIAL_FREEZE reason already says what the repeat note says, so the note stays in repeatedPlayFramesNote only)
         # PLAYBACK-SOURCE-FRAME-IDENTITY-1: the source-difference cross-check note follows the not-judged note.
-        $notes = (@($notJudgedNote, $crossCheckNote, $observerNote, $maskNote, $(if ($v.verdict -cne 'PARTIAL_FREEZE') { $repeatNote }), $stripNote) | Where-Object { $_ }) -join '; '
+        $notes = (@($notJudgedNote, $crossCheckNote, $observerNote, $maskNote, $(if ($v.verdict -cne 'PARTIAL_FREEZE') { $repeatNote }), $exposureNote, $stripNote) | Where-Object { $_ }) -join '; '
         # a NOT_CAPTURED leg whose strip also failed keeps both: the capture count, any step reason from before the strip, then the strip failure
         if ($v.verdict -ceq 'NOT_CAPTURED' -and $stripNote) { $block.reason = (@($v.reason, $reasonBeforeStrip, $stripNote) | Where-Object { $_ }) -join '; ' }
         elseif ($null -ne $v.reason -and -not ($v.verdict -ceq 'NOT_CAPTURED' -and $null -ne $block.reason)) { $block.reason = $(if ($notes) { "$($v.reason); $notes" } else { $v.reason }) }
         elseif ($null -eq $v.reason -and $crossCheckNote -and (-not $block.reason -or $block.reason -ceq $notJudgedNote)) { $block.reason = (@($notJudgedNote, $crossCheckNote) | Where-Object { $_ }) -join '; ' }   # no gate reason: the cross-check note stands beside the not-judged note
+        # an unusable exposure band file is always said in the reason, beside whatever note or verdict reason is already there (the first-wins rule above would drop it)
+        if ($exposureNote -and -not ([string]$block.reason).Contains($exposureNote)) { $block.reason = (@($block.reason, $exposureNote) | Where-Object { $_ }) -join '; ' }
         $block.verdict = $v.verdict; $block.counted = $v.counted
         $block
     }
@@ -3150,6 +3429,7 @@ function Read-DvVisualCaptures {
         $isPlayKind = $kind -cin @('play', 'play_unbound')
         $legName = $(if ($isPlayKind) { "$LegId-$($kind.Replace('_', '-'))-$index.png" } else { "$LegId-$($kind.Replace('_', '-')).png" })
         $entry = [ordered]@{ kind = $kind; index = $index; file = $legName; sha256 = $null; contentHash = $null; viewportMean = $null; viewportStd = $null; viewportAvailable = $true
+                             exposureLumaMean = $null; exposureNearBlackFraction = $null; exposureClippedFraction = $null; exposureLetterboxRowsDropped = $null
                              displayFrame = Get-DvProp $f 'display_frame'; playActive = Get-DvProp $f 'play_active'; tailElapsedMs = Get-DvProp $f 'tail_elapsed_ms'
                              captureMs = Get-DvProp $f 'capture_ms'; viewport = Get-DvProp $f 'viewport'; saved = [bool](Get-DvProp $f 'saved'); appReason = Get-DvProp $f 'reason'
                              serial = Get-DvProp $f 'serial'; paintedSerial = Get-DvProp $f 'painted_serial'; paintedSerialValid = Get-DvProp $f 'painted_serial_valid'
@@ -3165,6 +3445,12 @@ function Read-DvVisualCaptures {
                 if ($null -eq $hashPx) { $entry.viewportAvailable = $false }   # no usable viewport rectangle: the whole window is never hashed in its place
                 else {
                     $entry.contentHash = $hashPx.contentHash; $entry.viewportMean = $hashPx.mean; $entry.viewportStd = $hashPx.std
+                    # VISUAL-GATE-EXPOSURE-FLOOR-1: the picture-area exposure of the same viewport pixels the picture is hashed on
+                    $exposure = Get-DvVisualExposureStats -Rgb $hashPx.rgb -Width $script:VisualHashSize[0] -Height $script:VisualHashSize[1]
+                    if ($null -ne $exposure) {
+                        $entry.exposureLumaMean = $exposure.lumaMean; $entry.exposureNearBlackFraction = $exposure.nearBlackFraction
+                        $entry.exposureClippedFraction = $exposure.clippedFraction; $entry.exposureLetterboxRowsDropped = $exposure.letterboxRowsDropped
+                    }
                     if (-not $isPlayKind) { $pixels[$kind] = (Get-DvVisualViewportPixels -Path $local -Viewport $entry.viewport -Width $script:VisualDiffSize[0] -Height $script:VisualDiffSize[1] -RequireViewport).rgb }
                 }
             } catch { $entry.appReason = "the runner could not read the image: $($_.Exception.GetType().Name)" }
@@ -3236,6 +3522,20 @@ function Read-DvVisualCaptures {
     # r5 (sol r3 key class sweep): the same display frames reach here; a value that is not a frame number (Get-DvFrameNumber) is not counted, never a throw
     $block.appDistinctDisplayFrames = @($play | ForEach-Object { Get-DvFrameNumber $_.displayFrame } | Where-Object { $null -ne $_ } | Sort-Object -Unique).Count
     $block.flatPlayFrames = @($play | Where-Object { $null -ne $_.viewportStd -and [double]$_.viewportStd -lt $script:VisualFlatViewportStd }).Count
+    # VISUAL-GATE-EXPOSURE-FLOOR-1: the leg's exposure is the MEDIAN over the judged play frames (the same population as the picture), judged against the
+    # clip's band (exposure-bands.json) or the absolute fallback. An unusable band file is reported (exposureBandNote, and the reason), never a silent OK.
+    $measured = @($play | Where-Object { $null -ne $_.exposureLumaMean })
+    if ($measured.Count -gt 0) {
+        $block.exposureFrames = $measured.Count
+        # (unrounded: the verdict compares these to the band's caps; the reason text rounds for display)
+        $block.exposureMedianLuma = Get-DvExposureMedian ([double[]]@($measured | ForEach-Object { [double]$_.exposureLumaMean }))
+        $block.exposureMedianNearBlackFraction = Get-DvExposureMedian ([double[]]@($measured | ForEach-Object { [double]$_.exposureNearBlackFraction }))
+        $block.exposureMedianClippedFraction = Get-DvExposureMedian ([double[]]@($measured | ForEach-Object { [double]$_.exposureClippedFraction }))
+        $bandInfo = Get-DvExposureBand -ClipId $ClipId -Path $ExposureBandPath
+        $block.exposureBand = $bandInfo.band; $block.exposureBandSource = $bandInfo.source; $block.exposureBandNote = $bandInfo.note
+        # (never pre-set as block.reason, r2 fable H2: that displaced a NOT_CAPTURED verdict's own reason; the finish clause appends it to every reason)
+        if ($bandInfo.note) { $exposureNote = $bandInfo.note }
+    }
     if ($judgeKind -ceq 'play_unbound' -and $block.distinctContentHashes -eq 1 -and [int]$block.forcedPlayDistinctContentHashes -gt 1) {
         $maskNote = "the forced play captures show $($block.forcedPlayDistinctContentHashes) distinct pictures where the unforced ones show one: the force-paint would have masked this"
         if (-not $block.reason) { $block.reason = $maskNote }
@@ -3292,11 +3592,12 @@ function Read-DvVisualCaptures {
                    elseif ($_.kind -ceq 'stop') { "paused instant  f=$($_.displayFrame)$(if ($null -ne $_.labelBound) { "  bound=$([bool]$_.labelBound)" })" } else { "paused full quality  f=$($block.pausedFrame)" })
         [pscustomobject]@{ path = $(if ($_.sha256) { Join-Path $dir $_.file } else { $null }); viewport = $_.viewport; label = $label } })
     if ($tiles.Count -gt 0) {
+        $exArgs = & $exposureArgs
         $v = Get-DvVisualVerdict -Requested $true -Captured ([bool]$block.captured) -PlayFrames ([int]$block.playFrames) -DistinctContentHashes ([int]$block.distinctContentHashes) `
             -AppDistinctDisplayFrames ([int]$block.appDistinctDisplayFrames) -FlatPlayFrames ([int]$block.flatPlayFrames) -PlayVsPausedMeanAbsDiff $block.playVsPausedMeanAbsDiff -SamePosition ([bool]$block.samePosition) `
             -SourceDifference ([string]$block.sourceDifference) -ViewportUnavailablePlayFrames ([int]$block.viewportUnavailablePlayFrames) -LabelBound $block.labelBound `
-            -PausedLabelBound $block.pausedLabelBound -ObserverPaintedPlayFrames ([int]$block.observerPaintedPlayFrames) -RepeatedPlayFrames ([int]$block.repeatedPlayFramesSourceDiffer)
-        $head ="$Header  visual=$($v.verdict)  distinct=$($block.distinctContentHashes)/$($block.playFrames)  play-vs-paused=$($block.playVsPausedMeanAbsDiff)"
+            -PausedLabelBound $block.pausedLabelBound -ObserverPaintedPlayFrames ([int]$block.observerPaintedPlayFrames) -RepeatedPlayFrames ([int]$block.repeatedPlayFramesSourceDiffer) @exArgs
+        $head ="$Header  visual=$($v.verdict)  distinct=$($block.distinctContentHashes)/$($block.playFrames)  play-vs-paused=$($block.playVsPausedMeanAbsDiff)$(if ($null -ne $block.exposureMedianLuma) { "  luma=$([math]::Round([double]$block.exposureMedianLuma, 2))  near-black=$([math]::Round([double]$block.exposureMedianNearBlackFraction, 4))  clipped=$([math]::Round([double]$block.exposureMedianClippedFraction, 4))" })"
         try {
             $block.stripPath = New-DvVisualStrip -Tiles $tiles -OutPath (Join-Path $dir "$LegId-strip.png") -Header $head.Trim()
             $block.stripSha256 = Get-DvSha256OfFile $block.stripPath
@@ -4481,7 +4782,7 @@ function Write-DvReceipt {
 
 Export-ModuleMember -Function Get-DvOutcomeEnum, ConvertTo-DvCanonicalJson, Get-DvSha256OfBytes, Get-DvSha256OfText, Get-DvSha256OfFile,
     ConvertTo-DvLfBytes, Get-DvLegSpecSha256, Get-DvDerivedBackend, Get-DvBackendNotDerivable, Read-DvContactFrames, Get-DvLegSpecShapeRefusal, Get-DvPngImageProblem, Get-DvPairedSeekVerdict, Get-DvSubjectDigest,
-    Get-DvVisualViewportPixels, Get-DvVisualMeanAbsDiff, Get-DvVisualVerdict, Get-DvVisualSourceDifference, Get-DvFrameNumber, New-DvVisualStrip, Read-DvVisualCaptures, Get-DvVisualCaptureRequest, Read-DvVenueTable, ConvertFrom-DvVenueTableText, Get-DvVenueRole, Get-DvProp, Get-DvCommittedFile, Resolve-DvAdmissionSources,
+    Get-DvVisualViewportPixels, Get-DvVisualMeanAbsDiff, Get-DvExposureMedian, Get-DvVisualExposureStats, Get-DvExposureBand, Get-DvVisualVerdict, Get-DvVisualSourceDifference, Get-DvFrameNumber, New-DvVisualStrip, Read-DvVisualCaptures, Get-DvVisualCaptureRequest, Read-DvVenueTable, ConvertFrom-DvVenueTableText, Get-DvVenueRole, Get-DvProp, Get-DvCommittedFile, Resolve-DvAdmissionSources,
     Test-DvUnderClaudeState, Test-DvLocalReceiptRoot, Read-DvClipConsent, Get-DvClipAdmission, Get-DvSmokeSummaryFields, Get-DvConformPaceProof, Get-DvConformArmVerdict, Get-DvMinPlaySeconds, Get-DvPlaybackProblems,
     Get-DvPlaybackEvidence, Get-DvScaleEvidence, Get-DvScaleLabel, Get-DvDisplayEvidence, Get-DvUnpacedEvidence, Get-DvLookLabelEvidence, Get-DvWorkerThreadsEvidence, Get-DvPrepConflatedMoveEvidence, Get-DvLookAssistEvidence, Get-DvLegSetPlan, Get-DvSmokeSessionLineFields, Get-DvSmokeSessionLineRead, Get-DvLogRecordBody, Get-DvMatrixRates, Get-DvMatrixRow, Get-DvMedian, ConvertTo-DvMatrixTable, Get-DvBlobById, Find-DvCommittedLegSpec, Read-DvCommittedLookReceipt, Read-DvEvidenceSet, Test-DvJsonEquivalent, Test-DvReceiptValid, Get-DvJobNotAfter, Get-DvUmRunNotAfterArgs, Get-DvUmRunDropVisibleUtc, Get-DvUmRunDropNotAfter, Test-DvNotAfterCoversDrop, Get-DvHealthVerdict,
     New-DvHealthProbeJobText, ConvertFrom-DvProbeStdout,

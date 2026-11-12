@@ -70,6 +70,8 @@ import sys
 import tarfile
 import tempfile
 
+_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
+
 AGENT_DIR = "tools/agent-bridge"
 TEST_FILE = "test_server_wrapper_phase2.py"
 SERVER_FILE = "server.py"
@@ -112,7 +114,9 @@ def _child(agent_dir, st):
 
     # Everything the verdict will use is captured HERE, before any of the ref's code runs, so a test that rebinds
     # time.sleep, _thread._count, sys.monitoring.get_tool or the like cannot make the verdict run its code.
-    st["threading"] = threading
+    # The threading module itself is not stored (a module held in a dict cannot be followed by the hidden-spawn scan, and threading re-exports
+    # os); the closure reads the module object captured above, exactly as storing it did.
+    st["thread_excepthook_now"] = lambda: threading.excepthook
     st["sleep"] = time.sleep
     st["thread_count"] = _thread._count
     st["mon_get_tool"], st["mon_get_events"] = mon.get_tool, mon.get_events
@@ -315,7 +319,6 @@ def _verdict(st):
 def _decide(st, running):
     """Pure decision over data this checker owns. It calls nothing the test could have replaced, and it reads every
     fact (forced calls, observed frames, hooks, liveness) HERE, after every other inspection, as the last step."""
-    threading = st["threading"]
     frames = st["frames"]
     if st["problems"]:
         return "UNKNOWN (observer error: %s)" % st["problems"][0]
@@ -328,7 +331,7 @@ def _decide(st, running):
     if st["unraisable"] or sys.unraisablehook is not st["hook"]:
         return "UNKNOWN (an exception was ignored at shutdown, or the hook was replaced: %s)" % (
             st["unraisable"][0] if st["unraisable"] else "sys.unraisablehook replaced")
-    if st["thread_errors"] or threading.excepthook is not st["thread_hook"]:
+    if st["thread_errors"] or st["thread_excepthook_now"]() is not st["thread_hook"]:
         return "UNKNOWN (a thread died with an exception, or threading.excepthook was replaced: %s)" % (
             st["thread_errors"][0] if st["thread_errors"] else "threading.excepthook replaced")
     mon, name, events = st["monitor"]
@@ -412,7 +415,7 @@ def _replace(path, source):
 def _parent(ref, test_source, server_source):
     """Return (verdict line, exit code). Printing is main()'s job, after cleanup has been attempted."""
     env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_TRACE")}
-    data = subprocess.check_output(["git", "archive", ref, AGENT_DIR], env=env)
+    data = subprocess.check_output(["git", "archive", ref, AGENT_DIR], env=env, creationflags=_NO_WINDOW)
     kwargs = {"ignore_cleanup_errors": True} if sys.version_info >= (3, 10) else {}
     with tempfile.TemporaryDirectory(**kwargs) as tmp:
         with tarfile.open(fileobj=io.BytesIO(data)) as tar:
@@ -435,7 +438,7 @@ def _parent(ref, test_source, server_source):
             f.write(FORCING_STUB)
         nonce = secrets.token_hex(16)
         proc = subprocess.run([sys.executable, "-I", os.path.abspath(__file__), CHILD_FLAG, agent_dir],
-                              input=nonce + "\n", cwd=tmp, env=env, capture_output=True, text=True, timeout=300)
+                              input=nonce + "\n", cwd=tmp, env=env, capture_output=True, text=True, timeout=300, creationflags=_NO_WINDOW)
     prefix = "RESULT %s " % nonce
     verdicts = [l[len(prefix):] for l in proc.stdout.splitlines() if l.startswith(prefix)]
     if len(verdicts) == 1 and verdicts[0].split(" ")[0] in VERDICT_CODE \

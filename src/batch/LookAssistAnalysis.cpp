@@ -58,6 +58,7 @@ LookAssistStats analyzeLookAssistThumbnail( const unsigned char *rgb, int width,
     int balanceHistogramB[256] = { 0 };
     const int totalSamples = width * height;
     int midtoneSamples = 0;
+    int aboveVideoWhiteSamples = 0;
     double visibleRTotal = 0.0;
     double visibleGTotal = 0.0;
     double visibleBTotal = 0.0;
@@ -78,6 +79,8 @@ LookAssistStats analyzeLookAssistThumbnail( const unsigned char *rgb, int width,
 
         const int maxChannel = qMax( r, qMax( g, b ) );
         const int minChannel = qMin( r, qMin( g, b ) );
+        // Any channel, not luma: a saturated red (255, 0, 0) is luma 53 but is a clipped pixel.
+        if( maxChannel > 235 ) ++aboveVideoWhiteSamples;
         const int saturationProxy = maxChannel - minChannel;
         const double greenAxis = (double)g - ( ( (double)r + (double)b ) * 0.5 );
         if( luma >= 12 )
@@ -145,6 +148,7 @@ LookAssistStats analyzeLookAssistThumbnail( const unsigned char *rgb, int width,
     int clipHigh = histogram[252] + histogram[253] + histogram[254] + histogram[255];
     stats.clipLow = (double)clipLow / (double)totalSamples;
     stats.clipHigh = (double)clipHigh / (double)totalSamples;
+    stats.aboveVideoWhite = (double)aboveVideoWhiteSamples / (double)totalSamples;
     return stats;
 }
 
@@ -368,7 +372,49 @@ QString lookAssistDecisionLogFields( const LookAssistStats &resolved, const Look
                        : QStringLiteral("NA") );
 }
 
-bool lookAssistPictureCorroboratesDaylight( const LookAssistStats &processedAtPlannedExposure )
+LookAssistStats lookAssistDisplayMeterAggregate( const LookAssistStats *rendered, int count )
+{
+    LookAssistStats result;
+    if( !rendered || count <= 0 ) return result;
+    count = qMin( count, 3 );
+    double median[3], p95[3], p99[3], readClip[3], renderedClip[3];
+    int readCount = 0;
+    for( int i = 0; i < count; ++i )
+    {
+        renderedClip[i] = rendered[i].aboveVideoWhite;
+        if( !( rendered[i].median > 0.0 ) ) continue;   // black: rendered, not read
+        median[readCount] = rendered[i].median;
+        p95[readCount] = rendered[i].p95;
+        p99[readCount] = rendered[i].p99;
+        readClip[readCount] = rendered[i].aboveVideoWhite;
+        ++readCount;
+    }
+    if( readCount <= 0 ) return result;
+    std::sort( median, median + readCount );
+    std::sort( p95, p95 + readCount );
+    std::sort( p99, p99 + readCount );
+    std::sort( readClip, readClip + readCount );
+    std::sort( renderedClip, renderedClip + count );
+    result.median = median[readCount / 2];
+    result.p95 = p95[readCount / 2];
+    result.p99 = p99[readCount / 2];
+    result.aboveVideoWhite = qMax( readClip[readCount / 2], renderedClip[count / 2] );
+    result.p05 = result.median;
+    return result;
+}
+
+QString lookAssistDisplayMeterLogFields( int samples, const LookAssistStats &meter, int frame )
+{
+    return QStringLiteral("samples=%1 robust_median=%2 robust_p95=%3 robust_p99=%4 above_video_white=%5 frame=%6")
+        .arg( samples )
+        .arg( meter.median, 0, 'f', 1 )
+        .arg( meter.p95, 0, 'f', 1 )
+        .arg( meter.p99, 0, 'f', 1 )
+        .arg( meter.aboveVideoWhite, 0, 'f', 10 )
+        .arg( frame );
+}
+
+bool lookAssistPictureCorroboratesDaylight(const LookAssistStats &processedAtPlannedExposure )
 {
     // The Shade preset lifts a flat RAW thumbnail towards a mid-grey picture (target median 112). If the
     // exposure is right that the scene is daylight, the RENDERED picture at that lift is a lit picture:
@@ -2117,10 +2163,18 @@ LookAssistPreset presetForLookAssistScene( LookAssistScene scene,
     if( displayStats != nullptr && displayStats->median > 0.0 )
     {
         const int displayTarget = lookAssistDisplayTargetMedianForScene( scene );
-        int displayExposure = lookAssistExposureForTarget(
-            qMax( 1.0, displayStats->median ), (double)displayTarget, 0 );
         const int displayCap = lookAssistExposureForTarget(
             qMax( 1.0, displayStats->p99 ), 440.0, 400 );
+        int displayExposure = 0;
+        if( displayStats->median > 1.0 )
+            displayExposure = lookAssistExposureForTarget( displayStats->median, (double)displayTarget, 0 );
+        else if( displayStats->p99 > 16.0
+              && displayStats->p99 <= 235.0
+              && displayStats->aboveVideoWhite <= 0.002 )
+            // A median of one code value carries no mid-tone reading, so the highlights govern. Not when p99 is at
+            // or below video black (16): that frame is noise and the lift would only raise it. Not when p99 or more
+            // than 0.2% of the display has a channel above video white (235): the lift would push those pixels into clip.
+            displayExposure = displayCap;
         displayExposure = qMin( displayExposure, displayCap );
         exposure = qBound( -120, displayExposure, 380 );
     }
@@ -2218,6 +2272,229 @@ LookAssistPreset presetForLookAssistScene( LookAssistScene scene,
     preset.highlights = qBound( -100, preset.highlights, 100 );
     preset.vibrance = qBound( -100, preset.vibrance, 100 );
     return preset;
+}
+
+// Moved verbatim from platform/qt/MainWindow.cpp (LOOK-ASSIST-GREEN-ARTIFACT-FALLBACK-AT-LIFTED-EXPOSURE-1).
+QString lookAssistColorCastWarning(
+        bool postColorStatsValid,
+        const LookAssistStats &postColorStats,
+        double postVisibleGreenAxis,
+        int finalTemperature,
+        double postBlueAmberAxis )
+{
+    if( postColorStatsValid )
+    {
+        if( postColorStats.greenArtifactRatio >= 0.10
+         && postColorStats.greenArtifactMeanAxis >= 25.0 )
+        {
+            return QStringLiteral("localized-green-artifact");
+        }
+        if( postVisibleGreenAxis >= 8.0 )
+        {
+            return QStringLiteral("global-green-cast");
+        }
+        if( postVisibleGreenAxis <= -8.0 )
+        {
+            return QStringLiteral("global-magenta-cast");
+        }
+        if( finalTemperature <= 5200 && postBlueAmberAxis >= 4.0 )
+        {
+            return QStringLiteral("cool-blue-cast");
+        }
+        if( finalTemperature >= 6800 && postBlueAmberAxis <= -4.0 )
+        {
+            return QStringLiteral("warm-amber-cast");
+        }
+    }
+    return QStringLiteral("none");
+}
+
+// Moved verbatim from platform/qt/MainWindow.cpp (LOOK-ASSIST-GREEN-ARTIFACT-FALLBACK-AT-LIFTED-EXPOSURE-1).
+bool lookAssistColorCastShouldFailClosed( const QString &warning,
+                                          double greenArtifactRatio,
+                                          double greenArtifactMeanAxis,
+                                          double visibleGreenAxis,
+                                          bool postAppliedStats )
+{
+    if( warning == QStringLiteral("rejected-unstable-floor-lifted") )
+    {
+        return true;
+    }
+    if( warning == QStringLiteral("processed-floor-lifted-awb-risk") )
+    {
+        return true;
+    }
+    if( warning == QStringLiteral("processed-floor-lifted-post-invalid") )
+    {
+        return true;
+    }
+    if( warning == QStringLiteral("global-green-cast")
+     || warning == QStringLiteral("global-magenta-cast") )
+    {
+        return postAppliedStats;
+    }
+    if( warning == QStringLiteral("localized-green-artifact") )
+    {
+        if( !postAppliedStats )
+        {
+            return false;
+        }
+        return visibleGreenAxis >= 14.0
+            || ( greenArtifactRatio >= 0.28 && greenArtifactMeanAxis >= 42.0 );
+    }
+    return false;
+}
+
+LookAssistSafetyAction lookAssistSafetyAction( const QString &warning,
+                                               double greenArtifactRatio,
+                                               double greenArtifactMeanAxis,
+                                               double visibleGreenAxis,
+                                               bool postAppliedStats,
+                                               int appliedExposure,
+                                               int baselineExposure,
+                                               double postNeutralGreenAxis )
+{
+    if( !lookAssistColorCastShouldFailClosed( warning, greenArtifactRatio, greenArtifactMeanAxis,
+                                              visibleGreenAxis, postAppliedStats ) )
+    {
+        return LookAssistSafetyAction::Keep;
+    }
+    // Every green threshold is an absolute code-value distance, so an exposure the analysis raised can carry green
+    // CONTENT (foliage) over them while the neutral samples stay neutral (M16-1456: +3.8 stops, neutral green axis
+    // 5.0, visible green axis 5.6 -> 15.9). Only then is the exposure retreated rather than the whole look: a green
+    // warning, post-applied stats, a raised exposure and a neutral that does not itself lean green. A magenta,
+    // floor-lifted or unstable warning, or a green neutral (a real cast, or dual-ISO green corruption), reverts as before.
+    const bool greenWarning = warning == QStringLiteral("localized-green-artifact")
+                           || warning == QStringLiteral("global-green-cast");
+    if( greenWarning
+     && postAppliedStats
+     && appliedExposure > baselineExposure
+     && postNeutralGreenAxis <= 8.0 )
+    {
+        return LookAssistSafetyAction::RetreatExposure;
+    }
+    return LookAssistSafetyAction::RevertBaseline;
+}
+
+QVector<int> lookAssistSafetyRetreatRungs( int appliedExposure, int baselineExposure )
+{
+    QVector<int> rungs;
+    if( appliedExposure <= baselineExposure ) return rungs;
+    const qint64 excess = static_cast<qint64>( appliedExposure ) - baselineExposure;   // no int overflow
+    const int candidates[] = { static_cast<int>( baselineExposure + excess / 2 ),
+                               static_cast<int>( baselineExposure + excess / 4 ) };
+    for( const int rung : candidates )
+    {
+        if( rung == appliedExposure || rung == baselineExposure || rungs.contains( rung ) ) continue;
+        rungs.append( rung );
+    }
+    return rungs;
+}
+
+LookAssistRetreatOutcome lookAssistRunSafetyRetreat( int appliedExposure,
+                                                     int baselineExposure,
+                                                     const std::function<int( int exposure )> &applyExposure,
+                                                     const std::function<LookAssistRetreatMeasurement()> &measure )
+{
+    LookAssistRetreatOutcome out;
+    out.shownExposure = applyExposure( baselineExposure );
+    out.bottom = measure();
+    ++out.measurements;
+    out.shown = out.bottom;
+    if( !out.bottom.valid || out.bottom.warning != QStringLiteral("none") )
+    {
+        out.action = LookAssistSafetyAction::RevertBaseline;
+        return out;
+    }
+    for( const int rung : lookAssistSafetyRetreatRungs( appliedExposure, baselineExposure ) )
+    {
+        out.shownExposure = applyExposure( rung );
+        const LookAssistRetreatMeasurement m = measure();
+        ++out.measurements;
+        out.triedRungs.append( QStringLiteral("%1:%2:%3")
+                                   .arg( out.shownExposure )
+                                   .arg( m.visibleGreenAxis, 0, 'f', 3 )
+                                   .arg( m.valid ? m.stats.greenArtifactRatio : 0.0, 0, 'f', 6 ) );
+        if( m.valid
+         && !lookAssistColorCastShouldFailClosed( m.warning,
+                                                  m.stats.greenArtifactRatio,
+                                                  m.stats.greenArtifactMeanAxis,
+                                                  m.visibleGreenAxis,
+                                                  true ) )
+        {
+            out.rungKept = true;
+            out.shown = m;
+            break;
+        }
+    }
+    if( !out.rungKept )
+    {
+        // No rung passed: the baseline exposure is shown, described by its own (identical-settings) measurement.
+        out.shownExposure = applyExposure( baselineExposure );   // the same (deterministic) exposure the bottom measured
+        out.shown = out.bottom;
+    }
+    out.action = LookAssistSafetyAction::Keep;
+    return out;
+}
+
+QString lookAssistSafetyRetreatLogFields( const QString &firstWarning,
+                                          int appliedExposure,
+                                          int baselineExposure,
+                                          const LookAssistRetreatOutcome &outcome,
+                                          int frame )
+{
+    const bool kept = outcome.action == LookAssistSafetyAction::Keep;
+    return QStringLiteral("first_warning=%1 applied_exposure=%2 baseline_exposure=%3 bottom_warning=%4 bottom_visible_green_axis=%5 bottom_green_ratio=%6 kept_exposure=%7 rungs_tried=%8 rungs=%9 kept_warning=%10 frame=%11")
+        .arg( firstWarning )
+        .arg( appliedExposure )
+        .arg( baselineExposure )
+        .arg( outcome.bottom.warning )
+        .arg( outcome.bottom.visibleGreenAxis, 0, 'f', 3 )
+        .arg( outcome.bottom.valid ? outcome.bottom.stats.greenArtifactRatio : 0.0, 0, 'f', 6 )
+        .arg( kept ? QString::number( outcome.shownExposure ) : QStringLiteral("none") )
+        .arg( outcome.triedRungs.size() )
+        .arg( outcome.triedRungs.isEmpty() ? QStringLiteral("none") : outcome.triedRungs.join( QLatin1Char(',') ) )
+        .arg( kept ? outcome.shown.warning : QStringLiteral("reverted") )
+        .arg( frame );
+}
+
+QString lookAssistPictureDumpFileName( bool finalLook, int frame )
+{
+    return ( finalLook ? QStringLiteral("look-assist-final-frame%1.png")
+                       : QStringLiteral("look-assist-pre-safety-frame%1.png") ).arg( frame );
+}
+
+QString lookAssistPictureDumpFields( int frame,
+                                     int preSafetyExposure,
+                                     const QString &preSafetySha256,
+                                     int finalExposure,
+                                     const QString &finalSha256,
+                                     const QString &safety )
+{
+    const bool preWritten = !preSafetySha256.isEmpty();
+    const bool finalWritten = !finalSha256.isEmpty();
+    return QStringLiteral("pre_safety=%1 pre_safety_sha256=%2 pre_safety_exposure=%3 final=%4 final_sha256=%5 final_exposure=%6 safety=%7 frame=%8")
+        .arg( preWritten ? lookAssistPictureDumpFileName( false, frame ) : QStringLiteral("none") )
+        .arg( preWritten ? preSafetySha256 : QStringLiteral("none") )
+        .arg( preSafetyExposure )
+        .arg( finalWritten ? lookAssistPictureDumpFileName( true, frame ) : QStringLiteral("none") )
+        .arg( finalWritten ? finalSha256 : QStringLiteral("none") )
+        .arg( finalExposure )
+        .arg( safety )
+        .arg( frame );
+}
+
+bool lookAssistPictureDumpStateLabelValid( const QString &label )
+{
+    if( label.isEmpty() || label.size() > 64 ) return false;
+    for( const QChar c : label )
+    {
+        const ushort u = c.unicode();
+        const bool ok = ( u >= 'A' && u <= 'Z' ) || ( u >= 'a' && u <= 'z' ) || ( u >= '0' && u <= '9' )
+                     || u == '_' || u == '-';
+        if( !ok ) return false;
+    }
+    return true;
 }
 
 } // namespace lookassist

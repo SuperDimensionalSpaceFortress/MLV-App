@@ -45,6 +45,13 @@ import sys
 import time
 from pathlib import Path
 
+try:  # imported as tools.repo_hygiene.runtime_floor_suites (tests, CI) or run as a script from this directory
+    from .hidden_spawn import no_window_flags
+except ImportError:
+    from hidden_spawn import no_window_flags
+
+_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
+
 SCHEMA = "mlv-app/runtime-floors/v1"
 DEFAULT_MANIFEST = "tools/coordination/runtime-floors.json"
 PS_RUNTIMES = ("powershell-5.1", "pwsh")
@@ -285,7 +292,7 @@ def snapshot_report(snapshot: list[tuple]) -> list[str]:
 
 def _probe(argv: list[str], timeout: int = 60) -> str | None:
     try:
-        done = subprocess.run(argv, capture_output=True, text=True, timeout=timeout)
+        done = subprocess.run(argv, capture_output=True, text=True, timeout=timeout, creationflags=_NO_WINDOW)
     except (OSError, subprocess.TimeoutExpired):
         return None
     return done.stdout.strip() if done.returncode == 0 else None
@@ -326,7 +333,7 @@ def _git(worktree: Path, *args: str, nul: bool = False) -> list[str]:
     quote, tab, newline or non-ASCII character is returned as written, never as a quoted escape string."""
     try:
         done = subprocess.run(["git", "-C", str(worktree), "-c", "core.quotepath=off", *args],
-                              capture_output=True, timeout=120)
+                              capture_output=True, timeout=120, creationflags=_NO_WINDOW)
     except (OSError, subprocess.TimeoutExpired) as exc:
         raise Undecidable(f"git {' '.join(args)} could not run: {exc}") from exc
     if done.returncode != 0:
@@ -473,7 +480,9 @@ def task_argv(task: dict, worktree: Path) -> list[str]:
 
 def _spawn(argv: list[str], **kwargs):
     """The one place a suite child is started; tests replace it to capture argv and cwd without a real shell."""
-    return subprocess.Popen(argv, **kwargs)
+    # no_window_flags ORs the hidden bit into a caller flag (a priority class, a new process group) instead of replacing it,
+    # and drops CREATE_NEW_CONSOLE (0x10), with which Windows ignores CREATE_NO_WINDOW.
+    return subprocess.Popen(argv, creationflags=no_window_flags(kwargs.pop("creationflags", 0)), **kwargs)
 
 
 def _kill_tree(proc) -> None:
@@ -482,7 +491,7 @@ def _kill_tree(proc) -> None:
     if _IS_NT:
         try:
             subprocess.run(["taskkill.exe", "/PID", str(proc.pid), "/T", "/F"], capture_output=True,
-                           timeout=TASKKILL_TIMEOUT)
+                           timeout=TASKKILL_TIMEOUT, creationflags=_NO_WINDOW)
             return
         except (OSError, subprocess.TimeoutExpired):
             pass

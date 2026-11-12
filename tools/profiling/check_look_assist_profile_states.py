@@ -27,18 +27,32 @@ than master in any render state":
   * --subject-sha: every arm's log records the build it ran under (run_metadata "build_sha") and it is the subject;
     --exe: the executable carries the subject's build stamp (verify_exe_stamp.py).
   --require-daylight turns the master-analysis outcome into a failure: the improvement gate, not the safety one.
+  Picture binding (793-I2): the applied picture is the file the newest look_assist.apply.picture_dump line of the arm's
+  log names (final=look-assist-final-frameN.png final_sha256=<hex> final_exposure=<n> frame=<n>), that line belongs to the
+  LAST application (it precedes that application's result line), final=none is STALE (the file on disk is another run's),
+  the SHA-256 of the PNG bytes equals final_sha256, and the frame and exposure match the application. An arm with no
+  picture_dump line at all is UNBOUND_LEGACY: a failure unless --allow-unbound-legacy, which reports it as such, never PASS.
+  A log line is the event named by its first `interaction_trace event=` token, its fields are its whitespace-delimited
+  key=value pairs taken exactly once; every field the app prints on auto_wb / result / async_dispatch / auto_wb_async_applied /
+  picture_dump is typed by ONE table (AUTO_WB_FIELDS ... DUMP_FIELDS, derived from the app's format strings and pinned to them by
+  a test): a field that is present and not its type (NaN, empty, fractional, signed frame, huge digit string...) makes the event
+  malformed in EVERY mode, --decisions-only included, whether or not this checker reads the field. An incomplete, malformed or
+  ambiguous result is "no complete apply", and a line with no event marker keeps its decision reading but never owns a
+  picture_dump line.
 
 usage: check_look_assist_profile_states.py <root> --tag TAG [--clips a,b] [--deck-chroma-max X] [--require-daylight]
-           [--master-tolerance X] [--subject-sha SHA] [--exe PATH] [--decisions-only]
+           [--master-tolerance X] [--subject-sha SHA] [--exe PATH] [--decisions-only] [--allow-unbound-legacy]
 exit 0 = pass, 1 = a gate failed, 2 = nothing usable (no run directories / unreadable picture).
 """
 import argparse
 import glob
+import hashlib
 import os
 import re
 import sys
 
 import check_look_assist_sidecars as sidecars
+import look_assist_png
 import verify_exe_stamp
 
 DEFAULT_CLIPS = ("tiny_dual_iso", "large_dual_iso")
@@ -46,16 +60,152 @@ MODES = ("sync", "async")
 APPLIED_PICTURE = os.path.join("pic", "look-assist-final-frame0.png")
 MASTER_PICTURE = os.path.join("pic", "state-master.png")
 
-RESULT = re.compile(r"look_assist\.apply\.result\b.*?\bscene=(\S+).*?\bpreset_exp=(-?\d+).*?\bfinal_temp=(-?\d+) final_tint=(-?\d+)")
-ASYNC_APPLIED = re.compile(r"look_assist\.apply\.auto_wb_async_applied\b.*?\bsource=(\S+) decision=(\S+).*?\bfinal_temp=(-?\d+) final_tint=(-?\d+) preset_exp=(-?\d+)")
-AUTO_WB = re.compile(r"look_assist\.apply\.auto_wb\b.*?\bvalid=(\d) source=(\S+) decision=(\S+)")
-ASYNC_DISPATCH = re.compile(r"look_assist\.apply\.async_dispatch\b.*?\bscene=(\S+)")
-SAFETY_FALLBACK = re.compile(r"look_assist\.apply\.safety_fallback\b")
+# A line IS the event named by its first `interaction_trace event=` token (EVENT below), and only that event's reading
+# applies to it: a name spelled out inside another event's field is no evidence (adversary r2 A3). A line with NO such
+# marker (event=None, the back-compat reading) is read by the name appearing in it: it keeps its decision reading but
+# never owns a picture_dump line (adversary r2 A1). The fields of a line are its whitespace-delimited key=value pairs,
+# each taken exactly once and typed by the field table below; anything else is "no complete apply" (fail closed), never the
+# parse of a prefix or a shadow token (adversary r2 A2/A6).
+RESULT_EVENT = "look_assist.apply.result"
+ASYNC_APPLIED_EVENT = "look_assist.apply.auto_wb_async_applied"
+AUTO_WB_EVENT = "look_assist.apply.auto_wb"
+ASYNC_DISPATCH_EVENT = "look_assist.apply.async_dispatch"
+SAFETY_FALLBACK_EVENT = "look_assist.apply.safety_fallback"
 # EVERY skip event, with or without a reason: the app's env-disabled / file / receipt / enabled skip is logged as
 # "file_loaded=1 mlv=1 receipt=1 enabled=1" and has no reason= at all (sol, PR #222 r2).
-APPLY_SKIP = re.compile(r"look_assist\.apply\.skip\b(?:.*?\breason=(\S+))?")
-FALLBACK_TO_MASTER = re.compile(r"look_assist\.daylight_fallback_to_master\b")
+SKIP_EVENT = "look_assist.apply.skip"
+FALLBACK_EVENT = "look_assist.daylight_fallback_to_master"
+EVENT_NAME = {name: re.compile(re.escape(name) + r"\b") for name in (
+    RESULT_EVENT, ASYNC_APPLIED_EVENT, AUTO_WB_EVENT, ASYNC_DISPATCH_EVENT, SAFETY_FALLBACK_EVENT, SKIP_EVENT, FALLBACK_EVENT)}
+# THE FIELD TABLE (r5, sol key on 41f96076 B1/B2). Every field the app prints on an event this checker reads is listed here with
+# the type its format string gives it, derived from the emitters (platform/qt/MainWindow.cpp: auto_wb, result, async_dispatch,
+# auto_wb_async_applied; src/batch/LookAssistAnalysis.cpp: lookAssistDecisionLogFields, lookAssistPictureDumpFields). A field that
+# is PRESENT must match its type whether or not this checker reads it, and a value that does not makes the event malformed (the
+# arm is refused), never a field that is skipped over. A field that is ABSENT is an older recorded build's line (the recorded run
+# predates the decision fields and the dump): only the fields a reading below needs are required, and each reading says so.
+INT = r"0|-?[1-9][0-9]{0,8}"                  # %1 of an int: canonical decimal; never NaN, a fraction, a zero pad or a huge string
+UINT = r"0|[1-9][0-9]{0,8}"                   # a frame, a count, a size: never negative
+UINT64 = r"0|[1-9][0-9]{0,19}"                # a qulonglong serial
+TYPE_PATTERNS = {
+    "int": INT,
+    "uint": UINT,
+    "uint64": UINT64,
+    "bool01": r"[01]",
+    "fixed3": r"-?(?:0|[1-9][0-9]{0,8})\.[0-9]{3}",       # .arg(x, 0, 'f', 3); damping is logged this way
+    "fixed6": r"-?(?:0|[1-9][0-9]{0,8})\.[0-9]{6}",       # .arg(x, 0, 'f', 6)
+    "word": r"\S+",                                       # an enum / name the checker compares itself (never empty)
+    "dims": r"(?:%s)x(?:%s)" % (UINT, UINT),              # %1x%2
+    "ratio": r"(?:%s)/(?:%s)" % (INT, INT),               # %1/%2 of two ints
+    "sha256": r"[0-9a-fA-F]{64}",
+    "safety": r"keep|retreat|revert",
+    "ev100_source": r"recorded|aperture_bound|none",
+    "post_walk_branch": r"none|steps|cleanup|recovery",
+}
+TYPE_PATTERNS["fixed3|NA"] = TYPE_PATTERNS["fixed3"] + "|NA"
+TYPE_PATTERNS["ratio|NA"] = TYPE_PATTERNS["ratio"] + "|NA"
+TYPE_PATTERNS["uint|NA"] = UINT + "|NA"
+TYPE_PATTERNS["sha256|none"] = TYPE_PATTERNS["sha256"] + "|none"
+TYPE_PATTERNS["pre_safety_png|none"] = r"look-assist-pre-safety-frame[0-9]{1,9}\.png|none"
+TYPE_PATTERNS["final_png|none"] = r"look-assist-final-frame[0-9]{1,9}\.png|none"
+TYPES = {name: re.compile(pattern) for name, pattern in TYPE_PATTERNS.items()}
+INT_FIELD = TYPES["int"]
+DAMPING_FIELD = TYPES["fixed3"]
+DIGITS = TYPES["uint"]                    # a frame number; never an arbitrarily long digit string, never negative
+
+AUTO_WB_FIELDS = {"valid": "bool01", "source": "word", "decision": "word", "damping": "fixed3", "raw_x": "int", "raw_y": "int",
+                  "patch_luma": "fixed3", "patch_chroma": "fixed3", "patch_green_axis": "fixed3", "patch_blue_amber_axis": "fixed3",
+                  "base_temp": "int", "base_tint": "int", "candidate_temp": "int", "candidate_tint": "int",
+                  "awb_temp": "int", "awb_tint": "int", "final_temp_delta": "int", "final_tint_delta": "int"}
+# lookAssistDecisionLogFields, which the app appends to the result line
+DECISION_FIELDS = {"has_ev100": "bool01", "ev100": "fixed3|NA", "daylight_gate": "word", "post_walk_ran": "bool01",
+                   "post_walk_branch": "post_walk_branch", "post_walk_recovery": "ratio|NA", "display_meter_ran": "bool01",
+                   "playback_scale": "uint|NA", "ev100_bound": "fixed3|NA", "ev100_source": "ev100_source",
+                   "surface_search": "word", "surface_search_balance": "ratio|NA"}
+RESULT_FIELDS = dict({"analysis": "word", "scene": "word", "median": "fixed3", "p05": "fixed3", "p95": "fixed3", "p99": "fixed3",
+                      "clip_low": "fixed6", "clip_high": "fixed6", "balance_samples": "int", "preset_exp": "int",
+                      "preset_contrast": "int", "preset_pivot": "int", "preset_shadows": "int", "preset_highlights": "int",
+                      "preset_vibrance": "int", "preset_temp_delta": "int", "preset_tint_delta": "int", "final_temp": "int",
+                      "final_tint": "int", "thumb": "dims", "downscale": "int", "color_thumb": "dims", "color_downscale": "int",
+                      "frame": "uint", "last_serial": "uint64", "last_frame": "int", "next_serial": "uint64", "flavor": "word",
+                      "grade": "word"}, **DECISION_FIELDS)
+DISPATCH_FIELDS = {"generation": "int", "frame": "uint", "scene": "word", "floor_lifted": "bool01", "flavor": "word", "grade": "word"}
+APPLIED_FIELDS = {"generation": "int", "valid": "bool01", "source": "word", "decision": "word", "damping": "fixed3",
+                  "awb_temp": "int", "awb_tint": "int", "final_temp": "int", "final_tint": "int", "preset_exp": "int", "frame": "uint"}
+DUMP_FIELDS = {"pre_safety": "pre_safety_png|none", "pre_safety_sha256": "sha256|none", "pre_safety_exposure": "int",
+               "final": "final_png|none", "final_sha256": "sha256|none", "final_exposure": "int", "safety": "safety", "frame": "uint"}
+
+
+EVENT_TABLES = {AUTO_WB_EVENT: AUTO_WB_FIELDS, RESULT_EVENT: RESULT_FIELDS, ASYNC_DISPATCH_EVENT: DISPATCH_FIELDS,
+                ASYNC_APPLIED_EVENT: APPLIED_FIELDS}
+
+
+def defect_text(event, ambiguous, bad):
+    """Why one line of `event` makes the whole arm's evidence defective."""
+    if ambiguous:
+        return "a %s line gives a key twice (in any spelling)" % event
+    return "a %s line has a field that is not the type the app prints (%s)" % (event, ",".join(bad))
+
+
+TYPE_MAX = {"uint64": 2 ** 64 - 1}        # the digit bound alone does not bound the value: 20 digits run past a qulonglong
+
+
+def field_has_type(type_name, value):
+    """True when `value` is a well-typed spelling of `type_name`, range included."""
+    if not TYPES[type_name].fullmatch(value):
+        return False
+    return type_name not in TYPE_MAX or int(value) <= TYPE_MAX[type_name]
+
+
+def bad_fields(table, pairs):
+    """-> the names of the fields of `pairs` whose value does not match the type `table` gives them (every occurrence of a name).
+    A name the table does not list is the line's own and not ours to type; a name given twice is the caller's ambiguity check."""
+    return sorted({key for key, value in pairs if key in table and not field_has_type(table[key], value)})
+
+
+# What one application's result sets, plus the two markers of its identity: "closed" (a result / applied line completed it, so
+# the next one must bring its own evidence, never borrow this one's) and "generation" (the dispatch's, which the applied event
+# of the same application must repeat). A new application (auto_wb, dispatch) starts without any of them.
+RESULT_KEYS = ("scene", "exposure", "temperature", "tint", "frame", "picture_dump", "source", "decision", "closed", "generation", "dispatch_frame")
 BUILD_SHA = re.compile(r'"build_sha"\s*:\s*"([^"]*)"')
+# The app's own binding of the final PNG (PR #793 head cc3205de, src/batch/LookAssistAnalysis.cpp lookAssistPictureDumpFields):
+#   look_assist.apply.picture_dump pre_safety=<name|none> pre_safety_sha256=<hex|none> pre_safety_exposure=<n>
+#       final=<look-assist-final-frameN.png|none> final_sha256=<hex of the exact PNG bytes|none> final_exposure=<n>
+#       safety=<keep|retreat|revert> frame=<n>
+# It is logged after the application's last look change and BEFORE that application's look_assist.apply.result line.
+TRACE_TAG = re.compile(r"(?<!\S)interaction_trace(?!\S)")      # a standalone token (not a suffix or a field value); the FIRST is the marker
+TRACE_EVENT = re.compile(r"\s+event=(\S*)")           # what must follow it; an empty or absent event is NO event, never the next marker
+
+
+def line_event(line):
+    """-> (event, fields_start). event is None for a line with no interaction_trace tag at all (the old back-compat
+    reading), and "" for a tag not followed by a non-empty event=: such a line is no event of ours."""
+    tag = TRACE_TAG.search(line)
+    if not tag:
+        return None, 0
+    named = TRACE_EVENT.match(line, tag.end())
+    # The fields start AT the tag, so the event= selector is itself one of the line's key=value tokens: a second event= (any
+    # spelling) is a duplicate like any other and the line is ambiguous (adversary pass 978b1ac0 A1).
+    return (named.group(1) if named else ""), tag.end()
+DUMP_EVENT = "look_assist.apply.picture_dump"
+# EVERY name=value token the line carries, whatever the spelling of the name (upper case, hyphens, anything but "=" and
+# whitespace): the duplicate check runs over all of them BEFORE any consumer looks up the lower-case names it knows, so a
+# repeated "Audit=" or "audit-note=" is as ambiguous as a repeated "audit=" (sol, PR #799 r3 INV-1).
+FIELD = re.compile(r"(?<!\S)([^\s=]+)=(\S*)")
+FINAL_PICTURE_NAME = re.compile(r"^look-assist-final-frame(\d+)\.png$")
+
+
+def has_duplicate_key(pairs):
+    """True when one name is given twice, spelled exactly the same OR the same after case-folding."""
+    names = [key for key, _ in pairs]
+    return len(set(names)) != len(names) or len({key.casefold() for key in names}) != len(names)
+
+
+def open_base(receipt):
+    """What a result / applied event may build on: the receipt a dispatch or auto_wb opened. A receipt a result or applied
+    event already completed is CLOSED: the next such event starts from nothing and must bring its own scene, source and
+    decision, or it is "no complete apply" -- never a composite of two applications (adversary r3 A1)."""
+    receipt = receipt or {}
+    return {} if receipt.get("closed") else receipt
 
 
 def parse_log_text(text):
@@ -70,36 +220,129 @@ def parse_log_text(text):
     """
     receipt = None
     skipped = None
+    pending_dump = None      # the picture_dump line the NEXT result will own (it precedes its own result line)
+    newest_dump = None       # the newest picture_dump line anywhere in the log
+    dump_lines = 0
+    arm_defect = None        # the first line of any table event (or picture_dump) that is ambiguous or ill-typed, anywhere in the log
     for line in text.splitlines():
-        if SAFETY_FALLBACK.search(line):
+        event, start = line_event(line)
+        marked = event is not None          # False: no interaction_trace tag (back-compat reading, never owns a dump)
+        pairs = FIELD.findall(line[start:])
+        ambiguous = has_duplicate_key(pairs)      # a key given twice (in any spelling): no field of the line is trusted
+
+        def is_event(name):
+            return event == name if marked else bool(EVENT_NAME[name].search(line))
+
+        def once(key):
+            values = [value for found, value in pairs if found == key]
+            return values[0] if len(values) == 1 and not ambiguous else None
+
+        def int_once(key):
+            value = once(key)
+            return int(value) if value is not None and INT_FIELD.fullmatch(value) else None
+
+        for table_event, table in EVENT_TABLES.items():
+            # An ambiguous or ill-typed line of ANY event of the table is a defect of the ARM, not of one application: a later
+            # complete application does not erase it (adversary pass 20fddf3e A1: a malformed auto_wb / result / dispatch /
+            # applied line followed by a valid application passed in both modes). Like a skip, nothing after it clears it.
+            if is_event(table_event) and (ambiguous or bad_fields(table, pairs)):
+                arm_defect = arm_defect or defect_text(table_event, ambiguous, bad_fields(table, pairs))
+        if is_event(SAFETY_FALLBACK_EVENT):
             receipt = {"safety_fallback": True}
+            pending_dump = None
             continue
-        skip = APPLY_SKIP.search(line)
-        if skip:
-            skipped = skipped or skip.group(1) or "no reason logged"   # arm-level marker: the first skip is named
+        if is_event(SKIP_EVENT):
+            skipped = skipped or once("reason") or "no reason logged"   # arm-level marker: the first skip is named
             continue
-        if FALLBACK_TO_MASTER.search(line):
+        if event == DUMP_EVENT:
+            fields = dict(pairs)
+            if has_duplicate_key(pairs):
+                fields["_duplicate_key"] = "1"      # a key given twice is ambiguous, never a binding
+            bad = bad_fields(DUMP_FIELDS, pairs)
+            if bad:
+                fields["_malformed"] = ",".join(bad)      # a field of the app's dump line that is not its type: never a binding
+            if bad or ambiguous:
+                # ...and the arm's evidence is defective in EVERY mode: --decisions-only never binds a picture, but it does not get
+                # to ignore a dump line the app logged that is ambiguous or not what the app prints (adversary pass 0e450da2 A1).
+                arm_defect = arm_defect or defect_text(DUMP_EVENT, ambiguous, bad)
+            pending_dump = newest_dump = fields
+            dump_lines += 1
+            continue
+        if is_event(FALLBACK_EVENT):
             receipt = {"fell_back": True}
+            pending_dump = None
             continue
-        dispatch = ASYNC_DISPATCH.search(line)
-        if dispatch:
-            receipt = {"scene": dispatch.group(1)}   # a new application: nothing of the previous one survives
+        if is_event(ASYNC_DISPATCH_EVENT):
+            scene, generation = once("scene"), once("generation")
+            # a new application: nothing of the previous one survives. Its generation (None when it logs none) is what its
+            # applied event must repeat: another generation's application is not this dispatch's (adversary r3 A2). The
+            # app always logs the analysed frame as an integer (adversary r3 A1, pass on 5cb9b1a9).
+            frame = once("frame")
+            if (scene and frame is not None and not bad_fields(DISPATCH_FIELDS, pairs)      # every field the app prints, typed
+                    and once("floor_lifted") in ("0", "1")):      # bool01, always logged by the dispatch
+                receipt = {"scene": scene, "generation": generation, "dispatch_frame": frame}      # the applied event repeats both
+            else:
+                receipt = {"malformed_event": ASYNC_DISPATCH_EVENT}
+            pending_dump = None
             continue
-        wb = AUTO_WB.search(line)
-        if wb:
-            receipt = dict(receipt or {}, source=wb.group(2), decision=wb.group(3))
+        if is_event(AUTO_WB_EVENT):
+            valid, source, decision = once("valid"), once("source"), once("decision")
+            damping = once("damping")      # always logged, as %.3f
+            if (valid not in ("0", "1") or not source or not decision or damping is None      # bool01: 0 or 1
+                    or not DAMPING_FIELD.fullmatch(damping) or bad_fields(AUTO_WB_FIELDS, pairs)):      # every field the app prints, typed
+                receipt = {"malformed_event": AUTO_WB_EVENT}
+            else:
+                base = receipt or {}
+                if "exposure" in base:      # a complete application stands behind us: this auto_wb begins a NEW one, which
+                    base = {k: v for k, v in base.items() if k not in RESULT_KEYS}      # inherits none of its result
+                receipt = dict(base, source=source, decision=decision)
+                receipt.pop("malformed_event", None)
+            receipt.pop("picture_dump", None)        # a new application began: the earlier result's dump is not its
+            pending_dump = None                     # auto_wb precedes the dump of its own application
             continue
-        result = RESULT.search(line)
-        if result:
-            receipt = dict(receipt or {}, scene=result.group(1), exposure=int(result.group(2)),
-                           temperature=int(result.group(3)), tint=int(result.group(4)))
-            continue
-        applied = ASYNC_APPLIED.search(line)
-        if applied:
-            receipt = dict(receipt or {}, source=applied.group(1), decision=applied.group(2),
-                           temperature=int(applied.group(3)), tint=int(applied.group(4)), exposure=int(applied.group(5)))
+        if is_event(RESULT_EVENT):
+            scene, exposure, temperature, tint = once("scene"), int_once("preset_exp"), int_once("final_temp"), int_once("final_tint")
+            if not scene or None in (exposure, temperature, tint) or bad_fields(RESULT_FIELDS, pairs):      # every field the app prints, typed
+                receipt = {"malformed_event": RESULT_EVENT}     # an incomplete result is no apply, never an earlier receipt
+                pending_dump = None
+                continue
+            receipt = dict(open_base(receipt), scene=scene, exposure=exposure, temperature=temperature, tint=tint, closed=True)
+            receipt.pop("malformed_event", None)
+            receipt["frame"] = [value for key, value in pairs if key == "frame"]    # this event's own body fields; validated at the binding
+            if marked:
+                receipt["picture_dump"], pending_dump = pending_dump, None    # this application owns the dump before it
+            else:
+                receipt["picture_dump"], pending_dump = None, None    # no event marker: decisions only; it owns no dump and
+            continue                                                  # a dump it ends is spent, never inherited by a later result
+        if is_event(ASYNC_APPLIED_EVENT):
+            source, decision = once("source"), once("decision")
+            temperature, tint, exposure = int_once("final_temp"), int_once("final_tint"), int_once("preset_exp")
+            base = open_base(receipt)
+            valid = once("valid")      # the 0/1 flag the app logs (bool01), as auto_wb's; and the awb_* pair, as integers
+            if (not source or not decision or None in (temperature, tint, exposure)
+                    or valid not in ("0", "1") or None in (int_once("awb_temp"), int_once("awb_tint"))
+                    or once("damping") is None or not DAMPING_FIELD.fullmatch(once("damping")) or bad_fields(APPLIED_FIELDS, pairs)
+                    or base.get("dispatch_frame") != once("frame")      # the frame its own dispatch analysed, each given once
+                    or base.get("generation") != once("generation")):      # the generation of ITS OWN dispatch, each given once
+                receipt = {"malformed_event": ASYNC_APPLIED_EVENT}
+                pending_dump = None
+                continue
+            receipt = dict(base, source=source, decision=decision, temperature=temperature, tint=tint, exposure=exposure, closed=True)
+            receipt.pop("malformed_event", None)
+            receipt["frame"] = [value for key, value in pairs if key == "frame"]    # this event's own body fields; validated at the binding
+            if marked:
+                receipt["picture_dump"], pending_dump = pending_dump, None
+            else:
+                receipt["picture_dump"], pending_dump = None, None
     if skipped:
         receipt = dict(receipt or {}, skipped=skipped)
+    if arm_defect:
+        receipt = dict(receipt or {}, arm_defect=arm_defect)      # arm-level, like a skip: no later event clears it
+    if receipt is not None and dump_lines:
+        # Only the NEWEST picture_dump line can bind the final PNG now on disk, and only when it belongs to the LAST
+        # application. receipt["picture_dump"] is None when the last application owns no dump line.
+        receipt["picture_dump_lines"] = dump_lines
+        receipt["picture_dump_is_newest"] = receipt.get("picture_dump") is newest_dump
     return receipt
 
 
@@ -130,6 +373,8 @@ def check_receipt(name, receipt, require_daylight=False):
         return ["%s: the last application ended in a safety fallback (an earlier accepted receipt is not the shipped picture)" % name]
     if receipt and receipt.get("skipped"):
         return ["%s: the last application was skipped (%s)" % (name, receipt["skipped"])]
+    if receipt and receipt.get("arm_defect"):
+        return ["%s: the arm's evidence is defective: %s" % (name, receipt["arm_defect"])]
     if not receipt or not all(k in receipt for k in ("scene", "source", "decision", "temperature", "tint", "exposure")):
         return ["%s: no complete Look Assist apply in the trace (did the run settle?): %r" % (name, receipt)]
     if receipt["source"] in sidecars.FORBIDDEN_WB_SOURCES:
@@ -171,6 +416,57 @@ def check_subject(name, directory, subject_sha):
     return []
 
 
+def check_picture_binding(name, receipt, png_path, png_bytes, allow_legacy=False):
+    """-> (state, failures); png_bytes are the bytes of png_path that are also measured (one read). state is 'bound' (the newest picture_dump line names exactly this PNG, by content, for the
+    last application), 'legacy' (the arm's log has no picture_dump line at all: UNBOUND_LEGACY, a failure unless
+    allow_legacy), 'stale' (a picture_dump line exists and does not bind this PNG) or None (no usable receipt: the
+    decision gate already failed the arm). 793-I2: a readable PNG left by an earlier run must not pass."""
+    if not receipt or not all(k in receipt for k in ("scene", "source", "decision", "temperature", "tint", "exposure")):
+        return None, []
+    lines = receipt.get("picture_dump_lines", 0)
+    if not lines:
+        if allow_legacy:
+            return "legacy", []
+        return "legacy", ["%s: UNBOUND_LEGACY - the log has no look_assist.apply.picture_dump line, so %s is not tied to this "
+                          "application (only --allow-unbound-legacy accepts that, and reports it as UNBOUND_LEGACY, never as PASS)"
+                          % (name, os.path.basename(png_path))]
+    dump = receipt.get("picture_dump")
+    if dump is None or not receipt.get("picture_dump_is_newest"):
+        return "stale", ["%s: STALE - the newest look_assist.apply.picture_dump line does not belong to the last application "
+                         "(it precedes an earlier application's result or follows the last result), so %s is not its picture"
+                         % (name, os.path.basename(png_path))]
+    missing = [k for k in ("final", "final_sha256", "final_exposure", "frame") if k not in dump]
+    if missing:
+        return "stale", ["%s: STALE - the picture_dump line lacks %s" % (name, ", ".join(missing))]
+    if dump.get("_malformed"):
+        return "stale", ["%s: STALE - the picture_dump line has a field that is not the type the app prints (%s)" % (name, dump["_malformed"])]
+    if dump["final"] == "none" or dump["final_sha256"] == "none":
+        return "stale", ["%s: STALE - the picture_dump line says final=none: the app wrote no %s for this application, so a "
+                         "readable file of that name is left over from another run" % (name, os.path.basename(png_path))]
+    wanted = FINAL_PICTURE_NAME.match(os.path.basename(png_path))
+    named = FINAL_PICTURE_NAME.match(dump["final"])
+    failures = []
+    if dump.get("_duplicate_key"):
+        failures.append("%s: STALE - the picture_dump line gives a key twice" % name)
+    if not named or dump["final"] != os.path.basename(png_path):
+        failures.append("%s: STALE - picture_dump names final=%r, the gate reads %s" % (name, dump["final"], os.path.basename(png_path)))
+    result_frames = receipt.get("frame") or []
+    if not DIGITS.fullmatch(dump["frame"]) or (wanted and wanted.group(1) != dump["frame"]) or (named and named.group(1) != dump["frame"]):
+        failures.append("%s: STALE - picture_dump frame=%s does not match the picture under test (%s)"
+                        % (name, dump["frame"], os.path.basename(png_path)))
+    elif len(result_frames) != 1 or not DIGITS.fullmatch(result_frames[0]) or int(result_frames[0]) != int(dump["frame"]):
+        failures.append("%s: STALE - the application's result must carry exactly one frame=<digits> equal to picture_dump "
+                        "frame=%s (got %r)" % (name, dump["frame"], result_frames))
+    if dump["final_exposure"] != str(receipt["exposure"]):
+        failures.append("%s: STALE - picture_dump final_exposure=%s but the application's receipt exposure is %d"
+                        % (name, dump["final_exposure"], receipt["exposure"]))
+    actual = hashlib.sha256(png_bytes).hexdigest()
+    if actual != dump["final_sha256"].lower():
+        failures.append("%s: STALE - sha256 of %s is %s, picture_dump final_sha256=%s (the file is not the picture the app wrote)"
+                        % (name, os.path.basename(png_path), actual, dump["final_sha256"]))
+    return ("stale" if failures else "bound"), failures
+
+
 def find_runs(root, tag):
     runs = {}
     for directory in sorted(glob.glob(os.path.join(root, tag + "-*"))):
@@ -192,6 +488,10 @@ def main(argv=None):
     parser.add_argument("--subject-sha", default=None)
     parser.add_argument("--exe", default=None)
     parser.add_argument("--decisions-only", action="store_true", help="skip the picture gate (the pictures are then NOT required)")
+    parser.add_argument("--allow-unbound-legacy", action="store_true",
+                        help="accept an arm whose log has no look_assist.apply.picture_dump line (evidence from a build that "
+                             "does not emit it): reported as UNBOUND_LEGACY, never as PASS. A line that is present and does "
+                             "not bind the picture is STALE and always fails.")
     args = parser.parse_args(argv)
 
     runs = find_runs(args.root, args.tag)
@@ -201,6 +501,7 @@ def main(argv=None):
 
     failures = []
     notes = []
+    legacy = []
     for clip in [c for c in args.clips.split(",") if c]:
         for mode in MODES:
             if (clip, mode) not in runs:
@@ -237,14 +538,21 @@ def main(argv=None):
                                 % (name, ", ".join(os.path.relpath(p, directory) for p in missing)))
                 continue
             try:
-                chroma = sidecars.deck_cast_chroma(applied_png)
+                with open(applied_png, "rb") as handle:
+                    applied_bytes = handle.read()        # ONE read: the bytes hashed below are the bytes measured here
+                chroma = look_assist_png.deck_cast_chroma(applied_png, applied_bytes)
                 master = sidecars.deck_cast_chroma(master_png)
             except (OSError, ValueError) as error:
                 print("cannot read a picture of %s: %s" % (name, error))
                 return 2
             klass = receipt_class(receipts[(clip, mode)]) or "?"
             tolerance = args.master_tolerance if klass == "master" else 0.0
-            notes.append("%s [%s] deck chroma %.2f (master's look %.2f)" % (name, klass, chroma, master))
+            state, binding_failures = check_picture_binding(name, receipts[(clip, mode)], applied_png, applied_bytes, args.allow_unbound_legacy)
+            failures += binding_failures
+            if state == "legacy":
+                legacy.append(name)
+            notes.append("%s [%s] deck chroma %.2f (master's look %.2f)%s"
+                         % (name, klass, chroma, master, {"bound": " picture_dump-bound", "legacy": " UNBOUND_LEGACY"}.get(state, "")))
             if args.deck_chroma_max is not None and chroma > args.deck_chroma_max:
                 failures.append("%s: deck chroma %.2f > %.2f" % (name, chroma, args.deck_chroma_max))
             if chroma > master + tolerance:
@@ -253,7 +561,11 @@ def main(argv=None):
 
     for failure in failures:
         print("FAIL " + failure)
-    if not failures:
+    if not failures and legacy:
+        # Accepted only by --allow-unbound-legacy, and never labelled PASS: the picture is not tied to the application.
+        print("UNBOUND_LEGACY-ACCEPTED %d run(s), %d arm(s) with no picture_dump binding (%s): %s"
+              % (len(runs), len(legacy), ", ".join(legacy), "; ".join(notes)))
+    elif not failures:
         print("PASS %d run(s): %s" % (len(runs), "; ".join(notes) if notes else "decisions + sync/async parity"))
     return 1 if failures else 0
 

@@ -25,6 +25,9 @@ import subprocess
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
+import os
+
+_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
 
 ROOT = Path(__file__).resolve().parents[2]
 RUNNER = ROOT / "factory-pins" / "pin-runner.py"
@@ -83,7 +86,7 @@ def main(argv: list[str]) -> int:
         args += ["--config", str(CONFIG)]
     repo = Path(next((args[i + 1] for i, a in enumerate(args[:-1]) if a == "--repo"), str(ROOT))).resolve()
     done = subprocess.run([sys.executable, "-X", "utf8", "-I", str(RUNNER), "run", "check-doc-size", "--", *args],
-                          cwd=ROOT, capture_output=True)
+                          cwd=ROOT, capture_output=True, creationflags=_NO_WINDOW)
     sys.stdout.buffer.write(done.stdout)
     sys.stdout.buffer.flush()
     sys.stderr.buffer.write(done.stderr)

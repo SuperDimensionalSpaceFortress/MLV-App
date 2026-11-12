@@ -76,6 +76,9 @@ import re
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
+import os
+
+_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
 
 ROOT = Path(__file__).resolve().parents[2]
 
@@ -468,7 +471,7 @@ def _tracked_files(root: Path) -> list[str]:
     # turns tests/caf<e-acute>.cpp into a path that names nothing on disk.
     proc = subprocess.run(
         ["git", "-C", str(root), "ls-files", "-z", *SCAN_GLOBS],
-        capture_output=True, text=True, encoding="utf-8", errors="surrogateescape", check=True,
+        capture_output=True, text=True, encoding="utf-8", errors="surrogateescape", check=True, creationflags=_NO_WINDOW,
     )
     return [part for part in proc.stdout.split("\0") if part.strip()]
 

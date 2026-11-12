@@ -11,6 +11,8 @@ Owned dirt = files dirty now that were not dirty at SessionStart."""
 import fnmatch, json, os, shutil, subprocess, sys, time
 from pathlib import Path
 
+_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
+
 RUNBOOK_CANDIDATES = ["docs/ops/ROTATION.md", "knowledge/ROTATION.md",
                       "roadmap/handoff/ROTATION.md", "docs/ROTATION.md"]
 
@@ -18,7 +20,7 @@ RUNBOOK_CANDIDATES = ["docs/ops/ROTATION.md", "knowledge/ROTATION.md",
 def git(cwd, *args):
     try:
         p = subprocess.run(["git", "-C", str(cwd), "--no-optional-locks", *args],
-                           capture_output=True, text=True, timeout=60)
+                           capture_output=True, text=True, timeout=60, creationflags=_NO_WINDOW)
         return p.stdout.strip() if p.returncode == 0 else ""
     except Exception:
         return ""

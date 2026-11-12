@@ -2,6 +2,8 @@
 #define LOOKASSISTANALYSIS_H
 
 #include <QString>
+#include <QStringList>
+#include <QVector>
 
 #include <functional>
 #include <vector>
@@ -32,6 +34,8 @@ struct LookAssistStats
     double p99 = 0.0;
     double clipLow = 0.0;
     double clipHigh = 0.0;
+    // Share of samples with any channel above video white (235): a saturated single-channel clip has a low luma.
+    double aboveVideoWhite = 0.0;
     double dynamicRange = 0.0;
     double medianR = 0.0;
     double medianG = 0.0;
@@ -205,6 +209,26 @@ QString lookAssistDaylightGateName( const LookAssistStats &resolved, bool pictur
  *   surface_search=(not-run, converged, not-converged or unverifiable) surface_search_balance=(temp/tint, or NA)
  * Pure; reads nothing it was not given. */
 QString lookAssistDecisionLogFields( const LookAssistStats &resolved, const LookAssistDecisionTrace &trace );
+
+/* The display meter's answer from EVERY frame it rendered, up to three (ReceiptApplier::lookAssistDisplayMeter; the GUI
+ * and batch call that one meter). The meter READS a frame whose median is above 0; a black frame is rendered but not read.
+ * median, p95 and p99 are each sorted on their own over the read frames, and the element at index n / 2 is taken: the
+ * middle of three, the upper of two. The clip share (aboveVideoWhite) is the LARGER of two such medians, one over the read
+ * frames and one over every rendered frame. So a frame skipped as black still counts its clipped pixels (r4 adversary A1:
+ * two clipped black-median frames of three withhold the lift), and a clean black frame never dilutes the clip of a frame
+ * the meter reads. When every rendered frame is read, one clipped frame of three does not withhold the median-one lift,
+ * two do, and one of two does. The fields are independent, so the p99 and the clip share can come from different frames.
+ * p05 is the median. No read frame (or count <= 0) returns default stats, median 0. Pure. */
+LookAssistStats lookAssistDisplayMeterAggregate( const LookAssistStats *rendered, int count );
+
+/* The display_meter log fields, shared by the GUI (look_assist.display_meter) and batch ([BATCH] LOOK_ASSIST
+ * display_meter) lines, space separated:
+ *   samples=n robust_median=(1 decimal) robust_p95=(1 decimal) robust_p99=(1 decimal)
+ *   above_video_white=(the aboveVideoWhite fraction, 10 decimals) frame=n
+ * above_video_white is what the median-one lift's 0.002 gate reads. It is one frame's k / N (N = thumbnail pixels), which
+ * is either exactly 0.002 or at least 1 / (500 N) away from it, so 10 decimals print it on the correct side of
+ * 0.0020000000 for any N below 4e7 (r4 adversary A2: 101 / 50499 printed 0.002000 at 6 decimals). Pure. */
+QString lookAssistDisplayMeterLogFields( int samples, const LookAssistStats &meter, int frame );
 
 /* The picture rendered at the exposure the daylight verdict would apply (the Shade preset's lift) is a
  * lit daylight picture: mostly mid-tones around a mid median, not a dark field with a small bright
@@ -891,6 +915,100 @@ LookAssistPreset presetForLookAssistScene( LookAssistScene scene,
                                            const LookAssistStats *colorStats = nullptr,
                                            const LookAssistStats *displayStats = nullptr,
                                            LookAssistFlavor flavor = LookAssistFlavor::Classic );
+
+/* ---- The GUI's post-applied colour-cast safety (moved verbatim from platform/qt/MainWindow.cpp,
+ * LOOK-ASSIST-GREEN-ARTIFACT-FALLBACK-AT-LIFTED-EXPOSURE-1). ----
+ * The warning the post-applied picture carries ("none" when the stats are invalid). Every threshold is an absolute 8-bit
+ * code-value distance. */
+QString lookAssistColorCastWarning( bool postColorStatsValid,
+                                    const LookAssistStats &postColorStats,
+                                    double postVisibleGreenAxis,
+                                    int finalTemperature,
+                                    double postBlueAmberAxis );
+
+/* True when the warning must not be shown over the applied look. */
+bool lookAssistColorCastShouldFailClosed( const QString &warning,
+                                          double greenArtifactRatio,
+                                          double greenArtifactMeanAxis,
+                                          double visibleGreenAxis,
+                                          bool postAppliedStats );
+
+/* What the GUI's sync path does with a post-applied warning: keep the look, retreat only the exposure the analysis
+ * raised, or revert to the baseline sliders. postNeutralGreenAxis = balanceG - (balanceR + balanceB) / 2 of the same
+ * (failing) post-applied stats. */
+enum class LookAssistSafetyAction
+{
+    Keep,
+    RetreatExposure,
+    RevertBaseline
+};
+LookAssistSafetyAction lookAssistSafetyAction( const QString &warning,
+                                               double greenArtifactRatio,
+                                               double greenArtifactMeanAxis,
+                                               double visibleGreenAxis,
+                                               bool postAppliedStats,
+                                               int appliedExposure,
+                                               int baselineExposure,
+                                               double postNeutralGreenAxis );
+
+/* The exposures a RetreatExposure tries between the applied and the baseline exposure, highest first. */
+QVector<int> lookAssistSafetyRetreatRungs( int appliedExposure, int baselineExposure );
+
+/* ---- The RetreatExposure orchestration (793-I1): the GUI's sync path calls exactly this, with its live look behind the
+ * two callbacks, so the order of renders and the state left on screen are testable headless. ----
+ * One post-applied measurement of the look on screen (the GUI: analyzePostAppliedLook plus its warning). */
+struct LookAssistRetreatMeasurement
+{
+    bool valid = false;
+    LookAssistStats stats;
+    QString warning = QStringLiteral("none");
+    double visibleGreenAxis = 0.0;
+};
+struct LookAssistRetreatOutcome
+{
+    /* Keep: a rung or the measured bottom is on screen. RevertBaseline: the bottom is invalid or warned (the green is
+     * not the lift's), so the caller reverts the whole look. */
+    LookAssistSafetyAction action = LookAssistSafetyAction::RevertBaseline;
+    LookAssistRetreatMeasurement bottom;
+    bool rungKept = false;
+    int shownExposure = 0;                  // the exposure applyExposure last REPORTED applied: the one on screen
+    LookAssistRetreatMeasurement shown;     // the measurement of that state (the bottom's own when it was restored)
+    QStringList triedRungs;                 // "exposure:visible_green_axis:green_artifact_ratio", in order
+    int measurements = 0;                   // renders measured; never more than 3
+};
+/* applyExposure changes the exposure of the live look and nothing else, and returns the exposure it actually applied (the
+ * GUI clamps to the exposure slider's range: r2 adversary pass 4 A1, a rung of -401 shown as -400 must be reported as
+ * -400); measure measures the look on screen. Applies the
+ * baseline exposure and measures it (the bottom); when the bottom is valid and warning-free, tries each
+ * lookAssistSafetyRetreatRungs rung (apply + measure) and keeps the first that does not fail closed; when none does,
+ * re-applies the baseline exposure WITHOUT measuring it again and reports the bottom's measurement. */
+LookAssistRetreatOutcome lookAssistRunSafetyRetreat( int appliedExposure,
+                                                     int baselineExposure,
+                                                     const std::function<int( int exposure )> &applyExposure,
+                                                     const std::function<LookAssistRetreatMeasurement()> &measure );
+/* The fields of the look_assist.apply.safety_retreat line, from the outcome (kept_exposure is "none" on a revert). */
+QString lookAssistSafetyRetreatLogFields( const QString &firstWarning,
+                                          int appliedExposure,
+                                          int baselineExposure,
+                                          const LookAssistRetreatOutcome &outcome,
+                                          int frame );
+
+/* ---- The env-gated picture dump (793-F1, MLVAPP_LOOK_ASSIST_PICTURE_DUMP). The look before the safety handling and the
+ * look finally shown are two files; look-assist-final-frameN.png is always written AFTER the safety handling. ---- */
+QString lookAssistPictureDumpFileName( bool finalLook, int frame );
+/* The fields of the look_assist.apply.picture_dump line binding each file to the exposure it shows, BY CONTENT: *Sha256 is
+ * the SHA-256 (hex) of the exact PNG bytes this process wrote, empty when the write failed. A file is named only with its
+ * digest, and an unwritten one is "none" (r2 adversary A1/A2: a failed write, or a file another writer left or replaced
+ * under the same name, never verifies). safety is "keep", "retreat" or "revert". */
+QString lookAssistPictureDumpFields( int frame,
+                                     int preSafetyExposure,
+                                     const QString &preSafetySha256,
+                                     int finalExposure,
+                                     const QString &finalSha256,
+                                     const QString &safety );
+/* An MLVAPP_LOOK_ASSIST_PICTURE_DUMP_STATES label names state-<label>.png in the dump directory: 1-64 of [A-Za-z0-9_-],
+ * so it can never leave the directory or name another dump file (r2 adversary A1, pass 3). */
+bool lookAssistPictureDumpStateLabelValid( const QString &label );
 
 } // namespace lookassist
 

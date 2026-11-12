@@ -38,6 +38,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
+
 VERDICT_TAG = "k9-witness.v1"
 GIT_TIMEOUT_SECONDS = 60
 HEX40 = re.compile(r"^[0-9a-f]{40}$")
@@ -86,7 +88,7 @@ def _run(repo: str, args: list[str], input_bytes: bytes | None = None) -> subpro
     try:
         return subprocess.run(
             ["git", "-C", repo, *args],
-            input=input_bytes, capture_output=True, timeout=GIT_TIMEOUT_SECONDS,
+            input=input_bytes, capture_output=True, timeout=GIT_TIMEOUT_SECONDS, creationflags=_NO_WINDOW,
         )
     except (OSError, subprocess.TimeoutExpired) as exc:
         raise WitnessError(f"git {args[0]} could not run: {exc}") from exc

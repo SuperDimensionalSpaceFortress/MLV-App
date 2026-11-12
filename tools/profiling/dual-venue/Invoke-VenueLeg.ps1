@@ -903,7 +903,7 @@ if ($isLook -and $artifactsShare) {
 # strip, which is also copied next to the LOOK sheets (-SheetCopyDir, else <receipts>\..\sheets) so the hub can open it. Owner footage: .claude-state only.
 if ($visualRequest.applies -and $visualRequest.requested -and $artifactsShare -and (Test-Path -LiteralPath $artifactsShare -PathType Container)) {
     $receipt.visual = Read-DvVisualCaptures -Requested $true -ArtifactsDir $artifactsShare -EvidenceDir $evidenceDir -LegId ([string]$spec.legId) `
-        -Header "$($spec.legId)  $Venue  $Backend  $($SourceCommit.Substring(0, 12))"
+        -Header "$($spec.legId)  $Venue  $Backend  $($SourceCommit.Substring(0, 12))" -ClipId ([string]$spec.clipId)
     $stripDir = $(if (-not [string]::IsNullOrWhiteSpace($SheetCopyDir)) { $SheetCopyDir } else { Join-Path (Split-Path -Parent $ReceiptRoot) 'sheets' })
     $stripCert = $(if ($OfflineTestMode) { $stripDir } else { Test-DvLocalReceiptRoot -Path $stripDir })
     # r5 G6: the certified spelling replaces $stripDir HERE, before either branch (the primary strip and the self-heal loop below) builds a copy path from it
@@ -924,7 +924,7 @@ if ($visualRequest.applies -and $visualRequest.requested -and $artifactsShare -a
         $receipt['selfHealVisual'] = [ordered]@{}
         foreach ($preDir in @(Get-ChildItem -LiteralPath $selfHealLocal -Directory | Where-Object { $_.Name -cmatch '^pre-\d+$' } | Sort-Object { [int]$_.Name.Substring(4) })) {
             $preVisual = Read-DvVisualCaptures -Requested $true -ArtifactsDir $preDir.FullName -EvidenceDir (Join-Path $preDir.FullName 'inspected') -LegId "$($spec.legId)-$($preDir.Name)" `
-                -Header "$($spec.legId) $($preDir.Name)  $Venue  $Backend  $($SourceCommit.Substring(0, 12))"
+                -Header "$($spec.legId) $($preDir.Name)  $Venue  $Backend  $($SourceCommit.Substring(0, 12))" -ClipId ([string]$spec.clipId)
             if ($preVisual.stripPath -and $stripCert) {
                 New-Item -ItemType Directory -Force -Path $stripDir | Out-Null
                 $preStripCopy = Join-Path $stripDir "strip-$($spec.legId)-$($preDir.Name)-$Venue-$Backend-$($SourceCommit.Substring(0, 8))-$runStamp.png"
@@ -1080,7 +1080,8 @@ if ($outcome -in @('PASS', 'FAIL') -and $null -ne $receipt.visual) {
     if ($receipt.visual.verdict -ceq 'FROZEN_DISPLAY') {
         $detail = "INVALID: the job result was $outcome ($detail) but FROZEN_DISPLAY: $($receipt.visual.reason). A leg whose display did not change is not counted, whatever its cadence numbers say"
         $outcome = 'INVALID'
-    } elseif ($receipt.visual.verdict -cin @('VISUAL_DIVERGENCE', 'FROZEN_DISPLAY_SUSPECTED', 'VISUAL_ASSESSMENT_UNAVAILABLE', 'CAPTURE_UNBOUND', 'PARTIAL_FREEZE')) {
+    } elseif ($receipt.visual.verdict -cin @('VISUAL_DIVERGENCE', 'FROZEN_DISPLAY_SUSPECTED', 'VISUAL_ASSESSMENT_UNAVAILABLE', 'CAPTURE_UNBOUND', 'PARTIAL_FREEZE', 'EXPOSURE_OUT_OF_RANGE')) {
+        # VISUAL-GATE-EXPOSURE-FLOOR-1: a picture outside its exposure band (too dark / clipped in BOTH arms passes every other check) is counted and surfaced the same way.
         # (PLAYBACK-FROZEN-DISPLAY-SOURCE-DIFF-1: a single picture over an unknown source, and a leg with no viewport rectangle, are counted and surfaced like a divergence)
         # PLAYBACK-CPU-VISUAL-CAPTURE-TIMING-1: an unbound paused-instant capture is surfaced the same way (counted; its difference judges nothing).
         # PLAYBACK-CPU-VISUAL-CAPTURE-TIMING-2 r5: so is a partial freeze over source frames known to differ (counted; the display's paint stopped part-way).
@@ -1088,7 +1089,8 @@ if ($outcome -in @('PASS', 'FAIL') -and $null -ne $receipt.visual) {
     }
 }
 # GPU-DEVICE-LOSS-SELF-HEAL-1 r7 (sol r6 blocker; ledger scope 2026-10-15T08:05:36Z): every self-heal pre-launch the leg ran must show an OK picture. The fallback
-# runs L1-L3 ARE what the leg proves, so a PASS/FAIL leg is INVALID when any pre-launch's visual verdict is anything but OK -- FROZEN_DISPLAY, VISUAL_DIVERGENCE,
+# runs L1-L3 ARE what the leg proves, so a PASS/FAIL leg is INVALID when any pre-launch's visual verdict is anything but OK or EXPOSURE_OUT_OF_RANGE (the one
+# flag that is never an exclusion, VISUAL-GATE-EXPOSURE-FLOOR-1: counted and said in the detail) -- FROZEN_DISPLAY, VISUAL_DIVERGENCE,
 # NOT_CAPTURED, CAPTURE_BLANK, NOT_REQUESTED or a verdict this gate does not know -- or when a pre-launch the leg ran (pre-1..pre-<n> for the n entries of
 # generatorArgs.gpuPreLaunches, plus any pre-<n> it published) has no selfHealVisual entry or an entry with no verdict. The detail names every offending launch
 # and its verdict. (The measured run's own gate above, shared by every leg, is unchanged: there a divergence stays counted.)
@@ -1104,10 +1106,17 @@ if ($outcome -in @('PASS', 'FAIL') -and $selfHealLaunches.Count -gt 0) {
         $entry = $(if ($null -ne $receipt['selfHealVisual'] -and $receipt['selfHealVisual'].Contains($launch)) { $receipt['selfHealVisual'][$launch] } else { $null })
         if ($null -eq $entry -or [string]::IsNullOrWhiteSpace([string]$entry.verdict)) {
             "NO_VISUAL_ENTRY on self-heal pre-launch $($launch): the leg ran it but the receipt holds no visual verdict for it"
-        } elseif ([string]$entry.verdict -cne 'OK') {
+        } elseif ([string]$entry.verdict -cne 'OK' -and [string]$entry.verdict -cne 'EXPOSURE_OUT_OF_RANGE') {
             "$([string]$entry.verdict) on self-heal pre-launch $($launch): $($entry.reason)"
         }
     })
+    # VISUAL-GATE-EXPOSURE-FLOOR-1: EXPOSURE_OUT_OF_RANGE is a flag, never an exclusion (hub ruling), so it is the one non-OK verdict a pre-launch may show: it is
+    # counted and said in the detail, like the measured run's own divergence, and does not make the leg INVALID.
+    $exposureLaunches = @(foreach ($launch in $selfHealLaunches) {
+        $entry = $(if ($null -ne $receipt['selfHealVisual'] -and $receipt['selfHealVisual'].Contains($launch)) { $receipt['selfHealVisual'][$launch] } else { $null })
+        if ($null -ne $entry -and [string]$entry.verdict -ceq 'EXPOSURE_OUT_OF_RANGE') { "EXPOSURE_OUT_OF_RANGE on self-heal pre-launch $($launch) (counted, surfaced for review): $($entry.reason)" }
+    })
+    if ($exposureLaunches.Count -gt 0) { $detail += '; ' + ($exposureLaunches -join '; ') }
     if ($badLaunches.Count -gt 0) {
         $detail = "INVALID: the job result was $outcome ($detail) but " + ($badLaunches -join '; ') + '. A fallback run whose picture is not OK is not counted, whatever the measured run says'
         $outcome = 'INVALID'

@@ -27,6 +27,7 @@ from typing import Any, BinaryIO, Iterable
 
 from .core import is_reparse_point
 from .repository_identity import CANONICAL_REPOSITORY, alias_urls, is_repository_alias
+from .hidden_spawn import no_window_flags
 
 
 DEFAULT_MANIFEST = Path("tools/gates/vendored-native-payloads.json")
@@ -748,7 +749,7 @@ def _validate_promotion_verifier_unchanged(repo_root: Path) -> None:
         ["git", "-C", str(repo_root), "merge-base", "--is-ancestor", target_head, "HEAD"],
         check=False,
         stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
+        stderr=subprocess.PIPE, creationflags=no_window_flags(),
     )
     _require(ancestry.returncode == 0,
              "payload promotion target head is not an ancestor of the candidate")
@@ -761,7 +762,7 @@ def _validate_promotion_verifier_unchanged(repo_root: Path) -> None:
             check=False,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            text=True,
+            text=True, creationflags=no_window_flags(),
         )
         _require(target_blob.returncode == 0,
                  f"payload promotion verifier surface is absent from the pinned target: {relative}")
@@ -770,7 +771,7 @@ def _validate_promotion_verifier_unchanged(repo_root: Path) -> None:
             check=False,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            text=True,
+            text=True, creationflags=no_window_flags(),
         )
         _require(current_blob.returncode == 0 and current_blob.stdout.strip() == target_blob.stdout.strip(),
                  f"payload promotion verifier surface differs from the pinned target: {relative}")
@@ -806,7 +807,7 @@ def _tracked_repo_file(
                 ["git", "-C", str(repo_root), "ls-files", "--error-unmatch", "--stage", "--", relative],
                 check=False,
                 stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
+                stderr=subprocess.PIPE, creationflags=no_window_flags(),
             )
         except OSError as exc:
             raise PayloadIntegrityError(f"{label} cannot verify Git tracking: {exc}") from exc
@@ -944,7 +945,7 @@ def _validate_registered_promotion_claim(
         ["git", "-C", str(repo_root), "cat-file", "-e", f"{reviewed_commit}^{{commit}}"],
         check=False,
         stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
+        stderr=subprocess.PIPE, creationflags=no_window_flags(),
     )
     _require(commit_check.returncode == 0,
              f"{payload_id} registered promotion reviewed_commit is not a local commit")
@@ -952,7 +953,7 @@ def _validate_registered_promotion_claim(
         ["git", "-C", str(repo_root), "merge-base", "--is-ancestor", reviewed_commit, "HEAD"],
         check=False,
         stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
+        stderr=subprocess.PIPE, creationflags=no_window_flags(),
     )
     _require(ancestry.returncode == 0,
              f"{payload_id} registered promotion reviewed_commit is not an ancestor of HEAD")
@@ -960,7 +961,7 @@ def _validate_registered_promotion_claim(
         ["git", "-C", str(repo_root), "show", f"{reviewed_commit}:{receipt_path}"],
         check=False,
         stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
+        stderr=subprocess.PIPE, creationflags=no_window_flags(),
     )
     _require(receipt_at_review.returncode == 0,
              f"{payload_id} promotion receipt is absent at reviewed_commit")
@@ -970,7 +971,7 @@ def _validate_registered_promotion_claim(
         ["git", "-C", str(repo_root), "show", f"{reviewed_commit}:{DEFAULT_MANIFEST.as_posix()}"],
         check=False,
         stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
+        stderr=subprocess.PIPE, creationflags=no_window_flags(),
     )
     _require(manifest_at_review.returncode == 0,
              f"{payload_id} payload manifest is absent at reviewed_commit")
@@ -1655,7 +1656,7 @@ def _git_tracked_artifacts(repo_root: Path, suffixes: list[str]) -> set[str]:
             ["git", "-C", str(repo_root), "ls-files", "-z"],
             check=True,
             stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
+            stderr=subprocess.PIPE, creationflags=no_window_flags(),
         )
     except (OSError, subprocess.CalledProcessError) as exc:
         raise PayloadIntegrityError(f"cannot enumerate Git-tracked payload candidates: {exc}") from exc
