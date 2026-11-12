@@ -10,6 +10,9 @@ from pathlib import Path
 from typing import Any
 
 from jsonschema import Draft202012Validator
+import os
+
+_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
 
 
 SCHEMA_NAME = "sealed-real-clip-ab-receipt.schema.json"
@@ -36,7 +39,7 @@ def _git(repo_root: Path, *args: str) -> bytes:
         ["git", *args],
         cwd=repo_root,
         capture_output=True,
-        check=False,
+        check=False, creationflags=_NO_WINDOW,
     )
     if completed.returncode != 0:
         detail = (completed.stderr or completed.stdout).decode("utf-8", errors="replace")
@@ -146,7 +149,7 @@ def validate_sealed_receipt(
         ],
         cwd=repo_root,
         capture_output=True,
-        check=False,
+        check=False, creationflags=_NO_WINDOW,
     )
     if ancestry.returncode != 0:
         raise SealedReceiptError("protected baseline is not an ancestor of candidate product head")

@@ -17,6 +17,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, Iterator, List, Optional, Sequence, Tuple
 
+_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
+
 
 SCHEMA_VERSION = "1.0"
 POLICY_VERSION = "2026-05-03.v3"
@@ -464,7 +466,7 @@ def run_command(
         encoding="utf-8",
         errors="replace",
         capture_output=True,
-        env=env,
+        env=env, creationflags=_NO_WINDOW,
     )
     result = CommandResult(list(args), completed.returncode, completed.stdout, completed.stderr)
     if check and completed.returncode != 0:
@@ -1579,7 +1581,7 @@ def worktree_live_refusal(repo_root: Path, path: Path, *, runner: Any = subproce
               "if ($null -eq $r) { 'FREE' } else { $r | ConvertTo-Json -Compress -Depth 4 }")
     try:
         proc = runner([pwsh, "-NoProfile", "-NonInteractive", "-Command", script],
-                      capture_output=True, text=True, timeout=300, env=env)
+                      capture_output=True, text=True, timeout=300, env=env, creationflags=_NO_WINDOW)
     except (OSError, subprocess.TimeoutExpired) as exc:
         return failed(f"guard did not answer: {exc}")
     if proc.returncode != 0:
