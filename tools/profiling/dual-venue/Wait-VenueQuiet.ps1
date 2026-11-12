@@ -546,6 +546,35 @@ $telemetrySchema = 'mlv-app/venue-quiet-probe-telemetry/v1'
 $HeatFeedPath = $(if ($env:HEAVY_SLOT_FEED) { $env:HEAVY_SLOT_FEED } else { 'C:\temp\hwinfo-log-adapter.csv' })
 $HeatWindowRows = 60
 $HeatStaleSec = 120
+# BACHELOR-THERMAL-GATE-AGENT-THRESHOLD-PARITY-1: the agent hands every job its effective heat rule in $env:MLV_AGENT_HEAT_RULE (ultra-magnus-agent.ps1 Get-AgentHeatRule: maxThrottledRows,
+# meanMaxC, sustainedRows, feedStaleSec as JSON). The probe reads the feed with the AGENT'S window and staleness, and copies the record into heat{}.rule (and the 'tele heat' line) for the gate,
+# which holds the one validation that decides (Resolve-VenueHeatRule). Absent: the defaults above, no rule key (the gate says thresholds_source=default). Present but unusable (not JSON, not an
+# object, a field missing or not a finite non-negative number, a window outside 1..150, a staleness of 0): rule.source = invalid, and the defaults above are used for the feed read only.
+function Read-TelAgentHeatRule([string]$Json, [int]$DefaultRows, [double]$DefaultStaleSec) {
+    $r = [ordered]@{ source = 'default'; maxThrottledRows = $null; meanMaxC = $null; sustainedRows = $null; feedStaleSec = $null; windowRows = $DefaultRows; staleSec = $DefaultStaleSec }
+    if ([string]::IsNullOrWhiteSpace($Json)) { return [pscustomobject]$r }
+    $r.source = 'invalid'
+    try {
+        $o = $Json | ConvertFrom-Json -ErrorAction Stop
+        if ($o -isnot [pscustomobject]) { return [pscustomobject]$r }
+        $v = @{}
+        foreach ($k in 'maxThrottledRows', 'meanMaxC', 'sustainedRows', 'feedStaleSec') {
+            if (-not $o.PSObject.Properties[$k] -or $null -eq $o.$k -or $o.$k -is [bool]) { return [pscustomobject]$r }
+            $d = 0.0
+            if (-not [double]::TryParse([string]$o.$k, [Globalization.NumberStyles]::Float, [Globalization.CultureInfo]::InvariantCulture, [ref]$d)) { return [pscustomobject]$r }
+            if ([double]::IsNaN($d) -or [double]::IsInfinity($d) -or $d -lt 0) { return [pscustomobject]$r }
+            $v[$k] = $d
+        }
+        foreach ($k in 'maxThrottledRows', 'sustainedRows') { if ($v[$k] -ne [Math]::Floor($v[$k]) -or $v[$k] -gt [int]::MaxValue) { return [pscustomobject]$r } }
+        if ($v['sustainedRows'] -lt 1 -or $v['sustainedRows'] -gt 150 -or $v['feedStaleSec'] -le 0) { return [pscustomobject]$r }
+        $r.source = 'agent'; $r.maxThrottledRows = $o.maxThrottledRows; $r.meanMaxC = $o.meanMaxC; $r.sustainedRows = $o.sustainedRows; $r.feedStaleSec = $o.feedStaleSec
+        $r.windowRows = [int]$v['sustainedRows']; $r.staleSec = [double]$v['feedStaleSec']
+    } catch { $r.source = 'invalid' }
+    [pscustomobject]$r
+}
+$AgentHeatRule = Read-TelAgentHeatRule -Json ([string]$env:MLV_AGENT_HEAT_RULE) -DefaultRows $HeatWindowRows -DefaultStaleSec $HeatStaleSec
+$HeatWindowRows = $AgentHeatRule.windowRows
+$HeatStaleSec = $AgentHeatRule.staleSec
 $LeaseLogPath = ''
 $TelemetryCallMs = 4000
 $TelemetryWorkerPrelude = ''
@@ -638,6 +667,9 @@ function ConvertFrom-TelFeedRows([string[]]$Lines) {
 $heatFields = @('sample_age_s', 'hottest_core_c', 'max15_c', 'mean_c', 'mean_c_exact', 'throttled', 'window_rows', 'package_w')
 $telHeat = [ordered]@{ source = 'unavailable'; sample_age_s = $null; hottest_core_c = $null; max15_c = $null; mean_c = $null; mean_c_exact = $null; throttled = $null; window_rows = $null; package_w = $null
     window_rule_rows = $HeatWindowRows; stale_after_s = $HeatStaleSec; reasons = [ordered]@{}; why = $null }
+if ($AgentHeatRule.source -cne 'default') {
+    $telHeat['rule'] = [ordered]@{ source = $AgentHeatRule.source; maxThrottledRows = $AgentHeatRule.maxThrottledRows; meanMaxC = $AgentHeatRule.meanMaxC; sustainedRows = $AgentHeatRule.sustainedRows; feedStaleSec = $AgentHeatRule.feedStaleSec }
+}
 try {
     $w = Invoke-TelBounded $TelTailScript @($HeatFeedPath, (80 * 150 + 400), $TelemetryReadDelayMs) $TelemetryCallMs
     $code = $null
@@ -1264,7 +1296,13 @@ function Write-TelemetryLines($Probe) {
         Write-Gate (("  tele heat source={0} age={1} hottest={2} max15={3} mean={4} throttled={5}/{6} W={7}" -f (ConvertTo-IdentToken $h.source), (Format-TelNum $h.sample_age_s 's'),
             (Format-TelNum $h.hottest_core_c 'C'), (Format-TelNum $h.max15_c 'C'), (Format-TelNum $h.mean_c 'C'), (ConvertTo-IdentToken $h.throttled), (ConvertTo-IdentToken $h.window_rows),
             (Format-TelNum $h.package_w '')) + (Get-TelReasonSuffix $h) + $(if ($h.mean_c_exact -is [ValueType]) { ' mean_exact=' + ([double]$h.mean_c_exact).ToString('R', [Globalization.CultureInfo]::InvariantCulture) }
-            elseif ([string]$h.mean_c_exact -cin @('NaN', 'Infinity', '-Infinity')) { ' mean_exact=' + [string]$h.mean_c_exact } else { '' }))
+            elseif ([string]$h.mean_c_exact -cin @('NaN', 'Infinity', '-Infinity')) { ' mean_exact=' + [string]$h.mean_c_exact } else { '' }) +
+            # PARITY-1: the agent's published heat rule, as the gate reads it off this line (VenueThermalGate.psm1 Get-VenueRuleFromTeleLine); inline, so the existing harnesses that lift this function
+            # keep working. Nothing published -> nothing printed (the gate says thresholds_source=default); a record the probe could not use -> rule_source=invalid (THERMAL_THRESHOLDS_INVALID).
+            $(if ($h.PSObject.Properties['rule'] -and $null -ne $h.rule) {
+                if ([string]$h.rule.source -ceq 'agent') { ' rule_source=agent rule_max_throttled=' + (ConvertTo-IdentToken $h.rule.maxThrottledRows) + ' rule_mean_max_c=' + (ConvertTo-IdentToken $h.rule.meanMaxC) + ' rule_rows=' + (ConvertTo-IdentToken $h.rule.sustainedRows) + ' rule_stale_s=' + (ConvertTo-IdentToken $h.rule.feedStaleSec) }
+                else { ' rule_source=invalid' }
+            } else { '' }))
         $g = $Probe.gpu
         Write-Gate (("  tele gpu state={0} skipped_wake_risk={1} util={2} temp={3} W={4} pstate={5}" -f (ConvertTo-IdentToken $g.state), $(if ($g.skipped_wake_risk -eq $true) { 'true' } elseif ($g.skipped_wake_risk -eq $false) { 'false' } else { 'n/a' }),
             (Format-TelNum $g.utilization_percent '%'), (Format-TelNum $g.temp_c 'C'), (Format-TelNum $g.power_w ''), (ConvertTo-IdentToken $g.pstate)) + $(if ($g.state_reason) { ' state_reason=' + (ConvertTo-IdentToken $g.state_reason) } else { '' }))

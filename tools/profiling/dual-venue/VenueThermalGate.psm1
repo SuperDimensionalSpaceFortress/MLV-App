@@ -13,7 +13,10 @@
 # does not gate). The in-lease quiet probe (Wait-VenueQuiet.ps1) reads THE SAME feed with the agent's own reader copied (:527-546, the 60-row window) and
 # prints it on stdout BEFORE the leg is launched: "  tele heat source=<feed> ... mean=<C>C throttled=<n>/<rows> W=<w>" (:1262-1264). That line is the
 # reading this gate polls. Hot = the agent's rule exactly: throttled > 6 of the window, or mean >= 88 C (GateMaxThrottledRows / GateMeanMaxC, :60-61;
-# test_venue_thermal_gate.py holds these constants to the agent's defaults). A probe with no readable heat line is 'unknown' and is NOT gated (the agent
+# test_venue_thermal_gate.py holds these constants to the agent's defaults). BACHELOR-THERMAL-GATE-AGENT-THRESHOLD-PARITY-1: an agent started with other values publishes them
+# (ultra-magnus-agent.ps1 Get-AgentHeatRule -> job env MLV_AGENT_HEAT_RULE -> the probe's heat{}.rule and 'tele heat' rule_* tokens), and Resolve-VenueHeatRule applies them:
+# thresholds_source=agent. Nothing published (an agent that predates this): the defaults, thresholds_source=default. Published but unusable: heat 'unknown', reason
+# THERMAL_THRESHOLDS_INVALID. A probe with no readable heat line is 'unknown' and is NOT gated (the agent
 # does not gate lease-mode heat either); the receipt says so.
 #
 # Pure: no file writes, no network, no process start, no clock of its own. Read-VenueLegHeatHistory only reads the receipts it is pointed at.
@@ -27,21 +30,75 @@ $script:HeatMaxThrottledRows = 6
 $script:HeatMeanMaxC = 88.0
 $script:Inv = [System.Globalization.CultureInfo]::InvariantCulture
 
+$script:HeatSustainedRows = 60
+$script:HeatFeedStaleSec = 120.0
+$script:HeatMaxWindowRows = 150    # the rows the agent and the probe both read from the feed's tail (Select-Object -Last 150): a longer window is not one the probe can honour
+$script:ThresholdsInvalid = 'THERMAL_THRESHOLDS_INVALID'
+
+function Resolve-VenueHeatRule {
+    # BACHELOR-THERMAL-GATE-AGENT-THRESHOLD-PARITY-1: the heat thresholds the gate decides on. -Rule is the record the RUNNING agent published (ultra-magnus-agent.ps1
+    # Get-AgentHeatRule, copied by the quiet probe): an object with source, maxThrottledRows, meanMaxC, sustainedRows, feedStaleSec. $null (nothing published: an agent that predates it)
+    # -> the module defaults, source 'default'. A record that is present but unusable (not an object, source not 'agent', a field missing, not a number, non-finite, negative, a
+    # fractional count, a window of fewer than 1 or more than 150 rows, a staleness of 0) -> valid=$false, reason THERMAL_THRESHOLDS_INVALID: never the defaults, never a guess.
+    param([AllowNull()][object]$Rule)
+    $inv = [pscustomobject]@{ valid = $false; source = 'invalid'; maxThrottledRows = $null; meanMaxC = $null; sustainedRows = $null; feedStaleSec = $null; reason = $script:ThresholdsInvalid }
+    if ($null -eq $Rule) {
+        return [pscustomobject]@{ valid = $true; source = 'default'; maxThrottledRows = $script:HeatMaxThrottledRows; meanMaxC = $script:HeatMeanMaxC; sustainedRows = $script:HeatSustainedRows; feedStaleSec = $script:HeatFeedStaleSec; reason = $null }
+    }
+    if ($Rule -isnot [System.Management.Automation.PSCustomObject]) { return $inv }
+    $p = $Rule.PSObject.Properties
+    if (-not $p['source'] -or [string]$Rule.source -cne 'agent') { return $inv }
+    $vals = @{}
+    foreach ($k in 'maxThrottledRows', 'meanMaxC', 'sustainedRows', 'feedStaleSec') {
+        if (-not $p[$k] -or $null -eq $Rule.$k -or $Rule.$k -is [bool]) { return $inv }
+        $d = 0.0
+        if (-not [double]::TryParse([string]$Rule.$k, [System.Globalization.NumberStyles]::Float, $script:Inv, [ref]$d)) { return $inv }
+        if ([double]::IsNaN($d) -or [double]::IsInfinity($d) -or $d -lt 0) { return $inv }
+        $vals[$k] = $d
+    }
+    foreach ($k in 'maxThrottledRows', 'sustainedRows') { if ($vals[$k] -ne [Math]::Floor($vals[$k]) -or $vals[$k] -gt [int]::MaxValue) { return $inv } }
+    if ($vals['sustainedRows'] -lt 1 -or $vals['sustainedRows'] -gt $script:HeatMaxWindowRows) { return $inv }
+    if ($vals['feedStaleSec'] -le 0) { return $inv }
+    [pscustomobject]@{ valid = $true; source = 'agent'; maxThrottledRows = [int]$vals['maxThrottledRows']; meanMaxC = [double]$vals['meanMaxC']; sustainedRows = [int]$vals['sustainedRows']; feedStaleSec = [double]$vals['feedStaleSec']; reason = $null }
+}
+
 function Get-VenueHeatVerdict {
-    # 'hot' | 'clear' | 'unknown'. The agent's Get-SustainedHeatVerdict rule (ultra-magnus-agent.ps1:2436): hot when throttled > 6 or mean >= 88 C.
+    # 'hot' | 'clear' | 'unknown'. The agent's Get-SustainedHeatVerdict rule (ultra-magnus-agent.ps1:2436): hot when throttled > 6 or mean >= 88 C (the defaults; the agent's published
+    # thresholds replace them through -MaxThrottledRows / -MeanMaxC, resolved by Resolve-VenueHeatRule). The rule itself is the same under any thresholds.
     # r5 (sol r4 B1 / adversary A4): the throttled count is tested FIRST, so a mean that is NaN, missing or unparseable never masks a hot count (the feed parser accepts NaN and
     # Infinity, Wait-VenueQuiet.ps1:629). A mean of +Infinity is >= 88 and is hot, as the agent's comparison says. With throttled <= 6, a NaN, -Infinity or missing mean stays
     # unknown (fail closed, as before); so does a missing, unparseable or non-finite throttled count.
-    param([AllowNull()][object]$Throttled, [AllowNull()][object]$MeanC)
+    param([AllowNull()][object]$Throttled, [AllowNull()][object]$MeanC, [int]$MaxThrottledRows = $script:HeatMaxThrottledRows, [double]$MeanMaxC = $script:HeatMeanMaxC)
     if ($null -eq $Throttled) { return 'unknown' }
     $t = 0.0; $m = 0.0
     if (-not [double]::TryParse([string]$Throttled, [System.Globalization.NumberStyles]::Float, $script:Inv, [ref]$t)) { return 'unknown' }
     if ([double]::IsNaN($t) -or [double]::IsInfinity($t) -or $t -lt 0) { return 'unknown' }
-    if ($t -gt $script:HeatMaxThrottledRows) { return 'hot' }
+    if ($t -gt $MaxThrottledRows) { return 'hot' }
     if ($null -eq $MeanC) { return 'unknown' }
     if (-not [double]::TryParse([string]$MeanC, [System.Globalization.NumberStyles]::Float, $script:Inv, [ref]$m)) { return 'unknown' }
     if ([double]::IsNaN($m) -or [double]::IsNegativeInfinity($m)) { return 'unknown' }
-    if ($m -ge $script:HeatMeanMaxC) { 'hot' } else { 'clear' }
+    if ($m -ge $MeanMaxC) { 'hot' } else { 'clear' }
+}
+
+function Get-VenueRuleFromTeleLine {
+    # The agent's published rule as the quiet probe prints it on its "tele heat" line: rule_source=agent rule_max_throttled=<n> rule_mean_max_c=<c> rule_rows=<n> rule_stale_s=<s>
+    # (rule_source=invalid when the probe could not read the agent's record). No rule_source token = nothing was published = $null. A field that is missing stays MISSING on the
+    # object, so Resolve-VenueHeatRule refuses it.
+    param([string]$Line)
+    $src = [regex]::Match($Line, '\srule_source=(\S+)')
+    if (-not $src.Success) { return $null }
+    $o = [ordered]@{ source = $src.Groups[1].Value }
+    foreach ($pair in @(@('maxThrottledRows', 'rule_max_throttled'), @('meanMaxC', 'rule_mean_max_c'), @('sustainedRows', 'rule_rows'), @('feedStaleSec', 'rule_stale_s'))) {
+        $m = [regex]::Match($Line, '\s' + $pair[1] + '=(\S+)')
+        if ($m.Success) { $o[$pair[0]] = $m.Groups[1].Value }
+    }
+    [pscustomobject]$o
+}
+
+function New-VenueHeatReading {
+    # one reading object; thresholdsSource is 'agent' | 'default' | 'invalid', reason is $null or THERMAL_THRESHOLDS_INVALID
+    param([string]$Heat, $Throttled, $Window, $MeanC, [string]$Text, [string]$Source, $Rule)
+    [pscustomobject]@{ heat = $Heat; throttled = $Throttled; window = $Window; meanC = $MeanC; text = $Text; source = $Source; thresholdsSource = $Rule.source; reason = $Rule.reason }
 }
 
 function ConvertFrom-VenueProbeHeatLine {
@@ -64,15 +121,22 @@ function ConvertFrom-VenueProbeHeatLine {
             $okM = [double]::TryParse([string]$meanSrc, [System.Globalization.NumberStyles]::Float, $script:Inv, [ref]$mean)
             # r5 (B1): an unparseable mean is NaN, not a reason to drop the throttled count: Get-VenueHeatVerdict tests the count first
             if (-not $okM) { $mean = [double]::NaN }
-            $v = $(if ($okT -and $okW) { Get-VenueHeatVerdict -Throttled $thr -MeanC $mean } else { 'unknown' })
+            # PARITY-1: the agent's published thresholds ride in heat.rule; an unusable record is unknown, never read against the defaults
+            $rule = Resolve-VenueHeatRule -Rule $(if ($h.PSObject.Properties['rule']) { $h.rule } else { $null })
+            if (-not $rule.valid) { return (New-VenueHeatReading -Heat 'unknown' -Throttled $null -Window $null -MeanC $null -Text "$($rule.reason): the agent's published heat thresholds are unusable" -Source 'raw-json' -Rule $rule) }
+            $v = $(if ($okT -and $okW) { Get-VenueHeatVerdict -Throttled $thr -MeanC $mean -MaxThrottledRows $rule.maxThrottledRows -MeanMaxC $rule.meanMaxC } else { 'unknown' })
             if ($v -cne 'unknown') {
-                return [pscustomobject]@{ heat = $v; throttled = $thr; window = $win; meanC = $mean; text = "throttled $thr/$win, mean $($mean.ToString('0.00#', $script:Inv)) C"; source = 'raw-json' }
+                return (New-VenueHeatReading -Heat $v -Throttled $thr -Window $win -MeanC $mean -Text "throttled $thr/$win, mean $($mean.ToString('0.00#', $script:Inv)) C" -Source 'raw-json' -Rule $rule)
             }
         }
     }
     $line = @($Lines | Where-Object { $_ -match '^\s*tele heat ' }) | Select-Object -Last 1
-    $none = [pscustomobject]@{ heat = 'unknown'; throttled = $null; window = $null; meanC = $null; text = $(if ($line) { ([string]$line).Trim() } else { 'no tele heat line' }); source = 'none' }
+    $defaultRule = Resolve-VenueHeatRule -Rule $null
+    $none = New-VenueHeatReading -Heat 'unknown' -Throttled $null -Window $null -MeanC $null -Text $(if ($line) { ([string]$line).Trim() } else { 'no tele heat line' }) -Source 'none' -Rule $defaultRule
     if (-not $line) { return $none }
+    $rule = Resolve-VenueHeatRule -Rule (Get-VenueRuleFromTeleLine -Line ([string]$line))
+    if (-not $rule.valid) { return (New-VenueHeatReading -Heat 'unknown' -Throttled $null -Window $null -MeanC $null -Text "$($rule.reason): the agent's published heat thresholds are unusable" -Source 'tele-line' -Rule $rule) }
+    $none = New-VenueHeatReading -Heat 'unknown' -Throttled $null -Window $null -MeanC $null -Text ([string]$line).Trim() -Source 'none' -Rule $rule
     # r3 pass 2 A4: the feed parser accepts signed temperatures (a sensor's -1 error value), so the mean may carry a sign: unsigned only, the line read unknown while throttled=7/60 is hot
     # r5 (B1): and it accepts NaN and Infinity, which the display prints as NaN, the culture's infinity symbol (U+221E) or Infinity: any non-numeric mean token is read as a
     # non-finite mean, so the throttled count that follows it still decides (hot > 6) instead of the whole line reading unknown
@@ -96,7 +160,7 @@ function ConvertFrom-VenueProbeHeatLine {
     else { $mean = [double]::NaN }
     if (-not [int]::TryParse($m.Groups[2].Value, [System.Globalization.NumberStyles]::None, $script:Inv, [ref]$thr)) { return $none }   # advisory A10: an overflow is unknown, never a throw
     if (-not [int]::TryParse($m.Groups[3].Value, [System.Globalization.NumberStyles]::None, $script:Inv, [ref]$win)) { return $none }
-    [pscustomobject]@{ heat = (Get-VenueHeatVerdict -Throttled $thr -MeanC $mean); throttled = $thr; window = $win; meanC = $mean; text = "throttled $thr/$win, mean $($mean.ToString('0.0##', $script:Inv)) C"; source = 'tele-line' }
+    New-VenueHeatReading -Heat (Get-VenueHeatVerdict -Throttled $thr -MeanC $mean -MaxThrottledRows $rule.maxThrottledRows -MeanMaxC $rule.meanMaxC) -Throttled $thr -Window $win -MeanC $mean -Text "throttled $thr/$win, mean $($mean.ToString('0.0##', $script:Inv)) C" -Source 'tele-line' -Rule $rule
 }
 
 function Get-VenueThermalGateStep {
@@ -372,5 +436,5 @@ function Get-VenueThermalSpreadOrder {
     [pscustomobject]@{ items = @($out | ForEach-Object { , $Items[$_] }); heavy = $newHeavy; heavyAdjacent = (Measure-VenueHeavyAdjacency -Heavy $newHeavy); heavyAdjacentBefore = (Measure-VenueHeavyAdjacency -Heavy $Heavy) }
 }
 
-Export-ModuleMember -Function Get-VenueHeatVerdict, ConvertFrom-VenueProbeHeatLine, Get-VenueThermalGateStep, Get-VenueThermalProbeBudget, Get-VenueThermalNowUtc, Get-VenueThermalElapsedSec, Get-VenueLegKeyFromName, Get-VenueHeavyLegKeys, Read-VenueLegHeatHistory,
+Export-ModuleMember -Function Resolve-VenueHeatRule, Get-VenueHeatVerdict,ConvertFrom-VenueProbeHeatLine, Get-VenueThermalGateStep, Get-VenueThermalProbeBudget, Get-VenueThermalNowUtc, Get-VenueThermalElapsedSec, Get-VenueLegKeyFromName, Get-VenueHeavyLegKeys, Read-VenueLegHeatHistory,
     Measure-VenueHeavyAdjacency, Get-VenueThermalSpreadOrder

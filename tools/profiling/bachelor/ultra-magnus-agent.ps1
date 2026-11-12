@@ -2621,6 +2621,21 @@ function Get-SustainedHeatVerdict {
     return [pscustomobject]@{ state = "clear"; why = $s }
 }
 
+function Get-AgentHeatRule {
+    # BACHELOR-THERMAL-GATE-AGENT-THRESHOLD-PARITY-1. Pure. The heat rule THIS agent runs with, from the very params Get-SustainedHeatVerdict and ConvertFrom-HeavySlotFeedRows
+    # read, so a gate that reads it decides exactly as the agent does. Published on every admission record (admission.heatRule) and to every job as $env:MLV_AGENT_HEAT_RULE (JSON); the
+    # venue's quiet probe copies it into its heat{} block and the lease-batch thermal gate (VenueThermalGate.psm1 Resolve-VenueHeatRule) validates and applies it. A non-finite double
+    # (a GateMeanMaxC of NaN) is published as its name, since a JSON number cannot carry it: the gate then refuses the record. The values are the agent's constants (the same for
+    # every job), so the env var is overwritten per job and never needs clearing.
+    $mean = [double]$GateMeanMaxC
+    return [ordered]@{
+        maxThrottledRows = [int]$GateMaxThrottledRows
+        meanMaxC         = $(if ([double]::IsNaN($mean) -or [double]::IsInfinity($mean)) { [string]$mean } else { $mean })
+        sustainedRows    = [int]$GateSustainedRows
+        feedStaleSec     = [int]$GateFeedStaleSec
+    }
+}
+
 function Get-HeavySlotOccupancy {
     # Pure: who holds a slot, from `heavy-slot.py status`. $OwnSlot (this job's holder slot) counts as neither busy
     # nor free, so busy is about everyone ELSE. Also reads this job's position in heavy-slot.py's FIFO (queue lines).
@@ -4337,6 +4352,10 @@ function Invoke-QueuedJob {
         Complete-AdmissionWaitMarker -JobId $jobId -Status "queue-expired"
         return
     }
+    # PARITY-1: the heat rule this agent runs with, on the admission record and in the job's env (the quiet probe copies it for the lease-batch thermal gate)
+    $heatRule = Get-AgentHeatRule
+    $script:Admission | Add-Member -NotePropertyName heatRule -NotePropertyValue $heatRule -Force
+    $env:MLV_AGENT_HEAT_RULE = ($heatRule | ConvertTo-Json -Compress)
     $env:MLV_AGENT_ADMISSION = $script:Admission.label
     $env:MLV_AGENT_ADMISSION_THERMAL = [string]$script:Admission.thermal
     $env:MLV_AGENT_ADMISSION_WAIT_SEC = [string]$script:Admission.waitedSec

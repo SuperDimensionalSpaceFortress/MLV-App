@@ -1378,5 +1378,197 @@ class ThermalSpreadPlanTests(unittest.TestCase):
         self.assertIn("-HeatFrom is read only by -PlanOrder ThermalSpread", r.stderr)
 
 
+def agent_fn_ps(name: str, params: str, call: str) -> str:
+    """Run the agent's own function `name` (extracted by AST, never restated) with the agent's script-scope params set to `params` (PowerShell assignments)."""
+    return (f"$t = $null; $e = $null; $ast = [System.Management.Automation.Language.Parser]::ParseFile('{AGENT}', [ref]$t, [ref]$e); "
+            f"$fn = $ast.Find({{ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq '{name}' }}, $true); "
+            f"if ($null -eq $fn) {{ throw 'the agent does not define {name}' }}; . ([scriptblock]::Create($fn.Extent.Text)); {params}; {call}")
+
+
+def quiet_fn_ps(name: str, setup: str, call: str) -> str:
+    """Run Wait-VenueQuiet.ps1's own function `name`, taken from its text (the probe job is a here-string, so it is no AST function of the script, and the script itself
+    samples for 24 s and cannot be dot-sourced)."""
+    lines = QUIET.read_text(encoding="utf-8").splitlines()
+    i = next(k for k, l in enumerate(lines) if l.startswith(f"function {name}"))
+    out, depth = [], 0
+    for l in lines[i:]:
+        out.append(l)
+        depth += l.count("{") - l.count("}")
+        if depth == 0:
+            break
+    return "\n".join(out) + f"\n{setup}; {call}"
+
+
+def tele_line(throttled: int, mean: float, rule: str = "") -> str:
+    return (f"  tele heat source=C:\\temp\\hwinfo-log-adapter.csv age=1.7s hottest=50.0C max15=64.0C mean={mean:.1f}C throttled={throttled}/60 W=12.3{rule}")
+
+
+def agent_rule(thr, mean, rows=60, stale=120) -> str:
+    return f" rule_source=agent rule_max_throttled={thr} rule_mean_max_c={mean} rule_rows={rows} rule_stale_s={stale}"
+
+
+@requires_windows_pwsh
+class AgentThresholdParityTests(unittest.TestCase):
+    """BACHELOR-THERMAL-GATE-AGENT-THRESHOLD-PARITY-1 (adversary r5 A4 / r11 A3): the gate decides on the heat rule the RUNNING agent publishes, not on a copy of its defaults.
+    The agent publishes its effective rule (admission.heatRule and the job env MLV_AGENT_HEAT_RULE); the quiet probe copies it into heat{}.rule and the 'tele heat' line;
+    the gate reads it from there. Absent: the defaults, thresholds_source=default. Present but unusable: 'unknown' with THERMAL_THRESHOLDS_INVALID."""
+
+    def line(self, thr: int, mean: float, rule: str = "") -> dict:
+        return ps_json(f"ConvertFrom-VenueProbeHeatLine -Lines @('{tele_line(thr, mean, rule)}')")
+
+    def test_a_published_stricter_rule_makes_a_default_clear_reading_hot(self) -> None:
+        # throttled 4 and mean 82: clear under the defaults (> 6, >= 88), hot under the published 3 / 80
+        base = self.line(4, 82.0)
+        self.assertEqual((base["heat"], base["thresholdsSource"]), ("clear", "default"), base)
+        got = self.line(4, 82.0, agent_rule(3, 80))
+        self.assertEqual((got["heat"], got["thresholdsSource"]), ("hot", "agent"), got)
+        # each threshold alone decides: the count (4 > 3 with a cool mean), then the mean (82 >= 80 with a low count)
+        self.assertEqual(self.line(4, 70.0, agent_rule(3, 80))["heat"], "hot")
+        self.assertEqual(self.line(1, 82.0, agent_rule(3, 80))["heat"], "hot")
+        self.assertEqual(self.line(3, 79.9, agent_rule(3, 80))["heat"], "clear")   # the boundaries are the agent's: > 3 and >= 80
+
+    def test_a_published_looser_rule_makes_a_default_hot_reading_clear(self) -> None:
+        base = self.line(8, 90.0)
+        self.assertEqual((base["heat"], base["thresholdsSource"]), ("hot", "default"), base)
+        got = self.line(8, 90.0, agent_rule(10, 95))
+        self.assertEqual((got["heat"], got["thresholdsSource"]), ("clear", "agent"), got)
+        self.assertEqual(self.line(11, 90.0, agent_rule(10, 95))["heat"], "hot")
+        self.assertEqual(self.line(8, 95.0, agent_rule(10, 95))["heat"], "hot")
+
+    def test_the_raw_json_path_reads_the_published_rule_too(self) -> None:
+        import tempfile
+        d = Path(tempfile.mkdtemp(prefix="thermal-rule-raw-"))
+
+        def raw(name: str, heat: dict) -> str:
+            p = d / f"{name}.json"
+            p.write_text(json.dumps({"heat": heat}), encoding="utf-8")
+            return f"ConvertFrom-VenueProbeHeatLine -Lines @('  raw {p}')"
+
+        rule = {"source": "agent", "maxThrottledRows": 3, "meanMaxC": 80, "sustainedRows": 60, "feedStaleSec": 120}
+        hot = ps_json(raw("hot", {"mean_c": 82, "mean_c_exact": 82.0, "throttled": 4, "window_rows": 60, "rule": rule}))
+        self.assertEqual((hot["heat"], hot["thresholdsSource"], hot["source"]), ("hot", "agent", "raw-json"), hot)
+        clear = ps_json(raw("clear", {"mean_c": 90, "mean_c_exact": 90.0, "throttled": 8, "window_rows": 60, "rule": {**rule, "maxThrottledRows": 10, "meanMaxC": 95}}))
+        self.assertEqual((clear["heat"], clear["thresholdsSource"]), ("clear", "agent"), clear)
+        absent = ps_json(raw("absent", {"mean_c": 82, "mean_c_exact": 82.0, "throttled": 4, "window_rows": 60}))
+        self.assertEqual((absent["heat"], absent["thresholdsSource"]), ("clear", "default"), absent)
+        bad = ps_json(raw("bad", {"mean_c": 82, "mean_c_exact": 82.0, "throttled": 9, "window_rows": 60, "rule": {**rule, "meanMaxC": -1}}))
+        self.assertEqual((bad["heat"], bad["reason"], bad["thresholdsSource"]), ("unknown", "THERMAL_THRESHOLDS_INVALID", "invalid"), bad)
+
+    def test_an_absent_record_gives_the_defaults_and_says_so(self) -> None:
+        got = self.line(7, 70.0)
+        self.assertEqual((got["heat"], got["thresholdsSource"], got["reason"]), ("hot", "default", None), got)
+        self.assertEqual(self.line(6, 87.9)["heat"], "clear")
+        # a probe with no heat line at all is still unknown, and its source is the default (nothing was published)
+        none = ps_json("ConvertFrom-VenueProbeHeatLine -Lines @('QUIET mean=5.0%')")
+        self.assertEqual((none["heat"], none["thresholdsSource"]), ("unknown", "default"), none)
+        # the module's own defaults are unchanged
+        self.assertEqual(ps_json("Resolve-VenueHeatRule -Rule $null"),
+                         {"valid": True, "source": "default", "maxThrottledRows": 6, "meanMaxC": 88.0, "sustainedRows": 60, "feedStaleSec": 120.0, "reason": None})
+
+    def test_a_malformed_non_finite_or_negative_published_rule_is_unknown_with_a_typed_reason(self) -> None:
+        bad = ["rule_source=agent rule_max_throttled=NaN rule_mean_max_c=88 rule_rows=60 rule_stale_s=120",
+               "rule_source=agent rule_max_throttled=6 rule_mean_max_c=NaN rule_rows=60 rule_stale_s=120",
+               "rule_source=agent rule_max_throttled=6 rule_mean_max_c=Infinity rule_rows=60 rule_stale_s=120",
+               "rule_source=agent rule_max_throttled=-1 rule_mean_max_c=88 rule_rows=60 rule_stale_s=120",
+               "rule_source=agent rule_max_throttled=6 rule_mean_max_c=-5 rule_rows=60 rule_stale_s=120",
+               "rule_source=agent rule_max_throttled=6.5 rule_mean_max_c=88 rule_rows=60 rule_stale_s=120",
+               "rule_source=agent rule_max_throttled=6 rule_mean_max_c=88 rule_rows=0 rule_stale_s=120",          # a window the probe cannot honour
+               "rule_source=agent rule_max_throttled=6 rule_mean_max_c=88 rule_rows=151 rule_stale_s=120",        # more rows than the probe reads (150)
+               "rule_source=agent rule_max_throttled=6 rule_mean_max_c=88 rule_rows=60 rule_stale_s=0",
+               "rule_source=agent rule_max_throttled=6 rule_mean_max_c=88 rule_rows=60 rule_stale_s=-3",
+               "rule_source=agent rule_max_throttled=6 rule_mean_max_c=88 rule_rows=60 rule_stale_s=NaN",
+               "rule_source=agent rule_max_throttled=abc rule_mean_max_c=88 rule_rows=60 rule_stale_s=120",
+               "rule_source=agent rule_max_throttled=6 rule_mean_max_c=88 rule_rows=60",                          # a field missing
+               "rule_source=invalid",                                                                              # the probe could not read the agent's record
+               "rule_source=bogus rule_max_throttled=6 rule_mean_max_c=88 rule_rows=60 rule_stale_s=120"]
+        for tail in bad:
+            # throttled 9 would be hot under any rule: an unusable rule must not decide, nor fall back to the defaults
+            got = self.line(9, 95.0, " " + tail)
+            self.assertEqual((got["heat"], got["reason"], got["thresholdsSource"]), ("unknown", "THERMAL_THRESHOLDS_INVALID", "invalid"), (tail, got))
+        for rule in ({"source": "agent", "maxThrottledRows": "NaN", "meanMaxC": 88, "sustainedRows": 60, "feedStaleSec": 120},
+                     {"source": "agent", "maxThrottledRows": 6, "meanMaxC": "Infinity", "sustainedRows": 60, "feedStaleSec": 120},
+                     {"source": "agent", "maxThrottledRows": -2, "meanMaxC": 88, "sustainedRows": 60, "feedStaleSec": 120},
+                     {"source": "agent", "maxThrottledRows": 6, "meanMaxC": 88, "sustainedRows": 0, "feedStaleSec": 120},
+                     {"source": "agent", "maxThrottledRows": 6, "meanMaxC": 88, "sustainedRows": 60},
+                     {"source": "malformed"}):
+            got = ps_json(f"Resolve-VenueHeatRule -Rule ('{json.dumps(rule)}' | ConvertFrom-Json)")
+            self.assertEqual((got["valid"], got["reason"]), (False, "THERMAL_THRESHOLDS_INVALID"), (rule, got))
+
+    def test_the_heat_rule_itself_is_unchanged_count_first_and_non_finite_means_still_decide_as_before(self) -> None:
+        # the count is tested first under a published rule too; +Infinity is hot, NaN / -Infinity alone are unknown (the r5 behaviour, now under a non-default rule)
+        got = ps_json("$nan = [double]::NaN; $pi = [double]::PositiveInfinity; "
+                      "@((Get-VenueHeatVerdict -Throttled 4 -MeanC $nan -MaxThrottledRows 3 -MeanMaxC 80), (Get-VenueHeatVerdict -Throttled 0 -MeanC $pi -MaxThrottledRows 3 -MeanMaxC 80), "
+                      "(Get-VenueHeatVerdict -Throttled 0 -MeanC $nan -MaxThrottledRows 3 -MeanMaxC 80), (Get-VenueHeatVerdict -Throttled 3 -MeanC 79.9 -MaxThrottledRows 3 -MeanMaxC 80), "
+                      "(Get-VenueHeatVerdict -Throttled -1 -MeanC 10 -MaxThrottledRows 3 -MeanMaxC 80))")
+        self.assertEqual(got, ["hot", "hot", "unknown", "clear", "unknown"], got)
+
+    # ---- the agent publishes what it actually runs with
+    def test_e_the_agent_publishes_its_effective_params_defaults_and_non_default(self) -> None:
+        defaults = ps_json(agent_fn_ps("Get-AgentHeatRule", "$GateMaxThrottledRows = 6; $GateMeanMaxC = 88.0; $GateSustainedRows = 60; $GateFeedStaleSec = 120", "Get-AgentHeatRule"))
+        self.assertEqual(defaults, {"maxThrottledRows": 6, "meanMaxC": 88.0, "sustainedRows": 60, "feedStaleSec": 120})
+        custom = ps_json(agent_fn_ps("Get-AgentHeatRule", "$GateMaxThrottledRows = 3; $GateMeanMaxC = 80.5; $GateSustainedRows = 30; $GateFeedStaleSec = 45", "Get-AgentHeatRule"))
+        self.assertEqual(custom, {"maxThrottledRows": 3, "meanMaxC": 80.5, "sustainedRows": 30, "feedStaleSec": 45})
+        # a non-finite double is published as its name (a JSON number cannot carry it), so the gate sees it and refuses it
+        nan = ps_json(agent_fn_ps("Get-AgentHeatRule", "$GateMaxThrottledRows = 6; $GateMeanMaxC = [double]::NaN; $GateSustainedRows = 60; $GateFeedStaleSec = 120", "Get-AgentHeatRule"))
+        self.assertEqual(nan["meanMaxC"], "NaN")
+        # the published values, fed to the gate, are accepted as the rule
+        self.assertEqual(ps_json("Resolve-VenueHeatRule -Rule ('" + json.dumps({**custom, "source": "agent"}) + "' | ConvertFrom-Json)")["maxThrottledRows"], 3)
+
+    def test_e_the_agent_wires_the_rule_into_the_admission_record_and_the_job_env(self) -> None:
+        agent = AGENT.read_text(encoding="utf-8")
+        self.assertIn("function Get-AgentHeatRule", agent)
+        self.assertIn("$env:MLV_AGENT_HEAT_RULE = ($heatRule | ConvertTo-Json -Compress)", agent)
+        self.assertIn("$heatRule = Get-AgentHeatRule", agent)
+        self.assertIn("-NotePropertyName heatRule", agent)
+        # the env var is the agent's own constant, overwritten for every admitted job: it needs no Remove-Item (test_owner_footage_delete_class.py pins the exact Remove-Item lines)
+        self.assertNotIn("Env:\\MLV_AGENT_HEAT_RULE", agent)
+        # the decision still reads the very params that are published
+        self.assertIn("$Metrics.throttled -gt $GateMaxThrottledRows -or $Metrics.meanC -ge $GateMeanMaxC", agent)
+
+    # ---- the probe copies the agent's record, and reads the feed with the agent's window and staleness
+    def test_the_probe_reads_the_agents_env_rule_and_honours_its_window_and_staleness(self) -> None:
+        ok = ps_json(quiet_fn_ps("Read-TelAgentHeatRule", "", "Read-TelAgentHeatRule -Json '{\"maxThrottledRows\":3,\"meanMaxC\":80,\"sustainedRows\":30,\"feedStaleSec\":45}' -DefaultRows 60 -DefaultStaleSec 120"))
+        self.assertEqual((ok["source"], ok["maxThrottledRows"], ok["meanMaxC"], ok["sustainedRows"], ok["feedStaleSec"], ok["windowRows"], ok["staleSec"]), ("agent", 3, 80, 30, 45, 30, 45), ok)
+        absent = ps_json(quiet_fn_ps("Read-TelAgentHeatRule", "", "Read-TelAgentHeatRule -Json '' -DefaultRows 60 -DefaultStaleSec 120"))
+        self.assertEqual((absent["source"], absent["windowRows"], absent["staleSec"]), ("default", 60, 120), absent)
+        for text in ("{not json", '{"maxThrottledRows":3}', '{"maxThrottledRows":3,"meanMaxC":80,"sustainedRows":0,"feedStaleSec":45}',
+                     '{"maxThrottledRows":3,"meanMaxC":"NaN","sustainedRows":30,"feedStaleSec":45}', "[1,2]", '"text"'):
+            bad = ps_json(quiet_fn_ps("Read-TelAgentHeatRule", "", f"Read-TelAgentHeatRule -Json '{text}' -DefaultRows 60 -DefaultStaleSec 120"))
+            self.assertEqual((bad["source"], bad["windowRows"], bad["staleSec"]), ("invalid", 60, 120), (text, bad))
+        quiet = QUIET.read_text(encoding="utf-8")
+        self.assertIn("$env:MLV_AGENT_HEAT_RULE", quiet)
+        self.assertIn("rule_source=", quiet)
+        self.assertIn("$telHeat['rule'] = ", quiet)
+
+    def test_the_probes_printed_line_round_trips_the_published_rule_into_the_gate(self) -> None:
+        # the probe's own printer (Write-TelemetryLines, taken from Wait-VenueQuiet.ps1) -> the gate's line parser, through the probe's JSON round trip
+        funcs = "\n".join(quiet_fn_ps(n, "", "") for n in ("ConvertTo-IdentToken", "Format-TelNum", "Get-TelReasonSuffix", "Write-TelemetryLines"))
+        script = (
+            "$telemetrySchemaV1 = 'mlv-app/venue-quiet-probe-telemetry/v1'; function Write-Gate([string]$s) { $s }\n" + funcs + "\n"
+            "function Get-Case($rule, [int]$thr, [double]$mean) {\n"
+            "  $h = [ordered]@{ source = 'C:\\temp\\hwinfo-log-adapter.csv'; sample_age_s = 1.0; hottest_core_c = 50.0; max15_c = 60.0; mean_c = $mean; mean_c_exact = $mean; throttled = $thr; window_rows = 60; package_w = 10.0; reasons = [ordered]@{} }\n"
+            "  if ($null -ne $rule) { $h['rule'] = $rule }\n"
+            "  $p = [ordered]@{ telemetry_schema = $telemetrySchemaV1; heat = $h; gpu = [ordered]@{ state = 'absent' }; last_lease = [ordered]@{ event = 'none' } } | ConvertTo-Json -Depth 6 | ConvertFrom-Json\n"
+            "  $out = @('  raw UNWRITABLE sharing violation') + @(Write-TelemetryLines $p)\n"
+            "  $r = ConvertFrom-VenueProbeHeatLine -Lines $out\n"
+            "  [pscustomobject]@{ heat = $r.heat; src = $r.thresholdsSource; reason = $r.reason; line = [string](@($out | Where-Object { $_ -match '^\\s*tele heat ' })[0]) }\n"
+            "}\n"
+            "$strict = [ordered]@{ source = 'agent'; maxThrottledRows = 3; meanMaxC = 80.5; sustainedRows = 60; feedStaleSec = 120 }\n"
+            "$loose = [ordered]@{ source = 'agent'; maxThrottledRows = 10; meanMaxC = 95; sustainedRows = 30; feedStaleSec = 45 }\n"
+            "@((Get-Case $strict 4 82.0), (Get-Case $null 4 82.0), (Get-Case $loose 8 90.0), (Get-Case $null 8 90.0), (Get-Case ([ordered]@{ source = 'invalid' }) 9 95.0))")
+        got = ps_json(script)
+        self.assertEqual([(g["heat"], g["src"], g["reason"]) for g in got],
+                         [("hot", "agent", None), ("clear", "default", None), ("clear", "agent", None), ("hot", "default", None), ("unknown", "invalid", "THERMAL_THRESHOLDS_INVALID")], got)
+        self.assertTrue(got[0]["line"].endswith(" rule_source=agent rule_max_throttled=3 rule_mean_max_c=80.5 rule_rows=60 rule_stale_s=120"), got[0]["line"])
+        self.assertNotIn("rule_source", got[1]["line"], "nothing published prints nothing")
+        self.assertTrue(got[4]["line"].endswith(" rule_source=invalid"), got[4]["line"])
+
+    # ---- the leg receipt says where the thresholds came from
+    def test_the_runner_receipt_carries_thresholds_source(self) -> None:
+        src = (DV / "Invoke-VenueLeaseBatch.ps1").read_text(encoding="utf-8")
+        self.assertIn("thresholds_source", src)
+        self.assertIn("thresholdsSource = $ht.thresholdsSource", src)
+
+
 if __name__ == "__main__":
     unittest.main()
