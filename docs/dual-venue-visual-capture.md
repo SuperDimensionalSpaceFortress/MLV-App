@@ -116,7 +116,7 @@ Numbers are computed from the VIDEO VIEWPORT only -- the window's timecode and f
   and it carries at most 6 decimal places on a fraction cap and 4 on a luma limit, because a limit finer than a measurement (a ratio over 2304
   pixels) can resolve rounds to the same double as an outside measurement and would read in band).
   Luma is measured in exact integer ten-thousandths, so a row whose mean is exactly 2 is picture, not a bar, and a pixel at exactly 16 or 235 is on its own side of the limit. The medians and fractions are
-  stored unrounded (the reason rounds to 6 places for display), so a cap such as `maxClippedFraction` 0.00042 flags one clipped pixel in 2304.
+  stored unrounded to anything a limit could tell apart (the median rounds to 12 places, only to absorb floating-point noise, so a median exactly ON an inclusive limit is in band; the reason rounds to 6 places for display), so a cap such as `maxClippedFraction` 0.00042 flags one clipped pixel in 2304.
 
 | verdict | when | counted |
 |---|---|---|

@@ -9390,7 +9390,11 @@ class VisualExposureFloorTests(unittest.TestCase):
         # adversary 099c3eac A1 (r4): the median of an even count was ([double]a + [double]b) / 2.0, so frame fractions 0.4 and 0.8 (exactly 0.6 between them)
         # averaged to 0.6000000000000001 and tripped the inclusive cap of 0.6; the same for a luma median over 100.0001 and the clipped fraction
         pairs = [("0.4", "0.8", "0.6"), ("0.1", "0.5", "0.3"), ("100.0000", "100.0002", "100.0001"), ("99.9998", "100.0000", "99.9999"),
-                 ("0.2", "1.0", "0.6"), ("0.05", "0.15", "0.1"), ("16.0001", "16.0003", "16.0002"), ("234.9999", "235.0001", "235")]
+                 ("0.2", "1.0", "0.6"), ("0.05", "0.15", "0.1"), ("16.0001", "16.0003", "16.0002"), ("234.9999", "235.0001", "235"),
+                 # adversary 288559f1 A1: the frames' own ratios (a pixel count over the picture's pixel count) are not short decimals, so a decimal average is no better:
+                 # near-black 389/1920 and 1915/1920 (exactly 0.6), clipped 4/1920 and 188/1920 (0.05), luma 1531*100/1920 and 5*100/1920 (40)
+                 ("(389/1920)", "(1915/1920)", "0.6"), ("(4/1920)", "(188/1920)", "0.05"), ("(1531*100/1920)", "(5*100/1920)", "40"),
+                 ("(1152/1920)", "(1152/1920)", "0.6"), ("(96/1920)", "(96/1920)", "0.05")]
         script = "$ErrorActionPreference = 'Stop'; $rows = @(); " + " ".join(
             f"$rows += [pscustomobject]@{{ lo = '{a}'; hi = '{b}'; mid = '{m}'; "
             f"exact = ((Get-DvExposureMedian ([double[]]@({a}, {b}))) -eq {m}); "
