@@ -12686,6 +12686,55 @@ class ReconReleaseDeferredEvidenceTests(unittest.TestCase):
                     self.assertEqual((v["verdict"], v["blocks"], v["observed"]), ("NOT_HONOURED", True, None), v)
                     self.assertIn("unreadable", v["reason"])
 
+    # HFR-NATIVE-M16-1457-GUI-TEXTURE-PRESENT-OFFLOAD-1 r12 (r9 keys sol/opus/fable on 4a61e684, adversary A1): the mention test compared the session TEXT, so a
+    # record whose session is the same integer spelled `03`, `+3`, `003` or `+03` was not a mention. A conflicting one beside a canonical record read HONOURED,
+    # and alone it read NOT_REQUESTED (the isolation arm that does not ask). Equal integers are the same session; a signed run that is not a single optional
+    # sign is unreadable too (it blocks); a different integer (session=31, -3, +2) is another session.
+    NUMERIC_SPELLINGS = (("leading zero", lambda r: r.replace("session=3 ", "session=03 ")),
+                         ("plus sign", lambda r: r.replace("session=3 ", "session=+3 ")),
+                         ("two leading zeros", lambda r: r.replace("session=3 ", "session=003 ")),
+                         ("plus sign and leading zero", lambda r: r.replace("session=3 ", "session=+03 ")),
+                         ("a doubled sign", lambda r: r.replace("session=3 ", "session=++3 ")),
+                         ("a plus then a minus", lambda r: r.replace("session=3 ", "session=+-3 ")),
+                         ("spaces around the equals sign and a plus", lambda r: r.replace("session=3 ", "session = +3 ")),
+                         ("session after the first field, leading zero", lambda r: r.replace("session=3 deferred_enabled=", "deferred_enabled=").replace(" deferred=", " session=03 deferred=", 1)))
+
+    def test_a_numeric_spelling_of_the_measured_session_is_the_same_session(self) -> None:
+        for name, mangle in self.NUMERIC_SPELLINGS:
+            for spec, canonical, conflicting in ((self.OFF, self.record("0", deferred="0"), self.record("1")), ({}, self.record("1"), self.record("0", deferred="0"))):
+                with self.subTest(case=name, spec=spec):
+                    v = self.verdict(spec, self.log(canonical, mangle(conflicting)))
+                    self.assertEqual((v["verdict"], v["blocks"], v["observed"]), ("NOT_HONOURED", True, None), v)
+                    self.assertIn("unreadable", v["reason"])
+
+    def test_a_numeric_spelling_alone_is_unreadable_for_every_leg(self) -> None:
+        for name, mangle in self.NUMERIC_SPELLINGS:
+            for spec in (self.OFF, {}):
+                for enabled, deferred in (("0", "0"), ("1", "412")):
+                    with self.subTest(case=name, spec=spec, enabled=enabled):
+                        v = self.verdict(spec, self.log(mangle(self.record(enabled, deferred=deferred))))
+                        self.assertEqual((v["verdict"], v["blocks"], v["observed"]), ("NOT_HONOURED", True, None), v)
+                        self.assertIn("unreadable", v["reason"])
+
+    def test_a_measured_session_logged_with_a_leading_zero_matches_every_spelling_of_itself(self) -> None:
+        start = self.START.replace("session=3 ", "session=03 ")
+        summary = "playback_smoke.summary session=03 reason=reached presented_frames=600"
+
+        def zero_log(*records: str) -> str:
+            return "\n".join(["playback_smoke.measured_session id=03", start, *records, summary]) + "\n"
+
+        v = self.verdict(self.OFF, zero_log(self.record("0", session="03", deferred="0")))
+        self.assertEqual((v["verdict"], v["blocks"], v["observed"]), ("HONOURED", False, 0), v)
+        v = self.verdict(self.OFF, zero_log(self.record("0", session="03", deferred="0"), self.record("1", session="3")))
+        self.assertEqual((v["verdict"], v["blocks"], v["observed"]), ("NOT_HONOURED", True, None), v)
+
+    def test_a_different_integer_is_another_session_in_every_spelling(self) -> None:
+        for name, record in (("session 31", self.record("0", session=31)), ("session +31", self.record("0", session="+31")), ("session 031", self.record("0", session="031")),
+                             ("session -3", self.record("0", session="-3")), ("session +2", self.record("0", session="+2")), ("session 02", self.record("0", session="02"))):
+            with self.subTest(case=name):
+                v = self.verdict({}, self.log(self.record("1"), record))
+                self.assertEqual((v["verdict"], v["blocks"], v["observed"]), ("NOT_REQUESTED", False, 1), v)
+
     def test_another_sessions_noncanonical_record_is_not_a_mention(self) -> None:
         # The widening is scoped to the measured session: session=31 or session=2 in any shape is another session, never this one's record.
         for name, record in (("session 31", self.record("0", session=31)), ("session 2, double space", self.record("0", session=2).replace(" session=", "  session="))):
@@ -12805,6 +12854,39 @@ class PrepConflatedMoveEvidenceTests(unittest.TestCase):
                     v = self.verdict(spec, self.log(canonical, mangle(self.route("0" if spec else "1"))))
                     self.assertEqual((v["verdict"], v["blocks"], v["observed"]), ("NOT_HONOURED", True, None), v)
                     self.assertIn("unreadable", v["reason"])
+
+    # r12 (adversary A1 sibling :1774): the same numeric-spelling hole as the recon_release reader; equal integers are the same session.
+    NUMERIC_SPELLINGS = (("leading zero", lambda r: r.replace("session=3 ", "session=03 ")),
+                         ("plus sign", lambda r: r.replace("session=3 ", "session=+3 ")),
+                         ("two leading zeros", lambda r: r.replace("session=3 ", "session=003 ")),
+                         ("plus sign and leading zero", lambda r: r.replace("session=3 ", "session=+03 ")),
+                         ("a doubled sign", lambda r: r.replace("session=3 ", "session=++3 ")),
+                         ("a plus then a minus", lambda r: r.replace("session=3 ", "session=+-3 ")),
+                         ("spaces around the equals sign and a plus", lambda r: r.replace("session=3 ", "session = +3 ")),
+                         ("session after the field, leading zero", lambda r: "playback_smoke.prep_route prep_conflated_move_active=0 session=03"))
+
+    def test_a_numeric_spelling_of_the_measured_session_is_the_same_session(self) -> None:
+        for name, mangle in self.NUMERIC_SPELLINGS:
+            for spec, canonical, conflicting in ((self.ON, self.route("1"), self.route("0")), ({}, self.route("0"), self.route("1"))):
+                with self.subTest(case=name, spec=spec):
+                    v = self.verdict(spec, self.log(canonical, mangle(conflicting)))
+                    self.assertEqual((v["verdict"], v["blocks"], v["observed"]), ("NOT_HONOURED", True, None), v)
+                    self.assertIn("unreadable", v["reason"])
+
+    def test_a_numeric_spelling_alone_is_unreadable_for_every_leg(self) -> None:
+        for name, mangle in self.NUMERIC_SPELLINGS:
+            for spec in (self.ON, {}):
+                for value in ("0", "1"):
+                    with self.subTest(case=name, spec=spec, value=value):
+                        v = self.verdict(spec, self.log(mangle(self.route(value))))
+                        self.assertEqual((v["verdict"], v["blocks"], v["observed"]), ("NOT_HONOURED", True, None), v)
+                        self.assertIn("unreadable", v["reason"])
+
+    def test_a_different_integer_is_another_session_in_every_spelling(self) -> None:
+        for name, session in (("31", "31"), ("+31", "+31"), ("031", "031"), ("-3", "-3"), ("+2", "+2"), ("02", "02")):
+            with self.subTest(case=name):
+                v = self.verdict({}, self.log(self.route("0"), self.route("1", session=session)))
+                self.assertEqual((v["verdict"], v["blocks"], v["observed"]), ("NOT_REQUESTED", False, 0), v)
 
     def test_a_start_line_field_is_never_read_as_engagement(self) -> None:
         # r2 (adversary A1): the start line carries launcher env values, so a field there is not the app's decision.

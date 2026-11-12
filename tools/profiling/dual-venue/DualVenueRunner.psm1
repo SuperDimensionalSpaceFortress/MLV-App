@@ -1738,6 +1738,39 @@ function Get-DvWorkerThreadsEvidence {
     [ordered]@{ requested = $requested; observed = $observed; inheritedOverrides = $inheritedOverrides; verdict = $verdict; reason = $reason; blocks = ($verdict -cin @('NOT_HONOURED', 'INHERITED_WORKER_OVERRIDE')) }
 }
 
+function ConvertTo-DvSessionKey {
+    <#
+    .SYNOPSIS
+    HFR-NATIVE-M16-1457-GUI-TEXTURE-PRESENT-OFFLOAD-1 r12 (r9 keys on 4a61e684, adversary A1): the canonical text of a session integer, so equal integers compare equal
+    whatever their spelling (`3`, `03`, `+3`, `003`). A negative non-zero integer keeps its minus; `-0` is `0`. Digits only (no culture, no overflow).
+    #>
+    param([string]$Sign, [Parameter(Mandatory)][string]$Digits)
+    $d = $Digits.TrimStart('0')
+    if ($d -eq '') { return '0' }
+    if ($Sign -ceq '-') { return '-' + $d }
+    return $d
+}
+
+function Test-DvRecordMentionsSession {
+    <#
+    .SYNOPSIS
+    Does this record body mention the record marker AND the measured session, in any shape (r8: separators, field order)? r12: the session is compared as an INTEGER,
+    never as text, so `session=03`, `session=+3` and `session=003` are the measured session 3 (a record the app never writes, which is why it must make the state
+    unreadable rather than be skipped while a conflicting canonical record passes). A run of more than one sign (`++3`, `+-3`) is read as its magnitude, so it
+    still counts for session 3 and blocks; `-3` is another session. session=31 is not session 3. Pure; shared by the recon_release and prep_route readers.
+    #>
+    param([AllowNull()][AllowEmptyString()][string]$Body, [Parameter(Mandatory)][string]$Marker, [Parameter(Mandatory)][string]$Session)
+    if ([string]::IsNullOrEmpty($Body)) { return $false }
+    if ($Body -cnotmatch ('^(?=.*' + [regex]::Escape($Marker) + '(?!\w))')) { return $false }
+    $want = $(if ($Session -cmatch '^[0-9]+$') { ConvertTo-DvSessionKey -Sign '' -Digits $Session } else { $Session })
+    foreach ($m in [regex]::Matches($Body, '(?<!\w)session\s*=\s*(?<sign>[+-]*)(?<digits>[0-9]+)')) {
+        $sign = $m.Groups['sign'].Value
+        $key = ConvertTo-DvSessionKey -Sign $(if ($sign -ceq '-') { '-' } else { '' }) -Digits $m.Groups['digits'].Value
+        if ($key -ceq $want) { return $true }
+    }
+    return $false
+}
+
 function Get-DvPrepConflatedMoveEvidence {
     <#
     .SYNOPSIS
@@ -1771,9 +1804,9 @@ function Get-DvPrepConflatedMoveEvidence {
             $whole = '^(\[[^\]]*\] \[[A-Za-z]+\] (\[0x[0-9A-Fa-f]+\] )?)?playback_smoke\.prep_route session=' + [regex]::Escape([string]$session) +
                 ' prep_conflated_move_active=(?<v>[01])$'
             # r8 (adversary A1 sibling): any record body naming the marker and the measured session is a mention, whatever the separators or field order.
-            $mention = '^(?=.*playback_smoke\.prep_route(?!\w))(?=.*(?<!\w)session\s*=\s*' + [regex]::Escape([string]$session) + '(?!\d))'
+            # r12 (adversary A1 on 4a61e684): the session is compared as an integer (Test-DvRecordMentionsSession), so `session=03` / `session=+3` are this session.
             foreach ($l in (Get-DvLogRecordBodies -LogText $LogText)) {
-                if ($l -cnotmatch $mention) { continue }
+                if (-not (Test-DvRecordMentionsSession -Body $l -Marker 'playback_smoke.prep_route' -Session ([string]$session))) { continue }
                 $mentions++
                 $m = [regex]::Match($l, $whole)
                 if ($m.Success) { $records++; $observed = [int]$m.Groups['v'].Value }
@@ -1830,9 +1863,9 @@ function Get-DvReconReleaseDeferredEvidence {
             # (double space, TAB, punctuation, `session = 3`, session after another field), so a noncanonical duplicate is counted and makes the state
             # unreadable rather than being skipped while a conflicting canonical record passes. session=31 is not session 3. r8 fix 2 (adversary A1 on 17f3ed8e):
             # the two facts are independent lookaheads, so the session may come BEFORE the marker too (`session=3 playback_smoke.recon_release ...`).
-            $mention = '^(?=.*playback_smoke\.recon_release(?!\w))(?=.*(?<!\w)session\s*=\s*' + [regex]::Escape([string]$session) + '(?!\d))'
+            # r12 (adversary A1 on 4a61e684): the session is compared as an integer (Test-DvRecordMentionsSession), so `session=03` / `session=+3` are this session.
             foreach ($l in (Get-DvLogRecordBodies -LogText $LogText)) {
-                if ($l -cnotmatch $mention) { continue }
+                if (-not (Test-DvRecordMentionsSession -Body $l -Marker 'playback_smoke.recon_release' -Session ([string]$session))) { continue }
                 $mentions++
                 $m = [regex]::Match($l, $whole)
                 if ($m.Success) {
