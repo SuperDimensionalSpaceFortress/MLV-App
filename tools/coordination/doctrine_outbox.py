@@ -566,6 +566,25 @@ def _run_git(repo: pathlib.Path, args: list[str], input_text: str | None = None,
     )
 
 
+def item_text_from_bytes(raw: bytes) -> str:
+    """An outbox item's text with CRLF read as LF and NOTHING else changed. The default text readers (read_text, a text-mode git
+    pipe) also turn a lone CR into LF, which splits one row of a card into two: `rule: x<CR>check: hidden` is ONE row to the bus
+    validator (a fused key) and two accepted fields after that translation, so the screen never saw the fusion and the drain
+    rendered a duplicate field the bus then rejected (Sol r3 B1). A lone CR is kept here and refused by parse_item for a card."""
+    return raw.decode("utf-8", errors="replace").replace("\r\n", "\n")
+
+
+def git_show_item_text(repo: pathlib.Path, spec: str) -> tuple[int, str, str]:
+    """(returncode, text, stderr) of `git show <spec>`, the text read by item_text_from_bytes and stripped as git_try strips it."""
+    env = {**os.environ, "GIT_OPTIONAL_LOCKS": "0"}
+    proc = subprocess.run(
+        ["git", "-C", str(repo), "-c", "core.autocrlf=false", "-c", "core.safecrlf=false", "show", spec],
+        capture_output=True, timeout=120, env=env,
+    )
+    return (proc.returncode, item_text_from_bytes(proc.stdout).strip(),
+            proc.stderr.decode("utf-8", errors="replace").strip())
+
+
 def git(repo: pathlib.Path, *args: str, input_text: str | None = None,
         extra_env: dict[str, str] | None = None) -> str:
     proc = _run_git(repo, list(args), input_text, extra_env)
@@ -648,9 +667,16 @@ def parse_item(text: str) -> dict:
         raise Refusal("ITEM_LAW4_NOT_ATTESTED", "law4: attested is required (and is then SCREENED, not trusted)")
     if meta["target"] == "RULINGS.md" and not meta.get("ratified_by"):
         raise Refusal("ITEM_RULING_UNRATIFIED", "a RULINGS.md item needs ratified_by: <RULINGS anchor>; sessions do not mint law")
+    if meta["target"] != CARDS_TARGET:
+        body = body.replace("\r", "\n")   # an entry is read as it always was: the text readers turned a lone CR into LF
     if not body.strip():
         raise Refusal("ITEM_EMPTY_BODY")
     if meta["target"] == CARDS_TARGET:
+        if "\r" in body:
+            # The readers keep a lone CR (item_text_from_bytes). The bus splits a card on LF only, so a CR is text inside a row,
+            # where it can hide a fused field key that a CR-to-LF translation would promote to an accepted field (Sol r3 B1).
+            raise Refusal("ITEM_CARD_LONE_CR", "a card body holds a carriage return that is not part of a CRLF line end; the bus "
+                                               "validator reads it as text inside a row, so remove it")
         if not CARD_HEADING_RE.match(card_heading_row(body)):
             raise Refusal("ITEM_BODY_NOT_A_CARD", f"body must start with a '## {PROJECT}/<id>' card heading "
                                                   f"(R14.1; format in the bus's {CARD_VALIDATOR_REL})")
@@ -808,7 +834,22 @@ _PLAIN_KEY_RE = re.compile(rf"(?P<key>{_FIELD_KEY_ALT}):")
 _JS_WS_CHARS = "\t\n\x0b\x0c\r \xa0\u1680" + "".join(map(chr, range(0x2000, 0x200B))) + "\u2028\u2029\u202f\u205f\u3000\ufeff"
 _JS_WS = "[" + "".join(re.escape(c) for c in _JS_WS_CHARS) + "]"
 _JS_NOT_EOL = r"[^\n\r\u2028\u2029]"   # JS `.` (no s flag); the validator's `$` is the end of the line, there is no m flag
-_BUS_BOLD_LINE_RE = re.compile(rf"- \*\*(?P<label>[^*:]+):\*\*(?:{_JS_WS}+{_JS_NOT_EOL}*)?\Z")
+# The validator's bold line is `- **label:**` then optionally `\s+.*` to the end. A regex of `{WS}+{NOT_EOL}*\Z` backtracks
+# quadratically on a long whitespace run that ends in a line separator (Sol r3 B2), so only the head is a regex and the tail is
+# checked in linear time by _bold_tail_ok.
+_BUS_BOLD_HEAD_RE = re.compile(r"- \*\*(?P<label>[^*:]+):\*\*")
+_JS_EOL_CHARS = "\n\r  "
+
+
+def _bold_tail_ok(rest: str) -> bool:
+    """True when `rest` matches `(?:\\s+.*)?$` as JavaScript reads it: empty, or whitespace first and, up to the last line
+    terminator (which `.` cannot cross), nothing but whitespace."""
+    if not rest:
+        return True
+    if rest[0] not in _JS_WS_CHARS:
+        return False
+    last = max(rest.rfind(c) for c in _JS_EOL_CHARS)
+    return last < 0 or not rest[:last + 1].strip(_JS_WS_CHARS)
 _BUS_PLAIN_LINE_RE = re.compile(rf"(?P<label>[A-Za-z-]+):(?:{_JS_WS}{_JS_NOT_EOL}*)?\Z")
 # BOLD_LABELS in validate-cards.mjs (a test pins it to the vendored validator): the bold-bullet labels that are fields.
 _BOLD_LABELS = {**{k: k for k in CARD_FIELDS}, "applies to": "applies"}
@@ -833,9 +874,10 @@ def _card_rows(body: str) -> list[str]:
     dropped. A blank row is one JS trim() empties; whitespace ON the heading row is kept, because the bus reads `## ` only at
     the start of its line and rejects `  ## x` as card-like text outside a card."""
     rows = body.replace("\r\n", "\n").split("\n")
-    while rows and not rows[0].strip(_JS_WS_CHARS):
-        rows.pop(0)
-    return rows
+    first = 0   # an index, not rows.pop(0) in a loop: front removals are quadratic on a body of many blank rows (Sol r3 B2)
+    while first < len(rows) and not rows[first].strip(_JS_WS_CHARS):
+        first += 1
+    return rows[first:]
 
 
 def card_heading_row(body: str) -> str:
@@ -860,8 +902,8 @@ def _bold_label_fold(label: str) -> tuple[str, str | None]:
 def _parse_field_line(row: str) -> tuple[str, str | None, int] | None:
     """`(spelling, field, end)` for a line the bus validator reads as a field line, else None: spelling is "bold" or "plain",
     field is the field name (None for a bold note label or an unknown plain name), end is where the opening label ends."""
-    m = _BUS_BOLD_LINE_RE.match(row)
-    if m:
+    m = _BUS_BOLD_HEAD_RE.match(row)
+    if m and _bold_tail_ok(row[m.end():]):
         return "bold", _bold_label_fold(m.group("label"))[1], m.end("label") + 3
     m = _BUS_PLAIN_LINE_RE.match(row)
     if m:
@@ -913,7 +955,6 @@ def screen_rendered_card(item: dict) -> None:
     with the resolved 40-hex source commit, so PENDING is judged at that full width."""
     if item["meta"]["target"] != CARDS_TARGET:
         return
-    screen_card_field_keys(item["body"])
     src = item["meta"]["source_commit"]
     _key, block = render_block(item, "0" * 40 if src == "PENDING" else src)
     rows = block.replace("\r\n", "\n").strip("\n").split("\n")
@@ -922,6 +963,9 @@ def screen_rendered_card(item: dict) -> None:
         raise Refusal("CARD_INVALID", f"rendered card is {len(rows)} lines; the limit is {MAX_CARD_LINES}")
     if size > MAX_CARD_BYTES:
         raise Refusal("CARD_INVALID", f"rendered card is {size} bytes; the limit is {MAX_CARD_BYTES}")
+    # The limits come first: the field-key screen reads every row, so an input past the cap must be refused before it, not after
+    # a scan whose cost grows with the input (Sol r3 B2). Inside the cap the screen's input is at most 2,000 bytes.
+    screen_card_field_keys(item["body"])
 
 
 # ---------- repository queries (committed bytes only, never the worktree) ----------
@@ -986,7 +1030,9 @@ def load_outbox_items(repo: pathlib.Path, ref: str) -> list[dict]:
         if not ITEM_NAME_RE.match(name):
             items.append({"path": p, "name": name, "error": f"ITEM_BAD_FILENAME: {name}"})
             continue
-        text = git(repo, "show", f"{ref}:{p}")
+        rc, text, err = git_show_item_text(repo, f"{ref}:{p}")
+        if rc != 0:
+            raise GitError(f"git show {ref}:{p} (in {repo}): {err}")
         if not text.endswith("\n"):
             text += "\n"
         try:
@@ -2268,7 +2314,9 @@ def check_commit_bare(repo: pathlib.Path, sha: str, deny_terms: list[tuple[str, 
             problems.append(f"{sha[:10]} {p}: name must be <yyyymmdd>-<slug>.md")
             continue
         try:
-            text = git(repo, "show", f"{sha}:{p}")
+            rc, text, err = git_show_item_text(repo, f"{sha}:{p}")
+            if rc != 0:
+                raise GitError(f"git show {sha}:{p} (in {repo}): {err}")
             item = parse_item(text + "\n")
             screen_law4(item["body"], deny_terms)
             screen_rendered_card(item)
@@ -2307,7 +2355,7 @@ def check_commit(repo: pathlib.Path, sha: str, added_items: set[str],
         if norm not in added_items:
             problems.append(f"DOCTRINE_EXPORT_OUTBOX_ITEM_NOT_ADDED_IN_RANGE: {norm}")
             continue
-        rc, text, _err = git_try(repo, "show", f"{sha}:{norm}")
+        rc, text, _err = git_show_item_text(repo, f"{sha}:{norm}")
         if rc != 0:
             problems.append(f"DOCTRINE_EXPORT_OUTBOX_ITEM_MISSING_AT_COMMIT: {norm}")
             continue
@@ -2370,7 +2418,7 @@ def _item_paths(paths: Iterable[str]) -> list[str]:
 
 def _item_key(repo: pathlib.Path, rev: str, path: str) -> tuple[dict, str] | None:
     """(item, idempotency key) for `path` as it stands at `rev`; None when it is not a valid item (the other checks name that)."""
-    rc, text, _err = git_try(repo, "show", f"{rev}:{path}")
+    rc, text, _err = git_show_item_text(repo, f"{rev}:{path}")
     if rc != 0:
         return None
     try:
@@ -5185,7 +5233,7 @@ def cmd_validate(paths: list[pathlib.Path], deny_terms: list[tuple[str, str]],
             # a file that validates here has to be one the drain will accept.
             if not ITEM_NAME_RE.match(p.name):
                 raise Refusal("ITEM_BAD_FILENAME", p.name)
-            text = p.read_text(encoding="utf-8")
+            text = item_text_from_bytes(p.read_bytes())
             if not text.endswith("\n"):
                 text += "\n"
             item = parse_item(text)

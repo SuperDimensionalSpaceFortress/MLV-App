@@ -3572,3 +3572,113 @@ def test_every_heading_row_the_bus_rejects_is_refused_and_every_one_it_accepts_i
         if py_ok != (not errors):
             bad.append(f"{head!r}: bus_ok={not errors} validate_ok={py_ok} {errors[:1]}")
     assert not bad, "\n".join(bad)
+
+
+# ---------- r4: a lone CR is not a line break, and a huge input reaches its cap in linear time (Sol r3 B1 B2) ----------
+#
+# B1: the text readers turned a lone CR into LF, so `rule: x<CR>check: hidden` (ONE row to the bus: a fused key) became two
+# accepted fields; validate said OK and the drain rendered a duplicate `check` the bus rejects. The readers now keep a lone CR and
+# parse_item refuses it in a card (ITEM_CARD_LONE_CR). B2: the bold-line regex backtracked quadratically on a long whitespace run
+# that ends in a line separator, `_card_rows` removed leading blank rows one pop(0) at a time, and the field-key screen ran
+# before the byte cap, so an oversized input paid the quadratic cost before it was refused.
+#
+# Named mutation for this block (turns the named tests red, then is reverted):
+#   M19 read items with read_text / a text-mode git pipe again             -> every lone-CR test
+#   M20 restore the `{WS}+{NOT_EOL}*\Z` bold-line regex or the pop(0) loop -> the pre-cap timing tests
+
+def _lone_cr_body(key: str) -> str:
+    body = CARD_BODY.replace("rule: the rule\n", f"rule: x\r{key}: hidden\n", 1)
+    assert "\r" in body and body != CARD_BODY
+    return body
+
+
+@pytest.mark.parametrize("key", ob.CARD_FIELDS)
+def test_validate_refuses_a_card_whose_lone_cr_would_otherwise_hide_a_fused_field_key(tmp_path, capsys, key):
+    item = tmp_path / "20261009-lone-cr.md"
+    item.write_bytes(item_text(target=CARDS, body=_lone_cr_body(key)).encode("utf-8"))   # LF line ends, one lone CR, no translation
+    assert ob.main(["--repo", str(tmp_path), "validate", str(item)]) == 1
+    assert "ITEM_CARD_LONE_CR" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("key", ob.CARD_FIELDS)
+def test_check_commits_lists_a_card_whose_lone_cr_would_otherwise_hide_a_fused_field_key(tmp_path, key):
+    src, base = _range_repo(tmp_path)
+    name = "20261009-lone-cr-card.md"
+    sha = _commit(src, {f"doctrine-outbox/{name}": item_text(target=CARDS, body=_lone_cr_body(key))},
+                  f"add a lone-CR card\n\nDoctrine-Export: outbox {name}")
+    failures = ob.check_commits(src, f"{base}..HEAD", [])
+    problems = [p for ps in failures.values() for p in ps]
+    assert problems and all("ITEM_CARD_LONE_CR" in p for p in problems)
+    # the `trailer_mode: bare` reader (check_commit_bare) reads the same blob through the same item reader
+    bare = ob.check_commit_bare(src, sha, [])
+    assert [p for p in bare if "ITEM_CARD_LONE_CR" in p], bare
+
+
+def test_the_drain_reader_refuses_a_card_with_a_lone_cr_and_keeps_an_entrys_old_reading(tmp_path):
+    src, _base = _range_repo(tmp_path)
+    _commit(src, {"doctrine-outbox/20261009-lone-cr-card.md": item_text(target=CARDS, body=_lone_cr_body("check")),
+                  "doctrine-outbox/20261009-lone-cr-entry.md": item_text(body="### Entry\nline one\rline two\n")},
+            "add a card and an entry that carry a lone CR")
+    by_name = {e["name"]: e for e in ob.load_outbox_items(src, "HEAD")}
+    assert "ITEM_CARD_LONE_CR" in by_name["20261009-lone-cr-card.md"]["error"]
+    assert by_name["20261009-lone-cr-entry.md"]["item"]["body"] == "### Entry\nline one\nline two\n"   # an entry: CR read as LF, as before
+
+
+def test_a_card_with_crlf_line_ends_is_still_accepted(tmp_path):
+    item = tmp_path / "20261009-crlf-card.md"
+    item.write_bytes(item_text(target=CARDS, body=CARD_BODY).replace("\n", "\r\n").encode("utf-8"))
+    assert ob.main(["--repo", str(tmp_path), "validate", str(item)]) == 0
+
+
+_PRE_CAP_BUDGET_S = 3.0
+
+
+def _timed(fn):
+    t0 = time.perf_counter()
+    result = fn()
+    return result, time.perf_counter() - t0
+
+
+@pytest.mark.parametrize("sep", [" ", " ", "\n", "\r"])
+def test_a_long_whitespace_run_ending_in_a_line_separator_is_parsed_in_linear_time(sep):
+    row = "- **check:**" + " " * 60000 + "y" + sep + "z"
+    _, took = _timed(lambda: ob._parse_field_line(row))
+    assert took < _PRE_CAP_BUDGET_S, f"{took:.2f}s for 60000 spaces: the bold-line match is not linear"
+
+
+def test_the_bold_line_reading_is_unchanged_by_the_linear_tail_check():
+    """The linear tail check agrees with the regex it replaced (`\\s+.*` to the end, JavaScript's classes) on a table of tails."""
+    old = re.compile(rf"- \*\*[^*:]+:\*\*(?:{ob._JS_WS}+{ob._JS_NOT_EOL}*)?\Z")
+    tails = ["", " ", " x", " z", " \n z", "x", " ", "  \r  y  z", " y\nz", " y ", "  \t", "  q",
+             "﻿a", "\x85a", " a  ", "\n\n\n", "     b", "b "]
+    for tail in tails:
+        row = "- **check:**" + tail
+        parsed = ob._parse_field_line(row)
+        assert (parsed is not None and parsed[0] == "bold") == bool(old.match(row)), repr(tail)
+
+
+def test_a_body_of_many_leading_blank_rows_is_split_in_linear_time():
+    body = "\n" * 400000 + CARD_BODY
+    rows, took = _timed(lambda: ob._card_rows(body))
+    assert rows[0] == "## mlv-app/example-card"
+    assert took < _PRE_CAP_BUDGET_S, f"{took:.2f}s for 400000 blank rows"
+
+
+def test_an_oversized_card_is_refused_at_the_cap_before_the_field_key_screen_reads_it(monkeypatch):
+    called = []
+    monkeypatch.setattr(ob, "screen_card_field_keys", lambda body: called.append(len(body)))
+    huge = CARD_BODY.replace("mechanism: the mechanism\n", "mechanism: " + "m" * 50000 + "\n", 1)
+    item = {"meta": {"target": CARDS, "kind": "trap", "source_commit": "PENDING"}, "body": huge}
+    with pytest.raises(ob.Refusal) as e:
+        ob.screen_rendered_card(item)
+    assert e.value.code == "CARD_INVALID"
+    assert not called, "the field-key screen ran on an input over the byte cap"
+
+
+@pytest.mark.parametrize("sep", [" ", " "])
+def test_validate_refuses_a_million_space_bold_row_at_the_cap_in_bounded_time(tmp_path, capsys, sep):
+    body = CARD_BODY.replace("check: py -3 -m pytest tests/coordination -q\n", "- **check:**" + " " * 1000000 + "y" + sep + "z\n", 1)
+    item = _write_card_item(tmp_path, body)
+    rc, took = _timed(lambda: ob.main(["--repo", str(tmp_path), "validate", str(item)]))
+    assert rc == 1 and "CARD_INVALID" in capsys.readouterr().err
+    assert took < 10, f"{took:.1f}s to refuse a 1 MB card"
