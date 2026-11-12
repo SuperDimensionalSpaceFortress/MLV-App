@@ -232,6 +232,10 @@ NATIVE_TRACE_D4_LEGS = {
        for mode in ("fullscreen", "windowed") for scale in (2, 4)},
 }
 SHIPPED_LEGS = (*SHIPPED_LEGS, *NATIVE_TRACE_D4_LEGS)
+# HFR-NATIVE-M16-1457-GUI-TEXTURE-PRESENT-OFFLOAD-1 r7: the isolation arm of the deferred-release A/B (generatorArgs.disableReconReleaseDeferred true ->
+# MLVAPP_GPU_RECON_RELEASE_DEFERRED=0), keyed to the paced cell it twins (legId and that key are the only differences). The head arm is the cell itself.
+RELEASE_SYNC_LEGS = {"legs/m16-1457-native-fullscreen-s2-release-sync.json": "legs/m16-1457-native-fullscreen-s2.json"}
+SHIPPED_LEGS = (*SHIPPED_LEGS, *RELEASE_SYNC_LEGS)
 # CPU-S1-RECON-CHAIN-ATTRIBUTION-1: the capture-free CPU fullscreen s1 arms that attribute the frame interval: control (c), prep fast path off (p), a worker cap of 12 (t12), Look Assist off (l).
 CHAINATTR_LEGS = tuple(f"legs/m16-1243-chainattr-{arm}-fullscreen-s1.json" for arm in ("c", "p", "t12", "l"))
 SHIPPED_LEGS = (*SHIPPED_LEGS, *CHAINATTR_LEGS)
@@ -1090,6 +1094,28 @@ class GeneratorByteIdentityAndVariantTests(unittest.TestCase):
                         "the mapping must sit outside the forceLookAssist branch")
         schema = json.loads((DV / "leg-spec.schema.json").read_text(encoding="utf-8"))
         self.assertEqual(schema["properties"]["generatorArgs"]["properties"]["prepConflatedMove"]["const"], True)
+
+    def test_the_recon_release_kill_switch_reaches_the_apps_env_only_when_asked(self) -> None:
+        """HFR-NATIVE-M16-1457-GUI-TEXTURE-PRESENT-OFFLOAD-1 r7: -DisableReconReleaseDeferred adds MLVAPP_GPU_RECON_RELEASE_DEFERRED=0 to the app's env list
+        exactly once; absent, the job is the text it was (the head arm sets nothing: the app's default is the deferred release). The runner maps
+        generatorArgs.disableReconReleaseDeferred true for any leg (outside the forceLookAssist branch); the schema types it as a boolean."""
+        plain = self.generate(GENERATOR, "rrd-plain.job.ps1", []).read_text(encoding="utf-8").replace("\r\n", "\n")
+        self.assertNotIn("MLVAPP_GPU_RECON_RELEASE_DEFERRED", plain)
+        job = self.generate(GENERATOR, "rrd-off.job.ps1", ["-DisableReconReleaseDeferred"])
+        self.assertEqual(self.parse_errors(job), 0)
+        text = job.read_text(encoding="utf-8").replace("\r\n", "\n")
+        line = "    'MLVAPP_GPU_RECON_RELEASE_DEFERRED=0',\n"
+        self.assertEqual(text.count("MLVAPP_GPU_RECON_RELEASE_DEFERRED"), 1)
+        self.assertIn("'MLVAPP_PLAYBACK_PHASE3_UNATTENDED=1',\n" + line, text)
+        self.assertEqual(text.replace(line, ""), plain, "the switch is the only difference from the plain job")
+        runner = (DV / "Invoke-VenueLeg.ps1").read_text(encoding="utf-8")
+        mapping = ("if ($spec.generatorArgs.PSObject.Properties['disableReconReleaseDeferred'] -and $spec.generatorArgs.disableReconReleaseDeferred -is [bool] "
+                   "-and $spec.generatorArgs.disableReconReleaseDeferred) { $gen['DisableReconReleaseDeferred'] = $true }")
+        self.assertEqual(runner.count(mapping), 1)
+        self.assertLess(runner.index(mapping), runner.index("if (-not $isLook -and $spec.generatorArgs.PSObject.Properties['forceLookAssist']"),
+                        "the mapping must sit outside the forceLookAssist branch")
+        schema = json.loads((DV / "leg-spec.schema.json").read_text(encoding="utf-8"))
+        self.assertEqual(schema["properties"]["generatorArgs"]["properties"]["disableReconReleaseDeferred"]["type"], "boolean")
 
     def test_the_runner_passes_a_legs_swap_interval_to_the_generator(self) -> None:
         runner = (DV / "Invoke-VenueLeg.ps1").read_text(encoding="utf-8")
@@ -5568,6 +5594,35 @@ def run_pwsh_json(script: str, **env: str):
         return proc, None
 
 
+def run_pwsh_evidence_cases(function: str, cases: list[tuple[dict, str]]) -> tuple[subprocess.CompletedProcess, list | None]:
+    """One pwsh for a whole table of (spec, log) cases of a pure evidence reader (`function -Spec -LogText`), results in input order. The cases go through a
+    UTF-8 JSON file (ASCII-escaped, so a surrogate-pair digit survives), not the environment, whose 32 KB limit a table can pass."""
+    with tempfile.TemporaryDirectory() as d:
+        path = Path(d) / "cases.json"
+        path.write_text(json.dumps([{"spec": spec, "log": log} for spec, log in cases]), encoding="utf-8")
+        return run_pwsh_json("$cases = Get-Content -Raw -LiteralPath $env:DVE_CASES -Encoding utf8 | ConvertFrom-Json\n"
+                             f"@($cases | ForEach-Object {{ {function} -Spec $_.spec -LogText ([string]$_.log) }}) | ConvertTo-Json -Compress -Depth 5 -AsArray",
+                             DVE_CASES=str(path))
+
+
+# HFR-NATIVE-M16-1457-GUI-TEXTURE-PRESENT-OFFLOAD-1 r14 (r12 keys opus and fable key3 on e19e383d): the r12 mention helper listed the spellings of a session it
+# would recognise, and a + or - in the separator run that did not touch the digits (`session -> 3`, `session - 3`, `session = + 3`) matched none of them, so a
+# conflicting duplicate read HONOURED. It was the sixth spelling of one class, so the test is now INVERTED: a body that carries the marker is a mention of the
+# measured session unless it is a whole-line canonical record of a DIFFERENT session. No spelling is skipped: signs and arrows in the separator, a digit stored
+# as a surrogate pair, a body cut at its first ` (`, a record with no session at all. Each mangle rewrites the canonical `session=3 ` of a record.
+SESSION_SEPARATOR_SPELLINGS = (("an arrow", lambda r: r.replace("session=3 ", "session -> 3 ")),
+                               ("an arrow, no spaces", lambda r: r.replace("session=3 ", "session->3 ")),
+                               ("a spaced minus", lambda r: r.replace("session=3 ", "session - 3 ")),
+                               ("equals then a spaced plus", lambda r: r.replace("session=3 ", "session = + 3 ")),
+                               ("equals, a plus, then a space", lambda r: r.replace("session=3 ", "session=+ 3 ")),
+                               ("colon, a minus-plus run, then a leading zero", lambda r: r.replace("session=3 ", "session: -+ 03 ")),
+                               ("a fat arrow", lambda r: r.replace("session=3 ", "session=>3 ")),
+                               ("a mathematical bold digit (a surrogate pair)", lambda r: r.replace("session=3 ", "session=\U0001D7D1 ")),
+                               ("the session in parentheses (the body is cut at its first ' (')", lambda r: r.replace("session=3 ", "(session=3) ")),
+                               ("no session field at all", lambda r: r.replace("session=3 ", "")),
+                               ("a culture-folded key (dotless i)", lambda r: r.replace("session=3 ", "SESSıON=3 ")))
+
+
 class _ScaleLabelHeaderMixin:
     """Reads the one mapping (PlaybackScaleLabel::resolutionLabel) out of the C++ header for both mirror test classes below."""
 
@@ -7744,11 +7799,13 @@ class LegSpecSchemaTests(unittest.TestCase):
                 self.assertRegex(spec["legId"], r"^m16-1243-cpu-reduced-(fullscreen|windowed)-s[24]$", path.name)
                 self.assertEqual(spec["backends"], ["cpu"], path.name)
                 self.assertEqual(spec["generatorArgs"]["playbackProcessing"], "receipt", path.name)
-            elif spec["card"] == "CUDA-HEADROOM-1" and "legs/" + path.name in (*NATIVE_PACED_LEGS, *NATIVE_TRACE_LEGS):   # the PACED M16-1457 native s2/s4 legs (r2 of the LUT-keep card)
-                # and their per-present trace twins (HFR-NATIVE-M16-1457-PRESENT-TRACE-LEGS-1, NATIVE_TRACE_LEGS; presentTrace only on a -trace- leg)
+            elif spec["card"] == "CUDA-HEADROOM-1" and "legs/" + path.name in (*NATIVE_PACED_LEGS, *NATIVE_TRACE_LEGS, *RELEASE_SYNC_LEGS):   # the PACED M16-1457 native s2/s4 legs (r2 of the LUT-keep card)
+                # and their per-present trace twins (HFR-NATIVE-M16-1457-PRESENT-TRACE-LEGS-1, NATIVE_TRACE_LEGS; presentTrace only on a -trace- leg), and the
+                # deferred-release isolation twin (HFR-NATIVE-M16-1457-GUI-TEXTURE-PRESENT-OFFLOAD-1 r7, RELEASE_SYNC_LEGS; the kill switch only on a -release-sync leg)
                 self.assertEqual(spec["legId"], path.stem, path.name)
-                self.assertRegex(spec["legId"], r"^m16-1457-native-(trace-)?(fullscreen|windowed)-s[24]$", path.name)
+                self.assertRegex(spec["legId"], r"^m16-1457-native-(trace-)?(fullscreen|windowed)-s[24](-release-sync)?$", path.name)
                 self.assertEqual(spec["generatorArgs"].get("presentTrace", False), "-trace-" in spec["legId"], path.name)
+                self.assertEqual(spec["generatorArgs"].get("disableReconReleaseDeferred", False), spec["legId"].endswith("-release-sync"), path.name)
                 # paced: no unpaced switch and no swap-interval override (the app's own pacing), so the leg measures the shipping shape
                 self.assertNotIn("unpaced", spec["generatorArgs"], path.name)
                 self.assertNotIn("swapInterval", spec["generatorArgs"], path.name)
@@ -14179,6 +14236,274 @@ class WorkerThreadsReceiptBlockIsReDerivedTests(EvidenceFactory, unittest.TestCa
             self.assertAdvisory(receipt, repo)
 
 
+class ReconReleaseDeferredLegSpecTests(unittest.TestCase):
+    """HFR-NATIVE-M16-1457-GUI-TEXTURE-PRESENT-OFFLOAD-1 r7: the isolation arm of the deferred-release A/B is a named generatorArgs key; the one isolation twin
+    differs from the cell it twins only in legId and that key, so no receipted cell changes a byte."""
+
+    def setUp(self) -> None:
+        try:
+            import jsonschema
+        except ImportError:
+            self.skipTest("jsonschema is required")
+        self.jsonschema = jsonschema
+        self.schema = json.loads((DV / "leg-spec.schema.json").read_text(encoding="utf-8"))
+
+    def test_the_isolation_twin_differs_from_its_cell_only_in_the_leg_id_and_the_key(self) -> None:
+        self.assertEqual(len(RELEASE_SYNC_LEGS), 1, "one isolation twin: m16-1457 fullscreen s2, the card's gate cell")
+        for rel, cell_rel in RELEASE_SYNC_LEGS.items():
+            with self.subTest(leg=rel):
+                twin = json.loads((DV / rel).read_text(encoding="utf-8"))
+                cell = json.loads((DV / cell_rel).read_text(encoding="utf-8"))
+                self.jsonschema.validate(twin, self.schema)
+                self.assertNotIn("disableReconReleaseDeferred", cell["generatorArgs"], cell_rel)
+                self.assertEqual(twin["legId"], cell["legId"] + "-release-sync")
+                self.assertIs(twin["generatorArgs"].pop("disableReconReleaseDeferred"), True)
+                self.assertEqual(dict(twin, legId=cell["legId"]), cell)
+                self.assertEqual(list(twin), list(cell), "the cell's keys in the cell's order")
+
+    def test_no_other_leg_sets_the_key(self) -> None:
+        for path in sorted((DV / "legs").glob("*.json")):
+            if "legs/" + path.name in RELEASE_SYNC_LEGS:
+                continue
+            with self.subTest(leg=path.name):
+                self.assertNotIn("disableReconReleaseDeferred", json.loads(path.read_text(encoding="utf-8")).get("generatorArgs") or {})
+
+    def test_the_key_must_be_a_json_boolean(self) -> None:
+        twin = json.loads((DV / next(iter(RELEASE_SYNC_LEGS))).read_text(encoding="utf-8"))
+        for bad in (0, 1, "1", "true", None):
+            with self.subTest(value=repr(bad)):
+                with self.assertRaises(self.jsonschema.ValidationError):
+                    self.jsonschema.validate(dict(twin, generatorArgs=dict(twin["generatorArgs"], disableReconReleaseDeferred=bad)), self.schema)
+
+    def test_the_runner_and_the_validator_both_gate_on_the_apps_own_readback(self) -> None:
+        module = (DV / "DualVenueRunner.psm1").read_text(encoding="utf-8")
+        self.assertIn("$reconReleaseVerdict = Get-DvReconReleaseDeferredEvidence -Spec $spec -LogText $ev.logText", module)
+        self.assertIn('if ($reconReleaseVerdict.blocks) { $invalid.Add("RECON_RELEASE_DEFERRED_NOT_HONOURED:', module)
+        self.assertIn("Get-DvReconReleaseDeferredEvidence", module.split("Export-ModuleMember", 1)[1])
+        runner = (DV / "Invoke-VenueLeg.ps1").read_text(encoding="utf-8")
+        self.assertIn("$reconReleaseVerdict = Get-DvReconReleaseDeferredEvidence -Spec $spec -LogText $runLogText", runner)
+        self.assertIn("RECON_RELEASE_DEFERRED_NOT_HONOURED", runner)
+        # the app emits the record the gate reads, once per smoke session, in this exact field order
+        mw = (ROOT / "platform" / "qt" / "MainWindow.cpp").read_text(encoding="utf-8")
+        self.assertIn('"playback_smoke.recon_release session=%1 deferred_enabled=%2 deferred=%3 sync=%4 "\n'
+                      '                   "drained=%5 max_depth=%6 outstanding_at_stop=%7" )', mw.replace("\r\n", "\n"))
+
+
+@requires_windows_pwsh
+class ReconReleaseDeferredEvidenceTests(unittest.TestCase):
+    """Get-DvReconReleaseDeferredEvidence, pure: a leg that asks for the deferred-release kill switch counts only when the measured session's own
+    playback_smoke.recon_release record reports deferred_enabled=0. A switch value in the launcher's env block is a request, not engagement, and a binary
+    before r7 emits no such record, so an isolation leg on it is NOT_HONOURED rather than an unproven PASS."""
+
+    OFF = {"generatorArgs": {"disableReconReleaseDeferred": True}}
+    START = "playback_smoke.start session=3 position=0 scale_request=2 quality_mode=0 worker_threads=12 start_serial=2 env_force_threads=0"
+    PREFIX = "[2026-11-11T00:00:00.000Z] [INFO] [0x1a2b] "
+
+    def verdict(self, spec: dict, log: str) -> dict:
+        proc, out = run_pwsh_json("$s = $env:DVE_SPEC | ConvertFrom-Json\n(Get-DvReconReleaseDeferredEvidence -Spec $s -LogText $env:DVE_LOG) | ConvertTo-Json -Compress -Depth 4",
+                                  DVE_SPEC=json.dumps(spec), DVE_LOG=log)
+        self.assertIsNotNone(out, proc.stdout + proc.stderr)
+        return out
+
+    @classmethod
+    def log(cls, *records: str, start: str | None = None) -> str:
+        return "\n".join(["playback_smoke.measured_session id=3", start or cls.START, *records, "playback_smoke.summary session=3 reason=reached presented_frames=600"]) + "\n"
+
+    @staticmethod
+    def record(enabled: str, session: int = 3, deferred: str = "412") -> str:
+        return (f"playback_smoke.recon_release session={session} deferred_enabled={enabled} deferred={deferred} sync=1090 drained=412 max_depth=2"
+                " outstanding_at_stop=0")
+
+    def test_honoured_only_when_the_measured_session_reports_the_lever_off(self) -> None:
+        for name, record in (("bare", self.record("0", deferred="0")), ("crash-forensics prefix", self.PREFIX + self.record("0", deferred="0")),
+                             ("prefix and Qt location", self.PREFIX + self.record("0", deferred="0") + " (MainWindow.cpp:31700)")):
+            with self.subTest(case=name):
+                v = self.verdict(self.OFF, self.log(record))
+                self.assertEqual((v["requested"], v["observed"], v["verdict"], v["blocks"]), (True, 0, "HONOURED", False))
+                self.assertEqual(v["counts"]["deferred"], 0)
+                self.assertEqual(v["counts"]["sync"], 1090)
+
+    def test_a_binary_that_emits_no_record_is_not_engaged(self) -> None:
+        v = self.verdict(self.OFF, self.log())
+        self.assertEqual((v["verdict"], v["blocks"]), ("NOT_HONOURED", True), v)
+        self.assertIn("ROUTE_NOT_ENGAGED", v["reason"])
+
+    def test_any_other_report_blocks_never_passes(self) -> None:
+        for name, log in (("lever on", self.log(self.record("1"))),
+                          ("not a number", self.log(self.record("no"))),
+                          ("a count with a sign", self.log(self.record("0", deferred="+1"))),
+                          ("a trailing field", self.log(self.record("0") + " extra=1")),
+                          ("a field missing", self.log(self.record("0").replace(" max_depth=2", ""))),
+                          ("another session's record", self.log(self.record("0", session=2))),
+                          ("two records", self.log(self.record("0"), self.record("0"))),
+                          ("a start-line field is not a record", self.log(start=self.START + " deferred_enabled=0")),
+                          ("embedded in another record", self.log(start=self.START + " env_x=1 | " + self.record("0"))),
+                          ("no log", "")):
+            with self.subTest(case=name):
+                v = self.verdict(self.OFF, log)
+                self.assertEqual((v["verdict"], v["blocks"]), ("NOT_HONOURED", True), v)
+
+    def test_a_leg_that_does_not_ask_is_unchanged_unless_the_app_reports_the_lever_off(self) -> None:
+        for spec in ({}, {"generatorArgs": {"unpaced": True}}, {"generatorArgs": {"disableReconReleaseDeferred": False}}):
+            for name, log in (("control binary, no record", self.log()),
+                              ("lever on", self.log(self.record("1"))),
+                              ("lever on, nothing deferred (a cpu leg)", self.log(self.record("1", deferred="0"))),
+                              ("no log", "")):
+                with self.subTest(spec=spec, case=name):
+                    v = self.verdict(spec, log)
+                    self.assertEqual((v["requested"], v["verdict"], v["blocks"]), (False, "NOT_REQUESTED", False), v)
+            with self.subTest(spec=spec, case="inherited"):
+                v = self.verdict(spec, self.log(self.record("0")))
+                self.assertEqual((v["requested"], v["verdict"], v["blocks"]), (False, "NOT_HONOURED", True), v)
+                self.assertIn("RECON_RELEASE_DEFERRED_INHERITED", v["reason"])
+            with self.subTest(spec=spec, case="unreadable"):
+                v = self.verdict(spec, self.log(self.record("1") + " extra=1"))
+                self.assertEqual((v["verdict"], v["blocks"]), ("NOT_HONOURED", True), v)
+
+    def test_a_tab_after_the_session_is_a_mention_that_is_unreadable(self) -> None:
+        # r8 (r7 adversary advisory A1 on 4adc11c9): the mention regex took only an ASCII space after session=<n>, so a TAB-separated record was skipped and a
+        # leg that does not ask read NOT_REQUESTED/blocks=false instead of rejecting unreadable evidence (and an asking leg read ROUTE_NOT_ENGAGED).
+        for name, spec, record in (("asks, lever off", self.OFF, self.record("0", deferred="0")), ("does not ask, lever on", {}, self.record("1")),
+                                   ("does not ask, lever off", {}, self.record("0", deferred="0"))):
+            with self.subTest(case=name):
+                v = self.verdict(spec, self.log(record.replace("session=3 ", "session=3\t")))
+                self.assertEqual((v["verdict"], v["blocks"], v["observed"]), ("NOT_HONOURED", True, None), v)
+                self.assertIn("unreadable", v["reason"])
+
+    # r8 adversary A1 (major, on ea16773f): a mention needed ONE literal space between the marker and session=, so a second, noncanonical record of the
+    # measured session (double space, TAB, other separator, reordered fields) was skipped and a conflicting duplicate read HONOURED. Every record body that
+    # names the marker and the measured session is a mention, whatever its separators or field order; only the canonical whole line is ever read.
+    NONCANONICAL = (("double space before session", lambda r: r.replace("recon_release session=", "recon_release  session=")),
+                    ("TAB before session", lambda r: r.replace("recon_release session=", "recon_release\tsession=")),
+                    ("no-break space before session", lambda r: r.replace("recon_release session=", "recon_release session=")),
+                    ("punctuation before session", lambda r: r.replace("recon_release session=", "recon_release:session=")),
+                    ("comma after the session", lambda r: r.replace("session=3 ", "session=3, ")),
+                    ("spaces around the equals sign", lambda r: r.replace("session=3 ", "session = 3 ")),
+                    ("session after the first field", lambda r: r.replace("session=3 deferred_enabled=", "deferred_enabled=").replace(" deferred=", " session=3 deferred=", 1)),
+                    # r8 fix 2 (adversary A1 on 17f3ed8e): the session BEFORE the marker
+                    ("session before the marker", lambda r: "session=3 " + r.replace("recon_release session=3 ", "recon_release ")))
+
+    def test_a_noncanonical_duplicate_never_lets_a_conflicting_record_pass(self) -> None:
+        for name, mangle in self.NONCANONICAL:
+            with self.subTest(case=name):
+                v = self.verdict(self.OFF, self.log(self.record("0", deferred="0"), mangle(self.record("1"))))
+                self.assertEqual((v["verdict"], v["blocks"], v["observed"]), ("NOT_HONOURED", True, None), v)
+                self.assertIn("unreadable", v["reason"])
+
+    def test_a_noncanonical_record_alone_is_unreadable_for_every_leg(self) -> None:
+        for name, mangle in self.NONCANONICAL:
+            for spec in (self.OFF, {}):
+                with self.subTest(case=name, spec=spec):
+                    v = self.verdict(spec, self.log(mangle(self.record("0", deferred="0"))))
+                    self.assertEqual((v["verdict"], v["blocks"], v["observed"]), ("NOT_HONOURED", True, None), v)
+                    self.assertIn("unreadable", v["reason"])
+
+    # HFR-NATIVE-M16-1457-GUI-TEXTURE-PRESENT-OFFLOAD-1 r12 (r9 keys sol/opus/fable on 4a61e684, adversary A1): the mention test compared the session TEXT, so a
+    # record whose session is the same integer spelled `03`, `+3`, `003` or `+03` was not a mention. A conflicting one beside a canonical record read HONOURED,
+    # and alone it read NOT_REQUESTED (the isolation arm that does not ask). Equal integers are the same session; a signed run that is not a single optional
+    # sign is unreadable too (it blocks); a different integer (session=31, -3, +2) is another session.
+    NUMERIC_SPELLINGS = (("leading zero", lambda r: r.replace("session=3 ", "session=03 ")),
+                         ("plus sign", lambda r: r.replace("session=3 ", "session=+3 ")),
+                         ("two leading zeros", lambda r: r.replace("session=3 ", "session=003 ")),
+                         ("plus sign and leading zero", lambda r: r.replace("session=3 ", "session=+03 ")),
+                         ("a doubled sign", lambda r: r.replace("session=3 ", "session=++3 ")),
+                         ("a plus then a minus", lambda r: r.replace("session=3 ", "session=+-3 ")),
+                         # r12 fix 1 (adversary A1 on db8cdfa1): decoration around the value (quotes, other separators, JSON shape), other number spellings, case.
+                         ("double-quoted value", lambda r: r.replace("session=3 ", 'session="3" ')),
+                         ("single-quoted value", lambda r: r.replace("session=3 ", "session='3' ")),
+                         ("colon separator", lambda r: r.replace("session=3 ", "session:3 ")),
+                         ("colon, space and quoted value", lambda r: r.replace("session=3 ", 'session: "3" ')),
+                         ("JSON shape", lambda r: r.replace("session=3 ", '"session":3 ')),
+                         ("JSON shape, quoted value", lambda r: r.replace("session=3 ", '"session": "3" ')),
+                         ("bracketed value", lambda r: r.replace("session=3 ", "session=[3] ")),
+                         ("quoted and signed", lambda r: r.replace("session=3 ", 'session="+03" ')),
+                         ("hexadecimal", lambda r: r.replace("session=3 ", "session=0x3 ")),
+                         ("hexadecimal with a leading zero and capitals", lambda r: r.replace("session=3 ", "session=0X03 ")),
+                         ("a decimal point", lambda r: r.replace("session=3 ", "session=3.0 ")),
+                         ("an exponent", lambda r: r.replace("session=3 ", "session=3e0 ")),
+                         ("full-width digit", lambda r: r.replace("session=3 ", "session=３ ")),
+                         ("upper-case key", lambda r: r.replace("session=3 ", "SESSION=3 ")),
+                         ("capitalised key", lambda r: r.replace("session=3 ", "Session=3 ")),
+                         ("spaces around the equals sign and a plus", lambda r: r.replace("session=3 ", "session = +3 ")),
+                         ("session after the first field, leading zero", lambda r: r.replace("session=3 deferred_enabled=", "deferred_enabled=").replace(" deferred=", " session=03 deferred=", 1)))
+
+    def test_a_numeric_spelling_of_the_measured_session_is_the_same_session(self) -> None:
+        for name, mangle in self.NUMERIC_SPELLINGS:
+            for spec, canonical, conflicting in ((self.OFF, self.record("0", deferred="0"), self.record("1")), ({}, self.record("1"), self.record("0", deferred="0"))):
+                with self.subTest(case=name, spec=spec):
+                    v = self.verdict(spec, self.log(canonical, mangle(conflicting)))
+                    self.assertEqual((v["verdict"], v["blocks"], v["observed"]), ("NOT_HONOURED", True, None), v)
+                    self.assertIn("unreadable", v["reason"])
+
+    def test_a_numeric_spelling_alone_is_unreadable_for_every_leg(self) -> None:
+        for name, mangle in self.NUMERIC_SPELLINGS:
+            for spec in (self.OFF, {}):
+                for enabled, deferred in (("0", "0"), ("1", "412")):
+                    with self.subTest(case=name, spec=spec, enabled=enabled):
+                        v = self.verdict(spec, self.log(mangle(self.record(enabled, deferred=deferred))))
+                        self.assertEqual((v["verdict"], v["blocks"], v["observed"]), ("NOT_HONOURED", True, None), v)
+                        self.assertIn("unreadable", v["reason"])
+
+    def test_a_measured_session_logged_with_a_leading_zero_matches_every_spelling_of_itself(self) -> None:
+        start = self.START.replace("session=3 ", "session=03 ")
+        summary = "playback_smoke.summary session=03 reason=reached presented_frames=600"
+
+        def zero_log(*records: str) -> str:
+            return "\n".join(["playback_smoke.measured_session id=03", start, *records, summary]) + "\n"
+
+        v = self.verdict(self.OFF, zero_log(self.record("0", session="03", deferred="0")))
+        self.assertEqual((v["verdict"], v["blocks"], v["observed"]), ("HONOURED", False, 0), v)
+        v = self.verdict(self.OFF, zero_log(self.record("0", session="03", deferred="0"), self.record("1", session="3")))
+        self.assertEqual((v["verdict"], v["blocks"], v["observed"]), ("NOT_HONOURED", True, None), v)
+
+    def test_a_different_integer_is_another_session_in_every_spelling(self) -> None:
+        # r14: only a whole-line CANONICAL record (a plain, optionally signed decimal session) is ever read as another session; see the test below for the rest.
+        for name, record in (("session 31", self.record("0", session=31)), ("session +31", self.record("0", session="+31")), ("session 031", self.record("0", session="031")),
+                             ("session -3", self.record("0", session="-3")), ("session +2", self.record("0", session="+2")), ("session 02", self.record("0", session="02")),
+                             ("session 30", self.record("0", session=30)), ("session 4", self.record("0", session=4)), ("session -0", self.record("0", session="-0")),
+                             ("session 4, prefixed", self.PREFIX + self.record("0", session=4)),
+                             ("session 4, prefixed, with a Qt location", self.PREFIX + self.record("0", session=4) + " (MainWindow.cpp:31700)")):
+            with self.subTest(case=name):
+                v = self.verdict({}, self.log(self.record("1"), record))
+                self.assertEqual((v["verdict"], v["blocks"], v["observed"]), ("NOT_REQUESTED", False, 1), v)
+
+    def test_another_sessions_noncanonical_record_is_a_mention_that_blocks(self) -> None:
+        # r14 (fable key3 on e19e383d, adopted by the hub): the inversion. A marker-bearing body that is not a whole-line canonical record is a mention whatever
+        # session it seems to name, so it makes the state unreadable (fails closed). The app writes every record canonically (MainWindow.cpp `session=%1` from
+        # an unsigned integer), so this only ever blocks a garbled or forged log. Before r14 these rows read NOT_REQUESTED.
+        cases = [(name, record) for name, record in (("session 2, double space", self.record("0", session=2).replace(" session=", "  session=")),
+                                                     ("quoted 2", self.record("0", session='"2"')), ("quoted 31", self.record("0", session='"31"')),
+                                                     ("hex 2", self.record("0", session="0x2")), ("hex 1f (31)", self.record("0", session="0x1f")),
+                                                     ("a word", self.record("0", session="three")), ("an arrow to 4", self.record("0", session="4").replace("session=4", "session -> 4")),
+                                                     ("session 4 with a trailing field", self.record("0", session=4) + " extra=1"))]
+        proc, out = run_pwsh_evidence_cases("Get-DvReconReleaseDeferredEvidence", [({}, self.log(self.record("1"), record)) for _, record in cases])
+        self.assertIsNotNone(out, proc.stdout + proc.stderr)
+        for (name, _), v in zip(cases, out, strict=True):
+            with self.subTest(case=name):
+                self.assertEqual((v["verdict"], v["blocks"], v["observed"]), ("NOT_HONOURED", True, None), v)
+                self.assertIn("unreadable", v["reason"])
+
+    def test_any_marker_bearing_spelling_of_the_measured_session_is_a_mention(self) -> None:
+        # r14 (r12 keys opus and fable key3 on e19e383d): every row, the r12 numeric and r8 separator rows included, beside a conflicting canonical record and
+        # alone, for the leg that asks and the one that does not. One pwsh for the whole table.
+        cases = []
+        for name, mangle in SESSION_SEPARATOR_SPELLINGS + self.NUMERIC_SPELLINGS + self.NONCANONICAL:
+            for spec, canonical, conflicting in ((self.OFF, self.record("0", deferred="0"), self.record("1")), ({}, self.record("1"), self.record("0", deferred="0"))):
+                cases.append((f"{name} / beside a canonical record / {'asks' if spec else 'does not ask'}", spec, self.log(canonical, mangle(conflicting))))
+                cases.append((f"{name} / alone / {'asks' if spec else 'does not ask'}", spec, self.log(mangle(conflicting))))
+        proc, out = run_pwsh_evidence_cases("Get-DvReconReleaseDeferredEvidence", [(spec, log) for _, spec, log in cases])
+        self.assertIsNotNone(out, proc.stdout + proc.stderr)
+        for (name, _, _), v in zip(cases, out, strict=True):
+            with self.subTest(case=name):
+                self.assertEqual((v["verdict"], v["blocks"], v["observed"]), ("NOT_HONOURED", True, None), v)
+                self.assertIn("unreadable", v["reason"])
+
+    def test_the_head_arm_reads_its_counts(self) -> None:
+        v = self.verdict({}, self.log(self.record("1", deferred="412")))
+        self.assertEqual(v["observed"], 1)
+        self.assertEqual((v["counts"]["deferred"], v["counts"]["drained"], v["counts"]["maxDepth"], v["counts"]["outstandingAtStop"]), (412, 412, 2, 0))
+
+
 class PrepConflatedMoveLegSpecTests(unittest.TestCase):
     """PLAYBACK-PREP-CONFLATED-MOVE-FR1B-AB-1: the ON arm of the #397 prep-conflated-move A/B is a named generatorArgs key; each ON twin differs from the cell it
     twins only in legId and that key, so no receipted cell changes a byte."""
@@ -14262,6 +14587,110 @@ class PrepConflatedMoveEvidenceTests(unittest.TestCase):
         v = self.verdict(self.ON, self.log())
         self.assertEqual((v["verdict"], v["blocks"]), ("NOT_HONOURED", True), v)
         self.assertIn("ROUTE_NOT_ENGAGED", v["reason"])
+
+    def test_a_tab_after_the_session_is_a_mention_that_is_unreadable(self) -> None:
+        # HFR-NATIVE-M16-1457-GUI-TEXTURE-PRESENT-OFFLOAD-1 r8 (r7 adversary advisory A1, sibling :1773): a TAB after session=<n> was not a mention, so a leg
+        # that does not ask read NOT_REQUESTED/blocks=false on an unreadable record (and an asking leg read ROUTE_NOT_ENGAGED).
+        for name, spec, record in (("asks, switch on", self.ON, self.route("1")), ("does not ask, switch on", {}, self.route("1"))):
+            with self.subTest(case=name):
+                v = self.verdict(spec, self.log(record.replace("session=3 ", "session=3\t")))
+                self.assertEqual((v["verdict"], v["blocks"], v["observed"]), ("NOT_HONOURED", True, None), v)
+                self.assertIn("unreadable", v["reason"])
+
+    def test_a_noncanonical_duplicate_never_lets_a_conflicting_record_pass(self) -> None:
+        # r8 adversary A1 sibling (:1773): a canonical active record plus a double-spaced (TAB, punctuated, reordered) inactive one read HONOURED.
+        for name, mangle in (("double space before session", lambda r: r.replace("prep_route session=", "prep_route  session=")),
+                             ("TAB before session", lambda r: r.replace("prep_route session=", "prep_route\tsession=")),
+                             ("punctuation before session", lambda r: r.replace("prep_route session=", "prep_route:session=")),
+                             ("spaces around the equals sign", lambda r: r.replace("session=3 ", "session = 3 ")),
+                             ("session after the field", lambda r: "playback_smoke.prep_route prep_conflated_move_active=0 session=3"),
+                             ("session before the marker", lambda r: "session=3 " + r.replace("prep_route session=3 ", "prep_route "))):
+            for spec, canonical in ((self.ON, self.route("1")), ({}, self.route("0"))):
+                with self.subTest(case=name, spec=spec):
+                    v = self.verdict(spec, self.log(canonical, mangle(self.route("0" if spec else "1"))))
+                    self.assertEqual((v["verdict"], v["blocks"], v["observed"]), ("NOT_HONOURED", True, None), v)
+                    self.assertIn("unreadable", v["reason"])
+
+    # r12 (adversary A1 sibling :1774): the same numeric-spelling hole as the recon_release reader; equal integers are the same session.
+    NUMERIC_SPELLINGS = (("leading zero", lambda r: r.replace("session=3 ", "session=03 ")),
+                         ("plus sign", lambda r: r.replace("session=3 ", "session=+3 ")),
+                         ("two leading zeros", lambda r: r.replace("session=3 ", "session=003 ")),
+                         ("plus sign and leading zero", lambda r: r.replace("session=3 ", "session=+03 ")),
+                         ("a doubled sign", lambda r: r.replace("session=3 ", "session=++3 ")),
+                         ("a plus then a minus", lambda r: r.replace("session=3 ", "session=+-3 ")),
+                         # r12 fix 1 (adversary A1 on db8cdfa1): decoration around the value (quotes, other separators, JSON shape), other number spellings, case.
+                         ("double-quoted value", lambda r: r.replace("session=3 ", 'session="3" ')),
+                         ("single-quoted value", lambda r: r.replace("session=3 ", "session='3' ")),
+                         ("colon separator", lambda r: r.replace("session=3 ", "session:3 ")),
+                         ("colon, space and quoted value", lambda r: r.replace("session=3 ", 'session: "3" ')),
+                         ("JSON shape", lambda r: r.replace("session=3 ", '"session":3 ')),
+                         ("JSON shape, quoted value", lambda r: r.replace("session=3 ", '"session": "3" ')),
+                         ("bracketed value", lambda r: r.replace("session=3 ", "session=[3] ")),
+                         ("quoted and signed", lambda r: r.replace("session=3 ", 'session="+03" ')),
+                         ("hexadecimal", lambda r: r.replace("session=3 ", "session=0x3 ")),
+                         ("hexadecimal with a leading zero and capitals", lambda r: r.replace("session=3 ", "session=0X03 ")),
+                         ("a decimal point", lambda r: r.replace("session=3 ", "session=3.0 ")),
+                         ("an exponent", lambda r: r.replace("session=3 ", "session=3e0 ")),
+                         ("full-width digit", lambda r: r.replace("session=3 ", "session=３ ")),
+                         ("upper-case key", lambda r: r.replace("session=3 ", "SESSION=3 ")),
+                         ("capitalised key", lambda r: r.replace("session=3 ", "Session=3 ")),
+                         ("spaces around the equals sign and a plus", lambda r: r.replace("session=3 ", "session = +3 ")),
+                         ("session after the field, leading zero", lambda r: "playback_smoke.prep_route prep_conflated_move_active=0 session=03"))
+
+    def test_a_numeric_spelling_of_the_measured_session_is_the_same_session(self) -> None:
+        for name, mangle in self.NUMERIC_SPELLINGS:
+            for spec, canonical, conflicting in ((self.ON, self.route("1"), self.route("0")), ({}, self.route("0"), self.route("1"))):
+                with self.subTest(case=name, spec=spec):
+                    v = self.verdict(spec, self.log(canonical, mangle(conflicting)))
+                    self.assertEqual((v["verdict"], v["blocks"], v["observed"]), ("NOT_HONOURED", True, None), v)
+                    self.assertIn("unreadable", v["reason"])
+
+    def test_a_numeric_spelling_alone_is_unreadable_for_every_leg(self) -> None:
+        for name, mangle in self.NUMERIC_SPELLINGS:
+            for spec in (self.ON, {}):
+                for value in ("0", "1"):
+                    with self.subTest(case=name, spec=spec, value=value):
+                        v = self.verdict(spec, self.log(mangle(self.route(value))))
+                        self.assertEqual((v["verdict"], v["blocks"], v["observed"]), ("NOT_HONOURED", True, None), v)
+                        self.assertIn("unreadable", v["reason"])
+
+    def test_a_different_integer_is_another_session_in_every_spelling(self) -> None:
+        # r14: only a whole-line CANONICAL record (a plain, optionally signed decimal session) is ever read as another session; see the test below for the rest.
+        for name, record in (("31", self.route("1", session="31")), ("+31", self.route("1", session="+31")), ("031", self.route("1", session="031")),
+                             ("-3", self.route("1", session="-3")), ("+2", self.route("1", session="+2")), ("02", self.route("1", session="02")),
+                             ("30", self.route("1", session="30")), ("4", self.route("1", session="4")), ("-0", self.route("1", session="-0")),
+                             ("4, prefixed", self.PREFIX + self.route("1", session="4")),
+                             ("4, prefixed, with a Qt location", self.PREFIX + self.route("1", session="4") + " (MainWindow.cpp:25848)")):
+            with self.subTest(case=name):
+                v = self.verdict({}, self.log(self.route("0"), record))
+                self.assertEqual((v["verdict"], v["blocks"], v["observed"]), ("NOT_REQUESTED", False, 0), v)
+
+    def test_another_sessions_noncanonical_record_is_a_mention_that_blocks(self) -> None:
+        # r14 (fable key3 on e19e383d): the inversion, as in the recon_release reader. Before r14 these rows read NOT_REQUESTED.
+        cases = [("double space, 2", self.route("1", session="2").replace(" session=", "  session=")), ("quoted 2", self.route("1", session='"2"')),
+                 ("quoted 31", self.route("1", session='"31"')), ("hex 2", self.route("1", session="0x2")), ("hex 1f (31)", self.route("1", session="0x1f")),
+                 ("a word", self.route("1", session="three")), ("an arrow to 4", self.route("1", session="4").replace("session=4", "session -> 4")),
+                 ("4 with a trailing field", self.route("1", session="4") + " extra=1")]
+        proc, out = run_pwsh_evidence_cases("Get-DvPrepConflatedMoveEvidence", [({}, self.log(self.route("0"), record)) for _, record in cases])
+        self.assertIsNotNone(out, proc.stdout + proc.stderr)
+        for (name, _), v in zip(cases, out, strict=True):
+            with self.subTest(case=name):
+                self.assertEqual((v["verdict"], v["blocks"], v["observed"]), ("NOT_HONOURED", True, None), v)
+                self.assertIn("unreadable", v["reason"])
+
+    def test_any_marker_bearing_spelling_of_the_measured_session_is_a_mention(self) -> None:
+        # r14 (r12 keys on e19e383d, prep_route sibling): every row, the r12 numeric rows included, beside a conflicting canonical record and alone, for both legs.
+        cases = []
+        for name, mangle in SESSION_SEPARATOR_SPELLINGS + self.NUMERIC_SPELLINGS:
+            for spec, canonical, conflicting in ((self.ON, self.route("1"), self.route("0")), ({}, self.route("0"), self.route("1"))):
+                cases.append((f"{name} / beside a canonical record / {'asks' if spec else 'does not ask'}", spec, self.log(canonical, mangle(conflicting))))
+                cases.append((f"{name} / alone / {'asks' if spec else 'does not ask'}", spec, self.log(mangle(conflicting))))
+        proc, out = run_pwsh_evidence_cases("Get-DvPrepConflatedMoveEvidence", [(spec, log) for _, spec, log in cases])
+        self.assertIsNotNone(out, proc.stdout + proc.stderr)
+        for (name, _, _), v in zip(cases, out, strict=True):
+            with self.subTest(case=name):
+                self.assertEqual((v["verdict"], v["blocks"], v["observed"]), ("NOT_HONOURED", True, None), v)
+                self.assertIn("unreadable", v["reason"])
 
     def test_a_start_line_field_is_never_read_as_engagement(self) -> None:
         # r2 (adversary A1): the start line carries launcher env values, so a field there is not the app's decision.

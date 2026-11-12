@@ -47,6 +47,7 @@
 
 #include <QString>
 
+#include "PlaybackStrideSampler.h"
 #include "PlaybackWarmOutputReusePolicy.h"
 
 #include <algorithm>
@@ -294,9 +295,9 @@ public:
     /*! A later present: kept for the session medians. */
     void noteLaterPresent( double renderTotalMs, double guiPresentMs )
     {
-        if( m_laterRender.size() >= kMaxLaterSamples ) return;
-        m_laterRender.push_back( renderTotalMs );
-        m_laterGuiPresent.push_back( guiPresentMs );
+        // A4 (texture-present split card): a session-uniform sample past the cap, never the session prefix
+        m_laterRender.add( renderTotalMs );
+        m_laterGuiPresent.add( guiPresentMs );
     }
 
     void noteFirstFinishStep( int step, double ms )
@@ -336,8 +337,8 @@ public:
     double guiPresentFirstMs() const { return m_guiPresentFirstMs; }
     double finishFirstMs() const { return m_finishFirstMs; }
     double audioSyncFirstMs() const { return m_audioSyncFirstMs; }
-    double medianLaterRenderMs() const { return median( m_laterRender ); }
-    double medianLaterGuiPresentMs() const { return median( m_laterGuiPresent ); }
+    double medianLaterRenderMs() const { return median( m_laterRender.values() ); }
+    double medianLaterGuiPresentMs() const { return median( m_laterGuiPresent.values() ); }
 
     /*! The first GUI present minus the median later one (never negative). */
     double gpuRouteSetupFirstMs() const
@@ -401,8 +402,8 @@ private:
     FirstPresentSplit m_firstPresentSplit;
     RenderFirstSplit m_renderFirstSplit;
     AmazeFirstFrames m_amazeFirstFrames;
-    std::vector<double> m_laterRender;
-    std::vector<double> m_laterGuiPresent;
+    playback_sampling::SessionSampler m_laterRender { kMaxLaterSamples };
+    playback_sampling::SessionSampler m_laterGuiPresent { kMaxLaterSamples };
 };
 
 } // namespace playback_startup_split

@@ -923,6 +923,139 @@ int llrpGpuCudaSuppressed(void)
     return g_llrawproc_gpu_cuda_suppressed != 0;
 }
 
+/* HFR-NATIVE-M16-1457-GUI-TEXTURE-PRESENT-OFFLOAD-1 r7: deferred retained-token
+ * releases. The GUI thread returns a presented frame's slot right after its
+ * texture present, and that release (two host flag stores in the backend) used
+ * to wait for the backend mutex, which a recon run holds for its whole run,
+ * GPU wait included: 6-10 ms of the GUI thread on some slip frames. With the
+ * lever on, a release that finds the mutex busy queues its token here and
+ * returns; whoever holds the mutex next runs the queued releases (the drain
+ * below), and a recon run drains once more just before it unlocks, which is
+ * the moment the waiting release used to get the lock. So no release runs
+ * earlier than it did before; the backend's pool sees it at the same moment or
+ * later. Lock order: backend mutex, then the ring mutex, never the reverse;
+ * the ring mutex is never held across a backend call.
+ * MLVAPP_GPU_RECON_RELEASE_DEFERRED=0 (read once) is the blocking release. */
+#define LLRAWPROC_GPU_RELEASE_RING_CAPACITY LLRP_GPU_RETAINED_OUTSTANDING_MAX
+static pthread_mutex_t g_llrawproc_gpu_release_ring_mutex = PTHREAD_MUTEX_INITIALIZER;
+static uint64_t g_llrawproc_gpu_release_ring[LLRAWPROC_GPU_RELEASE_RING_CAPACITY];
+static int g_llrawproc_gpu_release_ring_count = 0;
+static int g_llrawproc_gpu_release_max_depth = 0;          /* under the ring mutex */
+static volatile LONG64 g_llrawproc_gpu_release_deferred = 0;
+static volatile LONG64 g_llrawproc_gpu_release_sync = 0;
+static volatile LONG64 g_llrawproc_gpu_release_drained = 0;
+static int g_llrawproc_gpu_release_deferred_env_cache = -1;
+
+static int llrawproc_gpu_release_deferred_enabled(void)
+{
+    if(g_llrawproc_gpu_release_deferred_env_cache < 0)
+    {
+        const char * v = getenv("MLVAPP_GPU_RECON_RELEASE_DEFERRED");
+        g_llrawproc_gpu_release_deferred_env_cache =
+            (v && *v && (strcmp(v, "0") == 0
+                      || strcmp(v, "false") == 0
+                      || strcmp(v, "FALSE") == 0
+                      || strcmp(v, "False") == 0)) ? 0 : 1;
+    }
+    return g_llrawproc_gpu_release_deferred_env_cache;
+}
+
+/* Test-only: read MLVAPP_GPU_RECON_RELEASE_DEFERRED again; returns the new value. */
+int llrpReinitGpuReconReleaseDeferredForTesting(void);
+int llrpReinitGpuReconReleaseDeferredForTesting(void)
+{
+    g_llrawproc_gpu_release_deferred_env_cache = -1;
+    return llrawproc_gpu_release_deferred_enabled();
+}
+
+/* Caller holds g_llrawproc_gpu_recon_backend_mutex. The synchronous release's
+ * body: the backend's release, then the token leaves the outstanding list on
+ * rc 0 or 1 (a backend that is gone answers -3 and the token stays). */
+static int llrawproc_gpu_recon_release_token_locked(uint64_t token)
+{
+    llrawprocGpuExportBackend_t * g = &g_llrawproc_gpu_export_backend;
+    int rc = -1;
+    if(g->backend && !g->unavailable && g->release_retained_device_output)
+    {
+        rc = g->release_retained_device_output(g->backend, token);
+    }
+    else
+    {
+        rc = -3;
+    }
+    if(rc == 0 || rc == 1)
+    {
+        int i;
+        for(i = 0; i < g->retained_outstanding_count; ++i)
+        {
+            if(g->retained_outstanding_tokens[i] == token)
+            {
+                g->retained_outstanding_tokens[i] =
+                    g->retained_outstanding_tokens[--g->retained_outstanding_count];
+                break;
+            }
+        }
+    }
+    return rc;
+}
+
+/* Caller holds g_llrawproc_gpu_recon_backend_mutex: runs every queued release,
+ * in queue order. The ring is emptied under its own mutex first, so a release
+ * queued meanwhile waits for the next drain. One relaxed load when empty. */
+static void llrawproc_gpu_recon_drain_deferred_releases_locked(void)
+{
+    uint64_t tokens[LLRAWPROC_GPU_RELEASE_RING_CAPACITY];
+    int count;
+    int i;
+    if(__atomic_load_n(&g_llrawproc_gpu_release_ring_count, __ATOMIC_RELAXED) == 0) return;
+    pthread_mutex_lock(&g_llrawproc_gpu_release_ring_mutex);
+    count = g_llrawproc_gpu_release_ring_count;
+    memcpy(tokens, g_llrawproc_gpu_release_ring, sizeof(tokens[0]) * (size_t)count);
+    __atomic_store_n(&g_llrawproc_gpu_release_ring_count, 0, __ATOMIC_RELAXED);
+    pthread_mutex_unlock(&g_llrawproc_gpu_release_ring_mutex);
+    for(i = 0; i < count; ++i)
+    {
+        (void)llrawproc_gpu_recon_release_token_locked(tokens[i]);
+        InterlockedIncrement64(&g_llrawproc_gpu_release_drained);
+    }
+}
+
+/* 1 when queued, 0 when the ring is full (the caller then releases blocking). */
+static int llrawproc_gpu_recon_queue_release(uint64_t token)
+{
+    int queued = 0;
+    pthread_mutex_lock(&g_llrawproc_gpu_release_ring_mutex);
+    if(g_llrawproc_gpu_release_ring_count < LLRAWPROC_GPU_RELEASE_RING_CAPACITY)
+    {
+        g_llrawproc_gpu_release_ring[g_llrawproc_gpu_release_ring_count] = token;
+        __atomic_store_n(&g_llrawproc_gpu_release_ring_count,
+                         g_llrawproc_gpu_release_ring_count + 1, __ATOMIC_RELAXED);
+        if(g_llrawproc_gpu_release_ring_count > g_llrawproc_gpu_release_max_depth)
+        {
+            g_llrawproc_gpu_release_max_depth = g_llrawproc_gpu_release_ring_count;
+        }
+        queued = 1;
+    }
+    pthread_mutex_unlock(&g_llrawproc_gpu_release_ring_mutex);
+    if(queued) InterlockedIncrement64(&g_llrawproc_gpu_release_deferred);
+    return queued;
+}
+
+void llrpGpuPlaybackReconReleaseStats(llrpGpuReconReleaseStats_t * out, int reset_max_depth)
+{
+    if(!out) return;
+    memset(out, 0, sizeof(*out));
+    out->enabled = llrawproc_gpu_release_deferred_enabled();
+    out->deferred = (uint64_t)InterlockedCompareExchange64(&g_llrawproc_gpu_release_deferred, 0, 0);
+    out->sync = (uint64_t)InterlockedCompareExchange64(&g_llrawproc_gpu_release_sync, 0, 0);
+    out->drained = (uint64_t)InterlockedCompareExchange64(&g_llrawproc_gpu_release_drained, 0, 0);
+    pthread_mutex_lock(&g_llrawproc_gpu_release_ring_mutex);
+    out->max_depth = g_llrawproc_gpu_release_max_depth;
+    out->pending = g_llrawproc_gpu_release_ring_count;
+    if(reset_max_depth) g_llrawproc_gpu_release_max_depth = g_llrawproc_gpu_release_ring_count;
+    pthread_mutex_unlock(&g_llrawproc_gpu_release_ring_mutex);
+}
+
 /* Caller holds g_llrawproc_gpu_recon_backend_mutex; info is zeroed. */
 static void llrawproc_gpu_recon_fill_backend_info(llrpGpuPlaybackReconBackendInfo_t * info)
 {
@@ -959,6 +1092,7 @@ int llrpGpuPlaybackReconGetBackendInfo(llrpGpuPlaybackReconBackendInfo_t * info)
     if(!info) return 0;
     memset(info, 0, sizeof(*info));
     pthread_mutex_lock(&g_llrawproc_gpu_recon_backend_mutex);
+    llrawproc_gpu_recon_drain_deferred_releases_locked();
     llrawproc_gpu_recon_fill_backend_info(info);
     pthread_mutex_unlock(&g_llrawproc_gpu_recon_backend_mutex);
     return 1;
@@ -978,6 +1112,7 @@ int llrpGpuPlaybackReconGetBackendInfoWithin(llrpGpuPlaybackReconBackendInfo_t *
         if(GetTickCount64() >= deadline) return 0;
         Sleep(1);
     }
+    llrawproc_gpu_recon_drain_deferred_releases_locked();
     llrawproc_gpu_recon_fill_backend_info(info);
     pthread_mutex_unlock(&g_llrawproc_gpu_recon_backend_mutex);
     return 1;
@@ -1263,6 +1398,16 @@ int llrpFakeGpuBackendFreedInUseRetainedForTesting(void);
 int llrpFakeGpuBackendFreedInUseRetainedForTesting(void)
 {
     return g_llrawproc_fake_gpu_backend_freed_in_use;
+}
+
+/* r7 test-only: how many times the fake's release ran, cumulative (a token
+ * released twice is counted twice). */
+static volatile LONG64 g_llrawproc_fake_gpu_backend_release_calls = 0;
+
+uint64_t llrpFakeGpuBackendReleaseCallsForTesting(void);
+uint64_t llrpFakeGpuBackendReleaseCallsForTesting(void)
+{
+    return (uint64_t)InterlockedCompareExchange64(&g_llrawproc_fake_gpu_backend_release_calls, 0, 0);
 }
 
 static igpu_recon_luts_t g_llrawproc_fake_gpu_backend_luts = {0};
@@ -1648,6 +1793,7 @@ static int llrawproc_fake_gpu_backend_release_retained_device_output(
 {
     (void)b;
     (void)token;
+    InterlockedIncrement64(&g_llrawproc_fake_gpu_backend_release_calls);
     if(g_llrawproc_fake_gpu_backend_in_use_count > 0)
     {
         --g_llrawproc_fake_gpu_backend_in_use_count;
@@ -1681,6 +1827,7 @@ int llrpInstallFakeGpuPlaybackReconBackendForTesting(int install)
 {
     llrawprocGpuExportBackend_t * g = &g_llrawproc_gpu_export_backend;
     pthread_mutex_lock(&g_llrawproc_gpu_recon_backend_mutex);
+    llrawproc_gpu_recon_drain_deferred_releases_locked();
     llrawproc_gpu_export_backend_release(g);
     free(g_llrawproc_fake_gpu_backend_preupload_bytes);
     g_llrawproc_fake_gpu_backend_preupload_bytes = NULL;
@@ -1758,6 +1905,7 @@ int llrpFakeGpuBackendFailCreateForTesting(void)
     llrawprocGpuExportBackend_t * g = &g_llrawproc_gpu_export_backend;
     if(!g_llrawproc_fake_gpu_backend_installed) return 0;
     pthread_mutex_lock(&g_llrawproc_gpu_recon_backend_mutex);
+    llrawproc_gpu_recon_drain_deferred_releases_locked();
     llrawproc_fake_gpu_backend_note_armed(IGPU_CUDA_ERROR_CHANNEL_RENDER);
     g->backend = NULL;
     llrawproc_gpu_export_backend_create_failed(g, "<in-process-fake>", "fake-test-backend");
@@ -1772,7 +1920,11 @@ int llrpFakeGpuBackendFailCreateForTesting(void)
 void llrpHoldGpuReconBackendMutexForTesting(int hold);
 void llrpHoldGpuReconBackendMutexForTesting(int hold)
 {
-    if(hold) pthread_mutex_lock(&g_llrawproc_gpu_recon_backend_mutex);
+    if(hold)
+    {
+        pthread_mutex_lock(&g_llrawproc_gpu_recon_backend_mutex);
+        llrawproc_gpu_recon_drain_deferred_releases_locked();
+    }
     else pthread_mutex_unlock(&g_llrawproc_gpu_recon_backend_mutex);
 }
 
@@ -1817,6 +1969,7 @@ int llrpSetFakeGpuBackendReducedIsoNotchSymbolForTesting(int present)
     llrawprocGpuExportBackend_t * g = &g_llrawproc_gpu_export_backend;
     if(!g_llrawproc_fake_gpu_backend_installed) return 0;
     pthread_mutex_lock(&g_llrawproc_gpu_recon_backend_mutex);
+    llrawproc_gpu_recon_drain_deferred_releases_locked();
     g->set_reduced_iso_notch =
         present ? llrawproc_fake_gpu_backend_set_reduced_iso_notch : NULL;
     if(!present) g_llrawproc_fake_gpu_backend_reduced_iso_notch = 0;
@@ -2036,6 +2189,7 @@ static int llrawproc_gpu_recon_backend_available_guarded(int prefer_playback_dll
 {
     int available = 0;
     pthread_mutex_lock(&g_llrawproc_gpu_recon_backend_mutex);
+    llrawproc_gpu_recon_drain_deferred_releases_locked();
     /* GPU-DEVICE-LOSS-SELF-HEAL-1 r6: the check can create the backend (a CUDA
      * call), so a suppressed session reads it as unavailable, under the lock. */
     if(!llrpGpuCudaSuppressed())
@@ -2363,6 +2517,7 @@ int llrpGpuPlaybackReconDrainCudaErrorsAtTeardown(int wait_ms)
         if(GetTickCount64() >= deadline) return -1;
         Sleep(1);
     }
+    llrawproc_gpu_recon_drain_deferred_releases_locked();
     llrawproc_gpu_stage_telemetry_take_leftovers(g, leftovers);
     llrawproc_gpu_suppress_on_device_loss_locked(leftovers, 2);
     pthread_mutex_unlock(&g_llrawproc_gpu_recon_backend_mutex);
@@ -2407,6 +2562,7 @@ int llrpGpuPlaybackReconPreuploadFrame(uint64_t frame_id,
         return 1;
     }
     locked = pthread_mutex_trylock(&g_llrawproc_gpu_recon_backend_mutex) == 0;
+    if(locked) llrawproc_gpu_recon_drain_deferred_releases_locked();
     if(!locked)
     {
         /* Claim before inspecting run_active so teardown, if it owns the
@@ -2632,6 +2788,7 @@ static int llrawproc_gpu_recon_run_backend(const dualiso_gpu_recon_state_t * sta
      * check above and then waited here through a loss must not reach CUDA. */
     if(llrpGpuCudaSuppressed())
     {
+        llrawproc_gpu_recon_drain_deferred_releases_locked();
         llrawproc_gpu_split_book_suppressed_wait(split_lock_start_s);
         pthread_mutex_unlock(&g_llrawproc_gpu_recon_backend_mutex);
         if(rc_out) *rc_out = LLRP_GPU_PLAYBACK_RECON_RC_CUDA_SUPPRESSED;
@@ -2644,6 +2801,9 @@ static int llrawproc_gpu_recon_run_backend(const dualiso_gpu_recon_state_t * sta
     g_llrawproc_last_dual_iso_gpu_split.mutex_wait_ms +=
         (split_lock_acquired_s - split_lock_start_s) * 1000.0;
     g_llrawproc_last_dual_iso_gpu_split.backend_calls++;
+    /* r7: queued releases run before this run reads the outstanding count or
+     * retains an output (llrawproc_gpu_recon_drain_deferred_releases_locked). */
+    llrawproc_gpu_recon_drain_deferred_releases_locked();
     if(!llrawproc_gpu_export_backend_available(prefer_playback_dll))
     {
         llrawproc_gpu_split_book_held_refusal(split_lock_acquired_s);
@@ -2990,6 +3150,10 @@ static int llrawproc_gpu_recon_run_backend(const dualiso_gpu_recon_state_t * sta
             split->configure_ms += (split_held_end_s - split_lock_acquired_s) * 1000.0;
         }
     }
+    /* r7: releases queued during this run run now, the moment a blocking
+     * release would have taken the mutex. The device-loss scan stays the last
+     * statement before the unlock (GPU-LOSS-EMIT-BEFORE-UNLOCK-1). */
+    llrawproc_gpu_recon_drain_deferred_releases_locked();
     llrawproc_gpu_suppress_on_device_loss_locked(telemetry_events, telemetry_event_count);
     pthread_mutex_unlock(&g_llrawproc_gpu_recon_backend_mutex);
     llrawproc_gpu_recon_after_unlock_for_testing();
@@ -3041,6 +3205,7 @@ int llrpGpuPlaybackReconResetGlTextureResources(void)
     llrpGpuStageTelemetrySink_t telemetry_sink = NULL;
     llrawprocGpuStageTelemetryEvent_t leftovers[2];
     pthread_mutex_lock(&g_llrawproc_gpu_recon_backend_mutex);
+    llrawproc_gpu_recon_drain_deferred_releases_locked();
     if(g->backend && g->reset_gl_texture_resources)
     {
         ok = (g->reset_gl_texture_resources(g->backend) == 0) ? 1 : 0;
@@ -3491,6 +3656,7 @@ int llrpGpuPlaybackReconCopyLastDeviceBayer16ToGlTexture(unsigned int gl_texture
     if(gl_texture_id == 0) return 0;
 
     pthread_mutex_lock(&g_llrawproc_gpu_recon_backend_mutex);
+    llrawproc_gpu_recon_drain_deferred_releases_locked();
     /* r6: read again under the lock (see llrawproc_gpu_recon_run_backend). */
     if(llrpGpuCudaSuppressed())
     {
@@ -3513,33 +3679,40 @@ int llrpGpuPlaybackReconCopyLastDeviceBayer16ToGlTexture(unsigned int gl_texture
 int llrpGpuPlaybackReconReleaseRetainedDeviceBayer16(uint64_t token);
 int llrpGpuPlaybackReconReleaseRetainedDeviceBayer16(uint64_t token)
 {
-    llrawprocGpuExportBackend_t * g = &g_llrawproc_gpu_export_backend;
     int rc = -1;
     if(token == 0) return 1;
 
-    pthread_mutex_lock(&g_llrawproc_gpu_recon_backend_mutex);
-    if(g->backend && !g->unavailable && g->release_retained_device_output)
+    /* r7: with the lever on, a busy backend mutex queues the release (see
+     * llrawproc_gpu_recon_drain_deferred_releases_locked) and returns 1. */
+    if(llrawproc_gpu_release_deferred_enabled())
     {
-        rc = g->release_retained_device_output(g->backend, token);
-    }
-    else
-    {
-        rc = -3;
-    }
-    if(rc == 0 || rc == 1)
-    {
-        int i;
-        for(i = 0; i < g->retained_outstanding_count; ++i)
+        if(pthread_mutex_trylock(&g_llrawproc_gpu_recon_backend_mutex) == 0)
         {
-            if(g->retained_outstanding_tokens[i] == token)
-            {
-                g->retained_outstanding_tokens[i] =
-                    g->retained_outstanding_tokens[--g->retained_outstanding_count];
-                break;
-            }
+            llrawproc_gpu_recon_drain_deferred_releases_locked();
+            rc = llrawproc_gpu_recon_release_token_locked(token);
+            pthread_mutex_unlock(&g_llrawproc_gpu_recon_backend_mutex);
+            InterlockedIncrement64(&g_llrawproc_gpu_release_sync);
+            return rc == 0 || rc == 1;
         }
+        if(llrawproc_gpu_recon_queue_release(token))
+        {
+            /* The holder may have run its last drain before this push: if the
+             * mutex is free now, drain here rather than wait for the next holder. */
+            if(pthread_mutex_trylock(&g_llrawproc_gpu_recon_backend_mutex) == 0)
+            {
+                llrawproc_gpu_recon_drain_deferred_releases_locked();
+                pthread_mutex_unlock(&g_llrawproc_gpu_recon_backend_mutex);
+            }
+            return 1;
+        }
+        /* Ring full: the blocking release below; the token is never dropped. */
     }
+
+    pthread_mutex_lock(&g_llrawproc_gpu_recon_backend_mutex);
+    llrawproc_gpu_recon_drain_deferred_releases_locked();
+    rc = llrawproc_gpu_recon_release_token_locked(token);
     pthread_mutex_unlock(&g_llrawproc_gpu_recon_backend_mutex);
+    InterlockedIncrement64(&g_llrawproc_gpu_release_sync);
 
     return rc == 0 || rc == 1;
 }
@@ -3548,6 +3721,8 @@ int llrpGpuPlaybackReconRetainedOutstandingCount(void)
 {
     int count;
     pthread_mutex_lock(&g_llrawproc_gpu_recon_backend_mutex);
+    /* r7: queued releases first, so the count is what the blocking release gave. */
+    llrawproc_gpu_recon_drain_deferred_releases_locked();
     count = g_llrawproc_gpu_export_backend.retained_outstanding_count;
     pthread_mutex_unlock(&g_llrawproc_gpu_recon_backend_mutex);
     return count;
@@ -3557,6 +3732,7 @@ uint64_t llrpGpuPlaybackReconClipDimsChangeRefusals(void)
 {
     uint64_t refusals;
     pthread_mutex_lock(&g_llrawproc_gpu_recon_backend_mutex);
+    llrawproc_gpu_recon_drain_deferred_releases_locked();
     refusals = g_llrawproc_gpu_export_backend.clip_dims_change_refusals;
     pthread_mutex_unlock(&g_llrawproc_gpu_recon_backend_mutex);
     return refusals;
@@ -3567,6 +3743,7 @@ int llrpGpuPlaybackReconReducedIsoNotchAvailable(void)
     llrawprocGpuExportBackend_t * g = &g_llrawproc_gpu_export_backend;
     int available = -1;
     pthread_mutex_lock(&g_llrawproc_gpu_recon_backend_mutex);
+    llrawproc_gpu_recon_drain_deferred_releases_locked();
     if(g->backend && !g->unavailable)
     {
         available = g->set_reduced_iso_notch ? 1 : 0;
@@ -3874,6 +4051,19 @@ int llrpGpuPlaybackReconResetGlTextureResources(void)
 }
 
 int llrpGpuPlaybackReconRetainedOutstandingCount(void)
+{
+    return 0;
+}
+
+/* r7: no backend in this build, so nothing is ever queued. */
+void llrpGpuPlaybackReconReleaseStats(llrpGpuReconReleaseStats_t * out, int reset_max_depth)
+{
+    (void)reset_max_depth;
+    if(out) memset(out, 0, sizeof(*out));
+}
+
+int llrpReinitGpuReconReleaseDeferredForTesting(void);
+int llrpReinitGpuReconReleaseDeferredForTesting(void)
 {
     return 0;
 }

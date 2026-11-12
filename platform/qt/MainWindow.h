@@ -1335,6 +1335,9 @@ private:
     // PLAYBACK-BACHELOR-PRESENT-JITTER-1: per-present slip accounting and timeline-path reconciliation for the
     // smoke session (playback_smoke.slip_summary); fed only while m_playbackSmokeActive.
     playback_slip::SlipHistogram m_playbackSlipHistogram;
+    // HFR-NATIVE-M16-1457-GUI-TEXTURE-PRESENT-OFFLOAD-1 K1: the texture-present split per path
+    // (playback_smoke.texture_present_split); fed and reset exactly like m_playbackSlipHistogram.
+    playback_texture_split::Aggregator m_playbackTextureSplit;
     // PLAYBACK-PRESENT-TAIL-TIMING-1: the GpuDisplayWindow recon present tail of the frame presentPlaybackPreparedFrame
     // is presenting (reset at its entry); notePlaybackSmokePresentedFrame reads it for that same frame.
     GpuPresentTailTiming m_lastPresentTailTiming;
@@ -1438,6 +1441,10 @@ private:
     int m_playbackSmokePresentIntervalOverBudget[4] = { 0, 0, 0, 0 };
     uint64_t m_playbackSmokeStartGpuSetClipCount = 0;
     uint64_t m_playbackSmokeStartGpuSetLutsCount = 0;
+    // HFR-NATIVE-M16-1457-GUI-TEXTURE-PRESENT-OFFLOAD-1 r7: deferred-release baselines (playback_smoke.recon_release).
+    uint64_t m_playbackSmokeStartReconReleaseDeferred = 0;
+    uint64_t m_playbackSmokeStartReconReleaseSync = 0;
+    uint64_t m_playbackSmokeStartReconReleaseDrained = 0;
     quint64 m_playbackSmokeStartPresentTextureReallocs = 0;
     double m_playbackSmokeRenderTotalSumMs = 0.0;
     double m_playbackSmokeRenderTotalMaxMs = 0.0;

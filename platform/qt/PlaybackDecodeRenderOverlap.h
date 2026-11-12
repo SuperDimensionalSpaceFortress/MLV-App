@@ -28,6 +28,7 @@
 #ifndef PLAYBACKDECODERENDEROVERLAP_H
 #define PLAYBACKDECODERENDEROVERLAP_H
 
+#include <atomic>
 #include <cstdint>
 #include <mutex>
 
@@ -120,6 +121,40 @@ struct OverlapSnapshot
     }
 };
 
+/*! HFR-NATIVE-M16-1457-GUI-TEXTURE-PRESENT-OFFLOAD-1 K1: the recon worker's activity at one instant. */
+struct ReconActivity
+{
+    unsigned long long starts = 0;   //!< recon starts since construction (monotonic)
+    int active = 0;                  //!< recons running now
+};
+
+/*! True when a recon ran at any point between two samples \a before and \a after: one was running at either
+ *  end, or one started in between (and may have finished before \a after). */
+inline bool reconRanBetween( const ReconActivity &before, const ReconActivity &after )
+{
+    return before.active > 0 || after.active > 0 || after.starts != before.starts;
+}
+
+/*! The packed recon activity word: active recons in the low 16 bits, starts above them (2^48 starts before wrap). One
+ *  begin adds kReconActivityBeginDelta (a start AND an active recon at once); one end subtracts 1. */
+inline constexpr int kReconActivityActiveBits = 16;
+inline constexpr uint64_t kReconActivityActiveMask = ( uint64_t( 1 ) << kReconActivityActiveBits ) - 1;
+inline constexpr uint64_t kReconActivityBeginDelta = ( uint64_t( 1 ) << kReconActivityActiveBits ) + 1;
+
+inline uint64_t packReconActivity( unsigned long long starts, int active )
+{
+    return ( static_cast<uint64_t>( starts ) << kReconActivityActiveBits )
+         | ( static_cast<uint64_t>( active < 0 ? 0 : active ) & kReconActivityActiveMask );
+}
+
+inline ReconActivity unpackReconActivity( uint64_t word )
+{
+    ReconActivity a;
+    a.starts = static_cast<unsigned long long>( word >> kReconActivityActiveBits );
+    a.active = static_cast<int>( word & kReconActivityActiveMask );
+    return a;
+}
+
 /*! Thread-safe: the decode worker, the recon worker and the render thread each
  *  report their own spans. Times are milliseconds on one monotonic clock. */
 class OverlapMeter
@@ -142,6 +177,7 @@ public:
                         UpstreamStage stage = UpstreamStage::Recon )
     {
         std::lock_guard<std::mutex> lock( m_mutex );
+        if( stage == UpstreamStage::Recon ) noteReconActivityLocked( true );
         if( !m_armed ) return;
         advanceLocked( nowMs );
         ++m_upstreamActive;
@@ -153,6 +189,7 @@ public:
     void upstreamEnd( double nowMs, UpstreamStage stage = UpstreamStage::Recon )
     {
         std::lock_guard<std::mutex> lock( m_mutex );
+        if( stage == UpstreamStage::Recon ) noteReconActivityLocked( false );
         if( !m_armed ) return;
         advanceLocked( nowMs );
         if( m_upstreamActive > 0 ) --m_upstreamActive;
@@ -191,7 +228,29 @@ public:
         return m_snapshot;
     }
 
+    /*! HFR-NATIVE-M16-1457-GUI-TEXTURE-PRESENT-OFFLOAD-1 K1: the recon worker's activity, read lock-free and with no
+     *  clock read, so the GUI thread can sample it around one texture present. Counted whether or not the meter is
+     *  armed and never reset (a reset while a recon runs would otherwise lose its end). */
+    ReconActivity reconActivity() const
+    {
+        return unpackReconActivity( m_reconActivityWord.load( std::memory_order_acquire ) );
+    }
+
 private:
+    /* Adversary A1-r1 (A2): starts and active live in ONE word, changed by one atomic RMW per begin and per end, so a
+     * reader never sees a begin half done (a start counted with its recon not yet active). */
+    void noteReconActivityLocked( bool begin )
+    {
+        if( begin )
+        {
+            m_reconActivityWord.fetch_add( kReconActivityBeginDelta, std::memory_order_acq_rel );
+        }
+        else if( unpackReconActivity( m_reconActivityWord.load( std::memory_order_acquire ) ).active > 0 )
+        {
+            m_reconActivityWord.fetch_sub( 1, std::memory_order_acq_rel );   // writers hold m_mutex: no lost update
+        }
+    }
+
     void advanceLocked( double nowMs )
     {
         if( nowMs <= m_lastMs ) return;
@@ -214,6 +273,7 @@ private:
     double m_resetMs = 0.0;
     double m_lastMs = 0.0;
     bool m_armed = false;
+    std::atomic<uint64_t> m_reconActivityWord{ 0 };   // packReconActivity( starts, active )
 };
 
 } // namespace playback_overlap

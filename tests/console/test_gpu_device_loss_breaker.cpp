@@ -846,3 +846,125 @@ TEST(GpuDeviceLossBreaker, SuppressedSessionCpuReducedReconRestampsTheCudaReconF
     const int fn = source.indexOf(QStringLiteral("int applyLLRawProcObjectWorker_with_dims(mlvObject_t * video,"));
     ASSERT_TRUE(source.indexOf(reset, fn) < source.indexOf(QStringLiteral("return llrawproc_apply_with_dims_internal("), fn));
 }
+
+namespace
+{
+// HFR-NATIVE-M16-1457-GUI-TEXTURE-PRESENT-OFFLOAD-1 r7: the deferred-release lever. A release that finds the backend
+// mutex busy is queued, so every acquisition of the backend mutex must run the queue before it does anything else
+// (no backend call, no outstanding-list read, no teardown in between), or a queued token could wait behind a holder
+// that reads a stale count. Returns "llrawproc.c:<line>" for each acquisition with no drain before its next unlock,
+// or with a backend touch ahead of the drain. Run on the comment-stripped source.
+QStringList backendAcquisitionsWithoutADrain(const QString & source)
+{
+    const QString drain = QStringLiteral("llrawproc_gpu_recon_drain_deferred_releases_locked();");
+    const QString unlock = QStringLiteral("pthread_mutex_unlock(&g_llrawproc_gpu_recon_backend_mutex)");
+    QStringList missing;
+    for (const QString & acquire : {QStringLiteral("pthread_mutex_lock(&g_llrawproc_gpu_recon_backend_mutex)"),
+                                    QStringLiteral("pthread_mutex_trylock(&g_llrawproc_gpu_recon_backend_mutex)")})
+    {
+        for (int at = source.indexOf(acquire); at >= 0; at = source.indexOf(acquire, at + 1))
+        {
+            const int from = at + acquire.size();
+            const int next = source.indexOf(unlock, from);
+            const QString region = source.mid(from, (next < 0 ? source.size() : next) - from);
+            const int drainAt = region.indexOf(drain);
+            const QString ahead = drainAt < 0 ? region : region.left(drainAt);
+            if (drainAt < 0 || ahead.contains(QStringLiteral("g->")) || ahead.contains(QStringLiteral("retained_outstanding"))
+                || ahead.contains(QStringLiteral("llrawproc_gpu_export_backend_")))
+                missing << QStringLiteral("llrawproc.c:%1").arg(source.left(at).count(QLatin1Char('\n')) + 1);
+        }
+    }
+    return missing;
+}
+
+QString bodyOf(const QString & source, const QString & entry)
+{
+    const int fn = source.indexOf(entry);
+    if (fn < 0) return QString();
+    const int end = source.indexOf(QStringLiteral("\n}\n"), fn);
+    return source.mid(fn, (end < 0 ? source.size() : end) - fn);
+}
+} // namespace
+
+TEST(GpuDeviceLossBreaker, R7EveryBackendMutexAcquisitionRunsTheQueuedReleasesFirst)
+{
+    const QString llrawproc = withoutCComments(readRepoFile(QStringLiteral("src/mlv/llrawproc/llrawproc.c")));
+    ASSERT_FALSE(llrawproc.isEmpty());
+    ASSERT_EQ(std::string(), backendAcquisitionsWithoutADrain(llrawproc).join(QStringLiteral(", ")).toStdString());
+    // Mutants: a site's drain removed, or moved after its first backend touch, is reported.
+    const QString clipDims = QStringLiteral("    llrawproc_gpu_recon_drain_deferred_releases_locked();\n"
+                                            "    refusals = g_llrawproc_gpu_export_backend.clip_dims_change_refusals;\n");
+    ASSERT_EQ(1, (int)backendAcquisitionsWithoutADrain(
+                     replacedOnce(llrawproc, clipDims,
+                                  QStringLiteral("    refusals = g_llrawproc_gpu_export_backend.clip_dims_change_refusals;\n")))
+                     .size());
+    const QString install = QStringLiteral("    llrawproc_gpu_recon_drain_deferred_releases_locked();\n"
+                                           "    llrawproc_gpu_export_backend_release(g);\n");
+    ASSERT_EQ(1, (int)backendAcquisitionsWithoutADrain(
+                     replacedOnce(llrawproc, install,
+                                  QStringLiteral("    llrawproc_gpu_export_backend_release(g);\n"
+                                                 "    llrawproc_gpu_recon_drain_deferred_releases_locked();\n")))
+                     .size());
+    // ...and a new acquisition site without one is reported.
+    const QString added = llrawproc + QStringLiteral(
+        "\nstatic int a_new_site(void)\n{\n"
+        "    pthread_mutex_lock(&g_llrawproc_gpu_recon_backend_mutex);\n"
+        "    pthread_mutex_unlock(&g_llrawproc_gpu_recon_backend_mutex);\n    return 0;\n}\n");
+    ASSERT_EQ(1, (int)backendAcquisitionsWithoutADrain(added).size());
+
+    // The recon run drains before it can create the backend, read the outstanding count or retain an output, and
+    // once more as it ends, just before the device-loss scan that must stay the last statement before the unlock.
+    const QString run = bodyOf(llrawproc, QStringLiteral("static int llrawproc_gpu_recon_run_backend("));
+    ASSERT_FALSE(run.isEmpty());
+    const int mainDrain = run.indexOf(QStringLiteral("llrawproc_gpu_recon_drain_deferred_releases_locked();"),
+                                      run.indexOf(QStringLiteral("split_lock_acquired_s = mlv_stage_timing_now();")));
+    ASSERT_TRUE(mainDrain > 0);
+    ASSERT_TRUE(mainDrain < run.indexOf(QStringLiteral("if(!llrawproc_gpu_export_backend_available(prefer_playback_dll))")));
+    ASSERT_TRUE(mainDrain < run.indexOf(QStringLiteral("g->retained_outstanding_count > 0")));
+    ASSERT_TRUE(mainDrain < run.indexOf(QStringLiteral("g->retain_last_device_output(")));
+    ASSERT_TRUE(run.contains(QStringLiteral(
+        "    llrawproc_gpu_recon_drain_deferred_releases_locked();\n"
+        "    llrawproc_gpu_suppress_on_device_loss_locked(telemetry_events, telemetry_event_count);\n"
+        "    pthread_mutex_unlock(&g_llrawproc_gpu_recon_backend_mutex);\n")));
+
+    // Lock order: backend mutex, then the ring mutex. The ring helpers take only the ring mutex, and the drain lets
+    // it go before it calls the backend.
+    for (const char * entry : {"static void llrawproc_gpu_recon_drain_deferred_releases_locked(void)",
+                               "static int llrawproc_gpu_recon_queue_release(uint64_t token)",
+                               "void llrpGpuPlaybackReconReleaseStats(llrpGpuReconReleaseStats_t * out, int reset_max_depth)\n{"})
+    {
+        const QString body = bodyOf(llrawproc, QString::fromLatin1(entry));
+        ASSERT_FALSE(body.isEmpty());
+        ASSERT_TRUE(body.contains(QStringLiteral("pthread_mutex_lock(&g_llrawproc_gpu_release_ring_mutex);")));
+        ASSERT_FALSE(body.contains(QStringLiteral("g_llrawproc_gpu_recon_backend_mutex")));
+    }
+    const QString drainBody = bodyOf(llrawproc, QStringLiteral("static void llrawproc_gpu_recon_drain_deferred_releases_locked(void)"));
+    ASSERT_TRUE(drainBody.indexOf(QStringLiteral("pthread_mutex_unlock(&g_llrawproc_gpu_release_ring_mutex);"))
+                < drainBody.indexOf(QStringLiteral("llrawproc_gpu_recon_release_token_locked(")));
+
+    // The entry: the lever's trylock path and the blocking path (kill switch 0, or a full queue) run the same body.
+    const QString release = bodyOf(llrawproc, QStringLiteral("int llrpGpuPlaybackReconReleaseRetainedDeviceBayer16(uint64_t token)\n{"));
+    ASSERT_FALSE(release.isEmpty());
+    ASSERT_EQ(2, (int)release.count(QStringLiteral("rc = llrawproc_gpu_recon_release_token_locked(token);")));
+    ASSERT_TRUE(release.indexOf(QStringLiteral("if(llrawproc_gpu_release_deferred_enabled())"))
+                < release.indexOf(QStringLiteral("pthread_mutex_trylock(&g_llrawproc_gpu_recon_backend_mutex)")));
+    ASSERT_TRUE(release.contains(QStringLiteral(
+        "    pthread_mutex_lock(&g_llrawproc_gpu_recon_backend_mutex);\n"
+        "    llrawproc_gpu_recon_drain_deferred_releases_locked();\n"
+        "    rc = llrawproc_gpu_recon_release_token_locked(token);\n"
+        "    pthread_mutex_unlock(&g_llrawproc_gpu_recon_backend_mutex);\n")));
+    // The count drains first, so the prewarm line and the session summary see what the blocking release gave.
+    ASSERT_TRUE(bodyOf(llrawproc, QStringLiteral("int llrpGpuPlaybackReconRetainedOutstandingCount(void)\n{\n    int count;"))
+                    .contains(QStringLiteral("llrawproc_gpu_recon_drain_deferred_releases_locked();\n"
+                                             "    count = g_llrawproc_gpu_export_backend.retained_outstanding_count;")));
+    // The kill switch is read once (a cache), default on, and both build variants define the stats call.
+    ASSERT_TRUE(llrawproc.contains(QStringLiteral("const char * v = getenv(\"MLVAPP_GPU_RECON_RELEASE_DEFERRED\");")));
+    ASSERT_TRUE(llrawproc.contains(QStringLiteral("if(g_llrawproc_gpu_release_deferred_env_cache < 0)")));
+    ASSERT_EQ(2, (int)llrawproc.count(QStringLiteral("void llrpGpuPlaybackReconReleaseStats(llrpGpuReconReleaseStats_t * out, int reset_max_depth)\n{")));
+
+    // MainWindow emits the engagement once per session, beside the other session summaries.
+    const QString mw = readRepoFile(QStringLiteral("platform/qt/MainWindow.cpp"));
+    ASSERT_EQ(1, (int)mw.count(QStringLiteral("\"playback_smoke.recon_release session=%1 deferred_enabled=%2 deferred=%3 sync=%4 \"")));
+    ASSERT_TRUE(mw.contains(QStringLiteral("\"drained=%5 max_depth=%6 outstanding_at_stop=%7\" )")));
+    ASSERT_EQ(1, (int)mw.count(QStringLiteral("llrpGpuPlaybackReconReleaseStats( &releaseStats, 1 );")));
+}

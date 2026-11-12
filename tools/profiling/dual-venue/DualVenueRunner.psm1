@@ -1738,6 +1738,61 @@ function Get-DvWorkerThreadsEvidence {
     [ordered]@{ requested = $requested; observed = $observed; inheritedOverrides = $inheritedOverrides; verdict = $verdict; reason = $reason; blocks = ($verdict -cin @('NOT_HONOURED', 'INHERITED_WORKER_OVERRIDE')) }
 }
 
+function ConvertTo-DvSessionKey {
+    <#
+    .SYNOPSIS
+    HFR-NATIVE-M16-1457-GUI-TEXTURE-PRESENT-OFFLOAD-1 r12 (r9 keys on 4a61e684, adversary A1): the canonical text of a session integer, so equal integers compare equal
+    whatever their spelling (`3`, `03`, `+3`, `003`, a full-width `3`). A negative non-zero integer keeps its minus; `-0` is `0`. Digits only (no culture, no overflow);
+    a Unicode decimal digit is read as its value.
+    #>
+    param([string]$Sign, [Parameter(Mandatory)][string]$Digits)
+    if ($Digits -cnotmatch '^[0-9]+$') { $Digits = -join ($Digits.ToCharArray() | ForEach-Object { [string][int][char]::GetNumericValue($_) }) }
+    $d = $Digits.TrimStart('0')
+    if ($d -eq '') { return '0' }
+    if ($Sign -ceq '-') { return '-' + $d }
+    return $d
+}
+
+# HFR-NATIVE-M16-1457-GUI-TEXTURE-PRESENT-OFFLOAD-1 r14: the optional log prefix a canonical session record may carry ([utc] [LEVEL] [0xthread] ), shared by
+# every whole-line record pattern Get-DvCanonicalRecordPattern builds.
+$script:DvLogRecordPrefix = '(\[[^\]]*\] \[[A-Za-z]+\] (\[0x[0-9A-Fa-f]+\] )?)?'
+
+function Get-DvCanonicalRecordPattern {
+    <#
+    .SYNOPSIS
+    HFR-NATIVE-M16-1457-GUI-TEXTURE-PRESENT-OFFLOAD-1 r14: the whole-line pattern of a canonical session record, `<optional log prefix><marker> session=<Session>
+    <Fields>` and nothing else. Session and Fields are regex text. One builder, so a reader's own record pattern and the "another session's record" test in
+    Test-DvRecordMentionsSession can never disagree on what canonical means.
+    #>
+    param([Parameter(Mandatory)][string]$Marker, [Parameter(Mandatory)][string]$Session, [Parameter(Mandatory)][string]$Fields)
+    '^' + $script:DvLogRecordPrefix + [regex]::Escape($Marker) + ' session=' + $Session + ' ' + $Fields + '$'
+}
+
+function Test-DvRecordMentionsSession {
+    <#
+    .SYNOPSIS
+    HFR-NATIVE-M16-1457-GUI-TEXTURE-PRESENT-OFFLOAD-1 r14 (r12 keys opus and fable key3 on e19e383d; fable's ruling, adopted by the hub): is this record body a
+    mention of the measured session? The test is INVERTED. A body that carries the marker (case-sensitive, not followed by a word character) is a mention UNLESS
+    the whole body is a canonical record (Get-DvCanonicalRecordPattern with the reader's own Fields) whose session is a plain decimal integer with at most one
+    sign, in ASCII digits, that differs from the measured session as an integer (ConvertTo-DvSessionKey: `03`, `+3` and `-0`/`0` compare by value). So a
+    mention needs no particular spelling of the session at all: any separator (`session -> 3`, `session = + 3`), a quote, a hex or decimal-point value, a digit
+    outside ASCII, a key in another case, a session cut off with the body at its first ` (`, or no session field at all. Anything that is neither the canonical
+    record of another session nor a body without the marker counts for the measured session, so it makes the state unreadable rather than being skipped while
+    a conflicting canonical record passes (fail closed). The only body skipped is the app's own canonical record of another session (`session=4 ...`). Before
+    r14 the helper listed the session spellings it would recognise, and the sixth hole in that list (a + or - in the separator) is why it no longer does.
+    Pure; shared by the recon_release and prep_route readers.
+    #>
+    param([AllowNull()][AllowEmptyString()][string]$Body, [Parameter(Mandatory)][string]$Marker, [Parameter(Mandatory)][string]$Session,
+          [Parameter(Mandatory)][string]$Fields)
+    if ([string]::IsNullOrEmpty($Body)) { return $false }
+    if ($Body -cnotmatch ('^(?=.*' + [regex]::Escape($Marker) + '(?!\w))')) { return $false }
+    $other = [regex]::Match($Body, (Get-DvCanonicalRecordPattern -Marker $Marker -Session '(?<dvsign>[+\-]?)(?<dvdigits>[0-9]+)' -Fields $Fields))
+    if (-not $other.Success) { return $true }
+    $want = $(if ($Session -cmatch '^\d+$') { ConvertTo-DvSessionKey -Sign '' -Digits $Session } else { $Session })
+    $key = ConvertTo-DvSessionKey -Sign $other.Groups['dvsign'].Value -Digits $other.Groups['dvdigits'].Value
+    return ($key -ceq $want)
+}
+
 function Get-DvPrepConflatedMoveEvidence {
     <#
     .SYNOPSIS
@@ -1768,11 +1823,12 @@ function Get-DvPrepConflatedMoveEvidence {
     if (-not [string]::IsNullOrEmpty($LogText)) {
         $session = (Get-DvSmokeSummaryFields -LogText $LogText).session
         if ($null -ne $session) {
-            $whole = '^(\[[^\]]*\] \[[A-Za-z]+\] (\[0x[0-9A-Fa-f]+\] )?)?playback_smoke\.prep_route session=' + [regex]::Escape([string]$session) +
-                ' prep_conflated_move_active=(?<v>[01])$'
-            $mention = 'playback_smoke\.prep_route session=' + [regex]::Escape([string]$session) + '( |$)'
+            $fields = 'prep_conflated_move_active=(?<v>[01])'
+            $whole = Get-DvCanonicalRecordPattern -Marker 'playback_smoke.prep_route' -Session ([regex]::Escape([string]$session)) -Fields $fields
+            # r14 (r12 keys on e19e383d): a mention is any record body that carries the marker and is not the whole-line canonical record of ANOTHER session
+            # (Test-DvRecordMentionsSession, inverted), so no spelling of the measured session, and no record without one, is ever skipped.
             foreach ($l in (Get-DvLogRecordBodies -LogText $LogText)) {
-                if ($l -cnotmatch $mention) { continue }
+                if (-not (Test-DvRecordMentionsSession -Body $l -Marker 'playback_smoke.prep_route' -Session ([string]$session) -Fields $fields)) { continue }
                 $mentions++
                 $m = [regex]::Match($l, $whole)
                 if ($m.Success) { $records++; $observed = [int]$m.Groups['v'].Value }
@@ -1795,6 +1851,68 @@ function Get-DvPrepConflatedMoveEvidence {
         elseif ($observed -eq 1) { $verdict = 'NOT_HONOURED'; $reason = 'PREP_CONFLATED_MOVE_INHERITED: the leg does not ask for the switch but the app reports prep_conflated_move_active=1 (the variable came from the launcher''s environment), so this run is not the OFF arm' }
     }
     [ordered]@{ requested = $requested; observed = $observed; verdict = $verdict; reason = $reason; blocks = ($verdict -ceq 'NOT_HONOURED') }
+}
+
+function Get-DvReconReleaseDeferredEvidence {
+    <#
+    .SYNOPSIS
+    HFR-NATIVE-M16-1457-GUI-TEXTURE-PRESENT-OFFLOAD-1 r7: did a leg that asks for the deferred-release kill switch (generatorArgs.disableReconReleaseDeferred =
+    true, which sets MLVAPP_GPU_RECON_RELEASE_DEFERRED=0) run with the lever OFF? Read ONLY from the app's own `playback_smoke.recon_release session=<n>
+    deferred_enabled=<0|1> deferred=<n> sync=<n> drained=<n> max_depth=<n> outstanding_at_stop=<n>` record for the MEASURED session, matched as a whole line
+    (an optional log prefix and Qt location suffix, nothing else), never from the start line, the spec or the launcher's env block. FAIL CLOSED: `blocks` is
+    true when the leg asked and there is no such record (a binary before r7 emits none), the record is unreadable or not unique, or it says deferred_enabled=1.
+    A leg that does not ask blocks only when the app reports deferred_enabled=0 (the head arm inherited the variable: RECON_RELEASE_DEFERRED_INHERITED) or a
+    record is present but unreadable; with no record (a control binary before r7), or a clean deferred_enabled=1, it is unchanged. The counts (deferred, sync,
+    drained, max_depth, outstanding_at_stop) are returned for the reader's own gates (the head arm's deferred > 0 is a gate there, not here: a cpu leg
+    retains no token and reports deferred=0 legitimately). Pure and shared: the runner gates on it and Test-DvReceiptValid re-derives it from the hashed run log.
+    #>
+    param([Parameter(Mandatory)]$Spec, [AllowNull()][AllowEmptyString()][string]$LogText)
+    $raw = Get-DvProp (Get-DvProp $Spec 'generatorArgs') 'disableReconReleaseDeferred'
+    $requested = ($raw -is [bool]) -and $raw
+    $observed = $null
+    $counts = $null
+    $verdict = 'NOT_REQUESTED'
+    $reason = $null
+    $records = 0
+    $mentions = 0
+    if (-not [string]::IsNullOrEmpty($LogText)) {
+        $session = (Get-DvSmokeSummaryFields -LogText $LogText).session
+        if ($null -ne $session) {
+            $fields = 'deferred_enabled=(?<v>[01]) deferred=(?<deferred>0|[1-9][0-9]{0,18}) sync=(?<sync>0|[1-9][0-9]{0,18}) drained=(?<drained>0|[1-9][0-9]{0,18})' +
+                ' max_depth=(?<depth>0|[1-9][0-9]{0,8}) outstanding_at_stop=(?<outstanding>0|[1-9][0-9]{0,8})'
+            $whole = Get-DvCanonicalRecordPattern -Marker 'playback_smoke.recon_release' -Session ([regex]::Escape([string]$session)) -Fields $fields
+            # r14 (r12 keys opus and fable key3 on e19e383d): a mention is ANY record body that carries the marker, whatever it says about the session (any
+            # separator, sign, quote, field order, the session before the marker, a cut body, no session at all), UNLESS the whole body is the canonical record
+            # of ANOTHER session (`session=31 ...`, `session=4 ...`): Test-DvRecordMentionsSession is inverted, so a noncanonical duplicate is counted and makes
+            # the state unreadable rather than being skipped while a conflicting canonical record passes. Only the canonical whole line ($whole) is ever read.
+            foreach ($l in (Get-DvLogRecordBodies -LogText $LogText)) {
+                if (-not (Test-DvRecordMentionsSession -Body $l -Marker 'playback_smoke.recon_release' -Session ([string]$session) -Fields $fields)) { continue }
+                $mentions++
+                $m = [regex]::Match($l, $whole)
+                if ($m.Success) {
+                    $records++
+                    $observed = [int]$m.Groups['v'].Value
+                    $counts = [ordered]@{ deferred = [decimal]$m.Groups['deferred'].Value; sync = [decimal]$m.Groups['sync'].Value; drained = [decimal]$m.Groups['drained'].Value
+                                          maxDepth = [int]$m.Groups['depth'].Value; outstandingAtStop = [int]$m.Groups['outstanding'].Value }
+                }
+            }
+        }
+    }
+    if ($records -ne 1 -or $mentions -ne 1) { $observed = $null; $counts = $null }
+    $unreadable = 'the lever state is unreadable: the measured session''s playback_smoke.recon_release record is not exactly one whole line of the form playback_smoke.recon_release session=<n> deferred_enabled=<0|1> deferred=<n> sync=<n> drained=<n> max_depth=<n> outstanding_at_stop=<n>, or there is more than one'
+    if ($requested) {
+        $verdict = 'NOT_HONOURED'
+        if ($mentions -eq 0) { $reason = 'ROUTE_NOT_ENGAGED: the run log has no playback_smoke.recon_release record for the measured session, so the binary does not report whether the release was deferred' }
+        elseif ($null -eq $observed) { $reason = $unreadable }
+        elseif ($observed -ne 0) { $reason = "ROUTE_NOT_ENGAGED: the measured session's playback_smoke.recon_release says deferred_enabled=$observed, not the 0 the leg names" }
+        else { $verdict = 'HONOURED' }
+    }
+    elseif ($mentions -gt 0) {
+        # An absent key sets nothing, so a launcher that already carries MLVAPP_GPU_RECON_RELEASE_DEFERRED=0 runs the head arm with the lever off.
+        if ($null -eq $observed) { $verdict = 'NOT_HONOURED'; $reason = $unreadable }
+        elseif ($observed -eq 0) { $verdict = 'NOT_HONOURED'; $reason = 'RECON_RELEASE_DEFERRED_INHERITED: the leg does not ask for the kill switch but the app reports deferred_enabled=0 (the variable came from the launcher''s environment), so this run is not the head arm' }
+    }
+    [ordered]@{ requested = $requested; observed = $observed; counts = $counts; verdict = $verdict; reason = $reason; blocks = ($verdict -ceq 'NOT_HONOURED') }
 }
 
 # The flavors the app can apply (src/batch/LookAssistAnalysis.cpp lookAssistFlavorName). The app's `look_assist_flavor=none` (nothing applied) is not among them.
@@ -2395,7 +2513,7 @@ function Read-DvContactFrames {
 # -ContactSheetSeekFrames they are now forwarded as, strictly ascending and at most 999999999). Returns the refusal text, or $null.
 $script:LegTypes = @('speed', 'look')   # leg-spec.schema.json properties.legType.enum
 # the generatorArgs members leg-spec.schema.json types boolean (prepConflatedMove: const true); a test pins this list to the schema
-$script:GeneratorArgsBooleanSwitches = @('forceLookAssist', 'corePartitionTelemetry', 'disableLookAssist', 'presentTrace', 'firstPresentCapture', 'warmReuseMissDump', 'unpaced', 'disablePrepPointwiseFast', 'prepConflatedMove', 'utilSample')
+$script:GeneratorArgsBooleanSwitches = @('forceLookAssist', 'corePartitionTelemetry', 'disableLookAssist', 'presentTrace', 'firstPresentCapture', 'warmReuseMissDump', 'unpaced', 'disablePrepPointwiseFast', 'prepConflatedMove', 'utilSample', 'disableReconReleaseDeferred')
 function Get-DvLegSpecShapeRefusal {
     param($Spec)
     if ($Spec -isnot [System.Management.Automation.PSCustomObject]) { return 'the leg spec must be a single JSON object' }
@@ -3966,6 +4084,21 @@ function Test-DvReceiptValid {
                 }
             }
             elseif ($null -ne $storedPrepConflatedMove) { $invalid.Add('PREP_CONFLATED_MOVE_NOT_FROM_EVIDENCE: the receipt carries a prepConflatedMove block but its committed leg spec names no prepConflatedMove') }
+            # HFR-NATIVE-M16-1457-GUI-TEXTURE-PRESENT-OFFLOAD-1 r7: a leg that asks for the deferred-release kill switch the app did not report off (or whose
+            # report is unreadable, or absent because the binary emits none), or a head-arm leg whose app reports it off, is no measurement of its arm; the
+            # receipt's own reconReleaseDeferred block is re-derived like the prepConflatedMove block.
+            $reconReleaseVerdict = Get-DvReconReleaseDeferredEvidence -Spec $spec -LogText $ev.logText
+            if ($reconReleaseVerdict.blocks) { $invalid.Add("RECON_RELEASE_DEFERRED_NOT_HONOURED: $($reconReleaseVerdict.reason); a run whose deferred-release state is not the one its leg names (off when it asks, otherwise not off) is no measurement of that arm") }
+            $storedReconRelease = Get-DvProp $Receipt 'reconReleaseDeferred'
+            if ($reconReleaseVerdict.requested) {
+                if ($null -eq $storedReconRelease) { $incomplete.Add('RECEIPT_FIELD_ABSENT: the receipt carries no reconReleaseDeferred block (requested / observed / verdict) and its committed spec names a disableReconReleaseDeferred') }
+                else {
+                    foreach ($f in @('requested', 'observed', 'verdict')) {
+                        if (-not (Test-DvJsonEquivalent (Get-DvProp $storedReconRelease $f) $reconReleaseVerdict[$f])) { $invalid.Add("RECON_RELEASE_DEFERRED_NOT_FROM_EVIDENCE: reconReleaseDeferred.$f is not what the hashed run log and the committed leg spec derive") }
+                    }
+                }
+            }
+            elseif ($null -ne $storedReconRelease) { $invalid.Add('RECON_RELEASE_DEFERRED_NOT_FROM_EVIDENCE: the receipt carries a reconReleaseDeferred block but its committed leg spec names no disableReconReleaseDeferred') }
         }
 
         # ---- the CONFORM ARM the run played under: re-derived from the HASHED run log and the COMMITTED spec (HFR-NATIVE-60FPS-FULLRES-1) ----
@@ -4784,6 +4917,6 @@ Export-ModuleMember -Function Get-DvOutcomeEnum, ConvertTo-DvCanonicalJson, Get-
     ConvertTo-DvLfBytes, Get-DvLegSpecSha256, Get-DvDerivedBackend, Get-DvBackendNotDerivable, Read-DvContactFrames, Get-DvLegSpecShapeRefusal, Get-DvPngImageProblem, Get-DvPairedSeekVerdict, Get-DvSubjectDigest,
     Get-DvVisualViewportPixels, Get-DvVisualMeanAbsDiff, Get-DvExposureMedian, Get-DvVisualExposureStats, Get-DvExposureBand, Get-DvVisualVerdict, Get-DvVisualSourceDifference, Get-DvFrameNumber, New-DvVisualStrip, Read-DvVisualCaptures, Get-DvVisualCaptureRequest, Read-DvVenueTable, ConvertFrom-DvVenueTableText, Get-DvVenueRole, Get-DvProp, Get-DvCommittedFile, Resolve-DvAdmissionSources,
     Test-DvUnderClaudeState, Test-DvLocalReceiptRoot, Read-DvClipConsent, Get-DvClipAdmission, Get-DvSmokeSummaryFields, Get-DvConformPaceProof, Get-DvConformArmVerdict, Get-DvMinPlaySeconds, Get-DvPlaybackProblems,
-    Get-DvPlaybackEvidence, Get-DvScaleEvidence, Get-DvScaleLabel, Get-DvDisplayEvidence, Get-DvUnpacedEvidence, Get-DvLookLabelEvidence, Get-DvWorkerThreadsEvidence, Get-DvPrepConflatedMoveEvidence, Get-DvLookAssistEvidence, Get-DvLegSetPlan, Get-DvSmokeSessionLineFields, Get-DvSmokeSessionLineRead, Get-DvLogRecordBody, Get-DvMatrixRates, Get-DvMatrixRow, Get-DvMedian, ConvertTo-DvMatrixTable, Get-DvBlobById, Find-DvCommittedLegSpec, Read-DvCommittedLookReceipt, Read-DvEvidenceSet, Test-DvJsonEquivalent, Test-DvReceiptValid, Get-DvJobNotAfter, Get-DvUmRunNotAfterArgs, Get-DvUmRunDropVisibleUtc, Get-DvUmRunDropNotAfter, Test-DvNotAfterCoversDrop, Get-DvHealthVerdict,
+    Get-DvPlaybackEvidence, Get-DvScaleEvidence, Get-DvScaleLabel, Get-DvDisplayEvidence, Get-DvUnpacedEvidence, Get-DvLookLabelEvidence, Get-DvWorkerThreadsEvidence, Get-DvPrepConflatedMoveEvidence, Get-DvReconReleaseDeferredEvidence, Get-DvLookAssistEvidence, Get-DvLegSetPlan, Get-DvSmokeSessionLineFields, Get-DvSmokeSessionLineRead, Get-DvLogRecordBody, Get-DvMatrixRates, Get-DvMatrixRow, Get-DvMedian, ConvertTo-DvMatrixTable, Get-DvBlobById, Find-DvCommittedLegSpec, Read-DvCommittedLookReceipt, Read-DvEvidenceSet, Test-DvJsonEquivalent, Test-DvReceiptValid, Get-DvJobNotAfter, Get-DvUmRunNotAfterArgs, Get-DvUmRunDropVisibleUtc, Get-DvUmRunDropNotAfter, Test-DvNotAfterCoversDrop, Get-DvHealthVerdict,
     New-DvHealthProbeJobText, ConvertFrom-DvProbeStdout,
     Get-DvResultToken, Resolve-DvJobOutcome, Test-DvCriteria, Get-DvPresentMonGapVerdict, Get-DvVerbatimMetrics, Get-DvCriteriaMetrics, New-DvReceipt, Write-DvReceipt

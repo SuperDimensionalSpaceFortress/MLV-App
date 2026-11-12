@@ -420,6 +420,9 @@ public:
                           uint64_t epoch, const std::function<void()> &onIdleLocked );
     void resetPipelineOverlapMeter( void );
     playback_overlap::OverlapSnapshot pipelineOverlapSnapshot( void );
+    /* HFR-NATIVE-M16-1457-GUI-TEXTURE-PRESENT-OFFLOAD-1 K1: lock-free, no clock read (the GUI samples it around one
+     * texture present). r2 (adversary A1/A2 on 639d7cfc): no retained-slot count is kept beside the slot tokens. */
+    playback_overlap::ReconActivity pipelineReconActivity( void ) const { return m_overlapMeter.reconActivity(); }
     bool acquireLatestReadyFrame( ReadyFrame *frame );
     bool acquireOldestGpuTextureNoReadbackReadyFrame( ReadyFrame *frame );
     bool acquireLatestGpuTextureNoReadbackReadyFrame( ReadyFrame *frame );

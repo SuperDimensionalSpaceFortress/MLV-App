@@ -1829,6 +1829,13 @@ bool GpuDisplayViewport::setPresentedGpuPlaybackReconAmazePostWbTexture(
         }
     }
     const bool ok = reconOk && amazeOk;
+    // HFR-NATIVE-M16-1457-GUI-TEXTURE-PRESENT-OFFLOAD-1 K1 (adversary A1): the AMaZE-only parts, as
+    // GpuDisplayWindow records them, so the viewport path's split is not zero
+    if ( amazeTiming.available )
+    {
+        setupTiming.amaze_kernel_ms = amazeTiming.kernelMs;
+        setupTiming.amaze_download_ms = amazeTiming.downloadMs;
+    }
     if ( timing )
     {
         *timing = llrpGpuPlaybackReconCombineTiming(

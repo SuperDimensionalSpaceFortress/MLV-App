@@ -527,6 +527,9 @@ try {
         if ($spec.generatorArgs.PSObject.Properties['disablePrepPointwiseFast'] -and $spec.generatorArgs.disablePrepPointwiseFast -is [bool] -and $spec.generatorArgs.disablePrepPointwiseFast) { $gen['DisablePrepPointwiseFast'] = $true }
         # PLAYBACK-PREP-CONFLATED-MOVE-FR1B-AB-1: the #397 prep-conflated-move switch (ON arm), for any leg; judged below by the app's own prep_conflated_move_active readback.
         if ($spec.generatorArgs.PSObject.Properties['prepConflatedMove'] -and $spec.generatorArgs.prepConflatedMove -is [bool] -and $spec.generatorArgs.prepConflatedMove) { $gen['PrepConflatedMove'] = $true }
+        # HFR-NATIVE-M16-1457-GUI-TEXTURE-PRESENT-OFFLOAD-1 r7: the deferred-release kill switch (isolation arm), for any leg; judged below by the app's own
+        # playback_smoke.recon_release deferred_enabled readback. Only a JSON true arms it.
+        if ($spec.generatorArgs.PSObject.Properties['disableReconReleaseDeferred'] -and $spec.generatorArgs.disableReconReleaseDeferred -is [bool] -and $spec.generatorArgs.disableReconReleaseDeferred) { $gen['DisableReconReleaseDeferred'] = $true }
         # CUDA-HEADROOM-UTIL-SAMPLER-1: the opt-in GPU/CPU utilisation sampler around the measured launch, for any leg (fail open: it never changes the verdict). Only a JSON true arms it.
         if ($spec.generatorArgs.PSObject.Properties['utilSample'] -and $spec.generatorArgs.utilSample -is [bool] -and $spec.generatorArgs.utilSample) { $gen['UtilSample'] = $true }
         # PLAYBACK-SCOPES-OPTION-1: the live scope the smoke forces on, and the app's playback scope throttle interval, for any leg.
@@ -1014,6 +1017,15 @@ $prepConflatedMoveVerdict = Get-DvPrepConflatedMoveEvidence -Spec $spec -LogText
 if ($prepConflatedMoveVerdict.requested) { $receipt['prepConflatedMove'] = [ordered]@{ requested = $true; observed = $prepConflatedMoveVerdict.observed; verdict = $prepConflatedMoveVerdict.verdict } }
 if ($outcome -in @('PASS', 'FAIL') -and $prepConflatedMoveVerdict.blocks) {
     $detail = "INVALID: the job result was $outcome ($detail) but PREP_CONFLATED_MOVE_NOT_HONOURED: $($prepConflatedMoveVerdict.reason). A run whose prep-conflated-move state is not the one its leg names (ON when it asks, otherwise not on) is no measurement of that arm"
+    $outcome = 'INVALID'
+}
+# HFR-NATIVE-M16-1457-GUI-TEXTURE-PRESENT-OFFLOAD-1 r7, FAIL CLOSED: a leg that asks for the deferred-release kill switch counts only when the measured
+# session's own playback_smoke.recon_release record reports deferred_enabled=0; a value in the launcher's env block is a request, not engagement, and a
+# binary that emits no such record is a typed INVALID, never a PASS or FAIL. A leg that does not ask blocks only when the app reports the lever off.
+$reconReleaseVerdict = Get-DvReconReleaseDeferredEvidence -Spec $spec -LogText $runLogText
+if ($reconReleaseVerdict.requested) { $receipt['reconReleaseDeferred'] = [ordered]@{ requested = $true; observed = $reconReleaseVerdict.observed; verdict = $reconReleaseVerdict.verdict } }
+if ($outcome -in @('PASS', 'FAIL') -and $reconReleaseVerdict.blocks) {
+    $detail = "INVALID: the job result was $outcome ($detail) but RECON_RELEASE_DEFERRED_NOT_HONOURED: $($reconReleaseVerdict.reason). A run whose deferred-release state is not the one its leg names (off when it asks, otherwise not off) is no measurement of that arm"
     $outcome = 'INVALID'
 }
 # PLAYBACK-CPU-VISUAL-CAPTURE-TIMING-2 r2 (D4b), FAIL CLOSED: a leg whose spec says Look Assist ON (a look leg, or generatorArgs.forceLookAssist) but whose run log does
