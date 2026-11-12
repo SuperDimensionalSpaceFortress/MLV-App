@@ -3699,11 +3699,27 @@ def test_a_committed_card_that_ends_in_a_lone_cr_is_refused_by_every_committed_i
     assert ob._item_key(src, "HEAD", f"doctrine-outbox/{name}") is None
 
 
-def test_the_margin_strip_keeps_a_cr_and_still_strips_everything_else():
-    assert ob.strip_keeping_cr("  \n x \n\t") == "x"
-    assert ob.strip_keeping_cr("x\n\r") == "x\r"
-    assert ob.strip_keeping_cr("\r\nx") == "x"          # not a lone CR here: item_text_from_bytes read CRLF as LF first
-    assert ob.strip_keeping_cr("\rx") == "\rx"
+def test_the_readers_translate_a_lone_cr_as_they_always_did_and_report_it_separately():
+    assert ob.item_text_from_bytes(b"a\rb\r\nc\r") == "a\nb\nc\n"
+    assert ob.has_lone_cr(b"a\rb") and ob.has_lone_cr(b"x\r") and ob.has_lone_cr(b"\r\r\n")
+    assert not ob.has_lone_cr(b"a\r\nb\n")
+
+
+def test_a_non_card_item_with_cr_line_ends_reads_exactly_as_before(tmp_path):
+    """Adversary pass on 14c63ace A1 A2: keeping a lone CR in every item changed how an entry parsed (a CR-only file lost its front
+    matter; a trailing CR doubled the final LF and moved the idempotency key). Only a card refuses a lone CR now."""
+    cr_only = tmp_path / "20261112-cr-entry.md"
+    cr_only.write_bytes(b"---\rtarget: RECEIPTS.md\rkind: receipt\rsource_commit: PENDING\rlaw4: attested\r---\r### Entry\rBody\r")
+    assert ob.main(["--repo", str(tmp_path), "validate", str(cr_only)]) == 0
+    (tmp_path / "r").mkdir()
+    src, _base = _range_repo(tmp_path / "r")
+    lf = item_text(target="RECEIPTS.md", kind="receipt", body="### Entry\nBody\n")
+    _commit(src, {"doctrine-outbox/20261112-lf-receipt.md": lf, "doctrine-outbox/20261112-cr-receipt.md": lf.rstrip("\n") + "\r"},
+            "add a receipt with and without a trailing CR")
+    by_name = {e["name"]: e for e in ob.load_outbox_items(src, "HEAD")}
+    assert by_name["20261112-cr-receipt.md"]["item"]["body"] == by_name["20261112-lf-receipt.md"]["item"]["body"] == "### Entry\nBody\n"
+    assert (ob._item_key(src, "HEAD", "doctrine-outbox/20261112-cr-receipt.md")[1]
+            == ob._item_key(src, "HEAD", "doctrine-outbox/20261112-lf-receipt.md")[1])
 
 
 def test_a_file_read_decodes_strictly_and_a_git_blob_read_replaces_as_each_did_before():

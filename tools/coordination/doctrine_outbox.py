@@ -567,32 +567,33 @@ def _run_git(repo: pathlib.Path, args: list[str], input_text: str | None = None,
 
 
 def item_text_from_bytes(raw: bytes, errors: str = "replace") -> str:
-    """An outbox item's text with CRLF read as LF and NOTHING else changed. The default text readers (read_text, a text-mode git
-    pipe) also turn a lone CR into LF, which splits one row of a card into two: `rule: x<CR>check: hidden` is ONE row to the bus
-    validator (a fused key) and two accepted fields after that translation, so the screen never saw the fusion and the drain
-    rendered a duplicate field the bus then rejected (Sol r3 B1). A lone CR is kept here and refused by parse_item for a card.
-    `errors` is "strict" for a file read (as read_text was) and "replace" for a git blob (as the text pipe was)."""
-    return raw.decode("utf-8", errors=errors).replace("\r\n", "\n")
+    """An outbox item's text exactly as the default text readers read it: CRLF and a lone CR both become LF (a file read with
+    read_text, a text-mode git pipe). `errors` is "strict" for a file read (as read_text was) and "replace" for a git blob (as the
+    text pipe was). Whether the bytes held a lone CR is a separate fact, has_lone_cr, which only a CARD refuses (parse_item)."""
+    return raw.decode("utf-8", errors=errors).replace("\r\n", "\n").replace("\r", "\n")
 
 
-def strip_keeping_cr(text: str) -> str:
-    """text.strip() that does not drop a CR from the margins it strips: a trailing lone CR is a card byte the bus reads (the adversary
-    pass on 1e217283 A1 found .strip() removing it, so a committed card ending in one passed both commit checks)."""
-    core = text.strip()
-    lead, trail = text[:len(text) - len(text.lstrip())], text[len(text.rstrip()):]
-    lone = re.compile(r"\r(?!\n)")   # a CR before an LF is a line end the margin strip may drop
-    return ("\r" if lone.search(lead) else "") + core + ("\r" if lone.search(trail) else "")
+_LONE_CR_RE = re.compile(rb"\r(?!\n)")
 
 
-def git_show_item_text(repo: pathlib.Path, spec: str) -> tuple[int, str, str]:
-    """(returncode, text, stderr) of `git show <spec>`, the text read by item_text_from_bytes and stripped as git_try strips it."""
+def has_lone_cr(raw: bytes) -> bool:
+    """True when `raw` holds a carriage return that is not half of a CRLF line end. The bus validator splits a card on LF only, so
+    `rule: x<CR>check: hidden` is ONE row to it (a fused key); the CR-to-LF translation above turns it into two accepted fields, so
+    the screen never saw the fusion and the drain rendered a duplicate field the bus rejects (Sol r3 B1). The translation stays,
+    for every non-card item reads as it always did, and a card carrying this refuses (ITEM_CARD_LONE_CR)."""
+    return _LONE_CR_RE.search(raw) is not None
+
+
+def git_show_item_text(repo: pathlib.Path, spec: str) -> tuple[int, str, str, bool]:
+    """(returncode, text, stderr, lone_cr) of `git show <spec>`: the text read by item_text_from_bytes and stripped as git_try strips
+    it, and whether the blob held a lone CR (has_lone_cr, judged on the raw bytes before any strip)."""
     env = {**os.environ, "GIT_OPTIONAL_LOCKS": "0"}
     proc = subprocess.run(
         ["git", "-C", str(repo), "-c", "core.autocrlf=false", "-c", "core.safecrlf=false", "show", spec],
         capture_output=True, timeout=120, env=env,
     )
-    return (proc.returncode, strip_keeping_cr(item_text_from_bytes(proc.stdout)),
-            proc.stderr.decode("utf-8", errors="replace").strip())
+    return (proc.returncode, item_text_from_bytes(proc.stdout).strip(),
+            proc.stderr.decode("utf-8", errors="replace").strip(), has_lone_cr(proc.stdout))
 
 
 def git(repo: pathlib.Path, *args: str, input_text: str | None = None,
@@ -641,8 +642,9 @@ def cat_file_blob(repo: pathlib.Path, ref: str, path: str, extra_env: dict[str, 
 
 # ---------- items: parse, screen, key, render ----------
 
-def parse_item(text: str) -> dict:
-    """Front matter + body. Refuses on any schema hole; never guesses a default."""
+def parse_item(text: str, lone_cr: bool = False) -> dict:
+    """Front matter + body. Refuses on any schema hole; never guesses a default. `lone_cr` is has_lone_cr of the item's raw bytes
+    (the readers translate it away); a card carrying one is refused."""
     require_configured()
     if not text.startswith("---\n"):
         raise Refusal("ITEM_NO_FRONT_MATTER")
@@ -677,14 +679,13 @@ def parse_item(text: str) -> dict:
         raise Refusal("ITEM_LAW4_NOT_ATTESTED", "law4: attested is required (and is then SCREENED, not trusted)")
     if meta["target"] == "RULINGS.md" and not meta.get("ratified_by"):
         raise Refusal("ITEM_RULING_UNRATIFIED", "a RULINGS.md item needs ratified_by: <RULINGS anchor>; sessions do not mint law")
-    if meta["target"] != CARDS_TARGET:
-        body = body.replace("\r", "\n")   # an entry is read as it always was: the text readers turned a lone CR into LF
     if not body.strip():
         raise Refusal("ITEM_EMPTY_BODY")
     if meta["target"] == CARDS_TARGET:
-        if "\r" in body:
-            # The readers keep a lone CR (item_text_from_bytes). The bus splits a card on LF only, so a CR is text inside a row,
-            # where it can hide a fused field key that a CR-to-LF translation would promote to an accepted field (Sol r3 B1).
+        if lone_cr or "\r" in body:
+            # The readers translate a lone CR to LF (item_text_from_bytes) and report it (has_lone_cr). The bus splits a card on LF
+            # only, so a CR is text inside a row, where it can hide a fused field key that the translation would promote to an
+            # accepted field (Sol r3 B1).
             raise Refusal("ITEM_CARD_LONE_CR", "a card body holds a carriage return that is not part of a CRLF line end; the bus "
                                                "validator reads it as text inside a row, so remove it")
         if not CARD_HEADING_RE.match(card_heading_row(body)):
@@ -1049,13 +1050,13 @@ def load_outbox_items(repo: pathlib.Path, ref: str) -> list[dict]:
         if not ITEM_NAME_RE.match(name):
             items.append({"path": p, "name": name, "error": f"ITEM_BAD_FILENAME: {name}"})
             continue
-        rc, text, err = git_show_item_text(repo, f"{ref}:{p}")
+        rc, text, err, lone_cr = git_show_item_text(repo, f"{ref}:{p}")
         if rc != 0:
             raise GitError(f"git show {ref}:{p} (in {repo}): {err}")
         if not text.endswith("\n"):
             text += "\n"
         try:
-            item = parse_item(text)
+            item = parse_item(text, lone_cr)
         except Refusal as e:
             items.append({"path": p, "name": name, "error": str(e)})
             continue
@@ -2333,10 +2334,10 @@ def check_commit_bare(repo: pathlib.Path, sha: str, deny_terms: list[tuple[str, 
             problems.append(f"{sha[:10]} {p}: name must be <yyyymmdd>-<slug>.md")
             continue
         try:
-            rc, text, err = git_show_item_text(repo, f"{sha}:{p}")
+            rc, text, err, lone_cr = git_show_item_text(repo, f"{sha}:{p}")
             if rc != 0:
                 raise GitError(f"git show {sha}:{p} (in {repo}): {err}")
-            item = parse_item(text + "\n")
+            item = parse_item(text + "\n", lone_cr)
             screen_card_limits(item)
             screen_law4(item["body"], deny_terms)
             screen_rendered_card(item)
@@ -2375,12 +2376,12 @@ def check_commit(repo: pathlib.Path, sha: str, added_items: set[str],
         if norm not in added_items:
             problems.append(f"DOCTRINE_EXPORT_OUTBOX_ITEM_NOT_ADDED_IN_RANGE: {norm}")
             continue
-        rc, text, _err = git_show_item_text(repo, f"{sha}:{norm}")
+        rc, text, _err, lone_cr = git_show_item_text(repo, f"{sha}:{norm}")
         if rc != 0:
             problems.append(f"DOCTRINE_EXPORT_OUTBOX_ITEM_MISSING_AT_COMMIT: {norm}")
             continue
         try:
-            parsed = parse_item(text + "\n")
+            parsed = parse_item(text + "\n", lone_cr)
             screen_card_limits(parsed)
             screen_law4(parsed["body"], deny_terms)
             screen_rendered_card(parsed)
@@ -2439,11 +2440,11 @@ def _item_paths(paths: Iterable[str]) -> list[str]:
 
 def _item_key(repo: pathlib.Path, rev: str, path: str) -> tuple[dict, str] | None:
     """(item, idempotency key) for `path` as it stands at `rev`; None when it is not a valid item (the other checks name that)."""
-    rc, text, _err = git_show_item_text(repo, f"{rev}:{path}")
+    rc, text, _err, lone_cr = git_show_item_text(repo, f"{rev}:{path}")
     if rc != 0:
         return None
     try:
-        item = parse_item(text + "\n")
+        item = parse_item(text + "\n", lone_cr)
     except Refusal:
         return None
     src = item["meta"]["source_commit"]
@@ -5254,10 +5255,11 @@ def cmd_validate(paths: list[pathlib.Path], deny_terms: list[tuple[str, str]],
             # a file that validates here has to be one the drain will accept.
             if not ITEM_NAME_RE.match(p.name):
                 raise Refusal("ITEM_BAD_FILENAME", p.name)
-            text = item_text_from_bytes(p.read_bytes(), errors="strict")
+            raw = p.read_bytes()
+            text = item_text_from_bytes(raw, errors="strict")
             if not text.endswith("\n"):
                 text += "\n"
-            item = parse_item(text)
+            item = parse_item(text, has_lone_cr(raw))
             screen_card_limits(item)
             screen_law4(item["body"], deny_terms)
             screen_rendered_card(item)
