@@ -12688,7 +12688,10 @@ class VenueProbeIdentityCallDeadlineTests(IdentityProbeMixin, unittest.TestCase)
         # VENUE-PROBE-CHILD-SIDE-MONOTONIC-EXIT-STAMP-1: the wall's LOWER bound is the child's own QPC run (first statement -> ProcessExit); the civil lifetime above is a cross-check only
         child = getattr(self, "last_child_qpc", None)
         child_run_s = None if child is None else (child[1] - child[0]) / 1e9
-        out = [("wall", *_ident_gap_verdict(wall_s, child_run_s, self.WALL_LIMIT_S, civil_run_s, _IDENT_WALL_ESTIMATE_UNCERTAINTY_S))]
+        if child is not None:   # adversary A1 on 99868f47: the run is INSIDE the parent's wall, judged on the EXACT stamps (the integer bounds above can round a 0.5 ns excess into an equality)
+            start_exact, exit_exact = _ident_exact_stamps(child)
+            self.assertLessEqual(exit_exact - start_exact, _IdentFraction(wall_s) * 1_000_000_000, f"typed failure, not a verdict: the child's own monotonic run exceeds the parent's wall {wall_s!r} s that contains it, so the two are not the same monotonic clock")
+        out =[("wall", *_ident_gap_verdict(wall_s, child_run_s, self.WALL_LIMIT_S, civil_run_s, _IDENT_WALL_ESTIMATE_UNCERTAINTY_S))]
         hold = self.exit_hold_verdict()
         if require_abandoned:
             self.assertGreaterEqual(self.last_timing["abandoned"], 1, "the slow call was not abandoned, so this case proves nothing")
@@ -13206,6 +13209,17 @@ class VenueProbeIdentityCallDeadlineTests(IdentityProbeMixin, unittest.TestCase)
         self.assertEqual(self.exit_hold_verdict()[0], "over")
         self._set_clocks_from_stamps("190000000000 2000000000", "200000000000", 200_000_000_000, 2_000_000_000, 100 * 10**9)
         self.assertEqual(self.exit_hold_verdict()[:2], ("pass", 0.0))
+
+    def test_r3_adversary_a1_a_child_run_longer_than_the_parents_wall_by_less_than_a_nanosecond_is_a_typed_failure(self) -> None:
+        # adversary A1 on 99868f47: the child's exact run is 10000000000.5 ns; the one-sided integer bounds make it 10.0 s, which equals the parent's wall, so the wall comparison accepted it
+        self._set_clocks_from_stamps("190000000001 2000000000", "210000000002", 200_000_000_000, 2_000_000_000, 105_000_000_001)
+        with self.assertRaises(AssertionError) as ctx:
+            self.timing_verdicts(10.0)
+        self.assertIn("typed failure", str(ctx.exception))
+        self.assertIn("not the same monotonic clock", str(ctx.exception))
+        # one tick (0.5 ns) the right way round the run is 10.0 s exactly and is a measurement again
+        self._set_clocks_from_stamps("190000000001 2000000000", "210000000001", 200_000_000_000, 2_000_000_000, 105_000_000_001)
+        self.assertEqual({what: kind for what, kind, _f, _r in self.timing_verdicts(10.0)}["wall"], "pass")
 
     def test_r2_b1_a_child_run_longer_than_the_parents_own_wall_is_a_typed_failure(self) -> None:
         # the wall bounds: a LOWER bound (the child's run) above the UPPER bound (the parent's wall, which contains it) cannot come from one monotonic clock
