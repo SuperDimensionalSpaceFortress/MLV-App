@@ -12696,6 +12696,22 @@ class ReconReleaseDeferredEvidenceTests(unittest.TestCase):
                          ("plus sign and leading zero", lambda r: r.replace("session=3 ", "session=+03 ")),
                          ("a doubled sign", lambda r: r.replace("session=3 ", "session=++3 ")),
                          ("a plus then a minus", lambda r: r.replace("session=3 ", "session=+-3 ")),
+                         # r12 fix 1 (adversary A1 on db8cdfa1): decoration around the value (quotes, other separators, JSON shape), other number spellings, case.
+                         ("double-quoted value", lambda r: r.replace("session=3 ", 'session="3" ')),
+                         ("single-quoted value", lambda r: r.replace("session=3 ", "session='3' ")),
+                         ("colon separator", lambda r: r.replace("session=3 ", "session:3 ")),
+                         ("colon, space and quoted value", lambda r: r.replace("session=3 ", 'session: "3" ')),
+                         ("JSON shape", lambda r: r.replace("session=3 ", '"session":3 ')),
+                         ("JSON shape, quoted value", lambda r: r.replace("session=3 ", '"session": "3" ')),
+                         ("bracketed value", lambda r: r.replace("session=3 ", "session=[3] ")),
+                         ("quoted and signed", lambda r: r.replace("session=3 ", 'session="+03" ')),
+                         ("hexadecimal", lambda r: r.replace("session=3 ", "session=0x3 ")),
+                         ("hexadecimal with a leading zero and capitals", lambda r: r.replace("session=3 ", "session=0X03 ")),
+                         ("a decimal point", lambda r: r.replace("session=3 ", "session=3.0 ")),
+                         ("an exponent", lambda r: r.replace("session=3 ", "session=3e0 ")),
+                         ("full-width digit", lambda r: r.replace("session=3 ", "session=３ ")),
+                         ("upper-case key", lambda r: r.replace("session=3 ", "SESSION=3 ")),
+                         ("capitalised key", lambda r: r.replace("session=3 ", "Session=3 ")),
                          ("spaces around the equals sign and a plus", lambda r: r.replace("session=3 ", "session = +3 ")),
                          ("session after the first field, leading zero", lambda r: r.replace("session=3 deferred_enabled=", "deferred_enabled=").replace(" deferred=", " session=03 deferred=", 1)))
 
@@ -12730,7 +12746,9 @@ class ReconReleaseDeferredEvidenceTests(unittest.TestCase):
 
     def test_a_different_integer_is_another_session_in_every_spelling(self) -> None:
         for name, record in (("session 31", self.record("0", session=31)), ("session +31", self.record("0", session="+31")), ("session 031", self.record("0", session="031")),
-                             ("session -3", self.record("0", session="-3")), ("session +2", self.record("0", session="+2")), ("session 02", self.record("0", session="02"))):
+                             ("session -3", self.record("0", session="-3")), ("session +2", self.record("0", session="+2")), ("session 02", self.record("0", session="02")),
+                             ("quoted 2", self.record("0", session='"2"')), ("quoted 31", self.record("0", session='"31"')), ("hex 2", self.record("0", session="0x2")),
+                             ("hex 1f (31)", self.record("0", session="0x1f")), ("session 30", self.record("0", session=30)), ("a word", self.record("0", session="three"))):
             with self.subTest(case=name):
                 v = self.verdict({}, self.log(self.record("1"), record))
                 self.assertEqual((v["verdict"], v["blocks"], v["observed"]), ("NOT_REQUESTED", False, 1), v)
@@ -12862,6 +12880,22 @@ class PrepConflatedMoveEvidenceTests(unittest.TestCase):
                          ("plus sign and leading zero", lambda r: r.replace("session=3 ", "session=+03 ")),
                          ("a doubled sign", lambda r: r.replace("session=3 ", "session=++3 ")),
                          ("a plus then a minus", lambda r: r.replace("session=3 ", "session=+-3 ")),
+                         # r12 fix 1 (adversary A1 on db8cdfa1): decoration around the value (quotes, other separators, JSON shape), other number spellings, case.
+                         ("double-quoted value", lambda r: r.replace("session=3 ", 'session="3" ')),
+                         ("single-quoted value", lambda r: r.replace("session=3 ", "session='3' ")),
+                         ("colon separator", lambda r: r.replace("session=3 ", "session:3 ")),
+                         ("colon, space and quoted value", lambda r: r.replace("session=3 ", 'session: "3" ')),
+                         ("JSON shape", lambda r: r.replace("session=3 ", '"session":3 ')),
+                         ("JSON shape, quoted value", lambda r: r.replace("session=3 ", '"session": "3" ')),
+                         ("bracketed value", lambda r: r.replace("session=3 ", "session=[3] ")),
+                         ("quoted and signed", lambda r: r.replace("session=3 ", 'session="+03" ')),
+                         ("hexadecimal", lambda r: r.replace("session=3 ", "session=0x3 ")),
+                         ("hexadecimal with a leading zero and capitals", lambda r: r.replace("session=3 ", "session=0X03 ")),
+                         ("a decimal point", lambda r: r.replace("session=3 ", "session=3.0 ")),
+                         ("an exponent", lambda r: r.replace("session=3 ", "session=3e0 ")),
+                         ("full-width digit", lambda r: r.replace("session=3 ", "session=３ ")),
+                         ("upper-case key", lambda r: r.replace("session=3 ", "SESSION=3 ")),
+                         ("capitalised key", lambda r: r.replace("session=3 ", "Session=3 ")),
                          ("spaces around the equals sign and a plus", lambda r: r.replace("session=3 ", "session = +3 ")),
                          ("session after the field, leading zero", lambda r: "playback_smoke.prep_route prep_conflated_move_active=0 session=03"))
 
@@ -12883,7 +12917,8 @@ class PrepConflatedMoveEvidenceTests(unittest.TestCase):
                         self.assertIn("unreadable", v["reason"])
 
     def test_a_different_integer_is_another_session_in_every_spelling(self) -> None:
-        for name, session in (("31", "31"), ("+31", "+31"), ("031", "031"), ("-3", "-3"), ("+2", "+2"), ("02", "02")):
+        for name, session in (("31", "31"), ("+31", "+31"), ("031", "031"), ("-3", "-3"), ("+2", "+2"), ("02", "02"), ('quoted 2', '"2"'), ("quoted 31", '"31"'),
+                              ("hex 2", "0x2"), ("hex 1f (31)", "0x1f"), ("30", "30"), ("a word", "three")):
             with self.subTest(case=name):
                 v = self.verdict({}, self.log(self.route("0"), self.route("1", session=session)))
                 self.assertEqual((v["verdict"], v["blocks"], v["observed"]), ("NOT_REQUESTED", False, 0), v)

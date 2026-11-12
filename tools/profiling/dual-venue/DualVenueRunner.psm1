@@ -1742,9 +1742,11 @@ function ConvertTo-DvSessionKey {
     <#
     .SYNOPSIS
     HFR-NATIVE-M16-1457-GUI-TEXTURE-PRESENT-OFFLOAD-1 r12 (r9 keys on 4a61e684, adversary A1): the canonical text of a session integer, so equal integers compare equal
-    whatever their spelling (`3`, `03`, `+3`, `003`). A negative non-zero integer keeps its minus; `-0` is `0`. Digits only (no culture, no overflow).
+    whatever their spelling (`3`, `03`, `+3`, `003`, a full-width `3`). A negative non-zero integer keeps its minus; `-0` is `0`. Digits only (no culture, no overflow);
+    a Unicode decimal digit is read as its value.
     #>
     param([string]$Sign, [Parameter(Mandatory)][string]$Digits)
+    if ($Digits -cnotmatch '^[0-9]+$') { $Digits = -join ($Digits.ToCharArray() | ForEach-Object { [string][int][char]::GetNumericValue($_) }) }
     $d = $Digits.TrimStart('0')
     if ($d -eq '') { return '0' }
     if ($Sign -ceq '-') { return '-' + $d }
@@ -1758,14 +1760,21 @@ function Test-DvRecordMentionsSession {
     never as text, so `session=03`, `session=+3` and `session=003` are the measured session 3 (a record the app never writes, which is why it must make the state
     unreadable rather than be skipped while a conflicting canonical record passes). A run of more than one sign (`++3`, `+-3`) is read as its magnitude, so it
     still counts for session 3 and blocks; `-3` is another session. session=31 is not session 3. Pure; shared by the recon_release and prep_route readers.
+    r12 fix 1 (adversary A1 on db8cdfa1): the key may be followed by ANY run of non-word separators (`=`, ` = `, `:`, `="`, `":`, `=[`, a quote), so a quoted or JSON-shaped
+    value is the same session; the key is matched without regard to case; and the value may be a decimal (a Unicode digit, `3.0` and `3e0` read as their leading integer)
+    or a 0x hexadecimal. session_id=3 and sessions=3 are other keys. A word (`three`) names no session.
     #>
     param([AllowNull()][AllowEmptyString()][string]$Body, [Parameter(Mandatory)][string]$Marker, [Parameter(Mandatory)][string]$Session)
     if ([string]::IsNullOrEmpty($Body)) { return $false }
     if ($Body -cnotmatch ('^(?=.*' + [regex]::Escape($Marker) + '(?!\w))')) { return $false }
-    $want = $(if ($Session -cmatch '^[0-9]+$') { ConvertTo-DvSessionKey -Sign '' -Digits $Session } else { $Session })
-    foreach ($m in [regex]::Matches($Body, '(?<!\w)session\s*=\s*(?<sign>[+-]*)(?<digits>[0-9]+)')) {
-        $sign = $m.Groups['sign'].Value
-        $key = ConvertTo-DvSessionKey -Sign $(if ($sign -ceq '-') { '-' } else { '' }) -Digits $m.Groups['digits'].Value
+    $want = $(if ($Session -cmatch '^\d+$') { ConvertTo-DvSessionKey -Sign '' -Digits $Session } else { $Session })
+    foreach ($m in [regex]::Matches($Body, '(?<!\w)(?i:session)[^\w+\-]*(?<sign>[+\-]*)(?:(?<hex>0[xX][0-9A-Fa-f]+)|(?<digits>\d+))')) {
+        $negative = ($m.Groups['sign'].Value -ceq '-')
+        if ($m.Groups['hex'].Success) {
+            $value = [System.Numerics.BigInteger]::Parse('0' + $m.Groups['hex'].Value.Substring(2), [System.Globalization.NumberStyles]::AllowHexSpecifier, [System.Globalization.CultureInfo]::InvariantCulture)
+            $key = ConvertTo-DvSessionKey -Sign $(if ($negative) { '-' } else { '' }) -Digits $value.ToString([System.Globalization.CultureInfo]::InvariantCulture)
+        }
+        else { $key = ConvertTo-DvSessionKey -Sign $(if ($negative) { '-' } else { '' }) -Digits $m.Groups['digits'].Value }
         if ($key -ceq $want) { return $true }
     }
     return $false
