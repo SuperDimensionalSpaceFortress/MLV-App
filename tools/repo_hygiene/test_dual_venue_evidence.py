@@ -11614,11 +11614,36 @@ class _IdentChildStamps(tuple):
     rounding the start up and the exit down can turn a reversal of less than 1 ns (a 2 GHz QPC has 0.5 ns ticks) into an equality, and an order check on the rounded figures accepts it. It is still
     a tuple of two ints, so every figure and equality is unchanged; a plain tuple set by a test has no `.exact`, and its integers are taken as exact (_ident_exact_stamps)."""
     exact: tuple
+    hz: int | None   # the child's own QueryPerformanceFrequency (the start stamp's second field); r4 (sol r3 B2): the end marker must carry the same one
 
-    def __new__(cls, bounds: tuple, exact: tuple):
+    def __new__(cls, bounds: tuple, exact: tuple, hz: int | None = None):
         self = super().__new__(cls, bounds)
         self.exact = exact
+        self.hz = hz
         return self
+
+
+class _IdentWallS(float):
+    """r4 (sol r3 on 5092ebcd B1): the parent's wall as a float of seconds that also carries the EXACT integer ns count it was computed from. A float is a rounding, so its binary value
+    (`Fraction(x)`) is not the wall: a consistent equality fell a hair under it (a typed failure on a run that was a measurement), and a 1e-10 ns excess fell a hair inside it (hidden)."""
+    exact_ns: int
+
+    @classmethod
+    def of_ns(cls, ns: int) -> "_IdentWallS":
+        self = cls(ns / 1e9)
+        self.exact_ns = ns
+        return self
+
+
+def _ident_wall_ns(wall_s) -> "_IdentFraction":
+    """The parent's wall, in exact ns. An exact figure (a `_IdentWallS`, an int or a Fraction of seconds) is taken as it is. A plain float is read as the decimal it prints as (`repr`, the shortest
+    string that gives the same float), which for a count of ns divided by 1e9 under 15 significant digits is that count itself, never its binary expansion."""
+    exact_ns = getattr(wall_s, "exact_ns", None)
+    if exact_ns is not None:
+        return _IdentFraction(exact_ns)
+    if isinstance(wall_s, (int, _IdentFraction)):
+        return _IdentFraction(wall_s) * 1_000_000_000
+    return _IdentFraction(repr(float(wall_s))) * 1_000_000_000
 
 
 def _ident_exact_stamps(child: tuple) -> tuple:
@@ -11642,7 +11667,7 @@ def _ident_read_child_stamps(start_path: Path, exit_path: Path) -> tuple:
     start_ticks, exit_ticks, hz = int(start[0]), int(exit_raw), int(start[1])
     if exit_ticks < start_ticks:   # adversary A1 on 636642d6: compared in TICKS, before the ns floor can make two different stamps equal
         return None, f"malformed child stamp: its exit stamp is {start_ticks - exit_ticks} ticks ({(start_ticks - exit_ticks) / hz:.3f} s) BEFORE its start stamp"
-    return _IdentChildStamps((-(-start_ticks * 1_000_000_000 // hz), exit_ticks * 1_000_000_000 // hz), (_IdentFraction(start_ticks * 1_000_000_000, hz), _IdentFraction(exit_ticks * 1_000_000_000, hz))), "ok"
+    return _IdentChildStamps((-(-start_ticks * 1_000_000_000 // hz), exit_ticks * 1_000_000_000 // hz), (_IdentFraction(start_ticks * 1_000_000_000, hz), _IdentFraction(exit_ticks * 1_000_000_000, hz)), hz), "ok"
 
 
 def _ident_marker_ns(end_qpc: int, qpc_hz: int, up: bool = False) -> int:
@@ -11964,7 +11989,7 @@ class IdentityProbeMixin:
         wall_started_ns = _ident_time.perf_counter_ns()   # r3: perf_counter is QueryPerformanceCounter on Windows, the clock Stopwatch.GetTimestamp() in the probe reads
         proc = _ident_run_reaped([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-File", str(job)], timeout=240, env=env)
         self.last_wall_end_ns = _ident_time.perf_counter_ns()
-        self.last_wall_s = (self.last_wall_end_ns - wall_started_ns) / 1e9
+        self.last_wall_s = _IdentWallS.of_ns(self.last_wall_end_ns - wall_started_ns)   # r4 (sol r3 B1): a float that keeps its exact ns count
         self.last_child_exit_ns, self.last_child_exit_note = proc.child_exit_ns, proc.child_exit_note   # r4: the END of the child, which the parent's own end read is not
         self.last_child_start_ns = proc.child_start_ns   # r5: its START, which the parent's own start (wall_started_ns) is not: the parent may be delayed before it even launches the child
         self.last_child_qpc, self.last_child_qpc_note = (_ident_read_child_stamps(qpc_start, qpc_exit) if timing else (None, "no child stamp: the timing seam is off"))
@@ -12690,8 +12715,8 @@ class VenueProbeIdentityCallDeadlineTests(IdentityProbeMixin, unittest.TestCase)
         child_run_s = None if child is None else (child[1] - child[0]) / 1e9
         if child is not None:   # adversary A1 on 99868f47: the run is INSIDE the parent's wall, judged on the EXACT stamps (the integer bounds above can round a 0.5 ns excess into an equality)
             start_exact, exit_exact = _ident_exact_stamps(child)
-            self.assertLessEqual(exit_exact - start_exact, _IdentFraction(wall_s) * 1_000_000_000, f"typed failure, not a verdict: the child's own monotonic run exceeds the parent's wall {wall_s!r} s that contains it, so the two are not the same monotonic clock")
-        out =[("wall", *_ident_gap_verdict(wall_s, child_run_s, self.WALL_LIMIT_S, civil_run_s, _IDENT_WALL_ESTIMATE_UNCERTAINTY_S))]
+            self.assertLessEqual(exit_exact - start_exact, _ident_wall_ns(wall_s), f"typed failure, not a verdict: the child's own monotonic run exceeds the parent's wall {wall_s!r} s that contains it, so the two are not the same monotonic clock")
+        out =[("wall", *_ident_gap_verdict(float(wall_s), child_run_s, self.WALL_LIMIT_S, civil_run_s, _IDENT_WALL_ESTIMATE_UNCERTAINTY_S))]
         hold = self.exit_hold_verdict()
         if require_abandoned:
             self.assertGreaterEqual(self.last_timing["abandoned"], 1, "the slow call was not abandoned, so this case proves nothing")
@@ -12751,6 +12776,9 @@ class VenueProbeIdentityCallDeadlineTests(IdentityProbeMixin, unittest.TestCase)
         if child is not None:
             # sol r1 on 9265be72 B1: the order is marker <= the child's ProcessExit stamp <= the parent's end read, with NO tolerance (one system-wide QPC; each stamp is floored, which keeps a true order true)
             start_exact, exit_exact = _ident_exact_stamps(child)
+            child_hz = getattr(child, "hz", None)   # r4 (sol r3 B2): one child has ONE QueryPerformanceFrequency; a marker that names another is not this child's marker, and a gap taken across the two is no measurement
+            if child_hz is not None:
+                self.assertEqual(t["qpc_hz"], child_hz, f"typed failure, not an exit hold: the end marker's QPC frequency ({t['qpc_hz']} Hz) is not the child's own stamp frequency ({child_hz} Hz), so the two stamps are not one clock")
             self.assertLessEqual(exit_exact, self.last_wall_end_ns, f"typed failure, not an exit hold: the child's exit stamp is {float(exit_exact - self.last_wall_end_ns) / 1e9:.9f} s AFTER the test saw the process end, so the two are not the same monotonic clock")
             self.assertGreaterEqual(exit_exact, marker_exact, f"typed failure, not an exit hold: the child's exit stamp is {float(marker_exact - exit_exact) / 1e9:.9f} s BEFORE its own end marker")
             marker_up_ns = _ident_marker_ns(t["end_qpc"], t["qpc_hz"], up=True)
@@ -13220,6 +13248,39 @@ class VenueProbeIdentityCallDeadlineTests(IdentityProbeMixin, unittest.TestCase)
         # one tick (0.5 ns) the right way round the run is 10.0 s exactly and is a measurement again
         self._set_clocks_from_stamps("190000000001 2000000000", "210000000001", 200_000_000_000, 2_000_000_000, 105_000_000_001)
         self.assertEqual({what: kind for what, kind, _f, _r in self.timing_verdicts(10.0)}["wall"], "pass")
+
+    def test_r4_b1_the_parents_wall_is_judged_as_the_ns_count_it_came_from_not_as_its_binary_float(self) -> None:
+        # sol r3 on 5092ebcd B1: Fraction(wall_s) is the float's BINARY value, which is not the wall the caller meant. The child ran exactly 10000000100 ns; the parent's wall is that same count
+        # (a float of it, 10.0000001 s, is a hair under 10000000100 ns in binary), so a consistent equality was a typed failure.
+        self._set_clocks_from_stamps("950000000 10000000", "1050000001", 1_000_000_000, 10_000_000, 105_000_000_100)
+        self.assertEqual({what: kind for what, kind, _f, _r in self.timing_verdicts(10_000_000_100 / 1e9)}["wall"], "pass", "a child run equal to the parent's wall is a measurement")
+        wall = _IdentWallS.of_ns(10_000_000_100)   # the harness's own figure carries its exact ns count
+        self.assertEqual({what: kind for what, kind, _f, _r in self.timing_verdicts(wall)}["wall"], "pass")
+        for exact in (_IdentFraction(10_000_000_100, 10**9), 10 + _IdentFraction(100, 10**9)):   # an exact rational of seconds is taken as it is
+            self.assertEqual({what: kind for what, kind, _f, _r in self.timing_verdicts(exact)}["wall"], "pass")
+        # the opposite direction (sol sibling): the child's exact run is 100000000.0000000001 ns, over an intended wall of 0.1 s, and Fraction(.1) is a hair ABOVE 0.1 s in binary
+        self._set_clocks_from_stamps("0 999999999999999999", "100000000000000000", 50_000_000_000_000_000, 999_999_999_999_999_999, 100_000_001)
+        with self.assertRaises(AssertionError) as ctx:
+            self.timing_verdicts(0.1)
+        self.assertIn("typed failure", str(ctx.exception))
+        self.assertIn("not the same monotonic clock", str(ctx.exception))
+        # a wall one ns longer holds the same run again
+        self.assertEqual({what: kind for what, kind, _f, _r in self.timing_verdicts(0.100000001)}["wall"], "pass")
+
+    def test_r4_b2_a_marker_frequency_that_disagrees_with_the_childs_is_a_typed_failure_never_a_hold(self) -> None:
+        # sol r3 on 5092ebcd B2: both records are well formed, so both readers accept them, but they describe two different QPC frequencies. On the marker's 20 MHz the gap is 15 s (a HOLD);
+        # on the child's own 10 MHz it is 10 s. One child has one QueryPerformanceFrequency.
+        self._set_clocks_from_stamps("0 10000000", "200000000", 100_000_000, 10_000_000, 20_100_000_000)
+        self.assertEqual(self.exit_hold_verdict()[:2], ("pass", 10.1), "the matching-frequency control is a measurement")
+        for marker_hz in (20_000_000, 5_000_000):
+            self._set_clocks_from_stamps("0 10000000", "200000000", 100_000_000, marker_hz, 20_100_000_000)
+            with self.assertRaises(AssertionError, msg=marker_hz) as ctx:
+                self.exit_hold_verdict()
+            self.assertIn("typed failure", str(ctx.exception))
+            self.assertIn("frequenc", str(ctx.exception))
+        # a plain tuple set by a test names no frequency, so there is nothing to compare it with
+        self._set_clocks(100.0, None, 120.1, child_qpc=(95.0, 120.0))
+        self.assertEqual(self.exit_hold_verdict()[0], "over")
 
     def test_r2_b1_a_child_run_longer_than_the_parents_own_wall_is_a_typed_failure(self) -> None:
         # the wall bounds: a LOWER bound (the child's run) above the UPPER bound (the parent's wall, which contains it) cannot come from one monotonic clock
