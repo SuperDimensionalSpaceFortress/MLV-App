@@ -265,8 +265,8 @@ param(
 
 $ErrorActionPreference = "Continue"
 $script:HeavySlotModeExplicit = $PSBoundParameters.ContainsKey("HeavySlotMode")
-# VENUE-PROBE-HEAVY-SLOT-FEED-FORWARD-1 r2 (adversary r2 A1): an explicit empty or blank -HeavySlotFeed is a feed this agent cannot read (feed unknown), but forwarded as an empty value it is the same as NO variable, so the heavy-slot.py children and the in-job quiet probe would fall back to the default csv (a different sensor). It becomes ONE unreadable local path here, once, so the agent's own reader and every forward (the three child launches, the slot holder, the job env) agree: feed missing, heat unknown.
-if ([string]::IsNullOrWhiteSpace($HeavySlotFeed)) { $HeavySlotFeed = "C:\temp\.heavy-slot-feed-not-set\feed.csv" }
+# VENUE-PROBE-HEAVY-SLOT-FEED-FORWARD-1 r2 (adversary r2 A1): an explicit empty or blank -HeavySlotFeed is a feed this agent cannot read (feed unknown), but forwarded as an empty value it is the same as NO variable, so the heavy-slot.py children and the in-job quiet probe would fall back to the default csv (a different sensor). It becomes ONE local path no file can have (the angle brackets are not legal in a Win32 file name, so it can never be planted as a readable feed) here, once, so the agent's own reader and every forward (the three child launches, the slot holder, the job env) agree: feed missing, heat unknown.
+if ([string]::IsNullOrWhiteSpace($HeavySlotFeed)) { $HeavySlotFeed = "C:\temp\heavy-slot-feed-<not-set>.csv" }
 $inbox    = Join-Path $Root "inbox"
 $outbox    = Join-Path $Root "outbox"
 $processed = Join-Path $Root "processed"

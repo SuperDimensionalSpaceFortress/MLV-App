@@ -2357,6 +2357,8 @@ class AgentHeavySlotFeedForwardTests(unittest.TestCase):
             self.assertNotEqual(fwd.lower(), self.DEFAULT_FEED.lower(), f"feed {blank!r} must not become the default csv")
             self.assertEqual(probe_path, fwd, "the job's gate reads exactly what the agent forwarded")
             self.assertEqual(exists, "False", "the stand-in path is unreadable, so the job reads 'feed missing' (unknown) like the agent does")
+            # adversary r2 pass 3 A1: a fixed, well-formed path could be PLANTED as a readable file (and then read as a cool feed): the stand-in carries a character no Win32 file name can hold
+            self.assertTrue(any(c in Path(fwd).name for c in '<>"|?*'), f"the stand-in {fwd!r} must be a name no file can have, so it can never be planted")
         # the line runs once, at start-up, before any function (so the agent's own reader and all five forwards below see the same value)
         agent = AGENT.read_text(encoding="utf-8")
         self.assertEqual(agent.count("\n" + self.NORMALIZE_HEAD), 1)
