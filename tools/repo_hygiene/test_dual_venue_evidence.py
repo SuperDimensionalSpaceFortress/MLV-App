@@ -11681,17 +11681,18 @@ def _ident_read_child_stamps(start_path: Path, exit_path: Path) -> tuple:
     return _IdentChildStamps((-(-start_ticks * 1_000_000_000 // hz), exit_ticks * 1_000_000_000 // hz), (_IdentFraction(start_ticks * 1_000_000_000, hz), _IdentFraction(exit_ticks * 1_000_000_000, hz)), hz), "ok"
 
 
-def _ident_start_hz(start_path: Path) -> int | None:
-    """adversary A1 on e584171e: the child's own QueryPerformanceFrequency (the start stamp's second field), read on its own. `_ident_read_child_stamps` returns no stamps at all when the EXIT stamp is
-    missing, empty, malformed or reversed, and with them went the frequency, so a marker on another clock sailed past the frequency check into a verdict. One child has one frequency whatever
-    became of its exit stamp. None when the start stamp is absent or of any other shape (nothing to compare the marker with)."""
+def _ident_start_stamp(start_path: Path) -> tuple | None:
+    """adversary A1 on e584171e and again on 4538d581: the child's START stamp read on its own, `(QueryPerformanceFrequency, exact start ns)`. `_ident_read_child_stamps` returns no stamps at all when
+    the EXIT stamp is missing, empty, malformed or reversed, and with them went everything the start stamp alone proves: a marker on another clock (the frequency check) and a first statement AFTER
+    the child's own end marker or after the parent saw the process end (the order checks). One child has one frequency and one first statement whatever became of its exit stamp. None when the start
+    stamp is absent or of any other shape (nothing to compare the marker with)."""
     try:
         start = start_path.read_text(encoding="ascii").split()
     except (OSError, UnicodeDecodeError):
         return None
     if len(start) != 2 or not all(re.fullmatch(r"\d{1,18}", x) for x in start) or int(start[1]) == 0:
         return None
-    return int(start[1])
+    return int(start[1]), _IdentFraction(int(start[0]) * 1_000_000_000, int(start[1]))
 
 
 def _ident_marker_ns(end_qpc: int, qpc_hz: int, up: bool = False) -> int:
@@ -12017,7 +12018,7 @@ class IdentityProbeMixin:
         self.last_child_exit_ns, self.last_child_exit_note = proc.child_exit_ns, proc.child_exit_note   # r4: the END of the child, which the parent's own end read is not
         self.last_child_start_ns = proc.child_start_ns   # r5: its START, which the parent's own start (wall_started_ns) is not: the parent may be delayed before it even launches the child
         self.last_child_qpc, self.last_child_qpc_note = (_ident_read_child_stamps(qpc_start, qpc_exit) if timing else (None, "no child stamp: the timing seam is off"))
-        self.last_child_hz = _ident_start_hz(qpc_start) if timing else None   # adversary A1 on e584171e: kept even when the exit stamp is unreadable
+        self.last_child_start = _ident_start_stamp(qpc_start) if timing else None   # adversary A1 on e584171e / 4538d581: kept even when the exit stamp is unreadable
         self.last_stderr = proc.stderr
         self.last_timing = _parse_probe_timing(proc.stderr)
         lines = [ln for ln in proc.stdout.splitlines() if ln.startswith("VENUE_QUIET=")]
@@ -12788,7 +12789,8 @@ class VenueProbeIdentityCallDeadlineTests(IdentityProbeMixin, unittest.TestCase)
         self.assertIsNotNone(t["probe_ms"], "typed failure, not a missing marker: " + t.get("bad", ""))
         self.assertTrue(t.get("end_qpc") is not None and t.get("qpc_hz"), "typed failure, not an exit hold: the marker carries no end_qpc / qpc_hz timestamp: " + self.last_stderr)
         child = getattr(self, "last_child_qpc", None)
-        child_hz = getattr(child, "hz", None) or getattr(self, "last_child_hz", None)   # r4 (sol r3 B2): one child has ONE QueryPerformanceFrequency; a marker that names another is not this child's marker, and a gap taken across the two is no measurement. A1 on e584171e: judged whether or not the exit stamp could be read
+        lone_start = getattr(self, "last_child_start", None)   # (hz, exact start ns) read from the start stamp alone
+        child_hz = getattr(child, "hz", None) or (lone_start[0] if lone_start else None)   # r4 (sol r3 B2): one child has ONE QueryPerformanceFrequency; a marker that names another is not this child's marker, and a gap taken across the two is no measurement. A1 on e584171e: judged whether or not the exit stamp could be read
         if child_hz is not None:
             self.assertEqual(t["qpc_hz"], child_hz, f"typed failure, not an exit hold: the end marker's QPC frequency ({t['qpc_hz']} Hz) is not the child's own stamp frequency ({child_hz} Hz), so the two stamps are not one clock")
         marker_ns = _ident_marker_ns(t["end_qpc"], t["qpc_hz"])
@@ -12800,13 +12802,16 @@ class VenueProbeIdentityCallDeadlineTests(IdentityProbeMixin, unittest.TestCase)
         civil_s = None if child_exit_ns is None else (child_exit_ns - marker_ns) / 1e9
         # VENUE-PROBE-CHILD-SIDE-MONOTONIC-EXIT-STAMP-1: the LOWER bound is the child's own ProcessExit QPC stamp; the civil estimate above is a cross-check only (adversary A1 on fae72991)
         child_s = None
+        start_known = _ident_exact_stamps(child)[0] if child is not None else (lone_start[1] if lone_start else None)
+        if start_known is not None:   # r2 (adversary A1): start <= marker, exact (r3: no rounding on either side); 4538d581: also when the exit stamp is unreadable, and no later than the parent's end read
+            self.assertLessEqual(start_known, marker_exact, f"typed failure, not an exit hold: the child's first statement is {float(start_known - marker_exact) / 1e9:.9f} s AFTER its own end marker")
+            self.assertLessEqual(start_known, self.last_wall_end_ns, f"typed failure, not an exit hold: the child's first statement is {float(start_known - self.last_wall_end_ns) / 1e9:.9f} s AFTER the test saw the process end, so the two are not the same monotonic clock")
         if child is not None:
             # sol r1 on 9265be72 B1: the order is marker <= the child's ProcessExit stamp <= the parent's end read, with NO tolerance (one system-wide QPC; each stamp is floored, which keeps a true order true)
             start_exact, exit_exact = _ident_exact_stamps(child)
             self.assertLessEqual(exit_exact, self.last_wall_end_ns, f"typed failure, not an exit hold: the child's exit stamp is {float(exit_exact - self.last_wall_end_ns) / 1e9:.9f} s AFTER the test saw the process end, so the two are not the same monotonic clock")
             self.assertGreaterEqual(exit_exact, marker_exact, f"typed failure, not an exit hold: the child's exit stamp is {float(marker_exact - exit_exact) / 1e9:.9f} s BEFORE its own end marker")
             marker_up_ns = _ident_marker_ns(t["end_qpc"], t["qpc_hz"], up=True)
-            self.assertLessEqual(start_exact, marker_exact, f"typed failure, not an exit hold: the child's first statement is {float(start_exact - marker_exact) / 1e9:.9f} s AFTER its own end marker")   # r2 (adversary A1): start <= marker, exact (r3: no rounding on either side)
             child_s = (child[1] - marker_up_ns) / 1e9   # a LOWER bound: the marker rounds up here
         kind, figure, reason = _ident_gap_verdict(upper, child_s, self.EXIT_HOLD_LIMIT_S, civil_s)
         if kind == "inconclusive":
@@ -13324,7 +13329,7 @@ class VenueProbeIdentityCallDeadlineTests(IdentityProbeMixin, unittest.TestCase)
             for marker_hz, ok in ((5_000_000, False), (20_000_000, False), (10_000_000, True)):
                 self._set_clocks(1.0, None, 2.0)
                 self.last_timing = _parse_probe_timing(f"VENUE_PROBE_INTERNAL_MS=1500 abandoned=1 end_qpc=100000000 qpc_hz={marker_hz}")
-                self.last_wall_end_ns, self.last_child_qpc, self.last_child_hz = 30 * 10**9, stamps, _ident_start_hz(start)
+                self.last_wall_end_ns, self.last_child_qpc, self.last_child_start = 30 * 10**9, stamps, _ident_start_stamp(start)
                 if ok:
                     self.assertEqual(self.exit_hold_verdict()[0], "inconclusive", exit_text)   # the matching-frequency control: on the child's own 10 MHz the gap is 20 s, over the limit, with no exit stamp to bound it below
                     continue
@@ -13334,10 +13339,44 @@ class VenueProbeIdentityCallDeadlineTests(IdentityProbeMixin, unittest.TestCase)
                 with self.assertRaises(AssertionError):
                     self.assert_no_exit_hold(require_abandoned=False)
         start.unlink(missing_ok=True)   # no start stamp, nothing to compare the marker with
-        self.assertIsNone(_ident_start_hz(start))
+        self.assertIsNone(_ident_start_stamp(start))
         for text in ("", "1000", "1000 0", "1000 x", "1000 2 3"):
             start.write_text(text, encoding="ascii")
-            self.assertIsNone(_ident_start_hz(start), text)
+            self.assertIsNone(_ident_start_stamp(start), text)
+
+    def test_r5_adversary_a1b_a_start_stamp_after_the_end_marker_is_a_typed_failure_even_when_the_exit_stamp_is_unreadable(self) -> None:
+        # adversary A1 on 4538d581 (same class as A1 on e584171e): start 100.05 s, marker 100 s, the exit stamp missing / empty / malformed / reversed. The reader dropped the start stamp with the exit stamp,
+        # so the child-is-not-None guard skipped the start <= marker order check and the run read as a pass. A half-ns reversal and a start after the parent's own end read are the same failure.
+        start, end = self.tmp / _IDENT_CHILD_QPC_START, self.tmp / _IDENT_CHILD_QPC_EXIT
+        rows = (("1000500000 10000000", 1_000_000_000, 10_000_000, 100_100_000_000, "AFTER its own end marker"),         # 100.05 s start, 100 s marker
+                ("2000000001 2000000000", 2_000_000_000, 2_000_000_000, 100_100_000_000, "AFTER its own end marker"),   # exact start 1000000000.5 ns vs marker 1000000000 ns: half a ns
+                ("1000500000 10000000", 1_010_000_000, 10_000_000, 100_040_000_000, "AFTER the test saw the process end"))   # start 100.05 s, marker 101 s, parent end 100.04 s
+        for start_text, marker_ticks, marker_hz, parent_end_ns, why in rows:
+            for exit_text in (None, "", "garbage", "5"):
+                for f in (start, end):
+                    f.unlink(missing_ok=True)
+                start.write_text(start_text, encoding="ascii")
+                if exit_text is not None:
+                    end.write_text(exit_text, encoding="ascii")
+                stamps, _note = _ident_read_child_stamps(start, end)
+                self.assertIsNone(stamps, (start_text, exit_text))
+                self._set_clocks(1.0, None, 2.0)
+                self.last_timing = _parse_probe_timing(f"VENUE_PROBE_INTERNAL_MS=1500 abandoned=1 end_qpc={marker_ticks} qpc_hz={marker_hz}")
+                self.last_wall_end_ns, self.last_child_qpc, self.last_child_start = parent_end_ns, stamps, _ident_start_stamp(start)
+                with self.assertRaises(AssertionError, msg=(start_text, exit_text)) as ctx:
+                    self.exit_hold_verdict()
+                self.assertIn("typed failure", str(ctx.exception))
+                self.assertIn(why, str(ctx.exception), (start_text, exit_text))
+                with self.assertRaises(AssertionError):
+                    self.timing_verdicts(2.0)
+        # the control: a start BEFORE the marker, with the exit stamp unreadable, is a measurement again (no stamp, so at best an upper bound)
+        for f in (start, end):
+            f.unlink(missing_ok=True)
+        start.write_text("990000000 10000000", encoding="ascii")
+        self._set_clocks(1.0, None, 2.0)
+        self.last_timing = _parse_probe_timing("VENUE_PROBE_INTERNAL_MS=1500 abandoned=1 end_qpc=1000000000 qpc_hz=10000000")
+        self.last_wall_end_ns, self.last_child_qpc, self.last_child_start = 100_100_000_000, None, _ident_start_stamp(start)
+        self.assertEqual(self.exit_hold_verdict()[:2], ("pass", 0.1))
 
     def test_r5_adversary_a2_the_limit_is_judged_as_the_decimal_it_prints_as_not_as_its_binary_float(self) -> None:
         # adversary A2 on e584171e: Fraction(0.1) is 0.1000000000000000055..., so a figure of exactly 0.1 s passed a 0.1 s limit, and a child bound 10^-18 s under 0.3 s reached an "over" at 0.3 s
