@@ -58,7 +58,7 @@ function Resolve-VenueHeatRule {
     }
     if ($Rule -isnot [System.Management.Automation.PSCustomObject]) { return $inv }
     $p = $Rule.PSObject.Properties
-    if (-not $p['source'] -or [string]$Rule.source -cne 'agent') { return $inv }
+    if (-not $p['source'] -or -not [string]::Equals([string]$Rule.source, 'agent', [System.StringComparison]::Ordinal)) { return $inv }   # ordinal: -cne ignores a soft hyphen inside "agent" (adversary r3 A5)
     $vals = @{}
     foreach ($k in 'maxThrottledRows', 'meanMaxC', 'sustainedRows', 'feedStaleSec') {
         if (-not $p[$k] -or $null -eq $Rule.$k -or $Rule.$k -is [bool] -or $Rule.$k -is [array]) { return $inv }   # a scalar number or its text: an array coerces through [string] and is no number

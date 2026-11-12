@@ -220,8 +220,8 @@ class ThermalGateModuleTests(unittest.TestCase):
                                "clear|tele-line|87.99833", "hot|tele-line|88"], got)
         # the producer writes both: mean_c (rounded, unchanged) and mean_c_exact, and prints mean_exact= on the display line
         q = QUIET.read_text(encoding="utf-8")
-        self.assertIn("$telHeat.mean_c_exact = [double]$r.m.meanC", q)
-        self.assertIn("' mean_exact=' + ([double]$h.mean_c_exact).ToString('R'", q)
+        self.assertIn("$telHeat.mean_c_exact = (ConvertTo-JsonSafeDouble $r.m.meanC)", q)
+        self.assertIn("' mean_exact=' + $mx", q)   # r4 A1: printed through the round-trip formatter ($rt), never 'R' (5.1 misses the round trip) or [string]
         self.assertIn("'mean_c_exact'", q.split("$heatFields = ", 1)[1].split("\n", 1)[0])
 
     def test_adversary_r3_a3_a_history_dir_that_cannot_be_resolved_is_skipped_and_named(self) -> None:
@@ -760,7 +760,7 @@ class ThermalGateModuleTests(unittest.TestCase):
         # 'Infinity', the display printed 'mean=n/a' with no mean_exact, and with the raw JSON unwritable (a sharing violation) the gate read unknown and ran the leg.
         # The probe's own functions are taken from Wait-VenueQuiet.ps1 (its feed reader, the telemetry line) and its JSON round trip is reproduced; the gate parses what it prints.
         quiet = QUIET.read_text(encoding="utf-8")
-        self.assertIn("$telHeat.mean_c = [math]::Round([double]$r.m.meanC, 2); $telHeat.mean_c_exact = [double]$r.m.meanC", quiet, "the probe's heat block moved: update this test")
+        self.assertIn("$telHeat.mean_c = [math]::Round([double]$r.m.meanC, 2); $telHeat.mean_c_exact = (ConvertTo-JsonSafeDouble $r.m.meanC)", quiet, "the probe's heat block moved: update this test")
         lines = quiet.splitlines()
 
         def fn(name: str) -> str:
@@ -1567,7 +1567,8 @@ class AgentThresholdParityTests(unittest.TestCase):
     def test_r1_a1_a_threshold_that_needs_every_digit_is_published_and_applied_exactly(self) -> None:
         exact = "80.00000000000001"   # the agent: mean 80 is CLEAR (80 >= 80.00000000000001 is false); the gate must agree on every path
         pub = ps(agent_fn_ps("Get-AgentHeatRule", f"$GateMaxThrottledRows = 6; $GateMeanMaxC = {exact}; $GateSustainedRows = 60; $GateFeedStaleSec = 120", "(Get-AgentHeatRule | ConvertTo-Json -Compress)"))
-        self.assertIn(f'"meanMaxC":{exact}', pub, "the agent publishes the threshold it runs with, every digit")
+        # r4 A1: a threshold 15 digits cannot carry is published as its round-trip TEXT (Windows PowerShell 5.1 would cut a number to 15 digits); the gate reads the text invariant
+        self.assertRegex(pub, r'"meanMaxC":"?' + re.escape(exact) + r'"?[,}]', "the agent publishes the threshold it runs with, every digit")
         probe_json = '{"maxThrottledRows":6,"meanMaxC":' + exact + ',"sustainedRows":60,"feedStaleSec":120}'
         rd = ps_json(quiet_fn_ps("Read-TelAgentHeatRule", "", f"Read-TelAgentHeatRule -Json '{probe_json}' -DefaultRows 60 -DefaultStaleSec 120"))
         self.assertEqual((rd["source"], rd["meanMaxC"]), ("agent", float(exact)), rd)
@@ -1712,6 +1713,112 @@ class AgentThresholdParityR3Tests(unittest.TestCase):
             self.assertLess(add, body.index(needle), f"admission.heatRule is added before {needle}")
         self.assertEqual(body.count("-NotePropertyName heatRule"), 1)
         self.assertIn("$env:MLV_AGENT_HEAT_RULE = ($heatRule | ConvertTo-Json -Compress)", body)
+
+
+SHELLS_R4 = [PWSH] + ([POWERSHELL_51] if POWERSHELL_51.exists() and sys.platform == "win32" else [])
+
+
+@requires_windows_pwsh
+class AgentThresholdParityR4Tests(unittest.TestCase):
+    """BACHELOR-THERMAL-GATE-AGENT-THRESHOLD-PARITY-1 r4 (adversary r3 A1, A2). Windows PowerShell 5.1 (the agent's shell when pwsh is absent on the venue) writes a [double] into JSON with
+    15 significant digits, or through 'R', which on .NET Framework is documented to miss the round trip for some values: a threshold or a mean that needs every digit reaches the gate as a
+    neighbouring double, so the agent says clear and the gate says hot. Every double on the path agent -> job env -> probe -> probe JSON -> printed line -> gate must arrive bit-identical."""
+
+    # Doubles are built from their BIT PATTERNS, so neither shell's literal parser can move them; the verdict is compared in Python, whose float() is correctly rounded.
+    THR_F = float("0.84551240822557006")    # the adversary's threshold (GateMeanMaxC)
+    MEAN_F = float("0.84551240822556994")   # the double one ulp under it: the agent's own comparison (mean >= threshold) is FALSE, so the agent says clear
+
+    @staticmethod
+    def bits(f: float) -> str:
+        import struct
+        return "[BitConverter]::Int64BitsToDouble(" + str(struct.unpack("<q", struct.pack("<d", f))[0]) + ")"
+
+    @staticmethod
+    def as_float(v) -> float:
+        return float(v)   # a JSON number or the round-trip text the probe publishes: both come back through Python's correctly rounded parser
+
+    def chain(self, exe) -> dict:
+        """The whole path, in the shell under test, with the project's own functions (lifted from their files, never restated)."""
+        funcs = "\n".join(quiet_fn_ps(n, "", "") for n in ("ConvertTo-JsonSafeDouble", "Read-TelAgentHeatRule", "ConvertTo-IdentToken", "Format-TelNum", "Get-TelReasonSuffix", "Write-TelemetryLines"))
+        script = (
+            f"Import-Module '{GATE}' -Force\n" + agent_fn_ps("Get-AgentHeatRule", f"$GateMaxThrottledRows = 6; $GateMeanMaxC = {self.bits(self.THR_F)}; $GateSustainedRows = 15; $GateFeedStaleSec = 120", "") + "\n"
+            "$telemetrySchemaV1 = 'mlv-app/venue-quiet-probe-telemetry/v1'; function Write-Gate([string]$s) { $s }\n" + funcs + "\n"
+            f"$thr = {self.bits(self.THR_F)}; $mean = {self.bits(self.MEAN_F)}\n"
+            "$agentSays = $(if ($mean -ge $thr) { 'hot' } else { 'clear' })\n"
+            "$envJson = (Get-AgentHeatRule | ConvertTo-Json -Compress)\n"                                  # the job env, as the agent writes it
+            "$ar = Read-TelAgentHeatRule -Json $envJson -DefaultRows 60 -DefaultStaleSec 120\n"            # the probe reads it
+            "$heat = [ordered]@{ source = 'x'; sample_age_s = 1.0; hottest_core_c = 50.0; max15_c = 60.0; mean_c = [math]::Round($mean, 2); mean_c_exact = (ConvertTo-JsonSafeDouble $mean); throttled = 0; window_rows = 15; package_w = 10.0; reasons = [ordered]@{}\n"
+            "  rule = [ordered]@{ source = $ar.source; maxThrottledRows = $ar.maxThrottledRows; meanMaxC = (ConvertTo-JsonSafeDouble $ar.meanMaxC); sustainedRows = $ar.sustainedRows; feedStaleSec = (ConvertTo-JsonSafeDouble $ar.feedStaleSec) } }\n"
+            "$probeJson = ([ordered]@{ telemetry_schema = $telemetrySchemaV1; heat = $heat; gpu = [ordered]@{ state = 'absent' }; last_lease = [ordered]@{ event = 'none' } } | ConvertTo-Json -Compress -Depth 6)\n"
+            "$p = $probeJson | ConvertFrom-Json\n"
+            "$lines = @(Write-TelemetryLines $p)\n"
+            "$viaLine = ConvertFrom-VenueProbeHeatLine -Lines (@('  raw UNWRITABLE sharing violation') + $lines)\n"      # the printed line
+            "$f = Join-Path ([IO.Path]::GetTempPath()) ('thermal-r4-' + [guid]::NewGuid().ToString('N') + '.json'); [IO.File]::WriteAllText($f, $probeJson)\n"
+            "$viaRaw = ConvertFrom-VenueProbeHeatLine -Lines @(\"  raw $f\"); Remove-Item -LiteralPath $f -Force\n"             # the raw JSON
+            "[pscustomobject]@{ agent = $agentSays; line = $viaLine.heat; raw = $viaRaw.heat; src = $viaLine.thresholdsSource; text = [string](@($lines | Where-Object { $_ -match '^\\s*tele heat ' })[0]); envJson = $envJson }"
+        )
+        return shell_json(exe, script)
+
+    def test_r4_a1_a_threshold_and_a_mean_that_need_every_digit_reach_the_gate_exactly_on_both_shells(self) -> None:
+        for exe in SHELLS_R4:
+            got = self.chain(exe)
+            self.assertEqual(got["agent"], "clear", got)
+            self.assertEqual((got["line"], got["raw"], got["src"]), ("clear", "clear", "agent"), f"{exe}: agent says clear, the gate must too: {got}")
+            thr = re.search(r" rule_mean_max_c=(\S+) ", got["text"] + " ")
+            mean = re.search(r" mean_exact=(\S+) ", got["text"] + " ")
+            self.assertTrue(thr and mean, got["text"])
+            self.assertEqual((self.as_float(thr.group(1)), self.as_float(mean.group(1))), (self.THR_F, self.MEAN_F), f"{exe}: the printed line must carry both doubles bit-identical: {got['text']}")
+
+    def test_r4_a1_the_published_form_round_trips_bit_identical_on_both_shells(self) -> None:
+        cases = [self.THR_F, self.MEAN_F, float("80.00000000000001"), 88.0, 0.1, 88.5, 1e300, 1.7976931348623157e308, 5e-324, 1e-5, 0.0, 123456789.12345678]
+        for exe in SHELLS_R4:
+            for f in cases:
+                out = shell_json(exe, quiet_fn_ps("ConvertTo-JsonSafeDouble", "", f"[pscustomobject]@{{ x = (ConvertTo-JsonSafeDouble ({self.bits(f)})) }}"))
+                self.assertEqual(self.as_float(out["x"]), f, f"{exe}: {f!r} published as {out['x']!r}")
+            # the threshold needs more than 15 digits: it can only be carried as text, never as a number a 5.1 writer would cut to 15 digits
+            self.assertIsInstance(shell_json(exe, quiet_fn_ps("ConvertTo-JsonSafeDouble", "", f"[pscustomobject]@{{ x = (ConvertTo-JsonSafeDouble ({self.bits(self.THR_F)})) }}"))["x"], str, str(exe))
+            for f in (88.0, 0.1, 88.5):
+                self.assertIsInstance(shell_json(exe, quiet_fn_ps("ConvertTo-JsonSafeDouble", "", f"[pscustomobject]@{{ x = (ConvertTo-JsonSafeDouble ({self.bits(f)})) }}"))["x"], (int, float), f"{exe}: {f} stays a JSON number")
+            for v in ("[double]::NaN", "[double]::PositiveInfinity", "[double]::NegativeInfinity"):
+                out = shell_json(exe, quiet_fn_ps("ConvertTo-JsonSafeDouble", "", f"[pscustomobject]@{{ x = (ConvertTo-JsonSafeDouble ({v})) }}"))
+                self.assertIsInstance(out["x"], str, f"{exe}: a non-finite double is published by name")
+            self.assertIsNone(shell_json(exe, quiet_fn_ps("ConvertTo-JsonSafeDouble", "", "[pscustomobject]@{ x = (ConvertTo-JsonSafeDouble $null) }"))["x"], "no value, no number")
+
+    def test_r4_a1_the_agent_publishes_the_threshold_exactly_under_either_shell(self) -> None:
+        for exe in SHELLS_R4:
+            for f in (self.THR_F, self.MEAN_F, float("80.00000000000001"), 88.0, 0.1):
+                out = shell_json(exe, agent_fn_ps("Get-AgentHeatRule", f"$GateMaxThrottledRows = 6; $GateMeanMaxC = {self.bits(f)}; $GateSustainedRows = 60; $GateFeedStaleSec = 120",
+                                                  "$j = (Get-AgentHeatRule | ConvertTo-Json -Compress); [pscustomobject]@{ json = $j }"))
+                published = json.loads(out["json"])["meanMaxC"]   # exactly what the job env carries, parsed by Python
+                self.assertEqual(self.as_float(published), f, f"{exe}: published {out['json']} for {f!r}")
+
+    def test_r4_a5_a_source_with_a_soft_hyphen_inside_agent_is_not_agent(self) -> None:
+        # adversary r3 A5: -ceq / -cne ignore a soft hyphen (U+00AD) inside the word, so "ag<SHY>ent" passed as the agent's record; the compare is ordinal
+        for exe in SHELLS_R4:
+            out = shell_json(exe, f"Import-Module '{GATE}' -Force; $s = 'ag' + [char]0xAD + 'ent'; "
+                                  "[pscustomobject]@{ shy = (Resolve-VenueHeatRule -Rule ([pscustomobject]@{ source = $s; maxThrottledRows = 6; meanMaxC = 88; sustainedRows = 60; feedStaleSec = 120 })).valid; "
+                                  "ok = (Resolve-VenueHeatRule -Rule ([pscustomobject]@{ source = 'agent'; maxThrottledRows = 6; meanMaxC = 88; sustainedRows = 60; feedStaleSec = 120 })).valid }")
+            self.assertEqual((out["shy"], out["ok"]), (False, True), f"{exe}: {out}")
+
+    # ---- A2: the in-gate queue-expired exit publishes the admission (and so the rule)
+    def test_r4_a2_a_queue_expired_result_carries_the_admission_and_its_heat_rule(self) -> None:
+        out = ps_json(agent_fn_ps("Invoke-QueueExpiredJob", "",
+                                  "$script:Pub = $null; function Publish-JobResult { param($JobId, $Result) $script:Pub = $Result; 'x' }; function Move-JobArtifacts { param($JobId, $JobPath, $DestinationDirectory) }; "
+                                  "function Add-AgentLogLine { param($m) }; $processed = 'p'; "
+                                  "$job = [pscustomobject]@{ BaseName = 'j1.job'; FullName = 'C:\\x\\j1.job' }; $md = [pscustomobject]@{ timeoutSec = 60; maxQueueAgeSec = 600 }; "
+                                  "$adm = [pscustomobject]@{ label = 'queue-expired'; queueAgeSec = 700; heatRule = [ordered]@{ maxThrottledRows = 6; meanMaxC = 88.0; sustainedRows = 60; feedStaleSec = 120 } }; "
+                                  "Invoke-QueueExpiredJob -Job $job -Metadata $md -QueueAgeSec 700 -Admission $adm; $script:Pub"))
+        self.assertEqual((out["queueExpired"], out["admission"]["label"], out["admission"]["heatRule"]["meanMaxC"]), (True, "queue-expired", 88.0), out)
+
+    def test_r4_a2_every_exit_after_the_admission_exists_publishes_it(self) -> None:
+        agent = AGENT.read_text(encoding="utf-8")
+        body = agent[agent.index("function Invoke-QueuedJob"):]
+        body = body[body.index("-NotePropertyName heatRule"):]   # from the point the rule is on the admission record
+        calls = re.findall(r"^\s*(Invoke-QueueExpiredJob|Publish-GateUnlaunchedResult|Publish-NotAfterExpiredResult)\b(.*)$", body, flags=re.M)
+        self.assertGreaterEqual(len(calls), 5, calls)
+        for name, rest in calls:
+            self.assertIn("-Admission $script:Admission", rest, f"{name} after the admission exists must carry it: {rest}")
+        self.assertNotIn("(expired before or inside the gate)", agent, "the stale 'shape unchanged inside the gate' comment is gone")
 
 
 if __name__ == "__main__":

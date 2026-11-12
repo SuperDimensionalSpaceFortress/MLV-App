@@ -553,6 +553,24 @@ $HeatStaleSec = 120
 # meanMaxC, sustainedRows, feedStaleSec as JSON). The probe reads the feed with the AGENT'S window and staleness, and copies the record into heat{}.rule (and the 'tele heat' line) for the gate,
 # which holds the one validation that decides (Resolve-VenueHeatRule). Absent: the defaults above, no rule key (the gate says thresholds_source=default). Present but unusable (not JSON, not an
 # object, a field missing or not a finite non-negative number, a window outside 1..150, a staleness of 0): rule.source = invalid, and the defaults above are used for the feed read only.
+# PARITY-1 r4 (adversary r3 A1): what a [double] becomes when this probe's JSON carries it to the lease-batch gate. Windows PowerShell 5.1 writes a double with 15 significant digits (or through 'R', which
+# on .NET Framework misses the round trip for some values), so a threshold or an exact mean that needs more digits would arrive as a neighbouring double and the gate would decide the other way from the
+# agent. A finite double that G15 gives back bit-identical stays a JSON number; any other is the shortest of its G16 / G17 text that does round trip (every reader parses numeric text invariant); a
+# non-finite double is its name (a JSON number cannot carry it).
+function ConvertTo-JsonSafeDouble($Value) {
+    if ($null -eq $Value) { return $null }   # a rule that was not published (source default / invalid) has no number to carry
+    $d = [double]$Value
+    if ([double]::IsNaN($d) -or [double]::IsInfinity($d)) { return [string]$d }
+    $inv = [Globalization.CultureInfo]::InvariantCulture
+    $ns = [Globalization.NumberStyles]::Float
+    # TryParse, not Parse: on .NET Framework the G15 / G16 text of [double]::MaxValue is past the largest double and Parse throws, which only means "does not round trip"
+    $p = 0.0
+    if ([double]::TryParse($d.ToString('G15', $inv), $ns, $inv, [ref]$p) -and $p -ceq $d) { return $d }
+    $t = $d.ToString('G17', $inv)
+    $s16 = $d.ToString('G16', $inv)
+    if ([double]::TryParse($s16, $ns, $inv, [ref]$p) -and $p -ceq $d) { $t = $s16 }
+    return $t
+}
 function Read-TelAgentHeatRule([string]$Json, [int]$DefaultRows, [double]$DefaultStaleSec) {
     $r = [ordered]@{ source = 'default'; maxThrottledRows = $null; meanMaxC = $null; sustainedRows = $null; feedStaleSec = $null; windowRows = $DefaultRows; staleSec = $DefaultStaleSec }
     if ([string]::IsNullOrWhiteSpace($Json)) { return [pscustomobject]$r }
@@ -679,7 +697,7 @@ $heatFields = @('sample_age_s', 'hottest_core_c', 'max15_c', 'mean_c', 'mean_c_e
 $telHeat = [ordered]@{ source = 'unavailable'; sample_age_s = $null; hottest_core_c = $null; max15_c = $null; mean_c = $null; mean_c_exact = $null; throttled = $null; window_rows = $null; package_w = $null
     window_rule_rows = $HeatWindowRows; stale_after_s = $HeatStaleSec; reasons = [ordered]@{}; why = $null }
 if ($AgentHeatRule.source -cne 'default') {
-    $telHeat['rule'] = [ordered]@{ source = $AgentHeatRule.source; maxThrottledRows = $AgentHeatRule.maxThrottledRows; meanMaxC = $AgentHeatRule.meanMaxC; sustainedRows = $AgentHeatRule.sustainedRows; feedStaleSec = $AgentHeatRule.feedStaleSec }
+    $telHeat['rule'] = [ordered]@{ source = $AgentHeatRule.source; maxThrottledRows = $AgentHeatRule.maxThrottledRows; meanMaxC = (ConvertTo-JsonSafeDouble $AgentHeatRule.meanMaxC); sustainedRows = $AgentHeatRule.sustainedRows; feedStaleSec = (ConvertTo-JsonSafeDouble $AgentHeatRule.feedStaleSec) }
 }
 try {
     $w = Invoke-TelBounded $TelTailScript @($HeatFeedPath, (80 * 150 + 400), $TelemetryReadDelayMs) $TelemetryCallMs
@@ -696,7 +714,7 @@ try {
             $r = ConvertFrom-TelFeedRows $lines
             if ($null -eq $r.m) { $code = $r.why }
             else {
-                $telHeat.hottest_core_c = [double]$r.m.lastC; $telHeat.max15_c = [double]$r.m.max15C; $telHeat.mean_c = [math]::Round([double]$r.m.meanC, 2); $telHeat.mean_c_exact = [double]$r.m.meanC   # r3 A2: mean_c is rounded to 0.01 (87.998 -> 88.0, hot by the agent's >= 88 rule while the exact mean is clear); the exact mean is what the lease-batch thermal gate decides on
+                $telHeat.hottest_core_c = [double]$r.m.lastC; $telHeat.max15_c = [double]$r.m.max15C; $telHeat.mean_c = [math]::Round([double]$r.m.meanC, 2); $telHeat.mean_c_exact = (ConvertTo-JsonSafeDouble $r.m.meanC)   # r4 A1: a number, or its round-trip text when 15 digits would not carry it. r3 A2: mean_c is rounded to 0.01 (87.998 -> 88.0, hot by the agent's >= 88 rule while the exact mean is clear); the exact mean is what the lease-batch thermal gate decides on
                 $telHeat.throttled = [int]$r.m.throttled; $telHeat.window_rows = [int]$r.m.window; $telHeat.package_w = [double]$r.m.watts30
             }
         }
@@ -1302,18 +1320,31 @@ function Write-TelemetryLines($Probe) {
     try {
         if ([string]$Probe.telemetry_schema -cne $telemetrySchemaV1) { return }
         $h = $Probe.heat
+        # PARITY-1 r4 (adversary r3 A1): a number, or the numeric text ConvertTo-JsonSafeDouble publishes, printed as the shortest G15 / G16 / G17 text that parses back to the same double: never 'R' (on
+        # Windows PowerShell 5.1 / .NET Framework it misses the round trip for some values) and never [string] (15 digits). A non-finite value is its name; anything else is $null. Inline, so a harness
+        # that lifts this function alone keeps working.
+        $rt = { param($x)
+            $d = 0.0; $inv = [Globalization.CultureInfo]::InvariantCulture; $ns = [Globalization.NumberStyles]::Float
+            if ($x -is [string]) { if (-not [double]::TryParse($x, $ns, $inv, [ref]$d)) { return $null } }
+            elseif ($x -is [double] -or $x -is [single] -or $x -is [decimal] -or $x -is [int] -or $x -is [long] -or $x -is [int16] -or $x -is [byte] -or $x -is [uint32] -or $x -is [uint64]) { $d = [double]$x }
+            else { return $null }
+            if ([double]::IsNaN($d) -or [double]::IsInfinity($d)) { return [string]$d }
+            $p = 0.0
+            foreach ($f in 'G15', 'G16', 'G17') { $t = $d.ToString($f, $inv); if ([double]::TryParse($t, $ns, $inv, [ref]$p) -and $p -ceq $d) { break } }
+            $t
+        }
         # BACHELOR-THERMAL-GATE-WAIT-1 r6 (adversary r5 A3): mean_exact is printed for a non-finite mean too. The JSON round trip holds it as the string NaN / Infinity / -Infinity, which
         # Format-TelNum prints as 'n/a' (as for a missing mean); mean_exact names it, so the lease-batch gate reads +Infinity as hot (the agent's >= 88 rule) and NaN / -Infinity as unknown.
         Write-Gate (("  tele heat source={0} age={1} hottest={2} max15={3} mean={4} throttled={5}/{6} W={7}" -f (ConvertTo-IdentToken $h.source), (Format-TelNum $h.sample_age_s 's'),
             (Format-TelNum $h.hottest_core_c 'C'), (Format-TelNum $h.max15_c 'C'), (Format-TelNum $h.mean_c 'C'), (ConvertTo-IdentToken $h.throttled), (ConvertTo-IdentToken $h.window_rows),
-            (Format-TelNum $h.package_w '')) + (Get-TelReasonSuffix $h) + $(if ($h.mean_c_exact -is [ValueType]) { ' mean_exact=' + ([double]$h.mean_c_exact).ToString('R', [Globalization.CultureInfo]::InvariantCulture) }
-            elseif ([string]$h.mean_c_exact -cin @('NaN', 'Infinity', '-Infinity')) { ' mean_exact=' + [string]$h.mean_c_exact } else { '' }) +
+            (Format-TelNum $h.package_w '')) + (Get-TelReasonSuffix $h) + $(if ($null -ne ($mx = (& $rt $h.mean_c_exact))) { ' mean_exact=' + $mx } else { '' }) +
             # PARITY-1: the agent's published heat rule, as the gate reads it off this line (VenueThermalGate.psm1 Get-VenueRuleFromTeleLine); inline, so the existing harnesses that lift this function
             # keep working. Nothing published -> nothing printed (the gate says thresholds_source=default); a record the probe could not use -> rule_source=invalid (THERMAL_THRESHOLDS_INVALID).
-            # a double is printed round-trip ('R'), never through [string] (15 significant digits: 80.00000000000001 would print as 80)
+            # a number, or the numeric text the probe publishes for a double 15 digits cannot carry, is printed round-trip ($rt above), never through [string] (15 significant digits: 80.00000000000001 would
+            # print as 80) and never as an identifier token (which would pass a padded text on as it came)
             $(if ($h.PSObject.Properties['rule'] -and $null -ne $h.rule) {
-                $rn = { param($x) if ($x -is [double]) { $x.ToString('R', [Globalization.CultureInfo]::InvariantCulture) } else { ConvertTo-IdentToken $x } }
-                if ([string]$h.rule.source -ceq 'agent') { ' rule_source=agent rule_max_throttled=' + (& $rn $h.rule.maxThrottledRows) + ' rule_mean_max_c=' + (& $rn $h.rule.meanMaxC) + ' rule_rows=' + (& $rn $h.rule.sustainedRows) + ' rule_stale_s=' + (& $rn $h.rule.feedStaleSec) }
+                $rn = { param($x) $v = (& $rt $x); if ($null -ne $v) { $v } else { ConvertTo-IdentToken $x } }
+                if ([string]::Equals([string]$h.rule.source, 'agent', [StringComparison]::Ordinal)) { ' rule_source=agent rule_max_throttled=' + (& $rn $h.rule.maxThrottledRows) + ' rule_mean_max_c=' + (& $rn $h.rule.meanMaxC) + ' rule_rows=' + (& $rn $h.rule.sustainedRows) + ' rule_stale_s=' + (& $rn $h.rule.feedStaleSec) }
                 else { ' rule_source=invalid' }
             } else { '' }))
         $g = $Probe.gpu

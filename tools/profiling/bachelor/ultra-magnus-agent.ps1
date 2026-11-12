@@ -1400,8 +1400,8 @@ function Test-LaunchOutFile {
 }
 
 function Invoke-QueueExpiredJob {
-    # -Admission: the record of a job that expired once admitted (with its leaseRelease); the result carries it. Without it (expired
-    # before or inside the gate) the result's shape is unchanged.
+    # -Admission: the record of a job that expired once an admission record existed (inside the gate, or after it, with its leaseRelease); the result carries it, heatRule included.
+    # Without it (expired before the gate, so no admission record exists) the result's shape is unchanged.
     param(
         [Parameter(Mandatory = $true)]$Job,
         [Parameter(Mandatory = $true)]$Metadata,
@@ -2630,10 +2630,26 @@ function Get-AgentHeatRule {
     # venue's quiet probe copies it into its heat{} block and the lease-batch thermal gate (VenueThermalGate.psm1 Resolve-VenueHeatRule) validates and applies it. A non-finite double
     # (a GateMeanMaxC of NaN) is published as its name, since a JSON number cannot carry it: the gate then refuses the record. The values are the agent's constants (the same for
     # every job), so the env var is overwritten per job and never needs clearing.
+    # PARITY-1 r4 (adversary r3 A1): Windows PowerShell 5.1 writes a [double] into JSON with 15 significant digits (or through 'R', which on .NET Framework misses the round trip for some values), so a
+    # threshold that needs every digit would reach the gate as a neighbouring double. A finite double that G15 does not give back bit-identical is therefore published as the shortest of its G16 / G17
+    # text that does (the readers parse numeric text invariant); every other double stays a JSON number. Inline, so this function stays liftable on its own.
     $mean = [double]$GateMeanMaxC
+    $inv = [System.Globalization.CultureInfo]::InvariantCulture
+    $meanOut = $mean
+    if ([double]::IsNaN($mean) -or [double]::IsInfinity($mean)) { $meanOut = [string]$mean }
+    else {
+        # TryParse, not Parse: on .NET Framework the G15 / G16 text of [double]::MaxValue is past the largest double and Parse throws, which only means "does not round trip"
+        $ns = [System.Globalization.NumberStyles]::Float
+        $back = 0.0
+        if (-not ([double]::TryParse($mean.ToString("G15", $inv), $ns, $inv, [ref]$back) -and $back -ceq $mean)) {
+            $meanOut = $mean.ToString("G17", $inv)
+            $g16 = $mean.ToString("G16", $inv)
+            if ([double]::TryParse($g16, $ns, $inv, [ref]$back) -and $back -ceq $mean) { $meanOut = $g16 }
+        }
+    }
     return [ordered]@{
         maxThrottledRows = [int]$GateMaxThrottledRows
-        meanMaxC         = $(if ([double]::IsNaN($mean) -or [double]::IsInfinity($mean)) { [string]$mean } else { $mean })
+        meanMaxC         = $meanOut
         sustainedRows    = [int]$GateSustainedRows
         feedStaleSec     = [int]$GateFeedStaleSec
     }
@@ -4277,7 +4293,8 @@ function Invoke-QueuedJob {
     $heatRule = Get-AgentHeatRule
     $script:Admission | Add-Member -NotePropertyName heatRule -NotePropertyValue $heatRule -Force
     if ($script:Admission.label -eq "queue-expired") {
-        Invoke-QueueExpiredJob -Job $Job -Metadata $metadata -QueueAgeSec ([int]$script:Admission.queueAgeSec)
+        # PARITY-1 r4 (adversary r3 A2): the in-gate expiry has an admission record (label queue-expired, with the heat rule on it), so the result carries it like every later exit
+        Invoke-QueueExpiredJob -Job $Job -Metadata $metadata -QueueAgeSec ([int]$script:Admission.queueAgeSec) -Admission $script:Admission
         Complete-AdmissionWaitMarker -JobId $jobId -Status "queue-expired"
         return
     }

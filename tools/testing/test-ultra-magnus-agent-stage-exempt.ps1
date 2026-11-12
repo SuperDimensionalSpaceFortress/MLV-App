@@ -182,7 +182,7 @@ function Get-QueueAgeSeconds { param($Job, $Metadata) if ([string]$Metadata.jobI
 function New-AdmissionWaitMarker { param([string]$JobId, $Job, $Metadata) $script:Claims.Add($JobId); return $true }
 function Complete-AdmissionWaitMarker { param([string]$JobId, [string]$Status) }
 function Add-HeavySlotHolderLossToAdmission { param([string]$JobId, $Admission) }
-function Invoke-QueueExpiredJob { param($Job, $Metadata, [int]$QueueAgeSec) $script:Published.Add("queue-expired|$($Job.BaseName -replace '\.job$', '')") }
+function Invoke-QueueExpiredJob { param($Job, $Metadata, [int]$QueueAgeSec, $Admission = $null) $script:Published.Add("queue-expired|$($Job.BaseName -replace '\.job$', '')") }
 function Publish-GateUnlaunchedResult { param($Job, $Metadata, $Admission, [int]$QueueAgeSec) $script:Published.Add("$($Admission.label)|$($Job.BaseName -replace '\.job$', '')") }
 function Publish-NotAfterExpiredResult { param($Job, $Metadata, $Admission, [int]$QueueAgeSec, $Verdict) $script:Published.Add("expired-not-after|$($Job.BaseName -replace '\.job$', '')") }
 # hardening r2: the launch-and-monitor tail of Invoke-QueuedJob, driven for real by the kill cases (a real child, the agent's own Stop-ProcessTree).
