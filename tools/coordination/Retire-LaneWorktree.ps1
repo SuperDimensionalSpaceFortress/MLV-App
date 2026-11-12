@@ -453,7 +453,9 @@ function Get-ProcessCreationOrder {
 function Get-BoundCreationOrder {
     # r2 (adversary A1): the live sequence number is used only when it belongs to the SAME process the snapshot row describes. The scan and this read are
     # not atomic: a row's process can exit in between and its pid start a NEWER process, whose key would then be compared against the old row. The live
-    # creation time must equal the row's CreationDate (the same kernel stamp, so a clock step cannot separate them; 50 ms covers the WMI rounding).
+    # creation time must equal the row's CreationDate: the same kernel stamp, so a clock step cannot separate them. The WMI string keeps microseconds
+    # and the kernel stamp 100 ns, so only a difference of one microsecond (10 ticks) is rounding; a pid reused after the scan starts a process at
+    # least milliseconds later, which is a different process however close (adversary pass 3: a 50 ms bound accepted a replacement 10 ms later).
     # Anything else (no row stamp, no live key, a different process) returns $null, and the caller falls back to the snapshot's own rows.
     param($Row, [int]$ProcessId)
     if (-not $Row) { return $null }
@@ -461,7 +463,7 @@ function Get-BoundCreationOrder {
     if (-not ($made -and $made.Value -is [datetime])) { return $null }
     $live = Get-ProcessCreationOrder -ProcessId $ProcessId
     if (-not $live -or $live.CreatedUtc -isnot [datetime]) { return $null }
-    if ([math]::Abs((([datetime]$made.Value).ToUniversalTime() - ([datetime]$live.CreatedUtc).ToUniversalTime()).TotalMilliseconds) -gt 50) { return $null }
+    if ([math]::Abs((([datetime]$made.Value).ToUniversalTime() - ([datetime]$live.CreatedUtc).ToUniversalTime()).Ticks) -gt 10) { return $null }
     return $live.Sequence
 }
 
