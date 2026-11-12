@@ -58,6 +58,9 @@ param(
     [int]$GateSustainedRows = 60,
     [ValidateRange(0, 150)]
     [int]$GateMaxThrottledRows = 6,
+    # PARITY-1 r3 (adversary r2 A2): refused at the source what the lease-batch gate refuses (VenueThermalGate.psm1 Resolve-VenueHeatRule: finite and not negative), so the rule this agent
+    # PUBLISHES is always a rule the gate can apply. A negative bound made every reading hot here and 'unknown' there; NaN and +Infinity cannot be published as a number at all.
+    [ValidateRange(0.0, 1.7976931348623157E+308)]
     [double]$GateMeanMaxC = 88,
     [ValidateRange(10, 3600)]
     [int]$GateFeedStaleSec = 120,
@@ -4269,6 +4272,10 @@ function Invoke-QueuedJob {
         else { $script:Admission = Wait-HeavySlotAdmission -JobId $jobId -Job $Job -Metadata $metadata }
         Add-HeavySlotHolderLossToAdmission -JobId $jobId -Admission $script:Admission
     }
+    # PARITY-1 r3 (adversary r2 A4): the heat rule this agent runs with goes on the admission RECORD as soon as there is one, so the early exits below (queue-expired, cancelled, not-after) publish
+    # it too. The job env (the quiet probe copies it for the lease-batch thermal gate) is still set only for a job that launches, after them.
+    $heatRule = Get-AgentHeatRule
+    $script:Admission | Add-Member -NotePropertyName heatRule -NotePropertyValue $heatRule -Force
     if ($script:Admission.label -eq "queue-expired") {
         Invoke-QueueExpiredJob -Job $Job -Metadata $metadata -QueueAgeSec ([int]$script:Admission.queueAgeSec)
         Complete-AdmissionWaitMarker -JobId $jobId -Status "queue-expired"
@@ -4352,9 +4359,7 @@ function Invoke-QueuedJob {
         Complete-AdmissionWaitMarker -JobId $jobId -Status "queue-expired"
         return
     }
-    # PARITY-1: the heat rule this agent runs with, on the admission record and in the job's env (the quiet probe copies it for the lease-batch thermal gate)
-    $heatRule = Get-AgentHeatRule
-    $script:Admission | Add-Member -NotePropertyName heatRule -NotePropertyValue $heatRule -Force
+    # PARITY-1: the heat rule in the job's env ($heatRule was put on the admission record above, before any early exit)
     $env:MLV_AGENT_HEAT_RULE = ($heatRule | ConvertTo-Json -Compress)
     $env:MLV_AGENT_ADMISSION = $script:Admission.label
     $env:MLV_AGENT_ADMISSION_THERMAL = [string]$script:Admission.thermal

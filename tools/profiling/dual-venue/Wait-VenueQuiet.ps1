@@ -166,7 +166,8 @@ function Get-VenueQuietDecision {
     foreach ($v in $vals) {
         if ($null -eq $v -or -not ($v -is [double] -or $v -is [int] -or $v -is [long] -or $v -is [decimal])) { $ok = $false; continue }
         $d = [double]$v
-        if (-not [double]::IsFinite($d) -or $d -lt 0.0 -or $d -gt 100.0) { $ok = $false }
+        # r3: IsNaN / IsInfinity, not [double]::IsFinite (a .NET Core method that Windows PowerShell 5.1 does not have)
+        if ([double]::IsNaN($d) -or [double]::IsInfinity($d) -or $d -lt 0.0 -or $d -gt 100.0) { $ok = $false }
     }
     if (-not $ok) { return [pscustomobject]@{ state = 'UNKNOWN'; mean = $null } }
     # The UNROUNDED mean decides; Format-Mean rounds for display only (three 20.04% samples are BUSY at 20 although they print as 20.0%).
@@ -177,11 +178,13 @@ function Get-VenueQuietDecision {
 function Format-Mean($m) { if ($null -eq $m) { 'UNKNOWN' } else { '{0:0.0}%' -f $m } }
 
 if ($PSCmdlet.ParameterSetName -eq 'Offline') {
-    try { $samples = @(ConvertFrom-Json -InputObject $SamplesJson -NoEnumerate) } catch {
+    # r3 (adversary r2 A1): no -NoEnumerate (absent from Windows PowerShell 5.1). PowerShell 7 enumerates a root array into its elements; Windows PowerShell 5.1 emits it whole, so only there is it
+    # unwrapped once. Either way the samples are the root array's elements, and a nested array is one element, which the decision refuses.
+    try { $samples = @(ConvertFrom-Json -InputObject $SamplesJson) } catch {
         [Console]::Error.WriteLine("USAGE -SamplesJson is not valid JSON: $($_.Exception.Message)")
         exit 2
     }
-    if ($samples.Count -eq 1 -and $samples[0] -is [array]) { $samples = @($samples[0]) }
+    if ($PSVersionTable.PSVersion.Major -lt 7 -and $samples.Count -eq 1 -and $samples[0] -is [array]) { $samples = @($samples[0]) }
     $d = Get-VenueQuietDecision -Samples $samples -Threshold $ThresholdPercent
     Write-Output "DECISION $($d.state) mean=$(Format-Mean $d.mean)"
     exit 0
@@ -555,9 +558,12 @@ function Read-TelAgentHeatRule([string]$Json, [int]$DefaultRows, [double]$Defaul
     if ([string]::IsNullOrWhiteSpace($Json)) { return [pscustomobject]$r }
     $r.source = 'invalid'
     try {
-        # -NoEnumerate: a root array stays an array (and is refused), never unwrapped into the object inside it. A field must be a scalar: a number as a number (never through [string], which keeps
-        # 15 significant digits: 80.00000000000001 would become 80), or numeric text.
-        $o = ConvertFrom-Json -InputObject $Json -NoEnumerate -ErrorAction Stop
+        # r3 (adversary r2 A1): no -NoEnumerate, which Windows PowerShell 5.1 (the agent's shell when pwsh is absent) does not have. Both shells unroll a one-element root array into the object inside
+        # it, so the root must be an object by its TEXT (past JSON whitespace the first character is an opening brace, as the agent's own sidecar reader checks), and by its type. A field must be a scalar:
+        # a number as a number (never through [string], which keeps 15 significant digits: 80.00000000000001 would become 80), or numeric text.
+        $txt = $Json.TrimStart([char[]]@([char]0x20, [char]0x09, [char]0x0D, [char]0x0A))
+        if ($txt.Length -eq 0 -or $txt[0] -ne [char]0x7B) { return [pscustomobject]$r }
+        $o = ConvertFrom-Json -InputObject $Json -ErrorAction Stop
         if ($o -isnot [pscustomobject]) { return [pscustomobject]$r }
         $v = @{}
         foreach ($k in 'maxThrottledRows', 'meanMaxC', 'sustainedRows', 'feedStaleSec') {
@@ -571,7 +577,8 @@ function Read-TelAgentHeatRule([string]$Json, [int]$DefaultRows, [double]$Defaul
         }
         foreach ($k in 'maxThrottledRows', 'sustainedRows') { if ($v[$k] -ne [Math]::Floor($v[$k]) -or $v[$k] -gt [int]::MaxValue) { return [pscustomobject]$r } }
         if ($v['sustainedRows'] -lt 1 -or $v['sustainedRows'] -gt 150 -or $v['feedStaleSec'] -le 0) { return [pscustomobject]$r }
-        $r.source = 'agent'; $r.maxThrottledRows = $o.maxThrottledRows; $r.meanMaxC = $o.meanMaxC; $r.sustainedRows = $o.sustainedRows; $r.feedStaleSec = $o.feedStaleSec
+        # r3 (adversary r2 A3): the PARSED numbers are stored (counts as [int], the others as the [double] they parse to), never the raw text: ' 80 ' printed as rule_mean_max_c=_80_ and broke the tele line
+        $r.source = 'agent'; $r.maxThrottledRows = [int]$v['maxThrottledRows']; $r.meanMaxC = [double]$v['meanMaxC']; $r.sustainedRows = [int]$v['sustainedRows']; $r.feedStaleSec = [double]$v['feedStaleSec']
         $r.windowRows = [int]$v['sustainedRows']; $r.staleSec = [double]$v['feedStaleSec']
     } catch { $r.source = 'invalid' }
     [pscustomobject]$r

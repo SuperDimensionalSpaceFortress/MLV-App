@@ -1620,5 +1620,99 @@ class AgentThresholdParityTests(unittest.TestCase):
         self.assertIn("thresholdsSource = $ht.thresholdsSource", src)
 
 
+POWERSHELL_51 = Path(r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe")
+requires_windows_powershell_51 = unittest.skipUnless(sys.platform == "win32" and POWERSHELL_51.exists(), "needs Windows PowerShell 5.1")
+RULE_JSON = '{"maxThrottledRows":6,"meanMaxC":88,"sustainedRows":60,"feedStaleSec":120}'
+
+
+def shell_json(exe, script: str):
+    r = subprocess.run([str(exe), "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", f"$ErrorActionPreference='Stop'; ConvertTo-Json -Depth 6 -Compress -InputObject $({script})"],
+                       capture_output=True, text=True, timeout=120)
+    if r.returncode != 0:
+        raise AssertionError(r.stdout + r.stderr)
+    return json.loads(r.stdout.strip())
+
+
+@requires_windows_pwsh
+class AgentThresholdParityR3Tests(unittest.TestCase):
+    """BACHELOR-THERMAL-GATE-AGENT-THRESHOLD-PARITY-1 r3 (adversary r2 A1-A4). The agent runs under Windows PowerShell 5.1 when pwsh is not installed on the venue, so the probe's reader must
+    work there (5.1 has no ConvertFrom-Json -NoEnumerate), and what the agent's binder accepts must be exactly what the gate accepts."""
+
+    def reader(self, exe, text: str):
+        return shell_json(exe, quiet_fn_ps("Read-TelAgentHeatRule", "", f"Read-TelAgentHeatRule -Json '{text}' -DefaultRows 60 -DefaultStaleSec 120"))
+
+    # ---- A1: the published-rule reader on Windows PowerShell 5.1
+    @requires_windows_powershell_51
+    def test_r3_a1_the_reader_applies_a_published_rule_under_windows_powershell_5_1(self) -> None:
+        ok = self.reader(POWERSHELL_51, RULE_JSON)
+        self.assertEqual((ok["source"], ok["maxThrottledRows"], ok["meanMaxC"], ok["sustainedRows"], ok["feedStaleSec"]), ("agent", 6, 88, 60, 120), ok)
+        # the whole chain on 5.1: a hot reading (throttled 7 of 60, mean 90) under the published 6 / 88 is hot, not unknown
+        rule = {"source": ok["source"], "maxThrottledRows": ok["maxThrottledRows"], "meanMaxC": ok["meanMaxC"], "sustainedRows": ok["sustainedRows"], "feedStaleSec": ok["feedStaleSec"]}
+        self.assertEqual(ps_json("Resolve-VenueHeatRule -Rule ('" + json.dumps(rule) + "' | ConvertFrom-Json)")["valid"], True)
+
+    def test_r3_a1_a_root_array_is_no_rule_on_either_shell(self) -> None:
+        # 5.1 and 7 both unroll a one-element root array into the object inside it, so the root is refused from the text, as the agent's own sidecar reader does
+        shells = [PWSH] + ([POWERSHELL_51] if POWERSHELL_51.exists() and sys.platform == "win32" else [])
+        for exe in shells:
+            for text in ('[' + RULE_JSON + ']', ' \t[' + RULE_JSON + ']', '[' + RULE_JSON + ',' + RULE_JSON + ']', "[1,2]", '"text"', "7", "null"):
+                self.assertEqual(self.reader(exe, text)["source"], "invalid", (str(exe), text))
+            self.assertEqual(self.reader(exe, '  \r\n' + RULE_JSON)["source"], "agent", str(exe))   # JSON whitespace before the object is fine
+
+    @requires_windows_powershell_51
+    def test_r3_a1_the_offline_samples_reader_has_no_noenumerate_either(self) -> None:
+        self.assertNotIn("-NoEnumerate", "\n".join(l for l in QUIET.read_text(encoding="utf-8").splitlines() if not l.lstrip().startswith("#")))
+        for exe in (POWERSHELL_51, PWSH):
+            for samples, want in (("[10,10,10]", "DECISION QUIET mean=10.0%"), ("[[10,10,10]]", "DECISION UNKNOWN mean=UNKNOWN"), ("[]", "DECISION UNKNOWN mean=UNKNOWN")):
+                r = subprocess.run([str(exe), "-NoLogo", "-NoProfile", "-NonInteractive", "-File", str(QUIET), "-SamplesJson", samples], capture_output=True, text=True, timeout=120)
+                self.assertEqual((r.stdout.strip(), r.stderr.strip()), (want, ""), (str(exe), samples))
+
+    # ---- A2: the binder refuses what the gate refuses
+    def binder(self, exe, name: str, value: str) -> bool:
+        """True when the agent's OWN declaration of parameter `name` (its attributes included, taken from the agent's AST) binds `value`."""
+        script = (f"$t = $null; $e = $null; $ast = [System.Management.Automation.Language.Parser]::ParseFile('{AGENT}', [ref]$t, [ref]$e); "
+                  f"$p = $ast.ParamBlock.Parameters | Where-Object {{ $_.Name.VariablePath.UserPath -eq '{name}' }}; if ($null -eq $p) {{ throw 'no such param' }}; "
+                  f"$f = [scriptblock]::Create('param(' + $p.Extent.Text + ') $' + '{name}'); try {{ & $f -{name} {value} | Out-Null; $true }} catch {{ $false }}")
+        return shell_json(exe, script)
+
+    def test_r3_a2_the_binder_accepts_no_heat_threshold_the_gate_refuses(self) -> None:
+        candidates = {"GateMeanMaxC": ["-1", "-0.5", "-88", "[double]::NaN", "[double]::PositiveInfinity", "[double]::NegativeInfinity", "0", "0.5", "88", "[double]::MaxValue"],
+                      "GateMaxThrottledRows": ["-1", "0", "6", "150", "151"],
+                      "GateSustainedRows": ["-1", "0", "1", "14", "15", "60", "150", "151"],
+                      "GateFeedStaleSec": ["-1", "0", "1", "9", "10", "120", "3600", "3601"]}
+        shells = [PWSH] + ([POWERSHELL_51] if POWERSHELL_51.exists() and sys.platform == "win32" else [])
+        for exe in shells:
+            for name, values in candidates.items():
+                for v in values:
+                    if not self.binder(exe, name, v):
+                        continue
+                    pub = {"GateMaxThrottledRows": "6", "GateMeanMaxC": "88.0", "GateSustainedRows": "60", "GateFeedStaleSec": "120"}
+                    pub[name] = v
+                    sets = "; ".join(f"${k} = {x}" for k, x in pub.items())
+                    rule = ps_json(agent_fn_ps("Get-AgentHeatRule", sets, "Get-AgentHeatRule"))
+                    got = ps_json("Resolve-VenueHeatRule -Rule ('" + json.dumps({**rule, "source": "agent"}) + "' | ConvertFrom-Json)")
+                    self.assertTrue(got["valid"], f"{exe}: the agent binds {name}={v} and publishes {rule}, which the gate refuses ({got})")
+        # and the one the adversary named is refused at the source
+        self.assertFalse(self.binder(PWSH, "GateMeanMaxC", "-1"))
+        self.assertTrue(self.binder(PWSH, "GateMeanMaxC", "88"))
+
+    # ---- A3: a padded numeric string is stored as the number it parses to
+    def test_r3_a3_a_padded_numeric_text_is_stored_as_its_number_and_round_trips_to_the_gate(self) -> None:
+        got = self.reader(PWSH, '{"maxThrottledRows":" 6 ","meanMaxC":" 80 ","sustainedRows":"60","feedStaleSec":" 120"}')
+        self.assertEqual((got["source"], got["maxThrottledRows"], got["meanMaxC"], got["sustainedRows"], got["feedStaleSec"]), ("agent", 6, 80, 60, 120), got)
+        for v in (got["maxThrottledRows"], got["meanMaxC"], got["sustainedRows"], got["feedStaleSec"]):
+            self.assertIsInstance(v, (int, float), got)
+
+    # ---- A4: every admission record carries the rule, the early exits included
+    def test_r3_a4_the_heat_rule_is_on_the_admission_before_any_early_exit_publishes_it(self) -> None:
+        agent = AGENT.read_text(encoding="utf-8")
+        body = agent[agent.index("function Invoke-QueuedJob"):]
+        body = body[body.index("Wait-QuietLeaseAdmission -JobId $jobId"):]   # from the admission's creation on
+        add = body.index("-NotePropertyName heatRule")
+        for needle in ('label -eq "queue-expired"', 'label -eq "cancelled-in-gate"', 'label -eq "expired-not-after"', "Publish-GateUnlaunchedResult", "Invoke-QueueExpiredJob", "Publish-NotAfterExpiredResult"):
+            self.assertLess(add, body.index(needle), f"admission.heatRule is added before {needle}")
+        self.assertEqual(body.count("-NotePropertyName heatRule"), 1)
+        self.assertIn("$env:MLV_AGENT_HEAT_RULE = ($heatRule | ConvertTo-Json -Compress)", body)
+
+
 if __name__ == "__main__":
     unittest.main()
