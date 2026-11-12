@@ -1753,31 +1753,44 @@ function ConvertTo-DvSessionKey {
     return $d
 }
 
+# HFR-NATIVE-M16-1457-GUI-TEXTURE-PRESENT-OFFLOAD-1 r14: the optional log prefix a canonical session record may carry ([utc] [LEVEL] [0xthread] ), shared by
+# every whole-line record pattern Get-DvCanonicalRecordPattern builds.
+$script:DvLogRecordPrefix = '(\[[^\]]*\] \[[A-Za-z]+\] (\[0x[0-9A-Fa-f]+\] )?)?'
+
+function Get-DvCanonicalRecordPattern {
+    <#
+    .SYNOPSIS
+    HFR-NATIVE-M16-1457-GUI-TEXTURE-PRESENT-OFFLOAD-1 r14: the whole-line pattern of a canonical session record, `<optional log prefix><marker> session=<Session>
+    <Fields>` and nothing else. Session and Fields are regex text. One builder, so a reader's own record pattern and the "another session's record" test in
+    Test-DvRecordMentionsSession can never disagree on what canonical means.
+    #>
+    param([Parameter(Mandatory)][string]$Marker, [Parameter(Mandatory)][string]$Session, [Parameter(Mandatory)][string]$Fields)
+    '^' + $script:DvLogRecordPrefix + [regex]::Escape($Marker) + ' session=' + $Session + ' ' + $Fields + '$'
+}
+
 function Test-DvRecordMentionsSession {
     <#
     .SYNOPSIS
-    Does this record body mention the record marker AND the measured session, in any shape (r8: separators, field order)? r12: the session is compared as an INTEGER,
-    never as text, so `session=03`, `session=+3` and `session=003` are the measured session 3 (a record the app never writes, which is why it must make the state
-    unreadable rather than be skipped while a conflicting canonical record passes). A run of more than one sign (`++3`, `+-3`) is read as its magnitude, so it
-    still counts for session 3 and blocks; `-3` is another session. session=31 is not session 3. Pure; shared by the recon_release and prep_route readers.
-    r12 fix 1 (adversary A1 on db8cdfa1): the key may be followed by ANY run of non-word separators (`=`, ` = `, `:`, `="`, `":`, `=[`, a quote), so a quoted or JSON-shaped
-    value is the same session; the key is matched without regard to case; and the value may be a decimal (a Unicode digit, `3.0` and `3e0` read as their leading integer)
-    or a 0x hexadecimal. session_id=3 and sessions=3 are other keys. A word (`three`) names no session.
+    HFR-NATIVE-M16-1457-GUI-TEXTURE-PRESENT-OFFLOAD-1 r14 (r12 keys opus and fable key3 on e19e383d; fable's ruling, adopted by the hub): is this record body a
+    mention of the measured session? The test is INVERTED. A body that carries the marker (case-sensitive, not followed by a word character) is a mention UNLESS
+    the whole body is a canonical record (Get-DvCanonicalRecordPattern with the reader's own Fields) whose session is a plain decimal integer with at most one
+    sign, in ASCII digits, that differs from the measured session as an integer (ConvertTo-DvSessionKey: `03`, `+3` and `-0`/`0` compare by value). So a
+    mention needs no particular spelling of the session at all: any separator (`session -> 3`, `session = + 3`), a quote, a hex or decimal-point value, a digit
+    outside ASCII, a key in another case, a session cut off with the body at its first ` (`, or no session field at all. Anything that is neither the canonical
+    record of another session nor a body without the marker counts for the measured session, so it makes the state unreadable rather than being skipped while
+    a conflicting canonical record passes (fail closed). The only body skipped is the app's own canonical record of another session (`session=4 ...`). Before
+    r14 the helper listed the session spellings it would recognise, and the sixth hole in that list (a + or - in the separator) is why it no longer does.
+    Pure; shared by the recon_release and prep_route readers.
     #>
-    param([AllowNull()][AllowEmptyString()][string]$Body, [Parameter(Mandatory)][string]$Marker, [Parameter(Mandatory)][string]$Session)
+    param([AllowNull()][AllowEmptyString()][string]$Body, [Parameter(Mandatory)][string]$Marker, [Parameter(Mandatory)][string]$Session,
+          [Parameter(Mandatory)][string]$Fields)
     if ([string]::IsNullOrEmpty($Body)) { return $false }
     if ($Body -cnotmatch ('^(?=.*' + [regex]::Escape($Marker) + '(?!\w))')) { return $false }
+    $other = [regex]::Match($Body, (Get-DvCanonicalRecordPattern -Marker $Marker -Session '(?<dvsign>[+\-]?)(?<dvdigits>[0-9]+)' -Fields $Fields))
+    if (-not $other.Success) { return $true }
     $want = $(if ($Session -cmatch '^\d+$') { ConvertTo-DvSessionKey -Sign '' -Digits $Session } else { $Session })
-    foreach ($m in [regex]::Matches($Body, '(?<!\w)(?i:session)[^\w+\-]*(?<sign>[+\-]*)(?:(?<hex>0[xX][0-9A-Fa-f]+)|(?<digits>\d+))')) {
-        $negative = ($m.Groups['sign'].Value -ceq '-')
-        if ($m.Groups['hex'].Success) {
-            $value = [System.Numerics.BigInteger]::Parse('0' + $m.Groups['hex'].Value.Substring(2), [System.Globalization.NumberStyles]::AllowHexSpecifier, [System.Globalization.CultureInfo]::InvariantCulture)
-            $key = ConvertTo-DvSessionKey -Sign $(if ($negative) { '-' } else { '' }) -Digits $value.ToString([System.Globalization.CultureInfo]::InvariantCulture)
-        }
-        else { $key = ConvertTo-DvSessionKey -Sign $(if ($negative) { '-' } else { '' }) -Digits $m.Groups['digits'].Value }
-        if ($key -ceq $want) { return $true }
-    }
-    return $false
+    $key = ConvertTo-DvSessionKey -Sign $other.Groups['dvsign'].Value -Digits $other.Groups['dvdigits'].Value
+    return ($key -ceq $want)
 }
 
 function Get-DvPrepConflatedMoveEvidence {
@@ -1810,12 +1823,12 @@ function Get-DvPrepConflatedMoveEvidence {
     if (-not [string]::IsNullOrEmpty($LogText)) {
         $session = (Get-DvSmokeSummaryFields -LogText $LogText).session
         if ($null -ne $session) {
-            $whole = '^(\[[^\]]*\] \[[A-Za-z]+\] (\[0x[0-9A-Fa-f]+\] )?)?playback_smoke\.prep_route session=' + [regex]::Escape([string]$session) +
-                ' prep_conflated_move_active=(?<v>[01])$'
-            # r8 (adversary A1 sibling): any record body naming the marker and the measured session is a mention, whatever the separators or field order.
-            # r12 (adversary A1 on 4a61e684): the session is compared as an integer (Test-DvRecordMentionsSession), so `session=03` / `session=+3` are this session.
+            $fields = 'prep_conflated_move_active=(?<v>[01])'
+            $whole = Get-DvCanonicalRecordPattern -Marker 'playback_smoke.prep_route' -Session ([regex]::Escape([string]$session)) -Fields $fields
+            # r14 (r12 keys on e19e383d): a mention is any record body that carries the marker and is not the whole-line canonical record of ANOTHER session
+            # (Test-DvRecordMentionsSession, inverted), so no spelling of the measured session, and no record without one, is ever skipped.
             foreach ($l in (Get-DvLogRecordBodies -LogText $LogText)) {
-                if (-not (Test-DvRecordMentionsSession -Body $l -Marker 'playback_smoke.prep_route' -Session ([string]$session))) { continue }
+                if (-not (Test-DvRecordMentionsSession -Body $l -Marker 'playback_smoke.prep_route' -Session ([string]$session) -Fields $fields)) { continue }
                 $mentions++
                 $m = [regex]::Match($l, $whole)
                 if ($m.Success) { $records++; $observed = [int]$m.Groups['v'].Value }
@@ -1865,16 +1878,15 @@ function Get-DvReconReleaseDeferredEvidence {
     if (-not [string]::IsNullOrEmpty($LogText)) {
         $session = (Get-DvSmokeSummaryFields -LogText $LogText).session
         if ($null -ne $session) {
-            $whole = '^(\[[^\]]*\] \[[A-Za-z]+\] (\[0x[0-9A-Fa-f]+\] )?)?playback_smoke\.recon_release session=' + [regex]::Escape([string]$session) +
-                ' deferred_enabled=(?<v>[01]) deferred=(?<deferred>0|[1-9][0-9]{0,18}) sync=(?<sync>0|[1-9][0-9]{0,18}) drained=(?<drained>0|[1-9][0-9]{0,18})' +
-                ' max_depth=(?<depth>0|[1-9][0-9]{0,8}) outstanding_at_stop=(?<outstanding>0|[1-9][0-9]{0,8})$'
-            # r8 (adversary A1 on ea16773f): a mention is ANY record body that names the marker and the measured session, whatever the separators or field order
-            # (double space, TAB, punctuation, `session = 3`, session after another field), so a noncanonical duplicate is counted and makes the state
-            # unreadable rather than being skipped while a conflicting canonical record passes. session=31 is not session 3. r8 fix 2 (adversary A1 on 17f3ed8e):
-            # the two facts are independent lookaheads, so the session may come BEFORE the marker too (`session=3 playback_smoke.recon_release ...`).
-            # r12 (adversary A1 on 4a61e684): the session is compared as an integer (Test-DvRecordMentionsSession), so `session=03` / `session=+3` are this session.
+            $fields = 'deferred_enabled=(?<v>[01]) deferred=(?<deferred>0|[1-9][0-9]{0,18}) sync=(?<sync>0|[1-9][0-9]{0,18}) drained=(?<drained>0|[1-9][0-9]{0,18})' +
+                ' max_depth=(?<depth>0|[1-9][0-9]{0,8}) outstanding_at_stop=(?<outstanding>0|[1-9][0-9]{0,8})'
+            $whole = Get-DvCanonicalRecordPattern -Marker 'playback_smoke.recon_release' -Session ([regex]::Escape([string]$session)) -Fields $fields
+            # r14 (r12 keys opus and fable key3 on e19e383d): a mention is ANY record body that carries the marker, whatever it says about the session (any
+            # separator, sign, quote, field order, the session before the marker, a cut body, no session at all), UNLESS the whole body is the canonical record
+            # of ANOTHER session (`session=31 ...`, `session=4 ...`): Test-DvRecordMentionsSession is inverted, so a noncanonical duplicate is counted and makes
+            # the state unreadable rather than being skipped while a conflicting canonical record passes. Only the canonical whole line ($whole) is ever read.
             foreach ($l in (Get-DvLogRecordBodies -LogText $LogText)) {
-                if (-not (Test-DvRecordMentionsSession -Body $l -Marker 'playback_smoke.recon_release' -Session ([string]$session))) { continue }
+                if (-not (Test-DvRecordMentionsSession -Body $l -Marker 'playback_smoke.recon_release' -Session ([string]$session) -Fields $fields)) { continue }
                 $mentions++
                 $m = [regex]::Match($l, $whole)
                 if ($m.Success) {

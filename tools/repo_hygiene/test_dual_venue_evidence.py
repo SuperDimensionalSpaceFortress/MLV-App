@@ -5541,6 +5541,35 @@ def run_pwsh_json(script: str, **env: str):
         return proc, None
 
 
+def run_pwsh_evidence_cases(function: str, cases: list[tuple[dict, str]]) -> tuple[subprocess.CompletedProcess, list | None]:
+    """One pwsh for a whole table of (spec, log) cases of a pure evidence reader (`function -Spec -LogText`), results in input order. The cases go through a
+    UTF-8 JSON file (ASCII-escaped, so a surrogate-pair digit survives), not the environment, whose 32 KB limit a table can pass."""
+    with tempfile.TemporaryDirectory() as d:
+        path = Path(d) / "cases.json"
+        path.write_text(json.dumps([{"spec": spec, "log": log} for spec, log in cases]), encoding="utf-8")
+        return run_pwsh_json("$cases = Get-Content -Raw -LiteralPath $env:DVE_CASES -Encoding utf8 | ConvertFrom-Json\n"
+                             f"@($cases | ForEach-Object {{ {function} -Spec $_.spec -LogText ([string]$_.log) }}) | ConvertTo-Json -Compress -Depth 5 -AsArray",
+                             DVE_CASES=str(path))
+
+
+# HFR-NATIVE-M16-1457-GUI-TEXTURE-PRESENT-OFFLOAD-1 r14 (r12 keys opus and fable key3 on e19e383d): the r12 mention helper listed the spellings of a session it
+# would recognise, and a + or - in the separator run that did not touch the digits (`session -> 3`, `session - 3`, `session = + 3`) matched none of them, so a
+# conflicting duplicate read HONOURED. It was the sixth spelling of one class, so the test is now INVERTED: a body that carries the marker is a mention of the
+# measured session unless it is a whole-line canonical record of a DIFFERENT session. No spelling is skipped: signs and arrows in the separator, a digit stored
+# as a surrogate pair, a body cut at its first ` (`, a record with no session at all. Each mangle rewrites the canonical `session=3 ` of a record.
+SESSION_SEPARATOR_SPELLINGS = (("an arrow", lambda r: r.replace("session=3 ", "session -> 3 ")),
+                               ("an arrow, no spaces", lambda r: r.replace("session=3 ", "session->3 ")),
+                               ("a spaced minus", lambda r: r.replace("session=3 ", "session - 3 ")),
+                               ("equals then a spaced plus", lambda r: r.replace("session=3 ", "session = + 3 ")),
+                               ("equals, a plus, then a space", lambda r: r.replace("session=3 ", "session=+ 3 ")),
+                               ("colon, a minus-plus run, then a leading zero", lambda r: r.replace("session=3 ", "session: -+ 03 ")),
+                               ("a fat arrow", lambda r: r.replace("session=3 ", "session=>3 ")),
+                               ("a mathematical bold digit (a surrogate pair)", lambda r: r.replace("session=3 ", "session=\U0001D7D1 ")),
+                               ("the session in parentheses (the body is cut at its first ' (')", lambda r: r.replace("session=3 ", "(session=3) ")),
+                               ("no session field at all", lambda r: r.replace("session=3 ", "")),
+                               ("a culture-folded key (dotless i)", lambda r: r.replace("session=3 ", "SESSıON=3 ")))
+
+
 class _ScaleLabelHeaderMixin:
     """Reads the one mapping (PlaybackScaleLabel::resolutionLabel) out of the C++ header for both mirror test classes below."""
 
@@ -12745,20 +12774,46 @@ class ReconReleaseDeferredEvidenceTests(unittest.TestCase):
         self.assertEqual((v["verdict"], v["blocks"], v["observed"]), ("NOT_HONOURED", True, None), v)
 
     def test_a_different_integer_is_another_session_in_every_spelling(self) -> None:
+        # r14: only a whole-line CANONICAL record (a plain, optionally signed decimal session) is ever read as another session; see the test below for the rest.
         for name, record in (("session 31", self.record("0", session=31)), ("session +31", self.record("0", session="+31")), ("session 031", self.record("0", session="031")),
                              ("session -3", self.record("0", session="-3")), ("session +2", self.record("0", session="+2")), ("session 02", self.record("0", session="02")),
-                             ("quoted 2", self.record("0", session='"2"')), ("quoted 31", self.record("0", session='"31"')), ("hex 2", self.record("0", session="0x2")),
-                             ("hex 1f (31)", self.record("0", session="0x1f")), ("session 30", self.record("0", session=30)), ("a word", self.record("0", session="three"))):
+                             ("session 30", self.record("0", session=30)), ("session 4", self.record("0", session=4)), ("session -0", self.record("0", session="-0")),
+                             ("session 4, prefixed", self.PREFIX + self.record("0", session=4)),
+                             ("session 4, prefixed, with a Qt location", self.PREFIX + self.record("0", session=4) + " (MainWindow.cpp:31700)")):
             with self.subTest(case=name):
                 v = self.verdict({}, self.log(self.record("1"), record))
                 self.assertEqual((v["verdict"], v["blocks"], v["observed"]), ("NOT_REQUESTED", False, 1), v)
 
-    def test_another_sessions_noncanonical_record_is_not_a_mention(self) -> None:
-        # The widening is scoped to the measured session: session=31 or session=2 in any shape is another session, never this one's record.
-        for name, record in (("session 31", self.record("0", session=31)), ("session 2, double space", self.record("0", session=2).replace(" session=", "  session="))):
+    def test_another_sessions_noncanonical_record_is_a_mention_that_blocks(self) -> None:
+        # r14 (fable key3 on e19e383d, adopted by the hub): the inversion. A marker-bearing body that is not a whole-line canonical record is a mention whatever
+        # session it seems to name, so it makes the state unreadable (fails closed). The app writes every record canonically (MainWindow.cpp `session=%1` from
+        # an unsigned integer), so this only ever blocks a garbled or forged log. Before r14 these rows read NOT_REQUESTED.
+        cases = [(name, record) for name, record in (("session 2, double space", self.record("0", session=2).replace(" session=", "  session=")),
+                                                     ("quoted 2", self.record("0", session='"2"')), ("quoted 31", self.record("0", session='"31"')),
+                                                     ("hex 2", self.record("0", session="0x2")), ("hex 1f (31)", self.record("0", session="0x1f")),
+                                                     ("a word", self.record("0", session="three")), ("an arrow to 4", self.record("0", session="4").replace("session=4", "session -> 4")),
+                                                     ("session 4 with a trailing field", self.record("0", session=4) + " extra=1"))]
+        proc, out = run_pwsh_evidence_cases("Get-DvReconReleaseDeferredEvidence", [({}, self.log(self.record("1"), record)) for _, record in cases])
+        self.assertIsNotNone(out, proc.stdout + proc.stderr)
+        for (name, _), v in zip(cases, out, strict=True):
             with self.subTest(case=name):
-                v = self.verdict({}, self.log(self.record("1"), record))
-                self.assertEqual((v["verdict"], v["blocks"], v["observed"]), ("NOT_REQUESTED", False, 1), v)
+                self.assertEqual((v["verdict"], v["blocks"], v["observed"]), ("NOT_HONOURED", True, None), v)
+                self.assertIn("unreadable", v["reason"])
+
+    def test_any_marker_bearing_spelling_of_the_measured_session_is_a_mention(self) -> None:
+        # r14 (r12 keys opus and fable key3 on e19e383d): every row, the r12 numeric and r8 separator rows included, beside a conflicting canonical record and
+        # alone, for the leg that asks and the one that does not. One pwsh for the whole table.
+        cases = []
+        for name, mangle in SESSION_SEPARATOR_SPELLINGS + self.NUMERIC_SPELLINGS + self.NONCANONICAL:
+            for spec, canonical, conflicting in ((self.OFF, self.record("0", deferred="0"), self.record("1")), ({}, self.record("1"), self.record("0", deferred="0"))):
+                cases.append((f"{name} / beside a canonical record / {'asks' if spec else 'does not ask'}", spec, self.log(canonical, mangle(conflicting))))
+                cases.append((f"{name} / alone / {'asks' if spec else 'does not ask'}", spec, self.log(mangle(conflicting))))
+        proc, out = run_pwsh_evidence_cases("Get-DvReconReleaseDeferredEvidence", [(spec, log) for _, spec, log in cases])
+        self.assertIsNotNone(out, proc.stdout + proc.stderr)
+        for (name, _, _), v in zip(cases, out, strict=True):
+            with self.subTest(case=name):
+                self.assertEqual((v["verdict"], v["blocks"], v["observed"]), ("NOT_HONOURED", True, None), v)
+                self.assertIn("unreadable", v["reason"])
 
     def test_the_head_arm_reads_its_counts(self) -> None:
         v = self.verdict({}, self.log(self.record("1", deferred="412")))
@@ -12917,11 +12972,42 @@ class PrepConflatedMoveEvidenceTests(unittest.TestCase):
                         self.assertIn("unreadable", v["reason"])
 
     def test_a_different_integer_is_another_session_in_every_spelling(self) -> None:
-        for name, session in (("31", "31"), ("+31", "+31"), ("031", "031"), ("-3", "-3"), ("+2", "+2"), ("02", "02"), ('quoted 2', '"2"'), ("quoted 31", '"31"'),
-                              ("hex 2", "0x2"), ("hex 1f (31)", "0x1f"), ("30", "30"), ("a word", "three")):
+        # r14: only a whole-line CANONICAL record (a plain, optionally signed decimal session) is ever read as another session; see the test below for the rest.
+        for name, record in (("31", self.route("1", session="31")), ("+31", self.route("1", session="+31")), ("031", self.route("1", session="031")),
+                             ("-3", self.route("1", session="-3")), ("+2", self.route("1", session="+2")), ("02", self.route("1", session="02")),
+                             ("30", self.route("1", session="30")), ("4", self.route("1", session="4")), ("-0", self.route("1", session="-0")),
+                             ("4, prefixed", self.PREFIX + self.route("1", session="4")),
+                             ("4, prefixed, with a Qt location", self.PREFIX + self.route("1", session="4") + " (MainWindow.cpp:25848)")):
             with self.subTest(case=name):
-                v = self.verdict({}, self.log(self.route("0"), self.route("1", session=session)))
+                v = self.verdict({}, self.log(self.route("0"), record))
                 self.assertEqual((v["verdict"], v["blocks"], v["observed"]), ("NOT_REQUESTED", False, 0), v)
+
+    def test_another_sessions_noncanonical_record_is_a_mention_that_blocks(self) -> None:
+        # r14 (fable key3 on e19e383d): the inversion, as in the recon_release reader. Before r14 these rows read NOT_REQUESTED.
+        cases = [("double space, 2", self.route("1", session="2").replace(" session=", "  session=")), ("quoted 2", self.route("1", session='"2"')),
+                 ("quoted 31", self.route("1", session='"31"')), ("hex 2", self.route("1", session="0x2")), ("hex 1f (31)", self.route("1", session="0x1f")),
+                 ("a word", self.route("1", session="three")), ("an arrow to 4", self.route("1", session="4").replace("session=4", "session -> 4")),
+                 ("4 with a trailing field", self.route("1", session="4") + " extra=1")]
+        proc, out = run_pwsh_evidence_cases("Get-DvPrepConflatedMoveEvidence", [({}, self.log(self.route("0"), record)) for _, record in cases])
+        self.assertIsNotNone(out, proc.stdout + proc.stderr)
+        for (name, _), v in zip(cases, out, strict=True):
+            with self.subTest(case=name):
+                self.assertEqual((v["verdict"], v["blocks"], v["observed"]), ("NOT_HONOURED", True, None), v)
+                self.assertIn("unreadable", v["reason"])
+
+    def test_any_marker_bearing_spelling_of_the_measured_session_is_a_mention(self) -> None:
+        # r14 (r12 keys on e19e383d, prep_route sibling): every row, the r12 numeric rows included, beside a conflicting canonical record and alone, for both legs.
+        cases = []
+        for name, mangle in SESSION_SEPARATOR_SPELLINGS + self.NUMERIC_SPELLINGS:
+            for spec, canonical, conflicting in ((self.ON, self.route("1"), self.route("0")), ({}, self.route("0"), self.route("1"))):
+                cases.append((f"{name} / beside a canonical record / {'asks' if spec else 'does not ask'}", spec, self.log(canonical, mangle(conflicting))))
+                cases.append((f"{name} / alone / {'asks' if spec else 'does not ask'}", spec, self.log(mangle(conflicting))))
+        proc, out = run_pwsh_evidence_cases("Get-DvPrepConflatedMoveEvidence", [(spec, log) for _, spec, log in cases])
+        self.assertIsNotNone(out, proc.stdout + proc.stderr)
+        for (name, _, _), v in zip(cases, out, strict=True):
+            with self.subTest(case=name):
+                self.assertEqual((v["verdict"], v["blocks"], v["observed"]), ("NOT_HONOURED", True, None), v)
+                self.assertIn("unreadable", v["reason"])
 
     def test_a_start_line_field_is_never_read_as_engagement(self) -> None:
         # r2 (adversary A1): the start line carries launcher env values, so a field there is not the app's decision.
