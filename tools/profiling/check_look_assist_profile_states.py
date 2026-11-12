@@ -33,8 +33,12 @@ than master in any render state":
   the SHA-256 of the PNG bytes equals final_sha256, and the frame and exposure match the application. An arm with no
   picture_dump line at all is UNBOUND_LEGACY: a failure unless --allow-unbound-legacy, which reports it as such, never PASS.
   A log line is the event named by its first `interaction_trace event=` token, its fields are its whitespace-delimited
-  key=value pairs taken exactly once (integers -?[0-9]{1,9}); an incomplete or ambiguous result is "no complete apply", and
-  a line with no event marker keeps its decision reading but never owns a picture_dump line.
+  key=value pairs taken exactly once; every field the app prints on auto_wb / result / async_dispatch / auto_wb_async_applied /
+  picture_dump is typed by ONE table (AUTO_WB_FIELDS ... DUMP_FIELDS, derived from the app's format strings and pinned to them by
+  a test): a field that is present and not its type (NaN, empty, fractional, signed frame, huge digit string...) makes the event
+  malformed in EVERY mode, --decisions-only included, whether or not this checker reads the field. An incomplete, malformed or
+  ambiguous result is "no complete apply", and a line with no event marker keeps its decision reading but never owns a
+  picture_dump line.
 
 usage: check_look_assist_profile_states.py <root> --tag TAG [--clips a,b] [--deck-chroma-max X] [--require-daylight]
            [--master-tolerance X] [--subject-sha SHA] [--exe PATH] [--decisions-only] [--allow-unbound-legacy]
@@ -60,7 +64,7 @@ MASTER_PICTURE = os.path.join("pic", "state-master.png")
 # applies to it: a name spelled out inside another event's field is no evidence (adversary r2 A3). A line with NO such
 # marker (event=None, the back-compat reading) is read by the name appearing in it: it keeps its decision reading but
 # never owns a picture_dump line (adversary r2 A1). The fields of a line are its whitespace-delimited key=value pairs,
-# each taken exactly once, integers as -?[0-9]{1,9}; anything else is "no complete apply" (fail closed), never the
+# each taken exactly once and typed by the field table below; anything else is "no complete apply" (fail closed), never the
 # parse of a prefix or a shadow token (adversary r2 A2/A6).
 RESULT_EVENT = "look_assist.apply.result"
 ASYNC_APPLIED_EVENT = "look_assist.apply.auto_wb_async_applied"
@@ -73,8 +77,70 @@ SKIP_EVENT = "look_assist.apply.skip"
 FALLBACK_EVENT = "look_assist.daylight_fallback_to_master"
 EVENT_NAME = {name: re.compile(re.escape(name) + r"\b") for name in (
     RESULT_EVENT, ASYNC_APPLIED_EVENT, AUTO_WB_EVENT, ASYNC_DISPATCH_EVENT, SAFETY_FALLBACK_EVENT, SKIP_EVENT, FALLBACK_EVENT)}
-INT_FIELD = re.compile(r"-?[0-9]{1,9}")
-DAMPING_FIELD = re.compile(r"-?[0-9]{1,9}\.[0-9]{3}")       # the app logs damping as %.3f (MainWindow.cpp, .arg(damping, 0, 'f', 3))
+# THE FIELD TABLE (r5, sol key on 41f96076 B1/B2). Every field the app prints on an event this checker reads is listed here with
+# the type its format string gives it, derived from the emitters (platform/qt/MainWindow.cpp: auto_wb, result, async_dispatch,
+# auto_wb_async_applied; src/batch/LookAssistAnalysis.cpp: lookAssistDecisionLogFields, lookAssistPictureDumpFields). A field that
+# is PRESENT must match its type whether or not this checker reads it, and a value that does not makes the event malformed (the
+# arm is refused), never a field that is skipped over. A field that is ABSENT is an older recorded build's line (the recorded run
+# predates the decision fields and the dump): only the fields a reading below needs are required, and each reading says so.
+INT = r"0|-?[1-9][0-9]{0,8}"                  # %1 of an int: canonical decimal; never NaN, a fraction, a zero pad or a huge string
+UINT = r"0|[1-9][0-9]{0,8}"                   # a frame, a count, a size: never negative
+UINT64 = r"0|[1-9][0-9]{0,19}"                # a qulonglong serial
+TYPE_PATTERNS = {
+    "int": INT,
+    "uint": UINT,
+    "uint64": UINT64,
+    "bool01": r"[01]",
+    "fixed3": r"-?(?:0|[1-9][0-9]{0,8})\.[0-9]{3}",       # .arg(x, 0, 'f', 3); damping is logged this way
+    "fixed6": r"-?(?:0|[1-9][0-9]{0,8})\.[0-9]{6}",       # .arg(x, 0, 'f', 6)
+    "word": r"\S+",                                       # an enum / name the checker compares itself (never empty)
+    "dims": r"(?:%s)x(?:%s)" % (UINT, UINT),              # %1x%2
+    "ratio": r"(?:%s)/(?:%s)" % (INT, INT),               # %1/%2 of two ints
+    "sha256": r"[0-9a-fA-F]{64}",
+    "safety": r"keep|retreat|revert",
+    "ev100_source": r"recorded|aperture_bound|none",
+    "post_walk_branch": r"none|steps|cleanup|recovery",
+}
+TYPE_PATTERNS["fixed3|NA"] = TYPE_PATTERNS["fixed3"] + "|NA"
+TYPE_PATTERNS["ratio|NA"] = TYPE_PATTERNS["ratio"] + "|NA"
+TYPE_PATTERNS["uint|NA"] = UINT + "|NA"
+TYPE_PATTERNS["sha256|none"] = TYPE_PATTERNS["sha256"] + "|none"
+TYPE_PATTERNS["pre_safety_png|none"] = r"look-assist-pre-safety-frame[0-9]{1,9}\.png|none"
+TYPE_PATTERNS["final_png|none"] = r"look-assist-final-frame[0-9]{1,9}\.png|none"
+TYPES = {name: re.compile(pattern) for name, pattern in TYPE_PATTERNS.items()}
+INT_FIELD = TYPES["int"]
+DAMPING_FIELD = TYPES["fixed3"]
+DIGITS = TYPES["uint"]                    # a frame number; never an arbitrarily long digit string, never negative
+
+AUTO_WB_FIELDS = {"valid": "bool01", "source": "word", "decision": "word", "damping": "fixed3", "raw_x": "int", "raw_y": "int",
+                  "patch_luma": "fixed3", "patch_chroma": "fixed3", "patch_green_axis": "fixed3", "patch_blue_amber_axis": "fixed3",
+                  "base_temp": "int", "base_tint": "int", "candidate_temp": "int", "candidate_tint": "int",
+                  "awb_temp": "int", "awb_tint": "int", "final_temp_delta": "int", "final_tint_delta": "int"}
+# lookAssistDecisionLogFields, which the app appends to the result line
+DECISION_FIELDS = {"has_ev100": "bool01", "ev100": "fixed3|NA", "daylight_gate": "word", "post_walk_ran": "bool01",
+                   "post_walk_branch": "post_walk_branch", "post_walk_recovery": "ratio|NA", "display_meter_ran": "bool01",
+                   "playback_scale": "uint|NA", "ev100_bound": "fixed3|NA", "ev100_source": "ev100_source",
+                   "surface_search": "word", "surface_search_balance": "ratio|NA"}
+RESULT_FIELDS = dict({"analysis": "word", "scene": "word", "median": "fixed3", "p05": "fixed3", "p95": "fixed3", "p99": "fixed3",
+                      "clip_low": "fixed6", "clip_high": "fixed6", "balance_samples": "int", "preset_exp": "int",
+                      "preset_contrast": "int", "preset_pivot": "int", "preset_shadows": "int", "preset_highlights": "int",
+                      "preset_vibrance": "int", "preset_temp_delta": "int", "preset_tint_delta": "int", "final_temp": "int",
+                      "final_tint": "int", "thumb": "dims", "downscale": "int", "color_thumb": "dims", "color_downscale": "int",
+                      "frame": "uint", "last_serial": "uint64", "last_frame": "int", "next_serial": "uint64", "flavor": "word",
+                      "grade": "word"}, **DECISION_FIELDS)
+DISPATCH_FIELDS = {"generation": "int", "frame": "uint", "scene": "word", "floor_lifted": "bool01", "flavor": "word", "grade": "word"}
+APPLIED_FIELDS = {"generation": "int", "valid": "bool01", "source": "word", "decision": "word", "damping": "fixed3",
+                  "awb_temp": "int", "awb_tint": "int", "final_temp": "int", "final_tint": "int", "preset_exp": "int", "frame": "uint"}
+DUMP_FIELDS = {"pre_safety": "pre_safety_png|none", "pre_safety_sha256": "sha256|none", "pre_safety_exposure": "int",
+               "final": "final_png|none", "final_sha256": "sha256|none", "final_exposure": "int", "safety": "safety", "frame": "uint"}
+
+
+def bad_fields(table, pairs):
+    """-> the names of the fields of `pairs` whose value does not match the type `table` gives them (every occurrence of a name).
+    A name the table does not list is the line's own and not ours to type; a name given twice is the caller's ambiguity check."""
+    return sorted({key for key, value in pairs if key in table and not TYPES[table[key]].fullmatch(value)})
+
+
 # What one application's result sets, plus the two markers of its identity: "closed" (a result / applied line completed it, so
 # the next one must bring its own evidence, never borrow this one's) and "generation" (the dispatch's, which the applied event
 # of the same application must repeat). A new application (auto_wb, dispatch) starts without any of them.
@@ -104,7 +170,6 @@ DUMP_EVENT = "look_assist.apply.picture_dump"
 # whitespace): the duplicate check runs over all of them BEFORE any consumer looks up the lower-case names it knows, so a
 # repeated "Audit=" or "audit-note=" is as ambiguous as a repeated "audit=" (sol, PR #799 r3 INV-1).
 FIELD = re.compile(r"(?<!\S)([^\s=]+)=(\S*)")
-DIGITS = re.compile(r"[0-9]{1,9}")      # a frame number; never an arbitrarily long digit string
 FINAL_PICTURE_NAME = re.compile(r"^look-assist-final-frame(\d+)\.png$")
 
 
@@ -165,6 +230,9 @@ def parse_log_text(text):
             fields = dict(pairs)
             if has_duplicate_key(pairs):
                 fields["_duplicate_key"] = "1"      # a key given twice is ambiguous, never a binding
+            bad = bad_fields(DUMP_FIELDS, pairs)
+            if bad:
+                fields["_malformed"] = ",".join(bad)      # a field of the app's dump line that is not its type: never a binding
             pending_dump = newest_dump = fields
             dump_lines += 1
             continue
@@ -178,7 +246,7 @@ def parse_log_text(text):
             # applied event must repeat: another generation's application is not this dispatch's (adversary r3 A2). The
             # app always logs the analysed frame as an integer (adversary r3 A1, pass on 5cb9b1a9).
             frame = once("frame")
-            if (scene and frame is not None and INT_FIELD.fullmatch(frame) and (generation is None or INT_FIELD.fullmatch(generation))
+            if (scene and frame is not None and not bad_fields(DISPATCH_FIELDS, pairs)      # every field the app prints, typed
                     and once("floor_lifted") in ("0", "1")):      # bool01, always logged by the dispatch
                 receipt = {"scene": scene, "generation": generation, "dispatch_frame": frame}      # the applied event repeats both
             else:
@@ -188,7 +256,8 @@ def parse_log_text(text):
         if is_event(AUTO_WB_EVENT):
             valid, source, decision = once("valid"), once("source"), once("decision")
             damping = once("damping")      # always logged, as %.3f
-            if valid not in ("0", "1") or not source or not decision or damping is None or not DAMPING_FIELD.fullmatch(damping):      # bool01: 0 or 1
+            if (valid not in ("0", "1") or not source or not decision or damping is None      # bool01: 0 or 1
+                    or not DAMPING_FIELD.fullmatch(damping) or bad_fields(AUTO_WB_FIELDS, pairs)):      # every field the app prints, typed
                 receipt = {"malformed_event": AUTO_WB_EVENT}
             else:
                 base = receipt or {}
@@ -201,7 +270,7 @@ def parse_log_text(text):
             continue
         if is_event(RESULT_EVENT):
             scene, exposure, temperature, tint = once("scene"), int_once("preset_exp"), int_once("final_temp"), int_once("final_tint")
-            if not scene or None in (exposure, temperature, tint):
+            if not scene or None in (exposure, temperature, tint) or bad_fields(RESULT_FIELDS, pairs):      # every field the app prints, typed
                 receipt = {"malformed_event": RESULT_EVENT}     # an incomplete result is no apply, never an earlier receipt
                 pending_dump = None
                 continue
@@ -220,7 +289,7 @@ def parse_log_text(text):
             valid = once("valid")      # the 0/1 flag the app logs (bool01), as auto_wb's; and the awb_* pair, as integers
             if (not source or not decision or None in (temperature, tint, exposure)
                     or valid not in ("0", "1") or None in (int_once("awb_temp"), int_once("awb_tint"))
-                    or once("damping") is None or not DAMPING_FIELD.fullmatch(once("damping"))
+                    or once("damping") is None or not DAMPING_FIELD.fullmatch(once("damping")) or bad_fields(APPLIED_FIELDS, pairs)
                     or base.get("dispatch_frame") != once("frame")      # the frame its own dispatch analysed, each given once
                     or base.get("generation") != once("generation")):      # the generation of ITS OWN dispatch, each given once
                 receipt = {"malformed_event": ASYNC_APPLIED_EVENT}
@@ -333,6 +402,8 @@ def check_picture_binding(name, receipt, png_path, png_bytes, allow_legacy=False
     missing = [k for k in ("final", "final_sha256", "final_exposure", "frame") if k not in dump]
     if missing:
         return "stale", ["%s: STALE - the picture_dump line lacks %s" % (name, ", ".join(missing))]
+    if dump.get("_malformed"):
+        return "stale", ["%s: STALE - the picture_dump line has a field that is not the type the app prints (%s)" % (name, dump["_malformed"])]
     if dump["final"] == "none" or dump["final_sha256"] == "none":
         return "stale", ["%s: STALE - the picture_dump line says final=none: the app wrote no %s for this application, so a "
                          "readable file of that name is left over from another run" % (name, os.path.basename(png_path))]

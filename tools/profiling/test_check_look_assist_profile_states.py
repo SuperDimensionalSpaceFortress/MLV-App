@@ -6,6 +6,8 @@ import hashlib
 import io
 import json
 import os
+import re
+import shutil
 import struct
 import tempfile
 import unittest
@@ -603,7 +605,10 @@ class PictureDumpBindingAdversaryR2(unittest.TestCase):
         root = self.bound(lambda sha: AUTO_WB_LINE + dump_line(sha) + result_line().replace("frame=0", "frame=" + "9" * 4301))
         code, text = run_checker([root, "--tag", "t"])
         self.assertEqual(1, code, text)
-        self.assertIn("STALE", text)
+        # r5: the result's frame is validated when the line is read (every mode), so a huge frame is a malformed result
+        # (no complete apply) before the binding is reached; either way the arm is refused and nothing binds.
+        self.assertRegex(text, "STALE|no complete Look Assist apply")
+        self.assertNotIn("picture_dump-bound", text)
 
 
 class PictureDumpBindingAdversaryR3(unittest.TestCase):
@@ -999,6 +1004,220 @@ class PngReader(unittest.TestCase):
                 handle.write(b"not a png")
             with self.assertRaises(ValueError):
                 look_assist_png.read_png_rgb(path)
+
+
+# ---- r5 (sol key on 41f96076, B1 + B2): ONE table of the fields the app prints, checked for every event in every mode ----
+# These lines carry EVERY field the app's format strings print (platform/qt/MainWindow.cpp auto_wb / result / async_dispatch /
+# auto_wb_async_applied, src/batch/LookAssistAnalysis.cpp lookAssistDecisionLogFields / lookAssistPictureDumpFields), written out
+# here independently of the checker's table; TableDrift proves the two agree with each other and with the app's source.
+FULL_AUTO_WB = ("look_assist.apply.auto_wb valid=1 source=rendered-neutral-patch decision=accepted damping=1.000 raw_x=40 raw_y=20 "
+                "patch_luma=0.520 patch_chroma=0.010 patch_green_axis=0.001 patch_blue_amber_axis=-0.002 base_temp=6000 base_tint=0 "
+                "candidate_temp=8950 candidate_tint=-35 awb_temp=8950 awb_tint=-35 final_temp_delta=2950 final_tint_delta=-35")
+FULL_RESULT = ("look_assist.apply.result analysis=raw scene=shade median=37.000 p05=35.000 p95=37.000 p99=38.000 clip_low=0.000000 "
+               "clip_high=0.000000 balance_samples=40680 preset_exp=160 preset_contrast=15 preset_pivot=46 preset_shadows=32 "
+               "preset_highlights=-26 preset_vibrance=3 preset_temp_delta=2950 preset_tint_delta=-35 final_temp=8950 final_tint=-35 "
+               "thumb=180x226 downscale=10 color_thumb=602x756 color_downscale=3 frame=0 last_serial=1 last_frame=0 next_serial=2 "
+               "has_ev100=1 ev100=12.345 daylight_gate=open post_walk_ran=1 post_walk_branch=recovery post_walk_recovery=-100/5 "
+               "display_meter_ran=0 playback_scale=NA ev100_bound=NA ev100_source=recorded surface_search=converged "
+               "surface_search_balance=8950/-35 flavor=classic grade=none")
+FULL_DISPATCH = "look_assist.apply.async_dispatch generation=3 frame=0 scene=shade floor_lifted=0 flavor=classic grade=none"
+FULL_APPLIED = ("look_assist.apply.auto_wb_async_applied generation=3 valid=1 source=processed-neutral-patch decision=accepted "
+                "damping=1.000 awb_temp=9990 awb_tint=-35 final_temp=9990 final_tint=-35 preset_exp=160 frame=0")
+FIELD_TYPES = {
+    "auto_wb": {"valid": "bool01", "source": "word", "decision": "word", "damping": "fixed3", "raw_x": "int", "raw_y": "int",
+                "patch_luma": "fixed3", "patch_chroma": "fixed3", "patch_green_axis": "fixed3", "patch_blue_amber_axis": "fixed3",
+                "base_temp": "int", "base_tint": "int", "candidate_temp": "int", "candidate_tint": "int", "awb_temp": "int",
+                "awb_tint": "int", "final_temp_delta": "int", "final_tint_delta": "int"},
+    "result": {"analysis": "word", "scene": "word", "median": "fixed3", "p05": "fixed3", "p95": "fixed3", "p99": "fixed3",
+               "clip_low": "fixed6", "clip_high": "fixed6", "balance_samples": "int", "preset_exp": "int", "preset_contrast": "int",
+               "preset_pivot": "int", "preset_shadows": "int", "preset_highlights": "int", "preset_vibrance": "int",
+               "preset_temp_delta": "int", "preset_tint_delta": "int", "final_temp": "int", "final_tint": "int", "thumb": "dims",
+               "downscale": "int", "color_thumb": "dims", "color_downscale": "int", "frame": "uint", "last_serial": "uint64",
+               "last_frame": "int", "next_serial": "uint64", "has_ev100": "bool01", "ev100": "fixed3|NA", "daylight_gate": "word",
+               "post_walk_ran": "bool01", "post_walk_branch": "post_walk_branch", "post_walk_recovery": "ratio|NA",
+               "display_meter_ran": "bool01", "playback_scale": "uint|NA", "ev100_bound": "fixed3|NA",
+               "ev100_source": "ev100_source", "surface_search": "word", "surface_search_balance": "ratio|NA", "flavor": "word",
+               "grade": "word"},
+    "dispatch": {"generation": "int", "frame": "uint", "scene": "word", "floor_lifted": "bool01", "flavor": "word", "grade": "word"},
+    "applied": {"generation": "int", "valid": "bool01", "source": "word", "decision": "word", "damping": "fixed3", "awb_temp": "int",
+                "awb_tint": "int", "final_temp": "int", "final_tint": "int", "preset_exp": "int", "frame": "uint"},
+    "dump": {"pre_safety": "pre_safety_png|none", "pre_safety_sha256": "sha256|none", "pre_safety_exposure": "int",
+             "final": "final_png|none", "final_sha256": "sha256|none", "final_exposure": "int", "safety": "safety", "frame": "uint"},
+}
+HUGE = "9" * 4301
+_NUM = ["NaN", "nan", "", "1.5", "-", "+1", "1e3", "0x10", "-0", "007", "1234567890", "-1234567890", HUGE, "-" + HUGE, "{}", "x"]
+_FIX = ["NaN", "nan", "inf", "-inf", "", "1", "1.0", "1e0", "x", "1.5.0", "+1.000", "1234567890.000", ".500", HUGE + ".000"]
+BAD_VALUES = {
+    "int": _NUM,
+    "uint": _NUM + ["-1", "-999999999"],
+    "uint64": ["NaN", "", "1.5", "-1", "+1", "007", "1" * 21, HUGE, "x"],
+    "bool01": ["2", "-1", "true", "", "01", "1.0", "x", "10"],
+    "fixed3": _FIX + ["1.0000"],
+    "fixed6": _FIX + ["1.000", "1.0000000"],
+    "word": [""],
+    "dims": ["10", "10x", "x10", "-1x5", "1.5x2", "NaNxNaN", "10x10x10", ""],
+    "ratio|NA": ["", "1", "1/", "/1", "1.5/2", "NaN/NaN", "1/2/3", "na", "N/A"],
+    "fixed3|NA": _FIX + ["1.0000", "na", "N/A"],
+    "uint|NA": _NUM + ["-1", "na"],
+    "sha256|none": ["", "x", "a" * 63, "a" * 65, "g" * 64, "NONE"],
+    "pre_safety_png|none": ["", "x.png", "look-assist-pre-safety-frame-1.png", "../look-assist-pre-safety-frame0.png", "look-assist-pre-safety-frameX.png"],
+    "final_png|none": ["", "x.png", "look-assist-final-frame-1.png", "../look-assist-final-frame0.png", "look-assist-final-frameX.png"],
+    "safety": ["", "Keep", "other", "keep2"],
+    "ev100_source": ["", "x", "Recorded"],
+    "post_walk_branch": ["", "x", "Steps"],
+}
+GOOD_VALUES = {
+    "int": ["0", "-1", "123456789", "-123456789"], "uint": ["0", "7", "123456789"], "uint64": ["0", "18446744073709551615"],
+    "bool01": ["0", "1"], "fixed3": ["0.000", "-0.500", "123.456"], "fixed6": ["0.000000", "0.250000"], "word": ["x"],
+    "dims": ["0x0", "602x756"], "ratio|NA": ["NA", "0/0", "-100/5"], "fixed3|NA": ["NA", "0.000", "-1.250"], "uint|NA": ["NA", "0", "4"],
+    "sha256|none": ["none", "d" * 64, "D" * 64], "safety": ["keep", "retreat", "revert"], "ev100_source": ["recorded", "aperture_bound", "none"],
+    "post_walk_branch": ["none", "steps", "cleanup", "recovery"],
+}
+# What the checker's verdict reads: a different (still well-typed) value there changes the outcome, so the sweep of good values
+# leaves those fields to their own tests.
+READ_BY_CHECKER = {"scene", "source", "decision", "final_temp", "final_tint", "preset_exp", "frame", "generation", "valid", "damping",
+                   "final", "final_sha256", "final_exposure", "floor_lifted"}
+
+
+def set_field(line, key, value):
+    new, count = re.subn(r"(?<!\S)%s=\S*" % re.escape(key), lambda _m: "%s=%s" % (key, value), line, count=1)
+    assert count == 1, (key, line)
+    return new
+
+
+class TableDrift(unittest.TestCase):
+    """The checker's table, the tests' independent statement of the app's lines, and the app's own format strings agree."""
+
+    def test_the_checker_table_is_the_apps_field_set_with_the_apps_types(self):
+        expected = {"auto_wb": chk.AUTO_WB_FIELDS, "result": chk.RESULT_FIELDS, "dispatch": chk.DISPATCH_FIELDS,
+                    "applied": chk.APPLIED_FIELDS, "dump": chk.DUMP_FIELDS}
+        for event, table in expected.items():
+            with self.subTest(event):
+                self.assertEqual(FIELD_TYPES[event], table)
+        dump = dump_line("e" * 64).replace(PREFIX, "").rstrip("\n")
+        for event, line in (("auto_wb", FULL_AUTO_WB), ("result", FULL_RESULT), ("dispatch", FULL_DISPATCH), ("applied", FULL_APPLIED),
+                            ("dump", dump)):
+            with self.subTest("full line " + event):
+                pairs = chk.FIELD.findall(line.split(" ", 1)[1])          # everything after the event name
+                self.assertEqual(sorted(FIELD_TYPES[event]), sorted(key for key, _ in pairs))
+                for key, value in pairs:
+                    self.assertTrue(chk.TYPES[FIELD_TYPES[event][key]].fullmatch(value), (event, key, value))
+        for type_name in set(t for table in FIELD_TYPES.values() for t in table.values()):
+            with self.subTest("type " + type_name):
+                self.assertIn(type_name, BAD_VALUES)
+                for bad in BAD_VALUES[type_name]:
+                    self.assertIsNone(chk.TYPES[type_name].fullmatch(bad), (type_name, bad[:20]))
+                for good in GOOD_VALUES.get(type_name, []):
+                    self.assertTrue(chk.TYPES[type_name].fullmatch(good), (type_name, good))
+
+    def test_the_tables_name_exactly_the_fields_in_the_apps_format_strings(self):
+        def keys(source_text, anchor, count_tail=False):
+            start = source_text.index(anchor)
+            literal = source_text[start:source_text.index(")", start)]
+            return sorted(set(re.findall(r"(\w+)=%\d+", literal)))
+        def read(*parts):
+            with open(os.path.join(REPO, *parts), "r", encoding="utf-8", errors="replace") as handle:
+                return handle.read()
+        main_window = read("platform", "qt", "MainWindow.cpp")
+        analysis = read("src", "batch", "LookAssistAnalysis.cpp")
+        decision = keys(analysis, '"has_ev100=%1')
+        self.assertEqual(sorted(chk.DECISION_FIELDS), decision)
+        self.assertEqual(sorted(chk.AUTO_WB_FIELDS), keys(main_window, '"valid=%1 source=%2 decision=%3 damping=%4'))
+        self.assertEqual(sorted(chk.RESULT_FIELDS),
+                         sorted(set(keys(main_window, '"analysis=raw scene=%1')) | set(decision) | {"analysis", "grade"}))     # analysis=raw is literal; %29 is the decision fields; grade is the Film / Vision tail
+        self.assertEqual(sorted(chk.DISPATCH_FIELDS), sorted(set(keys(main_window, '"generation=%1 frame=%2 scene=%3')) | {"grade"}))
+        self.assertEqual(sorted(chk.APPLIED_FIELDS), keys(main_window, '"generation=%1 valid=%2 source=%3'))
+        if "lookAssistPictureDumpFields" not in analysis:
+            self.skipTest("this branch has not merged the picture_dump emitter (PR #793) yet; hosted CI tests the merge ref, which has it")
+        self.assertEqual(sorted(chk.DUMP_FIELDS), keys(analysis, '"pre_safety=%1'))
+
+
+class TableDrivenFieldGrammar(unittest.TestCase):
+    """Sol, PR #799 r4 on 41f96076, B1 (a malformed field the checker did not read was skipped over) and B2 (--decisions-only
+    never validated the completion frame): every field of every event type, every malformed value of its type, both modes."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.template = tempfile.TemporaryDirectory()
+        cls.addClassCleanup(cls.template.cleanup)
+        pictures(cls.template.name, (132, 132, 134), (140, 146, 170))
+        with open(os.path.join(cls.template.name, chk.APPLIED_PICTURE), "rb") as handle:
+            cls.sha = hashlib.sha256(handle.read()).hexdigest()
+
+    def evidence(self, lines):
+        """A four-arm run whose every log is PREFIX-marked `lines`, with the real pictures in place."""
+        root = tempfile.TemporaryDirectory()
+        self.addCleanup(root.cleanup)
+        text = "".join(PREFIX + line + "\n" for line in lines)
+        for clip in chk.DEFAULT_CLIPS:
+            for mode in chk.MODES:
+                directory = make_run(root.name, "t", clip, mode, text, SHA)
+                for picture in (chk.APPLIED_PICTURE, chk.MASTER_PICTURE):
+                    os.makedirs(os.path.dirname(os.path.join(directory, picture)), exist_ok=True)
+                    shutil.copyfile(os.path.join(self.template.name, picture), os.path.join(directory, picture))
+        return root.name
+
+    def flow(self, event, key=None, value=None):
+        dump = dump_line(self.sha).replace(PREFIX, "").rstrip("\n")
+        paired = key in ("generation", "frame")
+        put = lambda line: set_field(line, key, value) if key is not None else line
+        lines = {
+            "auto_wb": lambda: [put(FULL_AUTO_WB), dump, FULL_RESULT],
+            "result": lambda: [FULL_AUTO_WB, dump, put(FULL_RESULT)],
+            "dispatch": lambda: [put(FULL_DISPATCH), dump, put(FULL_APPLIED) if paired else FULL_APPLIED],
+            "applied": lambda: [put(FULL_DISPATCH) if paired else FULL_DISPATCH, dump, put(FULL_APPLIED)],
+            "dump": lambda: [FULL_AUTO_WB, put(dump), FULL_RESULT],
+        }
+        return lines[event]()
+
+    def test_the_full_apps_lines_bind_in_every_event_flow(self):
+        for event in FIELD_TYPES:
+            with self.subTest(event):
+                code, text = run_checker([self.evidence(self.flow(event)), "--tag", "t"])
+                self.assertEqual(0, code, text)
+                self.assertIn("picture_dump-bound", text)
+                self.assertEqual(0, run_checker([self.evidence(self.flow(event)), "--tag", "t", "--decisions-only"])[0])
+
+    def test_b1_b2_every_malformed_field_of_every_event_refuses_the_arm_in_every_mode(self):
+        for event, table in FIELD_TYPES.items():
+            for key, type_name in table.items():
+                for bad in BAD_VALUES[type_name]:
+                    root = self.evidence(self.flow(event, key, bad))
+                    for argv in ([], ["--decisions-only"]):
+                        if event == "dump" and argv:
+                            continue        # decisions-only never reads the dump line
+                        with self.subTest("%s %s=%r %s" % (event, key, bad[:12] + ("...(%d)" % len(bad) if len(bad) > 12 else ""), argv)):
+                            code, text = run_checker([root, "--tag", "t"] + argv)
+                            self.assertEqual(1, code, text)
+                            self.assertNotIn("picture_dump-bound", text)
+                            self.assertNotIn("PASS", text)
+
+    def test_every_well_typed_value_of_a_field_the_checker_does_not_read_is_accepted(self):
+        for event, table in FIELD_TYPES.items():
+            for key, type_name in table.items():
+                if key in READ_BY_CHECKER:
+                    continue
+                for good in GOOD_VALUES.get(type_name, []):
+                    with self.subTest("control %s %s=%s" % (event, key, good)):
+                        code, text = run_checker([self.evidence(self.flow(event, key, good)), "--tag", "t"])
+                        self.assertEqual(0, code, text)
+
+    def test_b2_decisions_only_validates_the_completion_frame_of_every_application(self):
+        auto_wb = "look_assist.apply.auto_wb valid=1 source=rendered-neutral-patch decision=accepted damping=1.000"
+        result = "look_assist.apply.result analysis=raw scene=shade preset_exp=160 final_temp=8950 final_tint=-35 frame=%s"
+        dispatch = "look_assist.apply.async_dispatch generation=3 frame=%s scene=shade floor_lifted=0"
+        applied = ("look_assist.apply.auto_wb_async_applied generation=3 valid=1 source=processed-neutral-patch decision=accepted "
+                   "damping=1.000 awb_temp=9990 awb_tint=-35 final_temp=9990 final_tint=-35 preset_exp=160 frame=%s")
+        for bad in ("NaN", "", "1.5", "-1", "-999999999", HUGE):
+            for label, lines in (("sync result", [auto_wb, result % bad]),
+                                 ("async dispatch+applied (matching)", [dispatch % bad, applied % bad])):
+                with self.subTest("%s frame=%r" % (label, bad[:12])):
+                    code, text = run_checker([self.evidence(lines), "--tag", "t", "--decisions-only"])
+                    self.assertEqual(1, code, text)
+                    self.assertNotIn("PASS", text)
+        for label, lines in (("sync result", [auto_wb, result % "5"]), ("async", [dispatch % "5", applied % "5"])):
+            with self.subTest("control frame=5 " + label):
+                self.assertEqual(0, run_checker([self.evidence(lines), "--tag", "t", "--decisions-only"])[0])
 
 
 class RecordedAppRun(unittest.TestCase):
