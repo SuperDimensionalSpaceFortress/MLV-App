@@ -12667,7 +12667,9 @@ class ReconReleaseDeferredEvidenceTests(unittest.TestCase):
                     ("punctuation before session", lambda r: r.replace("recon_release session=", "recon_release:session=")),
                     ("comma after the session", lambda r: r.replace("session=3 ", "session=3, ")),
                     ("spaces around the equals sign", lambda r: r.replace("session=3 ", "session = 3 ")),
-                    ("session after the first field", lambda r: r.replace("session=3 deferred_enabled=", "deferred_enabled=").replace(" deferred=", " session=3 deferred=", 1)))
+                    ("session after the first field", lambda r: r.replace("session=3 deferred_enabled=", "deferred_enabled=").replace(" deferred=", " session=3 deferred=", 1)),
+                    # r8 fix 2 (adversary A1 on 17f3ed8e): the session BEFORE the marker
+                    ("session before the marker", lambda r: "session=3 " + r.replace("recon_release session=3 ", "recon_release ")))
 
     def test_a_noncanonical_duplicate_never_lets_a_conflicting_record_pass(self) -> None:
         for name, mangle in self.NONCANONICAL:
@@ -12796,7 +12798,8 @@ class PrepConflatedMoveEvidenceTests(unittest.TestCase):
                              ("TAB before session", lambda r: r.replace("prep_route session=", "prep_route\tsession=")),
                              ("punctuation before session", lambda r: r.replace("prep_route session=", "prep_route:session=")),
                              ("spaces around the equals sign", lambda r: r.replace("session=3 ", "session = 3 ")),
-                             ("session after the field", lambda r: "playback_smoke.prep_route prep_conflated_move_active=0 session=3")):
+                             ("session after the field", lambda r: "playback_smoke.prep_route prep_conflated_move_active=0 session=3"),
+                             ("session before the marker", lambda r: "session=3 " + r.replace("prep_route session=3 ", "prep_route "))):
             for spec, canonical in ((self.ON, self.route("1")), ({}, self.route("0"))):
                 with self.subTest(case=name, spec=spec):
                     v = self.verdict(spec, self.log(canonical, mangle(self.route("0" if spec else "1"))))
