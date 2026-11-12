@@ -918,6 +918,35 @@ class PictureDumpBindingAdversaryR3(unittest.TestCase):
                 code, text = run_checker([self.bound(lambda sha, flow=flow: flow(sha, "Audit=a audit-note=b")), "--tag", "t"])
                 self.assertEqual(0, code, text)
 
+    # ---- adversary pass on 20c35304 (A1): damping and floor_lifted are always logged, damping as %.3f and floor_lifted as 0/1 ----
+    def test_p10_a1_damping_and_floor_lifted_are_validated_as_the_app_logs_them(self):
+        cases = {}
+        for bad in ("x", "", "{}", "1", "1.0", "1.0000", "1.5.0", "1e0", "1234567890.000"):
+            cases["applied damping=%r" % bad] = lambda sha, bad=bad: DISPATCH_LINE + dump_line(sha) + ASYNC_APPLIED_LINE.replace("damping=1.000", "damping=" + bad)
+            cases["auto_wb damping=%r" % bad] = lambda sha, bad=bad: AUTO_WB_LINE.replace("damping=1.000", "damping=" + bad) + dump_line(sha) + result_line()
+        for bad in ("x", "", "2", "-1", "true", "00"):
+            cases["dispatch floor_lifted=%r" % bad] = lambda sha, bad=bad: DISPATCH_LINE.replace("floor_lifted=0", "floor_lifted=" + bad) + dump_line(sha) + ASYNC_APPLIED_LINE
+        cases["applied damping absent"] = lambda sha: DISPATCH_LINE + dump_line(sha) + ASYNC_APPLIED_LINE.replace(" damping=1.000", "")
+        cases["auto_wb damping absent"] = lambda sha: AUTO_WB_LINE.replace(" damping=1.000", "") + dump_line(sha) + result_line()
+        cases["dispatch floor_lifted absent"] = lambda sha: DISPATCH_LINE.replace(" floor_lifted=0", "") + dump_line(sha) + ASYNC_APPLIED_LINE
+        for label, trace_for in cases.items():
+            root = self.bound(trace_for)
+            for argv in ([], ["--decisions-only"]):
+                with self.subTest("%s %s" % (label, argv)):
+                    code, text = run_checker([root, "--tag", "t"] + argv)
+                    self.assertEqual(1, code, text)
+                    self.assertNotIn("picture_dump-bound", text)
+        # controls: the app's own spellings bind
+        controls = {
+            "applied damping=0.500": lambda sha: DISPATCH_LINE + dump_line(sha) + ASYNC_APPLIED_LINE.replace("damping=1.000", "damping=0.500"),
+            "auto_wb damping=0.000": lambda sha: AUTO_WB_LINE.replace("damping=1.000", "damping=0.000") + dump_line(sha) + result_line(),
+            "dispatch floor_lifted=1": lambda sha: DISPATCH_LINE.replace("floor_lifted=0", "floor_lifted=1") + dump_line(sha) + ASYNC_APPLIED_LINE,
+        }
+        for label, trace_for in controls.items():
+            with self.subTest("control " + label):
+                code, text = run_checker([self.bound(trace_for), "--tag", "t"])
+                self.assertEqual(0, code, text)
+
     def test_a5_a_corrupt_png_is_exit_2_not_a_crash(self):
         import struct
         import zlib

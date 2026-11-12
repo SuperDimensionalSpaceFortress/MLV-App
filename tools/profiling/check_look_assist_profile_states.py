@@ -74,6 +74,7 @@ FALLBACK_EVENT = "look_assist.daylight_fallback_to_master"
 EVENT_NAME = {name: re.compile(re.escape(name) + r"\b") for name in (
     RESULT_EVENT, ASYNC_APPLIED_EVENT, AUTO_WB_EVENT, ASYNC_DISPATCH_EVENT, SAFETY_FALLBACK_EVENT, SKIP_EVENT, FALLBACK_EVENT)}
 INT_FIELD = re.compile(r"-?[0-9]{1,9}")
+DAMPING_FIELD = re.compile(r"-?[0-9]{1,9}\.[0-9]{3}")       # the app logs damping as %.3f (MainWindow.cpp, .arg(damping, 0, 'f', 3))
 # What one application's result sets, plus the two markers of its identity: "closed" (a result / applied line completed it, so
 # the next one must bring its own evidence, never borrow this one's) and "generation" (the dispatch's, which the applied event
 # of the same application must repeat). A new application (auto_wb, dispatch) starts without any of them.
@@ -177,7 +178,8 @@ def parse_log_text(text):
             # applied event must repeat: another generation's application is not this dispatch's (adversary r3 A2). The
             # app always logs the analysed frame as an integer (adversary r3 A1, pass on 5cb9b1a9).
             frame = once("frame")
-            if scene and frame is not None and INT_FIELD.fullmatch(frame) and (generation is None or INT_FIELD.fullmatch(generation)):
+            if (scene and frame is not None and INT_FIELD.fullmatch(frame) and (generation is None or INT_FIELD.fullmatch(generation))
+                    and once("floor_lifted") in ("0", "1")):      # bool01, always logged by the dispatch
                 receipt = {"scene": scene, "generation": generation, "dispatch_frame": frame}      # the applied event repeats both
             else:
                 receipt = {"malformed_event": ASYNC_DISPATCH_EVENT}
@@ -185,7 +187,8 @@ def parse_log_text(text):
             continue
         if is_event(AUTO_WB_EVENT):
             valid, source, decision = once("valid"), once("source"), once("decision")
-            if valid not in ("0", "1") or not source or not decision:      # bool01: the app logs 0 or 1, nothing else
+            damping = once("damping")      # always logged, as %.3f
+            if valid not in ("0", "1") or not source or not decision or damping is None or not DAMPING_FIELD.fullmatch(damping):      # bool01: 0 or 1
                 receipt = {"malformed_event": AUTO_WB_EVENT}
             else:
                 base = receipt or {}
@@ -217,6 +220,7 @@ def parse_log_text(text):
             valid = once("valid")      # the 0/1 flag the app logs (bool01), as auto_wb's; and the awb_* pair, as integers
             if (not source or not decision or None in (temperature, tint, exposure)
                     or valid not in ("0", "1") or None in (int_once("awb_temp"), int_once("awb_tint"))
+                    or once("damping") is None or not DAMPING_FIELD.fullmatch(once("damping"))
                     or base.get("dispatch_frame") != once("frame")      # the frame its own dispatch analysed, each given once
                     or base.get("generation") != once("generation")):      # the generation of ITS OWN dispatch, each given once
                 receipt = {"malformed_event": ASYNC_APPLIED_EVENT}
