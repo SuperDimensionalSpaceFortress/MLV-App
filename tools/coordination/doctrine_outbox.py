@@ -798,38 +798,84 @@ def item_heading(item: dict) -> str:
 
 _FIELD_KEY_ALT = "|".join(CARD_FIELDS)
 _PLAIN_KEY_RE = re.compile(rf"(?P<key>{_FIELD_KEY_ALT}):")
-# The bold-bullet spelling of a field (`- **Check:**`, also `- **Applies to:**`) the way the bus validator reads it: the label
-# is trimmed, its whitespace folded, and compared case-insensitively (BOLD_LABELS in validate-cards.mjs). JS \s counts U+FEFF
-# as whitespace and Python's does not, so it is added.
-_WS = r"[\s﻿]"
-_BOLD_KEY_RE = re.compile(rf"- \*\*{_WS}*(?P<key>{_FIELD_KEY_ALT}|applies{_WS}+to){_WS}*:\*\*", re.IGNORECASE)
+
+# The bus validator's reading of one card line, reproduced from parseFieldLine in validate-cards.mjs rather than approximated.
+# The validator is JavaScript, and its `\s`, trim() and toLowerCase() are not Python's: \s and trim() count U+FEFF and not U+0085
+# or U+001C-U+001F, and toLowerCase() folds the Kelvin sign to `k` but not the dotless i or the long s. A lookalike
+# (r1: `[\s\ufeff]` and re.IGNORECASE) exempted lines the bus reads as notes. Tests run the vendored JavaScript over the same inputs
+# (test_a_line_is_read_as_a_field_exactly_as_the_bus_validators_parseFieldLine_reads_it) and compare the whitespace class
+# code point by code point.
+_JS_WS_CHARS = "\t\n\x0b\x0c\r \xa0\u1680" + "".join(map(chr, range(0x2000, 0x200B))) + "\u2028\u2029\u202f\u205f\u3000\ufeff"
+_JS_WS = "[" + "".join(re.escape(c) for c in _JS_WS_CHARS) + "]"
+_JS_NOT_EOL = r"[^\n\r\u2028\u2029]"   # JS `.` (no s flag); the validator's `$` is the end of the line, there is no m flag
+_BUS_BOLD_LINE_RE = re.compile(rf"- \*\*(?P<label>[^*:]+):\*\*(?:{_JS_WS}+{_JS_NOT_EOL}*)?\Z")
+_BUS_PLAIN_LINE_RE = re.compile(rf"(?P<label>[A-Za-z-]+):(?:{_JS_WS}{_JS_NOT_EOL}*)?\Z")
+# BOLD_LABELS in validate-cards.mjs (a test pins it to the vendored validator): the bold-bullet labels that are fields.
+_BOLD_LABELS = {**{k: k for k in CARD_FIELDS}, "applies to": "applies"}
+# A bold label anywhere in a line, for the scan past a line's opening (the validator reads one only at the start of a line).
+_BOLD_LABEL_SCAN_RE = re.compile(r"- \*\*(?P<label>[^*:]+):\*\*")
 # The one quotation the screen recognises: a field key written as a single-line, space-free backtick token that ends in the key
-# (`check:`, ``check:``, `touches/supersedes:`). It is a token pattern, not a markdown parser: a span with spaces in it, one
-# that crosses a line, or one opened by an escaped backtick is not recognised, so its key is refused (fail closed) and the
-# author rewords. Every parser-shaped exemption tried here (CommonMark spans, escapes, multi-line spans) was bypassed.
-_QUOTED_KEY_RE = re.compile(r"(?<![`\\\w])(`{1,3})(?!`)[A-Za-z0-9_./-]*(?:" + _FIELD_KEY_ALT + r"):\1(?!`)")
+# (`check:`, ``check:``, `touches/supersedes:`), opened and closed by backtick runs of the SAME length (a code span closes only
+# on an equal run, so any length is a quotation and an unequal pair is not). It is a token pattern, not a markdown parser: a span
+# with spaces in it, one that crosses a line, or one opened by an escaped backtick is not recognised, so its key is refused (fail
+# closed) and the author rewords. Every parser-shaped exemption tried here (CommonMark spans, escapes, multi-line spans) was bypassed.
+_QUOTED_KEY_RE = re.compile(r"(?<![`\\\w])(`+)(?!`)[^\s`]*(?:" + _FIELD_KEY_ALT + r"):\1(?!`)")
+
+
+def _bold_label_fold(label: str) -> tuple[str, str | None]:
+    """A bold label as the bus validator folds it (trim, lower-case, whitespace runs to one space) and the field it names, or None."""
+    folded = re.sub(f"{_JS_WS}+", " ", label.strip(_JS_WS_CHARS).lower())
+    return folded, _BOLD_LABELS.get(folded)
+
+
+def _parse_field_line(row: str) -> tuple[str, str | None, int] | None:
+    """`(spelling, field, end)` for a line the bus validator reads as a field line, else None: spelling is "bold" or "plain",
+    field is the field name (None for a bold note label or an unknown plain name), end is where the opening label ends."""
+    m = _BUS_BOLD_LINE_RE.match(row)
+    if m:
+        return "bold", _bold_label_fold(m.group("label"))[1], m.end("label") + 3
+    m = _BUS_PLAIN_LINE_RE.match(row)
+    if m:
+        label = m.group("label")
+        return "plain", label if label in CARD_FIELDS else None, m.end("label") + 1
+    return None
+
+
+def _first_fused_key(row: str, start: int) -> tuple[int, str] | None:
+    """`(column, key)` of the earliest card field key in row[start:], a bold label named as the validator folds it, else None."""
+    hits = []
+    m = _PLAIN_KEY_RE.search(row, start)
+    if m:
+        hits.append((m.start(), m.group("key")))
+    for b in _BOLD_LABEL_SCAN_RE.finditer(row, start):
+        folded, field = _bold_label_fold(b.group("label"))
+        if field:
+            hits.append((b.start(), folded))
+            break
+    return min(hits) if hits else None
 
 
 def screen_card_field_keys(body: str) -> None:
-    """Refuse a card with a known field key anywhere after the first position of a line. The bus validator reads a field only
-    at the start of a line, so `...Claude hooks.check: on a hot host` is prose to it: the card then loses the field, or fails,
-    only after it merges (06d1d11c, Grok G2 on #728). The key list is CARD_FIELDS, never a second copy. The heading line is
-    skipped; a line that opens with its own field (`rule:` or `- **check:**`, a real field label) is scanned past that opening
-    label, and any other line (a continuation, or a bold note such as `- **hooks.check:**`) is scanned in full, since a key
-    past column 0 is fused into the text before it. A quoted token (_QUOTED_KEY_RE) is blanked first (same width, so the
-    reported column holds). Lines split on "\\n" only (CRLF read as LF), as the bus validator splits them: str.splitlines()
-    also breaks on \\x85, U+2028 and friends, which turned `x<U+0085>applies: y` into a fictitious line that opens with its
-    own field."""
+    """Refuse a card with a known field key anywhere a field does not start. The bus validator reads a field only at the start
+    of a line, so `...Claude hooks.check: on a hot host` is prose to it: the card then loses the field, or fails, only after it
+    merges (06d1d11c, Grok G2 on #728). The key list is CARD_FIELDS, never a second copy. The heading line is skipped. A line the
+    bus validator reads as a field (_parse_field_line: `name: value` or `- **Name:** value`, a value after whitespace) is scanned
+    past its opening label; any other line (a continuation, a bold note such as `- **hooks.check:**`, or a line the validator does
+    not read as a field at all, such as `check:echo`) is scanned in full, since a key there is fused into the text before it. A
+    quoted token (_QUOTED_KEY_RE) is blanked first (same width, so the reported column holds). Lines split on "\\n" only (CRLF
+    read as LF), as the bus validator splits them: str.splitlines() also breaks on \\x85, U+2028 and friends, which turned
+    `x<U+0085>applies: y` into a fictitious line that opens with its own field."""
     rows = body.lstrip().replace("\r\n", "\n").split("\n")
     for n, row in enumerate(rows[1:], start=2):
-        row = _QUOTED_KEY_RE.sub(lambda s: " " * len(s.group(0)), row)
-        opening = _BOLD_KEY_RE.match(row) or _PLAIN_KEY_RE.match(row)
-        start = opening.end() if opening else 0
-        for m in (_PLAIN_KEY_RE.search(row, start), _BOLD_KEY_RE.search(row, start)):
-            if m:
-                key = re.sub(r"\s+", " ", m.group("key")).lower()
-                raise Refusal("FIELD_KEY_FUSED", f"card line {n} (the heading is line 1): field key '{key}:' is at column "
-                                                 f"{m.start()}, fused into other text; a field key starts its own line")
+        parsed = _parse_field_line(row)
+        start = parsed[2] if parsed and parsed[1] else 0
+        hit = _first_fused_key(_QUOTED_KEY_RE.sub(lambda s: " " * len(s.group(0)), row), start)
+        if hit:
+            col, key = hit
+            where = (f"is at column {col}, fused into other text; a field key starts its own line" if col else
+                     "is at column 0 but the bus validator does not read the line as a field (a value follows the colon after "
+                     "whitespace)")
+            raise Refusal("FIELD_KEY_FUSED", f"card line {n} (the heading is line 1): field key '{key}:' {where}")
 
 
 def screen_rendered_card(item: dict) -> None:

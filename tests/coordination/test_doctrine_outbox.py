@@ -3196,6 +3196,195 @@ def test_no_committed_outbox_card_has_a_fused_field_key():
     assert not bad, "\n".join(bad)
 
 
+# ---------- r2: the opening-field exemption IS the bus validator's parseFieldLine (adversary pass on ec096abf: A1 A2 A3 A4) ----------
+#
+# r1 exempted the opening of a line with a lookalike regex (Python \s and re.IGNORECASE). The bus validator (JavaScript) trims,
+# folds and splits differently, so a line it reads as a note was exempt here (`validate` OK, bus refuses) and the reverse. The
+# screen now reads a line the way parseFieldLine does (explicit JS whitespace, JS case folding, a value must follow the colon
+# after whitespace), and these tests run the vendored JavaScript over the same inputs, so the two cannot drift again.
+#
+# Named mutation for this block (turns the named tests red, then is reverted):
+#   M19 give _JS_WS_CHARS Python's \s set (add \x85 and \x1c-\x1f, drop U+FEFF)     -> the whitespace-class test and every A1 parity row
+#   M20 fold the bold label with re.IGNORECASE instead of str.lower()                -> the case rows (dotless i, long s, Kelvin)
+#   M21 drop the whitespace-or-end requirement after the colon                       -> the A3 rows
+#   M22 cap the quoted backtick run at 3                                             -> the A2 run-length rows
+
+_JS_FIELD_SRC = (FIXTURE_DIR / "validate-cards.mjs").as_uri()
+_JS_PARSE_ROWS = (f"import {{ readFileSync }} from 'node:fs'; import {{ parseFieldLine }} from '{_JS_FIELD_SRC}';\n"
+                  "const rows = JSON.parse(readFileSync(0, 'utf8'));\n"
+                  "process.stdout.write(JSON.stringify(rows.map((r) => { const f = parseFieldLine(r); "
+                  "return f ? (f.name || (f.note ? '#note' : '#unknown')) : null; })));\n")
+_JS_CARD_ERRORS = (f"import {{ readFileSync }} from 'node:fs'; import {{ parseCardsFile }} from '{_JS_FIELD_SRC}';\n"
+                   "const texts = JSON.parse(readFileSync(0, 'utf8'));\n"
+                   "process.stdout.write(JSON.stringify(texts.map((t) => parseCardsFile(t, 'mlv-app', ['mlv-app']).errors.map((e) => e.reason))));\n")
+_JS_CLASSES = ("const all = Array.from({length: 0x10000}, (_, i) => i);\n"
+               "process.stdout.write(JSON.stringify({ws: all.filter((i) => /\\s/.test(String.fromCharCode(i))),"
+               " trim: all.filter((i) => String.fromCharCode(i).trim() === ''),"
+               " lower: Object.fromEntries(all.map((i) => [i, String.fromCharCode(i).toLowerCase()])"
+               ".filter(([i, s]) => /^[a-z]+$/.test(s) && s !== String.fromCharCode(i)))}));\n")
+
+
+def _node(script: str, payload=None):
+    result = subprocess.run([shutil.which("node"), "--input-type=module", "-e", script], input=json.dumps(payload or []),
+                            capture_output=True, text=True, encoding="utf-8", timeout=180)
+    assert result.returncode == 0, result.stderr
+    return json.loads(result.stdout)
+
+
+def _py_row_class(row: str):
+    parsed = ob._parse_field_line(row)
+    return None if parsed is None else (parsed[1] or ("#note" if parsed[0] == "bold" else "#unknown"))
+
+
+# every code point JS reads as whitespace, the ones only Python does, and look-alikes neither reads as whitespace
+_WS_PROBES = ["\t", "\x0b", "\x0c", " ", "\xa0", "\u1680", "\u2000", "\u2003", "\u200a", "\u202f", "\u205f", "\u3000", "\ufeff",
+              "\x85", "\x1c", "\x1d", "\x1e", "\x1f", "\u180e", "\u200b", "\u2060"]
+_ROW_TEMPLATES = [
+    "- **{w}check:** echo ok", "- **check{w}:** echo ok", "- **Applies{w}to:** mlv-app", "- **applies to{w}:** x",
+    "- **check:**{w}echo ok", "- **check:**{w}{w}echo ok", "- **check:**{w}", "- **check:**",
+    "check:{w}echo ok", "rule:{w}x", "rule:{w}", "rule:", "{w}check: echo ok", "{w}- **check:** x", "- {w}**check:** x",
+    "check{w}: x", "- **check:{w}** x", "- **{w}:** x",
+]
+# the rows a whole card is built from: the check line only, with a value after it
+_E2E_TEMPLATES = ["- **{w}check:** echo ok", "- **check{w}:** echo ok", "- **check:**{w}echo ok", "- **check:**{w}{w}echo ok",
+                  "check:{w}echo ok", "{w}check: echo ok", "{w}- **check:** echo ok", "- {w}**check:** echo ok", "check{w}: echo ok"]
+_CASE_LABELS = ["check", "CHECK", "Check", "chec\u212a", "chec\u212a ", "mechan\u0131sm", "mechan\u0130sm", "\u017fupersedes", "\u017fUPERSEDES",
+                "ev\u0131dence", "Applies To", "applies  TO", "applies\u2003to", "applies\ufeffto", "rul\u0435", "\u0130nfo"]
+
+
+def _battery_rows() -> list[str]:
+    rows = [t.format(w=w) for t in _ROW_TEMPLATES for w in _WS_PROBES]
+    rows += [f"- **{lab}:** echo ok" for lab in _CASE_LABELS] + [f"- **{lab}:**echo ok" for lab in _CASE_LABELS]
+    rows += [f"{lab}: echo ok" for lab in ["check", "Check", "chec\u212a", "mechan\u0131sm", "\u017fupersedes", "rule", "ru-le", "x"]]
+    rows += ["rule:\r", "rule: a\rb", "rule: a\u2028b", "rule: a\u2029b", "- **rule:**\r", "- **rule:** a\u2028b", "- **a\rb:** x", "- **a\nb:** x"]
+    rows += ["", " ", "- ", "- **", "- **:** x", "- ****:** x", "- **a*b:** x", "- **a:b:** x", "rule", "rule :", "-rule: x", "- rule: x", "**rule:** x"]
+    return rows
+
+
+@needs_node
+def test_the_js_whitespace_class_is_the_javascript_one():
+    """A1: the explicit class equals what /\\s/ and String.prototype.trim() read as whitespace, over the whole BMP."""
+    js = _node(_JS_CLASSES)
+    ours = {ord(c) for c in ob._JS_WS_CHARS}
+    assert ours == set(js["ws"]) == set(js["trim"])
+    assert 0x85 not in ours and 0x1c not in ours and 0xfeff in ours
+
+
+@needs_node
+def test_ascii_letter_case_folding_is_the_javascript_one():
+    """A1: toLowerCase() maps U+212A (Kelvin) to k and nothing else non-ASCII to an ASCII letter; str.lower() agrees, so the label
+    fold (not re.IGNORECASE, which also folds the dotless i and the long s) decides what is a field."""
+    js = {int(k): v for k, v in _node(_JS_CLASSES)["lower"].items() if not ("A" <= chr(int(k)) <= "Z")}
+    py = {c: chr(c).lower() for c in range(0x10000) if re.fullmatch("[a-z]+", chr(c).lower()) and chr(c).lower() != chr(c)
+          and not ("A" <= chr(c) <= "Z")}
+    assert js == py == {0x212a: "k"}
+
+
+@needs_node
+def test_a_line_is_read_as_a_field_exactly_as_the_bus_validators_parseFieldLine_reads_it():
+    rows = _battery_rows()
+    js = _node(_JS_PARSE_ROWS, rows)
+    assert len(js) == len(rows)
+    diffs = [f"{r!r}: js={j} py={_py_row_class(r)}" for r, j in zip(rows, js) if _py_row_class(r) != j]
+    assert not diffs, "\n".join(diffs)
+
+
+def _check_line_card(row: str) -> str:
+    assert "check: py -3 -m pytest tests/coordination -q\n" in CARD_BODY
+    return CARD_BODY.replace("check: py -3 -m pytest tests/coordination -q\n", f"{row}\n")
+
+
+@needs_node
+def test_validate_and_the_bus_validator_agree_on_every_spelling_of_the_check_line(tmp_path):
+    """A1/A3 both ways: a card whose check line is `row` is accepted by validate exactly when the bus validator accepts it, so a
+    line the bus reads as a note is refused here and a real field label is never refused. Only rows that carry a literal `check:`
+    are compared both ways: the screen judges fused keys, so a row with no literal key (`- **check<U+001C>:** x`, a note to the
+    bus, which then misses `check`) is the bus validator's refusal, not this screen's; for those only "bus accepts => validate
+    accepts" holds."""
+    rows = [t.format(w=w) for t in _E2E_TEMPLATES for w in _WS_PROBES] + [
+        f"- **{lab}:** echo ok" for lab in _CASE_LABELS if "chec" in lab.lower()] + [
+        "- **Check:** echo ok", "- **CHECK:**\techo ok", "check: echo ok"]
+    js = _node(_JS_CARD_ERRORS, [_check_line_card(r) for r in rows])
+    bad = []
+    for n, (row, errors) in enumerate(zip(rows, js)):
+        item = _write_card_item(tmp_path, _check_line_card(row), f"20261009-row{n}.md")
+        py_ok = ob.main(["--repo", str(tmp_path), "validate", str(item)]) == 0
+        if (not errors and not py_ok) or ("check:" in row and py_ok != (not errors)):
+            bad.append(f"{row!r}: bus_ok={not errors} validate_ok={py_ok} {errors[:1]}")
+    assert not bad, "\n".join(bad)
+
+
+@pytest.mark.parametrize("row", [
+    "- **\u0085check:** echo ok",          # A1: U+0085 is not JS whitespace: the bus reads a note and misses `check`
+    "- **\x1ccheck:** echo ok",
+    "- **Check:**echo ok",                  # A3: no whitespace after the colon, the bus reads no field
+    "check:echo ok",
+    "- **Check:**\x85echo ok",
+])
+def test_validate_refuses_a_line_the_bus_validator_does_not_read_as_a_field(tmp_path, capsys, row):
+    body = CARD_BODY.replace("check: py -3 -m pytest tests/coordination -q\n", f"{row}\ncheck: py -3 -m pytest tests/coordination -q\n")
+    assert ob.main(["--repo", str(tmp_path), "validate", str(_write_card_item(tmp_path, body))]) == 1
+    assert "FIELD_KEY_FUSED" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("row", [
+    "- **\u017fupersedes:** none",                # long s: re.IGNORECASE folds it to s, toLowerCase does not: a note to the bus
+    "- **mechan\u0131sm:** x",                    # dotless i
+    "- **check\x1c:** echo ok",                   # U+001C is not JS whitespace: not the check label
+    "- **\x1fApplies\x1ato:** mlv-app",
+    "- **Check:**",                               # the value may be empty: the bus reads the field (its emptiness is another check)
+    "- **\ufeffCheck\u3000:** echo ok",
+    "- **Chec\u212a:** echo ok",                  # toLowerCase maps the Kelvin sign to k, so this IS the check field
+    "- **CHECK:**\techo ok",
+    "- **Check:**\u00a0echo ok",
+    "check:\u3000echo ok",
+])
+def test_validate_does_not_refuse_a_line_the_bus_validator_reads_as_a_field(row):
+    # `- **Check:**` alone is an empty field to the bus (a different refusal), so judge only the fused-key screen
+    ob.screen_card_field_keys(CARD_BODY.replace("check: py -3 -m pytest tests/coordination -q\n", f"{row}\n"))
+
+
+@pytest.mark.parametrize("run", ["`", "``", "```", "````", "`````"])
+@pytest.mark.parametrize("token", ["check:", "x/check:", "caf\u00e9/check:", "touches/supersedes:"])
+def test_validate_accepts_a_field_key_quoted_at_any_equal_length_backtick_run(tmp_path, run, token):
+    """A2: a code span closes on a run of the same length, so a 4- or 5-backtick quotation of a key is a quotation."""
+    body = CARD_BODY.replace("rule: the rule\n", f"rule: use {run}{token}{run} as the label\n", 1)
+    assert ob.main(["--repo", str(tmp_path), "validate", str(_write_card_item(tmp_path, body))]) == 0
+
+
+@pytest.mark.parametrize("fused", [
+    "use ````check:``` as the label",      # opens with four, closes with three
+    "use ```check:````` as the label",
+    "use ``a b check: c`` as the label",   # a span with spaces in it is no token: refused, fail closed
+    "use ````check: ```` as the label",
+    "x ``a`` check: v",
+])
+def test_validate_refuses_a_key_that_an_unequal_backtick_run_does_not_quote(tmp_path, capsys, fused):
+    body = CARD_BODY.replace("rule: the rule\n", f"rule: {fused}\n", 1)
+    assert ob.main(["--repo", str(tmp_path), "validate", str(_write_card_item(tmp_path, body))]) == 1
+    assert "FIELD_KEY_FUSED" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("label,shown", [
+    ("Applies\ufeffto", "applies to"),
+    ("Applies\u2003 to", "applies to"),
+    ("\u3000APPLIES\u00a0\u00a0TO ", "applies to"),
+    ("Chec\u212a", "check"),
+    ("  Supersedes  ", "supersedes"),
+])
+def test_validate_names_a_fused_bold_key_in_the_form_the_bus_validator_reads_it(tmp_path, capsys, label, shown):
+    """A4: the diagnostic shows the folded key (JS whitespace folded to one space, lower-cased), not the raw label."""
+    body = CARD_BODY.replace("rule: the rule\n", f"rule: x - **{label}:** mlv-app\n", 1)
+    assert ob.main(["--repo", str(tmp_path), "validate", str(_write_card_item(tmp_path, body))]) == 1
+    assert f"'{shown}:'" in capsys.readouterr().err
+
+
+@needs_node
+def test_the_bold_label_table_is_the_vendored_bus_validators():
+    got = _node(f"import {{ BOLD_LABELS }} from '{_JS_FIELD_SRC}'; process.stdout.write(JSON.stringify(BOLD_LABELS));\n")
+    assert ob._BOLD_LABELS == got
+
+
 # ---------- every committed outbox item must survive the drain's card validation ----------
 #
 # The drain refuses a card the bus validator rejects (size over 2,000 bytes, an `applies` value that
