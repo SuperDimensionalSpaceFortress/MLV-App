@@ -2277,12 +2277,19 @@ class AgentHeavySlotFeedForwardTests(unittest.TestCase):
     def quote(text: str) -> str:
         return "'" + text.replace("'", "''") + "'"
 
-    NORMALIZE_HEAD = "if ([string]::IsNullOrWhiteSpace($HeavySlotFeed)) { $HeavySlotFeed = "
+    NORMALIZE_BEGIN = "# >>> HEAVY-SLOT-FEED-NORMALIZE"
+    NORMALIZE_END = "# <<< HEAVY-SLOT-FEED-NORMALIZE"
+    R2_NORMALIZE_HEAD = "if ([string]::IsNullOrWhiteSpace($HeavySlotFeed)) { $HeavySlotFeed = "
 
     def normalize_line(self) -> str:
-        """The agent's own start-up line that gives an explicit empty/blank -HeavySlotFeed a value (taken from its text, never restated; '' when the agent has no such line)."""
+        """The agent's own start-up normalization of -HeavySlotFeed (taken from its text between two fixed marker lines, never restated). r3 closes the class there: ONE predicate decides
+        whether a feed can be forwarded losslessly, and every refused value becomes the stand-in. Before r3 the agent had one line for empty/blank only; that line is used when the markers are
+        absent, so the RED of this round runs the r2 agent as it was."""
         agent = AGENT.read_text(encoding="utf-8")
-        return next((ln.strip() for ln in agent.splitlines() if ln.startswith(self.NORMALIZE_HEAD)), "")
+        if self.NORMALIZE_BEGIN in agent:
+            a = agent.index(self.NORMALIZE_BEGIN)
+            return agent[a:agent.index(self.NORMALIZE_END, a)]
+        return next((ln.strip() for ln in agent.splitlines() if ln.startswith(self.R2_NORMALIZE_HEAD)), "")
 
     def long_temp_dir(self, prefix: str) -> Path:
         """A fresh temp dir spelled by its LONG name. A hosted Windows runner's TEMP is C:\\Users\\RUNNER~1\\...; the agent's GetFullPath (and the cwd it is handed) yields the long spelling of the
@@ -2294,17 +2301,21 @@ class AgentHeavySlotFeedForwardTests(unittest.TestCase):
         self.addCleanup(tmp.cleanup)
         return Path(os.path.realpath(tmp.name))
 
-    def job_env(self, feed: str, *, agent_env_feed: str | None, tail: str, cwd: str | None = None) -> str:
+    def job_env(self, feed: str, *, agent_env_feed: str | None, tail: str, cwd: str | None = None, feed_ps: str | None = None, echo_agent_feed: bool = False) -> str:
         """Run the agent's job-env block with $HeavySlotFeed = feed (the agent's own process env holding agent_env_feed as HEAVY_SLOT_FEED, or none, and its current directory `cwd`), then a child
-        standing for the job runs `tail`."""
+        standing for the job runs `tail`. feed_ps, when given, is a PowerShell EXPRESSION for the bound value instead (an argv cannot carry a NUL; an in-process caller's [string] can).
+        echo_agent_feed writes the agent's own $HeavySlotFeed after start-up normalization, then '###', before the job's output (the value the agent's reader opens). The separators are
+        tokens no tested feed contains (a refused feed may hold '|' or '#')."""
         import os
         env = {k: v for k, v in os.environ.items() if k != "HEAVY_SLOT_FEED"}
         if agent_env_feed is not None:
             env["HEAVY_SLOT_FEED"] = agent_env_feed
+        bound = feed_ps if feed_ps is not None else self.quote(feed)
+        echo = "[Console]::Out.Write([string]$HeavySlotFeed + '###')\n" if echo_agent_feed else ""
         script = ("$ErrorActionPreference = 'Stop'\n"
                   "$heatRule = [ordered]@{ maxThrottledRows = 6; meanMaxC = 88.0; sustainedRows = 60; feedStaleSec = 120 }\n"
                   "$script:Admission = [pscustomobject]@{ label = 'clear'; thermal = 'clear'; waitedSec = 0; heavySlotHeld = $null }\n"
-                  f"$HeavySlotFeed = {self.quote(feed)}\n" + self.normalize_line() + "\n" + self.block() + "\n"
+                  f"$HeavySlotFeed = {bound}\n" + self.normalize_line() + "\n" + echo + self.block() + "\n"
                   f"& {self.quote(str(PWSH))} -NoLogo -NoProfile -NonInteractive -Command {self.quote(tail)}\n")
         r = subprocess.run([str(PWSH), "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, timeout=180, env=env, cwd=cwd)
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
@@ -2349,30 +2360,65 @@ class AgentHeavySlotFeedForwardTests(unittest.TestCase):
         # adversary r2 A1 (introduced major): -HeavySlotFeed '' makes the agent's own reader see no file (feed unknown), but an empty value in the job env is the same as no variable, so the job's
         # gate picked the default csv (a different sensor) and labelled its thresholds `agent`. An empty/blank feed now becomes ONE unreadable local path at start-up, forwarded like any other.
         probe_line = next(ln.strip() for ln in QUIET.read_text(encoding="utf-8").splitlines() if ln.startswith("$HeatFeedPath = "))
-        tail = (probe_line + "\n[Console]::Out.Write([string]$env:HEAVY_SLOT_FEED + '|' + $HeatFeedPath + '|' + (Test-Path -LiteralPath $HeatFeedPath))")
+        tail = (probe_line + "\n[Console]::Out.Write([string]$env:HEAVY_SLOT_FEED + '@@@' + $HeatFeedPath + '@@@' + (Test-Path -LiteralPath $HeatFeedPath))")
+        stand_in = None
         for blank in ("", " ", "   \t"):
-            got = self.job_env(blank, agent_env_feed=None, tail=tail)
-            fwd, probe_path, exists = got.split("|")
+            got = self.job_env(blank, agent_env_feed=None, tail=tail, echo_agent_feed=True)
+            agent_feed, rest = got.split("###", 1)
+            fwd, probe_path, exists = rest.split("@@@")
             self.assertNotEqual(fwd, "", f"feed {blank!r} was forwarded as an empty value (the job falls back to the default csv)")
             self.assertNotEqual(fwd.lower(), self.DEFAULT_FEED.lower(), f"feed {blank!r} must not become the default csv")
+            self.assertEqual(agent_feed, fwd, "the agent's own reader opens exactly what it forwards")
             self.assertEqual(probe_path, fwd, "the job's gate reads exactly what the agent forwarded")
             self.assertEqual(exists, "False", "the stand-in path is unreadable, so the job reads 'feed missing' (unknown) like the agent does")
             # adversary r2 pass 3 A1: a fixed, well-formed path could be PLANTED as a readable file (and then read as a cool feed): the stand-in carries a character no Win32 file name can hold
             self.assertTrue(any(c in Path(fwd).name for c in '<>"|?*'), f"the stand-in {fwd!r} must be a name no file can have, so it can never be planted")
-        # the line runs once, at start-up, before any function (so the agent's own reader and all five forwards below see the same value)
+            stand_in = stand_in or fwd
+            self.assertEqual(fwd, stand_in, "every refused feed becomes the ONE stand-in")
+        # adversary r2 pass 4 A1 (introduced major) and the class it belongs to: a bound [string] the agent cannot forward losslessly to a child's environment. An embedded NUL truncates the env
+        # value (leading NUL: no variable, so the default csv; interior NUL: the prefix, here a PLANTED cool feed) while the agent's own FileInfo refuses it; a Win32-invalid path character, a lone
+        # surrogate (no UTF-8 form) and a path GetFullPath refuses are the same class. Each becomes the stand-in at start-up, so the agent and the job both read 'feed missing'.
+        d = self.long_temp_dir("feed-forward-nul-")
+        cool = d / "cool.csv"
+        cool.write_text("\n".join(["Date,Time,Tick,PackageC,PackageW,CoreThrottling,RingThrottling"]
+                                  + [f"10/24/2026,08:00:{i:02d},{i},40.0,20.0,No,No" for i in range(15)]) + "\n", encoding="utf-8")   # a readable COOL feed at the interior-NUL prefix
+        refused = {
+            "leading NUL": "[string][char]0 + 'FEED_SUFFIX=ignored'",
+            "interior NUL": self.quote(str(cool)) + " + [char]0 + 'FEED_SUFFIX=ignored'",
+            "tab (GetInvalidPathChars)": self.quote(str(d)) + " + '\\co' + [char]9 + 'ol.csv'",
+            "pipe (GetInvalidPathChars)": self.quote(str(d)) + " + '\\co' + [char]124 + 'ol.csv'",
+            "lone surrogate": self.quote(str(d)) + " + '\\co' + [char]0xD800 + 'ol.csv'",
+            "longer than GetFullPath takes": "'C:\\' + ('a' * 33000)",
+        }
+        for why, expr in refused.items():
+            with self.subTest(refused=why):
+                got = self.job_env("", agent_env_feed=None, tail=tail, feed_ps=expr, echo_agent_feed=True)
+                agent_feed, rest = got.split("###", 1)
+                fwd, probe_path, exists = rest.split("@@@")
+                self.assertEqual((agent_feed, fwd, probe_path, exists), (stand_in, stand_in, stand_in, "False"),
+                                 f"{why}: the agent's reader, the forwarded env and the job's gate must all name the stand-in (feed missing), never the default csv or a truncated prefix")
+        # a value GetFullPath canonicalises (trailing blanks) is forwarded in the canonical form, and the agent's own reader opens that same text
+        got = self.job_env(str(cool) + "  ", agent_env_feed=None, tail=tail, echo_agent_feed=True)
+        agent_feed, rest = got.split("###", 1)
+        self.assertEqual((agent_feed, rest), (str(cool), f"{cool}@@@{cool}@@@True"))
+        # the normalization runs once, at start-up, before any function but its own predicate (so the agent's own reader and all five forwards below see the same value)
         agent = AGENT.read_text(encoding="utf-8")
-        self.assertEqual(agent.count("\n" + self.NORMALIZE_HEAD), 1)
-        self.assertLess(agent.index("\n" + self.NORMALIZE_HEAD), agent.index("\nfunction "))
+        self.assertEqual(agent.count(self.NORMALIZE_BEGIN), 1)
+        self.assertEqual(agent.count(self.NORMALIZE_END), 1)
+        self.assertLess(agent.index(self.NORMALIZE_BEGIN), agent.index("\nfunction "))
+        self.assertGreater(agent.index("\nfunction ", agent.index(self.NORMALIZE_END)), agent.index(self.NORMALIZE_END))
+        self.assertNotIn(self.R2_NORMALIZE_HEAD, agent, "the r2 empty-only line is folded into the one predicate")
 
     def test_every_heavy_slot_child_the_agent_starts_forwards_the_feed_it_decides_on(self) -> None:
-        # the class: each child launch that reads the heat feed (heavy-slot.py status / lease request / lease renew: they start in the agent's own directory, so the raw path is the one it reads) sets
-        # HEAVY_SLOT_FEED from $HeavySlotFeed; the two that start in $Root (the job, and the slot holder) get the absolute path; the job takes it from the process env, set in the PARITY-1 block
+        # the class: each child launch that reads the heat feed (heavy-slot.py status / lease request / lease renew, the slot holder, the job) sets HEAVY_SLOT_FEED from $HeavySlotFeed, which
+        # the start-up normalization has already made the ABSOLUTE, losslessly forwardable path (or the stand-in), so no site re-derives it from the raw parameter or forwards a text it refused
         agent = AGENT.read_text(encoding="utf-8")
-        self.assertEqual(len(re.findall(r'\$si\.Environment\["HEAVY_SLOT_FEED"\] = \$HeavySlotFeed', agent)), 3)
-        absolute = "$(try { [System.IO.Path]::GetFullPath($HeavySlotFeed) } catch { $HeavySlotFeed })"
-        self.assertEqual(agent.count("HEAVY_SLOT_DIR = $HeavySlotDir; HEAVY_SLOT_FEED = " + absolute + "; HEAVY_SLOT_HELD = $null"), 1)
-        self.assertEqual(self.block().count("$env:HEAVY_SLOT_FEED = " + absolute), 1)
-        self.assertNotIn("$env:HEAVY_SLOT_FEED = $HeavySlotFeed", agent)
+        self.assertEqual(len(re.findall(r'\$si\.Environment\["HEAVY_SLOT_FEED"\] = \$HeavySlotFeed\s*$', agent, re.M)), 3)
+        self.assertEqual(agent.count("HEAVY_SLOT_DIR = $HeavySlotDir; HEAVY_SLOT_FEED = $HeavySlotFeed; HEAVY_SLOT_HELD = $null"), 1)
+        self.assertEqual(self.block().count("$env:HEAVY_SLOT_FEED = $HeavySlotFeed\n"), 1)
+        code_lines = [ln for ln in agent.replace(self.normalize_line(), "").splitlines() if "HEAVY_SLOT_FEED" in ln and not ln.lstrip().startswith("#")]
+        self.assertEqual(len(code_lines), 6, "five forwards plus the param default; a new HEAVY_SLOT_FEED site must be added to this test:\n" + "\n".join(code_lines))
+        self.assertNotIn("GetFullPath($HeavySlotFeed)", agent.replace(self.normalize_line(), ""), "the absolute form is made once, at start-up")
 
 
 if __name__ == "__main__":
