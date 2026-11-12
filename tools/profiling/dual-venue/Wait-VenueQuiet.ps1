@@ -555,13 +555,17 @@ function Read-TelAgentHeatRule([string]$Json, [int]$DefaultRows, [double]$Defaul
     if ([string]::IsNullOrWhiteSpace($Json)) { return [pscustomobject]$r }
     $r.source = 'invalid'
     try {
-        $o = $Json | ConvertFrom-Json -ErrorAction Stop
+        # -NoEnumerate: a root array stays an array (and is refused), never unwrapped into the object inside it. A field must be a scalar: a number as a number (never through [string], which keeps
+        # 15 significant digits: 80.00000000000001 would become 80), or numeric text.
+        $o = ConvertFrom-Json -InputObject $Json -NoEnumerate -ErrorAction Stop
         if ($o -isnot [pscustomobject]) { return [pscustomobject]$r }
         $v = @{}
         foreach ($k in 'maxThrottledRows', 'meanMaxC', 'sustainedRows', 'feedStaleSec') {
-            if (-not $o.PSObject.Properties[$k] -or $null -eq $o.$k -or $o.$k -is [bool]) { return [pscustomobject]$r }
-            $d = 0.0
-            if (-not [double]::TryParse([string]$o.$k, [Globalization.NumberStyles]::Float, [Globalization.CultureInfo]::InvariantCulture, [ref]$d)) { return [pscustomobject]$r }
+            if (-not $o.PSObject.Properties[$k] -or $null -eq $o.$k -or $o.$k -is [bool] -or $o.$k -is [array]) { return [pscustomobject]$r }
+            $d = 0.0; $x = $o.$k
+            if ($x -is [double] -or $x -is [long] -or $x -is [int] -or $x -is [decimal] -or $x -is [bigint]) { $d = [double]$x }
+            elseif ($x -is [string]) { if (-not [double]::TryParse($x, [Globalization.NumberStyles]::Float, [Globalization.CultureInfo]::InvariantCulture, [ref]$d)) { return [pscustomobject]$r } }
+            else { return [pscustomobject]$r }
             if ([double]::IsNaN($d) -or [double]::IsInfinity($d) -or $d -lt 0) { return [pscustomobject]$r }
             $v[$k] = $d
         }
@@ -1299,8 +1303,10 @@ function Write-TelemetryLines($Probe) {
             elseif ([string]$h.mean_c_exact -cin @('NaN', 'Infinity', '-Infinity')) { ' mean_exact=' + [string]$h.mean_c_exact } else { '' }) +
             # PARITY-1: the agent's published heat rule, as the gate reads it off this line (VenueThermalGate.psm1 Get-VenueRuleFromTeleLine); inline, so the existing harnesses that lift this function
             # keep working. Nothing published -> nothing printed (the gate says thresholds_source=default); a record the probe could not use -> rule_source=invalid (THERMAL_THRESHOLDS_INVALID).
+            # a double is printed round-trip ('R'), never through [string] (15 significant digits: 80.00000000000001 would print as 80)
             $(if ($h.PSObject.Properties['rule'] -and $null -ne $h.rule) {
-                if ([string]$h.rule.source -ceq 'agent') { ' rule_source=agent rule_max_throttled=' + (ConvertTo-IdentToken $h.rule.maxThrottledRows) + ' rule_mean_max_c=' + (ConvertTo-IdentToken $h.rule.meanMaxC) + ' rule_rows=' + (ConvertTo-IdentToken $h.rule.sustainedRows) + ' rule_stale_s=' + (ConvertTo-IdentToken $h.rule.feedStaleSec) }
+                $rn = { param($x) if ($x -is [double]) { $x.ToString('R', [Globalization.CultureInfo]::InvariantCulture) } else { ConvertTo-IdentToken $x } }
+                if ([string]$h.rule.source -ceq 'agent') { ' rule_source=agent rule_max_throttled=' + (& $rn $h.rule.maxThrottledRows) + ' rule_mean_max_c=' + (& $rn $h.rule.meanMaxC) + ' rule_rows=' + (& $rn $h.rule.sustainedRows) + ' rule_stale_s=' + (& $rn $h.rule.feedStaleSec) }
                 else { ' rule_source=invalid' }
             } else { '' }))
         $g = $Probe.gpu

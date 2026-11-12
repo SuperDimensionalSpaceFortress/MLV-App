@@ -35,6 +35,17 @@ $script:HeatFeedStaleSec = 120.0
 $script:HeatMaxWindowRows = 150    # the rows the agent and the probe both read from the feed's tail (Select-Object -Last 150): a longer window is not one the probe can honour
 $script:ThresholdsInvalid = 'THERMAL_THRESHOLDS_INVALID'
 
+function ConvertTo-VenueDouble {
+    # PARITY-1 r1 (adversary A1): a typed number is taken as the number it is. [string]$double keeps 15 significant digits (80.00000000000001 became 80, and the largest finite double a
+    # text that does not parse back), so a threshold or a mean one ulp off a boundary decided the other way from the agent's own comparison. Text is parsed invariant, as before.
+    param([AllowNull()][object]$Value, [ref]$Out)
+    if ($Value -is [double] -or $Value -is [float] -or $Value -is [decimal] -or $Value -is [int] -or $Value -is [long] -or $Value -is [int16] -or $Value -is [byte] -or $Value -is [uint32] -or $Value -is [uint64] -or $Value -is [bigint]) {
+        $Out.Value = [double]$Value
+        return $true
+    }
+    [double]::TryParse([string]$Value, [System.Globalization.NumberStyles]::Float, $script:Inv, $Out)
+}
+
 function Resolve-VenueHeatRule {
     # BACHELOR-THERMAL-GATE-AGENT-THRESHOLD-PARITY-1: the heat thresholds the gate decides on. -Rule is the record the RUNNING agent published (ultra-magnus-agent.ps1
     # Get-AgentHeatRule, copied by the quiet probe): an object with source, maxThrottledRows, meanMaxC, sustainedRows, feedStaleSec. $null (nothing published: an agent that predates it)
@@ -50,9 +61,9 @@ function Resolve-VenueHeatRule {
     if (-not $p['source'] -or [string]$Rule.source -cne 'agent') { return $inv }
     $vals = @{}
     foreach ($k in 'maxThrottledRows', 'meanMaxC', 'sustainedRows', 'feedStaleSec') {
-        if (-not $p[$k] -or $null -eq $Rule.$k -or $Rule.$k -is [bool]) { return $inv }
+        if (-not $p[$k] -or $null -eq $Rule.$k -or $Rule.$k -is [bool] -or $Rule.$k -is [array]) { return $inv }   # a scalar number or its text: an array coerces through [string] and is no number
         $d = 0.0
-        if (-not [double]::TryParse([string]$Rule.$k, [System.Globalization.NumberStyles]::Float, $script:Inv, [ref]$d)) { return $inv }
+        if (-not (ConvertTo-VenueDouble $Rule.$k ([ref]$d))) { return $inv }
         if ([double]::IsNaN($d) -or [double]::IsInfinity($d) -or $d -lt 0) { return $inv }
         $vals[$k] = $d
     }
@@ -71,11 +82,11 @@ function Get-VenueHeatVerdict {
     param([AllowNull()][object]$Throttled, [AllowNull()][object]$MeanC, [int]$MaxThrottledRows = $script:HeatMaxThrottledRows, [double]$MeanMaxC = $script:HeatMeanMaxC)
     if ($null -eq $Throttled) { return 'unknown' }
     $t = 0.0; $m = 0.0
-    if (-not [double]::TryParse([string]$Throttled, [System.Globalization.NumberStyles]::Float, $script:Inv, [ref]$t)) { return 'unknown' }
+    if (-not (ConvertTo-VenueDouble $Throttled ([ref]$t))) { return 'unknown' }
     if ([double]::IsNaN($t) -or [double]::IsInfinity($t) -or $t -lt 0) { return 'unknown' }
     if ($t -gt $MaxThrottledRows) { return 'hot' }
     if ($null -eq $MeanC) { return 'unknown' }
-    if (-not [double]::TryParse([string]$MeanC, [System.Globalization.NumberStyles]::Float, $script:Inv, [ref]$m)) { return 'unknown' }
+    if (-not (ConvertTo-VenueDouble $MeanC ([ref]$m))) { return 'unknown' }
     if ([double]::IsNaN($m) -or [double]::IsNegativeInfinity($m)) { return 'unknown' }
     if ($m -ge $MeanMaxC) { 'hot' } else { 'clear' }
 }
@@ -118,11 +129,14 @@ function ConvertFrom-VenueProbeHeatLine {
             # r3 A2: the probe rounds mean_c to 0.01 (87.998 -> 88.0, which the agent's rule calls hot while the exact mean is clear): the exact mean it also writes,
             # mean_c_exact, is the heat decision's value when present; the rounded mean_c only for a probe that predates it
             $meanSrc = $(if ($h.PSObject.Properties['mean_c_exact'] -and $null -ne $h.mean_c_exact) { $h.mean_c_exact } else { $h.mean_c })
-            $okM = [double]::TryParse([string]$meanSrc, [System.Globalization.NumberStyles]::Float, $script:Inv, [ref]$mean)
+            $okM = ConvertTo-VenueDouble $meanSrc ([ref]$mean)
             # r5 (B1): an unparseable mean is NaN, not a reason to drop the throttled count: Get-VenueHeatVerdict tests the count first
             if (-not $okM) { $mean = [double]::NaN }
             # PARITY-1: the agent's published thresholds ride in heat.rule; an unusable record is unknown, never read against the defaults
-            $rule = Resolve-VenueHeatRule -Rule $(if ($h.PSObject.Properties['rule']) { $h.rule } else { $null })
+            # assigned, not passed through $(...): a subexpression unwraps a one-element array, which would turn "rule": [ {..} ] into the object inside it
+            $ruleRaw = $null
+            if ($h.PSObject.Properties['rule']) { $ruleRaw = $h.rule }
+            $rule = Resolve-VenueHeatRule -Rule $ruleRaw
             if (-not $rule.valid) { return (New-VenueHeatReading -Heat 'unknown' -Throttled $null -Window $null -MeanC $null -Text "$($rule.reason): the agent's published heat thresholds are unusable" -Source 'raw-json' -Rule $rule) }
             $v = $(if ($okT -and $okW) { Get-VenueHeatVerdict -Throttled $thr -MeanC $mean -MaxThrottledRows $rule.maxThrottledRows -MeanMaxC $rule.meanMaxC } else { 'unknown' })
             if ($v -cne 'unknown') {

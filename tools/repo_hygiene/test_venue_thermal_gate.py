@@ -1563,6 +1563,56 @@ class AgentThresholdParityTests(unittest.TestCase):
         self.assertNotIn("rule_source", got[1]["line"], "nothing published prints nothing")
         self.assertTrue(got[4]["line"].endswith(" rule_source=invalid"), got[4]["line"])
 
+    # ---- adversary r1 A1 (introduced major) and its siblings: a number is never squeezed through [string] (15 significant digits) on its way to a comparison
+    def test_r1_a1_a_threshold_that_needs_every_digit_is_published_and_applied_exactly(self) -> None:
+        exact = "80.00000000000001"   # the agent: mean 80 is CLEAR (80 >= 80.00000000000001 is false); the gate must agree on every path
+        pub = ps(agent_fn_ps("Get-AgentHeatRule", f"$GateMaxThrottledRows = 6; $GateMeanMaxC = {exact}; $GateSustainedRows = 60; $GateFeedStaleSec = 120", "(Get-AgentHeatRule | ConvertTo-Json -Compress)"))
+        self.assertIn(f'"meanMaxC":{exact}', pub, "the agent publishes the threshold it runs with, every digit")
+        probe_json = '{"maxThrottledRows":6,"meanMaxC":' + exact + ',"sustainedRows":60,"feedStaleSec":120}'
+        rd = ps_json(quiet_fn_ps("Read-TelAgentHeatRule", "", f"Read-TelAgentHeatRule -Json '{probe_json}' -DefaultRows 60 -DefaultStaleSec 120"))
+        self.assertEqual((rd["source"], rd["meanMaxC"]), ("agent", float(exact)), rd)
+        # the probe's printer keeps the digits on the line; the gate reads them back
+        funcs = "\n".join(quiet_fn_ps(n, "", "") for n in ("ConvertTo-IdentToken", "Format-TelNum", "Get-TelReasonSuffix", "Write-TelemetryLines"))
+        printed = ps(
+            "$telemetrySchemaV1 = 'mlv-app/venue-quiet-probe-telemetry/v1'; function Write-Gate([string]$s) { $s }\n" + funcs + "\n"
+            f"$p = [ordered]@{{ telemetry_schema = $telemetrySchemaV1; heat = [ordered]@{{ source = 'x'; sample_age_s = 1.0; hottest_core_c = 50.0; max15_c = 60.0; mean_c = 80.0; mean_c_exact = 80.0; throttled = 0; window_rows = 60; package_w = 10.0; reasons = [ordered]@{{}}; "
+            f"rule = [ordered]@{{ source = 'agent'; maxThrottledRows = 6; meanMaxC = {exact}; sustainedRows = 60; feedStaleSec = 120 }} }}; gpu = [ordered]@{{ state = 'absent' }}; last_lease = [ordered]@{{ event = 'none' }} }} | ConvertTo-Json -Depth 6 | ConvertFrom-Json\n"
+            "@(Write-TelemetryLines $p)[0]")
+        self.assertIn(f" rule_mean_max_c={exact} ", printed + " ", printed)
+        # the gate: the printed line and the raw JSON both read mean 80.0 as clear, and 80.00000000000001 as hot (>=)
+        for mean, want in ((80.0, "clear"), (float(exact), "hot")):
+            line = f"  tele heat source=x age=1.0s hottest=50.0C max15=60.0C mean={mean:.1f}C throttled=0/60 W=10.0 mean_exact={mean!r} rule_source=agent rule_max_throttled=6 rule_mean_max_c={exact} rule_rows=60 rule_stale_s=120"
+            got = ps_json(f"ConvertFrom-VenueProbeHeatLine -Lines @('{line}')")
+            self.assertEqual((got["heat"], got["thresholdsSource"]), (want, "agent"), (mean, got))
+        import tempfile
+        d = Path(tempfile.mkdtemp(prefix="thermal-a1-"))
+        for mean, want in ((80.0, "clear"), (float(exact), "hot")):
+            p = d / f"raw-{mean!r}.json"
+            p.write_text('{"heat": {"mean_c": 80.0, "mean_c_exact": ' + repr(mean) + ', "throttled": 0, "window_rows": 60, "rule": {"source": "agent", "maxThrottledRows": 6, "meanMaxC": ' + exact
+                         + ', "sustainedRows": 60, "feedStaleSec": 120}}}', encoding="utf-8")
+            got = ps_json(f"ConvertFrom-VenueProbeHeatLine -Lines @('  raw {p}')")
+            self.assertEqual((got["heat"], got["source"]), (want, "raw-json"), (mean, got))
+        # the sibling: the largest finite double is a finite threshold (the lossy string form overflowed it), and an exact mean one ulp under the DEFAULT 88 is clear
+        big = ps_json("Resolve-VenueHeatRule -Rule ([pscustomobject]@{ source = 'agent'; maxThrottledRows = 6; meanMaxC = [double]::MaxValue; sustainedRows = 60; feedStaleSec = 120 })")
+        self.assertEqual((big["valid"], big["meanMaxC"]), (True, 1.7976931348623157e308), big)
+        under = "87.99999999999999"
+        self.assertEqual(ps_json(f"ConvertFrom-VenueProbeHeatLine -Lines @('  tele heat source=x age=1.0s hottest=50.0C max15=60.0C mean=88.0C throttled=0/60 W=10.0 mean_exact={under}')")["heat"], "clear")
+        self.assertEqual(ps_json(f"(Get-VenueHeatVerdict -Throttled 0 -MeanC ([double]{under}))"), "clear")
+
+    def test_r1_a2_an_array_is_not_a_published_rule(self) -> None:
+        # a numeric array coerces through [string]; the record must be one object of scalar numbers
+        for text in ('[{"maxThrottledRows":6,"meanMaxC":88,"sustainedRows":60,"feedStaleSec":120}]', '{"maxThrottledRows":[3],"meanMaxC":[80],"sustainedRows":[60],"feedStaleSec":[120]}'):
+            bad = ps_json(quiet_fn_ps("Read-TelAgentHeatRule", "", f"Read-TelAgentHeatRule -Json '{text}' -DefaultRows 60 -DefaultStaleSec 120"))
+            self.assertEqual(bad["source"], "invalid", (text, bad))
+        got = ps_json("Resolve-VenueHeatRule -Rule ('{\"source\":\"agent\",\"maxThrottledRows\":[3],\"meanMaxC\":[80],\"sustainedRows\":[60],\"feedStaleSec\":[120]}' | ConvertFrom-Json)")
+        self.assertEqual((got["valid"], got["reason"]), (False, "THERMAL_THRESHOLDS_INVALID"), got)
+        # a raw heat.rule that is a one-element array is no object either (a $(...) would have unwrapped it into the object inside)
+        import tempfile
+        p = Path(tempfile.mkdtemp(prefix="thermal-a2-")) / "raw.json"
+        p.write_text('{"heat": {"mean_c": 82, "mean_c_exact": 82.0, "throttled": 4, "window_rows": 60, "rule": [{"source": "agent", "maxThrottledRows": 3, "meanMaxC": 80, "sustainedRows": 60, "feedStaleSec": 120}]}}', encoding="utf-8")
+        got = ps_json(f"ConvertFrom-VenueProbeHeatLine -Lines @('  raw {p}')")
+        self.assertEqual((got["heat"], got["reason"]), ("unknown", "THERMAL_THRESHOLDS_INVALID"), got)
+
     # ---- the leg receipt says where the thresholds came from
     def test_the_runner_receipt_carries_thresholds_source(self) -> None:
         src = (DV / "Invoke-VenueLeaseBatch.ps1").read_text(encoding="utf-8")
