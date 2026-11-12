@@ -951,21 +951,24 @@ bool ReceiptApplier::applyHeadlessLookAssist(ReceiptSettings *receipt,
             renderedAtPresetExposure = processedThumbnailAtExposure(
                 mlvObject, frameIndex, colorDownscaleFactor, 1, presetStops, processedOut );
         }
+        bool processedRendered = renderedAtPresetExposure;
         if( !renderedAtPresetExposure )
         {
-            get_area_average_downscale_thumnail(
+            processedRendered = get_area_average_downscale_thumnail(
                 mlvObject,
                 frameIndex,
                 colorDownscaleFactor,
                 1,
-                processedOut );
+                processedOut ) != 0;
         }
         processedColorStats = analyzeLookAssistThumbnail(
             reinterpret_cast<const unsigned char *>( processedThumbnail.constData() ),
             colorWidth,
             colorHeight );
         const int minColorBalanceSamples = qMax( 32, ( colorWidth * colorHeight ) / 100 );
+        // r3 adversary pass 5 A1 sibling (same rule as the GUI): an unrendered buffer is never the measurement.
         useProcessedColorStats =
+            processedRendered &&
             processedColorStats.median > 0.0 &&
             processedColorStats.balanceSamples >= minColorBalanceSamples;
     }

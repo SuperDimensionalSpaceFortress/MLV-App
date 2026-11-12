@@ -2274,4 +2274,227 @@ LookAssistPreset presetForLookAssistScene( LookAssistScene scene,
     return preset;
 }
 
+// Moved verbatim from platform/qt/MainWindow.cpp (LOOK-ASSIST-GREEN-ARTIFACT-FALLBACK-AT-LIFTED-EXPOSURE-1).
+QString lookAssistColorCastWarning(
+        bool postColorStatsValid,
+        const LookAssistStats &postColorStats,
+        double postVisibleGreenAxis,
+        int finalTemperature,
+        double postBlueAmberAxis )
+{
+    if( postColorStatsValid )
+    {
+        if( postColorStats.greenArtifactRatio >= 0.10
+         && postColorStats.greenArtifactMeanAxis >= 25.0 )
+        {
+            return QStringLiteral("localized-green-artifact");
+        }
+        if( postVisibleGreenAxis >= 8.0 )
+        {
+            return QStringLiteral("global-green-cast");
+        }
+        if( postVisibleGreenAxis <= -8.0 )
+        {
+            return QStringLiteral("global-magenta-cast");
+        }
+        if( finalTemperature <= 5200 && postBlueAmberAxis >= 4.0 )
+        {
+            return QStringLiteral("cool-blue-cast");
+        }
+        if( finalTemperature >= 6800 && postBlueAmberAxis <= -4.0 )
+        {
+            return QStringLiteral("warm-amber-cast");
+        }
+    }
+    return QStringLiteral("none");
+}
+
+// Moved verbatim from platform/qt/MainWindow.cpp (LOOK-ASSIST-GREEN-ARTIFACT-FALLBACK-AT-LIFTED-EXPOSURE-1).
+bool lookAssistColorCastShouldFailClosed( const QString &warning,
+                                          double greenArtifactRatio,
+                                          double greenArtifactMeanAxis,
+                                          double visibleGreenAxis,
+                                          bool postAppliedStats )
+{
+    if( warning == QStringLiteral("rejected-unstable-floor-lifted") )
+    {
+        return true;
+    }
+    if( warning == QStringLiteral("processed-floor-lifted-awb-risk") )
+    {
+        return true;
+    }
+    if( warning == QStringLiteral("processed-floor-lifted-post-invalid") )
+    {
+        return true;
+    }
+    if( warning == QStringLiteral("global-green-cast")
+     || warning == QStringLiteral("global-magenta-cast") )
+    {
+        return postAppliedStats;
+    }
+    if( warning == QStringLiteral("localized-green-artifact") )
+    {
+        if( !postAppliedStats )
+        {
+            return false;
+        }
+        return visibleGreenAxis >= 14.0
+            || ( greenArtifactRatio >= 0.28 && greenArtifactMeanAxis >= 42.0 );
+    }
+    return false;
+}
+
+LookAssistSafetyAction lookAssistSafetyAction( const QString &warning,
+                                               double greenArtifactRatio,
+                                               double greenArtifactMeanAxis,
+                                               double visibleGreenAxis,
+                                               bool postAppliedStats,
+                                               int appliedExposure,
+                                               int baselineExposure,
+                                               double postNeutralGreenAxis )
+{
+    if( !lookAssistColorCastShouldFailClosed( warning, greenArtifactRatio, greenArtifactMeanAxis,
+                                              visibleGreenAxis, postAppliedStats ) )
+    {
+        return LookAssistSafetyAction::Keep;
+    }
+    // Every green threshold is an absolute code-value distance, so an exposure the analysis raised can carry green
+    // CONTENT (foliage) over them while the neutral samples stay neutral (M16-1456: +3.8 stops, neutral green axis
+    // 5.0, visible green axis 5.6 -> 15.9). Only then is the exposure retreated rather than the whole look: a green
+    // warning, post-applied stats, a raised exposure and a neutral that does not itself lean green. A magenta,
+    // floor-lifted or unstable warning, or a green neutral (a real cast, or dual-ISO green corruption), reverts as before.
+    const bool greenWarning = warning == QStringLiteral("localized-green-artifact")
+                           || warning == QStringLiteral("global-green-cast");
+    if( greenWarning
+     && postAppliedStats
+     && appliedExposure > baselineExposure
+     && postNeutralGreenAxis <= 8.0 )
+    {
+        return LookAssistSafetyAction::RetreatExposure;
+    }
+    return LookAssistSafetyAction::RevertBaseline;
+}
+
+QVector<int> lookAssistSafetyRetreatRungs( int appliedExposure, int baselineExposure )
+{
+    QVector<int> rungs;
+    if( appliedExposure <= baselineExposure ) return rungs;
+    const qint64 excess = static_cast<qint64>( appliedExposure ) - baselineExposure;   // no int overflow
+    const int candidates[] = { static_cast<int>( baselineExposure + excess / 2 ),
+                               static_cast<int>( baselineExposure + excess / 4 ) };
+    for( const int rung : candidates )
+    {
+        if( rung == appliedExposure || rung == baselineExposure || rungs.contains( rung ) ) continue;
+        rungs.append( rung );
+    }
+    return rungs;
+}
+
+LookAssistRetreatOutcome lookAssistRunSafetyRetreat( int appliedExposure,
+                                                     int baselineExposure,
+                                                     const std::function<int( int exposure )> &applyExposure,
+                                                     const std::function<LookAssistRetreatMeasurement()> &measure )
+{
+    LookAssistRetreatOutcome out;
+    out.shownExposure = applyExposure( baselineExposure );
+    out.bottom = measure();
+    ++out.measurements;
+    out.shown = out.bottom;
+    if( !out.bottom.valid || out.bottom.warning != QStringLiteral("none") )
+    {
+        out.action = LookAssistSafetyAction::RevertBaseline;
+        return out;
+    }
+    for( const int rung : lookAssistSafetyRetreatRungs( appliedExposure, baselineExposure ) )
+    {
+        out.shownExposure = applyExposure( rung );
+        const LookAssistRetreatMeasurement m = measure();
+        ++out.measurements;
+        out.triedRungs.append( QStringLiteral("%1:%2:%3")
+                                   .arg( out.shownExposure )
+                                   .arg( m.visibleGreenAxis, 0, 'f', 3 )
+                                   .arg( m.valid ? m.stats.greenArtifactRatio : 0.0, 0, 'f', 6 ) );
+        if( m.valid
+         && !lookAssistColorCastShouldFailClosed( m.warning,
+                                                  m.stats.greenArtifactRatio,
+                                                  m.stats.greenArtifactMeanAxis,
+                                                  m.visibleGreenAxis,
+                                                  true ) )
+        {
+            out.rungKept = true;
+            out.shown = m;
+            break;
+        }
+    }
+    if( !out.rungKept )
+    {
+        // No rung passed: the baseline exposure is shown, described by its own (identical-settings) measurement.
+        out.shownExposure = applyExposure( baselineExposure );   // the same (deterministic) exposure the bottom measured
+        out.shown = out.bottom;
+    }
+    out.action = LookAssistSafetyAction::Keep;
+    return out;
+}
+
+QString lookAssistSafetyRetreatLogFields( const QString &firstWarning,
+                                          int appliedExposure,
+                                          int baselineExposure,
+                                          const LookAssistRetreatOutcome &outcome,
+                                          int frame )
+{
+    const bool kept = outcome.action == LookAssistSafetyAction::Keep;
+    return QStringLiteral("first_warning=%1 applied_exposure=%2 baseline_exposure=%3 bottom_warning=%4 bottom_visible_green_axis=%5 bottom_green_ratio=%6 kept_exposure=%7 rungs_tried=%8 rungs=%9 kept_warning=%10 frame=%11")
+        .arg( firstWarning )
+        .arg( appliedExposure )
+        .arg( baselineExposure )
+        .arg( outcome.bottom.warning )
+        .arg( outcome.bottom.visibleGreenAxis, 0, 'f', 3 )
+        .arg( outcome.bottom.valid ? outcome.bottom.stats.greenArtifactRatio : 0.0, 0, 'f', 6 )
+        .arg( kept ? QString::number( outcome.shownExposure ) : QStringLiteral("none") )
+        .arg( outcome.triedRungs.size() )
+        .arg( outcome.triedRungs.isEmpty() ? QStringLiteral("none") : outcome.triedRungs.join( QLatin1Char(',') ) )
+        .arg( kept ? outcome.shown.warning : QStringLiteral("reverted") )
+        .arg( frame );
+}
+
+QString lookAssistPictureDumpFileName( bool finalLook, int frame )
+{
+    return ( finalLook ? QStringLiteral("look-assist-final-frame%1.png")
+                       : QStringLiteral("look-assist-pre-safety-frame%1.png") ).arg( frame );
+}
+
+QString lookAssistPictureDumpFields( int frame,
+                                     int preSafetyExposure,
+                                     const QString &preSafetySha256,
+                                     int finalExposure,
+                                     const QString &finalSha256,
+                                     const QString &safety )
+{
+    const bool preWritten = !preSafetySha256.isEmpty();
+    const bool finalWritten = !finalSha256.isEmpty();
+    return QStringLiteral("pre_safety=%1 pre_safety_sha256=%2 pre_safety_exposure=%3 final=%4 final_sha256=%5 final_exposure=%6 safety=%7 frame=%8")
+        .arg( preWritten ? lookAssistPictureDumpFileName( false, frame ) : QStringLiteral("none") )
+        .arg( preWritten ? preSafetySha256 : QStringLiteral("none") )
+        .arg( preSafetyExposure )
+        .arg( finalWritten ? lookAssistPictureDumpFileName( true, frame ) : QStringLiteral("none") )
+        .arg( finalWritten ? finalSha256 : QStringLiteral("none") )
+        .arg( finalExposure )
+        .arg( safety )
+        .arg( frame );
+}
+
+bool lookAssistPictureDumpStateLabelValid( const QString &label )
+{
+    if( label.isEmpty() || label.size() > 64 ) return false;
+    for( const QChar c : label )
+    {
+        const ushort u = c.unicode();
+        const bool ok = ( u >= 'A' && u <= 'Z' ) || ( u >= 'a' && u <= 'z' ) || ( u >= '0' && u <= '9' )
+                     || u == '_' || u == '-';
+        if( !ok ) return false;
+    }
+    return true;
+}
+
 } // namespace lookassist
