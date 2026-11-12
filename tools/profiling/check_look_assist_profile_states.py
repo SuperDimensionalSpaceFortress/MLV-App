@@ -95,7 +95,9 @@ def line_event(line):
     if not tag:
         return None, 0
     named = TRACE_EVENT.match(line, tag.end())
-    return (named.group(1), named.end()) if named else ("", tag.end())
+    # The fields start AT the tag, so the event= selector is itself one of the line's key=value tokens: a second event= (any
+    # spelling) is a duplicate like any other and the line is ambiguous (adversary pass 978b1ac0 A1).
+    return (named.group(1) if named else ""), tag.end()
 DUMP_EVENT = "look_assist.apply.picture_dump"
 # EVERY name=value token the line carries, whatever the spelling of the name (upper case, hyphens, anything but "=" and
 # whitespace): the duplicate check runs over all of them BEFORE any consumer looks up the lower-case names it knows, so a

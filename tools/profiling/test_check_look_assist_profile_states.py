@@ -886,6 +886,11 @@ class PictureDumpBindingAdversaryR3(unittest.TestCase):
             "case-folded known key Scene=night": "Scene=night",       # only the events that carry scene=
             "case-folded known key FRAME=7": "FRAME=7",          # only the events that carry frame=
             "hyphen and case AUDIT-NOTE=a audit-note=b": "AUDIT-NOTE=a audit-note=b",
+            # adversary pass on 978b1ac0 A1: the event selector itself is a field of the line, so a second one is a duplicate
+            "second event= selector (skip)": "event=look_assist.apply.skip",
+            "second EVENT= selector (skip)": "EVENT=look_assist.apply.skip",
+            "second event= selector (result)": "event=look_assist.apply.result",
+            "second Event= selector (same name)": "Event=look_assist.apply.picture_dump",
         }
         flows = {
             "dump": lambda sha, x: (AUTO_WB_LINE + add(dump_line(sha), x) + result_line()),
