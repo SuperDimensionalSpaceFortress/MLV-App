@@ -2909,7 +2909,14 @@ function Get-DvExposureMedian {
     if ($v.Count -eq 0) { return $null }
     $mid = [int][math]::Floor($v.Count / 2)
     if ($v.Count % 2 -eq 1) { return [double]$v[$mid] }
-    ([double]$v[$mid - 1] + [double]$v[$mid]) / 2.0
+    $lo = [double]$v[$mid - 1]; $hi = [double]$v[$mid]
+    # r4 (adversary 099c3eac A1): the middle two average in DECIMAL, not in binary floating point: (0.4 + 0.8) / 2.0 is 0.6000000000000001, which is over an
+    # inclusive cap of 0.6 that the exact midpoint meets (the same for a luma median over 100.0001 and for the clipped fraction). The decimal midpoint converts
+    # back to the double the file's own literal parses to, so a median that sits ON a limit compares equal to it. A value decimal cannot hold (NaN, infinity,
+    # a magnitude outside 1e-12..1e12 other than zero) keeps the double average: the verdict reports a non-finite median, so this never throws.
+    $inDecimalRange = { param($x) -not [double]::IsNaN($x) -and -not [double]::IsInfinity($x) -and ($x -eq 0.0 -or ([math]::Abs($x) -ge 1e-12 -and [math]::Abs($x) -le 1e12)) }
+    if ((& $inDecimalRange $lo) -and (& $inDecimalRange $hi)) { return [double](([decimal]$lo + [decimal]$hi) / 2) }
+    ($lo + $hi) / 2.0
 }
 
 function Get-DvVisualExposureStats {

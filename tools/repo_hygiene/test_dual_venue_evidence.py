@@ -9386,6 +9386,35 @@ class VisualExposureFloorTests(unittest.TestCase):
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         self.assertEqual(out, {"a": 20, "b": None, "c": 20, "d": 25})
 
+    def test_the_visual_exposure_median_of_an_even_count_is_the_exact_midpoint_not_a_floating_point_average(self) -> None:
+        # adversary 099c3eac A1 (r4): the median of an even count was ([double]a + [double]b) / 2.0, so frame fractions 0.4 and 0.8 (exactly 0.6 between them)
+        # averaged to 0.6000000000000001 and tripped the inclusive cap of 0.6; the same for a luma median over 100.0001 and the clipped fraction
+        pairs = [("0.4", "0.8", "0.6"), ("0.1", "0.5", "0.3"), ("100.0000", "100.0002", "100.0001"), ("99.9998", "100.0000", "99.9999"),
+                 ("0.2", "1.0", "0.6"), ("0.05", "0.15", "0.1"), ("16.0001", "16.0003", "16.0002"), ("234.9999", "235.0001", "235")]
+        script = "$ErrorActionPreference = 'Stop'; $rows = @(); " + " ".join(
+            f"$rows += [pscustomobject]@{{ lo = '{a}'; hi = '{b}'; mid = '{m}'; "
+            f"exact = ((Get-DvExposureMedian ([double[]]@({a}, {b}))) -eq {m}); "
+            f"reversed = ((Get-DvExposureMedian ([double[]]@({b}, {a}))) -eq {m}) }};" for a, b, m in pairs) + " ConvertTo-Json -InputObject @($rows) -Compress"
+        proc, out = run_pwsh_json(script)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIsNotNone(out, proc.stdout + proc.stderr)
+        for row in out:
+            self.assertTrue(row["exact"] and row["reversed"], row)
+        # six frames: three at 0.4 and three at 0.8 (the adversary's input), and the middle two of a longer even list
+        proc, out = run_pwsh_json("[pscustomobject]@{ six = ((Get-DvExposureMedian ([double[]]@(0.4, 0.4, 0.4, 0.8, 0.8, 0.8))) -eq 0.6); "
+                                  "four = ((Get-DvExposureMedian ([double[]]@(0.0, 0.4, 0.8, 1.0))) -eq 0.6); odd = ((Get-DvExposureMedian ([double[]]@(0.6, 0.1, 0.9))) -eq 0.6) } | ConvertTo-Json -Compress")
+        self.assertEqual(out, {"six": True, "four": True, "odd": True})
+
+    def test_the_visual_exposure_median_never_throws_on_values_a_decimal_cannot_hold(self) -> None:
+        # r4: the exact midpoint is taken in decimal, which throws on NaN, infinity and magnitudes past its range; the verdict reports 'a median is not a finite number',
+        # so the median must hand those on as doubles, never throw
+        proc, out = run_pwsh_json("$ErrorActionPreference = 'Stop'; [pscustomobject]@{ nan = [double]::IsNaN([double](Get-DvExposureMedian ([double[]]@([double]::NaN, 1.0)))); "
+                                  "inf = [double]::IsInfinity((Get-DvExposureMedian ([double[]]@(1.0, [double]::PositiveInfinity)))); "
+                                  "big = ((Get-DvExposureMedian ([double[]]@(1e300, 3e300))) -eq 2e300); tiny = ((Get-DvExposureMedian ([double[]]@(1e-300, 3e-300))) -eq 2e-300); "
+                                  "zero = ((Get-DvExposureMedian ([double[]]@(0.0, 0.0))) -eq 0.0) } | ConvertTo-Json -Compress")
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertEqual(out, {"nan": True, "inf": True, "big": True, "tiny": True, "zero": True})
+
     def test_the_visual_exposure_band_file_is_parsed_strictly(self) -> None:
         # adversary dfb973a0 A2 / A6: ConvertFrom-Json unwraps a one-element array root and refuses keys that differ only in case
         fallback = {"minMedianLuma": 16, "maxMedianLuma": 255, "maxNearBlackFraction": 0.6, "maxClippedFraction": 0.05}
