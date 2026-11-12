@@ -204,6 +204,9 @@ REGULAR_FILE_MODE = "100644"
 # a test pins them to the vendored copy. The drain's authority is still that validator.
 MAX_CARD_LINES = 15
 MAX_CARD_BYTES = 2000
+# The card field names, a copy of the bus validator's CARD_FIELDS (tools/validate-cards.mjs); a test pins it to the vendored
+# validator, like the two limits above. The fused-key screen (screen_card_field_keys) keys on this one list.
+CARD_FIELDS = ("rule", "mechanism", "applies", "check", "supersedes", "evidence")
 WORD_CAP = 450
 ITEM_NAME_RE = re.compile(r"^\d{8}-[a-z0-9][a-z0-9-]{2,60}\.md$")
 SHA_RE = re.compile(r"^[0-9a-f]{7,40}$")
@@ -563,6 +566,36 @@ def _run_git(repo: pathlib.Path, args: list[str], input_text: str | None = None,
     )
 
 
+def item_text_from_bytes(raw: bytes, errors: str = "replace") -> str:
+    """An outbox item's text exactly as the default text readers read it: CRLF and a lone CR both become LF (a file read with
+    read_text, a text-mode git pipe). `errors` is "strict" for a file read (as read_text was) and "replace" for a git blob (as the
+    text pipe was). Whether the bytes held a lone CR is a separate fact, has_lone_cr, which only a CARD refuses (parse_item)."""
+    return raw.decode("utf-8", errors=errors).replace("\r\n", "\n").replace("\r", "\n")
+
+
+_LONE_CR_RE = re.compile(rb"\r(?!\n)")
+
+
+def has_lone_cr(raw: bytes) -> bool:
+    """True when `raw` holds a carriage return that is not half of a CRLF line end. The bus validator splits a card on LF only, so
+    `rule: x<CR>check: hidden` is ONE row to it (a fused key); the CR-to-LF translation above turns it into two accepted fields, so
+    the screen never saw the fusion and the drain rendered a duplicate field the bus rejects (Sol r3 B1). The translation stays,
+    for every non-card item reads as it always did, and a card carrying this refuses (ITEM_CARD_LONE_CR)."""
+    return _LONE_CR_RE.search(raw) is not None
+
+
+def git_show_item_text(repo: pathlib.Path, spec: str) -> tuple[int, str, str, bool]:
+    """(returncode, text, stderr, lone_cr) of `git show <spec>`: the text read by item_text_from_bytes and stripped as git_try strips
+    it, and whether the blob held a lone CR (has_lone_cr, judged on the raw bytes before any strip)."""
+    env = {**os.environ, "GIT_OPTIONAL_LOCKS": "0"}
+    proc = subprocess.run(
+        ["git", "-C", str(repo), "-c", "core.autocrlf=false", "-c", "core.safecrlf=false", "show", spec],
+        capture_output=True, timeout=120, env=env,
+    )
+    return (proc.returncode, item_text_from_bytes(proc.stdout).strip(),
+            proc.stderr.decode("utf-8", errors="replace").strip(), has_lone_cr(proc.stdout))
+
+
 def git(repo: pathlib.Path, *args: str, input_text: str | None = None,
         extra_env: dict[str, str] | None = None) -> str:
     proc = _run_git(repo, list(args), input_text, extra_env)
@@ -609,8 +642,9 @@ def cat_file_blob(repo: pathlib.Path, ref: str, path: str, extra_env: dict[str, 
 
 # ---------- items: parse, screen, key, render ----------
 
-def parse_item(text: str) -> dict:
-    """Front matter + body. Refuses on any schema hole; never guesses a default."""
+def parse_item(text: str, lone_cr: bool = False) -> dict:
+    """Front matter + body. Refuses on any schema hole; never guesses a default. `lone_cr` is has_lone_cr of the item's raw bytes
+    (the readers translate it away); a card carrying one is refused."""
     require_configured()
     if not text.startswith("---\n"):
         raise Refusal("ITEM_NO_FRONT_MATTER")
@@ -648,7 +682,13 @@ def parse_item(text: str) -> dict:
     if not body.strip():
         raise Refusal("ITEM_EMPTY_BODY")
     if meta["target"] == CARDS_TARGET:
-        if not CARD_HEADING_RE.match(body.lstrip().splitlines()[0].rstrip()):
+        if lone_cr or "\r" in body:
+            # The readers translate a lone CR to LF (item_text_from_bytes) and report it (has_lone_cr). The bus splits a card on LF
+            # only, so a CR is text inside a row, where it can hide a fused field key that the translation would promote to an
+            # accepted field (Sol r3 B1).
+            raise Refusal("ITEM_CARD_LONE_CR", "a card body holds a carriage return that is not part of a CRLF line end; the bus "
+                                               "validator reads it as text inside a row, so remove it")
+        if not CARD_HEADING_RE.match(card_heading_row(body)):
             raise Refusal("ITEM_BODY_NOT_A_CARD", f"body must start with a '## {PROJECT}/<id>' card heading "
                                                   f"(R14.1; format in the bus's {CARD_VALIDATOR_REL})")
     elif not body.lstrip().startswith("### "):
@@ -783,20 +823,255 @@ def render_block(item: dict, source_commit: str, project: str | None = None) -> 
         # Every line of a card is a field, a continuation or a bold-bullet note; the validator
         # refuses an HTML comment there, so the marker is a note line. It counts toward the
         # card's 15-line and 2,000-byte limits, which the validator checks before any push.
+        # The block starts at the heading: a blank row before it (which parse_item accepts) would, appended after another card, be a
+        # row of THAT card (`﻿\x85` is a continuation with no field above it). The key above still covers the authored body.
+        body = _from_heading_row(body)
         return key, f"{body}\n- **Outbox:** outbox:{key} {project}:{source_commit[:12]}\n"
     block = f"{body}\n<!-- outbox:{key} {project}:{source_commit[:12]} -->\n"
     return key, block
 
 
 def item_heading(item: dict) -> str:
-    """The `### ` line an item opens with -- how a published_as claim is looked up."""
+    """The heading line an item opens with -- how a published_as claim is looked up. A card's is the heading row the bus reads
+    (card_heading_row), past any blank preamble row: lstrip() keeps U+FEFF, so it named the preamble (adversary pass on cd5b0b6c A2)."""
+    if item["meta"]["target"] == CARDS_TARGET:
+        return card_heading_row(item["body"])
     return item["body"].lstrip().splitlines()[0].rstrip()
+
+
+_FIELD_KEY_ALT = "|".join(CARD_FIELDS)
+_PLAIN_KEY_RE = re.compile(rf"(?P<key>{_FIELD_KEY_ALT}):")
+
+# The bus validator's reading of one card line, reproduced from parseFieldLine in validate-cards.mjs rather than approximated.
+# The validator is JavaScript, and its `\s`, trim() and toLowerCase() are not Python's: \s and trim() count U+FEFF and not U+0085
+# or U+001C-U+001F, and toLowerCase() folds the Kelvin sign to `k` but not the dotless i or the long s. A lookalike
+# (r1: `[\s\ufeff]` and re.IGNORECASE) exempted lines the bus reads as notes. Tests run the vendored JavaScript over the same inputs
+# (test_a_line_is_read_as_a_field_exactly_as_the_bus_validators_parseFieldLine_reads_it) and compare the whitespace class
+# code point by code point.
+_JS_WS_CHARS = "\t\n\x0b\x0c\r \xa0\u1680" + "".join(map(chr, range(0x2000, 0x200B))) + "\u2028\u2029\u202f\u205f\u3000\ufeff"
+_JS_WS = "[" + "".join(re.escape(c) for c in _JS_WS_CHARS) + "]"
+_JS_NOT_EOL = r"[^\n\r\u2028\u2029]"   # JS `.` (no s flag); the validator's `$` is the end of the line, there is no m flag
+# The validator's bold line is `- **label:**` then optionally `\s+.*` to the end. A regex of `{WS}+{NOT_EOL}*\Z` backtracks
+# quadratically on a long whitespace run that ends in a line separator (Sol r3 B2), so only the head is a regex and the tail is
+# checked in linear time by _bold_tail_ok.
+_BUS_BOLD_HEAD_RE = re.compile(r"- \*\*(?P<label>[^*:]+):\*\*")
+_JS_EOL_CHARS = "\n\r  "
+
+
+def _bold_tail_ok(rest: str) -> bool:
+    """True when `rest` matches `(?:\\s+.*)?$` as JavaScript reads it: empty, or whitespace first and, up to the last line
+    terminator (which `.` cannot cross), nothing but whitespace."""
+    if not rest:
+        return True
+    if rest[0] not in _JS_WS_CHARS:
+        return False
+    last = max(rest.rfind(c) for c in _JS_EOL_CHARS)
+    return last < 0 or not rest[:last + 1].strip(_JS_WS_CHARS)
+_BUS_PLAIN_LINE_RE = re.compile(rf"(?P<label>[A-Za-z-]+):(?:{_JS_WS}{_JS_NOT_EOL}*)?\Z")
+# BOLD_LABELS in validate-cards.mjs (a test pins it to the vendored validator): the bold-bullet labels that are fields.
+_BOLD_LABELS = {**{k: k for k in CARD_FIELDS}, "applies to": "applies"}
+# A bold label anywhere in a line, for the scan past a line's opening (the validator reads one only at the start of a line).
+_BOLD_LABEL_SCAN_RE = re.compile(r"- \*\*(?P<label>[^*:]+):\*\*")
+# The one quotation the screen recognises: a field key written as a single-line, space-free backtick token that ends in the key
+# (`check:`, ``check:``, `touches/supersedes:`), opened and closed by backtick runs of the SAME length (a code span closes only
+# on an equal run, so any length is a quotation and an unequal pair is not). It is a token pattern, not a markdown parser: a span
+# with spaces in it, one that crosses a line, or one opened by an escaped backtick is not recognised, so its key is refused (fail
+# closed) and the author rewords. Every parser-shaped exemption tried here (CommonMark spans, escapes, multi-line spans) was bypassed.
+_QUOTED_KEY_RE = re.compile(r"(?<![`\\\w])(`+)(?!`)[^\s`]*(?:" + _FIELD_KEY_ALT + r"):\1(?!`)")
+
+
+# What a quoted token is replaced with before the scan: the same width (so a reported column holds) and a character that is
+# neither whitespace nor part of a key or a bold label's punctuation. Spaces were wrong: a space inside a bold label is text the
+# bus validator trims and folds, so masking `check `rule:`:` as spaces made a fabricated `check` label (adversary r2 A1).
+_QUOTE_MASK = "\x00"
+
+
+# Every character either JavaScript's trim() or Python's strip() removes: the union, so a row that mixes the two classes
+# (U+0085 then U+FEFF, which neither rule empties alone) is blank too.
+_BLANK_ROW_CHARS = _JS_WS_CHARS + "".join(c for c in map(chr, range(0x10000)) if c.isspace() and c not in _JS_WS_CHARS)
+
+
+def _is_blank_row(row: str) -> bool:
+    """True for a row to skip before the card heading: one made only of characters JavaScript's trim() or Python's strip() removes
+    (_BLANK_ROW_CHARS). The bus ignores any row before its first card that is not card-like, so a row of only U+0085 or
+    U+001C-U+001F (which trim() keeps and str.strip() drops) is no card text to it, and the base read the heading past it with
+    body.lstrip() (adversary pass on 36e4753f A1). One test here, so every site that reads a card's rows skips the same rows; a
+    row with any other character, such as U+200B, is not blank and is still refused as the heading."""
+    return not row.strip(_BLANK_ROW_CHARS)
+
+
+def _from_heading_row(body: str) -> str:
+    """`body` without the blank rows (_is_blank_row) before its first other row, split on "\n" and otherwise byte for byte."""
+    rows = body.split("\n")
+    first = 0
+    while first < len(rows) and _is_blank_row(rows[first]):
+        first += 1
+    return "\n".join(rows[first:])
+
+
+_BACKTICK_RUN_RE = re.compile(r"`+")
+# Where markdown may read a backtick as plain text rather than a code-span delimiter: raw HTML, an HTML comment or an autolink (`<`),
+# a link destination or title (`](`), a reference definition (`]:`). Not modelled; masking stops there (see _mask_quotations).
+_MARKUP_OPEN_RE = re.compile(r"<|\]\(|\]:")
+
+
+def _backslashes_before(row: str, pos: int) -> int:
+    """How many backslashes sit directly before row[pos]."""
+    n = 0
+    while pos - n > 0 and row[pos - n - 1] == "\\":
+        n += 1
+    return n
+
+
+def _mask_quotations(row: str) -> tuple[str, bool]:
+    """`(masked, distrusted)`: `row` with each quoted key token (_QUOTED_KEY_RE) replaced by _QUOTE_MASK of the same width, and
+    whether the rows AFTER this one must be left unmasked. A token is masked only when its opening run really OPENS a code span:
+    the runs of the row pair as CommonMark pairs them (each run takes the next run of EQUAL length; the runs between are span
+    text), and only a run that takes a partner is an opener. Counting runs was wrong twice: in `x `!`check:` git` the run after
+    `!` closes a span, and in ``a`!``check:`` the lone run between equal-length runs is skipped, so the closing double run was
+    read as an opener and a bare `check:` was masked (adversary passes on b68df2a5 A1 and 0a19848c A1). A run with no partner in
+    the row, or one preceded by an odd number of backslashes (escaped: text, not a delimiter; Sol r5 B1), is not understood well
+    enough to model: it may pair with a run in a LATER row (a span crosses rows, adversary 0a19848c A2), so no token at or after
+    it is masked, in this row or any later one (`distrusted`). The token is left in the row, its key is refused (fail closed) and
+    the author rewords. An EVEN number of backslashes is an escaped backslash and leaves the run real. A backtick is also plain
+    text inside raw HTML (`<i title="`">`), an HTML comment, an autolink, a link destination or title (`](`) and a reference
+    definition (`]:`), so the first of those (_MARKUP_OPEN_RE) stops masking the same way (adversary 4640f9b8 A1)."""
+    runs = list(_BACKTICK_RUN_RE.finditer(row))
+    n = len(runs)
+    stop = len(row) + 1   # no token starting at or after this column is masked
+    markup = _MARKUP_OPEN_RE.search(row)
+    if markup:
+        stop = markup.start()
+    for r in runs:
+        if _backslashes_before(row, r.start()) % 2:
+            stop = min(stop, r.start())
+            break
+    nxt: list[int | None] = [None] * n   # the next run of the same length, found right to left (linear in the runs)
+    seen: dict[int, int] = {}
+    for i in range(n - 1, -1, -1):
+        width = runs[i].end() - runs[i].start()
+        nxt[i] = seen.get(width)
+        seen[width] = i
+    openers, i = set(), 0
+    while i < n:
+        j = nxt[i]
+        if j is None:
+            stop = min(stop, runs[i].start())
+            break
+        openers.add(runs[i].start())
+        i = j + 1
+    out, last = [], 0
+    for m in _QUOTED_KEY_RE.finditer(row):
+        if m.start() >= stop or m.start() not in openers:
+            continue
+        out.append(row[last:m.start()])
+        out.append(_QUOTE_MASK * (m.end() - m.start()))
+        last = m.end()
+    out.append(row[last:])
+    return "".join(out), stop <= len(row)
+
+
+def _card_rows(body: str) -> list[str]:
+    """The body's rows as the bus validator splits them: "\\n" only (CRLF read as LF), with the blank rows (_is_blank_row) before
+    the heading dropped. Whitespace ON the heading row is kept, because the bus reads `## ` only at the start of its line and
+    rejects `  ## x` as card-like text outside a card."""
+    rows = body.replace("\r\n", "\n").split("\n")
+    first = 0   # an index, not rows.pop(0) in a loop: front removals are quadratic on a body of many blank rows (Sol r3 B2)
+    while first < len(rows) and _is_blank_row(rows[first]):
+        first += 1
+    return rows[first:]
+
+
+def card_heading_row(body: str) -> str:
+    """The card's heading row as the bus validator reads it: the whole first row (_card_rows), JS-trimmed at the end, never the
+    str.splitlines() prefix. `## <project>/<id><U+0085>check: y` is ONE row to the bus, a heading that is not `## <project>/<id>`;
+    reading only the prefix passed it and hid the fused key in the row the field-key screen skips (Sol r2 B1)."""
+    rows = _card_rows(body)
+    if not rows:
+        return ""
+    row = rows[0]
+    # The bus opens a card at a row that starts with "## " and reads the heading as text.slice(3).trim(), so whitespace after
+    # the marker is trimmed, not refused (adversary r3 A1); the row is normalised to the one-space form CARD_HEADING_RE reads.
+    return "## " + row[3:].strip(_JS_WS_CHARS) if row.startswith("## ") else row.rstrip(_JS_WS_CHARS)
+
+
+def _bold_label_fold(label: str) -> tuple[str, str | None]:
+    """A bold label as the bus validator folds it (trim, lower-case, whitespace runs to one space) and the field it names, or None."""
+    folded = re.sub(f"{_JS_WS}+", " ", label.strip(_JS_WS_CHARS).lower())
+    return folded, _BOLD_LABELS.get(folded)
+
+
+def _parse_field_line(row: str) -> tuple[str, str | None, int] | None:
+    """`(spelling, field, end)` for a line the bus validator reads as a field line, else None: spelling is "bold" or "plain",
+    field is the field name (None for a bold note label or an unknown plain name), end is where the opening label ends."""
+    m = _BUS_BOLD_HEAD_RE.match(row)
+    if m and _bold_tail_ok(row[m.end():]):
+        return "bold", _bold_label_fold(m.group("label"))[1], m.end("label") + 3
+    m = _BUS_PLAIN_LINE_RE.match(row)
+    if m:
+        label = m.group("label")
+        return "plain", label if label in CARD_FIELDS else None, m.end("label") + 1
+    return None
+
+
+def _first_fused_key(row: str, start: int) -> tuple[int, str] | None:
+    """`(column, key)` of the earliest card field key in row[start:], a bold label named as the validator folds it, else None."""
+    hits = []
+    m = _PLAIN_KEY_RE.search(row, start)
+    if m:
+        hits.append((m.start(), m.group("key")))
+    for b in _BOLD_LABEL_SCAN_RE.finditer(row, start):
+        folded, field = _bold_label_fold(b.group("label"))
+        if field:
+            hits.append((b.start(), folded))
+            break
+    return min(hits) if hits else None
+
+
+def screen_card_field_keys(body: str) -> None:
+    """Refuse a card with a known field key anywhere a field does not start. The bus validator reads a field only at the start
+    of a line, so `...Claude hooks.check: on a hot host` is prose to it: the card then loses the field, or fails, only after it
+    merges (06d1d11c, Grok G2 on #728). The key list is CARD_FIELDS, never a second copy. The heading line is skipped. A line the
+    bus validator reads as a field (_parse_field_line: `name: value` or `- **Name:** value`, a value after whitespace) is scanned
+    past its opening label; any other line (a continuation, a bold note such as `- **hooks.check:**`, or a line the validator does
+    not read as a field at all, such as `check:echo`) is scanned in full, since a key there is fused into the text before it. A
+    quoted token (_QUOTED_KEY_RE) is masked first (_QUOTE_MASK, same width, so the reported column holds). Lines split on "\\n" only (CRLF
+    read as LF), as the bus validator splits them: str.splitlines() also breaks on \\x85, U+2028 and friends, which turned
+    `x<U+0085>applies: y` into a fictitious line that opens with its own field."""
+    rows = _card_rows(body)
+    distrusted = False   # a code span may cross rows: once a row leaves a run unpaired, no later row masks a quotation
+    for n, row in enumerate(rows[1:], start=2):
+        parsed = _parse_field_line(row)
+        start = parsed[2] if parsed and parsed[1] else 0
+        if distrusted:
+            masked = row
+        else:
+            masked, distrusted = _mask_quotations(row)
+        hit = _first_fused_key(masked, start)
+        if hit:
+            col, key = hit
+            where = (f"is at column {col}, fused into other text; a field key starts its own line" if col else
+                     "is at column 0 but the bus validator does not read the line as a field (a value follows the colon after "
+                     "whitespace)")
+            raise Refusal("FIELD_KEY_FUSED", f"card line {n} (the heading is line 1): field key '{key}:' {where}")
 
 
 def screen_rendered_card(item: dict) -> None:
     """Refuse a card whose RENDERED block (what the drain appends: body plus the Outbox note) is over
     the validator's limits, so it fails at authoring time and not after it merges. The drain renders
     with the resolved 40-hex source commit, so PENDING is judged at that full width."""
+    if item["meta"]["target"] != CARDS_TARGET:
+        return
+    screen_card_limits(item)
+    # The limits come first: the field-key screen reads every row, so an input past the cap must be refused before it, not after
+    # a scan whose cost grows with the input (Sol r3 B2). Inside the cap the screen's input is at most 2,000 bytes.
+    screen_card_field_keys(item["body"])
+
+
+def screen_card_limits(item: dict) -> None:
+    """The validator's line and byte limits on the RENDERED card, applied alone. The validate and commit paths call it BEFORE the
+    Law-4 screen, whose email pattern scans a long unbroken word in quadratic time: an input past the cap is refused here first
+    (the adversary pass on 1e217283 A3: a 128,000-character word took 11.6 s to reach CARD_INVALID)."""
     if item["meta"]["target"] != CARDS_TARGET:
         return
     src = item["meta"]["source_commit"]
@@ -871,11 +1146,13 @@ def load_outbox_items(repo: pathlib.Path, ref: str) -> list[dict]:
         if not ITEM_NAME_RE.match(name):
             items.append({"path": p, "name": name, "error": f"ITEM_BAD_FILENAME: {name}"})
             continue
-        text = git(repo, "show", f"{ref}:{p}")
+        rc, text, err, lone_cr = git_show_item_text(repo, f"{ref}:{p}")
+        if rc != 0:
+            raise GitError(f"git show {ref}:{p} (in {repo}): {err}")
         if not text.endswith("\n"):
             text += "\n"
         try:
-            item = parse_item(text)
+            item = parse_item(text, lone_cr)
         except Refusal as e:
             items.append({"path": p, "name": name, "error": str(e)})
             continue
@@ -1015,7 +1292,12 @@ def verify_published_as(bus_repo: pathlib.Path, tip: str, item: dict) -> str | N
     if content is None:
         return f"{item['meta']['target']} does not exist at {sha}"
     heading = item_heading(item)
-    if heading not in {line.rstrip() for line in content.splitlines()}:
+    if item["meta"]["target"] == CARDS_TARGET:
+        # the bus splits a card file on LF only, and reads a heading as card_heading_row reads it
+        lines = {card_heading_row(line) for line in content.replace("\r\n", "\n").split("\n") if line.startswith("## ")}
+    else:
+        lines = {line.rstrip() for line in content.splitlines()}
+    if heading not in lines:
         return f"heading {heading[:60]!r} is not in {item['meta']['target']} at {sha}"
     return None
 
@@ -2153,8 +2435,11 @@ def check_commit_bare(repo: pathlib.Path, sha: str, deny_terms: list[tuple[str, 
             problems.append(f"{sha[:10]} {p}: name must be <yyyymmdd>-<slug>.md")
             continue
         try:
-            text = git(repo, "show", f"{sha}:{p}")
-            item = parse_item(text + "\n")
+            rc, text, err, lone_cr = git_show_item_text(repo, f"{sha}:{p}")
+            if rc != 0:
+                raise GitError(f"git show {sha}:{p} (in {repo}): {err}")
+            item = parse_item(text + "\n", lone_cr)
+            screen_card_limits(item)
             screen_law4(item["body"], deny_terms)
             screen_rendered_card(item)
         except Refusal as e:
@@ -2192,12 +2477,13 @@ def check_commit(repo: pathlib.Path, sha: str, added_items: set[str],
         if norm not in added_items:
             problems.append(f"DOCTRINE_EXPORT_OUTBOX_ITEM_NOT_ADDED_IN_RANGE: {norm}")
             continue
-        rc, text, _err = git_try(repo, "show", f"{sha}:{norm}")
+        rc, text, _err, lone_cr = git_show_item_text(repo, f"{sha}:{norm}")
         if rc != 0:
             problems.append(f"DOCTRINE_EXPORT_OUTBOX_ITEM_MISSING_AT_COMMIT: {norm}")
             continue
         try:
-            parsed = parse_item(text + "\n")
+            parsed = parse_item(text + "\n", lone_cr)
+            screen_card_limits(parsed)
             screen_law4(parsed["body"], deny_terms)
             screen_rendered_card(parsed)
         except Refusal as e:
@@ -2255,11 +2541,11 @@ def _item_paths(paths: Iterable[str]) -> list[str]:
 
 def _item_key(repo: pathlib.Path, rev: str, path: str) -> tuple[dict, str] | None:
     """(item, idempotency key) for `path` as it stands at `rev`; None when it is not a valid item (the other checks name that)."""
-    rc, text, _err = git_try(repo, "show", f"{rev}:{path}")
+    rc, text, _err, lone_cr = git_show_item_text(repo, f"{rev}:{path}")
     if rc != 0:
         return None
     try:
-        item = parse_item(text + "\n")
+        item = parse_item(text + "\n", lone_cr)
     except Refusal:
         return None
     src = item["meta"]["source_commit"]
@@ -5070,10 +5356,12 @@ def cmd_validate(paths: list[pathlib.Path], deny_terms: list[tuple[str, str]],
             # a file that validates here has to be one the drain will accept.
             if not ITEM_NAME_RE.match(p.name):
                 raise Refusal("ITEM_BAD_FILENAME", p.name)
-            text = p.read_text(encoding="utf-8")
+            raw = p.read_bytes()
+            text = item_text_from_bytes(raw, errors="strict")
             if not text.endswith("\n"):
                 text += "\n"
-            item = parse_item(text)
+            item = parse_item(text, has_lone_cr(raw))
+            screen_card_limits(item)
             screen_law4(item["body"], deny_terms)
             screen_rendered_card(item)
             unchecked = screen_ruling_candidate(item, bus, own_candidate_slug(p.name))
