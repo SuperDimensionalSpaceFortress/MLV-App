@@ -2963,6 +2963,149 @@ def test_check_commits_lists_an_item_whose_rendered_card_is_over_the_limit(tmp_p
     assert "CARD_INVALID" in problems[0] and f"{max_bytes + 1} bytes" in problems[0]
 
 
+# ---------- a card field key fused mid-line into another field is refused (DOCTRINE-OUTBOX-VALIDATE-FUSED-FIELD-KEY-1) ----------
+#
+# Grok G2 on #728: commit 06d1d11c's trap card ended its `mechanism:` line with "...Claude hooks.check: on a hot host,
+# ..." -- the `check:` field key fused into the mechanism sentence -- and `validate` said OK. The bus validator reads
+# a field only at the start of a line, so the fused key is prose to it and the card then fails (or loses a field)
+# only after it merges. A known card field key followed by `:` anywhere after column 0 is now refused FIELD_KEY_FUSED.
+#
+# Named mutation for this block (turns the named tests red, then is reverted):
+#   M17 start the fused-key scan at column 1 only (skip the rest of the line) -> the regression test and every adversarial case
+#   M18 hand-copy a shorter CARD_FIELDS list                                  -> test_card_fields_are_the_vendored_bus_validators
+
+# The mechanism line of 06d1d11c's card, verbatim (the defect: "Claude hooks.check: on a hot host, ...").
+FUSED_CARD_BODY = (
+    "## mlv-app/rg-files-hidden-over-temp-drives-kernel-time\n"
+    "rule: locate a known file by its known path (Test-Path, or the run dir the lane itself wrote), never with "
+    "`rg --files --hidden` rooted at %TEMP% or ~\\.claude. If a walk is unavoidable, root it at the narrowest sub-path, "
+    "drop --hidden and -uu, cap it with `rg -j 2`, and use a timeout that kills the child, not only the tool call. "
+    "For the owners of Codex lanes and pwsh -Command callers to adopt or distinguish.\n"
+    "mechanism: those trees are huge and mostly hidden, and the walk is metadata syscalls, so it shows as kernel time, "
+    "not user time. A lane prompt or tool that repeats it re-issues it after a kill. A Claude PreToolUse hook cannot "
+    "stop it in a Codex lane, because Codex does not run Claude hooks.check: on a hot host, sample Get-Process rg twice "
+    "10 s apart (TotalProcessorTime delta / 10 = cores), then read its command line once to see the root it walks.\n"
+    "check: on a hot host, sample Get-Process rg twice 10 s apart (TotalProcessorTime delta / 10 = cores), then read "
+    "its command line once to see the root it walks.\n"
+    "supersedes: none\n"
+    "evidence: reported\n"
+    "- **Guard:** none yet (a Codex lane runs no Claude hook; the fix lives in each lane prompt or tool)\n"
+)
+
+
+def _vendored_card_fields() -> tuple[str, ...]:
+    text = (FIXTURE_DIR / "validate-cards.mjs").read_text(encoding="utf-8")
+    raw = re.search(r"export const CARD_FIELDS = \[([^\]]*)\];", text).group(1)
+    return tuple(re.findall(r"'([a-z]+)'", raw))
+
+
+def test_card_fields_are_the_vendored_bus_validators():
+    assert ob.CARD_FIELDS == _vendored_card_fields()
+    assert {"rule", "mechanism", "check", "supersedes", "evidence"} <= set(ob.CARD_FIELDS)
+
+
+def test_validate_refuses_the_card_from_06d1d11c_whose_check_key_is_fused_into_the_mechanism_line(tmp_path, capsys):
+    item = _write_card_item(tmp_path, FUSED_CARD_BODY)
+    assert ob.main(["--repo", str(tmp_path), "validate", str(item)]) == 1
+    err = capsys.readouterr().err
+    assert "FIELD_KEY_FUSED" in err and "'check:'" in err
+    assert "card line 3" in err   # the mechanism line: the heading is line 1
+
+
+def test_validate_accepts_the_same_card_once_the_fused_key_is_on_its_own_line(tmp_path):
+    fixed = FUSED_CARD_BODY.replace("hooks.check: on a hot host", "hooks. Check on a hot host")
+    assert fixed != FUSED_CARD_BODY
+    item = _write_card_item(tmp_path, fixed)
+    assert ob.main(["--repo", str(tmp_path), "validate", str(item)]) == 0
+
+
+@pytest.mark.parametrize("key", _vendored_card_fields())
+@pytest.mark.parametrize("join", ["hooks.{key}: v", "x {key}: v", "end;{key}: v", "(see {key}: v)", "word{key}: v", "a -- {key}: v"])
+def test_validate_refuses_every_known_field_key_after_the_first_position_of_a_line(tmp_path, capsys, key, join):
+    fused = join.format(key=key)
+    body = CARD_BODY.replace("rule: the rule\n", f"rule: the rule {fused}\n", 1)
+    assert body != CARD_BODY
+    item = _write_card_item(tmp_path, body)
+    assert ob.main(["--repo", str(tmp_path), "validate", str(item)]) == 1
+    err = capsys.readouterr().err
+    assert "FIELD_KEY_FUSED" in err and f"'{key}:'" in err and "card line 2" in err
+
+
+@pytest.mark.parametrize("key", ["rule", "mechanism", "check", "supersedes", "evidence"])
+def test_validate_refuses_a_field_key_fused_into_an_indented_continuation_line(tmp_path, capsys, key):
+    body = CARD_BODY.replace("rule: the rule\n", f"rule: the rule\n  more words {key}: v\n", 1)
+    item = _write_card_item(tmp_path, body)
+    assert ob.main(["--repo", str(tmp_path), "validate", str(item)]) == 1
+    err = capsys.readouterr().err
+    assert "FIELD_KEY_FUSED" in err and "card line 3" in err
+
+
+def test_validate_does_not_refuse_prose_that_names_a_field_without_a_colon(tmp_path):
+    body = CARD_BODY.replace(
+        "rule: the rule\n",
+        "rule: the rule of thumb: keep the check cheap and the evidence measured; supersedes nothing at 12:30 or "
+        "http://x/y\n", 1)
+    item = _write_card_item(tmp_path, body)
+    assert ob.main(["--repo", str(tmp_path), "validate", str(item)]) == 0
+
+
+def test_validate_accepts_a_field_key_quoted_in_a_code_span_and_refuses_one_after_the_span(tmp_path, capsys):
+    """Three committed cards (20261019/20261020/20261022) quote `touches/supersedes:` in a code span: a quoted
+    literal, not a fused field. A key after the closed span is still fused."""
+    quoted = CARD_BODY.replace(
+        "mechanism: the mechanism\n",
+        "mechanism: a `validate` refusal of a ruling candidate with no `touches/supersedes:` list; `check:` and `rule:` too\n", 1)
+    assert quoted != CARD_BODY
+    assert ob.main(["--repo", str(tmp_path), "validate", str(_write_card_item(tmp_path, quoted, "20261009-quoted.md"))]) == 0
+    after = CARD_BODY.replace("mechanism: the mechanism\n", "mechanism: the `mechanism` check: fused after a span\n", 1)
+    assert ob.main(["--repo", str(tmp_path), "validate", str(_write_card_item(tmp_path, after, "20261009-after-span.md"))]) == 1
+    err = capsys.readouterr().err
+    assert "FIELD_KEY_FUSED" in err and "'check:'" in err and "card line 3" in err
+    unclosed = CARD_BODY.replace("rule: the rule\n", "rule: the rule ` then check: x\n", 1)
+    assert ob.main(["--repo", str(tmp_path), "validate", str(_write_card_item(tmp_path, unclosed, "20261009-unclosed.md"))]) == 1
+
+
+def test_validate_leaves_a_field_at_the_start_of_each_line_and_non_card_targets_alone(tmp_path):
+    ok = _write_card_item(tmp_path, CARD_BODY, "20261009-ok-card.md")
+    trap = tmp_path / "20261009-prose-trap.md"
+    trap.write_text(item_text(body="### heading\nthe rule: is prose, and check: too, in a TRAPS entry\n"), encoding="utf-8")
+    assert ob.main(["--repo", str(tmp_path), "validate", str(ok), str(trap)]) == 0
+
+
+def test_validate_accepts_a_bold_bullet_field_at_line_start_and_refuses_one_fused_mid_line(tmp_path, capsys):
+    ok = CARD_BODY.replace("check: py -3 -m pytest tests/coordination -q\n", "- **check:** py -3 -m pytest tests/coordination -q\n")
+    assert ok != CARD_BODY
+    assert ob.main(["--repo", str(tmp_path), "validate", str(_write_card_item(tmp_path, ok, "20261009-bold-ok.md"))]) == 0
+    fused = CARD_BODY.replace("rule: the rule\n", "rule: the rule - **Check:** x\n", 1)
+    assert ob.main(["--repo", str(tmp_path), "validate", str(_write_card_item(tmp_path, fused, "20261009-bold-fused.md"))]) == 1
+    err = capsys.readouterr().err
+    assert "FIELD_KEY_FUSED" in err and "'check:'" in err and "card line 2" in err
+
+
+def test_check_commits_lists_an_item_whose_card_has_a_fused_field_key(tmp_path):
+    src, base = _range_repo(tmp_path)
+    name = "20261009-fused-card.md"
+    _commit(src, {f"doctrine-outbox/{name}": item_text(target=CARDS, body=FUSED_CARD_BODY)},
+            f"add a fused card\n\nDoctrine-Export: outbox {name}")
+    failures = ob.check_commits(src, f"{base}..HEAD", [])
+    (problems,) = failures.values()
+    assert problems[0].startswith(f"DOCTRINE_EXPORT_OUTBOX_ITEM_INVALID: doctrine-outbox/{name}")
+    assert "FIELD_KEY_FUSED" in problems[0]
+
+
+def test_no_committed_outbox_card_has_a_fused_field_key():
+    """The corpus guard, no node needed: every tracked card item at HEAD survives the fused-key screen."""
+    loaded = [i for i in ob.load_outbox_items(REPO_ROOT, "HEAD") if "item" in i]
+    assert loaded
+    bad = []
+    for entry in loaded:
+        try:
+            ob.screen_rendered_card(entry["item"])
+        except ob.Refusal as e:
+            bad.append(f"{entry['path']}: {e}")
+    assert not bad, "\n".join(bad)
+
+
 # ---------- every committed outbox item must survive the drain's card validation ----------
 #
 # The drain refuses a card the bus validator rejects (size over 2,000 bytes, an `applies` value that

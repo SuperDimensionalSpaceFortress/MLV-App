@@ -204,6 +204,9 @@ REGULAR_FILE_MODE = "100644"
 # a test pins them to the vendored copy. The drain's authority is still that validator.
 MAX_CARD_LINES = 15
 MAX_CARD_BYTES = 2000
+# The card field names, a copy of the bus validator's CARD_FIELDS (tools/validate-cards.mjs); a test pins it to the vendored
+# validator, like the two limits above. The fused-key screen (screen_card_field_keys) keys on this one list.
+CARD_FIELDS = ("rule", "mechanism", "applies", "check", "supersedes", "evidence")
 WORD_CAP = 450
 ITEM_NAME_RE = re.compile(r"^\d{8}-[a-z0-9][a-z0-9-]{2,60}\.md$")
 SHA_RE = re.compile(r"^[0-9a-f]{7,40}$")
@@ -793,12 +796,41 @@ def item_heading(item: dict) -> str:
     return item["body"].lstrip().splitlines()[0].rstrip()
 
 
+_FIELD_KEY_ALT = "|".join(CARD_FIELDS)
+_PLAIN_KEY_RE = re.compile(rf"(?:{_FIELD_KEY_ALT}):")
+# The bold-bullet spelling of a field (`- **Check:**`, also `- **Applies to:**`), compared case-insensitively like the validator.
+_BOLD_KEY_RE = re.compile(rf"- \*\*(?:{_FIELD_KEY_ALT}|applies to):\*\*", re.IGNORECASE)
+_BOLD_LABEL_PREFIX_RE = re.compile(r"- \*\*[^*:]+:\*\*")
+_CODE_SPAN_RE = re.compile(r"`[^`]*`")
+
+
+def screen_card_field_keys(body: str) -> None:
+    """Refuse a card with a known field key anywhere after the first position of a line. The bus validator reads a field only
+    at the start of a line, so `...Claude hooks.check: on a hot host` is prose to it: the card then loses the field, or fails,
+    only after it merges (06d1d11c, Grok G2 on #728). The key list is CARD_FIELDS, never a second copy. The heading line is
+    skipped; a line that opens with its own field (`rule:` or `- **check:**`) is scanned past that opening label, and any
+    other line (a continuation included) is scanned in full, since a key past column 0 is fused into the text before it.
+    A key inside a closed backtick span is a quoted literal (`touches/supersedes:`), not a field, and is blanked first
+    (same width, so the reported column holds); an unclosed backtick hides nothing."""
+    rows = body.lstrip().splitlines()
+    for n, row in enumerate(rows[1:], start=2):
+        row = _CODE_SPAN_RE.sub(lambda s: " " * len(s.group(0)), row)
+        opening = _BOLD_LABEL_PREFIX_RE.match(row) or _PLAIN_KEY_RE.match(row)
+        start = opening.end() if opening else 0
+        for m in (_PLAIN_KEY_RE.search(row, start), _BOLD_KEY_RE.search(row, start)):
+            if m:
+                key = m.group(0)[4:-3].lower() if m.group(0).startswith("- **") else m.group(0)[:-1]
+                raise Refusal("FIELD_KEY_FUSED", f"card line {n} (the heading is line 1): field key '{key}:' is at column "
+                                                 f"{m.start()}, fused into other text; a field key starts its own line")
+
+
 def screen_rendered_card(item: dict) -> None:
     """Refuse a card whose RENDERED block (what the drain appends: body plus the Outbox note) is over
     the validator's limits, so it fails at authoring time and not after it merges. The drain renders
     with the resolved 40-hex source commit, so PENDING is judged at that full width."""
     if item["meta"]["target"] != CARDS_TARGET:
         return
+    screen_card_field_keys(item["body"])
     src = item["meta"]["source_commit"]
     _key, block = render_block(item, "0" * 40 if src == "PENDING" else src)
     rows = block.replace("\r\n", "\n").strip("\n").split("\n")
