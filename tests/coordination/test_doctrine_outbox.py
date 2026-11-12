@@ -2963,6 +2963,451 @@ def test_check_commits_lists_an_item_whose_rendered_card_is_over_the_limit(tmp_p
     assert "CARD_INVALID" in problems[0] and f"{max_bytes + 1} bytes" in problems[0]
 
 
+# ---------- a card field key fused mid-line into another field is refused (DOCTRINE-OUTBOX-VALIDATE-FUSED-FIELD-KEY-1) ----------
+#
+# Grok G2 on #728: commit 06d1d11c's trap card ended its `mechanism:` line with "...Claude hooks.check: on a hot host,
+# ..." -- the `check:` field key fused into the mechanism sentence -- and `validate` said OK. The bus validator reads
+# a field only at the start of a line, so the fused key is prose to it and the card then fails (or loses a field)
+# only after it merges. A known card field key followed by `:` anywhere after column 0 is now refused FIELD_KEY_FUSED.
+#
+# Named mutation for this block (turns the named tests red, then is reverted):
+#   M17 start the fused-key scan at column 1 only (skip the rest of the line) -> the regression test and every adversarial case
+#   M18 hand-copy a shorter CARD_FIELDS list                                  -> test_card_fields_are_the_vendored_bus_validators
+
+# The mechanism line of 06d1d11c's card, verbatim (the defect: "Claude hooks.check: on a hot host, ...").
+FUSED_CARD_BODY = (
+    "## mlv-app/rg-files-hidden-over-temp-drives-kernel-time\n"
+    "rule: locate a known file by its known path (Test-Path, or the run dir the lane itself wrote), never with "
+    "`rg --files --hidden` rooted at %TEMP% or ~\\.claude. If a walk is unavoidable, root it at the narrowest sub-path, "
+    "drop --hidden and -uu, cap it with `rg -j 2`, and use a timeout that kills the child, not only the tool call. "
+    "For the owners of Codex lanes and pwsh -Command callers to adopt or distinguish.\n"
+    "mechanism: those trees are huge and mostly hidden, and the walk is metadata syscalls, so it shows as kernel time, "
+    "not user time. A lane prompt or tool that repeats it re-issues it after a kill. A Claude PreToolUse hook cannot "
+    "stop it in a Codex lane, because Codex does not run Claude hooks.check: on a hot host, sample Get-Process rg twice "
+    "10 s apart (TotalProcessorTime delta / 10 = cores), then read its command line once to see the root it walks.\n"
+    "check: on a hot host, sample Get-Process rg twice 10 s apart (TotalProcessorTime delta / 10 = cores), then read "
+    "its command line once to see the root it walks.\n"
+    "supersedes: none\n"
+    "evidence: reported\n"
+    "- **Guard:** none yet (a Codex lane runs no Claude hook; the fix lives in each lane prompt or tool)\n"
+)
+
+
+def _vendored_card_fields() -> tuple[str, ...]:
+    text = (FIXTURE_DIR / "validate-cards.mjs").read_text(encoding="utf-8")
+    raw = re.search(r"export const CARD_FIELDS = \[([^\]]*)\];", text).group(1)
+    return tuple(re.findall(r"'([a-z]+)'", raw))
+
+
+def test_card_fields_are_the_vendored_bus_validators():
+    assert ob.CARD_FIELDS == _vendored_card_fields()
+    assert {"rule", "mechanism", "check", "supersedes", "evidence"} <= set(ob.CARD_FIELDS)
+
+
+def test_validate_refuses_the_card_from_06d1d11c_whose_check_key_is_fused_into_the_mechanism_line(tmp_path, capsys):
+    item = _write_card_item(tmp_path, FUSED_CARD_BODY)
+    assert ob.main(["--repo", str(tmp_path), "validate", str(item)]) == 1
+    err = capsys.readouterr().err
+    assert "FIELD_KEY_FUSED" in err and "'check:'" in err
+    assert "card line 3" in err   # the mechanism line: the heading is line 1
+
+
+def test_validate_accepts_the_same_card_once_the_fused_key_is_on_its_own_line(tmp_path):
+    fixed = FUSED_CARD_BODY.replace("hooks.check: on a hot host", "hooks. Check on a hot host")
+    assert fixed != FUSED_CARD_BODY
+    item = _write_card_item(tmp_path, fixed)
+    assert ob.main(["--repo", str(tmp_path), "validate", str(item)]) == 0
+
+
+@pytest.mark.parametrize("key", _vendored_card_fields())
+@pytest.mark.parametrize("join", ["hooks.{key}: v", "x {key}: v", "end;{key}: v", "(see {key}: v)", "word{key}: v", "a -- {key}: v"])
+def test_validate_refuses_every_known_field_key_after_the_first_position_of_a_line(tmp_path, capsys, key, join):
+    fused = join.format(key=key)
+    body = CARD_BODY.replace("rule: the rule\n", f"rule: the rule {fused}\n", 1)
+    assert body != CARD_BODY
+    item = _write_card_item(tmp_path, body)
+    assert ob.main(["--repo", str(tmp_path), "validate", str(item)]) == 1
+    err = capsys.readouterr().err
+    assert "FIELD_KEY_FUSED" in err and f"'{key}:'" in err and "card line 2" in err
+
+
+@pytest.mark.parametrize("key", ["rule", "mechanism", "check", "supersedes", "evidence"])
+def test_validate_refuses_a_field_key_fused_into_an_indented_continuation_line(tmp_path, capsys, key):
+    body = CARD_BODY.replace("rule: the rule\n", f"rule: the rule\n  more words {key}: v\n", 1)
+    item = _write_card_item(tmp_path, body)
+    assert ob.main(["--repo", str(tmp_path), "validate", str(item)]) == 1
+    err = capsys.readouterr().err
+    assert "FIELD_KEY_FUSED" in err and "card line 3" in err
+
+
+def test_validate_does_not_refuse_prose_that_names_a_field_without_a_colon(tmp_path):
+    body = CARD_BODY.replace(
+        "rule: the rule\n",
+        "rule: the rule of thumb: keep the check cheap and the evidence measured; supersedes nothing at 12:30 or "
+        "http://x/y\n", 1)
+    item = _write_card_item(tmp_path, body)
+    assert ob.main(["--repo", str(tmp_path), "validate", str(item)]) == 0
+
+
+def test_validate_accepts_a_field_key_quoted_in_a_code_span_and_refuses_one_after_the_span(tmp_path, capsys):
+    """Three committed cards (20261019/20261020/20261022) quote `touches/supersedes:` in a code span: a quoted
+    literal, not a fused field. A key after the closed span is still fused."""
+    quoted = CARD_BODY.replace(
+        "mechanism: the mechanism\n",
+        "mechanism: a `validate` refusal of a ruling candidate with no `touches/supersedes:` list; `check:` and `rule:` too\n", 1)
+    assert quoted != CARD_BODY
+    assert ob.main(["--repo", str(tmp_path), "validate", str(_write_card_item(tmp_path, quoted, "20261009-quoted.md"))]) == 0
+    after = CARD_BODY.replace("mechanism: the mechanism\n", "mechanism: the `mechanism` check: fused after a span\n", 1)
+    assert ob.main(["--repo", str(tmp_path), "validate", str(_write_card_item(tmp_path, after, "20261009-after-span.md"))]) == 1
+    err = capsys.readouterr().err
+    assert "FIELD_KEY_FUSED" in err and "'check:'" in err and "card line 3" in err
+    unclosed = CARD_BODY.replace("rule: the rule\n", "rule: the rule ` then check: x\n", 1)
+    assert ob.main(["--repo", str(tmp_path), "validate", str(_write_card_item(tmp_path, unclosed, "20261009-unclosed.md"))]) == 1
+
+
+# Adversary pass r1 on 4ac14afa (sol): A1 code spans follow CommonMark (a run closes only on a run of the same length), A2 a
+# bold label is matched the validator's way (whitespace-tolerant), A3 lines split on "\n" as the bus validator does.
+
+@pytest.mark.parametrize("quoted", [
+    "use ``check:`` as the label",             # A1: a double-backtick span is a quotation
+    "use `x/check:` as the label",            # a path-like token ending in the key (the committed `touches/supersedes:` form)
+    "use ```check:``` as the label",
+    "`a` and ``rule:`` and ```supersedes:```",
+])
+def test_validate_accepts_a_field_key_quoted_in_a_code_span_of_any_backtick_length(tmp_path, quoted):
+    body = CARD_BODY.replace("rule: the rule\n", f"rule: {quoted}\n", 1)
+    assert ob.main(["--repo", str(tmp_path), "validate", str(_write_card_item(tmp_path, body))]) == 0
+
+
+@pytest.mark.parametrize("fused", [
+    "x `applies: mlv-app``",                    # A1: opens with one backtick, closes with two: no span, the key is exposed
+    "x ``check: y` z",                          # opens with two, closes with one
+    "x ``applies: mlv-app",                     # never closed
+    "x `a` applies: mlv-app",                   # after a closed span
+    "x `a`b`` applies: mlv-app",
+])
+def test_validate_refuses_a_field_key_that_no_matching_backtick_run_quotes(tmp_path, capsys, fused):
+    body = CARD_BODY.replace("rule: the rule\n", f"rule: {fused}\n", 1)
+    assert ob.main(["--repo", str(tmp_path), "validate", str(_write_card_item(tmp_path, body))]) == 1
+    assert "FIELD_KEY_FUSED" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("label", ["Applies  to", "applies\tto", "Applies to", " check ", "RULE", "  Supersedes  "])
+def test_validate_refuses_a_bold_label_fused_mid_line_in_any_spelling_the_bus_validator_reads(tmp_path, capsys, label):
+    """A2: the bus validator trims the bold label and folds its whitespace, so `- **Applies  to:**` is the field."""
+    body = CARD_BODY.replace("rule: the rule\n", f"rule: x - **{label}:** mlv-app\n", 1)
+    assert ob.main(["--repo", str(tmp_path), "validate", str(_write_card_item(tmp_path, body))]) == 1
+    assert "FIELD_KEY_FUSED" in capsys.readouterr().err
+
+
+def test_validate_names_the_bold_key_in_its_normalised_form(tmp_path, capsys):
+    body = CARD_BODY.replace("rule: the rule\n", "rule: x - **Applies  to:** mlv-app\n", 1)
+    ob.main(["--repo", str(tmp_path), "validate", str(_write_card_item(tmp_path, body))])
+    assert "'applies to:'" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("sep", ["\x85", " ", " ", "\x0b", "\x0c", "\x1c", "\x1d", "\x1e"])
+def test_validate_does_not_start_a_new_line_at_a_separator_the_bus_validator_does_not_split_on(tmp_path, capsys, sep):
+    """A3: str.splitlines() breaks on \\x85 and friends, which made `x<sep>applies: y` look like a line that opens with its own
+    field; the bus validator splits on \\n only, so there the key stays inside the rule prose."""
+    body = CARD_BODY.replace("rule: the rule\n", f"rule: x{sep}applies: mlv-app\n", 1)
+    assert ob.main(["--repo", str(tmp_path), "validate", str(_write_card_item(tmp_path, body))]) == 1
+    assert "FIELD_KEY_FUSED" in capsys.readouterr().err
+
+
+# Adversary pass 2 on 5f15cf63 (sol): the exemption is a quoted single-line, space-free TOKEN ending in the key, not a parsed
+# markdown span (A1 escaped opener, A2 spans across lines), a bold label is exempt only when it IS a field label (A4), and
+# the label whitespace is the JS one, U+FEFF included (A3). Anything the exemption does not recognise is refused: fail closed.
+
+@pytest.mark.parametrize("fused", [
+    "x \\` check: fused `",                                  # A1: an escaped opener is not a span
+    "x \\`a` check: fused `",
+    "use `start\n  end` check: fused `tail\n  close`",       # A2: spans across physical lines expose the text between them
+    "use `check:\n  value` as a label",                      # A2: a key in a span that crosses lines is not a quoted token
+    "use `a check: b` as a label",                           # a span with spaces is not a quoted token either
+    "x - **APPLIES﻿TO:** mlv-app",                      # A3: U+FEFF is whitespace to the bus validator
+    "x - **﻿check﻿:** y",
+])
+def test_validate_refuses_what_the_quoted_token_exemption_does_not_recognise(tmp_path, capsys, fused):
+    body = CARD_BODY.replace("rule: the rule\n", f"rule: {fused}\n", 1)
+    assert ob.main(["--repo", str(tmp_path), "validate", str(_write_card_item(tmp_path, body))]) == 1
+    assert "FIELD_KEY_FUSED" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("label", ["hooks.check", "x rule", "evidence list rule", "see supersedes"])
+def test_validate_scans_a_bold_note_label_that_is_not_a_field_label(tmp_path, capsys, label):
+    """A4: `- **hooks.check:** echo ok` is a NOTE to the bus validator (and the card then misses check); only a real field
+    label is exempt as the opening of its line."""
+    body = CARD_BODY.replace("check: py -3 -m pytest tests/coordination -q\n", f"- **{label}:** echo ok\n")
+    assert ob.main(["--repo", str(tmp_path), "validate", str(_write_card_item(tmp_path, body))]) == 1
+    assert "FIELD_KEY_FUSED" in capsys.readouterr().err
+
+
+def test_validate_still_accepts_a_bold_note_that_names_no_field_key(tmp_path):
+    body = CARD_BODY + "- **Guard:** none yet\n- **Outbox:** outbox:0123456789abcdef mlv-app:0123456789ab\n"
+    assert ob.main(["--repo", str(tmp_path), "validate", str(_write_card_item(tmp_path, body))]) == 0
+
+
+def test_validate_reads_a_crlf_card_as_lf(tmp_path):
+    body = CARD_BODY.replace("\n", "\r\n")
+    path = tmp_path / "20261009-crlf-card.md"
+    path.write_bytes(item_text(target=CARDS, body="@@").encode("utf-8").replace(b"@@", body.encode("utf-8")))
+    assert ob.main(["--repo", str(tmp_path), "validate", str(path)]) == 0
+
+
+def test_validate_leaves_a_field_at_the_start_of_each_line_and_non_card_targets_alone(tmp_path):
+    ok = _write_card_item(tmp_path, CARD_BODY, "20261009-ok-card.md")
+    trap = tmp_path / "20261009-prose-trap.md"
+    trap.write_text(item_text(body="### heading\nthe rule: is prose, and check: too, in a TRAPS entry\n"), encoding="utf-8")
+    assert ob.main(["--repo", str(tmp_path), "validate", str(ok), str(trap)]) == 0
+
+
+def test_validate_accepts_a_bold_bullet_field_at_line_start_and_refuses_one_fused_mid_line(tmp_path, capsys):
+    ok = CARD_BODY.replace("check: py -3 -m pytest tests/coordination -q\n", "- **check:** py -3 -m pytest tests/coordination -q\n")
+    assert ok != CARD_BODY
+    assert ob.main(["--repo", str(tmp_path), "validate", str(_write_card_item(tmp_path, ok, "20261009-bold-ok.md"))]) == 0
+    fused = CARD_BODY.replace("rule: the rule\n", "rule: the rule - **Check:** x\n", 1)
+    assert ob.main(["--repo", str(tmp_path), "validate", str(_write_card_item(tmp_path, fused, "20261009-bold-fused.md"))]) == 1
+    err = capsys.readouterr().err
+    assert "FIELD_KEY_FUSED" in err and "'check:'" in err and "card line 2" in err
+
+
+def test_check_commits_lists_an_item_whose_card_has_a_fused_field_key(tmp_path):
+    src, base = _range_repo(tmp_path)
+    name = "20261009-fused-card.md"
+    _commit(src, {f"doctrine-outbox/{name}": item_text(target=CARDS, body=FUSED_CARD_BODY)},
+            f"add a fused card\n\nDoctrine-Export: outbox {name}")
+    failures = ob.check_commits(src, f"{base}..HEAD", [])
+    (problems,) = failures.values()
+    assert problems[0].startswith(f"DOCTRINE_EXPORT_OUTBOX_ITEM_INVALID: doctrine-outbox/{name}")
+    assert "FIELD_KEY_FUSED" in problems[0]
+
+
+def test_no_committed_outbox_card_has_a_fused_field_key():
+    """The corpus guard, no node needed: every tracked card item at HEAD survives the fused-key screen."""
+    loaded = [i for i in ob.load_outbox_items(REPO_ROOT, "HEAD") if "item" in i]
+    assert loaded
+    bad = []
+    for entry in loaded:
+        try:
+            ob.screen_rendered_card(entry["item"])
+        except ob.Refusal as e:
+            bad.append(f"{entry['path']}: {e}")
+    assert not bad, "\n".join(bad)
+
+
+# ---------- r2: the opening-field exemption IS the bus validator's parseFieldLine (adversary pass on ec096abf: A1 A2 A3 A4) ----------
+#
+# r1 exempted the opening of a line with a lookalike regex (Python \s and re.IGNORECASE). The bus validator (JavaScript) trims,
+# folds and splits differently, so a line it reads as a note was exempt here (`validate` OK, bus refuses) and the reverse. The
+# screen now reads a line the way parseFieldLine does (explicit JS whitespace, JS case folding, a value must follow the colon
+# after whitespace), and these tests run the vendored JavaScript over the same inputs, so the two cannot drift again.
+#
+# Named mutation for this block (turns the named tests red, then is reverted):
+#   M19 give _JS_WS_CHARS Python's \s set (add \x85 and \x1c-\x1f, drop U+FEFF)     -> the whitespace-class test and every A1 parity row
+#   M20 fold the bold label with re.IGNORECASE instead of str.lower()                -> the case rows (dotless i, long s, Kelvin)
+#   M21 drop the whitespace-or-end requirement after the colon                       -> the A3 rows
+#   M22 cap the quoted backtick run at 3                                             -> the A2 run-length rows
+
+_JS_FIELD_SRC = (FIXTURE_DIR / "validate-cards.mjs").as_uri()
+_JS_PARSE_ROWS = (f"import {{ readFileSync }} from 'node:fs'; import {{ parseFieldLine }} from '{_JS_FIELD_SRC}';\n"
+                  "const rows = JSON.parse(readFileSync(0, 'utf8'));\n"
+                  "process.stdout.write(JSON.stringify(rows.map((r) => { const f = parseFieldLine(r); "
+                  "return f ? (f.name || (f.note ? '#note' : '#unknown')) : null; })));\n")
+_JS_CARD_ERRORS = (f"import {{ readFileSync }} from 'node:fs'; import {{ parseCardsFile }} from '{_JS_FIELD_SRC}';\n"
+                   "const texts = JSON.parse(readFileSync(0, 'utf8'));\n"
+                   "process.stdout.write(JSON.stringify(texts.map((t) => parseCardsFile(t, 'mlv-app', ['mlv-app']).errors.map((e) => e.reason))));\n")
+_JS_CLASSES = ("const all = Array.from({length: 0x10000}, (_, i) => i);\n"
+               "process.stdout.write(JSON.stringify({ws: all.filter((i) => /\\s/.test(String.fromCharCode(i))),"
+               " trim: all.filter((i) => String.fromCharCode(i).trim() === ''),"
+               " lower: Object.fromEntries(all.map((i) => [i, String.fromCharCode(i).toLowerCase()])"
+               ".filter(([i, s]) => /^[a-z]+$/.test(s) && s !== String.fromCharCode(i)))}));\n")
+
+
+def _node(script: str, payload=None):
+    result = subprocess.run([shutil.which("node"), "--input-type=module", "-e", script], input=json.dumps(payload or []),
+                            capture_output=True, text=True, encoding="utf-8", timeout=180)
+    assert result.returncode == 0, result.stderr
+    return json.loads(result.stdout)
+
+
+def _py_row_class(row: str):
+    parsed = ob._parse_field_line(row)
+    return None if parsed is None else (parsed[1] or ("#note" if parsed[0] == "bold" else "#unknown"))
+
+
+# every code point JS reads as whitespace, the ones only Python does, and look-alikes neither reads as whitespace
+_WS_PROBES = ["\t", "\x0b", "\x0c", " ", "\xa0", "\u1680", "\u2000", "\u2003", "\u200a", "\u202f", "\u205f", "\u3000", "\ufeff",
+              "\x85", "\x1c", "\x1d", "\x1e", "\x1f", "\u180e", "\u200b", "\u2060"]
+_ROW_TEMPLATES = [
+    "- **{w}check:** echo ok", "- **check{w}:** echo ok", "- **Applies{w}to:** mlv-app", "- **applies to{w}:** x",
+    "- **check:**{w}echo ok", "- **check:**{w}{w}echo ok", "- **check:**{w}", "- **check:**",
+    "check:{w}echo ok", "rule:{w}x", "rule:{w}", "rule:", "{w}check: echo ok", "{w}- **check:** x", "- {w}**check:** x",
+    "check{w}: x", "- **check:{w}** x", "- **{w}:** x",
+]
+# the rows a whole card is built from: the check line only, with a value after it
+_E2E_TEMPLATES = ["- **{w}check:** echo ok", "- **check{w}:** echo ok", "- **check:**{w}echo ok", "- **check:**{w}{w}echo ok",
+                  "check:{w}echo ok", "{w}check: echo ok", "{w}- **check:** echo ok", "- {w}**check:** echo ok", "check{w}: echo ok"]
+_CASE_LABELS = ["check", "CHECK", "Check", "chec\u212a", "chec\u212a ", "mechan\u0131sm", "mechan\u0130sm", "\u017fupersedes", "\u017fUPERSEDES",
+                "ev\u0131dence", "Applies To", "applies  TO", "applies\u2003to", "applies\ufeffto", "rul\u0435", "\u0130nfo"]
+
+
+def _battery_rows() -> list[str]:
+    rows = [t.format(w=w) for t in _ROW_TEMPLATES for w in _WS_PROBES]
+    rows += [f"- **{lab}:** echo ok" for lab in _CASE_LABELS] + [f"- **{lab}:**echo ok" for lab in _CASE_LABELS]
+    rows += [f"{lab}: echo ok" for lab in ["check", "Check", "chec\u212a", "mechan\u0131sm", "\u017fupersedes", "rule", "ru-le", "x"]]
+    rows += ["rule:\r", "rule: a\rb", "rule: a\u2028b", "rule: a\u2029b", "- **rule:**\r", "- **rule:** a\u2028b", "- **a\rb:** x", "- **a\nb:** x"]
+    rows += ["", " ", "- ", "- **", "- **:** x", "- ****:** x", "- **a*b:** x", "- **a:b:** x", "rule", "rule :", "-rule: x", "- rule: x", "**rule:** x"]
+    return rows
+
+
+@needs_node
+def test_the_js_whitespace_class_is_the_javascript_one():
+    """A1: the explicit class equals what /\\s/ and String.prototype.trim() read as whitespace, over the whole BMP."""
+    js = _node(_JS_CLASSES)
+    ours = {ord(c) for c in ob._JS_WS_CHARS}
+    assert ours == set(js["ws"]) == set(js["trim"])
+    assert 0x85 not in ours and 0x1c not in ours and 0xfeff in ours
+
+
+@needs_node
+def test_ascii_letter_case_folding_is_the_javascript_one():
+    """A1: toLowerCase() maps U+212A (Kelvin) to k and nothing else non-ASCII to an ASCII letter; str.lower() agrees, so the label
+    fold (not re.IGNORECASE, which also folds the dotless i and the long s) decides what is a field."""
+    js = {int(k): v for k, v in _node(_JS_CLASSES)["lower"].items() if not ("A" <= chr(int(k)) <= "Z")}
+    py = {c: chr(c).lower() for c in range(0x10000) if re.fullmatch("[a-z]+", chr(c).lower()) and chr(c).lower() != chr(c)
+          and not ("A" <= chr(c) <= "Z")}
+    assert js == py == {0x212a: "k"}
+
+
+@needs_node
+def test_a_line_is_read_as_a_field_exactly_as_the_bus_validators_parseFieldLine_reads_it():
+    rows = _battery_rows()
+    js = _node(_JS_PARSE_ROWS, rows)
+    assert len(js) == len(rows)
+    diffs = [f"{r!r}: js={j} py={_py_row_class(r)}" for r, j in zip(rows, js) if _py_row_class(r) != j]
+    assert not diffs, "\n".join(diffs)
+
+
+def _check_line_card(row: str) -> str:
+    assert "check: py -3 -m pytest tests/coordination -q\n" in CARD_BODY
+    return CARD_BODY.replace("check: py -3 -m pytest tests/coordination -q\n", f"{row}\n")
+
+
+@needs_node
+def test_validate_and_the_bus_validator_agree_on_every_spelling_of_the_check_line(tmp_path):
+    """A1/A3 both ways: a card whose check line is `row` is accepted by validate exactly when the bus validator accepts it, so a
+    line the bus reads as a note is refused here and a real field label is never refused. Only rows that carry a literal `check:`
+    are compared both ways: the screen judges fused keys, so a row with no literal key (`- **check<U+001C>:** x`, a note to the
+    bus, which then misses `check`) is the bus validator's refusal, not this screen's; for those only "bus accepts => validate
+    accepts" holds."""
+    rows = [t.format(w=w) for t in _E2E_TEMPLATES for w in _WS_PROBES] + [
+        f"- **{lab}:** echo ok" for lab in _CASE_LABELS if "chec" in lab.lower()] + [
+        "- **Check:** echo ok", "- **CHECK:**\techo ok", "check: echo ok"]
+    js = _node(_JS_CARD_ERRORS, [_check_line_card(r) for r in rows])
+    bad = []
+    for n, (row, errors) in enumerate(zip(rows, js)):
+        item = _write_card_item(tmp_path, _check_line_card(row), f"20261009-row{n}.md")
+        py_ok = ob.main(["--repo", str(tmp_path), "validate", str(item)]) == 0
+        if (not errors and not py_ok) or ("check:" in row and py_ok != (not errors)):
+            bad.append(f"{row!r}: bus_ok={not errors} validate_ok={py_ok} {errors[:1]}")
+    assert not bad, "\n".join(bad)
+
+
+@pytest.mark.parametrize("row", [
+    "- **\u0085check:** echo ok",          # A1: U+0085 is not JS whitespace: the bus reads a note and misses `check`
+    "- **\x1ccheck:** echo ok",
+    "- **Check:**echo ok",                  # A3: no whitespace after the colon, the bus reads no field
+    "check:echo ok",
+    "- **Check:**\x85echo ok",
+])
+def test_validate_refuses_a_line_the_bus_validator_does_not_read_as_a_field(tmp_path, capsys, row):
+    body = CARD_BODY.replace("check: py -3 -m pytest tests/coordination -q\n", f"{row}\ncheck: py -3 -m pytest tests/coordination -q\n")
+    assert ob.main(["--repo", str(tmp_path), "validate", str(_write_card_item(tmp_path, body))]) == 1
+    assert "FIELD_KEY_FUSED" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("row", [
+    "- **\u017fupersedes:** none",                # long s: re.IGNORECASE folds it to s, toLowerCase does not: a note to the bus
+    "- **mechan\u0131sm:** x",                    # dotless i
+    "- **check\x1c:** echo ok",                   # U+001C is not JS whitespace: not the check label
+    "- **\x1fApplies\x1ato:** mlv-app",
+    "- **Check:**",                               # the value may be empty: the bus reads the field (its emptiness is another check)
+    "- **\ufeffCheck\u3000:** echo ok",
+    "- **Chec\u212a:** echo ok",                  # toLowerCase maps the Kelvin sign to k, so this IS the check field
+    "- **CHECK:**\techo ok",
+    "- **Check:**\u00a0echo ok",
+    "check:\u3000echo ok",
+])
+def test_validate_does_not_refuse_a_line_the_bus_validator_reads_as_a_field(row):
+    # `- **Check:**` alone is an empty field to the bus (a different refusal), so judge only the fused-key screen
+    ob.screen_card_field_keys(CARD_BODY.replace("check: py -3 -m pytest tests/coordination -q\n", f"{row}\n"))
+
+
+@pytest.mark.parametrize("run", ["`", "``", "```", "````", "`````"])
+@pytest.mark.parametrize("token", ["check:", "x/check:", "caf\u00e9/check:", "touches/supersedes:"])
+def test_validate_accepts_a_field_key_quoted_at_any_equal_length_backtick_run(tmp_path, run, token):
+    """A2: a code span closes on a run of the same length, so a 4- or 5-backtick quotation of a key is a quotation."""
+    body = CARD_BODY.replace("rule: the rule\n", f"rule: use {run}{token}{run} as the label\n", 1)
+    assert ob.main(["--repo", str(tmp_path), "validate", str(_write_card_item(tmp_path, body))]) == 0
+
+
+@pytest.mark.parametrize("fused", [
+    "use ````check:``` as the label",      # opens with four, closes with three
+    "use ```check:````` as the label",
+    "use ``a b check: c`` as the label",   # a span with spaces in it is no token: refused, fail closed
+    "use ````check: ```` as the label",
+    "x ``a`` check: v",
+])
+def test_validate_refuses_a_key_that_an_unequal_backtick_run_does_not_quote(tmp_path, capsys, fused):
+    body = CARD_BODY.replace("rule: the rule\n", f"rule: {fused}\n", 1)
+    assert ob.main(["--repo", str(tmp_path), "validate", str(_write_card_item(tmp_path, body))]) == 1
+    assert "FIELD_KEY_FUSED" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("label,shown", [
+    ("Applies\ufeffto", "applies to"),
+    ("Applies\u2003 to", "applies to"),
+    ("\u3000APPLIES\u00a0\u00a0TO ", "applies to"),
+    ("Chec\u212a", "check"),
+    ("  Supersedes  ", "supersedes"),
+])
+def test_validate_names_a_fused_bold_key_in_the_form_the_bus_validator_reads_it(tmp_path, capsys, label, shown):
+    """A4: the diagnostic shows the folded key (JS whitespace folded to one space, lower-cased), not the raw label."""
+    body = CARD_BODY.replace("rule: the rule\n", f"rule: x - **{label}:** mlv-app\n", 1)
+    assert ob.main(["--repo", str(tmp_path), "validate", str(_write_card_item(tmp_path, body))]) == 1
+    assert f"'{shown}:'" in capsys.readouterr().err
+
+
+# Adversary pass r2 on fa3aec80 (sol): A1 the quoted token was masked with SPACES, and a space inside a bold label is label text
+# the bus validator trims and folds, so masking `check `rule:`:` made a fabricated `check` label out of a continuation line. The
+# mask is a character that is neither whitespace nor a label or key character, so masking never creates or joins a label.
+
+@pytest.mark.parametrize("row", [
+    "  - **check `rule:`:** x",                    # A1: the exact attack input: an indented continuation, prose to the bus
+    "  - **applies `x/rule:` to:** y",             # the same class through the folded two-word label
+    "  - **Where `a/rule:` and `b/check:`:** y",
+    "  note `rule:` and `touches/evidence:` quoted",
+    "  - **Where:** see `mechanism:` and ``check:`` here",
+])
+def test_validate_does_not_fabricate_a_field_from_the_mask_of_a_quoted_key(tmp_path, row):
+    body = CARD_BODY.replace("rule: the rule\n", f"rule: the rule\n{row}\n", 1)
+    assert ob.main(["--repo", str(tmp_path), "validate", str(_write_card_item(tmp_path, body))]) == 0
+
+
+@needs_node
+def test_the_bus_validator_accepts_the_cards_whose_quoted_keys_the_mask_must_leave_alone():
+    rows = ["  - **check `rule:`:** x", "  - **applies `x/rule:` to:** y", "  - **Where `a/rule:` and `b/check:`:** y", "  note `rule:` and `touches/evidence:` quoted"]
+    cards = [CARD_BODY.replace("rule: the rule\n", f"rule: the rule\n{r}\n", 1) for r in rows]
+    assert _node(_JS_CARD_ERRORS, cards) == [[] for _ in rows]
+
+
+@needs_node
+def test_the_bold_label_table_is_the_vendored_bus_validators():
+    got = _node(f"import {{ BOLD_LABELS }} from '{_JS_FIELD_SRC}'; process.stdout.write(JSON.stringify(BOLD_LABELS));\n")
+    assert ob._BOLD_LABELS == got
+
+
 # ---------- every committed outbox item must survive the drain's card validation ----------
 #
 # The drain refuses a card the bus validator rejects (size over 2,000 bytes, an `applies` value that
@@ -3081,3 +3526,506 @@ def test_drain_kernel_filing_shares_the_strict_ledger_read(tmp_path):
     with pytest.raises(ob.Unknown) as excinfo:
         ob.drain_kernel_filing(src, clone, "HEAD", ledger, [], push=False)
     assert excinfo.value.code == "sent-ledger-unreadable"
+
+
+# ---------- the card heading is the whole LF-delimited first line, read as the bus validator reads it (r3 B1) ----------
+#
+# Sol r2 B1: parse_item read the heading with str.splitlines()[0] and rstrip(), and screen_card_field_keys skipped its whole first
+# LF row, so `## mlv-app/example-card<U+0085>check: x` passed both: the heading was only the prefix before the separator and the
+# fused key rode in the skipped row. The bus splits on "\n" only and trims with JS trim(), so it reads that whole row as the heading
+# and rejects it. The heading row is now judged exactly as the bus judges it.
+#
+# Named mutation for this block (turns the named tests red, then is reverted):
+#   M23 read the heading with splitlines()[0].rstrip() again   -> the separator rows and the trailing-whitespace parity rows
+
+_HEADING_SEPARATORS = ["\x85", "\x0b", "\x0c", "\x1c", "\u2028", "\u2029"]
+
+
+def _heading_fused_card(sep: str, key: str) -> str:
+    return CARD_BODY.replace("## mlv-app/example-card\n", f"## mlv-app/example-card{sep}{key}: fused-heading-key\n", 1)
+
+
+@pytest.mark.parametrize("sep", _HEADING_SEPARATORS)
+@pytest.mark.parametrize("key", ob.CARD_FIELDS)
+def test_validate_refuses_a_field_key_fused_into_the_heading_row_after_a_non_lf_separator(tmp_path, capsys, sep, key):
+    body = _heading_fused_card(sep, key)
+    assert ob.main(["--repo", str(tmp_path), "validate", str(_write_card_item(tmp_path, body))]) == 1
+    assert "ITEM_BODY_NOT_A_CARD" in capsys.readouterr().err
+
+
+@needs_node
+def test_every_heading_row_the_bus_rejects_is_refused_and_every_one_it_accepts_is_accepted(tmp_path):
+    """The bus is the oracle: a heading row that carries a separator, trailing whitespace or a leading oddity is judged by the
+    vendored parseCardsFile and by validate on the same card, and the two agree."""
+    heads = ["## mlv-app/example-card" + s + t for s in _HEADING_SEPARATORS + _WS_PROBES + [""] for t in ("", "check: x")]
+    heads += [w + "## mlv-app/example-card" for w in _WS_PROBES]
+    # the bus reads the heading as text.slice(3).trim(): whitespace after `## ` and around the id is trimmed, not refused (adversary r3 A1)
+    heads += ["## " + w + "mlv-app/example-card" for w in _WS_PROBES] + ["##  mlv-app/example-card", "## \tmlv-app/example-card  ",
+                                                                         "##\tmlv-app/example-card", "## mlv-app/example-card",
+                                                                         "## mlv-app /example-card", "## mlv-app/ example-card"]
+    cards = [CARD_BODY.replace("## mlv-app/example-card", h, 1) for h in heads]
+    js = _node(_JS_CARD_ERRORS, cards)
+    bad = []
+    for n, (head, card, errors) in enumerate(zip(heads, cards, js)):
+        item = _write_card_item(tmp_path, card, f"20261009-head{n}.md")
+        py_ok = ob.main(["--repo", str(tmp_path), "validate", str(item)]) == 0
+        if py_ok != (not errors):
+            bad.append(f"{head!r}: bus_ok={not errors} validate_ok={py_ok} {errors[:1]}")
+    assert not bad, "\n".join(bad)
+
+
+# ---------- r4: a lone CR is not a line break, and a huge input reaches its cap in linear time (Sol r3 B1 B2) ----------
+#
+# B1: the text readers turned a lone CR into LF, so `rule: x<CR>check: hidden` (ONE row to the bus: a fused key) became two
+# accepted fields; validate said OK and the drain rendered a duplicate `check` the bus rejects. The readers now keep a lone CR and
+# parse_item refuses it in a card (ITEM_CARD_LONE_CR). B2: the bold-line regex backtracked quadratically on a long whitespace run
+# that ends in a line separator, `_card_rows` removed leading blank rows one pop(0) at a time, and the field-key screen ran
+# before the byte cap, so an oversized input paid the quadratic cost before it was refused.
+#
+# Named mutation for this block (turns the named tests red, then is reverted):
+#   M19 read items with read_text / a text-mode git pipe again             -> every lone-CR test
+#   M20 restore the `{WS}+{NOT_EOL}*\Z` bold-line regex or the pop(0) loop -> the pre-cap timing tests
+
+def _lone_cr_body(key: str) -> str:
+    body = CARD_BODY.replace("rule: the rule\n", f"rule: x\r{key}: hidden\n", 1)
+    assert "\r" in body and body != CARD_BODY
+    return body
+
+
+@pytest.mark.parametrize("key", ob.CARD_FIELDS)
+def test_validate_refuses_a_card_whose_lone_cr_would_otherwise_hide_a_fused_field_key(tmp_path, capsys, key):
+    item = tmp_path / "20261009-lone-cr.md"
+    item.write_bytes(item_text(target=CARDS, body=_lone_cr_body(key)).encode("utf-8"))   # LF line ends, one lone CR, no translation
+    assert ob.main(["--repo", str(tmp_path), "validate", str(item)]) == 1
+    assert "ITEM_CARD_LONE_CR" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("key", ob.CARD_FIELDS)
+def test_check_commits_lists_a_card_whose_lone_cr_would_otherwise_hide_a_fused_field_key(tmp_path, key):
+    src, base = _range_repo(tmp_path)
+    name = "20261009-lone-cr-card.md"
+    sha = _commit(src, {f"doctrine-outbox/{name}": item_text(target=CARDS, body=_lone_cr_body(key))},
+                  f"add a lone-CR card\n\nDoctrine-Export: outbox {name}")
+    failures = ob.check_commits(src, f"{base}..HEAD", [])
+    problems = [p for ps in failures.values() for p in ps]
+    assert problems and all("ITEM_CARD_LONE_CR" in p for p in problems)
+    # the `trailer_mode: bare` reader (check_commit_bare) reads the same blob through the same item reader
+    bare = ob.check_commit_bare(src, sha, [])
+    assert [p for p in bare if "ITEM_CARD_LONE_CR" in p], bare
+
+
+def test_the_drain_reader_refuses_a_card_with_a_lone_cr_and_keeps_an_entrys_old_reading(tmp_path):
+    src, _base = _range_repo(tmp_path)
+    _commit(src, {"doctrine-outbox/20261009-lone-cr-card.md": item_text(target=CARDS, body=_lone_cr_body("check")),
+                  "doctrine-outbox/20261009-lone-cr-entry.md": item_text(body="### Entry\nline one\rline two\n")},
+            "add a card and an entry that carry a lone CR")
+    by_name = {e["name"]: e for e in ob.load_outbox_items(src, "HEAD")}
+    assert "ITEM_CARD_LONE_CR" in by_name["20261009-lone-cr-card.md"]["error"]
+    assert by_name["20261009-lone-cr-entry.md"]["item"]["body"] == "### Entry\nline one\nline two\n"   # an entry: CR read as LF, as before
+
+
+def test_a_card_with_crlf_line_ends_is_still_accepted(tmp_path):
+    item = tmp_path / "20261009-crlf-card.md"
+    item.write_bytes(item_text(target=CARDS, body=CARD_BODY).replace("\n", "\r\n").encode("utf-8"))
+    assert ob.main(["--repo", str(tmp_path), "validate", str(item)]) == 0
+
+
+_PRE_CAP_BUDGET_S = 3.0
+
+
+def _timed(fn):
+    t0 = time.perf_counter()
+    result = fn()
+    return result, time.perf_counter() - t0
+
+
+@pytest.mark.parametrize("sep", [" ", " ", "\n", "\r"])
+def test_a_long_whitespace_run_ending_in_a_line_separator_is_parsed_in_linear_time(sep):
+    row = "- **check:**" + " " * 60000 + "y" + sep + "z"
+    _, took = _timed(lambda: ob._parse_field_line(row))
+    assert took < _PRE_CAP_BUDGET_S, f"{took:.2f}s for 60000 spaces: the bold-line match is not linear"
+
+
+def test_the_bold_line_reading_is_unchanged_by_the_linear_tail_check():
+    """The linear tail check agrees with the regex it replaced (`\\s+.*` to the end, JavaScript's classes) on a table of tails."""
+    old = re.compile(rf"- \*\*[^*:]+:\*\*(?:{ob._JS_WS}+{ob._JS_NOT_EOL}*)?\Z")
+    tails = ["", " ", " x", " z", " \n z", "x", " ", "  \r  y  z", " y\nz", " y ", "  \t", "  q",
+             "﻿a", "\x85a", " a  ", "\n\n\n", "     b", "b "]
+    for tail in tails:
+        row = "- **check:**" + tail
+        parsed = ob._parse_field_line(row)
+        assert (parsed is not None and parsed[0] == "bold") == bool(old.match(row)), repr(tail)
+
+
+def test_a_body_of_many_leading_blank_rows_is_split_in_linear_time():
+    body = "\n" * 400000 + CARD_BODY
+    rows, took = _timed(lambda: ob._card_rows(body))
+    assert rows[0] == "## mlv-app/example-card"
+    assert took < _PRE_CAP_BUDGET_S, f"{took:.2f}s for 400000 blank rows"
+
+
+def test_an_oversized_card_is_refused_at_the_cap_before_the_field_key_screen_reads_it(monkeypatch):
+    called = []
+    monkeypatch.setattr(ob, "screen_card_field_keys", lambda body: called.append(len(body)))
+    huge = CARD_BODY.replace("mechanism: the mechanism\n", "mechanism: " + "m" * 50000 + "\n", 1)
+    item = {"meta": {"target": CARDS, "kind": "trap", "source_commit": "PENDING"}, "body": huge}
+    with pytest.raises(ob.Refusal) as e:
+        ob.screen_rendered_card(item)
+    assert e.value.code == "CARD_INVALID"
+    assert not called, "the field-key screen ran on an input over the byte cap"
+
+
+@pytest.mark.parametrize("sep", [" ", " "])
+def test_validate_refuses_a_million_space_bold_row_at_the_cap_in_bounded_time(tmp_path, capsys, sep):
+    body = CARD_BODY.replace("check: py -3 -m pytest tests/coordination -q\n", "- **check:**" + " " * 1000000 + "y" + sep + "z\n", 1)
+    item = _write_card_item(tmp_path, body)
+    rc, took = _timed(lambda: ob.main(["--repo", str(tmp_path), "validate", str(item)]))
+    assert rc == 1 and "CARD_INVALID" in capsys.readouterr().err
+    assert took < 10, f"{took:.1f}s to refuse a 1 MB card"
+
+
+# ---------- r4 fix 1: adversary pass on 1e217283 (A1 a margin strip ate a trailing CR, A2 strict file decode, A3 limits before Law 4) ----------
+
+def test_a_committed_card_that_ends_in_a_lone_cr_is_refused_by_every_committed_item_reader(tmp_path):
+    src, base = _range_repo(tmp_path)
+    name = "20261009-trailing-cr.md"
+    sha = _commit(src, {f"doctrine-outbox/{name}": item_text(target=CARDS, body=CARD_BODY + "\r")},
+                  f"add a card that ends in a lone CR\n\nDoctrine-Export: outbox {name}")
+    problems = [p for ps in ob.check_commits(src, f"{base}..HEAD", []).values() for p in ps]
+    assert problems and all("ITEM_CARD_LONE_CR" in p for p in problems), problems
+    assert [p for p in ob.check_commit_bare(src, sha, []) if "ITEM_CARD_LONE_CR" in p]
+    (entry,) = [e for e in ob.load_outbox_items(src, "HEAD") if e["name"] == name]
+    assert "ITEM_CARD_LONE_CR" in entry["error"]
+    assert ob._item_key(src, "HEAD", f"doctrine-outbox/{name}") is None
+
+
+def test_the_readers_translate_a_lone_cr_as_they_always_did_and_report_it_separately():
+    assert ob.item_text_from_bytes(b"a\rb\r\nc\r") == "a\nb\nc\n"
+    assert ob.has_lone_cr(b"a\rb") and ob.has_lone_cr(b"x\r") and ob.has_lone_cr(b"\r\r\n")
+    assert not ob.has_lone_cr(b"a\r\nb\n")
+
+
+def test_a_non_card_item_with_cr_line_ends_reads_exactly_as_before(tmp_path):
+    """Adversary pass on 14c63ace A1 A2: keeping a lone CR in every item changed how an entry parsed (a CR-only file lost its front
+    matter; a trailing CR doubled the final LF and moved the idempotency key). Only a card refuses a lone CR now."""
+    cr_only = tmp_path / "20261112-cr-entry.md"
+    cr_only.write_bytes(b"---\rtarget: RECEIPTS.md\rkind: receipt\rsource_commit: PENDING\rlaw4: attested\r---\r### Entry\rBody\r")
+    assert ob.main(["--repo", str(tmp_path), "validate", str(cr_only)]) == 0
+    (tmp_path / "r").mkdir()
+    src, _base = _range_repo(tmp_path / "r")
+    lf = item_text(target="RECEIPTS.md", kind="receipt", body="### Entry\nBody\n")
+    _commit(src, {"doctrine-outbox/20261112-lf-receipt.md": lf, "doctrine-outbox/20261112-cr-receipt.md": lf.rstrip("\n") + "\r"},
+            "add a receipt with and without a trailing CR")
+    by_name = {e["name"]: e for e in ob.load_outbox_items(src, "HEAD")}
+    assert by_name["20261112-cr-receipt.md"]["item"]["body"] == by_name["20261112-lf-receipt.md"]["item"]["body"] == "### Entry\nBody\n"
+    assert (ob._item_key(src, "HEAD", "doctrine-outbox/20261112-cr-receipt.md")[1]
+            == ob._item_key(src, "HEAD", "doctrine-outbox/20261112-lf-receipt.md")[1])
+
+
+def test_a_file_read_decodes_strictly_and_a_git_blob_read_replaces_as_each_did_before():
+    with pytest.raises(UnicodeDecodeError):
+        ob.item_text_from_bytes(b"a\xffb", errors="strict")
+    assert ob.item_text_from_bytes(b"a\xffb") == "a�b"
+
+
+def test_validate_refuses_a_128000_character_word_at_the_cap_before_the_law4_email_scan(tmp_path, capsys):
+    body = CARD_BODY.replace("rule: the rule\n", "rule: " + "x" * 128000 + "\n", 1)
+    item = _write_card_item(tmp_path, body)
+    rc, took = _timed(lambda: ob.main(["--repo", str(tmp_path), "validate", str(item)]))
+    assert rc == 1 and "CARD_INVALID" in capsys.readouterr().err
+    assert took < _PRE_CAP_BUDGET_S, f"{took:.1f}s to refuse a 128 KB word: Law 4 scanned it before the cap"
+
+
+def test_check_commits_refuses_a_128000_character_word_at_the_cap_before_the_law4_email_scan(tmp_path):
+    src, base = _range_repo(tmp_path)
+    name = "20261009-long-word.md"
+    _commit(src, {f"doctrine-outbox/{name}": item_text(target=CARDS, body=CARD_BODY.replace("rule: the rule\n", "rule: " + "x" * 128000 + "\n", 1))},
+            f"add a card with a long word\n\nDoctrine-Export: outbox {name}")
+    failures, took = _timed(lambda: ob.check_commits(src, f"{base}..HEAD", []))
+    assert [p for ps in failures.values() for p in ps if "CARD_INVALID" in p]
+    assert took < _PRE_CAP_BUDGET_S, f"{took:.1f}s"
+
+
+# ---------- r5: a whitespace-only row before the heading is skipped as the bus skips it (adversary pass on 36e4753f A1) ----------
+#
+# A1: a standalone U+0085 (or U+001C..U+001F) row between the front matter and the heading is accepted by the base (Python's
+# str.lstrip() eats it) and by the bus (parseCardsFile ignores any non-card-like row before the first card), but r3's row split
+# kept it and card_heading_row took it as the heading: ITEM_BODY_NOT_A_CARD. A row is blank, to be skipped, when EITHER Python's
+# strip() or JavaScript's trim() empties it (one rule, _is_blank_row, shared by every site that reads the card's rows).
+#
+# Named mutation for this block (turns the named tests red, then is reverted):
+#   M24 skip only the rows JS trim() empties again (the 36e4753f rule) -> every U+0085 / U+001C..U+001F row below
+
+# standalone rows: first those Python's strip() empties and JavaScript's trim() does not (A1), then rows both empty, then JS-only
+_PREAMBLE_ROWS = ["\x85", "\x1c", "\x1d", "\x1e", "\x1f", "\x85\x85", " \x85 ", "\x1c\x1d\x1e\x1f", "\t\x85", "\x85\ufeff", "\ufeff", "\ufeff\x1c",
+                  "\u2003", "\xa0", " ", "\x0b", "\u2028"]
+
+
+def _preamble_card(row: str) -> str:
+    return row + "\n" + CARD_BODY
+
+
+@needs_node
+def test_a_whitespace_only_preamble_row_is_judged_as_the_bus_judges_it(tmp_path):
+    cards = [_preamble_card(r) for r in _PREAMBLE_ROWS]
+    js = _node(_JS_CARD_ERRORS, cards)
+    assert all(not errors for errors in js), "the bus no longer ignores one of these rows; the table is stale"
+    bad = []
+    for n, (row, card) in enumerate(zip(_PREAMBLE_ROWS, cards)):
+        item = _write_card_item(tmp_path, card, f"20261112-pre{n}.md")
+        if ob.main(["--repo", str(tmp_path), "validate", str(item)]) != 0:
+            bad.append(repr(row))
+    assert not bad, f"the bus accepts these and validate refuses them: {bad}"
+
+
+@needs_node
+def test_validate_never_accepts_a_preamble_row_the_bus_would_read_as_a_card_field(tmp_path):
+    rows = ["check: echo ok", "- **check:** x", "### Entry", "\x85check: x", "\ufeff### Entry"]
+    cards = [_preamble_card(r) for r in rows]
+    js = _node(_JS_CARD_ERRORS, cards)
+    for n, (row, card, errors) in enumerate(zip(rows, cards, js)):
+        item = _write_card_item(tmp_path, card, f"20261112-bad{n}.md")
+        if ob.main(["--repo", str(tmp_path), "validate", str(item)]) == 0:
+            assert not errors, f"validate accepted {row!r}, which the bus rejects: {errors[:1]}"
+
+
+@pytest.mark.parametrize("row", ["\x85", "\x1c", "\x1d", "\x1e", "\x1f"])
+def test_every_reader_accepts_a_standalone_python_only_whitespace_row_before_the_heading(tmp_path, capsys, row):
+    body = _preamble_card(row)
+    # validate (the working-tree reader)
+    assert ob.main(["--repo", str(tmp_path), "validate", str(_write_card_item(tmp_path, body))]) == 0, capsys.readouterr().err
+    # the committed-blob readers: check_commits, check_commit_bare, load_outbox_items, _item_key
+    (tmp_path / "r").mkdir()
+    src, base = _range_repo(tmp_path / "r")
+    name = "20261112-preamble-card.md"
+    sha = _commit(src, {f"doctrine-outbox/{name}": item_text(target=CARDS, body=body)},
+                  f"add a card with a {row!r} preamble row\n\nDoctrine-Export: outbox {name}")
+    assert not [p for ps in ob.check_commits(src, f"{base}..HEAD", []).values() for p in ps]
+    # the bare reader also judges the trailer form (`outbox <name>` is not a bare-mode value); only the card's own verdict is asked here
+    assert [p for p in ob.check_commit_bare(src, sha, []) if "ITEM_" in p or "CARD" in p or "FIELD_KEY" in p] == []
+    (entry,) = [e for e in ob.load_outbox_items(src, "HEAD") if e["name"] == name]
+    assert "item" in entry, entry
+    keyed = ob._item_key(src, "HEAD", f"doctrine-outbox/{name}")
+    assert keyed is not None
+    item, key = keyed
+    assert key == ob.idempotency_key(ob.added_in(src, "HEAD", f"doctrine-outbox/{name}"), CARDS, item["body"])
+
+
+def test_card_heading_row_and_card_rows_share_one_blank_row_rule():
+    for row in ["\x85", "\x1c", "\ufeff", "\x85\ufeff", " \t"]:
+        body = row + "\n" + CARD_BODY
+        assert ob.card_heading_row(body) == "## mlv-app/example-card", repr(row)
+        assert ob._card_rows(body)[0] == "## mlv-app/example-card", repr(row)
+        assert ob._is_blank_row(row), repr(row)
+    assert not ob._is_blank_row("x") and not ob._is_blank_row("\u200b") and not ob._is_blank_row("\x85x")
+
+
+def test_a_non_whitespace_preamble_row_is_still_refused(tmp_path, capsys):
+    for n, row in enumerate(["\u200b", "\u2060", "\u180e", "note"]):
+        item = _write_card_item(tmp_path, _preamble_card(row), f"20261112-junk{n}.md")
+        assert ob.main(["--repo", str(tmp_path), "validate", str(item)]) == 1, repr(row)
+        assert "ITEM_BODY_NOT_A_CARD" in capsys.readouterr().err
+
+
+# ---------- r5 fix 1: adversary pass on cd5b0b6c (A1 a kept preamble breaks the append, A2 item_heading read the preamble) ----------
+#
+# A1: a whitespace-only preamble row was accepted but kept in the rendered block, so appended after an existing card it was a body
+# row of that card (`\ufeff\x85` is a continuation with no field above it). The rendered card now starts at its heading.
+# A2: item_heading read the first line of body.lstrip(), which keeps U+FEFF, so a published_as claim was verified against U+FEFF
+# and a sent-item supersede named it, not the card id. A card's heading is card_heading_row for every consumer.
+#
+# Named mutation for this block (turns the named tests red, then is reverted):
+#   M25 render a card with its preamble rows again / read item_heading as body.lstrip().splitlines()[0] -> the tests below
+
+_PRIOR_CARD = ("## mlv-app/prior\nrule: the rule\nmechanism: the mechanism\ncheck: git status\nsupersedes: none\nevidence: measured\n")
+_APPEND_PREAMBLES = ["\ufeff\x85", "\x85\ufeff", "\x85", "\ufeff", "\x1c", " \x85 ", "\u2003\x1d", "\x85\x85\x85"]
+
+
+@needs_node
+def test_a_card_with_a_preamble_row_renders_a_block_that_appends_cleanly_after_an_existing_card():
+    items = [{"meta": {"target": CARDS, "kind": "trap", "source_commit": "PENDING"}, "body": _preamble_card(r)} for r in _APPEND_PREAMBLES]
+    files = [_PRIOR_CARD + "\n" + ob.render_block(item, "0" * 40)[1] for item in items]
+    bad = [f"{r!r}: {e[:1]}" for r, e in zip(_APPEND_PREAMBLES, _node(_JS_CARD_ERRORS, files)) if e]
+    assert not bad, "\n".join(bad)
+
+
+def test_the_idempotency_key_still_covers_the_authored_body_preamble_and_all():
+    body = _preamble_card("\x85")
+    item = {"meta": {"target": CARDS, "kind": "trap", "source_commit": "PENDING"}, "body": body}
+    key, block = ob.render_block(item, "0" * 40)
+    assert key == ob.idempotency_key("0" * 40, CARDS, body)
+    assert block.startswith("## mlv-app/example-card\n") and "\x85" not in block
+
+
+@pytest.mark.parametrize("row", _APPEND_PREAMBLES)
+def test_item_heading_of_a_card_is_its_heading_not_its_preamble(row):
+    item = {"meta": {"target": CARDS, "kind": "trap", "source_commit": "PENDING"}, "body": _preamble_card(row)}
+    assert ob.item_heading(item) == "## mlv-app/example-card"
+
+
+def test_item_heading_of_an_entry_reads_as_before():
+    item = {"meta": {"target": "TRAPS.md", "kind": "trap", "source_commit": "PENDING"}, "body": "  \n### An entry  \nBody\n"}
+    assert ob.item_heading(item) == "### An entry"
+
+
+@pytest.mark.parametrize("row", ["\ufeff", "\ufeff\x85", "\x85"])
+def test_a_published_as_claim_is_verified_against_the_cards_heading_not_its_preamble(monkeypatch, row):
+    sha = "1" * 40
+    item = {"meta": {"target": CARDS, "kind": "trap", "source_commit": "PENDING", "published_as": sha},
+            "body": row + "\n## mlv-app/never-published\nrule: the rule\n"}
+    monkeypatch.setattr(ob, "git_try", lambda *a, **k: (0, "", ""))
+    monkeypatch.setattr(ob, "bus_file_at", lambda *a, **k: "\ufeff\n## mlv-app/unrelated-card\nrule: the rule\n")
+    why = ob.verify_published_as(Path("."), "2" * 40, item)
+    assert why and "never-published" in why, why
+    monkeypatch.setattr(ob, "bus_file_at", lambda *a, **k: "## mlv-app/never-published\nrule: the rule\n")
+    assert ob.verify_published_as(Path("."), "2" * 40, item) is None
+
+
+# ---------- r5 fix 2: adversary pass on b68df2a5 (A1 a closing backtick re-used as the opener of a quotation) ----------
+#
+# A1: in `x `!`check:` git status` the span `!` is closed, so `check:` is bare text with a fused key; the quotation pattern took the
+# CLOSING backtick after `!` as an opener and masked `check:`, so the card passed validate and failed the bus (missing field 'check').
+# A backtick run quotes only when it OPENS: an even number of runs before it in the row (runs pair up left to right).
+#
+# Named mutation for this block (turns the named tests red, then is reverted):
+#   M26 mask every quotation-shaped token again, whatever precedes it -> every row below
+
+@pytest.mark.parametrize("n", [1, 2, 3])
+@pytest.mark.parametrize("punct", ["!", ",", ".", ";", "(", ")", "-", "x"])
+@pytest.mark.parametrize("key", ob.CARD_FIELDS)
+def test_validate_refuses_a_key_after_a_closed_span_whose_closing_run_would_open_a_fake_quotation(tmp_path, capsys, n, punct, key):
+    run = "`" * n
+    body = CARD_BODY.replace("rule: the rule\n", f"rule: x {run}{punct}{run}{key}:{run} git status\n", 1)
+    assert ob.main(["--repo", str(tmp_path), "validate", str(_write_card_item(tmp_path, body))]) == 1
+    assert "FIELD_KEY_FUSED" in capsys.readouterr().err
+
+
+def test_a_quotation_after_a_closed_span_is_still_a_quotation(tmp_path):
+    body = CARD_BODY.replace("rule: the rule\n", "rule: a `b` then `check:` and ``rule:`` and `c` then ```supersedes:``` ok\n", 1)
+    assert ob.main(["--repo", str(tmp_path), "validate", str(_write_card_item(tmp_path, body))]) == 0
+
+
+# ---------- r6 fix 1: Sol r5 B1 (an escaped backtick run counted as a delimiter masked a bare fused key) ----------
+#
+# B1: in `x \`a`!`check:` git status` the first run is escaped (text), so `a` is a span, `!` is text and `check:` follows a CLOSED span.
+# The parity count took the escaped run as a delimiter, read an even count and masked `check:`: validate and both commit-check modes
+# accepted a card the bus rejects (missing field 'check'). A run preceded by an odd number of backslashes is not counted and a token
+# after one is not masked (fail closed); an even number is an escaped backslash and the run stays real.
+#
+# Named mutation for this block (turns the named tests red, then is reverted):
+#   M27 count every backtick run again, whatever precedes it -> the odd-backslash rows below
+
+@pytest.mark.parametrize("slashes", ["\\", "\\\\\\"])
+@pytest.mark.parametrize("punct", ["!", ",", "("])
+@pytest.mark.parametrize("key", ob.CARD_FIELDS)
+def test_validate_refuses_a_key_after_an_escaped_backtick_run_the_parity_must_not_count(tmp_path, capsys, slashes, punct, key):
+    body = CARD_BODY.replace("rule: the rule\n", f"rule: x {slashes}`a`{punct}`{key}:` git status\n", 1)
+    assert ob.main(["--repo", str(tmp_path), "validate", str(_write_card_item(tmp_path, body))]) == 1
+    assert "FIELD_KEY_FUSED" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("key", ob.CARD_FIELDS)
+def test_the_screen_refuses_the_escaped_run_row_on_the_shared_entry_every_reader_calls(key):
+    with pytest.raises(ob.Refusal) as e:
+        ob.screen_card_field_keys(CARD_BODY.replace("rule: the rule\n", f"rule: x \`a`!`{key}:` git status\n", 1))
+    assert e.value.code == "FIELD_KEY_FUSED"
+
+
+@pytest.mark.parametrize("slashes", ["\\\\", "\\\\\\\\"])
+def test_an_even_backslash_prefix_leaves_the_run_real_so_the_later_quotation_still_quotes(tmp_path, slashes):
+    body = CARD_BODY.replace("rule: the rule\n", f"rule: x {slashes}`a`!`check:` git status\n", 1)
+    assert ob.main(["--repo", str(tmp_path), "validate", str(_write_card_item(tmp_path, body))]) == 0
+
+
+def test_an_escaped_run_after_the_quotation_does_not_unquote_it(tmp_path):
+    body = CARD_BODY.replace("rule: the rule\n", "rule: x `check:` then \`a` ok\n", 1)
+    assert ob.main(["--repo", str(tmp_path), "validate", str(_write_card_item(tmp_path, body))]) == 0
+
+
+# ---------- r6 fix 2: adversary pass on 0a19848c (A1 a lone shorter run between equal runs, A2 a span that crosses rows) ----------
+#
+# A1: in ``a`!``check:`` the lone run is skipped by the first pair (a code span closes only on an EQUAL run), so the next double run
+# is a CLOSER and `check:` is bare. Counting runs read it as an opener. A2: `x `a` then, on the next row, `!`check:` is one span
+# across the two rows: the row's own count restarted at zero and masked `check:`. A token is masked only when the CommonMark pairing
+# of the row's runs makes its opening run an opener; a run with no partner in the row (or an escaped one) stops masking from there
+# on, in this row and every later one.
+#
+# Named mutation for this block (turns the named tests red, then is reverted):
+#   M28 count runs again (even/odd) and restart the count on every row -> every row below
+
+@pytest.mark.parametrize("key", ob.CARD_FIELDS)
+@pytest.mark.parametrize("rows", [
+    "rule: x ``a`!``{key}:`` git status\n",                       # A1: a 1-run skipped between a 2-run pair
+    "rule: x ```a``!```{key}:``` git status\n",                   # a 2-run skipped between a 3-run pair
+    "rule: x `a\n  !`{key}:` git status\n",                       # A2: the span crosses to the next row
+    "rule: x ``a\n  `!``{key}:`` git status\n",                   # A2 with an unequal run in between
+    "rule: x `a\n  and more\n  !`{key}:` git status\n",           # A2 across two rows
+    "rule: x ``a\ncheck: y `z`\n  !``{key}:`` git status\n",      # a later row after an unpaired run, whatever it holds
+])
+def test_validate_refuses_a_key_after_runs_that_pair_the_other_way_or_across_rows(tmp_path, capsys, rows, key):
+    body = CARD_BODY.replace("rule: the rule\n", rows.replace("{key}", key), 1)
+    assert ob.main(["--repo", str(tmp_path), "validate", str(_write_card_item(tmp_path, body))]) == 1
+    assert "FIELD_KEY_FUSED" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("row", [
+    "rule: ``a`b`` then ``check:`` ok\n",                         # a pair that contains a lone run, then a real quotation
+    "rule: `a` `check:` ``b`c`` `rule:` ok\n",
+    "rule: x ``a`!``y then `check:` ok\n",
+])
+def test_a_quotation_after_pairs_that_close_in_the_row_is_still_a_quotation(tmp_path, row):
+    body = CARD_BODY.replace("rule: the rule\n", row, 1)
+    assert ob.main(["--repo", str(tmp_path), "validate", str(_write_card_item(tmp_path, body))]) == 0
+
+
+@pytest.mark.parametrize("key", ob.CARD_FIELDS)
+def test_the_screen_refuses_the_crossing_and_skipped_run_rows_on_the_entry_every_reader_calls(key):
+    for rows in (f"rule: x ``a`!``{key}:`` git status\n", f"rule: x `a\n  !`{key}:` git status\n"):
+        with pytest.raises(ob.Refusal) as e:
+            ob.screen_card_field_keys(CARD_BODY.replace("rule: the rule\n", rows, 1))
+        assert e.value.code == "FIELD_KEY_FUSED"
+
+
+def test_the_run_pairing_is_linear_in_the_number_of_runs(tmp_path):
+    row = "rule: " + " ".join("`" * (1 + k % 40) for k in range(1500)) + " x\n"
+    t = time.monotonic()
+    ob._mask_quotations(row.rstrip("\n"))
+    assert time.monotonic() - t < 1.0
+
+
+# ---------- r6 fix 3: adversary pass on 4640f9b8 (A1 a backtick that markup reads as text, not as a code-span delimiter) ----------
+#
+# A1: in `<i title="`">a`!`check:` git status` the backtick inside the HTML attribute is text, so `a`!` is a span and `check:` is bare;
+# the pairing counted the attribute backtick as a delimiter, shifted every pairing after it and masked `check:`. Raw HTML, comments,
+# autolinks, link destinations and titles, and reference definitions all read a backtick as text, so the first of them stops masking
+# (a later row too, as a tag can cross rows). A quotation BEFORE the markup is still a quotation.
+#
+# Named mutation for this block (turns the named tests red, then is reverted):
+#   M29 drop _MARKUP_OPEN_RE from the stop column -> every refusal row below
+
+@pytest.mark.parametrize("key", ob.CARD_FIELDS)
+@pytest.mark.parametrize("rows", [
+    'rule: <i title="`">a`!`{key}:` git status\n',                # the attack: a backtick inside an HTML attribute
+    "rule: <!-- ` -->a`!`{key}:` git status\n",                   # an HTML comment
+    "rule: <http://a`b>a`!`{key}:` git status\n",                 # an autolink
+    "rule: [t](http://a`b) a`!`{key}:` git status\n",             # a link destination
+    'rule: [t](u "`") a`!`{key}:` git status\n',                  # a link title
+    "rule: [t]: http://a`b a`!`{key}:` git status\n",             # a reference definition
+    'rule: <i title="`"\n  >a`!`{key}:` git status\n',            # a tag that crosses rows
+])
+def test_validate_refuses_a_key_after_markup_that_reads_a_backtick_as_text(tmp_path, capsys, rows, key):
+    body = CARD_BODY.replace("rule: the rule\n", rows.replace("{key}", key), 1)
+    assert ob.main(["--repo", str(tmp_path), "validate", str(_write_card_item(tmp_path, body))]) == 1
+    assert "FIELD_KEY_FUSED" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("key", ob.CARD_FIELDS)
+def test_the_screen_refuses_the_markup_row_on_the_entry_every_reader_calls(key):
+    with pytest.raises(ob.Refusal) as e:
+        ob.screen_card_field_keys(CARD_BODY.replace("rule: the rule\n", f'rule: <i title="`">a`!`{key}:` git status\n', 1))
+    assert e.value.code == "FIELD_KEY_FUSED"
+
+
+def test_a_quotation_before_the_markup_is_still_a_quotation(tmp_path):
+    body = CARD_BODY.replace("rule: the rule\n", 'rule: use `check:` then <i title="x">y</i> and [t](u)\n', 1)
+    assert ob.main(["--repo", str(tmp_path), "validate", str(_write_card_item(tmp_path, body))]) == 0
