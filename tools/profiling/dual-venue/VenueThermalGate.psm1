@@ -46,6 +46,18 @@ function ConvertTo-VenueDouble {
     [double]::TryParse([string]$Value, [System.Globalization.NumberStyles]::Float, $script:Inv, $Out)
 }
 
+function ConvertFrom-VenueDoubleBits {
+    # PARITY-1 r5 (adversary r4 A1, hub ruling EXACT BITS): a double's IEEE-754 bits (the agent's meanMaxCBits, the probe's feedStaleSecBits / mean_c_exact_bits, the tele line's *_bits= tokens) ->
+    # the double, by Int64BitsToDouble: no [double] parse, which on Windows PowerShell 5.1 is not correctly rounded. An exact Int32 / Int64 (what both shells' ConvertFrom-Json give for a JSON
+    # integer in range) or an all-digit text that fits Int64 decodes; anything else ($null, a double, a Decimal / BigInteger past Int64, other text, a bool, an array) is $false: never a guess.
+    param([AllowNull()][object]$Value, [ref]$Out)
+    $n = [long]0
+    if ($Value -is [long] -or $Value -is [int]) { $n = [long]$Value }
+    elseif (-not ($Value -is [string] -and $Value -match '\A-?[0-9]{1,19}\z' -and [long]::TryParse($Value, [System.Globalization.NumberStyles]::AllowLeadingSign, $script:Inv, [ref]$n))) { return $false }
+    $Out.Value = [BitConverter]::Int64BitsToDouble($n)
+    $true
+}
+
 function Resolve-VenueHeatRule {
     # BACHELOR-THERMAL-GATE-AGENT-THRESHOLD-PARITY-1: the heat thresholds the gate decides on. -Rule is the record the RUNNING agent published (ultra-magnus-agent.ps1
     # Get-AgentHeatRule, copied by the quiet probe): an object with source, maxThrottledRows, meanMaxC, sustainedRows, feedStaleSec. $null (nothing published: an agent that predates it)
@@ -58,12 +70,19 @@ function Resolve-VenueHeatRule {
     }
     if ($Rule -isnot [System.Management.Automation.PSCustomObject]) { return $inv }
     $p = $Rule.PSObject.Properties
-    if (-not $p['source'] -or -not [string]::Equals([string]$Rule.source, 'agent', [System.StringComparison]::Ordinal)) { return $inv }   # ordinal: -cne ignores a soft hyphen inside "agent" (adversary r3 A5)
+    # ordinal: -cne ignores a soft hyphen inside "agent" (adversary r3 A5); and a string: [string] turned a one-element array ["agent"] into agent (adversary r4 A3)
+    if (-not $p['source'] -or $Rule.source -isnot [string] -or -not [string]::Equals([string]$Rule.source, 'agent', [System.StringComparison]::Ordinal)) { return $inv }
     $vals = @{}
     foreach ($k in 'maxThrottledRows', 'meanMaxC', 'sustainedRows', 'feedStaleSec') {
-        if (-not $p[$k] -or $null -eq $Rule.$k -or $Rule.$k -is [bool] -or $Rule.$k -is [array]) { return $inv }   # a scalar number or its text: an array coerces through [string] and is no number
         $d = 0.0
-        if (-not (ConvertTo-VenueDouble $Rule.$k ([ref]$d))) { return $inv }
+        # r5 (adversary r4 A1): a double field's <name>Bits, when present, IS the value (ConvertFrom-VenueDoubleBits) and the number/text beside it is ignored; present but no integer -> invalid
+        if (($k -ceq 'meanMaxC' -or $k -ceq 'feedStaleSec') -and $p[$k + 'Bits']) {
+            if (-not (ConvertFrom-VenueDoubleBits $Rule.($k + 'Bits') ([ref]$d))) { return $inv }
+        }
+        else {
+            if (-not $p[$k] -or $null -eq $Rule.$k -or $Rule.$k -is [bool] -or $Rule.$k -is [array]) { return $inv }   # a scalar number or its text: an array coerces through [string] and is no number
+            if (-not (ConvertTo-VenueDouble $Rule.$k ([ref]$d))) { return $inv }
+        }
         if ([double]::IsNaN($d) -or [double]::IsInfinity($d) -or $d -lt 0) { return $inv }
         $vals[$k] = $d
     }
@@ -99,7 +118,7 @@ function Get-VenueRuleFromTeleLine {
     $src = [regex]::Match($Line, '\srule_source=(\S+)')
     if (-not $src.Success) { return $null }
     $o = [ordered]@{ source = $src.Groups[1].Value }
-    foreach ($pair in @(@('maxThrottledRows', 'rule_max_throttled'), @('meanMaxC', 'rule_mean_max_c'), @('sustainedRows', 'rule_rows'), @('feedStaleSec', 'rule_stale_s'))) {
+    foreach ($pair in @(@('maxThrottledRows', 'rule_max_throttled'), @('meanMaxC', 'rule_mean_max_c'), @('sustainedRows', 'rule_rows'), @('feedStaleSec', 'rule_stale_s'), @('meanMaxCBits', 'rule_mean_max_c_bits'), @('feedStaleSecBits', 'rule_stale_s_bits'))) {
         $m = [regex]::Match($Line, '\s' + $pair[1] + '=(\S+)')
         if ($m.Success) { $o[$pair[0]] = $m.Groups[1].Value }
     }
@@ -129,7 +148,10 @@ function ConvertFrom-VenueProbeHeatLine {
             # r3 A2: the probe rounds mean_c to 0.01 (87.998 -> 88.0, which the agent's rule calls hot while the exact mean is clear): the exact mean it also writes,
             # mean_c_exact, is the heat decision's value when present; the rounded mean_c only for a probe that predates it
             $meanSrc = $(if ($h.PSObject.Properties['mean_c_exact'] -and $null -ne $h.mean_c_exact) { $h.mean_c_exact } else { $h.mean_c })
-            $okM = ConvertTo-VenueDouble $meanSrc ([ref]$mean)
+            # r5 (adversary r4 A1): mean_c_exact_bits, when the probe wrote one (non-null: a probe with no reading writes null), IS the exact mean (no [double] parse, which Windows PowerShell 5.1
+            # does not round correctly); a value that is no integer is no mean (NaN below), never the number beside it
+            if ($h.PSObject.Properties['mean_c_exact_bits'] -and $null -ne $h.mean_c_exact_bits) { $okM = ConvertFrom-VenueDoubleBits $h.mean_c_exact_bits ([ref]$mean) }
+            else { $okM = ConvertTo-VenueDouble $meanSrc ([ref]$mean) }
             # r5 (B1): an unparseable mean is NaN, not a reason to drop the throttled count: Get-VenueHeatVerdict tests the count first
             if (-not $okM) { $mean = [double]::NaN }
             # PARITY-1: the agent's published thresholds ride in heat.rule; an unusable record is unknown, never read against the defaults
@@ -165,7 +187,11 @@ function ConvertFrom-VenueProbeHeatLine {
     $mx = [regex]::Match([string]$line, '\smean_exact=(-?[0-9]+(?:[.,][0-9]+)?(?:[eE][-+]?[0-9]+)?|NaN|[-+]?Infinity)(?:\s|$)')
     $meanText = $(if ($mx.Success) { $mx.Groups[1].Value } elseif ($m.Groups[1].Success) { $m.Groups[1].Value } else { 'n/a' })
     $inf = [string][char]0x221E
-    if ($meanText -ceq $inf -or $meanText -ceq "+$inf") { $mean = [double]::PositiveInfinity }
+    # r5 (adversary r4 A1): mean_exact_bits=<Int64> IS the exact mean (the probe prints it from its JSON's integer); a token that does not decode is no mean (NaN: the count alone may decide), never
+    # the mean_exact text beside it
+    $mb = [regex]::Match([string]$line, '\smean_exact_bits=(\S+)')
+    if ($mb.Success) { if (-not (ConvertFrom-VenueDoubleBits $mb.Groups[1].Value ([ref]$mean))) { $mean = [double]::NaN } }
+    elseif ($meanText -ceq $inf -or $meanText -ceq "+$inf") { $mean = [double]::PositiveInfinity }
     elseif ($meanText -ceq "-$inf") { $mean = [double]::NegativeInfinity }
     elseif ($meanText -ceq '+Infinity') { $mean = [double]::PositiveInfinity }
     elseif ($meanText -match '^-?[0-9]+(?:[.,][0-9]+)?(?:[eE][-+]?[0-9]+)?$' -or $meanText -cin @('NaN', 'Infinity', '-Infinity')) {

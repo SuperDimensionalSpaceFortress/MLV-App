@@ -557,6 +557,8 @@ $HeatStaleSec = 120
 # on .NET Framework misses the round trip for some values), so a threshold or an exact mean that needs more digits would arrive as a neighbouring double and the gate would decide the other way from the
 # agent. A finite double that G15 gives back bit-identical stays a JSON number; any other is the shortest of its G16 / G17 text that does round trip (every reader parses numeric text invariant); a
 # non-finite double is its name (a JSON number cannot carry it).
+# PARITY-1 r5 (adversary r4 A1, hub ruling EXACT BITS): that G15 self-check parses in THIS shell, and Windows PowerShell 5.1's parser is not correctly rounded, so on 5.1 it can pass a G15 text that every
+# correct parser reads as the neighbouring double. This function now shapes the HUMAN field only (and what a reader that predates the bits reads). The value travels in ConvertTo-TelDoubleBits below.
 function ConvertTo-JsonSafeDouble($Value) {
     if ($null -eq $Value) { return $null }   # a rule that was not published (source default / invalid) has no number to carry
     $d = [double]$Value
@@ -571,6 +573,18 @@ function ConvertTo-JsonSafeDouble($Value) {
     if ([double]::TryParse($s16, $ns, $inv, [ref]$p) -and $p -ceq $d) { $t = $s16 }
     return $t
 }
+# PARITY-1 r5: a double's IEEE-754 bits as an Int64 (a JSON integer, exact through both shells' ConvertTo-Json / ConvertFrom-Json), or $null for no value. No parse: a [double] is taken as it is.
+function ConvertTo-TelDoubleBits($Value) {
+    if ($null -eq $Value) { return $null }
+    [BitConverter]::DoubleToInt64Bits([double]$Value)
+}
+# PARITY-1 r5: the heat{}.rule block the gate reads: the human fields as before, and beside each double its bits (meanMaxCBits, feedStaleSecBits), which the gate decodes and prefers
+function New-TelHeatRuleBlock($Rule) {
+    $b = [ordered]@{ source = $Rule.source; maxThrottledRows = $Rule.maxThrottledRows; meanMaxC = (ConvertTo-JsonSafeDouble $Rule.meanMaxC); sustainedRows = $Rule.sustainedRows; feedStaleSec = (ConvertTo-JsonSafeDouble $Rule.feedStaleSec) }
+    if ($null -ne $Rule.meanMaxC) { $b['meanMaxCBits'] = (ConvertTo-TelDoubleBits $Rule.meanMaxC) }
+    if ($null -ne $Rule.feedStaleSec) { $b['feedStaleSecBits'] = (ConvertTo-TelDoubleBits $Rule.feedStaleSec) }
+    $b
+}
 function Read-TelAgentHeatRule([string]$Json, [int]$DefaultRows, [double]$DefaultStaleSec) {
     $r = [ordered]@{ source = 'default'; maxThrottledRows = $null; meanMaxC = $null; sustainedRows = $null; feedStaleSec = $null; windowRows = $DefaultRows; staleSec = $DefaultStaleSec }
     if ([string]::IsNullOrWhiteSpace($Json)) { return [pscustomobject]$r }
@@ -584,12 +598,26 @@ function Read-TelAgentHeatRule([string]$Json, [int]$DefaultRows, [double]$Defaul
         $o = ConvertFrom-Json -InputObject $Json -ErrorAction Stop
         if ($o -isnot [pscustomobject]) { return [pscustomobject]$r }
         $v = @{}
+        # PARITY-1 r5 (adversary r4 A1, hub ruling EXACT BITS): a double field's <name>Bits (the agent publishes meanMaxCBits) is its IEEE-754 bits, an exact Int32 / Int64 from either shell's
+        # ConvertFrom-Json, or an all-digit text. Present -> decoded with Int64BitsToDouble and the number/text beside it is IGNORED (Windows PowerShell 5.1's double parser is not correctly
+        # rounded). Present but not an integer (a double, a Decimal / BigInteger past Int64, junk text, $null, a bool, an array) -> invalid, never a fallback to the number. Absent -> the number/text.
+        $bitsOf = { param($x) $n = [long]0
+            if ($x -is [long] -or $x -is [int]) { return [long]$x }
+            if ($x -is [string] -and $x -match '\A-?[0-9]{1,19}\z' -and [long]::TryParse($x, [Globalization.NumberStyles]::AllowLeadingSign, [Globalization.CultureInfo]::InvariantCulture, [ref]$n)) { return $n }
+            return $null }
         foreach ($k in 'maxThrottledRows', 'meanMaxC', 'sustainedRows', 'feedStaleSec') {
+            $d = 0.0
+            if (($k -ceq 'meanMaxC' -or $k -ceq 'feedStaleSec') -and $o.PSObject.Properties[$k + 'Bits']) {
+                $b = & $bitsOf $o.($k + 'Bits')
+                if ($null -eq $b) { return [pscustomobject]$r }
+                $d = [BitConverter]::Int64BitsToDouble($b)
+            } else {
             if (-not $o.PSObject.Properties[$k] -or $null -eq $o.$k -or $o.$k -is [bool] -or $o.$k -is [array]) { return [pscustomobject]$r }
-            $d = 0.0; $x = $o.$k
+            $x = $o.$k
             if ($x -is [double] -or $x -is [long] -or $x -is [int] -or $x -is [decimal] -or $x -is [bigint]) { $d = [double]$x }
             elseif ($x -is [string]) { if (-not [double]::TryParse($x, [Globalization.NumberStyles]::Float, [Globalization.CultureInfo]::InvariantCulture, [ref]$d)) { return [pscustomobject]$r } }
             else { return [pscustomobject]$r }
+            }
             if ([double]::IsNaN($d) -or [double]::IsInfinity($d) -or $d -lt 0) { return [pscustomobject]$r }
             $v[$k] = $d
         }
@@ -694,10 +722,10 @@ function ConvertFrom-TelFeedRows([string[]]$Lines) {
         max15C = ($last15 | Measure-Object -Property c -Maximum).Maximum; watts30 = [Math]::Round(($last15 | Measure-Object -Property w -Average).Average, 1); lastC = $recs[$recs.Count - 1].c } }
 }
 $heatFields = @('sample_age_s', 'hottest_core_c', 'max15_c', 'mean_c', 'mean_c_exact', 'throttled', 'window_rows', 'package_w')
-$telHeat = [ordered]@{ source = 'unavailable'; sample_age_s = $null; hottest_core_c = $null; max15_c = $null; mean_c = $null; mean_c_exact = $null; throttled = $null; window_rows = $null; package_w = $null
+$telHeat = [ordered]@{ source = 'unavailable'; sample_age_s = $null; hottest_core_c = $null; max15_c = $null; mean_c = $null; mean_c_exact = $null; mean_c_exact_bits = $null; throttled = $null; window_rows = $null; package_w = $null
     window_rule_rows = $HeatWindowRows; stale_after_s = $HeatStaleSec; reasons = [ordered]@{}; why = $null }
 if ($AgentHeatRule.source -cne 'default') {
-    $telHeat['rule'] = [ordered]@{ source = $AgentHeatRule.source; maxThrottledRows = $AgentHeatRule.maxThrottledRows; meanMaxC = (ConvertTo-JsonSafeDouble $AgentHeatRule.meanMaxC); sustainedRows = $AgentHeatRule.sustainedRows; feedStaleSec = (ConvertTo-JsonSafeDouble $AgentHeatRule.feedStaleSec) }
+    $telHeat['rule'] = (New-TelHeatRuleBlock $AgentHeatRule)   # r5: with meanMaxCBits / feedStaleSecBits beside the human fields
 }
 try {
     $w = Invoke-TelBounded $TelTailScript @($HeatFeedPath, (80 * 150 + 400), $TelemetryReadDelayMs) $TelemetryCallMs
@@ -714,7 +742,7 @@ try {
             $r = ConvertFrom-TelFeedRows $lines
             if ($null -eq $r.m) { $code = $r.why }
             else {
-                $telHeat.hottest_core_c = [double]$r.m.lastC; $telHeat.max15_c = [double]$r.m.max15C; $telHeat.mean_c = [math]::Round([double]$r.m.meanC, 2); $telHeat.mean_c_exact = (ConvertTo-JsonSafeDouble $r.m.meanC)   # r4 A1: a number, or its round-trip text when 15 digits would not carry it. r3 A2: mean_c is rounded to 0.01 (87.998 -> 88.0, hot by the agent's >= 88 rule while the exact mean is clear); the exact mean is what the lease-batch thermal gate decides on
+                $telHeat.hottest_core_c = [double]$r.m.lastC; $telHeat.max15_c = [double]$r.m.max15C; $telHeat.mean_c = [math]::Round([double]$r.m.meanC, 2); $telHeat.mean_c_exact = (ConvertTo-JsonSafeDouble $r.m.meanC); $telHeat.mean_c_exact_bits = (ConvertTo-TelDoubleBits $r.m.meanC)   # r5 A1: mean_c_exact_bits is the exact mean the gate decides on (its IEEE-754 bits; mean_c_exact is the human field). r4 A1: a number, or its round-trip text when 15 digits would not carry it. r3 A2: mean_c is rounded to 0.01 (87.998 -> 88.0, hot by the agent's >= 88 rule while the exact mean is clear); the exact mean is what the lease-batch thermal gate decides on
                 $telHeat.throttled = [int]$r.m.throttled; $telHeat.window_rows = [int]$r.m.window; $telHeat.package_w = [double]$r.m.watts30
             }
         }
@@ -1333,18 +1361,32 @@ function Write-TelemetryLines($Probe) {
             foreach ($f in 'G15', 'G16', 'G17') { $t = $d.ToString($f, $inv); if ([double]::TryParse($t, $ns, $inv, [ref]$p) -and $p -ceq $d) { break } }
             $t
         }
+        # PARITY-1 r5 (adversary r4 A1, hub ruling EXACT BITS): $rt above shapes the HUMAN text only (its self-check parses in this shell, which on Windows PowerShell 5.1 is not correctly rounded).
+        # The values the gate decides on are the bits tokens (mean_exact_bits=, rule_mean_max_c_bits=, rule_stale_s_bits=), printed from the probe JSON's Int32 / Int64 (or all-digit text) as
+        # invariant digits. A bits field that is present but no integer ($null, a double, a Decimal / BigInteger, text, a bool, an array, whose [string] could even be digits) is printed as the
+        # token 'invalid', so the gate refuses it (never a silent fallback to the text beside it).
+        $bt = { param($Block, [string]$Name)
+            if (-not $Block.PSObject.Properties[$Name]) { return $null }
+            $x = $Block.$Name; $n = [long]0
+            if ($x -is [long] -or $x -is [int]) { return ([long]$x).ToString([Globalization.CultureInfo]::InvariantCulture) }
+            if ($x -is [string] -and $x -match '\A-?[0-9]{1,19}\z' -and [long]::TryParse($x, [Globalization.NumberStyles]::AllowLeadingSign, [Globalization.CultureInfo]::InvariantCulture, [ref]$n)) { return $n.ToString([Globalization.CultureInfo]::InvariantCulture) }
+            'invalid'
+        }
         # BACHELOR-THERMAL-GATE-WAIT-1 r6 (adversary r5 A3): mean_exact is printed for a non-finite mean too. The JSON round trip holds it as the string NaN / Infinity / -Infinity, which
         # Format-TelNum prints as 'n/a' (as for a missing mean); mean_exact names it, so the lease-batch gate reads +Infinity as hot (the agent's >= 88 rule) and NaN / -Infinity as unknown.
         Write-Gate (("  tele heat source={0} age={1} hottest={2} max15={3} mean={4} throttled={5}/{6} W={7}" -f (ConvertTo-IdentToken $h.source), (Format-TelNum $h.sample_age_s 's'),
             (Format-TelNum $h.hottest_core_c 'C'), (Format-TelNum $h.max15_c 'C'), (Format-TelNum $h.mean_c 'C'), (ConvertTo-IdentToken $h.throttled), (ConvertTo-IdentToken $h.window_rows),
             (Format-TelNum $h.package_w '')) + (Get-TelReasonSuffix $h) + $(if ($null -ne ($mx = (& $rt $h.mean_c_exact))) { ' mean_exact=' + $mx } else { '' }) +
+            $(if ($null -ne $h.mean_c_exact_bits -and $null -ne ($mb = (& $bt $h 'mean_c_exact_bits'))) { ' mean_exact_bits=' + $mb } else { '' }) +
             # PARITY-1: the agent's published heat rule, as the gate reads it off this line (VenueThermalGate.psm1 Get-VenueRuleFromTeleLine); inline, so the existing harnesses that lift this function
             # keep working. Nothing published -> nothing printed (the gate says thresholds_source=default); a record the probe could not use -> rule_source=invalid (THERMAL_THRESHOLDS_INVALID).
             # a number, or the numeric text the probe publishes for a double 15 digits cannot carry, is printed round-trip ($rt above), never through [string] (15 significant digits: 80.00000000000001 would
             # print as 80) and never as an identifier token (which would pass a padded text on as it came)
             $(if ($h.PSObject.Properties['rule'] -and $null -ne $h.rule) {
                 $rn = { param($x) $v = (& $rt $x); if ($null -ne $v) { $v } else { ConvertTo-IdentToken $x } }
-                if ([string]::Equals([string]$h.rule.source, 'agent', [StringComparison]::Ordinal)) { ' rule_source=agent rule_max_throttled=' + (& $rn $h.rule.maxThrottledRows) + ' rule_mean_max_c=' + (& $rn $h.rule.meanMaxC) + ' rule_rows=' + (& $rn $h.rule.sustainedRows) + ' rule_stale_s=' + (& $rn $h.rule.feedStaleSec) }
+                # r5 (adversary r4 A3): the source must BE the string agent: [string] turned a one-element array ["agent"] into agent
+                if ($h.rule.source -is [string] -and [string]::Equals([string]$h.rule.source, 'agent', [StringComparison]::Ordinal)) { ' rule_source=agent rule_max_throttled=' + (& $rn $h.rule.maxThrottledRows) + ' rule_mean_max_c=' + (& $rn $h.rule.meanMaxC) + ' rule_rows=' + (& $rn $h.rule.sustainedRows) + ' rule_stale_s=' + (& $rn $h.rule.feedStaleSec) +
+                    $(if ($null -ne ($b1 = (& $bt $h.rule 'meanMaxCBits'))) { ' rule_mean_max_c_bits=' + $b1 } else { '' }) + $(if ($null -ne ($b2 = (& $bt $h.rule 'feedStaleSecBits'))) { ' rule_stale_s_bits=' + $b2 } else { '' }) }
                 else { ' rule_source=invalid' }
             } else { '' }))
         $g = $Probe.gpu

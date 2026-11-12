@@ -2633,6 +2633,11 @@ function Get-AgentHeatRule {
     # PARITY-1 r4 (adversary r3 A1): Windows PowerShell 5.1 writes a [double] into JSON with 15 significant digits (or through 'R', which on .NET Framework misses the round trip for some values), so a
     # threshold that needs every digit would reach the gate as a neighbouring double. A finite double that G15 does not give back bit-identical is therefore published as the shortest of its G16 / G17
     # text that does (the readers parse numeric text invariant); every other double stays a JSON number. Inline, so this function stays liftable on its own.
+    # PARITY-1 r5 (adversary r4 A1, hub ruling EXACT BITS): that self-check parses in THIS shell, and Windows PowerShell 5.1's parser is not correctly rounded (the G15 text 79.3224899793614 of bits
+    # 4635282240941762887 parses back to ...887 there, to ...886 everywhere else), so meanMaxC is now the HUMAN field only, for people and for a reader that predates the bits. The rule's value is
+    # meanMaxCBits: the double's IEEE-754 bits as a JSON integer ([BitConverter]::DoubleToInt64Bits, exact on every shell; both shells' ConvertFrom-Json read it back as an exact Int32 / Int64).
+    # Every reader that finds it decodes it with Int64BitsToDouble and ignores meanMaxC, so no [double] parse in any shell is on the decision path. Bits of a non-finite double are published as
+    # they are; the readers refuse them (THERMAL_THRESHOLDS_INVALID). The three counts are [int] and travel exactly as JSON integers, so they carry no bits.
     $mean = [double]$GateMeanMaxC
     $inv = [System.Globalization.CultureInfo]::InvariantCulture
     $meanOut = $mean
@@ -2650,6 +2655,7 @@ function Get-AgentHeatRule {
     return [ordered]@{
         maxThrottledRows = [int]$GateMaxThrottledRows
         meanMaxC         = $meanOut
+        meanMaxCBits     = [BitConverter]::DoubleToInt64Bits($mean)
         sustainedRows    = [int]$GateSustainedRows
         feedStaleSec     = [int]$GateFeedStaleSec
     }
