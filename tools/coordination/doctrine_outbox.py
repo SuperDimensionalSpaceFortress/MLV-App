@@ -823,13 +823,19 @@ def render_block(item: dict, source_commit: str, project: str | None = None) -> 
         # Every line of a card is a field, a continuation or a bold-bullet note; the validator
         # refuses an HTML comment there, so the marker is a note line. It counts toward the
         # card's 15-line and 2,000-byte limits, which the validator checks before any push.
+        # The block starts at the heading: a blank row before it (which parse_item accepts) would, appended after another card, be a
+        # row of THAT card (`﻿\x85` is a continuation with no field above it). The key above still covers the authored body.
+        body = _from_heading_row(body)
         return key, f"{body}\n- **Outbox:** outbox:{key} {project}:{source_commit[:12]}\n"
     block = f"{body}\n<!-- outbox:{key} {project}:{source_commit[:12]} -->\n"
     return key, block
 
 
 def item_heading(item: dict) -> str:
-    """The `### ` line an item opens with -- how a published_as claim is looked up."""
+    """The heading line an item opens with -- how a published_as claim is looked up. A card's is the heading row the bus reads
+    (card_heading_row), past any blank preamble row: lstrip() keeps U+FEFF, so it named the preamble (adversary pass on cd5b0b6c A2)."""
+    if item["meta"]["target"] == CARDS_TARGET:
+        return card_heading_row(item["body"])
     return item["body"].lstrip().splitlines()[0].rstrip()
 
 
@@ -892,6 +898,15 @@ def _is_blank_row(row: str) -> bool:
     body.lstrip() (adversary pass on 36e4753f A1). One test here, so every site that reads a card's rows skips the same rows; a
     row with any other character, such as U+200B, is not blank and is still refused as the heading."""
     return not row.strip(_BLANK_ROW_CHARS)
+
+
+def _from_heading_row(body: str) -> str:
+    """`body` without the blank rows (_is_blank_row) before its first other row, split on "\n" and otherwise byte for byte."""
+    rows = body.split("\n")
+    first = 0
+    while first < len(rows) and _is_blank_row(rows[first]):
+        first += 1
+    return "\n".join(rows[first:])
 
 
 def _card_rows(body: str) -> list[str]:
@@ -1210,7 +1225,12 @@ def verify_published_as(bus_repo: pathlib.Path, tip: str, item: dict) -> str | N
     if content is None:
         return f"{item['meta']['target']} does not exist at {sha}"
     heading = item_heading(item)
-    if heading not in {line.rstrip() for line in content.splitlines()}:
+    if item["meta"]["target"] == CARDS_TARGET:
+        # the bus splits a card file on LF only, and reads a heading as card_heading_row reads it
+        lines = {card_heading_row(line) for line in content.replace("\r\n", "\n").split("\n") if line.startswith("## ")}
+    else:
+        lines = {line.rstrip() for line in content.splitlines()}
+    if heading not in lines:
         return f"heading {heading[:60]!r} is not in {item['meta']['target']} at {sha}"
     return None
 

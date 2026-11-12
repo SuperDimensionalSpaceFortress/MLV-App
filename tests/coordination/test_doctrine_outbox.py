@@ -3825,3 +3825,57 @@ def test_a_non_whitespace_preamble_row_is_still_refused(tmp_path, capsys):
         item = _write_card_item(tmp_path, _preamble_card(row), f"20261112-junk{n}.md")
         assert ob.main(["--repo", str(tmp_path), "validate", str(item)]) == 1, repr(row)
         assert "ITEM_BODY_NOT_A_CARD" in capsys.readouterr().err
+
+
+# ---------- r5 fix 1: adversary pass on cd5b0b6c (A1 a kept preamble breaks the append, A2 item_heading read the preamble) ----------
+#
+# A1: a whitespace-only preamble row was accepted but kept in the rendered block, so appended after an existing card it was a body
+# row of that card (`\ufeff\x85` is a continuation with no field above it). The rendered card now starts at its heading.
+# A2: item_heading read the first line of body.lstrip(), which keeps U+FEFF, so a published_as claim was verified against U+FEFF
+# and a sent-item supersede named it, not the card id. A card's heading is card_heading_row for every consumer.
+#
+# Named mutation for this block (turns the named tests red, then is reverted):
+#   M25 render a card with its preamble rows again / read item_heading as body.lstrip().splitlines()[0] -> the tests below
+
+_PRIOR_CARD = ("## mlv-app/prior\nrule: the rule\nmechanism: the mechanism\ncheck: git status\nsupersedes: none\nevidence: measured\n")
+_APPEND_PREAMBLES = ["\ufeff\x85", "\x85\ufeff", "\x85", "\ufeff", "\x1c", " \x85 ", "\u2003\x1d", "\x85\x85\x85"]
+
+
+@needs_node
+def test_a_card_with_a_preamble_row_renders_a_block_that_appends_cleanly_after_an_existing_card():
+    items = [{"meta": {"target": CARDS, "kind": "trap", "source_commit": "PENDING"}, "body": _preamble_card(r)} for r in _APPEND_PREAMBLES]
+    files = [_PRIOR_CARD + "\n" + ob.render_block(item, "0" * 40)[1] for item in items]
+    bad = [f"{r!r}: {e[:1]}" for r, e in zip(_APPEND_PREAMBLES, _node(_JS_CARD_ERRORS, files)) if e]
+    assert not bad, "\n".join(bad)
+
+
+def test_the_idempotency_key_still_covers_the_authored_body_preamble_and_all():
+    body = _preamble_card("\x85")
+    item = {"meta": {"target": CARDS, "kind": "trap", "source_commit": "PENDING"}, "body": body}
+    key, block = ob.render_block(item, "0" * 40)
+    assert key == ob.idempotency_key("0" * 40, CARDS, body)
+    assert block.startswith("## mlv-app/example-card\n") and "\x85" not in block
+
+
+@pytest.mark.parametrize("row", _APPEND_PREAMBLES)
+def test_item_heading_of_a_card_is_its_heading_not_its_preamble(row):
+    item = {"meta": {"target": CARDS, "kind": "trap", "source_commit": "PENDING"}, "body": _preamble_card(row)}
+    assert ob.item_heading(item) == "## mlv-app/example-card"
+
+
+def test_item_heading_of_an_entry_reads_as_before():
+    item = {"meta": {"target": "TRAPS.md", "kind": "trap", "source_commit": "PENDING"}, "body": "  \n### An entry  \nBody\n"}
+    assert ob.item_heading(item) == "### An entry"
+
+
+@pytest.mark.parametrize("row", ["\ufeff", "\ufeff\x85", "\x85"])
+def test_a_published_as_claim_is_verified_against_the_cards_heading_not_its_preamble(monkeypatch, row):
+    sha = "1" * 40
+    item = {"meta": {"target": CARDS, "kind": "trap", "source_commit": "PENDING", "published_as": sha},
+            "body": row + "\n## mlv-app/never-published\nrule: the rule\n"}
+    monkeypatch.setattr(ob, "git_try", lambda *a, **k: (0, "", ""))
+    monkeypatch.setattr(ob, "bus_file_at", lambda *a, **k: "\ufeff\n## mlv-app/unrelated-card\nrule: the rule\n")
+    why = ob.verify_published_as(Path("."), "2" * 40, item)
+    assert why and "never-published" in why, why
+    monkeypatch.setattr(ob, "bus_file_at", lambda *a, **k: "## mlv-app/never-published\nrule: the rule\n")
+    assert ob.verify_published_as(Path("."), "2" * 40, item) is None
