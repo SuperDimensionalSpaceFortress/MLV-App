@@ -32,6 +32,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
+
 # =============================== CONFIG =====================================
 # Everything below this line to END CONFIG is repo-specific.
 
@@ -286,7 +288,7 @@ def upstream_markdown(repo: Path) -> set[str]:
         capture_output=True,
         text=True,
         encoding="utf-8",
-        errors="surrogateescape",
+        errors="surrogateescape", creationflags=_NO_WINDOW,
     )
     if proc.returncode != 0:
         return set()
@@ -313,7 +315,7 @@ def tracked_markdown(repo: Path) -> list[str]:
         capture_output=True,
         text=True,
         encoding="utf-8",
-        errors="surrogateescape",
+        errors="surrogateescape", creationflags=_NO_WINDOW,
     )
     if proc.returncode != 0:
         print("git ls-files failed:", proc.stderr.strip(), file=sys.stderr)

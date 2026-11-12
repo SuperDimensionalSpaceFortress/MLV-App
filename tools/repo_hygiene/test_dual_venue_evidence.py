@@ -11471,6 +11471,8 @@ class VisualCaptureSpecAndAppSourceTests(unittest.TestCase):
 # Get-Counter / Get-Process / Get-CimInstance / Invoke-CimMethod shadows, so identity is proved on exact values, not on whatever the test host is running.
 import base64 as _ident_base64
 import datetime as _ident_dt
+import threading as _ident_threading
+import time as _ident_time
 
 IDENT_SCHEMA = "mlv-app/venue-quiet-probe-identity/v1"
 IDENT_T0 = _ident_dt.datetime(2026, 10, 24, 1, 2, 3, tzinfo=_ident_dt.timezone.utc)
@@ -11544,22 +11546,280 @@ def _ident_probe_body() -> str:
     return re.search(r"\$probeText = @'\r?\n(.*?)\r?\n'@", text, re.S).group(1)
 
 
+# r4 (sol r3 blocker) TEST SEAM: seconds the PARENT is stalled after the child has exited and been reaped, before the harness reads anything. It models a runner so loaded that the test
+# process is not scheduled for that long. The child is already gone, so a stall here must never read as the child holding its exit.
+_IDENT_AFTER_REAP_DELAY_S = 0.0
+
+
+_IDENT_PAIR_TIGHT_NS = 50_000_000   # a (QPC, FILETIME) pair is believed only when the QPC reads on both sides of the FILETIME read are within 50 ms of each other (error <= 25 ms)
+_IDENT_CIVIL_STEP_TOLERANCE_S = 0.5   # over a run, civil elapsed and monotonic elapsed may differ by this much (slew, read granularity); more is a clock STEP
+# MEASUREMENT UNCERTAINTY of the OS-exit estimate (pass-2 adversary A2): the two read pairs bound at most 2 * 25 ms, and a civil/monotonic disagreement under the tolerance is not seen, so a figure
+# is good to about this much. r5 (sol r4 A2): it is APPLIED to the verdict, see _ident_gap_verdict. A civil clock that steps one way and back inside ONE run (two opposite steps that cancel at the
+# endpoints) is not seen by the mapper at all; r5 (sol r4 A1) makes that harmless for a PASS (a civil estimate never passes a run) and a run it could have faked as a hold is a HOLD only when the
+# monotonic gap is over the limit too. r5 fix1 samples the pair during the run (_IdentClockSampler), which turns cancelling steps longer than the sample interval into a withheld estimate; OPEN
+# CIVIL-STEP-SUBINTERVAL (a step shorter than the interval, with the child's exit or creation inside it, can still fake a HOLD while the parent is also delayed): it needs a child-side MONOTONIC exit stamp.
+_IDENT_EXIT_ESTIMATE_UNCERTAINTY_S = 2 * _IDENT_CIVIL_STEP_TOLERANCE_S + 2 * _IDENT_PAIR_TIGHT_NS / 2e9
+# r5 fix2 (adversary A2 on fae72991): every pair may disagree with the launch pair by up to the tolerance in EITHER direction, so a FILETIME stamp placed through the read pair is good to TWICE the
+# tolerance (+ the pair read), not once. The child's wall estimate is a difference of two such stamps (exit - creation, one read pair, whose own error cancels), so it is good to twice that.
+_IDENT_WALL_ESTIMATE_UNCERTAINTY_S = 2 * _IDENT_EXIT_ESTIMATE_UNCERTAINTY_S
+
+
+def _ident_gap_verdict(mono_s: float, civil_s, limit_s: float, uncertainty_s: float | None = None) -> tuple:
+    """r5 (sol r4 A1-A3, HUB RULING): the ONE verdict for every time gap this class judges (marker -> process end, and the probe's whole wall). Returns (kind, figure_s, reason).
+    "pass": the MONOTONIC parent-side gap is under the limit; no civil clock is consulted. "over": the monotonic gap is over the limit AND the child-side civil estimate, widened by the documented
+    uncertainty in the direction that SHORTENS the gap, is still over it; the figure is the smaller of the two. "inconclusive": anything else (monotonic over but the civil estimate under or straddling
+    the limit, a civil step seen, or no estimate at all): a typed skip, never a pass and never an over verdict."""
+    u = _IDENT_EXIT_ESTIMATE_UNCERTAINTY_S if uncertainty_s is None else uncertainty_s
+    if mono_s < limit_s:
+        return "pass", mono_s, ""
+    if civil_s is None:
+        return "inconclusive", mono_s, f"the monotonic gap {mono_s:.2f} s is over the {limit_s:.0f} s limit and no child-side civil estimate could be formed"
+    if civil_s - u >= limit_s:
+        return "over", min(mono_s, civil_s), ""
+    return "inconclusive", mono_s, (f"the monotonic gap {mono_s:.2f} s is over the {limit_s:.0f} s limit but the child-side civil estimate {civil_s:.2f} s "
+                                    f"(good to +/-{u:.2f} s) does not clear it")
+
+
+def _ident_win32_clock():
+    """kernel32 with typed signatures for the two clock calls and GetProcessTimes, or None off Windows."""
+    if sys.platform != "win32":
+        return None
+    import ctypes
+    from ctypes import wintypes
+    k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    ptr = ctypes.POINTER(wintypes.FILETIME)
+    k32.GetProcessTimes.argtypes = [wintypes.HANDLE, ptr, ptr, ptr, ptr]
+    k32.GetProcessTimes.restype = wintypes.BOOL
+    k32.GetSystemTimePreciseAsFileTime.argtypes = [ptr]
+    k32.GetSystemTimePreciseAsFileTime.restype = None
+    return ctypes, wintypes, k32
+
+
+def _ident_ft_int(f) -> int:
+    return (f.dwHighDateTime << 32) | f.dwLowDateTime
+
+
+def _ident_read_pair_once() -> tuple:
+    ctypes, wintypes, k32 = _ident_win32_clock()
+    now = wintypes.FILETIME()
+    q0 = _ident_time.perf_counter_ns()
+    k32.GetSystemTimePreciseAsFileTime(ctypes.byref(now))
+    q1 = _ident_time.perf_counter_ns()
+    return q0, _ident_ft_int(now), q1
+
+
+def _ident_clock_pair(read_once=None, tries: int = 50):
+    """(qpc_ns, filetime_100ns) taken at ONE instant, or None. r4 (adversary A2): the QPC reads on both sides of the FILETIME read must be within _IDENT_PAIR_TIGHT_NS; a parent that is
+    descheduled between them makes the midpoint wrong by half the stall, so a loose read is thrown away and taken again, and a run of loose reads is no pair at all."""
+    read_once = read_once or _ident_read_pair_once
+    for _ in range(tries):
+        q0, ft, q1 = read_once()
+        if 0 <= q1 - q0 <= _IDENT_PAIR_TIGHT_NS:
+            return (q0 + q1) // 2, ft
+    return None
+
+
+def _ident_launch_pair():
+    try:
+        return _ident_clock_pair() if sys.platform == "win32" else None
+    except Exception:
+        return None
+
+
+class _IdentClockSampler:
+    """r5 (adversary A1 on b4cae711): tight (QPC, FILETIME) pairs taken every `interval_s` on a thread for as long as the child runs. Two civil steps that cancel at the launch and read pairs
+    (+20 s then -20 s) leave those two pairs in agreement, so an exit recorded inside the offset was believed; a pair taken INSIDE the offset disagrees, and the whole estimate is then withheld
+    (see _ident_exit_from_pairs). A step that starts and ends between two samples is not seen: OPEN CIVIL-STEP-SUBINTERVAL (a step shorter than the interval, with the exit inside it)."""
+
+    def __init__(self, interval_s: float = 0.1, read=None):
+        self.interval_s, self.read, self.samples = interval_s, read or (lambda: _ident_clock_pair(tries=3)), []
+        self._stop = _ident_threading.Event()
+        self._thread = _ident_threading.Thread(target=self._run, daemon=True)
+
+    def _run(self) -> None:
+        while not self._stop.wait(self.interval_s):
+            try:
+                pair = self.read()
+            except Exception:   # a clock fault is the absence of a sample, never a crash in the harness
+                pair = None
+            if pair is not None:
+                self.samples.append(pair)
+
+    def start(self):
+        if sys.platform == "win32" or self.read is not None:
+            self._thread.start()
+        return self
+
+    def stop(self) -> list:
+        self._stop.set()
+        if self._thread.is_alive():
+            self._thread.join(5)
+        return list(self.samples)
+
+
+def _ident_exit_from_pairs(pair0: tuple, pair1: tuple, exit_ft: int, samples: tuple = ()) -> tuple:
+    """PURE core of the child's exit time: pair0 / pair1 are (qpc_ns, filetime_100ns) pairs taken at launch and at the read, exit_ft the OS-recorded ExitTime (100 ns FILETIME), `samples` the pairs
+    taken in between (r5, see _IdentClockSampler). Returns (ns on the QPC axis, "ok"), or (None, reason). The OS exit time is on the civil clock, so it is believed only when the civil clock and the
+    monotonic clock agree at EVERY pair of the run: a civil step (NTP, VM resume, manual change) during the run would move the figure by the step, hiding a real hold or faking one, and is a
+    typed failure instead (adversary A1)."""
+    step_s = max((((p[1] - pair0[1]) * 100 - (p[0] - pair0[0])) / 1e9 for p in (pair1, *samples)), key=abs)
+    if abs(step_s) > _IDENT_CIVIL_STEP_TOLERANCE_S:
+        return None, f"the civil clock moved {step_s:+.1f} s against the monotonic clock during the run, so the OS exit time cannot be placed on the monotonic axis"
+    exit_ns = pair1[0] - (pair1[1] - exit_ft) * 100
+    if not (pair0[0] - 1_000_000_000 <= exit_ns <= pair1[0] + 1_000_000_000):
+        return None, f"the child's exit time lands {(exit_ns - pair1[0]) / 1e9:+.1f} s from the run window"
+    return exit_ns, "ok"
+
+
+def _ident_start_from_pairs(pair1: tuple, created_ft: int, pair0: tuple) -> int | None:
+    """r5 (adversary A2 on b4cae711): when the CHILD process was created, on the QPC axis, through the same read pair as its exit; None when it lands outside the run. The child-side wall
+    estimate runs from here, not from the parent's own start: a parent that was not scheduled for 61 s before it even launched the child did not wait for anything."""
+    start_ns = pair1[0] - (pair1[1] - created_ft) * 100
+    return start_ns if pair0[0] - 1_000_000_000 <= start_ns <= pair1[0] + 1_000_000_000 else None
+
+
+def _ident_child_exit_ns(proc, pair0, samples: tuple = ()) -> tuple:
+    """r5: returns (exit_ns, note, start_ns); r4 (sol r3 blocker): when the CHILD process exited, on the test's perf_counter (QueryPerformanceCounter) axis, as (ns, note); ns is None when it cannot be formed, with the reason in note.
+    The parent's own clock read after the reap is the moment the parent was SCHEDULED again, which on a starved runner is far later than the child's exit. So the end of the child is the exit
+    time the OS recorded for it (GetProcessTimes ExitTime, read from the Popen handle, which stays open until the object is collected), moved onto the QPC axis through a tight same-instant
+    pair read here (see _ident_exit_from_pairs): exit = pair_qpc - (pair_filetime - exit_filetime), so the time the parent spent not running cancels out."""
+    if sys.platform != "win32":
+        return None, "no child-side exit clock on this platform (GetProcessTimes is Windows-only)", None
+    if pair0 is None:
+        return None, "no tight clock pair could be taken at launch", None
+    try:
+        ctypes, wintypes, k32 = _ident_win32_clock()
+        created, exited, kernel, user = (wintypes.FILETIME() for _ in range(4))
+        if not k32.GetProcessTimes(int(proc._handle), ctypes.byref(created), ctypes.byref(exited), ctypes.byref(kernel), ctypes.byref(user)):
+            return None, f"GetProcessTimes failed (winerror {ctypes.get_last_error()})", None
+        pair1 = _ident_clock_pair()
+    except Exception as exc:   # a typed reason, never a crash inside the harness
+        return None, f"{type(exc).__name__}: {exc}", None
+    if _ident_ft_int(exited) == 0:
+        return None, "GetProcessTimes reports no exit time: the process had not exited", None
+    if pair1 is None:
+        return None, "no tight clock pair could be taken at the read: the parent was descheduled around every attempt", None
+    exit_ns, note = _ident_exit_from_pairs(pair0, pair1, _ident_ft_int(exited), samples)
+    return exit_ns, note, (None if exit_ns is None else _ident_start_from_pairs(pair1, _ident_ft_int(created), pair0))
+
+
 def _ident_run_reaped(cmd: list, timeout: float, env: dict | None = None) -> subprocess.CompletedProcess:
     """subprocess.run, except that a child still alive at the timeout (or on any error) is killed WITH its process tree (r5: an r4 probe child outlived its test).
-    r6: the final drain is bounded too, so a grandchild that still holds the pipes cannot hold the test."""
-    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env)
+    r6: the final drain is bounded too, so a grandchild that still holds the pipes cannot hold the test. r4: the result also carries child_exit_ns / child_exit_note (see _ident_child_exit_ns)."""
+    pair0 = _ident_launch_pair()   # r4: the civil clock and the monotonic clock side by side at launch (see _ident_exit_from_pairs)
+    sampler = _IdentClockSampler().start() if pair0 is not None else None   # r5: pairs taken during the run, see _IdentClockSampler
+    try:
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env)
+    except BaseException:
+        if sampler is not None:
+            sampler.stop()
+        raise
     try:
         out, err = proc.communicate(timeout=timeout)
+        samples = sampler.stop() if sampler is not None else []
     except BaseException:
+        if sampler is not None:
+            sampler.stop()
         if proc.poll() is None:
-            subprocess.run(["taskkill", "/F", "/T", "/PID", str(proc.pid)], capture_output=True, timeout=60)
+            try:
+                subprocess.run(["taskkill", "/F", "/T", "/PID", str(proc.pid)], capture_output=True, timeout=60)
+            except (subprocess.TimeoutExpired, OSError):   # r2 (sol hardening): a taskkill that itself hangs or fails must not skip the bounded drain and the fallback kill below
+                pass
         try:
             proc.communicate(timeout=60)
-        except subprocess.TimeoutExpired:
+        except (subprocess.TimeoutExpired, OSError):   # r4 (sol hardening): a drain that fails with an OSError (a broken pipe) must not skip the fallback kill either
             proc.kill()
             proc.wait(timeout=60)
         raise
-    return subprocess.CompletedProcess(cmd, proc.returncode, out, err)
+    if _IDENT_AFTER_REAP_DELAY_S:
+        _ident_time.sleep(_IDENT_AFTER_REAP_DELAY_S)
+    done = subprocess.CompletedProcess(cmd, proc.returncode, out, err)
+    done.child_exit_ns, done.child_exit_note, done.child_start_ns = _ident_child_exit_ns(proc, pair0, samples)
+    return done
+
+
+def _parse_probe_timing(stderr: str):
+    """CI-FLAKE-VENUE-PROBE-GETOWNER-DEADLINE-1 r2/r3/r4: the probe's one stderr timing line, `VENUE_PROBE_INTERNAL_MS=<ms> abandoned=<n> end_qpc=<ticks> qpc_hz=<hz>`. <ms> is ONE monotonic
+    Stopwatch started at probe entry (a diagnostic). <ticks> is Stopwatch.GetTimestamp() at the marker, the OS monotonic QueryPerformanceCounter: the exit-hold figure is (the child's OS exit
+    time on that same QueryPerformanceCounter axis, see _ident_child_exit_ns) - (<ticks> as ns), which contains neither pwsh start-up, script parse nor the parent's own scheduling delay.
+    None = no marker token at all. r4 (VENUE-PROBE-TIMING-PARSER-FULL-TOKEN-1): a line that carries the token is a PRESENT marker; it must match the whole line shape with plain integers of at
+    most 18 digits (a longer, junk-suffixed or junk-PREFIXED field, or a line of another shape, is a typed `bad` failure, never a missing marker and never a ValueError) and anything else comes back with
+    probe_ms=None and a `bad` reason, so a clock fault is a typed failure. end_qpc / qpc_hz are None when absent."""
+    if "VENUE_PROBE_INTERNAL_MS=" not in stderr:
+        return None
+    hits = [ln for ln in re.split(r"[\r\n]+", stderr) if "VENUE_PROBE_INTERNAL_MS=" in ln]
+    if len(hits) != 1:   # adversary A4: a second marker is never silently ignored
+        return {"probe_ms": None, "abandoned": None, "end_qpc": None, "qpc_hz": None, "bad": f"{len(hits)} timing marker lines on stderr, not exactly one: {[h[:60] for h in hits]!r}"}
+    line = hits[0]
+    f = re.fullmatch(r"VENUE_PROBE_INTERNAL_MS=(\S*)\s+abandoned=(\d{1,9})(?:\s+end_qpc=(\d{1,18})\s+qpc_hz=(\d{1,18}))?\s*", line)
+    if f is None:
+        return {"probe_ms": None, "abandoned": None, "end_qpc": None, "qpc_hz": None,
+                "bad": f"malformed timing marker (not `VENUE_PROBE_INTERNAL_MS=<ms> abandoned=<n> [end_qpc=<ticks> qpc_hz=<hz>]` with plain integers): {line[:120]!r}"}
+    raw = f.group(1)
+    qpc = {"end_qpc": int(f.group(3)) if f.group(3) is not None else None, "qpc_hz": int(f.group(4)) if f.group(4) is not None else None}
+    if re.fullmatch(r"\d{1,18}", raw):
+        return {"probe_ms": int(raw), "abandoned": int(f.group(2)), **qpc}
+    return {"probe_ms": None, "abandoned": int(f.group(2)), **qpc, "bad": f"VENUE_PROBE_INTERNAL_MS={raw!r} is not a non-negative integer (a civil clock was subtracted from a monotonic one?)"}
+
+
+def _probe_seam_violations(body: str) -> list:
+    """r4 (fable PROBE-TIMING-SEAM-PIN-SIGIL-FORMS-1): every CODE line of the probe body that names the timing seam in ANY spelling (`$ProbeTimingSeam`, `${ProbeTimingSeam}`,
+    `Set-Variable ProbeTimingSeam`, any case): exactly the one literal `$false` assignment and the one guard that guards the marker; no host input can reach either."""
+    bad = []
+    mentions = [ln for ln in body.splitlines() if not ln.lstrip().startswith("#") and re.search(r"ProbeTimingSeam", ln, re.I)]
+    if len(mentions) != 2:
+        bad.append(f"{len(mentions)} code lines name the seam, not 2: {mentions}")
+    if mentions.count("$ProbeTimingSeam = $false") != 1:
+        bad.append("not exactly one assignment, the literal $false")
+    if len([ln for ln in mentions if ln.startswith("if ($ProbeTimingSeam) { [Console]::Error.WriteLine('VENUE_PROBE_INTERNAL_MS=")]) != 1:
+        bad.append("not exactly one guard, guarding the marker")
+    for ln in mentions:
+        for banned in ("$env:", "Get-Content", "Test-Path", "GetEnvironmentVariable", "-or", "-and"):
+            if banned in ln:
+                bad.append(f"a host input can reach the seam ({banned!r}): {ln}")
+    # r4 (adversary A3): a variable whose NAME is built at run time (`Set-Variable -Name ('Probe' + 'TimingSeam')`) names the seam in no spelling at all, so the probe body must have no
+    # dynamic-variable or dynamic-code verb anywhere (it has none today)
+    for ln in body.splitlines():
+        if not ln.lstrip().startswith("#") and re.search(r"\b(?:Set|New|Get|Clear)-Variable\b|\bVariable:|\bInvoke-Expression\b|\biex\b|\bSet-Item\b", ln, re.I):
+            bad.append(f"a dynamic variable / code verb in the probe body: {ln.strip()[:100]}")
+    return bad
+
+
+def _probe_marker_violations(body: str) -> list:
+    """r4 (sol PROBE-TIMING-STATIC-PINS-MUTATION-1): the marker line is found by its token whatever the quoting; there is exactly one; it carries no comment (a trailing comment can only
+    be there to spell a token the code does not use); its only variables are the Stopwatch, the two abandoned counters and the seam (so a civil value cannot be stashed on an earlier line and
+    substituted); the end timestamp is the literal GetTimestamp() call, adjacent to its field names; and its position among the result line and the Exit is pinned."""
+    bad = []
+    lines = body.splitlines()
+    idx = [i for i, ln in enumerate(lines) if "VENUE_PROBE_INTERNAL_MS" in ln and not ln.lstrip().startswith("#")]
+    if len(idx) != 1:
+        return [f"{len(idx)} code lines carry the marker, not 1"]
+    line = lines[idx[0]]
+    if "#" in line:
+        bad.append("the marker line carries a comment")
+    allowed = {"$ProbeTimingSeam", "$script:ProbeSw", "$script:IdentAbandoned", "$script:TelAbandoned"}
+    found = set(re.findall(r"\$[A-Za-z_][\w:]*", line))
+    if found != allowed:
+        bad.append(f"the marker line's variables are {sorted(found)}, not {sorted(allowed)}")
+    if "' end_qpc=' + [Diagnostics.Stopwatch]::GetTimestamp() + ' qpc_hz=' + [Diagnostics.Stopwatch]::Frequency" not in line:
+        bad.append("end_qpc is not the literal [Diagnostics.Stopwatch]::GetTimestamp() beside qpc_hz=Frequency")
+    if "$script:ProbeSw.ElapsedMilliseconds" not in line:
+        bad.append("the elapsed field is not the Stopwatch")
+    elif "GetTimestamp" in line and line.index("ElapsedMilliseconds") > line.index("GetTimestamp"):
+        bad.append("the end timestamp is not the last clock read before the write")
+    for banned in ("[DateTime]", "Get-Date", ".StartTime", "GetCurrentProcess", "UtcNow", "Ticks", "$env:"):
+        if banned in line:
+            bad.append(f"a civil-clock read ({banned!r}) in the timing marker lets a clock step move the exit-hold arithmetic")
+    quiet = next((i for i, ln in enumerate(lines) if "VENUE_QUIET=" in ln and "Write-Output" in ln), None)
+    exit_at = next((i for i, ln in enumerate(lines) if "[Environment]::Exit(0)" in ln), None)
+    if quiet is None or exit_at is None:
+        bad.append("the result line or the Exit is missing from the body")
+    else:
+        if not quiet < idx[0]:
+            bad.append("the marker does not come after the result line is written")
+        if not idx[0] < exit_at:
+            bad.append("the marker does not come BEFORE the abandoned-call Exit, so the gap would not include the Exit")
+    return bad
 
 
 class IdentityProbeMixin:
@@ -11567,7 +11827,8 @@ class IdentityProbeMixin:
 
     def run_identity_probe(self, procs: list, cim: list, owners: dict | None = None, gpu: list | None = None, throw: bool = False, cpus: int = 4,
                            body: str | None = None, old_counter_shadow: bool = False, after_start_ft: dict | None = None,
-                           delays: dict | None = None, call_ms: int | None = None, tel: dict | None = None, env: dict | None = None) -> dict:
+                           delays: dict | None = None, call_ms: int | None = None, tel: dict | None = None, env: dict | None = None, timing: bool = False,
+                           civil_step_s: int = 0, probe_s: int = 0, exit_hold_s: int = 0, startup_s: int = 0) -> dict:
         delays = delays or {}
         body = (_ident_probe_body() if body is None else body).replace("[Environment]::ProcessorCount", str(cpus)).replace("Start-Sleep -Seconds 12", "Start-Sleep -Seconds 0")
         if call_ms is not None:
@@ -11602,9 +11863,36 @@ class IdentityProbeMixin:
         worker_b64 = _ident_base64.b64encode((cim_prelude + worker_counter).encode("utf-8")).decode("ascii")
         body = body.replace("$IdentityWorkerPrelude = ''", f"$IdentityWorkerPrelude = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('{worker_b64}'))")
         body = _tel_hermetic(body, self.tmp, tel)   # VENUE-PROBE-HEAT-GPU-TELEMETRY-1: the heat feed, dGPU and agent log are canned too, never the test host's
+        if timing:   # CI-FLAKE-VENUE-PROBE-GETOWNER-DEADLINE-1: the probe reports its own elapsed time on stderr (the seam is $false in production)
+            self.assertEqual(body.count("$ProbeTimingSeam = $false"), 1)
+            body = body.replace("$ProbeTimingSeam = $false", "$ProbeTimingSeam = $true")
+        # r2 fault injection, test copy only (needs timing=True): a civil-clock STEP (NTP / VM resume / manual change) is every `[DateTime]::Now` read taking a +/-N s offset; a probe that
+        # spends probe_s seconds before its marker; a process exit held exit_hold_s seconds after the marker. A probe whose timing leaves one monotonic Stopwatch is moved by the step.
+        if civil_step_s or probe_s or exit_hold_s:
+            self.assertTrue(timing, "fault injection rides on the timing seam")
+        if civil_step_s:   # r3 (fable CIVIL-STEP-INJECTION-VACUOUS-AT-HEAD-1): the probe reads the civil clock as [DateTime]::UtcNow, never ::Now, so a ::Now-only injector replaced nothing
+            self.civil_sites = len(re.findall(r"\[DateTime\]::(?:Utc)?Now", body))
+            self.assertGreaterEqual(self.civil_sites, 1, "the civil-step injector found no civil-clock read in the probe body: the step would be vacuous")
+            body = re.sub(r"\[DateTime\]::((?:Utc)?Now)", lambda m: f"[DateTime]::{m.group(1)}.AddSeconds({civil_step_s})", body)
+        if probe_s:
+            anchor = "$script:ProbeSw = [Diagnostics.Stopwatch]::StartNew()"
+            self.assertEqual(body.count(anchor), 1)
+            body = body.replace(anchor, anchor + f"\nStart-Sleep -Seconds {probe_s}")
+        if exit_hold_s:   # between the marker and the end of the process, so an abandoned call's Environment.Exit does not skip it (adversary A2)
+            exit_anchor = "if ($script:IdentAbandoned -gt 0 -or $script:TelAbandoned -gt 0) {"
+            self.assertEqual(body.count(exit_anchor), 1)
+            body = body.replace(exit_anchor, f"Start-Sleep -Seconds {exit_hold_s}\n" + exit_anchor)
         job = self.tmp / "identity-probe-job.ps1"
-        job.write_text(prelude + body, encoding="utf-8")
+        # r3 (fable key3): a START-UP stall is `startup_s` seconds spent BEFORE the probe's first statement (pwsh start-up, script parse, the test prelude on a starved host)
+        job.write_text((f"Start-Sleep -Seconds {startup_s}\n" if startup_s else "") + prelude + body, encoding="utf-8")
+        wall_started_ns = _ident_time.perf_counter_ns()   # r3: perf_counter is QueryPerformanceCounter on Windows, the clock Stopwatch.GetTimestamp() in the probe reads
         proc = _ident_run_reaped([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-File", str(job)], timeout=240, env=env)
+        self.last_wall_end_ns = _ident_time.perf_counter_ns()
+        self.last_wall_s = (self.last_wall_end_ns - wall_started_ns) / 1e9
+        self.last_child_exit_ns, self.last_child_exit_note = proc.child_exit_ns, proc.child_exit_note   # r4: the END of the child, which the parent's own end read is not
+        self.last_child_start_ns = proc.child_start_ns   # r5: its START, which the parent's own start (wall_started_ns) is not: the parent may be delayed before it even launches the child
+        self.last_stderr = proc.stderr
+        self.last_timing = _parse_probe_timing(proc.stderr)
         lines = [ln for ln in proc.stdout.splitlines() if ln.startswith("VENUE_QUIET=")]
         self.assertEqual(len(lines), 1, proc.stdout + proc.stderr)
         self.last_line = lines[0][len("VENUE_QUIET="):]   # the line exactly as the gate retains it (Wait-VenueQuiet.ps1 RAW RETENTION)
@@ -12277,8 +12565,13 @@ class VenueProbeIdentityRedactionR2Tests(IdentityProbeMixin, unittest.TestCase):
 # timeout). The forced-slow call is an UNINTERRUPTIBLE .NET sleep in the shadow (what a hung native call looks like), not an already-expired budget.
 @requires_windows_pwsh
 class VenueProbeIdentityCallDeadlineTests(IdentityProbeMixin, unittest.TestCase):
-    DELAY_MS = 20000
+    # CI-FLAKE-VENUE-PROBE-GETOWNER-DEADLINE-1: the slow call sleeps far longer than any wall a loaded host can need for the whole probe. The abandoned worker dies with the process, so a
+    # probe that bounds the call ends in seconds whatever the delay is; a probe that waited for it would need DELAY_MS. At 20 s the old limit (18 s) sat INSIDE what a starved runner
+    # needs for the probe alone (measured 28-30 s of pure load, no wait at all, with 40 busy processes on 16 cores), so the assertion could not tell load from a wait.
+    DELAY_MS = 120000
     CALL_MS = 1500
+    WALL_LIMIT_S = 60.0       # about twice the worst load-only wall measured; half the delay
+    EXIT_HOLD_LIMIT_S = 15.0  # r3/r4: the child's OS exit time minus the probe's end marker, both on the QueryPerformanceCounter axis (marker -> exit ONLY; start-up, parse and the parent's own scheduling delay are not in it)
 
     def setUp(self) -> None:
         tmp = tempfile.TemporaryDirectory(prefix="venue-probe-deadline-")
@@ -12296,14 +12589,87 @@ class VenueProbeIdentityCallDeadlineTests(IdentityProbeMixin, unittest.TestCase)
     def slow(self, which: str) -> tuple:
         import time
         started = time.monotonic()
-        p = self.run_identity_probe(self.procs, self.cim, CHAIN_OWNERS, gpu=[(16892, 0, 40.0)], delays={which: self.DELAY_MS}, call_ms=self.CALL_MS)
+        p = self.run_identity_probe(self.procs, self.cim, CHAIN_OWNERS, gpu=[(16892, 0, 40.0)], delays={which: self.DELAY_MS}, call_ms=self.CALL_MS, timing=True)
         return p, time.monotonic() - started
 
     def assert_measurement_unchanged(self, p: dict, elapsed: float) -> None:
+        # the timing of the SLOW run is judged first: reference() runs another probe, which replaces last_timing / last_wall_s. r5: the verdicts are SETTLED last, so an inconclusive timing
+        # (a typed skip) still leaves every content comparison below as a hard assertion
+        verdicts = self.timing_verdicts(elapsed)
         ref = self.reference()
         for k, v in ref.items():
             self.assertEqual(p[k], v, f"{k} changed because an identity call was slow")
-        self.assertLess(elapsed, self.DELAY_MS / 1000.0 - 2, f"the probe waited for the slow call instead of bounding it ({elapsed:.1f} s)")
+        self.settle_timing(verdicts)
+
+    def timing_verdicts(self, wall_s: float, require_abandoned: bool = True) -> list:
+        """r5: [(what, kind, figure_s, reason)] for the two gaps of one run. The WALL gap is the parent's elapsed time; its child-side estimate is the child's OS exit time minus the CHILD's OS
+        creation time, so a parent that was scheduled late after a prompt child exit (sol r4 A3) or before it launched the child (adversary A2) is not a wait for the slow call. The EXIT-HOLD gap is
+        marker -> process end (see exit_hold_verdict)."""
+        started, exit_ns = getattr(self, "last_child_start_ns", None), getattr(self, "last_child_exit_ns", None)
+        civil_run_s = None if (started is None or exit_ns is None) else (exit_ns - started) / 1e9
+        out = [("wall", *_ident_gap_verdict(wall_s, civil_run_s, self.WALL_LIMIT_S, _IDENT_WALL_ESTIMATE_UNCERTAINTY_S))]
+        hold = self.exit_hold_verdict()
+        if require_abandoned:
+            self.assertGreaterEqual(self.last_timing["abandoned"], 1, "the slow call was not abandoned, so this case proves nothing")
+        out.append(("exit hold", *hold))
+        return out
+
+    def settle_timing(self, verdicts: list) -> None:
+        """r5: any "over" is a failure; else any "inconclusive" is a typed skip `EXIT_HOLD_INCONCLUSIVE: <reason with both numbers>`; else a pass."""
+        for what, kind, figure, _reason in verdicts:
+            if kind == "over" and what == "wall":
+                self.fail(f"the probe waited for the slow call instead of bounding it ({figure:.1f} s; {self.timing_text()})")
+            if kind == "over":
+                self.fail(f"the process outlived the probe by {figure:.1f} s after its end marker: an abandoned call held the exit ({self.timing_text()}, wall {self.last_wall_s:.1f} s)")
+        why = [f"{what}: {reason}" for what, kind, _f, reason in verdicts if kind == "inconclusive"]
+        if why:
+            self.skipTest("EXIT_HOLD_INCONCLUSIVE: " + "; ".join(why))
+
+    def assert_timing(self, wall_s: float, require_abandoned: bool = True) -> None:
+        self.settle_timing(self.timing_verdicts(wall_s, require_abandoned))
+
+    def timing_text(self) -> str:
+        t = self.last_timing
+        if t is None:
+            return "no VENUE_PROBE_INTERNAL_MS line on stderr"
+        if t["probe_ms"] is None:
+            return t["bad"]
+        return f"probe stopwatch {t['probe_ms'] / 1000.0:.1f} s, {t['abandoned']} call(s) abandoned"
+
+    def exit_hold_s(self) -> float:
+        """The exit-hold figure (seconds) when the verdict is pass or over; an INCONCLUSIVE verdict is a typed skip (see exit_hold_verdict)."""
+        kind, figure, reason = self.exit_hold_verdict()
+        if kind == "inconclusive":
+            self.skipTest("EXIT_HOLD_INCONCLUSIVE: " + reason)
+        return figure
+
+    def exit_hold_verdict(self) -> tuple:
+        """r3/r4/r5: (kind, figure_s, reason) for the seconds from the probe's end marker to the CHILD's exit, on the OS monotonic QueryPerformanceCounter axis (the marker is the probe's
+        Stopwatch.GetTimestamp() ticks). The parent's end read (also QPC) is an UPPER BOUND on it: the child cannot have exited after the parent saw it gone. A bound under the limit PASSES with no
+        civil clock at all. Past the limit the bound may be the parent's own scheduling delay, so the child's OS-recorded exit time (see _ident_child_exit_ns) is the civil estimate that
+        _ident_gap_verdict widens by its uncertainty: over the limit even then is a HOLD, anything else (no estimate, a civil step, an estimate under or straddling the limit) is INCONCLUSIVE and
+        is never a pass or a hold. Whatever the probe did before its marker, however long pwsh took to start, and however long the parent was not scheduled, is not in a HOLD figure."""
+        t = self.last_timing
+        self.assertIsNotNone(t, "the timing seam printed nothing: " + self.last_stderr)
+        self.assertIsNotNone(t["probe_ms"], "typed failure, not a missing marker: " + t.get("bad", ""))
+        self.assertTrue(t.get("end_qpc") is not None and t.get("qpc_hz"), "typed failure, not an exit hold: the marker carries no end_qpc / qpc_hz timestamp: " + self.last_stderr)
+        marker_ns = t["end_qpc"] * 1_000_000_000 // t["qpc_hz"]
+        upper = (self.last_wall_end_ns - marker_ns) / 1e9
+        self.assertGreater(upper, -1.0, f"typed failure, not an exit hold: the probe's end marker is {-upper:.1f} s AFTER the test saw the process end, so the two are not the same monotonic clock")
+        child_exit_ns = getattr(self, "last_child_exit_ns", None)
+        civil_s = None if child_exit_ns is None else (child_exit_ns - marker_ns) / 1e9
+        kind, figure, reason = _ident_gap_verdict(upper, civil_s, self.EXIT_HOLD_LIMIT_S)
+        if kind == "inconclusive" and civil_s is None:
+            reason += f" ({getattr(self, 'last_child_exit_note', '')})"
+        return kind, figure, reason
+
+    def assert_no_exit_hold(self, require_abandoned: bool = True) -> None:
+        """Nothing may hold the PROCESS after the probe's end marker (an abandoned worker's runspace must not keep it alive). Start-up is not measured: see exit_hold_verdict.
+        r5: a HOLD fails; an INCONCLUSIVE verdict is a typed skip; only a monotonic gap under the limit passes."""
+        hold = self.exit_hold_verdict()
+        if require_abandoned:
+            self.assertGreaterEqual(self.last_timing["abandoned"], 1, "the slow call was not abandoned, so this case proves nothing")
+        self.settle_timing([("exit hold", *hold)])
 
     def test_a_slow_gpu_read_times_out_into_a_status_and_the_rest_of_identity_is_still_filled(self) -> None:
         p, elapsed = self.slow("gpu")
@@ -12325,6 +12691,475 @@ class VenueProbeIdentityCallDeadlineTests(IdentityProbeMixin, unittest.TestCase)
         self.assertEqual(set(p["identity"]), {"schema", "error"}, p["identity"])
         self.assertIn("timed out", p["identity"]["error"])
         self.assert_measurement_unchanged(p, elapsed)
+
+    def test_the_timing_seam_is_off_in_production_and_prints_nothing_unless_a_test_rewrites_it(self) -> None:
+        self.assertEqual(_probe_seam_violations(_ident_probe_body()), [], "r3/r4: every code mention of the seam in the WHOLE body, in any spelling")
+        self.run_identity_probe(self.procs, self.cim, CHAIN_OWNERS)
+        self.assertIsNone(self.last_timing)
+        self.assertNotIn("VENUE_PROBE_INTERNAL_MS", self.last_stderr)
+
+    def test_a_hostile_environment_cannot_switch_the_production_seam_on(self) -> None:
+        # r4 (adversary A3): the behavioural half of the pin. The UNREWRITTEN probe, with the seam spelled as an environment variable and truthy values around it, prints no marker
+        import os
+        self.run_identity_probe(self.procs, self.cim, CHAIN_OWNERS, env=dict(os.environ, ProbeTimingSeam="1", X="1", PROBETIMINGSEAM="true"))
+        self.assertIsNone(self.last_timing)
+        self.assertNotIn("VENUE_PROBE_INTERNAL_MS", self.last_stderr)
+
+    def test_the_seam_pin_catches_every_spelling_of_a_write_to_the_seam(self) -> None:
+        body = _ident_probe_body()
+        for extra in ("Set-Variable ProbeTimingSeam $true", "Set-Variable -Name probetimingseam -Value $true", "${ProbeTimingSeam} = $true", "$ProbeTimingSeam = $env:X",
+                      "New-Variable -Name ProbeTimingSeam -Value $true -Force", "Set-Variable -Name ('Probe' + 'TimingSeam') -Value ([bool]$env:X)", "Set-Item Variable:\\ProbeTimingSeam $true",
+                      "Invoke-Expression ('$Probe' + 'TimingSeam = $true')"):
+            self.assertNotEqual(_probe_seam_violations(body + "\n" + extra), [], extra)
+        self.assertNotEqual(_probe_seam_violations(body.replace("$ProbeTimingSeam = $false", "$ProbeTimingSeam = $true")), [])
+
+    # r2 (Dot 797-I1, sol CR on 51ace353): the probe's timing is ONE monotonic Stopwatch. A civil-clock step (+/-20 s, injected into every [DateTime]::Now read of the test copy) must neither
+    # hide an exit hold nor fake one, and the exit hold is injected for real (the process sleeps after its marker), so the gap assertion is reached on its own.
+    def test_a_forward_civil_clock_step_cannot_hide_a_20_second_exit_hold(self) -> None:
+        self.run_identity_probe(self.procs, self.cim, CHAIN_OWNERS, timing=True, probe_s=10, civil_step_s=20, exit_hold_s=20)
+        self.assertGreaterEqual(self.exit_hold_s(), 19.0, self.timing_text())
+        with self.assertRaises(AssertionError) as ctx:
+            self.assert_no_exit_hold(require_abandoned=False)
+        self.assertIn("outlived the probe", str(ctx.exception))
+
+    def test_an_exit_hold_is_rejected_when_a_slow_call_was_abandoned_too(self) -> None:
+        # adversary A2: the abandoned-call path ends in Environment.Exit, and the injected hold must still sit before it
+        self.run_identity_probe(self.procs, self.cim, CHAIN_OWNERS, delays={"cim": self.DELAY_MS}, call_ms=self.CALL_MS, timing=True, exit_hold_s=20)
+        self.assertGreaterEqual(self.last_timing["abandoned"], 1, self.timing_text())
+        with self.assertRaises(AssertionError) as ctx:
+            self.assert_no_exit_hold()
+        self.assertIn("outlived the probe", str(ctx.exception))
+
+    def test_a_backward_civil_clock_step_cannot_fake_an_exit_hold_or_a_missing_marker(self) -> None:
+        self.run_identity_probe(self.procs, self.cim, CHAIN_OWNERS, timing=True, probe_s=30, civil_step_s=-20)
+        self.assertGreaterEqual(self.last_timing["probe_ms"], 30000, self.timing_text())
+        self.assert_no_exit_hold(require_abandoned=False)   # no hold: 30 s of probe work, whatever the civil clock did
+
+    # r3 (fable key3 blocker): 16 s of start-up with NO exit hold. The gap must measure the EXIT only, so a start-up stall (pwsh start-up, script parse, the test prelude) is never reported as
+    # "an abandoned call held the exit".
+    def test_a_start_up_stall_longer_than_the_exit_hold_limit_is_not_an_exit_hold(self) -> None:
+        self.run_identity_probe(self.procs, self.cim, CHAIN_OWNERS, timing=True, startup_s=16)
+        self.assertGreater(self.last_wall_s, self.EXIT_HOLD_LIMIT_S, "the injected start-up stall is longer than the limit")
+        self.assert_no_exit_hold(require_abandoned=False)
+
+    # r4 (sol r3 blocker): the figure must end at the CHILD's exit, not at the moment the parent got scheduled again. A parent starved for PARENT_STALL_S after the child is gone
+    # (a loaded runner) used to read as "an abandoned call held the exit".
+    PARENT_STALL_S = 16.0   # longer than EXIT_HOLD_LIMIT_S
+
+    def _stall_parent(self):
+        from unittest import mock
+        return mock.patch.object(sys.modules[__name__], "_IDENT_AFTER_REAP_DELAY_S", self.PARENT_STALL_S)
+
+    def test_a_parent_starved_after_the_child_exits_is_not_an_exit_hold(self) -> None:
+        with self._stall_parent():
+            self.run_identity_probe(self.procs, self.cim, CHAIN_OWNERS, timing=True)
+        self.assertGreater(self.last_wall_s, self.EXIT_HOLD_LIMIT_S, "the injected parent stall is longer than the limit")
+        self.assertEqual(self.exit_hold_verdict()[0], "inconclusive", "r5: the parent's delay is never a hold, and (civil clock only) never a pass")
+        if self.last_child_exit_ns is None:   # adversary A4: a permitted missing child clock is a typed skip, not a crash
+            self.skipTest(f"EXIT_HOLD_INCONCLUSIVE: no child-side exit time ({self.last_child_exit_note})")
+        stall_s = (self.last_wall_end_ns - self.last_child_exit_ns) / 1e9
+        self.assertGreaterEqual(stall_s, self.PARENT_STALL_S - 1.0, f"the stall sits between the child's exit and the parent's end read ({stall_s:.1f} s)")
+
+    def test_a_parent_starved_after_an_abandoned_call_is_not_an_exit_hold(self) -> None:
+        with self._stall_parent():
+            self.run_identity_probe(self.procs, self.cim, CHAIN_OWNERS, delays={"cim": self.DELAY_MS}, call_ms=self.CALL_MS, timing=True)
+        self.assertGreaterEqual(self.last_timing["abandoned"], 1, self.timing_text())
+        self.assertEqual(self.exit_hold_verdict()[0], "inconclusive", "r5: the parent's delay is never a hold, and (civil clock only) never a pass")
+
+    def test_a_real_exit_hold_is_still_rejected_and_the_parent_stall_is_not_added_to_it(self) -> None:
+        with self._stall_parent():
+            self.run_identity_probe(self.procs, self.cim, CHAIN_OWNERS, timing=True, exit_hold_s=20)
+        gap = self.exit_hold_s()
+        self.assertGreaterEqual(gap, 19.0, self.timing_text())
+        self.assertLess(gap, 20.0 + self.PARENT_STALL_S - 2.0, "the figure is the child's hold, with the parent's own stall left out")
+        with self.assertRaises(AssertionError) as ctx:
+            self.assert_no_exit_hold(require_abandoned=False)
+        self.assertIn("held the exit", str(ctx.exception))
+
+    def _set_clocks(self, marker_s: float, child_exit_s, parent_end_s: float, abandoned: int = 1) -> None:
+        hz = 10_000_000
+        self.last_timing = _parse_probe_timing(f"VENUE_PROBE_INTERNAL_MS=1500 abandoned={abandoned} end_qpc={int(marker_s * hz)} qpc_hz={hz}")
+        self.last_child_exit_ns = None if child_exit_s is None else int(child_exit_s * 1e9)
+        self.last_child_exit_note = "no exit time in this case"
+        self.last_wall_end_ns, self.last_wall_s, self.last_stderr = int(parent_end_s * 1e9), parent_end_s - 1.0, ""
+        self.last_child_start_ns = int(1.0 * 1e9)
+
+    def test_the_sol_r3_repro_a_prompt_child_exit_and_a_16_second_parent_delay_is_no_exit_hold(self) -> None:
+        self._set_clocks(marker_s=100.0, child_exit_s=100.05, parent_end_s=116.05)   # sol: child exits 0.05 s after its marker, the parent resumes 16 s later
+        kind, _figure, reason = self.exit_hold_verdict()
+        self.assertEqual(kind, "inconclusive", "r5: never a hold, and never a pass on the civil estimate alone")
+        self.assertIn("16.05", reason)
+        self.assertIn("0.05", reason)
+
+    def test_a_civil_clock_step_after_the_childs_exit_is_a_typed_failure_never_a_hidden_or_a_faked_hold(self) -> None:
+        # adversary A1: launch at qpc 90 s; marker 100 s; the child exits at 120 s (a 20 s hold); the read pair is at qpc 136 s
+        S, B = 10_000_000, 5_000_000_000_000
+        pair0 = (90 * 10**9, B + 90 * S)
+        exit_ft = B + 120 * S
+        ns, note = _ident_exit_from_pairs(pair0, (136 * 10**9, B + 136 * S), exit_ft)
+        self.assertEqual((ns, note), (120 * 10**9, "ok"), "no step: the exit lands on the monotonic axis at 120 s")
+        for step_s in (20, -20):   # +20 s would map the 20 s hold to 0 s (hidden); -20 s would map a prompt exit to a 20 s hold (faked)
+            ns, note = _ident_exit_from_pairs(pair0, (136 * 10**9, B + (136 + step_s) * S), exit_ft)
+            self.assertIsNone(ns, step_s)
+            self.assertIn("civil clock moved", note)
+            step_note = note
+        ns, note = _ident_exit_from_pairs(pair0, (136 * 10**9, B + 136 * S), B + 500 * S)
+        self.assertIsNone(ns, "an exit after the read is outside the run")
+        # in the harness: a step makes the OS exit time unusable. A bound already under the limit still passes (a prompt exit cannot be FAKED into a hold) and a bound past it is not judged (a hold cannot be HIDDEN)
+        self._set_clocks(100.0, None, 100.1)
+        self.last_child_exit_note = note
+        self.assert_no_exit_hold()
+        self._set_clocks(100.0, None, 120.1)
+        self.last_child_exit_note = step_note
+        with self.assertRaises(unittest.SkipTest) as ctx:   # r5: a typed INCONCLUSIVE, never a pass and never a hold
+            self.assert_no_exit_hold()
+        self.assertIn("EXIT_HOLD_INCONCLUSIVE", str(ctx.exception))
+        self.assertIn("civil clock moved", str(ctx.exception))
+
+    # r5 (sol r4 blockers A1-A3, HUB RULING): a civil-clock estimate never decides a verdict on its own. PASS needs the monotonic parent-side gap under the limit; HOLD needs it over the limit AND
+    # the civil estimate, widened by the documented uncertainty in the direction that SHORTENS the hold, still over; anything else is a typed INCONCLUSIVE (a skip), never a pass or a hold.
+    S5, B5 = 10_000_000, 5_000_000_000_000
+
+    def _pairs_exit(self, pair1_ft: int, exit_ft: int):
+        """The REAL mapper (_ident_exit_from_pairs) on sol's literal pairs: launch at qpc 90 s, the read at qpc 136 s."""
+        return _ident_exit_from_pairs((90 * 10**9, self.B5 + 90 * self.S5), (136 * 10**9, pair1_ft), exit_ft)
+
+    def test_r5_a1_cancelling_civil_steps_cannot_hide_a_real_20_second_hold(self) -> None:
+        # sol A1: the civil clock steps -20 s at qpc 110 s and +20 s at qpc 130 s, so the endpoint pairs agree; the child really exits at 120 s but the OS records 100 s on the stepped clock
+        ns, note = self._pairs_exit(self.B5 + 136 * self.S5, 5_001_000_000_000)
+        self.assertEqual((ns, note), (100 * 10**9, "ok"), "the mapper alone cannot see steps that cancel at the endpoints")
+        self._set_clocks(100.0, ns / 1e9, 136.0)
+        with self.assertRaises(unittest.SkipTest) as ctx:   # never a pass on the civil estimate: the monotonic gap is 36 s
+            self.assert_no_exit_hold()
+        self.assertIn("EXIT_HOLD_INCONCLUSIVE", str(ctx.exception))
+        self.assertIn("36.00", str(ctx.exception), "the monotonic number")
+        self.assertIn("0.00", str(ctx.exception), "the civil number")
+
+    def test_r5_a2_a_tolerated_clock_movement_cannot_decide_a_hold_near_the_limit_either_way(self) -> None:
+        # sol A2, both directions: +0.3 s maps a real 15.2 s hold to 14.9 s; -0.3 s maps a real 14.8 s hold to 15.1 s. Parent end at 136 s, so the monotonic gap is over the limit in both
+        for label, pair1_ft, exit_ft in (("+0.3 s", 5_001_363_000_000, 5_001_152_000_000), ("-0.3 s", 5_001_357_000_000, 5_001_148_000_000)):
+            ns, note = self._pairs_exit(pair1_ft, exit_ft)
+            self.assertEqual(note, "ok", label)
+            self._set_clocks(100.0, ns / 1e9, 136.0)
+            with self.assertRaises(unittest.SkipTest) as ctx:
+                self.assert_no_exit_hold()
+            self.assertIn("EXIT_HOLD_INCONCLUSIVE", str(ctx.exception), label)
+
+    def test_r5_a3_a_61_second_parent_delay_after_a_prompt_child_exit_is_never_a_slow_call_wait(self) -> None:
+        # sol A3: marker 100 s, the child exits at 100.05 s, the parent only ends at 161.05 s (elapsed 71.05 s, started at 90 s): the child ran 10.05 s, so nothing waited for the slow call
+        p = self.reference()
+        self._set_clocks(100.0, 100.05, 161.05)
+        self.last_wall_s, self.last_wall_started_ns, self.last_child_start_ns = 71.05, int(90.0 * 1e9), int(90.0 * 1e9)
+        with self.assertRaises(unittest.SkipTest) as ctx:
+            self.assert_measurement_unchanged(p, 71.05)
+        self.assertIn("EXIT_HOLD_INCONCLUSIVE", str(ctx.exception))
+        self.assertNotIn("waited for the slow call", str(ctx.exception))
+
+    def test_r5_a_real_wait_for_the_slow_call_and_a_real_hold_with_honest_clocks_still_fail(self) -> None:
+        p = self.reference()
+        self._set_clocks(119.9, 120.0, 120.1)   # the child itself ran 120 s from a start at 0 s, then ended right after its marker
+        self.last_wall_s, self.last_wall_started_ns, self.last_child_start_ns = 120.1, 0, 0
+        with self.assertRaises(AssertionError) as ctx:
+            self.assert_measurement_unchanged(p, 120.1)
+        self.assertIn("waited for the slow call", str(ctx.exception))
+        for step in (0.3, -0.3):   # a real 20 s hold read through a tolerated movement is still a HOLD: the widened estimate (19.45 s) stays over the limit
+            ns, note = self._pairs_exit(self.B5 + int((136 + step) * self.S5), self.B5 + 120 * self.S5)
+            self._set_clocks(100.0, ns / 1e9, 136.0)
+            with self.assertRaises(AssertionError) as ctx:
+                self.assert_no_exit_hold(require_abandoned=False)
+            self.assertIn("held the exit", str(ctx.exception), step)
+
+    def test_r5_the_three_way_verdict_is_decided_by_the_monotonic_gap_and_the_widened_civil_estimate(self) -> None:
+        u, lim = _IDENT_EXIT_ESTIMATE_UNCERTAINTY_S, 15.0
+        self.assertEqual(_ident_gap_verdict(14.99, 99.0, lim)[0], "pass", "monotonic under the limit: no civil clock consulted")
+        self.assertEqual(_ident_gap_verdict(14.99, None, lim)[0], "pass")
+        self.assertEqual(_ident_gap_verdict(36.0, lim + u, lim)[0], "over", "the widened estimate lands exactly on the limit")
+        self.assertEqual(_ident_gap_verdict(36.0, lim + u - 0.01, lim)[0], "inconclusive", "a hair under it straddles the limit")
+        self.assertEqual(_ident_gap_verdict(36.0, None, lim)[0], "inconclusive", "no civil estimate")
+        kind, figure, reason = _ident_gap_verdict(36.0, 20.0, lim)
+        self.assertEqual((kind, figure, reason), ("over", 20.0, ""), "the figure is the smaller of the two")
+        self.assertIn("36.00", _ident_gap_verdict(36.0, 0.5, lim)[2])
+        self.assertIn("0.50", _ident_gap_verdict(36.0, 0.5, lim)[2])
+
+    # r5-FIX1-ROWS-BEGIN (adversary pass on b4cae711: A1 and A2 introduced majors, A4 introduced minor)
+    def test_r5_fix1_a1_a_pair_taken_inside_cancelling_civil_steps_withholds_the_exit_estimate(self) -> None:
+        # +20 s at qpc 99 s, -20 s at qpc 130 s: the child really exits at 100.05 s but the OS records 120.05 s. The launch and read pairs agree, a pair taken INSIDE the offset does not
+        S, B = self.S5, self.B5
+        pair0, pair1, exit_ft = (90 * 10**9, B + 90 * S), (136 * 10**9, B + 136 * S), B + int(120.05 * S)
+        ns, note = _ident_exit_from_pairs(pair0, pair1, exit_ft)
+        self.assertEqual(note, "ok", "the endpoint pairs alone cannot see the steps (the b4cae711 defect)")
+        ns, note = _ident_exit_from_pairs(pair0, pair1, exit_ft, samples=((110 * 10**9, B + 130 * S),))
+        self.assertIsNone(ns)
+        self.assertIn("civil clock moved", note)
+        ns, note = _ident_exit_from_pairs(pair0, pair1, B + int(100.05 * S), samples=((100 * 10**9, B + 100 * S), (120 * 10**9, B + 120 * S)))
+        self.assertEqual((note, round((ns - 100 * 10**9) / 1e9, 2)), ("ok", 0.05), "honest samples keep the estimate")
+        self._set_clocks(100.0, None, 136.0)   # the verdict on a withheld estimate: a monotonic gap of 36 s and no civil estimate
+        self.last_child_exit_note = "the civil clock moved +20.0 s against the monotonic clock during the run"
+        with self.assertRaises(unittest.SkipTest) as ctx:
+            self.assert_no_exit_hold()
+        self.assertIn("EXIT_HOLD_INCONCLUSIVE", str(ctx.exception))
+
+    def test_r5_fix1_the_clock_sampler_collects_pairs_while_it_runs_and_survives_a_failing_read(self) -> None:
+        reads = iter([(1, 10), None, RuntimeError("clock unavailable"), (2, 20)] + [(3, 30)] * 1000)
+
+        def read():
+            r = next(reads)
+            if isinstance(r, Exception):
+                raise r
+            return r
+        sampler = _IdentClockSampler(interval_s=0.01, read=read).start()
+        deadline = _ident_time.monotonic() + 30   # adversary A3: wait for the samples, never a fixed sleep a descheduled worker can miss
+        while len(sampler.samples) < 3 and _ident_time.monotonic() < deadline:
+            _ident_time.sleep(0.02)
+        samples = sampler.stop()
+        self.assertGreaterEqual(len(samples), 3, samples)
+        self.assertEqual(samples[:2], [(1, 10), (2, 20)], "a None read and a raising read are no sample, and not a crash")
+        self.assertFalse(sampler._thread.is_alive())
+
+    def test_r5_fix1_a2_a_parent_delayed_before_it_launched_the_child_did_not_wait_for_the_slow_call(self) -> None:
+        # adversary A2: the parent starts at 90 s, is not scheduled for 61 s before it launches the child at 151 s; the child marks at 160 s, exits at 160.05 s, the parent ends at 160.10 s
+        p = self.reference()
+        self._set_clocks(160.0, 160.05, 160.10)
+        self.last_wall_s, self.last_wall_started_ns, self.last_child_start_ns = 70.1, int(90.0 * 1e9), int(151.0 * 1e9)
+        with self.assertRaises(unittest.SkipTest) as ctx:
+            self.assert_measurement_unchanged(p, 70.1)
+        self.assertIn("EXIT_HOLD_INCONCLUSIVE", str(ctx.exception))
+        self.assertNotIn("waited for the slow call", str(ctx.exception))
+
+    def test_r5_fix1_a4_a_missing_child_clock_is_a_typed_skip_never_a_crash_or_a_hard_failure(self) -> None:
+        from unittest import mock
+        for name in ("test_a_parent_starved_after_the_child_exits_is_not_an_exit_hold", "test_the_childs_exit_time_is_the_os_recorded_exit_not_the_parents_clock_after_it"):
+            case = type(self)(name)
+            case.setUp()
+            with mock.patch.object(sys.modules[__name__], "_ident_clock_pair", return_value=None):   # every launch pair is loose: pair0 is None and no child exit time can be formed
+                with self.assertRaises(unittest.SkipTest, msg=name) as ctx:
+                    getattr(case, name)()
+            self.assertIn("EXIT_HOLD_INCONCLUSIVE", str(ctx.exception), name)
+    # r5-FIX1-ROWS-END
+
+    def test_r5_fix2_a2_opposite_sub_tolerance_offsets_at_launch_and_exit_cannot_decide_a_hold_near_the_limit(self) -> None:
+        # adversary A2 on fae72991: every pair agrees with the launch pair within 0.49 s (under the 0.5 s tolerance) but the offset is 0 at launch, +0.49 s at the child's real exit (114.8 s) and
+        # -0.49 s at the read, so the exit is placed at 115.78 s: a relative error of 0.98 s, which the old once-the-tolerance uncertainty (0.55 s) did not cover
+        S, B, off = self.S5, self.B5, 4_900_000
+        pair0, pair1 = (90 * 10**9, B + 90 * S), (136 * 10**9, B + 1_355_100_000)
+        samples = tuple((q * 10**9, B + q * S + o) for q, o in ((95, 0), (100, 0), (110, off), (115, off), (125, -off), (130, -off)))
+        ns, note = _ident_exit_from_pairs(pair0, pair1, B + 1_152_900_000, samples)
+        self.assertEqual(note, "ok", "every sampled disagreement is under the tolerance, so the mapper believes the figure")
+        self.assertAlmostEqual(ns / 1e9, 115.78, places=2)
+        self._set_clocks(100.0, ns / 1e9, 136.0)
+        with self.assertRaises(unittest.SkipTest) as ctx:   # the real gap is 14.8 s: never a HOLD at 15.78 s
+            self.assert_no_exit_hold()
+        self.assertIn("EXIT_HOLD_INCONCLUSIVE", str(ctx.exception))
+        self.assertEqual(_ident_gap_verdict(36.0, 15.78, 15.0)[0], "inconclusive")
+        self.assertEqual(_ident_gap_verdict(62.0, 60.78, 60.0, _IDENT_WALL_ESTIMATE_UNCERTAINTY_S)[0], "inconclusive", "the wall sibling: a real 59.8 s child lifetime is never a slow-call wait")
+        self.assertEqual(_ident_gap_verdict(62.0, 120.0, 60.0, _IDENT_WALL_ESTIMATE_UNCERTAINTY_S)[0], "over", "a real 120 s child lifetime still is")
+        self.assertEqual(_ident_gap_verdict(36.0, 20.0, 15.0)[0], "over", "a real 20 s hold still is a hold")
+
+    def test_the_exit_estimate_tolerances_are_small_against_the_limit_and_enforced(self) -> None:
+        # adversary A2 (pass 2): the estimate's uncertainty is named, is well inside the margin between the limit and the injected hold, and the tolerances are what the pair read and the step check enforce
+        S, B = 10_000_000, 5_000_000_000_000
+        self.assertLess(_IDENT_EXIT_ESTIMATE_UNCERTAINTY_S, 1.5)
+        self.assertLess(_IDENT_WALL_ESTIMATE_UNCERTAINTY_S, (self.DELAY_MS / 1000.0 - self.WALL_LIMIT_S) / 4, "far inside the margin between a real wait (the slow call's 120 s) and the wall limit")
+        self.assertLess(_IDENT_EXIT_ESTIMATE_UNCERTAINTY_S, (20.0 - self.EXIT_HOLD_LIMIT_S) / 4, "far inside the 5 s between the injected hold and the limit")
+        pair0 = (90 * 10**9, B + 90 * S)
+        for step_s, believed in ((0.3, True), (-0.3, True), (0.7, False), (-0.7, False)):
+            ns, note = _ident_exit_from_pairs(pair0, (136 * 10**9, B + int((136 + step_s) * S)), B + 120 * S)
+            self.assertEqual(ns is not None, believed, (step_s, note))
+        loose = (100 * 10**9, B + 100 * S, 100 * 10**9 + _IDENT_PAIR_TIGHT_NS + 1_000_000)
+        self.assertIsNone(_ident_clock_pair(read_once=lambda: loose, tries=3), "a pair read wider than the tight bound is thrown away")
+        inside = (100 * 10**9, B + 100 * S, 100 * 10**9 + _IDENT_PAIR_TIGHT_NS - 1_000_000)
+        self.assertIsNotNone(_ident_clock_pair(read_once=lambda: inside, tries=3))
+
+    def test_a_parent_stalled_inside_the_clock_pair_read_does_not_move_the_childs_exit(self) -> None:
+        # adversary A2: the FILETIME is sampled at 100.1 s, the parent is descheduled 32 s, the second QPC read says 132.1 s. The midpoint (116.1 s) is 16 s wrong, so that pair is thrown away
+        S, B = 10_000_000, 5_000_000_000_000
+        loose = (int(100.1 * 1e9), B + int(100.1 * S), int(132.1 * 1e9))
+        tight = (int(140.0 * 1e9), B + 140 * S, int(140.0 * 1e9) + 2_000_000)
+        reads = iter([loose, loose, tight])
+        pair1 = _ident_clock_pair(read_once=lambda: next(reads))
+        self.assertEqual(pair1, ((tight[0] + tight[2]) // 2, tight[1]))
+        pair0 = (90 * 10**9, B + 90 * S)
+        ns, note = _ident_exit_from_pairs(pair0, pair1, B + int(100.05 * S))   # the child exited 0.05 s after its marker at 100 s; the parent stalled; the read is at 140 s
+        self.assertEqual(note, "ok")
+        self.assertAlmostEqual((ns - 100 * 10**9) / 1e9, 0.05, places=2)
+        self.assertIsNone(_ident_clock_pair(read_once=lambda: loose, tries=5), "a run of loose reads is no pair at all")
+
+    def test_a_real_hold_is_rejected_whatever_the_parent_delay_and_an_unknown_child_exit_is_a_typed_failure(self) -> None:
+        for child_exit_s, parent_end_s in ((120.0, 120.1), (120.0, 136.0)):   # held 20 s; held 20 s and then the parent stalled 16 s
+            self._set_clocks(100.0, child_exit_s, parent_end_s)
+            with self.assertRaises(AssertionError) as ctx:
+                self.assert_no_exit_hold()
+            self.assertIn("held the exit", str(ctx.exception), (child_exit_s, parent_end_s))
+        self._set_clocks(100.0, None, 136.0)   # no child-side exit time: the parent's end is NOT a substitute for it
+        with self.assertRaises(unittest.SkipTest) as ctx:
+            self.assert_no_exit_hold()
+        self.assertIn("EXIT_HOLD_INCONCLUSIVE", str(ctx.exception))
+        self.assertNotIn("held the exit", str(ctx.exception))
+
+    # r3: the figure is built from the end marker, so a marker without one, or one in another clock, is a typed failure and never an exit hold
+    def test_a_marker_without_an_end_timestamp_or_in_another_clock_is_a_typed_failure_not_an_exit_hold(self) -> None:
+        now = _ident_time.perf_counter_ns()
+        self.last_wall_s, self.last_wall_end_ns, self.last_stderr = 30.0, now, ""
+        self.last_child_exit_ns, self.last_child_exit_note = now, "ok"
+        self.last_timing = _parse_probe_timing("VENUE_PROBE_INTERNAL_MS=10000 abandoned=1")   # the r2 marker: no end_qpc
+        with self.assertRaises(AssertionError) as ctx:
+            self.assert_no_exit_hold()
+        self.assertIn("typed failure", str(ctx.exception))
+        self.assertNotIn("held the exit", str(ctx.exception))
+        future_ticks = (now + 60 * 10**9) // 100   # a marker 60 s after the test saw the process end: not the same clock
+        self.last_timing = _parse_probe_timing(f"VENUE_PROBE_INTERNAL_MS=10000 abandoned=1 end_qpc={future_ticks} qpc_hz=10000000")
+        with self.assertRaises(AssertionError) as ctx:
+            self.assert_no_exit_hold()
+        self.assertIn("not the same monotonic clock", str(ctx.exception))
+        self.assertNotIn("held the exit", str(ctx.exception))
+        held_ticks = (now - 30 * 10**9) // 100   # a marker 30 s before the process end is a hold
+        self.last_timing = _parse_probe_timing(f"VENUE_PROBE_INTERNAL_MS=10000 abandoned=1 end_qpc={held_ticks} qpc_hz=10000000")
+        with self.assertRaises(AssertionError) as ctx:
+            self.assert_no_exit_hold()
+        self.assertIn("held the exit", str(ctx.exception))
+
+    # r3 (fable VENUE-PROBE-TEL-ABANDONED-EXIT-HOLD-TEST-1): the :605 twin. A hung TELEMETRY read (120 s, far past the 1 s call deadline) is abandoned, and the process still ends right after the marker.
+    def _tel_abandoned_run(self, exit_hold_s: int = 0) -> None:
+        feed = self.tmp / "hwinfo-log-adapter.csv"
+        feed.write_text("\r\n".join(_tel_feed_rows([70.0] * 20, [12.0] * 20, [False] * 20)) + "\r\n", encoding="utf-8")
+        self.run_identity_probe(self.procs, self.cim, CHAIN_OWNERS, timing=True, exit_hold_s=exit_hold_s,
+                               tel={"feed": feed, "call_ms": 1000, "read_delay_ms": self.DELAY_MS})
+
+    def test_an_abandoned_telemetry_call_does_not_hold_the_exit(self) -> None:
+        self._tel_abandoned_run()
+        self.assertGreaterEqual(self.last_timing["abandoned"], 1, self.timing_text())
+        self.assert_timing(self.last_wall_s)   # r5: wall and exit hold, three-way
+
+    def test_an_exit_hold_is_rejected_when_a_telemetry_call_was_abandoned_too(self) -> None:
+        self._tel_abandoned_run(exit_hold_s=20)
+        self.assertGreaterEqual(self.last_timing["abandoned"], 1, self.timing_text())
+        with self.assertRaises(AssertionError) as ctx:
+            self.assert_no_exit_hold()
+        self.assertIn("held the exit", str(ctx.exception))
+
+    def test_a_negative_or_unreadable_timing_marker_is_a_typed_failure_and_never_a_missing_marker(self) -> None:
+        for raw in ("-10000", "1.5", "NaN", ""):
+            t = _parse_probe_timing(f"VENUE_PROBE_INTERNAL_MS={raw} abandoned=1\n")
+            self.assertIsNotNone(t, raw)
+            t = _parse_probe_timing(f"VENUE_PROBE_INTERNAL_MS={raw}  abandoned=1\n")   # adversary A1: stray spacing is still a PRESENT marker
+            self.assertIsNotNone(t, raw)
+            self.assertIsNone(t["probe_ms"], raw)
+            self.assertIn("not a non-negative integer", t["bad"])
+            self.last_timing, self.last_stderr, self.last_wall_s, self.last_wall_end_ns = t, "", 30.5, _ident_time.perf_counter_ns()
+            self.last_child_exit_ns, self.last_child_exit_note = self.last_wall_end_ns, "ok"
+            with self.assertRaises(AssertionError) as ctx:
+                self.assert_no_exit_hold()
+            self.assertIn("typed failure", str(ctx.exception), raw)
+        self.assertEqual(_parse_probe_timing("VENUE_PROBE_INTERNAL_MS=10000 abandoned=1"), {"probe_ms": 10000, "abandoned": 1, "end_qpc": None, "qpc_hz": None})
+        self.assertEqual(_parse_probe_timing("VENUE_PROBE_INTERNAL_MS=10000 abandoned=1 end_qpc=123456 qpc_hz=10000000"), {"probe_ms": 10000, "abandoned": 1, "end_qpc": 123456, "qpc_hz": 10000000})
+        self.assertIsNone(_parse_probe_timing("no marker here"))
+
+    def test_the_marker_parser_anchors_every_field_to_a_whole_plain_integer_and_types_every_failure(self) -> None:
+        # r4 (VENUE-PROBE-TIMING-PARSER-FULL-TOKEN-1): a present marker of any other shape is a typed `bad`, never a missing marker, a junk-tolerant parse or a ValueError
+        digits = "9" * 5000
+        for line in ("VENUE_PROBE_INTERNAL_MS= NaN abandoned=1", "VENUE_PROBE_INTERNAL_MS=10 abandoned=1 end_qpc=5 qpc_hz=10000000junk", "VENUE_PROBE_INTERNAL_MS=10 abandoned=1 end_qpc=5x qpc_hz=10",
+                     f"VENUE_PROBE_INTERNAL_MS={digits} abandoned=1", f"VENUE_PROBE_INTERNAL_MS=10 abandoned={digits}", f"VENUE_PROBE_INTERNAL_MS=10 abandoned=1 end_qpc={digits} qpc_hz=10",
+                     "VENUE_PROBE_INTERNAL_MS=10 abandoned=1 end_qpc=5", "VENUE_PROBE_INTERNAL_MS=10", "VENUE_PROBE_INTERNAL_MS=10 abandoned=1 trailing", "VENUE_PROBE_INTERNAL_MS=1e3 abandoned=1",
+                     "noiseVENUE_PROBE_INTERNAL_MS=1500 abandoned=1 end_qpc=1000000000 qpc_hz=10000000",   # adversary A4: a prefix is not a clean marker line
+                     "VENUE_PROBE_INTERNAL_MS=1500 abandoned=1 end_qpc=1000000000 qpc_hz=10000000\nVENUE_PROBE_INTERNAL_MS=NaN abandoned=1",   # A4 pass 2: a second marker is not ignored
+                     "VENUE_PROBE_INTERNAL_MS=1500 abandoned=1 end_qpc=1000000000 qpc_hz=10000000\nVENUE_PROBE_INTERNAL_MS=1500 abandoned=1 end_qpc=1000000000 qpc_hz=10000000"):
+            t = _parse_probe_timing(line + "\n")
+            self.assertIsNotNone(t, line[:80])
+            self.assertIsNone(t["probe_ms"], line[:80])
+            self.assertTrue(t["bad"], line[:80])
+        t = _parse_probe_timing("noise\r\nVENUE_PROBE_INTERNAL_MS=1500 abandoned=0 end_qpc=1000000000 qpc_hz=10000000\r\n")
+        self.assertEqual(t, {"probe_ms": 1500, "abandoned": 0, "end_qpc": 1000000000, "qpc_hz": 10000000})
+        t = _parse_probe_timing("\rVENUE_PROBE_INTERNAL_MS=1500 abandoned=0 end_qpc=1000000000 qpc_hz=10000000")   # A4 pass 2: a lone carriage return before the line is still a present, clean marker
+        self.assertEqual(t, {"probe_ms": 1500, "abandoned": 0, "end_qpc": 1000000000, "qpc_hz": 10000000})
+
+    def test_the_timing_marker_is_read_from_monotonic_clocks_and_no_civil_clock(self) -> None:
+        self.assertEqual(_probe_marker_violations(_ident_probe_body()), [])
+
+    def test_the_marker_pin_catches_a_civil_value_stashed_on_an_earlier_line_and_a_comment_that_spells_the_real_call(self) -> None:
+        body = _ident_probe_body()
+        real = "[Diagnostics.Stopwatch]::GetTimestamp()"
+        self.assertEqual(body.count(real), 1)
+        marker = next(ln for ln in body.splitlines() if "VENUE_PROBE_INTERNAL_MS" in ln and not ln.lstrip().startswith("#"))
+        stash = body.replace(marker, "$fakeQpc = [DateTime]::UtcNow.Ticks\n" + marker.replace(real, "$fakeQpc") + " # " + real)   # sol's cross-line substitute with the real spelling in a trailing comment
+        self.assertNotEqual(_probe_marker_violations(stash), [])
+        self.assertNotEqual(_probe_marker_violations(body.replace(real, "$fakeQpc")), [], "the substitute alone")
+        self.assertNotEqual(_probe_marker_violations(body.replace(marker, marker + " # " + real)), [], "a trailing comment alone")
+        self.assertNotEqual(_probe_marker_violations(body.replace(real, "[DateTime]::UtcNow.Ticks")), [], "a civil read in place of the call")
+
+    def test_the_test_reaper_still_drains_and_kills_when_taskkill_itself_times_out(self) -> None:
+        from unittest import mock
+
+        class FakeProc:
+            pid = 4242
+
+            def __init__(self) -> None:
+                self.calls = []
+
+            def communicate(self, timeout=None):
+                self.calls.append("communicate")
+                raise subprocess.TimeoutExpired("probe", timeout)
+
+            def poll(self):
+                return None
+
+            def kill(self):
+                self.calls.append("kill")
+
+            def wait(self, timeout=None):
+                self.calls.append("wait")
+                return 0
+
+        fake = FakeProc()
+        with mock.patch.object(subprocess, "Popen", return_value=fake), \
+                mock.patch.object(subprocess, "run", side_effect=subprocess.TimeoutExpired("taskkill", 60)):
+            with self.assertRaises(subprocess.TimeoutExpired):
+                _ident_run_reaped(["probe"], timeout=1)
+        self.assertEqual(fake.calls, ["communicate", "communicate", "kill", "wait"], "taskkill failing must fall through to the bounded drain and the fallback kill")
+
+    def test_the_test_reaper_still_kills_when_the_second_drain_fails_with_an_os_error(self) -> None:
+        from unittest import mock
+
+        class FakeProc:
+            pid = 4243
+
+            def __init__(self) -> None:
+                self.calls = []
+
+            def communicate(self, timeout=None):
+                self.calls.append("communicate")
+                if self.calls.count("communicate") == 1:
+                    raise subprocess.TimeoutExpired("probe", timeout)
+                raise OSError("pipe read failure")
+
+            def poll(self):
+                return None
+
+            def kill(self):
+                self.calls.append("kill")
+
+            def wait(self, timeout=None):
+                self.calls.append("wait")
+                return 0
+
+        fake = FakeProc()
+        with mock.patch.object(subprocess, "Popen", return_value=fake), mock.patch.object(subprocess, "run", return_value=None):
+            with self.assertRaises(subprocess.TimeoutExpired):
+                _ident_run_reaped(["probe"], timeout=1)
+        self.assertEqual(fake.calls, ["communicate", "communicate", "kill", "wait"], "r4: a second drain that raises an OSError must still reach the fallback kill")
+
+    def test_the_childs_exit_time_is_the_os_recorded_exit_not_the_parents_clock_after_it(self) -> None:
+        from unittest import mock
+        # a real, prompt child: its OS exit time is inside the run, and a parent stalled afterwards does not move it
+        started = _ident_time.perf_counter_ns()
+        with mock.patch.object(sys.modules[__name__], "_IDENT_AFTER_REAP_DELAY_S", 3.0):
+            done = _ident_run_reaped([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", "Start-Sleep -Milliseconds 300"], timeout=120)
+        parent_end = _ident_time.perf_counter_ns()
+        if done.child_exit_ns is None:   # adversary A4: a permitted missing clock (a run of loose pair reads) is a typed skip
+            self.skipTest(f"EXIT_HOLD_INCONCLUSIVE: no child-side exit time ({done.child_exit_note})")
+        self.assertGreaterEqual(done.child_exit_ns, started)
+        self.assertIsNotNone(done.child_start_ns, "r5: the child's own creation time is mapped through the same pair")
+        self.assertLessEqual(done.child_start_ns, done.child_exit_ns)
+        self.assertGreaterEqual((parent_end - done.child_exit_ns) / 1e9, 2.5, "the 3 s stall sits after the child's exit")
 
     def test_the_call_deadline_is_a_pinned_literal_inside_the_identity_budget_arithmetic(self) -> None:
         body = _ident_probe_body()

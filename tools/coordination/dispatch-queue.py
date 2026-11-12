@@ -21,6 +21,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
+
 
 INTENT_SCHEMA = "dual-lane-dispatch-intent.v1"
 QUEUE_SCHEMA = "dual-lane-queue.v1"
@@ -334,7 +336,7 @@ def invoke_verified_writer(writer: Path, queue_path: Path, expected: str, candid
         "-Note",
         "dispatch-intent reconciliation",
     ]
-    result = subprocess.run(command, text=True, capture_output=True)
+    result = subprocess.run(command, text=True, capture_output=True, creationflags=_NO_WINDOW)
     if result.returncode != 0:
         detail = (result.stderr or result.stdout).strip()
         raise DispatchError(f"verified queue writer failed with exit {result.returncode}: {detail}")

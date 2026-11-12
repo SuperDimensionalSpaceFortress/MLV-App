@@ -76,6 +76,8 @@ import re
 import subprocess
 import sys
 
+_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
+
 BEGIN = "<!-- defect-dispositions:begin -->"
 END = "<!-- defect-dispositions:end -->"
 SCHEMA = "defect-ledger.v1"
@@ -468,7 +470,7 @@ def _git_reverts(repo, lo, hi, notes):
     cmd = ["git", "-C", repo, "log", "--merges", "--since=%s" % coarse, "--format=%H%x1f%ct%x1f%s%x1f%b%x1e"]
     try:
         proc = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace",
-                              timeout=GIT_TIMEOUT_S)
+                              timeout=GIT_TIMEOUT_S, creationflags=_NO_WINDOW)
     except (OSError, subprocess.SubprocessError) as exc:
         notes.append("ESCAPE unreadable git %s" % type(exc).__name__)
         return found

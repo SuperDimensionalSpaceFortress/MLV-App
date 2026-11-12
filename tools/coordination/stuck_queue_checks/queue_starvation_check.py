@@ -20,6 +20,9 @@ import argparse
 import json
 import subprocess
 import sys
+import os
+
+_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
 
 CAPACITY = 3
 OWNER_ID = "OWNER-P3"
@@ -54,7 +57,7 @@ def drain_aged(request):
 
 
 def run_command(cmd, request):
-    done = subprocess.run(cmd, shell=True, input=json.dumps(request), capture_output=True, text=True, timeout=60)
+    done = subprocess.run(cmd, shell=True, input=json.dumps(request), capture_output=True, text=True, timeout=60, creationflags=_NO_WINDOW)
     if done.returncode != 0:
         raise RuntimeError(f"drain command exited {done.returncode}: {done.stderr.strip()[:200]}")
     return json.loads(done.stdout)

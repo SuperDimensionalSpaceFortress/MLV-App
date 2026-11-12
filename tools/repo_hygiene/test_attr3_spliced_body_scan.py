@@ -37,6 +37,8 @@ import tempfile
 import unittest
 from pathlib import Path
 
+_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
+
 ROOT = Path(__file__).resolve().parents[2]
 SCANNER = ROOT / "tools" / "repo_hygiene" / "attr3_publish_write_scan.ps1"
 BACHELOR = ROOT / "tools" / "profiling" / "bachelor"
@@ -368,7 +370,7 @@ def run_scan(*, generators=(), templates=(), modules=(), splice_sources=()) -> d
 def run_bounded(command: list[str], timeout: float) -> "subprocess.CompletedProcess[str]":
     """subprocess.run with a bound: a hung pwsh fails this test instead of stalling the shard."""
     try:
-        return subprocess.run(command, capture_output=True, text=True, timeout=timeout)
+        return subprocess.run(command, capture_output=True, text=True, timeout=timeout, creationflags=_NO_WINDOW)
     except subprocess.TimeoutExpired as exc:
         raise AssertionError(f"{Path(command[0]).name} did not finish within {timeout:g}s: {' '.join(command[1:4])} ...") from exc
 

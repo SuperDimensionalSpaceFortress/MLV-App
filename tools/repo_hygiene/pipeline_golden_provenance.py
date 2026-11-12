@@ -12,6 +12,7 @@ from pathlib import Path, PurePosixPath
 from typing import Any, Protocol
 
 from .repository_identity import alias_urls, is_repository_alias
+from .hidden_spawn import no_window_flags
 
 
 DEFAULT_MANIFEST = Path("tests/fixtures/golden/pipeline_hashes.provenance.json")
@@ -88,7 +89,7 @@ class SubprocessGitWitness:
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             check=False,
-            timeout=30,
+            timeout=30, creationflags=no_window_flags(),
         )
         if result.returncode not in allowed:
             detail = result.stderr.decode("utf-8", errors="replace").strip()

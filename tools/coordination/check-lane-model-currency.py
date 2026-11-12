@@ -126,6 +126,8 @@ import re
 import subprocess
 import sys
 
+_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
+
 CLAUDE_ID_RE = re.compile(r"^claude-(?P<family>[a-z]+)-(?P<version>[0-9]+(?:-[0-9]+)*?)(?:-[0-9]{8})?$")
 CODEX_ID_RE = re.compile(r"^gpt-(?P<version>[0-9]+(?:\.[0-9]+)*)-(?P<family>[a-z0-9]+)$")
 REQUIRED_EFFORT = "high"
@@ -259,7 +261,7 @@ def default_runs_dir():
     for flags in (["--path-format=absolute", "--git-common-dir"], ["--git-common-dir"]):
         try:
             done = subprocess.run(["git", "rev-parse"] + flags, capture_output=True, text=True,
-                                  timeout=15, cwd=script_dir)
+                                  timeout=15, cwd=script_dir, creationflags=_NO_WINDOW)
         except (OSError, subprocess.SubprocessError):
             break
         if done.returncode == 0 and done.stdout.strip():
