@@ -1983,6 +1983,35 @@ class AgentThresholdParityR5Tests(unittest.TestCase):
                               "[string]@(Write-TelemetryLines $p)[0]")
             self.assertTrue(line.endswith(" rule_source=invalid"), f"{exe}: {line}")
 
+    def test_r5_pass_a3_an_array_rule_or_array_fields_print_as_invalid_on_both_shells(self) -> None:
+        # adversary r5 pass A3: the printer scalarized rule=[{..}] and fields [3]/[80] into a line the gate applied (hot, thresholdsSource=agent); the structured reader refuses both
+        funcs = "\n".join(quiet_fn_ps(n, "", "") for n in ("ConvertTo-IdentToken", "Format-TelNum", "Get-TelReasonSuffix", "Write-TelemetryLines"))
+        rule_obj = '{"source":"agent","maxThrottledRows":3,"meanMaxC":80,"sustainedRows":60,"feedStaleSec":120}'
+        rule_arr_fields = '{"source":"agent","maxThrottledRows":[3],"meanMaxC":[80],"sustainedRows":[60],"feedStaleSec":[120]}'
+        rule_arr_bits = '{"source":"agent","maxThrottledRows":3,"meanMaxC":88,"sustainedRows":60,"feedStaleSec":120,"meanMaxCBits":[' + str(double_bits(80.0)) + ']}'
+        for exe in SHELLS_R4:
+            for rule in ("[" + rule_obj + "]", rule_arr_fields, rule_arr_bits):
+                probe = ('{"telemetry_schema":"mlv-app/venue-quiet-probe-telemetry/v1","heat":{"source":"x","mean_c":82,"mean_c_exact":82,"throttled":4,"window_rows":60,"reasons":{},'
+                         '"rule":' + rule + '},"gpu":{"state":"absent"},"last_lease":{"event":"none"}}')
+                got = shell_json(exe, f"Import-Module '{GATE}' -Force; $telemetrySchemaV1 = 'mlv-app/venue-quiet-probe-telemetry/v1'; function Write-Gate([string]$s) {{ $s }}\n" + funcs + "\n"
+                                 f"$p = '{probe}' | ConvertFrom-Json\n"
+                                 "$r = ConvertFrom-VenueProbeHeatLine -Lines (@('  raw UNWRITABLE x') + @(Write-TelemetryLines $p)); [pscustomobject]@{ heat = $r.heat; src = $r.thresholdsSource; reason = $r.reason }")
+                self.assertEqual((got["heat"], got["src"], got["reason"]), ("unknown", "invalid", "THERMAL_THRESHOLDS_INVALID"), f"{exe}: {rule} -> {got}")
+
+    def test_r5_pass_a4_a_present_but_empty_token_is_refused_never_read_as_absent(self) -> None:
+        # adversary r5 pass A4: \S+ read an empty rule_source= / *_bits= / mean_exact_bits= as absent (defaults, the human threshold, the mean_exact text)
+        rule = " rule_source=agent rule_max_throttled=6 rule_mean_max_c=88 rule_rows=60 rule_stale_s=120"
+        for exe in SHELLS_R4:
+            def line(tail: str, thr: int = 0, mean: str = "82C") -> dict:
+                return shell_json(exe, f"Import-Module '{GATE}' -Force; ConvertFrom-VenueProbeHeatLine -Lines @('  tele heat source=x mean={mean} throttled={thr}/60{tail}')")
+            got = line(" rule_source= rule_max_throttled=3 rule_mean_max_c=80 rule_rows=60 rule_stale_s=120", thr=4)
+            self.assertEqual((got["heat"], got["thresholdsSource"], got["reason"]), ("unknown", "invalid", "THERMAL_THRESHOLDS_INVALID"), f"{exe}: {got}")
+            for tail in (rule + " rule_mean_max_c_bits=", rule + " rule_stale_s_bits=", rule + " rule_mean_max_c_bits= rule_stale_s_bits=" + str(double_bits(120.0))):
+                got = line(tail)
+                self.assertEqual((got["heat"], got["reason"]), ("unknown", "THERMAL_THRESHOLDS_INVALID"), f"{exe}: {tail} -> {got}")
+            got = line(" mean_exact=95 mean_exact_bits=")   # an empty mean token is no mean, never the 95 beside it: the count (0) does not decide
+            self.assertEqual(got["heat"], "unknown", f"{exe}: {got}")
+
     def test_r5_a1_no_double_parse_decides_when_the_bits_are_present(self) -> None:
         # the publisher, the probe and the gate carry/read the bits; the r4 G15 self-check only shapes the human field now
         agent = AGENT.read_text(encoding="utf-8")

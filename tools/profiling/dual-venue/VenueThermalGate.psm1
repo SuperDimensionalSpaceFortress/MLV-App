@@ -115,11 +115,12 @@ function Get-VenueRuleFromTeleLine {
     # (rule_source=invalid when the probe could not read the agent's record). No rule_source token = nothing was published = $null. A field that is missing stays MISSING on the
     # object, so Resolve-VenueHeatRule refuses it.
     param([string]$Line)
-    $src = [regex]::Match($Line, '\srule_source=(\S+)')
+    # r5 (adversary r5 A4): \S*, not \S+: a token that is PRESENT but empty (rule_source=, rule_mean_max_c_bits=) is present, so it is refused, never read as absent (defaults / the human field)
+    $src = [regex]::Match($Line, '\srule_source=(\S*)')
     if (-not $src.Success) { return $null }
     $o = [ordered]@{ source = $src.Groups[1].Value }
     foreach ($pair in @(@('maxThrottledRows', 'rule_max_throttled'), @('meanMaxC', 'rule_mean_max_c'), @('sustainedRows', 'rule_rows'), @('feedStaleSec', 'rule_stale_s'), @('meanMaxCBits', 'rule_mean_max_c_bits'), @('feedStaleSecBits', 'rule_stale_s_bits'))) {
-        $m = [regex]::Match($Line, '\s' + $pair[1] + '=(\S+)')
+        $m = [regex]::Match($Line, '\s' + $pair[1] + '=(\S*)')
         if ($m.Success) { $o[$pair[0]] = $m.Groups[1].Value }
     }
     [pscustomobject]$o
@@ -189,7 +190,7 @@ function ConvertFrom-VenueProbeHeatLine {
     $inf = [string][char]0x221E
     # r5 (adversary r4 A1): mean_exact_bits=<Int64> IS the exact mean (the probe prints it from its JSON's integer); a token that does not decode is no mean (NaN: the count alone may decide), never
     # the mean_exact text beside it
-    $mb = [regex]::Match([string]$line, '\smean_exact_bits=(\S+)')
+    $mb = [regex]::Match([string]$line, '\smean_exact_bits=(\S*)')   # \S*: a present but empty token is no mean, never the mean_exact beside it (adversary r5 A4)
     if ($mb.Success) { if (-not (ConvertFrom-VenueDoubleBits $mb.Groups[1].Value ([ref]$mean))) { $mean = [double]::NaN } }
     elseif ($meanText -ceq $inf -or $meanText -ceq "+$inf") { $mean = [double]::PositiveInfinity }
     elseif ($meanText -ceq "-$inf") { $mean = [double]::NegativeInfinity }

@@ -1383,9 +1383,10 @@ function Write-TelemetryLines($Probe) {
             # a number, or the numeric text the probe publishes for a double 15 digits cannot carry, is printed round-trip ($rt above), never through [string] (15 significant digits: 80.00000000000001 would
             # print as 80) and never as an identifier token (which would pass a padded text on as it came)
             $(if ($h.PSObject.Properties['rule'] -and $null -ne $h.rule) {
-                $rn = { param($x) $v = (& $rt $x); if ($null -ne $v) { $v } else { ConvertTo-IdentToken $x } }
+                # r5 (adversary r5 A3): an array is no rule and no number: [string] / ConvertTo-IdentToken scalarized [{..}] and [80] into a rule the gate applied; the gate's structured reader refuses both
+                $rn = { param($x) if ($x -is [array]) { return 'invalid' }; $v = (& $rt $x); if ($null -ne $v) { $v } else { ConvertTo-IdentToken $x } }
                 # r5 (adversary r4 A3): the source must BE the string agent: [string] turned a one-element array ["agent"] into agent
-                if ($h.rule.source -is [string] -and [string]::Equals([string]$h.rule.source, 'agent', [StringComparison]::Ordinal)) { ' rule_source=agent rule_max_throttled=' + (& $rn $h.rule.maxThrottledRows) + ' rule_mean_max_c=' + (& $rn $h.rule.meanMaxC) + ' rule_rows=' + (& $rn $h.rule.sustainedRows) + ' rule_stale_s=' + (& $rn $h.rule.feedStaleSec) +
+                if ($h.rule -is [System.Management.Automation.PSCustomObject] -and $h.rule.source -is [string] -and [string]::Equals([string]$h.rule.source, 'agent', [StringComparison]::Ordinal)) { ' rule_source=agent rule_max_throttled=' + (& $rn $h.rule.maxThrottledRows) + ' rule_mean_max_c=' + (& $rn $h.rule.meanMaxC) + ' rule_rows=' + (& $rn $h.rule.sustainedRows) + ' rule_stale_s=' + (& $rn $h.rule.feedStaleSec) +
                     $(if ($null -ne ($b1 = (& $bt $h.rule 'meanMaxCBits'))) { ' rule_mean_max_c_bits=' + $b1 } else { '' }) + $(if ($null -ne ($b2 = (& $bt $h.rule 'feedStaleSecBits'))) { ' rule_stale_s_bits=' + $b2 } else { '' }) }
                 else { ' rule_source=invalid' }
             } else { '' }))
