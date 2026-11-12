@@ -12,7 +12,7 @@ Only rows with `kind` of `product` or `playback` are shown. Hub-tooling, factory
 hygiene and ci-flake cards are tooling churn and are not counted here. Rows the board has
 not classified are not counted either, even when the card name says PLAYBACK.
 
-generated_from: 2026-11-05T21:15:39Z
+generated_from: 2026-11-12T23:32:29Z
 
 ## Open product and playback cards
 
@@ -20,22 +20,10 @@ generated_from: 2026-11-05T21:15:39Z
 
 | P | card | kind | state | queued since | order_chain |
 |---|---|---|---|---|---|
-| 1 | LOOK-ASSIST-CLIP-OPEN-GUI-BLOCK-1 | product | pr-open | 2026-10-14 | - |
-| 1 | LOOK-FULLSCREEN-PARITY-1 | product | pr-open | 2026-10-16 | - |
-| 1 | CORE-PARTITION-HELPER-PID-REUSE-1 | product | queued | 2026-10-28 | ORDER-20261028T134438Z #2 after BACHELOR-CORE-PARTITION-AB-1 |
-| 1 | CORE-PARTITION-TERMINAL-TEST-REAL-PUBLISHER-1 | product | queued | 2026-10-28 | - |
-| 1 | QUIET-LEASE-RENEW-HOOK-WRITE-RETRY-1 | product | queued | 2026-10-31 | - |
-| 1 | HFR-NATIVE-60FPS-FULLRES-1-MERGE-MASTER | product | running | 2026-10-31 | - |
-| 1 | HFR-NATIVE-M16-1457-GUI-PRESENT-CADENCE-1 | product | pr-open | 2026-11-04 | - |
-| 1 | CPU-SCOPE-LIVE-CRASH-FIX-1 | product | declared | 2026-11-05 | - |
+| 1 | LEASE-BATCH-IDLE-END-UNSEEN-1 | product | declared | 2026-11-05 | - |
 | 2 | PLAYBACK-GL-PRESENT-BACKLOG-1 | product | declared | 2026-10-09 | ORDER-20261008T151800Z #2 after PLAYBACK-GL-PRESENT-SETUP-STALL-1 |
-| 2 | HFR-NATIVE-60FPS-FULLRES-1 | product | pr-open | 2026-10-12 | ORDER-20261014T015628Z #3 after HFR-NATIVE-M16-1457-TIMEBUDGET-1 |
-| 2 | PLAYBACK-GPU-SCOPES-NO-VETO-1 | product | pr-open | 2026-10-15 | - |
-| 2 | CORE-PARTITION-PREDECESSOR-CLOCK-STEP-1 | product | queued | 2026-10-28 | ORDER-20261028T134438Z #3 after CORE-PARTITION-HELPER-PID-REUSE-1 |
-| 2 | CPU-S1-RECON-CHAIN-ATTRIBUTION-1 | product | pr-open | 2026-11-04 | - |
-| 2 | LEASE-BATCH-IDLE-END-UNSEEN-1 | product | queued | 2026-11-05 | - |
+| 2 | CPU-S1-DUALISO-MIX-CHROMA-LEVER-1 | product | declared | 2026-11-08 | - |
 | 3 | PLAYBACK-HFR-CONFORM-DEFAULT-1 | product | declared | 2026-10-15 | - |
-| 3 | WARM-RUN-CHROMA-SMOOTH-PARITY-1 | product | pr-open | 2026-10-18 | - |
 | 6 | PREP-WORKER-HL-RECON-REFUSAL-FIXTURE-1 | product | queued | 2026-10-07 | - |
 | 6 | C1-PARITY-TESTS-SKIP-WHEN-UNSET-1 | product | queued | 2026-10-09 | - |
 | 6 | PREP-TIER1-FROZEN-ORACLE-1 | product | queued | 2026-10-09 | - |
@@ -51,21 +39,21 @@ generated_from: 2026-11-05T21:15:39Z
 
 ## Drain
 
-product+playback open: 28
+product+playback open: 16
 
-Window: the 7 UTC days ending 2026-11-05 (the last day is partial).
+Window: the 7 UTC days ending 2026-11-12 (the last day is partial).
 Landed = merged rows by `merged_utc` when the row has one, else by the newest stamp (approximate: a lower bound on the merge time, not a measurement); queued = rows of any state by `source_ledger_stamp`.
 
 | day (UTC) | landed | queued |
 |---|---|---|
-| 2026-10-30 | 2 | 4 |
-| 2026-10-31 | 3 | 10 |
-| 2026-11-01 | 1 | 1 |
-| 2026-11-02 | 3 | 5 |
-| 2026-11-03 | 1 | 1 |
-| 2026-11-04 | 2 | 3 |
-| 2026-11-05 | 0 | 2 |
-| total | 12 | 26 |
+| 2026-11-06 | 1 | 2 |
+| 2026-11-07 | 1 | 1 |
+| 2026-11-08 | 3 | 2 |
+| 2026-11-09 | 4 | 1 |
+| 2026-11-10 | 3 | 5 |
+| 2026-11-11 | 0 | 1 |
+| 2026-11-12 | 1 | 4 |
+| total | 13 | 16 |
 
 does not drain (queued >= landed)
 
@@ -86,26 +74,29 @@ does not drain (queued >= landed)
 - CPU-DUALISO-REDUCED-RECON-EDGE-FRINGE-1 (P1): r2 PARTIAL FRINGE_NOT_CLOSED; successor chain S4-DECISION-1 (ruled 11:49:12Z) -> CPU-DUALISO-REDUCED-RECON-PLAYBACK-ONLY-1 (design runnin...
 - CPU-DUALISO-REDUCED-RECON-EDGE-FRINGE-1-r2 (P1): round ended PARTIAL; successor CPU-DUALISO-REDUCED-RECON-PLAYBACK-ONLY-1
 - CPU-DUALISO-REDUCED-RECON-S4-DECISION-1 (P1): decided by HUB RULING 2026-10-31T11:49:12Z; successor CPU-DUALISO-REDUCED-RECON-PLAYBACK-ONLY-1
+- CPU-S1-RECON-UNDER-LOOK-PACE-LEVER-1 (P1): HUB RULING 2026-11-07T21:29:03Z: r4 judged pace-neutral on both arms; no master merge or keys for no measured gain on a HIGH-RISK playbac...
+- GPU-EVENT153-ROOTCAUSE-3 (P1): closed by HUB RULING 2026-11-10T11:07:16Z item 4 (HUB-TICK 1056Z): r2 DONE verdict gone B 0/12 at 424e8e6b; successor (a) is #743's next ...
 - K4-RECEIPT-COMPLETE-ON-MAXTURNS-1 (P2): already fixed on master by 601fb4685 (2026-09-14) + test_coordination_guardrails.py:1257; instance-map K4 cell folded into SPEC-R14-R15-R...
 - VENUE-AA-UNDER-LOAD-1 (P2): design done (producer-prompt.md); producer waits on the owner unlocking the Bachelor console (KEEPALIVE_FAILED, HUB RULING 11:14:34Z)
 - VENUE-PAIR-COMPARABLE-1 (P2): HUB RULING 2026-10-09T19:10:51Z: AA-UNDER-LOAD-1 closed NOT_COMPARABLE; re-design needs a decode-state covariate, waits on PLAYBACK-BACHE...
 - PLAYBACK-CPU-PACE-AWARE-LOOKAHEAD-1 (P2): PR #413 closed unmerged by HUB RULING 2026-10-13T17:16:58Z (no gain; s2 regression belongs to #397 -> PACE-GAP r7)
-- GPU-EVENT153-ROOTCAUSE-3 (P2): waits for #437 merge (HUB-TICK 20261015T0610Z D13(d) re-scope: base 228d9a62 superseded by #434 tiling d9d6cd98; D13(e) re-queues on the ...
+- PLAYBACK-GPU-SCOPES-NO-VETO-1 (P2): HUB-TICK 20261109T0134Z A0b pr-stranded: PR #447 r2 PARTIAL (S1 n<4 counted), DIRTY ~120 h since r6 (2026-11-03), no keys; parked at owne...
 - OUTPUT-BUDGET-KNOWN-GOOD-PIN-1 (P2): design NO_GO 2026-10-19T21:24:56Z: pin is owner-reserved (golden authority NOT_INSTALLED); successors OUTPUT-BUDGET-KNOWN-GOOD-PROPOSAL-1...
 - OUTPUT-BUDGET-KNOWN-GOOD-PIN-2 (P2): r3 PARTIAL 443/480 quiet; no venue can pass the faster-venue probe; option (b) needs new owner ruling (HUB RULING 20261021T1215Z item 3)
 - CORE-PARTITION-UNIDENTIFIED-SEEN-PID-1 (P2): INTAKE-GUARD 2026-10-28: queued>landed 3 days (throughput: 2026-10-28 landed 1 / queued 33; 2026-10-27 landed 5 / queued 38; 2026-10-26 l...
 - LEASE-BATCH-RECEIPT-ROOT-1-ADV-A1A2A3 (P2): folded into #729 r8 (HUB-TICK 20261101T0051Z, sol r7 demonstrated A1/A2 as blockers)
-- HFR-NATIVE-M16-1457-GUI-TEXTURE-PRESENT-OFFLOAD-1 (P2): waits on the reading of PR 743 r10 same-batch A/B; carries bars moved from #743 by HUB RULING HUB-TICK 20261105T0215Z item 4; GUI-thread ...
 - HFR-NATIVE-M16-1457-WINDOWED-PRESENT-PENALTY-1 (P2): waits on HFR-NATIVE-M16-1457-PRESENT-TRACE-LEGS-1 r1 window split (Bachelor legs); hub writes the prompt from its summary
-- LOOK-ASSIST-M16-CAST-2 (P3): CLOSED-RULED: hub ruling ledger L2213 (#278 CLOSED unmerged, branch kept) and L3107 (CAST stack superseded, colour goal met by #295 #300 ...
-- LOOK-ASSIST-M16-CAST-3 (P3): CLOSED-RULED: hub ruling ledger L3107 (#280 CLOSE, lower layer of the CAST stack, superseded, colour goal met by #295 #300 #303)
-- LOOK-ASSIST-M16-CAST-4 (P3): CLOSED-RULED: hub ruling ledger L3107 (#282 CLOSE, lower layer of the CAST stack, superseded, colour goal met by #295 #300 #303)
-- LOOK-ASSIST-M16-CAST-5 (P3): CLOSED-RULED: hub ruling ledger L3478 (HUB-TICK 20261011T1150Z D13 triage: CAST-5 CLOSED, not a fix) and L3107 (#283 CLOSE)
-- LOOK-ASSIST-M16-CAST-6 (P3): PR #286 CLOSED; colour goal closed 2026-10-08 (goal-watch colour ok); parked HUB-TICK 20261020T2231Z
+- CPU-S1-PACE-NEXT-LEVER-DESIGN-1 (P2): closed: design r1 delivered; successor CPU-S1-PACE-NEXT-LEVER-1 (#774 r2 live); HUB RULING 2026-11-08T04:51:32Z
+- CPU-S1-GUI-REGION-RESIDUAL-1 (P2): GOAL_MET by design 20261109T0215Z; successor CPU-S1-DUALISO-MIX-CHROMA-LEVER-1 (HUB-TICK 20261109T0244Z)
+- CPU-S1-DUALISO-MIX-CHROMA-LEVER-2 (P2): HUB RULING 2026-11-12T04:21:53Z: LEVER_BAR_MISSED 8.011<10.0 ms under the pre-registered r11 plan; PR #785 stays draft; freeze is on both...
+- CPU-S1-DUALISO-PHASE-BALANCE-AVX2-1 (P2): design NO_GO 2026-11-12; ruling 0748
+- CPU-S1-DUALISO-MIX-CHROMA-LEVER-2-CONFIRM-1 (P2): HUB-TICK 20261112T0944Z: r1 DONE P1 MET 12.660 ms; its result feeds #785 r11 keys (closed by ruling 09:21:13Z); terminal, no successor round
+- CPU-S1-DUALISO-MIX-CHROMA-LEVER-2-REVERIFY-E101-1 (P2): HUB-TICK 20261112T2026Z: r2 DONE REVERIFIED (pooled 5(b) shared=3 differ=0); successor is CPU-S1-DUALISO-MIX-CHROMA-LEVER-2-GUARDS-E101-1...
 - LOOK-ASSIST-DUALISO-FIELD-SEAM-1 (P3): HUB RULING HUB-TICK 20261007T2308Z: after PLAYBACK-CUDA-HONOUR-SCALE-1 r8 VSTRIPES dual-ISO fix merges; first step re-runs U-RECON on the...
 - LOOK-ASSIST-WB-DECISION-2 (P3): design GOAL_MET 2026-10-08; colour goal closed (HUB RULING 0331Z tick); improvement is LOOK-ASSIST-GREEN-LEAN-MEASURE-1
 - CPU-DUALISO-NOTCH-COUNTER-PRESENTED-1 (P3): order: after PR #369 merges (it adds notch_frames); unpark then. HUB-TICK 20261010T1509Z
 - PLAYBACK-CPU-PACE-GAP-1 (P3): hub chat 2026-10-11T19:10Z: stopped twice for local MLVApp playback on the hub VM (owner objection); re-dispatch only with a venue-only D...
+- WARM-RUN-CHROMA-SMOOTH-PARITY-1 (P3): HUB-TICK 20261109T0134Z A0b pr-stranded: PR #516 DIRTY ~510 h, stacked on #502, red Repo Hygiene CI, no keys; parked at owner CPU cap 2. ...
 - CLIP-OPEN-ABORT-RENDER-THREAD-REBIND-1 (P3): waits for #493 (CPU-SCOPE-PLAYSTOP-LIFETIME-HARDENING-1) to merge: its cited lines exist only on #493 head 421c4aad; re-queue at P3 the t...
 - CLIP-OPEN-ABORT-STATE-ROLLBACK-1 (P3): waits for #493 (CPU-SCOPE-PLAYSTOP-LIFETIME-HARDENING-1) to merge: its cited lines exist only on #493 head 421c4aad; re-queue at P3 the t...
 - CLIP-OPEN-PREP-ABORT-USER-FEEDBACK-1 (P3): waits for #493 (CPU-SCOPE-PLAYSTOP-LIFETIME-HARDENING-1) to merge: its cited lines exist only on #493 head 421c4aad; re-queue at P3 the t...
@@ -117,6 +108,7 @@ does not drain (queued >= landed)
 - LEASE-BATCH-ZONE-UNRESOLVED-LABEL-1 (P3): folded into #704 r6 (sol r5b B1 = Dot A1), HUB-TICK 20261028T1405Z
 - CORE-PARTITION-REGION2-PENDING-ORDER-1 (P3): INTAKE-GUARD 2026-10-28: queued>landed 3 days (throughput: 2026-10-28 landed 1 / queued 33; 2026-10-27 landed 5 / queued 38; 2026-10-26 l...
 - HFR-NATIVE-M16-1457-WINDOWED-TIMER-GRANULARITY-1 (P3): folded into HFR-NATIVE-M16-1457-GUI-PRESENT-CADENCE-1 r1 (hub 17:49Z)
+- CPU-S1-DUALISO-MIX-CHROMA-LEVER-2-EVIDENCE-1 (P3): HUB-TICK 20261112T0944Z: r1 complete 08:46Z (5(b) MET, ws-s1 counted B=2 H=2); feeds #785 r11 keys; terminal
 - M16-CAST-PROBES-SALVAGE-1 (P4): D13(d) HUB-TICK 20261013T0714Z: measure-only salvage, colour goal closed 2026-10-08; P6 backlog when idle
 - GPU-FIELD-TELEMETRY-COLLECTION-AND-BATCH-1 (P4): waits for #409 to merge (hardening on its code); unpark the tick #409 MERGED is observed
 - PR493-CLIP-OPEN-ABORT-HARDENING-1 (P4): waits for #493 (CPU-SCOPE-PLAYSTOP-LIFETIME-HARDENING-1) to merge: its cited lines exist only on #493 head 421c4aad; re-queue at P3 the t...
