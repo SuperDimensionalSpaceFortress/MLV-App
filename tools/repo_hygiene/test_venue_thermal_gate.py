@@ -2277,6 +2277,13 @@ class AgentHeavySlotFeedForwardTests(unittest.TestCase):
     def quote(text: str) -> str:
         return "'" + text.replace("'", "''") + "'"
 
+    NORMALIZE_HEAD = "if ([string]::IsNullOrWhiteSpace($HeavySlotFeed)) { $HeavySlotFeed = "
+
+    def normalize_line(self) -> str:
+        """The agent's own start-up line that gives an explicit empty/blank -HeavySlotFeed a value (taken from its text, never restated; '' when the agent has no such line)."""
+        agent = AGENT.read_text(encoding="utf-8")
+        return next((ln.strip() for ln in agent.splitlines() if ln.startswith(self.NORMALIZE_HEAD)), "")
+
     def long_temp_dir(self, prefix: str) -> Path:
         """A fresh temp dir spelled by its LONG name. A hosted Windows runner's TEMP is C:\\Users\\RUNNER~1\\...; the agent's GetFullPath (and the cwd it is handed) yields the long spelling of the
         same directory, so a fixture path kept in the short spelling would differ from the agent's output as TEXT only. os.path.realpath resolves the 8.3 segments (the same fix as
@@ -2297,8 +2304,8 @@ class AgentHeavySlotFeedForwardTests(unittest.TestCase):
         script = ("$ErrorActionPreference = 'Stop'\n"
                   "$heatRule = [ordered]@{ maxThrottledRows = 6; meanMaxC = 88.0; sustainedRows = 60; feedStaleSec = 120 }\n"
                   "$script:Admission = [pscustomobject]@{ label = 'clear'; thermal = 'clear'; waitedSec = 0; heavySlotHeld = $null }\n"
-                  f"$HeavySlotFeed = {self.quote(feed)}\n" + self.block() + "\n"
-                  f"& '{PWSH}' -NoLogo -NoProfile -NonInteractive -Command {self.quote(tail)}\n")
+                  f"$HeavySlotFeed = {self.quote(feed)}\n" + self.normalize_line() + "\n" + self.block() + "\n"
+                  f"& {self.quote(str(PWSH))} -NoLogo -NoProfile -NonInteractive -Command {self.quote(tail)}\n")
         r = subprocess.run([str(PWSH), "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, timeout=180, env=env, cwd=cwd)
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
         return r.stdout.strip()
@@ -2337,6 +2344,23 @@ class AgentHeavySlotFeedForwardTests(unittest.TestCase):
         # an absolute path (with an apostrophe in it: adversary r1 A2) and a UNC path pass through unchanged
         self.assertEqual(self.job_env(r"C:\O'Brien\hot.csv", agent_env_feed=None, tail=tail, cwd=str(d)), r"C:\O'Brien\hot.csv")
         self.assertEqual(self.job_env(r"\\heat-trace.invalid\share\hwinfo-log-adapter.csv", agent_env_feed=None, tail=tail, cwd=str(d)), r"\\heat-trace.invalid\share\hwinfo-log-adapter.csv")
+
+    def test_an_explicit_empty_or_blank_feed_is_never_forwarded_as_nothing_so_the_job_cannot_fall_back_to_the_default_csv(self) -> None:
+        # adversary r2 A1 (introduced major): -HeavySlotFeed '' makes the agent's own reader see no file (feed unknown), but an empty value in the job env is the same as no variable, so the job's
+        # gate picked the default csv (a different sensor) and labelled its thresholds `agent`. An empty/blank feed now becomes ONE unreadable local path at start-up, forwarded like any other.
+        probe_line = next(ln.strip() for ln in QUIET.read_text(encoding="utf-8").splitlines() if ln.startswith("$HeatFeedPath = "))
+        tail = (probe_line + "\n[Console]::Out.Write([string]$env:HEAVY_SLOT_FEED + '|' + $HeatFeedPath + '|' + (Test-Path -LiteralPath $HeatFeedPath))")
+        for blank in ("", " ", "   \t"):
+            got = self.job_env(blank, agent_env_feed=None, tail=tail)
+            fwd, probe_path, exists = got.split("|")
+            self.assertNotEqual(fwd, "", f"feed {blank!r} was forwarded as an empty value (the job falls back to the default csv)")
+            self.assertNotEqual(fwd.lower(), self.DEFAULT_FEED.lower(), f"feed {blank!r} must not become the default csv")
+            self.assertEqual(probe_path, fwd, "the job's gate reads exactly what the agent forwarded")
+            self.assertEqual(exists, "False", "the stand-in path is unreadable, so the job reads 'feed missing' (unknown) like the agent does")
+        # the line runs once, at start-up, before any function (so the agent's own reader and all five forwards below see the same value)
+        agent = AGENT.read_text(encoding="utf-8")
+        self.assertEqual(agent.count("\n" + self.NORMALIZE_HEAD), 1)
+        self.assertLess(agent.index("\n" + self.NORMALIZE_HEAD), agent.index("\nfunction "))
 
     def test_every_heavy_slot_child_the_agent_starts_forwards_the_feed_it_decides_on(self) -> None:
         # the class: each child launch that reads the heat feed (heavy-slot.py status / lease request / lease renew: they start in the agent's own directory, so the raw path is the one it reads) sets
