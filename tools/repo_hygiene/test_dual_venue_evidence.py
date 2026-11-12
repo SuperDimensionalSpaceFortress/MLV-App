@@ -10762,23 +10762,28 @@ _IDENT_CIVIL_STEP_TOLERANCE_S = 0.5   # over a run, civil elapsed and monotonic 
 # MEASUREMENT UNCERTAINTY of the OS-exit estimate (pass-2 adversary A2): the two read pairs bound at most 2 * 25 ms, and a civil/monotonic disagreement under the tolerance is not seen, so a figure
 # is good to about this much. r5 (sol r4 A2): it is APPLIED to the verdict, see _ident_gap_verdict. A civil clock that steps one way and back inside ONE run (two opposite steps that cancel at the
 # endpoints) is not seen by the mapper at all; r5 (sol r4 A1) makes that harmless for a PASS (a civil estimate never passes a run) and a run it could have faked as a hold is a HOLD only when the
-# monotonic gap is over the limit too: OPEN CIVIL-STEP-CANCEL-FAKED-HOLD (a prompt child exit read through cancelling steps while the parent was also delayed) is a false HOLD, see the PR body.
-_IDENT_EXIT_ESTIMATE_UNCERTAINTY_S = _IDENT_CIVIL_STEP_TOLERANCE_S + 2 * _IDENT_PAIR_TIGHT_NS / 2e9
+# monotonic gap is over the limit too. r5 fix1 samples the pair during the run (_IdentClockSampler), which turns cancelling steps longer than the sample interval into a withheld estimate; OPEN
+# CIVIL-STEP-SUBINTERVAL (a step shorter than the interval, with the child's exit or creation inside it, can still fake a HOLD while the parent is also delayed): it needs a child-side MONOTONIC exit stamp.
+_IDENT_EXIT_ESTIMATE_UNCERTAINTY_S = 2 * _IDENT_CIVIL_STEP_TOLERANCE_S + 2 * _IDENT_PAIR_TIGHT_NS / 2e9
+# r5 fix2 (adversary A2 on fae72991): every pair may disagree with the launch pair by up to the tolerance in EITHER direction, so a FILETIME stamp placed through the read pair is good to TWICE the
+# tolerance (+ the pair read), not once. The child's wall estimate is a difference of two such stamps (exit - creation, one read pair, whose own error cancels), so it is good to twice that.
+_IDENT_WALL_ESTIMATE_UNCERTAINTY_S = 2 * _IDENT_EXIT_ESTIMATE_UNCERTAINTY_S
 
 
-def _ident_gap_verdict(mono_s: float, civil_s, limit_s: float) -> tuple:
+def _ident_gap_verdict(mono_s: float, civil_s, limit_s: float, uncertainty_s: float | None = None) -> tuple:
     """r5 (sol r4 A1-A3, HUB RULING): the ONE verdict for every time gap this class judges (marker -> process end, and the probe's whole wall). Returns (kind, figure_s, reason).
     "pass": the MONOTONIC parent-side gap is under the limit; no civil clock is consulted. "over": the monotonic gap is over the limit AND the child-side civil estimate, widened by the documented
     uncertainty in the direction that SHORTENS the gap, is still over it; the figure is the smaller of the two. "inconclusive": anything else (monotonic over but the civil estimate under or straddling
     the limit, a civil step seen, or no estimate at all): a typed skip, never a pass and never an over verdict."""
+    u = _IDENT_EXIT_ESTIMATE_UNCERTAINTY_S if uncertainty_s is None else uncertainty_s
     if mono_s < limit_s:
         return "pass", mono_s, ""
     if civil_s is None:
         return "inconclusive", mono_s, f"the monotonic gap {mono_s:.2f} s is over the {limit_s:.0f} s limit and no child-side civil estimate could be formed"
-    if civil_s - _IDENT_EXIT_ESTIMATE_UNCERTAINTY_S >= limit_s:
+    if civil_s - u >= limit_s:
         return "over", min(mono_s, civil_s), ""
     return "inconclusive", mono_s, (f"the monotonic gap {mono_s:.2f} s is over the {limit_s:.0f} s limit but the child-side civil estimate {civil_s:.2f} s "
-                                    f"(good to +/-{_IDENT_EXIT_ESTIMATE_UNCERTAINTY_S:.2f} s) does not clear it")
+                                    f"(good to +/-{u:.2f} s) does not clear it")
 
 
 def _ident_win32_clock():
@@ -11808,7 +11813,7 @@ class VenueProbeIdentityCallDeadlineTests(IdentityProbeMixin, unittest.TestCase)
         marker -> process end (see exit_hold_verdict)."""
         started, exit_ns = getattr(self, "last_child_start_ns", None), getattr(self, "last_child_exit_ns", None)
         civil_run_s = None if (started is None or exit_ns is None) else (exit_ns - started) / 1e9
-        out = [("wall", *_ident_gap_verdict(wall_s, civil_run_s, self.WALL_LIMIT_S))]
+        out = [("wall", *_ident_gap_verdict(wall_s, civil_run_s, self.WALL_LIMIT_S, _IDENT_WALL_ESTIMATE_UNCERTAINTY_S))]
         hold = self.exit_hold_verdict()
         if require_abandoned:
             self.assertGreaterEqual(self.last_timing["abandoned"], 1, "the slow call was not abandoned, so this case proves nothing")
@@ -12109,7 +12114,9 @@ class VenueProbeIdentityCallDeadlineTests(IdentityProbeMixin, unittest.TestCase)
                 raise r
             return r
         sampler = _IdentClockSampler(interval_s=0.01, read=read).start()
-        _ident_time.sleep(0.3)
+        deadline = _ident_time.monotonic() + 30   # adversary A3: wait for the samples, never a fixed sleep a descheduled worker can miss
+        while len(sampler.samples) < 3 and _ident_time.monotonic() < deadline:
+            _ident_time.sleep(0.02)
         samples = sampler.stop()
         self.assertGreaterEqual(len(samples), 3, samples)
         self.assertEqual(samples[:2], [(1, 10), (2, 20)], "a None read and a raising read are no sample, and not a crash")
@@ -12136,10 +12143,29 @@ class VenueProbeIdentityCallDeadlineTests(IdentityProbeMixin, unittest.TestCase)
             self.assertIn("EXIT_HOLD_INCONCLUSIVE", str(ctx.exception), name)
     # r5-FIX1-ROWS-END
 
+    def test_r5_fix2_a2_opposite_sub_tolerance_offsets_at_launch_and_exit_cannot_decide_a_hold_near_the_limit(self) -> None:
+        # adversary A2 on fae72991: every pair agrees with the launch pair within 0.49 s (under the 0.5 s tolerance) but the offset is 0 at launch, +0.49 s at the child's real exit (114.8 s) and
+        # -0.49 s at the read, so the exit is placed at 115.78 s: a relative error of 0.98 s, which the old once-the-tolerance uncertainty (0.55 s) did not cover
+        S, B, off = self.S5, self.B5, 4_900_000
+        pair0, pair1 = (90 * 10**9, B + 90 * S), (136 * 10**9, B + 1_355_100_000)
+        samples = tuple((q * 10**9, B + q * S + o) for q, o in ((95, 0), (100, 0), (110, off), (115, off), (125, -off), (130, -off)))
+        ns, note = _ident_exit_from_pairs(pair0, pair1, B + 1_152_900_000, samples)
+        self.assertEqual(note, "ok", "every sampled disagreement is under the tolerance, so the mapper believes the figure")
+        self.assertAlmostEqual(ns / 1e9, 115.78, places=2)
+        self._set_clocks(100.0, ns / 1e9, 136.0)
+        with self.assertRaises(unittest.SkipTest) as ctx:   # the real gap is 14.8 s: never a HOLD at 15.78 s
+            self.assert_no_exit_hold()
+        self.assertIn("EXIT_HOLD_INCONCLUSIVE", str(ctx.exception))
+        self.assertEqual(_ident_gap_verdict(36.0, 15.78, 15.0)[0], "inconclusive")
+        self.assertEqual(_ident_gap_verdict(62.0, 60.78, 60.0, _IDENT_WALL_ESTIMATE_UNCERTAINTY_S)[0], "inconclusive", "the wall sibling: a real 59.8 s child lifetime is never a slow-call wait")
+        self.assertEqual(_ident_gap_verdict(62.0, 120.0, 60.0, _IDENT_WALL_ESTIMATE_UNCERTAINTY_S)[0], "over", "a real 120 s child lifetime still is")
+        self.assertEqual(_ident_gap_verdict(36.0, 20.0, 15.0)[0], "over", "a real 20 s hold still is a hold")
+
     def test_the_exit_estimate_tolerances_are_small_against_the_limit_and_enforced(self) -> None:
         # adversary A2 (pass 2): the estimate's uncertainty is named, is well inside the margin between the limit and the injected hold, and the tolerances are what the pair read and the step check enforce
         S, B = 10_000_000, 5_000_000_000_000
-        self.assertLess(_IDENT_EXIT_ESTIMATE_UNCERTAINTY_S, 1.0)
+        self.assertLess(_IDENT_EXIT_ESTIMATE_UNCERTAINTY_S, 1.5)
+        self.assertLess(_IDENT_WALL_ESTIMATE_UNCERTAINTY_S, (self.DELAY_MS / 1000.0 - self.WALL_LIMIT_S) / 4, "far inside the margin between a real wait (the slow call's 120 s) and the wall limit")
         self.assertLess(_IDENT_EXIT_ESTIMATE_UNCERTAINTY_S, (20.0 - self.EXIT_HOLD_LIMIT_S) / 4, "far inside the 5 s between the injected hold and the limit")
         pair0 = (90 * 10**9, B + 90 * S)
         for step_s, believed in ((0.3, True), (-0.3, True), (0.7, False), (-0.7, False)):
