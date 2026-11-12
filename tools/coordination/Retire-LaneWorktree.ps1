@@ -385,15 +385,16 @@ public static class MlvProcOrder {
     [DllImport("kernel32.dll", SetLastError = true)] static extern IntPtr OpenProcess(int access, bool inherit, int pid);
     [DllImport("kernel32.dll")] static extern bool CloseHandle(IntPtr h);
     [DllImport("ntdll.dll")] static extern int NtQueryInformationProcess(IntPtr h, int cls, byte[] buf, int len, out int ret);
-    public static long Get(int pid) {
+    // { sequence, creation FILETIME } of the process that holds `pid` NOW, or null.
+    public static long[] Get(int pid) {
         IntPtr h = OpenProcess(0x1000, false, pid);
-        if (h == IntPtr.Zero) return 0;
+        if (h == IntPtr.Zero) return null;
         try {
             byte[] b = new byte[8192]; int rl;
-            if (NtQueryInformationProcess(h, 64, b, b.Length, out rl) != 0) return 0;
-            if (BitConverter.ToUInt32(b, 4) != (uint)pid) return 0;
-            long seq = BitConverter.ToInt64(b, 40);
-            return seq > 0 ? seq : 0;
+            if (NtQueryInformationProcess(h, 64, b, b.Length, out rl) != 0) return null;
+            if (BitConverter.ToUInt32(b, 4) != (uint)pid) return null;
+            long seq = BitConverter.ToInt64(b, 40), made = BitConverter.ToInt64(b, 16);
+            return (seq > 0 && made > 0) ? new long[] { seq, made } : null;
         } finally { CloseHandle(h); }
     }
 }
@@ -438,11 +439,30 @@ function Get-ProcessCurrentDirectory {
 }
 
 function Get-ProcessCreationOrder {
-    # The monotonic creation sequence of a LIVE pid, or $null when it cannot be read. A seam too: a test redefines this function.
+    # { Sequence (monotonic creation order), CreatedUtc (its wall-clock creation time) } of the process that holds this pid RIGHT NOW, or $null when
+    # it cannot be read. A seam too: a test redefines this function.
     param([int]$ProcessId)
     if (-not ('MlvProcOrder' -as [type])) { return $null }
-    try { $v = [MlvProcOrder]::Get($ProcessId); if ($v -gt 0) { return [uint64]$v } } catch { }
+    try {
+        $v = [MlvProcOrder]::Get($ProcessId)
+        if ($v -and $v.Count -eq 2) { return [pscustomobject]@{ Sequence = [uint64]$v[0]; CreatedUtc = [datetime]::FromFileTimeUtc([int64]$v[1]) } }
+    } catch { }
     return $null
+}
+
+function Get-BoundCreationOrder {
+    # r2 (adversary A1): the live sequence number is used only when it belongs to the SAME process the snapshot row describes. The scan and this read are
+    # not atomic: a row's process can exit in between and its pid start a NEWER process, whose key would then be compared against the old row. The live
+    # creation time must equal the row's CreationDate (the same kernel stamp, so a clock step cannot separate them; 50 ms covers the WMI rounding).
+    # Anything else (no row stamp, no live key, a different process) returns $null, and the caller falls back to the snapshot's own rows.
+    param($Row, [int]$ProcessId)
+    if (-not $Row) { return $null }
+    $made = $Row.PSObject.Properties['CreationDate']
+    if (-not ($made -and $made.Value -is [datetime])) { return $null }
+    $live = Get-ProcessCreationOrder -ProcessId $ProcessId
+    if (-not $live -or $live.CreatedUtc -isnot [datetime]) { return $null }
+    if ([math]::Abs((([datetime]$made.Value).ToUniversalTime() - ([datetime]$live.CreatedUtc).ToUniversalTime()).TotalMilliseconds) -gt 50) { return $null }
+    return $live.Sequence
 }
 
 function Get-LaneProcessSnapshot {
@@ -474,8 +494,8 @@ function Get-LaneProcessSnapshot {
     while ($pp -and $self -notcontains $pp) {
         $parent = $byPid[[int]$pp]
         if ($parent) {
-            $childKey = Get-ProcessCreationOrder -ProcessId $cur
-            $parentKey = Get-ProcessCreationOrder -ProcessId ([int]$pp)
+            $childKey = Get-BoundCreationOrder -Row $node -ProcessId $cur
+            $parentKey = Get-BoundCreationOrder -Row $parent -ProcessId ([int]$pp)
             if ($null -ne $childKey -and $null -ne $parentKey) {
                 if ($parentKey -ge $childKey) { break }
             } else {
