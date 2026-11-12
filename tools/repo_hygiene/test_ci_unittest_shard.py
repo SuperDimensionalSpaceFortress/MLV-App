@@ -296,6 +296,37 @@ class ShardDurationBudgetTests(unittest.TestCase):
                 )
 
 
+# A discovered class may go without a weight row only with a reason written here. Empty today: a
+# class with no row is silently weighted DEFAULT_TEST_SECONDS per test, which is how five
+# test_venue_thermal_gate classes sat unweighted while the windows shard they landed on drifted
+# to ~1259 s against its 1224 s limit (CI-SHARD-WEIGHTS-THERMAL-PARITY-CLASSES-1).
+UNWEIGHTED_EXEMPT: dict[str, str] = {}
+
+
+class EveryClassHasWeightRowTests(unittest.TestCase):
+    def test_every_discovered_class_has_a_weight_row_in_every_profile(self) -> None:
+        for profile in shard.PROFILES:
+            with self.subTest(profile=profile):
+                weights = shard.load_weights(profile)
+                unweighted = sorted(key for key in _COUNTS if key not in weights and key not in UNWEIGHTED_EXEMPT)
+                self.assertFalse(
+                    unweighted,
+                    f"{profile}: {len(unweighted)} discovered classes have no row in "
+                    "ci_unittest_shard_weights.json, so each is weighted at DEFAULT_TEST_SECONDS per "
+                    "test and the shard headroom guards pass only because the class is unweighted; "
+                    "measure each (ci_unittest_shard_timings.class_seconds over a stamped "
+                    "`unittest -v` run) and add its row: " + ", ".join(unweighted),
+                )
+
+    def test_every_exemption_is_a_discovered_unweighted_class_with_a_reason(self) -> None:
+        for key, reason in UNWEIGHTED_EXEMPT.items():
+            with self.subTest(key=key):
+                self.assertIn(key, _COUNTS, "a stale exemption: discover no longer collects this class")
+                self.assertTrue(reason.strip(), "an exemption names its reason")
+                for profile in shard.PROFILES:
+                    self.assertNotIn(key, shard.load_weights(profile), f"{profile} now weights it: drop the exemption")
+
+
 class JobCapPinTests(unittest.TestCase):
     def test_the_runner_job_caps_equal_the_workflow_timeout_minutes(self) -> None:
         # The 75 % warning is only a warning about the real cancel point if the runner's cap
