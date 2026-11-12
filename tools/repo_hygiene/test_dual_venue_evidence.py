@@ -11471,6 +11471,7 @@ class VisualCaptureSpecAndAppSourceTests(unittest.TestCase):
 # Get-Counter / Get-Process / Get-CimInstance / Invoke-CimMethod shadows, so identity is proved on exact values, not on whatever the test host is running.
 import base64 as _ident_base64
 import datetime as _ident_dt
+from fractions import Fraction as _IdentFraction
 import threading as _ident_threading
 import time as _ident_time
 
@@ -11608,6 +11609,22 @@ def _ident_child_stamp_prelude(start_path: Path, exit_path: Path) -> str:
     ))
 
 
+class _IdentChildStamps(tuple):
+    """sol r2 on 46c71e12 B1: `(start_ns, exit_ns)` are one-sided INTEGER bounds (the verdict figures), and `.exact` is the same two stamps as exact rationals of a ns, for the EVENT-ORDER checks:
+    rounding the start up and the exit down can turn a reversal of less than 1 ns (a 2 GHz QPC has 0.5 ns ticks) into an equality, and an order check on the rounded figures accepts it. It is still
+    a tuple of two ints, so every figure and equality is unchanged; a plain tuple set by a test has no `.exact`, and its integers are taken as exact (_ident_exact_stamps)."""
+    exact: tuple
+
+    def __new__(cls, bounds: tuple, exact: tuple):
+        self = super().__new__(cls, bounds)
+        self.exact = exact
+        return self
+
+
+def _ident_exact_stamps(child: tuple) -> tuple:
+    return getattr(child, "exact", None) or (_IdentFraction(child[0]), _IdentFraction(child[1]))
+
+
 def _ident_read_child_stamps(start_path: Path, exit_path: Path) -> tuple:
     """((start_ns, exit_ns) on the perf_counter_ns axis, "ok"), or (None, typed reason): no stamp, or a stamp of any other shape, is the ABSENCE of child-side evidence, never a number.
     The two figures are ONE-SIDED integer bounds (sol r1 on 9265be72 B2): the exit rounds DOWN and the start rounds UP, so `exit_ns - start_ns` is never more than the real run, and the gap to a
@@ -11625,7 +11642,7 @@ def _ident_read_child_stamps(start_path: Path, exit_path: Path) -> tuple:
     start_ticks, exit_ticks, hz = int(start[0]), int(exit_raw), int(start[1])
     if exit_ticks < start_ticks:   # adversary A1 on 636642d6: compared in TICKS, before the ns floor can make two different stamps equal
         return None, f"malformed child stamp: its exit stamp is {start_ticks - exit_ticks} ticks ({(start_ticks - exit_ticks) / hz:.3f} s) BEFORE its start stamp"
-    return (-(-start_ticks * 1_000_000_000 // hz), exit_ticks * 1_000_000_000 // hz), "ok"
+    return _IdentChildStamps((-(-start_ticks * 1_000_000_000 // hz), exit_ticks * 1_000_000_000 // hz), (_IdentFraction(start_ticks * 1_000_000_000, hz), _IdentFraction(exit_ticks * 1_000_000_000, hz))), "ok"
 
 
 def _ident_marker_ns(end_qpc: int, qpc_hz: int, up: bool = False) -> int:
@@ -12720,7 +12737,9 @@ class VenueProbeIdentityCallDeadlineTests(IdentityProbeMixin, unittest.TestCase)
         self.assertTrue(t.get("end_qpc") is not None and t.get("qpc_hz"), "typed failure, not an exit hold: the marker carries no end_qpc / qpc_hz timestamp: " + self.last_stderr)
         marker_ns = _ident_marker_ns(t["end_qpc"], t["qpc_hz"])
         upper = (self.last_wall_end_ns - marker_ns) / 1e9
-        self.assertGreaterEqual(upper, 0, f"typed failure, not an exit hold: the probe's end marker is {-upper:.3f} s AFTER the test saw the process end, so the two are not the same monotonic clock")   # r2 (adversary A3): no tolerance, like the child stamps below
+        # sol r2 on 46c71e12 B1: every ORDER check below is on the EXACT stamps (rationals of a ns), never on the rounded integer bounds, which can hide a reversal of less than 1 ns
+        marker_exact = _IdentFraction(t["end_qpc"] * 1_000_000_000, t["qpc_hz"])
+        self.assertLessEqual(marker_exact, self.last_wall_end_ns, f"typed failure, not an exit hold: the probe's end marker is {float(marker_exact - self.last_wall_end_ns) / 1e9:.9f} s AFTER the test saw the process end, so the two are not the same monotonic clock")   # r2 (adversary A3): no tolerance, like the child stamps below
         child_exit_ns = getattr(self, "last_child_exit_ns", None)
         civil_s = None if child_exit_ns is None else (child_exit_ns - marker_ns) / 1e9
         # VENUE-PROBE-CHILD-SIDE-MONOTONIC-EXIT-STAMP-1: the LOWER bound is the child's own ProcessExit QPC stamp; the civil estimate above is a cross-check only (adversary A1 on fae72991)
@@ -12728,10 +12747,11 @@ class VenueProbeIdentityCallDeadlineTests(IdentityProbeMixin, unittest.TestCase)
         child_s = None
         if child is not None:
             # sol r1 on 9265be72 B1: the order is marker <= the child's ProcessExit stamp <= the parent's end read, with NO tolerance (one system-wide QPC; each stamp is floored, which keeps a true order true)
-            self.assertLessEqual(child[1], self.last_wall_end_ns, f"typed failure, not an exit hold: the child's exit stamp is {(child[1] - self.last_wall_end_ns) / 1e9:.3f} s AFTER the test saw the process end, so the two are not the same monotonic clock")
-            self.assertGreaterEqual(child[1], marker_ns, f"typed failure, not an exit hold: the child's exit stamp is {(marker_ns - child[1]) / 1e9:.3f} s BEFORE its own end marker")
+            start_exact, exit_exact = _ident_exact_stamps(child)
+            self.assertLessEqual(exit_exact, self.last_wall_end_ns, f"typed failure, not an exit hold: the child's exit stamp is {float(exit_exact - self.last_wall_end_ns) / 1e9:.9f} s AFTER the test saw the process end, so the two are not the same monotonic clock")
+            self.assertGreaterEqual(exit_exact, marker_exact, f"typed failure, not an exit hold: the child's exit stamp is {float(marker_exact - exit_exact) / 1e9:.9f} s BEFORE its own end marker")
             marker_up_ns = _ident_marker_ns(t["end_qpc"], t["qpc_hz"], up=True)
-            self.assertLessEqual(child[0], marker_up_ns, f"typed failure, not an exit hold: the child's first statement is {(child[0] - marker_up_ns) / 1e9:.3f} s AFTER its own end marker")   # r2 (adversary A1): start <= marker (start rounds up, so it is compared with the marker rounded up)
+            self.assertLessEqual(start_exact, marker_exact, f"typed failure, not an exit hold: the child's first statement is {float(start_exact - marker_exact) / 1e9:.9f} s AFTER its own end marker")   # r2 (adversary A1): start <= marker, exact (r3: no rounding on either side)
             child_s = (child[1] - marker_up_ns) / 1e9   # a LOWER bound: the marker rounds up here
         kind, figure, reason = _ident_gap_verdict(upper, child_s, self.EXIT_HOLD_LIMIT_S, civil_s)
         if kind == "inconclusive":
@@ -13165,6 +13185,27 @@ class VenueProbeIdentityCallDeadlineTests(IdentityProbeMixin, unittest.TestCase)
             self.exit_hold_verdict()
         self.assertIn("typed failure", str(ctx.exception))
         self.assertIn("not the same monotonic clock", str(ctx.exception))
+
+    def test_r3_b1_an_event_order_reversed_by_less_than_a_nanosecond_is_a_typed_failure_not_a_verdict(self) -> None:
+        # sol r2 on 46c71e12 B1: the stamps are accepted as integers after one-sided ns rounding, which can turn a reversal of 0.5 ns into an equality. The order is judged on the EXACT stamps (a 2 GHz QPC
+        # has 0.5 ns ticks); each row is (child start, child exit, marker ticks, parent end ns, why). No row is a measurement of anything.
+        rows = (
+            ("200000000002 2000000000", "240000000000", 200_000_000_001, 136 * 10**9, "AFTER its own end marker"),         # start 0.5 ns after the marker; both ceil to the same ns (sol repro)
+            ("190000000000 2000000000", "200000000001", 200_000_000_001, 100 * 10**9, "not the same monotonic clock"),      # marker and exit 0.5 ns after the parent's end read (sol sibling)
+            ("380000000000 2000000000", "400000000000", 400_000_000_001, 216 * 10**9, "BEFORE its own end marker"),         # exit 0.5 ns before the marker; both floor to the same ns
+            ("190000000000 2000000000", "272000000001", 200_000_000_000, 136 * 10**9, "not the same monotonic clock"),      # exit 0.5 ns after the parent's end read; both floor to the same ns
+        )
+        for start_text, exit_text, marker_ticks, parent_end_ns, why in rows:
+            self._set_clocks_from_stamps(start_text, exit_text, marker_ticks, 2_000_000_000, parent_end_ns)
+            with self.assertRaises(AssertionError, msg=(start_text, exit_text, marker_ticks)) as ctx:
+                self.exit_hold_verdict()
+            self.assertIn("typed failure", str(ctx.exception))
+            self.assertIn(why, str(ctx.exception), (start_text, exit_text, marker_ticks))
+        # the same stamps one tick (0.5 ns) the right way round are measurements again, so the exact check does not over-reject
+        self._set_clocks_from_stamps("200000000000 2000000000", "240000000000", 200_000_000_000, 2_000_000_000, 136 * 10**9)
+        self.assertEqual(self.exit_hold_verdict()[0], "over")
+        self._set_clocks_from_stamps("190000000000 2000000000", "200000000000", 200_000_000_000, 2_000_000_000, 100 * 10**9)
+        self.assertEqual(self.exit_hold_verdict()[:2], ("pass", 0.0))
 
     def test_r2_b1_a_child_run_longer_than_the_parents_own_wall_is_a_typed_failure(self) -> None:
         # the wall bounds: a LOWER bound (the child's run) above the UPPER bound (the parent's wall, which contains it) cannot come from one monotonic clock
