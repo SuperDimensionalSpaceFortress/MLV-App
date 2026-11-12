@@ -910,6 +910,9 @@ def _from_heading_row(body: str) -> str:
 
 
 _BACKTICK_RUN_RE = re.compile(r"`+")
+# Where markdown may read a backtick as plain text rather than a code-span delimiter: raw HTML, an HTML comment or an autolink (`<`),
+# a link destination or title (`](`), a reference definition (`]:`). Not modelled; masking stops there (see _mask_quotations).
+_MARKUP_OPEN_RE = re.compile(r"<|\]\(|\]:")
 
 
 def _backslashes_before(row: str, pos: int) -> int:
@@ -930,13 +933,18 @@ def _mask_quotations(row: str) -> tuple[str, bool]:
     the row, or one preceded by an odd number of backslashes (escaped: text, not a delimiter; Sol r5 B1), is not understood well
     enough to model: it may pair with a run in a LATER row (a span crosses rows, adversary 0a19848c A2), so no token at or after
     it is masked, in this row or any later one (`distrusted`). The token is left in the row, its key is refused (fail closed) and
-    the author rewords. An EVEN number of backslashes is an escaped backslash and leaves the run real."""
+    the author rewords. An EVEN number of backslashes is an escaped backslash and leaves the run real. A backtick is also plain
+    text inside raw HTML (`<i title="`">`), an HTML comment, an autolink, a link destination or title (`](`) and a reference
+    definition (`]:`), so the first of those (_MARKUP_OPEN_RE) stops masking the same way (adversary 4640f9b8 A1)."""
     runs = list(_BACKTICK_RUN_RE.finditer(row))
     n = len(runs)
     stop = len(row) + 1   # no token starting at or after this column is masked
+    markup = _MARKUP_OPEN_RE.search(row)
+    if markup:
+        stop = markup.start()
     for r in runs:
         if _backslashes_before(row, r.start()) % 2:
-            stop = r.start()
+            stop = min(stop, r.start())
             break
     nxt: list[int | None] = [None] * n   # the next run of the same length, found right to left (linear in the runs)
     seen: dict[int, int] = {}

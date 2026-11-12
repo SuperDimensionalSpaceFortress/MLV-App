@@ -3991,3 +3991,41 @@ def test_the_run_pairing_is_linear_in_the_number_of_runs(tmp_path):
     t = time.monotonic()
     ob._mask_quotations(row.rstrip("\n"))
     assert time.monotonic() - t < 1.0
+
+
+# ---------- r6 fix 3: adversary pass on 4640f9b8 (A1 a backtick that markup reads as text, not as a code-span delimiter) ----------
+#
+# A1: in `<i title="`">a`!`check:` git status` the backtick inside the HTML attribute is text, so `a`!` is a span and `check:` is bare;
+# the pairing counted the attribute backtick as a delimiter, shifted every pairing after it and masked `check:`. Raw HTML, comments,
+# autolinks, link destinations and titles, and reference definitions all read a backtick as text, so the first of them stops masking
+# (a later row too, as a tag can cross rows). A quotation BEFORE the markup is still a quotation.
+#
+# Named mutation for this block (turns the named tests red, then is reverted):
+#   M29 drop _MARKUP_OPEN_RE from the stop column -> every refusal row below
+
+@pytest.mark.parametrize("key", ob.CARD_FIELDS)
+@pytest.mark.parametrize("rows", [
+    'rule: <i title="`">a`!`{key}:` git status\n',                # the attack: a backtick inside an HTML attribute
+    "rule: <!-- ` -->a`!`{key}:` git status\n",                   # an HTML comment
+    "rule: <http://a`b>a`!`{key}:` git status\n",                 # an autolink
+    "rule: [t](http://a`b) a`!`{key}:` git status\n",             # a link destination
+    'rule: [t](u "`") a`!`{key}:` git status\n',                  # a link title
+    "rule: [t]: http://a`b a`!`{key}:` git status\n",             # a reference definition
+    'rule: <i title="`"\n  >a`!`{key}:` git status\n',            # a tag that crosses rows
+])
+def test_validate_refuses_a_key_after_markup_that_reads_a_backtick_as_text(tmp_path, capsys, rows, key):
+    body = CARD_BODY.replace("rule: the rule\n", rows.replace("{key}", key), 1)
+    assert ob.main(["--repo", str(tmp_path), "validate", str(_write_card_item(tmp_path, body))]) == 1
+    assert "FIELD_KEY_FUSED" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("key", ob.CARD_FIELDS)
+def test_the_screen_refuses_the_markup_row_on_the_entry_every_reader_calls(key):
+    with pytest.raises(ob.Refusal) as e:
+        ob.screen_card_field_keys(CARD_BODY.replace("rule: the rule\n", f'rule: <i title="`">a`!`{key}:` git status\n', 1))
+    assert e.value.code == "FIELD_KEY_FUSED"
+
+
+def test_a_quotation_before_the_markup_is_still_a_quotation(tmp_path):
+    body = CARD_BODY.replace("rule: the rule\n", 'rule: use `check:` then <i title="x">y</i> and [t](u)\n', 1)
+    assert ob.main(["--repo", str(tmp_path), "validate", str(_write_card_item(tmp_path, body))]) == 0
