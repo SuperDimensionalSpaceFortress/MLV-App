@@ -635,9 +635,8 @@ bool ReceiptApplier::lookAssistDisplayMeter(mlvObject_t *mlvObject,
     const double samplePcts[3] = { 0.15, 0.5, 0.85 };
     QByteArray displayThumb;
     displayThumb.resize( width * height * 3 );
-    double medianSamples[3];
-    double p95Samples[3];
-    double p99Samples[3];
+    LookAssistStats rendered[3];
+    int renderedCount = 0;
     int valid = 0;
 
     for( int s = 0; s < 3; ++s )
@@ -658,17 +657,14 @@ bool ReceiptApplier::lookAssistDisplayMeter(mlvObject_t *mlvObject,
                 &displaySettings,
                 reinterpret_cast<unsigned char *>( displayThumb.data() ) ) )
         {
-            const LookAssistStats sampleStats = analyzeLookAssistThumbnail(
+            // Every rendered frame goes to the aggregate: a black (median 0) frame is not read for the exposure, but its
+            // clipped pixels still count against the median-one lift (r4 adversary A1).
+            rendered[renderedCount] = analyzeLookAssistThumbnail(
                 reinterpret_cast<const unsigned char *>( displayThumb.constData() ),
                 width,
                 height );
-            if( sampleStats.median > 0.0 )
-            {
-                medianSamples[valid] = sampleStats.median;
-                p95Samples[valid] = sampleStats.p95;
-                p99Samples[valid] = sampleStats.p99;
-                ++valid;
-            }
+            if( rendered[renderedCount].median > 0.0 ) ++valid;
+            ++renderedCount;
         }
 
         if( totalFrames <= 1 ) break;
@@ -678,15 +674,7 @@ bool ReceiptApplier::lookAssistDisplayMeter(mlvObject_t *mlvObject,
     if( validSamples ) *validSamples = valid;
     if( valid <= 0 ) return false;
 
-    std::sort( medianSamples, medianSamples + valid );
-    std::sort( p95Samples, p95Samples + valid );
-    std::sort( p99Samples, p99Samples + valid );
-    LookAssistStats result;
-    result.median = medianSamples[valid / 2];
-    result.p95 = p95Samples[valid / 2];
-    result.p99 = p99Samples[valid / 2];
-    result.p05 = result.median;
-    *out = result;
+    *out = lookAssistDisplayMeterAggregate( rendered, renderedCount );
     return true;
 }
 
@@ -991,13 +979,8 @@ bool ReceiptApplier::applyHeadlessLookAssist(ReceiptSettings *receipt,
     if( displayStatsValid )
     {
         decisionTrace.displayMeterRan = true;   // batch has no playback, so playback_scale stays NA
-        BatchLogger::out( QStringLiteral(
-            "[BATCH] LOOK_ASSIST display_meter samples=%1 robust_median=%2 robust_p95=%3 robust_p99=%4 frame=%5\n" )
-            .arg( displayMeterSamples )
-            .arg( displayStats.median, 0, 'f', 1 )
-            .arg( displayStats.p95, 0, 'f', 1 )
-            .arg( displayStats.p99, 0, 'f', 1 )
-            .arg( frameIndex ) );
+        BatchLogger::out( QStringLiteral( "[BATCH] LOOK_ASSIST display_meter %1\n" )
+            .arg( lookAssistDisplayMeterLogFields( displayMeterSamples, displayStats, frameIndex ) ) );
     }
 
     LookAssistPreset preset = presetForLookAssistScene(
