@@ -97,9 +97,18 @@ def line_event(line):
     named = TRACE_EVENT.match(line, tag.end())
     return (named.group(1), named.end()) if named else ("", tag.end())
 DUMP_EVENT = "look_assist.apply.picture_dump"
-FIELD = re.compile(r"(?<!\S)([a-z_0-9]+)=(\S*)")
+# EVERY name=value token the line carries, whatever the spelling of the name (upper case, hyphens, anything but "=" and
+# whitespace): the duplicate check runs over all of them BEFORE any consumer looks up the lower-case names it knows, so a
+# repeated "Audit=" or "audit-note=" is as ambiguous as a repeated "audit=" (sol, PR #799 r3 INV-1).
+FIELD = re.compile(r"(?<!\S)([^\s=]+)=(\S*)")
 DIGITS = re.compile(r"[0-9]{1,9}")      # a frame number; never an arbitrarily long digit string
 FINAL_PICTURE_NAME = re.compile(r"^look-assist-final-frame(\d+)\.png$")
+
+
+def has_duplicate_key(pairs):
+    """True when one name is given twice, spelled exactly the same OR the same after case-folding."""
+    names = [key for key, _ in pairs]
+    return len(set(names)) != len(names) or len({key.casefold() for key in names}) != len(names)
 
 
 def open_base(receipt):
@@ -129,7 +138,7 @@ def parse_log_text(text):
         event, start = line_event(line)
         marked = event is not None          # False: no interaction_trace tag (back-compat reading, never owns a dump)
         pairs = FIELD.findall(line[start:])
-        ambiguous = len({key for key, _ in pairs}) != len(pairs)      # a key given twice: no field of the line is trusted
+        ambiguous = has_duplicate_key(pairs)      # a key given twice (in any spelling): no field of the line is trusted
 
         def is_event(name):
             return event == name if marked else bool(EVENT_NAME[name].search(line))
@@ -151,7 +160,7 @@ def parse_log_text(text):
             continue
         if event == DUMP_EVENT:
             fields = dict(pairs)
-            if len(fields) != len(pairs):
+            if has_duplicate_key(pairs):
                 fields["_duplicate_key"] = "1"      # a key given twice is ambiguous, never a binding
             pending_dump = newest_dump = fields
             dump_lines += 1

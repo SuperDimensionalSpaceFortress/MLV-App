@@ -875,6 +875,44 @@ class PictureDumpBindingAdversaryR3(unittest.TestCase):
                 trace_for = lambda sha, flag=flag: AUTO_WB_LINE.replace("valid=1", "valid=" + flag) + dump_line(sha) + result_line()
                 self.assertEqual(0, run_checker([self.bound(trace_for), "--tag", "t"])[0])
 
+    # ---- sol on af63f817 (r3, INV-1): a duplicate whose name the field pattern did not take was omitted before the duplicate check ----
+    def test_p9_a1_a_duplicate_field_of_any_spelling_on_any_event_line_is_ambiguous_and_never_bound(self):
+        def add(line, extra):
+            return line.rstrip("\n") + " " + extra + "\n"
+        spellings = {
+            "Audit=a Audit=b": "Audit=a Audit=b",
+            "audit-note=a audit-note=b": "audit-note=a audit-note=b",
+            "case-folded Audit=a audit=b": "Audit=a audit=b",
+            "case-folded known key Scene=night": "Scene=night",       # only the events that carry scene=
+            "case-folded known key FRAME=7": "FRAME=7",          # only the events that carry frame=
+            "hyphen and case AUDIT-NOTE=a audit-note=b": "AUDIT-NOTE=a audit-note=b",
+        }
+        flows = {
+            "dump": lambda sha, x: (AUTO_WB_LINE + add(dump_line(sha), x) + result_line()),
+            "result": lambda sha, x: (AUTO_WB_LINE + dump_line(sha) + add(result_line(), x)),
+            "auto_wb": lambda sha, x: (add(AUTO_WB_LINE, x) + dump_line(sha) + result_line()),
+            "dispatch": lambda sha, x: (add(DISPATCH_LINE, x) + dump_line(sha) + ASYNC_APPLIED_LINE),
+            "applied": lambda sha, x: (DISPATCH_LINE + dump_line(sha) + add(ASYNC_APPLIED_LINE, x)),
+        }
+        carries = {"Scene=night": ("result", "dispatch"), "FRAME=7": ("dump", "result", "dispatch", "applied")}
+        for spelling, extra in spellings.items():
+            for event, flow in flows.items():
+                if event not in carries.get(extra, flows):
+                    continue
+                root = self.bound(lambda sha, flow=flow, extra=extra: flow(sha, extra))
+                for argv in ([], ["--decisions-only"]):
+                    if event == "dump" and argv:
+                        continue        # decisions-only never reads the dump line
+                    with self.subTest("%s on %s %s" % (spelling, event, argv)):
+                        code, text = run_checker([root, "--tag", "t"] + argv)
+                        self.assertEqual(1, code, text)
+                        self.assertNotIn("picture_dump-bound", text)
+        # controls: distinct names (one hyphenated, one upper-case) are no duplicate and still bind
+        for event, flow in flows.items():
+            with self.subTest("control " + event):
+                code, text = run_checker([self.bound(lambda sha, flow=flow: flow(sha, "Audit=a audit-note=b")), "--tag", "t"])
+                self.assertEqual(0, code, text)
+
     def test_a5_a_corrupt_png_is_exit_2_not_a_crash(self):
         import struct
         import zlib
