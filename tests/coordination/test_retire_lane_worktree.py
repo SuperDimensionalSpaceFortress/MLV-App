@@ -709,7 +709,11 @@ def test_holder_exit_releases_the_worktree_for_real_retirement(repo):
         assert wt.exists()
     finally:
         _stop(p)
-    d, _ = _gate_real(wt, whatif=False)
+    # CI-FLAKE-RETIRE-HOLDER-EXIT-RELEASE-CORPUS-EMPTY-1: with the holder gone this call is about the retirement, not the host. A short-lived process of
+    # another project (measured here: vitest's node.exe, relative script, unreadable cwd, 3 in 20 loops) is a `relative-script-unresolved` row that is
+    # never exempt, so it refused a removal that had nothing to do with the holder. Same narrowing as the retry-window cases (ONLY_PYTEST_CHILDREN).
+    # The call that PROVES the live holder (above) keeps the whole-host snapshot.
+    d, _ = _gate_real(wt, whatif=False, prelude=ONLY_PYTEST_CHILDREN)
     assert (d["action"], d["reason"]) == ("retired", "ok"), d
     assert not wt.exists()
 
