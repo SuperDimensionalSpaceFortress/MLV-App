@@ -182,7 +182,8 @@ function ConvertFrom-VenueProbeHeatLine {
             # PARITY-1: the agent's published thresholds ride in heat.rule; an unusable record is unknown, never read against the defaults
             # assigned, not passed through $(...): a subexpression unwraps a one-element array, which would turn "rule": [ {..} ] into the object inside it
             $ruleRaw = $null
-            if ($h.PSObject.Properties['rule']) { $ruleRaw = $h.rule }
+            # r6 (sol r5 B1, the same class): a rule key that is PRESENT but null was published empty, which is malformed: an empty record (no source), so it is refused. Only an ABSENT key is the defaults
+            if ($h.PSObject.Properties['rule']) { $ruleRaw = $h.rule; if ($null -eq $ruleRaw) { $ruleRaw = [pscustomobject]@{} } }
             $rule = Resolve-VenueHeatRule -Rule $ruleRaw
             if (-not $rule.valid) { return (New-VenueHeatReading -Heat 'unknown' -Throttled $null -Window $null -MeanC $null -Text "$($rule.reason): the agent's published heat thresholds are unusable" -Source 'raw-json' -Rule $rule) }
             $v = $(if ($okT -and $okW) { Get-VenueHeatVerdict -Throttled $thr -MeanC $mean -MaxThrottledRows $rule.maxThrottledRows -MeanMaxC $rule.meanMaxC } else { 'unknown' })

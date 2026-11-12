@@ -1405,7 +1405,9 @@ function Write-TelemetryLines($Probe) {
             # keep working. Nothing published -> nothing printed (the gate says thresholds_source=default); a record the probe could not use -> rule_source=invalid (THERMAL_THRESHOLDS_INVALID).
             # a number, or the numeric text the probe publishes for a double 15 digits cannot carry, is printed round-trip ($rt above), never through [string] (15 significant digits: 80.00000000000001 would
             # print as 80) and never as an identifier token (which would pass a padded text on as it came)
-            $(if ($h.PSObject.Properties['rule'] -and $null -ne $h.rule) {
+            # r6 (sol r5 B1, the same class): a rule key that is present but null is a rule published empty: rule_source=invalid, never nothing (which the gate reads as the defaults)
+            $(if ($h.PSObject.Properties['rule'] -and $null -eq $h.rule) { ' rule_source=invalid' }
+            elseif ($h.PSObject.Properties['rule']) {
                 # r5 (adversary r5 A3): an array is no rule and no number: [string] / ConvertTo-IdentToken scalarized [{..}] and [80] into a rule the gate applied; the gate's structured reader refuses both
                 $rn = { param($x) if ($x -is [array]) { return 'invalid' }; $v = (& $rt $x); if ($null -ne $v) { $v } else { ConvertTo-IdentToken $x } }
                 # r5 (adversary r4 A3): the source must BE the string agent: [string] turned a one-element array ["agent"] into agent

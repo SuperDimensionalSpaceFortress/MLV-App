@@ -2184,6 +2184,12 @@ class AgentThresholdParityR6Tests(unittest.TestCase):
         # the whole probe path: the probe prints rule_source=invalid, so the gate reads unknown / THERMAL_THRESHOLDS_INVALID on the line AND on the raw JSON (sol's repro read clear/default)
         cases += [("chain", b) for b in blanks] + [("chain", "")]
         want += ["unknown/invalid|unknown/invalid|"] * len(blanks) + ["clear/default|clear/default|"]
+        # the same class in the probe JSON: a rule key that is present but null was published empty, so the printer and the raw reader both refuse it (they read it as the defaults);
+        # an absent key is the defaults
+        heat = '{"source": "x", "sample_age_s": 1.0, "hottest_core_c": 50.0, "max15_c": 60.0, "mean_c": 82.0, "mean_c_exact": 82.0, "throttled": 4, "window_rows": 60, "package_w": 10.0, "reasons": {}%s}'
+        probe = '{"telemetry_schema": "mlv-app/venue-quiet-probe-telemetry/v1", "heat": %s, "gpu": {"state": "absent"}, "last_lease": {"event": "none"}}'
+        cases += [("probejson", probe % (heat % ', "rule": null')), ("probejson", probe % (heat % ""))]
+        want += ["unknown/invalid|unknown/invalid|", "clear/default|clear/default|"]
         self.check(cases, want)
 
     # ---- B2: a fractional count is refused before any rounding, in the gate, the probe's reader and the tele line
