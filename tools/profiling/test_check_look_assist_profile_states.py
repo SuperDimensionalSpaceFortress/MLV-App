@@ -516,7 +516,7 @@ class PictureDumpBindingAdversaryR1(unittest.TestCase):
                 code, text = run_checker([root, "--tag", "t"])
                 self.assertEqual(1, code, text)
                 # a key given twice is rejected as "no complete apply" before the binding is reached (r2 A3)
-                self.assertRegex(text, "STALE|no complete Look Assist apply")
+                self.assertRegex(text, "STALE|no complete Look Assist apply|evidence is defective")
         # an async application owns its dump the same way
         root = self.bound(lambda sha: DISPATCH_LINE + dump_line(sha) + ASYNC_APPLIED_LINE.replace("frame=0", "frame=-1"))
         self.assertEqual(1, run_checker([root, "--tag", "t"])[0])
@@ -607,7 +607,7 @@ class PictureDumpBindingAdversaryR2(unittest.TestCase):
         self.assertEqual(1, code, text)
         # r5: the result's frame is validated when the line is read (every mode), so a huge frame is a malformed result
         # (no complete apply) before the binding is reached; either way the arm is refused and nothing binds.
-        self.assertRegex(text, "STALE|no complete Look Assist apply")
+        self.assertRegex(text, "STALE|no complete Look Assist apply|evidence is defective")
         self.assertNotIn("picture_dump-bound", text)
 
 
@@ -1257,6 +1257,33 @@ class TableDrivenFieldGrammar(unittest.TestCase):
         code, text = run_checker([self.evidence([auto_wb, stale, result, auto_wb, dump % "keep", result]), "--tag", "t", "--decisions-only"])
         self.assertEqual(1, code, text)
         self.assertEqual(0, run_checker([self.evidence([auto_wb, dump % "keep", result]), "--tag", "t", "--decisions-only"])[0])
+
+    def test_adversary_20fddf3e_a1_a_malformed_line_is_a_defect_of_the_arm_that_a_later_valid_application_does_not_erase(self):
+        for event, table in FIELD_TYPES.items():
+            for key, type_name in table.items():
+                for bad in BAD_VALUES[type_name][:2]:
+                    lines = self.flow(event, key, bad) + self.flow(event)      # the ill-typed application, then a fully valid one
+                    root = self.evidence(lines)
+                    for argv in ([], ["--decisions-only"]):
+                        with self.subTest("%s %s=%r then a valid application %s" % (event, key, bad[:12], argv)):
+                            code, text = run_checker([root, "--tag", "t"] + argv)
+                            self.assertEqual(1, code, text)
+                            self.assertNotIn("picture_dump-bound", text)
+                            self.assertNotIn("PASS", text)
+        # the same for a key given twice on one line (any spelling), and the control: the valid applications alone bind
+        names = {"auto_wb": ".auto_wb ", "result": ".result ", "dispatch": ".async_dispatch ", "applied": ".auto_wb_async_applied ",
+                 "dump": ".picture_dump "}
+        for event in FIELD_TYPES:
+            doubled = [line + " Audit=a audit=b" if names[event] in line.split(" ", 1)[0] + " " else line for line in self.flow(event)]
+            self.assertNotEqual(doubled, self.flow(event))
+            for argv in ([], ["--decisions-only"]):
+                with self.subTest("%s given a key twice, then a valid application %s" % (event, argv)):
+                    code, text = run_checker([self.evidence(doubled + self.flow(event)), "--tag", "t"] + argv)
+                    self.assertEqual(1, code, text)
+                    self.assertNotIn("PASS", text)
+        for event in FIELD_TYPES:
+            with self.subTest("control: two valid applications " + event):
+                self.assertEqual(0, run_checker([self.evidence(self.flow(event) + self.flow(event)), "--tag", "t"])[0])
 
     def test_adversary_0e450da2_a2_a_serial_above_the_unsigned_64_bit_maximum_is_malformed(self):
         for key, bad in (("last_serial", "18446744073709551616"), ("next_serial", "99999999999999999999")):

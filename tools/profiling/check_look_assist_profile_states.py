@@ -135,6 +135,17 @@ DUMP_FIELDS = {"pre_safety": "pre_safety_png|none", "pre_safety_sha256": "sha256
                "final": "final_png|none", "final_sha256": "sha256|none", "final_exposure": "int", "safety": "safety", "frame": "uint"}
 
 
+EVENT_TABLES = {AUTO_WB_EVENT: AUTO_WB_FIELDS, RESULT_EVENT: RESULT_FIELDS, ASYNC_DISPATCH_EVENT: DISPATCH_FIELDS,
+                ASYNC_APPLIED_EVENT: APPLIED_FIELDS}
+
+
+def defect_text(event, ambiguous, bad):
+    """Why one line of `event` makes the whole arm's evidence defective."""
+    if ambiguous:
+        return "a %s line gives a key twice (in any spelling)" % event
+    return "a %s line has a field that is not the type the app prints (%s)" % (event, ",".join(bad))
+
+
 TYPE_MAX = {"uint64": 2 ** 64 - 1}        # the digit bound alone does not bound the value: 20 digits run past a qulonglong
 
 
@@ -212,7 +223,7 @@ def parse_log_text(text):
     pending_dump = None      # the picture_dump line the NEXT result will own (it precedes its own result line)
     newest_dump = None       # the newest picture_dump line anywhere in the log
     dump_lines = 0
-    dump_defect = None       # the first picture_dump line that is ambiguous or ill-typed, anywhere in the arm's log
+    arm_defect = None        # the first line of any table event (or picture_dump) that is ambiguous or ill-typed, anywhere in the log
     for line in text.splitlines():
         event, start = line_event(line)
         marked = event is not None          # False: no interaction_trace tag (back-compat reading, never owns a dump)
@@ -230,6 +241,12 @@ def parse_log_text(text):
             value = once(key)
             return int(value) if value is not None and INT_FIELD.fullmatch(value) else None
 
+        for table_event, table in EVENT_TABLES.items():
+            # An ambiguous or ill-typed line of ANY event of the table is a defect of the ARM, not of one application: a later
+            # complete application does not erase it (adversary pass 20fddf3e A1: a malformed auto_wb / result / dispatch /
+            # applied line followed by a valid application passed in both modes). Like a skip, nothing after it clears it.
+            if is_event(table_event) and (ambiguous or bad_fields(table, pairs)):
+                arm_defect = arm_defect or defect_text(table_event, ambiguous, bad_fields(table, pairs))
         if is_event(SAFETY_FALLBACK_EVENT):
             receipt = {"safety_fallback": True}
             pending_dump = None
@@ -247,8 +264,7 @@ def parse_log_text(text):
             if bad or ambiguous:
                 # ...and the arm's evidence is defective in EVERY mode: --decisions-only never binds a picture, but it does not get
                 # to ignore a dump line the app logged that is ambiguous or not what the app prints (adversary pass 0e450da2 A1).
-                dump_defect = dump_defect or ("a picture_dump line gives a key twice" if ambiguous
-                                              else "a picture_dump line has a field that is not the type the app prints (%s)" % ",".join(bad))
+                arm_defect = arm_defect or defect_text(DUMP_EVENT, ambiguous, bad)
             pending_dump = newest_dump = fields
             dump_lines += 1
             continue
@@ -320,8 +336,8 @@ def parse_log_text(text):
                 receipt["picture_dump"], pending_dump = None, None
     if skipped:
         receipt = dict(receipt or {}, skipped=skipped)
-    if dump_defect:
-        receipt = dict(receipt or {}, dump_defect=dump_defect)      # arm-level, like a skip: no later event clears it
+    if arm_defect:
+        receipt = dict(receipt or {}, arm_defect=arm_defect)      # arm-level, like a skip: no later event clears it
     if receipt is not None and dump_lines:
         # Only the NEWEST picture_dump line can bind the final PNG now on disk, and only when it belongs to the LAST
         # application. receipt["picture_dump"] is None when the last application owns no dump line.
@@ -357,8 +373,8 @@ def check_receipt(name, receipt, require_daylight=False):
         return ["%s: the last application ended in a safety fallback (an earlier accepted receipt is not the shipped picture)" % name]
     if receipt and receipt.get("skipped"):
         return ["%s: the last application was skipped (%s)" % (name, receipt["skipped"])]
-    if receipt and receipt.get("dump_defect"):
-        return ["%s: the arm's evidence is defective: %s" % (name, receipt["dump_defect"])]
+    if receipt and receipt.get("arm_defect"):
+        return ["%s: the arm's evidence is defective: %s" % (name, receipt["arm_defect"])]
     if not receipt or not all(k in receipt for k in ("scene", "source", "decision", "temperature", "tint", "exposure")):
         return ["%s: no complete Look Assist apply in the trace (did the run settle?): %r" % (name, receipt)]
     if receipt["source"] in sidecars.FORBIDDEN_WB_SOURCES:
