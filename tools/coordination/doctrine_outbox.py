@@ -651,7 +651,7 @@ def parse_item(text: str) -> dict:
     if not body.strip():
         raise Refusal("ITEM_EMPTY_BODY")
     if meta["target"] == CARDS_TARGET:
-        if not CARD_HEADING_RE.match(body.lstrip().splitlines()[0].rstrip()):
+        if not CARD_HEADING_RE.match(card_heading_row(body)):
             raise Refusal("ITEM_BODY_NOT_A_CARD", f"body must start with a '## {PROJECT}/<id>' card heading "
                                                   f"(R14.1; format in the bus's {CARD_VALIDATOR_REL})")
     elif not body.lstrip().startswith("### "):
@@ -828,6 +828,24 @@ _QUOTED_KEY_RE = re.compile(r"(?<![`\\\w])(`+)(?!`)[^\s`]*(?:" + _FIELD_KEY_ALT 
 _QUOTE_MASK = "\x00"
 
 
+def _card_rows(body: str) -> list[str]:
+    """The body's rows as the bus validator splits them: "\\n" only (CRLF read as LF), with the blank rows before the heading
+    dropped. A blank row is one JS trim() empties; whitespace ON the heading row is kept, because the bus reads `## ` only at
+    the start of its line and rejects `  ## x` as card-like text outside a card."""
+    rows = body.replace("\r\n", "\n").split("\n")
+    while rows and not rows[0].strip(_JS_WS_CHARS):
+        rows.pop(0)
+    return rows
+
+
+def card_heading_row(body: str) -> str:
+    """The card's heading row as the bus validator reads it: the whole first row (_card_rows), JS-trimmed at the end, never the
+    str.splitlines() prefix. `## <project>/<id><U+0085>check: y` is ONE row to the bus, a heading that is not `## <project>/<id>`;
+    reading only the prefix passed it and hid the fused key in the row the field-key screen skips (Sol r2 B1)."""
+    rows = _card_rows(body)
+    return rows[0].rstrip(_JS_WS_CHARS) if rows else ""
+
+
 def _bold_label_fold(label: str) -> tuple[str, str | None]:
     """A bold label as the bus validator folds it (trim, lower-case, whitespace runs to one space) and the field it names, or None."""
     folded = re.sub(f"{_JS_WS}+", " ", label.strip(_JS_WS_CHARS).lower())
@@ -871,7 +889,7 @@ def screen_card_field_keys(body: str) -> None:
     quoted token (_QUOTED_KEY_RE) is masked first (_QUOTE_MASK, same width, so the reported column holds). Lines split on "\\n" only (CRLF
     read as LF), as the bus validator splits them: str.splitlines() also breaks on \\x85, U+2028 and friends, which turned
     `x<U+0085>applies: y` into a fictitious line that opens with its own field."""
-    rows = body.lstrip().replace("\r\n", "\n").split("\n")
+    rows = _card_rows(body)
     for n, row in enumerate(rows[1:], start=2):
         parsed = _parse_field_line(row)
         start = parsed[2] if parsed and parsed[1] else 0

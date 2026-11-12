@@ -3526,3 +3526,45 @@ def test_drain_kernel_filing_shares_the_strict_ledger_read(tmp_path):
     with pytest.raises(ob.Unknown) as excinfo:
         ob.drain_kernel_filing(src, clone, "HEAD", ledger, [], push=False)
     assert excinfo.value.code == "sent-ledger-unreadable"
+
+
+# ---------- the card heading is the whole LF-delimited first line, read as the bus validator reads it (r3 B1) ----------
+#
+# Sol r2 B1: parse_item read the heading with str.splitlines()[0] and rstrip(), and screen_card_field_keys skipped its whole first
+# LF row, so `## mlv-app/example-card<U+0085>check: x` passed both: the heading was only the prefix before the separator and the
+# fused key rode in the skipped row. The bus splits on "\n" only and trims with JS trim(), so it reads that whole row as the heading
+# and rejects it. The heading row is now judged exactly as the bus judges it.
+#
+# Named mutation for this block (turns the named tests red, then is reverted):
+#   M23 read the heading with splitlines()[0].rstrip() again   -> the separator rows and the trailing-whitespace parity rows
+
+_HEADING_SEPARATORS = ["\x85", "\x0b", "\x0c", "\x1c", "\u2028", "\u2029"]
+
+
+def _heading_fused_card(sep: str, key: str) -> str:
+    return CARD_BODY.replace("## mlv-app/example-card\n", f"## mlv-app/example-card{sep}{key}: fused-heading-key\n", 1)
+
+
+@pytest.mark.parametrize("sep", _HEADING_SEPARATORS)
+@pytest.mark.parametrize("key", ob.CARD_FIELDS)
+def test_validate_refuses_a_field_key_fused_into_the_heading_row_after_a_non_lf_separator(tmp_path, capsys, sep, key):
+    body = _heading_fused_card(sep, key)
+    assert ob.main(["--repo", str(tmp_path), "validate", str(_write_card_item(tmp_path, body))]) == 1
+    assert "ITEM_BODY_NOT_A_CARD" in capsys.readouterr().err
+
+
+@needs_node
+def test_every_heading_row_the_bus_rejects_is_refused_and_every_one_it_accepts_is_accepted(tmp_path):
+    """The bus is the oracle: a heading row that carries a separator, trailing whitespace or a leading oddity is judged by the
+    vendored parseCardsFile and by validate on the same card, and the two agree."""
+    heads = ["## mlv-app/example-card" + s + t for s in _HEADING_SEPARATORS + _WS_PROBES + [""] for t in ("", "check: x")]
+    heads += [w + "## mlv-app/example-card" for w in _WS_PROBES]
+    cards = [CARD_BODY.replace("## mlv-app/example-card", h, 1) for h in heads]
+    js = _node(_JS_CARD_ERRORS, cards)
+    bad = []
+    for n, (head, card, errors) in enumerate(zip(heads, cards, js)):
+        item = _write_card_item(tmp_path, card, f"20261009-head{n}.md")
+        py_ok = ob.main(["--repo", str(tmp_path), "validate", str(item)]) == 0
+        if py_ok != (not errors):
+            bad.append(f"{head!r}: bus_ok={not errors} validate_ok={py_ok} {errors[:1]}")
+    assert not bad, "\n".join(bad)
