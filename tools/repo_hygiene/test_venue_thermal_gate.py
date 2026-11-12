@@ -2277,6 +2277,16 @@ class AgentHeavySlotFeedForwardTests(unittest.TestCase):
     def quote(text: str) -> str:
         return "'" + text.replace("'", "''") + "'"
 
+    def long_temp_dir(self, prefix: str) -> Path:
+        """A fresh temp dir spelled by its LONG name. A hosted Windows runner's TEMP is C:\\Users\\RUNNER~1\\...; the agent's GetFullPath (and the cwd it is handed) yields the long spelling of the
+        same directory, so a fixture path kept in the short spelling would differ from the agent's output as TEXT only. os.path.realpath resolves the 8.3 segments (the same fix as
+        test_attr3_footage_stage). The assertions still compare exact strings: a job handed the default csv, or a path that resolves elsewhere, still fails them."""
+        import os
+        import tempfile
+        tmp = tempfile.TemporaryDirectory(prefix=prefix)
+        self.addCleanup(tmp.cleanup)
+        return Path(os.path.realpath(tmp.name))
+
     def job_env(self, feed: str, *, agent_env_feed: str | None, tail: str, cwd: str | None = None) -> str:
         """Run the agent's job-env block with $HeavySlotFeed = feed (the agent's own process env holding agent_env_feed as HEAVY_SLOT_FEED, or none, and its current directory `cwd`), then a child
         standing for the job runs `tail`."""
@@ -2303,8 +2313,7 @@ class AgentHeavySlotFeedForwardTests(unittest.TestCase):
         self.assertEqual(self.job_env(self.DEFAULT_FEED, agent_env_feed=None, tail=tail), self.DEFAULT_FEED)
 
     def test_the_card_repro_the_gate_reads_the_agents_hot_feed_never_the_default(self) -> None:
-        import tempfile
-        d = Path(tempfile.mkdtemp(prefix="feed-forward-"))
+        d = self.long_temp_dir("feed-forward-")
         hot = d / "hot.csv"
         hot.write_text("\n".join(["Date,Time,Tick,PackageC,PackageW,CoreThrottling,RingThrottling"]
                                  + [f"10/24/2026,08:00:{i:02d},{i},90.0,40.0,No,No" for i in range(15)]) + "\n", encoding="utf-8")   # 15 rows at 90 C: hot under the default rule (mean >= 88)
@@ -2320,8 +2329,7 @@ class AgentHeavySlotFeedForwardTests(unittest.TestCase):
     def test_a_relative_feed_is_forwarded_as_the_file_the_agent_reads_never_as_a_path_the_job_resolves_elsewhere(self) -> None:
         # adversary r1 A1 (introduced major): the agent opens a relative -HeavySlotFeed under ITS current directory; the job (and the slot holder) start in $Root, so the raw text would name another
         # file (or none) there. The job gets the absolute path the agent itself reads.
-        import tempfile
-        d = Path(tempfile.mkdtemp(prefix="feed-forward-rel-"))
+        d = self.long_temp_dir("feed-forward-rel-")
         tail = "[Console]::Out.Write([string]$env:HEAVY_SLOT_FEED)"
         self.assertEqual(self.job_env("hot.csv", agent_env_feed=None, tail=tail, cwd=str(d)), str(d / "hot.csv"))
         # an inherited absolute HEAVY_SLOT_FEED does not matter: the effective (relative) param wins in the agent, and it is the absolute form of THAT that the job gets
