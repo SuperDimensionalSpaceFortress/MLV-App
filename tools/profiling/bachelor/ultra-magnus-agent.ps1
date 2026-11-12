@@ -58,6 +58,9 @@ param(
     [int]$GateSustainedRows = 60,
     [ValidateRange(0, 150)]
     [int]$GateMaxThrottledRows = 6,
+    # PARITY-1 r3 (adversary r2 A2): refused at the source what the lease-batch gate refuses (VenueThermalGate.psm1 Resolve-VenueHeatRule: finite and not negative), so the rule this agent
+    # PUBLISHES is always a rule the gate can apply. A negative bound made every reading hot here and 'unknown' there; NaN and +Infinity cannot be published as a number at all.
+    [ValidateRange(0.0, 1.7976931348623157E+308)]
     [double]$GateMeanMaxC = 88,
     [ValidateRange(10, 3600)]
     [int]$GateFeedStaleSec = 120,
@@ -1397,8 +1400,8 @@ function Test-LaunchOutFile {
 }
 
 function Invoke-QueueExpiredJob {
-    # -Admission: the record of a job that expired once admitted (with its leaseRelease); the result carries it. Without it (expired
-    # before or inside the gate) the result's shape is unchanged.
+    # -Admission: the record of a job that expired once an admission record existed (inside the gate, or after it, with its leaseRelease); the result carries it, heatRule included.
+    # Without it (expired before the gate, so no admission record exists) the result's shape is unchanged.
     param(
         [Parameter(Mandatory = $true)]$Job,
         [Parameter(Mandatory = $true)]$Metadata,
@@ -2619,6 +2622,43 @@ function Get-SustainedHeatVerdict {
         return [pscustomobject]@{ state = "hot"; why = "sustained heat: $s (blocks at > $GateMaxThrottledRows throttled or mean >= $GateMeanMaxC C)" }
     }
     return [pscustomobject]@{ state = "clear"; why = $s }
+}
+
+function Get-AgentHeatRule {
+    # BACHELOR-THERMAL-GATE-AGENT-THRESHOLD-PARITY-1. Pure. The heat rule THIS agent runs with, from the very params Get-SustainedHeatVerdict and ConvertFrom-HeavySlotFeedRows
+    # read, so a gate that reads it decides exactly as the agent does. Published on every admission record (admission.heatRule) and to every job as $env:MLV_AGENT_HEAT_RULE (JSON); the
+    # venue's quiet probe copies it into its heat{} block and the lease-batch thermal gate (VenueThermalGate.psm1 Resolve-VenueHeatRule) validates and applies it. A non-finite double
+    # (a GateMeanMaxC of NaN) is published as its name, since a JSON number cannot carry it: the gate then refuses the record. The values are the agent's constants (the same for
+    # every job), so the env var is overwritten per job and never needs clearing.
+    # PARITY-1 r4 (adversary r3 A1): Windows PowerShell 5.1 writes a [double] into JSON with 15 significant digits (or through 'R', which on .NET Framework misses the round trip for some values), so a
+    # threshold that needs every digit would reach the gate as a neighbouring double. A finite double that G15 does not give back bit-identical is therefore published as the shortest of its G16 / G17
+    # text that does (the readers parse numeric text invariant); every other double stays a JSON number. Inline, so this function stays liftable on its own.
+    # PARITY-1 r5 (adversary r4 A1, hub ruling EXACT BITS): that self-check parses in THIS shell, and Windows PowerShell 5.1's parser is not correctly rounded (the G15 text 79.3224899793614 of bits
+    # 4635282240941762887 parses back to ...887 there, to ...886 everywhere else), so meanMaxC is now the HUMAN field only, for people and for a reader that predates the bits. The rule's value is
+    # meanMaxCBits: the double's IEEE-754 bits as a JSON integer ([BitConverter]::DoubleToInt64Bits, exact on every shell; both shells' ConvertFrom-Json read it back as an exact Int32 / Int64).
+    # Every reader that finds it decodes it with Int64BitsToDouble and ignores meanMaxC, so no [double] parse in any shell is on the decision path. Bits of a non-finite double are published as
+    # they are; the readers refuse them (THERMAL_THRESHOLDS_INVALID). The three counts are [int] and travel exactly as JSON integers, so they carry no bits.
+    $mean = [double]$GateMeanMaxC
+    $inv = [System.Globalization.CultureInfo]::InvariantCulture
+    $meanOut = $mean
+    if ([double]::IsNaN($mean) -or [double]::IsInfinity($mean)) { $meanOut = [string]$mean }
+    else {
+        # TryParse, not Parse: on .NET Framework the G15 / G16 text of [double]::MaxValue is past the largest double and Parse throws, which only means "does not round trip"
+        $ns = [System.Globalization.NumberStyles]::Float
+        $back = 0.0
+        if (-not ([double]::TryParse($mean.ToString("G15", $inv), $ns, $inv, [ref]$back) -and $back -ceq $mean)) {
+            $meanOut = $mean.ToString("G17", $inv)
+            $g16 = $mean.ToString("G16", $inv)
+            if ([double]::TryParse($g16, $ns, $inv, [ref]$back) -and $back -ceq $mean) { $meanOut = $g16 }
+        }
+    }
+    return [ordered]@{
+        maxThrottledRows = [int]$GateMaxThrottledRows
+        meanMaxC         = $meanOut
+        meanMaxCBits     = [BitConverter]::DoubleToInt64Bits($mean)
+        sustainedRows    = [int]$GateSustainedRows
+        feedStaleSec     = [int]$GateFeedStaleSec
+    }
 }
 
 function Get-HeavySlotOccupancy {
@@ -4254,8 +4294,13 @@ function Invoke-QueuedJob {
         else { $script:Admission = Wait-HeavySlotAdmission -JobId $jobId -Job $Job -Metadata $metadata }
         Add-HeavySlotHolderLossToAdmission -JobId $jobId -Admission $script:Admission
     }
+    # PARITY-1 r3 (adversary r2 A4): the heat rule this agent runs with goes on the admission RECORD as soon as there is one, so the early exits below (queue-expired, cancelled, not-after) publish
+    # it too. The job env (the quiet probe copies it for the lease-batch thermal gate) is still set only for a job that launches, after them.
+    $heatRule = Get-AgentHeatRule
+    $script:Admission | Add-Member -NotePropertyName heatRule -NotePropertyValue $heatRule -Force
     if ($script:Admission.label -eq "queue-expired") {
-        Invoke-QueueExpiredJob -Job $Job -Metadata $metadata -QueueAgeSec ([int]$script:Admission.queueAgeSec)
+        # PARITY-1 r4 (adversary r3 A2): the in-gate expiry has an admission record (label queue-expired, with the heat rule on it), so the result carries it like every later exit
+        Invoke-QueueExpiredJob -Job $Job -Metadata $metadata -QueueAgeSec ([int]$script:Admission.queueAgeSec) -Admission $script:Admission
         Complete-AdmissionWaitMarker -JobId $jobId -Status "queue-expired"
         return
     }
@@ -4337,6 +4382,8 @@ function Invoke-QueuedJob {
         Complete-AdmissionWaitMarker -JobId $jobId -Status "queue-expired"
         return
     }
+    # PARITY-1: the heat rule in the job's env ($heatRule was put on the admission record above, before any early exit)
+    $env:MLV_AGENT_HEAT_RULE = ($heatRule | ConvertTo-Json -Compress)
     $env:MLV_AGENT_ADMISSION = $script:Admission.label
     $env:MLV_AGENT_ADMISSION_THERMAL = [string]$script:Admission.thermal
     $env:MLV_AGENT_ADMISSION_WAIT_SEC = [string]$script:Admission.waitedSec

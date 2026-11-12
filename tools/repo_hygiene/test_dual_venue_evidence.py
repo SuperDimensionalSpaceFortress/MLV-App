@@ -13602,8 +13602,12 @@ class VenueProbeScriptCheckR6Tests(IdentityProbeMixin, unittest.TestCase):
         self.assertRegex(rest, r"Invoke-IdentBounded \$IdentScriptCheckScript @\([^)]*\) \$IdentityCallMs", "and only through the bounded call, under the call deadline")
         self.assertRegex(body, r"(?m)^\$IdentityScriptCheckDelayMs = 0$", "the seam is 0 in production")
         # VENUE-PROBE-HEAT-GPU-TELEMETRY-1: HEAVY_SLOT_FEED is the agent's own feed override, read on the ONE line that picks the heat feed path; it reaches no seam
-        self.assertEqual(sorted(set(re.findall(r"\$env:(\w+)", code))), ["COMPUTERNAME", "HEAVY_SLOT_FEED"], "no other environment variable can reach the probe, so none can set the seam")
+        # BACHELOR-THERMAL-GATE-AGENT-THRESHOLD-PARITY-1 r3: MLV_AGENT_HEAT_RULE is the agent's published heat rule (data that Read-TelAgentHeatRule parses to numbers). Reading it is a
+        # process-environment read, not I/O, and it reaches no seam, so it joins HEAVY_SLOT_FEED here, each pinned to the ONE line that reads it. It cannot move into a worker body: the
+        # rule must be known before the feed is read.
+        self.assertEqual(sorted(set(re.findall(r"\$env:(\w+)", code))), ["COMPUTERNAME", "HEAVY_SLOT_FEED", "MLV_AGENT_HEAT_RULE"], "no other environment variable can reach the probe, so none can set the seam")
         self.assertEqual([ln.strip() for ln in code.splitlines() if "$env:HEAVY_SLOT_FEED" in ln], [TEL_FEED_LINE])
+        self.assertEqual([ln.strip() for ln in code.splitlines() if "$env:MLV_AGENT_HEAT_RULE" in ln], [TEL_AGENT_RULE_LINE])
 
     def test_script_check_is_printed_on_the_top_attr_and_ident_lines_of_a_row_that_carries_it(self) -> None:
         block = dict(IDENT_BLOCK, processes=[dict(IDENT_ROW, script_check="ok"), dict(IDENT_GPU_ROW, script_check="rejected"), dict(IDENT_DENIED_ROW, script_check=None), IDENT_MISMATCH_ROW])
@@ -13763,6 +13767,7 @@ ConvertTo-Json -InputObject @($out) -Compress"""
 # The real probe job runs against a canned feed file, canned Get-PnpDevice / Get-PnpDeviceProperty / nvidia-smi shadows in the telemetry worker, and a canned agent.log.
 TEL_SCHEMA = "mlv-app/venue-quiet-probe-telemetry/v1"
 TEL_FEED_LINE = r"$HeatFeedPath = $(if ($env:HEAVY_SLOT_FEED) { $env:HEAVY_SLOT_FEED } else { 'C:\temp\hwinfo-log-adapter.csv' })"
+TEL_AGENT_RULE_LINE = r"$AgentHeatRule = Read-TelAgentHeatRule -Json ([string]$env:MLV_AGENT_HEAT_RULE) -DefaultRows $HeatWindowRows -DefaultStaleSec $HeatStaleSec"   # BACHELOR-THERMAL-GATE-AGENT-THRESHOLD-PARITY-1 r3
 TEL_HEAT_FIELDS = ("sample_age_s", "hottest_core_c", "max15_c", "mean_c", "throttled", "window_rows", "package_w")
 TEL_GPU_FIELDS = ("utilization_percent", "temp_c", "power_w", "pstate")
 TEL_VM_ADAPTER = r"PCI\VEN_15AD&DEV_0405&SUBSYS_040515AD&REV_00\3&18D45AA6&0&78"

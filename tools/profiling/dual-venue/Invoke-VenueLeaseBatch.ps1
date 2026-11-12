@@ -1555,6 +1555,7 @@ function Invoke-QuietProbe([string]$Name, [string]$Phase, [int]$MaxWaitSec, $The
     # item 10: the probe's own reading of the agent's heavy-slot feed (its "tele heat" line): the reading the thermal gate polls
     $ht = ConvertFrom-VenueProbeHeatLine -Lines $lines
     [pscustomobject]@{ verdict = $verdict; code = $code; mean = $mean; reason = $reason; foreignFloor = [bool]$ff; foreignFloorLine = [string]$ff; heat = $ht.heat; heatText = $ht.text
+        thresholdsSource = $ht.thresholdsSource; heatReason = $ht.reason
         endTs = $endTs; endUtc = $endUtc; maxWaitSec = $wait }
 }
 
@@ -2390,6 +2391,10 @@ while ($pending.Count -gt 0 -and $null -eq $stopReason) {
                 if ($detail) { $row['outcomeDetail'] = $detail }
                 # item 10: the thermal gate's receipt per leg: how long it waited for heat, the first and the launch reading, and the agent's own at grant
                 $row['thermalWaitSec'] = $th.doneWaitSec; $row['thermalWaitOvershootSec'] = $th.doneOvershootSec; $row['thermalSkips'] = $th.skips; $row['heatAtProbe'] = $th.firstHeat; $row['heatAtProbeText'] = $th.firstHeatText; $row['heatAtLaunch'] = $q.heat
+                # BACHELOR-THERMAL-GATE-AGENT-THRESHOLD-PARITY-1: where the gate's thresholds came from at the launch probe: 'agent' (the running agent's published rule), 'default' (nothing
+                # published: an agent that predates it) or 'invalid' (published but unusable: heat is unknown, heatReasonAtLaunch is THERMAL_THRESHOLDS_INVALID)
+                $row['thresholds_source'] = $(if ($q.PSObject.Properties['thresholdsSource'] -and $q.thresholdsSource) { [string]$q.thresholdsSource } else { 'default' })
+                if ($q.PSObject.Properties['heatReason'] -and $q.heatReason) { $row['heatReasonAtLaunch'] = [string]$q.heatReason }
                 $row['heatAtGrant'] = $(if ($null -ne $ja -and $ja.PSObject.Properties['heat'] -and $ja.heat) { [string]$ja.heat } else { 'unknown' })
                 if ($agentStop) { $row['leaseStop'] = $agentStop }
                 if ($withdraw) { $row['withdraw'] = $withdraw }

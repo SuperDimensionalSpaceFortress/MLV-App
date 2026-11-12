@@ -1926,7 +1926,9 @@ function Exit-HeavySlot {
         'lease-start-post-start-cleanup-throws')
     if (@($qjCases | Where-Object { Test-Case $_ }).Count -gt 0) {
         # STAGE-JOB-LEASE-EXEMPT-1 r2: Invoke-QueuedJob classifies the job through Get-GateExemptClass, which reads both patterns.
-        foreach ($name in @('Invoke-QueuedJob', 'Complete-AdmissionWaitMarker', 'Publish-GateUnlaunchedResult', 'Get-GateExemptClass')) { . ([scriptblock]::Create((Get-FunctionBody $name))) }
+        foreach ($name in @('Invoke-QueuedJob', 'Complete-AdmissionWaitMarker', 'Publish-GateUnlaunchedResult', 'Get-GateExemptClass', 'Get-AgentHeatRule')) { . ([scriptblock]::Create((Get-FunctionBody $name))) }
+        # BACHELOR-THERMAL-GATE-AGENT-THRESHOLD-PARITY-1 r2: Invoke-QueuedJob publishes Get-AgentHeatRule, which reads the agent's own heat params.
+        $GateSustainedRows = [int]$paramDefaults['GateSustainedRows']; $GateMaxThrottledRows = [int]$paramDefaults['GateMaxThrottledRows']; $GateMeanMaxC = [double]$paramDefaults['GateMeanMaxC']; $GateFeedStaleSec = [int]$paramDefaults['GateFeedStaleSec']
         . ([scriptblock]::Create(((Get-FunctionBody 'Get-JobMetadata') -replace '^function Get-JobMetadata', 'function Get-JobMetadataReal')))
         # QUIET-LEASE-EXIT-RELEASE-EVIDENCE-1: the REAL queue-expired publisher and holder-loss recorder run under counting wrappers,
         # so a case reads the published result and the kept holder-lost event, not a stub's copy.
