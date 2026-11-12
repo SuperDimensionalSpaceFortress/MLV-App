@@ -9599,7 +9599,7 @@ class VisualExposureFloorTests(unittest.TestCase):
         self.assertEqual((under["nearBlackFraction"], under["clippedFraction"]), (0.5, 0.5), under)
 
     # r3 (sol r2 B1, fable N1): the runner runs under $ErrorActionPreference = 'Stop', so a probe that throws before the guard ended the leg (RUNNER_ERROR)
-    NUL_BAND_PATH = "('C:\\absent-dir\\band' + [char]0 + '.json')"   # Test-Path -LiteralPath throws ArgumentException on an embedded NUL, on every OS
+    NUL_BAND_PATH = "('C:\\absent-dir\\band' + [char]0 + '.json')"   # Test-Path -LiteralPath throws ArgumentException on an embedded NUL on WINDOWS only: pwsh on Linux returns False for it (r4)
 
     @contextlib.contextmanager
     def unreadable_band_file(self):
@@ -9616,15 +9616,27 @@ class VisualExposureFloorTests(unittest.TestCase):
                 subprocess.run(["icacls", str(path), "/remove:d", user], capture_output=True, text=True)
 
     def test_the_visual_exposure_band_probe_that_throws_under_stop_is_the_reported_fallback(self) -> None:
-        # sol r2 B1: the existence probe sat outside the guard, so a path it throws on ended the call (and the measured leg) instead of the reported fallback
-        proc, out = run_pwsh_json("$ErrorActionPreference = 'Stop'; $r = Get-DvExposureBand -ClipId 'c' -Path " + self.NUL_BAND_PATH + "; "
-                                  "$r | ConvertTo-Json -Depth 4 -Compress")
+        # sol r2 B1: the existence probe sat outside the guard, so a path it throws on ended the call (and the measured leg) instead of the reported fallback.
+        # r4: the throw is injected (a function named Test-Path in the caller's scope answers the probe by throwing a chosen exception), so the row behaves the same
+        # on ubuntu, where a real embedded NUL does not throw from Test-Path (it reads False, so the reader said fallback-missing)
+        proc, out = run_pwsh_json("$ErrorActionPreference = 'Stop'; function Test-Path { throw [System.ArgumentException]::new('injected probe failure') }; "
+                                  "$r = Get-DvExposureBand -ClipId 'c' -Path 'any-band-file.json'; $r | ConvertTo-Json -Depth 4 -Compress")
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         self.assertIsNotNone(out, "Get-DvExposureBand returned nothing under Stop: " + proc.stdout + proc.stderr)
         self.assertEqual(out["source"], "fallback-unreadable", out)
         self.assertEqual((out["band"]["minMedianLuma"], out["band"]["maxNearBlackFraction"]), (16, 0.6), out)
         self.assertIn("cannot be read", out["note"])
         self.assertIn("ArgumentException", out["note"], "the note names what failed")
+
+    @requires_windows_pwsh
+    def test_the_visual_exposure_band_path_with_an_embedded_nul_is_the_reported_fallback_on_windows(self) -> None:
+        # the real fault the injected row stands in for: on Windows Test-Path -LiteralPath throws ArgumentException on an embedded NUL
+        proc, out = run_pwsh_json("$ErrorActionPreference = 'Stop'; $r = Get-DvExposureBand -ClipId 'c' -Path " + self.NUL_BAND_PATH + "; "
+                                  "$r | ConvertTo-Json -Depth 4 -Compress")
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIsNotNone(out, proc.stdout + proc.stderr)
+        self.assertEqual(out["source"], "fallback-unreadable", out)
+        self.assertIn("ArgumentException", out["note"])
 
     @requires_windows_pwsh
     def test_the_visual_exposure_band_file_that_is_access_denied_is_unreadable_not_malformed(self) -> None:
@@ -9639,9 +9651,13 @@ class VisualExposureFloorTests(unittest.TestCase):
             self.assertIn("UnauthorizedAccessException", out["note"])
 
     def test_the_visual_exposure_band_file_that_goes_away_after_the_probe_is_missing_not_malformed(self) -> None:
-        # fable N1: the probe says "there" and the read finds nothing (a function named Test-Path in the caller's scope answers the probe, the way a race would)
-        proc, out = run_pwsh_json("$ErrorActionPreference = 'Stop'; function Test-Path { $true }; "
-                                  "$r = Get-DvExposureBand -ClipId 'c' -Path 'C:\\absent-dir\\bands.json'; $r | ConvertTo-Json -Depth 4 -Compress")
+        # fable N1: the probe says "there" and the read finds nothing (a function named Test-Path in the caller's scope answers the probe, the way a race would).
+        # r4: the absent path is a real absent directory under a temp dir, never the literal 'C:\absent-dir\...': on ubuntu that names a DRIVE pwsh does not have,
+        # which raises DriveNotFoundException (not ItemNotFound), so the reader said fallback-unreadable
+        with tempfile.TemporaryDirectory(prefix="vis-exp-band-", ignore_cleanup_errors=True) as d:
+            gone = Path(d) / "absent-dir" / "bands.json"
+            proc, out = run_pwsh_json("$ErrorActionPreference = 'Stop'; function Test-Path { $true }; "
+                                      f"$r = Get-DvExposureBand -ClipId 'c' -Path '{gone}'; $r | ConvertTo-Json -Depth 4 -Compress")
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         self.assertIsNotNone(out, proc.stdout + proc.stderr)
         self.assertEqual(out["source"], "fallback-missing", out)
