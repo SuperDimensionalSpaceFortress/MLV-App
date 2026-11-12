@@ -46,6 +46,23 @@ function ConvertTo-VenueDouble {
     [double]::TryParse([string]$Value, [System.Globalization.NumberStyles]::Float, $script:Inv, $Out)
 }
 
+function ConvertTo-VenueCount {
+    # PARITY-1 r6 (sol r5 B2): a whole-number count (a rule's maxThrottledRows / sustainedRows, a reading's throttled / window_rows) is decided on its TOKEN, before any conversion to double:
+    # "6.0000000000000001", "0.99999999999999999" and "150.00000000000000001" round to 6 / 1 / 150 as doubles and so passed a Floor() check made after the parse. Accepted: an integer type,
+    # which is what both shells' ConvertFrom-Json give for a JSON integer token (Int32 / Int64; measured on 5.1.19041 and 7.6), or a text of ASCII digits only (no sign, '.', exponent or
+    # whitespace). A Double (7) / Decimal (5.1) is what a fractional or exponent JSON token becomes, so it is refused whatever its value; so is a BigInteger / Decimal past Int64.
+    # Range 0 .. Int32.MaxValue; anything else is $false: never rounded, never a guess.
+    param([AllowNull()][object]$Value, [ref]$Out)
+    $n = [long]0
+    if ($Value -is [int] -or $Value -is [long] -or $Value -is [int16] -or $Value -is [byte] -or $Value -is [sbyte] -or $Value -is [uint16] -or $Value -is [uint32]) { $n = [long]$Value }
+    elseif ($Value -is [uint64]) { if ($Value -gt [uint64][int]::MaxValue) { return $false }; $n = [long]$Value }
+    elseif ($Value -is [string] -and $Value -match '\A[0-9]+\z') { if (-not [long]::TryParse($Value, [System.Globalization.NumberStyles]::None, $script:Inv, [ref]$n)) { return $false } }
+    else { return $false }
+    if ($n -lt 0 -or $n -gt [int]::MaxValue) { return $false }
+    $Out.Value = [int]$n
+    $true
+}
+
 function ConvertFrom-VenueDoubleBits {
     # PARITY-1 r5 (adversary r4 A1, hub ruling EXACT BITS): a double's IEEE-754 bits (the agent's meanMaxCBits, the probe's feedStaleSecBits / mean_c_exact_bits, the tele line's *_bits= tokens) ->
     # the double, by Int64BitsToDouble: no [double] parse, which on Windows PowerShell 5.1 is not correctly rounded. An exact Int32 / Int64 (what both shells' ConvertFrom-Json give for a JSON
@@ -63,6 +80,7 @@ function Resolve-VenueHeatRule {
     # Get-AgentHeatRule, copied by the quiet probe): an object with source, maxThrottledRows, meanMaxC, sustainedRows, feedStaleSec. $null (nothing published: an agent that predates it)
     # -> the module defaults, source 'default'. A record that is present but unusable (not an object, source not 'agent', a field missing, not a number, non-finite, negative, a
     # fractional count, a window of fewer than 1 or more than 150 rows, a staleness of 0) -> valid=$false, reason THERMAL_THRESHOLDS_INVALID: never the defaults, never a guess.
+    # r6 (sol r5 B2): a count is an integer TOKEN (ConvertTo-VenueCount), judged before any conversion to double: "6.0000000000000001", 6.0, "6e0", " 6 " and "+6" are all refused.
     param([AllowNull()][object]$Rule)
     $inv = [pscustomobject]@{ valid = $false; source = 'invalid'; maxThrottledRows = $null; meanMaxC = $null; sustainedRows = $null; feedStaleSec = $null; reason = $script:ThresholdsInvalid }
     if ($null -eq $Rule) {
@@ -81,12 +99,17 @@ function Resolve-VenueHeatRule {
         }
         else {
             if (-not $p[$k] -or $null -eq $Rule.$k -or $Rule.$k -is [bool] -or $Rule.$k -is [array]) { return $inv }   # a scalar number or its text: an array coerces through [string] and is no number
-            if (-not (ConvertTo-VenueDouble $Rule.$k ([ref]$d))) { return $inv }
+            if ($k -ceq 'maxThrottledRows' -or $k -ceq 'sustainedRows') {
+                # r6 (sol r5 B2): a count is decided on its token (ConvertTo-VenueCount), never on the double it rounds to
+                $c = 0
+                if (-not (ConvertTo-VenueCount $Rule.$k ([ref]$c))) { return $inv }
+                $d = [double]$c
+            }
+            elseif (-not (ConvertTo-VenueDouble $Rule.$k ([ref]$d))) { return $inv }
         }
         if ([double]::IsNaN($d) -or [double]::IsInfinity($d) -or $d -lt 0) { return $inv }
         $vals[$k] = $d
     }
-    foreach ($k in 'maxThrottledRows', 'sustainedRows') { if ($vals[$k] -ne [Math]::Floor($vals[$k]) -or $vals[$k] -gt [int]::MaxValue) { return $inv } }
     if ($vals['sustainedRows'] -lt 1 -or $vals['sustainedRows'] -gt $script:HeatMaxWindowRows) { return $inv }
     if ($vals['feedStaleSec'] -le 0) { return $inv }
     [pscustomobject]@{ valid = $true; source = 'agent'; maxThrottledRows = [int]$vals['maxThrottledRows']; meanMaxC = [double]$vals['meanMaxC']; sustainedRows = [int]$vals['sustainedRows']; feedStaleSec = [double]$vals['feedStaleSec']; reason = $null }
@@ -144,8 +167,9 @@ function ConvertFrom-VenueProbeHeatLine {
         if ($null -ne $h -and $h -is [System.Management.Automation.PSCustomObject] -and $h.PSObject.Properties['mean_c'] -and $h.PSObject.Properties['throttled'] -and $h.PSObject.Properties['window_rows']) {
             # adversary r1b A8: a count that is not a whole number in Int32 range is not a reading: the display line is used instead, never a throw
             $thr = 0; $win = 0; $mean = 0.0
-            $okT = [int]::TryParse([string]$h.throttled, [System.Globalization.NumberStyles]::None, $script:Inv, [ref]$thr)
-            $okW = [int]::TryParse([string]$h.window_rows, [System.Globalization.NumberStyles]::None, $script:Inv, [ref]$win)
+            # r6 (sol r5 B2, the same class): on the token, not through [string]: pwsh 7 prints a Double 7 from "7.0" as 7 while 5.1's Decimal prints 7.0, so the shells disagreed
+            $okT = ConvertTo-VenueCount $h.throttled ([ref]$thr)
+            $okW = ConvertTo-VenueCount $h.window_rows ([ref]$win)
             # r3 A2: the probe rounds mean_c to 0.01 (87.998 -> 88.0, which the agent's rule calls hot while the exact mean is clear): the exact mean it also writes,
             # mean_c_exact, is the heat decision's value when present; the rounded mean_c only for a probe that predates it
             $meanSrc = $(if ($h.PSObject.Properties['mean_c_exact'] -and $null -ne $h.mean_c_exact) { $h.mean_c_exact } else { $h.mean_c })

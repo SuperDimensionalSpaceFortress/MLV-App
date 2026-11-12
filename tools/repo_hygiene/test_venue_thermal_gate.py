@@ -1699,7 +1699,8 @@ class AgentThresholdParityR3Tests(unittest.TestCase):
 
     # ---- A3: a padded numeric string is stored as the number it parses to
     def test_r3_a3_a_padded_numeric_text_is_stored_as_its_number_and_round_trips_to_the_gate(self) -> None:
-        got = self.reader(PWSH, '{"maxThrottledRows":" 6 ","meanMaxC":" 80 ","sustainedRows":"60","feedStaleSec":" 120"}')
+        # r6 (sol r5 B2): a COUNT is an integer token, so a padded count is refused (AgentThresholdParityR6Tests); the doubles may still be padded text
+        got = self.reader(PWSH, '{"maxThrottledRows":"6","meanMaxC":" 80 ","sustainedRows":"60","feedStaleSec":" 120"}')
         self.assertEqual((got["source"], got["maxThrottledRows"], got["meanMaxC"], got["sustainedRows"], got["feedStaleSec"]), ("agent", 6, 80, 60, 120), got)
         for v in (got["maxThrottledRows"], got["meanMaxC"], got["sustainedRows"], got["feedStaleSec"]):
             self.assertIsInstance(v, (int, float), got)
@@ -2100,6 +2101,153 @@ class AgentThresholdParityR5Tests(unittest.TestCase):
             self.assertEqual(lines[1:], [], f"{exe}: values that did not arrive bit-identical (want -> env reader, line rule, raw rule, line mean): {lines[1:20]}")
         for exe in SHELLS_R4:
             self.assertEqual(total[str(exe)], len(vals), str(exe))
+
+
+R6_SCRIPT = (
+    "param([string]$In)\n"
+    "$ErrorActionPreference = 'Stop'\n"
+    "Import-Module '{gate}' -Force\n"
+    "$telemetrySchemaV1 = 'mlv-app/venue-quiet-probe-telemetry/v1'; function Write-Gate([string]$s) {{ $s }}\n"
+    "{quietfns}\n"
+    "$tmp = Join-Path ([IO.Path]::GetTempPath()) ('thermal-r6-' + [guid]::NewGuid().ToString('N') + '.json')\n"
+    "function Read-Both($lines) {{ $h = ConvertFrom-VenueProbeHeatLine -Lines $lines; $h.heat + '/' + $h.thresholdsSource }}\n"
+    "$all = [IO.File]::ReadAllText($In, [Text.Encoding]::UTF8) | ConvertFrom-Json\n"   # assigned first: 5.1 writes a root array to the pipeline as ONE object, so @(... | ConvertFrom-Json) would wrap it
+    "$out = foreach ($c in $all) {{\n"
+    "  if ($c.kind -ceq 'gate') {{ $g = Resolve-VenueHeatRule -Rule ($c.text | ConvertFrom-Json); if ($g.valid) {{ 'valid:' + $g.maxThrottledRows + ':' + $g.sustainedRows }} else {{ 'invalid' }} }}\n"
+    "  elseif ($c.kind -ceq 'probe') {{ $q = Read-TelAgentHeatRule -Json $c.text -DefaultRows 60 -DefaultStaleSec 120; $q.source + ':' + $q.windowRows }}\n"
+    "  elseif ($c.kind -ceq 'line') {{ Read-Both @($c.text) }}\n"
+    "  elseif ($c.kind -ceq 'chain' -or $c.kind -ceq 'probejson') {{\n"
+    "    if ($c.kind -ceq 'chain') {{\n"
+    # the job env text -> the probe's reader -> its heat{} block (rule block only when not default, as the probe does) -> its JSON -> its printed line -> the gate
+    "      $ar = Read-TelAgentHeatRule -Json $c.text -DefaultRows 60 -DefaultStaleSec 120\n"
+    "      $heat = [ordered]@{{ source = 'x'; sample_age_s = 1.0; hottest_core_c = 50.0; max15_c = 60.0; mean_c = 82.0; mean_c_exact = 82.0; throttled = 4; window_rows = 60; package_w = 10.0; reasons = [ordered]@{{}} }}\n"
+    "      if ($ar.source -cne 'default') {{ $heat['rule'] = (New-TelHeatRuleBlock $ar) }}\n"
+    "      $pj = ([ordered]@{{ telemetry_schema = $telemetrySchemaV1; heat = $heat; gpu = [ordered]@{{ state = 'absent' }}; last_lease = [ordered]@{{ event = 'none' }} }} | ConvertTo-Json -Compress -Depth 6)\n"
+    "    }} else {{ $pj = [string]$c.text }}\n"
+    "    $lines = @(Write-TelemetryLines ($pj | ConvertFrom-Json))\n"
+    "    [IO.File]::WriteAllText($tmp, $pj)\n"
+    # line = the printed line alone (the raw file unwritable); both = what the runner reads (the raw JSON first, the line as its fallback)
+    "    (Read-Both (@('  raw UNWRITABLE x') + $lines)) + '|' + (Read-Both (@(\"  raw $tmp\") + $lines)) + '|' + [string]$lines[0]\n"
+    "  }}\n"
+    "  else {{ throw ('unknown kind ' + $c.kind) }}\n"
+    "}}\n"
+    "if (Test-Path -LiteralPath $tmp) {{ Remove-Item -LiteralPath $tmp -Force }}\n"
+    "ConvertTo-Json -Compress -InputObject @($out)\n"
+)
+
+
+@requires_windows_pwsh
+class AgentThresholdParityR6Tests(unittest.TestCase):
+    """BACHELOR-THERMAL-GATE-AGENT-THRESHOLD-PARITY-1 r6 (sol r5 B1, B2). B1: a published rule that is PRESENT but blank (a space, a tab, a line break) is malformed, so it is
+    THERMAL_THRESHOLDS_INVALID, never the defaults; only an ABSENT rule ('' -- Windows cannot hold an empty environment variable) selects them. B2: a count (maxThrottledRows, sustainedRows,
+    and a reading's throttled / window_rows) is judged on its TOKEN, before any conversion to double: '6.0000000000000001', '0.99999999999999999' and '150.00000000000000001' rounded to
+    6 / 1 / 150 and passed. Both shells give a JSON integer token as Int32 / Int64 and a fractional or exponent one as Decimal (5.1) / Double (7), so only an integer type or an
+    all-ASCII-digit text is a count. Every case runs in one process per shell, on Windows PowerShell 5.1 and pwsh 7."""
+
+    BASE = {"source": "agent", "maxThrottledRows": 6, "meanMaxC": 88, "sustainedRows": 60, "feedStaleSec": 120}
+    BAD_TEXT = ["6.0000000000000001", "0.99999999999999999", "150.00000000000000001", "6.0", "6e0", " 6 ", "6 ", "+6", "-0", "0x6", "٦", "", "6\n"]
+    BAD_NUMBER = ["6.0000000000000001", "0.99999999999999999", "150.00000000000000001", "6.0", "6e0", "60.0", "1E2"]
+    LINE = "  tele heat source=x mean=82C throttled=4/60 rule_source=agent rule_max_throttled={m} rule_mean_max_c=88 rule_rows={r} rule_stale_s=120"
+
+    def run_cases(self, exe, cases: list) -> list:
+        import tempfile
+        d = Path(tempfile.mkdtemp(prefix="thermal-r6-"))
+        script = d / "r6.ps1"
+        funcs = "\n".join(quiet_fn_ps(n, "", "") for n in ("ConvertTo-JsonSafeDouble", "ConvertTo-TelDoubleBits", "New-TelHeatRuleBlock", "Read-TelAgentHeatRule", "ConvertTo-IdentToken",
+                                                           "Format-TelNum", "Get-TelReasonSuffix", "Write-TelemetryLines"))
+        script.write_text(R6_SCRIPT.format(gate=GATE, quietfns=funcs), encoding="utf-8-sig")
+        inp = d / "cases.json"
+        inp.write_text(json.dumps([{"kind": k, "text": t} for k, t in cases]), encoding="utf-8")
+        r = subprocess.run([str(exe), "-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", str(script), "-In", str(inp)], capture_output=True, text=True, timeout=300)
+        self.assertEqual(r.returncode, 0, f"{exe}: {r.stdout}{r.stderr}")
+        got = json.loads(r.stdout.strip())
+        got = got if isinstance(got, list) else [got]
+        self.assertEqual(len(got), len(cases), f"{exe}: {got}")
+        return got
+
+    def check(self, cases: list, want: list) -> None:
+        for exe in SHELLS_R4:
+            got = self.run_cases(exe, cases)
+            bad = [(c, g, w) for c, g, w in zip(cases, got, want) if not (g.startswith(w) if w.endswith("|") else g == w)]
+            self.assertEqual(bad, [], f"{exe}: (case, got, want)")
+
+    def rule_json(self, field: str, token: str, *, text: bool, source: bool = True) -> str:
+        body = {k: v for k, v in self.BASE.items() if source or k != "source"}
+        s = json.dumps(body, separators=(",", ":"))
+        return s.replace(f'"{field}":{self.BASE[field]}', f'"{field}":' + (json.dumps(token) if text else token))
+
+    # ---- B1: present but blank is invalid, never the defaults; absent is the defaults
+    def test_r6_b1_blank_rule_text_is_invalid_and_only_absent_selects_defaults(self) -> None:
+        blanks = [" ", "\t", "  \r\n ", "\r\n", " "]
+        cases = [("probe", b) for b in blanks] + [("probe", "")]
+        want = ["invalid:60"] * len(blanks) + ["default:60"]
+        # the whole probe path: the probe prints rule_source=invalid, so the gate reads unknown / THERMAL_THRESHOLDS_INVALID on the line AND on the raw JSON (sol's repro read clear/default)
+        cases += [("chain", b) for b in blanks] + [("chain", "")]
+        want += ["unknown/invalid|unknown/invalid|"] * len(blanks) + ["clear/default|clear/default|"]
+        self.check(cases, want)
+
+    # ---- B2: a fractional count is refused before any rounding, in the gate, the probe's reader and the tele line
+    def test_r6_b2_fractional_count_text_and_numbers_are_refused_by_both_readers(self) -> None:
+        cases, want = [], []
+        for field in ("maxThrottledRows", "sustainedRows"):
+            for tok in self.BAD_TEXT:
+                cases += [("gate", self.rule_json(field, tok, text=True)), ("probe", self.rule_json(field, tok, text=True, source=False))]
+                want += ["invalid", "invalid:60"]
+            for tok in self.BAD_NUMBER:
+                cases += [("gate", self.rule_json(field, tok, text=False)), ("probe", self.rule_json(field, tok, text=False, source=False))]
+                want += ["invalid", "invalid:60"]
+        self.check(cases, want)
+
+    def test_r6_b2_fractional_count_tokens_on_the_tele_line_are_refused(self) -> None:
+        cases, want = [], []
+        for tok in ("6.0000000000000001", "0.99999999999999999", "150.00000000000000001", "6.0", "6e0", "+6", "-0", "0x6", "٦"):
+            cases += [("line", self.LINE.format(m=tok, r=60)), ("line", self.LINE.format(m=6, r=tok))]
+            want += ["unknown/invalid", "unknown/invalid"]
+        self.check(cases, want)
+
+    def test_r6_b2_the_valid_neighbours_stay_valid(self) -> None:
+        cases = [("gate", self.rule_json("maxThrottledRows", t, text=False)) for t in ("6", "0", "150")]
+        want = ["valid:6:60", "valid:0:60", "valid:150:60"]
+        cases += [("gate", self.rule_json("sustainedRows", t, text=False)) for t in ("1", "60", "150")]
+        want += ["valid:6:1", "valid:6:60", "valid:6:150"]
+        cases += [("gate", self.rule_json("maxThrottledRows", "6", text=True)), ("gate", self.rule_json("sustainedRows", "150", text=True)), ("gate", self.rule_json("sustainedRows", "060", text=True))]
+        want += ["valid:6:60", "valid:6:150", "valid:6:60"]
+        cases += [("probe", self.rule_json("sustainedRows", t, text=False, source=False)) for t in ("1", "60", "150")]
+        want += ["agent:1", "agent:60", "agent:150"]
+        cases += [("probe", self.rule_json("sustainedRows", "150", text=True, source=False)), ("probe", self.rule_json("maxThrottledRows", "6", text=True, source=False))]
+        want += ["agent:150", "agent:60"]
+        cases += [("line", self.LINE.format(m=6, r=60)), ("line", self.LINE.format(m=6, r=150)), ("line", self.LINE.format(m=3, r=60))]
+        want += ["clear/agent", "clear/agent", "hot/agent"]
+        # the whole path with the agent's own published rule: clear under 6 / 88 at throttled 4/60, mean 82
+        cases += [("chain", json.dumps({k: v for k, v in self.BASE.items() if k != "source"}))]
+        want += ["clear/agent|clear/agent|"]
+        self.check(cases, want)
+        # sustainedRows out of range stays refused (the integer check does not widen the window)
+        self.check([("gate", self.rule_json("sustainedRows", t, text=False)) for t in ("0", "151", "2147483648")], ["invalid"] * 3)
+
+    def test_r6_b2_the_printer_never_rounds_a_count_and_the_raw_reader_agrees_on_both_shells(self) -> None:
+        # a probe JSON whose rule count is a fractional token: the printer printed it as 6 (via [double]) on both shells; it prints 'invalid' now, so the line and the raw JSON both refuse
+        def probe(rule_extra: dict | None, **heat) -> str:
+            h = {"source": "x", "sample_age_s": 1.0, "hottest_core_c": 50.0, "max15_c": 60.0, "mean_c": 82.0, "mean_c_exact": 82.0, "throttled": 4, "window_rows": 60, "package_w": 10.0, "reasons": {}}
+            h.update(heat)
+            s = json.dumps({"telemetry_schema": "mlv-app/venue-quiet-probe-telemetry/v1", "heat": h, "gpu": {"state": "absent"}, "last_lease": {"event": "none"}})
+            if rule_extra is not None:
+                s = s.replace('"reasons": {}', '"reasons": {}, "rule": ' + json.dumps(rule_extra))
+            return s
+        cases, want = [], []
+        for field in ("maxThrottledRows", "sustainedRows"):
+            for tok in ("6.0000000000000001", "0.99999999999999999", "150.00000000000000001", "6.0"):
+                cases.append(("probejson", probe(None).replace('"reasons": {}', '"reasons": {}, "rule": ' + self.rule_json(field, tok, text=False))))
+                want.append("unknown/invalid|unknown/invalid|")
+        # a reading's own count from a fractional token: pwsh 7 read the Double 4.0 as 4 (clear) and 5.1 its Decimal as no count (unknown); both shells now refuse it on both paths
+        for heat in ({"throttled": "__4.0__"}, {"window_rows": "__60.0__"}, {"throttled": "__7.0__"}):
+            k, v = next(iter(heat.items()))
+            cases.append(("probejson", probe(None).replace(f'"{k}": {4 if k == "throttled" else 60}', f'"{k}": {v.strip("_")}')))
+            want.append("unknown/default|unknown/default|")
+        # the integer neighbours are read
+        cases += [("probejson", probe(None)), ("probejson", probe(None, throttled=7)), ("probejson", probe(dict(self.BASE, maxThrottledRows=3)))]
+        want += ["clear/default|clear/default|", "hot/default|hot/default|", "hot/agent|hot/agent|"]
+        self.check(cases, want)
 
 
 if __name__ == "__main__":

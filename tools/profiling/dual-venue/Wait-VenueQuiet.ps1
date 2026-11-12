@@ -552,7 +552,8 @@ $HeatStaleSec = 120
 # BACHELOR-THERMAL-GATE-AGENT-THRESHOLD-PARITY-1: the agent hands every job its effective heat rule in $env:MLV_AGENT_HEAT_RULE (ultra-magnus-agent.ps1 Get-AgentHeatRule: maxThrottledRows,
 # meanMaxC, sustainedRows, feedStaleSec as JSON). The probe reads the feed with the AGENT'S window and staleness, and copies the record into heat{}.rule (and the 'tele heat' line) for the gate,
 # which holds the one validation that decides (Resolve-VenueHeatRule). Absent: the defaults above, no rule key (the gate says thresholds_source=default). Present but unusable (not JSON, not an
-# object, a field missing or not a finite non-negative number, a window outside 1..150, a staleness of 0): rule.source = invalid, and the defaults above are used for the feed read only.
+# object, a field missing or not a finite non-negative number, a count that is not an integer token, a window outside 1..150, a staleness of 0, or a value that is present but blank (r6)):
+# rule.source = invalid, and the defaults above are used for the feed read only.
 # PARITY-1 r4 (adversary r3 A1): what a [double] becomes when this probe's JSON carries it to the lease-batch gate. Windows PowerShell 5.1 writes a double with 15 significant digits (or through 'R', which
 # on .NET Framework misses the round trip for some values), so a threshold or an exact mean that needs more digits would arrive as a neighbouring double and the gate would decide the other way from the
 # agent. A finite double that G15 gives back bit-identical stays a JSON number; any other is the shortest of its G16 / G17 text that does round trip (every reader parses numeric text invariant); a
@@ -587,7 +588,9 @@ function New-TelHeatRuleBlock($Rule) {
 }
 function Read-TelAgentHeatRule([string]$Json, [int]$DefaultRows, [double]$DefaultStaleSec) {
     $r = [ordered]@{ source = 'default'; maxThrottledRows = $null; meanMaxC = $null; sustainedRows = $null; feedStaleSec = $null; windowRows = $DefaultRows; staleSec = $DefaultStaleSec }
-    if ([string]::IsNullOrWhiteSpace($Json)) { return [pscustomobject]$r }
+    # r6 (sol r5 B1): ONLY an absent rule selects the defaults. An unset variable reads as '' ([string]$null), and Windows cannot hold an empty environment variable, so '' is absent;
+    # a value that is present but blank (a space, a tab, a line break) is a malformed published rule: invalid (THERMAL_THRESHOLDS_INVALID at the gate), never the defaults.
+    if ([string]::IsNullOrEmpty($Json)) { return [pscustomobject]$r }
     $r.source = 'invalid'
     try {
         # r3 (adversary r2 A1): no -NoEnumerate, which Windows PowerShell 5.1 (the agent's shell when pwsh is absent) does not have. Both shells unroll a one-element root array into the object inside
@@ -614,7 +617,18 @@ function Read-TelAgentHeatRule([string]$Json, [int]$DefaultRows, [double]$Defaul
             } else {
             if (-not $o.PSObject.Properties[$k] -or $null -eq $o.$k -or $o.$k -is [bool] -or $o.$k -is [array]) { return [pscustomobject]$r }
             $x = $o.$k
-            if ($x -is [double] -or $x -is [long] -or $x -is [int] -or $x -is [decimal] -or $x -is [bigint]) { $d = [double]$x }
+            if ($k -ceq 'maxThrottledRows' -or $k -ceq 'sustainedRows') {
+                # r6 (sol r5 B2): a count is decided on its TOKEN, never on the double it rounds to ("6.0000000000000001" -> 6, "0.99999999999999999" -> 1 passed the Floor() check below).
+                # Both shells give a JSON integer token as Int32 / Int64 and a fractional or exponent one as Decimal (5.1) / Double (7): only the integer types, or a text of ASCII digits
+                # only (no sign, '.', exponent or whitespace), in 0 .. Int32.MaxValue. The same rule as the gate's ConvertTo-VenueCount (VenueThermalGate.psm1).
+                $n = [long]0
+                if ($x -is [int] -or $x -is [long]) { $n = [long]$x }
+                elseif ($x -is [string] -and $x -match '\A[0-9]+\z' -and [long]::TryParse($x, [Globalization.NumberStyles]::None, [Globalization.CultureInfo]::InvariantCulture, [ref]$n)) { }
+                else { return [pscustomobject]$r }
+                if ($n -lt 0 -or $n -gt [int]::MaxValue) { return [pscustomobject]$r }
+                $d = [double]$n
+            }
+            elseif ($x -is [double] -or $x -is [long] -or $x -is [int] -or $x -is [decimal] -or $x -is [bigint]) { $d = [double]$x }
             elseif ($x -is [string]) { if (-not [double]::TryParse($x, [Globalization.NumberStyles]::Float, [Globalization.CultureInfo]::InvariantCulture, [ref]$d)) { return [pscustomobject]$r } }
             else { return [pscustomobject]$r }
             }
@@ -1372,10 +1386,19 @@ function Write-TelemetryLines($Probe) {
             if ($x -is [string] -and $x -match '\A-?[0-9]{1,19}\z' -and [long]::TryParse($x, [Globalization.NumberStyles]::AllowLeadingSign, [Globalization.CultureInfo]::InvariantCulture, [ref]$n)) { return $n.ToString([Globalization.CultureInfo]::InvariantCulture) }
             'invalid'
         }
+        # PARITY-1 r6 (sol r5 B2): a COUNT (throttled, window_rows, the rule's maxThrottledRows / sustainedRows) is printed from its token, never through a double: an Int32 / Int64 (a JSON
+        # integer on both shells) or an all-ASCII-digit text as its digits; $null as n/a; anything else (a Double / Decimal from a fractional or exponent JSON token, which [double] and [string]
+        # rounded to 6 or printed as 6 on pwsh 7, a BigInteger, an array, other text) as the token 'invalid', which the gate refuses. Inline, so a harness that lifts this function alone keeps working.
+        $cn = { param($x)
+            if ($null -eq $x) { return 'n/a' }
+            if ($x -is [int] -or $x -is [long]) { return ([long]$x).ToString([Globalization.CultureInfo]::InvariantCulture) }
+            if ($x -is [string] -and $x -match '\A[0-9]+\z') { return $x }
+            'invalid'
+        }
         # BACHELOR-THERMAL-GATE-WAIT-1 r6 (adversary r5 A3): mean_exact is printed for a non-finite mean too. The JSON round trip holds it as the string NaN / Infinity / -Infinity, which
         # Format-TelNum prints as 'n/a' (as for a missing mean); mean_exact names it, so the lease-batch gate reads +Infinity as hot (the agent's >= 88 rule) and NaN / -Infinity as unknown.
         Write-Gate (("  tele heat source={0} age={1} hottest={2} max15={3} mean={4} throttled={5}/{6} W={7}" -f (ConvertTo-IdentToken $h.source), (Format-TelNum $h.sample_age_s 's'),
-            (Format-TelNum $h.hottest_core_c 'C'), (Format-TelNum $h.max15_c 'C'), (Format-TelNum $h.mean_c 'C'), (ConvertTo-IdentToken $h.throttled), (ConvertTo-IdentToken $h.window_rows),
+            (Format-TelNum $h.hottest_core_c 'C'), (Format-TelNum $h.max15_c 'C'), (Format-TelNum $h.mean_c 'C'), (& $cn $h.throttled), (& $cn $h.window_rows),
             (Format-TelNum $h.package_w '')) + (Get-TelReasonSuffix $h) + $(if ($null -ne ($mx = (& $rt $h.mean_c_exact))) { ' mean_exact=' + $mx } else { '' }) +
             $(if ($null -ne $h.mean_c_exact_bits -and $null -ne ($mb = (& $bt $h 'mean_c_exact_bits'))) { ' mean_exact_bits=' + $mb } else { '' }) +
             # PARITY-1: the agent's published heat rule, as the gate reads it off this line (VenueThermalGate.psm1 Get-VenueRuleFromTeleLine); inline, so the existing harnesses that lift this function
@@ -1386,7 +1409,7 @@ function Write-TelemetryLines($Probe) {
                 # r5 (adversary r5 A3): an array is no rule and no number: [string] / ConvertTo-IdentToken scalarized [{..}] and [80] into a rule the gate applied; the gate's structured reader refuses both
                 $rn = { param($x) if ($x -is [array]) { return 'invalid' }; $v = (& $rt $x); if ($null -ne $v) { $v } else { ConvertTo-IdentToken $x } }
                 # r5 (adversary r4 A3): the source must BE the string agent: [string] turned a one-element array ["agent"] into agent
-                if ($h.rule -is [System.Management.Automation.PSCustomObject] -and $h.rule.source -is [string] -and [string]::Equals([string]$h.rule.source, 'agent', [StringComparison]::Ordinal)) { ' rule_source=agent rule_max_throttled=' + (& $rn $h.rule.maxThrottledRows) + ' rule_mean_max_c=' + (& $rn $h.rule.meanMaxC) + ' rule_rows=' + (& $rn $h.rule.sustainedRows) + ' rule_stale_s=' + (& $rn $h.rule.feedStaleSec) +
+                if ($h.rule -is [System.Management.Automation.PSCustomObject] -and $h.rule.source -is [string] -and [string]::Equals([string]$h.rule.source, 'agent', [StringComparison]::Ordinal)) { ' rule_source=agent rule_max_throttled=' + (& $cn $h.rule.maxThrottledRows) + ' rule_mean_max_c=' + (& $rn $h.rule.meanMaxC) + ' rule_rows=' + (& $cn $h.rule.sustainedRows) + ' rule_stale_s=' + (& $rn $h.rule.feedStaleSec) +
                     $(if ($null -ne ($b1 = (& $bt $h.rule 'meanMaxCBits'))) { ' rule_mean_max_c_bits=' + $b1 } else { '' }) + $(if ($null -ne ($b2 = (& $bt $h.rule 'feedStaleSecBits'))) { ' rule_stale_s_bits=' + $b2 } else { '' }) }
                 else { ' rule_source=invalid' }
             } else { '' }))
