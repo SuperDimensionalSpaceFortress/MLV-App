@@ -797,11 +797,14 @@ def item_heading(item: dict) -> str:
 
 
 _FIELD_KEY_ALT = "|".join(CARD_FIELDS)
-_PLAIN_KEY_RE = re.compile(rf"(?:{_FIELD_KEY_ALT}):")
-# The bold-bullet spelling of a field (`- **Check:**`, also `- **Applies to:**`), compared case-insensitively like the validator.
-_BOLD_KEY_RE = re.compile(rf"- \*\*(?:{_FIELD_KEY_ALT}|applies to):\*\*", re.IGNORECASE)
+_PLAIN_KEY_RE = re.compile(rf"(?P<key>{_FIELD_KEY_ALT}):")
+# The bold-bullet spelling of a field (`- **Check:**`, also `- **Applies to:**`) the way the bus validator reads it: the label
+# is trimmed, its whitespace folded, and compared case-insensitively (BOLD_LABELS in validate-cards.mjs).
+_BOLD_KEY_RE = re.compile(rf"- \*\*\s*(?P<key>{_FIELD_KEY_ALT}|applies\s+to)\s*:\*\*", re.IGNORECASE)
 _BOLD_LABEL_PREFIX_RE = re.compile(r"- \*\*[^*:]+:\*\*")
-_CODE_SPAN_RE = re.compile(r"`[^`]*`")
+# A CommonMark code span: a run of N backticks closes only on the next run of exactly N, so `a`, ``a ` b`` and ```a``` quote
+# and `a`` (one opening, two closing) does not.
+_CODE_SPAN_RE = re.compile(r"(?<!`)(`+)(?!`).*?(?<!`)\1(?!`)")
 
 
 def screen_card_field_keys(body: str) -> None:
@@ -810,16 +813,18 @@ def screen_card_field_keys(body: str) -> None:
     only after it merges (06d1d11c, Grok G2 on #728). The key list is CARD_FIELDS, never a second copy. The heading line is
     skipped; a line that opens with its own field (`rule:` or `- **check:**`) is scanned past that opening label, and any
     other line (a continuation included) is scanned in full, since a key past column 0 is fused into the text before it.
-    A key inside a closed backtick span is a quoted literal (`touches/supersedes:`), not a field, and is blanked first
-    (same width, so the reported column holds); an unclosed backtick hides nothing."""
-    rows = body.lstrip().splitlines()
+    A key inside a code span (_CODE_SPAN_RE) is a quoted literal (`touches/supersedes:`), not a field, and is blanked first
+    (same width, so the reported column holds); a backtick run that nothing closes hides nothing. Lines split on "\\n" only
+    (CRLF read as LF), as the bus validator splits them: str.splitlines() also breaks on \\x85, U+2028 and friends, which
+    turned `x<U+0085>applies: y` into a fictitious line that opens with its own field."""
+    rows = body.lstrip().replace("\r\n", "\n").split("\n")
     for n, row in enumerate(rows[1:], start=2):
         row = _CODE_SPAN_RE.sub(lambda s: " " * len(s.group(0)), row)
         opening = _BOLD_LABEL_PREFIX_RE.match(row) or _PLAIN_KEY_RE.match(row)
         start = opening.end() if opening else 0
         for m in (_PLAIN_KEY_RE.search(row, start), _BOLD_KEY_RE.search(row, start)):
             if m:
-                key = m.group(0)[4:-3].lower() if m.group(0).startswith("- **") else m.group(0)[:-1]
+                key = re.sub(r"\s+", " ", m.group("key")).lower()
                 raise Refusal("FIELD_KEY_FUSED", f"card line {n} (the heading is line 1): field key '{key}:' is at column "
                                                  f"{m.start()}, fused into other text; a field key starts its own line")
 

@@ -3065,6 +3065,63 @@ def test_validate_accepts_a_field_key_quoted_in_a_code_span_and_refuses_one_afte
     assert ob.main(["--repo", str(tmp_path), "validate", str(_write_card_item(tmp_path, unclosed, "20261009-unclosed.md"))]) == 1
 
 
+# Adversary pass r1 on 4ac14afa (sol): A1 code spans follow CommonMark (a run closes only on a run of the same length), A2 a
+# bold label is matched the validator's way (whitespace-tolerant), A3 lines split on "\n" as the bus validator does.
+
+@pytest.mark.parametrize("quoted", [
+    "use ``check:`` as the label",             # A1: a double-backtick span is a quotation
+    "use ``a ` b check: c`` as the label",     # a longer span may hold a single backtick
+    "use ```check:``` as the label",
+    "`a` and ``rule:`` and ```supersedes:```",
+])
+def test_validate_accepts_a_field_key_quoted_in_a_code_span_of_any_backtick_length(tmp_path, quoted):
+    body = CARD_BODY.replace("rule: the rule\n", f"rule: {quoted}\n", 1)
+    assert ob.main(["--repo", str(tmp_path), "validate", str(_write_card_item(tmp_path, body))]) == 0
+
+
+@pytest.mark.parametrize("fused", [
+    "x `applies: mlv-app``",                    # A1: opens with one backtick, closes with two: no span, the key is exposed
+    "x ``check: y` z",                          # opens with two, closes with one
+    "x ``applies: mlv-app",                     # never closed
+    "x `a` applies: mlv-app",                   # after a closed span
+    "x `a`b`` applies: mlv-app",
+])
+def test_validate_refuses_a_field_key_that_no_matching_backtick_run_quotes(tmp_path, capsys, fused):
+    body = CARD_BODY.replace("rule: the rule\n", f"rule: {fused}\n", 1)
+    assert ob.main(["--repo", str(tmp_path), "validate", str(_write_card_item(tmp_path, body))]) == 1
+    assert "FIELD_KEY_FUSED" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("label", ["Applies  to", "applies\tto", "Applies to", " check ", "RULE", "  Supersedes  "])
+def test_validate_refuses_a_bold_label_fused_mid_line_in_any_spelling_the_bus_validator_reads(tmp_path, capsys, label):
+    """A2: the bus validator trims the bold label and folds its whitespace, so `- **Applies  to:**` is the field."""
+    body = CARD_BODY.replace("rule: the rule\n", f"rule: x - **{label}:** mlv-app\n", 1)
+    assert ob.main(["--repo", str(tmp_path), "validate", str(_write_card_item(tmp_path, body))]) == 1
+    assert "FIELD_KEY_FUSED" in capsys.readouterr().err
+
+
+def test_validate_names_the_bold_key_in_its_normalised_form(tmp_path, capsys):
+    body = CARD_BODY.replace("rule: the rule\n", "rule: x - **Applies  to:** mlv-app\n", 1)
+    ob.main(["--repo", str(tmp_path), "validate", str(_write_card_item(tmp_path, body))])
+    assert "'applies to:'" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("sep", ["\x85", " ", " ", "\x0b", "\x0c", "\x1c", "\x1d", "\x1e"])
+def test_validate_does_not_start_a_new_line_at_a_separator_the_bus_validator_does_not_split_on(tmp_path, capsys, sep):
+    """A3: str.splitlines() breaks on \\x85 and friends, which made `x<sep>applies: y` look like a line that opens with its own
+    field; the bus validator splits on \\n only, so there the key stays inside the rule prose."""
+    body = CARD_BODY.replace("rule: the rule\n", f"rule: x{sep}applies: mlv-app\n", 1)
+    assert ob.main(["--repo", str(tmp_path), "validate", str(_write_card_item(tmp_path, body))]) == 1
+    assert "FIELD_KEY_FUSED" in capsys.readouterr().err
+
+
+def test_validate_reads_a_crlf_card_as_lf(tmp_path):
+    body = CARD_BODY.replace("\n", "\r\n")
+    path = tmp_path / "20261009-crlf-card.md"
+    path.write_bytes(item_text(target=CARDS, body="@@").encode("utf-8").replace(b"@@", body.encode("utf-8")))
+    assert ob.main(["--repo", str(tmp_path), "validate", str(path)]) == 0
+
+
 def test_validate_leaves_a_field_at_the_start_of_each_line_and_non_card_targets_alone(tmp_path):
     ok = _write_card_item(tmp_path, CARD_BODY, "20261009-ok-card.md")
     trap = tmp_path / "20261009-prose-trap.md"
