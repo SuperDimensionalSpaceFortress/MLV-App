@@ -372,6 +372,35 @@ public static class MlvProcCwd {
     } catch { }
 }
 
+if (-not ('MlvProcOrder' -as [type])) {
+    # CI-FLAKE-RETIRE-HOLDER-EXIT-RELEASE-CORPUS-EMPTY-1 r2 (Sol r1 ANC-01): the kernel's monotonic process-creation sequence number
+    # (NtQueryInformationProcess class 64, ProcessTelemetryIdInformation, field ProcessSequenceNumber at byte 40), opened PROCESS_QUERY_LIMITED_INFORMATION
+    # only. Unlike CreationDate it is not a wall-clock stamp, so a clock step cannot reorder a parent and its child. 0 = unreadable (process gone, access
+    # denied, a Windows build without the class).
+    try {
+        Add-Type -ErrorAction Stop -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+public static class MlvProcOrder {
+    [DllImport("kernel32.dll", SetLastError = true)] static extern IntPtr OpenProcess(int access, bool inherit, int pid);
+    [DllImport("kernel32.dll")] static extern bool CloseHandle(IntPtr h);
+    [DllImport("ntdll.dll")] static extern int NtQueryInformationProcess(IntPtr h, int cls, byte[] buf, int len, out int ret);
+    public static long Get(int pid) {
+        IntPtr h = OpenProcess(0x1000, false, pid);
+        if (h == IntPtr.Zero) return 0;
+        try {
+            byte[] b = new byte[8192]; int rl;
+            if (NtQueryInformationProcess(h, 64, b, b.Length, out rl) != 0) return 0;
+            if (BitConverter.ToUInt32(b, 4) != (uint)pid) return 0;
+            long seq = BitConverter.ToInt64(b, 40);
+            return seq > 0 ? seq : 0;
+        } finally { CloseHandle(h); }
+    }
+}
+'@
+    } catch { }
+}
+
 if (-not ('MlvRegKeyTime' -as [type])) {
     # r5: LastWriteTime of an HKLM key as a FILETIME, opened KEY_QUERY_VALUE only (read, never write). <= 0 = unreadable.
     try {
@@ -408,6 +437,14 @@ function Get-ProcessCurrentDirectory {
     try { return [MlvProcCwd]::Get($ProcessId) } catch { return $null }
 }
 
+function Get-ProcessCreationOrder {
+    # The monotonic creation sequence of a LIVE pid, or $null when it cannot be read. A seam too: a test redefines this function.
+    param([int]$ProcessId)
+    if (-not ('MlvProcOrder' -as [type])) { return $null }
+    try { $v = [MlvProcOrder]::Get($ProcessId); if ($v -gt 0) { return [uint64]$v } } catch { }
+    return $null
+}
+
 function Get-LaneProcessSnapshot {
     # ONE Win32_Process scan, then the self/ancestor chain is walked IN MEMORY from its ParentProcessId
     # column. Measured 2026-10-03: the old per-ancestor `Get-CimInstance -Filter "ProcessId=N"` loop cost
@@ -430,14 +467,25 @@ function Get-LaneProcessSnapshot {
     # BEFORE its child. A live parent row whose CreationDate is later than the child's is a recycled pid, and one whose creation time (or the child's)
     # cannot be read cannot be shown to be the parent: either ends the chain, and the pid stays in Procs to be judged like any other process.
     # An ABSENT parent row is a parent that already exited; its pid is listed (it names no row, so it excludes nothing).
+    # r2 (Sol r1 ANC-01): the wall clock cannot order the pair after a backward clock step (a GENUINE parent then carries the LATER stamp and the rule
+    # above would end the chain at it, reporting a real ancestor as a non-ancestor holder). When both pids' monotonic creation sequence numbers can be
+    # read (Get-ProcessCreationOrder), they decide, in both directions; the wall-clock rule above remains only for a pair with an unreadable key.
+    $cur = [int]$PID
     while ($pp -and $self -notcontains $pp) {
         $parent = $byPid[[int]$pp]
         if ($parent) {
-            $childMade = if ($node) { $node.PSObject.Properties['CreationDate'] } else { $null }
-            $parentMade = $parent.PSObject.Properties['CreationDate']
-            if (-not ($childMade -and $parentMade -and $childMade.Value -is [datetime] -and $parentMade.Value -is [datetime] -and
-                      ([datetime]$parentMade.Value).ToUniversalTime() -le ([datetime]$childMade.Value).ToUniversalTime())) { break }
+            $childKey = Get-ProcessCreationOrder -ProcessId $cur
+            $parentKey = Get-ProcessCreationOrder -ProcessId ([int]$pp)
+            if ($null -ne $childKey -and $null -ne $parentKey) {
+                if ($parentKey -ge $childKey) { break }
+            } else {
+                $childMade = if ($node) { $node.PSObject.Properties['CreationDate'] } else { $null }
+                $parentMade = $parent.PSObject.Properties['CreationDate']
+                if (-not ($childMade -and $parentMade -and $childMade.Value -is [datetime] -and $parentMade.Value -is [datetime] -and
+                          ([datetime]$parentMade.Value).ToUniversalTime() -le ([datetime]$childMade.Value).ToUniversalTime())) { break }
+            }
         }
+        $cur = [int]$pp
         $self += $pp
         $node = $parent
         $pp = if ($node) { $node.ParentProcessId } else { 0 }
