@@ -3903,3 +3903,40 @@ def test_validate_refuses_a_key_after_a_closed_span_whose_closing_run_would_open
 def test_a_quotation_after_a_closed_span_is_still_a_quotation(tmp_path):
     body = CARD_BODY.replace("rule: the rule\n", "rule: a `b` then `check:` and ``rule:`` and `c` then ```supersedes:``` ok\n", 1)
     assert ob.main(["--repo", str(tmp_path), "validate", str(_write_card_item(tmp_path, body))]) == 0
+
+
+# ---------- r6 fix 1: Sol r5 B1 (an escaped backtick run counted as a delimiter masked a bare fused key) ----------
+#
+# B1: in `x \`a`!`check:` git status` the first run is escaped (text), so `a` is a span, `!` is text and `check:` follows a CLOSED span.
+# The parity count took the escaped run as a delimiter, read an even count and masked `check:`: validate and both commit-check modes
+# accepted a card the bus rejects (missing field 'check'). A run preceded by an odd number of backslashes is not counted and a token
+# after one is not masked (fail closed); an even number is an escaped backslash and the run stays real.
+#
+# Named mutation for this block (turns the named tests red, then is reverted):
+#   M27 count every backtick run again, whatever precedes it -> the odd-backslash rows below
+
+@pytest.mark.parametrize("slashes", ["\\", "\\\\\\"])
+@pytest.mark.parametrize("punct", ["!", ",", "("])
+@pytest.mark.parametrize("key", ob.CARD_FIELDS)
+def test_validate_refuses_a_key_after_an_escaped_backtick_run_the_parity_must_not_count(tmp_path, capsys, slashes, punct, key):
+    body = CARD_BODY.replace("rule: the rule\n", f"rule: x {slashes}`a`{punct}`{key}:` git status\n", 1)
+    assert ob.main(["--repo", str(tmp_path), "validate", str(_write_card_item(tmp_path, body))]) == 1
+    assert "FIELD_KEY_FUSED" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("key", ob.CARD_FIELDS)
+def test_the_screen_refuses_the_escaped_run_row_on_the_shared_entry_every_reader_calls(key):
+    with pytest.raises(ob.Refusal) as e:
+        ob.screen_card_field_keys(CARD_BODY.replace("rule: the rule\n", f"rule: x \`a`!`{key}:` git status\n", 1))
+    assert e.value.code == "FIELD_KEY_FUSED"
+
+
+@pytest.mark.parametrize("slashes", ["\\\\", "\\\\\\\\"])
+def test_an_even_backslash_prefix_leaves_the_run_real_so_the_later_quotation_still_quotes(tmp_path, slashes):
+    body = CARD_BODY.replace("rule: the rule\n", f"rule: x {slashes}`a`!`check:` git status\n", 1)
+    assert ob.main(["--repo", str(tmp_path), "validate", str(_write_card_item(tmp_path, body))]) == 0
+
+
+def test_an_escaped_run_after_the_quotation_does_not_unquote_it(tmp_path):
+    body = CARD_BODY.replace("rule: the rule\n", "rule: x `check:` then \`a` ok\n", 1)
+    assert ob.main(["--repo", str(tmp_path), "validate", str(_write_card_item(tmp_path, body))]) == 0

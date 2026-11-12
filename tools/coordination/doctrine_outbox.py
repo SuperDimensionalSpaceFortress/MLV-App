@@ -912,15 +912,27 @@ def _from_heading_row(body: str) -> str:
 _BACKTICK_RUN_RE = re.compile(r"`+")
 
 
+def _backslashes_before(row: str, pos: int) -> int:
+    """How many backslashes sit directly before row[pos]."""
+    n = 0
+    while pos - n > 0 and row[pos - n - 1] == "\\":
+        n += 1
+    return n
+
+
 def _mask_quotations(row: str) -> str:
     """`row` with each quoted key token (_QUOTED_KEY_RE) replaced by _QUOTE_MASK of the same width. A backtick run quotes only
     when it OPENS: runs pair up left to right, so a token whose opening run has an odd number of runs before it follows an
     unclosed or already-closed span and starts at a CLOSING run. In `x `!`check:` git`, the run after `!` closes the span `!`;
     taking it as an opener masked a bare `check:` (adversary pass on b68df2a5 A1). That token is left in the row, so its key is
-    refused: fail closed, and the author rewords."""
+    refused: fail closed, and the author rewords. A run preceded by an odd number of backslashes is escaped: it is text, not a
+    delimiter, and what an escaped backtick leaves behind (one literal backtick, then a shorter run) is not worth modelling. A
+    token after one is not masked at all, so its key is refused (Sol r5 B1: an escaped first run was counted, the pair read as
+    even, and a bare `check:` was masked). An EVEN number of backslashes is an escaped backslash and leaves the run real."""
     out, last = [], 0
     for m in _QUOTED_KEY_RE.finditer(row):
-        if len(_BACKTICK_RUN_RE.findall(row, 0, m.start())) % 2:
+        runs = list(_BACKTICK_RUN_RE.finditer(row, 0, m.start()))
+        if len(runs) % 2 or any(_backslashes_before(row, r.start()) % 2 for r in runs):
             continue
         out.append(row[last:m.start()])
         out.append(_QUOTE_MASK * (m.end() - m.start()))
