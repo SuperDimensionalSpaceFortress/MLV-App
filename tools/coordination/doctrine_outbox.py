@@ -843,7 +843,12 @@ def card_heading_row(body: str) -> str:
     str.splitlines() prefix. `## <project>/<id><U+0085>check: y` is ONE row to the bus, a heading that is not `## <project>/<id>`;
     reading only the prefix passed it and hid the fused key in the row the field-key screen skips (Sol r2 B1)."""
     rows = _card_rows(body)
-    return rows[0].rstrip(_JS_WS_CHARS) if rows else ""
+    if not rows:
+        return ""
+    row = rows[0]
+    # The bus opens a card at a row that starts with "## " and reads the heading as text.slice(3).trim(), so whitespace after
+    # the marker is trimmed, not refused (adversary r3 A1); the row is normalised to the one-space form CARD_HEADING_RE reads.
+    return "## " + row[3:].strip(_JS_WS_CHARS) if row.startswith("## ") else row.rstrip(_JS_WS_CHARS)
 
 
 def _bold_label_fold(label: str) -> tuple[str, str | None]:

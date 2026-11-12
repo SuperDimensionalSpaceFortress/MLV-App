@@ -3559,6 +3559,10 @@ def test_every_heading_row_the_bus_rejects_is_refused_and_every_one_it_accepts_i
     vendored parseCardsFile and by validate on the same card, and the two agree."""
     heads = ["## mlv-app/example-card" + s + t for s in _HEADING_SEPARATORS + _WS_PROBES + [""] for t in ("", "check: x")]
     heads += [w + "## mlv-app/example-card" for w in _WS_PROBES]
+    # the bus reads the heading as text.slice(3).trim(): whitespace after `## ` and around the id is trimmed, not refused (adversary r3 A1)
+    heads += ["## " + w + "mlv-app/example-card" for w in _WS_PROBES] + ["##  mlv-app/example-card", "## \tmlv-app/example-card  ",
+                                                                         "##\tmlv-app/example-card", "## mlv-app/example-card",
+                                                                         "## mlv-app /example-card", "## mlv-app/ example-card"]
     cards = [CARD_BODY.replace("## mlv-app/example-card", h, 1) for h in heads]
     js = _node(_JS_CARD_ERRORS, cards)
     bad = []
