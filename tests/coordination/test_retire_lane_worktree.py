@@ -709,7 +709,11 @@ def test_holder_exit_releases_the_worktree_for_real_retirement(repo):
         assert wt.exists()
     finally:
         _stop(p)
-    d, _ = _gate_real(wt, whatif=False)
+    # CI-FLAKE-RETIRE-HOLDER-EXIT-RELEASE-CORPUS-EMPTY-1: with the holder gone this call is about the retirement, not the host. A short-lived process of
+    # another project (measured here: vitest's node.exe, relative script, unreadable cwd, 3 in 20 loops) is a `relative-script-unresolved` row that is
+    # never exempt, so it refused a removal that had nothing to do with the holder. Same narrowing as the retry-window cases (ONLY_PYTEST_CHILDREN).
+    # The call that PROVES the live holder (above) keeps the whole-host snapshot.
+    d, _ = _gate_real(wt, whatif=False, prelude=ONLY_PYTEST_CHILDREN)
     assert (d["action"], d["reason"]) == ("retired", "ok"), d
     assert not wt.exists()
 
@@ -5794,3 +5798,158 @@ def test_noread_row_kinds_retire_keeps_the_worktree_naming_pid_and_file(repo, ki
     assert d["action"] == "kept" and d["reason"].startswith("cwd-unknown") and str(p.pid) in d["reason"] and _NOREAD_FILE in d["reason"], json.dumps(d)
     assert d["renameProbe"] == "not-run", json.dumps(d)
     assert (wt / ".git").exists() and (wt / "a.txt").exists(), "the worktree must be intact"
+
+
+# --- CI-FLAKE-RETIRE-HOLDER-EXIT-RELEASE-CORPUS-EMPTY-1: a recycled parent pid in the caller's ancestor chain hid a live holder ---
+# Hosted Tests run 43201503884 (job 131125818658, #802 head 9265be72): test_holder_exit_releases_the_worktree_for_real_retirement saw the gate
+# return `kept: in-use` (the rename probe) with holders=[] and cwdUnknown=[] while the holder (pid 732, a low pid) was alive and its cwd WAS the
+# worktree (the post-hoc census read it). The card's "corpus files: 0" is not the cause: a `-Command` holder has no script, so its corpus is
+# empty by construction. The row the gate never judged is the one it dropped as the CALLER'S OWN ANCESTOR: Get-LaneProcessSnapshot walked
+# ParentProcessId upward with no creation-time check, so an ancestor whose parent had exited (its pid since recycled to the holder) put the
+# holder's pid into SelfPids, and Get-LaneHolderIndex / Find-WorktreeHolders / Find-RunDirDriverHolders skip every SelfPids pid. A real parent
+# is created BEFORE its child; a "parent" created after its child is a recycled pid and ends the chain.
+
+_CHAIN_BASE = "([datetime]'2026-01-01T00:00:00Z')"
+
+
+def _chain_row(pid, ppid, name, minutes, extra=""):
+    """One Win32_Process row; minutes=None gives it no readable CreationDate."""
+    created = "$null" if minutes is None else f"{_CHAIN_BASE}.AddMinutes({minutes})"
+    return (f"[pscustomobject]@{{ ProcessId = [int]{pid}; ParentProcessId = [int]{ppid}; Name = '{name}'; CommandLine = '{name}'; "
+            f"CreationDate = {created}{extra} }}")
+
+
+def _chain_cim_seam(rows):
+    """Win32_Process answered from `rows` (built with _chain_row); every other class goes to the real cmdlet."""
+    return ("function Get-CimInstance { [CmdletBinding()] param([Parameter(Position=0)][string]$ClassName, [string]$Filter, [string[]]$Property) "
+            "if ($ClassName -ne 'Win32_Process') { return CimCmdlets\\Get-CimInstance @PSBoundParameters }; "
+            f"$all = @({'; '.join(rows)}); "
+            "if ($Filter -match 'ProcessId\\s*=\\s*(\\d+)') { return @($all | Where-Object { $_.ProcessId -eq [int]$Matches[1] }) }; $all };")
+
+
+def _chain_self_pids(rows):
+    script = ("$ErrorActionPreference='Stop'; " + f". '{HELPER}'; " + _chain_cim_seam(rows)
+              + " $s = Get-LaneProcessSnapshot; ConvertTo-Json -Compress @($s.SelfPids)")
+    r = subprocess.run([PWSH, "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True)
+    assert r.returncode == 0, r.stdout + r.stderr
+    return sorted(json.loads(r.stdout))
+
+
+def test_snapshot_ancestor_chain_stops_at_a_parent_pid_recycled_after_the_child_started():
+    """50002 was created AFTER its supposed child 50001 (the pid was recycled), so it is not an ancestor."""
+    s = _chain_self_pids([_chain_row("$PID", 50001, "pwsh.exe", 10), _chain_row(50001, 50002, "python.exe", 5), _chain_row(50002, 0, "holder.exe", 20)])
+    assert 50001 in s and 50002 not in s, s
+
+
+def test_snapshot_ancestor_chain_keeps_every_real_ancestor():
+    """A parent created before its child is an ancestor, however far up (the chain a lane running inside its own worktree has)."""
+    s = _chain_self_pids([_chain_row("$PID", 50001, "pwsh.exe", 30), _chain_row(50001, 50002, "python.exe", 20),
+                          _chain_row(50002, 50003, "bash.exe", 10), _chain_row(50003, 0, "Runner.exe", 1)])
+    assert {50001, 50002, 50003} <= set(s), s
+
+
+def test_snapshot_ancestor_chain_does_not_claim_a_parent_whose_creation_time_is_unreadable():
+    """Unknown is never free: a parent whose CreationDate cannot be read cannot be shown to be the real parent, so it is not excluded as self."""
+    s = _chain_self_pids([_chain_row("$PID", 50001, "pwsh.exe", 10), _chain_row(50001, 50002, "python.exe", 5), _chain_row(50002, 0, "holder.exe", None)])
+    assert 50001 in s and 50002 not in s, s
+
+
+def test_gate_refuses_a_live_holder_whose_pid_is_a_recycled_parent_of_the_callers_chain(repo):
+    """End to end through the REAL snapshot code: the holder's cwd is the worktree and its pid is the recycled parent of the caller's chain."""
+    tmp, main = repo
+    wt = _add_wt(main, tmp / "wt-recycled-parent")
+    rows = [_chain_row("$PID", 50001, "pwsh.exe", 10), _chain_row(50001, 50002, "python.exe", 5),
+            _chain_row(50002, 0, "pwsh.exe", 20, f"; CurrentDirectory = '{wt}\\'")]
+    d, err = _gate_err(wt, None, prelude=_chain_cim_seam(rows), whatif=True)
+    assert d["action"] == "kept" and d["reason"].startswith("live-process: 50002 pwsh.exe"), json.dumps(d)
+
+
+# --- CI-FLAKE-RETIRE-HOLDER-EXIT-RELEASE-CORPUS-EMPTY-1 r2 (Sol r1 ANC-01): the wall clock alone cannot order a parent and its child ---
+# The r1 rule ended the chain at a parent whose CreationDate was later than its child's. After a backward clock step (NTP, VM time sync) a GENUINE
+# parent carries the later stamp, so it was reported as a non-ancestor and, if its command line named the worktree, as a live holder (a false
+# refusal). Windows keeps a monotonic creation order the wall clock cannot disturb (ProcessSequenceNumber, NtQueryInformationProcess class 64):
+# when both pids' keys are readable it decides, and the wall-clock rule stays only as the fallback for a pid whose key cannot be read.
+
+
+def _chain_order_seam(keys, stale=None):
+    """Get-ProcessCreationOrder answered from `keys` ({pid or '$PID': sequence}); a pid not listed has no readable key. The live creation time it
+    reports is the snapshot row's own, except for the pids in `stale` ({pid: milliseconds}: the row's process has exited and the pid now runs a
+    process created that many ms LATER)."""
+    arms = "; ".join(f"$m[[int]{pid}] = [uint64]{seq}" for pid, seq in keys.items())
+    st = "; ".join(f"$st[[int]{pid}] = {ms}" for pid, ms in (stale or {}).items())
+    return ("function Get-ProcessCreationOrder { param([int]$ProcessId) $m = @{}; " + arms + f"; $st = @{{}}; {st}; "
+            "if (-not $m.ContainsKey($ProcessId)) { return $null }; "
+            "$r = @(Get-CimInstance Win32_Process | Where-Object { $_.ProcessId -eq $ProcessId })[0]; $c = ([datetime]$r.CreationDate).ToUniversalTime(); "
+            "if ($st.ContainsKey($ProcessId)) { $c = $c.AddMilliseconds($st[$ProcessId]) }; "
+            "[pscustomobject]@{ Sequence = [uint64]$m[$ProcessId]; CreatedUtc = $c } };")
+
+
+def _chain_self_pids_keyed(rows, keys, stale=None):
+    script = ("$ErrorActionPreference='Stop'; " + f". '{HELPER}'; " + _chain_cim_seam(rows) + " " + _chain_order_seam(keys, stale)
+              + " $s = Get-LaneProcessSnapshot; ConvertTo-Json -Compress @($s.SelfPids)")
+    r = subprocess.run([PWSH, "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True)
+    assert r.returncode == 0, r.stdout + r.stderr
+    return sorted(json.loads(r.stdout))
+
+
+def test_snapshot_ancestor_chain_keeps_a_genuine_parent_after_a_backward_clock_step():
+    """ANC-01: the parent (00:10) really started before its child (00:05 on the stepped-back clock); the monotonic key says so."""
+    rows = [_chain_row("$PID", 50001, "pwsh.exe", 5), _chain_row(50001, 0, "holder.exe", 10)]
+    s = _chain_self_pids_keyed(rows, {"$PID": 2000, 50001: 1000})
+    assert 50001 in s, s
+
+
+def test_snapshot_ancestor_chain_stops_at_a_recycled_parent_even_when_the_wall_clock_says_it_is_older():
+    """The converse: the wall clock (00:01 < 00:10) would accept the parent, the monotonic key (3000 > 2000) shows its pid was recycled."""
+    rows = [_chain_row("$PID", 50001, "pwsh.exe", 10), _chain_row(50001, 0, "holder.exe", 1)]
+    s = _chain_self_pids_keyed(rows, {"$PID": 2000, 50001: 3000})
+    assert 50001 not in s, s
+
+
+def test_snapshot_ancestor_chain_falls_back_to_the_wall_clock_when_a_key_is_unreadable():
+    """Only one side readable: the r1 wall-clock rule decides (older parent kept, newer parent ends the chain)."""
+    older = [_chain_row("$PID", 50001, "pwsh.exe", 10), _chain_row(50001, 0, "holder.exe", 1)]
+    newer = [_chain_row("$PID", 50001, "pwsh.exe", 5), _chain_row(50001, 0, "holder.exe", 10)]
+    assert 50001 in _chain_self_pids_keyed(older, {"$PID": 2000})
+    assert 50001 not in _chain_self_pids_keyed(newer, {"$PID": 2000})
+
+
+@pytest.mark.parametrize("later_ms", [3600000, 25, 10, 1], ids=["1h", "25ms", "10ms", "1ms"])
+def test_snapshot_ancestor_chain_ignores_a_live_key_that_belongs_to_a_different_process_than_the_row(later_ms):
+    """Adversary A1 (passes 2 and 3): the genuine parent (row 00:05, key 1000) exited after the scan and pid 50001 now runs a NEWER process (key 3000)
+    created `later_ms` after it. The live key is not the row's process however close the two stamps are (the WMI stamp has microsecond resolution, so
+    only a stamp within 1 us is the same process), so it is not used; the snapshot's own rows (parent 00:05 before child 00:10) decide."""
+    rows = [_chain_row("$PID", 50001, "pwsh.exe", 10), _chain_row(50001, 0, "runner.exe", 5)]
+    s = _chain_self_pids_keyed(rows, {"$PID": 2000, 50001: 3000}, stale={50001: later_ms})
+    assert 50001 in s, s
+    s = _chain_self_pids_keyed(rows, {"$PID": 2000, 50001: 3000})
+    s = _chain_self_pids_keyed(rows, {"$PID": 2000, 50001: 3000})
+    assert 50001 not in s, "with the live key bound to the row's process, the sequence (3000 > 2000) still ends the chain: " + str(s)
+
+
+def test_gate_does_not_refuse_a_genuine_ancestor_whose_command_line_names_the_worktree_after_a_clock_step_back(repo):
+    """ANC-01 end to end: the genuine parent (created 00:10, child 00:05) names the worktree on its command line and is not a holder."""
+    tmp, main = repo
+    wt = _add_wt(main, tmp / "wt-clock-step")
+    rows = [_chain_row("$PID", 50001, "pwsh.exe", 5),
+            _chain_row(50001, 0, f"holder.exe {wt}\\driver.py", 10)]
+    d, err = _gate_err(wt, None, prelude=_chain_cim_seam(rows) + " " + _chain_order_seam({"$PID": 2000, 50001: 1000}), whatif=True)
+    assert not str(d.get("reason", "")).startswith("live-process"), json.dumps(d)
+
+
+def test_real_process_creation_order_increases_from_parent_to_child():
+    """The real reader: a process started now has a larger key than this pwsh, its live creation time is the one the process table reports, and a pid
+    that does not exist has no key. The child is held alive (60 s ping) for the lookup and stopped afterwards (A2: no race with its exit)."""
+    script = ("$ErrorActionPreference='Stop'; " + f". '{HELPER}'; "
+              "$p = Start-Process -PassThru -WindowStyle Hidden ping -ArgumentList '-n 60 127.0.0.1'; "
+              "try { $mine = Get-ProcessCreationOrder -ProcessId $PID; $kid = Get-ProcessCreationOrder -ProcessId $p.Id; "
+              "$none = Get-ProcessCreationOrder -ProcessId 2147483000; "
+              "$row = Get-CimInstance Win32_Process -Filter \"ProcessId=$($p.Id)\"; "
+              "$skew = if ($kid) { [math]::Abs(($kid.CreatedUtc - ([datetime]$row.CreationDate).ToUniversalTime()).TotalMilliseconds) } else { -1 }; "
+              "ConvertTo-Json -Compress @{ mine = $mine.Sequence; kid = $kid.Sequence; none = $none; skewMs = $skew } } "
+              "finally { Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue }")
+    r = subprocess.run([PWSH, "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True)
+    assert r.returncode == 0, r.stdout + r.stderr
+    got = json.loads(r.stdout)
+    assert got["mine"] and got["kid"] and got["kid"] > got["mine"] and got["none"] is None, got
+    assert 0 <= got["skewMs"] <= 0.001, got   # the same kernel stamp: within the 1 us the WMI string keeps
