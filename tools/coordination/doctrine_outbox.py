@@ -909,6 +909,26 @@ def _from_heading_row(body: str) -> str:
     return "\n".join(rows[first:])
 
 
+_BACKTICK_RUN_RE = re.compile(r"`+")
+
+
+def _mask_quotations(row: str) -> str:
+    """`row` with each quoted key token (_QUOTED_KEY_RE) replaced by _QUOTE_MASK of the same width. A backtick run quotes only
+    when it OPENS: runs pair up left to right, so a token whose opening run has an odd number of runs before it follows an
+    unclosed or already-closed span and starts at a CLOSING run. In `x `!`check:` git`, the run after `!` closes the span `!`;
+    taking it as an opener masked a bare `check:` (adversary pass on b68df2a5 A1). That token is left in the row, so its key is
+    refused: fail closed, and the author rewords."""
+    out, last = [], 0
+    for m in _QUOTED_KEY_RE.finditer(row):
+        if len(_BACKTICK_RUN_RE.findall(row, 0, m.start())) % 2:
+            continue
+        out.append(row[last:m.start()])
+        out.append(_QUOTE_MASK * (m.end() - m.start()))
+        last = m.end()
+    out.append(row[last:])
+    return "".join(out)
+
+
 def _card_rows(body: str) -> list[str]:
     """The body's rows as the bus validator splits them: "\\n" only (CRLF read as LF), with the blank rows (_is_blank_row) before
     the heading dropped. Whitespace ON the heading row is kept, because the bus reads `## ` only at the start of its line and
@@ -980,7 +1000,7 @@ def screen_card_field_keys(body: str) -> None:
     for n, row in enumerate(rows[1:], start=2):
         parsed = _parse_field_line(row)
         start = parsed[2] if parsed and parsed[1] else 0
-        hit = _first_fused_key(_QUOTED_KEY_RE.sub(lambda s: _QUOTE_MASK * len(s.group(0)), row), start)
+        hit = _first_fused_key(_mask_quotations(row), start)
         if hit:
             col, key = hit
             where = (f"is at column {col}, fused into other text; a field key starts its own line" if col else

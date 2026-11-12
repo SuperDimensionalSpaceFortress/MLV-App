@@ -3879,3 +3879,27 @@ def test_a_published_as_claim_is_verified_against_the_cards_heading_not_its_prea
     assert why and "never-published" in why, why
     monkeypatch.setattr(ob, "bus_file_at", lambda *a, **k: "## mlv-app/never-published\nrule: the rule\n")
     assert ob.verify_published_as(Path("."), "2" * 40, item) is None
+
+
+# ---------- r5 fix 2: adversary pass on b68df2a5 (A1 a closing backtick re-used as the opener of a quotation) ----------
+#
+# A1: in `x `!`check:` git status` the span `!` is closed, so `check:` is bare text with a fused key; the quotation pattern took the
+# CLOSING backtick after `!` as an opener and masked `check:`, so the card passed validate and failed the bus (missing field 'check').
+# A backtick run quotes only when it OPENS: an even number of runs before it in the row (runs pair up left to right).
+#
+# Named mutation for this block (turns the named tests red, then is reverted):
+#   M26 mask every quotation-shaped token again, whatever precedes it -> every row below
+
+@pytest.mark.parametrize("n", [1, 2, 3])
+@pytest.mark.parametrize("punct", ["!", ",", ".", ";", "(", ")", "-", "x"])
+@pytest.mark.parametrize("key", ob.CARD_FIELDS)
+def test_validate_refuses_a_key_after_a_closed_span_whose_closing_run_would_open_a_fake_quotation(tmp_path, capsys, n, punct, key):
+    run = "`" * n
+    body = CARD_BODY.replace("rule: the rule\n", f"rule: x {run}{punct}{run}{key}:{run} git status\n", 1)
+    assert ob.main(["--repo", str(tmp_path), "validate", str(_write_card_item(tmp_path, body))]) == 1
+    assert "FIELD_KEY_FUSED" in capsys.readouterr().err
+
+
+def test_a_quotation_after_a_closed_span_is_still_a_quotation(tmp_path):
+    body = CARD_BODY.replace("rule: the rule\n", "rule: a `b` then `check:` and ``rule:`` and `c` then ```supersedes:``` ok\n", 1)
+    assert ob.main(["--repo", str(tmp_path), "validate", str(_write_card_item(tmp_path, body))]) == 0
