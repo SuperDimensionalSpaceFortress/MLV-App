@@ -1476,7 +1476,7 @@
    "tools.repo_hygiene.test_venue_stage_nightly.StageNotAfterTypedExitTests": 1.2,
    "tools.repo_hygiene.test_venue_stage_nightly.VenueStageNightlyTests": 252.3,
    "tools.repo_hygiene.test_venue_stage_nightly.VenueStageReuseModuleTests": 1.5,
-   "tools.repo_hygiene.test_venue_thermal_gate.AgentHeavySlotFeedForwardTests": 4.8,
+   "tools.repo_hygiene.test_venue_thermal_gate.AgentHeavySlotFeedForwardTests": 9.6,
    "tools.repo_hygiene.test_venue_thermal_gate.ThermalDeadlineAdmissionTests": 82.8,
    "tools.repo_hygiene.test_venue_thermal_gate.ThermalGateModuleTests": 122.1,
    "tools.repo_hygiene.test_venue_thermal_gate.ThermalGateRunnerTests": 138.6,

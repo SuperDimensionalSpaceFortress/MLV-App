@@ -2277,8 +2277,9 @@ class AgentHeavySlotFeedForwardTests(unittest.TestCase):
     def quote(text: str) -> str:
         return "'" + text.replace("'", "''") + "'"
 
-    def job_env(self, feed: str, *, agent_env_feed: str | None, tail: str) -> str:
-        """Run the agent's job-env block with $HeavySlotFeed = feed (the agent's own process env holding agent_env_feed as HEAVY_SLOT_FEED, or none), then a child standing for the job runs `tail`."""
+    def job_env(self, feed: str, *, agent_env_feed: str | None, tail: str, cwd: str | None = None) -> str:
+        """Run the agent's job-env block with $HeavySlotFeed = feed (the agent's own process env holding agent_env_feed as HEAVY_SLOT_FEED, or none, and its current directory `cwd`), then a child
+        standing for the job runs `tail`."""
         import os
         env = {k: v for k, v in os.environ.items() if k != "HEAVY_SLOT_FEED"}
         if agent_env_feed is not None:
@@ -2286,9 +2287,9 @@ class AgentHeavySlotFeedForwardTests(unittest.TestCase):
         script = ("$ErrorActionPreference = 'Stop'\n"
                   "$heatRule = [ordered]@{ maxThrottledRows = 6; meanMaxC = 88.0; sustainedRows = 60; feedStaleSec = 120 }\n"
                   "$script:Admission = [pscustomobject]@{ label = 'clear'; thermal = 'clear'; waitedSec = 0; heavySlotHeld = $null }\n"
-                  f"$HeavySlotFeed = '{feed}'\n" + self.block() + "\n"
+                  f"$HeavySlotFeed = {self.quote(feed)}\n" + self.block() + "\n"
                   f"& '{PWSH}' -NoLogo -NoProfile -NonInteractive -Command {self.quote(tail)}\n")
-        r = subprocess.run([str(PWSH), "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, timeout=180, env=env)
+        r = subprocess.run([str(PWSH), "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, timeout=180, env=env, cwd=cwd)
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
         return r.stdout.strip()
 
@@ -2316,13 +2317,28 @@ class AgentHeavySlotFeedForwardTests(unittest.TestCase):
         got = self.job_env(str(hot), agent_env_feed=None, tail=tail)
         self.assertEqual(got, f"{hot}|hot", "the job's gate must read the agent's feed (hot), not the default csv")
 
+    def test_a_relative_feed_is_forwarded_as_the_file_the_agent_reads_never_as_a_path_the_job_resolves_elsewhere(self) -> None:
+        # adversary r1 A1 (introduced major): the agent opens a relative -HeavySlotFeed under ITS current directory; the job (and the slot holder) start in $Root, so the raw text would name another
+        # file (or none) there. The job gets the absolute path the agent itself reads.
+        import tempfile
+        d = Path(tempfile.mkdtemp(prefix="feed-forward-rel-"))
+        tail = "[Console]::Out.Write([string]$env:HEAVY_SLOT_FEED)"
+        self.assertEqual(self.job_env("hot.csv", agent_env_feed=None, tail=tail, cwd=str(d)), str(d / "hot.csv"))
+        # an inherited absolute HEAVY_SLOT_FEED does not matter: the effective (relative) param wins in the agent, and it is the absolute form of THAT that the job gets
+        self.assertEqual(self.job_env(r"sub\hot.csv", agent_env_feed=r"C:\temp\hot.csv", tail=tail, cwd=str(d)), str(d / "sub" / "hot.csv"))
+        # an absolute path (with an apostrophe in it: adversary r1 A2) and a UNC path pass through unchanged
+        self.assertEqual(self.job_env(r"C:\O'Brien\hot.csv", agent_env_feed=None, tail=tail, cwd=str(d)), r"C:\O'Brien\hot.csv")
+        self.assertEqual(self.job_env(r"\\heat-trace.invalid\share\hwinfo-log-adapter.csv", agent_env_feed=None, tail=tail, cwd=str(d)), r"\\heat-trace.invalid\share\hwinfo-log-adapter.csv")
+
     def test_every_heavy_slot_child_the_agent_starts_forwards_the_feed_it_decides_on(self) -> None:
-        # the class: each child launch that reads the heat feed (heavy-slot.py status / holder / lease request / lease renew) sets HEAVY_SLOT_FEED from $HeavySlotFeed; the job is the one child that
-        # takes it from the process env, set in the PARITY-1 block
+        # the class: each child launch that reads the heat feed (heavy-slot.py status / lease request / lease renew: they start in the agent's own directory, so the raw path is the one it reads) sets
+        # HEAVY_SLOT_FEED from $HeavySlotFeed; the two that start in $Root (the job, and the slot holder) get the absolute path; the job takes it from the process env, set in the PARITY-1 block
         agent = AGENT.read_text(encoding="utf-8")
         self.assertEqual(len(re.findall(r'\$si\.Environment\["HEAVY_SLOT_FEED"\] = \$HeavySlotFeed', agent)), 3)
-        self.assertEqual(len(re.findall(r"HEAVY_SLOT_DIR = \$HeavySlotDir; HEAVY_SLOT_FEED = \$HeavySlotFeed", agent)), 1)
-        self.assertEqual(self.block().count("$env:HEAVY_SLOT_FEED = $HeavySlotFeed"), 1)
+        absolute = "$(try { [System.IO.Path]::GetFullPath($HeavySlotFeed) } catch { $HeavySlotFeed })"
+        self.assertEqual(agent.count("HEAVY_SLOT_DIR = $HeavySlotDir; HEAVY_SLOT_FEED = " + absolute + "; HEAVY_SLOT_HELD = $null"), 1)
+        self.assertEqual(self.block().count("$env:HEAVY_SLOT_FEED = " + absolute), 1)
+        self.assertNotIn("$env:HEAVY_SLOT_FEED = $HeavySlotFeed", agent)
 
 
 if __name__ == "__main__":

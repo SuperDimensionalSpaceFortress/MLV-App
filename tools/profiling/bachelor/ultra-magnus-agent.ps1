@@ -2865,7 +2865,7 @@ function Start-HeavySlotHolder {
         # HEAVY_SLOT_HELD is REMOVED: a holder must take its own slot, never pass through as nested.
         $launch = Start-WindowlessRedirectedProcess -FilePath $py -ArgumentList $argv `
             -OutFile (Join-Path $logs "$id.heavy-slot.out.txt") -ErrFile (Join-Path $logs "$id.heavy-slot.err.txt") `
-            -Environment @{ HEAVY_SLOT_DIR = $HeavySlotDir; HEAVY_SLOT_FEED = $HeavySlotFeed; HEAVY_SLOT_HELD = $null }
+            -Environment @{ HEAVY_SLOT_DIR = $HeavySlotDir; HEAVY_SLOT_FEED = $(try { [System.IO.Path]::GetFullPath($HeavySlotFeed) } catch { $HeavySlotFeed }); HEAVY_SLOT_HELD = $null }
     }
     catch {
         # AGENT-LEASE-HEAT-TRACE-BOUND-HARDEN-1 r2 (sol r1 B4-post-start): the launch helper has already stopped a holder that started before
@@ -4386,7 +4386,8 @@ function Invoke-QueuedJob {
     $env:MLV_AGENT_HEAT_RULE = ($heatRule | ConvertTo-Json -Compress)
     # VENUE-PROBE-HEAVY-SLOT-FEED-FORWARD-1: the FEED the rule is applied to rides with the rule. The in-job quiet probe picks its feed from $env:HEAVY_SLOT_FEED (else the default csv), so an
     # agent started with -HeavySlotFeed X and no HEAVY_SLOT_FEED of its own would otherwise judge X while the job's gate read the default csv and still labelled its thresholds `agent`.
-    $env:HEAVY_SLOT_FEED = $HeavySlotFeed
+    # The ABSOLUTE path, as the agent's own reader resolves it (a relative -HeavySlotFeed is a file under THIS agent's current directory, and the job starts in $Root); a text GetFullPath refuses goes as given.
+    $env:HEAVY_SLOT_FEED = $(try { [System.IO.Path]::GetFullPath($HeavySlotFeed) } catch { $HeavySlotFeed })
     $env:MLV_AGENT_ADMISSION = $script:Admission.label
     $env:MLV_AGENT_ADMISSION_THERMAL = [string]$script:Admission.thermal
     $env:MLV_AGENT_ADMISSION_WAIT_SEC = [string]$script:Admission.waitedSec
