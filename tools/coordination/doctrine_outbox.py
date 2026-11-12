@@ -822,6 +822,12 @@ _BOLD_LABEL_SCAN_RE = re.compile(r"- \*\*(?P<label>[^*:]+):\*\*")
 _QUOTED_KEY_RE = re.compile(r"(?<![`\\\w])(`+)(?!`)[^\s`]*(?:" + _FIELD_KEY_ALT + r"):\1(?!`)")
 
 
+# What a quoted token is replaced with before the scan: the same width (so a reported column holds) and a character that is
+# neither whitespace nor part of a key or a bold label's punctuation. Spaces were wrong: a space inside a bold label is text the
+# bus validator trims and folds, so masking `check `rule:`:` as spaces made a fabricated `check` label (adversary r2 A1).
+_QUOTE_MASK = "\x00"
+
+
 def _bold_label_fold(label: str) -> tuple[str, str | None]:
     """A bold label as the bus validator folds it (trim, lower-case, whitespace runs to one space) and the field it names, or None."""
     folded = re.sub(f"{_JS_WS}+", " ", label.strip(_JS_WS_CHARS).lower())
@@ -862,14 +868,14 @@ def screen_card_field_keys(body: str) -> None:
     bus validator reads as a field (_parse_field_line: `name: value` or `- **Name:** value`, a value after whitespace) is scanned
     past its opening label; any other line (a continuation, a bold note such as `- **hooks.check:**`, or a line the validator does
     not read as a field at all, such as `check:echo`) is scanned in full, since a key there is fused into the text before it. A
-    quoted token (_QUOTED_KEY_RE) is blanked first (same width, so the reported column holds). Lines split on "\\n" only (CRLF
+    quoted token (_QUOTED_KEY_RE) is masked first (_QUOTE_MASK, same width, so the reported column holds). Lines split on "\\n" only (CRLF
     read as LF), as the bus validator splits them: str.splitlines() also breaks on \\x85, U+2028 and friends, which turned
     `x<U+0085>applies: y` into a fictitious line that opens with its own field."""
     rows = body.lstrip().replace("\r\n", "\n").split("\n")
     for n, row in enumerate(rows[1:], start=2):
         parsed = _parse_field_line(row)
         start = parsed[2] if parsed and parsed[1] else 0
-        hit = _first_fused_key(_QUOTED_KEY_RE.sub(lambda s: " " * len(s.group(0)), row), start)
+        hit = _first_fused_key(_QUOTED_KEY_RE.sub(lambda s: _QUOTE_MASK * len(s.group(0)), row), start)
         if hit:
             col, key = hit
             where = (f"is at column {col}, fused into other text; a field key starts its own line" if col else

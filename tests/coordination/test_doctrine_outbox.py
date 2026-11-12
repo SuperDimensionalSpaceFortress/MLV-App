@@ -3379,6 +3379,29 @@ def test_validate_names_a_fused_bold_key_in_the_form_the_bus_validator_reads_it(
     assert f"'{shown}:'" in capsys.readouterr().err
 
 
+# Adversary pass r2 on fa3aec80 (sol): A1 the quoted token was masked with SPACES, and a space inside a bold label is label text
+# the bus validator trims and folds, so masking `check `rule:`:` made a fabricated `check` label out of a continuation line. The
+# mask is a character that is neither whitespace nor a label or key character, so masking never creates or joins a label.
+
+@pytest.mark.parametrize("row", [
+    "  - **check `rule:`:** x",                    # A1: the exact attack input: an indented continuation, prose to the bus
+    "  - **applies `x/rule:` to:** y",             # the same class through the folded two-word label
+    "  - **Where `a/rule:` and `b/check:`:** y",
+    "  note `rule:` and `touches/evidence:` quoted",
+    "  - **Where:** see `mechanism:` and ``check:`` here",
+])
+def test_validate_does_not_fabricate_a_field_from_the_mask_of_a_quoted_key(tmp_path, row):
+    body = CARD_BODY.replace("rule: the rule\n", f"rule: the rule\n{row}\n", 1)
+    assert ob.main(["--repo", str(tmp_path), "validate", str(_write_card_item(tmp_path, body))]) == 0
+
+
+@needs_node
+def test_the_bus_validator_accepts_the_cards_whose_quoted_keys_the_mask_must_leave_alone():
+    rows = ["  - **check `rule:`:** x", "  - **applies `x/rule:` to:** y", "  - **Where `a/rule:` and `b/check:`:** y", "  note `rule:` and `touches/evidence:` quoted"]
+    cards = [CARD_BODY.replace("rule: the rule\n", f"rule: the rule\n{r}\n", 1) for r in rows]
+    assert _node(_JS_CARD_ERRORS, cards) == [[] for _ in rows]
+
+
 @needs_node
 def test_the_bold_label_table_is_the_vendored_bus_validators():
     got = _node(f"import {{ BOLD_LABELS }} from '{_JS_FIELD_SRC}'; process.stdout.write(JSON.stringify(BOLD_LABELS));\n")
