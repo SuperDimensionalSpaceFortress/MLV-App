@@ -135,10 +135,20 @@ DUMP_FIELDS = {"pre_safety": "pre_safety_png|none", "pre_safety_sha256": "sha256
                "final": "final_png|none", "final_sha256": "sha256|none", "final_exposure": "int", "safety": "safety", "frame": "uint"}
 
 
+TYPE_MAX = {"uint64": 2 ** 64 - 1}        # the digit bound alone does not bound the value: 20 digits run past a qulonglong
+
+
+def field_has_type(type_name, value):
+    """True when `value` is a well-typed spelling of `type_name`, range included."""
+    if not TYPES[type_name].fullmatch(value):
+        return False
+    return type_name not in TYPE_MAX or int(value) <= TYPE_MAX[type_name]
+
+
 def bad_fields(table, pairs):
     """-> the names of the fields of `pairs` whose value does not match the type `table` gives them (every occurrence of a name).
     A name the table does not list is the line's own and not ours to type; a name given twice is the caller's ambiguity check."""
-    return sorted({key for key, value in pairs if key in table and not TYPES[table[key]].fullmatch(value)})
+    return sorted({key for key, value in pairs if key in table and not field_has_type(table[key], value)})
 
 
 # What one application's result sets, plus the two markers of its identity: "closed" (a result / applied line completed it, so
@@ -202,6 +212,7 @@ def parse_log_text(text):
     pending_dump = None      # the picture_dump line the NEXT result will own (it precedes its own result line)
     newest_dump = None       # the newest picture_dump line anywhere in the log
     dump_lines = 0
+    dump_defect = None       # the first picture_dump line that is ambiguous or ill-typed, anywhere in the arm's log
     for line in text.splitlines():
         event, start = line_event(line)
         marked = event is not None          # False: no interaction_trace tag (back-compat reading, never owns a dump)
@@ -233,6 +244,11 @@ def parse_log_text(text):
             bad = bad_fields(DUMP_FIELDS, pairs)
             if bad:
                 fields["_malformed"] = ",".join(bad)      # a field of the app's dump line that is not its type: never a binding
+            if bad or ambiguous:
+                # ...and the arm's evidence is defective in EVERY mode: --decisions-only never binds a picture, but it does not get
+                # to ignore a dump line the app logged that is ambiguous or not what the app prints (adversary pass 0e450da2 A1).
+                dump_defect = dump_defect or ("a picture_dump line gives a key twice" if ambiguous
+                                              else "a picture_dump line has a field that is not the type the app prints (%s)" % ",".join(bad))
             pending_dump = newest_dump = fields
             dump_lines += 1
             continue
@@ -304,6 +320,8 @@ def parse_log_text(text):
                 receipt["picture_dump"], pending_dump = None, None
     if skipped:
         receipt = dict(receipt or {}, skipped=skipped)
+    if dump_defect:
+        receipt = dict(receipt or {}, dump_defect=dump_defect)      # arm-level, like a skip: no later event clears it
     if receipt is not None and dump_lines:
         # Only the NEWEST picture_dump line can bind the final PNG now on disk, and only when it belongs to the LAST
         # application. receipt["picture_dump"] is None when the last application owns no dump line.
@@ -339,6 +357,8 @@ def check_receipt(name, receipt, require_daylight=False):
         return ["%s: the last application ended in a safety fallback (an earlier accepted receipt is not the shipped picture)" % name]
     if receipt and receipt.get("skipped"):
         return ["%s: the last application was skipped (%s)" % (name, receipt["skipped"])]
+    if receipt and receipt.get("dump_defect"):
+        return ["%s: the arm's evidence is defective: %s" % (name, receipt["dump_defect"])]
     if not receipt or not all(k in receipt for k in ("scene", "source", "decision", "temperature", "tint", "exposure")):
         return ["%s: no complete Look Assist apply in the trace (did the run settle?): %r" % (name, receipt)]
     if receipt["source"] in sidecars.FORBIDDEN_WB_SOURCES:

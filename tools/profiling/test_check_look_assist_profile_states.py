@@ -910,9 +910,7 @@ class PictureDumpBindingAdversaryR3(unittest.TestCase):
                 if event not in carries.get(extra, flows):
                     continue
                 root = self.bound(lambda sha, flow=flow, extra=extra: flow(sha, extra))
-                for argv in ([], ["--decisions-only"]):
-                    if event == "dump" and argv:
-                        continue        # decisions-only never reads the dump line
+                for argv in ([], ["--decisions-only"]):      # r5 (adversary 0e450da2 A1): a dump line the arm carries is validated in EVERY mode
                     with self.subTest("%s on %s %s" % (spelling, event, argv)):
                         code, text = run_checker([root, "--tag", "t"] + argv)
                         self.assertEqual(1, code, text)
@@ -1050,7 +1048,8 @@ _FIX = ["NaN", "nan", "inf", "-inf", "", "1", "1.0", "1e0", "x", "1.5.0", "+1.00
 BAD_VALUES = {
     "int": _NUM,
     "uint": _NUM + ["-1", "-999999999"],
-    "uint64": ["NaN", "", "1.5", "-1", "+1", "007", "1" * 21, HUGE, "x"],
+    "uint64": ["NaN", "", "1.5", "-1", "+1", "007", "1" * 21, HUGE, "x",
+               "18446744073709551616", "99999999999999999999"],      # r5 (adversary 0e450da2 A2): 20 digits above the qulonglong maximum
     "bool01": ["2", "-1", "true", "", "01", "1.0", "x", "10"],
     "fixed3": _FIX + ["1.0000"],
     "fixed6": _FIX + ["1.000", "1.0000000"],
@@ -1101,20 +1100,56 @@ class TableDrift(unittest.TestCase):
                 pairs = chk.FIELD.findall(line.split(" ", 1)[1])          # everything after the event name
                 self.assertEqual(sorted(FIELD_TYPES[event]), sorted(key for key, _ in pairs))
                 for key, value in pairs:
-                    self.assertTrue(chk.TYPES[FIELD_TYPES[event][key]].fullmatch(value), (event, key, value))
+                    self.assertTrue(chk.field_has_type(FIELD_TYPES[event][key], value), (event, key, value))
         for type_name in set(t for table in FIELD_TYPES.values() for t in table.values()):
             with self.subTest("type " + type_name):
                 self.assertIn(type_name, BAD_VALUES)
                 for bad in BAD_VALUES[type_name]:
-                    self.assertIsNone(chk.TYPES[type_name].fullmatch(bad), (type_name, bad[:20]))
+                    self.assertFalse(chk.field_has_type(type_name, bad), (type_name, bad[:20]))
                 for good in GOOD_VALUES.get(type_name, []):
-                    self.assertTrue(chk.TYPES[type_name].fullmatch(good), (type_name, good))
+                    self.assertTrue(chk.field_has_type(type_name, good), (type_name, good))
 
-    def test_the_tables_name_exactly_the_fields_in_the_apps_format_strings(self):
-        def keys(source_text, anchor, count_tail=False):
+    def test_the_tables_name_exactly_the_fields_in_the_apps_format_strings_and_their_precision(self):
+        def literal_of(source_text, anchor):
             start = source_text.index(anchor)
-            literal = source_text[start:source_text.index(")", start)]
-            return sorted(set(re.findall(r"(\w+)=%\d+", literal)))
+            return start, source_text[start:source_text.index(")", start)]
+
+        def keys(source_text, anchor):
+            return sorted(set(re.findall(r"(\w+)=%\d+", literal_of(source_text, anchor)[1])))
+
+        def args_of(source_text, anchor):
+            """The arguments of the .arg( ... ) chain that fills the format string, balanced-paren split (adversary 0e450da2 A3)."""
+            position = source_text.index(".arg(", literal_of(source_text, anchor)[0])
+            args = []
+            while source_text.startswith(".arg(", position):
+                depth, index, quoted = 1, position + len(".arg("), False
+                while depth:
+                    char = source_text[index]
+                    if char == '"':
+                        quoted = not quoted
+                    elif not quoted and char == "(":
+                        depth += 1
+                    elif not quoted and char == ")":
+                        depth -= 1
+                    index += 1
+                args.append(source_text[position + len(".arg("):index - 1])
+                position = index
+                while source_text[position].isspace():
+                    position += 1
+            return args
+
+        def precision_is_pinned(source_text, anchor, table):
+            """Every key=%N of the format string is printed with the precision its table type says: 'f', 3 for fixed3, 'f', 6 for
+            fixed6, and no 'f' argument at all for an integer, flag, name or size. -> how many fields were checked."""
+            wanted = {"fixed3": 3, "fixed6": 6, "fixed3|NA": 3}
+            args = args_of(source_text, anchor)
+            pairs = re.findall(r"(\w+)=%(\d+)", literal_of(source_text, anchor)[1])
+            self.assertTrue(pairs)
+            for key, number in pairs:
+                found = re.search(r"'f',\s*(\d+)", args[int(number) - 1])
+                self.assertEqual(wanted.get(table[key]), int(found.group(1)) if found else None, (anchor, key, args[int(number) - 1]))
+            return len(pairs)
+
         def read(*parts):
             with open(os.path.join(REPO, *parts), "r", encoding="utf-8", errors="replace") as handle:
                 return handle.read()
@@ -1127,9 +1162,16 @@ class TableDrift(unittest.TestCase):
                          sorted(set(keys(main_window, '"analysis=raw scene=%1')) | set(decision) | {"analysis", "grade"}))     # analysis=raw is literal; %29 is the decision fields; grade is the Film / Vision tail
         self.assertEqual(sorted(chk.DISPATCH_FIELDS), sorted(set(keys(main_window, '"generation=%1 frame=%2 scene=%3')) | {"grade"}))
         self.assertEqual(sorted(chk.APPLIED_FIELDS), keys(main_window, '"generation=%1 valid=%2 source=%3'))
+        # the precision each field is printed with is what its type pins (a 'f', 6 where the table says fixed3 is a drift)
+        self.assertEqual(18, precision_is_pinned(main_window, '"valid=%1 source=%2 decision=%3 damping=%4', chk.AUTO_WB_FIELDS))
+        self.assertGreater(precision_is_pinned(main_window, '"analysis=raw scene=%1', chk.RESULT_FIELDS), 25)
+        self.assertEqual(11, precision_is_pinned(main_window, '"generation=%1 valid=%2 source=%3', chk.APPLIED_FIELDS))
+        self.assertEqual(5, precision_is_pinned(main_window, '"generation=%1 frame=%2 scene=%3', chk.DISPATCH_FIELDS))
+        self.assertEqual(12, precision_is_pinned(analysis, '"has_ev100=%1', chk.DECISION_FIELDS))
         if "lookAssistPictureDumpFields" not in analysis:
             self.skipTest("this branch has not merged the picture_dump emitter (PR #793) yet; hosted CI tests the merge ref, which has it")
         self.assertEqual(sorted(chk.DUMP_FIELDS), keys(analysis, '"pre_safety=%1'))
+        self.assertEqual(8, precision_is_pinned(analysis, '"pre_safety=%1', chk.DUMP_FIELDS))
 
 
 class TableDrivenFieldGrammar(unittest.TestCase):
@@ -1183,9 +1225,7 @@ class TableDrivenFieldGrammar(unittest.TestCase):
             for key, type_name in table.items():
                 for bad in BAD_VALUES[type_name]:
                     root = self.evidence(self.flow(event, key, bad))
-                    for argv in ([], ["--decisions-only"]):
-                        if event == "dump" and argv:
-                            continue        # decisions-only never reads the dump line
+                    for argv in ([], ["--decisions-only"]):      # r5 (adversary 0e450da2 A1): the dump line too, in every mode
                         with self.subTest("%s %s=%r %s" % (event, key, bad[:12] + ("...(%d)" % len(bad) if len(bad) > 12 else ""), argv)):
                             code, text = run_checker([root, "--tag", "t"] + argv)
                             self.assertEqual(1, code, text)
@@ -1201,6 +1241,31 @@ class TableDrivenFieldGrammar(unittest.TestCase):
                     with self.subTest("control %s %s=%s" % (event, key, good)):
                         code, text = run_checker([self.evidence(self.flow(event, key, good)), "--tag", "t"])
                         self.assertEqual(0, code, text)
+
+    def test_adversary_0e450da2_a1_a_malformed_dump_line_refuses_the_arm_under_decisions_only_too(self):
+        auto_wb = "look_assist.apply.auto_wb valid=1 source=rendered-neutral-patch decision=accepted damping=1.000"
+        result = "look_assist.apply.result scene=shade preset_exp=160 final_temp=8950 final_tint=-35 frame=0"
+        dump = ("look_assist.apply.picture_dump final=look-assist-final-frame0.png final_sha256=%s final_exposure=160 safety=%s frame=0"
+                % ("a" * 64, "%s"))
+        for bad in ("NaN", "", "other"):
+            with self.subTest("safety=%r" % bad):
+                code, text = run_checker([self.evidence([auto_wb, dump % bad, result]), "--tag", "t", "--decisions-only"])
+                self.assertEqual(1, code, text)
+                self.assertNotIn("PASS", text)
+        # a dump line from an EARLIER application is as much the arm's evidence as the newest one
+        stale = dump % "NaN"
+        code, text = run_checker([self.evidence([auto_wb, stale, result, auto_wb, dump % "keep", result]), "--tag", "t", "--decisions-only"])
+        self.assertEqual(1, code, text)
+        self.assertEqual(0, run_checker([self.evidence([auto_wb, dump % "keep", result]), "--tag", "t", "--decisions-only"])[0])
+
+    def test_adversary_0e450da2_a2_a_serial_above_the_unsigned_64_bit_maximum_is_malformed(self):
+        for key, bad in (("last_serial", "18446744073709551616"), ("next_serial", "99999999999999999999")):
+            with self.subTest(key):
+                code, text = run_checker([self.evidence(self.flow("result", key, bad)), "--tag", "t"])
+                self.assertEqual(1, code, text)
+                self.assertNotIn("picture_dump-bound", text)
+        code, text = run_checker([self.evidence(self.flow("result", "last_serial", "18446744073709551615")), "--tag", "t"])
+        self.assertEqual(0, code, text)
 
     def test_b2_decisions_only_validates_the_completion_frame_of_every_application(self):
         auto_wb = "look_assist.apply.auto_wb valid=1 source=rendered-neutral-patch decision=accepted damping=1.000"
