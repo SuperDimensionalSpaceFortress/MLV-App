@@ -18,6 +18,8 @@ from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Iterable, Sequence
 
+_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
+
 
 SCHEMA = "mlv-protected-check-route/v1"
 FULL_SHA = re.compile(r"^[0-9a-f]{40}$")
@@ -55,7 +57,7 @@ def _git(repo: Path, *args: str, text: bool = True) -> str | bytes:
         cwd=repo,
         capture_output=True,
         text=text,
-        check=False,
+        check=False, creationflags=_NO_WINDOW,
     )
     if result.returncode != 0:
         stderr = result.stderr if text else result.stderr.decode("utf-8", "replace")

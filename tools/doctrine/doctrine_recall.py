@@ -63,6 +63,8 @@ from dataclasses import dataclass, field
 from datetime import date
 from pathlib import Path
 
+_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
+
 REPO_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_BUS = Path(r"C:\!Layi Wkspc\softwarefactory-fleet-doctrine")
 CONSUMER_DOC = REPO_ROOT / "agents" / "doctrine-consumer.md"
@@ -400,7 +402,7 @@ def _kill_tree(proc: subprocess.Popen) -> None:
                 ["taskkill", "/T", "/F", "/PID", str(proc.pid)],
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
-                timeout=KILL_TASKKILL_S,
+                timeout=KILL_TASKKILL_S, creationflags=_NO_WINDOW,
             )
         except (OSError, subprocess.SubprocessError):
             pass
@@ -434,6 +436,7 @@ def _git_run(
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE if capture_stderr else subprocess.DEVNULL,
             stdin=subprocess.DEVNULL,
+            creationflags=_NO_WINDOW,
             **extra,
         )
     except OSError as exc:

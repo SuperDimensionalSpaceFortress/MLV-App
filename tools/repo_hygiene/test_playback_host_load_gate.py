@@ -26,6 +26,8 @@ import tempfile
 import unittest
 from pathlib import Path
 
+_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
+
 ROOT = Path(__file__).resolve().parents[2]
 SMOKE_SCRIPT = ROOT / "tools" / "profiling" / "run-release-gui-smoke.ps1"
 COMPARE_SCRIPT = ROOT / "tools" / "profiling" / "compare-release-gui-smoke-ab.ps1"
@@ -94,7 +96,7 @@ class _ProbeCase(unittest.TestCase):
         return subprocess.run(
             [PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
              "-File", str(script)],
-            capture_output=True, text=True,
+            capture_output=True, text=True, creationflags=_NO_WINDOW,
         )
 
 
@@ -241,7 +243,7 @@ class HostLoadSnapshotTests(_ProbeCase):
         # subjectCpuSeconds must fall back to $null (third state), never a stale or zero value.
         proc = self.run_snippet(
             "$p = Start-Process -FilePath 'powershell.exe' "
-            "-ArgumentList '-NoProfile','-Command','Start-Sleep -Milliseconds 300' -PassThru\n"
+            "-ArgumentList '-NoProfile','-Command','Start-Sleep -Milliseconds 300' -WindowStyle Hidden -PassThru\n"
             "Start-Sleep -Milliseconds 150\n"
             "$live = Get-HostLoadSnapshot -TopProcessCount 1 -SubjectProcess $p\n"
             "Write-Host \"LIVE_SUBJECT=$($live.subjectCpuSeconds)\"\n"
@@ -404,7 +406,7 @@ class GuiSmokeScreenshotCatchSanitizationTests(unittest.TestCase):
         return subprocess.run(
             [PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
              "-File", str(script)],
-            capture_output=True, text=True,
+            capture_output=True, text=True, creationflags=_NO_WINDOW,
         )
 
     def test_a_throwing_screenshot_metadata_read_records_type_name_only(self) -> None:
@@ -1052,7 +1054,7 @@ class HostLoadSnapshotProducerAlignmentTests(_ProbeCase):
             # (-SubjectNotYetStarted) is pinned to the OPPOSITE order by
             # test_before_bracket_takes_system_times_after_slow_evidence below.
             "$subject = Start-Process -FilePath 'powershell.exe' -ArgumentList "
-            "'-NoProfile','-NonInteractive','-Command','Start-Sleep -Seconds 60' -PassThru\n"
+            "'-NoProfile','-NonInteractive','-Command','Start-Sleep -Seconds 60' -WindowStyle Hidden -PassThru\n"
             "try {\n"
             "$callStartUtc = [datetime]::UtcNow\n"
             "$s = Get-HostLoadSnapshot -TopProcessCount 1 -SubjectProcess $subject\n"
@@ -1216,7 +1218,7 @@ class HostLoadSnapshotProducerAlignmentTests(_ProbeCase):
             "function Get-Process { param($ErrorAction, $Id) @() }\n"
             "$spinner = Start-Process -FilePath 'powershell.exe' -ArgumentList "
             "'-NoProfile','-NonInteractive','-Command','while ($true) { [Math]::Sqrt(12345) | Out-Null }' "
-            "-PassThru\n"
+            "-WindowStyle Hidden -PassThru\n"
             "try {\n"
             "    $before = Get-HostLoadSnapshot -TopProcessCount 1 -SubjectProcess $spinner\n"
             "    $spinner.Refresh()\n"
@@ -1531,7 +1533,7 @@ class GuiSmokeObservedMaxSampleGapGuardExecutesTests(_ProbeCase):
         return subprocess.run(
             [PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
              "-File", str(script)],
-            capture_output=True, text=True,
+            capture_output=True, text=True, creationflags=_NO_WINDOW,
         )
 
     def test_astras_exact_repro_the_true_maximum_gap_is_7000ms_not_4000ms(self) -> None:
@@ -2922,7 +2924,7 @@ class P3ValidationSpeedValidatedGuardExecutesTests(_ProbeCase):
         return subprocess.run(
             [PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
              "-File", str(script)],
-            capture_output=True, text=True,
+            capture_output=True, text=True, creationflags=_NO_WINDOW,
         )
 
     def test_provisional_clip_that_is_otherwise_clean_is_not_speed_validated(self) -> None:
@@ -3005,7 +3007,7 @@ class P3ValidationImportSpeedFloorGuardExecutesTests(_ProbeCase):
         return subprocess.run(
             [PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
              "-File", str(script)],
-            capture_output=True, text=True,
+            capture_output=True, text=True, creationflags=_NO_WINDOW,
         )
 
     def test_provisional_false_with_unknown_state_is_refused(self) -> None:
@@ -3091,7 +3093,7 @@ class P3ValidationHostLoadFieldsAssignmentExecutesTests(_ProbeCase):
         return subprocess.run(
             [PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
              "-File", str(script)],
-            capture_output=True, text=True,
+            capture_output=True, text=True, creationflags=_NO_WINDOW,
         )
 
     def test_production_assignment_executes_with_a_populated_result(self) -> None:
@@ -3220,7 +3222,7 @@ class LocalCudaProofSummarizerGuardExecutesTests(_ProbeCase):
         return subprocess.run(
             [PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
              "-File", str(script)],
-            capture_output=True, text=True,
+            capture_output=True, text=True, creationflags=_NO_WINDOW,
         )
 
     def test_baseline_provisional_false_with_unknown_state_is_refused(self) -> None:
@@ -3360,7 +3362,7 @@ class ConsumerSweepUltraMagnusAndLocalGpuCapabilityRowsTests(unittest.TestCase):
             proc = subprocess.run(
                 [PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
                  "-File", str(script)],
-                capture_output=True, text=True,
+                capture_output=True, text=True, creationflags=_NO_WINDOW,
             )
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         self.assertIn("host_load_provisional", proc.stdout)
@@ -3412,7 +3414,7 @@ class WholeFileParseSafetyNetTests(unittest.TestCase):
             self.assertTrue(path.is_file(), f"missing file: {path}")
             proc = subprocess.run(
                 [PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", self._parse_check_command(path)],
-                capture_output=True, text=True,
+                capture_output=True, text=True, creationflags=_NO_WINDOW,
             )
             self.assertEqual(proc.returncode, 0, f"{path} failed to parse:\n{proc.stdout}{proc.stderr}")
 
@@ -3430,7 +3432,7 @@ class WholeFileParseSafetyNetTests(unittest.TestCase):
             )
             proc = subprocess.run(
                 [PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", self._parse_check_command(broken)],
-                capture_output=True, text=True,
+                capture_output=True, text=True, creationflags=_NO_WINDOW,
             )
             self.assertNotEqual(proc.returncode, 0)
 

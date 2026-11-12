@@ -529,25 +529,27 @@ int get_area_average_downscale_thumnail_with_processing_cachefree(
     return result;
 }
 
-void get_area_average_downscale_thumnail(mlvObject_t *video, int frame_index, int downscale_factor, int cpu_cores, unsigned char *out_buffer)
+int get_area_average_downscale_thumnail(mlvObject_t *video, int frame_index, int downscale_factor, int cpu_cores, unsigned char *out_buffer)
 {
     if (!video || !out_buffer) {
-        return;
+        return 0;
     }
 
     processingObject_t *analysis_processing = processingCloneForAnalysis(video->processing);
     if (!analysis_processing) {
-        return;
+        return 0;
     }
 
-    get_area_average_downscale_thumnail_with_processing(video,
-                                                        frame_index,
-                                                        downscale_factor,
-                                                        cpu_cores,
-                                                        analysis_processing,
-                                                        NULL,
-                                                        out_buffer);
+    /* The render's own result is returned, never discarded: on 0 out_buffer still holds whatever it held before. */
+    const int rendered = get_area_average_downscale_thumnail_with_processing(video,
+                                                                             frame_index,
+                                                                             downscale_factor,
+                                                                             cpu_cores,
+                                                                             analysis_processing,
+                                                                             NULL,
+                                                                             out_buffer);
     processingFreeClone(analysis_processing);
+    return rendered;
 }
 
 void get_area_average_downscale_raw_thumnail(mlvObject_t *video, int frame_index, int downscale_factor, unsigned char *out_buffer)

@@ -1024,6 +1024,13 @@ $embeddedFunctions = $embeddedFunctions + "`r`n# VENUE-SESSION-LOCKED-REFUSAL-1 
 $embeddedFunctions = $embeddedFunctions + "`r`n# HFR-CONFORM-AWARE-RECEIPT-ORACLES-1 >>>`r`n" + (Get-AttrCudaEmbeddedFunctionSource -Name @(
     'Get-AttrCudaConformAwareSourceFramesVerdict'
 )) +"`r`n# HFR-CONFORM-AWARE-RECEIPT-ORACLES-1 <<<"
+# PRESENTMON-BACHELOR-CUDA-INTERNAL-GAP-1: the temporal arm over the app's swap window (it calls the embedded Get-AttrCudaTemporalCoverage and the strict swap-stamp reader
+# beside it, which the job-stop arm calls too), spliced inside its own sentinel brackets for the same byte-identity reason as the splices above.
+$embeddedFunctions = $embeddedFunctions + "`r`n# PRESENTMON-BACHELOR-CUDA-INTERNAL-GAP-1 >>>`r`n" + (Get-AttrCudaEmbeddedFunctionSource -Name @(
+    'ConvertFrom-AttrCudaSwapStampUtc',
+    'Get-AttrCudaSwapWindowRecord',
+    'Get-AttrCudaPlaybackTemporalCoverage'
+)) +"`r`n# PRESENTMON-BACHELOR-CUDA-INTERNAL-GAP-1 <<<"
 $smokeRunnerClosureDigest = Get-AttrCudaClosureDigestHex -Closure $smokeRunnerClosure
 if ($smokeRunnerClosureDigest -notmatch '^[0-9a-f]{64}$') {
     throw "ATTRCUDA_BLOB_SHA_MALFORMED smoke-runner closure digest is not 64 lowercase hex: '$smokeRunnerClosureDigest'"
@@ -4041,6 +4048,18 @@ $presentMonAppSwapSource = $appSwapTelemetry.source
 $presentMonCoverageAvailable = ($null -ne $presentMonAppSwapCount) -and ($presentMonAppSwapCount -gt 0)
 $presentMonCoverageFraction = if ($presentMonCoverageAvailable) { $pmIntervalRows.Count / [double]$presentMonAppSwapCount } else { 0.0 }
 $presentMonTemporal = Get-AttrCudaTemporalCoverage -TimeInMsValues @($pmIntervalRows | ForEach-Object { [double]$_.timeInMs }) -WindowStartMs $displayReport.windowStartMs -WindowEndMs $displayReport.windowEndMs -MaxGapMs $presentMonSufficiencyMaxGapMs
+# PRESENTMON-BACHELOR-CUDA-INTERNAL-GAP-1 >>>
+$presentMonCaptureTemporal = $presentMonTemporal
+# PRESENTMON-BACHELOR-CUDA-INTERNAL-GAP-1: the display report's window above is the whole MLVApp process lifetime, so the seconds the app
+# presents nothing while it loads, runs the Look Assist baseline and idles after Stop read as PresentMon gaps (r4 stalled leg: a 12.7 s
+# "internal" gap that was the Look Assist baseline, with 96.5 ms the longest gap inside playback). The temporal arm is judged over the app's
+# own swap window (playback_smoke.gpu_window_swaps first_swap_utc..last_swap_utc) under both ends of the capture-start bracket. Without
+# that window or a trusted bracket it falls back to the process lifetime, and presentMonTemporalWindowSource says which one was used.
+# The whole-capture result is published beside it (presentMonCaptureTemporal*), so a pre-roll gap is still named, never silent.
+$presentMonPlaybackTemporal = Get-AttrCudaPlaybackTemporalCoverage -TimeInMsValues @($displayReport.targetPositiveIntervalTimesMs) -LogText $rawLog -EarliestAnchorUtc $presentMonCaptureStartUtc -LatestAnchorUtc $presentMonPostSpawnUtc -LatestAnchorTrusted $presentMonTraceReadyVerified -MaxGapMs $presentMonSufficiencyMaxGapMs -PresentTimesMs @($displayReport.selectedPresentTimesMs)
+$presentMonTemporalWindowSource = if ($presentMonPlaybackTemporal.windowSource -ceq 'app_swap_window') { 'app_swap_window' } else { 'process_lifetime' }
+if ($presentMonTemporalWindowSource -ceq 'app_swap_window') { $presentMonTemporal = $presentMonPlaybackTemporal }
+# PRESENTMON-BACHELOR-CUDA-INTERNAL-GAP-1 <<<
 $presentMonCountSufficient = ($pmIntervalRows.Count -ge $presentMonSufficiencyMinIntervalCount)
 $presentMonCoverageSufficient = ($presentMonCoverageAvailable -and ($presentMonCoverageFraction -ge $presentMonSufficiencyMinCoverageFraction))
 $presentMonTemporalSufficient = [bool]$presentMonTemporal.sufficient
@@ -4098,6 +4117,17 @@ if ($presentMonStoppedByJob) {
             $swapWindowParsed = $false
         }
     }
+    # PRESENTMON-BACHELOR-CUDA-INTERNAL-GAP-1 >>>
+    # PRESENTMON-BACHELOR-CUDA-INTERNAL-GAP-1 (PR #788 r1 sol B1, catalogue P-02; r2 sol B1): the matcher above is unanchored and takes the last
+    # STAMP-BEARING record, so a stampless final record reused an earlier session's stamps and a " (C:/build first_swap_utc=...)" location suffix
+    # supplied them; the [datetime] casts accept a truncated, zone-less or date-only stamp. The window is re-selected here by the SAME reader the
+    # temporal arm uses (Get-AttrCudaSwapWindowRecord: the LAST line-anchored record, its own key=value fields only, strict writer-shape stamps).
+    # A last record without usable stamps is unparsed, so the position arm below refuses: never an earlier record's window.
+    $swapWindowRecord = Get-AttrCudaSwapWindowRecord -LogText $(if ($appSwapTelemetry.source -eq 'gpu_window_swaps') { $rawLog } else { '' })
+    $swapFirstUtc = $swapWindowRecord.firstUtc
+    $swapLastUtc = $swapWindowRecord.lastUtc
+    $swapWindowParsed = ($null -eq $swapWindowRecord.why -and $null -ne $swapFirstUtc -and $null -ne $swapLastUtc -and $swapLastUtc -gt $swapFirstUtc)
+    # PRESENTMON-BACHELOR-CUDA-INTERNAL-GAP-1 <<<
     $presentMonJobStopAnchorUncertaintyMs = ($presentMonPostSpawnUtc - $presentMonCaptureStartUtc).TotalMilliseconds
     $pmPresentTimes = @($displayReport.selectedPresentTimesMs | ForEach-Object { [double]$_ } | Sort-Object)
     # UM-PRESENTMON-STOP-2 r2 (sol blocker): the late end of the bracket is an upper bound for PresentMon's origin
@@ -4168,6 +4198,9 @@ $presentMonStatusReason = if ($presentMonSufficient) {
     }
     if (-not $presentMonTemporalSufficient) {
         $presentMonFailedArms += "temporal: a $([math]::Round($presentMonTemporal.maxGapMs / 1000.0, 1))s $($presentMonTemporal.gapKind) gap between positive-interval rows exceeds the $([math]::Round($presentMonSufficiencyMaxGapMs / 1000.0, 1))s ceiling"
+        # PRESENTMON-BACHELOR-CUDA-INTERNAL-GAP-1 >>>
+        $presentMonFailedArms[$presentMonFailedArms.Count - 1] += " (window: $presentMonTemporalWindowSource)"
+        # PRESENTMON-BACHELOR-CUDA-INTERNAL-GAP-1 <<<
     }
     $presentMonFailedArms += $presentMonJobStopFailedArms
     "PresentMon's display-cadence evidence is too thin to corroborate as measured -- $($presentMonFailedArms -join '; ') -- display itself is still confirmed, cadence is not"
@@ -4245,6 +4278,12 @@ $manifest = [ordered]@{
         coverageFraction=$presentMonCoverageFraction
         temporalMaxGapMs=$presentMonTemporal.maxGapMs
         temporalGapKind=$presentMonTemporal.gapKind
+        # PRESENTMON-BACHELOR-CUDA-INTERNAL-GAP-1 >>>
+        temporalWindowSource=$presentMonTemporalWindowSource
+        playbackTemporal=$presentMonPlaybackTemporal
+        captureTemporalMaxGapMs=$presentMonCaptureTemporal.maxGapMs
+        captureTemporalGapKind=$presentMonCaptureTemporal.gapKind
+        # PRESENTMON-BACHELOR-CUDA-INTERNAL-GAP-1 <<<
         clockBracket=$displayReport.clockBracket
         sufficiency=[ordered]@{ minIntervalCount=$presentMonSufficiencyMinIntervalCount; minCoverageFraction=$presentMonSufficiencyMinCoverageFraction; maxGapMs=$presentMonSufficiencyMaxGapMs; countSufficient=$presentMonCountSufficient; coverageSufficient=$presentMonCoverageSufficient; temporalSufficient=$presentMonTemporalSufficient; sufficient=$presentMonSufficient }
         status=$presentMonStatus
@@ -4305,6 +4344,20 @@ Save-Json ([ordered]@{
     presentMonCoverageFraction = $presentMonCoverageFraction
     presentMonTemporalMaxGapMs = $presentMonTemporal.maxGapMs
     presentMonTemporalGapKind = $presentMonTemporal.gapKind
+    # PRESENTMON-BACHELOR-CUDA-INTERNAL-GAP-1 >>>
+    # PRESENTMON-BACHELOR-CUDA-INTERNAL-GAP-1: which window the two fields above were judged over (app_swap_window | process_lifetime), and
+    # the whole-capture gap beside them; Get-DvPresentMonGapVerdict (DualVenueRunner.psm1) reads all of them from the receipt's metrics.
+    presentMonTemporalWindowSource = $presentMonTemporalWindowSource
+    presentMonCaptureTemporalMaxGapMs = $presentMonCaptureTemporal.maxGapMs
+    presentMonCaptureTemporalGapKind = $presentMonCaptureTemporal.gapKind
+    # PR #788 r1 opus B3: the app's own max inter-swap gap from the same swap record, and the most over-ceiling gaps any permitted origin shows, so the
+    # receipt guard tells an app stall (counted) from lost PresentMon rows (not counted). $null when the swap window was unavailable.
+    presentMonTemporalAppSwapMaxGapMs = $presentMonPlaybackTemporal.appSwapMaxGapMs
+    presentMonTemporalOverBoundGapCount = $presentMonPlaybackTemporal.overBoundGapCount
+    # CoS G8: whether PresentMon's over-bound internal gap sits where the app's own longest gap is (by its max_gap_before_serial swap ordinal):
+    # $true / $false, or $null when the record has no ordinal or there is no over-bound internal gap.
+    presentMonTemporalOverBoundGapAtAppStall = $presentMonPlaybackTemporal.overBoundGapAtAppStall
+    # PRESENTMON-BACHELOR-CUDA-INTERNAL-GAP-1 <<<
     presentMonSufficiency = [ordered]@{
         minIntervalCount=$presentMonSufficiencyMinIntervalCount
         minCoverageFraction=$presentMonSufficiencyMinCoverageFraction

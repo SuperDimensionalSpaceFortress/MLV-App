@@ -29,9 +29,11 @@ from __future__ import annotations
 
 import ast
 import concurrent.futures
+import contextlib
 import hashlib
 import io
 import json
+import os
 import re
 import shutil
 import subprocess
@@ -495,6 +497,13 @@ class GeneratorByteIdentityAndVariantTests(unittest.TestCase):
     CPU_GL_ENV_CLEAR_OPEN = "PROCESSED8-CPU-LEG-GL-VIEWPORT-ENV-CLEAR-1 >>>"
     CPU_GL_ENV_CLEAR_CLOSE = "PROCESSED8-CPU-LEG-GL-VIEWPORT-ENV-CLEAR-1 <<<"
     CPU_GL_ENV_CLEAR_REGIONS = 3
+    # PRESENTMON-BACHELOR-CUDA-INTERNAL-GAP-1: the PresentMon temporal arm judged over the app's own swap window (Get-AttrCudaPlaybackTemporalCoverage and the job's use of it).
+    # Seven regions in the default job: the report field in Get-AttrCudaPresentMonDisplayReport, the helpers' splice, the template's window block, the job-stop arm's strict
+    # swap-stamp re-read (PR #788 r1 sol B1; after the base parse, which stays verbatim), the failed-arm reason's window suffix, the manifest fields, the summary fields. Absent
+    # from the baseline, whose temporal arm is the process-lifetime Get-AttrCudaTemporalCoverage line (kept verbatim outside the regions).
+    PM_INTERNAL_GAP_OPEN = "PRESENTMON-BACHELOR-CUDA-INTERNAL-GAP-1 >>>"
+    PM_INTERNAL_GAP_CLOSE = "PRESENTMON-BACHELOR-CUDA-INTERNAL-GAP-1 <<<"
+    PM_INTERNAL_GAP_REGIONS = 7
 
     @classmethod
     def strip_regions(cls, text: str) -> tuple[str, dict[str, int]]:
@@ -508,7 +517,8 @@ class GeneratorByteIdentityAndVariantTests(unittest.TestCase):
                     "hfr-conform-oracles": (cls.HFR_CONFORM_OPEN, cls.HFR_CONFORM_CLOSE),
                     "hfr-10s-floor": (cls.HFR_10S_OPEN, cls.HFR_10S_CLOSE),
                     "heavy-frame-log": (cls.HEAVY_FRAME_LOG_OPEN, cls.HEAVY_FRAME_LOG_CLOSE),
-                    "cpu-gl-env-clear": (cls.CPU_GL_ENV_CLEAR_OPEN, cls.CPU_GL_ENV_CLEAR_CLOSE)}
+                    "cpu-gl-env-clear": (cls.CPU_GL_ENV_CLEAR_OPEN, cls.CPU_GL_ENV_CLEAR_CLOSE),
+                    "pm-internal-gap": (cls.PM_INTERNAL_GAP_OPEN, cls.PM_INTERNAL_GAP_CLOSE)}
         kept: list[str] = []
         inside: str | None = None
         counts = {name: 0 for name in families}
@@ -562,6 +572,7 @@ class GeneratorByteIdentityAndVariantTests(unittest.TestCase):
         self.assertEqual(new_counts["heavy-frame-log"], self.HEAVY_FRAME_LOG_REGIONS, "the default (HEAVY) job carries exactly the pinned number of bracketed HEAVY-FRAME-LOG-1 regions")
         self.assertEqual(old_counts["heavy-frame-log"], 0, "the baseline predates the HEAVY frame-log opt-out")
         self.assertEqual((new_counts["cpu-gl-env-clear"], old_counts["cpu-gl-env-clear"]), (0, 0), "a cuda job carries no cpu GL-viewport env-clear region, and neither does the baseline")
+        self.assertEqual((new_counts["pm-internal-gap"], old_counts["pm-internal-gap"]), (self.PM_INTERNAL_GAP_REGIONS, 0), "the default job carries exactly the pinned number of bracketed PRESENTMON-BACHELOR-CUDA-INTERNAL-GAP-1 regions; the baseline predates them")
         self.assertEqual(stripped, old_stripped,
                          "the DEFAULT (bachelor/cuda) emitted job changed outside the bracketed regions -- it must stay byte-identical to the pinned baseline")
 
@@ -3654,25 +3665,67 @@ class EvidenceBoundReceiptTests(EvidenceFactory, ModuleMutationMixin, unittest.T
                     bad.append(f"{name}:{n}")
         return bad
 
+    # The census guards PRODUCTION paths: a script or module that reads a real receipt must re-derive it against the repo root. A test module is
+    # never such a reader -- it runs the validator on fixture receipts in a temp repo (often without -RepoRoot on purpose, see ps_receipt_status)
+    # or pins a production caller's exact line as a string. So test modules are out of the census BY PATH CLASS (tools/repo_hygiene/test_*.py and
+    # tests/**), never by file name; everything else, including a test-looking name outside the class, is still counted.
+    PRODUCTION_RECEIPT_CALLERS = frozenset({"tools/profiling/dual-venue/DualVenueRunner.psm1", "tools/profiling/dual-venue/New-VenueSheetPair.ps1",
+                                            "tools/profiling/dual-venue/New-VenueFlavorPair.ps1", "tools/profiling/dual-venue/Invoke-VenueBaseline.ps1"})
+    PRODUCTION_RECEIPT_READERS = frozenset({"tools/profiling/dual-venue/DualVenueRunner.psm1", "tools/profiling/dual-venue/Invoke-VenueLeg.ps1"})
+
+    @staticmethod
+    def is_test_module(path: str) -> bool:
+        return path.startswith("tests/") or re.fullmatch(r"tools/repo_hygiene/test_[^/]*\.py", path) is not None
+
+    @classmethod
+    def receipt_census(cls, texts: dict[str, str]) -> tuple[set[str], set[str]]:
+        prod = {n: t for n, t in texts.items() if not cls.is_test_module(n)}
+        callers = {n for n, t in prod.items() if re.search(r"Test-DvReceiptValid\s+-", t)}
+        readers = {n for n, t in prod.items() if "dual-venue-receipt/v1" in t or "dual-venue\\receipts" in t or "dual-venue/receipts" in t}
+        return callers, readers
+
     def test_every_in_tree_caller_of_the_validator_passes_the_repo_root_and_the_only_receipt_readers_are_the_known_ones(self) -> None:
         tracked = subprocess.run(["git", "-C", str(ROOT), "ls-files", "*.ps1", "*.psm1", "*.py"], capture_output=True, text=True, check=True).stdout.split()
         texts = {name: (ROOT / name).read_text(encoding="utf-8", errors="replace") for name in tracked if (ROOT / name).is_file()}
-        callers = {n for n, t in texts.items() if re.search(r"Test-DvReceiptValid\s+-", t) and n != "tools/repo_hygiene/test_dual_venue_evidence.py"}
+        callers, readers = self.receipt_census(texts)
         # LOOK-ASSIST-CINEMATIC-BENCH-PAIR-1 added New-VenueFlavorPair.ps1 (the Classic | Cinematic pair), which validates both receipts the same way.
-        self.assertEqual(callers, {"tools/profiling/dual-venue/DualVenueRunner.psm1", "tools/profiling/dual-venue/New-VenueSheetPair.ps1",
-                                   "tools/profiling/dual-venue/New-VenueFlavorPair.ps1", "tools/profiling/dual-venue/Invoke-VenueBaseline.ps1"})
+        self.assertEqual(callers, set(self.PRODUCTION_RECEIPT_CALLERS))
         self.assertEqual(self.readers_without_repo_root({n: texts[n] for n in callers}), [])
         # nothing else in the tree reads a receipt file: a new reader must call the validator (and be added to this list in review)
-        readers = {n for n, t in texts.items() if ("dual-venue-receipt/v1" in t or "dual-venue\\receipts" in t or "dual-venue/receipts" in t)
-                   # (test files hold receipt-shaped fixtures they never read back; test_venue_baseline.py's stub chain writes one for the baseline runner, which IS a caller above)
-                   and n not in ("tools/repo_hygiene/test_dual_venue_evidence.py", "tools/repo_hygiene/test_mlv_never_authorized.py", "tools/repo_hygiene/test_venue_baseline.py")}
-        self.assertEqual(readers, {"tools/profiling/dual-venue/DualVenueRunner.psm1", "tools/profiling/dual-venue/Invoke-VenueLeg.ps1"},
+        self.assertEqual(readers, set(self.PRODUCTION_RECEIPT_READERS),
                          "an unknown reader of dual-venue receipts must call Test-DvReceiptValid -RepoRoot and be named here")
         mutated = texts["tools/profiling/dual-venue/New-VenueSheetPair.ps1"].replace("Test-DvReceiptValid -Receipt $r -RepoRoot $repoRoot", "Test-DvReceiptValid -Receipt $r")
         self.assertNotEqual(mutated, texts["tools/profiling/dual-venue/New-VenueSheetPair.ps1"])
         self.assertEqual(self.readers_without_repo_root({"New-VenueSheetPair.ps1": mutated}), ["New-VenueSheetPair.ps1:" + str(next(
             i for i, l in enumerate(mutated.splitlines(), 1) if "Test-DvReceiptValid" in l and not l.lstrip().startswith("#")))],
             "a reader that drops -RepoRoot is caught by the scan -- so the scan guards item 3")
+
+    def test_the_census_exempts_only_test_modules_so_a_production_caller_without_the_repo_root_still_fails(self) -> None:
+        # PR #788 r4 R1: the test-module exemption is a path class, not a hole -- a non-test caller that omits -RepoRoot is still caught.
+        bare_call, pinned_call = "$v = Test-DvReceiptValid -Receipt $r\n", 'assertIn("Test-DvReceiptValid -Receipt $r -RepoRoot $repoRoot", t)\n'
+        exempt = ["tools/repo_hygiene/test_new_gap.py", "tests/coordination/test_reader.py", "tests/fixtures/reader.ps1"]
+        counted = ["tools/profiling/dual-venue/New-VenueReader.ps1", "tools/profiling/test_reader.ps1", "tools/repo_hygiene/test_reader.ps1",
+                   "tools/repo_hygiene/sub/test_reader.py", "tools/repo_hygiene/helpers_test.py", "attests/reader.ps1", "tools/tests/reader.ps1"]
+        for path in exempt:
+            self.assertTrue(self.is_test_module(path), path)
+            self.assertEqual(self.receipt_census({path: bare_call + pinned_call + "dual-venue/receipts\n"}), (set(), set()), path)
+        for path in counted:
+            self.assertFalse(self.is_test_module(path), path)
+            callers, readers = self.receipt_census({path: bare_call, path + ".r.ps1": "Get-ChildItem dual-venue/receipts\n"})
+            self.assertEqual(callers, {path}, "a non-test caller is in the census, so the known-callers equality fails on it: " + path)
+            self.assertEqual(readers, {path + ".r.ps1"}, path)
+            tree = {n: "Test-DvReceiptValid -Receipt $r -RepoRoot $repoRoot\n" for n in self.PRODUCTION_RECEIPT_CALLERS}
+            self.assertEqual(self.receipt_census(tree)[0], set(self.PRODUCTION_RECEIPT_CALLERS))
+            self.assertNotEqual(self.receipt_census(dict(tree, **{path: bare_call}))[0], set(self.PRODUCTION_RECEIPT_CALLERS), path)
+            self.assertEqual(self.readers_without_repo_root({path: bare_call}), [path + ":1"], "and its missing -RepoRoot is flagged: " + path)
+        # the real tree with one production caller's -RepoRoot dropped: the census still names it and the scan flags it
+        name = "tools/profiling/dual-venue/New-VenueFlavorPair.ps1"
+        text = (ROOT / name).read_text(encoding="utf-8", errors="replace")
+        mutated = re.sub(r"(Test-DvReceiptValid\s+-Receipt\s+\$\w+)\s+-RepoRoot\s+\$\w+", r"\1", text)
+        self.assertNotEqual(mutated, text)
+        callers, _ = self.receipt_census({name: mutated, "tools/repo_hygiene/test_presentmon_playback_window_gap.py": pinned_call})
+        self.assertEqual(callers, {name})
+        self.assertTrue(self.readers_without_repo_root({name: mutated}), "a production caller that drops -RepoRoot fails the census scan")
 
     # -- mutations: each rule's test can fail ----------------------------------------------------------------------------------------
     def test_mutation_trusting_the_consent_blobs_format_a_zero_record_blob_validates(self) -> None:
@@ -8742,6 +8795,9 @@ class LookReceiptGeneratorTests(unittest.TestCase):
                 # PROCESSED8-MEASURED-BRANCH-HEAVY-LEG-SPEC-1 r6: the r5 cpu block is in every cpu job (its three bracketed regions) and in no cuda job; the base predates it.
                 self.assertEqual((new_counts.pop("cpu-gl-env-clear"), old_counts.pop("cpu-gl-env-clear")),
                                  (GeneratorByteIdentityAndVariantTests.CPU_GL_ENV_CLEAR_REGIONS if name.startswith("cpu") else 0, 0), name)
+                # PRESENTMON-BACHELOR-CUDA-INTERNAL-GAP-1's regions: in the new job only (the base predates the app-swap-window temporal arm), at their pinned count.
+                self.assertEqual((new_counts.pop("pm-internal-gap"), old_counts.pop("pm-internal-gap")),
+                                 (GeneratorByteIdentityAndVariantTests.PM_INTERNAL_GAP_REGIONS, 0), name)
                 self.assertEqual(new_counts, old_counts, f"{name}: the job without -LookReceiptPath carries the base generator's bracketed regions")
                 self.assertEqual(kept, old_kept, f"{name}: the job without -LookReceiptPath must be the base generator's bytes")
                 self.assertNotIn(b"LookReceipt", new)
@@ -9166,6 +9222,754 @@ class VisualCaptureObserverPaintTests(unittest.TestCase):
                                           f"-FlatPlayFrames 0 -PlayVsPausedMeanAbsDiff 1.0 -SamePosition $true -ObserverPaintedPlayFrames {observer} | ConvertTo-Json -Compress")
                 self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
                 self.assertEqual((out["verdict"], out["counted"]), (verdict, True))
+
+
+class VisualExposureFloorTests(unittest.TestCase):
+    """VISUAL-GATE-EXPOSURE-FLOOR-1: the visual gate passed a leg whose strips advance, are untorn and match across the A/B arms, so a picture that is
+    equally wrong in both arms was an OK (M16-1457: 'visual OK 6/6' at mean luma 6.9/255, 84% near-black). The capture step now measures the picture
+    area's luma, near-black and clipped fractions per frame, takes the leg's medians, and flags EXPOSURE_OUT_OF_RANGE outside a per-clip band (else an
+    absolute fallback). All test names carry "visual" (-k visual). The pure ones (numbers in, verdict out) run on every OS; the ones that read real PNGs
+    are requires_windows_imaging."""
+
+    W, H = 64, 36
+    # independent of the PowerShell: BT.709 luma, near-black under 16, clipped over 235
+    @staticmethod
+    def luma(r: int, g: int, b: int) -> float:
+        return 0.2126 * r + 0.7152 * g + 0.0722 * b
+
+    @staticmethod
+    def shown(value: float) -> str:
+        """How the verdict reason prints a number: rounded to 6 places, trailing zeros dropped (the PowerShell '0.######')."""
+        return ("%.6f" % value).rstrip("0").rstrip(".")
+
+    def rgb(self, pixel) -> str:
+        """A W x H frame as base64 packed R,G,B; pixel(x, y, i) -> (r, g, b)."""
+        import base64
+        return base64.b64encode(bytes(c for y in range(self.H) for x in range(self.W) for c in pixel(x, y, y * self.W + x))).decode("ascii")
+
+    def underexposed(self) -> str:
+        # the M16-1457 leg: about 84% of the picture near-black, mean luma about 7
+        return self.rgb(lambda x, y, i: (3, 3, 3) if i % 25 < 21 else (26, 26, 26))
+
+    def normal(self) -> str:
+        return self.rgb(lambda x, y, i: (40 + x * 2, 90, 160 - x))
+
+    def exposure(self, b64: str, band_path: str | None = None, clip: str = "c", with_exposure: bool = True, **over: str) -> dict:
+        """Stats of the frame, its band, and the verdict taken from them. over overrides a verdict parameter (PlayFrames="1", SourceDifference="known-differ")."""
+        args = {"Requested": "$true", "Captured": "$true", "PlayFrames": "6", "DistinctContentHashes": "6", "AppDistinctDisplayFrames": "6", "FlatPlayFrames": "0",
+                "PlayVsPausedMeanAbsDiff": "1.0", "SamePosition": "$true", **over}
+        band = f"-Path '{band_path}'" if band_path is not None else ""
+        script = ("$rgb = [Convert]::FromBase64String($env:DVE_RGB); "
+                  f"$s = Get-DvVisualExposureStats -Rgb $rgb -Width {self.W} -Height {self.H}; "
+                  f"$b = Get-DvExposureBand -ClipId '{clip}' {band}; "
+                  "$v = Get-DvVisualVerdict " + " ".join(f"-{k} {v}" for k, v in args.items()) + " "
+                  + ("-ExposureMedianLuma $s.lumaMean -ExposureMedianNearBlackFraction $s.nearBlackFraction -ExposureMedianClippedFraction $s.clippedFraction "
+                     "-ExposureBand $b.band -ExposureBandSource $b.source " if with_exposure else "")
+                  + "; [pscustomobject]@{ stats = $s; band = $b; verdict = $v } | ConvertTo-Json -Depth 6 -Compress")
+        proc, out = run_pwsh_json(script, DVE_RGB=b64)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIsNotNone(out, proc.stdout + proc.stderr)
+        return out
+
+    def test_the_visual_exposure_numbers_of_a_synthetic_underexposed_frame(self) -> None:
+        out = self.exposure(self.underexposed())["stats"]
+        n = self.W * self.H
+        px = [(3, 3, 3) if i % 25 < 21 else (26, 26, 26) for i in range(n)]
+        self.assertAlmostEqual(out["lumaMean"], sum(self.luma(*p) for p in px) / n, places=2)
+        self.assertAlmostEqual(out["nearBlackFraction"], sum(self.luma(*p) < 16 for p in px) / n, places=3)
+        self.assertEqual(out["clippedFraction"], 0)
+        self.assertLess(out["lumaMean"], 8)
+        self.assertGreater(out["nearBlackFraction"], 0.83)
+
+    def test_the_visual_exposure_numbers_drop_letterbox_rows_and_read_black_and_clipped_frames(self) -> None:
+        bars = self.exposure(self.rgb(lambda x, y, i: (0, 0, 0) if y < 4 or y >= self.H - 4 else (128, 128, 128)))["stats"]
+        self.assertAlmostEqual(bars["lumaMean"], 128.0, places=6)
+        self.assertEqual((bars["nearBlackFraction"], bars["clippedFraction"], bars["letterboxRowsDropped"]), (0, 0, 8))
+        # a row whose full-width mean is 2 or more is picture (a dark one), not a bar
+        dim = self.exposure(self.rgb(lambda x, y, i: (3, 3, 3) if y < 4 else (128, 128, 128)))["stats"]
+        self.assertEqual(dim["letterboxRowsDropped"], 0)
+        # a frame with no picture rows at all is a BLACK picture, not "nothing to judge": every row is measured
+        black = self.exposure(self.rgb(lambda x, y, i: (0, 0, 0)))["stats"]
+        self.assertEqual((black["lumaMean"], black["nearBlackFraction"], black["clippedFraction"], black["letterboxRowsDropped"]), (0, 1, 0, 0))
+        white = self.exposure(self.rgb(lambda x, y, i: (250, 250, 250)))["stats"]
+        self.assertAlmostEqual(white["lumaMean"], 250.0, places=6)
+        self.assertEqual((white["nearBlackFraction"], white["clippedFraction"]), (0, 1))
+
+    def test_the_visual_exposure_numbers_of_a_mis_sized_frame_are_null(self) -> None:
+        proc, out = run_pwsh_json("[byte[]]$b = 1..30; $r = Get-DvVisualExposureStats -Rgb $b -Width 64 -Height 36; ConvertTo-Json -Compress -InputObject $r")
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIsNone(out)
+
+    def test_the_visual_gate_flags_a_synthetic_underexposed_frame_with_its_numbers(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="vis-exp-") as d:
+            band = str(Path(d) / "absent.json")
+            out = self.exposure(self.underexposed(), band)
+            v = out["verdict"]
+            self.assertEqual((v["verdict"], v["counted"]), ("EXPOSURE_OUT_OF_RANGE", True), v["reason"])
+            s = out["stats"]
+            # the reason quotes the three numbers and the band limits they broke
+            for text in (f"median luma {self.shown(s['lumaMean'])}", f"near-black fraction {self.shown(s['nearBlackFraction'])}", f"clipped fraction {self.shown(s['clippedFraction'])}",
+                         "band luma 16..255", "near-black <= 0.6", "clipped <= 0.05", "is under the band minimum 16", "is over the band maximum 0.6"):
+                self.assertIn(text, v["reason"])
+            self.assertNotIn("clipped fraction 0 is over", v["reason"])
+
+    def test_the_visual_gate_keeps_a_normally_exposed_frame_ok(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="vis-exp-") as d:
+            out = self.exposure(self.normal(), str(Path(d) / "absent.json"))
+            self.assertEqual((out["verdict"]["verdict"], out["verdict"]["counted"], out["verdict"]["reason"]), ("OK", True, None), out["stats"])
+            self.assertGreater(out["stats"]["lumaMean"], 60)
+
+    def test_the_visual_gate_judges_nothing_on_exposure_without_a_band_or_the_medians(self) -> None:
+        # a caller that does not pass the exposure arguments gets exactly the verdict it always got
+        out = self.exposure(self.underexposed(), with_exposure=False)["verdict"]
+        self.assertEqual((out["verdict"], out["counted"], out["reason"]), ("OK", True, None))
+        script = ("Get-DvVisualVerdict -Requested $true -Captured $true -PlayFrames 6 -DistinctContentHashes 6 -AppDistinctDisplayFrames 6 -FlatPlayFrames 0 "
+                  "-PlayVsPausedMeanAbsDiff 1.0 -SamePosition $true -ExposureMedianLuma 5 -ExposureMedianNearBlackFraction 0.9 -ExposureMedianClippedFraction 0 "
+                  "| ConvertTo-Json -Compress")
+        proc, out = run_pwsh_json(script)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertEqual(out["verdict"], "OK", "no band, nothing to judge against")
+
+    def test_the_visual_exposure_verdict_ranks_after_every_other_verdict(self) -> None:
+        rows = [({"FlatPlayFrames": "6"}, "CAPTURE_BLANK", True), ({"PlayVsPausedMeanAbsDiff": "9.0"}, "VISUAL_DIVERGENCE", True),
+                ({"DistinctContentHashes": "1", "SourceDifference": "known-differ"}, "FROZEN_DISPLAY", False),
+                ({"DistinctContentHashes": "1", "SourceDifference": "unknown"}, "FROZEN_DISPLAY_SUSPECTED", True),
+                ({"RepeatedPlayFrames": "2", "SourceDifference": "known-differ"}, "PARTIAL_FREEZE", True), ({"LabelBound": "$false"}, "CAPTURE_UNBOUND", True),
+                ({"ViewportUnavailablePlayFrames": "5", "PlayFrames": "1"}, "VISUAL_ASSESSMENT_UNAVAILABLE", True), ({"PlayFrames": "1"}, "NOT_CAPTURED", True)]
+        with tempfile.TemporaryDirectory(prefix="vis-exp-") as d:
+            band = str(Path(d) / "absent.json")
+            for over, verdict, counted in rows:
+                with self.subTest(over=over):
+                    out = self.exposure(self.underexposed(), band, **over)["verdict"]
+                    self.assertEqual((out["verdict"], out["counted"]), (verdict, counted), out["reason"])
+                    plain = self.exposure(self.underexposed(), band, with_exposure=False, **over)["verdict"]
+                    self.assertEqual(out, plain, "the exposure inputs change nothing about a verdict that outranks them")
+            # a leg that was OK stays OK on a normal picture, with the same fields it always had
+            ok = self.exposure(self.normal(), band)["verdict"]
+            self.assertEqual((ok["verdict"], ok["counted"], ok["reason"]), ("OK", True, None))
+
+    def test_the_visual_exposure_flag_keeps_the_static_clip_waiver_in_its_reason(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="vis-exp-") as d:
+            out = self.exposure(self.underexposed(), str(Path(d) / "absent.json"), DistinctContentHashes="1", SourceDifference="known-identical")["verdict"]
+            self.assertEqual((out["verdict"], out["counted"]), ("EXPOSURE_OUT_OF_RANGE", True), out["reason"])
+            self.assertIn("a static clip", out["reason"])
+
+    def test_the_visual_exposure_band_resolves_from_the_file(self) -> None:
+        fallback = {"minMedianLuma": 16, "maxMedianLuma": 255, "maxNearBlackFraction": 0.6, "maxClippedFraction": 0.05}
+        rows = [  # file text (None = absent), clip asked, expected source, band, whether a note is reported
+            (None, "c", "fallback-missing", fallback, True),
+            ("", "c", "fallback-empty", fallback, True),   # r2 (fable H5): an empty or truncated file is reported, never silent
+            ("   \n", "c", "fallback-empty", fallback, True),
+            ("{}", "c", "fallback-no-row", fallback, False),
+            ('{"clips": {}}', "c", "fallback-no-row", fallback, False),
+            ('{"clips": null}', "c", "fallback-no-row", fallback, False),
+            ('{"clips": {"other": {"minMedianLuma": 4}}}', "c", "fallback-no-row", fallback, False),
+            ('{"clips": {"C": {"minMedianLuma": 4}}}', "c", "fallback-no-row", fallback, False),   # clip ids match exactly
+            ('{"clips": {"c": {"minMedianLuma": 4}}}', "", "fallback-no-row", fallback, False),
+            ('{"clips": {"c": {"minMedianLuma": 4}}}', "c", "clip", {**fallback, "minMedianLuma": 4}, False),
+            ('{"clips": {"c": {"minMedianLuma": 4, "maxMedianLuma": 60, "maxNearBlackFraction": 0.95, "maxClippedFraction": 0.2}}}', "c", "clip",
+             {"minMedianLuma": 4, "maxMedianLuma": 60, "maxNearBlackFraction": 0.95, "maxClippedFraction": 0.2}, False),
+            ("{not json", "c", "fallback-malformed", fallback, True),
+            ("[]", "c", "fallback-malformed", fallback, True),
+            ("null", "c", "fallback-malformed", fallback, True),
+            ('"text"', "c", "fallback-malformed", fallback, True),
+            ('{"clips": []}', "c", "fallback-malformed", fallback, True),
+            ('{"clips": 5}', "c", "fallback-malformed", fallback, True),
+            ('{"clips": {"c": 5}}', "c", "fallback-malformed", fallback, True),
+            ('{"clips": {"c": {}}}', "c", "fallback-malformed", fallback, True),
+            ('{"clips": {"c": {"unrelated": 1}}}', "c", "fallback-malformed", fallback, True),
+            ('{"clips": {"c": {"minMedianLuma": "4"}}}', "c", "fallback-malformed", fallback, True),
+            ('{"clips": {"c": {"minMedianLuma": true}}}', "c", "fallback-malformed", fallback, True),
+            ('{"clips": {"c": {"minMedianLuma": null}}}', "c", "fallback-malformed", fallback, True),
+            ('{"clips": {"c": {"minMedianLuma": -1}}}', "c", "fallback-malformed", fallback, True),
+            ('{"clips": {"c": {"minMedianLuma": 300}}}', "c", "fallback-malformed", fallback, True),
+            ('{"clips": {"c": {"maxNearBlackFraction": 1.5}}}', "c", "fallback-malformed", fallback, True),
+            ('{"clips": {"c": {"minMedianLuma": 50, "maxMedianLuma": 20}}}', "c", "fallback-malformed", fallback, True),
+        ]
+        with tempfile.TemporaryDirectory(prefix="vis-exp-band-") as d:
+            for n, (text, clip, source, band, note) in enumerate(rows):
+                with self.subTest(text=text, clip=clip):
+                    path = Path(d) / f"bands-{n}.json"
+                    if text is not None:
+                        path.write_text(text, encoding="utf-8")
+                    proc, out = run_pwsh_json(f"Get-DvExposureBand -ClipId '{clip}' -Path '{path}' | ConvertTo-Json -Depth 4 -Compress")
+                    self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+                    self.assertEqual(out["source"], source, out)
+                    self.assertEqual(out["band"], band)
+                    self.assertEqual(out["note"] is not None, note, out)
+
+    def test_the_visual_exposure_gate_never_reads_ok_through_an_unusable_band_file(self) -> None:
+        # an empty / missing / malformed band file falls back to the absolute band: the under-exposed frame is still flagged, and a malformed or missing file says so
+        with tempfile.TemporaryDirectory(prefix="vis-exp-band-") as d:
+            for n, text in enumerate((None, "", "{}", "{not json", '{"clips": {"c": {"minMedianLuma": "4"}}}', '{"clips": {"c": {"minMedianLuma": 50, "maxMedianLuma": 20}}}')):
+                with self.subTest(text=text):
+                    path = Path(d) / f"bands-{n}.json"
+                    if text is not None:
+                        path.write_text(text, encoding="utf-8")
+                    out = self.exposure(self.underexposed(), str(path))
+                    self.assertEqual(out["verdict"]["verdict"], "EXPOSURE_OUT_OF_RANGE", out["verdict"]["reason"])
+                    self.assertIn("band luma 16..255", out["verdict"]["reason"])
+                    self.assertIn(out["band"]["source"], ("fallback-missing", "fallback-empty", "fallback-no-row", "fallback-malformed"))
+
+    def test_the_visual_exposure_gate_takes_a_clip_row_over_the_fallback(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="vis-exp-band-") as d:
+            path = Path(d) / "bands.json"
+            # a deliberately dark clip: its legs sit near luma 6, 84% near-black, so its own band admits them
+            path.write_text('{"schema": "mlv-app/dual-venue-exposure-bands/v1", "clips": {"dark-clip": {"minMedianLuma": 3, "maxMedianLuma": 30, "maxNearBlackFraction": 0.9}}}',
+                            encoding="utf-8")
+            row = self.exposure(self.underexposed(), str(path), clip="dark-clip")
+            self.assertEqual((row["band"]["source"], row["verdict"]["verdict"]), ("clip", "OK"), row["verdict"]["reason"])
+            other = self.exposure(self.underexposed(), str(path), clip="another-clip")
+            self.assertEqual((other["band"]["source"], other["verdict"]["verdict"]), ("fallback-no-row", "EXPOSURE_OUT_OF_RANGE"))
+            # the row still binds: a frame brighter than its maximum luma is out of range
+            bright = self.exposure(self.normal(), str(path), clip="dark-clip")
+            self.assertEqual(bright["verdict"]["verdict"], "EXPOSURE_OUT_OF_RANGE", bright["verdict"]["reason"])
+            self.assertIn("is over the band maximum 30", bright["verdict"]["reason"])
+
+    def test_the_visual_exposure_bands_file_is_committed_with_no_clip_rows(self) -> None:
+        doc = json.loads((DV / "exposure-bands.json").read_text(encoding="utf-8"))
+        self.assertEqual(doc["schema"], "mlv-app/dual-venue-exposure-bands/v1")
+        self.assertEqual(doc["clips"], {}, "rows are seeded from the grade corpus by VISUAL-GATE-EXPOSURE-BANDS-SEED-1, not here")
+        proc, out = run_pwsh_json("Get-DvExposureBand -ClipId 'M16-1457' | ConvertTo-Json -Depth 4 -Compress")
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertEqual((out["source"], out["note"]), ("fallback-no-row", None))
+
+    def test_the_visual_exposure_work_leaves_the_matrix_median_alone(self) -> None:
+        # adversary dfb973a0 A1: a second Get-DvMedian (double[] parameter) shadowed the matrix table's, which skips missing values, so a missing timing read as 0
+        source = (DV / "DualVenueRunner.psm1").read_text(encoding="utf-8")
+        self.assertEqual(source.count("function Get-DvMedian {"), 1, "the exposure median has its own name (Get-DvExposureMedian)")
+        proc, out = run_pwsh_json("[pscustomobject]@{ a = Get-DvMedian @($null, 20); b = Get-DvMedian @($null, $null); c = Get-DvMedian @(10, 30, $null) "
+                                  "; d = Get-DvExposureMedian ([double[]]@(10, 30, 20, 40)) } | ConvertTo-Json -Compress")
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertEqual(out, {"a": 20, "b": None, "c": 20, "d": 25})
+
+    def test_the_visual_exposure_median_of_an_even_count_is_the_exact_midpoint_not_a_floating_point_average(self) -> None:
+        # adversary 099c3eac A1 (r4): the median of an even count was ([double]a + [double]b) / 2.0, so frame fractions 0.4 and 0.8 (exactly 0.6 between them)
+        # averaged to 0.6000000000000001 and tripped the inclusive cap of 0.6; the same for a luma median over 100.0001 and the clipped fraction
+        pairs = [("0.4", "0.8", "0.6"), ("0.1", "0.5", "0.3"), ("100.0000", "100.0002", "100.0001"), ("99.9998", "100.0000", "99.9999"),
+                 ("0.2", "1.0", "0.6"), ("0.05", "0.15", "0.1"), ("16.0001", "16.0003", "16.0002"), ("234.9999", "235.0001", "235"),
+                 # adversary 288559f1 A1: the frames' own ratios (a pixel count over the picture's pixel count) are not short decimals, so a decimal average is no better:
+                 # near-black 389/1920 and 1915/1920 (exactly 0.6), clipped 4/1920 and 188/1920 (0.05), luma 1531*100/1920 and 5*100/1920 (40)
+                 ("(389/1920)", "(1915/1920)", "0.6"), ("(4/1920)", "(188/1920)", "0.05"), ("(1531*100/1920)", "(5*100/1920)", "40"),
+                 ("(1152/1920)", "(1152/1920)", "0.6"), ("(96/1920)", "(96/1920)", "0.05")]
+        script = "$ErrorActionPreference = 'Stop'; $rows = @(); " + " ".join(
+            f"$rows += [pscustomobject]@{{ lo = '{a}'; hi = '{b}'; mid = '{m}'; "
+            f"exact = ((Get-DvExposureMedian ([double[]]@({a}, {b}))) -eq {m}); "
+            f"reversed = ((Get-DvExposureMedian ([double[]]@({b}, {a}))) -eq {m}) }};" for a, b, m in pairs) + " ConvertTo-Json -InputObject @($rows) -Compress"
+        proc, out = run_pwsh_json(script)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIsNotNone(out, proc.stdout + proc.stderr)
+        for row in out:
+            self.assertTrue(row["exact"] and row["reversed"], row)
+        # six frames: three at 0.4 and three at 0.8 (the adversary's input), and the middle two of a longer even list
+        proc, out = run_pwsh_json("[pscustomobject]@{ six = ((Get-DvExposureMedian ([double[]]@(0.4, 0.4, 0.4, 0.8, 0.8, 0.8))) -eq 0.6); "
+                                  "four = ((Get-DvExposureMedian ([double[]]@(0.0, 0.4, 0.8, 1.0))) -eq 0.6); odd = ((Get-DvExposureMedian ([double[]]@(0.6, 0.1, 0.9))) -eq 0.6) } | ConvertTo-Json -Compress")
+        self.assertEqual(out, {"six": True, "four": True, "odd": True})
+
+    def test_the_visual_exposure_median_never_throws_on_values_a_decimal_cannot_hold(self) -> None:
+        # r4: the exact midpoint is taken in decimal, which throws on NaN, infinity and magnitudes past its range; the verdict reports 'a median is not a finite number',
+        # so the median must hand those on as doubles, never throw
+        proc, out = run_pwsh_json("$ErrorActionPreference = 'Stop'; [pscustomobject]@{ nan = [double]::IsNaN([double](Get-DvExposureMedian ([double[]]@([double]::NaN, 1.0)))); "
+                                  "inf = [double]::IsInfinity((Get-DvExposureMedian ([double[]]@(1.0, [double]::PositiveInfinity)))); "
+                                  "big = ((Get-DvExposureMedian ([double[]]@(1e300, 3e300))) -eq 2e300); tiny = ((Get-DvExposureMedian ([double[]]@(1e-300, 3e-300))) -eq 2e-300); "
+                                  "zero = ((Get-DvExposureMedian ([double[]]@(0.0, 0.0))) -eq 0.0) } | ConvertTo-Json -Compress")
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertEqual(out, {"nan": True, "inf": True, "big": True, "tiny": True, "zero": True})
+
+    def test_the_visual_exposure_band_file_is_parsed_strictly(self) -> None:
+        # adversary dfb973a0 A2 / A6: ConvertFrom-Json unwraps a one-element array root and refuses keys that differ only in case
+        fallback = {"minMedianLuma": 16, "maxMedianLuma": 255, "maxNearBlackFraction": 0.6, "maxClippedFraction": 0.05}
+        rows = [  # file text, clip asked, expected source, expected minMedianLuma
+            ('[{"clips": {"c": {"minMedianLuma": 0, "maxNearBlackFraction": 1}}}]', "c", "fallback-malformed", 16),
+            ('[[{"clips": {"c": {"minMedianLuma": 4}}}]]', "c", "fallback-malformed", 16),
+            ('{"clips": {"c": {"minMedianLuma": 4}, "C": {"minMedianLuma": 20}}}', "c", "clip", 4),
+            ('{"clips": {"c": {"minMedianLuma": 4}, "C": {"minMedianLuma": 20}}}', "C", "clip", 20),
+            ('{"clips": {"c": {"minMedianLuma": 4}, "C": {"minMedianLuma": 20}}}', "cc", "fallback-no-row", 16),
+            ('{"clips": {"c": {"minMedianLuma": 4}, "c": {"minMedianLuma": 5}}}', "c", "fallback-malformed", 16),
+            ('{"clips": {"c": {"minMedianLuma": 4, "minMedianLuma": 5}}}', "c", "fallback-malformed", 16),
+            ('{"clips": {}, "clips": {"c": {"minMedianLuma": 4}}}', "c", "fallback-malformed", 16),
+            ('{"clips": {"c": {"minMedianLuma": 4}},}', "c", "fallback-malformed", 16),
+            ('{"clips": {"c": {"minMedianLuma": 4}}} trailing', "c", "fallback-malformed", 16),
+            ('﻿{"clips": {"c": {"minMedianLuma": 4}}}', "c", "clip", 4),
+            # adversary a32b95c6 A1: -ceq is a culture comparison that ignores an embedded NUL, so "c<NUL>" was the row of "c"; names compare ordinally
+            ('{"clips": {"c\\u0000": {"minMedianLuma": 4}}}', "c", "fallback-no-row", 16),
+            ('{"clips\\u0000": {"c": {"minMedianLuma": 4}}}', "c", "fallback-no-row", 16),
+            ('{"clips": {"c": {"minMedianLuma\\u0000": 4, "maxClippedFraction": 0.5}}}', "c", "fallback-malformed", 16),   # r2 (fable H4): the NUL field is an unknown field, so the row is malformed
+            ('{"clips": {"c\\u200b": {"minMedianLuma": 4}, "c": {"minMedianLuma": 6}}}', "c", "clip", 6),
+            # adversary a32b95c6 A2: a repeated key is ambiguous whoever it belongs to (another clip's row, an unknown field, an unrelated root key)
+            ('{"clips": {"c": {"minMedianLuma": 4}, "other": {"minMedianLuma": 4}, "other": {"minMedianLuma": 5}}}', "c", "fallback-malformed", 16),
+            ('{"clips": {"c": {"minMedianLuma": 4, "zzz": 1, "zzz": 2}}}', "c", "fallback-malformed", 16),
+            ('{"schema": "a", "schema": "b", "clips": {"c": {"minMedianLuma": 4}}}', "c", "fallback-malformed", 16),
+            ('{"clips": {"c": {"minMedianLuma": 4}, "c\\u0000": {"minMedianLuma": 5}}}', "c", "clip", 4),
+        ]
+        with tempfile.TemporaryDirectory(prefix="vis-exp-band-") as d:
+            for n, (text, clip, source, minimum) in enumerate(rows):
+                with self.subTest(text=text, clip=clip):
+                    path = Path(d) / f"strict-{n}.json"
+                    path.write_text(text, encoding="utf-8")
+                    proc, out = run_pwsh_json(f"Get-DvExposureBand -ClipId '{clip}' -Path '{path}' | ConvertTo-Json -Depth 4 -Compress")
+                    self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+                    self.assertEqual((out["source"], out["band"]["minMedianLuma"]), (source, minimum), out)
+                    self.assertEqual(out["note"] is not None, source == "fallback-malformed")
+                    if source != "clip":
+                        self.assertEqual(out["band"], fallback)
+            # the relaxed band of the unwrapped array would have passed the under-exposed frame; the fallback must flag it
+            path = Path(d) / "strict-0.json"
+            self.assertEqual(self.exposure(self.underexposed(), str(path))["verdict"]["verdict"], "EXPOSURE_OUT_OF_RANGE")
+            both = Path(d) / "strict-3.json"
+            self.assertEqual(self.exposure(self.underexposed(), str(both), clip="c")["verdict"]["verdict"], "EXPOSURE_OUT_OF_RANGE", "c's row (min 4) still holds near-black 0.84 over the 0.6 fallback cap")
+
+    # ---- r2 (PR #796): sol B1 / Dot 796-D1, fable B1 / Dot 796-I1, fable H2-H5 ----------------------------------------------------------------------------
+
+    def test_the_visual_exposure_numbers_drop_only_symmetric_edge_bars(self) -> None:
+        # r2 (fable B1, Dot 796-I1, opus hardening): the old filter dropped EVERY full-width row with mean luma < 2 wherever it sat, so a banded dark picture
+        # was measured on its bright rows only. Only a dark run at BOTH the top and the bottom edge is a letterbox, and at most a quarter of the rows per edge.
+        black, dim = (0, 0, 0), (40, 40, 40)
+        fallback_flags = "EXPOSURE_OUT_OF_RANGE"
+        cases = [  # name, pixel(y), rows dropped, verdict on the fallback band
+            ("fable B1: rows 0-5 dim, rows 6-35 crushed (the M16-1457 numbers)", lambda y: dim if y < 6 else black, 0, fallback_flags),
+            ("Dot I1: six separated dim rows among 30 black rows", lambda y: (60, 60, 60) if y in (2, 8, 14, 20, 26, 32) else black, 4, fallback_flags),
+            ("35 black rows and one bright row in the middle", lambda y: (200, 200, 200) if y == 18 else black, 18, fallback_flags),
+            ("35 black rows and one bright row at the top", lambda y: (200, 200, 200) if y == 0 else black, 0, fallback_flags),
+            ("35 black rows and one bright row at the bottom", lambda y: (200, 200, 200) if y == 35 else black, 0, fallback_flags),
+            ("an interior dark band under a bright top and bottom", lambda y: black if 6 <= y < 30 else (90, 90, 90), 0, fallback_flags),
+        ]
+        for name, pixel, dropped, verdict in cases:
+            with self.subTest(name):
+                out = self.exposure(self.rgb(lambda x, y, i: pixel(y)))
+                px = [self.luma(*pixel(i // self.W)) for i in range(self.W * self.H)]
+                if dropped == 0:
+                    self.assertEqual(out["stats"]["letterboxRowsDropped"], 0, out["stats"])
+                    self.assertAlmostEqual(out["stats"]["lumaMean"], sum(px) / len(px), places=3)
+                else:
+                    self.assertEqual(out["stats"]["letterboxRowsDropped"], dropped, out["stats"])
+                self.assertEqual(out["verdict"]["verdict"], verdict, out["verdict"]["reason"])
+        # a symmetric pair of bars is still dropped, up to a quarter of the rows per edge; a bar pair of 12 rows each is cut to 9 and the rest is picture
+        wide = self.exposure(self.rgb(lambda x, y, i: (0, 0, 0) if y < 12 or y >= self.H - 12 else (128, 128, 128)))
+        self.assertEqual(wide["stats"]["letterboxRowsDropped"], 18)
+        self.assertEqual(wide["verdict"]["verdict"], "OK", wide["verdict"]["reason"])
+        # bars of different depth: only the matching depth is dropped, the rest of the deeper bar is picture
+        uneven = self.exposure(self.rgb(lambda x, y, i: (0, 0, 0) if y < 4 or y >= self.H - 2 else (128, 128, 128)))["stats"]
+        self.assertEqual(uneven["letterboxRowsDropped"], 4)
+
+    def test_the_visual_exposure_band_file_validates_every_row_before_selecting_one(self) -> None:
+        # r2 (sol B1, Dot 796-D1): a repeated field in ANY clip row (not only the selected one), and the absent-clip sibling, make the file malformed
+        fallback = {"minMedianLuma": 16, "maxMedianLuma": 255, "maxNearBlackFraction": 0.6, "maxClippedFraction": 0.05}
+        relaxed = '"c": {"minMedianLuma": 0, "maxNearBlackFraction": 1}'
+        rows = [  # file text, clip asked, expected source
+            ('{"clips": {' + relaxed + ', "other": {"minMedianLuma": 4, "minMedianLuma": 5}}}', "c", "fallback-malformed"),   # sol's repro, verbatim
+            ('{"clips": {' + relaxed + ', "other": {"minMedianLuma": 4, "minMedianLuma": 5}}}', "other", "fallback-malformed"),
+            ('{"clips": {' + relaxed + ', "other": {"minMedianLuma": 4, "minMedianLuma": 5}}}', "absent", "fallback-malformed"),
+            ('{"clips": {' + relaxed + ', "other": {"minMedianLuma": 4, "minMedianLuma": 5}}}', "", "fallback-malformed"),
+            ('{"clips": {"other": {"x": 1, "x": 2}}}', "absent", "fallback-malformed"),
+            ('{"clips": {"other": {"minMedianLuma": 4, "minMedianLuma": 4}}}', "absent", "fallback-malformed"),   # a repeat of the same value is still a repeat
+            # every other per-row check, on a row that is NOT the selected one
+            ('{"clips": {' + relaxed + ', "other": 5}}', "c", "fallback-malformed"),
+            ('{"clips": {' + relaxed + ', "other": []}}', "c", "fallback-malformed"),
+            ('{"clips": {' + relaxed + ', "other": null}}', "c", "fallback-malformed"),
+            ('{"clips": {' + relaxed + ', "other": {}}}', "c", "fallback-malformed"),
+            ('{"clips": {' + relaxed + ', "other": {"minMedianLuma": "4"}}}', "c", "fallback-malformed"),
+            ('{"clips": {' + relaxed + ', "other": {"minMedianLuma": 300}}}', "c", "fallback-malformed"),
+            ('{"clips": {' + relaxed + ', "other": {"minMedianLuma": 50, "maxMedianLuma": 20}}}', "c", "fallback-malformed"),
+            ('{"clips": {' + relaxed + ', "other": {"minMedianLuma": 4, "zzz": 1}}}', "c", "fallback-malformed"),
+            ('{"clips": {"other": {"minMedianLuma": 50, "maxMedianLuma": 20}}}', "absent", "fallback-malformed"),
+            # fable H4: a misspelt field beside a valid one must not silently take the fallback's value
+            ('{"clips": {"c": {"minMedianLuma": 3, "maxNearBlackFration": 0.9}}}', "c", "fallback-malformed"),
+            # fable H3: a lone-surrogate key is read without a throw (it is a clip id no real clip has, so the clip has no row); inside a row it is an unknown field
+            ('{"clips": {"\\ud800": {"minMedianLuma": 4}}}', "c", "fallback-no-row"),
+            ('{"clips": {"c": {"minMedianLuma": 4}, "d": {"\\ud800": 4}}}', "c", "fallback-malformed"),
+            # controls: valid rows beside the selected one change nothing
+            ('{"clips": {"c": {"minMedianLuma": 4}, "other": {"maxClippedFraction": 0.5}}}', "c", "clip"),
+            ('{"clips": {"c": {"minMedianLuma": 4}, "other": {"maxClippedFraction": 0.5}}}', "absent", "fallback-no-row"),
+        ]
+        with tempfile.TemporaryDirectory(prefix="vis-exp-band-") as d:
+            for n, (text, clip, source) in enumerate(rows):
+                with self.subTest(text=text, clip=clip):
+                    path = Path(d) / f"rows-{n}.json"
+                    path.write_text(text, encoding="utf-8")
+                    proc, out = run_pwsh_json(f"Get-DvExposureBand -ClipId '{clip}' -Path '{path}' | ConvertTo-Json -Depth 4 -Compress")
+                    self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+                    self.assertIsNotNone(out, proc.stdout + proc.stderr)
+                    self.assertEqual(out["source"], source, out)
+                    self.assertEqual(out["note"] is not None, source == "fallback-malformed", out)
+                    if source == "fallback-malformed":
+                        self.assertEqual(out["band"], fallback)
+            # the verdict: sol's relaxed band would have read the under-exposed frame as OK
+            path = Path(d) / "rows-0.json"
+            for clip in ("c", "absent"):
+                got = self.exposure(self.underexposed(), str(path), clip=clip)
+                self.assertEqual(got["verdict"]["verdict"], "EXPOSURE_OUT_OF_RANGE", got["verdict"]["reason"])
+                self.assertEqual(got["band"]["source"], "fallback-malformed")
+                self.assertIn("exposure band file is unusable", got["verdict"]["reason"] + str(got["band"]["note"]))
+
+    def test_the_visual_exposure_band_file_refuses_a_negative_limit_that_underflows_to_zero(self) -> None:
+        # adversary fc152c48 A1: TryGetDouble reads -1e-400 as -0.0, which is not under 0, so a negative limit in an unselected row passed the range check
+        with tempfile.TemporaryDirectory(prefix="vis-exp-band-") as d:
+            rows = [("-1e-400", "fallback-malformed"), ("-0", "fallback-malformed"), ("-0.0", "fallback-malformed"), ("-0.001", "fallback-malformed"),
+                    # r3 (adversary 6256c193 A1): a positive limit that underflows to 0.0 is no longer in range either; the double is not the number the file states
+                    ("1e-400", "fallback-malformed"), ("0", "clip"), ("0.5", "clip")]
+            for n, (number, source) in enumerate(rows):
+                for field in ("minMedianLuma", "maxClippedFraction"):
+                    with self.subTest(number=number, field=field):
+                        path = Path(d) / f"neg-{n}-{field}.json"
+                        path.write_text('{"clips": {"c": {"minMedianLuma": 0, "maxNearBlackFraction": 1}, "other": {"' + field + '": ' + number + '}}}', encoding="utf-8")
+                        proc, out = run_pwsh_json(f"Get-DvExposureBand -ClipId 'c' -Path '{path}' | ConvertTo-Json -Depth 4 -Compress")
+                        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+                        self.assertEqual(out["source"], source, out)
+                        self.assertEqual(out["note"] is not None, source == "fallback-malformed", out)
+
+    def test_the_visual_exposure_band_path_resolves_against_the_powershell_location(self) -> None:
+        # adversary fc152c48 A2: Test-Path resolves a relative path against the PowerShell location and [IO.File]::ReadAllText against the process directory,
+        # so an existing band file given by a relative path read as a malformed file (and a valid clip row was replaced by the fallback)
+        with tempfile.TemporaryDirectory(prefix="vis-exp-band-") as d:
+            (Path(d) / "bands.json").write_text('{"clips": {"c": {"minMedianLuma": 0, "maxNearBlackFraction": 1}}}', encoding="utf-8")
+            proc, out = run_pwsh_json(f"Set-Location -LiteralPath '{d}'; Get-DvExposureBand -ClipId 'c' -Path 'bands.json' | ConvertTo-Json -Depth 4 -Compress")
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            self.assertEqual((out["source"], out["band"]["minMedianLuma"], out["note"]), ("clip", 0, None), out)
+            proc, out = run_pwsh_json(f"Set-Location -LiteralPath '{d}'; Get-DvExposureBand -ClipId 'c' -Path 'absent.json' | ConvertTo-Json -Depth 4 -Compress")
+            self.assertEqual((out["source"], out["note"] is not None), ("fallback-missing", True), out)
+
+    def test_the_visual_exposure_band_limit_must_be_exactly_what_the_file_says(self) -> None:
+        # adversary 6256c193 A1: TryGetDouble rounds 1.0000000000000001 to 1.0, so a cap above its maximum read as in range (and, in an unselected row, let a
+        # relaxed row beside it be chosen); 16.000000000000001 / 16 read as min <= max. A limit whose double is not the number the file states is malformed.
+        rows = [
+            ('{"clips": {"M16-1457": {"minMedianLuma": 0, "maxNearBlackFraction": 1}, "other": {"maxClippedFraction": 1.0000000000000001}}}', "M16-1457", "fallback-malformed"),   # the adversary's input
+            ('{"clips": {"c": {"maxNearBlackFraction": 1.0000000000000001}}}', "c", "fallback-malformed"),
+            ('{"clips": {"c": {"maxClippedFraction": 1.00000000000000000000000000001}}}', "c", "fallback-malformed"),
+            ('{"clips": {"c": {"maxMedianLuma": 255.00000000000001}}}', "c", "fallback-malformed"),
+            ('{"clips": {"c": {"minMedianLuma": 16.000000000000001, "maxMedianLuma": 16}}}', "c", "fallback-malformed"),
+            ('{"clips": {"c": {"minMedianLuma": 1e-400}}}', "c", "fallback-malformed"),   # an underflow to 0.0 is not the number the file states
+            # a limit that is exact in the file's own digits stays valid, whatever its spelling
+            ('{"clips": {"c": {"maxNearBlackFraction": 1.0}}}', "c", "clip"),
+            ('{"clips": {"c": {"maxNearBlackFraction": 1}}}', "c", "clip"),
+            ('{"clips": {"c": {"maxNearBlackFraction": 10e-1}}}', "c", "clip"),
+            ('{"clips": {"c": {"maxClippedFraction": 0.00042}}}', "c", "clip"),
+            ('{"clips": {"c": {"maxClippedFraction": 0.6}}}', "c", "clip"),
+            ('{"clips": {"c": {"maxClippedFraction": 1e-5}}}', "c", "clip"),
+            ('{"clips": {"c": {"minMedianLuma": 255.0, "maxMedianLuma": 255}}}', "c", "clip"),
+            ('{"clips": {"c": {"minMedianLuma": 0, "maxMedianLuma": 0.0}}}', "c", "clip"),
+            ('{"clips": {"c": {"maxClippedFraction": 0.000001, "minMedianLuma": 99.9999, "maxMedianLuma": 100.0004, "maxNearBlackFraction": 0.999999}}}', "c", "clip"),   # the finest limits: 6 places (fractions), 4 (luma)
+            # adversary c9ac4917 A2: a limit finer than a measurement can resolve rounds to the same double as an OUTSIDE measurement (1/2304 = 0.000434027777...,
+            # and a luma mean one 10000th of a level over 100), so it is refused, never compared
+            ('{"clips": {"c": {"maxClippedFraction": 0.00043402777777777775}}}', "c", "fallback-malformed"),   # the adversary's input: 1 clipped pixel in 2304 vs this cap
+            ('{"clips": {"c": {"maxNearBlackFraction": 0.00043402777777777775}}}', "c", "fallback-malformed"),
+            ('{"clips": {"c": {"maxMedianLuma": 100.00043402777777}}}', "c", "fallback-malformed"),
+            ('{"clips": {"c": {"minMedianLuma": 99.99956597222223}}}', "c", "fallback-malformed"),
+            ('{"clips": {"c": {"maxClippedFraction": 0.0000001}}}', "c", "fallback-malformed"),   # 7 places
+            ('{"clips": {"c": {"maxMedianLuma": 100.00001}}}', "c", "fallback-malformed"),   # 5 places on a luma limit
+            # adversary c9ac4917 A1 (DISTINGUISH): a limit written as an exact double expansion (0.5 + 2^-53, 53 places) is far finer than any measurement
+            ('{"clips": {"c": {"maxClippedFraction": 0.50000000000000011102230246251565404236316680908203125}}}', "c", "fallback-malformed"),
+            ('{"clips": {"c": {"minMedianLuma": 16.000000000000004, "maxMedianLuma": 16.000000000000004}}}', "c", "fallback-malformed"),   # the neighbouring double of 16, written in full
+        ]
+        with tempfile.TemporaryDirectory(prefix="vis-exp-band-") as d:
+            for n, (text, clip, source) in enumerate(rows):
+                with self.subTest(text=text):
+                    path = Path(d) / f"bands-{n}.json"
+                    path.write_text(text, encoding="utf-8")
+                    proc, out = run_pwsh_json(f"Get-DvExposureBand -ClipId '{clip}' -Path '{path}' | ConvertTo-Json -Depth 4 -Compress")
+                    self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+                    self.assertIsNotNone(out, proc.stdout + proc.stderr)
+                    self.assertEqual(out["source"], source, out)
+                    self.assertEqual(out["note"] is not None, source == "fallback-malformed", out)
+
+    def test_the_visual_exposure_numbers_are_exact_at_the_letterbox_and_pixel_limits(self) -> None:
+        # adversary 6256c193 A2: a dark edge row whose true mean luma is exactly 2 summed to 1.9999999999999996 in floating point, read as a bar and was dropped,
+        # so a picture the gate must judge in full read as its bright middle only
+        def edge(x: int, y: int, i: int) -> tuple[int, int, int]:
+            if y < 9 or y >= 27:   # rows 0..8 and 27..35: 8 px each of (16,0,0), (0,16,0), (0,0,16), the rest black: full-width mean luma exactly 2.0
+                return (16, 0, 0) if x < 8 else (0, 16, 0) if x < 16 else (0, 0, 16) if x < 24 else (0, 0, 0)
+            return (27, 27, 27) if (x, y) == (0, 10) else (26, 26, 26)
+        out = self.exposure(self.rgb(edge))["stats"]
+        self.assertEqual(out["letterboxRowsDropped"], 0, out)
+        self.assertAlmostEqual(out["lumaMean"], (18 * 2.0 + 18 * 26.0 + 1 / 64) / 36, places=6)   # all 36 rows are the picture
+        # a pixel of luma exactly 16 is not near-black (under 16) and exactly 235 is not clipped (over 235)
+        limits = self.exposure(self.rgb(lambda x, y, i: (16, 16, 16) if i % 2 == 0 else (235, 235, 235)))["stats"]
+        self.assertEqual((limits["nearBlackFraction"], limits["clippedFraction"]), (0, 0), limits)
+        under = self.exposure(self.rgb(lambda x, y, i: (15, 15, 15) if i % 2 == 0 else (236, 236, 236)))["stats"]
+        self.assertEqual((under["nearBlackFraction"], under["clippedFraction"]), (0.5, 0.5), under)
+
+    # r3 (sol r2 B1, fable N1): the runner runs under $ErrorActionPreference = 'Stop', so a probe that throws before the guard ended the leg (RUNNER_ERROR)
+    NUL_BAND_PATH = "('C:\\absent-dir\\band' + [char]0 + '.json')"   # Test-Path -LiteralPath throws ArgumentException on an embedded NUL on WINDOWS only: pwsh on Linux returns False for it (r4)
+
+    @contextlib.contextmanager
+    def unreadable_band_file(self):
+        """A band file the current user may not read (an ACL deny, removed again on exit)."""
+        user = os.environ.get("USERNAME") or ""
+        with tempfile.TemporaryDirectory(prefix="vis-exp-band-", ignore_cleanup_errors=True) as d:
+            path = Path(d) / "bands.json"
+            path.write_text('{"clips": {"c": {"minMedianLuma": 0, "maxNearBlackFraction": 1}}}', encoding="utf-8")
+            denied = subprocess.run(["icacls", str(path), "/deny", f"{user}:(R)"], capture_output=True, text=True)
+            self.assertEqual(denied.returncode, 0, denied.stdout + denied.stderr)
+            try:
+                yield path
+            finally:
+                subprocess.run(["icacls", str(path), "/remove:d", user], capture_output=True, text=True)
+
+    def test_the_visual_exposure_band_probe_that_throws_under_stop_is_the_reported_fallback(self) -> None:
+        # sol r2 B1: the existence probe sat outside the guard, so a path it throws on ended the call (and the measured leg) instead of the reported fallback.
+        # r4: the throw is injected (a function named Test-Path in the caller's scope answers the probe by throwing a chosen exception), so the row behaves the same
+        # on ubuntu, where a real embedded NUL does not throw from Test-Path (it reads False, so the reader said fallback-missing)
+        proc, out = run_pwsh_json("$ErrorActionPreference = 'Stop'; function Test-Path { throw [System.ArgumentException]::new('injected probe failure') }; "
+                                  "$r = Get-DvExposureBand -ClipId 'c' -Path 'any-band-file.json'; $r | ConvertTo-Json -Depth 4 -Compress")
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIsNotNone(out, "Get-DvExposureBand returned nothing under Stop: " + proc.stdout + proc.stderr)
+        self.assertEqual(out["source"], "fallback-unreadable", out)
+        self.assertEqual((out["band"]["minMedianLuma"], out["band"]["maxNearBlackFraction"]), (16, 0.6), out)
+        self.assertIn("cannot be read", out["note"])
+        self.assertIn("ArgumentException", out["note"], "the note names what failed")
+
+    @requires_windows_pwsh
+    def test_the_visual_exposure_band_path_with_an_embedded_nul_is_the_reported_fallback_on_windows(self) -> None:
+        # the real fault the injected row stands in for: on Windows Test-Path -LiteralPath throws ArgumentException on an embedded NUL
+        proc, out = run_pwsh_json("$ErrorActionPreference = 'Stop'; $r = Get-DvExposureBand -ClipId 'c' -Path " + self.NUL_BAND_PATH + "; "
+                                  "$r | ConvertTo-Json -Depth 4 -Compress")
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIsNotNone(out, proc.stdout + proc.stderr)
+        self.assertEqual(out["source"], "fallback-unreadable", out)
+        self.assertIn("ArgumentException", out["note"])
+
+    @requires_windows_pwsh
+    def test_the_visual_exposure_band_file_that_is_access_denied_is_unreadable_not_malformed(self) -> None:
+        # fable N1: a file that exists but cannot be read is not a malformed file (and not a missing one): it has its own truthful label, under Stop too
+        with self.unreadable_band_file() as path:
+            proc, out = run_pwsh_json(f"$ErrorActionPreference = 'Stop'; Get-DvExposureBand -ClipId 'c' -Path '{path}' | ConvertTo-Json -Depth 4 -Compress")
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            self.assertIsNotNone(out, proc.stdout + proc.stderr)
+            self.assertEqual(out["source"], "fallback-unreadable", out)
+            self.assertEqual(out["band"]["minMedianLuma"], 16, "the clip's relaxed row is not applied: the absolute fallback judges")
+            self.assertIn("cannot be read", out["note"])
+            self.assertIn("UnauthorizedAccessException", out["note"])
+
+    def test_the_visual_exposure_band_file_that_goes_away_after_the_probe_is_missing_not_malformed(self) -> None:
+        # fable N1: the probe says "there" and the read finds nothing (a function named Test-Path in the caller's scope answers the probe, the way a race would).
+        # r4: the absent path is a real absent directory under a temp dir, never the literal 'C:\absent-dir\...': on ubuntu that names a DRIVE pwsh does not have,
+        # which raises DriveNotFoundException (not ItemNotFound), so the reader said fallback-unreadable
+        with tempfile.TemporaryDirectory(prefix="vis-exp-band-", ignore_cleanup_errors=True) as d:
+            gone = Path(d) / "absent-dir" / "bands.json"
+            proc, out = run_pwsh_json("$ErrorActionPreference = 'Stop'; function Test-Path { $true }; "
+                                      f"$r = Get-DvExposureBand -ClipId 'c' -Path '{gone}'; $r | ConvertTo-Json -Depth 4 -Compress")
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIsNotNone(out, proc.stdout + proc.stderr)
+        self.assertEqual(out["source"], "fallback-missing", out)
+        self.assertIn("went away", out["note"])
+
+    def test_the_visual_exposure_band_fallback_result_is_a_fresh_object_a_caller_cannot_poison(self) -> None:
+        # r5 (adversary 288559f1/a7424c18 A1): every fallback-* result carried the ONE $script:ExposureFallbackBand object, so a caller that edited a first result's
+        # .band (a floor of 0, a ceiling of 255) changed the band that every LATER clip was judged against. Each call now builds its own band from the constant.
+        # Every fallback source is covered (no path, absent file, empty file, malformed JSON, a valid file with no row for the clip, a clip whose row is malformed).
+        with tempfile.TemporaryDirectory(prefix="vis-exp-fresh-", ignore_cleanup_errors=True) as d:
+            files = {"empty": "", "malformed": "{not json", "norow": '{"clips": {"other": {"minMedianLuma": 5}}}', "badrow": '{"clips": {"c": {"minMedianLuma": "x"}}}'}
+            for name, text in files.items():
+                (Path(d) / f"{name}.json").write_text(text, encoding="utf-8")
+            absent = Path(d) / "absent-dir" / "bands.json"
+            script = (
+                "$cases = [ordered]@{ "
+                f"missing = '{absent}'; empty = '{Path(d) / 'empty.json'}'; malformed = '{Path(d) / 'malformed.json'}'; "
+                f"norow = '{Path(d) / 'norow.json'}'; badrow = '{Path(d) / 'badrow.json'}' }}; "
+                "$out = [ordered]@{}; "
+                "foreach ($k in $cases.Keys) { "
+                "  $first = Get-DvExposureBand -ClipId 'c' -Path $cases[$k]; "
+                "  $source = $first.source; "
+                "  $first.band.minMedianLuma = 0.0; $first.band.maxMedianLuma = 255.0; $first.band.maxNearBlackFraction = 1.0; $first.band.maxClippedFraction = 1.0; "
+                "  $second = Get-DvExposureBand -ClipId 'c' -Path $cases[$k]; "
+                "  $v = Get-DvVisualVerdict -Requested $true -Captured $true -PlayFrames 6 -DistinctContentHashes 6 -AppDistinctDisplayFrames 6 -FlatPlayFrames 0 "
+                "       -PlayVsPausedMeanAbsDiff 1.0 -SamePosition $true -ExposureMedianLuma 7.0 -ExposureMedianNearBlackFraction 0.84 -ExposureMedianClippedFraction 0.0 "
+                "       -ExposureBand $second.band -ExposureBandSource $second.source; "
+                "  $out[$k] = [pscustomobject]@{ source = $source; secondSource = $second.source; band = $second.band; same = [object]::ReferenceEquals($first.band, $second.band); verdict = $v.verdict } "
+                "} "
+                "$none = Get-DvExposureBand -ClipId 'c' -Path ''; $none.band.minMedianLuma = 0.0; $none2 = Get-DvExposureBand -ClipId 'c' -Path ''; "
+                "$out['nopath'] = [pscustomobject]@{ source = $none.source; secondSource = $none2.source; band = $none2.band; same = [object]::ReferenceEquals($none.band, $none2.band); verdict = 'n/a' }; "
+                "$out | ConvertTo-Json -Depth 5 -Compress")
+            proc, out = run_pwsh_json(script)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIsNotNone(out, proc.stdout + proc.stderr)
+        self.assertEqual(set(out), {"missing", "empty", "malformed", "norow", "badrow", "nopath"}, out)
+        for name, row in out.items():
+            self.assertTrue(row["source"].startswith("fallback-"), (name, row))
+            self.assertEqual(row["secondSource"], row["source"], (name, row))
+            self.assertFalse(row["same"], f"{name}: the two results share one band object")
+            self.assertEqual((row["band"]["minMedianLuma"], row["band"]["maxMedianLuma"], row["band"]["maxNearBlackFraction"], row["band"]["maxClippedFraction"]),
+                             (16, 255, 0.6, 0.05), f"{name}: a caller's edit of the first result changed the second one's band: {row['band']}")
+            if name != "nopath":
+                self.assertEqual(row["verdict"], "EXPOSURE_OUT_OF_RANGE", f"{name}: the second clip must still be judged against the shipped fallback limits")
+
+    @requires_windows_imaging
+    def test_the_visual_reader_keeps_the_leg_measured_when_the_band_file_is_unreadable_under_stop(self) -> None:
+        # sol r2 B1, runner level: the reader is what Invoke-VenueLeg calls on the measured run and on a self-heal pre-launch; an unreadable band file there
+        # was a RUNNER_ERROR. Now the leg keeps its verdict (here the underexposed picture is still flagged by the fallback) and says why.
+        with tempfile.TemporaryDirectory(prefix="vis-exp-read-", ignore_cleanup_errors=True) as d:
+            self.dark_captures(Path(d) / "artifacts" / "visual", 4)
+            nul = self.read(d, "-ClipId 'dark-clip' -ExposureBandPath " + self.NUL_BAND_PATH, stop=True)
+            self.assertEqual((nul["verdict"], nul["counted"], nul["exposureBandSource"]), ("EXPOSURE_OUT_OF_RANGE", True, "fallback-unreadable"), nul["reason"])
+            self.assertIn("cannot be read", nul["exposureBandNote"])
+            self.assertIn("cannot be read", nul["reason"], "reported beside the verdict")
+            self.assertEqual(nul["exposureFrames"], 6, "the leg is still measured")
+            with self.unreadable_band_file() as path:
+                denied = self.read(d, f"-ClipId 'dark-clip' -ExposureBandPath '{path}'", stop=True)
+                self.assertEqual((denied["verdict"], denied["counted"], denied["exposureBandSource"]), ("EXPOSURE_OUT_OF_RANGE", True, "fallback-unreadable"), denied["reason"])
+            normal = Path(d) / "normal"
+            write_visual_captures(normal / "artifacts" / "visual", "ok")
+            ok = self.read(str(normal), "-ClipId 'unit-clip' -ExposureBandPath " + self.NUL_BAND_PATH, stop=True)
+            self.assertEqual((ok["verdict"], ok["counted"], ok["exposureBandSource"]), ("OK", True, "fallback-unreadable"), ok["reason"])
+            self.assertIn("cannot be read", ok["reason"], "an OK leg says its band file was unusable")
+
+    def test_the_visual_exposure_band_catalogue_names_the_unreadable_source(self) -> None:
+        doc = (ROOT / "docs" / "dual-venue-visual-capture.md").read_text(encoding="utf-8")
+        self.assertIn("fallback-unreadable", doc)
+        self.assertIn("unreadable exposure-band metadata under Stop", doc)
+        psm1 = (DV / "DualVenueRunner.psm1").read_text(encoding="utf-8")
+        self.assertIn("fallback-unreadable", psm1.split("function Get-DvExposureBand", 1)[1].split("function Get-DvVisualVerdict", 1)[0])
+
+    @requires_windows_imaging
+    def test_the_visual_reader_keeps_a_not_captured_reason_beside_an_unusable_band_file(self) -> None:
+        # r2 (fable H2): the band-file note was pre-set as block.reason, which displaced the NOT_CAPTURED verdict's own reason
+        with tempfile.TemporaryDirectory(prefix="vis-exp-read-") as d:
+            visual = Path(d) / "artifacts" / "visual"
+            write_visual_captures(visual, "ok")
+            for k in range(1, 6):
+                (visual / f"play-{k}.png").unlink()
+            out = self.read(d, f"-ClipId 'unit-clip' -ExposureBandPath '{Path(d) / 'absent.json'}'")
+            self.assertEqual(out["verdict"], "NOT_CAPTURED", out["reason"])
+            self.assertIn("only 1 play frame(s) were captured", out["reason"])
+            self.assertIn("exposure band file is missing", out["reason"], "the band-file warning is beside the verdict's reason, not instead of it")
+
+    def test_the_visual_exposure_numbers_are_compared_unrounded(self) -> None:
+        # adversary dfb973a0 A3: one clipped pixel in 2304 is 0.000434; rounded to 4 places it read 0.0004 and passed a cap of 0.00042
+        one = self.rgb(lambda x, y, i: (255, 255, 255) if i == 0 else (100, 100, 100))
+        with tempfile.TemporaryDirectory(prefix="vis-exp-band-") as d:
+            path = Path(d) / "bands.json"
+            path.write_text('{"clips": {"c": {"maxClippedFraction": 0.00042}}}', encoding="utf-8")
+            out = self.exposure(one, str(path))
+            self.assertAlmostEqual(out["stats"]["clippedFraction"], 1 / 2304, places=12)
+            self.assertEqual(out["verdict"]["verdict"], "EXPOSURE_OUT_OF_RANGE", out["verdict"]["reason"])
+            self.assertIn("clipped fraction 0.000434 is over the band maximum 0.00042", out["verdict"]["reason"])
+            path.write_text('{"clips": {"c": {"maxClippedFraction": 0.00044}}}', encoding="utf-8")
+            self.assertEqual(self.exposure(one, str(path))["verdict"]["verdict"], "OK")
+
+    def test_the_visual_exposure_verdict_refuses_a_median_that_is_not_a_number(self) -> None:
+        for bad in ("[double]::NaN", "[double]::PositiveInfinity"):
+            with self.subTest(bad=bad):
+                proc, out = run_pwsh_json("$band = [pscustomobject]@{ minMedianLuma = 16.0; maxMedianLuma = 255.0; maxNearBlackFraction = 0.6; maxClippedFraction = 0.05 }; "
+                                          "Get-DvVisualVerdict -Requested $true -Captured $true -PlayFrames 6 -DistinctContentHashes 6 -AppDistinctDisplayFrames 6 -FlatPlayFrames 0 "
+                                          f"-PlayVsPausedMeanAbsDiff 1.0 -SamePosition $true -ExposureMedianLuma ({bad}) -ExposureMedianNearBlackFraction 0 -ExposureMedianClippedFraction 0 "
+                                          "-ExposureBand $band | ConvertTo-Json -Compress")
+                self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+                self.assertEqual(out["verdict"], "EXPOSURE_OUT_OF_RANGE", out["reason"])
+                self.assertIn("not a finite number", out["reason"])
+
+    @requires_windows_imaging
+    def test_the_visual_reader_says_an_unusable_band_file_beside_an_earlier_note(self) -> None:
+        # adversary dfb973a0 A5: `reason` keeps its first note, so the band-file warning of an OK leg was only in exposureBandNote
+        with tempfile.TemporaryDirectory(prefix="vis-exp-read-") as d:
+            write_visual_captures(Path(d) / "artifacts" / "visual", "partial-ok")
+            out = self.read(d, f"-ClipId 'unit-clip' -ExposureBandPath '{Path(d) / 'absent.json'}'")
+            self.assertEqual(out["verdict"], "OK", out["reason"])
+            self.assertIn("no usable viewport rectangle", out["reason"])
+            self.assertIn("exposure band file is missing", out["reason"])
+            self.assertIn("exposure band file is missing", out["exposureBandNote"])
+            clean = self.read(d, f"-ClipId 'unit-clip'")   # the committed file: valid, no note, the reason is what it always was
+            self.assertIsNone(clean["exposureBandNote"])
+            self.assertNotIn("exposure band", clean["reason"])
+
+    def test_the_visual_self_heal_gate_lets_a_pre_launch_carry_the_exposure_flag(self) -> None:
+        # adversary dfb973a0 A4: "never an exclusion" holds for a self-heal pre-launch too; every other non-OK verdict there still makes the leg INVALID
+        runner = (DV / "Invoke-VenueLeg.ps1").read_text(encoding="utf-8")
+        self.assertIn("elseif ([string]$entry.verdict -cne 'OK' -and [string]$entry.verdict -cne 'EXPOSURE_OUT_OF_RANGE') {", runner)
+        self.assertIn("EXPOSURE_OUT_OF_RANGE on self-heal pre-launch", runner)
+        self.assertEqual(runner.count("-cne 'EXPOSURE_OUT_OF_RANGE'"), 1)
+        doc = (ROOT / "docs" / "dual-venue-visual-capture.md").read_text(encoding="utf-8")
+        self.assertIn("a self-heal pre-launch may show it too", doc)
+
+    def test_the_visual_leg_runner_passes_the_clip_and_surfaces_the_exposure_verdict(self) -> None:
+        runner = (DV / "Invoke-VenueLeg.ps1").read_text(encoding="utf-8")
+        calls = re.findall(r"Read-DvVisualCaptures -Requested \$true -ArtifactsDir[^\n]*\n[^\n]*\n", runner)
+        self.assertEqual(len(calls), 2, "the measured run's read and the self-heal pre-launch read")
+        for call in calls:
+            self.assertIn("-ClipId ([string]$spec.clipId)", call)
+        self.assertIn("'PARTIAL_FREEZE', 'EXPOSURE_OUT_OF_RANGE')) {", runner, "counted for speed and surfaced in the detail, like a divergence")
+        self.assertNotIn("EXPOSURE_OUT_OF_RANGE", runner.split("elseif ($receipt.visual.verdict -cin")[0], "never an exclusion: the FROZEN_DISPLAY branch does not name it")
+
+    DARK_PNG_PS = r"""
+Add-Type -AssemblyName System.Drawing
+function New-DarkPng([string]$Path, [int]$Seed, [int]$Base) {
+    $b = [System.Drawing.Bitmap]::new(320, 200)
+    $g = [System.Drawing.Graphics]::FromImage($b)
+    $g.Clear([System.Drawing.Color]::FromArgb(128, 128, 128))
+    $g.FillRectangle([System.Drawing.SolidBrush]::new([System.Drawing.Color]::FromArgb($Base, $Base, $Base)), 10, 20, 300, 160)
+    $g.FillRectangle([System.Drawing.SolidBrush]::new([System.Drawing.Color]::FromArgb($Base + 30, $Base + 30, $Base + 30)), 10 + ($Seed * 40) % 280, 60, 20, 80)
+    $g.Dispose(); $b.Save($Path, [System.Drawing.Imaging.ImageFormat]::Png); $b.Dispose()
+}
+"""
+
+    def dark_captures(self, dest: Path, base: int) -> None:
+        """The 'ok' captures (six moving pictures, stop, paused) with every viewport repainted dark: a flat 'base' with a moving brighter bar."""
+        write_visual_captures(dest, "ok")
+        calls = [f"New-DarkPng '{dest / f'play-{k}.png'}' {k} {base}" for k in range(6)]
+        calls += [f"New-DarkPng '{dest / 'stop.png'}' 5 {base}", f"New-DarkPng '{dest / 'paused.png'}' 5 {base}"]
+        proc = run_pwsh(["-Command", self.DARK_PNG_PS + "\n".join(calls)])
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+
+    def read(self, d: str, extra: str = "", stop: bool = False) -> dict:
+        # stop: the runner's own error preference (Invoke-VenueLeg.ps1 sets $ErrorActionPreference = 'Stop'); the default test shell's Continue hides a throw
+        proc, out = run_pwsh_json(("$ErrorActionPreference = 'Stop'; " if stop else "") + f"Read-DvVisualCaptures -Requested $true -ArtifactsDir '{Path(d) / 'artifacts'}' -EvidenceDir '{Path(d) / 'evidence'}' "
+                                  f"-LegId 'unit-leg' -Header 'unit' {extra} | ConvertTo-Json -Depth 8 -Compress")
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIsNotNone(out, proc.stdout + proc.stderr)
+        return out
+
+    @requires_windows_imaging
+    def test_the_visual_reader_records_exposure_numbers_and_stays_ok_on_a_normal_picture(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="vis-exp-read-") as d:
+            write_visual_captures(Path(d) / "artifacts" / "visual", "ok")
+            out = self.read(d, f"-ClipId 'unit-clip' -ExposureBandPath '{Path(d) / 'absent.json'}'")
+            self.assertEqual((out["verdict"], out["counted"]), ("OK", True), out["reason"])
+            self.assertEqual(out["exposureFrames"], 6)
+            self.assertTrue(60 < out["exposureMedianLuma"] < 130, out["exposureMedianLuma"])
+            # (the fixture's moving bar is white: about 2% of the picture clips, well under the 5% fallback)
+            self.assertEqual(out["exposureMedianNearBlackFraction"], 0)
+            self.assertTrue(0.01 < out["exposureMedianClippedFraction"] < 0.05, out["exposureMedianClippedFraction"])
+            play = [f for f in out["frames"] if f["kind"] == "play"]
+            self.assertEqual(len(play), 6)
+            for f in play:
+                self.assertTrue(60 < f["exposureLumaMean"] < 130)
+                self.assertEqual((f["exposureNearBlackFraction"], f["exposureLetterboxRowsDropped"]), (0, 0))
+                self.assertTrue(0.01 < f["exposureClippedFraction"] < 0.05, f["exposureClippedFraction"])
+            self.assertEqual(out["exposureBandSource"], "fallback-missing")
+            self.assertIn("exposure band file is missing", out["exposureBandNote"], "an unusable band file is reported, never silent")
+            self.assertIn("exposure band file is missing", out["reason"])
+            for old in ("playFrames", "distinctContentHashes", "flatPlayFrames", "sourceDifference", "stripPath", "divergenceThreshold"):
+                self.assertIn(old, out, "no existing field is renamed or dropped")
+
+    @requires_windows_imaging
+    def test_the_visual_reader_flags_an_underexposed_picture_that_every_other_check_passes(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="vis-exp-read-") as d:
+            self.dark_captures(Path(d) / "artifacts" / "visual", 4)
+            out = self.read(d, f"-ClipId 'unit-clip' -ExposureBandPath '{Path(d) / 'absent.json'}'")
+            # six distinct pictures, the playback frame equals its paused re-render: nothing but exposure is wrong
+            self.assertEqual((out["distinctContentHashes"], out["playVsPausedMeanAbsDiff"]), (6, 0))
+            self.assertEqual((out["verdict"], out["counted"]), ("EXPOSURE_OUT_OF_RANGE", True), out["reason"])
+            self.assertLess(out["exposureMedianLuma"], 8)
+            self.assertGreater(out["exposureMedianNearBlackFraction"], 0.9)
+            self.assertIn(f"median luma {self.shown(out['exposureMedianLuma'])}", out["reason"])
+            self.assertIn(f"near-black fraction {self.shown(out['exposureMedianNearBlackFraction'])}", out["reason"])
+            self.assertIn("band luma 16..255", out["reason"])
+            self.assertTrue((Path(d) / "evidence" / "visual" / "app-visual.json").is_file())
+            self.assertTrue(Path(out["stripPath"]).is_file(), "the strip is composed")
+
+    @requires_windows_imaging
+    def test_the_visual_reader_judges_a_dark_clip_by_its_own_row_and_reports_a_malformed_file(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="vis-exp-read-") as d:
+            self.dark_captures(Path(d) / "artifacts" / "visual", 4)
+            bands = Path(d) / "bands.json"
+            bands.write_text('{"clips": {"dark-clip": {"minMedianLuma": 2, "maxMedianLuma": 20, "maxNearBlackFraction": 1.0}}}', encoding="utf-8")
+            row = self.read(d, f"-ClipId 'dark-clip' -ExposureBandPath '{bands}'")
+            self.assertEqual((row["verdict"], row["exposureBandSource"], row["exposureBandNote"]), ("OK", "clip", None), row["reason"])
+            self.assertEqual(row["exposureBand"]["minMedianLuma"], 2)
+            bands.write_text('{"clips": {"dark-clip": {"minMedianLuma": "2"}}}', encoding="utf-8")
+            bad = self.read(d, f"-ClipId 'dark-clip' -ExposureBandPath '{bands}'")
+            self.assertEqual((bad["verdict"], bad["exposureBandSource"]), ("EXPOSURE_OUT_OF_RANGE", "fallback-malformed"), bad["reason"])
+            self.assertIn("is malformed", bad["exposureBandNote"])
+            self.assertIn("is malformed", bad["reason"], "reported beside the verdict")
 
 
 class GeneratorWarmUpIsOptInPerClassTests(unittest.TestCase):
@@ -10105,6 +10909,50 @@ class VisualCaptureRunnerTests(RunnerHarness, unittest.TestCase):
         self.assertIn("VISUAL_DIVERGENCE on self-heal pre-launch pre-1", receipt["outcomeDetail"])
         self.assertNotIn("pre-2", receipt["outcomeDetail"])
 
+    def darken(self, visual_dir: Path, base: int) -> None:
+        """Repaint a write_visual_captures('ok') directory dark (a flat 'base' with a moving brighter bar): every other check still passes, only the exposure is wrong."""
+        calls = [f"New-DarkPng '{visual_dir / f'play-{k}.png'}' {k} {base}" for k in range(6)]
+        calls += [f"New-DarkPng '{visual_dir / name}' 5 {base}" for name in ("stop.png", "paused.png")]
+        proc = run_pwsh(["-Command", VisualExposureFloorTests.DARK_PNG_PS + "\n".join(calls)])
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+
+    def run_dark_self_heal(self, launches: dict):
+        """launches: pre-<n> -> 'dark' (an OK-shaped capture repainted dark) or a write_visual_captures mode; the measured run's own captures are fine."""
+        self.write_artifacts()
+        write_visual_captures(self.artifacts / "visual", "ok")
+        shutil.rmtree(self.artifacts / "self-heal", ignore_errors=True)
+        for name, mode in launches.items():
+            dest = self.artifacts / "self-heal" / name / "visual"
+            write_visual_captures(dest, "ok" if mode == "dark" else mode)
+            if mode == "dark":
+                self.darken(dest, 4)
+        return self.run_leg("ultra-magnus", self.write_spec(), extra=["-Backend", "cpu"])
+
+    @requires_windows_imaging
+    def test_the_leg_runner_counts_and_surfaces_a_dark_measured_picture(self) -> None:
+        """r2 (fable H7): the Invoke-VenueLeg wiring pinned by BEHAVIOUR, not source text -- a leg whose pictures move and match but are crushed dark is
+        counted (PASS, never INVALID) and says EXPOSURE_OUT_OF_RANGE in its detail."""
+        self.write_artifacts()
+        write_visual_captures(self.artifacts / "visual", "ok")
+        self.darken(self.artifacts / "visual", 4)
+        _, receipt, _ = self.run_leg("ultra-magnus", self.write_spec(), extra=["-Backend", "cpu"])
+        self.assertEqual((receipt["visual"]["verdict"], receipt["visual"]["counted"]), ("EXPOSURE_OUT_OF_RANGE", True), receipt["visual"]["reason"])
+        self.assertEqual(receipt["outcome"], "PASS", receipt["outcomeDetail"])
+        self.assertIn("EXPOSURE_OUT_OF_RANGE (counted for speed, surfaced for review)", receipt["outcomeDetail"])
+
+    @requires_windows_imaging
+    def test_a_dark_self_heal_pre_launch_is_counted_and_surfaced_but_every_other_non_ok_one_still_voids_the_leg(self) -> None:
+        """r2 (fable H7): the self-heal exemption by behaviour. A dark pre-launch is the one non-OK verdict that does not void the leg; it is in the detail."""
+        _, receipt, _ = self.run_dark_self_heal({"pre-1": "dark", "pre-2": "ok"})
+        self.assertEqual(receipt["selfHealVisual"]["pre-1"]["verdict"], "EXPOSURE_OUT_OF_RANGE")
+        self.assertEqual(receipt["outcome"], "PASS", receipt["outcomeDetail"])
+        self.assertIn("EXPOSURE_OUT_OF_RANGE on self-heal pre-launch pre-1 (counted, surfaced for review)", receipt["outcomeDetail"])
+        self.assertNotIn("pre-2", receipt["outcomeDetail"])
+        # the same dark pre-launch beside a frozen one: the frozen one still voids the leg
+        _, receipt, _ = self.run_dark_self_heal({"pre-1": "dark", "pre-2": "frozen"})
+        self.assertEqual(receipt["outcome"], "INVALID", receipt["outcomeDetail"])
+        self.assertIn("FROZEN_DISPLAY on self-heal pre-launch pre-2", receipt["outcomeDetail"])
+
     def test_a_self_heal_pre_launch_with_no_captures_makes_the_leg_invalid(self) -> None:
         """GPU-DEVICE-LOSS-SELF-HEAL-1 r7: pre-2 published its self-heal\\pre-2 but no visual\\ (captured=false): NOT_CAPTURED is no picture of the fallback."""
         _, receipt, _ = self.run_self_heal_visual("ok", {"pre-1": "ok", "pre-2": None, "pre-3": "ok"}, declared=3)
@@ -10680,6 +11528,8 @@ class VisualCaptureSpecAndAppSourceTests(unittest.TestCase):
 # Get-Counter / Get-Process / Get-CimInstance / Invoke-CimMethod shadows, so identity is proved on exact values, not on whatever the test host is running.
 import base64 as _ident_base64
 import datetime as _ident_dt
+import threading as _ident_threading
+import time as _ident_time
 
 IDENT_SCHEMA = "mlv-app/venue-quiet-probe-identity/v1"
 IDENT_T0 = _ident_dt.datetime(2026, 10, 24, 1, 2, 3, tzinfo=_ident_dt.timezone.utc)
@@ -10753,22 +11603,280 @@ def _ident_probe_body() -> str:
     return re.search(r"\$probeText = @'\r?\n(.*?)\r?\n'@", text, re.S).group(1)
 
 
+# r4 (sol r3 blocker) TEST SEAM: seconds the PARENT is stalled after the child has exited and been reaped, before the harness reads anything. It models a runner so loaded that the test
+# process is not scheduled for that long. The child is already gone, so a stall here must never read as the child holding its exit.
+_IDENT_AFTER_REAP_DELAY_S = 0.0
+
+
+_IDENT_PAIR_TIGHT_NS = 50_000_000   # a (QPC, FILETIME) pair is believed only when the QPC reads on both sides of the FILETIME read are within 50 ms of each other (error <= 25 ms)
+_IDENT_CIVIL_STEP_TOLERANCE_S = 0.5   # over a run, civil elapsed and monotonic elapsed may differ by this much (slew, read granularity); more is a clock STEP
+# MEASUREMENT UNCERTAINTY of the OS-exit estimate (pass-2 adversary A2): the two read pairs bound at most 2 * 25 ms, and a civil/monotonic disagreement under the tolerance is not seen, so a figure
+# is good to about this much. r5 (sol r4 A2): it is APPLIED to the verdict, see _ident_gap_verdict. A civil clock that steps one way and back inside ONE run (two opposite steps that cancel at the
+# endpoints) is not seen by the mapper at all; r5 (sol r4 A1) makes that harmless for a PASS (a civil estimate never passes a run) and a run it could have faked as a hold is a HOLD only when the
+# monotonic gap is over the limit too. r5 fix1 samples the pair during the run (_IdentClockSampler), which turns cancelling steps longer than the sample interval into a withheld estimate; OPEN
+# CIVIL-STEP-SUBINTERVAL (a step shorter than the interval, with the child's exit or creation inside it, can still fake a HOLD while the parent is also delayed): it needs a child-side MONOTONIC exit stamp.
+_IDENT_EXIT_ESTIMATE_UNCERTAINTY_S = 2 * _IDENT_CIVIL_STEP_TOLERANCE_S + 2 * _IDENT_PAIR_TIGHT_NS / 2e9
+# r5 fix2 (adversary A2 on fae72991): every pair may disagree with the launch pair by up to the tolerance in EITHER direction, so a FILETIME stamp placed through the read pair is good to TWICE the
+# tolerance (+ the pair read), not once. The child's wall estimate is a difference of two such stamps (exit - creation, one read pair, whose own error cancels), so it is good to twice that.
+_IDENT_WALL_ESTIMATE_UNCERTAINTY_S = 2 * _IDENT_EXIT_ESTIMATE_UNCERTAINTY_S
+
+
+def _ident_gap_verdict(mono_s: float, civil_s, limit_s: float, uncertainty_s: float | None = None) -> tuple:
+    """r5 (sol r4 A1-A3, HUB RULING): the ONE verdict for every time gap this class judges (marker -> process end, and the probe's whole wall). Returns (kind, figure_s, reason).
+    "pass": the MONOTONIC parent-side gap is under the limit; no civil clock is consulted. "over": the monotonic gap is over the limit AND the child-side civil estimate, widened by the documented
+    uncertainty in the direction that SHORTENS the gap, is still over it; the figure is the smaller of the two. "inconclusive": anything else (monotonic over but the civil estimate under or straddling
+    the limit, a civil step seen, or no estimate at all): a typed skip, never a pass and never an over verdict."""
+    u = _IDENT_EXIT_ESTIMATE_UNCERTAINTY_S if uncertainty_s is None else uncertainty_s
+    if mono_s < limit_s:
+        return "pass", mono_s, ""
+    if civil_s is None:
+        return "inconclusive", mono_s, f"the monotonic gap {mono_s:.2f} s is over the {limit_s:.0f} s limit and no child-side civil estimate could be formed"
+    if civil_s - u >= limit_s:
+        return "over", min(mono_s, civil_s), ""
+    return "inconclusive", mono_s, (f"the monotonic gap {mono_s:.2f} s is over the {limit_s:.0f} s limit but the child-side civil estimate {civil_s:.2f} s "
+                                    f"(good to +/-{u:.2f} s) does not clear it")
+
+
+def _ident_win32_clock():
+    """kernel32 with typed signatures for the two clock calls and GetProcessTimes, or None off Windows."""
+    if sys.platform != "win32":
+        return None
+    import ctypes
+    from ctypes import wintypes
+    k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    ptr = ctypes.POINTER(wintypes.FILETIME)
+    k32.GetProcessTimes.argtypes = [wintypes.HANDLE, ptr, ptr, ptr, ptr]
+    k32.GetProcessTimes.restype = wintypes.BOOL
+    k32.GetSystemTimePreciseAsFileTime.argtypes = [ptr]
+    k32.GetSystemTimePreciseAsFileTime.restype = None
+    return ctypes, wintypes, k32
+
+
+def _ident_ft_int(f) -> int:
+    return (f.dwHighDateTime << 32) | f.dwLowDateTime
+
+
+def _ident_read_pair_once() -> tuple:
+    ctypes, wintypes, k32 = _ident_win32_clock()
+    now = wintypes.FILETIME()
+    q0 = _ident_time.perf_counter_ns()
+    k32.GetSystemTimePreciseAsFileTime(ctypes.byref(now))
+    q1 = _ident_time.perf_counter_ns()
+    return q0, _ident_ft_int(now), q1
+
+
+def _ident_clock_pair(read_once=None, tries: int = 50):
+    """(qpc_ns, filetime_100ns) taken at ONE instant, or None. r4 (adversary A2): the QPC reads on both sides of the FILETIME read must be within _IDENT_PAIR_TIGHT_NS; a parent that is
+    descheduled between them makes the midpoint wrong by half the stall, so a loose read is thrown away and taken again, and a run of loose reads is no pair at all."""
+    read_once = read_once or _ident_read_pair_once
+    for _ in range(tries):
+        q0, ft, q1 = read_once()
+        if 0 <= q1 - q0 <= _IDENT_PAIR_TIGHT_NS:
+            return (q0 + q1) // 2, ft
+    return None
+
+
+def _ident_launch_pair():
+    try:
+        return _ident_clock_pair() if sys.platform == "win32" else None
+    except Exception:
+        return None
+
+
+class _IdentClockSampler:
+    """r5 (adversary A1 on b4cae711): tight (QPC, FILETIME) pairs taken every `interval_s` on a thread for as long as the child runs. Two civil steps that cancel at the launch and read pairs
+    (+20 s then -20 s) leave those two pairs in agreement, so an exit recorded inside the offset was believed; a pair taken INSIDE the offset disagrees, and the whole estimate is then withheld
+    (see _ident_exit_from_pairs). A step that starts and ends between two samples is not seen: OPEN CIVIL-STEP-SUBINTERVAL (a step shorter than the interval, with the exit inside it)."""
+
+    def __init__(self, interval_s: float = 0.1, read=None):
+        self.interval_s, self.read, self.samples = interval_s, read or (lambda: _ident_clock_pair(tries=3)), []
+        self._stop = _ident_threading.Event()
+        self._thread = _ident_threading.Thread(target=self._run, daemon=True)
+
+    def _run(self) -> None:
+        while not self._stop.wait(self.interval_s):
+            try:
+                pair = self.read()
+            except Exception:   # a clock fault is the absence of a sample, never a crash in the harness
+                pair = None
+            if pair is not None:
+                self.samples.append(pair)
+
+    def start(self):
+        if sys.platform == "win32" or self.read is not None:
+            self._thread.start()
+        return self
+
+    def stop(self) -> list:
+        self._stop.set()
+        if self._thread.is_alive():
+            self._thread.join(5)
+        return list(self.samples)
+
+
+def _ident_exit_from_pairs(pair0: tuple, pair1: tuple, exit_ft: int, samples: tuple = ()) -> tuple:
+    """PURE core of the child's exit time: pair0 / pair1 are (qpc_ns, filetime_100ns) pairs taken at launch and at the read, exit_ft the OS-recorded ExitTime (100 ns FILETIME), `samples` the pairs
+    taken in between (r5, see _IdentClockSampler). Returns (ns on the QPC axis, "ok"), or (None, reason). The OS exit time is on the civil clock, so it is believed only when the civil clock and the
+    monotonic clock agree at EVERY pair of the run: a civil step (NTP, VM resume, manual change) during the run would move the figure by the step, hiding a real hold or faking one, and is a
+    typed failure instead (adversary A1)."""
+    step_s = max((((p[1] - pair0[1]) * 100 - (p[0] - pair0[0])) / 1e9 for p in (pair1, *samples)), key=abs)
+    if abs(step_s) > _IDENT_CIVIL_STEP_TOLERANCE_S:
+        return None, f"the civil clock moved {step_s:+.1f} s against the monotonic clock during the run, so the OS exit time cannot be placed on the monotonic axis"
+    exit_ns = pair1[0] - (pair1[1] - exit_ft) * 100
+    if not (pair0[0] - 1_000_000_000 <= exit_ns <= pair1[0] + 1_000_000_000):
+        return None, f"the child's exit time lands {(exit_ns - pair1[0]) / 1e9:+.1f} s from the run window"
+    return exit_ns, "ok"
+
+
+def _ident_start_from_pairs(pair1: tuple, created_ft: int, pair0: tuple) -> int | None:
+    """r5 (adversary A2 on b4cae711): when the CHILD process was created, on the QPC axis, through the same read pair as its exit; None when it lands outside the run. The child-side wall
+    estimate runs from here, not from the parent's own start: a parent that was not scheduled for 61 s before it even launched the child did not wait for anything."""
+    start_ns = pair1[0] - (pair1[1] - created_ft) * 100
+    return start_ns if pair0[0] - 1_000_000_000 <= start_ns <= pair1[0] + 1_000_000_000 else None
+
+
+def _ident_child_exit_ns(proc, pair0, samples: tuple = ()) -> tuple:
+    """r5: returns (exit_ns, note, start_ns); r4 (sol r3 blocker): when the CHILD process exited, on the test's perf_counter (QueryPerformanceCounter) axis, as (ns, note); ns is None when it cannot be formed, with the reason in note.
+    The parent's own clock read after the reap is the moment the parent was SCHEDULED again, which on a starved runner is far later than the child's exit. So the end of the child is the exit
+    time the OS recorded for it (GetProcessTimes ExitTime, read from the Popen handle, which stays open until the object is collected), moved onto the QPC axis through a tight same-instant
+    pair read here (see _ident_exit_from_pairs): exit = pair_qpc - (pair_filetime - exit_filetime), so the time the parent spent not running cancels out."""
+    if sys.platform != "win32":
+        return None, "no child-side exit clock on this platform (GetProcessTimes is Windows-only)", None
+    if pair0 is None:
+        return None, "no tight clock pair could be taken at launch", None
+    try:
+        ctypes, wintypes, k32 = _ident_win32_clock()
+        created, exited, kernel, user = (wintypes.FILETIME() for _ in range(4))
+        if not k32.GetProcessTimes(int(proc._handle), ctypes.byref(created), ctypes.byref(exited), ctypes.byref(kernel), ctypes.byref(user)):
+            return None, f"GetProcessTimes failed (winerror {ctypes.get_last_error()})", None
+        pair1 = _ident_clock_pair()
+    except Exception as exc:   # a typed reason, never a crash inside the harness
+        return None, f"{type(exc).__name__}: {exc}", None
+    if _ident_ft_int(exited) == 0:
+        return None, "GetProcessTimes reports no exit time: the process had not exited", None
+    if pair1 is None:
+        return None, "no tight clock pair could be taken at the read: the parent was descheduled around every attempt", None
+    exit_ns, note = _ident_exit_from_pairs(pair0, pair1, _ident_ft_int(exited), samples)
+    return exit_ns, note, (None if exit_ns is None else _ident_start_from_pairs(pair1, _ident_ft_int(created), pair0))
+
+
 def _ident_run_reaped(cmd: list, timeout: float, env: dict | None = None) -> subprocess.CompletedProcess:
     """subprocess.run, except that a child still alive at the timeout (or on any error) is killed WITH its process tree (r5: an r4 probe child outlived its test).
-    r6: the final drain is bounded too, so a grandchild that still holds the pipes cannot hold the test."""
-    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env)
+    r6: the final drain is bounded too, so a grandchild that still holds the pipes cannot hold the test. r4: the result also carries child_exit_ns / child_exit_note (see _ident_child_exit_ns)."""
+    pair0 = _ident_launch_pair()   # r4: the civil clock and the monotonic clock side by side at launch (see _ident_exit_from_pairs)
+    sampler = _IdentClockSampler().start() if pair0 is not None else None   # r5: pairs taken during the run, see _IdentClockSampler
+    try:
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env)
+    except BaseException:
+        if sampler is not None:
+            sampler.stop()
+        raise
     try:
         out, err = proc.communicate(timeout=timeout)
+        samples = sampler.stop() if sampler is not None else []
     except BaseException:
+        if sampler is not None:
+            sampler.stop()
         if proc.poll() is None:
-            subprocess.run(["taskkill", "/F", "/T", "/PID", str(proc.pid)], capture_output=True, timeout=60)
+            try:
+                subprocess.run(["taskkill", "/F", "/T", "/PID", str(proc.pid)], capture_output=True, timeout=60)
+            except (subprocess.TimeoutExpired, OSError):   # r2 (sol hardening): a taskkill that itself hangs or fails must not skip the bounded drain and the fallback kill below
+                pass
         try:
             proc.communicate(timeout=60)
-        except subprocess.TimeoutExpired:
+        except (subprocess.TimeoutExpired, OSError):   # r4 (sol hardening): a drain that fails with an OSError (a broken pipe) must not skip the fallback kill either
             proc.kill()
             proc.wait(timeout=60)
         raise
-    return subprocess.CompletedProcess(cmd, proc.returncode, out, err)
+    if _IDENT_AFTER_REAP_DELAY_S:
+        _ident_time.sleep(_IDENT_AFTER_REAP_DELAY_S)
+    done = subprocess.CompletedProcess(cmd, proc.returncode, out, err)
+    done.child_exit_ns, done.child_exit_note, done.child_start_ns = _ident_child_exit_ns(proc, pair0, samples)
+    return done
+
+
+def _parse_probe_timing(stderr: str):
+    """CI-FLAKE-VENUE-PROBE-GETOWNER-DEADLINE-1 r2/r3/r4: the probe's one stderr timing line, `VENUE_PROBE_INTERNAL_MS=<ms> abandoned=<n> end_qpc=<ticks> qpc_hz=<hz>`. <ms> is ONE monotonic
+    Stopwatch started at probe entry (a diagnostic). <ticks> is Stopwatch.GetTimestamp() at the marker, the OS monotonic QueryPerformanceCounter: the exit-hold figure is (the child's OS exit
+    time on that same QueryPerformanceCounter axis, see _ident_child_exit_ns) - (<ticks> as ns), which contains neither pwsh start-up, script parse nor the parent's own scheduling delay.
+    None = no marker token at all. r4 (VENUE-PROBE-TIMING-PARSER-FULL-TOKEN-1): a line that carries the token is a PRESENT marker; it must match the whole line shape with plain integers of at
+    most 18 digits (a longer, junk-suffixed or junk-PREFIXED field, or a line of another shape, is a typed `bad` failure, never a missing marker and never a ValueError) and anything else comes back with
+    probe_ms=None and a `bad` reason, so a clock fault is a typed failure. end_qpc / qpc_hz are None when absent."""
+    if "VENUE_PROBE_INTERNAL_MS=" not in stderr:
+        return None
+    hits = [ln for ln in re.split(r"[\r\n]+", stderr) if "VENUE_PROBE_INTERNAL_MS=" in ln]
+    if len(hits) != 1:   # adversary A4: a second marker is never silently ignored
+        return {"probe_ms": None, "abandoned": None, "end_qpc": None, "qpc_hz": None, "bad": f"{len(hits)} timing marker lines on stderr, not exactly one: {[h[:60] for h in hits]!r}"}
+    line = hits[0]
+    f = re.fullmatch(r"VENUE_PROBE_INTERNAL_MS=(\S*)\s+abandoned=(\d{1,9})(?:\s+end_qpc=(\d{1,18})\s+qpc_hz=(\d{1,18}))?\s*", line)
+    if f is None:
+        return {"probe_ms": None, "abandoned": None, "end_qpc": None, "qpc_hz": None,
+                "bad": f"malformed timing marker (not `VENUE_PROBE_INTERNAL_MS=<ms> abandoned=<n> [end_qpc=<ticks> qpc_hz=<hz>]` with plain integers): {line[:120]!r}"}
+    raw = f.group(1)
+    qpc = {"end_qpc": int(f.group(3)) if f.group(3) is not None else None, "qpc_hz": int(f.group(4)) if f.group(4) is not None else None}
+    if re.fullmatch(r"\d{1,18}", raw):
+        return {"probe_ms": int(raw), "abandoned": int(f.group(2)), **qpc}
+    return {"probe_ms": None, "abandoned": int(f.group(2)), **qpc, "bad": f"VENUE_PROBE_INTERNAL_MS={raw!r} is not a non-negative integer (a civil clock was subtracted from a monotonic one?)"}
+
+
+def _probe_seam_violations(body: str) -> list:
+    """r4 (fable PROBE-TIMING-SEAM-PIN-SIGIL-FORMS-1): every CODE line of the probe body that names the timing seam in ANY spelling (`$ProbeTimingSeam`, `${ProbeTimingSeam}`,
+    `Set-Variable ProbeTimingSeam`, any case): exactly the one literal `$false` assignment and the one guard that guards the marker; no host input can reach either."""
+    bad = []
+    mentions = [ln for ln in body.splitlines() if not ln.lstrip().startswith("#") and re.search(r"ProbeTimingSeam", ln, re.I)]
+    if len(mentions) != 2:
+        bad.append(f"{len(mentions)} code lines name the seam, not 2: {mentions}")
+    if mentions.count("$ProbeTimingSeam = $false") != 1:
+        bad.append("not exactly one assignment, the literal $false")
+    if len([ln for ln in mentions if ln.startswith("if ($ProbeTimingSeam) { [Console]::Error.WriteLine('VENUE_PROBE_INTERNAL_MS=")]) != 1:
+        bad.append("not exactly one guard, guarding the marker")
+    for ln in mentions:
+        for banned in ("$env:", "Get-Content", "Test-Path", "GetEnvironmentVariable", "-or", "-and"):
+            if banned in ln:
+                bad.append(f"a host input can reach the seam ({banned!r}): {ln}")
+    # r4 (adversary A3): a variable whose NAME is built at run time (`Set-Variable -Name ('Probe' + 'TimingSeam')`) names the seam in no spelling at all, so the probe body must have no
+    # dynamic-variable or dynamic-code verb anywhere (it has none today)
+    for ln in body.splitlines():
+        if not ln.lstrip().startswith("#") and re.search(r"\b(?:Set|New|Get|Clear)-Variable\b|\bVariable:|\bInvoke-Expression\b|\biex\b|\bSet-Item\b", ln, re.I):
+            bad.append(f"a dynamic variable / code verb in the probe body: {ln.strip()[:100]}")
+    return bad
+
+
+def _probe_marker_violations(body: str) -> list:
+    """r4 (sol PROBE-TIMING-STATIC-PINS-MUTATION-1): the marker line is found by its token whatever the quoting; there is exactly one; it carries no comment (a trailing comment can only
+    be there to spell a token the code does not use); its only variables are the Stopwatch, the two abandoned counters and the seam (so a civil value cannot be stashed on an earlier line and
+    substituted); the end timestamp is the literal GetTimestamp() call, adjacent to its field names; and its position among the result line and the Exit is pinned."""
+    bad = []
+    lines = body.splitlines()
+    idx = [i for i, ln in enumerate(lines) if "VENUE_PROBE_INTERNAL_MS" in ln and not ln.lstrip().startswith("#")]
+    if len(idx) != 1:
+        return [f"{len(idx)} code lines carry the marker, not 1"]
+    line = lines[idx[0]]
+    if "#" in line:
+        bad.append("the marker line carries a comment")
+    allowed = {"$ProbeTimingSeam", "$script:ProbeSw", "$script:IdentAbandoned", "$script:TelAbandoned"}
+    found = set(re.findall(r"\$[A-Za-z_][\w:]*", line))
+    if found != allowed:
+        bad.append(f"the marker line's variables are {sorted(found)}, not {sorted(allowed)}")
+    if "' end_qpc=' + [Diagnostics.Stopwatch]::GetTimestamp() + ' qpc_hz=' + [Diagnostics.Stopwatch]::Frequency" not in line:
+        bad.append("end_qpc is not the literal [Diagnostics.Stopwatch]::GetTimestamp() beside qpc_hz=Frequency")
+    if "$script:ProbeSw.ElapsedMilliseconds" not in line:
+        bad.append("the elapsed field is not the Stopwatch")
+    elif "GetTimestamp" in line and line.index("ElapsedMilliseconds") > line.index("GetTimestamp"):
+        bad.append("the end timestamp is not the last clock read before the write")
+    for banned in ("[DateTime]", "Get-Date", ".StartTime", "GetCurrentProcess", "UtcNow", "Ticks", "$env:"):
+        if banned in line:
+            bad.append(f"a civil-clock read ({banned!r}) in the timing marker lets a clock step move the exit-hold arithmetic")
+    quiet = next((i for i, ln in enumerate(lines) if "VENUE_QUIET=" in ln and "Write-Output" in ln), None)
+    exit_at = next((i for i, ln in enumerate(lines) if "[Environment]::Exit(0)" in ln), None)
+    if quiet is None or exit_at is None:
+        bad.append("the result line or the Exit is missing from the body")
+    else:
+        if not quiet < idx[0]:
+            bad.append("the marker does not come after the result line is written")
+        if not idx[0] < exit_at:
+            bad.append("the marker does not come BEFORE the abandoned-call Exit, so the gap would not include the Exit")
+    return bad
 
 
 class IdentityProbeMixin:
@@ -10776,7 +11884,8 @@ class IdentityProbeMixin:
 
     def run_identity_probe(self, procs: list, cim: list, owners: dict | None = None, gpu: list | None = None, throw: bool = False, cpus: int = 4,
                            body: str | None = None, old_counter_shadow: bool = False, after_start_ft: dict | None = None,
-                           delays: dict | None = None, call_ms: int | None = None, tel: dict | None = None, env: dict | None = None) -> dict:
+                           delays: dict | None = None, call_ms: int | None = None, tel: dict | None = None, env: dict | None = None, timing: bool = False,
+                           civil_step_s: int = 0, probe_s: int = 0, exit_hold_s: int = 0, startup_s: int = 0) -> dict:
         delays = delays or {}
         body = (_ident_probe_body() if body is None else body).replace("[Environment]::ProcessorCount", str(cpus)).replace("Start-Sleep -Seconds 12", "Start-Sleep -Seconds 0")
         if call_ms is not None:
@@ -10811,9 +11920,36 @@ class IdentityProbeMixin:
         worker_b64 = _ident_base64.b64encode((cim_prelude + worker_counter).encode("utf-8")).decode("ascii")
         body = body.replace("$IdentityWorkerPrelude = ''", f"$IdentityWorkerPrelude = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('{worker_b64}'))")
         body = _tel_hermetic(body, self.tmp, tel)   # VENUE-PROBE-HEAT-GPU-TELEMETRY-1: the heat feed, dGPU and agent log are canned too, never the test host's
+        if timing:   # CI-FLAKE-VENUE-PROBE-GETOWNER-DEADLINE-1: the probe reports its own elapsed time on stderr (the seam is $false in production)
+            self.assertEqual(body.count("$ProbeTimingSeam = $false"), 1)
+            body = body.replace("$ProbeTimingSeam = $false", "$ProbeTimingSeam = $true")
+        # r2 fault injection, test copy only (needs timing=True): a civil-clock STEP (NTP / VM resume / manual change) is every `[DateTime]::Now` read taking a +/-N s offset; a probe that
+        # spends probe_s seconds before its marker; a process exit held exit_hold_s seconds after the marker. A probe whose timing leaves one monotonic Stopwatch is moved by the step.
+        if civil_step_s or probe_s or exit_hold_s:
+            self.assertTrue(timing, "fault injection rides on the timing seam")
+        if civil_step_s:   # r3 (fable CIVIL-STEP-INJECTION-VACUOUS-AT-HEAD-1): the probe reads the civil clock as [DateTime]::UtcNow, never ::Now, so a ::Now-only injector replaced nothing
+            self.civil_sites = len(re.findall(r"\[DateTime\]::(?:Utc)?Now", body))
+            self.assertGreaterEqual(self.civil_sites, 1, "the civil-step injector found no civil-clock read in the probe body: the step would be vacuous")
+            body = re.sub(r"\[DateTime\]::((?:Utc)?Now)", lambda m: f"[DateTime]::{m.group(1)}.AddSeconds({civil_step_s})", body)
+        if probe_s:
+            anchor = "$script:ProbeSw = [Diagnostics.Stopwatch]::StartNew()"
+            self.assertEqual(body.count(anchor), 1)
+            body = body.replace(anchor, anchor + f"\nStart-Sleep -Seconds {probe_s}")
+        if exit_hold_s:   # between the marker and the end of the process, so an abandoned call's Environment.Exit does not skip it (adversary A2)
+            exit_anchor = "if ($script:IdentAbandoned -gt 0 -or $script:TelAbandoned -gt 0) {"
+            self.assertEqual(body.count(exit_anchor), 1)
+            body = body.replace(exit_anchor, f"Start-Sleep -Seconds {exit_hold_s}\n" + exit_anchor)
         job = self.tmp / "identity-probe-job.ps1"
-        job.write_text(prelude + body, encoding="utf-8")
+        # r3 (fable key3): a START-UP stall is `startup_s` seconds spent BEFORE the probe's first statement (pwsh start-up, script parse, the test prelude on a starved host)
+        job.write_text((f"Start-Sleep -Seconds {startup_s}\n" if startup_s else "") + prelude + body, encoding="utf-8")
+        wall_started_ns = _ident_time.perf_counter_ns()   # r3: perf_counter is QueryPerformanceCounter on Windows, the clock Stopwatch.GetTimestamp() in the probe reads
         proc = _ident_run_reaped([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-File", str(job)], timeout=240, env=env)
+        self.last_wall_end_ns = _ident_time.perf_counter_ns()
+        self.last_wall_s = (self.last_wall_end_ns - wall_started_ns) / 1e9
+        self.last_child_exit_ns, self.last_child_exit_note = proc.child_exit_ns, proc.child_exit_note   # r4: the END of the child, which the parent's own end read is not
+        self.last_child_start_ns = proc.child_start_ns   # r5: its START, which the parent's own start (wall_started_ns) is not: the parent may be delayed before it even launches the child
+        self.last_stderr = proc.stderr
+        self.last_timing = _parse_probe_timing(proc.stderr)
         lines = [ln for ln in proc.stdout.splitlines() if ln.startswith("VENUE_QUIET=")]
         self.assertEqual(len(lines), 1, proc.stdout + proc.stderr)
         self.last_line = lines[0][len("VENUE_QUIET="):]   # the line exactly as the gate retains it (Wait-VenueQuiet.ps1 RAW RETENTION)
@@ -11486,8 +12622,13 @@ class VenueProbeIdentityRedactionR2Tests(IdentityProbeMixin, unittest.TestCase):
 # timeout). The forced-slow call is an UNINTERRUPTIBLE .NET sleep in the shadow (what a hung native call looks like), not an already-expired budget.
 @requires_windows_pwsh
 class VenueProbeIdentityCallDeadlineTests(IdentityProbeMixin, unittest.TestCase):
-    DELAY_MS = 20000
+    # CI-FLAKE-VENUE-PROBE-GETOWNER-DEADLINE-1: the slow call sleeps far longer than any wall a loaded host can need for the whole probe. The abandoned worker dies with the process, so a
+    # probe that bounds the call ends in seconds whatever the delay is; a probe that waited for it would need DELAY_MS. At 20 s the old limit (18 s) sat INSIDE what a starved runner
+    # needs for the probe alone (measured 28-30 s of pure load, no wait at all, with 40 busy processes on 16 cores), so the assertion could not tell load from a wait.
+    DELAY_MS = 120000
     CALL_MS = 1500
+    WALL_LIMIT_S = 60.0       # about twice the worst load-only wall measured; half the delay
+    EXIT_HOLD_LIMIT_S = 15.0  # r3/r4: the child's OS exit time minus the probe's end marker, both on the QueryPerformanceCounter axis (marker -> exit ONLY; start-up, parse and the parent's own scheduling delay are not in it)
 
     def setUp(self) -> None:
         tmp = tempfile.TemporaryDirectory(prefix="venue-probe-deadline-")
@@ -11505,14 +12646,87 @@ class VenueProbeIdentityCallDeadlineTests(IdentityProbeMixin, unittest.TestCase)
     def slow(self, which: str) -> tuple:
         import time
         started = time.monotonic()
-        p = self.run_identity_probe(self.procs, self.cim, CHAIN_OWNERS, gpu=[(16892, 0, 40.0)], delays={which: self.DELAY_MS}, call_ms=self.CALL_MS)
+        p = self.run_identity_probe(self.procs, self.cim, CHAIN_OWNERS, gpu=[(16892, 0, 40.0)], delays={which: self.DELAY_MS}, call_ms=self.CALL_MS, timing=True)
         return p, time.monotonic() - started
 
     def assert_measurement_unchanged(self, p: dict, elapsed: float) -> None:
+        # the timing of the SLOW run is judged first: reference() runs another probe, which replaces last_timing / last_wall_s. r5: the verdicts are SETTLED last, so an inconclusive timing
+        # (a typed skip) still leaves every content comparison below as a hard assertion
+        verdicts = self.timing_verdicts(elapsed)
         ref = self.reference()
         for k, v in ref.items():
             self.assertEqual(p[k], v, f"{k} changed because an identity call was slow")
-        self.assertLess(elapsed, self.DELAY_MS / 1000.0 - 2, f"the probe waited for the slow call instead of bounding it ({elapsed:.1f} s)")
+        self.settle_timing(verdicts)
+
+    def timing_verdicts(self, wall_s: float, require_abandoned: bool = True) -> list:
+        """r5: [(what, kind, figure_s, reason)] for the two gaps of one run. The WALL gap is the parent's elapsed time; its child-side estimate is the child's OS exit time minus the CHILD's OS
+        creation time, so a parent that was scheduled late after a prompt child exit (sol r4 A3) or before it launched the child (adversary A2) is not a wait for the slow call. The EXIT-HOLD gap is
+        marker -> process end (see exit_hold_verdict)."""
+        started, exit_ns = getattr(self, "last_child_start_ns", None), getattr(self, "last_child_exit_ns", None)
+        civil_run_s = None if (started is None or exit_ns is None) else (exit_ns - started) / 1e9
+        out = [("wall", *_ident_gap_verdict(wall_s, civil_run_s, self.WALL_LIMIT_S, _IDENT_WALL_ESTIMATE_UNCERTAINTY_S))]
+        hold = self.exit_hold_verdict()
+        if require_abandoned:
+            self.assertGreaterEqual(self.last_timing["abandoned"], 1, "the slow call was not abandoned, so this case proves nothing")
+        out.append(("exit hold", *hold))
+        return out
+
+    def settle_timing(self, verdicts: list) -> None:
+        """r5: any "over" is a failure; else any "inconclusive" is a typed skip `EXIT_HOLD_INCONCLUSIVE: <reason with both numbers>`; else a pass."""
+        for what, kind, figure, _reason in verdicts:
+            if kind == "over" and what == "wall":
+                self.fail(f"the probe waited for the slow call instead of bounding it ({figure:.1f} s; {self.timing_text()})")
+            if kind == "over":
+                self.fail(f"the process outlived the probe by {figure:.1f} s after its end marker: an abandoned call held the exit ({self.timing_text()}, wall {self.last_wall_s:.1f} s)")
+        why = [f"{what}: {reason}" for what, kind, _f, reason in verdicts if kind == "inconclusive"]
+        if why:
+            self.skipTest("EXIT_HOLD_INCONCLUSIVE: " + "; ".join(why))
+
+    def assert_timing(self, wall_s: float, require_abandoned: bool = True) -> None:
+        self.settle_timing(self.timing_verdicts(wall_s, require_abandoned))
+
+    def timing_text(self) -> str:
+        t = self.last_timing
+        if t is None:
+            return "no VENUE_PROBE_INTERNAL_MS line on stderr"
+        if t["probe_ms"] is None:
+            return t["bad"]
+        return f"probe stopwatch {t['probe_ms'] / 1000.0:.1f} s, {t['abandoned']} call(s) abandoned"
+
+    def exit_hold_s(self) -> float:
+        """The exit-hold figure (seconds) when the verdict is pass or over; an INCONCLUSIVE verdict is a typed skip (see exit_hold_verdict)."""
+        kind, figure, reason = self.exit_hold_verdict()
+        if kind == "inconclusive":
+            self.skipTest("EXIT_HOLD_INCONCLUSIVE: " + reason)
+        return figure
+
+    def exit_hold_verdict(self) -> tuple:
+        """r3/r4/r5: (kind, figure_s, reason) for the seconds from the probe's end marker to the CHILD's exit, on the OS monotonic QueryPerformanceCounter axis (the marker is the probe's
+        Stopwatch.GetTimestamp() ticks). The parent's end read (also QPC) is an UPPER BOUND on it: the child cannot have exited after the parent saw it gone. A bound under the limit PASSES with no
+        civil clock at all. Past the limit the bound may be the parent's own scheduling delay, so the child's OS-recorded exit time (see _ident_child_exit_ns) is the civil estimate that
+        _ident_gap_verdict widens by its uncertainty: over the limit even then is a HOLD, anything else (no estimate, a civil step, an estimate under or straddling the limit) is INCONCLUSIVE and
+        is never a pass or a hold. Whatever the probe did before its marker, however long pwsh took to start, and however long the parent was not scheduled, is not in a HOLD figure."""
+        t = self.last_timing
+        self.assertIsNotNone(t, "the timing seam printed nothing: " + self.last_stderr)
+        self.assertIsNotNone(t["probe_ms"], "typed failure, not a missing marker: " + t.get("bad", ""))
+        self.assertTrue(t.get("end_qpc") is not None and t.get("qpc_hz"), "typed failure, not an exit hold: the marker carries no end_qpc / qpc_hz timestamp: " + self.last_stderr)
+        marker_ns = t["end_qpc"] * 1_000_000_000 // t["qpc_hz"]
+        upper = (self.last_wall_end_ns - marker_ns) / 1e9
+        self.assertGreater(upper, -1.0, f"typed failure, not an exit hold: the probe's end marker is {-upper:.1f} s AFTER the test saw the process end, so the two are not the same monotonic clock")
+        child_exit_ns = getattr(self, "last_child_exit_ns", None)
+        civil_s = None if child_exit_ns is None else (child_exit_ns - marker_ns) / 1e9
+        kind, figure, reason = _ident_gap_verdict(upper, civil_s, self.EXIT_HOLD_LIMIT_S)
+        if kind == "inconclusive" and civil_s is None:
+            reason += f" ({getattr(self, 'last_child_exit_note', '')})"
+        return kind, figure, reason
+
+    def assert_no_exit_hold(self, require_abandoned: bool = True) -> None:
+        """Nothing may hold the PROCESS after the probe's end marker (an abandoned worker's runspace must not keep it alive). Start-up is not measured: see exit_hold_verdict.
+        r5: a HOLD fails; an INCONCLUSIVE verdict is a typed skip; only a monotonic gap under the limit passes."""
+        hold = self.exit_hold_verdict()
+        if require_abandoned:
+            self.assertGreaterEqual(self.last_timing["abandoned"], 1, "the slow call was not abandoned, so this case proves nothing")
+        self.settle_timing([("exit hold", *hold)])
 
     def test_a_slow_gpu_read_times_out_into_a_status_and_the_rest_of_identity_is_still_filled(self) -> None:
         p, elapsed = self.slow("gpu")
@@ -11534,6 +12748,475 @@ class VenueProbeIdentityCallDeadlineTests(IdentityProbeMixin, unittest.TestCase)
         self.assertEqual(set(p["identity"]), {"schema", "error"}, p["identity"])
         self.assertIn("timed out", p["identity"]["error"])
         self.assert_measurement_unchanged(p, elapsed)
+
+    def test_the_timing_seam_is_off_in_production_and_prints_nothing_unless_a_test_rewrites_it(self) -> None:
+        self.assertEqual(_probe_seam_violations(_ident_probe_body()), [], "r3/r4: every code mention of the seam in the WHOLE body, in any spelling")
+        self.run_identity_probe(self.procs, self.cim, CHAIN_OWNERS)
+        self.assertIsNone(self.last_timing)
+        self.assertNotIn("VENUE_PROBE_INTERNAL_MS", self.last_stderr)
+
+    def test_a_hostile_environment_cannot_switch_the_production_seam_on(self) -> None:
+        # r4 (adversary A3): the behavioural half of the pin. The UNREWRITTEN probe, with the seam spelled as an environment variable and truthy values around it, prints no marker
+        import os
+        self.run_identity_probe(self.procs, self.cim, CHAIN_OWNERS, env=dict(os.environ, ProbeTimingSeam="1", X="1", PROBETIMINGSEAM="true"))
+        self.assertIsNone(self.last_timing)
+        self.assertNotIn("VENUE_PROBE_INTERNAL_MS", self.last_stderr)
+
+    def test_the_seam_pin_catches_every_spelling_of_a_write_to_the_seam(self) -> None:
+        body = _ident_probe_body()
+        for extra in ("Set-Variable ProbeTimingSeam $true", "Set-Variable -Name probetimingseam -Value $true", "${ProbeTimingSeam} = $true", "$ProbeTimingSeam = $env:X",
+                      "New-Variable -Name ProbeTimingSeam -Value $true -Force", "Set-Variable -Name ('Probe' + 'TimingSeam') -Value ([bool]$env:X)", "Set-Item Variable:\\ProbeTimingSeam $true",
+                      "Invoke-Expression ('$Probe' + 'TimingSeam = $true')"):
+            self.assertNotEqual(_probe_seam_violations(body + "\n" + extra), [], extra)
+        self.assertNotEqual(_probe_seam_violations(body.replace("$ProbeTimingSeam = $false", "$ProbeTimingSeam = $true")), [])
+
+    # r2 (Dot 797-I1, sol CR on 51ace353): the probe's timing is ONE monotonic Stopwatch. A civil-clock step (+/-20 s, injected into every [DateTime]::Now read of the test copy) must neither
+    # hide an exit hold nor fake one, and the exit hold is injected for real (the process sleeps after its marker), so the gap assertion is reached on its own.
+    def test_a_forward_civil_clock_step_cannot_hide_a_20_second_exit_hold(self) -> None:
+        self.run_identity_probe(self.procs, self.cim, CHAIN_OWNERS, timing=True, probe_s=10, civil_step_s=20, exit_hold_s=20)
+        self.assertGreaterEqual(self.exit_hold_s(), 19.0, self.timing_text())
+        with self.assertRaises(AssertionError) as ctx:
+            self.assert_no_exit_hold(require_abandoned=False)
+        self.assertIn("outlived the probe", str(ctx.exception))
+
+    def test_an_exit_hold_is_rejected_when_a_slow_call_was_abandoned_too(self) -> None:
+        # adversary A2: the abandoned-call path ends in Environment.Exit, and the injected hold must still sit before it
+        self.run_identity_probe(self.procs, self.cim, CHAIN_OWNERS, delays={"cim": self.DELAY_MS}, call_ms=self.CALL_MS, timing=True, exit_hold_s=20)
+        self.assertGreaterEqual(self.last_timing["abandoned"], 1, self.timing_text())
+        with self.assertRaises(AssertionError) as ctx:
+            self.assert_no_exit_hold()
+        self.assertIn("outlived the probe", str(ctx.exception))
+
+    def test_a_backward_civil_clock_step_cannot_fake_an_exit_hold_or_a_missing_marker(self) -> None:
+        self.run_identity_probe(self.procs, self.cim, CHAIN_OWNERS, timing=True, probe_s=30, civil_step_s=-20)
+        self.assertGreaterEqual(self.last_timing["probe_ms"], 30000, self.timing_text())
+        self.assert_no_exit_hold(require_abandoned=False)   # no hold: 30 s of probe work, whatever the civil clock did
+
+    # r3 (fable key3 blocker): 16 s of start-up with NO exit hold. The gap must measure the EXIT only, so a start-up stall (pwsh start-up, script parse, the test prelude) is never reported as
+    # "an abandoned call held the exit".
+    def test_a_start_up_stall_longer_than_the_exit_hold_limit_is_not_an_exit_hold(self) -> None:
+        self.run_identity_probe(self.procs, self.cim, CHAIN_OWNERS, timing=True, startup_s=16)
+        self.assertGreater(self.last_wall_s, self.EXIT_HOLD_LIMIT_S, "the injected start-up stall is longer than the limit")
+        self.assert_no_exit_hold(require_abandoned=False)
+
+    # r4 (sol r3 blocker): the figure must end at the CHILD's exit, not at the moment the parent got scheduled again. A parent starved for PARENT_STALL_S after the child is gone
+    # (a loaded runner) used to read as "an abandoned call held the exit".
+    PARENT_STALL_S = 16.0   # longer than EXIT_HOLD_LIMIT_S
+
+    def _stall_parent(self):
+        from unittest import mock
+        return mock.patch.object(sys.modules[__name__], "_IDENT_AFTER_REAP_DELAY_S", self.PARENT_STALL_S)
+
+    def test_a_parent_starved_after_the_child_exits_is_not_an_exit_hold(self) -> None:
+        with self._stall_parent():
+            self.run_identity_probe(self.procs, self.cim, CHAIN_OWNERS, timing=True)
+        self.assertGreater(self.last_wall_s, self.EXIT_HOLD_LIMIT_S, "the injected parent stall is longer than the limit")
+        self.assertEqual(self.exit_hold_verdict()[0], "inconclusive", "r5: the parent's delay is never a hold, and (civil clock only) never a pass")
+        if self.last_child_exit_ns is None:   # adversary A4: a permitted missing child clock is a typed skip, not a crash
+            self.skipTest(f"EXIT_HOLD_INCONCLUSIVE: no child-side exit time ({self.last_child_exit_note})")
+        stall_s = (self.last_wall_end_ns - self.last_child_exit_ns) / 1e9
+        self.assertGreaterEqual(stall_s, self.PARENT_STALL_S - 1.0, f"the stall sits between the child's exit and the parent's end read ({stall_s:.1f} s)")
+
+    def test_a_parent_starved_after_an_abandoned_call_is_not_an_exit_hold(self) -> None:
+        with self._stall_parent():
+            self.run_identity_probe(self.procs, self.cim, CHAIN_OWNERS, delays={"cim": self.DELAY_MS}, call_ms=self.CALL_MS, timing=True)
+        self.assertGreaterEqual(self.last_timing["abandoned"], 1, self.timing_text())
+        self.assertEqual(self.exit_hold_verdict()[0], "inconclusive", "r5: the parent's delay is never a hold, and (civil clock only) never a pass")
+
+    def test_a_real_exit_hold_is_still_rejected_and_the_parent_stall_is_not_added_to_it(self) -> None:
+        with self._stall_parent():
+            self.run_identity_probe(self.procs, self.cim, CHAIN_OWNERS, timing=True, exit_hold_s=20)
+        gap = self.exit_hold_s()
+        self.assertGreaterEqual(gap, 19.0, self.timing_text())
+        self.assertLess(gap, 20.0 + self.PARENT_STALL_S - 2.0, "the figure is the child's hold, with the parent's own stall left out")
+        with self.assertRaises(AssertionError) as ctx:
+            self.assert_no_exit_hold(require_abandoned=False)
+        self.assertIn("held the exit", str(ctx.exception))
+
+    def _set_clocks(self, marker_s: float, child_exit_s, parent_end_s: float, abandoned: int = 1) -> None:
+        hz = 10_000_000
+        self.last_timing = _parse_probe_timing(f"VENUE_PROBE_INTERNAL_MS=1500 abandoned={abandoned} end_qpc={int(marker_s * hz)} qpc_hz={hz}")
+        self.last_child_exit_ns = None if child_exit_s is None else int(child_exit_s * 1e9)
+        self.last_child_exit_note = "no exit time in this case"
+        self.last_wall_end_ns, self.last_wall_s, self.last_stderr = int(parent_end_s * 1e9), parent_end_s - 1.0, ""
+        self.last_child_start_ns = int(1.0 * 1e9)
+
+    def test_the_sol_r3_repro_a_prompt_child_exit_and_a_16_second_parent_delay_is_no_exit_hold(self) -> None:
+        self._set_clocks(marker_s=100.0, child_exit_s=100.05, parent_end_s=116.05)   # sol: child exits 0.05 s after its marker, the parent resumes 16 s later
+        kind, _figure, reason = self.exit_hold_verdict()
+        self.assertEqual(kind, "inconclusive", "r5: never a hold, and never a pass on the civil estimate alone")
+        self.assertIn("16.05", reason)
+        self.assertIn("0.05", reason)
+
+    def test_a_civil_clock_step_after_the_childs_exit_is_a_typed_failure_never_a_hidden_or_a_faked_hold(self) -> None:
+        # adversary A1: launch at qpc 90 s; marker 100 s; the child exits at 120 s (a 20 s hold); the read pair is at qpc 136 s
+        S, B = 10_000_000, 5_000_000_000_000
+        pair0 = (90 * 10**9, B + 90 * S)
+        exit_ft = B + 120 * S
+        ns, note = _ident_exit_from_pairs(pair0, (136 * 10**9, B + 136 * S), exit_ft)
+        self.assertEqual((ns, note), (120 * 10**9, "ok"), "no step: the exit lands on the monotonic axis at 120 s")
+        for step_s in (20, -20):   # +20 s would map the 20 s hold to 0 s (hidden); -20 s would map a prompt exit to a 20 s hold (faked)
+            ns, note = _ident_exit_from_pairs(pair0, (136 * 10**9, B + (136 + step_s) * S), exit_ft)
+            self.assertIsNone(ns, step_s)
+            self.assertIn("civil clock moved", note)
+            step_note = note
+        ns, note = _ident_exit_from_pairs(pair0, (136 * 10**9, B + 136 * S), B + 500 * S)
+        self.assertIsNone(ns, "an exit after the read is outside the run")
+        # in the harness: a step makes the OS exit time unusable. A bound already under the limit still passes (a prompt exit cannot be FAKED into a hold) and a bound past it is not judged (a hold cannot be HIDDEN)
+        self._set_clocks(100.0, None, 100.1)
+        self.last_child_exit_note = note
+        self.assert_no_exit_hold()
+        self._set_clocks(100.0, None, 120.1)
+        self.last_child_exit_note = step_note
+        with self.assertRaises(unittest.SkipTest) as ctx:   # r5: a typed INCONCLUSIVE, never a pass and never a hold
+            self.assert_no_exit_hold()
+        self.assertIn("EXIT_HOLD_INCONCLUSIVE", str(ctx.exception))
+        self.assertIn("civil clock moved", str(ctx.exception))
+
+    # r5 (sol r4 blockers A1-A3, HUB RULING): a civil-clock estimate never decides a verdict on its own. PASS needs the monotonic parent-side gap under the limit; HOLD needs it over the limit AND
+    # the civil estimate, widened by the documented uncertainty in the direction that SHORTENS the hold, still over; anything else is a typed INCONCLUSIVE (a skip), never a pass or a hold.
+    S5, B5 = 10_000_000, 5_000_000_000_000
+
+    def _pairs_exit(self, pair1_ft: int, exit_ft: int):
+        """The REAL mapper (_ident_exit_from_pairs) on sol's literal pairs: launch at qpc 90 s, the read at qpc 136 s."""
+        return _ident_exit_from_pairs((90 * 10**9, self.B5 + 90 * self.S5), (136 * 10**9, pair1_ft), exit_ft)
+
+    def test_r5_a1_cancelling_civil_steps_cannot_hide_a_real_20_second_hold(self) -> None:
+        # sol A1: the civil clock steps -20 s at qpc 110 s and +20 s at qpc 130 s, so the endpoint pairs agree; the child really exits at 120 s but the OS records 100 s on the stepped clock
+        ns, note = self._pairs_exit(self.B5 + 136 * self.S5, 5_001_000_000_000)
+        self.assertEqual((ns, note), (100 * 10**9, "ok"), "the mapper alone cannot see steps that cancel at the endpoints")
+        self._set_clocks(100.0, ns / 1e9, 136.0)
+        with self.assertRaises(unittest.SkipTest) as ctx:   # never a pass on the civil estimate: the monotonic gap is 36 s
+            self.assert_no_exit_hold()
+        self.assertIn("EXIT_HOLD_INCONCLUSIVE", str(ctx.exception))
+        self.assertIn("36.00", str(ctx.exception), "the monotonic number")
+        self.assertIn("0.00", str(ctx.exception), "the civil number")
+
+    def test_r5_a2_a_tolerated_clock_movement_cannot_decide_a_hold_near_the_limit_either_way(self) -> None:
+        # sol A2, both directions: +0.3 s maps a real 15.2 s hold to 14.9 s; -0.3 s maps a real 14.8 s hold to 15.1 s. Parent end at 136 s, so the monotonic gap is over the limit in both
+        for label, pair1_ft, exit_ft in (("+0.3 s", 5_001_363_000_000, 5_001_152_000_000), ("-0.3 s", 5_001_357_000_000, 5_001_148_000_000)):
+            ns, note = self._pairs_exit(pair1_ft, exit_ft)
+            self.assertEqual(note, "ok", label)
+            self._set_clocks(100.0, ns / 1e9, 136.0)
+            with self.assertRaises(unittest.SkipTest) as ctx:
+                self.assert_no_exit_hold()
+            self.assertIn("EXIT_HOLD_INCONCLUSIVE", str(ctx.exception), label)
+
+    def test_r5_a3_a_61_second_parent_delay_after_a_prompt_child_exit_is_never_a_slow_call_wait(self) -> None:
+        # sol A3: marker 100 s, the child exits at 100.05 s, the parent only ends at 161.05 s (elapsed 71.05 s, started at 90 s): the child ran 10.05 s, so nothing waited for the slow call
+        p = self.reference()
+        self._set_clocks(100.0, 100.05, 161.05)
+        self.last_wall_s, self.last_wall_started_ns, self.last_child_start_ns = 71.05, int(90.0 * 1e9), int(90.0 * 1e9)
+        with self.assertRaises(unittest.SkipTest) as ctx:
+            self.assert_measurement_unchanged(p, 71.05)
+        self.assertIn("EXIT_HOLD_INCONCLUSIVE", str(ctx.exception))
+        self.assertNotIn("waited for the slow call", str(ctx.exception))
+
+    def test_r5_a_real_wait_for_the_slow_call_and_a_real_hold_with_honest_clocks_still_fail(self) -> None:
+        p = self.reference()
+        self._set_clocks(119.9, 120.0, 120.1)   # the child itself ran 120 s from a start at 0 s, then ended right after its marker
+        self.last_wall_s, self.last_wall_started_ns, self.last_child_start_ns = 120.1, 0, 0
+        with self.assertRaises(AssertionError) as ctx:
+            self.assert_measurement_unchanged(p, 120.1)
+        self.assertIn("waited for the slow call", str(ctx.exception))
+        for step in (0.3, -0.3):   # a real 20 s hold read through a tolerated movement is still a HOLD: the widened estimate (19.45 s) stays over the limit
+            ns, note = self._pairs_exit(self.B5 + int((136 + step) * self.S5), self.B5 + 120 * self.S5)
+            self._set_clocks(100.0, ns / 1e9, 136.0)
+            with self.assertRaises(AssertionError) as ctx:
+                self.assert_no_exit_hold(require_abandoned=False)
+            self.assertIn("held the exit", str(ctx.exception), step)
+
+    def test_r5_the_three_way_verdict_is_decided_by_the_monotonic_gap_and_the_widened_civil_estimate(self) -> None:
+        u, lim = _IDENT_EXIT_ESTIMATE_UNCERTAINTY_S, 15.0
+        self.assertEqual(_ident_gap_verdict(14.99, 99.0, lim)[0], "pass", "monotonic under the limit: no civil clock consulted")
+        self.assertEqual(_ident_gap_verdict(14.99, None, lim)[0], "pass")
+        self.assertEqual(_ident_gap_verdict(36.0, lim + u, lim)[0], "over", "the widened estimate lands exactly on the limit")
+        self.assertEqual(_ident_gap_verdict(36.0, lim + u - 0.01, lim)[0], "inconclusive", "a hair under it straddles the limit")
+        self.assertEqual(_ident_gap_verdict(36.0, None, lim)[0], "inconclusive", "no civil estimate")
+        kind, figure, reason = _ident_gap_verdict(36.0, 20.0, lim)
+        self.assertEqual((kind, figure, reason), ("over", 20.0, ""), "the figure is the smaller of the two")
+        self.assertIn("36.00", _ident_gap_verdict(36.0, 0.5, lim)[2])
+        self.assertIn("0.50", _ident_gap_verdict(36.0, 0.5, lim)[2])
+
+    # r5-FIX1-ROWS-BEGIN (adversary pass on b4cae711: A1 and A2 introduced majors, A4 introduced minor)
+    def test_r5_fix1_a1_a_pair_taken_inside_cancelling_civil_steps_withholds_the_exit_estimate(self) -> None:
+        # +20 s at qpc 99 s, -20 s at qpc 130 s: the child really exits at 100.05 s but the OS records 120.05 s. The launch and read pairs agree, a pair taken INSIDE the offset does not
+        S, B = self.S5, self.B5
+        pair0, pair1, exit_ft = (90 * 10**9, B + 90 * S), (136 * 10**9, B + 136 * S), B + int(120.05 * S)
+        ns, note = _ident_exit_from_pairs(pair0, pair1, exit_ft)
+        self.assertEqual(note, "ok", "the endpoint pairs alone cannot see the steps (the b4cae711 defect)")
+        ns, note = _ident_exit_from_pairs(pair0, pair1, exit_ft, samples=((110 * 10**9, B + 130 * S),))
+        self.assertIsNone(ns)
+        self.assertIn("civil clock moved", note)
+        ns, note = _ident_exit_from_pairs(pair0, pair1, B + int(100.05 * S), samples=((100 * 10**9, B + 100 * S), (120 * 10**9, B + 120 * S)))
+        self.assertEqual((note, round((ns - 100 * 10**9) / 1e9, 2)), ("ok", 0.05), "honest samples keep the estimate")
+        self._set_clocks(100.0, None, 136.0)   # the verdict on a withheld estimate: a monotonic gap of 36 s and no civil estimate
+        self.last_child_exit_note = "the civil clock moved +20.0 s against the monotonic clock during the run"
+        with self.assertRaises(unittest.SkipTest) as ctx:
+            self.assert_no_exit_hold()
+        self.assertIn("EXIT_HOLD_INCONCLUSIVE", str(ctx.exception))
+
+    def test_r5_fix1_the_clock_sampler_collects_pairs_while_it_runs_and_survives_a_failing_read(self) -> None:
+        reads = iter([(1, 10), None, RuntimeError("clock unavailable"), (2, 20)] + [(3, 30)] * 1000)
+
+        def read():
+            r = next(reads)
+            if isinstance(r, Exception):
+                raise r
+            return r
+        sampler = _IdentClockSampler(interval_s=0.01, read=read).start()
+        deadline = _ident_time.monotonic() + 30   # adversary A3: wait for the samples, never a fixed sleep a descheduled worker can miss
+        while len(sampler.samples) < 3 and _ident_time.monotonic() < deadline:
+            _ident_time.sleep(0.02)
+        samples = sampler.stop()
+        self.assertGreaterEqual(len(samples), 3, samples)
+        self.assertEqual(samples[:2], [(1, 10), (2, 20)], "a None read and a raising read are no sample, and not a crash")
+        self.assertFalse(sampler._thread.is_alive())
+
+    def test_r5_fix1_a2_a_parent_delayed_before_it_launched_the_child_did_not_wait_for_the_slow_call(self) -> None:
+        # adversary A2: the parent starts at 90 s, is not scheduled for 61 s before it launches the child at 151 s; the child marks at 160 s, exits at 160.05 s, the parent ends at 160.10 s
+        p = self.reference()
+        self._set_clocks(160.0, 160.05, 160.10)
+        self.last_wall_s, self.last_wall_started_ns, self.last_child_start_ns = 70.1, int(90.0 * 1e9), int(151.0 * 1e9)
+        with self.assertRaises(unittest.SkipTest) as ctx:
+            self.assert_measurement_unchanged(p, 70.1)
+        self.assertIn("EXIT_HOLD_INCONCLUSIVE", str(ctx.exception))
+        self.assertNotIn("waited for the slow call", str(ctx.exception))
+
+    def test_r5_fix1_a4_a_missing_child_clock_is_a_typed_skip_never_a_crash_or_a_hard_failure(self) -> None:
+        from unittest import mock
+        for name in ("test_a_parent_starved_after_the_child_exits_is_not_an_exit_hold", "test_the_childs_exit_time_is_the_os_recorded_exit_not_the_parents_clock_after_it"):
+            case = type(self)(name)
+            case.setUp()
+            with mock.patch.object(sys.modules[__name__], "_ident_clock_pair", return_value=None):   # every launch pair is loose: pair0 is None and no child exit time can be formed
+                with self.assertRaises(unittest.SkipTest, msg=name) as ctx:
+                    getattr(case, name)()
+            self.assertIn("EXIT_HOLD_INCONCLUSIVE", str(ctx.exception), name)
+    # r5-FIX1-ROWS-END
+
+    def test_r5_fix2_a2_opposite_sub_tolerance_offsets_at_launch_and_exit_cannot_decide_a_hold_near_the_limit(self) -> None:
+        # adversary A2 on fae72991: every pair agrees with the launch pair within 0.49 s (under the 0.5 s tolerance) but the offset is 0 at launch, +0.49 s at the child's real exit (114.8 s) and
+        # -0.49 s at the read, so the exit is placed at 115.78 s: a relative error of 0.98 s, which the old once-the-tolerance uncertainty (0.55 s) did not cover
+        S, B, off = self.S5, self.B5, 4_900_000
+        pair0, pair1 = (90 * 10**9, B + 90 * S), (136 * 10**9, B + 1_355_100_000)
+        samples = tuple((q * 10**9, B + q * S + o) for q, o in ((95, 0), (100, 0), (110, off), (115, off), (125, -off), (130, -off)))
+        ns, note = _ident_exit_from_pairs(pair0, pair1, B + 1_152_900_000, samples)
+        self.assertEqual(note, "ok", "every sampled disagreement is under the tolerance, so the mapper believes the figure")
+        self.assertAlmostEqual(ns / 1e9, 115.78, places=2)
+        self._set_clocks(100.0, ns / 1e9, 136.0)
+        with self.assertRaises(unittest.SkipTest) as ctx:   # the real gap is 14.8 s: never a HOLD at 15.78 s
+            self.assert_no_exit_hold()
+        self.assertIn("EXIT_HOLD_INCONCLUSIVE", str(ctx.exception))
+        self.assertEqual(_ident_gap_verdict(36.0, 15.78, 15.0)[0], "inconclusive")
+        self.assertEqual(_ident_gap_verdict(62.0, 60.78, 60.0, _IDENT_WALL_ESTIMATE_UNCERTAINTY_S)[0], "inconclusive", "the wall sibling: a real 59.8 s child lifetime is never a slow-call wait")
+        self.assertEqual(_ident_gap_verdict(62.0, 120.0, 60.0, _IDENT_WALL_ESTIMATE_UNCERTAINTY_S)[0], "over", "a real 120 s child lifetime still is")
+        self.assertEqual(_ident_gap_verdict(36.0, 20.0, 15.0)[0], "over", "a real 20 s hold still is a hold")
+
+    def test_the_exit_estimate_tolerances_are_small_against_the_limit_and_enforced(self) -> None:
+        # adversary A2 (pass 2): the estimate's uncertainty is named, is well inside the margin between the limit and the injected hold, and the tolerances are what the pair read and the step check enforce
+        S, B = 10_000_000, 5_000_000_000_000
+        self.assertLess(_IDENT_EXIT_ESTIMATE_UNCERTAINTY_S, 1.5)
+        self.assertLess(_IDENT_WALL_ESTIMATE_UNCERTAINTY_S, (self.DELAY_MS / 1000.0 - self.WALL_LIMIT_S) / 4, "far inside the margin between a real wait (the slow call's 120 s) and the wall limit")
+        self.assertLess(_IDENT_EXIT_ESTIMATE_UNCERTAINTY_S, (20.0 - self.EXIT_HOLD_LIMIT_S) / 4, "far inside the 5 s between the injected hold and the limit")
+        pair0 = (90 * 10**9, B + 90 * S)
+        for step_s, believed in ((0.3, True), (-0.3, True), (0.7, False), (-0.7, False)):
+            ns, note = _ident_exit_from_pairs(pair0, (136 * 10**9, B + int((136 + step_s) * S)), B + 120 * S)
+            self.assertEqual(ns is not None, believed, (step_s, note))
+        loose = (100 * 10**9, B + 100 * S, 100 * 10**9 + _IDENT_PAIR_TIGHT_NS + 1_000_000)
+        self.assertIsNone(_ident_clock_pair(read_once=lambda: loose, tries=3), "a pair read wider than the tight bound is thrown away")
+        inside = (100 * 10**9, B + 100 * S, 100 * 10**9 + _IDENT_PAIR_TIGHT_NS - 1_000_000)
+        self.assertIsNotNone(_ident_clock_pair(read_once=lambda: inside, tries=3))
+
+    def test_a_parent_stalled_inside_the_clock_pair_read_does_not_move_the_childs_exit(self) -> None:
+        # adversary A2: the FILETIME is sampled at 100.1 s, the parent is descheduled 32 s, the second QPC read says 132.1 s. The midpoint (116.1 s) is 16 s wrong, so that pair is thrown away
+        S, B = 10_000_000, 5_000_000_000_000
+        loose = (int(100.1 * 1e9), B + int(100.1 * S), int(132.1 * 1e9))
+        tight = (int(140.0 * 1e9), B + 140 * S, int(140.0 * 1e9) + 2_000_000)
+        reads = iter([loose, loose, tight])
+        pair1 = _ident_clock_pair(read_once=lambda: next(reads))
+        self.assertEqual(pair1, ((tight[0] + tight[2]) // 2, tight[1]))
+        pair0 = (90 * 10**9, B + 90 * S)
+        ns, note = _ident_exit_from_pairs(pair0, pair1, B + int(100.05 * S))   # the child exited 0.05 s after its marker at 100 s; the parent stalled; the read is at 140 s
+        self.assertEqual(note, "ok")
+        self.assertAlmostEqual((ns - 100 * 10**9) / 1e9, 0.05, places=2)
+        self.assertIsNone(_ident_clock_pair(read_once=lambda: loose, tries=5), "a run of loose reads is no pair at all")
+
+    def test_a_real_hold_is_rejected_whatever_the_parent_delay_and_an_unknown_child_exit_is_a_typed_failure(self) -> None:
+        for child_exit_s, parent_end_s in ((120.0, 120.1), (120.0, 136.0)):   # held 20 s; held 20 s and then the parent stalled 16 s
+            self._set_clocks(100.0, child_exit_s, parent_end_s)
+            with self.assertRaises(AssertionError) as ctx:
+                self.assert_no_exit_hold()
+            self.assertIn("held the exit", str(ctx.exception), (child_exit_s, parent_end_s))
+        self._set_clocks(100.0, None, 136.0)   # no child-side exit time: the parent's end is NOT a substitute for it
+        with self.assertRaises(unittest.SkipTest) as ctx:
+            self.assert_no_exit_hold()
+        self.assertIn("EXIT_HOLD_INCONCLUSIVE", str(ctx.exception))
+        self.assertNotIn("held the exit", str(ctx.exception))
+
+    # r3: the figure is built from the end marker, so a marker without one, or one in another clock, is a typed failure and never an exit hold
+    def test_a_marker_without_an_end_timestamp_or_in_another_clock_is_a_typed_failure_not_an_exit_hold(self) -> None:
+        now = _ident_time.perf_counter_ns()
+        self.last_wall_s, self.last_wall_end_ns, self.last_stderr = 30.0, now, ""
+        self.last_child_exit_ns, self.last_child_exit_note = now, "ok"
+        self.last_timing = _parse_probe_timing("VENUE_PROBE_INTERNAL_MS=10000 abandoned=1")   # the r2 marker: no end_qpc
+        with self.assertRaises(AssertionError) as ctx:
+            self.assert_no_exit_hold()
+        self.assertIn("typed failure", str(ctx.exception))
+        self.assertNotIn("held the exit", str(ctx.exception))
+        future_ticks = (now + 60 * 10**9) // 100   # a marker 60 s after the test saw the process end: not the same clock
+        self.last_timing = _parse_probe_timing(f"VENUE_PROBE_INTERNAL_MS=10000 abandoned=1 end_qpc={future_ticks} qpc_hz=10000000")
+        with self.assertRaises(AssertionError) as ctx:
+            self.assert_no_exit_hold()
+        self.assertIn("not the same monotonic clock", str(ctx.exception))
+        self.assertNotIn("held the exit", str(ctx.exception))
+        held_ticks = (now - 30 * 10**9) // 100   # a marker 30 s before the process end is a hold
+        self.last_timing = _parse_probe_timing(f"VENUE_PROBE_INTERNAL_MS=10000 abandoned=1 end_qpc={held_ticks} qpc_hz=10000000")
+        with self.assertRaises(AssertionError) as ctx:
+            self.assert_no_exit_hold()
+        self.assertIn("held the exit", str(ctx.exception))
+
+    # r3 (fable VENUE-PROBE-TEL-ABANDONED-EXIT-HOLD-TEST-1): the :605 twin. A hung TELEMETRY read (120 s, far past the 1 s call deadline) is abandoned, and the process still ends right after the marker.
+    def _tel_abandoned_run(self, exit_hold_s: int = 0) -> None:
+        feed = self.tmp / "hwinfo-log-adapter.csv"
+        feed.write_text("\r\n".join(_tel_feed_rows([70.0] * 20, [12.0] * 20, [False] * 20)) + "\r\n", encoding="utf-8")
+        self.run_identity_probe(self.procs, self.cim, CHAIN_OWNERS, timing=True, exit_hold_s=exit_hold_s,
+                               tel={"feed": feed, "call_ms": 1000, "read_delay_ms": self.DELAY_MS})
+
+    def test_an_abandoned_telemetry_call_does_not_hold_the_exit(self) -> None:
+        self._tel_abandoned_run()
+        self.assertGreaterEqual(self.last_timing["abandoned"], 1, self.timing_text())
+        self.assert_timing(self.last_wall_s)   # r5: wall and exit hold, three-way
+
+    def test_an_exit_hold_is_rejected_when_a_telemetry_call_was_abandoned_too(self) -> None:
+        self._tel_abandoned_run(exit_hold_s=20)
+        self.assertGreaterEqual(self.last_timing["abandoned"], 1, self.timing_text())
+        with self.assertRaises(AssertionError) as ctx:
+            self.assert_no_exit_hold()
+        self.assertIn("held the exit", str(ctx.exception))
+
+    def test_a_negative_or_unreadable_timing_marker_is_a_typed_failure_and_never_a_missing_marker(self) -> None:
+        for raw in ("-10000", "1.5", "NaN", ""):
+            t = _parse_probe_timing(f"VENUE_PROBE_INTERNAL_MS={raw} abandoned=1\n")
+            self.assertIsNotNone(t, raw)
+            t = _parse_probe_timing(f"VENUE_PROBE_INTERNAL_MS={raw}  abandoned=1\n")   # adversary A1: stray spacing is still a PRESENT marker
+            self.assertIsNotNone(t, raw)
+            self.assertIsNone(t["probe_ms"], raw)
+            self.assertIn("not a non-negative integer", t["bad"])
+            self.last_timing, self.last_stderr, self.last_wall_s, self.last_wall_end_ns = t, "", 30.5, _ident_time.perf_counter_ns()
+            self.last_child_exit_ns, self.last_child_exit_note = self.last_wall_end_ns, "ok"
+            with self.assertRaises(AssertionError) as ctx:
+                self.assert_no_exit_hold()
+            self.assertIn("typed failure", str(ctx.exception), raw)
+        self.assertEqual(_parse_probe_timing("VENUE_PROBE_INTERNAL_MS=10000 abandoned=1"), {"probe_ms": 10000, "abandoned": 1, "end_qpc": None, "qpc_hz": None})
+        self.assertEqual(_parse_probe_timing("VENUE_PROBE_INTERNAL_MS=10000 abandoned=1 end_qpc=123456 qpc_hz=10000000"), {"probe_ms": 10000, "abandoned": 1, "end_qpc": 123456, "qpc_hz": 10000000})
+        self.assertIsNone(_parse_probe_timing("no marker here"))
+
+    def test_the_marker_parser_anchors_every_field_to_a_whole_plain_integer_and_types_every_failure(self) -> None:
+        # r4 (VENUE-PROBE-TIMING-PARSER-FULL-TOKEN-1): a present marker of any other shape is a typed `bad`, never a missing marker, a junk-tolerant parse or a ValueError
+        digits = "9" * 5000
+        for line in ("VENUE_PROBE_INTERNAL_MS= NaN abandoned=1", "VENUE_PROBE_INTERNAL_MS=10 abandoned=1 end_qpc=5 qpc_hz=10000000junk", "VENUE_PROBE_INTERNAL_MS=10 abandoned=1 end_qpc=5x qpc_hz=10",
+                     f"VENUE_PROBE_INTERNAL_MS={digits} abandoned=1", f"VENUE_PROBE_INTERNAL_MS=10 abandoned={digits}", f"VENUE_PROBE_INTERNAL_MS=10 abandoned=1 end_qpc={digits} qpc_hz=10",
+                     "VENUE_PROBE_INTERNAL_MS=10 abandoned=1 end_qpc=5", "VENUE_PROBE_INTERNAL_MS=10", "VENUE_PROBE_INTERNAL_MS=10 abandoned=1 trailing", "VENUE_PROBE_INTERNAL_MS=1e3 abandoned=1",
+                     "noiseVENUE_PROBE_INTERNAL_MS=1500 abandoned=1 end_qpc=1000000000 qpc_hz=10000000",   # adversary A4: a prefix is not a clean marker line
+                     "VENUE_PROBE_INTERNAL_MS=1500 abandoned=1 end_qpc=1000000000 qpc_hz=10000000\nVENUE_PROBE_INTERNAL_MS=NaN abandoned=1",   # A4 pass 2: a second marker is not ignored
+                     "VENUE_PROBE_INTERNAL_MS=1500 abandoned=1 end_qpc=1000000000 qpc_hz=10000000\nVENUE_PROBE_INTERNAL_MS=1500 abandoned=1 end_qpc=1000000000 qpc_hz=10000000"):
+            t = _parse_probe_timing(line + "\n")
+            self.assertIsNotNone(t, line[:80])
+            self.assertIsNone(t["probe_ms"], line[:80])
+            self.assertTrue(t["bad"], line[:80])
+        t = _parse_probe_timing("noise\r\nVENUE_PROBE_INTERNAL_MS=1500 abandoned=0 end_qpc=1000000000 qpc_hz=10000000\r\n")
+        self.assertEqual(t, {"probe_ms": 1500, "abandoned": 0, "end_qpc": 1000000000, "qpc_hz": 10000000})
+        t = _parse_probe_timing("\rVENUE_PROBE_INTERNAL_MS=1500 abandoned=0 end_qpc=1000000000 qpc_hz=10000000")   # A4 pass 2: a lone carriage return before the line is still a present, clean marker
+        self.assertEqual(t, {"probe_ms": 1500, "abandoned": 0, "end_qpc": 1000000000, "qpc_hz": 10000000})
+
+    def test_the_timing_marker_is_read_from_monotonic_clocks_and_no_civil_clock(self) -> None:
+        self.assertEqual(_probe_marker_violations(_ident_probe_body()), [])
+
+    def test_the_marker_pin_catches_a_civil_value_stashed_on_an_earlier_line_and_a_comment_that_spells_the_real_call(self) -> None:
+        body = _ident_probe_body()
+        real = "[Diagnostics.Stopwatch]::GetTimestamp()"
+        self.assertEqual(body.count(real), 1)
+        marker = next(ln for ln in body.splitlines() if "VENUE_PROBE_INTERNAL_MS" in ln and not ln.lstrip().startswith("#"))
+        stash = body.replace(marker, "$fakeQpc = [DateTime]::UtcNow.Ticks\n" + marker.replace(real, "$fakeQpc") + " # " + real)   # sol's cross-line substitute with the real spelling in a trailing comment
+        self.assertNotEqual(_probe_marker_violations(stash), [])
+        self.assertNotEqual(_probe_marker_violations(body.replace(real, "$fakeQpc")), [], "the substitute alone")
+        self.assertNotEqual(_probe_marker_violations(body.replace(marker, marker + " # " + real)), [], "a trailing comment alone")
+        self.assertNotEqual(_probe_marker_violations(body.replace(real, "[DateTime]::UtcNow.Ticks")), [], "a civil read in place of the call")
+
+    def test_the_test_reaper_still_drains_and_kills_when_taskkill_itself_times_out(self) -> None:
+        from unittest import mock
+
+        class FakeProc:
+            pid = 4242
+
+            def __init__(self) -> None:
+                self.calls = []
+
+            def communicate(self, timeout=None):
+                self.calls.append("communicate")
+                raise subprocess.TimeoutExpired("probe", timeout)
+
+            def poll(self):
+                return None
+
+            def kill(self):
+                self.calls.append("kill")
+
+            def wait(self, timeout=None):
+                self.calls.append("wait")
+                return 0
+
+        fake = FakeProc()
+        with mock.patch.object(subprocess, "Popen", return_value=fake), \
+                mock.patch.object(subprocess, "run", side_effect=subprocess.TimeoutExpired("taskkill", 60)):
+            with self.assertRaises(subprocess.TimeoutExpired):
+                _ident_run_reaped(["probe"], timeout=1)
+        self.assertEqual(fake.calls, ["communicate", "communicate", "kill", "wait"], "taskkill failing must fall through to the bounded drain and the fallback kill")
+
+    def test_the_test_reaper_still_kills_when_the_second_drain_fails_with_an_os_error(self) -> None:
+        from unittest import mock
+
+        class FakeProc:
+            pid = 4243
+
+            def __init__(self) -> None:
+                self.calls = []
+
+            def communicate(self, timeout=None):
+                self.calls.append("communicate")
+                if self.calls.count("communicate") == 1:
+                    raise subprocess.TimeoutExpired("probe", timeout)
+                raise OSError("pipe read failure")
+
+            def poll(self):
+                return None
+
+            def kill(self):
+                self.calls.append("kill")
+
+            def wait(self, timeout=None):
+                self.calls.append("wait")
+                return 0
+
+        fake = FakeProc()
+        with mock.patch.object(subprocess, "Popen", return_value=fake), mock.patch.object(subprocess, "run", return_value=None):
+            with self.assertRaises(subprocess.TimeoutExpired):
+                _ident_run_reaped(["probe"], timeout=1)
+        self.assertEqual(fake.calls, ["communicate", "communicate", "kill", "wait"], "r4: a second drain that raises an OSError must still reach the fallback kill")
+
+    def test_the_childs_exit_time_is_the_os_recorded_exit_not_the_parents_clock_after_it(self) -> None:
+        from unittest import mock
+        # a real, prompt child: its OS exit time is inside the run, and a parent stalled afterwards does not move it
+        started = _ident_time.perf_counter_ns()
+        with mock.patch.object(sys.modules[__name__], "_IDENT_AFTER_REAP_DELAY_S", 3.0):
+            done = _ident_run_reaped([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", "Start-Sleep -Milliseconds 300"], timeout=120)
+        parent_end = _ident_time.perf_counter_ns()
+        if done.child_exit_ns is None:   # adversary A4: a permitted missing clock (a run of loose pair reads) is a typed skip
+            self.skipTest(f"EXIT_HOLD_INCONCLUSIVE: no child-side exit time ({done.child_exit_note})")
+        self.assertGreaterEqual(done.child_exit_ns, started)
+        self.assertIsNotNone(done.child_start_ns, "r5: the child's own creation time is mapped through the same pair")
+        self.assertLessEqual(done.child_start_ns, done.child_exit_ns)
+        self.assertGreaterEqual((parent_end - done.child_exit_ns) / 1e9, 2.5, "the 3 s stall sits after the child's exit")
 
     def test_the_call_deadline_is_a_pinned_literal_inside_the_identity_budget_arithmetic(self) -> None:
         body = _ident_probe_body()

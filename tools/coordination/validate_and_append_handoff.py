@@ -18,13 +18,15 @@ import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 
+_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
+
 
 SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 
 
 def run_git(repo: Path, *args: str) -> str:
     result = subprocess.run(
-        ["git", *args], cwd=repo, text=True, capture_output=True, check=False
+        ["git", *args], cwd=repo, text=True, capture_output=True, check=False, creationflags=_NO_WINDOW
     )
     if result.returncode:
         raise RuntimeError(result.stderr.strip() or f"git {' '.join(args)} failed")
@@ -45,7 +47,7 @@ def validate_range(repo: Path, start: str, feature: str) -> tuple[str, str, str]
         ["git", "merge-base", "--is-ancestor", start_sha, feature_sha],
         cwd=repo,
         capture_output=True,
-        check=False,
+        check=False, creationflags=_NO_WINDOW,
     )
     if result.returncode:
         raise RuntimeError(f"feature {feature_sha} is not descended from start {start_sha}")

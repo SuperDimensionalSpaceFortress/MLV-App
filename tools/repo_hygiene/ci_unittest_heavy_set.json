@@ -24,6 +24,7 @@
         "tools.repo_hygiene.test_dual_venue_evidence.VenueQuietAttributionTests",
         "tools.repo_hygiene.test_dual_venue_evidence.VenueQuietForeignFloorTests",
         "tools.repo_hygiene.test_dual_venue_evidence.VisualCaptureRunnerModuleTests",
+        "tools.repo_hygiene.test_dual_venue_evidence.VisualExposureFloorTests",
         "tools.repo_hygiene.test_dual_venue_paired_seek.PairedSeekImageContentTests",
         "tools.repo_hygiene.test_heavy_arm_frame_log.CpuReceiptLegRunsProcessed8",
         "tools.repo_hygiene.test_heavy_arm_frame_log.HeavyArmKeepsFrameRows",

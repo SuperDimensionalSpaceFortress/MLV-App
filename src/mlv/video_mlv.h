@@ -685,8 +685,10 @@ int get_mlv_raw_frame_debayered_isolated_analysis_scaled(mlvObject_t * video,
 /* Thumbnail Creation with a downscaled raw image sub-sampling algorithm is used. */
 int create_thumbnail(mlvObject_t * video, uint8_t * thumbnail_img, int downscaled_factor, int width, int height, int threads);
 
-/* Thumbnail Creation with full debayer, but downscaled image processing */
-void get_area_average_downscale_thumnail(mlvObject_t *video, int frame_index, int downscale_factor, int cpu_cores, unsigned char *out_buffer);
+/* Thumbnail Creation with full debayer, but downscaled image processing. Returns 1 when out_buffer was rendered, 0 when
+ * it was not (an allocation or clone failure): the buffer is then left as it was, so a caller that measures it must
+ * check the result (LOOK-ASSIST-GREEN-ARTIFACT-FALLBACK-AT-LIFTED-EXPOSURE-1 r3, adversary pass 5 A1). */
+int get_area_average_downscale_thumnail(mlvObject_t *video, int frame_index, int downscale_factor, int cpu_cores, unsigned char *out_buffer);
 
 enum mlv_processed_thumbnail_settings_flags
 {
