@@ -5794,3 +5794,67 @@ def test_noread_row_kinds_retire_keeps_the_worktree_naming_pid_and_file(repo, ki
     assert d["action"] == "kept" and d["reason"].startswith("cwd-unknown") and str(p.pid) in d["reason"] and _NOREAD_FILE in d["reason"], json.dumps(d)
     assert d["renameProbe"] == "not-run", json.dumps(d)
     assert (wt / ".git").exists() and (wt / "a.txt").exists(), "the worktree must be intact"
+
+
+# --- CI-FLAKE-RETIRE-HOLDER-EXIT-RELEASE-CORPUS-EMPTY-1: a recycled parent pid in the caller's ancestor chain hid a live holder ---
+# Hosted Tests run 43201503884 (job 131125818658, #802 head 9265be72): test_holder_exit_releases_the_worktree_for_real_retirement saw the gate
+# return `kept: in-use` (the rename probe) with holders=[] and cwdUnknown=[] while the holder (pid 732, a low pid) was alive and its cwd WAS the
+# worktree (the post-hoc census read it). The card's "corpus files: 0" is not the cause: a `-Command` holder has no script, so its corpus is
+# empty by construction. The row the gate never judged is the one it dropped as the CALLER'S OWN ANCESTOR: Get-LaneProcessSnapshot walked
+# ParentProcessId upward with no creation-time check, so an ancestor whose parent had exited (its pid since recycled to the holder) put the
+# holder's pid into SelfPids, and Get-LaneHolderIndex / Find-WorktreeHolders / Find-RunDirDriverHolders skip every SelfPids pid. A real parent
+# is created BEFORE its child; a "parent" created after its child is a recycled pid and ends the chain.
+
+_CHAIN_BASE = "([datetime]'2026-01-01T00:00:00Z')"
+
+
+def _chain_row(pid, ppid, name, minutes, extra=""):
+    """One Win32_Process row; minutes=None gives it no readable CreationDate."""
+    created = "$null" if minutes is None else f"{_CHAIN_BASE}.AddMinutes({minutes})"
+    return (f"[pscustomobject]@{{ ProcessId = [int]{pid}; ParentProcessId = [int]{ppid}; Name = '{name}'; CommandLine = '{name}'; "
+            f"CreationDate = {created}{extra} }}")
+
+
+def _chain_cim_seam(rows):
+    """Win32_Process answered from `rows` (built with _chain_row); every other class goes to the real cmdlet."""
+    return ("function Get-CimInstance { [CmdletBinding()] param([Parameter(Position=0)][string]$ClassName, [string]$Filter, [string[]]$Property) "
+            "if ($ClassName -ne 'Win32_Process') { return CimCmdlets\\Get-CimInstance @PSBoundParameters }; "
+            f"$all = @({'; '.join(rows)}); "
+            "if ($Filter -match 'ProcessId\\s*=\\s*(\\d+)') { return @($all | Where-Object { $_.ProcessId -eq [int]$Matches[1] }) }; $all };")
+
+
+def _chain_self_pids(rows):
+    script = ("$ErrorActionPreference='Stop'; " + f". '{HELPER}'; " + _chain_cim_seam(rows)
+              + " $s = Get-LaneProcessSnapshot; ConvertTo-Json -Compress @($s.SelfPids)")
+    r = subprocess.run([PWSH, "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True)
+    assert r.returncode == 0, r.stdout + r.stderr
+    return sorted(json.loads(r.stdout))
+
+
+def test_snapshot_ancestor_chain_stops_at_a_parent_pid_recycled_after_the_child_started():
+    """50002 was created AFTER its supposed child 50001 (the pid was recycled), so it is not an ancestor."""
+    s = _chain_self_pids([_chain_row("$PID", 50001, "pwsh.exe", 10), _chain_row(50001, 50002, "python.exe", 5), _chain_row(50002, 0, "holder.exe", 20)])
+    assert 50001 in s and 50002 not in s, s
+
+
+def test_snapshot_ancestor_chain_keeps_every_real_ancestor():
+    """A parent created before its child is an ancestor, however far up (the chain a lane running inside its own worktree has)."""
+    s = _chain_self_pids([_chain_row("$PID", 50001, "pwsh.exe", 30), _chain_row(50001, 50002, "python.exe", 20),
+                          _chain_row(50002, 50003, "bash.exe", 10), _chain_row(50003, 0, "Runner.exe", 1)])
+    assert {50001, 50002, 50003} <= set(s), s
+
+
+def test_snapshot_ancestor_chain_does_not_claim_a_parent_whose_creation_time_is_unreadable():
+    """Unknown is never free: a parent whose CreationDate cannot be read cannot be shown to be the real parent, so it is not excluded as self."""
+    s = _chain_self_pids([_chain_row("$PID", 50001, "pwsh.exe", 10), _chain_row(50001, 50002, "python.exe", 5), _chain_row(50002, 0, "holder.exe", None)])
+    assert 50001 in s and 50002 not in s, s
+
+
+def test_gate_refuses_a_live_holder_whose_pid_is_a_recycled_parent_of_the_callers_chain(repo):
+    """End to end through the REAL snapshot code: the holder's cwd is the worktree and its pid is the recycled parent of the caller's chain."""
+    tmp, main = repo
+    wt = _add_wt(main, tmp / "wt-recycled-parent")
+    rows = [_chain_row("$PID", 50001, "pwsh.exe", 10), _chain_row(50001, 50002, "python.exe", 5),
+            _chain_row(50002, 0, "pwsh.exe", 20, f"; CurrentDirectory = '{wt}\\'")]
+    d, err = _gate_err(wt, None, prelude=_chain_cim_seam(rows), whatif=True)
+    assert d["action"] == "kept" and d["reason"].startswith("live-process: 50002 pwsh.exe"), json.dumps(d)
