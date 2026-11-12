@@ -1671,7 +1671,7 @@ class AgentThresholdParityR3Tests(unittest.TestCase):
         """True when the agent's OWN declaration of parameter `name` (its attributes included, taken from the agent's AST) binds `value`."""
         script = (f"$t = $null; $e = $null; $ast = [System.Management.Automation.Language.Parser]::ParseFile('{AGENT}', [ref]$t, [ref]$e); "
                   f"$p = $ast.ParamBlock.Parameters | Where-Object {{ $_.Name.VariablePath.UserPath -eq '{name}' }}; if ($null -eq $p) {{ throw 'no such param' }}; "
-                  f"$f = [scriptblock]::Create('param(' + $p.Extent.Text + ') $' + '{name}'); try {{ & $f -{name} {value} | Out-Null; $true }} catch {{ $false }}")
+                  f"$f = [scriptblock]::Create('param(' + $p.Extent.Text + ') $' + '{name}'); try {{ & $f -{name} ({value}) | Out-Null; $true }} catch {{ $false }}")
         return shell_json(exe, script)
 
     def test_r3_a2_the_binder_accepts_no_heat_threshold_the_gate_refuses(self) -> None:
