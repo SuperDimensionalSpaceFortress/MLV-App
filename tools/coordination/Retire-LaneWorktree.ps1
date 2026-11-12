@@ -423,9 +423,23 @@ function Get-LaneProcessSnapshot {
     $self = @($PID)
     $node = $byPid[[int]$PID]
     $pp = if ($node) { $node.ParentProcessId } else { 0 }
+    # CI-FLAKE-RETIRE-HOLDER-EXIT-RELEASE-CORPUS-EMPTY-1 (hosted Tests run 43201503884, job 131125818658): ParentProcessId is the pid of the process that
+    # started this one, recorded at creation and never updated. Once that parent exits, Windows hands its pid to the next new process, so a chain
+    # walked by pid alone can step onto an unrelated live process and exclude it from every holder check as "the caller's own ancestor" (the
+    # holder, a test's pid 732, was dropped from the census and the retirement was refused only by the rename probe). A real parent was created
+    # BEFORE its child. A live parent row whose CreationDate is later than the child's is a recycled pid, and one whose creation time (or the child's)
+    # cannot be read cannot be shown to be the parent: either ends the chain, and the pid stays in Procs to be judged like any other process.
+    # An ABSENT parent row is a parent that already exited; its pid is listed (it names no row, so it excludes nothing).
     while ($pp -and $self -notcontains $pp) {
+        $parent = $byPid[[int]$pp]
+        if ($parent) {
+            $childMade = if ($node) { $node.PSObject.Properties['CreationDate'] } else { $null }
+            $parentMade = $parent.PSObject.Properties['CreationDate']
+            if (-not ($childMade -and $parentMade -and $childMade.Value -is [datetime] -and $parentMade.Value -is [datetime] -and
+                      ([datetime]$parentMade.Value).ToUniversalTime() -le ([datetime]$childMade.Value).ToUniversalTime())) { break }
+        }
         $self += $pp
-        $node = $byPid[[int]$pp]
+        $node = $parent
         $pp = if ($node) { $node.ParentProcessId } else { 0 }
     }
     [pscustomobject]@{
