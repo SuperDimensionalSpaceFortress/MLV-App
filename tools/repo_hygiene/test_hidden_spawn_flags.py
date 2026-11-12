@@ -461,6 +461,7 @@ _BUILTINS_NAMES: set[str] = set()  # names the file binds to the builtins module
 _REBOUND_TYPES: set[str] = set()  # `str` / `bytes` the file binds to something other than the builtin (`str = bytes`, `def str`, `class bytes`, an argument): the bare name proves nothing
 _CODEC_ALIASES: set[str] = set()  # names the file being scanned binds to the codecs module (`import codecs as c`); set per scan by _note_aliases
 _CODEC_FUNCS: dict[str, str] = {}  # names the file binds to codecs.decode / codecs.encode (`from codecs import decode as d`), to the method they stand for
+_SPELLED_FOLDS: set[str] = set()  # r18: every name the file SPELLS as a fold's module, function or type, bound once or not (`op` in `import operator as op` twice); a call through one whose identity is unproven is an unknown build
 
 
 _TEXT_BASE_MEMO: dict[tuple[int, int], tuple[ast.AST, dict[str, str], bool]] = {}  # per scan: (id(node), id(consts)) -> (node, consts, answer); cleared by _note_aliases
@@ -505,12 +506,13 @@ def _note_aliases(tree: ast.AST) -> None:
     """r16 (pass 39, one class): a name stands for the module / function / type only while the file binds it EXACTLY ONCE (the import or the alias assignment itself): a parameter, a
     rebinding, a second import, a loop variable or a class attribute of the same name is something else, and the scan then reads the call as unknown (reported), never as the standard one."""
     _TEXT_BASE_MEMO.clear()
-    for table in (_STR_ALIASES, _BYTES_ALIASES, _STR_KIND_ALIASES, _BUILTINS_NAMES, _OPERATOR_MODULES, _OPERATOR_FUNCS, _REBOUND_TYPES, _CODEC_ALIASES, _CODEC_FUNCS):
+    for table in (_STR_ALIASES, _BYTES_ALIASES, _STR_KIND_ALIASES, _BUILTINS_NAMES, _OPERATOR_MODULES, _OPERATOR_FUNCS, _REBOUND_TYPES, _CODEC_ALIASES, _CODEC_FUNCS, _SPELLED_FOLDS):
         table.clear()
     counts: dict[str, int] = {}
     for n in ast.walk(tree):
         for name in _bound_names(n):
             counts[name] = counts.get(name, 0) + 1
+    _note_spelled(tree, counts)
     once = lambda name: counts.get(name) == 1  # noqa: E731
     for n in ast.walk(tree):  # the names an import gives the types come first: an alias of one (`C = B`) is read against them
         mod = n.module if isinstance(n, ast.ImportFrom) and not n.level else None
@@ -548,6 +550,66 @@ def _note_aliases(tree: ast.AST) -> None:
                 _STR_KIND_ALIASES.add(name)
         if known == (len(_STR_ALIASES), len(_BYTES_ALIASES), len(_STR_KIND_ALIASES), len(_OPERATOR_MODULES)):
             break
+
+
+_FOLD_SPELLINGS = frozenset({"str", "bytes", "codecs", "operator", "builtins"})
+_FOLD_FROM_NAMES = {"codecs": frozenset({"decode", "encode"}), "operator": frozenset(_OPERATOR_BINOPS), "builtins": frozenset({"str", "bytes"})}
+_FOLD_DUNDERS = frozenset(_DUNDER_BINOPS) | {"__format__"}
+_FOLD_METHODS = _STR_METHODS | frozenset(_OPERATOR_BINOPS) | {"encode"}
+
+
+def _spells_fold(v: ast.AST, spelled: set[str] | frozenset[str]) -> bool:
+    """r18: does this expression SPELL a fold's module, function or type: a name in ``spelled``, ``x.str`` / ``x.codecs``, ``str.lower``, ``type(x)``, ``x.__class__``? Spelling is all
+    it reads: whether the name really is that is the identity proof, which a rebinding withdraws."""
+    if isinstance(v, ast.Name):
+        return v.id in spelled or v.id in ("str", "bytes")  # the builtin types, whether or not the file rebinds them (`S = str` bound twice)
+    if isinstance(v, ast.Attribute):
+        return v.attr in _FOLD_SPELLINGS or v.attr == "__class__" or _spells_fold(v.value, spelled)
+    return isinstance(v, ast.Call) and isinstance(v.func, ast.Name) and v.func.id == "type" and len(v.args) == 1
+
+
+def _note_spelled(tree: ast.AST, counts: dict[str, int]) -> None:
+    """r18 (HUB RULING): the names the file spells as one of the fold's modules, functions or types, WHETHER OR NOT it binds them once. ``_note_aliases`` keeps only the proven ones
+    (bound once); withdrawing a proof must never make the call invisible, so a call through a spelled name that is not proven is read as an unknown build (``_unproven_fold``)."""
+    spelled = set(_FOLD_SPELLINGS)  # a bare `codecs` the file never imports is spelled too: `from lib import *` may have brought it, so nothing proves it is the module
+    pairs: list[tuple[str, ast.AST]] = []
+    for n in ast.walk(tree):
+        if isinstance(n, ast.Import):
+            spelled.update(a.asname or a.name for a in n.names if a.name in _FOLD_FROM_NAMES)
+        elif isinstance(n, ast.ImportFrom) and not n.level and n.module in _FOLD_FROM_NAMES:
+            spelled.update(a.asname or a.name for a in n.names if a.name in _FOLD_FROM_NAMES[n.module])
+        elif isinstance(n, ast.Assign) and len(n.targets) == 1 and isinstance(n.targets[0], ast.Name):
+            pairs.append((n.targets[0].id, n.value))
+        elif isinstance(n, ast.AnnAssign) and isinstance(n.target, ast.Name) and n.value is not None:
+            pairs.append((n.target.id, n.value))
+        elif isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):  # `def f(S=str)`
+            a = n.args
+            positional = a.posonlyargs + a.args
+            pairs += [(p.arg, d) for p, d in zip(positional[len(positional) - len(a.defaults):], a.defaults)]
+            pairs += [(p.arg, d) for p, d in zip(a.kwonlyargs, a.kw_defaults) if d is not None]
+    for _ in range(len(pairs) + 1):  # an alias of an alias is read once the first is known
+        before = len(spelled)
+        spelled.update(name for name, v in pairs if name not in spelled and _spells_fold(v, spelled))
+        if len(spelled) == before:
+            break
+    _SPELLED_FOLDS.update(spelled)
+
+
+def _unproven_fold(node: ast.AST, consts: dict[str, str]) -> bool:
+    """r18 (HUB RULING): a fold-LIKE call whose identity is NOT proven and that has a string / bytes literal argument. Fold-like is the callee SPELLING: a name the file spells as a fold
+    function or type (``codecs.decode``, ``op.add``, ``concat``, ``S.lower``, ``b.str.format``) or any dunder fold (``X.__add__``, ``__radd__``, ``__mul__``, ``__mod__``, ``__format__``).
+    The call is read as an unknown build (reported), never as the harmless pieces it is made of: withdrawing an identity proof must not make a call invisible. A call whose identity IS
+    proven is folded by ``_bound_form`` before it gets here, and a proven one it leaves alone (``codecs.decode(read_bytes(), 'utf-8')``) is not this."""
+    if not isinstance(node, ast.Call) or not any(not isinstance(a, ast.Starred) and _text_base(a, consts) for a in node.args):
+        return False
+    f = node.func
+    if isinstance(f, ast.Name):
+        return f.id in _SPELLED_FOLDS and f.id not in _CODEC_FUNCS and f.id not in _OPERATOR_FUNCS and _type_kind(f) is None
+    if not isinstance(f, ast.Attribute) or _text_base(f.value, consts):
+        return False
+    if isinstance(f.value, ast.Name) and (f.value.id in _CODEC_ALIASES or f.value.id in _OPERATOR_MODULES) or _type_kind(f.value) is not None:
+        return False  # a proven module or type
+    return f.attr in _FOLD_DUNDERS or (f.attr in _FOLD_METHODS and _spells_fold(f.value, _SPELLED_FOLDS))
 
 
 def _codecs_like(recv: ast.AST) -> bool:
@@ -877,6 +939,8 @@ def _flatten_node(node: ast.AST, consts: dict[str, str], depth: int = 0) -> tupl
     if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Mult):  # string repetition: `('subprocess_' + kind) * 1` is the text itself, `* n` repeats it
         texts = [t for t, _ in (_flatten(node.left, consts, depth + 1), _flatten(node.right, consts, depth + 1)) if t.replace(_WILD, "")]
         return (_WILD + texts[0] + _WILD, False) if len(texts) == 1 else (_WILD, False)
+    if _unproven_fold(node, consts):
+        return _unread_codec_text(), False  # r18: a fold-like call whose identity is unproven is an unknown build, whatever its literals spell
     if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
         method, recv = node.func.attr, node.func.value
         if method == "join" and len(node.args) == 1 and not node.keywords:
@@ -2371,6 +2435,8 @@ def _folds(node: ast.AST, consts: dict[str, str]) -> bool:
     if isinstance(node, ast.Subscript):
         return _text_base(node.value, consts)
     if isinstance(node, ast.Call):
+        if _unproven_fold(node, consts):
+            return True  # r18: the fold reads it as an unknown build (its pieces are not judged alone)
         if any(isinstance(a, ast.Constant) and isinstance(a.value, bytes) for a in node.args):
             return True  # r15 (A3): a callee that is not PROVEN to be str / bytes still gets a bytes literal read as the text it spells (`T.str(b'Start-Process cmd.exe', 'ascii')`)
         if isinstance(node.func, ast.Attribute):
@@ -4239,6 +4305,11 @@ class AdversaryR8Tests(unittest.TestCase):
         found, bad = _start_process_violations(f"script = {expr}\n")
         return found, len(bad)
 
+    @staticmethod
+    def _ps_with(prefix: str, expr: str) -> tuple[int, int]:
+        found, bad = _start_process_violations(prefix + f"script = {expr}\n")
+        return found, len(bad)
+
     # ---- G13: one row per spelling Grok named, each an unhidden launch ----
     def g13_rows(self) -> list[str]:
         sp = self.SP
@@ -4512,6 +4583,7 @@ class AdversaryR9Tests(unittest.TestCase):
         found, bad = _start_process_violations("import operator\nimport operator as op\nfrom operator import add, mod, concat\nx = " + expr + "\n")
         return found, len(bad)
     _ps = staticmethod(AdversaryR8Tests._ps)
+    _ps_with = staticmethod(AdversaryR8Tests._ps_with)
 
     @staticmethod
     def _unbound(expr: str) -> str:
@@ -4562,8 +4634,9 @@ class AdversaryR9Tests(unittest.TestCase):
         self.assertGreaterEqual(len(self._bad(self._launch("'value_' + kind"))), 1)  # r15 (conservative flip): a name that is not a constant, in a getattr name position, is reported
         self.assertEqual(self._bad("import operator\nasync def f(o):\n    return hasattr(o, 'subprocess_exec_x') and operator.attrgetter('subprocess_exec_y')(o)\n"), [])
         for expr in ("str.lower('hello')", "str.join(' ', parts)", "ident('hello world')", "str.removeprefix('the end', 'the ')", "''.join(reversed('dlrow'))",
-                     "operator.concat('a', 'b')", "str.__add__('foo', 'bar')"):
+                     "str.__add__('foo', 'bar')"):
             self.assertEqual(self._ps(expr), (0, 0), expr)
+        self.assertEqual(self._ps_with("import operator\n", "operator.concat('a', 'b')"), (0, 0))  # r18: `operator` is the module only where the file imports it (once)
 
     # ---- G15: PowerShell side ----
     def g15_ps_rows(self) -> list[str]:
@@ -4936,7 +5009,7 @@ class AdversaryR9Tests(unittest.TestCase):
                      "'.' + b'value_\\xffx'.decode('ascii', 'ignore')", "b'abc'.decode('utf-16', 'ignore')", "'loop.' + 'abc'.encode('latin-1').decode('latin-1')",
                      "br'sub\\x70rocess_exec'.decode('raw_unicode_escape')"):  # the last: raw_unicode_escape does not read \x70, so Python keeps it as text and it names no method
             self.assertEqual(self._bad("import codecs\n" + self._launch(expr)), [], expr)
-            self.assertEqual(self._ps(expr), (0, 0), expr)
+            self.assertEqual(self._ps_with("import codecs\n", expr), (0, 0), expr)  # r18: `codecs` is the module only where the file imports it (once)
 
 
     # ---- pass 25 (review-adversary-MLV-LANE-CONSOLE-HIDDEN-1-r10-0f30bb2d) A1-A3, as classes ----
@@ -4972,7 +5045,7 @@ class AdversaryR9Tests(unittest.TestCase):
         for prefix, expr in (("import codecs\n", "codecs.decode(data, 'rot_13')"), ("", "payload.decode(enc)"), ("import codecs\n", "codecs.decode(b'abc', 'ascii')"),
                              ("import codecs\n", "codecs.decode(read_bytes(), 'utf-8', 'replace')"), ("", "b''.decode(enc)"), ("", "'\\x00'.encode(enc)")):
             self.assertEqual(self._bad(prefix + self._named(expr)), [], (prefix, expr))
-            self.assertEqual(self._ps(expr), (0, 0), expr)
+            self.assertEqual(self._ps_with(prefix, expr), (0, 0), expr)
 
     def test_pass25_a3_a_powershell_comment_is_a_comment_wherever_a_token_can_start(self):
         for script in ("Start-Process cmd.exe -ArgumentList '/c'# -WindowStyle Hidden", "Start-Process cmd.exe -ArgumentList ('/c')# -WindowStyle Hidden",
@@ -5650,6 +5723,58 @@ class AdversaryR9Tests(unittest.TestCase):
         for name in ("Builder.__add__('exec', 'subprocess_')", "Builder.__mod__('subprocess_%s', 'exec')", "Builder.__rmod__('exec', 'subprocess_%s')", "Builder.__radd__('subprocess_', 'exec')"):
             self.assertGreaterEqual(len(_unflagged_spawns_in_source(launch.format(name=name), "probe.py")), 1, name)
         self.assertEqual(self._fold_text("str.__add__('subprocess_', 'exec')"), ("subprocess_exec", True))  # the proven type keeps its fold
+
+    # ---- r18 (both r17 keys, one class): withdrawing an identity proof must never make a call invisible ----
+    # A fold-LIKE call (its callee spelling is a fold the scan knows) whose identity is not proven, with a string / bytes literal argument, is an UNKNOWN BUILD: reported on both sides.
+    _R18_BUILDER = "class Builder:\n    def __add__(left, right):\n        return left + right\n"
+    _R18_ROWS = (  # (label, prefix, PowerShell-side expression, Python-side expression)
+        ("codecs re-imported in a function (opus repro 1)", "import codecs\ndef f():\n    import codecs\n    return 1\n", "codecs.decode('Fgneg-Cebprff pzq.rkr', 'rot_13')", "codecs.decode('fhocebprff_rkrp', 'rot_13')"),
+        ("codecs imported twice, one name", "import codecs\nimport json as codecs\n", "codecs.encode('Fgneg-Cebprff pzq.rkr', 'rot_13')", "codecs.encode('fhocebprff_rkrp', 'rot_13')"),
+        ("codecs never imported (a star import may bring it)", "", "codecs.decode('Fgneg-Cebprff pzq.rkr', 'rot_13')", "codecs.decode('fhocebprff_rkrp', 'rot_13')"),
+        ("from codecs import decode as d, bound twice", "from codecs import decode as d\nd = object\n", "d('Fgneg-Cebprff pzq.rkr', 'rot_13')", "d('fhocebprff_rkrp', 'rot_13')"),
+        ("op.add shadowed", "import operator as op\nop = object()\n", "op.add('Start-', 'Process cmd.exe')", "op.add('subprocess_', 'exec')"),
+        ("op.concat shadowed", "import operator as op\nop = object()\n", "op.concat('Start-', 'Process cmd.exe')", "op.concat('subprocess_', 'exec')"),
+        ("op.mul shadowed", "import operator as op\nop = object()\n", "op.mul('Start-Process cmd.exe', 1)", "op.mul('subprocess_exec', 1)"),
+        ("op.mod shadowed", "import operator as op\nop = object()\n", "op.mod('%sProcess cmd.exe', 'Start-')", "op.mod('%sexec', 'subprocess_')"),
+        ("from operator import concat, shadowed", "from operator import concat\nconcat = object\n", "concat('Start-', 'Process cmd.exe')", "concat('subprocess_', 'exec')"),
+        ("from operator import add, shadowed", "from operator import add\nadd = object\n", "add('Start-', 'Process cmd.exe')", "add('subprocess_', 'exec')"),
+        ("S = str bound twice, __add__ (opus repro 2)", "S = str\nS = object\n", "S.__add__('Start-', 'Process cmd.exe')", "S.__add__('subprocess_', 'exec')"),
+        ("S = str bound twice, __radd__", "S = str\nS = object\n", "S.__radd__('Process cmd.exe', 'Start-')", "S.__radd__('exec', 'subprocess_')"),
+        ("S = str bound twice, __rmod__", "S = str\nS = object\n", "S.__rmod__('Start-', '%sProcess cmd.exe')", "S.__rmod__('subprocess_', '%sexec')"),
+        ("S = str bound twice, __mul__", "S = str\nS = object\n", "S.__mul__('Start-Process cmd.exe', 1)", "S.__mul__('subprocess_exec', 1)"),
+        ("S = str bound twice, removeprefix", "S = str\nS = object\n", "S.removeprefix('zzStart-Process cmd.exe', 'zz')", "S.removeprefix('zzsubprocess_exec', 'zz')"),
+        ("S = str bound twice, join", "S = str\nS = object\n", "S.join('', ['Sta', 'rt-Process cmd.exe'])", "S.join('', ['subprocess_', 'exec'])"),
+        ("def f(S=str) (opus repro 3)", "def g(S=str):\n    return S\n", "S.__add__('Start-', 'Process cmd.exe')", "S.__add__('subprocess_', 'exec')"),
+        ("T = type('') bound twice", "T = type('')\nT = object\n", "T.__add__('Start-', 'Process cmd.exe')", "T.__add__('subprocess_', 'exec')"),
+        ("Builder.__add__ (sol repro)", _R18_BUILDER, "Builder.__add__('Sta', 'rt-Process cmd.exe')", "Builder.__add__('subprocess_', 'exec')"),
+        ("b.str.removeprefix, b bound twice", "import builtins as b\nb = object\n", "b.str.removeprefix('zzStart-Process cmd.exe', 'zz')", "b.str.removeprefix('zzsubprocess_exec', 'zz')"),
+        ("b.str.format, b bound twice", "import builtins as b\nb = object\n", "b.str.format('{}Process cmd.exe', 'Start-')", "b.str.format('{}exec', 'subprocess_')"),
+        ("str rebound, __add__", "str = object\n", "str.__add__('Start-', 'Process cmd.exe')", "str.__add__('subprocess_', 'exec')"),
+        ("from builtins import str as S, bound twice, bytes literal", "from builtins import str as S\nS = object\n", "S(b'Start-Process cmd.exe', 'ascii')", "S(b'subprocess_exec', 'ascii')"),
+    )
+
+    def test_r18_a_fold_like_call_whose_identity_is_not_proven_is_reported_on_both_sides(self):
+        named = "import asyncio\nasync def launch():\n    loop = asyncio.get_running_loop()\n    name = {expr}\n    await loop.run_in_executor(None, print, name)\n"
+        for label, prefix, ps_expr, py_expr in self._R18_ROWS:
+            found, bad = _start_process_violations(prefix + f"script = {ps_expr}\n")
+            self.assertEqual((found, len(bad)), (1, 1), (label, "powershell side"))
+            self.assertGreaterEqual(len(_unflagged_spawns_in_source(prefix + named.format(expr=py_expr), "probe.py")), 1, (label, "python side"))
+
+    def test_r18_restores_the_pass22_a3_and_pass25_a2_assertions_for_the_unproven_shapes(self):
+        for expr in ("S.__add__('Start-', 'Process cmd.exe')", "X.__radd__('Process cmd.exe', 'Start-')", "T.__mul__('Start-Process cmd.exe', 1)"):  # a type name nothing binds: no proof
+            self.assertEqual(self._ps(expr), (1, 1), expr)
+        for expr in ("codecs.decode('Fgneg-Cebprff pzq.rkr', 'rot_13')", "codecs.decode(b'U3RhcnQtUHJvY2VzcyBjbWQuZXhl', 'base64').decode()", "codecs.decode('fnCF pzq.rkr', 'rot13')"):
+            self.assertEqual(self._ps(expr), (1, 1), expr)  # the shapes pass25_a2 asserted before r16 bound the name
+            self.assertEqual(self._ps_with("import codecs\n", expr), (1, 1), expr)  # ... and still bound once
+            self.assertEqual(self._ps_with("import codecs\nimport json as codecs\n", expr), (1, 1), expr)  # ... and bound twice
+
+    def test_r18_proven_identity_keeps_its_exact_fold_and_clean_calls_stay_clean(self):
+        for prefix, expr in (("import operator as op\n", "op.add('Start-', 'Process cmd.exe')"), ("S = str\n", "S.__add__('Start-', 'Process cmd.exe')"),
+                             ("from operator import concat\n", "concat('Start-', 'Process cmd.exe')"), ("import codecs\n", "codecs.decode(b'Start-Process cmd.exe', 'ascii')")):
+            self.assertEqual(self._ps_with(prefix, expr), (1, 1), (prefix, expr))  # proven: the exact text is judged (unhidden launch)
+        for prefix, expr in (("import operator as op\n", "op.add('hello', ' world')"), ("S = str\n", "S.__add__('hello', ' world')"), ("import codecs\n", "codecs.decode(read_bytes(), 'utf-8')"),
+                             ("import codecs\n", "codecs.decode(b'abc', 'ascii')"), ("", "payload.decode('utf-8')"), ("", "log.format('{}', 'x')"), ("", "ident('hello', 'world')")):
+            self.assertEqual(self._ps_with(prefix, expr), (0, 0), (prefix, expr))
 
     def test_r15_conservative_flips_a_name_that_is_not_a_constant_is_reported_in_a_getattr_name_position(self):
         # every one of these read clean before r15 (a matcher ruled the partial text out); the class rule reports them: a false positive is allowlisted by a reviewer, a false negative is not
