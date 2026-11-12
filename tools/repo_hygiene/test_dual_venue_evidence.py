@@ -31,6 +31,7 @@ import ast
 import concurrent.futures
 import contextlib
 import hashlib
+import inspect
 import io
 import json
 import os
@@ -39,6 +40,8 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import textwrap
+import types
 import unittest
 import unittest.mock
 from pathlib import Path
@@ -11661,14 +11664,34 @@ def _ident_exact_stamps(child: tuple) -> tuple:
     return getattr(child, "exact", None) or (_IdentFraction(child[0]), _IdentFraction(child[1]))
 
 
+def _ident_read_start_once(start_path: Path) -> tuple:
+    """sol r5 B1: the child's START stamp file is read ONCE per run, `(text, None)` or `(None, the OSError / UnicodeDecodeError)`. Both consumers (the pair reader and the lone-start reader) parse this
+    one read: a second read of the file could fail after the first had succeeded (PermissionError, disappearance, a decoding error) and drop start evidence already observed."""
+    try:
+        return start_path.read_text(encoding="ascii"), None
+    except (OSError, UnicodeDecodeError) as exc:
+        return None, exc
+
+
 def _ident_read_child_stamps(start_path: Path, exit_path: Path) -> tuple:
+    return _ident_child_stamps_of(_ident_read_start_once(start_path), exit_path)
+
+
+def _ident_read_child_evidence(start_path: Path, exit_path: Path) -> tuple:
+    """sol r5 B1: `(stamps, note, lone_start)` from ONE read of the start file: the pair (or None and its typed reason) and the start stamp on its own, whatever became of the exit stamp."""
+    start_read = _ident_read_start_once(start_path)
+    stamps, note = _ident_child_stamps_of(start_read, exit_path)
+    return stamps, note, _ident_start_stamp_of(start_read)
+
+
+def _ident_child_stamps_of(start_read: tuple, exit_path: Path) -> tuple:
     """((start_ns, exit_ns) on the perf_counter_ns axis, "ok"), or (None, typed reason): no stamp, or a stamp of any other shape, is the ABSENCE of child-side evidence, never a number.
     The two figures are ONE-SIDED integer bounds (sol r1 on 9265be72 B2): the exit rounds DOWN and the start rounds UP, so `exit_ns - start_ns` is never more than the real run, and the gap to a
     marker (`exit_ns - _ident_marker_ns(.., up=True)`) never more than the real gap. Flooring both could lift a 14.9999999995 s gap to the 15 s limit and turn it into an over verdict."""
-    try:
-        start = start_path.read_text(encoding="ascii").split()
-    except (OSError, UnicodeDecodeError) as exc:
-        return None, f"no child start stamp ({type(exc).__name__})"
+    start_text, start_exc = start_read
+    if start_text is None:
+        return None, f"no child start stamp ({type(start_exc).__name__})"
+    start = start_text.split()
     try:
         exit_raw = exit_path.read_text(encoding="ascii").strip()
     except (OSError, UnicodeDecodeError) as exc:
@@ -11682,14 +11705,18 @@ def _ident_read_child_stamps(start_path: Path, exit_path: Path) -> tuple:
 
 
 def _ident_start_stamp(start_path: Path) -> tuple | None:
+    return _ident_start_stamp_of(_ident_read_start_once(start_path))
+
+
+def _ident_start_stamp_of(start_read: tuple) -> tuple | None:
     """adversary A1 on e584171e and again on 4538d581: the child's START stamp read on its own, `(QueryPerformanceFrequency, exact start ns)`. `_ident_read_child_stamps` returns no stamps at all when
     the EXIT stamp is missing, empty, malformed or reversed, and with them went everything the start stamp alone proves: a marker on another clock (the frequency check) and a first statement AFTER
     the child's own end marker or after the parent saw the process end (the order checks). One child has one frequency and one first statement whatever became of its exit stamp. None when the start
     stamp is absent or of any other shape (nothing to compare the marker with)."""
-    try:
-        start = start_path.read_text(encoding="ascii").split()
-    except (OSError, UnicodeDecodeError):
+    start_text, _exc = start_read
+    if start_text is None:
         return None
+    start = start_text.split()
     if len(start) != 2 or not all(re.fullmatch(r"\d{1,18}", x) for x in start) or int(start[1]) == 0:
         return None
     return int(start[1]), _IdentFraction(int(start[0]) * 1_000_000_000, int(start[1]))
@@ -12017,8 +12044,7 @@ class IdentityProbeMixin:
         self.last_wall_s = _IdentWallS.of_ns(self.last_wall_end_ns - wall_started_ns)   # r4 (sol r3 B1): a float that keeps its exact ns count
         self.last_child_exit_ns, self.last_child_exit_note = proc.child_exit_ns, proc.child_exit_note   # r4: the END of the child, which the parent's own end read is not
         self.last_child_start_ns = proc.child_start_ns   # r5: its START, which the parent's own start (wall_started_ns) is not: the parent may be delayed before it even launches the child
-        self.last_child_qpc, self.last_child_qpc_note = (_ident_read_child_stamps(qpc_start, qpc_exit) if timing else (None, "no child stamp: the timing seam is off"))
-        self.last_child_start = _ident_start_stamp(qpc_start) if timing else None   # adversary A1 on e584171e / 4538d581: kept even when the exit stamp is unreadable
+        self.last_child_qpc, self.last_child_qpc_note, self.last_child_start = (_ident_read_child_evidence(qpc_start, qpc_exit) if timing else (None, "no child stamp: the timing seam is off", None))   # adversary A1 on e584171e / 4538d581: the lone start is kept even when the exit stamp is unreadable; sol r5 B1: both from ONE read of the start file
         self.last_stderr = proc.stderr
         self.last_timing = _parse_probe_timing(proc.stderr)
         lines = [ln for ln in proc.stdout.splitlines() if ln.startswith("VENUE_QUIET=")]
@@ -13376,6 +13402,54 @@ class VenueProbeIdentityCallDeadlineTests(IdentityProbeMixin, unittest.TestCase)
         self._set_clocks(1.0, None, 2.0)
         self.last_timing = _parse_probe_timing("VENUE_PROBE_INTERNAL_MS=1500 abandoned=1 end_qpc=1000000000 qpc_hz=10000000")
         self.last_wall_end_ns, self.last_child_qpc, self.last_child_start = 100_100_000_000, None, _ident_start_stamp(start)
+        self.assertEqual(self.exit_hold_verdict()[:2], ("pass", 0.1))
+
+    def test_r6_sol_b1_a_failed_second_read_of_the_start_stamp_cannot_drop_start_evidence_already_observed(self) -> None:
+        # sol r5 on 4f16d8c2 B1: the start file was read once for the pair and AGAIN for the lone start. A first read that succeeded, an exit stamp that was unreadable and a second start read that failed
+        # (PermissionError, FileNotFoundError, UnicodeDecodeError) left no start evidence at all, so a marker on another clock (5 MHz against the child's 10 MHz) and a start AFTER the marker read as passes.
+        # This drives the orchestration's OWN assignments to the `last_child_*` fields, lifted from run_identity_probe by AST, with a start file whose read FAILS after its first success.
+        func = ast.parse(textwrap.dedent(inspect.getsource(IdentityProbeMixin.run_identity_probe))).body[0]
+        fields = {"last_child_qpc", "last_child_qpc_note", "last_child_start"}
+
+        def targets(node):
+            return [e for t in node.targets for e in (t.elts if isinstance(t, ast.Tuple) else [t])]
+        assigns = sorted((n for n in ast.walk(func) if isinstance(n, ast.Assign) and any(isinstance(t, ast.Attribute) and t.attr in fields for t in targets(n))), key=lambda n: n.lineno)
+        self.assertTrue(assigns, "the orchestration no longer assigns the child stamps: the lift found nothing")
+        code = compile(ast.fix_missing_locations(ast.Module(body=assigns, type_ignores=[])), "<run_identity_probe child-stamp assignments>", "exec")
+
+        class _ReadsThen:
+            def __init__(self, *outcomes):
+                self.outcomes = list(outcomes)
+
+            def read_text(self, encoding=None):
+                outcome = self.outcomes.pop(0) if self.outcomes else self.outcomes_last
+                self.outcomes_last = outcome
+                if isinstance(outcome, BaseException):
+                    raise outcome
+                return outcome
+        second_reads = (PermissionError("denied"), FileNotFoundError("gone"), UnicodeDecodeError("ascii", b"\xff", 0, 1, "not ascii"))
+        rows = (("100000000 10000000", 100_000_000, 5_000_000, 30 * 10**9, "frequenc"),                          # marker on 5 MHz, child on 10 MHz
+                ("1000500000 10000000", 1_000_000_000, 10_000_000, 100_100_000_000, "AFTER its own end marker"))   # child's first statement (100.05 s) after its marker (100 s)
+        for start_text, marker_ticks, marker_hz, parent_end_ns, why in rows:
+            for second in second_reads:
+                ns = types.SimpleNamespace()
+                exec(code, globals(), {"self": ns, "timing": True, "qpc_start": _ReadsThen(start_text, second), "qpc_exit": _ReadsThen(FileNotFoundError("no exit stamp"))})
+                self._set_clocks(1.0, None, 2.0)
+                self.last_timing = _parse_probe_timing(f"VENUE_PROBE_INTERNAL_MS=1500 abandoned=1 end_qpc={marker_ticks} qpc_hz={marker_hz}")
+                self.last_wall_end_ns, self.last_child_qpc, self.last_child_start = parent_end_ns, ns.last_child_qpc, ns.last_child_start
+                self.assertIsNone(ns.last_child_qpc, "the exit stamp is unreadable: no pair")
+                self.assertIsNotNone(ns.last_child_start, (start_text, type(second).__name__, "the start stamp read the first time was dropped"))
+                with self.assertRaises(AssertionError, msg=(start_text, type(second).__name__)) as ctx:
+                    self.exit_hold_verdict()
+                self.assertIn(why, str(ctx.exception))
+                with self.assertRaises(AssertionError):
+                    self.timing_verdicts(2.0)
+        # the control: a consistent start (990000000 ticks at 10 MHz, marker 100 s on the same clock) with an unreadable exit stamp and a failing second read is still a measurement (an upper bound)
+        ns = types.SimpleNamespace()
+        exec(code, globals(), {"self": ns, "timing": True, "qpc_start": _ReadsThen("990000000 10000000", PermissionError("denied")), "qpc_exit": _ReadsThen(FileNotFoundError("no exit stamp"))})
+        self._set_clocks(1.0, None, 2.0)
+        self.last_timing = _parse_probe_timing("VENUE_PROBE_INTERNAL_MS=1500 abandoned=1 end_qpc=1000000000 qpc_hz=10000000")
+        self.last_wall_end_ns, self.last_child_qpc, self.last_child_start = 100_100_000_000, ns.last_child_qpc, ns.last_child_start
         self.assertEqual(self.exit_hold_verdict()[:2], ("pass", 0.1))
 
     def test_r5_adversary_a2_the_limit_is_judged_as_the_decimal_it_prints_as_not_as_its_binary_float(self) -> None:
