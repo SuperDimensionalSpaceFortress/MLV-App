@@ -799,28 +799,31 @@ def item_heading(item: dict) -> str:
 _FIELD_KEY_ALT = "|".join(CARD_FIELDS)
 _PLAIN_KEY_RE = re.compile(rf"(?P<key>{_FIELD_KEY_ALT}):")
 # The bold-bullet spelling of a field (`- **Check:**`, also `- **Applies to:**`) the way the bus validator reads it: the label
-# is trimmed, its whitespace folded, and compared case-insensitively (BOLD_LABELS in validate-cards.mjs).
-_BOLD_KEY_RE = re.compile(rf"- \*\*\s*(?P<key>{_FIELD_KEY_ALT}|applies\s+to)\s*:\*\*", re.IGNORECASE)
-_BOLD_LABEL_PREFIX_RE = re.compile(r"- \*\*[^*:]+:\*\*")
-# A CommonMark code span: a run of N backticks closes only on the next run of exactly N, so `a`, ``a ` b`` and ```a``` quote
-# and `a`` (one opening, two closing) does not.
-_CODE_SPAN_RE = re.compile(r"(?<!`)(`+)(?!`).*?(?<!`)\1(?!`)")
+# is trimmed, its whitespace folded, and compared case-insensitively (BOLD_LABELS in validate-cards.mjs). JS \s counts U+FEFF
+# as whitespace and Python's does not, so it is added.
+_WS = r"[\s﻿]"
+_BOLD_KEY_RE = re.compile(rf"- \*\*{_WS}*(?P<key>{_FIELD_KEY_ALT}|applies{_WS}+to){_WS}*:\*\*", re.IGNORECASE)
+# The one quotation the screen recognises: a field key written as a single-line, space-free backtick token that ends in the key
+# (`check:`, ``check:``, `touches/supersedes:`). It is a token pattern, not a markdown parser: a span with spaces in it, one
+# that crosses a line, or one opened by an escaped backtick is not recognised, so its key is refused (fail closed) and the
+# author rewords. Every parser-shaped exemption tried here (CommonMark spans, escapes, multi-line spans) was bypassed.
+_QUOTED_KEY_RE = re.compile(r"(?<![`\\\w])(`{1,3})(?!`)[A-Za-z0-9_./-]*(?:" + _FIELD_KEY_ALT + r"):\1(?!`)")
 
 
 def screen_card_field_keys(body: str) -> None:
     """Refuse a card with a known field key anywhere after the first position of a line. The bus validator reads a field only
     at the start of a line, so `...Claude hooks.check: on a hot host` is prose to it: the card then loses the field, or fails,
     only after it merges (06d1d11c, Grok G2 on #728). The key list is CARD_FIELDS, never a second copy. The heading line is
-    skipped; a line that opens with its own field (`rule:` or `- **check:**`) is scanned past that opening label, and any
-    other line (a continuation included) is scanned in full, since a key past column 0 is fused into the text before it.
-    A key inside a code span (_CODE_SPAN_RE) is a quoted literal (`touches/supersedes:`), not a field, and is blanked first
-    (same width, so the reported column holds); a backtick run that nothing closes hides nothing. Lines split on "\\n" only
-    (CRLF read as LF), as the bus validator splits them: str.splitlines() also breaks on \\x85, U+2028 and friends, which
-    turned `x<U+0085>applies: y` into a fictitious line that opens with its own field."""
+    skipped; a line that opens with its own field (`rule:` or `- **check:**`, a real field label) is scanned past that opening
+    label, and any other line (a continuation, or a bold note such as `- **hooks.check:**`) is scanned in full, since a key
+    past column 0 is fused into the text before it. A quoted token (_QUOTED_KEY_RE) is blanked first (same width, so the
+    reported column holds). Lines split on "\\n" only (CRLF read as LF), as the bus validator splits them: str.splitlines()
+    also breaks on \\x85, U+2028 and friends, which turned `x<U+0085>applies: y` into a fictitious line that opens with its
+    own field."""
     rows = body.lstrip().replace("\r\n", "\n").split("\n")
     for n, row in enumerate(rows[1:], start=2):
-        row = _CODE_SPAN_RE.sub(lambda s: " " * len(s.group(0)), row)
-        opening = _BOLD_LABEL_PREFIX_RE.match(row) or _PLAIN_KEY_RE.match(row)
+        row = _QUOTED_KEY_RE.sub(lambda s: " " * len(s.group(0)), row)
+        opening = _BOLD_KEY_RE.match(row) or _PLAIN_KEY_RE.match(row)
         start = opening.end() if opening else 0
         for m in (_PLAIN_KEY_RE.search(row, start), _BOLD_KEY_RE.search(row, start)):
             if m:

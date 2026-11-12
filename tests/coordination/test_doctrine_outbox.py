@@ -3070,7 +3070,7 @@ def test_validate_accepts_a_field_key_quoted_in_a_code_span_and_refuses_one_afte
 
 @pytest.mark.parametrize("quoted", [
     "use ``check:`` as the label",             # A1: a double-backtick span is a quotation
-    "use ``a ` b check: c`` as the label",     # a longer span may hold a single backtick
+    "use `x/check:` as the label",            # a path-like token ending in the key (the committed `touches/supersedes:` form)
     "use ```check:``` as the label",
     "`a` and ``rule:`` and ```supersedes:```",
 ])
@@ -3113,6 +3113,39 @@ def test_validate_does_not_start_a_new_line_at_a_separator_the_bus_validator_doe
     body = CARD_BODY.replace("rule: the rule\n", f"rule: x{sep}applies: mlv-app\n", 1)
     assert ob.main(["--repo", str(tmp_path), "validate", str(_write_card_item(tmp_path, body))]) == 1
     assert "FIELD_KEY_FUSED" in capsys.readouterr().err
+
+
+# Adversary pass 2 on 5f15cf63 (sol): the exemption is a quoted single-line, space-free TOKEN ending in the key, not a parsed
+# markdown span (A1 escaped opener, A2 spans across lines), a bold label is exempt only when it IS a field label (A4), and
+# the label whitespace is the JS one, U+FEFF included (A3). Anything the exemption does not recognise is refused: fail closed.
+
+@pytest.mark.parametrize("fused", [
+    "x \\` check: fused `",                                  # A1: an escaped opener is not a span
+    "x \\`a` check: fused `",
+    "use `start\n  end` check: fused `tail\n  close`",       # A2: spans across physical lines expose the text between them
+    "use `check:\n  value` as a label",                      # A2: a key in a span that crosses lines is not a quoted token
+    "use `a check: b` as a label",                           # a span with spaces is not a quoted token either
+    "x - **APPLIES﻿TO:** mlv-app",                      # A3: U+FEFF is whitespace to the bus validator
+    "x - **﻿check﻿:** y",
+])
+def test_validate_refuses_what_the_quoted_token_exemption_does_not_recognise(tmp_path, capsys, fused):
+    body = CARD_BODY.replace("rule: the rule\n", f"rule: {fused}\n", 1)
+    assert ob.main(["--repo", str(tmp_path), "validate", str(_write_card_item(tmp_path, body))]) == 1
+    assert "FIELD_KEY_FUSED" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("label", ["hooks.check", "x rule", "evidence list rule", "see supersedes"])
+def test_validate_scans_a_bold_note_label_that_is_not_a_field_label(tmp_path, capsys, label):
+    """A4: `- **hooks.check:** echo ok` is a NOTE to the bus validator (and the card then misses check); only a real field
+    label is exempt as the opening of its line."""
+    body = CARD_BODY.replace("check: py -3 -m pytest tests/coordination -q\n", f"- **{label}:** echo ok\n")
+    assert ob.main(["--repo", str(tmp_path), "validate", str(_write_card_item(tmp_path, body))]) == 1
+    assert "FIELD_KEY_FUSED" in capsys.readouterr().err
+
+
+def test_validate_still_accepts_a_bold_note_that_names_no_field_key(tmp_path):
+    body = CARD_BODY + "- **Guard:** none yet\n- **Outbox:** outbox:0123456789abcdef mlv-app:0123456789ab\n"
+    assert ob.main(["--repo", str(tmp_path), "validate", str(_write_card_item(tmp_path, body))]) == 0
 
 
 def test_validate_reads_a_crlf_card_as_lf(tmp_path):
