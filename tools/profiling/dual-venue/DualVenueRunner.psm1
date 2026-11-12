@@ -3070,8 +3070,14 @@ function Get-DvExposureBand {
     a malformed row anywhere makes the file malformed, so a relaxed row can never be picked from a file that has an ambiguous row beside it.
     #>
     param([string]$ClipId, [string]$Path = $script:ExposureBandsPath)
-    $fallback = $script:ExposureFallbackBand
-    $result = { param($source, $note, $band) [pscustomobject]@{ band = $band; source = $source; note = $note } }
+    # r5 (adversary 288559f1/a7424c18 A1): a FRESH band per call, copied field by field from the constant. Handing back the script-scope object itself let a
+    # caller that edited one result's .band (a floor of 0, a ceiling of 255) change the fallback every later clip is judged against. A row from the file is
+    # already built per call (ConvertTo-DvExposureRow); every fallback-* result below returns this copy, never the constant.
+    $fallback = [pscustomobject]@{
+        minMedianLuma = [double]$script:ExposureFallbackBand.minMedianLuma; maxMedianLuma = [double]$script:ExposureFallbackBand.maxMedianLuma
+        maxNearBlackFraction = [double]$script:ExposureFallbackBand.maxNearBlackFraction; maxClippedFraction = [double]$script:ExposureFallbackBand.maxClippedFraction
+    }
+    $result ={ param($source, $note, $band) [pscustomobject]@{ band = $band; source = $source; note = $note } }
     $unreadable = { param($e) (& $result 'fallback-unreadable' "the exposure band file cannot be read ($($e.GetType().Name)): the absolute fallback band judges" $fallback) }
     if ([string]::IsNullOrWhiteSpace($Path)) {
         return (& $result 'fallback-missing' "the exposure band file is missing ($Path): the absolute fallback band judges" $fallback)

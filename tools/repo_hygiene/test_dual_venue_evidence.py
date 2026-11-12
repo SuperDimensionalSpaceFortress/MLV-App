@@ -9696,6 +9696,46 @@ class VisualExposureFloorTests(unittest.TestCase):
         self.assertEqual(out["source"], "fallback-missing", out)
         self.assertIn("went away", out["note"])
 
+    def test_the_visual_exposure_band_fallback_result_is_a_fresh_object_a_caller_cannot_poison(self) -> None:
+        # r5 (adversary 288559f1/a7424c18 A1): every fallback-* result carried the ONE $script:ExposureFallbackBand object, so a caller that edited a first result's
+        # .band (a floor of 0, a ceiling of 255) changed the band that every LATER clip was judged against. Each call now builds its own band from the constant.
+        # Every fallback source is covered (no path, absent file, empty file, malformed JSON, a valid file with no row for the clip, a clip whose row is malformed).
+        with tempfile.TemporaryDirectory(prefix="vis-exp-fresh-", ignore_cleanup_errors=True) as d:
+            files = {"empty": "", "malformed": "{not json", "norow": '{"clips": {"other": {"minMedianLuma": 5}}}', "badrow": '{"clips": {"c": {"minMedianLuma": "x"}}}'}
+            for name, text in files.items():
+                (Path(d) / f"{name}.json").write_text(text, encoding="utf-8")
+            absent = Path(d) / "absent-dir" / "bands.json"
+            script = (
+                "$cases = [ordered]@{ "
+                f"missing = '{absent}'; empty = '{Path(d) / 'empty.json'}'; malformed = '{Path(d) / 'malformed.json'}'; "
+                f"norow = '{Path(d) / 'norow.json'}'; badrow = '{Path(d) / 'badrow.json'}' }}; "
+                "$out = [ordered]@{}; "
+                "foreach ($k in $cases.Keys) { "
+                "  $first = Get-DvExposureBand -ClipId 'c' -Path $cases[$k]; "
+                "  $source = $first.source; "
+                "  $first.band.minMedianLuma = 0.0; $first.band.maxMedianLuma = 255.0; $first.band.maxNearBlackFraction = 1.0; $first.band.maxClippedFraction = 1.0; "
+                "  $second = Get-DvExposureBand -ClipId 'c' -Path $cases[$k]; "
+                "  $v = Get-DvVisualVerdict -Requested $true -Captured $true -PlayFrames 6 -DistinctContentHashes 6 -AppDistinctDisplayFrames 6 -FlatPlayFrames 0 "
+                "       -PlayVsPausedMeanAbsDiff 1.0 -SamePosition $true -ExposureMedianLuma 7.0 -ExposureMedianNearBlackFraction 0.84 -ExposureMedianClippedFraction 0.0 "
+                "       -ExposureBand $second.band -ExposureBandSource $second.source; "
+                "  $out[$k] = [pscustomobject]@{ source = $source; secondSource = $second.source; band = $second.band; same = [object]::ReferenceEquals($first.band, $second.band); verdict = $v.verdict } "
+                "} "
+                "$none = Get-DvExposureBand -ClipId 'c' -Path ''; $none.band.minMedianLuma = 0.0; $none2 = Get-DvExposureBand -ClipId 'c' -Path ''; "
+                "$out['nopath'] = [pscustomobject]@{ source = $none.source; secondSource = $none2.source; band = $none2.band; same = [object]::ReferenceEquals($none.band, $none2.band); verdict = 'n/a' }; "
+                "$out | ConvertTo-Json -Depth 5 -Compress")
+            proc, out = run_pwsh_json(script)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIsNotNone(out, proc.stdout + proc.stderr)
+        self.assertEqual(set(out), {"missing", "empty", "malformed", "norow", "badrow", "nopath"}, out)
+        for name, row in out.items():
+            self.assertTrue(row["source"].startswith("fallback-"), (name, row))
+            self.assertEqual(row["secondSource"], row["source"], (name, row))
+            self.assertFalse(row["same"], f"{name}: the two results share one band object")
+            self.assertEqual((row["band"]["minMedianLuma"], row["band"]["maxMedianLuma"], row["band"]["maxNearBlackFraction"], row["band"]["maxClippedFraction"]),
+                             (16, 255, 0.6, 0.05), f"{name}: a caller's edit of the first result changed the second one's band: {row['band']}")
+            if name != "nopath":
+                self.assertEqual(row["verdict"], "EXPOSURE_OUT_OF_RANGE", f"{name}: the second clip must still be judged against the shipped fallback limits")
+
     @requires_windows_imaging
     def test_the_visual_reader_keeps_the_leg_measured_when_the_band_file_is_unreadable_under_stop(self) -> None:
         # sol r2 B1, runner level: the reader is what Invoke-VenueLeg calls on the measured run and on a self-heal pre-launch; an unreadable band file there
