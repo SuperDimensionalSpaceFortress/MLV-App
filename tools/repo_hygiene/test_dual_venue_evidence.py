@@ -11618,11 +11618,10 @@ def _ident_read_child_stamps(start_path: Path, exit_path: Path) -> tuple:
         return None, f"no child exit stamp: its ProcessExit handler never ran ({type(exc).__name__})"
     if len(start) != 2 or not all(re.fullmatch(r"\d{1,18}", s) for s in (*start, exit_raw)) or int(start[1]) == 0:
         return None, f"malformed child stamp (start={' '.join(start)[:60]!r}, exit={exit_raw[:40]!r})"
-    hz = int(start[1])
-    start_ns, exit_ns = int(start[0]) * 1_000_000_000 // hz, int(exit_raw) * 1_000_000_000 // hz
-    if exit_ns < start_ns:
-        return None, f"malformed child stamp: its exit stamp is {(start_ns - exit_ns) / 1e9:.3f} s BEFORE its start stamp"
-    return (start_ns, exit_ns), "ok"
+    start_ticks, exit_ticks, hz = int(start[0]), int(exit_raw), int(start[1])
+    if exit_ticks < start_ticks:   # adversary A1 on 636642d6: compared in TICKS, before the ns floor can make two different stamps equal
+        return None, f"malformed child stamp: its exit stamp is {start_ticks - exit_ticks} ticks ({(start_ticks - exit_ticks) / hz:.3f} s) BEFORE its start stamp"
+    return (start_ticks * 1_000_000_000 // hz, exit_ticks * 1_000_000_000 // hz), "ok"
 
 
 def _ident_win32_clock():
@@ -13099,7 +13098,8 @@ class VenueProbeIdentityCallDeadlineTests(IdentityProbeMixin, unittest.TestCase)
         self.assertEqual(_ident_read_child_stamps(start, end), ((100_000, 2_100_000), "ok"))
         for s_text, e_text, why in (("1000 10000000", None, "ProcessExit handler never ran"), (None, "21000", "no child start stamp"), ("1000", "21000", "malformed"),
                                     ("1000 0", "21000", "malformed"), ("1000 10000000", "-5", "malformed"), ("1000 10000000", "2e4", "malformed"), ("1000 10000000", "9" * 30, "malformed"),
-                                    ("21000 10000000", "1000", "BEFORE its start stamp")):
+                                    ("21000 10000000", "1000", "BEFORE its start stamp"),
+                                    ("2 999999999999999999", "1", "BEFORE its start stamp")):   # adversary A1 on 636642d6: both floor to 0 ns, the ticks still say exit < start
             for f, text in ((start, s_text), (end, e_text)):
                 f.unlink(missing_ok=True)
                 if text is not None:
