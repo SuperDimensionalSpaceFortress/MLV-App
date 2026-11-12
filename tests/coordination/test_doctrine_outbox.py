@@ -3744,3 +3744,84 @@ def test_check_commits_refuses_a_128000_character_word_at_the_cap_before_the_law
     failures, took = _timed(lambda: ob.check_commits(src, f"{base}..HEAD", []))
     assert [p for ps in failures.values() for p in ps if "CARD_INVALID" in p]
     assert took < _PRE_CAP_BUDGET_S, f"{took:.1f}s"
+
+
+# ---------- r5: a whitespace-only row before the heading is skipped as the bus skips it (adversary pass on 36e4753f A1) ----------
+#
+# A1: a standalone U+0085 (or U+001C..U+001F) row between the front matter and the heading is accepted by the base (Python's
+# str.lstrip() eats it) and by the bus (parseCardsFile ignores any non-card-like row before the first card), but r3's row split
+# kept it and card_heading_row took it as the heading: ITEM_BODY_NOT_A_CARD. A row is blank, to be skipped, when EITHER Python's
+# strip() or JavaScript's trim() empties it (one rule, _is_blank_row, shared by every site that reads the card's rows).
+#
+# Named mutation for this block (turns the named tests red, then is reverted):
+#   M24 skip only the rows JS trim() empties again (the 36e4753f rule) -> every U+0085 / U+001C..U+001F row below
+
+# standalone rows: first those Python's strip() empties and JavaScript's trim() does not (A1), then rows both empty, then JS-only
+_PREAMBLE_ROWS = ["\x85", "\x1c", "\x1d", "\x1e", "\x1f", "\x85\x85", " \x85 ", "\x1c\x1d\x1e\x1f", "\t\x85", "\x85\ufeff", "\ufeff", "\ufeff\x1c",
+                  "\u2003", "\xa0", " ", "\x0b", "\u2028"]
+
+
+def _preamble_card(row: str) -> str:
+    return row + "\n" + CARD_BODY
+
+
+@needs_node
+def test_a_whitespace_only_preamble_row_is_judged_as_the_bus_judges_it(tmp_path):
+    cards = [_preamble_card(r) for r in _PREAMBLE_ROWS]
+    js = _node(_JS_CARD_ERRORS, cards)
+    assert all(not errors for errors in js), "the bus no longer ignores one of these rows; the table is stale"
+    bad = []
+    for n, (row, card) in enumerate(zip(_PREAMBLE_ROWS, cards)):
+        item = _write_card_item(tmp_path, card, f"20261112-pre{n}.md")
+        if ob.main(["--repo", str(tmp_path), "validate", str(item)]) != 0:
+            bad.append(repr(row))
+    assert not bad, f"the bus accepts these and validate refuses them: {bad}"
+
+
+@needs_node
+def test_validate_never_accepts_a_preamble_row_the_bus_would_read_as_a_card_field(tmp_path):
+    rows = ["check: echo ok", "- **check:** x", "### Entry", "\x85check: x", "\ufeff### Entry"]
+    cards = [_preamble_card(r) for r in rows]
+    js = _node(_JS_CARD_ERRORS, cards)
+    for n, (row, card, errors) in enumerate(zip(rows, cards, js)):
+        item = _write_card_item(tmp_path, card, f"20261112-bad{n}.md")
+        if ob.main(["--repo", str(tmp_path), "validate", str(item)]) == 0:
+            assert not errors, f"validate accepted {row!r}, which the bus rejects: {errors[:1]}"
+
+
+@pytest.mark.parametrize("row", ["\x85", "\x1c", "\x1d", "\x1e", "\x1f"])
+def test_every_reader_accepts_a_standalone_python_only_whitespace_row_before_the_heading(tmp_path, capsys, row):
+    body = _preamble_card(row)
+    # validate (the working-tree reader)
+    assert ob.main(["--repo", str(tmp_path), "validate", str(_write_card_item(tmp_path, body))]) == 0, capsys.readouterr().err
+    # the committed-blob readers: check_commits, check_commit_bare, load_outbox_items, _item_key
+    (tmp_path / "r").mkdir()
+    src, base = _range_repo(tmp_path / "r")
+    name = "20261112-preamble-card.md"
+    sha = _commit(src, {f"doctrine-outbox/{name}": item_text(target=CARDS, body=body)},
+                  f"add a card with a {row!r} preamble row\n\nDoctrine-Export: outbox {name}")
+    assert not [p for ps in ob.check_commits(src, f"{base}..HEAD", []).values() for p in ps]
+    # the bare reader also judges the trailer form (`outbox <name>` is not a bare-mode value); only the card's own verdict is asked here
+    assert [p for p in ob.check_commit_bare(src, sha, []) if "ITEM_" in p or "CARD" in p or "FIELD_KEY" in p] == []
+    (entry,) = [e for e in ob.load_outbox_items(src, "HEAD") if e["name"] == name]
+    assert "item" in entry, entry
+    keyed = ob._item_key(src, "HEAD", f"doctrine-outbox/{name}")
+    assert keyed is not None
+    item, key = keyed
+    assert key == ob.idempotency_key(ob.added_in(src, "HEAD", f"doctrine-outbox/{name}"), CARDS, item["body"])
+
+
+def test_card_heading_row_and_card_rows_share_one_blank_row_rule():
+    for row in ["\x85", "\x1c", "\ufeff", "\x85\ufeff", " \t"]:
+        body = row + "\n" + CARD_BODY
+        assert ob.card_heading_row(body) == "## mlv-app/example-card", repr(row)
+        assert ob._card_rows(body)[0] == "## mlv-app/example-card", repr(row)
+        assert ob._is_blank_row(row), repr(row)
+    assert not ob._is_blank_row("x") and not ob._is_blank_row("\u200b") and not ob._is_blank_row("\x85x")
+
+
+def test_a_non_whitespace_preamble_row_is_still_refused(tmp_path, capsys):
+    for n, row in enumerate(["\u200b", "\u2060", "\u180e", "note"]):
+        item = _write_card_item(tmp_path, _preamble_card(row), f"20261112-junk{n}.md")
+        assert ob.main(["--repo", str(tmp_path), "validate", str(item)]) == 1, repr(row)
+        assert "ITEM_BODY_NOT_A_CARD" in capsys.readouterr().err

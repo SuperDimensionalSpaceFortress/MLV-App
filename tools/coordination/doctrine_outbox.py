@@ -880,13 +880,27 @@ _QUOTED_KEY_RE = re.compile(r"(?<![`\\\w])(`+)(?!`)[^\s`]*(?:" + _FIELD_KEY_ALT 
 _QUOTE_MASK = "\x00"
 
 
+# Every character either JavaScript's trim() or Python's strip() removes: the union, so a row that mixes the two classes
+# (U+0085 then U+FEFF, which neither rule empties alone) is blank too.
+_BLANK_ROW_CHARS = _JS_WS_CHARS + "".join(c for c in map(chr, range(0x10000)) if c.isspace() and c not in _JS_WS_CHARS)
+
+
+def _is_blank_row(row: str) -> bool:
+    """True for a row to skip before the card heading: one made only of characters JavaScript's trim() or Python's strip() removes
+    (_BLANK_ROW_CHARS). The bus ignores any row before its first card that is not card-like, so a row of only U+0085 or
+    U+001C-U+001F (which trim() keeps and str.strip() drops) is no card text to it, and the base read the heading past it with
+    body.lstrip() (adversary pass on 36e4753f A1). One test here, so every site that reads a card's rows skips the same rows; a
+    row with any other character, such as U+200B, is not blank and is still refused as the heading."""
+    return not row.strip(_BLANK_ROW_CHARS)
+
+
 def _card_rows(body: str) -> list[str]:
-    """The body's rows as the bus validator splits them: "\\n" only (CRLF read as LF), with the blank rows before the heading
-    dropped. A blank row is one JS trim() empties; whitespace ON the heading row is kept, because the bus reads `## ` only at
-    the start of its line and rejects `  ## x` as card-like text outside a card."""
+    """The body's rows as the bus validator splits them: "\\n" only (CRLF read as LF), with the blank rows (_is_blank_row) before
+    the heading dropped. Whitespace ON the heading row is kept, because the bus reads `## ` only at the start of its line and
+    rejects `  ## x` as card-like text outside a card."""
     rows = body.replace("\r\n", "\n").split("\n")
     first = 0   # an index, not rows.pop(0) in a loop: front removals are quadratic on a body of many blank rows (Sol r3 B2)
-    while first < len(rows) and not rows[first].strip(_JS_WS_CHARS):
+    while first < len(rows) and _is_blank_row(rows[first]):
         first += 1
     return rows[first:]
 
