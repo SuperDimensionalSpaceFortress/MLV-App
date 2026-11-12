@@ -12648,6 +12648,16 @@ class ReconReleaseDeferredEvidenceTests(unittest.TestCase):
                 v = self.verdict(spec, self.log(self.record("1") + " extra=1"))
                 self.assertEqual((v["verdict"], v["blocks"]), ("NOT_HONOURED", True), v)
 
+    def test_a_tab_after_the_session_is_a_mention_that_is_unreadable(self) -> None:
+        # r8 (r7 adversary advisory A1 on 4adc11c9): the mention regex took only an ASCII space after session=<n>, so a TAB-separated record was skipped and a
+        # leg that does not ask read NOT_REQUESTED/blocks=false instead of rejecting unreadable evidence (and an asking leg read ROUTE_NOT_ENGAGED).
+        for name, spec, record in (("asks, lever off", self.OFF, self.record("0", deferred="0")), ("does not ask, lever on", {}, self.record("1")),
+                                   ("does not ask, lever off", {}, self.record("0", deferred="0"))):
+            with self.subTest(case=name):
+                v = self.verdict(spec, self.log(record.replace("session=3 ", "session=3\t")))
+                self.assertEqual((v["verdict"], v["blocks"], v["observed"]), ("NOT_HONOURED", True, None), v)
+                self.assertIn("unreadable", v["reason"])
+
     def test_the_head_arm_reads_its_counts(self) -> None:
         v = self.verdict({}, self.log(self.record("1", deferred="412")))
         self.assertEqual(v["observed"], 1)
@@ -12737,6 +12747,15 @@ class PrepConflatedMoveEvidenceTests(unittest.TestCase):
         v = self.verdict(self.ON, self.log())
         self.assertEqual((v["verdict"], v["blocks"]), ("NOT_HONOURED", True), v)
         self.assertIn("ROUTE_NOT_ENGAGED", v["reason"])
+
+    def test_a_tab_after_the_session_is_a_mention_that_is_unreadable(self) -> None:
+        # HFR-NATIVE-M16-1457-GUI-TEXTURE-PRESENT-OFFLOAD-1 r8 (r7 adversary advisory A1, sibling :1773): a TAB after session=<n> was not a mention, so a leg
+        # that does not ask read NOT_REQUESTED/blocks=false on an unreadable record (and an asking leg read ROUTE_NOT_ENGAGED).
+        for name, spec, record in (("asks, switch on", self.ON, self.route("1")), ("does not ask, switch on", {}, self.route("1"))):
+            with self.subTest(case=name):
+                v = self.verdict(spec, self.log(record.replace("session=3 ", "session=3\t")))
+                self.assertEqual((v["verdict"], v["blocks"], v["observed"]), ("NOT_HONOURED", True, None), v)
+                self.assertIn("unreadable", v["reason"])
 
     def test_a_start_line_field_is_never_read_as_engagement(self) -> None:
         # r2 (adversary A1): the start line carries launcher env values, so a field there is not the app's decision.
