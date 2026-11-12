@@ -3940,3 +3940,54 @@ def test_an_even_backslash_prefix_leaves_the_run_real_so_the_later_quotation_sti
 def test_an_escaped_run_after_the_quotation_does_not_unquote_it(tmp_path):
     body = CARD_BODY.replace("rule: the rule\n", "rule: x `check:` then \`a` ok\n", 1)
     assert ob.main(["--repo", str(tmp_path), "validate", str(_write_card_item(tmp_path, body))]) == 0
+
+
+# ---------- r6 fix 2: adversary pass on 0a19848c (A1 a lone shorter run between equal runs, A2 a span that crosses rows) ----------
+#
+# A1: in ``a`!``check:`` the lone run is skipped by the first pair (a code span closes only on an EQUAL run), so the next double run
+# is a CLOSER and `check:` is bare. Counting runs read it as an opener. A2: `x `a` then, on the next row, `!`check:` is one span
+# across the two rows: the row's own count restarted at zero and masked `check:`. A token is masked only when the CommonMark pairing
+# of the row's runs makes its opening run an opener; a run with no partner in the row (or an escaped one) stops masking from there
+# on, in this row and every later one.
+#
+# Named mutation for this block (turns the named tests red, then is reverted):
+#   M28 count runs again (even/odd) and restart the count on every row -> every row below
+
+@pytest.mark.parametrize("key", ob.CARD_FIELDS)
+@pytest.mark.parametrize("rows", [
+    "rule: x ``a`!``{key}:`` git status\n",                       # A1: a 1-run skipped between a 2-run pair
+    "rule: x ```a``!```{key}:``` git status\n",                   # a 2-run skipped between a 3-run pair
+    "rule: x `a\n  !`{key}:` git status\n",                       # A2: the span crosses to the next row
+    "rule: x ``a\n  `!``{key}:`` git status\n",                   # A2 with an unequal run in between
+    "rule: x `a\n  and more\n  !`{key}:` git status\n",           # A2 across two rows
+    "rule: x ``a\ncheck: y `z`\n  !``{key}:`` git status\n",      # a later row after an unpaired run, whatever it holds
+])
+def test_validate_refuses_a_key_after_runs_that_pair_the_other_way_or_across_rows(tmp_path, capsys, rows, key):
+    body = CARD_BODY.replace("rule: the rule\n", rows.replace("{key}", key), 1)
+    assert ob.main(["--repo", str(tmp_path), "validate", str(_write_card_item(tmp_path, body))]) == 1
+    assert "FIELD_KEY_FUSED" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("row", [
+    "rule: ``a`b`` then ``check:`` ok\n",                         # a pair that contains a lone run, then a real quotation
+    "rule: `a` `check:` ``b`c`` `rule:` ok\n",
+    "rule: x ``a`!``y then `check:` ok\n",
+])
+def test_a_quotation_after_pairs_that_close_in_the_row_is_still_a_quotation(tmp_path, row):
+    body = CARD_BODY.replace("rule: the rule\n", row, 1)
+    assert ob.main(["--repo", str(tmp_path), "validate", str(_write_card_item(tmp_path, body))]) == 0
+
+
+@pytest.mark.parametrize("key", ob.CARD_FIELDS)
+def test_the_screen_refuses_the_crossing_and_skipped_run_rows_on_the_entry_every_reader_calls(key):
+    for rows in (f"rule: x ``a`!``{key}:`` git status\n", f"rule: x `a\n  !`{key}:` git status\n"):
+        with pytest.raises(ob.Refusal) as e:
+            ob.screen_card_field_keys(CARD_BODY.replace("rule: the rule\n", rows, 1))
+        assert e.value.code == "FIELD_KEY_FUSED"
+
+
+def test_the_run_pairing_is_linear_in_the_number_of_runs(tmp_path):
+    row = "rule: " + " ".join("`" * (1 + k % 40) for k in range(1500)) + " x\n"
+    t = time.monotonic()
+    ob._mask_quotations(row.rstrip("\n"))
+    assert time.monotonic() - t < 1.0

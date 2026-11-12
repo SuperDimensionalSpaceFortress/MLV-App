@@ -920,25 +920,47 @@ def _backslashes_before(row: str, pos: int) -> int:
     return n
 
 
-def _mask_quotations(row: str) -> str:
-    """`row` with each quoted key token (_QUOTED_KEY_RE) replaced by _QUOTE_MASK of the same width. A backtick run quotes only
-    when it OPENS: runs pair up left to right, so a token whose opening run has an odd number of runs before it follows an
-    unclosed or already-closed span and starts at a CLOSING run. In `x `!`check:` git`, the run after `!` closes the span `!`;
-    taking it as an opener masked a bare `check:` (adversary pass on b68df2a5 A1). That token is left in the row, so its key is
-    refused: fail closed, and the author rewords. A run preceded by an odd number of backslashes is escaped: it is text, not a
-    delimiter, and what an escaped backtick leaves behind (one literal backtick, then a shorter run) is not worth modelling. A
-    token after one is not masked at all, so its key is refused (Sol r5 B1: an escaped first run was counted, the pair read as
-    even, and a bare `check:` was masked). An EVEN number of backslashes is an escaped backslash and leaves the run real."""
+def _mask_quotations(row: str) -> tuple[str, bool]:
+    """`(masked, distrusted)`: `row` with each quoted key token (_QUOTED_KEY_RE) replaced by _QUOTE_MASK of the same width, and
+    whether the rows AFTER this one must be left unmasked. A token is masked only when its opening run really OPENS a code span:
+    the runs of the row pair as CommonMark pairs them (each run takes the next run of EQUAL length; the runs between are span
+    text), and only a run that takes a partner is an opener. Counting runs was wrong twice: in `x `!`check:` git` the run after
+    `!` closes a span, and in ``a`!``check:`` the lone run between equal-length runs is skipped, so the closing double run was
+    read as an opener and a bare `check:` was masked (adversary passes on b68df2a5 A1 and 0a19848c A1). A run with no partner in
+    the row, or one preceded by an odd number of backslashes (escaped: text, not a delimiter; Sol r5 B1), is not understood well
+    enough to model: it may pair with a run in a LATER row (a span crosses rows, adversary 0a19848c A2), so no token at or after
+    it is masked, in this row or any later one (`distrusted`). The token is left in the row, its key is refused (fail closed) and
+    the author rewords. An EVEN number of backslashes is an escaped backslash and leaves the run real."""
+    runs = list(_BACKTICK_RUN_RE.finditer(row))
+    n = len(runs)
+    stop = len(row) + 1   # no token starting at or after this column is masked
+    for r in runs:
+        if _backslashes_before(row, r.start()) % 2:
+            stop = r.start()
+            break
+    nxt: list[int | None] = [None] * n   # the next run of the same length, found right to left (linear in the runs)
+    seen: dict[int, int] = {}
+    for i in range(n - 1, -1, -1):
+        width = runs[i].end() - runs[i].start()
+        nxt[i] = seen.get(width)
+        seen[width] = i
+    openers, i = set(), 0
+    while i < n:
+        j = nxt[i]
+        if j is None:
+            stop = min(stop, runs[i].start())
+            break
+        openers.add(runs[i].start())
+        i = j + 1
     out, last = [], 0
     for m in _QUOTED_KEY_RE.finditer(row):
-        runs = list(_BACKTICK_RUN_RE.finditer(row, 0, m.start()))
-        if len(runs) % 2 or any(_backslashes_before(row, r.start()) % 2 for r in runs):
+        if m.start() >= stop or m.start() not in openers:
             continue
         out.append(row[last:m.start()])
         out.append(_QUOTE_MASK * (m.end() - m.start()))
         last = m.end()
     out.append(row[last:])
-    return "".join(out)
+    return "".join(out), stop <= len(row)
 
 
 def _card_rows(body: str) -> list[str]:
@@ -1009,10 +1031,15 @@ def screen_card_field_keys(body: str) -> None:
     read as LF), as the bus validator splits them: str.splitlines() also breaks on \\x85, U+2028 and friends, which turned
     `x<U+0085>applies: y` into a fictitious line that opens with its own field."""
     rows = _card_rows(body)
+    distrusted = False   # a code span may cross rows: once a row leaves a run unpaired, no later row masks a quotation
     for n, row in enumerate(rows[1:], start=2):
         parsed = _parse_field_line(row)
         start = parsed[2] if parsed and parsed[1] else 0
-        hit = _first_fused_key(_mask_quotations(row), start)
+        if distrusted:
+            masked = row
+        else:
+            masked, distrusted = _mask_quotations(row)
+        hit = _first_fused_key(masked, start)
         if hit:
             col, key = hit
             where = (f"is at column {col}, fused into other text; a field key starts its own line" if col else
