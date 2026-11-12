@@ -12658,6 +12658,39 @@ class ReconReleaseDeferredEvidenceTests(unittest.TestCase):
                 self.assertEqual((v["verdict"], v["blocks"], v["observed"]), ("NOT_HONOURED", True, None), v)
                 self.assertIn("unreadable", v["reason"])
 
+    # r8 adversary A1 (major, on ea16773f): a mention needed ONE literal space between the marker and session=, so a second, noncanonical record of the
+    # measured session (double space, TAB, other separator, reordered fields) was skipped and a conflicting duplicate read HONOURED. Every record body that
+    # names the marker and the measured session is a mention, whatever its separators or field order; only the canonical whole line is ever read.
+    NONCANONICAL = (("double space before session", lambda r: r.replace("recon_release session=", "recon_release  session=")),
+                    ("TAB before session", lambda r: r.replace("recon_release session=", "recon_release\tsession=")),
+                    ("no-break space before session", lambda r: r.replace("recon_release session=", "recon_release session=")),
+                    ("punctuation before session", lambda r: r.replace("recon_release session=", "recon_release:session=")),
+                    ("comma after the session", lambda r: r.replace("session=3 ", "session=3, ")),
+                    ("spaces around the equals sign", lambda r: r.replace("session=3 ", "session = 3 ")),
+                    ("session after the first field", lambda r: r.replace("session=3 deferred_enabled=", "deferred_enabled=").replace(" deferred=", " session=3 deferred=", 1)))
+
+    def test_a_noncanonical_duplicate_never_lets_a_conflicting_record_pass(self) -> None:
+        for name, mangle in self.NONCANONICAL:
+            with self.subTest(case=name):
+                v = self.verdict(self.OFF, self.log(self.record("0", deferred="0"), mangle(self.record("1"))))
+                self.assertEqual((v["verdict"], v["blocks"], v["observed"]), ("NOT_HONOURED", True, None), v)
+                self.assertIn("unreadable", v["reason"])
+
+    def test_a_noncanonical_record_alone_is_unreadable_for_every_leg(self) -> None:
+        for name, mangle in self.NONCANONICAL:
+            for spec in (self.OFF, {}):
+                with self.subTest(case=name, spec=spec):
+                    v = self.verdict(spec, self.log(mangle(self.record("0", deferred="0"))))
+                    self.assertEqual((v["verdict"], v["blocks"], v["observed"]), ("NOT_HONOURED", True, None), v)
+                    self.assertIn("unreadable", v["reason"])
+
+    def test_another_sessions_noncanonical_record_is_not_a_mention(self) -> None:
+        # The widening is scoped to the measured session: session=31 or session=2 in any shape is another session, never this one's record.
+        for name, record in (("session 31", self.record("0", session=31)), ("session 2, double space", self.record("0", session=2).replace(" session=", "  session="))):
+            with self.subTest(case=name):
+                v = self.verdict({}, self.log(self.record("1"), record))
+                self.assertEqual((v["verdict"], v["blocks"], v["observed"]), ("NOT_REQUESTED", False, 1), v)
+
     def test_the_head_arm_reads_its_counts(self) -> None:
         v = self.verdict({}, self.log(self.record("1", deferred="412")))
         self.assertEqual(v["observed"], 1)
@@ -12756,6 +12789,19 @@ class PrepConflatedMoveEvidenceTests(unittest.TestCase):
                 v = self.verdict(spec, self.log(record.replace("session=3 ", "session=3\t")))
                 self.assertEqual((v["verdict"], v["blocks"], v["observed"]), ("NOT_HONOURED", True, None), v)
                 self.assertIn("unreadable", v["reason"])
+
+    def test_a_noncanonical_duplicate_never_lets_a_conflicting_record_pass(self) -> None:
+        # r8 adversary A1 sibling (:1773): a canonical active record plus a double-spaced (TAB, punctuated, reordered) inactive one read HONOURED.
+        for name, mangle in (("double space before session", lambda r: r.replace("prep_route session=", "prep_route  session=")),
+                             ("TAB before session", lambda r: r.replace("prep_route session=", "prep_route\tsession=")),
+                             ("punctuation before session", lambda r: r.replace("prep_route session=", "prep_route:session=")),
+                             ("spaces around the equals sign", lambda r: r.replace("session=3 ", "session = 3 ")),
+                             ("session after the field", lambda r: "playback_smoke.prep_route prep_conflated_move_active=0 session=3")):
+            for spec, canonical in ((self.ON, self.route("1")), ({}, self.route("0"))):
+                with self.subTest(case=name, spec=spec):
+                    v = self.verdict(spec, self.log(canonical, mangle(self.route("0" if spec else "1"))))
+                    self.assertEqual((v["verdict"], v["blocks"], v["observed"]), ("NOT_HONOURED", True, None), v)
+                    self.assertIn("unreadable", v["reason"])
 
     def test_a_start_line_field_is_never_read_as_engagement(self) -> None:
         # r2 (adversary A1): the start line carries launcher env values, so a field there is not the app's decision.

@@ -1770,7 +1770,8 @@ function Get-DvPrepConflatedMoveEvidence {
         if ($null -ne $session) {
             $whole = '^(\[[^\]]*\] \[[A-Za-z]+\] (\[0x[0-9A-Fa-f]+\] )?)?playback_smoke\.prep_route session=' + [regex]::Escape([string]$session) +
                 ' prep_conflated_move_active=(?<v>[01])$'
-            $mention = 'playback_smoke\.prep_route session=' + [regex]::Escape([string]$session) + '(\s|$)'
+            # r8 (adversary A1 sibling): any record body naming the marker and the measured session is a mention, whatever the separators or field order.
+            $mention = 'playback_smoke\.prep_route(?!\w).*?(?<!\w)session\s*=\s*' + [regex]::Escape([string]$session) + '(?!\d)'
             foreach ($l in (Get-DvLogRecordBodies -LogText $LogText)) {
                 if ($l -cnotmatch $mention) { continue }
                 $mentions++
@@ -1825,7 +1826,10 @@ function Get-DvReconReleaseDeferredEvidence {
             $whole = '^(\[[^\]]*\] \[[A-Za-z]+\] (\[0x[0-9A-Fa-f]+\] )?)?playback_smoke\.recon_release session=' + [regex]::Escape([string]$session) +
                 ' deferred_enabled=(?<v>[01]) deferred=(?<deferred>0|[1-9][0-9]{0,18}) sync=(?<sync>0|[1-9][0-9]{0,18}) drained=(?<drained>0|[1-9][0-9]{0,18})' +
                 ' max_depth=(?<depth>0|[1-9][0-9]{0,8}) outstanding_at_stop=(?<outstanding>0|[1-9][0-9]{0,8})$'
-            $mention = 'playback_smoke\.recon_release session=' + [regex]::Escape([string]$session) + '(\s|$)'
+            # r8 (adversary A1 on ea16773f): a mention is ANY record body that names the marker and the measured session, whatever the separators or field order
+            # (double space, TAB, punctuation, `session = 3`, session after another field), so a noncanonical duplicate is counted and makes the state
+            # unreadable rather than being skipped while a conflicting canonical record passes. session=31 is not session 3.
+            $mention = 'playback_smoke\.recon_release(?!\w).*?(?<!\w)session\s*=\s*' + [regex]::Escape([string]$session) + '(?!\d)'
             foreach ($l in (Get-DvLogRecordBodies -LogText $LogText)) {
                 if ($l -cnotmatch $mention) { continue }
                 $mentions++
