@@ -28,6 +28,9 @@
 #include "opt_med.h"
 #include "wirth.h"
 #include <pthread.h>
+#ifdef _OPENMP
+#include <omp.h>
+#endif
 #if defined(__GNUC__) && !defined(__clang__) && (defined(__x86_64__) || defined(__i386__))
 #include <immintrin.h>
 #define DUALISO_AVX2_AVAILABLE 1
@@ -1396,6 +1399,7 @@ void free_dualiso_full20bit_scratch(dualiso_full20bit_scratch_t * scratch)
     free(scratch->amaze_thread_id);
     free(scratch->amaze_arguments);
     free(scratch->alias_aux);
+    free(scratch->mix_chroma_ring);
     memset(scratch, 0, sizeof(*scratch));
 }
 
@@ -4605,6 +4609,641 @@ static inline void build_alias_map(struct raw_info raw_info,
 #include "chroma_smooth.c"
 #undef CHROMA_SMOOTH_5X5
 
+/* CPU-S1-DUALISO-MIX-CHROMA-LEVER-1: byte-identical fast form of the uint32
+ * chroma_smooth_2x2 instantiation above, bound to the dual-ISO matched-source
+ * smooth only (pixelproc.c's uint16 instantiation is untouched).
+ *
+ * K1: the legacy cell gathers 5 H + 5 V cross samples (6 raw2ev lookups each)
+ * plus 6 centre lookups. Every sample depends only on its position (p, q), and
+ * each position is shared by up to 5 cells, so each position is computed once
+ * (8 raw2ev lookups) into a per-thread ring of 3 position rows. The cell then
+ * runs the same med5, use_average, choose and clamped ev2raw store as the
+ * legacy non-probe path.
+ * K2: each thread band writes whole output rows (input copied, then the R/B
+ * sites patched), and the border rows are copied inside the same region, so
+ * the serial full-plane memcpy before the legacy kernel is gone.
+ * Read footprint per position (p, q): rows p-1..p+2, cols q-1..q+2, i.e. the
+ * legacy union footprint rows 1..ymax+4, cols 1..xmax+4. */
+/* One position row, as a structure of arrays so the per-cell median pass in
+ * dualiso_cs2_cell_row runs as plain vectorizable loops. */
+typedef struct
+{
+    int * hr;
+    int * hb;
+    int * vr;
+    int * vb;
+    int * eht;
+    int * evt;
+    int * g1;
+    int * g2;
+    int * g3;
+    int * g4;
+    int * g5;
+    int * g6;
+} dualiso_cs2_pos_row_t;
+
+#define DUALISO_CS2_POS_FIELDS 12
+#define DUALISO_CS2_CELL_FIELDS 6
+
+/* Test-only RED switch (dualisoSetMixChromaFastMutationForTesting): 1 breaks
+ * the fast kernel on purpose (k1/k3 cross rows swapped and the V-blue sample
+ * sign flipped) so the identity tests can be shown to fail. Always 0 in the
+ * product. */
+static int g_dualiso_cs2_mutation_for_testing = 0;
+
+void dualisoSetMixChromaFastMutationForTesting(int mutation);
+void dualisoSetMixChromaFastMutationForTesting(int mutation)
+{
+    g_dualiso_cs2_mutation_for_testing = mutation;
+}
+
+static inline void dualiso_cs2_bind_pos_row(int * base, int npos, dualiso_cs2_pos_row_t * row)
+{
+    const size_t n = (size_t)npos;
+    row->hr = base;
+    row->hb = base + n;
+    row->vr = base + 2 * n;
+    row->vb = base + 3 * n;
+    row->eht = base + 4 * n;
+    row->evt = base + 5 * n;
+    row->g1 = base + 6 * n;
+    row->g2 = base + 7 * n;
+    row->g3 = base + 8 * n;
+    row->g4 = base + 9 * n;
+    row->g5 = base + 10 * n;
+    row->g6 = base + 11 * n;
+}
+
+static inline void dualiso_cs2_fill_pos_row(const uint32_t * __restrict inp,
+                                            int w,
+                                            int p,
+                                            int npos,
+                                            const int * __restrict raw2ev,
+                                            int mutation,
+                                            const dualiso_cs2_pos_row_t * row)
+{
+    const uint32_t * r_m1 = inp + (size_t)(p - 1) * (size_t)w;
+    const uint32_t * r_0 = inp + (size_t)p * (size_t)w;
+    const uint32_t * r_p1 = r_0 + w;
+    const uint32_t * r_p2 = inp + (size_t)(p + 2) * (size_t)w;
+    int * __restrict o_hr = row->hr;
+    int * __restrict o_hb = row->hb;
+    int * __restrict o_vr = row->vr;
+    int * __restrict o_vb = row->vb;
+    int * __restrict o_eht = row->eht;
+    int * __restrict o_evt = row->evt;
+    int * __restrict o_g1 = row->g1;
+    int * __restrict o_g2 = row->g2;
+    int * __restrict o_g3 = row->g3;
+    int * __restrict o_g4 = row->g4;
+    int * __restrict o_g5 = row->g5;
+    int * __restrict o_g6 = row->g6;
+    /* Positions are filled eagerly, including ones only a skipped (fully
+     * clipped) cell would use, which the legacy loop never looks up. Clamp
+     * the LUT index so such a sample can never read past raw2ev (adversary
+     * eae11081 A2). For every value the legacy kernel can look up in bounds
+     * (< DUALISO_RAW2EV_LUT_COUNT) the clamp is the identity. */
+    #define DUALISO_CS2_EV(v) raw2ev[MIN((uint32_t)(v), (uint32_t)(DUALISO_RAW2EV_LUT_COUNT - 1u))]
+    for (int j = 0; j < npos; j++)
+    {
+        const int q = 2 + 2 * j;
+        const int rr = DUALISO_CS2_EV(r_0[q]);
+        const int bb = DUALISO_CS2_EV(r_p1[q + 1]);
+        const int g1 = DUALISO_CS2_EV(r_0[q + 1]);
+        const int g2 = DUALISO_CS2_EV(r_p1[q]);
+        const int g3 = DUALISO_CS2_EV(r_0[q - 1]);
+        const int g5 = DUALISO_CS2_EV(r_p1[q + 2]);
+        const int g4 = DUALISO_CS2_EV(r_m1[q]);
+        const int g6 = DUALISO_CS2_EV(r_p2[q + 1]);
+        o_hr[j] = rr - (g1 + g3) / 2;
+        o_hb[j] = bb - (g2 + g5) / 2;
+        o_eht[j] = ABS(g1 - g3) + ABS(g2 - g5);
+        o_vr[j] = rr - (g2 + g4) / 2;
+        o_vb[j] = mutation ? (g1 + g6) / 2 - bb : bb - (g1 + g6) / 2;
+        o_evt[j] = ABS(g2 - g4) + ABS(g1 - g6);
+        o_g1[j] = g1;
+        o_g2[j] = g2;
+        o_g3[j] = g3;
+        o_g4[j] = g4;
+        o_g5[j] = g5;
+        o_g6[j] = g6;
+    }
+    #undef DUALISO_CS2_EV
+}
+
+/* med5 over the cell's 5 cross positions in the legacy k order: k0 (y, x-2)
+ * = mid[i], k1 (y-2, x) = up[i+1], k2 (y, x) = mid[i+1], k3 (y+2, x) =
+ * dn[i+1], k4 (y, x+2) = mid[i+2]. Plain loop so it vectorizes. */
+static inline void dualiso_cs2_med5_pass(int ncx,
+                                         const int * __restrict up,
+                                         const int * __restrict mid,
+                                         const int * __restrict dn,
+                                         int * __restrict med)
+{
+    for (int i = 0; i < ncx; i++)
+    {
+        med[i] = chroma_smooth_med5(mid[i], up[i + 1], mid[i + 1], dn[i + 1], mid[i + 2]);
+    }
+}
+
+static inline void dualiso_cs2_sum5_pass(int ncx,
+                                         const int * __restrict up,
+                                         const int * __restrict mid,
+                                         const int * __restrict dn,
+                                         int * __restrict sum)
+{
+    for (int i = 0; i < ncx; i++)
+    {
+        sum[i] = mid[i] + up[i + 1] + mid[i + 1] + dn[i + 1] + mid[i + 2];
+    }
+}
+
+/* The legacy-order store for cells [i_begin, i_end) of cell row y. The scalar
+ * K1/K2 row stores every cell here; the LEVER-2 AVX2 row stores its ncx % 8
+ * tail here. cell holds the row's DUALISO_CS2_CELL_FIELDS per-cell arrays. */
+static inline void dualiso_cs2_store_range(const uint32_t * __restrict inp,
+                                           uint32_t * __restrict out,
+                                           int w,
+                                           int y,
+                                           int ncx,
+                                           int i_begin,
+                                           int i_end,
+                                           const dualiso_cs2_pos_row_t * mid,
+                                           const int * __restrict cell,
+                                           const int * __restrict ev2raw,
+                                           int black,
+                                           int white)
+{
+    /* Same margin as the uint32 instantiation's CHROMA_SMOOTH_RAW_BLACK_MARGIN. */
+    const int black_thr = black + 64 * 64;
+    const unsigned int white_u = (unsigned int)white;
+    const int ev2raw_lo = -10 * EV_RESOLUTION;
+    const int ev2raw_hi = 14 * EV_RESOLUTION - 1;
+    const int direction_ev_thr = 64;
+    const uint32_t * row_y = inp + (size_t)y * (size_t)w;
+    const uint32_t * row_y_p1 = row_y + w;
+    uint32_t * out_y = out + (size_t)y * (size_t)w;
+    uint32_t * out_y_p1 = out_y + w;
+    const size_t n = (size_t)ncx;
+    const int * c_drh = cell;
+    const int * c_dbh = cell + n;
+    const int * c_drv = cell + 2 * n;
+    const int * c_dbv = cell + 3 * n;
+    const int * c_eh = cell + 4 * n;
+    const int * c_ev = cell + 5 * n;
+
+    const int * __restrict cg1 = mid->g1 + 1;
+    const int * __restrict cg2 = mid->g2 + 1;
+    const int * __restrict cg3 = mid->g3 + 1;
+    const int * __restrict cg4 = mid->g4 + 1;
+    const int * __restrict cg5 = mid->g5 + 1;
+    const int * __restrict cg6 = mid->g6 + 1;
+    for (int i = i_begin; i < i_end; i++)
+    {
+        const int x = 4 + 2 * i;
+        const int r0 = (int)row_y[x];
+        const int b0 = (int)row_y_p1[x + 1];
+        const int write_r = (unsigned int)r0 < white_u;
+        const int write_b = (unsigned int)b0 < white_u;
+        if (UNLIKELY(!write_r && !write_b))
+        {
+            continue;
+        }
+        const int drh = c_drh[i];
+        const int dbh = c_dbh[i];
+        const int drv = c_drv[i];
+        const int dbv = c_dbv[i];
+        const int eh = c_eh[i];
+        const int ev = c_ev[i];
+        /* Centre g1..g6 are the k2 position's own gathers. */
+        const int g1 = cg1[i];
+        const int g2 = cg2[i];
+        const int g3 = cg3[i];
+        const int g4 = cg4[i];
+        const int g5 = cg5[i];
+        const int g6 = cg6[i];
+        const int grv = (g2 + g4) / 2;
+        const int grh = (g1 + g3) / 2;
+        const int gbv = (g1 + g6) / 2;
+        const int gbh = (g2 + g5) / 2;
+        const int choose_ev_lt_eh = ev < eh;
+        int dr = choose_ev_lt_eh ? drv : drh;
+        int db = choose_ev_lt_eh ? dbv : dbh;
+        const int use_average = r0 < black_thr || b0 < black_thr
+            || ABS(drv - drh) < direction_ev_thr
+            || ABS(grv - grh) < direction_ev_thr
+            || ABS(gbv - gbh) < direction_ev_thr;
+        int gr;
+        int gb;
+        if (use_average)
+        {
+            dr = (drv + drh) / 2;
+            gr = (g1 + g2 + g3 + g4) / 4;
+            db = (dbv + dbh) / 2;
+            gb = (g1 + g2 + g5 + g6) / 4;
+        }
+        else
+        {
+            gr = choose_ev_lt_eh ? grv : grh;
+            gb = choose_ev_lt_eh ? gbv : gbh;
+        }
+        if (write_r)
+        {
+            out_y[x] = chroma_smooth_ev2raw_clamped(ev2raw, ev2raw_lo, ev2raw_hi, gr + dr);
+        }
+        if (write_b)
+        {
+            out_y_p1[x + 1] = chroma_smooth_ev2raw_clamped(ev2raw, ev2raw_lo, ev2raw_hi, gb + db);
+        }
+    }
+}
+
+static inline void dualiso_cs2_cell_row(const uint32_t * __restrict inp,
+                                        uint32_t * __restrict out,
+                                        int w,
+                                        int y,
+                                        int ncx,
+                                        const dualiso_cs2_pos_row_t * up,
+                                        const dualiso_cs2_pos_row_t * mid,
+                                        const dualiso_cs2_pos_row_t * dn,
+                                        int * __restrict cell,
+                                        const int * __restrict ev2raw,
+                                        int black,
+                                        int white)
+{
+    const uint32_t * row_y = inp + (size_t)y * (size_t)w;
+    uint32_t * out_y = out + (size_t)y * (size_t)w;
+    const size_t n = (size_t)ncx;
+
+    /* Cross medians and direction sums for every cell of the row (cells the
+     * store loop skips are computed too and simply not used). */
+    dualiso_cs2_med5_pass(ncx, up->hr, mid->hr, dn->hr, cell);
+    dualiso_cs2_med5_pass(ncx, up->hb, mid->hb, dn->hb, cell + n);
+    dualiso_cs2_med5_pass(ncx, up->vr, mid->vr, dn->vr, cell + 2 * n);
+    dualiso_cs2_med5_pass(ncx, up->vb, mid->vb, dn->vb, cell + 3 * n);
+    dualiso_cs2_sum5_pass(ncx, up->eht, mid->eht, dn->eht, cell + 4 * n);
+    dualiso_cs2_sum5_pass(ncx, up->evt, mid->evt, dn->evt, cell + 5 * n);
+
+    /* K2: whole output rows y and y+1 start as the input. */
+    memcpy(out_y, row_y, (size_t)2 * (size_t)w * sizeof(uint32_t));
+
+    dualiso_cs2_store_range(inp, out, w, y, ncx, 0, ncx, mid, cell, ev2raw, black, white);
+}
+
+/* CPU-S1-DUALISO-MIX-CHROMA-LEVER-2 K4 dispatch (pattern: AMaZE above). The
+ * AVX2 2x2 kernel runs when the CPU has avx2 + fma, unless MLVAPP_DISABLE_AVX2
+ * or MLVAPP_DISABLE_AVX2_DUALISO_MIX_CHROMA is truthy. The scalar fallback is
+ * the K1/K2 kernel above. */
+static pthread_once_t g_dualiso_mix_chroma_dispatch_once = PTHREAD_ONCE_INIT;
+static int g_dualiso_mix_chroma_use_avx2 = 0;
+
+static void dualiso_mix_chroma_dispatch_init(void)
+{
+    int use_avx2 = 0;
+#ifdef DUALISO_AVX2_AVAILABLE
+    __builtin_cpu_init();
+    use_avx2 = __builtin_cpu_supports("avx2") && __builtin_cpu_supports("fma");
+#endif
+    if (dualiso_env_truthy(getenv("MLVAPP_DISABLE_AVX2"))) use_avx2 = 0;
+    if (dualiso_env_truthy(getenv("MLVAPP_DISABLE_AVX2_DUALISO_MIX_CHROMA"))) use_avx2 = 0;
+    g_dualiso_mix_chroma_use_avx2 = use_avx2;
+}
+
+int dualisoMixChromaAvx2Active(void);
+int dualisoMixChromaAvx2Active(void)
+{
+    pthread_once(&g_dualiso_mix_chroma_dispatch_once, dualiso_mix_chroma_dispatch_init);
+    return g_dualiso_mix_chroma_use_avx2;
+}
+
+/* Test-only hook: re-evaluate the dispatch from the current env. */
+int dualisoMixChromaReinitDispatchForTesting(void);
+int dualisoMixChromaReinitDispatchForTesting(void)
+{
+    pthread_once(&g_dualiso_mix_chroma_dispatch_once, dualiso_mix_chroma_dispatch_init);
+    dualiso_mix_chroma_dispatch_init();
+    return g_dualiso_mix_chroma_use_avx2;
+}
+
+/* Test-only route override for the matched-source smooth (pattern:
+ * g_dualiso_cs2_mutation_for_testing). -1 = product dispatch (the product
+ * never sets it); 0 = legacy copy + kernel; 1 = K1/K2 scalar; 2 = LEVER-2
+ * AVX2 (scalar when the dispatch is off). */
+static int g_dualiso_mix_chroma_route_for_testing = -1;
+
+void dualisoSetMixChromaRouteForTesting(int route);
+void dualisoSetMixChromaRouteForTesting(int route)
+{
+    g_dualiso_mix_chroma_route_for_testing = (route >= 0 && route <= 2) ? route : -1;
+}
+
+/* Test-only K3 off switch: 1 = the fast kernel allocates its ring per call
+ * (the pre-K3 behaviour) instead of using the scratch-owned ring. */
+static int g_dualiso_mix_chroma_ring_per_call_for_testing = 0;
+
+void dualisoSetMixChromaRingPerCallForTesting(int per_call);
+void dualisoSetMixChromaRingPerCallForTesting(int per_call)
+{
+    g_dualiso_mix_chroma_ring_per_call_for_testing = per_call ? 1 : 0;
+}
+
+/* Test-only ring failure switch (adversary 4e8c6627 A1): 1 = the fast kernel
+ * reports its ring allocation failure for every plane with a cell, so the
+ * matched-source smooth takes its fallback copy + legacy kernel. Always 0 in
+ * the product. */
+static int g_dualiso_mix_chroma_ring_fail_for_testing = 0;
+
+void dualisoSetMixChromaRingFailureForTesting(int fail);
+void dualisoSetMixChromaRingFailureForTesting(int fail)
+{
+    g_dualiso_mix_chroma_ring_fail_for_testing = fail ? 1 : 0;
+}
+
+#ifdef DUALISO_AVX2_AVAILABLE
+#include "dualiso_mix_chroma_avx2.inc"
+#endif
+
+/* Ints one thread needs: 3 position rows, the cell arrays, and (AVX2 only)
+ * a 4-row ring of EV rows split into even and odd columns. */
+static inline size_t dualiso_cs2_thread_ints(int ncx, int npos)
+{
+    return (size_t)3 * (size_t)DUALISO_CS2_POS_FIELDS * (size_t)npos
+        + (size_t)DUALISO_CS2_CELL_FIELDS * (size_t)ncx
+        + (size_t)4 * (size_t)2 * (size_t)(npos + 2);
+}
+
+/* Returns 1 when out holds the full smoothed plane (copy fused), 0 when the
+ * per-thread ring could not be allocated (out untouched; caller falls back to
+ * memcpy + legacy kernel). scratch == NULL allocates the ring for this call
+ * only (test seam); otherwise the ring is the scratch's reusable buffer (K3).
+ * use_avx2 selects the LEVER-2 kernel; callers pass it only when the dispatch
+ * is active. avx2_ran (optional) is set to 1 only when the AVX2 kernel
+ * actually ran at least one vector store (an unclipped 8-cell step), never
+ * for a plane too small to hold a cell (plain copy), a plane whose cells all
+ * fall in the scalar tail (0 < ncx < 8, Grok G2), a plane whose every vector
+ * step is clipped (adversary a16ec254 A1) or a ring failure (adversary
+ * 457eb203 A1). */
+static int dualiso_chroma_smooth_2x2_fast_u32(int w,
+                                              int h,
+                                              const uint32_t * __restrict inp,
+                                              uint32_t * __restrict out,
+                                              const int * __restrict raw2ev,
+                                              const int * __restrict ev2raw,
+                                              int black,
+                                              int white,
+                                              dualiso_full20bit_scratch_t * scratch,
+                                              int use_avx2,
+                                              int * avx2_ran)
+{
+    const int ncx = (w > 8) ? (w - 7) / 2 : 0;
+    const int ncy = (h > 9) ? (h - 8) / 2 : 0;
+    const size_t row_bytes = (size_t)w * sizeof(uint32_t);
+    if (avx2_ran)
+    {
+        *avx2_ran = 0;
+    }
+    if (ncx <= 0 || ncy <= 0)
+    {
+        if (w > 0 && h > 0)
+        {
+            memcpy(out, inp, row_bytes * (size_t)h);
+        }
+        return 1;
+    }
+
+    const int npos = ncx + 2;
+    int max_threads = 1;
+#ifdef _OPENMP
+    max_threads = omp_get_max_threads();
+    if (max_threads < 1)
+    {
+        max_threads = 1;
+    }
+#endif
+    /* Per thread: 3 position rows of DUALISO_CS2_POS_FIELDS arrays, plus
+     * DUALISO_CS2_CELL_FIELDS per-cell arrays for the row being stored, plus
+     * the AVX2 EV-row ring. */
+    const size_t pos_row_ints = (size_t)DUALISO_CS2_POS_FIELDS * (size_t)npos;
+    const size_t thread_ints = dualiso_cs2_thread_ints(ncx, npos);
+    if (thread_ints > SIZE_MAX / sizeof(int) / (size_t)max_threads
+        || g_dualiso_mix_chroma_ring_fail_for_testing)
+    {
+        return 0;
+    }
+    int * rings = NULL;
+    int rings_owned = 0;
+    if (scratch && !g_dualiso_mix_chroma_ring_per_call_for_testing)
+    {
+        if (!ensure_reusable_scratch_buffer((void **)&scratch->mix_chroma_ring,
+                                            &scratch->mix_chroma_ring_capacity,
+                                            thread_ints * (size_t)max_threads,
+                                            sizeof(int)))
+        {
+            return 0;
+        }
+        rings = scratch->mix_chroma_ring;
+    }
+    else
+    {
+        rings = (int *)malloc(thread_ints * (size_t)max_threads * sizeof(int));
+        rings_owned = 1;
+    }
+    if (!rings)
+    {
+        return 0;
+    }
+
+    const int first_tail_row = 4 + 2 * ncy;
+    /* Mutation 1 breaks both kernels; mutation 2 only the AVX2 kernel. */
+    const int mutation = g_dualiso_cs2_mutation_for_testing == 1;
+#ifdef DUALISO_AVX2_AVAILABLE
+    const int avx2_mutation = g_dualiso_cs2_mutation_for_testing;
+#else
+    (void)use_avx2;
+#endif
+    /* AVX2 vector stores over all bands (the path proof, adversary a16ec254 A1). */
+    long long avx2_vector_stores = 0;
+
+#ifdef _OPENMP
+#pragma omp parallel num_threads(max_threads) reduction(+:avx2_vector_stores)
+#endif
+    {
+        int tid = 0;
+        int nth = 1;
+#ifdef _OPENMP
+        tid = omp_get_thread_num();
+        nth = omp_get_num_threads();
+#endif
+        if (tid == 0)
+        {
+            memcpy(out, inp, row_bytes * 4);
+        }
+        if (tid == nth - 1 && first_tail_row < h)
+        {
+            memcpy(out + (size_t)first_tail_row * (size_t)w,
+                   inp + (size_t)first_tail_row * (size_t)w,
+                   row_bytes * (size_t)(h - first_tail_row));
+        }
+
+        const int i0 = (int)(((long long)ncy * tid) / nth);
+        const int i1 = (int)(((long long)ncy * (tid + 1)) / nth);
+        if (i0 < i1)
+        {
+            int * base = rings + thread_ints * (size_t)tid;
+            dualiso_cs2_pos_row_t slot[3];
+            dualiso_cs2_bind_pos_row(base, npos, &slot[0]);
+            dualiso_cs2_bind_pos_row(base + pos_row_ints, npos, &slot[1]);
+            dualiso_cs2_bind_pos_row(base + 2 * pos_row_ints, npos, &slot[2]);
+            int * cell = base + 3 * pos_row_ints;
+#ifdef DUALISO_AVX2_AVAILABLE
+            if (use_avx2)
+            {
+                int * ev_ring = cell + (size_t)DUALISO_CS2_CELL_FIELDS * (size_t)ncx;
+                avx2_vector_stores += dualiso_cs2_band_avx2(inp, out, w, i0, i1, ncx, npos, raw2ev, ev2raw,
+                                                            black, white, avx2_mutation, slot, cell, ev_ring);
+            }
+            else
+#endif
+            {
+            /* Position row pi sits at p = 2 + 2 * pi; cell row i (y = 4 + 2i)
+             * needs position rows i (y-2), i+1 (y) and i+2 (y+2). Each band
+             * fills its own 2-row halo. */
+            dualiso_cs2_fill_pos_row(inp, w, 2 + 2 * i0, npos, raw2ev, mutation, &slot[i0 % 3]);
+            dualiso_cs2_fill_pos_row(inp, w, 2 + 2 * (i0 + 1), npos, raw2ev, mutation, &slot[(i0 + 1) % 3]);
+            for (int i = i0; i < i1; i++)
+            {
+                dualiso_cs2_fill_pos_row(inp, w, 2 + 2 * (i + 2), npos, raw2ev, mutation, &slot[(i + 2) % 3]);
+                const dualiso_cs2_pos_row_t * up = &slot[i % 3];
+                const dualiso_cs2_pos_row_t * dn = &slot[(i + 2) % 3];
+                dualiso_cs2_cell_row(inp, out, w, 4 + 2 * i, ncx,
+                                     mutation ? dn : up, &slot[(i + 1) % 3], mutation ? up : dn,
+                                     cell, ev2raw, black, white);
+            }
+            }
+        }
+    }
+
+    if (rings_owned)
+    {
+        free(rings);
+    }
+    /* Grok G2 (hub ACK 6741752322) and adversary a16ec254 A1: the proof means
+     * an AVX2 vector store ran. dualiso_cs2_cell_row_avx2 stores 8 cells per
+     * step, skips a step whose cells are all clipped and leaves ncx % 8 to the
+     * scalar store, so a plane with 0 < ncx < 8, or whose every vector step is
+     * clipped (only scalar-tail cells written), does not count. */
+    if (avx2_ran)
+    {
+        *avx2_ran = (use_avx2 && avx2_vector_stores > 0) ? 1 : 0;
+    }
+    return 1;
+}
+
+/* Legacy reference: serial full-plane copy, then the uint32 2x2 kernel. */
+static void dualiso_chroma_smooth_2x2_legacy_u32(int w,
+                                                 int h,
+                                                 uint32_t * inp,
+                                                 uint32_t * out,
+                                                 int * raw2ev,
+                                                 int * ev2raw,
+                                                 int black,
+                                                 int white)
+{
+    memcpy(out, inp, (size_t)w * (size_t)h * sizeof(uint32_t));
+    chroma_smooth_2x2(w, h, inp, out, raw2ev, ev2raw, black, white);
+}
+
+/* Test-only entry (pattern: dualisoSetAmazeThreadCreateFailureForTesting).
+ * Runs the legacy (use_fast=0), K1/K2 scalar (use_fast=1) or LEVER-2 AVX2
+ * (use_fast=2; scalar when dualisoMixChromaAvx2Active() is 0) 2x2 uint32
+ * kernel on caller planes with an EV LUT built for (lut_black, lut_white),
+ * exactly as smooth_matched_source_planes builds it. The seam allocates its
+ * own ring per call. kernel_ms (optional) receives the kernel time only
+ * (legacy: plane copy + kernel; fast: fused kernel), not the LUT build.
+ * Returns 1 on success. */
+int dualisoMixChroma2x2KernelForTesting(int use_fast,
+                                        int w,
+                                        int h,
+                                        const uint32_t * inp,
+                                        uint32_t * out,
+                                        int black,
+                                        int white,
+                                        int lut_black,
+                                        int lut_white,
+                                        double * kernel_ms);
+int dualisoMixChroma2x2KernelForTesting(int use_fast,
+                                        int w,
+                                        int h,
+                                        const uint32_t * inp,
+                                        uint32_t * out,
+                                        int black,
+                                        int white,
+                                        int lut_black,
+                                        int lut_white,
+                                        double * kernel_ms)
+{
+    /* The LUT builder indexes raw2ev[white]; keep the seam inside the range
+     * production metadata guarantees (adversary 5ef39f3a A1). */
+    if (!inp || !out || w <= 0 || h <= 0
+        || lut_black < 0 || lut_white <= lut_black
+        || (uint32_t)lut_white >= DUALISO_RAW2EV_LUT_COUNT)
+    {
+        return 0;
+    }
+    /* The LUT pair (1 Mi log2 + 1.5 Mi pow) is kept across calls for the last
+     * (lut_black, lut_white): rebuilding it per call made the identity test
+     * cost ~125 s, past the 240 s CI shard bound with its neighbours (r2). */
+    static pthread_mutex_t lut_lock = PTHREAD_MUTEX_INITIALIZER;
+    static int * cached_raw2ev = NULL;
+    static int * cached_ev2raw_0 = NULL;
+    static int cached_black = -1;
+    static int cached_white = -1;
+    pthread_mutex_lock(&lut_lock);
+    if (!cached_raw2ev || !cached_ev2raw_0)
+    {
+        free(cached_raw2ev);
+        free(cached_ev2raw_0);
+        cached_raw2ev = (int *)malloc(DUALISO_RAW2EV_LUT_COUNT * sizeof(int));
+        cached_ev2raw_0 = (int *)malloc(DUALISO_EV2RAW_LUT_COUNT * sizeof(int));
+        cached_black = -1;
+        cached_white = -1;
+        if (!cached_raw2ev || !cached_ev2raw_0)
+        {
+            free(cached_raw2ev);
+            free(cached_ev2raw_0);
+            cached_raw2ev = NULL;
+            cached_ev2raw_0 = NULL;
+            pthread_mutex_unlock(&lut_lock);
+            return 0;
+        }
+    }
+    if (cached_black != lut_black || cached_white != lut_white)
+    {
+        build_ev2raw_lut(cached_raw2ev, cached_ev2raw_0, lut_black, lut_white);
+        cached_black = lut_black;
+        cached_white = lut_white;
+    }
+    int * raw2ev = cached_raw2ev;
+    int * ev2raw = cached_ev2raw_0 + 10 * EV_RESOLUTION;
+    int ok = 1;
+    const double kernel_start = mlv_stage_timing_now();
+    if (use_fast)
+    {
+        const int use_avx2 = use_fast == 2 && dualisoMixChromaAvx2Active();
+        ok = dualiso_chroma_smooth_2x2_fast_u32(w, h, inp, out, raw2ev, ev2raw, black, white, NULL, use_avx2, NULL);
+    }
+    else
+    {
+        dualiso_chroma_smooth_2x2_legacy_u32(w, h, (uint32_t *)inp, out, raw2ev, ev2raw, black, white);
+    }
+    if (kernel_ms)
+    {
+        *kernel_ms = dualiso_debug_elapsed_ms(kernel_start);
+    }
+    pthread_mutex_unlock(&lut_lock);
+    return ok;
+}
+
 static inline void hdr_chroma_smooth(struct raw_info raw_info, uint32_t * input, uint32_t * output, int method, int * raw2ev, int * ev2raw)
 {
     int w = raw_info.width;
@@ -4681,6 +5320,48 @@ static void dualiso_debug_dump_source_smooth_plane(const char * name,
     fclose(f);
 }
 
+/* One matched-source plane: the fast fused kernel when route is 1 (K1/K2
+ * scalar) or 2 (LEVER-2 AVX2), else (or if the fast ring cannot be
+ * allocated) the legacy copy + hdr_chroma_smooth. On the legacy route the
+ * caller has already copied both planes. Returns 1 only when the AVX2 kernel
+ * smoothed this plane (adversary 457eb203 A1: a cell-less plane is a copy). */
+static inline int dualiso_smooth_source_plane(int route,
+                                              struct raw_info info,
+                                              uint32_t * input,
+                                              uint32_t * output,
+                                              int method,
+                                              int * raw2ev,
+                                              int * ev2raw,
+                                              size_t plane_bytes,
+                                              dualiso_full20bit_scratch_t * scratch)
+{
+    if (route > 0)
+    {
+        int avx2_ran = 0;
+        if (dualiso_chroma_smooth_2x2_fast_u32(info.width,
+                                               info.height,
+                                               input,
+                                               output,
+                                               raw2ev,
+                                               ev2raw,
+                                               info.black_level,
+                                               info.white_level,
+                                               scratch,
+                                               route == 2,
+                                               &avx2_ran))
+        {
+            return avx2_ran;
+        }
+        /* Fallback copy: timed only by the caller's windows (mix_chroma_ms and
+         * the fullres/halfres stage), like the kernel it stands in for. Adding
+         * it to mix_chroma_copy_ms as well counted it twice in the bench's
+         * mix_chroma + copy sum (adversary 4e8c6627 A1). */
+        memcpy(output, input, plane_bytes);
+    }
+    hdr_chroma_smooth(info, input, output, method, raw2ev, ev2raw);
+    return 0;
+}
+
 static inline int smooth_matched_source_planes(struct raw_info raw_info,
                                                uint32_t * dark,
                                                uint32_t * bright,
@@ -4700,14 +5381,45 @@ static inline int smooth_matched_source_planes(struct raw_info raw_info,
     {
         return 0;
     }
-    g_dualiso_full20bit_timing.mix_chroma_probe_mode = dualiso_mix_chroma_probe_mode();
+    const int probe_mode = dualiso_mix_chroma_probe_mode();
+    g_dualiso_full20bit_timing.mix_chroma_probe_mode = probe_mode;
+    /* CPU-S1-DUALISO-MIX-CHROMA-LEVER-1: the default route (probe unset or
+     * -1) takes the byte-identical fast 2x2 kernel with the copy fused into
+     * its parallel bands. Any probe mode >= 0 keeps the legacy copy + kernel
+     * so probe telemetry keeps its meaning.
+     * CPU-S1-DUALISO-MIX-CHROMA-LEVER-2: the fast route runs the AVX2 kernel
+     * when its dispatch is active (route 2), else the K1/K2 scalar kernel
+     * (route 1). Tests can pin the route (dualisoSetMixChromaRouteForTesting). */
+    int route = 0;
+    if (chroma_smooth_method == 1)
+    {
+        if (g_dualiso_mix_chroma_route_for_testing >= 0)
+        {
+            route = g_dualiso_mix_chroma_route_for_testing;
+        }
+        else if (probe_mode < 0)
+        {
+            route = 2;
+        }
+    }
+    if (route == 2 && !dualisoMixChromaAvx2Active())
+    {
+        route = 1;
+    }
+    const int use_fast = route > 0;
 
     const size_t plane_pixels = (size_t)raw_info.width * (size_t)raw_info.height;
     const size_t plane_bytes = plane_pixels * sizeof(uint32_t);
 
     double stage_start = mlv_stage_timing_now();
-    memcpy(bright_smooth, bright, plane_bytes);
-    memcpy(dark_smooth, dark, plane_bytes);
+    if (!use_fast)
+    {
+        memcpy(bright_smooth, bright, plane_bytes);
+        memcpy(dark_smooth, dark, plane_bytes);
+    }
+    /* On the fast route no separate copy remains (it is inside the bands), so
+     * this times nothing; a fast plane that falls back copies inside the
+     * chroma window below and is counted there only (adversary 4e8c6627 A1). */
     g_dualiso_full20bit_timing.mix_chroma_copy_ms += dualiso_debug_elapsed_ms(stage_start);
 
 #ifndef STDOUT_SILENT
@@ -4732,7 +5444,8 @@ static inline int smooth_matched_source_planes(struct raw_info raw_info,
     struct raw_info bright_info = raw_info;
     bright_info.black_level = black;
     bright_info.white_level = bright_white;
-    hdr_chroma_smooth(bright_info, bright, bright_smooth, chroma_smooth_method, raw2ev, ev2raw);
+    int avx2_planes = dualiso_smooth_source_plane(route, bright_info, bright, bright_smooth, chroma_smooth_method,
+                                                  raw2ev, ev2raw, plane_bytes, scratch);
     g_dualiso_mix_chroma_probe_stage_cache = 0;
     g_dualiso_full20bit_timing.mix_chroma_probe_stage = 0;
     g_dualiso_full20bit_timing.mix_chroma_fullres_ms += dualiso_debug_elapsed_ms(stage_start);
@@ -4743,10 +5456,17 @@ static inline int smooth_matched_source_planes(struct raw_info raw_info,
     struct raw_info dark_info = raw_info;
     dark_info.black_level = black;
     dark_info.white_level = dark_white;
-    hdr_chroma_smooth(dark_info, dark, dark_smooth, chroma_smooth_method, raw2ev, ev2raw);
+    avx2_planes += dualiso_smooth_source_plane(route, dark_info, dark, dark_smooth, chroma_smooth_method,
+                                               raw2ev, ev2raw, plane_bytes, scratch);
     g_dualiso_mix_chroma_probe_stage_cache = 0;
     g_dualiso_full20bit_timing.mix_chroma_probe_stage = 0;
     g_dualiso_full20bit_timing.mix_chroma_halfres_ms += dualiso_debug_elapsed_ms(stage_start);
+    /* Venue proof: both planes ran an AVX2 vector store this frame. A plane
+     * under 23 px wide (ncx < 8) only runs the scalar tail, and a plane whose
+     * every 8-cell step is clipped skips every vector store; neither counts
+     * (Grok G2, adversary a16ec254 A1). The venue raw (1808 wide, ncx = 900)
+     * has unclipped cells on every real frame. */
+    g_dualiso_full20bit_timing.mix_chroma_avx2_used = avx2_planes == 2;
 
     dualiso_debug_dump_source_smooth_plane("stage_bright_source_smooth.u32",
                                            bright_smooth,
@@ -4757,6 +5477,68 @@ static inline int smooth_matched_source_planes(struct raw_info raw_info,
 
     g_dualiso_full20bit_timing.mix_chroma_ms += dualiso_debug_elapsed_ms(chroma_start);
     return 1;
+}
+
+/* Test-only entry (adversary 4e8c6627 A1): runs smooth_matched_source_planes
+ * once (2x2 method, a scratch of its own) on caller planes and returns in
+ * window_ms the wall time of that call, so a test can check that the
+ * mix_chroma_copy_ms and mix_chroma_ms it added are disjoint parts of the
+ * window. The caller resets and reads the full20 timing; the route is the one
+ * dualisoSetMixChromaRouteForTesting pinned. Returns the smooth's result. */
+int dualisoSmoothMatchedSourcePlanesForTesting(int w,
+                                               int h,
+                                               const uint32_t * dark,
+                                               const uint32_t * bright,
+                                               uint32_t * dark_smooth,
+                                               uint32_t * bright_smooth,
+                                               int black,
+                                               int dark_white,
+                                               int bright_white,
+                                               double * window_ms);
+int dualisoSmoothMatchedSourcePlanesForTesting(int w,
+                                               int h,
+                                               const uint32_t * dark,
+                                               const uint32_t * bright,
+                                               uint32_t * dark_smooth,
+                                               uint32_t * bright_smooth,
+                                               int black,
+                                               int dark_white,
+                                               int bright_white,
+                                               double * window_ms)
+{
+    if (!dark || !bright || !dark_smooth || !bright_smooth || w <= 0 || h <= 0
+        || black < 0 || dark_white <= black || bright_white <= black
+        || (uint32_t)dark_white >= DUALISO_RAW2EV_LUT_COUNT
+        || (uint32_t)bright_white >= DUALISO_RAW2EV_LUT_COUNT)
+    {
+        return 0;
+    }
+    struct raw_info info;
+    memset(&info, 0, sizeof(info));
+    info.width = w;
+    info.height = h;
+    info.pitch = w;
+    info.black_level = black;
+    info.white_level = dark_white;
+    dualiso_full20bit_scratch_t scratch;
+    memset(&scratch, 0, sizeof(scratch));
+    const double window_start = mlv_stage_timing_now();
+    const int ok = smooth_matched_source_planes(info,
+                                                (uint32_t *)dark,
+                                                (uint32_t *)bright,
+                                                dark_smooth,
+                                                bright_smooth,
+                                                1,
+                                                black,
+                                                dark_white,
+                                                bright_white,
+                                                &scratch);
+    if (window_ms)
+    {
+        *window_ms = dualiso_debug_elapsed_ms(window_start);
+    }
+    free_dualiso_full20bit_scratch(&scratch);
+    return ok;
 }
 
 static inline int mix_curve_key_matches(const dualiso_full20bit_scratch_t * scratch,

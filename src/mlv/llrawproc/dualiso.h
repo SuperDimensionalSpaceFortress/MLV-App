@@ -168,6 +168,11 @@ typedef struct
 
     uint16_t * alias_aux;
     size_t alias_aux_capacity;
+
+    /* CPU-S1-DUALISO-MIX-CHROMA-LEVER-2 K3: per-thread 2x2 chroma-smooth
+     * rings (position rows, cell arrays, EV rows), reused across frames. */
+    int * mix_chroma_ring;
+    size_t mix_chroma_ring_capacity;
 } dualiso_full20bit_scratch_t;
 
 typedef struct
@@ -311,6 +316,9 @@ typedef struct
     int interp_method;
     int use_alias_map;
     int use_fullres;
+    /* CPU-S1-DUALISO-MIX-CHROMA-LEVER-2: 1 when this frame's matched-source
+     * 2x2 smooth ran the AVX2 kernel (venue proof of the path taken). */
+    int mix_chroma_avx2_used;
     int threads;
     int valid;
 } dualiso_full20bit_timing_t;

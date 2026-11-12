@@ -81,8 +81,8 @@
 #endif
 
 /* ---- bring in the recon as a single TU --------------------------------- *
- * dualiso.c inline-#includes dualiso_avx2.inc, dualiso_amaze_avx2.inc and
- * chroma_smooth.c (x3). hist.c is compiled into the same TU. The only external
+ * dualiso.c inline-#includes dualiso_avx2.inc, dualiso_amaze_avx2.inc,
+ * dualiso_mix_chroma_avx2.inc and chroma_smooth.c (x3). hist.c is compiled into the same TU. The only external
  * symbol diso_get_full20bit's reachable code references that is not defined in
  * dualiso.c is demosaic() (debayer.h) - referenced only in the AMaZE worker
  * (dualiso.c:2809), never entered for interp_method=1. Provide a stub before

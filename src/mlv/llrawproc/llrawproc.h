@@ -613,6 +613,11 @@ typedef struct
 } llrpDualIsoGpuSplitTiming_t;
 void llrpGetLastDualIsoGpuSplitTiming(llrpDualIsoGpuSplitTiming_t * timing);
 void llrpGetLastDualIsoFull20bitTiming(dualiso_full20bit_timing_t * timing);
+/* CPU-S1-DUALISO-MIX-CHROMA-LEVER-2 r3: the number of llrawproc runs started
+ * on this thread (both entries count, at the point they reset the last-run
+ * records). Equal before and after a frame = that frame ran no llrawproc here,
+ * so the last-run records above are an earlier frame's. */
+uint64_t llrpGetRunGenerationForCurrentThread(void);
 double llrpGetLastDualIsoPreviewHistogramMilliseconds(void);
 double llrpGetLastDualIsoPreviewRegressionMilliseconds(void);
 double llrpGetLastDualIsoPreviewRowscaleMilliseconds(void);

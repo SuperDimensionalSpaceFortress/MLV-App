@@ -27333,6 +27333,7 @@ void MainWindow::beginPlaybackSmokeTelemetry( void )
     m_playbackSmokeDualIsoFull20LastThreads = 0;
     m_playbackSmokeDualIsoFull20LastAliasMap = false;
     m_playbackSmokeDualIsoFull20LastFullres = false;
+    m_playbackSmokeDualIsoMixChromaAvx2UsedFrames = 0;
     m_playbackSmokeLastDebayerEngineMode = -1;
     m_playbackSmokeDebayerBasicU16Avx2AvailableFrames = 0;
     m_playbackSmokeDebayerBasicU16Avx2UsedFrames = 0;
@@ -27762,6 +27763,8 @@ void MainWindow::notePlaybackSmokePresentedFrame(
         telemetryBoolValue( timing, "dual_iso_full20_use_alias_map" );
     const bool dualIsoFull20Fullres =
         telemetryBoolValue( timing, "dual_iso_full20_use_fullres" );
+    /* Render-thread recon or consumed worker recon (ReconWorkerSplit.h). */
+    const bool dualIsoFull20MixChromaAvx2Used = recon_worker_split::mixChromaAvx2Used( timing );
     const double llrawprocChromaSmoothMs =
         telemetryDoubleValue( timing, "llrawproc_chroma_smooth_ms" );
     const double llrawprocOtherMs =
@@ -28366,6 +28369,9 @@ void MainWindow::notePlaybackSmokePresentedFrame(
         m_playbackSmokeDualIsoFull20LastAliasMap = dualIsoFull20AliasMap;
         m_playbackSmokeDualIsoFull20LastFullres = dualIsoFull20Fullres;
     }
+    /* Outside the render thread's full20 validity gate: a consumed worker recon leaves it false. */
+    if( dualIsoFull20MixChromaAvx2Used )
+        ++m_playbackSmokeDualIsoMixChromaAvx2UsedFrames;
     m_playbackSmokeLlrawprocChromaSmoothSumMs += llrawprocChromaSmoothMs;
     m_playbackSmokeLlrawprocOtherSumMs += llrawprocOtherMs;
     m_playbackSmokeDebayeredFrameSumMs += debayeredFrameMs;
@@ -32067,6 +32073,16 @@ void MainWindow::finishPlaybackSmokeTelemetry( const char *reason )
                .arg( m_playbackSmokeLastDebayerEngineMode )
                .arg( m_playbackSmokeDebayerBasicU16Avx2AvailableFrames )
                .arg( m_playbackSmokeDebayerBasicU16Avx2UsedFrames );
+
+    /* CPU-S1-DUALISO-MIX-CHROMA-LEVER-2: venue proof of the matched-source smooth path, printed on
+     * every session (not under the full20 validity gate a consumed worker recon fails). */
+    qInfo().noquote()
+        << QStringLiteral(
+               "playback_smoke.dual_iso_mix_chroma_path session=%1 frames=%2 "
+               "dualiso_mix_chroma_avx2_used_frames=%3" )
+               .arg( static_cast<qulonglong>( m_playbackSmokeSessionId ) )
+               .arg( m_playbackSmokePresentedFrames )
+               .arg( m_playbackSmokeDualIsoMixChromaAvx2UsedFrames );
 
     qInfo().noquote()
         << QStringLiteral(

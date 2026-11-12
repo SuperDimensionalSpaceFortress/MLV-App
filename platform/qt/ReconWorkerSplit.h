@@ -29,13 +29,45 @@ namespace recon_worker_split
 
 inline QString prefix() { return QStringLiteral( "recon_worker_" ); }
 
-// A worker key this split carries: an llrawproc_* or dual_iso_full20_* duration, or the full20 valid flag.
+// CPU-S1-DUALISO-MIX-CHROMA-LEVER-2: the full20 flag saying the matched-source smooth ran AVX2.
+inline QString mixChromaAvx2UsedKey() { return QStringLiteral( "dual_iso_full20_mix_chroma_avx2_used" ); }
+
+// A worker key this split carries: an llrawproc_* or dual_iso_full20_* duration, the full20 valid flag,
+// or the mix-chroma AVX2 path flag.
 inline bool isSplitKey( const QString &key )
 {
     const bool family = key.startsWith( QLatin1String( "llrawproc_" ) )
                      || key.startsWith( QLatin1String( "dual_iso_full20_" ) );
     return family && ( key.endsWith( QLatin1String( "_ms" ) )
-                       || key == QLatin1String( "dual_iso_full20_valid" ) );
+                       || key == QLatin1String( "dual_iso_full20_valid" )
+                       || key == mixChromaAvx2UsedKey() );
+}
+
+// A presented frame whose matched-source smooth ran the AVX2 kernel, on the recon that produced THIS
+// frame. A frame that consumed the worker's recon carries the worker's flag under recon_worker_ (the
+// worker always writes it, RenderFrameThread.cpp insertLlrawprocReconTimingTelemetry), and only that
+// flag counts: the render thread ran no recon, and its unprefixed flag is its last-run record, which a
+// consumed frame does not reset, so it can be a stale true from its own earlier recon (adversary
+// 5f16bcdf A1, adversary b2992f19 A1). Any other frame is the render thread's own recon, whose flag
+// drawFrame already scoped to this frame (renderThreadMixChromaAvx2Used below).
+inline bool mixChromaAvx2Used( const QJsonObject &presented )
+{
+    const QString workerKey = prefix() + mixChromaAvx2UsedKey();
+    if( presented.contains( workerKey ) ) return presented.value( workerKey ).toBool();
+    return presented.value( mixChromaAvx2UsedKey() ).toBool();
+}
+
+// CPU-S1-DUALISO-MIX-CHROMA-LEVER-2 r3 (adversary e4160976 A1): the render thread's own flag, as
+// RenderFrameThread::drawFrame publishes it. The llrawproc last-run record is rewritten only by a
+// run, so a frame that skipped llrawproc (a processed8 or processed16 cache hit, a debayered-cache
+// copy) still reads the previous run's flag. It counts only when an llrawproc run started on this
+// thread during this frame: llrpGetRunGenerationForCurrentThread() moved between drawFrame entry
+// (`generationAtFrameStart`) and the read (`generationNow`). The worker rule above is unchanged.
+inline bool renderThreadMixChromaAvx2Used( bool lastRunRecordFlag,
+                                           quint64 generationAtFrameStart,
+                                           quint64 generationNow )
+{
+    return lastRunRecordFlag && generationNow != generationAtFrameStart;
 }
 
 // Copies the worker's split keys from `worker` (the slot telemetry as the recon worker left it) into
