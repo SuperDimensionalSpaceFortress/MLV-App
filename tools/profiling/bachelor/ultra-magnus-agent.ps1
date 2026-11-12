@@ -4384,6 +4384,9 @@ function Invoke-QueuedJob {
     }
     # PARITY-1: the heat rule in the job's env ($heatRule was put on the admission record above, before any early exit)
     $env:MLV_AGENT_HEAT_RULE = ($heatRule | ConvertTo-Json -Compress)
+    # VENUE-PROBE-HEAVY-SLOT-FEED-FORWARD-1: the FEED the rule is applied to rides with the rule. The in-job quiet probe picks its feed from $env:HEAVY_SLOT_FEED (else the default csv), so an
+    # agent started with -HeavySlotFeed X and no HEAVY_SLOT_FEED of its own would otherwise judge X while the job's gate read the default csv and still labelled its thresholds `agent`.
+    $env:HEAVY_SLOT_FEED = $HeavySlotFeed
     $env:MLV_AGENT_ADMISSION = $script:Admission.label
     $env:MLV_AGENT_ADMISSION_THERMAL = [string]$script:Admission.thermal
     $env:MLV_AGENT_ADMISSION_WAIT_SEC = [string]$script:Admission.waitedSec

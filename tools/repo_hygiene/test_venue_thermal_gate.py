@@ -2256,5 +2256,74 @@ class AgentThresholdParityR6Tests(unittest.TestCase):
         self.check(cases, want)
 
 
+@requires_windows_pwsh
+class AgentHeavySlotFeedForwardTests(unittest.TestCase):
+    """VENUE-PROBE-HEAVY-SLOT-FEED-FORWARD-1 (key3 opus r6 on #800 0b4e4ed3). The agent judges heat on its own $HeavySlotFeed, and the in-job quiet probe (Wait-VenueQuiet.ps1) picks its feed
+    from $env:HEAVY_SLOT_FEED, else the default csv. The agent used to put the heat RULE in the job env (PARITY-1) but not the FEED, so an agent started with -HeavySlotFeed X (and no
+    HEAVY_SLOT_FEED in its own env) judged X while the job's gate read the default csv and still labelled its thresholds `agent`. The job env must carry the agent's EFFECTIVE feed.
+    The agent's own PARITY-1 block (taken from its text between two fixed lines, never restated) runs in a child shell and a grandchild stands for the job."""
+
+    START = "$env:MLV_AGENT_HEAT_RULE = ($heatRule | ConvertTo-Json -Compress)"
+    END = "$holderLossLogged = $false"
+    DEFAULT_FEED = r"C:\temp\hwinfo-log-adapter.csv"
+
+    def block(self) -> str:
+        agent = AGENT.read_text(encoding="utf-8")
+        body = agent[agent.index("function Invoke-QueuedJob"):]
+        a = body.index(self.START)
+        return body[a:body.index(self.END, a)]
+
+    @staticmethod
+    def quote(text: str) -> str:
+        return "'" + text.replace("'", "''") + "'"
+
+    def job_env(self, feed: str, *, agent_env_feed: str | None, tail: str) -> str:
+        """Run the agent's job-env block with $HeavySlotFeed = feed (the agent's own process env holding agent_env_feed as HEAVY_SLOT_FEED, or none), then a child standing for the job runs `tail`."""
+        import os
+        env = {k: v for k, v in os.environ.items() if k != "HEAVY_SLOT_FEED"}
+        if agent_env_feed is not None:
+            env["HEAVY_SLOT_FEED"] = agent_env_feed
+        script = ("$ErrorActionPreference = 'Stop'\n"
+                  "$heatRule = [ordered]@{ maxThrottledRows = 6; meanMaxC = 88.0; sustainedRows = 60; feedStaleSec = 120 }\n"
+                  "$script:Admission = [pscustomobject]@{ label = 'clear'; thermal = 'clear'; waitedSec = 0; heavySlotHeld = $null }\n"
+                  f"$HeavySlotFeed = '{feed}'\n" + self.block() + "\n"
+                  f"& '{PWSH}' -NoLogo -NoProfile -NonInteractive -Command {self.quote(tail)}\n")
+        r = subprocess.run([str(PWSH), "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, timeout=180, env=env)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        return r.stdout.strip()
+
+    def test_the_job_env_carries_the_agents_effective_feed(self) -> None:
+        tail = "[Console]::Out.Write([string]$env:HEAVY_SLOT_FEED)"
+        # the agent got -HeavySlotFeed explicitly and its own env has no HEAVY_SLOT_FEED: the job must not fall back to the default csv
+        self.assertEqual(self.job_env(r"C:\temp\hot.csv", agent_env_feed=None, tail=tail), r"C:\temp\hot.csv")
+        # the agent's own env names another feed than the one it runs with (the param wins in the agent): the job gets the one the agent decides on
+        self.assertEqual(self.job_env(r"C:\temp\hot.csv", agent_env_feed=r"C:\temp\stale-env.csv", tail=tail), r"C:\temp\hot.csv")
+        # the agent on its default feed: the job gets that feed, spelled out
+        self.assertEqual(self.job_env(self.DEFAULT_FEED, agent_env_feed=None, tail=tail), self.DEFAULT_FEED)
+
+    def test_the_card_repro_the_gate_reads_the_agents_hot_feed_never_the_default(self) -> None:
+        import tempfile
+        d = Path(tempfile.mkdtemp(prefix="feed-forward-"))
+        hot = d / "hot.csv"
+        hot.write_text("\n".join(["Date,Time,Tick,PackageC,PackageW,CoreThrottling,RingThrottling"]
+                                 + [f"10/24/2026,08:00:{i:02d},{i},90.0,40.0,No,No" for i in range(15)]) + "\n", encoding="utf-8")   # 15 rows at 90 C: hot under the default rule (mean >= 88)
+        # the agent's own feed reader and verdict decide on the feed path the JOB hands the probe: the probe's ONE feed-path line (taken from Wait-VenueQuiet.ps1) run in the job's env
+        feed_line = next(ln.strip() for ln in QUIET.read_text(encoding="utf-8").splitlines() if ln.startswith("$HeatFeedPath = "))
+        tail = (agent_fn_ps("ConvertFrom-HeavySlotFeedRows", "", "") + "\n" + agent_fn_ps("Get-SustainedHeatVerdict", "$GateSustainedRows = 60; $GateMaxThrottledRows = 6; $GateMeanMaxC = 88.0", "") + "\n"
+                + feed_line + "\n"
+                "$m = $null; if (Test-Path -LiteralPath $HeatFeedPath) { $m = ConvertFrom-HeavySlotFeedRows -Lines @(Get-Content -LiteralPath $HeatFeedPath) }\n"
+                "[Console]::Out.Write('' + $HeatFeedPath + '|' + (Get-SustainedHeatVerdict -Metrics $m).state)")
+        got = self.job_env(str(hot), agent_env_feed=None, tail=tail)
+        self.assertEqual(got, f"{hot}|hot", "the job's gate must read the agent's feed (hot), not the default csv")
+
+    def test_every_heavy_slot_child_the_agent_starts_forwards_the_feed_it_decides_on(self) -> None:
+        # the class: each child launch that reads the heat feed (heavy-slot.py status / holder / lease request / lease renew) sets HEAVY_SLOT_FEED from $HeavySlotFeed; the job is the one child that
+        # takes it from the process env, set in the PARITY-1 block
+        agent = AGENT.read_text(encoding="utf-8")
+        self.assertEqual(len(re.findall(r'\$si\.Environment\["HEAVY_SLOT_FEED"\] = \$HeavySlotFeed', agent)), 3)
+        self.assertEqual(len(re.findall(r"HEAVY_SLOT_DIR = \$HeavySlotDir; HEAVY_SLOT_FEED = \$HeavySlotFeed", agent)), 1)
+        self.assertEqual(self.block().count("$env:HEAVY_SLOT_FEED = $HeavySlotFeed"), 1)
+
+
 if __name__ == "__main__":
     unittest.main()
