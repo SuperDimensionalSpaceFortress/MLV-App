@@ -3682,3 +3682,49 @@ def test_validate_refuses_a_million_space_bold_row_at_the_cap_in_bounded_time(tm
     rc, took = _timed(lambda: ob.main(["--repo", str(tmp_path), "validate", str(item)]))
     assert rc == 1 and "CARD_INVALID" in capsys.readouterr().err
     assert took < 10, f"{took:.1f}s to refuse a 1 MB card"
+
+
+# ---------- r4 fix 1: adversary pass on 1e217283 (A1 a margin strip ate a trailing CR, A2 strict file decode, A3 limits before Law 4) ----------
+
+def test_a_committed_card_that_ends_in_a_lone_cr_is_refused_by_every_committed_item_reader(tmp_path):
+    src, base = _range_repo(tmp_path)
+    name = "20261009-trailing-cr.md"
+    sha = _commit(src, {f"doctrine-outbox/{name}": item_text(target=CARDS, body=CARD_BODY + "\r")},
+                  f"add a card that ends in a lone CR\n\nDoctrine-Export: outbox {name}")
+    problems = [p for ps in ob.check_commits(src, f"{base}..HEAD", []).values() for p in ps]
+    assert problems and all("ITEM_CARD_LONE_CR" in p for p in problems), problems
+    assert [p for p in ob.check_commit_bare(src, sha, []) if "ITEM_CARD_LONE_CR" in p]
+    (entry,) = [e for e in ob.load_outbox_items(src, "HEAD") if e["name"] == name]
+    assert "ITEM_CARD_LONE_CR" in entry["error"]
+    assert ob._item_key(src, "HEAD", f"doctrine-outbox/{name}") is None
+
+
+def test_the_margin_strip_keeps_a_cr_and_still_strips_everything_else():
+    assert ob.strip_keeping_cr("  \n x \n\t") == "x"
+    assert ob.strip_keeping_cr("x\n\r") == "x\r"
+    assert ob.strip_keeping_cr("\r\nx") == "x"          # not a lone CR here: item_text_from_bytes read CRLF as LF first
+    assert ob.strip_keeping_cr("\rx") == "\rx"
+
+
+def test_a_file_read_decodes_strictly_and_a_git_blob_read_replaces_as_each_did_before():
+    with pytest.raises(UnicodeDecodeError):
+        ob.item_text_from_bytes(b"a\xffb", errors="strict")
+    assert ob.item_text_from_bytes(b"a\xffb") == "a�b"
+
+
+def test_validate_refuses_a_128000_character_word_at_the_cap_before_the_law4_email_scan(tmp_path, capsys):
+    body = CARD_BODY.replace("rule: the rule\n", "rule: " + "x" * 128000 + "\n", 1)
+    item = _write_card_item(tmp_path, body)
+    rc, took = _timed(lambda: ob.main(["--repo", str(tmp_path), "validate", str(item)]))
+    assert rc == 1 and "CARD_INVALID" in capsys.readouterr().err
+    assert took < _PRE_CAP_BUDGET_S, f"{took:.1f}s to refuse a 128 KB word: Law 4 scanned it before the cap"
+
+
+def test_check_commits_refuses_a_128000_character_word_at_the_cap_before_the_law4_email_scan(tmp_path):
+    src, base = _range_repo(tmp_path)
+    name = "20261009-long-word.md"
+    _commit(src, {f"doctrine-outbox/{name}": item_text(target=CARDS, body=CARD_BODY.replace("rule: the rule\n", "rule: " + "x" * 128000 + "\n", 1))},
+            f"add a card with a long word\n\nDoctrine-Export: outbox {name}")
+    failures, took = _timed(lambda: ob.check_commits(src, f"{base}..HEAD", []))
+    assert [p for ps in failures.values() for p in ps if "CARD_INVALID" in p]
+    assert took < _PRE_CAP_BUDGET_S, f"{took:.1f}s"

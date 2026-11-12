@@ -566,12 +566,22 @@ def _run_git(repo: pathlib.Path, args: list[str], input_text: str | None = None,
     )
 
 
-def item_text_from_bytes(raw: bytes) -> str:
+def item_text_from_bytes(raw: bytes, errors: str = "replace") -> str:
     """An outbox item's text with CRLF read as LF and NOTHING else changed. The default text readers (read_text, a text-mode git
     pipe) also turn a lone CR into LF, which splits one row of a card into two: `rule: x<CR>check: hidden` is ONE row to the bus
     validator (a fused key) and two accepted fields after that translation, so the screen never saw the fusion and the drain
-    rendered a duplicate field the bus then rejected (Sol r3 B1). A lone CR is kept here and refused by parse_item for a card."""
-    return raw.decode("utf-8", errors="replace").replace("\r\n", "\n")
+    rendered a duplicate field the bus then rejected (Sol r3 B1). A lone CR is kept here and refused by parse_item for a card.
+    `errors` is "strict" for a file read (as read_text was) and "replace" for a git blob (as the text pipe was)."""
+    return raw.decode("utf-8", errors=errors).replace("\r\n", "\n")
+
+
+def strip_keeping_cr(text: str) -> str:
+    """text.strip() that does not drop a CR from the margins it strips: a trailing lone CR is a card byte the bus reads (the adversary
+    pass on 1e217283 A1 found .strip() removing it, so a committed card ending in one passed both commit checks)."""
+    core = text.strip()
+    lead, trail = text[:len(text) - len(text.lstrip())], text[len(text.rstrip()):]
+    lone = re.compile(r"\r(?!\n)")   # a CR before an LF is a line end the margin strip may drop
+    return ("\r" if lone.search(lead) else "") + core + ("\r" if lone.search(trail) else "")
 
 
 def git_show_item_text(repo: pathlib.Path, spec: str) -> tuple[int, str, str]:
@@ -581,7 +591,7 @@ def git_show_item_text(repo: pathlib.Path, spec: str) -> tuple[int, str, str]:
         ["git", "-C", str(repo), "-c", "core.autocrlf=false", "-c", "core.safecrlf=false", "show", spec],
         capture_output=True, timeout=120, env=env,
     )
-    return (proc.returncode, item_text_from_bytes(proc.stdout).strip(),
+    return (proc.returncode, strip_keeping_cr(item_text_from_bytes(proc.stdout)),
             proc.stderr.decode("utf-8", errors="replace").strip())
 
 
@@ -955,6 +965,18 @@ def screen_rendered_card(item: dict) -> None:
     with the resolved 40-hex source commit, so PENDING is judged at that full width."""
     if item["meta"]["target"] != CARDS_TARGET:
         return
+    screen_card_limits(item)
+    # The limits come first: the field-key screen reads every row, so an input past the cap must be refused before it, not after
+    # a scan whose cost grows with the input (Sol r3 B2). Inside the cap the screen's input is at most 2,000 bytes.
+    screen_card_field_keys(item["body"])
+
+
+def screen_card_limits(item: dict) -> None:
+    """The validator's line and byte limits on the RENDERED card, applied alone. The validate and commit paths call it BEFORE the
+    Law-4 screen, whose email pattern scans a long unbroken word in quadratic time: an input past the cap is refused here first
+    (the adversary pass on 1e217283 A3: a 128,000-character word took 11.6 s to reach CARD_INVALID)."""
+    if item["meta"]["target"] != CARDS_TARGET:
+        return
     src = item["meta"]["source_commit"]
     _key, block = render_block(item, "0" * 40 if src == "PENDING" else src)
     rows = block.replace("\r\n", "\n").strip("\n").split("\n")
@@ -963,9 +985,6 @@ def screen_rendered_card(item: dict) -> None:
         raise Refusal("CARD_INVALID", f"rendered card is {len(rows)} lines; the limit is {MAX_CARD_LINES}")
     if size > MAX_CARD_BYTES:
         raise Refusal("CARD_INVALID", f"rendered card is {size} bytes; the limit is {MAX_CARD_BYTES}")
-    # The limits come first: the field-key screen reads every row, so an input past the cap must be refused before it, not after
-    # a scan whose cost grows with the input (Sol r3 B2). Inside the cap the screen's input is at most 2,000 bytes.
-    screen_card_field_keys(item["body"])
 
 
 # ---------- repository queries (committed bytes only, never the worktree) ----------
@@ -2318,6 +2337,7 @@ def check_commit_bare(repo: pathlib.Path, sha: str, deny_terms: list[tuple[str, 
             if rc != 0:
                 raise GitError(f"git show {sha}:{p} (in {repo}): {err}")
             item = parse_item(text + "\n")
+            screen_card_limits(item)
             screen_law4(item["body"], deny_terms)
             screen_rendered_card(item)
         except Refusal as e:
@@ -2361,6 +2381,7 @@ def check_commit(repo: pathlib.Path, sha: str, added_items: set[str],
             continue
         try:
             parsed = parse_item(text + "\n")
+            screen_card_limits(parsed)
             screen_law4(parsed["body"], deny_terms)
             screen_rendered_card(parsed)
         except Refusal as e:
@@ -5233,10 +5254,11 @@ def cmd_validate(paths: list[pathlib.Path], deny_terms: list[tuple[str, str]],
             # a file that validates here has to be one the drain will accept.
             if not ITEM_NAME_RE.match(p.name):
                 raise Refusal("ITEM_BAD_FILENAME", p.name)
-            text = item_text_from_bytes(p.read_bytes())
+            text = item_text_from_bytes(p.read_bytes(), errors="strict")
             if not text.endswith("\n"):
                 text += "\n"
             item = parse_item(text)
+            screen_card_limits(item)
             screen_law4(item["body"], deny_terms)
             screen_rendered_card(item)
             unchecked = screen_ruling_candidate(item, bus, own_candidate_slug(p.name))
