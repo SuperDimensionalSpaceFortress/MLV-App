@@ -61,7 +61,9 @@ $lift = @('Resolve-HeavySlotPython', 'Get-ProcessIdentity', 'Test-EpochMillisClo
     # hardening r2: the real child launch, the process-tree kill and the adopt path, so the ceiling kill is driven against a real child
     'Start-WindowlessRedirectedProcess', 'Complete-WindowlessRedirectedProcess', 'Set-LaunchedMarkerFields', 'Stop-VerifiedProcessIdentities', 'Invoke-AdoptStartedJob', 'Get-RecoveredAdmission',
     # r4 (master merge of AGENT-TIMESTAMP-PARSE-TZ-1): Invoke-AdoptStartedJob now reads the marker's startedUtc through this helper
-    'ConvertTo-UtcDateTime')
+    'ConvertTo-UtcDateTime',
+    # BACHELOR-THERMAL-GATE-AGENT-THRESHOLD-PARITY-1 r2: Invoke-QueuedJob calls it for the heat rule it publishes
+    'Get-AgentHeatRule')
 foreach ($name in $lift) { $fn = Find-Function $name; Assert-True ($null -ne $fn) "agent defines $name"; . ([scriptblock]::Create($fn.Extent.Text)) }
 # The function under change: lifted when present, so a base agent runs every behavioural case and fails each on behaviour.
 $classifyFn = Find-Function 'Get-GateExemptClass'
@@ -87,6 +89,8 @@ foreach ($p in $ast.ParamBlock.Parameters) { if ($p.DefaultValue -is [System.Man
 $GateExemptJobPattern = [string]$paramDefaults['GateExemptJobPattern']
 $GateStageJobPattern = $paramDefaults['GateStageJobPattern']
 $StageExemptMaxSec = $paramDefaults['StageExemptMaxSec']
+# BACHELOR-THERMAL-GATE-AGENT-THRESHOLD-PARITY-1 r2: Invoke-QueuedJob publishes Get-AgentHeatRule, which reads the agent's own heat params.
+$GateSustainedRows = [int]$paramDefaults['GateSustainedRows']; $GateMaxThrottledRows = [int]$paramDefaults['GateMaxThrottledRows']; $GateMeanMaxC = [double]$paramDefaults['GateMeanMaxC']; $GateFeedStaleSec = [int]$paramDefaults['GateFeedStaleSec']
 $agentText = [IO.File]::ReadAllText($agentScript)
 # hardening r2: the immutable default grammar Get-GateExemptClass ANDs with the effective pattern (a base agent has none: its classifier ignores this).
 $grammarAst = $ast.Find({ param($n) $n -is [System.Management.Automation.Language.AssignmentStatementAst] -and $n.Left.Extent.Text -eq '$script:StageGrammarDefault' }, $true)
