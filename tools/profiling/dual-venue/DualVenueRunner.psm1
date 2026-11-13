@@ -1915,6 +1915,54 @@ function Get-DvReconReleaseDeferredEvidence {
     [ordered]@{ requested = $requested; observed = $observed; counts = $counts; verdict = $verdict; reason = $reason; blocks = ($verdict -ceq 'NOT_HONOURED') }
 }
 
+function Get-DvDueWakeDeliveryEvidence {
+    <#
+    .SYNOPSIS
+    HFR-NATIVE-M16-1457-FULLSCREEN-S1S2-PRESENT-GAP-1 r1: did a leg run with the due-wake delivery its arm names? A leg that asks for the posted wake
+    (generatorArgs.dueWakeDeliveryPost = true, which sets MLVAPP_PLAYBACK_DUE_WAKE_DELIVERY=post) must report delivery_kind=post; any other leg is the head
+    arm and must report delivery_kind=send whenever it reports one. Read ONLY from the app's own `playback_due_wake armed=<n> ...` record bodies (the
+    delivery_kind field r1 appends; one line per Play), never from the start line, the spec or the launcher's env block. FAIL CLOSED: `blocks` is true when
+    the leg asked and no playback_due_wake line carries a delivery_kind (a binary before r1 emits none), a field is unreadable, two lines disagree, or the
+    value is not post. A leg that does not ask blocks when a readable delivery_kind is anything but send (DUE_WAKE_DELIVERY_INHERITED: the variable came
+    from the launcher, or the wake fell back) or the field is unreadable; with no delivery_kind at all (a control binary before r1) it is unchanged. Pure and
+    shared: the runner gates on it and Test-DvReceiptValid re-derives it from the hashed run log.
+    #>
+    param([Parameter(Mandatory)]$Spec, [AllowNull()][AllowEmptyString()][string]$LogText)
+    $raw = Get-DvProp (Get-DvProp $Spec 'generatorArgs') 'dueWakeDeliveryPost'
+    $requested = ($raw -is [bool]) -and $raw
+    $observed = $null
+    $verdict = 'NOT_REQUESTED'
+    $reason = $null
+    $mentions = 0
+    $unreadableSeen = $false
+    $values = New-Object System.Collections.Generic.List[string]
+    if (-not [string]::IsNullOrEmpty($LogText)) {
+        foreach ($l in (Get-DvLogRecordBodies -LogText $LogText)) {
+            if ($l -notmatch '(?:^|\s)playback_due_wake armed=') { continue }
+            $fields = [regex]::Matches($l, '(?:^|\s)delivery_kind=(?<k>\S*)')
+            if ($fields.Count -eq 0) { continue }
+            $mentions++
+            if ($fields.Count -ne 1 -or $fields[0].Groups['k'].Value -cnotmatch '^(send|post|notifier|qtimer|none)$') { $unreadableSeen = $true; continue }
+            $values.Add($fields[0].Groups['k'].Value)
+        }
+    }
+    $distinct = @($values | Select-Object -Unique)
+    if (-not $unreadableSeen -and $distinct.Count -eq 1) { $observed = [string]$distinct[0] }
+    $unreadable = 'the due-wake delivery is unreadable: a playback_due_wake line carries a delivery_kind that is not exactly one of send, post, notifier, qtimer, none (MainWindow::playbackDueWakeSummaryLine), or two lines disagree'
+    if ($requested) {
+        $verdict = 'NOT_HONOURED'
+        if ($mentions -eq 0) { $reason = 'ROUTE_NOT_ENGAGED: no playback_due_wake line in the run log carries a delivery_kind, so the binary does not report how the wake was delivered' }
+        elseif ($null -eq $observed) { $reason = $unreadable }
+        elseif ($observed -cne 'post') { $reason = "ROUTE_NOT_ENGAGED: the run's playback_due_wake says delivery_kind=$observed, not the post the leg names" }
+        else { $verdict = 'HONOURED' }
+    }
+    elseif ($mentions -gt 0) {
+        if ($null -eq $observed) { $verdict = 'NOT_HONOURED'; $reason = $unreadable }
+        elseif ($observed -cne 'send') { $verdict = 'NOT_HONOURED'; $reason = "DUE_WAKE_DELIVERY_INHERITED: the leg does not ask for the posted wake but the app reports delivery_kind=$observed, so this run is not the head arm" }
+    }
+    [ordered]@{ requested = $requested; observed = $observed; verdict = $verdict; reason = $reason; blocks = ($verdict -ceq 'NOT_HONOURED') }
+}
+
 # The flavors the app can apply (src/batch/LookAssistAnalysis.cpp lookAssistFlavorName). The app's `look_assist_flavor=none` (nothing applied) is not among them.
 $script:DvAppliedLookFlavors = @('classic', 'cinematic', 'film', 'vision50d')
 
@@ -2513,7 +2561,7 @@ function Read-DvContactFrames {
 # -ContactSheetSeekFrames they are now forwarded as, strictly ascending and at most 999999999). Returns the refusal text, or $null.
 $script:LegTypes = @('speed', 'look')   # leg-spec.schema.json properties.legType.enum
 # the generatorArgs members leg-spec.schema.json types boolean (prepConflatedMove: const true); a test pins this list to the schema
-$script:GeneratorArgsBooleanSwitches = @('forceLookAssist', 'corePartitionTelemetry', 'disableLookAssist', 'presentTrace', 'firstPresentCapture', 'warmReuseMissDump', 'unpaced', 'disablePrepPointwiseFast', 'prepConflatedMove', 'utilSample', 'disableReconReleaseDeferred')
+$script:GeneratorArgsBooleanSwitches = @('forceLookAssist', 'corePartitionTelemetry', 'disableLookAssist', 'presentTrace', 'firstPresentCapture', 'warmReuseMissDump', 'unpaced', 'disablePrepPointwiseFast', 'prepConflatedMove', 'utilSample', 'disableReconReleaseDeferred', 'dueWakeDeliveryPost')
 function Get-DvLegSpecShapeRefusal {
     param($Spec)
     if ($Spec -isnot [System.Management.Automation.PSCustomObject]) { return 'the leg spec must be a single JSON object' }
@@ -4099,6 +4147,20 @@ function Test-DvReceiptValid {
                 }
             }
             elseif ($null -ne $storedReconRelease) { $invalid.Add('RECON_RELEASE_DEFERRED_NOT_FROM_EVIDENCE: the receipt carries a reconReleaseDeferred block but its committed leg spec names no disableReconReleaseDeferred') }
+            # HFR-NATIVE-M16-1457-FULLSCREEN-S1S2-PRESENT-GAP-1 r1: a leg whose due-wake delivery is not the one its arm names (post when it asks, otherwise
+            # send when reported) is no measurement of its arm; the receipt's own dueWakeDelivery block is re-derived like the reconReleaseDeferred block.
+            $dueWakeDeliveryVerdict = Get-DvDueWakeDeliveryEvidence -Spec $spec -LogText $ev.logText
+            if ($dueWakeDeliveryVerdict.blocks) { $invalid.Add("DUE_WAKE_DELIVERY_NOT_HONOURED: $($dueWakeDeliveryVerdict.reason); a run whose due-wake delivery is not the one its leg names (post when it asks, otherwise send) is no measurement of that arm") }
+            $storedDueWakeDelivery = Get-DvProp $Receipt 'dueWakeDelivery'
+            if ($dueWakeDeliveryVerdict.requested) {
+                if ($null -eq $storedDueWakeDelivery) { $incomplete.Add('RECEIPT_FIELD_ABSENT: the receipt carries no dueWakeDelivery block (requested / observed / verdict) and its committed spec names a dueWakeDeliveryPost') }
+                else {
+                    foreach ($f in @('requested', 'observed', 'verdict')) {
+                        if (-not (Test-DvJsonEquivalent (Get-DvProp $storedDueWakeDelivery $f) $dueWakeDeliveryVerdict[$f])) { $invalid.Add("DUE_WAKE_DELIVERY_NOT_FROM_EVIDENCE: dueWakeDelivery.$f is not what the hashed run log and the committed leg spec derive") }
+                    }
+                }
+            }
+            elseif ($null -ne $storedDueWakeDelivery) { $invalid.Add('DUE_WAKE_DELIVERY_NOT_FROM_EVIDENCE: the receipt carries a dueWakeDelivery block but its committed leg spec names no dueWakeDeliveryPost') }
         }
 
         # ---- the CONFORM ARM the run played under: re-derived from the HASHED run log and the COMMITTED spec (HFR-NATIVE-60FPS-FULLRES-1) ----
@@ -4917,6 +4979,6 @@ Export-ModuleMember -Function Get-DvOutcomeEnum, ConvertTo-DvCanonicalJson, Get-
     ConvertTo-DvLfBytes, Get-DvLegSpecSha256, Get-DvDerivedBackend, Get-DvBackendNotDerivable, Read-DvContactFrames, Get-DvLegSpecShapeRefusal, Get-DvPngImageProblem, Get-DvPairedSeekVerdict, Get-DvSubjectDigest,
     Get-DvVisualViewportPixels, Get-DvVisualMeanAbsDiff, Get-DvExposureMedian, Get-DvVisualExposureStats, Get-DvExposureBand, Get-DvVisualVerdict, Get-DvVisualSourceDifference, Get-DvFrameNumber, New-DvVisualStrip, Read-DvVisualCaptures, Get-DvVisualCaptureRequest, Read-DvVenueTable, ConvertFrom-DvVenueTableText, Get-DvVenueRole, Get-DvProp, Get-DvCommittedFile, Resolve-DvAdmissionSources,
     Test-DvUnderClaudeState, Test-DvLocalReceiptRoot, Read-DvClipConsent, Get-DvClipAdmission, Get-DvSmokeSummaryFields, Get-DvConformPaceProof, Get-DvConformArmVerdict, Get-DvMinPlaySeconds, Get-DvPlaybackProblems,
-    Get-DvPlaybackEvidence, Get-DvScaleEvidence, Get-DvScaleLabel, Get-DvDisplayEvidence, Get-DvUnpacedEvidence, Get-DvLookLabelEvidence, Get-DvWorkerThreadsEvidence, Get-DvPrepConflatedMoveEvidence, Get-DvReconReleaseDeferredEvidence, Get-DvLookAssistEvidence, Get-DvLegSetPlan, Get-DvSmokeSessionLineFields, Get-DvSmokeSessionLineRead, Get-DvLogRecordBody, Get-DvMatrixRates, Get-DvMatrixRow, Get-DvMedian, ConvertTo-DvMatrixTable, Get-DvBlobById, Find-DvCommittedLegSpec, Read-DvCommittedLookReceipt, Read-DvEvidenceSet, Test-DvJsonEquivalent, Test-DvReceiptValid, Get-DvJobNotAfter, Get-DvUmRunNotAfterArgs, Get-DvUmRunDropVisibleUtc, Get-DvUmRunDropNotAfter, Test-DvNotAfterCoversDrop, Get-DvHealthVerdict,
+    Get-DvPlaybackEvidence, Get-DvScaleEvidence, Get-DvScaleLabel, Get-DvDisplayEvidence, Get-DvUnpacedEvidence, Get-DvLookLabelEvidence, Get-DvWorkerThreadsEvidence, Get-DvPrepConflatedMoveEvidence, Get-DvReconReleaseDeferredEvidence, Get-DvDueWakeDeliveryEvidence, Get-DvLookAssistEvidence, Get-DvLegSetPlan, Get-DvSmokeSessionLineFields, Get-DvSmokeSessionLineRead, Get-DvLogRecordBody, Get-DvMatrixRates, Get-DvMatrixRow, Get-DvMedian, ConvertTo-DvMatrixTable, Get-DvBlobById, Find-DvCommittedLegSpec, Read-DvCommittedLookReceipt, Read-DvEvidenceSet, Test-DvJsonEquivalent, Test-DvReceiptValid, Get-DvJobNotAfter, Get-DvUmRunNotAfterArgs, Get-DvUmRunDropVisibleUtc, Get-DvUmRunDropNotAfter, Test-DvNotAfterCoversDrop, Get-DvHealthVerdict,
     New-DvHealthProbeJobText, ConvertFrom-DvProbeStdout,
     Get-DvResultToken, Resolve-DvJobOutcome, Test-DvCriteria, Get-DvPresentMonGapVerdict, Get-DvVerbatimMetrics, Get-DvCriteriaMetrics, New-DvReceipt, Write-DvReceipt

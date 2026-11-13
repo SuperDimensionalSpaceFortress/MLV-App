@@ -240,6 +240,12 @@ SHIPPED_LEGS = (*SHIPPED_LEGS, *NATIVE_TRACE_D4_LEGS)
 # MLVAPP_GPU_RECON_RELEASE_DEFERRED=0), keyed to the paced cell it twins (legId and that key are the only differences). The head arm is the cell itself.
 RELEASE_SYNC_LEGS = {"legs/m16-1457-native-fullscreen-s2-release-sync.json": "legs/m16-1457-native-fullscreen-s2.json"}
 SHIPPED_LEGS = (*SHIPPED_LEGS, *RELEASE_SYNC_LEGS)
+# HFR-NATIVE-M16-1457-FULLSCREEN-S1S2-PRESENT-GAP-1 r1: the isolation arm of the due-wake delivery A/B (generatorArgs.dueWakeDeliveryPost true ->
+# MLVAPP_PLAYBACK_DUE_WAKE_DELIVERY=post, the wake posted as before r1), keyed to the fullscreen cell it twins (legId and that key are the only differences).
+# The head arm is the cell itself (the wake sent).
+WAKE_POST_LEGS = {"legs/m16-1457-native-fullscreen-s1-wake-post.json": "legs/m16-1457-native-fullscreen-s1.json",
+                  "legs/m16-1457-native-fullscreen-s2-wake-post.json": "legs/m16-1457-native-fullscreen-s2.json"}
+SHIPPED_LEGS = (*SHIPPED_LEGS, *WAKE_POST_LEGS)
 # CPU-S1-RECON-CHAIN-ATTRIBUTION-1: the capture-free CPU fullscreen s1 arms that attribute the frame interval: control (c), prep fast path off (p), a worker cap of 12 (t12), Look Assist off (l).
 CHAINATTR_LEGS = tuple(f"legs/m16-1243-chainattr-{arm}-fullscreen-s1.json" for arm in ("c", "p", "t12", "l"))
 SHIPPED_LEGS = (*SHIPPED_LEGS, *CHAINATTR_LEGS)
@@ -1120,6 +1126,28 @@ class GeneratorByteIdentityAndVariantTests(unittest.TestCase):
                         "the mapping must sit outside the forceLookAssist branch")
         schema = json.loads((DV / "leg-spec.schema.json").read_text(encoding="utf-8"))
         self.assertEqual(schema["properties"]["generatorArgs"]["properties"]["disableReconReleaseDeferred"]["type"], "boolean")
+
+    def test_the_posted_due_wake_reaches_the_apps_env_only_when_asked(self) -> None:
+        """HFR-NATIVE-M16-1457-FULLSCREEN-S1S2-PRESENT-GAP-1 r1: -DueWakeDeliveryPost adds MLVAPP_PLAYBACK_DUE_WAKE_DELIVERY=post to the app's env list
+        exactly once; absent, the job is the text it was (the head arm sets nothing: the app's default is the sent wake). The runner maps
+        generatorArgs.dueWakeDeliveryPost true for any leg (outside the forceLookAssist branch); the schema types it as a boolean."""
+        plain = self.generate(GENERATOR, "dwd-plain.job.ps1", []).read_text(encoding="utf-8").replace("\r\n", "\n")
+        self.assertNotIn("MLVAPP_PLAYBACK_DUE_WAKE_DELIVERY", plain)
+        job = self.generate(GENERATOR, "dwd-post.job.ps1", ["-DueWakeDeliveryPost"])
+        self.assertEqual(self.parse_errors(job), 0)
+        text = job.read_text(encoding="utf-8").replace("\r\n", "\n")
+        line = "    'MLVAPP_PLAYBACK_DUE_WAKE_DELIVERY=post',\n"
+        self.assertEqual(text.count("MLVAPP_PLAYBACK_DUE_WAKE_DELIVERY"), 1)
+        self.assertIn("'MLVAPP_PLAYBACK_PHASE3_UNATTENDED=1',\n" + line, text)
+        self.assertEqual(text.replace(line, ""), plain, "the switch is the only difference from the plain job")
+        runner = (DV / "Invoke-VenueLeg.ps1").read_text(encoding="utf-8")
+        mapping = ("if ($spec.generatorArgs.PSObject.Properties['dueWakeDeliveryPost'] -and $spec.generatorArgs.dueWakeDeliveryPost -is [bool] "
+                   "-and $spec.generatorArgs.dueWakeDeliveryPost) { $gen['DueWakeDeliveryPost'] = $true }")
+        self.assertEqual(runner.count(mapping), 1)
+        self.assertLess(runner.index(mapping), runner.index("if (-not $isLook -and $spec.generatorArgs.PSObject.Properties['forceLookAssist']"),
+                        "the mapping must sit outside the forceLookAssist branch")
+        schema = json.loads((DV / "leg-spec.schema.json").read_text(encoding="utf-8"))
+        self.assertEqual(schema["properties"]["generatorArgs"]["properties"]["dueWakeDeliveryPost"]["type"], "boolean")
 
     def test_the_runner_passes_a_legs_swap_interval_to_the_generator(self) -> None:
         runner = (DV / "Invoke-VenueLeg.ps1").read_text(encoding="utf-8")
@@ -7797,19 +7825,23 @@ class LegSpecSchemaTests(unittest.TestCase):
                 self.assertRegex(spec["legId"], r"^m16-145[67]-conform-(fullscreen|windowed)-s1$", path.name)
             elif spec["card"] == "HFR-NATIVE-60FPS-FULLRES-1":   # the native-HFR capture-free speed legs on M16-1457, named by cell and lever
                 self.assertEqual(spec["legId"], path.stem, path.name)
-                self.assertRegex(spec["legId"], r"^m16-1457-native-(fullscreen|windowed)-s1(-nola|-la3|-heavy)?$", path.name)
+                self.assertRegex(spec["legId"], r"^m16-1457-native-(fullscreen|windowed)-s1(-nola|-la3|-heavy|-wake-post)?$", path.name)
+                # -wake-post: the posted-due-wake isolation twin (HFR-NATIVE-M16-1457-FULLSCREEN-S1S2-PRESENT-GAP-1 r1, WAKE_POST_LEGS); no other leg sets it
+                self.assertEqual(spec["generatorArgs"].get("dueWakeDeliveryPost", False), spec["legId"].endswith("-wake-post"), path.name)
             elif spec["card"] == "CPU-DUALISO-REDUCED-ISO-NOTCH-1":   # the cpu-only legs that engage the CPU reduced recon, named by their cell
                 self.assertEqual(spec["legId"], path.stem, path.name)
                 self.assertRegex(spec["legId"], r"^m16-1243-cpu-reduced-(fullscreen|windowed)-s[24]$", path.name)
                 self.assertEqual(spec["backends"], ["cpu"], path.name)
                 self.assertEqual(spec["generatorArgs"]["playbackProcessing"], "receipt", path.name)
-            elif spec["card"] == "CUDA-HEADROOM-1" and "legs/" + path.name in (*NATIVE_PACED_LEGS, *NATIVE_TRACE_LEGS, *RELEASE_SYNC_LEGS):   # the PACED M16-1457 native s2/s4 legs (r2 of the LUT-keep card)
-                # and their per-present trace twins (HFR-NATIVE-M16-1457-PRESENT-TRACE-LEGS-1, NATIVE_TRACE_LEGS; presentTrace only on a -trace- leg), and the
+            elif spec["card"] == "CUDA-HEADROOM-1" and "legs/" + path.name in (*NATIVE_PACED_LEGS, *NATIVE_TRACE_LEGS, *RELEASE_SYNC_LEGS, *WAKE_POST_LEGS):   # the PACED M16-1457 native s2/s4 legs (r2 of the LUT-keep card)
+                # and their per-present trace twins (HFR-NATIVE-M16-1457-PRESENT-TRACE-LEGS-1, NATIVE_TRACE_LEGS; presentTrace only on a -trace- leg), the
                 # deferred-release isolation twin (HFR-NATIVE-M16-1457-GUI-TEXTURE-PRESENT-OFFLOAD-1 r7, RELEASE_SYNC_LEGS; the kill switch only on a -release-sync leg)
+                # and the posted-due-wake isolation twin (HFR-NATIVE-M16-1457-FULLSCREEN-S1S2-PRESENT-GAP-1 r1, WAKE_POST_LEGS; the key only on a -wake-post leg)
                 self.assertEqual(spec["legId"], path.stem, path.name)
-                self.assertRegex(spec["legId"], r"^m16-1457-native-(trace-)?(fullscreen|windowed)-s[24](-release-sync)?$", path.name)
+                self.assertRegex(spec["legId"], r"^m16-1457-native-(trace-)?(fullscreen|windowed)-s[24](-release-sync|-wake-post)?$", path.name)
                 self.assertEqual(spec["generatorArgs"].get("presentTrace", False), "-trace-" in spec["legId"], path.name)
                 self.assertEqual(spec["generatorArgs"].get("disableReconReleaseDeferred", False), spec["legId"].endswith("-release-sync"), path.name)
+                self.assertEqual(spec["generatorArgs"].get("dueWakeDeliveryPost", False), spec["legId"].endswith("-wake-post"), path.name)
                 # paced: no unpaced switch and no swap-interval override (the app's own pacing), so the leg measures the shipping shape
                 self.assertNotIn("unpaced", spec["generatorArgs"], path.name)
                 self.assertNotIn("swapInterval", spec["generatorArgs"], path.name)
@@ -15123,6 +15155,134 @@ class ReconReleaseDeferredEvidenceTests(unittest.TestCase):
         v = self.verdict({}, self.log(self.record("1", deferred="412")))
         self.assertEqual(v["observed"], 1)
         self.assertEqual((v["counts"]["deferred"], v["counts"]["drained"], v["counts"]["maxDepth"], v["counts"]["outstandingAtStop"]), (412, 412, 2, 0))
+
+
+class DueWakeDeliveryLegSpecTests(unittest.TestCase):
+    """HFR-NATIVE-M16-1457-FULLSCREEN-S1S2-PRESENT-GAP-1 r1: the isolation arm of the due-wake delivery A/B is a named generatorArgs key; each isolation
+    twin differs from the cell it twins only in legId and that key, so no receipted cell changes a byte."""
+
+    def setUp(self) -> None:
+        try:
+            import jsonschema
+        except ImportError:
+            self.skipTest("jsonschema is required")
+        self.jsonschema = jsonschema
+        self.schema = json.loads((DV / "leg-spec.schema.json").read_text(encoding="utf-8"))
+
+    def test_each_isolation_twin_differs_from_its_cell_only_in_the_leg_id_and_the_key(self) -> None:
+        self.assertEqual(len(WAKE_POST_LEGS), 2, "two isolation twins: m16-1457 fullscreen s1 and s2, the card's gate cells")
+        for rel, cell_rel in WAKE_POST_LEGS.items():
+            with self.subTest(leg=rel):
+                twin = json.loads((DV / rel).read_text(encoding="utf-8"))
+                cell = json.loads((DV / cell_rel).read_text(encoding="utf-8"))
+                self.jsonschema.validate(twin, self.schema)
+                self.assertNotIn("dueWakeDeliveryPost", cell["generatorArgs"], cell_rel)
+                self.assertEqual(twin["legId"], cell["legId"] + "-wake-post")
+                self.assertIs(twin["generatorArgs"].pop("dueWakeDeliveryPost"), True)
+                self.assertEqual(dict(twin, legId=cell["legId"]), cell)
+                self.assertEqual(list(twin), list(cell), "the cell's keys in the cell's order")
+                self.assertTrue(cell["generatorArgs"].get("forceLookAssist"), "the gate cells run with Look Assist on")
+
+    def test_no_other_leg_sets_the_key(self) -> None:
+        for path in sorted((DV / "legs").glob("*.json")):
+            if "legs/" + path.name in WAKE_POST_LEGS:
+                continue
+            with self.subTest(leg=path.name):
+                self.assertNotIn("dueWakeDeliveryPost", json.loads(path.read_text(encoding="utf-8")).get("generatorArgs") or {})
+
+    def test_the_key_must_be_a_json_boolean(self) -> None:
+        twin = json.loads((DV / next(iter(WAKE_POST_LEGS))).read_text(encoding="utf-8"))
+        for bad in (0, 1, "1", "post", None):
+            with self.subTest(value=repr(bad)):
+                with self.assertRaises(self.jsonschema.ValidationError):
+                    self.jsonschema.validate(dict(twin, generatorArgs=dict(twin["generatorArgs"], dueWakeDeliveryPost=bad)), self.schema)
+
+    def test_the_runner_and_the_validator_both_gate_on_the_apps_own_readback(self) -> None:
+        module = (DV / "DualVenueRunner.psm1").read_text(encoding="utf-8")
+        self.assertIn("$dueWakeDeliveryVerdict = Get-DvDueWakeDeliveryEvidence -Spec $spec -LogText $ev.logText", module)
+        self.assertIn('if ($dueWakeDeliveryVerdict.blocks) { $invalid.Add("DUE_WAKE_DELIVERY_NOT_HONOURED:', module)
+        self.assertIn("Get-DvDueWakeDeliveryEvidence", module.split("Export-ModuleMember", 1)[1])
+        runner = (DV / "Invoke-VenueLeg.ps1").read_text(encoding="utf-8")
+        self.assertIn("$dueWakeDeliveryVerdict = Get-DvDueWakeDeliveryEvidence -Spec $spec -LogText $runLogText", runner)
+        self.assertIn("DUE_WAKE_DELIVERY_NOT_HONOURED", runner)
+        # the app emits the field the gate reads, on its playback_due_wake line, from the wake's own delivery
+        mw = (ROOT / "platform" / "qt" / "MainWindow.cpp").read_text(encoding="utf-8").replace("\r\n", "\n")
+        self.assertIn('reentrant_deferred=%5 delivery_kind=%6" )', mw)
+        self.assertIn('m_playbackDueWake ? QString::fromLatin1( m_playbackDueWake->deliveryKindName() ) : QStringLiteral( "none" )', mw)
+        self.assertIn('return QStringLiteral( "playback_due_wake armed=%1 ', mw)
+
+
+@requires_windows_pwsh
+class DueWakeDeliveryEvidenceTests(unittest.TestCase):
+    """Get-DvDueWakeDeliveryEvidence, pure: a leg that asks for the posted due wake counts only when the app's own playback_due_wake line reports
+    delivery_kind=post; a head-arm leg counts only when a reported delivery_kind is send. A value in the launcher's env block is a request, not engagement,
+    and a binary before r1 emits no delivery_kind, so an isolation leg on it is NOT_HONOURED rather than an unproven PASS."""
+
+    POST = {"generatorArgs": {"dueWakeDeliveryPost": True}}
+    PREFIX = "[2026-11-13T00:00:00.000Z] [INFO] [0x1a2b] "
+
+    def verdict(self, spec: dict, log: str) -> dict:
+        proc, out = run_pwsh_json("$s = $env:DVE_SPEC | ConvertFrom-Json\n(Get-DvDueWakeDeliveryEvidence -Spec $s -LogText $env:DVE_LOG) | ConvertTo-Json -Compress -Depth 4",
+                                  DVE_SPEC=json.dumps(spec), DVE_LOG=log)
+        self.assertIsNotNone(out, proc.stdout + proc.stderr)
+        return out
+
+    @staticmethod
+    def wake(kind: str | None) -> str:
+        line = ("playback_due_wake armed=1200 fired=1198 advanced=1190 rearmed=8 busy_deferred=3 late_p50_ms=0.4 late_p95_ms=1.9 hires=1 disabled=0"
+                " delivery=native unpresented_deferred=0 stranded=0 runner_sleep_woken=12 reentrant_deferred=0")
+        return line if kind is None else line + f" delivery_kind={kind} post_to_awake_min_ms=0.1"
+
+    @staticmethod
+    def log(*records: str) -> str:
+        return "\n".join(["playback_smoke.measured_session id=3", *records, "playback_smoke.summary session=3 reason=reached presented_frames=600"]) + "\n"
+
+    def test_honoured_only_when_the_app_reports_the_post(self) -> None:
+        for name, log in (("bare", self.log(self.wake("post"))), ("crash-forensics prefix", self.log(self.PREFIX + self.wake("post"))),
+                          ("two Plays agree", self.log(self.wake("post"), self.wake("post")))):
+            with self.subTest(case=name):
+                v = self.verdict(self.POST, log)
+                self.assertEqual((v["requested"], v["observed"], v["verdict"], v["blocks"]), (True, "post", "HONOURED", False), v)
+
+    def test_a_binary_that_emits_no_delivery_kind_is_not_engaged(self) -> None:
+        for name, log in (("pre-r1 line", self.log(self.wake(None))), ("no line", self.log()), ("no log", "")):
+            with self.subTest(case=name):
+                v = self.verdict(self.POST, log)
+                self.assertEqual((v["verdict"], v["blocks"]), ("NOT_HONOURED", True), v)
+                self.assertIn("ROUTE_NOT_ENGAGED", v["reason"])
+
+    def test_any_other_report_blocks_never_passes(self) -> None:
+        for name, log in (("sent", self.log(self.wake("send"))),
+                          ("notifier fallback", self.log(self.wake("notifier"))),
+                          ("wake off", self.log(self.wake("none"))),
+                          ("not a kind", self.log(self.wake("Post"))),
+                          ("empty", self.log(self.wake(""))),
+                          ("two fields", self.log(self.wake("post") + " delivery_kind=post")),
+                          ("two Plays disagree", self.log(self.wake("post"), self.wake("send"))),
+                          ("one Play unreadable", self.log(self.wake("post"), self.wake("p0st")))):
+            with self.subTest(case=name):
+                v = self.verdict(self.POST, log)
+                self.assertEqual((v["verdict"], v["blocks"]), ("NOT_HONOURED", True), v)
+
+    def test_a_field_outside_a_playback_due_wake_line_is_not_read(self) -> None:
+        v = self.verdict(self.POST, self.log("playback_smoke.start session=3 delivery_kind=post", self.wake(None)))
+        self.assertEqual((v["verdict"], v["blocks"]), ("NOT_HONOURED", True), v)
+        self.assertIn("ROUTE_NOT_ENGAGED", v["reason"])
+
+    def test_a_leg_that_does_not_ask_is_the_sent_arm(self) -> None:
+        for spec in ({}, {"generatorArgs": {"unpaced": True}}, {"generatorArgs": {"dueWakeDeliveryPost": False}}, {"generatorArgs": {"dueWakeDeliveryPost": "true"}}):
+            for name, log in (("control binary, no delivery_kind", self.log(self.wake(None))), ("sent", self.log(self.wake("send"))), ("no log", "")):
+                with self.subTest(spec=spec, case=name):
+                    v = self.verdict(spec, log)
+                    self.assertEqual((v["requested"], v["verdict"], v["blocks"]), (False, "NOT_REQUESTED", False), v)
+            for name, kind in (("inherited post", "post"), ("notifier fallback", "notifier"), ("wake off", "none")):
+                with self.subTest(spec=spec, case=name):
+                    v = self.verdict(spec, self.log(self.wake(kind)))
+                    self.assertEqual((v["requested"], v["verdict"], v["blocks"]), (False, "NOT_HONOURED", True), v)
+                    self.assertIn("DUE_WAKE_DELIVERY_INHERITED", v["reason"])
+            with self.subTest(spec=spec, case="unreadable"):
+                v = self.verdict(spec, self.log(self.wake("send"), self.wake("post")))
+                self.assertEqual((v["verdict"], v["blocks"]), ("NOT_HONOURED", True), v)
 
 
 class PrepConflatedMoveLegSpecTests(unittest.TestCase):

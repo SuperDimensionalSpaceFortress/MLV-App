@@ -530,6 +530,9 @@ try {
         # HFR-NATIVE-M16-1457-GUI-TEXTURE-PRESENT-OFFLOAD-1 r7: the deferred-release kill switch (isolation arm), for any leg; judged below by the app's own
         # playback_smoke.recon_release deferred_enabled readback. Only a JSON true arms it.
         if ($spec.generatorArgs.PSObject.Properties['disableReconReleaseDeferred'] -and $spec.generatorArgs.disableReconReleaseDeferred -is [bool] -and $spec.generatorArgs.disableReconReleaseDeferred) { $gen['DisableReconReleaseDeferred'] = $true }
+        # HFR-NATIVE-M16-1457-FULLSCREEN-S1S2-PRESENT-GAP-1 r1: the due wake's isolation arm (posted, as before r1), for any leg; judged below by the app's
+        # own playback_due_wake delivery_kind readback. Only a JSON true arms it.
+        if ($spec.generatorArgs.PSObject.Properties['dueWakeDeliveryPost'] -and $spec.generatorArgs.dueWakeDeliveryPost -is [bool] -and $spec.generatorArgs.dueWakeDeliveryPost) { $gen['DueWakeDeliveryPost'] = $true }
         # CUDA-HEADROOM-UTIL-SAMPLER-1: the opt-in GPU/CPU utilisation sampler around the measured launch, for any leg (fail open: it never changes the verdict). Only a JSON true arms it.
         if ($spec.generatorArgs.PSObject.Properties['utilSample'] -and $spec.generatorArgs.utilSample -is [bool] -and $spec.generatorArgs.utilSample) { $gen['UtilSample'] = $true }
         # PLAYBACK-SCOPES-OPTION-1: the live scope the smoke forces on, and the app's playback scope throttle interval, for any leg.
@@ -1026,6 +1029,15 @@ $reconReleaseVerdict = Get-DvReconReleaseDeferredEvidence -Spec $spec -LogText $
 if ($reconReleaseVerdict.requested) { $receipt['reconReleaseDeferred'] = [ordered]@{ requested = $true; observed = $reconReleaseVerdict.observed; verdict = $reconReleaseVerdict.verdict } }
 if ($outcome -in @('PASS', 'FAIL') -and $reconReleaseVerdict.blocks) {
     $detail = "INVALID: the job result was $outcome ($detail) but RECON_RELEASE_DEFERRED_NOT_HONOURED: $($reconReleaseVerdict.reason). A run whose deferred-release state is not the one its leg names (off when it asks, otherwise not off) is no measurement of that arm"
+    $outcome = 'INVALID'
+}
+# HFR-NATIVE-M16-1457-FULLSCREEN-S1S2-PRESENT-GAP-1 r1, FAIL CLOSED: a leg that asks for the posted due wake counts only when the measured Play's own
+# playback_due_wake line reports delivery_kind=post; a leg that does not ask blocks when the app reports any delivery_kind but send (a binary that emits no
+# delivery_kind, the control arm before r1, is unchanged). A value in the launcher's env block is a request, not engagement.
+$dueWakeDeliveryVerdict = Get-DvDueWakeDeliveryEvidence -Spec $spec -LogText $runLogText
+if ($dueWakeDeliveryVerdict.requested) { $receipt['dueWakeDelivery'] = [ordered]@{ requested = $true; observed = $dueWakeDeliveryVerdict.observed; verdict = $dueWakeDeliveryVerdict.verdict } }
+if ($outcome -in @('PASS', 'FAIL') -and $dueWakeDeliveryVerdict.blocks) {
+    $detail = "INVALID: the job result was $outcome ($detail) but DUE_WAKE_DELIVERY_NOT_HONOURED: $($dueWakeDeliveryVerdict.reason). A run whose due-wake delivery is not the one its leg names (post when it asks, otherwise send) is no measurement of that arm"
     $outcome = 'INVALID'
 }
 # PLAYBACK-CPU-VISUAL-CAPTURE-TIMING-2 r2 (D4b), FAIL CLOSED: a leg whose spec says Look Assist ON (a look leg, or generatorArgs.forceLookAssist) but whose run log does

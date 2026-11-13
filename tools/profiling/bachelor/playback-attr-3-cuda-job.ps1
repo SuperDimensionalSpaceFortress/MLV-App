@@ -470,6 +470,10 @@ param(
     # GUI thread's slot release waits for the recon backend mutex, as before r7), the isolation arm of a same-binary A/B. Absent: nothing is set and the
     # emitted job is the text it was before this parameter.
     [switch]$DisableReconReleaseDeferred,
+    # HFR-NATIVE-M16-1457-FULLSCREEN-S1S2-PRESENT-GAP-1 r1: the posted due wake (MLVAPP_PLAYBACK_DUE_WAKE_DELIVERY=post: PostMessageW, byte for byte the
+    # delivery before r1), the isolation arm of a same-binary A/B against the sent wake. Absent: nothing is set and the emitted job is the text it was
+    # before this parameter.
+    [switch]$DueWakeDeliveryPost,
 
     # PLAYBACK-SCOPES-OPTION-1: the live scope the smoke forces on (the smoke runner's -Scope -> the app's --scope, which also shows the
     # edit area). '' or 'none' (the default) keeps -Scope none: the emitted job is the text it was before this parameter.
@@ -6460,6 +6464,18 @@ if ($DisableReconReleaseDeferred) {
     })
 }
 
+# HFR-NATIVE-M16-1457-FULLSCREEN-S1S2-PRESENT-GAP-1 r1: the posted-wake arm adds MLVAPP_PLAYBACK_DUE_WAKE_DELIVERY=post at the same env-list site, only when
+# asked. The anchor must match exactly once, or the generator throws (the runner also requires the app's own playback_due_wake delivery_kind=post before
+# the leg counts).
+if ($DueWakeDeliveryPost) {
+    $dueWakeDeliveryEnvAnchor = [regex]"(?<ind>[ \t]*)'MLVAPP_PLAYBACK_PHASE3_UNATTENDED=1',(?<nl>\r?\n)"
+    if ($dueWakeDeliveryEnvAnchor.Matches($text).Count -ne 1) { throw 'DUAL_VENUE_DUE_WAKE_DELIVERY_ANCHOR_MISSING the job template has no single env-list site to add MLVAPP_PLAYBACK_DUE_WAKE_DELIVERY to' }
+    $text = $dueWakeDeliveryEnvAnchor.Replace($text, [System.Text.RegularExpressions.MatchEvaluator]{
+        param($m)
+        $m.Value + $m.Groups['ind'].Value + "'MLVAPP_PLAYBACK_DUE_WAKE_DELIVERY=post'," + $m.Groups['nl'].Value
+    })
+}
+
 # PLAYBACK-VISUAL-INSPECTION-1: a visual-capture leg gains three bracketed regions, on the expanded text and only when asked (like --windowed
 # above), so every other job is the text it always was. Each anchor must match exactly once (Edit-DualVenueTemplate throws otherwise):
 #   1. before PresentMon starts: the four module helpers (spliced here, not into the default embed list) and the feature probe + argument;
@@ -7905,6 +7921,7 @@ $clipContentSha256 = if ($isFixtureRehearsal) {
     disablePrepPointwiseFast = [bool]$DisablePrepPointwiseFast
     prepConflatedMove = [bool]$PrepConflatedMove
     disableReconReleaseDeferred = [bool]$DisableReconReleaseDeferred
+    dueWakeDeliveryPost = [bool]$DueWakeDeliveryPost
     scope =$(if ([string]::IsNullOrEmpty($Scope)) { 'none' } else { $Scope })
     scopeIntervalMs = $(if ($ScopeIntervalMs -ge 0) { $ScopeIntervalMs } else { $null })
     scopesDuringPlayback = $(if ([string]::IsNullOrEmpty($ScopesDuringPlayback)) { $null } else { $ScopesDuringPlayback })
