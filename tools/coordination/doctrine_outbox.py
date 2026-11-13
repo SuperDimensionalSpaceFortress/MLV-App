@@ -908,9 +908,11 @@ def _from_heading_row(body: str) -> str:
 
 
 # The inline pass reads a row left to right through only the events that decide whether a backtick run is a code-span delimiter:
-# a backtick run, a `<` that can open raw HTML or an autolink (CommonMark: followed by a letter, `/`, `!` or `?`), and a `]` that
-# continues into a link destination (`(`), a reference label (`[`) or a definition (`:`).
-_INLINE_EVENT_RE = re.compile(r"`+|<(?=[A-Za-z/!?])|\](?=[(\[:])")
+# a backtick run, any `<` (raw HTML or an autolink: a tag, comment, processing instruction, declaration, CDATA, a URI autolink, or
+# an email autolink whose local part may start with a digit, punctuation or a backtick, so no lookahead can rule a `<` out; the
+# adversary pass on 1b231d25 A1 broke the first version that tried), and a `]` that continues into a link destination (`(`), a
+# reference label (`[`) or a definition (`:`).
+_INLINE_EVENT_RE = re.compile(r"`+|<|\](?=[(\[:])")
 
 
 def _backslashes_before(row: str, pos: int) -> int:
@@ -933,9 +935,9 @@ def _mask_quotations(row: str) -> tuple[str, bool]:
         emphasis. Text outside spans is plain text for this purpose: emphasis delimiters, character references (`&#96;` is not a
         backtick), hard breaks and a backslash before any other character cannot make a raw backtick run text.
       * everything else that can read a backtick as TEXT is not modelled and ends the pass: a run with no closing run in the row
-        (it may close in a later row, so the span may cross rows), a run escaped by an odd number of backslashes, a `<` that opens
-        raw HTML or an autolink (tag, comment, processing instruction, declaration, CDATA), a `]` that continues into a link
-        destination or title, a reference label or a reference definition.
+        (it may close in a later row, so the span may cross rows), a run escaped by an odd number of backslashes, any `<` outside
+        a span (it may open raw HTML or an autolink: tag, comment, processing instruction, declaration, CDATA, URI or email
+        autolink), a `]` that continues into a link destination or title, a reference label or a reference definition.
     From the first unmodelled construct nothing is masked, in this row or any later one (`distrusted`): the key is refused (fail
     closed) and the author rewords. Do not add a case for another construct; an unclassified row is refused, not guessed."""
     events = list(_INLINE_EVENT_RE.finditer(row))

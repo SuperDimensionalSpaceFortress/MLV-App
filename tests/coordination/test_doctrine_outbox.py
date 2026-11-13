@@ -4093,10 +4093,14 @@ _MARKUP_CLASS_TABLE = [
     ("html-cdata", "CM 6.6", "<![CDATA[ ` ]]>" + _TAIL, "REFUSED"),
     ("html-quotation-before", "r6", 'use `@K@:` then <i title="x">y</i> and [t](u)', "ACCEPTED"),
     ("html-lt-inside-span", "CM 6.1", "a `x<y` b `@K@:` c", "ACCEPTED"),
-    ("html-lt-not-a-tag", "CM 6.6", "a < b and 3<4 then `@K@:` c", "ACCEPTED"),
-    # ---- autolinks ----
+    ("html-lt-unclassified", "fail-closed", "a < b and 3<4 then `@K@:` c", "REFUSED"),
+    # ---- autolinks: an email autolink's local part may start with ANY of [A-Za-z0-9.!#$%&'*+/=?^_`{|}~-], a backtick included ----
     ("autolink-uri", "r6", "<http://a`b>" + _TAIL, "REFUSED"),
     ("autolink-email-shape", "CM 6.5", "<me@a`b.example>" + _TAIL, "REFUSED"),
+    ("autolink-email-digit-initial", "adversary r1 A1", "<1`x@b>" + _TAIL, "REFUSED"),
+    ("autolink-email-punct-initial", "adversary r1 A1", "<#`x@b>" + _TAIL, "REFUSED"),
+    ("autolink-email-backtick-initial", "adversary r1 A1", "<`x@b>" + _TAIL, "REFUSED"),
+    ("autolink-email-after-quotation", "CM 6.5", "use `@K@:` then <1x@b> ok", "ACCEPTED"),
     # ---- inline links and images, including nested brackets ----
     ("link-destination", "r6", "[t](http://a`b) " + _TAIL, "REFUSED"),
     ("link-title", "r6", '[t](u "`") ' + _TAIL, "REFUSED"),
