@@ -611,8 +611,11 @@ TEST(PlaybackDueWakeSamplesB1, MainWindowKeepsNoUnboundedDueWakeSampleVector)
     ASSERT_FALSE( header.isEmpty() );
     ASSERT_FALSE( source.isEmpty() );
     ASSERT_FALSE( header.contains( QRegularExpression( QStringLiteral( "std::vector<double>[ ]+m_playbackDueWake" ) ) ) );
-    // r6 (pass 10 A2): the lateness, and the split's four bounds and its post-call span
-    ASSERT_EQ( 6, header.count( QRegularExpression( QStringLiteral( "PlaybackDueWakeSamples[ ]+m_playbackDueWake[A-Za-z]+Ms;" ) ) ) );
+    // r6 (pass 10 A2): the lateness, and the split's four bounds and its post-call span; FULLSCREEN-S1S2-PRESENT-GAP-1 r1: and
+    // post_to_awake / awake_to_receive (bounded the same way)
+    ASSERT_EQ( 8, header.count( QRegularExpression( QStringLiteral( "PlaybackDueWakeSamples[ ]+m_playbackDueWake[A-Za-z]+Ms;" ) ) ) );
+    ASSERT_EQ( 1, header.count( QStringLiteral( "PlaybackDueWakeSamples m_playbackDueWakePostToAwakeMs;" ) ) );
+    ASSERT_EQ( 1, header.count( QStringLiteral( "PlaybackDueWakeSamples m_playbackDueWakeAwakeToReceiveMs;" ) ) );
     ASSERT_FALSE( source.contains( QRegularExpression( QStringLiteral( "m_playbackDueWake[A-Za-z]*Ms[.](push_back|emplace_back|clear)[(]" ) ) ) );
     const QString reset = functionBody( source, QStringLiteral( "void MainWindow::resetPlaybackDueWakeCounters( void )" ),
                                         QStringLiteral( "QString MainWindow::playbackDueWakeSummaryLine( void ) const" ) );
@@ -781,8 +784,10 @@ TEST(PlaybackDueWakeSamplesB2, TheLongPlaySummaryLineDisclosesEachSetsRangeAndCe
     ASSERT_FALSE( line.isEmpty() );
     // r6 (pass 10 A2): lateness p50 / p95 and the post-call span at p50 / p95 are values; the four split bounds at p50 / p95
     // are bounds, rounded outward (pass 11 A1)
-    ASSERT_EQ( 4, line.count( QStringLiteral( "playbackDueWakePercentileText( m_playbackDueWake" ) ) );
-    const char *const ranks[] = { "LatenessMs, 0.50 )", "LatenessMs, 0.95 )", "PostCallMs, 0.50 )", "PostCallMs, 0.95 )" };
+    // FULLSCREEN-S1S2-PRESENT-GAP-1 r1: and post_to_awake / awake_to_receive at p50 / p95, values
+    ASSERT_EQ( 8, line.count( QStringLiteral( "playbackDueWakePercentileText( m_playbackDueWake" ) ) );
+    const char *const ranks[] = { "LatenessMs, 0.50 )", "LatenessMs, 0.95 )", "PostCallMs, 0.50 )", "PostCallMs, 0.95 )",
+                                  "PostToAwakeMs, 0.50 )", "PostToAwakeMs, 0.95 )", "AwakeToReceiveMs, 0.50 )", "AwakeToReceiveMs, 0.95 )" };
     for( const char *rank : ranks )
         ASSERT_EQ( 1, line.count( QStringLiteral( "playbackDueWakePercentileText( m_playbackDueWake" ) + QLatin1String( rank ) ) );
     ASSERT_EQ( 8, line.count( QStringLiteral( "playbackDueWakePercentileBoundText( m_playbackDueWake" ) ) );
@@ -1370,7 +1375,10 @@ TEST(PlaybackDueWakeNative, APostAFullQueueRefusesIsDeliveredOnceByThePollTickAn
     ASSERT_EQ( 2u, wake.postFailures() );
     // the wiring: the post result is checked and retried, the poll tick rescues, and the line counts all three
     const QString source = dueWakeRepoSource( QStringLiteral( "platform/qt/PlaybackDueWake.cpp" ) );
-    ASSERT_EQ( 1, source.count( QStringLiteral( "static_cast<LPARAM>( postQpc ) ) != 0;" ) ) );
+    // FULLSCREEN-S1S2-PRESENT-GAP-1 r1: both deliveries check their result -- SendNotifyMessageW (the default) and PostMessageW
+    ASSERT_EQ( 2, source.count( QStringLiteral( "static_cast<LPARAM>( postQpc ) ) != 0;" ) ) );
+    ASSERT_EQ( 1, source.count( QStringLiteral( "return SendNotifyMessageW( args.window, PlaybackDueWake::kNativeWakeMessage," ) ) );
+    ASSERT_EQ( 1, source.count( QStringLiteral( "return PostMessageW( args.window, PlaybackDueWake::kNativeWakeMessage," ) ) );
     ASSERT_EQ( 1, source.count( QStringLiteral( "bool posted = postDueWake( args, postQpc.QuadPart, generation );" ) ) );
     ASSERT_EQ( 1, source.count( QStringLiteral( "args.lostGeneration->store( generation, std::memory_order_release );" ) ) );
     const QString mainWindow = dueWakeRepoSource( QStringLiteral( "platform/qt/MainWindow.cpp" ) );
