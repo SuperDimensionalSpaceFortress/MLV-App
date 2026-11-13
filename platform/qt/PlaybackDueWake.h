@@ -316,6 +316,9 @@ public:
     /*! \a owner parents the notifier / timer (the GUI thread's object); \a onFire runs on that thread.
      *  \a preferNativeMessage false skips the wait thread and uses the notifier (r1) path. */
     PlaybackDueWake( QObject *owner, std::function<void()> onFire, bool preferNativeMessage = true );
+    /*! FULLSCREEN-S1S2-PRESENT-GAP-1: the delivery chosen by mode (MainWindow passes the parsed environment). The bool
+     *  constructor is this one with Post (true) or Notifier (false), so its callers keep the r2 PostMessageW path. */
+    PlaybackDueWake( QObject *owner, std::function<void()> onFire, PlaybackDueWakeDeliveryMode mode );
     ~PlaybackDueWake();
     PlaybackDueWake( const PlaybackDueWake & ) = delete;
     PlaybackDueWake & operator=( const PlaybackDueWake & ) = delete;
@@ -413,6 +416,9 @@ public:
     /*! MLVAPP_PLAYBACK_DUE_WAKE=0 turns the due wake off; anything else (or unset) leaves it on. Read on every call. */
     static bool enabledByEnvironment();
 
+    /*! FULLSCREEN-S1S2-PRESENT-GAP-1: true when the wait thread hands the wake over with SendNotifyMessageW (the native path
+     *  was taken and the mode is SendNotify). */
+    bool sendsNotify() const;
     /*! "send" | "post" (the native-message path, by mode) | "notifier" | "qtimer" (the path chosen at construction) */
     const char *deliveryKindName() const;
 
@@ -439,9 +445,26 @@ public:
     };
     StrandedCounts strandedCounts() const;
     void resetStrandedCounts();
-    /*! Any thread (diagnostic): the wait thread has published the return stamp of a post carrying the current generation,
+    /*! GUI thread (diagnostic): the wait thread has published the return stamp of a post carrying the current generation,
      *  i.e. the current arm's message has been handed over. */
     bool armPostPublished() const;
+
+    /*! FULLSCREEN-S1S2-PRESENT-GAP-1, the lever's second half. The --gui-smoke-playback runner sleeps on the GUI thread
+     *  between its processEvents calls (MainWindow::sleepGuiThreadForSmokeRunner) with QThread::msleep, which pumps nothing:
+     *  a wake handed over during it waited for its end, posted or sent (Bachelor 4adc11c9 fullscreen: post_to_receive p50
+     *  7.9 / 9.2 ms against a 10 ms sleep). The application's own loop waits with QS_ALLINPUT, so a wake reaches it at once.
+     *  GUI thread. With SendNotify delivery this sleeps \a ms as a message wait for QS_SENDMESSAGE ONLY (traced as the runner
+     *  sleep): the sent wake ends it early; posted messages, timers and input do not, so the runner's cadence is otherwise
+     *  unchanged. Returns RunnerSleep::NotHandled for every other delivery (the caller sleeps exactly as before),
+     *  Slept when the whole \a ms passed, WokenBySent when a sent message is pending: the caller then accounts its sleep
+     *  and calls dispatchSentMessages(). */
+    enum class RunnerSleep { NotHandled, Slept, WokenBySent };
+    RunnerSleep sleepForSmokeRunner( unsigned long ms );
+    /*! GUI thread: dispatch the pending SENT messages (the wake's window procedure runs here), and nothing else -- posted
+     *  messages stay queued for the caller's next processEvents. */
+    void dispatchSentMessages();
+    /*! Runner sleeps a sent message ended early, since construction or resetStrandedCounts(). */
+    quint64 runnerSleepsWokenBySent() const;
 
 private:
     struct Impl;

@@ -1738,6 +1738,22 @@ private:
         MainWindow *m_window;
         gui_present_gap::OtherBusySpan m_span;
     };
+    // HFR-NATIVE-M16-1457-FULLSCREEN-S1S2-PRESENT-GAP-1: the due wake is now a SENT message, which a nested non-Qt PeekMessage
+    // (a driver, a modal helper) also dispatches. Across a present (drawFrameReady -> presentPlaybackPreparedFrame ->
+    // finishPresentedFrame -> armPlaybackDueWake) and an advance (timerFrameEvent) a wake does not advance: it is counted
+    // (reentrant_deferred) and the arm that follows re-arms it; when no arm followed, the outermost scope's end re-arms.
+    class PlaybackDueWakeDeferScope
+    {
+    public:
+        explicit PlaybackDueWakeDeferScope( MainWindow *window );
+        ~PlaybackDueWakeDeferScope();
+        PlaybackDueWakeDeferScope( const PlaybackDueWakeDeferScope & ) = delete;
+        PlaybackDueWakeDeferScope &operator=( const PlaybackDueWakeDeferScope & ) = delete;
+    private:
+        MainWindow *m_window;
+    };
+    int m_playbackDueWakeDeferDepth = 0;
+    bool m_playbackDueWakeDeferredSinceArm = false;   // a deferred wake that no arm has replaced yet
     double m_playbackSmokePrepWorkerTotalSumMs = 0.0;
     double m_playbackSmokePrepResultQueueSumMs = 0.0;
     double m_playbackSmokePrepTotalBeforeFinishSumMs = 0.0;

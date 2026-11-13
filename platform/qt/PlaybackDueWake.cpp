@@ -83,6 +83,7 @@ struct PlaybackDueWake::Impl
     QMetaObject::Connection traceBlock;
     QMetaObject::Connection traceAwake;
     PlaybackDueWake::StrandedCounts stranded;
+    quint64 runnerSleepsWokenBySent = 0;
     double nowMs() const { return static_cast<double>( nowNs() ) / 1000000.0; }
     PlaybackGuiSleepTrace::At guiStateAt( double ms ) const
     {
@@ -226,13 +227,23 @@ struct WaitThreadArgs
     std::atomic<quint64> *settleAck;
     std::atomic<int> *settleAnswerDelayMsForTest;   // r8 pass 18 A1: a pause between the settle wake and its request load
     std::atomic<quint32> *postReturnGeneration;     // FULLSCREEN-S1S2-PRESENT-GAP-1: the generation the published post carried
+    bool sendNotify;                                // FULLSCREEN-S1S2-PRESENT-GAP-1: SendNotifyMessageW instead of PostMessageW
 };
 
 // One post of the wake message, carrying the generation stored now; false when the queue refused it. \a generation is the
 // generation it carried.
+// FULLSCREEN-S1S2-PRESENT-GAP-1: with sendNotify the same message, wParam and lParam go through SendNotifyMessageW. To a window
+// of another thread it queues a sent message and returns at once (it never waits for the GUI thread); the GUI thread's next
+// PeekMessage / GetMessage dispatches it to dueWakeWindowProc whatever their filter, and a message wait that names
+// QS_SENDMESSAGE returns for it. A 0 return takes the refused-post path below (retry within the budget, then a lost post).
 bool postDueWake( const WaitThreadArgs & args, qint64 postQpc, quint32 & generation )
 {
     generation = args.postGeneration->load( std::memory_order_acquire );
+    if( args.sendNotify )
+        return SendNotifyMessageW( args.window, PlaybackDueWake::kNativeWakeMessage,
+                                   static_cast<WPARAM>( playbackDueWakePackWParam(
+                                       generation, static_cast<quint32>( PlaybackDueWake::kNativeWakeTag ) ) ),
+                                   static_cast<LPARAM>( postQpc ) ) != 0;
     return PostMessageW( args.window, PlaybackDueWake::kNativeWakeMessage,
                          static_cast<WPARAM>( playbackDueWakePackWParam(
                              generation, static_cast<quint32>( PlaybackDueWake::kNativeWakeTag ) ) ),
@@ -361,8 +372,17 @@ private:
 #endif
 
 PlaybackDueWake::PlaybackDueWake( QObject *owner, std::function<void()> onFire, bool preferNativeMessage )
+    : PlaybackDueWake( owner, std::move( onFire ),
+                       preferNativeMessage ? PlaybackDueWakeDeliveryMode::Post : PlaybackDueWakeDeliveryMode::Notifier )
+{
+}
+
+PlaybackDueWake::PlaybackDueWake( QObject *owner, std::function<void()> onFire, PlaybackDueWakeDeliveryMode mode )
     : d( new Impl )
 {
+    // FULLSCREEN-S1S2-PRESENT-GAP-1: Notifier skips the wait thread (r1); Post and SendNotify take the native path
+    const bool preferNativeMessage = mode != PlaybackDueWakeDeliveryMode::Notifier;
+    d->mode = mode;
     d->onFire = std::move( onFire );
     d->clock.start();
 #ifdef Q_OS_WIN
@@ -391,7 +411,8 @@ PlaybackDueWake::PlaybackDueWake( QObject *owner, std::function<void()> onFire, 
                                                         &d->postReturnFor, &d->postReturnQpc, &d->lostGeneration,
                                                         &d->postRefusals, &d->postFailures, &d->postRetryBudgetMs,
                                                         d->settleEvent, d->settledEvent, &d->settleRequest, &d->settleAck,
-                                                        &d->settleAnswerDelayMsForTest, &d->postReturnGeneration };
+                                                        &d->settleAnswerDelayMsForTest, &d->postReturnGeneration,
+                                                        d->mode == PlaybackDueWakeDeliveryMode::SendNotify };
             d->thread = CreateThread( nullptr, 0, dueWakeWaitThread, args, 0, nullptr );
             if( d->thread )
                 SetThreadPriority( d->thread, THREAD_PRIORITY_HIGHEST );
@@ -724,6 +745,44 @@ const char *PlaybackDueWake::deliveryName( Delivery delivery )
     return "qtimer";
 }
 
+bool PlaybackDueWake::sendsNotify() const
+{
+    return d->delivery == Delivery::NativeMessage && d->mode == PlaybackDueWakeDeliveryMode::SendNotify;
+}
+
+PlaybackDueWake::RunnerSleep PlaybackDueWake::sleepForSmokeRunner( unsigned long ms )
+{
+#ifdef Q_OS_WIN
+    if( !sendsNotify() ) return RunnerSleep::NotHandled;
+    noteRunnerSleep( true );
+    // QS_SENDMESSAGE only: the sent wake ends the sleep; posted messages, timers and input leave the runner's cadence as it
+    // was. MWMO_INPUTAVAILABLE: a sent message already pending at the call returns at once (never a missed wake)
+    const DWORD result = MsgWaitForMultipleObjectsEx( 0, nullptr, static_cast<DWORD>( ms ), QS_SENDMESSAGE, MWMO_INPUTAVAILABLE );
+    noteRunnerSleep( false );
+    if( result != WAIT_OBJECT_0 ) return RunnerSleep::Slept;   // the timeout (or a failed wait: the caller's loop goes on)
+    ++d->runnerSleepsWokenBySent;
+    return RunnerSleep::WokenBySent;
+#else
+    Q_UNUSED( ms );
+    return RunnerSleep::NotHandled;
+#endif
+}
+
+void PlaybackDueWake::dispatchSentMessages()
+{
+#ifdef Q_OS_WIN
+    // PeekMessage dispatches every pending sent message before it looks at the queue; PM_QS_SENDMESSAGE with PM_NOREMOVE
+    // leaves every posted message where it is
+    MSG msg;
+    PeekMessageW( &msg, nullptr, 0, 0, PM_NOREMOVE | PM_QS_SENDMESSAGE );
+#endif
+}
+
+quint64 PlaybackDueWake::runnerSleepsWokenBySent() const
+{
+    return d->runnerSleepsWokenBySent;
+}
+
 const char *PlaybackDueWake::deliveryKindName() const
 {
     switch( d->delivery )
@@ -784,6 +843,7 @@ PlaybackDueWake::StrandedCounts PlaybackDueWake::strandedCounts() const
 void PlaybackDueWake::resetStrandedCounts()
 {
     d->stranded = StrandedCounts();
+    d->runnerSleepsWokenBySent = 0;
 }
 
 bool PlaybackDueWake::armPostPublished() const

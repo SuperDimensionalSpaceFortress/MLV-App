@@ -2930,6 +2930,7 @@ static int mlvappStartPlaybackTimer( QObject *owner, double framerate )
 void MainWindow::timerFrameEvent( bool predictivePlaybackAdvance )
 {
     const GuiOtherBusyScope otherBusySpan( this, gui_present_gap::OtherBusySpan::TimerFrame );
+    const PlaybackDueWakeDeferScope dueWakeDeferScope( this );   // FULLSCREEN-S1S2-PRESENT-GAP-1: never an advance inside one
     // No render starts during a Look Assist analysis. m_frameChanged stays set, so the first tick after landing draws.
     if( m_lookAssistPump.sessionOpen() ) return;
 
@@ -5231,17 +5232,29 @@ void MainWindow::sleepGuiThreadForSmokeRunner( unsigned long ms )
     slept.start();
     // HFR-NATIVE-M16-1457-FULLSCREEN-S1S2-PRESENT-GAP-1: the due wake's GUI trace records this sleep (a wake posted in it
     // waits for its end, whatever the dispatcher does)
-    if( m_playbackDueWake ) m_playbackDueWake->noteRunnerSleep( true );
-    QThread::msleep( ms );
-    if( m_playbackDueWake ) m_playbackDueWake->noteRunnerSleep( false );
+    // FULLSCREEN-S1S2-PRESENT-GAP-1: with the sent wake (the default) the sleep is a QS_SENDMESSAGE wait the wake ends early,
+    // as the application's own QS_ALLINPUT wait would (PlaybackDueWake::sleepForSmokeRunner); every other delivery, and no
+    // wake at all, sleeps exactly as before. The woken wake runs after this sleep is accounted, never inside it.
+    const PlaybackDueWake::RunnerSleep runnerSleep =
+        m_playbackDueWake ? m_playbackDueWake->sleepForSmokeRunner( ms ) : PlaybackDueWake::RunnerSleep::NotHandled;
+    if( runnerSleep == PlaybackDueWake::RunnerSleep::NotHandled )
+    {
+        if( m_playbackDueWake ) m_playbackDueWake->noteRunnerSleep( true );
+        QThread::msleep( ms );
+        if( m_playbackDueWake ) m_playbackDueWake->noteRunnerSleep( false );
+    }
     const qint64 sleptNs = slept.nsecsElapsed();
     if( startNs >= 0 && m_guiPresentGapStartNs >= 0 )
         m_guiPresentGapRunnerSleepNs += m_guiPresentGapClock.nsecsElapsed() - startNs;
     GpuDisplayWindow::noteSmokeRunnerSleepIfActive( sleptNs );
+    // the sent wake that ended the sleep runs now (its window procedure; posted messages wait for the runner's processEvents)
+    if( runnerSleep == PlaybackDueWake::RunnerSleep::WokenBySent && m_playbackDueWake ) m_playbackDueWake->dispatchSentMessages();
 }
 
 void MainWindow::presentPlaybackPreparedFrame( const PlaybackPrepResult &result )
 {
+    // FULLSCREEN-S1S2-PRESENT-GAP-1: the worker-prep present (onPlaybackPrepResultReady) reaches here without drawFrameReady
+    const PlaybackDueWakeDeferScope dueWakeDeferScope( this );
     m_lastPresentTailTiming = GpuPresentTailTiming();   // PLAYBACK-PRESENT-TAIL-TIMING-1: never a previous frame's
     m_lastPresentTailTimingKnown = false;
     const PlaybackPrepTask &task = result.task;
@@ -20644,13 +20657,15 @@ static bool mlvappPlaybackDueWakeEnabled()
 }
 
 // HFR-NATIVE-M16-1457-GUI-PRESENT-CADENCE-1 r2: MLVAPP_PLAYBACK_DUE_WAKE_DELIVERY=notifier keeps r1's QWinEventNotifier
-// delivery (an isolation arm); anything else uses the native-message wait thread, with the notifier as its fallback.
-static bool mlvappPlaybackDueWakePreferNativeMessage()
+// delivery (an isolation arm), with the native-message wait thread otherwise and the notifier as its fallback.
+// HFR-NATIVE-M16-1457-FULLSCREEN-S1S2-PRESENT-GAP-1: the native path SENDS the wake (SendNotifyMessageW) by default;
+// MLVAPP_PLAYBACK_DUE_WAKE_DELIVERY=post restores r2's PostMessageW byte for byte, smoke runner sleep included (the isolation
+// arm). Read once; playbackDueWakeDeliveryModeFromText is the parse (pinned by the console tests).
+static PlaybackDueWakeDeliveryMode mlvappPlaybackDueWakeDeliveryMode()
 {
-    static const bool preferNative =
-        qEnvironmentVariable( "MLVAPP_PLAYBACK_DUE_WAKE_DELIVERY" ).trimmed().compare( QStringLiteral( "notifier" ),
-                                                                                         Qt::CaseInsensitive ) != 0;
-    return preferNative;
+    static const PlaybackDueWakeDeliveryMode mode =
+        playbackDueWakeDeliveryModeFromText( qEnvironmentVariable( "MLVAPP_PLAYBACK_DUE_WAKE_DELIVERY" ) );
+    return mode;
 }
 
 // The wake lands this long after the credit covers the frame, so the guard's grant at the wake is never a hair short.
@@ -20683,13 +20698,14 @@ void MainWindow::armPlaybackDueWake( void )
     if( !m_playbackDueWake )
     {
         m_playbackDueWake.reset( new PlaybackDueWake( this, [this]() { onPlaybackDueWake(); },
-                                                      mlvappPlaybackDueWakePreferNativeMessage() ) );
+                                                      mlvappPlaybackDueWakeDeliveryMode() ) );
         m_playbackDueWake->beginPlay();   // created inside a Play: on_actionPlay_toggled could not begin it
         m_playbackDueWake->setGuiTraceActive( m_playbackSmokeActive );   // FULLSCREEN-S1S2-PRESENT-GAP-1
     }
     // r2 adversary pass 5 A1: the delivery and resolution are recorded per ARM (notePlaybackDueWakeArmMechanism), not here
     m_playbackDueWakeDueAtMs = nowMs + dueMs + kPlaybackDueWakeSlackMs;
     m_playbackDueWake->arm( dueMs + kPlaybackDueWakeSlackMs );
+    m_playbackDueWakeDeferredSinceArm = false;   // FULLSCREEN-S1S2-PRESENT-GAP-1: this arm replaces a deferred wake
     ++m_playbackDueWakeArmed;
     // adversary r1 A4 + r2 pass 5 A1: what this arm actually ran on (a SetWaitableTimer failure falls back to a QTimer)
     notePlaybackDueWakeArmMechanism();
@@ -20757,6 +20773,15 @@ void MainWindow::onPlaybackDueWake( void )
             break;
         }
     }
+    // FULLSCREEN-S1S2-PRESENT-GAP-1: a sent wake dispatched inside a present or an advance (a nested PeekMessage) never
+    // advances there -- timerFrameEvent is never nested inside a present. Measured above, counted, and re-armed by the arm
+    // that follows (or by the outermost scope's end)
+    if( m_playbackDueWakeDeferDepth > 0 )
+    {
+        ++m_playbackDueWakeReentrantDeferred;
+        m_playbackDueWakeDeferredSinceArm = true;
+        return;
+    }
     // r5 adversary pass 9 A1: postMs is PostMessageW's return time; a native delivery taken before the wait thread published
     // it is in neither split set (post_unsplit), never split at the first stamp
     else if( m_playbackDueWake && m_playbackDueWake->lastDeliveryUnsplit() )
@@ -20805,7 +20830,24 @@ void MainWindow::onPlaybackDueWake( void )
     ++m_playbackDueWakeRearmed;
     m_playbackDueWakeDueAtMs = rearmNowMs + dueMs + kPlaybackDueWakeSlackMs;
     m_playbackDueWake->arm( dueMs + kPlaybackDueWakeSlackMs );
+    m_playbackDueWakeDeferredSinceArm = false;
     notePlaybackDueWakeArmMechanism();   // r2 adversary pass 5 A1: a re-arm can fall back too
+}
+
+// HFR-NATIVE-M16-1457-FULLSCREEN-S1S2-PRESENT-GAP-1: see MainWindow.h. Nested scopes count; only the outermost end re-arms,
+// and only when a wake was deferred inside and no arm has replaced it since (the present's own arm usually has).
+MainWindow::PlaybackDueWakeDeferScope::PlaybackDueWakeDeferScope( MainWindow *window )
+    : m_window( window )
+{
+    ++m_window->m_playbackDueWakeDeferDepth;
+}
+
+MainWindow::PlaybackDueWakeDeferScope::~PlaybackDueWakeDeferScope()
+{
+    if( --m_window->m_playbackDueWakeDeferDepth > 0 ) return;
+    if( !m_window->m_playbackDueWakeDeferredSinceArm ) return;
+    m_window->m_playbackDueWakeDeferredSinceArm = false;
+    m_window->armPlaybackDueWake();
 }
 
 void MainWindow::cancelPlaybackDueWake( void )
@@ -20924,6 +20966,8 @@ QString MainWindow::playbackDueWakeSummaryLine( void ) const
         .arg( m_playbackDueWakePostRunnerSleep )
         .arg( m_playbackDueWakePostAwake )
         .arg( m_playbackDueWakePostStateUnknown )
+        + QStringLiteral( " runner_sleep_woken=%1" )
+              .arg( static_cast<qulonglong>( m_playbackDueWake ? m_playbackDueWake->runnerSleepsWokenBySent() : 0 ) )
         + QStringLiteral( " post_to_awake_p50_ms=%1 post_to_awake_p95_ms=%2 awake_to_receive_p50_ms=%3 "
                           "awake_to_receive_p95_ms=%4 reentrant_deferred=%5 delivery_kind=%6" )
               .arg( playbackDueWakePercentileText( m_playbackDueWakePostToAwakeMs, 0.50 ) )
@@ -34992,6 +35036,7 @@ void MainWindow::finishPresentedFrame( uint64_t displayFrame,
 void MainWindow::drawFrameReady()
 {
     const GuiOtherBusyScope otherBusySpan( this, gui_present_gap::OtherBusySpan::DrawFrameReady );
+    const PlaybackDueWakeDeferScope dueWakeDeferScope( this );   // FULLSCREEN-S1S2-PRESENT-GAP-1: never an advance inside a present
     // A frame that outlasted the drain bound presents on landing, never under the analysis.
     if( m_lookAssistPump.holdsPresentation() )
     {
