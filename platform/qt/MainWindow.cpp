@@ -4050,6 +4050,11 @@ void MainWindow::queuePlaybackLookaheadRequests(
                                       lookaheadContext,
                                       presentationPreparation );
         ++m_playbackLookaheadRequestsIssued;
+        // CPU-S1-PACE-POST-785-LEVER-1 (adversary A1 on e35b8030): lookahead_route is the route a request was issued on,
+        // latched here and never at admission (a one-frame loop admits the route and queues nothing).
+        if( m_playbackSmokeActive )
+            m_playbackLookaheadSessionRoute =
+                playback_overlap::lookaheadRouteName( textureRouteAdmits, !textureRouteAdmits );
         if( interactiveTraceEnabled() )
         {
             logInteractionEvent(
@@ -7566,13 +7571,6 @@ void MainWindow::drawFrame( bool updateTimecodeLabel )
         cpuRoute.prepRoute.gpuPlaybackReconTextureNoReadbackCandidate =
             requestContext.gpuPlaybackReconTexturePresentRequested;
         m_playbackLookaheadCpuRouteAdmitted = playbackLookaheadCpuRouteAdmits( cpuRoute );
-    }
-    // The route the session's lookahead ran on (latched: a request after Stop must not reset it).
-    if( m_playbackSmokeActive && ui->actionPlay->isChecked() && playbackRenderLookaheadFrames() > 0 )
-    {
-        const char *route = playback_overlap::lookaheadRouteName( m_playbackLookaheadTextureRouteAdmitted,
-                                                                  m_playbackLookaheadCpuRouteAdmitted );
-        if( std::strcmp( route, "none" ) != 0 ) m_playbackLookaheadSessionRoute = route;
     }
     if( playbackRenderLookaheadFrames() > 0
      && ui->actionPlay->isChecked()

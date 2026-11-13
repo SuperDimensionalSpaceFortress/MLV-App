@@ -642,6 +642,25 @@ TEST(PlaybackLookaheadCpuRouteWiring, TheCpuAcquireIsTargetFiltered)
         "                it = m_renderRequests.erase( it );") ) );
 }
 
+TEST(PlaybackLookaheadCpuRouteWiring, TheRouteIsLatchedOnlyWhereALookaheadRequestIsIssued)
+{
+    // Adversary A1 on e35b8030: Cut In = Cut Out = 100 (one-frame loop), slider 99, Play + Loop + Drop Frame on the admitted
+    // CPU route. Depth 1's candidate wraps to the current frame and is skipped, so nothing is queued (lookahead_requests=0),
+    // yet the route latched at admission in drawFrame printed lookahead_route=cpu. The route is the one a request ran on.
+    const QString mw = readRepoText( "platform/qt/MainWindow.cpp" );
+    const QString draw = functionBody( mw, QStringLiteral("void MainWindow::drawFrame( bool updateTimecodeLabel )") );
+    ASSERT_FALSE( draw.isEmpty() );
+    ASSERT_FALSE( draw.contains( QStringLiteral("m_playbackLookaheadSessionRoute =") ) );
+    const QString queue = functionBody( mw, QStringLiteral("void MainWindow::queuePlaybackLookaheadRequests(") );
+    const int issued = queue.indexOf( QStringLiteral("++m_playbackLookaheadRequestsIssued;") );
+    const int latch = queue.indexOf( QStringLiteral(
+        "m_playbackLookaheadSessionRoute =\n"
+        "                playback_overlap::lookaheadRouteName( textureRouteAdmits, !textureRouteAdmits );") );
+    ASSERT_TRUE( issued > 0 );
+    ASSERT_TRUE( latch > issued );
+    ASSERT_EQ( 1, mw.count( QStringLiteral("m_playbackLookaheadSessionRoute =") ) - mw.count( QStringLiteral("m_playbackLookaheadSessionRoute = \"none\";") ) );
+}
+
 TEST(PlaybackLookaheadCpuRouteWiring, TheSevenNewFieldsAreAppendedNeverRenamed)
 {
     const QString mw = readRepoText( "platform/qt/MainWindow.cpp" );
