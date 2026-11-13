@@ -672,7 +672,7 @@ TEST(PlaybackLookaheadCpuRouteWiring, TheMaxBusyGapStartIsStampedAtOpenNotReadAg
     ASSERT_FALSE( open.isEmpty() );
     ASSERT_FALSE( close.isEmpty() );
     const int stamp = open.indexOf( QStringLiteral(
-        "m_guiPresentGapStartSinceSmokeMs = static_cast<double>( gapOpenNs - m_guiPresentGapClockAtSmokeStartNs ) / 1000000.0;") );
+        "m_guiPresentGapStartSinceSmokeMs = static_cast<double>( gapOpenNs ) / 1000000.0 - m_playbackSmokeStartTime * 1000.0;") );
     const int armed = open.indexOf( QStringLiteral("if( !m_playbackSmokeActive || !m_guiPresentIdleProbeConnected ) return;") );
     const int start = open.indexOf( QStringLiteral("m_guiPresentGapStartNs = gapOpenNs;") );
     // r2 (adversary A1 on 89e3a9d1): one clock read arms and places the gap.
@@ -683,15 +683,19 @@ TEST(PlaybackLookaheadCpuRouteWiring, TheMaxBusyGapStartIsStampedAtOpenNotReadAg
     ASSERT_TRUE( start > stamp );
     ASSERT_TRUE( close.contains( QStringLiteral("gaps.busyMaxAtMs = m_guiPresentGapStartSinceSmokeMs;") ) );
     ASSERT_FALSE( close.contains( QStringLiteral("mlv_stage_timing_now()") ) );   // no second clock at the close
-    // r2: the smoke-start zero is taken on the gap clock, beside the smoke clock's own start mark.
+    // r2 fix iteration 1 (adversary A1 on 482616a5): smoke start 100.000 s, a 500 ms deschedule before a separate gap-clock
+    // baseline read, gap opens at 101.000 s -> max_gui_busy_at_ms=500 instead of 1000. The gap clock IS the smoke clock, so
+    // the zero is m_playbackSmokeStartTime itself and smoke start reads no gap clock at all.
     const QString begin = functionBody( mw, QStringLiteral("void MainWindow::beginPlaybackSmokeTelemetry( void )") );
     ASSERT_FALSE( begin.isEmpty() );
-    const int smokeStart = begin.indexOf( QStringLiteral("m_playbackSmokeStartTime = mlv_stage_timing_now();") );
-    const int gapZero = begin.indexOf( QStringLiteral(
-        "m_guiPresentGapClockAtSmokeStartNs = m_guiPresentGapClock.isValid() ? m_guiPresentGapClock.nsecsElapsed() : 0;") );
-    ASSERT_TRUE( smokeStart > 0 );
-    ASSERT_TRUE( gapZero > smokeStart );
-    ASSERT_EQ( 1, mw.count( QStringLiteral("m_guiPresentGapClockAtSmokeStartNs =") ) );
+    ASSERT_TRUE( begin.contains( QStringLiteral("m_playbackSmokeStartTime = mlv_stage_timing_now();") ) );
+    ASSERT_FALSE( begin.contains( QStringLiteral("m_guiPresentGapClock") ) );
+    ASSERT_FALSE( mw.contains( QStringLiteral("m_guiPresentGapClockAtSmokeStartNs") ) );
+    const QString h = readRepoText( "platform/qt/MainWindow.h" );
+    ASSERT_TRUE( h.contains( QStringLiteral("GuiPresentGapClock m_guiPresentGapClock;") ) );
+    ASSERT_FALSE( h.contains( QStringLiteral("QElapsedTimer m_guiPresentGapClock;") ) );
+    const QString clock = functionBody( mw, QStringLiteral("qint64 MainWindow::GuiPresentGapClock::nsecsElapsed( void ) const") );
+    ASSERT_TRUE( clock.contains( QStringLiteral("return static_cast<qint64>( mlv_stage_timing_now() * 1000000000.0 );") ) );
 }
 
 TEST(PlaybackLookaheadCpuRouteWiring, TheSevenNewFieldsAreAppendedNeverRenamed)

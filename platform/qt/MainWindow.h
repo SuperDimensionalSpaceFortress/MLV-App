@@ -1723,8 +1723,16 @@ private:
     GuiPresentGapTotals m_guiPresentGaps;
     long long m_guiPresentGapFrame = -1;
     double m_guiPresentGapStartSinceSmokeMs = -1.0;
-    qint64 m_guiPresentGapClockAtSmokeStartNs = 0;
-    QElapsedTimer m_guiPresentGapClock;
+    // CPU-S1-PACE-POST-785-LEVER-1 r2 fix iteration 1 (adversary A1 on 482616a5): the gap clock IS the smoke clock
+    // (mlv_stage_timing_now, the clock m_playbackSmokeStartTime is read on), so a gap's opening instant is placed
+    // against the measured Play start with no second clock and no second baseline read. Same interface as the
+    // QElapsedTimer it replaces (start / nsecsElapsed); only differences between two reads are durations.
+    struct GuiPresentGapClock
+    {
+        void start( void ) {}
+        qint64 nsecsElapsed( void ) const;   // mlv_stage_timing_now() in ns (MainWindow.cpp)
+    };
+    GuiPresentGapClock m_guiPresentGapClock;
     qint64 m_guiPresentGapStartNs = -1;
     gui_present_gap::IdleWaits m_guiPresentGapIdle;
     qint64 m_guiPresentGapRunnerSleepNs = 0;

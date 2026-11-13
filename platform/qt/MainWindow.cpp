@@ -5172,10 +5172,17 @@ void MainWindow::openGuiPresentGap( void )
     m_guiPresentGapFrame = m_lastDisplayedPlaybackFrame;   // the frame whose present opened the gap
     // CPU-S1-PACE-POST-785-LEVER-1 fix iteration 2 (adversary A1 on fb4d13fe): the gap's opening instant on the smoke clock,
     // stamped here once; the close never reads a second clock to place it.
-    // r2 (adversary A1 on 89e3a9d1): ONE read of the gap clock arms the gap and places it; the smoke-start mark is on the same clock.
+    // r2 (adversary A1 on 89e3a9d1 and on 482616a5): ONE read of the gap clock arms the gap and places it. The gap
+    // clock is the smoke clock (GuiPresentGapClock), so the zero is m_playbackSmokeStartTime itself: no baseline read.
     const qint64 gapOpenNs = m_guiPresentGapClock.nsecsElapsed();
-    m_guiPresentGapStartSinceSmokeMs = static_cast<double>( gapOpenNs - m_guiPresentGapClockAtSmokeStartNs ) / 1000000.0;
+    m_guiPresentGapStartSinceSmokeMs = static_cast<double>( gapOpenNs ) / 1000000.0 - m_playbackSmokeStartTime * 1000.0;
     m_guiPresentGapStartNs = gapOpenNs;
+}
+
+// The gap clock reads the smoke clock (MainWindow.h GuiPresentGapClock).
+qint64 MainWindow::GuiPresentGapClock::nsecsElapsed( void ) const
+{
+    return static_cast<qint64>( mlv_stage_timing_now() * 1000000000.0 );
 }
 
 // CPU-S1-RECON-UNDER-LOOK-PACE-LEVER-1 (Part B): the clock a GUI handler span reads at its start and
@@ -27176,9 +27183,6 @@ void MainWindow::beginPlaybackSmokeTelemetry( void )
     m_playbackSmokeStartAudioSyncApplied = m_playbackAudioSyncAppliedCount;
     m_playbackSmokeStartAudioSyncSkipped = m_playbackAudioSyncSkippedCount;
     m_playbackSmokeStartTime = mlv_stage_timing_now();
-    // r2 (adversary A1 on 89e3a9d1): max_gui_busy_at_ms's zero, on the gap clock (started only with the idle probe, the
-    // only case in which a gap opens).
-    m_guiPresentGapClockAtSmokeStartNs = m_guiPresentGapClock.isValid() ? m_guiPresentGapClock.nsecsElapsed() : 0;
     m_playbackPresentTrace.begin( m_playbackSmokeStartTime * 1000.0, 4096 );   // r7 present trace (no-op when off)
     m_playbackSlipHistogram.reset( m_playbackSmokeStartPosition, getPlaybackFramerate() );
     m_playbackTextureSplit.reset();   // K1 (texture-present split)
