@@ -194,23 +194,17 @@ public:
     // largest (ties go to the named span). Read before closeGap, which clears the gap's spans.
     int dominantBucket( double otherBusyMs ) const
     {
-        if( !( otherBusyMs > 0.0 ) || !std::isfinite( otherBusyMs ) ) otherBusyMs = 0.0;
-        if( otherBusyMs > kMaxSpanMs ) otherBusyMs = kMaxSpanMs;
-        double named = 0.0;
-        for( int i = 0; i < kCount; ++i ) named += gapMs[i];
-        const double scale = ( named > otherBusyMs && named > 0.0 ) ? otherBusyMs / named : 1.0;
+        // closeGap's own charging, run on a copy of this gap's spans (no second copy of its rules).
+        OtherBusySpans probe;
+        for( int i = 0; i < kCount; ++i ) probe.gapMs[i] = gapMs[i];
+        const double rest = probe.closeGap( otherBusyMs );
         int best = -1;
-        double bestMs = 0.0;
-        double charged = 0.0;
+        double bestCharge = 0.0;
         for( int i = 0; i < kCount; ++i )
         {
-            const double ms = gapMs[i] * scale;
-            charged += ms;
-            if( ms > bestMs ) { bestMs = ms; best = i; }
+            if( probe.sumMs[i] > bestCharge ) { bestCharge = probe.sumMs[i]; best = i; }
         }
-        const double rest = otherBusyMs - charged;
-        if( best >= 0 && rest > bestMs ) return -1;
-        return best;
+        return ( best >= 0 && !( rest > bestCharge ) ) ? best : -1;
     }
 
     // A gap opened: spans of a previous gap that never closed are not carried into it.
