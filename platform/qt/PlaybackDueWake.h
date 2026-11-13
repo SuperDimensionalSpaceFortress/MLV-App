@@ -32,13 +32,125 @@
 #ifndef PLAYBACKDUEWAKE_H
 #define PLAYBACKDUEWAKE_H
 
+#include <QString>
 #include <QtGlobal>
 
+#include <array>
+#include <cstddef>
 #include <functional>
 #include <limits>
 #include <memory>
 
 class QObject;
+
+/*! HFR-NATIVE-M16-1457-FULLSCREEN-S1S2-PRESENT-GAP-1: what the GUI thread was doing at a given instant, read back from a
+ *  bounded trace of its own transitions (GUI thread only; one clock, QueryPerformanceCounter ms, the clock the wake's post
+ *  stamps use). A transition names the state ENTERED:
+ *  - DispatcherWait: QAbstractEventDispatcher::aboutToBlock (the dispatcher is about to wait for messages);
+ *  - RunnerSleep:    the --gui-smoke-playback runner's own sleep on the GUI thread begins (MainWindow::sleepGuiThreadForSmokeRunner);
+ *  - Running:        QAbstractEventDispatcher::awake, or the runner's sleep ended.
+ *  at( t ) is the state the latest transition at or before t entered, and (for the two sleeping states) when the GUI thread
+ *  next left it. Memory is a fixed ring of kCapacity transitions; consecutive Running transitions are folded into the first
+ *  (the dispatcher emits awake at the start of every processEvents too), and an instant older than the ring's oldest kept
+ *  transition is Unknown, never guessed. */
+class PlaybackGuiSleepTrace
+{
+public:
+    enum class State { Running, DispatcherWait, RunnerSleep, Unknown };
+    static constexpr std::size_t kCapacity = 256;
+
+    struct At
+    {
+        State state;
+        bool hasLeft;    // a sleeping state the GUI thread has left since (a later transition is kept)
+        double leftMs;   // ...when it left it (the first later transition); meaningless unless hasLeft
+    };
+
+    void note( State entered, double ms )
+    {
+        if( entered == State::Unknown ) return;
+        if( m_count > 0 && entered == State::Running && m_ring[slot( m_count - 1 )].state == State::Running ) return;
+        m_ring[slot( m_count )] = Entry { ms, entered };
+        ++m_count;
+    }
+
+    At at( double ms ) const
+    {
+        const std::size_t kept = m_count < kCapacity ? m_count : kCapacity;
+        const std::size_t first = m_count - kept;
+        // the latest transition at or before ms (newest first); the one after it is when that state was left
+        for( std::size_t i = m_count; i > first; --i )
+        {
+            const Entry &entry = m_ring[slot( i - 1 )];
+            if( entry.ms > ms ) continue;
+            if( entry.state == State::Running ) return { State::Running, false, 0.0 };
+            if( i < m_count ) return { entry.state, true, m_ring[slot( i )].ms };
+            return { entry.state, false, 0.0 };
+        }
+        return { State::Unknown, false, 0.0 };   // nothing kept that old (or nothing traced yet)
+    }
+
+    void reset() { m_count = 0; }
+    std::size_t transitions() const { return m_count; }
+
+    static bool sleeping( State state ) { return state == State::DispatcherWait || state == State::RunnerSleep; }
+
+private:
+    struct Entry
+    {
+        double ms;
+        State state;
+    };
+    static std::size_t slot( std::size_t index ) { return index % kCapacity; }
+    std::array<Entry, kCapacity> m_ring {};
+    std::size_t m_count = 0;
+};
+
+/*! FULLSCREEN-S1S2-PRESENT-GAP-1: one fired wake's post, classified by what the GUI thread was doing when it was posted.
+ *  - Asleep: in the dispatcher's wait or the smoke runner's sleep (runnerSleep says which). postToAwakeMs = when it left
+ *    that sleep - the post; awakeToReceiveMs = the receive - when it left.
+ *  - Awake: running (occupancy). awakeToReceiveMs = the receive - the post; there is no post-to-awake part.
+ *  - Unknown: the trace was off or did not reach back that far, or a sleep that had not ended by the receive. */
+struct PlaybackDueWakePostClass
+{
+    enum class Kind { Asleep, Awake, Unknown };
+    Kind kind;
+    bool runnerSleep;
+    double postToAwakeMs;
+    double awakeToReceiveMs;
+};
+
+inline PlaybackDueWakePostClass playbackDueWakeClassifyPost( const PlaybackGuiSleepTrace::At &at, double postMs, double receiveMs )
+{
+    if( PlaybackGuiSleepTrace::sleeping( at.state ) )
+    {
+        if( !at.hasLeft || at.leftMs > receiveMs || at.leftMs < postMs )
+            return { PlaybackDueWakePostClass::Kind::Unknown, false, 0.0, 0.0 };
+        return { PlaybackDueWakePostClass::Kind::Asleep, at.state == PlaybackGuiSleepTrace::State::RunnerSleep,
+                 at.leftMs - postMs, receiveMs - at.leftMs };
+    }
+    if( at.state == PlaybackGuiSleepTrace::State::Running )
+        return { PlaybackDueWakePostClass::Kind::Awake, false, 0.0, receiveMs - postMs };
+    return { PlaybackDueWakePostClass::Kind::Unknown, false, 0.0, 0.0 };
+}
+
+/*! HFR-NATIVE-M16-1457-FULLSCREEN-S1S2-PRESENT-GAP-1: how the wait thread hands the wake to the GUI thread.
+ *  - SendNotify (default): SendNotifyMessageW. A cross-thread sent message sets QS_SENDMESSAGE, which a message wait that
+ *    names it returns for, and it is dispatched to the window procedure inside the thread's next PeekMessage / GetMessage
+ *    whatever their filter (dueWakeWindowProc -> handleNativeMessage).
+ *  - Post: PostMessageW, the r2..r8 path byte for byte (MLVAPP_PLAYBACK_DUE_WAKE_DELIVERY=post, the isolation arm).
+ *  - Notifier: r1's QWinEventNotifier, no wait thread (MLVAPP_PLAYBACK_DUE_WAKE_DELIVERY=notifier). */
+enum class PlaybackDueWakeDeliveryMode { SendNotify, Post, Notifier };
+
+/*! The MLVAPP_PLAYBACK_DUE_WAKE_DELIVERY parse: "post" / "notifier" (trimmed, any case); anything else, or unset, is
+ *  SendNotify. Pure: MainWindow reads the variable once and hands the text here. */
+inline PlaybackDueWakeDeliveryMode playbackDueWakeDeliveryModeFromText( const QString &text )
+{
+    const QString value = text.trimmed();
+    if( value.compare( QStringLiteral( "post" ), Qt::CaseInsensitive ) == 0 ) return PlaybackDueWakeDeliveryMode::Post;
+    if( value.compare( QStringLiteral( "notifier" ), Qt::CaseInsensitive ) == 0 ) return PlaybackDueWakeDeliveryMode::Notifier;
+    return PlaybackDueWakeDeliveryMode::SendNotify;
+}
 
 /*! The stale-delivery gate, pure (GUI thread only). Every arm() and cancel() starts a new generation; a delivery is
  *  taken only when it carries the current generation, the wake is armed, and it is not early for the armed due time. */
@@ -300,6 +412,36 @@ public:
 
     /*! MLVAPP_PLAYBACK_DUE_WAKE=0 turns the due wake off; anything else (or unset) leaves it on. Read on every call. */
     static bool enabledByEnvironment();
+
+    /*! "send" | "post" (the native-message path, by mode) | "notifier" | "qtimer" (the path chosen at construction) */
+    const char *deliveryKindName() const;
+
+    /*! FULLSCREEN-S1S2-PRESENT-GAP-1, measurement. GUI thread. While on, the GUI thread's event dispatcher's aboutToBlock /
+     *  awake are traced (PlaybackGuiSleepTrace), and noteRunnerSleep() is recorded; off disconnects and forgets the trace.
+     *  Idempotent. MainWindow turns it on only inside a playback_smoke session. */
+    void setGuiTraceActive( bool active );
+    bool guiTraceActive() const;
+    /*! The smoke runner's own sleep on the GUI thread begins (\a sleeping true) or ends, stamped now on the wake's own (QPC)
+     *  clock. A no-op while the trace is off. */
+    void noteRunnerSleep( bool sleeping );
+    /*! What the GUI thread was doing at \a ms (QPC ms), from the trace. Unknown while the trace is off. */
+    PlaybackGuiSleepTrace::At guiStateAt( double ms ) const;
+    /*! A posted (or sent) wake whose arm was replaced or cancelled before the GUI thread took it: the wait thread had
+     *  published its post-return stamp for the replaced generation, and the gate never accepted it. Counted at arm() /
+     *  cancel() on the GUI thread, split by what the GUI thread was doing at that post (guiStateAt of the return stamp). */
+    struct StrandedCounts
+    {
+        quint64 total = 0;
+        quint64 dispatcherWait = 0;
+        quint64 runnerSleep = 0;
+        quint64 running = 0;
+        quint64 unknown = 0;
+    };
+    StrandedCounts strandedCounts() const;
+    void resetStrandedCounts();
+    /*! Any thread (diagnostic): the wait thread has published the return stamp of a post carrying the current generation,
+     *  i.e. the current arm's message has been handed over. */
+    bool armPostPublished() const;
 
 private:
     struct Impl;

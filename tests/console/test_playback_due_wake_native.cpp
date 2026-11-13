@@ -20,6 +20,7 @@
 #include <QFile>
 #include <QString>
 #include <QTextStream>
+#include <QTimer>
 
 #include <algorithm>
 #include <atomic>
@@ -1673,4 +1674,223 @@ TEST(PlaybackDueWakeNative, APostAFullQueueRefusesIsRetriedAndDeliveredOnceWhenT
 #else
     SKIP_TEST( "native-message delivery is Windows-only" );
 #endif
+}
+
+// ---------------------------------------------------------------------------------------------------------------------------
+// HFR-NATIVE-M16-1457-FULLSCREEN-S1S2-PRESENT-GAP-1, step 1 (measurement). On Bachelor CUDA (4adc11c9) the fullscreen wake was
+// posted on time but taken 7.9-9.2 ms later (post_to_receive p50, s2/s4) and 1162 of 1217 fullscreen s1 arms were replaced
+// before the GUI thread took their post. These pin the split that says WHERE the GUI thread was at each post: the dispatcher's
+// wait (aboutToBlock), the smoke runner's own sleep, or running.
+
+TEST(PlaybackGuiSleepTrace, TheStateAtAnInstantIsTheLatestTransitionAndASleepKnowsWhenItWasLeft)
+{
+    typedef PlaybackGuiSleepTrace::State S;
+    PlaybackGuiSleepTrace trace;
+    ASSERT_TRUE( trace.at( 5.0 ).state == S::Unknown );   // nothing traced yet
+    trace.note( S::Running, 10.0 );
+    trace.note( S::RunnerSleep, 12.0 );
+    trace.note( S::Running, 22.5 );
+    trace.note( S::Running, 23.0 );                        // folded into the 22.5 transition (awake at every processEvents)
+    trace.note( S::DispatcherWait, 30.0 );
+    trace.note( S::Unknown, 31.0 );                        // never a transition
+    ASSERT_EQ( static_cast<std::size_t>( 4 ), trace.transitions() );
+    ASSERT_TRUE( trace.at( 9.0 ).state == S::Unknown );    // older than anything kept: never guessed
+    PlaybackGuiSleepTrace::At at = trace.at( 15.0 );
+    ASSERT_TRUE( at.state == S::RunnerSleep );
+    ASSERT_TRUE( at.hasLeft );
+    ASSERT_NEAR( 22.5, at.leftMs, 1e-9 );                  // left at the FIRST later transition, not the folded one
+    at = trace.at( 12.0 );                                 // at the instant of the transition: the state it entered
+    ASSERT_TRUE( at.state == S::RunnerSleep );
+    at = trace.at( 25.0 );
+    ASSERT_TRUE( at.state == S::Running );
+    ASSERT_FALSE( at.hasLeft );
+    at = trace.at( 31.0 );
+    ASSERT_TRUE( at.state == S::DispatcherWait );
+    ASSERT_FALSE( at.hasLeft );                            // still waiting: not left yet
+    ASSERT_TRUE( PlaybackGuiSleepTrace::sleeping( S::DispatcherWait ) && PlaybackGuiSleepTrace::sleeping( S::RunnerSleep ) );
+    ASSERT_FALSE( PlaybackGuiSleepTrace::sleeping( S::Running ) || PlaybackGuiSleepTrace::sleeping( S::Unknown ) );
+    trace.reset();
+    ASSERT_TRUE( trace.at( 31.0 ).state == S::Unknown );
+}
+
+TEST(PlaybackGuiSleepTrace, TheRingIsBoundedAndAnInstantOlderThanItsOldestKeptTransitionIsUnknown)
+{
+    typedef PlaybackGuiSleepTrace::State S;
+    PlaybackGuiSleepTrace trace;
+    const std::size_t n = PlaybackGuiSleepTrace::kCapacity * 3;
+    for( std::size_t i = 0; i < n; ++i ) trace.note( ( i % 2 ) ? S::Running : S::RunnerSleep, static_cast<double>( i ) );
+    ASSERT_EQ( n, trace.transitions() );
+    ASSERT_TRUE( trace.at( 1.5 ).state == S::Unknown );    // overwritten: Unknown, not the oldest kept state
+    const double oldestKept = static_cast<double>( n - PlaybackGuiSleepTrace::kCapacity );   // even: a RunnerSleep entry
+    ASSERT_TRUE( trace.at( oldestKept - 0.5 ).state == S::Unknown );
+    const PlaybackGuiSleepTrace::At at = trace.at( oldestKept + 0.5 );
+    ASSERT_TRUE( at.state == S::RunnerSleep );
+    ASSERT_TRUE( at.hasLeft );
+    ASSERT_NEAR( oldestKept + 1.0, at.leftMs, 1e-9 );
+    ASSERT_TRUE( trace.at( static_cast<double>( n ) ).state == S::Running );   // the newest (n - 1 is odd)
+    ASSERT_TRUE( sizeof( PlaybackGuiSleepTrace ) <= PlaybackGuiSleepTrace::kCapacity * 16 + 16 );   // fixed, whatever the Play's length
+}
+
+TEST(PlaybackDueWakeClassify, APostIsAsleepAwakeOrUnknownAndTheAsleepCaseSplitsAtTheWake)
+{
+    typedef PlaybackGuiSleepTrace::State S;
+    typedef PlaybackDueWakePostClass::Kind K;
+    // the 4adc11c9 fullscreen shape: posted 1 ms into a 10 ms runner sleep, taken right after it
+    PlaybackDueWakePostClass c = playbackDueWakeClassifyPost( { S::RunnerSleep, true, 21.0 }, 12.0, 21.4 );
+    ASSERT_TRUE( c.kind == K::Asleep );
+    ASSERT_TRUE( c.runnerSleep );
+    ASSERT_NEAR( 9.0, c.postToAwakeMs, 1e-9 );
+    ASSERT_NEAR( 0.4, c.awakeToReceiveMs, 1e-9 );
+    // posted into the dispatcher's wait, which returned at once
+    c = playbackDueWakeClassifyPost( { S::DispatcherWait, true, 12.2 }, 12.0, 12.3 );
+    ASSERT_TRUE( c.kind == K::Asleep );
+    ASSERT_FALSE( c.runnerSleep );
+    ASSERT_NEAR( 0.2, c.postToAwakeMs, 1e-9 );
+    ASSERT_NEAR( 0.1, c.awakeToReceiveMs, 1e-9 );
+    // posted while the GUI thread was running: all of it is occupancy
+    c = playbackDueWakeClassifyPost( { S::Running, false, 0.0 }, 12.0, 20.0 );
+    ASSERT_TRUE( c.kind == K::Awake );
+    ASSERT_NEAR( 8.0, c.awakeToReceiveMs, 1e-9 );
+    // a sleep that was not left (or left after the receive, or before the post) is inconsistent: Unknown, never a split
+    ASSERT_TRUE( playbackDueWakeClassifyPost( { S::RunnerSleep, false, 0.0 }, 12.0, 20.0 ).kind == K::Unknown );
+    ASSERT_TRUE( playbackDueWakeClassifyPost( { S::RunnerSleep, true, 25.0 }, 12.0, 20.0 ).kind == K::Unknown );
+    ASSERT_TRUE( playbackDueWakeClassifyPost( { S::DispatcherWait, true, 11.0 }, 12.0, 20.0 ).kind == K::Unknown );
+    ASSERT_TRUE( playbackDueWakeClassifyPost( { S::Unknown, false, 0.0 }, 12.0, 20.0 ).kind == K::Unknown );
+}
+
+TEST(PlaybackDueWakeNative, APostWhoseArmIsReplacedBeforeTheGuiTakesItIsStrandedAndSplitByWhereTheGuiWas)
+{
+#ifdef Q_OS_WIN
+    int fired = 0;
+    PlaybackDueWake wake( nullptr, [&fired]() { ++fired; } );
+    ASSERT_TRUE( wake.delivery() == PlaybackDueWake::Delivery::NativeMessage );
+    ASSERT_EQ( std::string( "post" ), std::string( wake.deliveryKindName() ) );   // the bool constructor keeps PostMessageW
+    // trace off: the stranded post is counted, its GUI state Unknown
+    wake.arm( 0.5 );
+    ASSERT_TRUE( waitWithoutPumping( [&wake]() { return wake.armPostPublished(); }, 1000 ) );
+    wake.arm( 50.0 );                                             // replaced before anyone took the post
+    PlaybackDueWake::StrandedCounts s = wake.strandedCounts();
+    ASSERT_EQ( 1u, s.total );
+    ASSERT_EQ( 1u, s.unknown );
+    wake.cancel();                                                // that arm never posted: nothing more is stranded
+    ASSERT_EQ( 1u, wake.strandedCounts().total );
+    ASSERT_EQ( 1, pumpDueWakeMessages( wake, 60 ) );              // the stranded message is taken late and dropped
+    ASSERT_EQ( 0, fired );
+    // trace on, posted inside the smoke runner's sleep
+    wake.setGuiTraceActive( true );
+    ASSERT_TRUE( wake.guiTraceActive() );
+    wake.noteRunnerSleep( true );
+    wake.arm( 0.5 );
+    ASSERT_TRUE( waitWithoutPumping( [&wake]() { return wake.armPostPublished(); }, 1000 ) );
+    wake.noteRunnerSleep( false );
+    wake.cancel();
+    s = wake.strandedCounts();
+    ASSERT_EQ( 2u, s.total );
+    ASSERT_EQ( 1u, s.runnerSleep );
+    // posted while running
+    wake.arm( 0.5 );
+    ASSERT_TRUE( waitWithoutPumping( [&wake]() { return wake.armPostPublished(); }, 1000 ) );
+    wake.arm( 50.0 );
+    s = wake.strandedCounts();
+    ASSERT_EQ( 3u, s.total );
+    ASSERT_EQ( 1u, s.running );
+    ASSERT_EQ( 0u, s.dispatcherWait );
+    wake.cancel();
+    ASSERT_EQ( 2, pumpDueWakeMessages( wake, 60 ) );
+    ASSERT_EQ( 0, fired );
+    // a post the GUI thread took is never stranded
+    wake.arm( 0.5 );
+    ASSERT_EQ( 1, pumpDueWakeMessages( wake, 200 ) );
+    ASSERT_EQ( 1, fired );
+    wake.arm( 50.0 );
+    wake.cancel();
+    ASSERT_EQ( 3u, wake.strandedCounts().total );
+    wake.resetStrandedCounts();
+    ASSERT_EQ( 0u, wake.strandedCounts().total );
+    wake.setGuiTraceActive( false );
+    ASSERT_FALSE( wake.guiTraceActive() );
+    ASSERT_TRUE( wake.guiStateAt( 1.0e12 ).state == PlaybackGuiSleepTrace::State::Unknown );
+#else
+    SKIP_TEST( "native-message delivery is Windows-only" );
+#endif
+}
+
+TEST(PlaybackDueWakeNative, QtsWindowsDispatcherSignalsAboutToBlockSoAWakePostedIntoAnIdleLoopReadsAsleep)
+{
+    // K0 for FULLSCREEN-S1S2-PRESENT-GAP-1: the split needs QAbstractEventDispatcher::aboutToBlock / awake around the Windows
+    // dispatcher's wait (Qt 6.10.2 ships no source in the install, so this proves it on the real dispatcher): a wake posted
+    // while a QEventLoop idles is classified Asleep in the dispatcher's wait, and its receive follows the wait's end.
+#ifdef Q_OS_WIN
+    LARGE_INTEGER frequency;
+    ASSERT_TRUE( QueryPerformanceFrequency( &frequency ) && frequency.QuadPart > 0 );
+    const auto qpcMs = [&frequency]() -> double
+    {
+        LARGE_INTEGER now;
+        QueryPerformanceCounter( &now );
+        return static_cast<double>( now.QuadPart ) * 1000.0 / static_cast<double>( frequency.QuadPart );
+    };
+    int fired = 0;
+    double postMs = -2.0;
+    double receivedMs = -2.0;
+    PlaybackGuiSleepTrace::At at { PlaybackGuiSleepTrace::State::Unknown, false, 0.0 };
+    PlaybackDueWake *self = nullptr;
+    QEventLoop loop;
+    PlaybackDueWake wake( nullptr, [&]() {
+        ++fired;
+        postMs = self->lastDeliveryPostMs();
+        receivedMs = qpcMs();
+        at = self->guiStateAt( postMs );
+        loop.quit();
+    } );
+    self = &wake;
+    ASSERT_TRUE( wake.delivery() == PlaybackDueWake::Delivery::NativeMessage );
+    wake.setGuiTraceActive( true );
+    QTimer guard;
+    guard.setSingleShot( true );
+    QObject::connect( &guard, &QTimer::timeout, &loop, &QEventLoop::quit );
+    for( int attempt = 0; attempt < 10 && at.state != PlaybackGuiSleepTrace::State::DispatcherWait; ++attempt )
+    {
+        wake.arm( 20.0 );
+        guard.start( 1000 );
+        loop.exec();
+        guard.stop();
+    }
+    ASSERT_TRUE( fired >= 1 );
+    ASSERT_TRUE( at.state == PlaybackGuiSleepTrace::State::DispatcherWait );
+    ASSERT_TRUE( at.hasLeft );
+    const PlaybackDueWakePostClass c = playbackDueWakeClassifyPost( at, postMs, receivedMs );
+    ASSERT_TRUE( c.kind == PlaybackDueWakePostClass::Kind::Asleep );
+    ASSERT_FALSE( c.runnerSleep );
+    ASSERT_TRUE( c.postToAwakeMs < 50.0 );                        // the wait returned for the posted message
+    wake.setGuiTraceActive( false );
+#else
+    SKIP_TEST( "the Windows event dispatcher" );
+#endif
+}
+
+TEST(PlaybackDueWakeNative, TheSummaryLineCarriesTheGuiStateSplitAndTheRunnerSleepIsTraced)
+{
+    const QString mainWindow = dueWakeRepoSource( QStringLiteral( "platform/qt/MainWindow.cpp" ) );
+    ASSERT_FALSE( mainWindow.isEmpty() );
+    ASSERT_EQ( 1, mainWindow.count( QStringLiteral(
+        "\" stranded=%1 stranded_asleep=%2 stranded_runner_sleep=%3 stranded_awake=%4 \"" ) ) );
+    ASSERT_EQ( 1, mainWindow.count( QStringLiteral(
+        "\"stranded_unknown=%5 post_asleep=%6 post_runner_sleep=%7 post_awake=%8 \"" ) ) );
+    ASSERT_EQ( 1, mainWindow.count( QStringLiteral(
+        "\"awake_to_receive_p95_ms=%4 reentrant_deferred=%5 delivery_kind=%6\"" ) ) );
+    ASSERT_EQ( 1, mainWindow.count( QStringLiteral( ".arg( m_playbackDueWakeUnpresentedDeferred ) + split + bound + gui;" ) ) );
+    ASSERT_EQ( 1, mainWindow.count( QStringLiteral(
+        "playbackDueWakeClassifyPost( m_playbackDueWake->guiStateAt( postMs ), postMs, nowMs );" ) ) );
+    // the trace runs only inside a smoke session, and the runner's sleep is bracketed
+    ASSERT_EQ( 1, mainWindow.count( QStringLiteral( "if( m_playbackDueWake ) m_playbackDueWake->setGuiTraceActive( true );" ) ) );
+    ASSERT_EQ( 1, mainWindow.count( QStringLiteral( "m_playbackDueWake->setGuiTraceActive( m_playbackSmokeActive );" ) ) );
+    const QString sleepBody = functionBody( mainWindow, QStringLiteral( "void MainWindow::sleepGuiThreadForSmokeRunner( unsigned long ms )" ),
+                                            QStringLiteral( "void MainWindow::presentPlaybackPreparedFrame(" ) );
+    const int begin = sleepBody.indexOf( QStringLiteral( "m_playbackDueWake->noteRunnerSleep( true );" ) );
+    const int end = sleepBody.indexOf( QStringLiteral( "m_playbackDueWake->noteRunnerSleep( false );" ) );
+    ASSERT_TRUE( begin > 0 && end > begin );
+    // the line's sets stay bounded (PlaybackDueWakeSamples), and both disclose their range
+    ASSERT_EQ( 1, mainWindow.count( QStringLiteral( "playbackDueWakeRangeFields( m_playbackDueWakePostToAwakeMs, \"post_to_awake\" )" ) ) );
+    const QString header = dueWakeRepoSource( QStringLiteral( "platform/qt/MainWindow.h" ) );
+    ASSERT_EQ( 1, header.count( QStringLiteral( "PlaybackDueWakeSamples m_playbackDueWakeAwakeToReceiveMs;" ) ) );
 }

@@ -5,6 +5,7 @@
 
 #include "PlaybackDueWake.h"
 
+#include <QAbstractEventDispatcher>
 #include <QAbstractNativeEventFilter>
 #include <QByteArray>
 #include <QCoreApplication>
@@ -53,6 +54,8 @@ struct PlaybackDueWake::Impl
     // so a reader that sees the same first stamp before and after reading postReturnQpc read that post's return time.
     std::atomic<qint64> postReturnFor { 0 };
     std::atomic<qint64> postReturnQpc { 0 };
+    // FULLSCREEN-S1S2-PRESENT-GAP-1: the generation that post carried, written inside the same seqlock window
+    std::atomic<quint32> postReturnGeneration { 0 };
     QAbstractNativeEventFilter *filter = nullptr;
     // r7 (adversary passes 13/14 A1): a post the full queue refused past the retry budget leaves its generation here for the
     // GUI thread (deliverLostPost, 0: none); the counters are the wait thread's, read for the summary line
@@ -71,6 +74,47 @@ struct PlaybackDueWake::Impl
     // the summary line before deliverLostPost returns); rescuingLostPost marks the delivery deliverLostPost is making
     quint64 postRescued = 0;
     bool rescuingLostPost = false;
+
+    // FULLSCREEN-S1S2-PRESENT-GAP-1 (measurement, GUI thread): the delivery mode, the GUI thread's sleep trace and the
+    // stranded-post counts
+    PlaybackDueWakeDeliveryMode mode = PlaybackDueWakeDeliveryMode::Post;
+    PlaybackGuiSleepTrace guiTrace;
+    bool guiTraceActive = false;
+    QMetaObject::Connection traceBlock;
+    QMetaObject::Connection traceAwake;
+    PlaybackDueWake::StrandedCounts stranded;
+    double nowMs() const { return static_cast<double>( nowNs() ) / 1000000.0; }
+    PlaybackGuiSleepTrace::At guiStateAt( double ms ) const
+    {
+        if( !guiTraceActive ) return { PlaybackGuiSleepTrace::State::Unknown, false, 0.0 };
+        return guiTrace.at( ms );
+    }
+    // GUI thread, at arm() / cancel() BEFORE the gate moves on: the arm being replaced was never accepted, and the wait
+    // thread had already published the return stamp of a post carrying exactly its generation -- that message is in the
+    // GUI thread's queue (or was refused nothing: it returned) and will be dropped as stale. Seqlock reader as in
+    // handleNativeMessage: the same first stamp before and after the reads.
+    void noteStrandedIfPosted()
+    {
+#ifdef Q_OS_WIN
+        if( !gate.armed() || qpcFrequency <= 0 ) return;
+        const qint64 forBefore = postReturnFor.load();
+        const qint64 returnTicks = postReturnQpc.load();
+        const quint32 postedGeneration = postReturnGeneration.load();
+        const qint64 forAfter = postReturnFor.load();
+        if( forBefore <= 0 || forAfter != forBefore || returnTicks < forBefore ) return;
+        if( postedGeneration != gate.generation() ) return;
+        ++stranded.total;
+        const PlaybackGuiSleepTrace::State state =
+            guiStateAt( static_cast<double>( ticksToNs( returnTicks, qpcFrequency ) ) / 1000000.0 ).state;
+        switch( state )
+        {
+        case PlaybackGuiSleepTrace::State::DispatcherWait: ++stranded.dispatcherWait; break;
+        case PlaybackGuiSleepTrace::State::RunnerSleep: ++stranded.runnerSleep; break;
+        case PlaybackGuiSleepTrace::State::Running: ++stranded.running; break;
+        case PlaybackGuiSleepTrace::State::Unknown: ++stranded.unknown; break;
+        }
+#endif
+    }
 
     // r3 (adversary pass 7 A1): the gate's clock. On Windows it is QueryPerformanceCounter in ns, the clock the wait thread
     // stamps the post time on, so the gate can drop a delivery posted before the armed due time; elsewhere QElapsedTimer.
@@ -181,6 +225,7 @@ struct WaitThreadArgs
     std::atomic<quint64> *settleRequest;
     std::atomic<quint64> *settleAck;
     std::atomic<int> *settleAnswerDelayMsForTest;   // r8 pass 18 A1: a pause between the settle wake and its request load
+    std::atomic<quint32> *postReturnGeneration;     // FULLSCREEN-S1S2-PRESENT-GAP-1: the generation the published post carried
 };
 
 // One post of the wake message, carrying the generation stored now; false when the queue refused it. \a generation is the
@@ -284,6 +329,7 @@ DWORD WINAPI dueWakeWaitThread( LPVOID parameter )
         {
             args.postReturnFor->store( 0 );
             args.postReturnQpc->store( returnQpc.QuadPart );
+            args.postReturnGeneration->store( generation );   // FULLSCREEN-S1S2-PRESENT-GAP-1: inside the same window
             args.postReturnFor->store( postQpc.QuadPart );
         }
     }
@@ -345,7 +391,7 @@ PlaybackDueWake::PlaybackDueWake( QObject *owner, std::function<void()> onFire, 
                                                         &d->postReturnFor, &d->postReturnQpc, &d->lostGeneration,
                                                         &d->postRefusals, &d->postFailures, &d->postRetryBudgetMs,
                                                         d->settleEvent, d->settledEvent, &d->settleRequest, &d->settleAck,
-                                                        &d->settleAnswerDelayMsForTest };
+                                                        &d->settleAnswerDelayMsForTest, &d->postReturnGeneration };
             d->thread = CreateThread( nullptr, 0, dueWakeWaitThread, args, 0, nullptr );
             if( d->thread )
                 SetThreadPriority( d->thread, THREAD_PRIORITY_HIGHEST );
@@ -398,6 +444,7 @@ PlaybackDueWake::~PlaybackDueWake()
     stop();
     cancel();
     endPlay();
+    setGuiTraceActive( false );   // FULLSCREEN-S1S2-PRESENT-GAP-1: the dispatcher connections capture this object
 #ifdef Q_OS_WIN
     if( d->filter )
     {
@@ -451,6 +498,7 @@ void PlaybackDueWake::arm( double dueMs )
     if( !( dueMs > 0.0 ) ) dueMs = 0.0;
     // r6 adversary pass 12 A1 (and pass 10 A4, +infinity): bounded before the ns, 100 ns and int conversions below
     if( dueMs > kMaxDueMs ) dueMs = kMaxDueMs;
+    d->noteStrandedIfPosted();   // FULLSCREEN-S1S2-PRESENT-GAP-1: before the replaced arm's generation is gone
     const quint32 generation = d->gate.arm( d->nowNs(), static_cast<qint64>( dueMs * 1000000.0 ) );
     d->lastArmQtTimer = d->delivery == Delivery::QtTimer;
 #ifdef Q_OS_WIN
@@ -496,6 +544,7 @@ void PlaybackDueWake::arm( double dueMs )
 
 void PlaybackDueWake::cancel()
 {
+    d->noteStrandedIfPosted();   // FULLSCREEN-S1S2-PRESENT-GAP-1
     d->gate.cancel();
 #ifdef Q_OS_WIN
     d->postGeneration.store( d->gate.generation(), std::memory_order_release );
@@ -673,6 +722,80 @@ const char *PlaybackDueWake::deliveryName( Delivery delivery )
     case Delivery::QtTimer: break;
     }
     return "qtimer";
+}
+
+const char *PlaybackDueWake::deliveryKindName() const
+{
+    switch( d->delivery )
+    {
+    case Delivery::NativeMessage: return d->mode == PlaybackDueWakeDeliveryMode::SendNotify ? "send" : "post";
+    case Delivery::Notifier: return "notifier";
+    case Delivery::QtTimer: break;
+    }
+    return "qtimer";
+}
+
+void PlaybackDueWake::setGuiTraceActive( bool active )
+{
+    if( active == d->guiTraceActive ) return;
+    if( !active )
+    {
+        QObject::disconnect( d->traceBlock );
+        QObject::disconnect( d->traceAwake );
+        d->guiTraceActive = false;
+        d->guiTrace.reset();
+        return;
+    }
+    // the calling (GUI) thread's dispatcher; none (a thread without an event loop): no trace, every state reads Unknown
+    QAbstractEventDispatcher *dispatcher = QAbstractEventDispatcher::instance();
+    if( !dispatcher ) return;
+    Impl *impl = d.get();
+    d->guiTrace.reset();
+    d->traceBlock = QObject::connect( dispatcher, &QAbstractEventDispatcher::aboutToBlock, [impl]() {
+        impl->guiTrace.note( PlaybackGuiSleepTrace::State::DispatcherWait, impl->nowMs() );
+    } );
+    d->traceAwake = QObject::connect( dispatcher, &QAbstractEventDispatcher::awake, [impl]() {
+        impl->guiTrace.note( PlaybackGuiSleepTrace::State::Running, impl->nowMs() );
+    } );
+    d->guiTraceActive = true;
+}
+
+bool PlaybackDueWake::guiTraceActive() const
+{
+    return d->guiTraceActive;
+}
+
+void PlaybackDueWake::noteRunnerSleep( bool sleeping )
+{
+    if( !d->guiTraceActive ) return;
+    d->guiTrace.note( sleeping ? PlaybackGuiSleepTrace::State::RunnerSleep : PlaybackGuiSleepTrace::State::Running, d->nowMs() );
+}
+
+PlaybackGuiSleepTrace::At PlaybackDueWake::guiStateAt( double ms ) const
+{
+    return d->guiStateAt( ms );
+}
+
+PlaybackDueWake::StrandedCounts PlaybackDueWake::strandedCounts() const
+{
+    return d->stranded;
+}
+
+void PlaybackDueWake::resetStrandedCounts()
+{
+    d->stranded = StrandedCounts();
+}
+
+bool PlaybackDueWake::armPostPublished() const
+{
+#ifdef Q_OS_WIN
+    const qint64 forBefore = d->postReturnFor.load();
+    const quint32 postedGeneration = d->postReturnGeneration.load();
+    const qint64 forAfter = d->postReturnFor.load();
+    return forBefore > 0 && forAfter == forBefore && postedGeneration == d->gate.generation();
+#else
+    return false;
+#endif
 }
 
 bool PlaybackDueWake::enabledByEnvironment()

@@ -1328,6 +1328,15 @@ private:
     PlaybackDueWakeSamples m_playbackDueWakePostToReceiveLoMs;   // GUI-thread receive time - return stamp
     PlaybackDueWakeSamples m_playbackDueWakePostToReceiveHiMs;   // GUI-thread receive time - first stamp
     PlaybackDueWakeSamples m_playbackDueWakePostCallMs;          // return stamp - first stamp (the attribution uncertainty)
+    // HFR-NATIVE-M16-1457-FULLSCREEN-S1S2-PRESENT-GAP-1 (measurement): each fired wake's post classified by what the GUI thread
+    // was doing at the return stamp (PlaybackDueWake::guiStateAt, playbackDueWakeClassifyPost), bounded per Play
+    quint64 m_playbackDueWakePostAsleep = 0;          // in the dispatcher's wait or the smoke runner's sleep
+    quint64 m_playbackDueWakePostRunnerSleep = 0;     // ...of which the smoke runner's sleep
+    quint64 m_playbackDueWakePostAwake = 0;           // running (occupancy)
+    quint64 m_playbackDueWakePostStateUnknown = 0;
+    quint64 m_playbackDueWakeReentrantDeferred = 0;   // a delivery inside a present / advance scope, not advanced
+    PlaybackDueWakeSamples m_playbackDueWakePostToAwakeMs;     // asleep cases: left the sleep - post
+    PlaybackDueWakeSamples m_playbackDueWakeAwakeToReceiveMs;  // receive - max( post, left the sleep )
     // HFR-NATIVE-60FPS-FULLRES-1 r24 (adversary A1 on 9b900412): whole frames a conformed drop-frame tick held back
     // (playback_frame_range::conformDropFrameDelta), repaid one presented frame per later tick. Cleared with the pace guard.
     double m_conformDropDebtFrames = 0.0;

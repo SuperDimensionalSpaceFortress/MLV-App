@@ -5229,7 +5229,11 @@ void MainWindow::sleepGuiThreadForSmokeRunner( unsigned long ms )
     const qint64 startNs = m_guiPresentGapStartNs >= 0 ? m_guiPresentGapClock.nsecsElapsed() : -1;
     QElapsedTimer slept;
     slept.start();
+    // HFR-NATIVE-M16-1457-FULLSCREEN-S1S2-PRESENT-GAP-1: the due wake's GUI trace records this sleep (a wake posted in it
+    // waits for its end, whatever the dispatcher does)
+    if( m_playbackDueWake ) m_playbackDueWake->noteRunnerSleep( true );
     QThread::msleep( ms );
+    if( m_playbackDueWake ) m_playbackDueWake->noteRunnerSleep( false );
     const qint64 sleptNs = slept.nsecsElapsed();
     if( startNs >= 0 && m_guiPresentGapStartNs >= 0 )
         m_guiPresentGapRunnerSleepNs += m_guiPresentGapClock.nsecsElapsed() - startNs;
@@ -20681,6 +20685,7 @@ void MainWindow::armPlaybackDueWake( void )
         m_playbackDueWake.reset( new PlaybackDueWake( this, [this]() { onPlaybackDueWake(); },
                                                       mlvappPlaybackDueWakePreferNativeMessage() ) );
         m_playbackDueWake->beginPlay();   // created inside a Play: on_actionPlay_toggled could not begin it
+        m_playbackDueWake->setGuiTraceActive( m_playbackSmokeActive );   // FULLSCREEN-S1S2-PRESENT-GAP-1
     }
     // r2 adversary pass 5 A1: the delivery and resolution are recorded per ARM (notePlaybackDueWakeArmMechanism), not here
     m_playbackDueWakeDueAtMs = nowMs + dueMs + kPlaybackDueWakeSlackMs;
@@ -20730,6 +20735,27 @@ void MainWindow::onPlaybackDueWake( void )
         m_playbackDueWakePostToReceiveLoMs.add( bounds.postToReceiveLoMs );
         m_playbackDueWakePostToReceiveHiMs.add( bounds.postToReceiveHiMs );
         m_playbackDueWakePostCallMs.add( bounds.postCallMs );
+        // HFR-NATIVE-M16-1457-FULLSCREEN-S1S2-PRESENT-GAP-1: what the GUI thread was doing at the post (return stamp): asleep
+        // in the dispatcher's wait or the smoke runner's sleep (then how long until it left it, and from there to here), or
+        // running (occupancy: the whole post-to-receive)
+        const PlaybackDueWakePostClass post =
+            playbackDueWakeClassifyPost( m_playbackDueWake->guiStateAt( postMs ), postMs, nowMs );
+        switch( post.kind )
+        {
+        case PlaybackDueWakePostClass::Kind::Asleep:
+            ++m_playbackDueWakePostAsleep;
+            if( post.runnerSleep ) ++m_playbackDueWakePostRunnerSleep;
+            m_playbackDueWakePostToAwakeMs.add( post.postToAwakeMs );
+            m_playbackDueWakeAwakeToReceiveMs.add( post.awakeToReceiveMs );
+            break;
+        case PlaybackDueWakePostClass::Kind::Awake:
+            ++m_playbackDueWakePostAwake;
+            m_playbackDueWakeAwakeToReceiveMs.add( post.awakeToReceiveMs );
+            break;
+        case PlaybackDueWakePostClass::Kind::Unknown:
+            ++m_playbackDueWakePostStateUnknown;
+            break;
+        }
     }
     // r5 adversary pass 9 A1: postMs is PostMessageW's return time; a native delivery taken before the wait thread published
     // it is in neither split set (post_unsplit), never split at the first stamp
@@ -20816,6 +20842,15 @@ void MainWindow::resetPlaybackDueWakeCounters( void )
     m_playbackDueWakePostToReceiveLoMs.reset();
     m_playbackDueWakePostToReceiveHiMs.reset();
     m_playbackDueWakePostCallMs.reset();
+    // HFR-NATIVE-M16-1457-FULLSCREEN-S1S2-PRESENT-GAP-1
+    m_playbackDueWakePostAsleep = 0;
+    m_playbackDueWakePostRunnerSleep = 0;
+    m_playbackDueWakePostAwake = 0;
+    m_playbackDueWakePostStateUnknown = 0;
+    m_playbackDueWakeReentrantDeferred = 0;
+    m_playbackDueWakePostToAwakeMs.reset();
+    m_playbackDueWakeAwakeToReceiveMs.reset();
+    if( m_playbackDueWake ) m_playbackDueWake->resetStrandedCounts();
 }
 
 // One line per measured Play, logged after the timed window has closed (finishPlaybackSmokeTelemetry).
@@ -20872,6 +20907,33 @@ QString MainWindow::playbackDueWakeSummaryLine( void ) const
         + playbackDueWakeRangeFields( m_playbackDueWakePostToReceiveLoMs, "post_to_receive_lo" )
         + playbackDueWakeRangeFields( m_playbackDueWakePostToReceiveHiMs, "post_to_receive_hi" )
         + playbackDueWakeRangeFields( m_playbackDueWakePostCallMs, "post_call" );
+    // HFR-NATIVE-M16-1457-FULLSCREEN-S1S2-PRESENT-GAP-1: where the GUI thread was at each post. stranded = posts whose arm was
+    // replaced or cancelled before the GUI thread took them (split like the fired ones: *_asleep counts the dispatcher's wait
+    // AND the smoke runner's sleep, *_runner_sleep the latter alone); delivery_kind = send | post | notifier | qtimer
+    const PlaybackDueWake::StrandedCounts stranded =
+        m_playbackDueWake ? m_playbackDueWake->strandedCounts() : PlaybackDueWake::StrandedCounts();
+    const QString gui = QStringLiteral( " stranded=%1 stranded_asleep=%2 stranded_runner_sleep=%3 stranded_awake=%4 "
+                                        "stranded_unknown=%5 post_asleep=%6 post_runner_sleep=%7 post_awake=%8 "
+                                        "post_state_unknown=%9" )
+        .arg( static_cast<qulonglong>( stranded.total ) )
+        .arg( static_cast<qulonglong>( stranded.dispatcherWait + stranded.runnerSleep ) )
+        .arg( static_cast<qulonglong>( stranded.runnerSleep ) )
+        .arg( static_cast<qulonglong>( stranded.running ) )
+        .arg( static_cast<qulonglong>( stranded.unknown ) )
+        .arg( m_playbackDueWakePostAsleep )
+        .arg( m_playbackDueWakePostRunnerSleep )
+        .arg( m_playbackDueWakePostAwake )
+        .arg( m_playbackDueWakePostStateUnknown )
+        + QStringLiteral( " post_to_awake_p50_ms=%1 post_to_awake_p95_ms=%2 awake_to_receive_p50_ms=%3 "
+                          "awake_to_receive_p95_ms=%4 reentrant_deferred=%5 delivery_kind=%6" )
+              .arg( playbackDueWakePercentileText( m_playbackDueWakePostToAwakeMs, 0.50 ) )
+              .arg( playbackDueWakePercentileText( m_playbackDueWakePostToAwakeMs, 0.95 ) )
+              .arg( playbackDueWakePercentileText( m_playbackDueWakeAwakeToReceiveMs, 0.50 ) )
+              .arg( playbackDueWakePercentileText( m_playbackDueWakeAwakeToReceiveMs, 0.95 ) )
+              .arg( m_playbackDueWakeReentrantDeferred )
+              .arg( m_playbackDueWake ? QString::fromLatin1( m_playbackDueWake->deliveryKindName() ) : QStringLiteral( "none" ) )
+        + playbackDueWakeRangeFields( m_playbackDueWakePostToAwakeMs, "post_to_awake" )
+        + playbackDueWakeRangeFields( m_playbackDueWakeAwakeToReceiveMs, "awake_to_receive" );
     return QStringLiteral( "playback_due_wake armed=%1 fired=%2 advanced=%3 rearmed=%4 busy_deferred=%5 "
                            "late_p50_ms=%6 late_p95_ms=%7 hires=%8 disabled=%9 delivery=%10 unpresented_deferred=%11" )
         .arg( m_playbackDueWakeArmed )
@@ -20884,7 +20946,7 @@ QString MainWindow::playbackDueWakeSummaryLine( void ) const
         .arg( m_playbackDueWakeHiRes ? 1 : 0 )
         .arg( mlvappPlaybackDueWakeEnabled() ? 0 : 1 )
         .arg( m_playbackDueWakeDelivery.isEmpty() ? QStringLiteral( "none" ) : m_playbackDueWakeDelivery )
-        .arg( m_playbackDueWakeUnpresentedDeferred ) + split + bound;
+        .arg( m_playbackDueWakeUnpresentedDeferred ) + split + bound + gui;
 }
 
 //Paint the Audio Track Wave to GUI
@@ -27054,6 +27116,8 @@ void MainWindow::beginPlaybackSmokeTelemetry( void )
     m_playbackLookaheadCoveredRequests = 0;
     if( m_pRenderThread ) m_pRenderThread->resetPipelineOverlapMeter();
     m_playbackSmokeActive = true;
+    // HFR-NATIVE-M16-1457-FULLSCREEN-S1S2-PRESENT-GAP-1: the GUI thread's sleep trace runs only inside a smoke session
+    if( m_playbackDueWake ) m_playbackDueWake->setGuiTraceActive( true );
     m_playbackSmokeFrameTelemetry = playbackSmokeFrameTelemetryEnabled();
     m_playbackSmokeFrameLogEnabled =
         m_playbackSmokeFrameTelemetry && !playbackSmokeFrameLogDisabledByEnvironment();
@@ -30775,6 +30839,7 @@ void MainWindow::finishPlaybackSmokeTelemetry( const char *reason )
     }
 
     m_playbackSmokeActive = false;
+    if( m_playbackDueWake ) m_playbackDueWake->setGuiTraceActive( false );   // FULLSCREEN-S1S2-PRESENT-GAP-1
     m_playbackPresentTrace.end();
 
     // PLAYBACK-CLIP-LENGTH-ENFORCE-1: the loaded clip's own length, printed on the summary and
