@@ -15212,6 +15212,11 @@ class DueWakeDeliveryLegSpecTests(unittest.TestCase):
         self.assertIn('.arg( m_playbackDueWake ? QString::fromLatin1( m_playbackDueWake->deliveryKindName() ) : QStringLiteral( "none" ) )', mw)
         self.assertIn('"late_p50_ms=%6 late_p95_ms=%7 hires=%8 disabled=%9 delivery=%10 unpresented_deferred=%11" )', mw)
         self.assertIn('return QStringLiteral( "playback_due_wake armed=%1 ', mw)
+        # r2 G1 / G3 (CoS PR 811): the line also carries the runner-sleep interruptions by another sent message and the failed waits, BEFORE
+        # delivery_kind; neither name contains " delivery=" or " delivery_kind=", so the gate's two field reads stay exactly one each
+        self.assertIn('+ QStringLiteral( " runner_sleep_woken=%1" )', mw)
+        self.assertIn('+ QStringLiteral( " runner_sleep_woken_other=%1 runner_sleep_wait_failed=%2" )', mw)
+        self.assertLess(mw.index('" runner_sleep_woken_other=%1 runner_sleep_wait_failed=%2"'), mw.index('reentrant_deferred=%5 delivery_kind=%6" )'))
         # A3: the line follows the measured session's pace_summary, which is what binds it to the measured Play
         pace = mw.index('"playback_smoke.pace_summary session=%1 first_present_ms=%2 paced_elapsed_ms=%3 "')
         line = mw.index("qInfo().noquote() << playbackDueWakeSummaryLine();")
@@ -15239,7 +15244,8 @@ class DueWakeDeliveryEvidenceTests(unittest.TestCase):
     @staticmethod
     def wake(kind: str | None, mech: str = "native-msg") -> str:
         line = ("playback_due_wake armed=1200 fired=1198 advanced=1190 rearmed=8 busy_deferred=3 late_p50_ms=0.4 late_p95_ms=1.9 hires=1 disabled=0"
-                f" delivery={mech} unpresented_deferred=0 stranded=0 runner_sleep_woken=12 reentrant_deferred=0")
+                f" delivery={mech} unpresented_deferred=0 stranded=0 runner_sleep_woken=12 runner_sleep_woken_other=2 runner_sleep_wait_failed=0"
+                " reentrant_deferred=0")
         return line if kind is None else line + f" delivery_kind={kind} post_to_awake_min_ms=0.1"
 
     @staticmethod
@@ -15323,7 +15329,12 @@ class DueWakeDeliveryEvidenceTests(unittest.TestCase):
                     v = self.verdict(spec, self.log(self.wake("send", mech)))
                     self.assertEqual((v["verdict"], v["blocks"]), ("NOT_HONOURED", True), v)
                     self.assertIn("DUE_WAKE_DELIVERY_FELL_BACK", v["reason"])
-            for name, log in (("unreadable", self.log(self.wake("p0st"))), ("a kind the app never prints", self.log(self.wake("mixed", "native-msg+qtimer")))):
+            for name, log in (("unreadable", self.log(self.wake("p0st"))), ("a kind the app never prints", self.log(self.wake("mixed", "native-msg+qtimer"))),
+                              # r1 adversary pass 3 A1, verbatim shape: a selection that contradicts the arms is unreadable
+                              ("none on a native Play", self.log(self.wake("none", "native-msg"))),
+                              ("qtimer on a native Play", self.log(self.wake("qtimer", "native-msg"))),
+                              ("notifier on a native Play", self.log(self.wake("notifier", "native-msg"))),
+                              ("send on a notifier Play", self.log(self.wake("send", "notifier")))):
                 with self.subTest(spec=spec, case=name):
                     v = self.verdict(spec, log)
                     self.assertEqual((v["verdict"], v["blocks"]), ("NOT_HONOURED", True), v)

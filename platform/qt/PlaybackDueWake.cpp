@@ -13,9 +13,12 @@
 #include <QObject>
 #include <QTimer>
 
+#include <QThread>
+
 #include <algorithm>
 #include <atomic>
 #include <cmath>
+#include <vector>
 
 #ifdef Q_OS_WIN
 #include <QWinEventNotifier>
@@ -84,6 +87,17 @@ struct PlaybackDueWake::Impl
     QMetaObject::Connection traceAwake;
     PlaybackDueWake::StrandedCounts stranded;
     quint64 runnerSleepsWokenBySent = 0;
+    // r2 G1 (GUI thread): sleepForSmokeRunner dispatches the sent messages that end its wait; inside that dispatch the window
+    // procedure HOLDS this wake's own message (heldWakes) instead of firing it, so the wake still runs after the sleep is
+    // accounted (dispatchSentMessages). A dispatch that held none was another sent message: counted, and the sleep goes on.
+    bool inRunnerSleepDispatch = false;
+    quint64 runnerSleepsWokenOther = 0;
+    // r2 G3: runner sleeps whose message wait failed (WAIT_FAILED); the rest of the interval was a plain msleep
+    quint64 runnerSleepWaitFailed = 0;
+    bool failRunnerSleepWaitForTest = false;
+#ifdef Q_OS_WIN
+    std::vector<MSG> heldWakes;
+#endif
     // r1 adversary pass 2 A3 (GUI thread only): the first stamp (lParam) of the last native message the GUI thread took, stale
     // or not; a published post with this stamp is consumed, never stranded
     qint64 consumedPostFor = 0;
@@ -190,11 +204,20 @@ LRESULT CALLBACK dueWakeWindowProc( HWND hwnd, UINT message, WPARAM wParam, LPAR
             msg.message = message;
             msg.wParam = wParam;
             msg.lParam = lParam;
-            wake->handleNativeMessage( &msg );
+            // r2 G1: inside the runner sleep's dispatch the wake is held (and flagged), and fires after the sleep
+            if( !wake->holdWindowProcWake( &msg ) ) wake->handleNativeMessage( &msg );
         }
         return 0;
     }
     return DefWindowProcW( hwnd, message, wParam, lParam );
+}
+
+// GUI thread: PeekMessage dispatches every pending sent message before it looks at the queue; PM_QS_SENDMESSAGE with
+// PM_NOREMOVE leaves every posted message where it is
+void dispatchPendingSentMessages()
+{
+    MSG msg;
+    PeekMessageW( &msg, nullptr, 0, 0, PM_NOREMOVE | PM_QS_SENDMESSAGE );
 }
 
 bool registerDueWakeWindowClass()
@@ -772,13 +795,34 @@ PlaybackDueWake::RunnerSleep PlaybackDueWake::sleepForSmokeRunner( unsigned long
     {
         const qint64 sleptMs = slept.elapsed();
         const DWORD restMs = sleptMs >= static_cast<qint64>( waitMs ) ? 0 : static_cast<DWORD>( static_cast<qint64>( waitMs ) - sleptMs );
-        const DWORD result = MsgWaitForMultipleObjectsEx( 0, nullptr, restMs, QS_SENDMESSAGE, MWMO_INPUTAVAILABLE );
-        if( result != WAIT_OBJECT_0 ) break;   // the timeout (or a failed wait: the caller's loop goes on)
+        const DWORD result = d->failRunnerSleepWaitForTest
+            ? WAIT_FAILED : MsgWaitForMultipleObjectsEx( 0, nullptr, restMs, QS_SENDMESSAGE, MWMO_INPUTAVAILABLE );
+        if( result == WAIT_FAILED )
+        {
+            // r2 G3: a failed wait never ends the sleep at ~0 ms; the rest of the interval is the plain msleep every other
+            // delivery uses (no sent wake ends it), and the failure is counted (runner_sleep_wait_failed)
+            ++d->runnerSleepWaitFailed;
+            const qint64 leftMs = static_cast<qint64>( waitMs ) - slept.elapsed();
+            if( leftMs > 0 ) QThread::msleep( static_cast<unsigned long>( leftMs ) );
+            break;
+        }
+        if( result != WAIT_OBJECT_0 ) break;   // the timeout
         if( HIWORD( GetQueueStatus( QS_SENDMESSAGE ) ) & QS_SENDMESSAGE )
         {
-            noteRunnerSleep( false );
-            ++d->runnerSleepsWokenBySent;
-            return RunnerSleep::WokenBySent;
+            // r2 G1: only the wake ends the sleep. The sent messages are dispatched here; the wake's window procedure holds
+            // this wake's own message (holdWindowProcWake) and it fires after the sleep (dispatchSentMessages). Any other sent
+            // message ran in this dispatch: counted runner_sleep_woken_other, and the sleep goes on to its full interval.
+            const size_t heldBefore = d->heldWakes.size();
+            d->inRunnerSleepDispatch = true;
+            dispatchPendingSentMessages();
+            d->inRunnerSleepDispatch = false;
+            if( d->heldWakes.size() > heldBefore )
+            {
+                noteRunnerSleep( false );
+                ++d->runnerSleepsWokenBySent;
+                return RunnerSleep::WokenBySent;
+            }
+            ++d->runnerSleepsWokenOther;
         }
         if( slept.hasExpired( static_cast<qint64>( waitMs ) ) ) break;
     }
@@ -793,16 +837,45 @@ PlaybackDueWake::RunnerSleep PlaybackDueWake::sleepForSmokeRunner( unsigned long
 void PlaybackDueWake::dispatchSentMessages()
 {
 #ifdef Q_OS_WIN
-    // PeekMessage dispatches every pending sent message before it looks at the queue; PM_QS_SENDMESSAGE with PM_NOREMOVE
-    // leaves every posted message where it is
-    MSG msg;
-    PeekMessageW( &msg, nullptr, 0, 0, PM_NOREMOVE | PM_QS_SENDMESSAGE );
+    // r2 G1: first the wakes the runner sleep held, in the order they were sent (each through the gate, as the window
+    // procedure would have), then every sent message still pending
+    std::vector<MSG> held;
+    held.swap( d->heldWakes );
+    for( const MSG &msg : held ) handleNativeMessage( &msg );
+    dispatchPendingSentMessages();
+#endif
+}
+
+bool PlaybackDueWake::holdWindowProcWake( const void *message )
+{
+#ifdef Q_OS_WIN
+    if( !d->inRunnerSleepDispatch ) return false;
+    d->heldWakes.push_back( *static_cast<const MSG *>( message ) );
+    return true;
+#else
+    Q_UNUSED( message );
+    return false;
 #endif
 }
 
 quint64 PlaybackDueWake::runnerSleepsWokenBySent() const
 {
     return d->runnerSleepsWokenBySent;
+}
+
+quint64 PlaybackDueWake::runnerSleepsWokenOther() const
+{
+    return d->runnerSleepsWokenOther;
+}
+
+quint64 PlaybackDueWake::runnerSleepWaitFailures() const
+{
+    return d->runnerSleepWaitFailed;
+}
+
+void PlaybackDueWake::setRunnerSleepWaitFailsForTest( bool fails )
+{
+    d->failRunnerSleepWaitForTest = fails;
 }
 
 const char *PlaybackDueWake::deliveryKindName() const
@@ -866,6 +939,8 @@ void PlaybackDueWake::resetStrandedCounts()
 {
     d->stranded = StrandedCounts();
     d->runnerSleepsWokenBySent = 0;
+    d->runnerSleepsWokenOther = 0;
+    d->runnerSleepWaitFailed = 0;
 }
 
 bool PlaybackDueWake::armPostPublished() const

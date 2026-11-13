@@ -20968,6 +20968,11 @@ QString MainWindow::playbackDueWakeSummaryLine( void ) const
         .arg( m_playbackDueWakePostStateUnknown )
         + QStringLiteral( " runner_sleep_woken=%1" )
               .arg( static_cast<qulonglong>( m_playbackDueWake ? m_playbackDueWake->runnerSleepsWokenBySent() : 0 ) )
+        // r2 G1 / G3 (CoS PR 811): runner sleeps another sent message interrupted (the sleep went on), and runner sleeps whose
+        // message wait failed and fell back to the msleep
+        + QStringLiteral( " runner_sleep_woken_other=%1 runner_sleep_wait_failed=%2" )
+              .arg( static_cast<qulonglong>( m_playbackDueWake ? m_playbackDueWake->runnerSleepsWokenOther() : 0 ) )
+              .arg( static_cast<qulonglong>( m_playbackDueWake ? m_playbackDueWake->runnerSleepWaitFailures() : 0 ) )
         + QStringLiteral( " post_to_awake_p50_ms=%1 post_to_awake_p95_ms=%2 awake_to_receive_p50_ms=%3 "
                           "awake_to_receive_p95_ms=%4 reentrant_deferred=%5 delivery_kind=%6" )
               .arg( playbackDueWakePercentileText( m_playbackDueWakePostToAwakeMs, 0.50 ) )
@@ -30885,8 +30890,9 @@ void MainWindow::finishPlaybackSmokeTelemetry( const char *reason )
     }
 
     m_playbackSmokeActive = false;
-    if( m_playbackDueWake ) m_playbackDueWake->setGuiTraceActive( false );   // FULLSCREEN-S1S2-PRESENT-GAP-1
     m_playbackPresentTrace.end();
+    // FULLSCREEN-S1S2-PRESENT-GAP-1 (r2: after the present trace's end, which PlaybackPresentTraceWiring pins next to the flag)
+    if( m_playbackDueWake ) m_playbackDueWake->setGuiTraceActive( false );
 
     // PLAYBACK-CLIP-LENGTH-ENFORCE-1: the loaded clip's own length, printed on the summary and
     // gate lines so a receipt carries the footage length the measured window actually played.

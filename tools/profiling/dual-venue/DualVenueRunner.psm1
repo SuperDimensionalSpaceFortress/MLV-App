@@ -1965,7 +1965,15 @@ function Get-DvDueWakeDeliveryEvidence {
             $fields = [regex]::Matches($l, '(?:^|\s)delivery_kind=(?<k>\S*)')
             $mech = [regex]::Matches($l, '(?:^|\s)delivery=(?<m>\S*)')
             if ($fields.Count -ne 1 -or $fields[0].Groups['k'].Value -cnotmatch '^(send|post|notifier|qtimer|none)$' -or $mech.Count -ne 1 -or $mech[0].Groups['m'].Value -cnotmatch '^(native-msg|qtimer|notifier|none)(\+(native-msg|qtimer|notifier))*$') { $unreadableSeen = $true }
-            else { $observed = $fields[0].Groups['k'].Value; $mechanism = $mech[0].Groups['m'].Value }
+            else {
+                # r1 adversary pass 3 A1: the selection and the arms must agree -- none only with no arm (delivery=none), qtimer only on QTimer arms, notifier
+                # only on notifier (or fallback QTimer) arms, send / post only on native-message (or fallback QTimer) arms; any other pair is contradictory
+                $k = $fields[0].Groups['k'].Value
+                $parts = @($mech[0].Groups['m'].Value -split '\+')
+                $allowed = switch ($k) { 'none' { @('none') } 'qtimer' { @('qtimer', 'none') } 'notifier' { @('notifier', 'qtimer', 'none') } default { @('native-msg', 'qtimer', 'none') } }
+                if (@($parts | Where-Object { $_ -cnotin $allowed }).Count -gt 0) { $unreadableSeen = $true }
+                else { $observed = $k; $mechanism = $mech[0].Groups['m'].Value }
+            }
         }
     }
     $unreadable = 'the due-wake delivery is unreadable: the measured session''s playback_due_wake line (after its playback_smoke.pace_summary, before the next) is not exactly one line carrying one delivery_kind of send, post, notifier, qtimer, none and one delivery= of native-msg, qtimer, notifier, none or a "+"-join (MainWindow::playbackDueWakeSummaryLine)'

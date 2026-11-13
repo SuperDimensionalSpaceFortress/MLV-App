@@ -2194,3 +2194,83 @@ TEST(PlaybackDueWakeSend, OnlyAQueuedSentMessageEndsTheRunnerSleepAndAConsumedPo
     ASSERT_EQ( static_cast<quint64>( 0 ), wake.runnerSleepsWokenBySent() );
 #endif
 }
+
+TEST(PlaybackDueWakeSend, G1_AForeignSentMessageInTheRunnerSleepIsNotAWakeAndTheSleepRunsItsFullInterval)
+{
+    // r2 G1 (CoS PR 811): the sleep ended, and counted runner_sleep_woken, for ANY pending sent message. Only this wake's own
+    // message (held by its window procedure inside the sleep's dispatch) ends it now; another sent message is dispatched,
+    // counted runner_sleep_woken_other, and the sleep goes on to its full interval.
+    const QString source = dueWakeRepoSource( QStringLiteral( "platform/qt/MainWindow.cpp" ) );
+    ASSERT_EQ( 1, source.count( QStringLiteral( "\" runner_sleep_woken_other=%1 runner_sleep_wait_failed=%2\"" ) ) );
+    ASSERT_EQ( 1, source.count( QStringLiteral( "m_playbackDueWake->runnerSleepsWokenOther()" ) ) );
+    const QString wakeSource = dueWakeRepoSource( QStringLiteral( "platform/qt/PlaybackDueWake.cpp" ) );
+    ASSERT_EQ( 1, wakeSource.count( QStringLiteral( "if( !wake->holdWindowProcWake( &msg ) ) wake->handleNativeMessage( &msg );" ) ) );
+    ASSERT_EQ( 1, wakeSource.count( QStringLiteral( "++d->runnerSleepsWokenOther;" ) ) );
+#ifdef Q_OS_WIN
+    int fired = 0;
+    PlaybackDueWake wake( nullptr, [&fired]() { ++fired; }, PlaybackDueWakeDeliveryMode::SendNotify );
+    const HWND window = reinterpret_cast<HWND>( wake.nativeWindow() );
+    ASSERT_TRUE( window != nullptr );
+    // a foreign sent message (not kNativeWakeMessage) to the GUI-thread window, 15 ms into a 150 ms runner sleep
+    std::atomic<bool> sent { false };
+    std::thread sender( [window, &sent]() {
+        Sleep( 15 );
+        sent = SendNotifyMessageW( window, WM_USER + 0x51, 0, 0 ) != 0;
+    } );
+    QElapsedTimer t;
+    t.start();
+    const PlaybackDueWake::RunnerSleep slept = wake.sleepForSmokeRunner( 150 );
+    const qint64 sleptMs = t.elapsed();
+    sender.join();
+    ASSERT_TRUE( sent.load() );
+    ASSERT_TRUE( slept == PlaybackDueWake::RunnerSleep::Slept );      // not WokenBySent
+    ASSERT_TRUE( sleptMs >= 140 );                                     // the full interval, never cut short at ~15 ms
+    ASSERT_EQ( static_cast<quint64>( 0 ), wake.runnerSleepsWokenBySent() );
+    ASSERT_EQ( static_cast<quint64>( 1 ), wake.runnerSleepsWokenOther() );
+    ASSERT_EQ( 0, fired );
+    // the wake itself still ends a sleep at once, is held inside it, and fires only when dispatched after it
+    wake.arm( 2.0 );
+    t.restart();
+    ASSERT_TRUE( wake.sleepForSmokeRunner( 500 ) == PlaybackDueWake::RunnerSleep::WokenBySent );
+    ASSERT_TRUE( t.elapsed() < 250 );
+    ASSERT_EQ( 0, fired );
+    ASSERT_EQ( static_cast<quint64>( 1 ), wake.runnerSleepsWokenBySent() );
+    ASSERT_EQ( static_cast<quint64>( 1 ), wake.runnerSleepsWokenOther() );
+    wake.dispatchSentMessages();
+    ASSERT_EQ( 1, fired );
+    ASSERT_FALSE( wake.armed() );
+    wake.resetStrandedCounts();
+    ASSERT_EQ( static_cast<quint64>( 0 ), wake.runnerSleepsWokenOther() );
+#else
+    SKIP_TEST( "native-message delivery is Windows-only" );
+#endif
+}
+
+TEST(PlaybackDueWakeSend, G3_AFailedRunnerSleepWaitSleepsTheRestOfTheIntervalAndIsCounted)
+{
+    // r2 G3 (CoS PR 811): WAIT_FAILED used to break out and return Slept after ~0 ms. It now sleeps the rest of the interval
+    // with QThread::msleep and counts runner_sleep_wait_failed. The OS failure cannot be injected, so a test hook forces it.
+    const QString wakeSource = dueWakeRepoSource( QStringLiteral( "platform/qt/PlaybackDueWake.cpp" ) );
+    const int failed = wakeSource.indexOf( QStringLiteral( "if( result == WAIT_FAILED )" ) );
+    const int counted = wakeSource.indexOf( QStringLiteral( "++d->runnerSleepWaitFailed;" ), failed );
+    const int msleep = wakeSource.indexOf( QStringLiteral( "QThread::msleep( static_cast<unsigned long>( leftMs ) );" ), counted );
+    const int timeout = wakeSource.indexOf( QStringLiteral( "if( result != WAIT_OBJECT_0 ) break;   // the timeout" ), msleep );
+    ASSERT_TRUE( failed > 0 && counted > failed && msleep > counted && timeout > msleep );
+#ifdef Q_OS_WIN
+    PlaybackDueWake wake( nullptr, []() {}, PlaybackDueWakeDeliveryMode::SendNotify );
+    wake.setRunnerSleepWaitFailsForTest( true );
+    QElapsedTimer t;
+    t.start();
+    ASSERT_TRUE( wake.sleepForSmokeRunner( 60 ) == PlaybackDueWake::RunnerSleep::Slept );
+    ASSERT_TRUE( t.elapsed() >= 50 );                                  // never ~0 ms
+    ASSERT_EQ( static_cast<quint64>( 1 ), wake.runnerSleepWaitFailures() );
+    ASSERT_EQ( static_cast<quint64>( 0 ), wake.runnerSleepsWokenBySent() );
+    wake.setRunnerSleepWaitFailsForTest( false );
+    ASSERT_TRUE( wake.sleepForSmokeRunner( 10 ) == PlaybackDueWake::RunnerSleep::Slept );
+    ASSERT_EQ( static_cast<quint64>( 1 ), wake.runnerSleepWaitFailures() );
+    wake.resetStrandedCounts();
+    ASSERT_EQ( static_cast<quint64>( 0 ), wake.runnerSleepWaitFailures() );
+#else
+    SKIP_TEST( "native-message delivery is Windows-only" );
+#endif
+}

@@ -456,15 +456,30 @@ public:
      *  GUI thread. With SendNotify delivery this sleeps \a ms as a message wait for QS_SENDMESSAGE ONLY (traced as the runner
      *  sleep): the sent wake ends it early; posted messages, timers and input do not, so the runner's cadence is otherwise
      *  unchanged. Returns RunnerSleep::NotHandled for every other delivery (the caller sleeps exactly as before),
-     *  Slept when the whole \a ms passed, WokenBySent when a sent message is pending: the caller then accounts its sleep
-     *  and calls dispatchSentMessages(). */
+     *  Slept when the whole \a ms passed, WokenBySent when THIS wake's sent message arrived: the caller then accounts its
+     *  sleep and calls dispatchSentMessages().
+     *  r2 G1 (CoS PR 811): a sent message ends the wait, and the sleep dispatches the pending sent messages at once. This
+     *  wake's window procedure holds its own message there (holdWindowProcWake) instead of firing it; only a dispatch that
+     *  held one ends the sleep (WokenBySent). Any other sent message runs in that dispatch, is counted
+     *  (runnerSleepsWokenOther, once per interruption) and the sleep goes on for the rest of \a ms, so the cadence never shortens.
+     *  r2 G3: a failed wait (WAIT_FAILED) sleeps the rest of \a ms with QThread::msleep (counted runnerSleepWaitFailures). */
     enum class RunnerSleep { NotHandled, Slept, WokenBySent };
     RunnerSleep sleepForSmokeRunner( unsigned long ms );
-    /*! GUI thread: dispatch the pending SENT messages (the wake's window procedure runs here), and nothing else -- posted
-     *  messages stay queued for the caller's next processEvents. */
+    /*! GUI thread: fire the wakes the runner sleep held (through the gate), then dispatch the pending SENT messages (the
+     *  wake's window procedure runs here), and nothing else -- posted messages stay queued for the caller's next processEvents. */
     void dispatchSentMessages();
-    /*! Runner sleeps a sent message ended early, since construction or resetStrandedCounts(). */
+    /*! GUI thread, called by the wake's window procedure with a kNativeWakeMessage MSG*: inside sleepForSmokeRunner's own
+     *  dispatch the message is held for dispatchSentMessages() and this returns true (the window procedure does not fire
+     *  it); anywhere else false. */
+    bool holdWindowProcWake( const void *message );
+    /*! Runner sleeps this wake's sent message ended early, since construction or resetStrandedCounts(). */
     quint64 runnerSleepsWokenBySent() const;
+    /*! r2 G1: runner-sleep interruptions by a sent message that was not this wake (the sleep went on), same span. */
+    quint64 runnerSleepsWokenOther() const;
+    /*! r2 G3: runner sleeps whose message wait failed and fell back to QThread::msleep, same span. */
+    quint64 runnerSleepWaitFailures() const;
+    /*! Test hook: make the runner sleep's message wait return WAIT_FAILED (the OS failure cannot be injected otherwise). */
+    void setRunnerSleepWaitFailsForTest( bool fails );
 
 private:
     struct Impl;
