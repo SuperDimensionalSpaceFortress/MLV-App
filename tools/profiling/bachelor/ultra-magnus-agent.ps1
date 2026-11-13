@@ -265,6 +265,43 @@ param(
 
 $ErrorActionPreference = "Continue"
 $script:HeavySlotModeExplicit = $PSBoundParameters.ContainsKey("HeavySlotMode")
+# >>> HEAVY-SLOT-FEED-NORMALIZE (VENUE-PROBE-HEAVY-SLOT-FEED-FORWARD-1 r3; tests take this block from its text between the two marker lines)
+# The agent reads its heat feed itself AND forwards it to five children (heavy-slot.py status / lease request / lease renew, the slot holder, the job's quiet probe), each of which
+# falls back to the DEFAULT csv when HEAVY_SLOT_FEED is empty or absent. A child's environment is a NUL-terminated UTF-16 block, so a value it cannot carry byte-for-byte reaches the
+# child as something else (an embedded NUL truncates it: no variable, so the default csv; or a prefix, so another file) while the agent's own FileInfo refuses it: two sensors.
+# r2 fixed instances (empty, blank); this closes the CLASS. ONE predicate decides here, once, before anything reads or forwards the feed: a feed it refuses becomes ONE stand-in no
+# file can have (angle brackets are not legal in a Win32 file name, so it can never be planted as a readable feed), and the agent and every child agree: feed missing, heat unknown.
+# An accepted feed is replaced by its ABSOLUTE form, so no forward re-derives it (children that start in $Root would resolve a relative path elsewhere).
+# Mapped here rather than refused at bind by [ValidateScript()]: a validation attribute stays on the variable (this reassignment would be re-validated), it never sees the env-derived
+# default, and a refused bind kills a scheduled-task agent before its log exists (the venue goes dark); the stand-in keeps the agent up and its start line types the refusal (feedRefused=).
+function ConvertTo-ForwardableHeavySlotFeed {
+    # Returns @{ feed; refused }: refused is $null for an accepted feed (feed = its absolute form), else a token naming the rule that refused it (feed = the stand-in).
+    # Touches nothing but one scratch variable in this process's own environment (set, read back, removed).
+    param([AllowNull()][AllowEmptyString()][string]$Feed)
+    $standIn = "C:\temp\heavy-slot-feed-<not-set>.csv"
+    if ([string]::IsNullOrWhiteSpace($Feed)) { return @{ feed = $standIn; refused = "empty-or-blank" } }
+    # NUL, U+0001..U+001F and '|' ([IO.Path]::GetInvalidPathChars on .NET): no Win32 path holds one, and NUL is the env-block terminator
+    if ($Feed.IndexOfAny([System.IO.Path]::GetInvalidPathChars()) -ge 0) { return @{ feed = $standIn; refused = "invalid-path-char" } }
+    # a lone surrogate has no UTF-8 form: heavy-slot.py, the job's JSON and the agent's own log would each spell it differently
+    try { [void][System.Text.UTF8Encoding]::new($false, $true).GetByteCount($Feed) } catch { return @{ feed = $standIn; refused = "not-utf8-encodable" } }
+    try { $full = [System.IO.Path]::GetFullPath($Feed) } catch { return @{ feed = $standIn; refused = "not-a-full-path" } }
+    if ([string]::IsNullOrWhiteSpace($full) -or $full.IndexOfAny([System.IO.Path]::GetInvalidPathChars()) -ge 0) { return @{ feed = $standIn; refused = "not-a-full-path" } }
+    # the round trip itself: exactly the value a child's environment will carry, read back ordinal (a value the OS cannot store, e.g. over its length limit, fails here)
+    $scratch = "MLV_AGENT_FEED_ROUNDTRIP_$PID"
+    $back = $null
+    try {
+        [Environment]::SetEnvironmentVariable($scratch, $full, [EnvironmentVariableTarget]::Process)
+        $back = [Environment]::GetEnvironmentVariable($scratch, [EnvironmentVariableTarget]::Process)
+    }
+    catch { $back = $null }
+    finally { [Environment]::SetEnvironmentVariable($scratch, $null, [EnvironmentVariableTarget]::Process) }
+    if (-not [string]::Equals($back, $full, [StringComparison]::Ordinal)) { return @{ feed = $standIn; refused = "env-round-trip" } }
+    return @{ feed = $full; refused = $null }
+}
+$script:HeavySlotFeedNormalized = ConvertTo-ForwardableHeavySlotFeed -Feed $HeavySlotFeed
+$script:HeavySlotFeedRefused = $script:HeavySlotFeedNormalized.refused
+$HeavySlotFeed = [string]$script:HeavySlotFeedNormalized.feed
+# <<< HEAVY-SLOT-FEED-NORMALIZE
 $inbox     = Join-Path $Root "inbox"
 $outbox    = Join-Path $Root "outbox"
 $processed = Join-Path $Root "processed"
@@ -4384,6 +4421,10 @@ function Invoke-QueuedJob {
     }
     # PARITY-1: the heat rule in the job's env ($heatRule was put on the admission record above, before any early exit)
     $env:MLV_AGENT_HEAT_RULE = ($heatRule | ConvertTo-Json -Compress)
+    # VENUE-PROBE-HEAVY-SLOT-FEED-FORWARD-1: the FEED the rule is applied to rides with the rule. The in-job quiet probe picks its feed from $env:HEAVY_SLOT_FEED (else the default csv), so an
+    # agent started with -HeavySlotFeed X and no HEAVY_SLOT_FEED of its own would otherwise judge X while the job's gate read the default csv and still labelled its thresholds `agent`.
+    # $HeavySlotFeed is already the ABSOLUTE, losslessly forwardable path (or the stand-in): the start-up HEAVY-SLOT-FEED-NORMALIZE block made it so (the job starts in $Root).
+    $env:HEAVY_SLOT_FEED = $HeavySlotFeed
     $env:MLV_AGENT_ADMISSION = $script:Admission.label
     $env:MLV_AGENT_ADMISSION_THERMAL = [string]$script:Admission.thermal
     $env:MLV_AGENT_ADMISSION_WAIT_SEC = [string]$script:Admission.waitedSec
@@ -4639,7 +4680,7 @@ try {
         exit 0
     }
     $priority = Set-AgentPriority
-    Add-AgentLogLine "agent start pid=$PID host=$env:COMPUTERNAME root=$Root shell=$psExe processStartUtc=$script:AgentProcessStartUtc imagePath=$script:AgentImagePath gate=$script:GateVersion mode=$(Resolve-HeavySlotMode) priority=$priority slots=$HeavySlotCount slotDir=$HeavySlotDir feed=$HeavySlotFeed heat=[blocked when > $GateMaxThrottledRows/$GateSustainedRows throttled or mean >= $GateMeanMaxC C] waitCap=none"
+    Add-AgentLogLine "agent start pid=$PID host=$env:COMPUTERNAME root=$Root shell=$psExe processStartUtc=$script:AgentProcessStartUtc imagePath=$script:AgentImagePath gate=$script:GateVersion mode=$(Resolve-HeavySlotMode) priority=$priority slots=$HeavySlotCount slotDir=$HeavySlotDir feed=$HeavySlotFeed feedRefused=$(if ($script:HeavySlotFeedRefused) { $script:HeavySlotFeedRefused } else { 'none' }) heat=[blocked when > $GateMaxThrottledRows/$GateSustainedRows throttled or mean >= $GateMeanMaxC C] waitCap=none"
     Stop-StaleHeavySlotHolders
     Stop-StaleQuietLeases
     Resolve-StartedMarkers
