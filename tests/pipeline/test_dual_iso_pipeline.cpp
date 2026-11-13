@@ -7486,18 +7486,43 @@ TEST(DualIsoPipeline, Full20PublishIsFrameScoped)
     const QString scopedRead = QStringLiteral("llrpGetDualIsoFull20bitTimingForRunSince(");
     const int rawReads = static_cast<int>(body.count(rawRead));
     const int scopedReads = static_cast<int>(body.count(scopedRead));
+    // Adversary 288ee706 A1: the generation argument must BE the entry generation, not merely
+    // mention it (`llrpRunGenerationAtDrawFrameEntry + 1` would read every one-run frame as unmeasured).
+    // The whole first argument, whitespace dropped, must be the entry capture or its uint64_t cast.
+    const auto firstArgumentOf = [](const QString &callArgs) {
+        QString compact = callArgs;
+        compact.remove(QLatin1Char(' ')).remove(QLatin1Char('\t')).remove(QLatin1Char('\n')).remove(QLatin1Char('\r'));
+        const qsizetype comma = compact.lastIndexOf(QLatin1Char(','));
+        return comma > 0 ? compact.left(comma) : QString();
+    };
+    const auto keyedByEntryGeneration = [](const QString &firstArg) {
+        return firstArg == QStringLiteral("static_cast<uint64_t>(llrpRunGenerationAtDrawFrameEntry)")
+            || firstArg == QStringLiteral("llrpRunGenerationAtDrawFrameEntry");
+    };
+    // The checker itself refuses the adversary's mutation and an unrelated generation.
+    ASSERT_FALSE(keyedByEntryGeneration(firstArgumentOf(
+        QStringLiteral(" static_cast<uint64_t>( llrpRunGenerationAtDrawFrameEntry + 1 ), &dualIsoFull20 "))));
+    ASSERT_FALSE(keyedByEntryGeneration(firstArgumentOf(
+        QStringLiteral(" llrpGetRunGenerationForCurrentThread(), &dualIsoFull20 "))));
+    ASSERT_TRUE(keyedByEntryGeneration(firstArgumentOf(
+        QStringLiteral(" static_cast<uint64_t>( llrpRunGenerationAtDrawFrameEntry ), &dualIsoFull20 "))));
     bool scopedKeyed = false;
+    QString scopedFirstArg;
     const qsizetype at = body.indexOf(scopedRead);
     if (at >= 0)
     {
-        const qsizetype end = body.indexOf(QStringLiteral(");"), at);
-        scopedKeyed = end > at
-            && body.mid(at, end - at).contains(QStringLiteral("llrpRunGenerationAtDrawFrameEntry"));
+        const qsizetype argsStart = at + scopedRead.size();
+        const qsizetype end = body.indexOf(QStringLiteral(");"), argsStart);
+        if (end > argsStart)
+        {
+            scopedFirstArg = firstArgumentOf(body.mid(argsStart, end - argsStart));
+            scopedKeyed = keyedByEntryGeneration(scopedFirstArg);
+        }
     }
     std::fprintf(stderr, "[full20-frame-scope] case=wiring drawFrame=%lld body_end=%lld raw_reads=%d "
-                 "scoped_reads=%d scoped_keyed=%d\n",
+                 "scoped_reads=%d scoped_keyed=%d scoped_first_arg=%s\n",
                  static_cast<long long>(drawFrame), static_cast<long long>(bodyEnd), rawReads, scopedReads,
-                 scopedKeyed ? 1 : 0);
+                 scopedKeyed ? 1 : 0, scopedFirstArg.toUtf8().constData());
     ASSERT_EQ(0, rawReads);
     ASSERT_EQ(1, scopedReads);
     ASSERT_TRUE(scopedKeyed);
