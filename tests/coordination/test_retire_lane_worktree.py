@@ -6000,3 +6000,25 @@ def test_real_process_creation_order_retries_once_when_the_first_buffer_is_too_s
     finally:
         child.kill()
         child.wait(timeout=30)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="reads the Windows process table")
+def test_real_process_creation_order_get_returns_null_for_a_first_buffer_length_it_cannot_allocate():
+    """RETIRE-PROC-ORDER-BUFFER-RETRY-1 r2 (sol r1 blocker, ANC-03): the public Get(pid, first) is pair-or-null, so a first buffer length outside 1..1 MiB (the
+    same bound the retry applies to the reported length) must read as unreadable on a queryable process, never escape as a negative-size OverflowException
+    (-1, Int32.MinValue) or an out-of-memory one (Int32.MaxValue). 1 and 1 MiB are the inclusive edges and still answer; 1 byte is retried to the real key."""
+    script = ("$ErrorActionPreference='Stop'; " + f". '{HELPER}'; "
+              "$r = [ordered]@{}; "
+              "foreach ($n in @(-1, 0, [int]::MinValue, 1048577, [int]::MaxValue)) { "
+              "try { $v = [MlvProcOrder]::Get($PID, $n); $r[[string]$n] = @{ threw = $false; isNull = ($null -eq $v) } } "
+              "catch { $r[[string]$n] = @{ threw = $true; isNull = $false } } }; "
+              "$default = [MlvProcOrder]::Get($PID); $one = [MlvProcOrder]::Get($PID, 1); $max = [MlvProcOrder]::Get($PID, 1048576); "
+              "$r['default'] = $default; $r['one'] = $one; $r['max'] = $max; "
+              "ConvertTo-Json -Compress -Depth 4 $r")
+    r = subprocess.run([PWSH, "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, timeout=120)
+    assert r.returncode == 0, r.stdout + r.stderr
+    got = json.loads(r.stdout)
+    assert got["default"] and len(got["default"]) == 2, got
+    for n in ("-1", "0", str(-2**31), "1048577", str(2**31 - 1)):
+        assert got[n] == {"threw": False, "isNull": True}, (n, got)
+    assert got["one"] == got["default"] and got["max"] == got["default"], got

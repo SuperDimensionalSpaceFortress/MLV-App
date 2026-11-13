@@ -388,8 +388,10 @@ public static class MlvProcOrder {
     [DllImport("ntdll.dll")] static extern int NtQueryInformationProcess(IntPtr h, int cls, byte[] buf, int len, out int ret);
     // { sequence, creation FILETIME } of the process that holds `pid` NOW, or null.
     public static long[] Get(int pid) { return Get(pid, 8192); }
-    // `first` is the initial buffer length (a test passes a small one to force the retry below).
+    // `first` is the initial buffer length (a test passes a small one to force the retry below). Pair-or-null: a length outside 1..1 MiB (the retry's bound)
+    // is unreadable, rejected before any handle is opened, so no negative or oversize buffer is ever allocated.
     public static long[] Get(int pid, int first) {
+        if (first < 1 || first > 1048576) return null;
         IntPtr h = OpenProcess(0x1000, false, pid);
         if (h == IntPtr.Zero) return null;
         try {
