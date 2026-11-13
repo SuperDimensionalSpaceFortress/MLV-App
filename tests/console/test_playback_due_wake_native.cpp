@@ -1956,7 +1956,9 @@ TEST(PlaybackDueWakeSend, A_ARunnerSleepEndsForASentWakeButNotForAPostedOne)
     ASSERT_EQ( 1u, wake.runnerSleepsWokenBySent() );
     wake.dispatchSentMessages();
     ASSERT_EQ( 1, fired );
-    ASSERT_TRUE( firedMs - wokeMs < 5.0 );                        // dispatched at once, no queue in between
+    // r3 (r2 adversary pass 6 advisory A4): dispatched at once, no queue in between -- bounded well below the 500 ms sleep the
+    // wake cut short, not at 5 ms, so a test thread descheduled for a few ms between the two stamps does not fail it
+    ASSERT_TRUE( firedMs - wokeMs < 50.0 );
     ASSERT_FALSE( wake.armed() );
     // the design's shape: a filtered PM_NOREMOVE peek of an unrelated range (which marks the queue seen), then a plain
     // QS_ALLINPUT wait without MWMO_INPUTAVAILABLE -- a sent wake that arrives during it still ends it, and the next
@@ -2241,6 +2243,102 @@ TEST(PlaybackDueWakeSend, G1_AForeignSentMessageInTheRunnerSleepIsNotAWakeAndThe
     ASSERT_FALSE( wake.armed() );
     wake.resetStrandedCounts();
     ASSERT_EQ( static_cast<quint64>( 0 ), wake.runnerSleepsWokenOther() );
+#else
+    SKIP_TEST( "native-message delivery is Windows-only" );
+#endif
+}
+
+#ifdef Q_OS_WIN
+namespace {
+// r3 A3: a GUI-thread window whose handler does real work, so the runner sleep's dispatch of its sent message takes time
+struct R3A3Foreign
+{
+    PlaybackDueWake *wake = nullptr;
+    int calls = 0;
+    PlaybackGuiSleepTrace::At at { PlaybackGuiSleepTrace::State::Unknown, false, 0.0 };
+    double handlerStartMs = -1.0;
+};
+R3A3Foreign *g_r3a3Foreign = nullptr;
+constexpr UINT kR3A3ForeignMessage = WM_USER + 0x52;
+LRESULT CALLBACK r3a3ForeignProc( HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam )
+{
+    if( message == kR3A3ForeignMessage && g_r3a3Foreign )
+    {
+        ++g_r3a3Foreign->calls;
+        g_r3a3Foreign->handlerStartMs = dueWakeQpcNowMs();
+        // what the GUI trace says while the handler runs -- the state a wake posted from here is classified by
+        g_r3a3Foreign->at = g_r3a3Foreign->wake->guiStateAt( g_r3a3Foreign->handlerStartMs );
+        QElapsedTimer busy;
+        busy.start();
+        volatile quint64 spin = 0;
+        while( busy.elapsed() < 30 ) ++spin;                      // >= 20 ms of real handler work
+        return 0;
+    }
+    return DefWindowProcW( hwnd, message, wParam, lParam );
+}
+}
+#endif
+
+TEST(PlaybackDueWakeSend, R3A3_AForeignHandlerInTheRunnerSleepIsGuiWorkNotRunnerSleep)
+{
+    // r2 adversary pass 7 A3, its input: SendNotify delivery, trace on, a runner sleep; another thread sends a message to a
+    // GUI-thread window whose handler does real work. The handler ran while the trace still said RunnerSleep, so its time was
+    // charged to the runner sleep and a wake posted in it was classed asleep. Now the dispatch is traced Running and its time
+    // is returned (lastRunnerSleepDispatchNs) for the caller to take out of the sleep it accounts.
+    const QString mainWindow = dueWakeRepoSource( QStringLiteral( "platform/qt/MainWindow.cpp" ) );
+    ASSERT_EQ( 1, mainWindow.count( QStringLiteral( "? m_playbackDueWake->lastRunnerSleepDispatchNs() : 0;" ) ) );
+    ASSERT_EQ( 1, mainWindow.count( QStringLiteral( "const qint64 sleptNs = std::max<qint64>( 0, slept.nsecsElapsed() - dispatchNs );" ) ) );
+    ASSERT_EQ( 1, mainWindow.count( QStringLiteral(
+        "m_guiPresentGapRunnerSleepNs += std::max<qint64>( 0, m_guiPresentGapClock.nsecsElapsed() - startNs - dispatchNs );" ) ) );
+#ifdef Q_OS_WIN
+    PlaybackDueWake wake( nullptr, []() {}, PlaybackDueWakeDeliveryMode::SendNotify );
+    ASSERT_TRUE( wake.sendsNotify() );
+    R3A3Foreign foreign;
+    foreign.wake = &wake;
+    g_r3a3Foreign = &foreign;
+    static const wchar_t *kClass = L"MlvR3A3ForeignHandler";
+    WNDCLASSW wc {};
+    wc.lpfnWndProc = r3a3ForeignProc;
+    wc.hInstance = GetModuleHandleW( nullptr );
+    wc.lpszClassName = kClass;
+    RegisterClassW( &wc );
+    const HWND window = CreateWindowExW( 0, kClass, L"", 0, 0, 0, 0, 0, HWND_MESSAGE, nullptr, wc.hInstance, nullptr );
+    ASSERT_TRUE( window != nullptr );
+    wake.setGuiTraceActive( true );
+    std::atomic<bool> sent { false };
+    std::thread sender( [window, &sent]() {
+        Sleep( 5 );
+        sent = SendNotifyMessageW( window, kR3A3ForeignMessage, 0, 0 ) != 0;
+    } );
+    QElapsedTimer t;
+    t.start();
+    const PlaybackDueWake::RunnerSleep slept = wake.sleepForSmokeRunner( 150 );
+    const qint64 sleptMs = t.elapsed();
+    sender.join();
+    // after the sleep: the trace is back in RunnerSleep only while the runner really slept
+    const PlaybackGuiSleepTrace::At afterHandler = wake.guiStateAt( foreign.handlerStartMs + 60.0 );
+    wake.setGuiTraceActive( false );
+    g_r3a3Foreign = nullptr;
+    DestroyWindow( window );
+    ASSERT_TRUE( sent.load() );
+    ASSERT_EQ( 1, foreign.calls );
+    ASSERT_TRUE( slept == PlaybackDueWake::RunnerSleep::Slept );
+    ASSERT_TRUE( sleptMs >= 140 );                                     // the cadence is unchanged: the full interval
+    // the handler ran as GUI work: a wake posted from it is not classed asleep, nor as a runner-sleep post
+    ASSERT_TRUE( foreign.at.state == PlaybackGuiSleepTrace::State::Running );
+    const PlaybackDueWakePostClass c = playbackDueWakeClassifyPost( foreign.at, foreign.handlerStartMs, foreign.handlerStartMs + 1.0 );
+    ASSERT_TRUE( c.kind != PlaybackDueWakePostClass::Kind::Asleep );
+    ASSERT_FALSE( c.runnerSleep );
+    // ...and the sleep went back to RunnerSleep for the rest of its interval
+    ASSERT_TRUE( afterHandler.state == PlaybackGuiSleepTrace::State::RunnerSleep );
+    // the handler's time is returned, so the caller's runner-sleep account excludes it
+    const qint64 dispatchMs = wake.lastRunnerSleepDispatchNs() / 1000000;
+    ASSERT_TRUE( dispatchMs >= 28 );
+    ASSERT_TRUE( dispatchMs <= sleptMs );
+    ASSERT_TRUE( sleptMs - dispatchMs <= 150 );
+    // a sleep that dispatched nothing returns 0
+    ASSERT_TRUE( wake.sleepForSmokeRunner( 5 ) == PlaybackDueWake::RunnerSleep::Slept );
+    ASSERT_EQ( static_cast<qint64>( 0 ), wake.lastRunnerSleepDispatchNs() );
 #else
     SKIP_TEST( "native-message delivery is Windows-only" );
 #endif

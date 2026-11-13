@@ -1108,19 +1108,22 @@ function Get-DvSmokeSummaryFields {
         # PLAYBACK-PREP-CONFLATED-MOVE-FR1B-AB-1 r4 (r3 adversary A2 and advisory A3 on #726): every line is read as its record body, so a build path in a Qt
         # location suffix never selects the session or a line, and never adds a summary or conform field.
         $lines = Get-DvLogRecordBodies -LogText $LogText
-        foreach ($line in $lines) { if ($line -match 'playback_smoke\.measured_session id=(?<s>\d+)') { $session = $Matches['s']; break } }
-        if ($null -eq $session) { foreach ($line in $lines) { if ($line -match 'playback_smoke\.summary session=(?<s>\d+)') { $session = $Matches['s']; break } } }
+        # HFR-NATIVE-M16-1457-FULLSCREEN-S1S2-PRESENT-GAP-1 r3 (r2 adversary pass 7 A2): each marker counts only where it STARTS the record body
+        # ($script:DvRecordStart), so a run_metadata command line (or any other record) holding `playback_smoke.measured_session id=<n>` never picks the session
+        $rs = $script:DvRecordStart
+        foreach ($line in $lines) { if ($line -match ($rs + 'playback_smoke\.measured_session id=(?<s>\d+)')) { $session = $Matches['s']; break } }
+        if ($null -eq $session) { foreach ($line in $lines) { if ($line -match ($rs + 'playback_smoke\.summary session=(?<s>\d+)')) { $session = $Matches['s']; break } } }
         if ($null -ne $session) {
             $summaryLine = $null
-            foreach ($line in $lines) { if ($line -match ('playback_smoke\.summary session=' + [regex]::Escape($session) + '(\s|$)')) { $summaryLine = $line } }
+            foreach ($line in $lines) { if ($line -match ($rs + 'playback_smoke\.summary session=' + [regex]::Escape($session) + '(\s|$)')) { $summaryLine = $line } }
             if ($null -ne $summaryLine) {
                 foreach ($m in [regex]::Matches($summaryLine, '(?<k>[A-Za-z0-9_]+)=(?<v>\S+)')) { $fields[$m.Groups['k'].Value] = $m.Groups['v'].Value }
             }
-            foreach ($line in $lines) { if ($line -match ('playback_smoke\.conform session=' + [regex]::Escape($session) + '(\s|$)')) { $conformLine = $line } }
+            foreach ($line in $lines) { if ($line -match ($rs + 'playback_smoke\.conform session=' + [regex]::Escape($session) + '(\s|$)')) { $conformLine = $line } }
         }
         # Master isolates an automation run's settings store (the venue's persisted settings are never read or rewritten).
         # A build that predates that, or a line that says otherwise, leaves the venue's QSettings exposed: not evidence.
-        $iso = @($lines | Where-Object { $_ -match 'interaction_trace event=automation\.pacing_isolated(\s|$)' })
+        $iso = @($lines | Where-Object { $_ -match ($rs + 'interaction_trace event=automation\.pacing_isolated(\s|$)') })
         $isolated = ($iso.Count -gt 0) -and (@($iso | Where-Object { $_ -notmatch 'settings_store=run_scoped(\s|$)' }).Count -eq 0)
     }
     [pscustomobject]@{ session = $session; fields = $fields; settingsIsolated = $isolated; conformLine = $conformLine }
@@ -1461,7 +1464,8 @@ function Get-DvScaleEvidence {
         if ($null -ne $clampFlag) { $clampActive = ($clampFlag -ne 0) }
         if ($null -eq $effective) {
             foreach ($line in (Get-DvLogRecordBodies -LogText $LogText)) {
-                if ($line -match 'playback_scale_clamped_for_gpu_texture_route requested=(?<r>\d+) effective=(?<e>\d+)') { $effective = [int64]$Matches['e']; $source = 'playback_scale_clamped_for_gpu_texture_route effective (clamp line)'; $clampActive = $true; break }
+                # r3 (r2 adversary pass 6 A3): the clamp record only where it starts the record body
+                if ($line -match ($script:DvRecordStart + 'playback_scale_clamped_for_gpu_texture_route requested=(?<r>\d+) effective=(?<e>\d+)')) { $effective = [int64]$Matches['e']; $source = 'playback_scale_clamped_for_gpu_texture_route effective (clamp line)'; $clampActive = $true; break }
             }
         }
     }
@@ -1757,6 +1761,11 @@ function ConvertTo-DvSessionKey {
 # every whole-line record pattern Get-DvCanonicalRecordPattern builds.
 $script:DvLogRecordPrefix = '(\[[^\]]*\] \[[A-Za-z]+\] (\[0x[0-9A-Fa-f]+\] )?)?'
 
+# HFR-NATIVE-M16-1457-FULLSCREEN-S1S2-PRESENT-GAP-1 r3 (r2 adversary pass 7 A2, pass 6 advisory A3): where a record marker must sit to count -- at the START
+# of the record body, after at most the log prefix's bracket groups ([utc] [LEVEL] [0x<thread>] , or a shorter fixture prefix), never as text inside
+# another record (a run_metadata command line, a path, a field value). Every reader that selects the measured session or reads a session record anchors on it.
+$script:DvRecordStart = '^(?:\[[^\]]*\] ){0,3}'
+
 function Get-DvCanonicalRecordPattern {
     <#
     .SYNOPSIS
@@ -1946,8 +1955,9 @@ function Get-DvDueWakeDeliveryEvidence {
         $session = (Get-DvSmokeSummaryFields -LogText $LogText).session
         if ($null -ne $session) {
             # r2 adversary pass 6 A1: a record is read only where it STARTS the record body (after the optional `[utc] [LEVEL] [0x<thread>] ` prefix,
-            # Get-DvLogRecordBody), never as text inside another record's line
-            $start = '^(?:\[[^\]]*\] \[[A-Za-z]+\] \[0x[0-9A-Fa-f]+\] )?'
+            # Get-DvLogRecordBody), never as text inside another record's line. r3: the one shared anchor ($script:DvRecordStart), which the session
+            # selector above (Get-DvSmokeSummaryFields) now uses too (r2 adversary pass 7 A2)
+            $start = $script:DvRecordStart
             $paceRx = $start + 'playback_smoke\.pace_summary session=' + [regex]::Escape([string]$session) + '(?:\s|$)'
             $open = $false
             foreach ($l in (Get-DvLogRecordBodies -LogText $LogText)) {
@@ -1973,7 +1983,11 @@ function Get-DvDueWakeDeliveryEvidence {
             $l = $candidates[0]
             $fields = [regex]::Matches($l, '(?:^|\s)delivery_kind=(?<k>\S*)')
             $mech = [regex]::Matches($l, '(?:^|\s)delivery=(?<m>\S*)')
-            if ($fields.Count -ne 1 -or $fields[0].Groups['k'].Value -cnotmatch '^(send|post|notifier|qtimer|none)$' -or $mech.Count -ne 1 -or $mech[0].Groups['m'].Value -cnotmatch '^(native-msg|qtimer|notifier|none)(\+(native-msg|qtimer|notifier))*$') { $unreadableSeen = $true }
+            # r3 (r2 adversary pass 7 advisory A1): the app's record starts `playback_due_wake armed=<n>` (MainWindow::playbackDueWakeSummaryLine) with one
+            # non-negative decimal count; a record without it, or with an empty, signed, fractional or repeated armed=, is unreadable
+            $armed = [regex]::Matches($l, '(?:^|\s)armed=(?<a>\S*)')
+            if ($l -cnotmatch ($start + 'playback_due_wake armed=[0-9]+(?:\s|$)') -or $armed.Count -ne 1) { $unreadableSeen = $true }
+            elseif ($fields.Count -ne 1 -or $fields[0].Groups['k'].Value -cnotmatch '^(send|post|notifier|qtimer|none)$' -or $mech.Count -ne 1 -or $mech[0].Groups['m'].Value -cnotmatch '^(native-msg|qtimer|notifier|none)(\+(native-msg|qtimer|notifier))*$') { $unreadableSeen = $true }
             else {
                 # r1 adversary pass 3 A1: the selection and the arms must agree -- none only with no arm (delivery=none), qtimer only on QTimer arms, notifier
                 # only on notifier (or fallback QTimer) arms, send / post only on native-message (or fallback QTimer) arms; any other pair is contradictory
@@ -2033,7 +2047,9 @@ function Get-DvLookAssistEvidence {
         if (-not [string]::IsNullOrEmpty($LogText)) {
             # r4 (r3 adversary A2 on #726): matched on the record body, so a Qt location path never selects (or answers for) the visual_state line
             foreach ($line in (Get-DvLogRecordBodies -LogText $LogText)) {
-                if ($line -match '(^|\s)event=gui_smoke\.visual_state(\s|$)') {
+                # r3 (r2 adversary pass 6 A3): the visual_state record only where it starts the record body (logInteractionEvent writes
+                # `interaction_trace event=<name> ...`), never an `event=gui_smoke.visual_state` text inside another record
+                if ($line -match ($script:DvRecordStart + 'interaction_trace event=gui_smoke\.visual_state(\s|$)')) {
                     $found = $line
                     foreach ($ft in [regex]::Matches($line, '(^|\s)look_assist_flavor=(?<f>\S*)')) { [void]$flavorsSeen.Add($ft.Groups['f'].Value) }
                 }
@@ -2159,7 +2175,8 @@ function Get-DvSmokeSessionLineRead {
     if (-not [string]::IsNullOrEmpty($LogText)) {
         $session = (Get-DvSmokeSummaryFields -LogText $LogText).session
         if ($null -ne $session) {
-            $pattern = 'playback_smoke\.' + $Marker + ' session=' + [regex]::Escape([string]$session) + '(\s|$)'
+            # r3 (r2 adversary pass 6 A3): the record only where it starts the record body
+            $pattern = $script:DvRecordStart + 'playback_smoke\.' + $Marker + ' session=' + [regex]::Escape([string]$session) + '(\s|$)'
             # r4 (r3 adversary A2 on #726): the marker is matched on each line's record body, so a later line whose build path holds
             # `playback_smoke.<Marker> session=<n>` is never selected
             foreach ($line in (Get-DvLogRecordBodies -LogText $LogText)) { if ($line -match $pattern) { $found = $line } }

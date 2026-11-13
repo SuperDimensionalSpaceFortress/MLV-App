@@ -5243,9 +5243,13 @@ void MainWindow::sleepGuiThreadForSmokeRunner( unsigned long ms )
         QThread::msleep( ms );
         if( m_playbackDueWake ) m_playbackDueWake->noteRunnerSleep( false );
     }
-    const qint64 sleptNs = slept.nsecsElapsed();
+    // r3 (r2 adversary pass 7 A3): a sent message the sleep dispatched ran GUI work, not the runner's sleep; its time is taken
+    // out of both sleep accounts (0 when nothing was dispatched, or the delivery is not the sent wake)
+    const qint64 dispatchNs = ( runnerSleep != PlaybackDueWake::RunnerSleep::NotHandled && m_playbackDueWake )
+        ? m_playbackDueWake->lastRunnerSleepDispatchNs() : 0;
+    const qint64 sleptNs = std::max<qint64>( 0, slept.nsecsElapsed() - dispatchNs );
     if( startNs >= 0 && m_guiPresentGapStartNs >= 0 )
-        m_guiPresentGapRunnerSleepNs += m_guiPresentGapClock.nsecsElapsed() - startNs;
+        m_guiPresentGapRunnerSleepNs += std::max<qint64>( 0, m_guiPresentGapClock.nsecsElapsed() - startNs - dispatchNs );
     GpuDisplayWindow::noteSmokeRunnerSleepIfActive( sleptNs );
     // the sent wake that ended the sleep runs now (its window procedure; posted messages wait for the runner's processEvents)
     if( runnerSleep == PlaybackDueWake::RunnerSleep::WokenBySent && m_playbackDueWake ) m_playbackDueWake->dispatchSentMessages();

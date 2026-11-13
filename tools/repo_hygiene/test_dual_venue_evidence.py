@@ -15355,6 +15355,87 @@ class DueWakeDeliveryEvidenceTests(unittest.TestCase):
                     v = self.verdict(spec, log)
                     self.assertEqual((v["verdict"], v["blocks"]), ("NOT_HONOURED", True), v)
 
+    def test_a_wake_record_without_one_plain_armed_count_is_unreadable(self) -> None:
+        # r3 (r2 adversary pass 7 advisory A1, verbatim shape): the app's record starts `playback_due_wake armed=<n>`; without that count it proves nothing
+        bare = "playback_due_wake delivery=native-msg delivery_kind=post"
+        for name, line in (("no armed=", bare), ("empty armed=", bare.replace("playback_due_wake ", "playback_due_wake armed= ")),
+                           ("negative armed=", bare.replace("playback_due_wake ", "playback_due_wake armed=-1 ")),
+                           ("NaN armed=", bare.replace("playback_due_wake ", "playback_due_wake armed=NaN ")),
+                           ("armed= not first", "playback_due_wake fired=3 armed=3 delivery=native-msg delivery_kind=post"),
+                           ("two armed=", self.wake("post") + " armed=4")):
+            with self.subTest(case=name):
+                v = self.verdict(self.POST, self.log(line))
+                self.assertEqual((v["verdict"], v["blocks"]), ("NOT_HONOURED", True), v)
+                self.assertIn("unreadable", v["reason"])
+        v = self.verdict(self.POST, self.log(self.PREFIX + self.wake("post").replace("armed=1200", "armed=0")))
+        self.assertEqual((v["verdict"], v["blocks"]), ("HONOURED", False), v)
+
+
+@requires_windows_pwsh
+class DueWakeMeasuredSessionAnchorTests(unittest.TestCase):
+    """HFR-NATIVE-M16-1457-FULLSCREEN-S1S2-PRESENT-GAP-1 r3 (r2 adversary pass 7 A2, pass 6 advisory A3): the measured session, and every session record a
+    reader takes from the run log, counts only where its marker STARTS the record body ($script:DvRecordStart). A run_metadata command line (or any other
+    record) that holds `playback_smoke.measured_session id=<n>` or a session record's text never selects the session or supplies a field."""
+
+    PREFIX = "[2026-11-13T00:00:00.000Z] [INFO] [0x1a2b] "
+    # r2 adversary pass 7 A2 (its input; the clip file name in the command line is left out, the marker text is what it tests)
+    A2_LOG = "\n".join([
+        'run_metadata={"command_line":["MLVApp.exe","--gui-smoke-playback","C:/runs/playback_smoke.measured_session id=2/input"]}',
+        "playback_smoke.summary session=2 reason=play-stop presented_frames=120",
+        "playback_smoke.pace_summary session=2 first_present_ms=40.000 paced_elapsed_ms=2000.000",
+        "playback_due_wake armed=120 delivery=native-msg delivery_kind=post",
+        "playback_smoke.measured_session id=3",
+        "playback_smoke.summary session=3 reason=play-stop presented_frames=600",
+        "playback_smoke.pace_summary session=3 first_present_ms=40.000 paced_elapsed_ms=25000.000",
+        "playback_due_wake armed=1200 delivery=native-msg+qtimer delivery_kind=post"]) + "\n"
+
+    def ps(self, script: str, log: str, spec: dict | None = None) -> dict:
+        proc, out = run_pwsh_json(script, DVE_LOG=log, DVE_SPEC=json.dumps(spec or {}))
+        self.assertIsNotNone(out, proc.stdout + proc.stderr)
+        return out
+
+    def summary(self, log: str) -> dict:
+        return self.ps("$r = Get-DvSmokeSummaryFields -LogText $env:DVE_LOG\n[ordered]@{ session = $r.session; fields = $r.fields; "
+                       "iso = $r.settingsIsolated; conform = $r.conformLine } | ConvertTo-Json -Compress -Depth 4", log)
+
+    def test_a2_the_metadata_line_never_selects_the_measured_session(self) -> None:
+        for name, log in (("bare", self.A2_LOG), ("crash-forensics prefix", "\n".join(self.PREFIX + l for l in self.A2_LOG.splitlines()) + "\n")):
+            with self.subTest(case=name):
+                self.assertEqual(self.summary(log)["session"], "3")
+                v = self.ps("$s = $env:DVE_SPEC | ConvertFrom-Json\n(Get-DvDueWakeDeliveryEvidence -Spec $s -LogText $env:DVE_LOG) | ConvertTo-Json -Compress",
+                            log, {"generatorArgs": {"dueWakeDeliveryPost": True}})
+                self.assertEqual((v["verdict"], v["blocks"]), ("NOT_HONOURED", True), v)
+                self.assertIn("DUE_WAKE_DELIVERY_FELL_BACK", v["reason"])
+
+    def test_pass6_a3_record_text_inside_another_record_supplies_nothing(self) -> None:
+        # r2 adversary pass 6 advisory A3, verbatim: diagnostic text selects no session and adds no summary field
+        r = self.summary("diagnostic: playback_smoke.summary session=3 presented_frames=600 scale_active_last=1\n")
+        self.assertIsNone(r["session"], r)
+        self.assertEqual(r["fields"], {}, r)
+        base = ["playback_smoke.measured_session id=3", "playback_smoke.summary session=3 reason=reached presented_frames=600"]
+        r = self.summary("\n".join(base + ["note: playback_smoke.summary session=3 presented_frames=1 scale_active_last=4",
+                                           "note: playback_smoke.conform session=3 conform_active=1",
+                                           "note: interaction_trace event=automation.pacing_isolated settings_store=run_scoped"]) + "\n")
+        self.assertEqual((r["session"], r["fields"].get("presented_frames"), r["fields"].get("scale_active_last"), r["conform"], r["iso"]),
+                         ("3", "600", None, None, False), r)
+        # the app's own records, with and without the crash-forensics prefix, still read
+        r = self.summary("\n".join([self.PREFIX + base[0], base[1], self.PREFIX + "playback_smoke.conform session=3 conform_active=1",
+                                    self.PREFIX + "interaction_trace event=automation.pacing_isolated site=x settings_store=run_scoped"]) + "\n")
+        self.assertEqual((r["session"], r["fields"].get("presented_frames"), r["iso"]), ("3", "600", True), r)
+        self.assertIsNotNone(r["conform"], r)
+
+    def test_pass6_a3_sibling_readers_ignore_marker_text_inside_another_record(self) -> None:
+        base = ["playback_smoke.measured_session id=3", "playback_smoke.summary session=3 reason=reached presented_frames=600"]
+        pace = self.ps("(Get-DvSmokeSessionLineRead -LogText $env:DVE_LOG -Marker 'pace_summary') | ConvertTo-Json -Compress -Depth 4",
+                       "\n".join(base + ["note: playback_smoke.pace_summary session=3 timeline_fps_after_first_present=99"]) + "\n")
+        self.assertFalse(pace["found"], pace)
+        scale = self.ps("$s = [pscustomobject]@{ scaleFactor = 2 }\n(Get-DvScaleEvidence -Spec $s -Backend 'cuda' -LogText $env:DVE_LOG) | ConvertTo-Json -Compress",
+                        "\n".join(base + ["note: playback_scale_clamped_for_gpu_texture_route requested=2 effective=2"]) + "\n")
+        self.assertEqual(scale["effectiveScale"], "UNKNOWN", scale)
+        look = self.ps("$s = $env:DVE_SPEC | ConvertFrom-Json\n(Get-DvLookAssistEvidence -Spec $s -LogText $env:DVE_LOG) | ConvertTo-Json -Compress",
+                       "\n".join(base + ["note: event=gui_smoke.visual_state look_assist_enabled=1"]) + "\n", {"generatorArgs": {"forceLookAssist": True}})
+        self.assertEqual((look["verdict"], look["blocks"]), ("NOT_HONOURED", True), look)
+
 
 class PrepConflatedMoveLegSpecTests(unittest.TestCase):
     """PLAYBACK-PREP-CONFLATED-MOVE-FR1B-AB-1: the ON arm of the #397 prep-conflated-move A/B is a named generatorArgs key; each ON twin differs from the cell it

@@ -471,6 +471,10 @@ public:
      *  r2 G3: a failed wait (WAIT_FAILED) sleeps the rest of \a ms with QThread::msleep (counted runnerSleepWaitFailures). */
     enum class RunnerSleep { NotHandled, Slept, WokenBySent };
     RunnerSleep sleepForSmokeRunner( unsigned long ms );
+    /*! r3 (r2 adversary pass 7 A3): the nanoseconds the LAST sleepForSmokeRunner spent dispatching sent messages (0 when it
+     *  dispatched none, or returned NotHandled). That dispatch is GUI work: the trace says Running while it runs, and the caller
+     *  takes this time out of the runner sleep it accounts (MainWindow::sleepGuiThreadForSmokeRunner). */
+    qint64 lastRunnerSleepDispatchNs() const;
     /*! GUI thread: fire the wakes the runner sleep held (through the gate), then dispatch the pending SENT messages (the
      *  wake's window procedure runs here), and nothing else -- posted messages stay queued for the caller's next processEvents. */
     void dispatchSentMessages();

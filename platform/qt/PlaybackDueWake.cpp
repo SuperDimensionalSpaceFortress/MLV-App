@@ -91,6 +91,9 @@ struct PlaybackDueWake::Impl
     // procedure HOLDS this wake's own message (heldWakes) instead of firing it, so the wake still runs after the sleep is
     // accounted (dispatchSentMessages). A dispatch that held none was another sent message: counted, and the sleep goes on.
     bool inRunnerSleepDispatch = false;
+    // r3 (r2 adversary pass 7 A3): the time the LAST sleepForSmokeRunner spent running sent messages (GUI work, traced as Running,
+    // not RunnerSleep); the caller takes it out of the sleep it accounts (lastRunnerSleepDispatchNs)
+    qint64 runnerSleepDispatchNs = 0;
     quint64 runnerSleepsWokenOther = 0;
     // r2 G3: runner sleeps whose message wait failed (WAIT_FAILED); the rest of the interval was a plain msleep
     quint64 runnerSleepWaitFailed = 0;
@@ -787,6 +790,7 @@ bool PlaybackDueWake::sendsNotify() const
 PlaybackDueWake::RunnerSleep PlaybackDueWake::sleepForSmokeRunner( unsigned long ms )
 {
 #ifdef Q_OS_WIN
+    d->runnerSleepDispatchNs = 0;
     if( !sendsNotify() ) return RunnerSleep::NotHandled;
     noteRunnerSleep( true );
     // QS_SENDMESSAGE only: the sent wake ends the sleep; posted messages, timers and input leave the runner's cadence as it
@@ -818,17 +822,26 @@ PlaybackDueWake::RunnerSleep PlaybackDueWake::sleepForSmokeRunner( unsigned long
             // r2 G1: only the wake ends the sleep. The sent messages are dispatched here; the wake's window procedure holds
             // this wake's own message (holdWindowProcWake) and it fires after the sleep (dispatchSentMessages). Any other sent
             // message ran in this dispatch: counted runner_sleep_woken_other, and the sleep goes on to its full interval.
+            // r3 (r2 adversary pass 7 A3): the dispatch is GUI work, not the runner's sleep -- the trace says Running while it
+            // runs (a wake posted from a handler in it is not classed asleep), and its time is returned to the caller
+            // (lastRunnerSleepDispatchNs), which takes it out of the runner sleep it accounts
             const size_t heldBefore = d->heldWakes.size();
+            noteRunnerSleep( false );
+            QElapsedTimer dispatchClock;
+            dispatchClock.start();
             d->inRunnerSleepDispatch = true;
             dispatchPendingSentMessages();
             d->inRunnerSleepDispatch = false;
+            d->runnerSleepDispatchNs += dispatchClock.nsecsElapsed();
             if( d->heldWakes.size() > heldBefore )
             {
-                noteRunnerSleep( false );
                 ++d->runnerSleepsWokenBySent;
                 return RunnerSleep::WokenBySent;
             }
             ++d->runnerSleepsWokenOther;
+            if( slept.hasExpired( static_cast<qint64>( waitMs ) ) ) break;
+            noteRunnerSleep( true );
+            continue;
         }
         if( slept.hasExpired( static_cast<qint64>( waitMs ) ) ) break;
     }
@@ -838,6 +851,11 @@ PlaybackDueWake::RunnerSleep PlaybackDueWake::sleepForSmokeRunner( unsigned long
     Q_UNUSED( ms );
     return RunnerSleep::NotHandled;
 #endif
+}
+
+qint64 PlaybackDueWake::lastRunnerSleepDispatchNs() const
+{
+    return d->runnerSleepDispatchNs;
 }
 
 void PlaybackDueWake::dispatchSentMessages()
