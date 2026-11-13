@@ -153,17 +153,18 @@ static int llrawproc_analysis_chroma_smooth_method(int shared_method,
  * dualisoHqReinitDispatchForTesting at dualiso.c). */
 static int g_dualiso_playback_mean23_override_env_cache = -1;
 
+static void llrawproc_fill_unmeasured_full20bit_timing(dualiso_full20bit_timing_t * t)
+{
+    memset(t, 0, sizeof(*t));
+    t->interp_method = -1;
+    t->final_blend_probe_mode = -1;
+    t->path_kind = DUALISO_FULL20_PATH_NONE;
+    t->pattern_source = DUALISO_FULL20_PATTERN_SOURCE_NONE;
+}
+
 static void llrawproc_reset_dual_iso_full20bit_timing(void)
 {
-    memset(&g_llrawproc_last_dual_iso_full20bit_timing,
-           0,
-           sizeof(g_llrawproc_last_dual_iso_full20bit_timing));
-    g_llrawproc_last_dual_iso_full20bit_timing.interp_method = -1;
-    g_llrawproc_last_dual_iso_full20bit_timing.final_blend_probe_mode = -1;
-    g_llrawproc_last_dual_iso_full20bit_timing.path_kind =
-        DUALISO_FULL20_PATH_NONE;
-    g_llrawproc_last_dual_iso_full20bit_timing.pattern_source =
-        DUALISO_FULL20_PATTERN_SOURCE_NONE;
+    llrawproc_fill_unmeasured_full20bit_timing(&g_llrawproc_last_dual_iso_full20bit_timing);
 }
 
 static int dualiso_playback_mean23_override_disabled_via_env(void)
@@ -7248,6 +7249,20 @@ void llrpGetLastDualIsoFull20bitTiming(dualiso_full20bit_timing_t * timing)
 uint64_t llrpGetRunGenerationForCurrentThread(void)
 {
     return g_llrawproc_run_generation;
+}
+
+void llrpGetDualIsoFull20bitTimingForRunSince(uint64_t generationAtFrameStart,
+                                              dualiso_full20bit_timing_t * timing)
+{
+    if (!timing) return;
+    if (g_llrawproc_run_generation != generationAtFrameStart)
+    {
+        *timing = g_llrawproc_last_dual_iso_full20bit_timing;
+    }
+    else
+    {
+        llrawproc_fill_unmeasured_full20bit_timing(timing);
+    }
 }
 
 double llrpGetLastDualIsoPreviewHistogramMilliseconds(void)

@@ -618,6 +618,16 @@ void llrpGetLastDualIsoFull20bitTiming(dualiso_full20bit_timing_t * timing);
  * records). Equal before and after a frame = that frame ran no llrawproc here,
  * so the last-run records above are an earlier frame's. */
 uint64_t llrpGetRunGenerationForCurrentThread(void);
+/* DUALISO-FULL20-PUBLISH-FRAME-SCOPED-1 (Dot G1): the frame-scoped read of the
+ * full20 last-run record. generationAtFrameStart is
+ * llrpGetRunGenerationForCurrentThread() taken when the frame began. If an
+ * llrawproc run started on this thread since then, timing receives that run's
+ * record; otherwise (a processed8/processed16/debayered cache hit that ran no
+ * llrawproc) it receives the unmeasured record (valid=0, every ms 0,
+ * interp_method=-1, final_blend_probe_mode=-1, path_kind=NONE,
+ * pattern_source=NONE), never an earlier frame's. */
+void llrpGetDualIsoFull20bitTimingForRunSince(uint64_t generationAtFrameStart,
+                                              dualiso_full20bit_timing_t * timing);
 double llrpGetLastDualIsoPreviewHistogramMilliseconds(void);
 double llrpGetLastDualIsoPreviewRegressionMilliseconds(void);
 double llrpGetLastDualIsoPreviewRowscaleMilliseconds(void);
