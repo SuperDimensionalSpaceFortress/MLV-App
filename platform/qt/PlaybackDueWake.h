@@ -192,10 +192,16 @@ public:
      *  split. \a postNs < 0 (the notifier / qtimer paths carry none) keeps the r2 rule. */
     bool accept( quint32 generation, qint64 nowNs, qint64 postNs = -1 )
     {
+        if( !wouldAccept( generation, nowNs, postNs ) ) return false;
+        m_armed = false;
+        return true;
+    }
+    /*! r2 adversary pass 5 A1: accept()'s verdict without disarming -- the runner sleep holds only a wake this would accept. */
+    bool wouldAccept( quint32 generation, qint64 nowNs, qint64 postNs = -1 ) const
+    {
         if( !m_armed || generation != m_generation ) return false;
         if( nowNs < m_dueNs - kStaleDeliveryNs ) return false;
         if( postNs >= 0 && postNs < m_dueNs - kStaleDeliveryNs ) return false;
-        m_armed = false;
         return true;
     }
     bool armed() const { return m_armed; }

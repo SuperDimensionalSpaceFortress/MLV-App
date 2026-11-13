@@ -2246,6 +2246,48 @@ TEST(PlaybackDueWakeSend, G1_AForeignSentMessageInTheRunnerSleepIsNotAWakeAndThe
 #endif
 }
 
+TEST(PlaybackDueWakeSend, R2A1_AStaleSentWakeInTheRunnerSleepIsNotHeldCountedOrAllowedToEndTheSleep)
+{
+    // r2 adversary pass 5 A1, its input verbatim: SendNotify; arm(0.5); the sent message published without pumping; cancel();
+    // runner sleep; dispatch. Variant: arm(40) instead of cancel(). The stale wake must not end the sleep, count as a wake,
+    // or fire; the replacement (variant) still ends it at its own due time. (The live part runs first, so RED shows the behaviour.)
+#ifdef Q_OS_WIN
+    int fired = 0;
+    PlaybackDueWake wake( nullptr, [&fired]() { ++fired; }, PlaybackDueWakeDeliveryMode::SendNotify );
+    wake.arm( 0.5 );
+    ASSERT_TRUE( waitWithoutPumping( [&wake]() { return wake.armPostPublished(); }, 1000 ) );
+    wake.cancel();
+    QElapsedTimer t;
+    t.start();
+    ASSERT_TRUE( wake.sleepForSmokeRunner( 60 ) == PlaybackDueWake::RunnerSleep::Slept );
+    ASSERT_TRUE( t.elapsed() >= 50 );                                  // the stale wake did not cut it short
+    ASSERT_EQ( static_cast<quint64>( 0 ), wake.runnerSleepsWokenBySent() );
+    ASSERT_EQ( static_cast<quint64>( 1 ), wake.runnerSleepsWokenOther() );
+    wake.dispatchSentMessages();
+    ASSERT_EQ( 0, fired );
+    // variant: replaced by arm(40) -- the old generation's wake goes on to sleep, the replacement ends it and fires once
+    wake.resetStrandedCounts();
+    wake.arm( 0.5 );
+    ASSERT_TRUE( waitWithoutPumping( [&wake]() { return wake.armPostPublished(); }, 1000 ) );
+    wake.arm( 40.0 );
+    t.restart();
+    ASSERT_TRUE( wake.sleepForSmokeRunner( 500 ) == PlaybackDueWake::RunnerSleep::WokenBySent );
+    ASSERT_TRUE( t.elapsed() >= 30 );                                  // not at the stale wake (~0 ms), at the replacement
+    ASSERT_EQ( static_cast<quint64>( 1 ), wake.runnerSleepsWokenBySent() );
+    ASSERT_EQ( static_cast<quint64>( 1 ), wake.runnerSleepsWokenOther() );
+    ASSERT_EQ( 0, fired );
+    wake.dispatchSentMessages();
+    ASSERT_EQ( 1, fired );
+    ASSERT_FALSE( wake.armed() );
+#endif
+    const QString wakeSource = dueWakeRepoSource( QStringLiteral( "platform/qt/PlaybackDueWake.cpp" ) );
+    const QString hold = functionBody( wakeSource, QStringLiteral( "bool PlaybackDueWake::holdWindowProcWake( const void *message )" ),
+                                       QStringLiteral( "quint64 PlaybackDueWake::runnerSleepsWokenBySent() const" ) );
+    const int current = hold.indexOf( QStringLiteral( "if( !d->deliveryCurrent( playbackDueWakeWParamGeneration( wParam )" ) );
+    const int pushed = hold.indexOf( QStringLiteral( "d->heldWakes.push_back( *m );" ) );
+    ASSERT_TRUE( current > 0 && pushed > current );
+}
+
 TEST(PlaybackDueWakeSend, G3_AFailedRunnerSleepWaitSleepsTheRestOfTheIntervalAndIsCounted)
 {
     // r2 G3 (CoS PR 811): WAIT_FAILED used to break out and return Slept after ~0 ms. It now sleeps the rest of the interval

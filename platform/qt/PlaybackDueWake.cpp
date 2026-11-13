@@ -166,6 +166,12 @@ struct PlaybackDueWake::Impl
     // the native-message path: the message names its generation and (r3) its first post stamp in QPC ticks (<= 0: none);
     // r5: returnTicks is PostMessageW's return time for that stamp (<= 0: not published when the GUI thread took it). The gate
     // still judges "posted before the due time" on the first stamp, the earliest the post can have been.
+    // r2 adversary pass 5 A1: the gate's verdict on a native delivery without taking it (deliverGeneration's own test)
+    bool deliveryCurrent( quint32 generation, qint64 postTicks ) const
+    {
+        const qint64 postNs = ( postTicks > 0 && qpcFrequency > 0 ) ? ticksToNs( postTicks, qpcFrequency ) : -1;
+        return gate.wouldAccept( generation, nowNs(), postNs );
+    }
     void deliverGeneration( quint32 generation, qint64 postTicks = 0, qint64 returnTicks = 0 )
     {
         const qint64 postNs = ( postTicks > 0 && qpcFrequency > 0 ) ? ticksToNs( postTicks, qpcFrequency ) : -1;
@@ -849,8 +855,16 @@ void PlaybackDueWake::dispatchSentMessages()
 bool PlaybackDueWake::holdWindowProcWake( const void *message )
 {
 #ifdef Q_OS_WIN
-    if( !d->inRunnerSleepDispatch ) return false;
-    d->heldWakes.push_back( *static_cast<const MSG *>( message ) );
+    if( !d->inRunnerSleepDispatch || !message ) return false;
+    const MSG *m = static_cast<const MSG *>( message );
+    // r2 adversary pass 5 A1: only a wake the gate would accept now ends the runner sleep. A stale one (cancelled, replaced,
+    // stopped, or posted before the current arm's due time), or one not for this window / tag, is not held: the window
+    // procedure hands it to handleNativeMessage, which drops it as before, and the sleep goes on (runner_sleep_woken_other).
+    if( m->message != kNativeWakeMessage || !d->window || m->hwnd != d->window ) return false;
+    const quint64 wParam = static_cast<quint64>( m->wParam );
+    if( playbackDueWakeWParamTag( wParam ) != static_cast<quint32>( kNativeWakeTag ) ) return false;
+    if( !d->deliveryCurrent( playbackDueWakeWParamGeneration( wParam ), static_cast<qint64>( m->lParam ) ) ) return false;
+    d->heldWakes.push_back( *m );
     return true;
 #else
     Q_UNUSED( message );
