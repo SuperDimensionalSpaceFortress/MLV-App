@@ -2428,10 +2428,17 @@ def test_r13_iter2_a1_a_stalled_shim_read_spends_the_lane_budget_and_is_a_lane_t
 def test_r13_iter2_a1_sibling_the_mcp_probe_starts_no_process_after_its_deadline_and_stays_a_timeout(fixture_tree):
     # adversary A1 sibling: a shim re-hash that used up the probe's budget still started the probe's process, and the expiry read as codex-mcp-list-unreadable.
     root=fixture_tree["root"]
+    # CI-FLAKE-LANE-CONTAINMENT-MCP-PROBE-DEADLINE-127-1: a 1 ms budget alone is host-speed dependent. The pre-start check compares a whole-millisecond stopwatch
+    # with it, so a host that finishes the shim re-hash in under 1 ms reads 0 ms, starts the probe, and the probe's own expiry is codex-mcp-list-unreadable (127,
+    # pinned elsewhere as the contract for a probe that ran) -- seen on three hosted jobs. The delay below sits between the stopwatch start and that check, so the
+    # budget is spent on any host and this test pins only the branch it names.
     old="$probeBudgetMs = [math]::Max(1, $TimeoutMs)"
+    check="        if ($probeSw.ElapsedMilliseconds -ge $probeBudgetMs) { throw [TimeoutException]::new('launch-budget-exhausted') }\n"
     def mutation(text):
         assert text.count(old)==1, "the probe budget moved; update this fixture mutation"
-        return text.replace(old,"$probeBudgetMs = 1")
+        assert text.count(check)==1, "the probe's pre-start deadline check moved; update this fixture mutation"
+        text=text.replace(old,"$probeBudgetMs = 1")
+        return text.replace(check,"        Start-Sleep -Milliseconds 50\n"+check)
     cmd,env,receipt=prepare(fixture_tree,"normal",lane="sol",mutation=mutation)
     r=run_lane(cmd,env)
     q=json.loads(receipt.read_text(encoding="utf-8"))
