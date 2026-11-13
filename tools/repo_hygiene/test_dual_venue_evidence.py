@@ -15205,10 +15205,12 @@ class DueWakeDeliveryLegSpecTests(unittest.TestCase):
         runner = (DV / "Invoke-VenueLeg.ps1").read_text(encoding="utf-8")
         self.assertIn("$dueWakeDeliveryVerdict = Get-DvDueWakeDeliveryEvidence -Spec $spec -LogText $runLogText", runner)
         self.assertIn("DUE_WAKE_DELIVERY_NOT_HONOURED", runner)
-        # the app emits the field the gate reads, on its playback_due_wake line, from the Play's own arms (r1 adversary pass 1 A2)
+        # the app emits the fields the gate reads on its playback_due_wake line: delivery_kind = the wake's SELECTED delivery (never rewritten by a
+        # fallback arm: r1 adversary pass 2 A1), delivery= = what the Play's arms used (pass 1 A2)
         mw = (ROOT / "platform" / "qt" / "MainWindow.cpp").read_text(encoding="utf-8").replace("\r\n", "\n")
         self.assertIn('reentrant_deferred=%5 delivery_kind=%6" )', mw)
-        self.assertIn(".arg( playbackDueWakePlayDeliveryKind(\n", mw)
+        self.assertIn('.arg( m_playbackDueWake ? QString::fromLatin1( m_playbackDueWake->deliveryKindName() ) : QStringLiteral( "none" ) )', mw)
+        self.assertIn('"late_p50_ms=%6 late_p95_ms=%7 hires=%8 disabled=%9 delivery=%10 unpresented_deferred=%11" )', mw)
         self.assertIn('return QStringLiteral( "playback_due_wake armed=%1 ', mw)
         # A3: the line follows the measured session's pace_summary, which is what binds it to the measured Play
         pace = mw.index('"playback_smoke.pace_summary session=%1 first_present_ms=%2 paced_elapsed_ms=%3 "')
@@ -15283,7 +15285,10 @@ class DueWakeDeliveryEvidenceTests(unittest.TestCase):
                           ("post on a mixed Play", self.log(self.wake("post", "native-msg+qtimer"))),
                           ("post with no delivery= field", self.log(self.wake("post").replace(" delivery=native-msg", ""))),
                           ("two measured pace_summaries", "\n".join(["playback_smoke.measured_session id=3", *self.play(3, self.wake("post")),
-                                                                     *self.play(3, self.wake("post"))]) + "\n")):
+                                                                     *self.play(3, self.wake("post"))]) + "\n"),
+                          # r1 adversary pass 2 A4, verbatim shape: a second line in the measured window is seen, and contradicts
+                          ("two lines after the measured pace_summary", self.log(self.wake("post"), self.wake("send"))),
+                          ("two agreeing lines after the measured pace_summary", self.log(self.wake("post"), self.wake("post")))):
             with self.subTest(case=name):
                 v = self.verdict(self.POST, log)
                 self.assertEqual((v["verdict"], v["blocks"]), ("NOT_HONOURED", True), v)
@@ -15299,18 +15304,26 @@ class DueWakeDeliveryEvidenceTests(unittest.TestCase):
                               # r1 adversary pass 1 A1, verbatim shape: an unpaced leg has no wake at all
                               ("no wake (unpaced)", self.log("playback_due_wake armed=0 fired=0 advanced=0 rearmed=0 busy_deferred=0 hires=0 disabled=0"
                                                              " delivery=none unpresented_deferred=0 delivery_kind=none")),
-                              ("qtimer fallback", self.log(self.wake("qtimer", "qtimer"))),
-                              ("mixed fallback", self.log(self.wake("mixed", "native-msg+qtimer"))),
+                              ("no native wake built", self.log(self.wake("qtimer", "qtimer"))),
+                              ("sent, no arm this Play", self.log(self.wake("send", "none"))),
                               ("an earlier Play posted (not the measured one)", self.log(self.wake("send"), before=self.play(2, self.wake("post"))))):
                 with self.subTest(spec=spec, case=name):
                     v = self.verdict(spec, log)
                     self.assertEqual((v["requested"], v["verdict"], v["blocks"]), (False, "NOT_REQUESTED", False), v)
-            for name, kind, mech in (("inherited post", "post", "native-msg"), ("inherited notifier", "notifier", "notifier")):
+            # r1 adversary pass 2 A1, verbatim shape: an inherited selection shows whatever the arms used, a fallback arm included
+            for name, kind, mech in (("inherited post", "post", "native-msg"), ("inherited notifier", "notifier", "notifier"),
+                                     ("inherited post, one arm fell back", "post", "native-msg+qtimer"), ("inherited post, other order", "post", "qtimer+native-msg"),
+                                     ("inherited notifier, one arm fell back", "notifier", "notifier+qtimer"), ("inherited post, every arm fell back", "post", "qtimer")):
                 with self.subTest(spec=spec, case=name):
                     v = self.verdict(spec, self.log(self.wake(kind, mech)))
                     self.assertEqual((v["requested"], v["verdict"], v["blocks"]), (False, "NOT_HONOURED", True), v)
                     self.assertIn("DUE_WAKE_DELIVERY_INHERITED", v["reason"])
-            for name, log in (("unreadable", self.log(self.wake("p0st"))), ("send on a qtimer Play", self.log(self.wake("send", "qtimer")))):
+            for name, mech in (("send on a qtimer Play", "qtimer"), ("send on a mixed Play", "native-msg+qtimer")):
+                with self.subTest(spec=spec, case=name):
+                    v = self.verdict(spec, self.log(self.wake("send", mech)))
+                    self.assertEqual((v["verdict"], v["blocks"]), ("NOT_HONOURED", True), v)
+                    self.assertIn("DUE_WAKE_DELIVERY_FELL_BACK", v["reason"])
+            for name, log in (("unreadable", self.log(self.wake("p0st"))), ("a kind the app never prints", self.log(self.wake("mixed", "native-msg+qtimer")))):
                 with self.subTest(spec=spec, case=name):
                     v = self.verdict(spec, log)
                     self.assertEqual((v["verdict"], v["blocks"]), ("NOT_HONOURED", True), v)

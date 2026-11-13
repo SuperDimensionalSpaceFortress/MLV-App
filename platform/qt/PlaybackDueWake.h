@@ -152,19 +152,6 @@ inline PlaybackDueWakeDeliveryMode playbackDueWakeDeliveryModeFromText( const QS
     return PlaybackDueWakeDeliveryMode::SendNotify;
 }
 
-/*! r1 adversary pass 1 A2: the playback_due_wake line's delivery_kind for one Play. constructedKind is the wake's own
- *  deliveryKindName() (send / post on the native-message path); playDelivery is the line's delivery= field, the "+"-joined
- *  mechanisms the Play's arms used. send / post is reported only when every arm went by the native message
- *  ("native-msg"); a Play with a fallback arm reports what its arms used (qtimer / notifier, or mixed), and a Play with no
- *  arm reports none, so the field never names a mechanism no arm used. Pure. */
-inline QString playbackDueWakePlayDeliveryKind( const QString &constructedKind, const QString &playDelivery )
-{
-    if( playDelivery == QLatin1String( "native-msg" ) ) return constructedKind;
-    if( playDelivery.contains( QLatin1Char( '+' ) ) ) return QStringLiteral( "mixed" );
-    if( playDelivery == QLatin1String( "qtimer" ) || playDelivery == QLatin1String( "notifier" ) ) return playDelivery;
-    return QStringLiteral( "none" );
-}
-
 /*! The stale-delivery gate, pure (GUI thread only). Every arm() and cancel() starts a new generation; a delivery is
  *  taken only when it carries the current generation, the wake is armed, and it is not early for the armed due time. */
 class PlaybackDueWakeGate

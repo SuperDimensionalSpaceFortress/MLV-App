@@ -20,6 +20,7 @@
 #include <QFile>
 #include <QString>
 #include <QTextStream>
+#include <QElapsedTimer>
 #include <QTimer>
 
 #include <algorithm>
@@ -2135,41 +2136,53 @@ TEST(PlaybackDueWakeSend, TheRunnerSleepIsTheSentWaitWithTheMsleepKeptForEveryOt
     ASSERT_EQ( 1, source.count( QStringLiteral( "\" runner_sleep_woken=%1\"" ) ) );
     const QString wakeSource = dueWakeRepoSource( QStringLiteral( "platform/qt/PlaybackDueWake.cpp" ) );
     ASSERT_EQ( 1, wakeSource.count( QStringLiteral(
-        "MsgWaitForMultipleObjectsEx( 0, nullptr, waitMs, QS_SENDMESSAGE, MWMO_INPUTAVAILABLE );" ) ) );
+        "MsgWaitForMultipleObjectsEx( 0, nullptr, restMs, QS_SENDMESSAGE, MWMO_INPUTAVAILABLE );" ) ) );
     // r1 adversary pass 1 A5: never INFINITE, whatever the unsigned long
     ASSERT_EQ( 1, wakeSource.count( QStringLiteral(
         "const DWORD waitMs = ms >= static_cast<unsigned long>( INFINITE ) ? INFINITE - 1 : static_cast<DWORD>( ms );" ) ) );
     ASSERT_EQ( 1, wakeSource.count( QStringLiteral( "PeekMessageW( &msg, nullptr, 0, 0, PM_NOREMOVE | PM_QS_SENDMESSAGE );" ) ) );
 }
 
-TEST(PlaybackDueWakeSend, ThePlaysDeliveryKindNamesSendOrPostOnlyWhenEveryArmWentNative)
+TEST(PlaybackDueWakeSend, DeliveryKindIsTheSelectionAndDeliveryIsWhatTheArmsUsed)
 {
-    // r1 adversary pass 1 A2: an arm whose SetWaitableTimer failed went by a QTimer; the line's delivery_kind must not still
-    // claim the constructed send / post (the venue gate reads it as the arm's proof)
-    const auto kind = []( const char *constructed, const char *playDelivery ) {
-        return playbackDueWakePlayDeliveryKind( QString::fromLatin1( constructed ), QString::fromLatin1( playDelivery ) ).toStdString();
-    };
-    ASSERT_EQ( std::string( "send" ), kind( "send", "native-msg" ) );
-    ASSERT_EQ( std::string( "post" ), kind( "post", "native-msg" ) );
-    ASSERT_EQ( std::string( "mixed" ), kind( "post", "native-msg+qtimer" ) );
-    ASSERT_EQ( std::string( "mixed" ), kind( "send", "qtimer+native-msg" ) );
-    ASSERT_EQ( std::string( "qtimer" ), kind( "post", "qtimer" ) );
-    ASSERT_EQ( std::string( "notifier" ), kind( "notifier", "notifier" ) );
-    ASSERT_EQ( std::string( "none" ), kind( "send", "none" ) );
-    ASSERT_EQ( std::string( "none" ), kind( "none", "" ) );
-    // the summary line routes the wake's constructed kind through it, with the Play's own delivery= mechanisms
+    // r1 adversary passes 1 A2 / 2 A1: delivery_kind is the SELECTED delivery, never rewritten by a fallback arm (an inherited
+    // selection must always show), and the arm that fell back to a QTimer shows in the Play's delivery= field, which the venue
+    // gate requires to be exactly native-msg before send / post counts
     const QString source = dueWakeRepoSource( QStringLiteral( "platform/qt/MainWindow.cpp" ) );
-    ASSERT_EQ( 1, source.count( QStringLiteral( ".arg( playbackDueWakePlayDeliveryKind(\n" ) ) );
-    ASSERT_EQ( 1, source.count( QStringLiteral( "                        m_playbackDueWakeDelivery ) )" ) ) );
+    ASSERT_EQ( 1, source.count( QStringLiteral(
+        ".arg( m_playbackDueWake ? QString::fromLatin1( m_playbackDueWake->deliveryKindName() ) : QStringLiteral( \"none\" ) )" ) ) );
+    ASSERT_EQ( 1, source.count( QStringLiteral(
+        "const QString used = QString::fromLatin1( PlaybackDueWake::deliveryName( m_playbackDueWake->lastArmDelivery() ) );" ) ) );
 #ifdef Q_OS_WIN
-    // the live shape: a wake whose timer cannot be armed delivers by a QTimer, and its arm says so
     int fired = 0;
     PlaybackDueWake wake( nullptr, [&fired]() { ++fired; }, PlaybackDueWakeDeliveryMode::Post );
     wake.setWaitableTimerFailsForTest( true );
     wake.arm( 1.0 );
     ASSERT_TRUE( wake.lastArmDelivery() == PlaybackDueWake::Delivery::QtTimer );
-    ASSERT_EQ( std::string( "post" ), std::string( wake.deliveryKindName() ) );   // construction-time: why the Play's kind is derived
-    ASSERT_EQ( std::string( "qtimer" ), kind( wake.deliveryKindName(), PlaybackDueWake::deliveryName( wake.lastArmDelivery() ) ) );
+    ASSERT_EQ( std::string( "qtimer" ), std::string( PlaybackDueWake::deliveryName( wake.lastArmDelivery() ) ) );
+    ASSERT_EQ( std::string( "post" ), std::string( wake.deliveryKindName() ) );   // the selection stays visible
     wake.cancel();
+#endif
+}
+
+TEST(PlaybackDueWakeSend, OnlyAQueuedSentMessageEndsTheRunnerSleepAndAConsumedPostIsNeverStranded)
+{
+    const QString wakeSource = dueWakeRepoSource( QStringLiteral( "platform/qt/PlaybackDueWake.cpp" ) );
+    // r1 adversary pass 2 A2: a wait that returns with no sent message queued sleeps on; only a queued one is counted
+    const int wait = wakeSource.indexOf( QStringLiteral( "MsgWaitForMultipleObjectsEx( 0, nullptr, restMs, QS_SENDMESSAGE, MWMO_INPUTAVAILABLE );" ) );
+    const int queued = wakeSource.indexOf( QStringLiteral( "if( HIWORD( GetQueueStatus( QS_SENDMESSAGE ) ) & QS_SENDMESSAGE )" ), wait );
+    const int counted = wakeSource.indexOf( QStringLiteral( "++d->runnerSleepsWokenBySent;" ), queued );
+    ASSERT_TRUE( wait > 0 && queued > wait && counted > queued );
+    // r1 adversary pass 2 A3: the GUI thread notes every native message it takes, and a published post it took is not stranded
+    ASSERT_EQ( 1, wakeSource.count( QStringLiteral( "d->consumedPostFor = postTicks;" ) ) );
+    ASSERT_EQ( 1, wakeSource.count( QStringLiteral( "if( forBefore == consumedPostFor ) return;" ) ) );
+#ifdef Q_OS_WIN
+    // live: an unarmed sent-wake sleep with nothing sent sleeps its whole time and counts nothing
+    PlaybackDueWake wake( nullptr, []() {}, PlaybackDueWakeDeliveryMode::SendNotify );
+    QElapsedTimer t;
+    t.start();
+    ASSERT_TRUE( wake.sleepForSmokeRunner( 20 ) == PlaybackDueWake::RunnerSleep::Slept );
+    ASSERT_TRUE( t.elapsed() >= 15 );
+    ASSERT_EQ( static_cast<quint64>( 0 ), wake.runnerSleepsWokenBySent() );
 #endif
 }

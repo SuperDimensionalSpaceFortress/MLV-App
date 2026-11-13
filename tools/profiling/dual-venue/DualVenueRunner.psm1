@@ -1948,10 +1948,14 @@ function Get-DvDueWakeDeliveryEvidence {
             $open = $false
             foreach ($l in (Get-DvLogRecordBodies -LogText $LogText)) {
                 if ($l -match '(?:^|\s)playback_smoke\.pace_summary session=') { $open = ($l -match $paceRx); if ($open) { $paces++ }; continue }
-                if ($open -and $l -match '(?:^|\s)playback_due_wake armed=') { $candidates.Add($l); $open = $false }
+                # r1 adversary pass 2 A4: the window stays open to the next pace_summary, so a second line in it is seen (and is unreadable)
+                if ($open -and $l -match '(?:^|\s)playback_due_wake armed=') { $candidates.Add($l) }
             }
         }
     }
+    # delivery_kind is the SELECTED delivery (send / post / notifier; qtimer when the wake was built on a QTimer; none with no wake), never rewritten by a
+    # fallback arm; delivery= is what this Play's arms used (native-msg, qtimer, notifier, "+"-joined when they differed, none with no arm)
+    $mechanism = $null
     $withKind = @($candidates | Where-Object { $_ -match '(?:^|\s)delivery_kind=' })
     if ($withKind.Count -gt 0) {
         $mentions = $withKind.Count
@@ -1960,25 +1964,26 @@ function Get-DvDueWakeDeliveryEvidence {
             $l = $candidates[0]
             $fields = [regex]::Matches($l, '(?:^|\s)delivery_kind=(?<k>\S*)')
             $mech = [regex]::Matches($l, '(?:^|\s)delivery=(?<m>\S*)')
-            if ($fields.Count -ne 1 -or $fields[0].Groups['k'].Value -cnotmatch '^(send|post|notifier|qtimer|mixed|none)$') { $unreadableSeen = $true }
-            # r1 adversary pass 1 A2: send / post claims the native message for every arm of the Play; the line's own delivery= must say exactly that
-            elseif ($fields[0].Groups['k'].Value -cin @('send', 'post') -and ($mech.Count -ne 1 -or $mech[0].Groups['m'].Value -cne 'native-msg')) { $unreadableSeen = $true }
-            else { $observed = $fields[0].Groups['k'].Value }
+            if ($fields.Count -ne 1 -or $fields[0].Groups['k'].Value -cnotmatch '^(send|post|notifier|qtimer|none)$' -or $mech.Count -ne 1 -or $mech[0].Groups['m'].Value -cnotmatch '^(native-msg|qtimer|notifier|none)(\+(native-msg|qtimer|notifier))*$') { $unreadableSeen = $true }
+            else { $observed = $fields[0].Groups['k'].Value; $mechanism = $mech[0].Groups['m'].Value }
         }
     }
-    $unreadable = 'the due-wake delivery is unreadable: the measured session''s playback_due_wake line (the one after its playback_smoke.pace_summary) carries a delivery_kind that is not exactly one of send, post, notifier, qtimer, mixed, none (MainWindow::playbackDueWakeSummaryLine), names send or post on a Play whose delivery= is not exactly native-msg, or the measured session has more than one such line'
+    $unreadable = 'the due-wake delivery is unreadable: the measured session''s playback_due_wake line (after its playback_smoke.pace_summary, before the next) is not exactly one line carrying one delivery_kind of send, post, notifier, qtimer, none and one delivery= of native-msg, qtimer, notifier, none or a "+"-join (MainWindow::playbackDueWakeSummaryLine)'
     if ($requested) {
         $verdict = 'NOT_HONOURED'
         if ($mentions -eq 0) { $reason = 'ROUTE_NOT_ENGAGED: the measured session has no playback_due_wake line with a delivery_kind (after its playback_smoke.pace_summary), so the binary does not report how its wake was delivered' }
         elseif ($null -eq $observed) { $reason = $unreadable }
         elseif ($observed -cne 'post') { $reason = "ROUTE_NOT_ENGAGED: the measured session's playback_due_wake says delivery_kind=$observed, not the post the leg names" }
+        # r1 adversary pass 1 A2: the posted arm counts only when every arm of the measured Play went by the native message
+        elseif ($mechanism -cne 'native-msg') { $reason = "DUE_WAKE_DELIVERY_FELL_BACK: the measured Play's arms used delivery=$mechanism, not only the native message the posted arm names" }
         else { $verdict = 'HONOURED' }
     }
     elseif ($mentions -gt 0) {
-        # r1 adversary pass 1 A1: only a kind the variable selects (post, notifier) is inherited; none (no wake: an unpaced leg), qtimer and mixed (a
-        # fallback) are what the head arm itself does, and send is the head arm
+        # r1 adversary passes 1 A1 / 2 A1: a selection the variable makes (post, notifier) is inherited whatever the arms used; none (no wake: an
+        # unpaced leg) and qtimer (no native wake built) are the app's own; send is the head arm, and counts only when no arm fell back (pass 1 A2)
         if ($null -eq $observed) { $verdict = 'NOT_HONOURED'; $reason = $unreadable }
         elseif ($observed -cin @('post', 'notifier')) { $verdict = 'NOT_HONOURED'; $reason = "DUE_WAKE_DELIVERY_INHERITED: the leg does not ask for the posted wake but the app reports delivery_kind=$observed (MLVAPP_PLAYBACK_DUE_WAKE_DELIVERY came from the launcher), so this run is not the head arm" }
+        elseif ($observed -ceq 'send' -and $mechanism -cnotin @('native-msg', 'none')) { $verdict = 'NOT_HONOURED'; $reason = "DUE_WAKE_DELIVERY_FELL_BACK: the head arm's measured Play used delivery=$mechanism, not only the sent native message" }
     }
     [ordered]@{ requested = $requested; observed = $observed; verdict = $verdict; reason = $reason; blocks = ($verdict -ceq 'NOT_HONOURED') }
 }

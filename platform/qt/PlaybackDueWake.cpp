@@ -84,6 +84,9 @@ struct PlaybackDueWake::Impl
     QMetaObject::Connection traceAwake;
     PlaybackDueWake::StrandedCounts stranded;
     quint64 runnerSleepsWokenBySent = 0;
+    // r1 adversary pass 2 A3 (GUI thread only): the first stamp (lParam) of the last native message the GUI thread took, stale
+    // or not; a published post with this stamp is consumed, never stranded
+    qint64 consumedPostFor = 0;
     double nowMs() const { return static_cast<double>( nowNs() ) / 1000000.0; }
     PlaybackGuiSleepTrace::At guiStateAt( double ms ) const
     {
@@ -104,6 +107,7 @@ struct PlaybackDueWake::Impl
         const qint64 forAfter = postReturnFor.load();
         if( forBefore <= 0 || forAfter != forBefore || returnTicks < forBefore ) return;
         if( postedGeneration != gate.generation() ) return;
+        if( forBefore == consumedPostFor ) return;   // r1 adversary pass 2 A3: already taken (e.g. dropped as early), not in the queue
         ++stranded.total;
         const PlaybackGuiSleepTrace::State state =
             guiStateAt( static_cast<double>( ticksToNs( returnTicks, qpcFrequency ) ) / 1000000.0 ).state;
@@ -595,6 +599,7 @@ bool PlaybackDueWake::handleNativeMessage( const void *msg )
     const qint64 returnTicks = d->postReturnQpc.load();
     const qint64 forAfter = d->postReturnFor.load();
     const bool published = postTicks > 0 && forBefore == postTicks && forAfter == postTicks;
+    d->consumedPostFor = postTicks;   // r1 adversary pass 2 A3: this post is out of the queue whatever the gate decides
     d->deliverGeneration( playbackDueWakeWParamGeneration( wParam ), postTicks, published ? returnTicks : 0 );
     return true;
 #else
@@ -759,11 +764,26 @@ PlaybackDueWake::RunnerSleep PlaybackDueWake::sleepForSmokeRunner( unsigned long
     // was. MWMO_INPUTAVAILABLE: a sent message already pending at the call returns at once (never a missed wake)
     // r1 adversary pass 1 A5: always a finite wait (INFINITE is 0xFFFFFFFF; a larger unsigned long would truncate)
     const DWORD waitMs = ms >= static_cast<unsigned long>( INFINITE ) ? INFINITE - 1 : static_cast<DWORD>( ms );
-    const DWORD result = MsgWaitForMultipleObjectsEx( 0, nullptr, waitMs, QS_SENDMESSAGE, MWMO_INPUTAVAILABLE );
+    // r1 adversary pass 2 A2: the wait may also return for a system event with no sent message queued; only a queued sent
+    // message ends the sleep early (and is counted), anything else sleeps out the rest of the requested time
+    QElapsedTimer slept;
+    slept.start();
+    for( ;; )
+    {
+        const qint64 sleptMs = slept.elapsed();
+        const DWORD restMs = sleptMs >= static_cast<qint64>( waitMs ) ? 0 : static_cast<DWORD>( static_cast<qint64>( waitMs ) - sleptMs );
+        const DWORD result = MsgWaitForMultipleObjectsEx( 0, nullptr, restMs, QS_SENDMESSAGE, MWMO_INPUTAVAILABLE );
+        if( result != WAIT_OBJECT_0 ) break;   // the timeout (or a failed wait: the caller's loop goes on)
+        if( HIWORD( GetQueueStatus( QS_SENDMESSAGE ) ) & QS_SENDMESSAGE )
+        {
+            noteRunnerSleep( false );
+            ++d->runnerSleepsWokenBySent;
+            return RunnerSleep::WokenBySent;
+        }
+        if( slept.hasExpired( static_cast<qint64>( waitMs ) ) ) break;
+    }
     noteRunnerSleep( false );
-    if( result != WAIT_OBJECT_0 ) return RunnerSleep::Slept;   // the timeout (or a failed wait: the caller's loop goes on)
-    ++d->runnerSleepsWokenBySent;
-    return RunnerSleep::WokenBySent;
+    return RunnerSleep::Slept;
 #else
     Q_UNUSED( ms );
     return RunnerSleep::NotHandled;

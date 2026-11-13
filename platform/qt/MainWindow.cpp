@@ -20975,10 +20975,9 @@ QString MainWindow::playbackDueWakeSummaryLine( void ) const
               .arg( playbackDueWakePercentileText( m_playbackDueWakeAwakeToReceiveMs, 0.50 ) )
               .arg( playbackDueWakePercentileText( m_playbackDueWakeAwakeToReceiveMs, 0.95 ) )
               .arg( m_playbackDueWakeReentrantDeferred )
-              // r1 adversary pass 1 A2: send / post only when every arm of this Play went by the native message
-              .arg( playbackDueWakePlayDeliveryKind(
-                        m_playbackDueWake ? QString::fromLatin1( m_playbackDueWake->deliveryKindName() ) : QStringLiteral( "none" ),
-                        m_playbackDueWakeDelivery ) )
+              // the SELECTED delivery (send / post / notifier; r1 adversary pass 2 A1: never rewritten by a fallback arm, so an
+              // inherited selection always shows); what the Play's arms actually used is delivery= above (adversary pass 1 A2)
+              .arg( m_playbackDueWake ? QString::fromLatin1( m_playbackDueWake->deliveryKindName() ) : QStringLiteral( "none" ) )
         + playbackDueWakeRangeFields( m_playbackDueWakePostToAwakeMs, "post_to_awake" )
         + playbackDueWakeRangeFields( m_playbackDueWakeAwakeToReceiveMs, "awake_to_receive" );
     return QStringLiteral( "playback_due_wake armed=%1 fired=%2 advanced=%3 rearmed=%4 busy_deferred=%5 "
