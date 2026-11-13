@@ -672,14 +672,26 @@ TEST(PlaybackLookaheadCpuRouteWiring, TheMaxBusyGapStartIsStampedAtOpenNotReadAg
     ASSERT_FALSE( open.isEmpty() );
     ASSERT_FALSE( close.isEmpty() );
     const int stamp = open.indexOf( QStringLiteral(
-        "m_guiPresentGapStartSinceSmokeMs = ( mlv_stage_timing_now() - m_playbackSmokeStartTime ) * 1000.0;") );
+        "m_guiPresentGapStartSinceSmokeMs = static_cast<double>( gapOpenNs - m_guiPresentGapClockAtSmokeStartNs ) / 1000000.0;") );
     const int armed = open.indexOf( QStringLiteral("if( !m_playbackSmokeActive || !m_guiPresentIdleProbeConnected ) return;") );
-    const int start = open.indexOf( QStringLiteral("m_guiPresentGapStartNs = m_guiPresentGapClock.nsecsElapsed();") );
+    const int start = open.indexOf( QStringLiteral("m_guiPresentGapStartNs = gapOpenNs;") );
+    // r2 (adversary A1 on 89e3a9d1): one clock read arms and places the gap.
+    ASSERT_EQ( 1, open.count( QStringLiteral("m_guiPresentGapClock.nsecsElapsed()") ) );
+    ASSERT_FALSE( open.contains( QStringLiteral("mlv_stage_timing_now()") ) );
     ASSERT_TRUE( armed > 0 );
     ASSERT_TRUE( stamp > armed );
     ASSERT_TRUE( start > stamp );
     ASSERT_TRUE( close.contains( QStringLiteral("gaps.busyMaxAtMs = m_guiPresentGapStartSinceSmokeMs;") ) );
     ASSERT_FALSE( close.contains( QStringLiteral("mlv_stage_timing_now()") ) );   // no second clock at the close
+    // r2: the smoke-start zero is taken on the gap clock, beside the smoke clock's own start mark.
+    const QString begin = functionBody( mw, QStringLiteral("void MainWindow::beginPlaybackSmokeTelemetry( void )") );
+    ASSERT_FALSE( begin.isEmpty() );
+    const int smokeStart = begin.indexOf( QStringLiteral("m_playbackSmokeStartTime = mlv_stage_timing_now();") );
+    const int gapZero = begin.indexOf( QStringLiteral(
+        "m_guiPresentGapClockAtSmokeStartNs = m_guiPresentGapClock.isValid() ? m_guiPresentGapClock.nsecsElapsed() : 0;") );
+    ASSERT_TRUE( smokeStart > 0 );
+    ASSERT_TRUE( gapZero > smokeStart );
+    ASSERT_EQ( 1, mw.count( QStringLiteral("m_guiPresentGapClockAtSmokeStartNs =") ) );
 }
 
 TEST(PlaybackLookaheadCpuRouteWiring, TheSevenNewFieldsAreAppendedNeverRenamed)
@@ -695,7 +707,7 @@ TEST(PlaybackLookaheadCpuRouteWiring, TheSevenNewFieldsAreAppendedNeverRenamed)
     ASSERT_TRUE( appended > raw );
     ASSERT_TRUE( mw.contains( QStringLiteral("\"recon_starts_held_for_render=%19\" )") ) );   // the old format is intact
     const int gui = mw.indexOf( QStringLiteral("\"playback_smoke.gui_present_summary session=%1 frames=%2 \"") );
-    const int unattributed = mw.indexOf( QStringLiteral("QStringLiteral( \" avg_gui_other_busy_unattributed_ms=%1\" )"), gui );
+    const int unattributed = mw.indexOf( QStringLiteral("QStringLiteral( \" avg_gui_other_busy_unattributed_ms=%1\" )") );   // r2 (advisory A2): the builder precedes the format
     const int freeze = mw.indexOf( QStringLiteral(
         "QStringLiteral( \" max_gui_busy_at_ms=%1 max_gui_busy_frame=%2 max_gui_other_busy_bucket=%3\" )") );
     ASSERT_TRUE( gui > 0 );
