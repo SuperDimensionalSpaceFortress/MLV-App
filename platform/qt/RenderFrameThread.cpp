@@ -1246,6 +1246,8 @@ void RenderFrameThread::renderFrame(uint32_t frameNumber,
              && it->presentationContext.presentationGeneration
                 == request.presentationContext.presentationGeneration )
             {
+                if( it->presentationContext.playbackLookaheadRequest )
+                    m_playbackLookaheadDroppedQueued.fetch_add( 1, std::memory_order_relaxed );
                 it = m_renderRequests.erase( it );
                 ++request.queuedPlaybackDropCount;
             }

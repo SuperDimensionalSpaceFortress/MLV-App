@@ -15,12 +15,16 @@
 
 #include "../../platform/qt/PlaybackDecodeRenderOverlap.h"
 #include "../../platform/qt/PlaybackNativePaceGuard.h"
+#include "../../platform/qt/PlaybackLookaheadCpuRoute.h"
+#include "../../platform/qt/GuiPresentGapIdle.h"
 
 #include <QFile>
 #include <QString>
 #include <QTextStream>
 
+#include <cstdio>
 #include <deque>
+#include <limits>
 #include <map>
 #include <vector>
 
@@ -425,4 +429,246 @@ TEST(PlaybackDecodeRenderOverlapWiring, TheRenderThreadReportsEveryStageToTheMet
     ASSERT_TRUE( rft.contains( QStringLiteral("playback_overlap::reconMayStart(") ) );
     ASSERT_TRUE( rft.contains( QStringLiteral("m_reconWaitCondition.wakeAll();\n        m_mutex.unlock();\n        emit frameReady();") ) );
     ASSERT_TRUE( rft.contains( QStringLiteral("playback_overlap::blocksPlaybackAdvance(") ) );
+}
+
+// ---- CPU-S1-PACE-POST-785-LEVER-1: the CPU-route lookahead (depth 1), its admission and its telemetry ----------
+
+TEST(PlaybackLookaheadCpuRoute, ThreeArgumentDepthEnvWinsTextureTwoCpuOneElseZero)
+{
+    const int envs[] = { -1, 0, 1, 2, 5 };
+    for( const int env : envs )
+    {
+        for( int tex = 0; tex < 2; ++tex )
+        {
+            for( int cpu = 0; cpu < 2; ++cpu )
+            {
+                int expected = 0;
+                if( env >= 0 ) expected = env > 3 ? 3 : env;
+                else if( tex ) expected = 2;
+                else if( cpu ) expected = 1;
+                ASSERT_EQ( expected, effectiveLookaheadFrames( env, tex != 0, cpu != 0 ) );
+            }
+            // The 2-argument form is unchanged: the 3-argument form with the CPU route refused.
+            ASSERT_EQ( effectiveLookaheadFrames( env, tex != 0, false ), effectiveLookaheadFrames( env, tex != 0 ) );
+        }
+    }
+    ASSERT_EQ( 2, playback_overlap::kDefaultTextureRouteLookaheadFrames );
+    ASSERT_EQ( 1, playback_overlap::kDefaultCpuRouteLookaheadFrames );
+    ASSERT_EQ( 2, effectiveLookaheadFrames( -1, true, true ) );   // the texture default wins over the CPU one
+    ASSERT_EQ( 0, effectiveLookaheadFrames( 0, true, true ) );    // env 0 kills both routes
+    ASSERT_EQ( 0, effectiveLookaheadFrames( 0, false, true ) );
+    ASSERT_TRUE( QString::fromLatin1( playback_overlap::lookaheadRouteName( true, true ) ) == QStringLiteral("texture") );
+    ASSERT_TRUE( QString::fromLatin1( playback_overlap::lookaheadRouteName( false, true ) ) == QStringLiteral("cpu") );
+    ASSERT_TRUE( QString::fromLatin1( playback_overlap::lookaheadRouteName( false, false ) ) == QStringLiteral("none") );
+}
+
+namespace
+{
+PlaybackLookaheadCpuRouteInputs admittedCpuRoute()
+{
+    PlaybackLookaheadCpuRouteInputs in;
+    in.playing = true;
+    in.fileLoaded = true;
+    in.dropFrameMode = true;
+    in.phase3DecodeReconProcess = true;
+    in.prepRoute.playing = true;
+    in.prepRoute.displayPreviewCachingAllowed = false;
+    in.prepRoute.cpuPreviewProcessingActive = true;
+    in.prepRoute.outputProcessed8 = false;
+    return in;
+}
+} // namespace
+
+TEST(PlaybackLookaheadCpuRoute, AdmissionTruthTableRefusesEveryGpuRouteAndEveryMissingCondition)
+{
+    ASSERT_TRUE( playbackLookaheadCpuRouteAdmits( admittedCpuRoute() ) );
+    struct Flip { const char *name; void ( *apply )( PlaybackLookaheadCpuRouteInputs & ); };
+    const Flip refusals[] = {
+        { "not playing", []( PlaybackLookaheadCpuRouteInputs &i ) { i.playing = false; } },
+        { "no file", []( PlaybackLookaheadCpuRouteInputs &i ) { i.fileLoaded = false; } },
+        { "whole-frame playback", []( PlaybackLookaheadCpuRouteInputs &i ) { i.dropFrameMode = false; } },
+        { "no phase 3 recon worker", []( PlaybackLookaheadCpuRouteInputs &i ) { i.phase3DecodeReconProcess = false; } },
+        { "GPU texture route", []( PlaybackLookaheadCpuRouteInputs &i ) { i.textureRouteRequested = true; } },
+        { "GPU bilinear debayer", []( PlaybackLookaheadCpuRouteInputs &i ) { i.gpuBilinearDebayer = true; } },
+        { "GPU AMaZE debayer", []( PlaybackLookaheadCpuRouteInputs &i ) { i.gpuAmazeDebayer = true; } },
+        { "gpu16 preview", []( PlaybackLookaheadCpuRouteInputs &i ) { i.prepRoute.gpu16PreviewActive = true; } },
+        { "GPU preview processing", []( PlaybackLookaheadCpuRouteInputs &i ) { i.prepRoute.gpuPreviewProcessingActive = true; } },
+        { "AMaZE texture candidate", []( PlaybackLookaheadCpuRouteInputs &i ) { i.prepRoute.gpuAmazeTexturePresentCandidate = true; } },
+        { "recon texture candidate", []( PlaybackLookaheadCpuRouteInputs &i ) { i.prepRoute.gpuPlaybackReconTexturePresentCandidate = true; } },
+        { "no-readback candidate", []( PlaybackLookaheadCpuRouteInputs &i ) { i.prepRoute.gpuPlaybackReconTextureNoReadbackCandidate = true; } },
+        { "prep not playing", []( PlaybackLookaheadCpuRouteInputs &i ) { i.prepRoute.playing = false; } },
+        { "display caching (paused policy)", []( PlaybackLookaheadCpuRouteInputs &i ) { i.prepRoute.displayPreviewCachingAllowed = true; } },
+        { "8-bit output, no CPU processing", []( PlaybackLookaheadCpuRouteInputs &i ) {
+              i.prepRoute.cpuPreviewProcessingActive = false; i.prepRoute.outputProcessed8 = true; } },
+    };
+    for( const Flip &f : refusals )
+    {
+        PlaybackLookaheadCpuRouteInputs in = admittedCpuRoute();
+        f.apply( in );
+        if( playbackLookaheadCpuRouteAdmits( in ) )
+        {
+            fprintf( stderr, "admitted with: %s\n", f.name );
+            ASSERT_TRUE( false );
+        }
+    }
+    // The buffer fields are never the route: a null buffer on the request side still admits.
+    PlaybackLookaheadCpuRouteInputs noBuffer = admittedCpuRoute();
+    noBuffer.prepRoute.rawImage16 = nullptr;
+    noBuffer.prepRoute.rawImage16Bytes = 0;
+    noBuffer.prepRoute.sourceImage16Bytes = 0;
+    ASSERT_TRUE( playbackLookaheadCpuRouteAdmits( noBuffer ) );
+}
+
+TEST(PlaybackLookaheadCpuRoute, TheCpuPrepRouteIsDecidedByTheBorrowPredicateItself)
+{
+    // Every combination of #774's nine route bools: with the lookahead's own gates open, the admission equals
+    // playbackPrepMayBorrowSlotRgb16 on the same route with an adequate buffer.
+    static const uint16_t words[4] = {};
+    for( int mask = 0; mask < ( 1 << 9 ); ++mask )
+    {
+        PlaybackLookaheadCpuRouteInputs in = admittedCpuRoute();
+        PlaybackPrepBorrowInputs &r = in.prepRoute;
+        r.playing = ( mask & 1 ) != 0;
+        r.displayPreviewCachingAllowed = ( mask & 2 ) != 0;
+        r.cpuPreviewProcessingActive = ( mask & 4 ) != 0;
+        r.outputProcessed8 = ( mask & 8 ) != 0;
+        r.gpu16PreviewActive = ( mask & 16 ) != 0;
+        r.gpuPreviewProcessingActive = ( mask & 32 ) != 0;
+        r.gpuAmazeTexturePresentCandidate = ( mask & 64 ) != 0;
+        r.gpuPlaybackReconTexturePresentCandidate = ( mask & 128 ) != 0;
+        r.gpuPlaybackReconTextureNoReadbackCandidate = ( mask & 256 ) != 0;
+        PlaybackPrepBorrowInputs withBuffer = r;
+        withBuffer.rawImage16 = words;
+        withBuffer.rawImage16Bytes = sizeof( words );
+        withBuffer.sourceImage16Bytes = sizeof( words );
+        ASSERT_EQ( playbackPrepMayBorrowSlotRgb16( withBuffer ), playbackLookaheadCpuRouteAdmits( in ) );
+    }
+}
+
+TEST(PlaybackLookaheadCpuRoute, TheMaxBusyGapNamesItsDominantBucket)
+{
+    using gui_present_gap::OtherBusySpan;
+    using gui_present_gap::OtherBusySpans;
+    using gui_present_gap::SpanClock;
+    OtherBusySpans spans;
+    spans.openGap();
+    ASSERT_EQ( -1, spans.dominantBucket( 10.0 ) );   // nothing named: all unattributed
+    SpanClock a; a.gapSerial = 1; a.nowNs = 0;
+    SpanClock b = a; b.nowNs = 6000000;              // 6 ms of draw_frame_ready
+    spans.begin( a );
+    spans.end( OtherBusySpan::DrawFrameReady, b );
+    ASSERT_EQ( static_cast<int>( OtherBusySpan::DrawFrameReady ), spans.dominantBucket( 10.0 ) );  // 6 > 4 rest
+    ASSERT_EQ( -1, spans.dominantBucket( 20.0 ) );   // 14 ms unattributed beats 6
+    ASSERT_EQ( static_cast<int>( OtherBusySpan::DrawFrameReady ), spans.dominantBucket( 3.0 ) );   // scaled to the budget
+    ASSERT_EQ( -1, spans.dominantBucket( std::numeric_limits<double>::quiet_NaN() ) );   // no budget: nothing charged
+    spans.closeGap( 10.0 );
+    ASSERT_EQ( -1, spans.dominantBucket( 10.0 ) );   // closeGap cleared the gap's spans
+    ASSERT_TRUE( QString::fromLatin1( gui_present_gap::otherBusyBucketName( -1 ) ) == QStringLiteral("unattributed") );
+    ASSERT_TRUE( QString::fromLatin1( gui_present_gap::otherBusyBucketName( -2 ) ) == QStringLiteral("none") );
+    ASSERT_TRUE( QString::fromLatin1( gui_present_gap::otherBusyBucketName( 99 ) ) == QStringLiteral("none") );
+    ASSERT_TRUE( QString::fromLatin1( gui_present_gap::otherBusyBucketName( 0 ) ) == QStringLiteral("draw_frame_ready") );
+}
+
+namespace
+{
+QString functionBody( const QString &source, const QString &signature )
+{
+    const int start = source.indexOf( signature );
+    if( start < 0 ) return QString();
+    const int end = source.indexOf( QStringLiteral("\n}\n"), start );
+    return end < 0 ? QString() : source.mid( start, end - start );
+}
+} // namespace
+
+TEST(PlaybackLookaheadCpuRouteWiring, DrawFrameConsultsThePredicateBesideTheTextureAdmission)
+{
+    const QString mw = readRepoText( "platform/qt/MainWindow.cpp" );
+    ASSERT_FALSE( mw.isEmpty() );
+    const QString draw = functionBody( mw, QStringLiteral("void MainWindow::drawFrame( bool updateTimecodeLabel )") );
+    ASSERT_FALSE( draw.isEmpty() );
+    const int texture = draw.indexOf( QStringLiteral("m_playbackLookaheadTextureRouteAdmitted =\n        ui->actionPlay->isChecked()") );
+    const int cpu = draw.indexOf( QStringLiteral("m_playbackLookaheadCpuRouteAdmitted = playbackLookaheadCpuRouteAdmits( cpuRoute );") );
+    const int prune = draw.indexOf( QStringLiteral("if( playbackRenderLookaheadFrames() > 0\n     && ui->actionPlay->isChecked()") );
+    ASSERT_TRUE( texture > 0 );
+    ASSERT_TRUE( cpu > texture );
+    ASSERT_TRUE( prune > cpu );
+    // The CPU prep route is #774's predicate on the request's inputs, not a restatement.
+    ASSERT_TRUE( draw.contains( QStringLiteral("cpuRoute.prepRoute.cpuPreviewProcessingActive =\n            requestContext.renderThreadUsingCpuPreviewProcessing\n            && requestContext.gpuPreviewProcessingConfig.enabled;") ) );
+    ASSERT_TRUE( draw.contains( QStringLiteral("cpuRoute.dropFrameMode = ui->actionDropFrameMode->isChecked();") ) );
+    ASSERT_TRUE( draw.contains( QStringLiteral("requestedPhase3Mode == Phase3Mode::DecodeReconProcess\n            && !phase3LiveFallbackActive()\n            && !phase3KillSwitchActive( requestedPhase3Mode );") ) );
+    const QString depth = functionBody( mw, QStringLiteral("int MainWindow::playbackRenderLookaheadFrames() const") );
+    ASSERT_TRUE( depth.contains( QStringLiteral("m_playbackLookaheadTextureRouteAdmitted,\n                                                       m_playbackLookaheadCpuRouteAdmitted );") ) );
+    const QString hdr = readRepoText( "platform/qt/PlaybackLookaheadCpuRoute.h" );
+    ASSERT_TRUE( hdr.contains( QStringLiteral("return playbackPrepMayBorrowSlotRgb16( route );") ) );
+}
+
+TEST(PlaybackLookaheadCpuRouteWiring, TheQueueAdmitsTheCpuRouteAndKeepsTheTextureChecks)
+{
+    const QString mw = readRepoText( "platform/qt/MainWindow.cpp" );
+    const QString queue = functionBody( mw, QStringLiteral("void MainWindow::queuePlaybackLookaheadRequests(") );
+    ASSERT_FALSE( queue.isEmpty() );
+    ASSERT_TRUE( queue.contains( QStringLiteral(
+        "    const bool textureRouteAdmits =\n"
+        "        baseContext.gpuPlaybackReconTexturePresentRequested\n"
+        "        && baseContext.gpuPlaybackReconAmazeTexturePresentAdmitted\n"
+        "        && mainWindowGpuTextureRouteAdmitsPlaybackScale(\n"
+        "               baseContext.playbackScaleFactor, gpuReducedReconHonouredSessionScale() );\n"
+        "    if( !textureRouteAdmits && !m_playbackLookaheadCpuRouteAdmitted ) return;") ) );
+    ASSERT_TRUE( queue.contains( QStringLiteral("const int depth = playbackRenderLookaheadFrames();") ) );
+    ASSERT_TRUE( queue.contains( QStringLiteral("lookaheadContext.playbackLookaheadRequest = true;") ) );
+}
+
+TEST(PlaybackLookaheadCpuRouteWiring, TheCpuAcquireIsTargetFiltered)
+{
+    const QString mw = readRepoText( "platform/qt/MainWindow.cpp" );
+    const QString ready = functionBody( mw, QStringLiteral("void MainWindow::drawFrameReady()") );
+    ASSERT_FALSE( ready.isEmpty() );
+    // With a lookahead depth (any route) the CPU slot is taken only by the target-filtered acquire.
+    ASSERT_TRUE( ready.contains( QStringLiteral("const bool targetAwareLookaheadAcquire =\n        playbackRenderLookaheadFrames() > 0 && ui->actionPlay->isChecked();") ) );
+    ASSERT_TRUE( ready.contains( QStringLiteral(
+        "            haveReadyFrame = targetAwareLookaheadAcquire\n"
+        "                ? m_pRenderThread->acquireLatestReadyFrameForPlaybackTarget(") ) );
+    const QString rft = readRepoText( "platform/qt/RenderFrameThread.cpp" );
+    const QString acquire = functionBody( rft, QStringLiteral("bool RenderFrameThread::acquireLatestReadyFrameForPlaybackTarget(") );
+    ASSERT_TRUE( acquire.contains( QStringLiteral(
+        "        if( slot.presentationContext.playbackLookaheadRequest\n"
+        "         && ( activePlaybackTarget < 0\n"
+        "           || slot.presentationContext.presentationGeneration != activeGeneration\n"
+        "           || static_cast<int>( slot.frameNumber ) != activePlaybackTarget ) )") ) );
+    // The drop-frame erase counts the lookahead requests it removes (lookahead_dropped_queued).
+    ASSERT_TRUE( rft.contains( QStringLiteral(
+        "                if( it->presentationContext.playbackLookaheadRequest )\n"
+        "                    m_playbackLookaheadDroppedQueued.fetch_add( 1, std::memory_order_relaxed );\n"
+        "                it = m_renderRequests.erase( it );") ) );
+}
+
+TEST(PlaybackLookaheadCpuRouteWiring, TheSevenNewFieldsAreAppendedNeverRenamed)
+{
+    const QString mw = readRepoText( "platform/qt/MainWindow.cpp" );
+    const int overlap = mw.indexOf( QStringLiteral("\"playback_smoke.overlap_summary session=%1 lookahead_depth=%2 \"") );
+    ASSERT_TRUE( overlap > 0 );
+    const int raw = mw.indexOf( QStringLiteral("            + rawPrefetchFields\n"), overlap );
+    const int appended = mw.indexOf( QStringLiteral(
+        "QStringLiteral( \" lookahead_route=%1 lookahead_presented=%2 lookahead_pruned=%3 \"\n"
+        "                              \"lookahead_dropped_queued=%4\" )"), overlap );
+    ASSERT_TRUE( raw > overlap );
+    ASSERT_TRUE( appended > raw );
+    ASSERT_TRUE( mw.contains( QStringLiteral("\"recon_starts_held_for_render=%19\" )") ) );   // the old format is intact
+    const int gui = mw.indexOf( QStringLiteral("\"playback_smoke.gui_present_summary session=%1 frames=%2 \"") );
+    const int unattributed = mw.indexOf( QStringLiteral("QStringLiteral( \" avg_gui_other_busy_unattributed_ms=%1\" )"), gui );
+    const int freeze = mw.indexOf( QStringLiteral(
+        "QStringLiteral( \" max_gui_busy_at_ms=%1 max_gui_busy_frame=%2 max_gui_other_busy_bucket=%3\" )") );
+    ASSERT_TRUE( gui > 0 );
+    ASSERT_TRUE( unattributed > 0 );
+    ASSERT_TRUE( freeze > unattributed );
+    const QStringList fields = { QStringLiteral("lookahead_route="), QStringLiteral("lookahead_presented="),
+                                 QStringLiteral("lookahead_pruned="), QStringLiteral("lookahead_dropped_queued="),
+                                 QStringLiteral("max_gui_busy_at_ms="), QStringLiteral("max_gui_busy_frame="),
+                                 QStringLiteral("max_gui_other_busy_bucket=") };
+    ASSERT_EQ( 7, fields.size() );
+    for( const QString &f : fields ) ASSERT_EQ( 1, mw.count( QStringLiteral(" ") + f ) );
+    // Fed where the spec says: the session reset, the present, both prune sites, the gap close.
+    ASSERT_TRUE( mw.contains( QStringLiteral("if( requestContext.playbackLookaheadRequest ) ++m_playbackLookaheadPresented;") ) );
+    ASSERT_EQ( 2, mw.count( QStringLiteral("m_playbackLookaheadPruned += static_cast<uint64_t>(") ) );
+    ASSERT_TRUE( mw.contains( QStringLiteral("gaps.busyMaxBucket = m_guiOtherBusySpans.dominantBucket( split.otherBusyMs );") ) );
 }

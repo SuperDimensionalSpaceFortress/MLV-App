@@ -1351,6 +1351,14 @@ private:
     bool m_playbackLookaheadTextureRouteAdmitted = false;
     uint64_t m_playbackLookaheadRequestsIssued = 0;
     uint64_t m_playbackLookaheadCoveredRequests = 0;
+    // CPU-S1-PACE-POST-785-LEVER-1: the last drawFrame() request was on the admitted CPU route
+    // (PlaybackLookaheadCpuRoute.h), where the lookahead runs at depth 1. The route latched while
+    // playing in this smoke session, and the appended overlap_summary counters.
+    bool m_playbackLookaheadCpuRouteAdmitted = false;
+    const char *m_playbackLookaheadSessionRoute = "none";
+    uint64_t m_playbackLookaheadPresented = 0;
+    uint64_t m_playbackLookaheadPruned = 0;
+    uint64_t m_playbackLookaheadDroppedQueuedStart = 0;
     int playbackRenderLookaheadFrames() const;
     int currentPlaybackAdvanceTarget();
     bool renderThreadBusyForPlaybackAdvance( int activePlaybackTarget );
@@ -1705,8 +1713,15 @@ private:
         double busyMaxMs = 0.0;
         double otherBusySumMs = 0.0;
         double otherBusyMaxMs = 0.0;
+        // CPU-S1-PACE-POST-785-LEVER-1 (FREEZE attribution): the gap that set busyMaxMs -- its
+        // start in ms since the measured Play start, the frame whose present opened it, and the
+        // other-busy bucket that held most of it (-1 = unattributed, -2 = no gap yet).
+        double busyMaxAtMs = -1.0;
+        long long busyMaxFrame = -1;
+        int busyMaxBucket = -2;
     };
     GuiPresentGapTotals m_guiPresentGaps;
+    long long m_guiPresentGapFrame = -1;
     QElapsedTimer m_guiPresentGapClock;
     qint64 m_guiPresentGapStartNs = -1;
     gui_present_gap::IdleWaits m_guiPresentGapIdle;

@@ -466,6 +466,11 @@ public:
     double lastFrameReadyEmitStageTime( void ) const;
     void setPhase3Mode( Phase3Mode mode ) noexcept;
     Phase3Mode phase3Mode( void ) const noexcept;
+    //! CPU-S1-PACE-POST-785-LEVER-1: queued lookahead requests a drop-frame request erased (monotonic).
+    uint64_t playbackLookaheadDroppedQueuedCount( void ) const noexcept
+    {
+        return m_playbackLookaheadDroppedQueued.load( std::memory_order_relaxed );
+    }
     void stop( void );
     void lock( void );
     void unlock( void );
@@ -719,6 +724,7 @@ private:
     int m_renderingSlotIndex;
     int m_presentingSlotIndex;
     std::atomic<Phase3Mode> m_phase3Mode;
+    std::atomic<uint64_t> m_playbackLookaheadDroppedQueued{ 0 };
     FrameSlotStorage m_frameSlots;
     FastPlaybackScaleCache m_playbackScaleCache;
     BilinearPlaybackScaleCache m_playbackBilinearScaleCache;

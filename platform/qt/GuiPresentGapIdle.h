@@ -90,6 +90,16 @@ inline const char *otherBusySpanName( OtherBusySpan span )
     return "unknown";
 }
 
+// CPU-S1-PACE-POST-785-LEVER-1: max_gui_other_busy_bucket's value -- a span name, "unattributed"
+// (-1, OtherBusySpans::dominantBucket), or "none" when no gap closed (-2 or any other value).
+inline const char *otherBusyBucketName( int bucket )
+{
+    if( bucket == -1 ) return "unattributed";
+    if( bucket >= 0 && bucket < static_cast<int>( OtherBusySpan::Count ) )
+        return otherBusySpanName( static_cast<OtherBusySpan>( bucket ) );
+    return "none";
+}
+
 // One clock reading of the four quantities a span needs.
 struct SpanClock
 {
@@ -177,6 +187,30 @@ public:
         const double rest = otherBusyMs - charged;
         unattributedSumMs += rest > 0.0 ? rest : 0.0;
         return rest > 0.0 ? rest : 0.0;
+    }
+
+    // CPU-S1-PACE-POST-785-LEVER-1 (FREEZE attribution): the bucket that holds most of the open gap's
+    // other busy, as closeGap would charge it -- a span index, or -1 when the unattributed rest is the
+    // largest (ties go to the named span). Read before closeGap, which clears the gap's spans.
+    int dominantBucket( double otherBusyMs ) const
+    {
+        if( !( otherBusyMs > 0.0 ) || !std::isfinite( otherBusyMs ) ) otherBusyMs = 0.0;
+        if( otherBusyMs > kMaxSpanMs ) otherBusyMs = kMaxSpanMs;
+        double named = 0.0;
+        for( int i = 0; i < kCount; ++i ) named += gapMs[i];
+        const double scale = ( named > otherBusyMs && named > 0.0 ) ? otherBusyMs / named : 1.0;
+        int best = -1;
+        double bestMs = 0.0;
+        double charged = 0.0;
+        for( int i = 0; i < kCount; ++i )
+        {
+            const double ms = gapMs[i] * scale;
+            charged += ms;
+            if( ms > bestMs ) { bestMs = ms; best = i; }
+        }
+        const double rest = otherBusyMs - charged;
+        if( best >= 0 && rest > bestMs ) return -1;
+        return best;
     }
 
     // A gap opened: spans of a previous gap that never closed are not carried into it.
