@@ -923,13 +923,36 @@ def _backslashes_before(row: str, pos: int) -> int:
     return n
 
 
+# A block container's opening on a row: a block quote marker (and one optional space) or a list marker and the one space after it.
+_CONTAINER_OPEN_RE = re.compile(r">[ ]?|(?:[-*+]|\d{1,9}[.)])[ ]")
+
+
+def _opens_inline_text(row: str) -> bool:
+    """False when `row` may START a block whose content is not inline text, so a backtick pair in it is no code span: indented
+    code (four columns of indent, a tab counting as four), a `~~~` fence (its rows after it are code too), or a reference or
+    footnote definition (the row starts with `[`: its label is raw text), each read after any block quote or list marker. The
+    rows of the other blocks (paragraphs and their continuations, headings, list items, quotes) are inline text. A row that
+    fails this test is not classified (_mask_quotations): its key is refused and the rows after it are left unmasked."""
+    s = row
+    while True:
+        t = s.lstrip(" \t")
+        lead = s[:len(s) - len(t)]
+        if "\t" in lead or len(lead) >= 4 or t.startswith(("[", "~~~")):
+            return False
+        m = _CONTAINER_OPEN_RE.match(t)
+        if not m:
+            return True
+        s = t[m.end():]
+
+
 def _mask_quotations(row: str) -> tuple[str, bool]:
     """`(masked, distrusted)`: `row` with each quoted key (a code span whose content is _QUOTED_SPAN_CONTENT_RE) replaced by
     _QUOTE_MASK of the same width, and whether the rows AFTER this one must be left unmasked.
 
     ONE inline pass, CommonMark's, instead of one special case per markup class (#801 r1-r6 found unequal runs, escaped runs,
     spans across rows, raw HTML, autolinks, link destinations and reference definitions one adversary pass at a time). The row is
-    read left to right and each construct is either classified or ends the pass:
+    read left to right and each construct is either classified or ends the pass. A row that starts a block that is not inline text
+    (_opens_inline_text: indented code, a `~~~` fence, a reference definition) is not read at all:
       * a backtick run opens a code span that closes at the NEXT run of exactly the same length; everything between, whatever it
         holds (`<`, `]`, shorter or longer runs), is span content, because code spans bind tighter than raw HTML, links and
         emphasis. Text outside spans is plain text for this purpose: emphasis delimiters, character references (`&#96;` is not a
@@ -940,6 +963,8 @@ def _mask_quotations(row: str) -> tuple[str, bool]:
         autolink), a `]` that continues into a link destination or title, a reference label or a reference definition.
     From the first unmodelled construct nothing is masked, in this row or any later one (`distrusted`): the key is refused (fail
     closed) and the author rewords. Do not add a case for another construct; an unclassified row is refused, not guessed."""
+    if not _opens_inline_text(row):
+        return row, True
     events = list(_INLINE_EVENT_RE.finditer(row))
     nxt: dict[int, int] = {}   # event index of a backtick run -> the next run of the same length (right to left: linear)
     seen: dict[int, int] = {}

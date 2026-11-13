@@ -4119,6 +4119,22 @@ _MARKUP_CLASS_TABLE = [
     # ---- emphasis delimiters bind less tightly than code spans and never shift a backtick run ----
     ("emphasis-around", "CM 6.2", "*a* **b** _c_ `@K@:` ok", "ACCEPTED"),
     ("emphasis-span-crosses", "CM 6.1", "*a`b* x`!`@K@:` git status", "ACCEPTED"),
+    # ---- block structure: a row that starts a reference definition, a `~~~` fence or indented code is not inline text at all ----
+    ("block-refdef-label", "adversary r1 A1", "the rule\n  # details\n  [x`@K@:`]: /u", "REFUSED"),
+    ("block-refdef-first", "adversary r1 A1", "x\n[`@K@:`]: /u", "REFUSED"),
+    ("block-footnote-def", "CM 4.7", "x\n[^1]: note `@K@:` y", "REFUSED"),
+    ("block-refdef-in-quote", "CM 4.7", "x\n> [`@K@:`]: /u", "REFUSED"),
+    ("block-refdef-in-list", "CM 4.7", "x\n- [`@K@:`]: /u", "REFUSED"),
+    ("block-tilde-fence", "adversary r1 A1", "x\n  ~~~\n  `@K@:` in the fence\n  ~~~", "REFUSED"),
+    ("block-indented-code", "adversary r1 A1", "x\n\n    `@K@:` as code", "REFUSED"),
+    ("block-indented-code-tab", "adversary r1 A1", "x\n\n\t`@K@:` as code", "REFUSED"),
+    ("block-list-item-code", "CM 5.2", "x\n-     `@K@:` as code", "REFUSED"),
+    ("block-quote-code", "CM 5.1", "x\n>     `@K@:` as code", "REFUSED"),
+    ("block-continuation-quotation", "CM 4.8", "x\n  note `@K@:` here", "ACCEPTED"),
+    ("block-list-item-quotation", "CM 5.2", "x\n- note `@K@:` here", "ACCEPTED"),
+    ("block-quote-quotation", "CM 5.1", "x\n> note `@K@:` here", "ACCEPTED"),
+    ("block-heading-quotation", "CM 4.2", "x\n  # a `@K@:` heading", "ACCEPTED"),
+    ("block-bracket-mid-row", "CM 6.3", "x\n  see [x`@K@:`] label", "ACCEPTED"),
     # ---- hard breaks ----
     ("hard-break-spaces", "CM 6.7", "x  \n  `@K@:` y", "ACCEPTED"),
     ("hard-break-backslash", "CM 6.7", "x\\\n  `@K@:` y", "ACCEPTED"),
