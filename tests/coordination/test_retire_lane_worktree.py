@@ -5957,9 +5957,11 @@ def test_real_process_creation_order_increases_from_parent_to_child():
 
 @pytest.mark.skipif(os.name != "nt", reason="reads the Windows process table")
 def test_real_process_creation_order_is_readable_for_a_process_with_a_five_thousand_character_command_line():
-    """RETIRE-PROC-ORDER-BUFFER-RETRY-1 (PR #803 opus r2 finding 1): class 64 (ProcessTelemetryIdInformation) carries the command line, so a fixed 8 KiB buffer
-    answers STATUS_INFO_LENGTH_MISMATCH for a process whose command line is long, and its creation-order key read as unreadable (the wall-clock fallback then
-    decided the pair). The child below has a command line of at least 5,000 characters and must still get a key, bound to its own pid."""
+    """RETIRE-PROC-ORDER-BUFFER-RETRY-1 (PR #803 opus r2 finding 1): REGRESSION GUARD for the retry path, NOT the RED test. The premise that a fixed 8 KiB
+    buffer overflows (STATUS_INFO_LENGTH_MISMATCH) for a long command line is UNREPRODUCED on Win10 19045: class 64 (ProcessTelemetryIdInformation) returned
+    1,336 bytes at 100, 5,000 and 20,000 characters, so this test also passes on the unfixed code. It only pins that a child with a command line of at least
+    5,000 characters still gets a creation-order key, bound to its own pid. The RED test is
+    test_real_process_creation_order_retries_once_when_the_first_buffer_is_too_small, which forces the too-small status with a 64-byte first buffer."""
     import sys
     child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)", "x" * 5000], stdin=subprocess.DEVNULL,
                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
