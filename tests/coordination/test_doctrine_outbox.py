@@ -4001,7 +4001,7 @@ def test_the_run_pairing_is_linear_in_the_number_of_runs(tmp_path):
 # (a later row too, as a tag can cross rows). A quotation BEFORE the markup is still a quotation.
 #
 # Named mutation for this block (turns the named tests red, then is reverted):
-#   M29 drop _MARKUP_OPEN_RE from the stop column -> every refusal row below
+#   M29 drop the `<` and `]` events from _INLINE_EVENT_RE -> every refusal row below
 
 @pytest.mark.parametrize("key", ob.CARD_FIELDS)
 @pytest.mark.parametrize("rows", [
@@ -4029,3 +4029,117 @@ def test_the_screen_refuses_the_markup_row_on_the_entry_every_reader_calls(key):
 def test_a_quotation_before_the_markup_is_still_a_quotation(tmp_path):
     body = CARD_BODY.replace("rule: the rule\n", 'rule: use `check:` then <i title="x">y</i> and [t](u)\n', 1)
     assert ob.main(["--repo", str(tmp_path), "validate", str(_write_card_item(tmp_path, body))]) == 0
+
+
+# ---------- DOCTRINE-OUTBOX-MARKUP-CLASS-COMPLETENESS-1: one table over every CommonMark inline class ----------
+#
+# #801 r1-r6 found the markup classes one at a time (unequal runs, escaped runs, spans across rows, a closing run reused as an
+# opener, backticks inside raw HTML / autolinks / link destinations / reference definitions): each adversary pass named the next
+# class the per-class code had not modelled. This table is the completeness guard: every CommonMark inline construct (code spans
+# of any backtick length, backslash escapes, character references, raw HTML of all five kinds, autolinks, inline links and images,
+# reference links, emphasis, hard breaks) against the one thing the screen decides -- whether a backtick-quoted field key is a real
+# code span (so it is a quotation) or text (so the key is fused). The verdict is the SCREEN's: REFUSED where the key is bare or
+# the row cannot be classified (fail closed: the author rewords), ACCEPTED only where the row's code spans are exactly CommonMark's.
+# The tail `a`!`KEY:` git status` is the probe: if an earlier construct made one of its three backtick runs text, the runs pair
+# the other way and `KEY:` is bare (CommonMark: the `!` span is closed, `KEY:` is text); a screen that took the construct for
+# plain text would mask `KEY:` and pass a card the bus rejects. Source column: the #801 round that found the class, or the
+# CommonMark rule the row exercises. Expected verdicts are hand-derived from CommonMark 0.31.2 (no renderer is a dependency).
+#
+# Named mutation for this block (turns the named rows red, then is reverted):
+#   M30 stop only at `<` and `](` / `]:` again (the per-class stop set) -> the reference-link and in-span rows
+
+_TAIL = "a`!`@K@:` git status"
+_MARKUP_CLASS_TABLE = [
+    # ---- code spans: N-backtick fences pair only with an EQUAL run (CommonMark section 6.1) ----
+    ("span-1", "CM 6.1", "use `@K@:` as a label", "ACCEPTED"),
+    ("span-2", "CM 6.1", "use ``@K@:`` as a label", "ACCEPTED"),
+    ("span-3", "CM 6.1", "use ```@K@:``` as a label", "ACCEPTED"),
+    ("span-path", "CM 6.1", "use `x/@K@:` as a label", "ACCEPTED"),
+    ("span-lone-run-inside", "CM 6.1", "``a`b`` then `@K@:` ok", "ACCEPTED"),
+    ("span-longer-run-inside", "CM 6.1", "`foo `` bar` then `@K@:` ok", "ACCEPTED"),
+    ("span-several", "CM 6.1", "`a` and ``@K@:`` and ```@K@:```", "ACCEPTED"),
+    ("span-after-word", "CM 6.1", "x`@K@:` y", "ACCEPTED"),
+    ("span-bare-after-span", "r1", "x `a` @K@: after a closed span", "REFUSED"),
+    ("span-unequal-close", "r1", "x `@K@: mlv-app``", "REFUSED"),
+    ("span-unequal-open", "r1", "x ``@K@: y` z", "REFUSED"),
+    ("span-never-closed", "r1", "x ``@K@: mlv-app", "REFUSED"),
+    ("span-with-spaces", "r2", "use `a @K@: b` as a label", "REFUSED"),
+    ("span-crosses-rows", "r2", "use `@K@:\n  value` as a label", "REFUSED"),
+    ("span-text-between-rows", "r2", "use `start\n  end` @K@: fused `tail\n  close`", "REFUSED"),
+    ("span-closing-run-reused", "r4", "x `!`@K@:` git status", "REFUSED"),
+    ("span-lone-run-skipped", "r6", "x ``a`!``@K@:`` git status", "REFUSED"),
+    ("span-crosses-to-next-row", "r6", "x `a\n  !`@K@:` git status", "REFUSED"),
+    ("span-opened-unpaired-then-later-row", "r6", "x ``a\ncheck: y `z`\n  !``@K@:`` git status", "REFUSED"),
+    ("span-three-run-unpaired", "CM 6.1", "```a`` b `@K@:` c", "REFUSED"),
+    # ---- backslash escapes: an odd number of backslashes makes the run text; an even number leaves it a delimiter ----
+    ("escape-odd-1", "r2", "x \\` @K@: fused `", "REFUSED"),
+    ("escape-odd-opener", "r5", "x \\`" + _TAIL, "REFUSED"),
+    ("escape-odd-3", "r5", "x \\\\\\`" + _TAIL, "REFUSED"),
+    ("escape-even-2", "r5", "x \\\\`" + _TAIL, "ACCEPTED"),
+    ("escape-after-quotation", "r5", "x `@K@:` then \\`a` ok", "ACCEPTED"),
+    ("escape-not-before-backtick", "CM 2.4", "a \\* b \\_ c `@K@:` d", "ACCEPTED"),
+    # ---- entity and numeric character references: a reference is not a raw backtick and not a raw key ----
+    ("entity-numeric-backtick", "CM 6.2", "x &#96;@K@:&#96; y", "REFUSED"),
+    ("entity-named-backtick", "CM 6.2", "x &grave;@K@:&grave; y", "REFUSED"),
+    ("entity-before-quotation", "CM 6.2", "x &amp; &lt;b&gt; &#96; `@K@:` y", "ACCEPTED"),
+    ("entity-spells-the-key", "CM 6.2", "x &#99;heck: y &#114;ule: z", "ACCEPTED"),
+    # ---- raw HTML: a backtick inside any of the five kinds is text ----
+    ("html-tag-attribute", "r6", '<i title="`">' + _TAIL, "REFUSED"),
+    ("html-tag-crosses-rows", "r6", '<i title="`"\n  >' + _TAIL, "REFUSED"),
+    ("html-closing-tag", "CM 6.6", "</i `>" + _TAIL, "REFUSED"),
+    ("html-comment", "r6", "<!-- ` -->" + _TAIL, "REFUSED"),
+    ("html-processing-instruction", "CM 6.6", "<? ` ?>" + _TAIL, "REFUSED"),
+    ("html-declaration", "CM 6.6", "<!DOCTYPE ` x>" + _TAIL, "REFUSED"),
+    ("html-cdata", "CM 6.6", "<![CDATA[ ` ]]>" + _TAIL, "REFUSED"),
+    ("html-quotation-before", "r6", 'use `@K@:` then <i title="x">y</i> and [t](u)', "ACCEPTED"),
+    ("html-lt-inside-span", "CM 6.1", "a `x<y` b `@K@:` c", "ACCEPTED"),
+    ("html-lt-not-a-tag", "CM 6.6", "a < b and 3<4 then `@K@:` c", "ACCEPTED"),
+    # ---- autolinks ----
+    ("autolink-uri", "r6", "<http://a`b>" + _TAIL, "REFUSED"),
+    ("autolink-email-shape", "CM 6.5", "<me@a`b.example>" + _TAIL, "REFUSED"),
+    # ---- inline links and images, including nested brackets ----
+    ("link-destination", "r6", "[t](http://a`b) " + _TAIL, "REFUSED"),
+    ("link-title", "r6", '[t](u "`") ' + _TAIL, "REFUSED"),
+    ("image-destination", "CM 6.4", "![img](http://a`b) " + _TAIL, "REFUSED"),
+    ("link-nested-brackets", "CM 6.3", "[a [b] c](http://x`y) " + _TAIL, "REFUSED"),
+    ("link-bracket-in-span", "CM 6.1", "see `](` then `@K@:` ok", "ACCEPTED"),
+    ("link-text-holds-span", "CM 6.1", "[`@K@:`](u) as a link", "ACCEPTED"),
+    ("link-then-quotation", "fail-closed", "see [t](u) and `@K@:` here", "REFUSED"),
+    ("bracket-stray", "CM 6.3", "a ] b `@K@:` c", "ACCEPTED"),
+    # ---- reference links and definitions ----
+    ("reference-full", "CM 6.3", "[t][r`x] " + _TAIL, "REFUSED"),
+    ("reference-collapsed-nested", "CM 6.3", "[[a]][r`x] " + _TAIL, "REFUSED"),
+    ("reference-definition", "r6", "[t]: http://a`b " + _TAIL, "REFUSED"),
+    ("reference-label-holds-span", "CM 6.1", "[r`x]a`!`@K@:` git status", "ACCEPTED"),
+    ("reference-shortcut-then-quotation", "CM 6.3", "[x] done, then `@K@:` here", "ACCEPTED"),
+    # ---- emphasis delimiters bind less tightly than code spans and never shift a backtick run ----
+    ("emphasis-around", "CM 6.2", "*a* **b** _c_ `@K@:` ok", "ACCEPTED"),
+    ("emphasis-span-crosses", "CM 6.1", "*a`b* x`!`@K@:` git status", "ACCEPTED"),
+    # ---- hard breaks ----
+    ("hard-break-spaces", "CM 6.7", "x  \n  `@K@:` y", "ACCEPTED"),
+    ("hard-break-backslash", "CM 6.7", "x\\\n  `@K@:` y", "ACCEPTED"),
+    ("hard-break-inside-span", "CM 6.7", "x `a  \n  b` then `@K@:`", "REFUSED"),
+]
+
+
+def _screen_verdict(row: str, key: str) -> str:
+    body = CARD_BODY.replace("rule: the rule\n", "rule: " + row.replace("@K@", key) + "\n", 1)
+    try:
+        ob.screen_card_field_keys(body)
+    except ob.Refusal as e:
+        assert e.code == "FIELD_KEY_FUSED"
+        return "REFUSED"
+    return "ACCEPTED"
+
+
+@pytest.mark.parametrize("key", ob.CARD_FIELDS)
+@pytest.mark.parametrize("row_id,source,row,verdict", _MARKUP_CLASS_TABLE, ids=[r[0] for r in _MARKUP_CLASS_TABLE])
+def test_the_screen_judges_a_quoted_key_by_one_inline_pass_over_every_commonmark_class(row_id, source, row, verdict, key):
+    assert _screen_verdict(row, key) == verdict, f"{row_id} ({source}): {row!r}"
+
+
+def test_the_markup_class_table_covers_every_inline_class_and_both_verdicts():
+    classes = {r[0].split("-")[0] for r in _MARKUP_CLASS_TABLE}
+    assert classes >= {"span", "escape", "entity", "html", "autolink", "link", "image", "reference", "emphasis", "hard", "bracket"}
+    assert {r[3] for r in _MARKUP_CLASS_TABLE} == {"ACCEPTED", "REFUSED"}
+    assert len({r[0] for r in _MARKUP_CLASS_TABLE}) == len(_MARKUP_CLASS_TABLE)

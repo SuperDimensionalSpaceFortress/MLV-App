@@ -872,12 +872,10 @@ _BUS_PLAIN_LINE_RE = re.compile(rf"(?P<label>[A-Za-z-]+):(?:{_JS_WS}{_JS_NOT_EOL
 _BOLD_LABELS = {**{k: k for k in CARD_FIELDS}, "applies to": "applies"}
 # A bold label anywhere in a line, for the scan past a line's opening (the validator reads one only at the start of a line).
 _BOLD_LABEL_SCAN_RE = re.compile(r"- \*\*(?P<label>[^*:]+):\*\*")
-# The one quotation the screen recognises: a field key written as a single-line, space-free backtick token that ends in the key
-# (`check:`, ``check:``, `touches/supersedes:`), opened and closed by backtick runs of the SAME length (a code span closes only
-# on an equal run, so any length is a quotation and an unequal pair is not). It is a token pattern, not a markdown parser: a span
-# with spaces in it, one that crosses a line, or one opened by an escaped backtick is not recognised, so its key is refused (fail
-# closed) and the author rewords. Every parser-shaped exemption tried here (CommonMark spans, escapes, multi-line spans) was bypassed.
-_QUOTED_KEY_RE = re.compile(r"(?<![`\\\w])(`+)(?!`)[^\s`]*(?:" + _FIELD_KEY_ALT + r"):\1(?!`)")
+# The one quotation the screen recognises: a code span (see _mask_quotations) whose whole content is a single space-free token that
+# ends in a field key (`check:`, ``check:``, `touches/supersedes:`). A span with spaces in it, or one that crosses a line, is not a
+# quotation, so its key is refused (fail closed) and the author rewords.
+_QUOTED_SPAN_CONTENT_RE = re.compile(r"[^\s`]*(?:" + _FIELD_KEY_ALT + r"):")
 
 
 # What a quoted token is replaced with before the scan: the same width (so a reported column holds) and a character that is
@@ -909,10 +907,10 @@ def _from_heading_row(body: str) -> str:
     return "\n".join(rows[first:])
 
 
-_BACKTICK_RUN_RE = re.compile(r"`+")
-# Where markdown may read a backtick as plain text rather than a code-span delimiter: raw HTML, an HTML comment or an autolink (`<`),
-# a link destination or title (`](`), a reference definition (`]:`). Not modelled; masking stops there (see _mask_quotations).
-_MARKUP_OPEN_RE = re.compile(r"<|\]\(|\]:")
+# The inline pass reads a row left to right through only the events that decide whether a backtick run is a code-span delimiter:
+# a backtick run, a `<` that can open raw HTML or an autolink (CommonMark: followed by a letter, `/`, `!` or `?`), and a `]` that
+# continues into a link destination (`(`), a reference label (`[`) or a definition (`:`).
+_INLINE_EVENT_RE = re.compile(r"`+|<(?=[A-Za-z/!?])|\](?=[(\[:])")
 
 
 def _backslashes_before(row: str, pos: int) -> int:
@@ -924,51 +922,47 @@ def _backslashes_before(row: str, pos: int) -> int:
 
 
 def _mask_quotations(row: str) -> tuple[str, bool]:
-    """`(masked, distrusted)`: `row` with each quoted key token (_QUOTED_KEY_RE) replaced by _QUOTE_MASK of the same width, and
-    whether the rows AFTER this one must be left unmasked. A token is masked only when its opening run really OPENS a code span:
-    the runs of the row pair as CommonMark pairs them (each run takes the next run of EQUAL length; the runs between are span
-    text), and only a run that takes a partner is an opener. Counting runs was wrong twice: in `x `!`check:` git` the run after
-    `!` closes a span, and in ``a`!``check:`` the lone run between equal-length runs is skipped, so the closing double run was
-    read as an opener and a bare `check:` was masked (adversary passes on b68df2a5 A1 and 0a19848c A1). A run with no partner in
-    the row, or one preceded by an odd number of backslashes (escaped: text, not a delimiter; Sol r5 B1), is not understood well
-    enough to model: it may pair with a run in a LATER row (a span crosses rows, adversary 0a19848c A2), so no token at or after
-    it is masked, in this row or any later one (`distrusted`). The token is left in the row, its key is refused (fail closed) and
-    the author rewords. An EVEN number of backslashes is an escaped backslash and leaves the run real. A backtick is also plain
-    text inside raw HTML (`<i title="`">`), an HTML comment, an autolink, a link destination or title (`](`) and a reference
-    definition (`]:`), so the first of those (_MARKUP_OPEN_RE) stops masking the same way (adversary 4640f9b8 A1)."""
-    runs = list(_BACKTICK_RUN_RE.finditer(row))
-    n = len(runs)
-    stop = len(row) + 1   # no token starting at or after this column is masked
-    markup = _MARKUP_OPEN_RE.search(row)
-    if markup:
-        stop = markup.start()
-    for r in runs:
-        if _backslashes_before(row, r.start()) % 2:
-            stop = min(stop, r.start())
-            break
-    nxt: list[int | None] = [None] * n   # the next run of the same length, found right to left (linear in the runs)
+    """`(masked, distrusted)`: `row` with each quoted key (a code span whose content is _QUOTED_SPAN_CONTENT_RE) replaced by
+    _QUOTE_MASK of the same width, and whether the rows AFTER this one must be left unmasked.
+
+    ONE inline pass, CommonMark's, instead of one special case per markup class (#801 r1-r6 found unequal runs, escaped runs,
+    spans across rows, raw HTML, autolinks, link destinations and reference definitions one adversary pass at a time). The row is
+    read left to right and each construct is either classified or ends the pass:
+      * a backtick run opens a code span that closes at the NEXT run of exactly the same length; everything between, whatever it
+        holds (`<`, `]`, shorter or longer runs), is span content, because code spans bind tighter than raw HTML, links and
+        emphasis. Text outside spans is plain text for this purpose: emphasis delimiters, character references (`&#96;` is not a
+        backtick), hard breaks and a backslash before any other character cannot make a raw backtick run text.
+      * everything else that can read a backtick as TEXT is not modelled and ends the pass: a run with no closing run in the row
+        (it may close in a later row, so the span may cross rows), a run escaped by an odd number of backslashes, a `<` that opens
+        raw HTML or an autolink (tag, comment, processing instruction, declaration, CDATA), a `]` that continues into a link
+        destination or title, a reference label or a reference definition.
+    From the first unmodelled construct nothing is masked, in this row or any later one (`distrusted`): the key is refused (fail
+    closed) and the author rewords. Do not add a case for another construct; an unclassified row is refused, not guessed."""
+    events = list(_INLINE_EVENT_RE.finditer(row))
+    nxt: dict[int, int] = {}   # event index of a backtick run -> the next run of the same length (right to left: linear)
     seen: dict[int, int] = {}
-    for i in range(n - 1, -1, -1):
-        width = runs[i].end() - runs[i].start()
-        nxt[i] = seen.get(width)
-        seen[width] = i
-    openers, i = set(), 0
-    while i < n:
-        j = nxt[i]
-        if j is None:
-            stop = min(stop, runs[i].start())
-            break
-        openers.add(runs[i].start())
+    for i in range(len(events) - 1, -1, -1):
+        ev = events[i]
+        if ev.group()[0] == "`":
+            width = ev.end() - ev.start()
+            if width in seen:
+                nxt[i] = seen[width]
+            seen[width] = i
+    out, last, i = [], 0, 0
+    while i < len(events):
+        ev = events[i]
+        if ev.group()[0] != "`":
+            return "".join(out) + row[last:], True   # raw HTML, autolink, link destination, reference label or definition
+        j = nxt.get(i)
+        if j is None or _backslashes_before(row, ev.start()) % 2:
+            return "".join(out) + row[last:], True   # no closing run in the row, or an escaped run
+        close = events[j]
+        if _QUOTED_SPAN_CONTENT_RE.fullmatch(row, ev.end(), close.start()):
+            out.append(row[last:ev.start()])
+            out.append(_QUOTE_MASK * (close.end() - ev.start()))
+            last = close.end()
         i = j + 1
-    out, last = [], 0
-    for m in _QUOTED_KEY_RE.finditer(row):
-        if m.start() >= stop or m.start() not in openers:
-            continue
-        out.append(row[last:m.start()])
-        out.append(_QUOTE_MASK * (m.end() - m.start()))
-        last = m.end()
-    out.append(row[last:])
-    return "".join(out), stop <= len(row)
+    return "".join(out) + row[last:], False
 
 
 def _card_rows(body: str) -> list[str]:
@@ -1035,7 +1029,7 @@ def screen_card_field_keys(body: str) -> None:
     bus validator reads as a field (_parse_field_line: `name: value` or `- **Name:** value`, a value after whitespace) is scanned
     past its opening label; any other line (a continuation, a bold note such as `- **hooks.check:**`, or a line the validator does
     not read as a field at all, such as `check:echo`) is scanned in full, since a key there is fused into the text before it. A
-    quoted token (_QUOTED_KEY_RE) is masked first (_QUOTE_MASK, same width, so the reported column holds). Lines split on "\\n" only (CRLF
+    quoted key (a code span, _mask_quotations) is masked first (_QUOTE_MASK, same width, so the reported column holds). Lines split on "\\n" only (CRLF
     read as LF), as the bus validator splits them: str.splitlines() also breaks on \\x85, U+2028 and friends, which turned
     `x<U+0085>applies: y` into a fictitious line that opens with its own field."""
     rows = _card_rows(body)
