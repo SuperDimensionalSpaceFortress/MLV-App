@@ -923,26 +923,37 @@ def _backslashes_before(row: str, pos: int) -> int:
     return n
 
 
-# A block container's opening on a row: a block quote marker (and one optional space) or a list marker and the one space after it.
-_CONTAINER_OPEN_RE = re.compile(r">[ ]?|(?:[-*+]|\d{1,9}[.)])[ ]")
+# One marker that may open a block container: a block quote `>`, a bullet `-` `*` `+`, or an ordered number and its `.` or `)`.
+_CONTAINER_MARK_RE = re.compile(r">|[-*+]|\d{1,9}[.)]")
 
 
 def _opens_inline_text(row: str) -> bool:
     """False when `row` may START a block whose content is not inline text, so a backtick pair in it is no code span: indented
-    code (four columns of indent, a tab counting as four), a `~~~` fence (its rows after it are code too), or a reference or
-    footnote definition (the row starts with `[`: its label is raw text), each read after any block quote or list marker. The
-    rows of the other blocks (paragraphs and their continuations, headings, list items, quotes) are inline text. A row that
-    fails this test is not classified (_mask_quotations): its key is refused and the rows after it are left unmasked."""
+    code, a `~~~` fence (its rows after it are code too), or a reference or footnote definition (the row starts with `[`: its
+    label is raw text), each read after any block quote or list marker. The rows of the other blocks (paragraphs and their
+    continuations, headings, list items, quotes) are inline text. A row that fails this test is not classified
+    (_mask_quotations): its key is refused and the rows after it are left unmasked.
+
+    A fail-closed predicate over the row's LEAD (adversary pass on 6718542d A1: a list marker followed by a TAB was read as inline
+    text, so `-<TAB>[x`check:`]: /u` hid a raw label key; the exact-marker loop this replaced had a hole for every spelling it did
+    not list). The lead may hold only spaces and container markers, and a marker is modelled only in the forms CommonMark's block
+    rules read the same way: a block quote `>` with anything after it, or a bullet or ordered marker with a SPACE (or nothing)
+    after it. A tab anywhere in the lead, four spaces of indent, or a marker followed by a tab is not modelled, so the row is not
+    classified. A bullet or number NOT followed by a space (`-x`, `**b**`, `1.5`) is no marker, so the row is plain text."""
     s = row
     while True:
-        t = s.lstrip(" \t")
-        lead = s[:len(s) - len(t)]
-        if "\t" in lead or len(lead) >= 4 or t.startswith(("[", "~~~")):
+        t = s.lstrip(" ")
+        if len(s) - len(t) >= 4 or t.startswith(("\t", "[", "~~~")):
             return False
-        m = _CONTAINER_OPEN_RE.match(t)
+        m = _CONTAINER_MARK_RE.match(t)
         if not m:
             return True
-        s = t[m.end():]
+        rest = t[m.end():]
+        if rest.startswith("\t"):
+            return False
+        if m.group() != ">" and rest and rest[0] != " ":
+            return True
+        s = rest
 
 
 def _mask_quotations(row: str) -> tuple[str, bool]:
