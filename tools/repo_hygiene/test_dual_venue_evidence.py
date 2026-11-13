@@ -11695,7 +11695,7 @@ def _ident_child_stamps_of(start_read: tuple, exit_path: Path) -> tuple:
     try:
         exit_raw = exit_path.read_text(encoding="ascii").strip()
     except (OSError, UnicodeDecodeError) as exc:
-        return None, f"no child exit stamp: its ProcessExit handler never ran ({type(exc).__name__})"
+        return None, f"no child exit stamp could be read ({type(exc).__name__}): the evidence is unavailable, which says nothing about whether the child's ProcessExit handler ran"   # sol r6 B2: a read failure is not proof the writer never ran (a lock, a deletion or a replacement after a successful write)
     if len(start) != 2 or not all(re.fullmatch(r"\d{1,18}", s) for s in (*start, exit_raw)) or int(start[1]) == 0:
         return None, f"malformed child stamp (start={' '.join(start)[:60]!r}, exit={exit_raw[:40]!r})"
     start_ticks, exit_ticks, hz = int(start[0]), int(exit_raw), int(start[1])
@@ -12763,7 +12763,7 @@ class VenueProbeIdentityCallDeadlineTests(IdentityProbeMixin, unittest.TestCase)
         civil_run_s = None if (started is None or exit_ns is None) else (exit_ns - started) / 1e9
         # VENUE-PROBE-CHILD-SIDE-MONOTONIC-EXIT-STAMP-1: the wall's LOWER bound is the child's own QPC run (first statement -> ProcessExit); the civil lifetime above is a cross-check only
         child = getattr(self, "last_child_qpc", None)
-        child_run_s = None if child is None else (child[1] - child[0]) / 1e9
+        child_run_s = None if child is None else _IdentWallS.of_ns(child[1] - child[0])   # sol r6 B1: the exact ns count rides with the float, so the verdict never compares binary roundings of two accepted integer bounds
         if child is not None:   # adversary A1 on 99868f47: the run is INSIDE the parent's wall, judged on the EXACT stamps (the integer bounds above can round a 0.5 ns excess into an equality)
             start_exact, exit_exact = _ident_exact_stamps(child)
             self.assertLessEqual(exit_exact - start_exact, _ident_wall_ns(wall_s), f"typed failure, not a verdict: the child's own monotonic run exceeds the parent's wall {wall_s!r} s that contains it, so the two are not the same monotonic clock")
@@ -12820,7 +12820,7 @@ class VenueProbeIdentityCallDeadlineTests(IdentityProbeMixin, unittest.TestCase)
         if child_hz is not None:
             self.assertEqual(t["qpc_hz"], child_hz, f"typed failure, not an exit hold: the end marker's QPC frequency ({t['qpc_hz']} Hz) is not the child's own stamp frequency ({child_hz} Hz), so the two stamps are not one clock")
         marker_ns = _ident_marker_ns(t["end_qpc"], t["qpc_hz"])
-        upper = (self.last_wall_end_ns - marker_ns) / 1e9
+        upper = _IdentWallS.of_ns(self.last_wall_end_ns - marker_ns)   # sol r6 B1: exact ns count, as the lower bound below (a float of 999999999999999999 ns is 10^9 s)
         # sol r2 on 46c71e12 B1: every ORDER check below is on the EXACT stamps (rationals of a ns), never on the rounded integer bounds, which can hide a reversal of less than 1 ns
         marker_exact = _IdentFraction(t["end_qpc"] * 1_000_000_000, t["qpc_hz"])
         self.assertLessEqual(marker_exact, self.last_wall_end_ns, f"typed failure, not an exit hold: the probe's end marker is {float(marker_exact - self.last_wall_end_ns) / 1e9:.9f} s AFTER the test saw the process end, so the two are not the same monotonic clock")   # r2 (adversary A3): no tolerance, like the child stamps below
@@ -12838,7 +12838,7 @@ class VenueProbeIdentityCallDeadlineTests(IdentityProbeMixin, unittest.TestCase)
             self.assertLessEqual(exit_exact, self.last_wall_end_ns, f"typed failure, not an exit hold: the child's exit stamp is {float(exit_exact - self.last_wall_end_ns) / 1e9:.9f} s AFTER the test saw the process end, so the two are not the same monotonic clock")
             self.assertGreaterEqual(exit_exact, marker_exact, f"typed failure, not an exit hold: the child's exit stamp is {float(marker_exact - exit_exact) / 1e9:.9f} s BEFORE its own end marker")
             marker_up_ns = _ident_marker_ns(t["end_qpc"], t["qpc_hz"], up=True)
-            child_s = (child[1] - marker_up_ns) / 1e9   # a LOWER bound: the marker rounds up here
+            child_s = _IdentWallS.of_ns(child[1] - marker_up_ns)   # a LOWER bound: the marker rounds up here; sol r6 B1: exact ns count
         kind, figure, reason = _ident_gap_verdict(upper, child_s, self.EXIT_HOLD_LIMIT_S, civil_s)
         if kind == "inconclusive":
             reason += "".join(f" ({note})" for absent, note in ((child is None, getattr(self, "last_child_qpc_note", "")), (civil_s is None, getattr(self, "last_child_exit_note", ""))) if absent and note)
@@ -13215,7 +13215,7 @@ class VenueProbeIdentityCallDeadlineTests(IdentityProbeMixin, unittest.TestCase)
         start.write_text("1000 10000000", encoding="ascii")
         end.write_text("21000", encoding="ascii")
         self.assertEqual(_ident_read_child_stamps(start, end), ((100_000, 2_100_000), "ok"))
-        for s_text, e_text, why in (("1000 10000000", None, "ProcessExit handler never ran"), (None, "21000", "no child start stamp"), ("1000", "21000", "malformed"),
+        for s_text, e_text, why in (("1000 10000000", None, "no child exit stamp could be read"), (None, "21000", "no child start stamp"), ("1000", "21000", "malformed"),
                                     ("1000 0", "21000", "malformed"), ("1000 10000000", "-5", "malformed"), ("1000 10000000", "2e4", "malformed"), ("1000 10000000", "9" * 30, "malformed"),
                                     ("21000 10000000", "1000", "BEFORE its start stamp"),
                                     ("2 999999999999999999", "1", "BEFORE its start stamp")):   # adversary A1 on 636642d6: both floor to 0 ns, the ticks still say exit < start
@@ -13483,6 +13483,52 @@ class VenueProbeIdentityCallDeadlineTests(IdentityProbeMixin, unittest.TestCase)
         # a plain tuple set by a test names no frequency, so there is nothing to compare it with
         self._set_clocks(100.0, None, 120.1, child_qpc=(95.0, 120.0))
         self.assertEqual(self.exit_hold_verdict()[0], "over")
+
+    # VENUE-PROBE-CHILD-SIDE-MONOTONIC-EXIT-STAMP-1 r7 (sol r6 on bea73826: B1 and B2)
+    def test_r7_b1_accepted_integer_ns_bounds_keep_their_exact_order_through_the_verdict_conversion(self) -> None:
+        # sol B1: child run, parent wall and marker -> exit are all exact ns counts; dividing by 1e9 into a float rounded 999999999999999999 ns up to 10^9 s and made two consistent bounds "not the same clock"
+        big = 999_999_999_999_999_999
+        self._set_clocks_from_stamps("0 1000000000", str(big), big - 1, 1_000_000_000, big)
+        verdicts = {what: kind for what, kind, _f, _r in self.timing_verdicts(_IdentWallS.of_ns(big))}
+        self.assertEqual(verdicts, {"wall": "over", "exit hold": "pass"}, "the exact child and parent durations are equal, so the wall is over the limit and the exit hold under it")
+    def test_r7_b1_upper_sibling_an_exact_bound_one_ns_under_a_caller_limit_is_a_pass(self) -> None:
+        # the exact gap marker -> parent end is 10^9 s - 1 ns, UNDER a caller-overridden 10^9 s limit
+        self.EXIT_HOLD_LIMIT_S = 1e9
+        self._set_clocks_from_stamps("0 1000000000", "1", 0, 1_000_000_000, 999_999_999_999_999_999)
+        self.assertEqual(self.exit_hold_verdict()[0], "pass", "an exact upper bound under the limit is a pass, not a float that rounds onto it")
+
+    def test_r7_b1_lower_sibling_an_exact_lower_bound_one_ns_under_a_caller_limit_is_never_over_it(self) -> None:
+        # the parent's bound is exactly the limit, the child's exact lower bound is 1 ns under it
+        self.EXIT_HOLD_LIMIT_S = 1e9
+        self._set_clocks_from_stamps("0 1000000000", str(999_999_999_999_999_999), 0, 1_000_000_000, 10**18)
+        self.assertEqual(self.exit_hold_verdict()[0], "inconclusive", "a lower bound 1 ns under the limit is never over it")
+
+    def test_r7_b2_an_exit_stamp_read_failure_never_claims_the_handler_did_not_run(self) -> None:
+        # sol B2: a handler can write its stamp and a later read fail (a lock, a deletion, a replacement); the reader knows the READ failed and nothing about the writer
+        start, end = self.tmp / _IDENT_CHILD_QPC_START, self.tmp / _IDENT_CHILD_QPC_EXIT
+        start.write_text("100000000 10000000", encoding="ascii")
+        real_read_text = Path.read_text
+
+        def locked(path, *a, **k):
+            if path == end:
+                raise PermissionError("locked")
+            return real_read_text(path, *a, **k)
+
+        cases = []
+        end.write_text("200000000", encoding="ascii")
+        with unittest.mock.patch.object(Path, "read_text", locked):
+            cases.append(("PermissionError", _ident_read_child_evidence(start, end)))
+        end.unlink()
+        cases.append(("FileNotFoundError", _ident_read_child_evidence(start, end)))
+        end.write_bytes(b"\xff")
+        cases.append(("UnicodeDecodeError", _ident_read_child_evidence(start, end)))
+        for name, (stamps, note, lone_start) in cases:
+            self.assertIsNone(stamps, name)
+            self.assertIsNotNone(lone_start, f"{name}: the start evidence already observed is kept")
+            self.assertIn(name, note)
+            self.assertIn("exit stamp", note)
+            self.assertNotIn("never ran", note, f"{name}: a failed read proves nothing about the writer")
+            self.assertNotIn("did not run", note, name)
 
     def test_r2_b1_a_child_run_longer_than_the_parents_own_wall_is_a_typed_failure(self) -> None:
         # the wall bounds: a LOWER bound (the child's run) above the UPPER bound (the parent's wall, which contains it) cannot come from one monotonic clock
