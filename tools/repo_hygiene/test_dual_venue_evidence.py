@@ -15272,11 +15272,27 @@ class DueWakeDeliveryEvidenceTests(unittest.TestCase):
                           ("measured line lacks the field, an earlier Play has it", self.log(self.wake(None), before=self.play(1, self.wake("post")))),
                           ("measured Play has no line, an earlier Play has it", self.log(before=self.play(1, self.wake("post")))),
                           ("the line is not after the measured pace_summary", "\n".join(["playback_smoke.measured_session id=3", self.wake("post"),
-                                                                                        *self.play(3)]) + "\n")):
+                                                                                        *self.play(3)]) + "\n"),
+                          # r2 adversary pass 6 A1, verbatim: the wake text inside ANOTHER record's line is not a wake record
+                          ("the wake is text inside another record", "\n".join([
+                              "playback_smoke.measured_session id=3", "playback_smoke.summary session=3 reason=reached presented_frames=600",
+                              "playback_smoke.pace_summary session=3 first_present_ms=40.000 paced_elapsed_ms=25000.000",
+                              "playback_smoke.startup_catchup session=3 frames=0 playback_due_wake armed=1200 delivery=native-msg delivery_kind=post"]) + "\n"),
+                          # r2 adversary pass 6 A2, verbatim: the measured Play has no wake record; session 4's must not stand in for it
+                          ("another session's wake after the measured pace_summary", "\n".join([
+                              "playback_smoke.measured_session id=3", "playback_smoke.summary session=3 reason=reached presented_frames=600",
+                              "playback_smoke.pace_summary session=3 first_present_ms=40.000 paced_elapsed_ms=25000.000",
+                              "playback_smoke.startup_catchup session=3 frames=0", "playback_smoke.start session=4",
+                              "playback_smoke.summary session=4 reason=reached presented_frames=600",
+                              "playback_due_wake armed=1200 delivery=native-msg delivery_kind=post"]) + "\n")):
             with self.subTest(case=name):
                 v = self.verdict(self.POST, log)
                 self.assertEqual((v["verdict"], v["blocks"]), ("NOT_HONOURED", True), v)
                 self.assertIn("ROUTE_NOT_ENGAGED", v["reason"])
+        # r2 adversary pass 6 A1, second input: a genuine post record followed by a contradictory wake record without armed= is unreadable
+        v = self.verdict(self.POST, self.log(self.wake("post"), "playback_due_wake delivery=native-msg delivery_kind=send"))
+        self.assertEqual((v["verdict"], v["blocks"]), ("NOT_HONOURED", True), v)
+        self.assertIn("unreadable", v["reason"])
 
     def test_any_other_report_blocks_never_passes(self) -> None:
         for name, log in (("sent", self.log(self.wake("send"))),

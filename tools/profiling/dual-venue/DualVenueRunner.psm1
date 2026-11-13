@@ -1925,8 +1925,9 @@ function Get-DvDueWakeDeliveryEvidence {
     line, the start line, the spec or the launcher's env block. FAIL CLOSED: `blocks` is true when the leg asked and the measured line carries no
     delivery_kind (a binary before r1 emits none, or the measured Play printed no line), the field is unreadable or contradicts delivery=, or the value is not
     post. A leg that does not ask blocks when the measured line reports post or notifier (DUE_WAKE_DELIVERY_INHERITED: the variable came from the launcher)
-    or is unreadable; send, none (no wake: an unpaced leg), qtimer and mixed (a fallback), and no delivery_kind at all (a control binary before r1) leave it
-    unchanged. Pure and shared: the runner gates on it and Test-DvReceiptValid re-derives it from the hashed run log.
+    or is unreadable; send, none (no wake: an unpaced leg) and qtimer, and no delivery_kind at all (a control binary before r1) leave it unchanged (any
+    other kind, "mixed" included, is unreadable). r2 adversary pass 6: a record counts only where it starts its record body, and the measured window closes
+    at the next pace_summary or at any playback_smoke record of another session. Pure and shared: the runner gates on it and Test-DvReceiptValid re-derives it from the hashed run log.
     #>
     param([Parameter(Mandatory)]$Spec, [AllowNull()][AllowEmptyString()][string]$LogText)
     $raw = Get-DvProp (Get-DvProp $Spec 'generatorArgs') 'dueWakeDeliveryPost'
@@ -1944,12 +1945,20 @@ function Get-DvDueWakeDeliveryEvidence {
     if (-not [string]::IsNullOrEmpty($LogText)) {
         $session = (Get-DvSmokeSummaryFields -LogText $LogText).session
         if ($null -ne $session) {
-            $paceRx = '(?:^|\s)playback_smoke\.pace_summary session=' + [regex]::Escape([string]$session) + '(?:\s|$)'
+            # r2 adversary pass 6 A1: a record is read only where it STARTS the record body (after the optional `[utc] [LEVEL] [0x<thread>] ` prefix,
+            # Get-DvLogRecordBody), never as text inside another record's line
+            $start = '^(?:\[[^\]]*\] \[[A-Za-z]+\] \[0x[0-9A-Fa-f]+\] )?'
+            $paceRx = $start + 'playback_smoke\.pace_summary session=' + [regex]::Escape([string]$session) + '(?:\s|$)'
             $open = $false
             foreach ($l in (Get-DvLogRecordBodies -LogText $LogText)) {
-                if ($l -match '(?:^|\s)playback_smoke\.pace_summary session=') { $open = ($l -match $paceRx); if ($open) { $paces++ }; continue }
-                # r1 adversary pass 2 A4: the window stays open to the next pace_summary, so a second line in it is seen (and is unreadable)
-                if ($open -and $l -match '(?:^|\s)playback_due_wake armed=') { $candidates.Add($l) }
+                if ($l -match ($start + 'playback_smoke\.pace_summary session=')) { $open = ($l -match $paceRx); if ($open) { $paces++ }; continue }
+                # r2 adversary pass 6 A2: any playback_smoke record of ANOTHER session (its start, summary, ...) closes the window, so another Play's
+                # wake line never stands in for the measured Play's missing one
+                if ($open -and $l -match ($start + 'playback_smoke\.[A-Za-z0-9_]+ session=(?<s>\S+)') -and $Matches['s'] -cne [string]$session) { $open = $false; continue }
+                # r1 adversary pass 2 A4: the window stays open to the next pace_summary, so a second line in it is seen (and is unreadable).
+                # r2 adversary pass 6 A1: ANY playback_due_wake record (the app prints exactly one shape, starting armed=) is a candidate, so a second
+                # one without armed= makes the read unreadable instead of being skipped
+                if ($open -and $l -match ($start + 'playback_due_wake(?:\s|$)')) { $candidates.Add($l) }
             }
         }
     }
