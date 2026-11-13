@@ -661,6 +661,27 @@ TEST(PlaybackLookaheadCpuRouteWiring, TheRouteIsLatchedOnlyWhereALookaheadReques
     ASSERT_EQ( 1, mw.count( QStringLiteral("m_playbackLookaheadSessionRoute =") ) - mw.count( QStringLiteral("m_playbackLookaheadSessionRoute = \"none\";") ) );
 }
 
+TEST(PlaybackLookaheadCpuRouteWiring, TheMaxBusyGapStartIsStampedAtOpenNotReadAgainAtClose)
+{
+    // Adversary A1 on fb4d13fe: smoke start 100.000 s, the gap opens at 101.000 s and closes at 101.020 s (20 ms), then the GUI
+    // thread is descheduled 500 ms before a second clock read at the close: start = 101.520 - 0.020 = 1500 ms, outside the gap
+    // [1000, 1020]. The start is the opening instant, stamped once in openGuiPresentGap.
+    const QString mw = readRepoText( "platform/qt/MainWindow.cpp" );
+    const QString open = functionBody( mw, QStringLiteral("void MainWindow::openGuiPresentGap( void )") );
+    const QString close = functionBody( mw, QStringLiteral("void MainWindow::closeGuiPresentGap( void )") );
+    ASSERT_FALSE( open.isEmpty() );
+    ASSERT_FALSE( close.isEmpty() );
+    const int stamp = open.indexOf( QStringLiteral(
+        "m_guiPresentGapStartSinceSmokeMs = ( mlv_stage_timing_now() - m_playbackSmokeStartTime ) * 1000.0;") );
+    const int armed = open.indexOf( QStringLiteral("if( !m_playbackSmokeActive || !m_guiPresentIdleProbeConnected ) return;") );
+    const int start = open.indexOf( QStringLiteral("m_guiPresentGapStartNs = m_guiPresentGapClock.nsecsElapsed();") );
+    ASSERT_TRUE( armed > 0 );
+    ASSERT_TRUE( stamp > armed );
+    ASSERT_TRUE( start > stamp );
+    ASSERT_TRUE( close.contains( QStringLiteral("gaps.busyMaxAtMs = m_guiPresentGapStartSinceSmokeMs;") ) );
+    ASSERT_FALSE( close.contains( QStringLiteral("mlv_stage_timing_now()") ) );   // no second clock at the close
+}
+
 TEST(PlaybackLookaheadCpuRouteWiring, TheSevenNewFieldsAreAppendedNeverRenamed)
 {
     const QString mw = readRepoText( "platform/qt/MainWindow.cpp" );

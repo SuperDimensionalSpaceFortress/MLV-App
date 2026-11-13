@@ -1722,6 +1722,7 @@ private:
     };
     GuiPresentGapTotals m_guiPresentGaps;
     long long m_guiPresentGapFrame = -1;
+    double m_guiPresentGapStartSinceSmokeMs = -1.0;
     QElapsedTimer m_guiPresentGapClock;
     qint64 m_guiPresentGapStartNs = -1;
     gui_present_gap::IdleWaits m_guiPresentGapIdle;

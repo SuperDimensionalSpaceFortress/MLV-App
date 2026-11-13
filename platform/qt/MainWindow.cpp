@@ -5170,6 +5170,9 @@ void MainWindow::openGuiPresentGap( void )
     ++m_guiPresentGapSerial;
     m_guiOtherBusySpans.openGap();
     m_guiPresentGapFrame = m_lastDisplayedPlaybackFrame;   // the frame whose present opened the gap
+    // CPU-S1-PACE-POST-785-LEVER-1 fix iteration 2 (adversary A1 on fb4d13fe): the gap's opening instant on the smoke clock,
+    // stamped here once; the close never reads a second clock to place it.
+    m_guiPresentGapStartSinceSmokeMs = ( mlv_stage_timing_now() - m_playbackSmokeStartTime ) * 1000.0;
     m_guiPresentGapStartNs = m_guiPresentGapClock.nsecsElapsed();
 }
 
@@ -5220,9 +5223,8 @@ void MainWindow::closeGuiPresentGap( void )
     if( gaps.gaps == 1 || split.busyMs > gaps.busyMaxMs )
     {
         // CPU-S1-PACE-POST-785-LEVER-1 (FREEZE attribution): where the longest busy gap sat. Its start,
-        // in ms since the measured Play start; the bucket is read before closeGap clears the spans.
-        gaps.busyMaxAtMs =
-            ( mlv_stage_timing_now() - m_playbackSmokeStartTime ) * 1000.0 - split.gapMs;
+        // in ms since the measured Play start (stamped at open); the bucket is read before closeGap clears the spans.
+        gaps.busyMaxAtMs = m_guiPresentGapStartSinceSmokeMs;
         gaps.busyMaxFrame = m_guiPresentGapFrame;
         gaps.busyMaxBucket = m_guiOtherBusySpans.dominantBucket( split.otherBusyMs );
     }
