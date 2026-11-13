@@ -1031,9 +1031,9 @@ if ($outcome -in @('PASS', 'FAIL') -and $reconReleaseVerdict.blocks) {
     $detail = "INVALID: the job result was $outcome ($detail) but RECON_RELEASE_DEFERRED_NOT_HONOURED: $($reconReleaseVerdict.reason). A run whose deferred-release state is not the one its leg names (off when it asks, otherwise not off) is no measurement of that arm"
     $outcome = 'INVALID'
 }
-# HFR-NATIVE-M16-1457-FULLSCREEN-S1S2-PRESENT-GAP-1 r1, FAIL CLOSED: a leg that asks for the posted due wake counts only when the measured Play's own
-# playback_due_wake line reports delivery_kind=post; a leg that does not ask blocks when the app reports any delivery_kind but send (a binary that emits no
-# delivery_kind, the control arm before r1, is unchanged). A value in the launcher's env block is a request, not engagement.
+# HFR-NATIVE-M16-1457-FULLSCREEN-S1S2-PRESENT-GAP-1 r1, FAIL CLOSED: a leg that asks for the posted due wake counts only when the measured session's own
+# playback_due_wake line reports delivery_kind=post (delivery=native-msg); a leg that does not ask blocks when that line reports post or notifier (a binary
+# that emits no delivery_kind, the control arm before r1, is unchanged). A value in the launcher's env block is a request, not engagement.
 $dueWakeDeliveryVerdict = Get-DvDueWakeDeliveryEvidence -Spec $spec -LogText $runLogText
 if ($dueWakeDeliveryVerdict.requested) { $receipt['dueWakeDelivery'] = [ordered]@{ requested = $true; observed = $dueWakeDeliveryVerdict.observed; verdict = $dueWakeDeliveryVerdict.verdict } }
 if ($outcome -in @('PASS', 'FAIL') -and $dueWakeDeliveryVerdict.blocks) {

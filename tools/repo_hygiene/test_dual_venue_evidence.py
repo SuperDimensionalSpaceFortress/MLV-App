@@ -15205,18 +15205,25 @@ class DueWakeDeliveryLegSpecTests(unittest.TestCase):
         runner = (DV / "Invoke-VenueLeg.ps1").read_text(encoding="utf-8")
         self.assertIn("$dueWakeDeliveryVerdict = Get-DvDueWakeDeliveryEvidence -Spec $spec -LogText $runLogText", runner)
         self.assertIn("DUE_WAKE_DELIVERY_NOT_HONOURED", runner)
-        # the app emits the field the gate reads, on its playback_due_wake line, from the wake's own delivery
+        # the app emits the field the gate reads, on its playback_due_wake line, from the Play's own arms (r1 adversary pass 1 A2)
         mw = (ROOT / "platform" / "qt" / "MainWindow.cpp").read_text(encoding="utf-8").replace("\r\n", "\n")
         self.assertIn('reentrant_deferred=%5 delivery_kind=%6" )', mw)
-        self.assertIn('m_playbackDueWake ? QString::fromLatin1( m_playbackDueWake->deliveryKindName() ) : QStringLiteral( "none" )', mw)
+        self.assertIn(".arg( playbackDueWakePlayDeliveryKind(\n", mw)
         self.assertIn('return QStringLiteral( "playback_due_wake armed=%1 ', mw)
+        # A3: the line follows the measured session's pace_summary, which is what binds it to the measured Play
+        pace = mw.index('"playback_smoke.pace_summary session=%1 first_present_ms=%2 paced_elapsed_ms=%3 "')
+        line = mw.index("qInfo().noquote() << playbackDueWakeSummaryLine();")
+        self.assertLess(pace, line)
+        self.assertNotIn("qInfo", mw[mw.index("\n", pace):line].replace("qInfo().noquote() << playbackDueWakeSummaryLine();", ""))
+        self.assertEqual(mw.count("playbackDueWakeSummaryLine();"), 1)
 
 
 @requires_windows_pwsh
 class DueWakeDeliveryEvidenceTests(unittest.TestCase):
-    """Get-DvDueWakeDeliveryEvidence, pure: a leg that asks for the posted due wake counts only when the app's own playback_due_wake line reports
-    delivery_kind=post; a head-arm leg counts only when a reported delivery_kind is send. A value in the launcher's env block is a request, not engagement,
-    and a binary before r1 emits no delivery_kind, so an isolation leg on it is NOT_HONOURED rather than an unproven PASS."""
+    """Get-DvDueWakeDeliveryEvidence, pure: a leg that asks for the posted due wake counts only when the MEASURED session's own playback_due_wake line
+    (the one after its playback_smoke.pace_summary) reports delivery_kind=post with delivery=native-msg; a leg that does not ask blocks only on a kind the
+    variable selects (post, notifier). A value in the launcher's env block is a request, not engagement, and a binary before r1 emits no delivery_kind, so
+    an isolation leg on it is NOT_HONOURED rather than an unproven PASS."""
 
     POST = {"generatorArgs": {"dueWakeDeliveryPost": True}}
     PREFIX = "[2026-11-13T00:00:00.000Z] [INFO] [0x1a2b] "
@@ -15228,24 +15235,36 @@ class DueWakeDeliveryEvidenceTests(unittest.TestCase):
         return out
 
     @staticmethod
-    def wake(kind: str | None) -> str:
+    def wake(kind: str | None, mech: str = "native-msg") -> str:
         line = ("playback_due_wake armed=1200 fired=1198 advanced=1190 rearmed=8 busy_deferred=3 late_p50_ms=0.4 late_p95_ms=1.9 hires=1 disabled=0"
-                " delivery=native unpresented_deferred=0 stranded=0 runner_sleep_woken=12 reentrant_deferred=0")
+                f" delivery={mech} unpresented_deferred=0 stranded=0 runner_sleep_woken=12 reentrant_deferred=0")
         return line if kind is None else line + f" delivery_kind={kind} post_to_awake_min_ms=0.1"
 
     @staticmethod
-    def log(*records: str) -> str:
-        return "\n".join(["playback_smoke.measured_session id=3", *records, "playback_smoke.summary session=3 reason=reached presented_frames=600"]) + "\n"
+    def play(session: int, *wake_lines: str) -> list:
+        return [f"playback_smoke.summary session={session} reason=reached presented_frames=600",
+                f"playback_smoke.pace_summary session={session} first_present_ms=40.000 paced_elapsed_ms=25000.000", *wake_lines,
+                f"playback_smoke.startup_catchup session={session} frames=0"]
 
-    def test_honoured_only_when_the_app_reports_the_post(self) -> None:
+    @classmethod
+    def log(cls, *wake_lines: str, before: list | None = None) -> str:
+        return "\n".join(["playback_smoke.measured_session id=3", *(before or []), *cls.play(3, *wake_lines)]) + "\n"
+
+    def test_honoured_only_when_the_measured_play_reports_the_post(self) -> None:
         for name, log in (("bare", self.log(self.wake("post"))), ("crash-forensics prefix", self.log(self.PREFIX + self.wake("post"))),
-                          ("two Plays agree", self.log(self.wake("post"), self.wake("post")))):
+                          ("an earlier Play agrees", self.log(self.wake("post"), before=self.play(2, self.wake("post")))),
+                          ("an earlier Play sent (not the measured one)", self.log(self.wake("post"), before=self.play(2, self.wake("send"))))):
             with self.subTest(case=name):
                 v = self.verdict(self.POST, log)
                 self.assertEqual((v["requested"], v["observed"], v["verdict"], v["blocks"]), (True, "post", "HONOURED", False), v)
 
-    def test_a_binary_that_emits_no_delivery_kind_is_not_engaged(self) -> None:
-        for name, log in (("pre-r1 line", self.log(self.wake(None))), ("no line", self.log()), ("no log", "")):
+    def test_a_binary_or_play_that_reports_no_delivery_kind_is_not_engaged(self) -> None:
+        for name, log in (("pre-r1 line", self.log(self.wake(None))), ("no line", self.log()), ("no log", ""),
+                          # r1 adversary pass 1 A3, verbatim shape: another Play's post never stands in for the measured Play's line
+                          ("measured line lacks the field, an earlier Play has it", self.log(self.wake(None), before=self.play(1, self.wake("post")))),
+                          ("measured Play has no line, an earlier Play has it", self.log(before=self.play(1, self.wake("post")))),
+                          ("the line is not after the measured pace_summary", "\n".join(["playback_smoke.measured_session id=3", self.wake("post"),
+                                                                                        *self.play(3)]) + "\n")):
             with self.subTest(case=name):
                 v = self.verdict(self.POST, log)
                 self.assertEqual((v["verdict"], v["blocks"]), ("NOT_HONOURED", True), v)
@@ -15253,36 +15272,48 @@ class DueWakeDeliveryEvidenceTests(unittest.TestCase):
 
     def test_any_other_report_blocks_never_passes(self) -> None:
         for name, log in (("sent", self.log(self.wake("send"))),
-                          ("notifier fallback", self.log(self.wake("notifier"))),
-                          ("wake off", self.log(self.wake("none"))),
+                          ("notifier", self.log(self.wake("notifier", "notifier"))),
+                          ("wake off", self.log(self.wake("none", "none"))),
+                          ("a fallback Play", self.log(self.wake("mixed", "native-msg+qtimer"))),
                           ("not a kind", self.log(self.wake("Post"))),
                           ("empty", self.log(self.wake(""))),
                           ("two fields", self.log(self.wake("post") + " delivery_kind=post")),
-                          ("two Plays disagree", self.log(self.wake("post"), self.wake("send"))),
-                          ("one Play unreadable", self.log(self.wake("post"), self.wake("p0st")))):
+                          # r1 adversary pass 1 A2, verbatim shape: post claimed on a Play whose arms went by a QTimer
+                          ("post on a qtimer Play", self.log(self.wake("post", "qtimer"))),
+                          ("post on a mixed Play", self.log(self.wake("post", "native-msg+qtimer"))),
+                          ("post with no delivery= field", self.log(self.wake("post").replace(" delivery=native-msg", ""))),
+                          ("two measured pace_summaries", "\n".join(["playback_smoke.measured_session id=3", *self.play(3, self.wake("post")),
+                                                                     *self.play(3, self.wake("post"))]) + "\n")):
             with self.subTest(case=name):
                 v = self.verdict(self.POST, log)
                 self.assertEqual((v["verdict"], v["blocks"]), ("NOT_HONOURED", True), v)
 
     def test_a_field_outside_a_playback_due_wake_line_is_not_read(self) -> None:
-        v = self.verdict(self.POST, self.log("playback_smoke.start session=3 delivery_kind=post", self.wake(None)))
+        v = self.verdict(self.POST, self.log(self.wake(None), before=["playback_smoke.start session=3 delivery_kind=post"]))
         self.assertEqual((v["verdict"], v["blocks"]), ("NOT_HONOURED", True), v)
         self.assertIn("ROUTE_NOT_ENGAGED", v["reason"])
 
-    def test_a_leg_that_does_not_ask_is_the_sent_arm(self) -> None:
+    def test_a_leg_that_does_not_ask_blocks_only_on_a_kind_the_variable_selects(self) -> None:
         for spec in ({}, {"generatorArgs": {"unpaced": True}}, {"generatorArgs": {"dueWakeDeliveryPost": False}}, {"generatorArgs": {"dueWakeDeliveryPost": "true"}}):
-            for name, log in (("control binary, no delivery_kind", self.log(self.wake(None))), ("sent", self.log(self.wake("send"))), ("no log", "")):
+            for name, log in (("control binary, no delivery_kind", self.log(self.wake(None))), ("sent", self.log(self.wake("send"))), ("no log", ""),
+                              # r1 adversary pass 1 A1, verbatim shape: an unpaced leg has no wake at all
+                              ("no wake (unpaced)", self.log("playback_due_wake armed=0 fired=0 advanced=0 rearmed=0 busy_deferred=0 hires=0 disabled=0"
+                                                             " delivery=none unpresented_deferred=0 delivery_kind=none")),
+                              ("qtimer fallback", self.log(self.wake("qtimer", "qtimer"))),
+                              ("mixed fallback", self.log(self.wake("mixed", "native-msg+qtimer"))),
+                              ("an earlier Play posted (not the measured one)", self.log(self.wake("send"), before=self.play(2, self.wake("post"))))):
                 with self.subTest(spec=spec, case=name):
                     v = self.verdict(spec, log)
                     self.assertEqual((v["requested"], v["verdict"], v["blocks"]), (False, "NOT_REQUESTED", False), v)
-            for name, kind in (("inherited post", "post"), ("notifier fallback", "notifier"), ("wake off", "none")):
+            for name, kind, mech in (("inherited post", "post", "native-msg"), ("inherited notifier", "notifier", "notifier")):
                 with self.subTest(spec=spec, case=name):
-                    v = self.verdict(spec, self.log(self.wake(kind)))
+                    v = self.verdict(spec, self.log(self.wake(kind, mech)))
                     self.assertEqual((v["requested"], v["verdict"], v["blocks"]), (False, "NOT_HONOURED", True), v)
                     self.assertIn("DUE_WAKE_DELIVERY_INHERITED", v["reason"])
-            with self.subTest(spec=spec, case="unreadable"):
-                v = self.verdict(spec, self.log(self.wake("send"), self.wake("post")))
-                self.assertEqual((v["verdict"], v["blocks"]), ("NOT_HONOURED", True), v)
+            for name, log in (("unreadable", self.log(self.wake("p0st"))), ("send on a qtimer Play", self.log(self.wake("send", "qtimer")))):
+                with self.subTest(spec=spec, case=name):
+                    v = self.verdict(spec, log)
+                    self.assertEqual((v["verdict"], v["blocks"]), ("NOT_HONOURED", True), v)
 
 
 class PrepConflatedMoveLegSpecTests(unittest.TestCase):

@@ -2032,6 +2032,14 @@ TEST(PlaybackDueWakeSend, C_AWakeInsideAPresentOrAnAdvanceIsDeferredCountedAndRe
     // measured first, then deferred before the outcome (no pending-advance flag is touched) and before any advance
     ASSERT_TRUE( classify > 0 && guard > classify && counted > guard && pending > guard && returned > pending );
     ASSERT_TRUE( outcome > returned && advance > outcome );
+    // r1 adversary pass 1 A4: a deferred delivery is still measured in full -- an unsplit one is counted post_unsplit BEFORE
+    // the deferral returns, and that count stays the else-branch of the split (never bound to the deferral's if)
+    const int unsplitCounted = onWake.indexOf( QStringLiteral( "++m_playbackDueWakePostUnsplit;" ) );
+    ASSERT_TRUE( unsplitCounted > classify && unsplitCounted < guard );
+    ASSERT_EQ( 1, onWake.count( QStringLiteral( "            break;\n        }\n    }\n"
+                                                "    // r5 adversary pass 9 A1: postMs is PostMessageW's return time; a native delivery taken before the wait thread published\n"
+                                                "    // it is in neither split set (post_unsplit), never split at the first stamp\n"
+                                                "    else if( m_playbackDueWake && m_playbackDueWake->lastDeliveryUnsplit() )\n" ) ) );
     // the scopes: a present (both entry points) and every advance
     ASSERT_EQ( 1, source.count( QStringLiteral(
         "    const GuiOtherBusyScope otherBusySpan( this, gui_present_gap::OtherBusySpan::DrawFrameReady );\n"
@@ -2127,6 +2135,41 @@ TEST(PlaybackDueWakeSend, TheRunnerSleepIsTheSentWaitWithTheMsleepKeptForEveryOt
     ASSERT_EQ( 1, source.count( QStringLiteral( "\" runner_sleep_woken=%1\"" ) ) );
     const QString wakeSource = dueWakeRepoSource( QStringLiteral( "platform/qt/PlaybackDueWake.cpp" ) );
     ASSERT_EQ( 1, wakeSource.count( QStringLiteral(
-        "MsgWaitForMultipleObjectsEx( 0, nullptr, static_cast<DWORD>( ms ), QS_SENDMESSAGE, MWMO_INPUTAVAILABLE );" ) ) );
+        "MsgWaitForMultipleObjectsEx( 0, nullptr, waitMs, QS_SENDMESSAGE, MWMO_INPUTAVAILABLE );" ) ) );
+    // r1 adversary pass 1 A5: never INFINITE, whatever the unsigned long
+    ASSERT_EQ( 1, wakeSource.count( QStringLiteral(
+        "const DWORD waitMs = ms >= static_cast<unsigned long>( INFINITE ) ? INFINITE - 1 : static_cast<DWORD>( ms );" ) ) );
     ASSERT_EQ( 1, wakeSource.count( QStringLiteral( "PeekMessageW( &msg, nullptr, 0, 0, PM_NOREMOVE | PM_QS_SENDMESSAGE );" ) ) );
+}
+
+TEST(PlaybackDueWakeSend, ThePlaysDeliveryKindNamesSendOrPostOnlyWhenEveryArmWentNative)
+{
+    // r1 adversary pass 1 A2: an arm whose SetWaitableTimer failed went by a QTimer; the line's delivery_kind must not still
+    // claim the constructed send / post (the venue gate reads it as the arm's proof)
+    const auto kind = []( const char *constructed, const char *playDelivery ) {
+        return playbackDueWakePlayDeliveryKind( QString::fromLatin1( constructed ), QString::fromLatin1( playDelivery ) ).toStdString();
+    };
+    ASSERT_EQ( std::string( "send" ), kind( "send", "native-msg" ) );
+    ASSERT_EQ( std::string( "post" ), kind( "post", "native-msg" ) );
+    ASSERT_EQ( std::string( "mixed" ), kind( "post", "native-msg+qtimer" ) );
+    ASSERT_EQ( std::string( "mixed" ), kind( "send", "qtimer+native-msg" ) );
+    ASSERT_EQ( std::string( "qtimer" ), kind( "post", "qtimer" ) );
+    ASSERT_EQ( std::string( "notifier" ), kind( "notifier", "notifier" ) );
+    ASSERT_EQ( std::string( "none" ), kind( "send", "none" ) );
+    ASSERT_EQ( std::string( "none" ), kind( "none", "" ) );
+    // the summary line routes the wake's constructed kind through it, with the Play's own delivery= mechanisms
+    const QString source = dueWakeRepoSource( QStringLiteral( "platform/qt/MainWindow.cpp" ) );
+    ASSERT_EQ( 1, source.count( QStringLiteral( ".arg( playbackDueWakePlayDeliveryKind(\n" ) ) );
+    ASSERT_EQ( 1, source.count( QStringLiteral( "                        m_playbackDueWakeDelivery ) )" ) ) );
+#ifdef Q_OS_WIN
+    // the live shape: a wake whose timer cannot be armed delivers by a QTimer, and its arm says so
+    int fired = 0;
+    PlaybackDueWake wake( nullptr, [&fired]() { ++fired; }, PlaybackDueWakeDeliveryMode::Post );
+    wake.setWaitableTimerFailsForTest( true );
+    wake.arm( 1.0 );
+    ASSERT_TRUE( wake.lastArmDelivery() == PlaybackDueWake::Delivery::QtTimer );
+    ASSERT_EQ( std::string( "post" ), std::string( wake.deliveryKindName() ) );   // construction-time: why the Play's kind is derived
+    ASSERT_EQ( std::string( "qtimer" ), kind( wake.deliveryKindName(), PlaybackDueWake::deliveryName( wake.lastArmDelivery() ) ) );
+    wake.cancel();
+#endif
 }

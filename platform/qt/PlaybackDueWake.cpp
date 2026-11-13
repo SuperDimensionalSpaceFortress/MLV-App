@@ -757,7 +757,9 @@ PlaybackDueWake::RunnerSleep PlaybackDueWake::sleepForSmokeRunner( unsigned long
     noteRunnerSleep( true );
     // QS_SENDMESSAGE only: the sent wake ends the sleep; posted messages, timers and input leave the runner's cadence as it
     // was. MWMO_INPUTAVAILABLE: a sent message already pending at the call returns at once (never a missed wake)
-    const DWORD result = MsgWaitForMultipleObjectsEx( 0, nullptr, static_cast<DWORD>( ms ), QS_SENDMESSAGE, MWMO_INPUTAVAILABLE );
+    // r1 adversary pass 1 A5: always a finite wait (INFINITE is 0xFFFFFFFF; a larger unsigned long would truncate)
+    const DWORD waitMs = ms >= static_cast<unsigned long>( INFINITE ) ? INFINITE - 1 : static_cast<DWORD>( ms );
+    const DWORD result = MsgWaitForMultipleObjectsEx( 0, nullptr, waitMs, QS_SENDMESSAGE, MWMO_INPUTAVAILABLE );
     noteRunnerSleep( false );
     if( result != WAIT_OBJECT_0 ) return RunnerSleep::Slept;   // the timeout (or a failed wait: the caller's loop goes on)
     ++d->runnerSleepsWokenBySent;

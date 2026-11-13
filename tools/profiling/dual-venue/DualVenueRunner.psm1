@@ -1920,12 +1920,13 @@ function Get-DvDueWakeDeliveryEvidence {
     .SYNOPSIS
     HFR-NATIVE-M16-1457-FULLSCREEN-S1S2-PRESENT-GAP-1 r1: did a leg run with the due-wake delivery its arm names? A leg that asks for the posted wake
     (generatorArgs.dueWakeDeliveryPost = true, which sets MLVAPP_PLAYBACK_DUE_WAKE_DELIVERY=post) must report delivery_kind=post; any other leg is the head
-    arm and must report delivery_kind=send whenever it reports one. Read ONLY from the app's own `playback_due_wake armed=<n> ...` record bodies (the
-    delivery_kind field r1 appends; one line per Play), never from the start line, the spec or the launcher's env block. FAIL CLOSED: `blocks` is true when
-    the leg asked and no playback_due_wake line carries a delivery_kind (a binary before r1 emits none), a field is unreadable, two lines disagree, or the
-    value is not post. A leg that does not ask blocks when a readable delivery_kind is anything but send (DUE_WAKE_DELIVERY_INHERITED: the variable came
-    from the launcher, or the wake fell back) or the field is unreadable; with no delivery_kind at all (a control binary before r1) it is unchanged. Pure and
-    shared: the runner gates on it and Test-DvReceiptValid re-derives it from the hashed run log.
+    arm and must not report a kind the variable selects. Read ONLY from the MEASURED session's own `playback_due_wake armed=<n> ...` record (the one after
+    its playback_smoke.pace_summary; the delivery_kind field r1 appends, cross-checked with the same line's delivery= mechanisms), never from another Play's
+    line, the start line, the spec or the launcher's env block. FAIL CLOSED: `blocks` is true when the leg asked and the measured line carries no
+    delivery_kind (a binary before r1 emits none, or the measured Play printed no line), the field is unreadable or contradicts delivery=, or the value is not
+    post. A leg that does not ask blocks when the measured line reports post or notifier (DUE_WAKE_DELIVERY_INHERITED: the variable came from the launcher)
+    or is unreadable; send, none (no wake: an unpaced leg), qtimer and mixed (a fallback), and no delivery_kind at all (a control binary before r1) leave it
+    unchanged. Pure and shared: the runner gates on it and Test-DvReceiptValid re-derives it from the hashed run log.
     #>
     param([Parameter(Mandatory)]$Spec, [AllowNull()][AllowEmptyString()][string]$LogText)
     $raw = Get-DvProp (Get-DvProp $Spec 'generatorArgs') 'dueWakeDeliveryPost'
@@ -1935,30 +1936,49 @@ function Get-DvDueWakeDeliveryEvidence {
     $reason = $null
     $mentions = 0
     $unreadableSeen = $false
-    $values = New-Object System.Collections.Generic.List[string]
+    # r1 adversary pass 1 A3: the MEASURED Play's own line only. The app prints playback_due_wake once per smoke session, directly after that session's
+    # playback_smoke.pace_summary (MainWindow.cpp, the smoke summary path), so the measured line is the first playback_due_wake record after the measured
+    # session's pace_summary and before any other pace_summary; another Play's line never stands in for it, and a measured Play with no line has none.
+    $candidates = New-Object System.Collections.Generic.List[string]
+    $paces = 0
     if (-not [string]::IsNullOrEmpty($LogText)) {
-        foreach ($l in (Get-DvLogRecordBodies -LogText $LogText)) {
-            if ($l -notmatch '(?:^|\s)playback_due_wake armed=') { continue }
-            $fields = [regex]::Matches($l, '(?:^|\s)delivery_kind=(?<k>\S*)')
-            if ($fields.Count -eq 0) { continue }
-            $mentions++
-            if ($fields.Count -ne 1 -or $fields[0].Groups['k'].Value -cnotmatch '^(send|post|notifier|qtimer|none)$') { $unreadableSeen = $true; continue }
-            $values.Add($fields[0].Groups['k'].Value)
+        $session = (Get-DvSmokeSummaryFields -LogText $LogText).session
+        if ($null -ne $session) {
+            $paceRx = '(?:^|\s)playback_smoke\.pace_summary session=' + [regex]::Escape([string]$session) + '(?:\s|$)'
+            $open = $false
+            foreach ($l in (Get-DvLogRecordBodies -LogText $LogText)) {
+                if ($l -match '(?:^|\s)playback_smoke\.pace_summary session=') { $open = ($l -match $paceRx); if ($open) { $paces++ }; continue }
+                if ($open -and $l -match '(?:^|\s)playback_due_wake armed=') { $candidates.Add($l); $open = $false }
+            }
         }
     }
-    $distinct = @($values | Select-Object -Unique)
-    if (-not $unreadableSeen -and $distinct.Count -eq 1) { $observed = [string]$distinct[0] }
-    $unreadable = 'the due-wake delivery is unreadable: a playback_due_wake line carries a delivery_kind that is not exactly one of send, post, notifier, qtimer, none (MainWindow::playbackDueWakeSummaryLine), or two lines disagree'
+    $withKind = @($candidates | Where-Object { $_ -match '(?:^|\s)delivery_kind=' })
+    if ($withKind.Count -gt 0) {
+        $mentions = $withKind.Count
+        if ($paces -ne 1 -or $candidates.Count -ne 1) { $unreadableSeen = $true }
+        else {
+            $l = $candidates[0]
+            $fields = [regex]::Matches($l, '(?:^|\s)delivery_kind=(?<k>\S*)')
+            $mech = [regex]::Matches($l, '(?:^|\s)delivery=(?<m>\S*)')
+            if ($fields.Count -ne 1 -or $fields[0].Groups['k'].Value -cnotmatch '^(send|post|notifier|qtimer|mixed|none)$') { $unreadableSeen = $true }
+            # r1 adversary pass 1 A2: send / post claims the native message for every arm of the Play; the line's own delivery= must say exactly that
+            elseif ($fields[0].Groups['k'].Value -cin @('send', 'post') -and ($mech.Count -ne 1 -or $mech[0].Groups['m'].Value -cne 'native-msg')) { $unreadableSeen = $true }
+            else { $observed = $fields[0].Groups['k'].Value }
+        }
+    }
+    $unreadable = 'the due-wake delivery is unreadable: the measured session''s playback_due_wake line (the one after its playback_smoke.pace_summary) carries a delivery_kind that is not exactly one of send, post, notifier, qtimer, mixed, none (MainWindow::playbackDueWakeSummaryLine), names send or post on a Play whose delivery= is not exactly native-msg, or the measured session has more than one such line'
     if ($requested) {
         $verdict = 'NOT_HONOURED'
-        if ($mentions -eq 0) { $reason = 'ROUTE_NOT_ENGAGED: no playback_due_wake line in the run log carries a delivery_kind, so the binary does not report how the wake was delivered' }
+        if ($mentions -eq 0) { $reason = 'ROUTE_NOT_ENGAGED: the measured session has no playback_due_wake line with a delivery_kind (after its playback_smoke.pace_summary), so the binary does not report how its wake was delivered' }
         elseif ($null -eq $observed) { $reason = $unreadable }
-        elseif ($observed -cne 'post') { $reason = "ROUTE_NOT_ENGAGED: the run's playback_due_wake says delivery_kind=$observed, not the post the leg names" }
+        elseif ($observed -cne 'post') { $reason = "ROUTE_NOT_ENGAGED: the measured session's playback_due_wake says delivery_kind=$observed, not the post the leg names" }
         else { $verdict = 'HONOURED' }
     }
     elseif ($mentions -gt 0) {
+        # r1 adversary pass 1 A1: only a kind the variable selects (post, notifier) is inherited; none (no wake: an unpaced leg), qtimer and mixed (a
+        # fallback) are what the head arm itself does, and send is the head arm
         if ($null -eq $observed) { $verdict = 'NOT_HONOURED'; $reason = $unreadable }
-        elseif ($observed -cne 'send') { $verdict = 'NOT_HONOURED'; $reason = "DUE_WAKE_DELIVERY_INHERITED: the leg does not ask for the posted wake but the app reports delivery_kind=$observed, so this run is not the head arm" }
+        elseif ($observed -cin @('post', 'notifier')) { $verdict = 'NOT_HONOURED'; $reason = "DUE_WAKE_DELIVERY_INHERITED: the leg does not ask for the posted wake but the app reports delivery_kind=$observed (MLVAPP_PLAYBACK_DUE_WAKE_DELIVERY came from the launcher), so this run is not the head arm" }
     }
     [ordered]@{ requested = $requested; observed = $observed; verdict = $verdict; reason = $reason; blocks = ($verdict -ceq 'NOT_HONOURED') }
 }

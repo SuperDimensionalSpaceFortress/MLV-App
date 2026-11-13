@@ -20773,19 +20773,19 @@ void MainWindow::onPlaybackDueWake( void )
             break;
         }
     }
+    // r5 adversary pass 9 A1: postMs is PostMessageW's return time; a native delivery taken before the wait thread published
+    // it is in neither split set (post_unsplit), never split at the first stamp
+    else if( m_playbackDueWake && m_playbackDueWake->lastDeliveryUnsplit() )
+        ++m_playbackDueWakePostUnsplit;
     // FULLSCREEN-S1S2-PRESENT-GAP-1: a sent wake dispatched inside a present or an advance (a nested PeekMessage) never
-    // advances there -- timerFrameEvent is never nested inside a present. Measured above, counted, and re-armed by the arm
-    // that follows (or by the outermost scope's end)
+    // advances there -- timerFrameEvent is never nested inside a present. Measured above (split or post_unsplit: r1 adversary
+    // pass 1 A4), counted, and re-armed by the arm that follows (or by the outermost scope's end)
     if( m_playbackDueWakeDeferDepth > 0 )
     {
         ++m_playbackDueWakeReentrantDeferred;
         m_playbackDueWakeDeferredSinceArm = true;
         return;
     }
-    // r5 adversary pass 9 A1: postMs is PostMessageW's return time; a native delivery taken before the wait thread published
-    // it is in neither split set (post_unsplit), never split at the first stamp
-    else if( m_playbackDueWake && m_playbackDueWake->lastDeliveryUnsplit() )
-        ++m_playbackDueWakePostUnsplit;
     // adversary r1 pass 2 A1: the wake honours m_frameStillDrawing exactly as the poll tick does and never recomputes it from the
     // render thread -- an idle renderer with a Ready frame whose notification is still queued would read as not busy, and the
     // advance would request the next frame over it (every-frame mode, CPU latest-ready acquisition: a skipped frame).
@@ -20975,7 +20975,10 @@ QString MainWindow::playbackDueWakeSummaryLine( void ) const
               .arg( playbackDueWakePercentileText( m_playbackDueWakeAwakeToReceiveMs, 0.50 ) )
               .arg( playbackDueWakePercentileText( m_playbackDueWakeAwakeToReceiveMs, 0.95 ) )
               .arg( m_playbackDueWakeReentrantDeferred )
-              .arg( m_playbackDueWake ? QString::fromLatin1( m_playbackDueWake->deliveryKindName() ) : QStringLiteral( "none" ) )
+              // r1 adversary pass 1 A2: send / post only when every arm of this Play went by the native message
+              .arg( playbackDueWakePlayDeliveryKind(
+                        m_playbackDueWake ? QString::fromLatin1( m_playbackDueWake->deliveryKindName() ) : QStringLiteral( "none" ),
+                        m_playbackDueWakeDelivery ) )
         + playbackDueWakeRangeFields( m_playbackDueWakePostToAwakeMs, "post_to_awake" )
         + playbackDueWakeRangeFields( m_playbackDueWakeAwakeToReceiveMs, "awake_to_receive" );
     return QStringLiteral( "playback_due_wake armed=%1 fired=%2 advanced=%3 rearmed=%4 busy_deferred=%5 "
