@@ -31,6 +31,7 @@ import ast
 import concurrent.futures
 import contextlib
 import hashlib
+import inspect
 import io
 import json
 import os
@@ -39,7 +40,10 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import textwrap
+import types
 import unittest
+import unittest.mock
 from pathlib import Path
 
 from tools.repo_hygiene.synthetic_mlv import FRAMES_30S_AT_23976, write_synthetic_mlv
@@ -11528,6 +11532,7 @@ class VisualCaptureSpecAndAppSourceTests(unittest.TestCase):
 # Get-Counter / Get-Process / Get-CimInstance / Invoke-CimMethod shadows, so identity is proved on exact values, not on whatever the test host is running.
 import base64 as _ident_base64
 import datetime as _ident_dt
+from fractions import Fraction as _IdentFraction
 import threading as _ident_threading
 import time as _ident_time
 
@@ -11613,28 +11618,171 @@ _IDENT_CIVIL_STEP_TOLERANCE_S = 0.5   # over a run, civil elapsed and monotonic 
 # MEASUREMENT UNCERTAINTY of the OS-exit estimate (pass-2 adversary A2): the two read pairs bound at most 2 * 25 ms, and a civil/monotonic disagreement under the tolerance is not seen, so a figure
 # is good to about this much. r5 (sol r4 A2): it is APPLIED to the verdict, see _ident_gap_verdict. A civil clock that steps one way and back inside ONE run (two opposite steps that cancel at the
 # endpoints) is not seen by the mapper at all; r5 (sol r4 A1) makes that harmless for a PASS (a civil estimate never passes a run) and a run it could have faked as a hold is a HOLD only when the
-# monotonic gap is over the limit too. r5 fix1 samples the pair during the run (_IdentClockSampler), which turns cancelling steps longer than the sample interval into a withheld estimate; OPEN
-# CIVIL-STEP-SUBINTERVAL (a step shorter than the interval, with the child's exit or creation inside it, can still fake a HOLD while the parent is also delayed): it needs a child-side MONOTONIC exit stamp.
+# monotonic gap is over the limit too. r5 fix1 samples the pair during the run (_IdentClockSampler), which turns cancelling steps longer than the sample interval into a withheld estimate. A step
+# SHORTER than the interval, with the child's exit or creation inside it, is seen by no pair at all (adversary A1 on fae72991): VENUE-PROBE-CHILD-SIDE-MONOTONIC-EXIT-STAMP-1 therefore takes the
+# civil estimate out of every verdict (it is a printed cross-check only) and decides an over verdict on the child's OWN QPC stamps (_ident_child_stamp_prelude).
 _IDENT_EXIT_ESTIMATE_UNCERTAINTY_S = 2 * _IDENT_CIVIL_STEP_TOLERANCE_S + 2 * _IDENT_PAIR_TIGHT_NS / 2e9
 # r5 fix2 (adversary A2 on fae72991): every pair may disagree with the launch pair by up to the tolerance in EITHER direction, so a FILETIME stamp placed through the read pair is good to TWICE the
 # tolerance (+ the pair read), not once. The child's wall estimate is a difference of two such stamps (exit - creation, one read pair, whose own error cancels), so it is good to twice that.
 _IDENT_WALL_ESTIMATE_UNCERTAINTY_S = 2 * _IDENT_EXIT_ESTIMATE_UNCERTAINTY_S
 
 
-def _ident_gap_verdict(mono_s: float, civil_s, limit_s: float, uncertainty_s: float | None = None) -> tuple:
-    """r5 (sol r4 A1-A3, HUB RULING): the ONE verdict for every time gap this class judges (marker -> process end, and the probe's whole wall). Returns (kind, figure_s, reason).
-    "pass": the MONOTONIC parent-side gap is under the limit; no civil clock is consulted. "over": the monotonic gap is over the limit AND the child-side civil estimate, widened by the documented
-    uncertainty in the direction that SHORTENS the gap, is still over it; the figure is the smaller of the two. "inconclusive": anything else (monotonic over but the civil estimate under or straddling
-    the limit, a civil step seen, or no estimate at all): a typed skip, never a pass and never an over verdict."""
-    u = _IDENT_EXIT_ESTIMATE_UNCERTAINTY_S if uncertainty_s is None else uncertainty_s
-    if mono_s < limit_s:
+def _ident_gap_verdict(mono_s: float, child_s, limit_s: float, civil_s=None, civil_u_s: float | None = None) -> tuple:
+    """r5 (HUB RULING) three-way verdict, VENUE-PROBE-CHILD-SIDE-MONOTONIC-EXIT-STAMP-1 evidence: the ONE verdict for every time gap this class judges (marker -> process end, and the probe's whole
+    wall). Returns (kind, figure_s, reason). Both bounds are MONOTONIC (QueryPerformanceCounter). `mono_s` is the parent-side figure, an UPPER bound: the parent read its clock after the child was
+    gone, so its own scheduling delay is in it. `child_s` is the child's own figure from its QPC stamps (_ident_child_stamp_prelude), a LOWER bound: the child was still running when it stamped.
+    "pass": the upper bound is under the limit. "over": the lower bound is at or over the limit, so the real gap is too; the figure is the lower bound. "inconclusive" (a typed skip, never a pass and
+    never an over verdict): anything else, including no child stamp. `civil_s` (the OS FILETIME estimate, _ident_exit_from_pairs, good to +/-`civil_u_s`) is a CROSS-CHECK printed in the reason
+    only: a civil step shorter than the sampler's interval is seen by no pair (adversary A1 on fae72991), so the civil clock never decides a verdict."""
+    # r5 (sol r4 on a7ddf486 B1): every comparison below is on the EXACT figure (`_ident_exact_s`), never on a float of it: a wall of 60 - 10^-18 s rounds to 60.0, which is AT the limit, and turned a
+    # pass into a typed skip. The floats are only what is returned and printed.
+    mono_x, child_x = _ident_exact_s(mono_s), None if child_s is None else _ident_exact_s(child_s)
+    mono_s, child_s = float(mono_s), None if child_s is None else float(child_s)
+    if child_x is not None and child_x > mono_x:   # sol r1 on 9265be72 B1: the child's run is INSIDE the parent's wall, so a lower bound above the upper bound is no measurement of either
+        raise AssertionError(f"typed failure, not a verdict: the child's own monotonic figure {child_s:.6f} s (a lower bound) exceeds the parent's {mono_s:.6f} s (an upper bound), so the two are not the same monotonic clock")
+    limit_x = _ident_exact_s(limit_s)   # adversary A2 on e584171e: Fraction(0.1) is the float's BINARY value; the limit is the decimal it prints as, like every other figure here
+    if mono_x < limit_x:
         return "pass", mono_s, ""
-    if civil_s is None:
-        return "inconclusive", mono_s, f"the monotonic gap {mono_s:.2f} s is over the {limit_s:.0f} s limit and no child-side civil estimate could be formed"
-    if civil_s - u >= limit_s:
-        return "over", min(mono_s, civil_s), ""
-    return "inconclusive", mono_s, (f"the monotonic gap {mono_s:.2f} s is over the {limit_s:.0f} s limit but the child-side civil estimate {civil_s:.2f} s "
-                                    f"(good to +/-{u:.2f} s) does not clear it")
+    if child_x is not None and child_x >= limit_x:
+        return "over", child_s, ""
+    why = f"the monotonic gap {mono_s:.2f} s is over the {limit_s:.0f} s limit but " + (
+        f"the child's own monotonic stamp {child_s:.2f} s (a lower bound) does not reach it" if child_s is not None else "the child left no monotonic stamp to bound it from below")
+    if civil_s is not None:
+        u = _IDENT_EXIT_ESTIMATE_UNCERTAINTY_S if civil_u_s is None else civil_u_s
+        why += f" (civil cross-check {civil_s:.2f} s, good to +/-{u:.2f} s, never used for a verdict)"
+    return "inconclusive", mono_s, why
+
+
+_IDENT_CHILD_QPC_START = "child-qpc-start.txt"
+_IDENT_CHILD_QPC_EXIT = "child-qpc-exit.txt"
+
+
+def _ident_child_stamp_prelude(start_path: Path, exit_path: Path) -> str:
+    """VENUE-PROBE-CHILD-SIDE-MONOTONIC-EXIT-STAMP-1: TEST-COPY-ONLY PowerShell, written at the top of the job file the test runs (never into Wait-VenueQuiet.ps1, so no measurement value, sample
+    window or verdict of the gate changes). The CHILD stamps its own QueryPerformanceCounter ([Diagnostics.Stopwatch]::GetTimestamp(), the axis of the probe's end_qpc and of the parent's
+    perf_counter_ns) twice: at its first statement into `start_path` (`<ticks> <Frequency>`), and from an AppDomain.ProcessExit handler into `exit_path` (`<ticks>`). ProcessExit is raised by
+    [Environment]::Exit and by a normal end alike, after the script's last statement (and, on a normal end, after the foreground threads), so the exit stamp is a LOWER bound on the real exit
+    that no civil clock and no parent scheduling delay can move. The handler is a compiled expression tree, not a scriptblock: it needs no runspace on the thread that raises ProcessExit."""
+    q = lambda p: "'" + str(p).replace("'", "''") + "'"
+    return "\n".join((
+        f"[IO.File]::WriteAllText({q(start_path)}, ([string][Diagnostics.Stopwatch]::GetTimestamp()) + ' ' + [Diagnostics.Stopwatch]::Frequency)",
+        "$__QpcX = [System.Linq.Expressions.Expression]",
+        "$__QpcNow = $__QpcX::Call($__QpcX::Call([Diagnostics.Stopwatch].GetMethod('GetTimestamp', [Type[]]@())), [long].GetMethod('ToString', [Type[]]@()))",
+        f"$__QpcWrite = $__QpcX::Call([IO.File].GetMethod('WriteAllText', [Type[]]@([string], [string])), $__QpcX::Constant({q(exit_path)}), $__QpcNow)",
+        "$__QpcArgs = [System.Linq.Expressions.ParameterExpression[]]@($__QpcX::Parameter([object], 's'), $__QpcX::Parameter([EventArgs], 'e'))",
+        "[AppDomain]::CurrentDomain.add_ProcessExit([EventHandler]$__QpcX::Lambda([EventHandler], $__QpcWrite, $__QpcArgs).Compile())",
+        "",
+    ))
+
+
+class _IdentChildStamps(tuple):
+    """sol r2 on 46c71e12 B1: `(start_ns, exit_ns)` are one-sided INTEGER bounds (the verdict figures), and `.exact` is the same two stamps as exact rationals of a ns, for the EVENT-ORDER checks:
+    rounding the start up and the exit down can turn a reversal of less than 1 ns (a 2 GHz QPC has 0.5 ns ticks) into an equality, and an order check on the rounded figures accepts it. It is still
+    a tuple of two ints, so every figure and equality is unchanged; a plain tuple set by a test has no `.exact`, and its integers are taken as exact (_ident_exact_stamps)."""
+    exact: tuple
+    hz: int | None   # the child's own QueryPerformanceFrequency (the start stamp's second field); r4 (sol r3 B2): the end marker must carry the same one
+
+    def __new__(cls, bounds: tuple, exact: tuple, hz: int | None = None):
+        self = super().__new__(cls, bounds)
+        self.exact = exact
+        self.hz = hz
+        return self
+
+
+class _IdentWallS(float):
+    """r4 (sol r3 on 5092ebcd B1): the parent's wall as a float of seconds that also carries the EXACT integer ns count it was computed from. A float is a rounding, so its binary value
+    (`Fraction(x)`) is not the wall: a consistent equality fell a hair under it (a typed failure on a run that was a measurement), and a 1e-10 ns excess fell a hair inside it (hidden)."""
+    exact_ns: int
+
+    @classmethod
+    def of_ns(cls, ns: int) -> "_IdentWallS":
+        self = cls(ns / 1e9)
+        self.exact_ns = ns
+        return self
+
+
+def _ident_wall_ns(wall_s) -> "_IdentFraction":
+    """The parent's wall, in exact ns. An exact figure (a `_IdentWallS`, an int or a Fraction of seconds) is taken as it is. A plain float is read as the decimal it prints as (`repr`, the shortest
+    string that gives the same float), which for a count of ns divided by 1e9 under 15 significant digits is that count itself, never its binary expansion."""
+    exact_ns = getattr(wall_s, "exact_ns", None)
+    if exact_ns is not None:
+        return _IdentFraction(exact_ns)
+    if isinstance(wall_s, (int, _IdentFraction)):
+        return _IdentFraction(wall_s) * 1_000_000_000
+    return _IdentFraction(repr(float(wall_s))) * 1_000_000_000
+
+
+def _ident_exact_s(figure_s) -> "_IdentFraction":
+    """r5 (sol r4 B1): a figure of seconds as the exact rational it stands for (see _ident_wall_ns: a `_IdentWallS`, an int or a Fraction as it is, a plain float as the decimal it prints as)."""
+    return _ident_wall_ns(figure_s) / 1_000_000_000
+
+
+def _ident_exact_stamps(child: tuple) -> tuple:
+    return getattr(child, "exact", None) or (_IdentFraction(child[0]), _IdentFraction(child[1]))
+
+
+def _ident_read_start_once(start_path: Path) -> tuple:
+    """sol r5 B1: the child's START stamp file is read ONCE per run, `(text, None)` or `(None, the OSError / UnicodeDecodeError)`. Both consumers (the pair reader and the lone-start reader) parse this
+    one read: a second read of the file could fail after the first had succeeded (PermissionError, disappearance, a decoding error) and drop start evidence already observed."""
+    try:
+        return start_path.read_text(encoding="ascii"), None
+    except (OSError, UnicodeDecodeError) as exc:
+        return None, exc
+
+
+def _ident_read_child_stamps(start_path: Path, exit_path: Path) -> tuple:
+    return _ident_child_stamps_of(_ident_read_start_once(start_path), exit_path)
+
+
+def _ident_read_child_evidence(start_path: Path, exit_path: Path) -> tuple:
+    """sol r5 B1: `(stamps, note, lone_start)` from ONE read of the start file: the pair (or None and its typed reason) and the start stamp on its own, whatever became of the exit stamp."""
+    start_read = _ident_read_start_once(start_path)
+    stamps, note = _ident_child_stamps_of(start_read, exit_path)
+    return stamps, note, _ident_start_stamp_of(start_read)
+
+
+def _ident_child_stamps_of(start_read: tuple, exit_path: Path) -> tuple:
+    """((start_ns, exit_ns) on the perf_counter_ns axis, "ok"), or (None, typed reason): no stamp, or a stamp of any other shape, is the ABSENCE of child-side evidence, never a number.
+    The two figures are ONE-SIDED integer bounds (sol r1 on 9265be72 B2): the exit rounds DOWN and the start rounds UP, so `exit_ns - start_ns` is never more than the real run, and the gap to a
+    marker (`exit_ns - _ident_marker_ns(.., up=True)`) never more than the real gap. Flooring both could lift a 14.9999999995 s gap to the 15 s limit and turn it into an over verdict."""
+    start_text, start_exc = start_read
+    if start_text is None:
+        return None, f"no child start stamp ({type(start_exc).__name__})"
+    start = start_text.split()
+    try:
+        exit_raw = exit_path.read_text(encoding="ascii").strip()
+    except (OSError, UnicodeDecodeError) as exc:
+        return None, f"no child exit stamp could be read ({type(exc).__name__}): the evidence is unavailable, which says nothing about whether the child's ProcessExit handler ran"   # sol r6 B2: a read failure is not proof the writer never ran (a lock, a deletion or a replacement after a successful write)
+    if len(start) != 2 or not all(re.fullmatch(r"\d{1,18}", s) for s in (*start, exit_raw)) or int(start[1]) == 0:
+        return None, f"malformed child stamp (start={' '.join(start)[:60]!r}, exit={exit_raw[:40]!r})"
+    start_ticks, exit_ticks, hz = int(start[0]), int(exit_raw), int(start[1])
+    if exit_ticks < start_ticks:   # adversary A1 on 636642d6: compared in TICKS, before the ns floor can make two different stamps equal
+        return None, f"malformed child stamp: its exit stamp is {start_ticks - exit_ticks} ticks ({(start_ticks - exit_ticks) / hz:.3f} s) BEFORE its start stamp"
+    return _IdentChildStamps((-(-start_ticks * 1_000_000_000 // hz), exit_ticks * 1_000_000_000 // hz), (_IdentFraction(start_ticks * 1_000_000_000, hz), _IdentFraction(exit_ticks * 1_000_000_000, hz)), hz), "ok"
+
+
+def _ident_start_stamp(start_path: Path) -> tuple | None:
+    return _ident_start_stamp_of(_ident_read_start_once(start_path))
+
+
+def _ident_start_stamp_of(start_read: tuple) -> tuple | None:
+    """adversary A1 on e584171e and again on 4538d581: the child's START stamp read on its own, `(QueryPerformanceFrequency, exact start ns)`. `_ident_read_child_stamps` returns no stamps at all when
+    the EXIT stamp is missing, empty, malformed or reversed, and with them went everything the start stamp alone proves: a marker on another clock (the frequency check) and a first statement AFTER
+    the child's own end marker or after the parent saw the process end (the order checks). One child has one frequency and one first statement whatever became of its exit stamp. None when the start
+    stamp is absent or of any other shape (nothing to compare the marker with)."""
+    start_text, _exc = start_read
+    if start_text is None:
+        return None
+    start = start_text.split()
+    if len(start) != 2 or not all(re.fullmatch(r"\d{1,18}", x) for x in start) or int(start[1]) == 0:
+        return None
+    return int(start[1]), _IdentFraction(int(start[0]) * 1_000_000_000, int(start[1]))
+
+
+def _ident_marker_ns(end_qpc: int, qpc_hz: int, up: bool = False) -> int:
+    """The probe's end marker on the perf_counter_ns axis, as an integer bound: rounded DOWN by default (right for an UPPER bound on a gap measured TO it) and UP with `up=True` (right for the
+    LOWER bound on a gap measured FROM it, so the lower bound never exceeds the real gap; sol r1 on 9265be72 B2)."""
+    return -(-end_qpc * 1_000_000_000 // qpc_hz) if up else end_qpc * 1_000_000_000 // qpc_hz
 
 
 def _ident_win32_clock():
@@ -11940,14 +12088,20 @@ class IdentityProbeMixin:
             self.assertEqual(body.count(exit_anchor), 1)
             body = body.replace(exit_anchor, f"Start-Sleep -Seconds {exit_hold_s}\n" + exit_anchor)
         job = self.tmp / "identity-probe-job.ps1"
+        # VENUE-PROBE-CHILD-SIDE-MONOTONIC-EXIT-STAMP-1: with the timing seam on, the child stamps its own QPC (first statement, ProcessExit); stale stamps from an earlier run never count
+        qpc_start, qpc_exit = self.tmp / _IDENT_CHILD_QPC_START, self.tmp / _IDENT_CHILD_QPC_EXIT
+        for f in (qpc_start, qpc_exit):
+            f.unlink(missing_ok=True)
+        stamp = _ident_child_stamp_prelude(qpc_start, qpc_exit) if timing else ""
         # r3 (fable key3): a START-UP stall is `startup_s` seconds spent BEFORE the probe's first statement (pwsh start-up, script parse, the test prelude on a starved host)
-        job.write_text((f"Start-Sleep -Seconds {startup_s}\n" if startup_s else "") + prelude + body, encoding="utf-8")
+        job.write_text((f"Start-Sleep -Seconds {startup_s}\n" if startup_s else "") + stamp + prelude + body, encoding="utf-8")
         wall_started_ns = _ident_time.perf_counter_ns()   # r3: perf_counter is QueryPerformanceCounter on Windows, the clock Stopwatch.GetTimestamp() in the probe reads
         proc = _ident_run_reaped([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-File", str(job)], timeout=240, env=env)
         self.last_wall_end_ns = _ident_time.perf_counter_ns()
-        self.last_wall_s = (self.last_wall_end_ns - wall_started_ns) / 1e9
+        self.last_wall_s = _IdentWallS.of_ns(self.last_wall_end_ns - wall_started_ns)   # r4 (sol r3 B1): a float that keeps its exact ns count
         self.last_child_exit_ns, self.last_child_exit_note = proc.child_exit_ns, proc.child_exit_note   # r4: the END of the child, which the parent's own end read is not
         self.last_child_start_ns = proc.child_start_ns   # r5: its START, which the parent's own start (wall_started_ns) is not: the parent may be delayed before it even launches the child
+        self.last_child_qpc, self.last_child_qpc_note, self.last_child_start = (_ident_read_child_evidence(qpc_start, qpc_exit) if timing else (None, "no child stamp: the timing seam is off", None))   # adversary A1 on e584171e / 4538d581: the lone start is kept even when the exit stamp is unreadable; sol r5 B1: both from ONE read of the start file
         self.last_stderr = proc.stderr
         self.last_timing = _parse_probe_timing(proc.stderr)
         lines = [ln for ln in proc.stdout.splitlines() if ln.startswith("VENUE_QUIET=")]
@@ -12644,10 +12798,9 @@ class VenueProbeIdentityCallDeadlineTests(IdentityProbeMixin, unittest.TestCase)
         return self.run_identity_probe(self.procs, self.cim, CHAIN_OWNERS, body=body)
 
     def slow(self, which: str) -> tuple:
-        import time
-        started = time.monotonic()
+        started_ns = _ident_time.perf_counter_ns()   # adversary A3 on e584171e: time.monotonic() floats subtract to 60.0 for a true 59.999999999 s; the exact ns count is kept (the same QPC as the harness's own wall)
         p = self.run_identity_probe(self.procs, self.cim, CHAIN_OWNERS, gpu=[(16892, 0, 40.0)], delays={which: self.DELAY_MS}, call_ms=self.CALL_MS, timing=True)
-        return p, time.monotonic() - started
+        return p, _IdentWallS.of_ns(_ident_time.perf_counter_ns() - started_ns)
 
     def assert_measurement_unchanged(self, p: dict, elapsed: float) -> None:
         # the timing of the SLOW run is judged first: reference() runs another probe, which replaces last_timing / last_wall_s. r5: the verdicts are SETTLED last, so an inconclusive timing
@@ -12659,12 +12812,19 @@ class VenueProbeIdentityCallDeadlineTests(IdentityProbeMixin, unittest.TestCase)
         self.settle_timing(verdicts)
 
     def timing_verdicts(self, wall_s: float, require_abandoned: bool = True) -> list:
-        """r5: [(what, kind, figure_s, reason)] for the two gaps of one run. The WALL gap is the parent's elapsed time; its child-side estimate is the child's OS exit time minus the CHILD's OS
-        creation time, so a parent that was scheduled late after a prompt child exit (sol r4 A3) or before it launched the child (adversary A2) is not a wait for the slow call. The EXIT-HOLD gap is
+        """r5: [(what, kind, figure_s, reason)] for the two gaps of one run. The WALL gap is the parent's elapsed time (an upper bound); its lower bound is the child's own QPC run, first statement ->
+        ProcessExit (VENUE-PROBE-CHILD-SIDE-MONOTONIC-EXIT-STAMP-1), so a parent that was scheduled late after a prompt child exit (sol r4 A3) or before it launched the child (adversary A2) is not
+        a wait for the slow call, and neither is a civil step at the child's creation (adversary A1 on fae72991: the OS exit - creation lifetime is a cross-check only). The EXIT-HOLD gap is
         marker -> process end (see exit_hold_verdict)."""
         started, exit_ns = getattr(self, "last_child_start_ns", None), getattr(self, "last_child_exit_ns", None)
         civil_run_s = None if (started is None or exit_ns is None) else (exit_ns - started) / 1e9
-        out = [("wall", *_ident_gap_verdict(wall_s, civil_run_s, self.WALL_LIMIT_S, _IDENT_WALL_ESTIMATE_UNCERTAINTY_S))]
+        # VENUE-PROBE-CHILD-SIDE-MONOTONIC-EXIT-STAMP-1: the wall's LOWER bound is the child's own QPC run (first statement -> ProcessExit); the civil lifetime above is a cross-check only
+        child = getattr(self, "last_child_qpc", None)
+        child_run_s = None if child is None else _IdentWallS.of_ns(child[1] - child[0])   # sol r6 B1: the exact ns count rides with the float, so the verdict never compares binary roundings of two accepted integer bounds
+        if child is not None:   # adversary A1 on 99868f47: the run is INSIDE the parent's wall, judged on the EXACT stamps (the integer bounds above can round a 0.5 ns excess into an equality)
+            start_exact, exit_exact = _ident_exact_stamps(child)
+            self.assertLessEqual(exit_exact - start_exact, _ident_wall_ns(wall_s), f"typed failure, not a verdict: the child's own monotonic run exceeds the parent's wall {wall_s!r} s that contains it, so the two are not the same monotonic clock")
+        out =[("wall", *_ident_gap_verdict(wall_s, child_run_s, self.WALL_LIMIT_S, civil_run_s, _IDENT_WALL_ESTIMATE_UNCERTAINTY_S))]
         hold = self.exit_hold_verdict()
         if require_abandoned:
             self.assertGreaterEqual(self.last_timing["abandoned"], 1, "the slow call was not abandoned, so this case proves nothing")
@@ -12703,21 +12863,42 @@ class VenueProbeIdentityCallDeadlineTests(IdentityProbeMixin, unittest.TestCase)
     def exit_hold_verdict(self) -> tuple:
         """r3/r4/r5: (kind, figure_s, reason) for the seconds from the probe's end marker to the CHILD's exit, on the OS monotonic QueryPerformanceCounter axis (the marker is the probe's
         Stopwatch.GetTimestamp() ticks). The parent's end read (also QPC) is an UPPER BOUND on it: the child cannot have exited after the parent saw it gone. A bound under the limit PASSES with no
-        civil clock at all. Past the limit the bound may be the parent's own scheduling delay, so the child's OS-recorded exit time (see _ident_child_exit_ns) is the civil estimate that
-        _ident_gap_verdict widens by its uncertainty: over the limit even then is a HOLD, anything else (no estimate, a civil step, an estimate under or straddling the limit) is INCONCLUSIVE and
-        is never a pass or a hold. Whatever the probe did before its marker, however long pwsh took to start, and however long the parent was not scheduled, is not in a HOLD figure."""
+        civil clock at all. Past the limit the bound may be the parent's own scheduling delay, so a HOLD needs the child's own ProcessExit QPC stamp (a LOWER bound, same clock as the marker) at or
+        past the limit; anything else (no stamp, a stamp under the limit) is INCONCLUSIVE and is never a pass or a hold. The child's OS-recorded exit time (see _ident_child_exit_ns) is a civil
+        cross-check printed in the reason only (VENUE-PROBE-CHILD-SIDE-MONOTONIC-EXIT-STAMP-1). Whatever the probe did before its marker, however long pwsh took to start, and however long the
+        parent was not scheduled, is not in a HOLD figure."""
         t = self.last_timing
         self.assertIsNotNone(t, "the timing seam printed nothing: " + self.last_stderr)
         self.assertIsNotNone(t["probe_ms"], "typed failure, not a missing marker: " + t.get("bad", ""))
         self.assertTrue(t.get("end_qpc") is not None and t.get("qpc_hz"), "typed failure, not an exit hold: the marker carries no end_qpc / qpc_hz timestamp: " + self.last_stderr)
-        marker_ns = t["end_qpc"] * 1_000_000_000 // t["qpc_hz"]
-        upper = (self.last_wall_end_ns - marker_ns) / 1e9
-        self.assertGreater(upper, -1.0, f"typed failure, not an exit hold: the probe's end marker is {-upper:.1f} s AFTER the test saw the process end, so the two are not the same monotonic clock")
+        child = getattr(self, "last_child_qpc", None)
+        lone_start = getattr(self, "last_child_start", None)   # (hz, exact start ns) read from the start stamp alone
+        child_hz = getattr(child, "hz", None) or (lone_start[0] if lone_start else None)   # r4 (sol r3 B2): one child has ONE QueryPerformanceFrequency; a marker that names another is not this child's marker, and a gap taken across the two is no measurement. A1 on e584171e: judged whether or not the exit stamp could be read
+        if child_hz is not None:
+            self.assertEqual(t["qpc_hz"], child_hz, f"typed failure, not an exit hold: the end marker's QPC frequency ({t['qpc_hz']} Hz) is not the child's own stamp frequency ({child_hz} Hz), so the two stamps are not one clock")
+        marker_ns = _ident_marker_ns(t["end_qpc"], t["qpc_hz"])
+        upper = _IdentWallS.of_ns(self.last_wall_end_ns - marker_ns)   # sol r6 B1: exact ns count, as the lower bound below (a float of 999999999999999999 ns is 10^9 s)
+        # sol r2 on 46c71e12 B1: every ORDER check below is on the EXACT stamps (rationals of a ns), never on the rounded integer bounds, which can hide a reversal of less than 1 ns
+        marker_exact = _IdentFraction(t["end_qpc"] * 1_000_000_000, t["qpc_hz"])
+        self.assertLessEqual(marker_exact, self.last_wall_end_ns, f"typed failure, not an exit hold: the probe's end marker is {float(marker_exact - self.last_wall_end_ns) / 1e9:.9f} s AFTER the test saw the process end, so the two are not the same monotonic clock")   # r2 (adversary A3): no tolerance, like the child stamps below
         child_exit_ns = getattr(self, "last_child_exit_ns", None)
         civil_s = None if child_exit_ns is None else (child_exit_ns - marker_ns) / 1e9
-        kind, figure, reason = _ident_gap_verdict(upper, civil_s, self.EXIT_HOLD_LIMIT_S)
-        if kind == "inconclusive" and civil_s is None:
-            reason += f" ({getattr(self, 'last_child_exit_note', '')})"
+        # VENUE-PROBE-CHILD-SIDE-MONOTONIC-EXIT-STAMP-1: the LOWER bound is the child's own ProcessExit QPC stamp; the civil estimate above is a cross-check only (adversary A1 on fae72991)
+        child_s = None
+        start_known = _ident_exact_stamps(child)[0] if child is not None else (lone_start[1] if lone_start else None)
+        if start_known is not None:   # r2 (adversary A1): start <= marker, exact (r3: no rounding on either side); 4538d581: also when the exit stamp is unreadable, and no later than the parent's end read
+            self.assertLessEqual(start_known, marker_exact, f"typed failure, not an exit hold: the child's first statement is {float(start_known - marker_exact) / 1e9:.9f} s AFTER its own end marker")
+            self.assertLessEqual(start_known, self.last_wall_end_ns, f"typed failure, not an exit hold: the child's first statement is {float(start_known - self.last_wall_end_ns) / 1e9:.9f} s AFTER the test saw the process end, so the two are not the same monotonic clock")
+        if child is not None:
+            # sol r1 on 9265be72 B1: the order is marker <= the child's ProcessExit stamp <= the parent's end read, with NO tolerance (one system-wide QPC; each stamp is floored, which keeps a true order true)
+            start_exact, exit_exact = _ident_exact_stamps(child)
+            self.assertLessEqual(exit_exact, self.last_wall_end_ns, f"typed failure, not an exit hold: the child's exit stamp is {float(exit_exact - self.last_wall_end_ns) / 1e9:.9f} s AFTER the test saw the process end, so the two are not the same monotonic clock")
+            self.assertGreaterEqual(exit_exact, marker_exact, f"typed failure, not an exit hold: the child's exit stamp is {float(marker_exact - exit_exact) / 1e9:.9f} s BEFORE its own end marker")
+            marker_up_ns = _ident_marker_ns(t["end_qpc"], t["qpc_hz"], up=True)
+            child_s = _IdentWallS.of_ns(child[1] - marker_up_ns)   # a LOWER bound: the marker rounds up here; sol r6 B1: exact ns count
+        kind, figure, reason = _ident_gap_verdict(upper, child_s, self.EXIT_HOLD_LIMIT_S, civil_s)
+        if kind == "inconclusive":
+            reason += "".join(f" ({note})" for absent, note in ((child is None, getattr(self, "last_child_qpc_note", "")), (civil_s is None, getattr(self, "last_child_exit_note", ""))) if absent and note)
         return kind, figure, reason
 
     def assert_no_exit_hold(self, require_abandoned: bool = True) -> None:
@@ -12833,13 +13014,16 @@ class VenueProbeIdentityCallDeadlineTests(IdentityProbeMixin, unittest.TestCase)
             self.assert_no_exit_hold(require_abandoned=False)
         self.assertIn("held the exit", str(ctx.exception))
 
-    def _set_clocks(self, marker_s: float, child_exit_s, parent_end_s: float, abandoned: int = 1) -> None:
+    def _set_clocks(self, marker_s: float, child_exit_s, parent_end_s: float, abandoned: int = 1, child_qpc: tuple | None = None) -> None:
+        """`child_exit_s` is the CIVIL (OS FILETIME) exit estimate; `child_qpc` is the child's own (start_s, exit_s) QPC stamps, None = the child left none."""
         hz = 10_000_000
         self.last_timing = _parse_probe_timing(f"VENUE_PROBE_INTERNAL_MS=1500 abandoned={abandoned} end_qpc={int(marker_s * hz)} qpc_hz={hz}")
         self.last_child_exit_ns = None if child_exit_s is None else int(child_exit_s * 1e9)
         self.last_child_exit_note = "no exit time in this case"
         self.last_wall_end_ns, self.last_wall_s, self.last_stderr = int(parent_end_s * 1e9), parent_end_s - 1.0, ""
         self.last_child_start_ns = int(1.0 * 1e9)
+        self.last_child_qpc = None if child_qpc is None else (int(child_qpc[0] * 1e9), int(child_qpc[1] * 1e9))
+        self.last_child_qpc_note = "no child stamp in this case"
 
     def test_the_sol_r3_repro_a_prompt_child_exit_and_a_16_second_parent_delay_is_no_exit_hold(self) -> None:
         self._set_clocks(marker_s=100.0, child_exit_s=100.05, parent_end_s=116.05)   # sol: child exits 0.05 s after its marker, the parent resumes 16 s later
@@ -12914,29 +13098,35 @@ class VenueProbeIdentityCallDeadlineTests(IdentityProbeMixin, unittest.TestCase)
 
     def test_r5_a_real_wait_for_the_slow_call_and_a_real_hold_with_honest_clocks_still_fail(self) -> None:
         p = self.reference()
-        self._set_clocks(119.9, 120.0, 120.1)   # the child itself ran 120 s from a start at 0 s, then ended right after its marker
+        self._set_clocks(119.9, 120.0, 120.1, child_qpc=(0.5, 120.0))   # the child itself ran 120 s from a start at 0 s (its own stamps: 0.5 s -> 120 s), then ended right after its marker
         self.last_wall_s, self.last_wall_started_ns, self.last_child_start_ns = 120.1, 0, 0
         with self.assertRaises(AssertionError) as ctx:
             self.assert_measurement_unchanged(p, 120.1)
         self.assertIn("waited for the slow call", str(ctx.exception))
-        for step in (0.3, -0.3):   # a real 20 s hold read through a tolerated movement is still a HOLD: the widened estimate (19.45 s) stays over the limit
+        for step in (0.3, -0.3):   # a real 20 s hold read through a tolerated civil movement is still a HOLD: the child's own exit stamp says 20 s, whatever the civil estimate says
             ns, note = self._pairs_exit(self.B5 + int((136 + step) * self.S5), self.B5 + 120 * self.S5)
-            self._set_clocks(100.0, ns / 1e9, 136.0)
+            self._set_clocks(100.0, ns / 1e9, 136.0, child_qpc=(90.5, 120.0))
             with self.assertRaises(AssertionError) as ctx:
                 self.assert_no_exit_hold(require_abandoned=False)
             self.assertIn("held the exit", str(ctx.exception), step)
 
-    def test_r5_the_three_way_verdict_is_decided_by_the_monotonic_gap_and_the_widened_civil_estimate(self) -> None:
-        u, lim = _IDENT_EXIT_ESTIMATE_UNCERTAINTY_S, 15.0
-        self.assertEqual(_ident_gap_verdict(14.99, 99.0, lim)[0], "pass", "monotonic under the limit: no civil clock consulted")
+    def test_r5_the_three_way_verdict_is_decided_by_the_two_monotonic_bounds_and_never_by_the_civil_estimate(self) -> None:
+        # VENUE-PROBE-CHILD-SIDE-MONOTONIC-EXIT-STAMP-1: pass = the parent's upper bound under the limit; over = the child's own lower bound at or over it; the civil estimate is printed only
+        lim = 15.0
+        self.assertEqual(_ident_gap_verdict(14.99, None, lim, 99.0)[0], "pass", "upper bound under the limit: nothing else consulted")
         self.assertEqual(_ident_gap_verdict(14.99, None, lim)[0], "pass")
-        self.assertEqual(_ident_gap_verdict(36.0, lim + u, lim)[0], "over", "the widened estimate lands exactly on the limit")
-        self.assertEqual(_ident_gap_verdict(36.0, lim + u - 0.01, lim)[0], "inconclusive", "a hair under it straddles the limit")
-        self.assertEqual(_ident_gap_verdict(36.0, None, lim)[0], "inconclusive", "no civil estimate")
+        self.assertEqual(_ident_gap_verdict(36.0, lim, lim)[0], "over", "the child's own stamp lands exactly on the limit")
+        self.assertEqual(_ident_gap_verdict(36.0, lim - 0.01, lim)[0], "inconclusive", "a hair under it")
+        self.assertEqual(_ident_gap_verdict(36.0, None, lim)[0], "inconclusive", "no child stamp")
+        for civil in (lim + 5.0, 36.0, 1000.0):
+            self.assertEqual(_ident_gap_verdict(36.0, None, lim, civil)[0], "inconclusive", f"a civil estimate alone never decides an over verdict, however far over ({civil})")
+            self.assertEqual(_ident_gap_verdict(36.0, 0.05, lim, civil)[0], "inconclusive", f"nor against a child stamp under the limit ({civil})")
         kind, figure, reason = _ident_gap_verdict(36.0, 20.0, lim)
-        self.assertEqual((kind, figure, reason), ("over", 20.0, ""), "the figure is the smaller of the two")
-        self.assertIn("36.00", _ident_gap_verdict(36.0, 0.5, lim)[2])
-        self.assertIn("0.50", _ident_gap_verdict(36.0, 0.5, lim)[2])
+        self.assertEqual((kind, figure, reason), ("over", 20.0, ""), "the figure is the child's lower bound")
+        self.assertEqual(_ident_gap_verdict(36.0, 20.0, lim, 0.0)[:2], ("over", 20.0), "a civil estimate cannot hide a hold the child stamped either")
+        reason = _ident_gap_verdict(36.0, 0.5, lim, 0.25)[2]
+        for number in ("36.00", "0.50", "0.25"):
+            self.assertIn(number, reason)
 
     # r5-FIX1-ROWS-BEGIN (adversary pass on b4cae711: A1 and A2 introduced majors, A4 introduced minor)
     def test_r5_fix1_a1_a_pair_taken_inside_cancelling_civil_steps_withholds_the_exit_estimate(self) -> None:
@@ -13007,10 +13197,427 @@ class VenueProbeIdentityCallDeadlineTests(IdentityProbeMixin, unittest.TestCase)
         with self.assertRaises(unittest.SkipTest) as ctx:   # the real gap is 14.8 s: never a HOLD at 15.78 s
             self.assert_no_exit_hold()
         self.assertIn("EXIT_HOLD_INCONCLUSIVE", str(ctx.exception))
-        self.assertEqual(_ident_gap_verdict(36.0, 15.78, 15.0)[0], "inconclusive")
-        self.assertEqual(_ident_gap_verdict(62.0, 60.78, 60.0, _IDENT_WALL_ESTIMATE_UNCERTAINTY_S)[0], "inconclusive", "the wall sibling: a real 59.8 s child lifetime is never a slow-call wait")
-        self.assertEqual(_ident_gap_verdict(62.0, 120.0, 60.0, _IDENT_WALL_ESTIMATE_UNCERTAINTY_S)[0], "over", "a real 120 s child lifetime still is")
-        self.assertEqual(_ident_gap_verdict(36.0, 20.0, 15.0)[0], "over", "a real 20 s hold still is a hold")
+        self.assertEqual(_ident_gap_verdict(36.0, None, 15.0, 15.78)[0], "inconclusive")
+        self.assertEqual(_ident_gap_verdict(62.0, 59.8, 60.0, 60.78, _IDENT_WALL_ESTIMATE_UNCERTAINTY_S)[0], "inconclusive", "the wall sibling: a real 59.8 s child lifetime is never a slow-call wait")
+        self.assertEqual(_ident_gap_verdict(122.0, 120.0, 60.0, None, _IDENT_WALL_ESTIMATE_UNCERTAINTY_S)[0], "over", "a real 120 s child lifetime (its own stamps) still is")   # r2: the parent's wall (122 s) contains the child's run (120 s)
+        self.assertEqual(_ident_gap_verdict(36.0, 20.0, 15.0)[0], "over", "a real 20 s hold (the child's own exit stamp) still is a hold")
+
+    # VENUE-PROBE-CHILD-SIDE-MONOTONIC-EXIT-STAMP-1 (adversary A1 on fae72991, OPEN after #797): a civil step SHORTER than the 0.1 s sample interval with the child's exit (or creation) inside it is
+    # invisible to every pair, so the OS FILETIME is believed. The child's own QPC stamps (its first statement and its ProcessExit, see _ident_child_stamp_prelude) say what really happened.
+    def test_child_stamp_a1_a_sub_interval_civil_step_at_the_childs_exit_cannot_fake_an_exit_hold(self) -> None:
+        # sol: civil offset +20 s only during QPC [100.025, 100.075); the child really exits at 100.05 s, so the OS records 120.05 s; the parent only ends at 136 s; one call abandoned
+        B = self.B5
+        pair0, pair1 = (90_000_000_000, B + 900_000_000), (136_000_000_000, B + 1_360_000_000)
+        samples = tuple((k * 100_000_000, B + k * 1_000_000) for k in range(901, 1360))
+        ns, note = _ident_exit_from_pairs(pair0, pair1, 5_001_200_500_000, samples)
+        self.assertEqual(note, "ok", "all 459 samples agree: the sampler cannot see a step shorter than its interval")
+        self.assertAlmostEqual(ns / 1e9, 120.05, places=2)
+        self._set_clocks(100.0, ns / 1e9, 136.0)
+        self.last_child_qpc = (95_000_000_000, 100_050_000_000)   # the child's own QPC: first statement at 95 s, ProcessExit at 100.05 s
+        kind, figure, reason = self.exit_hold_verdict()
+        self.assertNotEqual(kind, "over", f"a real 0.05 s gap reported as a {figure:.2f} s HOLD")
+        self.assertEqual(kind, "inconclusive", "the parent's 36 s is an upper bound only: never a pass either")
+        with self.assertRaises(unittest.SkipTest) as ctx:
+            self.assert_no_exit_hold()
+        self.assertIn("EXIT_HOLD_INCONCLUSIVE", str(ctx.exception))
+        self.assertNotIn("held the exit", str(ctx.exception))
+
+    def test_child_stamp_a1_creation_sibling_a_sub_interval_civil_step_at_creation_cannot_fake_a_slow_call_wait(self) -> None:
+        # sol: launch at 90 s; a cancelling -60 s offset covers the child's real creation at 151.05 s but no sample, so the OS records creation at 91.05 s; exit 160.05 s; read/end 161 s
+        B = self.B5
+        pair0, pair1 = (90_000_000_000, B + 900_000_000), (161_000_000_000, B + 1_610_000_000)
+        samples = tuple((k * 100_000_000, B + k * 1_000_000) for k in range(901, 1610))
+        exit_ns, note = _ident_exit_from_pairs(pair0, pair1, B + 1_600_500_000, samples)
+        self.assertEqual(note, "ok")
+        start_ns = _ident_start_from_pairs(pair1, 5_000_910_500_000, pair0)
+        self.assertAlmostEqual((exit_ns - start_ns) / 1e9, 69.0, places=2, msg="the civil lifetime the mapper forms")
+        self._set_clocks(160.0, exit_ns / 1e9, 161.0)
+        self.last_wall_s, self.last_child_start_ns = 71.0, start_ns
+        self.last_child_qpc = (151_500_000_000, 160_050_000_000)   # the child's own QPC: a real 8.55 s from its first statement to its ProcessExit
+        verdicts = {what: (kind, figure) for what, kind, figure, _r in self.timing_verdicts(71.0)}
+        self.assertNotEqual(verdicts["wall"][0], "over", f"a real 9 s child lifetime reported as a {verdicts['wall'][1]:.1f} s slow-call wait")
+        self.assertEqual(verdicts["wall"][0], "inconclusive")
+
+    def test_child_stamp_a_real_probe_stamps_its_own_start_and_exit_between_its_launch_and_the_parents_end_read(self) -> None:
+        # the stamps are taken by the CHILD on the parent's own perf_counter axis: start <= marker <= exit <= the parent's end read, and a prompt exit is a pass by the parent's own bound
+        launched = _ident_time.perf_counter_ns()
+        self.run_identity_probe(self.procs, self.cim, CHAIN_OWNERS, timing=True)
+        self.assertIsNotNone(self.last_child_qpc, self.last_child_qpc_note)
+        start_ns, exit_ns = self.last_child_qpc
+        marker_ns = self.last_timing["end_qpc"] * 1_000_000_000 // self.last_timing["qpc_hz"]
+        self.assertLessEqual(launched, start_ns)
+        self.assertLessEqual(start_ns, marker_ns)
+        self.assertLessEqual(marker_ns, exit_ns, "the ProcessExit stamp comes after the end marker")
+        self.assertLessEqual(exit_ns, self.last_wall_end_ns, "and before the parent saw the process end")
+        self.assert_no_exit_hold(require_abandoned=False)
+        self.run_identity_probe(self.procs, self.cim, CHAIN_OWNERS)
+        self.assertIsNone(self.last_child_qpc, "the timing seam off: no stamp, and the stamps of the previous run are not reused")
+
+    def test_child_stamp_a_real_20_second_exit_hold_is_stamped_by_the_child_and_its_parent_stall_is_not(self) -> None:
+        # the injected hold sits between the marker and the abandoned-call Exit; the parent then stalls 16 s. The child's ProcessExit stamp carries the hold and not the stall
+        with self._stall_parent():
+            self.run_identity_probe(self.procs, self.cim, CHAIN_OWNERS, delays={"cim": self.DELAY_MS}, call_ms=self.CALL_MS, timing=True, exit_hold_s=20)
+        self.assertGreaterEqual(self.last_timing["abandoned"], 1, self.timing_text())
+        self.assertIsNotNone(self.last_child_qpc, self.last_child_qpc_note)
+        marker_ns = self.last_timing["end_qpc"] * 1_000_000_000 // self.last_timing["qpc_hz"]
+        held_s, stall_s = (self.last_child_qpc[1] - marker_ns) / 1e9, (self.last_wall_end_ns - self.last_child_qpc[1]) / 1e9
+        self.assertGreaterEqual(held_s, 19.0)
+        self.assertGreaterEqual(stall_s, self.PARENT_STALL_S - 1.0)
+        kind, figure, _reason = self.exit_hold_verdict()
+        self.assertEqual(kind, "over")
+        self.assertLess(figure, 20.0 + self.PARENT_STALL_S - 2.0, "the figure is the child's own hold")
+
+    def test_child_stamp_reader_types_every_missing_or_malformed_stamp_as_absent_evidence(self) -> None:
+        start, end = self.tmp / _IDENT_CHILD_QPC_START, self.tmp / _IDENT_CHILD_QPC_EXIT
+        start.write_text("1000 10000000", encoding="ascii")
+        end.write_text("21000", encoding="ascii")
+        self.assertEqual(_ident_read_child_stamps(start, end), ((100_000, 2_100_000), "ok"))
+        for s_text, e_text, why in (("1000 10000000", None, "no child exit stamp could be read"), (None, "21000", "no child start stamp"), ("1000", "21000", "malformed"),
+                                    ("1000 0", "21000", "malformed"), ("1000 10000000", "-5", "malformed"), ("1000 10000000", "2e4", "malformed"), ("1000 10000000", "9" * 30, "malformed"),
+                                    ("21000 10000000", "1000", "BEFORE its start stamp"),
+                                    ("2 999999999999999999", "1", "BEFORE its start stamp")):   # adversary A1 on 636642d6: both floor to 0 ns, the ticks still say exit < start
+            for f, text in ((start, s_text), (end, e_text)):
+                f.unlink(missing_ok=True)
+                if text is not None:
+                    f.write_text(text, encoding="ascii")
+            stamps, note = _ident_read_child_stamps(start, end)
+            self.assertIsNone(stamps, (s_text, e_text))
+            self.assertIn(why, note)
+        prelude = _ident_child_stamp_prelude(Path(r"C:\it's\start.txt"), Path(r"C:\it's\exit.txt"))
+        self.assertIn(r"'C:\it''s\start.txt'", prelude, "a quote in the temp path is escaped for the single-quoted PowerShell literal")
+        for civil in ("[DateTime]", "Get-Date", "UtcNow", "FileTime"):
+            self.assertNotIn(civil, prelude, "the child stamps only the monotonic QPC")
+
+    # VENUE-PROBE-CHILD-SIDE-MONOTONIC-EXIT-STAMP-1 r2 (sol r1 on 9265be72: B1 and B2): the reader's output is a pair of one-sided integer bounds, and an event order the child cannot have produced is a typed failure
+    def _set_clocks_from_stamps(self, start_text: str, exit_text: str, marker_ticks: int, marker_hz: int, parent_end_ns: int) -> None:
+        start, end = self.tmp / _IDENT_CHILD_QPC_START, self.tmp / _IDENT_CHILD_QPC_EXIT
+        start.write_text(start_text, encoding="ascii")
+        end.write_text(exit_text, encoding="ascii")
+        stamps, note = _ident_read_child_stamps(start, end)
+        self.assertEqual(note, "ok", (start_text, exit_text))
+        self._set_clocks(1.0, None, 2.0)
+        self.last_timing = _parse_probe_timing(f"VENUE_PROBE_INTERNAL_MS=1500 abandoned=1 end_qpc={marker_ticks} qpc_hz={marker_hz}")
+        self.last_wall_end_ns, self.last_child_qpc = parent_end_ns, stamps
+
+    def test_r2_b1_a_child_exit_stamp_out_of_event_order_is_a_typed_failure_never_a_measurement_verdict(self) -> None:
+        # sol B1: marker at 100 s, the parent saw the process end at 120 s, the child's own exit stamp says 120.5 s: the parent cannot have seen the end before the child exited, so this is no 20.5 s hold
+        self._set_clocks_from_stamps("950000000 10000000", "1205000000", 1_000_000_000, 10_000_000, 120 * 10**9)
+        with self.assertRaises(AssertionError) as ctx:
+            self.exit_hold_verdict()
+        self.assertIn("typed failure", str(ctx.exception))
+        self.assertIn("not the same monotonic clock", str(ctx.exception))
+        # sol B1 sibling: an exit stamp 0.5 s BEFORE the marker the child printed earlier is no measurement either (the old check tolerated a full second)
+        self._set_clocks_from_stamps("950000000 10000000", "995000000", 1_000_000_000, 10_000_000, 136 * 10**9)
+        with self.assertRaises(AssertionError) as ctx:
+            self.exit_hold_verdict()
+        self.assertIn("typed failure", str(ctx.exception))
+        self.assertIn("BEFORE its own end marker", str(ctx.exception))
+
+    def test_r2_adversary_a1_a3_the_rest_of_the_event_order_is_a_typed_failure_too(self) -> None:
+        # adversary A1 on 8afca421: the child's FIRST statement (start 101 s) cannot come after the end marker it printed (100 s)
+        self._set_clocks_from_stamps("1010000000 10000000", "1200000000", 1_000_000_000, 10_000_000, 136 * 10**9)
+        with self.assertRaises(AssertionError) as ctx:
+            self.exit_hold_verdict()
+        self.assertIn("typed failure", str(ctx.exception))
+        self.assertIn("AFTER its own end marker", str(ctx.exception))
+        # adversary A3 (pre-existing sibling of B1): the end marker 0.5 s AFTER the parent saw the process end, with no child stamp at all, is no measurement (it passed the old -1 s tolerance)
+        self._set_clocks(100.0, None, 100.0)
+        self.last_timing = _parse_probe_timing("VENUE_PROBE_INTERNAL_MS=1500 abandoned=1 end_qpc=1005000000 qpc_hz=10000000")
+        self.last_wall_end_ns, self.last_child_qpc = 100 * 10**9, None
+        with self.assertRaises(AssertionError) as ctx:
+            self.exit_hold_verdict()
+        self.assertIn("typed failure", str(ctx.exception))
+        self.assertIn("not the same monotonic clock", str(ctx.exception))
+
+    def test_r3_b1_an_event_order_reversed_by_less_than_a_nanosecond_is_a_typed_failure_not_a_verdict(self) -> None:
+        # sol r2 on 46c71e12 B1: the stamps are accepted as integers after one-sided ns rounding, which can turn a reversal of 0.5 ns into an equality. The order is judged on the EXACT stamps (a 2 GHz QPC
+        # has 0.5 ns ticks); each row is (child start, child exit, marker ticks, parent end ns, why). No row is a measurement of anything.
+        rows = (
+            ("200000000002 2000000000", "240000000000", 200_000_000_001, 136 * 10**9, "AFTER its own end marker"),         # start 0.5 ns after the marker; both ceil to the same ns (sol repro)
+            ("190000000000 2000000000", "200000000001", 200_000_000_001, 100 * 10**9, "not the same monotonic clock"),      # marker and exit 0.5 ns after the parent's end read (sol sibling)
+            ("380000000000 2000000000", "400000000000", 400_000_000_001, 216 * 10**9, "BEFORE its own end marker"),         # exit 0.5 ns before the marker; both floor to the same ns
+            ("190000000000 2000000000", "272000000001", 200_000_000_000, 136 * 10**9, "not the same monotonic clock"),      # exit 0.5 ns after the parent's end read; both floor to the same ns
+        )
+        for start_text, exit_text, marker_ticks, parent_end_ns, why in rows:
+            self._set_clocks_from_stamps(start_text, exit_text, marker_ticks, 2_000_000_000, parent_end_ns)
+            with self.assertRaises(AssertionError, msg=(start_text, exit_text, marker_ticks)) as ctx:
+                self.exit_hold_verdict()
+            self.assertIn("typed failure", str(ctx.exception))
+            self.assertIn(why, str(ctx.exception), (start_text, exit_text, marker_ticks))
+        # the same stamps one tick (0.5 ns) the right way round are measurements again, so the exact check does not over-reject
+        self._set_clocks_from_stamps("200000000000 2000000000", "240000000000", 200_000_000_000, 2_000_000_000, 136 * 10**9)
+        self.assertEqual(self.exit_hold_verdict()[0], "over")
+        self._set_clocks_from_stamps("190000000000 2000000000", "200000000000", 200_000_000_000, 2_000_000_000, 100 * 10**9)
+        self.assertEqual(self.exit_hold_verdict()[:2], ("pass", 0.0))
+
+    def test_r3_adversary_a1_a_child_run_longer_than_the_parents_wall_by_less_than_a_nanosecond_is_a_typed_failure(self) -> None:
+        # adversary A1 on 99868f47: the child's exact run is 10000000000.5 ns; the one-sided integer bounds make it 10.0 s, which equals the parent's wall, so the wall comparison accepted it
+        self._set_clocks_from_stamps("190000000001 2000000000", "210000000002", 200_000_000_000, 2_000_000_000, 105_000_000_001)
+        with self.assertRaises(AssertionError) as ctx:
+            self.timing_verdicts(10.0)
+        self.assertIn("typed failure", str(ctx.exception))
+        self.assertIn("not the same monotonic clock", str(ctx.exception))
+        # one tick (0.5 ns) the right way round the run is 10.0 s exactly and is a measurement again
+        self._set_clocks_from_stamps("190000000001 2000000000", "210000000001", 200_000_000_000, 2_000_000_000, 105_000_000_001)
+        self.assertEqual({what: kind for what, kind, _f, _r in self.timing_verdicts(10.0)}["wall"], "pass")
+
+    def test_r4_b1_the_parents_wall_is_judged_as_the_ns_count_it_came_from_not_as_its_binary_float(self) -> None:
+        # sol r3 on 5092ebcd B1: Fraction(wall_s) is the float's BINARY value, which is not the wall the caller meant. The child ran exactly 10000000100 ns; the parent's wall is that same count
+        # (a float of it, 10.0000001 s, is a hair under 10000000100 ns in binary), so a consistent equality was a typed failure.
+        self._set_clocks_from_stamps("950000000 10000000", "1050000001", 1_000_000_000, 10_000_000, 105_000_000_100)
+        self.assertEqual({what: kind for what, kind, _f, _r in self.timing_verdicts(10_000_000_100 / 1e9)}["wall"], "pass", "a child run equal to the parent's wall is a measurement")
+        wall = _IdentWallS.of_ns(10_000_000_100)   # the harness's own figure carries its exact ns count
+        self.assertEqual({what: kind for what, kind, _f, _r in self.timing_verdicts(wall)}["wall"], "pass")
+        for exact in (_IdentFraction(10_000_000_100, 10**9), 10 + _IdentFraction(100, 10**9)):   # an exact rational of seconds is taken as it is
+            self.assertEqual({what: kind for what, kind, _f, _r in self.timing_verdicts(exact)}["wall"], "pass")
+        # the opposite direction (sol sibling): the child's exact run is 100000000.0000000001 ns, over an intended wall of 0.1 s, and Fraction(.1) is a hair ABOVE 0.1 s in binary
+        self._set_clocks_from_stamps("0 999999999999999999", "100000000000000000", 50_000_000_000_000_000, 999_999_999_999_999_999, 100_000_001)
+        with self.assertRaises(AssertionError) as ctx:
+            self.timing_verdicts(0.1)
+        self.assertIn("typed failure", str(ctx.exception))
+        self.assertIn("not the same monotonic clock", str(ctx.exception))
+        # a wall one ns longer holds the same run again
+        self.assertEqual({what: kind for what, kind, _f, _r in self.timing_verdicts(0.100000001)}["wall"], "pass")
+
+    def test_r5_b1_an_exact_wall_under_the_deadline_is_judged_as_the_exact_figure_never_as_its_float(self) -> None:
+        # sol r4 on a7ddf486 B1: wall_s = 60 - 10^-18 s is an accepted exact figure (the child/wall order check passes on it), but float() rounds it to 60.0, which is AT the deadline, so the verdict
+        # said inconclusive (a typed skip) on a run whose exact upper bound is under it. The verdict compares the exact figure; the float is only a printed figure.
+        self._set_clocks_from_stamps("900000000 10000000", "910000000", 905_000_000, 10_000_000, 100 * 10**9)
+        under = _IdentFraction(60) - _IdentFraction(1, 10**18)
+        verdicts = {what: kind for what, kind, _f, _r in self.timing_verdicts(under)}
+        self.assertEqual(verdicts["wall"], "pass", "an exact upper bound under the deadline is a pass, never rounded onto it")
+        self.assertEqual(verdicts["exit hold"], "pass")
+        self.assert_timing(under)   # no typed skip either
+        self.assertEqual(_ident_gap_verdict(under, None, 60.0)[0], "pass", "the shared helper judges the exact figure")
+        self.assertEqual(_ident_gap_verdict(under, 59.0, 60.0)[0], "pass")
+        # the controls on the other side: AT the deadline, or a hair over it, is still not a pass (a child run under the limit => inconclusive, never a pass)
+        for wall in (_IdentFraction(60), _IdentFraction(60) + _IdentFraction(1, 10**18), 60.0):
+            self.assertEqual({what: kind for what, kind, _f, _r in self.timing_verdicts(wall)}["wall"], "inconclusive", wall)
+        # class sibling: the child's figure is judged as the decimal count it came from, so a child run equal to the exact wall is not a reversal whatever its binary float is
+        self.assertEqual(_ident_gap_verdict(_IdentFraction(10_000_000_100, 10**9), 10_000_000_100 / 1e9, 60.0)[0], "pass")
+        self.assertEqual(_ident_gap_verdict(_IdentWallS.of_ns(60_000_000_000), 60_000_000_000 / 1e9, 60.0)[:2], ("over", 60.0))
+
+    def test_r5_adversary_a1_the_marker_frequency_is_checked_even_when_the_exit_stamp_is_unreadable(self) -> None:
+        # adversary A1 on e584171e: a valid start stamp (10 MHz) with a missing / empty / malformed / reversed exit stamp returned no stamps, so the frequency was lost and a marker on a 5 MHz clock
+        # (end_qpc=100000000 -> 20 s, parent end 30 s: a 10 s gap, a "pass", that is really 20 s on the child's own 10 MHz clock) became a "pass". The mismatch is a typed failure whatever became of the exit stamp.
+        start, end = self.tmp / _IDENT_CHILD_QPC_START, self.tmp / _IDENT_CHILD_QPC_EXIT
+        for exit_text in (None, "", "garbage", "5", "-1", "9" * 30):   # "5" is BEFORE the start stamp (reversed)
+            for f in (start, end):
+                f.unlink(missing_ok=True)
+            start.write_text("100000000 10000000", encoding="ascii")
+            if exit_text is not None:
+                end.write_text(exit_text, encoding="ascii")
+            stamps, _note = _ident_read_child_stamps(start, end)
+            self.assertIsNone(stamps, exit_text)
+            for marker_hz, ok in ((5_000_000, False), (20_000_000, False), (10_000_000, True)):
+                self._set_clocks(1.0, None, 2.0)
+                self.last_timing = _parse_probe_timing(f"VENUE_PROBE_INTERNAL_MS=1500 abandoned=1 end_qpc=100000000 qpc_hz={marker_hz}")
+                self.last_wall_end_ns, self.last_child_qpc, self.last_child_start = 30 * 10**9, stamps, _ident_start_stamp(start)
+                if ok:
+                    self.assertEqual(self.exit_hold_verdict()[0], "inconclusive", exit_text)   # the matching-frequency control: on the child's own 10 MHz the gap is 20 s, over the limit, with no exit stamp to bound it below
+                    continue
+                with self.assertRaises(AssertionError, msg=(exit_text, marker_hz)) as ctx:
+                    self.exit_hold_verdict()
+                self.assertIn("frequenc", str(ctx.exception))
+                with self.assertRaises(AssertionError):
+                    self.assert_no_exit_hold(require_abandoned=False)
+        start.unlink(missing_ok=True)   # no start stamp, nothing to compare the marker with
+        self.assertIsNone(_ident_start_stamp(start))
+        for text in ("", "1000", "1000 0", "1000 x", "1000 2 3"):
+            start.write_text(text, encoding="ascii")
+            self.assertIsNone(_ident_start_stamp(start), text)
+
+    def test_r5_adversary_a1b_a_start_stamp_after_the_end_marker_is_a_typed_failure_even_when_the_exit_stamp_is_unreadable(self) -> None:
+        # adversary A1 on 4538d581 (same class as A1 on e584171e): start 100.05 s, marker 100 s, the exit stamp missing / empty / malformed / reversed. The reader dropped the start stamp with the exit stamp,
+        # so the child-is-not-None guard skipped the start <= marker order check and the run read as a pass. A half-ns reversal and a start after the parent's own end read are the same failure.
+        start, end = self.tmp / _IDENT_CHILD_QPC_START, self.tmp / _IDENT_CHILD_QPC_EXIT
+        rows = (("1000500000 10000000", 1_000_000_000, 10_000_000, 100_100_000_000, "AFTER its own end marker"),         # 100.05 s start, 100 s marker
+                ("2000000001 2000000000", 2_000_000_000, 2_000_000_000, 100_100_000_000, "AFTER its own end marker"),   # exact start 1000000000.5 ns vs marker 1000000000 ns: half a ns
+                ("1000500000 10000000", 1_010_000_000, 10_000_000, 100_040_000_000, "AFTER the test saw the process end"))   # start 100.05 s, marker 101 s, parent end 100.04 s
+        for start_text, marker_ticks, marker_hz, parent_end_ns, why in rows:
+            for exit_text in (None, "", "garbage", "5"):
+                for f in (start, end):
+                    f.unlink(missing_ok=True)
+                start.write_text(start_text, encoding="ascii")
+                if exit_text is not None:
+                    end.write_text(exit_text, encoding="ascii")
+                stamps, _note = _ident_read_child_stamps(start, end)
+                self.assertIsNone(stamps, (start_text, exit_text))
+                self._set_clocks(1.0, None, 2.0)
+                self.last_timing = _parse_probe_timing(f"VENUE_PROBE_INTERNAL_MS=1500 abandoned=1 end_qpc={marker_ticks} qpc_hz={marker_hz}")
+                self.last_wall_end_ns, self.last_child_qpc, self.last_child_start = parent_end_ns, stamps, _ident_start_stamp(start)
+                with self.assertRaises(AssertionError, msg=(start_text, exit_text)) as ctx:
+                    self.exit_hold_verdict()
+                self.assertIn("typed failure", str(ctx.exception))
+                self.assertIn(why, str(ctx.exception), (start_text, exit_text))
+                with self.assertRaises(AssertionError):
+                    self.timing_verdicts(2.0)
+        # the control: a start BEFORE the marker, with the exit stamp unreadable, is a measurement again (no stamp, so at best an upper bound)
+        for f in (start, end):
+            f.unlink(missing_ok=True)
+        start.write_text("990000000 10000000", encoding="ascii")
+        self._set_clocks(1.0, None, 2.0)
+        self.last_timing = _parse_probe_timing("VENUE_PROBE_INTERNAL_MS=1500 abandoned=1 end_qpc=1000000000 qpc_hz=10000000")
+        self.last_wall_end_ns, self.last_child_qpc, self.last_child_start = 100_100_000_000, None, _ident_start_stamp(start)
+        self.assertEqual(self.exit_hold_verdict()[:2], ("pass", 0.1))
+
+    def test_r6_sol_b1_a_failed_second_read_of_the_start_stamp_cannot_drop_start_evidence_already_observed(self) -> None:
+        # sol r5 on 4f16d8c2 B1: the start file was read once for the pair and AGAIN for the lone start. A first read that succeeded, an exit stamp that was unreadable and a second start read that failed
+        # (PermissionError, FileNotFoundError, UnicodeDecodeError) left no start evidence at all, so a marker on another clock (5 MHz against the child's 10 MHz) and a start AFTER the marker read as passes.
+        # This drives the orchestration's OWN assignments to the `last_child_*` fields, lifted from run_identity_probe by AST, with a start file whose read FAILS after its first success.
+        func = ast.parse(textwrap.dedent(inspect.getsource(IdentityProbeMixin.run_identity_probe))).body[0]
+        fields = {"last_child_qpc", "last_child_qpc_note", "last_child_start"}
+
+        def targets(node):
+            return [e for t in node.targets for e in (t.elts if isinstance(t, ast.Tuple) else [t])]
+        assigns = sorted((n for n in ast.walk(func) if isinstance(n, ast.Assign) and any(isinstance(t, ast.Attribute) and t.attr in fields for t in targets(n))), key=lambda n: n.lineno)
+        self.assertTrue(assigns, "the orchestration no longer assigns the child stamps: the lift found nothing")
+        code = compile(ast.fix_missing_locations(ast.Module(body=assigns, type_ignores=[])), "<run_identity_probe child-stamp assignments>", "exec")
+
+        class _ReadsThen:
+            def __init__(self, *outcomes):
+                self.outcomes = list(outcomes)
+
+            def read_text(self, encoding=None):
+                outcome = self.outcomes.pop(0) if self.outcomes else self.outcomes_last
+                self.outcomes_last = outcome
+                if isinstance(outcome, BaseException):
+                    raise outcome
+                return outcome
+        second_reads = (PermissionError("denied"), FileNotFoundError("gone"), UnicodeDecodeError("ascii", b"\xff", 0, 1, "not ascii"))
+        rows = (("100000000 10000000", 100_000_000, 5_000_000, 30 * 10**9, "frequenc"),                          # marker on 5 MHz, child on 10 MHz
+                ("1000500000 10000000", 1_000_000_000, 10_000_000, 100_100_000_000, "AFTER its own end marker"))   # child's first statement (100.05 s) after its marker (100 s)
+        for start_text, marker_ticks, marker_hz, parent_end_ns, why in rows:
+            for second in second_reads:
+                ns = types.SimpleNamespace()
+                exec(code, globals(), {"self": ns, "timing": True, "qpc_start": _ReadsThen(start_text, second), "qpc_exit": _ReadsThen(FileNotFoundError("no exit stamp"))})
+                self._set_clocks(1.0, None, 2.0)
+                self.last_timing = _parse_probe_timing(f"VENUE_PROBE_INTERNAL_MS=1500 abandoned=1 end_qpc={marker_ticks} qpc_hz={marker_hz}")
+                self.last_wall_end_ns, self.last_child_qpc, self.last_child_start = parent_end_ns, ns.last_child_qpc, ns.last_child_start
+                self.assertIsNone(ns.last_child_qpc, "the exit stamp is unreadable: no pair")
+                self.assertIsNotNone(ns.last_child_start, (start_text, type(second).__name__, "the start stamp read the first time was dropped"))
+                with self.assertRaises(AssertionError, msg=(start_text, type(second).__name__)) as ctx:
+                    self.exit_hold_verdict()
+                self.assertIn(why, str(ctx.exception))
+                with self.assertRaises(AssertionError):
+                    self.timing_verdicts(2.0)
+        # the control: a consistent start (990000000 ticks at 10 MHz, marker 100 s on the same clock) with an unreadable exit stamp and a failing second read is still a measurement (an upper bound)
+        ns = types.SimpleNamespace()
+        exec(code, globals(), {"self": ns, "timing": True, "qpc_start": _ReadsThen("990000000 10000000", PermissionError("denied")), "qpc_exit": _ReadsThen(FileNotFoundError("no exit stamp"))})
+        self._set_clocks(1.0, None, 2.0)
+        self.last_timing = _parse_probe_timing("VENUE_PROBE_INTERNAL_MS=1500 abandoned=1 end_qpc=1000000000 qpc_hz=10000000")
+        self.last_wall_end_ns, self.last_child_qpc, self.last_child_start = 100_100_000_000, ns.last_child_qpc, ns.last_child_start
+        self.assertEqual(self.exit_hold_verdict()[:2], ("pass", 0.1))
+
+    def test_r5_adversary_a2_the_limit_is_judged_as_the_decimal_it_prints_as_not_as_its_binary_float(self) -> None:
+        # adversary A2 on e584171e: Fraction(0.1) is 0.1000000000000000055..., so a figure of exactly 0.1 s passed a 0.1 s limit, and a child bound 10^-18 s under 0.3 s reached an "over" at 0.3 s
+        self.assertNotEqual(_ident_gap_verdict(0.1, 0.1, 0.1)[0], "pass", "a gap AT the limit is not under it")
+        self.assertEqual(_ident_gap_verdict(0.1, 0.1, 0.1)[0], "over")
+        self.assertEqual(_ident_gap_verdict(1, _IdentFraction(3, 10) - _IdentFraction(1, 10**18), 0.3)[0], "inconclusive", "a lower bound under the limit is never over it")
+        self.assertEqual(_ident_gap_verdict(1, _IdentFraction(3, 10), 0.3)[0], "over")
+        self.assertEqual(_ident_gap_verdict(_IdentFraction(3, 10) - _IdentFraction(1, 10**18), None, 0.3)[0], "pass")
+
+    def test_r5_adversary_a3_the_slow_call_wall_keeps_the_exact_ns_count_of_the_elapsed_time(self) -> None:
+        # adversary A3 on e584171e (pre-existing): two time.monotonic() reads a true 59.999999999 s apart subtract to 60.0, which is AT the deadline, so the wall was inconclusive instead of a pass
+        reads = iter((16_777_216_000_000_001, 16_777_276_000_000_000))
+        with unittest.mock.patch.object(_ident_time, "perf_counter_ns", side_effect=lambda: next(reads)), unittest.mock.patch.object(self, "run_identity_probe", return_value={}):
+            _p, elapsed = self.slow("gpu")
+        self.assertEqual(elapsed.exact_ns, 59_999_999_999, "the exact count survives, not a float of it")
+        self._set_clocks_from_stamps("100000000 10000000", "680000000", 675_000_000, 10_000_000, 69 * 10**9)   # a consistent child run of 58 s inside the parent's wall
+        self.assertEqual({what: kind for what, kind, _f, _r in self.timing_verdicts(elapsed)}["wall"], "pass")
+
+    def test_r4_b2_a_marker_frequency_that_disagrees_with_the_childs_is_a_typed_failure_never_a_hold(self) -> None:
+        # sol r3 on 5092ebcd B2: both records are well formed, so both readers accept them, but they describe two different QPC frequencies. On the marker's 20 MHz the gap is 15 s (a HOLD);
+        # on the child's own 10 MHz it is 10 s. One child has one QueryPerformanceFrequency.
+        self._set_clocks_from_stamps("0 10000000", "200000000", 100_000_000, 10_000_000, 20_100_000_000)
+        self.assertEqual(self.exit_hold_verdict()[:2], ("pass", 10.1), "the matching-frequency control is a measurement")
+        for marker_hz in (20_000_000, 5_000_000):
+            self._set_clocks_from_stamps("0 10000000", "200000000", 100_000_000, marker_hz, 20_100_000_000)
+            with self.assertRaises(AssertionError, msg=marker_hz) as ctx:
+                self.exit_hold_verdict()
+            self.assertIn("typed failure", str(ctx.exception))
+            self.assertIn("frequenc", str(ctx.exception))
+        # a plain tuple set by a test names no frequency, so there is nothing to compare it with
+        self._set_clocks(100.0, None, 120.1, child_qpc=(95.0, 120.0))
+        self.assertEqual(self.exit_hold_verdict()[0], "over")
+
+    # VENUE-PROBE-CHILD-SIDE-MONOTONIC-EXIT-STAMP-1 r7 (sol r6 on bea73826: B1 and B2)
+    def test_r7_b1_accepted_integer_ns_bounds_keep_their_exact_order_through_the_verdict_conversion(self) -> None:
+        # sol B1: child run, parent wall and marker -> exit are all exact ns counts; dividing by 1e9 into a float rounded 999999999999999999 ns up to 10^9 s and made two consistent bounds "not the same clock"
+        big = 999_999_999_999_999_999
+        self._set_clocks_from_stamps("0 1000000000", str(big), big - 1, 1_000_000_000, big)
+        verdicts = {what: kind for what, kind, _f, _r in self.timing_verdicts(_IdentWallS.of_ns(big))}
+        self.assertEqual(verdicts, {"wall": "over", "exit hold": "pass"}, "the exact child and parent durations are equal, so the wall is over the limit and the exit hold under it")
+    def test_r7_b1_upper_sibling_an_exact_bound_one_ns_under_a_caller_limit_is_a_pass(self) -> None:
+        # the exact gap marker -> parent end is 10^9 s - 1 ns, UNDER a caller-overridden 10^9 s limit
+        self.EXIT_HOLD_LIMIT_S = 1e9
+        self._set_clocks_from_stamps("0 1000000000", "1", 0, 1_000_000_000, 999_999_999_999_999_999)
+        self.assertEqual(self.exit_hold_verdict()[0], "pass", "an exact upper bound under the limit is a pass, not a float that rounds onto it")
+
+    def test_r7_b1_lower_sibling_an_exact_lower_bound_one_ns_under_a_caller_limit_is_never_over_it(self) -> None:
+        # the parent's bound is exactly the limit, the child's exact lower bound is 1 ns under it
+        self.EXIT_HOLD_LIMIT_S = 1e9
+        self._set_clocks_from_stamps("0 1000000000", str(999_999_999_999_999_999), 0, 1_000_000_000, 10**18)
+        self.assertEqual(self.exit_hold_verdict()[0], "inconclusive", "a lower bound 1 ns under the limit is never over it")
+
+    def test_r7_b2_an_exit_stamp_read_failure_never_claims_the_handler_did_not_run(self) -> None:
+        # sol B2: a handler can write its stamp and a later read fail (a lock, a deletion, a replacement); the reader knows the READ failed and nothing about the writer
+        start, end = self.tmp / _IDENT_CHILD_QPC_START, self.tmp / _IDENT_CHILD_QPC_EXIT
+        start.write_text("100000000 10000000", encoding="ascii")
+        real_read_text = Path.read_text
+
+        def locked(path, *a, **k):
+            if path == end:
+                raise PermissionError("locked")
+            return real_read_text(path, *a, **k)
+
+        cases = []
+        end.write_text("200000000", encoding="ascii")
+        with unittest.mock.patch.object(Path, "read_text", locked):
+            cases.append(("PermissionError", _ident_read_child_evidence(start, end)))
+        end.unlink()
+        cases.append(("FileNotFoundError", _ident_read_child_evidence(start, end)))
+        end.write_bytes(b"\xff")
+        cases.append(("UnicodeDecodeError", _ident_read_child_evidence(start, end)))
+        for name, (stamps, note, lone_start) in cases:
+            self.assertIsNone(stamps, name)
+            self.assertIsNotNone(lone_start, f"{name}: the start evidence already observed is kept")
+            self.assertIn(name, note)
+            self.assertIn("exit stamp", note)
+            self.assertNotIn("never ran", note, f"{name}: a failed read proves nothing about the writer")
+            self.assertNotIn("did not run", note, name)
+
+    def test_r2_b1_a_child_run_longer_than_the_parents_own_wall_is_a_typed_failure(self) -> None:
+        # the wall bounds: a LOWER bound (the child's run) above the UPPER bound (the parent's wall, which contains it) cannot come from one monotonic clock
+        with self.assertRaises(AssertionError) as ctx:
+            _ident_gap_verdict(10.0, 20.0, 15.0)
+        self.assertIn("typed failure", str(ctx.exception))
+        self.assertEqual(_ident_gap_verdict(20.0, 20.0, 15.0)[:2], ("over", 20.0), "equal bounds are consistent")
+        self._set_clocks_from_stamps("950000000 10000000", "1100000000", 1_000_000_000, 10_000_000, 111 * 10**9)   # the child ran 15 s inside a parent wall of 10 s
+        with self.assertRaises(AssertionError) as ctx:
+            self.timing_verdicts(10.0)
+        self.assertIn("typed failure", str(ctx.exception))
+
+    def test_r2_b2_a_lower_bound_is_never_rounded_up_into_a_verdict(self) -> None:
+        # sol B2 (synthetic 2 GHz QPC): the exact gap marker -> child exit is 29999999999/2000000000 = 14.9999999995 s. Flooring BOTH endpoints made it 15.0 s and an exit HOLD
+        self._set_clocks_from_stamps("380000000000 2000000000", "430000000000", 400_000_000_001, 2_000_000_000, 216 * 10**9)
+        kind, figure, _reason = self.exit_hold_verdict()
+        self.assertNotEqual(kind, "over", f"a 14.9999999995 s gap reported as a {figure!r} s hold")
+        self.assertEqual(kind, "inconclusive")
+        with self.assertRaises(unittest.SkipTest):
+            self.assert_no_exit_hold(require_abandoned=False)
+        # the wall sibling: 59.9999999995 s exact; the start stamp rounds UP and the exit stamp DOWN, so the child's run never exceeds the real one
+        start, end = self.tmp / _IDENT_CHILD_QPC_START, self.tmp / _IDENT_CHILD_QPC_EXIT
+        start.write_text("380000000001 2000000000", encoding="ascii")
+        end.write_text("500000000000", encoding="ascii")
+        self.assertEqual(_ident_read_child_stamps(start, end), ((190_000_000_001, 250_000_000_000), "ok"))
+        self._set_clocks_from_stamps("380000000001 2000000000", "500000000000", 380_000_000_002, 2_000_000_000, 251 * 10**9)   # the marker is just after the child's first statement
+        verdicts = {what: (kind, figure) for what, kind, figure, _r in self.timing_verdicts(61.0)}
+        self.assertNotEqual(verdicts["wall"][0], "over", f"a 59.9999999995 s child run reported as a {verdicts['wall'][1]!r} s slow-call wait")
+        self.assertEqual(verdicts["wall"][0], "inconclusive")
+        # and an exactly representable lower bound at the limit still IS over
+        self._set_clocks_from_stamps("380000000000 2000000000", "430000000000", 400_000_000_000, 2_000_000_000, 216 * 10**9)
+        self.assertEqual(self.exit_hold_verdict()[:2], ("over", 15.0))
 
     def test_the_exit_estimate_tolerances_are_small_against_the_limit_and_enforced(self) -> None:
         # adversary A2 (pass 2): the estimate's uncertainty is named, is well inside the margin between the limit and the injected hold, and the tolerances are what the pair read and the step check enforce
@@ -13043,15 +13650,23 @@ class VenueProbeIdentityCallDeadlineTests(IdentityProbeMixin, unittest.TestCase)
 
     def test_a_real_hold_is_rejected_whatever_the_parent_delay_and_an_unknown_child_exit_is_a_typed_failure(self) -> None:
         for child_exit_s, parent_end_s in ((120.0, 120.1), (120.0, 136.0)):   # held 20 s; held 20 s and then the parent stalled 16 s
-            self._set_clocks(100.0, child_exit_s, parent_end_s)
-            with self.assertRaises(AssertionError) as ctx:
+            for civil_s in (child_exit_s, None):   # the child's own exit stamp decides; the civil estimate, present or not, does not
+                self._set_clocks(100.0, civil_s, parent_end_s, child_qpc=(95.0, child_exit_s))
+                with self.assertRaises(AssertionError) as ctx:
+                    self.assert_no_exit_hold()
+                self.assertIn("held the exit", str(ctx.exception), (child_exit_s, parent_end_s, civil_s))
+        for civil_s in (None, 120.0):   # no child stamp: neither the parent's end nor a civil exit time is a substitute for it
+            self._set_clocks(100.0, civil_s, 136.0)
+            with self.assertRaises(unittest.SkipTest) as ctx:
                 self.assert_no_exit_hold()
-            self.assertIn("held the exit", str(ctx.exception), (child_exit_s, parent_end_s))
-        self._set_clocks(100.0, None, 136.0)   # no child-side exit time: the parent's end is NOT a substitute for it
-        with self.assertRaises(unittest.SkipTest) as ctx:
-            self.assert_no_exit_hold()
-        self.assertIn("EXIT_HOLD_INCONCLUSIVE", str(ctx.exception))
-        self.assertNotIn("held the exit", str(ctx.exception))
+            self.assertIn("EXIT_HOLD_INCONCLUSIVE", str(ctx.exception))
+            self.assertNotIn("held the exit", str(ctx.exception))
+        for bad, why in (((95.0, 138.0), "not the same monotonic clock"), ((95.0, 97.0), "BEFORE its own end marker")):   # a child stamp that cannot be on this axis is a typed failure, never a verdict
+            self._set_clocks(100.0, None, 136.0, child_qpc=bad)
+            with self.assertRaises(AssertionError) as ctx:
+                self.exit_hold_verdict()
+            self.assertIn(why, str(ctx.exception))
+            self.assertIn("typed failure", str(ctx.exception))
 
     # r3: the figure is built from the end marker, so a marker without one, or one in another clock, is a typed failure and never an exit hold
     def test_a_marker_without_an_end_timestamp_or_in_another_clock_is_a_typed_failure_not_an_exit_hold(self) -> None:
@@ -13069,7 +13684,8 @@ class VenueProbeIdentityCallDeadlineTests(IdentityProbeMixin, unittest.TestCase)
             self.assert_no_exit_hold()
         self.assertIn("not the same monotonic clock", str(ctx.exception))
         self.assertNotIn("held the exit", str(ctx.exception))
-        held_ticks = (now - 30 * 10**9) // 100   # a marker 30 s before the process end is a hold
+        held_ticks = (now - 30 * 10**9) // 100   # a marker 30 s before the process end is a hold (the child's own exit stamp at `now` says so)
+        self.last_child_qpc = (now - 40 * 10**9, now)
         self.last_timing = _parse_probe_timing(f"VENUE_PROBE_INTERNAL_MS=10000 abandoned=1 end_qpc={held_ticks} qpc_hz=10000000")
         with self.assertRaises(AssertionError) as ctx:
             self.assert_no_exit_hold()
