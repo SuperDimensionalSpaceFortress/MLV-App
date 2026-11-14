@@ -799,6 +799,31 @@ class MeasuredSmokeSessionIdTests(unittest.TestCase):
                 self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
                 self.assertIn(expected, proc.stdout)
 
+    def test_r11_a_first_marker_or_summary_not_read_whole_is_unreadable_never_a_later_one(self) -> None:
+        # HFR-NATIVE-M16-1457-FULLSCREEN-S1S2-PRESENT-GAP-1 r11 (r10 adversary A1 sibling, playback-attr-3-cuda-job.ps1:2250/2251): a first record that
+        # starts `playback_smoke.measured_session` (or, with no marker, `playback_smoke.summary`) but has no whole `id=<n>` (`session=<n>`) right after
+        # it is unreadable. On 205a5b6c the selector needed the literal `id=` / `session=`, skipped the record and returned the later session 4.
+        for shape in ("playback_smoke.measured_session", "playback_smoke.measured_session id", "playback_smoke.measured_session  id=3",
+                      "playback_smoke.measured_session ID=3", "playback_smoke.measured_session id:3"):
+            log = f"{shape}\nplayback_smoke.summary session=3 reason=play-stop\nplayback_smoke.measured_session id=4\nplayback_smoke.summary session=4 reason=play-stop\n"
+            with self.subTest(shape=shape):
+                proc = self._run(log)
+                self.assertNotEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+                self.assertNotIn("ID=", proc.stdout)
+                self.assertIn("unreadable", normalize_pwsh_message_text(proc.stdout + proc.stderr))
+        for shape in ("playback_smoke.summary", "playback_smoke.summary session", "playback_smoke.summary reason=play-stop session=3",
+                      "playback_smoke.summary  session=3 reason=play-stop"):
+            log = f"{shape}\nplayback_smoke.summary session=4 reason=play-stop\n"
+            with self.subTest(summary=shape):
+                proc = self._run(log)
+                self.assertNotEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+                self.assertNotIn("ID=", proc.stdout)
+                self.assertIn("unreadable", normalize_pwsh_message_text(proc.stdout + proc.stderr))
+        # control: another record name is not the marker
+        proc = self._run("playback_smoke.measured_session_v2 id=9\nplayback_smoke.measured_session id=4\nplayback_smoke.summary session=4 reason=play-stop\n")
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("ID=4", proc.stdout)
+
     def test_throws_when_neither_marker_nor_summary_is_present(self) -> None:
         proc = self._run("nothing relevant here\n")
         self.assertNotEqual(proc.returncode, 0, proc.stdout + proc.stderr)

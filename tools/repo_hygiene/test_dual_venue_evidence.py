@@ -11508,6 +11508,24 @@ class SelfHealLegGatesTheL1ToL4FactsTests(unittest.TestCase):
                 for n in (1, 2, 3):
                     self.assertIsNone(got["metrics"][f"selfHealL{n}FpsRatio"])
 
+    def test_r11_an_incomplete_first_measured_session_marker_is_no_session_never_a_later_one(self) -> None:
+        """HFR-NATIVE-M16-1457-FULLSCREEN-S1S2-PRESENT-GAP-1 r11 (r10 adversary A1 sibling, AttrCudaArtifacts.psm1:3493): a first record that starts
+        `playback_smoke.measured_session` but is not read whole as `id=<n>` (no `id=`, no `=`, a doubled space, another key) is no measured session.
+        On 205a5b6c the reader required the literal `id=`, skipped it and took the later id=2 marker (the adversary's run: presented_fps=99 read)."""
+        prefix = "[2026-11-13T00:00:00.000Z] [INFO] [0x1a2b] "
+        for shape in ("playback_smoke.measured_session", "playback_smoke.measured_session id", "playback_smoke.measured_session  id=1",
+                      "playback_smoke.measured_session ID=1", "playback_smoke.measured_session session=1", "playback_smoke.measured_session id:1"):
+            log = (prefix + shape + "\n"
+                   + prefix + "playback_smoke.summary session=1 reason=visual-capture presented_frames=599 presented_fps=23.201\n"
+                   + prefix + "playback_smoke.measured_session id=2\n"
+                   + prefix + "playback_smoke.summary session=2 reason=visual-capture presented_frames=599 presented_fps=23.201\n")
+            with self.subTest(shape=shape):
+                got = self.evaluate(["good"], measured_log=log)["good"]
+                self.assertFalse(got["pass"], got)
+                self.assertEqual(sorted({f.split(" ")[0].rstrip(":") for f in got["failures"]}), [f"selfHealL{n}FpsRatio" for n in (1, 2, 3)], got["failures"])
+                for n in (1, 2, 3):
+                    self.assertIsNone(got["metrics"][f"selfHealL{n}FpsRatio"])
+
 
 class VisualCaptureSpecAndAppSourceTests(unittest.TestCase):
     """The schema's opt-out shape, the proof leg, and the app side of the capture (a source census: the app is built and run on a venue, never here)."""
@@ -16024,6 +16042,105 @@ class DueWakeMeasuredSessionAnchorTests(unittest.TestCase):
             with self.subTest(region=name):
                 self.assertIsNone(unbounded.search(body), name)
                 self.assertIn("'^[0-9]+$'", body, name)
+
+    # r11 (r10 adversary pass on 205a5b6c, A1 and A2, both introduced): a record that LOOKS like a measured-session marker or a session boundary but is
+    # not read whole is never skipped. FIRST (the selector's marker, or with none the first summary): the measured session is UNREADABLE, never a later
+    # Play. INTERVENING (inside the measured session's pace window): it ends the measured Play and blocks every leg, so the wake after it is never the
+    # measured Play's. Every leg: posted, head (send), unpaced (none) and a control binary's line (no delivery_kind) on the head spec.
+    WAKE_NONE = "playback_due_wake armed=0 fired=0 disabled=0 delivery=none post_rescued=0 post_counts_settled=1 delivery_kind=none"
+    WAKE_CONTROL = "playback_due_wake armed=1 fired=1 disabled=0 delivery=native-msg"
+    LEG_WAKES = (("posted", {"generatorArgs": {"dueWakeDeliveryPost": True}}, "WAKE_POST"), ("head", {}, "WAKE_SEND"),
+                 ("unpaced", {"generatorArgs": {"unpaced": True}}, "WAKE_NONE"), ("control", {}, "WAKE_CONTROL"))
+    MARKER_SHAPES = ("playback_smoke.measured_session", "playback_smoke.measured_session id", "playback_smoke.measured_session id=",
+                     "playback_smoke.measured_session  id=3", "playback_smoke.measured_session ID=3", "playback_smoke.measured_session session=3",
+                     "playback_smoke.measured_session id:3", "playback_smoke.measured_session id=3x", "playback_smoke.measured_session.id=3")
+    SUMMARY_SHAPES = ("playback_smoke.summary", "playback_smoke.summary session", "playback_smoke.summary session=",
+                      "playback_smoke.summary reason=play-stop session=3 presented_frames=600", "playback_smoke.summary  session=3 reason=play-stop",
+                      "playback_smoke.summary SESSION=3 reason=play-stop", "playback_smoke.summary session=3x reason=play-stop")
+    BOUNDARY_SHAPES = ("playback_smoke.measured_session id=", "playback_smoke.measured_session", "playback_smoke.measured_session id",
+                       "playback_smoke.measured_session id=4x", "playback_smoke.measured_session  id=4", "playback_smoke.start session=",
+                       "playback_smoke.start", "playback_smoke.start session", "playback_smoke.start session=4x", "playback_smoke.start  session=4",
+                       "playback_smoke.start position=0 session=4", "playback_smoke.summary session=", "playback_smoke.summary",
+                       "playback_smoke.summary session=3x reason=play-stop", "playback_smoke.conform session=", "playback_smoke.pace_summary session=",
+                       "playback_smoke.pace_summary", "playback_smoke.pace_summary session=3x", "playback_smoke.gpu_summary session=",
+                       "playback_smoke.gpu_summary session")
+
+    def leg_wake(self, attr: str) -> str:
+        return getattr(self, attr)
+
+    def assert_every_leg_blocks(self, log_for_wake, token: str, **sub) -> None:
+        for leg, spec, wake in self.LEG_WAKES:
+            v = self.wake_verdict(log_for_wake(self.leg_wake(wake)), spec)
+            with self.subTest(leg=leg, **sub):
+                self.assertEqual((v["verdict"], v["blocks"]), ("NOT_HONOURED", True), v)
+                self.assertIn(token, v["reason"], v)
+
+    def test_r11_a1_its_input_verbatim_an_incomplete_first_marker_never_selects_a_later_play(self) -> None:
+        spec = json.loads((DV / "legs" / "m16-1457-native-fullscreen-s1-wake-post.json").read_text(encoding="utf-8"))
+        log = ("playback_smoke.measured_session id\nplayback_smoke.summary session=3 reason=play-stop presented_frames=600\nplayback_smoke.pace_summary session=3\n"
+               "playback_due_wake armed=1 fired=1 disabled=0 delivery=native-msg post_rescued=0 post_counts_settled=1 delivery_kind=send\n"
+               "playback_smoke.measured_session id=4\nplayback_smoke.summary session=4 reason=play-stop presented_frames=600\nplayback_smoke.pace_summary session=4\n"
+               "playback_due_wake armed=1 fired=1 disabled=0 delivery=native-msg post_rescued=0 post_counts_settled=1 delivery_kind=post\n")
+        for name, text in (("bare", log), ("crash-forensics prefix", "\n".join(self.PREFIX + l for l in log.splitlines()) + "\n")):
+            with self.subTest(case=name):
+                self.assertEqual(self.selected(text), {"session": None, "unreadable": True})
+                v = self.wake_verdict(text, spec)
+                self.assertEqual((v["verdict"], v["blocks"]), ("NOT_HONOURED", True), v)
+                self.assertIn("DUE_WAKE_SESSION_UNREADABLE", v["reason"], v)
+
+    def test_r11_a1_class_every_first_marker_or_summary_shape_not_read_whole_is_unreadable(self) -> None:
+        def marker_log(first: str):
+            return lambda wake: "\n".join([first, "playback_smoke.summary session=3 reason=play-stop presented_frames=600", "playback_smoke.pace_summary session=3",
+                                           wake, "playback_smoke.measured_session id=4", "playback_smoke.summary session=4 reason=play-stop presented_frames=600",
+                                           "playback_smoke.pace_summary session=4", wake]) + "\n"
+
+        def summary_log(first: str):
+            return lambda wake: "\n".join([first, "playback_smoke.pace_summary session=3", wake, "playback_smoke.summary session=4 reason=play-stop presented_frames=600",
+                                           "playback_smoke.pace_summary session=4", wake]) + "\n"
+        for kind, shapes, build in (("marker", self.MARKER_SHAPES, marker_log), ("summary", self.SUMMARY_SHAPES, summary_log)):
+            for shape in shapes:
+                with self.subTest(kind=kind, shape=shape):
+                    self.assertEqual(self.selected(build(shape)(self.WAKE_SEND)), {"session": None, "unreadable": True})
+                self.assert_every_leg_blocks(build(shape), "DUE_WAKE_SESSION_UNREADABLE", kind=kind, shape=shape)
+        # controls: a marker read whole selects its session; another record name (measured_session_v2) is not a marker
+        self.assertEqual(self.selected(marker_log("playback_smoke.measured_session id=3")(self.WAKE_SEND)), {"session": "3", "unreadable": False})
+        self.assertEqual(self.selected(marker_log("playback_smoke.measured_session_v2 id=9")(self.WAKE_SEND)), {"session": "4", "unreadable": False})
+        self.assertEqual(self.selected(summary_log("playback_smoke.summary session=3 reason=play-stop")(self.WAKE_SEND)), {"session": "3", "unreadable": False})
+
+    A2_BASE = ["playback_smoke.measured_session id=3", "playback_smoke.summary session=3 reason=play-stop presented_frames=600", "playback_smoke.pace_summary session=3"]
+
+    def test_r11_a2_its_input_verbatim_an_unreadable_intervening_boundary_never_binds_the_following_wake(self) -> None:
+        spec = json.loads((DV / "legs" / "m16-1457-native-fullscreen-s1-wake-post.json").read_text(encoding="utf-8"))
+        for boundary in ("playback_smoke.measured_session id=", "playback_smoke.start session="):
+            log = "\n".join(self.A2_BASE + [boundary, self.WAKE_POST]) + "\n"
+            for name, text in (("bare", log), ("crash-forensics prefix", "\n".join(self.PREFIX + l for l in log.splitlines()) + "\n")):
+                with self.subTest(boundary=boundary, case=name):
+                    v = self.wake_verdict(text, spec)
+                    self.assertEqual((v["verdict"], v["blocks"]), ("NOT_HONOURED", True), v)
+                    self.assertIn("DUE_WAKE_SESSION_BOUNDARY_UNREADABLE", v["reason"], v)
+
+    def test_r11_a2_class_every_intervening_boundary_shape_not_read_whole_blocks_every_leg(self) -> None:
+        for shape in self.BOUNDARY_SHAPES:
+            for prefix_name, prefix in (("bare", ""), ("crash-forensics prefix", self.PREFIX)):
+                build = (lambda s, p: lambda wake: "\n".join(p + l for l in self.A2_BASE + [s, wake]) + "\n")(shape, prefix)
+                self.assert_every_leg_blocks(build, "DUE_WAKE_SESSION_BOUNDARY_UNREADABLE", shape=shape, prefix=prefix_name)
+        # controls, unchanged by r11: a same-session record, a record with no session field and the same marker keep the window open; another
+        # session's readable boundary still closes it (the posted leg then has no line, the head leg is not refused)
+        post = {"generatorArgs": {"dueWakeDeliveryPost": True}}
+        for keep in ("playback_smoke.gpu_summary session=3 frames=600", "playback_smoke.render_manifest frames=600", "playback_smoke.measured_session id=3"):
+            with self.subTest(control=keep):
+                v = self.wake_verdict("\n".join(self.A2_BASE + [keep, self.WAKE_POST]) + "\n", post)
+                self.assertEqual((v["verdict"], v["blocks"]), ("HONOURED", False), v)
+        for close in ("playback_smoke.start session=4 position=0", "playback_smoke.measured_session id=4"):
+            with self.subTest(control=close):
+                v = self.wake_verdict("\n".join(self.A2_BASE + [close, self.WAKE_POST]) + "\n", post)
+                self.assertEqual((v["verdict"], v["blocks"]), ("NOT_HONOURED", True), v)
+                self.assertIn("ROUTE_NOT_ENGAGED", v["reason"], v)
+                v = self.wake_verdict("\n".join(self.A2_BASE + [close, self.WAKE_SEND]) + "\n", {})
+                self.assertEqual((v["verdict"], v["blocks"]), ("NOT_REQUESTED", False), v)
+        # an unreadable record AFTER another session's boundary closed the window is that session's, not the measured Play's
+        v = self.wake_verdict("\n".join(self.A2_BASE + [self.WAKE_POST, "playback_smoke.start session=4", "playback_smoke.start session="]) + "\n", post)
+        self.assertEqual((v["verdict"], v["blocks"]), ("HONOURED", False), v)
 
 
 class PrepConflatedMoveLegSpecTests(unittest.TestCase):

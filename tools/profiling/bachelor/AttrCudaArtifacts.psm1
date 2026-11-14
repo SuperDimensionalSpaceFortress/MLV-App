@@ -3490,7 +3490,11 @@ function Get-AttrCudaSelfHealMetrics {
         $recordStart = '(?m)^(?:\[[^\]\r\n]*\] ){0,3}'
         if ([string]::IsNullOrEmpty($Session)) {
             # r10 (sol r9 B1 class sweep): the WHOLE id token, one plain decimal [0-9]+; a malformed first marker is no session (never its numeric prefix)
-            $sm = [regex]::Match($LogText, $recordStart + 'playback_smoke\.measured_session id=(\S*)')
+            # r11 (r10 adversary A1 sibling, its run: an incomplete first marker then id=4 read presented_fps=99): the FIRST record starting with the
+            # marker's name (any case, ending at a non-name character) is the marker, read whole (case-sensitive ` id=<[0-9]+>`) or no session
+            $first = [regex]::Match($LogText, $recordStart + '(?i:playback_smoke\.measured_session)(?![A-Za-z0-9_])[^\r\n]*')
+            if (-not $first.Success) { return $null }
+            $sm = [regex]::Match($first.Value, '^(?:\[[^\]\r\n]*\] ){0,3}playback_smoke\.measured_session id=(\S*)')
             if (-not $sm.Success -or $sm.Groups[1].Value -cnotmatch '^[0-9]+$') { return $null }
             $Session = $sm.Groups[1].Value
         }

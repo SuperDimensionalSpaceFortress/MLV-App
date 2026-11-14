@@ -2246,9 +2246,11 @@ function Get-MeasuredSmokeSessionId([string]$RawLog) {
     $recordStart = '^(?:\[[^\]]*\] ){0,3}'
     # r10 (sol r9 B1 class sweep): the id is the WHOLE token up to whitespace or the end of the line, one plain decimal [0-9]+; a malformed first
     # marker (or, with no marker, a malformed first summary) is unreadable and throws, never its numeric prefix (id=3x was 3) or a later record's id
+    # r11 (r10 adversary A1 sibling): the FIRST record starting with the marker's name (any case, ending at a non-name character) is the marker, read whole
+    # (case-sensitive ` id=`) or as the empty token: `... id`, a doubled space or `ID=` throws unreadable, never skipped for a later marker; same for the summary
     $token = $null
-    foreach ($line in ($RawLog -split "`r?`n")) { if ($line -match ($recordStart + 'playback_smoke\.measured_session id=(?<session>\S*)')) { $token = $Matches['session']; break } }
-    if ($null -eq $token) { foreach ($line in ($RawLog -split "`r?`n")) { if ($line -match ($recordStart + 'playback_smoke\.summary session=(?<session>\S*)')) { $token = $Matches['session']; break } } }
+    foreach ($line in ($RawLog -split "`r?`n")) { if ($line -match ($recordStart + 'playback_smoke\.measured_session(?![A-Za-z0-9_])')) { $token = $(if ($line -cmatch ($recordStart + 'playback_smoke\.measured_session id=(?<session>\S*)')) { $Matches['session'] } else { '' }); break } }
+    if ($null -eq $token) { foreach ($line in ($RawLog -split "`r?`n")) { if ($line -match ($recordStart + 'playback_smoke\.summary(?![A-Za-z0-9_])')) { $token = $(if ($line -cmatch ($recordStart + 'playback_smoke\.summary session=(?<session>\S*)')) { $Matches['session'] } else { '' }); break } } }
     if ($null -ne $token) {
         if ($token -cmatch '^[0-9]+$') { return $token }
         throw ("the measured playback_smoke session id is unreadable (not one whole decimal id): '" + $token + "'")
@@ -5048,8 +5050,9 @@ function Get-CorePartitionPlaybackStart([string]$LogText, $LaunchUtcTicks, $Laun
         # (the $script:DvRecordStart rule), so a marker inside another record's text never picks the session
         $recordStart = '^(?:\[[^\]]*\] ){0,3}'
         # r10 (sol r9 B1 class sweep): the WHOLE id token, one plain decimal [0-9]+; a malformed one is no session (never its numeric prefix)
-        foreach ($ln in $lines) { $mm = [regex]::Match($ln, $recordStart + 'playback_smoke\.measured_session id=(\S*)'); if ($mm.Success) { $sid = $mm.Groups[1].Value; break } }
-        if ($null -eq $sid) { foreach ($ln in $lines) { $mm = [regex]::Match($ln, $recordStart + 'playback_smoke\.summary session=(\S*)'); if ($mm.Success) { $sid = $mm.Groups[1].Value; break } } }
+        # r11 (r10 adversary A1 sibling): the FIRST record starting with the marker's (else the summary's) name is read whole or is the empty token (no session)
+        foreach ($ln in $lines) { if ($ln -match ($recordStart + 'playback_smoke\.measured_session(?![A-Za-z0-9_])')) { $mm = [regex]::Match($ln, $recordStart + 'playback_smoke\.measured_session id=(\S*)'); $sid = $(if ($mm.Success) { $mm.Groups[1].Value } else { '' }); break } }
+        if ($null -eq $sid) { foreach ($ln in $lines) { if ($ln -match ($recordStart + 'playback_smoke\.summary(?![A-Za-z0-9_])')) { $mm = [regex]::Match($ln, $recordStart + 'playback_smoke\.summary session=(\S*)'); $sid = $(if ($mm.Success) { $mm.Groups[1].Value } else { '' }); break } } }
         if ($null -eq $sid -or $sid -cnotmatch '^[0-9]+$') { return $r }
         $r.session = [int64]$sid
         $stamp = $null
@@ -7521,16 +7524,20 @@ function Get-UtilSamplePlayWindow([string]$LogText) {
         # (a build path such as "C:/b playback_smoke.measured_session id=1 x/MainWindow.cpp:1") is never taken for the measured-session or summary line
         # HFR-NATIVE-M16-1457-FULLSCREEN-S1S2-PRESENT-GAP-1 r10 (r10 adversary advisory A1): the FIRST marker's whole id token, one plain decimal [0-9]+;
         # a malformed one (id=3x) is no window, never skipped for a later Play's marker (the Get-CorePartitionPlaybackStart rule)
-        foreach ($ln in $lines) { $mm = [regex]::Match($ln, '^\[[^\]]+\] \[[^\]]*\] \[[^\]]*\] playback_smoke\.measured_session id=(\S*)'); if ($mm.Success) { $sid = $mm.Groups[1].Value; break } }
-        if ($null -eq $sid) { foreach ($ln in $lines) { $mm = [regex]::Match($ln, '^\[[^\]]+\] \[[^\]]*\] \[[^\]]*\] playback_smoke\.summary session=(\S*)'); if ($mm.Success) { $sid = $mm.Groups[1].Value; break } } }
+        # r11 (r10 adversary A1 sibling): the FIRST record starting with the marker's (else the summary's) name is read whole or is the empty token (no window)
+        $ux = '^\[[^\]]+\] \[[^\]]*\] \[[^\]]*\] '
+        foreach ($ln in $lines) { if ($ln -match ($ux + 'playback_smoke\.measured_session(?![A-Za-z0-9_])')) { $mm = [regex]::Match($ln, $ux + 'playback_smoke\.measured_session id=(\S*)'); $sid = $(if ($mm.Success) { $mm.Groups[1].Value } else { '' }); break } }
+        if ($null -eq $sid) { foreach ($ln in $lines) { if ($ln -match ($ux + 'playback_smoke\.summary(?![A-Za-z0-9_])')) { $mm = [regex]::Match($ln, $ux + 'playback_smoke\.summary session=(\S*)'); $sid = $(if ($mm.Success) { $mm.Groups[1].Value } else { '' }); break } } }
         if ($null -eq $sid -or $sid -cnotmatch '^[0-9]+$') { return $null }
         $stamp = $null; $startTh = $null
         $begins = [Collections.Generic.Dictionary[string, string]]::new()
         foreach ($ln in $lines) {
             $mm = [regex]::Match($ln, '^\[(?<ts>[^\]]+)\] \[[^\]]*\] \[(?<th>[^\]]*)\] interaction_trace event=play\.toggled\.begin checked=1(\s|$)')
             if ($mm.Success) { $begins[$mm.Groups['th'].Value] = $mm.Groups['ts'].Value; continue }
-            $mm = [regex]::Match($ln, '^\[(?<ts>[^\]]+)\] \[[^\]]*\] \[(?<th>[^\]]*)\] playback_smoke\.start session=(?<id>\d+)(\s|$)')
-            if (-not $mm.Success) { continue }
+            $mm = [regex]::Match($ln, '^\[(?<ts>[^\]]+)\] \[[^\]]*\] \[(?<th>[^\]]*)\] playback_smoke\.start session=(?<id>[0-9]+)(\s|$)')
+            # r11 (r10 adversary A2 sibling): a start record not read whole (session= empty or 4x, no session first, a doubled space) may be another
+            # Play's start, so no begin line before it can be shown to be the measured session's anchor: every begin seen so far is dropped
+            if (-not $mm.Success) { if ($ln -match ($ux + 'playback_smoke\.start(?![A-Za-z0-9_])')) { $begins.Clear() }; continue }
             if ($mm.Groups['id'].Value -ceq $sid) { $stamp = $mm.Groups['ts'].Value; $startTh = $mm.Groups['th'].Value; break }
             [void]$begins.Remove($mm.Groups['th'].Value)
         }

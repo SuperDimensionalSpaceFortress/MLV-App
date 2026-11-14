@@ -1115,9 +1115,12 @@ function Get-DvSmokeSummaryFields {
         # r10 (sol r9 B1): the id is the WHOLE token up to whitespace or the end of the line, and must be one plain decimal [0-9]+; before r10 `id=3x`,
         # `3.5` or `3/old` selected session 3 by its numeric prefix (and another Play's wake was honoured). A malformed first marker (or, with no marker,
         # a malformed first summary) makes the measured session UNREADABLE: session stays $null and sessionUnreadable is $true, never a later record's
+        # r11 (r10 adversary A1 on 205a5b6c): the FIRST record that starts with the marker's name (`playback_smoke.measured_session` ending at a non-name
+        # character, any case) is the marker, read whole (case-sensitive) or not at all: no `id=` right after it (`... id`, a doubled space, `ID=`) is the
+        # empty token, so unreadable, never skipped for a later Play's marker. The summary fallback reads the first `playback_smoke.summary` the same way.
         $token = $null
-        foreach ($line in $lines) { if ($line -match ($rs + 'playback_smoke\.measured_session id=(?<s>\S*)')) { $token = $Matches['s']; break } }
-        if ($null -eq $token) { foreach ($line in $lines) { if ($line -match ($rs + 'playback_smoke\.summary session=(?<s>\S*)')) { $token = $Matches['s']; break } } }
+        foreach ($line in $lines) { if ($line -match ($rs + 'playback_smoke\.measured_session(?![A-Za-z0-9_])')) { $token = $(if ($line -cmatch ($rs + 'playback_smoke\.measured_session id=(?<s>\S*)')) { $Matches['s'] } else { '' }); break } }
+        if ($null -eq $token) { foreach ($line in $lines) { if ($line -match ($rs + 'playback_smoke\.summary(?![A-Za-z0-9_])')) { $token = $(if ($line -cmatch ($rs + 'playback_smoke\.summary session=(?<s>\S*)')) { $Matches['s'] } else { '' }); break } } }
         if ($null -ne $token) { if ($token -cmatch '^[0-9]+$') { $session = $token } else { $sessionUnreadable = $true } }
         if ($null -ne $session) {
             $summaryLine = $null
@@ -1986,7 +1989,9 @@ function Get-DvDueWakeDeliveryEvidence {
     Play DELIVERED a wake by its route (Get-DvDueWakeDelivered: fired= minus post_rescued= of one or more); none, or a missing or unreadable count, is
     DUE_WAKE_NOT_ENGAGED. r9 (Grok G10): post_rescued= counts only beside exactly one post_counts_settled=1 on the same line; an unsettled, missing,
     repeated or malformed flag is unreadable there, so DUE_WAKE_NOT_ENGAGED on both paths. r10 (sol r9 B1): a malformed measured-session id (id=3x, 3.5,
-    3/old; Get-DvSmokeSummaryFields sessionUnreadable) blocks every leg, exempt ones included (DUE_WAKE_SESSION_UNREADABLE). EXEMPT: a control binary's line (no delivery_kind; its binary is not under test) and an unpaced leg (it never arms).
+    3/old; Get-DvSmokeSummaryFields sessionUnreadable) blocks every leg, exempt ones included (DUE_WAKE_SESSION_UNREADABLE). r11 (r10 adversary A1/A2): so
+    does a first marker not read whole (no id=, a doubled space), and a session boundary inside the measured window not read whole ends the measured Play
+    and blocks every leg too (DUE_WAKE_SESSION_BOUNDARY_UNREADABLE). EXEMPT: a control binary's line (no delivery_kind; its binary is not under test) and an unpaced leg (it never arms).
     Pure and shared: the runner gates on it and Test-DvReceiptValid re-derives it from the hashed run log.
     #>
     param([Parameter(Mandatory)]$Spec, [AllowNull()][AllowEmptyString()][string]$LogText)
@@ -2003,6 +2008,8 @@ function Get-DvDueWakeDeliveryEvidence {
     $candidates = New-Object System.Collections.Generic.List[string]
     $paces = 0
     $sessionUnreadable = $false
+    # r11 (r10 adversary A2): a session boundary inside the measured window that is not read whole (see the loop below)
+    $boundaryUnreadable = $false
     if (-not [string]::IsNullOrEmpty($LogText)) {
         $picked = Get-DvSmokeSummaryFields -LogText $LogText
         $session = $picked.session
@@ -2015,12 +2022,31 @@ function Get-DvDueWakeDeliveryEvidence {
             $start = $script:DvRecordStart
             $paceRx = $start + 'playback_smoke\.pace_summary session=' + [regex]::Escape([string]$session) + '(?:\s|$)'
             $open = $false
+            # r11 (r10 adversary A2 on 205a5b6c): a session boundary inside the open window that is not read whole ENDS the measured Play and marks
+            # the read unreadable (DUE_WAKE_SESSION_BOUNDARY_UNREADABLE below, every leg), so the wake after it is never credited to the measured Play.
+            # A boundary is: a measured_session marker (read whole: ` id=<[0-9]+>`), a start / summary / conform / pace_summary record, or any
+            # playback_smoke record whose first field is session (read whole: ` session=<[0-9]+>`); the empty `id=` / `session=`, no `=`, a doubled
+            # space, `4x`, or a start with no session first are each unreadable. A boundary read whole of another session still just closes it.
+            $nameEnd = '(?![A-Za-z0-9_])'
             foreach ($l in (Get-DvLogRecordBodies -LogText $LogText)) {
-                if ($l -match ($start + 'playback_smoke\.pace_summary session=')) { $open = ($l -match $paceRx); if ($open) { $paces++ }; continue }
+                if ($l -match ($start + 'playback_smoke\.pace_summary' + $nameEnd)) {
+                    if ($open -and $l -cnotmatch ($start + 'playback_smoke\.pace_summary session=[0-9]+(?:\s|$)')) { $boundaryUnreadable = $true }
+                    $open = ($l -cmatch $paceRx); if ($open) { $paces++ }; continue
+                }
                 # r2 adversary pass 6 A2: any playback_smoke record of ANOTHER session (its start, summary, ...) closes the window, so another Play's
                 # wake line never stands in for the measured Play's missing one. r5 (r4 adversary pass 10 advisory A3): measured_session names its
                 # session with id=, not session=, and closes the window the same way
-                if ($open -and $l -match ($start + 'playback_smoke\.(?:measured_session id=|[A-Za-z0-9_]+ session=)(?<s>\S+)') -and $Matches['s'] -cne [string]$session) { $open = $false; continue }
+                if ($open) {
+                    $bid = $null; $isBoundary = $false
+                    if ($l -match ($start + 'playback_smoke\.measured_session' + $nameEnd)) {
+                        $isBoundary = $true; if ($l -cmatch ($start + 'playback_smoke\.measured_session id=(?<s>[0-9]+)(?:\s|$)')) { $bid = $Matches['s'] }
+                    }
+                    elseif ($l -match ($start + 'playback_smoke\.(?:start|summary|conform)' + $nameEnd) -or $l -match ($start + 'playback_smoke\.[A-Za-z0-9_]+\s+session' + $nameEnd)) {
+                        $isBoundary = $true; if ($l -cmatch ($start + 'playback_smoke\.[A-Za-z0-9_]+ session=(?<s>[0-9]+)(?:\s|$)')) { $bid = $Matches['s'] }
+                    }
+                    if ($isBoundary -and $null -eq $bid) { $boundaryUnreadable = $true; $open = $false; continue }
+                    if ($isBoundary -and $bid -cne [string]$session) { $open = $false; continue }
+                }
                 # r1 adversary pass 2 A4: the window stays open to the next pace_summary, so a second line in it is seen (and is unreadable).
                 # r2 adversary pass 6 A1: ANY playback_due_wake record (the app prints exactly one shape, starting armed=) is a candidate, so a second
                 # one without armed= makes the read unreadable instead of being skipped
@@ -2099,6 +2125,11 @@ function Get-DvDueWakeDeliveryEvidence {
         # r10 (sol r9 B1, its input: `playback_smoke.measured_session id=3x` before session 3's posted wake and a valid id=4 was HONOURED): FAIL CLOSED for
         # every leg, the posted one and the head arm alike; never the numeric prefix's wake and never a later session's
         $verdict = 'NOT_HONOURED'; $reason = 'DUE_WAKE_SESSION_UNREADABLE: the first playback_smoke.measured_session id= (or, with none, the first playback_smoke.summary session=) is not one whole decimal id up to whitespace or the end of the line, so no playback_due_wake line can be read as the measured Play''s'
+    }
+    elseif ($boundaryUnreadable) {
+        # r11 (r10 adversary A2, its input: an empty `playback_smoke.measured_session id=` or `playback_smoke.start session=` after session 3's pace_summary,
+        # then a posted wake, was HONOURED): the boundary may be another Play's, so no wake after it is the measured Play's; FAIL CLOSED for every leg
+        $verdict = 'NOT_HONOURED'; $reason = 'DUE_WAKE_SESSION_BOUNDARY_UNREADABLE: inside the measured session''s window (after its playback_smoke.pace_summary) a playback_smoke session boundary (measured_session, start, summary, conform, pace_summary, or a record whose first field is session) is not read whole as id=<n> / session=<n>, so the measured Play''s end is unknown and no later playback_due_wake line can be read as its own'
     }
     elseif ($requested) {
         $verdict = 'NOT_HONOURED'
