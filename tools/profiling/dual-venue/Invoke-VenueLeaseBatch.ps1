@@ -1641,6 +1641,17 @@ function Get-LeaseEndUtc($Result) {
     } catch { $null }
 }
 
+function ConvertTo-AgentUtc($Value) {
+    # LEASE-BATCH-IDLE-END-UNSEEN-1 r2 (adversary r2 A2): an agent stamp as a UTC DateTime, read by what ConvertFrom-Json handed back (Get-LeaseEndUtc's rule): a DateTime by its
+    # Kind (Unspecified read as UTC, like a zone-less string), a DateTimeOffset by its offset, a string as UTC unless it names an offset. $null when it is none of these or unreadable.
+    if ($Value -is [DateTime]) { if ($Value.Kind -eq [DateTimeKind]::Unspecified) { return [DateTime]::SpecifyKind($Value, [DateTimeKind]::Utc) }; return $Value.ToUniversalTime() }
+    if ($Value -is [DateTimeOffset]) { return $Value.UtcDateTime }
+    if ($Value -isnot [string]) { return $null }
+    $o = [DateTimeOffset]::MinValue
+    if ([DateTimeOffset]::TryParse($Value, [Globalization.CultureInfo]::InvariantCulture, ([Globalization.DateTimeStyles]::AssumeUniversal -bor [Globalization.DateTimeStyles]::AdjustToUniversal), [ref]$o)) { return $o.UtcDateTime }
+    $null
+}
+
 function Get-LeaseIdleEnd([string]$Token, [string]$LeaseId) {
     # LEASE-BATCH-IDLE-END-UNSEEN-1: the agent releases a parked batch lease after LeaseBatchIdleSec (300 s) with no job (ultra-magnus-agent.ps1 Update-LeaseBatchHold) and writes its
     # receipt line (endReason=idle) at once. A quiet probe that waits in Wait-VenueQuiet's queue gate submits no job for that long, so the lease can end under the wait while the runner
@@ -2198,10 +2209,12 @@ while ($pending.Count -gt 0 -and $null -eq $stopReason) {
                 # above was taken on a lease that is gone. No leg is launched on it and no more room is counted: the batch ends typed (never LEASE_LOST) and the leg goes to the next batch.
                 $ie = Get-LeaseIdleEnd $token ([string]$b.leaseId)
                 if ($null -ne $ie) {
-                    $ieAt = [DateTimeOffset]::MinValue
-                    if ([DateTimeOffset]::TryParse([string]$ie.endedUtc, [Globalization.CultureInfo]::InvariantCulture, ([Globalization.DateTimeStyles]::AssumeUniversal -bor [Globalization.DateTimeStyles]::AdjustToUniversal), [ref]$ieAt) -and $ieAt.UtcDateTime -lt $leaseEnd) { $leaseEnd = $ieAt.UtcDateTime; $b.leaseEndUtc = $leaseEnd.ToString('o') }
+                    # r2 (adversary r2 A2, opus r1 H1): the agent's instant by what ConvertFrom-Json handed back, never through [string] (that drops a DateTime's zone)
+                    $ieAt = ConvertTo-AgentUtc $ie.endedUtc
+                    if ($null -ne $ieAt -and $ieAt -lt $leaseEnd) { $leaseEnd = $ieAt; $b.leaseEndUtc = $leaseEnd.ToString('o') }
                     $b.endReason = 'LEASE_IDLE_ENDED'; $b.endDetail = "the agent released lease $($b.leaseId) as idle (endedUtc=$($ie.endedUtc) heldSec=$($ie.heldSec) why=$($ie.why)) while the probe for leg $($leg.name) waited: no leg launched, it goes to the next batch"
-                    L "LEASE_IDLE_ENDED batch=$batchNo leg=$($leg.name) lease=$($b.leaseId) endedUtc=$($ie.endedUtc) heldSec=$($ie.heldSec) (the probe's reading is void: no leg launched, no more room counted)"
+                    # r2 (adversary r2 A1): best effort, so a batch.log append failure cannot turn the typed end into BATCH_ERROR and drop the pending leg
+                    LogBest "LEASE_IDLE_ENDED batch=$batchNo leg=$($leg.name) lease=$($b.leaseId) endedUtc=$($ie.endedUtc) heldSec=$($ie.heldSec) (the probe's reading is void: no leg launched, no more room counted)"
                     break
                 }
                 # adversary r2b A3: the leg's thermal state is made here, so the first KNOWN heat reading counts even from a busy (COOLDOWN_UNMET) probe: heatAtProbe is
@@ -2315,7 +2328,7 @@ while ($pending.Count -gt 0 -and $null -eq $stopReason) {
                 # LEASE-BATCH-IDLE-END-UNSEEN-1 (adversary A1): and the run's deadline, so the receipt read after the probe (or any slow guard) cannot carry the run past it into a launch
                 if ([DateTime]::UtcNow -ge $deadline) {
                     $b.legsAttempted--; $b.endReason = 'DEADLINE'; $b.endDetail = "at the launch of leg $($leg.name): the run deadline passed (deadline=$($deadline.ToString('o'))): no leg launched"
-                    L "DEADLINE batch=$batchNo leg=$($leg.name) phase=launch (the run deadline passed after the probe: no leg launched)"; Set-Stop 'DEADLINE' 3
+                    Set-Stop 'DEADLINE' 3; LogBest "DEADLINE batch=$batchNo leg=$($leg.name) phase=launch (the run deadline passed after the probe: no leg launched)"   # r2 (adversary r2 A1): typed first, logged best effort
                     break
                 }
                 if ($cl -or $roomAtLaunch -lt $legBudget) {

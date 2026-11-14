@@ -779,6 +779,17 @@ class VenueLeaseBatchRunnerTests(unittest.TestCase):
         res = batch_result(r.stdout)
         self.assertEqual((res["ran"], res["counted"]), (2, 2))
 
+    def test_lease_batch_idle_end_r2_adv_a2_the_idle_clamp_is_the_agents_instant_on_any_host_offset(self) -> None:
+        # adversary r2 pass 2 A2 / opus r1 H1: the clamp cast ConvertFrom-Json's endedUtc (an offset stamp becomes a Local DateTime) through [string], dropping the zone, so on a
+        # host west or east of UTC leaseEndUtc moved by the host's offset. The fake agent stamps endedUtc with '+00:00' at the probe; the clamp must land on that instant.
+        before = datetime.now(timezone.utc)
+        r = self.run_batch(self.specs[:2], FAKE_QUIET_MODES="QUIET,IDLE,QUIET")
+        after = datetime.now(timezone.utc)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        b1 = self.batches()[0]
+        lease_end = datetime.fromisoformat(b1["leaseEndUtc"].replace("Z", "+00:00"))
+        self.assertTrue(before - timedelta(seconds=5) <= lease_end <= after + timedelta(seconds=5), (b1["leaseEndUtc"], before, after))
+
     def test_a_leg_that_finished_after_the_agent_idled_its_lease_is_typed_idle_ended_not_lease_lost(self) -> None:
         # the idle release landing after the pre-launch read: the leg's job took a fresh lease under the token (not the batch's), and the agent's receipt for the batch lease says idle
         r = self.run_batch(self.specs[:2], FAKE_LEG_LOSE="1", FAKE_LEG_IDLE_END="1")
@@ -2779,6 +2790,32 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
         self.assertEqual(batch_result(r.stdout)["ran"], 4)
         self.assertIn("BATCH_LOG_FAILED the batch log cannot be written (simulated result-line append failure)", r.stderr)
+
+    def test_lease_batch_idle_end_r2_adv_a1_a_log_failure_at_the_idle_end_keeps_the_typed_stop_and_the_leg(self) -> None:
+        # adversary r2 pass 2 A1 (adversary-bd508a0e.json): the LEASE_IDLE_ENDED line was logged with L, which rethrows a batch.log append failure, so the typed end became
+        # BATCH_ERROR/12 and the pending leg NOT_RUN. The line is best effort: the batch ends LEASE_IDLE_ENDED and the leg runs in the next batch.
+        anchor = "function L([string]$Message) {\n"
+        runner = self._patched_runner(anchor, anchor + "    if ($Message -like 'LEASE_IDLE_ENDED*') { throw [IO.IOException]::new('simulated: batch.log held') }\n")
+        args, e = self.plan_cmd(self.ab_block_plan(), "-PlanOrder", "Interleave")
+        args[args.index("-File") + 1] = str(runner)
+        e = dict(e, FAKE_QUIET_MODES="QUIET,IDLE,QUIET")
+        r = subprocess.run(args, capture_output=True, text=True, timeout=180, env=e)
+        res = batch_result(r.stdout)
+        self.assertEqual((r.returncode, res["stopReason"], res["ran"], res["notRun"]), (0, res["stopReason"], 4, 0), r.stdout + r.stderr)
+        self.assertEqual(self.batches()[0]["endReason"], "LEASE_IDLE_ENDED", self.batches()[0])
+        self.assertIn("BATCH_LOG_FAILED", r.stderr)
+
+    def test_lease_batch_idle_end_r2_adv_a1_sibling_a_log_failure_at_the_launch_deadline_keeps_deadline_exit_3(self) -> None:
+        dl = utc_iso(datetime.now(timezone.utc) + timedelta(seconds=25))
+        anchor = "function L([string]$Message) {\n"
+        runner = self._patched_runner(anchor, anchor + "    if ($Message -like 'DEADLINE batch=*phase=launch*') { throw [IO.IOException]::new('simulated: batch.log held') }\n")
+        args, e = self.plan_cmd(self.ab_block_plan(), "-PlanOrder", "Interleave", "-DeadlineUtc", dl)
+        args[args.index("-File") + 1] = str(runner)
+        e = dict(e, FAKE_QUIET_MODES="PASTDEADLINE", FAKE_DEADLINE_UTC=dl)
+        r = subprocess.run(args, capture_output=True, text=True, timeout=180, env=e)
+        res = batch_result(r.stdout)
+        self.assertEqual((r.returncode, res["stopReason"], res["ran"]), (3, "DEADLINE", 0), r.stdout + r.stderr)
+        self.assertEqual(self.batches()[0]["endReason"], "DEADLINE", self.batches()[0])
 
     def test_r7_sol_a_final_result_append_that_fails_is_counted_in_the_logwritefailures_the_result_line_reports(self) -> None:
         # sol r6b blocker: logWriteFailures was serialized into the result line BEFORE the final append was attempted, so an IOException on that append left the live
