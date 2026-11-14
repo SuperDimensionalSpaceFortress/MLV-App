@@ -952,6 +952,69 @@ class VenueStageNightlyTests(unittest.TestCase):
                 self.assertNotIn("STAGE_RESERVED", [r["outcome"] for r in self.rows()])
                 self.assertLess(took, int(cap) + 10, f"the call ran {took:.1f} s against a {cap} s cap")
 
+    # ---------------------------------------------------------------- r9 (Grok G9/G14 on #814, adversary A1/A2 on be203fe6)
+    STARTS = "the soundness read of the staged build of {sha} {when} starts"
+
+    def test_r9_g14_a_cap_under_1s_at_the_step4_soundness_read_ends_the_call_before_any_read(self) -> None:
+        # G14: the cap has 0.5 s left after the read's probe bound was taken (-TestSoundnessCapLeftSec). The guard ends the call STAGE_CAP_EXCEEDED (exit 50)
+        # before Get-VenueStagedBuildManifest is called (its "starts" line is never printed), with the step-4 wording; nothing is built or submitted.
+        self.stage_cache()
+        p = self.run_driver("-TestSoundnessCapLeftSec", "0.5", "-TestSoundnessCapAt", "first", probe="5")
+        self.assert_exit(p, "STAGE_CAP_EXCEEDED")
+        self.assertEqual(p.returncode, 50)
+        self.assertRegex(p.stdout, rf"cap ran out before the soundness read of the staged build of {SHA} before anything was built could start \(0(\.\d+)? s left\); nothing was submitted")
+        self.assertNotIn(self.STARTS.format(sha=SHA, when="before anything was built"), p.stdout, "Get-VenueStagedBuildManifest was called")
+        self.assertNotIn("ran to the end of", p.stdout)
+        self.nothing_built_or_submitted()
+
+    def test_r9_g14_a_cap_under_1s_at_the_final_verify_soundness_read_ends_the_call_before_any_read(self) -> None:
+        # G14 + G13: the same at the final verify of a call that submitted its stage job; the refusal says the stage job was submitted and nothing is recorded as staged
+        p = self.run_driver("-TestSoundnessCapLeftSec", "0.5", "-TestSoundnessCapAt", "final", probe="5")
+        self.assert_exit(p, "STAGE_CAP_EXCEEDED")
+        self.assertEqual(p.returncode, 50)
+        self.assertRegex(p.stdout, rf"cap ran out before the soundness read of the staged build of {SHA} at the final verify could start \(0(\.\d+)? s left\); the stage job was submitted; not recorded as staged")
+        self.assertNotIn(self.STARTS.format(sha=SHA, when="at the final verify"), p.stdout, "Get-VenueStagedBuildManifest was called")
+        self.assertEqual(len(self.calls("STAGEGEN")), 1, "the stage job was emitted and submitted before the final verify")
+        self.assertNotIn("STAGE_OK", [r["outcome"] for r in self.rows()])
+
+    def test_r9_a2_a_final_verify_refusal_of_a_call_that_submitted_no_stage_job_says_so(self) -> None:
+        # adversary A2 on be203fe6: the build was already in the cache (only its runner was missing), so no stage job was submitted; the final verify's refusal never
+        # claims one was
+        self.stage_cache(runner=False)
+        p = self.run_driver("-TestSoundnessCapLeftSec", "0.5", "-TestSoundnessCapAt", "final", probe="5")
+        self.assert_exit(p, "STAGE_CAP_EXCEEDED")
+        self.assertRegex(p.stdout, r"at the final verify could start \(0(\.\d+)? s left\); this call submitted no stage job; not recorded as staged")
+        self.assertNotIn("the stage job was submitted", p.stdout)
+
+    def test_r9_a1_a_staged_answer_that_arrives_after_the_deadline_is_never_acted_on(self) -> None:
+        # adversary A1 on be203fe6: the read's cap sample left 4 s, then a 5 s scheduling delay (-TestSoundnessPostCapDelayMs) came before the call. The module bounds
+        # the read on its own clock from the call, so a SOUND build answered STAGED after the deadline, and step 4 recorded STAGE_SKIP_ALREADY (exit 0) past the cap.
+        self.stage_cache()
+        p = self.run_driver("-TestSoundnessCapLeftSec", "4", "-TestSoundnessPostCapDelayMs", "5000", "-TestSoundnessCapAt", "first", probe="5")
+        self.assert_exit(p, "STAGE_CAP_EXCEEDED")
+        self.assertRegex(p.stdout, rf"the soundness read of the staged build of {SHA} before anything was built answered STAGED [0-9.]+ s after the \d+ s cap ran out; an answer past the cap is never acted on; nothing was submitted")
+        self.assertNotIn("STAGE_SKIP_ALREADY", [r["outcome"] for r in self.rows()])
+        self.nothing_built_or_submitted()
+
+    def test_r9_g9_the_artifact_delay_seam_takes_its_read_in_any_case(self) -> None:
+        # G9: ValidateSet is case-insensitive, so FINAL and First bind; with -ceq the seam silently dropped the delay. Each spelling delays its read (the call takes
+        # the 8 s) and ends with the lowercase run's verdict (test_the_final_verify_artifact_hash_past_the_probe_timeout_with_cap_left_is_stage_ok, STAGE_OK).
+        t0 = time.monotonic()
+        p = self.run_driver("-TestSoundnessArtifactDelayMs", "8000", "-TestSoundnessArtifactDelayAt", "FINAL", probe="5")
+        took = time.monotonic() - t0
+        self.assert_exit(p, "STAGE_OK")
+        self.assertGreaterEqual(took, 8.0, f"FINAL dropped the delay: the call took {took:.1f} s")
+
+    def test_r9_g9_the_artifact_delay_seam_takes_its_first_read_in_any_case(self) -> None:
+        # G9: the same for First at step 4 (the lowercase run is test_step4_artifact_hash_past_the_probe_timeout_with_cap_left_is_skip_already, STAGE_SKIP_ALREADY)
+        self.stage_cache()
+        t0 = time.monotonic()
+        p = self.run_driver("-TestSoundnessArtifactDelayMs", "8000", "-TestSoundnessArtifactDelayAt", "First", probe="5")
+        took = time.monotonic() - t0
+        self.assert_exit(p, "STAGE_SKIP_ALREADY")
+        self.assertGreaterEqual(took, 8.0, f"First dropped the delay: the call took {took:.1f} s")
+        self.nothing_built_or_submitted()
+
     # ---------------------------------------------------------------- r6 fix iteration (adversary pass on 424df284, A1-A2, RED first)
     def test_a_source_commit_with_a_trailing_newline_is_refused_at_binding_everywhere(self) -> None:
         # A1: ValidatePattern('^[0-9a-f]{40}$') accepted '<40 hex>\n' ('$' matches before a final newline). The stage job then derived the same cache
@@ -1302,10 +1365,11 @@ class SoundnessReadCapNeverZeroTests(unittest.TestCase):
         # Grok G13: the final verify runs after the stage job was submitted, so its refusals never say "nothing was submitted"; step 4 and step 8 still do.
         text = DRIVER.read_text(encoding="utf-8")
         body = re.search(r"(?ms)^function Read-StagedSoundness\(.*?^\}", text).group(0)
-        self.assertIn("$notDone = $(if ($FinalVerify) { 'the stage job was submitted; not recorded as staged' } else { 'nothing was submitted' })", body)
+        self.assertIn("$notDone = $(if (-not $FinalVerify) { 'nothing was submitted' } elseif ($script:Row.steps.stage -cin @('staged', 'staged-suffix')) "
+                      "{ 'the stage job was submitted; not recorded as staged' } else { 'this call submitted no stage job; not recorded as staged' })", body)
         self.assertNotIn("nothing was submitted\"", body, "a refusal in the soundness read hard-codes the step-4 wording")
         refusals = re.findall(r"Stop-Nightly 'STAGE_CAP_EXCEEDED' \"[^\"]*\"", body)
-        self.assertEqual(len(refusals), 2, refusals)
+        self.assertEqual(len(refusals), 3, refusals)  # r9 fix iteration (adversary A1 on be203fe6): an answer past the cap is the third
         for r in refusals:
             self.assertTrue(r.endswith("; $notDone\""), r)
         self.assertLess(body.index("$notDone = "), body.index("if ($capSec -lt 1.0)"))

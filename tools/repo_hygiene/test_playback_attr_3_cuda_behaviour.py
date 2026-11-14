@@ -1166,6 +1166,36 @@ class StagedBuildNeverReplacedTests(_PwshCase):
         self.assertEqual(a.returncode, 0, f"{out}\n{err}")
         self.assertEqual(self.manifest_sha(), hashlib.sha256((self.tmp / "build-f8fc75a2" / self.manifest_name).read_bytes()).hexdigest())
 
+    def test_r9_g8_an_unsound_manifest_replaced_before_its_retirement_is_left_and_nothing_is_staged(self) -> None:
+        # r9 (Grok G8 on #814): STAGE_REFUSED_STAGED_UNRETIRED. The guard judged the cached manifest unsound (its artifacts are absent); before the retirement by
+        # content proof, other bytes took the name (the -TestHoldBeforeRetirePath seam). The removal finds bytes it never judged: they are left, nothing is staged.
+        first = self.stage("ad005766", suffix="first")
+        self.assertEqual(first.returncode, 0, f"{first.stdout}\n{first.stderr}")
+        for e in list(self.cache.iterdir()):
+            if e.name != self.manifest_name and e.is_file():
+                e.unlink()
+        job = self.emit("f8fc75a2", suffix="unretired")
+        hold = self.tmp / "hold-retire"
+        cmd = [PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", str(job), "-TestHoldBeforeRetirePath", str(hold)]
+        a = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        foreign = b'{"foreign":"another stager wrote these bytes after the guard read"}'
+        try:
+            t0 = time.monotonic()
+            while not Path(f"{hold}.reached").exists() and a.poll() is None and time.monotonic() - t0 < 90:
+                time.sleep(0.1)
+            self.assertTrue(Path(f"{hold}.reached").exists(), "the stager never reached the retirement")
+            (self.cache / self.manifest_name).write_bytes(foreign)
+            before = sorted((e.name, e.stat().st_size) for e in self.cache.iterdir() if e.is_file())
+        finally:
+            hold.write_text("", encoding="utf-8")
+            out, err = a.communicate(timeout=180)
+        self.assertEqual(a.returncode, 7, f"{out}\n{err}")
+        self.assertIn("STAGE_REFUSED_STAGED_UNRETIRED sha=", out)
+        self.assertIn("RESULT=STAGE_FAILED STEP=stagedBuildGuard EXIT=7", out)
+        self.assertEqual((self.cache / self.manifest_name).read_bytes(), foreign, "the foreign manifest was not left in place")
+        self.assertEqual(sorted((e.name, e.stat().st_size) for e in self.cache.iterdir() if e.is_file()), before, "an artifact was renamed into the cache")
+        self.assertEqual(before, [(self.manifest_name, len(foreign))])
+
     def test_r8_a_manifest_replaced_or_retired_while_its_artifacts_are_hashed_is_never_sound(self) -> None:
         # r8 (adversary A1 on 0c0eafd7, reader side, VenueChain.psm1 Get-VenueStagedBuildManifest): the manifest read answered for M0's bytes, then a stager retired or
         # replaced M0 before the artifact hash. The default hash reads the manifest again last: gone -> BUILD_ARTIFACT_MISSING, other bytes -> BUILD_ARTIFACT_MISMATCH.
@@ -1189,6 +1219,9 @@ class StagedBuildNeverReplacedTests(_PwshCase):
                     name=f"swapped-{case}.ps1",
                 )
                 self.assertRegex(proc.stdout, rf"STATE=STAGED ARTIFACT=\[{code} [^\]]*{re.escape(self.manifest_name)}", proc.stdout + proc.stderr)
+                # r9 (Grok G11 on #814): the typed code stays; the cause named is the manifest, never a missing or stale exe
+                self.assertIn(f"ARTIFACT=[{code} the build manifest was retired or replaced while its artifacts were hashed: manifest {self.manifest_name}", proc.stdout)
+                self.assertNotIn("the cached artifact", proc.stdout)
 
     def test_the_stage_lock_is_the_caches_and_the_shas_never_a_callers_name(self) -> None:
         # A3 siblings: the lock is taken before the never-replace guard and held through publishRename (:442), the manifest slot (:451) and its publish (:454)

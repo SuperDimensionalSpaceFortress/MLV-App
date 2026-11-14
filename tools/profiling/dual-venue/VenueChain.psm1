@@ -768,7 +768,10 @@ function Get-VenueStagedBuildManifest {
             $notime = @($lines | Where-Object { $_.StartsWith('NOTIME:') } | ForEach-Object { $p = $_.Split(':', 3); "$($p[1]) $($p[2])" })
             # a file found absent or different before the time ran out is still that typed problem; with none, a file never started is a hash that did not finish (UNREACHABLE)
             if (-not $missing.Count -and -not $differs.Count -and $notime.Count) { return [pscustomobject]@{ state = 'UNREACHABLE'; sha256 = $null; path = $path; error = "the cached artifacts could not be hashed: no time is left of -TimeoutSec $([Math]::Round($TimeoutSec, 2)) to start hashing $($notime[0]) (under $ArtifactMinSec s left)"; contentProblem = $null; artifactProblem = $null; artifactsUnhashed = $true } }
-            $artifactProblem = $(if ($missing.Count) { "BUILD_ARTIFACT_MISSING the cached artifact is absent from $cacheDir`: $($missing -join '; ') (the leg job hashes it against the build manifest and throws after the lease opened)" }
+            # r9 (Grok G11 on #814): the manifest item gone or changed keeps its typed code, but its cause is the manifest, never a missing exe
+            $manifestGone = @(@($missing) + @($differs) | Where-Object { $_.StartsWith('manifest ') })
+            $artifactProblem = $(if ($manifestGone.Count) { "$(if (@($missing | Where-Object { $_.StartsWith('manifest ') }).Count) { 'BUILD_ARTIFACT_MISSING' } else { 'BUILD_ARTIFACT_MISMATCH' }) the build manifest was retired or replaced while its artifacts were hashed: $($manifestGone -join '; ') in $cacheDir" }
+                elseif ($missing.Count) { "BUILD_ARTIFACT_MISSING the cached artifact is absent from $cacheDir`: $($missing -join '; ') (the leg job hashes it against the build manifest and throws after the lease opened)" }
                 elseif ($differs.Count) { "BUILD_ARTIFACT_MISMATCH the cached artifact does not hash to the build manifest's digest in ${cacheDir}: $($differs -join '; ') (the leg job throws after the lease opened)" }
                 else { '' })
         }

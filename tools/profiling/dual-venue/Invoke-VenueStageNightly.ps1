@@ -110,7 +110,13 @@ param(
     # cached package does (Get-VenueStagedBuildManifest -TestArtifactDelayMs): -TestSoundnessArtifactDelayAt first = the call's first soundness read, final = the
     # final verify's. Production passes none.
     [ValidateRange(0, 600000)][int]$TestSoundnessArtifactDelayMs = 0,
-    [ValidateSet('first', 'final')][string]$TestSoundnessArtifactDelayAt = 'first'
+    [ValidateSet('first', 'final')][string]$TestSoundnessArtifactDelayAt = 'first',
+    # Test-only (r9, Grok G14 + adversary A1 on be203fe6): at one soundness read (-TestSoundnessCapAt first = the call's first, final = the final verify's),
+    # -TestSoundnessCapLeftSec moves the call's deadline to that many seconds after the read's probe bound was taken (a cap spent down to it; -1 = off), and
+    # -TestSoundnessPostCapDelayMs sleeps between the read's cap sample and the read itself (a scheduling delay). Production passes none.
+    [ValidateRange(-1.0, 86400.0)][double]$TestSoundnessCapLeftSec = -1,
+    [ValidateRange(0, 60000)][int]$TestSoundnessPostCapDelayMs = 0,
+    [ValidateSet('first', 'final')][string]$TestSoundnessCapAt = 'first'
 )
 $ErrorActionPreference = 'Stop'
 $here = $PSScriptRoot
@@ -251,6 +257,9 @@ function Read-Share([string]$What, [scriptblock]$Script, [object[]]$ArgList) {
     if ($b.timedOut -and $sec -lt $ProbeTimeoutSec) { Stop-Nightly 'STAGE_CAP_EXCEEDED' "reading $What : $($b.error), the rest of the $MaxTotalSec s cap" }
     if ($b.timedOut) { Stop-Nightly 'SHARE_UNREACHABLE' "reading $What : $($b.error)" }
     if (-not $b.ok) { Stop-Nightly 'SHARE_UNREACHABLE' "reading $What failed: $($b.error)" }
+    # r9 fix iteration (adversary A1 on be203fe6, sibling): an answer that arrived after the deadline is never acted on
+    $past = ([DateTime]::UtcNow - $script:Deadline).TotalSeconds
+    if ($past -ge 0.0) { Stop-Nightly 'STAGE_CAP_EXCEEDED' "reading $What answered $([Math]::Round($past, 2)) s after the $MaxTotalSec s cap ran out; an answer past the cap is never acted on" }
     $b.value
 }
 
@@ -270,22 +279,31 @@ function Read-StagedSoundness([string]$When, [switch]$FinalVerify) {
     # probe here: r2 (A3 on 90b1c58e) by min(-ProbeTimeoutSec, what is left of -MaxTotalSec). r3 (adversary A2 on ce5a0380): STAGE_CAP_EXCEEDED only when the cap
     # really ran out during the read (under the 1 s Get-ProbeSec needs for any read); a read that failed with time left is an UNREACHABLE answer the caller types.
     $soundSec = Get-ProbeSec "the soundness of the staged build of $commit"
+    $atSeam = ($TestSoundnessCapAt -ieq 'first' -and $script:SoundnessReads -eq 0) -or ($TestSoundnessCapAt -ieq 'final' -and $FinalVerify)
+    if ($atSeam -and $TestSoundnessCapLeftSec -ge 0) { $script:Deadline = [DateTime]::UtcNow.AddSeconds($TestSoundnessCapLeftSec) }
     # r6 (Grok G6/G7 on #814): the manifest read keeps that probe bound, and the artifact hash (the package zip, exe and dll over SMB) gets its OWN budget, the
     # lease batch plan preflight's (-ArtifactTimeoutSec 300, Invoke-VenueLeaseBatch.ps1), never past what is left of -MaxTotalSec (-CallCapSec). r4/r5 hashed all
     # three inside the one 30 s probe, so a sound build whose package hashed slower than that was SHARE_UNREACHABLE at step 4 (G6) and at the final verify (G7).
     $capSec = [Math]::Max(0.0, ($script:Deadline - [DateTime]::UtcNow).TotalSeconds)
     # r8 fix iteration 2 (adversary A1 on ad703c59): -CallCapSec 0 means NO cap to Get-VenueStagedBuildManifest, so a cap that ran out after Get-ProbeSec is never handed
     # over as 0 (a 300 s artifact hash then ran unbounded and a STAGED answer past the cap was STAGE_SKIP_ALREADY). Under the 1 s any read needs: no read, the cap ran out.
-    # r9 (Grok G13 on #814): the final verify runs after the stage job was submitted, so its refusals say so (the wording of the final verify's cap refusal below it)
-    $notDone = $(if ($FinalVerify) { 'the stage job was submitted; not recorded as staged' } else { 'nothing was submitted' })
+    # r9 (Grok G13 on #814): the final verify runs after the stage job was submitted, so its refusals say so (the wording of the final verify's cap refusal below it).
+    # r9 fix iteration (adversary A2 on be203fe6): only when THIS call submitted one; an in-cache build or a reused one reaches the final verify with no stage job.
+    $notDone = $(if (-not $FinalVerify) { 'nothing was submitted' } elseif ($script:Row.steps.stage -cin @('staged', 'staged-suffix')) { 'the stage job was submitted; not recorded as staged' } else { 'this call submitted no stage job; not recorded as staged' })
     if ($capSec -lt 1.0) { Stop-Nightly 'STAGE_CAP_EXCEEDED' "the $MaxTotalSec s cap ran out before the soundness read of the staged build of $commit $When could start ($([Math]::Floor($capSec * 100.0) / 100.0) s left); $notDone" }
     # the test-only -TestSoundnessReadDelayMs stalls the call's FIRST soundness read only (step 4's when a build.json is there, else step 8's), never the final verify's
+    if ($atSeam -and $TestSoundnessPostCapDelayMs -gt 0) { Start-Sleep -Milliseconds $TestSoundnessPostCapDelayMs }
+    Say "the soundness read of the staged build of $commit $When starts (the manifest read at most $([Math]::Round($soundSec, 2)) s, the whole read at most $([Math]::Round($capSec, 2)) s, what is left of the cap)"
     $script:SoundnessReads++
-    $delayMs = $(if ($script:SoundnessReads -eq 1) { $TestSoundnessReadDelayMs } else { 0 })
+    $delayMs =$(if ($script:SoundnessReads -eq 1) { $TestSoundnessReadDelayMs } else { 0 })
     $artDelayMs = $(if (($TestSoundnessArtifactDelayAt -ieq 'first' -and $script:SoundnessReads -eq 1) -or ($TestSoundnessArtifactDelayAt -ieq 'final' -and $FinalVerify)) { $TestSoundnessArtifactDelayMs } else { 0 })
     $r = try { Get-VenueStagedBuildManifest -AgentShare $share -SourceCommit $commit -VerifyArtifacts -TimeoutSec $soundSec -ArtifactTimeoutSec 300 -CallCapSec $capSec -TestReadDelayMs $delayMs -TestArtifactDelayMs $artDelayMs } catch { [pscustomobject]@{ state = 'UNREACHABLE'; error = ($_.Exception.Message -replace '\s+', ' ') } }
     $leftAfter = ($script:Deadline - [DateTime]::UtcNow).TotalSeconds
     if ($r.state -ceq 'UNREACHABLE' -and $leftAfter -lt 1.0) { Stop-Nightly 'STAGE_CAP_EXCEEDED' "the soundness read of the staged build of $commit $When ran to the end of the $MaxTotalSec s cap (the manifest read $([Math]::Round($soundSec, 2)) s, the artifact hash at most 300 s, $([Math]::Round($capSec, 2)) s in all) and the cap ran out with no answer ($([Math]::Floor([Math]::Max(0.0, $leftAfter) * 100.0) / 100.0) s left): $($r.error); $notDone" }
+    # r9 fix iteration (adversary A1 on be203fe6): the module bounds the read by -CallCapSec on its OWN clock, started when it is called, so a scheduling delay
+    # between the cap sample above and the call lets an answer arrive after the deadline. An answer past the cap is never acted on, a STAGED one included (it was
+    # STAGE_SKIP_ALREADY at step 4 and a reuse at step 8 past the cap).
+    if ($leftAfter -le 0.0) { Stop-Nightly 'STAGE_CAP_EXCEEDED' "the soundness read of the staged build of $commit $When answered $($r.state) $([Math]::Round(-$leftAfter, 2)) s after the $MaxTotalSec s cap ran out; an answer past the cap is never acted on; $notDone" }
     $r
 }
 
@@ -450,6 +468,7 @@ $reachSec = Get-ProbeSec "the agent share cache '$cache'"
 $reach = Invoke-Bounded { param($p) Test-Path -LiteralPath $p -PathType Container } @($cache) $reachSec
 if ($reach.timedOut -and $reachSec -lt $ProbeTimeoutSec) { Stop-Nightly 'STAGE_CAP_EXCEEDED' "the agent share cache '$cache' did not answer in $($reach.error), the rest of the $MaxTotalSec s cap" }
 if (-not $reach.ok -or $reach.value -ne $true) { Stop-Nightly 'SHARE_UNREACHABLE' "the agent share cache '$cache' did not answer as a directory ($(if ($reach.error) { $reach.error } else { 'not found' }))" }
+if (([DateTime]::UtcNow - $script:Deadline).TotalSeconds -ge 0.0) { Stop-Nightly 'STAGE_CAP_EXCEEDED' "the agent share cache '$cache' answered after the $MaxTotalSec s cap ran out; an answer past the cap is never acted on" }
 
 # ------------------------------------------------------------------ 4. idempotency: what the cache already holds, by name --------------------------------------------------
 $script:WorkDir = Join-Path $BuildRoot ('runs\' + $startedUtc.ToString('yyyyMMddTHHmmssZ') + "-$s12")
