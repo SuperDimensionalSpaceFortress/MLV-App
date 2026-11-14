@@ -751,7 +751,9 @@ TEST(PlaybackLookaheadCpuRouteWiring, TheSevenNewFieldsAreAppendedNeverRenamed)
                                  QStringLiteral("max_gui_busy_at_ms="), QStringLiteral("max_gui_busy_frame="),
                                  QStringLiteral("max_gui_other_busy_bucket=") };
     ASSERT_EQ( 7, fields.size() );
-    for( const QString &f : fields ) ASSERT_EQ( 1, mw.count( QStringLiteral(" ") + f ) );
+    // r2: each field is ONE format key (name=%n). A leading-space search missed lookahead_dropped_queued=, which opens a
+    // continued string literal (found by the r2 console run: actual=0).
+    for( const QString &f : fields ) ASSERT_EQ( 1, mw.count( f + QStringLiteral("%") ) );
     // Fed where the spec says: the session reset, the present, both prune sites, the gap close.
     ASSERT_TRUE( mw.contains( QStringLiteral("if( requestContext.playbackLookaheadRequest ) ++m_playbackLookaheadPresented;") ) );
     ASSERT_EQ( 2, mw.count( QStringLiteral("m_playbackLookaheadPruned += static_cast<uint64_t>(") ) );
