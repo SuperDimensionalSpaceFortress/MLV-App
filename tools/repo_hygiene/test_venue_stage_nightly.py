@@ -114,6 +114,13 @@ $bj = Join-Path $OutDir "playback-attr-3-cuda-$s-build.json"
 # assembledAtUtc makes every assemble a NEW manifest, exactly like the real assembler (assemble.ps1:411)
 [IO.File]::WriteAllText($bj, (@{ sourceCommit = $SourceCommit; assembledAtUtc = [DateTime]::UtcNow.ToString('o'); nonce = [guid]::NewGuid().ToString('N') } | ConvertTo-Json -Compress))
 $h = (Get-FileHash -LiteralPath $bj -Algorithm SHA256).Hash.ToLowerInvariant()
+# racestage (VENUE-STAGE-SAME-SHA-RESTAGE-GUARD-1): while this assemble ran, ANOTHER stager staged this sha (its own assemble) into $env:FAKE_RACE_CACHE
+if ($env:FAKE_ASSEMBLE -eq 'racestage') {
+    foreach ($n in "MLVApp-playback-attr-3-cuda-$s.exe", "igpu_recon_cuda-playback-attr-3-cuda-$s.dll", "MLVApp-playback-attr-3-cuda-$s-pkg.zip") {
+        Set-Content -LiteralPath (Join-Path $env:FAKE_RACE_CACHE $n) -Value "racer $n"
+    }
+    [IO.File]::WriteAllText((Join-Path $env:FAKE_RACE_CACHE "playback-attr-3-cuda-$s-build.json"), (@{ sourceCommit = $SourceCommit; assembledAtUtc = 'racer' } | ConvertTo-Json -Compress))
+}
 "RESULT=ASSEMBLE_OK SOURCE=$SourceCommit EXE=x DLL=x PKG=x MANIFEST=playback-attr-3-cuda-$s-build.json MANIFEST_SHA256=$h OUT=$OutDir"
 exit 0
 """
@@ -641,6 +648,21 @@ class VenueStageNightlyTests(unittest.TestCase):
         self.spend_default_stage_jobid()
         self.stage_cache(runner=False, body=json.dumps({"sourceCommit": OTHER_SHA}).encode())
         self.assert_restaged_under_a_suffix(self.run_driver())
+
+    # ---------------------------------------------------------------- VENUE-STAGE-SAME-SHA-RESTAGE-GUARD-1 (RED first)
+    def test_a_build_another_stager_staged_during_the_assemble_is_reused_never_replaced(self) -> None:
+        # 2026-11-13: two stagers both found 23a07757 NOT_STAGED and both assembled; the later one's stage replaced the first one's
+        # manifest under a running lease batch. The cache is read again right before the stage submission, and a staged build is reused.
+        p = self.run_driver(env={"FAKE_ASSEMBLE": "racestage", "FAKE_RACE_CACHE": str(self.share / "cache")})
+        self.assert_exit(p, "STAGE_OK")
+        bj = self.share / "cache" / names()["build"]
+        self.assertEqual(json.loads(bj.read_text(encoding="utf-8"))["assembledAtUtc"], "racer", "the racer's staged manifest was replaced")
+        racer = sha256(bj)
+        self.assertEqual(self.calls("STAGEGEN"), [])
+        self.assertFalse([c for c in self.submissions() if "job=playback-attr-3-cuda-stage-" in c], self.submissions())
+        self.assertRegex(p.stdout, rf"(?m)STAGE_REUSED_EXISTING sha={S12} manifest={racer[:8]} ")
+        r = self.rows()[-1]
+        self.assertEqual((r["outcome"], r["buildManifestSha256"], r["steps"]["stage"]), ("STAGE_OK", racer, "reused-existing"))
 
     def test_a_cache_hash_that_differs_after_stage_ok_is_a_verify_mismatch(self) -> None:
         p = self.run_driver(env={"FAKE_UMRUN_STAGE": "wrongcache"})

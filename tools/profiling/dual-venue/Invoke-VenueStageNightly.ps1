@@ -404,21 +404,28 @@ $runnerJob = $sm.Groups[2].Value
 $runnerId = [IO.Path]::GetFileName($runnerJob) -replace '\.job\.ps1$', ''
 $script:Row.smokeRunnerCacheDir = $runnerDirName
 
-$cached = Read-Share $cacheBuildJson $HashByName @($cacheBuildJson)
-$cachedWellFormed = $false
-if ($cached.present) {
-    $cj = try { $cached.text | ConvertFrom-Json } catch { $null }
-    $cachedWellFormed = ($null -ne $cj) -and ([string]$cj.sourceCommit -ceq $commit)
+# The ONE reading of "this sha is staged" (VENUE-STAGE-SAME-SHA-RESTAGE-GUARD-1): made here and again right before the stage submission (step 8),
+# because another stager can stage this sha while this call assembles it.
+function Read-CachedBuild {
+    $c = Read-Share $cacheBuildJson $HashByName @($cacheBuildJson)
+    $wf = $false
+    if ($c.present) {
+        $cj = try { $c.text | ConvertFrom-Json } catch { $null }
+        $wf = ($null -ne $cj) -and ([string]$cj.sourceCommit -ceq $commit)
+    }
+    $miss = @(foreach ($n in @($names.exeName, $names.reconName, $names.packageZipName)) { if (-not (Read-Share "$cache\$n" $PathByName @((Join-Path $cache $n), 'file'))) { $n } })
+    if ($wf -and $miss.Count -gt 0) {
+        Stop-Nightly 'STAGE_FAILED' "the $Venue cache holds $($names.buildManifestName) for $commit but not $($miss -join ', '); not re-assembled (a re-assemble makes a new manifest); the hub inspects the cache"
+    }
+    [pscustomobject]@{ cached = $c; inCache = ($wf -and $miss.Count -eq 0) }
 }
-$missingArtifacts = @(foreach ($n in @($names.exeName, $names.reconName, $names.packageZipName)) { if (-not (Read-Share "$cache\$n" $PathByName @((Join-Path $cache $n), 'file'))) { $n } })
+$cb = Read-CachedBuild
+$cached = $cb.cached
 $runnerPresent = [bool](Read-Share "$cache\$runnerDirName" $PathByName @((Join-Path $cache $runnerDirName), 'dir'))
-$buildInCache = $cachedWellFormed -and $missingArtifacts.Count -eq 0
+$buildInCache = $cb.inCache
 if ($buildInCache -and $runnerPresent) {
     $script:Row.steps.dllPair = 'skipped'; $script:Row.steps.assemble = 'skipped'; $script:Row.steps.stage = 'in-cache'; $script:Row.steps.smokeRunner = 'in-cache'
     Stop-Nightly 'STAGE_SKIP_ALREADY' "$cacheBuildJson (sourceCommit $commit) and its three artifacts and $runnerDirName are already in the $Venue cache; nothing was built or submitted" -Manifest $cached.hash
-}
-if ($cachedWellFormed -and $missingArtifacts.Count -gt 0) {
-    Stop-Nightly 'STAGE_FAILED' "the $Venue cache holds $($names.buildManifestName) for $commit but not $($missingArtifacts -join ', '); not re-assembled (a re-assemble makes a new manifest); the hub inspects the cache"
 }
 
 # ------------------------------------------------------------------ 5. the floors (the shared board gate scripts, never copied) ---------------------------------------------
@@ -603,7 +610,17 @@ if ($buildInCache) {
     $t0 = [DateTime]::UtcNow
     $suffix = ''
     $submit = $true
-    if (Read-Share "$share\outbox\$stageDefaultId.result.json" $PathByName @("$share\outbox\$stageDefaultId.result.json", 'file')) {
+    # VENUE-STAGE-SAME-SHA-RESTAGE-GUARD-1: the assemble can take hours, and another stager may have staged this sha meanwhile (2026-11-13: a second
+    # lane's stage of 23a07757 replaced the manifest a running lease batch had pinned). A staged build is reused, never replaced: this call's own
+    # assemble is left unstaged and the staged manifest is the one recorded. (The stage job refuses a replacement on the host as well.)
+    $again = Read-CachedBuild
+    if ($again.inCache) {
+        $submit = $false
+        $expected = $again.cached.hash
+        $script:Row.steps.stage = 'reused-existing'
+        $script:Row.jobIds.stage = $null
+        Out-Line "STAGE_REUSED_EXISTING sha=$s12 manifest=$($expected.Substring(0, 8)) manifestSha256=$expected (staged by another stager while this call assembled; its own build $buildDir is not staged)"
+    } elseif (Read-Share "$share\outbox\$stageDefaultId.result.json" $PathByName @("$share\outbox\$stageDefaultId.result.json", 'file')) {
         $prior = Read-Share "$share\outbox\$stageDefaultId.result.json" $StageReuseByName @($reuseModule, "$share\outbox\$stageDefaultId.result.json", $stageDefaultId, $commit, 'Stage')
         $now2 = Read-Share $cacheBuildJson $HashByName @($cacheBuildJson)
         if ($now2.present -and $now2.hash -ceq $expected) {

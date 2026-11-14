@@ -44,6 +44,11 @@
 # Re-staging a build whose default JobId was already used needs -JobIdSuffix: the job is then
 # playback-attr-3-cuda-stage-<sha12>-<suffix>. The generator does not submit anything, so it
 # cannot see an UMRUN_JOBID_IN_USE refusal; the caller of um-run.ps1 owns that.
+# A suffix never replaces a SOUND staged build of the sha (VENUE-STAGE-SAME-SHA-RESTAGE-GUARD-1): the
+# job reuses it when the manifest bytes are the same (STAGE_REUSED_EXISTING, exit 0) and refuses
+# otherwise (STAGE_REFUSED_STAGED_OTHER_MANIFEST, exit 7), writing nothing into the cache either way.
+# Only a staged build that is not sound (another sha, unparseable, an artifact missing or different)
+# is replaced.
 
 [CmdletBinding()]
 param(
@@ -323,6 +328,54 @@ if ($VerifyOnly) {
     Write-Output "RESULT=VERIFY_ONLY_OK SOURCE=$SourceCommit FILES=$($sideFiles.Count) MANIFEST=$ManifestName"
     exit 0
 }
+
+# --- VENUE-STAGE-SAME-SHA-RESTAGE-GUARD-1: a sound staged build of this sha is never replaced -----
+# The cache holds ONE build per sha, and a re-assemble of the same sha is a NEW manifest (build.json
+# carries assembledAtUtc). 2026-11-13: two lanes both assembled 23a07757; the later one's suffixed
+# stage replaced the manifest a running lease batch had pinned (ad005766 -> f8fc75a2), so the batch
+# ended BUILD_MANIFEST_MISMATCH and lost a leg. Every stager reaches the cache only through this job,
+# and the agent runs inbox jobs one at a time, so the rule is held here, before the first cache write.
+# SOUND = the cached build.json names this sha and each of the three cached artifacts hashes to its
+# claim (what the leg job checks). A sound staged build with these exact manifest bytes is reused
+# (STAGE_REUSED_EXISTING, exit 0); with any other manifest it is refused (exit 7). Neither writes the
+# cache; both remove this job's own verified inputs from the inbox by content. A build.json that is
+# not sound (another sha, unparseable, an artifact missing or different) is replaced as before.
+if (Test-Path -LiteralPath $manifestCachePath) {
+    $stagedSha = ''
+    $unsound = ''
+    try {
+        $stagedSha = Get-ShaLower $manifestCachePath
+        $stagedText = Get-Content -Raw -LiteralPath $manifestCachePath
+        $staged = try { $stagedText | ConvertFrom-Json } catch { $null }
+        if ($null -eq $staged) { $unsound = 'it is not JSON' }
+        elseif ([string]$staged.sourceCommit -cne $SourceCommit) { $unsound = "it declares sourceCommit '$($staged.sourceCommit)'" }
+        foreach ($item in $sideFiles) {
+            if ($unsound) { break }
+            $claim = @($staged.packageZip, $staged.exe, $staged.dll) | Where-Object { $null -ne $_ -and [string]$_.name -ceq [string]$item.name } | Select-Object -First 1
+            if ($null -eq $claim) { $unsound = "it claims no $($item.name)" }
+            elseif (-not (Test-Path -LiteralPath ([string]$item.cachePath) -PathType Leaf)) { $unsound = "$($item.name) is not in the cache" }
+            elseif ((Get-ShaLower ([string]$item.cachePath)) -ne ([string]$claim.sha256).ToLowerInvariant()) { $unsound = "the cached $($item.name) differs from its claim" }
+        }
+    } catch {
+        # A staged build this job cannot read is not one it may replace: fail closed, write nothing.
+        Write-Output "STAGE_REFUSED_STAGED_UNREADABLE sha=$($SourceCommit.Substring(0, 12)) incoming=$($ManifestSha256.Substring(0, 8)) $($_.Exception.Message -replace '\s+', ' ')"
+        Complete-Failed 7 'stagedBuildGuard' "the staged build of $SourceCommit could not be read, so it is not replaced: $($_.Exception.Message)"
+    }
+    if ($unsound) {
+        Say "replacing a staged build that is not sound ($unsound); staged manifest $stagedSha"
+    } else {
+        foreach ($item in $sideFiles) { [void](Remove-AttrCudaInputFileByContent -TrustedRoot $AgentRoot -Path ([string]$item.path) -ExpectedSha256 ([string]$item.sha256)) }
+        [void](Remove-AttrCudaInputFileByContent -TrustedRoot $AgentRoot -Path $manifestSide -ExpectedSha256 $ManifestSha256)
+        if ($stagedSha -ceq $ManifestSha256) {
+            Write-Output "STAGE_REUSED_EXISTING sha=$($SourceCommit.Substring(0, 12)) manifest=$($stagedSha.Substring(0, 8)) manifestSha256=$stagedSha"
+            Write-Output "RESULT=STAGE_OK SOURCE=$SourceCommit FILES=0 CACHE=$Cache REUSED=1"
+            exit 0
+        }
+        Write-Output "STAGE_REFUSED_STAGED_OTHER_MANIFEST sha=$($SourceCommit.Substring(0, 12)) staged=$($stagedSha.Substring(0, 8)) incoming=$($ManifestSha256.Substring(0, 8)) stagedSha256=$stagedSha incomingSha256=$ManifestSha256"
+        Complete-Failed 7 'stagedBuildGuard' "the cache already holds a sound build of $SourceCommit (manifest $stagedSha); a staged build is never replaced, a lease batch may have pinned it. Pin that manifest (Get-VenueStagedBuildManifest) instead of re-staging."
+    }
+}
+$StepLog['stagedBuildGuard'] = 0
 
 # Each container is created explicitly, parent first (never as a side effect of -Force on a deeper
 # path), so every one of them is link-checked. The work and outbox trees are created FRESH and

@@ -12,6 +12,9 @@
 # WHAT THEY DO NOT ANSWER (#508, VENUE-STAGED-BUILD-VANISHED-AFTER-ADMISSION-WAIT-1). A STAGE_OK result for the default stage JobId does NOT prove the venue cache
 # holds the manifest a caller expects: a re-assemble of the same sha makes a new manifest (build.json carries assembledAtUtc), and the cache keeps whatever was
 # staged first. Get-StageReuse is therefore evidence about a RESULT, never about the CACHE; Invoke-VenueStageNightly.ps1 hashes the cache build.json by name.
+# Nor does it stop a re-stage (VENUE-STAGE-SAME-SHA-RESTAGE-GUARD-1, 2026-11-13): a lane stage-one compared the cache with ITS OWN fresh assemble and,
+# on a difference, submitted a suffixed stage that replaced a manifest a lease batch had pinned. The never-replace rule is held by the emitted stage job
+# (tools\profiling\bachelor\playback-attr-3-cuda-stage-job.ps1, step stagedBuildGuard), which every stager's submission passes through.
 
 function Test-UmRunJobIdInUseMessage {
     param([string]$Message, [string]$JobId)

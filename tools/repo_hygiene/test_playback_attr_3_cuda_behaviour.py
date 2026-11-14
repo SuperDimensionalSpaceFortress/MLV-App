@@ -382,8 +382,11 @@ class SourceArchiveBindingTests(_PwshCase):
 # --------------------------------------------------------------------------------------------
 
 
-def _fake_build_dir(build: Path, sha: str, exe_name_override: str | None = None) -> dict:
-    """Write the four files the assembler publishes, with fabricated contents."""
+def _fake_build_dir(build: Path, sha: str, exe_name_override: str | None = None, rebuild_tag: str = "") -> dict:
+    """Write the four files the assembler publishes, with fabricated contents.
+
+    rebuild_tag (VENUE-STAGE-SAME-SHA-RESTAGE-GUARD-1): one assemble of the sha. A different tag is a re-assemble of
+    the same sha: other exe bytes and another assembledAtUtc, so another manifest sha256, as the real assembler makes."""
     short = sha[:12]
     names = {
         "exe": f"MLVApp-playback-attr-3-cuda-{short}.exe",
@@ -396,7 +399,7 @@ def _fake_build_dir(build: Path, sha: str, exe_name_override: str | None = None)
 
     shas = {}
     for key in ("exe", "dll", "packageZip"):
-        payload = f"fabricated {key} for {sha}".encode("utf-8")
+        payload = f"fabricated {key} for {sha}{' ' + rebuild_tag if rebuild_tag and key == 'exe' else ''}".encode("utf-8")
         (build / names[key]).write_bytes(payload)
         shas[key] = hashlib.sha256(payload).hexdigest()
     manifest = {
@@ -408,6 +411,8 @@ def _fake_build_dir(build: Path, sha: str, exe_name_override: str | None = None)
         "pendingSymbolPresence": True,
         "dllPairManifestSha256": "b" * 64,
     }
+    if rebuild_tag:
+        manifest["assembledAtUtc"] = rebuild_tag
     (build / names["manifest"]).write_text(json.dumps(manifest, indent=2), encoding="utf-8")
     return names
 
@@ -991,6 +996,116 @@ class InterruptedStagingTests(_PwshCase):
 
         self.assertEqual(proc.returncode, 4, f"{proc.stdout}\n{proc.stderr}")
         self.assertEqual(self.cache_names(), [])
+
+
+# --------------------------------------------------------------------------------------------
+# (e2) VENUE-STAGE-SAME-SHA-RESTAGE-GUARD-1: a sound staged build of a sha is never replaced
+# --------------------------------------------------------------------------------------------
+
+
+@requires_pwsh
+class StagedBuildNeverReplacedTests(_PwshCase):
+    """A stage of a sha whose cache already holds a sound build writes nothing into the cache.
+
+    2026-11-13: lane HFR-NATIVE-M16-1457-FULLSCREEN-S1S2-PRESENT-GAP-1 re-assembled 23a07757 (a new
+    manifest, f8fc75a2), and its suffixed stage job replaced the build another lane had staged
+    (ad005766) while a lease batch that had pinned it was running: BUILD_MANIFEST_MISMATCH
+    (Invoke-VenueLeaseBatch.ps1:1258) and one lost leg. Every stager reaches the cache only through
+    this emitted job, so the job is where the rule holds.
+    """
+
+    VENUE_CHAIN = ROOT / "tools" / "profiling" / "dual-venue" / "VenueChain.psm1"
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.agent = self.tmp / "agent"
+        self.inbox = self.agent / "inbox"
+        self.cache = self.agent / "cache"
+        self.inbox.mkdir(parents=True)
+        self.cache.mkdir(parents=True)
+        self.manifest_name = f"playback-attr-3-cuda-{SHA_FIXTURE[:12]}-build.json"
+
+    def stage(self, tag: str, suffix: str = "") -> subprocess.CompletedProcess:
+        """Assemble (tag = which assemble) and stage the sha through the real generator and job."""
+        build = self.tmp / f"build-{tag}"
+        staging = self.tmp / f"staging-{tag}-{suffix or 'default'}"
+        staging.mkdir(parents=True)
+        names = _fake_build_dir(build, SHA_FIXTURE, rebuild_tag=tag)
+        script = self.tmp / f"generate-{tag}-{suffix or 'default'}.ps1"
+        script.write_text(
+            "$ErrorActionPreference = 'Stop'\n"
+            f"& '{STAGE_GENERATOR}' -SourceCommit '{SHA_FIXTURE}' -BuildDir '{build}' "
+            f"-OutDir '{staging}' -AgentRoot '{self.agent}'"
+            + (f" -JobIdSuffix '{suffix}'" if suffix else "")
+            + " | ConvertTo-Json -Depth 5\n",
+            encoding="utf-8",
+        )
+        gen = _run_pwsh_file(script)
+        self.assertEqual(gen.returncode, 0, f"{gen.stdout}\n{gen.stderr}")
+        for name in names.values():
+            shutil.copy2(build / name, self.inbox / name)
+        return _run_job(Path(json.loads(gen.stdout)["jobFile"]))
+
+    def snapshot(self) -> dict:
+        return {e.name: (e.read_bytes(), e.stat().st_mtime_ns) for e in sorted(self.cache.iterdir())}
+
+    def manifest_sha(self) -> str:
+        return hashlib.sha256((self.cache / self.manifest_name).read_bytes()).hexdigest()
+
+    def test_a_second_stage_with_another_manifest_is_refused_and_writes_nothing(self) -> None:
+        first = self.stage("ad005766")
+        self.assertEqual(first.returncode, 0, f"{first.stdout}\n{first.stderr}")
+        staged, before = self.manifest_sha(), self.snapshot()
+
+        second = self.stage("f8fc75a2", suffix="fsgap202611131829")
+
+        self.assertEqual(second.returncode, 7, f"{second.stdout}\n{second.stderr}")
+        self.assertRegex(second.stdout, rf"(?m)^STAGE_REFUSED_STAGED_OTHER_MANIFEST sha={SHA_FIXTURE[:12]} staged={staged[:8]} incoming=[0-9a-f]{{8}} ")
+        self.assertIn("RESULT=STAGE_FAILED STEP=stagedBuildGuard EXIT=7", second.stdout)
+        self.assertEqual(self.snapshot(), before, "the staged build was rewritten")
+        self.assertEqual(list(self.inbox.iterdir()), [], "the refused inputs were left in the inbox")
+
+    def test_a_manifest_a_lease_batch_pinned_still_reads_as_its_pin_after_a_second_stage(self) -> None:
+        # The batch's own guard (Invoke-VenueLeaseBatch.ps1:1258 / :1393) reads Get-VenueStagedBuildManifest and compares it to the
+        # sha256 its plan pinned when the lease opened; any other answer is BUILD_MANIFEST_MISMATCH.
+        first = self.stage("ad005766")
+        self.assertEqual(first.returncode, 0, f"{first.stdout}\n{first.stderr}")
+        pin = self.manifest_sha()
+
+        self.stage("f8fc75a2", suffix="fsgap202611131829")
+
+        proc = self.run_with_module(
+            f"Import-Module '{self.VENUE_CHAIN}' -Force -DisableNameChecking\n"
+            f"$s = Get-VenueStagedBuildManifest -AgentShare '{self.agent}' -SourceCommit '{SHA_FIXTURE}' -VerifyArtifacts\n"
+            "Write-Output ('STATE=' + $s.state + ' SHA=' + $s.sha256 + ' CONTENT=[' + $s.contentProblem + '] ARTIFACT=[' + $s.artifactProblem + ']')\n",
+            name="pin.ps1",
+        )
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn(f"STATE=STAGED SHA={pin} CONTENT=[] ARTIFACT=[]", proc.stdout)
+
+    def test_a_second_stage_with_the_same_manifest_reuses_it_and_writes_nothing(self) -> None:
+        first = self.stage("ad005766")
+        self.assertEqual(first.returncode, 0, f"{first.stdout}\n{first.stderr}")
+        staged, before = self.manifest_sha(), self.snapshot()
+
+        second = self.stage("ad005766", suffix="again")
+
+        self.assertEqual(second.returncode, 0, f"{second.stdout}\n{second.stderr}")
+        self.assertRegex(second.stdout, rf"(?m)^STAGE_REUSED_EXISTING sha={SHA_FIXTURE[:12]} manifest={staged[:8]} ")
+        self.assertRegex(second.stdout, rf"(?m)^RESULT=STAGE_OK SOURCE={SHA_FIXTURE} ")
+        self.assertEqual(self.snapshot(), before, "a reuse rewrote the cache")
+        self.assertEqual(list(self.inbox.iterdir()), [], "the reused inputs were left in the inbox")
+
+    def test_a_staged_build_that_is_not_sound_is_replaced(self) -> None:
+        # A build.json whose artifacts are gone is not a build any leg can run (BUILD_ARTIFACT_MISSING), so it does not wedge the sha.
+        first = self.stage("ad005766")
+        self.assertEqual(first.returncode, 0, f"{first.stdout}\n{first.stderr}")
+        (self.cache / f"MLVApp-playback-attr-3-cuda-{SHA_FIXTURE[:12]}.exe").unlink()
+
+        second = self.stage("f8fc75a2", suffix="fsgap202611131829")
+
+        self.assertEqual(second.returncode, 0, f"{second.stdout}\n{second.stderr}")
+        self.assertEqual(self.manifest_sha(), hashlib.sha256((self.tmp / "build-f8fc75a2" / self.manifest_name).read_bytes()).hexdigest())
 
 
 # --------------------------------------------------------------------------------------------

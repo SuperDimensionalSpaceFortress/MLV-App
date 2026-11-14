@@ -535,6 +535,11 @@ pwsh -NoProfile -File tools\profiling\dual-venue\Invoke-VenueStageNightly.ps1 [-
   dir are already there is `STAGE_SKIP_ALREADY` and is never re-assembled. A re-assemble makes a new manifest (`assembledAtUtc`), so a spent default
   stage JobId whose cache does not hold the assembled manifest is re-staged under `-JobIdSuffix n<yyyyMMddHHmm>` (#508). Every `STAGE_OK` is
   re-hashed by name, and a mismatch is `STAGE_VERIFY_MISMATCH`.
+- A staged build is never replaced (VENUE-STAGE-SAME-SHA-RESTAGE-GUARD-1). The driver reads the cache again just before the stage submission; a
+  build that another stager staged during the assemble is reused (`STAGE_REUSED_EXISTING`, stage step `reused-existing`). The stage job also
+  enforces this on the host for every stager: when the cache already holds a sound build of the sha, it reuses identical manifest bytes (exit 0)
+  and refuses any other manifest with `STAGE_REFUSED_STAGED_OTHER_MANIFEST`, exit 7. Neither case writes the cache. Only a staged build that
+  is not sound is replaced.
 - The receipt row (`<main checkout>\.claude-state\dual-venue\stage-nightly.jsonl`, schema `mlv-app/venue-stage-nightly/v1`) records
   `buildManifestSha256` as that by-name hash. It is the exact file `Invoke-VenueBaseline.ps1` and `Invoke-VenueLeg.ps1` hash.
 - The night is reserved before it is spent. Before the first staging step, the driver appends a `STAGE_RESERVED` row (venue, `nightKey`,
