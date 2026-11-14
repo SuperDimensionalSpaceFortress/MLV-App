@@ -1559,11 +1559,14 @@ foreach ($path in @(Get-Content -LiteralPath $ListFile -Encoding UTF8 | Where-Ob
         }
     }
     # An alias the file defines names the command it points at (adversary A2 on f65d9c29): `Set-Alias SpawnWmi Invoke-CimMethod; SpawnWmi ...`. Set-Alias, New-Alias,
-    # sal and nal with a literal name and a literal value (named or positional) are mapped; the map is followed below, so an alias of an alias resolves too.
+    # sal and nal (also module-qualified) with a literal name and a literal value (named or positional) are mapped. EVERY definition of a name is kept, and a command name
+    # resolves to the whole closure of what it may point at (any chain length), so a later redefinition or a shadowing twin cannot hide a WMI create (pass 9 on 71996ac0).
     $aliasMap = @{}
     foreach ($c in $ast.FindAll({ param($x) $x -is [CommandAst] }, $true)) {
         $cn = $c.GetCommandName()
-        if ($null -eq $cn -or @('set-alias', 'new-alias', 'sal', 'nal') -notcontains $cn.ToLowerInvariant()) { continue }
+        if ($null -eq $cn) { continue }
+        $cn = (($cn -replace '^.*[\\/]', '') -replace '\.(exe|com|cmd|bat)$', '').ToLowerInvariant()
+        if (@('set-alias', 'new-alias', 'sal', 'nal') -notcontains $cn) { continue }
         $aliasName = Get-ParameterValue $c 'Name' 1
         $aliasValue = Get-ParameterValue $c 'Value' 1
         $positional = New-Object System.Collections.Generic.List[object]
@@ -1571,16 +1574,22 @@ foreach ($path in @(Get-Content -LiteralPath $ListFile -Encoding UTF8 | Where-Ob
         for ($i = 1; $i -lt $elements.Count; $i++) {
             $e = $elements[$i]
             if ($e -is [CommandParameterAst]) {
-                if ($null -eq $e.Argument -and $e.ParameterName -notmatch '^(f|force|p|passthru|c|confirm|wi|whatif)$') { $i++ }
+                # A switch (Force, PassThru, Confirm, WhatIf, Verbose, Debug, or an abbreviation) takes no value; any other parameter takes the next element.
+                $isSwitch = $false
+                foreach ($sw in @('Force', 'PassThru', 'Confirm', 'WhatIf', 'Verbose', 'Debug')) { if ($sw.StartsWith($e.ParameterName, [StringComparison]::OrdinalIgnoreCase)) { $isSwitch = $true } }
+                if ($null -eq $e.Argument -and -not $isSwitch) { $i++ }
                 continue
             }
             $positional.Add($e)
         }
-        if ($null -eq $aliasName -and $positional.Count -gt 0) { $aliasName = $positional[0] }
-        if ($null -eq $aliasValue -and $positional.Count -gt 1) { $aliasValue = $positional[1] }
+        # Positional operands fill the slots no named parameter took, Name first.
+        $next = 0
+        if ($null -eq $aliasName -and $next -lt $positional.Count) { $aliasName = $positional[$next]; $next++ }
+        if ($null -eq $aliasValue -and $next -lt $positional.Count) { $aliasValue = $positional[$next] }
         if ($aliasName -is [StringConstantExpressionAst] -and $aliasValue -is [StringConstantExpressionAst]) {
             $aliasKey = (([string]$aliasName.Value -replace '^.*[\\/]', '') -replace '\.(exe|com|cmd|bat)$', '').ToLowerInvariant()
-            $aliasMap[$aliasKey] = (([string]$aliasValue.Value -replace '^.*[\\/]', '') -replace '\.(exe|com|cmd|bat)$', '').ToLowerInvariant()
+            if (-not $aliasMap.ContainsKey($aliasKey)) { $aliasMap[$aliasKey] = New-Object System.Collections.Generic.List[string] }
+            $aliasMap[$aliasKey].Add((([string]$aliasValue.Value -replace '^.*[\\/]', '') -replace '\.(exe|com|cmd|bat)$', '').ToLowerInvariant())
         }
     }
     foreach ($n in $ast.FindAll({ param($x) $true }, $true)) {
@@ -1604,7 +1613,16 @@ foreach ($path in @(Get-Content -LiteralPath $ListFile -Encoding UTF8 | Where-Ob
             if ($null -eq $name) { $name = '' }
             # The command as it resolves: a module-qualified name (CimCmdlets\Invoke-CimMethod) and a full path (C:\...\wmic.exe) are the same command.
             $lname = (($name -replace '^.*[\\/]', '') -replace '\.(exe|com|cmd|bat)$', '').ToLowerInvariant()
-            for ($hop = 0; $hop -lt 10 -and $aliasMap.ContainsKey($lname); $hop++) { $lname = $aliasMap[$lname] }
+            # Everything the name may mean once the file's aliases are followed (a cycle ends because a name is listed once); the first meaning that is a command this scan
+            # watches is the one tested below.
+            $closure = New-Object System.Collections.Generic.List[string]
+            $closure.Add($lname)
+            for ($k = 0; $k -lt $closure.Count; $k++) {
+                if ($aliasMap.ContainsKey($closure[$k])) { foreach ($v in $aliasMap[$closure[$k]]) { if (-not $closure.Contains($v)) { $closure.Add($v) } } }
+            }
+            foreach ($cand in $closure) {
+                if (($wmiCommands -contains $cand) -or $cand -eq 'wmic' -or (@('foreach-object', 'foreach', '%') -contains $cand)) { $lname = $cand; break }
+            }
             if ($wmiCommands -contains $lname) {
                 $method = Get-MethodName $n
                 if ($null -eq $method) { $kind = 'wmi-method-name-not-literal' }
@@ -1903,7 +1921,16 @@ def test_wmi_create_scan_refuses_each_direct_create_spelling(tmp_path):
         "alias-sal-of-invoke-cimmethod": "sal SpawnWmi Invoke-CimMethod\nSpawnWmi -ClassName Win32_Process -MethodName Create",
         "alias-of-wmic": "Set-Alias w wmic.exe\nw process call create 'x'",
         "alias-of-foreach-object": "Set-Alias each ForEach-Object\nGet-WmiObject -List Win32_Process | each -MemberName Create",
-        "alias-of-an-alias": "Set-Alias a1 Invoke-CimMethod\nSet-Alias a2 a1\na2 -ClassName Win32_Process -MethodName Create",
+        # adversary pass 9 on 71996ac0 (A1-A6): an alias chain of any length, a later redefinition, a named name with a positional value, a switch before the operands,
+        # a module-qualified Set-Alias, and an alias or a command name that another alias definition shadows
+        "alias-chain-of-eleven": "Set-Alias a0 Invoke-CimMethod\n" + "".join(f"Set-Alias a{i} a{i - 1}\n" for i in range(1, 11)) + "a10 -ClassName Win32_Process -MethodName Create",
+        "alias-redefined-to-a-safe-command-later": "Set-Alias spawn Invoke-CimMethod\nspawn -ClassName Win32_Process -MethodName Create\nSet-Alias spawn Get-Date",
+        "alias-named-name-and-positional-value": "Set-Alias -Name spawn Invoke-CimMethod\nspawn -ClassName Win32_Process -MethodName Create",
+        "alias-verbose-switch-before-positional-operands": "Set-Alias -Verbose spawn Invoke-CimMethod\nspawn -ClassName Win32_Process -MethodName Create",
+        "alias-module-qualified-set-alias": "Microsoft.PowerShell.Utility\\Set-Alias -Name spawn -Value Invoke-CimMethod\nspawn -ClassName Win32_Process -MethodName Create",
+        "alias-shadows-the-real-command-name": "Set-Alias Invoke-CimMethod Get-Date\nCimCmdlets\\Invoke-CimMethod -ClassName Win32_Process -MethodName Create",
+        "alias-with-an-exe-twin-that-shadows-it": "Set-Alias spawn Invoke-CimMethod\nSet-Alias spawn.exe Get-Date\nspawn -ClassName Win32_Process -MethodName Create",
+        "alias-of-an-alias":"Set-Alias a1 Invoke-CimMethod\nSet-Alias a2 a1\na2 -ClassName Win32_Process -MethodName Create",
         "splat-add-with-a-key-from-a-variable":"$k = 'PipelineVariable'\n$h = @{}\n$h.Add($k, 'w')\nGet-WmiObject -List Win32_Process @h | ForEach-Object { $w.Create('x') }",
         "splat-hashtable-key-from-a-variable": "$k = 'PipelineVariable'\n$h = @{ $k = 'w' }\nGet-WmiObject -List Win32_Process @h | ForEach-Object { $w.Create('x') }",
         "splat-hashtable-from-a-call": "$h = Get-Content settings.json | ConvertFrom-Json -AsHashtable\nGet-WmiObject -List Win32_Process @h | ForEach-Object { $w.Create('x') }",
