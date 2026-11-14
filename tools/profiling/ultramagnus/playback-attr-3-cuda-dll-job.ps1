@@ -50,7 +50,7 @@
 [CmdletBinding()]
 param(
     [Parameter(Mandatory = $true)]
-    [ValidatePattern('^[0-9a-f]{40}$')]
+    [ValidatePattern('^[0-9a-f]{40}\z')]
     [string]$SourceCommit,
 
     [Parameter(Mandatory = $true)]

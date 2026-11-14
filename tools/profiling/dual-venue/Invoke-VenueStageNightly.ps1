@@ -14,8 +14,9 @@
 #
 # THE CACHE IS THE TRUTH, READ BY NAME (#508, VENUE-STAGED-BUILD-VANISHED-AFTER-ADMISSION-WAIT-1). A re-assemble of one sha makes a NEW manifest (build.json
 # carries assembledAtUtc) and the stage JobId is single-use, so an earlier STAGE_OK result for the default JobId says nothing about what the cache holds. So:
-#   - a sha whose <agentShare>\cache\playback-attr-3-cuda-<sha12>-build.json is present and well-formed (right sourceCommit), with its three named artifacts and
-#     the smoke-runner dir, is STAGE_SKIP_ALREADY: nothing is re-assembled or submitted (the local smoke-runner generator only names the runner dir);
+#   - a sha whose <agentShare>\cache\playback-attr-3-cuda-<sha12>-build.json is a SOUND staged build (Get-VenueStagedBuildManifest -VerifyArtifacts: the leg's
+#     manifest fields and claim shapes, and the three cached artifacts hash to its digests; r4), with the smoke-runner dir, is STAGE_SKIP_ALREADY: nothing is
+#     re-assembled or submitted (the local smoke-runner generator only names the runner dir);
 #   - when the default stage JobId is spent and the cache does not hold the assembled manifest, the build is re-staged under -JobIdSuffix n<yyyyMMddHHmm>;
 #   - after every STAGE_OK the cache build.json is re-hashed BY NAME; a hash that is not the assembled MANIFEST_SHA256 is STAGE_VERIFY_MISMATCH, never success;
 #   - the recorded buildManifestSha256 is ALWAYS that by-name hash of the cache file (the exact path Invoke-VenueBaseline and Invoke-VenueLeg hash), never a local one.
@@ -77,12 +78,15 @@
 [CmdletBinding()]
 param(
     [ValidateSet('bachelor', 'ultra-magnus')][string]$Venue = 'ultra-magnus',
-    [ValidatePattern('^[0-9a-f]{40}$')][string]$SourceCommit = '',
+    [ValidatePattern('^[0-9a-f]{40}\z')][string]$SourceCommit = '',
     [string]$BuildRoot = 'C:\mlvtmp\lane-um-nightly-stage',
     [string]$ReceiptFile = '',
     # Total wall-clock cap for everything after the plan. The default fits a cold night: a DLL-pair compile on Ultra-Magnus, a build-guarded assemble and two stages.
     [ValidateRange(10, 28800)][int]$MaxTotalSec = 7200,
-    [ValidateRange(1, 300)][int]$ProbeTimeoutSec = 30,
+    # r4 fix iteration (adversary pass 7 A2 on 24f85549): at least 5 s. The soundness read (Read-StagedSoundness) needs the manifest read PLUS -ArtifactMinSec (1 s)
+    # left to start hashing the artifacts inside one probe; at 1 s a healthy staged build was SHARE_UNREACHABLE on every run. (r6, Grok G6/G7: the hash now has its
+    # own budget, 300 s inside the cap, and this bounds the manifest read; the floor stays.)
+    [ValidateRange(5, 300)][int]$ProbeTimeoutSec = 30,
     [switch]$WhatIf,
     [string]$UmRunScript = '',
     [string]$DllJobScript = '',
@@ -98,7 +102,15 @@ param(
     [string]$NowUtc = '',
     # Test-only (LEASE-NOT-AFTER-SUBMITTER-DEADLINE-TIMING-1): sleeps this long between each submission's remaining-budget sample and its not-after bound,
     # a scheduling delay test_venue_stage_nightly.py injects to prove the bound never passes the deadline. Production passes none.
-    [ValidateRange(0, 60000)][int]$TestNotAfterSampleDelayMs = 0
+    [ValidateRange(0, 60000)][int]$TestNotAfterSampleDelayMs = 0,
+    # Test-only (VENUE-STAGE-SAME-SHA-RESTAGE-GUARD-1 r2): the call's first soundness read (r4: step 4's when a build.json is there, else step 8's) blocks its
+    # worker this long first, as a read stuck on a dead SMB host does (Get-VenueStagedBuildManifest -TestReadDelayMs). Production passes none.
+    [ValidateRange(0, 600000)][int]$TestSoundnessReadDelayMs = 0,
+    # Test-only (r6, Grok G6/G7 on #814): the ARTIFACT HASH (not the manifest read) of one soundness read blocks this long first, as a slow SMB hash of a large
+    # cached package does (Get-VenueStagedBuildManifest -TestArtifactDelayMs): -TestSoundnessArtifactDelayAt first = the call's first soundness read, final = the
+    # final verify's. Production passes none.
+    [ValidateRange(0, 600000)][int]$TestSoundnessArtifactDelayMs = 0,
+    [ValidateSet('first', 'final')][string]$TestSoundnessArtifactDelayAt = 'first'
 )
 $ErrorActionPreference = 'Stop'
 $here = $PSScriptRoot
@@ -133,6 +145,7 @@ $script:Row = [ordered]@{
     cFreeGiB = [ordered]@{ start = $null; end = $null }; commitGiB = $null; buildDir = $null; detail = $null; reservationId = $null; reconciled = @()
 }
 $script:WriteRow = $false
+$script:SoundnessReads = 0
 $script:Mutex = $null
 $script:ReservationId = $null
 
@@ -200,28 +213,42 @@ function Stop-Nightly([string]$Reason, [string]$Detail = '', [string[]]$Verbatim
     $sha = $(if ($r.sourceCommit) { $r.sourceCommit } else { 'none' })
     Out-Line "STAGE_NIGHTLY_EXIT code=$code reason=$Reason sha=$sha manifest=$(if ($r.buildManifestSha256) { $r.buildManifestSha256 } else { 'none' })"
     Out-Line ('STAGE_NIGHTLY_RESULT=' + ($r | ConvertTo-Json -Compress -Depth 6))
+    # VENUE-STAGE-SAME-SHA-RESTAGE-GUARD-1 r2 (adversary A2 on 90b1c58e): a share read given up on is a live foreground thread the host would wait for at exit, so a read
+    # stuck on a dead SMB host held the process long after the typed exit. Everything is written; when a read was abandoned, the process ends now.
+    Complete-VenueProcess -ExitCode $code
     exit $code
 }
 
-function Invoke-Bounded([scriptblock]$Script, [object[]]$ArgList, [int]$Sec) {
+function Invoke-Bounded([scriptblock]$Script, [object[]]$ArgList, [double]$Sec) {
     # The Invoke-VenueBaseline.ps1 pattern: run a by-name share read on a worker thread and give up after $Sec seconds (a UNC path of a host that is down can block
-    # for minutes). A worker still stuck when we give up is abandoned (BeginStop, no wait), never joined.
+    # for minutes). A worker still stuck when we give up is abandoned (BeginStop, no wait), never joined -- and counted (r2, A2), so Stop-Nightly ends the process.
     $ps = [powershell]::Create()
     [void]$ps.AddScript($Script.ToString())
     foreach ($a in $ArgList) { [void]$ps.AddArgument($a) }
     $async = $ps.BeginInvoke()
     if (-not $async.AsyncWaitHandle.WaitOne([TimeSpan]::FromSeconds($Sec))) {
         try { [void]$ps.BeginStop($null, $null) } catch { }
-        return [pscustomobject]@{ ok = $false; timedOut = $true; value = $null; error = "no answer in $Sec s" }
+        & (Get-Module VenueChain) { $script:VenueAbandonedReads++ }
+        return [pscustomobject]@{ ok = $false; timedOut = $true; value = $null; error = "no answer in $([Math]::Round($Sec, 2)) s" }
     }
     try { $v = @($ps.EndInvoke($async)); [pscustomobject]@{ ok = $true; timedOut = $false; value = $(if ($v.Count -gt 0) { $v[0] } else { $null }); error = $null } }
     catch { [pscustomobject]@{ ok = $false; timedOut = $false; value = $null; error = $_.Exception.Message } }
     finally { $ps.Dispose() }
 }
 
+function Get-ProbeSec([string]$What) {
+    # VENUE-STAGE-SAME-SHA-RESTAGE-GUARD-1 r2 (adversary A3 on 90b1c58e): -MaxTotalSec is the total wall-clock cap, so every share probe gets min(-ProbeTimeoutSec,
+    # what is left of it), in seconds with their fraction. Under 1 s left there is no read to make: the cap ran out (STAGE_CAP_EXCEEDED), nothing more is read or written.
+    $left = ($script:Deadline - [DateTime]::UtcNow).TotalSeconds
+    if ($left -lt 1.0) { Stop-Nightly 'STAGE_CAP_EXCEEDED' "the $MaxTotalSec s cap ran out before $What could be read ($([Math]::Floor([Math]::Max(0.0, $left) * 100.0) / 100.0) s left)" }
+    [Math]::Min([double]$ProbeTimeoutSec, $left)
+}
+
 function Read-Share([string]$What, [scriptblock]$Script, [object[]]$ArgList) {
-    # A bounded by-name read; a share that does not answer ends the call SHARE_UNREACHABLE.
-    $b = Invoke-Bounded $Script $ArgList $ProbeTimeoutSec
+    # A bounded by-name read; a share that does not answer ends the call SHARE_UNREACHABLE (STAGE_CAP_EXCEEDED when what it was given was the rest of the cap).
+    $sec = Get-ProbeSec $What
+    $b = Invoke-Bounded $Script $ArgList $sec
+    if ($b.timedOut -and $sec -lt $ProbeTimeoutSec) { Stop-Nightly 'STAGE_CAP_EXCEEDED' "reading $What : $($b.error), the rest of the $MaxTotalSec s cap" }
     if ($b.timedOut) { Stop-Nightly 'SHARE_UNREACHABLE' "reading $What : $($b.error)" }
     if (-not $b.ok) { Stop-Nightly 'SHARE_UNREACHABLE' "reading $What failed: $($b.error)" }
     $b.value
@@ -236,6 +263,33 @@ $HashByName = {
 $PathByName = { param($p, $kind) if ($kind -eq 'dir') { Test-Path -LiteralPath $p -PathType Container } else { Test-Path -LiteralPath $p -PathType Leaf } }
 $DllReuseByName = { param($mod, $outbox, $id, $sha) Import-Module -Name $mod -Force; Get-DllPairReuse -Outbox $outbox -JobId $id -Sha $sha }
 $StageReuseByName = { param($mod, $path, $id, $sha, $kind) Import-Module -Name $mod -Force; Get-StageReuse -ResultPath $path -JobId $id -Sha $sha -Kind $kind }
+
+function Read-StagedSoundness([string]$When, [switch]$FinalVerify) {
+    # THE ONE soundness read of this driver (step 4's "already in the cache" and step 8's reuse both take it): Get-VenueStagedBuildManifest -VerifyArtifacts, the
+    # read the lease batch guards with and the one that embeds the leg's claim-shape predicate (Get-AttrCudaBuildManifestClaimSha256). Bounded like every share
+    # probe here: r2 (A3 on 90b1c58e) by min(-ProbeTimeoutSec, what is left of -MaxTotalSec). r3 (adversary A2 on ce5a0380): STAGE_CAP_EXCEEDED only when the cap
+    # really ran out during the read (under the 1 s Get-ProbeSec needs for any read); a read that failed with time left is an UNREACHABLE answer the caller types.
+    $soundSec = Get-ProbeSec "the soundness of the staged build of $commit"
+    # r6 (Grok G6/G7 on #814): the manifest read keeps that probe bound, and the artifact hash (the package zip, exe and dll over SMB) gets its OWN budget, the
+    # lease batch plan preflight's (-ArtifactTimeoutSec 300, Invoke-VenueLeaseBatch.ps1), never past what is left of -MaxTotalSec (-CallCapSec). r4/r5 hashed all
+    # three inside the one 30 s probe, so a sound build whose package hashed slower than that was SHARE_UNREACHABLE at step 4 (G6) and at the final verify (G7).
+    $capSec = [Math]::Max(0.0, ($script:Deadline - [DateTime]::UtcNow).TotalSeconds)
+    # the test-only -TestSoundnessReadDelayMs stalls the call's FIRST soundness read only (step 4's when a build.json is there, else step 8's), never the final verify's
+    $script:SoundnessReads++
+    $delayMs = $(if ($script:SoundnessReads -eq 1) { $TestSoundnessReadDelayMs } else { 0 })
+    $artDelayMs = $(if (($TestSoundnessArtifactDelayAt -ceq 'first' -and $script:SoundnessReads -eq 1) -or ($TestSoundnessArtifactDelayAt -ceq 'final' -and $FinalVerify)) { $TestSoundnessArtifactDelayMs } else { 0 })
+    $r = try { Get-VenueStagedBuildManifest -AgentShare $share -SourceCommit $commit -VerifyArtifacts -TimeoutSec $soundSec -ArtifactTimeoutSec 300 -CallCapSec $capSec -TestReadDelayMs $delayMs -TestArtifactDelayMs $artDelayMs } catch { [pscustomobject]@{ state = 'UNREACHABLE'; error = ($_.Exception.Message -replace '\s+', ' ') } }
+    $leftAfter = ($script:Deadline - [DateTime]::UtcNow).TotalSeconds
+    if ($r.state -ceq 'UNREACHABLE' -and $leftAfter -lt 1.0) { Stop-Nightly 'STAGE_CAP_EXCEEDED' "the soundness read of the staged build of $commit $When ran to the end of the $MaxTotalSec s cap (the manifest read $([Math]::Round($soundSec, 2)) s, the artifact hash at most 300 s, $([Math]::Round($capSec, 2)) s in all) and the cap ran out with no answer ($([Math]::Floor([Math]::Max(0.0, $leftAfter) * 100.0) / 100.0) s left): $($r.error); nothing was submitted" }
+    $r
+}
+
+function Test-StagedSound($Read, [string]$Hash) {
+    # sound = STAGED, no content or artifact problem, and the same manifest bytes the by-name read hashed
+    $null -ne $Read -and $Read.state -ceq 'STAGED' -and $Read.contentProblem -ceq '' -and $Read.artifactProblem -ceq '' -and $Read.sha256 -ceq $Hash
+}
+
+function Format-StagedSoundness($Read) { "state=$($Read.state) manifest=$($Read.sha256) content=[$($Read.contentProblem)] artifacts=[$($Read.artifactProblem)] error=[$($Read.error)]" }
 
 function Get-RemainingSec { [int][Math]::Floor(($script:Deadline - [DateTime]::UtcNow).TotalSeconds) }
 
@@ -387,7 +441,9 @@ function Assert-VenueFree([string]$Before) {
     }
 }
 Assert-VenueFree 'before anything was built'
-$reach = Invoke-Bounded { param($p) Test-Path -LiteralPath $p -PathType Container } @($cache) $ProbeTimeoutSec
+$reachSec = Get-ProbeSec "the agent share cache '$cache'"
+$reach = Invoke-Bounded { param($p) Test-Path -LiteralPath $p -PathType Container } @($cache) $reachSec
+if ($reach.timedOut -and $reachSec -lt $ProbeTimeoutSec) { Stop-Nightly 'STAGE_CAP_EXCEEDED' "the agent share cache '$cache' did not answer in $($reach.error), the rest of the $MaxTotalSec s cap" }
 if (-not $reach.ok -or $reach.value -ne $true) { Stop-Nightly 'SHARE_UNREACHABLE' "the agent share cache '$cache' did not answer as a directory ($(if ($reach.error) { $reach.error } else { 'not found' }))" }
 
 # ------------------------------------------------------------------ 4. idempotency: what the cache already holds, by name --------------------------------------------------
@@ -412,10 +468,20 @@ if ($cached.present) {
 }
 $missingArtifacts = @(foreach ($n in @($names.exeName, $names.reconName, $names.packageZipName)) { if (-not (Read-Share "$cache\$n" $PathByName @((Join-Path $cache $n), 'file'))) { $n } })
 $runnerPresent = [bool](Read-Share "$cache\$runnerDirName" $PathByName @((Join-Path $cache $runnerDirName), 'dir'))
-$buildInCache = $cachedWellFormed -and $missingArtifacts.Count -eq 0
+# VENUE-STAGE-SAME-SHA-RESTAGE-GUARD-1 r4 (adversary pass 6 A2 on 3bec2622): "already in the cache" is the SOUND staged build, decided by the one soundness read
+# (Read-StagedSoundness), never by a parseable build.json plus three artifact NAMES: a build whose exe claim is sha256=[h] (refused by the leg's claim-shape
+# predicate) was reported STAGE_SKIP_ALREADY. Unsound is not in the cache: this call builds and stages its own (the stage job replaces only an unsound build).
+# A read that does not answer with time left is SHARE_UNREACHABLE, as every other by-name read of this step is (Read-Share); nothing is reserved or built.
+$buildInCache = $false
+if ($cached.present) {
+    $step4 = Read-StagedSoundness 'before anything was built'
+    if ($step4.state -ceq 'UNREACHABLE') { Stop-Nightly 'SHARE_UNREACHABLE' "the soundness read of the staged build of $commit did not answer before anything was built: $($step4.error)" }
+    $buildInCache = Test-StagedSound $step4 $cached.hash
+    if (-not $buildInCache) { Say "the $Venue cache holds a build.json for $commit that is not a sound staged build ($(Format-StagedSoundness $step4)); it is not taken as staged" }
+}
 if ($buildInCache -and $runnerPresent) {
     $script:Row.steps.dllPair = 'skipped'; $script:Row.steps.assemble = 'skipped'; $script:Row.steps.stage = 'in-cache'; $script:Row.steps.smokeRunner = 'in-cache'
-    Stop-Nightly 'STAGE_SKIP_ALREADY' "$cacheBuildJson (sourceCommit $commit) and its three artifacts and $runnerDirName are already in the $Venue cache; nothing was built or submitted" -Manifest $cached.hash
+    Stop-Nightly 'STAGE_SKIP_ALREADY' "$cacheBuildJson (a sound staged build of ${commit}: its manifest and the three artifacts it names verified) and $runnerDirName are already in the $Venue cache; nothing was built or submitted" -Manifest $cached.hash
 }
 if ($cachedWellFormed -and $missingArtifacts.Count -gt 0) {
     Stop-Nightly 'STAGE_FAILED' "the $Venue cache holds $($names.buildManifestName) for $commit but not $($missingArtifacts -join ', '); not re-assembled (a re-assemble makes a new manifest); the hub inspects the cache"
@@ -603,7 +669,32 @@ if ($buildInCache) {
     $t0 = [DateTime]::UtcNow
     $suffix = ''
     $submit = $true
-    if (Read-Share "$share\outbox\$stageDefaultId.result.json" $PathByName @("$share\outbox\$stageDefaultId.result.json", 'file')) {
+    # VENUE-STAGE-SAME-SHA-RESTAGE-GUARD-1: the assemble can take hours, and another stager may have staged this sha meanwhile (2026-11-13: a second
+    # lane's stage of 23a07757 replaced the manifest a running lease batch had pinned). A staged build is reused, never replaced: this call's own
+    # assemble is left unstaged and the staged manifest is the one recorded. (The stage job refuses a replacement on the host as well.)
+    # Reused only when SOUND: Read-StagedSoundness (Get-VenueStagedBuildManifest -VerifyArtifacts, the read the lease batch guards with, and step 4's
+    # since r4) finds no content or artifact problem and the same manifest bytes. It is asked whenever a build.json is there (adversary A2/A3 on
+    # 72577e87), and it is bounded like every other share probe here (A4): r2 (A3 on 90b1c58e) by min(-ProbeTimeoutSec, what is left of -MaxTotalSec),
+    # so a reuse is never decided past the cap; a read cut short by the cap is STAGE_CAP_EXCEEDED. Anything else (unsound, changed, or a read that did
+    # not answer) goes to the stage job, which replaces only an unsound build and refuses to replace a sound one (exit 7, STAGE_FAILED here, nothing written).
+    $again = Read-Share $cacheBuildJson $HashByName @($cacheBuildJson)
+    $sound = $null
+    if ($again.present) {
+        # r3 (adversary A2 on ce5a0380): a read that failed with time left (a held artifact, 0.09 s, ~100 s of the cap left) is an ordinary unreadable answer
+        # here, and the stage job decides on the host (Read-StagedSoundness types only a read the cap cut short).
+        $sound = Read-StagedSoundness 'before the stage submission'
+        if (-not (Test-StagedSound $sound $again.hash)) {
+            Say "the $Venue cache holds a build of $commit that is not reused: $(Format-StagedSoundness $sound); staging this call's build (the stage job replaces only an unsound build)"
+            $sound = $null
+        }
+    }
+    if ($null -ne $sound) {
+        $submit = $false
+        $expected = $sound.sha256
+        $script:Row.steps.stage = 'reused-existing'
+        $script:Row.jobIds.stage = $null
+        Out-Line "STAGE_REUSED_EXISTING sha=$s12 manifest=$($expected.Substring(0, 8)) manifestSha256=$expected (staged by another stager while this call assembled; its own build $buildDir is not staged)"
+    } elseif (Read-Share "$share\outbox\$stageDefaultId.result.json" $PathByName @("$share\outbox\$stageDefaultId.result.json", 'file')) {
         $prior = Read-Share "$share\outbox\$stageDefaultId.result.json" $StageReuseByName @($reuseModule, "$share\outbox\$stageDefaultId.result.json", $stageDefaultId, $commit, 'Stage')
         $now2 = Read-Share $cacheBuildJson $HashByName @($cacheBuildJson)
         if ($now2.present -and $now2.hash -ceq $expected) {
@@ -677,4 +768,15 @@ $final = Read-Share $cacheBuildJson $HashByName @($cacheBuildJson)
 if (-not $final.present -or $final.hash -cne $expected) {
     Stop-Nightly 'STAGE_VERIFY_MISMATCH' "the final by-name read of $cacheBuildJson hashes $(if ($final.present) { $final.hash } else { 'MISSING' }), not $expected; never recorded as staged"
 }
+# r4 fix iteration (adversary pass 7 A1 on 24f85549): the bytes are the expected ones, and they must also be a build a leg runs. A hash-only verify recorded
+# STAGE_OK for an unsound build that every reuse read had refused (the local build held the same unsound manifest, and the spent default JobId's
+# "cache holds the expected hash" fallback skipped the submission). STAGE_OK and STAGE_SKIP_ALREADY are recorded only for a SOUND staged build.
+$finalSound = Read-StagedSoundness 'at the final verify' -FinalVerify
+if ($finalSound.state -ceq 'UNREACHABLE') { Stop-Nightly 'SHARE_UNREACHABLE' "the soundness read of the staged build of $commit did not answer at the final verify: $($finalSound.error); not recorded as staged" }
+if (-not (Test-StagedSound $finalSound $final.hash)) {
+    Stop-Nightly 'STAGE_VERIFY_MISMATCH' "the $Venue cache holds the expected $cacheBuildJson ($($final.hash)) but it is not a sound staged build ($(Format-StagedSoundness $finalSound)); never recorded as staged (the hub re-assembles)"
+}
+# r2 (adversary A3 on 90b1c58e): -MaxTotalSec is the cap on the whole call, STAGE_OK included: an outcome reached after it is never reported as STAGE_OK.
+$overBy = ([DateTime]::UtcNow - $script:Deadline).TotalSeconds
+if ($overBy -gt 0) { Stop-Nightly 'STAGE_CAP_EXCEEDED' "the $MaxTotalSec s cap ran out $([Math]::Round($overBy, 2)) s before the verified $cacheBuildJson ($($final.hash)) could be recorded; not recorded as staged" }
 Stop-Nightly 'STAGE_OK' "$cacheBuildJson sha256 $($final.hash) (read by name) and $runnerDirName are in the $Venue cache; Invoke-VenueBaseline finds this manifest" -Manifest $final.hash

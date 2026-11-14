@@ -230,7 +230,7 @@ function Get-AttrCudaArtifactNames {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory = $true)]
-        [ValidatePattern('^[0-9a-f]{40}$')]
+        [ValidatePattern('^[0-9a-f]{40}\z')]
         [string]$SourceCommit
     )
 
@@ -251,7 +251,7 @@ function New-AttrCudaBuildInfoHeader {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory = $true)]
-        [ValidatePattern('^[0-9a-f]{40}$')]
+        [ValidatePattern('^[0-9a-f]{40}\z')]
         [string]$SourceCommit,
 
         [string]$BuildTimeUtc = [DateTime]::UtcNow.ToString('yyyy-MM-ddTHH:mm:ssZ')
@@ -410,6 +410,108 @@ function Assert-AttrCudaBuildManifest {
         throw "ATTRCUDA_BUILD_MANIFEST_SYMBOL_PRESENCE_INVALID $Path pendingSymbolPresence is not a boolean (got '$observed')"
     }
     $manifest
+}
+
+function Get-AttrCudaBuildManifestClaimSha256 {
+    <#
+    .SYNOPSIS
+    The digest a parsed build.json claims for one cached artifact (packageZip | exe | dll), or ''
+    when the claim is not of the one accepted shape.
+    .DESCRIPTION
+    VENUE-STAGE-SAME-SHA-RESTAGE-GUARD-1 r3 (adversary A1 on ce5a0380): the ONE claim-shape
+    predicate. The accepted shape is strict: the -Key property holds ONE object (or a JSON array
+    of exactly one object, the shape r2 admitted), and that object's sha256 is a scalar string of
+    64 hex. Anything else is '' -- a digest held in an array ([["<hex>"]] or ["<hex>"]), an array
+    of two claims, a number, a missing claim. Member access ($m.exe.sha256) let PowerShell's
+    member enumeration unwrap a nested [["<hex>"]] into a digest for the leg job while the stage
+    job's host guard refused it, so the guard replaced a build the leg ran.
+    Every reader of the claim calls this text: the leg job ($manifestChecks) and the
+    reference-frame runner job, the stage job's generator, binding and host guard (all embedded
+    verbatim), and VenueChain.psm1 Get-VenueStagedBuildManifest, whose share read runs this same
+    text (the nightly's reuse decision and the lease batch's plan and post-claim guards take
+    that read). One text, so one accept-set.
+    #>
+    param($Manifest, [string]$Key)
+
+    if ($null -eq $Manifest -or $Manifest -isnot [System.Management.Automation.PSCustomObject]) { return '' }
+    $property = $Manifest.PSObject.Properties[$Key]
+    if ($null -eq $property) { return '' }
+    $claim = $property.Value
+    if ($claim -is [array]) {
+        if ($claim.Count -ne 1) { return '' }
+        $claim = $claim[0]
+    }
+    if ($null -eq $claim -or $claim -isnot [System.Management.Automation.PSCustomObject]) { return '' }
+    $digest = $claim.PSObject.Properties['sha256']
+    if ($null -eq $digest -or $digest.Value -isnot [string] -or $digest.Value -notmatch '^[0-9a-fA-F]{64}\z') { return '' }
+    $digest.Value.ToLowerInvariant()
+}
+
+function Enter-AttrCudaStageLock {
+    <#
+    .SYNOPSIS
+    Take the ONE stage lock of a sha in an agent root, for the life of the calling process.
+    .DESCRIPTION
+    VENUE-STAGE-SAME-SHA-RESTAGE-GUARD-1 r3 (adversary A3 on ce5a0380, A1 on 3bec2622). Two agents on
+    one root, each with its own -MutexName and both admitted, both passed the stage job's
+    absent-manifest guard; B published, then A replaced B's artifacts, deleted B's sound manifest and
+    failed. The lock is named for the PHYSICAL identity of the agent root (volume serial and file
+    index, read with Get-AttrCudaFileId -FollowLinks, so C:\ProgramData\MlvAgent and an alias of it
+    through a junction are one root) and the sha -- never a caller-chosen name or a lexical path:
+    Global\MlvAttrCudaStage-<sha256 of "vol=<serial>;idx=<high>-<low>|<sha, lower>">. Every stager of
+    that sha into that root's cache, in any session, contends for the same one. The caller keeps the
+    returned mutex referenced and never releases it: the OS releases it when the process ends, after
+    the last cache write. An abandoned lock (a stager that died) is taken over, because the caller
+    re-reads the cache under it. -WaitMarkerPath (test-only) is written when the lock is busy, before
+    the wait. Returns name, held (false: still busy after -WaitSec) and waited. Throws when the
+    root's identity cannot be read.
+    r4 (Grok G5 on #814): a busy lock is announced BEFORE the wait, on the job's stdout (the agent
+    captures the job process's stdout), as one line
+    "STAGE_LOCK_WAIT vol=<serial>;idx=<high>-<low> <sha> waiting up to <n> s (lock <name> ...)", so a
+    stager blocked for up to -WaitSec is never silent. Write-Host, not the output stream: the line is
+    not part of the returned object.
+    #>
+    param(
+        [Parameter(Mandatory = $true)][string]$Root,
+        # r6 fix iteration (adversary A1 on 424df284): the lock key is this sha, so a '<40 hex>\n' (which '$' let through) never names a second lock
+        [Parameter(Mandatory = $true)][ValidatePattern('^[0-9a-f]{40}\z')][string]$SourceCommit,
+        [int]$WaitSec = 1800,
+        [string]$WaitMarkerPath = ''
+    )
+
+    $id = Get-AttrCudaFileId -Path $Root -FollowLinks
+    $rootId = 'vol=' + [string]$id.VolumeSerialNumber + ';idx=' + [string]$id.FileIndexHigh + '-' + [string]$id.FileIndexLow
+    $key = $rootId + '|' + $SourceCommit.ToLowerInvariant()
+    $hasher = [Security.Cryptography.SHA256]::Create()
+    try {
+        $name = 'Global\MlvAttrCudaStage-' + ([BitConverter]::ToString($hasher.ComputeHash([Text.Encoding]::UTF8.GetBytes($key))) -replace '-', '').ToLowerInvariant()
+    } finally { $hasher.Dispose() }
+    $mutex = [Threading.Mutex]::new($false, $name)
+    $held = $false
+    $waited = $false
+    try { $held = $mutex.WaitOne(0) } catch [Threading.AbandonedMutexException] { $held = $true }
+    if (-not $held) {
+        $waited = $true
+        Write-Host ('STAGE_LOCK_WAIT ' + $rootId + ' ' + $SourceCommit.ToLowerInvariant() + ' waiting up to ' + [string]$WaitSec + ' s (lock ' + $name + ' is held by another stager of this sha into this agent root)')
+        if ($WaitMarkerPath) { [IO.File]::WriteAllText($WaitMarkerPath, $name) }
+        try { $held = $mutex.WaitOne($WaitSec * 1000) } catch [Threading.AbandonedMutexException] { $held = $true }
+    }
+    [pscustomobject]@{ name = $name; held = $held; waited = $waited; mutex = $mutex }
+}
+
+function Wait-AttrCudaTestHold {
+    <#
+    .SYNOPSIS
+    Test-only seam (VENUE-STAGE-SAME-SHA-RESTAGE-GUARD-1 r3): with a -Path, mark "<Path>.reached" and
+    wait (at most -MaxSec) until -Path exists. With none -- every production call, the agent runs a
+    job with no arguments -- it returns at once and touches nothing.
+    #>
+    param([string]$Path = '', [int]$MaxSec = 120)
+
+    if ([string]::IsNullOrEmpty($Path)) { return }
+    [IO.File]::WriteAllText("$Path.reached", '')
+    $clock = [Diagnostics.Stopwatch]::StartNew()
+    while (-not (Test-Path -LiteralPath $Path) -and $clock.Elapsed.TotalSeconds -lt $MaxSec) { Start-Sleep -Milliseconds 100 }
 }
 
 function Get-AttrCudaGitBlobHashFromBytes {
@@ -688,7 +790,7 @@ function Resolve-AttrCudaCommittedBlobId {
         [string]$RepoRoot,
 
         [Parameter(Mandatory = $true)]
-        [ValidatePattern('^[0-9a-f]{40}$')]
+        [ValidatePattern('^[0-9a-f]{40}\z')]
         [string]$Commit,
 
         [Parameter(Mandatory = $true)]
@@ -733,7 +835,7 @@ function Save-AttrCudaCommittedBlobBytes {
         [string]$RepoRoot,
 
         [Parameter(Mandatory = $true)]
-        [ValidatePattern('^[0-9a-f]{40}$')]
+        [ValidatePattern('^[0-9a-f]{40}\z')]
         [string]$BlobId,
 
         [Parameter(Mandatory = $true)]
@@ -1198,7 +1300,7 @@ function Assert-AttrCudaClosureComplete {
         [string]$RepoRoot,
 
         [Parameter(Mandatory = $true)]
-        [ValidatePattern('^[0-9a-f]{40}$')]
+        [ValidatePattern('^[0-9a-f]{40}\z')]
         [string]$Commit,
 
         [string[]]$RepoRelativePaths = $script:AttrCudaSmokeRunnerClosureManifest
@@ -1306,7 +1408,7 @@ function Resolve-AttrCudaSmokeRunnerClosure {
         [string]$RepoRoot,
 
         [Parameter(Mandatory = $true)]
-        [ValidatePattern('^[0-9a-f]{40}$')]
+        [ValidatePattern('^[0-9a-f]{40}\z')]
         [string]$Commit,
 
         [string[]]$RepoRelativePaths = $script:AttrCudaSmokeRunnerClosureManifest
@@ -7763,6 +7865,9 @@ Export-ModuleMember -Function `
     Assert-AttrCudaSafeArtifactName, `
     Assert-AttrCudaDirectChild, `
     Assert-AttrCudaBuildManifest, `
+    Get-AttrCudaBuildManifestClaimSha256, `
+    Enter-AttrCudaStageLock, `
+    Wait-AttrCudaTestHold, `
     Assert-AttrCudaFixtureCommittedBytes, `
     Resolve-AttrCudaCommittedBlobId, `
     Save-AttrCudaCommittedBlobBytes, `

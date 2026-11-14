@@ -56,7 +56,7 @@
 [CmdletBinding()]
 param(
     [ValidateSet('bachelor', 'ultra-magnus')][string]$Venue = 'ultra-magnus',
-    [ValidatePattern('^[0-9a-f]{40}$')][string]$SourceCommit = '',
+    [ValidatePattern('^[0-9a-f]{40}\z')][string]$SourceCommit = '',
     [ValidatePattern('^[0-9a-f]{64}$')][string]$BuildManifestSha256 = '',
     [string]$TrendFile = '',
     [string]$RunDir = '',
@@ -102,6 +102,8 @@ function Stop-Baseline([string]$Reason, [string]$Detail) {
         $r = [ordered]@{ schema = 'mlv-app/venue-baseline-result/v1'; venue = $Venue; exitCode = $code; reason = $Reason; detail = $Detail; startedUtc = $startedUtc.ToString('o'); finishedUtc = [DateTime]::UtcNow.ToString('o') }
         try { [IO.File]::WriteAllText((Join-Path $script:RunDirResolved 'baseline-result.json'), ($r | ConvertTo-Json -Compress -Depth 6)) } catch { }
     }
+    # VENUE-STAGE-SAME-SHA-RESTAGE-GUARD-1 r2 (adversary A2 sibling): a by-name read given up on is a live foreground thread the host would wait for at exit; end now.
+    Complete-VenueProcess -ExitCode $code
     exit $code
 }
 
@@ -114,6 +116,8 @@ function Invoke-Bounded([scriptblock]$Script, [object[]]$ArgList, [int]$Sec) {
     $async = $ps.BeginInvoke()
     if (-not $async.AsyncWaitHandle.WaitOne([TimeSpan]::FromSeconds($Sec))) {
         try { [void]$ps.BeginStop($null, $null) } catch { }
+        # r2 (A2 sibling): counted, so Complete-VenueProcess ends the process at exit instead of waiting for this worker
+        & (Get-Module VenueChain) { $script:VenueAbandonedReads++ }
         return [pscustomobject]@{ ok = $false; timedOut = $true; value = $null; error = "no answer in $Sec s" }
     }
     try { $v = @($ps.EndInvoke($async)); [pscustomobject]@{ ok = $true; timedOut = $false; value = $(if ($v.Count -gt 0) { $v[0] } else { $null }); error = $null } }
@@ -500,4 +504,5 @@ $summary = [ordered]@{
 [IO.File]::WriteAllText((Join-Path $RunDir 'baseline-result.json'), ($summary | ConvertTo-Json -Compress -Depth 8))
 Out-Line "BASELINE_EXIT code=$code reason=$reason rows=$($rows.Count)$(if ($typed) { " detail=$($typed.detail)" } elseif ($reason -ceq 'NO_MEASUREMENT') { " detail=$noMeasurementDetail" })"
 Out-Line ('BASELINE_RESULT=' + ($summary | ConvertTo-Json -Compress -Depth 8))
+Complete-VenueProcess -ExitCode $code
 exit $code

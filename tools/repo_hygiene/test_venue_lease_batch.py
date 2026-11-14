@@ -38,6 +38,8 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest import mock
 
+from tools.repo_hygiene.venue_fixture_modules import copy_cross_tree_modules
+
 ROOT = Path(__file__).resolve().parents[2]
 DV = ROOT / "tools" / "profiling" / "dual-venue"
 RUNNER = DV / "Invoke-VenueLeaseBatch.ps1"
@@ -1656,6 +1658,8 @@ $ids = @(1..40 | ForEach-Object {{ New-VenueCapsProbeId }})
         shutil.copytree(DV, tree / "dual-venue", ignore=shutil.ignore_patterns("look-receipts", "legs", "legsets"))
         (tree / "bachelor").mkdir()
         shutil.copy2(AGENT, tree / "bachelor" / AGENT.name)
+        # VENUE-STAGE-SAME-SHA-RESTAGE-GUARD-1 r5 (CI run 43580040634): and every neighbouring-folder module the dual-venue modules read (..\bachelor\AttrCudaArtifacts.psm1)
+        copy_cross_tree_modules(MODULE, tree / "dual-venue")
         if agent_patches:
             agent_copy = tree / "bachelor" / AGENT.name
             agent_text = agent_copy.read_text(encoding="utf-8")
@@ -2579,6 +2583,8 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
         shutil.copytree(DV, tree / "dual-venue", ignore=shutil.ignore_patterns("look-receipts", "legs", "legsets"))
         (tree / "bachelor").mkdir()
         shutil.copy2(AGENT, tree / "bachelor" / AGENT.name)
+        # VENUE-STAGE-SAME-SHA-RESTAGE-GUARD-1 r5 (CI run 43580040634): and every neighbouring-folder module the dual-venue modules read (..\bachelor\AttrCudaArtifacts.psm1)
+        copy_cross_tree_modules(MODULE, tree / "dual-venue")
         runner = tree / "dual-venue" / RUNNER.name
         text = runner.read_text(encoding="utf-8")
         for o, n in ((old, new), *more):

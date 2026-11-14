@@ -6,7 +6,7 @@ Owner directive 2026-10-18 (Layi): "I'm curious how playback performs on ultrama
 four tracked staging steps (DLL pair on Ultra-Magnus, local assemble under build-guard, stage job, smoke-runner stage job).
 
 WHAT IS PINNED
-  * idempotency: a sha whose cache build.json (well-formed, right sourceCommit), three named artifacts and smoke-runner dir are all on the share is STAGE_SKIP_ALREADY;
+  * idempotency: a sha whose cache build.json is a SOUND staged build (the shared soundness read, artifacts verified; r4) and whose smoke-runner dir is on the share is STAGE_SKIP_ALREADY;
     nothing is generated (except the local smoke-runner generator that names the runner dir), assembled or submitted, and the row carries the by-name cache hash;
   * the #508 shape: a default stage JobId whose outbox result says STAGE_OK while the cache does not hold the expected manifest is re-staged under a -JobIdSuffix,
     never reported "reused"; after every STAGE_OK the cache file is re-hashed BY NAME, and a mismatch is STAGE_VERIFY_MISMATCH, never success;
@@ -111,9 +111,43 @@ foreach ($n in "MLVApp-playback-attr-3-cuda-$s.exe", "igpu_recon_cuda-playback-a
     Set-Content -LiteralPath (Join-Path $OutDir $n) -Value "fixture $n"
 }
 $bj = Join-Path $OutDir "playback-attr-3-cuda-$s-build.json"
-# assembledAtUtc makes every assemble a NEW manifest, exactly like the real assembler (assemble.ps1:411)
-[IO.File]::WriteAllText($bj, (@{ sourceCommit = $SourceCommit; assembledAtUtc = [DateTime]::UtcNow.ToString('o'); nonce = [guid]::NewGuid().ToString('N') } | ConvertTo-Json -Compress))
+# assembledAtUtc makes every assemble a NEW manifest, exactly like the real assembler (assemble.ps1:411). r4 fix iteration (adversary pass 7 A1): the driver
+# records STAGE_OK only for a SOUND staged build, so the assembled manifest carries what the leg reads (scalar digests of the three artifacts written above).
+$own = [ordered]@{}
+foreach ($pair in @(@('exe', "MLVApp-playback-attr-3-cuda-$s.exe"), @('dll', "igpu_recon_cuda-playback-attr-3-cuda-$s.dll"), @('packageZip', "MLVApp-playback-attr-3-cuda-$s-pkg.zip"))) {
+    $own[$pair[0]] = [ordered]@{ name = $pair[1]; sha256 = (Get-FileHash -LiteralPath (Join-Path $OutDir $pair[1]) -Algorithm SHA256).Hash.ToLowerInvariant() }
+}
+[IO.File]::WriteAllText($bj, ([ordered]@{ sourceCommit = $SourceCommit; assembledAtUtc = [DateTime]::UtcNow.ToString('o'); nonce = [guid]::NewGuid().ToString('N')
+    dllPairManifestSha256 = ('b' * 64); pendingSymbolPresence = $true; packageZip = $own.packageZip; exe = $own.exe; dll = $own.dll } | ConvertTo-Json -Compress -Depth 4))
 $h = (Get-FileHash -LiteralPath $bj -Algorithm SHA256).Hash.ToLowerInvariant()
+# racestage (VENUE-STAGE-SAME-SHA-RESTAGE-GUARD-1): while this assemble ran, ANOTHER stager staged this sha (its own assemble) into $env:FAKE_RACE_CACHE,
+# a build the leg job accepts (manifest fields + artifact digests). racestage-corrupt: the same, then the cached exe no longer hashes to its digest.
+if ($env:FAKE_ASSEMBLE -like 'racestage*') {
+    $claims = @{}
+    foreach ($pair in @(@('exe', "MLVApp-playback-attr-3-cuda-$s.exe"), @('dll', "igpu_recon_cuda-playback-attr-3-cuda-$s.dll"), @('packageZip', "MLVApp-playback-attr-3-cuda-$s-pkg.zip"))) {
+        $p = Join-Path $env:FAKE_RACE_CACHE $pair[1]
+        [IO.File]::WriteAllText($p, "racer $($pair[1])")
+        $claims[$pair[0]] = [ordered]@{ name = $pair[1]; sha256 = (Get-FileHash -LiteralPath $p -Algorithm SHA256).Hash.ToLowerInvariant() }
+    }
+    if ($env:FAKE_ASSEMBLE -eq 'racestage-corrupt') { [IO.File]::WriteAllText((Join-Path $env:FAKE_RACE_CACHE "MLVApp-playback-attr-3-cuda-$s.exe"), 'corrupt') }
+    # racestage-missing: the racer's cached exe is gone afterwards; racestage-upper: the racer's manifest spells the commit in upper case (the leg accepts it)
+    if ($env:FAKE_ASSEMBLE -eq 'racestage-missing') { Remove-Item -LiteralPath (Join-Path $env:FAKE_RACE_CACHE "MLVApp-playback-attr-3-cuda-$s.exe") }
+    $rm = [ordered]@{ sourceCommit = $(if ($env:FAKE_ASSEMBLE -eq 'racestage-upper') { $SourceCommit.ToUpperInvariant() } else { $SourceCommit }); assembledAtUtc = 'racer'; dllPairManifestSha256 = ('b' * 64); pendingSymbolPresence = $true; packageZip = $claims.packageZip; exe = $claims.exe; dll = $claims.dll }
+    # racestage-array (r2, adversary A1 on 90b1c58e): the exe claim is a one-element ARRAY [{name,sha256}], a shape the leg job and the host guard accept
+    if ($env:FAKE_ASSEMBLE -eq 'racestage-array') { $rm.exe = @($claims.exe) }
+    # FAKE_ASSEMBLE_SLEEP: the assemble takes this many seconds more (the racer's stage lands meanwhile)
+    if ($env:FAKE_ASSEMBLE_SLEEP) { Start-Sleep -Seconds ([int]$env:FAKE_ASSEMBLE_SLEEP) }
+    [IO.File]::WriteAllText((Join-Path $env:FAKE_RACE_CACHE "playback-attr-3-cuda-$s-build.json"), ($rm | ConvertTo-Json -Compress -Depth 4))
+    # racestage-locked (r3, adversary A2 on ce5a0380): the racer's cached exe is held open with FileShare.None for FAKE_LOCK_SEC s, so the soundness read's
+    # artifact hash fails AT ONCE with nearly all of the cap left. The holder marks <FAKE_CALLS>.lockheld once it holds the file and .lockreleased after.
+    if ($env:FAKE_ASSEMBLE -eq 'racestage-locked') {
+        $exe = Join-Path $env:FAKE_RACE_CACHE "MLVApp-playback-attr-3-cuda-$s.exe"
+        $hold = "`$fs = [IO.File]::Open('$exe', 'Open', 'Read', 'None'); [IO.File]::WriteAllText('$($env:FAKE_CALLS).lockheld', ''); Start-Sleep -Seconds $env:FAKE_LOCK_SEC; `$fs.Dispose(); [IO.File]::WriteAllText('$($env:FAKE_CALLS).lockreleased', '')"
+        Start-Process -FilePath (Get-Process -Id $PID).Path -ArgumentList @('-NoProfile', '-NonInteractive', '-Command', $hold) -WindowStyle Hidden | Out-Null
+        $t = [Diagnostics.Stopwatch]::StartNew()
+        while (-not (Test-Path -LiteralPath "$($env:FAKE_CALLS).lockheld") -and $t.Elapsed.TotalSeconds -lt 60) { Start-Sleep -Milliseconds 100 }
+    }
+}
 "RESULT=ASSEMBLE_OK SOURCE=$SourceCommit EXE=x DLL=x PKG=x MANIFEST=playback-attr-3-cuda-$s-build.json MANIFEST_SHA256=$h OUT=$OutDir"
 exit 0
 """
@@ -166,6 +200,11 @@ elseif ($kind -eq 'DLLPAIR') {
     [IO.File]::WriteAllText((Join-Path $art 'dll-pair-manifest.json'), (@{ sourceCommit = $sha; jobId = $JobId } | ConvertTo-Json -Compress))
     $out = "RESULT=DLL_PAIR_OK SOURCE=$sha ARCH=sm_86 RECON=x AMAZE=x ARTIFACTS=$art"
 } elseif ($kind -eq 'STAGE') {
+    # racestage-locked: the agent runs the stage once the racer's lock holder has let go (the copy below replaces the held exe)
+    if (Test-Path -LiteralPath "$($env:FAKE_CALLS).lockheld") {
+        $t = [Diagnostics.Stopwatch]::StartNew()
+        while (-not (Test-Path -LiteralPath "$($env:FAKE_CALLS).lockreleased") -and $t.Elapsed.TotalSeconds -lt 60) { Start-Sleep -Milliseconds 100 }
+    }
     foreach ($f in $sides) { Copy-Item -LiteralPath $f -Destination (Join-Path $cache (Split-Path -Leaf $f)) -Force }
     if ($mode -eq 'wrongcache') {
         $bj = @($sides | Where-Object { $_ -like '*-build.json' })[0]
@@ -254,12 +293,12 @@ class VenueStageNightlyTests(unittest.TestCase):
 
     # ---------------------------------------------------------------- harness
     def args(self, *extra: str, share: Path | None = None, commit: str | None = SHA, now: str | None = NOW, driver: Path | None = None,
-             repo: Path | None = None) -> list[str]:
+             repo: Path | None = None, probe: str = "20") -> list[str]:
         a = [PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-File", str(driver or DRIVER), "-RepoRoot", str(repo or self.checkout),
              "-ReceiptFile", str(self.receipt), "-BuildRoot", str(self.build_root),
              "-AgentShare", str(share or self.share), "-ClaimDir", str(self.claims), "-GateDir", str(self.gates),
              "-UmRunScript", str(self.stubs / "um-run.ps1"), "-DllJobScript", str(self.stubs / "dll-gen.ps1"), "-AssembleScript", str(self.stubs / "assemble.ps1"),
-             "-StageJobScript", str(self.stubs / "stage-gen.ps1"), "-SmokeRunnerJobScript", str(self.stubs / "smoke-gen.ps1"), "-ProbeTimeoutSec", "20"]
+             "-StageJobScript", str(self.stubs / "stage-gen.ps1"), "-SmokeRunnerJobScript", str(self.stubs / "smoke-gen.ps1"), "-ProbeTimeoutSec", probe]
         if commit:
             a += ["-SourceCommit", commit]
         if now:
@@ -310,10 +349,20 @@ class VenueStageNightlyTests(unittest.TestCase):
         for role in ("DLLGEN", "ASSEMBLE", "STAGEGEN", "UMRUN"):
             self.assertEqual(self.calls(role), [], role)
 
-    def stage_cache(self, sha: str = SHA, runner: bool = True, artifacts: bool = True, body: bytes | None = None) -> Path:
+    def stage_cache(self, sha: str = SHA, runner: bool = True, artifacts: bool = True, body: bytes | None = None, exe_claim: object = None) -> Path:
+        # r4 (adversary pass 6 A2 on 3bec2622): step 4 decides "already in the cache" by the shared soundness read (Get-VenueStagedBuildManifest
+        # -VerifyArtifacts), so the default fixture is a SOUND staged build: the fields the leg job's validator reads and a scalar 64-hex digest per artifact
+        # that the cached bytes (b"x") hash to. -exe_claim replaces the exe claim (a shape the leg refuses); -body replaces the whole manifest.
         n = names(sha)
         bj = self.share / "cache" / n["build"]
-        bj.write_bytes(body if body is not None else json.dumps({"sourceCommit": sha, "assembledAtUtc": "2026-10-19T01:02:03Z"}).encode())
+        if body is None:
+            digest = hashlib.sha256(b"x").hexdigest()
+            claim = {k: {"name": n[f], "sha256": digest} for k, f in (("packageZip", "pkg"), ("exe", "exe"), ("dll", "dll"))}
+            if exe_claim is not None:
+                claim["exe"] = exe_claim
+            body = json.dumps({"sourceCommit": sha, "assembledAtUtc": "2026-10-19T01:02:03Z", "dllPairManifestSha256": "b" * 64, "pendingSymbolPresence": True,
+                               **claim}).encode()
+        bj.write_bytes(body)
         if artifacts:
             for k in ("exe", "dll", "pkg"):
                 (self.share / "cache" / n[k]).write_bytes(b"x")
@@ -641,6 +690,296 @@ class VenueStageNightlyTests(unittest.TestCase):
         self.spend_default_stage_jobid()
         self.stage_cache(runner=False, body=json.dumps({"sourceCommit": OTHER_SHA}).encode())
         self.assert_restaged_under_a_suffix(self.run_driver())
+
+    # ---------------------------------------------------------------- VENUE-STAGE-SAME-SHA-RESTAGE-GUARD-1 (RED first)
+    def assert_racer_reused(self, mode: str) -> None:
+        p = self.run_driver(env={"FAKE_ASSEMBLE": mode, "FAKE_RACE_CACHE": str(self.share / "cache")})
+        self.assert_exit(p, "STAGE_OK")
+        bj = self.share / "cache" / names()["build"]
+        self.assertEqual(json.loads(bj.read_text(encoding="utf-8"))["assembledAtUtc"], "racer", "the racer's staged manifest was replaced")
+        racer = sha256(bj)
+        self.assertEqual(self.calls("STAGEGEN"), [])
+        self.assertFalse([c for c in self.submissions() if "job=playback-attr-3-cuda-stage-" in c], self.submissions())
+        self.assertRegex(p.stdout, rf"(?m)STAGE_REUSED_EXISTING sha={S12} manifest={racer[:8]} ")
+        r = self.rows()[-1]
+        self.assertEqual((r["outcome"], r["buildManifestSha256"], r["steps"]["stage"]), ("STAGE_OK", racer, "reused-existing"))
+
+    def test_a_build_another_stager_staged_during_the_assemble_is_reused_never_replaced(self) -> None:
+        # 2026-11-13: two stagers both found 23a07757 NOT_STAGED and both assembled; the later one's stage replaced the first one's
+        # manifest under a running lease batch. The cache is read again right before the stage submission, and a staged build is reused.
+        self.assert_racer_reused("racestage")
+
+    def test_a_raced_in_build_with_an_upper_case_commit_is_reused(self) -> None:
+        # adversary A2 (72577e87): the leg (and the batch's reader) compare sourceCommit case-insensitively, so this is a sound build; a
+        # case-sensitive re-check sent it to the stage job, which refuses to replace a sound build (STAGE_FAILED).
+        self.assert_racer_reused("racestage-upper")
+
+    def test_a_raced_in_build_missing_an_artifact_is_restaged_not_refused(self) -> None:
+        # adversary A3 (72577e87): a build.json whose exe is gone is not a build a leg can run; this call already assembled one, so it stages it
+        # (the stage job replaces an unsound build) instead of stopping STAGE_FAILED for the hub.
+        p = self.run_driver(env={"FAKE_ASSEMBLE": "racestage-missing", "FAKE_RACE_CACHE": str(self.share / "cache")})
+        self.assert_exit(p, "STAGE_OK")
+        self.assertEqual(len([c for c in self.submissions() if "job=playback-attr-3-cuda-stage-" in c]), 1, self.submissions())
+        self.assertEqual(sha256(self.share / "cache" / names()["build"]), self.assembled_manifest_sha())
+        self.assertIn("BUILD_ARTIFACT_MISSING", p.stdout)
+
+    def test_the_pre_submission_soundness_read_is_bounded_by_the_probe_timeout(self) -> None:
+        # adversary A4 (72577e87): every share probe of this driver is bounded by -ProbeTimeoutSec; the soundness read too (a read that does not
+        # answer in time is not a reuse, and the stage job decides on the host). r2 (A3 on 90b1c58e): by min(-ProbeTimeoutSec, what is left of the cap).
+        text = DRIVER.read_text(encoding="utf-8")
+        calls = re.findall(r"Get-VenueStagedBuildManifest -AgentShare [^\r\n}]*", text)
+        self.assertEqual(len(calls), 1, calls)
+        self.assertIn("-TimeoutSec $soundSec ", calls[0])
+        self.assertIn('$soundSec = Get-ProbeSec ', text)
+        # r6 (Grok G6/G7 on #814): the artifact hash has its own budget, the plan preflight's 300 s (Invoke-VenueLeaseBatch.ps1), bounded by what is left of the cap
+        self.assertIn("-ArtifactTimeoutSec 300 -CallCapSec $capSec ", calls[0])
+
+    def test_a_raced_in_build_the_leg_job_would_refuse_is_not_reused(self) -> None:
+        # adversary A2 (b47fcfbc): the staged build.json names the sha and every artifact name is there, but the cached exe does not hash to its digest.
+        # Reusing it would record STAGE_OK for a build every leg refuses; it goes to the stage job instead (which replaces only an unsound build).
+        p = self.run_driver(env={"FAKE_ASSEMBLE": "racestage-corrupt", "FAKE_RACE_CACHE": str(self.share / "cache")})
+        self.assert_exit(p, "STAGE_OK")
+        self.assertNotIn("STAGE_REUSED_EXISTING", p.stdout)
+        self.assertEqual(len([c for c in self.submissions() if "job=playback-attr-3-cuda-stage-" in c]), 1, self.submissions())
+        self.assertEqual(sha256(self.share / "cache" / names()["build"]), self.assembled_manifest_sha())
+        self.assertIn("BUILD_ARTIFACT_MISMATCH", p.stdout)
+
+    # ---------------------------------------------------------------- r2 (adversary A1-A3 on 90b1c58e)
+    def test_a_raced_in_build_whose_exe_claim_is_a_one_element_array_is_reused(self) -> None:
+        # A1: the leg job reads $buildManifest.exe.sha256 (member access) and so does the host guard, so exe=[{name,sha256}] is a sound build. The shared
+        # reader (Get-VenueStagedBuildManifest, which the lease batch guards with too) required a single object, so the nightly re-staged over it.
+        self.assert_racer_reused("racestage-array")
+        self.assertIsInstance(json.loads((self.share / "cache" / names()["build"]).read_text(encoding="utf-8"))["exe"], list)
+
+    def test_a_soundness_read_given_up_on_does_not_hold_the_process(self) -> None:
+        # A2: the soundness read is stuck (a blocking SMB read: Thread.Sleep, which a stop request cannot interrupt) past -ProbeTimeoutSec. It is given up on
+        # (not reused; this call's build is staged), and the process ends when the driver does, never when the abandoned read finally returns.
+        stuck = 60
+        t0 = time.monotonic()
+        p = self.run_driver("-TestSoundnessReadDelayMs", str(stuck * 1000), probe="5",
+                            env={"FAKE_ASSEMBLE": "racestage", "FAKE_RACE_CACHE": str(self.share / "cache")})
+        took = time.monotonic() - t0
+        self.assert_exit(p, "STAGE_OK")
+        self.assertNotIn("STAGE_REUSED_EXISTING", p.stdout)
+        self.assertRegex(p.stdout, r"is not reused: state=UNREACHABLE ")
+        self.assertLess(took, stuck - 15, f"the process waited {took:.1f} s for the abandoned {stuck} s soundness read")
+
+    def test_the_soundness_read_never_runs_past_the_total_cap(self) -> None:
+        # A3: -MaxTotalSec is the total wall-clock cap. The soundness read starts a few seconds before it and would answer (sound racer, reusable) after it;
+        # it gets what is LEFT of the cap, never the full -ProbeTimeoutSec, so the call ends STAGE_CAP_EXCEEDED at the cap, never STAGE_OK past it.
+        cap, slow = 25, 15
+        # the finding's input: the DLL pair is reusable and the smoke-runner dir is already in the cache (no submission needs its 30 s floor)
+        self.built_dll_pair()
+        (self.share / "cache" / RUNNER_DIR).mkdir()
+        t0 = time.monotonic()
+        p = self.run_driver("-MaxTotalSec", str(cap), "-TestSoundnessReadDelayMs", str(slow * 1000),
+                            env={"FAKE_ASSEMBLE": "racestage", "FAKE_ASSEMBLE_SLEEP": "10", "FAKE_RACE_CACHE": str(self.share / "cache")})
+        took = time.monotonic() - t0
+        # the racer landed and the soundness read was asked (the call reached step 8 inside the cap: the test's own premise)
+        self.assertIn("ASSEMBLE ", "\n".join(self.calls("ASSEMBLE")), p.stdout)
+        self.assertTrue((self.share / "cache" / names()["build"]).exists(), p.stdout)
+        self.assert_exit(p, "STAGE_CAP_EXCEEDED")
+        self.assertNotIn("STAGE_REUSED_EXISTING", p.stdout)
+        self.assertFalse([c for c in self.submissions() if "job=playback-attr-3-cuda-stage-" in c], self.submissions())
+        self.assertEqual(json.loads((self.share / "cache" / names()["build"]).read_text(encoding="utf-8"))["assembledAtUtc"], "racer")
+        self.assertLess(took, cap + 8, f"the call ran {took:.1f} s against a {cap} s cap")
+
+    def test_an_unreadable_soundness_answer_with_budget_left_goes_to_the_stage_job(self) -> None:
+        # r3 (adversary A2 on ce5a0380): -MaxTotalSec 120, -ProbeTimeoutSec 300, and the racer's cached exe is held with FileShare.None, so the soundness
+        # read's hash fails AT ONCE with about 100 s of the cap left. r2 called that STAGE_CAP_EXCEEDED only because the read was GIVEN less than
+        # -ProbeTimeoutSec; the cap had not run out, so the read is an ordinary unreadable answer and the stage job decides on the host.
+        def lock_released() -> None:
+            # the holder lets go after FAKE_LOCK_SEC whatever the driver did, so the case directory can be removed
+            held, released, t0 = Path(f"{self.calls_log}.lockheld"), Path(f"{self.calls_log}.lockreleased"), time.monotonic()
+            while held.exists() and not released.exists() and time.monotonic() - t0 < 60:
+                time.sleep(0.2)
+            time.sleep(0.5)
+        self.addCleanup(lock_released)
+        self.built_dll_pair()
+        (self.share / "cache" / RUNNER_DIR).mkdir()
+        p = self.run_driver("-MaxTotalSec", "120", probe="300",
+                            env={"FAKE_ASSEMBLE": "racestage-locked", "FAKE_LOCK_SEC": "8", "FAKE_RACE_CACHE": str(self.share / "cache")})
+        self.assertNotIn("STAGE_CAP_EXCEEDED", p.stdout)
+        self.assert_exit(p, "STAGE_OK")
+        self.assertRegex(p.stdout, r"is not reused: state=UNREACHABLE ")
+        self.assertEqual(len([c for c in self.submissions() if "job=playback-attr-3-cuda-stage-" in c]), 1, self.submissions())
+
+    def test_the_shared_soundness_read_takes_every_claim_shape_the_leg_takes(self) -> None:
+        # A1 siblings (Invoke-VenueLeaseBatch.ps1 plan preflight and post-claim guard take the same read): a one-element array claim is the leg's digest
+        # ($buildManifest.exe.sha256 enumerates to it); a two-element array is not one digest, and the leg refuses it, so the read does too.
+        cache = self.share / "cache"
+        n = names()
+        claims = {}
+        for k, f in (("packageZip", n["pkg"]), ("exe", n["exe"]), ("dll", n["dll"])):
+            (cache / f).write_bytes(b"a")
+            claims[k] = {"name": f, "sha256": hashlib.sha256(b"a").hexdigest()}
+        out = {}
+        for label, exe in (("one", [claims["exe"]]), ("two", [claims["exe"], claims["exe"]])):
+            (cache / n["build"]).write_text(json.dumps({"sourceCommit": SHA, "dllPairManifestSha256": "b" * 64, "pendingSymbolPresence": True,
+                                                        "packageZip": claims["packageZip"], "exe": exe, "dll": claims["dll"]}), encoding="utf-8")
+            ps = (f"Import-Module '{DRIVER.parent / 'VenueChain.psm1'}' -Force -DisableNameChecking; "
+                  f"$r = Get-VenueStagedBuildManifest -AgentShare '{self.share}' -SourceCommit '{SHA}' -VerifyArtifacts -TimeoutSec 30; "
+                  "'STATE=' + $r.state; 'CONTENT=[' + $r.contentProblem + ']'; 'ARTIFACTS=[' + $r.artifactProblem + ']'")
+            p = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", ps], capture_output=True, text=True, timeout=120, stdin=subprocess.DEVNULL)
+            out[label] = p.stdout
+        self.assertIn("STATE=STAGED\nCONTENT=[]\nARTIFACTS=[]", out["one"].replace("\r\n", "\n"))
+        self.assertIn("ATTRCUDA_BUILD_MANIFEST_ARTIFACT_SHA_MISSING", out["two"])
+        self.assertIn("for exe ", out["two"])
+
+    def test_every_share_probe_is_bounded_by_what_is_left_of_the_cap(self) -> None:
+        # A3 siblings: every by-name read (Read-Share, the reachability probe, the soundness read) takes min(-ProbeTimeoutSec, what is left of -MaxTotalSec).
+        text = DRIVER.read_text(encoding="utf-8")
+        self.assertEqual(re.findall(r"Invoke-Bounded [^\r\n]*\$ProbeTimeoutSec", text), [])
+        self.assertEqual(re.findall(r"-TimeoutSec \(\[double\]\$ProbeTimeoutSec\)", text), [])
+        # and an abandoned read is counted, so the one exit ends the process instead of waiting for it (A2)
+        self.assertIn("Complete-VenueProcess -ExitCode $code", text)
+
+    # ---------------------------------------------------------------- r4 (adversary pass 6 A2 on 3bec2622, RED first)
+    def assert_step4_unsound_build_restaged(self, runner: bool) -> None:
+        # A2: step 4 (STAGE_SKIP_ALREADY, and the in-cache branch that stages only the runner) decided "in the cache" from a build.json that parses and
+        # names the sha plus three artifact NAMES. A staged build whose exe claim is sha256=[h] (an array, which the narrowed leg refuses) was reported
+        # staged. Step 4 now takes the shared soundness read: this build is not in the cache, so the call assembles and stages its own.
+        self.built_dll_pair()
+        self.stage_cache(runner=runner, exe_claim={"name": names()["exe"], "sha256": [hashlib.sha256(b"x").hexdigest()]})
+        p = self.run_driver()
+        self.assert_exit(p, "STAGE_OK")
+        self.assertIn("ATTRCUDA_BUILD_MANIFEST_ARTIFACT_SHA_MISSING", p.stdout)
+        self.assertEqual(len(self.calls("ASSEMBLE")), 1, p.stdout)
+        self.assertEqual(len([c for c in self.submissions() if "job=playback-attr-3-cuda-stage-" in c]), 1, self.submissions())
+        cache_hash = sha256(self.share / "cache" / names()["build"])
+        self.assertEqual(cache_hash, self.assembled_manifest_sha())
+        r = self.rows()[-1]
+        self.assertEqual((r["outcome"], r["buildManifestSha256"], r["steps"]["stage"]), ("STAGE_OK", cache_hash, "staged"))
+
+    def test_step4_a_staged_build_the_leg_refuses_is_not_skipped_as_already_staged(self) -> None:
+        self.assert_step4_unsound_build_restaged(runner=True)
+
+    def test_step4_a_staged_build_the_leg_refuses_is_not_kept_when_only_the_runner_is_missing(self) -> None:
+        self.assert_step4_unsound_build_restaged(runner=False)
+
+    def test_step4_a_sound_build_with_an_upper_case_commit_is_skipped(self) -> None:
+        # the leg compares sourceCommit case-insensitively (adversary A2 on 72577e87), so step 4's in-cache answer does too: one predicate, every reader
+        bj = self.stage_cache()
+        m = json.loads(bj.read_text(encoding="utf-8"))
+        m["sourceCommit"] = SHA.upper()
+        bj.write_text(json.dumps(m), encoding="utf-8")
+        p = self.run_driver()
+        self.assert_exit(p, "STAGE_SKIP_ALREADY")
+        self.nothing_built_or_submitted()
+        self.assertEqual(self.rows()[-1]["buildManifestSha256"], sha256(bj))
+
+    def test_step4_soundness_read_that_does_not_answer_is_typed_and_builds_nothing(self) -> None:
+        # bounded like every share probe: min(-ProbeTimeoutSec, what is left of the cap). A read that does not answer with time left is SHARE_UNREACHABLE
+        # (nothing reserved, built or submitted); one that got the rest of the cap is STAGE_CAP_EXCEEDED.
+        self.stage_cache()
+        for extra, probe, token in ((("-TestSoundnessReadDelayMs", "60000"), "5", "SHARE_UNREACHABLE"),
+                                    (("-TestSoundnessReadDelayMs", "60000", "-MaxTotalSec", "12"), "60", "STAGE_CAP_EXCEEDED")):
+            with self.subTest(token=token):
+                self.calls_log.unlink(missing_ok=True)
+                t0 = time.monotonic()
+                p = self.run_driver(*extra, probe=probe)
+                took = time.monotonic() - t0
+                self.assert_exit(p, token)
+                self.nothing_built_or_submitted()
+                self.assertNotIn("STAGE_RESERVED", [r["outcome"] for r in self.rows()])
+                self.assertLess(took, 40, f"the call ran {took:.1f} s")
+
+    # ---------------------------------------------------------------- r4 fix iteration (adversary pass 7 A1-A2 on 24f85549, RED first)
+    def test_an_unsound_build_the_cache_already_holds_is_never_recorded_staged(self) -> None:
+        # A1: step 4 refuses the [H] exe claim, the local build dir holds the same manifest (an earlier call assembled it), step 8 refuses it again,
+        # and the spent default stage JobId's "cache holds the expected hash" fallback skipped the submission: the hash-only final verify recorded STAGE_OK
+        # for a build every leg refuses. The final verify takes the one soundness read: an unsound final build is STAGE_VERIFY_MISMATCH, never STAGE_OK.
+        h = hashlib.sha256(b"x").hexdigest()
+        bj = self.stage_cache(exe_claim={"name": names()["exe"], "sha256": [h]})
+        local = self.build_root / f"build-{S12}"
+        local.mkdir(parents=True)
+        shutil.copy2(bj, local / names()["build"])
+        for k in ("exe", "dll", "pkg"):
+            (local / names()[k]).write_bytes(b"x")
+        self.built_dll_pair()
+        self.spend_default_stage_jobid()
+        p = self.run_driver()
+        self.assert_exit(p, "STAGE_VERIFY_MISMATCH")
+        self.assertIn("ATTRCUDA_BUILD_MANIFEST_ARTIFACT_SHA_MISSING", p.stdout)
+        self.assertNotIn("STAGE_OK", [r["outcome"] for r in self.rows()])
+        self.assertIsNone(self.rows()[-1]["buildManifestSha256"])
+
+    def test_the_probe_floor_leaves_a_healthy_soundness_read_room_to_hash(self) -> None:
+        # A2: -ProbeTimeoutSec 1 was accepted, but the soundness read needs the manifest read plus -ArtifactMinSec (1 s) to start hashing, so a healthy
+        # staged build was SHARE_UNREACHABLE (41) at every run. The floor is 5 s: 1 is refused at binding (nothing probed or written), 5 skips the healthy build.
+        self.stage_cache()
+        low = self.run_driver(probe="1")
+        self.assertNotEqual(low.returncode, EXIT["SHARE_UNREACHABLE"], low.stdout)
+        self.assertNotIn("STAGE_NIGHTLY_EXIT", low.stdout)
+        self.assertIn("ProbeTimeoutSec", low.stdout + low.stderr)
+        self.assertEqual(self.calls(), [])
+        self.assertEqual(self.rows(), [])
+        ok = self.run_driver(probe="5")
+        self.assert_exit(ok, "STAGE_SKIP_ALREADY")
+
+    # ---------------------------------------------------------------- r6 (Grok G6/G7 on #814, RED first)
+    def test_the_final_verify_artifact_hash_past_the_probe_timeout_with_cap_left_is_stage_ok(self) -> None:
+        # G7: the final verify takes the one soundness read, whose artifact hash shared min(-ProbeTimeoutSec, cap left) with the manifest read. A real stage
+        # landed, the share needed longer than -ProbeTimeoutSec to hash the cached package, and the night ended SHARE_UNREACHABLE with its manifest dropped.
+        # The hash has its own budget (the plan preflight's 300 s), bounded by what is left of -MaxTotalSec: STAGE_OK, with the manifest recorded.
+        p = self.run_driver("-TestSoundnessArtifactDelayMs", "8000", "-TestSoundnessArtifactDelayAt", "final", probe="5")
+        self.assert_exit(p, "STAGE_OK")
+        cache_hash = sha256(self.share / "cache" / names()["build"])
+        r = self.rows()[-1]
+        self.assertEqual((r["outcome"], r["buildManifestSha256"]), ("STAGE_OK", cache_hash))
+        self.assertIn(f"manifest={cache_hash}", p.stdout)
+
+    def test_step4_artifact_hash_past_the_probe_timeout_with_cap_left_is_skip_already(self) -> None:
+        # G6: an already soundly staged sha whose cached package hashes slower than -ProbeTimeoutSec over the share is STAGE_SKIP_ALREADY, never SHARE_UNREACHABLE
+        bj = self.stage_cache()
+        p = self.run_driver("-TestSoundnessArtifactDelayMs", "8000", probe="5")
+        self.assert_exit(p, "STAGE_SKIP_ALREADY")
+        self.nothing_built_or_submitted()
+        self.assertEqual(self.rows()[-1]["buildManifestSha256"], sha256(bj))
+
+    def test_the_artifact_hash_budget_is_still_bounded_by_the_cap(self) -> None:
+        # G6/G7: the hash's own budget never runs past -MaxTotalSec. A hash the cap cuts short is STAGE_CAP_EXCEEDED (as a manifest read the cap cuts short
+        # is), whether the cap is under -ProbeTimeoutSec or over it; nothing is reserved, built or submitted, and the call ends near the cap.
+        self.stage_cache()
+        for cap, probe in (("12", "60"), ("20", "5")):
+            with self.subTest(cap=cap, probe=probe):
+                self.calls_log.unlink(missing_ok=True)
+                t0 = time.monotonic()
+                p = self.run_driver("-TestSoundnessArtifactDelayMs", "60000", "-MaxTotalSec", cap, probe=probe)
+                took = time.monotonic() - t0
+                self.assert_exit(p, "STAGE_CAP_EXCEEDED")
+                self.nothing_built_or_submitted()
+                self.assertNotIn("STAGE_RESERVED", [r["outcome"] for r in self.rows()])
+                self.assertLess(took, int(cap) + 10, f"the call ran {took:.1f} s against a {cap} s cap")
+
+    # ---------------------------------------------------------------- r6 fix iteration (adversary pass on 424df284, A1-A2, RED first)
+    def test_a_source_commit_with_a_trailing_newline_is_refused_at_binding_everywhere(self) -> None:
+        # A1: ValidatePattern('^[0-9a-f]{40}$') accepted '<40 hex>\n' ('$' matches before a final newline). The stage job then derived the same cache
+        # file name as the clean sha but another stage-lock key, and its never-replace guard read the resident clean manifest as COMMIT_MISMATCH (unsound)
+        # and replaced it. Every sha40 parameter in the venue chain anchors with \z, and the lock itself validates its sha.
+        roots = [ROOT / "tools" / "profiling" / d for d in ("bachelor", "dual-venue", "ultramagnus")]
+        loose = [f"{p.relative_to(ROOT)}:{i}" for r in roots for p in sorted(r.rglob("*.ps*1"))
+                 for i, line in enumerate(p.read_text(encoding="utf-8", errors="replace").splitlines(), 1) if "ValidatePattern('^[0-9a-f]{40}$')" in line]
+        self.assertEqual(loose, [])
+        lf = SHA + "`n"
+        ps = (f"Import-Module '{DRIVER.parent / 'VenueChain.psm1'}' -Force -DisableNameChecking; "
+              f"Import-Module '{DRIVER.parent.parent / 'bachelor' / 'AttrCudaArtifacts.psm1'}' -Force -DisableNameChecking; "
+              f"foreach ($c in @({{ Enter-AttrCudaStageLock -Root '{self.case}' -SourceCommit \"{lf}\" -WaitSec 1 }}, {{ Get-AttrCudaArtifactNames -SourceCommit \"{lf}\" }}, "
+              f"{{ Get-VenueStagedBuildManifest -AgentShare '{self.share}' -SourceCommit \"{lf}\" -TimeoutSec 5 }})) {{ "
+              "try { $null = & $c; 'ACCEPTED' } catch { 'REFUSED ' + ($_.FullyQualifiedErrorId -split ',')[0] } }")
+        p = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", ps], capture_output=True, text=True, timeout=120, stdin=subprocess.DEVNULL)
+        self.assertEqual(p.stdout.split(), ["REFUSED", "ParameterArgumentValidationError"] * 3, p.stdout + p.stderr)
+
+    def test_call_cap_sec_bounds_the_manifest_read_too(self) -> None:
+        # A2: -CallCapSec bounded only the artifact hash. With an absent agent root, -TimeoutSec 3 and -CallCapSec 1, a manifest read stuck 2.2 s answered
+        # NOT_STAGED after the whole-call cap. The manifest read now gets min(-TimeoutSec, -CallCapSec): it is given up on at the cap, UNREACHABLE.
+        ps = (f"Import-Module '{DRIVER.parent / 'VenueChain.psm1'}' -Force -DisableNameChecking; $sw = [Diagnostics.Stopwatch]::StartNew(); "
+              f"$r = Get-VenueStagedBuildManifest -AgentShare '{self.case / 'adversary-empty-root'}' -SourceCommit '{SHA}' -TimeoutSec 3 -ArtifactTimeoutSec 300 "
+              "-CallCapSec 1 -VerifyArtifacts -TestReadDelayMs 2200; 'STATE=' + $r.state; 'SEC=' + $sw.Elapsed.TotalSeconds.ToString('0.000', [Globalization.CultureInfo]::InvariantCulture)")
+        p = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", ps], capture_output=True, text=True, timeout=120, stdin=subprocess.DEVNULL)
+        self.assertIn("STATE=UNREACHABLE", p.stdout, p.stdout + p.stderr)
+        sec = float(re.search(r"SEC=([0-9.]+)", p.stdout).group(1))
+        self.assertLess(sec, 1.8, p.stdout)
 
     def test_a_cache_hash_that_differs_after_stage_ok_is_a_verify_mismatch(self) -> None:
         p = self.run_driver(env={"FAKE_UMRUN_STAGE": "wrongcache"})

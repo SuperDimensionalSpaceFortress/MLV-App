@@ -31,6 +31,8 @@ import os
 import re
 import shutil
 import subprocess
+import threading
+import time
 import tempfile
 import unittest
 from pathlib import Path
@@ -382,8 +384,11 @@ class SourceArchiveBindingTests(_PwshCase):
 # --------------------------------------------------------------------------------------------
 
 
-def _fake_build_dir(build: Path, sha: str, exe_name_override: str | None = None) -> dict:
-    """Write the four files the assembler publishes, with fabricated contents."""
+def _fake_build_dir(build: Path, sha: str, exe_name_override: str | None = None, rebuild_tag: str = "") -> dict:
+    """Write the four files the assembler publishes, with fabricated contents.
+
+    rebuild_tag (VENUE-STAGE-SAME-SHA-RESTAGE-GUARD-1): one assemble of the sha. A different tag is a re-assemble of
+    the same sha: other exe bytes and another assembledAtUtc, so another manifest sha256, as the real assembler makes."""
     short = sha[:12]
     names = {
         "exe": f"MLVApp-playback-attr-3-cuda-{short}.exe",
@@ -396,7 +401,7 @@ def _fake_build_dir(build: Path, sha: str, exe_name_override: str | None = None)
 
     shas = {}
     for key in ("exe", "dll", "packageZip"):
-        payload = f"fabricated {key} for {sha}".encode("utf-8")
+        payload = f"fabricated {key} for {sha}{' ' + rebuild_tag if rebuild_tag and key == 'exe' else ''}".encode("utf-8")
         (build / names[key]).write_bytes(payload)
         shas[key] = hashlib.sha256(payload).hexdigest()
     manifest = {
@@ -408,6 +413,8 @@ def _fake_build_dir(build: Path, sha: str, exe_name_override: str | None = None)
         "pendingSymbolPresence": True,
         "dllPairManifestSha256": "b" * 64,
     }
+    if rebuild_tag:
+        manifest["assembledAtUtc"] = rebuild_tag
     (build / names["manifest"]).write_text(json.dumps(manifest, indent=2), encoding="utf-8")
     return names
 
@@ -991,6 +998,323 @@ class InterruptedStagingTests(_PwshCase):
 
         self.assertEqual(proc.returncode, 4, f"{proc.stdout}\n{proc.stderr}")
         self.assertEqual(self.cache_names(), [])
+
+
+# --------------------------------------------------------------------------------------------
+# (e2) VENUE-STAGE-SAME-SHA-RESTAGE-GUARD-1: a sound staged build of a sha is never replaced
+# --------------------------------------------------------------------------------------------
+
+
+@requires_pwsh
+class StagedBuildNeverReplacedTests(_PwshCase):
+    """A stage of a sha whose cache already holds a sound build writes nothing into the cache.
+
+    2026-11-13: lane HFR-NATIVE-M16-1457-FULLSCREEN-S1S2-PRESENT-GAP-1 re-assembled 23a07757 (a new
+    manifest, f8fc75a2), and its suffixed stage job replaced the build another lane had staged
+    (ad005766) while a lease batch that had pinned it was running: BUILD_MANIFEST_MISMATCH
+    (Invoke-VenueLeaseBatch.ps1:1258) and one lost leg. Every stager reaches the cache only through
+    this emitted job, so the job is where the rule holds.
+    """
+
+    VENUE_CHAIN = ROOT / "tools" / "profiling" / "dual-venue" / "VenueChain.psm1"
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.agent = self.tmp / "agent"
+        self.inbox = self.agent / "inbox"
+        self.cache = self.agent / "cache"
+        self.inbox.mkdir(parents=True)
+        self.cache.mkdir(parents=True)
+        self.manifest_name = f"playback-attr-3-cuda-{SHA_FIXTURE[:12]}-build.json"
+
+    def stage(self, tag: str, suffix: str = "", mutate=None) -> subprocess.CompletedProcess:
+        """Assemble (tag = which assemble) and stage the sha through the real generator and job.
+
+        mutate(manifest_dict) edits the assembled build.json before the job is generated."""
+        return _run_job(self.emit(tag, suffix, mutate))
+
+    def emit(self, tag: str, suffix: str = "", mutate=None, agent_root: Path | None = None) -> Path:
+        """Assemble and generate the stage job, and drop its inputs into the inbox; the job is not run.
+
+        agent_root: the -AgentRoot the job is generated for (default self.agent; an alias of it reaches the same inbox and cache)."""
+        build = self.tmp / f"build-{tag}"
+        staging = self.tmp / f"staging-{tag}-{suffix or 'default'}"
+        staging.mkdir(parents=True)
+        names = _fake_build_dir(build, SHA_FIXTURE, rebuild_tag=tag)
+        if mutate is not None:
+            manifest = json.loads((build / names["manifest"]).read_text(encoding="utf-8"))
+            mutate(manifest)
+            (build / names["manifest"]).write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+        script = self.tmp / f"generate-{tag}-{suffix or 'default'}.ps1"
+        script.write_text(
+            "$ErrorActionPreference = 'Stop'\n"
+            f"& '{STAGE_GENERATOR}' -SourceCommit '{SHA_FIXTURE}' -BuildDir '{build}' "
+            f"-OutDir '{staging}' -AgentRoot '{agent_root or self.agent}'"
+            + (f" -JobIdSuffix '{suffix}'" if suffix else "")
+            + " | ConvertTo-Json -Depth 5\n",
+            encoding="utf-8",
+        )
+        gen = _run_pwsh_file(script)
+        self.assertEqual(gen.returncode, 0, f"{gen.stdout}\n{gen.stderr}")
+        for name in names.values():
+            shutil.copy2(build / name, self.inbox / name)
+        return Path(json.loads(gen.stdout)["jobFile"])
+
+    def test_two_stagers_of_one_sha_into_one_cache_never_lose_the_staged_build(self) -> None:
+        # r3 (adversary A3 on ce5a0380): two agents on ONE root, each with its own -MutexName, both admitted; identical build bytes, JobIdSuffix a and b.
+        # A passes the (absent-manifest) guard and copies its partials; B then stages. B must not pass the guard while A is between its guard and its
+        # publication: the lock is the cache's and the sha's, not a caller's name. A publishes, and B finds the sound build and reuses it (no cache write).
+        # On ce5a0380 B published meanwhile, A replaced B's artifacts, deleted B's sound manifest and failed (exit 22): a sound stage with no manifest.
+        # adversary A1 on 3bec2622: B reaches the SAME root through a junction (C:\Users\All Users -> C:\ProgramData), so a lock keyed on the lexical
+        # path would be two locks; the lock is the root's physical identity.
+        # The junction is an ANCESTOR of B's root (as All Users is), not the root itself.
+        alias = self.tmp.parent / (self.tmp.name + "-alias")
+        mk = subprocess.run(["cmd", "/c", "mklink", "/J", str(alias), str(self.tmp)], capture_output=True, text=True)
+        self.assertEqual(mk.returncode, 0, mk.stdout + mk.stderr)
+        self.addCleanup(lambda: os.rmdir(alias) if alias.exists() else None)
+        job_a, job_b = self.emit("ad005766", suffix="a"), self.emit("ad005766", suffix="b", agent_root=alias / self.agent.name)
+        hold, b_waits = self.tmp / "hold-a", self.tmp / "b-waits"
+        cmd = [PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File"]
+        a = subprocess.Popen(cmd + [str(job_a), "-TestHoldAfterPartialsPath", str(hold)], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        b = None
+        try:
+            t0 = time.monotonic()
+            while not Path(f"{hold}.reached").exists() and a.poll() is None and time.monotonic() - t0 < 90:
+                time.sleep(0.1)
+            self.assertTrue(Path(f"{hold}.reached").exists(), "stager A never reached its publication")
+            b = subprocess.Popen(cmd + [str(job_b), "-TestLockWaitMarkerPath", str(b_waits)], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            # r4 (Grok G5 on #814): B's stdout is read live, so the test sees what B printed WHILE it was blocked on the lock
+            b_lines: list[str] = []
+            b_reader = threading.Thread(target=lambda: b_lines.extend(iter(b.stdout.readline, "")), daemon=True)
+            b_reader.start()
+            t0 = time.monotonic()
+            while b.poll() is None and not b_waits.exists() and time.monotonic() - t0 < 90:
+                time.sleep(0.1)
+            # a stager blocked on the lock says so BEFORE it blocks (up to 1800 s otherwise silent): the busy line is out while A still holds
+            t0 = time.monotonic()
+            while b.poll() is None and not any(l.startswith("STAGE_LOCK_WAIT ") for l in list(b_lines)) and time.monotonic() - t0 < 30:
+                time.sleep(0.1)
+            b_busy_while_a_held = [l.rstrip() for l in list(b_lines) if l.startswith("STAGE_LOCK_WAIT ")]
+            b_done_while_a_held = b.poll() is not None
+        finally:
+            hold.write_text("", encoding="utf-8")
+            a_out, a_err = a.communicate(timeout=180)
+            if b is not None:
+                b.wait(timeout=180)
+                b_reader.join(timeout=30)
+                b_out, b_err = "".join(b_lines), b.stderr.read()
+            else:
+                b_out, b_err = "", ""
+        lock_id = re.search(r"(?m)^STAGE_LOCK_WAIT (vol=\d+;idx=\d+-\d+) " + SHA_FIXTURE + r" waiting up to 1800 s ", "\n".join(b_busy_while_a_held))
+        self.assertIsNotNone(lock_id, f"stager B printed no STAGE_LOCK_WAIT line before it blocked on the lock A held:\n{b_out}")
+        self.assertRegex(b_out, r"(?m)^\[[^\]]+\] STAGE_LOCK_WAITED ")
+        self.assertEqual(a.returncode, 0, f"A: {a_out}\n{a_err}\nB: {b_out}\n{b_err}")
+        self.assertFalse(b_done_while_a_held, f"stager B finished while A held the stage of the same sha:\n{b_out}")
+        self.assertEqual(b.returncode, 0, f"{b_out}\n{b_err}")
+        self.assertRegex(b_out, rf"(?m)^STAGE_REUSED_EXISTING sha={SHA_FIXTURE[:12]} ")
+        self.assertTrue((self.cache / self.manifest_name).exists(), "the staged manifest was lost")
+        self.assertEqual(self.manifest_sha(), hashlib.sha256((self.tmp / "build-ad005766" / self.manifest_name).read_bytes()).hexdigest())
+        proc = self.run_with_module(
+            f"Import-Module '{self.VENUE_CHAIN}' -Force -DisableNameChecking\n"
+            f"$s = Get-VenueStagedBuildManifest -AgentShare '{self.agent}' -SourceCommit '{SHA_FIXTURE}' -VerifyArtifacts\n"
+            "Write-Output ('STATE=' + $s.state + ' CONTENT=[' + $s.contentProblem + '] ARTIFACT=[' + $s.artifactProblem + ']')\n",
+            name="after-two.ps1",
+        )
+        self.assertIn("STATE=STAGED CONTENT=[] ARTIFACT=[]", proc.stdout, proc.stdout + proc.stderr)
+        self.assertEqual(list(self.inbox.iterdir()), [], "inputs were left in the inbox")
+
+    def test_the_stage_lock_is_the_caches_and_the_shas_never_a_callers_name(self) -> None:
+        # A3 siblings: the lock is taken before the never-replace guard and held through publishRename (:442), the manifest slot (:451) and its publish (:454)
+        text = STAGE_GENERATOR.read_text(encoding="utf-8")
+        lock, guard, publish = text.index("$StageLock = Enter-AttrCudaStageLock -Root $AgentRoot -SourceCommit $SourceCommit "), text.index("if (Test-Path -LiteralPath $manifestCachePath) {"), text.index("Publish-AttrCudaFileMove -Source $manifestPartialPath")
+        self.assertLess(lock, guard)
+        self.assertLess(guard, publish)
+        self.assertNotIn("$MutexName", text)
+        self.assertNotIn("ReleaseMutex", text)
+        # adversary A1 on 3bec2622: the name is the root's PHYSICAL identity and the sha, never a lexical path or a caller's name
+        body = re.search(r"(?ms)^function Enter-AttrCudaStageLock \{.*?^\}", MODULE.read_text(encoding="utf-8")).group(0)
+        self.assertIn("Get-AttrCudaFileId -Path $Root -FollowLinks", body)
+        self.assertNotIn("GetFullPath", body)
+        self.assertNotIn("ReleaseMutex", body)
+
+    def snapshot(self) -> dict:
+        return {e.name: (e.read_bytes(), e.stat().st_mtime_ns) for e in sorted(self.cache.iterdir())}
+
+    def manifest_sha(self) -> str:
+        return hashlib.sha256((self.cache / self.manifest_name).read_bytes()).hexdigest()
+
+    def test_a_second_stage_with_another_manifest_is_refused_and_writes_nothing(self) -> None:
+        first = self.stage("ad005766")
+        self.assertEqual(first.returncode, 0, f"{first.stdout}\n{first.stderr}")
+        staged, before = self.manifest_sha(), self.snapshot()
+
+        second = self.stage("f8fc75a2", suffix="fsgap202611131829")
+
+        self.assertEqual(second.returncode, 7, f"{second.stdout}\n{second.stderr}")
+        self.assertRegex(second.stdout, rf"(?m)^STAGE_REFUSED_STAGED_OTHER_MANIFEST sha={SHA_FIXTURE[:12]} staged={staged[:8]} incoming=[0-9a-f]{{8}} ")
+        self.assertIn("RESULT=STAGE_FAILED STEP=stagedBuildGuard EXIT=7", second.stdout)
+        self.assertEqual(self.snapshot(), before, "the staged build was rewritten")
+        self.assertEqual(list(self.inbox.iterdir()), [], "the refused inputs were left in the inbox")
+
+    def test_a_manifest_a_lease_batch_pinned_still_reads_as_its_pin_after_a_second_stage(self) -> None:
+        # The batch's own guard (Invoke-VenueLeaseBatch.ps1:1258 / :1393) reads Get-VenueStagedBuildManifest and compares it to the
+        # sha256 its plan pinned when the lease opened; any other answer is BUILD_MANIFEST_MISMATCH.
+        first = self.stage("ad005766")
+        self.assertEqual(first.returncode, 0, f"{first.stdout}\n{first.stderr}")
+        pin = self.manifest_sha()
+
+        self.stage("f8fc75a2", suffix="fsgap202611131829")
+
+        proc = self.run_with_module(
+            f"Import-Module '{self.VENUE_CHAIN}' -Force -DisableNameChecking\n"
+            f"$s = Get-VenueStagedBuildManifest -AgentShare '{self.agent}' -SourceCommit '{SHA_FIXTURE}' -VerifyArtifacts\n"
+            "Write-Output ('STATE=' + $s.state + ' SHA=' + $s.sha256 + ' CONTENT=[' + $s.contentProblem + '] ARTIFACT=[' + $s.artifactProblem + ']')\n",
+            name="pin.ps1",
+        )
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn(f"STATE=STAGED SHA={pin} CONTENT=[] ARTIFACT=[]", proc.stdout)
+
+    def test_a_second_stage_with_the_same_manifest_reuses_it_and_writes_nothing(self) -> None:
+        first = self.stage("ad005766")
+        self.assertEqual(first.returncode, 0, f"{first.stdout}\n{first.stderr}")
+        staged, before = self.manifest_sha(), self.snapshot()
+
+        second = self.stage("ad005766", suffix="again")
+
+        self.assertEqual(second.returncode, 0, f"{second.stdout}\n{second.stderr}")
+        self.assertRegex(second.stdout, rf"(?m)^STAGE_REUSED_EXISTING sha={SHA_FIXTURE[:12]} manifest={staged[:8]} ")
+        self.assertRegex(second.stdout, rf"(?m)^RESULT=STAGE_OK SOURCE={SHA_FIXTURE} ")
+        self.assertEqual(self.snapshot(), before, "a reuse rewrote the cache")
+        self.assertEqual(list(self.inbox.iterdir()), [], "the reused inputs were left in the inbox")
+
+    def test_a_staged_build_that_is_not_sound_is_replaced(self) -> None:
+        # A build.json whose artifacts are gone is not a build any leg can run (BUILD_ARTIFACT_MISSING), so it does not wedge the sha.
+        first = self.stage("ad005766")
+        self.assertEqual(first.returncode, 0, f"{first.stdout}\n{first.stderr}")
+        (self.cache / f"MLVApp-playback-attr-3-cuda-{SHA_FIXTURE[:12]}.exe").unlink()
+
+        second = self.stage("f8fc75a2", suffix="fsgap202611131829")
+
+        self.assertEqual(second.returncode, 0, f"{second.stdout}\n{second.stderr}")
+        self.assertEqual(self.manifest_sha(), hashlib.sha256((self.tmp / "build-f8fc75a2" / self.manifest_name).read_bytes()).hexdigest())
+
+    def test_a_staged_build_the_leg_job_accepts_is_sound_whatever_the_case_of_its_commit(self) -> None:
+        # adversary A1 (b47fcfbc): the stage and leg jobs compare sourceCommit case-insensitively, so an upper-case one is a build legs run
+        # and a lease can pin; it must be protected exactly like any other.
+        first = self.stage("ad005766", mutate=lambda m: m.update(sourceCommit=SHA_FIXTURE.upper()))
+        self.assertEqual(first.returncode, 0, f"{first.stdout}\n{first.stderr}")
+        before = self.snapshot()
+
+        second = self.stage("f8fc75a2", suffix="fsgap202611131829")
+
+        self.assertEqual(second.returncode, 7, f"{second.stdout}\n{second.stderr}")
+        self.assertIn("STAGE_REFUSED_STAGED_OTHER_MANIFEST", second.stdout)
+        self.assertEqual(self.snapshot(), before)
+
+    def test_a_claim_the_leg_job_reads_through_member_enumeration_is_sound(self) -> None:
+        # adversary A1 (72577e87): the leg job reads $buildManifest.exe.sha256, so an exe claim held in a one-element array is accepted there
+        # (and by the generator and the job's own binding); the guard reads it the same way and protects that build.
+        first = self.stage("ad005766", mutate=lambda m: m.update(exe=[m["exe"]]))
+        self.assertEqual(first.returncode, 0, f"{first.stdout}\n{first.stderr}")
+        before = self.snapshot()
+
+        second = self.stage("f8fc75a2", suffix="again")
+
+        self.assertEqual(second.returncode, 7, f"{second.stdout}\n{second.stderr}")
+        self.assertIn("STAGE_REFUSED_STAGED_OTHER_MANIFEST", second.stdout)
+        self.assertEqual(self.snapshot(), before)
+
+    # r3 (adversary A1 on ce5a0380): ONE table of claim shapes, fed to every reader of a cached build's artifact claim. Accept-set equality:
+    # the shared predicate, the leg job's own $manifestChecks text, the stage job's host guard and the share read (Get-VenueStagedBuildManifest,
+    # which the nightly and the lease batch decide on) all say the same thing for every row.
+    CLAIM_SHAPES = (
+        ("one object", lambda m: None, "accept"),
+        ("a one-element array of the object", lambda m: m.update(exe=[m["exe"]]), "accept"),
+        ("a nested singleton digest [[hex]]", lambda m: m["exe"].update(sha256=[[m["exe"]["sha256"]]]), "refuse"),
+        ("a singleton digest [hex]", lambda m: m["exe"].update(sha256=[m["exe"]["sha256"]]), "refuse"),
+        ("two claims", lambda m: m.update(exe=[m["exe"], m["exe"]]), "refuse"),
+    )
+
+    def leg_manifest_check_text(self) -> str:
+        """The leg job's own claim check, verbatim from the generator ($manifestChecks through the verified trace line)."""
+        text = ATTRIBUTION_GENERATOR.read_text(encoding="utf-8")
+        m = re.search(r"(?ms)^\$manifestChecks = @\(.*?^Write-JobTrace 'step build-manifest-artifacts-verified'", text)
+        self.assertIsNotNone(m, "the leg job's $manifestChecks block moved")
+        return m.group(0)
+
+    def readers_verdicts(self, names: dict) -> dict:
+        """predicate / leg / share verdicts for the build in the cache, in one pwsh."""
+        bj = self.cache / self.manifest_name
+        proc = self.run_with_module(
+            f"Import-Module '{self.VENUE_CHAIN}' -Force -DisableNameChecking\n"
+            f"$bj = '{bj}'\n"
+            "$m = [IO.File]::ReadAllText($bj) | ConvertFrom-Json\n"
+            "'PREDICATE=' + $(if (@('packageZip', 'exe', 'dll' | Where-Object { -not (Get-AttrCudaBuildManifestClaimSha256 $m $_) }).Count -eq 0) { 'accept' } else { 'refuse' })\n"
+            f"$Cache = '{self.cache}'; $BasePackageZip = '{names['packageZip']}'; $ExeName = '{names['exe']}'; $ReconName = '{names['dll']}'; $buildManifestName = '{self.manifest_name}'\n"
+            "function Get-Sha([string]$Path, [string]$Label) { (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash.ToUpperInvariant() }\n"
+            "function Write-JobTrace([string]$Text) { }\n"
+            f"$buildManifest = Assert-AttrCudaBuildManifest -Path $bj -ExpectedSha256 ((Get-FileHash -LiteralPath $bj -Algorithm SHA256).Hash.ToLowerInvariant()) -ExpectedSourceCommit '{SHA_FIXTURE}'\n"
+            "$leg = try { & {\n" + self.leg_manifest_check_text() + "\n}; 'accept' } catch { 'refuse' }\n"
+            "'LEG=' + $leg\n"
+            f"$s = Get-VenueStagedBuildManifest -AgentShare '{self.agent}' -SourceCommit '{SHA_FIXTURE}' -VerifyArtifacts\n"
+            "'SHARE=' + $(if ($s.state -ceq 'STAGED' -and $s.contentProblem -ceq '' -and $s.artifactProblem -ceq '') { 'accept' } else { 'refuse' })\n",
+            name="readers.ps1",
+        )
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        return dict(re.findall(r"(?m)^(PREDICATE|LEG|SHARE)=(\w+)\s*$", proc.stdout))
+
+    def test_every_reader_of_a_cached_claim_accepts_exactly_the_same_shapes(self) -> None:
+        first = self.stage("ad005766")
+        self.assertEqual(first.returncode, 0, f"{first.stdout}\n{first.stderr}")
+        good = {e.name: e.read_bytes() for e in self.cache.iterdir()}
+        names = _fake_build_dir(self.tmp / "names-only", SHA_FIXTURE)
+        seen = {}
+        for i, (label, mutate, expected) in enumerate(self.CLAIM_SHAPES):
+            for e in self.cache.iterdir():
+                e.unlink()
+            for n, b in good.items():
+                (self.cache / n).write_bytes(b)
+            manifest = json.loads(good[self.manifest_name].decode("utf-8"))
+            mutate(manifest)
+            (self.cache / self.manifest_name).write_text(json.dumps(manifest), encoding="utf-8")
+            verdicts = self.readers_verdicts(names)
+            staged = self.manifest_sha()
+            # the host guard: a sound staged build is never replaced (exit 7); an unsound one is replaced by the incoming stage (exit 0)
+            second = self.stage("f8fc75a2", suffix=f"shape{i}")
+            guard = {7: "accept", 0: "refuse"}.get(second.returncode, f"exit {second.returncode}")
+            if guard == "accept":
+                self.assertEqual(self.manifest_sha(), staged, f"{label}: a refused stage changed the cache")
+            verdicts["GUARD"] = guard
+            seen[label] = verdicts
+        expected = {label: {k: want for k in ("PREDICATE", "LEG", "SHARE", "GUARD")} for label, _, want in self.CLAIM_SHAPES}
+        self.maxDiff = None
+        self.assertEqual(seen, expected)
+
+    def test_every_claim_reader_calls_the_one_predicate(self) -> None:
+        # the leg job, the reference-frame runner and the stage job read a claim's digest only through Get-AttrCudaBuildManifestClaimSha256 (embedded
+        # verbatim), and VenueChain's share read runs the same text; the nightly and the lease batch decide only on that share read.
+        bachelor = ROOT / "tools" / "profiling" / "bachelor"
+        dv = ROOT / "tools" / "profiling" / "dual-venue"
+        for path in (ATTRIBUTION_GENERATOR, bachelor / "reference-frame-runner-job.ps1", STAGE_GENERATOR, self.VENUE_CHAIN,
+                     dv / "Invoke-VenueStageNightly.ps1", dv / "Invoke-VenueLeaseBatch.ps1"):
+            text = "\n".join(l for l in path.read_text(encoding="utf-8").splitlines() if not l.lstrip().startswith("#"))
+            self.assertEqual(re.findall(r"(?:packageZip|exe|dll|\$k|\(\$check\[0\]\)|\$claim)\)?\.sha256\b", text), [], f"{path.name} reads a claim digest by member access")
+        for path in (ATTRIBUTION_GENERATOR, bachelor / "reference-frame-runner-job.ps1", STAGE_GENERATOR):
+            text = path.read_text(encoding="utf-8")
+            self.assertIn("'Get-AttrCudaBuildManifestClaimSha256'", text, f"{path.name} does not embed the predicate")
+        self.assertIn("Get-AttrCudaBuildManifestClaimSha256", self.VENUE_CHAIN.read_text(encoding="utf-8"))
+
+    def test_a_staged_build_the_leg_job_refuses_for_its_dll_pair_binding_is_replaced(self) -> None:
+        # adversary A3 (b47fcfbc): Assert-AttrCudaBuildManifest refuses a build.json with no dllPairManifestSha256 (DLLPAIR_UNBOUND), so no leg can
+        # run it; a corrected stage must be able to replace it, not be refused.
+        first = self.stage("ad005766", mutate=lambda m: m.pop("dllPairManifestSha256"))
+        self.assertEqual(first.returncode, 0, f"{first.stdout}\n{first.stderr}")
+
+        second = self.stage("f8fc75a2", suffix="repair")
+
+        self.assertEqual(second.returncode, 0, f"{second.stdout}\n{second.stderr}")
+        self.assertIn("DLLPAIR_UNBOUND", second.stdout)
+        self.assertEqual(self.manifest_sha(), hashlib.sha256((self.tmp / "build-f8fc75a2" / self.manifest_name).read_bytes()).hexdigest())
 
 
 # --------------------------------------------------------------------------------------------

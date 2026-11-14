@@ -597,6 +597,22 @@ function Get-VenueSupplementaryIdle {
     [pscustomobject]@{ idle = (-not $held -and $live.Count -eq 0); claimState = [string]$s.claim.state; liveTickets = $live.Count; holder = $holder }
 }
 
+$script:VenueClaimShapeSource = $null
+function Get-VenueClaimShapeSource {
+    # VENUE-STAGE-SAME-SHA-RESTAGE-GUARD-1 r3 (adversary A1 on ce5a0380): the verbatim text of Get-AttrCudaBuildManifestClaimSha256, extracted from AttrCudaArtifacts.psm1 by
+    # the same contract Get-AttrCudaEmbeddedFunctionSource embeds it into the leg and stage jobs with ("function <Name> {" ... "}" at column 0). Read as text, never imported:
+    # this module imports nothing from the bachelor tree. A missing function is an error, never a silently different predicate.
+    if ($null -eq $script:VenueClaimShapeSource) {
+        # r5 (CI run 43580040634): a module that will not read is a typed refusal naming the file, never a bare ReadAllText exception
+        $srcPath = Join-Path $PSScriptRoot '..\bachelor\AttrCudaArtifacts.psm1'
+        $src = try { [IO.File]::ReadAllText($srcPath) } catch { throw "VENUE_CLAIM_PREDICATE_UNREADABLE the claim-shape predicate's module $srcPath could not be read: $($_.Exception.Message -replace '\s+', ' ')" }
+        $mm = [regex]::Match($src, '(?ms)^function\s+Get-AttrCudaBuildManifestClaimSha256\s*\{.*?^\}')
+        if (-not $mm.Success) { throw 'VENUE_CLAIM_PREDICATE_MISSING AttrCudaArtifacts.psm1 defines no extractable Get-AttrCudaBuildManifestClaimSha256' }
+        $script:VenueClaimShapeSource = $mm.Value
+    }
+    $script:VenueClaimShapeSource
+}
+
 function Get-VenueStagedBuildManifest {
     <#
     .SYNOPSIS
@@ -608,8 +624,18 @@ function Get-VenueStagedBuildManifest {
     .OUTPUTS
     [pscustomobject]@{ state (STAGED | NOT_STAGED | UNREACHABLE); sha256; path; error; contentProblem }
     #>
-    param([Parameter(Mandatory)][string]$AgentShare, [Parameter(Mandatory)][ValidatePattern('^[0-9a-f]{40}$')][string]$SourceCommit, [ValidateRange(1.0, 600.0)][double]$TimeoutSec = 30, [scriptblock]$ProbeScript = $null,
-        [switch]$VerifyArtifacts, [ValidateRange(0, 600)][int]$ArtifactTimeoutSec = 0, [scriptblock]$ArtifactProbeScript = $null, [ValidateRange(1.0, 600.0)][double]$ArtifactMinSec = 1)
+    param([Parameter(Mandatory)][string]$AgentShare, [Parameter(Mandatory)][ValidatePattern('^[0-9a-f]{40}\z')][string]$SourceCommit, [ValidateRange(1.0, 600.0)][double]$TimeoutSec = 30, [scriptblock]$ProbeScript = $null,
+        [switch]$VerifyArtifacts, [ValidateRange(0, 600)][int]$ArtifactTimeoutSec = 0, [scriptblock]$ArtifactProbeScript = $null, [ValidateRange(1.0, 600.0)][double]$ArtifactMinSec = 1,
+        # Test-only (VENUE-STAGE-SAME-SHA-RESTAGE-GUARD-1 r2): the default manifest read first blocks its worker this long, as a read stuck on a dead SMB host does
+        # (Thread.Sleep: a stop request cannot interrupt it). test_venue_stage_nightly.py uses it; production passes none.
+        [ValidateRange(0, 600000)][int]$TestReadDelayMs = 0,
+        # VENUE-STAGE-SAME-SHA-RESTAGE-GUARD-1 r6 (Grok G6/G7 on #814): the whole call (manifest read plus artifact hash) ends inside -CallCapSec seconds of its start
+        # (0 = no such bound): the manifest read gets min(-TimeoutSec, -CallCapSec) (fix iteration, adversary A2 on 424df284), and the hash gets min(-ArtifactTimeoutSec,
+        # what is left of -CallCapSec), none under -ArtifactMinSec (UNREACHABLE).
+        # The stage nightly passes what is left of its -MaxTotalSec, so a 300 s hash never runs past the call's own cap.
+        [ValidateRange(0.0, 86400.0)][double]$CallCapSec = 0,
+        # Test-only (r6): the default artifact hash first blocks its worker this long, as a slow SMB hash of a large cached package does. Production passes none.
+        [ValidateRange(0, 600000)][int]$TestArtifactDelayMs = 0)
     # -ArtifactTimeoutSec 0 (the default): the artifact hash gets what is left of -TimeoutSec after the manifest read (under -ArtifactMinSec left, no hash: UNREACHABLE), so the whole call stays inside -TimeoutSec, as
     # every caller that passes 30 relies on. A caller that can afford more (the pre-claim plan preflight) or must afford less (the post-claim guard) says so.
     # r7 (sol r6 B1): -TimeoutSec and what is left of it are seconds with their fraction, never floored: the lease batch guard hands over a 2.8 s remainder as 2.8.
@@ -635,14 +661,30 @@ function Get-VenueStagedBuildManifest {
                 $s = $m.PSObject.Properties['pendingSymbolPresence']; 'S:' + $(if ($null -ne $s -and $s.Value -is [bool]) { 'bool' } else { 'bad' })
                 # r13 (adversary r13 A1): and the three artifact digests the job hashes the cached artifacts against (playback-attr-3-cuda-job.ps1 $manifestChecks): a string of
                 # 64 hex, the only value Get-Sha's digest can ever equal; a blank one makes the job throw, a non-string one throws in ToUpperInvariant.
+                # VENUE-STAGE-SAME-SHA-RESTAGE-GUARD-1 r3 (adversary A1 on ce5a0380): each claim is read by Get-AttrCudaBuildManifestClaimSha256, the ONE claim-shape predicate
+                # (tools/profiling/bachelor/AttrCudaArtifacts.psm1). Its TEXT is defined in this read's runspace below, the same text the leg job, the reference-frame runner and the
+                # stage job's generator, binding and host guard embed, so every one of them accepts exactly the same claims. ('' = not of the accepted shape.)
+                # This read is the ONE share-side soundness predicate: the nightly's reuse decision and the lease batch's plan and post-claim guards all take it.
                 foreach ($k in 'packageZip', 'exe', 'dll') {
-                    $o = $m.PSObject.Properties[$k]; $v = $(if ($null -ne $o -and $o.Value -is [System.Management.Automation.PSCustomObject] -and $o.Value.PSObject.Properties['sha256']) { $o.Value.sha256 } else { $null })
-                    'A:' + $k + '=' + $(if ($v -is [string] -and $v -match '^[0-9a-fA-F]{64}\z') { 'ok' } else { 'bad' })
+                    $v = Get-AttrCudaBuildManifestClaimSha256 $m $k
+                    'A:' + $k + '=' + $(if ($v -cmatch '^[0-9a-f]{64}\z') { 'ok' } else { 'bad' })
                     # LEASE-BATCH-PLAN-ARTIFACT-PREFLIGHT-1: the digest itself, for -VerifyArtifacts (the same bytes as the facts above)
-                    if ($v -is [string] -and $v -match '^[0-9a-fA-F]{64}\z') { 'H:' + $k + '=' + $v.ToLowerInvariant() }
+                    if ($v -cmatch '^[0-9a-f]{64}\z') { 'H:' + $k + '=' + $v }
                 }
             } })
-    $r = Invoke-VenueBoundedRead -ScriptText $read.ToString() -Argument $path -TimeoutSec $TimeoutSec
+    # r3: the default read runs with the claim-shape predicate defined (the read's own scriptblock is invoked inside, so it sees the function)
+    $readText = $(if ($null -eq $ProbeScript) {
+            "param(`$p)`n" + (Get-VenueClaimShapeSource) + "`n" + $(if ($TestReadDelayMs -gt 0) { "[Threading.Thread]::Sleep($TestReadDelayMs)`n" } else { '' }) + "& {" + $read.ToString() + "`n} `$p"
+        } else { $read.ToString() })
+    # r6 fix iteration (adversary A2 on 424df284): -CallCapSec bounds the WHOLE call, the manifest read too (it bounded only the hash, so a read stuck past the cap
+    # answered NOT_STAGED after it). Under 1 s of it (the least a read can be given) there is no read: UNREACHABLE.
+    $readSec = $TimeoutSec
+    if ($CallCapSec -gt 0) {
+        $capLeft = $CallCapSec - $callClock.Elapsed.TotalSeconds
+        if ($capLeft -lt 1.0) { return [pscustomobject]@{ state = 'UNREACHABLE'; sha256 = $null; path = $path; error = "the staged manifest could not be read: no time is left of -CallCapSec $([Math]::Round($CallCapSec, 2)) ($([Math]::Floor([Math]::Max(0.0, $capLeft) * 100.0) / 100.0) s left, under 1)"; contentProblem = $null } }
+        $readSec = [Math]::Min($TimeoutSec, $capLeft)
+    }
+    $r = Invoke-VenueBoundedRead -ScriptText $readText -Argument $path -TimeoutSec $readSec
     if (-not $r.answered) { return [pscustomobject]@{ state = 'UNREACHABLE'; sha256 = $null; path = $path; error = $r.error; contentProblem = $null } }
     $sha = $(if ($r.value.Count -gt 0) { [string]$r.value[0] } else { '' })
     if ($sha -cmatch '^[0-9a-f]{64}$') {
@@ -695,9 +737,16 @@ function Get-VenueStagedBuildManifest {
                     } })
             # adversary r2 A2: with no explicit bound the hash gets what is LEFT of -TimeoutSec, and none when less than -ArtifactMinSec is left (a 1 s floor would run the call past its own bound)
             $artSec = $ArtifactTimeoutSec
+            if ($artSec -gt 0 -and $CallCapSec -gt 0) {
+                # r6 (Grok G6/G7 on #814): an explicit hash budget never runs the call past -CallCapSec; under -ArtifactMinSec left of it, no hash (UNREACHABLE)
+                $capLeft = $CallCapSec - $callClock.Elapsed.TotalSeconds
+                if ($capLeft -lt $ArtifactMinSec) { return [pscustomobject]@{ state = 'UNREACHABLE'; sha256 = $null; path = $path; error = "the cached artifacts could not be hashed: no time is left of -CallCapSec $([Math]::Round($CallCapSec, 2)) after the manifest read ($([Math]::Floor([Math]::Max(0.0, $capLeft) * 100.0) / 100.0) s left, under $ArtifactMinSec)"; contentProblem = $null; artifactProblem = $null; artifactsUnhashed = $true } }
+                $artSec = [Math]::Min([double]$artSec, $capLeft)
+            }
             if ($artSec -le 0) {
                 # r7 (sol r6 B1): the exact remainder, not its whole seconds (2.7 s left was floored to 1, under the guard's 2 s minimum, and a healthy hash never started)
-                $left = $TimeoutSec - $callClock.Elapsed.TotalSeconds
+                # r6 fix iteration (A2): what is left of the manifest read's own bound, which -CallCapSec already shortened
+                $left = $readSec - $callClock.Elapsed.TotalSeconds
                 # r10 (adversary pass 2 A3): the time left is printed rounded DOWN to hundredths -- Round(1.999, 2) printed "2 s left, under 2"
                 # r5 (adversary r5 A2): -ArtifactMinSec is the least a hash may START with; the lease batch guard asks for its own minimum ($script:GuardReadMinSec, the same rule)
                 if ($left -lt $ArtifactMinSec) { return [pscustomobject]@{ state = 'UNREACHABLE'; sha256 = $null; path = $path; error = "the cached artifacts could not be hashed: no time is left of -TimeoutSec $([Math]::Round($TimeoutSec, 2)) after the manifest read ($([Math]::Floor([Math]::Max(0.0, $left) * 100.0) / 100.0) s left, under $ArtifactMinSec)"; contentProblem = $null; artifactProblem = $null; artifactsUnhashed = $true } }
@@ -706,7 +755,8 @@ function Get-VenueStagedBuildManifest {
             # r7 adversary A2: the hash's end on the call's own clock, so the worker checks the minimum again before each file
             $hashEnd = $callClock.Elapsed.TotalSeconds + $artSec
             foreach ($it in $items) { $it.clock = $callClock; $it.endSec = $hashEnd; $it.minSec = $ArtifactMinSec }
-            $ar =Invoke-VenueBoundedRead -ScriptText $probe.ToString() -Argument $items -TimeoutSec $artSec
+            $probeText = $(if ($TestArtifactDelayMs -gt 0 -and $null -eq $ArtifactProbeScript) { "param(`$items)`n[Threading.Thread]::Sleep($TestArtifactDelayMs)`n& {" + $probe.ToString() + "`n} `$items" } else { $probe.ToString() })
+            $ar =Invoke-VenueBoundedRead -ScriptText $probeText -Argument $items -TimeoutSec $artSec
             if (-not $ar.answered) { return [pscustomobject]@{ state = 'UNREACHABLE'; sha256 = $null; path = $path; error = "the cached artifacts could not be hashed: $($ar.error)"; contentProblem = $null; artifactProblem = $null; artifactsUnhashed = $true } }
             $lines = @($ar.value | ForEach-Object { [string]$_ })
             $missing = @($lines | Where-Object { $_.StartsWith('MISSING:') } | ForEach-Object { $p = $_.Split(':', 3); "$($p[1]) $($p[2])" })
@@ -729,7 +779,7 @@ function Get-VenueStagedArtifactNames {
     The cached artifact file names for a build, by the formulas Get-AttrCudaArtifactNames (tools/profiling/bachelor/AttrCudaArtifacts.psm1) derives and the leg job reads from the
     agent cache. Kept here as a copy because this module imports nothing from the bachelor tree; test_venue_lease_batch.py pins the two together.
     #>
-    param([Parameter(Mandatory)][ValidatePattern('^[0-9a-f]{40}$')][string]$SourceCommit)
+    param([Parameter(Mandatory)][ValidatePattern('^[0-9a-f]{40}\z')][string]$SourceCommit)
     $s = $SourceCommit.Substring(0, 12)
     @{ exe = "MLVApp-playback-attr-3-cuda-$s.exe"; dll = "igpu_recon_cuda-playback-attr-3-cuda-$s.dll"; packageZip = "MLVApp-playback-attr-3-cuda-$s-pkg.zip" }
 }
