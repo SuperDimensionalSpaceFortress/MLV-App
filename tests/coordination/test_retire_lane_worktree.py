@@ -5953,3 +5953,74 @@ def test_real_process_creation_order_increases_from_parent_to_child():
     got = json.loads(r.stdout)
     assert got["mine"] and got["kid"] and got["kid"] > got["mine"] and got["none"] is None, got
     assert 0 <= got["skewMs"] <= 0.001, got   # the same kernel stamp: within the 1 us the WMI string keeps
+
+
+@pytest.mark.skipif(os.name != "nt", reason="reads the Windows process table")
+def test_real_process_creation_order_is_readable_for_a_process_with_a_five_thousand_character_command_line():
+    """RETIRE-PROC-ORDER-BUFFER-RETRY-1 (PR #803 opus r2 finding 1): REGRESSION GUARD for the retry path, NOT the RED test. The premise that a fixed 8 KiB
+    buffer overflows (STATUS_INFO_LENGTH_MISMATCH) for a long command line is UNREPRODUCED on Win10 19045: class 64 (ProcessTelemetryIdInformation) returned
+    1,336 bytes at 100, 5,000 and 20,000 characters, so this test also passes on the unfixed code. It only pins that a child with a command line of at least
+    5,000 characters still gets a creation-order key, bound to its own pid. The RED test is
+    test_real_process_creation_order_retries_once_when_the_first_buffer_is_too_small, which forces the too-small status with a 64-byte first buffer."""
+    import sys
+    child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)", "x" * 5000], stdin=subprocess.DEVNULL,
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    try:
+        script = ("$ErrorActionPreference='Stop'; " + f". '{HELPER}'; "
+                  f"$kid = [MlvProcOrder]::Get({child.pid}); $wrapped = Get-ProcessCreationOrder -ProcessId {child.pid}; "
+                  "$cl = (Get-CimInstance Win32_Process -Filter \"ProcessId=" + str(child.pid) + "\").CommandLine.Length; "
+                  "ConvertTo-Json -Compress @{ raw = $kid; wrapped = $wrapped.Sequence; cmdLen = $cl }")
+        r = subprocess.run([PWSH, "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, timeout=120)
+        assert r.returncode == 0, r.stdout + r.stderr
+        got = json.loads(r.stdout)
+        assert got["cmdLen"] >= 5000, got                      # the fixture really is a long command line
+        assert got["raw"] and len(got["raw"]) == 2 and got["raw"][0] > 0, got
+        assert got["wrapped"] and got["wrapped"] == got["raw"][0], got
+    finally:
+        child.kill()
+        child.wait(timeout=30)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="reads the Windows process table")
+def test_real_process_creation_order_retries_once_when_the_first_buffer_is_too_small():
+    """RETIRE-PROC-ORDER-BUFFER-RETRY-1: the host's class-64 result for a 5,000-character command line is 1,336 bytes, so the default 8 KiB buffer never
+    overflows here; the reader's first buffer is a parameter so the too-small status (0xC0000004) is real, not simulated. A 64-byte first buffer must be
+    retried once at the reported length and give the SAME key as the default read; a dead pid still has none."""
+    import sys
+    child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)", "x" * 5000], stdin=subprocess.DEVNULL,
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    try:
+        script = ("$ErrorActionPreference='Stop'; " + f". '{HELPER}'; "
+                  f"$default = [MlvProcOrder]::Get({child.pid}); $small = [MlvProcOrder]::Get({child.pid}, 64); $none = [MlvProcOrder]::Get(2147483000, 64); "
+                  "ConvertTo-Json -Compress @{ default = $default; small = $small; none = $none }")
+        r = subprocess.run([PWSH, "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, timeout=120)
+        assert r.returncode == 0, r.stdout + r.stderr
+        got = json.loads(r.stdout)
+        assert got["default"] and len(got["default"]) == 2, got
+        assert got["small"] == got["default"], got
+        assert got["none"] is None, got
+    finally:
+        child.kill()
+        child.wait(timeout=30)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="reads the Windows process table")
+def test_real_process_creation_order_get_returns_null_for_a_first_buffer_length_it_cannot_allocate():
+    """RETIRE-PROC-ORDER-BUFFER-RETRY-1 r2 (sol r1 blocker, ANC-03): the public Get(pid, first) is pair-or-null, so a first buffer length outside 1..1 MiB (the
+    same bound the retry applies to the reported length) must read as unreadable on a queryable process, never escape as a negative-size OverflowException
+    (-1, Int32.MinValue) or an out-of-memory one (Int32.MaxValue). 1 and 1 MiB are the inclusive edges and still answer; 1 byte is retried to the real key."""
+    script = ("$ErrorActionPreference='Stop'; " + f". '{HELPER}'; "
+              "$r = [ordered]@{}; "
+              "foreach ($n in @(-1, 0, [int]::MinValue, 1048577, [int]::MaxValue)) { "
+              "try { $v = [MlvProcOrder]::Get($PID, $n); $r[[string]$n] = @{ threw = $false; isNull = ($null -eq $v) } } "
+              "catch { $r[[string]$n] = @{ threw = $true; isNull = $false } } }; "
+              "$default = [MlvProcOrder]::Get($PID); $one = [MlvProcOrder]::Get($PID, 1); $max = [MlvProcOrder]::Get($PID, 1048576); "
+              "$r['default'] = $default; $r['one'] = $one; $r['max'] = $max; "
+              "ConvertTo-Json -Compress -Depth 4 $r")
+    r = subprocess.run([PWSH, "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, timeout=120)
+    assert r.returncode == 0, r.stdout + r.stderr
+    got = json.loads(r.stdout)
+    assert got["default"] and len(got["default"]) == 2, got
+    for n in ("-1", "0", str(-2**31), "1048577", str(2**31 - 1)):
+        assert got[n] == {"threw": False, "isNull": True}, (n, got)
+    assert got["one"] == got["default"] and got["max"] == got["default"], got
