@@ -783,6 +783,8 @@ if (-not $isFixtureRehearsal) {
 Import-Module (Join-Path $PSScriptRoot 'AttrCudaArtifacts.psm1') -Force
 $embeddedFunctions = Get-AttrCudaEmbeddedFunctionSource -Name @(
     'Assert-AttrCudaBuildManifest',
+    # VENUE-STAGE-SAME-SHA-RESTAGE-GUARD-1 r3: the ONE claim-shape predicate every reader of a cached build's artifact claim calls.
+    'Get-AttrCudaBuildManifestClaimSha256',
     'Resolve-AttrCudaSmokeRunLog',
     'Get-AttrCudaLastEligibilityLine',
     'Get-AttrCudaEligibilityVerdict',
@@ -2577,10 +2579,13 @@ $buildManifest = Assert-AttrCudaBuildManifest -Path $buildManifestPath -Expected
 # manifest, whose bytes are now authenticated above.
 $pendingSymbolPresence = [bool]$buildManifest.pendingSymbolPresence
 $dllPairManifestSha256 = ([string]$buildManifest.dllPairManifestSha256).ToLowerInvariant()
+# VENUE-STAGE-SAME-SHA-RESTAGE-GUARD-1 r3 (adversary A1 on ce5a0380): each digest is read through the ONE claim-shape predicate (embedded
+# above), never by member access: member enumeration turned a nested [["<hex>"]] into a digest here while the stage job's guard refused it.
+# A claim of any other shape is '' and refused below as a missing sha256.
 $manifestChecks = @(
-    @{ label = 'packageZip'; path = (Join-Path $Cache $BasePackageZip); expectedSha = $buildManifest.packageZip.sha256 },
-    @{ label = 'exe'; path = (Join-Path $Cache $ExeName); expectedSha = $buildManifest.exe.sha256 },
-    @{ label = 'dll'; path = (Join-Path $Cache $ReconName); expectedSha = $buildManifest.dll.sha256 }
+    @{ label = 'packageZip'; path = (Join-Path $Cache $BasePackageZip); expectedSha = (Get-AttrCudaBuildManifestClaimSha256 $buildManifest 'packageZip') },
+    @{ label = 'exe'; path = (Join-Path $Cache $ExeName); expectedSha = (Get-AttrCudaBuildManifestClaimSha256 $buildManifest 'exe') },
+    @{ label = 'dll'; path = (Join-Path $Cache $ReconName); expectedSha = (Get-AttrCudaBuildManifestClaimSha256 $buildManifest 'dll') }
 )
 # BACHELOR-OWNER-CLIP-STAGE-STALL-1: each cached artifact is hashed ONCE per job. The digest that
 # just matched the authenticated manifest is kept and reused below as the expected value for the

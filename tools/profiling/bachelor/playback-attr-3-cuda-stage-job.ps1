@@ -117,8 +117,9 @@ foreach ($item in $canonical) {
     if ($claimedName -cne [string]$item.name) {
         throw "build manifest names $($item.label) '$claimedName'; the canonical name for $SourceCommit is '$($item.name)'. Names are derived, never taken from the manifest."
     }
-    $sha = if ($null -eq $item.claim) { '' } else { ([string]$item.claim.sha256).ToLowerInvariant() }
-    if ($sha -notmatch '^[0-9a-f]{64}$') { throw "build manifest sha256 for $($item.name) is not a lowercase sha256" }
+    # VENUE-STAGE-SAME-SHA-RESTAGE-GUARD-1 r3: through the ONE claim-shape predicate the leg job reads with, so nothing is staged that a leg refuses
+    $sha = Get-AttrCudaBuildManifestClaimSha256 $buildManifest ([string]$item.label)
+    if ($sha -notmatch '^[0-9a-f]{64}$') { throw "build manifest sha256 for $($item.name) is not a lowercase sha256 of the one accepted claim shape" }
     $expected += [ordered]@{ name = [string]$item.name; sha256 = $sha }
 }
 # Verify each one HERE first: a side-file that does not match on this machine can never match on
@@ -159,7 +160,9 @@ $embeddedFunctions = Get-AttrCudaEmbeddedFunctionSource -Name @(
     'Remove-AttrCudaInputFileByContent',
     # VENUE-STAGE-SAME-SHA-RESTAGE-GUARD-1: a staged build is "sound" exactly when the leg job's own
     # manifest check (playback-attr-3-cuda-job.ps1) accepts it.
-    'Assert-AttrCudaBuildManifest'
+    'Assert-AttrCudaBuildManifest',
+    # r3 (adversary A1 on ce5a0380): and its artifact claims are read through the ONE claim-shape predicate the leg job reads them with.
+    'Get-AttrCudaBuildManifestClaimSha256'
 )
 
 if (-not (Test-Path -LiteralPath $OutDir)) { New-Item -ItemType Directory -Path $OutDir -Force | Out-Null }
@@ -171,7 +174,9 @@ $template = @'
 # -VerifyOnly runs the read-only prefix (name derivation and safety, path containment, side-file
 # presence, hashes, manifest binding) and exits without creating, copying, publishing or deleting
 # anything. The agent never passes it; the behavioural tests do.
-param([switch]$VerifyOnly)
+# -TestHoldAfterPartialsPath / -TestLockWaitMarkerPath (VENUE-STAGE-SAME-SHA-RESTAGE-GUARD-1 r3): test-only seams for the two-stager
+# interleaving test (test_playback_attr_3_cuda_behaviour.py). The agent runs a job with no arguments, so production passes neither.
+param([switch]$VerifyOnly, [string]$TestHoldAfterPartialsPath = '', [string]$TestLockWaitMarkerPath = '')
 
 $ErrorActionPreference = 'Stop'
 $SourceCommit = '__SOURCE_COMMIT__'
@@ -315,12 +320,14 @@ if ($arrivedManifest.sourceCommit -ne $SourceCommit) {
 if ($arrivedManifest.pendingSymbolPresence -isnot [bool]) {
     Complete-Failed 5 'manifestBinding' 'arrived manifest has no boolean pendingSymbolPresence; the attribution job would refuse it'
 }
-foreach ($claim in @($arrivedManifest.packageZip, $arrivedManifest.exe, $arrivedManifest.dll)) {
+foreach ($claimKey in 'packageZip', 'exe', 'dll') {
+    $claim = $arrivedManifest.$claimKey
     $claimedName = [string]$claim.name
     if (-not $observed.Contains($claimedName)) {
         Complete-Failed 5 'manifestBinding' "arrived manifest names $claimedName, which is not in the staged set"
     }
-    if ($observed[$claimedName] -ne ([string]$claim.sha256).ToLowerInvariant()) {
+    # r3: the digest through the ONE claim-shape predicate (embedded below), never by member access
+    if ($observed[$claimedName] -ne (Get-AttrCudaBuildManifestClaimSha256 $arrivedManifest $claimKey)) {
         Complete-Failed 5 'manifestBinding' "arrived manifest sha256 for $claimedName disagrees with the staged bytes"
     }
 }
@@ -345,6 +352,38 @@ if ($VerifyOnly) {
 # bytes is reused (STAGE_REUSED_EXISTING, exit 0); with any other manifest it is refused (exit 7).
 # Neither writes the cache; both remove this job's own verified inputs from the inbox by content. A
 # build.json the leg job would refuse anyway is not a build anyone can run, so it is replaced as before.
+#
+# r3 (adversary A3 on ce5a0380): the guard and the publication below are ONE step per cache and sha. Two
+# agents on one root (each with its own -MutexName, both admitted) both passed an absent-manifest guard; B
+# published, then A replaced B's artifacts, deleted B's sound manifest and failed (exit 22): a sound stage
+# with no manifest. So this job takes a lock named for the cache directory's full path and the sha (never a
+# caller-chosen name) BEFORE the guard reads the cache, and holds it until the process ends, past the last
+# cache write (the OS releases it then; an abandoned lock is taken over, because the guard re-reads the cache
+# under it). A second stager of the sha waits, then finds the sound build and reuses or refuses it. A lock
+# that cannot be had is a refusal (exit 7) with nothing written.
+$StageLockWaitSec = 1800
+$lockHasher = [Security.Cryptography.SHA256]::Create()
+try {
+    $lockKey = [IO.Path]::GetFullPath($Cache).TrimEnd('\').ToLowerInvariant() + '|' + $SourceCommit.ToLowerInvariant()
+    $stageLockName = 'Global\MlvAttrCudaStage-' + ([BitConverter]::ToString($lockHasher.ComputeHash([Text.Encoding]::UTF8.GetBytes($lockKey))) -replace '-', '').ToLowerInvariant()
+} finally { $lockHasher.Dispose() }
+$stageLockHeld = $false
+try {
+    $StageLock = [Threading.Mutex]::new($false, $stageLockName)
+    try { $stageLockHeld = $StageLock.WaitOne(0) } catch [Threading.AbandonedMutexException] { $stageLockHeld = $true }
+    if (-not $stageLockHeld) {
+        Say "STAGE_LOCK_WAIT another stager of $SourceCommit into $Cache holds $stageLockName; waiting up to $StageLockWaitSec s"
+        if ($TestLockWaitMarkerPath) { [IO.File]::WriteAllText($TestLockWaitMarkerPath, $stageLockName) }
+        try { $stageLockHeld = $StageLock.WaitOne([TimeSpan]::FromSeconds($StageLockWaitSec)) } catch [Threading.AbandonedMutexException] { $stageLockHeld = $true }
+    }
+} catch {
+    Write-Output "STAGE_REFUSED_STAGE_LOCK sha=$($SourceCommit.Substring(0, 12)) lock=$stageLockName $($_.Exception.Message -replace '\s+', ' ')"
+    Complete-Failed 7 'stagedBuildGuard' "the stage lock $stageLockName of $SourceCommit in $Cache could not be taken, so nothing is staged: $($_.Exception.Message)"
+}
+if (-not $stageLockHeld) {
+    Write-Output "STAGE_REFUSED_STAGE_LOCK_BUSY sha=$($SourceCommit.Substring(0, 12)) lock=$stageLockName waitedSec=$StageLockWaitSec"
+    Complete-Failed 7 'stagedBuildGuard' "another stager of $SourceCommit into $Cache held $stageLockName for $StageLockWaitSec s; nothing is staged"
+}
 if (Test-Path -LiteralPath $manifestCachePath) {
     $stagedSha = ''
     $unsound = ''
@@ -363,11 +402,11 @@ if (Test-Path -LiteralPath $manifestCachePath) {
             $cachePathByName = @{}
             foreach ($item in $sideFiles) { $cachePathByName[[string]$item.name] = [string]$item.cachePath }
             foreach ($check in @(@('packageZip', $derived.packageZipName), @('exe', $derived.exeName), @('dll', $derived.reconName))) {
-                # Read exactly as the leg job reads it ($buildManifest.exe.sha256, member access), so a claim shape the leg accepts
-                # (a one-element array, through member enumeration) counts here too (adversary A1 on 72577e87).
-                $claimSha = [string]$staged.($check[0]).sha256
+                # r3 (adversary A1 on ce5a0380): read through the ONE claim-shape predicate the leg job reads it with (embedded verbatim
+                # in both), so the leg and this guard accept exactly the same claims; '' is a claim the leg refuses, so the build is unsound.
+                $claimSha = Get-AttrCudaBuildManifestClaimSha256 $staged ([string]$check[0])
                 $cachedPath = $cachePathByName[[string]$check[1]]
-                if ([string]::IsNullOrWhiteSpace($claimSha)) { $unsound = "it carries no sha256 for $($check[0])"; break }
+                if ([string]::IsNullOrWhiteSpace($claimSha)) { $unsound = "it carries no sha256 of the accepted claim shape for $($check[0])"; break }
                 if (-not (Test-Path -LiteralPath $cachedPath -PathType Leaf)) { $unsound = "$($check[1]) is not in the cache"; break }
                 if ((Get-ShaLower $cachedPath) -ne $claimSha.ToLowerInvariant()) { $unsound = "the cached $($check[1]) differs from the manifest's $($check[0]) sha256"; break }
             }
@@ -436,6 +475,12 @@ try {
     Complete-Failed 20 'publishPartials' $_.Exception.Message
 }
 $StepLog['publishPartials'] = 0
+if ($TestHoldAfterPartialsPath) {
+    # Test-only (r3): the partials are copied and verified; wait here (bounded) until the test lets go, so a second stager can be run meanwhile.
+    [IO.File]::WriteAllText("$TestHoldAfterPartialsPath.reached", '')
+    $holdClock = [Diagnostics.Stopwatch]::StartNew()
+    while (-not (Test-Path -LiteralPath $TestHoldAfterPartialsPath) -and $holdClock.Elapsed.TotalSeconds -lt 120) { Start-Sleep -Milliseconds 100 }
+}
 
 try {
     foreach ($item in $sideFiles) {

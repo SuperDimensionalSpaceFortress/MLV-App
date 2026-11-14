@@ -597,6 +597,20 @@ function Get-VenueSupplementaryIdle {
     [pscustomobject]@{ idle = (-not $held -and $live.Count -eq 0); claimState = [string]$s.claim.state; liveTickets = $live.Count; holder = $holder }
 }
 
+$script:VenueClaimShapeSource = $null
+function Get-VenueClaimShapeSource {
+    # VENUE-STAGE-SAME-SHA-RESTAGE-GUARD-1 r3 (adversary A1 on ce5a0380): the verbatim text of Get-AttrCudaBuildManifestClaimSha256, extracted from AttrCudaArtifacts.psm1 by
+    # the same contract Get-AttrCudaEmbeddedFunctionSource embeds it into the leg and stage jobs with ("function <Name> {" ... "}" at column 0). Read as text, never imported:
+    # this module imports nothing from the bachelor tree. A missing function is an error, never a silently different predicate.
+    if ($null -eq $script:VenueClaimShapeSource) {
+        $src = [IO.File]::ReadAllText((Join-Path $PSScriptRoot '..\bachelor\AttrCudaArtifacts.psm1'))
+        $mm = [regex]::Match($src, '(?ms)^function\s+Get-AttrCudaBuildManifestClaimSha256\s*\{.*?^\}')
+        if (-not $mm.Success) { throw 'VENUE_CLAIM_PREDICATE_MISSING AttrCudaArtifacts.psm1 defines no extractable Get-AttrCudaBuildManifestClaimSha256' }
+        $script:VenueClaimShapeSource = $mm.Value
+    }
+    $script:VenueClaimShapeSource
+}
+
 function Get-VenueStagedBuildManifest {
     <#
     .SYNOPSIS
@@ -638,21 +652,21 @@ function Get-VenueStagedBuildManifest {
                 $s = $m.PSObject.Properties['pendingSymbolPresence']; 'S:' + $(if ($null -ne $s -and $s.Value -is [bool]) { 'bool' } else { 'bad' })
                 # r13 (adversary r13 A1): and the three artifact digests the job hashes the cached artifacts against (playback-attr-3-cuda-job.ps1 $manifestChecks): a string of
                 # 64 hex, the only value Get-Sha's digest can ever equal; a blank one makes the job throw, a non-string one throws in ToUpperInvariant.
-                # VENUE-STAGE-SAME-SHA-RESTAGE-GUARD-1 r2 (adversary A1 on 90b1c58e): the claim is read with the leg job's OWN expression ($buildManifest.exe.sha256, member
-                # access) and the stage job's host guard reads it the same way, so every claim shape they accept counts here too: a one-element array [{name,sha256}]
-                # enumerates to its one digest. Requiring a single object refused a build both of them accept, and the nightly re-staged over it (exit 7).
-                # VENUE-STAGE-SAME-SHA-RESTAGE-GUARD-1 r2 (adversary A1 on 90b1c58e): the claim is read with the leg job's OWN expression ($buildManifest.exe.sha256, member
-                # access; playback-attr-3-cuda-job.ps1 $manifestChecks), as the stage job's host guard reads it, so every claim shape those two accept counts here too: a
-                # one-element array [{name,sha256}] enumerates to its one digest. Requiring a single object refused a build both accept, and the nightly re-staged over it.
+                # VENUE-STAGE-SAME-SHA-RESTAGE-GUARD-1 r3 (adversary A1 on ce5a0380): each claim is read by Get-AttrCudaBuildManifestClaimSha256, the ONE claim-shape predicate
+                # (tools/profiling/bachelor/AttrCudaArtifacts.psm1). Its TEXT is defined in this read's runspace below, the same text the leg job, the reference-frame runner and the
+                # stage job's generator, binding and host guard embed, so every one of them accepts exactly the same claims. ('' = not of the accepted shape.)
                 # This read is the ONE share-side soundness predicate: the nightly's reuse decision and the lease batch's plan and post-claim guards all take it.
                 foreach ($k in 'packageZip', 'exe', 'dll') {
-                    $v = $(try { $m.$k.sha256 } catch { $null })
-                    'A:' + $k + '=' + $(if ($v -is [string] -and $v -match '^[0-9a-fA-F]{64}\z') { 'ok' } else { 'bad' })
+                    $v = Get-AttrCudaBuildManifestClaimSha256 $m $k
+                    'A:' + $k + '=' + $(if ($v -cmatch '^[0-9a-f]{64}\z') { 'ok' } else { 'bad' })
                     # LEASE-BATCH-PLAN-ARTIFACT-PREFLIGHT-1: the digest itself, for -VerifyArtifacts (the same bytes as the facts above)
-                    if ($v -is [string] -and $v -match '^[0-9a-fA-F]{64}\z') { 'H:' + $k + '=' + $v.ToLowerInvariant() }
+                    if ($v -cmatch '^[0-9a-f]{64}\z') { 'H:' + $k + '=' + $v }
                 }
             } })
-    $readText = $(if ($TestReadDelayMs -gt 0 -and $null -eq $ProbeScript) { "param(`$p)`n[Threading.Thread]::Sleep($TestReadDelayMs)`n& {" + $read.ToString() + "`n} `$p" } else { $read.ToString() })
+    # r3: the default read runs with the claim-shape predicate defined (the read's own scriptblock is invoked inside, so it sees the function)
+    $readText = $(if ($null -eq $ProbeScript) {
+            "param(`$p)`n" + (Get-VenueClaimShapeSource) + "`n" + $(if ($TestReadDelayMs -gt 0) { "[Threading.Thread]::Sleep($TestReadDelayMs)`n" } else { '' }) + "& {" + $read.ToString() + "`n} `$p"
+        } else { $read.ToString() })
     $r = Invoke-VenueBoundedRead -ScriptText $readText -Argument $path -TimeoutSec $TimeoutSec
     if (-not $r.answered) { return [pscustomobject]@{ state = 'UNREACHABLE'; sha256 = $null; path = $path; error = $r.error; contentProblem = $null } }
     $sha = $(if ($r.value.Count -gt 0) { [string]$r.value[0] } else { '' })

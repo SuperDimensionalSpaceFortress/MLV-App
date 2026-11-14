@@ -636,7 +636,10 @@ if ($buildInCache) {
     if ($again.present) {
         $soundSec = Get-ProbeSec "the soundness of the staged build of $commit"
         $sound = try { Get-VenueStagedBuildManifest -AgentShare $share -SourceCommit $commit -VerifyArtifacts -TimeoutSec $soundSec -TestReadDelayMs $TestSoundnessReadDelayMs } catch { [pscustomobject]@{ state = 'UNREACHABLE'; error = ($_.Exception.Message -replace '\s+', ' ') } }
-        if ($sound.state -ceq 'UNREACHABLE' -and $soundSec -lt $ProbeTimeoutSec) { Stop-Nightly 'STAGE_CAP_EXCEEDED' "the soundness read of the staged build of $commit got the rest of the $MaxTotalSec s cap ($([Math]::Round($soundSec, 2)) s) and did not answer in it: $($sound.error); nothing was submitted" }
+        # r3 (adversary A2 on ce5a0380): STAGE_CAP_EXCEEDED only when the cap really ran out during the read (under the 1 s Get-ProbeSec needs for any read): a read
+        # GIVEN less than -ProbeTimeoutSec that failed at once (a held artifact, 0.09 s) with ~100 s left is an ordinary unreadable answer, and the stage job decides.
+        $leftAfter = ($script:Deadline - [DateTime]::UtcNow).TotalSeconds
+        if ($sound.state -ceq 'UNREACHABLE' -and $leftAfter -lt 1.0) { Stop-Nightly 'STAGE_CAP_EXCEEDED' "the soundness read of the staged build of $commit got the rest of the $MaxTotalSec s cap ($([Math]::Round($soundSec, 2)) s) and the cap ran out with no answer ($([Math]::Floor([Math]::Max(0.0, $leftAfter) * 100.0) / 100.0) s left): $($sound.error); nothing was submitted" }
         if (-not ($sound.state -ceq 'STAGED' -and $sound.contentProblem -ceq '' -and $sound.artifactProblem -ceq '' -and $sound.sha256 -ceq $again.hash)) {
             Say "the $Venue cache holds a build of $commit that is not reused: state=$($sound.state) manifest=$($sound.sha256) content=[$($sound.contentProblem)] artifacts=[$($sound.artifactProblem)] error=[$($sound.error)]; staging this call's build (the stage job replaces only an unsound build)"
             $sound = $null

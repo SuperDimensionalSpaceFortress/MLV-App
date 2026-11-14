@@ -132,6 +132,15 @@ if ($env:FAKE_ASSEMBLE -like 'racestage*') {
     # FAKE_ASSEMBLE_SLEEP: the assemble takes this many seconds more (the racer's stage lands meanwhile)
     if ($env:FAKE_ASSEMBLE_SLEEP) { Start-Sleep -Seconds ([int]$env:FAKE_ASSEMBLE_SLEEP) }
     [IO.File]::WriteAllText((Join-Path $env:FAKE_RACE_CACHE "playback-attr-3-cuda-$s-build.json"), ($rm | ConvertTo-Json -Compress -Depth 4))
+    # racestage-locked (r3, adversary A2 on ce5a0380): the racer's cached exe is held open with FileShare.None for FAKE_LOCK_SEC s, so the soundness read's
+    # artifact hash fails AT ONCE with nearly all of the cap left. The holder marks <FAKE_CALLS>.lockheld once it holds the file and .lockreleased after.
+    if ($env:FAKE_ASSEMBLE -eq 'racestage-locked') {
+        $exe = Join-Path $env:FAKE_RACE_CACHE "MLVApp-playback-attr-3-cuda-$s.exe"
+        $hold = "`$fs = [IO.File]::Open('$exe', 'Open', 'Read', 'None'); [IO.File]::WriteAllText('$($env:FAKE_CALLS).lockheld', ''); Start-Sleep -Seconds $env:FAKE_LOCK_SEC; `$fs.Dispose(); [IO.File]::WriteAllText('$($env:FAKE_CALLS).lockreleased', '')"
+        Start-Process -FilePath (Get-Process -Id $PID).Path -ArgumentList @('-NoProfile', '-NonInteractive', '-Command', $hold) -WindowStyle Hidden | Out-Null
+        $t = [Diagnostics.Stopwatch]::StartNew()
+        while (-not (Test-Path -LiteralPath "$($env:FAKE_CALLS).lockheld") -and $t.Elapsed.TotalSeconds -lt 60) { Start-Sleep -Milliseconds 100 }
+    }
 }
 "RESULT=ASSEMBLE_OK SOURCE=$SourceCommit EXE=x DLL=x PKG=x MANIFEST=playback-attr-3-cuda-$s-build.json MANIFEST_SHA256=$h OUT=$OutDir"
 exit 0
@@ -185,6 +194,11 @@ elseif ($kind -eq 'DLLPAIR') {
     [IO.File]::WriteAllText((Join-Path $art 'dll-pair-manifest.json'), (@{ sourceCommit = $sha; jobId = $JobId } | ConvertTo-Json -Compress))
     $out = "RESULT=DLL_PAIR_OK SOURCE=$sha ARCH=sm_86 RECON=x AMAZE=x ARTIFACTS=$art"
 } elseif ($kind -eq 'STAGE') {
+    # racestage-locked: the agent runs the stage once the racer's lock holder has let go (the copy below replaces the held exe)
+    if (Test-Path -LiteralPath "$($env:FAKE_CALLS).lockheld") {
+        $t = [Diagnostics.Stopwatch]::StartNew()
+        while (-not (Test-Path -LiteralPath "$($env:FAKE_CALLS).lockreleased") -and $t.Elapsed.TotalSeconds -lt 60) { Start-Sleep -Milliseconds 100 }
+    }
     foreach ($f in $sides) { Copy-Item -LiteralPath $f -Destination (Join-Path $cache (Split-Path -Leaf $f)) -Force }
     if ($mode -eq 'wrongcache') {
         $bj = @($sides | Where-Object { $_ -like '*-build.json' })[0]
@@ -752,6 +766,26 @@ class VenueStageNightlyTests(unittest.TestCase):
         self.assertFalse([c for c in self.submissions() if "job=playback-attr-3-cuda-stage-" in c], self.submissions())
         self.assertEqual(json.loads((self.share / "cache" / names()["build"]).read_text(encoding="utf-8"))["assembledAtUtc"], "racer")
         self.assertLess(took, cap + 8, f"the call ran {took:.1f} s against a {cap} s cap")
+
+    def test_an_unreadable_soundness_answer_with_budget_left_goes_to_the_stage_job(self) -> None:
+        # r3 (adversary A2 on ce5a0380): -MaxTotalSec 120, -ProbeTimeoutSec 300, and the racer's cached exe is held with FileShare.None, so the soundness
+        # read's hash fails AT ONCE with about 100 s of the cap left. r2 called that STAGE_CAP_EXCEEDED only because the read was GIVEN less than
+        # -ProbeTimeoutSec; the cap had not run out, so the read is an ordinary unreadable answer and the stage job decides on the host.
+        def lock_released() -> None:
+            # the holder lets go after FAKE_LOCK_SEC whatever the driver did, so the case directory can be removed
+            held, released, t0 = Path(f"{self.calls_log}.lockheld"), Path(f"{self.calls_log}.lockreleased"), time.monotonic()
+            while held.exists() and not released.exists() and time.monotonic() - t0 < 60:
+                time.sleep(0.2)
+            time.sleep(0.5)
+        self.addCleanup(lock_released)
+        self.built_dll_pair()
+        (self.share / "cache" / RUNNER_DIR).mkdir()
+        p = self.run_driver("-MaxTotalSec", "120", probe="300",
+                            env={"FAKE_ASSEMBLE": "racestage-locked", "FAKE_LOCK_SEC": "8", "FAKE_RACE_CACHE": str(self.share / "cache")})
+        self.assertNotIn("STAGE_CAP_EXCEEDED", p.stdout)
+        self.assert_exit(p, "STAGE_OK")
+        self.assertRegex(p.stdout, r"is not reused: state=UNREACHABLE ")
+        self.assertEqual(len([c for c in self.submissions() if "job=playback-attr-3-cuda-stage-" in c]), 1, self.submissions())
 
     def test_the_shared_soundness_read_takes_every_claim_shape_the_leg_takes(self) -> None:
         # A1 siblings (Invoke-VenueLeaseBatch.ps1 plan preflight and post-claim guard take the same read): a one-element array claim is the leg's digest

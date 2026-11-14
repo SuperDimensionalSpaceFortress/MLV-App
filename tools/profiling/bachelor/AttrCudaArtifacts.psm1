@@ -412,6 +412,41 @@ function Assert-AttrCudaBuildManifest {
     $manifest
 }
 
+function Get-AttrCudaBuildManifestClaimSha256 {
+    <#
+    .SYNOPSIS
+    The digest a parsed build.json claims for one cached artifact (packageZip | exe | dll), or ''
+    when the claim is not of the one accepted shape.
+    .DESCRIPTION
+    VENUE-STAGE-SAME-SHA-RESTAGE-GUARD-1 r3 (adversary A1 on ce5a0380): the ONE claim-shape
+    predicate. The accepted shape is strict: the -Key property holds ONE object (or a JSON array
+    of exactly one object, the shape r2 admitted), and that object's sha256 is a scalar string of
+    64 hex. Anything else is '' -- a digest held in an array ([["<hex>"]] or ["<hex>"]), an array
+    of two claims, a number, a missing claim. Member access ($m.exe.sha256) let PowerShell's
+    member enumeration unwrap a nested [["<hex>"]] into a digest for the leg job while the stage
+    job's host guard refused it, so the guard replaced a build the leg ran.
+    Every reader of the claim calls this text: the leg job ($manifestChecks) and the
+    reference-frame runner job, the stage job's generator, binding and host guard (all embedded
+    verbatim), and VenueChain.psm1 Get-VenueStagedBuildManifest, whose share read runs this same
+    text (the nightly's reuse decision and the lease batch's plan and post-claim guards take
+    that read). One text, so one accept-set.
+    #>
+    param($Manifest, [string]$Key)
+
+    if ($null -eq $Manifest -or $Manifest -isnot [System.Management.Automation.PSCustomObject]) { return '' }
+    $property = $Manifest.PSObject.Properties[$Key]
+    if ($null -eq $property) { return '' }
+    $claim = $property.Value
+    if ($claim -is [array]) {
+        if ($claim.Count -ne 1) { return '' }
+        $claim = $claim[0]
+    }
+    if ($null -eq $claim -or $claim -isnot [System.Management.Automation.PSCustomObject]) { return '' }
+    $digest = $claim.PSObject.Properties['sha256']
+    if ($null -eq $digest -or $digest.Value -isnot [string] -or $digest.Value -notmatch '^[0-9a-fA-F]{64}\z') { return '' }
+    $digest.Value.ToLowerInvariant()
+}
+
 function Get-AttrCudaGitBlobHashFromBytes {
     <#
     .SYNOPSIS
@@ -7763,6 +7798,7 @@ Export-ModuleMember -Function `
     Assert-AttrCudaSafeArtifactName, `
     Assert-AttrCudaDirectChild, `
     Assert-AttrCudaBuildManifest, `
+    Get-AttrCudaBuildManifestClaimSha256, `
     Assert-AttrCudaFixtureCommittedBytes, `
     Resolve-AttrCudaCommittedBlobId, `
     Save-AttrCudaCommittedBlobBytes, `
