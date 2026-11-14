@@ -83,7 +83,9 @@ param(
     [string]$ReceiptFile = '',
     # Total wall-clock cap for everything after the plan. The default fits a cold night: a DLL-pair compile on Ultra-Magnus, a build-guarded assemble and two stages.
     [ValidateRange(10, 28800)][int]$MaxTotalSec = 7200,
-    [ValidateRange(1, 300)][int]$ProbeTimeoutSec = 30,
+    # r4 fix iteration (adversary pass 7 A2 on 24f85549): at least 5 s. The soundness read (Read-StagedSoundness) needs the manifest read PLUS -ArtifactMinSec (1 s)
+    # left to start hashing the artifacts inside one probe; at 1 s a healthy staged build was SHARE_UNREACHABLE on every run.
+    [ValidateRange(5, 300)][int]$ProbeTimeoutSec = 30,
     [switch]$WhatIf,
     [string]$UmRunScript = '',
     [string]$DllJobScript = '',
@@ -100,8 +102,8 @@ param(
     # Test-only (LEASE-NOT-AFTER-SUBMITTER-DEADLINE-TIMING-1): sleeps this long between each submission's remaining-budget sample and its not-after bound,
     # a scheduling delay test_venue_stage_nightly.py injects to prove the bound never passes the deadline. Production passes none.
     [ValidateRange(0, 60000)][int]$TestNotAfterSampleDelayMs = 0,
-    # Test-only (VENUE-STAGE-SAME-SHA-RESTAGE-GUARD-1 r2): the pre-submission soundness read blocks its worker this long first, as a read stuck on a dead SMB
-    # host does (Get-VenueStagedBuildManifest -TestReadDelayMs). Production passes none.
+    # Test-only (VENUE-STAGE-SAME-SHA-RESTAGE-GUARD-1 r2): the call's first soundness read (r4: step 4's when a build.json is there, else step 8's) blocks its
+    # worker this long first, as a read stuck on a dead SMB host does (Get-VenueStagedBuildManifest -TestReadDelayMs). Production passes none.
     [ValidateRange(0, 600000)][int]$TestSoundnessReadDelayMs = 0
 )
 $ErrorActionPreference = 'Stop'
@@ -137,6 +139,7 @@ $script:Row = [ordered]@{
     cFreeGiB = [ordered]@{ start = $null; end = $null }; commitGiB = $null; buildDir = $null; detail = $null; reservationId = $null; reconciled = @()
 }
 $script:WriteRow = $false
+$script:SoundnessReads = 0
 $script:Mutex = $null
 $script:ReservationId = $null
 
@@ -261,7 +264,10 @@ function Read-StagedSoundness([string]$When) {
     # probe here: r2 (A3 on 90b1c58e) by min(-ProbeTimeoutSec, what is left of -MaxTotalSec). r3 (adversary A2 on ce5a0380): STAGE_CAP_EXCEEDED only when the cap
     # really ran out during the read (under the 1 s Get-ProbeSec needs for any read); a read that failed with time left is an UNREACHABLE answer the caller types.
     $soundSec = Get-ProbeSec "the soundness of the staged build of $commit"
-    $r = try { Get-VenueStagedBuildManifest -AgentShare $share -SourceCommit $commit -VerifyArtifacts -TimeoutSec $soundSec -TestReadDelayMs $TestSoundnessReadDelayMs } catch { [pscustomobject]@{ state = 'UNREACHABLE'; error = ($_.Exception.Message -replace '\s+', ' ') } }
+    # the test-only -TestSoundnessReadDelayMs stalls the call's FIRST soundness read only (step 4's when a build.json is there, else step 8's), never the final verify's
+    $script:SoundnessReads++
+    $delayMs = $(if ($script:SoundnessReads -eq 1) { $TestSoundnessReadDelayMs } else { 0 })
+    $r = try { Get-VenueStagedBuildManifest -AgentShare $share -SourceCommit $commit -VerifyArtifacts -TimeoutSec $soundSec -TestReadDelayMs $delayMs } catch { [pscustomobject]@{ state = 'UNREACHABLE'; error = ($_.Exception.Message -replace '\s+', ' ') } }
     $leftAfter = ($script:Deadline - [DateTime]::UtcNow).TotalSeconds
     if ($r.state -ceq 'UNREACHABLE' -and $leftAfter -lt 1.0) { Stop-Nightly 'STAGE_CAP_EXCEEDED' "the soundness read of the staged build of $commit $When got the rest of the $MaxTotalSec s cap ($([Math]::Round($soundSec, 2)) s) and the cap ran out with no answer ($([Math]::Floor([Math]::Max(0.0, $leftAfter) * 100.0) / 100.0) s left): $($r.error); nothing was submitted" }
     $r
@@ -750,6 +756,14 @@ $script:Row.timings.runnerSec = [math]::Round(([DateTime]::UtcNow - $t0).TotalSe
 $final = Read-Share $cacheBuildJson $HashByName @($cacheBuildJson)
 if (-not $final.present -or $final.hash -cne $expected) {
     Stop-Nightly 'STAGE_VERIFY_MISMATCH' "the final by-name read of $cacheBuildJson hashes $(if ($final.present) { $final.hash } else { 'MISSING' }), not $expected; never recorded as staged"
+}
+# r4 fix iteration (adversary pass 7 A1 on 24f85549): the bytes are the expected ones, and they must also be a build a leg runs. A hash-only verify recorded
+# STAGE_OK for an unsound build that every reuse read had refused (the local build held the same unsound manifest, and the spent default JobId's
+# "cache holds the expected hash" fallback skipped the submission). STAGE_OK and STAGE_SKIP_ALREADY are recorded only for a SOUND staged build.
+$finalSound = Read-StagedSoundness 'at the final verify'
+if ($finalSound.state -ceq 'UNREACHABLE') { Stop-Nightly 'SHARE_UNREACHABLE' "the soundness read of the staged build of $commit did not answer at the final verify: $($finalSound.error); not recorded as staged" }
+if (-not (Test-StagedSound $finalSound $final.hash)) {
+    Stop-Nightly 'STAGE_VERIFY_MISMATCH' "the $Venue cache holds the expected $cacheBuildJson ($($final.hash)) but it is not a sound staged build ($(Format-StagedSoundness $finalSound)); never recorded as staged (the hub re-assembles)"
 }
 # r2 (adversary A3 on 90b1c58e): -MaxTotalSec is the cap on the whole call, STAGE_OK included: an outcome reached after it is never reported as STAGE_OK.
 $overBy = ([DateTime]::UtcNow - $script:Deadline).TotalSeconds
