@@ -783,8 +783,6 @@ if (-not $isFixtureRehearsal) {
 Import-Module (Join-Path $PSScriptRoot 'AttrCudaArtifacts.psm1') -Force
 $embeddedFunctions = Get-AttrCudaEmbeddedFunctionSource -Name @(
     'Assert-AttrCudaBuildManifest',
-    # VENUE-STAGE-SAME-SHA-RESTAGE-GUARD-1 r3: the ONE claim-shape predicate every reader of a cached build's artifact claim calls.
-    'Get-AttrCudaBuildManifestClaimSha256',
     'Resolve-AttrCudaSmokeRunLog',
     'Get-AttrCudaLastEligibilityLine',
     'Get-AttrCudaEligibilityVerdict',
@@ -1033,6 +1031,11 @@ $embeddedFunctions = $embeddedFunctions + "`r`n# PRESENTMON-BACHELOR-CUDA-INTERN
     'Get-AttrCudaSwapWindowRecord',
     'Get-AttrCudaPlaybackTemporalCoverage'
 )) +"`r`n# PRESENTMON-BACHELOR-CUDA-INTERNAL-GAP-1 <<<"
+# VENUE-STAGE-SAME-SHA-RESTAGE-GUARD-1 r3: the ONE claim-shape predicate every reader of a cached build's artifact claim calls ($manifestChecks below),
+# spliced inside its own sentinel brackets for the same byte-identity reason as the splices above (r5: CI run 43580040634).
+$embeddedFunctions = $embeddedFunctions + "`r`n# VENUE-STAGE-CLAIM-SHAPE-1 >>>`r`n" + (Get-AttrCudaEmbeddedFunctionSource -Name @(
+    'Get-AttrCudaBuildManifestClaimSha256'
+)) +"`r`n# VENUE-STAGE-CLAIM-SHAPE-1 <<<"
 $smokeRunnerClosureDigest = Get-AttrCudaClosureDigestHex -Closure $smokeRunnerClosure
 if ($smokeRunnerClosureDigest -notmatch '^[0-9a-f]{64}$') {
     throw "ATTRCUDA_BLOB_SHA_MALFORMED smoke-runner closure digest is not 64 lowercase hex: '$smokeRunnerClosureDigest'"
@@ -2579,6 +2582,7 @@ $buildManifest = Assert-AttrCudaBuildManifest -Path $buildManifestPath -Expected
 # manifest, whose bytes are now authenticated above.
 $pendingSymbolPresence = [bool]$buildManifest.pendingSymbolPresence
 $dllPairManifestSha256 = ([string]$buildManifest.dllPairManifestSha256).ToLowerInvariant()
+# VENUE-STAGE-CLAIM-SHAPE-1 >>>
 # VENUE-STAGE-SAME-SHA-RESTAGE-GUARD-1 r3 (adversary A1 on ce5a0380): each digest is read through the ONE claim-shape predicate (embedded
 # above), never by member access: member enumeration turned a nested [["<hex>"]] into a digest here while the stage job's guard refused it.
 # A claim of any other shape is '' and refused below as a missing sha256.
@@ -2587,6 +2591,7 @@ $manifestChecks = @(
     @{ label = 'exe'; path = (Join-Path $Cache $ExeName); expectedSha = (Get-AttrCudaBuildManifestClaimSha256 $buildManifest 'exe') },
     @{ label = 'dll'; path = (Join-Path $Cache $ReconName); expectedSha = (Get-AttrCudaBuildManifestClaimSha256 $buildManifest 'dll') }
 )
+# VENUE-STAGE-CLAIM-SHAPE-1 <<<
 # BACHELOR-OWNER-CLIP-STAGE-STALL-1: each cached artifact is hashed ONCE per job. The digest that
 # just matched the authenticated manifest is kept and reused below as the expected value for the
 # deployed copies -- the deployed-copy comparison further down still catches any change since.

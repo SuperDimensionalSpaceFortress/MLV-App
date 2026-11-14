@@ -30,7 +30,7 @@ import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from tools.repo_hygiene.venue_fixture_modules import copy_with_siblings, sibling_modules
+from tools.repo_hygiene.venue_fixture_modules import copy_with_siblings, cross_tree_modules, sibling_modules
 
 ROOT = Path(__file__).resolve().parents[2]
 DV = ROOT / "tools" / "profiling" / "dual-venue"
@@ -215,11 +215,46 @@ class VenueFixtureModuleCopyTests(unittest.TestCase):
 
     def test_ci_b1_a_scratch_copy_with_its_siblings_imports_and_resolves_them_from_the_scratch_dir(self) -> None:
         with tempfile.TemporaryDirectory(prefix="ci-b1-") as tmp:
-            folder = Path(os.path.realpath(tmp))
+            # a dir of its own: copy_with_siblings also writes the neighbouring-folder modules beside it (..\bachelor)
+            folder = Path(os.path.realpath(tmp)) / "dual-venue"
             copy_with_siblings(MODULE, folder)
             r = self.import_copy(folder)
             self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
             self.assertEqual(Path(r.stdout.strip()), folder / "VenueRawJson.psm1")
+
+    def test_r5_ci_the_derived_cross_tree_set_names_the_claim_shape_predicates_module(self) -> None:
+        # VENUE-STAGE-SAME-SHA-RESTAGE-GUARD-1 r5 (hosted Tests run 43580040634): VenueChain.psm1 reads ..\bachelor\AttrCudaArtifacts.psm1 as text (Get-VenueClaimShapeSource)
+        self.assertIn("..\\bachelor\\AttrCudaArtifacts.psm1", cross_tree_modules(MODULE))
+
+    def test_r5_ci_a_scratch_copy_reads_the_claim_shape_predicate_from_its_own_scratch_tree(self) -> None:
+        # the staged-manifest read takes the predicate's text from <module dir>\..\bachelor; a scratch copy must find the scratch tree's copy, never the repo's
+        with tempfile.TemporaryDirectory(prefix="ci-r5-") as tmp:
+            folder = Path(os.path.realpath(tmp)) / "dual-venue"
+            copy_with_siblings(MODULE, folder)
+            scratch = folder.parent / "bachelor" / "AttrCudaArtifacts.psm1"
+            self.assertTrue(scratch.is_file(), "the neighbouring-folder module was not copied beside the scratch dir")
+            marker = "# r5-ci scratch marker"
+            scratch.write_text(scratch.read_text(encoding="utf-8").replace("function Get-AttrCudaBuildManifestClaimSha256 {", "function Get-AttrCudaBuildManifestClaimSha256 {\n" + marker, 1), encoding="utf-8")
+            script = (f"$ErrorActionPreference = 'Stop'; Import-Module '{folder / MODULE.name}' -Force -DisableNameChecking\n"
+                      "& (Get-Module VenueChain) { Get-VenueClaimShapeSource }")
+            r = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, timeout=120, stdin=subprocess.DEVNULL)
+            self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+            self.assertIn(marker, r.stdout, "the scratch module read the predicate from somewhere other than its own scratch tree")
+
+    def test_r5_ci_control_a_scratch_copy_without_the_neighbouring_module_is_a_typed_refusal(self) -> None:
+        # the failure the hosted run hit, now typed: with no ..\bachelor beside the copy, the predicate read says which file it could not read
+        with tempfile.TemporaryDirectory(prefix="ci-r5-") as tmp:
+            folder = Path(os.path.realpath(tmp)) / "dual-venue"
+            folder.mkdir()
+            for sibling in sibling_modules(MODULE):
+                shutil.copy2(sibling, folder / sibling.name)
+            shutil.copy2(MODULE, folder / MODULE.name)
+            script = (f"$ErrorActionPreference = 'Stop'; Import-Module '{folder / MODULE.name}' -Force -DisableNameChecking\n"
+                      "& (Get-Module VenueChain) { Get-VenueClaimShapeSource }")
+            r = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, timeout=120, stdin=subprocess.DEVNULL)
+            self.assertNotEqual(r.returncode, 0, r.stdout + r.stderr)
+            self.assertIn("VENUE_CLAIM_PREDICATE_UNREADABLE", r.stdout + r.stderr)
+            self.assertIn("AttrCudaArtifacts.psm1", r.stdout + r.stderr)
 
     def test_ci_b1_control_a_scratch_copy_without_its_siblings_stops_on_the_import(self) -> None:
         # the failure the hosted run hit: with only the module copied, the import stops before any mutation under test

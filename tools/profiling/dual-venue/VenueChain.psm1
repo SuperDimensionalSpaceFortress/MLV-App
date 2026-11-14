@@ -603,7 +603,9 @@ function Get-VenueClaimShapeSource {
     # the same contract Get-AttrCudaEmbeddedFunctionSource embeds it into the leg and stage jobs with ("function <Name> {" ... "}" at column 0). Read as text, never imported:
     # this module imports nothing from the bachelor tree. A missing function is an error, never a silently different predicate.
     if ($null -eq $script:VenueClaimShapeSource) {
-        $src = [IO.File]::ReadAllText((Join-Path $PSScriptRoot '..\bachelor\AttrCudaArtifacts.psm1'))
+        # r5 (CI run 43580040634): a module that will not read is a typed refusal naming the file, never a bare ReadAllText exception
+        $srcPath = Join-Path $PSScriptRoot '..\bachelor\AttrCudaArtifacts.psm1'
+        $src = try { [IO.File]::ReadAllText($srcPath) } catch { throw "VENUE_CLAIM_PREDICATE_UNREADABLE the claim-shape predicate's module $srcPath could not be read: $($_.Exception.Message -replace '\s+', ' ')" }
         $mm = [regex]::Match($src, '(?ms)^function\s+Get-AttrCudaBuildManifestClaimSha256\s*\{.*?^\}')
         if (-not $mm.Success) { throw 'VENUE_CLAIM_PREDICATE_MISSING AttrCudaArtifacts.psm1 defines no extractable Get-AttrCudaBuildManifestClaimSha256' }
         $script:VenueClaimShapeSource = $mm.Value
