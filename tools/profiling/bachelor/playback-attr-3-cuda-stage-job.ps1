@@ -180,7 +180,8 @@ $template = @'
 # -TestHoldAfterPartialsPath / -TestLockWaitMarkerPath (VENUE-STAGE-SAME-SHA-RESTAGE-GUARD-1 r3): test-only seams for the two-stager
 # interleaving test (test_playback_attr_3_cuda_behaviour.py). The agent runs a job with no arguments, so production passes neither.
 # -TestHoldBeforeRetirePath (r9, Grok G8 on #814): the same hold between the never-replace guard's read of an unsound staged manifest and its
-# retirement by content proof, so a test can put other bytes at the name meanwhile. Production passes none.
+# retirement by content proof (r9 fix iteration 3: before the other-commit re-read too), so a test can put other bytes at the name meanwhile.
+# Production passes none.
 param([switch]$VerifyOnly, [string]$TestHoldAfterPartialsPath = '', [string]$TestLockWaitMarkerPath = '', [string]$TestHoldBeforeRetirePath = '')
 
 $ErrorActionPreference = 'Stop'
@@ -414,11 +415,24 @@ if (Test-Path -LiteralPath $manifestCachePath) {
         Write-Output "STAGE_REFUSED_STAGED_UNREADABLE sha=$($SourceCommit.Substring(0, 12)) incoming=$($ManifestSha256.Substring(0, 8)) $($_.Exception.Message -replace '\s+', ' ')"
         Complete-Failed 7 'stagedBuildGuard' "the staged build of $SourceCommit could not be read, so it is not replaced: $($_.Exception.Message)"
     }
+    if ($unsound) { Wait-AttrCudaTestHold -Path $TestHoldBeforeRetirePath }
     if ($unsound -match '^ATTRCUDA_BUILD_MANIFEST_COMMIT_MISMATCH ') {
         # r9 fix iteration (adversary A1 on 9825bfd9): the cache name is the sha's first 12 hex, so a manifest of ANOTHER commit with the same 12 can stand at
         # it, sound for that commit and maybe pinned by its lease batch. It is not this commit's unsound build: never replaced, nothing is staged. (Any other
         # sourceCommit -- not a sha, or another prefix -- is this name's own corrupt build and is replaced as before.)
-        $cachedCommit = try { [string](([IO.File]::ReadAllText($manifestCachePath) | ConvertFrom-Json).sourceCommit) } catch { '' }
+        # r9 fix iteration 3 (adversary A1 on d7d19398): the commit is read from the bytes that were judged (hashed to the judged sha256 before and after the read),
+        # and a read that fails or finds other bytes fails closed (STAGE_REFUSED_STAGED_UNREADABLE); it was '' there, which let another commit's held manifest be replaced.
+        $cachedCommit = ''
+        try {
+            $before = Get-ShaLower $manifestCachePath
+            $cachedText = [IO.File]::ReadAllText($manifestCachePath)
+            $after = Get-ShaLower $manifestCachePath
+            if ($before -cne $stagedSha -or $after -cne $stagedSha) { throw "the staged manifest hashes $before / $after now, not the $stagedSha judged" }
+            $cachedCommit = [string](($cachedText | ConvertFrom-Json).sourceCommit)
+        } catch {
+            Write-Output "STAGE_REFUSED_STAGED_UNREADABLE sha=$($SourceCommit.Substring(0, 12)) incoming=$($ManifestSha256.Substring(0, 8)) $($_.Exception.Message -replace '\s+', ' ')"
+            Complete-Failed 7 'stagedBuildGuard' "the staged build of $SourceCommit (COMMIT_MISMATCH) could not be read again to name its commit, so it is not replaced: $($_.Exception.Message)"
+        }
         if ($cachedCommit -match '^[0-9a-fA-F]{40}\z' -and $cachedCommit.Substring(0, 12) -ieq $SourceCommit.Substring(0, 12) -and $cachedCommit -ine $SourceCommit) {
             Write-Output "STAGE_REFUSED_STAGED_OTHER_COMMIT sha=$($SourceCommit.Substring(0, 12)) staged=$($stagedSha.Substring(0, 8)) stagedCommit=$cachedCommit incoming=$($ManifestSha256.Substring(0, 8))"
             Complete-Failed 7 'stagedBuildGuard' "the cache name of $SourceCommit holds the build of $cachedCommit (the same 12-hex prefix); another commit's build is never replaced, so nothing is staged"
@@ -429,7 +443,6 @@ if (Test-Path -LiteralPath $manifestCachePath) {
         # r8 (adversary A1 on 0c0eafd7): the unsound manifest leaves the cache name BEFORE any artifact is renamed in. Left standing, a reader that hashed the repaired
         # artifacts against it found it sound and pinned it, and the publish below then replaced it. Removed by content proof only (the bytes judged unsound);
         # anything else at the name is left and nothing is staged.
-        Wait-AttrCudaTestHold -Path $TestHoldBeforeRetirePath
         if (-not (Remove-AttrCudaInputFileByContent -TrustedRoot $AgentRoot -Path $manifestCachePath -ExpectedSha256 $stagedSha)) {
             Write-Output "STAGE_REFUSED_STAGED_UNRETIRED sha=$($SourceCommit.Substring(0, 12)) staged=$($stagedSha.Substring(0, 8)) incoming=$($ManifestSha256.Substring(0, 8))"
             Complete-Failed 7 'stagedBuildGuard' "the unsound staged manifest of $SourceCommit could not be removed by content proof before the repair, so nothing is staged"

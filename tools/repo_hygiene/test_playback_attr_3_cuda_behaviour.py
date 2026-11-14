@@ -1275,6 +1275,56 @@ class StagedBuildNeverReplacedTests(_PwshCase):
         self.assertIn("RESULT=STAGE_FAILED STEP=stagedBuildGuard EXIT=7", second.stdout)
         self.assertEqual(self.snapshot(), before, "another commit's staged build was rewritten")
 
+    def test_r9_another_commits_build_that_cannot_be_read_again_fails_closed(self) -> None:
+        # r9 fix iteration 3 (adversary A1 on d7d19398): after the guard judged the resident manifest COMMIT_MISMATCH, its commit is read again to tell another
+        # commit's build from this name's corrupt one. That re-read failing (held FileShare.None) or finding other bytes made the commit '' and the build was
+        # replaced. Both now fail closed: STAGE_REFUSED_STAGED_UNREADABLE, exit 7, the resident manifest left as it is.
+        if os.name != "nt":
+            self.skipTest("the held case takes a FileShare.None handle through kernel32")
+        import ctypes
+        from ctypes import wintypes
+        k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        k32.CreateFileW.restype = wintypes.HANDLE
+        k32.CreateFileW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, wintypes.LPVOID, wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE]
+        other = SHA_FIXTURE[:12] + "1" * 28
+        first = self.stage("ad005766", suffix="resident")
+        self.assertEqual(first.returncode, 0, f"{first.stdout}\n{first.stderr}")
+        m = json.loads((self.cache / self.manifest_name).read_text(encoding="utf-8"))
+        m["sourceCommit"] = other
+        resident = json.dumps(m, indent=2).encode()
+        for case in ("held", "changed"):
+            with self.subTest(case=case):
+                (self.cache / self.manifest_name).write_bytes(resident)
+                job = self.emit("f8fc75a2", suffix=f"reread{case}")
+                hold = self.tmp / f"hold-reread-{case}"
+                cmd = [PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", str(job), "-TestHoldBeforeRetirePath", str(hold)]
+                a = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                h = None
+                expect = resident
+                try:
+                    t0 = time.monotonic()
+                    while not Path(f"{hold}.reached").exists() and a.poll() is None and time.monotonic() - t0 < 90:
+                        time.sleep(0.1)
+                    self.assertTrue(Path(f"{hold}.reached").exists(), "the stager never reached the re-read")
+                    if case == "held":
+                        h = k32.CreateFileW(str(self.cache / self.manifest_name), 0x80000000, 0, None, 3, 0x80, None)
+                        self.assertNotEqual(h, wintypes.HANDLE(-1).value, ctypes.get_last_error())
+                    else:
+                        expect = resident + b"\n"
+                        (self.cache / self.manifest_name).write_bytes(expect)
+                    hold.write_text("", encoding="utf-8")
+                    out, err = a.communicate(timeout=180)
+                finally:
+                    if h is not None:
+                        k32.CloseHandle(h)
+                    hold.write_text("", encoding="utf-8")
+                    if a.poll() is None:
+                        a.kill()
+                self.assertEqual(a.returncode, 7, f"{out}\n{err}")
+                self.assertRegex(out, rf"(?m)^STAGE_REFUSED_STAGED_UNREADABLE sha={SHA_FIXTURE[:12]} ")
+                self.assertIn("RESULT=STAGE_FAILED STEP=stagedBuildGuard EXIT=7", out)
+                self.assertEqual((self.cache / self.manifest_name).read_bytes(), expect, "another commit's build was replaced")
+
     def test_r9_the_stage_lock_is_one_for_every_sha_that_shares_the_cache_names(self) -> None:
         # r9 fix iteration (adversary A1 on 9825bfd9): the lock was keyed on the full sha, so two commits with the same 12 hex (the same cache files) never
         # contended; it is keyed on the 12 hex the cache names carry. Another 12 is another lock.
