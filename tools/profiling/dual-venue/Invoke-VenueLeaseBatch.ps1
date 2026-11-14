@@ -2255,7 +2255,12 @@ while ($pending.Count -gt 0 -and $null -eq $stopReason) {
             $b.endReason = 'AGENT_NOT_BATCH_CAPABLE'; $b.endDetail = "the open's result carries a $($openLb.type), not one admission.leaseBatch object: no lease or idle bound is named for token ${token}, so no probe or leg runs (the lease the agent may hold under the token is closed and charged)"
             Set-Stop 'AGENT_NOT_BATCH_CAPABLE' 10; LogBest "AGENT_NOT_BATCH_CAPABLE batch=$batchNo token=$token shape=$($openLb.type) (no probe or leg runs; the close releases the token)"
         } elseif ($openLb.state -cne 'OBJECT' -or -not [string]::Equals([string]$openLb.value.token, $token, [StringComparison]::Ordinal) -or -not $openLb.value.leaseId) {
-            $b.endReason = 'AGENT_NOT_BATCH_CAPABLE'; $b.endDetail = "admission.mode=$($adm.mode) gate=$($adm.gate) (no admission.leaseBatch for token ${token}: the lease-batch agent is not deployed)"
+            # r5 pass 2 (adversary r5 A1): a leaseBatch object that IS there but names no usable lease for this token (VenueRawJson clears every identity of a reading that holds a
+            # non-string one, leaseId 1 for example; a foreign or blank token) may still be a lease the agent took: charged open-lease-unnamed, as the malformed shape is. Only an
+            # ABSENT leaseBatch (an agent with no lease batches, which parks no lease) charges nothing.
+            if ($openLb.state -ceq 'OBJECT') { $openLeaseUnnamed = $true }
+            $b.endReason = 'AGENT_NOT_BATCH_CAPABLE'; $b.endDetail = $(if ($openLb.state -ceq 'OBJECT') { "admission.mode=$($adm.mode) gate=$($adm.gate) (admission.leaseBatch names no usable lease for token ${token}: token=$(if ($null -eq $openLb.value.token) { 'none' } else { "'$($openLb.value.token)'" }) leaseId=$(if ($null -eq $openLb.value.leaseId) { 'none' } else { "'$($openLb.value.leaseId)'" }); no probe or leg runs, and the lease the agent may hold is closed and charged)" }
+                else { "admission.mode=$($adm.mode) gate=$($adm.gate) (no admission.leaseBatch for token ${token}: the lease-batch agent is not deployed)" })
             Set-Stop 'AGENT_NOT_BATCH_CAPABLE' 10
         } elseif ($openHit) {
             $hr = Get-HitRefusal $openHit
@@ -2446,6 +2451,9 @@ while ($pending.Count -gt 0 -and $null -eq $stopReason) {
                     # now and the sleep is cut to what is left of the allowance (none at all when it is gone); the next iteration then re-checks the deadline before it dispatches.
                     $th.reprobePending = $true
                     $sleep = (Get-VenueThermalProbeBudget -CapSec $ThermalWaitCapSec -DispatchGraceSec $ThermalDispatchGraceSec -ElapsedSec (Get-ThermalElapsedSec $th) -SlowestReprobeSec ([int]$th.slowProbeSec) -WantSleepSec $sleep).sleepSec
+                    # r5 pass 2 (adversary r5 A2): the poll sleep runs no agent job, so it never runs past what is left of the agent's idle allowance (a -ThermalPollSec above it let the
+                    # agent release the lease under every hot wait: idle ends, then LEASE_IDLE_CHURN, before the thermal skip and re-queue). The re-probe, a measuring one, restarts it.
+                    $sleep = [int][Math]::Min([long]$sleep, [Math]::Max(0L, [long](Get-IdleAllowanceSec)))
                     if ($sleep -gt 0) { Start-Sleep -Seconds $sleep }
                     continue
                 }
@@ -2609,7 +2617,14 @@ while ($pending.Count -gt 0 -and $null -eq $stopReason) {
                 LogBest "LEG $($leg.name) RAN batch=$batchNo exit=$legCode outcome=$outcome class=$class counted=$counted quietMean=$(Format-Mean $q.mean) preLoadMean=$(Format-Mean $preLoad) legSec=$legSec receipt=$receipt $leaseWhy$(if ($legFF) { ' foreignFloor=1' })"
                 if ($leaseClass -ceq 'LEASE_IDLE_ENDED') { $b.endDetail = $leaseWhy; Set-BatchLeaseIdleEnded $b $legIe $leg.name "before leg $($leg.name)'s job was admitted: it ran off the lease, uncounted" 'a leg ran off the lease: uncounted' -AppendDetail; break }
                 if ($leaseClass) { $b.endReason = $leaseClass; $b.endDetail = $leaseWhy; break }
-                if ($pending.Count -gt 0 -and $CooldownSec -gt 0) { L "COOLDOWN ${CooldownSec} s (inside the lease)"; Start-Sleep -Seconds $CooldownSec }
+                if ($pending.Count -gt 0 -and $CooldownSec -gt 0) {
+                    # r5 pass 2 (adversary r5 A2 sibling): the cooldown sleeps inside the lease with no agent job, so it never runs past what is left of the agent's idle allowance (the
+                    # leg child's own time after its job ended is already spent from it, Get-AgentJobEndTs). A cut is logged; the next probe still measures quiet and heat first.
+                    $cdSec = [int][Math]::Min([long]$CooldownSec, [Math]::Max(0L, [long](Get-IdleAllowanceSec)))
+                    L "COOLDOWN ${CooldownSec} s (inside the lease)$(if ($cdSec -lt $CooldownSec) { " cut to ${cdSec} s by the agent's idle allowance" })"
+                    $cdSec = [int][Math]::Min([long]$cdSec, [Math]::Max(0L, [long](Get-IdleAllowanceSec)))   # read again after the log write, which may have stalled
+                    if ($cdSec -gt 0) { Start-Sleep -Seconds $cdSec }
+                }
             }
             if ($null -eq $b.endReason -and $pending.Count -eq 0) { $b.endReason = 'ALL_LEGS_DONE' }
             # r3 adversary pass 2 A2: a room-short end can come before the next probe's receipt read (a busy sleep that woke past the idle release). If the agent released this
@@ -2679,7 +2694,7 @@ while ($pending.Count -gt 0 -and $null -eq $stopReason) {
             # taken a lease this run cannot name: charged from the open's submit to the close with no lease id, never read as CANCELLED or ENDED from inside an array.
             $cLb = Get-AdmissionLeaseBatch $ca
             $cState = $(if ($cr.state -cne 'FOUND') { 'UNRECONCILED' } elseif ($cLb.state -ceq 'MALFORMED') { 'RAN_LEASE_UNNAMED' } elseif ($null -ne $ca -and [string]$ca.label -ceq 'cancelled-in-gate') { 'CANCELLED' }
-                elseif ($cLb.state -ceq 'OBJECT' -and $cLb.value.leaseId) { 'RAN_BEFORE_CANCEL' } else { 'ENDED' })
+                elseif ($cLb.state -ceq 'OBJECT' -and $cLb.value.leaseId) { 'RAN_BEFORE_CANCEL' } elseif ($cLb.state -ceq 'OBJECT') { 'RAN_LEASE_UNNAMED' } else { 'ENDED' })   # r5 pass 2 (adversary r5 A1): a leaseBatch with no usable lease id
             if ($cState -ceq 'RAN_BEFORE_CANCEL' -and -not $b.leaseId) { $b.leaseId = [string]$cLb.value.leaseId; $leaseStartUtc = $openSubmitUtc }
             if ($cState -ceq 'RAN_LEASE_UNNAMED') { $openLeaseUnnamed = $true }
             $b.openCancel = [ordered]@{ requested = $cx.state; state = $cState; resultState = $cr.state; resultLabel = $(if ($null -ne $ca) { [string]$ca.label } else { $null }); waitedSec = [int]([DateTime]::UtcNow - $tc).TotalSeconds; error = $(if ($cx.error) { $cx.error } else { $cr.error }) }

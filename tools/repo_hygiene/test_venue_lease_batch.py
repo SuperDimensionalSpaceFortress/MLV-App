@@ -179,6 +179,8 @@ if ($JobId -like 'lease-batch-open-*') {
     $lid = "lease-$($n + 1)"
     # r13 (adversary r12 A1): FAKE_OPEN_LEASE_ID answers with that exact lease id (a timestamp-shaped one, which ConvertFrom-Json turns into a DateTime)
     if ($env:FAKE_OPEN_LEASE_ID) { $lid = $env:FAKE_OPEN_LEASE_ID }
+    # r5 pass 2 (adversary r5 A1): FAKE_OPEN_LEASE_ID_NUM answers with a JSON NUMBER lease id (VenueRawJson then clears every identity in the reading)
+    if ($env:FAKE_OPEN_LEASE_ID_NUM) { $lid = [int]$env:FAKE_OPEN_LEASE_ID_NUM }
     $adm = [ordered]@{ gate = 'fake'; mode = 'lease'; label = 'clear'; heavySlotHeld = "1:$(1001 + $n)"; slot = 'C:\t\.heavy-slots\1'; leaseMinutes = 45; waitedSec = 7; leaseRequests = 2
         leaseRefusals = @([ordered]@{ reason = 'refused'; rc = 75; why = 'quiet lease cooldown' }) }
     # r12 (adversary A2): FAKE_OPEN_TOKEN_SHY=1 answers with the batch's token plus a soft hyphen (U+00AD): culture-aware equality says it is the same token, ordinal says it is not
@@ -1103,6 +1105,39 @@ class VenueLeaseBatchRunnerTests(unittest.TestCase):
                 res = batch_result(r.stdout)
                 self.assertEqual((res["stopReason"], res["notRun"]), ("AGENT_NOT_BATCH_CAPABLE", 2))
 
+    def test_lease_batch_idle_end_r5_adv_p2_a1_a_lease_batch_with_no_usable_identity_is_charged_unnamed(self) -> None:
+        # adversary-ff81d798.json A1: the open's result {"leaseBatch":{"token":..,"leaseId":1,..}} reaches the runner through the real um-run.ps1 reader, whose VenueRawJson clears
+        # every identity of a reading that holds a non-string one. The leaseBatch is still ONE object, so the r5 MALFORMED charge did not fire: AGENT_NOT_BATCH_CAPABLE with no
+        # ledger row for a lease the agent took. It is charged open-lease-unnamed now; only an ABSENT leaseBatch (the nobatch agent) charges nothing.
+        real = str(RUNNER.parent.parent / "um-run.ps1")
+        r = self.run_batch(self.specs[:2], FAKE_OPEN_LEASE_ID_NUM="1", FAKE_OPEN_VIA_REAL_UMRUN="1", FAKE_REAL_UMRUN=real)
+        self.assertEqual(r.returncode, 10, r.stdout + r.stderr)
+        [b] = self.batches()
+        self.assertEqual((b["endReason"], b["legsAttempted"], b["leaseId"]), ("AGENT_NOT_BATCH_CAPABLE", 0, None), b)
+        self.assertIn("names no usable lease for token", b["endDetail"])
+        self.assertEqual(self.kinds(), [f"OPEN:{b['token']}", f"CLOSE:{b['token']}"])
+        self.assertIsNotNone(b["ledger"], b)
+        self.assertEqual((b["ledger"]["basis"], b["ledger"]["leaseId"]), ("open-lease-unnamed", None), b["ledger"])
+        # control: an agent with no lease batches parks no lease, so nothing is charged
+        self.setUp()
+        r = self.run_batch(self.specs[:2], FAKE_OPEN_MODES="nobatch")
+        self.assertEqual(r.returncode, 10, r.stdout + r.stderr)
+        [b] = self.batches()
+        self.assertEqual((b["endReason"], b["ledger"]), ("AGENT_NOT_BATCH_CAPABLE", None), b)
+
+    def test_lease_batch_idle_end_r5_adv_p2_a2_the_in_lease_cooldown_never_sleeps_past_the_idle_allowance(self) -> None:
+        # adversary-ff81d798.json A2 sibling: the cooldown slept the full -CooldownSec after the leg child had already spent part of the allowance after its job ended. Agent
+        # bound 70, margin 60 (10 s), -CooldownSec 9 (accepted: under 10), the child works 6 s after its job: the cooldown is cut to at most about 4 s, and the cut is logged.
+        self._tree_with_agent_idle(b"70")
+        r = self.run_batch(self.specs[:2], "-ProbeMaxWaitSec", "600", "-CooldownSec", "9", FAKE_LEG_TAIL_SLEEP="6")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        log = (self.run_dir / "batch.log").read_text(encoding="utf-8")
+        m = re.search(r"COOLDOWN 9 s \(inside the lease\) cut to (\d+) s by the agent's idle allowance", log)
+        self.assertIsNotNone(m, [l for l in log.splitlines() if "COOLDOWN" in l])
+        self.assertLessEqual(int(m.group(1)), 4, m.group(0))
+        src = RUNNER.read_text(encoding="utf-8")
+        self.assertNotIn('Start-Sleep -Seconds $CooldownSec', src)
+
     def test_lease_batch_idle_end_r5_adv_a1_a_leg_whose_lease_batch_is_array_wrapped_is_not_on_the_lease(self) -> None:
         # the :2526 sibling: a leg result whose leaseBatch is [{.. this batch's lease ..}] gave jobLease through member enumeration, so the leg counted on the lease. It names no
         # lease now: not on this batch's lease (LEASE_LOST, never counted), as a leg on another lease is (the FAKE_LEG_LOSE case).
@@ -1119,10 +1154,13 @@ class VenueLeaseBatchRunnerTests(unittest.TestCase):
         # the :2646 sibling: the open's um-run failed after the agent ran it (its result landed by name), so the finally reconciles it. Its leaseBatch [{..}] read as
         # RAN_BEFORE_CANCEL with the lease id enumerated out of the array; it is RAN_LEASE_UNNAMED now, charged open to close with no lease id. Control: one object is still
         # RAN_BEFORE_CANCEL on its own lease.
-        for wrap, want_state, want_lease, want_basis in (("array", "RAN_LEASE_UNNAMED", None, "open-lease-unnamed"), ("", "RAN_BEFORE_CANCEL", "lease-1", "open-to-close")):
-            with self.subTest(wrap=wrap or "object"):
+        # r5 pass 2 (adversary r5 A1): a numeric lease id (VenueRawJson clears every identity of that reading) leaves an OBJECT with no lease id: RAN_LEASE_UNNAMED too, never ENDED
+        for shape, env, want_state, want_lease, want_basis in (("array", {"FAKE_OPEN_LB_WRAP": "array"}, "RAN_LEASE_UNNAMED", None, "open-lease-unnamed"),
+                                                               ("numericLeaseId", {"FAKE_OPEN_LEASE_ID_NUM": "1"}, "RAN_LEASE_UNNAMED", None, "open-lease-unnamed"),
+                                                               ("object", {}, "RAN_BEFORE_CANCEL", "lease-1", "open-to-close")):
+            with self.subTest(shape=shape):
                 self.setUp()
-                r = self.run_batch(self.specs[:1], "-CancelReconcileSec", "3", FAKE_OPEN_MODES="errlanded", **({"FAKE_OPEN_LB_WRAP": wrap} if wrap else {}))
+                r = self.run_batch(self.specs[:1], "-CancelReconcileSec", "3", FAKE_OPEN_MODES="errlanded", **env)
                 self.assertEqual(r.returncode, 9, r.stdout + r.stderr)
                 [b] = self.batches()
                 self.assertEqual((b["endReason"], b["openOutcome"], b["legsAttempted"]), ("OPEN_FAILED", "ERROR", 0), b)

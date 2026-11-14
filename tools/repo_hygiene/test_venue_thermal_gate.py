@@ -955,6 +955,25 @@ class ThermalGateRunnerTests(unittest.TestCase):
         self.assertEqual(self.log().count(" THERMAL_WAIT leg=01-fx-a-spec "), 2)
         self.assertIn("heat=hot (throttled 9/60, mean 70.0 C)", self.log())
 
+    def test_lease_batch_idle_end_r5_adv_p2_a2_the_thermal_poll_sleep_never_runs_past_the_idle_allowance(self) -> None:
+        # LEASE-BATCH-IDLE-END-UNSEEN-1 r5 pass 2 (adversary-ff81d798.json A2): the in-lease poll sleep was -ThermalPollSec, bounded by the thermal cap and the room only, so
+        # a poll longer than the agent's idle allowance let the agent release the lease under every hot wait. Agent bound 300 (the script default), -ProbeIdleMarginSec 290
+        # (a 10 s allowance), -ThermalPollSec 30: the re-probe follows the first hot reading within the allowance, not 30 s later.
+        r = self.run_batch([self.specs[0]], "-ThermalWaitCapSec", "120", "-ThermalPollSec", "30", "-ProbeIdleMarginSec", "290", FAKE_HEAT="9,0")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        [b] = self.batches()
+        self.assertEqual((b["legs"][0]["status"], b["thermalWaits"]), ("RAN", 1), b)
+        lines = self.log().splitlines()
+        at = [i for i, l in enumerate(lines) if " THERMAL_WAIT leg=01-fx-a-spec " in l]
+        self.assertEqual(len(at), 1, lines)
+        nxt = next(l for l in lines[at[0] + 1:] if " QUIET leg=01-fx-a-spec " in l)
+        from datetime import datetime
+
+        def ts(line: str) -> datetime:
+            return datetime.fromisoformat(line.split(" ", 1)[0].replace("Z", "+00:00"))
+        gap = (ts(nxt) - ts(lines[at[0]])).total_seconds()
+        self.assertLess(gap, 20, f"the poll sleep ran past the agent's idle allowance: {gap:.0f} s\n{lines[at[0]]}\n{nxt}")
+
     def test_cap_skip_requeues_the_hot_leg_and_runs_the_next_one_first(self) -> None:
         r = self.run_batch(self.specs[:2], "-ThermalWaitCapSec", "2", FAKE_HEAT="HOT_UNTIL_SKIP")
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
