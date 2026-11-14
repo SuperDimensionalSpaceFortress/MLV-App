@@ -15546,6 +15546,48 @@ class DueWakeDeliveryEvidenceTests(unittest.TestCase):
         v = self.verdict(cell, self.log(control))
         self.assertEqual((v["verdict"], v["blocks"]), ("NOT_REQUESTED", False), v)
 
+    def test_r7_g9_a_control_line_after_two_measured_pace_windows_is_unreadable(self) -> None:
+        # r7 (Grok G9 on #811, its input verbatim): the committed paced cell, the measured session's pace_summary twice, then one control line
+        # (no delivery_kind) saying delivery=native-msg. The delivery_kind path treats $paces -ne 1 as unreadable; the control path counted only
+        # the candidates, so a line from a later pace window stood in for the measured Play and the verdict was NOT_REQUESTED blocks=false
+        cell = json.loads((DV / "legs" / "m16-1457-native-fullscreen-s1.json").read_text(encoding="utf-8"))
+        self.assertNotIn("unpaced", cell["generatorArgs"])
+        pace = "playback_smoke.pace_summary session=3 first_present_ms=40.000 paced_elapsed_ms=25000.000"
+        verbatim = ("playback_smoke.measured_session id=3\nplayback_smoke.summary session=3 reason=play-stop presented_frames=600\n"
+                    f"{pace}\n{pace}\n"
+                    "playback_due_wake armed=1200 fired=1198 advanced=1190 rearmed=8 busy_deferred=3 hires=1 disabled=0 delivery=native-msg"
+                    " unpresented_deferred=0\n")
+        self.assertNotIn("delivery_kind=", verbatim)
+        v = self.verdict(cell, verbatim)
+        self.assertEqual((v["requested"], v["verdict"], v["blocks"]), (False, "NOT_HONOURED", True), v)
+        self.assertIn("unreadable", v["reason"])
+
+    def test_r7_g9_parity_the_control_and_delivery_kind_paths_agree_on_the_pace_window(self) -> None:
+        # r7 (Grok G9, escaped-defect rule): the same log run through BOTH paths -- a control line (no delivery_kind) and the same line with
+        # delivery_kind=send -- reaches the same blocks verdict. Two measured pace windows are unreadable on both paths whatever the layout; one
+        # window with one armed line passes on both (so the parity is not met by blocking everything). Passes 12 A1 and 13 A1 were this split.
+        cell = json.loads((DV / "legs" / "m16-1457-native-fullscreen-s1.json").read_text(encoding="utf-8"))
+        pace = "playback_smoke.pace_summary session=3 first_present_ms=40.000 paced_elapsed_ms=25000.000"
+        head = ["playback_smoke.measured_session id=3", "playback_smoke.summary session=3 reason=play-stop presented_frames=600"]
+        layouts = {
+            "Grok G9: pace, pace, line": lambda w: head + [pace, pace, w],
+            "pace, line, pace": lambda w: head + [pace, w, pace],
+            "a line in each window": lambda w: head + [pace, w, pace, w],
+            "crash-forensics prefix, pace, pace, line": lambda w: head + [pace, pace, self.PREFIX + w],
+        }
+        single = lambda w: head + [pace, w]
+        for spec_name, spec in (("committed paced cell", cell), ("unpaced leg", {"generatorArgs": {"unpaced": True}})):
+            for name, layout in [*layouts.items(), ("one window (baseline)", single)]:
+                control = self.verdict(spec, "\n".join(layout(self.wake(None))) + "\n")
+                kinded = self.verdict(spec, "\n".join(layout(self.wake("send"))) + "\n")
+                with self.subTest(spec=spec_name, case=name):
+                    self.assertEqual(control["blocks"], kinded["blocks"], (control, kinded))
+                    if name in layouts:
+                        self.assertEqual((control["verdict"], control["blocks"]), ("NOT_HONOURED", True), control)
+                        self.assertIn("unreadable", control["reason"])
+                    else:
+                        self.assertEqual((control["verdict"], control["blocks"]), ("NOT_REQUESTED", False), control)
+
     def test_r5_a3_a_measured_session_record_of_another_session_closes_the_window(self) -> None:
         # r5 (r4 adversary pass 10 advisory A3, verbatim shape): `playback_smoke.measured_session id=4` names its session with id=, not session=, and
         # it is a playback_smoke record of ANOTHER session, so it closes the measured wake window like any other; a wake record after it is not the

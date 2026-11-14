@@ -2000,8 +2000,10 @@ function Get-DvDueWakeDeliveryEvidence {
     # repeated or out-of-grammar delivery= on that line is unreadable. A line with no delivery= at all (an older binary) is left unchanged.
     # r6 (r5 adversary pass 13 A1): the app prints one wake record per Play, so a measured window with more than one and no delivery_kind is unreadable
     # too; before r6 a second record (a bare `playback_due_wake`) skipped the one-line read and removed the paced no-arm refusal below
+    # r7 (Grok G9): and so is one with the measured session's pace_summary more than once, as on the delivery_kind path below ($paces -ne 1): a line
+    # from a later pace window never stands in for the measured Play
     $controlMech = $null
-    $controlMechUnreadable = ($candidates.Count -gt 1 -and $withKind.Count -eq 0)
+    $controlMechUnreadable = ($withKind.Count -eq 0 -and $candidates.Count -gt 0 -and ($candidates.Count -gt 1 -or $paces -ne 1))
     if ($candidates.Count -eq 1 -and $withKind.Count -eq 0) {
         $cm = [regex]::Matches($candidates[0], '(?:^|\s)delivery=(?<m>\S*)')
         if ($cm.Count -gt 1 -or ($cm.Count -eq 1 -and $cm[0].Groups['m'].Value -cnotmatch '^(native-msg|qtimer|notifier|none)(\+(native-msg|qtimer|notifier))*$')) { $controlMechUnreadable = $true }
@@ -2055,7 +2057,7 @@ function Get-DvDueWakeDeliveryEvidence {
     }
     elseif ($controlMechUnreadable) {
         # r5 (r5 adversary pass 12 A1): the control line's delivery= cannot show which arms the measured Play used
-        $verdict = 'NOT_HONOURED'; $reason = 'the due-wake delivery is unreadable: the measured session''s playback_due_wake records carry no delivery_kind and are more than one, or the one line''s delivery= is repeated or is not native-msg, qtimer, notifier, none or a "+"-join'
+        $verdict = 'NOT_HONOURED'; $reason = 'the due-wake delivery is unreadable: the measured session''s playback_due_wake records carry no delivery_kind and are more than one or follow more than one of its pace_summary lines, or the one line''s delivery= is repeated or is not native-msg, qtimer, notifier, none or a "+"-join'
     }
     elseif ($controlMech -ceq 'none' -and -not $unpacedLeg) {
         # r5 (r5 adversary pass 12 A1, its input: the committed paced cell with a control line saying delivery=none): the r4 rule below, on a line
