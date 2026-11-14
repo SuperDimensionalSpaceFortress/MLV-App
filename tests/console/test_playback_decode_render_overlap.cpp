@@ -680,6 +680,51 @@ TEST(PlaybackLookaheadCpuRouteWiring, TheQueueAdmitsTheCpuRouteAndKeepsTheTextur
     ASSERT_TRUE( queue.contains( QStringLiteral("lookaheadContext.playbackLookaheadRequest = true;") ) );
 }
 
+// CPU-LOOKAHEAD-PRUNE-WASTE-1 (r4): the lookahead frame and the prune window come from playback_lookahead_cpu
+// (behaviour: test_playback_lookahead_prune_waste.cpp). The route is the one the request was admitted on: the texture
+// route passes cpuRoute=false and keeps requestedFrame + k and the depth window.
+TEST(PlaybackLookaheadCpuRouteWiring, TheLookaheadFrameAndThePruneWindowFollowTheDropFrameEngine)
+{
+    const QString mw = readRepoText( "platform/qt/MainWindow.cpp" );
+    const QString queue = functionBody( mw, QStringLiteral("void MainWindow::queuePlaybackLookaheadRequests(") );
+    ASSERT_FALSE( queue.isEmpty() );
+    ASSERT_TRUE( queue.contains( QStringLiteral("const bool cpuRouteLookahead = !textureRouteAdmits;") ) );
+    ASSERT_TRUE( queue.contains( QStringLiteral(
+        "        int lookaheadFrame = requestedFrame\n"
+        "            + playback_lookahead_cpu::lookaheadOffsetFrames( offset, cpuRouteLookahead, cpuRoutePositionFraction,\n"
+        "                                                             m_playbackDropFrameStride.strideFrames() );") ) );
+    ASSERT_FALSE( queue.contains( QStringLiteral("int lookaheadFrame = requestedFrame + offset;") ) );
+
+    // Both prune sites (drawFrame, drawFrameReady) keep the route's window, and none passes the bare depth.
+    ASSERT_EQ( mw.count( QStringLiteral("                    playbackLookaheadPruneWindowFrames(),") ), 2 );
+    const QString window = functionBody( mw, QStringLiteral("int MainWindow::playbackLookaheadPruneWindowFrames() const") );
+    ASSERT_TRUE( window.contains( QStringLiteral(
+        "m_playbackLookaheadCpuRouteAdmitted && !m_playbackLookaheadTextureRouteAdmitted") ) );
+
+    // drawFrame samples the engine only on the admitted CPU route and resets otherwise.
+    const QString draw = functionBody( mw, QStringLiteral("void MainWindow::drawFrame( bool updateTimecodeLabel )") );
+    ASSERT_TRUE( draw.contains( QStringLiteral(
+        "if( m_playbackLookaheadCpuRouteAdmitted ) m_playbackDropFrameStride.noteTarget( requestedFrame, m_newPosDropMode );\n"
+        "        else m_playbackDropFrameStride.reset();") ) );
+}
+
+// CPU-LOOKAHEAD-ENV-DEPTH-SLOT-BUDGET-TEST-1 (r4): the slot rule the slot-budget model runs
+// (test_playback_lookahead_prune_waste.cpp). With no free slot both run loops WAIT; findFreeSlotLocked never hands
+// out a rendering, ready, presenting or non-idle slot; and the presenting slot goes back through the prep hand-off.
+TEST(PlaybackLookaheadCpuRouteWiring, WithNoFreeSlotTheRenderThreadWaitsAndNeverEvicts)
+{
+    const QString rft = readRepoText( "platform/qt/RenderFrameThread.cpp" );
+    ASSERT_FALSE( rft.isEmpty() );
+    ASSERT_EQ( rft.count( QStringLiteral("( m_renderRequests.empty() || findFreeSlotLocked() < 0 ) )") ), 2 );
+    const QString freeSlot = functionBody( rft, QStringLiteral("int RenderFrameThread::findFreeSlotLocked() const") );
+    ASSERT_TRUE( freeSlot.contains( QStringLiteral("if( i == m_renderingSlotIndex ) continue;") ) );
+    ASSERT_TRUE( freeSlot.contains( QStringLiteral("if( slot.ready || slot.presenting ) continue;") ) );
+    ASSERT_TRUE( freeSlot.contains( QStringLiteral("!= SlotState::Idle ) continue;") ) );
+    ASSERT_TRUE( freeSlot.contains( QStringLiteral("return -1;") ) );
+    const QString h = readRepoText( "platform/qt/RenderFrameThread.h" );
+    ASSERT_TRUE( h.contains( QStringLiteral("static constexpr int kDefaultFrameSlotCount = 4;") ) );
+}
+
 TEST(PlaybackLookaheadCpuRouteWiring, TheCpuAcquireIsTargetFiltered)
 {
     const QString mw = readRepoText( "platform/qt/MainWindow.cpp" );

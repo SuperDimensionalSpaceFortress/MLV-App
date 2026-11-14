@@ -39,6 +39,7 @@
 #include "PlaybackDueWakeSamples.h"
 #include "PlaybackPrepInFlightGate.h"
 #include "PlaybackPrepOwnership.h"
+#include "PlaybackLookaheadCpuRoute.h"
 #include "PlaybackPresentTrace.h"
 #include "PlaybackScopesDuringPlayback.h"
 #include "PlaybackSlipHistogram.h"
@@ -1359,7 +1360,11 @@ private:
     uint64_t m_playbackLookaheadPresented = 0;
     uint64_t m_playbackLookaheadPruned = 0;
     uint64_t m_playbackLookaheadDroppedQueuedStart = 0;
+    // CPU-LOOKAHEAD-PRUNE-WASTE-1 (r4): the drop-frame engine's target-to-target advance, which places the CPU
+    // route's lookahead on the frame the engine is predicted to present next (playback_lookahead_cpu).
+    playback_lookahead_cpu::DropFrameStride m_playbackDropFrameStride;
     int playbackRenderLookaheadFrames() const;
+    int playbackLookaheadPruneWindowFrames() const;
     int currentPlaybackAdvanceTarget();
     bool renderThreadBusyForPlaybackAdvance( int activePlaybackTarget );
     bool conformTargetPresentOutstanding();

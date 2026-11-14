@@ -2796,6 +2796,15 @@ int MainWindow::playbackRenderLookaheadFrames() const
                                                        m_playbackLookaheadCpuRouteAdmitted );
 }
 
+// CPU-LOOKAHEAD-PRUNE-WASTE-1 (r4): the forward window the lookahead prune keeps. The texture route keeps the depth
+// unchanged; the CPU route keeps the frames queuePlaybackLookaheadRequests may have placed past +depth.
+int MainWindow::playbackLookaheadPruneWindowFrames() const
+{
+    return playback_lookahead_cpu::lookaheadWindowFrames(
+        playbackRenderLookaheadFrames(),
+        m_playbackLookaheadCpuRouteAdmitted && !m_playbackLookaheadTextureRouteAdmitted );
+}
+
 int MainWindow::currentPlaybackAdvanceTarget()
 {
     return ui->actionDropFrameMode->isChecked()
@@ -4001,10 +4010,20 @@ void MainWindow::queuePlaybackLookaheadRequests(
     const int cutOutFrame =
         qBound( cutInFrame, ui->spinBoxCutOut->value() - 1, totalFrames - 1 );
     const int loopSpan = cutOutFrame - cutInFrame + 1;
+    // CPU-LOOKAHEAD-PRUNE-WASTE-1 (r4): on the CPU route lookahead k asks for the frame the drop-frame engine is
+    // predicted to present next, floor( position + k x stride ), not one it will skip. The texture route keeps
+    // requestedFrame + k.
+    const bool cpuRouteLookahead = !textureRouteAdmits;
+    const double cpuRoutePositionFraction =
+        ( cpuRouteLookahead && ui->actionDropFrameMode->isChecked() )
+            ? m_newPosDropMode - static_cast<double>( requestedFrame )
+            : 0.0;
 
     for( int offset = 1; offset <= depth; ++offset )
     {
-        int lookaheadFrame = requestedFrame + offset;
+        int lookaheadFrame = requestedFrame
+            + playback_lookahead_cpu::lookaheadOffsetFrames( offset, cpuRouteLookahead, cpuRoutePositionFraction,
+                                                             m_playbackDropFrameStride.strideFrames() );
         if( lookaheadFrame > cutOutFrame )
         {
             if( !ui->actionLoop->isChecked() || loopSpan <= 0 ) break;
@@ -7582,6 +7601,10 @@ void MainWindow::drawFrame( bool updateTimecodeLabel )
         cpuRoute.prepRoute.gpuPlaybackReconTextureNoReadbackCandidate =
             requestContext.gpuPlaybackReconTexturePresentRequested;
         m_playbackLookaheadCpuRouteAdmitted = playbackLookaheadCpuRouteAdmits( cpuRoute );
+        // CPU-LOOKAHEAD-PRUNE-WASTE-1 (r4): sample the drop-frame engine's advance on the admitted CPU route; any
+        // other route starts the next CPU-route session from stride 1.
+        if( m_playbackLookaheadCpuRouteAdmitted ) m_playbackDropFrameStride.noteTarget( requestedFrame, m_newPosDropMode );
+        else m_playbackDropFrameStride.reset();
     }
     if( playbackRenderLookaheadFrames() > 0
      && ui->actionPlay->isChecked()
@@ -7602,7 +7625,7 @@ void MainWindow::drawFrame( bool updateTimecodeLabel )
                     requestContext.presentationGeneration,
                     cutInFrame,
                     cutOutFrame,
-                    playbackRenderLookaheadFrames(),
+                    playbackLookaheadPruneWindowFrames(),
                     ui->actionLoop->isChecked() );
             if( m_playbackSmokeActive && prunedPlaybackLookahead > 0 )
                 m_playbackLookaheadPruned += static_cast<uint64_t>( prunedPlaybackLookahead );
@@ -35048,7 +35071,7 @@ void MainWindow::drawFrameReady()
                     activeGeneration,
                     cutInFrame,
                     cutOutFrame,
-                    playbackRenderLookaheadFrames(),
+                    playbackLookaheadPruneWindowFrames(),
                     ui->actionLoop->isChecked() );
             if( m_playbackSmokeActive && prunedPlaybackLookaheadBeforeAcquire > 0 )
                 m_playbackLookaheadPruned += static_cast<uint64_t>( prunedPlaybackLookaheadBeforeAcquire );
