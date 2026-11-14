@@ -14,8 +14,9 @@
  *
  * This header holds the three pieces that fix and prove it:
  *  - effectiveLookaheadFrames(): the lookahead is on by default (depth 2) on the
- *    CUDA texture route only; MLVAPP_PLAYBACK_RENDER_LOOKAHEAD_FRAMES=0 is the kill
- *    switch, any explicit value wins, and every other route keeps depth 0.
+ *    CUDA texture route and (depth 1, CPU-S1-PACE-POST-785-LEVER-1) on the admitted CPU
+ *    route; MLVAPP_PLAYBACK_RENDER_LOOKAHEAD_FRAMES=0 is the kill switch, any explicit
+ *    value wins, and every other route keeps depth 0.
  *  - WorkItem / blocksPlaybackAdvance(): speculative lookahead work for a frame
  *    other than the current playback target never holds the timer back; the
  *    target's own work (lookahead or not) and every non-lookahead request still do.
@@ -41,15 +42,45 @@ inline constexpr int kDefaultTextureRouteLookaheadFrames = 2;
 /*! RenderFrameThread's queuePlaybackLookaheadRequests() bound (qBound( 0, env, 3 )). */
 inline constexpr int kMaxLookaheadFrames = 3;
 
+/*! CPU-S1-PACE-POST-785-LEVER-1: the default depth on the CPU route
+ *  (PlaybackLookaheadCpuRoute.h). One frame ahead runs the recon of N+1 under the render and
+ *  present of N; the prep worker is the co-limit, so a deeper queue would only hold slots. */
+inline constexpr int kDefaultCpuRouteLookaheadFrames = 1;
+/*! CPU-S1-PACE-POST-785-LEVER-1 r4 fix iteration 1 (adversary A1 on 05511dac): the CPU route's ceiling, env included. Its
+ *  lookahead lands on predicted frames up to 3 ahead (PlaybackLookaheadCpuRoute.h), so the frames it holds are not contiguous.
+ *  At depth 3 the 4 frame slots could all hold ready lookaheads ahead of a target that has no request yet (the target
+ *  between them, no presenting slot left to release): a deadlock. At depth 1 every held lookahead was issued from an
+ *  earlier target and lies at most 2 frames past the current one, so the presenting slot, the target and at most two
+ *  lookaheads fit in the 4 slots. */
+inline constexpr int kMaxCpuRouteLookaheadFrames = 1;
+
 /*! \a envFrames is the parsed MLVAPP_PLAYBACK_RENDER_LOOKAHEAD_FRAMES (or its
- *  legacy alias), or -1 when neither is set. */
-inline int effectiveLookaheadFrames( int envFrames, bool textureRouteAdmitted )
+ *  legacy alias), or -1 when neither is set. Any explicit value wins (0 is the kill switch
+ *  for both routes), clamped to 3, and to kMaxCpuRouteLookaheadFrames on the CPU route; otherwise the texture
+ *  route gets 2, the CPU route 1, every other route 0. */
+inline int effectiveLookaheadFrames( int envFrames, bool textureRouteAdmitted, bool cpuRouteAdmitted )
 {
     if( envFrames >= 0 )
     {
-        return envFrames > kMaxLookaheadFrames ? kMaxLookaheadFrames : envFrames;
+        const int frames = envFrames > kMaxLookaheadFrames ? kMaxLookaheadFrames : envFrames;
+        if( !textureRouteAdmitted && cpuRouteAdmitted && frames > kMaxCpuRouteLookaheadFrames )
+            return kMaxCpuRouteLookaheadFrames;
+        return frames;
     }
-    return textureRouteAdmitted ? kDefaultTextureRouteLookaheadFrames : 0;
+    if( textureRouteAdmitted ) return kDefaultTextureRouteLookaheadFrames;
+    return cpuRouteAdmitted ? kDefaultCpuRouteLookaheadFrames : 0;
+}
+
+inline int effectiveLookaheadFrames( int envFrames, bool textureRouteAdmitted )
+{
+    return effectiveLookaheadFrames( envFrames, textureRouteAdmitted, false );
+}
+
+/*! The route the lookahead runs on, for playback_smoke.overlap_summary lookahead_route. */
+inline const char *lookaheadRouteName( bool textureRouteAdmitted, bool cpuRouteAdmitted )
+{
+    if( textureRouteAdmitted ) return "texture";
+    return cpuRouteAdmitted ? "cpu" : "none";
 }
 
 /*! One unit of render-thread work as the playback advance sees it: a queued

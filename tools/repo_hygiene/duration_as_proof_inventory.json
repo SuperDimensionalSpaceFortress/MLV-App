@@ -3138,6 +3138,16 @@
       ]
     },
     {
+      "path": "platform/qt/GuiPresentGapIdle.h",
+      "anchor": "if ( ! ( ms > 0.0 ) || ! std :: isfinite ( ms ) ) return 0 ;",
+      "class": "value_fallback_select",
+      "clock": "other",
+      "justification": "CPU-S1-PACE-POST-785-LEVER-1 r3 (adversary A1 on 9c18b971): OtherBusySpans::dominantBucket's ticks() converts an already-charged ms value (closeGap's per-span charge or its rest) to whole gap-clock ticks for an integer tie compare; a value that is not a positive finite number is 0 ticks so llround never sees NaN or infinity. It only picks which bucket name max_gui_other_busy_bucket prints, a data-validity clamp, not a proof that any stage ran.",
+      "lines": [
+        213
+      ]
+    },
+    {
       "path": "tests/console/test_playback_smoke_gui_present_attribution_wiring.cpp",
       "anchor": "ASSERT_TRUE ( spans . unattributedSumMs >= 0.0 ) ;",
       "class": "not_run_proof_structural",

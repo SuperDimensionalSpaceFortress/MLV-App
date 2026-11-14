@@ -134,39 +134,9 @@ bool playbackFrameWithinLookaheadWindow( uint32_t frameNumber,
                                          int lookaheadDepth,
                                          bool loopEnabled )
 {
-    if( activePlaybackTarget < 0 || lookaheadDepth < 0 ) return true;
-
-    const int frame = static_cast<int>( frameNumber );
-    const int depth = std::max( 0, lookaheadDepth );
-    if( frame == activePlaybackTarget ) return true;
-
-    if( cutOutFrame < cutInFrame )
-    {
-        return frame >= activePlaybackTarget
-            && frame <= activePlaybackTarget + depth;
-    }
-
-    const int cutIn = std::max( 0, cutInFrame );
-    const int cutOut = std::max( cutIn, cutOutFrame );
-    if( activePlaybackTarget < cutIn || activePlaybackTarget > cutOut
-     || frame < cutIn || frame > cutOut )
-    {
-        return frame >= activePlaybackTarget
-            && frame <= activePlaybackTarget + depth;
-    }
-
-    if( !loopEnabled )
-    {
-        return frame >= activePlaybackTarget
-            && frame <= std::min( cutOut, activePlaybackTarget + depth );
-    }
-
-    const int loopSpan = cutOut - cutIn + 1;
-    if( loopSpan <= 0 ) return frame == activePlaybackTarget;
-
-    int distance = frame - activePlaybackTarget;
-    if( distance < 0 ) distance += loopSpan;
-    return distance >= 0 && distance <= depth;
+    // CPU-S1-PACE-POST-785-LEVER-1 r5 (adversary A1 on 63652a97): the rule moved to PlaybackFrameRange.h (64-bit end points).
+    return playback_frame_range::frameWithinLookaheadWindow( frameNumber, activePlaybackTarget, cutInFrame, cutOutFrame,
+                                                             lookaheadDepth, loopEnabled );
 }
 
 bool isGpuPlaybackReconTimingTelemetryKey( const QString &key )
@@ -1246,6 +1216,8 @@ void RenderFrameThread::renderFrame(uint32_t frameNumber,
              && it->presentationContext.presentationGeneration
                 == request.presentationContext.presentationGeneration )
             {
+                if( it->presentationContext.playbackLookaheadRequest )
+                    m_playbackLookaheadDroppedQueued.fetch_add( 1, std::memory_order_relaxed );
                 it = m_renderRequests.erase( it );
                 ++request.queuedPlaybackDropCount;
             }

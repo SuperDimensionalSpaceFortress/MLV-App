@@ -15,12 +15,16 @@
 
 #include "../../platform/qt/PlaybackDecodeRenderOverlap.h"
 #include "../../platform/qt/PlaybackNativePaceGuard.h"
+#include "../../platform/qt/PlaybackLookaheadCpuRoute.h"
+#include "../../platform/qt/GuiPresentGapIdle.h"
 
 #include <QFile>
 #include <QString>
 #include <QTextStream>
 
+#include <cstdio>
 #include <deque>
+#include <limits>
 #include <map>
 #include <vector>
 
@@ -425,4 +429,444 @@ TEST(PlaybackDecodeRenderOverlapWiring, TheRenderThreadReportsEveryStageToTheMet
     ASSERT_TRUE( rft.contains( QStringLiteral("playback_overlap::reconMayStart(") ) );
     ASSERT_TRUE( rft.contains( QStringLiteral("m_reconWaitCondition.wakeAll();\n        m_mutex.unlock();\n        emit frameReady();") ) );
     ASSERT_TRUE( rft.contains( QStringLiteral("playback_overlap::blocksPlaybackAdvance(") ) );
+}
+
+// ---- CPU-S1-PACE-POST-785-LEVER-1: the CPU-route lookahead (depth 1), its admission and its telemetry ----------
+
+TEST(PlaybackLookaheadCpuRoute, ThreeArgumentDepthEnvWinsTextureTwoCpuOneElseZero)
+{
+    const int envs[] = { -1, 0, 1, 2, 5 };
+    for( const int env : envs )
+    {
+        for( int tex = 0; tex < 2; ++tex )
+        {
+            for( int cpu = 0; cpu < 2; ++cpu )
+            {
+                int expected = 0;
+                if( env >= 0 )
+                {
+                    expected = env > 3 ? 3 : env;
+                    // r4 fix iteration 1 (adversary A1 on 05511dac): the CPU route's env ceiling is 1.
+                    if( !tex && cpu && expected > 1 ) expected = 1;
+                }
+                else if( tex ) expected = 2;
+                else if( cpu ) expected = 1;
+                ASSERT_EQ( expected, effectiveLookaheadFrames( env, tex != 0, cpu != 0 ) );
+            }
+            // The 2-argument form is unchanged: the 3-argument form with the CPU route refused.
+            ASSERT_EQ( effectiveLookaheadFrames( env, tex != 0, false ), effectiveLookaheadFrames( env, tex != 0 ) );
+        }
+    }
+    ASSERT_EQ( 2, playback_overlap::kDefaultTextureRouteLookaheadFrames );
+    ASSERT_EQ( 1, playback_overlap::kDefaultCpuRouteLookaheadFrames );
+    ASSERT_EQ( 2, effectiveLookaheadFrames( -1, true, true ) );   // the texture default wins over the CPU one
+    ASSERT_EQ( 0, effectiveLookaheadFrames( 0, true, true ) );    // env 0 kills both routes
+    ASSERT_EQ( 0, effectiveLookaheadFrames( 0, false, true ) );
+    ASSERT_TRUE( QString::fromLatin1( playback_overlap::lookaheadRouteName( true, true ) ) == QStringLiteral("texture") );
+    ASSERT_TRUE( QString::fromLatin1( playback_overlap::lookaheadRouteName( false, true ) ) == QStringLiteral("cpu") );
+    ASSERT_TRUE( QString::fromLatin1( playback_overlap::lookaheadRouteName( false, false ) ) == QStringLiteral("none") );
+}
+
+namespace
+{
+PlaybackLookaheadCpuRouteInputs admittedCpuRoute()
+{
+    PlaybackLookaheadCpuRouteInputs in;
+    in.playing = true;
+    in.fileLoaded = true;
+    in.dropFrameMode = true;
+    in.phase3DecodeReconProcess = true;
+    in.prepRoute.playing = true;
+    in.prepRoute.displayPreviewCachingAllowed = false;
+    in.prepRoute.cpuPreviewProcessingActive = true;
+    in.prepRoute.outputProcessed8 = false;
+    return in;
+}
+} // namespace
+
+TEST(PlaybackLookaheadCpuRoute, AdmissionTruthTableRefusesEveryGpuRouteAndEveryMissingCondition)
+{
+    ASSERT_TRUE( playbackLookaheadCpuRouteAdmits( admittedCpuRoute() ) );
+    struct Flip { const char *name; void ( *apply )( PlaybackLookaheadCpuRouteInputs & ); };
+    const Flip refusals[] = {
+        { "not playing", []( PlaybackLookaheadCpuRouteInputs &i ) { i.playing = false; } },
+        { "no file", []( PlaybackLookaheadCpuRouteInputs &i ) { i.fileLoaded = false; } },
+        { "whole-frame playback", []( PlaybackLookaheadCpuRouteInputs &i ) { i.dropFrameMode = false; } },
+        { "no phase 3 recon worker", []( PlaybackLookaheadCpuRouteInputs &i ) { i.phase3DecodeReconProcess = false; } },
+        { "GPU texture route", []( PlaybackLookaheadCpuRouteInputs &i ) { i.textureRouteRequested = true; } },
+        { "GPU bilinear debayer", []( PlaybackLookaheadCpuRouteInputs &i ) { i.gpuBilinearDebayer = true; } },
+        { "GPU AMaZE debayer", []( PlaybackLookaheadCpuRouteInputs &i ) { i.gpuAmazeDebayer = true; } },
+        { "gpu16 preview", []( PlaybackLookaheadCpuRouteInputs &i ) { i.prepRoute.gpu16PreviewActive = true; } },
+        { "GPU preview processing", []( PlaybackLookaheadCpuRouteInputs &i ) { i.prepRoute.gpuPreviewProcessingActive = true; } },
+        { "AMaZE texture candidate", []( PlaybackLookaheadCpuRouteInputs &i ) { i.prepRoute.gpuAmazeTexturePresentCandidate = true; } },
+        { "recon texture candidate", []( PlaybackLookaheadCpuRouteInputs &i ) { i.prepRoute.gpuPlaybackReconTexturePresentCandidate = true; } },
+        { "no-readback candidate", []( PlaybackLookaheadCpuRouteInputs &i ) { i.prepRoute.gpuPlaybackReconTextureNoReadbackCandidate = true; } },
+        { "prep not playing", []( PlaybackLookaheadCpuRouteInputs &i ) { i.prepRoute.playing = false; } },
+        { "display caching (paused policy)", []( PlaybackLookaheadCpuRouteInputs &i ) { i.prepRoute.displayPreviewCachingAllowed = true; } },
+        { "8-bit output, no CPU processing", []( PlaybackLookaheadCpuRouteInputs &i ) {
+              i.prepRoute.cpuPreviewProcessingActive = false; i.prepRoute.outputProcessed8 = true; } },
+    };
+    for( const Flip &f : refusals )
+    {
+        PlaybackLookaheadCpuRouteInputs in = admittedCpuRoute();
+        f.apply( in );
+        if( playbackLookaheadCpuRouteAdmits( in ) )
+        {
+            fprintf( stderr, "admitted with: %s\n", f.name );
+            ASSERT_TRUE( false );
+        }
+    }
+    // The buffer fields are never the route: a null buffer on the request side still admits.
+    PlaybackLookaheadCpuRouteInputs noBuffer = admittedCpuRoute();
+    noBuffer.prepRoute.rawImage16 = nullptr;
+    noBuffer.prepRoute.rawImage16Bytes = 0;
+    noBuffer.prepRoute.sourceImage16Bytes = 0;
+    ASSERT_TRUE( playbackLookaheadCpuRouteAdmits( noBuffer ) );
+}
+
+TEST(PlaybackLookaheadCpuRoute, TheCpuPrepRouteIsDecidedByTheBorrowPredicateItself)
+{
+    // Every combination of #774's nine route bools: with the lookahead's own gates open, the admission equals
+    // playbackPrepMayBorrowSlotRgb16 on the same route with an adequate buffer.
+    static const uint16_t words[4] = {};
+    for( int mask = 0; mask < ( 1 << 9 ); ++mask )
+    {
+        PlaybackLookaheadCpuRouteInputs in = admittedCpuRoute();
+        PlaybackPrepBorrowInputs &r = in.prepRoute;
+        r.playing = ( mask & 1 ) != 0;
+        r.displayPreviewCachingAllowed = ( mask & 2 ) != 0;
+        r.cpuPreviewProcessingActive = ( mask & 4 ) != 0;
+        r.outputProcessed8 = ( mask & 8 ) != 0;
+        r.gpu16PreviewActive = ( mask & 16 ) != 0;
+        r.gpuPreviewProcessingActive = ( mask & 32 ) != 0;
+        r.gpuAmazeTexturePresentCandidate = ( mask & 64 ) != 0;
+        r.gpuPlaybackReconTexturePresentCandidate = ( mask & 128 ) != 0;
+        r.gpuPlaybackReconTextureNoReadbackCandidate = ( mask & 256 ) != 0;
+        PlaybackPrepBorrowInputs withBuffer = r;
+        withBuffer.rawImage16 = words;
+        withBuffer.rawImage16Bytes = sizeof( words );
+        withBuffer.sourceImage16Bytes = sizeof( words );
+        ASSERT_EQ( playbackPrepMayBorrowSlotRgb16( withBuffer ), playbackLookaheadCpuRouteAdmits( in ) );
+    }
+}
+
+TEST(PlaybackLookaheadCpuRoute, AMeasuredTieGoesToTheNamedSpanDespiteRoundingInTheRest)
+{
+    // r2 fix iteration 2 (adversary A1 on 1a6d7fd5): a 1.5 ms gap, zero idle, sleep and paint; draw_frame_ready 0.3 ms and
+    // timer_frame 0.6 ms. The rest is 1.5 - (0.3 + 0.6) = 0.6000000000000001 in IEEE double, an ulp above timer_frame's 0.6:
+    // the measured tie must name timer_frame, never unattributed.
+    using gui_present_gap::OtherBusySpan;
+    using gui_present_gap::OtherBusySpans;
+    using gui_present_gap::SpanClock;
+    OtherBusySpans spans;
+    spans.openGap();
+    SpanClock c; c.gapSerial = 1;
+    c.nowNs = 100000100000; spans.begin( c );
+    c.nowNs = 100000400000; spans.end( OtherBusySpan::DrawFrameReady, c );
+    c.nowNs = 100000500000; spans.begin( c );
+    c.nowNs = 100001100000; spans.end( OtherBusySpan::TimerFrame, c );
+    ASSERT_EQ( static_cast<int>( OtherBusySpan::TimerFrame ), spans.dominantBucket( 1.5 ) );
+    // A real margin still decides: 2 ns more rest than timer_frame is the rest's (well above one clock tick).
+    ASSERT_EQ( -1, spans.dominantBucket( 1.5 + 0.000002 ) );
+    // Two named spans tied within a tick: the first (draw_frame_ready) keeps it.
+    OtherBusySpans pair;
+    pair.openGap();
+    c.gapSerial = 2;
+    c.nowNs = 0; pair.begin( c );
+    c.nowNs = 300000; pair.end( OtherBusySpan::DrawFrameReady, c );
+    c.nowNs = 400000; pair.begin( c );
+    c.nowNs = 700000; pair.end( OtherBusySpan::TimerFrame, c );
+    ASSERT_EQ( static_cast<int>( OtherBusySpan::DrawFrameReady ), pair.dominantBucket( 0.6 ) );
+    // r3 (adversary A1 on 9c18b971, its input verbatim): gap open 100000000000 ns, close 100000250029 ns, zero idle, sleep and
+    // paint; draw_frame from 100000010000 to 100000135014 ns (125014 ns) leaves a 125015 ns rest -- a one-tick tie, which the
+    // double-ms tolerance lost at its boundary (0.12501500000000002 > 0.125014 + 1e-6 returned unattributed).
+    OtherBusySpans tick;
+    tick.openGap();
+    c.gapSerial = 3;
+    c.nowNs = 100000010000; tick.begin( c );
+    c.nowNs = 100000135014; tick.end( OtherBusySpan::DrawFrame, c );
+    ASSERT_EQ( static_cast<int>( OtherBusySpan::DrawFrame ), tick.dominantBucket( 250029 / 1000000.0 ) );
+    // The adversary's second input: one named charge and the budget both 1/1000000.0 ms, zero rest. The charge equalled the old
+    // tieMs and was never selected; a positive charge of one tick is that span's, never unattributed.
+    OtherBusySpans one;
+    one.openGap();
+    c.gapSerial = 4;
+    c.nowNs = 0; one.begin( c );
+    c.nowNs = 1; one.end( OtherBusySpan::TimerFrame, c );
+    ASSERT_EQ( static_cast<int>( OtherBusySpan::TimerFrame ), one.dominantBucket( 1 / 1000000.0 ) );
+    // r3 fix iteration 1 (adversary A1 on 9f942b1e, its input verbatim): gap open 100000000000 ns, close 100003000003 ns;
+    // draw_frame_ready 1000000 ns, timer_frame 1000001 ns, rest 1000002 ns. Chained ties kept draw_frame_ready and then lost
+    // it to the rest (-1); against one anchor (the 1000002 rest), timer_frame ties it and draw_frame_ready (2 ticks) does not.
+    OtherBusySpans chain;
+    chain.openGap();
+    c.gapSerial = 5;
+    c.nowNs = 100000100000; chain.begin( c );
+    c.nowNs = 100001100000; chain.end( OtherBusySpan::DrawFrameReady, c );
+    c.nowNs = 100001200000; chain.begin( c );
+    c.nowNs = 100002200001; chain.end( OtherBusySpan::TimerFrame, c );
+    ASSERT_EQ( static_cast<int>( OtherBusySpan::TimerFrame ), chain.dominantBucket( 3000003 / 1000000.0 ) );
+    // r3 hardening: a non-finite charge is 0 ticks (never handed to llround) and is never the dominant bucket.
+    OtherBusySpans odd;
+    odd.gapMs[static_cast<int>( OtherBusySpan::DrawFrameReady )] = std::numeric_limits<double>::quiet_NaN();
+    odd.gapMs[static_cast<int>( OtherBusySpan::TimerFrame )] = 0.5;
+    ASSERT_EQ( static_cast<int>( OtherBusySpan::TimerFrame ), odd.dominantBucket( 1.0 ) );
+}
+
+TEST(PlaybackLookaheadCpuRoute, TheMaxBusyGapNamesItsDominantBucket)
+{
+    using gui_present_gap::OtherBusySpan;
+    using gui_present_gap::OtherBusySpans;
+    using gui_present_gap::SpanClock;
+    OtherBusySpans spans;
+    spans.openGap();
+    ASSERT_EQ( -1, spans.dominantBucket( 10.0 ) );   // nothing named: all unattributed
+    SpanClock a; a.gapSerial = 1; a.nowNs = 0;
+    SpanClock b = a; b.nowNs = 6000000;              // 6 ms of draw_frame_ready
+    spans.begin( a );
+    spans.end( OtherBusySpan::DrawFrameReady, b );
+    ASSERT_EQ( static_cast<int>( OtherBusySpan::DrawFrameReady ), spans.dominantBucket( 10.0 ) );  // 6 > 4 rest
+    ASSERT_EQ( -1, spans.dominantBucket( 20.0 ) );   // 14 ms unattributed beats 6
+    ASSERT_EQ( static_cast<int>( OtherBusySpan::DrawFrameReady ), spans.dominantBucket( 3.0 ) );   // scaled to the budget
+    ASSERT_EQ( -1, spans.dominantBucket( std::numeric_limits<double>::quiet_NaN() ) );   // no budget: nothing charged
+    spans.closeGap( 10.0 );
+    ASSERT_EQ( -1, spans.dominantBucket( 10.0 ) );   // closeGap cleared the gap's spans
+    ASSERT_TRUE( QString::fromLatin1( gui_present_gap::otherBusyBucketName( -1 ) ) == QStringLiteral("unattributed") );
+    ASSERT_TRUE( QString::fromLatin1( gui_present_gap::otherBusyBucketName( -2 ) ) == QStringLiteral("none") );
+    ASSERT_TRUE( QString::fromLatin1( gui_present_gap::otherBusyBucketName( 99 ) ) == QStringLiteral("none") );
+    ASSERT_TRUE( QString::fromLatin1( gui_present_gap::otherBusyBucketName( 0 ) ) == QStringLiteral("draw_frame_ready") );
+}
+
+namespace
+{
+QString functionBody( const QString &source, const QString &signature )
+{
+    const int start = source.indexOf( signature );
+    if( start < 0 ) return QString();
+    const int end = source.indexOf( QStringLiteral("\n}\n"), start );
+    return end < 0 ? QString() : source.mid( start, end - start );
+}
+} // namespace
+
+TEST(PlaybackLookaheadCpuRouteWiring, DrawFrameConsultsThePredicateBesideTheTextureAdmission)
+{
+    const QString mw = readRepoText( "platform/qt/MainWindow.cpp" );
+    ASSERT_FALSE( mw.isEmpty() );
+    const QString draw = functionBody( mw, QStringLiteral("void MainWindow::drawFrame( bool updateTimecodeLabel )") );
+    ASSERT_FALSE( draw.isEmpty() );
+    const int texture = draw.indexOf( QStringLiteral("m_playbackLookaheadTextureRouteAdmitted =\n        ui->actionPlay->isChecked()") );
+    const int cpu = draw.indexOf( QStringLiteral("m_playbackLookaheadCpuRouteAdmitted = playbackLookaheadCpuRouteAdmits( cpuRoute );") );
+    const int prune = draw.indexOf( QStringLiteral("if( playbackRenderLookaheadFrames() > 0\n     && ui->actionPlay->isChecked()") );
+    ASSERT_TRUE( texture > 0 );
+    ASSERT_TRUE( cpu > texture );
+    ASSERT_TRUE( prune > cpu );
+    // The CPU prep route is #774's predicate on the request's inputs, not a restatement.
+    ASSERT_TRUE( draw.contains( QStringLiteral("cpuRoute.prepRoute.cpuPreviewProcessingActive =\n            requestContext.renderThreadUsingCpuPreviewProcessing\n            && requestContext.gpuPreviewProcessingConfig.enabled;") ) );
+    ASSERT_TRUE( draw.contains( QStringLiteral("cpuRoute.dropFrameMode = ui->actionDropFrameMode->isChecked();") ) );
+    ASSERT_TRUE( draw.contains( QStringLiteral("requestedPhase3Mode == Phase3Mode::DecodeReconProcess\n            && !phase3LiveFallbackActive()\n            && !phase3KillSwitchActive( requestedPhase3Mode );") ) );
+    const QString depth = functionBody( mw, QStringLiteral("int MainWindow::playbackRenderLookaheadFrames() const") );
+    ASSERT_TRUE( depth.contains( QStringLiteral("m_playbackLookaheadTextureRouteAdmitted,\n                                                       m_playbackLookaheadCpuRouteAdmitted );") ) );
+    const QString hdr = readRepoText( "platform/qt/PlaybackLookaheadCpuRoute.h" );
+    ASSERT_TRUE( hdr.contains( QStringLiteral("return playbackPrepMayBorrowSlotRgb16( route );") ) );
+}
+
+TEST(PlaybackLookaheadCpuRouteWiring, TheQueueAdmitsTheCpuRouteAndKeepsTheTextureChecks)
+{
+    const QString mw = readRepoText( "platform/qt/MainWindow.cpp" );
+    const QString queue = functionBody( mw, QStringLiteral("void MainWindow::queuePlaybackLookaheadRequests(") );
+    ASSERT_FALSE( queue.isEmpty() );
+    ASSERT_TRUE( queue.contains( QStringLiteral(
+        "    const bool textureRouteAdmits =\n"
+        "        baseContext.gpuPlaybackReconTexturePresentRequested\n"
+        "        && baseContext.gpuPlaybackReconAmazeTexturePresentAdmitted\n"
+        "        && mainWindowGpuTextureRouteAdmitsPlaybackScale(\n"
+        "               baseContext.playbackScaleFactor, gpuReducedReconHonouredSessionScale() );\n"
+        "    if( !textureRouteAdmits && !m_playbackLookaheadCpuRouteAdmitted ) return;") ) );
+    ASSERT_TRUE( queue.contains( QStringLiteral("const int depth = playbackRenderLookaheadFrames();") ) );
+    ASSERT_TRUE( queue.contains( QStringLiteral("lookaheadContext.playbackLookaheadRequest = true;") ) );
+}
+
+// CPU-LOOKAHEAD-PRUNE-WASTE-1 (r4): the lookahead frame and the prune window come from playback_lookahead_cpu
+// (behaviour: test_playback_lookahead_prune_waste.cpp). The route is the one the request was admitted on: the texture
+// route passes cpuRoute=false and keeps requestedFrame + k and the depth window.
+TEST(PlaybackLookaheadCpuRouteWiring, TheLookaheadFrameAndThePruneWindowFollowTheDropFrameEngine)
+{
+    const QString mw = readRepoText( "platform/qt/MainWindow.cpp" );
+    const QString queue = functionBody( mw, QStringLiteral("void MainWindow::queuePlaybackLookaheadRequests(") );
+    ASSERT_FALSE( queue.isEmpty() );
+    ASSERT_TRUE( queue.contains( QStringLiteral("const bool cpuRouteLookahead = !textureRouteAdmits;") ) );
+    ASSERT_TRUE( queue.contains( QStringLiteral(
+        "        int lookaheadFrame = cpuRouteLookahead\n"
+        "            ? playback_lookahead_cpu::cpuRouteLookaheadFrame( requestedFrame, offset, cpuRoutePositionFraction,\n"
+        "                                                              m_playbackDropFrameStride.strideFrames(),\n"
+        "                                                              ui->spinBoxCutIn->value(), ui->spinBoxCutOut->value(),\n"
+        "                                                              ui->actionLoop->isChecked(), playbackConformActive() )\n"
+        "            : requestedFrame + offset;") ) );
+    ASSERT_FALSE( queue.contains( QStringLiteral("int lookaheadFrame = requestedFrame + offset;") ) );
+
+    // Both prune sites (drawFrame, drawFrameReady) keep the route's window, and none passes the bare depth.
+    ASSERT_EQ( mw.count( QStringLiteral("                    playbackLookaheadPruneWindowFrames(),") ), 2 );
+    const QString window = functionBody( mw, QStringLiteral("int MainWindow::playbackLookaheadPruneWindowFrames() const") );
+    ASSERT_TRUE( window.contains( QStringLiteral(
+        "m_playbackLookaheadCpuRouteAdmitted && !m_playbackLookaheadTextureRouteAdmitted") ) );
+
+    // drawFrame samples the engine only on the admitted CPU route and resets otherwise.
+    const QString draw = functionBody( mw, QStringLiteral("void MainWindow::drawFrame( bool updateTimecodeLabel )") );
+    ASSERT_TRUE( draw.contains( QStringLiteral(
+        "if( m_playbackLookaheadCpuRouteAdmitted ) m_playbackDropFrameStride.noteTarget( requestedFrame, m_newPosDropMode );\n"
+        "        else m_playbackDropFrameStride.reset();") ) );
+    // r4 fix iteration 2 (adversary A3 on c7953c66): the admission reads the thread's real slot count.
+    ASSERT_TRUE( draw.contains( QStringLiteral(
+        "cpuRoute.frameSlotCount = RenderFrameThread::playbackFrameSlotCount();") ) );
+}
+
+// r4 fix iteration 2 (adversary A1 on c7953c66): withinPruneWindow in test_playback_lookahead_prune_waste.cpp mirrors this
+// function; the Loop distance is modulo the cut's frame count, the source of the CPU window's + 1.
+TEST(PlaybackLookaheadCpuRouteWiring, TheLoopPruneDistanceIsModuloTheCutFrameCount)
+{
+    const QString rft = readRepoText( "platform/qt/RenderFrameThread.cpp" );
+    const QString wrapper = functionBody( rft, QStringLiteral("bool playbackFrameWithinLookaheadWindow( uint32_t frameNumber,") );
+    ASSERT_FALSE( wrapper.isEmpty() );
+    // r5 (adversary A1 on 63652a97): the rule moved to PlaybackFrameRange.h, which the tests call; the thread delegates to it.
+    ASSERT_TRUE( wrapper.contains( QStringLiteral("return playback_frame_range::frameWithinLookaheadWindow( frameNumber, activePlaybackTarget,") ) );
+    const QString range = readRepoText( "platform/qt/PlaybackFrameRange.h" );
+    const QString window = functionBody( range, QStringLiteral("inline bool frameWithinLookaheadWindow( uint32_t frameNumber,") );
+    ASSERT_FALSE( window.isEmpty() );
+    ASSERT_TRUE( window.contains( QStringLiteral("const long long loopSpan = static_cast<long long>( cutOut ) - cutIn + 1;") ) );
+    ASSERT_TRUE( window.contains( QStringLiteral("if( distance < 0 ) distance += loopSpan;") ) );
+    ASSERT_TRUE( window.contains( QStringLiteral("return distance >= 0 && distance <= depth;") ) );
+    ASSERT_TRUE( window.contains( QStringLiteral("const long long windowEnd = target + depth;") ) );
+    ASSERT_TRUE( window.contains( QStringLiteral("&& frame <= std::min( static_cast<long long>( cutOut ), windowEnd );") ) );
+    const QString h = readRepoText( "platform/qt/RenderFrameThread.h" );
+    ASSERT_TRUE( h.contains( QStringLiteral(
+        "static int playbackFrameSlotCount( void ) { return configuredFrameSlotCount(); }") ) );
+}
+
+// CPU-LOOKAHEAD-ENV-DEPTH-SLOT-BUDGET-TEST-1 (r4): the slot rule the slot-budget model runs
+// (test_playback_lookahead_prune_waste.cpp). With no free slot both run loops WAIT; findFreeSlotLocked never hands
+// out a rendering, ready, presenting or non-idle slot; and the presenting slot goes back through the prep hand-off.
+TEST(PlaybackLookaheadCpuRouteWiring, WithNoFreeSlotTheRenderThreadWaitsAndNeverEvicts)
+{
+    const QString rft = readRepoText( "platform/qt/RenderFrameThread.cpp" );
+    ASSERT_FALSE( rft.isEmpty() );
+    ASSERT_EQ( rft.count( QStringLiteral("( m_renderRequests.empty() || findFreeSlotLocked() < 0 ) )") ), 2 );
+    const QString freeSlot = functionBody( rft, QStringLiteral("int RenderFrameThread::findFreeSlotLocked() const") );
+    ASSERT_TRUE( freeSlot.contains( QStringLiteral("if( i == m_renderingSlotIndex ) continue;") ) );
+    ASSERT_TRUE( freeSlot.contains( QStringLiteral("if( slot.ready || slot.presenting ) continue;") ) );
+    ASSERT_TRUE( freeSlot.contains( QStringLiteral("!= SlotState::Idle ) continue;") ) );
+    ASSERT_TRUE( freeSlot.contains( QStringLiteral("return -1;") ) );
+    const QString h = readRepoText( "platform/qt/RenderFrameThread.h" );
+    ASSERT_TRUE( h.contains( QStringLiteral("static constexpr int kDefaultFrameSlotCount = 4;") ) );
+}
+
+TEST(PlaybackLookaheadCpuRouteWiring, TheCpuAcquireIsTargetFiltered)
+{
+    const QString mw = readRepoText( "platform/qt/MainWindow.cpp" );
+    const QString ready = functionBody( mw, QStringLiteral("void MainWindow::drawFrameReady()") );
+    ASSERT_FALSE( ready.isEmpty() );
+    // With a lookahead depth (any route) the CPU slot is taken only by the target-filtered acquire.
+    ASSERT_TRUE( ready.contains( QStringLiteral("const bool targetAwareLookaheadAcquire =\n        playbackRenderLookaheadFrames() > 0 && ui->actionPlay->isChecked();") ) );
+    ASSERT_TRUE( ready.contains( QStringLiteral(
+        "            haveReadyFrame = targetAwareLookaheadAcquire\n"
+        "                ? m_pRenderThread->acquireLatestReadyFrameForPlaybackTarget(") ) );
+    const QString rft = readRepoText( "platform/qt/RenderFrameThread.cpp" );
+    const QString acquire = functionBody( rft, QStringLiteral("bool RenderFrameThread::acquireLatestReadyFrameForPlaybackTarget(") );
+    ASSERT_TRUE( acquire.contains( QStringLiteral(
+        "        if( slot.presentationContext.playbackLookaheadRequest\n"
+        "         && ( activePlaybackTarget < 0\n"
+        "           || slot.presentationContext.presentationGeneration != activeGeneration\n"
+        "           || static_cast<int>( slot.frameNumber ) != activePlaybackTarget ) )") ) );
+    // The drop-frame erase counts the lookahead requests it removes (lookahead_dropped_queued).
+    ASSERT_TRUE( rft.contains( QStringLiteral(
+        "                if( it->presentationContext.playbackLookaheadRequest )\n"
+        "                    m_playbackLookaheadDroppedQueued.fetch_add( 1, std::memory_order_relaxed );\n"
+        "                it = m_renderRequests.erase( it );") ) );
+}
+
+TEST(PlaybackLookaheadCpuRouteWiring, TheRouteIsLatchedOnlyWhereALookaheadRequestIsIssued)
+{
+    // Adversary A1 on e35b8030: Cut In = Cut Out = 100 (one-frame loop), slider 99, Play + Loop + Drop Frame on the admitted
+    // CPU route. Depth 1's candidate wraps to the current frame and is skipped, so nothing is queued (lookahead_requests=0),
+    // yet the route latched at admission in drawFrame printed lookahead_route=cpu. The route is the one a request ran on.
+    const QString mw = readRepoText( "platform/qt/MainWindow.cpp" );
+    const QString draw = functionBody( mw, QStringLiteral("void MainWindow::drawFrame( bool updateTimecodeLabel )") );
+    ASSERT_FALSE( draw.isEmpty() );
+    ASSERT_FALSE( draw.contains( QStringLiteral("m_playbackLookaheadSessionRoute =") ) );
+    const QString queue = functionBody( mw, QStringLiteral("void MainWindow::queuePlaybackLookaheadRequests(") );
+    const int issued = queue.indexOf( QStringLiteral("++m_playbackLookaheadRequestsIssued;") );
+    const int latch = queue.indexOf( QStringLiteral(
+        "m_playbackLookaheadSessionRoute =\n"
+        "                playback_overlap::lookaheadRouteName( textureRouteAdmits, !textureRouteAdmits );") );
+    ASSERT_TRUE( issued > 0 );
+    ASSERT_TRUE( latch > issued );
+    ASSERT_EQ( 1, mw.count( QStringLiteral("m_playbackLookaheadSessionRoute =") ) - mw.count( QStringLiteral("m_playbackLookaheadSessionRoute = \"none\";") ) );
+}
+
+TEST(PlaybackLookaheadCpuRouteWiring, TheMaxBusyGapStartIsStampedAtOpenNotReadAgainAtClose)
+{
+    // Adversary A1 on fb4d13fe: smoke start 100.000 s, the gap opens at 101.000 s and closes at 101.020 s (20 ms), then the GUI
+    // thread is descheduled 500 ms before a second clock read at the close: start = 101.520 - 0.020 = 1500 ms, outside the gap
+    // [1000, 1020]. The start is the opening instant, stamped once in openGuiPresentGap.
+    const QString mw = readRepoText( "platform/qt/MainWindow.cpp" );
+    const QString open = functionBody( mw, QStringLiteral("void MainWindow::openGuiPresentGap( void )") );
+    const QString close = functionBody( mw, QStringLiteral("void MainWindow::closeGuiPresentGap( void )") );
+    ASSERT_FALSE( open.isEmpty() );
+    ASSERT_FALSE( close.isEmpty() );
+    const int stamp = open.indexOf( QStringLiteral(
+        "m_guiPresentGapStartSinceSmokeMs = static_cast<double>( gapOpenNs ) / 1000000.0 - m_playbackSmokeStartTime * 1000.0;") );
+    const int armed = open.indexOf( QStringLiteral("if( !m_playbackSmokeActive || !m_guiPresentIdleProbeConnected ) return;") );
+    const int start = open.indexOf( QStringLiteral("m_guiPresentGapStartNs = gapOpenNs;") );
+    // r2 (adversary A1 on 89e3a9d1): one clock read arms and places the gap.
+    ASSERT_EQ( 1, open.count( QStringLiteral("m_guiPresentGapClock.nsecsElapsed()") ) );
+    ASSERT_FALSE( open.contains( QStringLiteral("mlv_stage_timing_now()") ) );
+    ASSERT_TRUE( armed > 0 );
+    ASSERT_TRUE( stamp > armed );
+    ASSERT_TRUE( start > stamp );
+    ASSERT_TRUE( close.contains( QStringLiteral("gaps.busyMaxAtMs = m_guiPresentGapStartSinceSmokeMs;") ) );
+    ASSERT_FALSE( close.contains( QStringLiteral("mlv_stage_timing_now()") ) );   // no second clock at the close
+    // r2 fix iteration 1 (adversary A1 on 482616a5): smoke start 100.000 s, a 500 ms deschedule before a separate gap-clock
+    // baseline read, gap opens at 101.000 s -> max_gui_busy_at_ms=500 instead of 1000. The gap clock IS the smoke clock, so
+    // the zero is m_playbackSmokeStartTime itself and smoke start reads no gap clock at all.
+    const QString begin = functionBody( mw, QStringLiteral("void MainWindow::beginPlaybackSmokeTelemetry( void )") );
+    ASSERT_FALSE( begin.isEmpty() );
+    ASSERT_TRUE( begin.contains( QStringLiteral("m_playbackSmokeStartTime = mlv_stage_timing_now();") ) );
+    ASSERT_FALSE( begin.contains( QStringLiteral("m_guiPresentGapClock") ) );
+    ASSERT_FALSE( mw.contains( QStringLiteral("m_guiPresentGapClockAtSmokeStartNs") ) );
+    const QString h = readRepoText( "platform/qt/MainWindow.h" );
+    ASSERT_TRUE( h.contains( QStringLiteral("GuiPresentGapClock m_guiPresentGapClock;") ) );
+    ASSERT_FALSE( h.contains( QStringLiteral("QElapsedTimer m_guiPresentGapClock;") ) );
+    const QString clock = functionBody( mw, QStringLiteral("qint64 MainWindow::GuiPresentGapClock::nsecsElapsed( void ) const") );
+    ASSERT_TRUE( clock.contains( QStringLiteral("return static_cast<qint64>( mlv_stage_timing_now() * 1000000000.0 );") ) );
+}
+
+TEST(PlaybackLookaheadCpuRouteWiring, TheSevenNewFieldsAreAppendedNeverRenamed)
+{
+    const QString mw = readRepoText( "platform/qt/MainWindow.cpp" );
+    const int overlap = mw.indexOf( QStringLiteral("\"playback_smoke.overlap_summary session=%1 lookahead_depth=%2 \"") );
+    ASSERT_TRUE( overlap > 0 );
+    const int raw = mw.indexOf( QStringLiteral("            + rawPrefetchFields\n"), overlap );
+    const int appended = mw.indexOf( QStringLiteral(
+        "QStringLiteral( \" lookahead_route=%1 lookahead_presented=%2 lookahead_pruned=%3 \"\n"
+        "                              \"lookahead_dropped_queued=%4\" )"), overlap );
+    ASSERT_TRUE( raw > overlap );
+    ASSERT_TRUE( appended > raw );
+    ASSERT_TRUE( mw.contains( QStringLiteral("\"recon_starts_held_for_render=%19\" )") ) );   // the old format is intact
+    const int gui = mw.indexOf( QStringLiteral("\"playback_smoke.gui_present_summary session=%1 frames=%2 \"") );
+    const int unattributed = mw.indexOf( QStringLiteral("QStringLiteral( \" avg_gui_other_busy_unattributed_ms=%1\" )") );   // r2 (advisory A2): the builder precedes the format
+    const int freeze = mw.indexOf( QStringLiteral(
+        "QStringLiteral( \" max_gui_busy_at_ms=%1 max_gui_busy_frame=%2 max_gui_other_busy_bucket=%3\" )") );
+    ASSERT_TRUE( gui > 0 );
+    ASSERT_TRUE( unattributed > 0 );
+    ASSERT_TRUE( freeze > unattributed );
+    const QStringList fields = { QStringLiteral("lookahead_route="), QStringLiteral("lookahead_presented="),
+                                 QStringLiteral("lookahead_pruned="), QStringLiteral("lookahead_dropped_queued="),
+                                 QStringLiteral("max_gui_busy_at_ms="), QStringLiteral("max_gui_busy_frame="),
+                                 QStringLiteral("max_gui_other_busy_bucket=") };
+    ASSERT_EQ( 7, fields.size() );
+    // r2: each field is ONE format key (name=%n). A leading-space search missed lookahead_dropped_queued=, which opens a
+    // continued string literal (found by the r2 console run: actual=0).
+    for( const QString &f : fields ) ASSERT_EQ( 1, mw.count( f + QStringLiteral("%") ) );
+    // Fed where the spec says: the session reset, the present, both prune sites, the gap close.
+    ASSERT_TRUE( mw.contains( QStringLiteral("if( requestContext.playbackLookaheadRequest ) ++m_playbackLookaheadPresented;") ) );
+    ASSERT_EQ( 2, mw.count( QStringLiteral("m_playbackLookaheadPruned += static_cast<uint64_t>(") ) );
+    ASSERT_TRUE( mw.contains( QStringLiteral("gaps.busyMaxBucket = m_guiOtherBusySpans.dominantBucket( split.otherBusyMs );") ) );
 }
