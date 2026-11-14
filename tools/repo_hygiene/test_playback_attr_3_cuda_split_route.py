@@ -339,7 +339,9 @@ class AttributionJobTests(unittest.TestCase):
         function = function[: function.index("\nfunction ")]
         # Statement positions, not prose: the doc comment names ConvertFrom-Json too.
         # VENUE-STAGE-SAME-SHA-RESTAGE-GUARD-1 r8 (adversary A1): the read and the typed parse are two statements now; both follow the hash check.
-        for statement in ("$manifestText = [IO.File]::ReadAllText($Path)", "$manifest = try { $manifestText | ConvertFrom-Json -ErrorAction Stop }"):
+        # r10 (adversary A1 on 0b1fcfe2): ONE read; the bytes parsed are the bytes hashed, and that hash is checked before the parse too.
+        for statement in ("$manifestBytes = [IO.File]::ReadAllBytes($Path)", 'throw "ATTRCUDA_BUILD_MANIFEST_SHA_MISMATCH $Path expected=$ExpectedSha256 actual=$readSha',
+                          "$manifestText = [IO.StreamReader]::new([IO.MemoryStream]::new($manifestBytes)", "$manifest = try { $manifestText | ConvertFrom-Json -ErrorAction Stop }"):
             self.assertLess(
                 function.index('throw "ATTRCUDA_BUILD_MANIFEST_SHA_MISMATCH'),
                 function.index(statement),

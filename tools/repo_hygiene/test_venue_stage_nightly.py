@@ -1044,6 +1044,22 @@ class VenueStageNightlyTests(unittest.TestCase):
         sec = float(re.search(r"SEC=([0-9.]+)", p.stdout).group(1))
         self.assertLess(sec, 1.8, p.stdout)
 
+    def test_r10_a3_the_time_before_the_read_is_counted_once(self) -> None:
+        # r10 (adversary A3 on e9e6c210, VenueChain.psm1:749): with -ArtifactTimeoutSec 0 and -CallCapSec, the hash got $readSec - elapsed, and $readSec was
+        # already min(-TimeoutSec, what was left of -CallCapSec), so the time spent before the read was subtracted twice. Join-Path (in the first
+        # Get-VenueClaimShapeSource call, before the read) is shadowed to take 4 s: 20 - 4 - read is left, over -ArtifactMinSec 12; the double count left ~11.
+        share = self.case / "a3-share"
+        (share / "cache").mkdir(parents=True)
+        claim = {k: {"name": f"{k}.bin", "sha256": c * 64} for k, c in (("packageZip", "a"), ("exe", "b"), ("dll", "c"))}
+        (share / "cache" / f"playback-attr-3-cuda-{SHA[:12]}-build.json").write_text(
+            json.dumps({"sourceCommit": SHA, "dllPairManifestSha256": "d" * 64, "pendingSymbolPresence": True, **claim}), encoding="utf-8")
+        ps = (f"Import-Module '{DRIVER.parent / 'VenueChain.psm1'}' -Force -DisableNameChecking; "
+              "function global:Join-Path { [Threading.Thread]::Sleep(4000); Microsoft.PowerShell.Management\\Join-Path @args }; "
+              f"$r = Get-VenueStagedBuildManifest -AgentShare '{share}' -SourceCommit '{SHA}' -TimeoutSec 20 -CallCapSec 20 -ArtifactMinSec 12 -VerifyArtifacts "
+              "-ArtifactProbeScript { param($items) }; 'STATE=' + $r.state + ' ARTIFACT=[' + $r.artifactProblem + '] ERROR=[' + $r.error + ']'")
+        p = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", ps], capture_output=True, text=True, timeout=120, stdin=subprocess.DEVNULL)
+        self.assertIn("STATE=STAGED ARTIFACT=[] ERROR=[]", p.stdout, p.stdout + p.stderr)
+
     def test_a_cache_hash_that_differs_after_stage_ok_is_a_verify_mismatch(self) -> None:
         p = self.run_driver(env={"FAKE_UMRUN_STAGE": "wrongcache"})
         self.assert_exit(p, "STAGE_VERIFY_MISMATCH")

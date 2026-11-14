@@ -746,6 +746,21 @@ class BuildManifestAuthenticationTests(_PwshCase):
                 self.manifest_path.write_bytes(payload)
                 self.assert_throws(self.call(hashlib.sha256(payload).hexdigest()), "ATTRCUDA_BUILD_MANIFEST_UNPARSEABLE")
 
+    def test_r10_the_bytes_parsed_are_the_bytes_hashed(self) -> None:
+        # VENUE-STAGE-SAME-SHA-RESTAGE-GUARD-1 r10 (adversary A1 on 0b1fcfe2): the file was hashed, then read again to parse. Bytes swapped in between were
+        # parsed under the judged sha256: here sourceCommit 'not-a-sha' (the stage guard then took another commit's sound build for this name's corrupt one).
+        # Get-FileHash is shadowed so the swap lands exactly after the hash. The bytes parsed must be the bytes hashed: SHA_MISMATCH, never their content verdict.
+        sha = self.write()
+        swapped = json.dumps({"sourceCommit": "not-a-sha", "pendingSymbolPresence": True, "dllPairManifestSha256": "d" * 64}, indent=2)
+        proc = self.run_with_module(
+            "function global:Get-FileHash { $h = Microsoft.PowerShell.Utility\\Get-FileHash @args; "
+            f"[IO.File]::WriteAllText('{self.manifest_path}', '{swapped}'); $h }}\n"
+            + _guard(f"Assert-AttrCudaBuildManifest -Path '{self.manifest_path}' -ExpectedSha256 '{sha}' -ExpectedSourceCommit '{SHA_FIXTURE}'"),
+            name="swap-after-hash.ps1",
+        )
+        self.assert_throws(proc, "ATTRCUDA_BUILD_MANIFEST_SHA_MISMATCH")
+        self.assertNotIn("not-a-sha", proc.stdout)
+
 
 # --------------------------------------------------------------------------------------------
 # (d) the smoke-runner log contract
@@ -1275,10 +1290,11 @@ class StagedBuildNeverReplacedTests(_PwshCase):
         self.assertIn("RESULT=STAGE_FAILED STEP=stagedBuildGuard EXIT=7", second.stdout)
         self.assertEqual(self.snapshot(), before, "another commit's staged build was rewritten")
 
-    def test_r9_another_commits_build_that_cannot_be_read_again_fails_closed(self) -> None:
-        # r9 fix iteration 3 (adversary A1 on d7d19398): after the guard judged the resident manifest COMMIT_MISMATCH, its commit is read again to tell another
-        # commit's build from this name's corrupt one. That re-read failing (held FileShare.None) or finding other bytes made the commit '' and the build was
-        # replaced. Both now fail closed: STAGE_REFUSED_STAGED_UNREADABLE, exit 7, the resident manifest left as it is.
+    def test_r9_another_commits_build_held_or_changed_after_the_judgement_is_never_replaced(self) -> None:
+        # r9 fix iteration 3 (adversary A1 on d7d19398): after the guard judged the resident manifest COMMIT_MISMATCH, its commit was read again to tell another
+        # commit's build from this name's corrupt one; a held or changed file made that commit '' and the build was replaced (r9: fail closed, UNREADABLE).
+        # r10 (adversary A1 on 0b1fcfe2): there is no second read: the commit is the one the judged bytes declare, so a file held (FileShare.None) or changed
+        # after the judgement changes nothing: STAGE_REFUSED_STAGED_OTHER_COMMIT, exit 7, the manifest left as it is.
         if os.name != "nt":
             self.skipTest("the held case takes a FileShare.None handle through kernel32")
         import ctypes
@@ -1321,9 +1337,21 @@ class StagedBuildNeverReplacedTests(_PwshCase):
                     if a.poll() is None:
                         a.kill()
                 self.assertEqual(a.returncode, 7, f"{out}\n{err}")
-                self.assertRegex(out, rf"(?m)^STAGE_REFUSED_STAGED_UNREADABLE sha={SHA_FIXTURE[:12]} ")
+                self.assertRegex(out, rf"(?m)^STAGE_REFUSED_STAGED_OTHER_COMMIT sha={SHA_FIXTURE[:12]} staged=[0-9a-f]{{8}} stagedCommit={other} ")
                 self.assertIn("RESULT=STAGE_FAILED STEP=stagedBuildGuard EXIT=7", out)
                 self.assertEqual((self.cache / self.manifest_name).read_bytes(), expect, "another commit's build was replaced")
+
+    def test_r10_the_stage_guard_names_the_commit_from_the_judged_bytes_only(self) -> None:
+        # r10 (adversary A1 on 0b1fcfe2, sibling of AttrCudaArtifacts.psm1:399): between the judgement and the retirement the guard opens the manifest no more
+        # (r9 hashed, read and hashed it again: three opens a writer could interleave); its commit is the one Assert-AttrCudaBuildManifest's refusal names.
+        text = STAGE_GENERATOR.read_text(encoding="utf-8")
+        guard = text[text.index("if ($unsound -match '^ATTRCUDA_BUILD_MANIFEST_COMMIT_MISMATCH ') {"):text.index("Remove-AttrCudaInputFileByContent -TrustedRoot $AgentRoot -Path $manifestCachePath")]
+        self.assertNotIn("$manifestCachePath)", guard.replace("$mismatchHead", ""))
+        self.assertNotIn("Get-ShaLower", guard)
+        self.assertNotIn("ReadAll", guard)
+        body = re.search(r"(?ms)^function Assert-AttrCudaBuildManifest \{.*?^\}", MODULE.read_text(encoding="utf-8")).group(0)
+        self.assertEqual(body.count("[IO.File]::ReadAll"), 1, "the manifest is read once")
+        self.assertIn("$manifestText = [IO.StreamReader]::new([IO.MemoryStream]::new($manifestBytes)", body)
 
     def test_r9_the_stage_lock_is_one_for_every_sha_that_shares_the_cache_names(self) -> None:
         # r9 fix iteration (adversary A1 on 9825bfd9): the lock was keyed on the full sha, so two commits with the same 12 hex (the same cache files) never

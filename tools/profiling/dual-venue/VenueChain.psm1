@@ -679,6 +679,9 @@ function Get-VenueStagedBuildManifest {
     # r6 fix iteration (adversary A2 on 424df284): -CallCapSec bounds the WHOLE call, the manifest read too (it bounded only the hash, so a read stuck past the cap
     # answered NOT_STAGED after it). Under 1 s of it (the least a read can be given) there is no read: UNREACHABLE.
     $readSec = $TimeoutSec
+    # r10 (adversary A3 on e9e6c210): the end of the call's bound on its own clock (-TimeoutSec, or -CallCapSec when sooner), what an unbounded hash is given what is left of.
+    # $readSec is a remainder already (the cap less the time before the read), so the hash's remainder taken from it counted that time twice.
+    $boundEndSec = $(if ($CallCapSec -gt 0) { [Math]::Min($TimeoutSec, $CallCapSec) } else { $TimeoutSec })
     if ($CallCapSec -gt 0) {
         $capLeft = $CallCapSec - $callClock.Elapsed.TotalSeconds
         if ($capLeft -lt 1.0) { return [pscustomobject]@{ state = 'UNREACHABLE'; sha256 = $null; path = $path; error = "the staged manifest could not be read: no time is left of -CallCapSec $([Math]::Round($CallCapSec, 2)) ($([Math]::Floor([Math]::Max(0.0, $capLeft) * 100.0) / 100.0) s left, under 1)"; contentProblem = $null } }
@@ -746,7 +749,8 @@ function Get-VenueStagedBuildManifest {
             if ($artSec -le 0) {
                 # r7 (sol r6 B1): the exact remainder, not its whole seconds (2.7 s left was floored to 1, under the guard's 2 s minimum, and a healthy hash never started)
                 # r6 fix iteration (A2): what is left of the manifest read's own bound, which -CallCapSec already shortened
-                $left = $readSec - $callClock.Elapsed.TotalSeconds
+                # r10 (adversary A3 on e9e6c210): from the bound's end on the call clock, never from $readSec (the time before the read was subtracted twice)
+                $left = $boundEndSec - $callClock.Elapsed.TotalSeconds
                 # r10 (adversary pass 2 A3): the time left is printed rounded DOWN to hundredths -- Round(1.999, 2) printed "2 s left, under 2"
                 # r5 (adversary r5 A2): -ArtifactMinSec is the least a hash may START with; the lease batch guard asks for its own minimum ($script:GuardReadMinSec, the same rule)
                 if ($left -lt $ArtifactMinSec) { return [pscustomobject]@{ state = 'UNREACHABLE'; sha256 = $null; path = $path; error = "the cached artifacts could not be hashed: no time is left of -TimeoutSec $([Math]::Round($TimeoutSec, 2)) after the manifest read ($([Math]::Floor([Math]::Max(0.0, $left) * 100.0) / 100.0) s left, under $ArtifactMinSec)"; contentProblem = $null; artifactProblem = $null; artifactsUnhashed = $true } }
