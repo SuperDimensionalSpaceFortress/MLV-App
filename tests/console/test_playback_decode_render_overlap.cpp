@@ -724,12 +724,18 @@ TEST(PlaybackLookaheadCpuRouteWiring, TheLookaheadFrameAndThePruneWindowFollowTh
 TEST(PlaybackLookaheadCpuRouteWiring, TheLoopPruneDistanceIsModuloTheCutFrameCount)
 {
     const QString rft = readRepoText( "platform/qt/RenderFrameThread.cpp" );
-    const QString window = functionBody( rft, QStringLiteral("bool playbackFrameWithinLookaheadWindow( uint32_t frameNumber,") );
+    const QString wrapper = functionBody( rft, QStringLiteral("bool playbackFrameWithinLookaheadWindow( uint32_t frameNumber,") );
+    ASSERT_FALSE( wrapper.isEmpty() );
+    // r5 (adversary A1 on 63652a97): the rule moved to PlaybackFrameRange.h, which the tests call; the thread delegates to it.
+    ASSERT_TRUE( wrapper.contains( QStringLiteral("return playback_frame_range::frameWithinLookaheadWindow( frameNumber, activePlaybackTarget,") ) );
+    const QString range = readRepoText( "platform/qt/PlaybackFrameRange.h" );
+    const QString window = functionBody( range, QStringLiteral("inline bool frameWithinLookaheadWindow( uint32_t frameNumber,") );
     ASSERT_FALSE( window.isEmpty() );
-    ASSERT_TRUE( window.contains( QStringLiteral("const int loopSpan = cutOut - cutIn + 1;") ) );
+    ASSERT_TRUE( window.contains( QStringLiteral("const long long loopSpan = static_cast<long long>( cutOut ) - cutIn + 1;") ) );
     ASSERT_TRUE( window.contains( QStringLiteral("if( distance < 0 ) distance += loopSpan;") ) );
     ASSERT_TRUE( window.contains( QStringLiteral("return distance >= 0 && distance <= depth;") ) );
-    ASSERT_TRUE( window.contains( QStringLiteral("&& frame <= std::min( cutOut, activePlaybackTarget + depth );") ) );
+    ASSERT_TRUE( window.contains( QStringLiteral("const long long windowEnd = target + depth;") ) );
+    ASSERT_TRUE( window.contains( QStringLiteral("&& frame <= std::min( static_cast<long long>( cutOut ), windowEnd );") ) );
     const QString h = readRepoText( "platform/qt/RenderFrameThread.h" );
     ASSERT_TRUE( h.contains( QStringLiteral(
         "static int playbackFrameSlotCount( void ) { return configuredFrameSlotCount(); }") ) );

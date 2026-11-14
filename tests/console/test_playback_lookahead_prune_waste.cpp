@@ -75,7 +75,7 @@ PruneRun simulateDropFramePrune( bool cpuRoute, int depth, double advance, doubl
         const int window = lookaheadWindowFrames( depth, cpuRoute );
         for( auto it = outstanding.begin(); it != outstanding.end(); )
         {
-            if( *it < target || *it > target + window )
+            if( *it < target || *it > static_cast<long long>( target ) + window )
             {
                 ++run.pruned;
                 it = outstanding.erase( it );
@@ -270,10 +270,10 @@ SlotBudgetRun simulateSlotBudget( int depth, double pipelineMs, double prepMs, d
                 stride.noteTarget( target, position );
                 for( ModelSlot &s : slots )
                     if( s.state == SlotState::Ready && s.lookahead && s.frame != target
-                     && ( s.frame < target || s.frame > target + window ) )
+                     && ( s.frame < target || s.frame > static_cast<long long>( target ) + window ) )
                         s = ModelSlot();
                 for( auto it = queue.begin(); it != queue.end(); )
-                    if( it->lookahead && ( it->frame < target || it->frame > target + window ) ) it = queue.erase( it );
+                    if( it->lookahead && ( it->frame < target || it->frame > static_cast<long long>( target ) + window ) ) it = queue.erase( it );
                     else ++it;
                 if( !covered( target ) )
                 {
@@ -337,21 +337,11 @@ namespace
 
 // RenderFrameThread.cpp playbackFrameWithinLookaheadWindow, mirrored (it is not in a header). The Loop branch measures the
 // distance modulo the cut's frame count, cutOut - cutIn + 1; TheLoopPruneDistanceIsModuloTheCutFrameCount pins that source.
+// r5 (adversary A1 on 63652a97): no longer a mirror; the rule moved to PlaybackFrameRange.h and this calls it.
 bool withinPruneWindow( int frame, int target, int cutInFrame, int cutOutFrame, int depth, bool loopEnabled )
 {
-    if( target < 0 || depth < 0 ) return true;
-    if( frame == target ) return true;
-    if( cutOutFrame < cutInFrame ) return frame >= target && frame <= target + depth;
-    const int cutIn = std::max( 0, cutInFrame );
-    const int cutOut = std::max( cutIn, cutOutFrame );
-    if( target < cutIn || target > cutOut || frame < cutIn || frame > cutOut )
-        return frame >= target && frame <= target + depth;
-    if( !loopEnabled ) return frame >= target && frame <= std::min( cutOut, target + depth );
-    const int loopSpan = cutOut - cutIn + 1;
-    if( loopSpan <= 0 ) return frame == target;
-    int distance = frame - target;
-    if( distance < 0 ) distance += loopSpan;
-    return distance >= 0 && distance <= depth;
+    return playback_frame_range::frameWithinLookaheadWindow( static_cast<uint32_t>( frame ), target, cutInFrame, cutOutFrame,
+                                                             depth, loopEnabled );
 }
 
 struct ScriptedSlotsRun
@@ -669,6 +659,27 @@ TEST(PlaybackLookaheadPruneWaste, TheCpuPredictionMirrorsTheEnginesDoubleAdditio
     ASSERT_EQ( lookaheadOffsetFrames( 1, true, fraction, 1.0 ), 1 );
     ASSERT_EQ( lookaheadOffsetFrames( 1, true, fraction, 1.0, 127 ), 2 );
     ASSERT_EQ( lookaheadOffsetFrames( 1, false, fraction, 1.0, 127 ), 1 );   // the texture route is k, unchanged
+}
+
+// RED on 63652a97 (adversary A1, pass 13): the CPU window (depth x 3 + 1 = 4) near INT_MAX. target 2147483644 + 4 overflowed
+// int (undefined; wrapped it is -2147483648), so the valid lookahead 2147483645 was pruned. The Loop span of a cut 0..INT_MAX
+// (cutOut - cutIn + 1) overflowed the same way, and so did the out-of-cut branch's end point.
+TEST(PlaybackLookaheadPruneWaste, ThePruneWindowNeverOverflowsNearTheLastRepresentableFrame)
+{
+    const int intMax = std::numeric_limits<int>::max();
+    const int window = lookaheadWindowFrames( 1, true );
+    ASSERT_EQ( window, 4 );
+    // The adversary's input: Loop off, Cut 1..INT_MAX (frames 0..2147483646), target 2147483644, lookahead 2147483645.
+    ASSERT_TRUE( withinPruneWindow( 2147483645, 2147483644, 0, intMax - 1, window, false ) );
+    ASSERT_TRUE( withinPruneWindow( 2147483646, 2147483644, 0, intMax - 1, window, false ) );
+    ASSERT_FALSE( withinPruneWindow( 2147483643, 2147483644, 0, intMax - 1, window, false ) );   // behind: pruned
+    // Out-of-cut branch (target past cutOut): the end point target + depth.
+    ASSERT_TRUE( withinPruneWindow( intMax, intMax - 2, 0, 10, window, false ) );
+    // Invalid cut (cutOut < cutIn): the same end point.
+    ASSERT_TRUE( withinPruneWindow( intMax, intMax - 2, 10, 5, window, true ) );
+    // Loop over 0..INT_MAX: the span is 2^31; target INT_MAX - 1, frame 1 is 3 ahead after the wrap.
+    ASSERT_TRUE( withinPruneWindow( 1, intMax - 1, 0, intMax, window, true ) );
+    ASSERT_FALSE( withinPruneWindow( 10, intMax - 1, 0, intMax, window, true ) );
 }
 
 // Adversary A3 on 05511dac: 0.9999999999999999 + 3.0 rounds to 4.0, past the depth-1 window of 3.

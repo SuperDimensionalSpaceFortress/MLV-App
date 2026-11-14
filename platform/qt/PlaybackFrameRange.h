@@ -333,6 +333,51 @@ inline DropFrameTickResult advanceDropFrameTick(
     return result;
 }
 
+// The forward window RenderFrameThread::prunePlaybackLookaheadOutsideForwardWindow keeps around the active playback target
+// (RenderFrameThread.cpp playbackFrameWithinLookaheadWindow delegates here, so the tests run the real rule).
+// CPU-S1-PACE-POST-785-LEVER-1 r5 (adversary A1 on 63652a97): every end point, span and distance is 64-bit. The CPU window
+// (depth x 3 + 1) made target 2147483644 + 4 overflow int, undefined, and wrapped to -2147483648 it pruned the valid
+// lookahead 2147483645; the Loop span of a cut 0..INT_MAX (cutOut - cutIn + 1) overflowed the same way.
+inline bool frameWithinLookaheadWindow( uint32_t frameNumber, int activePlaybackTarget, int cutInFrame, int cutOutFrame,
+                                        int lookaheadDepth, bool loopEnabled )
+{
+    if( activePlaybackTarget < 0 || lookaheadDepth < 0 ) return true;
+
+    const int frame = static_cast<int>( frameNumber );
+    const long long depth = std::max( 0, lookaheadDepth );
+    if( frame == activePlaybackTarget ) return true;
+    const long long target = activePlaybackTarget;
+    const long long windowEnd = target + depth;
+
+    if( cutOutFrame < cutInFrame )
+    {
+        return frame >= target
+            && frame <= windowEnd;
+    }
+
+    const int cutIn = std::max( 0, cutInFrame );
+    const int cutOut = std::max( cutIn, cutOutFrame );
+    if( activePlaybackTarget < cutIn || activePlaybackTarget > cutOut
+     || frame < cutIn || frame > cutOut )
+    {
+        return frame >= target
+            && frame <= windowEnd;
+    }
+
+    if( !loopEnabled )
+    {
+        return frame >= target
+            && frame <= std::min( static_cast<long long>( cutOut ), windowEnd );
+    }
+
+    const long long loopSpan = static_cast<long long>( cutOut ) - cutIn + 1;
+    if( loopSpan <= 0 ) return frame == activePlaybackTarget;
+
+    long long distance = static_cast<long long>( frame ) - target;
+    if( distance < 0 ) distance += loopSpan;
+    return distance >= 0 && distance <= depth;
+}
+
 // r33 B1: whether the drop-frame position (m_newPosDropMode) is inside the normalized cut \a range. Below the cut's first frame
 // it is out. With \a presentLastFrame (MainWindow passes playbackConformActive(), as it does to advanceDropFrameTick) a position
 // in [last, dropFrameLoopWrapAt) is IN range: the conformed engine holds the last frame there and its fraction is the sub-frame
