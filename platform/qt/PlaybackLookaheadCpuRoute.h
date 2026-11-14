@@ -107,9 +107,15 @@ private:
  *  outside [0, 1) or a non-finite one counts as 0. \a strideFrames is clamped to [1, kMaxStrideFrames], and a non-finite value counts as 1. */
 inline int lookaheadOffsetFrames( int k, bool cpuRoute, double positionFraction, double strideFrames )
 {
-    // RED (80c753d8's rule): requestedFrame + k on every route.
-    (void)cpuRoute; (void)positionFraction; (void)strideFrames;
-    return k;
+    if( !cpuRoute || k <= 0 ) return k;
+    double fraction = std::isfinite( positionFraction ) ? positionFraction : 0.0;
+    if( fraction < 0.0 ) fraction = 0.0;
+    if( fraction >= 1.0 ) fraction = 0.0;
+    double stride = std::isfinite( strideFrames ) ? strideFrames : kMinStrideFrames;
+    if( stride < kMinStrideFrames ) stride = kMinStrideFrames;
+    if( stride > kMaxStrideFrames ) stride = kMaxStrideFrames;
+    const int offset = static_cast<int>( std::floor( fraction + static_cast<double>( k ) * stride ) );
+    return offset < k ? k : offset;
 }
 
 /*! The forward window prunePlaybackLookaheadOutsideForwardWindow keeps, in frames past the active target. The
@@ -118,8 +124,8 @@ inline int lookaheadOffsetFrames( int k, bool cpuRoute, double positionFraction,
  *  are still pruned. */
 inline int lookaheadWindowFrames( int depth, bool cpuRoute )
 {
-    (void)cpuRoute; // RED (80c753d8's rule): the depth on every route.
-    return depth;
+    if( !cpuRoute || depth <= 0 ) return depth;
+    return depth * kMaxStrideFrames;
 }
 
 } // namespace playback_lookahead_cpu
