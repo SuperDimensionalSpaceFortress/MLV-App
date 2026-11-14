@@ -23,7 +23,9 @@
 #      8a), the next leg would outlive the lease (LEASE_REMAINING_SHORT: the rest go to the next batch; also
 #      a busy probe with less room left after the leg's budget than one -RecheckSec), the lease was lost (LEASE_LOST), demoted (LEASE_DEMOTED / LEASE_RENEW_UNKNOWN, 6e)
 #      or ended under a leg (LEASE_EXPIRED, 7b), the agent released it as idle while a probe waited with no job (LEASE_IDLE_ENDED: read from the agent's receipt after each probe;
-#      no leg launches on that reading, the leg goes to the next batch), the deadline passed (DEADLINE), or a probe could not measure (PROBE_<verdict>: the run stops). An open still
+#      no leg launches on that reading, the leg goes to the next batch; r3: -IdleEndedZeroLegMax consecutive such batches with no leg launched stop the run LEASE_IDLE_CHURN, exit 14,
+#      and an in-lease probe's wait is cut below the agent's idle bound, AGENT_IDLE_BOUND_UNKNOWN exit 10 when the agent script gives none), the deadline passed (DEADLINE), or a probe
+#      could not measure (PROBE_<verdict>: the run stops). An open still
 #      unanswered is cancelled and reconciled first (7a). The light job
 #      lease-batch-close-<stamp>-lb<token> then releases the lease at once (the agent's idle bound would, later). The agent's own batch receipt is read by
 #      name (logs\lease-batch-<token>.jsonl), and the claim is released.
@@ -143,9 +145,11 @@
 # non-zero (LEG_FAILED), was killed at the lease's end (LEASE_EXPIRED) or stayed THERMAL_HOT_SKIPPED past its re-queues (item 10; the run goes on); 9 a batch lease could not be opened (the open job was RETRACTED,
 # UNRESOLVED or not admitted, or never submitted because its sidecar could not be written: LIVENESS_UNAVAILABLE, or its job file could not be written here:
 # OPEN_JOB_WRITE_FAILED, or refused at its dispatch because the agent could admit it after the claim's last good expiry while the keeper is not renewing the claim:
-# OPEN_OUTLIVES_CLAIM (CLAIM_LOST when the keeper found it lost), no cancel, no close, no ledger charge); 10 the agent is not batch-capable; 11 an open left in the agent's gate was cancelled but never reconciled (OPEN_CANCEL_UNRECONCILED,
+# OPEN_OUTLIVES_CLAIM (CLAIM_LOST when the keeper found it lost), no cancel, no close, no ledger charge); 10 the agent is not batch-capable (r3: or the agent script gives no
+# LeaseBatchIdleSec default, AGENT_IDLE_BOUND_UNKNOWN: nothing runs on the lease, it is closed); 14 (r3) -IdleEndedZeroLegMax consecutive batches ended LEASE_IDLE_ENDED with no leg
+# launched (LEASE_IDLE_CHURN: the venue stays busy past the agent's idle bound, so no further lease is opened); 11 an open left in the agent's gate was cancelled but never reconciled (OPEN_CANCEL_UNRECONCILED,
 # 7a); 12 an unexpected throw inside a batch after its claim was taken (BATCH_ERROR: the claim keeper is stopped, the claim released and the batch receipt written
-# first; a leg whose child had started is LEG_FAILED reason=BATCH_ERROR, the legs never started are NOT_RUN). A stopping code (2-6, 9, 10) replaces 0 or 7; 12 replaces every other code but 11, and 11 replaces every other code.
+# first; a leg whose child had started is LEG_FAILED reason=BATCH_ERROR, the legs never started are NOT_RUN). A stopping code (2-6, 9, 10, 14) replaces 0 or 7; 12 replaces every other code but 11, and 11 replaces every other code.
 # 13 a receipt file could not be written (batch-NN.json or batches.jsonl, e.g. occupied by a directory): RECEIPT_PERSIST_FAILED file=<path> reason=<msg> is logged once per failure, the summary still prints with
 # receiptPersistFailures, and every other code keeps its own meaning (13 replaces only a clean 0), so a lost receipt is never an exit 0. Each receipt is serialized with the live logWriteFailures (the diagnostic itself can fail to log).
 # r5: a receipt write the input guard skipped (an accepted input is a runner output) is a receiptPersistFailures entry too (reason WRITE_SUPPRESSED <stop reason>), and a hit seen at a receipt
@@ -191,6 +195,11 @@ param(
     [ValidateRange(1, 3600)][int]$RecheckSec = 90,
     # one in-lease probe waits at most this long (and never past the room the lease has left for the leg)
     [ValidateRange(0, 3600)][int]$ProbeMaxWaitSec = 600,
+    # r3 (Grok G1 on #817): and never past the agent's idle bound for a parked lease (LeaseBatchIdleSec, read from the agent script's own param default: one home, no copy
+    # here) less this margin and -CooldownSec, so a probe's gate wait (no job) cannot outlast the lease it runs under
+    [ValidateRange(0, 1800)][int]$ProbeIdleMarginSec = 60,
+    # r3 (Grok G1): this many CONSECUTIVE batches that ended LEASE_IDLE_ENDED with no leg launched stop the run (LEASE_IDLE_CHURN, exit 14) instead of a lease after lease
+    [ValidateRange(1, 100)][int]$IdleEndedZeroLegMax = 2,
     [ValidateRange(60, 2700)][int]$LegBudgetSec = 360,
     [ValidateRange(0, 900)][int]$LeaseMarginSec = 120,
     [ValidateRange(0, 3600)][int]$CooldownSec = 0,
@@ -1652,6 +1661,20 @@ function ConvertTo-AgentUtc($Value) {
     $null
 }
 
+function Get-AgentLeaseBatchIdleSec([string]$AgentScript) {
+    # r3 (Grok G1 on #817): the agent's idle bound for a parked batch lease, LeaseBatchIdleSec, as the agent script's own param block declares it (AST; the same script the open's
+    # liveness read-back lifts its functions from). $null when the script, the parameter or a positive integer default cannot be read: the caller then runs nothing on the lease.
+    try {
+        $ast = [System.Management.Automation.Language.Parser]::ParseFile($AgentScript, [ref]$null, [ref]$null)
+        if ($null -eq $ast.ParamBlock) { return $null }
+        $p = @($ast.ParamBlock.Parameters | Where-Object { [string]::Equals($_.Name.VariablePath.UserPath, 'LeaseBatchIdleSec', [StringComparison]::OrdinalIgnoreCase) })
+        if ($p.Count -ne 1 -or $p[0].DefaultValue -isnot [System.Management.Automation.Language.ConstantExpressionAst]) { return $null }
+        $v = $p[0].DefaultValue.Value
+        if ($v -is [int] -and $v -gt 0) { return [int]$v }
+    } catch { }
+    $null
+}
+
 function Get-LeaseIdleEnd([string]$Token, [string]$LeaseId) {
     # LEASE-BATCH-IDLE-END-UNSEEN-1: the agent releases a parked batch lease after LeaseBatchIdleSec (300 s) with no job (ultra-magnus-agent.ps1 Update-LeaseBatchHold) and writes its
     # receipt line (endReason=idle) at once. A quiet probe that waits in Wait-VenueQuiet's queue gate submits no job for that long, so the lease can end under the wait while the runner
@@ -1680,6 +1703,8 @@ $batches = [System.Collections.Generic.List[object]]::new()
 $exitCode = 0
 $stopReason = $null
 $legBudget = $LegBudgetSec
+$agentIdleSec = $null      # r3 (Grok G1): the agent's LeaseBatchIdleSec, read once a lease is in hand (Get-AgentLeaseBatchIdleSec)
+$idleZeroLegRun = 0        # r3 (Grok G1): consecutive batches that ended LEASE_IDLE_ENDED with no leg launched
 $script:guardBudget = $null   # r3: the content guard's bound while one is in force (New-GuardBudget)
 $batchNo = 0
 # LEASE-BATCH-RECEIPT-PERSIST-FAILURE-REPORTING-1 (Dot B6 on #684): a receipt file the run cannot write (batches.jsonl or batch-NN.json occupied by a directory, a held or full disk) is a
@@ -2152,9 +2177,17 @@ while ($pending.Count -gt 0 -and $null -eq $stopReason) {
             $b.leaseEndUtc = $leaseEnd.ToString('o')
             L "BATCH_OPEN batch=$batchNo token=$token lease=$($b.leaseId) held=$($b.held) minutes=$($b.leaseMinutes) roomSec=$([int]($leaseEnd - [DateTime]::UtcNow).TotalSeconds) openWaitedSec=$($b.openWaitedSec) refusals=$(@($b.refusals).Count)"
             # (3) the legs, under the lease
+            # r3 (Grok G1 on #817): the agent releases this lease after LeaseBatchIdleSec with no job, and a probe's gate wait submits none, so every in-lease probe waits at most
+            # that bound less -ProbeIdleMarginSec and -CooldownSec (the cooldown sleep after a leg is no-job time too). No bound readable: nothing runs on the lease (fail closed).
+            if ($null -eq $agentIdleSec) { $agentIdleSec = Get-AgentLeaseBatchIdleSec (Join-Path $here '..\bachelor\ultra-magnus-agent.ps1') }
+            if ($null -eq $agentIdleSec) {
+                $b.endReason = 'AGENT_IDLE_BOUND_UNKNOWN'; $b.endDetail = "the agent script ($(Join-Path $here '..\bachelor\ultra-magnus-agent.ps1')) gives no LeaseBatchIdleSec default: no probe or leg runs on lease $($b.leaseId)"
+                Set-Stop 'AGENT_IDLE_BOUND_UNKNOWN' 10; LogBest "AGENT_IDLE_BOUND_UNKNOWN batch=$batchNo lease=$($b.leaseId) (no probe or leg runs on it; the lease is closed)"
+            }
+            $probeIdleCap = $(if ($null -ne $agentIdleSec) { [int][Math]::Max(0, $agentIdleSec - $ProbeIdleMarginSec - $CooldownSec) } else { 0 })
             $attempt = 0
             $launchShort = $false
-            while ($pending.Count -gt 0) {
+            while ($pending.Count -gt 0 -and $null -eq $b.endReason) {
                 $leg = $pending[0]; $inFlightLeg = $null
                 if ($script:RunOutputAliased) { Stop-BatchOnSuppression $b; break }   # r7: a write refused anywhere in the batch: no probe or leg runs after it
                 if ([DateTime]::UtcNow -ge $deadline) { $b.endReason = 'DEADLINE'; Set-Stop 'DEADLINE' 3; break }
@@ -2168,7 +2201,7 @@ while ($pending.Count -gt 0 -and $null -eq $stopReason) {
                     break
                 }
                 $attempt++
-                $probeWait = [int][Math]::Max(0, [Math]::Min($ProbeMaxWaitSec, $room - $legBudget))
+                $probeWait = [int][Math]::Max(0, [Math]::Min([Math]::Min($ProbeMaxWaitSec, $probeIdleCap), $room - $legBudget))   # r3 (Grok G1): and under the agent's idle bound
                 # adversary r1b A1: a re-probe during a thermal wait may wait for quiet only for what is left of the thermal cap. Its fixed sample window and the remote
                 # job's own queue limits still run and are not bounded here: the cap is a soft budget (cap + one probe), see the Get-VenueThermalProbeBudget comment
                 # r6 (adversary r5 A1): that cut is made at the dispatch (Invoke-QuietProbe), after every check that can stall, never here at the loop top
@@ -2452,6 +2485,13 @@ while ($pending.Count -gt 0 -and $null -eq $stopReason) {
             # r8 pass 3 (#704): nor is room the guards ate at the launch
             if ($b.endReason -ceq 'LEASE_REMAINING_SHORT' -and $b.legsAttempted -eq 0 -and $b.probeRetries -eq 0 -and $b.thermalWaits -eq 0 -and $b.thermalSkips -eq 0 -and -not $launchShort) {
                 $b.endReason = 'LEG_BUDGET_EXCEEDS_LEASE'; Set-Stop 'LEG_BUDGET_EXCEEDS_LEASE' 2
+            }
+            # r3 (Grok G1 on #817): a venue that stays busy past the agent's idle bound ends batch after batch LEASE_IDLE_ENDED with no leg, each one a fresh lease (a ledger and
+            # budget charge). -IdleEndedZeroLegMax such batches IN A ROW stop the run typed; a batch that launched a leg, or ended any other way, starts the count again.
+            if ($b.endReason -ceq 'LEASE_IDLE_ENDED' -and $b.legsAttempted -eq 0) { $idleZeroLegRun++ } else { $idleZeroLegRun = 0 }
+            if ($idleZeroLegRun -ge $IdleEndedZeroLegMax) {
+                $b.endDetail = "$($b.endDetail); $idleZeroLegRun consecutive batches ended LEASE_IDLE_ENDED with no leg launched (-IdleEndedZeroLegMax $IdleEndedZeroLegMax): the run stops LEASE_IDLE_CHURN"
+                Set-Stop 'LEASE_IDLE_CHURN' 14; LogBest "LEASE_IDLE_CHURN batch=$batchNo zeroLegIdleEnds=$idleZeroLegRun max=$IdleEndedZeroLegMax (no further lease is opened)"
             }
         }
     } catch {

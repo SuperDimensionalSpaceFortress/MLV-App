@@ -849,6 +849,83 @@ class VenueLeaseBatchRunnerTests(unittest.TestCase):
         self.assertEqual((b1["endReason"], b1["legsRan"]), ("ALL_LEGS_DONE", 2), b1)
         self.assertEqual((b1["agent"]["token"], b1["agent"]["endReason"]), (b1["token"], "closed"), b1["agent"])
 
+    # ---------------------------------------------------------------- r3 (Grok CoS G1 on #817): the probe's wait vs the agent's idle bound, and the churn it caused
+    def _in_lease_waits(self) -> list[int]:
+        return [int(l.rsplit("maxWait=", 1)[1]) for l in self.events_raw() if " QUIET " in l]
+
+    def test_lease_batch_idle_end_r3_grok_g1_consecutive_zero_leg_idle_ends_stop_the_run_typed(self) -> None:
+        # G1: a venue whose probe outlasts the agent's idle bound every time ended batch after batch LEASE_IDLE_ENDED with no leg, each one a fresh lease (a ledger and budget charge),
+        # until the deadline. Batch 1 runs fx-a and idles on fx-b's probe (a leg was attempted: no churn yet); batches 2 and 3 open, idle and launch nothing: the second consecutive
+        # zero-leg idle end stops the run typed (LEASE_IDLE_CHURN, exit 14), three leases in all, fx-b NOT_RUN, never a fourth open.
+        dl = utc_iso(datetime.now(timezone.utc) + timedelta(seconds=120))
+        r = self.run_batch(self.specs[:2], "-DeadlineUtc", dl, FAKE_QUIET_MODES="QUIET,IDLE,IDLE,IDLE,IDLE,IDLE,IDLE,IDLE")
+        self.assertEqual(r.returncode, 14, r.stdout + r.stderr)
+        bs = self.batches()
+        self.assertEqual(len(bs), 3, [(b["endReason"], b["legsAttempted"]) for b in bs])
+        t1, t2, t3 = (b["token"] for b in bs)
+        self.assertEqual(self.kinds(), [f"OPEN:{t1}", "QUIET:QUIET", f"LEG:fx-a:{t1}", "QUIET:IDLE", f"CLOSE:{t1}", f"OPEN:{t2}", "QUIET:IDLE", f"CLOSE:{t2}",
+                                        f"OPEN:{t3}", "QUIET:IDLE", f"CLOSE:{t3}"])
+        self.assertEqual([(b["endReason"], b["legsAttempted"]) for b in bs], [("LEASE_IDLE_ENDED", 1), ("LEASE_IDLE_ENDED", 0), ("LEASE_IDLE_ENDED", 0)])
+        res = batch_result(r.stdout)
+        self.assertEqual((res["exitCode"], res["stopReason"], res["ran"], res["counted"], res["notRun"]), (14, "LEASE_IDLE_CHURN", 1, 1, 1))
+        self.assertIn("LEASE_IDLE_CHURN", (self.run_dir / "batch.log").read_text(encoding="utf-8"))
+
+    def test_lease_batch_idle_end_r3_grok_g1_one_zero_leg_idle_end_between_legs_is_no_churn(self) -> None:
+        # control: a zero-leg idle end followed by a batch that launches a leg resets the count, so the run finishes (exit 0, 3 leases): only CONSECUTIVE zero-leg idle ends stop it
+        r = self.run_batch(self.specs[:2], FAKE_QUIET_MODES="QUIET,IDLE,IDLE,QUIET")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        bs = self.batches()
+        self.assertEqual([(b["endReason"], b["legsAttempted"]) for b in bs], [("LEASE_IDLE_ENDED", 1), ("LEASE_IDLE_ENDED", 0), ("ALL_LEGS_DONE", 1)])
+        res = batch_result(r.stdout)
+        self.assertEqual((res["exitCode"], res["stopReason"], res["ran"], res["notRun"]), (0, None, 2, 0))
+
+    def test_lease_batch_idle_end_r3_grok_g1_the_in_lease_probe_wait_stays_under_the_agents_idle_bound(self) -> None:
+        # G1: -ProbeMaxWaitSec (600 by default) let one probe wait twice the agent's idle bound (LeaseBatchIdleSec 300) with no job, so the lease idled out under it. The in-lease
+        # wait is cut to the agent's bound less -ProbeIdleMarginSec (60 by default) and -CooldownSec (0 here): 240 s, with the lease's room far larger.
+        r = self.run_batch(self.specs[:2], "-ProbeMaxWaitSec", "600")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertEqual(self._in_lease_waits(), [240, 240], self.events_raw())
+        self.setUp()
+        r = self.run_batch(self.specs[:2], "-ProbeMaxWaitSec", "600", "-ProbeIdleMarginSec", "100")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertEqual(self._in_lease_waits(), [200, 200], self.events_raw())
+        # a shorter -ProbeMaxWaitSec is kept as it is
+        self.setUp()
+        r = self.run_batch(self.specs[:2], "-ProbeMaxWaitSec", "30")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertEqual(self._in_lease_waits(), [30, 30], self.events_raw())
+
+    def test_lease_batch_idle_end_r3_grok_g1_the_idle_bound_is_read_from_the_agent_script_not_a_second_copy(self) -> None:
+        # the bound has ONE home, the agent's own param default (LeaseBatchIdleSec): a copy of the tree whose agent says 200 cuts the wait to 200 - 60 = 140
+        tree = self.case / "tree" / "tools" / "profiling"
+        shutil.copytree(DV, tree / "dual-venue", ignore=shutil.ignore_patterns("look-receipts", "legs", "legsets"))
+        (tree / "bachelor").mkdir()
+        agent = AGENT.read_bytes()
+        self.assertEqual(agent.count(b"[int]$LeaseBatchIdleSec = 300,"), 1, "the agent's idle bound moved: update this fixture")
+        (tree / "bachelor" / AGENT.name).write_bytes(agent.replace(b"[int]$LeaseBatchIdleSec = 300,", b"[int]$LeaseBatchIdleSec = 200,"))
+        self.runner = tree / "dual-venue" / RUNNER.name
+        r = self.run_batch(self.specs[:2], "-ProbeMaxWaitSec", "600")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertEqual(self._in_lease_waits(), [140, 140], self.events_raw())
+        self.assertNotRegex(RUNNER.read_text(encoding="utf-8"), r"(?i)IdleSec\s*=\s*300\b", "the runner keeps no second copy of the agent's 300 s")
+
+    def test_lease_batch_idle_end_r3_grok_g1_an_unreadable_idle_bound_launches_nothing_on_the_lease(self) -> None:
+        # fail closed: an agent script whose LeaseBatchIdleSec has no readable default gives no bound, so no probe or leg runs on the lease (AGENT_IDLE_BOUND_UNKNOWN, exit 10);
+        # the lease is still closed and the claim released
+        tree = self.case / "tree" / "tools" / "profiling"
+        shutil.copytree(DV, tree / "dual-venue", ignore=shutil.ignore_patterns("look-receipts", "legs", "legsets"))
+        (tree / "bachelor").mkdir()
+        agent = AGENT.read_bytes()
+        (tree / "bachelor" / AGENT.name).write_bytes(agent.replace(b"[int]$LeaseBatchIdleSec = 300,", b"[int]$LeaseBatchIdleSec,"))
+        self.runner = tree / "dual-venue" / RUNNER.name
+        r = self.run_batch(self.specs[:2])
+        self.assertEqual(r.returncode, 10, r.stdout + r.stderr)
+        [b] = self.batches()
+        self.assertEqual((b["endReason"], b["legsAttempted"]), ("AGENT_IDLE_BOUND_UNKNOWN", 0), b)
+        self.assertEqual(self.kinds(), [f"OPEN:{b['token']}", f"CLOSE:{b['token']}"])
+        res = batch_result(r.stdout)
+        self.assertEqual((res["exitCode"], res["stopReason"], res["notRun"]), (10, "AGENT_IDLE_BOUND_UNKNOWN", 2))
+
     def test_r2_a_leg_off_the_lease_reads_only_its_own_tokens_idle_line(self) -> None:
         # the in-flight consumer: a foreign closed line before the agent's idle line still types LEASE_IDLE_ENDED; a lone foreign idle line is no idle end (LEASE_LOST)
         for mode, want in (("foreign-then-idle", "LEASE_IDLE_ENDED"), ("foreign", "LEASE_LOST")):
@@ -2801,7 +2878,8 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
         e = dict(e, FAKE_QUIET_MODES="QUIET,IDLE,QUIET")
         r = subprocess.run(args, capture_output=True, text=True, timeout=180, env=e)
         res = batch_result(r.stdout)
-        self.assertEqual((r.returncode, res["stopReason"], res["ran"], res["notRun"]), (0, res["stopReason"], 4, 0), r.stdout + r.stderr)
+        # r3 (Grok G5): the stop reason is pinned (this slot compared it with itself): the idle end is a batch end, never a run stop, so the run ends with none
+        self.assertEqual((r.returncode, res["stopReason"], res["ran"], res["notRun"]), (0, None, 4, 0), r.stdout + r.stderr)
         self.assertEqual(self.batches()[0]["endReason"], "LEASE_IDLE_ENDED", self.batches()[0])
         self.assertIn("BATCH_LOG_FAILED", r.stderr)
 
@@ -8949,6 +9027,58 @@ class LeaseEndUtcTimezoneTests(unittest.TestCase):
         self.assertIn("AssumeUniversal", fn)
         self.assertIn("AdjustToUniversal", fn)
         self.assertNotIn("::Parse(", fn, "a zone-less string must go through TryParse with AssumeUniversal, never a bare Parse")
+
+    # ---- r3 (Grok G4 on #817): the idle clamp's guards that a UTC CI host can fail (the behavioural A2 case goes red only off UTC)
+    def test_lease_batch_idle_end_r3_grok_g4_the_idle_clamp_reads_endedutc_through_the_helper_never_string(self) -> None:
+        text = RUNNER.read_text(encoding="utf-8")
+        at = text.index("$ie = Get-LeaseIdleEnd $token")
+        clamp = text[at:text.index("break", at)]
+        self.assertIn("$ieAt = ConvertTo-AgentUtc $ie.endedUtc", clamp, "the idle clamp takes the agent's instant from ConvertTo-AgentUtc")
+        self.assertIsNone(re.search(r"\[string\]\s*\$ie\.endedUtc", text), "[string] drops a DateTime's zone (and its fraction): the agent's endedUtc never goes through it")
+        self.assertNotIn("TryParse", clamp, "the clamp parses nothing itself: ConvertTo-AgentUtc is the one reader")
+        fn = text[text.index("function ConvertTo-AgentUtc"):]
+        fn = fn[:fn.index("\n}\n") + 3]
+        self.assertIsNone(re.search(r"\[string\]\s*\$Value", fn), "the helper never casts its input through [string]")
+        for needle in ("$Value -is [DateTime]", "[DateTimeKind]::Unspecified", ".ToUniversalTime()", "$Value -is [DateTimeOffset]", ".UtcDateTime", "$Value -isnot [string]",
+                       "AssumeUniversal", "AdjustToUniversal"):
+            self.assertIn(needle, fn)
+
+    def test_lease_batch_idle_end_r3_grok_g4_convertto_agentutc_gives_the_exact_utc_instant_for_every_shape(self) -> None:
+        # adversarial direct case on the runner's own function (AST): every shape ConvertFrom-Json or a caller can hand it lands on the same instant, TO THE TICK and of Kind Utc.
+        # Exact ticks are what make this red on a UTC host too: a [string] round trip drops the fractional second whatever the host's offset is.
+        script = (
+            f"$ast = [System.Management.Automation.Language.Parser]::ParseFile('{psq(RUNNER)}', [ref]$null, [ref]$null)\n"
+            "$fn = $ast.Find({ param($x) $x -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $x.Name -eq 'ConvertTo-AgentUtc' }, $true)\n"
+            ". ([scriptblock]::Create($fn.Extent.Text))\n"
+            "function Show($v) { $r = ConvertTo-AgentUtc $v; if ($null -eq $r) { $null } elseif ($r -isnot [DateTime]) { 'type:' + $r.GetType().Name } else { '{0}|{1}' -f $r.Kind, $r.Ticks } }\n"
+            "$utc = [DateTime]::SpecifyKind([DateTime]::new(2026, 10, 25, 1, 19, 14).AddTicks(7209943), [DateTimeKind]::Utc)\n"
+            "[ordered]@{\n"
+            "  want = '{0}|{1}' -f [DateTimeKind]::Utc, $utc.Ticks\n"
+            "  utcKind = Show $utc\n"
+            "  localKind = Show $utc.ToLocalTime()\n"
+            "  unspecifiedKind = Show ([DateTime]::SpecifyKind($utc, [DateTimeKind]::Unspecified))\n"
+            "  offsetMinus5 = Show ([DateTimeOffset]::new($utc).ToOffset([TimeSpan]::FromHours(-5)))\n"
+            "  offsetPlus530 = Show ([DateTimeOffset]::new($utc).ToOffset([TimeSpan]::FromMinutes(330)))\n"
+            "  stringOffset = Show '2026-10-25T03:19:14.7209943+02:00'\n"
+            "  stringZ = Show '2026-10-25T01:19:14.7209943Z'\n"
+            "  stringNoZone = Show '2026-10-25T01:19:14.7209943'\n"
+            "  json = Show (('{\"t\": \"2026-10-25T01:19:14.7209943Z\"}' | ConvertFrom-Json).t)\n"
+            "  jsonOffset = Show (('{\"t\": \"2026-10-24T20:19:14.7209943-05:00\"}' | ConvertFrom-Json).t)\n"
+            "  null = Show $null\n"
+            "  garbage = Show 'not a time'\n"
+            "  number = Show 42\n"
+            "  array = Show @('2026-10-25T01:19:14.7209943Z')\n"
+            "} | ConvertTo-Json -Compress\n"
+        )
+        out = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, timeout=120)
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        got = json.loads(out.stdout)
+        for shape in ("utcKind", "localKind", "unspecifiedKind", "offsetMinus5", "offsetPlus530", "stringOffset", "stringZ", "stringNoZone", "json", "jsonOffset"):
+            with self.subTest(shape=shape):
+                self.assertEqual(got[shape], got["want"], f"{shape}: {got}")
+        for shape in ("null", "garbage", "number", "array"):
+            with self.subTest(shape=shape):
+                self.assertIsNone(got[shape], f"{shape} is no instant: {got}")
 
 
 if __name__ == "__main__":
