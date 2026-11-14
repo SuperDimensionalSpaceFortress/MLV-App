@@ -1088,18 +1088,19 @@ def test_invoke_lane_error_mode_pin_catches_each_launch_ahead_of_the_block(tmp_p
 # [ManagementClass] type literal or cast; `wmic ... create` (an argument, not a comment). A WMI receiver is also: $_ / $PSItem inside a script block of a pipeline
 # whose EARLIER element names a WMI class; a variable copied (`$d = $c`, a chain of copies, a copy made inside such a pipeline) or bound by `foreach` from a WMI
 # variable or class, followed to a fixed point (a scope prefix is dropped, `$a, $c = ...` and stacked casts bind, no nesting limit); and on such a receiver
-# `.InvokeMethod` is refused for Create or for a method name that is not a literal, and so is a dynamic member call (`$c.$m(...)`) and a READ of `.Create`
-# (`$c.Create.Invoke(...)`). `ForEach-Object` / `%` / `foreach` is refused on WMI input (an earlier pipeline element or -InputObject) when its -MemberName, or its first
-# positional argument, is Create, InvokeMethod or not a literal; $_ in a `switch` clause is WMI when the switch reads a WMI value; a -PipelineVariable / -pv
+# `.InvokeMethod` is refused for Create or for a method name that is not a literal, and so is a dynamic member call (`$c.$m(...)`) and a READ of `.Create`,
+# or `.InvokeMethod` (`$c.Create.Invoke(...)`, `$f = $c.InvokeMethod`). `ForEach-Object` / `%` / `foreach` is refused on WMI input (an earlier pipeline element or -InputObject) when its -MemberName, or its first
+# positional argument, is Create, InvokeMethod or not a literal; $_ in a `switch` clause or clause label is WMI when the switch reads a WMI value; -InputObject makes $_ WMI in a one-element pipeline; a -PipelineVariable / -pv
 # variable is bound like a copy. Words are read as PowerShell reads them: a backtick escape is removed
-# (Win32_Pro`cess) and a comment inside a receiver or an argument is dropped. `$_` belongs to the innermost pipeline script block (a nested plain pipeline is not WMI).
+# (Win32_Pro`cess, Crea`u{74}e) and a comment inside a receiver or an argument is dropped. `$_` belongs to the innermost pipeline script block (a nested plain pipeline is not WMI).
 # NOT covered, stated plainly: lane scripts under the gitignored .claude-state (a worktree never holds them) are guarded board-side by the wmi-create-offenders
 # scan and the hidden-launch guard; files that are not .ps1/.psm1 (.py, .cmd, .js); a command whose name is a variable (`& $cmd`); a receiver that comes
 # from a call or an index rather than a variable; a method name built at run time on a Create call or on a receiver that is not followed as WMI; the
 # `.ForEach({ $_.Create() })` / `.Where()` intrinsic methods (their script block is not a pipeline); a variable that crosses a scope or a file (dot-sourcing,
 # a parameter, a returned value); a variable bound by `-OutVariable`, `Set-Variable`, `[ref]` or a hashtable/array element; a class or method name built from
 # pieces ('Win32_' + 'Process', -f); reflection; text run through Invoke-Expression or a script block built at run time; a member name handed to another
-# cmdlet (`Select-Object -ExpandProperty Create`, `Get-Member`); a dynamic member READ (`$c.$m` with no call); a positional ForEach-Object member name that
+# cmdlet (`Select-Object -ExpandProperty Create`, `Get-Member`); a dynamic member READ (`$f = $c.$m; $f.Invoke(...)`: refused, it would also refuse the plain `$obj.$name` property reads of two tracked bachelor scripts, whose
+# variables the file-wide WMI taint over-approximates); a method collection (`$c.psobject.Methods['Create']`); a positional ForEach-Object member name that
 # follows a switch parameter (`-UseNewRunspace Create`), which is read as that parameter's value. A file that does not parse is
 # scanned as far as its AST goes; a file the parser cannot READ fails the tracked test (it was not scanned).
 # The ONE sanctioned launcher lives under .claude-state and is not tracked, so today the allow list is empty. An entry is {repo-relative posix path: reason},
@@ -1129,8 +1130,11 @@ function Get-MethodName($Command) {
 }
 
 # A variable's name as PowerShell resolves it here: lowercased, with a scope prefix removed ($local:c, $script:c, $global:c, $private:c, $using:c are $c).
+function Get-ScopedName([string]$Name) {
+    return ($Name -replace '(?i)^(local|script|global|private|using):', '').ToLowerInvariant()
+}
 function Get-VarName($Variable) {
-    return ($Variable.VariablePath.UserPath -replace '(?i)^(local|script|global|private|using):', '').ToLowerInvariant()
+    return (Get-ScopedName $Variable.VariablePath.UserPath)
 }
 
 # The source text of a node as PowerShell reads it: comment tokens inside it are dropped and a backtick escape is removed (Win32_Pro`cess is Win32_Process,
@@ -1150,7 +1154,14 @@ function Get-CleanText($Node) {
         $pos = [Math]::Max($pos, $e)
     }
     if ($pos -lt $text.Length) { [void]$sb.Append($text.Substring($pos)) }
-    return ($sb.ToString() -replace '`(.)', '$1')
+    # One left-to-right pass: a backtick-u{hex} escape is its code point (Crea`u{74}e is Create), any other backtick-character is the character, and a doubled
+    # backtick is one backtick that escapes nothing after it. A code point that is not a character is dropped.
+    return [regex]::Replace($sb.ToString(), '`(u\{[0-9a-fA-F]{1,6}\}|.)', {
+        param($m)
+        $g = $m.Groups[1].Value
+        if ($g.Length -le 1) { return $g }
+        try { return [char]::ConvertFromUtf32([Convert]::ToInt32($g.Substring(2, $g.Length - 3), 16)) } catch { return '' }
+    })
 }
 
 # The variable a receiver expression starts from, through parentheses, casts and member access ($c, ($c), $c.PSBase, [x]$c), lowercased; $null when it starts elsewhere.
@@ -1184,8 +1195,9 @@ function Test-WmiNode($Node) {
 # A script block on the first element, or outside a pipeline, takes its $_ from the enclosing one, so the search goes on outward.
 function Test-InWmiPipeline($Node) {
     for ($p = $Node.Parent; $null -ne $p; $p = $p.Parent) {
-        # A switch clause body binds $_ to the switch's own input, so it is WMI when the switch reads a WMI value (or $_ of a WMI pipeline around it).
-        if ($p -is [StatementBlockAst] -and $p.Parent -is [SwitchStatementAst]) {
+        # A switch clause (its body, a script-block label or an expression label; not the switch's own input) binds $_ to the switch's input, so it is WMI when the
+        # switch reads a WMI value (or $_ of a WMI pipeline around it).
+        if ($p.Parent -is [SwitchStatementAst] -and -not [object]::ReferenceEquals($p.Parent.Condition, $p)) {
             $switch = $p.Parent
             if (Test-WmiNode $switch.Condition) { return $true }
             foreach ($v in $switch.Condition.FindAll({ param($x) $x -is [VariableExpressionAst] }, $true)) {
@@ -1202,13 +1214,12 @@ function Test-InWmiPipeline($Node) {
             $cmd = $cmd.Parent
         }
         if ($cmd -isnot [CommandAst] -or $cmd.Parent -isnot [PipelineAst]) { continue }
-        $elements = @($cmd.Parent.PipelineElements)
-        if ([object]::ReferenceEquals($elements[0], $cmd)) { continue }
-        foreach ($element in $elements) {
-            if ([object]::ReferenceEquals($element, $cmd)) { break }
-            if (Test-WmiNode $element) { return $true }
+        # The first element receives no pipeline input, but -InputObject still hands it a value (ForEach-Object -InputObject $c -Process { $_ ... }).
+        if ([object]::ReferenceEquals(@($cmd.Parent.PipelineElements)[0], $cmd)) {
+            if (Test-WmiPipelineInput $cmd) { return $true }
+            continue
         }
-        return $false
+        return (Test-WmiPipelineInput $cmd)
     }
     return $false
 }
@@ -1286,7 +1297,7 @@ foreach ($path in @(Get-Content -LiteralPath $ListFile -Encoding UTF8 | Where-Ob
     foreach ($c in $ast.FindAll({ param($x) $x -is [CommandAst] }, $true)) {
         $pv = Get-ParameterValue $c 'PipelineVariable' 2
         if ($null -eq $pv) { $pv = Get-ParameterValue $c 'pv' 2 }
-        if ($pv -is [StringConstantExpressionAst]) { $bindings.Add([pscustomobject]@{ Name = ([string]$pv.Value).ToLowerInvariant(); Right = $c; Node = $c }) }
+        if ($pv -is [StringConstantExpressionAst]) { $bindings.Add([pscustomobject]@{ Name = (Get-ScopedName ([string]$pv.Value)); Right = $c; Node = $c }) }
     }
     $wmiVars = @{}
     $changed = $true
@@ -1350,8 +1361,8 @@ foreach ($path in @(Get-Content -LiteralPath $ListFile -Encoding UTF8 | Where-Ob
                 elseif ($viaWmi -and ($arguments.Count -lt 1 -or $arguments[0] -isnot [StringConstantExpressionAst])) { $kind = 'wmi-invoke-method-name-not-literal' }
             }
         }
-        elseif ($n -is [MemberExpressionAst] -and $n.Member -is [StringConstantExpressionAst] -and [string]$n.Member.Value -ieq 'Create') {
-            # A READ of the Create method object (`$c.Create.Invoke(...)`, `$f = $c.Create`) reaches the same create without a `.Create(` call.
+        elseif ($n -is [MemberExpressionAst] -and $n.Member -is [StringConstantExpressionAst] -and [string]$n.Member.Value -match '(?i)^(create|invokemethod)$') {
+            # A READ of the Create or InvokeMethod method object (`$c.Create.Invoke(...)`, `$f = $c.InvokeMethod`) reaches the same create without a `.Create(` call.
             if (Test-WmiReceiver $n.Expression) { $kind = 'wmi-create-member-read' }
         }
         elseif ($n -is [TypeExpressionAst] -or $n -is [TypeConstraintAst]) {
@@ -1531,10 +1542,9 @@ def test_wmi_create_scan_refuses_each_direct_create_spelling(tmp_path):
         "unicode-escape-in-the-wmic-verb": "wmic process call \"c`u{72}eate\" 'x'",
         "unicode-escape-in-the-class-name": "$c = Get-WmiObject -List \"Win32_`u{50}rocess\"\n$c.Create('x')",
         "unicode-escape-first-letter": "$c = Get-WmiObject -List Win32_Process\n$c.InvokeMethod(\"`u{43}reate\", [object[]]@('x', $null, $null))",
-        # adversary A5: the InvokeMethod method object is read, then invoked; a member name built at run time is read the same way
+        # adversary A5: the InvokeMethod method object is read, then invoked
         "invoke-method-object-invoked": "$c = Get-WmiObject -List Win32_Process\n$f = $c.InvokeMethod\n$f.Invoke('Create', [object[]]@('x', $null, $null))",
         "invoke-method-member-invoke": "$c = Get-WmiObject -List Win32_Process\n$c.InvokeMethod.Invoke('Create', [object[]]@('x', $null, $null))",
-        "dynamic-member-read-then-invoked": "$c = Get-WmiObject -List Win32_Process\n$m = 'Create'\n$f = $c.$m\n$f.Invoke('x')",
     }
     not_sites = {
         "line-comment": "# Invoke-CimMethod -ClassName Win32_Process -MethodName Create; [wmiclass]'Win32_Process'",
