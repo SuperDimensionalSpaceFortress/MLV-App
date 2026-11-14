@@ -1077,6 +1077,388 @@ def test_invoke_lane_error_mode_pin_catches_each_launch_ahead_of_the_block(tmp_p
     assert false_alarms == {}, "a comment, a string or a function definition is not a launch"
 
 
+# --- DOCTRINE-OUTBOX-WMI-CHILD-ERRORMODE-1: no tracked PowerShell script calls the WMI process create itself ----------
+# A process made by WMI Win32_Process Create is not a child of the caller: its parent is WmiPrvSE, so it inherits none of the error mode Invoke-Lane sets
+# and a crash in it can raise a modal box on the owner's desktop (trap card doctrine-outbox/20261114-wmi-create-child-inherits-gpfault-error-box.md).
+# The rule: every detached launch goes through ONE launcher (a stub that sets the error mode first); a script never calls the create itself.
+# This pins the rule over the TRACKED tree. Covered: *.ps1 and *.psm1 that `git ls-files` lists, read by PowerShell's own AST, so a comment, a string and a
+# here-string are not calls. Refused: Invoke-CimMethod / Invoke-WmiMethod (and the icim / iwmi aliases) whose -MethodName / -Name is Create or is not a
+# literal (a module-qualified name or a full path is the same command); a `.Create(...)` or `.InvokeMethod(... Create ...)` on an expression that names
+# Win32_Process, wmiclass or ManagementClass, or on a variable assigned from one (also through parentheses, a cast or .PSBase); a [wmiclass] / [wmi] /
+# [ManagementClass] type literal or cast; `wmic ... create` (an argument, not a comment). A WMI receiver is also: $_ / $PSItem inside a script block of a pipeline
+# whose EARLIER element names a WMI class; a variable copied (`$d = $c`, a chain of copies, a copy made inside such a pipeline) or bound by `foreach` from a WMI
+# variable or class, followed to a fixed point (a scope prefix is dropped, `$a, $c = ...` and stacked casts bind, no nesting limit); and on such a receiver
+# `.InvokeMethod` is refused for Create or for a method name that is not a literal. Words are read as PowerShell reads them: a backtick escape is removed
+# (Win32_Pro`cess) and a comment inside a receiver or an argument is dropped. `$_` belongs to the innermost pipeline script block (a nested plain pipeline is not WMI).
+# NOT covered, stated plainly: lane scripts under the gitignored .claude-state (a worktree never holds them) are guarded board-side by the wmi-create-offenders
+# scan and the hidden-launch guard; files that are not .ps1/.psm1 (.py, .cmd, .js); a command whose name is a variable (`& $cmd`); a receiver that comes
+# from a call or an index rather than a variable; a method name built at run time on a Create call or on a receiver that is not followed as WMI; the
+# `.ForEach({ $_.Create() })` / `.Where()` intrinsic methods (their script block is not a pipeline); a variable that crosses a scope or a file (dot-sourcing,
+# a parameter, a returned value); a variable bound by `-OutVariable`, `Set-Variable`, `[ref]` or a hashtable/array element; a class or method name built from
+# pieces ('Win32_' + 'Process', -f); reflection; text run through Invoke-Expression or a script block built at run time. A file that does not parse is
+# scanned as far as its AST goes; a file the parser cannot READ fails the tracked test (it was not scanned).
+# The ONE sanctioned launcher lives under .claude-state and is not tracked, so today the allow list is empty. An entry is {repo-relative posix path: reason},
+# added only in review for a script that must call the create itself; an entry that stops matching a site fails the test, so the list cannot go stale.
+WMI_CREATE_ALLOW = {}
+_WMI_CREATE_SCANNER = r"""
+using namespace System.Management.Automation.Language
+param([Parameter(Mandatory = $true)][string]$ListFile)
+$ErrorActionPreference = 'Stop'
+$wmiWord = [regex]::new('(?i)win32_process|wmiclass|managementclass')
+$wmiCommands = @('invoke-cimmethod', 'invoke-wmimethod', 'icim', 'iwmi')
+$wmiTypes = '(^|\.)(wmiclass|wmi|ManagementClass)$'
+
+# The literal method name of an Invoke-CimMethod / Invoke-WmiMethod call, or $null when it is positional, built at run time or splatted.
+function Get-MethodName($Command) {
+    $elements = @($Command.CommandElements)
+    for ($i = 1; $i -lt $elements.Count; $i++) {
+        $e = $elements[$i]
+        if ($e -isnot [CommandParameterAst]) { continue }
+        $n = $e.ParameterName
+        $isName = ($n.Length -ge 2 -and 'MethodName'.StartsWith($n, [StringComparison]::OrdinalIgnoreCase)) -or ($n -ieq 'Name')
+        if (-not $isName) { continue }
+        $v = if ($null -ne $e.Argument) { $e.Argument } elseif ($i + 1 -lt $elements.Count) { $elements[$i + 1] } else { $null }
+        if ($v -is [StringConstantExpressionAst]) { return [string]$v.Value }
+    }
+    return $null
+}
+
+# A variable's name as PowerShell resolves it here: lowercased, with a scope prefix removed ($local:c, $script:c, $global:c, $private:c, $using:c are $c).
+function Get-VarName($Variable) {
+    return ($Variable.VariablePath.UserPath -replace '(?i)^(local|script|global|private|using):', '').ToLowerInvariant()
+}
+
+# The source text of a node as PowerShell reads it: comment tokens inside it are dropped and a backtick escape is removed (Win32_Pro`cess is Win32_Process,
+# "C`Reate" is "CReate"), so a word is matched by what it says, not by how it is spelled. $comments holds the current file's comment tokens.
+function Get-CleanText($Node) {
+    $text = $Node.Extent.Text
+    if ($text.IndexOf('#') -lt 0 -and $text.IndexOf([char]96) -lt 0) { return $text }
+    $start = $Node.Extent.StartOffset; $end = $Node.Extent.EndOffset
+    $sb = New-Object System.Text.StringBuilder
+    $pos = 0
+    foreach ($c in $comments) {
+        if ($c.Extent.EndOffset -le $start -or $c.Extent.StartOffset -ge $end) { continue }
+        $s = [Math]::Max($c.Extent.StartOffset - $start, 0)
+        $e = [Math]::Min($c.Extent.EndOffset - $start, $text.Length)
+        if ($s -gt $pos) { [void]$sb.Append($text.Substring($pos, $s - $pos)) }
+        [void]$sb.Append(' ')
+        $pos = [Math]::Max($pos, $e)
+    }
+    if ($pos -lt $text.Length) { [void]$sb.Append($text.Substring($pos)) }
+    return ($sb.ToString() -replace '`(.)', '$1')
+}
+
+# The variable a receiver expression starts from, through parentheses, casts and member access ($c, ($c), $c.PSBase, [x]$c), lowercased; $null when it starts elsewhere.
+# No depth limit: the loop ends at the first node that is not one of the three wrappers, and an AST has no cycles.
+function Get-ReceiverRoot($Expression) {
+    while ($null -ne $Expression) {
+        if ($Expression -is [VariableExpressionAst]) { return (Get-VarName $Expression) }
+        if ($Expression -is [ParenExpressionAst]) {
+            $elements = if ($Expression.Pipeline -is [PipelineAst]) { @($Expression.Pipeline.PipelineElements) } else { @() }
+            if ($elements.Count -ne 1 -or $elements[0] -isnot [CommandExpressionAst]) { return $null }
+            $Expression = $elements[0].Expression
+        }
+        elseif ($Expression -is [MemberExpressionAst]) { $Expression = $Expression.Expression }
+        elseif ($Expression -is [ConvertExpressionAst]) { $Expression = $Expression.Child }
+        else { return $null }
+    }
+    return $null
+}
+
+# True when the node names a WMI class (as PowerShell reads it) or mentions a variable already known to hold a WMI object.
+function Test-WmiNode($Node) {
+    if ($wmiWord.IsMatch((Get-CleanText $Node))) { return $true }
+    foreach ($v in $Node.FindAll({ param($x) $x -is [VariableExpressionAst] }, $true)) {
+        if ($wmiVars.ContainsKey((Get-VarName $v))) { return $true }
+    }
+    return $false
+}
+
+# True when $_ / $PSItem at $Node is a WMI object. $_ belongs to the INNERMOST script block that is an argument of a pipeline element after the first (ForEach-Object,
+# Where-Object, a calculated property of Select-Object ...); it is WMI when an earlier element of that pipeline names a WMI class or starts from a WMI variable.
+# A script block on the first element, or outside a pipeline, takes its $_ from the enclosing one, so the search goes on outward.
+function Test-InWmiPipeline($Node) {
+    for ($p = $Node.Parent; $null -ne $p; $p = $p.Parent) {
+        if ($p -isnot [ScriptBlockExpressionAst]) { continue }
+        $cmd = $p.Parent
+        # Up to the command the block is an argument of, through a parameter, a hashtable or an array; an assignment or another scope ends the climb.
+        while ($null -ne $cmd -and $cmd -isnot [CommandAst]) {
+            if ($cmd -is [ScriptBlockAst] -or ($cmd -is [StatementAst] -and $cmd -isnot [PipelineAst] -and $cmd -isnot [CommandExpressionAst])) { $cmd = $null; break }
+            $cmd = $cmd.Parent
+        }
+        if ($cmd -isnot [CommandAst] -or $cmd.Parent -isnot [PipelineAst]) { continue }
+        $elements = @($cmd.Parent.PipelineElements)
+        if ([object]::ReferenceEquals($elements[0], $cmd)) { continue }
+        foreach ($element in $elements) {
+            if ([object]::ReferenceEquals($element, $cmd)) { break }
+            if (Test-WmiNode $element) { return $true }
+        }
+        return $false
+    }
+    return $false
+}
+
+# True when the receiver names a WMI class, starts from a WMI variable, or is $_ / $PSItem inside a pipeline that read a WMI class.
+function Test-WmiReceiver($Expression) {
+    if ($wmiWord.IsMatch((Get-CleanText $Expression))) { return $true }
+    $root = Get-ReceiverRoot $Expression
+    if ($null -eq $root) { return $false }
+    if ($wmiVars.ContainsKey($root)) { return $true }
+    return (($root -eq '_' -or $root -eq 'psitem') -and (Test-InWmiPipeline $Expression))
+}
+
+$out = [ordered]@{}
+foreach ($path in @(Get-Content -LiteralPath $ListFile -Encoding UTF8 | Where-Object { $_ })) {
+    $tokens = $null; $errors = $null
+    $ast = [Parser]::ParseFile($path, [ref]$tokens, [ref]$errors)
+    $sites = New-Object System.Collections.Generic.List[object]
+    $comments = @($tokens | Where-Object { $_.Kind -eq [TokenKind]::Comment })
+    # Every binding of a variable: `$d = <right>`, `$a, $d = <right>`, `[x][y]$d = <right>` and `foreach ($d in <right>)`. A variable is WMI when its right side
+    # names a WMI class or mentions a WMI variable (or $_ / $PSItem inside a WMI pipeline); the loop runs to a fixed point, so a copy of a copy is followed.
+    $bindings = New-Object System.Collections.Generic.List[object]
+    foreach ($a in $ast.FindAll({ param($x) $x -is [AssignmentStatementAst] }, $true)) {
+        $targets = if ($a.Left -is [ArrayLiteralAst]) { @($a.Left.Elements) } else { @($a.Left) }
+        foreach ($t in $targets) {
+            while ($t -is [ConvertExpressionAst]) { $t = $t.Child }
+            if ($t -is [VariableExpressionAst]) { $bindings.Add([pscustomobject]@{ Name = (Get-VarName $t); Right = $a.Right; Node = $a }) }
+        }
+    }
+    foreach ($f in $ast.FindAll({ param($x) $x -is [ForEachStatementAst] }, $true)) {
+        $bindings.Add([pscustomobject]@{ Name = (Get-VarName $f.Variable); Right = $f.Condition; Node = $f })
+    }
+    $wmiVars = @{}
+    $changed = $true
+    while ($changed) {
+        $changed = $false
+        foreach ($b in $bindings) {
+            if ($wmiVars.ContainsKey($b.Name)) { continue }
+            $hit = Test-WmiNode $b.Right
+            if (-not $hit) {
+                foreach ($v in $b.Right.FindAll({ param($x) $x -is [VariableExpressionAst] }, $true)) {
+                    $vn = Get-VarName $v
+                    if (($vn -eq '_' -or $vn -eq 'psitem') -and (Test-InWmiPipeline $b.Node)) { $hit = $true; break }
+                }
+            }
+            if ($hit) { $wmiVars[$b.Name] = $true; $changed = $true }
+        }
+    }
+    foreach ($n in $ast.FindAll({ param($x) $true }, $true)) {
+        $kind = $null
+        if ($n -is [CommandAst]) {
+            $name = $n.GetCommandName()
+            if ($null -eq $name) { continue }
+            # The command as it resolves: a module-qualified name (CimCmdlets\Invoke-CimMethod) and a full path (C:\...\wmic.exe) are the same command.
+            $lname = (($name -replace '^.*[\\/]', '') -replace '\.(exe|com|cmd|bat)$', '').ToLowerInvariant()
+            if ($wmiCommands -contains $lname) {
+                $method = Get-MethodName $n
+                if ($null -eq $method) { $kind = 'wmi-method-name-not-literal' }
+                elseif ($method -match '(?i)create') { $kind = 'wmi-create' }
+            }
+            elseif ($lname -eq 'wmic') {
+                # The argument elements only: a comment inside the command is not an argument.
+                $words = @($n.CommandElements | Select-Object -Skip 1 | ForEach-Object { Get-CleanText $_ })
+                if (($words -join ' ') -match '(?i)\bcreate\b') { $kind = 'wmic-create' }
+            }
+        }
+        elseif ($n -is [InvokeMemberExpressionAst]) {
+            if ($n.Member -isnot [StringConstantExpressionAst]) { continue }
+            $member = [string]$n.Member.Value
+            $viaWmi = Test-WmiReceiver $n.Expression
+            if ($member -ieq 'Create') {
+                if ($viaWmi) { $kind = 'wmi-create-member' }
+            }
+            elseif ($member -ieq 'InvokeMethod') {
+                # The arguments only, so a comment between them does not count; the receiver or an argument names the WMI class.
+                $arguments = @($n.Arguments)
+                $argText = (@($arguments | ForEach-Object { Get-CleanText $_ }) -join ' ')
+                if (($viaWmi -or $wmiWord.IsMatch($argText)) -and $argText -match '(?i)\bcreate\b') { $kind = 'wmi-invoke-method-create' }
+                # On a WMI receiver a method name that is not a literal could be Create, as for Invoke-CimMethod above.
+                elseif ($viaWmi -and ($arguments.Count -lt 1 -or $arguments[0] -isnot [StringConstantExpressionAst])) { $kind = 'wmi-invoke-method-name-not-literal' }
+            }
+        }
+        elseif ($n -is [TypeExpressionAst] -or $n -is [TypeConstraintAst]) {
+            if ($n.TypeName.FullName -match $wmiTypes) { $kind = 'wmi-type' }
+        }
+        if ($null -ne $kind) {
+            $text = ($n.Extent.Text -replace '\s+', ' ')
+            $sites.Add([ordered]@{ kind = $kind; line = $n.Extent.StartLineNumber; text = $text.Substring(0, [Math]::Min(120, $text.Length)) })
+        }
+    }
+    # A file the parser could not read has no AST to scan: it is reported, so the caller cannot count it as clean.
+    $unreadable = [bool]($errors | Where-Object { $_.ErrorId -eq 'FileReadError' })
+    $out[$path] = [ordered]@{ parseErrors = $(if ($errors) { @($errors).Count } else { 0 }); unreadable = $unreadable; sites = $sites.ToArray() }
+}
+$out | ConvertTo-Json -Depth 5 -Compress
+"""
+
+
+def _wmi_create_scan(tmp_path, paths):
+    """Scan the given files in one pwsh process. {str(path): {"parseErrors": n, "sites": [{kind, line, text}]}}."""
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    scanner, listing = tmp_path / "wmi-scan.ps1", tmp_path / "wmi-scan-list.txt"
+    scanner.write_text(_WMI_CREATE_SCANNER, encoding="ascii", newline="\n")
+    listing.write_text("\n".join(str(p) for p in paths) + "\n", encoding="utf-8", newline="\n")
+    done = subprocess.run(
+        [_LANE_ERROR_MODE_PWSH, "-NoProfile", "-NonInteractive", "-File", str(scanner), "-ListFile", str(listing)],
+        text=True, capture_output=True, timeout=300,
+    )
+    assert done.returncode == 0, f"the WMI create scanner failed: {done.stdout!r} {done.stderr!r}"
+    return json.loads(done.stdout)
+
+
+def _tracked_powershell_files():
+    listing = subprocess.run(
+        ["git", "-C", str(ROOT), "ls-files", "-z", "--", "*.ps1", "*.psm1"], text=True, capture_output=True, check=True,
+    ).stdout
+    return sorted(p for p in listing.split("\0") if p)
+
+
+@_lane_scanner_only
+def test_tracked_powershell_has_no_direct_wmi_create_outside_the_allow_list(tmp_path):
+    tracked = _tracked_powershell_files()
+    # A floor, so an empty `git ls-files` cannot pass with nothing scanned.
+    assert len(tracked) > 100 and "tools/coordination/Invoke-Lane.ps1" in tracked, tracked[:5]
+    scan = _wmi_create_scan(tmp_path, [ROOT / p for p in tracked])
+    assert scan.keys() == {str(ROOT / p) for p in tracked}, "the scanner did not report every tracked file"
+    unreadable = sorted(p for p in tracked if scan[str(ROOT / p)]["unreadable"])
+    assert unreadable == [], f"tracked files the scanner could not read (they were not scanned): {unreadable}"
+    by_file = {p: scan[str(ROOT / p)]["sites"] for p in tracked}
+    offenders = {p: sites for p, sites in by_file.items() if sites and p not in WMI_CREATE_ALLOW}
+    assert offenders == {}, (
+        "a tracked PowerShell script creates a process through WMI itself; that child inherits no error mode from the lane and can raise a crash box on the "
+        "owner's desktop. Start it through the one launcher (hub-tools\\Start-HiddenDetached.ps1), or add the file to WMI_CREATE_ALLOW with a reason in review"
+    )
+    stale = sorted(p for p in WMI_CREATE_ALLOW if not by_file.get(p))
+    assert stale == [], f"WMI_CREATE_ALLOW entries that no longer match a site (delete them): {stale}"
+    assert all(WMI_CREATE_ALLOW[p].strip() for p in WMI_CREATE_ALLOW), "every WMI_CREATE_ALLOW entry needs a reason"
+
+
+@_lane_scanner_only
+def test_wmi_create_scan_refuses_each_direct_create_spelling(tmp_path):
+    """RED proof: each spelling is a mutant script on a temp copy (the tracked tree is never edited); each must be refused, and each non-call accepted."""
+    mutants = {
+        # the `wmi` mutant of the lane launch-order pin above
+        "cim-create": "Invoke-CimMethod -ClassName Win32_Process -MethodName Create",
+        "cim-create-with-arguments": "Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{ CommandLine = 'git --version' }",
+        "cim-method-prefix": "Invoke-CimMethod -ClassName Win32_Process -Method Create",
+        "cim-colon-form": "Invoke-CimMethod -ClassName Win32_Process -MethodName:Create",
+        "cim-quoted-name": "Invoke-CimMethod -ClassName Win32_Process -MethodName 'create'",
+        "cim-alias": "icim -ClassName Win32_Process -MethodName Create",
+        "cim-positional-name": "Invoke-CimMethod Win32_Process Create",
+        "cim-name-from-a-variable": "$m = 'Create'\nInvoke-CimMethod -ClassName Win32_Process -MethodName $m",
+        "cim-splatted": "$h = @{ ClassName = 'Win32_Process'; MethodName = 'Create' }\nInvoke-CimMethod @h",
+        "cim-in-a-pipeline": "Get-CimClass -ClassName Win32_Process | Invoke-CimMethod -MethodName Create",
+        "cim-in-a-function": "function Start-Quietly { Invoke-CimMethod -ClassName Win32_Process -MethodName Create }",
+        "cim-in-a-script-block": "$sb = { Invoke-CimMethod -ClassName Win32_Process -MethodName Create }",
+        "wmi-method": "Invoke-WmiMethod -Class Win32_Process -Name Create -ArgumentList 'git --version'",
+        "wmi-method-alias": "iwmi -Class Win32_Process -Name Create",
+        "wmiclass-cast": "([wmiclass]'Win32_Process').Create('git --version')",
+        "wmiclass-variable": "$c = [wmiclass]'Win32_Process'\n$c.Create('git --version')",
+        "wmi-type-literal": "$c = [System.Management.ManagementClass]::new('Win32_Process')",
+        "wmi-accelerator": "$c = [wmi]'Win32_Process'",
+        "create-on-a-get-wmiobject-variable": "$c = Get-WmiObject -List Win32_Process\n$c.Create('git --version')",
+        "create-on-the-class-expression": "(Get-WmiObject -List Win32_Process).Create('git --version')",
+        "invoke-method": "$session.InvokeMethod('root/cimv2', 'Win32_Process', 'Create', $null)",
+        "wmic": "wmic process call create 'git --version'",
+        # adversary A1 on ef629834: a module-qualified or full-path command name is the same command
+        "cim-module-qualified": "CimCmdlets\\Invoke-CimMethod -ClassName Win32_Process -MethodName Create",
+        "wmi-module-qualified": "Microsoft.PowerShell.Management\\Invoke-WmiMethod -Class Win32_Process -Name Create",
+        "cim-full-path-call-operator": "& 'C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\Invoke-CimMethod' -ClassName Win32_Process -MethodName Create",
+        "wmic-full-path": "& 'C:\\Windows\\System32\\wbem\\wmic.exe' process call create 'git --version'",
+        "wmic-exe": "wmic.exe process call create 'git --version'",
+        # adversary A2 on ef629834: the receiver is a variable assigned from a WMI class, reached through parentheses, .PSBase or InvokeMethod
+        "invoke-method-on-a-variable": "$c = Get-WmiObject -List Win32_Process\n$c.InvokeMethod('Create', [object[]]@('cmd.exe /c exit 0', $null, $null))",
+        "psbase-invoke-method": "$c = Get-WmiObject -List Win32_Process\n$c.PSBase.InvokeMethod('Create', [object[]]@('cmd.exe /c exit 0', $null, $null))",
+        "parenthesized-variable-create": "$c = Get-WmiObject -List Win32_Process\n($c).Create('cmd.exe /c exit 0')",
+        # CoS G6 on 1287dc08: the four spellings, verbatim from the ask
+        "pipeline-underscore-create": "Get-WmiObject -List Win32_Process | ForEach-Object { $_.Create('x') }",
+        "pipeline-psitem-create": "Get-CimClass Win32_Process | % { $PSItem.Create('x') }",
+        "pipeline-underscore-invoke-method": "Get-WmiObject -List Win32_Process | ForEach-Object { $_.InvokeMethod('Create', @('x')) }",
+        "copied-variable-create": "$c = Get-WmiObject -List Win32_Process; $d = $c; $d.Create('x')",
+        # siblings of G6: a longer copy chain, a copy made inside the pipeline, .PSBase / parentheses on the pipeline receiver, a class several elements back,
+        # a foreach loop variable over the class, and a method name built at run time on a WMI receiver
+        "copy-chain-create": "$c = Get-WmiObject -List Win32_Process\n$d = $c\n$e = $d\n$e.Create('x')",
+        "copy-made-in-the-pipeline": "Get-WmiObject -List Win32_Process | ForEach-Object { $k = $_; $k.Create('x') }",
+        "pipeline-psbase-invoke-method": "Get-WmiObject -List Win32_Process | ForEach-Object { $_.PSBase.InvokeMethod('Create', @('x')) }",
+        "pipeline-parenthesized-create": "Get-WmiObject -List Win32_Process | ForEach-Object { ($_).Create('x') }",
+        "pipeline-class-several-elements-back": "Get-WmiObject -List Win32_Process | Select-Object -First 1 | ForEach-Object { $_.Create('x') }",
+        "foreach-loop-variable-create": "foreach ($k in Get-WmiObject -List Win32_Process) { $k.Create('x') }",
+        "copy-then-invoke-method": "$c = Get-WmiObject -List Win32_Process\n$d = $c\n$d.InvokeMethod('Create', @('x'))",
+        "invoke-method-name-from-a-variable": "$c = Get-WmiObject -List Win32_Process\n$m = 'Create'\n$c.InvokeMethod($m, @('x'))",
+        # adversary A1 on 60ff547a: a backtick inside a word or a string is removed by PowerShell, so the class and the method are the same words
+        "backtick-in-the-class-name": "$c = Get-WmiObject -List Win32_Pro`cess\n$c.Create('x')",
+        "backtick-in-the-invoke-method-name": "$c = Get-WmiObject -List Win32_Process\n$c.InvokeMethod(\"C`Reate\", [object[]]@('x', $null, $null))",
+        "backtick-in-the-wmic-verb": "wmic process call c`Reate 'x'",
+        "backtick-in-the-class-of-a-pipeline": "Get-WmiObject -List Win32_Pro`cess | ForEach-Object { $_.Create('x') }",
+        # adversary A2: the same variable under a scope prefix
+        "local-scope-binding": "$local:c = Get-WmiObject -List Win32_Process\n$c.Create('x')",
+        "script-scope-receiver": "$c = Get-WmiObject -List Win32_Process\n$script:c.Create('x')",
+        "global-scope-both": "$global:c = Get-WmiObject -List Win32_Process\n$global:c.InvokeMethod('Create', @('x'))",
+        # adversary A3: a pipeline that starts from a WMI variable, a calculated property, and a nested pipeline whose OUTER one is the WMI one
+        "wmi-variable-piped": "$c = Get-WmiObject -List Win32_Process\n$c | ForEach-Object { $_.Create('x') }",
+        "wmi-variable-piped-psitem": "$c = Get-WmiObject -List Win32_Process\n$c | Where-Object { $true } | ForEach-Object { $PSItem.InvokeMethod('Create', @('x')) }",
+        "calculated-property-create": "Get-WmiObject -List Win32_Process | Select-Object @{ n = 'p'; e = { $_.Create('x') } }",
+        "wmi-pipeline-inside-a-plain-script-block": "Get-Item x | ForEach-Object { Get-WmiObject -List Win32_Process | ForEach-Object { $_.Create('x') } }",
+        # adversary A4: parentheses nested deeper than twenty
+        "deep-parentheses-create": "$c = Get-WmiObject -List Win32_Process\n" + "(" * 25 + "$c" + ")" * 25 + ".Create('x')",
+        "deep-parentheses-invoke-method": "$c = Get-WmiObject -List Win32_Process\n" + "(" * 25 + "$c" + ")" * 25 + ".InvokeMethod('Create', @('x'))",
+        # adversary A6: more than one conversion, and a multiple assignment, on the binding
+        "double-conversion-binding": "[object][object]$c = Get-WmiObject -List Win32_Process\n$c.Create('x')",
+        "multiple-assignment-binding": "$a, $c = Get-WmiObject -List Win32_Process\n$c.Create('x')",
+    }
+    not_sites = {
+        "line-comment": "# Invoke-CimMethod -ClassName Win32_Process -MethodName Create; [wmiclass]'Win32_Process'",
+        "block-comment": "<# Invoke-WmiMethod -Class Win32_Process -Name Create #>",
+        "string": "$note = 'Invoke-CimMethod -ClassName Win32_Process -MethodName Create'",
+        "here-string": "$note = @'\nInvoke-CimMethod -ClassName Win32_Process -MethodName Create\n'@",
+        "read-the-process-table": "Get-CimInstance -ClassName Win32_Process -Filter 'ProcessId=4'",
+        "read-the-process-table-positional": "Get-CimInstance Win32_Process | Select-Object ProcessId",
+        "get-owner": "Invoke-CimMethod -InputObject $proc -MethodName GetOwner",
+        "terminate": "Invoke-CimMethod -InputObject $proc -MethodName Terminate",
+        "scriptblock-create": "$sb = [scriptblock]::Create('1')",
+        "file-create": "$f = [System.IO.File]::Create('x')",
+        "unrelated-method": "Invoke-WmiMethod -Class Win32_OperatingSystem -Name Win32Shutdown",
+        # adversary A3 on ef629834: a word in a comment inside the command is not an argument
+        "wmic-comment-says-create": "wmic process <# create #> get ProcessId",
+        "wmic-read-the-table": "wmic process get ProcessId",
+        "invoke-method-other-method": "$c = Get-WmiObject -List Win32_Process\n$c.InvokeMethod('Terminate', $null)",
+        "invoke-method-comment-says-create": "$c = Get-WmiObject -List Win32_Process\n$c.InvokeMethod('Terminate', <# Create #> $null)",
+        # G6: a pipeline receiver or a copy that is not a WMI class stays accepted
+        "pipeline-reads-the-process-table": "Get-CimInstance Win32_Process | ForEach-Object { $_.ProcessId }",
+        "pipeline-terminates-a-process": "Get-WmiObject Win32_Process | ForEach-Object { $_.Terminate() }",
+        "pipeline-without-a-class-creates-a-file": "Get-Item x | ForEach-Object { $_.Create('y') }",
+        "create-before-the-class-in-the-pipeline": "Get-Item . | ForEach-Object { $_.Create('x') } | Get-CimInstance Win32_Process",
+        "copy-of-a-non-wmi-variable": "$c = Get-Item x\n$d = $c\n$d.Create('y')",
+        "copy-keeps-a-wmi-variable-read-only": "$c = Get-WmiObject -List Win32_Process\n$d = $c\n$d.InvokeMethod('Terminate', $null)",
+        "foreach-over-a-plain-list": "foreach ($k in Get-ChildItem) { $k.Create('x') }",
+        "scriptblock-create-in-a-wmi-pipeline": "Get-CimInstance Win32_Process | ForEach-Object { [scriptblock]::Create('1') }",
+        # adversary A3/A5: $_ in a nested pipeline that does not read a WMI class is not a WMI object; a comment in a receiver or an argument is not the class
+        "nested-plain-pipeline-inside-a-wmi-one": "Get-WmiObject -List Win32_Process | ForEach-Object { Get-Item x | ForEach-Object { $_.Create('y') } }",
+        "comment-names-the-class-in-a-receiver": "$c = Get-Item .\n($c <# Win32_Process #>).Create()",
+        "wmic-comment-in-a-parenthesized-argument": "wmic process get (<# create #> 'ProcessId')",
+        "plain-variable-piped": "$c = Get-Item x\n$c | ForEach-Object { $_.Create('y') }",
+        "scope-prefix-on-a-plain-variable": "$local:c = Get-Item x\n$script:c.Create('y')",
+    }
+    files = {}
+    for name, text in {**mutants, **not_sites}.items():
+        path = tmp_path / "cases" / f"{name}.ps1"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text + "\n", encoding="utf-8", newline="\n")
+        files[name] = path
+    scan = _wmi_create_scan(tmp_path / "scan", list(files.values()))
+    # A case that does not parse proves nothing: it would be refused (or accepted) for the parse error, not for the spelling it names.
+    unparsed = {name: scan[str(path)]["parseErrors"] for name, path in files.items() if scan[str(path)]["parseErrors"]}
+    assert unparsed == {}, "a case must still be valid PowerShell"
+    survivors = [name for name in mutants if not scan[str(files[name])]["sites"]]
+    assert survivors == [], f"these direct WMI creates were not refused: {survivors}"
+    false_alarms = {name: scan[str(files[name])]["sites"] for name in not_sites if scan[str(files[name])]["sites"]}
+    assert false_alarms == {}, "a comment, a string, a read of the process table, GetOwner, Terminate and [scriptblock]::Create are not a WMI process create"
+    # adversary A7: a file the parser cannot read is reported as unreadable, not as a clean file with no sites
+    missing = tmp_path / "cases" / "this-file-does-not-exist.ps1"
+    unread = _wmi_create_scan(tmp_path / "scan-missing", [missing])[str(missing)]
+    assert unread["unreadable"] is True and all(not scan[str(path)]["unreadable"] for path in files.values()), unread
+
+
 # --- LANE-CHILD-LOADER-DIALOG-CODEX-SANDBOX-1: the codex lane's children must find the MinGW runtime DLLs ----------
 # MEASURED 2026-11-06 (System log, source 'Application Popup'): green2.exe 09:56:51Z and red.exe 09:57:28Z raised "libstdc++-6.dll / libgcc_s_seh-1.dll was
 # not found" on the owner's desktop AFTER the error-mode fix above merged. The codex sandbox's spawn does not carry that mode to the commands it runs, so the
