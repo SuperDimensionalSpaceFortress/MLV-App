@@ -1405,6 +1405,38 @@ def test_wmi_create_scan_refuses_each_direct_create_spelling(tmp_path):
         # adversary A6: more than one conversion, and a multiple assignment, on the binding
         "double-conversion-binding": "[object][object]$c = Get-WmiObject -List Win32_Process\n$c.Create('x')",
         "multiple-assignment-binding": "$a, $c = Get-WmiObject -List Win32_Process\n$c.Create('x')",
+        # CoS G7 on d1381e61: ForEach-Object / % / foreach name the method as -MemberName or as the first positional argument (no script block, no `.Create(`)
+        "foreach-membername-create": "Get-WmiObject -List Win32_Process | ForEach-Object -MemberName Create -ArgumentList 'x'",
+        "percent-positional-create": "Get-CimClass Win32_Process | % Create 'x'",
+        "foreach-alias-positional-create": "Get-WmiObject -List Win32_Process | foreach Create 'x'",
+        "wmi-variable-foreach-positional-create": "$c = Get-WmiObject -List Win32_Process\n$c | ForEach-Object Create 'x'",
+        "foreach-membername-invoke-method": "Get-WmiObject -List Win32_Process | ForEach-Object -MemberName InvokeMethod -ArgumentList 'Create', @('x')",
+        "foreach-positional-invoke-method": "Get-WmiObject -List Win32_Process | % InvokeMethod 'Create'",
+        "foreach-membername-from-a-variable": "$m = 'Create'\nGet-WmiObject -List Win32_Process | ForEach-Object -MemberName $m",
+        "foreach-positional-from-a-variable": "$m = 'Create'\nGet-WmiObject -List Win32_Process | % $m 'x'",
+        "foreach-membername-abbreviated": "Get-WmiObject -List Win32_Process | ForEach-Object -Mem Create",
+        "foreach-membername-colon-form": "Get-WmiObject -List Win32_Process | ForEach-Object -MemberName:Create",
+        "foreach-inputobject-membername": "$c = Get-WmiObject -List Win32_Process\nForEach-Object -InputObject $c -MemberName Create",
+        # G7: $_ inside a switch over a WMI value is that value
+        "switch-over-a-wmi-variable-create": "$c = Get-WmiObject -List Win32_Process\nswitch ($c) { default { $_.Create('x') } }",
+        "switch-over-a-wmi-class-create": "switch (Get-WmiObject -List Win32_Process) { default { $_.Create('x') } }",
+        "switch-psitem-invoke-method": "$c = Get-WmiObject -List Win32_Process\nswitch ($c) { default { $PSItem.InvokeMethod('Create', @('x')) } }",
+        "switch-over-the-pipeline-item": "Get-WmiObject -List Win32_Process | ForEach-Object { switch ($_) { default { $_.Create('x') } } }",
+        "switch-clause-create": "$c = Get-WmiObject -List Win32_Process\nswitch ($c) { { $true } { $_.Create('x') } }",
+        # G7: a `.Create` member READ on a WMI receiver (the method object is invoked later)
+        "create-member-invoke": "$c = Get-WmiObject -List Win32_Process\n$c.Create.Invoke('x')",
+        "create-member-copied-then-invoked": "$c = Get-WmiObject -List Win32_Process\n$f = $c.Create\n$f.Invoke('x')",
+        "create-member-read-on-the-class": "(Get-WmiObject -List Win32_Process).Create.Invoke('x')",
+        "create-member-read-in-a-pipeline": "Get-WmiObject -List Win32_Process | ForEach-Object { $_.Create.Invoke('x') }",
+        # G7: a member name built at run time, called on a WMI receiver
+        "dynamic-member-call": "$c = Get-WmiObject -List Win32_Process\n$m = 'Create'\n$c.$m('x')",
+        "dynamic-member-call-on-the-class": "$m = 'Create'\n(Get-WmiObject -List Win32_Process).$m('x')",
+        "dynamic-member-call-in-a-pipeline": "$m = 'Create'\nGet-WmiObject -List Win32_Process | ForEach-Object { $_.$m('x') }",
+        # G7: -PipelineVariable binds each output of the command to a variable
+        "pipeline-variable-create": "Get-WmiObject -List Win32_Process -PipelineVariable w | % { $w.Create('x') }",
+        "pipeline-variable-alias": "Get-CimClass Win32_Process -pv w | ForEach-Object { $w.Create('x') }",
+        "pipeline-variable-colon-form": "Get-CimClass Win32_Process -PipelineVariable:w | ForEach-Object { $w.InvokeMethod('Create', @('x')) }",
+        "pipeline-variable-on-a-wmi-variable": "$c = Get-WmiObject -List Win32_Process\n$c | ForEach-Object -PipelineVariable w -Process { $w.Create('x') }",
     }
     not_sites = {
         "line-comment": "# Invoke-CimMethod -ClassName Win32_Process -MethodName Create; [wmiclass]'Win32_Process'",
@@ -1438,6 +1470,18 @@ def test_wmi_create_scan_refuses_each_direct_create_spelling(tmp_path):
         "wmic-comment-in-a-parenthesized-argument": "wmic process get (<# create #> 'ProcessId')",
         "plain-variable-piped": "$c = Get-Item x\n$c | ForEach-Object { $_.Create('y') }",
         "scope-prefix-on-a-plain-variable": "$local:c = Get-Item x\n$script:c.Create('y')",
+        # G7: the same shapes that are not a create stay accepted
+        "foreach-membername-name-on-a-wmi-pipeline": "Get-WmiObject -List Win32_Process | ForEach-Object -MemberName Name",
+        "foreach-positional-terminate-on-a-wmi-pipeline": "Get-WmiObject Win32_Process | % Terminate",
+        "foreach-membername-name-on-a-wmi-variable": "$c = Get-WmiObject -List Win32_Process\n$c | ForEach-Object Name",
+        "foreach-membername-create-on-a-plain-pipeline": "Get-Item x | ForEach-Object -MemberName Create -ArgumentList 'y'",
+        "foreach-script-block-positional-on-a-wmi-pipeline": "Get-WmiObject Win32_Process | ForEach-Object { $_.ProcessId }",
+        "switch-over-a-plain-value": "$x = Get-Item .\nswitch ($x) { default { $_.Create('y') } }",
+        "switch-over-a-wmi-value-reads-a-property": "$c = Get-WmiObject -List Win32_Process\nswitch ($c) { default { $_.Name } }",
+        "switch-over-a-plain-value-inside-a-wmi-pipeline": "Get-WmiObject -List Win32_Process | ForEach-Object { switch (Get-Item x) { default { $_.Create('y') } } }",
+        "create-member-read-on-a-plain-variable": "$c = Get-Item x\n$f = $c.Create\n$f.Invoke('y')",
+        "dynamic-member-call-on-a-plain-variable": "$c = Get-Item x\n$m = 'Create'\n$c.$m('y')",
+        "pipeline-variable-on-a-plain-command": "Get-Item x -PipelineVariable w | ForEach-Object { $w.Create('y') }",
     }
     files = {}
     for name, text in {**mutants, **not_sites}.items():
