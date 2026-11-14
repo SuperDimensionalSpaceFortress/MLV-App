@@ -35,11 +35,18 @@ struct PlaybackLookaheadCpuRouteInputs
     bool gpuBilinearDebayer = false;        // m_renderThreadUsingGpuBilinearDebayer
     bool gpuAmazeDebayer = false;           // m_renderThreadUsingGpuAmazeDebayer
     PlaybackPrepBorrowInputs prepRoute;     // #774's borrow inputs, request side (buffer fields unused)
+    int frameSlotCount = 4;                 // RenderFrameThread::playbackFrameSlotCount()
 };
+
+/*! r4 fix iteration 2 (adversary A3 on c7953c66): the frame slots the CPU-route lookahead needs. At depth 1 the slots
+ *  hold at most the presenting slot (#774 borrow), the target and two lookaheads issued from earlier targets. With
+ *  MLVAPP_PHASE3_FRAME_SLOT_COUNT=1 or 2, ready lookaheads 27 and 28 filled every slot before target 26 had one: a deadlock. */
+inline constexpr int kCpuRouteLookaheadMinFrameSlots = 4;
 
 inline bool playbackLookaheadCpuRouteAdmits( const PlaybackLookaheadCpuRouteInputs &in )
 {
     if( !in.playing || !in.fileLoaded || !in.dropFrameMode ) return false;
+    if( in.frameSlotCount < kCpuRouteLookaheadMinFrameSlots ) return false;
     if( !in.phase3DecodeReconProcess ) return false;
     if( in.textureRouteRequested ) return false;
     if( in.gpuBilinearDebayer || in.gpuAmazeDebayer ) return false;
@@ -123,31 +130,43 @@ inline int lookaheadOffsetFrames( int k, bool cpuRoute, double positionFraction,
 }
 
 /*! r4 fix iteration 1 (adversary A2 on 05511dac): the frame CPU-route lookahead \a k asks for is the frame the drop-frame
- *  engine itself reaches. It advances the position requestedFrame + fraction by lookaheadOffsetFrames whole frames through
- *  playback_frame_range::advanceDropFrameTick, so the engine's own Loop wrap (which never returns the cut's last frame
+ *  engine itself reaches. It advances the position requestedFrame + fraction by lookaheadOffsetFrames whole frames under
+ *  playback_frame_range::advanceDropFrameTick's rule (mirrored in integers below), so the engine's own Loop wrap (which never returns the cut's last frame
  *  unless \a presentLastFrame, i.e. conform) or end-of-cut clamp applies. Before this, Loop on with Cut 1..10,
  *  requestedFrame 8 at 8.25 and stride 1 asked for frame 9; the engine wraps 9.25 to 0.25, so 9 was never presented and
  *  was pruned. \a cutInValue and \a cutOutValue are the 1-based spin box values, as the engine takes them. */
 inline int cpuRouteLookaheadFrame( int requestedFrame, int k, double positionFraction, double strideFrames,
                                    int cutInValue, int cutOutValue, bool loopEnabled, bool presentLastFrame )
 {
-    double fraction = std::isfinite( positionFraction ) ? positionFraction : 0.0;
-    if( fraction < 0.0 || fraction >= 1.0 ) fraction = 0.0;
-    const int offset = lookaheadOffsetFrames( k, true, fraction, strideFrames );
-    const playback_frame_range::DropFrameTickResult tick = playback_frame_range::advanceDropFrameTick(
-        static_cast<double>( requestedFrame ) + fraction, static_cast<double>( offset ),
-        cutInValue, cutOutValue, loopEnabled, presentLastFrame );
-    return static_cast<int>( std::floor( tick.position ) );
+    const int offset = lookaheadOffsetFrames( k, true, positionFraction, strideFrames );
+    // r4 fix iteration 2 (adversary A2 on c7953c66): advanceDropFrameTick's rule in exact integers. The engine's position
+    // is N + fraction with N = requestedFrame + offset and fraction in [0, 1), and every bound it compares against is a
+    // whole frame, so N alone decides. Adding them in double first rounded 1.9999999999999998 + 3 up to 5.0, so frame 4
+    // was asked for as 5.
+    const long long n = static_cast<long long>( requestedFrame ) + offset;
+    const long long lastFrame = static_cast<long long>( cutOutValue ) - 1;
+    const long long wrapAt = presentLastFrame ? lastFrame + 1 : lastFrame;   // playback_frame_range::dropFrameLoopWrapAt
+    if( loopEnabled && n >= wrapAt )
+    {
+        const long long width = static_cast<long long>( cutOutValue ) - cutInValue + ( presentLastFrame ? 1 : 0 );
+        if( width <= 0 ) return static_cast<int>( n );   // the engine subtracts nothing
+        const long long laps = ( n - wrapAt ) / width + 1;
+        return static_cast<int>( n - laps * width );
+    }
+    if( !loopEnabled && n >= lastFrame ) return static_cast<int>( lastFrame );
+    return static_cast<int>( n );
 }
 
 /*! The forward window prunePlaybackLookaheadOutsideForwardWindow keeps, in frames past the active target. The
- *  texture route keeps \a depth (unchanged). The CPU route keeps depth x kMaxStrideFrames, so a request
- *  lookaheadOffsetFrames placed ahead is never pruned before the engine reaches it. Frames behind the target
- *  are still pruned. */
+ *  texture route keeps \a depth (unchanged). The CPU route keeps depth x kMaxStrideFrames + 1, so a request
+ *  cpuRouteLookaheadFrame placed ahead is never pruned before the engine reaches it. Frames behind the target
+ *  are still pruned. The + 1 (r4 fix iteration 2, adversary A1 on c7953c66): under Loop the engine wraps by
+ *  cutOut - cutIn (it skips the cut's last frame), but the prune measures the distance modulo the cut's frame count
+ *  cutOut - cutIn + 1. So a prediction 3 ahead that wraps (97 + 3, Cut 1..100, to frame 1) measures 4. */
 inline int lookaheadWindowFrames( int depth, bool cpuRoute )
 {
     if( !cpuRoute || depth <= 0 ) return depth;
-    return depth * kMaxStrideFrames;
+    return depth * kMaxStrideFrames + 1;
 }
 
 } // namespace playback_lookahead_cpu

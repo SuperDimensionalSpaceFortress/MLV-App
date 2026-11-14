@@ -444,6 +444,9 @@ public:
      * frameNumber in activeGeneration, lookahead or not (not yet acquired). */
     bool hasReadyFrameForPlaybackTarget( uint32_t frameNumber,
                                          uint64_t activeGeneration );
+    /* CPU-S1-PACE-POST-785-LEVER-1 r4 fix iteration 2 (adversary A3 on c7953c66): the frame slot count the thread runs
+     * (MLVAPP_PHASE3_FRAME_SLOT_COUNT or 4), for the CPU-route lookahead's slot budget (PlaybackLookaheadCpuRoute.h). */
+    static int playbackFrameSlotCount( void ) { return configuredFrameSlotCount(); }
     int prunePlaybackLookaheadOutsideForwardWindow( int activePlaybackTarget,
                                                     uint64_t activeGeneration,
                                                     int cutInFrame,

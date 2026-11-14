@@ -18,6 +18,7 @@
 #include "../../platform/qt/PlaybackLookaheadCpuRoute.h"
 #include "../../platform/qt/PlaybackDecodeRenderOverlap.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <deque>
@@ -334,6 +335,25 @@ SlotBudgetRun simulateSlotBudget( int depth, double pipelineMs, double prepMs, d
 namespace
 {
 
+// RenderFrameThread.cpp playbackFrameWithinLookaheadWindow, mirrored (it is not in a header). The Loop branch measures the
+// distance modulo the cut's frame count, cutOut - cutIn + 1; TheLoopPruneDistanceIsModuloTheCutFrameCount pins that source.
+bool withinPruneWindow( int frame, int target, int cutInFrame, int cutOutFrame, int depth, bool loopEnabled )
+{
+    if( target < 0 || depth < 0 ) return true;
+    if( frame == target ) return true;
+    if( cutOutFrame < cutInFrame ) return frame >= target && frame <= target + depth;
+    const int cutIn = std::max( 0, cutInFrame );
+    const int cutOut = std::max( cutIn, cutOutFrame );
+    if( target < cutIn || target > cutOut || frame < cutIn || frame > cutOut )
+        return frame >= target && frame <= target + depth;
+    if( !loopEnabled ) return frame >= target && frame <= std::min( cutOut, target + depth );
+    const int loopSpan = cutOut - cutIn + 1;
+    if( loopSpan <= 0 ) return frame == target;
+    int distance = frame - target;
+    if( distance < 0 ) distance += loopSpan;
+    return distance >= 0 && distance <= depth;
+}
+
 struct ScriptedSlotsRun
 {
     bool deadlocked = false;
@@ -349,9 +369,8 @@ struct ScriptedSlotsRun
 // does), queue the CPU lookaheads (cpuRouteLookaheadFrame), fill, then present the target. Deadlock: the target is
 // still queued, every slot holds a ready lookahead that is not the target, and nothing is presenting.
 ScriptedSlotsRun simulateScriptedSlots( int depth, const std::vector<double> &positions, int cutInValue, int cutOutValue,
-                                        bool loopEnabled )
+                                        bool loopEnabled, int kSlots = 4 )
 {
-    constexpr int kSlots = 4;
     struct Slot { int frame = -1; bool lookahead = false; bool presenting = false; };
     struct Request { int frame; bool lookahead; };
     std::vector<Slot> slots( kSlots );
@@ -390,10 +409,11 @@ ScriptedSlotsRun simulateScriptedSlots( int depth, const std::vector<double> &po
         stride.noteTarget( target, position );
         for( Slot &s : slots )
             if( s.frame >= 0 && s.lookahead && !s.presenting && s.frame != target
-             && ( s.frame < target || s.frame > target + window ) )
+             && !withinPruneWindow( s.frame, target, cutInValue - 1, cutOutValue - 1, window, loopEnabled ) )
                 s = Slot();
         for( auto it = queue.begin(); it != queue.end(); )
-            if( it->lookahead && ( it->frame < target || it->frame > target + window ) ) it = queue.erase( it );
+            if( it->lookahead && !withinPruneWindow( it->frame, target, cutInValue - 1, cutOutValue - 1, window, loopEnabled ) )
+                it = queue.erase( it );
             else ++it;
         if( !covered( target ) )
         {
@@ -504,6 +524,81 @@ TEST(PlaybackLookaheadPruneWaste, AtTheLoopEndTheCpuLookaheadIsTheFrameTheEngine
                                 if( loop ) ASSERT_TRUE( frame != cutOut - 1 );   // Loop without conform never returns it
                                 ASSERT_TRUE( frame >= cutIn - 1 && frame <= cutOut - 1 );
                             }
+}
+
+// RED on c7953c66 (adversary A3): MLVAPP_PHASE3_FRAME_SLOT_COUNT=1 or 2 admitted the CPU lookahead; ready lookahead 27
+// (one slot) or 27 and 28 (two slots) held every slot when target 25 or 26 arrived.
+TEST(PlaybackLookaheadCpuSlotBudget, FewerThanFourFrameSlotsRefuseTheCpuLookaheadAndNeverDeadlock)
+{
+    PlaybackLookaheadCpuRouteInputs in;
+    in.playing = true;
+    in.fileLoaded = true;
+    in.dropFrameMode = true;
+    in.phase3DecodeReconProcess = true;
+    in.prepRoute.playing = true;
+    in.prepRoute.displayPreviewCachingAllowed = false;
+    in.prepRoute.cpuPreviewProcessingActive = true;
+    in.prepRoute.outputProcessed8 = false;
+    ASSERT_TRUE( playbackLookaheadCpuRouteAdmits( in ) );   // the default 4 slots
+    std::vector<double> positions;
+    for( double p = 0.9; p < 25.0; p += 3.0 ) positions.push_back( p );
+    positions.push_back( 25.9 );
+    positions.push_back( 26.9 );
+    for( int slots = 1; slots <= 12; ++slots )
+    {
+        in.frameSlotCount = slots;
+        const bool admitted = playbackLookaheadCpuRouteAdmits( in );
+        ASSERT_EQ( admitted, slots >= kCpuRouteLookaheadMinFrameSlots );
+        const int depth = playback_overlap::effectiveLookaheadFrames( -1, false, admitted );
+        const ScriptedSlotsRun run = simulateScriptedSlots( depth, positions, 1, 100, false, slots );
+        std::printf( "scripted_slots slots=%d admitted=%d depth=%d deadlocked=%d at=%d\n", slots, admitted ? 1 : 0,
+                     depth, run.deadlocked ? 1 : 0, run.deadlockTarget );
+        ASSERT_FALSE( run.deadlocked );
+    }
+}
+
+// RED on c7953c66 (adversary A1): Loop on, Cut 1..100, target 97 at 97.9 with stride ~2.5 predicts 97 + 3, which the
+// engine wraps (by 99) to frame 1. The prune measures 1 - 97 modulo 100 = 4 against a window of 3 and dropped it.
+TEST(PlaybackLookaheadPruneWaste, AWrappedCpuPredictionStaysInsideTheLoopPruneWindow)
+{
+    using playback_lookahead_cpu::cpuRouteLookaheadFrame;
+    ASSERT_EQ( cpuRouteLookaheadFrame( 97, 1, 0.9, 2.499849321361419, 1, 100, true, false ), 1 );
+    ASSERT_TRUE( withinPruneWindow( 1, 97, 0, 99, lookaheadWindowFrames( 1, true ), true ) );
+    const double strides[] = { 1.0, 1.35, 2.0, 2.5, 3.0 };
+    for( int cutIn = 1; cutIn <= 3; ++cutIn )
+        for( int cutOut = cutIn + 1; cutOut <= 14; ++cutOut )
+            for( int presentLast = 0; presentLast < 2; ++presentLast )
+                for( double s : strides )
+                    for( int target = cutIn - 1; target <= cutOut - 1; ++target )
+                        for( double f = 0.0; f < 1.0; f += 0.125 )
+                        {
+                            const int frame = cpuRouteLookaheadFrame( target, 1, f, s, cutIn, cutOut, true, presentLast != 0 );
+                            ASSERT_TRUE( withinPruneWindow( frame, target, cutIn - 1, cutOut - 1,
+                                                            lookaheadWindowFrames( 1, true ), true ) );
+                        }
+    // The scripted run of the adversary's positions keeps every prediction until the engine reaches it.
+    std::vector<double> positions;
+    for( double p = 0.9; p < 98.0; p += 3.0 ) positions.push_back( p );
+    positions.push_back( 97.9 );
+    const ScriptedSlotsRun run = simulateScriptedSlots( 1, positions, 1, 100, true );
+    ASSERT_FALSE( run.deadlocked );
+}
+
+// RED on c7953c66 (adversary A2): 1 + 0.9999999999999998 + 3 rounds to 5.0 in double, so frame 4 was asked for as 5.
+TEST(PlaybackLookaheadPruneWaste, TheCpuPredictionIsExactUnderDoubleRounding)
+{
+    using playback_lookahead_cpu::cpuRouteLookaheadFrame;
+    ASSERT_EQ( cpuRouteLookaheadFrame( 1, 1, 0.9999999999999998, 2.15625, 1, 100, false, false ), 4 );
+    ASSERT_EQ( cpuRouteLookaheadFrame( 1, 1, 0.9999999999999999, 3.0, 1, 100, false, false ), 4 );
+    const double fractions[] = { 0.9999999999999998, 0.9999999999999999, 0.99999999, 0.5 };
+    for( int target = 0; target < 200; ++target )
+        for( double f : fractions )
+            for( double s = 1.0; s <= 3.0; s += 0.03125 )
+            {
+                const int frame = cpuRouteLookaheadFrame( target, 1, f, s, 1, 1000, false, false );
+                ASSERT_TRUE( frame - target >= 1 && frame - target <= 3 );
+                ASSERT_TRUE( withinPruneWindow( frame, target, 0, 999, lookaheadWindowFrames( 1, true ), false ) );
+            }
 }
 
 // Adversary A3 on 05511dac: 0.9999999999999999 + 3.0 rounds to 4.0, past the depth-1 window of 3.

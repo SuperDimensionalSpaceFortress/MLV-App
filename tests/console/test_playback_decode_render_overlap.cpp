@@ -714,6 +714,25 @@ TEST(PlaybackLookaheadCpuRouteWiring, TheLookaheadFrameAndThePruneWindowFollowTh
     ASSERT_TRUE( draw.contains( QStringLiteral(
         "if( m_playbackLookaheadCpuRouteAdmitted ) m_playbackDropFrameStride.noteTarget( requestedFrame, m_newPosDropMode );\n"
         "        else m_playbackDropFrameStride.reset();") ) );
+    // r4 fix iteration 2 (adversary A3 on c7953c66): the admission reads the thread's real slot count.
+    ASSERT_TRUE( draw.contains( QStringLiteral(
+        "cpuRoute.frameSlotCount = RenderFrameThread::playbackFrameSlotCount();") ) );
+}
+
+// r4 fix iteration 2 (adversary A1 on c7953c66): withinPruneWindow in test_playback_lookahead_prune_waste.cpp mirrors this
+// function; the Loop distance is modulo the cut's frame count, the source of the CPU window's + 1.
+TEST(PlaybackLookaheadCpuRouteWiring, TheLoopPruneDistanceIsModuloTheCutFrameCount)
+{
+    const QString rft = readRepoText( "platform/qt/RenderFrameThread.cpp" );
+    const QString window = functionBody( rft, QStringLiteral("bool playbackFrameWithinLookaheadWindow( uint32_t frameNumber,") );
+    ASSERT_FALSE( window.isEmpty() );
+    ASSERT_TRUE( window.contains( QStringLiteral("const int loopSpan = cutOut - cutIn + 1;") ) );
+    ASSERT_TRUE( window.contains( QStringLiteral("if( distance < 0 ) distance += loopSpan;") ) );
+    ASSERT_TRUE( window.contains( QStringLiteral("return distance >= 0 && distance <= depth;") ) );
+    ASSERT_TRUE( window.contains( QStringLiteral("&& frame <= std::min( cutOut, activePlaybackTarget + depth );") ) );
+    const QString h = readRepoText( "platform/qt/RenderFrameThread.h" );
+    ASSERT_TRUE( h.contains( QStringLiteral(
+        "static int playbackFrameSlotCount( void ) { return configuredFrameSlotCount(); }") ) );
 }
 
 // CPU-LOOKAHEAD-ENV-DEPTH-SLOT-BUDGET-TEST-1 (r4): the slot rule the slot-budget model runs

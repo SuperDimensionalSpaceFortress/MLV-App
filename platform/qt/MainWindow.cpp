@@ -7605,6 +7605,7 @@ void MainWindow::drawFrame( bool updateTimecodeLabel )
             requestContext.gpuPlaybackReconTexturePresentRequested;
         cpuRoute.prepRoute.gpuPlaybackReconTextureNoReadbackCandidate =
             requestContext.gpuPlaybackReconTexturePresentRequested;
+        cpuRoute.frameSlotCount = RenderFrameThread::playbackFrameSlotCount();   // r4 fix iteration 2 (adversary A3)
         m_playbackLookaheadCpuRouteAdmitted = playbackLookaheadCpuRouteAdmits( cpuRoute );
         // CPU-LOOKAHEAD-PRUNE-WASTE-1 (r4): sample the drop-frame engine's advance on the admitted CPU route; any
         // other route starts the next CPU-route session from stride 1.
