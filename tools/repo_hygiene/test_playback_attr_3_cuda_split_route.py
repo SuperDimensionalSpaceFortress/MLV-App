@@ -338,11 +338,13 @@ class AttributionJobTests(unittest.TestCase):
         function = module[module.index("function Assert-AttrCudaBuildManifest") :]
         function = function[: function.index("\nfunction ")]
         # Statement positions, not prose: the doc comment names ConvertFrom-Json too.
-        self.assertLess(
-            function.index('throw "ATTRCUDA_BUILD_MANIFEST_SHA_MISMATCH'),
-            function.index("$manifest = [IO.File]::ReadAllText($Path) | ConvertFrom-Json"),
-            "the hash must be checked before the manifest is parsed",
-        )
+        # VENUE-STAGE-SAME-SHA-RESTAGE-GUARD-1 r8 (adversary A1): the read and the typed parse are two statements now; both follow the hash check.
+        for statement in ("$manifestText = [IO.File]::ReadAllText($Path)", "$manifest = try { $manifestText | ConvertFrom-Json -ErrorAction Stop }"):
+            self.assertLess(
+                function.index('throw "ATTRCUDA_BUILD_MANIFEST_SHA_MISMATCH'),
+                function.index(statement),
+                "the hash must be checked before the manifest is parsed",
+            )
 
     def test_the_build_manifest_must_chain_to_the_dll_pair_manifest(self) -> None:
         self.assertIn("ATTRCUDA_BUILD_MANIFEST_DLLPAIR_UNBOUND", _read(SHARED_MODULE))
