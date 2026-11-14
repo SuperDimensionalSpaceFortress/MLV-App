@@ -277,7 +277,7 @@ function Read-StagedSoundness([string]$When, [switch]$FinalVerify) {
     # the test-only -TestSoundnessReadDelayMs stalls the call's FIRST soundness read only (step 4's when a build.json is there, else step 8's), never the final verify's
     $script:SoundnessReads++
     $delayMs = $(if ($script:SoundnessReads -eq 1) { $TestSoundnessReadDelayMs } else { 0 })
-    $artDelayMs = $(if (($TestSoundnessArtifactDelayAt -ceq 'first' -and $script:SoundnessReads -eq 1) -or ($TestSoundnessArtifactDelayAt -ceq 'final' -and $FinalVerify)) { $TestSoundnessArtifactDelayMs } else { 0 })
+    $artDelayMs = $(if (($TestSoundnessArtifactDelayAt -ieq 'first' -and $script:SoundnessReads -eq 1) -or ($TestSoundnessArtifactDelayAt -ieq 'final' -and $FinalVerify)) { $TestSoundnessArtifactDelayMs } else { 0 })
     $r = try { Get-VenueStagedBuildManifest -AgentShare $share -SourceCommit $commit -VerifyArtifacts -TimeoutSec $soundSec -ArtifactTimeoutSec 300 -CallCapSec $capSec -TestReadDelayMs $delayMs -TestArtifactDelayMs $artDelayMs } catch { [pscustomobject]@{ state = 'UNREACHABLE'; error = ($_.Exception.Message -replace '\s+', ' ') } }
     $leftAfter = ($script:Deadline - [DateTime]::UtcNow).TotalSeconds
     if ($r.state -ceq 'UNREACHABLE' -and $leftAfter -lt 1.0) { Stop-Nightly 'STAGE_CAP_EXCEEDED' "the soundness read of the staged build of $commit $When ran to the end of the $MaxTotalSec s cap (the manifest read $([Math]::Round($soundSec, 2)) s, the artifact hash at most 300 s, $([Math]::Round($capSec, 2)) s in all) and the cap ran out with no answer ($([Math]::Floor([Math]::Max(0.0, $leftAfter) * 100.0) / 100.0) s left): $($r.error); nothing was submitted" }

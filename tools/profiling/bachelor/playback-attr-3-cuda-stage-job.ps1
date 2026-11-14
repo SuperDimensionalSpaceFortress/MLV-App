@@ -414,6 +414,13 @@ if (Test-Path -LiteralPath $manifestCachePath) {
     }
     if ($unsound) {
         Say "replacing a staged build that is not sound ($unsound); staged manifest $stagedSha"
+        # r8 (adversary A1 on 0c0eafd7): the unsound manifest leaves the cache name BEFORE any artifact is renamed in. Left standing, a reader that hashed the repaired
+        # artifacts against it found it sound and pinned it, and the publish below then replaced it. Removed by content proof only (the bytes judged unsound);
+        # anything else at the name is left and nothing is staged.
+        if (-not (Remove-AttrCudaInputFileByContent -TrustedRoot $AgentRoot -Path $manifestCachePath -ExpectedSha256 $stagedSha)) {
+            Write-Output "STAGE_REFUSED_STAGED_UNRETIRED sha=$($SourceCommit.Substring(0, 12)) staged=$($stagedSha.Substring(0, 8)) incoming=$($ManifestSha256.Substring(0, 8))"
+            Complete-Failed 7 'stagedBuildGuard' "the unsound staged manifest of $SourceCommit could not be removed by content proof before the repair, so nothing is staged"
+        }
     } else {
         foreach ($item in $sideFiles) { [void](Remove-AttrCudaInputFileByContent -TrustedRoot $AgentRoot -Path ([string]$item.path) -ExpectedSha256 ([string]$item.sha256)) }
         [void](Remove-AttrCudaInputFileByContent -TrustedRoot $AgentRoot -Path $manifestSide -ExpectedSha256 $ManifestSha256)

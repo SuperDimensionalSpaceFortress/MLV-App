@@ -755,6 +755,10 @@ function Get-VenueStagedBuildManifest {
             # r7 adversary A2: the hash's end on the call's own clock, so the worker checks the minimum again before each file
             $hashEnd = $callClock.Elapsed.TotalSeconds + $artSec
             foreach ($it in $items) { $it.clock = $callClock; $it.endSec = $hashEnd; $it.minSec = $ArtifactMinSec }
+            # VENUE-STAGE-SAME-SHA-RESTAGE-GUARD-1 r8 (adversary A1 on 0c0eafd7): the default hash reads the manifest itself again LAST, in the same bounded read, against the
+            # digest read above: a manifest a stager retired or replaced while its artifacts were hashed is BUILD_ARTIFACT_MISSING / _MISMATCH, never sound on its successor's
+            # artifacts. No clock: a few-byte read is never NOTIME. An offline -ArtifactProbeScript still sees the three artifacts only.
+            if ($null -eq $ArtifactProbeScript) { $items += @{ label = 'manifest'; name = [IO.Path]::GetFileName($path); path = $path; sha = $sha } }
             $probeText = $(if ($TestArtifactDelayMs -gt 0 -and $null -eq $ArtifactProbeScript) { "param(`$items)`n[Threading.Thread]::Sleep($TestArtifactDelayMs)`n& {" + $probe.ToString() + "`n} `$items" } else { $probe.ToString() })
             $ar =Invoke-VenueBoundedRead -ScriptText $probeText -Argument $items -TimeoutSec $artSec
             if (-not $ar.answered) { return [pscustomobject]@{ state = 'UNREACHABLE'; sha256 = $null; path = $path; error = "the cached artifacts could not be hashed: $($ar.error)"; contentProblem = $null; artifactProblem = $null; artifactsUnhashed = $true } }
