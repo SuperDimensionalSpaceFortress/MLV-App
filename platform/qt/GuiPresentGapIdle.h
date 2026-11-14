@@ -203,16 +203,29 @@ public:
         // so a measured tie can land an ulp apart (0.3 + 0.6 charged of 1.5 leaves 0.6000000000000001 against 0.6). Every
         // comparison here treats charges within one clock tick (1 ns) or a few ulps of the gap's charged total as a tie:
         // ties go to the named span over the rest, and to the first named span over a later one.
-        double total = rest;
-        for( int i = 0; i < kCount; ++i ) total += probe.sumMs[i];
-        const double tieMs = std::fmax( 1e-6, 8.0 * std::numeric_limits<double>::epsilon() * total );
+        // r3 (adversary A1 on 9c18b971): a tolerance compared in double ms still leaked at its own boundary (a 1 ns tie came
+        // out 1 ns + 1 ulp apart). Every charge is now rounded to whole gap-clock ticks (ns) and compared as an integer: a
+        // difference of at most tieNs ticks (1, or 8 ulps of the gap's charged total at sizes where 1 ns is below an ulp;
+        // kMaxSpanMs = 1e12 ms = 1e18 ns, and six such terms sum below INT64_MAX) is a tie. A charge that is not a positive
+        // finite number is 0 ticks and one past kMaxSpanMs is capped there, so llround never sees NaN, infinity or an overflow.
+        const auto ticks = []( double ms ) -> long long
+        {
+            if( !( ms > 0.0 ) || !std::isfinite( ms ) ) return 0;
+            return std::llround( ( ms < kMaxSpanMs ? ms : kMaxSpanMs ) * 1000000.0 );
+        };
+        long long totalNs = ticks( rest );
+        for( int i = 0; i < kCount; ++i ) totalNs += ticks( probe.sumMs[i] );
+        const long long ulpNs =
+            std::llround( 8.0 * std::numeric_limits<double>::epsilon() * static_cast<double>( totalNs ) );
+        const long long tieNs = ulpNs > 1 ? ulpNs : 1;
         int best = -1;
-        double bestCharge = 0.0;
+        long long bestNs = 0;
         for( int i = 0; i < kCount; ++i )
         {
-            if( probe.sumMs[i] > bestCharge + tieMs ) { bestCharge = probe.sumMs[i]; best = i; }
+            const long long n = ticks( probe.sumMs[i] );
+            if( n > 0 && ( best < 0 || n > bestNs + tieNs ) ) { bestNs = n; best = i; }
         }
-        return ( best >= 0 && !( rest > bestCharge + tieMs ) ) ? best : -1;
+        return ( best >= 0 && ticks( rest ) <= bestNs + tieNs ) ? best : -1;
     }
 
     // A gap opened: spans of a previous gap that never closed are not carried into it.

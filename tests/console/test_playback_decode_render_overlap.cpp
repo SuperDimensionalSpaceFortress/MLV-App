@@ -572,6 +572,28 @@ TEST(PlaybackLookaheadCpuRoute, AMeasuredTieGoesToTheNamedSpanDespiteRoundingInT
     c.nowNs = 400000; pair.begin( c );
     c.nowNs = 700000; pair.end( OtherBusySpan::TimerFrame, c );
     ASSERT_EQ( static_cast<int>( OtherBusySpan::DrawFrameReady ), pair.dominantBucket( 0.6 ) );
+    // r3 (adversary A1 on 9c18b971, its input verbatim): gap open 100000000000 ns, close 100000250029 ns, zero idle, sleep and
+    // paint; draw_frame from 100000010000 to 100000135014 ns (125014 ns) leaves a 125015 ns rest -- a one-tick tie, which the
+    // double-ms tolerance lost at its boundary (0.12501500000000002 > 0.125014 + 1e-6 returned unattributed).
+    OtherBusySpans tick;
+    tick.openGap();
+    c.gapSerial = 3;
+    c.nowNs = 100000010000; tick.begin( c );
+    c.nowNs = 100000135014; tick.end( OtherBusySpan::DrawFrame, c );
+    ASSERT_EQ( static_cast<int>( OtherBusySpan::DrawFrame ), tick.dominantBucket( 250029 / 1000000.0 ) );
+    // The adversary's second input: one named charge and the budget both 1/1000000.0 ms, zero rest. The charge equalled the old
+    // tieMs and was never selected; a positive charge of one tick is that span's, never unattributed.
+    OtherBusySpans one;
+    one.openGap();
+    c.gapSerial = 4;
+    c.nowNs = 0; one.begin( c );
+    c.nowNs = 1; one.end( OtherBusySpan::TimerFrame, c );
+    ASSERT_EQ( static_cast<int>( OtherBusySpan::TimerFrame ), one.dominantBucket( 1 / 1000000.0 ) );
+    // r3 hardening: a non-finite charge is 0 ticks (never handed to llround) and is never the dominant bucket.
+    OtherBusySpans odd;
+    odd.gapMs[static_cast<int>( OtherBusySpan::DrawFrameReady )] = std::numeric_limits<double>::quiet_NaN();
+    odd.gapMs[static_cast<int>( OtherBusySpan::TimerFrame )] = 0.5;
+    ASSERT_EQ( static_cast<int>( OtherBusySpan::TimerFrame ), odd.dominantBucket( 1.0 ) );
 }
 
 TEST(PlaybackLookaheadCpuRoute, TheMaxBusyGapNamesItsDominantBucket)
