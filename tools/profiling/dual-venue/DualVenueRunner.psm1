@@ -1937,7 +1937,7 @@ function Get-DvDueWakeDelivered {
     advanced= is not read (decided r8): a delivered wake on a busy renderer hands its advance to the frameReady path (busy_deferred=), so advanced=0
     with a delivered wake is a measured outcome of the arm, not a route that did not run.
     The one predicate for "a wake was delivered": Get-DvDueWakeDeliveryEvidence calls it for both the requested and the head path, and the runner's
-    gate (Invoke-VenueLeg.ps1) and Test-DvReceiptValid reach it only through that reader.
+    gate (Invoke-VenueLeg) and Test-DvReceiptValid reach it only through that reader.
     #>
     param([AllowNull()][AllowEmptyString()][string]$Line)
     $n = @{}
