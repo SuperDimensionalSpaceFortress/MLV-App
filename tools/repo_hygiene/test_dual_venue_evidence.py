@@ -15752,6 +15752,27 @@ class DueWakeDeliveryEvidenceTests(unittest.TestCase):
                 v = self.verdict(spec, self.log(rescued(2, 1).replace("delivery_kind=post", f"delivery_kind={kind}")))
                 self.assertEqual((v["verdict"], v["blocks"]), (want, False), v)
 
+    def test_r8_p4_a1_a_delivery_kind_line_without_one_disabled_is_unreadable(self) -> None:
+        # r8 adversary pass 4 A1, its input verbatim: a line WITH a delivery_kind (an r1+ binary, whose playbackDueWakeSummaryLine always prints
+        # disabled=) but no disabled= at all left the kill switch unshown, yet the posted arm was HONOURED and the sent head counterpart unblocked
+        post = json.loads((DV / "legs" / "m16-1457-native-fullscreen-s1-wake-post.json").read_text(encoding="utf-8"))
+        cell = json.loads((DV / "legs" / "m16-1457-native-fullscreen-s1.json").read_text(encoding="utf-8"))
+        verbatim = ("playback_smoke.measured_session id=3\nplayback_smoke.pace_summary session=3\n"
+                    "playback_due_wake armed=1 fired=1 post_rescued=0 delivery=native-msg delivery_kind=post\n")
+        for name, log in (("verbatim", verbatim), ("full line, no disabled=", self.log(self.wake("post").replace(" disabled=0", ""))),
+                          ("crash-forensics prefix", self.log(self.PREFIX + self.wake("post").replace(" disabled=0", "")))):
+            for leg, spec, kind in (("posted, verbatim spec", self.POST, "post"), ("posted, committed spec", post, "post"), ("head", cell, "send"),
+                                    ("unpaced leg", {"generatorArgs": {"unpaced": True}}, "send")):
+                with self.subTest(leg=leg, case=name):
+                    v = self.verdict(spec, log.replace("delivery_kind=post", f"delivery_kind={kind}"))
+                    self.assertEqual((v["verdict"], v["blocks"]), ("NOT_HONOURED", True), v)
+                    self.assertIn("unreadable", v["reason"])
+        # unchanged: the same line with its disabled=0 counts; a control binary's line (no delivery_kind) with no disabled= stays exempt (r5 G8 test)
+        v = self.verdict(post, verbatim.replace(" delivery=", " disabled=0 delivery="))
+        self.assertEqual((v["verdict"], v["blocks"]), ("HONOURED", False), v)
+        v = self.verdict(cell, self.log(self.wake(None).replace(" disabled=0", "")))
+        self.assertEqual((v["verdict"], v["blocks"]), ("NOT_REQUESTED", False), v)
+
     def test_r8_b1_one_delivered_wake_predicate_serves_both_arms_and_every_consumer(self) -> None:
         # r8 B1 class sweep: one predicate decides "a wake was delivered" for the requested and the head path, and both consumers (the runner's
         # gate and Test-DvReceiptValid's re-derivation) reach it only through Get-DvDueWakeDeliveryEvidence
@@ -15783,7 +15804,7 @@ class DueWakeMeasuredSessionAnchorTests(unittest.TestCase):
         "playback_smoke.measured_session id=3",
         "playback_smoke.summary session=3 reason=play-stop presented_frames=600",
         "playback_smoke.pace_summary session=3 first_present_ms=40.000 paced_elapsed_ms=25000.000",
-        "playback_due_wake armed=1200 delivery=native-msg+qtimer delivery_kind=post"]) + "\n"
+        "playback_due_wake armed=1200 disabled=0 delivery=native-msg+qtimer delivery_kind=post"]) + "\n"
 
     def ps(self, script: str, log: str, spec: dict | None = None) -> dict:
         proc, out = run_pwsh_json(script, DVE_LOG=log, DVE_SPEC=json.dumps(spec or {}))

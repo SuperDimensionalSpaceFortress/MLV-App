@@ -2058,7 +2058,9 @@ function Get-DvDueWakeDeliveryEvidence {
             $mech = [regex]::Matches($l, '(?:^|\s)delivery=(?<m>\S*)')
             # r3 (r2 adversary pass 7 advisory A1): the app's record starts `playback_due_wake armed=<n>` (MainWindow::playbackDueWakeSummaryLine) with one
             # non-negative decimal count; a record without it, or with an empty, signed, fractional or repeated armed=, is unreadable
-            if (-not (& $armedReadable $l) -or $disabledUnreadable) { $unreadableSeen = $true }
+            # r8 (r8 adversary pass 4 A1): a binary that prints delivery_kind always prints disabled=, so a line with no disabled= cannot show the
+            # kill switch off and is unreadable too ($dis counts this one candidate's disabled= tokens; a control line with none stays as r5 left it)
+            if (-not (& $armedReadable $l) -or $disabledUnreadable -or $dis.Count -ne 1) { $unreadableSeen = $true }
             elseif ($fields.Count -ne 1 -or $fields[0].Groups['k'].Value -cnotmatch '^(send|post|notifier|qtimer|none)$' -or $mech.Count -ne 1 -or -not (& $mechReadable $mech[0].Groups['m'].Value)) { $unreadableSeen = $true }
             else {
                 # r1 adversary pass 3 A1: the selection and the arms must agree -- none only with no arm (delivery=none), qtimer only on QTimer arms, notifier
