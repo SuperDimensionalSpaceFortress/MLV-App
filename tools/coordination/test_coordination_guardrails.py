@@ -1088,14 +1088,19 @@ def test_invoke_lane_error_mode_pin_catches_each_launch_ahead_of_the_block(tmp_p
 # [ManagementClass] type literal or cast; `wmic ... create` (an argument, not a comment). A WMI receiver is also: $_ / $PSItem inside a script block of a pipeline
 # whose EARLIER element names a WMI class; a variable copied (`$d = $c`, a chain of copies, a copy made inside such a pipeline) or bound by `foreach` from a WMI
 # variable or class, followed to a fixed point (a scope prefix is dropped, `$a, $c = ...` and stacked casts bind, no nesting limit); and on such a receiver
-# `.InvokeMethod` is refused for Create or for a method name that is not a literal. Words are read as PowerShell reads them: a backtick escape is removed
+# `.InvokeMethod` is refused for Create or for a method name that is not a literal, and so is a dynamic member call (`$c.$m(...)`) and a READ of `.Create`
+# (`$c.Create.Invoke(...)`). `ForEach-Object` / `%` / `foreach` is refused on WMI input (an earlier pipeline element or -InputObject) when its -MemberName, or its first
+# positional argument, is Create, InvokeMethod or not a literal; $_ in a `switch` clause is WMI when the switch reads a WMI value; a -PipelineVariable / -pv
+# variable is bound like a copy. Words are read as PowerShell reads them: a backtick escape is removed
 # (Win32_Pro`cess) and a comment inside a receiver or an argument is dropped. `$_` belongs to the innermost pipeline script block (a nested plain pipeline is not WMI).
 # NOT covered, stated plainly: lane scripts under the gitignored .claude-state (a worktree never holds them) are guarded board-side by the wmi-create-offenders
 # scan and the hidden-launch guard; files that are not .ps1/.psm1 (.py, .cmd, .js); a command whose name is a variable (`& $cmd`); a receiver that comes
 # from a call or an index rather than a variable; a method name built at run time on a Create call or on a receiver that is not followed as WMI; the
 # `.ForEach({ $_.Create() })` / `.Where()` intrinsic methods (their script block is not a pipeline); a variable that crosses a scope or a file (dot-sourcing,
 # a parameter, a returned value); a variable bound by `-OutVariable`, `Set-Variable`, `[ref]` or a hashtable/array element; a class or method name built from
-# pieces ('Win32_' + 'Process', -f); reflection; text run through Invoke-Expression or a script block built at run time. A file that does not parse is
+# pieces ('Win32_' + 'Process', -f); reflection; text run through Invoke-Expression or a script block built at run time; a member name handed to another
+# cmdlet (`Select-Object -ExpandProperty Create`, `Get-Member`); a dynamic member READ (`$c.$m` with no call); a positional ForEach-Object member name that
+# follows a switch parameter (`-UseNewRunspace Create`), which is read as that parameter's value. A file that does not parse is
 # scanned as far as its AST goes; a file the parser cannot READ fails the tracked test (it was not scanned).
 # The ONE sanctioned launcher lives under .claude-state and is not tracked, so today the allow list is empty. An entry is {repo-relative posix path: reason},
 # added only in review for a script that must call the create itself; an entry that stops matching a site fails the test, so the list cannot go stale.
@@ -1179,6 +1184,16 @@ function Test-WmiNode($Node) {
 # A script block on the first element, or outside a pipeline, takes its $_ from the enclosing one, so the search goes on outward.
 function Test-InWmiPipeline($Node) {
     for ($p = $Node.Parent; $null -ne $p; $p = $p.Parent) {
+        # A switch clause body binds $_ to the switch's own input, so it is WMI when the switch reads a WMI value (or $_ of a WMI pipeline around it).
+        if ($p -is [StatementBlockAst] -and $p.Parent -is [SwitchStatementAst]) {
+            $switch = $p.Parent
+            if (Test-WmiNode $switch.Condition) { return $true }
+            foreach ($v in $switch.Condition.FindAll({ param($x) $x -is [VariableExpressionAst] }, $true)) {
+                $vn = Get-VarName $v
+                if (($vn -eq '_' -or $vn -eq 'psitem') -and (Test-InWmiPipeline $switch)) { return $true }
+            }
+            return $false
+        }
         if ($p -isnot [ScriptBlockExpressionAst]) { continue }
         $cmd = $p.Parent
         # Up to the command the block is an argument of, through a parameter, a hashtable or an array; an assignment or another scope ends the climb.
@@ -1207,6 +1222,47 @@ function Test-WmiReceiver($Expression) {
     return (($root -eq '_' -or $root -eq 'psitem') -and (Test-InWmiPipeline $Expression))
 }
 
+# The value a command gives to a parameter named (or abbreviated to at least $MinLength letters of) $Full: the colon form's argument, else the next element.
+function Get-ParameterValue($Command, [string]$Full, [int]$MinLength) {
+    $elements = @($Command.CommandElements)
+    for ($i = 1; $i -lt $elements.Count; $i++) {
+        $e = $elements[$i]
+        if ($e -isnot [CommandParameterAst]) { continue }
+        $n = $e.ParameterName
+        if ($n.Length -lt $MinLength -or -not $Full.StartsWith($n, [StringComparison]::OrdinalIgnoreCase)) { continue }
+        if ($null -ne $e.Argument) { return $e.Argument }
+        if ($i + 1 -lt $elements.Count) { return $elements[$i + 1] }
+    }
+    return $null
+}
+
+# The method name a ForEach-Object / % / foreach call gives as -MemberName or as its first positional argument; $null when it gives none (a script block is the
+# -Process argument, not a member name). A positional is the first element that is neither a parameter nor a parameter's value.
+function Get-ForEachMemberName($Command) {
+    $explicit = Get-ParameterValue $Command 'MemberName' 1
+    if ($null -ne $explicit) { return $explicit }
+    $elements = @($Command.CommandElements)
+    for ($i = 1; $i -lt $elements.Count; $i++) {
+        $e = $elements[$i]
+        if ($e -is [CommandParameterAst]) { if ($null -eq $e.Argument) { $i++ }; continue }
+        if ($e -is [ScriptBlockExpressionAst]) { return $null }
+        return $e
+    }
+    return $null
+}
+
+# True when the objects a command receives are WMI: an earlier element of its pipeline names a WMI class or starts from a WMI variable, or -InputObject does.
+function Test-WmiPipelineInput($Command) {
+    if ($Command.Parent -is [PipelineAst]) {
+        foreach ($element in @($Command.Parent.PipelineElements)) {
+            if ([object]::ReferenceEquals($element, $Command)) { break }
+            if (Test-WmiNode $element) { return $true }
+        }
+    }
+    $inputObject = Get-ParameterValue $Command 'InputObject' 3
+    return ($null -ne $inputObject -and (Test-WmiNode $inputObject))
+}
+
 $out = [ordered]@{}
 foreach ($path in @(Get-Content -LiteralPath $ListFile -Encoding UTF8 | Where-Object { $_ })) {
     $tokens = $null; $errors = $null
@@ -1226,6 +1282,12 @@ foreach ($path in @(Get-Content -LiteralPath $ListFile -Encoding UTF8 | Where-Ob
     foreach ($f in $ast.FindAll({ param($x) $x -is [ForEachStatementAst] }, $true)) {
         $bindings.Add([pscustomobject]@{ Name = (Get-VarName $f.Variable); Right = $f.Condition; Node = $f })
     }
+    # -PipelineVariable name (-pv): the variable holds each output of the command, so it is WMI when the command, or an element before it, reads WMI.
+    foreach ($c in $ast.FindAll({ param($x) $x -is [CommandAst] }, $true)) {
+        $pv = Get-ParameterValue $c 'PipelineVariable' 2
+        if ($null -eq $pv) { $pv = Get-ParameterValue $c 'pv' 2 }
+        if ($pv -is [StringConstantExpressionAst]) { $bindings.Add([pscustomobject]@{ Name = ([string]$pv.Value).ToLowerInvariant(); Right = $c; Node = $c }) }
+    }
     $wmiVars = @{}
     $changed = $true
     while ($changed) {
@@ -1233,6 +1295,7 @@ foreach ($path in @(Get-Content -LiteralPath $ListFile -Encoding UTF8 | Where-Ob
         foreach ($b in $bindings) {
             if ($wmiVars.ContainsKey($b.Name)) { continue }
             $hit = Test-WmiNode $b.Right
+            if (-not $hit -and $b.Node -is [CommandAst]) { $hit = Test-WmiPipelineInput $b.Node }
             if (-not $hit) {
                 foreach ($v in $b.Right.FindAll({ param($x) $x -is [VariableExpressionAst] }, $true)) {
                     $vn = Get-VarName $v
@@ -1259,9 +1322,20 @@ foreach ($path in @(Get-Content -LiteralPath $ListFile -Encoding UTF8 | Where-Ob
                 $words = @($n.CommandElements | Select-Object -Skip 1 | ForEach-Object { Get-CleanText $_ })
                 if (($words -join ' ') -match '(?i)\bcreate\b') { $kind = 'wmic-create' }
             }
+            elseif (@('foreach-object', 'foreach', '%') -contains $lname) {
+                # ForEach-Object calls the named method on each input: no script block and no `.Create(` is needed.
+                $memberName = Get-ForEachMemberName $n
+                if ($null -ne $memberName -and (Test-WmiPipelineInput $n)) {
+                    if ($memberName -isnot [StringConstantExpressionAst]) { $kind = 'wmi-foreach-member-not-literal' }
+                    elseif ([string]$memberName.Value -match '(?i)create|invokemethod') { $kind = 'wmi-foreach-member-create' }
+                }
+            }
+        }
+        elseif ($n -is [InvokeMemberExpressionAst] -and $n.Member -isnot [StringConstantExpressionAst]) {
+            # A member name built at run time could be Create.
+            if (Test-WmiReceiver $n.Expression) { $kind = 'wmi-dynamic-member-call' }
         }
         elseif ($n -is [InvokeMemberExpressionAst]) {
-            if ($n.Member -isnot [StringConstantExpressionAst]) { continue }
             $member = [string]$n.Member.Value
             $viaWmi = Test-WmiReceiver $n.Expression
             if ($member -ieq 'Create') {
@@ -1275,6 +1349,10 @@ foreach ($path in @(Get-Content -LiteralPath $ListFile -Encoding UTF8 | Where-Ob
                 # On a WMI receiver a method name that is not a literal could be Create, as for Invoke-CimMethod above.
                 elseif ($viaWmi -and ($arguments.Count -lt 1 -or $arguments[0] -isnot [StringConstantExpressionAst])) { $kind = 'wmi-invoke-method-name-not-literal' }
             }
+        }
+        elseif ($n -is [MemberExpressionAst] -and $n.Member -is [StringConstantExpressionAst] -and [string]$n.Member.Value -ieq 'Create') {
+            # A READ of the Create method object (`$c.Create.Invoke(...)`, `$f = $c.Create`) reaches the same create without a `.Create(` call.
+            if (Test-WmiReceiver $n.Expression) { $kind = 'wmi-create-member-read' }
         }
         elseif ($n -is [TypeExpressionAst] -or $n -is [TypeConstraintAst]) {
             if ($n.TypeName.FullName -match $wmiTypes) { $kind = 'wmi-type' }
