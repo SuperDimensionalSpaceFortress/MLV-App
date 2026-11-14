@@ -1936,7 +1936,10 @@ function Get-DvDueWakeDeliveryEvidence {
     post. A leg that does not ask blocks when the measured line reports post or notifier (DUE_WAKE_DELIVERY_INHERITED: the variable came from the launcher)
     or is unreadable; send, none (no wake: an unpaced leg) and qtimer, and no delivery_kind at all (a control binary before r1) leave it unchanged (any
     other kind, "mixed" included, is unreadable). r2 adversary pass 6: a record counts only where it starts its record body, and the measured window closes
-    at the next pace_summary or at any playback_smoke record of another session. Pure and shared: the runner gates on it and Test-DvReceiptValid re-derives it from the hashed run log.
+    at the next pace_summary or at any playback_smoke record of another session. r4 (r4 adversary pass 9 A1): a leg that does not ask also blocks when the
+    measured line says disabled=1 (DUE_WAKE_DISABLED_INHERITED: MLVAPP_PLAYBACK_DUE_WAKE=0 came from the launcher; a control binary's line included), and
+    when a PACED leg's measured Play armed no wake (delivery=none: DUE_WAKE_NOT_ENGAGED); "none" is the app's own only on a generatorArgs.unpaced = true leg.
+    Pure and shared: the runner gates on it and Test-DvReceiptValid re-derives it from the hashed run log.
     #>
     param([Parameter(Mandatory)]$Spec, [AllowNull()][AllowEmptyString()][string]$LogText)
     $raw = Get-DvProp (Get-DvProp $Spec 'generatorArgs') 'dueWakeDeliveryPost'
@@ -1975,6 +1978,17 @@ function Get-DvDueWakeDeliveryEvidence {
     # delivery_kind is the SELECTED delivery (send / post / notifier; qtimer when the wake was built on a QTimer; none with no wake), never rewritten by a
     # fallback arm; delivery= is what this Play's arms used (native-msg, qtimer, notifier, "+"-joined when they differed, none with no arm)
     $mechanism = $null
+    # r4 (r4 adversary pass 9 A1): disabled= is the app's MLVAPP_PLAYBACK_DUE_WAKE kill switch (MainWindow::playbackDueWakeSummaryLine prints 0 or 1), read
+    # from the measured line whether or not it carries a delivery_kind (a control binary's line has none); a repeated or non-0/1 value is unreadable
+    $disabledSeen = $false
+    $disabledUnreadable = $false
+    if ($candidates.Count -eq 1) {
+        $dis = [regex]::Matches($candidates[0], '(?:^|\s)disabled=(?<d>\S*)')
+        if ($dis.Count -gt 1 -or ($dis.Count -eq 1 -and $dis[0].Groups['d'].Value -cnotmatch '^[01]$')) { $disabledUnreadable = $true }
+        elseif ($dis.Count -eq 1 -and $dis[0].Groups['d'].Value -ceq '1') { $disabledSeen = $true }
+    }
+    $unpacedRaw = Get-DvProp (Get-DvProp $Spec 'generatorArgs') 'unpaced'
+    $unpacedLeg = ($unpacedRaw -is [bool]) -and $unpacedRaw
     $withKind = @($candidates | Where-Object { $_ -match '(?:^|\s)delivery_kind=' })
     if ($withKind.Count -gt 0) {
         $mentions = $withKind.Count
@@ -1986,7 +2000,7 @@ function Get-DvDueWakeDeliveryEvidence {
             # r3 (r2 adversary pass 7 advisory A1): the app's record starts `playback_due_wake armed=<n>` (MainWindow::playbackDueWakeSummaryLine) with one
             # non-negative decimal count; a record without it, or with an empty, signed, fractional or repeated armed=, is unreadable
             $armed = [regex]::Matches($l, '(?:^|\s)armed=(?<a>\S*)')
-            if ($l -cnotmatch ($start + 'playback_due_wake armed=[0-9]+(?:\s|$)') -or $armed.Count -ne 1) { $unreadableSeen = $true }
+            if ($l -cnotmatch ($start + 'playback_due_wake armed=[0-9]+(?:\s|$)') -or $armed.Count -ne 1 -or $disabledUnreadable) { $unreadableSeen = $true }
             elseif ($fields.Count -ne 1 -or $fields[0].Groups['k'].Value -cnotmatch '^(send|post|notifier|qtimer|none)$' -or $mech.Count -ne 1 -or $mech[0].Groups['m'].Value -cnotmatch '^(native-msg|qtimer|notifier|none)(\+(native-msg|qtimer|notifier))*$') { $unreadableSeen = $true }
             else {
                 # r1 adversary pass 3 A1: the selection and the arms must agree -- none only with no arm (delivery=none), qtimer only on QTimer arms, notifier
@@ -2009,11 +2023,20 @@ function Get-DvDueWakeDeliveryEvidence {
         elseif ($mechanism -cne 'native-msg') { $reason = "DUE_WAKE_DELIVERY_FELL_BACK: the measured Play's arms used delivery=$mechanism, not only the native message the posted arm names" }
         else { $verdict = 'HONOURED' }
     }
+    elseif ($disabledSeen) {
+        # r4 (r4 adversary pass 9 A1, its input: the committed paced head cell with an inherited MLVAPP_PLAYBACK_DUE_WAKE=0): the kill switch is never a
+        # leg's own arm (no leg spec sets it), and it also changes how an unpaced Play advances, so disabled=1 blocks every leg that does not ask, a control
+        # binary's line included
+        $verdict = 'NOT_HONOURED'; $reason = 'DUE_WAKE_DISABLED_INHERITED: the measured session''s playback_due_wake line says disabled=1 (MLVAPP_PLAYBACK_DUE_WAKE=0 came from the launcher), so this run is not the arm its leg names'
+    }
     elseif ($mentions -gt 0) {
-        # r1 adversary passes 1 A1 / 2 A1: a selection the variable makes (post, notifier) is inherited whatever the arms used; none (no wake: an
-        # unpaced leg) and qtimer (no native wake built) are the app's own; send is the head arm, and counts only when no arm fell back (pass 1 A2)
+        # r1 adversary passes 1 A1 / 2 A1: a selection the variable makes (post, notifier) is inherited whatever the arms used; qtimer (no native wake
+        # built) is the app's own; send is the head arm, and counts only when no arm fell back (pass 1 A2). r4 (pass 9 A1): no arm in the measured Play
+        # (delivery=none, delivery_kind none or not) is the app's own only on an unpaced leg (generatorArgs.unpaced = true, which never arms); a paced leg
+        # that armed no wake measured no sent wake
         if ($null -eq $observed) { $verdict = 'NOT_HONOURED'; $reason = $unreadable }
         elseif ($observed -cin @('post', 'notifier')) { $verdict = 'NOT_HONOURED'; $reason = "DUE_WAKE_DELIVERY_INHERITED: the leg does not ask for the posted wake but the app reports delivery_kind=$observed (MLVAPP_PLAYBACK_DUE_WAKE_DELIVERY came from the launcher), so this run is not the head arm" }
+        elseif ($mechanism -ceq 'none' -and -not $unpacedLeg) { $verdict = 'NOT_HONOURED'; $reason = "DUE_WAKE_NOT_ENGAGED: the leg is paced (no generatorArgs.unpaced) but its measured Play armed no due wake (delivery=none, delivery_kind=$observed), so it measured no sent wake; only an unpaced leg runs without one" }
         elseif ($observed -ceq 'send' -and $mechanism -cnotin @('native-msg', 'none')) { $verdict = 'NOT_HONOURED'; $reason = "DUE_WAKE_DELIVERY_FELL_BACK: the head arm's measured Play used delivery=$mechanism, not only the sent native message" }
     }
     [ordered]@{ requested = $requested; observed = $observed; verdict = $verdict; reason = $reason; blocks = ($verdict -ceq 'NOT_HONOURED') }

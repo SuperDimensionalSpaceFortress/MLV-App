@@ -15323,15 +15323,21 @@ class DueWakeDeliveryEvidenceTests(unittest.TestCase):
     def test_a_leg_that_does_not_ask_blocks_only_on_a_kind_the_variable_selects(self) -> None:
         for spec in ({}, {"generatorArgs": {"unpaced": True}}, {"generatorArgs": {"dueWakeDeliveryPost": False}}, {"generatorArgs": {"dueWakeDeliveryPost": "true"}}):
             for name, log in (("control binary, no delivery_kind", self.log(self.wake(None))), ("sent", self.log(self.wake("send"))), ("no log", ""),
-                              # r1 adversary pass 1 A1, verbatim shape: an unpaced leg has no wake at all
-                              ("no wake (unpaced)", self.log("playback_due_wake armed=0 fired=0 advanced=0 rearmed=0 busy_deferred=0 hires=0 disabled=0"
-                                                             " delivery=none unpresented_deferred=0 delivery_kind=none")),
                               ("no native wake built", self.log(self.wake("qtimer", "qtimer"))),
-                              ("sent, no arm this Play", self.log(self.wake("send", "none"))),
                               ("an earlier Play posted (not the measured one)", self.log(self.wake("send"), before=self.play(2, self.wake("post"))))):
                 with self.subTest(spec=spec, case=name):
                     v = self.verdict(spec, log)
                     self.assertEqual((v["requested"], v["verdict"], v["blocks"]), (False, "NOT_REQUESTED", False), v)
+            # r1 adversary pass 1 A1, verbatim shape: an unpaced leg has no wake at all. r4 (pass 9 A1): ONLY an unpaced leg; a paced leg whose
+            # measured Play armed no wake measured no sent wake (test_r4_a1_* below)
+            for name, log in (("no wake (unpaced)", self.log(self.NO_WAKE)), ("sent, no arm this Play", self.log(self.wake("send", "none")))):
+                with self.subTest(spec=spec, case=name):
+                    v = self.verdict(spec, log)
+                    if spec.get("generatorArgs", {}).get("unpaced") is True:
+                        self.assertEqual((v["requested"], v["verdict"], v["blocks"]), (False, "NOT_REQUESTED", False), v)
+                    else:
+                        self.assertEqual((v["requested"], v["verdict"], v["blocks"]), (False, "NOT_HONOURED", True), v)
+                        self.assertIn("DUE_WAKE_NOT_ENGAGED", v["reason"])
             # r1 adversary pass 2 A1, verbatim shape: an inherited selection shows whatever the arms used, a fallback arm included
             for name, kind, mech in (("inherited post", "post", "native-msg"), ("inherited notifier", "notifier", "notifier"),
                                      ("inherited post, one arm fell back", "post", "native-msg+qtimer"), ("inherited post, other order", "post", "qtimer+native-msg"),
@@ -15369,6 +15375,53 @@ class DueWakeDeliveryEvidenceTests(unittest.TestCase):
                 self.assertIn("unreadable", v["reason"])
         v = self.verdict(self.POST, self.log(self.PREFIX + self.wake("post").replace("armed=1200", "armed=0")))
         self.assertEqual((v["verdict"], v["blocks"]), ("HONOURED", False), v)
+
+    NO_WAKE = ("playback_due_wake armed=0 fired=0 advanced=0 rearmed=0 busy_deferred=0 hires=0 disabled=0"
+               " delivery=none unpresented_deferred=0 delivery_kind=none")
+
+    def test_r4_a1_an_inherited_kill_switch_or_a_paced_play_without_a_wake_blocks(self) -> None:
+        # r4 (r4 adversary pass 9 A1, verbatim input): the committed paced head cell, unchanged, run with an inherited MLVAPP_PLAYBACK_DUE_WAKE=0. The
+        # app reports disabled=1 delivery=none delivery_kind=none; the gate read that as an unpaced leg's own "no wake" and let the run count.
+        cell = json.loads((DV / "legs" / "m16-1457-native-fullscreen-s1.json").read_text(encoding="utf-8"))
+        self.assertNotIn("unpaced", cell["generatorArgs"])
+        verbatim = ("playback_smoke.measured_session id=3\nplayback_smoke.summary session=3 reason=play-stop presented_frames=600\n"
+                    "playback_smoke.pace_summary session=3 first_present_ms=40.000 paced_elapsed_ms=25000.000\n"
+                    "playback_due_wake armed=0 fired=0 advanced=0 rearmed=0 busy_deferred=0 hires=0 disabled=1 delivery=none unpresented_deferred=0"
+                    " delivery_kind=none\n")
+        v = self.verdict(cell, verbatim)
+        self.assertEqual((v["requested"], v["verdict"], v["blocks"]), (False, "NOT_HONOURED", True), v)
+        self.assertIn("DUE_WAKE_DISABLED_INHERITED", v["reason"])
+        disabled = self.NO_WAKE.replace("disabled=0", "disabled=1")
+        # the kill switch also changes how an unpaced Play advances (playbackPendingAdvanceMayBeTaken), and a control binary's line (no
+        # delivery_kind) carries it too: whatever the leg, an inherited disabled=1 is not the arm the leg names
+        for name, spec, log in (("unpaced leg", {"generatorArgs": {"unpaced": True}}, self.log(disabled)),
+                                ("control binary line", cell, self.log(self.wake(None).replace("disabled=0", "disabled=1"))),
+                                ("crash-forensics prefix", cell, self.log(self.PREFIX + disabled))):
+            with self.subTest(case=name):
+                v = self.verdict(spec, log)
+                self.assertEqual((v["verdict"], v["blocks"]), ("NOT_HONOURED", True), v)
+                self.assertIn("DUE_WAKE_DISABLED_INHERITED", v["reason"])
+        # the wake on (disabled=0) but no arm in the measured Play: a paced leg measured no sent wake; only a boolean unpaced=true excuses it
+        for name, spec in (("committed paced cell", cell), ("no generatorArgs", {}), ("unpaced as a string", {"generatorArgs": {"unpaced": "true"}}),
+                           ("unpaced false", {"generatorArgs": {"unpaced": False}})):
+            for case, log in (("no wake object", self.log(self.NO_WAKE)), ("sent, no arm", self.log(self.wake("send", "none"))),
+                              ("qtimer, no arm", self.log(self.wake("qtimer", "none")))):
+                with self.subTest(spec=name, case=case):
+                    v = self.verdict(spec, log)
+                    self.assertEqual((v["verdict"], v["blocks"]), ("NOT_HONOURED", True), v)
+                    self.assertIn("DUE_WAKE_NOT_ENGAGED", v["reason"])
+        # a disabled= the app never prints is unreadable, never read as on
+        for name, line in (("disabled=yes", self.wake("send").replace("disabled=0", "disabled=yes")),
+                           ("two disabled=", self.wake("send") + " disabled=1"), ("empty disabled=", self.wake("send").replace("disabled=0", "disabled="))):
+            with self.subTest(case=name):
+                v = self.verdict(cell, self.log(line))
+                self.assertEqual((v["verdict"], v["blocks"]), ("NOT_HONOURED", True), v)
+        # unchanged: the paced head arm's sent wake counts, and a posted leg with the kill switch is still not engaged
+        v = self.verdict(cell, self.log(self.wake("send")))
+        self.assertEqual((v["verdict"], v["blocks"]), ("NOT_REQUESTED", False), v)
+        v = self.verdict(self.POST, self.log(disabled))
+        self.assertEqual((v["verdict"], v["blocks"]), ("NOT_HONOURED", True), v)
+        self.assertIn("ROUTE_NOT_ENGAGED", v["reason"])
 
 
 @requires_windows_pwsh
