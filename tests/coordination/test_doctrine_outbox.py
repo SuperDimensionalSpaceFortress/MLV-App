@@ -2931,6 +2931,28 @@ def test_validate_accepts_a_card_exactly_at_the_rendered_limits(tmp_path, capsys
     assert capsys.readouterr().err.count("REFUSED") == 1
 
 
+@pytest.mark.parametrize("wide", [False, True], ids=["ascii-pad", "two-byte-pad"])
+def test_card_validator_passes_a_card_rendering_to_exactly_the_byte_limit_and_refuses_one_byte_more(wide):
+    """G13(b): the byte limit, read from the vendored bus validator and never hard-coded, so it cannot drift unnoticed. Both sides
+    are measured with the validator's own renderer (ob.render_block, the block the drain appends) and judged by the validator's
+    own screen (ob.screen_rendered_card): a card of exactly the limit passes, one byte more is refused. The wide variant swaps
+    two pad bytes for one two-byte character, so a count of characters instead of bytes would pass the 2001-byte card."""
+    _max_lines, max_bytes = _vendored_card_limits()
+    for size, passes in ((max_bytes, True), (max_bytes + 1, False)):
+        body = _card_with_rendered_bytes(size)
+        if wide:
+            assert "xx" in body
+            body = body.replace("xx", "é", 1)
+        item = {"meta": {"target": CARDS, "source_commit": "PENDING"}, "body": body}
+        assert _rendered_card_size(body)[1] == size, "the renderer is the measure of the card, not the body"
+        if passes:
+            ob.screen_rendered_card(item)
+        else:
+            with pytest.raises(ob.Refusal) as refused:
+                ob.screen_rendered_card(item)
+            assert refused.value.code == "CARD_INVALID" and f"{size} bytes" in str(refused.value)
+
+
 def test_validate_does_not_apply_the_card_limit_to_other_targets(tmp_path):
     long_trap = tmp_path / "20261009-long-trap.md"
     long_trap.write_text(item_text(body="### heading\n" + "x" * 5000 + "\n"), encoding="utf-8")
