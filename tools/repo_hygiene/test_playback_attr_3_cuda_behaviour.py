@@ -31,6 +31,7 @@ import os
 import re
 import shutil
 import subprocess
+import threading
 import time
 import tempfile
 import unittest
@@ -1082,14 +1083,31 @@ class StagedBuildNeverReplacedTests(_PwshCase):
                 time.sleep(0.1)
             self.assertTrue(Path(f"{hold}.reached").exists(), "stager A never reached its publication")
             b = subprocess.Popen(cmd + [str(job_b), "-TestLockWaitMarkerPath", str(b_waits)], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            # r4 (Grok G5 on #814): B's stdout is read live, so the test sees what B printed WHILE it was blocked on the lock
+            b_lines: list[str] = []
+            b_reader = threading.Thread(target=lambda: b_lines.extend(iter(b.stdout.readline, "")), daemon=True)
+            b_reader.start()
             t0 = time.monotonic()
             while b.poll() is None and not b_waits.exists() and time.monotonic() - t0 < 90:
                 time.sleep(0.1)
+            # a stager blocked on the lock says so BEFORE it blocks (up to 1800 s otherwise silent): the busy line is out while A still holds
+            t0 = time.monotonic()
+            while b.poll() is None and not any(l.startswith("STAGE_LOCK_WAIT ") for l in list(b_lines)) and time.monotonic() - t0 < 30:
+                time.sleep(0.1)
+            b_busy_while_a_held = [l.rstrip() for l in list(b_lines) if l.startswith("STAGE_LOCK_WAIT ")]
             b_done_while_a_held = b.poll() is not None
         finally:
             hold.write_text("", encoding="utf-8")
             a_out, a_err = a.communicate(timeout=180)
-            b_out, b_err = b.communicate(timeout=180) if b is not None else ("", "")
+            if b is not None:
+                b.wait(timeout=180)
+                b_reader.join(timeout=30)
+                b_out, b_err = "".join(b_lines), b.stderr.read()
+            else:
+                b_out, b_err = "", ""
+        lock_id = re.search(r"(?m)^STAGE_LOCK_WAIT (vol=\d+;idx=\d+-\d+) " + SHA_FIXTURE + r" waiting up to 1800 s ", "\n".join(b_busy_while_a_held))
+        self.assertIsNotNone(lock_id, f"stager B printed no STAGE_LOCK_WAIT line before it blocked on the lock A held:\n{b_out}")
+        self.assertRegex(b_out, r"(?m)^\[[^\]]+\] STAGE_LOCK_WAITED ")
         self.assertEqual(a.returncode, 0, f"A: {a_out}\n{a_err}\nB: {b_out}\n{b_err}")
         self.assertFalse(b_done_while_a_held, f"stager B finished while A held the stage of the same sha:\n{b_out}")
         self.assertEqual(b.returncode, 0, f"{b_out}\n{b_err}")

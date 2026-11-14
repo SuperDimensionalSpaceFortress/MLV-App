@@ -6,7 +6,7 @@ Owner directive 2026-10-18 (Layi): "I'm curious how playback performs on ultrama
 four tracked staging steps (DLL pair on Ultra-Magnus, local assemble under build-guard, stage job, smoke-runner stage job).
 
 WHAT IS PINNED
-  * idempotency: a sha whose cache build.json (well-formed, right sourceCommit), three named artifacts and smoke-runner dir are all on the share is STAGE_SKIP_ALREADY;
+  * idempotency: a sha whose cache build.json is a SOUND staged build (the shared soundness read, artifacts verified; r4) and whose smoke-runner dir is on the share is STAGE_SKIP_ALREADY;
     nothing is generated (except the local smoke-runner generator that names the runner dir), assembled or submitted, and the row carries the by-name cache hash;
   * the #508 shape: a default stage JobId whose outbox result says STAGE_OK while the cache does not hold the expected manifest is re-staged under a -JobIdSuffix,
     never reported "reused"; after every STAGE_OK the cache file is re-hashed BY NAME, and a mismatch is STAGE_VERIFY_MISMATCH, never success;
@@ -343,10 +343,20 @@ class VenueStageNightlyTests(unittest.TestCase):
         for role in ("DLLGEN", "ASSEMBLE", "STAGEGEN", "UMRUN"):
             self.assertEqual(self.calls(role), [], role)
 
-    def stage_cache(self, sha: str = SHA, runner: bool = True, artifacts: bool = True, body: bytes | None = None) -> Path:
+    def stage_cache(self, sha: str = SHA, runner: bool = True, artifacts: bool = True, body: bytes | None = None, exe_claim: object = None) -> Path:
+        # r4 (adversary pass 6 A2 on 3bec2622): step 4 decides "already in the cache" by the shared soundness read (Get-VenueStagedBuildManifest
+        # -VerifyArtifacts), so the default fixture is a SOUND staged build: the fields the leg job's validator reads and a scalar 64-hex digest per artifact
+        # that the cached bytes (b"x") hash to. -exe_claim replaces the exe claim (a shape the leg refuses); -body replaces the whole manifest.
         n = names(sha)
         bj = self.share / "cache" / n["build"]
-        bj.write_bytes(body if body is not None else json.dumps({"sourceCommit": sha, "assembledAtUtc": "2026-10-19T01:02:03Z"}).encode())
+        if body is None:
+            digest = hashlib.sha256(b"x").hexdigest()
+            claim = {k: {"name": n[f], "sha256": digest} for k, f in (("packageZip", "pkg"), ("exe", "exe"), ("dll", "dll"))}
+            if exe_claim is not None:
+                claim["exe"] = exe_claim
+            body = json.dumps({"sourceCommit": sha, "assembledAtUtc": "2026-10-19T01:02:03Z", "dllPairManifestSha256": "b" * 64, "pendingSymbolPresence": True,
+                               **claim}).encode()
+        bj.write_bytes(body)
         if artifacts:
             for k in ("exe", "dll", "pkg"):
                 (self.share / "cache" / n[k]).write_bytes(b"x")
@@ -816,6 +826,56 @@ class VenueStageNightlyTests(unittest.TestCase):
         self.assertEqual(re.findall(r"-TimeoutSec \(\[double\]\$ProbeTimeoutSec\)", text), [])
         # and an abandoned read is counted, so the one exit ends the process instead of waiting for it (A2)
         self.assertIn("Complete-VenueProcess -ExitCode $code", text)
+
+    # ---------------------------------------------------------------- r4 (adversary pass 6 A2 on 3bec2622, RED first)
+    def assert_step4_unsound_build_restaged(self, runner: bool) -> None:
+        # A2: step 4 (STAGE_SKIP_ALREADY, and the in-cache branch that stages only the runner) decided "in the cache" from a build.json that parses and
+        # names the sha plus three artifact NAMES. A staged build whose exe claim is sha256=[h] (an array, which the narrowed leg refuses) was reported
+        # staged. Step 4 now takes the shared soundness read: this build is not in the cache, so the call assembles and stages its own.
+        self.built_dll_pair()
+        self.stage_cache(runner=runner, exe_claim={"name": names()["exe"], "sha256": [hashlib.sha256(b"x").hexdigest()]})
+        p = self.run_driver()
+        self.assert_exit(p, "STAGE_OK")
+        self.assertIn("ATTRCUDA_BUILD_MANIFEST_ARTIFACT_SHA_MISSING", p.stdout)
+        self.assertEqual(len(self.calls("ASSEMBLE")), 1, p.stdout)
+        self.assertEqual(len([c for c in self.submissions() if "job=playback-attr-3-cuda-stage-" in c]), 1, self.submissions())
+        cache_hash = sha256(self.share / "cache" / names()["build"])
+        self.assertEqual(cache_hash, self.assembled_manifest_sha())
+        r = self.rows()[-1]
+        self.assertEqual((r["outcome"], r["buildManifestSha256"], r["steps"]["stage"]), ("STAGE_OK", cache_hash, "staged"))
+
+    def test_step4_a_staged_build_the_leg_refuses_is_not_skipped_as_already_staged(self) -> None:
+        self.assert_step4_unsound_build_restaged(runner=True)
+
+    def test_step4_a_staged_build_the_leg_refuses_is_not_kept_when_only_the_runner_is_missing(self) -> None:
+        self.assert_step4_unsound_build_restaged(runner=False)
+
+    def test_step4_a_sound_build_with_an_upper_case_commit_is_skipped(self) -> None:
+        # the leg compares sourceCommit case-insensitively (adversary A2 on 72577e87), so step 4's in-cache answer does too: one predicate, every reader
+        bj = self.stage_cache()
+        m = json.loads(bj.read_text(encoding="utf-8"))
+        m["sourceCommit"] = SHA.upper()
+        bj.write_text(json.dumps(m), encoding="utf-8")
+        p = self.run_driver()
+        self.assert_exit(p, "STAGE_SKIP_ALREADY")
+        self.nothing_built_or_submitted()
+        self.assertEqual(self.rows()[-1]["buildManifestSha256"], sha256(bj))
+
+    def test_step4_soundness_read_that_does_not_answer_is_typed_and_builds_nothing(self) -> None:
+        # bounded like every share probe: min(-ProbeTimeoutSec, what is left of the cap). A read that does not answer with time left is SHARE_UNREACHABLE
+        # (nothing reserved, built or submitted); one that got the rest of the cap is STAGE_CAP_EXCEEDED.
+        self.stage_cache()
+        for extra, probe, token in ((("-TestSoundnessReadDelayMs", "60000"), "3", "SHARE_UNREACHABLE"),
+                                    (("-TestSoundnessReadDelayMs", "60000", "-MaxTotalSec", "12"), "60", "STAGE_CAP_EXCEEDED")):
+            with self.subTest(token=token):
+                self.calls_log.unlink(missing_ok=True)
+                t0 = time.monotonic()
+                p = self.run_driver(*extra, probe=probe)
+                took = time.monotonic() - t0
+                self.assert_exit(p, token)
+                self.nothing_built_or_submitted()
+                self.assertNotIn("STAGE_RESERVED", [r["outcome"] for r in self.rows()])
+                self.assertLess(took, 40, f"the call ran {took:.1f} s")
 
     def test_a_cache_hash_that_differs_after_stage_ok_is_a_verify_mismatch(self) -> None:
         p = self.run_driver(env={"FAKE_UMRUN_STAGE": "wrongcache"})

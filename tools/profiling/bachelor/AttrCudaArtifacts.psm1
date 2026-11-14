@@ -465,6 +465,11 @@ function Enter-AttrCudaStageLock {
     re-reads the cache under it. -WaitMarkerPath (test-only) is written when the lock is busy, before
     the wait. Returns name, held (false: still busy after -WaitSec) and waited. Throws when the
     root's identity cannot be read.
+    r4 (Grok G5 on #814): a busy lock is announced BEFORE the wait, on the job's stdout (the agent
+    captures the job process's stdout), as one line
+    "STAGE_LOCK_WAIT vol=<serial>;idx=<high>-<low> <sha> waiting up to <n> s (lock <name> ...)", so a
+    stager blocked for up to -WaitSec is never silent. Write-Host, not the output stream: the line is
+    not part of the returned object.
     #>
     param(
         [Parameter(Mandatory = $true)][string]$Root,
@@ -474,7 +479,8 @@ function Enter-AttrCudaStageLock {
     )
 
     $id = Get-AttrCudaFileId -Path $Root -FollowLinks
-    $key = 'vol=' + [string]$id.VolumeSerialNumber + ';idx=' + [string]$id.FileIndexHigh + '-' + [string]$id.FileIndexLow + '|' + $SourceCommit.ToLowerInvariant()
+    $rootId = 'vol=' + [string]$id.VolumeSerialNumber + ';idx=' + [string]$id.FileIndexHigh + '-' + [string]$id.FileIndexLow
+    $key = $rootId + '|' + $SourceCommit.ToLowerInvariant()
     $hasher = [Security.Cryptography.SHA256]::Create()
     try {
         $name = 'Global\MlvAttrCudaStage-' + ([BitConverter]::ToString($hasher.ComputeHash([Text.Encoding]::UTF8.GetBytes($key))) -replace '-', '').ToLowerInvariant()
@@ -485,6 +491,7 @@ function Enter-AttrCudaStageLock {
     try { $held = $mutex.WaitOne(0) } catch [Threading.AbandonedMutexException] { $held = $true }
     if (-not $held) {
         $waited = $true
+        Write-Host ('STAGE_LOCK_WAIT ' + $rootId + ' ' + $SourceCommit.ToLowerInvariant() + ' waiting up to ' + [string]$WaitSec + ' s (lock ' + $name + ' is held by another stager of this sha into this agent root)')
         if ($WaitMarkerPath) { [IO.File]::WriteAllText($WaitMarkerPath, $name) }
         try { $held = $mutex.WaitOne($WaitSec * 1000) } catch [Threading.AbandonedMutexException] { $held = $true }
     }

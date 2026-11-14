@@ -366,6 +366,8 @@ if ($VerifyOnly) {
 # that cannot be had is a refusal (exit 7) with nothing written.
 # The lock is keyed on the agent root's PHYSICAL identity (adversary A1 on 3bec2622: a junction alias of the
 # same root took a different lexical-path lock), in Enter-AttrCudaStageLock, embedded above.
+# r4 (Grok G5 on #814): a busy lock prints STAGE_LOCK_WAIT <root-id> <sha> waiting up to <n> s BEFORE the wait
+# (Enter-AttrCudaStageLock), so a stager blocked here is never silent; STAGE_LOCK_WAITED follows the wait.
 $StageLockWaitSec = 1800
 try {
     $StageLock = Enter-AttrCudaStageLock -Root $AgentRoot -SourceCommit $SourceCommit -WaitSec $StageLockWaitSec -WaitMarkerPath $TestLockWaitMarkerPath

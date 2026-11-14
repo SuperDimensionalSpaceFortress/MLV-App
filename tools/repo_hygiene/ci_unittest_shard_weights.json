@@ -1507,7 +1507,7 @@
    "tools.repo_hygiene.test_venue_raw_identity.RawIdentityReaderTests": 5.2,
    "tools.repo_hygiene.test_venue_raw_identity.UmRunResultReaderTests": 1.2,
    "tools.repo_hygiene.test_venue_stage_nightly.StageNotAfterTypedExitTests": 1.2,
-   "tools.repo_hygiene.test_venue_stage_nightly.VenueStageNightlyTests": 344.2,
+   "tools.repo_hygiene.test_venue_stage_nightly.VenueStageNightlyTests": 377.2,
    "tools.repo_hygiene.test_venue_stage_nightly.VenueStageReuseModuleTests": 1.5,
    "tools.repo_hygiene.test_venue_start_cap.LeaseBatchWiringTests": 0.0,
    "tools.repo_hygiene.test_venue_start_cap.StartCapAdversaryPass2Tests": 5.5,
