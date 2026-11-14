@@ -86,7 +86,7 @@
 [CmdletBinding()]
 param(
     # The commit the STAGED BUILD was built from (cache file names, the build manifest's sourceCommit, the capture's recorded identity).
-    [Parameter(Mandatory = $true)][ValidatePattern('^[0-9a-f]{40}$')][string]$SourceCommit,
+    [Parameter(Mandatory = $true)][ValidatePattern('^[0-9a-f]{40}\z')][string]$SourceCommit,
     # The commit whose COMMITTED bytes supply the capture script, its dependencies and tools/gates/output-budget.json. It is NOT the build's
     # commit: the build under test may be older than the capture script's gate-profile arguments (the June-era build the known-good bridge needs).
     # Default: the HEAD of -RepoRoot, the tooling checkout this generator runs from.

@@ -230,7 +230,7 @@ function Get-AttrCudaArtifactNames {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory = $true)]
-        [ValidatePattern('^[0-9a-f]{40}$')]
+        [ValidatePattern('^[0-9a-f]{40}\z')]
         [string]$SourceCommit
     )
 
@@ -251,7 +251,7 @@ function New-AttrCudaBuildInfoHeader {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory = $true)]
-        [ValidatePattern('^[0-9a-f]{40}$')]
+        [ValidatePattern('^[0-9a-f]{40}\z')]
         [string]$SourceCommit,
 
         [string]$BuildTimeUtc = [DateTime]::UtcNow.ToString('yyyy-MM-ddTHH:mm:ssZ')
@@ -473,7 +473,8 @@ function Enter-AttrCudaStageLock {
     #>
     param(
         [Parameter(Mandatory = $true)][string]$Root,
-        [Parameter(Mandatory = $true)][string]$SourceCommit,
+        # r6 fix iteration (adversary A1 on 424df284): the lock key is this sha, so a '<40 hex>\n' (which '$' let through) never names a second lock
+        [Parameter(Mandatory = $true)][ValidatePattern('^[0-9a-f]{40}\z')][string]$SourceCommit,
         [int]$WaitSec = 1800,
         [string]$WaitMarkerPath = ''
     )
@@ -789,7 +790,7 @@ function Resolve-AttrCudaCommittedBlobId {
         [string]$RepoRoot,
 
         [Parameter(Mandatory = $true)]
-        [ValidatePattern('^[0-9a-f]{40}$')]
+        [ValidatePattern('^[0-9a-f]{40}\z')]
         [string]$Commit,
 
         [Parameter(Mandatory = $true)]
@@ -834,7 +835,7 @@ function Save-AttrCudaCommittedBlobBytes {
         [string]$RepoRoot,
 
         [Parameter(Mandatory = $true)]
-        [ValidatePattern('^[0-9a-f]{40}$')]
+        [ValidatePattern('^[0-9a-f]{40}\z')]
         [string]$BlobId,
 
         [Parameter(Mandatory = $true)]
@@ -1299,7 +1300,7 @@ function Assert-AttrCudaClosureComplete {
         [string]$RepoRoot,
 
         [Parameter(Mandatory = $true)]
-        [ValidatePattern('^[0-9a-f]{40}$')]
+        [ValidatePattern('^[0-9a-f]{40}\z')]
         [string]$Commit,
 
         [string[]]$RepoRelativePaths = $script:AttrCudaSmokeRunnerClosureManifest
@@ -1407,7 +1408,7 @@ function Resolve-AttrCudaSmokeRunnerClosure {
         [string]$RepoRoot,
 
         [Parameter(Mandatory = $true)]
-        [ValidatePattern('^[0-9a-f]{40}$')]
+        [ValidatePattern('^[0-9a-f]{40}\z')]
         [string]$Commit,
 
         [string[]]$RepoRelativePaths = $script:AttrCudaSmokeRunnerClosureManifest

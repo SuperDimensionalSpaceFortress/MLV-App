@@ -952,6 +952,35 @@ class VenueStageNightlyTests(unittest.TestCase):
                 self.assertNotIn("STAGE_RESERVED", [r["outcome"] for r in self.rows()])
                 self.assertLess(took, int(cap) + 10, f"the call ran {took:.1f} s against a {cap} s cap")
 
+    # ---------------------------------------------------------------- r6 fix iteration (adversary pass on 424df284, A1-A2, RED first)
+    def test_a_source_commit_with_a_trailing_newline_is_refused_at_binding_everywhere(self) -> None:
+        # A1: ValidatePattern('^[0-9a-f]{40}$') accepted '<40 hex>\n' ('$' matches before a final newline). The stage job then derived the same cache
+        # file name as the clean sha but another stage-lock key, and its never-replace guard read the resident clean manifest as COMMIT_MISMATCH (unsound)
+        # and replaced it. Every sha40 parameter in the venue chain anchors with \z, and the lock itself validates its sha.
+        roots = [ROOT / "tools" / "profiling" / d for d in ("bachelor", "dual-venue", "ultramagnus")]
+        loose = [f"{p.relative_to(ROOT)}:{i}" for r in roots for p in sorted(r.rglob("*.ps*1"))
+                 for i, line in enumerate(p.read_text(encoding="utf-8", errors="replace").splitlines(), 1) if "ValidatePattern('^[0-9a-f]{40}$')" in line]
+        self.assertEqual(loose, [])
+        lf = SHA + "`n"
+        ps = (f"Import-Module '{DRIVER.parent / 'VenueChain.psm1'}' -Force -DisableNameChecking; "
+              f"Import-Module '{DRIVER.parent.parent / 'bachelor' / 'AttrCudaArtifacts.psm1'}' -Force -DisableNameChecking; "
+              f"foreach ($c in @({{ Enter-AttrCudaStageLock -Root '{self.case}' -SourceCommit \"{lf}\" -WaitSec 1 }}, {{ Get-AttrCudaArtifactNames -SourceCommit \"{lf}\" }}, "
+              f"{{ Get-VenueStagedBuildManifest -AgentShare '{self.share}' -SourceCommit \"{lf}\" -TimeoutSec 5 }})) {{ "
+              "try { $null = & $c; 'ACCEPTED' } catch { 'REFUSED ' + ($_.FullyQualifiedErrorId -split ',')[0] } }")
+        p = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", ps], capture_output=True, text=True, timeout=120, stdin=subprocess.DEVNULL)
+        self.assertEqual(p.stdout.split(), ["REFUSED", "ParameterArgumentValidationError"] * 3, p.stdout + p.stderr)
+
+    def test_call_cap_sec_bounds_the_manifest_read_too(self) -> None:
+        # A2: -CallCapSec bounded only the artifact hash. With an absent agent root, -TimeoutSec 3 and -CallCapSec 1, a manifest read stuck 2.2 s answered
+        # NOT_STAGED after the whole-call cap. The manifest read now gets min(-TimeoutSec, -CallCapSec): it is given up on at the cap, UNREACHABLE.
+        ps = (f"Import-Module '{DRIVER.parent / 'VenueChain.psm1'}' -Force -DisableNameChecking; $sw = [Diagnostics.Stopwatch]::StartNew(); "
+              f"$r = Get-VenueStagedBuildManifest -AgentShare '{self.case / 'adversary-empty-root'}' -SourceCommit '{SHA}' -TimeoutSec 3 -ArtifactTimeoutSec 300 "
+              "-CallCapSec 1 -VerifyArtifacts -TestReadDelayMs 2200; 'STATE=' + $r.state; 'SEC=' + $sw.Elapsed.TotalSeconds.ToString('0.000', [Globalization.CultureInfo]::InvariantCulture)")
+        p = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", ps], capture_output=True, text=True, timeout=120, stdin=subprocess.DEVNULL)
+        self.assertIn("STATE=UNREACHABLE", p.stdout, p.stdout + p.stderr)
+        sec = float(re.search(r"SEC=([0-9.]+)", p.stdout).group(1))
+        self.assertLess(sec, 1.8, p.stdout)
+
     def test_a_cache_hash_that_differs_after_stage_ok_is_a_verify_mismatch(self) -> None:
         p = self.run_driver(env={"FAKE_UMRUN_STAGE": "wrongcache"})
         self.assert_exit(p, "STAGE_VERIFY_MISMATCH")

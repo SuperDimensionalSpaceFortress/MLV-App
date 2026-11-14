@@ -53,7 +53,7 @@
 [CmdletBinding()]
 param(
     [Parameter(Mandatory = $true)]
-    [ValidatePattern('^[0-9a-f]{40}$')]
+    [ValidatePattern('^[0-9a-f]{40}\z')]
     [string]$SourceCommit,
 
     # The assembler's -OutDir: holds playback-attr-3-cuda-<sha12>-build.json and the three

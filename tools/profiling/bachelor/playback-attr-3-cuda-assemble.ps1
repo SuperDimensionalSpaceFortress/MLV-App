@@ -45,7 +45,7 @@
 [CmdletBinding()]
 param(
     [Parameter(Mandatory = $true)]
-    [ValidatePattern('^[0-9a-f]{40}$')]
+    [ValidatePattern('^[0-9a-f]{40}\z')]
     [string]$SourceCommit,
 
     # The Ultra-Magnus DLL-pair job's published artifacts directory (or a copy of it): holds

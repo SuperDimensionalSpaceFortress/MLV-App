@@ -26,7 +26,7 @@ function Get-StageReuse {
     param(
         [Parameter(Mandatory = $true)][string]$ResultPath,
         [Parameter(Mandatory = $true)][string]$JobId,
-        [Parameter(Mandatory = $true)][ValidatePattern('^[0-9a-f]{40}$')][string]$Sha,
+        [Parameter(Mandatory = $true)][ValidatePattern('^[0-9a-f]{40}\z')][string]$Sha,
         [Parameter(Mandatory = $true)][ValidateSet('Stage', 'SmokeRunner')][string]$Kind
     )
     $no = { param($why) [pscustomobject]@{ Staged = $false; Reason = $why; EndedUtc = $null; Line = $null } }
@@ -62,7 +62,7 @@ function Get-DllPairReuse {
     param(
         [Parameter(Mandatory = $true)][string]$Outbox,
         [Parameter(Mandatory = $true)][string]$JobId,
-        [Parameter(Mandatory = $true)][ValidatePattern('^[0-9a-f]{40}$')][string]$Sha
+        [Parameter(Mandatory = $true)][ValidatePattern('^[0-9a-f]{40}\z')][string]$Sha
     )
     $no = { param($why) [pscustomobject]@{ Reusable = $false; Reason = $why; EndedUtc = $null; Line = $null; ArtifactsDir = $null } }
     $resultPath = Join-Path $Outbox "$JobId.result.json"

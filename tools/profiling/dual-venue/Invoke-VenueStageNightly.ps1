@@ -78,7 +78,7 @@
 [CmdletBinding()]
 param(
     [ValidateSet('bachelor', 'ultra-magnus')][string]$Venue = 'ultra-magnus',
-    [ValidatePattern('^[0-9a-f]{40}$')][string]$SourceCommit = '',
+    [ValidatePattern('^[0-9a-f]{40}\z')][string]$SourceCommit = '',
     [string]$BuildRoot = 'C:\mlvtmp\lane-um-nightly-stage',
     [string]$ReceiptFile = '',
     # Total wall-clock cap for everything after the plan. The default fits a cold night: a DLL-pair compile on Ultra-Magnus, a build-guarded assemble and two stages.

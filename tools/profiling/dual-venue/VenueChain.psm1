@@ -624,13 +624,14 @@ function Get-VenueStagedBuildManifest {
     .OUTPUTS
     [pscustomobject]@{ state (STAGED | NOT_STAGED | UNREACHABLE); sha256; path; error; contentProblem }
     #>
-    param([Parameter(Mandatory)][string]$AgentShare, [Parameter(Mandatory)][ValidatePattern('^[0-9a-f]{40}$')][string]$SourceCommit, [ValidateRange(1.0, 600.0)][double]$TimeoutSec = 30, [scriptblock]$ProbeScript = $null,
+    param([Parameter(Mandatory)][string]$AgentShare, [Parameter(Mandatory)][ValidatePattern('^[0-9a-f]{40}\z')][string]$SourceCommit, [ValidateRange(1.0, 600.0)][double]$TimeoutSec = 30, [scriptblock]$ProbeScript = $null,
         [switch]$VerifyArtifacts, [ValidateRange(0, 600)][int]$ArtifactTimeoutSec = 0, [scriptblock]$ArtifactProbeScript = $null, [ValidateRange(1.0, 600.0)][double]$ArtifactMinSec = 1,
         # Test-only (VENUE-STAGE-SAME-SHA-RESTAGE-GUARD-1 r2): the default manifest read first blocks its worker this long, as a read stuck on a dead SMB host does
         # (Thread.Sleep: a stop request cannot interrupt it). test_venue_stage_nightly.py uses it; production passes none.
         [ValidateRange(0, 600000)][int]$TestReadDelayMs = 0,
-        # VENUE-STAGE-SAME-SHA-RESTAGE-GUARD-1 r6 (Grok G6/G7 on #814): with an explicit -ArtifactTimeoutSec, the whole call (manifest read plus artifact hash) ends inside
-        # -CallCapSec seconds of its start (0 = no such bound): the hash gets min(-ArtifactTimeoutSec, what is left of -CallCapSec), and none under -ArtifactMinSec (UNREACHABLE).
+        # VENUE-STAGE-SAME-SHA-RESTAGE-GUARD-1 r6 (Grok G6/G7 on #814): the whole call (manifest read plus artifact hash) ends inside -CallCapSec seconds of its start
+        # (0 = no such bound): the manifest read gets min(-TimeoutSec, -CallCapSec) (fix iteration, adversary A2 on 424df284), and the hash gets min(-ArtifactTimeoutSec,
+        # what is left of -CallCapSec), none under -ArtifactMinSec (UNREACHABLE).
         # The stage nightly passes what is left of its -MaxTotalSec, so a 300 s hash never runs past the call's own cap.
         [ValidateRange(0.0, 86400.0)][double]$CallCapSec = 0,
         # Test-only (r6): the default artifact hash first blocks its worker this long, as a slow SMB hash of a large cached package does. Production passes none.
@@ -675,7 +676,15 @@ function Get-VenueStagedBuildManifest {
     $readText = $(if ($null -eq $ProbeScript) {
             "param(`$p)`n" + (Get-VenueClaimShapeSource) + "`n" + $(if ($TestReadDelayMs -gt 0) { "[Threading.Thread]::Sleep($TestReadDelayMs)`n" } else { '' }) + "& {" + $read.ToString() + "`n} `$p"
         } else { $read.ToString() })
-    $r = Invoke-VenueBoundedRead -ScriptText $readText -Argument $path -TimeoutSec $TimeoutSec
+    # r6 fix iteration (adversary A2 on 424df284): -CallCapSec bounds the WHOLE call, the manifest read too (it bounded only the hash, so a read stuck past the cap
+    # answered NOT_STAGED after it). Under 1 s of it (the least a read can be given) there is no read: UNREACHABLE.
+    $readSec = $TimeoutSec
+    if ($CallCapSec -gt 0) {
+        $capLeft = $CallCapSec - $callClock.Elapsed.TotalSeconds
+        if ($capLeft -lt 1.0) { return [pscustomobject]@{ state = 'UNREACHABLE'; sha256 = $null; path = $path; error = "the staged manifest could not be read: no time is left of -CallCapSec $([Math]::Round($CallCapSec, 2)) ($([Math]::Floor([Math]::Max(0.0, $capLeft) * 100.0) / 100.0) s left, under 1)"; contentProblem = $null } }
+        $readSec = [Math]::Min($TimeoutSec, $capLeft)
+    }
+    $r = Invoke-VenueBoundedRead -ScriptText $readText -Argument $path -TimeoutSec $readSec
     if (-not $r.answered) { return [pscustomobject]@{ state = 'UNREACHABLE'; sha256 = $null; path = $path; error = $r.error; contentProblem = $null } }
     $sha = $(if ($r.value.Count -gt 0) { [string]$r.value[0] } else { '' })
     if ($sha -cmatch '^[0-9a-f]{64}$') {
@@ -736,7 +745,8 @@ function Get-VenueStagedBuildManifest {
             }
             if ($artSec -le 0) {
                 # r7 (sol r6 B1): the exact remainder, not its whole seconds (2.7 s left was floored to 1, under the guard's 2 s minimum, and a healthy hash never started)
-                $left = $TimeoutSec - $callClock.Elapsed.TotalSeconds
+                # r6 fix iteration (A2): what is left of the manifest read's own bound, which -CallCapSec already shortened
+                $left = $readSec - $callClock.Elapsed.TotalSeconds
                 # r10 (adversary pass 2 A3): the time left is printed rounded DOWN to hundredths -- Round(1.999, 2) printed "2 s left, under 2"
                 # r5 (adversary r5 A2): -ArtifactMinSec is the least a hash may START with; the lease batch guard asks for its own minimum ($script:GuardReadMinSec, the same rule)
                 if ($left -lt $ArtifactMinSec) { return [pscustomobject]@{ state = 'UNREACHABLE'; sha256 = $null; path = $path; error = "the cached artifacts could not be hashed: no time is left of -TimeoutSec $([Math]::Round($TimeoutSec, 2)) after the manifest read ($([Math]::Floor([Math]::Max(0.0, $left) * 100.0) / 100.0) s left, under $ArtifactMinSec)"; contentProblem = $null; artifactProblem = $null; artifactsUnhashed = $true } }
@@ -769,7 +779,7 @@ function Get-VenueStagedArtifactNames {
     The cached artifact file names for a build, by the formulas Get-AttrCudaArtifactNames (tools/profiling/bachelor/AttrCudaArtifacts.psm1) derives and the leg job reads from the
     agent cache. Kept here as a copy because this module imports nothing from the bachelor tree; test_venue_lease_batch.py pins the two together.
     #>
-    param([Parameter(Mandatory)][ValidatePattern('^[0-9a-f]{40}$')][string]$SourceCommit)
+    param([Parameter(Mandatory)][ValidatePattern('^[0-9a-f]{40}\z')][string]$SourceCommit)
     $s = $SourceCommit.Substring(0, 12)
     @{ exe = "MLVApp-playback-attr-3-cuda-$s.exe"; dll = "igpu_recon_cuda-playback-attr-3-cuda-$s.dll"; packageZip = "MLVApp-playback-attr-3-cuda-$s-pkg.zip" }
 }

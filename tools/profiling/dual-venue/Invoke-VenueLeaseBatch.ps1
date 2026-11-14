@@ -166,7 +166,7 @@ param(
     [Parameter(ParameterSetName = 'Scalar')][ValidateRange(1, 20)][int]$Repeats = 1,
     [Parameter(ParameterSetName = 'Scalar')][ValidateSet('cuda', 'cpu')][string]$Backend,
     [Parameter(Mandatory = $true)][string]$RunDir,
-    [Parameter(ParameterSetName = 'Scalar', Mandatory = $true)][ValidatePattern('^[0-9a-f]{40}$')][string]$SourceCommit,
+    [Parameter(ParameterSetName = 'Scalar', Mandatory = $true)][ValidatePattern('^[0-9a-f]{40}\z')][string]$SourceCommit,
     [Parameter(ParameterSetName = 'Scalar', Mandatory = $true)][ValidatePattern('^[0-9a-f]{64}$')][string]$BuildManifestSha256,
     # LEASE-BATCH-MULTI-BUILD-1 (item 9): an ordered leg plan, each leg with its own build, backend and arm, run in ONE batched lease series
     [Parameter(ParameterSetName = 'Plan', Mandatory = $true)][string]$LegPlan,

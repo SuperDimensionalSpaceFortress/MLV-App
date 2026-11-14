@@ -56,7 +56,7 @@
 [CmdletBinding()]
 param(
     [ValidateSet('bachelor', 'ultra-magnus')][string]$Venue = 'ultra-magnus',
-    [ValidatePattern('^[0-9a-f]{40}$')][string]$SourceCommit = '',
+    [ValidatePattern('^[0-9a-f]{40}\z')][string]$SourceCommit = '',
     [ValidatePattern('^[0-9a-f]{64}$')][string]$BuildManifestSha256 = '',
     [string]$TrendFile = '',
     [string]$RunDir = '',

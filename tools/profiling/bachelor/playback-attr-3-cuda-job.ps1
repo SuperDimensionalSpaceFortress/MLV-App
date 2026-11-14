@@ -117,7 +117,7 @@
 [CmdletBinding()]
 param(
     [Parameter(Mandatory = $true)]
-    [ValidatePattern('^[0-9a-f]{40}$')]
+    [ValidatePattern('^[0-9a-f]{40}\z')]
     [string]$SourceCommit,
 
     # Either the owner-clip id pattern (resolved via tools/gates/resolve_consented_clip.py,
