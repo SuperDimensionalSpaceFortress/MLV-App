@@ -1941,6 +1941,8 @@ function Get-DvDueWakeDeliveryEvidence {
     when a PACED leg's measured Play armed no wake (delivery=none: DUE_WAKE_NOT_ENGAGED); "none" is the app's own only on a generatorArgs.unpaced = true leg.
     r5 (Grok G8, r4 adversary pass 10 A2/A3): a disabled= that is not exactly one 0 or 1 across the measured window's wake records blocks such a leg on a
     control binary's line too (DUE_WAKE_DISABLED_UNREADABLE), and a playback_smoke.measured_session id= of another session closes the window.
+    r5 (pass 12 A1): on a control binary's line (no delivery_kind) a paced leg's delivery=none is DUE_WAKE_NOT_ENGAGED too, and a repeated or
+    out-of-grammar delivery= is unreadable; a posted leg whose line says disabled=1 is ROUTE_NOT_ENGAGED (pass 11 A2).
     Pure and shared: the runner gates on it and Test-DvReceiptValid re-derives it from the hashed run log.
     #>
     param([Parameter(Mandatory)]$Spec, [AllowNull()][AllowEmptyString()][string]$LogText)
@@ -1993,6 +1995,16 @@ function Get-DvDueWakeDeliveryEvidence {
     $unpacedRaw = Get-DvProp (Get-DvProp $Spec 'generatorArgs') 'unpaced'
     $unpacedLeg = ($unpacedRaw -is [bool]) -and $unpacedRaw
     $withKind = @($candidates | Where-Object { $_ -match '(?:^|\s)delivery_kind=' })
+    # r5 (r5 adversary pass 12 A1): a control binary's line (one wake record, no delivery_kind) still carries delivery= (master's
+    # playbackDueWakeSummaryLine prints it), so a paced leg whose measured Play armed no wake (delivery=none) is not engaged there either; a
+    # repeated or out-of-grammar delivery= on that line is unreadable. A line with no delivery= at all (an older binary) is left unchanged.
+    $controlMech = $null
+    $controlMechUnreadable = $false
+    if ($candidates.Count -eq 1 -and $withKind.Count -eq 0) {
+        $cm = [regex]::Matches($candidates[0], '(?:^|\s)delivery=(?<m>\S*)')
+        if ($cm.Count -gt 1 -or ($cm.Count -eq 1 -and $cm[0].Groups['m'].Value -cnotmatch '^(native-msg|qtimer|notifier|none)(\+(native-msg|qtimer|notifier))*$')) { $controlMechUnreadable = $true }
+        elseif ($cm.Count -eq 1) { $controlMech = $cm[0].Groups['m'].Value }
+    }
     if ($withKind.Count -gt 0) {
         $mentions = $withKind.Count
         if ($paces -ne 1 -or $candidates.Count -ne 1) { $unreadableSeen = $true }
@@ -2038,6 +2050,15 @@ function Get-DvDueWakeDeliveryEvidence {
         # r5 (Grok G8 = r4 adversary pass 10 advisory A2): a control binary's line (no delivery_kind, so no mention) with disabled=yes, an empty disabled=
         # or a repeated disabled= cannot show the kill switch off, so it blocks like a line with a delivery_kind does (the $unreadableSeen path above)
         $verdict = 'NOT_HONOURED'; $reason = 'DUE_WAKE_DISABLED_UNREADABLE: the kill switch is unreadable: the measured session''s playback_due_wake records carry a disabled= that is not exactly one 0 or 1 (MainWindow::playbackDueWakeSummaryLine prints one), so the kill switch is not shown off'
+    }
+    elseif ($controlMechUnreadable) {
+        # r5 (r5 adversary pass 12 A1): the control line's delivery= cannot show which arms the measured Play used
+        $verdict = 'NOT_HONOURED'; $reason = 'the due-wake delivery is unreadable: the measured session''s playback_due_wake line has no delivery_kind and its delivery= is repeated or is not native-msg, qtimer, notifier, none or a "+"-join'
+    }
+    elseif ($controlMech -ceq 'none' -and -not $unpacedLeg) {
+        # r5 (r5 adversary pass 12 A1, its input: the committed paced cell with a control line saying delivery=none): the r4 rule below, on a line
+        # with no delivery_kind
+        $verdict = 'NOT_HONOURED'; $reason = 'DUE_WAKE_NOT_ENGAGED: the leg is paced (no generatorArgs.unpaced) but its measured Play armed no due wake (delivery=none, no delivery_kind), so it measured no wake; only an unpaced leg runs without one'
     }
     elseif ($mentions -gt 0) {
         # r1 adversary passes 1 A1 / 2 A1: a selection the variable makes (post, notifier) is inherited whatever the arms used; qtimer (no native wake

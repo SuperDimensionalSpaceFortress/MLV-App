@@ -15488,6 +15488,43 @@ class DueWakeDeliveryEvidenceTests(unittest.TestCase):
         v = self.verdict(self.POST, self.log(self.wake("post")))
         self.assertEqual((v["verdict"], v["blocks"]), ("HONOURED", False), v)
 
+    def test_r5_p12_a1_a_paced_control_line_with_no_arm_blocks(self) -> None:
+        # r5 adversary pass 12 A1, its input verbatim: the committed paced cell, a control-binary line (no delivery_kind) saying delivery=none. The
+        # r4 paced no-arm rule ran only on a line with a delivery_kind, so this was NOT_REQUESTED blocks=false
+        cell = json.loads((DV / "legs" / "m16-1457-native-fullscreen-s1.json").read_text(encoding="utf-8"))
+        verbatim = ("playback_smoke.measured_session id=3\nplayback_smoke.summary session=3 reason=play-stop presented_frames=600\n"
+                    "playback_smoke.pace_summary session=3 first_present_ms=40.000 paced_elapsed_ms=25000.000\n"
+                    "playback_due_wake armed=0 fired=0 advanced=0 rearmed=0 busy_deferred=0 late_p50_ms=na late_p95_ms=na hires=0 disabled=0 delivery=none"
+                    " unpresented_deferred=0\n")
+        control = self.wake(None)
+        for spec_name, spec in (("committed paced cell", cell), ("no generatorArgs", {}), ("unpaced as a string", {"generatorArgs": {"unpaced": "true"}})):
+            for name, log in (("verbatim", verbatim), ("control line, no arm", self.log(control.replace("delivery=native-msg", "delivery=none"))),
+                              ("crash-forensics prefix", self.log(self.PREFIX + control.replace("delivery=native-msg", "delivery=none")))):
+                with self.subTest(spec=spec_name, case=name):
+                    v = self.verdict(spec, log)
+                    self.assertEqual((v["requested"], v["verdict"], v["blocks"]), (False, "NOT_HONOURED", True), v)
+                    self.assertIn("DUE_WAKE_NOT_ENGAGED", v["reason"])
+        # a control line's delivery= that is repeated or outside the app's grammar is unreadable, whatever the leg
+        for spec_name, spec in (("committed paced cell", cell), ("unpaced leg", {"generatorArgs": {"unpaced": True}})):
+            for name, line in (("two delivery=", control + " delivery=none"), ("delivery=bogus", control.replace("delivery=native-msg", "delivery=bogus")),
+                               ("empty delivery=", control.replace("delivery=native-msg", "delivery="))):
+                with self.subTest(spec=spec_name, case=name):
+                    v = self.verdict(spec, self.log(line))
+                    self.assertEqual((v["verdict"], v["blocks"]), ("NOT_HONOURED", True), v)
+                    self.assertIn("unreadable", v["reason"])
+        # unchanged: an unpaced leg's control line with no arm, a control line that armed (native-msg, a fallback join), and an older line with no
+        # delivery= at all leave a leg that does not ask unchanged
+        for spec_name, spec, line in (("unpaced leg, no arm", {"generatorArgs": {"unpaced": True}}, control.replace("delivery=native-msg", "delivery=none")),
+                                      ("paced, native-msg", cell, control), ("paced, fallback join", cell, control.replace("delivery=native-msg", "delivery=native-msg+qtimer")),
+                                      ("paced, no delivery=", cell, control.replace(" delivery=native-msg", ""))):
+            with self.subTest(case=spec_name):
+                v = self.verdict(spec, self.log(line))
+                self.assertEqual((v["verdict"], v["blocks"]), ("NOT_REQUESTED", False), v)
+        # a posted leg on a control line is still not engaged (no delivery_kind)
+        v = self.verdict(self.POST, verbatim)
+        self.assertEqual((v["verdict"], v["blocks"]), ("NOT_HONOURED", True), v)
+        self.assertIn("ROUTE_NOT_ENGAGED", v["reason"])
+
     def test_r5_a3_a_measured_session_record_of_another_session_closes_the_window(self) -> None:
         # r5 (r4 adversary pass 10 advisory A3, verbatim shape): `playback_smoke.measured_session id=4` names its session with id=, not session=, and
         # it is a playback_smoke record of ANOTHER session, so it closes the measured wake window like any other; a wake record after it is not the
