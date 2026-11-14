@@ -1256,6 +1256,37 @@ class StagedBuildNeverReplacedTests(_PwshCase):
         self.assertEqual(self.snapshot(), before, "the staged build was rewritten")
         self.assertEqual(list(self.inbox.iterdir()), [], "the refused inputs were left in the inbox")
 
+    def test_r9_a_build_of_another_commit_with_the_same_12_hex_is_never_replaced(self) -> None:
+        # r9 fix iteration (adversary A1 on 9825bfd9): the cache names carry only the sha's first 12 hex. Another commit with the same 12 staged its SOUND build
+        # there (here: the resident manifest's sourceCommit is that commit). The never-replace guard read it as COMMIT_MISMATCH (unsound for this sha), retired
+        # it and published this sha's build over it. It is refused (exit 7) and the cache is left byte for byte.
+        first = self.stage("ad005766")
+        self.assertEqual(first.returncode, 0, f"{first.stdout}\n{first.stderr}")
+        other = SHA_FIXTURE[:12] + "1" * 28
+        m = json.loads((self.cache / self.manifest_name).read_text(encoding="utf-8"))
+        m["sourceCommit"] = other
+        (self.cache / self.manifest_name).write_text(json.dumps(m, indent=2), encoding="utf-8")
+        staged, before = self.manifest_sha(), self.snapshot()
+
+        second = self.stage("f8fc75a2", suffix="samesha12")
+
+        self.assertEqual(second.returncode, 7, f"{second.stdout}\n{second.stderr}")
+        self.assertRegex(second.stdout, rf"(?m)^STAGE_REFUSED_STAGED_OTHER_COMMIT sha={SHA_FIXTURE[:12]} staged={staged[:8]} stagedCommit={other} incoming=[0-9a-f]{{8}}")
+        self.assertIn("RESULT=STAGE_FAILED STEP=stagedBuildGuard EXIT=7", second.stdout)
+        self.assertEqual(self.snapshot(), before, "another commit's staged build was rewritten")
+
+    def test_r9_the_stage_lock_is_one_for_every_sha_that_shares_the_cache_names(self) -> None:
+        # r9 fix iteration (adversary A1 on 9825bfd9): the lock was keyed on the full sha, so two commits with the same 12 hex (the same cache files) never
+        # contended; it is keyed on the 12 hex the cache names carry. Another 12 is another lock.
+        def lock_name(sha: str) -> str:
+            proc = self.run_with_module(f"(Enter-AttrCudaStageLock -Root '{self.agent}' -SourceCommit '{sha}' -WaitSec 5).name\n", name=f"lock-{sha[:14]}.ps1")
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            return proc.stdout.strip()
+        a, b, c = lock_name(SHA_FIXTURE), lock_name(SHA_FIXTURE[:12] + "1" * 28), lock_name("e" + SHA_FIXTURE[1:])
+        self.assertRegex(a, r"^Global\\MlvAttrCudaStage-[0-9a-f]{64}$")
+        self.assertEqual(a, b)
+        self.assertNotEqual(a, c)
+
     def test_a_manifest_a_lease_batch_pinned_still_reads_as_its_pin_after_a_second_stage(self) -> None:
         # The batch's own guard (Invoke-VenueLeaseBatch.ps1:1258 / :1393) reads Get-VenueStagedBuildManifest and compares it to the
         # sha256 its plan pinned when the lease opened; any other answer is BUILD_MANIFEST_MISMATCH.

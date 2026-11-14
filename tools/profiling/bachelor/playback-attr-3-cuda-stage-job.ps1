@@ -414,6 +414,16 @@ if (Test-Path -LiteralPath $manifestCachePath) {
         Write-Output "STAGE_REFUSED_STAGED_UNREADABLE sha=$($SourceCommit.Substring(0, 12)) incoming=$($ManifestSha256.Substring(0, 8)) $($_.Exception.Message -replace '\s+', ' ')"
         Complete-Failed 7 'stagedBuildGuard' "the staged build of $SourceCommit could not be read, so it is not replaced: $($_.Exception.Message)"
     }
+    if ($unsound -match '^ATTRCUDA_BUILD_MANIFEST_COMMIT_MISMATCH ') {
+        # r9 fix iteration (adversary A1 on 9825bfd9): the cache name is the sha's first 12 hex, so a manifest of ANOTHER commit with the same 12 can stand at
+        # it, sound for that commit and maybe pinned by its lease batch. It is not this commit's unsound build: never replaced, nothing is staged. (Any other
+        # sourceCommit -- not a sha, or another prefix -- is this name's own corrupt build and is replaced as before.)
+        $cachedCommit = try { [string](([IO.File]::ReadAllText($manifestCachePath) | ConvertFrom-Json).sourceCommit) } catch { '' }
+        if ($cachedCommit -match '^[0-9a-fA-F]{40}\z' -and $cachedCommit.Substring(0, 12) -ieq $SourceCommit.Substring(0, 12) -and $cachedCommit -ine $SourceCommit) {
+            Write-Output "STAGE_REFUSED_STAGED_OTHER_COMMIT sha=$($SourceCommit.Substring(0, 12)) staged=$($stagedSha.Substring(0, 8)) stagedCommit=$cachedCommit incoming=$($ManifestSha256.Substring(0, 8))"
+            Complete-Failed 7 'stagedBuildGuard' "the cache name of $SourceCommit holds the build of $cachedCommit (the same 12-hex prefix); another commit's build is never replaced, so nothing is staged"
+        }
+    }
     if ($unsound) {
         Say "replacing a staged build that is not sound ($unsound); staged manifest $stagedSha"
         # r8 (adversary A1 on 0c0eafd7): the unsound manifest leaves the cache name BEFORE any artifact is renamed in. Left standing, a reader that hashed the repaired

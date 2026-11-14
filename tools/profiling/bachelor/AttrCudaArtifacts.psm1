@@ -464,8 +464,9 @@ function Enter-AttrCudaStageLock {
     failed. The lock is named for the PHYSICAL identity of the agent root (volume serial and file
     index, read with Get-AttrCudaFileId -FollowLinks, so C:\ProgramData\MlvAgent and an alias of it
     through a junction are one root) and the sha -- never a caller-chosen name or a lexical path:
-    Global\MlvAttrCudaStage-<sha256 of "vol=<serial>;idx=<high>-<low>|<sha, lower>">. Every stager of
-    that sha into that root's cache, in any session, contends for the same one. The caller keeps the
+    Global\MlvAttrCudaStage-<sha256 of "vol=<serial>;idx=<high>-<low>|<sha12, lower>">. Every stager of
+    that sha -- r9: of any sha with the same 12-hex cache-name prefix -- into that root's cache, in any
+    session, contends for the same one. The caller keeps the
     returned mutex referenced and never releases it: the OS releases it when the process ends, after
     the last cache write. An abandoned lock (a stager that died) is taken over, because the caller
     re-reads the cache under it. -WaitMarkerPath (test-only) is written when the lock is busy, before
@@ -487,7 +488,9 @@ function Enter-AttrCudaStageLock {
 
     $id = Get-AttrCudaFileId -Path $Root -FollowLinks
     $rootId = 'vol=' + [string]$id.VolumeSerialNumber + ';idx=' + [string]$id.FileIndexHigh + '-' + [string]$id.FileIndexLow
-    $key = $rootId + '|' + $SourceCommit.ToLowerInvariant()
+    # r9 fix iteration (adversary A1 on 9825bfd9): the cache names carry the sha's first 12 hex (playback-attr-3-cuda-<sha12>-build.json and its artifacts), so the lock does too: two
+    # commits that share them write the same files and must contend for the same lock (a full-sha key let both into the one name at once)
+    $key = $rootId + '|' + $SourceCommit.Substring(0, 12).ToLowerInvariant()
     $hasher = [Security.Cryptography.SHA256]::Create()
     try {
         $name = 'Global\MlvAttrCudaStage-' + ([BitConverter]::ToString($hasher.ComputeHash([Text.Encoding]::UTF8.GetBytes($key))) -replace '-', '').ToLowerInvariant()
