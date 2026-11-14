@@ -213,19 +213,28 @@ public:
             if( !( ms > 0.0 ) || !std::isfinite( ms ) ) return 0;
             return std::llround( ( ms < kMaxSpanMs ? ms : kMaxSpanMs ) * 1000000.0 );
         };
-        long long totalNs = ticks( rest );
-        for( int i = 0; i < kCount; ++i ) totalNs += ticks( probe.sumMs[i] );
+        // r3 fix iteration 1 (adversary A1 on 9f942b1e): chaining ties span to span is not transitive (1000000 and 1000001
+        // tie, 1000001 and a 1000002 rest tie, yet the kept 1000000 lost to the rest). Every bucket is now compared with ONE
+        // anchor -- the largest charge in ticks, the rest included -- and the bucket is the first named span within tieNs of
+        // it (a positive charge), else -1 (the rest alone is the largest).
+        const long long restNs = ticks( rest );
+        long long ns[kCount] = {};
+        long long totalNs = restNs;
+        long long anchorNs = restNs;
+        for( int i = 0; i < kCount; ++i )
+        {
+            ns[i] = ticks( probe.sumMs[i] );
+            totalNs += ns[i];
+            if( ns[i] > anchorNs ) anchorNs = ns[i];
+        }
         const long long ulpNs =
             std::llround( 8.0 * std::numeric_limits<double>::epsilon() * static_cast<double>( totalNs ) );
         const long long tieNs = ulpNs > 1 ? ulpNs : 1;
-        int best = -1;
-        long long bestNs = 0;
         for( int i = 0; i < kCount; ++i )
         {
-            const long long n = ticks( probe.sumMs[i] );
-            if( n > 0 && ( best < 0 || n > bestNs + tieNs ) ) { bestNs = n; best = i; }
+            if( ns[i] > 0 && ns[i] >= anchorNs - tieNs ) return i;
         }
-        return ( best >= 0 && ticks( rest ) <= bestNs + tieNs ) ? best : -1;
+        return -1;
     }
 
     // A gap opened: spans of a previous gap that never closed are not carried into it.

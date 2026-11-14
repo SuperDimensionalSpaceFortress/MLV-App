@@ -589,6 +589,17 @@ TEST(PlaybackLookaheadCpuRoute, AMeasuredTieGoesToTheNamedSpanDespiteRoundingInT
     c.nowNs = 0; one.begin( c );
     c.nowNs = 1; one.end( OtherBusySpan::TimerFrame, c );
     ASSERT_EQ( static_cast<int>( OtherBusySpan::TimerFrame ), one.dominantBucket( 1 / 1000000.0 ) );
+    // r3 fix iteration 1 (adversary A1 on 9f942b1e, its input verbatim): gap open 100000000000 ns, close 100003000003 ns;
+    // draw_frame_ready 1000000 ns, timer_frame 1000001 ns, rest 1000002 ns. Chained ties kept draw_frame_ready and then lost
+    // it to the rest (-1); against one anchor (the 1000002 rest), timer_frame ties it and draw_frame_ready (2 ticks) does not.
+    OtherBusySpans chain;
+    chain.openGap();
+    c.gapSerial = 5;
+    c.nowNs = 100000100000; chain.begin( c );
+    c.nowNs = 100001100000; chain.end( OtherBusySpan::DrawFrameReady, c );
+    c.nowNs = 100001200000; chain.begin( c );
+    c.nowNs = 100002200001; chain.end( OtherBusySpan::TimerFrame, c );
+    ASSERT_EQ( static_cast<int>( OtherBusySpan::TimerFrame ), chain.dominantBucket( 3000003 / 1000000.0 ) );
     // r3 hardening: a non-finite charge is 0 ticks (never handed to llround) and is never the dominant bucket.
     OtherBusySpans odd;
     odd.gapMs[static_cast<int>( OtherBusySpan::DrawFrameReady )] = std::numeric_limits<double>::quiet_NaN();
