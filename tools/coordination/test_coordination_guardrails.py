@@ -1124,6 +1124,7 @@ def test_invoke_lane_error_mode_pin_catches_each_launch_ahead_of_the_block(tmp_p
 # NOT covered, a parenthesized literal command name (distinct from the `& $cmd` form above): `& ('Invoke-CimMethod') -ClassName Win32_Process -MethodName Create`.
 # An alias the file itself defines (Set-Alias / New-Alias / sal / nal, literal name and value, an alias of an alias) is read as the command it names; a name with several meanings is tested as EVERY watched one, and a WMI command name stays one whatever it is aliased to. NOT covered: an alias made any other way (a non-literal name or value, `Import-Alias`, `$ExecutionContext`, `Set-Item alias:`, `New-Item -Path Alias:spawn -Value Invoke-CimMethod`) or defined in another file.
 # NOT covered, a write that reaches a splatted table through a nested index or an array wrapper (`@($h)[0]['PipelineVariable'] = 'w'`, `$h[0]['k'] = ...`): only `( )`, `$( )` of one statement, a cast and `-as` are read through.
+# A class named by a selector is read: the process class name with a wildcard or a character class (`Win32_Proc*`, `Win32[_]Proces[s]`), and a WQL meta_class / __CLASS / __THIS / __DERIVATION / __DYNASTY / __SUPERCLASS query; an assignment in parentheses is read as its target (`($h = @{})['k'] = 'w'`, `($PSDefaultParameterValues = @{})[...]`). NOT covered: a selector on another property (`__RELPATH`, `__PATH`), and `1 | ForEach-Object -InputObject { $_ } -Process { $_ }`, which recurses and fails the tracked test instead of being scanned (adversary pass 11 A2).
 # The ONE sanctioned launcher lives under .claude-state and is not tracked, so today the allow list is empty. An entry is {repo-relative posix path: reason},
 # added only in review for a script that must call the create itself; an entry that stops matching a site fails the test, so the list cannot go stale.
 WMI_CREATE_ALLOW = {}
@@ -1131,7 +1132,10 @@ _WMI_CREATE_SCANNER = r"""
 using namespace System.Management.Automation.Language
 param([Parameter(Mandatory = $true)][string]$ListFile)
 $ErrorActionPreference = 'Stop'
-$wmiWord = [regex]::new('(?i)win32_process|wmiclass|managementclass')
+# The ways a script can name the process class: the class name, a prefix of it followed by a wildcard or a character class (Win32_Proc*, Win32_P%, Win32[_]Proces[s],
+# Win32*), the type names, and a WQL schema selector that finds a class by a property instead of its name (meta_class, __CLASS, __THIS, __DERIVATION, __DYNASTY,
+# __SUPERCLASS). Another Win32_ class (Win32_OperatingSystem) is not the process class, so a plain Win32_ prefix is not a match.
+$wmiWord = [regex]::new('(?i)win32(?:_|\[_\])(?:process|(?:p|pr|pro|proc|proce|proces)?[*%?\[])|win32[*%?\[]|wmiclass|managementclass|meta_class|__class|__this|__derivation|__dynasty|__superclass')
 $wmiCommands = @('invoke-cimmethod', 'invoke-wmimethod', 'icim', 'iwmi')
 $wmiTypes = '(^|\.)(wmiclass|wmi|ManagementClass)$'
 $quoteChars = '["' + "'" + [char]0x2018 + [char]0x2019 + [char]0x201A + [char]0x201B + [char]0x201C + [char]0x201D + [char]0x201E + ']'
@@ -1340,6 +1344,8 @@ function Get-ValueExpression($Node) {
             $Node = @($Node.SubExpression.Statements)[0]
         }
         elseif ($Node -is [BinaryExpressionAst] -and $Node.Operator -eq [TokenKind]::As) { $Node = $Node.Left }
+        # `($h = @{})` is an expression whose value is what was assigned to its target: a write through it is a write to that target (adversary pass 12 A2).
+        elseif ($Node -is [AssignmentStatementAst]) { $Node = $Node.Left }
         else { return $Node }
     }
     return $null
@@ -1976,6 +1982,19 @@ def test_wmi_create_scan_refuses_each_direct_create_spelling(tmp_path):
         "cim-method-name-non-literal-then-safe-literal": "Invoke-CimMethod -ClassName Win32_Process -Name $m -MethodName GetOwner",
         "cim-method-name-safe-literal-then-non-literal": "Invoke-CimMethod -ClassName Win32_Process -MethodName GetOwner -Name $m",
         "wmi-method-name-given-twice": "Invoke-WmiMethod -Class Win32_Process -Name GetOwner -Name Create",
+        # adversary pass 12 A1: a WQL selector or a wildcard names the process class without the literal name Win32_Process
+        "wql-meta-class-char-class-selector": "$c = Get-WmiObject -Query \"SELECT * FROM meta_class WHERE __CLASS LIKE 'Win32[_]Proces[s]'\"\n$c.Create('x')",
+        "wql-meta-class-like-selector": "$c = gwmi -Query \"SELECT * FROM meta_class WHERE __CLASS LIKE '%ocess'\"\n$c.Create('x')",
+        "wql-derivation-selector": "$c = Get-WmiObject -Query \"SELECT * FROM meta_class WHERE __DERIVATION = 'x'\"\n$c.Create('x')",
+        "wmi-list-with-a-wildcard-class": "$c = Get-WmiObject -List 'Win32_Proc*'\n$c.Create('x')",
+        "wmi-list-with-a-bracket-class": "$c = Get-WmiObject -List 'Win32[_]Proces[s]'\n$c.Create('x')",
+        "wmi-list-with-a-percent-class": "$c = Get-WmiObject -List 'Win32_P%'\n$c.Create('x')",
+        # adversary pass 12 A2: an assignment inside parentheses is an expression whose value is its target, so a write through it is a write to that target
+        "splat-parenthesized-assignment-keyed-write": "($h = @{})['PipelineVariable'] = 'w'\nGet-WmiObject -List Win32_Process @h | ForEach-Object { $w.Create('x') }",
+        "splat-parenthesized-assignment-member-write": "($h = @{}).PipelineVariable = 'w'\nGet-WmiObject -List Win32_Process @h | ForEach-Object { $w.Create('x') }",
+        "splat-parenthesized-assignment-add": "($h = @{}).Add('PipelineVariable', 'w')\nGet-WmiObject -List Win32_Process @h | ForEach-Object { $w.Create('x') }",
+        "splat-subexpression-assignment-keyed-write": "$($h = @{})['PipelineVariable'] = 'w'\nGet-WmiObject -List Win32_Process @h | ForEach-Object { $w.Create('x') }",
+        "default-parameter-values-parenthesized-assignment-write": "($PSDefaultParameterValues = @{})['ForEach-Object:MemberName'] = 'Create'\nGet-WmiObject -List Win32_Process | ForEach-Object -ArgumentList 'x'",
         # adversary pass 10 A3: a write through `$(...)` or an `-as` cast is a write to the table
         "splat-subexpression-keyed-write": "$h = @{}\n$($h)['PipelineVariable'] = 'w'\nGet-WmiObject -List Win32_Process @h | ForEach-Object { $w.Create('x') }",
         "splat-subexpression-member-write": "$h = @{}\n$($h).PipelineVariable = 'w'\nGet-WmiObject -List Win32_Process @h | ForEach-Object { $w.Create('x') }",
@@ -2101,6 +2120,8 @@ def test_wmi_create_scan_refuses_each_direct_create_spelling(tmp_path):
         "wmi-value-only-in-a-ternary-condition": "$c = Get-WmiObject -List Win32_Process\n$x = Get-Item x\n($c ? $x : $x).Create('y')",
         "splat-a-safe-table-on-a-wmi-read": "$h = @{ ClassName = 'Win32_Process'; Filter = 'ProcessId=4' }\nGet-CimInstance @h",
         "splat-a-safe-table-on-a-wmi-pipeline": "$h = @{ Property = 'ProcessId' }\nGet-CimInstance Win32_Process | Select-Object @h",
+        "splat-a-safe-table-assigned-in-parentheses": "($h = @{})['ClassName'] = 'Win32_Process'\nGet-CimInstance @h",
+        "a-win32-api-note-and-an-unrelated-create": "$note = 'the win32 api'\n$o = Get-Item x\n$o.Create('y')",
         "alias-of-an-unrelated-command": "Set-Alias gs git\nNew-Alias -Name ll -Value Get-ChildItem\ngs status\nll .",
         "alias-for-a-safe-target-with-a-name-that-is-not-a-wmi-command": "Set-Alias Invoke-Thing Get-Date\nInvoke-Thing",
         "alias-g12-wmi-command-name-aliased-away-but-only-terminating": "Set-Alias Invoke-CimMethod Get-Date\nInvoke-CimMethod -InputObject $proc -MethodName Terminate",
