@@ -1912,6 +1912,7 @@ def test_wmi_create_scan_refuses_each_direct_create_spelling(tmp_path):
         "splat-a-safe-table-written-by-key": "$h = @{}\n$h['ClassName'] = 'Win32_Process'\n$h.Add('Filter', 'ProcessId=4')\nGet-CimInstance @h",
         "splat-on-a-plain-command": "$h = @{ PipelineVariable = 'w' }\nGet-Item x @h | ForEach-Object { $w.Create('y') }",
         "splat-unbound-on-a-plain-command": "Get-Item x @h",
+        "splat-with-an-argument-named-like-a-wmi-variable": "$c = Get-CimInstance Win32_Process\nfunction Run-Git([string]$C, [string[]]$A) { & git.exe -C $C @A 2>&1 }",
         "default-parameter-values-disabled-key-and-restore": "$saved = $PSDefaultParameterValues\n$PSDefaultParameterValues['Disabled'] = $true\nGet-CimInstance Win32_Process\n$PSDefaultParameterValues = $saved",
         "default-parameter-values-safe-key-in-a-wmi-file": "$PSDefaultParameterValues = @{ 'Get-ChildItem:Force' = $true }\nGet-CimInstance Win32_Process",
         "default-parameter-values-empty-in-a-wmi-file": "$PSDefaultParameterValues = @{}\nGet-CimInstance Win32_Process",
