@@ -1095,8 +1095,15 @@ def test_invoke_lane_error_mode_pin_catches_each_launch_ahead_of_the_block(tmp_p
 # value; -InputObject makes `$_` WMI in a one-element pipeline (and an explicit -InputObject that is not WMI makes it not WMI). A -PipelineVariable / -pv variable is
 # bound like a copy, and a -PipelineVariable name that is not a literal is refused on a command that reads WMI. Words are read as PowerShell reads them: a backtick
 # escape is removed (Win32_Pro`cess, Crea`u{74}e), quotes spliced into a word are removed (Manage"ment"Class) and a comment inside a receiver or an argument is
-# dropped. `$_` belongs to the innermost pipeline script block (a nested plain pipeline is not WMI).
-# NOT covered, stated plainly: lane scripts under the gitignored .claude-state (a worktree never holds them) are guarded board-side by the wmi-create-offenders
+# dropped. `$_` belongs to the innermost pipeline script block (a nested plain pipeline is not WMI). A receiver is also read through a comma, an array literal (any
+# element), a ternary (either branch), `??`, `+` and the statements of $( ) / @( ) (any branch of an `if`; its condition is not a receiver): `(,$c)[0].Create(...)`,
+# `($t ? $c : $n).Create(...)`. A ForEach-Object member name with a wildcard (`*`, `?`, `[`) is refused (`-MemberName 'Cr?ate'`). A splatted argument on a command
+# that reads WMI (it names a class, its input is WMI, or the splatted table is WMI-tainted) is refused unless the table is bound only to hashtable literals with
+# literal keys, none a -PipelineVariable / -pv / -InputObject / -MemberName (or an abbreviation) and none a script block; in a file that reads WMI a write to
+# $PSDefaultParameterValues is refused unless its keys are such literals (`Disabled` and a restore from a saved copy stay accepted). The tracked listing reads
+# .ps1 / .psm1 in any letter case (`:(icase)` pathspecs).
+# NOT covered, stated plainly: a splatted table or $PSDefaultParameterValues that crosses a file or a scope, is written through an alias (`$m = $PSDefaultParameterValues;
+# $m['x'] = ...`) or through a method other than Add / set_Item / TryAdd; lane scripts under the gitignored .claude-state (a worktree never holds them) are guarded board-side by the wmi-create-offenders
 # scan and the hidden-launch guard; files that are not .ps1/.psm1 (.py, .cmd, .js); a command whose name is a variable (`& $cmd`); a receiver that comes
 # from a call rather than a variable; a method name built at run time on a Create call or on a receiver that is not followed as WMI; the
 # `.ForEach({ $_.Create() })` / `.Where()` intrinsic methods (their script block is not a pipeline); a variable that crosses a scope or a file (dot-sourcing,
@@ -1181,20 +1188,39 @@ function Get-WrappedExpression($Pipeline, $Statements) {
     return $elements[0].Expression
 }
 
-# The variable a receiver expression starts from, through parentheses, @( ), $( ), indexes, casts and member access ($c, ($c), @($c), $($c), $c[0], $c.PSBase, [x]$c),
-# lowercased; $null when it starts elsewhere.
-# No depth limit: the loop ends at the first node that is not one of those wrappers, and an AST has no cycles.
-function Get-ReceiverRoot($Expression) {
-    while ($null -ne $Expression) {
-        if ($Expression -is [VariableExpressionAst]) { return (Get-VarName $Expression) }
-        if ($Expression -is [ParenExpressionAst]) { $Expression = Get-WrappedExpression $Expression.Pipeline $null }
-        elseif ($Expression -is [ArrayExpressionAst] -or $Expression -is [SubExpressionAst]) { $Expression = Get-WrappedExpression $null $Expression.SubExpression.Statements }
-        elseif ($Expression -is [IndexExpressionAst]) { $Expression = $Expression.Target }
-        elseif ($Expression -is [MemberExpressionAst]) { $Expression = $Expression.Expression }
-        elseif ($Expression -is [ConvertExpressionAst]) { $Expression = $Expression.Child }
-        else { return $null }
+# EVERY variable a receiver expression can start from, lowercased (an empty list when it starts elsewhere), through parentheses, @( ), $( ), indexes, casts, member
+# access, a comma, an array literal (any element), a ternary (either branch), `??` and `+` (either side) and the statements of a sub-expression ($c, ($c), @($c),
+# $($c), $c[0], $c.PSBase, [x]$c, (,$c)[0], @($null, $c)[1], ($t ? $c : $n), ($n ?? $c), $(if ($t) { $c } else { $n }), $($n; $c)). The condition of an if or a
+# ternary is not a receiver. A pipeline of commands, or a statement that is not a lone expression, contributes every variable in it.
+# No depth limit: the work list ends when no wrapper is left, and an AST has no cycles.
+function Get-ReceiverRoots($Expression) {
+    $roots = New-Object System.Collections.Generic.List[string]
+    $work = New-Object System.Collections.Generic.Stack[object]
+    $work.Push($Expression)
+    while ($work.Count -gt 0) {
+        $e = $work.Pop()
+        if ($null -eq $e) { continue }
+        if ($e -is [VariableExpressionAst]) { $roots.Add((Get-VarName $e)) }
+        elseif ($e -is [ParenExpressionAst]) { $work.Push($e.Pipeline) }
+        elseif ($e -is [ArrayExpressionAst] -or $e -is [SubExpressionAst]) { foreach ($s in @($e.SubExpression.Statements)) { $work.Push($s) } }
+        elseif ($e -is [StatementBlockAst]) { foreach ($s in @($e.Statements)) { $work.Push($s) } }
+        elseif ($e -is [IfStatementAst]) {
+            foreach ($clause in @($e.Clauses)) { $work.Push($clause.Item2) }
+            if ($null -ne $e.ElseClause) { $work.Push($e.ElseClause) }
+        }
+        elseif ($e -is [CommandExpressionAst]) { $work.Push($e.Expression) }
+        elseif ($e -is [PipelineAst] -and @($e.PipelineElements).Count -eq 1 -and @($e.PipelineElements)[0] -is [CommandExpressionAst]) { $work.Push(@($e.PipelineElements)[0].Expression) }
+        elseif ($e -is [IndexExpressionAst]) { $work.Push($e.Target) }
+        elseif ($e -is [MemberExpressionAst]) { $work.Push($e.Expression) }
+        elseif ($e -is [ConvertExpressionAst] -or $e -is [UnaryExpressionAst]) { $work.Push($e.Child) }
+        elseif ($e -is [ArrayLiteralAst]) { foreach ($x in @($e.Elements)) { $work.Push($x) } }
+        elseif ($e -is [TernaryExpressionAst]) { $work.Push($e.IfTrue); $work.Push($e.IfFalse) }
+        elseif ($e -is [BinaryExpressionAst] -and ($e.Operator -eq [TokenKind]::QuestionQuestion -or $e.Operator -eq [TokenKind]::Plus)) { $work.Push($e.Left); $work.Push($e.Right) }
+        elseif ($e -is [StatementAst]) {
+            foreach ($v in $e.FindAll({ param($x) $x -is [VariableExpressionAst] }, $true)) { $roots.Add((Get-VarName $v)) }
+        }
     }
-    return $null
+    return $roots.ToArray()
 }
 
 # True when the node names a WMI class (as PowerShell reads it) or mentions a variable already known to hold a WMI object.
@@ -1239,10 +1265,11 @@ function Test-InWmiPipeline($Node) {
 # True when the receiver names a WMI class, starts from a WMI variable, or is $_ / $PSItem inside a pipeline that read a WMI class.
 function Test-WmiReceiver($Expression) {
     if ($wmiWord.IsMatch((Get-CleanText $Expression))) { return $true }
-    $root = Get-ReceiverRoot $Expression
-    if ($null -eq $root) { return $false }
-    if ($wmiVars.ContainsKey($root)) { return $true }
-    return (($root -eq '_' -or $root -eq 'psitem') -and (Test-InWmiPipeline $Expression))
+    foreach ($root in @(Get-ReceiverRoots $Expression)) {
+        if ($wmiVars.ContainsKey($root)) { return $true }
+        if (($root -eq '_' -or $root -eq 'psitem') -and (Test-InWmiPipeline $Expression)) { return $true }
+    }
+    return $false
 }
 
 # The value a command gives to a parameter named (or abbreviated to at least $MinLength letters of) $Full: the colon form's argument, else the next element.
@@ -1268,6 +1295,141 @@ function Get-PipelineVariableName($Command) {
     while ($pv -is [ParenExpressionAst]) { $pv = Get-WrappedExpression $pv.Pipeline $null }
     if ($pv -is [StringConstantExpressionAst]) { return [pscustomobject]@{ Name = (Get-ScopedName ([string]$pv.Value)) } }
     return [pscustomobject]@{ Name = $null }
+}
+
+# The value expression under any wrapper: a statement that holds one expression, parentheses and casts. A command or a longer pipeline is returned as it is.
+function Get-ValueExpression($Node) {
+    while ($null -ne $Node) {
+        if ($Node -is [CommandExpressionAst]) { $Node = $Node.Expression }
+        elseif ($Node -is [PipelineAst]) {
+            if (@($Node.PipelineElements).Count -ne 1) { return $Node }
+            $Node = @($Node.PipelineElements)[0]
+        }
+        elseif ($Node -is [ParenExpressionAst]) { $Node = $Node.Pipeline }
+        elseif ($Node -is [ConvertExpressionAst]) { $Node = $Node.Child }
+        else { return $Node }
+    }
+    return $null
+}
+
+# The parameters that move WMI objects or a method name between commands: -PipelineVariable / -pv (two letters or more), -InputObject (two or more) and
+# -MemberName (any abbreviation). A table that carries one of them, or a name with a wildcard, onto a command that reads WMI is refused.
+$dangerousParameters = @(@('PipelineVariable', 2), @('pv', 2), @('InputObject', 2), @('MemberName', 1))
+function Test-DangerousParameterName([string]$Name) {
+    if ($Name.Length -eq 0 -or $Name -match '[*?\[]') { return $true }
+    foreach ($p in $dangerousParameters) {
+        if ($Name.Length -ge $p[1] -and $p[0].StartsWith($Name, [StringComparison]::OrdinalIgnoreCase)) { return $true }
+    }
+    return $false
+}
+
+# A table key that is a literal and is not a dangerous parameter name. For a $PSDefaultParameterValues key ('Cmdlet:Parameter') only the parameter part counts.
+function Test-SafeKey($KeyAst, [bool]$Defaults) {
+    if ($KeyAst -isnot [ConstantExpressionAst]) { return $false }
+    $key = Get-CleanText $KeyAst
+    if ($Defaults) { $key = $key.Substring($key.LastIndexOf(':') + 1) }
+    return (-not (Test-DangerousParameterName $key))
+}
+
+# A hashtable literal whose keys are all safe literals. A script-block value is refused for a splat (a default value may be one).
+function Test-SafeTableLiteral($Table, [bool]$Defaults) {
+    foreach ($pair in @($Table.KeyValuePairs)) {
+        if (-not (Test-SafeKey $pair.Item1 $Defaults)) { return $false }
+        if (-not $Defaults -and @($pair.Item2.FindAll({ param($x) $x -is [ScriptBlockExpressionAst] }, $true)).Count -gt 0) { return $false }
+    }
+    return $true
+}
+
+# True when every binding and every keyed write of the variable $Name in this file is a hashtable literal with safe keys (or a copy of another such variable, or of
+# $PSDefaultParameterValues, whose own writes are checked separately). A parameter, a foreach variable, a multiple assignment, a call, a non-literal key or (with
+# $NeedBinding) no binding at all makes it opaque. $Seen holds the variables already being checked, so a cycle of copies ends.
+function Test-SafeTableVariable([string]$Name, [bool]$Defaults, $Seen, [bool]$NeedBinding) {
+    if (-not $Seen.Add($Name)) { return $true }
+    $bound = $false
+    foreach ($p in $parameterAsts) { if ((Get-VarName $p.Name) -eq $Name) { return $false } }
+    foreach ($f in $foreachAsts) { if ((Get-VarName $f.Variable) -eq $Name) { return $false } }
+    foreach ($a in $assignments) {
+        $left = $a.Left
+        if ($left -is [ArrayLiteralAst]) {
+            foreach ($t in @($left.Elements)) {
+                while ($t -is [ConvertExpressionAst]) { $t = $t.Child }
+                if ($t -is [VariableExpressionAst] -and (Get-VarName $t) -eq $Name) { return $false }
+            }
+            continue
+        }
+        while ($left -is [ConvertExpressionAst]) { $left = $left.Child }
+        if ($left -is [VariableExpressionAst]) {
+            if ((Get-VarName $left) -ne $Name) { continue }
+            $bound = $true
+            $value = Get-ValueExpression $a.Right
+            if ($value -is [HashtableAst]) { if (-not (Test-SafeTableLiteral $value $Defaults)) { return $false } }
+            elseif ($value -is [VariableExpressionAst]) {
+                $source = Get-VarName $value
+                if ($source -ne 'psdefaultparametervalues' -and -not (Test-SafeTableVariable $source $Defaults $Seen $true)) { return $false }
+            }
+            else { return $false }
+        }
+        elseif ($left -is [IndexExpressionAst] -and $left.Target -is [VariableExpressionAst] -and (Get-VarName $left.Target) -eq $Name) {
+            if (-not (Test-SafeKey $left.Index $Defaults)) { return $false }
+        }
+        elseif ($left -is [MemberExpressionAst] -and $left.Expression -is [VariableExpressionAst] -and (Get-VarName $left.Expression) -eq $Name) {
+            if ($left.Member -isnot [StringConstantExpressionAst] -or -not (Test-SafeKey $left.Member $Defaults)) { return $false }
+        }
+    }
+    foreach ($i in $invokeAsts) {
+        if ($i.Expression -isnot [VariableExpressionAst] -or (Get-VarName $i.Expression) -ne $Name) { continue }
+        if ($i.Member -isnot [StringConstantExpressionAst]) { return $false }
+        if ([string]$i.Member.Value -match '(?i)^(add|set_item|tryadd)$') {
+            $first = @($i.Arguments) | Select-Object -First 1
+            if (-not (Test-SafeKey $first $Defaults)) { return $false }
+        }
+    }
+    return ($bound -or -not $NeedBinding)
+}
+
+# The writes to $PSDefaultParameterValues (in a file that reads WMI) that could give a command a -PipelineVariable / -InputObject / -MemberName: an assignment of
+# a table whose keys are not safe literals, a keyed write or Add with such a key, or an assignment from a variable that is not itself such a table.
+function Get-DefaultParameterValuesSites {
+    $name = 'psdefaultparametervalues'
+    $bad = New-Object System.Collections.Generic.List[object]
+    foreach ($a in $assignments) {
+        $left = $a.Left
+        if ($left -is [ArrayLiteralAst]) {
+            foreach ($t in @($left.Elements)) {
+                while ($t -is [ConvertExpressionAst]) { $t = $t.Child }
+                if ($t -is [VariableExpressionAst] -and (Get-VarName $t) -eq $name) { $bad.Add($a) }
+            }
+            continue
+        }
+        while ($left -is [ConvertExpressionAst]) { $left = $left.Child }
+        if ($left -is [VariableExpressionAst] -and (Get-VarName $left) -eq $name) {
+            $value = Get-ValueExpression $a.Right
+            $ok = $false
+            if ($value -is [HashtableAst]) { $ok = Test-SafeTableLiteral $value $true }
+            elseif ($value -is [VariableExpressionAst]) {
+                $seen = New-Object 'System.Collections.Generic.HashSet[string]'
+                [void]$seen.Add($name)
+                $source = Get-VarName $value
+                $ok = ($source -eq $name) -or (Test-SafeTableVariable $source $true $seen $true)
+            }
+            if (-not $ok) { $bad.Add($a) }
+        }
+        elseif ($left -is [IndexExpressionAst] -and $left.Target -is [VariableExpressionAst] -and (Get-VarName $left.Target) -eq $name) {
+            if (-not (Test-SafeKey $left.Index $true)) { $bad.Add($a) }
+        }
+        elseif ($left -is [MemberExpressionAst] -and $left.Expression -is [VariableExpressionAst] -and (Get-VarName $left.Expression) -eq $name) {
+            if ($left.Member -isnot [StringConstantExpressionAst] -or -not (Test-SafeKey $left.Member $true)) { $bad.Add($a) }
+        }
+    }
+    foreach ($i in $invokeAsts) {
+        if ($i.Expression -isnot [VariableExpressionAst] -or (Get-VarName $i.Expression) -ne $name) { continue }
+        if ($i.Member -isnot [StringConstantExpressionAst]) { $bad.Add($i); continue }
+        if ([string]$i.Member.Value -match '(?i)^(add|set_item|tryadd)$') {
+            $first = @($i.Arguments) | Select-Object -First 1
+            if (-not (Test-SafeKey $first $true)) { $bad.Add($i) }
+        }
+    }
+    return $bad.ToArray()
 }
 
 # The method name a ForEach-Object / % / foreach call gives as -MemberName or as its first positional argument; $null when it gives none (a script block is the
@@ -1303,6 +1465,10 @@ foreach ($path in @(Get-Content -LiteralPath $ListFile -Encoding UTF8 | Where-Ob
     $ast = [Parser]::ParseFile($path, [ref]$tokens, [ref]$errors)
     $sites = New-Object System.Collections.Generic.List[object]
     $comments = @($tokens | Where-Object { $_.Kind -eq [TokenKind]::Comment })
+    $assignments = @($ast.FindAll({ param($x) $x -is [AssignmentStatementAst] }, $true))
+    $foreachAsts = @($ast.FindAll({ param($x) $x -is [ForEachStatementAst] }, $true))
+    $parameterAsts = @($ast.FindAll({ param($x) $x -is [ParameterAst] }, $true))
+    $invokeAsts = @($ast.FindAll({ param($x) $x -is [InvokeMemberExpressionAst] }, $true))
     # Every binding of a variable: `$d = <right>`, `$a, $d = <right>`, `[x][y]$d = <right>` and `foreach ($d in <right>)`. A variable is WMI when its right side
     # names a WMI class or mentions a WMI variable (or $_ / $PSItem inside a WMI pipeline); the loop runs to a fixed point, so a copy of a copy is followed.
     $bindings = New-Object System.Collections.Generic.List[object]
@@ -1338,9 +1504,29 @@ foreach ($path in @(Get-Content -LiteralPath $ListFile -Encoding UTF8 | Where-Ob
             if ($hit) { $wmiVars[$b.Name] = $true; $changed = $true }
         }
     }
+    # $PSDefaultParameterValues can hand any command a -PipelineVariable / -InputObject / -MemberName: in a file that reads WMI, a write to it that is not a
+    # hashtable of safe literal keys is refused.
+    $fileReadsWmi = $wmiWord.IsMatch((Get-CleanText $ast))
+    if ($fileReadsWmi) {
+        foreach ($d in @(Get-DefaultParameterValuesSites)) {
+            $text = ($d.Extent.Text -replace '\s+', ' ')
+            $sites.Add([ordered]@{ kind = 'wmi-default-parameter-values'; line = $d.Extent.StartLineNumber; text = $text.Substring(0, [Math]::Min(120, $text.Length)) })
+        }
+    }
     foreach ($n in $ast.FindAll({ param($x) $true }, $true)) {
         $kind = $null
         if ($n -is [CommandAst]) {
+            # A splatted argument carries parameters the scanner cannot see: on a command that reads WMI it is refused unless its table is a hashtable of safe literal keys.
+            $splats = @($n.CommandElements | Where-Object { $_ -is [VariableExpressionAst] -and $_.Splatted })
+            # "Reads WMI" here: the command names a WMI class, its input is WMI, or a splatted table is itself tainted by WMI (an ordinary argument that merely shares a
+            # name with a WMI variable elsewhere in the file does not count: `git -C $C @A` with a parameter $C).
+            $splatReadsWmi = $wmiWord.IsMatch((Get-CleanText $n)) -or (Test-WmiPipelineInput $n)
+            foreach ($s in $splats) { if ($wmiVars.ContainsKey((Get-VarName $s))) { $splatReadsWmi = $true } }
+            if ($splats.Count -gt 0 -and $splatReadsWmi) {
+                foreach ($s in $splats) {
+                    if (-not (Test-SafeTableVariable (Get-VarName $s) $false (New-Object 'System.Collections.Generic.HashSet[string]') $true)) { $kind = 'wmi-splat-unsafe'; break }
+                }
+            }
             # A -PipelineVariable name that is not a literal could name any variable: it is refused when the command reads WMI.
             $pvName = Get-PipelineVariableName $n
             if ($null -ne $pvName -and $null -eq $pvName.Name -and ((Test-WmiNode $n) -or (Test-WmiPipelineInput $n))) { $kind = 'wmi-pipeline-variable-not-literal' }
@@ -1364,6 +1550,8 @@ foreach ($path in @(Get-Content -LiteralPath $ListFile -Encoding UTF8 | Where-Ob
                 if ($null -ne $memberName -and (Test-WmiPipelineInput $n)) {
                     if ($memberName -isnot [StringConstantExpressionAst]) { $kind = 'wmi-foreach-member-not-literal' }
                     elseif ([string]$memberName.Value -match '(?i)create|invokemethod') { $kind = 'wmi-foreach-member-create' }
+                    # A member name is a wildcard pattern: 'Cr?ate' and 'Cr*' name Create.
+                    elseif ([string]$memberName.Value -match '[*?\[]') { $kind = 'wmi-foreach-member-wildcard' }
                 }
             }
         }
@@ -1422,7 +1610,7 @@ def _wmi_create_scan(tmp_path, paths):
 
 def _tracked_powershell_files(root=ROOT):
     listing = subprocess.run(
-        ["git", "-C", str(root), "ls-files", "-z", "--", "*.ps1", "*.psm1"], text=True, capture_output=True, check=True,
+        ["git", "-C", str(root), "ls-files", "-z", "--", ":(icase)*.ps1", ":(icase)*.psm1"], text=True, capture_output=True, check=True,
     ).stdout
     return sorted(p for p in listing.split("\0") if p)
 
@@ -1430,12 +1618,12 @@ def _tracked_powershell_files(root=ROOT):
 def test_tracked_powershell_listing_reads_any_extension_case(tmp_path):
     """adversary A4 on cc2d32d8: PowerShell runs unsafe.PS1 and Mod.PSM1 like the lower-case names, so the listing must not skip them."""
     subprocess.run(["git", "init", "-q", str(tmp_path)], check=True, capture_output=True)
-    for name in ("lower.ps1", "UPPER.PS1", "Mixed.Ps1", "mod.psm1", "MOD.PSM1", "notes.txt", "x.ps1.bak", "sub/deep.PS1"):
+    for name in ("lower.ps1", "UPPER.PS1", "Mixed.Ps1", "mod.psm1", "Other.PSM1", "notes.txt", "x.ps1.bak", "sub/deep.PS1"):
         target = tmp_path / name
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text("# x\n", encoding="utf-8", newline="\n")
     subprocess.run(["git", "-C", str(tmp_path), "add", "-A"], check=True, capture_output=True)
-    assert _tracked_powershell_files(tmp_path) == sorted(["lower.ps1", "UPPER.PS1", "Mixed.Ps1", "mod.psm1", "MOD.PSM1", "sub/deep.PS1"])
+    assert _tracked_powershell_files(tmp_path) == sorted(["lower.ps1", "UPPER.PS1", "Mixed.Ps1", "mod.psm1", "Other.PSM1", "sub/deep.PS1"])
 
 
 @_lane_scanner_only
