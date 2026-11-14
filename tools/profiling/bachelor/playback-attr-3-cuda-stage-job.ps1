@@ -387,6 +387,7 @@ if (Test-Path -LiteralPath $manifestCachePath) {
     $stagedSha = ''
     $unsound = ''
     $unsoundRaw = ''
+    $declaredCommit = $null
     try {
         $stagedSha = Get-ShaLower $manifestCachePath
         $staged = $null
@@ -398,6 +399,8 @@ if (Test-Path -LiteralPath $manifestCachePath) {
                 $_.Exception -isnot [ArgumentException]) { throw }
             $unsoundRaw = [string]$_.Exception.Message
             $unsound = ($unsoundRaw -replace '\s+', ' ')
+            # r12 (Grok G15 on #814): a COMMIT_MISMATCH carries the commit the judged bytes declare as data; read it from there, never from the message text
+            if ($null -ne $_.Exception.Data -and $_.Exception.Data.Contains('declaredCommit')) { $declaredCommit = [string]$_.Exception.Data['declaredCommit'] }
         }
         if (-not $unsound) {
             $cachePathByName = @{}
@@ -425,14 +428,13 @@ if (Test-Path -LiteralPath $manifestCachePath) {
         # r10 (adversary A1 on 0b1fcfe2): the commit is the one the JUDGED bytes declare, never a second read of the file: Assert-AttrCudaBuildManifest parses
         # the very bytes it hashed to $stagedSha (one read), and its COMMIT_MISMATCH names that declaration. A second read (r9: hash, read, hash) could parse
         # bytes swapped in and out between its three opens. A refusal of any other shape names no commit: fail closed, nothing is replaced.
-        $mismatchHead = "ATTRCUDA_BUILD_MANIFEST_COMMIT_MISMATCH $manifestCachePath declares '"
-        $mismatchTail = "', expected '$SourceCommit'"
-        if ($unsoundRaw.Length -lt ($mismatchHead.Length + $mismatchTail.Length) -or $unsoundRaw.Substring(0, $mismatchHead.Length) -cne $mismatchHead -or
-                $unsoundRaw.Substring($unsoundRaw.Length - $mismatchTail.Length) -cne $mismatchTail) {
+        # r12 (Grok G15 on #814): that commit is Assert's Exception.Data['declaredCommit'], a value, never a parse of the message text: r10 matched the message
+        # byte for byte against a copy of Assert's wording, so any drift on either side failed every COMMIT_MISMATCH closed and wedged the sha.
+        if ($null -eq $declaredCommit) {
             Write-Output "STAGE_REFUSED_STAGED_UNREADABLE sha=$($SourceCommit.Substring(0, 12)) incoming=$($ManifestSha256.Substring(0, 8)) the COMMIT_MISMATCH refusal names no commit: $unsound"
             Complete-Failed 7 'stagedBuildGuard' "the staged build of $SourceCommit (COMMIT_MISMATCH) names no commit, so it is not replaced: $unsound"
         }
-        $cachedCommit = $unsoundRaw.Substring($mismatchHead.Length, $unsoundRaw.Length - $mismatchHead.Length - $mismatchTail.Length)
+        $cachedCommit = $declaredCommit
         if ($cachedCommit -match '^[0-9a-fA-F]{40}\z' -and $cachedCommit.Substring(0, 12) -ieq $SourceCommit.Substring(0, 12) -and $cachedCommit -ine $SourceCommit) {
             Write-Output "STAGE_REFUSED_STAGED_OTHER_COMMIT sha=$($SourceCommit.Substring(0, 12)) staged=$($stagedSha.Substring(0, 8)) stagedCommit=$cachedCommit incoming=$($ManifestSha256.Substring(0, 8))"
             Complete-Failed 7 'stagedBuildGuard' "the cache name of $SourceCommit holds the build of $cachedCommit (the same 12-hex prefix); another commit's build is never replaced, so nothing is staged"

@@ -254,8 +254,8 @@ _allow("Publish-AttrCudaBoundedTextCopy",
        "reads the tail of -Source (File.Open Open/Read); the bounded text is then published through Publish-AttrCudaText, never written here",
        ("R1", "New-Object byte[]", 1), ("R4", "IO.File::Open", 1))
 _allow("Assert-AttrCudaBuildManifest",
-       "r10 (adversary A1 on 0b1fcfe2): decodes, as ReadAllText would, the manifest bytes already read once and hashed (a MemoryStream); opens no file",
-       ("R4", "IO.StreamReader::new", 1), ("R4", ".ReadToEnd()", 1))
+       "r10/r12: decodes the manifest bytes already read and hashed (a MemoryStream), opens no file; its COMMIT_MISMATCH is an in-memory InvalidOperationException with the commit in Data",
+       ("R4", "IO.StreamReader::new", 1), ("R4", ".ReadToEnd()", 1), ("R4", "InvalidOperationException::new", 1))
 _allow("Read-AttrCudaOwnedJournal",
        "reads the creator journal (File.Open Open/Read, ReadWrite share) through a StreamReader; read-only",
        ("R4", "IO.File::Open", 1), ("R4", "IO.StreamReader::new", 1))

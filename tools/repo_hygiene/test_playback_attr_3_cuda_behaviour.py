@@ -1353,6 +1353,51 @@ class StagedBuildNeverReplacedTests(_PwshCase):
         self.assertEqual(body.count("[IO.File]::ReadAll"), 1, "the manifest is read once")
         self.assertIn("$manifestText = [IO.StreamReader]::new([IO.MemoryStream]::new($manifestBytes)", body)
 
+    def test_r12_g15_the_stage_guard_takes_the_declared_commit_as_data_never_from_the_message(self) -> None:
+        # r12 (Grok G15 on #814): r10 matched the COMMIT_MISMATCH message byte for byte against a copy of Assert's wording ($mismatchHead/$mismatchTail), so a
+        # wording drift on either side failed every COMMIT_MISMATCH closed (STAGE_REFUSED_STAGED_UNREADABLE) and wedged the sha. The declared commit is now
+        # data on the refusal (Exception.Data['declaredCommit']), and the guard reads it from there only.
+        text = STAGE_GENERATOR.read_text(encoding="utf-8")
+        guard = text[text.index("if ($unsound -match '^ATTRCUDA_BUILD_MANIFEST_COMMIT_MISMATCH ') {"):text.index("Remove-AttrCudaInputFileByContent -TrustedRoot $AgentRoot -Path $manifestCachePath")]
+        self.assertNotIn("$unsoundRaw.Substring", guard)
+        self.assertIn("$cachedCommit = $declaredCommit", guard)
+        self.assertIn("$_.Exception.Data['declaredCommit']", text)
+        for declared in ("not-a-sha", "", SHA_FIXTURE[:12] + "1" * 28, "it's, expected 'x'"):
+            with self.subTest(declared=declared):
+                bj = self.tmp / f"g15-{len(declared)}.json"
+                bj.write_text(json.dumps({"sourceCommit": declared, "dllPairManifestSha256": "d" * 64, "pendingSymbolPresence": True}), encoding="utf-8")
+                p = self.run_with_module(
+                    f"try {{ Assert-AttrCudaBuildManifest -Path '{bj}' -ExpectedSha256 '{hashlib.sha256(bj.read_bytes()).hexdigest()}' -ExpectedSourceCommit '{SHA_FIXTURE}' | Out-Null; 'NO_THROW' }} "
+                    "catch { 'HAS=' + $_.Exception.Data.Contains('declaredCommit'); 'DATA=[' + $_.Exception.Data['declaredCommit'] + ']'; 'MSG=' + $_.Exception.Message }\n",
+                    name=f"g15-{len(declared)}.ps1")
+                self.assertIn("HAS=True", p.stdout, p.stdout + p.stderr)
+                self.assertIn(f"DATA=[{declared}]", p.stdout, p.stdout + p.stderr)
+                self.assertIn("MSG=ATTRCUDA_BUILD_MANIFEST_COMMIT_MISMATCH ", p.stdout, p.stdout + p.stderr)
+
+    def test_r12_g15_this_names_own_corrupt_commit_is_replaced(self) -> None:
+        # r12 (Grok G15 (a) on #814): the replace path the r9 comment promises ("is replaced as before") had no behaviour test; only the refuse path did. A resident
+        # manifest whose sourceCommit is not a sha, is missing, or is a 40-hex of ANOTHER 12-hex prefix is this name's own corrupt build: exit 0, the new manifest in
+        # place, and never STAGE_REFUSED_STAGED_UNREADABLE.
+        for i, declared in enumerate(("not-a-sha", None, "f" * 40)):
+            with self.subTest(declared=declared):
+                for e in list(self.cache.iterdir()):
+                    shutil.rmtree(e) if e.is_dir() else e.unlink()
+                first = self.stage("ad005766", suffix=f"g15first{i}")
+                self.assertEqual(first.returncode, 0, f"{first.stdout}\n{first.stderr}")
+                m = json.loads((self.cache / self.manifest_name).read_text(encoding="utf-8"))
+                if declared is None:
+                    m.pop("sourceCommit")
+                else:
+                    m["sourceCommit"] = declared
+                (self.cache / self.manifest_name).write_text(json.dumps(m, indent=2), encoding="utf-8")
+
+                second = self.stage("f8fc75a2", suffix=f"g15repair{i}")
+
+                self.assertEqual(second.returncode, 0, f"{second.stdout}\n{second.stderr}")
+                self.assertNotIn("STAGE_REFUSED_STAGED_UNREADABLE", second.stdout)
+                self.assertIn("ATTRCUDA_BUILD_MANIFEST_COMMIT_MISMATCH", second.stdout)
+                self.assertEqual(self.manifest_sha(), hashlib.sha256((self.tmp / "build-f8fc75a2" / self.manifest_name).read_bytes()).hexdigest())
+
     def test_r9_the_stage_lock_is_one_for_every_sha_that_shares_the_cache_names(self) -> None:
         # r9 fix iteration (adversary A1 on 9825bfd9): the lock was keyed on the full sha, so two commits with the same 12 hex (the same cache files) never
         # contended; it is keyed on the 12 hex the cache names carry. Another 12 is another lock.
