@@ -1121,6 +1121,8 @@ def test_invoke_lane_error_mode_pin_catches_each_launch_ahead_of_the_block(tmp_p
 # bachelor scripts, whose variables the file-wide WMI taint over-approximates); a method collection (`$c.psobject.Methods['Create']`); a positional ForEach-Object member name that
 # follows a switch parameter (`-UseNewRunspace Create`), which is read as that parameter's value. A file that does not parse is
 # scanned as far as its AST goes; a file the parser cannot READ fails the tracked test (it was not scanned).
+# NOT covered, a parenthesized literal command name (distinct from the `& $cmd` form above): `& ('Invoke-CimMethod') -ClassName Win32_Process -MethodName Create`.
+# NOT covered, a multiple assignment with an indexed target: `$h['PipelineVariable'], $ignored = 'w', 0`.
 # The ONE sanctioned launcher lives under .claude-state and is not tracked, so today the allow list is empty. An entry is {repo-relative posix path: reason},
 # added only in review for a script that must call the create itself; an entry that stops matching a site fails the test, so the list cannot go stale.
 WMI_CREATE_ALLOW = {}
