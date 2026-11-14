@@ -585,6 +585,25 @@ class VenueBaselineTests(unittest.TestCase):
         self.assertEqual(p2.returncode, 0, p2.stdout + p2.stderr)
         self.assertTrue(all(f"manifest={given}" in c for c in self.chain_calls()))
 
+    def test_r12_a_build_of_another_commit_at_the_12_hex_name_is_never_pinned(self) -> None:
+        # VENUE-STAGE-SAME-SHA-RESTAGE-GUARD-1 r12 (r10's OPEN, Invoke-VenueBaseline.ps1:292-296): the cache name carries only the sha's first 12 hex, and the
+        # lookup pinned whatever manifest stood there by its hash without reading its sourceCommit, so another commit's build (same 12 hex) was handed to both
+        # chains as this commit's. It is BUILD_NOT_STAGED (exit 22), no chain is called; the commit is read from the same bytes that are hashed.
+        bj = self.share / "cache" / f"playback-attr-3-cuda-{SHORT}-build.json"
+        for label, payload in (("another commit, same 12 hex", b'{"sourceCommit": "' + (SHA[:12] + "1" * 28).encode() + b'"}\n'),
+                               ("no sourceCommit", b'{"x": 1}\n'), ("not JSON", b"{ not json")):
+            with self.subTest(case=label):
+                bj.write_bytes(payload)
+                before = len(self.chain_calls())
+                p = self.run_baseline()
+                self.assertEqual(p.returncode, EXIT["BUILD_NOT_STAGED"], p.stdout + p.stderr)
+                self.assertIn("reason=BUILD_NOT_STAGED", p.stdout)
+                self.assertEqual(len(self.chain_calls()), before, "a chain ran on another commit's build")
+        # the case of the declared commit is the leg job's own (Assert-AttrCudaBuildManifest compares with -ne): an upper-case declaration is this commit
+        bj.write_bytes(b'{"sourceCommit": "' + SHA.upper().encode() + b'"}\n')
+        p = self.run_baseline()
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+
     def test_gate_refusal_exits_typed_and_stops_before_the_second_backend(self) -> None:
         p = self.run_baseline(mode="gate")
         self.assertEqual(p.returncode, EXIT["GATE_REFUSED"], p.stdout + p.stderr)

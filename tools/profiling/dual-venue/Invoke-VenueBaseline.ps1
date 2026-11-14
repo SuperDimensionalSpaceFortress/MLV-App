@@ -290,10 +290,20 @@ if (-not $reach.ok -or $reach.value -ne $true) { Stop-Baseline 'SHARE_UNREACHABL
 $manifest = $BuildManifestSha256
 if (-not $manifest) {
     $buildJson = "$cache\playback-attr-3-cuda-$($commit.Substring(0, 12))-build.json"
-    $m = Invoke-Bounded { param($p) if (Test-Path -LiteralPath $p -PathType Leaf) { (Get-FileHash -LiteralPath $p -Algorithm SHA256).Hash.ToLowerInvariant() } else { '' } } @($buildJson) $ProbeTimeoutSec
+    # VENUE-STAGE-SAME-SHA-RESTAGE-GUARD-1 r12 (r10's OPEN): the cache name carries only the sha's first 12 hex, so the manifest standing there may be ANOTHER commit's
+    # build. ONE read: the bytes hashed are the bytes whose sourceCommit is read (decoded as Assert-AttrCudaBuildManifest decodes them); a manifest that does not declare
+    # this commit (compared as the leg job compares it, -ne) is not this commit's staged build, so it is never pinned for the chains.
+    $m = Invoke-Bounded {
+        param($p)
+        if (-not (Test-Path -LiteralPath $p -PathType Leaf)) { return '' }
+        $bytes = [IO.File]::ReadAllBytes($p)
+        $declared = try { $j = [IO.StreamReader]::new([IO.MemoryStream]::new($bytes), [Text.Encoding]::UTF8, $true).ReadToEnd() | ConvertFrom-Json -ErrorAction Stop; $q = $j.PSObject.Properties['sourceCommit']; if ($null -eq $q) { '<absent>' } else { [string]$q.Value } } catch { '<unparseable>' }
+        [pscustomobject]@{ hash = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($bytes)).ToLowerInvariant(); commit = $declared }
+    } @($buildJson) $ProbeTimeoutSec
     if ($m.timedOut) { Stop-Baseline 'SHARE_UNREACHABLE' "reading '$buildJson' $($m.error)" }
     if (-not $m.ok -or -not $m.value) { Stop-Baseline 'BUILD_NOT_STAGED' "no staged build manifest for $($commit.Substring(0, 12)) at '$buildJson'; the hub stages it first (assemble + stage job), this script stages nothing" }
-    $manifest = [string]$m.value
+    if ([string]$m.value.commit -ne $commit) { Stop-Baseline 'BUILD_NOT_STAGED' "the staged build manifest at '$buildJson' declares '$($m.value.commit)', not $commit (the 12-hex cache name holds another build); this commit is not staged, so no chain runs on it; the hub stages it first, this script stages nothing" }
+    $manifest = [string]$m.value.hash
 }
 Out-Line "BASELINE_BUILD sourceCommit=$commit buildManifestSha256=$manifest"
 
