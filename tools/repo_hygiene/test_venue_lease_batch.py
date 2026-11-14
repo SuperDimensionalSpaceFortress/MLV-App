@@ -183,7 +183,11 @@ if ($JobId -like 'lease-batch-open-*') {
     $tokOut = $(if ($env:FAKE_OPEN_TOKEN_SHY -eq '1') { $token + [string][char]0x00AD } else { $token })
     if ($mode -ne 'nobatch') { $adm['leaseBatch'] = [ordered]@{ token = $tokOut; leaseId = $lid; seq = 1; reused = $false; untilEpoch = $now.ToUnixTimeSeconds() + $remain; remainingSec = $remain } }
     # LEASE-BATCH-IDLE-END-UNSEEN-1 r3 pass 2 (adversary A2): FAKE_IDLE_SEC is the running agent's own idle bound, published as admission.leaseBatch.idleSec
-    if ($mode -ne 'nobatch' -and $env:FAKE_IDLE_SEC) { $adm['leaseBatch']['idleSec'] = [int]$env:FAKE_IDLE_SEC }
+    # r4 (Grok G7): 'str:<s>' publishes a string, 'dbl:<d>' a double, 'null' a JSON null; anything else an int
+    if ($mode -ne 'nobatch' -and $env:FAKE_IDLE_SEC) {
+        $iv = [string]$env:FAKE_IDLE_SEC
+        $adm['leaseBatch']['idleSec'] = $(if ($iv -like 'str:*') { $iv.Substring(4) } elseif ($iv -like 'dbl:*') { [double]$iv.Substring(4) } elseif ($iv -eq 'null') { $null } else { [int]$iv })
+    }
     [pscustomobject]@{ opens = $n + 1; leaseId = $lid; token = $token } | ConvertTo-Json | Set-Content -LiteralPath $stateFile
     # r5: FAKE_OPEN_SLEEP per open: um-run blocks this long first, as it does while the agent re-asks a refused (exit 75) request for the open
     $sleep = [int](Pick $env:FAKE_OPEN_SLEEP $n '0')
@@ -310,6 +314,8 @@ $rp = Join-Path $rdir "$id.json"; Set-Content -LiteralPath $rp -Value '{}'
 $edir = Join-Path (Join-Path (Split-Path -Parent $rroot) 'evidence') $id; New-Item -ItemType Directory -Force -Path $edir | Out-Null
 $pre = Pick $env:FAKE_LEG_PRELOADS $k '5'
 if ($pre -ne 'none') { Set-Content -LiteralPath (Join-Path $edir 'summary.json') -Value ('{"cpuQuiescence":{"timeMeanPercent":' + $pre + '}}') }
+# r4 (adversary r4 A1): FAKE_LEG_TAIL_SLEEP = the leg child's own work after its agent job ended (its receipt, its evidence), before it exits
+if ($env:FAKE_LEG_TAIL_SLEEP) { Start-Sleep -Seconds ([int]$env:FAKE_LEG_TAIL_SLEEP) }
 "DVE_OUTCOME=$(if ($legMode -eq 'unresolved') { 'UNRESOLVED' } else { Pick $env:FAKE_LEG_OUTCOMES $k 'PASS' })"
 "DVE_RECEIPT_PATH=$rp"
 exit 0
@@ -807,6 +813,18 @@ class VenueLeaseBatchRunnerTests(unittest.TestCase):
         b1 = self.batches()[0]
         self.assertEqual((b1["endReason"], b1["legsRan"], b1["legsCounted"]), ("LEASE_IDLE_ENDED", 1, 0), b1)
         self.assertEqual((b1["legs"][0]["class"], b1["legs"][0]["counted"], b1["legs"][0]["onLease"]), ("LEASE_IDLE_ENDED", False, False), b1["legs"][0])
+        # r4 (adversary r4 A2 sibling of Grok G9): this site types the end through the same helper: the lease's end clamped to the agent's endedUtc and the LEASE_IDLE_ENDED line
+        self._assert_idle_end_clamped_and_logged(b1)
+
+    def _assert_idle_end_clamped_and_logged(self, b: dict) -> None:
+        rows = [json.loads(l) for l in (self.share / "logs" / f"lease-batch-{b['token']}.jsonl").read_text(encoding="utf-8").splitlines() if l.strip()]
+        idle = [x for x in rows if x.get("endReason") == "idle" and x.get("token") == b["token"]]
+        self.assertEqual(len(idle), 1, rows)
+        ended = datetime.fromisoformat(idle[0]["endedUtc"].replace("Z", "+00:00"))
+        lease_end = datetime.fromisoformat(b["leaseEndUtc"].replace("Z", "+00:00"))
+        self.assertLess(abs((lease_end - ended).total_seconds()), 1.0, (b["leaseEndUtc"], idle[0]["endedUtc"]))
+        log = (self.run_dir / "batch.log").read_text(encoding="utf-8")
+        self.assertIn(f" LEASE_IDLE_ENDED batch={b['batch']} ", log)
 
     def test_a_leg_never_launches_after_the_run_deadline_passed_between_its_probe_and_its_launch(self) -> None:
         # adversary A1 (adversary-7ce11cb9.json): the launch guard checked the claim and the lease's room only, so the receipt read after a probe (or any slow guard) could carry the
@@ -891,7 +909,8 @@ class VenueLeaseBatchRunnerTests(unittest.TestCase):
 
     def test_lease_batch_idle_end_r3_grok_g1_the_in_lease_probe_wait_stays_under_the_agents_idle_bound(self) -> None:
         # G1: -ProbeMaxWaitSec (600 by default) let one probe wait twice the agent's idle bound (LeaseBatchIdleSec 300) with no job, so the lease idled out under it. The in-lease
-        # wait is cut to the agent's bound less -ProbeIdleMarginSec (60 by default) and -CooldownSec (0 here): 240 s, with the lease's room far larger.
+        # wait is cut to the agent's bound less -ProbeIdleMarginSec (60 by default): 240 s, with the lease's room far larger. -CooldownSec does NOT cut this wait (r4, Grok G6: a cooldown
+        # at or above the bound less the margin is refused before any lease instead, see test_lease_batch_idle_end_r4_grok_g6_*).
         # r3 pass 2 (adversary A1): counted from the last agent job seen to end, so a probe a few seconds after the open or a leg gets a few seconds less than the bound
         def within(waits: list[int], top: int) -> bool:
             return len(waits) == 2 and all(top - 15 <= w <= top for w in waits)
@@ -978,6 +997,97 @@ class VenueLeaseBatchRunnerTests(unittest.TestCase):
         self.assertEqual((b1["endReason"], b1["legsAttempted"]), ("LEASE_IDLE_ENDED", 0), b1)
         self.assertIn("as idle", b1["endDetail"])
         self.assertEqual((b2["endReason"], b2["legsRan"]), ("ALL_LEGS_DONE", 1), b2)
+        # r4 (Grok G9; adversary r4 A2): this retype is the same end as the in-loop one, so it carries every field that one sets: leaseEndUtc clamped to the agent's endedUtc
+        # (to the second) and the LEASE_IDLE_ENDED batch=1 line in batch.log (on 253ac155 it set only the reason and the detail)
+        self._assert_idle_end_clamped_and_logged(b1)
+
+    def test_lease_batch_idle_end_r4_grok_g9_lease_idle_ended_is_typed_in_one_helper(self) -> None:
+        # Grok G9 prevention: a second site that sets an existing end reason by hand drifts from the first. The literal assignment appears once, inside Set-BatchLeaseIdleEnded,
+        # and every site that finds the agent's idle release calls it (the probe's receipt read, the room-short batch end, a leg that ran off the lease: RETRY and RAN).
+        text = RUNNER.read_text(encoding="utf-8")
+        self.assertEqual(text.count("endReason = 'LEASE_IDLE_ENDED'"), 1)
+        start = text.index("function Set-BatchLeaseIdleEnded")
+        body = text[start:text.index("\n}\n", start)]
+        self.assertIn("endReason = 'LEASE_IDLE_ENDED'", body)
+        self.assertIn("ConvertTo-AgentUtc $Ie.endedUtc", body)
+        self.assertIn('LogBest "LEASE_IDLE_ENDED batch=', body)
+        self.assertEqual(text.count("Set-BatchLeaseIdleEnded $b "), 4, "the probe read, the room-short end, and the RETRY and RAN off-lease ends")
+
+    # ---------------------------------------------------------------- r4 (Grok G6 on #817): the run's own in-lease waits vs the agent's idle bound, refused before any lease
+    def test_lease_batch_idle_end_r4_grok_g6_a_cooldown_or_margin_past_the_idle_bound_is_refused_before_any_lease(self) -> None:
+        # -CooldownSec sleeps inside the lease with no job and is not bounded by the idle allowance: at or above the bound less the margin (300 - 60 = 240 with the agent script's
+        # default), the agent releases the lease under every cooldown. -ProbeIdleMarginSec at or above the bound leaves every probe no wait. Refused typed (exit 15) before
+        # anything is submitted: no open, no batch receipt. On 253ac155 these ran (exit 0).
+        for extra in (("-CooldownSec", "240"), ("-CooldownSec", "3600"), ("-ProbeIdleMarginSec", "300"), ("-ProbeIdleMarginSec", "1800")):
+            with self.subTest(extra=extra):
+                self.setUp()
+                r = self.run_batch(self.specs[:2], *extra)
+                self.assertEqual(r.returncode, 15, r.stdout + r.stderr)
+                self.assertIn("BATCH_REFUSED IDLE_BOUND_CONFIG_REFUSED", r.stderr)
+                self.assertIn(extra[0], r.stderr)
+                self.assertEqual(self.kinds(), [], "nothing was submitted")
+                self.assertFalse((self.run_dir / "batches.jsonl").exists())
+
+    def test_lease_batch_idle_end_r4_grok_g6_a_config_just_under_the_idle_bound_runs(self) -> None:
+        # control: one second under each refusal runs (exit 0)
+        for extra in (("-CooldownSec", "239"), ("-ProbeIdleMarginSec", "299")):
+            with self.subTest(extra=extra):
+                self.setUp()
+                r = self.run_batch(self.specs[:1], *extra)
+                self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+                self.assertEqual(self.batches()[0]["endReason"], "ALL_LEGS_DONE")
+
+    def test_lease_batch_idle_end_r4_grok_g6_the_running_agents_tighter_bound_is_checked_once_the_lease_is_in_hand(self) -> None:
+        # the running agent publishes 100: -CooldownSec 40 (= 100 - 60) passes the pre-lease check against the script default (300) but not the bound the run uses. No probe or
+        # leg runs on the lease, the lease is closed, the run stops IDLE_BOUND_CONFIG_REFUSED (exit 15). The same for -ProbeIdleMarginSec 100.
+        for extra in (("-CooldownSec", "40"), ("-ProbeIdleMarginSec", "100")):
+            with self.subTest(extra=extra):
+                self.setUp()
+                r = self.run_batch(self.specs[:2], *extra, FAKE_IDLE_SEC="100")
+                self.assertEqual(r.returncode, 15, r.stdout + r.stderr)
+                [b] = self.batches()
+                self.assertEqual((b["endReason"], b["legsAttempted"]), ("IDLE_BOUND_CONFIG_REFUSED", 0), b)
+                self.assertIn("published by the running agent", b["endDetail"])
+                self.assertEqual(self.kinds(), [f"OPEN:{b['token']}", f"CLOSE:{b['token']}"])
+                res = batch_result(r.stdout)
+                self.assertEqual((res["exitCode"], res["stopReason"], res["notRun"]), (15, "IDLE_BOUND_CONFIG_REFUSED", 2))
+
+    # ---------------------------------------------------------------- r4 (Grok G7 on #817): a published idleSec that is there but invalid fails closed
+    def test_lease_batch_idle_end_r4_grok_g7_an_invalid_published_idle_bound_fails_closed_not_to_the_script_default(self) -> None:
+        # only an ABSENT field (an agent that predates it) falls back to the agent script's default; 0, a string, a double, a JSON null, a negative or an out-of-range value from
+        # the RUNNING agent means its bound is unknown: AGENT_IDLE_BOUND_UNKNOWN (exit 10), nothing runs, the lease is closed. On 253ac155 each fell back to 300 and ran.
+        for val in ("0", "str:100", "dbl:100.0", "null", "-5", "86401"):
+            with self.subTest(idleSec=val):
+                self.setUp()
+                r = self.run_batch(self.specs[:2], FAKE_IDLE_SEC=val)
+                self.assertEqual(r.returncode, 10, r.stdout + r.stderr)
+                [b] = self.batches()
+                self.assertEqual((b["endReason"], b["legsAttempted"]), ("AGENT_IDLE_BOUND_UNKNOWN", 0), b)
+                self.assertIn("published admission.leaseBatch.idleSec=", b["endDetail"])
+                self.assertEqual(self.kinds(), [f"OPEN:{b['token']}", f"CLOSE:{b['token']}"])
+
+    # ---------------------------------------------------------------- r4 (adversary r4 A1): the idle anchor is the agent job's end, not when this runner got round to it
+    def test_lease_batch_idle_end_r4_adv_a1_the_idle_allowance_starts_before_the_opens_liveness_cleanup(self) -> None:
+        # adversary-253ac155.json A1: the anchor was sampled after Stop-VenueJobLiveness -Remove, so a slow cleanup was not spent from the allowance. Agent bound 70, margin 60
+        # (10 s), a 6 s stall in that cleanup: the first probe may wait at most about 4 s.
+        self._tree_with_agent_idle(b"70")
+        self._patch_tree_runner("        if ($op.outcome -ceq 'RECEIPT' -or $op.outcome -ceq 'RECEIPT_BY_NAME' -or $op.outcome -ceq 'RETRACTED'",
+                                "        Start-Sleep -Seconds 6; if ($op.outcome -ceq 'RECEIPT' -or $op.outcome -ceq 'RECEIPT_BY_NAME' -or $op.outcome -ceq 'RETRACTED'")
+        r = self.run_batch(self.specs[:1], "-ProbeMaxWaitSec", "600")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        waits = self._in_lease_waits()
+        self.assertEqual(len(waits), 1, self.events_raw())
+        self.assertLessEqual(waits[0], 4, f"the open's liveness cleanup was not spent from the idle allowance: {waits}")
+
+    def test_lease_batch_idle_end_r4_adv_a1_the_idle_allowance_after_a_leg_starts_at_its_jobs_end(self) -> None:
+        # the sibling at the leg: the anchor was the leg child's return, after its own receipt work. Agent bound 70, margin 60, the child works 6 s after its job ended: the
+        # next probe may wait at most about 4 s (the job's endedUtc), not about 10.
+        self._tree_with_agent_idle(b"70")
+        r = self.run_batch(self.specs[:2], "-ProbeMaxWaitSec", "600", FAKE_LEG_TAIL_SLEEP="6")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        waits = self._in_lease_waits()
+        self.assertEqual(len(waits), 2, self.events_raw())
+        self.assertLessEqual(waits[1], 4, f"the leg child's work after its job was not spent from the idle allowance: {waits}")
 
     def test_lease_batch_idle_end_r3_adv_a1_a_long_claim_poll_sleep_stops_just_past_the_agents_idle_bound(self) -> None:
         # adversary r3 A1: the busy sleep used the loop top's room and -ClaimPollSec only, so a long poll slept far past the idle release (into a room-short end that hid it).
@@ -9112,9 +9222,12 @@ class LeaseEndUtcTimezoneTests(unittest.TestCase):
     def test_lease_batch_idle_end_r3_grok_g4_the_idle_clamp_reads_endedutc_through_the_helper_never_string(self) -> None:
         text = RUNNER.read_text(encoding="utf-8")
         at = text.index("$ie = Get-LeaseIdleEnd $token")
-        clamp = text[at:text.index("break", at)]
-        self.assertIn("$ieAt = ConvertTo-AgentUtc $ie.endedUtc", clamp, "the idle clamp takes the agent's instant from ConvertTo-AgentUtc")
-        self.assertIsNone(re.search(r"\[string\]\s*\$ie\.endedUtc", text), "[string] drops a DateTime's zone (and its fraction): the agent's endedUtc never goes through it")
+        self.assertIn("Set-BatchLeaseIdleEnded $b $ie ", text[at:text.index("break", at)], "r4 (Grok G9): the probe's idle end is typed through the one helper")
+        # r4 (Grok G9): the clamp lives in Set-BatchLeaseIdleEnded, shared by every site that types LEASE_IDLE_ENDED
+        at = text.index("function Set-BatchLeaseIdleEnded")
+        clamp = text[at:text.index("\n}\n", at)]
+        self.assertIn("$ieAt = ConvertTo-AgentUtc $Ie.endedUtc", clamp, "the idle clamp takes the agent's instant from ConvertTo-AgentUtc")
+        self.assertIsNone(re.search(r"(?i)\[string\]\s*\$ie\w*\.endedUtc", text), "[string] drops a DateTime's zone (and its fraction): the agent's endedUtc never goes through it")
         self.assertNotIn("TryParse", clamp, "the clamp parses nothing itself: ConvertTo-AgentUtc is the one reader")
         fn = text[text.index("function ConvertTo-AgentUtc"):]
         fn = fn[:fn.index("\n}\n") + 3]

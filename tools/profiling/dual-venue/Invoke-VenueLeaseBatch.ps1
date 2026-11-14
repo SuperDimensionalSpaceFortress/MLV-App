@@ -147,9 +147,12 @@
 # OPEN_JOB_WRITE_FAILED, or refused at its dispatch because the agent could admit it after the claim's last good expiry while the keeper is not renewing the claim:
 # OPEN_OUTLIVES_CLAIM (CLAIM_LOST when the keeper found it lost), no cancel, no close, no ledger charge); 10 the agent is not batch-capable (r3: or the agent script gives no
 # LeaseBatchIdleSec default, AGENT_IDLE_BOUND_UNKNOWN: nothing runs on the lease, it is closed); 14 (r3) -IdleEndedZeroLegMax consecutive batches ended LEASE_IDLE_ENDED with no leg
-# launched (LEASE_IDLE_CHURN: the venue stays busy past the agent's idle bound, so no further lease is opened); 11 an open left in the agent's gate was cancelled but never reconciled (OPEN_CANCEL_UNRECONCILED,
+# launched (LEASE_IDLE_CHURN: the venue stays busy past the agent's idle bound, so no further lease is opened); 15 (r4, Grok G6) the idle bound cannot hold the run's in-lease
+# waits (IDLE_BOUND_CONFIG_REFUSED: -ProbeIdleMarginSec at or above the agent's idle bound, or -CooldownSec at or above that bound less -ProbeIdleMarginSec, so the agent would
+# release the lease under a cooldown or every probe would get no wait). Checked against the agent script's default BEFORE any lease (BATCH_REFUSED on stderr, nothing submitted),
+# and again against the running agent's published idleSec once a lease is in hand (no probe or leg runs on it; the lease is closed); 11 an open left in the agent's gate was cancelled but never reconciled (OPEN_CANCEL_UNRECONCILED,
 # 7a); 12 an unexpected throw inside a batch after its claim was taken (BATCH_ERROR: the claim keeper is stopped, the claim released and the batch receipt written
-# first; a leg whose child had started is LEG_FAILED reason=BATCH_ERROR, the legs never started are NOT_RUN). A stopping code (2-6, 9, 10, 14) replaces 0 or 7; 12 replaces every other code but 11, and 11 replaces every other code.
+# first; a leg whose child had started is LEG_FAILED reason=BATCH_ERROR, the legs never started are NOT_RUN). A stopping code (2-6, 9, 10, 14, 15) replaces 0 or 7; 12 replaces every other code but 11, and 11 replaces every other code.
 # 13 a receipt file could not be written (batch-NN.json or batches.jsonl, e.g. occupied by a directory): RECEIPT_PERSIST_FAILED file=<path> reason=<msg> is logged once per failure, the summary still prints with
 # receiptPersistFailures, and every other code keeps its own meaning (13 replaces only a clean 0), so a lost receipt is never an exit 0. Each receipt is serialized with the live logWriteFailures (the diagnostic itself can fail to log).
 # r5: a receipt write the input guard skipped (an accepted input is a runner output) is a receiptPersistFailures entry too (reason WRITE_SUPPRESSED <stop reason>), and a hit seen at a receipt
@@ -197,6 +200,7 @@ param(
     [ValidateRange(0, 3600)][int]$ProbeMaxWaitSec = 600,
     # r3 (Grok G1 on #817): and never past the agent's idle bound for a parked lease (the running agent's admission.leaseBatch.idleSec, else the agent script's own
     # LeaseBatchIdleSec default: no copy here) less this margin, counted from the last agent job seen to end, so a probe's gate wait (no job) cannot outlast the lease
+    # r4 (Grok G6): at or above that bound is refused IDLE_BOUND_CONFIG_REFUSED (exit 15), as is a -CooldownSec at or above the bound less this margin
     [ValidateRange(0, 1800)][int]$ProbeIdleMarginSec = 60,
     # r3 (Grok G1): this many CONSECUTIVE batches that ended LEASE_IDLE_ENDED with no leg launched stop the run (LEASE_IDLE_CHURN, exit 14) instead of a lease after lease
     [ValidateRange(1, 100)][int]$IdleEndedZeroLegMax = 2,
@@ -1693,6 +1697,61 @@ function Get-LeaseIdleEnd([string]$Token, [string]$LeaseId) {
     $null
 }
 
+function Get-PublishedIdleBound($LeaseBatch) {
+    # r4 (Grok G7 on #817): admission.leaseBatch.idleSec as the running agent published it. ABSENT (an agent that predates the field) is the only case the caller may answer from
+    # the agent script's default; a key that is THERE but is not a whole number of seconds in 1..86400 (0, negative, too large, a string, a double, null) is INVALID: the running
+    # agent's bound is then unknown, and the caller fails closed (AGENT_IDLE_BOUND_UNKNOWN), never the repo copy's default.
+    $present = $false; $v = $null
+    if ($LeaseBatch -is [System.Collections.IDictionary]) { if ($LeaseBatch.Contains('idleSec')) { $present = $true; $v = $LeaseBatch['idleSec'] } }
+    elseif ($null -ne $LeaseBatch -and $null -ne $LeaseBatch.PSObject.Properties['idleSec']) { $present = $true; $v = $LeaseBatch.idleSec }
+    if (-not $present) { return [pscustomobject]@{ state = 'ABSENT'; sec = $null; text = 'absent' } }
+    if (($v -is [int] -or $v -is [long]) -and $v -gt 0 -and $v -le 86400) { return [pscustomobject]@{ state = 'VALID'; sec = [int]$v; text = [string]$v } }
+    [pscustomobject]@{ state = 'INVALID'; sec = $null; text = $(if ($null -eq $v) { 'null' } else { "$($v.GetType().Name) '$v'" }) }
+}
+
+function Get-IdleBoundConfigRefusal([int]$IdleSec, [string]$Source) {
+    # r4 (Grok G6 on #817): the in-lease waits this run's own parameters force on a parked lease, against the agent's idle bound. -ProbeIdleMarginSec at or above the bound leaves
+    # every in-lease probe no wait at all; a -CooldownSec at or above the bound less that margin sleeps inside the lease with no job past what the agent allows, so the agent
+    # releases the lease under every cooldown (one leg a lease, each a fresh lease and a ledger charge, and no churn guard fires: a leg was attempted). Refused, never run.
+    if ($ProbeIdleMarginSec -ge $IdleSec) { return "-ProbeIdleMarginSec $ProbeIdleMarginSec is at or above the agent's idle bound ${IdleSec} s ($Source): no in-lease probe could wait at all" }
+    if ($CooldownSec -ge $IdleSec - $ProbeIdleMarginSec) { return "-CooldownSec $CooldownSec is at or above the agent's idle bound ${IdleSec} s less -ProbeIdleMarginSec $ProbeIdleMarginSec ($Source): the agent would release the lease as idle during an in-lease cooldown" }
+    $null
+}
+
+function Get-AgentJobEndTs([long]$ObservedTs, [long]$FloorTs, $EndedUtc) {
+    # r4 (adversary r4 A1): the agent's idle clock restarts when ITS job ended, which is before this runner saw the result (um-run's return, the leg child's own receipt work, the
+    # open's liveness cleanup). The monotonic anchor is moved EARLIER by how long ago the agent says the job ended, never later than the instant it was observed and never before
+    # the job was sent ($FloorTs). An agent clock behind this host's only shortens the allowance; an unreadable endedUtc keeps the observed instant.
+    $ts = $ObservedTs
+    $at = ConvertTo-AgentUtc $EndedUtc
+    if ($null -ne $at) {
+        $ago = ([DateTime]::UtcNow - $at).TotalSeconds; $nowTs = [Diagnostics.Stopwatch]::GetTimestamp()
+        if ($ago -gt 0) { $cand = $nowTs - [long]($ago * [Diagnostics.Stopwatch]::Frequency); if ($cand -lt $ts) { $ts = $cand } }
+    }
+    if ($ts -lt $FloorTs) { $ts = $FloorTs }
+    $ts
+}
+
+function Set-BatchLeaseIdleEnded($B, $Ie, [string]$LegName, [string]$DetailTail, [string]$LogWhy, [switch]$AppendDetail) {
+    # r4 (Grok G9 on #817; adversary r4 A2): the ONE place a batch is typed LEASE_IDLE_ENDED, whichever site found the agent's idle release (the probe's receipt read, the batch end
+    # after a room-short loop top, a leg that ran off the lease). Every site gets the same three things: the lease's end clamped to the agent's endedUtc (read through
+    # ConvertTo-AgentUtc, never [string]), the reason and detail, and the LEASE_IDLE_ENDED log line (best effort: a log failure cannot turn the typed end into BATCH_ERROR).
+    $ieAt = ConvertTo-AgentUtc $Ie.endedUtc
+    if ($null -ne $ieAt -and $null -ne $script:leaseEnd -and $ieAt -lt $script:leaseEnd) { $script:leaseEnd = $ieAt; $B.leaseEndUtc = $ieAt.ToString('o') }
+    $what = "the agent released lease $($B.leaseId) as idle (endedUtc=$($Ie.endedUtc) heldSec=$($Ie.heldSec) why=$($Ie.why)) $DetailTail"
+    $B.endReason = 'LEASE_IDLE_ENDED'
+    $B.endDetail = $(if ($AppendDetail -and $B.endDetail) { "$($B.endDetail); $what" } else { $what })
+    LogBest "LEASE_IDLE_ENDED batch=$($B.batch) leg=$LegName lease=$($B.leaseId) endedUtc=$($Ie.endedUtc) heldSec=$($Ie.heldSec) ($LogWhy)"
+}
+
+# r4 (Grok G6 on #817): the run's own in-lease waits are checked against the agent's idle bound BEFORE any lease is asked for (the agent script's default here: the running
+# agent's published bound is read once a lease is in hand and checked again there). Nothing is submitted, claimed or written on a refusal.
+$preIdleSec = Get-AgentLeaseBatchIdleSec (Join-Path $here '..\bachelor\ultra-magnus-agent.ps1')
+if ($null -ne $preIdleSec) {
+    $preIdleRefusal = Get-IdleBoundConfigRefusal $preIdleSec 'the agent script default'
+    if ($preIdleRefusal) { [Console]::Error.WriteLine("BATCH_REFUSED IDLE_BOUND_CONFIG_REFUSED $preIdleRefusal (before any lease: nothing submitted)"); try { Complete-VenueProcess -ExitCode 15 } catch { }; exit 15 }
+}
+
 $pending = [System.Collections.Generic.List[object]]::new()
 foreach ($p in $plan) { $pending.Add($p) }
 # r5 (V-01, Invoke-VenueChain's r4 rule): leg name -> the first FOREIGN_FLOOR line any probe of that leg printed, in any attempt or batch. Sticky: a leg
@@ -2054,6 +2113,7 @@ while ($pending.Count -gt 0 -and $null -eq $stopReason) {
     # the sidecar was checked) means nothing was sent. r16 (sol r15 B1; hub ruling 08:18:44Z): submitted = um-run.ps1 was called for it ($script:umRunCalled), not merely
     # Submit-AgentJob: a job file that could not be created or written here (JOB_WRITE_FAILED) reached no one.
     $op = $null; $leaseStartUtc = $null; $openSubmitUtc = $null; $openLive = $null; $cr = $null; $inFlightLeg = $null
+    $openSubmitTs = 0L; $openResultTs = $null   # r4 (adversary r4 A1): monotonic instants of the open's submit and of its result's return (the idle anchor, Get-AgentJobEndTs)
     # r5 (key3 F1): the try opens IMMEDIATELY after the keeper starts, so every throw from here on ends with the keeper stopped, the claim released and the batch
     # receipt written (the finally), and as a typed exit 12 (the catch). A throw outside it left the keeper runspace renewing the claim of a process that had died.
     try {
@@ -2070,7 +2130,7 @@ while ($pending.Count -gt 0 -and $null -eq $stopReason) {
         $b.openJobId = "lease-batch-open-$stamp-lb$token"
         $wait = [int][Math]::Max(60.0, [Math]::Min([double]$OpenAdmissionWaitSec, ($deadline - [DateTime]::UtcNow).TotalSeconds))
         L "BATCH_OPEN_SUBMIT batch=$batchNo token=$token job=$($b.openJobId) admissionWaitSec=$wait (the agent requests the lease; heavy-slot.py's cooldown is waited out there)"
-        $openSubmitUtc = [DateTime]::UtcNow
+        $openSubmitUtc = [DateTime]::UtcNow; $openSubmitTs = [Diagnostics.Stopwatch]::GetTimestamp()
         # r4 (sol r3 B1): the open carries the batch deadline as notAfterUtc, so no lease is taken for it after the deadline, whether or not the agent answers
         # the cancel below. The close job carries none: it must still run after the deadline.
         $b.openNotAfterUtc = $deadline.ToString('o')
@@ -2095,6 +2155,7 @@ while ($pending.Count -gt 0 -and $null -eq $stopReason) {
             $op = [pscustomobject]@{ outcome = 'NOT_SUBMITTED'; result = $null; message = "first liveness write $($openLive.first.state)$(if ($openLive.first.error) { ": $($openLive.first.error)" })$(if ($crossed) { ", but the batch deadline passed first (the sidecar is live; read-back: $($rb.why))" } elseif ($null -ne $rb -and -not $rb.live) { ", but the agent's own parser does not read it as live (read-back $($rb.livenessState)): $($rb.why)" })" }
         } else {
             $op = Submit-AgentJob $b.openJobId "Write-Output ('LEASE_BATCH_OPEN token=$token held=' + [string]`$env:HEAVY_SLOT_HELD + ' admission=' + [string]`$env:MLV_AGENT_ADMISSION)" 120 $wait $b.openNotAfterUtc -Open
+            $openResultTs = [Diagnostics.Stopwatch]::GetTimestamp()   # r4 (adversary r4 A1): before the liveness cleanup and the guards below, which spend the agent's idle time too
         }
         if ($op.outcome -ceq 'UNRESOLVED' -and $op.message -match 'admission gate') {
             # CAPS d: um-run stopped while the agent still holds the open in its gate, re-asking a refused (exit 75) request. That is a wait, not a failure:
@@ -2109,7 +2170,7 @@ while ($pending.Count -gt 0 -and $null -eq $stopReason) {
             L "BATCH_OPEN_STILL_WAITING batch=$batchNo job=$($b.openJobId) (held in the agent's admission gate: exit 75 is wait-and-retry; reading its result by name until $($deadline.ToString('o')))"
             while ($true) {
                 $jr = Get-VenueJobResult -AgentShare $AgentShare -JobId $b.openJobId
-                if ($jr.state -ceq 'FOUND') { $op = [pscustomobject]@{ outcome = 'RECEIPT_BY_NAME'; result = $jr.result; message = $null }; break }
+                if ($jr.state -ceq 'FOUND') { $openResultTs = [Diagnostics.Stopwatch]::GetTimestamp(); $op = [pscustomobject]@{ outcome = 'RECEIPT_BY_NAME'; result = $jr.result; message = $null }; break }
                 if ([DateTime]::UtcNow.AddSeconds($ClaimPollSec) -ge $deadline) { break }
                 Start-Sleep -Seconds $ClaimPollSec
             }
@@ -2190,16 +2251,27 @@ while ($pending.Count -gt 0 -and $null -eq $stopReason) {
             # r3 (Grok G1 on #817): the agent releases this lease after LeaseBatchIdleSec with no job, and a probe's gate wait submits none, so no in-lease probe may wait past that
             # bound less -ProbeIdleMarginSec, counted from the last agent job this runner saw end under the lease (Get-IdleAllowanceSec). r3 pass 2 (adversary A2): the bound is
             # the RUNNING agent's own, published in admission.leaseBatch.idleSec; an agent that predates the field gives the agent script's param default. Neither: nothing runs.
-            $pubIdle = $adm.leaseBatch.idleSec
-            $batchIdleSec = $(if (($pubIdle -is [int] -or $pubIdle -is [long]) -and $pubIdle -gt 0 -and $pubIdle -le 86400) { [int]$pubIdle } else {
-                if ($null -eq $agentIdleSec) { $agentIdleSec = Get-AgentLeaseBatchIdleSec (Join-Path $here '..\bachelor\ultra-magnus-agent.ps1') }; $agentIdleSec })
+            # r4 (Grok G7): only an ABSENT field falls back to the script default; a field that is there but invalid fails closed below (the running agent's bound is unknown)
+            $pubIdle = Get-PublishedIdleBound $adm.leaseBatch
+            $batchIdleSec = $(if ($pubIdle.state -ceq 'VALID') { $pubIdle.sec } elseif ($pubIdle.state -ceq 'ABSENT') {
+                if ($null -eq $agentIdleSec) { $agentIdleSec = Get-AgentLeaseBatchIdleSec (Join-Path $here '..\bachelor\ultra-magnus-agent.ps1') }; $agentIdleSec } else { $null })
             if ($null -eq $batchIdleSec) {
-                $b.endReason = 'AGENT_IDLE_BOUND_UNKNOWN'; $b.endDetail = "the agent published no admission.leaseBatch.idleSec and its script ($(Join-Path $here '..\bachelor\ultra-magnus-agent.ps1')) gives no LeaseBatchIdleSec default: no probe or leg runs on lease $($b.leaseId)"
-                Set-Stop 'AGENT_IDLE_BOUND_UNKNOWN' 10; LogBest "AGENT_IDLE_BOUND_UNKNOWN batch=$batchNo lease=$($b.leaseId) (no probe or leg runs on it; the lease is closed)"
+                $b.endReason = 'AGENT_IDLE_BOUND_UNKNOWN'
+                $b.endDetail = $(if ($pubIdle.state -ceq 'INVALID') { "the agent published admission.leaseBatch.idleSec=$($pubIdle.text), not a whole number of seconds in 1..86400: its idle bound is unknown, so no probe or leg runs on lease $($b.leaseId)" }
+                    else { "the agent published no admission.leaseBatch.idleSec and its script ($(Join-Path $here '..\bachelor\ultra-magnus-agent.ps1')) gives no LeaseBatchIdleSec default: no probe or leg runs on lease $($b.leaseId)" })
+                Set-Stop 'AGENT_IDLE_BOUND_UNKNOWN' 10; LogBest "AGENT_IDLE_BOUND_UNKNOWN batch=$batchNo lease=$($b.leaseId) published=$($pubIdle.text) (no probe or leg runs on it; the lease is closed)"
+            } else {
+                # r4 (Grok G6): the bound the run actually uses (the published one may be tighter than the script default checked before the lease)
+                $idleRefusal = Get-IdleBoundConfigRefusal $batchIdleSec $(if ($pubIdle.state -ceq 'VALID') { 'published by the running agent' } else { 'the agent script default' })
+                if ($idleRefusal) {
+                    $b.endReason = 'IDLE_BOUND_CONFIG_REFUSED'; $b.endDetail = "${idleRefusal}: no probe or leg runs on lease $($b.leaseId)"
+                    Set-Stop 'IDLE_BOUND_CONFIG_REFUSED' 15; LogBest "IDLE_BOUND_CONFIG_REFUSED batch=$batchNo lease=$($b.leaseId) idleSec=$batchIdleSec probeIdleMarginSec=$ProbeIdleMarginSec cooldownSec=$CooldownSec (no probe or leg runs on it; the lease is closed)"
+                }
             }
             $probeIdleCap = $(if ($null -ne $batchIdleSec) { [int]$batchIdleSec - $ProbeIdleMarginSec } else { 0 })
-            # the open's job ended no later than its result was read; r3 adversary pass 2 A1: from THAT instant, so the guard and the BATCH_OPEN log append since are spent too
-            $idleAnchorTs = $openReadTs
+            # the open's job ended no later than its result was read; r3 adversary pass 2 A1: from THAT instant, so the guard and the BATCH_OPEN log append since are spent too.
+            # r4 (adversary r4 A1): the instant the result RETURNED (before the liveness cleanup), moved earlier to the agent's own endedUtc for the open (Get-AgentJobEndTs)
+            $idleAnchorTs = Get-AgentJobEndTs $(if ($null -ne $openResultTs) { $openResultTs } else { $openReadTs }) $openSubmitTs $op.result.endedUtc
             $attempt = 0
             $launchShort = $false
             while ($pending.Count -gt 0 -and $null -eq $b.endReason) {
@@ -2261,12 +2333,9 @@ while ($pending.Count -gt 0 -and $null -eq $stopReason) {
                 # above was taken on a lease that is gone. No leg is launched on it and no more room is counted: the batch ends typed (never LEASE_LOST) and the leg goes to the next batch.
                 $ie = Get-LeaseIdleEnd $token ([string]$b.leaseId)
                 if ($null -ne $ie) {
-                    # r2 (adversary r2 A2, opus r1 H1): the agent's instant by what ConvertFrom-Json handed back, never through [string] (that drops a DateTime's zone)
-                    $ieAt = ConvertTo-AgentUtc $ie.endedUtc
-                    if ($null -ne $ieAt -and $ieAt -lt $leaseEnd) { $leaseEnd = $ieAt; $b.leaseEndUtc = $leaseEnd.ToString('o') }
-                    $b.endReason = 'LEASE_IDLE_ENDED'; $b.endDetail = "the agent released lease $($b.leaseId) as idle (endedUtc=$($ie.endedUtc) heldSec=$($ie.heldSec) why=$($ie.why)) while the probe for leg $($leg.name) waited: no leg launched, it goes to the next batch"
-                    # r2 (adversary r2 A1): best effort, so a batch.log append failure cannot turn the typed end into BATCH_ERROR and drop the pending leg
-                    LogBest "LEASE_IDLE_ENDED batch=$batchNo leg=$($leg.name) lease=$($b.leaseId) endedUtc=$($ie.endedUtc) heldSec=$($ie.heldSec) (the probe's reading is void: no leg launched, no more room counted)"
+                    # r2 (adversary r2 A2, opus r1 H1): the agent's instant by what ConvertFrom-Json handed back, never through [string] (that drops a DateTime's zone); r2 (adversary r2 A1):
+                    # the log line is best effort. r4 (Grok G9): both live in Set-BatchLeaseIdleEnded, shared with every other site that types this end
+                    Set-BatchLeaseIdleEnded $b $ie $leg.name "while the probe for leg $($leg.name) waited: no leg launched, it goes to the next batch" "the probe's reading is void: no leg launched, no more room counted"
                     break
                 }
                 # adversary r2b A3: the leg's thermal state is made here, so the first KNOWN heat reading counts even from a busy (COOLDOWN_UNMET) probe: heatAtProbe is
@@ -2391,7 +2460,7 @@ while ($pending.Count -gt 0 -and $null -eq $stopReason) {
                     else { $b.endReason = 'LEASE_REMAINING_SHORT'; $b.endDetail = "at the launch of leg $($leg.name): roomSec=$roomAtLaunch < legBudgetSec=$legBudget (leaseMarginSec=$LeaseMarginSec): it goes to the next batch" }
                     break
                 }
-                $tLeg = [DateTime]::UtcNow
+                $tLeg = [DateTime]::UtcNow; $tLegTs = [Diagnostics.Stopwatch]::GetTimestamp()
                 # r3 (sol r2 B2): the leg runs only while the lease does. It is a bounded child: still running at the lease's end, it is killed with its whole
                 # process tree (Kill($true), Invoke-VenueBoundedProcess) and typed LEASE_EXPIRED below. The agent stops its job at the same bound (lease-batch r3).
                 $legBoundSec = [int][Math]::Max(1, [Math]::Floor(($leaseEnd - [DateTime]::UtcNow).TotalSeconds))
@@ -2401,7 +2470,7 @@ while ($pending.Count -gt 0 -and $null -eq $stopReason) {
                     if ($_.Exception -is [ComponentModel.Win32Exception] -or $_.Exception.InnerException -is [ComponentModel.Win32Exception]) { $inFlightLeg = $null }
                     throw
                 }
-                $idleAnchorTs = [Diagnostics.Stopwatch]::GetTimestamp()   # r3 pass 2 (adversary A1): the leg's agent job has ended: the agent's idle clock restarts
+                $idleAnchorTs = [Diagnostics.Stopwatch]::GetTimestamp()   # r3 pass 2 (adversary A1): the leg's agent job has ended: the agent's idle clock restarts (r4: moved to the job's endedUtc below)
                 $text = [string]$lp.stdout + [string]$lp.stderr   # r7: read from the child, never back from the file, whose write the guard may refuse
                 if (Test-RunDirWrite $out) { [IO.File]::WriteAllText($out, $text, [Text.UTF8Encoding]::new($false)) }
                 $legCode = $lp.exit
@@ -2449,6 +2518,8 @@ while ($pending.Count -gt 0 -and $null -eq $stopReason) {
                     $withdraw = $wx.state
                     L "LEG_WITHDRAWN leg=$($leg.name) batch=$batchNo jobId=$legJobId result=$($jr.state) printedOutcome=$outcome cancel=$($wx.state)$(if ($wx.error) { " error=$($wx.error)" })"
                 }
+                # r4 (adversary r4 A1): the agent's idle clock restarted when the leg's JOB ended, before the leg child wrote its receipt and exited
+                if ($jr.state -ceq 'FOUND' -and $null -ne $jr.result) { $idleAnchorTs = Get-AgentJobEndTs $idleAnchorTs $tLegTs $jr.result.endedUtc }
                 $ja = $(if ($jr.state -ceq 'FOUND') { $jr.result.admission } else { $null })
                 $jobLease = $(if ($null -ne $ja -and $null -ne $ja.leaseBatch) { [string]$ja.leaseBatch.leaseId } else { $null })
                 # r12 (adversary r11 A2): the lease id is compared ORDINALLY (-ceq is case-sensitive but culture-aware: a soft hyphen made another lease the batch's own); blank is no lease
@@ -2460,8 +2531,10 @@ while ($pending.Count -gt 0 -and $null -eq $stopReason) {
                 if ($null -ne $gap -and ($null -eq $b.renewOkMaxGapSec -or $gap -gt $b.renewOkMaxGapSec)) { $b.renewOkMaxGapSec = $gap }
                 # r3: the agent's own bound (lease-batch r3) stopped the job at its lease's end, on a demoted lease or a lost one: typed as such, never counted.
                 $agentStop = $(if ($null -ne $ja -and $null -ne $ja.leaseStop) { [string]$ja.leaseStop.reason } else { $null })
+                # r4 (adversary r4 A2 sibling): the idle record is kept, so the batch end below types it through Set-BatchLeaseIdleEnded (the clamp and the log line too)
+                $legIe = $(if (-not $agentStop -and -not $onLease) { Get-LeaseIdleEnd $token ([string]$b.leaseId) } else { $null })
                 $leaseClass = $(if ($agentStop) { switch ($agentStop) { 'lease-end' { 'LEASE_EXPIRED' } 'demoted' { 'LEASE_DEMOTED' } default { 'LEASE_LOST' } } }
-                    elseif (-not $onLease) { $(if ($null -ne (Get-LeaseIdleEnd $token ([string]$b.leaseId))) { 'LEASE_IDLE_ENDED' } else { 'LEASE_LOST' }) } elseif ($null -eq $gap) { 'LEASE_RENEW_UNKNOWN' } elseif ($gap -gt $RenewGapMaxSec) { 'LEASE_DEMOTED' } else { $null })
+                    elseif (-not $onLease) { $(if ($null -ne $legIe) { 'LEASE_IDLE_ENDED' } else { 'LEASE_LOST' }) } elseif ($null -eq $gap) { 'LEASE_RENEW_UNKNOWN' } elseif ($gap -gt $RenewGapMaxSec) { 'LEASE_DEMOTED' } else { $null })
                 $leaseWhy = "jobId=$legJobId result=$($jr.state)$(if ($withdraw) { " withdraw=$withdraw" }) jobLease=$jobLease slotContinuity=$(if ($ja) { $ja.slotContinuity }) renewOkMaxGapSec=$(if ($null -ne $gap) { $gap } else { 'UNKNOWN' })$(if ($agentStop) { " leaseStop=$agentStop" })$(if ($jr.error) { " error=$($jr.error)" })"
                 # r3 (fable r2): a leg whose job took a fresh lease under this token carries that request's exit-75 refusals; the batch receipt counts them too.
                 $legRef = $(if ($null -ne $ja) { @(@($ja.leaseRefusals) | Where-Object { $null -ne $_ -and [string]$_.rc -eq '75' }).Count } else { 0 })
@@ -2472,6 +2545,7 @@ while ($pending.Count -gt 0 -and $null -eq $stopReason) {
                     $b.legs.Add([pscustomobject][ordered]@{ batch = $batchNo; attempt = $attempt; status = 'RETRY'; outcome = $outcome; thermalWaitSec = $th.doneWaitSec; receipt = $receipt; jobId = $legJobId; jobLease = $jobLease; onLease = $onLease; renewOkMaxGapSec = $gap; counted = $false; legSec = $legSec; exit75Refusals = $legRef; withdraw = $withdraw; heatAtProbe = $th.firstHeat; heatAtProbeText = $th.firstHeatText })   # r6 (adversary r6 A2)
                     Add-PlanIdentity $b.legs[$b.legs.Count - 1] $leg
                     L "RETRY_IN_LEASE leg=$($leg.name) batch=$batchNo reason=LEG_NOT_QUIESCENT receipt=$receipt onLease=$onLease $leaseWhy"
+                    if ($leaseClass -ceq 'LEASE_IDLE_ENDED') { $b.endDetail = $leaseWhy; Set-BatchLeaseIdleEnded $b $legIe $leg.name "before leg $($leg.name)'s job was admitted: it ran off the lease, uncounted" 'a leg ran off the lease: uncounted' -AppendDetail; break }
                     if ($leaseClass) { $b.endReason = $leaseClass; $b.endDetail = $leaseWhy; break }
                     continue
                 }
@@ -2498,6 +2572,7 @@ while ($pending.Count -gt 0 -and $null -eq $stopReason) {
                 Add-PlanIdentity $b.legs[$b.legs.Count - 1] $leg
                 $b.legsRan++; if ($counted) { $b.legsCounted++ }
                 L "LEG $($leg.name) RAN batch=$batchNo exit=$legCode outcome=$outcome class=$class counted=$counted quietMean=$(Format-Mean $q.mean) preLoadMean=$(Format-Mean $preLoad) legSec=$legSec receipt=$receipt $leaseWhy$(if ($legFF) { ' foreignFloor=1' })"
+                if ($leaseClass -ceq 'LEASE_IDLE_ENDED') { $b.endDetail = $leaseWhy; Set-BatchLeaseIdleEnded $b $legIe $leg.name "before leg $($leg.name)'s job was admitted: it ran off the lease, uncounted" 'a leg ran off the lease: uncounted' -AppendDetail; break }
                 if ($leaseClass) { $b.endReason = $leaseClass; $b.endDetail = $leaseWhy; break }
                 if ($pending.Count -gt 0 -and $CooldownSec -gt 0) { L "COOLDOWN ${CooldownSec} s (inside the lease)"; Start-Sleep -Seconds $CooldownSec }
             }
@@ -2506,7 +2581,8 @@ while ($pending.Count -gt 0 -and $null -eq $stopReason) {
             # lease as idle, that is the end (LEASE_IDLE_ENDED, and it counts toward -IdleEndedZeroLegMax), never a room-short one that hides it.
             if ($b.endReason -ceq 'LEASE_REMAINING_SHORT') {
                 $ieS = Get-LeaseIdleEnd $token ([string]$b.leaseId)
-                if ($null -ne $ieS) { $b.endReason = 'LEASE_IDLE_ENDED'; $b.endDetail = "$($b.endDetail); the agent had released lease $($b.leaseId) as idle (endedUtc=$($ieS.endedUtc) heldSec=$($ieS.heldSec) why=$($ieS.why))" }
+                # r4 (Grok G9): typed through the one helper, so this end clamps leaseEndUtc and logs LEASE_IDLE_ENDED exactly as the in-loop end does
+                if ($null -ne $ieS) { Set-BatchLeaseIdleEnded $b $ieS $(if ($pending.Count -gt 0) { $pending[0].name } else { '' }) 'before the batch ended room-short: the end is the idle release' 'found at the batch end: the room-short end came after the idle release' -AppendDetail }
             }
             # A FRESH lease with no room for even one leg can never run it: stop rather than open lease after lease.
             # adversary r1 A1: a batch that ran out of room WAITING FOR HEAT (or skipping hot legs) had room for a leg: not a leg budget no lease can hold
