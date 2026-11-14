@@ -232,10 +232,14 @@ function Invoke-Bounded([scriptblock]$Script, [object[]]$ArgList, [double]$Sec) 
     [void]$ps.AddScript($Script.ToString())
     foreach ($a in $ArgList) { [void]$ps.AddArgument($a) }
     $async = $ps.BeginInvoke()
-    if (-not $async.AsyncWaitHandle.WaitOne([TimeSpan]::FromSeconds($Sec))) {
+    # VENUE-STAGE-SAME-SHA-RESTAGE-GUARD-1 r12 (adversary A1 on 7754d16e, siblings :235/:255/:467): $Sec is a remainder the caller sampled before this call, so the wait
+    # also ends at the deadline itself, sampled right before it (capCut: the deadline, not $Sec, is what ended it; the caller types that STAGE_CAP_EXCEEDED)
+    $waitSec = $Sec; $capCut = $false
+    if ($null -ne $script:Deadline) { $dl = ($script:Deadline - [DateTime]::UtcNow).TotalSeconds; if ($dl -lt $waitSec) { $waitSec = [Math]::Max(0.0, $dl); $capCut = $true } }
+    if (-not $async.AsyncWaitHandle.WaitOne([TimeSpan]::FromSeconds($waitSec))) {
         try { [void]$ps.BeginStop($null, $null) } catch { }
         & (Get-Module VenueChain) { $script:VenueAbandonedReads++ }
-        return [pscustomobject]@{ ok = $false; timedOut = $true; value = $null; error = "no answer in $([Math]::Round($Sec, 2)) s" }
+        return [pscustomobject]@{ ok = $false; timedOut = $true; capCut = $capCut; value = $null; error = "no answer in $([Math]::Round($waitSec, 2)) s" }
     }
     try { $v = @($ps.EndInvoke($async)); [pscustomobject]@{ ok = $true; timedOut = $false; value = $(if ($v.Count -gt 0) { $v[0] } else { $null }); error = $null } }
     catch { [pscustomobject]@{ ok = $false; timedOut = $false; value = $null; error = $_.Exception.Message } }
@@ -254,7 +258,7 @@ function Read-Share([string]$What, [scriptblock]$Script, [object[]]$ArgList) {
     # A bounded by-name read; a share that does not answer ends the call SHARE_UNREACHABLE (STAGE_CAP_EXCEEDED when what it was given was the rest of the cap).
     $sec = Get-ProbeSec $What
     $b = Invoke-Bounded $Script $ArgList $sec
-    if ($b.timedOut -and $sec -lt $ProbeTimeoutSec) { Stop-Nightly 'STAGE_CAP_EXCEEDED' "reading $What : $($b.error), the rest of the $MaxTotalSec s cap" }
+    if ($b.timedOut -and ($sec -lt $ProbeTimeoutSec -or $b.capCut)) { Stop-Nightly 'STAGE_CAP_EXCEEDED' "reading $What : $($b.error), the rest of the $MaxTotalSec s cap" }
     if ($b.timedOut) { Stop-Nightly 'SHARE_UNREACHABLE' "reading $What : $($b.error)" }
     if (-not $b.ok) { Stop-Nightly 'SHARE_UNREACHABLE' "reading $What failed: $($b.error)" }
     # r9 fix iteration (adversary A1 on be203fe6, sibling): an answer that arrived after the deadline is never acted on
@@ -297,7 +301,7 @@ function Read-StagedSoundness([string]$When, [switch]$FinalVerify) {
     $script:SoundnessReads++
     $delayMs =$(if ($script:SoundnessReads -eq 1) { $TestSoundnessReadDelayMs } else { 0 })
     $artDelayMs = $(if (($TestSoundnessArtifactDelayAt -ieq 'first' -and $script:SoundnessReads -eq 1) -or ($TestSoundnessArtifactDelayAt -ieq 'final' -and $FinalVerify)) { $TestSoundnessArtifactDelayMs } else { 0 })
-    $r = try { Get-VenueStagedBuildManifest -AgentShare $share -SourceCommit $commit -VerifyArtifacts -TimeoutSec $soundSec -ArtifactTimeoutSec 300 -CallCapSec $capSec -TestReadDelayMs $delayMs -TestArtifactDelayMs $artDelayMs } catch { [pscustomobject]@{ state = 'UNREACHABLE'; error = ($_.Exception.Message -replace '\s+', ' ') } }
+    $r = try { Get-VenueStagedBuildManifest -AgentShare $share -SourceCommit $commit -VerifyArtifacts -TimeoutSec $soundSec -ArtifactTimeoutSec 300 -CallCapSec $capSec -CallDeadlineUtc $script:Deadline -TestReadDelayMs $delayMs -TestArtifactDelayMs $artDelayMs } catch { [pscustomobject]@{ state = 'UNREACHABLE'; error = ($_.Exception.Message -replace '\s+', ' ') } }
     $leftAfter = ($script:Deadline - [DateTime]::UtcNow).TotalSeconds
     if ($r.state -ceq 'UNREACHABLE' -and $leftAfter -lt 1.0) { Stop-Nightly 'STAGE_CAP_EXCEEDED' "the soundness read of the staged build of $commit $When ran to the end of the $MaxTotalSec s cap (the manifest read $([Math]::Round($soundSec, 2)) s, the artifact hash at most 300 s, $([Math]::Round($capSec, 2)) s in all) and the cap ran out with no answer ($([Math]::Floor([Math]::Max(0.0, $leftAfter) * 100.0) / 100.0) s left): $($r.error); $notDone" }
     # r9 fix iteration (adversary A1 on be203fe6): the module bounds the read by -CallCapSec on its OWN clock, started when it is called, so a scheduling delay
@@ -466,7 +470,7 @@ function Assert-VenueFree([string]$Before) {
 Assert-VenueFree 'before anything was built'
 $reachSec = Get-ProbeSec "the agent share cache '$cache'"
 $reach = Invoke-Bounded { param($p) Test-Path -LiteralPath $p -PathType Container } @($cache) $reachSec
-if ($reach.timedOut -and $reachSec -lt $ProbeTimeoutSec) { Stop-Nightly 'STAGE_CAP_EXCEEDED' "the agent share cache '$cache' did not answer in $($reach.error), the rest of the $MaxTotalSec s cap" }
+if ($reach.timedOut -and ($reachSec -lt $ProbeTimeoutSec -or $reach.capCut)) { Stop-Nightly 'STAGE_CAP_EXCEEDED' "the agent share cache '$cache' did not answer in $($reach.error), the rest of the $MaxTotalSec s cap" }
 if (-not $reach.ok -or $reach.value -ne $true) { Stop-Nightly 'SHARE_UNREACHABLE' "the agent share cache '$cache' did not answer as a directory ($(if ($reach.error) { $reach.error } else { 'not found' }))" }
 if (([DateTime]::UtcNow - $script:Deadline).TotalSeconds -ge 0.0) { Stop-Nightly 'STAGE_CAP_EXCEEDED' "the agent share cache '$cache' answered after the $MaxTotalSec s cap ran out; an answer past the cap is never acted on" }
 

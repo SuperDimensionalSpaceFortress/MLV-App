@@ -1236,14 +1236,17 @@ function Get-InputContentRefusal {
             # for its hash): a hash the preflight accepted (310 s of a 519 s room) is never refused for a 300 s cap under the room
             $share = 300
             # r10 (sol r9 B1): 330.0, never 330 -- an integer first operand selects [Math]::Min's Int32 overload and rounds the double room (2.3 s -> 2, under the hash's 2 s minimum)
-            if ($null -ne $script:guardBudget) { $share = [Math]::Min(330.0, $script:guardBudget.sec - $script:guardBudget.clock.Elapsed.TotalSeconds) }
+            # VENUE-STAGE-SAME-SHA-RESTAGE-GUARD-1 r12 (adversary A1 on 7754d16e, sibling :1239): the share's END goes over too, as an instant taken with the remainder
+            # (-CallDeadlineUtc), so nothing between this sample and the call's own clock start moves the read's end past the budget's
+            $shareDeadline = $null
+            if ($null -ne $script:guardBudget) { $share = [Math]::Min(330.0, $script:guardBudget.sec - $script:guardBudget.clock.Elapsed.TotalSeconds); $shareDeadline = [DateTime]::UtcNow.AddSeconds([Math]::Max(0.0, $share)) }
             if ($share -lt $script:GuardReadMinSec) { return [pscustomobject]@{ kind = 'content'; item = $g.item; code = $script:guardBudget.code; noAnswer = $true; noRoom = $true; readAbandoned = $false; why = "no time is left in $($script:guardBudget.what) to read and hash the staged build for $short; no leg runs on it" } }
             # r5 (key3 r4 B1): no artifact hash while no claim is held (a budget with artifactsOff); the manifest itself is still re-read and compared
             $verifyArtifacts = -not ($null -ne $script:guardBudget -and $script:guardBudget.artifactsOff)
             # r12 (#704 merge): nor at a receipt write (Test-ReceiptWriteSuppressed): the legs already ran, and the artifacts were hashed under the claim and after the open
             if ($script:receiptGuardActive) { $verifyArtifacts = $false }
             $abandonedBefore = & (Get-Module VenueChain) { $script:VenueAbandonedReads }; $shareClock = [Diagnostics.Stopwatch]::StartNew()
-            $st = Get-VenueStagedBuildManifest -AgentShare $AgentShare -SourceCommit $g.commit -TimeoutSec $share -VerifyArtifacts:$verifyArtifacts -ArtifactMinSec $script:GuardReadMinSec -ProbeScript $stagedBuildProbe -ArtifactProbeScript $artifactProbe
+            $st = Get-VenueStagedBuildManifest -AgentShare $AgentShare -SourceCommit $g.commit -TimeoutSec $share -VerifyArtifacts:$verifyArtifacts -ArtifactMinSec $script:GuardReadMinSec -ProbeScript $stagedBuildProbe -ArtifactProbeScript $artifactProbe -CallDeadlineUtc $shareDeadline
             $within = $(if ($null -ne $script:guardBudget) { "a $([Math]::Round($share, 2)) s share of $($script:guardBudget.what)" } else { "a ${share} s bound" })
             # #705 r14 (adversary r14 A1 sibling): a bounded manifest read or hash given up on under a guard budget is a read still held on the manifest's share, so its location is
             # left unknown as Invoke-InputGuard leaves it for a worker given up on (a "no time left" refusal gave up on no read, and keeps the location it verified)

@@ -992,7 +992,10 @@ class VenueStageNightlyTests(unittest.TestCase):
         self.stage_cache()
         p = self.run_driver("-TestSoundnessCapLeftSec", "4", "-TestSoundnessPostCapDelayMs", "5000", "-TestSoundnessCapAt", "first", probe="5")
         self.assert_exit(p, "STAGE_CAP_EXCEEDED")
-        self.assertRegex(p.stdout, rf"the soundness read of the staged build of {SHA} before anything was built answered STAGED [0-9.]+ s after the \d+ s cap ran out; an answer past the cap is never acted on; nothing was submitted")
+        # r12 (adversary A1 on 7754d16e): the nightly now hands the deadline itself over (-CallDeadlineUtc), so the call starts with the deadline already past and makes
+        # no read at all; before r12 it read and answered STAGED after the deadline, and only the late-answer check below the call refused it.
+        self.assertRegex(p.stdout, rf"the soundness read of the staged build of {SHA} before anything was built ran to the end of the \d+ s cap .*the staged manifest could not be read: no time is left of -CallCapSec [0-9.]+ \(-CallDeadlineUtc [0-9T:.-]+Z\).*; nothing was submitted")
+        self.assertNotIn("answered STAGED", p.stdout)
         self.assertNotIn("STAGE_SKIP_ALREADY", [r["outcome"] for r in self.rows()])
         self.nothing_built_or_submitted()
 
@@ -1059,17 +1062,89 @@ class VenueStageNightlyTests(unittest.TestCase):
         p = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", ps], capture_output=True, text=True, timeout=120, stdin=subprocess.DEVNULL)
         self.assertIn("STATE=STAGED ARTIFACT=[] ERROR=[]", p.stdout, p.stdout + p.stderr)
 
-    def test_r10_a1_the_predicate_source_is_never_read_inside_a_capped_call(self) -> None:
-        # r10 fix iteration (adversary A1 on a4b659de, VenueChain.psm1:677/:608): the first Get-VenueStagedBuildManifest read AttrCudaArtifacts.psm1 for the
-        # claim-shape predicate on the caller's thread, before its -CallCapSec check, so a slow share held a 5 s call as long as the read took. Join-Path (on
-        # that read's path) is shadowed to take 6 s from before the import: the import may take it, the 5 s call may not.
-        ps = ("function global:Join-Path { [Threading.Thread]::Sleep(6000); Microsoft.PowerShell.Management\\Join-Path @args }; "
-              f"Import-Module '{DRIVER.parent / 'VenueChain.psm1'}' -Force -DisableNameChecking; $sw = [Diagnostics.Stopwatch]::StartNew(); "
-              f"$r = Get-VenueStagedBuildManifest -AgentShare '{self.case / 'a1-absent-root'}' -SourceCommit '{SHA}' -TimeoutSec 5 -CallCapSec 5 -VerifyArtifacts; "
-              "'STATE=' + $r.state; 'SEC=' + $sw.Elapsed.TotalSeconds.ToString('0.000', [Globalization.CultureInfo]::InvariantCulture)")
-        p = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", ps], capture_output=True, text=True, timeout=180, stdin=subprocess.DEVNULL)
-        self.assertIn("STATE=NOT_STAGED", p.stdout, p.stdout + p.stderr)
-        self.assertLess(float(re.search(r"SEC=([0-9.]+)", p.stdout).group(1)), 5.0, p.stdout)
+    def test_r11_g18_the_predicate_source_is_read_inside_the_calls_bounded_read(self) -> None:
+        # r10 fix iteration (adversary A1 on a4b659de): the predicate read must never hold a capped call past its cap. r11 (Grok G17/G18 on #814): it is read on
+        # every call INSIDE the bounded read, so the cap bounds it. The predicate's module path is pointed at a named pipe this script serves and never writes to:
+        # a read of it blocks, as a read on a stalled share does. The 3 s call ends UNREACHABLE inside its cap, and the pipe saw the read (the seam fired).
+        pipe = f"mlv-r11-g18-{os.getpid()}"
+        ps = (f"Import-Module '{DRIVER.parent / 'VenueChain.psm1'}' -Force -DisableNameChecking; "
+              f"$srv = [IO.Pipes.NamedPipeServerStream]::new('{pipe}', [IO.Pipes.PipeDirection]::Out, 1, [IO.Pipes.PipeTransmissionMode]::Byte, [IO.Pipes.PipeOptions]::Asynchronous); "
+              "$hit = $srv.WaitForConnectionAsync(); "
+              f"& (Get-Module VenueChain) {{ $script:VenueClaimShapeModulePath = '\\\\.\\pipe\\{pipe}' }}; $sw = [Diagnostics.Stopwatch]::StartNew(); "
+              f"$r = try {{ Get-VenueStagedBuildManifest -AgentShare '{self.case / 'a1-absent-root'}' -SourceCommit '{SHA}' -TimeoutSec 3 -CallCapSec 3 -VerifyArtifacts }} "
+              "catch { [pscustomobject]@{ state = 'THREW ' + $_.Exception.Message } }; "
+              "'STATE=' + $r.state; 'SEC=' + $sw.Elapsed.TotalSeconds.ToString('0.000', [Globalization.CultureInfo]::InvariantCulture); 'READ_HIT=' + $hit.IsCompleted; $srv.Dispose()")
+        p = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", ps], capture_output=True, text=True, timeout=120, stdin=subprocess.DEVNULL)
+        self.assertIn("READ_HIT=True", p.stdout, "the call never read the predicate's module at all: " + p.stdout + p.stderr)
+        self.assertIn("STATE=UNREACHABLE", p.stdout, p.stdout + p.stderr)
+        self.assertLess(float(re.search(r"SEC=([0-9.]+)", p.stdout).group(1)), 3.6, p.stdout)
+
+    def test_r11_g17_a_failed_predicate_read_clears_on_a_later_call(self) -> None:
+        # r11 (Grok G17 on #814): r10 read the predicate once at import and kept a failure for the module's life, so a scanner holding AttrCudaArtifacts.psm1 for a
+        # moment refused every later call in a long-lived importer. The scratch tree's copy is held open with no sharing from BEFORE the import: the first call is the
+        # typed refusal, and once the file is released a later call in the same process reads it and answers.
+        from tools.repo_hygiene.venue_fixture_modules import copy_with_siblings
+        folder = Path(os.path.realpath(self.case)) / "g17-tree" / "dual-venue"
+        copy_with_siblings(DRIVER.parent / "VenueChain.psm1", folder)
+        held = folder.parent / "bachelor" / "AttrCudaArtifacts.psm1"
+        self.assertTrue(held.is_file())
+        call = (f"$x = try {{ (Get-VenueStagedBuildManifest -AgentShare '{self.case / 'g17-absent-root'}' -SourceCommit '{SHA}' -TimeoutSec 10).state }} "
+                "catch { 'REFUSED ' + ($_.Exception.Message -split ' ')[0] }; ")
+        ps = (f"$f = [IO.File]::Open('{held}', [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::None); "
+              f"Import-Module '{folder / 'VenueChain.psm1'}' -Force -DisableNameChecking; "
+              + call + "'FIRST=' + $x; $f.Dispose(); " + call + "'SECOND=' + $x")
+        p = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", ps], capture_output=True, text=True, timeout=120, stdin=subprocess.DEVNULL)
+        self.assertIn("FIRST=REFUSED VENUE_CLAIM_PREDICATE_UNREADABLE", p.stdout, p.stdout + p.stderr)
+        self.assertIn("SECOND=NOT_STAGED", p.stdout, "a failed predicate read was kept past the release: " + p.stdout + p.stderr)
+
+    def _r11_sound_share(self, name: str) -> Path:
+        share = self.case / name
+        (share / "cache").mkdir(parents=True)
+        claim = {k: {"name": f"{k}.bin", "sha256": c * 64} for k, c in (("packageZip", "a"), ("exe", "b"), ("dll", "c"))}
+        (share / "cache" / f"playback-attr-3-cuda-{SHA[:12]}-build.json").write_text(
+            json.dumps({"sourceCommit": SHA, "dllPairManifestSha256": "d" * 64, "pendingSymbolPresence": True, **claim}), encoding="utf-8")
+        return share
+
+    def _r11_timed_call(self, share: Path, args: str) -> tuple[str, float, str]:
+        ps = (f"Import-Module '{DRIVER.parent / 'VenueChain.psm1'}' -Force -DisableNameChecking; $sw = [Diagnostics.Stopwatch]::StartNew(); "
+              f"$r = Get-VenueStagedBuildManifest -AgentShare '{share}' -SourceCommit '{SHA}' -VerifyArtifacts {args} "
+              "-ArtifactProbeScript { param($items) [Threading.Thread]::Sleep(4000) }; "
+              "'STATE=' + $r.state + ' ARTIFACT=[' + $r.artifactProblem + '] ERROR=[' + $r.error + ']'; 'SEC=' + $sw.Elapsed.TotalSeconds.ToString('0.000', [Globalization.CultureInfo]::InvariantCulture)")
+        p = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", ps], capture_output=True, text=True, timeout=120, stdin=subprocess.DEVNULL)
+        m = re.search(r"SEC=([0-9.]+)", p.stdout)
+        self.assertIsNotNone(m, p.stdout + p.stderr)
+        return p.stdout, float(m.group(1)), p.stdout + p.stderr
+
+    def test_r11_a1_a_stall_before_the_hash_starts_never_moves_its_end_past_the_cap(self) -> None:
+        # r11 (adversary A1 on 7754d16e, VenueChain.psm1:754/:769): the hash's budget was sampled as "what is left of -CallCapSec" and then re-anchored at the hash's
+        # start (hashEnd = elapsed + budget), so a caller descheduled in between moved the end past the cap. -TestPreHashDelayMs stalls 3 s there; the hash takes 4 s.
+        # RED: STAGED at about 7.2 s under a 6 s cap. The end is now fixed on the call clock, and the bounded wait ends at it: UNREACHABLE inside the cap.
+        out, sec, both = self._r11_timed_call(self._r11_sound_share("a1-cap-share"), "-TimeoutSec 5 -ArtifactTimeoutSec 300 -CallCapSec 6 -TestPreHashDelayMs 3000")
+        self.assertIn("STATE=UNREACHABLE", out, both)
+        self.assertLess(sec, 6.6, both)
+
+    def test_r11_a1_the_implicit_hash_budget_also_ends_at_the_bound(self) -> None:
+        # the same stall with -ArtifactTimeoutSec 0 (the hash gets what is left of -TimeoutSec): the bound's end is kept, never re-anchored at the hash start
+        out, sec, both = self._r11_timed_call(self._r11_sound_share("a1-bound-share"), "-TimeoutSec 6 -TestPreHashDelayMs 3000")
+        self.assertIn("STATE=UNREACHABLE", out, both)
+        self.assertLess(sec, 6.6, both)
+
+    def test_r11_a1_the_deadline_handed_over_is_the_calls_end(self) -> None:
+        # sibling (Invoke-VenueStageNightly.ps1:287/:300): the nightly handed over "what is left of the cap" as a number, measured before the call, and the call
+        # counted it from its own later start. It now hands over the deadline itself (-CallDeadlineUtc), so the call ends at it whatever ran in between.
+        out, sec, both = self._r11_timed_call(self._r11_sound_share("a1-deadline-share"),
+                                              "-TimeoutSec 20 -ArtifactTimeoutSec 300 -CallCapSec 20 -CallDeadlineUtc ([DateTime]::UtcNow.AddSeconds(3.5)) -TestPreHashDelayMs 1000")
+        self.assertIn("STATE=UNREACHABLE", out, both)
+        self.assertLess(sec, 4.1, both)
+        # r12: and the call really ran to the deadline (the hash was started and given up on there), never a deadline that failed to parse ending it at once
+        self.assertGreater(sec, 3.0, both)
+        self.assertIn("could not be hashed: no answer in", out + both, both)
+
+    def test_r11_a1_the_nightly_hands_its_deadline_to_the_soundness_read(self) -> None:
+        text = DRIVER.read_text(encoding="utf-8")
+        calls = [l for l in text.splitlines() if "Get-VenueStagedBuildManifest -AgentShare" in l]
+        self.assertTrue(calls)
+        self.assertTrue(all("-CallDeadlineUtc $script:Deadline" in l for l in calls), calls)
 
     def test_a_cache_hash_that_differs_after_stage_ok_is_a_verify_mismatch(self) -> None:
         p = self.run_driver(env={"FAKE_UMRUN_STAGE": "wrongcache"})
