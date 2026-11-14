@@ -392,8 +392,14 @@ function Assert-AttrCudaBuildManifest {
         throw "ATTRCUDA_BUILD_MANIFEST_SHA_MISMATCH $Path expected=$ExpectedSha256 actual=$actual"
     }
 
-    $manifest = [IO.File]::ReadAllText($Path) | ConvertFrom-Json
+    # VENUE-STAGE-CLAIM-SHAPE-1 >>>
+    # VENUE-STAGE-SAME-SHA-RESTAGE-GUARD-1 r7 (adversary A1 on ef28cd37): the read stays outside the catch (a read that failed is no verdict), and EVERY parse
+    # failure of the bytes read is the one content refusal: ConvertFrom-Json throws InvalidOperationException on keys that differ only by case and
+    # ArgumentException on malformed text, and the stage job's guard replaces a build only on a token it names.
+    $manifestText = [IO.File]::ReadAllText($Path)
+    $manifest = try { $manifestText | ConvertFrom-Json -ErrorAction Stop } catch { throw "ATTRCUDA_BUILD_MANIFEST_UNPARSEABLE $Path $($_.Exception.Message -replace '\s+', ' ')" }
     if ($null -eq $manifest) { throw "ATTRCUDA_BUILD_MANIFEST_UNPARSEABLE $Path" }
+    # VENUE-STAGE-CLAIM-SHAPE-1 <<<
     $commitProperty = $manifest.PSObject.Properties['sourceCommit']
     $commit = if ($null -eq $commitProperty) { '' } else { [string]$commitProperty.Value }
     if ($commit -ne $ExpectedSourceCommit) {
