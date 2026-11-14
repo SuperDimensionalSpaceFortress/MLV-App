@@ -127,6 +127,10 @@ if ($env:FAKE_ASSEMBLE -like 'racestage*') {
     # racestage-missing: the racer's cached exe is gone afterwards; racestage-upper: the racer's manifest spells the commit in upper case (the leg accepts it)
     if ($env:FAKE_ASSEMBLE -eq 'racestage-missing') { Remove-Item -LiteralPath (Join-Path $env:FAKE_RACE_CACHE "MLVApp-playback-attr-3-cuda-$s.exe") }
     $rm = [ordered]@{ sourceCommit = $(if ($env:FAKE_ASSEMBLE -eq 'racestage-upper') { $SourceCommit.ToUpperInvariant() } else { $SourceCommit }); assembledAtUtc = 'racer'; dllPairManifestSha256 = ('b' * 64); pendingSymbolPresence = $true; packageZip = $claims.packageZip; exe = $claims.exe; dll = $claims.dll }
+    # racestage-array (r2, adversary A1 on 90b1c58e): the exe claim is a one-element ARRAY [{name,sha256}], a shape the leg job and the host guard accept
+    if ($env:FAKE_ASSEMBLE -eq 'racestage-array') { $rm.exe = @($claims.exe) }
+    # FAKE_ASSEMBLE_SLEEP: the assemble takes this many seconds more (the racer's stage lands meanwhile)
+    if ($env:FAKE_ASSEMBLE_SLEEP) { Start-Sleep -Seconds ([int]$env:FAKE_ASSEMBLE_SLEEP) }
     [IO.File]::WriteAllText((Join-Path $env:FAKE_RACE_CACHE "playback-attr-3-cuda-$s-build.json"), ($rm | ConvertTo-Json -Compress -Depth 4))
 }
 "RESULT=ASSEMBLE_OK SOURCE=$SourceCommit EXE=x DLL=x PKG=x MANIFEST=playback-attr-3-cuda-$s-build.json MANIFEST_SHA256=$h OUT=$OutDir"
@@ -269,12 +273,12 @@ class VenueStageNightlyTests(unittest.TestCase):
 
     # ---------------------------------------------------------------- harness
     def args(self, *extra: str, share: Path | None = None, commit: str | None = SHA, now: str | None = NOW, driver: Path | None = None,
-             repo: Path | None = None) -> list[str]:
+             repo: Path | None = None, probe: str = "20") -> list[str]:
         a = [PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-File", str(driver or DRIVER), "-RepoRoot", str(repo or self.checkout),
              "-ReceiptFile", str(self.receipt), "-BuildRoot", str(self.build_root),
              "-AgentShare", str(share or self.share), "-ClaimDir", str(self.claims), "-GateDir", str(self.gates),
              "-UmRunScript", str(self.stubs / "um-run.ps1"), "-DllJobScript", str(self.stubs / "dll-gen.ps1"), "-AssembleScript", str(self.stubs / "assemble.ps1"),
-             "-StageJobScript", str(self.stubs / "stage-gen.ps1"), "-SmokeRunnerJobScript", str(self.stubs / "smoke-gen.ps1"), "-ProbeTimeoutSec", "20"]
+             "-StageJobScript", str(self.stubs / "stage-gen.ps1"), "-SmokeRunnerJobScript", str(self.stubs / "smoke-gen.ps1"), "-ProbeTimeoutSec", probe]
         if commit:
             a += ["-SourceCommit", commit]
         if now:
@@ -691,11 +695,12 @@ class VenueStageNightlyTests(unittest.TestCase):
 
     def test_the_pre_submission_soundness_read_is_bounded_by_the_probe_timeout(self) -> None:
         # adversary A4 (72577e87): every share probe of this driver is bounded by -ProbeTimeoutSec; the soundness read too (a read that does not
-        # answer in time is not a reuse, and the stage job decides on the host).
+        # answer in time is not a reuse, and the stage job decides on the host). r2 (A3 on 90b1c58e): by min(-ProbeTimeoutSec, what is left of the cap).
         text = DRIVER.read_text(encoding="utf-8")
         calls = re.findall(r"Get-VenueStagedBuildManifest -AgentShare [^\r\n}]*", text)
         self.assertEqual(len(calls), 1, calls)
-        self.assertIn("-TimeoutSec ([double]$ProbeTimeoutSec)", calls[0])
+        self.assertIn("-TimeoutSec $soundSec ", calls[0])
+        self.assertIn('$soundSec = Get-ProbeSec ', text)
         self.assertNotIn("-ArtifactTimeoutSec", calls[0])
 
     def test_a_raced_in_build_the_leg_job_would_refuse_is_not_reused(self) -> None:
@@ -707,6 +712,76 @@ class VenueStageNightlyTests(unittest.TestCase):
         self.assertEqual(len([c for c in self.submissions() if "job=playback-attr-3-cuda-stage-" in c]), 1, self.submissions())
         self.assertEqual(sha256(self.share / "cache" / names()["build"]), self.assembled_manifest_sha())
         self.assertIn("BUILD_ARTIFACT_MISMATCH", p.stdout)
+
+    # ---------------------------------------------------------------- r2 (adversary A1-A3 on 90b1c58e)
+    def test_a_raced_in_build_whose_exe_claim_is_a_one_element_array_is_reused(self) -> None:
+        # A1: the leg job reads $buildManifest.exe.sha256 (member access) and so does the host guard, so exe=[{name,sha256}] is a sound build. The shared
+        # reader (Get-VenueStagedBuildManifest, which the lease batch guards with too) required a single object, so the nightly re-staged over it.
+        self.assert_racer_reused("racestage-array")
+        self.assertIsInstance(json.loads((self.share / "cache" / names()["build"]).read_text(encoding="utf-8"))["exe"], list)
+
+    def test_a_soundness_read_given_up_on_does_not_hold_the_process(self) -> None:
+        # A2: the soundness read is stuck (a blocking SMB read: Thread.Sleep, which a stop request cannot interrupt) past -ProbeTimeoutSec. It is given up on
+        # (not reused; this call's build is staged), and the process ends when the driver does, never when the abandoned read finally returns.
+        stuck = 60
+        t0 = time.monotonic()
+        p = self.run_driver("-TestSoundnessReadDelayMs", str(stuck * 1000), probe="3",
+                            env={"FAKE_ASSEMBLE": "racestage", "FAKE_RACE_CACHE": str(self.share / "cache")})
+        took = time.monotonic() - t0
+        self.assert_exit(p, "STAGE_OK")
+        self.assertNotIn("STAGE_REUSED_EXISTING", p.stdout)
+        self.assertRegex(p.stdout, r"is not reused: state=UNREACHABLE ")
+        self.assertLess(took, stuck - 15, f"the process waited {took:.1f} s for the abandoned {stuck} s soundness read")
+
+    def test_the_soundness_read_never_runs_past_the_total_cap(self) -> None:
+        # A3: -MaxTotalSec is the total wall-clock cap. The soundness read starts a few seconds before it and would answer (sound racer, reusable) after it;
+        # it gets what is LEFT of the cap, never the full -ProbeTimeoutSec, so the call ends STAGE_CAP_EXCEEDED at the cap, never STAGE_OK past it.
+        cap, slow = 25, 15
+        # the finding's input: the DLL pair is reusable and the smoke-runner dir is already in the cache (no submission needs its 30 s floor)
+        self.built_dll_pair()
+        (self.share / "cache" / RUNNER_DIR).mkdir()
+        t0 = time.monotonic()
+        p = self.run_driver("-MaxTotalSec", str(cap), "-TestSoundnessReadDelayMs", str(slow * 1000),
+                            env={"FAKE_ASSEMBLE": "racestage", "FAKE_ASSEMBLE_SLEEP": "10", "FAKE_RACE_CACHE": str(self.share / "cache")})
+        took = time.monotonic() - t0
+        # the racer landed and the soundness read was asked (the call reached step 8 inside the cap: the test's own premise)
+        self.assertIn("ASSEMBLE ", "\n".join(self.calls("ASSEMBLE")), p.stdout)
+        self.assertTrue((self.share / "cache" / names()["build"]).exists(), p.stdout)
+        self.assert_exit(p, "STAGE_CAP_EXCEEDED")
+        self.assertNotIn("STAGE_REUSED_EXISTING", p.stdout)
+        self.assertFalse([c for c in self.submissions() if "job=playback-attr-3-cuda-stage-" in c], self.submissions())
+        self.assertEqual(json.loads((self.share / "cache" / names()["build"]).read_text(encoding="utf-8"))["assembledAtUtc"], "racer")
+        self.assertLess(took, cap + 8, f"the call ran {took:.1f} s against a {cap} s cap")
+
+    def test_the_shared_soundness_read_takes_every_claim_shape_the_leg_takes(self) -> None:
+        # A1 siblings (Invoke-VenueLeaseBatch.ps1 plan preflight and post-claim guard take the same read): a one-element array claim is the leg's digest
+        # ($buildManifest.exe.sha256 enumerates to it); a two-element array is not one digest, and the leg refuses it, so the read does too.
+        cache = self.share / "cache"
+        n = names()
+        claims = {}
+        for k, f in (("packageZip", n["pkg"]), ("exe", n["exe"]), ("dll", n["dll"])):
+            (cache / f).write_bytes(b"a")
+            claims[k] = {"name": f, "sha256": hashlib.sha256(b"a").hexdigest()}
+        out = {}
+        for label, exe in (("one", [claims["exe"]]), ("two", [claims["exe"], claims["exe"]])):
+            (cache / n["build"]).write_text(json.dumps({"sourceCommit": SHA, "dllPairManifestSha256": "b" * 64, "pendingSymbolPresence": True,
+                                                        "packageZip": claims["packageZip"], "exe": exe, "dll": claims["dll"]}), encoding="utf-8")
+            ps = (f"Import-Module '{DRIVER.parent / 'VenueChain.psm1'}' -Force -DisableNameChecking; "
+                  f"$r = Get-VenueStagedBuildManifest -AgentShare '{self.share}' -SourceCommit '{SHA}' -VerifyArtifacts -TimeoutSec 30; "
+                  "'STATE=' + $r.state; 'CONTENT=[' + $r.contentProblem + ']'; 'ARTIFACTS=[' + $r.artifactProblem + ']'")
+            p = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", ps], capture_output=True, text=True, timeout=120, stdin=subprocess.DEVNULL)
+            out[label] = p.stdout
+        self.assertIn("STATE=STAGED\nCONTENT=[]\nARTIFACTS=[]", out["one"].replace("\r\n", "\n"))
+        self.assertIn("ATTRCUDA_BUILD_MANIFEST_ARTIFACT_SHA_MISSING", out["two"])
+        self.assertIn("for exe ", out["two"])
+
+    def test_every_share_probe_is_bounded_by_what_is_left_of_the_cap(self) -> None:
+        # A3 siblings: every by-name read (Read-Share, the reachability probe, the soundness read) takes min(-ProbeTimeoutSec, what is left of -MaxTotalSec).
+        text = DRIVER.read_text(encoding="utf-8")
+        self.assertEqual(re.findall(r"Invoke-Bounded [^\r\n]*\$ProbeTimeoutSec", text), [])
+        self.assertEqual(re.findall(r"-TimeoutSec \(\[double\]\$ProbeTimeoutSec\)", text), [])
+        # and an abandoned read is counted, so the one exit ends the process instead of waiting for it (A2)
+        self.assertIn("Complete-VenueProcess -ExitCode $code", text)
 
     def test_a_cache_hash_that_differs_after_stage_ok_is_a_verify_mismatch(self) -> None:
         p = self.run_driver(env={"FAKE_UMRUN_STAGE": "wrongcache"})

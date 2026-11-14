@@ -609,7 +609,10 @@ function Get-VenueStagedBuildManifest {
     [pscustomobject]@{ state (STAGED | NOT_STAGED | UNREACHABLE); sha256; path; error; contentProblem }
     #>
     param([Parameter(Mandatory)][string]$AgentShare, [Parameter(Mandatory)][ValidatePattern('^[0-9a-f]{40}$')][string]$SourceCommit, [ValidateRange(1.0, 600.0)][double]$TimeoutSec = 30, [scriptblock]$ProbeScript = $null,
-        [switch]$VerifyArtifacts, [ValidateRange(0, 600)][int]$ArtifactTimeoutSec = 0, [scriptblock]$ArtifactProbeScript = $null, [ValidateRange(1.0, 600.0)][double]$ArtifactMinSec = 1)
+        [switch]$VerifyArtifacts, [ValidateRange(0, 600)][int]$ArtifactTimeoutSec = 0, [scriptblock]$ArtifactProbeScript = $null, [ValidateRange(1.0, 600.0)][double]$ArtifactMinSec = 1,
+        # Test-only (VENUE-STAGE-SAME-SHA-RESTAGE-GUARD-1 r2): the default manifest read first blocks its worker this long, as a read stuck on a dead SMB host does
+        # (Thread.Sleep: a stop request cannot interrupt it). test_venue_stage_nightly.py uses it; production passes none.
+        [ValidateRange(0, 600000)][int]$TestReadDelayMs = 0)
     # -ArtifactTimeoutSec 0 (the default): the artifact hash gets what is left of -TimeoutSec after the manifest read (under -ArtifactMinSec left, no hash: UNREACHABLE), so the whole call stays inside -TimeoutSec, as
     # every caller that passes 30 relies on. A caller that can afford more (the pre-claim plan preflight) or must afford less (the post-claim guard) says so.
     # r7 (sol r6 B1): -TimeoutSec and what is left of it are seconds with their fraction, never floored: the lease batch guard hands over a 2.8 s remainder as 2.8.
@@ -635,14 +638,22 @@ function Get-VenueStagedBuildManifest {
                 $s = $m.PSObject.Properties['pendingSymbolPresence']; 'S:' + $(if ($null -ne $s -and $s.Value -is [bool]) { 'bool' } else { 'bad' })
                 # r13 (adversary r13 A1): and the three artifact digests the job hashes the cached artifacts against (playback-attr-3-cuda-job.ps1 $manifestChecks): a string of
                 # 64 hex, the only value Get-Sha's digest can ever equal; a blank one makes the job throw, a non-string one throws in ToUpperInvariant.
+                # VENUE-STAGE-SAME-SHA-RESTAGE-GUARD-1 r2 (adversary A1 on 90b1c58e): the claim is read with the leg job's OWN expression ($buildManifest.exe.sha256, member
+                # access) and the stage job's host guard reads it the same way, so every claim shape they accept counts here too: a one-element array [{name,sha256}]
+                # enumerates to its one digest. Requiring a single object refused a build both of them accept, and the nightly re-staged over it (exit 7).
+                # VENUE-STAGE-SAME-SHA-RESTAGE-GUARD-1 r2 (adversary A1 on 90b1c58e): the claim is read with the leg job's OWN expression ($buildManifest.exe.sha256, member
+                # access; playback-attr-3-cuda-job.ps1 $manifestChecks), as the stage job's host guard reads it, so every claim shape those two accept counts here too: a
+                # one-element array [{name,sha256}] enumerates to its one digest. Requiring a single object refused a build both accept, and the nightly re-staged over it.
+                # This read is the ONE share-side soundness predicate: the nightly's reuse decision and the lease batch's plan and post-claim guards all take it.
                 foreach ($k in 'packageZip', 'exe', 'dll') {
-                    $o = $m.PSObject.Properties[$k]; $v = $(if ($null -ne $o -and $o.Value -is [System.Management.Automation.PSCustomObject] -and $o.Value.PSObject.Properties['sha256']) { $o.Value.sha256 } else { $null })
+                    $v = $(try { $m.$k.sha256 } catch { $null })
                     'A:' + $k + '=' + $(if ($v -is [string] -and $v -match '^[0-9a-fA-F]{64}\z') { 'ok' } else { 'bad' })
                     # LEASE-BATCH-PLAN-ARTIFACT-PREFLIGHT-1: the digest itself, for -VerifyArtifacts (the same bytes as the facts above)
                     if ($v -is [string] -and $v -match '^[0-9a-fA-F]{64}\z') { 'H:' + $k + '=' + $v.ToLowerInvariant() }
                 }
             } })
-    $r = Invoke-VenueBoundedRead -ScriptText $read.ToString() -Argument $path -TimeoutSec $TimeoutSec
+    $readText = $(if ($TestReadDelayMs -gt 0 -and $null -eq $ProbeScript) { "param(`$p)`n[Threading.Thread]::Sleep($TestReadDelayMs)`n& {" + $read.ToString() + "`n} `$p" } else { $read.ToString() })
+    $r = Invoke-VenueBoundedRead -ScriptText $readText -Argument $path -TimeoutSec $TimeoutSec
     if (-not $r.answered) { return [pscustomobject]@{ state = 'UNREACHABLE'; sha256 = $null; path = $path; error = $r.error; contentProblem = $null } }
     $sha = $(if ($r.value.Count -gt 0) { [string]$r.value[0] } else { '' })
     if ($sha -cmatch '^[0-9a-f]{64}$') {

@@ -98,7 +98,10 @@ param(
     [string]$NowUtc = '',
     # Test-only (LEASE-NOT-AFTER-SUBMITTER-DEADLINE-TIMING-1): sleeps this long between each submission's remaining-budget sample and its not-after bound,
     # a scheduling delay test_venue_stage_nightly.py injects to prove the bound never passes the deadline. Production passes none.
-    [ValidateRange(0, 60000)][int]$TestNotAfterSampleDelayMs = 0
+    [ValidateRange(0, 60000)][int]$TestNotAfterSampleDelayMs = 0,
+    # Test-only (VENUE-STAGE-SAME-SHA-RESTAGE-GUARD-1 r2): the pre-submission soundness read blocks its worker this long first, as a read stuck on a dead SMB
+    # host does (Get-VenueStagedBuildManifest -TestReadDelayMs). Production passes none.
+    [ValidateRange(0, 600000)][int]$TestSoundnessReadDelayMs = 0
 )
 $ErrorActionPreference = 'Stop'
 $here = $PSScriptRoot
@@ -200,28 +203,42 @@ function Stop-Nightly([string]$Reason, [string]$Detail = '', [string[]]$Verbatim
     $sha = $(if ($r.sourceCommit) { $r.sourceCommit } else { 'none' })
     Out-Line "STAGE_NIGHTLY_EXIT code=$code reason=$Reason sha=$sha manifest=$(if ($r.buildManifestSha256) { $r.buildManifestSha256 } else { 'none' })"
     Out-Line ('STAGE_NIGHTLY_RESULT=' + ($r | ConvertTo-Json -Compress -Depth 6))
+    # VENUE-STAGE-SAME-SHA-RESTAGE-GUARD-1 r2 (adversary A2 on 90b1c58e): a share read given up on is a live foreground thread the host would wait for at exit, so a read
+    # stuck on a dead SMB host held the process long after the typed exit. Everything is written; when a read was abandoned, the process ends now.
+    Complete-VenueProcess -ExitCode $code
     exit $code
 }
 
-function Invoke-Bounded([scriptblock]$Script, [object[]]$ArgList, [int]$Sec) {
+function Invoke-Bounded([scriptblock]$Script, [object[]]$ArgList, [double]$Sec) {
     # The Invoke-VenueBaseline.ps1 pattern: run a by-name share read on a worker thread and give up after $Sec seconds (a UNC path of a host that is down can block
-    # for minutes). A worker still stuck when we give up is abandoned (BeginStop, no wait), never joined.
+    # for minutes). A worker still stuck when we give up is abandoned (BeginStop, no wait), never joined -- and counted (r2, A2), so Stop-Nightly ends the process.
     $ps = [powershell]::Create()
     [void]$ps.AddScript($Script.ToString())
     foreach ($a in $ArgList) { [void]$ps.AddArgument($a) }
     $async = $ps.BeginInvoke()
     if (-not $async.AsyncWaitHandle.WaitOne([TimeSpan]::FromSeconds($Sec))) {
         try { [void]$ps.BeginStop($null, $null) } catch { }
-        return [pscustomobject]@{ ok = $false; timedOut = $true; value = $null; error = "no answer in $Sec s" }
+        & (Get-Module VenueChain) { $script:VenueAbandonedReads++ }
+        return [pscustomobject]@{ ok = $false; timedOut = $true; value = $null; error = "no answer in $([Math]::Round($Sec, 2)) s" }
     }
     try { $v = @($ps.EndInvoke($async)); [pscustomobject]@{ ok = $true; timedOut = $false; value = $(if ($v.Count -gt 0) { $v[0] } else { $null }); error = $null } }
     catch { [pscustomobject]@{ ok = $false; timedOut = $false; value = $null; error = $_.Exception.Message } }
     finally { $ps.Dispose() }
 }
 
+function Get-ProbeSec([string]$What) {
+    # VENUE-STAGE-SAME-SHA-RESTAGE-GUARD-1 r2 (adversary A3 on 90b1c58e): -MaxTotalSec is the total wall-clock cap, so every share probe gets min(-ProbeTimeoutSec,
+    # what is left of it), in seconds with their fraction. Under 1 s left there is no read to make: the cap ran out (STAGE_CAP_EXCEEDED), nothing more is read or written.
+    $left = ($script:Deadline - [DateTime]::UtcNow).TotalSeconds
+    if ($left -lt 1.0) { Stop-Nightly 'STAGE_CAP_EXCEEDED' "the $MaxTotalSec s cap ran out before $What could be read ($([Math]::Floor([Math]::Max(0.0, $left) * 100.0) / 100.0) s left)" }
+    [Math]::Min([double]$ProbeTimeoutSec, $left)
+}
+
 function Read-Share([string]$What, [scriptblock]$Script, [object[]]$ArgList) {
-    # A bounded by-name read; a share that does not answer ends the call SHARE_UNREACHABLE.
-    $b = Invoke-Bounded $Script $ArgList $ProbeTimeoutSec
+    # A bounded by-name read; a share that does not answer ends the call SHARE_UNREACHABLE (STAGE_CAP_EXCEEDED when what it was given was the rest of the cap).
+    $sec = Get-ProbeSec $What
+    $b = Invoke-Bounded $Script $ArgList $sec
+    if ($b.timedOut -and $sec -lt $ProbeTimeoutSec) { Stop-Nightly 'STAGE_CAP_EXCEEDED' "reading $What : $($b.error), the rest of the $MaxTotalSec s cap" }
     if ($b.timedOut) { Stop-Nightly 'SHARE_UNREACHABLE' "reading $What : $($b.error)" }
     if (-not $b.ok) { Stop-Nightly 'SHARE_UNREACHABLE' "reading $What failed: $($b.error)" }
     $b.value
@@ -387,7 +404,9 @@ function Assert-VenueFree([string]$Before) {
     }
 }
 Assert-VenueFree 'before anything was built'
-$reach = Invoke-Bounded { param($p) Test-Path -LiteralPath $p -PathType Container } @($cache) $ProbeTimeoutSec
+$reachSec = Get-ProbeSec "the agent share cache '$cache'"
+$reach = Invoke-Bounded { param($p) Test-Path -LiteralPath $p -PathType Container } @($cache) $reachSec
+if ($reach.timedOut -and $reachSec -lt $ProbeTimeoutSec) { Stop-Nightly 'STAGE_CAP_EXCEEDED' "the agent share cache '$cache' did not answer in $($reach.error), the rest of the $MaxTotalSec s cap" }
 if (-not $reach.ok -or $reach.value -ne $true) { Stop-Nightly 'SHARE_UNREACHABLE' "the agent share cache '$cache' did not answer as a directory ($(if ($reach.error) { $reach.error } else { 'not found' }))" }
 
 # ------------------------------------------------------------------ 4. idempotency: what the cache already holds, by name --------------------------------------------------
@@ -608,13 +627,16 @@ if ($buildInCache) {
     # assemble is left unstaged and the staged manifest is the one recorded. (The stage job refuses a replacement on the host as well.)
     # Reused only when SOUND: Get-VenueStagedBuildManifest -VerifyArtifacts, the read the lease batch guards with, finds no content or artifact problem
     # and the same manifest bytes. It is asked whenever a build.json is there (not only when step 4's stricter test holds: its case-sensitive commit
-    # compare and its missing-artifact stop are not what a leg accepts; adversary A2/A3 on 72577e87), and it is bounded by -ProbeTimeoutSec like
-    # every other share probe here (A4). Anything else (unsound, changed, or a read that did not answer) goes to the stage job, which replaces
+    # compare and its missing-artifact stop are not what a leg accepts; adversary A2/A3 on 72577e87), and it is bounded like every other share probe
+    # here (A4): r2 (A3 on 90b1c58e) by min(-ProbeTimeoutSec, what is left of -MaxTotalSec), so a reuse is never decided past the cap; a read cut short by
+    # the cap is STAGE_CAP_EXCEEDED. Anything else (unsound, changed, or a read that did not answer) goes to the stage job, which replaces
     # only an unsound build and refuses to replace a sound one (exit 7, STAGE_FAILED here, nothing written).
     $again = Read-Share $cacheBuildJson $HashByName @($cacheBuildJson)
     $sound = $null
     if ($again.present) {
-        $sound = try { Get-VenueStagedBuildManifest -AgentShare $share -SourceCommit $commit -VerifyArtifacts -TimeoutSec ([double]$ProbeTimeoutSec) } catch { [pscustomobject]@{ state = 'UNREACHABLE'; error = ($_.Exception.Message -replace '\s+', ' ') } }
+        $soundSec = Get-ProbeSec "the soundness of the staged build of $commit"
+        $sound = try { Get-VenueStagedBuildManifest -AgentShare $share -SourceCommit $commit -VerifyArtifacts -TimeoutSec $soundSec -TestReadDelayMs $TestSoundnessReadDelayMs } catch { [pscustomobject]@{ state = 'UNREACHABLE'; error = ($_.Exception.Message -replace '\s+', ' ') } }
+        if ($sound.state -ceq 'UNREACHABLE' -and $soundSec -lt $ProbeTimeoutSec) { Stop-Nightly 'STAGE_CAP_EXCEEDED' "the soundness read of the staged build of $commit got the rest of the $MaxTotalSec s cap ($([Math]::Round($soundSec, 2)) s) and did not answer in it: $($sound.error); nothing was submitted" }
         if (-not ($sound.state -ceq 'STAGED' -and $sound.contentProblem -ceq '' -and $sound.artifactProblem -ceq '' -and $sound.sha256 -ceq $again.hash)) {
             Say "the $Venue cache holds a build of $commit that is not reused: state=$($sound.state) manifest=$($sound.sha256) content=[$($sound.contentProblem)] artifacts=[$($sound.artifactProblem)] error=[$($sound.error)]; staging this call's build (the stage job replaces only an unsound build)"
             $sound = $null
@@ -700,4 +722,7 @@ $final = Read-Share $cacheBuildJson $HashByName @($cacheBuildJson)
 if (-not $final.present -or $final.hash -cne $expected) {
     Stop-Nightly 'STAGE_VERIFY_MISMATCH' "the final by-name read of $cacheBuildJson hashes $(if ($final.present) { $final.hash } else { 'MISSING' }), not $expected; never recorded as staged"
 }
+# r2 (adversary A3 on 90b1c58e): -MaxTotalSec is the cap on the whole call, STAGE_OK included: an outcome reached after it is never reported as STAGE_OK.
+$overBy = ([DateTime]::UtcNow - $script:Deadline).TotalSeconds
+if ($overBy -gt 0) { Stop-Nightly 'STAGE_CAP_EXCEEDED' "the $MaxTotalSec s cap ran out $([Math]::Round($overBy, 2)) s before the verified $cacheBuildJson ($($final.hash)) could be recorded; not recorded as staged" }
 Stop-Nightly 'STAGE_OK' "$cacheBuildJson sha256 $($final.hash) (read by name) and $runnerDirName are in the $Venue cache; Invoke-VenueBaseline finds this manifest" -Manifest $final.hash
