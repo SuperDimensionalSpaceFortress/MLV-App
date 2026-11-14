@@ -1102,6 +1102,7 @@ function Get-DvSmokeSummaryFields {
     param([AllowNull()][AllowEmptyString()][string]$LogText)
     $fields = @{}
     $session = $null
+    $sessionUnreadable = $false
     $isolated = $false
     $conformLine = $null
     if (-not [string]::IsNullOrEmpty($LogText)) {
@@ -1111,8 +1112,13 @@ function Get-DvSmokeSummaryFields {
         # HFR-NATIVE-M16-1457-FULLSCREEN-S1S2-PRESENT-GAP-1 r3 (r2 adversary pass 7 A2): each marker counts only where it STARTS the record body
         # ($script:DvRecordStart), so a run_metadata command line (or any other record) holding `playback_smoke.measured_session id=<n>` never picks the session
         $rs = $script:DvRecordStart
-        foreach ($line in $lines) { if ($line -match ($rs + 'playback_smoke\.measured_session id=(?<s>\d+)')) { $session = $Matches['s']; break } }
-        if ($null -eq $session) { foreach ($line in $lines) { if ($line -match ($rs + 'playback_smoke\.summary session=(?<s>\d+)')) { $session = $Matches['s']; break } } }
+        # r10 (sol r9 B1): the id is the WHOLE token up to whitespace or the end of the line, and must be one plain decimal [0-9]+; before r10 `id=3x`,
+        # `3.5` or `3/old` selected session 3 by its numeric prefix (and another Play's wake was honoured). A malformed first marker (or, with no marker,
+        # a malformed first summary) makes the measured session UNREADABLE: session stays $null and sessionUnreadable is $true, never a later record's
+        $token = $null
+        foreach ($line in $lines) { if ($line -match ($rs + 'playback_smoke\.measured_session id=(?<s>\S*)')) { $token = $Matches['s']; break } }
+        if ($null -eq $token) { foreach ($line in $lines) { if ($line -match ($rs + 'playback_smoke\.summary session=(?<s>\S*)')) { $token = $Matches['s']; break } } }
+        if ($null -ne $token) { if ($token -cmatch '^[0-9]+$') { $session = $token } else { $sessionUnreadable = $true } }
         if ($null -ne $session) {
             $summaryLine = $null
             foreach ($line in $lines) { if ($line -match ($rs + 'playback_smoke\.summary session=' + [regex]::Escape($session) + '(\s|$)')) { $summaryLine = $line } }
@@ -1126,7 +1132,7 @@ function Get-DvSmokeSummaryFields {
         $iso = @($lines | Where-Object { $_ -match ($rs + 'interaction_trace event=automation\.pacing_isolated(\s|$)') })
         $isolated = ($iso.Count -gt 0) -and (@($iso | Where-Object { $_ -notmatch 'settings_store=run_scoped(\s|$)' }).Count -eq 0)
     }
-    [pscustomobject]@{ session = $session; fields = $fields; settingsIsolated = $isolated; conformLine = $conformLine }
+    [pscustomobject]@{ session = $session; sessionUnreadable = $sessionUnreadable; fields = $fields; settingsIsolated = $isolated; conformLine = $conformLine }
 }
 
 function Get-DvConformPaceProof {
@@ -1979,7 +1985,8 @@ function Get-DvDueWakeDeliveryEvidence {
     r8 (B1, sol + key3 opus r7): on a line with a delivery_kind, the posted leg and every PACED leg that does not ask count only when the measured
     Play DELIVERED a wake by its route (Get-DvDueWakeDelivered: fired= minus post_rescued= of one or more); none, or a missing or unreadable count, is
     DUE_WAKE_NOT_ENGAGED. r9 (Grok G10): post_rescued= counts only beside exactly one post_counts_settled=1 on the same line; an unsettled, missing,
-    repeated or malformed flag is unreadable there, so DUE_WAKE_NOT_ENGAGED on both paths. EXEMPT: a control binary's line (no delivery_kind; its binary is not under test) and an unpaced leg (it never arms).
+    repeated or malformed flag is unreadable there, so DUE_WAKE_NOT_ENGAGED on both paths. r10 (sol r9 B1): a malformed measured-session id (id=3x, 3.5,
+    3/old; Get-DvSmokeSummaryFields sessionUnreadable) blocks every leg, exempt ones included (DUE_WAKE_SESSION_UNREADABLE). EXEMPT: a control binary's line (no delivery_kind; its binary is not under test) and an unpaced leg (it never arms).
     Pure and shared: the runner gates on it and Test-DvReceiptValid re-derives it from the hashed run log.
     #>
     param([Parameter(Mandatory)]$Spec, [AllowNull()][AllowEmptyString()][string]$LogText)
@@ -1995,8 +2002,12 @@ function Get-DvDueWakeDeliveryEvidence {
     # session's pace_summary and before any other pace_summary; another Play's line never stands in for it, and a measured Play with no line has none.
     $candidates = New-Object System.Collections.Generic.List[string]
     $paces = 0
+    $sessionUnreadable = $false
     if (-not [string]::IsNullOrEmpty($LogText)) {
-        $session = (Get-DvSmokeSummaryFields -LogText $LogText).session
+        $picked = Get-DvSmokeSummaryFields -LogText $LogText
+        $session = $picked.session
+        # r10 (sol r9 B1): a malformed measured-session id names no session, so no line is the measured Play's; it blocks every leg below
+        $sessionUnreadable = ($picked.sessionUnreadable -eq $true)
         if ($null -ne $session) {
             # r2 adversary pass 6 A1: a record is read only where it STARTS the record body (after the optional `[utc] [LEVEL] [0x<thread>] ` prefix,
             # Get-DvLogRecordBody), never as text inside another record's line. r3: the one shared anchor ($script:DvRecordStart), which the session
@@ -2084,7 +2095,12 @@ function Get-DvDueWakeDeliveryEvidence {
     $unreadable = 'the due-wake delivery is unreadable: the measured session''s playback_due_wake line (after its playback_smoke.pace_summary, before the next) is not exactly one line carrying one delivery_kind of send, post, notifier, qtimer, none and one delivery= of native-msg, qtimer, notifier, none or a "+"-join (MainWindow::playbackDueWakeSummaryLine)'
     # r8 (B1): the reason both paths give when the measured line shows no delivered wake
     $notDelivered = "DUE_WAKE_NOT_ENGAGED: the measured session's playback_due_wake line shows $(if ($delivered -ceq 'none') { 'no wake delivered by its route (fired= minus post_rescued= is below 1)' } else { 'no readable fired= or post_rescued= count (exactly one whole number each, with exactly one post_counts_settled=1: an unsettled post count may still move)' }), so no armed wake was delivered to the GUI thread by the route the leg names (fired= counts the wakes it took, a lost post the poll tick rescued included; an arm replaced or cancelled first delivers nothing) and the run measured no delivered wake"
-    if ($requested) {
+    if ($sessionUnreadable) {
+        # r10 (sol r9 B1, its input: `playback_smoke.measured_session id=3x` before session 3's posted wake and a valid id=4 was HONOURED): FAIL CLOSED for
+        # every leg, the posted one and the head arm alike; never the numeric prefix's wake and never a later session's
+        $verdict = 'NOT_HONOURED'; $reason = 'DUE_WAKE_SESSION_UNREADABLE: the first playback_smoke.measured_session id= (or, with none, the first playback_smoke.summary session=) is not one whole decimal id up to whitespace or the end of the line, so no playback_due_wake line can be read as the measured Play''s'
+    }
+    elseif ($requested) {
         $verdict = 'NOT_HONOURED'
         if ($mentions -eq 0) { $reason = 'ROUTE_NOT_ENGAGED: the measured session has no playback_due_wake line with a delivery_kind (after its playback_smoke.pace_summary), so the binary does not report how its wake was delivered' }
         elseif ($null -eq $observed) { $reason = $unreadable }

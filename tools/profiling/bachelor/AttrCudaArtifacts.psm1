@@ -3489,8 +3489,9 @@ function Get-AttrCudaSelfHealMetrics {
         # newline), never as text inside another record's line
         $recordStart = '(?m)^(?:\[[^\]\r\n]*\] ){0,3}'
         if ([string]::IsNullOrEmpty($Session)) {
-            $sm = [regex]::Match($LogText, $recordStart + 'playback_smoke\.measured_session id=(\d+)')
-            if (-not $sm.Success) { return $null }
+            # r10 (sol r9 B1 class sweep): the WHOLE id token, one plain decimal [0-9]+; a malformed first marker is no session (never its numeric prefix)
+            $sm = [regex]::Match($LogText, $recordStart + 'playback_smoke\.measured_session id=(\S*)')
+            if (-not $sm.Success -or $sm.Groups[1].Value -cnotmatch '^[0-9]+$') { return $null }
             $Session = $sm.Groups[1].Value
         }
         $found = $null

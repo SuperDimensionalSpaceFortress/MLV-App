@@ -11491,6 +11491,23 @@ class SelfHealLegGatesTheL1ToL4FactsTests(unittest.TestCase):
                 self.assertTrue(got["pass"] and got["supplementaryPass"], got["failures"])
                 self.assertEqual(got["metrics"]["selfHealL1FpsRatio"], 0.974)
 
+    def test_r10_a_malformed_measured_session_id_is_no_session_never_its_numeric_prefix(self) -> None:
+        """HFR-NATIVE-M16-1457-FULLSCREEN-S1S2-PRESENT-GAP-1 r10 (sol r9 B1 class sweep, AttrCudaArtifacts.psm1:3492): the self-heal reader's measured-
+        session pick reads the whole id token. Before r10 `id=1x` (or 1.5, 1/old) selected session 1 by its numeric prefix and its summary's
+        presented_fps passed every ratio; now a malformed id is no measured session, so the ratios are unusable (fail closed)."""
+        prefix = "[2026-11-13T00:00:00.000Z] [INFO] [0x1a2b] "
+        for token in ("1x", "1.5", "1/old", "", "١"):
+            log = (prefix + f"playback_smoke.measured_session id={token}\n"
+                   + prefix + "playback_smoke.summary session=1 reason=visual-capture presented_frames=599 presented_fps=23.201\n"
+                   + prefix + "playback_smoke.measured_session id=2\n"
+                   + prefix + "playback_smoke.summary session=2 reason=visual-capture presented_frames=599 presented_fps=23.201\n")
+            with self.subTest(token=token):
+                got = self.evaluate(["good"], measured_log=log)["good"]
+                self.assertFalse(got["pass"], got)
+                self.assertEqual(sorted({f.split(" ")[0].rstrip(":") for f in got["failures"]}), [f"selfHealL{n}FpsRatio" for n in (1, 2, 3)], got["failures"])
+                for n in (1, 2, 3):
+                    self.assertIsNone(got["metrics"][f"selfHealL{n}FpsRatio"])
+
 
 class VisualCaptureSpecAndAppSourceTests(unittest.TestCase):
     """The schema's opt-out shape, the proof leg, and the app side of the capture (a source census: the app is built and run on a venue, never here)."""
@@ -15923,6 +15940,88 @@ class DueWakeMeasuredSessionAnchorTests(unittest.TestCase):
         look = self.ps("$s = $env:DVE_SPEC | ConvertFrom-Json\n(Get-DvLookAssistEvidence -Spec $s -LogText $env:DVE_LOG) | ConvertTo-Json -Compress",
                        "\n".join(base + ["note: event=gui_smoke.visual_state look_assist_enabled=1"]) + "\n", {"generatorArgs": {"forceLookAssist": True}})
         self.assertEqual((look["verdict"], look["blocks"]), ("NOT_HONOURED", True), look)
+
+    # r10 (sol r9 B1, its input verbatim with the token as the variable): a malformed measured-session token followed by conflicting valid-session
+    # evidence. On 65701d27 `id=3x` selected session 3 by its numeric prefix and HONOURED session 3's posted wake (blocks=false); `3.5` and `3/old` too,
+    # and through the summary fallback. The token must be one whole decimal id up to whitespace or the end of the line; anything else makes the measured
+    # session UNREADABLE, so the due-wake reader blocks every leg (never HONOURED, never another session's line).
+    WAKE_POST = "playback_due_wake armed=1 fired=1 disabled=0 delivery=native-msg post_rescued=0 post_counts_settled=1 delivery_kind=post"
+    WAKE_SEND = "playback_due_wake armed=1 fired=1 disabled=0 delivery=native-msg post_rescued=0 post_counts_settled=1 delivery_kind=send"
+    MALFORMED_TOKENS = ("3x", "3.5", "3/old", "", "+3", "-3", "3,4", "0x3", "٣")
+
+    @classmethod
+    def sol_r9_b1_log(cls, token: str | None, prefix: str = "") -> str:
+        lines = ([] if token is None else [f"playback_smoke.measured_session id={token}"]) + [
+            "playback_smoke.summary session=3 reason=play-stop presented_frames=600", "playback_smoke.pace_summary session=3", cls.WAKE_POST,
+            "playback_smoke.measured_session id=4", "playback_smoke.summary session=4 reason=play-stop presented_frames=600",
+            "playback_smoke.pace_summary session=4", cls.WAKE_SEND]
+        return "\n".join(prefix + l for l in lines) + "\n"
+
+    @classmethod
+    def summary_fallback_log(cls, token: str) -> str:
+        return "\n".join([f"playback_smoke.summary session={token} reason=play-stop presented_frames=600", "playback_smoke.pace_summary session=3", cls.WAKE_POST,
+                          "playback_smoke.summary session=4 reason=play-stop presented_frames=600", "playback_smoke.pace_summary session=4", cls.WAKE_SEND]) + "\n"
+
+    def selected(self, log: str) -> dict:
+        return self.ps("$r = Get-DvSmokeSummaryFields -LogText $env:DVE_LOG\n[ordered]@{ session = $r.session; unreadable = $r.sessionUnreadable } | ConvertTo-Json -Compress", log)
+
+    def wake_verdict(self, log: str, spec: dict) -> dict:
+        return self.ps("$s = $env:DVE_SPEC | ConvertFrom-Json\n(Get-DvDueWakeDeliveryEvidence -Spec $s -LogText $env:DVE_LOG) | ConvertTo-Json -Compress", log, spec)
+
+    def test_r10_sol_b1_a_malformed_measured_session_id_never_selects_its_numeric_prefix(self) -> None:
+        post = {"generatorArgs": {"dueWakeDeliveryPost": True}}
+        for token in self.MALFORMED_TOKENS:
+            for prefix_name, prefix in (("bare", ""), ("crash-forensics prefix", self.PREFIX)):
+                log = self.sol_r9_b1_log(token, prefix)
+                with self.subTest(token=token, prefix=prefix_name):
+                    self.assertEqual(self.selected(log), {"session": None, "unreadable": True})
+                    for leg, spec in (("posted", post), ("head", {})):
+                        v = self.wake_verdict(log, spec)
+                        self.assertEqual((leg, v["verdict"], v["blocks"]), (leg, "NOT_HONOURED", True), v)
+                        self.assertIn("DUE_WAKE_SESSION_UNREADABLE", v["reason"], v)
+        # controls: without the malformed marker the reader takes session 4 exactly as before (its send line refuses the posted leg; the head leg reads it)
+        log = self.sol_r9_b1_log(None)
+        self.assertEqual(self.selected(log), {"session": "4", "unreadable": False})
+        v = self.wake_verdict(log, post)
+        self.assertEqual((v["verdict"], v["blocks"]), ("NOT_HONOURED", True), v)
+        self.assertIn("ROUTE_NOT_ENGAGED", v["reason"])
+        v = self.wake_verdict(log, {})
+        self.assertEqual((v["verdict"], v["blocks"]), ("NOT_REQUESTED", False), v)
+        # and a well-formed id=3 still selects session 3 and honours its own posted wake
+        log = self.sol_r9_b1_log("3")
+        self.assertEqual(self.selected(log), {"session": "3", "unreadable": False})
+        v = self.wake_verdict(log, post)
+        self.assertEqual((v["verdict"], v["blocks"]), ("HONOURED", False), v)
+
+    def test_r10_sol_b1_a_malformed_summary_session_never_selects_its_numeric_prefix(self) -> None:
+        post = {"generatorArgs": {"dueWakeDeliveryPost": True}}
+        for token in self.MALFORMED_TOKENS:
+            log = self.summary_fallback_log(token)
+            with self.subTest(token=token):
+                self.assertEqual(self.selected(log), {"session": None, "unreadable": True})
+                for leg, spec in (("posted", post), ("head", {})):
+                    v = self.wake_verdict(log, spec)
+                    self.assertEqual((leg, v["verdict"], v["blocks"]), (leg, "NOT_HONOURED", True), v)
+                    self.assertIn("DUE_WAKE_SESSION_UNREADABLE", v["reason"], v)
+        log = self.summary_fallback_log("3")
+        self.assertEqual(self.selected(log), {"session": "3", "unreadable": False})
+        v = self.wake_verdict(log, post)
+        self.assertEqual((v["verdict"], v["blocks"]), ("HONOURED", False), v)
+
+    def test_r10_sol_b1_class_sweep_every_session_capture_is_a_whole_token(self) -> None:
+        # r10 (sol r9 B1 class sweep): no live selector in the runner module, the artifacts module or the job's anchored and core-partition selectors
+        # captures a session id as a bare \d+ (a numeric prefix); each reads the whole token (\S*) and refuses anything but [0-9]+
+        unbounded = re.compile(r"(?:measured_session id|summary session)=\((?:\?<\w+>)?\\d\+\)(?!\(\\s\|\$\))")
+        for path in (DV / "DualVenueRunner.psm1", DV / "Invoke-VenueLeg.ps1", ATTR_MODULE):
+            with self.subTest(path=path.name):
+                self.assertIsNone(unbounded.search(path.read_text(encoding="utf-8")), path)
+        job = (ROOT / "tools" / "profiling" / "bachelor" / "playback-attr-3-cuda-job.ps1").read_text(encoding="utf-8")
+        anchor = job.split("# SESSION-ANCHOR-1 >>>", 1)[1].split("# SESSION-ANCHOR-1 <<<", 1)[0]
+        core = job.split("function Get-CorePartitionPlaybackStart(", 1)[1].split("\nfunction ", 1)[0]
+        for name, body in (("Get-MeasuredSmokeSessionId anchored region", anchor), ("Get-CorePartitionPlaybackStart", core)):
+            with self.subTest(region=name):
+                self.assertIsNone(unbounded.search(body), name)
+                self.assertIn("'^[0-9]+$'", body, name)
 
 
 class PrepConflatedMoveLegSpecTests(unittest.TestCase):

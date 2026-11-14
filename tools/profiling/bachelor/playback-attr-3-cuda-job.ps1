@@ -2244,8 +2244,15 @@ function Get-MeasuredSmokeSessionId([string]$RawLog) {
     # run_metadata command line or any other record holding the marker text never selects the session. This region returns or throws;
     # the baseline's substring loops after it stay verbatim (the default job's byte-identity pin) and are no longer reached.
     $recordStart = '^(?:\[[^\]]*\] ){0,3}'
-    foreach ($line in ($RawLog -split "`r?`n")) { if ($line -match ($recordStart + 'playback_smoke\.measured_session id=(?<session>\d+)')) { return $Matches['session'] } }
-    foreach ($line in ($RawLog -split "`r?`n")) { if ($line -match ($recordStart + 'playback_smoke\.summary session=(?<session>\d+)')) { return $Matches['session'] } }
+    # r10 (sol r9 B1 class sweep): the id is the WHOLE token up to whitespace or the end of the line, one plain decimal [0-9]+; a malformed first
+    # marker (or, with no marker, a malformed first summary) is unreadable and throws, never its numeric prefix (id=3x was 3) or a later record's id
+    $token = $null
+    foreach ($line in ($RawLog -split "`r?`n")) { if ($line -match ($recordStart + 'playback_smoke\.measured_session id=(?<session>\S*)')) { $token = $Matches['session']; break } }
+    if ($null -eq $token) { foreach ($line in ($RawLog -split "`r?`n")) { if ($line -match ($recordStart + 'playback_smoke\.summary session=(?<session>\S*)')) { $token = $Matches['session']; break } } }
+    if ($null -ne $token) {
+        if ($token -cmatch '^[0-9]+$') { return $token }
+        throw ("the measured playback_smoke session id is unreadable (not one whole decimal id): '" + $token + "'")
+    }
     throw 'no playback_smoke.summary line found in the MLVApp log'
     # SESSION-ANCHOR-1 <<<
     foreach ($line in ($RawLog -split "`r?`n")) {
@@ -5040,9 +5047,10 @@ function Get-CorePartitionPlaybackStart([string]$LogText, $LaunchUtcTicks, $Laun
         # HFR-NATIVE-M16-1457-FULLSCREEN-S1S2-PRESENT-GAP-1 r5 (Grok G5 sibling): the selectors count a marker only where it STARTS the record body
         # (the $script:DvRecordStart rule), so a marker inside another record's text never picks the session
         $recordStart = '^(?:\[[^\]]*\] ){0,3}'
-        foreach ($ln in $lines) { $mm = [regex]::Match($ln, $recordStart + 'playback_smoke\.measured_session id=(\d+)'); if ($mm.Success) { $sid = $mm.Groups[1].Value; break } }
-        if ($null -eq $sid) { foreach ($ln in $lines) { $mm = [regex]::Match($ln, $recordStart + 'playback_smoke\.summary session=(\d+)'); if ($mm.Success) { $sid = $mm.Groups[1].Value; break } } }
-        if ($null -eq $sid) { return $r }
+        # r10 (sol r9 B1 class sweep): the WHOLE id token, one plain decimal [0-9]+; a malformed one is no session (never its numeric prefix)
+        foreach ($ln in $lines) { $mm = [regex]::Match($ln, $recordStart + 'playback_smoke\.measured_session id=(\S*)'); if ($mm.Success) { $sid = $mm.Groups[1].Value; break } }
+        if ($null -eq $sid) { foreach ($ln in $lines) { $mm = [regex]::Match($ln, $recordStart + 'playback_smoke\.summary session=(\S*)'); if ($mm.Success) { $sid = $mm.Groups[1].Value; break } } }
+        if ($null -eq $sid -or $sid -cnotmatch '^[0-9]+$') { return $r }
         $r.session = [int64]$sid
         $stamp = $null
         foreach ($ln in $lines) { $mm = [regex]::Match($ln, '^\[(?<ts>[^\]]+)\] \[[^\]]*\] \[[^\]]*\] playback_smoke\.start session=' + $sid + '(\s|$)'); if ($mm.Success) { $stamp = $mm.Groups['ts'].Value; break } }

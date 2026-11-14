@@ -775,6 +775,30 @@ class MeasuredSmokeSessionIdTests(unittest.TestCase):
         proc = self._run(meta)
         self.assertNotEqual(proc.returncode, 0, proc.stdout + proc.stderr)
 
+    def test_r10_a_malformed_session_id_is_unreadable_never_its_numeric_prefix(self) -> None:
+        # HFR-NATIVE-M16-1457-FULLSCREEN-S1S2-PRESENT-GAP-1 r10 (sol r9 B1 class sweep, playback-attr-3-cuda-job.ps1:2247/2248): the id is the
+        # whole token up to whitespace or the end of the line. Before r10 `id=3x` (3.5, 3/old) returned 3, the numeric prefix, although a valid
+        # id=4 followed; now a malformed first marker (or, with no marker, a malformed first summary) throws: the measured session is unreadable.
+        for token in ("3x", "3.5", "3/old", "", "-3", "٣"):
+            for name, log in (
+                ("measured marker", f"playback_smoke.measured_session id={token}\nplayback_smoke.summary session=3 reason=play-stop\n"
+                 "playback_smoke.measured_session id=4\nplayback_smoke.summary session=4 reason=play-stop\n"),
+                ("summary fallback", f"playback_smoke.summary session={token} reason=play-stop\nplayback_smoke.summary session=4 reason=play-stop\n"),
+            ):
+                with self.subTest(token=token, case=name):
+                    proc = self._run(log)
+                    self.assertNotEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+                    self.assertNotIn("ID=", proc.stdout)
+                    self.assertIn("unreadable", normalize_pwsh_message_text(proc.stdout + proc.stderr))
+        # controls: a whole id still selects, and a tab after it is whitespace
+        for log, expected in (("playback_smoke.measured_session id=3\nplayback_smoke.summary session=3 reason=play-stop\n", "ID=3"),
+                              ("playback_smoke.measured_session id=3\tx\nplayback_smoke.summary session=3 reason=play-stop\n", "ID=3"),
+                              ("playback_smoke.summary session=12 reason=play-stop\n", "ID=12")):
+            with self.subTest(control=log):
+                proc = self._run(log)
+                self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+                self.assertIn(expected, proc.stdout)
+
     def test_throws_when_neither_marker_nor_summary_is_present(self) -> None:
         proc = self._run("nothing relevant here\n")
         self.assertNotEqual(proc.returncode, 0, proc.stdout + proc.stderr)
