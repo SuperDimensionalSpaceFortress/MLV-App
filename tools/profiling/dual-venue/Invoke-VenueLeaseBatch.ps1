@@ -22,7 +22,8 @@
 #   4. END. A batch ends when its legs are done (ALL_LEGS_DONE), the claim is lost (CLAIM_LOST, 8b), the open's sidecar cannot be written (LIVENESS_UNAVAILABLE,
 #      8a), the next leg would outlive the lease (LEASE_REMAINING_SHORT: the rest go to the next batch; also
 #      a busy probe with less room left after the leg's budget than one -RecheckSec), the lease was lost (LEASE_LOST), demoted (LEASE_DEMOTED / LEASE_RENEW_UNKNOWN, 6e)
-#      or ended under a leg (LEASE_EXPIRED, 7b), the deadline passed (DEADLINE), or a probe could not measure (PROBE_<verdict>: the run stops). An open still
+#      or ended under a leg (LEASE_EXPIRED, 7b), the agent released it as idle while a probe waited with no job (LEASE_IDLE_ENDED: read from the agent's receipt after each probe;
+#      no leg launches on that reading, the leg goes to the next batch), the deadline passed (DEADLINE), or a probe could not measure (PROBE_<verdict>: the run stops). An open still
 #      unanswered is cancelled and reconciled first (7a). The light job
 #      lease-batch-close-<stamp>-lb<token> then releases the lease at once (the agent's idle bound would, later). The agent's own batch receipt is read by
 #      name (logs\lease-batch-<token>.jsonl), and the claim is released.
@@ -1640,6 +1641,17 @@ function Get-LeaseEndUtc($Result) {
     } catch { $null }
 }
 
+function Get-LeaseIdleEnd([string]$Token, [string]$LeaseId) {
+    # LEASE-BATCH-IDLE-END-UNSEEN-1: the agent releases a parked batch lease after LeaseBatchIdleSec (300 s) with no job (ultra-magnus-agent.ps1 Update-LeaseBatchHold) and writes its
+    # receipt line (endReason=idle) at once. A quiet probe that waits in Wait-VenueQuiet's queue gate submits no job for that long, so the lease can end under the wait while the runner
+    # keeps counting its room. Read BY NAME (logs\lease-batch-<token>.jsonl). Returns the agent's record when this lease ended idle, else $null (absent, unreadable, ended another way:
+    # an unreadable share is no evidence, and the leg's own admission still types a lost lease after it runs).
+    if ([string]::IsNullOrWhiteSpace($LeaseId)) { return $null }
+    $ar = Read-VenueLeaseBatchReceipt -AgentShare $AgentShare -Token $Token -LeaseId $LeaseId
+    if ($ar.state -ceq 'FOUND' -and [string]::Equals([string]$ar.record.endReason, 'idle', [StringComparison]::Ordinal)) { return $ar.record }
+    $null
+}
+
 $pending = [System.Collections.Generic.List[object]]::new()
 foreach ($p in $plan) { $pending.Add($p) }
 # r5 (V-01, Invoke-VenueChain's r4 rule): leg name -> the first FOREIGN_FLOOR line any probe of that leg printed, in any attempt or batch. Sticky: a leg
@@ -2182,6 +2194,16 @@ while ($pending.Count -gt 0 -and $null -eq $stopReason) {
                 if ($q.verdict -ceq 'GATE_UNREADABLE') { $b.endReason = 'PROBE_GATE_UNREADABLE'; Set-Stop 'GATE_UNREADABLE' 4; break }
                 if ($q.verdict -ceq 'HOST_MISMATCH') { $b.endReason = 'PROBE_HOST_MISMATCH'; Set-Stop 'HOST_MISMATCH' 5; break }
                 if ($q.verdict -ceq 'VENUE_QUIET_UNKNOWN') { $b.endReason = 'PROBE_VENUE_QUIET_UNKNOWN'; $b.endDetail = $q.reason; Set-Stop 'VENUE_QUIET_UNKNOWN' 6; break }
+                # LEASE-BATCH-IDLE-END-UNSEEN-1: the probe may have waited past the agent's idle bound with no job submitted: if the agent released this lease as idle, the reading
+                # above was taken on a lease that is gone. No leg is launched on it and no more room is counted: the batch ends typed (never LEASE_LOST) and the leg goes to the next batch.
+                $ie = Get-LeaseIdleEnd $token ([string]$b.leaseId)
+                if ($null -ne $ie) {
+                    $ieAt = [DateTimeOffset]::MinValue
+                    if ([DateTimeOffset]::TryParse([string]$ie.endedUtc, [Globalization.CultureInfo]::InvariantCulture, ([Globalization.DateTimeStyles]::AssumeUniversal -bor [Globalization.DateTimeStyles]::AdjustToUniversal), [ref]$ieAt) -and $ieAt.UtcDateTime -lt $leaseEnd) { $leaseEnd = $ieAt.UtcDateTime; $b.leaseEndUtc = $leaseEnd.ToString('o') }
+                    $b.endReason = 'LEASE_IDLE_ENDED'; $b.endDetail = "the agent released lease $($b.leaseId) as idle (endedUtc=$($ie.endedUtc) heldSec=$($ie.heldSec) why=$($ie.why)) while the probe for leg $($leg.name) waited: no leg launched, it goes to the next batch"
+                    L "LEASE_IDLE_ENDED batch=$batchNo leg=$($leg.name) lease=$($b.leaseId) endedUtc=$($ie.endedUtc) heldSec=$($ie.heldSec) (the probe's reading is void: no leg launched, no more room counted)"
+                    break
+                }
                 # adversary r2b A3: the leg's thermal state is made here, so the first KNOWN heat reading counts even from a busy (COOLDOWN_UNMET) probe: heatAtProbe is
                 # the leg's reading right after its predecessor, which the spread measures heavy keys from
                 $th = $legThermal[$leg.name]
@@ -2365,7 +2387,7 @@ while ($pending.Count -gt 0 -and $null -eq $stopReason) {
                 # r3: the agent's own bound (lease-batch r3) stopped the job at its lease's end, on a demoted lease or a lost one: typed as such, never counted.
                 $agentStop = $(if ($null -ne $ja -and $null -ne $ja.leaseStop) { [string]$ja.leaseStop.reason } else { $null })
                 $leaseClass = $(if ($agentStop) { switch ($agentStop) { 'lease-end' { 'LEASE_EXPIRED' } 'demoted' { 'LEASE_DEMOTED' } default { 'LEASE_LOST' } } }
-                    elseif (-not $onLease) { 'LEASE_LOST' } elseif ($null -eq $gap) { 'LEASE_RENEW_UNKNOWN' } elseif ($gap -gt $RenewGapMaxSec) { 'LEASE_DEMOTED' } else { $null })
+                    elseif (-not $onLease) { $(if ($null -ne (Get-LeaseIdleEnd $token ([string]$b.leaseId))) { 'LEASE_IDLE_ENDED' } else { 'LEASE_LOST' }) } elseif ($null -eq $gap) { 'LEASE_RENEW_UNKNOWN' } elseif ($gap -gt $RenewGapMaxSec) { 'LEASE_DEMOTED' } else { $null })
                 $leaseWhy = "jobId=$legJobId result=$($jr.state)$(if ($withdraw) { " withdraw=$withdraw" }) jobLease=$jobLease slotContinuity=$(if ($ja) { $ja.slotContinuity }) renewOkMaxGapSec=$(if ($null -ne $gap) { $gap } else { 'UNKNOWN' })$(if ($agentStop) { " leaseStop=$agentStop" })$(if ($jr.error) { " error=$($jr.error)" })"
                 # r3 (fable r2): a leg whose job took a fresh lease under this token carries that request's exit-75 refusals; the batch receipt counts them too.
                 $legRef = $(if ($null -ne $ja) { @(@($ja.leaseRefusals) | Where-Object { $null -ne $_ -and [string]$_.rc -eq '75' }).Count } else { 0 })

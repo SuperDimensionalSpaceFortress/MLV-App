@@ -91,6 +91,15 @@ switch ($mode) {
     'COOLDOWN' { "COOLDOWN_UNMET mean=32.0% threshold=$ThresholdPercent% waitedSec=1"; exit 0 }
     'FOREIGN' { 'FOREIGN_FLOOR owners=explorer:1,textinputhost:2,bloody7:3 floorMean=32.0% waitedSec=1 probes=3'; "COOLDOWN_UNMET mean=32.0% threshold=$ThresholdPercent% waitedSec=1"; exit 0 }
     'BUSY' { 'GATE_BUSY quiet-probe waitedSec=1'; exit 3 }
+    'IDLE' {
+        # LEASE-BATCH-IDLE-END-UNSEEN-1: the wait outlasted the agent's idle bound (it submitted no job for 300 s): the agent released the parked batch lease and wrote its receipt line
+        # (endReason=idle, ultra-magnus-agent.ps1 Close-LeaseBatch), and the probe still reads QUIET.
+        $stq = Get-Content -LiteralPath (Join-Path $env:FAKE_SHARE 'fake-agent-state.json') -Raw | ConvertFrom-Json
+        $lg = Join-Path $env:FAKE_SHARE 'logs'
+        New-Item -ItemType Directory -Force -Path $lg | Out-Null
+        Add-Content -LiteralPath (Join-Path $lg "lease-batch-$($stq.token).jsonl") -Value (([ordered]@{ schema = 'mlv-agent-lease-batch.v1'; token = $stq.token; leaseId = $stq.leaseId; endedUtc = [DateTimeOffset]::UtcNow.ToString('o'); heldSec = 301; endReason = 'idle'; why = 'no job for 301s > 300s'; jobsRun = 1 }) | ConvertTo-Json -Compress)
+        "QUIET mean=5.0% threshold=$ThresholdPercent% waitedSec=301"; exit 0
+    }
     'UNKNOWN' { "VENUE_QUIET_UNKNOWN mean=UNKNOWN threshold=$ThresholdPercent% waitedSec=1 reason=probe-failed"; exit 6 }
     'STEAL' {
         # r5b (Grok G1): another owner's claim replaces the run's mid-batch (another nonce; its owner pid is dead, so the next batch may break it). The probe
@@ -228,6 +237,12 @@ if ($legMode -eq 'hang') {
     exit 0
 }
 $lose =@(([string]$env:FAKE_LEG_LOSE) -split ',' | Where-Object { $_ } | ForEach-Object { [int]$_ })
+# LEASE-BATCH-IDLE-END-UNSEEN-1: FAKE_LEG_IDLE_END=1 is the idle release landing AFTER the runner's pre-launch read (the agent wrote its endReason=idle line for the batch lease while the leg's job
+# was being admitted, so the job took a fresh lease under the token: pair it with FAKE_LEG_LOSE for that call)
+if ($env:FAKE_LEG_IDLE_END -eq '1') {
+    New-Item -ItemType Directory -Force -Path (Join-Path $share 'logs') | Out-Null
+    Add-Content -LiteralPath (Join-Path $share "logs\lease-batch-$($st.token).jsonl") -Value (([ordered]@{ schema = 'mlv-agent-lease-batch.v1'; token = $st.token; leaseId = $st.leaseId; endedUtc = [DateTimeOffset]::UtcNow.ToString('o'); heldSec = 301; endReason = 'idle'; why = 'no job for 301s > 300s'; jobsRun = 1 }) | ConvertTo-Json -Compress)
+}
 # r12 (adversary A2): FAKE_LEG_LEASE_SHY=1 reports the batch's lease id plus a soft hyphen (U+00AD): culture-aware equality says it is the same lease, ordinal says it is not
 $lid = $(if ($lose -contains ($k + 1)) { 'lease-somebody-else' } elseif ($env:FAKE_LEG_LEASE_SHY -eq '1') { $st.leaseId + [string][char]0x00AD } elseif ($env:FAKE_LEG_LEASE_ID) { $env:FAKE_LEG_LEASE_ID } else { $st.leaseId })
 # r13 (adversary r12 A1): FAKE_LEG_LEASE_ID reports that exact lease id (a different spelling of the batch's instant), instead of the batch's own
@@ -711,6 +726,45 @@ class VenueLeaseBatchRunnerTests(unittest.TestCase):
         self.assertEqual((b2["legsRan"], b2["legsCounted"]), (1, 1))
         res = batch_result(r.stdout)
         self.assertEqual((res["ran"], res["counted"]), (2, 1))
+
+    # ---------------------------------------------------------------- LEASE-BATCH-IDLE-END-UNSEEN-1: the agent's idle release of the parked batch lease
+    def test_an_idle_end_of_the_lease_during_a_quiet_wait_ends_the_batch_before_the_leg_launches(self) -> None:
+        # ledger QUEUED 2026-11-05T20:06:29Z (venue-42012aec): the agent released the idle batch lease (no job for 301 s > 300 s) while the leg's quiet probe waited, the runner kept counting
+        # its room, and the leg then ran on a fresh lease under the token: LEASE_LOST, a clean leg thrown away. The runner now reads the agent's receipt after the probe.
+        r = self.run_batch(self.specs[:2], FAKE_QUIET_MODES="QUIET,IDLE,QUIET")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        b1, b2 = self.batches()
+        t1, t2 = b1["token"], b2["token"]
+        self.assertEqual(self.kinds(), [f"OPEN:{t1}", "QUIET:QUIET", f"LEG:fx-a:{t1}", "QUIET:IDLE", f"CLOSE:{t1}", f"OPEN:{t2}", "QUIET:QUIET", f"LEG:fx-b:{t2}", f"CLOSE:{t2}"])
+        self.assertEqual((b1["endReason"], b1["legsAttempted"], b1["legsRan"], b1["legsCounted"]), ("LEASE_IDLE_ENDED", 1, 1, 1), b1)
+        self.assertNotIn("LEASE_LOST", [l.get("class") for b in (b1, b2) for l in b["legs"]], "an idle end is never typed LEASE_LOST")
+        self.assertEqual((b2["endReason"], b2["legsRan"], b2["legsCounted"]), ("ALL_LEGS_DONE", 1, 1), "the leg goes to the next batch and counts there")
+        self.assertEqual(b1["agent"]["endReason"], "idle", "the agent's own receipt for the lease is attached")
+        self.assertIn("the agent released lease lease-1 as idle", b1["endDetail"])
+        # the room accounting stops at the idle end: the lease's end is clamped to the agent's endedUtc, and no later line of batch 1 counts room
+        ended = datetime.fromisoformat(b1["agent"]["endedUtc"].replace("Z", "+00:00"))
+        lease_end = datetime.fromisoformat(b1["leaseEndUtc"].replace("Z", "+00:00"))
+        self.assertLessEqual(lease_end, ended + timedelta(seconds=1), (b1["leaseEndUtc"], b1["agent"]["endedUtc"]))
+        lines = (self.run_dir / "batch.log").read_text(encoding="utf-8").splitlines()
+        at = next(i for i, l in enumerate(lines) if " LEASE_IDLE_ENDED batch=1 " in l)
+        self.assertFalse([l for l in lines[at + 1:] if "batch=1 " in l and "roomSec=" in l and " BATCH_END " not in l], lines[at:])
+        res = batch_result(r.stdout)
+        self.assertEqual((res["ran"], res["counted"]), (2, 2))
+
+    def test_a_leg_that_finished_after_the_agent_idled_its_lease_is_typed_idle_ended_not_lease_lost(self) -> None:
+        # the idle release landing after the pre-launch read: the leg's job took a fresh lease under the token (not the batch's), and the agent's receipt for the batch lease says idle
+        r = self.run_batch(self.specs[:2], FAKE_LEG_LOSE="1", FAKE_LEG_IDLE_END="1")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        b1 = self.batches()[0]
+        self.assertEqual((b1["endReason"], b1["legsRan"], b1["legsCounted"]), ("LEASE_IDLE_ENDED", 1, 0), b1)
+        self.assertEqual((b1["legs"][0]["class"], b1["legs"][0]["counted"], b1["legs"][0]["onLease"]), ("LEASE_IDLE_ENDED", False, False), b1["legs"][0])
+
+    def test_a_lost_lease_with_no_idle_receipt_is_still_lease_lost(self) -> None:
+        # control: the typed idle end needs the agent's endReason=idle line for THIS lease; another end reason on it leaves LEASE_LOST as it was
+        r = self.run_batch(self.specs[:2], FAKE_LEG_LOSE="1")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        b1 = self.batches()[0]
+        self.assertEqual((b1["endReason"], b1["legs"][0]["class"], b1["agent"]["endReason"]), ("LEASE_LOST", "LEASE_LOST", "closed"), b1)
 
     def test_r12_adversary_a2_a_job_lease_that_differs_only_by_an_ignorable_character_is_another_lease(self) -> None:
         # adversary r11 A2 on e5ff0114 (sibling Invoke-VenueLeaseBatch.ps1:2013): jobLease -ceq $b.leaseId is culture-aware, so lease-1 + U+00AD read as the batch's own lease
