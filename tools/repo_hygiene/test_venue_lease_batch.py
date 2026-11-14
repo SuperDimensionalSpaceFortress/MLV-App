@@ -1230,6 +1230,31 @@ class VenueLeaseBatchRunnerTests(unittest.TestCase):
         self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
         self.assertEqual(json.loads(out.stdout), {"ahead": True, "unreadable": True, "absent": True, "past": True, "beforeFloor": True})
 
+    def test_lease_batch_idle_end_r7_adv_a1_a_pause_between_the_two_clock_reads_never_places_the_end_late(self) -> None:
+        # adversary-cc90eef2.json A1: Get-AgentJobEndTs read the wall clock (`ago`) and THEN the monotonic one (`nowTs`), so a scheduling pause between the two reads was added to
+        # the anchor: the job's end landed that pause late and the idle allowance got that time back (a 6 s pause granted 3 s past an exhausted allowance). The helper is rebuilt
+        # here with a 1.5 s sleep after EVERY statement of its body (whatever order the reads are in, a pause sits between them), the job ended 2 s before the call. The anchor
+        # may land earlier than the true end (spent, conservative), never more than 0.3 s later. Siblings: every Get-AgentJobEndTs caller (:2324 open, :2559 leg) and every
+        # Get-IdleAllowanceSec reader (:1517 probe wait, :2469 thermal sleep, :2638 cooldown) read the anchor this helper places; no other wall-to-monotonic conversion exists.
+        script = (
+            f"$ast = [System.Management.Automation.Language.Parser]::ParseFile('{psq(RUNNER)}', [ref]$null, [ref]$null)\n"
+            "$fa = $ast.Find({ param($x) $x -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $x.Name -eq 'ConvertTo-AgentUtc' }, $true); . ([scriptblock]::Create($fa.Extent.Text))\n"
+            "$fn = $ast.Find({ param($x) $x -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $x.Name -eq 'Get-AgentJobEndTs' }, $true)\n"
+            "$stmts = @($fn.Body.EndBlock.Statements | ForEach-Object { $_.Extent.Text })\n"
+            "$text = 'function Get-AgentJobEndTs(' + (@($fn.Parameters | ForEach-Object { $_.Extent.Text }) -join ', ') + \") {`n\" + ($stmts -join \"`nStart-Sleep -Milliseconds 1500`n\") + \"`n}\"\n"
+            ". ([scriptblock]::Create($text))\n"
+            "$f = [Diagnostics.Stopwatch]::Frequency; $t0Ts = [Diagnostics.Stopwatch]::GetTimestamp(); $t0 = [DateTime]::UtcNow\n"
+            "$trueEnd = $t0Ts - 2 * $f; $floor = $t0Ts - 100 * $f\n"
+            "$a = Get-AgentJobEndTs $t0Ts $floor ($t0.AddSeconds(-2).ToString('o'))\n"
+            "[ordered]@{ statements = $stmts.Count; lateSec = [Math]::Round(($a - $trueEnd) / [double]$f, 3); atOrAboveFloor = ($a -ge $floor) } | ConvertTo-Json -Compress\n"
+        )
+        out = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, timeout=120)
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        got = json.loads(out.stdout)
+        self.assertGreaterEqual(got["statements"], 3, got)
+        self.assertTrue(got["atOrAboveFloor"], got)
+        self.assertLessEqual(got["lateSec"], 0.3, f"a pause between the clock reads placed the agent job's end late (time handed back to the idle allowance): {got}")
+
     def test_lease_batch_idle_end_r6_grok_g11_every_idle_end_call_names_its_parameters_in_full(self) -> None:
         # Grok G11 on #817: a call that abbreviates a parameter (-Append for -AppendDetail) binds today by prefix and turns into an ambiguous-parameter error (BATCH_ERROR on a rare
         # path) the day the helper gains another -Append* parameter. Every Set-BatchLeaseIdleEnded call names each parameter exactly as the helper declares it (AST on both sides).

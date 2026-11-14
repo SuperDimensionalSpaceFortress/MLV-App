@@ -1760,9 +1760,12 @@ function Get-AgentJobEndTs([long]$ObservedTs, [long]$FloorTs, $EndedUtc) {
     # r6 (adversary-848f6559.json A2): an endedUtc that says nothing usable about when the job ended (unreadable, absent, or in this host's future: an agent clock AHEAD, `ago`
     # negative) gives the FLOOR, the job's send, never the observed instant: the job may have been over for as long as it took to come back, and that time is spent. A clock
     # ahead by less than the job-to-observation gap still reads a positive `ago` and places the end up to that skew late (bounded by the skew, never past the observation).
+    # r7 (adversary-cc90eef2.json A1): the MONOTONIC clock is read first and the wall clock after it. A pause between the two reads then only makes `ago` longer, which places
+    # the end earlier (spent); read the other way round, the pause was added to the anchor and handed back to the idle allowance.
     $at = ConvertTo-AgentUtc $EndedUtc
     if ($null -eq $at) { return $FloorTs }
-    $ago = ([DateTime]::UtcNow - $at).TotalSeconds; $nowTs = [Diagnostics.Stopwatch]::GetTimestamp()
+    $nowTs = [Diagnostics.Stopwatch]::GetTimestamp()
+    $ago = ([DateTime]::UtcNow - $at).TotalSeconds
     if ($ago -lt 0) { return $FloorTs }
     $ts = [Math]::Min($ObservedTs, $nowTs - [long]($ago * [Diagnostics.Stopwatch]::Frequency))
     if ($ts -lt $FloorTs) { $ts = $FloorTs }
