@@ -4350,6 +4350,9 @@ $r.noSinkStamp = Pick (Get-CorePartitionPlaybackStart "playback_smoke.start sess
 $r.unparseableStamp = Pick (Get-CorePartitionPlaybackStart "[not-a-time] [info] [0x1] playback_smoke.start session=1 position=0`nplayback_smoke.measured_session id=1" $L.Ticks 1000 1000 0 41000)
 $r.noSession = Pick (Get-CorePartitionPlaybackStart (Ln 1000 'playback_smoke.start session=1 position=0') $L.Ticks 1000 1000 0 41000)
 $r.emptyLog = Pick (Get-CorePartitionPlaybackStart '' $L.Ticks 1000 1000 0 41000)
+# HFR-NATIVE-M16-1457-FULLSCREEN-S1S2-PRESENT-GAP-1 r5 (Grok G5 sibling, r4 adversary pass 10 A1): a marker inside another record's text never selects the session
+$r.embeddedMeasuredMarkerIsNotTheSession = Pick (Get-CorePartitionPlaybackStart (@((Ln 500 'interaction_trace event=automation.start note=playback_smoke.measured_session id=9'), (Ln 1000 'playback_smoke.start session=1 position=0'), (Ln 1100 'playback_smoke.measured_session id=1'), (Sm 31000 '30000.000')) -join "`n") $L.Ticks 1000 1000 0 41000)
+$r.embeddedSummaryMarkerIsNotTheSession = Pick (Get-CorePartitionPlaybackStart (@((Ln 500 'interaction_trace event=automation.start note=playback_smoke.summary session=9 reason=x'), (Ln 2000 'playback_smoke.start session=3 position=0'), (Sm 40000 '38000.000' 3)) -join "`n") $L.Ticks 1000 1000 0 42000)
 # r13b (adversary r13 028f4619 A1): the stamp is trusted only when the app's monotonic elapsed_ms agrees with it, and the stamped gap is under the
 # job's monotonic ceiling. The adversary's input: playback really starts at L+60000 (mono 61000); a backward step between two polls stamps it L+3000.
 $a1 = @((Ln 3000 'playback_smoke.start session=1 position=0 worker_threads=8'), (Ln 3010 'playback_smoke.measured_session id=1'), (Sm 89500 '29500.000')) -join "`n"
@@ -4667,6 +4670,9 @@ class CorePartitionR13StartTests(unittest.TestCase):
         self.assertEqual(r["selA1dUnambiguousControl"], ["", 0, 1])
         self.assertEqual(r["sessionPrefixIsNotTheSession"], [unverified, None, 1])
         self.assertEqual(r["summaryFallback"], ["", 2000, 3])
+        # r5 (Grok G5 sibling): the marker counts only where it starts the record body ($script:DvRecordStart rule)
+        self.assertEqual(r["embeddedMeasuredMarkerIsNotTheSession"], ["", 1000, 1])
+        self.assertEqual(r["embeddedSummaryMarkerIsNotTheSession"], ["", 2000, 3])
         self.assertEqual(r["unknownSkew"], [unverified, None, 1])
         self.assertEqual(r["noSinkStamp"], [unverified, None, 1])
         self.assertEqual(r["unparseableStamp"], [unverified, None, 1])

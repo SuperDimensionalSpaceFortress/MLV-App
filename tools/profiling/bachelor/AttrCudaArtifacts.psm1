@@ -3484,13 +3484,17 @@ function Get-AttrCudaSelfHealMetrics {
     $sessionLine = {
         param([string]$LogText, [string]$Session, [string]$Marker)
         if ([string]::IsNullOrEmpty($LogText)) { return $null }
+        # HFR-NATIVE-M16-1457-FULLSCREEN-S1S2-PRESENT-GAP-1 r5 (Grok G5 sibling, r4 adversary pass 10 A1): a marker counts only where it STARTS the
+        # record body, after at most three `[...] ` prefix fields (DualVenueRunner.psm1's $script:DvRecordStart rule; one line, so no field spans a
+        # newline), never as text inside another record's line
+        $recordStart = '(?m)^(?:\[[^\]\r\n]*\] ){0,3}'
         if ([string]::IsNullOrEmpty($Session)) {
-            $sm = [regex]::Match($LogText, 'playback_smoke\.measured_session id=(\d+)')
+            $sm = [regex]::Match($LogText, $recordStart + 'playback_smoke\.measured_session id=(\d+)')
             if (-not $sm.Success) { return $null }
             $Session = $sm.Groups[1].Value
         }
         $found = $null
-        foreach ($lm in [regex]::Matches($LogText, '(?m)' + [regex]::Escape($Marker) + ' session=' + [regex]::Escape($Session) + ' (?<rest>[^\r\n]*)')) { $found = $lm.Groups['rest'].Value }
+        foreach ($lm in [regex]::Matches($LogText, $recordStart + [regex]::Escape($Marker) + ' session=' + [regex]::Escape($Session) + ' (?<rest>[^\r\n]*)')) { $found = $lm.Groups['rest'].Value }
         if ($null -eq $found) { return $null }
         $fields = @{}
         foreach ($kv in [regex]::Matches($found, '([A-Za-z0-9_]+)=(\S*)')) { $fields[$kv.Groups[1].Value] = $kv.Groups[2].Value }

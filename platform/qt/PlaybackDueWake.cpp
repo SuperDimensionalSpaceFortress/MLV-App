@@ -204,7 +204,10 @@ LRESULT CALLBACK dueWakeWindowProc( HWND hwnd, UINT message, WPARAM wParam, LPAR
 {
     if( message == PlaybackDueWake::kNativeWakeMessage )
     {
-        // reached only when the Qt filter did not see it (a modal loop dispatching on its own)
+        // r5 (Grok G6): with SendNotify, the default delivery (postDueWake below), a sent wake never passes the Qt native
+        // event filter (DueWakeNativeFilter: it sees only messages the dispatcher peeks as posted), so every sent wake
+        // reaches this window procedure, and the runner-sleep hold happens here. Under the Post arm a posted wake reaches it
+        // only when the Qt filter did not see it (a modal loop dispatching on its own)
         PlaybackDueWake *wake = reinterpret_cast<PlaybackDueWake *>( GetWindowLongPtrW( hwnd, GWLP_USERDATA ) );
         if( wake )
         {

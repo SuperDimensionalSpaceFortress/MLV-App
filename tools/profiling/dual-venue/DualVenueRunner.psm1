@@ -1939,6 +1939,8 @@ function Get-DvDueWakeDeliveryEvidence {
     at the next pace_summary or at any playback_smoke record of another session. r4 (r4 adversary pass 9 A1): a leg that does not ask also blocks when the
     measured line says disabled=1 (DUE_WAKE_DISABLED_INHERITED: MLVAPP_PLAYBACK_DUE_WAKE=0 came from the launcher; a control binary's line included), and
     when a PACED leg's measured Play armed no wake (delivery=none: DUE_WAKE_NOT_ENGAGED); "none" is the app's own only on a generatorArgs.unpaced = true leg.
+    r5 (Grok G8, r4 adversary pass 10 A2/A3): a disabled= that is not exactly one 0 or 1 across the measured window's wake records blocks such a leg on a
+    control binary's line too (DUE_WAKE_DISABLED_UNREADABLE), and a playback_smoke.measured_session id= of another session closes the window.
     Pure and shared: the runner gates on it and Test-DvReceiptValid re-derives it from the hashed run log.
     #>
     param([Parameter(Mandatory)]$Spec, [AllowNull()][AllowEmptyString()][string]$LogText)
@@ -1966,8 +1968,9 @@ function Get-DvDueWakeDeliveryEvidence {
             foreach ($l in (Get-DvLogRecordBodies -LogText $LogText)) {
                 if ($l -match ($start + 'playback_smoke\.pace_summary session=')) { $open = ($l -match $paceRx); if ($open) { $paces++ }; continue }
                 # r2 adversary pass 6 A2: any playback_smoke record of ANOTHER session (its start, summary, ...) closes the window, so another Play's
-                # wake line never stands in for the measured Play's missing one
-                if ($open -and $l -match ($start + 'playback_smoke\.[A-Za-z0-9_]+ session=(?<s>\S+)') -and $Matches['s'] -cne [string]$session) { $open = $false; continue }
+                # wake line never stands in for the measured Play's missing one. r5 (r4 adversary pass 10 advisory A3): measured_session names its
+                # session with id=, not session=, and closes the window the same way
+                if ($open -and $l -match ($start + 'playback_smoke\.(?:measured_session id=|[A-Za-z0-9_]+ session=)(?<s>\S+)') -and $Matches['s'] -cne [string]$session) { $open = $false; continue }
                 # r1 adversary pass 2 A4: the window stays open to the next pace_summary, so a second line in it is seen (and is unreadable).
                 # r2 adversary pass 6 A1: ANY playback_due_wake record (the app prints exactly one shape, starting armed=) is a candidate, so a second
                 # one without armed= makes the read unreadable instead of being skipped
@@ -1979,14 +1982,14 @@ function Get-DvDueWakeDeliveryEvidence {
     # fallback arm; delivery= is what this Play's arms used (native-msg, qtimer, notifier, "+"-joined when they differed, none with no arm)
     $mechanism = $null
     # r4 (r4 adversary pass 9 A1): disabled= is the app's MLVAPP_PLAYBACK_DUE_WAKE kill switch (MainWindow::playbackDueWakeSummaryLine prints 0 or 1), read
-    # from the measured line whether or not it carries a delivery_kind (a control binary's line has none); a repeated or non-0/1 value is unreadable
+    # from the measured line whether or not it carries a delivery_kind (a control binary's line has none); a repeated or non-0/1 value is unreadable.
+    # r5 (Grok G8 = r4 adversary pass 10 advisory A2): the repeat is counted across every wake record in the measured window (a second control line
+    # repeats it), and an unreadable value blocks a leg that does not ask on a line with no delivery_kind too (DUE_WAKE_DISABLED_UNREADABLE below)
     $disabledSeen = $false
     $disabledUnreadable = $false
-    if ($candidates.Count -eq 1) {
-        $dis = [regex]::Matches($candidates[0], '(?:^|\s)disabled=(?<d>\S*)')
-        if ($dis.Count -gt 1 -or ($dis.Count -eq 1 -and $dis[0].Groups['d'].Value -cnotmatch '^[01]$')) { $disabledUnreadable = $true }
-        elseif ($dis.Count -eq 1 -and $dis[0].Groups['d'].Value -ceq '1') { $disabledSeen = $true }
-    }
+    $dis = @(foreach ($c in $candidates) { [regex]::Matches($c, '(?:^|\s)disabled=(?<d>\S*)') })
+    if ($dis.Count -gt 1 -or ($dis.Count -eq 1 -and $dis[0].Groups['d'].Value -cnotmatch '^[01]$')) { $disabledUnreadable = $true }
+    elseif ($dis.Count -eq 1 -and $dis[0].Groups['d'].Value -ceq '1') { $disabledSeen = $true }
     $unpacedRaw = Get-DvProp (Get-DvProp $Spec 'generatorArgs') 'unpaced'
     $unpacedLeg = ($unpacedRaw -is [bool]) -and $unpacedRaw
     $withKind = @($candidates | Where-Object { $_ -match '(?:^|\s)delivery_kind=' })
@@ -2028,6 +2031,11 @@ function Get-DvDueWakeDeliveryEvidence {
         # leg's own arm (no leg spec sets it), and it also changes how an unpaced Play advances, so disabled=1 blocks every leg that does not ask, a control
         # binary's line included
         $verdict = 'NOT_HONOURED'; $reason = 'DUE_WAKE_DISABLED_INHERITED: the measured session''s playback_due_wake line says disabled=1 (MLVAPP_PLAYBACK_DUE_WAKE=0 came from the launcher), so this run is not the arm its leg names'
+    }
+    elseif ($disabledUnreadable) {
+        # r5 (Grok G8 = r4 adversary pass 10 advisory A2): a control binary's line (no delivery_kind, so no mention) with disabled=yes, an empty disabled=
+        # or a repeated disabled= cannot show the kill switch off, so it blocks like a line with a delivery_kind does (the $unreadableSeen path above)
+        $verdict = 'NOT_HONOURED'; $reason = 'DUE_WAKE_DISABLED_UNREADABLE: the kill switch is unreadable: the measured session''s playback_due_wake records carry a disabled= that is not exactly one 0 or 1 (MainWindow::playbackDueWakeSummaryLine prints one), so the kill switch is not shown off'
     }
     elseif ($mentions -gt 0) {
         # r1 adversary passes 1 A1 / 2 A1: a selection the variable makes (post, notifier) is inherited whatever the arms used; qtimer (no native wake

@@ -11370,11 +11370,12 @@ class SelfHealLegGatesTheL1ToL4FactsTests(unittest.TestCase):
         "fps-absent-l3": (["selfHealL3FpsRatio"], "COUNTER_ABSENT"),
     }
 
-    def evaluate(self, cases, measured_fps: str = "23.201") -> dict:
+    def evaluate(self, cases, measured_fps: str = "23.201", measured_log: str | None = None) -> dict:
         with tempfile.TemporaryDirectory(prefix="sh-gate-") as d:
             measured = Path(d) / "measured.log"
-            measured.write_text("playback_smoke.measured_session id=1\nplayback_smoke.summary session=1 reason=visual-capture presented_frames=599 "
-                                f"presented_fps={measured_fps}\n", encoding="utf-8")
+            measured.write_text(measured_log if measured_log is not None else
+                                ("playback_smoke.measured_session id=1\nplayback_smoke.summary session=1 reason=visual-capture presented_frames=599 "
+                                 f"presented_fps={measured_fps}\n"), encoding="utf-8")
             for case in cases:
                 if case != "l4-counters-only":
                     write_self_heal_evidence(Path(d) / case / "self-heal", "good" if case == "good" else case)
@@ -11461,6 +11462,22 @@ class SelfHealLegGatesTheL1ToL4FactsTests(unittest.TestCase):
                 for n in (1, 2, 3):
                     self.assertIsNone(got["metrics"][f"selfHealL{n}FpsRatio"])
                     self.assertIsNotNone(got["metrics"][f"selfHealL{n}PresentedFps"])
+
+    def test_r5_the_measured_session_and_its_summary_count_only_where_they_start_the_record_body(self) -> None:
+        """HFR-NATIVE-M16-1457-FULLSCREEN-S1S2-PRESENT-GAP-1 r5 (Grok G5 sibling, r4 adversary pass 10 A1): AttrCudaArtifacts' session-line reader takes
+        the measured session and its marker line only where they START the record body ($script:DvRecordStart rule). Before r5 a run_metadata line
+        holding `playback_smoke.measured_session id=9` picked session 9 (no summary: MEASURED_FPS_UNUSABLE), and a later record holding summary text
+        supplied presented_fps=0."""
+        prefix = "[2026-11-13T00:00:00.000Z] [INFO] [0x1a2b] "
+        real = (prefix + "playback_smoke.measured_session id=1\n" + prefix
+                + "playback_smoke.summary session=1 reason=visual-capture presented_frames=599 presented_fps=23.201\n")
+        for name, log in (("embedded measured marker first",
+                           prefix + 'run_metadata={"command_line":["MLVApp.exe","C:/runs/playback_smoke.measured_session id=9/in"]}\n' + real),
+                          ("embedded summary text last", real + prefix + "interaction_trace event=x note=playback_smoke.summary session=1 presented_fps=0\n")):
+            with self.subTest(case=name):
+                got = self.evaluate(["good"], measured_log=log)["good"]
+                self.assertTrue(got["pass"] and got["supplementaryPass"], got["failures"])
+                self.assertEqual(got["metrics"]["selfHealL1FpsRatio"], 0.974)
 
 
 class VisualCaptureSpecAndAppSourceTests(unittest.TestCase):
@@ -15422,6 +15439,56 @@ class DueWakeDeliveryEvidenceTests(unittest.TestCase):
         v = self.verdict(self.POST, self.log(disabled))
         self.assertEqual((v["verdict"], v["blocks"]), ("NOT_HONOURED", True), v)
         self.assertIn("ROUTE_NOT_ENGAGED", v["reason"])
+
+    def test_r5_g8_an_unreadable_kill_switch_on_a_control_binary_line_blocks(self) -> None:
+        # r5 (Grok G8 = r4 adversary pass 10 advisory A2): disabled= is read whether or not the line carries a delivery_kind, so an unreadable value on a
+        # control binary's line (no delivery_kind: no kind is a mention) blocks a leg that does not ask; before r5 it fell through to NOT_REQUESTED
+        cell = json.loads((DV / "legs" / "m16-1457-native-fullscreen-s1.json").read_text(encoding="utf-8"))
+        control = self.wake(None)
+        self.assertNotIn("delivery_kind=", control)
+        for spec_name, spec in (("committed paced cell", cell), ("no generatorArgs", {}), ("unpaced leg", {"generatorArgs": {"unpaced": True}})):
+            for name, log in (("disabled=yes", self.log(control.replace("disabled=0", "disabled=yes"))),
+                              ("empty disabled=", self.log(control.replace("disabled=0", "disabled="))),
+                              ("two disabled=, both 0", self.log(control + " disabled=0")),
+                              ("two disabled=, 0 then 1", self.log(control + " disabled=1")),
+                              ("crash-forensics prefix, disabled=yes", self.log(self.PREFIX + control.replace("disabled=0", "disabled=yes"))),
+                              # the repeat is counted across the measured window's wake records, not per line
+                              ("two control lines in the measured window", self.log(control, control))):
+                with self.subTest(spec=spec_name, case=name):
+                    v = self.verdict(spec, log)
+                    self.assertEqual((v["requested"], v["verdict"], v["blocks"]), (False, "NOT_HONOURED", True), v)
+                    self.assertIn("DUE_WAKE_DISABLED_UNREADABLE", v["reason"])
+            # unchanged: a control line with a readable disabled=0 (or none at all) leaves a leg that does not ask unchanged
+            for name, log in (("disabled=0", self.log(control)), ("no disabled=", self.log(control.replace(" disabled=0", "")))):
+                with self.subTest(spec=spec_name, case=name):
+                    v = self.verdict(spec, log)
+                    self.assertEqual((v["verdict"], v["blocks"]), ("NOT_REQUESTED", False), v)
+
+    def test_r5_a3_a_measured_session_record_of_another_session_closes_the_window(self) -> None:
+        # r5 (r4 adversary pass 10 advisory A3, verbatim shape): `playback_smoke.measured_session id=4` names its session with id=, not session=, and
+        # it is a playback_smoke record of ANOTHER session, so it closes the measured wake window like any other; a wake record after it is not the
+        # measured Play's
+        def closed(marker: str, wake: str) -> str:
+            return "\n".join(["playback_smoke.measured_session id=3", "playback_smoke.summary session=3 reason=reached presented_frames=600",
+                              "playback_smoke.pace_summary session=3 first_present_ms=40.000 paced_elapsed_ms=25000.000", marker, wake]) + "\n"
+        cell = json.loads((DV / "legs" / "m16-1457-native-fullscreen-s1.json").read_text(encoding="utf-8"))
+        for name, marker in (("bare", "playback_smoke.measured_session id=4"), ("crash-forensics prefix", self.PREFIX + "playback_smoke.measured_session id=4"),
+                             ("trailing fields", "playback_smoke.measured_session id=4 reason=second")):
+            with self.subTest(case=name, leg="posted"):
+                v = self.verdict(self.POST, closed(marker, self.wake("post")))
+                self.assertEqual((v["verdict"], v["blocks"]), ("NOT_HONOURED", True), v)
+                self.assertIn("ROUTE_NOT_ENGAGED", v["reason"])
+            with self.subTest(case=name, leg="head, another session's kill switch"):
+                v = self.verdict(cell, closed(marker, self.wake("send").replace("disabled=0", "disabled=1")))
+                self.assertEqual((v["verdict"], v["blocks"]), ("NOT_REQUESTED", False), v)
+        # the measured session's own measured_session record keeps the window open (sessions compare as written, like session= above)
+        for name, marker in (("same session", "playback_smoke.measured_session id=3"), ("same session, prefix", self.PREFIX + "playback_smoke.measured_session id=3")):
+            with self.subTest(case=name):
+                v = self.verdict(self.POST, closed(marker, self.wake("post")))
+                self.assertEqual((v["verdict"], v["blocks"]), ("HONOURED", False), v)
+        # a measured_session id= inside another record's text is not a record and closes nothing
+        v = self.verdict(self.POST, closed("playback_smoke.startup_catchup session=3 frames=0 note=playback_smoke.measured_session id=4", self.wake("post")))
+        self.assertEqual((v["verdict"], v["blocks"]), ("HONOURED", False), v)
 
 
 @requires_windows_pwsh

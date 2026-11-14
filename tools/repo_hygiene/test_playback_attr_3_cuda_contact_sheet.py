@@ -754,6 +754,27 @@ class MeasuredSmokeSessionIdTests(unittest.TestCase):
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         self.assertIn("ID=7", proc.stdout)
 
+    def test_r5_a_marker_counts_only_where_it_starts_the_record_body(self) -> None:
+        # HFR-NATIVE-M16-1457-FULLSCREEN-S1S2-PRESENT-GAP-1 r5 (Grok G5 sibling, r4 adversary pass 10 A1): the dual-venue
+        # reader's $script:DvRecordStart rule -- at most three `[...] ` prefix fields, then the marker. A run_metadata
+        # command line (or any record) holding the marker text never selects the session; before r5 it chose 9.
+        prefix = "[2026-11-13T00:00:00.000Z] [INFO] [0x1a2b] "
+        meta = prefix + 'run_metadata={"command_line":["MLVApp.exe","C:/runs/playback_smoke.measured_session id=9/in"]}\n'
+        for name, log, expected in (
+            ("embedded measured marker", meta + prefix + "playback_smoke.measured_session id=2\n"
+             + prefix + "playback_smoke.summary session=2 reason=play-stop elapsed_ms=1000\n", "ID=2"),
+            ("embedded summary text before the real summary", prefix + "interaction_trace event=x note=playback_smoke.summary session=9 reason=y\n"
+             + prefix + "playback_smoke.summary session=7 reason=play-stop elapsed_ms=1000\n", "ID=7"),
+            ("bare marker", "playback_smoke.measured_session id=4\nplayback_smoke.summary session=4 reason=play-stop\n", "ID=4"),
+        ):
+            with self.subTest(case=name):
+                proc = self._run(log)
+                self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+                self.assertIn(expected, proc.stdout)
+        # only embedded text: neither a marker nor a summary record, so the selector refuses
+        proc = self._run(meta)
+        self.assertNotEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+
     def test_throws_when_neither_marker_nor_summary_is_present(self) -> None:
         proc = self._run("nothing relevant here\n")
         self.assertNotEqual(proc.returncode, 0, proc.stdout + proc.stderr)
