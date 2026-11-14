@@ -1136,7 +1136,10 @@ class SourceFramesOracleParityTests(unittest.TestCase):
         mutations = {
             "guard disabled": ("if ($sourceFramesVerdict.invalid) {", "if ($false -and $sourceFramesVerdict.invalid) {"),
             "guard inverted": ("if ($sourceFramesVerdict.invalid) {", "if (-not $sourceFramesVerdict.invalid) {"),
-            "any session's line accepted": ("[regex]::Escape([string]$measuredSmokeSessionId)", "''"),
+            # HFR-NATIVE-M16-1457-FULLSCREEN-S1S2-PRESENT-GAP-1 r5: the effective summary pick is the anchored re-pick (SESSION-ANCHOR-1), which
+            # replaces the baseline's substring pick kept verbatim above it, so the mutation targets the re-pick
+            "any session's line accepted": ("($sourceFramesRecordStart + 'playback_smoke\\.summary session=' + [regex]::Escape([string]$measuredSmokeSessionId)",
+                                            "($sourceFramesRecordStart + 'playback_smoke\\.summary session=' + ''"),
             "verdict ignored": ("$sourceFramesVerdict = Get-AttrCudaConformAwareSourceFramesVerdict -SummaryLine $sourceFramesSummaryLine -ExpectedRunNonce $runLog.runNonce -ConformLine $sourceFramesConformLine",
                                 "$sourceFramesVerdict = [pscustomobject]@{ invalid = $false; wrapped = $false; failures = @(); sourceAdvanced = 0; requiredSourceFrames = 0 }"),
         }

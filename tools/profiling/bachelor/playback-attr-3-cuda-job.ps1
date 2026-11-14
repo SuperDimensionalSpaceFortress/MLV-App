@@ -2237,19 +2237,24 @@ function Get-MeasuredSmokeSessionId([string]$RawLog) {
     block even starts (see runGuiPlaybackSmoke's own ordering comment), so every session opened
     afterwards is chronologically LATER, and the FIRST playback_smoke.summary line's session id
     is still the measured one.
-    HFR-NATIVE-M16-1457-FULLSCREEN-S1S2-PRESENT-GAP-1 r5 (Grok G5 sibling, r4 adversary pass 10 A1): each marker
-    counts only where it STARTS the record body, after at most three `[...] ` prefix fields -- the dual-venue
-    reader's $script:DvRecordStart rule (DualVenueRunner.psm1) -- so a run_metadata command line or any other
-    record holding the marker text never selects the session.
     #>
+    # SESSION-ANCHOR-1 >>>
+    # HFR-NATIVE-M16-1457-FULLSCREEN-S1S2-PRESENT-GAP-1 r5 (Grok G5 sibling, r4 adversary pass 10 A1): each marker counts only where it
+    # STARTS the record body, after at most three `[...] ` prefix fields (DualVenueRunner.psm1's $script:DvRecordStart rule), so a
+    # run_metadata command line or any other record holding the marker text never selects the session. This region returns or throws;
+    # the baseline's substring loops after it stay verbatim (the default job's byte-identity pin) and are no longer reached.
     $recordStart = '^(?:\[[^\]]*\] ){0,3}'
+    foreach ($line in ($RawLog -split "`r?`n")) { if ($line -match ($recordStart + 'playback_smoke\.measured_session id=(?<session>\d+)')) { return $Matches['session'] } }
+    foreach ($line in ($RawLog -split "`r?`n")) { if ($line -match ($recordStart + 'playback_smoke\.summary session=(?<session>\d+)')) { return $Matches['session'] } }
+    throw 'no playback_smoke.summary line found in the MLVApp log'
+    # SESSION-ANCHOR-1 <<<
     foreach ($line in ($RawLog -split "`r?`n")) {
-        if ($line -match ($recordStart + 'playback_smoke\.measured_session id=(?<session>\d+)')) {
+        if ($line -match 'playback_smoke\.measured_session id=(?<session>\d+)') {
             return $Matches['session']
         }
     }
     foreach ($line in ($RawLog -split "`r?`n")) {
-        if ($line -match ($recordStart + 'playback_smoke\.summary session=(?<session>\d+)')) {
+        if ($line -match 'playback_smoke\.summary session=(?<session>\d+)') {
             return $Matches['session']
         }
     }
@@ -3775,14 +3780,23 @@ if (-not $verdict.admitted) {
 # the admitted Play had to; a receipt with fewer (or none, or a run paced by a persisted fps override, or a
 # wrapped timeline) is INVALID, never MEASUREMENT_CAPTURED -- whatever the smoke runner's exit code said.
 $sourceFramesSummaryLine = $null
+foreach ($candidateLine in ($rawLog -split "`r?`n")) {
+    if ($candidateLine -match ('playback_smoke\.summary session=' + [regex]::Escape([string]$measuredSmokeSessionId) + '(\s|$)')) {
+        $sourceFramesSummaryLine = $candidateLine
+    }
+}
+# SESSION-ANCHOR-1 >>>
 # HFR-NATIVE-M16-1457-FULLSCREEN-S1S2-PRESENT-GAP-1 r5 (Grok G5 sibling): the summary and conform records count only where they START the record
-# body (the $script:DvRecordStart rule, as Get-MeasuredSmokeSessionId), never as text inside another record
+# body (the $script:DvRecordStart rule, as Get-MeasuredSmokeSessionId), never as text inside another record; this re-pick replaces the substring
+# pick above (kept verbatim for the default job's byte-identity pin)
 $sourceFramesRecordStart = '^(?:\[[^\]]*\] ){0,3}'
+$sourceFramesSummaryLine = $null
 foreach ($candidateLine in ($rawLog -split "`r?`n")) {
     if ($candidateLine -match ($sourceFramesRecordStart + 'playback_smoke\.summary session=' + [regex]::Escape([string]$measuredSmokeSessionId) + '(\s|$)')) {
         $sourceFramesSummaryLine = $candidateLine
     }
 }
+# SESSION-ANCHOR-1 <<<
 $sourceFramesVerdict = Get-AttrCudaSourceFramesVerdict -SummaryLine $sourceFramesSummaryLine -ExpectedRunNonce $runLog.runNonce
 # HFR-CONFORM-AWARE-RECEIPT-ORACLES-1 >>>
 # The measured session's playback_smoke.conform line (the last one wins). Only a conform line the oracle can PROVE (active, this session, rates

@@ -2024,6 +2024,8 @@ function Get-DvDueWakeDeliveryEvidence {
         elseif ($observed -cne 'post') { $reason = "ROUTE_NOT_ENGAGED: the measured session's playback_due_wake says delivery_kind=$observed, not the post the leg names" }
         # r1 adversary pass 1 A2: the posted arm counts only when every arm of the measured Play went by the native message
         elseif ($mechanism -cne 'native-msg') { $reason = "DUE_WAKE_DELIVERY_FELL_BACK: the measured Play's arms used delivery=$mechanism, not only the native message the posted arm names" }
+        # r5 (r5 adversary pass 11 advisory A2): the kill switch on contradicts any engagement the same line claims
+        elseif ($disabledSeen) { $reason = 'ROUTE_NOT_ENGAGED: the measured session''s playback_due_wake line says disabled=1 (MLVAPP_PLAYBACK_DUE_WAKE=0), which contradicts the posted wake it reports' }
         else { $verdict = 'HONOURED' }
     }
     elseif ($disabledSeen) {

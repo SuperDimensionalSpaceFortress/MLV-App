@@ -514,6 +514,13 @@ class GeneratorByteIdentityAndVariantTests(unittest.TestCase):
     PM_INTERNAL_GAP_OPEN = "PRESENTMON-BACHELOR-CUDA-INTERNAL-GAP-1 >>>"
     PM_INTERNAL_GAP_CLOSE = "PRESENTMON-BACHELOR-CUDA-INTERNAL-GAP-1 <<<"
     PM_INTERNAL_GAP_REGIONS = 7
+    # HFR-NATIVE-M16-1457-FULLSCREEN-S1S2-PRESENT-GAP-1 r5 (Grok G5 sibling; r5 adversary pass 11 A1, this pin): the measured-session and summary
+    # selectors take a marker only where it starts the record body. Two regions in the default job: Get-MeasuredSmokeSessionId's anchored pick
+    # (returns or throws, so the baseline loops after it are not reached) and the source-frames summary re-pick. The baseline's substring lines stay
+    # verbatim outside them; absent from the baseline.
+    SESSION_ANCHOR_OPEN = "SESSION-ANCHOR-1 >>>"
+    SESSION_ANCHOR_CLOSE = "SESSION-ANCHOR-1 <<<"
+    SESSION_ANCHOR_REGIONS = 2
 
     @classmethod
     def strip_regions(cls, text: str) -> tuple[str, dict[str, int]]:
@@ -528,7 +535,8 @@ class GeneratorByteIdentityAndVariantTests(unittest.TestCase):
                     "hfr-10s-floor": (cls.HFR_10S_OPEN, cls.HFR_10S_CLOSE),
                     "heavy-frame-log": (cls.HEAVY_FRAME_LOG_OPEN, cls.HEAVY_FRAME_LOG_CLOSE),
                     "cpu-gl-env-clear": (cls.CPU_GL_ENV_CLEAR_OPEN, cls.CPU_GL_ENV_CLEAR_CLOSE),
-                    "pm-internal-gap": (cls.PM_INTERNAL_GAP_OPEN, cls.PM_INTERNAL_GAP_CLOSE)}
+                    "pm-internal-gap": (cls.PM_INTERNAL_GAP_OPEN, cls.PM_INTERNAL_GAP_CLOSE),
+                    "session-anchor": (cls.SESSION_ANCHOR_OPEN, cls.SESSION_ANCHOR_CLOSE)}
         kept: list[str] = []
         inside: str | None = None
         counts = {name: 0 for name in families}
@@ -583,6 +591,7 @@ class GeneratorByteIdentityAndVariantTests(unittest.TestCase):
         self.assertEqual(old_counts["heavy-frame-log"], 0, "the baseline predates the HEAVY frame-log opt-out")
         self.assertEqual((new_counts["cpu-gl-env-clear"], old_counts["cpu-gl-env-clear"]), (0, 0), "a cuda job carries no cpu GL-viewport env-clear region, and neither does the baseline")
         self.assertEqual((new_counts["pm-internal-gap"], old_counts["pm-internal-gap"]), (self.PM_INTERNAL_GAP_REGIONS, 0), "the default job carries exactly the pinned number of bracketed PRESENTMON-BACHELOR-CUDA-INTERNAL-GAP-1 regions; the baseline predates them")
+        self.assertEqual((new_counts["session-anchor"], old_counts["session-anchor"]), (self.SESSION_ANCHOR_REGIONS, 0), "the default job carries exactly the pinned number of bracketed SESSION-ANCHOR-1 regions; the baseline predates them")
         self.assertEqual(stripped, old_stripped,
                          "the DEFAULT (bachelor/cuda) emitted job changed outside the bracketed regions -- it must stay byte-identical to the pinned baseline")
 
@@ -8834,6 +8843,9 @@ class LookReceiptGeneratorTests(unittest.TestCase):
                 # PRESENTMON-BACHELOR-CUDA-INTERNAL-GAP-1's regions: in the new job only (the base predates the app-swap-window temporal arm), at their pinned count.
                 self.assertEqual((new_counts.pop("pm-internal-gap"), old_counts.pop("pm-internal-gap")),
                                  (GeneratorByteIdentityAndVariantTests.PM_INTERNAL_GAP_REGIONS, 0), name)
+                # HFR-NATIVE-M16-1457-FULLSCREEN-S1S2-PRESENT-GAP-1 r5's anchored session selectors: in the new job only (the base predates them).
+                self.assertEqual((new_counts.pop("session-anchor"), old_counts.pop("session-anchor")),
+                                 (GeneratorByteIdentityAndVariantTests.SESSION_ANCHOR_REGIONS, 0), name)
                 self.assertEqual(new_counts, old_counts, f"{name}: the job without -LookReceiptPath carries the base generator's bracketed regions")
                 self.assertEqual(kept, old_kept, f"{name}: the job without -LookReceiptPath must be the base generator's bytes")
                 self.assertNotIn(b"LookReceipt", new)
@@ -15463,6 +15475,18 @@ class DueWakeDeliveryEvidenceTests(unittest.TestCase):
                 with self.subTest(spec=spec_name, case=name):
                     v = self.verdict(spec, log)
                     self.assertEqual((v["verdict"], v["blocks"]), ("NOT_REQUESTED", False), v)
+        # r5 adversary pass 11 advisory A2, its input verbatim: a posted leg whose measured line claims the posted wake with the kill switch on is not
+        # engaged (the switch contradicts the claim); before r5 it was HONOURED
+        verbatim = ("playback_smoke.measured_session id=3\nplayback_smoke.summary session=3 reason=play-stop presented_frames=600\n"
+                    "playback_smoke.pace_summary session=3 first_present_ms=40.000 paced_elapsed_ms=25000.000\n"
+                    "playback_due_wake armed=1200 disabled=1 delivery=native-msg delivery_kind=post\n")
+        for name, log in (("verbatim", verbatim), ("full line", self.log(self.wake("post").replace("disabled=0", "disabled=1")))):
+            with self.subTest(case=name, leg="posted"):
+                v = self.verdict(self.POST, log)
+                self.assertEqual((v["requested"], v["verdict"], v["blocks"]), (True, "NOT_HONOURED", True), v)
+                self.assertIn("ROUTE_NOT_ENGAGED", v["reason"])
+        v = self.verdict(self.POST, self.log(self.wake("post")))
+        self.assertEqual((v["verdict"], v["blocks"]), ("HONOURED", False), v)
 
     def test_r5_a3_a_measured_session_record_of_another_session_closes_the_window(self) -> None:
         # r5 (r4 adversary pass 10 advisory A3, verbatim shape): `playback_smoke.measured_session id=4` names its session with id=, not session=, and
