@@ -276,14 +276,16 @@ function Read-StagedSoundness([string]$When, [switch]$FinalVerify) {
     $capSec = [Math]::Max(0.0, ($script:Deadline - [DateTime]::UtcNow).TotalSeconds)
     # r8 fix iteration 2 (adversary A1 on ad703c59): -CallCapSec 0 means NO cap to Get-VenueStagedBuildManifest, so a cap that ran out after Get-ProbeSec is never handed
     # over as 0 (a 300 s artifact hash then ran unbounded and a STAGED answer past the cap was STAGE_SKIP_ALREADY). Under the 1 s any read needs: no read, the cap ran out.
-    if ($capSec -lt 1.0) { Stop-Nightly 'STAGE_CAP_EXCEEDED' "the $MaxTotalSec s cap ran out before the soundness read of the staged build of $commit $When could start ($([Math]::Floor($capSec * 100.0) / 100.0) s left); nothing was submitted" }
+    # r9 (Grok G13 on #814): the final verify runs after the stage job was submitted, so its refusals say so (the wording of the final verify's cap refusal below it)
+    $notDone = $(if ($FinalVerify) { 'the stage job was submitted; not recorded as staged' } else { 'nothing was submitted' })
+    if ($capSec -lt 1.0) { Stop-Nightly 'STAGE_CAP_EXCEEDED' "the $MaxTotalSec s cap ran out before the soundness read of the staged build of $commit $When could start ($([Math]::Floor($capSec * 100.0) / 100.0) s left); $notDone" }
     # the test-only -TestSoundnessReadDelayMs stalls the call's FIRST soundness read only (step 4's when a build.json is there, else step 8's), never the final verify's
     $script:SoundnessReads++
     $delayMs = $(if ($script:SoundnessReads -eq 1) { $TestSoundnessReadDelayMs } else { 0 })
     $artDelayMs = $(if (($TestSoundnessArtifactDelayAt -ieq 'first' -and $script:SoundnessReads -eq 1) -or ($TestSoundnessArtifactDelayAt -ieq 'final' -and $FinalVerify)) { $TestSoundnessArtifactDelayMs } else { 0 })
     $r = try { Get-VenueStagedBuildManifest -AgentShare $share -SourceCommit $commit -VerifyArtifacts -TimeoutSec $soundSec -ArtifactTimeoutSec 300 -CallCapSec $capSec -TestReadDelayMs $delayMs -TestArtifactDelayMs $artDelayMs } catch { [pscustomobject]@{ state = 'UNREACHABLE'; error = ($_.Exception.Message -replace '\s+', ' ') } }
     $leftAfter = ($script:Deadline - [DateTime]::UtcNow).TotalSeconds
-    if ($r.state -ceq 'UNREACHABLE' -and $leftAfter -lt 1.0) { Stop-Nightly 'STAGE_CAP_EXCEEDED' "the soundness read of the staged build of $commit $When ran to the end of the $MaxTotalSec s cap (the manifest read $([Math]::Round($soundSec, 2)) s, the artifact hash at most 300 s, $([Math]::Round($capSec, 2)) s in all) and the cap ran out with no answer ($([Math]::Floor([Math]::Max(0.0, $leftAfter) * 100.0) / 100.0) s left): $($r.error); nothing was submitted" }
+    if ($r.state -ceq 'UNREACHABLE' -and $leftAfter -lt 1.0) { Stop-Nightly 'STAGE_CAP_EXCEEDED' "the soundness read of the staged build of $commit $When ran to the end of the $MaxTotalSec s cap (the manifest read $([Math]::Round($soundSec, 2)) s, the artifact hash at most 300 s, $([Math]::Round($capSec, 2)) s in all) and the cap ran out with no answer ($([Math]::Floor([Math]::Max(0.0, $leftAfter) * 100.0) / 100.0) s left): $($r.error); $notDone" }
     $r
 }
 

@@ -1296,8 +1296,22 @@ class VenueStageNightlyTests(unittest.TestCase):
             self.assertIn(needed, code, needed)
 
 
-@requires_windows_pwsh
 class SoundnessReadCapNeverZeroTests(unittest.TestCase):
+    # r9 (Grok G12 on #814): source-text tests, so no @requires_windows_pwsh; they run on every runner
+    def test_r9_g13_the_soundness_read_refusals_name_what_was_submitted_per_path(self) -> None:
+        # Grok G13: the final verify runs after the stage job was submitted, so its refusals never say "nothing was submitted"; step 4 and step 8 still do.
+        text = DRIVER.read_text(encoding="utf-8")
+        body = re.search(r"(?ms)^function Read-StagedSoundness\(.*?^\}", text).group(0)
+        self.assertIn("$notDone = $(if ($FinalVerify) { 'the stage job was submitted; not recorded as staged' } else { 'nothing was submitted' })", body)
+        self.assertNotIn("nothing was submitted\"", body, "a refusal in the soundness read hard-codes the step-4 wording")
+        refusals = re.findall(r"Stop-Nightly 'STAGE_CAP_EXCEEDED' \"[^\"]*\"", body)
+        self.assertEqual(len(refusals), 2, refusals)
+        for r in refusals:
+            self.assertTrue(r.endswith("; $notDone\""), r)
+        self.assertLess(body.index("$notDone = "), body.index("if ($capSec -lt 1.0)"))
+        # the final verify's own cap refusal (after the read) carries the same tail
+        self.assertIn("could be recorded; not recorded as staged\" }", text)
+
     def test_r8_a_spent_cap_is_never_handed_to_the_soundness_read_as_call_cap_zero(self) -> None:
         # r8 fix iteration 2 (adversary A1 on ad703c59): Get-VenueStagedBuildManifest reads -CallCapSec 0 as NO cap (VenueChain.psm1 `if ($CallCapSec -gt 0)`), so a
         # cap that ran out between Get-ProbeSec and the call must end the call (STAGE_CAP_EXCEEDED) before it, never become an unbounded 300 s artifact hash.
@@ -1312,6 +1326,7 @@ class SoundnessReadCapNeverZeroTests(unittest.TestCase):
         self.assertIn("if ($CallCapSec -gt 0) {", (DV / "VenueChain.psm1").read_text(encoding="utf-8"))
 
 
+@requires_windows_pwsh
 class VenueStageReuseModuleTests(unittest.TestCase):
     """The three promoted functions, logic unchanged from the untracked venue-reuse-check.ps1 the lanes copied word for word."""
 
