@@ -168,8 +168,8 @@ _LOCAL_BLOCK = "invokes a script block bound to a local variable in this same bo
 
 # ---- VENUE-STAGE-SAME-SHA-RESTAGE-GUARD-1 r3 (adversary A3 on ce5a0380): the stage lock and its test-only seams ----
 _allow("Enter-AttrCudaStageLock",
-       "creates the named stage lock (a kernel mutex, no file) keyed on the agent root's physical identity and the sha; WriteAllText only when the caller passed the test-only -WaitMarkerPath; "
-       "r4 (Grok G5 on #814): Write-Host prints the one STAGE_LOCK_WAIT line to the job's stdout before a busy wait (host output only: no file, process or registry)",
+       "named stage lock (kernel mutex, no file) on the root's physical id and the sha; Write-Host prints STAGE_LOCK_WAIT to job stdout before a busy wait (r4 G5); "
+       "WriteAllText only for test-only -WaitMarkerPath",
        ("R4", "Threading.Mutex::new", 1), ("R4", "IO.File::WriteAllText", 1), ("R1", "Write-Host", 1))
 _allow("Wait-AttrCudaTestHold",
        "test-only seam: writes '<Path>.reached' only when a test passed -Path; production passes none and the body returns before it",
