@@ -174,6 +174,8 @@ if ($JobId -like 'lease-batch-open-*') {
     # r12 (adversary A2): FAKE_OPEN_TOKEN_SHY=1 answers with the batch's token plus a soft hyphen (U+00AD): culture-aware equality says it is the same token, ordinal says it is not
     $tokOut = $(if ($env:FAKE_OPEN_TOKEN_SHY -eq '1') { $token + [string][char]0x00AD } else { $token })
     if ($mode -ne 'nobatch') { $adm['leaseBatch'] = [ordered]@{ token = $tokOut; leaseId = $lid; seq = 1; reused = $false; untilEpoch = $now.ToUnixTimeSeconds() + $remain; remainingSec = $remain } }
+    # LEASE-BATCH-IDLE-END-UNSEEN-1 r3 pass 2 (adversary A2): FAKE_IDLE_SEC is the running agent's own idle bound, published as admission.leaseBatch.idleSec
+    if ($mode -ne 'nobatch' -and $env:FAKE_IDLE_SEC) { $adm['leaseBatch']['idleSec'] = [int]$env:FAKE_IDLE_SEC }
     [pscustomobject]@{ opens = $n + 1; leaseId = $lid; token = $token } | ConvertTo-Json | Set-Content -LiteralPath $stateFile
     # r5: FAKE_OPEN_SLEEP per open: um-run blocks this long first, as it does while the agent re-asks a refused (exit 75) request for the open
     $sleep = [int](Pick $env:FAKE_OPEN_SLEEP $n '0')
@@ -882,32 +884,72 @@ class VenueLeaseBatchRunnerTests(unittest.TestCase):
     def test_lease_batch_idle_end_r3_grok_g1_the_in_lease_probe_wait_stays_under_the_agents_idle_bound(self) -> None:
         # G1: -ProbeMaxWaitSec (600 by default) let one probe wait twice the agent's idle bound (LeaseBatchIdleSec 300) with no job, so the lease idled out under it. The in-lease
         # wait is cut to the agent's bound less -ProbeIdleMarginSec (60 by default) and -CooldownSec (0 here): 240 s, with the lease's room far larger.
+        # r3 pass 2 (adversary A1): counted from the last agent job seen to end, so a probe a few seconds after the open or a leg gets a few seconds less than the bound
+        def within(waits: list[int], top: int) -> bool:
+            return len(waits) == 2 and all(top - 15 <= w <= top for w in waits)
         r = self.run_batch(self.specs[:2], "-ProbeMaxWaitSec", "600")
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
-        self.assertEqual(self._in_lease_waits(), [240, 240], self.events_raw())
+        self.assertTrue(within(self._in_lease_waits(), 240), self.events_raw())
         self.setUp()
         r = self.run_batch(self.specs[:2], "-ProbeMaxWaitSec", "600", "-ProbeIdleMarginSec", "100")
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
-        self.assertEqual(self._in_lease_waits(), [200, 200], self.events_raw())
+        self.assertTrue(within(self._in_lease_waits(), 200), self.events_raw())
         # a shorter -ProbeMaxWaitSec is kept as it is
         self.setUp()
         r = self.run_batch(self.specs[:2], "-ProbeMaxWaitSec", "30")
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
         self.assertEqual(self._in_lease_waits(), [30, 30], self.events_raw())
 
-    def test_lease_batch_idle_end_r3_grok_g1_the_idle_bound_is_read_from_the_agent_script_not_a_second_copy(self) -> None:
-        # the bound has ONE home, the agent's own param default (LeaseBatchIdleSec): a copy of the tree whose agent says 200 cuts the wait to 200 - 60 = 140
+    def _tree_with_agent_idle(self, idle: bytes) -> None:
         tree = self.case / "tree" / "tools" / "profiling"
         shutil.copytree(DV, tree / "dual-venue", ignore=shutil.ignore_patterns("look-receipts", "legs", "legsets"))
         (tree / "bachelor").mkdir()
         agent = AGENT.read_bytes()
         self.assertEqual(agent.count(b"[int]$LeaseBatchIdleSec = 300,"), 1, "the agent's idle bound moved: update this fixture")
-        (tree / "bachelor" / AGENT.name).write_bytes(agent.replace(b"[int]$LeaseBatchIdleSec = 300,", b"[int]$LeaseBatchIdleSec = 200,"))
+        (tree / "bachelor" / AGENT.name).write_bytes(agent.replace(b"[int]$LeaseBatchIdleSec = 300,", b"[int]$LeaseBatchIdleSec = " + idle + b","))
         self.runner = tree / "dual-venue" / RUNNER.name
+
+    def test_lease_batch_idle_end_r3_grok_g1_the_idle_bound_is_read_from_the_agent_script_not_a_second_copy(self) -> None:
+        # the bound has ONE home, the agent's own param default (LeaseBatchIdleSec): a copy of the tree whose agent says 200 cuts the wait to about 200 - 60 = 140
+        self._tree_with_agent_idle(b"200")
         r = self.run_batch(self.specs[:2], "-ProbeMaxWaitSec", "600")
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
-        self.assertEqual(self._in_lease_waits(), [140, 140], self.events_raw())
+        waits = self._in_lease_waits()
+        self.assertTrue(len(waits) == 2 and all(125 <= w <= 140 for w in waits), self.events_raw())
         self.assertNotRegex(RUNNER.read_text(encoding="utf-8"), r"(?i)IdleSec\s*=\s*300\b", "the runner keeps no second copy of the agent's 300 s")
+
+    def test_lease_batch_idle_end_r3_adv_a2_the_running_agents_published_idle_bound_wins_over_the_script_default(self) -> None:
+        # adversary r3 A2 (adversary-55df4367.json): an agent started with -LeaseBatchIdleSec 100 releases after 100 s whatever its script's default says. The agent publishes its
+        # effective bound (admission.leaseBatch.idleSec, Get-LeaseBatchAdmission) and the runner bounds its waits by it: about 100 - 60 = 40, never the default's 240.
+        r = self.run_batch(self.specs[:2], "-ProbeMaxWaitSec", "600", FAKE_IDLE_SEC="100")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        waits = self._in_lease_waits()
+        self.assertTrue(len(waits) == 2 and all(25 <= w <= 40 for w in waits), self.events_raw())
+        # and the agent publishes it
+        self.assertIn("idleSec = $LeaseBatchIdleSec", AGENT.read_text(encoding="utf-8")[AGENT.read_text(encoding="utf-8").index("function Get-LeaseBatchAdmission"):][:900])
+
+    def test_lease_batch_idle_end_r3_adv_a1_busy_gate_retries_share_one_idle_allowance(self) -> None:
+        # adversary r3 A1: a GATE_BUSY probe runs no agent job, so the agent's idle clock keeps running across the retries; each retry used to get a fresh full allowance. Agent
+        # bound 70, margin 60: one 10 s allowance from the open, spent by the retries (2 s sleeps), never renewed by a busy probe; the QUIET probe after a leg starts a new one.
+        self._tree_with_agent_idle(b"70")
+        r = self.run_batch(self.specs[:2], "-ProbeMaxWaitSec", "600", "-ClaimPollSec", "2", FAKE_QUIET_MODES="BUSY,BUSY,BUSY,BUSY,QUIET,QUIET")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        waits = self._in_lease_waits()
+        self.assertEqual(len(waits), 6, self.events_raw())
+        self.assertLessEqual(waits[0], 10, waits)
+        self.assertTrue(all(b <= a for a, b in zip(waits[:4], waits[1:5])), f"a busy retry got a fresh allowance: {waits}")
+        self.assertLessEqual(waits[4], 10 - 6, f"three 2 s busy sleeps spent at least 6 s of the allowance: {waits}")
+        self.assertGreaterEqual(waits[5], 5, f"a leg's job restarts the allowance: {waits}")
+
+    def test_lease_batch_idle_end_r3_adv_a1_a_long_claim_poll_sleep_stops_just_past_the_agents_idle_bound(self) -> None:
+        # adversary r3 A1: the busy sleep used the loop top's room and -ClaimPollSec only, so a long poll slept far past the idle release (into a room-short end that hid it).
+        # Agent bound 12, margin 5, -ClaimPollSec 120: the sleep after the busy probe ends within a few seconds past 12 s, not 120 s later.
+        self._tree_with_agent_idle(b"12")
+        r = self.run_batch(self.specs[:1], "-ProbeMaxWaitSec", "600", "-ProbeIdleMarginSec", "5", "-ClaimPollSec", "120", FAKE_QUIET_MODES="BUSY,QUIET")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        ticks = [int(l.split(" ", 1)[0]) for l in self.events_raw() if " QUIET " in l]
+        self.assertEqual(len(ticks), 2, self.events_raw())
+        self.assertLess((ticks[1] - ticks[0]) / 1e7, 40, f"the busy sleep ran past the agent's idle bound: {(ticks[1] - ticks[0]) / 1e7:.1f} s")
 
     def test_lease_batch_idle_end_r3_grok_g1_an_unreadable_idle_bound_launches_nothing_on_the_lease(self) -> None:
         # fail closed: an agent script whose LeaseBatchIdleSec has no readable default gives no bound, so no probe or leg runs on the lease (AGENT_IDLE_BOUND_UNKNOWN, exit 10);

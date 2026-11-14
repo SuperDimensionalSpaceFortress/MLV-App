@@ -195,8 +195,8 @@ param(
     [ValidateRange(1, 3600)][int]$RecheckSec = 90,
     # one in-lease probe waits at most this long (and never past the room the lease has left for the leg)
     [ValidateRange(0, 3600)][int]$ProbeMaxWaitSec = 600,
-    # r3 (Grok G1 on #817): and never past the agent's idle bound for a parked lease (LeaseBatchIdleSec, read from the agent script's own param default: one home, no copy
-    # here) less this margin and -CooldownSec, so a probe's gate wait (no job) cannot outlast the lease it runs under
+    # r3 (Grok G1 on #817): and never past the agent's idle bound for a parked lease (the running agent's admission.leaseBatch.idleSec, else the agent script's own
+    # LeaseBatchIdleSec default: no copy here) less this margin, counted from the last agent job seen to end, so a probe's gate wait (no job) cannot outlast the lease
     [ValidateRange(0, 1800)][int]$ProbeIdleMarginSec = 60,
     # r3 (Grok G1): this many CONSECUTIVE batches that ended LEASE_IDLE_ENDED with no leg launched stop the run (LEASE_IDLE_CHURN, exit 14) instead of a lease after lease
     [ValidateRange(1, 100)][int]$IdleEndedZeroLegMax = 2,
@@ -1510,7 +1510,7 @@ function Get-ProbeLaunchVerdict([int]$MaxWaitSec) {
     if ($cl) { return [pscustomobject]@{ verdict = 'CLAIM_LOST'; code = 'none'; mean = $null; reason = $cl.detail; foreignFloor = $false } }
     $roomAtLaunch = [int](($leaseEnd - [DateTime]::UtcNow).TotalSeconds) - $LeaseMarginSec
     if ($roomAtLaunch -lt $legBudget) { return [pscustomobject]@{ verdict = 'LEASE_SHORT'; code = 'none'; mean = $null; reason = "roomSec=$roomAtLaunch < legBudgetSec=$legBudget (leaseMarginSec=$LeaseMarginSec)"; foreignFloor = $false } }
-    [pscustomobject]@{ verdict = $null; maxWait = [int][Math]::Max(0, [Math]::Min($MaxWaitSec, $roomAtLaunch - $legBudget)) }
+    [pscustomobject]@{ verdict = $null; maxWait = [int][Math]::Max(0, [Math]::Min([Math]::Min($MaxWaitSec, (Get-IdleAllowanceSec)), $roomAtLaunch - $legBudget)) }   # r3 pass 2 (adversary A1): and the idle allowance left now
 }
 
 function Invoke-QuietProbe([string]$Name, [string]$Phase, [int]$MaxWaitSec, $ThermalState = $null) {
@@ -1675,6 +1675,13 @@ function Get-AgentLeaseBatchIdleSec([string]$AgentScript) {
     $null
 }
 
+function Get-IdleAllowanceSec {
+    # r3 pass 2 (adversary A1): what is left of the no-job time the agent allows ($probeIdleCap: its idle bound less -ProbeIdleMarginSec) since the last agent job this runner saw
+    # end under the lease ($idleAnchorTs, monotonic: the open, a leg, a probe that measured). A busy-gate probe ran no job and moves nothing, so its retries share one allowance.
+    if ($null -eq $idleAnchorTs) { return [int]::MaxValue }
+    [int][Math]::Floor($probeIdleCap - ([Diagnostics.Stopwatch]::GetTimestamp() - $idleAnchorTs) / [double][Diagnostics.Stopwatch]::Frequency)
+}
+
 function Get-LeaseIdleEnd([string]$Token, [string]$LeaseId) {
     # LEASE-BATCH-IDLE-END-UNSEEN-1: the agent releases a parked batch lease after LeaseBatchIdleSec (300 s) with no job (ultra-magnus-agent.ps1 Update-LeaseBatchHold) and writes its
     # receipt line (endReason=idle) at once. A quiet probe that waits in Wait-VenueQuiet's queue gate submits no job for that long, so the lease can end under the wait while the runner
@@ -1705,6 +1712,8 @@ $stopReason = $null
 $legBudget = $LegBudgetSec
 $agentIdleSec = $null      # r3 (Grok G1): the agent's LeaseBatchIdleSec, read once a lease is in hand (Get-AgentLeaseBatchIdleSec)
 $idleZeroLegRun = 0        # r3 (Grok G1): consecutive batches that ended LEASE_IDLE_ENDED with no leg launched
+$idleAnchorTs = $null      # r3 pass 2 (adversary A1): monotonic instant of the last agent job seen to end under the batch lease (Get-IdleAllowanceSec)
+$probeIdleCap = 0
 $script:guardBudget = $null   # r3: the content guard's bound while one is in force (New-GuardBudget)
 $batchNo = 0
 # LEASE-BATCH-RECEIPT-PERSIST-FAILURE-REPORTING-1 (Dot B6 on #684): a receipt file the run cannot write (batches.jsonl or batch-NN.json occupied by a directory, a held or full disk) is a
@@ -2177,14 +2186,18 @@ while ($pending.Count -gt 0 -and $null -eq $stopReason) {
             $b.leaseEndUtc = $leaseEnd.ToString('o')
             L "BATCH_OPEN batch=$batchNo token=$token lease=$($b.leaseId) held=$($b.held) minutes=$($b.leaseMinutes) roomSec=$([int]($leaseEnd - [DateTime]::UtcNow).TotalSeconds) openWaitedSec=$($b.openWaitedSec) refusals=$(@($b.refusals).Count)"
             # (3) the legs, under the lease
-            # r3 (Grok G1 on #817): the agent releases this lease after LeaseBatchIdleSec with no job, and a probe's gate wait submits none, so every in-lease probe waits at most
-            # that bound less -ProbeIdleMarginSec and -CooldownSec (the cooldown sleep after a leg is no-job time too). No bound readable: nothing runs on the lease (fail closed).
-            if ($null -eq $agentIdleSec) { $agentIdleSec = Get-AgentLeaseBatchIdleSec (Join-Path $here '..\bachelor\ultra-magnus-agent.ps1') }
-            if ($null -eq $agentIdleSec) {
-                $b.endReason = 'AGENT_IDLE_BOUND_UNKNOWN'; $b.endDetail = "the agent script ($(Join-Path $here '..\bachelor\ultra-magnus-agent.ps1')) gives no LeaseBatchIdleSec default: no probe or leg runs on lease $($b.leaseId)"
+            # r3 (Grok G1 on #817): the agent releases this lease after LeaseBatchIdleSec with no job, and a probe's gate wait submits none, so no in-lease probe may wait past that
+            # bound less -ProbeIdleMarginSec, counted from the last agent job this runner saw end under the lease (Get-IdleAllowanceSec). r3 pass 2 (adversary A2): the bound is
+            # the RUNNING agent's own, published in admission.leaseBatch.idleSec; an agent that predates the field gives the agent script's param default. Neither: nothing runs.
+            $pubIdle = $adm.leaseBatch.idleSec
+            $batchIdleSec = $(if (($pubIdle -is [int] -or $pubIdle -is [long]) -and $pubIdle -gt 0 -and $pubIdle -le 86400) { [int]$pubIdle } else {
+                if ($null -eq $agentIdleSec) { $agentIdleSec = Get-AgentLeaseBatchIdleSec (Join-Path $here '..\bachelor\ultra-magnus-agent.ps1') }; $agentIdleSec })
+            if ($null -eq $batchIdleSec) {
+                $b.endReason = 'AGENT_IDLE_BOUND_UNKNOWN'; $b.endDetail = "the agent published no admission.leaseBatch.idleSec and its script ($(Join-Path $here '..\bachelor\ultra-magnus-agent.ps1')) gives no LeaseBatchIdleSec default: no probe or leg runs on lease $($b.leaseId)"
                 Set-Stop 'AGENT_IDLE_BOUND_UNKNOWN' 10; LogBest "AGENT_IDLE_BOUND_UNKNOWN batch=$batchNo lease=$($b.leaseId) (no probe or leg runs on it; the lease is closed)"
             }
-            $probeIdleCap = $(if ($null -ne $agentIdleSec) { [int][Math]::Max(0, $agentIdleSec - $ProbeIdleMarginSec - $CooldownSec) } else { 0 })
+            $probeIdleCap = $(if ($null -ne $batchIdleSec) { [int]$batchIdleSec - $ProbeIdleMarginSec } else { 0 })
+            $idleAnchorTs = [Diagnostics.Stopwatch]::GetTimestamp()   # the open's job ended no later than its result was read
             $attempt = 0
             $launchShort = $false
             while ($pending.Count -gt 0 -and $null -eq $b.endReason) {
@@ -2201,7 +2214,7 @@ while ($pending.Count -gt 0 -and $null -eq $stopReason) {
                     break
                 }
                 $attempt++
-                $probeWait = [int][Math]::Max(0, [Math]::Min([Math]::Min($ProbeMaxWaitSec, $probeIdleCap), $room - $legBudget))   # r3 (Grok G1): and under the agent's idle bound
+                $probeWait = [int][Math]::Max(0, [Math]::Min([Math]::Min($ProbeMaxWaitSec, (Get-IdleAllowanceSec)), $room - $legBudget))   # r3 (Grok G1): and under the agent's idle bound
                 # adversary r1b A1: a re-probe during a thermal wait may wait for quiet only for what is left of the thermal cap. Its fixed sample window and the remote
                 # job's own queue limits still run and are not bounded here: the cap is a soft budget (cap + one probe), see the Get-VenueThermalProbeBudget comment
                 # r6 (adversary r5 A1): that cut is made at the dispatch (Invoke-QuietProbe), after every check that can stall, never here at the loop top
@@ -2229,6 +2242,10 @@ while ($pending.Count -gt 0 -and $null -eq $stopReason) {
                 # adversary r4 A2: the instant the probe returned is the instant of its reading: the first hot reading starts the cap there, not after the QUIET log line below.
                 # r6 (adversary r5 A2): and not after the probe's evidence write either: the instant is the one Invoke-QuietProbe took when it observed the child's result
                 $probeEndTs = $q.endTs; $probeEndUtc = $q.endUtc
+                # r3 pass 2 (adversary A1): a probe that MEASURED ran agent jobs, which restart the agent's idle clock: QUIET just after its last sample, COOLDOWN_UNMET within one
+                # -RecheckSec of its end (it re-probes every -RecheckSec). A busy gate (GATE_BUSY) ran none: the anchor stays where it was.
+                if ($q.verdict -ceq 'QUIET') { $idleAnchorTs = $q.endTs }
+                elseif ($q.verdict -ceq 'COOLDOWN_UNMET') { $idleAnchorTs = [Math]::Max($idleAnchorTs, $q.endTs - [long]$RecheckSec * [Diagnostics.Stopwatch]::Frequency) }
                 if ($null -ne $q.maxWaitSec) { $probeWait = $q.maxWaitSec }   # the wait the probe was given (cut at its dispatch), for the QUIET line
                 if ($q.foreignFloor -and -not $legForeign.ContainsKey($leg.name)) { $legForeign[$leg.name] = $q.foreignFloorLine }
                 L "QUIET leg=$($leg.name) batch=$batchNo phase=in-lease exit=$($q.code) verdict=$($q.verdict) mean=$(Format-Mean $q.mean) maxWaitSec=$probeWait roomSec=$room$(if ($q.reason) { " reason=$($q.reason)" })$(if ($q.foreignFloor) { ' foreignFloor=1' })"
@@ -2282,7 +2299,9 @@ while ($pending.Count -gt 0 -and $null -eq $stopReason) {
                     L "RETRY_IN_LEASE leg=$($leg.name) batch=$batchNo reason=$($q.verdict) mean=$(Format-Mean $q.mean) roomSec=$room"
                     if ($thermalActive) { $th.reprobePending = $true }   # r4: the next iteration re-checks the deadline right before it dispatches (the log write above may have stalled)
                     if ($q.verdict -ceq 'GATE_BUSY') {
-                        $busySleep = [int][Math]::Max(1, [Math]::Min($ClaimPollSec, $room - $legBudget))
+                        # r3 pass 2 (adversary A1): from the room left NOW (not the loop top's), and never past a few seconds after the agent's idle bound: a long -ClaimPollSec
+                        # sleep cannot carry the batch past the idle release into a room-short end that hides it (the next probe's receipt read types it LEASE_IDLE_ENDED)
+                        $busySleep = [int][Math]::Max(1, [Math]::Min([Math]::Min($ClaimPollSec, $roomNow - $legBudget), [long](Get-IdleAllowanceSec) + $ProbeIdleMarginSec + 5))
                         # adversary r3 A1: during a thermal wait the next probe starts no later than the deadline less the slowest re-probe (the same budget function as the poll sleep).
                         # r4: read the clock AFTER the log write, so a stalled append shortens (or removes) the sleep instead of being added to it
                         if ($thermalActive) { $busySleep = (Get-VenueThermalProbeBudget -CapSec $ThermalWaitCapSec -DispatchGraceSec $ThermalDispatchGraceSec -ElapsedSec (Get-ThermalElapsedSec $th) -SlowestReprobeSec $th.slowProbeSec -WantSleepSec $busySleep).sleepSec }
@@ -2380,6 +2399,7 @@ while ($pending.Count -gt 0 -and $null -eq $stopReason) {
                     if ($_.Exception -is [ComponentModel.Win32Exception] -or $_.Exception.InnerException -is [ComponentModel.Win32Exception]) { $inFlightLeg = $null }
                     throw
                 }
+                $idleAnchorTs = [Diagnostics.Stopwatch]::GetTimestamp()   # r3 pass 2 (adversary A1): the leg's agent job has ended: the agent's idle clock restarts
                 $text = [string]$lp.stdout + [string]$lp.stderr   # r7: read from the child, never back from the file, whose write the guard may refuse
                 if (Test-RunDirWrite $out) { [IO.File]::WriteAllText($out, $text, [Text.UTF8Encoding]::new($false)) }
                 $legCode = $lp.exit
