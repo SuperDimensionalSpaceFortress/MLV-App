@@ -162,7 +162,10 @@ $embeddedFunctions = Get-AttrCudaEmbeddedFunctionSource -Name @(
     # manifest check (playback-attr-3-cuda-job.ps1) accepts it.
     'Assert-AttrCudaBuildManifest',
     # r3 (adversary A1 on ce5a0380): and its artifact claims are read through the ONE claim-shape predicate the leg job reads them with.
-    'Get-AttrCudaBuildManifestClaimSha256'
+    'Get-AttrCudaBuildManifestClaimSha256',
+    # r3 (adversary A3 on ce5a0380, A1 on 3bec2622): the one stage lock of a sha in a physical agent root, and the test-only hold seam.
+    'Enter-AttrCudaStageLock',
+    'Wait-AttrCudaTestHold'
 )
 
 if (-not (Test-Path -LiteralPath $OutDir)) { New-Item -ItemType Directory -Path $OutDir -Force | Out-Null }
@@ -361,29 +364,20 @@ if ($VerifyOnly) {
 # cache write (the OS releases it then; an abandoned lock is taken over, because the guard re-reads the cache
 # under it). A second stager of the sha waits, then finds the sound build and reuses or refuses it. A lock
 # that cannot be had is a refusal (exit 7) with nothing written.
+# The lock is keyed on the agent root's PHYSICAL identity (adversary A1 on 3bec2622: a junction alias of the
+# same root took a different lexical-path lock), in Enter-AttrCudaStageLock, embedded above.
 $StageLockWaitSec = 1800
-$lockHasher = [Security.Cryptography.SHA256]::Create()
 try {
-    $lockKey = [IO.Path]::GetFullPath($Cache).TrimEnd('\').ToLowerInvariant() + '|' + $SourceCommit.ToLowerInvariant()
-    $stageLockName = 'Global\MlvAttrCudaStage-' + ([BitConverter]::ToString($lockHasher.ComputeHash([Text.Encoding]::UTF8.GetBytes($lockKey))) -replace '-', '').ToLowerInvariant()
-} finally { $lockHasher.Dispose() }
-$stageLockHeld = $false
-try {
-    $StageLock = [Threading.Mutex]::new($false, $stageLockName)
-    try { $stageLockHeld = $StageLock.WaitOne(0) } catch [Threading.AbandonedMutexException] { $stageLockHeld = $true }
-    if (-not $stageLockHeld) {
-        Say "STAGE_LOCK_WAIT another stager of $SourceCommit into $Cache holds $stageLockName; waiting up to $StageLockWaitSec s"
-        if ($TestLockWaitMarkerPath) { [IO.File]::WriteAllText($TestLockWaitMarkerPath, $stageLockName) }
-        try { $stageLockHeld = $StageLock.WaitOne([TimeSpan]::FromSeconds($StageLockWaitSec)) } catch [Threading.AbandonedMutexException] { $stageLockHeld = $true }
-    }
+    $StageLock = Enter-AttrCudaStageLock -Root $AgentRoot -SourceCommit $SourceCommit -WaitSec $StageLockWaitSec -WaitMarkerPath $TestLockWaitMarkerPath
 } catch {
-    Write-Output "STAGE_REFUSED_STAGE_LOCK sha=$($SourceCommit.Substring(0, 12)) lock=$stageLockName $($_.Exception.Message -replace '\s+', ' ')"
-    Complete-Failed 7 'stagedBuildGuard' "the stage lock $stageLockName of $SourceCommit in $Cache could not be taken, so nothing is staged: $($_.Exception.Message)"
+    Write-Output "STAGE_REFUSED_STAGE_LOCK sha=$($SourceCommit.Substring(0, 12)) $($_.Exception.Message -replace '\s+', ' ')"
+    Complete-Failed 7 'stagedBuildGuard' "the stage lock of $SourceCommit in $AgentRoot could not be taken, so nothing is staged: $($_.Exception.Message)"
 }
-if (-not $stageLockHeld) {
-    Write-Output "STAGE_REFUSED_STAGE_LOCK_BUSY sha=$($SourceCommit.Substring(0, 12)) lock=$stageLockName waitedSec=$StageLockWaitSec"
-    Complete-Failed 7 'stagedBuildGuard' "another stager of $SourceCommit into $Cache held $stageLockName for $StageLockWaitSec s; nothing is staged"
+if (-not $StageLock.held) {
+    Write-Output "STAGE_REFUSED_STAGE_LOCK_BUSY sha=$($SourceCommit.Substring(0, 12)) lock=$($StageLock.name) waitedSec=$StageLockWaitSec"
+    Complete-Failed 7 'stagedBuildGuard' "another stager of $SourceCommit into $AgentRoot held $($StageLock.name) for $StageLockWaitSec s; nothing is staged"
 }
+if ($StageLock.waited) { Say "STAGE_LOCK_WAITED another stager of $SourceCommit held $($StageLock.name); the cache is read again under it" }
 if (Test-Path -LiteralPath $manifestCachePath) {
     $stagedSha = ''
     $unsound = ''
@@ -475,12 +469,9 @@ try {
     Complete-Failed 20 'publishPartials' $_.Exception.Message
 }
 $StepLog['publishPartials'] = 0
-if ($TestHoldAfterPartialsPath) {
-    # Test-only (r3): the partials are copied and verified; wait here (bounded) until the test lets go, so a second stager can be run meanwhile.
-    [IO.File]::WriteAllText("$TestHoldAfterPartialsPath.reached", '')
-    $holdClock = [Diagnostics.Stopwatch]::StartNew()
-    while (-not (Test-Path -LiteralPath $TestHoldAfterPartialsPath) -and $holdClock.Elapsed.TotalSeconds -lt 120) { Start-Sleep -Milliseconds 100 }
-}
+# Test-only (r3): with -TestHoldAfterPartialsPath the partials are copied and verified and the job waits here (bounded) so a second stager can run
+# meanwhile; production passes none and this returns at once.
+Wait-AttrCudaTestHold -Path $TestHoldAfterPartialsPath
 
 try {
     foreach ($item in $sideFiles) {

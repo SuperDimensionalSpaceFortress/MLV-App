@@ -447,6 +447,65 @@ function Get-AttrCudaBuildManifestClaimSha256 {
     $digest.Value.ToLowerInvariant()
 }
 
+function Enter-AttrCudaStageLock {
+    <#
+    .SYNOPSIS
+    Take the ONE stage lock of a sha in an agent root, for the life of the calling process.
+    .DESCRIPTION
+    VENUE-STAGE-SAME-SHA-RESTAGE-GUARD-1 r3 (adversary A3 on ce5a0380, A1 on 3bec2622). Two agents on
+    one root, each with its own -MutexName and both admitted, both passed the stage job's
+    absent-manifest guard; B published, then A replaced B's artifacts, deleted B's sound manifest and
+    failed. The lock is named for the PHYSICAL identity of the agent root (volume serial and file
+    index, read with Get-AttrCudaFileId -FollowLinks, so C:\ProgramData\MlvAgent and an alias of it
+    through a junction are one root) and the sha -- never a caller-chosen name or a lexical path:
+    Global\MlvAttrCudaStage-<sha256 of "vol=<serial>;idx=<high>-<low>|<sha, lower>">. Every stager of
+    that sha into that root's cache, in any session, contends for the same one. The caller keeps the
+    returned mutex referenced and never releases it: the OS releases it when the process ends, after
+    the last cache write. An abandoned lock (a stager that died) is taken over, because the caller
+    re-reads the cache under it. -WaitMarkerPath (test-only) is written when the lock is busy, before
+    the wait. Returns name, held (false: still busy after -WaitSec) and waited. Throws when the
+    root's identity cannot be read.
+    #>
+    param(
+        [Parameter(Mandatory = $true)][string]$Root,
+        [Parameter(Mandatory = $true)][string]$SourceCommit,
+        [int]$WaitSec = 1800,
+        [string]$WaitMarkerPath = ''
+    )
+
+    $id = Get-AttrCudaFileId -Path $Root -FollowLinks
+    $key = 'vol=' + [string]$id.VolumeSerialNumber + ';idx=' + [string]$id.FileIndexHigh + '-' + [string]$id.FileIndexLow + '|' + $SourceCommit.ToLowerInvariant()
+    $hasher = [Security.Cryptography.SHA256]::Create()
+    try {
+        $name = 'Global\MlvAttrCudaStage-' + ([BitConverter]::ToString($hasher.ComputeHash([Text.Encoding]::UTF8.GetBytes($key))) -replace '-', '').ToLowerInvariant()
+    } finally { $hasher.Dispose() }
+    $mutex = [Threading.Mutex]::new($false, $name)
+    $held = $false
+    $waited = $false
+    try { $held = $mutex.WaitOne(0) } catch [Threading.AbandonedMutexException] { $held = $true }
+    if (-not $held) {
+        $waited = $true
+        if ($WaitMarkerPath) { [IO.File]::WriteAllText($WaitMarkerPath, $name) }
+        try { $held = $mutex.WaitOne($WaitSec * 1000) } catch [Threading.AbandonedMutexException] { $held = $true }
+    }
+    [pscustomobject]@{ name = $name; held = $held; waited = $waited; mutex = $mutex }
+}
+
+function Wait-AttrCudaTestHold {
+    <#
+    .SYNOPSIS
+    Test-only seam (VENUE-STAGE-SAME-SHA-RESTAGE-GUARD-1 r3): with a -Path, mark "<Path>.reached" and
+    wait (at most -MaxSec) until -Path exists. With none -- every production call, the agent runs a
+    job with no arguments -- it returns at once and touches nothing.
+    #>
+    param([string]$Path = '', [int]$MaxSec = 120)
+
+    if ([string]::IsNullOrEmpty($Path)) { return }
+    [IO.File]::WriteAllText("$Path.reached", '')
+    $clock = [Diagnostics.Stopwatch]::StartNew()
+    while (-not (Test-Path -LiteralPath $Path) -and $clock.Elapsed.TotalSeconds -lt $MaxSec) { Start-Sleep -Milliseconds 100 }
+}
+
 function Get-AttrCudaGitBlobHashFromBytes {
     <#
     .SYNOPSIS
@@ -7799,6 +7858,8 @@ Export-ModuleMember -Function `
     Assert-AttrCudaDirectChild, `
     Assert-AttrCudaBuildManifest, `
     Get-AttrCudaBuildManifestClaimSha256, `
+    Enter-AttrCudaStageLock, `
+    Wait-AttrCudaTestHold, `
     Assert-AttrCudaFixtureCommittedBytes, `
     Resolve-AttrCudaCommittedBlobId, `
     Save-AttrCudaCommittedBlobBytes, `

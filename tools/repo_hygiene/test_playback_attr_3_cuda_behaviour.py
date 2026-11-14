@@ -1032,8 +1032,10 @@ class StagedBuildNeverReplacedTests(_PwshCase):
         mutate(manifest_dict) edits the assembled build.json before the job is generated."""
         return _run_job(self.emit(tag, suffix, mutate))
 
-    def emit(self, tag: str, suffix: str = "", mutate=None) -> Path:
-        """Assemble and generate the stage job, and drop its inputs into the inbox; the job is not run."""
+    def emit(self, tag: str, suffix: str = "", mutate=None, agent_root: Path | None = None) -> Path:
+        """Assemble and generate the stage job, and drop its inputs into the inbox; the job is not run.
+
+        agent_root: the -AgentRoot the job is generated for (default self.agent; an alias of it reaches the same inbox and cache)."""
         build = self.tmp / f"build-{tag}"
         staging = self.tmp / f"staging-{tag}-{suffix or 'default'}"
         staging.mkdir(parents=True)
@@ -1046,7 +1048,7 @@ class StagedBuildNeverReplacedTests(_PwshCase):
         script.write_text(
             "$ErrorActionPreference = 'Stop'\n"
             f"& '{STAGE_GENERATOR}' -SourceCommit '{SHA_FIXTURE}' -BuildDir '{build}' "
-            f"-OutDir '{staging}' -AgentRoot '{self.agent}'"
+            f"-OutDir '{staging}' -AgentRoot '{agent_root or self.agent}'"
             + (f" -JobIdSuffix '{suffix}'" if suffix else "")
             + " | ConvertTo-Json -Depth 5\n",
             encoding="utf-8",
@@ -1062,7 +1064,14 @@ class StagedBuildNeverReplacedTests(_PwshCase):
         # A passes the (absent-manifest) guard and copies its partials; B then stages. B must not pass the guard while A is between its guard and its
         # publication: the lock is the cache's and the sha's, not a caller's name. A publishes, and B finds the sound build and reuses it (no cache write).
         # On ce5a0380 B published meanwhile, A replaced B's artifacts, deleted B's sound manifest and failed (exit 22): a sound stage with no manifest.
-        job_a, job_b = self.emit("ad005766", suffix="a"), self.emit("ad005766", suffix="b")
+        # adversary A1 on 3bec2622: B reaches the SAME root through a junction (C:\Users\All Users -> C:\ProgramData), so a lock keyed on the lexical
+        # path would be two locks; the lock is the root's physical identity.
+        # The junction is an ANCESTOR of B's root (as All Users is), not the root itself.
+        alias = self.tmp.parent / (self.tmp.name + "-alias")
+        mk = subprocess.run(["cmd", "/c", "mklink", "/J", str(alias), str(self.tmp)], capture_output=True, text=True)
+        self.assertEqual(mk.returncode, 0, mk.stdout + mk.stderr)
+        self.addCleanup(lambda: os.rmdir(alias) if alias.exists() else None)
+        job_a, job_b = self.emit("ad005766", suffix="a"), self.emit("ad005766", suffix="b", agent_root=alias / self.agent.name)
         hold, b_waits = self.tmp / "hold-a", self.tmp / "b-waits"
         cmd = [PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File"]
         a = subprocess.Popen(cmd + [str(job_a), "-TestHoldAfterPartialsPath", str(hold)], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
@@ -1099,12 +1108,16 @@ class StagedBuildNeverReplacedTests(_PwshCase):
     def test_the_stage_lock_is_the_caches_and_the_shas_never_a_callers_name(self) -> None:
         # A3 siblings: the lock is taken before the never-replace guard and held through publishRename (:442), the manifest slot (:451) and its publish (:454)
         text = STAGE_GENERATOR.read_text(encoding="utf-8")
-        lock, guard, publish = text.index("$StageLock = [Threading.Mutex]::new("), text.index("if (Test-Path -LiteralPath $manifestCachePath) {"), text.index("Publish-AttrCudaFileMove -Source $manifestPartialPath")
+        lock, guard, publish = text.index("$StageLock = Enter-AttrCudaStageLock -Root $AgentRoot -SourceCommit $SourceCommit "), text.index("if (Test-Path -LiteralPath $manifestCachePath) {"), text.index("Publish-AttrCudaFileMove -Source $manifestPartialPath")
         self.assertLess(lock, guard)
         self.assertLess(guard, publish)
-        self.assertIn("[IO.Path]::GetFullPath($Cache)", text[:guard][lock - 2000:])
         self.assertNotIn("$MutexName", text)
         self.assertNotIn("ReleaseMutex", text)
+        # adversary A1 on 3bec2622: the name is the root's PHYSICAL identity and the sha, never a lexical path or a caller's name
+        body = re.search(r"(?ms)^function Enter-AttrCudaStageLock \{.*?^\}", MODULE.read_text(encoding="utf-8")).group(0)
+        self.assertIn("Get-AttrCudaFileId -Path $Root -FollowLinks", body)
+        self.assertNotIn("GetFullPath", body)
+        self.assertNotIn("ReleaseMutex", body)
 
     def snapshot(self) -> dict:
         return {e.name: (e.read_bytes(), e.stat().st_mtime_ns) for e in sorted(self.cache.iterdir())}

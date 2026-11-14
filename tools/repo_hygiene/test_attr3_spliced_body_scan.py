@@ -166,6 +166,14 @@ _IN_MEMORY = "in-memory object or buffer only; no file, process or registry acce
 _TYPE_NAME = "reads the exception's type name inside a catch block to report it; nothing is reflected into or invoked"
 _LOCAL_BLOCK = "invokes a script block bound to a local variable in this same body, so the block's text is inside the scanned body"
 
+# ---- VENUE-STAGE-SAME-SHA-RESTAGE-GUARD-1 r3 (adversary A3 on ce5a0380): the stage lock and its test-only seams ----
+_allow("Enter-AttrCudaStageLock",
+       "creates the named stage lock (a kernel mutex, no file) keyed on the agent root's physical identity and the sha; WriteAllText only when the caller passed the test-only -WaitMarkerPath",
+       ("R4", "Threading.Mutex::new", 1), ("R4", "IO.File::WriteAllText", 1))
+_allow("Wait-AttrCudaTestHold",
+       "test-only seam: writes '<Path>.reached' only when a test passed -Path; production passes none and the body returns before it",
+       ("R4", "IO.File::WriteAllText", 1))
+
 # ---- the runtime WRITE / DELETE boundary: every raw write or delete lives here, behind a slot or ownership proof ----
 _allow("Assert-AttrCudaWritableFileSlot",
        "replace-in-place of a fixed derived publish name: removes the stale plain FILE in the slot after refusing a directory, a reparse point and a multi-link file",
