@@ -396,6 +396,12 @@ $a3log2 = "[2026-11-02T14:00:00.000Z] [info] [0x1] trace (C:/b playback_smoke.su
           "[2026-11-02T14:00:01.000Z] [info] [0x1] interaction_trace event=play.toggled.begin checked=1`n[2026-11-02T14:00:01.000Z] [info] [0x1] playback_smoke.start session=1 position=0`n[2026-11-02T14:00:05.000Z] [info] [0x1] playback_smoke.summary session=1 reason=play-stop elapsed_ms=4000`n"
 $a3w2 = Get-UtilSamplePlayWindow $a3log2
 $r['r3A3Summary'] = @{ session = $(if ($a3w2) { $a3w2.session }) }
+# HFR-NATIVE-M16-1457-FULLSCREEN-S1S2-PRESENT-GAP-1 r10 (r10 adversary advisory A1, its input with the token as the variable): a malformed first
+# measured-session id (or, with no marker, a malformed first summary session) is no window, never a later Play's (before r10 id=3x selected session 4)
+$r['r10MalformedMeasured'] = @(foreach ($tok in @('3x', '3.5', '3/old', '', '-3')) { $null -eq (Get-UtilSamplePlayWindow ("[2026-11-13T00:00:00.000Z] [INFO] [0x1] playback_smoke.measured_session id=$tok`n[2026-11-13T00:00:01.000Z] [INFO] [0x1] interaction_trace event=play.toggled.begin checked=1`n[2026-11-13T00:00:01.000Z] [INFO] [0x1] playback_smoke.start session=4`n[2026-11-13T00:00:01.001Z] [INFO] [0x1] playback_smoke.measured_session id=4`n[2026-11-13T00:00:21.000Z] [INFO] [0x1] playback_smoke.summary session=4 elapsed_ms=20000")) })
+$r['r10MalformedSummary'] = @(foreach ($tok in @('3x', '3.5', '')) { $null -eq (Get-UtilSamplePlayWindow ("[2026-11-13T00:00:00.000Z] [INFO] [0x1] playback_smoke.summary session=$tok elapsed_ms=1`n[2026-11-13T00:00:01.000Z] [INFO] [0x1] interaction_trace event=play.toggled.begin checked=1`n[2026-11-13T00:00:01.000Z] [INFO] [0x1] playback_smoke.start session=4`n[2026-11-13T00:00:21.000Z] [INFO] [0x1] playback_smoke.summary session=4 elapsed_ms=20000")) })
+$r10ok = Get-UtilSamplePlayWindow "[2026-11-13T00:00:01.000Z] [INFO] [0x1] interaction_trace event=play.toggled.begin checked=1`n[2026-11-13T00:00:01.000Z] [INFO] [0x1] playback_smoke.start session=4`n[2026-11-13T00:00:01.001Z] [INFO] [0x1] playback_smoke.measured_session id=4`n[2026-11-13T00:00:21.000Z] [INFO] [0x1] playback_smoke.summary session=4 elapsed_ms=20000"
+$r['r10WellFormedControl'] = @{ session = $(if ($r10ok) { $r10ok.session }) }
 # r3 A2: a sampler whose stop failed (stopped=false, a live process after both Kills) is a typed failure, never ok / utilSampleStatus ok
 $a2stop = [ordered]@{ stopped = $false; killed = $false; exitedBeforeStop = $false; exitCode = $null; why = 'stop-failed: Access is denied' }
 $a2g = Get-UtilSampleGpuSummary $g ([ordered]@{ status = 'running'; reason = $null }) $win $a2stop
@@ -1250,6 +1256,10 @@ class UtilSamplePureHelperTests(unittest.TestCase):
     def test_r3_a3_a_marker_quoted_in_a_location_suffix_is_not_the_measured_session(self) -> None:
         self.assertEqual(self.r["r3A3Measured"], {"session": 2, "start": "2026-11-02T14:00:10.0000000Z"})
         self.assertEqual(self.r["r3A3Summary"], {"session": 1}, "the fall-back summary line is the log sink's line too")
+        # r10 (r10 adversary advisory A1): a malformed first id is no window, never a later Play's; a whole id still selects
+        self.assertEqual(self.r["r10MalformedMeasured"], [True] * 5)
+        self.assertEqual(self.r["r10MalformedSummary"], [True] * 3)
+        self.assertEqual(self.r["r10WellFormedControl"], {"session": 4})
 
     def test_r3_a2_a_failed_stop_is_a_typed_failure_not_ok(self) -> None:
         self.assertEqual(self.r["r3A2"], {"gpu": "unavailable(nvidia-smi-stop-failed)", "cpu": "unavailable(cpu-sampler-stop-failed)",

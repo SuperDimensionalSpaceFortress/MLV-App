@@ -16018,7 +16018,9 @@ class DueWakeMeasuredSessionAnchorTests(unittest.TestCase):
         job = (ROOT / "tools" / "profiling" / "bachelor" / "playback-attr-3-cuda-job.ps1").read_text(encoding="utf-8")
         anchor = job.split("# SESSION-ANCHOR-1 >>>", 1)[1].split("# SESSION-ANCHOR-1 <<<", 1)[0]
         core = job.split("function Get-CorePartitionPlaybackStart(", 1)[1].split("\nfunction ", 1)[0]
-        for name, body in (("Get-MeasuredSmokeSessionId anchored region", anchor), ("Get-CorePartitionPlaybackStart", core)):
+        # r10 adversary advisory A1: the utilisation Play-window selector follows the same rule (a malformed first id is no window)
+        util = job.split("function Get-UtilSamplePlayWindow(", 1)[1].split("\nfunction ", 1)[0]
+        for name, body in (("Get-MeasuredSmokeSessionId anchored region", anchor), ("Get-CorePartitionPlaybackStart", core), ("Get-UtilSamplePlayWindow", util)):
             with self.subTest(region=name):
                 self.assertIsNone(unbounded.search(body), name)
                 self.assertIn("'^[0-9]+$'", body, name)

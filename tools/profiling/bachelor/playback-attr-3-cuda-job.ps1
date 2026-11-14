@@ -7519,9 +7519,11 @@ function Get-UtilSamplePlayWindow([string]$LogText) {
         $sid = $null
         # adversary 693bf053 A3: only a line that starts with the log sink's prefix counts, so a marker quoted in another line's source-location suffix
         # (a build path such as "C:/b playback_smoke.measured_session id=1 x/MainWindow.cpp:1") is never taken for the measured-session or summary line
-        foreach ($ln in $lines) { $mm = [regex]::Match($ln, '^\[[^\]]+\] \[[^\]]*\] \[[^\]]*\] playback_smoke\.measured_session id=(\d+)(\s|$)'); if ($mm.Success) { $sid = $mm.Groups[1].Value; break } }
-        if ($null -eq $sid) { foreach ($ln in $lines) { $mm = [regex]::Match($ln, '^\[[^\]]+\] \[[^\]]*\] \[[^\]]*\] playback_smoke\.summary session=(\d+)(\s|$)'); if ($mm.Success) { $sid = $mm.Groups[1].Value; break } } }
-        if ($null -eq $sid) { return $null }
+        # HFR-NATIVE-M16-1457-FULLSCREEN-S1S2-PRESENT-GAP-1 r10 (r10 adversary advisory A1): the FIRST marker's whole id token, one plain decimal [0-9]+;
+        # a malformed one (id=3x) is no window, never skipped for a later Play's marker (the Get-CorePartitionPlaybackStart rule)
+        foreach ($ln in $lines) { $mm = [regex]::Match($ln, '^\[[^\]]+\] \[[^\]]*\] \[[^\]]*\] playback_smoke\.measured_session id=(\S*)'); if ($mm.Success) { $sid = $mm.Groups[1].Value; break } }
+        if ($null -eq $sid) { foreach ($ln in $lines) { $mm = [regex]::Match($ln, '^\[[^\]]+\] \[[^\]]*\] \[[^\]]*\] playback_smoke\.summary session=(\S*)'); if ($mm.Success) { $sid = $mm.Groups[1].Value; break } } }
+        if ($null -eq $sid -or $sid -cnotmatch '^[0-9]+$') { return $null }
         $stamp = $null; $startTh = $null
         $begins = [Collections.Generic.Dictionary[string, string]]::new()
         foreach ($ln in $lines) {
