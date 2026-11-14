@@ -1125,6 +1125,7 @@ def test_invoke_lane_error_mode_pin_catches_each_launch_ahead_of_the_block(tmp_p
 # An alias the file itself defines (Set-Alias / New-Alias / sal / nal, literal name and value, an alias of an alias) is read as the command it names; a name with several meanings is tested as EVERY watched one, and a WMI command name stays one whatever it is aliased to. NOT covered: an alias made any other way (a non-literal name or value, `Import-Alias`, `$ExecutionContext`, `Set-Item alias:`, `New-Item -Path Alias:spawn -Value Invoke-CimMethod`) or defined in another file.
 # NOT covered, a write that reaches a splatted table through a nested index or an array wrapper (`@($h)[0]['PipelineVariable'] = 'w'`, `$h[0]['k'] = ...`): only `( )`, `$( )` of one statement, a cast and `-as` are read through.
 # A class named by a selector is read: the process class name with a wildcard or a character class (`Win32_Proc*`, `Win32[_]Proces[s]`), and a WQL meta_class / __CLASS / __THIS / __DERIVATION / __DYNASTY / __SUPERCLASS query; an assignment in parentheses is read as its target (`($h = @{})['k'] = 'w'`, `($PSDefaultParameterValues = @{})[...]`). NOT covered: a selector on another property (`__RELPATH`, `__PATH`), and `1 | ForEach-Object -InputObject { $_ } -Process { $_ }`, which recurses and fails the tracked test instead of being scanned (adversary pass 11 A2).
+# A CLASS OPERAND is read by what it is, not by its letters (adversary pass 13 A1): the class operand of Get-WmiObject / gwmi / Get-CimClass / Get-CimInstance / gcim (also through a file alias; -Class / -ClassName / -Query in any abbreviation, or positional) that is not a plain literal name, or holds `*` `?` `[` or a WQL `%`, taints the command as WMI whatever its letters (`Win?2_Process`, `Win3[2]_Process`, `*Process`, `*`); a read with no class operand (`Get-WmiObject -List`) taints too. The values of -Filter, -Namespace, -ComputerName, -Property and the common parameters are not class operands. NOT covered: a class operand that is a plain literal Win32_ name other than the process class but reaches the process class by inheritance (`-List Win32_Perf*` is read, `-List CIM_Process` is not), and a read by a command other than these five (`Get-CimAssociatedInstance`, `[wmisearcher]`, `Get-WmiObject` through `& $cmd`).
 # The ONE sanctioned launcher lives under .claude-state and is not tracked, so today the allow list is empty. An entry is {repo-relative posix path: reason},
 # added only in review for a script that must call the create itself; an entry that stops matching a site fails the test, so the list cannot go stale.
 WMI_CREATE_ALLOW = {}
@@ -1232,7 +1233,7 @@ function Get-ReceiverRoots($Expression) {
         elseif ($e -is [IndexExpressionAst]) { $work.Push($e.Target) }
         elseif ($e -is [MemberExpressionAst]) { $work.Push($e.Expression) }
         elseif ($e -is [ConvertExpressionAst]) {
-            if ($wmiWord.IsMatch((Get-CleanText $e.Type))) { $roots.Add('#wmi') }
+            if (Test-WmiWord $e.Type) { $roots.Add('#wmi') }
             $work.Push($e.Child)
         }
         elseif ($e -is [UnaryExpressionAst]) { $work.Push($e.Child) }
@@ -1246,7 +1247,7 @@ function Get-ReceiverRoots($Expression) {
         else {
             # A command, a longer pipeline, a statement that is not a lone expression, a call, a type or a constant: it contributes every variable in it, and the
             # WMI class it names. The condition of an if or a ternary never reaches here, so a read of the process table there does not make the receiver WMI.
-            if ($wmiWord.IsMatch((Get-CleanText $e))) { $roots.Add('#wmi') }
+            if (Test-WmiWord $e) { $roots.Add('#wmi') }
             if ($e -is [StatementAst]) {
                 foreach ($v in $e.FindAll({ param($x) $x -is [VariableExpressionAst] }, $true)) { $roots.Add((Get-VarName $v)) }
             }
@@ -1257,7 +1258,7 @@ function Get-ReceiverRoots($Expression) {
 
 # True when the node names a WMI class (as PowerShell reads it) or mentions a variable already known to hold a WMI object.
 function Test-WmiNode($Node) {
-    if ($wmiWord.IsMatch((Get-CleanText $Node))) { return $true }
+    if (Test-WmiWord $Node) { return $true }
     foreach ($v in $Node.FindAll({ param($x) $x -is [VariableExpressionAst] }, $true)) {
         $name = Get-VarName $v
         if ($wmiVars.ContainsKey($name)) { return $true }
@@ -1521,6 +1522,84 @@ function Test-WmiPipelineInput($Command) {
     return ($null -ne $inputObject -and (Test-WmiNode $inputObject))
 }
 
+# Everything a command's name may mean once the file's aliases are followed (a cycle ends because a name is listed once). The alias map only ADDS meanings: the raw
+# name is the first entry, and every meaning is tested by the caller, none is skipped for an earlier one (G12, G15). A module-qualified name and a full path are the same command.
+function Get-CommandMeanings($Command) {
+    $name = $Command.GetCommandName()
+    if ($null -eq $name) { $name = '' }
+    $closure = New-Object System.Collections.Generic.List[string]
+    $closure.Add((($name -replace '^.*[\\/]', '') -replace '\.(exe|com|cmd|bat)$', '').ToLowerInvariant())
+    for ($k = 0; $k -lt $closure.Count; $k++) {
+        if ($aliasMap.ContainsKey($closure[$k])) { foreach ($v in $aliasMap[$closure[$k]]) { if (-not $closure.Contains($v)) { $closure.Add($v) } } }
+    }
+    return $closure.ToArray()
+}
+
+# The commands that read a WMI class by an operand (adversary pass 13 A1). Their class operand is not matched by its letters (a wildcard or a character class spells
+# Win32_Process in any number of ways: Win?2_Process, Win3[2]_Process, *Process, *): a class operand that is not a plain literal name, or that holds a wildcard character
+# (* ? [) or a WQL % (in a -Query the `*` of `SELECT *` is not one), taints the command as WMI, and so does a read with no class operand at all (-List alone lists every class).
+$wmiReadCommands = @('get-wmiobject', 'gwmi', 'get-cimclass', 'get-ciminstance', 'gcim')
+# -Class / -ClassName / -Query (any abbreviation, one letter or more) hold the class. The parameters below take a value that is never the class (-Filter, -Namespace, the
+# common parameters ...); the value of one is skipped. A switch (-List) or an unknown parameter takes none, so the element after it is read as an operand.
+$wmiClassParameters = @('Class', 'ClassName', 'Query')
+$wmiOtherValueParameters = @('Namespace', 'ComputerName', 'Credential', 'Authentication', 'Authority', 'Impersonation', 'ThrottleLimit', 'Filter', 'Property', 'Locale', 'CimSession', 'OperationTimeoutSec', 'ResourceUri', 'ErrorAction', 'WarningAction', 'InformationAction', 'ErrorVariable', 'WarningVariable', 'InformationVariable', 'OutVariable', 'OutBuffer')
+
+function Test-WmiClassOperandText($Operand, [bool]$IsQuery) {
+    if ($Operand -is [ConstantExpressionAst] -and $Operand -isnot [StringConstantExpressionAst]) { return $false }
+    if ($Operand -isnot [StringConstantExpressionAst]) { return $true }
+    $value = [string]$Operand.Value
+    if ($IsQuery) { $value = [regex]::Replace($value, '(?i)\bselect\s+\*', 'select') }
+    return ($value -match '[*?\[%]')
+}
+
+# True when this one command reads WMI by a class operand that is tainted (see above).
+function Test-WmiClassOperandCommand($Command) {
+    $watched = $false
+    foreach ($meaning in @(Get-CommandMeanings $Command)) { if ($wmiReadCommands -contains $meaning) { $watched = $true } }
+    if (-not $watched) { return $false }
+    $elements = @($Command.CommandElements)
+    $examined = 0
+    for ($i = 1; $i -lt $elements.Count; $i++) {
+        $e = $elements[$i]
+        if ($e -is [CommandParameterAst]) {
+            $n = $e.ParameterName
+            $isClass = $false
+            foreach ($cp in $wmiClassParameters) { if ($cp.StartsWith($n, [StringComparison]::OrdinalIgnoreCase)) { $isClass = $true } }
+            $isOther = $false
+            if (-not $isClass -and $n.Length -ge 2) {
+                foreach ($op in $wmiOtherValueParameters) { if ($op.StartsWith($n, [StringComparison]::OrdinalIgnoreCase)) { $isOther = $true } }
+                if (@('ea', 'wa', 'ia', 'ev', 'wv', 'iv', 'ov', 'ob') -contains $n.ToLowerInvariant()) { $isOther = $true }
+            }
+            if ($null -ne $e.Argument) {
+                if ($isOther) { continue }
+                $examined++
+                if (Test-WmiClassOperandText $e.Argument ($n -match '^[qQ]')) { return $true }
+                continue
+            }
+            if ($isOther -and $i + 1 -lt $elements.Count -and $elements[$i + 1] -isnot [CommandParameterAst]) { $i++ }
+            continue
+        }
+        $examined++
+        $query = ($i -ge 2 -and $elements[$i - 1] -is [CommandParameterAst] -and $null -eq $elements[$i - 1].Argument -and $elements[$i - 1].ParameterName -match '^[qQ]')
+        if (Test-WmiClassOperandText $e $query) { return $true }
+    }
+    return ($examined -eq 0)
+}
+
+# True when the node is, or holds, a command that reads WMI by a tainted class operand.
+function Test-WmiClassOperand($Node) {
+    foreach ($c in @($Node.FindAll({ param($x) $x -is [CommandAst] }, $true))) {
+        if (Test-WmiClassOperandCommand $c) { return $true }
+    }
+    return $false
+}
+
+# True when the node names the WMI process class in any spelling the scanner knows (the letters), or reads a class by a tainted operand.
+function Test-WmiWord($Node) {
+    if ($wmiWord.IsMatch((Get-CleanText $Node))) { return $true }
+    return (Test-WmiClassOperand $Node)
+}
+
 $out = [ordered]@{}
 foreach ($path in @(Get-Content -LiteralPath $ListFile -Encoding UTF8 | Where-Object { $_ })) {
     $tokens = $null; $errors = $null
@@ -1531,6 +1610,42 @@ foreach ($path in @(Get-Content -LiteralPath $ListFile -Encoding UTF8 | Where-Ob
     $foreachAsts = @($ast.FindAll({ param($x) $x -is [ForEachStatementAst] }, $true))
     $parameterAsts = @($ast.FindAll({ param($x) $x -is [ParameterAst] }, $true))
     $invokeAsts = @($ast.FindAll({ param($x) $x -is [InvokeMemberExpressionAst] }, $true))
+    # (The alias map is built here, before the WMI variables are followed, because a read through an alias (`g -List 'Win?2_Process'`) is a WMI read too: pass 13 A1.)
+    # An alias the file defines names the command it points at (adversary A2 on f65d9c29): `Set-Alias SpawnWmi Invoke-CimMethod; SpawnWmi ...`. Set-Alias, New-Alias,
+    # sal and nal (also module-qualified) with a literal name and a literal value (named or positional) are mapped. EVERY definition of a name is kept, and a command name
+    # resolves to the whole closure of what it may point at (any chain length), so a later redefinition or a shadowing twin cannot hide a WMI create (pass 9 on 71996ac0).
+    $aliasMap = @{}
+    foreach ($c in $ast.FindAll({ param($x) $x -is [CommandAst] }, $true)) {
+        $cn = $c.GetCommandName()
+        if ($null -eq $cn) { continue }
+        $cn = (($cn -replace '^.*[\\/]', '') -replace '\.(exe|com|cmd|bat)$', '').ToLowerInvariant()
+        if (@('set-alias', 'new-alias', 'sal', 'nal') -notcontains $cn) { continue }
+        $aliasName = Get-ParameterValue $c 'Name' 1
+        $aliasValue = Get-ParameterValue $c 'Value' 1
+        $positional = New-Object System.Collections.Generic.List[object]
+        $elements = @($c.CommandElements)
+        for ($i = 1; $i -lt $elements.Count; $i++) {
+            $e = $elements[$i]
+            if ($e -is [CommandParameterAst]) {
+                # A switch (Force, PassThru, Confirm, WhatIf, Verbose, Debug, an abbreviation, or the aliases vb, db, cf and wi) takes no value; any other parameter takes the next element.
+                $isSwitch = (@('vb', 'db', 'cf', 'wi') -contains $e.ParameterName.ToLowerInvariant())
+                foreach ($sw in @('Force', 'PassThru', 'Confirm', 'WhatIf', 'Verbose', 'Debug')) { if ($sw.StartsWith($e.ParameterName, [StringComparison]::OrdinalIgnoreCase)) { $isSwitch = $true } }
+                if ($null -eq $e.Argument -and -not $isSwitch) { $i++ }
+                continue
+            }
+            $positional.Add($e)
+        }
+        # Positional operands fill the slots no named parameter took, Name first.
+        $next = 0
+        if ($null -eq $aliasName -and $next -lt $positional.Count) { $aliasName = $positional[$next]; $next++ }
+        if ($null -eq $aliasValue -and $next -lt $positional.Count) { $aliasValue = $positional[$next] }
+        # A literal is a string or a number: Set-Alias converts `7` to the name '7', which `& '7'` calls.
+        if ($aliasName -is [ConstantExpressionAst] -and $aliasValue -is [ConstantExpressionAst]) {
+            $aliasKey = (([string]$aliasName.Value -replace '^.*[\\/]', '') -replace '\.(exe|com|cmd|bat)$', '').ToLowerInvariant()
+            if (-not $aliasMap.ContainsKey($aliasKey)) { $aliasMap[$aliasKey] = New-Object System.Collections.Generic.List[string] }
+            $aliasMap[$aliasKey].Add((([string]$aliasValue.Value -replace '^.*[\\/]', '') -replace '\.(exe|com|cmd|bat)$', '').ToLowerInvariant())
+        }
+    }
     # Every binding of a variable: `$d = <right>`, `$a, $d = <right>`, `[x][y]$d = <right>` and `foreach ($d in <right>)`. A variable is WMI when its right side
     # names a WMI class or mentions a WMI variable (or $_ / $PSItem inside a WMI pipeline); the loop runs to a fixed point, so a copy of a copy is followed.
     $bindings = New-Object System.Collections.Generic.List[object]
@@ -1568,46 +1683,11 @@ foreach ($path in @(Get-Content -LiteralPath $ListFile -Encoding UTF8 | Where-Ob
     }
     # $PSDefaultParameterValues can hand any command a -PipelineVariable / -InputObject / -MemberName: in a file that reads WMI, a write to it that is not a
     # hashtable of safe literal keys is refused.
-    $fileReadsWmi = $wmiWord.IsMatch((Get-CleanText $ast))
+    $fileReadsWmi = Test-WmiWord $ast
     if ($fileReadsWmi) {
         foreach ($d in @(Get-DefaultParameterValuesSites)) {
             $text = ($d.Extent.Text -replace '\s+', ' ')
             $sites.Add([ordered]@{ kind = 'wmi-default-parameter-values'; line = $d.Extent.StartLineNumber; text = $text.Substring(0, [Math]::Min(120, $text.Length)) })
-        }
-    }
-    # An alias the file defines names the command it points at (adversary A2 on f65d9c29): `Set-Alias SpawnWmi Invoke-CimMethod; SpawnWmi ...`. Set-Alias, New-Alias,
-    # sal and nal (also module-qualified) with a literal name and a literal value (named or positional) are mapped. EVERY definition of a name is kept, and a command name
-    # resolves to the whole closure of what it may point at (any chain length), so a later redefinition or a shadowing twin cannot hide a WMI create (pass 9 on 71996ac0).
-    $aliasMap = @{}
-    foreach ($c in $ast.FindAll({ param($x) $x -is [CommandAst] }, $true)) {
-        $cn = $c.GetCommandName()
-        if ($null -eq $cn) { continue }
-        $cn = (($cn -replace '^.*[\\/]', '') -replace '\.(exe|com|cmd|bat)$', '').ToLowerInvariant()
-        if (@('set-alias', 'new-alias', 'sal', 'nal') -notcontains $cn) { continue }
-        $aliasName = Get-ParameterValue $c 'Name' 1
-        $aliasValue = Get-ParameterValue $c 'Value' 1
-        $positional = New-Object System.Collections.Generic.List[object]
-        $elements = @($c.CommandElements)
-        for ($i = 1; $i -lt $elements.Count; $i++) {
-            $e = $elements[$i]
-            if ($e -is [CommandParameterAst]) {
-                # A switch (Force, PassThru, Confirm, WhatIf, Verbose, Debug, an abbreviation, or the aliases vb, db, cf and wi) takes no value; any other parameter takes the next element.
-                $isSwitch = (@('vb', 'db', 'cf', 'wi') -contains $e.ParameterName.ToLowerInvariant())
-                foreach ($sw in @('Force', 'PassThru', 'Confirm', 'WhatIf', 'Verbose', 'Debug')) { if ($sw.StartsWith($e.ParameterName, [StringComparison]::OrdinalIgnoreCase)) { $isSwitch = $true } }
-                if ($null -eq $e.Argument -and -not $isSwitch) { $i++ }
-                continue
-            }
-            $positional.Add($e)
-        }
-        # Positional operands fill the slots no named parameter took, Name first.
-        $next = 0
-        if ($null -eq $aliasName -and $next -lt $positional.Count) { $aliasName = $positional[$next]; $next++ }
-        if ($null -eq $aliasValue -and $next -lt $positional.Count) { $aliasValue = $positional[$next] }
-        # A literal is a string or a number: Set-Alias converts `7` to the name '7', which `& '7'` calls.
-        if ($aliasName -is [ConstantExpressionAst] -and $aliasValue -is [ConstantExpressionAst]) {
-            $aliasKey = (([string]$aliasName.Value -replace '^.*[\\/]', '') -replace '\.(exe|com|cmd|bat)$', '').ToLowerInvariant()
-            if (-not $aliasMap.ContainsKey($aliasKey)) { $aliasMap[$aliasKey] = New-Object System.Collections.Generic.List[string] }
-            $aliasMap[$aliasKey].Add((([string]$aliasValue.Value -replace '^.*[\\/]', '') -replace '\.(exe|com|cmd|bat)$', '').ToLowerInvariant())
         }
     }
     foreach ($n in $ast.FindAll({ param($x) $true }, $true)) {
@@ -1617,7 +1697,7 @@ foreach ($path in @(Get-Content -LiteralPath $ListFile -Encoding UTF8 | Where-Ob
             $splats = @($n.CommandElements | Where-Object { $_ -is [VariableExpressionAst] -and $_.Splatted })
             # "Reads WMI" here: the command names a WMI class, its input is WMI, or a splatted table is itself tainted by WMI (an ordinary argument that merely shares a
             # name with a WMI variable elsewhere in the file does not count: `git -C $C @A` with a parameter $C).
-            $splatReadsWmi = $wmiWord.IsMatch((Get-CleanText $n)) -or (Test-WmiPipelineInput $n)
+            $splatReadsWmi = (Test-WmiWord $n) -or (Test-WmiPipelineInput $n)
             foreach ($s in $splats) { if ($wmiVars.ContainsKey((Get-VarName $s))) { $splatReadsWmi = $true } }
             if ($splats.Count -gt 0 -and $splatReadsWmi) {
                 foreach ($s in $splats) {
@@ -1630,15 +1710,8 @@ foreach ($path in @(Get-Content -LiteralPath $ListFile -Encoding UTF8 | Where-Ob
             $name = $n.GetCommandName()
             if ($null -eq $name) { $name = '' }
             # The command as it resolves: a module-qualified name (CimCmdlets\Invoke-CimMethod) and a full path (C:\...\wmic.exe) are the same command.
-            $lname = (($name -replace '^.*[\\/]', '') -replace '\.(exe|com|cmd|bat)$', '').ToLowerInvariant()
-            # Everything the name may mean once the file's aliases are followed (a cycle ends because a name is listed once). The alias map only ADDS meanings: the raw name
-            # is the first entry, and EVERY meaning that is a command this scan watches is tested below, none is skipped for an earlier one (G12, G15).
-            $closure = New-Object System.Collections.Generic.List[string]
-            $closure.Add($lname)
-            for ($k = 0; $k -lt $closure.Count; $k++) {
-                if ($aliasMap.ContainsKey($closure[$k])) { foreach ($v in $aliasMap[$closure[$k]]) { if (-not $closure.Contains($v)) { $closure.Add($v) } } }
-            }
-            foreach ($cand in $closure) {
+            # Every meaning of the name once the file's aliases are followed; EVERY meaning that is a command this scan watches is tested below (G12, G15).
+            foreach ($cand in @(Get-CommandMeanings $n)) {
                 if ($wmiCommands -contains $cand) {
                     $method = Get-MethodName $n
                     if ($null -eq $method) { $kind = 'wmi-method-name-not-literal' }
@@ -1675,7 +1748,9 @@ foreach ($path in @(Get-Content -LiteralPath $ListFile -Encoding UTF8 | Where-Ob
                 # The arguments only, so a comment between them does not count; the receiver or an argument names the WMI class.
                 $arguments = @($n.Arguments)
                 $argText = (@($arguments | ForEach-Object { Get-CleanText $_ }) -join ' ')
-                if (($viaWmi -or $wmiWord.IsMatch($argText)) -and $argText -match '(?i)\bcreate\b') { $kind = 'wmi-invoke-method-create' }
+                $argsReadWmi = $wmiWord.IsMatch($argText)
+                foreach ($argAst in $arguments) { if (Test-WmiClassOperand $argAst) { $argsReadWmi = $true } }
+                if (($viaWmi -or $argsReadWmi) -and $argText -match '(?i)\bcreate\b') { $kind = 'wmi-invoke-method-create' }
                 # On a WMI receiver a method name that is not a literal could be Create, as for Invoke-CimMethod above.
                 elseif ($viaWmi -and ($arguments.Count -lt 1 -or $arguments[0] -isnot [StringConstantExpressionAst])) { $kind = 'wmi-invoke-method-name-not-literal' }
             }
@@ -1989,6 +2064,27 @@ def test_wmi_create_scan_refuses_each_direct_create_spelling(tmp_path):
         "wmi-list-with-a-wildcard-class": "$c = Get-WmiObject -List 'Win32_Proc*'\n$c.Create('x')",
         "wmi-list-with-a-bracket-class": "$c = Get-WmiObject -List 'Win32[_]Proces[s]'\n$c.Create('x')",
         "wmi-list-with-a-percent-class": "$c = Get-WmiObject -List 'Win32_P%'\n$c.Create('x')",
+        # adversary pass 13 A1 (r12 on ebbb01b4): the class OPERAND of a WMI-reading command that is not a plain literal name, or has a wildcard / WQL character, is
+        # tainted whatever its letters; a read with no class operand (it lists every class) is tainted too
+        "wmi-list-with-a-question-mark-class": "$c = Get-WmiObject -List 'Win?2_Process'\n$c.Create('cmd.exe /c exit 0')",
+        "wmi-list-with-a-char-class-in-the-middle": "$c = Get-WmiObject -List 'Win3[2]_Process'\n$c.Create('x')",
+        "wmi-list-with-a-leading-star": "$c = Get-WmiObject -List '*Process'\n$c.Create('x')",
+        "wmi-list-with-a-lone-star": "$c = Get-WmiObject -List '*'\n$c.Create('x')",
+        "wmi-list-with-no-class-operand": "$c = Get-WmiObject -List\n$c.Create('x')",
+        "wmi-list-with-an-unquoted-wildcard": "$c = Get-WmiObject -List Win?2_Process\n$c.Create('x')",
+        "gwmi-class-parameter-with-a-wildcard": "$c = gwmi -Class 'Win?2_Process'\n$c.Create('x')",
+        "gwmi-class-colon-form-with-a-wildcard": "$c = gwmi -Class:'Win3?_Process'\n$c.Create('x')",
+        "gwmi-abbreviated-class-parameter-with-a-wildcard": "$c = Get-WmiObject -Cl 'W*_Process'\n$c.Create('x')",
+        "wmi-class-from-a-variable": "$k = 'Win32_Process'\n$c = Get-WmiObject -Class $k\n$c.Create('x')",
+        "wmi-class-built-in-a-string": "$k = 'Process'\n$c = Get-WmiObject -Class \"Win32_$k\"\n$c.Create('x')",
+        "wmi-class-from-a-splat": "$h = @{ Class = 'Win32_Process' }\n$c = Get-WmiObject @h\n$c.Create('x')",
+        "cim-class-with-a-wildcard-in-a-pipeline": "Get-CimClass -ClassName 'Win?2_Process' | ForEach-Object { $_.Create('x') }",
+        "cim-class-with-no-operand": "$c = Get-CimClass\n$c.Create('x')",
+        "cim-instance-with-a-wildcard-class": "$c = Get-CimInstance -ClassName 'Win3[2]_Process'\n$c.Create('x')",
+        "wmi-query-from-a-variable": "$q = 'SELECT * FROM Win32_Process'\n$c = Get-WmiObject -Query $q\n$c.Create('x')",
+        "wmi-query-with-a-class-wildcard": "$c = Get-CimInstance -Query 'SELECT * FROM Win32_Pro%'\n$c.Create('x')",
+        "wmi-aliased-read-with-a-wildcard-class": "Set-Alias g Get-WmiObject\n$c = g -List 'Win?2_Process'\n$c.Create('x')",
+        "wmi-wildcard-class-pipeline-with-a-member-name": "Get-WmiObject -List 'Win?2_Process' | ForEach-Object -MemberName Create -ArgumentList 'x'",
         # adversary pass 12 A2: an assignment inside parentheses is an expression whose value is its target, so a write through it is a write to that target
         "splat-parenthesized-assignment-keyed-write": "($h = @{})['PipelineVariable'] = 'w'\nGet-WmiObject -List Win32_Process @h | ForEach-Object { $w.Create('x') }",
         "splat-parenthesized-assignment-member-write": "($h = @{}).PipelineVariable = 'w'\nGet-WmiObject -List Win32_Process @h | ForEach-Object { $w.Create('x') }",
@@ -2144,6 +2240,12 @@ def test_wmi_create_scan_refuses_each_direct_create_spelling(tmp_path):
         "default-parameter-values-safe-key-in-a-wmi-file": "$PSDefaultParameterValues = @{ 'Get-ChildItem:Force' = $true }\nGet-CimInstance Win32_Process",
         "default-parameter-values-empty-in-a-wmi-file": "$PSDefaultParameterValues = @{}\nGet-CimInstance Win32_Process",
         "default-parameter-values-dangerous-key-in-a-plain-file": "$PSDefaultParameterValues['ForEach-Object:MemberName'] = 'Create'\nGet-Item x | ForEach-Object",
+        # adversary pass 13 A1: a plain literal class name, with the other parameters of the real tracked reads, is not a tainted operand
+        "wmi-list-with-a-plain-other-class": "$c = Get-WmiObject -List Win32_OperatingSystem\n$c.Create('y')",
+        "cim-class-parameter-with-a-plain-other-class": "$c = Get-CimInstance -ClassName Win32_Service -Filter \"State='Running'\" -Property ProcessId, Name -ErrorAction Stop\n$c.Create('y')",
+        "cim-read-with-variable-values-on-the-other-parameters": "$c = Get-CimInstance Win32_Service -ComputerName $h -OperationTimeoutSec $t -Filter \"Name like 'x%'\" -ErrorAction $e\n$c.Create('y')",
+        "cim-read-in-another-namespace": "$rows = @(Get-CimInstance -Namespace root\\wmi -ClassName WmiMonitorID | ForEach-Object { $_.Create('y') })",
+        "gcim-plain-class-with-a-filter-variable": "$c = gcim Win32_Service -Filter $args[0] -EA Stop\n$c.Create('y')",
     }
     files = {}
     for name, text in {**mutants, **not_sites}.items():
