@@ -30,6 +30,13 @@ ob = importlib.util.module_from_spec(_spec)
 sys.modules["doctrine_outbox"] = ob
 _spec.loader.exec_module(ob)
 
+# HERMETIC AGAINST A GIT HOOK: a hook (the lane pre-push guard runs this file's card-validator tests from one) is started with GIT_DIR, GIT_WORK_TREE and
+# GIT_INDEX_FILE exported for the repository being pushed; every fixture repository below is addressed with `git -C <tmp>`, which an inherited GIT_DIR overrides
+# ("fatal: this operation must be run in a work tree"), so the tests failed only under the hook and the guard refused a push of a valid card (r13). The
+# variables that LOCATE a repository are dropped from this process; none of them is a setting these tests rely on.
+for _locator in ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_COMMON_DIR", "GIT_PREFIX", "GIT_OBJECT_DIRECTORY", "GIT_ALTERNATE_OBJECT_DIRECTORIES", "GIT_NAMESPACE"):
+    os.environ.pop(_locator, None)
+
 GIT_ID = ["-c", "user.name=t", "-c", "user.email=t@example.invalid", "-c", "core.autocrlf=false", "-c", "core.safecrlf=false"]
 
 
