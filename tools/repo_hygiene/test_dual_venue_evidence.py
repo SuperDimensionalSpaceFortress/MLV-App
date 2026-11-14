@@ -15525,6 +15525,27 @@ class DueWakeDeliveryEvidenceTests(unittest.TestCase):
         self.assertEqual((v["verdict"], v["blocks"]), ("NOT_HONOURED", True), v)
         self.assertIn("ROUTE_NOT_ENGAGED", v["reason"])
 
+    def test_r6_p13_a1_a_second_control_record_is_unreadable_not_a_pass(self) -> None:
+        # r5 adversary pass 13 A1, its input verbatim: the committed paced cell, a control line saying delivery=none, then a bare playback_due_wake
+        # record. The control delivery= rule read only a window with exactly one candidate, so the second record removed the refusal and the verdict
+        # was NOT_REQUESTED blocks=false; more than one wake record in the measured window is unreadable, whatever the leg
+        cell = json.loads((DV / "legs" / "m16-1457-native-fullscreen-s1.json").read_text(encoding="utf-8"))
+        verbatim = ("playback_smoke.measured_session id=3\nplayback_smoke.summary session=3 reason=play-stop presented_frames=600\n"
+                    "playback_smoke.pace_summary session=3 first_present_ms=40.000 paced_elapsed_ms=25000.000\n"
+                    "playback_due_wake armed=0 fired=0 advanced=0 rearmed=0 busy_deferred=0 hires=0 disabled=0 delivery=none unpresented_deferred=0\n"
+                    "playback_due_wake\n")
+        control = self.wake(None).replace(" disabled=0", "")
+        for spec_name, spec, log in (("committed paced cell, verbatim", cell, verbatim),
+                                     ("committed paced cell, two armed control lines", cell, self.log(control, control)),
+                                     ("unpaced leg, two armed control lines", {"generatorArgs": {"unpaced": True}}, self.log(control, control))):
+            with self.subTest(case=spec_name):
+                v = self.verdict(spec, log)
+                self.assertEqual((v["requested"], v["verdict"], v["blocks"]), (False, "NOT_HONOURED", True), v)
+                self.assertIn("unreadable", v["reason"])
+        # unchanged: one armed control line leaves the paced cell unchanged (a posted leg on a control window: test_r5_p12 above)
+        v = self.verdict(cell, self.log(control))
+        self.assertEqual((v["verdict"], v["blocks"]), ("NOT_REQUESTED", False), v)
+
     def test_r5_a3_a_measured_session_record_of_another_session_closes_the_window(self) -> None:
         # r5 (r4 adversary pass 10 advisory A3, verbatim shape): `playback_smoke.measured_session id=4` names its session with id=, not session=, and
         # it is a playback_smoke record of ANOTHER session, so it closes the measured wake window like any other; a wake record after it is not the
