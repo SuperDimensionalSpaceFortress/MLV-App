@@ -2189,6 +2189,26 @@ $ids = @(1..40 | ForEach-Object {{ New-VenueCapsProbeId }})
         want = {"L1": "FOUND:idle"} | {f"L{i}": "ABSENT:" for i in range(2, 10)}
         self.assertEqual(json.loads(out.stdout), want)
 
+    def test_r2_adversary_a1_a_non_string_identity_spelled_like_the_request_neither_answers_nor_hides_the_agents_line(self) -> None:
+        # adversary r2 A1 on 92c08033 (adversary-92c08033.json): an all-digit token written as a JSON NUMBER became the text '123456789012' and matched the request, so a
+        # closed line hid the agent's own idle line. Siblings: a numeric lease id 1 for -LeaseId '1', an array ["L1"] for -LeaseId '["L1"]'.
+        (self.share / "logs").mkdir()
+        t = "123456789012"
+        lines = [
+            {"token": 123456789012, "leaseId": "L1", "endReason": "closed"}, {"token": t, "leaseId": "L1", "endReason": "idle", "endedUtc": "2026-11-14T18:05:01Z", "heldSec": 301},
+            {"token": t, "leaseId": 1, "endReason": "idle"}, {"token": t, "leaseId": ["L1"], "endReason": "idle"},
+        ]
+        (self.share / "logs" / f"lease-batch-{t}.jsonl").write_text("".join(json.dumps(x) + "\n" for x in lines), encoding="utf-8")
+        script = (
+            f"Import-Module '{psq(MODULE)}' -Force -DisableNameChecking\n"
+            f"$s = '{psq(self.share)}'\n"
+            f"$rd = {{ param($id) $x = Read-VenueLeaseBatchReceipt -AgentShare $s -Token '{t}' -LeaseId $id; \"$($x.state):$($x.record.endReason)\" }}\n"
+            "[ordered]@{ L1 = (& $rd 'L1'); one = (& $rd '1'); arr = (& $rd '[\"L1\"]') } | ConvertTo-Json -Compress\n"
+        )
+        out = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, timeout=120)
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        self.assertEqual(json.loads(out.stdout), {"L1": "FOUND:idle", "one": "ABSENT:", "arr": "ABSENT:"})
+
 
 # LEASE-BATCH-MULTI-BUILD-1: a wrapper around fake-leg.ps1 that records the build, backend and spec each leg was called with, then runs the fake leg unchanged.
 FAKE_LEG_ARGS = r"""
