@@ -15647,6 +15647,94 @@ class DueWakeDeliveryEvidenceTests(unittest.TestCase):
         v = self.verdict(self.POST, closed("playback_smoke.startup_catchup session=3 frames=0 note=playback_smoke.measured_session id=4", self.wake("post")))
         self.assertEqual((v["verdict"], v["blocks"]), ("HONOURED", False), v)
 
+    def test_r8_b1_a_paced_record_with_no_delivered_wake_is_not_engaged(self) -> None:
+        # r8 B1 (sol r7 + key3 opus r7 on e9a55f21, their input verbatim): the reader never read fired=, so a posted leg whose measured Play delivered
+        # zero wakes was HONOURED and the sent head arm with fired=0 was unblocked. fired= counts the wakes the GUI thread took
+        # (MainWindow::onPlaybackDueWake); armed= counts arms, and an arm replaced or cancelled before delivery (stranded=) delivers nothing
+        cell = json.loads((DV / "legs" / "m16-1457-native-fullscreen-s1.json").read_text(encoding="utf-8"))
+        self.assertNotIn("unpaced", cell["generatorArgs"])
+        head = "playback_smoke.measured_session id=3\nplayback_smoke.pace_summary session=3\n"
+        verbatim = head + "playback_due_wake armed=1200 fired=0 disabled=0 delivery=native-msg runner_sleep_woken=0 delivery_kind=post\n"
+        zero = {
+            "verbatim": verbatim,
+            "armed=0 fired=0 (opus row 3)": head + "playback_due_wake armed=0 fired=0 disabled=0 delivery=native-msg runner_sleep_woken=0 delivery_kind=post\n",
+            "full line, stranded=1200": self.log(self.wake("post").replace("fired=1198", "fired=0").replace("stranded=0", "stranded=1200")
+                                                 .replace("runner_sleep_woken=12", "runner_sleep_woken=0")),
+            "crash-forensics prefix": self.log(self.PREFIX + self.wake("post").replace("fired=1198", "fired=0")),
+            "fired=00": self.log(self.wake("post").replace("fired=1198", "fired=00")),
+        }
+        # (a) the posted isolation arm: not honoured
+        for name, log in zero.items():
+            with self.subTest(leg="posted", case=name):
+                v = self.verdict(self.POST, log)
+                self.assertEqual((v["requested"], v["verdict"], v["blocks"]), (True, "NOT_HONOURED", True), v)
+                self.assertIn("DUE_WAKE_NOT_ENGAGED", v["reason"])
+        # (b) the same records as the sent head arm (and a paced QTimer-built wake that never fired): blocked
+        for name, log in zero.items():
+            for kind, mech in (("send", "native-msg"), ("qtimer", "qtimer")):
+                with self.subTest(leg="head", case=name, kind=kind):
+                    v = self.verdict(cell, log.replace("delivery_kind=post", f"delivery_kind={kind}").replace("delivery=native-msg", f"delivery={mech}"))
+                    self.assertEqual((v["requested"], v["verdict"], v["blocks"]), (False, "NOT_HONOURED", True), v)
+                    self.assertIn("DUE_WAKE_NOT_ENGAGED", v["reason"])
+        # fail closed: a fired= that is missing, empty, signed, not a whole count or repeated cannot show a delivered wake, on either arm
+        for name, line in (("no fired=", self.wake("post").replace(" fired=1198", "")), ("empty fired=", self.wake("post").replace("fired=1198", "fired=")),
+                           ("negative fired=", self.wake("post").replace("fired=1198", "fired=-1")), ("NaN fired=", self.wake("post").replace("fired=1198", "fired=NaN")),
+                           ("fractional fired=", self.wake("post").replace("fired=1198", "fired=1.5")),
+                           ("two fired=", self.wake("post") + " fired=0"), ("two fired=, both delivered", self.wake("post") + " fired=1198")):
+            for leg, spec, kind in (("posted", self.POST, "post"), ("head", cell, "send")):
+                with self.subTest(leg=leg, case=name):
+                    v = self.verdict(spec, self.log(line.replace("delivery_kind=post", f"delivery_kind={kind}")))
+                    self.assertEqual((v["verdict"], v["blocks"]), ("NOT_HONOURED", True), v)
+                    self.assertIn("DUE_WAKE_NOT_ENGAGED", v["reason"])
+        # (c) one delivered wake is enough, and a sibling field named *fired= is never read as fired=
+        for name, line in (("fired=1", self.wake("post").replace("fired=1198", "fired=1")), ("fired=1198", self.wake("post")),
+                           ("prev_probe_fired=0 elsewhere", self.wake("post") + " prev_probe_fired=0")):
+            with self.subTest(leg="posted", case=name):
+                v = self.verdict(self.POST, self.log(line))
+                self.assertEqual((v["verdict"], v["blocks"]), ("HONOURED", False), v)
+            with self.subTest(leg="head", case=name):
+                v = self.verdict(cell, self.log(line.replace("delivery_kind=post", "delivery_kind=send")))
+                self.assertEqual((v["verdict"], v["blocks"]), ("NOT_REQUESTED", False), v)
+        # (d) EXEMPT, by design: a control binary's line (no delivery_kind) is the C arm, whose binary is not under test here; the paced no-arm rule
+        # (delivery=none) is its only engagement check, so fired=0 or no fired= there leaves a leg that does not ask unchanged. An unpaced leg never
+        # arms, so its fired=0 is its own (and a posted leg on a control line stays ROUTE_NOT_ENGAGED)
+        control = self.wake(None)
+        for name, spec, line in (("control line, fired=0", cell, control.replace("fired=1198", "fired=0")),
+                                 ("control line, no fired=", cell, control.replace(" fired=1198", "")),
+                                 ("unpaced leg, no wake", {"generatorArgs": {"unpaced": True}}, self.NO_WAKE),
+                                 ("unpaced leg, control line with no arm", {"generatorArgs": {"unpaced": True}}, control.replace("fired=1198", "fired=0").replace("delivery=native-msg", "delivery=none"))):
+            with self.subTest(exempt=name):
+                v = self.verdict(spec, self.log(line))
+                self.assertEqual((v["verdict"], v["blocks"]), ("NOT_REQUESTED", False), v)
+        v = self.verdict(self.POST, self.log(control.replace("fired=1198", "fired=0")))
+        self.assertEqual((v["verdict"], v["blocks"]), ("NOT_HONOURED", True), v)
+        self.assertIn("ROUTE_NOT_ENGAGED", v["reason"])
+        # (e) DECIDED: advanced=0 with fired>0 IS engaged. The evidence bar is a DELIVERED wake; advanced= counts only the wakes that moved the frame
+        # themselves, and a delivered wake on a busy renderer hands its advance to the frameReady path (busy_deferred=), so advanced=0 is a measured
+        # outcome of the arm, not a route that did not run
+        for name, line in (("advanced=0, fired=5", self.wake("post").replace("fired=1198", "fired=5").replace("advanced=1190", "advanced=0")),
+                           ("advanced=0, every wake busy-deferred", self.wake("post").replace("advanced=1190", "advanced=0").replace("busy_deferred=3", "busy_deferred=1198"))):
+            with self.subTest(leg="posted", case=name):
+                v = self.verdict(self.POST, self.log(line))
+                self.assertEqual((v["verdict"], v["blocks"]), ("HONOURED", False), v)
+            with self.subTest(leg="head", case=name):
+                v = self.verdict(cell, self.log(line.replace("delivery_kind=post", "delivery_kind=send")))
+                self.assertEqual((v["verdict"], v["blocks"]), ("NOT_REQUESTED", False), v)
+
+    def test_r8_b1_one_delivered_wake_predicate_serves_both_arms_and_every_consumer(self) -> None:
+        # r8 B1 class sweep: one predicate decides "a wake was delivered" for the requested and the head path, and both consumers (the runner's
+        # gate and Test-DvReceiptValid's re-derivation) reach it only through Get-DvDueWakeDeliveryEvidence
+        module = (DV / "DualVenueRunner.psm1").read_text(encoding="utf-8")
+        body = module.split("function Get-DvDueWakeDeliveryEvidence {", 1)[1].split("\nfunction ", 1)[0]
+        self.assertIn("function Get-DvDueWakeDelivered {", module)
+        self.assertEqual(body.count("Get-DvDueWakeDelivered -Line"), 1, "one read of the measured line, shared by both paths")
+        self.assertEqual(body.count("-cne 'delivered'"), 2, "the requested path and the head path both gate on it")
+        self.assertNotIn("(?:^|\\s)fired=", body, "fired= is parsed only inside Get-DvDueWakeDelivered")
+        self.assertIn("$dueWakeDeliveryVerdict = Get-DvDueWakeDeliveryEvidence -Spec $spec -LogText $ev.logText", module)
+        runner = (DV / "Invoke-VenueLeg.ps1").read_text(encoding="utf-8")
+        self.assertIn("$dueWakeDeliveryVerdict = Get-DvDueWakeDeliveryEvidence -Spec $spec -LogText $runLogText", runner)
+        self.assertNotIn("Get-DvDueWakeDelivered -Line", runner, "the runner's gate reads delivery only through Get-DvDueWakeDeliveryEvidence")
+
 
 @requires_windows_pwsh
 class DueWakeMeasuredSessionAnchorTests(unittest.TestCase):
