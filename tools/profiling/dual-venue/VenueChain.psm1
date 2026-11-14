@@ -1074,8 +1074,8 @@ function Stop-VenueJobLiveness {
 function Read-VenueLeaseBatchReceipt {
     <#
     .SYNOPSIS
-    The venue agent's own receipt for one batch lease (ultra-magnus-agent.ps1 lease-batch item 5): the line of <AgentShare>\logs\lease-batch-<Token>.jsonl whose leaseId is
-    -LeaseId, read by NAME on one bounded worker.
+    The venue agent's own receipt for one batch lease (ultra-magnus-agent.ps1 lease-batch item 5): the line of <AgentShare>\logs\lease-batch-<Token>.jsonl whose token is
+    -Token AND whose leaseId is -LeaseId (both scalar strings, ordinal), read by NAME on one bounded worker. A line with a missing, non-string or other token is never this batch's.
     .OUTPUTS
     [pscustomobject]@{ state (FOUND | ABSENT | UNKNOWN); record; error }
     #>
@@ -1088,7 +1088,9 @@ function Read-VenueLeaseBatchReceipt {
     foreach ($line in $lines) {
         $rec = try { ConvertFrom-VenueJsonRawIdentity -Text $line } catch { $null }
         # r12 (adversary r11 A2): ordinal on the exact lease id (-ceq is culture-aware); an empty or whitespace-only -LeaseId names no lease, so it matches no line
-        if ($null -ne $rec -and -not [string]::IsNullOrWhiteSpace($LeaseId) -and [string]::Equals([string]$rec.leaseId, $LeaseId, [StringComparison]::Ordinal)) { return [pscustomobject]@{ state = 'FOUND'; record = $rec; error = $null } }
+        # r2 (sol key r1 BLOCKER, PR 817): the line must also be THIS token's, a scalar string compared ordinally, so a foreign or token-less line neither answers nor hides the agent's own
+        if ($null -ne $rec -and -not [string]::IsNullOrWhiteSpace($LeaseId) -and $rec.token -is [string] -and [string]::Equals($rec.token, $Token, [StringComparison]::Ordinal) -and
+            $rec.leaseId -is [string] -and [string]::Equals($rec.leaseId, $LeaseId, [StringComparison]::Ordinal)) { return [pscustomobject]@{ state = 'FOUND'; record = $rec; error = $null } }
     }
     [pscustomobject]@{ state = 'ABSENT'; record = $null; error = "no line for lease $LeaseId among $($lines.Count)" }
 }

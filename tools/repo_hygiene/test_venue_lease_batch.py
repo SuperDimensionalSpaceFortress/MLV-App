@@ -106,6 +106,23 @@ switch ($mode) {
         Add-Content -LiteralPath (Join-Path $lg "lease-batch-$($stq.token).jsonl") -Value (([ordered]@{ schema = 'mlv-agent-lease-batch.v1'; token = $stq.token; leaseId = $stq.leaseId; endedUtc = [DateTimeOffset]::UtcNow.ToString('o'); heldSec = 301; endReason = 'idle'; why = 'no job for 301s > 300s'; jobsRun = 1 }) | ConvertTo-Json -Compress)
         "QUIET mean=5.0% threshold=$ThresholdPercent% waitedSec=301"; exit 0
     }
+    { $_ -in 'IDLEFOREIGN', 'FOREIGNIDLE', 'NOTOKENIDLE', 'FOREIGNEND' } {
+        # r2 (sol key r1 BLOCKER, receipt token binding): lines in THIS batch's receipt file for THIS lease that another token wrote, or no token at all. IDLEFOREIGN: a foreign
+        # closed line, then the agent's own idle line. FOREIGNIDLE / NOTOKENIDLE: a lone idle line under another token / under none. FOREIGNEND: a lone foreign non-idle line.
+        $stq = Get-Content -LiteralPath (Join-Path $env:FAKE_SHARE 'fake-agent-state.json') -Raw | ConvertFrom-Json
+        $lg = Join-Path $env:FAKE_SHARE 'logs'
+        New-Item -ItemType Directory -Force -Path $lg | Out-Null
+        $rf = Join-Path $lg "lease-batch-$($stq.token).jsonl"
+        $at = [DateTimeOffset]::UtcNow.ToString('o')
+        $rows = switch ($mode) {
+            'IDLEFOREIGN' { [ordered]@{ token = 'ffffffffffff'; leaseId = $stq.leaseId; endReason = 'closed' }, [ordered]@{ token = $stq.token; leaseId = $stq.leaseId; endedUtc = $at; endReason = 'idle' } }
+            'FOREIGNIDLE' { , [ordered]@{ token = 'ffffffffffff'; leaseId = $stq.leaseId; endedUtc = $at; endReason = 'idle' } }
+            'NOTOKENIDLE' { , [ordered]@{ leaseId = $stq.leaseId; endedUtc = $at; endReason = 'idle' } }
+            'FOREIGNEND' { , [ordered]@{ token = 'ffffffffffff'; leaseId = $stq.leaseId; endReason = 'foreign' } }
+        }
+        foreach ($row in $rows) { Add-Content -LiteralPath $rf -Value ($row | ConvertTo-Json -Compress) }
+        "QUIET mean=5.0% threshold=$ThresholdPercent% waitedSec=301"; exit 0
+    }
     'UNKNOWN' { "VENUE_QUIET_UNKNOWN mean=UNKNOWN threshold=$ThresholdPercent% waitedSec=1 reason=probe-failed"; exit 6 }
     'STEAL' {
         # r5b (Grok G1): another owner's claim replaces the run's mid-batch (another nonce; its owner pid is dead, so the next batch may break it). The probe
@@ -245,7 +262,12 @@ if ($legMode -eq 'hang') {
 $lose =@(([string]$env:FAKE_LEG_LOSE) -split ',' | Where-Object { $_ } | ForEach-Object { [int]$_ })
 # LEASE-BATCH-IDLE-END-UNSEEN-1: FAKE_LEG_IDLE_END=1 is the idle release landing AFTER the runner's pre-launch read (the agent wrote its endReason=idle line for the batch lease while the leg's job
 # was being admitted, so the job took a fresh lease under the token: pair it with FAKE_LEG_LOSE for that call)
-if ($env:FAKE_LEG_IDLE_END -eq '1') {
+if ($env:FAKE_LEG_IDLE_END -in 'foreign-then-idle', 'foreign') {
+    # r2 (sol key r1 BLOCKER): a line ANOTHER token wrote for this lease lands first (closed before the agent's own idle line; or idle, alone)
+    New-Item -ItemType Directory -Force -Path (Join-Path $share 'logs') | Out-Null
+    Add-Content -LiteralPath (Join-Path $share "logs\lease-batch-$($st.token).jsonl") -Value (([ordered]@{ token = 'ffffffffffff'; leaseId = $st.leaseId; endedUtc = [DateTimeOffset]::UtcNow.ToString('o'); endReason = $(if ($env:FAKE_LEG_IDLE_END -eq 'foreign') { 'idle' } else { 'closed' }) }) | ConvertTo-Json -Compress)
+}
+if ($env:FAKE_LEG_IDLE_END -in '1', 'foreign-then-idle') {
     New-Item -ItemType Directory -Force -Path (Join-Path $share 'logs') | Out-Null
     Add-Content -LiteralPath (Join-Path $share "logs\lease-batch-$($st.token).jsonl") -Value (([ordered]@{ schema = 'mlv-agent-lease-batch.v1'; token = $st.token; leaseId = $st.leaseId; endedUtc = [DateTimeOffset]::UtcNow.ToString('o'); heldSec = 301; endReason = 'idle'; why = 'no job for 301s > 300s'; jobsRun = 1 }) | ConvertTo-Json -Compress)
 }
@@ -784,6 +806,48 @@ class VenueLeaseBatchRunnerTests(unittest.TestCase):
         b1 = self.batches()[0]
         self.assertEqual((b1["endReason"], b1["legs"][0]["class"], b1["agent"]["endReason"]), ("LEASE_LOST", "LEASE_LOST", "closed"), b1)
 
+    # ---------------------------------------------------------------- r2 (sol key r1 BLOCKER): a receipt line is this batch's only when its token AND lease id are this batch's
+    def test_r2_a_foreign_token_line_before_the_agents_own_idle_line_does_not_hide_the_idle_end(self) -> None:
+        # sol r1 repro: a foreign-token closed line for this lease, then the agent's idle line under this token. The reader returned the first lease match, so no idle end was seen
+        # and the next leg launched on an ended lease.
+        r = self.run_batch(self.specs[:2], FAKE_QUIET_MODES="QUIET,IDLEFOREIGN,QUIET")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        b1, b2 = self.batches()
+        t1, t2 = b1["token"], b2["token"]
+        self.assertEqual(self.kinds(), [f"OPEN:{t1}", "QUIET:QUIET", f"LEG:fx-a:{t1}", "QUIET:IDLEFOREIGN", f"CLOSE:{t1}", f"OPEN:{t2}", "QUIET:QUIET", f"LEG:fx-b:{t2}", f"CLOSE:{t2}"])
+        self.assertEqual((b1["endReason"], b1["legsAttempted"], b1["legsRan"]), ("LEASE_IDLE_ENDED", 1, 1), b1)
+        self.assertEqual((b1["agent"]["token"], b1["agent"]["endReason"]), (t1, "idle"), b1["agent"])
+
+    def test_r2_an_idle_line_under_another_token_or_none_is_no_idle_end_of_this_batch(self) -> None:
+        for mode in ("FOREIGNIDLE", "NOTOKENIDLE"):
+            with self.subTest(mode=mode):
+                self.setUp()
+                r = self.run_batch(self.specs[:2], FAKE_QUIET_MODES=f"QUIET,{mode},QUIET")
+                self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+                [b1] = self.batches()
+                t1 = b1["token"]
+                self.assertEqual(self.kinds(), [f"OPEN:{t1}", "QUIET:QUIET", f"LEG:fx-a:{t1}", f"QUIET:{mode}", f"LEG:fx-b:{t1}", f"CLOSE:{t1}"])
+                self.assertEqual((b1["endReason"], b1["legsRan"], b1["legsCounted"]), ("ALL_LEGS_DONE", 2, 2), b1)
+                self.assertEqual((b1["agent"]["token"], b1["agent"]["endReason"]), (t1, "closed"), b1["agent"])
+
+    def test_r2_the_batch_attaches_only_its_own_tokens_receipt_line(self) -> None:
+        # the class sweep's third consumer (the receipt attached after the close): a foreign-token line for this lease came first and was attached as the agent's receipt
+        r = self.run_batch(self.specs[:2], FAKE_QUIET_MODES="QUIET,FOREIGNEND,QUIET")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        [b1] = self.batches()
+        self.assertEqual((b1["endReason"], b1["legsRan"]), ("ALL_LEGS_DONE", 2), b1)
+        self.assertEqual((b1["agent"]["token"], b1["agent"]["endReason"]), (b1["token"], "closed"), b1["agent"])
+
+    def test_r2_a_leg_off_the_lease_reads_only_its_own_tokens_idle_line(self) -> None:
+        # the in-flight consumer: a foreign closed line before the agent's idle line still types LEASE_IDLE_ENDED; a lone foreign idle line is no idle end (LEASE_LOST)
+        for mode, want in (("foreign-then-idle", "LEASE_IDLE_ENDED"), ("foreign", "LEASE_LOST")):
+            with self.subTest(mode=mode):
+                self.setUp()
+                r = self.run_batch(self.specs[:2], FAKE_LEG_LOSE="1", FAKE_LEG_IDLE_END=mode)
+                self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+                b1 = self.batches()[0]
+                self.assertEqual((b1["endReason"], b1["legs"][0]["class"], b1["legs"][0]["counted"]), (want, want, False), b1)
+
     def test_r12_adversary_a2_a_job_lease_that_differs_only_by_an_ignorable_character_is_another_lease(self) -> None:
         # adversary r11 A2 on e5ff0114 (sibling Invoke-VenueLeaseBatch.ps1:2013): jobLease -ceq $b.leaseId is culture-aware, so lease-1 + U+00AD read as the batch's own lease
         # and a leg that ran on ANOTHER lease was counted. Ordinal equality: it is LEASE_LOST and uncounted, exactly like a different lease id.
@@ -801,7 +865,8 @@ class VenueLeaseBatchRunnerTests(unittest.TestCase):
     def test_r12_adversary_a2_the_agents_batch_receipt_is_found_by_the_exact_lease_id_only(self) -> None:
         # sibling VenueChain.psm1:1087: [string]$rec.leaseId -ceq $LeaseId was culture-aware, and an empty or whitespace lease id matched a record with no lease id
         (self.share / "logs").mkdir()
-        lines = [{"leaseId": "L1" + chr(0xAD), "endReason": "other"}, {"endReason": "noid"}, {"leaseId": "L1", "endReason": "closed"}]
+        # r2: every line carries this batch's token (the reader binds token AND lease id), so only the lease id differs here
+        lines = [{"token": "0123456789ab", "leaseId": "L1" + chr(0xAD), "endReason": "other"}, {"token": "0123456789ab", "endReason": "noid"}, {"token": "0123456789ab", "leaseId": "L1", "endReason": "closed"}]
         (self.share / "logs" / "lease-batch-0123456789ab.jsonl").write_text("".join(json.dumps(x, ensure_ascii=False) + "\n" for x in lines), encoding="utf-8")
         script = (
             f"Import-Module '{psq(MODULE)}' -Force -DisableNameChecking\n"
@@ -852,7 +917,7 @@ class VenueLeaseBatchRunnerTests(unittest.TestCase):
     def test_r13_adversary_a1_the_agents_batch_receipt_and_the_lease_ledger_keep_the_lease_id_as_written(self) -> None:
         # siblings VenueChain.psm1 Read-VenueLeaseBatchReceipt / Read-VenueLeaseLedger: a timestamp-shaped lease id was a DateTime, so '...:00.0Z' was FOUND for '...:00Z' and the ledger row's id was reformatted
         (self.share / "logs").mkdir()
-        lines = [{"leaseId": "2026-10-30T10:00:00.0Z", "endReason": "other"}, {"leaseId": "2026-10-30T10:00:00Z", "endReason": "closed"}]
+        lines = [{"token": "0123456789ab", "leaseId": "2026-10-30T10:00:00.0Z", "endReason": "other"}, {"token": "0123456789ab", "leaseId": "2026-10-30T10:00:00Z", "endReason": "closed"}]
         (self.share / "logs" / "lease-batch-0123456789ab.jsonl").write_text("".join(json.dumps(x) + "\n" for x in lines), encoding="utf-8")
         claim_dir = self.share / "claims"
         script = (
@@ -2088,7 +2153,7 @@ $ids = @(1..40 | ForEach-Object {{ New-VenueCapsProbeId }})
         (self.share / "logs").mkdir()
         (self.share / "outbox" / "j1.result.json").write_text(json.dumps({"jobId": "j1", "admission": {"leaseBatch": {"leaseId": "L1"}}}), encoding="utf-8")
         (self.share / "logs" / "lease-batch-0123456789ab.jsonl").write_text(
-            json.dumps({"leaseId": "L0", "endReason": "idle"}) + "\n" + json.dumps({"leaseId": "L1", "endReason": "closed"}) + "\n", encoding="utf-8")
+            json.dumps({"token": "0123456789ab", "leaseId": "L0", "endReason": "idle"}) + "\n" + json.dumps({"token": "0123456789ab", "leaseId": "L1", "endReason": "closed"}) + "\n", encoding="utf-8")
         script = (
             f"Import-Module '{psq(MODULE)}' -Force -DisableNameChecking\n"
             f"$s = '{psq(self.share)}'\n"
@@ -2099,6 +2164,30 @@ $ids = @(1..40 | ForEach-Object {{ New-VenueCapsProbeId }})
         out = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, timeout=120)
         self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
         self.assertEqual(json.loads(out.stdout), {"found": "L1", "absent": "ABSENT", "bad": "UNKNOWN", "rec": "closed", "none": "ABSENT", "nofile": "ABSENT"})
+
+    def test_r2_the_batch_receipt_line_is_bound_to_the_requested_token_and_lease(self) -> None:
+        # sol key r1 BLOCKER (VenueChain.psm1 Read-VenueLeaseBatchReceipt): the first leaseId match won whatever its token. Fail closed: a token that is missing, not a string, another
+        # token, or this token with another spelling (case, a soft hyphen) names no line of this batch; nor does a lease id that is not a string.
+        (self.share / "logs").mkdir()
+        t = "0123456789ab"
+        lines = [
+            {"token": "ffffffffffff", "leaseId": "L1", "endReason": "closed"}, {"token": t, "leaseId": "L1", "endReason": "idle"},
+            {"leaseId": "L2", "endReason": "idle"}, {"token": None, "leaseId": "L3", "endReason": "idle"}, {"token": [t], "leaseId": "L4", "endReason": "idle"},
+            {"token": 123456789012, "leaseId": "L5", "endReason": "idle"}, {"token": t.upper(), "leaseId": "L6", "endReason": "idle"},
+            {"token": t + chr(0xAD), "leaseId": "L7", "endReason": "idle"}, {"token": t, "leaseId": ["L8"], "endReason": "idle"},
+            {"token": "ffffffffffff", "leaseId": "L9", "endReason": "idle"},
+        ]
+        (self.share / "logs" / f"lease-batch-{t}.jsonl").write_text("".join(json.dumps(x, ensure_ascii=False) + "\n" for x in lines), encoding="utf-8")
+        script = (
+            f"Import-Module '{psq(MODULE)}' -Force -DisableNameChecking\n"
+            f"$s = '{psq(self.share)}'\n"
+            f"$rd = {{ param($id) $x = Read-VenueLeaseBatchReceipt -AgentShare $s -Token '{t}' -LeaseId $id; \"$($x.state):$($x.record.endReason)\" }}\n"
+            "$o = [ordered]@{}; foreach ($id in 'L1','L2','L3','L4','L5','L6','L7','L8','L9') { $o[$id] = & $rd $id }; $o | ConvertTo-Json -Compress\n"
+        )
+        out = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, timeout=120)
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        want = {"L1": "FOUND:idle"} | {f"L{i}": "ABSENT:" for i in range(2, 10)}
+        self.assertEqual(json.loads(out.stdout), want)
 
 
 # LEASE-BATCH-MULTI-BUILD-1: a wrapper around fake-leg.ps1 that records the build, backend and spec each leg was called with, then runs the fake leg unchanged.
