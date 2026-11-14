@@ -274,6 +274,9 @@ function Read-StagedSoundness([string]$When, [switch]$FinalVerify) {
     # lease batch plan preflight's (-ArtifactTimeoutSec 300, Invoke-VenueLeaseBatch.ps1), never past what is left of -MaxTotalSec (-CallCapSec). r4/r5 hashed all
     # three inside the one 30 s probe, so a sound build whose package hashed slower than that was SHARE_UNREACHABLE at step 4 (G6) and at the final verify (G7).
     $capSec = [Math]::Max(0.0, ($script:Deadline - [DateTime]::UtcNow).TotalSeconds)
+    # r8 fix iteration 2 (adversary A1 on ad703c59): -CallCapSec 0 means NO cap to Get-VenueStagedBuildManifest, so a cap that ran out after Get-ProbeSec is never handed
+    # over as 0 (a 300 s artifact hash then ran unbounded and a STAGED answer past the cap was STAGE_SKIP_ALREADY). Under the 1 s any read needs: no read, the cap ran out.
+    if ($capSec -lt 1.0) { Stop-Nightly 'STAGE_CAP_EXCEEDED' "the $MaxTotalSec s cap ran out before the soundness read of the staged build of $commit $When could start ($([Math]::Floor($capSec * 100.0) / 100.0) s left); nothing was submitted" }
     # the test-only -TestSoundnessReadDelayMs stalls the call's FIRST soundness read only (step 4's when a build.json is there, else step 8's), never the final verify's
     $script:SoundnessReads++
     $delayMs = $(if ($script:SoundnessReads -eq 1) { $TestSoundnessReadDelayMs } else { 0 })
