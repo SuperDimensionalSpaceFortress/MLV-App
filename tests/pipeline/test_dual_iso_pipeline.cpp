@@ -7393,6 +7393,146 @@ TEST(DualIsoPipeline, MixChromaAvx2RenderProofIsFrameScoped)
     ASSERT_EQ(1, publishes);
 }
 
+// DUALISO-FULL20-PUBLISH-FRAME-SCOPED-1 (Dot G1, bus eeb4b6e, cos-feedback/mlv-app/pr-785.md): #785
+// scoped only mix_chroma_avx2_used. drawFrame still read the whole full20 last-run record raw, so a
+// processed8/processed16/debayered cache-hit frame (no llrawproc run, no reset of the record)
+// re-published the previous run's valid=1 and every full20 ms. The read is now frame-scoped by the
+// llrawproc run generation captured at drawFrame entry.
+TEST(DualIsoPipeline, Full20PublishIsFrameScoped)
+{
+    MlvPipelineFixture fixture;
+    QString error_message;
+    ASSERT_TRUE(fixture.openTinyDualIso(&error_message));
+    ASSERT_TRUE(fixture.loadReceipt(QStringLiteral("tests/fixtures/receipts/tiny_dual_iso_hq.marxml"), &error_message));
+    ASSERT_TRUE(fixture.applyReceipt(&error_message));
+    ASSERT_EQ(1, llrpGetDualIsoMode(fixture.video()));
+
+    // Behaviour: a frame whose render ran llrawproc reads that run's record.
+    const uint64_t g0 = llrpGetRunGenerationForCurrentThread();
+    const std::vector<uint16_t> frame = fixture.renderFrame16(0, 1);
+    ASSERT_FALSE(frame.empty());
+    const uint64_t g1 = llrpGetRunGenerationForCurrentThread();
+    dualiso_full20bit_timing_t last = {};
+    llrpGetLastDualIsoFull20bitTiming(&last);
+    std::fprintf(stderr, "[full20-frame-scope] case=run g0=%llu g1=%llu last_valid=%d last_total_ms=%.3f\n",
+                 static_cast<unsigned long long>(g0), static_cast<unsigned long long>(g1),
+                 last.valid, last.total_ms);
+    // Run proof is the run counter and the record's valid flag, never a duration (duration-as-proof
+    // inventory); the ms ride along unchanged.
+    ASSERT_TRUE(g1 > g0);
+    ASSERT_EQ(1, last.valid);
+
+    dualiso_full20bit_timing_t ran = {};
+    llrpGetDualIsoFull20bitTimingForRunSince(g0, &ran);
+    ASSERT_EQ(1, ran.valid);
+    ASSERT_EQ(last.total_ms, ran.total_ms);
+    ASSERT_EQ(last.fullres_ms, ran.fullres_ms);
+    ASSERT_EQ(last.path_kind, ran.path_kind);
+
+    // The cache-hit frame: no llrawproc run since g1. The raw last-run record still says valid=1
+    // (what the old drawFrame published); the frame-scoped read is the unmeasured record.
+    dualiso_full20bit_timing_t hit = {};
+    hit.valid = 7;
+    hit.total_ms = -1.0;
+    llrpGetDualIsoFull20bitTimingForRunSince(g1, &hit);
+    dualiso_full20bit_timing_t stale = {};
+    llrpGetLastDualIsoFull20bitTiming(&stale);
+    std::fprintf(stderr, "[full20-frame-scope] case=no-run-since g1=%llu scoped_valid=%d scoped_total_ms=%.3f "
+                 "scoped_path_kind=%d scoped_interp=%d stale_valid=%d\n",
+                 static_cast<unsigned long long>(g1), hit.valid, hit.total_ms, hit.path_kind,
+                 hit.interp_method, stale.valid);
+    ASSERT_EQ(1, stale.valid);
+    ASSERT_EQ(0, hit.valid);
+    ASSERT_EQ(0.0, hit.total_ms);
+    ASSERT_EQ(0, hit.mix_chroma_avx2_used);
+    ASSERT_EQ(DUALISO_FULL20_PATH_NONE, hit.path_kind);
+    ASSERT_EQ(DUALISO_FULL20_PATTERN_SOURCE_NONE, hit.pattern_source);
+    ASSERT_EQ(-1, hit.interp_method);
+    ASSERT_EQ(-1, hit.final_blend_probe_mode);
+    llrpGetDualIsoFull20bitTimingForRunSince(g1, nullptr); // null-safe
+
+    // A second render of the same frame: if this fixture serves it from a cache (no llrawproc run),
+    // the frame-scoped read must be unmeasured; if it re-runs llrawproc, it reads that run.
+    const std::vector<uint16_t> again = fixture.renderFrame16(0, 1);
+    ASSERT_FALSE(again.empty());
+    const uint64_t g2 = llrpGetRunGenerationForCurrentThread();
+    dualiso_full20bit_timing_t second = {};
+    llrpGetDualIsoFull20bitTimingForRunSince(g1, &second);
+    std::fprintf(stderr, "[full20-frame-scope] case=second-render g1=%llu g2=%llu cache_hit=%d scoped_valid=%d\n",
+                 static_cast<unsigned long long>(g1), static_cast<unsigned long long>(g2),
+                 g2 == g1 ? 1 : 0, second.valid);
+    if (g2 == g1)
+    {
+        ASSERT_EQ(0, second.valid);
+        ASSERT_EQ(0.0, second.total_ms);
+        ASSERT_EQ(DUALISO_FULL20_PATH_NONE, second.path_kind);
+    }
+    else
+    {
+        ASSERT_EQ(1, second.valid);
+    }
+
+    // Wiring: drawFrame reads the full20 record only through the frame-scoped read, keyed by the
+    // run generation it captured at entry.
+    QFile file(repo_file_path(QStringLiteral("platform/qt/RenderFrameThread.cpp")));
+    ASSERT_TRUE(file.open(QIODevice::ReadOnly | QIODevice::Text));
+    const QString source = QString::fromUtf8(file.readAll());
+    const qsizetype drawFrame = source.indexOf(QStringLiteral("void RenderFrameThread::drawFrame("));
+    ASSERT_TRUE(drawFrame >= 0);
+    qsizetype bodyEnd = source.indexOf(QStringLiteral("void RenderFrameThread::"), drawFrame + 1);
+    if (bodyEnd < 0) bodyEnd = source.size();
+    const QString body = source.mid(drawFrame, bodyEnd - drawFrame);
+    // The scan reads the body with all whitespace dropped, so a spaced call
+    // (`llrpGetLastDualIsoFull20bitTiming ( &x );`, adversary dd1ced64 A2) still counts.
+    const auto compactOf = [](const QString &text) {
+        QString compact = text;
+        compact.remove(QLatin1Char(' ')).remove(QLatin1Char('\t')).remove(QLatin1Char('\n')).remove(QLatin1Char('\r'));
+        return compact;
+    };
+    const QString rawRead = QStringLiteral("llrpGetLastDualIsoFull20bitTiming(");
+    const QString scopedRead = QStringLiteral("llrpGetDualIsoFull20bitTimingForRunSince(");
+    const auto countReads = [&](const QString &text, const QString &read) {
+        return static_cast<int>(compactOf(text).count(read));
+    };
+    // The whole argument list must BE (entry generation, &dualIsoFull20): merely mentioning the
+    // entry capture let `llrpRunGenerationAtDrawFrameEntry + 1` (adversary 288ee706 A1) and a
+    // nullptr output (adversary dd1ced64 A1) pass.
+    const auto argumentsOfScopedRead = [&](const QString &text) {
+        const QString compact = compactOf(text);
+        const qsizetype at = compact.indexOf(scopedRead);
+        if (at < 0) return QString();
+        const qsizetype argsStart = at + scopedRead.size();
+        const qsizetype end = compact.indexOf(QStringLiteral(");"), argsStart);
+        return end > argsStart ? compact.mid(argsStart, end - argsStart) : QString();
+    };
+    const auto keyedToThisFrame = [](const QString &args) {
+        return args == QStringLiteral("static_cast<uint64_t>(llrpRunGenerationAtDrawFrameEntry),&dualIsoFull20")
+            || args == QStringLiteral("llrpRunGenerationAtDrawFrameEntry,&dualIsoFull20");
+    };
+    // The checker itself refuses each adversary input and accepts the shipped call.
+    const QString shipped =
+        QStringLiteral("llrpGetDualIsoFull20bitTimingForRunSince( static_cast<uint64_t>( llrpRunGenerationAtDrawFrameEntry ), &dualIsoFull20 );");
+    ASSERT_TRUE(keyedToThisFrame(argumentsOfScopedRead(shipped)));
+    ASSERT_FALSE(keyedToThisFrame(argumentsOfScopedRead(QStringLiteral(
+        "llrpGetDualIsoFull20bitTimingForRunSince( static_cast<uint64_t>( llrpRunGenerationAtDrawFrameEntry + 1 ), &dualIsoFull20 );"))));
+    ASSERT_FALSE(keyedToThisFrame(argumentsOfScopedRead(QStringLiteral(
+        "llrpGetDualIsoFull20bitTimingForRunSince( static_cast<uint64_t>( llrpRunGenerationAtDrawFrameEntry ), nullptr );"))));
+    ASSERT_FALSE(keyedToThisFrame(argumentsOfScopedRead(QStringLiteral(
+        "llrpGetDualIsoFull20bitTimingForRunSince( llrpGetRunGenerationForCurrentThread(), &dualIsoFull20 );"))));
+    ASSERT_EQ(1, countReads(shipped + QStringLiteral("\n    llrpGetLastDualIsoFull20bitTiming ( &dualIsoFull20 );"), rawRead));
+    const int rawReads = countReads(body, rawRead);
+    const int scopedReads = countReads(body, scopedRead);
+    const QString scopedArgs = argumentsOfScopedRead(body);
+    const bool scopedKeyed = keyedToThisFrame(scopedArgs);
+    std::fprintf(stderr, "[full20-frame-scope] case=wiring drawFrame=%lld body_end=%lld raw_reads=%d "
+                 "scoped_reads=%d scoped_keyed=%d scoped_args=%s\n",
+                 static_cast<long long>(drawFrame), static_cast<long long>(bodyEnd), rawReads, scopedReads,
+                 scopedKeyed ? 1 : 0, scopedArgs.toUtf8().constData());
+    ASSERT_EQ(0, rawReads);
+    ASSERT_EQ(1, scopedReads);
+    ASSERT_TRUE(scopedKeyed);
+}
+
 // Adversary 457eb203 A1: a frame too narrow to hold a 2x2 cell (ncx = 0) is a plain copy on
 // the fast route; the AVX2 path proof must stay 0 for it.
 TEST(DualIsoPipeline, MixChromaAvx2ProofIsZeroForACelllessPlane)

@@ -1693,6 +1693,26 @@
     },
     {
       "path": "tests/pipeline/test_dual_iso_pipeline.cpp",
+      "anchor": "ASSERT_EQ ( 0.0 , hit . total_ms ) ;",
+      "class": "not_run_proof_structural",
+      "clock": "qpc_stage_clock",
+      "justification": "DUALISO-FULL20-PUBLISH-FRAME-SCOPED-1 (Full20PublishIsFrameScoped): a negative check that the frame-scoped full20 read with no llrawproc run since the given generation returns the unmeasured fill (the record was pre-seeded total_ms=-1.0, so 0.0 proves the fill wrote it). 'No run happened' is proved by the run counter (llrpGetRunGenerationForCurrentThread unchanged) and valid == 0 asserted beside it; the positive 'a run happened' leg is g1 > g0 plus valid == 1, never a duration.",
+      "lines": [
+        7446
+      ]
+    },
+    {
+      "path": "tests/pipeline/test_dual_iso_pipeline.cpp",
+      "anchor": "ASSERT_EQ ( 0.0 , second . total_ms ) ;",
+      "class": "not_run_proof_structural",
+      "clock": "qpc_stage_clock",
+      "justification": "DUALISO-FULL20-PUBLISH-FRAME-SCOPED-1 (Full20PublishIsFrameScoped): inside the branch taken only when the second render of the same frame was a cache hit, proved by the run counter (g2 == g1), with valid == 0 asserted beside it; checks the frame-scoped read publishes the unmeasured record for that frame instead of the previous run's ms. Not a run-proof.",
+      "lines": [
+        7467
+      ]
+    },
+    {
+      "path": "tests/pipeline/test_dual_iso_pipeline.cpp",
       "anchor": "ASSERT_TRUE ( llrpGetLastPreDualIsoFixMilliseconds ( ) >= 0.0 ) ;",
       "class": "not_run_proof_structural",
       "clock": "qpc_stage_clock",

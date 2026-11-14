@@ -375,8 +375,9 @@ public static class MlvProcCwd {
 if (-not ('MlvProcOrder' -as [type])) {
     # CI-FLAKE-RETIRE-HOLDER-EXIT-RELEASE-CORPUS-EMPTY-1 r2 (Sol r1 ANC-01): the kernel's monotonic process-creation sequence number
     # (NtQueryInformationProcess class 64, ProcessTelemetryIdInformation, field ProcessSequenceNumber at byte 40), opened PROCESS_QUERY_LIMITED_INFORMATION
-    # only. Unlike CreationDate it is not a wall-clock stamp, so a clock step cannot reorder a parent and its child. 0 = unreadable (process gone, access
-    # denied, a Windows build without the class).
+    # only. Unlike CreationDate it is not a wall-clock stamp, so a clock step cannot reorder a parent and its child. null = unreadable (process gone, access
+    # denied, a Windows build without the class, a result over 1 MiB); never 0. RETIRE-PROC-ORDER-BUFFER-RETRY-1 (PR #803 opus r2 finding 1): the class carries
+    # variable-length strings, so a too-small buffer is retried ONCE at the length the kernel reports, bounded to 1 MiB.
     try {
         Add-Type -ErrorAction Stop -TypeDefinition @'
 using System;
@@ -386,12 +387,23 @@ public static class MlvProcOrder {
     [DllImport("kernel32.dll")] static extern bool CloseHandle(IntPtr h);
     [DllImport("ntdll.dll")] static extern int NtQueryInformationProcess(IntPtr h, int cls, byte[] buf, int len, out int ret);
     // { sequence, creation FILETIME } of the process that holds `pid` NOW, or null.
-    public static long[] Get(int pid) {
+    public static long[] Get(int pid) { return Get(pid, 8192); }
+    // `first` is the initial buffer length (a test passes a small one to force the retry below). Pair-or-null: a length outside 1..1 MiB (the retry's bound)
+    // is unreadable, rejected before any handle is opened, so no negative or oversize buffer is ever allocated.
+    public static long[] Get(int pid, int first) {
+        if (first < 1 || first > 1048576) return null;
         IntPtr h = OpenProcess(0x1000, false, pid);
         if (h == IntPtr.Zero) return null;
         try {
-            byte[] b = new byte[8192]; int rl;
-            if (NtQueryInformationProcess(h, 64, b, b.Length, out rl) != 0) return null;
+            byte[] b = new byte[first]; int rl;
+            int st = NtQueryInformationProcess(h, 64, b, b.Length, out rl);
+            // STATUS_INFO_LENGTH_MISMATCH, STATUS_BUFFER_TOO_SMALL, STATUS_BUFFER_OVERFLOW: retry ONCE at the reported length, bounded to 1 MiB.
+            if (st == unchecked((int)0xC0000004) || st == unchecked((int)0xC0000023) || st == unchecked((int)0x80000005)) {
+                if (rl <= b.Length || rl > 1048576) return null;
+                b = new byte[rl];
+                st = NtQueryInformationProcess(h, 64, b, b.Length, out rl);
+            }
+            if (st != 0) return null;
             if (BitConverter.ToUInt32(b, 4) != (uint)pid) return null;
             long seq = BitConverter.ToInt64(b, 40), made = BitConverter.ToInt64(b, 16);
             return (seq > 0 && made > 0) ? new long[] { seq, made } : null;

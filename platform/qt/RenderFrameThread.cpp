@@ -6486,7 +6486,7 @@ void RenderFrameThread::drawFrame( int slotIndex,
     const double llrawprocPatternNoiseMs = llrpGetLastPatternNoiseMilliseconds();
     const double llrawprocDualIsoMs = llrpGetLastDualIsoMilliseconds();
     dualiso_full20bit_timing_t dualIsoFull20 = {};
-    llrpGetLastDualIsoFull20bitTiming( &dualIsoFull20 );
+    llrpGetDualIsoFull20bitTimingForRunSince( static_cast<uint64_t>( llrpRunGenerationAtDrawFrameEntry ), &dualIsoFull20 );
     const double llrawprocChromaSmoothMs = llrpGetLastChromaSmoothMilliseconds();
     /* LLRAWPROC-RESIDUAL-SUBTIMERS-1 (adversary A1): a render that consumed another
      * thread's recon ran no llrawproc here (every reconned-raw consumer zeroes
