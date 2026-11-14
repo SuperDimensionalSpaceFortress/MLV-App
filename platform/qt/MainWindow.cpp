@@ -4021,9 +4021,14 @@ void MainWindow::queuePlaybackLookaheadRequests(
 
     for( int offset = 1; offset <= depth; ++offset )
     {
-        int lookaheadFrame = requestedFrame
-            + playback_lookahead_cpu::lookaheadOffsetFrames( offset, cpuRouteLookahead, cpuRoutePositionFraction,
-                                                             m_playbackDropFrameStride.strideFrames() );
+        // r4 fix iteration 1 (adversary A2 on 05511dac): the CPU frame is the one the drop-frame engine itself reaches,
+        // through its own Loop wrap and end-of-cut clamp (advanceDropFrameTick), never the cut's unreturned last frame.
+        int lookaheadFrame = cpuRouteLookahead
+            ? playback_lookahead_cpu::cpuRouteLookaheadFrame( requestedFrame, offset, cpuRoutePositionFraction,
+                                                              m_playbackDropFrameStride.strideFrames(),
+                                                              ui->spinBoxCutIn->value(), ui->spinBoxCutOut->value(),
+                                                              ui->actionLoop->isChecked(), playbackConformActive() )
+            : requestedFrame + offset;
         if( lookaheadFrame > cutOutFrame )
         {
             if( !ui->actionLoop->isChecked() || loopSpan <= 0 ) break;

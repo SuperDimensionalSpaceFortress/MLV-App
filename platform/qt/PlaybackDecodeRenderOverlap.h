@@ -46,15 +46,26 @@ inline constexpr int kMaxLookaheadFrames = 3;
  *  (PlaybackLookaheadCpuRoute.h). One frame ahead runs the recon of N+1 under the render and
  *  present of N; the prep worker is the co-limit, so a deeper queue would only hold slots. */
 inline constexpr int kDefaultCpuRouteLookaheadFrames = 1;
+/*! CPU-S1-PACE-POST-785-LEVER-1 r4 fix iteration 1 (adversary A1 on 05511dac): the CPU route's ceiling, env included. Its
+ *  lookahead lands on predicted frames up to 3 ahead (PlaybackLookaheadCpuRoute.h), so the frames it holds are not contiguous.
+ *  At depth 3 the 4 frame slots could all hold ready lookaheads ahead of a target that has no request yet (the target
+ *  between them, no presenting slot left to release): a deadlock. At depth 1 every held lookahead was issued from an
+ *  earlier target and lies at most 2 frames past the current one, so the presenting slot, the target and at most two
+ *  lookaheads fit in the 4 slots. */
+inline constexpr int kMaxCpuRouteLookaheadFrames = 1;
 
 /*! \a envFrames is the parsed MLVAPP_PLAYBACK_RENDER_LOOKAHEAD_FRAMES (or its
  *  legacy alias), or -1 when neither is set. Any explicit value wins (0 is the kill switch
- *  for both routes); otherwise the texture route gets 2, the CPU route 1, every other route 0. */
+ *  for both routes), clamped to 3, and to kMaxCpuRouteLookaheadFrames on the CPU route; otherwise the texture
+ *  route gets 2, the CPU route 1, every other route 0. */
 inline int effectiveLookaheadFrames( int envFrames, bool textureRouteAdmitted, bool cpuRouteAdmitted )
 {
     if( envFrames >= 0 )
     {
-        return envFrames > kMaxLookaheadFrames ? kMaxLookaheadFrames : envFrames;
+        const int frames = envFrames > kMaxLookaheadFrames ? kMaxLookaheadFrames : envFrames;
+        if( !textureRouteAdmitted && cpuRouteAdmitted && frames > kMaxCpuRouteLookaheadFrames )
+            return kMaxCpuRouteLookaheadFrames;
+        return frames;
     }
     if( textureRouteAdmitted ) return kDefaultTextureRouteLookaheadFrames;
     return cpuRouteAdmitted ? kDefaultCpuRouteLookaheadFrames : 0;

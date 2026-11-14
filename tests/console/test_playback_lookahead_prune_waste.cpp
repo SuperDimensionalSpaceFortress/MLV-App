@@ -16,6 +16,7 @@
 #include "../common/minitest.h"
 
 #include "../../platform/qt/PlaybackLookaheadCpuRoute.h"
+#include "../../platform/qt/PlaybackDecodeRenderOverlap.h"
 
 #include <cmath>
 #include <cstdint>
@@ -330,10 +331,198 @@ SlotBudgetRun simulateSlotBudget( int depth, double pipelineMs, double prepMs, d
 
 } // namespace
 
+namespace
+{
+
+struct ScriptedSlotsRun
+{
+    bool deadlocked = false;
+    int deadlockTarget = -1;
+    int presented = 0;
+    int maxSlotsInUse = 0;
+};
+
+// Adversary A1 on 05511dac, run as written. The drop-frame engine visits \a positions. The workers fill every free slot
+// from the queue at once, before and after each GUI step and after each presenting-slot release (they always have
+// time to). At each new target: release the presenting slot (the prep hand-off), fill, prune outside
+// [target, target + window], queue the target if nothing covers it (erasing queued lookaheads as the drop-frame request
+// does), queue the CPU lookaheads (cpuRouteLookaheadFrame), fill, then present the target. Deadlock: the target is
+// still queued, every slot holds a ready lookahead that is not the target, and nothing is presenting.
+ScriptedSlotsRun simulateScriptedSlots( int depth, const std::vector<double> &positions, int cutInValue, int cutOutValue,
+                                        bool loopEnabled )
+{
+    constexpr int kSlots = 4;
+    struct Slot { int frame = -1; bool lookahead = false; bool presenting = false; };
+    struct Request { int frame; bool lookahead; };
+    std::vector<Slot> slots( kSlots );
+    std::deque<Request> queue;
+    DropFrameStride stride;
+    ScriptedSlotsRun run;
+    const int window = lookaheadWindowFrames( depth, true );
+    const auto inUse = [&]() { int n = 0; for( const Slot &s : slots ) if( s.frame >= 0 ) ++n; return n; };
+    const auto fill = [&]()
+    {
+        for( Slot &s : slots )
+        {
+            if( queue.empty() ) break;
+            if( s.frame >= 0 ) continue;
+            s.frame = queue.front().frame;
+            s.lookahead = queue.front().lookahead;
+            s.presenting = false;
+            queue.pop_front();
+        }
+        if( inUse() > run.maxSlotsInUse ) run.maxSlotsInUse = inUse();
+    };
+    const auto covered = [&]( int frame )
+    {
+        for( const Request &r : queue ) if( r.frame == frame ) return true;
+        for( const Slot &s : slots ) if( s.frame == frame && !s.presenting ) return true;
+        return false;
+    };
+    int lastTarget = -1;
+    for( double position : positions )
+    {
+        const int target = static_cast<int>( std::floor( position ) );
+        if( target == lastTarget ) continue;
+        lastTarget = target;
+        for( Slot &s : slots ) if( s.presenting ) s = Slot();   // the prep hand-off released it
+        fill();
+        stride.noteTarget( target, position );
+        for( Slot &s : slots )
+            if( s.frame >= 0 && s.lookahead && !s.presenting && s.frame != target
+             && ( s.frame < target || s.frame > target + window ) )
+                s = Slot();
+        for( auto it = queue.begin(); it != queue.end(); )
+            if( it->lookahead && ( it->frame < target || it->frame > target + window ) ) it = queue.erase( it );
+            else ++it;
+        if( !covered( target ) )
+        {
+            for( auto it = queue.begin(); it != queue.end(); )
+                if( it->lookahead ) it = queue.erase( it ); else ++it;
+            queue.push_back( { target, false } );
+        }
+        for( int k = 1; k <= depth; ++k )
+        {
+            const int frame = playback_lookahead_cpu::cpuRouteLookaheadFrame(
+                target, k, position - static_cast<double>( target ), stride.strideFrames(),
+                cutInValue, cutOutValue, loopEnabled, false );
+            if( frame < 0 || frame == target || covered( frame ) ) continue;
+            queue.push_back( { frame, true } );
+        }
+        fill();
+        bool presentedTarget = false;
+        for( Slot &s : slots )
+        {
+            if( s.frame == target && !s.presenting )
+            {
+                s.presenting = true;
+                s.lookahead = false;
+                presentedTarget = true;
+                ++run.presented;
+                break;
+            }
+        }
+        if( !presentedTarget )
+        {
+            run.deadlocked = true;   // the target waits for a slot no release will ever free
+            run.deadlockTarget = target;
+            return run;
+        }
+    }
+    return run;
+}
+
+} // namespace
+
+// RED on 05511dac (adversary A1): env depth 3 on the CPU route held ready lookaheads for 26, 27, 30, 33 when target 25
+// arrived; the target's request had no slot and no presenting slot was left to release.
+TEST(PlaybackLookaheadCpuSlotBudget, TheAdversaryPositionsAtEnvDepthThreeNeverDeadlockTheCpuRoute)
+{
+    const std::vector<double> positions = { 0.9, 3.9, 6.9, 9.9, 12.9, 15.9, 18.9, 21.9, 24.9, 25.9 };
+    for( int env = 1; env <= 3; ++env )
+    {
+        const int depth = playback_overlap::effectiveLookaheadFrames( env, false, true );
+        const ScriptedSlotsRun run = simulateScriptedSlots( depth, positions, 1, 100, false );
+        std::printf( "scripted_slots env=%d depth=%d deadlocked=%d at=%d presented=%d max_slots=%d\n", env, depth,
+                     run.deadlocked ? 1 : 0, run.deadlockTarget, run.presented, run.maxSlotsInUse );
+        ASSERT_FALSE( run.deadlocked );
+        ASSERT_EQ( run.presented, 10 );
+        ASSERT_TRUE( run.maxSlotsInUse <= 4 );
+    }
+    // The CPU route's ceiling, env included; the texture route keeps its env depth.
+    ASSERT_EQ( playback_overlap::effectiveLookaheadFrames( 3, false, true ), 1 );
+    ASSERT_EQ( playback_overlap::effectiveLookaheadFrames( 2, false, true ), 1 );
+    ASSERT_EQ( playback_overlap::effectiveLookaheadFrames( 3, true, true ), 3 );
+    ASSERT_EQ( playback_overlap::effectiveLookaheadFrames( 3, true, false ), 3 );
+}
+
+TEST(PlaybackLookaheadCpuSlotBudget, DepthOneNeverDeadlocksUnderAnyStrideSequence)
+{
+    // Every advance pattern of 1, 2 and 3 frames (with fractions) for 6 targets, after a warm-up at each stride.
+    const double advances[] = { 1.0, 1.35, 2.0, 2.6, 3.0 };
+    for( double warm : advances )
+        for( double a : advances )
+            for( double b : advances )
+                for( double c : advances )
+                {
+                    std::vector<double> positions;
+                    double p = 0.9;
+                    for( int i = 0; i < 8; ++i ) { positions.push_back( p ); p += warm; }
+                    const double tail[] = { a, b, c, a, c, b };
+                    for( double d : tail ) { positions.push_back( p ); p += d; }
+                    const ScriptedSlotsRun run = simulateScriptedSlots(
+                        playback_overlap::effectiveLookaheadFrames( 3, false, true ), positions, 1, 1000, false );
+                    ASSERT_FALSE( run.deadlocked );
+                    ASSERT_TRUE( run.maxSlotsInUse <= 4 );
+                }
+}
+
+// RED on 05511dac (adversary A2): Loop on, Cut 1..10, requestedFrame 8 at 8.25, stride 1 asked for frame 9, which the
+// engine never returns (it wraps 9.25 to 0.25), so the request was pruned.
+TEST(PlaybackLookaheadPruneWaste, AtTheLoopEndTheCpuLookaheadIsTheFrameTheEngineWrapsTo)
+{
+    using playback_lookahead_cpu::cpuRouteLookaheadFrame;
+    using playback_frame_range::advanceDropFrameTick;
+    ASSERT_EQ( cpuRouteLookaheadFrame( 8, 1, 0.25, 1.0, 1, 10, true, false ), 0 );
+    ASSERT_EQ( cpuRouteLookaheadFrame( 8, 1, 0.25, 1.0, 1, 10, true, true ), 9 );   // conform presents the last frame
+    ASSERT_EQ( cpuRouteLookaheadFrame( 8, 1, 0.25, 1.0, 1, 10, false, false ), 9 ); // no Loop: the engine clamps to it
+    ASSERT_EQ( cpuRouteLookaheadFrame( 4, 1, 0.25, 1.0, 1, 10, true, false ), 5 );  // mid-cut: unchanged
+    // Every frame asked for is the frame the engine reaches from the same position and whole-frame advance.
+    const double strides[] = { 1.0, 1.35, 2.2, 3.0 };
+    for( int cutIn = 1; cutIn <= 3; ++cutIn )
+        for( int cutOut = cutIn + 1; cutOut <= 12; ++cutOut )
+            for( int loop = 0; loop < 2; ++loop )
+                for( double s : strides )
+                    for( int target = cutIn - 1; target <= cutOut - 1; ++target )
+                        for( double f = 0.0; f < 1.0; f += 0.125 )
+                            for( int k = 1; k <= 3; ++k )
+                            {
+                                const int frame = cpuRouteLookaheadFrame( target, k, f, s, cutIn, cutOut, loop != 0, false );
+                                const int offset = lookaheadOffsetFrames( k, true, f, s );
+                                const double engine = advanceDropFrameTick( target + f, offset, cutIn, cutOut, loop != 0, false ).position;
+                                ASSERT_EQ( frame, static_cast<int>( std::floor( engine ) ) );
+                                if( loop ) ASSERT_TRUE( frame != cutOut - 1 );   // Loop without conform never returns it
+                                ASSERT_TRUE( frame >= cutIn - 1 && frame <= cutOut - 1 );
+                            }
+}
+
+// Adversary A3 on 05511dac: 0.9999999999999999 + 3.0 rounds to 4.0, past the depth-1 window of 3.
+TEST(PlaybackLookaheadPruneWaste, TheOffsetNeverPassesThePruneWindowUnderRounding)
+{
+    for( int k = 1; k <= 3; ++k )
+    {
+        ASSERT_TRUE( lookaheadOffsetFrames( k, true, 0.9999999999999999, 3.0 ) <= k * playback_lookahead_cpu::kMaxStrideFrames );
+        ASSERT_TRUE( lookaheadOffsetFrames( k, true, 0.9999999999999999, 3.0 ) <= lookaheadWindowFrames( k, true ) );
+    }
+}
+
 TEST(PlaybackLookaheadCpuSlotBudget, EnvDepthTwoAndThreeWaitForAFreeSlotAndNeverDeadlockOrOverrun)
 {
-    for( int depth = 2; depth <= 3; ++depth )
+    for( int env = 2; env <= 3; ++env )
     {
+        // r4 fix iteration 1: the CPU route clamps the env depth to 1 (kMaxCpuRouteLookaheadFrames).
+        const int depth = playback_overlap::effectiveLookaheadFrames( env, false, true );
+        ASSERT_EQ( depth, 1 );
         // Slow (the r3 CPU cost: a frame every ~56 ms) and fast (keeps pace) pipelines.
         const double pipelines[] = { 56.0, 30.0 };
         for( double pipelineMs : pipelines )
@@ -348,7 +537,8 @@ TEST(PlaybackLookaheadCpuSlotBudget, EnvDepthTwoAndThreeWaitForAFreeSlotAndNever
             ASSERT_TRUE( run.maxPresentGapMs < 500.0 );   // and never stalls for a FREEZE-sized gap
         }
     }
-    // At depth 3 the target, three lookaheads and the borrowed presenting slot want 5 slots: the thread waits.
+    // Unclamped depth 3 (the CPU route no longer runs it): the target, three lookaheads and the borrowed presenting slot
+    // want 5 slots, and the thread waits.
     const SlotBudgetRun deep = simulateSlotBudget( 3, 30.0, 36.0, 20000.0 );
     ASSERT_TRUE( deep.waitsForFreeSlot > 0 );
     ASSERT_EQ( deep.maxSlotsInUse, 4 );

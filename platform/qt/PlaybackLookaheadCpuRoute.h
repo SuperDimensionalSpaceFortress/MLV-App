@@ -20,6 +20,7 @@
 //    route decides.
 
 #include "PlaybackPrepOwnership.h"
+#include "PlaybackFrameRange.h"
 
 #include <cmath>
 #include <cstdint>
@@ -115,7 +116,28 @@ inline int lookaheadOffsetFrames( int k, bool cpuRoute, double positionFraction,
     if( stride < kMinStrideFrames ) stride = kMinStrideFrames;
     if( stride > kMaxStrideFrames ) stride = kMaxStrideFrames;
     const int offset = static_cast<int>( std::floor( fraction + static_cast<double>( k ) * stride ) );
+    // r4 fix iteration 1 (adversary A3 on 05511dac): 0.9999999999999999 + 3.0 rounds to 4.0 in double, so the floor is
+    // capped at k x kMaxStrideFrames: a request never lands past the prune window it must stay inside.
+    if( offset > k * kMaxStrideFrames ) return k * kMaxStrideFrames;
     return offset < k ? k : offset;
+}
+
+/*! r4 fix iteration 1 (adversary A2 on 05511dac): the frame CPU-route lookahead \a k asks for is the frame the drop-frame
+ *  engine itself reaches. It advances the position requestedFrame + fraction by lookaheadOffsetFrames whole frames through
+ *  playback_frame_range::advanceDropFrameTick, so the engine's own Loop wrap (which never returns the cut's last frame
+ *  unless \a presentLastFrame, i.e. conform) or end-of-cut clamp applies. Before this, Loop on with Cut 1..10,
+ *  requestedFrame 8 at 8.25 and stride 1 asked for frame 9; the engine wraps 9.25 to 0.25, so 9 was never presented and
+ *  was pruned. \a cutInValue and \a cutOutValue are the 1-based spin box values, as the engine takes them. */
+inline int cpuRouteLookaheadFrame( int requestedFrame, int k, double positionFraction, double strideFrames,
+                                   int cutInValue, int cutOutValue, bool loopEnabled, bool presentLastFrame )
+{
+    double fraction = std::isfinite( positionFraction ) ? positionFraction : 0.0;
+    if( fraction < 0.0 || fraction >= 1.0 ) fraction = 0.0;
+    const int offset = lookaheadOffsetFrames( k, true, fraction, strideFrames );
+    const playback_frame_range::DropFrameTickResult tick = playback_frame_range::advanceDropFrameTick(
+        static_cast<double>( requestedFrame ) + fraction, static_cast<double>( offset ),
+        cutInValue, cutOutValue, loopEnabled, presentLastFrame );
+    return static_cast<int>( std::floor( tick.position ) );
 }
 
 /*! The forward window prunePlaybackLookaheadOutsideForwardWindow keeps, in frames past the active target. The

@@ -443,7 +443,12 @@ TEST(PlaybackLookaheadCpuRoute, ThreeArgumentDepthEnvWinsTextureTwoCpuOneElseZer
             for( int cpu = 0; cpu < 2; ++cpu )
             {
                 int expected = 0;
-                if( env >= 0 ) expected = env > 3 ? 3 : env;
+                if( env >= 0 )
+                {
+                    expected = env > 3 ? 3 : env;
+                    // r4 fix iteration 1 (adversary A1 on 05511dac): the CPU route's env ceiling is 1.
+                    if( !tex && cpu && expected > 1 ) expected = 1;
+                }
                 else if( tex ) expected = 2;
                 else if( cpu ) expected = 1;
                 ASSERT_EQ( expected, effectiveLookaheadFrames( env, tex != 0, cpu != 0 ) );
@@ -690,9 +695,12 @@ TEST(PlaybackLookaheadCpuRouteWiring, TheLookaheadFrameAndThePruneWindowFollowTh
     ASSERT_FALSE( queue.isEmpty() );
     ASSERT_TRUE( queue.contains( QStringLiteral("const bool cpuRouteLookahead = !textureRouteAdmits;") ) );
     ASSERT_TRUE( queue.contains( QStringLiteral(
-        "        int lookaheadFrame = requestedFrame\n"
-        "            + playback_lookahead_cpu::lookaheadOffsetFrames( offset, cpuRouteLookahead, cpuRoutePositionFraction,\n"
-        "                                                             m_playbackDropFrameStride.strideFrames() );") ) );
+        "        int lookaheadFrame = cpuRouteLookahead\n"
+        "            ? playback_lookahead_cpu::cpuRouteLookaheadFrame( requestedFrame, offset, cpuRoutePositionFraction,\n"
+        "                                                              m_playbackDropFrameStride.strideFrames(),\n"
+        "                                                              ui->spinBoxCutIn->value(), ui->spinBoxCutOut->value(),\n"
+        "                                                              ui->actionLoop->isChecked(), playbackConformActive() )\n"
+        "            : requestedFrame + offset;") ) );
     ASSERT_FALSE( queue.contains( QStringLiteral("int lookaheadFrame = requestedFrame + offset;") ) );
 
     // Both prune sites (drawFrame, drawFrameReady) keep the route's window, and none passes the bare depth.
