@@ -1756,13 +1756,15 @@ function Get-IdleBoundConfigRefusal([int]$IdleSec, [string]$Source) {
 function Get-AgentJobEndTs([long]$ObservedTs, [long]$FloorTs, $EndedUtc) {
     # r4 (adversary r4 A1): the agent's idle clock restarts when ITS job ended, which is before this runner saw the result (um-run's return, the leg child's own receipt work, the
     # open's liveness cleanup). The monotonic anchor is moved EARLIER by how long ago the agent says the job ended, never later than the instant it was observed and never before
-    # the job was sent ($FloorTs). An agent clock behind this host's only shortens the allowance; an unreadable endedUtc keeps the observed instant.
-    $ts = $ObservedTs
+    # the job was sent ($FloorTs). An agent clock behind this host's only shortens the allowance.
+    # r6 (adversary-848f6559.json A2): an endedUtc that says nothing usable about when the job ended (unreadable, absent, or in this host's future: an agent clock AHEAD, `ago`
+    # negative) gives the FLOOR, the job's send, never the observed instant: the job may have been over for as long as it took to come back, and that time is spent. A clock
+    # ahead by less than the job-to-observation gap still reads a positive `ago` and places the end up to that skew late (bounded by the skew, never past the observation).
     $at = ConvertTo-AgentUtc $EndedUtc
-    if ($null -ne $at) {
-        $ago = ([DateTime]::UtcNow - $at).TotalSeconds; $nowTs = [Diagnostics.Stopwatch]::GetTimestamp()
-        if ($ago -gt 0) { $cand = $nowTs - [long]($ago * [Diagnostics.Stopwatch]::Frequency); if ($cand -lt $ts) { $ts = $cand } }
-    }
+    if ($null -eq $at) { return $FloorTs }
+    $ago = ([DateTime]::UtcNow - $at).TotalSeconds; $nowTs = [Diagnostics.Stopwatch]::GetTimestamp()
+    if ($ago -lt 0) { return $FloorTs }
+    $ts = [Math]::Min($ObservedTs, $nowTs - [long]($ago * [Diagnostics.Stopwatch]::Frequency))
     if ($ts -lt $FloorTs) { $ts = $FloorTs }
     $ts
 }
@@ -2522,8 +2524,8 @@ while ($pending.Count -gt 0 -and $null -eq $stopReason) {
                     if ($_.Exception -is [ComponentModel.Win32Exception] -or $_.Exception.InnerException -is [ComponentModel.Win32Exception]) { $inFlightLeg = $null }
                     throw
                 }
-                $idleAnchorTs = [Diagnostics.Stopwatch]::GetTimestamp()   # r3 pass 2 (adversary A1): the leg's agent job has ended: the agent's idle clock restarts (r4: moved to the job's endedUtc below)
-                $text = [string]$lp.stdout + [string]$lp.stderr   # r7: read from the child, never back from the file, whose write the guard may refuse
+                $legReturnTs = [Diagnostics.Stopwatch]::GetTimestamp()   # r6 (adversary-848f6559.json A1): the child's return; the idle anchor is placed from the leg job's own result below
+                $text =[string]$lp.stdout + [string]$lp.stderr   # r7: read from the child, never back from the file, whose write the guard may refuse
                 if (Test-RunDirWrite $out) { [IO.File]::WriteAllText($out, $text, [Text.UTF8Encoding]::new($false)) }
                 $legCode = $lp.exit
                 $legSec = [int]([DateTime]::UtcNow - $tLeg).TotalSeconds
@@ -2549,6 +2551,12 @@ while ($pending.Count -gt 0 -and $null -eq $stopReason) {
                     if ($exitCode -eq 0) { $exitCode = 7 }
                     break
                 }
+                # Did it run on THIS batch's lease? Read by name, bounded.
+                # r6 (adversary-848f6559.json A1): read BEFORE the exit code is judged, so a child that exits nonzero after its agent job ended (the real Invoke-VenueLeg.ps1:314 exits 2
+                # when its receipt write is denied) still has the idle anchor moved to that job's end: its own work since is spent from the allowance. The anchor moves only on
+                # the leg job's own result: with none (the child died before its job landed one, or the read failed) nothing shows the agent's idle clock restarted, so it stays.
+                $jr = Get-VenueJobResult -AgentShare $AgentShare -JobId $legJobId
+                if ($jr.state -ceq 'FOUND' -and $null -ne $jr.result) { $idleAnchorTs = Get-AgentJobEndTs $legReturnTs $tLegTs $jr.result.endedUtc }
                 if ($legCode -ne 0) {
                     # Invoke-VenueLeg exits 0 whenever it wrote a receipt; non-zero means it died without one. Not evidence: LEG_FAILED, the run goes on.
                     # r6 (adversary r6 A2): the row keeps heatAtProbe. r7: this note sits on its own line, because the failing-action body pin
@@ -2560,8 +2568,6 @@ while ($pending.Count -gt 0 -and $null -eq $stopReason) {
                     if ($exitCode -eq 0) { $exitCode = 7 }
                     continue
                 }
-                # Did it run on THIS batch's lease? Read by name, bounded.
-                $jr = Get-VenueJobResult -AgentShare $AgentShare -JobId $legJobId
                 # r5b (hub 13:21Z B2 clause, dot 242171b3): no agent result for the leg's job (um-run said UNRESOLVED, um-run.ps1:480-501, or the read failed) means
                 # the agent may still hold it. It is WITHDRAWN (its cancel file) before the batch goes on or closes, never left in place for a parked lease to launch.
                 $withdraw = $null
@@ -2570,8 +2576,6 @@ while ($pending.Count -gt 0 -and $null -eq $stopReason) {
                     $withdraw = $wx.state
                     L "LEG_WITHDRAWN leg=$($leg.name) batch=$batchNo jobId=$legJobId result=$($jr.state) printedOutcome=$outcome cancel=$($wx.state)$(if ($wx.error) { " error=$($wx.error)" })"
                 }
-                # r4 (adversary r4 A1): the agent's idle clock restarted when the leg's JOB ended, before the leg child wrote its receipt and exited
-                if ($jr.state -ceq 'FOUND' -and $null -ne $jr.result) { $idleAnchorTs = Get-AgentJobEndTs $idleAnchorTs $tLegTs $jr.result.endedUtc }
                 $ja = $(if ($jr.state -ceq 'FOUND') { $jr.result.admission } else { $null })
                 # r5 (adversary r4 pass 3 A1 sibling): one leaseBatch object or none; an array-wrapped one names no lease, so the leg is not on this batch's lease (never counted)
                 $jaLb = $(if ($jr.state -ceq 'FOUND') { (Get-AdmissionLeaseBatch $jr.result).value } else { $null })   # r5 pass 3: from the result ($ja above is unrolled)

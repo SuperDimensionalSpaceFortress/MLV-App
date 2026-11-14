@@ -349,7 +349,12 @@ class ThermalGateModuleTests(unittest.TestCase):
         self.assertNotIn("*> $out", fn, "the redirect opens the output file after the admission")
         marker = "return [pscustomobject]@{ expiredBeforeDispatch = $true }\n    }\n"
         after = [l for l in fn[fn.index(marker) + len(marker):].splitlines() if l.strip() and not l.strip().startswith("#")]
-        self.assertTrue(after[0].lstrip().startswith("$captured = @(& $pwshExe @qArgs *>&1"), after[0])
+        # LEASE-BATCH-IDLE-END-UNSEEN-1 r5 pass 3 / r6 (hosted CI on 848f6559): only two in-memory statements may sit between the admission and the start, neither of which
+        # touches a file or a share: the probe's absolute wait end (-WaitUntilUtc, fixed at the dispatch) and the dispatch's monotonic instant (the idle anchor)
+        in_memory = ("$qArgs += @('-WaitUntilUtc', [DateTime]::UtcNow.AddSeconds($wait).ToString('o'))", "$startTs = [Diagnostics.Stopwatch]::GetTimestamp()")
+        while after and after[0].lstrip().startswith(in_memory):
+            after.pop(0)
+        self.assertTrue(after and after[0].lstrip().startswith("$captured = @(& $pwshExe @qArgs *>&1"), after[:1])
         self.assertIn("Set-Content -LiteralPath $out -Value $captured", fn)
 
     def test_r6p1_a2_only_a_launched_row_is_a_heavy_predecessor_and_an_unknown_status_is_a_barrier(self) -> None:

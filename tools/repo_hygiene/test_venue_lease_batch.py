@@ -212,7 +212,9 @@ if ($JobId -like 'lease-batch-open-*') {
         $now = [DateTimeOffset]::UtcNow
     }
     if ($ro) { Set-ItemProperty -LiteralPath $env:FAKE_CLAIM_PATH -Name IsReadOnly -Value $false }
-    $res = [pscustomobject]@{ jobId = $JobId; exitCode = 0; endedUtc = $now.ToString('o'); admission = [pscustomobject]$adm; stdout = 'LEASE_BATCH_OPEN' }
+    # r6 (adversary-848f6559.json A2): FAKE_OPEN_ENDED_AHEAD_SEC = the agent's clock runs that far ahead of this host's (the open's endedUtc lies in the host's future)
+    $openEnded = $now.AddSeconds($(if ($env:FAKE_OPEN_ENDED_AHEAD_SEC) { [int]$env:FAKE_OPEN_ENDED_AHEAD_SEC } else { 0 })).ToString('o')
+    $res = [pscustomobject]@{ jobId = $JobId; exitCode = 0; endedUtc = $openEnded; admission = [pscustomobject]$adm; stdout = 'LEASE_BATCH_OPEN' }
     # r5 pass 3 (adversary r5 pass 2 A1): FAKE_OPEN_ADM_WRAP=array publishes the whole admission inside a one-element array
     if ($env:FAKE_OPEN_ADM_WRAP -eq 'array') { $res.admission = @($res.admission) }
     if ($mode -eq 'exit1') { $res.exitCode = 1 }   # r14: the open job's receipt says it failed (OPEN_FAILED)
@@ -286,6 +288,8 @@ $jobId = "dve-$leaf-$Venue-cpu-2026102300000$k$(if ($LeaseBatch) { "-lb$LeaseBat
 # r3: FAKE_LEG_MODES per call: ok | exit3 (died without a receipt) | hang (still running at lease end: it starts a grandchild, records both pids, and sleeps)
 $legMode = Pick $env:FAKE_LEG_MODES $k 'ok'
 if ($legMode -eq 'exit3') { exit 3 }
+# r6 (adversary-848f6559.json A1 sibling): exit3late = the child works 6 s and dies without its agent job ever landing a result (no evidence the agent's idle clock restarted)
+if ($legMode -eq 'exit3late') { Start-Sleep -Seconds 6; exit 3 }
 if ($legMode -eq 'hang') {
     $gc = Start-Process -FilePath ([Environment]::ProcessPath) -ArgumentList '-NoProfile -NonInteractive -Command Start-Sleep -Seconds 300' -PassThru -NoNewWindow
     Add-Content -LiteralPath (Join-Path $share 'fake-leg-pids.txt') -Value "$PID $($gc.Id) $jobId"
@@ -312,7 +316,10 @@ $now = [DateTimeOffset]::UtcNow
 $remain = [int](Pick $env:FAKE_LEG_REMAIN $k '2600')
 $outbox = Join-Path $share 'outbox'
 New-Item -ItemType Directory -Force -Path $outbox | Out-Null
-$res = [ordered]@{ jobId = $jobId; exitCode = 0; endedUtc = $now.ToString('o'); admission = [ordered]@{ mode = 'lease'; label = 'clear'; leaseBatch = [ordered]@{ token = $LeaseBatch; leaseId = $lid; seq = $k + 2; reused = $true; untilEpoch = $now.ToUnixTimeSeconds() + $remain } } }
+# r6 (adversary-848f6559.json A2): FAKE_LEG_ENDED_AHEAD_SEC per call = the agent's clock runs that far ahead (its endedUtc lies in this host's future); FAKE_LEG_ENDED_RAW = an
+# endedUtc that is no instant at all
+$legEnded = $(if ($env:FAKE_LEG_ENDED_RAW) { [string]$env:FAKE_LEG_ENDED_RAW } else { $now.AddSeconds([int](Pick $env:FAKE_LEG_ENDED_AHEAD_SEC $k '0')).ToString('o') })
+$res = [ordered]@{ jobId = $jobId; exitCode = 0; endedUtc = $legEnded; admission = [ordered]@{ mode = 'lease'; label = 'clear'; leaseBatch = [ordered]@{ token = $LeaseBatch; leaseId = $lid; seq = $k + 2; reused = $true; untilEpoch = $now.ToUnixTimeSeconds() + $remain } } }
 # the agent's renew record at the leg's end: okMaxGapSec from FAKE_LEG_GAPS (default 3 s; 'none' = no record)
 $gap = Pick $env:FAKE_LEG_GAPS $k '3'
 if ($gap -ne 'none') { $res.admission['leaseRenew'] = [ordered]@{ intervalSec = 60; ok = 5; okMaxGapSec = [double]$gap; staleSec = 120 } }
@@ -340,6 +347,8 @@ $pre = Pick $env:FAKE_LEG_PRELOADS $k '5'
 if ($pre -ne 'none') { Set-Content -LiteralPath (Join-Path $edir 'summary.json') -Value ('{"cpuQuiescence":{"timeMeanPercent":' + $pre + '}}') }
 # r4 (adversary r4 A1): FAKE_LEG_TAIL_SLEEP = the leg child's own work after its agent job ended (its receipt, its evidence), before it exits
 if ($env:FAKE_LEG_TAIL_SLEEP) { Start-Sleep -Seconds ([int]$env:FAKE_LEG_TAIL_SLEEP) }
+# r6 (adversary-848f6559.json A1): FAKE_LEG_EXIT per call = the child exits with that code AFTER its agent job's result landed (a receipt write denied, Invoke-VenueLeg.ps1:314)
+$legExit = [int](Pick $env:FAKE_LEG_EXIT $k '0'); if ($legExit -ne 0) { exit $legExit }
 "DVE_OUTCOME=$(if ($legMode -eq 'unresolved') { 'UNRESOLVED' } else { Pick $env:FAKE_LEG_OUTCOMES $k 'PASS' })"
 "DVE_RECEIPT_PATH=$rp"
 exit 0
@@ -1167,6 +1176,85 @@ class VenueLeaseBatchRunnerTests(unittest.TestCase):
             self.assertEqual(wvq.count(line), 1, line)
         self.assertLess(wvq.index("$gateEnd = $t0.AddSeconds("), wvq.index("    if ($wu -lt $gateEnd) { $gateEnd = $wu }"))
         self.assertLess(wvq.index("    if ($wu -lt $gateEnd) { $gateEnd = $wu }"), wvq.index("function Wait-QueueGate"))
+
+    # ---------------------------------------------------------------- r6 (adversary-848f6559.json A1/A2): the idle anchor after an agent job comes from that job's own result
+    def test_lease_batch_idle_end_r6_adv_a1_a_leg_that_exits_nonzero_after_its_job_still_spends_its_post_job_work(self) -> None:
+        # adversary-848f6559.json A1: a leg child that exits nonzero (the real Invoke-VenueLeg.ps1:314 exits 2 when its receipt write is denied) took the LEG_FAILED path, which skipped
+        # the move of the anchor to the job's endedUtc, so the child's 6 s after its job were never spent. Agent bound 70, margin 60 (10 s): the next probe waits at most about 4 s.
+        # Sibling: a child that dies 6 s in with NO result landed (exit3late) gives no evidence the agent's idle clock restarted, so the anchor stays where it was.
+        for name, env in (("exit2-after-its-job", {"FAKE_LEG_TAIL_SLEEP": "6", "FAKE_LEG_EXIT": "2,0"}), ("exit3-no-result", {"FAKE_LEG_MODES": "exit3late,ok"})):
+            with self.subTest(case=name):
+                self.setUp()
+                self._tree_with_agent_idle(b"70")
+                r = self.run_batch(self.specs[:2], "-ProbeMaxWaitSec", "600", **env)
+                self.assertEqual(r.returncode, 7, r.stdout + r.stderr)
+                [b] = self.batches()
+                self.assertEqual(b["legs"][0]["status"], "LEG_FAILED", b["legs"][0])
+                waits = self._in_lease_waits()
+                self.assertEqual(len(waits), 2, self.events_raw())
+                self.assertLessEqual(waits[1], 4, f"the failed leg child's time after its job was not spent from the idle allowance: {waits}")
+
+    def test_lease_batch_idle_end_r6_adv_a2_an_agent_clock_ahead_or_an_unreadable_end_falls_back_to_the_jobs_send(self) -> None:
+        # adversary-848f6559.json A2: an agent clock AHEAD of this host's gives a negative `ago`, and Get-AgentJobEndTs kept the observation instant: the time the job had already
+        # been over was never spent. With no usable endedUtc (ahead, or not an instant) the only safe bound is the job's send. Agent bound 70, margin 60 (10 s).
+        #   open: um-run returns 6 s after the send, the agent's clock 30 s ahead: the first probe waits at most about 4 s (it waited about 10).
+        #   leg (the :2574 sibling): the child works 6 s after its job, the agent's clock 30 s ahead, or endedUtc 'not-a-time': the next probe waits at most about 4 s.
+        for name, env, which in (("open-ahead", {"FAKE_OPEN_SLEEP": "6", "FAKE_OPEN_ENDED_AHEAD_SEC": "30"}, 0),
+                                 ("leg-ahead", {"FAKE_LEG_TAIL_SLEEP": "6", "FAKE_LEG_ENDED_AHEAD_SEC": "30"}, 1),
+                                 ("leg-unreadable", {"FAKE_LEG_TAIL_SLEEP": "6", "FAKE_LEG_ENDED_RAW": "not-a-time"}, 1)):
+            with self.subTest(case=name):
+                self.setUp()
+                self._tree_with_agent_idle(b"70")
+                r = self.run_batch(self.specs[:2], "-ProbeMaxWaitSec", "600", **env)
+                self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+                waits = self._in_lease_waits()
+                self.assertEqual(len(waits), 2, self.events_raw())
+                self.assertLessEqual(waits[which], 4, f"{name}: the time since the job's send was not spent from the idle allowance: {waits}")
+
+    def test_lease_batch_idle_end_r6_adv_a2_get_agent_job_end_ts_never_keeps_the_observation_on_an_unusable_end(self) -> None:
+        # the helper itself, with the adversary's input: endedUtc 5 s in this host's future (ago < 0), unreadable, absent: the floor (the send). A usable end in the past moves the
+        # anchor earlier, never before the floor and never after the observation.
+        script = (
+            f"$ast = [System.Management.Automation.Language.Parser]::ParseFile('{psq(RUNNER)}', [ref]$null, [ref]$null)\n"
+            "foreach ($n in 'ConvertTo-AgentUtc', 'Get-AgentJobEndTs') { . ([scriptblock]::Create($ast.Find({ param($x) $x -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $x.Name -eq $n }, $true).Extent.Text)) }\n"
+            "$f = [Diagnostics.Stopwatch]::Frequency; $now = [Diagnostics.Stopwatch]::GetTimestamp(); $floor = $now - 20 * $f; $obs = $now - 1 * $f\n"
+            "$out = [ordered]@{}\n"
+            "$out['ahead'] = (Get-AgentJobEndTs $obs $floor ([DateTime]::UtcNow.AddSeconds(5).ToString('o'))) -eq $floor\n"
+            "$out['unreadable'] = (Get-AgentJobEndTs $obs $floor 'not-a-time') -eq $floor\n"
+            "$out['absent'] = (Get-AgentJobEndTs $obs $floor $null) -eq $floor\n"
+            "$p = Get-AgentJobEndTs $obs $floor ([DateTime]::UtcNow.AddSeconds(-6).ToString('o')); $out['past'] = ($p -ge $floor) -and ($p -le $now - 5 * $f)\n"
+            "$out['beforeFloor'] = (Get-AgentJobEndTs $obs $floor ([DateTime]::UtcNow.AddSeconds(-60).ToString('o'))) -eq $floor\n"
+            "$out | ConvertTo-Json -Compress\n"
+        )
+        out = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, timeout=120)
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        self.assertEqual(json.loads(out.stdout), {"ahead": True, "unreadable": True, "absent": True, "past": True, "beforeFloor": True})
+
+    def test_lease_batch_idle_end_r6_grok_g11_every_idle_end_call_names_its_parameters_in_full(self) -> None:
+        # Grok G11 on #817: a call that abbreviates a parameter (-Append for -AppendDetail) binds today by prefix and turns into an ambiguous-parameter error (BATCH_ERROR on a rare
+        # path) the day the helper gains another -Append* parameter. Every Set-BatchLeaseIdleEnded call names each parameter exactly as the helper declares it (AST on both sides).
+        # Mutation: a copy whose RETRY site says -Append is caught.
+        def offenders(path: Path) -> list:
+            script = (
+                f"$ast = [System.Management.Automation.Language.Parser]::ParseFile('{psq(path)}', [ref]$null, [ref]$null)\n"
+                "$fn = $ast.Find({ param($x) $x -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $x.Name -eq 'Set-BatchLeaseIdleEnded' }, $true)\n"
+                "$declared = @($fn.Parameters | ForEach-Object { $_.Name.VariablePath.UserPath })\n"
+                "$calls = @($ast.FindAll({ param($x) $x -is [System.Management.Automation.Language.CommandAst] -and $x.GetCommandName() -eq 'Set-BatchLeaseIdleEnded' }, $true))\n"
+                "$bad = @(foreach ($c in $calls) { foreach ($e in $c.CommandElements) { if ($e -is [System.Management.Automation.Language.CommandParameterAst] -and $declared -cnotcontains $e.ParameterName) { \"$($c.Extent.StartLineNumber):-$($e.ParameterName)\" } } })\n"
+                "[ordered]@{ calls = $calls.Count; declared = $declared; bad = $bad } | ConvertTo-Json -Compress\n"
+            )
+            out = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, timeout=120)
+            self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+            return json.loads(out.stdout)
+        r = offenders(RUNNER)
+        self.assertEqual(r["calls"], 4, r)
+        self.assertIn("AppendDetail", r["declared"])
+        self.assertEqual(r["bad"], [], "a Set-BatchLeaseIdleEnded call abbreviates (or misspells) a parameter")
+        src = RUNNER.read_text(encoding="utf-8")
+        self.assertEqual(src.count("'a leg ran off the lease: uncounted' -AppendDetail; break }"), 2, "the RETRY and RAN off-lease ends append with the full name")
+        mut = self.case / "mutant-g11.ps1"
+        mut.write_text(src.replace("'a leg ran off the lease: uncounted' -AppendDetail; break }", "'a leg ran off the lease: uncounted' -Append; break }", 1), encoding="utf-8")
+        self.assertEqual(len(offenders(mut)["bad"]), 1, "the mutant's -Append must be caught")
 
     def test_lease_batch_idle_end_r5_adv_a1_a_leg_whose_lease_batch_is_array_wrapped_is_not_on_the_lease(self) -> None:
         # the :2526 sibling: a leg result whose leaseBatch is [{.. this batch's lease ..}] gave jobLease through member enumeration, so the leg counted on the lease. It names no
@@ -9351,8 +9439,8 @@ class LeaseEndUtcTimezoneTests(unittest.TestCase):
         script = (
             f"Import-Module '{psq(MODULE)}' -Force -DisableNameChecking\n"
             f"$ast = [System.Management.Automation.Language.Parser]::ParseFile('{psq(RUNNER)}', [ref]$null, [ref]$null)\n"
-            "$fn = $ast.Find({ param($x) $x -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $x.Name -eq 'Get-LeaseEndUtc' }, $true)\n"
-            ". ([scriptblock]::Create($fn.Extent.Text))\n"
+            # r6: and the readers it calls since r5 (Get-AdmissionLeaseBatch, Test-JsonObject); without them every shape read $null (hosted CI on 848f6559)
+            "foreach ($n in 'Test-JsonObject', 'Get-AdmissionLeaseBatch', 'Get-LeaseEndUtc') { . ([scriptblock]::Create($ast.Find({ param($x) $x -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $x.Name -eq $n }, $true).Extent.Text)) }\n"
             f"$until = {until}\n"
             "function Delta($ended) {\n"
             "  $r = Get-LeaseEndUtc ([pscustomobject]@{ endedUtc = $ended; admission = [pscustomobject]@{ leaseBatch = [pscustomobject]@{ untilEpoch = $until } } })\n"

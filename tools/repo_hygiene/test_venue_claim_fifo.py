@@ -613,6 +613,113 @@ $declared = @(Get-ParamNames (Get-Ast $UmRun) '*')
             self.assertNotEqual(r.returncode, 4, text)
             self.assertIn("Cannot validate argument on parameter 'MaxAdmissionWaitSec'", text)
 
+    # ---------------------------------------------------------------- LEASE-BATCH-IDLE-END-UNSEEN-1 r6 (Grok G10 on #817; adversary-848f6559.json A3): -WaitUntilUtc, run for real
+    # The real Wait-VenueQuiet.ps1, Live set, against a scratch share whose inbox holds one queued job: the queue gate stays BUSY, so the script never submits a probe (no um-run,
+    # no venue). DST wrapper: the same script run in a process whose local zone is the host's own offset shifted by an hour, which is what a DST fall-back (or spring-forward)
+    # between the cutoff instant and now does to a cutoff read as LocalDateTime. The host clock is never touched.
+    DST_WRAPPER = r"""
+param([string]$Quiet, [string]$ParamsJson, [double]$ShiftHours, [string]$WaitUntilUtc)
+$cd = [TimeZoneInfo].GetField('s_cachedData', [Reflection.BindingFlags]'NonPublic,Static').GetValue($null)
+$os = [DateTimeOffset]::Now.Offset
+$z = [TimeZoneInfo]::CreateCustomTimeZone('test-shifted', $os.Add([TimeSpan]::FromHours($ShiftHours)), 'test-shifted', 'test-shifted')
+$cd.GetType().GetField('_localTimeZone', [Reflection.BindingFlags]'NonPublic,Instance').SetValue($cd, $z)
+if ([TimeZoneInfo]::Local.BaseUtcOffset -ne $os.Add([TimeSpan]::FromHours($ShiftHours))) { [Console]::Error.WriteLine('WRAPPER could not shift the local zone'); exit 99 }
+$h = @{}; foreach ($p in (ConvertFrom-Json $ParamsJson).PSObject.Properties) { $h[$p.Name] = $p.Value }
+$h['WaitUntilUtc'] = $WaitUntilUtc   # passed as its own string: ConvertFrom-Json turns an ISO string into a DateTime
+& $Quiet @h
+exit $LASTEXITCODE
+"""
+
+    def busy_share(self) -> Path:
+        share = self.case / "busy-share"
+        (share / "inbox").mkdir(parents=True)
+        (share / "running").mkdir()
+        (share / "inbox" / "someone-else.job.ps1").write_text("# queued by another lane\n", encoding="utf-8")
+        return share
+
+    def run_real_gate(self, share: Path, until: str, max_sec: int = 30, shift_hours: float | None = None) -> tuple[subprocess.CompletedProcess, float]:
+        params = {"Venue": "bachelor", "WorkDir": str(self.case / "quiet-work"), "AgentShare": str(share), "AllowShareOverride": True, "MaxWaitSec": max_sec,
+                  "MaxGateSec": max_sec, "GatePollSec": 1, "ReadAttempts": 1, "ReadBackoffSec": 0, "WaitUntilUtc": until}
+        if shift_hours is None:
+            argv = [PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-File", str(QUIET)]
+            for k, v in params.items():
+                argv += [f"-{k}"] if v is True else [f"-{k}", str(v)]
+        else:
+            wrapper = self.case / "dst-wrapper.ps1"
+            wrapper.write_text(self.DST_WRAPPER, encoding="utf-8")
+            rest = {k: v for k, v in params.items() if k != "WaitUntilUtc"}
+            argv = [PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-File", str(wrapper), "-Quiet", str(QUIET), "-ParamsJson", json.dumps(rest), "-ShiftHours", str(shift_hours),
+                    "-WaitUntilUtc", until]
+        t = time.monotonic()
+        r = subprocess.run(argv, capture_output=True, text=True, timeout=180)
+        return r, time.monotonic() - t
+
+    def assert_nothing_dispatched(self, share: Path) -> None:
+        self.assertEqual(sorted(p.name for p in (share / "inbox").iterdir()), ["someone-else.job.ps1"], "the probe submitted a job")
+        self.assertEqual(list((share / "running").iterdir()), [])
+        self.assertFalse((share / "outbox").exists())
+
+    @staticmethod
+    def waited(text: str) -> int:
+        import re
+        m = re.search(r"^GATE_BUSY \S+ waitedSec=(\d+)$", text, re.M)
+        assert m, text
+        return int(m.group(1))
+
+    def test_r6_g10_a_busy_queue_gate_ends_at_wait_until_utc_not_at_max_wait(self) -> None:
+        # Grok G10 (a): -MaxWaitSec 30 -MaxGateSec 30 and a cutoff 2 s out: GATE_BUSY (exit 3) after about 2 s, nothing dispatched. Both ISO spellings the runner and a
+        # person write (the 'o' round-trip form with 7 fractional digits, and seconds with Z) are read.
+        share = self.busy_share()
+        for name, fmt in (("round-trip", lambda d: d.strftime("%Y-%m-%dT%H:%M:%S.%f") + "0Z"), ("seconds", lambda d: d.strftime("%Y-%m-%dT%H:%M:%SZ"))):
+            with self.subTest(form=name):
+                until = fmt(datetime.now(timezone.utc) + timedelta(seconds=3 if name == "seconds" else 2))
+                r, took = self.run_real_gate(share, until)
+                text = r.stdout + r.stderr
+                self.assertEqual(r.returncode, 3, text)
+                self.assertLessEqual(self.waited(text), 3, text)
+                self.assertLess(took, 20, f"the gate ran {took:.1f} s past a cutoff about 2 s out: {text}")
+                self.assert_nothing_dispatched(share)
+
+    def test_r6_g10_a_wait_until_utc_that_is_not_an_iso_instant_is_refused_before_anything_is_read(self) -> None:
+        # Grok G10 (b)/(c): 'nope', and forms [DateTimeOffset]::TryParse with InvariantCulture accepted although the USAGE text says "is not an ISO 8601 instant" (11/14/2026, a
+        # long date): exit 2, the USAGE line, no gate line, nothing dispatched.
+        share = self.busy_share()
+        for bad in ("nope", "11/14/2026", "11/14/2026 18:00:00", "Saturday, November 14, 2026", "2026-11-14"):
+            with self.subTest(value=bad):
+                r, _ = self.run_real_gate(share, bad)
+                text = r.stdout + r.stderr
+                self.assertEqual(r.returncode, 2, text)
+                self.assertIn(f"USAGE -WaitUntilUtc '{bad}' is not an ISO 8601 instant", text)
+                self.assertNotIn("GATE ", text)
+                self.assert_nothing_dispatched(share)
+
+    def test_r6_adv_a3_the_cutoff_holds_when_the_local_offset_moved_between_it_and_now(self) -> None:
+        # adversary-848f6559.json A3: the clamp read the cutoff as LocalDateTime and compared it with local Get-Date values, which compare by ticks only. When the cutoff's local
+        # offset differs from now's (a DST fall-back between them), an EXPIRED cutoff read an hour late and the gate waited its whole -MaxWaitSec past it; a cutoff a few seconds out
+        # read an hour early and the gate gave up at once (a false GATE_BUSY). Every clock in the script is UTC now.
+        share = self.busy_share()
+        r, took = self.run_real_gate(share, utc_iso(datetime.now(timezone.utc) - timedelta(seconds=5)), max_sec=10, shift_hours=1)
+        text = r.stdout + r.stderr
+        self.assertNotEqual(r.returncode, 99, text)
+        self.assertEqual(r.returncode, 3, text)
+        self.assertLessEqual(self.waited(text), 1, f"an expired cutoff (read an hour late) did not end the gate: {text}")
+        self.assert_nothing_dispatched(share)
+        r, took = self.run_real_gate(share, utc_iso(datetime.now(timezone.utc) + timedelta(seconds=5)), max_sec=20, shift_hours=-1)
+        text = r.stdout + r.stderr
+        self.assertEqual(r.returncode, 3, text)
+        self.assertGreaterEqual(self.waited(text), 3, f"a cutoff 5 s out (read an hour early) ended the gate at once: {text}")
+        self.assertLessEqual(self.waited(text), 6, text)
+        self.assert_nothing_dispatched(share)
+
+    def test_r6_adv_a3_no_wait_in_the_probe_script_reads_a_local_clock(self) -> None:
+        # the class (A3's siblings :277, :278, :289, :306, :1628): outside the probe job's own text, the script reads no local clock (Get-Date, [DateTime]::Now, LocalDateTime,
+        # ToLocalTime), so no deadline, gate end, retry check or recheck can compare local DateTimes again
+        src = QUIET.read_text(encoding="utf-8")
+        start = src.index("$probeText = @'")
+        outside = src[:start] + src[src.index("\n'@", start):]
+        import re
+        self.assertEqual(re.findall(r"(?i)Get-Date|\[DateTime\]::Now\b|\.LocalDateTime\b|ToLocalTime\(", outside), [])
+
     def test_the_contract_is_documented_in_both_headers(self) -> None:
         mod = MODULE.read_text(encoding="utf-8")
         run = RUNNER.read_text(encoding="utf-8")

@@ -160,7 +160,9 @@ param(
     [double]$ThresholdPercent = 20.0
 )
 $ErrorActionPreference = 'Stop'
-$t0 = Get-Date
+# LEASE-BATCH-IDLE-END-UNSEEN-1 r6 (adversary-848f6559.json A3): every clock this script waits on is UTC. Local DateTimes compare by ticks only, so across a DST change a deadline
+# read as local time moved by an hour against the local clock (an expired -WaitUntilUtc read an hour late, a near one an hour early).
+$t0 = [DateTime]::UtcNow
 
 function Get-VenueQuietDecision {
     # PURE: the decision from the samples alone. Exactly 3 finite samples in [0, 100] are needed; anything else (a $null = a failed read) is UNKNOWN.
@@ -267,13 +269,17 @@ function Get-GateCount([string]$Dir, [string]$Filter, [bool]$MustExist, [string]
 # queue busy again cannot stretch the whole wait past -MaxWaitSec. The share is read up to -ReadAttempts times (see Read-GateCounts) before it is unreadable.
 $deadline = $t0.AddSeconds($MaxWaitSec)
 $gateEnd = $t0.AddSeconds([Math]::Min($MaxGateSec, $MaxWaitSec))
-# LEASE-BATCH-IDLE-END-UNSEEN-1 r5 pass 3 (adversary r5 pass 2 A2): and never past the caller's -WaitUntilUtc (read on THIS clock, as $t0 is: local DateTimes compare by ticks only)
+# LEASE-BATCH-IDLE-END-UNSEEN-1 r5 pass 3 (adversary r5 pass 2 A2): and never past the caller's -WaitUntilUtc
+# r6 (adversary-848f6559.json A3): compared as UTC, as $t0 is (it was LocalDateTime). r6 (Grok G10 on #817): read with TryParseExact, so only an ISO 8601 date and time with
+# seconds is an instant ('o', the form the batch runner sends, or seconds with an optional fraction, each with Z or an offset; no offset reads as UTC); TryParse with the
+# invariant culture also took 11/14/2026 and a long date, which the USAGE line said it refused.
+$wuFormats = [string[]]@('o', "yyyy'-'MM'-'dd'T'HH':'mm':'ssK", "yyyy'-'MM'-'dd'T'HH':'mm':'ss'.'FFFFFFFK")
 if ($WaitUntilUtc) {
     $wuo = [DateTimeOffset]::MinValue
-    if (-not [DateTimeOffset]::TryParse($WaitUntilUtc, [Globalization.CultureInfo]::InvariantCulture, ([Globalization.DateTimeStyles]::AssumeUniversal -bor [Globalization.DateTimeStyles]::AdjustToUniversal), [ref]$wuo)) {
+    if (-not [DateTimeOffset]::TryParseExact($WaitUntilUtc, $wuFormats, [Globalization.CultureInfo]::InvariantCulture, ([Globalization.DateTimeStyles]::AssumeUniversal -bor [Globalization.DateTimeStyles]::AdjustToUniversal), [ref]$wuo)) {
         Write-Output "USAGE -WaitUntilUtc '$WaitUntilUtc' is not an ISO 8601 instant"; exit 2
     }
-    $wu = $wuo.LocalDateTime
+    $wu = $wuo.UtcDateTime
     if ($wu -lt $deadline) { $deadline = $wu }
     if ($wu -lt $gateEnd) { $gateEnd = $wu }
 }
@@ -286,7 +292,7 @@ function Read-GateCounts([string]$Name) {
         $script:GateRunning = Get-GateCount "$agentShare\running" '' $false $setAsideRecordPattern
         if (($null -ne $script:GateQueued -and $null -ne $script:GateRunning) -or $attempt -ge $ReadAttempts) { return }
         $delay = $ReadBackoffSec * $attempt
-        if ((Get-Date).AddSeconds($delay) -gt $deadline) { return }   # no time left for another try: report what is known
+        if ([DateTime]::UtcNow.AddSeconds($delay) -gt $deadline) { return }   # no time left for another try: report what is known
         Write-Gate "GATE_READ_RETRY $Name $Venue attempt=$($attempt + 1)/$ReadAttempts inboxReadable=$($null -ne $script:GateQueued) runningReadable=$($null -ne $script:GateRunning) $([DateTime]::UtcNow.ToString('HH:mm:ssZ'))"
         if ($delay -gt 0) { Start-Sleep -Seconds $delay }
     }
@@ -302,7 +308,7 @@ function Wait-QueueGate([string]$Name) {
         }
         Write-Gate "GATE $Name $Venue queued=$q running=$r $([DateTime]::UtcNow.ToString('HH:mm:ssZ'))"
         if ($q -eq 0 -and $r -eq 0) { $script:GateState = 'CLEAR'; return }
-        $now = Get-Date
+        $now = [DateTime]::UtcNow
         if ($now -gt $gateEnd) { Write-Gate "GATE_BUSY $Name waitedSec=$([int]($now - $t0).TotalSeconds)"; $script:GateState = 'BUSY'; return }
         # (the poll never sleeps past the end of the gate, so the wait ends when the deadline does)
         Start-Sleep -Milliseconds ([int][Math]::Max(10.0, [Math]::Min([double]($GatePollSec * 1000), ($gateEnd - $now).TotalMilliseconds + 10)))
@@ -1625,17 +1631,17 @@ while ($true) {
             break
         }
     }
-    if ((Get-Date).AddSeconds($RecheckSec) -gt $deadline) { break }
+    if ([DateTime]::UtcNow.AddSeconds($RecheckSec) -gt $deadline) { break }
     Start-Sleep -Seconds $RecheckSec
 }
 # UNKNOWN is not a measured busy venue: it gets its own typed verdict and exit code (6), so a caller can never read it as COOLDOWN_UNMET (exit 0, proceed).
 if ($last.decision.state -ceq 'UNKNOWN') {
-    Write-Gate "VENUE_QUIET_UNKNOWN mean=UNKNOWN threshold=$ThresholdPercent% waitedSec=$([int]((Get-Date) - $t0).TotalSeconds) reason=$($last.whyKind)$(if ($last.why) { " note=$($last.why)" })"
+    Write-Gate "VENUE_QUIET_UNKNOWN mean=UNKNOWN threshold=$ThresholdPercent% waitedSec=$([int]([DateTime]::UtcNow - $t0).TotalSeconds) reason=$($last.whyKind)$(if ($last.why) { " note=$($last.why)" })"
     exit 6
 }
-if ($null -ne $foreignFloor) { Write-Gate "FOREIGN_FLOOR owners=$($foreignFloor.owners -join ',') floorMean=$(Format-Mean $foreignFloor.floorMean) waitedSec=$([int]((Get-Date) - $t0).TotalSeconds) probes=$($foreignFloor.probes)" }
+if ($null -ne $foreignFloor) { Write-Gate "FOREIGN_FLOOR owners=$($foreignFloor.owners -join ',') floorMean=$(Format-Mean $foreignFloor.floorMean) waitedSec=$([int]([DateTime]::UtcNow - $t0).TotalSeconds) probes=$($foreignFloor.probes)" }
 $verdict = $(if ($last.decision.state -ceq 'QUIET') { 'QUIET' } else { 'COOLDOWN_UNMET' })
-Write-Gate "$verdict mean=$(Format-Mean $last.decision.mean) threshold=$ThresholdPercent% waitedSec=$([int]((Get-Date) - $t0).TotalSeconds)"
+Write-Gate "$verdict mean=$(Format-Mean $last.decision.mean) threshold=$ThresholdPercent% waitedSec=$([int]([DateTime]::UtcNow - $t0).TotalSeconds)"
 $topIdMap = $(if ($null -ne $last.probe) { Get-IdentityRowMap $last.probe } else { $null })
 if ($null -ne $last.probe) { foreach ($p in @($last.probe.top)) { Write-Gate (("  top {0} pid={1} cpuSeconds={2}" -f $p.name, $p.pid, $p.cpuSeconds) + $(if ($null -ne $topIdMap -and $null -ne $p.pid -and $topIdMap.ContainsKey("$($p.pid)")) { Get-IdentSuffix $topIdMap["$($p.pid)"] $true } else { '' })) } }
 if ($null -ne $last.probe) { Write-AttributionLines $last.probe }
