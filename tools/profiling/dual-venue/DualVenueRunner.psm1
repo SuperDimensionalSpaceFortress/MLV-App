@@ -1929,17 +1929,24 @@ function Get-DvDueWakeDelivered {
     .SYNOPSIS
     HFR-NATIVE-M16-1457-FULLSCREEN-S1S2-PRESENT-GAP-1 r8 (B1, sol + key3 opus r7): does ONE measured playback_due_wake record show a DELIVERED wake?
     fired= counts the wakes the GUI thread took (MainWindow::onPlaybackDueWake); armed= counts arms, and an arm replaced or cancelled before delivery
-    (stranded=) delivers nothing, so arming is not delivery. Returns 'delivered' (exactly one fired= of one or more), 'none' (exactly one fired= of
-    zero) or 'unreadable' (fired= missing, repeated, empty, signed or not a whole count). FAIL CLOSED: only 'delivered' is delivery evidence.
+    (stranded=) delivers nothing, so arming is not delivery. r8 adversary pass 3 A1: fired= also counts a LOST post (the queue refused the native
+    message past its retry budget) that the poll tick delivered (PlaybackDueWake::deliverLostPost, counted in post_rescued=), which is no native
+    delivery; so the wakes the arm's own route delivered are fired= minus post_rescued=. Returns 'delivered' (exactly one whole-number fired= and
+    exactly one whole-number post_rescued=, and fired - post_rescued >= 1), 'none' (both readable, difference < 1) or 'unreadable' (either field
+    missing, repeated, empty, signed or not a whole count). FAIL CLOSED: only 'delivered' is delivery evidence.
     advanced= is not read (decided r8): a delivered wake on a busy renderer hands its advance to the frameReady path (busy_deferred=), so advanced=0
-    with fired>0 is a measured outcome of the arm, not a route that did not run.
+    with a delivered wake is a measured outcome of the arm, not a route that did not run.
     The one predicate for "a wake was delivered": Get-DvDueWakeDeliveryEvidence calls it for both the requested and the head path, and the runner's
     gate (Invoke-VenueLeg.ps1) and Test-DvReceiptValid reach it only through that reader.
     #>
     param([AllowNull()][AllowEmptyString()][string]$Line)
-    $f = [regex]::Matches([string]$Line, '(?:^|\s)fired=(?<f>\S*)')
-    if ($f.Count -ne 1 -or $f[0].Groups['f'].Value -cnotmatch '^[0-9]+$') { return 'unreadable' }
-    if ($f[0].Groups['f'].Value -cmatch '^0+$') { return 'none' }
+    $n = @{}
+    foreach ($name in @('fired', 'post_rescued')) {
+        $f = [regex]::Matches([string]$Line, '(?:^|\s)' + $name + '=(?<f>\S*)')
+        if ($f.Count -ne 1 -or $f[0].Groups['f'].Value -cnotmatch '^[0-9]+$') { return 'unreadable' }
+        $n[$name] = [System.Numerics.BigInteger]::Parse($f[0].Groups['f'].Value, [Globalization.CultureInfo]::InvariantCulture)
+    }
+    if (($n['fired'] - $n['post_rescued']) -lt [System.Numerics.BigInteger]::One) { return 'none' }
     'delivered'
 }
 
@@ -1963,7 +1970,7 @@ function Get-DvDueWakeDeliveryEvidence {
     r5 (pass 12 A1): on a control binary's line (no delivery_kind) a paced leg's delivery=none is DUE_WAKE_NOT_ENGAGED too, and a repeated or
     out-of-grammar delivery= is unreadable; a posted leg whose line says disabled=1 is ROUTE_NOT_ENGAGED (pass 11 A2).
     r8 (B1, sol + key3 opus r7): on a line with a delivery_kind, the posted leg and every PACED leg that does not ask count only when the measured
-    Play DELIVERED a wake (Get-DvDueWakeDelivered: one fired= of one or more); fired=0, or a fired= that is missing or unreadable, is
+    Play DELIVERED a wake by its route (Get-DvDueWakeDelivered: fired= minus post_rescued= of one or more); none, or a missing or unreadable count, is
     DUE_WAKE_NOT_ENGAGED. EXEMPT: a control binary's line (no delivery_kind; its binary is not under test) and an unpaced leg (it never arms).
     Pure and shared: the runner gates on it and Test-DvReceiptValid re-derives it from the hashed run log.
     #>
@@ -2066,7 +2073,7 @@ function Get-DvDueWakeDeliveryEvidence {
     }
     $unreadable = 'the due-wake delivery is unreadable: the measured session''s playback_due_wake line (after its playback_smoke.pace_summary, before the next) is not exactly one line carrying one delivery_kind of send, post, notifier, qtimer, none and one delivery= of native-msg, qtimer, notifier, none or a "+"-join (MainWindow::playbackDueWakeSummaryLine)'
     # r8 (B1): the reason both paths give when the measured line shows no delivered wake
-    $notDelivered = "DUE_WAKE_NOT_ENGAGED: the measured session's playback_due_wake line shows $(if ($delivered -ceq 'none') { 'fired=0' } else { 'no readable fired= count (exactly one whole number)' }), so no armed wake was delivered to the GUI thread (fired= counts the wakes it took; an arm replaced or cancelled first delivers nothing) and the run measured no delivered wake"
+    $notDelivered = "DUE_WAKE_NOT_ENGAGED: the measured session's playback_due_wake line shows $(if ($delivered -ceq 'none') { 'no wake delivered by its route (fired= minus post_rescued= is below 1)' } else { 'no readable fired= or post_rescued= count (exactly one whole number each)' }), so no armed wake was delivered to the GUI thread by the route the leg names (fired= counts the wakes it took, a lost post the poll tick rescued included; an arm replaced or cancelled first delivers nothing) and the run measured no delivered wake"
     if ($requested) {
         $verdict = 'NOT_HONOURED'
         if ($mentions -eq 0) { $reason = 'ROUTE_NOT_ENGAGED: the measured session has no playback_due_wake line with a delivery_kind (after its playback_smoke.pace_summary), so the binary does not report how its wake was delivered' }

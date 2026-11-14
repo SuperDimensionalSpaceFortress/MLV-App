@@ -15273,7 +15273,8 @@ class DueWakeDeliveryEvidenceTests(unittest.TestCase):
     @staticmethod
     def wake(kind: str | None, mech: str = "native-msg") -> str:
         line = ("playback_due_wake armed=1200 fired=1198 advanced=1190 rearmed=8 busy_deferred=3 late_p50_ms=0.4 late_p95_ms=1.9 hires=1 disabled=0"
-                f" delivery={mech} unpresented_deferred=0 stranded=0 runner_sleep_woken=12 runner_sleep_woken_other=2 runner_sleep_wait_failed=0"
+                f" delivery={mech} unpresented_deferred=0 post_refused=0 post_failed=0 post_rescued=0 post_counts_settled=1"
+                " stranded=0 runner_sleep_woken=12 runner_sleep_woken_other=2 runner_sleep_wait_failed=0"
                 " reentrant_deferred=0")
         return line if kind is None else line + f" delivery_kind={kind} post_to_awake_min_ms=0.1"
 
@@ -15720,6 +15721,36 @@ class DueWakeDeliveryEvidenceTests(unittest.TestCase):
             with self.subTest(leg="head", case=name):
                 v = self.verdict(cell, self.log(line.replace("delivery_kind=post", "delivery_kind=send")))
                 self.assertEqual((v["verdict"], v["blocks"]), ("NOT_REQUESTED", False), v)
+
+    def test_r8_p3_a1_a_lost_post_the_poll_tick_rescued_is_no_route_delivery(self) -> None:
+        # r8 adversary pass 3 A1, its input verbatim: fired= also counts a lost post (the queue refused the native message past its retry budget)
+        # that the poll tick delivered (PlaybackDueWake::deliverLostPost, counted in post_rescued=). With fired=1 post_rescued=1 the arm's own
+        # route delivered nothing, yet the posted arm was HONOURED and the sent head counterpart unblocked
+        post = json.loads((DV / "legs" / "m16-1457-native-fullscreen-s1-wake-post.json").read_text(encoding="utf-8"))
+        cell = json.loads((DV / "legs" / "m16-1457-native-fullscreen-s1.json").read_text(encoding="utf-8"))
+        self.assertIs(post["generatorArgs"]["dueWakeDeliveryPost"], True)
+        verbatim = ("playback_smoke.measured_session id=3\nplayback_smoke.summary session=3 reason=play-stop presented_frames=1200\n"
+                    "playback_smoke.pace_summary session=3 first_present_ms=40 paced_elapsed_ms=25000\n"
+                    "playback_due_wake armed=1200 fired=1 advanced=0 rearmed=0 busy_deferred=1 hires=1 disabled=0 delivery=native-msg unpresented_deferred=0"
+                    " post_stamped=0 post_unsplit=0 post_refused=100 post_failed=1 post_rescued=1 post_counts_settled=1 stranded=1199 runner_sleep_woken=0"
+                    " delivery_kind=post\n")
+        rescued = lambda fired, resc: self.wake("post").replace("fired=1198", f"fired={fired}").replace("post_rescued=0", f"post_rescued={resc}")
+        cases = {"verbatim": verbatim, "every delivery rescued": self.log(rescued(5, 5)), "more rescued than fired": self.log(rescued(1, 3)),
+                 "no post_rescued=": self.log(self.wake("post").replace(" post_rescued=0", "")),
+                 "empty post_rescued=": self.log(self.wake("post").replace("post_rescued=0", "post_rescued=")),
+                 "negative post_rescued=": self.log(self.wake("post").replace("post_rescued=0", "post_rescued=-1")),
+                 "two post_rescued=": self.log(self.wake("post") + " post_rescued=0")}
+        for name, log in cases.items():
+            for leg, spec, kind in (("posted", post, "post"), ("head", cell, "send")):
+                with self.subTest(leg=leg, case=name):
+                    v = self.verdict(spec, log.replace("delivery_kind=post", f"delivery_kind={kind}"))
+                    self.assertEqual((v["verdict"], v["blocks"]), ("NOT_HONOURED", True), v)
+                    self.assertIn("DUE_WAKE_NOT_ENGAGED", v["reason"])
+        # one wake the route itself delivered beside a rescued one still counts
+        for leg, spec, kind, want in (("posted", post, "post", "HONOURED"), ("head", cell, "send", "NOT_REQUESTED")):
+            with self.subTest(leg=leg, case="fired=2 post_rescued=1"):
+                v = self.verdict(spec, self.log(rescued(2, 1).replace("delivery_kind=post", f"delivery_kind={kind}")))
+                self.assertEqual((v["verdict"], v["blocks"]), (want, False), v)
 
     def test_r8_b1_one_delivered_wake_predicate_serves_both_arms_and_every_consumer(self) -> None:
         # r8 B1 class sweep: one predicate decides "a wake was delivered" for the requested and the head path, and both consumers (the runner's
