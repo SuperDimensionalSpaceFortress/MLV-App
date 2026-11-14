@@ -15759,6 +15759,8 @@ class DueWakeDeliveryEvidenceTests(unittest.TestCase):
         cell = json.loads((DV / "legs" / "m16-1457-native-fullscreen-s1.json").read_text(encoding="utf-8"))
         verbatim = ("playback_smoke.measured_session id=3\nplayback_smoke.pace_summary session=3\n"
                     "playback_due_wake armed=1 fired=1 post_rescued=0 delivery=native-msg delivery_kind=post\n")
+        # r9 (G10): the verbatim input predates the settled flag; it is added for the one case below that must count
+        verbatim = verbatim.replace(" post_rescued=0", " post_rescued=0 post_counts_settled=1")
         for name, log in (("verbatim", verbatim), ("full line, no disabled=", self.log(self.wake("post").replace(" disabled=0", ""))),
                           ("crash-forensics prefix", self.log(self.PREFIX + self.wake("post").replace(" disabled=0", "")))):
             for leg, spec, kind in (("posted, verbatim spec", self.POST, "post"), ("posted, committed spec", post, "post"), ("head", cell, "send"),
@@ -15786,6 +15788,75 @@ class DueWakeDeliveryEvidenceTests(unittest.TestCase):
         runner = (DV / "Invoke-VenueLeg.ps1").read_text(encoding="utf-8")
         self.assertIn("$dueWakeDeliveryVerdict = Get-DvDueWakeDeliveryEvidence -Spec $spec -LogText $runLogText", runner)
         self.assertNotIn("Get-DvDueWakeDelivered -Line", runner, "the runner's gate reads delivery only through Get-DvDueWakeDeliveryEvidence")
+
+    def test_r9_g10_post_rescued_counts_only_when_its_line_says_the_post_counts_settled(self) -> None:
+        # r9 (Grok CoS G10 on 316e3744, its input verbatim): the predicate subtracts post_rescued= but never read the same line's
+        # post_counts_settled=, so `fired=1 post_rescued=0 post_counts_settled=0 delivery_kind=post` was HONOURED. The app prints
+        # post_counts_settled=0 when the wait thread did not answer in time at the line or at the Play's baseline (MainWindow.cpp, the
+        # postCountsSettled comment), which leaves the post differences open to another Play's late count: a rescue that would cancel the one wake
+        # may not be counted yet. Anything but exactly one post_counts_settled=1 is unreadable, on the posted and on the paced head path
+        post = json.loads((DV / "legs" / "m16-1457-native-fullscreen-s1-wake-post.json").read_text(encoding="utf-8"))
+        cell = json.loads((DV / "legs" / "m16-1457-native-fullscreen-s1.json").read_text(encoding="utf-8"))
+        self.assertIs(post["generatorArgs"]["dueWakeDeliveryPost"], True)
+        self.assertNotIn("unpaced", cell["generatorArgs"])
+        head = "playback_smoke.measured_session id=3\nplayback_smoke.pace_summary session=3\n"
+        grok = head + "playback_due_wake armed=1 fired=1 disabled=0 delivery=native-msg post_rescued=0 post_counts_settled=0 delivery_kind=post\n"
+        full = self.wake("post")
+        bad = {
+            "Grok G10 verbatim": grok,
+            "full line, post_counts_settled=0": self.log(full.replace("post_counts_settled=1", "post_counts_settled=0")),
+            "crash-forensics prefix, post_counts_settled=0": self.log(self.PREFIX + full.replace("post_counts_settled=1", "post_counts_settled=0")),
+            "no post_counts_settled=": self.log(full.replace(" post_counts_settled=1", "")),
+            "empty post_counts_settled=": self.log(full.replace("post_counts_settled=1", "post_counts_settled=")),
+            "post_counts_settled=01": self.log(full.replace("post_counts_settled=1", "post_counts_settled=01")),
+            "post_counts_settled=2": self.log(full.replace("post_counts_settled=1", "post_counts_settled=2")),
+            "post_counts_settled=yes": self.log(full.replace("post_counts_settled=1", "post_counts_settled=yes")),
+            "two post_counts_settled=1": self.log(full + " post_counts_settled=1"),
+            "post_counts_settled=1 then =0": self.log(full + " post_counts_settled=0"),
+            "post_counts_settled=0 then =1": self.log(full.replace("post_counts_settled=1", "post_counts_settled=0") + " post_counts_settled=1"),
+            "only a sibling x_post_counts_settled=1": self.log(full.replace(" post_counts_settled=1", " x_post_counts_settled=1")),
+        }
+        cases, labels = [], []
+        for name, log in bad.items():
+            for leg, spec, kind, mech in (("posted, committed spec", post, "post", "native-msg"), ("posted, verbatim spec", self.POST, "post", "native-msg"),
+                                          ("head (send)", cell, "send", "native-msg"), ("head (qtimer)", cell, "qtimer", "qtimer")):
+                cases.append((spec, log.replace("delivery_kind=post", f"delivery_kind={kind}").replace("delivery=native-msg", f"delivery={mech}")))
+                labels.append((leg, name))
+        # unchanged: exactly one post_counts_settled=1 counts (Grok's line settled, and the full line), and a sibling field beside the real one is not read
+        good = {"Grok G10 line, settled": grok.replace("post_counts_settled=0", "post_counts_settled=1"), "full line": self.log(full),
+                "sibling x_post_counts_settled=0 beside the real one": self.log(full + " x_post_counts_settled=0")}
+        for name, log in good.items():
+            for leg, spec, kind, want in (("posted", post, "post", "HONOURED"), ("head (send)", cell, "send", "NOT_REQUESTED")):
+                cases.append((spec, log.replace("delivery_kind=post", f"delivery_kind={kind}")))
+                labels.append((leg, "good: " + name))
+        # EXEMPT as r8 left it: a control binary's line (no delivery_kind) never reads post_rescued=, so its settled flag changes nothing there
+        cases.append((cell, self.log(self.wake(None).replace("post_counts_settled=1", "post_counts_settled=0"))))
+        labels.append(("head", "exempt: control line, post_counts_settled=0"))
+        proc, out = run_pwsh_evidence_cases("Get-DvDueWakeDeliveryEvidence", cases)
+        self.assertIsNotNone(out, proc.stdout + proc.stderr)
+        self.assertEqual(len(out), len(cases))
+        for (leg, name), v in zip(labels, out):
+            with self.subTest(leg=leg, case=name):
+                if name.startswith("good: "):
+                    self.assertEqual((v["verdict"], v["blocks"]), ("HONOURED" if leg == "posted" else "NOT_REQUESTED", False), v)
+                elif name.startswith("exempt: "):
+                    self.assertEqual((v["verdict"], v["blocks"]), ("NOT_REQUESTED", False), v)
+                else:
+                    self.assertEqual((v["verdict"], v["blocks"]), ("NOT_HONOURED", True), v)
+                    self.assertIn("DUE_WAKE_NOT_ENGAGED", v["reason"])
+                    self.assertIn("post_counts_settled=1", v["reason"])
+
+    def test_r9_g10_class_sweep_post_rescued_is_read_only_beside_its_settled_flag(self) -> None:
+        # r9 (G10 class sweep): post_rescued= and post_counts_settled= are parsed in one place (Get-DvDueWakeDelivered), which requires the flag;
+        # no other reader in the module or the runner reads either field
+        module = (DV / "DualVenueRunner.psm1").read_text(encoding="utf-8")
+        pred = module.split("function Get-DvDueWakeDelivered {", 1)[1].split("\nfunction ", 1)[0]
+        self.assertIn("post_counts_settled", pred.split("#>", 1)[1], "the predicate's code reads the settled flag")
+        rest = module.replace(pred, "")
+        for field in ("post_rescued", "post_counts_settled"):
+            code = "\n".join(l for l in rest.splitlines() if not l.lstrip().startswith("#"))
+            self.assertNotRegex(code, r"\(\?:\^\|\\s\)" + field + "=", f"{field}= is parsed only inside Get-DvDueWakeDelivered")
+            self.assertNotIn(field + "=", (DV / "Invoke-VenueLeg.ps1").read_text(encoding="utf-8"))
 
 
 @requires_windows_pwsh
