@@ -1515,6 +1515,26 @@ def test_wmi_create_scan_refuses_each_direct_create_spelling(tmp_path):
         "pipeline-variable-alias": "Get-CimClass Win32_Process -pv w | ForEach-Object { $w.Create('x') }",
         "pipeline-variable-colon-form": "Get-CimClass Win32_Process -PipelineVariable:w | ForEach-Object { $w.InvokeMethod('Create', @('x')) }",
         "pipeline-variable-on-a-wmi-variable": "$c = Get-WmiObject -List Win32_Process\n$c | ForEach-Object -PipelineVariable w -Process { $w.Create('x') }",
+        # adversary A1 on e14374f9: the -PipelineVariable name takes a scope prefix too
+        "pipeline-variable-script-scope": "Get-WmiObject -List Win32_Process -PipelineVariable script:w | ForEach-Object { $script:w.Create('x') }",
+        "pipeline-variable-prefix-dropped-at-the-receiver": "Get-WmiObject -List Win32_Process -PipelineVariable local:w | ForEach-Object { $w.Create('x') }",
+        # adversary A2: a switch clause LABEL that is a script block or an expression also reads $_ as the switch item
+        "switch-predicate-create": "$c = Get-WmiObject -List Win32_Process\nswitch ($c) { { $_.Create('x'); $false } { } }",
+        "switch-label-expression-create": "$c = Get-WmiObject -List Win32_Process\nswitch ($c) { ($_.Create('x')) { } }",
+        "switch-predicate-invoke-method": "switch (Get-WmiObject -List Win32_Process) { { $PSItem.InvokeMethod('Create', @('x')); $false } { } }",
+        # adversary A3: the WMI object arrives as -InputObject of a one-element pipeline
+        "foreach-inputobject-process-block": "$c = Get-WmiObject -List Win32_Process\nForEach-Object -InputObject $c -Process { $_.Create('x') }",
+        "where-inputobject-filter-block": "$c = Get-WmiObject -List Win32_Process\nWhere-Object -InputObject $c -FilterScript { $_.Create('x') }",
+        "inputobject-of-a-later-element": "Get-Item x | ForEach-Object -InputObject (Get-WmiObject -List Win32_Process) -Process { $_.Create('x') }",
+        # adversary A4: PowerShell 7 decodes a backtick-u{hex} escape in a double-quoted string
+        "unicode-escape-in-the-invoke-method-name": "$c = New-Object -TypeName System.Management.ManagementClass -ArgumentList 'Win32_Process'\n$c.InvokeMethod(\"Crea`u{74}e\", [object[]]@('x', $null, $null))",
+        "unicode-escape-in-the-wmic-verb": "wmic process call \"c`u{72}eate\" 'x'",
+        "unicode-escape-in-the-class-name": "$c = Get-WmiObject -List \"Win32_`u{50}rocess\"\n$c.Create('x')",
+        "unicode-escape-first-letter": "$c = Get-WmiObject -List Win32_Process\n$c.InvokeMethod(\"`u{43}reate\", [object[]]@('x', $null, $null))",
+        # adversary A5: the InvokeMethod method object is read, then invoked; a member name built at run time is read the same way
+        "invoke-method-object-invoked": "$c = Get-WmiObject -List Win32_Process\n$f = $c.InvokeMethod\n$f.Invoke('Create', [object[]]@('x', $null, $null))",
+        "invoke-method-member-invoke": "$c = Get-WmiObject -List Win32_Process\n$c.InvokeMethod.Invoke('Create', [object[]]@('x', $null, $null))",
+        "dynamic-member-read-then-invoked": "$c = Get-WmiObject -List Win32_Process\n$m = 'Create'\n$f = $c.$m\n$f.Invoke('x')",
     }
     not_sites = {
         "line-comment": "# Invoke-CimMethod -ClassName Win32_Process -MethodName Create; [wmiclass]'Win32_Process'",
@@ -1560,6 +1580,15 @@ def test_wmi_create_scan_refuses_each_direct_create_spelling(tmp_path):
         "create-member-read-on-a-plain-variable": "$c = Get-Item x\n$f = $c.Create\n$f.Invoke('y')",
         "dynamic-member-call-on-a-plain-variable": "$c = Get-Item x\n$m = 'Create'\n$c.$m('y')",
         "pipeline-variable-on-a-plain-command": "Get-Item x -PipelineVariable w | ForEach-Object { $w.Create('y') }",
+        # adversary pass 1 on e14374f9: the same shapes on a value that is not WMI, and a WMI value that is only read or ends a different method
+        "scoped-pipeline-variable-on-a-plain-command": "Get-Item x -PipelineVariable script:w | ForEach-Object { $script:w.Create('y') }",
+        "switch-predicate-on-a-plain-value": "$x = Get-Item .\nswitch ($x) { { $_.Create('y'); $false } { } }",
+        "switch-label-expression-on-a-plain-value": "$x = Get-Item .\nswitch ($x) { ($_.Name) { } }",
+        "inputobject-process-block-on-a-plain-value": "$c = Get-Item x\nForEach-Object -InputObject $c -Process { $_.Create('y') }",
+        "unicode-escape-spells-another-method": "$c = Get-WmiObject -List Win32_Process\n$c.InvokeMethod(\"Ter`u{6d}inate\", $null)",
+        "unicode-escape-in-a-note": "$note = \"Invoke-CimMethod -MethodName Crea`u{74}e\"",
+        "invoke-method-member-read-on-a-plain-variable": "$c = Get-Item x\n$f = $c.InvokeMethod\n$f.Invoke('Create')",
+        "dynamic-member-read-on-a-plain-variable": "$c = Get-Item x\n$m = 'Name'\n$f = $c.$m",
     }
     files = {}
     for name, text in {**mutants, **not_sites}.items():
