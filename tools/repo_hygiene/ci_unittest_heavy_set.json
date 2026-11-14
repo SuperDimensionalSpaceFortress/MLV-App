@@ -25,6 +25,7 @@
         "tools.repo_hygiene.test_dual_venue_evidence.NarrowedProductionReceiptsAndBoundBackendTests",
         "tools.repo_hygiene.test_dual_venue_evidence.ProductFailureTerminalsAreReceiptableTests",
         "tools.repo_hygiene.test_dual_venue_evidence.ReconReleaseDeferredEvidenceTests",
+        "tools.repo_hygiene.test_dual_venue_evidence.RunNonceIsTheRealLaunchersTests",
         "tools.repo_hygiene.test_dual_venue_evidence.SelfHealLegGatesTheL1ToL4FactsTests",
         "tools.repo_hygiene.test_dual_venue_evidence.VenueProbeIdentityNoArgumentTextR5Tests",
         "tools.repo_hygiene.test_dual_venue_evidence.VenueQuietAttributionTests",

@@ -15588,6 +15588,39 @@ class DueWakeDeliveryEvidenceTests(unittest.TestCase):
                     else:
                         self.assertEqual((control["verdict"], control["blocks"]), ("NOT_REQUESTED", False), control)
 
+    def test_r7_p1_a1_a2_a_malformed_armed_or_delivery_blocks_on_both_paths(self) -> None:
+        # r7 adversary pass 1 A1 / A2, their inputs verbatim, each run as a control line (no delivery_kind) and with a delivery_kind appended. A1: the
+        # control path skipped the `playback_due_wake armed=<n>` check the delivery_kind path makes, so armed=-1 was NOT_REQUESTED blocks=false. A2:
+        # the delivery= grammar admitted none+qtimer (the app prints "none" only alone and never repeats a mechanism in the join)
+        cell = json.loads((DV / "legs" / "m16-1457-native-fullscreen-s1.json").read_text(encoding="utf-8"))
+        head = ("playback_smoke.measured_session id=3\nplayback_smoke.summary session=3 reason=play-stop presented_frames=600\n"
+                "playback_smoke.pace_summary session=3 first_present_ms=40.000 paced_elapsed_ms=25000.000\n")
+        a1 = "playback_due_wake armed=-1 disabled=0 delivery=native-msg"
+        a2 = "playback_due_wake armed=0 fired=0 advanced=0 disabled=0 delivery=none+qtimer"
+        line = "playback_due_wake armed=1200 fired=1198 disabled=0 delivery=native-msg"
+        cases = [("A1 verbatim", a1, "send"), ("A2 verbatim", a2, "qtimer"),
+                 ("no armed=", line.replace("armed=1200 ", ""), "send"), ("empty armed=", line.replace("armed=1200", "armed="), "send"),
+                 ("NaN armed=", line.replace("armed=1200", "armed=NaN"), "send"), ("armed= not first", line.replace("armed=1200 fired=1198", "fired=1198 armed=1200"), "send"),
+                 ("two armed=", line + " armed=4", "send"),
+                 ("qtimer+none", line.replace("native-msg", "qtimer+none"), "qtimer"), ("native-msg+none", line.replace("native-msg", "native-msg+none"), "send"),
+                 ("a repeated mechanism", line.replace("native-msg", "native-msg+native-msg"), "send"),
+                 ("a mechanism repeated after another", line.replace("native-msg", "qtimer+native-msg+qtimer"), "send")]
+        for spec_name, spec in (("committed paced cell", cell), ("unpaced leg", {"generatorArgs": {"unpaced": True}})):
+            for name, wake, kind in cases:
+                if spec_name == "unpaced leg" and not name.endswith("verbatim"):
+                    continue
+                for path, log in (("control line", head + wake + "\n"), (f"delivery_kind={kind}", head + wake + f" delivery_kind={kind}\n")):
+                    with self.subTest(spec=spec_name, case=name, path=path):
+                        v = self.verdict(spec, log)
+                        self.assertEqual((v["verdict"], v["blocks"]), ("NOT_HONOURED", True), v)
+                        self.assertIn("unreadable", v["reason"])
+        # unchanged: a readable control line (one plain armed=, distinct mechanisms in either order) leaves the paced cell unchanged
+        for name, wake in (("native-msg", line), ("a fallback join", line.replace("native-msg", "native-msg+qtimer")),
+                           ("the other order", line.replace("native-msg", "qtimer+native-msg")), ("armed=0", line.replace("armed=1200", "armed=0"))):
+            with self.subTest(case=name, path="control line, readable"):
+                v = self.verdict(cell, head + wake + "\n")
+                self.assertEqual((v["verdict"], v["blocks"]), ("NOT_REQUESTED", False), v)
+
     def test_r5_a3_a_measured_session_record_of_another_session_closes_the_window(self) -> None:
         # r5 (r4 adversary pass 10 advisory A3, verbatim shape): `playback_smoke.measured_session id=4` names its session with id=, not session=, and
         # it is a playback_smoke record of ANOTHER session, so it closes the measured wake window like any other; a wake record after it is not the

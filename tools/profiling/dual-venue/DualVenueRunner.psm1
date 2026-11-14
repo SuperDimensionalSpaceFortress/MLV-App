@@ -2004,9 +2004,18 @@ function Get-DvDueWakeDeliveryEvidence {
     # from a later pace window never stands in for the measured Play
     $controlMech = $null
     $controlMechUnreadable = ($withKind.Count -eq 0 -and $candidates.Count -gt 0 -and ($candidates.Count -gt 1 -or $paces -ne 1))
+    # r7 (r7 adversary pass 1 A2): the app's delivery= is "none" alone (reset, no arm this Play) or a "+"-join of distinct mechanisms (the first arm
+    # replaces "none", and a later arm appends its mechanism only when the join lacks it; MainWindow.cpp, the arm path), so none+qtimer or a repeated
+    # mechanism is unreadable on both paths
+    $mechReadable = { param([string]$m) ($m -cmatch '^(?:none|(?:native-msg|qtimer|notifier)(?:\+(?:native-msg|qtimer|notifier))*)$') -and
+                      (@($m -split '\+' | Sort-Object -Unique).Count -eq @($m -split '\+').Count) }
+    # r7 (r7 adversary pass 1 A1): a control binary prints the same `playback_due_wake armed=<n>` start (46d3472b's playbackDueWakeSummaryLine), so a
+    # control line without one plain armed count is unreadable as on the delivery_kind path below
+    $armedReadable = { param([string]$l) ($l -cmatch ($script:DvRecordStart + 'playback_due_wake armed=[0-9]+(?:\s|$)')) -and
+                       ([regex]::Matches($l, '(?:^|\s)armed=(?<a>\S*)').Count -eq 1) }
     if ($candidates.Count -eq 1 -and $withKind.Count -eq 0) {
         $cm = [regex]::Matches($candidates[0], '(?:^|\s)delivery=(?<m>\S*)')
-        if ($cm.Count -gt 1 -or ($cm.Count -eq 1 -and $cm[0].Groups['m'].Value -cnotmatch '^(native-msg|qtimer|notifier|none)(\+(native-msg|qtimer|notifier))*$')) { $controlMechUnreadable = $true }
+        if (-not (& $armedReadable $candidates[0]) -or $cm.Count -gt 1 -or ($cm.Count -eq 1 -and -not (& $mechReadable $cm[0].Groups['m'].Value))) { $controlMechUnreadable = $true }
         elseif ($cm.Count -eq 1) { $controlMech = $cm[0].Groups['m'].Value }
     }
     if ($withKind.Count -gt 0) {
@@ -2018,9 +2027,8 @@ function Get-DvDueWakeDeliveryEvidence {
             $mech = [regex]::Matches($l, '(?:^|\s)delivery=(?<m>\S*)')
             # r3 (r2 adversary pass 7 advisory A1): the app's record starts `playback_due_wake armed=<n>` (MainWindow::playbackDueWakeSummaryLine) with one
             # non-negative decimal count; a record without it, or with an empty, signed, fractional or repeated armed=, is unreadable
-            $armed = [regex]::Matches($l, '(?:^|\s)armed=(?<a>\S*)')
-            if ($l -cnotmatch ($start + 'playback_due_wake armed=[0-9]+(?:\s|$)') -or $armed.Count -ne 1 -or $disabledUnreadable) { $unreadableSeen = $true }
-            elseif ($fields.Count -ne 1 -or $fields[0].Groups['k'].Value -cnotmatch '^(send|post|notifier|qtimer|none)$' -or $mech.Count -ne 1 -or $mech[0].Groups['m'].Value -cnotmatch '^(native-msg|qtimer|notifier|none)(\+(native-msg|qtimer|notifier))*$') { $unreadableSeen = $true }
+            if (-not (& $armedReadable $l) -or $disabledUnreadable) { $unreadableSeen = $true }
+            elseif ($fields.Count -ne 1 -or $fields[0].Groups['k'].Value -cnotmatch '^(send|post|notifier|qtimer|none)$' -or $mech.Count -ne 1 -or -not (& $mechReadable $mech[0].Groups['m'].Value)) { $unreadableSeen = $true }
             else {
                 # r1 adversary pass 3 A1: the selection and the arms must agree -- none only with no arm (delivery=none), qtimer only on QTimer arms, notifier
                 # only on notifier (or fallback QTimer) arms, send / post only on native-message (or fallback QTimer) arms; any other pair is contradictory
@@ -2057,7 +2065,7 @@ function Get-DvDueWakeDeliveryEvidence {
     }
     elseif ($controlMechUnreadable) {
         # r5 (r5 adversary pass 12 A1): the control line's delivery= cannot show which arms the measured Play used
-        $verdict = 'NOT_HONOURED'; $reason = 'the due-wake delivery is unreadable: the measured session''s playback_due_wake records carry no delivery_kind and are more than one or follow more than one of its pace_summary lines, or the one line''s delivery= is repeated or is not native-msg, qtimer, notifier, none or a "+"-join'
+        $verdict = 'NOT_HONOURED'; $reason = 'the due-wake delivery is unreadable: the measured session''s playback_due_wake records carry no delivery_kind and are more than one or follow more than one of its pace_summary lines, or the one line does not start with one plain armed= count, or its delivery= is repeated or is not none alone or a "+"-join of distinct native-msg, qtimer, notifier'
     }
     elseif ($controlMech -ceq 'none' -and -not $unpacedLeg) {
         # r5 (r5 adversary pass 12 A1, its input: the committed paced cell with a control line saying delivery=none): the r4 rule below, on a line
