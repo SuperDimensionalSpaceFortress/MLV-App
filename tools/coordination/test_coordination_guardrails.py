@@ -1122,7 +1122,8 @@ def test_invoke_lane_error_mode_pin_catches_each_launch_ahead_of_the_block(tmp_p
 # follows a switch parameter (`-UseNewRunspace Create`), which is read as that parameter's value. A file that does not parse is
 # scanned as far as its AST goes; a file the parser cannot READ fails the tracked test (it was not scanned).
 # NOT covered, a parenthesized literal command name (distinct from the `& $cmd` form above): `& ('Invoke-CimMethod') -ClassName Win32_Process -MethodName Create`.
-# An alias the file itself defines (Set-Alias / New-Alias / sal / nal, literal name and value, an alias of an alias) is read as the command it names. NOT covered: an alias made any other way (a non-literal name or value, `Import-Alias`, `$ExecutionContext`, `Set-Item alias:`) or defined in another file.
+# An alias the file itself defines (Set-Alias / New-Alias / sal / nal, literal name and value, an alias of an alias) is read as the command it names; a name with several meanings is tested as EVERY watched one, and a WMI command name stays one whatever it is aliased to. NOT covered: an alias made any other way (a non-literal name or value, `Import-Alias`, `$ExecutionContext`, `Set-Item alias:`, `New-Item -Path Alias:spawn -Value Invoke-CimMethod`) or defined in another file.
+# NOT covered, a write that reaches a splatted table through a nested index or an array wrapper (`@($h)[0]['PipelineVariable'] = 'w'`, `$h[0]['k'] = ...`): only `( )`, `$( )` of one statement, a cast and `-as` are read through.
 # The ONE sanctioned launcher lives under .claude-state and is not tracked, so today the allow list is empty. An entry is {repo-relative posix path: reason},
 # added only in review for a script that must call the create itself; an entry that stops matching a site fails the test, so the list cannot go stale.
 WMI_CREATE_ALLOW = {}
@@ -1329,6 +1330,12 @@ function Get-ValueExpression($Node) {
         }
         elseif ($Node -is [ParenExpressionAst]) { $Node = $Node.Pipeline }
         elseif ($Node -is [ConvertExpressionAst]) { $Node = $Node.Child }
+        # `$($h)` is one statement holding the expression, and `$h -as [type]` returns its left operand (adversary pass 10 A3).
+        elseif ($Node -is [SubExpressionAst]) {
+            if (@($Node.SubExpression.Statements).Count -ne 1) { return $Node }
+            $Node = @($Node.SubExpression.Statements)[0]
+        }
+        elseif ($Node -is [BinaryExpressionAst] -and $Node.Operator -eq [TokenKind]::As) { $Node = $Node.Left }
         else { return $Node }
     }
     return $null
@@ -1574,8 +1581,8 @@ foreach ($path in @(Get-Content -LiteralPath $ListFile -Encoding UTF8 | Where-Ob
         for ($i = 1; $i -lt $elements.Count; $i++) {
             $e = $elements[$i]
             if ($e -is [CommandParameterAst]) {
-                # A switch (Force, PassThru, Confirm, WhatIf, Verbose, Debug, or an abbreviation) takes no value; any other parameter takes the next element.
-                $isSwitch = $false
+                # A switch (Force, PassThru, Confirm, WhatIf, Verbose, Debug, an abbreviation, or the aliases vb, db, cf and wi) takes no value; any other parameter takes the next element.
+                $isSwitch = (@('vb', 'db', 'cf', 'wi') -contains $e.ParameterName.ToLowerInvariant())
                 foreach ($sw in @('Force', 'PassThru', 'Confirm', 'WhatIf', 'Verbose', 'Debug')) { if ($sw.StartsWith($e.ParameterName, [StringComparison]::OrdinalIgnoreCase)) { $isSwitch = $true } }
                 if ($null -eq $e.Argument -and -not $isSwitch) { $i++ }
                 continue
@@ -1586,7 +1593,8 @@ foreach ($path in @(Get-Content -LiteralPath $ListFile -Encoding UTF8 | Where-Ob
         $next = 0
         if ($null -eq $aliasName -and $next -lt $positional.Count) { $aliasName = $positional[$next]; $next++ }
         if ($null -eq $aliasValue -and $next -lt $positional.Count) { $aliasValue = $positional[$next] }
-        if ($aliasName -is [StringConstantExpressionAst] -and $aliasValue -is [StringConstantExpressionAst]) {
+        # A literal is a string or a number: Set-Alias converts `7` to the name '7', which `& '7'` calls.
+        if ($aliasName -is [ConstantExpressionAst] -and $aliasValue -is [ConstantExpressionAst]) {
             $aliasKey = (([string]$aliasName.Value -replace '^.*[\\/]', '') -replace '\.(exe|com|cmd|bat)$', '').ToLowerInvariant()
             if (-not $aliasMap.ContainsKey($aliasKey)) { $aliasMap[$aliasKey] = New-Object System.Collections.Generic.List[string] }
             $aliasMap[$aliasKey].Add((([string]$aliasValue.Value -replace '^.*[\\/]', '') -replace '\.(exe|com|cmd|bat)$', '').ToLowerInvariant())
@@ -1613,34 +1621,33 @@ foreach ($path in @(Get-Content -LiteralPath $ListFile -Encoding UTF8 | Where-Ob
             if ($null -eq $name) { $name = '' }
             # The command as it resolves: a module-qualified name (CimCmdlets\Invoke-CimMethod) and a full path (C:\...\wmic.exe) are the same command.
             $lname = (($name -replace '^.*[\\/]', '') -replace '\.(exe|com|cmd|bat)$', '').ToLowerInvariant()
-            # Everything the name may mean once the file's aliases are followed (a cycle ends because a name is listed once); the first meaning that is a command this scan
-            # watches is the one tested below.
+            # Everything the name may mean once the file's aliases are followed (a cycle ends because a name is listed once). The alias map only ADDS meanings: the raw name
+            # is the first entry, and EVERY meaning that is a command this scan watches is tested below, none is skipped for an earlier one (G12, G15).
             $closure = New-Object System.Collections.Generic.List[string]
             $closure.Add($lname)
             for ($k = 0; $k -lt $closure.Count; $k++) {
                 if ($aliasMap.ContainsKey($closure[$k])) { foreach ($v in $aliasMap[$closure[$k]]) { if (-not $closure.Contains($v)) { $closure.Add($v) } } }
             }
             foreach ($cand in $closure) {
-                if (($wmiCommands -contains $cand) -or $cand -eq 'wmic' -or (@('foreach-object', 'foreach', '%') -contains $cand)) { $lname = $cand; break }
-            }
-            if ($wmiCommands -contains $lname) {
-                $method = Get-MethodName $n
-                if ($null -eq $method) { $kind = 'wmi-method-name-not-literal' }
-                elseif ($method -match '(?i)create') { $kind = 'wmi-create' }
-            }
-            elseif ($lname -eq 'wmic') {
-                # The argument elements only: a comment inside the command is not an argument.
-                $words = @($n.CommandElements | Select-Object -Skip 1 | ForEach-Object { Get-CleanText $_ })
-                if (($words -join ' ') -match '(?i)\bcreate\b') { $kind = 'wmic-create' }
-            }
-            elseif (@('foreach-object', 'foreach', '%') -contains $lname) {
-                # ForEach-Object calls the named method on each input: no script block and no `.Create(` is needed.
-                $memberName = Get-ForEachMemberName $n
-                if ($null -ne $memberName -and (Test-WmiPipelineInput $n)) {
-                    if ($memberName -isnot [StringConstantExpressionAst]) { $kind = 'wmi-foreach-member-not-literal' }
-                    elseif ([string]$memberName.Value -match '(?i)create|invokemethod') { $kind = 'wmi-foreach-member-create' }
-                    # A member name is a wildcard pattern: 'Cr?ate' and 'Cr*' name Create.
-                    elseif ([string]$memberName.Value -match '[*?\[]') { $kind = 'wmi-foreach-member-wildcard' }
+                if ($wmiCommands -contains $cand) {
+                    $method = Get-MethodName $n
+                    if ($null -eq $method) { $kind = 'wmi-method-name-not-literal' }
+                    elseif ($method -match '(?i)create') { $kind = 'wmi-create' }
+                }
+                elseif ($cand -eq 'wmic') {
+                    # The argument elements only: a comment inside the command is not an argument.
+                    $words = @($n.CommandElements | Select-Object -Skip 1 | ForEach-Object { Get-CleanText $_ })
+                    if (($words -join ' ') -match '(?i)\bcreate\b') { $kind = 'wmic-create' }
+                }
+                elseif (@('foreach-object', 'foreach', '%') -contains $cand) {
+                    # ForEach-Object calls the named method on each input: no script block and no `.Create(` is needed.
+                    $memberName = Get-ForEachMemberName $n
+                    if ($null -ne $memberName -and (Test-WmiPipelineInput $n)) {
+                        if ($memberName -isnot [StringConstantExpressionAst]) { $kind = 'wmi-foreach-member-not-literal' }
+                        elseif ([string]$memberName.Value -match '(?i)create|invokemethod') { $kind = 'wmi-foreach-member-create' }
+                        # A member name is a wildcard pattern: 'Cr?ate' and 'Cr*' name Create.
+                        elseif ([string]$memberName.Value -match '[*?\[]') { $kind = 'wmi-foreach-member-wildcard' }
+                    }
                 }
             }
         }
@@ -1931,6 +1938,41 @@ def test_wmi_create_scan_refuses_each_direct_create_spelling(tmp_path):
         "alias-shadows-the-real-command-name": "Set-Alias Invoke-CimMethod Get-Date\nCimCmdlets\\Invoke-CimMethod -ClassName Win32_Process -MethodName Create",
         "alias-with-an-exe-twin-that-shadows-it": "Set-Alias spawn Invoke-CimMethod\nSet-Alias spawn.exe Get-Date\nspawn -ClassName Win32_Process -MethodName Create",
         "alias-of-an-alias":"Set-Alias a1 Invoke-CimMethod\nSet-Alias a2 a1\na2 -ClassName Win32_Process -MethodName Create",
+        # Grok CoS G12 on 71996ac0: the alias map only ADDS danger; a name that is itself a WMI command stays one whatever it is aliased to, and wherever the alias is
+        "alias-g12-shadow-after-the-create": "Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{ CommandLine = 'x' }\nSet-Alias Invoke-CimMethod Get-Date",
+        "alias-g12-shadow-inside-a-function": "function f { Set-Alias Invoke-CimMethod Get-Date }\nInvoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{ CommandLine = 'x' }",
+        "alias-g12-shadow-inside-a-dead-branch": "if ($false) { Set-Alias Invoke-CimMethod Get-Date }\nInvoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{ CommandLine = 'x' }",
+        "alias-g12-wmic-shadowed-after-the-create": "wmic process call create 'x'\nSet-Alias wmic hostname",
+        "alias-g12-shadow-on-the-same-line": "Set-Alias Invoke-CimMethod Get-Date; Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{ CommandLine = 'x' }",
+        # Grok CoS G15 and adversary pass 10 A1: ONE name with TWO meanings, in both orders, the dangerous one in each position; every watched meaning is tested
+        "alias-g15-foreach-first-then-cim": "sal spawn ForEach-Object\nsal spawn Invoke-CimMethod\nspawn -ClassName Win32_Process -MethodName Create",
+        "alias-g15-cim-first-then-foreach": "sal spawn Invoke-CimMethod\nsal spawn ForEach-Object\nspawn -ClassName Win32_Process -MethodName Create",
+        "alias-g15-dead-branch-foreach-then-cim": "if ($false) { Set-Alias spawn ForEach-Object }\nSet-Alias spawn Invoke-CimMethod\nspawn -ClassName Win32_Process -MethodName Create",
+        "alias-g15-dead-branch-cim-then-foreach": "if ($false) { Set-Alias spawn Invoke-CimMethod }\nSet-Alias spawn ForEach-Object\nspawn -ClassName Win32_Process -MethodName Create",
+        "alias-g15-foreach-first-then-wmic": "Set-Alias w ForEach-Object\nSet-Alias w wmic\nw process call create 'x'",
+        "alias-g15-wmic-first-then-foreach": "Set-Alias w wmic\nSet-Alias w ForEach-Object\nw process call create 'x'",
+        "alias-g15-cim-first-then-foreach-wildcard-member": "Set-Alias each Invoke-CimMethod\nSet-Alias each ForEach-Object\nGet-WmiObject -List Win32_Process | each 'Cr?ate'",
+        "alias-g15-foreach-first-then-cim-wildcard-member": "Set-Alias each ForEach-Object\nSet-Alias each Invoke-CimMethod\nGet-WmiObject -List Win32_Process | each 'Cr?ate'",
+        "alias-g15-foreach-first-then-harmless-then-cim": "Set-Alias spawn ForEach-Object\nSet-Alias spawn Get-Date\nSet-Alias spawn Invoke-CimMethod\nspawn -ClassName Win32_Process -MethodName Create",
+        # adversary pass 10 A2: -vb / -db / -cf / -wi are the aliases of the Verbose / Debug / Confirm / WhatIf switches and take no value
+        "alias-vb-switch-alias-before-positional-operands": "Set-Alias -vb spawn Invoke-CimMethod\nspawn -ClassName Win32_Process -MethodName Create",
+        "alias-db-switch-alias-before-positional-operands": "Set-Alias -db spawn Invoke-CimMethod\nspawn -ClassName Win32_Process -MethodName Create",
+        "alias-cf-switch-alias-before-positional-operands": "Set-Alias -cf spawn Invoke-CimMethod\nspawn -ClassName Win32_Process -MethodName Create",
+        "alias-wi-switch-alias-before-positional-operands": "Set-Alias -wi spawn Invoke-CimMethod\nspawn -ClassName Win32_Process -MethodName Create",
+        # adversary pass 10 A4: Set-Alias converts a numeric literal to the string it names
+        "alias-numeric-name": "Set-Alias -Name 7 -Value Invoke-CimMethod\n& '7' -ClassName Win32_Process -MethodName Create",
+        "alias-numeric-positional-name": "Set-Alias 7 Invoke-CimMethod\n& '7' -ClassName Win32_Process -MethodName Create",
+        "alias-numeric-hop-in-a-chain": "Set-Alias 7 Invoke-CimMethod\nSet-Alias spawn 7\nspawn -ClassName Win32_Process -MethodName Create",
+        # adversary pass 10 A3: a write through `$(...)` or an `-as` cast is a write to the table
+        "splat-subexpression-keyed-write": "$h = @{}\n$($h)['PipelineVariable'] = 'w'\nGet-WmiObject -List Win32_Process @h | ForEach-Object { $w.Create('x') }",
+        "splat-subexpression-member-write": "$h = @{}\n$($h).PipelineVariable = 'w'\nGet-WmiObject -List Win32_Process @h | ForEach-Object { $w.Create('x') }",
+        "splat-subexpression-add": "$h = @{}\n$($h).Add('PipelineVariable', 'w')\nGet-WmiObject -List Win32_Process @h | ForEach-Object { $w.Create('x') }",
+        "splat-as-cast-keyed-write": "$h = @{}\n($h -as [hashtable])['PipelineVariable'] = 'w'\nGet-WmiObject -List Win32_Process @h | ForEach-Object { $w.Create('x') }",
+        "splat-as-cast-member-write": "$h = @{}\n($h -as [hashtable]).PipelineVariable = 'w'\nGet-WmiObject -List Win32_Process @h | ForEach-Object { $w.Create('x') }",
+        "splat-as-cast-add": "$h = @{}\n($h -as [hashtable]).Add('PipelineVariable', 'w')\nGet-WmiObject -List Win32_Process @h | ForEach-Object { $w.Create('x') }",
+        "splat-subexpression-multiple-assignment": "$h = @{}\n$ignored, $($h)['PipelineVariable'] = 0, 'w'\nGet-WmiObject -List Win32_Process @h | ForEach-Object { $w.Create('x') }",
+        "default-parameter-values-subexpression-write": "$($PSDefaultParameterValues)['ForEach-Object:MemberName'] = 'Create'\nGet-WmiObject -List Win32_Process | ForEach-Object",
+        "default-parameter-values-as-cast-add": "($PSDefaultParameterValues -as [hashtable]).Add('ForEach-Object:MemberName', 'Create')\nGet-WmiObject -List Win32_Process | ForEach-Object",
         "splat-add-with-a-key-from-a-variable":"$k = 'PipelineVariable'\n$h = @{}\n$h.Add($k, 'w')\nGet-WmiObject -List Win32_Process @h | ForEach-Object { $w.Create('x') }",
         "splat-hashtable-key-from-a-variable": "$k = 'PipelineVariable'\n$h = @{ $k = 'w' }\nGet-WmiObject -List Win32_Process @h | ForEach-Object { $w.Create('x') }",
         "splat-hashtable-from-a-call": "$h = Get-Content settings.json | ConvertFrom-Json -AsHashtable\nGet-WmiObject -List Win32_Process @h | ForEach-Object { $w.Create('x') }",
@@ -2047,7 +2089,14 @@ def test_wmi_create_scan_refuses_each_direct_create_spelling(tmp_path):
         "splat-a-safe-table-on-a-wmi-read": "$h = @{ ClassName = 'Win32_Process'; Filter = 'ProcessId=4' }\nGet-CimInstance @h",
         "splat-a-safe-table-on-a-wmi-pipeline": "$h = @{ Property = 'ProcessId' }\nGet-CimInstance Win32_Process | Select-Object @h",
         "alias-of-an-unrelated-command": "Set-Alias gs git\nNew-Alias -Name ll -Value Get-ChildItem\ngs status\nll .",
-        "alias-named-like-a-wmi-command-for-a-safe-target": "Set-Alias Invoke-Thing Get-Date\nInvoke-Thing",
+        "alias-for-a-safe-target-with-a-name-that-is-not-a-wmi-command": "Set-Alias Invoke-Thing Get-Date\nInvoke-Thing",
+        "alias-g12-wmi-command-name-aliased-away-but-only-terminating": "Set-Alias Invoke-CimMethod Get-Date\nInvoke-CimMethod -InputObject $proc -MethodName Terminate",
+        "alias-g15-two-safe-meanings": "Set-Alias spawn Get-Date\nSet-Alias spawn Get-Item\nspawn .",
+        "alias-g15-foreach-and-cim-meanings-on-a-read": "Set-Alias spawn ForEach-Object\nSet-Alias spawn Get-CimInstance\nspawn -ClassName Win32_Process -Filter 'ProcessId=4'",
+        "alias-switch-alias-before-an-unrelated-pair": "Set-Alias -vb gs git\ngs status",
+        "alias-numeric-name-for-a-safe-target": "Set-Alias -Name 7 -Value Get-Date\n& '7'",
+        "splat-a-safe-table-written-through-a-subexpression": "$h = @{}\n$($h)['ClassName'] = 'Win32_Process'\nGet-CimInstance @h",
+        "splat-a-safe-table-written-through-an-as-cast": "$h = @{}\n($h -as [hashtable]).Add('Filter', 'ProcessId=4')\nGet-CimInstance @h",
         "splat-a-safe-table-written-by-key":"$h = @{}\n$h['ClassName'] = 'Win32_Process'\n$h.Add('Filter', 'ProcessId=4')\nGet-CimInstance @h",
         "splat-on-a-plain-command": "$h = @{ PipelineVariable = 'w' }\nGet-Item x @h | ForEach-Object { $w.Create('y') }",
         "splat-unbound-on-a-plain-command": "Get-Item x @h",
