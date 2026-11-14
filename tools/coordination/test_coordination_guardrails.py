@@ -1545,6 +1545,28 @@ def test_wmi_create_scan_refuses_each_direct_create_spelling(tmp_path):
         # adversary A5: the InvokeMethod method object is read, then invoked
         "invoke-method-object-invoked": "$c = Get-WmiObject -List Win32_Process\n$f = $c.InvokeMethod\n$f.Invoke('Create', [object[]]@('x', $null, $null))",
         "invoke-method-member-invoke": "$c = Get-WmiObject -List Win32_Process\n$c.InvokeMethod.Invoke('Create', [object[]]@('x', $null, $null))",
+        # adversary pass 2 on 0a003045, A1: quotes spliced into a bareword are removed by PowerShell (Manage"ment"Class is ManagementClass)
+        "quote-spliced-class-name": "$c = New-Object -TypeName System.Management.Manage\"ment\"Class -ArgumentList Win32_\"Pro\"cess\n$c.InvokeMethod('Create', [object[]]@('x', $null, $null))",
+        "quote-spliced-wmic-verb": "wmic process call cr\"ea\"te 'x'",
+        "single-quote-spliced-class-name": "$c = Get-WmiObject -List Win32_'Pro'cess\n$c.Create('x')",
+        # A2: the -PipelineVariable name in parentheses, or not a literal
+        "pipeline-variable-parenthesized-name": "Get-WmiObject -List Win32_Process -PipelineVariable ('w') | ForEach-Object { $w.InvokeMethod('Create', @('x')) }",
+        "pipeline-variable-name-from-a-variable": "$n = 'w'\nGet-WmiObject -List Win32_Process -PipelineVariable $n | ForEach-Object { $w.Create('x') }",
+        "pipeline-variable-double-quoted-name": "Get-WmiObject -List Win32_Process -PipelineVariable \"w\" | ForEach-Object { $w.Create('x') }",
+        # A3: the variable: drive reads the same variable
+        "variable-drive-receiver": "$c = Get-WmiObject -List Win32_Process\n$variable:c.InvokeMethod('Create', [object[]]@('x', $null, $null))",
+        "variable-drive-binding": "$variable:c = Get-WmiObject -List Win32_Process\n$c.Create('x')",
+        "variable-drive-copy": "$c = Get-WmiObject -List Win32_Process\n$d = $variable:c\n$d.Create('x')",
+        "braced-variable-drive-receiver": "$c = Get-WmiObject -List Win32_Process\n${variable:c}.Create('x')",
+        "variable-drive-pipeline-variable": "Get-WmiObject -List Win32_Process -PipelineVariable variable:w | ForEach-Object { $w.Create('x') }",
+        # A4: the receiver inside @( ), $( ) or an index
+        "array-wrapped-receiver": "$c = Get-WmiObject -List Win32_Process\n@($c).InvokeMethod('Create', [object[]]@('x', $null, $null))",
+        "subexpression-receiver": "$c = Get-WmiObject -List Win32_Process\n$($c).Create('x')",
+        "index-receiver": "$c = Get-WmiObject -List Win32_Process\n$c[0].Create('x')",
+        "array-wrapped-class-expression": "@(Get-WmiObject -List Win32_Process).Create('x')",
+        # class sibling of A3/A4: the item of a WMI pipeline is piped on, or read through a nested pipeline
+        "item-piped-to-a-member-create": "Get-WmiObject -List Win32_Process | ForEach-Object { $_ | ForEach-Object -MemberName Create }",
+        "item-piped-to-a-script-block": "Get-WmiObject -List Win32_Process | ForEach-Object { $_ | ForEach-Object { $_.Create('x') } }",
     }
     not_sites = {
         "line-comment": "# Invoke-CimMethod -ClassName Win32_Process -MethodName Create; [wmiclass]'Win32_Process'",
@@ -1599,6 +1621,15 @@ def test_wmi_create_scan_refuses_each_direct_create_spelling(tmp_path):
         "unicode-escape-in-a-note": "$note = \"Invoke-CimMethod -MethodName Crea`u{74}e\"",
         "invoke-method-member-read-on-a-plain-variable": "$c = Get-Item x\n$f = $c.InvokeMethod\n$f.Invoke('Create')",
         "dynamic-member-read-on-a-plain-variable": "$c = Get-Item x\n$m = 'Name'\n$f = $c.$m",
+        # adversary pass 2 on 0a003045: the same shapes on a value that is not WMI
+        "quote-spliced-unrelated-method": "$c = Get-WmiObject -List Win32_Process\n$c.InvokeMethod('Term\"inate\"', $null)",
+        "variable-drive-on-a-plain-variable": "$c = Get-Item x\n$variable:c.Create('y')",
+        "array-wrapped-plain-receiver": "$c = Get-Item x\n@($c).Create('y')\n$($c).Create('y')\n$c[0].Create('y')",
+        "item-piped-through-a-plain-pipeline": "Get-Item x | ForEach-Object { $_ | ForEach-Object { $_.Create('y') } }",
+        "pipeline-variable-parenthesized-name-on-a-plain-command": "Get-Item x -PipelineVariable ('w') | ForEach-Object { $w.Create('y') }",
+        "pipeline-variable-name-from-a-variable-on-a-plain-command": "$n = 'w'\nGet-Item x -PipelineVariable $n | ForEach-Object { $w.Create('y') }",
+        # A5: an explicit -InputObject that is not WMI is the $_ of its script block, whatever pipeline surrounds it
+        "explicit-plain-inputobject-inside-a-wmi-pipeline": "Get-WmiObject -List Win32_Process | ForEach-Object { ForEach-Object -InputObject ([System.IO.FileInfo]'scratch.txt') -Process { $_.Create().Dispose() } }",
     }
     files = {}
     for name, text in {**mutants, **not_sites}.items():
