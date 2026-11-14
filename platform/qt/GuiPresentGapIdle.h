@@ -11,6 +11,7 @@
 #include <QtGlobal>
 
 #include <cmath>
+#include <limits>
 
 namespace gui_present_gap
 {
@@ -198,13 +199,20 @@ public:
         OtherBusySpans probe;
         for( int i = 0; i < kCount; ++i ) probe.gapMs[i] = gapMs[i];
         const double rest = probe.closeGap( otherBusyMs );
+        // r2 fix iteration 2 (adversary A1 on 1a6d7fd5): closeGap's rest is a subtraction (budget less the summed charges),
+        // so a measured tie can land an ulp apart (0.3 + 0.6 charged of 1.5 leaves 0.6000000000000001 against 0.6). Every
+        // comparison here treats charges within one clock tick (1 ns) or a few ulps of the gap's charged total as a tie:
+        // ties go to the named span over the rest, and to the first named span over a later one.
+        double total = rest;
+        for( int i = 0; i < kCount; ++i ) total += probe.sumMs[i];
+        const double tieMs = std::fmax( 1e-6, 8.0 * std::numeric_limits<double>::epsilon() * total );
         int best = -1;
         double bestCharge = 0.0;
         for( int i = 0; i < kCount; ++i )
         {
-            if( probe.sumMs[i] > bestCharge ) { bestCharge = probe.sumMs[i]; best = i; }
+            if( probe.sumMs[i] > bestCharge + tieMs ) { bestCharge = probe.sumMs[i]; best = i; }
         }
-        return ( best >= 0 && !( rest > bestCharge ) ) ? best : -1;
+        return ( best >= 0 && !( rest > bestCharge + tieMs ) ) ? best : -1;
     }
 
     // A gap opened: spans of a previous gap that never closed are not carried into it.

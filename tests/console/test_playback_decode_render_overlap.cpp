@@ -545,6 +545,35 @@ TEST(PlaybackLookaheadCpuRoute, TheCpuPrepRouteIsDecidedByTheBorrowPredicateItse
     }
 }
 
+TEST(PlaybackLookaheadCpuRoute, AMeasuredTieGoesToTheNamedSpanDespiteRoundingInTheRest)
+{
+    // r2 fix iteration 2 (adversary A1 on 1a6d7fd5): a 1.5 ms gap, zero idle, sleep and paint; draw_frame_ready 0.3 ms and
+    // timer_frame 0.6 ms. The rest is 1.5 - (0.3 + 0.6) = 0.6000000000000001 in IEEE double, an ulp above timer_frame's 0.6:
+    // the measured tie must name timer_frame, never unattributed.
+    using gui_present_gap::OtherBusySpan;
+    using gui_present_gap::OtherBusySpans;
+    using gui_present_gap::SpanClock;
+    OtherBusySpans spans;
+    spans.openGap();
+    SpanClock c; c.gapSerial = 1;
+    c.nowNs = 100000100000; spans.begin( c );
+    c.nowNs = 100000400000; spans.end( OtherBusySpan::DrawFrameReady, c );
+    c.nowNs = 100000500000; spans.begin( c );
+    c.nowNs = 100001100000; spans.end( OtherBusySpan::TimerFrame, c );
+    ASSERT_EQ( static_cast<int>( OtherBusySpan::TimerFrame ), spans.dominantBucket( 1.5 ) );
+    // A real margin still decides: 2 ns more rest than timer_frame is the rest's (well above one clock tick).
+    ASSERT_EQ( -1, spans.dominantBucket( 1.5 + 0.000002 ) );
+    // Two named spans tied within a tick: the first (draw_frame_ready) keeps it.
+    OtherBusySpans pair;
+    pair.openGap();
+    c.gapSerial = 2;
+    c.nowNs = 0; pair.begin( c );
+    c.nowNs = 300000; pair.end( OtherBusySpan::DrawFrameReady, c );
+    c.nowNs = 400000; pair.begin( c );
+    c.nowNs = 700000; pair.end( OtherBusySpan::TimerFrame, c );
+    ASSERT_EQ( static_cast<int>( OtherBusySpan::DrawFrameReady ), pair.dominantBucket( 0.6 ) );
+}
+
 TEST(PlaybackLookaheadCpuRoute, TheMaxBusyGapNamesItsDominantBucket)
 {
     using gui_present_gap::OtherBusySpan;
