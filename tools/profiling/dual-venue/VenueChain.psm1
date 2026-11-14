@@ -628,7 +628,13 @@ function Get-VenueStagedBuildManifest {
         [switch]$VerifyArtifacts, [ValidateRange(0, 600)][int]$ArtifactTimeoutSec = 0, [scriptblock]$ArtifactProbeScript = $null, [ValidateRange(1.0, 600.0)][double]$ArtifactMinSec = 1,
         # Test-only (VENUE-STAGE-SAME-SHA-RESTAGE-GUARD-1 r2): the default manifest read first blocks its worker this long, as a read stuck on a dead SMB host does
         # (Thread.Sleep: a stop request cannot interrupt it). test_venue_stage_nightly.py uses it; production passes none.
-        [ValidateRange(0, 600000)][int]$TestReadDelayMs = 0)
+        [ValidateRange(0, 600000)][int]$TestReadDelayMs = 0,
+        # VENUE-STAGE-SAME-SHA-RESTAGE-GUARD-1 r6 (Grok G6/G7 on #814): with an explicit -ArtifactTimeoutSec, the whole call (manifest read plus artifact hash) ends inside
+        # -CallCapSec seconds of its start (0 = no such bound): the hash gets min(-ArtifactTimeoutSec, what is left of -CallCapSec), and none under -ArtifactMinSec (UNREACHABLE).
+        # The stage nightly passes what is left of its -MaxTotalSec, so a 300 s hash never runs past the call's own cap.
+        [ValidateRange(0.0, 86400.0)][double]$CallCapSec = 0,
+        # Test-only (r6): the default artifact hash first blocks its worker this long, as a slow SMB hash of a large cached package does. Production passes none.
+        [ValidateRange(0, 600000)][int]$TestArtifactDelayMs = 0)
     # -ArtifactTimeoutSec 0 (the default): the artifact hash gets what is left of -TimeoutSec after the manifest read (under -ArtifactMinSec left, no hash: UNREACHABLE), so the whole call stays inside -TimeoutSec, as
     # every caller that passes 30 relies on. A caller that can afford more (the pre-claim plan preflight) or must afford less (the post-claim guard) says so.
     # r7 (sol r6 B1): -TimeoutSec and what is left of it are seconds with their fraction, never floored: the lease batch guard hands over a 2.8 s remainder as 2.8.
@@ -722,6 +728,12 @@ function Get-VenueStagedBuildManifest {
                     } })
             # adversary r2 A2: with no explicit bound the hash gets what is LEFT of -TimeoutSec, and none when less than -ArtifactMinSec is left (a 1 s floor would run the call past its own bound)
             $artSec = $ArtifactTimeoutSec
+            if ($artSec -gt 0 -and $CallCapSec -gt 0) {
+                # r6 (Grok G6/G7 on #814): an explicit hash budget never runs the call past -CallCapSec; under -ArtifactMinSec left of it, no hash (UNREACHABLE)
+                $capLeft = $CallCapSec - $callClock.Elapsed.TotalSeconds
+                if ($capLeft -lt $ArtifactMinSec) { return [pscustomobject]@{ state = 'UNREACHABLE'; sha256 = $null; path = $path; error = "the cached artifacts could not be hashed: no time is left of -CallCapSec $([Math]::Round($CallCapSec, 2)) after the manifest read ($([Math]::Floor([Math]::Max(0.0, $capLeft) * 100.0) / 100.0) s left, under $ArtifactMinSec)"; contentProblem = $null; artifactProblem = $null; artifactsUnhashed = $true } }
+                $artSec = [Math]::Min([double]$artSec, $capLeft)
+            }
             if ($artSec -le 0) {
                 # r7 (sol r6 B1): the exact remainder, not its whole seconds (2.7 s left was floored to 1, under the guard's 2 s minimum, and a healthy hash never started)
                 $left = $TimeoutSec - $callClock.Elapsed.TotalSeconds
@@ -733,7 +745,8 @@ function Get-VenueStagedBuildManifest {
             # r7 adversary A2: the hash's end on the call's own clock, so the worker checks the minimum again before each file
             $hashEnd = $callClock.Elapsed.TotalSeconds + $artSec
             foreach ($it in $items) { $it.clock = $callClock; $it.endSec = $hashEnd; $it.minSec = $ArtifactMinSec }
-            $ar =Invoke-VenueBoundedRead -ScriptText $probe.ToString() -Argument $items -TimeoutSec $artSec
+            $probeText = $(if ($TestArtifactDelayMs -gt 0 -and $null -eq $ArtifactProbeScript) { "param(`$items)`n[Threading.Thread]::Sleep($TestArtifactDelayMs)`n& {" + $probe.ToString() + "`n} `$items" } else { $probe.ToString() })
+            $ar =Invoke-VenueBoundedRead -ScriptText $probeText -Argument $items -TimeoutSec $artSec
             if (-not $ar.answered) { return [pscustomobject]@{ state = 'UNREACHABLE'; sha256 = $null; path = $path; error = "the cached artifacts could not be hashed: $($ar.error)"; contentProblem = $null; artifactProblem = $null; artifactsUnhashed = $true } }
             $lines = @($ar.value | ForEach-Object { [string]$_ })
             $missing = @($lines | Where-Object { $_.StartsWith('MISSING:') } | ForEach-Object { $p = $_.Split(':', 3); "$($p[1]) $($p[2])" })

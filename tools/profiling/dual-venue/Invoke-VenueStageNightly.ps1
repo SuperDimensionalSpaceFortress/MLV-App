@@ -84,7 +84,8 @@ param(
     # Total wall-clock cap for everything after the plan. The default fits a cold night: a DLL-pair compile on Ultra-Magnus, a build-guarded assemble and two stages.
     [ValidateRange(10, 28800)][int]$MaxTotalSec = 7200,
     # r4 fix iteration (adversary pass 7 A2 on 24f85549): at least 5 s. The soundness read (Read-StagedSoundness) needs the manifest read PLUS -ArtifactMinSec (1 s)
-    # left to start hashing the artifacts inside one probe; at 1 s a healthy staged build was SHARE_UNREACHABLE on every run.
+    # left to start hashing the artifacts inside one probe; at 1 s a healthy staged build was SHARE_UNREACHABLE on every run. (r6, Grok G6/G7: the hash now has its
+    # own budget, 300 s inside the cap, and this bounds the manifest read; the floor stays.)
     [ValidateRange(5, 300)][int]$ProbeTimeoutSec = 30,
     [switch]$WhatIf,
     [string]$UmRunScript = '',
@@ -104,7 +105,12 @@ param(
     [ValidateRange(0, 60000)][int]$TestNotAfterSampleDelayMs = 0,
     # Test-only (VENUE-STAGE-SAME-SHA-RESTAGE-GUARD-1 r2): the call's first soundness read (r4: step 4's when a build.json is there, else step 8's) blocks its
     # worker this long first, as a read stuck on a dead SMB host does (Get-VenueStagedBuildManifest -TestReadDelayMs). Production passes none.
-    [ValidateRange(0, 600000)][int]$TestSoundnessReadDelayMs = 0
+    [ValidateRange(0, 600000)][int]$TestSoundnessReadDelayMs = 0,
+    # Test-only (r6, Grok G6/G7 on #814): the ARTIFACT HASH (not the manifest read) of one soundness read blocks this long first, as a slow SMB hash of a large
+    # cached package does (Get-VenueStagedBuildManifest -TestArtifactDelayMs): -TestSoundnessArtifactDelayAt first = the call's first soundness read, final = the
+    # final verify's. Production passes none.
+    [ValidateRange(0, 600000)][int]$TestSoundnessArtifactDelayMs = 0,
+    [ValidateSet('first', 'final')][string]$TestSoundnessArtifactDelayAt = 'first'
 )
 $ErrorActionPreference = 'Stop'
 $here = $PSScriptRoot
@@ -258,18 +264,23 @@ $PathByName = { param($p, $kind) if ($kind -eq 'dir') { Test-Path -LiteralPath $
 $DllReuseByName = { param($mod, $outbox, $id, $sha) Import-Module -Name $mod -Force; Get-DllPairReuse -Outbox $outbox -JobId $id -Sha $sha }
 $StageReuseByName = { param($mod, $path, $id, $sha, $kind) Import-Module -Name $mod -Force; Get-StageReuse -ResultPath $path -JobId $id -Sha $sha -Kind $kind }
 
-function Read-StagedSoundness([string]$When) {
+function Read-StagedSoundness([string]$When, [switch]$FinalVerify) {
     # THE ONE soundness read of this driver (step 4's "already in the cache" and step 8's reuse both take it): Get-VenueStagedBuildManifest -VerifyArtifacts, the
     # read the lease batch guards with and the one that embeds the leg's claim-shape predicate (Get-AttrCudaBuildManifestClaimSha256). Bounded like every share
     # probe here: r2 (A3 on 90b1c58e) by min(-ProbeTimeoutSec, what is left of -MaxTotalSec). r3 (adversary A2 on ce5a0380): STAGE_CAP_EXCEEDED only when the cap
     # really ran out during the read (under the 1 s Get-ProbeSec needs for any read); a read that failed with time left is an UNREACHABLE answer the caller types.
     $soundSec = Get-ProbeSec "the soundness of the staged build of $commit"
+    # r6 (Grok G6/G7 on #814): the manifest read keeps that probe bound, and the artifact hash (the package zip, exe and dll over SMB) gets its OWN budget, the
+    # lease batch plan preflight's (-ArtifactTimeoutSec 300, Invoke-VenueLeaseBatch.ps1), never past what is left of -MaxTotalSec (-CallCapSec). r4/r5 hashed all
+    # three inside the one 30 s probe, so a sound build whose package hashed slower than that was SHARE_UNREACHABLE at step 4 (G6) and at the final verify (G7).
+    $capSec = [Math]::Max(0.0, ($script:Deadline - [DateTime]::UtcNow).TotalSeconds)
     # the test-only -TestSoundnessReadDelayMs stalls the call's FIRST soundness read only (step 4's when a build.json is there, else step 8's), never the final verify's
     $script:SoundnessReads++
     $delayMs = $(if ($script:SoundnessReads -eq 1) { $TestSoundnessReadDelayMs } else { 0 })
-    $r = try { Get-VenueStagedBuildManifest -AgentShare $share -SourceCommit $commit -VerifyArtifacts -TimeoutSec $soundSec -TestReadDelayMs $delayMs } catch { [pscustomobject]@{ state = 'UNREACHABLE'; error = ($_.Exception.Message -replace '\s+', ' ') } }
+    $artDelayMs = $(if (($TestSoundnessArtifactDelayAt -ceq 'first' -and $script:SoundnessReads -eq 1) -or ($TestSoundnessArtifactDelayAt -ceq 'final' -and $FinalVerify)) { $TestSoundnessArtifactDelayMs } else { 0 })
+    $r = try { Get-VenueStagedBuildManifest -AgentShare $share -SourceCommit $commit -VerifyArtifacts -TimeoutSec $soundSec -ArtifactTimeoutSec 300 -CallCapSec $capSec -TestReadDelayMs $delayMs -TestArtifactDelayMs $artDelayMs } catch { [pscustomobject]@{ state = 'UNREACHABLE'; error = ($_.Exception.Message -replace '\s+', ' ') } }
     $leftAfter = ($script:Deadline - [DateTime]::UtcNow).TotalSeconds
-    if ($r.state -ceq 'UNREACHABLE' -and $leftAfter -lt 1.0) { Stop-Nightly 'STAGE_CAP_EXCEEDED' "the soundness read of the staged build of $commit $When got the rest of the $MaxTotalSec s cap ($([Math]::Round($soundSec, 2)) s) and the cap ran out with no answer ($([Math]::Floor([Math]::Max(0.0, $leftAfter) * 100.0) / 100.0) s left): $($r.error); nothing was submitted" }
+    if ($r.state -ceq 'UNREACHABLE' -and $leftAfter -lt 1.0) { Stop-Nightly 'STAGE_CAP_EXCEEDED' "the soundness read of the staged build of $commit $When ran to the end of the $MaxTotalSec s cap (the manifest read $([Math]::Round($soundSec, 2)) s, the artifact hash at most 300 s, $([Math]::Round($capSec, 2)) s in all) and the cap ran out with no answer ($([Math]::Floor([Math]::Max(0.0, $leftAfter) * 100.0) / 100.0) s left): $($r.error); nothing was submitted" }
     $r
 }
 
@@ -760,7 +771,7 @@ if (-not $final.present -or $final.hash -cne $expected) {
 # r4 fix iteration (adversary pass 7 A1 on 24f85549): the bytes are the expected ones, and they must also be a build a leg runs. A hash-only verify recorded
 # STAGE_OK for an unsound build that every reuse read had refused (the local build held the same unsound manifest, and the spent default JobId's
 # "cache holds the expected hash" fallback skipped the submission). STAGE_OK and STAGE_SKIP_ALREADY are recorded only for a SOUND staged build.
-$finalSound = Read-StagedSoundness 'at the final verify'
+$finalSound = Read-StagedSoundness 'at the final verify' -FinalVerify
 if ($finalSound.state -ceq 'UNREACHABLE') { Stop-Nightly 'SHARE_UNREACHABLE' "the soundness read of the staged build of $commit did not answer at the final verify: $($finalSound.error); not recorded as staged" }
 if (-not (Test-StagedSound $finalSound $final.hash)) {
     Stop-Nightly 'STAGE_VERIFY_MISMATCH' "the $Venue cache holds the expected $cacheBuildJson ($($final.hash)) but it is not a sound staged build ($(Format-StagedSoundness $finalSound)); never recorded as staged (the hub re-assembles)"

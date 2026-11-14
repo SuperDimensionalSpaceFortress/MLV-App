@@ -731,7 +731,8 @@ class VenueStageNightlyTests(unittest.TestCase):
         self.assertEqual(len(calls), 1, calls)
         self.assertIn("-TimeoutSec $soundSec ", calls[0])
         self.assertIn('$soundSec = Get-ProbeSec ', text)
-        self.assertNotIn("-ArtifactTimeoutSec", calls[0])
+        # r6 (Grok G6/G7 on #814): the artifact hash has its own budget, the plan preflight's 300 s (Invoke-VenueLeaseBatch.ps1), bounded by what is left of the cap
+        self.assertIn("-ArtifactTimeoutSec 300 -CallCapSec $capSec ", calls[0])
 
     def test_a_raced_in_build_the_leg_job_would_refuse_is_not_reused(self) -> None:
         # adversary A2 (b47fcfbc): the staged build.json names the sha and every artifact name is there, but the cached exe does not hash to its digest.
@@ -915,6 +916,41 @@ class VenueStageNightlyTests(unittest.TestCase):
         self.assertEqual(self.rows(), [])
         ok = self.run_driver(probe="5")
         self.assert_exit(ok, "STAGE_SKIP_ALREADY")
+
+    # ---------------------------------------------------------------- r6 (Grok G6/G7 on #814, RED first)
+    def test_the_final_verify_artifact_hash_past_the_probe_timeout_with_cap_left_is_stage_ok(self) -> None:
+        # G7: the final verify takes the one soundness read, whose artifact hash shared min(-ProbeTimeoutSec, cap left) with the manifest read. A real stage
+        # landed, the share needed longer than -ProbeTimeoutSec to hash the cached package, and the night ended SHARE_UNREACHABLE with its manifest dropped.
+        # The hash has its own budget (the plan preflight's 300 s), bounded by what is left of -MaxTotalSec: STAGE_OK, with the manifest recorded.
+        p = self.run_driver("-TestSoundnessArtifactDelayMs", "8000", "-TestSoundnessArtifactDelayAt", "final", probe="5")
+        self.assert_exit(p, "STAGE_OK")
+        cache_hash = sha256(self.share / "cache" / names()["build"])
+        r = self.rows()[-1]
+        self.assertEqual((r["outcome"], r["buildManifestSha256"]), ("STAGE_OK", cache_hash))
+        self.assertIn(f"manifest={cache_hash}", p.stdout)
+
+    def test_step4_artifact_hash_past_the_probe_timeout_with_cap_left_is_skip_already(self) -> None:
+        # G6: an already soundly staged sha whose cached package hashes slower than -ProbeTimeoutSec over the share is STAGE_SKIP_ALREADY, never SHARE_UNREACHABLE
+        bj = self.stage_cache()
+        p = self.run_driver("-TestSoundnessArtifactDelayMs", "8000", probe="5")
+        self.assert_exit(p, "STAGE_SKIP_ALREADY")
+        self.nothing_built_or_submitted()
+        self.assertEqual(self.rows()[-1]["buildManifestSha256"], sha256(bj))
+
+    def test_the_artifact_hash_budget_is_still_bounded_by_the_cap(self) -> None:
+        # G6/G7: the hash's own budget never runs past -MaxTotalSec. A hash the cap cuts short is STAGE_CAP_EXCEEDED (as a manifest read the cap cuts short
+        # is), whether the cap is under -ProbeTimeoutSec or over it; nothing is reserved, built or submitted, and the call ends near the cap.
+        self.stage_cache()
+        for cap, probe in (("12", "60"), ("20", "5")):
+            with self.subTest(cap=cap, probe=probe):
+                self.calls_log.unlink(missing_ok=True)
+                t0 = time.monotonic()
+                p = self.run_driver("-TestSoundnessArtifactDelayMs", "60000", "-MaxTotalSec", cap, probe=probe)
+                took = time.monotonic() - t0
+                self.assert_exit(p, "STAGE_CAP_EXCEEDED")
+                self.nothing_built_or_submitted()
+                self.assertNotIn("STAGE_RESERVED", [r["outcome"] for r in self.rows()])
+                self.assertLess(took, int(cap) + 10, f"the call ran {took:.1f} s against a {cap} s cap")
 
     def test_a_cache_hash_that_differs_after_stage_ok_is_a_verify_mismatch(self) -> None:
         p = self.run_driver(env={"FAKE_UMRUN_STAGE": "wrongcache"})
