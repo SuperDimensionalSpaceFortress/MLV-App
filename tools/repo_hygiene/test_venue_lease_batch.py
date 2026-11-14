@@ -91,6 +91,12 @@ switch ($mode) {
     'COOLDOWN' { "COOLDOWN_UNMET mean=32.0% threshold=$ThresholdPercent% waitedSec=1"; exit 0 }
     'FOREIGN' { 'FOREIGN_FLOOR owners=explorer:1,textinputhost:2,bloody7:3 floorMean=32.0% waitedSec=1 probes=3'; "COOLDOWN_UNMET mean=32.0% threshold=$ThresholdPercent% waitedSec=1"; exit 0 }
     'BUSY' { 'GATE_BUSY quiet-probe waitedSec=1'; exit 3 }
+    'PASTDEADLINE' {
+        # LEASE-BATCH-IDLE-END-UNSEEN-1 A1: a probe that returns QUIET only after the run's deadline (FAKE_DEADLINE_UTC): the time the runner spends between the probe and the leg's launch
+        $until = [DateTime]::Parse($env:FAKE_DEADLINE_UTC, [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::AdjustToUniversal).AddSeconds(1)
+        while ([DateTime]::UtcNow -lt $until) { Start-Sleep -Milliseconds 100 }
+        "QUIET mean=5.0% threshold=$ThresholdPercent% waitedSec=1"; exit 0
+    }
     'IDLE' {
         # LEASE-BATCH-IDLE-END-UNSEEN-1: the wait outlasted the agent's idle bound (it submitted no job for 300 s): the agent released the parked batch lease and wrote its receipt line
         # (endReason=idle, ultra-magnus-agent.ps1 Close-LeaseBatch), and the probe still reads QUIET.
@@ -758,6 +764,18 @@ class VenueLeaseBatchRunnerTests(unittest.TestCase):
         b1 = self.batches()[0]
         self.assertEqual((b1["endReason"], b1["legsRan"], b1["legsCounted"]), ("LEASE_IDLE_ENDED", 1, 0), b1)
         self.assertEqual((b1["legs"][0]["class"], b1["legs"][0]["counted"], b1["legs"][0]["onLease"]), ("LEASE_IDLE_ENDED", False, False), b1["legs"][0])
+
+    def test_a_leg_never_launches_after_the_run_deadline_passed_between_its_probe_and_its_launch(self) -> None:
+        # adversary A1 (adversary-7ce11cb9.json): the launch guard checked the claim and the lease's room only, so the receipt read after a probe (or any slow guard) could carry the
+        # run past -DeadlineUtc and the leg still launched. The launch is the dispatch: a passed deadline starts nothing (DEADLINE, exit 3, the leg goes unrun).
+        dl = utc_iso(datetime.now(timezone.utc) + timedelta(seconds=25))
+        r = self.run_batch(self.specs[:1], "-DeadlineUtc", dl, FAKE_QUIET_MODES="PASTDEADLINE", FAKE_DEADLINE_UTC=dl)
+        self.assertEqual(r.returncode, 3, r.stdout + r.stderr)
+        b = self.batches()[0]
+        self.assertEqual((b["endReason"], b["legsAttempted"], b["legsRan"]), ("DEADLINE", 0, 0), b)
+        self.assertNotIn("LEG:fx-a", " ".join(k.rsplit(":", 1)[0] for k in self.kinds()), self.kinds())
+        res = batch_result(r.stdout)
+        self.assertEqual((res["exitCode"], res["stopReason"], res["ran"], res["notRun"]), (3, "DEADLINE", 0, 1))
 
     def test_a_lost_lease_with_no_idle_receipt_is_still_lease_lost(self) -> None:
         # control: the typed idle end needs the agent's endReason=idle line for THIS lease; another end reason on it leaves LEASE_LOST as it was

@@ -1648,7 +1648,7 @@ function Get-LeaseIdleEnd([string]$Token, [string]$LeaseId) {
     # an unreadable share is no evidence, and the leg's own admission still types a lost lease after it runs).
     if ([string]::IsNullOrWhiteSpace($LeaseId)) { return $null }
     $ar = Read-VenueLeaseBatchReceipt -AgentShare $AgentShare -Token $Token -LeaseId $LeaseId
-    if ($ar.state -ceq 'FOUND' -and [string]::Equals([string]$ar.record.endReason, 'idle', [StringComparison]::Ordinal)) { return $ar.record }
+    if ($ar.state -ceq 'FOUND' -and $ar.record.endReason -is [string] -and [string]::Equals([string]$ar.record.endReason, 'idle', [StringComparison]::Ordinal)) { return $ar.record }   # exact scalar only (adversary A2: a one-element array casts to 'idle')
     $null
 }
 
@@ -2312,6 +2312,12 @@ while ($pending.Count -gt 0 -and $null -eq $stopReason) {
                 # claim and the lease's room are asked again HERE: a lost claim, or less room than the leg's budget, starts nothing (the leg goes to the next batch)
                 $cl = Get-VenueClaimKeeperLoss -Keeper $claimKeeper -ClaimExpiresUtc $claim.expiresUtc
                 $roomAtLaunch = [int](($leaseEnd - [DateTime]::UtcNow).TotalSeconds) - $LeaseMarginSec
+                # LEASE-BATCH-IDLE-END-UNSEEN-1 (adversary A1): and the run's deadline, so the receipt read after the probe (or any slow guard) cannot carry the run past it into a launch
+                if ([DateTime]::UtcNow -ge $deadline) {
+                    $b.legsAttempted--; $b.endReason = 'DEADLINE'; $b.endDetail = "at the launch of leg $($leg.name): the run deadline passed (deadline=$($deadline.ToString('o'))): no leg launched"
+                    L "DEADLINE batch=$batchNo leg=$($leg.name) phase=launch (the run deadline passed after the probe: no leg launched)"; Set-Stop 'DEADLINE' 3
+                    break
+                }
                 if ($cl -or $roomAtLaunch -lt $legBudget) {
                     $b.legsAttempted--; $launchShort = -not $cl
                     if ($cl) { $b.endReason = 'CLAIM_LOST'; $b.endDetail = "at the launch of leg $($leg.name): $($cl.detail)"; L "CLAIM_LOST batch=$batchNo leg=$($leg.name) phase=launch $($cl.detail)" }
