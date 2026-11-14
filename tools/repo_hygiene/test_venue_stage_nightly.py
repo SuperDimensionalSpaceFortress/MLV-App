@@ -114,12 +114,18 @@ $bj = Join-Path $OutDir "playback-attr-3-cuda-$s-build.json"
 # assembledAtUtc makes every assemble a NEW manifest, exactly like the real assembler (assemble.ps1:411)
 [IO.File]::WriteAllText($bj, (@{ sourceCommit = $SourceCommit; assembledAtUtc = [DateTime]::UtcNow.ToString('o'); nonce = [guid]::NewGuid().ToString('N') } | ConvertTo-Json -Compress))
 $h = (Get-FileHash -LiteralPath $bj -Algorithm SHA256).Hash.ToLowerInvariant()
-# racestage (VENUE-STAGE-SAME-SHA-RESTAGE-GUARD-1): while this assemble ran, ANOTHER stager staged this sha (its own assemble) into $env:FAKE_RACE_CACHE
-if ($env:FAKE_ASSEMBLE -eq 'racestage') {
-    foreach ($n in "MLVApp-playback-attr-3-cuda-$s.exe", "igpu_recon_cuda-playback-attr-3-cuda-$s.dll", "MLVApp-playback-attr-3-cuda-$s-pkg.zip") {
-        Set-Content -LiteralPath (Join-Path $env:FAKE_RACE_CACHE $n) -Value "racer $n"
+# racestage (VENUE-STAGE-SAME-SHA-RESTAGE-GUARD-1): while this assemble ran, ANOTHER stager staged this sha (its own assemble) into $env:FAKE_RACE_CACHE,
+# a build the leg job accepts (manifest fields + artifact digests). racestage-corrupt: the same, then the cached exe no longer hashes to its digest.
+if ($env:FAKE_ASSEMBLE -like 'racestage*') {
+    $claims = @{}
+    foreach ($pair in @(@('exe', "MLVApp-playback-attr-3-cuda-$s.exe"), @('dll', "igpu_recon_cuda-playback-attr-3-cuda-$s.dll"), @('packageZip', "MLVApp-playback-attr-3-cuda-$s-pkg.zip"))) {
+        $p = Join-Path $env:FAKE_RACE_CACHE $pair[1]
+        [IO.File]::WriteAllText($p, "racer $($pair[1])")
+        $claims[$pair[0]] = [ordered]@{ name = $pair[1]; sha256 = (Get-FileHash -LiteralPath $p -Algorithm SHA256).Hash.ToLowerInvariant() }
     }
-    [IO.File]::WriteAllText((Join-Path $env:FAKE_RACE_CACHE "playback-attr-3-cuda-$s-build.json"), (@{ sourceCommit = $SourceCommit; assembledAtUtc = 'racer' } | ConvertTo-Json -Compress))
+    if ($env:FAKE_ASSEMBLE -eq 'racestage-corrupt') { [IO.File]::WriteAllText((Join-Path $env:FAKE_RACE_CACHE "MLVApp-playback-attr-3-cuda-$s.exe"), 'corrupt') }
+    $rm = [ordered]@{ sourceCommit = $SourceCommit; assembledAtUtc = 'racer'; dllPairManifestSha256 = ('b' * 64); pendingSymbolPresence = $true; packageZip = $claims.packageZip; exe = $claims.exe; dll = $claims.dll }
+    [IO.File]::WriteAllText((Join-Path $env:FAKE_RACE_CACHE "playback-attr-3-cuda-$s-build.json"), ($rm | ConvertTo-Json -Compress -Depth 4))
 }
 "RESULT=ASSEMBLE_OK SOURCE=$SourceCommit EXE=x DLL=x PKG=x MANIFEST=playback-attr-3-cuda-$s-build.json MANIFEST_SHA256=$h OUT=$OutDir"
 exit 0
@@ -663,6 +669,16 @@ class VenueStageNightlyTests(unittest.TestCase):
         self.assertRegex(p.stdout, rf"(?m)STAGE_REUSED_EXISTING sha={S12} manifest={racer[:8]} ")
         r = self.rows()[-1]
         self.assertEqual((r["outcome"], r["buildManifestSha256"], r["steps"]["stage"]), ("STAGE_OK", racer, "reused-existing"))
+
+    def test_a_raced_in_build_the_leg_job_would_refuse_is_not_reused(self) -> None:
+        # adversary A2 (b47fcfbc): the staged build.json names the sha and every artifact name is there, but the cached exe does not hash to its digest.
+        # Reusing it would record STAGE_OK for a build every leg refuses; it goes to the stage job instead (which replaces only an unsound build).
+        p = self.run_driver(env={"FAKE_ASSEMBLE": "racestage-corrupt", "FAKE_RACE_CACHE": str(self.share / "cache")})
+        self.assert_exit(p, "STAGE_OK")
+        self.assertNotIn("STAGE_REUSED_EXISTING", p.stdout)
+        self.assertEqual(len([c for c in self.submissions() if "job=playback-attr-3-cuda-stage-" in c]), 1, self.submissions())
+        self.assertEqual(sha256(self.share / "cache" / names()["build"]), self.assembled_manifest_sha())
+        self.assertIn("BUILD_ARTIFACT_MISMATCH", p.stdout)
 
     def test_a_cache_hash_that_differs_after_stage_ok_is_a_verify_mismatch(self) -> None:
         p = self.run_driver(env={"FAKE_UMRUN_STAGE": "wrongcache"})

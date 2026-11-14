@@ -613,8 +613,19 @@ if ($buildInCache) {
     # VENUE-STAGE-SAME-SHA-RESTAGE-GUARD-1: the assemble can take hours, and another stager may have staged this sha meanwhile (2026-11-13: a second
     # lane's stage of 23a07757 replaced the manifest a running lease batch had pinned). A staged build is reused, never replaced: this call's own
     # assemble is left unstaged and the staged manifest is the one recorded. (The stage job refuses a replacement on the host as well.)
+    # Reused only when SOUND: Get-VenueStagedBuildManifest -VerifyArtifacts, the read the lease batch guards with, finds no content or artifact problem
+    # and the same manifest bytes. Anything else (unsound, changed, or a read that did not answer) goes to the stage job, which replaces only an
+    # unsound build and refuses to replace a sound one (exit 7, STAGE_FAILED here, nothing written).
     $again = Read-CachedBuild
+    $sound = $null
     if ($again.inCache) {
+        $sound = Get-VenueStagedBuildManifest -AgentShare $share -SourceCommit $commit -VerifyArtifacts -TimeoutSec ([double][Math]::Min(600, [Math]::Max(1, (Get-RemainingSec) - 60)))
+        if (-not ($sound.state -ceq 'STAGED' -and $sound.contentProblem -ceq '' -and $sound.artifactProblem -ceq '' -and $sound.sha256 -ceq $again.cached.hash)) {
+            Say "the $Venue cache holds a build of $commit that is not reused: state=$($sound.state) manifest=$($sound.sha256) content=[$($sound.contentProblem)] artifacts=[$($sound.artifactProblem)] error=[$($sound.error)]; staging this call's build (the stage job replaces only an unsound build)"
+            $sound = $null
+        }
+    }
+    if ($null -ne $sound) {
         $submit = $false
         $expected = $again.cached.hash
         $script:Row.steps.stage = 'reused-existing'

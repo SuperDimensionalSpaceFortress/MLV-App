@@ -47,8 +47,8 @@
 # A suffix never replaces a SOUND staged build of the sha (VENUE-STAGE-SAME-SHA-RESTAGE-GUARD-1): the
 # job reuses it when the manifest bytes are the same (STAGE_REUSED_EXISTING, exit 0) and refuses
 # otherwise (STAGE_REFUSED_STAGED_OTHER_MANIFEST, exit 7), writing nothing into the cache either way.
-# Only a staged build that is not sound (another sha, unparseable, an artifact missing or different)
-# is replaced.
+# Sound means what the leg job accepts (Assert-AttrCudaBuildManifest plus the three artifact hashes);
+# only a staged build the leg job would refuse is replaced.
 
 [CmdletBinding()]
 param(
@@ -156,7 +156,10 @@ $embeddedFunctions = Get-AttrCudaEmbeddedFunctionSource -Name @(
     'Get-AttrCudaOwnershipProof',
     'New-AttrCudaOwnedRoot',
     'New-AttrCudaOwnedFileStream',
-    'Remove-AttrCudaInputFileByContent'
+    'Remove-AttrCudaInputFileByContent',
+    # VENUE-STAGE-SAME-SHA-RESTAGE-GUARD-1: a staged build is "sound" exactly when the leg job's own
+    # manifest check (playback-attr-3-cuda-job.ps1) accepts it.
+    'Assert-AttrCudaBuildManifest'
 )
 
 if (-not (Test-Path -LiteralPath $OutDir)) { New-Item -ItemType Directory -Path $OutDir -Force | Out-Null }
@@ -335,26 +338,38 @@ if ($VerifyOnly) {
 # stage replaced the manifest a running lease batch had pinned (ad005766 -> f8fc75a2), so the batch
 # ended BUILD_MANIFEST_MISMATCH and lost a leg. Every stager reaches the cache only through this job,
 # and the agent runs inbox jobs one at a time, so the rule is held here, before the first cache write.
-# SOUND = the cached build.json names this sha and each of the three cached artifacts hashes to its
-# claim (what the leg job checks). A sound staged build with these exact manifest bytes is reused
-# (STAGE_REUSED_EXISTING, exit 0); with any other manifest it is refused (exit 7). Neither writes the
-# cache; both remove this job's own verified inputs from the inbox by content. A build.json that is
-# not sound (another sha, unparseable, an artifact missing or different) is replaced as before.
+# SOUND = exactly what the leg job (playback-attr-3-cuda-job.ps1) accepts before it runs: the cached
+# build.json passes Assert-AttrCudaBuildManifest (this sha, a well-formed dllPairManifestSha256, a
+# boolean pendingSymbolPresence), and each of the three cached artifacts, by its derived name, hashes
+# to the manifest's packageZip / exe / dll sha256. A sound staged build with these exact manifest
+# bytes is reused (STAGE_REUSED_EXISTING, exit 0); with any other manifest it is refused (exit 7).
+# Neither writes the cache; both remove this job's own verified inputs from the inbox by content. A
+# build.json the leg job would refuse anyway is not a build anyone can run, so it is replaced as before.
 if (Test-Path -LiteralPath $manifestCachePath) {
     $stagedSha = ''
     $unsound = ''
     try {
         $stagedSha = Get-ShaLower $manifestCachePath
-        $stagedText = Get-Content -Raw -LiteralPath $manifestCachePath
-        $staged = try { $stagedText | ConvertFrom-Json } catch { $null }
-        if ($null -eq $staged) { $unsound = 'it is not JSON' }
-        elseif ([string]$staged.sourceCommit -cne $SourceCommit) { $unsound = "it declares sourceCommit '$($staged.sourceCommit)'" }
-        foreach ($item in $sideFiles) {
-            if ($unsound) { break }
-            $claim = @($staged.packageZip, $staged.exe, $staged.dll) | Where-Object { $null -ne $_ -and [string]$_.name -ceq [string]$item.name } | Select-Object -First 1
-            if ($null -eq $claim) { $unsound = "it claims no $($item.name)" }
-            elseif (-not (Test-Path -LiteralPath ([string]$item.cachePath) -PathType Leaf)) { $unsound = "$($item.name) is not in the cache" }
-            elseif ((Get-ShaLower ([string]$item.cachePath)) -ne ([string]$claim.sha256).ToLowerInvariant()) { $unsound = "the cached $($item.name) differs from its claim" }
+        $staged = $null
+        try {
+            $staged = Assert-AttrCudaBuildManifest -Path $manifestCachePath -ExpectedSha256 $stagedSha -ExpectedSourceCommit $SourceCommit
+        } catch {
+            # Only the leg job's own content refusals make a staged build unsound; a read that failed is not a verdict (outer catch: refused).
+            if ([string]$_.Exception.Message -notmatch '^ATTRCUDA_BUILD_MANIFEST_(UNPARSEABLE|COMMIT_MISMATCH|DLLPAIR_UNBOUND|SYMBOL_PRESENCE_INVALID) ' -and
+                $_.Exception -isnot [ArgumentException]) { throw }
+            $unsound = ([string]$_.Exception.Message -replace '\s+', ' ')
+        }
+        if (-not $unsound) {
+            $cachePathByName = @{}
+            foreach ($item in $sideFiles) { $cachePathByName[[string]$item.name] = [string]$item.cachePath }
+            foreach ($check in @(@('packageZip', $derived.packageZipName), @('exe', $derived.exeName), @('dll', $derived.reconName))) {
+                $claimProperty = $staged.PSObject.Properties[$check[0]]
+                $claimSha = if ($null -ne $claimProperty -and $null -ne $claimProperty.Value -and $null -ne $claimProperty.Value.PSObject.Properties['sha256']) { [string]$claimProperty.Value.sha256 } else { '' }
+                $cachedPath = $cachePathByName[[string]$check[1]]
+                if ([string]::IsNullOrWhiteSpace($claimSha)) { $unsound = "it carries no sha256 for $($check[0])"; break }
+                if (-not (Test-Path -LiteralPath $cachedPath -PathType Leaf)) { $unsound = "$($check[1]) is not in the cache"; break }
+                if ((Get-ShaLower $cachedPath) -ne $claimSha.ToLowerInvariant()) { $unsound = "the cached $($check[1]) differs from the manifest's $($check[0]) sha256"; break }
+            }
         }
     } catch {
         # A staged build this job cannot read is not one it may replace: fail closed, write nothing.

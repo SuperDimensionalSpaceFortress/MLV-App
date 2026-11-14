@@ -1025,12 +1025,18 @@ class StagedBuildNeverReplacedTests(_PwshCase):
         self.cache.mkdir(parents=True)
         self.manifest_name = f"playback-attr-3-cuda-{SHA_FIXTURE[:12]}-build.json"
 
-    def stage(self, tag: str, suffix: str = "") -> subprocess.CompletedProcess:
-        """Assemble (tag = which assemble) and stage the sha through the real generator and job."""
+    def stage(self, tag: str, suffix: str = "", mutate=None) -> subprocess.CompletedProcess:
+        """Assemble (tag = which assemble) and stage the sha through the real generator and job.
+
+        mutate(manifest_dict) edits the assembled build.json before the job is generated."""
         build = self.tmp / f"build-{tag}"
         staging = self.tmp / f"staging-{tag}-{suffix or 'default'}"
         staging.mkdir(parents=True)
         names = _fake_build_dir(build, SHA_FIXTURE, rebuild_tag=tag)
+        if mutate is not None:
+            manifest = json.loads((build / names["manifest"]).read_text(encoding="utf-8"))
+            mutate(manifest)
+            (build / names["manifest"]).write_text(json.dumps(manifest, indent=2), encoding="utf-8")
         script = self.tmp / f"generate-{tag}-{suffix or 'default'}.ps1"
         script.write_text(
             "$ErrorActionPreference = 'Stop'\n"
@@ -1105,6 +1111,31 @@ class StagedBuildNeverReplacedTests(_PwshCase):
         second = self.stage("f8fc75a2", suffix="fsgap202611131829")
 
         self.assertEqual(second.returncode, 0, f"{second.stdout}\n{second.stderr}")
+        self.assertEqual(self.manifest_sha(), hashlib.sha256((self.tmp / "build-f8fc75a2" / self.manifest_name).read_bytes()).hexdigest())
+
+    def test_a_staged_build_the_leg_job_accepts_is_sound_whatever_the_case_of_its_commit(self) -> None:
+        # adversary A1 (b47fcfbc): the stage and leg jobs compare sourceCommit case-insensitively, so an upper-case one is a build legs run
+        # and a lease can pin; it must be protected exactly like any other.
+        first = self.stage("ad005766", mutate=lambda m: m.update(sourceCommit=SHA_FIXTURE.upper()))
+        self.assertEqual(first.returncode, 0, f"{first.stdout}\n{first.stderr}")
+        before = self.snapshot()
+
+        second = self.stage("f8fc75a2", suffix="fsgap202611131829")
+
+        self.assertEqual(second.returncode, 7, f"{second.stdout}\n{second.stderr}")
+        self.assertIn("STAGE_REFUSED_STAGED_OTHER_MANIFEST", second.stdout)
+        self.assertEqual(self.snapshot(), before)
+
+    def test_a_staged_build_the_leg_job_refuses_for_its_dll_pair_binding_is_replaced(self) -> None:
+        # adversary A3 (b47fcfbc): Assert-AttrCudaBuildManifest refuses a build.json with no dllPairManifestSha256 (DLLPAIR_UNBOUND), so no leg can
+        # run it; a corrected stage must be able to replace it, not be refused.
+        first = self.stage("ad005766", mutate=lambda m: m.pop("dllPairManifestSha256"))
+        self.assertEqual(first.returncode, 0, f"{first.stdout}\n{first.stderr}")
+
+        second = self.stage("f8fc75a2", suffix="repair")
+
+        self.assertEqual(second.returncode, 0, f"{second.stdout}\n{second.stderr}")
+        self.assertIn("DLLPAIR_UNBOUND", second.stdout)
         self.assertEqual(self.manifest_sha(), hashlib.sha256((self.tmp / "build-f8fc75a2" / self.manifest_name).read_bytes()).hexdigest())
 
 
