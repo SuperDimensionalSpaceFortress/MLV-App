@@ -598,20 +598,26 @@ function Get-VenueSupplementaryIdle {
 }
 
 $script:VenueClaimShapeSource = $null
+$script:VenueClaimShapeError = $null
 function Get-VenueClaimShapeSource {
     # VENUE-STAGE-SAME-SHA-RESTAGE-GUARD-1 r3 (adversary A1 on ce5a0380): the verbatim text of Get-AttrCudaBuildManifestClaimSha256, extracted from AttrCudaArtifacts.psm1 by
     # the same contract Get-AttrCudaEmbeddedFunctionSource embeds it into the leg and stage jobs with ("function <Name> {" ... "}" at column 0). Read as text, never imported:
     # this module imports nothing from the bachelor tree. A missing function is an error, never a silently different predicate.
-    if ($null -eq $script:VenueClaimShapeSource) {
-        # r5 (CI run 43580040634): a module that will not read is a typed refusal naming the file, never a bare ReadAllText exception
-        $srcPath = Join-Path $PSScriptRoot '..\bachelor\AttrCudaArtifacts.psm1'
-        $src = try { [IO.File]::ReadAllText($srcPath) } catch { throw "VENUE_CLAIM_PREDICATE_UNREADABLE the claim-shape predicate's module $srcPath could not be read: $($_.Exception.Message -replace '\s+', ' ')" }
-        $mm = [regex]::Match($src, '(?ms)^function\s+Get-AttrCudaBuildManifestClaimSha256\s*\{.*?^\}')
-        if (-not $mm.Success) { throw 'VENUE_CLAIM_PREDICATE_MISSING AttrCudaArtifacts.psm1 defines no extractable Get-AttrCudaBuildManifestClaimSha256' }
-        $script:VenueClaimShapeSource = $mm.Value
-    }
+    # r10 fix iteration (adversary A1 on a4b659de): the file is read ONCE, when this module is imported (below), never inside a bounded call: the first
+    # Get-VenueStagedBuildManifest read it on the caller's thread before its -CallCapSec check, so a slow share held a 5 s call for as long as the read took.
+    # A read that failed at import is that same typed refusal on every later call, with no new read.
+    if ($null -ne $script:VenueClaimShapeSource) { return $script:VenueClaimShapeSource }
+    if ($null -ne $script:VenueClaimShapeError) { throw $script:VenueClaimShapeError }
+    # r5 (CI run 43580040634): a module that will not read is a typed refusal naming the file, never a bare ReadAllText exception
+    $srcPath = Join-Path $PSScriptRoot '..\bachelor\AttrCudaArtifacts.psm1'
+    $src = try { [IO.File]::ReadAllText($srcPath) } catch { $script:VenueClaimShapeError = "VENUE_CLAIM_PREDICATE_UNREADABLE the claim-shape predicate's module $srcPath could not be read: $($_.Exception.Message -replace '\s+', ' ')"; throw $script:VenueClaimShapeError }
+    $mm = [regex]::Match($src, '(?ms)^function\s+Get-AttrCudaBuildManifestClaimSha256\s*\{.*?^\}')
+    if (-not $mm.Success) { $script:VenueClaimShapeError = 'VENUE_CLAIM_PREDICATE_MISSING AttrCudaArtifacts.psm1 defines no extractable Get-AttrCudaBuildManifestClaimSha256'; throw $script:VenueClaimShapeError }
+    $script:VenueClaimShapeSource = $mm.Value
     $script:VenueClaimShapeSource
 }
+# r10 fix iteration (adversary A1 on a4b659de): read at import, outside every caller's clock; a failure is kept and refused by the call that needs it
+try { [void](Get-VenueClaimShapeSource) } catch { }
 
 function Get-VenueStagedBuildManifest {
     <#
@@ -635,7 +641,9 @@ function Get-VenueStagedBuildManifest {
         # The stage nightly passes what is left of its -MaxTotalSec, so a 300 s hash never runs past the call's own cap.
         [ValidateRange(0.0, 86400.0)][double]$CallCapSec = 0,
         # Test-only (r6): the default artifact hash first blocks its worker this long, as a slow SMB hash of a large cached package does. Production passes none.
-        [ValidateRange(0, 600000)][int]$TestArtifactDelayMs = 0)
+        [ValidateRange(0, 600000)][int]$TestArtifactDelayMs = 0,
+        # Test-only (r10, adversary A3 on e9e6c210): the call's own thread waits this long before the manifest read, as time spent preparing it does. Production passes none.
+        [ValidateRange(0, 600000)][int]$TestPreReadDelayMs = 0)
     # -ArtifactTimeoutSec 0 (the default): the artifact hash gets what is left of -TimeoutSec after the manifest read (under -ArtifactMinSec left, no hash: UNREACHABLE), so the whole call stays inside -TimeoutSec, as
     # every caller that passes 30 relies on. A caller that can afford more (the pre-claim plan preflight) or must afford less (the post-claim guard) says so.
     # r7 (sol r6 B1): -TimeoutSec and what is left of it are seconds with their fraction, never floored: the lease batch guard hands over a 2.8 s remainder as 2.8.
@@ -678,6 +686,7 @@ function Get-VenueStagedBuildManifest {
         } else { $read.ToString() })
     # r6 fix iteration (adversary A2 on 424df284): -CallCapSec bounds the WHOLE call, the manifest read too (it bounded only the hash, so a read stuck past the cap
     # answered NOT_STAGED after it). Under 1 s of it (the least a read can be given) there is no read: UNREACHABLE.
+    if ($TestPreReadDelayMs -gt 0) { [Threading.Thread]::Sleep($TestPreReadDelayMs) }
     $readSec = $TimeoutSec
     # r10 (adversary A3 on e9e6c210): the end of the call's bound on its own clock (-TimeoutSec, or -CallCapSec when sooner), what an unbounded hash is given what is left of.
     # $readSec is a remainder already (the cap less the time before the read), so the hash's remainder taken from it counted that time twice.

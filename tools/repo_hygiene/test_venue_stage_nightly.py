@@ -1046,19 +1046,30 @@ class VenueStageNightlyTests(unittest.TestCase):
 
     def test_r10_a3_the_time_before_the_read_is_counted_once(self) -> None:
         # r10 (adversary A3 on e9e6c210, VenueChain.psm1:749): with -ArtifactTimeoutSec 0 and -CallCapSec, the hash got $readSec - elapsed, and $readSec was
-        # already min(-TimeoutSec, what was left of -CallCapSec), so the time spent before the read was subtracted twice. Join-Path (in the first
-        # Get-VenueClaimShapeSource call, before the read) is shadowed to take 4 s: 20 - 4 - read is left, over -ArtifactMinSec 12; the double count left ~11.
+        # already min(-TimeoutSec, what was left of -CallCapSec), so the time spent before the read was subtracted twice. The test-only -TestPreReadDelayMs
+        # spends 4 s before the read: 20 - 4 - read is left, over -ArtifactMinSec 12; the double count left ~11 (RED: "11.79 s left, under 12").
         share = self.case / "a3-share"
         (share / "cache").mkdir(parents=True)
         claim = {k: {"name": f"{k}.bin", "sha256": c * 64} for k, c in (("packageZip", "a"), ("exe", "b"), ("dll", "c"))}
         (share / "cache" / f"playback-attr-3-cuda-{SHA[:12]}-build.json").write_text(
             json.dumps({"sourceCommit": SHA, "dllPairManifestSha256": "d" * 64, "pendingSymbolPresence": True, **claim}), encoding="utf-8")
         ps = (f"Import-Module '{DRIVER.parent / 'VenueChain.psm1'}' -Force -DisableNameChecking; "
-              "function global:Join-Path { [Threading.Thread]::Sleep(4000); Microsoft.PowerShell.Management\\Join-Path @args }; "
               f"$r = Get-VenueStagedBuildManifest -AgentShare '{share}' -SourceCommit '{SHA}' -TimeoutSec 20 -CallCapSec 20 -ArtifactMinSec 12 -VerifyArtifacts "
-              "-ArtifactProbeScript { param($items) }; 'STATE=' + $r.state + ' ARTIFACT=[' + $r.artifactProblem + '] ERROR=[' + $r.error + ']'")
+              "-TestPreReadDelayMs 4000 -ArtifactProbeScript { param($items) }; 'STATE=' + $r.state + ' ARTIFACT=[' + $r.artifactProblem + '] ERROR=[' + $r.error + ']'")
         p = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", ps], capture_output=True, text=True, timeout=120, stdin=subprocess.DEVNULL)
         self.assertIn("STATE=STAGED ARTIFACT=[] ERROR=[]", p.stdout, p.stdout + p.stderr)
+
+    def test_r10_a1_the_predicate_source_is_never_read_inside_a_capped_call(self) -> None:
+        # r10 fix iteration (adversary A1 on a4b659de, VenueChain.psm1:677/:608): the first Get-VenueStagedBuildManifest read AttrCudaArtifacts.psm1 for the
+        # claim-shape predicate on the caller's thread, before its -CallCapSec check, so a slow share held a 5 s call as long as the read took. Join-Path (on
+        # that read's path) is shadowed to take 6 s from before the import: the import may take it, the 5 s call may not.
+        ps = ("function global:Join-Path { [Threading.Thread]::Sleep(6000); Microsoft.PowerShell.Management\\Join-Path @args }; "
+              f"Import-Module '{DRIVER.parent / 'VenueChain.psm1'}' -Force -DisableNameChecking; $sw = [Diagnostics.Stopwatch]::StartNew(); "
+              f"$r = Get-VenueStagedBuildManifest -AgentShare '{self.case / 'a1-absent-root'}' -SourceCommit '{SHA}' -TimeoutSec 5 -CallCapSec 5 -VerifyArtifacts; "
+              "'STATE=' + $r.state; 'SEC=' + $sw.Elapsed.TotalSeconds.ToString('0.000', [Globalization.CultureInfo]::InvariantCulture)")
+        p = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", ps], capture_output=True, text=True, timeout=180, stdin=subprocess.DEVNULL)
+        self.assertIn("STATE=NOT_STAGED", p.stdout, p.stdout + p.stderr)
+        self.assertLess(float(re.search(r"SEC=([0-9.]+)", p.stdout).group(1)), 5.0, p.stdout)
 
     def test_a_cache_hash_that_differs_after_stage_ok_is_a_verify_mismatch(self) -> None:
         p = self.run_driver(env={"FAKE_UMRUN_STAGE": "wrongcache"})
