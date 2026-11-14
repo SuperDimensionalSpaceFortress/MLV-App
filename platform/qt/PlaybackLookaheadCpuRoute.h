@@ -112,8 +112,13 @@ private:
 /*! Frames past requestedFrame that lookahead \a k ( 1..depth ) asks for. The texture route (\a cpuRoute false) is
  *  k exactly. The CPU route is floor( \a positionFraction + k x \a strideFrames ), which is never less than k and
  *  strictly increases with k. \a positionFraction is the drop-frame position minus requestedFrame; a value
- *  outside [0, 1) or a non-finite one counts as 0. \a strideFrames is clamped to [1, kMaxStrideFrames], and a non-finite value counts as 1. */
-inline int lookaheadOffsetFrames( int k, bool cpuRoute, double positionFraction, double strideFrames )
+ *  outside [0, 1) or a non-finite one counts as 0. \a strideFrames is clamped to [1, kMaxStrideFrames], and a non-finite value counts as 1.
+ *  r5 (adversary A1 on fcce2b40): the sum is the engine's own, in double, on the ABSOLUTE position \a requestedFrame + fraction
+ *  (advanceDropFrameTick adds its delta to m_newPosDropMode), so its rounding is the engine's: 127.99999999999999 + 1.0 is
+ *  129.0, an offset of 2, not 1. requestedFrame + fraction is exact when fraction = position - requestedFrame and
+ *  requestedFrame = floor( position ) >= 0 (Sterbenz), as MainWindow passes it. This reverses c7953c66's A2 (exact
+ *  integers) on purpose: that pass's own input still gives frame 4 (1.9999999999999998 + 2.15625 = 4.15625). */
+inline int lookaheadOffsetFrames( int k, bool cpuRoute, double positionFraction, double strideFrames, int requestedFrame = 0 )
 {
     if( !cpuRoute || k <= 0 ) return k;
     double fraction = std::isfinite( positionFraction ) ? positionFraction : 0.0;
@@ -122,11 +127,14 @@ inline int lookaheadOffsetFrames( int k, bool cpuRoute, double positionFraction,
     double stride = std::isfinite( strideFrames ) ? strideFrames : kMinStrideFrames;
     if( stride < kMinStrideFrames ) stride = kMinStrideFrames;
     if( stride > kMaxStrideFrames ) stride = kMaxStrideFrames;
-    const int offset = static_cast<int>( std::floor( fraction + static_cast<double>( k ) * stride ) );
+    const double base = static_cast<double>( requestedFrame );
+    const double offset = std::floor( ( base + fraction ) + static_cast<double>( k ) * stride ) - base;
     // r4 fix iteration 1 (adversary A3 on 05511dac): 0.9999999999999999 + 3.0 rounds to 4.0 in double, so the floor is
-    // capped at k x kMaxStrideFrames: a request never lands past the prune window it must stay inside.
-    if( offset > k * kMaxStrideFrames ) return k * kMaxStrideFrames;
-    return offset < k ? k : offset;
+    // capped at k x kMaxStrideFrames: a request never lands past the prune window it must stay inside. This integer cap
+    // is the only one left (r5): it binds only where the engine's rounded advance passes k x kMaxStrideFrames, which
+    // needs a stride of ~3 (a stall) and a position within an ulp of the next frame.
+    if( offset > static_cast<double>( k * kMaxStrideFrames ) ) return k * kMaxStrideFrames;
+    return offset < static_cast<double>( k ) ? k : static_cast<int>( offset );
 }
 
 /*! r4 fix iteration 1 (adversary A2 on 05511dac): the frame CPU-route lookahead \a k asks for is the frame the drop-frame
@@ -138,11 +146,11 @@ inline int lookaheadOffsetFrames( int k, bool cpuRoute, double positionFraction,
 inline int cpuRouteLookaheadFrame( int requestedFrame, int k, double positionFraction, double strideFrames,
                                    int cutInValue, int cutOutValue, bool loopEnabled, bool presentLastFrame )
 {
-    const int offset = lookaheadOffsetFrames( k, true, positionFraction, strideFrames );
-    // r4 fix iteration 2 (adversary A2 on c7953c66): advanceDropFrameTick's rule in exact integers. The engine's position
-    // is N + fraction with N = requestedFrame + offset and fraction in [0, 1), and every bound it compares against is a
-    // whole frame, so N alone decides. Adding them in double first rounded 1.9999999999999998 + 3 up to 5.0, so frame 4
-    // was asked for as 5.
+    // r5 (adversary A1 on fcce2b40): N = floor( requestedFrame + fraction + k x stride ), the engine's double sum
+    // (lookaheadOffsetFrames with requestedFrame), so its rounding decides N exactly as it decides the engine's frame.
+    // advanceDropFrameTick's wrap and clamp then follow in integers: every bound is a whole frame, so N alone decides
+    // whether the engine wraps or clamps, and by how many laps.
+    const int offset = lookaheadOffsetFrames( k, true, positionFraction, strideFrames, requestedFrame );
     const long long n = static_cast<long long>( requestedFrame ) + offset;
     const long long lastFrame = static_cast<long long>( cutOutValue ) - 1;
     const long long wrapAt = presentLastFrame ? lastFrame + 1 : lastFrame;   // playback_frame_range::dropFrameLoopWrapAt

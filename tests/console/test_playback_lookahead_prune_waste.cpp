@@ -93,7 +93,7 @@ PruneRun simulateDropFramePrune( bool cpuRoute, int depth, double advance, doubl
         const double fraction = position - static_cast<double>( target );
         for( int k = 1; k <= depth; ++k )
         {
-            const int frame = target + lookaheadOffsetFrames( k, cpuRoute, fraction, stride.strideFrames() );
+            const int frame = target + lookaheadOffsetFrames( k, cpuRoute, fraction, stride.strideFrames(), target );
             if( frame == target || outstanding.count( frame ) ) continue;
             outstanding.insert( frame );
             ++run.issued;
@@ -284,7 +284,7 @@ SlotBudgetRun simulateSlotBudget( int depth, double pipelineMs, double prepMs, d
                 const double fraction = position - static_cast<double>( target );
                 for( int k = 1; k <= depth; ++k )
                 {
-                    const int frame = target + lookaheadOffsetFrames( k, true, fraction, stride.strideFrames() );
+                    const int frame = target + lookaheadOffsetFrames( k, true, fraction, stride.strideFrames(), target );
                     if( !covered( frame ) ) queue.push_back( { frame, true } );
                 }
             }
@@ -518,8 +518,8 @@ TEST(PlaybackLookaheadPruneWaste, AtTheLoopEndTheCpuLookaheadIsTheFrameTheEngine
                             for( int k = 1; k <= 3; ++k )
                             {
                                 const int frame = cpuRouteLookaheadFrame( target, k, f, s, cutIn, cutOut, loop != 0, false );
-                                const int offset = lookaheadOffsetFrames( k, true, f, s );
-                                const double engine = advanceDropFrameTick( target + f, offset, cutIn, cutOut, loop != 0, false ).position;
+                                // r5 (A1 on fcce2b40): the engine's own sum, position + k x stride, not position + offset.
+                                const double engine = advanceDropFrameTick( target + f, k * s, cutIn, cutOut, loop != 0, false ).position;
                                 ASSERT_EQ( frame, static_cast<int>( std::floor( engine ) ) );
                                 if( loop ) ASSERT_TRUE( frame != cutOut - 1 );   // Loop without conform never returns it
                                 ASSERT_TRUE( frame >= cutIn - 1 && frame <= cutOut - 1 );
@@ -599,6 +599,76 @@ TEST(PlaybackLookaheadPruneWaste, TheCpuPredictionIsExactUnderDoubleRounding)
                 ASSERT_TRUE( frame - target >= 1 && frame - target <= 3 );
                 ASSERT_TRUE( withinPruneWindow( frame, target, 0, 999, lookaheadWindowFrames( 1, true ), false ) );
             }
+}
+
+// RED on fcce2b40 (adversary A1, pass 12): the engine adds the advance to its ABSOLUTE position in double
+// (advanceDropFrameTick), so 127.99999999999999 + 1.0 rounds to 129.0. Loop on, Cut 1..130: it wraps to frame 0. Loop off:
+// it clamps to 129. The exact-integer prediction (c7953c66 A2) asked for 128 in both cases, a frame the engine skips.
+// r5 reverses that A2 on purpose: the frame follows the engine's double sum; only the window keeps an integer cap.
+TEST(PlaybackLookaheadPruneWaste, WithLoopOffTheCpuPredictionIsTheFrameTheEngineClampsTo)
+{
+    using playback_lookahead_cpu::cpuRouteLookaheadFrame;
+    using playback_frame_range::advanceDropFrameTick;
+    const double position = 127.99999999999999;
+    const double fraction = position - 127.0;
+    ASSERT_EQ( static_cast<int>( std::floor( advanceDropFrameTick( position, 1.0, 1, 130, false, false ).position ) ), 129 );
+    ASSERT_EQ( cpuRouteLookaheadFrame( 127, 1, fraction, 1.0, 1, 130, false, false ), 129 );
+    ASSERT_TRUE( withinPruneWindow( 129, 127, 0, 129, lookaheadWindowFrames( 1, true ), false ) );
+}
+
+TEST(PlaybackLookaheadPruneWaste, TheCpuPredictionMirrorsTheEnginesDoubleAddition)
+{
+    using playback_lookahead_cpu::cpuRouteLookaheadFrame;
+    using playback_frame_range::advanceDropFrameTick;
+    const double position = 127.99999999999999;
+    const double fraction = position - 127.0;
+    ASSERT_TRUE( fraction == 0.9999999999999858 );
+    ASSERT_EQ( static_cast<int>( std::floor( advanceDropFrameTick( position, 1.0, 1, 130, true, false ).position ) ), 0 );
+    ASSERT_EQ( cpuRouteLookaheadFrame( 127, 1, fraction, 1.0, 1, 130, true, false ), 0 );
+    ASSERT_TRUE( withinPruneWindow( 0, 127, 0, 129, lookaheadWindowFrames( 1, true ), true ) );
+    // c7953c66 A2's own input stays GREEN: the engine's 1.9999999999999998 + 2.15625 is 4.15625, frame 4.
+    ASSERT_EQ( cpuRouteLookaheadFrame( 1, 1, 0.9999999999999998, 2.15625, 1, 100, false, false ), 4 );
+    // Positions 1..4 ulps below a whole frame, every stride, Loop on/off, conform on/off, cuts that wrap near the target:
+    // the prediction is the frame the engine reaches from the same position and advance, except where the window cap
+    // applies (the engine's rounded advance passes k x kMaxStrideFrames, possible only at a stride of ~3), and it always
+    // stays inside the prune window.
+    const double strides[] = { 1.0, 1.35, 2.0, 2.15625, 2.5, 2.9999999999999996, 3.0 };
+    int compared = 0;
+    int capped = 0;
+    for( int target = 0; target < 300; ++target )
+        for( int ulps = 1; ulps <= 4; ++ulps )
+        {
+            double p = static_cast<double>( target + 1 );
+            for( int u = 0; u < ulps; ++u ) p = std::nextafter( p, 0.0 );
+            if( static_cast<int>( std::floor( p ) ) != target ) continue;
+            const int cutOuts[] = { target + 2, target + 3, target + 4, target + 5, 1000 };
+            for( int cutOut : cutOuts )
+                for( int loop = 0; loop < 2; ++loop )
+                    for( int presentLast = 0; presentLast < 2; ++presentLast )
+                        for( double s : strides )
+                        {
+                            const int frame = cpuRouteLookaheadFrame( target, 1, p - static_cast<double>( target ), s,
+                                                                      1, cutOut, loop != 0, presentLast != 0 );
+                            const bool cap = std::floor( p + s ) - static_cast<double>( target )
+                                             > static_cast<double>( playback_lookahead_cpu::kMaxStrideFrames );
+                            if( cap ) ++capped;
+                            else
+                            {
+                                const double engine =
+                                    advanceDropFrameTick( p, s, 1, cutOut, loop != 0, presentLast != 0 ).position;
+                                ASSERT_EQ( frame, static_cast<int>( std::floor( engine ) ) );
+                                ++compared;
+                            }
+                            ASSERT_TRUE( withinPruneWindow( frame, target, 0, cutOut - 1,
+                                                            lookaheadWindowFrames( 1, true ), loop != 0 ) );
+                        }
+        }
+    std::printf( "double_parity compared=%d capped=%d\n", compared, capped );
+    ASSERT_TRUE( compared > 0 );
+    // The offset helper carries the same sum: at requestedFrame 0 it is unchanged, at 127 it is the engine's 2.
+    ASSERT_EQ( lookaheadOffsetFrames( 1, true, fraction, 1.0 ), 1 );
+    ASSERT_EQ( lookaheadOffsetFrames( 1, true, fraction, 1.0, 127 ), 2 );
+    ASSERT_EQ( lookaheadOffsetFrames( 1, false, fraction, 1.0, 127 ), 1 );   // the texture route is k, unchanged
 }
 
 // Adversary A3 on 05511dac: 0.9999999999999999 + 3.0 rounds to 4.0, past the depth-1 window of 3.
