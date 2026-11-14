@@ -1111,7 +1111,11 @@ def test_invoke_lane_error_mode_pin_catches_each_launch_ahead_of_the_block(tmp_p
 # scan and the hidden-launch guard; files that are not .ps1/.psm1 (.py, .cmd, .js); a command whose name is a variable (`& $cmd`); a receiver that comes
 # from a call rather than a variable; a method name built at run time on a Create call or on a receiver that is not followed as WMI; the
 # `.ForEach({ $_.Create() })` / `.Where()` intrinsic methods (their script block is not a pipeline); a variable that crosses a scope or a file (dot-sourcing,
-# a parameter, a returned value); a variable bound by `-OutVariable`, `Set-Variable`, `[ref]` or a hashtable/array element; a class or method name built from
+# a parameter, a returned value), and `$_` inside a `filter` or a function `process` block whose input comes from the caller's pipeline
+# (`filter f { $_.Create('x') }; Get-WmiObject -List Win32_Process | f`: the block's `$_` is not seen as WMI); a variable bound by `-OutVariable`,
+# `Tee-Object -Variable` (`Get-WmiObject -List Win32_Process | Tee-Object -Variable w | Out-Null; $w.Create('x')`), `Set-Variable`, `[ref]` or a hashtable/array element;
+# `CimSession.InvokeMethod(namespace, $classVar, 'Create', ...)` with the class name held in a variable (`$k = 'Win32_Process'; $s.InvokeMethod('root/cimv2', $k, 'Create', $null)`;
+# the literal-class form is refused); a class or method name built from
 # pieces ('Win32_' + 'Process', -f); reflection; text run through Invoke-Expression or a script block built at run time; a member name handed to another
 # cmdlet (`Select-Object -ExpandProperty Create`, `Get-Member`); a dynamic member READ (`$f = $c.$m; $f.Invoke(...)`: refusing it would also refuse the plain `$obj.$name` property reads of two tracked
 # bachelor scripts, whose variables the file-wide WMI taint over-approximates); a method collection (`$c.psobject.Methods['Create']`); a positional ForEach-Object member name that
