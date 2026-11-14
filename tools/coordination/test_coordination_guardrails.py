@@ -1420,11 +1420,22 @@ def _wmi_create_scan(tmp_path, paths):
     return json.loads(done.stdout)
 
 
-def _tracked_powershell_files():
+def _tracked_powershell_files(root=ROOT):
     listing = subprocess.run(
-        ["git", "-C", str(ROOT), "ls-files", "-z", "--", "*.ps1", "*.psm1"], text=True, capture_output=True, check=True,
+        ["git", "-C", str(root), "ls-files", "-z", "--", "*.ps1", "*.psm1"], text=True, capture_output=True, check=True,
     ).stdout
     return sorted(p for p in listing.split("\0") if p)
+
+
+def test_tracked_powershell_listing_reads_any_extension_case(tmp_path):
+    """adversary A4 on cc2d32d8: PowerShell runs unsafe.PS1 and Mod.PSM1 like the lower-case names, so the listing must not skip them."""
+    subprocess.run(["git", "init", "-q", str(tmp_path)], check=True, capture_output=True)
+    for name in ("lower.ps1", "UPPER.PS1", "Mixed.Ps1", "mod.psm1", "MOD.PSM1", "notes.txt", "x.ps1.bak", "sub/deep.PS1"):
+        target = tmp_path / name
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text("# x\n", encoding="utf-8", newline="\n")
+    subprocess.run(["git", "-C", str(tmp_path), "add", "-A"], check=True, capture_output=True)
+    assert _tracked_powershell_files(tmp_path) == sorted(["lower.ps1", "UPPER.PS1", "Mixed.Ps1", "mod.psm1", "MOD.PSM1", "sub/deep.PS1"])
 
 
 @_lane_scanner_only
@@ -1592,6 +1603,49 @@ def test_wmi_create_scan_refuses_each_direct_create_spelling(tmp_path):
         # class sibling of A3/A4: the item of a WMI pipeline is piped on, or read through a nested pipeline
         "item-piped-to-a-member-create": "Get-WmiObject -List Win32_Process | ForEach-Object { $_ | ForEach-Object -MemberName Create }",
         "item-piped-to-a-script-block": "Get-WmiObject -List Win32_Process | ForEach-Object { $_ | ForEach-Object { $_.Create('x') } }",
+        # adversary A1 on cc2d32d8: -MemberName is a wildcard pattern, so 'Cr?ate' names Create
+        "foreach-membername-wildcard-question": "Get-WmiObject -List Win32_Process | ForEach-Object -MemberName 'Cr?ate' -ArgumentList 'x'",
+        "foreach-positional-wildcard-star": "Get-CimClass Win32_Process | % 'Cr*' 'x'",
+        "foreach-membername-wildcard-class": "$c = Get-WmiObject -List Win32_Process\n$c | ForEach-Object -MemberName '[C]reate' -ArgumentList 'x'",
+        "foreach-membername-wildcard-invoke-method": "Get-WmiObject -List Win32_Process | foreach -MemberName 'Invoke?ethod' -ArgumentList 'Create', @('x')",
+        # adversary A2: the receiver is one element of a comma, an array literal, a ternary, a ?? or a sub-expression
+        "comma-wrapped-receiver": "$c = Get-WmiObject -List Win32_Process\n(,$c)[0].Create('x')",
+        "array-literal-element-receiver": "$c = Get-WmiObject -List Win32_Process\n@($null, $c)[1].Create('x')",
+        "array-literal-first-element-invoke-method": "$c = Get-WmiObject -List Win32_Process\n@($c, $null)[0].InvokeMethod('Create', [object[]]@('x', $null, $null))",
+        "ternary-receiver": "$c = Get-WmiObject -List Win32_Process\n($true ? $c : $null).Create('x')",
+        "ternary-false-branch-receiver": "$c = Get-WmiObject -List Win32_Process\n($false ? $null : $c).Create('x')",
+        "null-coalescing-receiver": "$c = Get-WmiObject -List Win32_Process\n($null ?? $c).Create('x')",
+        "subexpression-if-receiver": "$c = Get-WmiObject -List Win32_Process\n$(if ($true) { $c } else { $null }).Create('x')",
+        "subexpression-else-branch-receiver": "$c = Get-WmiObject -List Win32_Process\n$(if ($false) { $null } else { $c }).Create('x')",
+        "subexpression-statements-receiver": "$c = Get-WmiObject -List Win32_Process\n$($null; $c).Create('x')",
+        "array-expression-statements-receiver": "$c = Get-WmiObject -List Win32_Process\n@($null; $c)[1].Create('x')",
+        "comma-wrapped-pipeline-item-receiver": "Get-WmiObject -List Win32_Process | ForEach-Object { (,$_)[0].Create('x') }",
+        "array-plus-receiver": "$c = Get-WmiObject -List Win32_Process\n(@() + $c)[0].Create('x')",
+        "comma-wrapped-dynamic-member-call": "$c = Get-WmiObject -List Win32_Process\n$m = 'Create'\n(,$c)[0].$m('x')",
+        "comma-wrapped-create-member-read": "$c = Get-WmiObject -List Win32_Process\n(,$c)[0].Create.Invoke('x')",
+        # adversary A3: a splatted hashtable carries -PipelineVariable / -InputObject / -MemberName, and so does $PSDefaultParameterValues
+        "splat-pipeline-variable": "$h = @{ PipelineVariable = 'w' }\nGet-WmiObject -List Win32_Process @h | ForEach-Object { $w.Create('x') }",
+        "splat-pipeline-variable-abbreviated": "$h = @{ pv = 'w' }\nGet-CimClass Win32_Process @h | ForEach-Object { $w.Create('x') }",
+        "splat-inputobject-and-membername": "$c = Get-WmiObject -List Win32_Process\n$h = @{ InputObject = $c; MemberName = 'Create' }\nForEach-Object @h",
+        "splat-inputobject-with-a-script-block": "$c = Get-WmiObject -List Win32_Process\n$h = @{ InputObject = $c; Process = { $_.Create('x') } }\nForEach-Object @h",
+        "splat-from-a-parameter": "param($h)\nGet-WmiObject -List Win32_Process @h | ForEach-Object { $w.Create('x') }",
+        "splat-unbound": "Get-WmiObject -List Win32_Process @h | ForEach-Object { $w.Create('x') }",
+        "splat-index-write-of-a-dangerous-key": "$h = @{}\n$h['PipelineVariable'] = 'w'\nGet-WmiObject -List Win32_Process @h | ForEach-Object { $w.Create('x') }",
+        "splat-member-write-of-a-dangerous-key": "$h = @{}\n$h.PipelineVariable = 'w'\nGet-WmiObject -List Win32_Process @h | ForEach-Object { $w.Create('x') }",
+        "splat-add-with-a-key-from-a-variable": "$k = 'PipelineVariable'\n$h = @{}\n$h.Add($k, 'w')\nGet-WmiObject -List Win32_Process @h | ForEach-Object { $w.Create('x') }",
+        "splat-hashtable-key-from-a-variable": "$k = 'PipelineVariable'\n$h = @{ $k = 'w' }\nGet-WmiObject -List Win32_Process @h | ForEach-Object { $w.Create('x') }",
+        "splat-hashtable-from-a-call": "$h = Get-Content settings.json | ConvertFrom-Json -AsHashtable\nGet-WmiObject -List Win32_Process @h | ForEach-Object { $w.Create('x') }",
+        "splat-array-positional-membername": "$a = @('Create')\nGet-WmiObject -List Win32_Process | ForEach-Object @a",
+        "splat-on-a-wmi-variable-pipeline": "$c = Get-WmiObject -List Win32_Process\n$h = $global:cfg\n$c | ForEach-Object @h",
+        "default-parameter-values-pipeline-variable": "$PSDefaultParameterValues['Get-WmiObject:PipelineVariable'] = 'w'\nGet-WmiObject -List Win32_Process | ForEach-Object { $w.Create('x') }",
+        "default-parameter-values-membername": "$PSDefaultParameterValues['ForEach-Object:MemberName'] = 'Create'\nGet-WmiObject -List Win32_Process | ForEach-Object",
+        "default-parameter-values-wildcard-key": "$PSDefaultParameterValues['*:Pipeline*'] = 'w'\nGet-WmiObject -List Win32_Process | ForEach-Object { $w.Create('x') }",
+        "default-parameter-values-key-from-a-variable": "$k = 'ForEach-Object:MemberName'\n$PSDefaultParameterValues[$k] = 'Create'\nGet-WmiObject -List Win32_Process | ForEach-Object",
+        "default-parameter-values-table": "$PSDefaultParameterValues = @{ 'ForEach-Object:MemberName' = 'Create' }\nGet-WmiObject -List Win32_Process | ForEach-Object",
+        "default-parameter-values-add": "$PSDefaultParameterValues.Add('Get-WmiObject:pv', 'w')\nGet-WmiObject -List Win32_Process | ForEach-Object { $w.Create('x') }",
+        "default-parameter-values-plus-equals": "$PSDefaultParameterValues += @{ 'ForEach-Object:MemberName' = 'Create' }\nGet-WmiObject -List Win32_Process | ForEach-Object",
+        "default-parameter-values-from-a-variable": "$t = Get-Content t.json | ConvertFrom-Json -AsHashtable\n$PSDefaultParameterValues = $t\nGet-WmiObject -List Win32_Process | ForEach-Object",
+        "default-parameter-values-global-scope": "$global:PSDefaultParameterValues['ForEach-Object:MemberName'] = 'Create'\nGet-WmiObject -List Win32_Process | ForEach-Object",
     }
     not_sites = {
         "line-comment": "# Invoke-CimMethod -ClassName Win32_Process -MethodName Create; [wmiclass]'Win32_Process'",
@@ -1655,6 +1709,25 @@ def test_wmi_create_scan_refuses_each_direct_create_spelling(tmp_path):
         "pipeline-variable-name-from-a-variable-on-a-plain-command": "$n = 'w'\nGet-Item x -PipelineVariable $n | ForEach-Object { $w.Create('y') }",
         # A5: an explicit -InputObject that is not WMI is the $_ of its script block, whatever pipeline surrounds it
         "explicit-plain-inputobject-inside-a-wmi-pipeline": "Get-WmiObject -List Win32_Process | ForEach-Object { ForEach-Object -InputObject ([System.IO.FileInfo]'scratch.txt') -Process { $_.Create().Dispose() } }",
+        # adversary A1-A3 on cc2d32d8: the same shapes on a value that is not WMI, and the safe forms of a splat and of $PSDefaultParameterValues
+        "foreach-membername-wildcard-on-a-plain-pipeline": "Get-Item x | ForEach-Object -MemberName 'Na*'",
+        "comma-wrapped-plain-receiver": "$c = Get-Item x\n(,$c)[0].Create('y')",
+        "array-literal-plain-receiver": "$c = Get-Item x\n@($null, $c)[1].Create('y')",
+        "ternary-plain-receiver": "$c = Get-Item x\n($true ? $c : $null).Create('y')",
+        "null-coalescing-plain-receiver": "$c = Get-Item x\n($null ?? $c).Create('y')",
+        "subexpression-if-plain-receiver": "$c = Get-Item x\n$(if ($true) { $c } else { $null }).Create('y')",
+        "subexpression-statements-plain-receiver": "$c = Get-Item x\n$($null; $c).Create('y')",
+        "wmi-value-only-in-an-if-condition": "$c = Get-WmiObject -List Win32_Process\n$x = Get-Item x\n$(if ($c) { $x } else { $x }).Create('y')",
+        "wmi-value-only-in-a-ternary-condition": "$c = Get-WmiObject -List Win32_Process\n$x = Get-Item x\n($c ? $x : $x).Create('y')",
+        "splat-a-safe-table-on-a-wmi-read": "$h = @{ ClassName = 'Win32_Process'; Filter = 'ProcessId=4' }\nGet-CimInstance @h",
+        "splat-a-safe-table-on-a-wmi-pipeline": "$h = @{ Property = 'ProcessId' }\nGet-CimInstance Win32_Process | Select-Object @h",
+        "splat-a-safe-table-written-by-key": "$h = @{}\n$h['ClassName'] = 'Win32_Process'\n$h.Add('Filter', 'ProcessId=4')\nGet-CimInstance @h",
+        "splat-on-a-plain-command": "$h = @{ PipelineVariable = 'w' }\nGet-Item x @h | ForEach-Object { $w.Create('y') }",
+        "splat-unbound-on-a-plain-command": "Get-Item x @h",
+        "default-parameter-values-disabled-key-and-restore": "$saved = $PSDefaultParameterValues\n$PSDefaultParameterValues['Disabled'] = $true\nGet-CimInstance Win32_Process\n$PSDefaultParameterValues = $saved",
+        "default-parameter-values-safe-key-in-a-wmi-file": "$PSDefaultParameterValues = @{ 'Get-ChildItem:Force' = $true }\nGet-CimInstance Win32_Process",
+        "default-parameter-values-empty-in-a-wmi-file": "$PSDefaultParameterValues = @{}\nGet-CimInstance Win32_Process",
+        "default-parameter-values-dangerous-key-in-a-plain-file": "$PSDefaultParameterValues['ForEach-Object:MemberName'] = 'Create'\nGet-Item x | ForEach-Object",
     }
     files = {}
     for name, text in {**mutants, **not_sites}.items():
