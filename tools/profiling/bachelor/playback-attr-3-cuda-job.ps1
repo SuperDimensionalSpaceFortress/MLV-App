@@ -470,6 +470,10 @@ param(
     # GUI thread's slot release waits for the recon backend mutex, as before r7), the isolation arm of a same-binary A/B. Absent: nothing is set and the
     # emitted job is the text it was before this parameter.
     [switch]$DisableReconReleaseDeferred,
+    # HFR-NATIVE-M16-1457-FULLSCREEN-S1S2-PRESENT-GAP-1 r1: the posted due wake (MLVAPP_PLAYBACK_DUE_WAKE_DELIVERY=post: PostMessageW, byte for byte the
+    # delivery before r1), the isolation arm of a same-binary A/B against the sent wake. Absent: nothing is set and the emitted job is the text it was
+    # before this parameter.
+    [switch]$DueWakeDeliveryPost,
 
     # PLAYBACK-SCOPES-OPTION-1: the live scope the smoke forces on (the smoke runner's -Scope -> the app's --scope, which also shows the
     # edit area). '' or 'none' (the default) keeps -Scope none: the emitted job is the text it was before this parameter.
@@ -2234,6 +2238,16 @@ function Get-MeasuredSmokeSessionId([string]$RawLog) {
     afterwards is chronologically LATER, and the FIRST playback_smoke.summary line's session id
     is still the measured one.
     #>
+    # SESSION-ANCHOR-1 >>>
+    # HFR-NATIVE-M16-1457-FULLSCREEN-S1S2-PRESENT-GAP-1 r5 (Grok G5 sibling, r4 adversary pass 10 A1): each marker counts only where it
+    # STARTS the record body, after at most three `[...] ` prefix fields (DualVenueRunner.psm1's $script:DvRecordStart rule), so a
+    # run_metadata command line or any other record holding the marker text never selects the session. This region returns or throws;
+    # the baseline's substring loops after it stay verbatim (the default job's byte-identity pin) and are no longer reached.
+    $recordStart = '^(?:\[[^\]]*\] ){0,3}'
+    foreach ($line in ($RawLog -split "`r?`n")) { if ($line -match ($recordStart + 'playback_smoke\.measured_session id=(?<session>\d+)')) { return $Matches['session'] } }
+    foreach ($line in ($RawLog -split "`r?`n")) { if ($line -match ($recordStart + 'playback_smoke\.summary session=(?<session>\d+)')) { return $Matches['session'] } }
+    throw 'no playback_smoke.summary line found in the MLVApp log'
+    # SESSION-ANCHOR-1 <<<
     foreach ($line in ($RawLog -split "`r?`n")) {
         if ($line -match 'playback_smoke\.measured_session id=(?<session>\d+)') {
             return $Matches['session']
@@ -3771,13 +3785,25 @@ foreach ($candidateLine in ($rawLog -split "`r?`n")) {
         $sourceFramesSummaryLine = $candidateLine
     }
 }
+# SESSION-ANCHOR-1 >>>
+# HFR-NATIVE-M16-1457-FULLSCREEN-S1S2-PRESENT-GAP-1 r5 (Grok G5 sibling): the summary and conform records count only where they START the record
+# body (the $script:DvRecordStart rule, as Get-MeasuredSmokeSessionId), never as text inside another record; this re-pick replaces the substring
+# pick above (kept verbatim for the default job's byte-identity pin)
+$sourceFramesRecordStart = '^(?:\[[^\]]*\] ){0,3}'
+$sourceFramesSummaryLine = $null
+foreach ($candidateLine in ($rawLog -split "`r?`n")) {
+    if ($candidateLine -match ($sourceFramesRecordStart + 'playback_smoke\.summary session=' + [regex]::Escape([string]$measuredSmokeSessionId) + '(\s|$)')) {
+        $sourceFramesSummaryLine = $candidateLine
+    }
+}
+# SESSION-ANCHOR-1 <<<
 $sourceFramesVerdict = Get-AttrCudaSourceFramesVerdict -SummaryLine $sourceFramesSummaryLine -ExpectedRunNonce $runLog.runNonce
 # HFR-CONFORM-AWARE-RECEIPT-ORACLES-1 >>>
 # The measured session's playback_smoke.conform line (the last one wins). Only a conform line the oracle can PROVE (active, this session, rates
 # consistent with the summary) moves the PACE rule off the native fps; absent = the verdict above stands. The 20 s floor is never relaxed.
 $sourceFramesConformLine = $null
 foreach ($candidateLine in ($rawLog -split "`r?`n")) {
-    if ($candidateLine -match ('playback_smoke\.conform session=' + [regex]::Escape([string]$measuredSmokeSessionId) + '(\s|$)')) {
+    if ($candidateLine -match ($sourceFramesRecordStart + 'playback_smoke\.conform session=' + [regex]::Escape([string]$measuredSmokeSessionId) + '(\s|$)')) {
         $sourceFramesConformLine = $candidateLine
     }
 }
@@ -5011,8 +5037,11 @@ function Get-CorePartitionPlaybackStart([string]$LogText, $LaunchUtcTicks, $Laun
         if ([string]::IsNullOrEmpty($LogText)) { return $r }
         $lines = @($LogText -split "`r?`n")
         $sid = $null
-        foreach ($ln in $lines) { $mm = [regex]::Match($ln, 'playback_smoke\.measured_session id=(\d+)'); if ($mm.Success) { $sid = $mm.Groups[1].Value; break } }
-        if ($null -eq $sid) { foreach ($ln in $lines) { $mm = [regex]::Match($ln, 'playback_smoke\.summary session=(\d+)'); if ($mm.Success) { $sid = $mm.Groups[1].Value; break } } }
+        # HFR-NATIVE-M16-1457-FULLSCREEN-S1S2-PRESENT-GAP-1 r5 (Grok G5 sibling): the selectors count a marker only where it STARTS the record body
+        # (the $script:DvRecordStart rule), so a marker inside another record's text never picks the session
+        $recordStart = '^(?:\[[^\]]*\] ){0,3}'
+        foreach ($ln in $lines) { $mm = [regex]::Match($ln, $recordStart + 'playback_smoke\.measured_session id=(\d+)'); if ($mm.Success) { $sid = $mm.Groups[1].Value; break } }
+        if ($null -eq $sid) { foreach ($ln in $lines) { $mm = [regex]::Match($ln, $recordStart + 'playback_smoke\.summary session=(\d+)'); if ($mm.Success) { $sid = $mm.Groups[1].Value; break } } }
         if ($null -eq $sid) { return $r }
         $r.session = [int64]$sid
         $stamp = $null
@@ -6457,6 +6486,18 @@ if ($DisableReconReleaseDeferred) {
     $text = $releaseDeferredEnvAnchor.Replace($text, [System.Text.RegularExpressions.MatchEvaluator]{
         param($m)
         $m.Value + $m.Groups['ind'].Value + "'MLVAPP_GPU_RECON_RELEASE_DEFERRED=0'," + $m.Groups['nl'].Value
+    })
+}
+
+# HFR-NATIVE-M16-1457-FULLSCREEN-S1S2-PRESENT-GAP-1 r1: the posted-wake arm adds MLVAPP_PLAYBACK_DUE_WAKE_DELIVERY=post at the same env-list site, only when
+# asked. The anchor must match exactly once, or the generator throws (the runner also requires the app's own playback_due_wake delivery_kind=post before
+# the leg counts).
+if ($DueWakeDeliveryPost) {
+    $dueWakeDeliveryEnvAnchor = [regex]"(?<ind>[ \t]*)'MLVAPP_PLAYBACK_PHASE3_UNATTENDED=1',(?<nl>\r?\n)"
+    if ($dueWakeDeliveryEnvAnchor.Matches($text).Count -ne 1) { throw 'DUAL_VENUE_DUE_WAKE_DELIVERY_ANCHOR_MISSING the job template has no single env-list site to add MLVAPP_PLAYBACK_DUE_WAKE_DELIVERY to' }
+    $text = $dueWakeDeliveryEnvAnchor.Replace($text, [System.Text.RegularExpressions.MatchEvaluator]{
+        param($m)
+        $m.Value + $m.Groups['ind'].Value + "'MLVAPP_PLAYBACK_DUE_WAKE_DELIVERY=post'," + $m.Groups['nl'].Value
     })
 }
 
@@ -7905,6 +7946,7 @@ $clipContentSha256 = if ($isFixtureRehearsal) {
     disablePrepPointwiseFast = [bool]$DisablePrepPointwiseFast
     prepConflatedMove = [bool]$PrepConflatedMove
     disableReconReleaseDeferred = [bool]$DisableReconReleaseDeferred
+    dueWakeDeliveryPost = [bool]$DueWakeDeliveryPost
     scope =$(if ([string]::IsNullOrEmpty($Scope)) { 'none' } else { $Scope })
     scopeIntervalMs = $(if ($ScopeIntervalMs -ge 0) { $ScopeIntervalMs } else { $null })
     scopesDuringPlayback = $(if ([string]::IsNullOrEmpty($ScopesDuringPlayback)) { $null } else { $ScopesDuringPlayback })

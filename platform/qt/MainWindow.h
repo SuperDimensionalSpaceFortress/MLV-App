@@ -1328,6 +1328,15 @@ private:
     PlaybackDueWakeSamples m_playbackDueWakePostToReceiveLoMs;   // GUI-thread receive time - return stamp
     PlaybackDueWakeSamples m_playbackDueWakePostToReceiveHiMs;   // GUI-thread receive time - first stamp
     PlaybackDueWakeSamples m_playbackDueWakePostCallMs;          // return stamp - first stamp (the attribution uncertainty)
+    // HFR-NATIVE-M16-1457-FULLSCREEN-S1S2-PRESENT-GAP-1 (measurement): each fired wake's post classified by what the GUI thread
+    // was doing at the return stamp (PlaybackDueWake::guiStateAt, playbackDueWakeClassifyPost), bounded per Play
+    quint64 m_playbackDueWakePostAsleep = 0;          // in the dispatcher's wait or the smoke runner's sleep
+    quint64 m_playbackDueWakePostRunnerSleep = 0;     // ...of which the smoke runner's sleep
+    quint64 m_playbackDueWakePostAwake = 0;           // running (occupancy)
+    quint64 m_playbackDueWakePostStateUnknown = 0;
+    quint64 m_playbackDueWakeReentrantDeferred = 0;   // a delivery inside a present / advance scope, not advanced
+    PlaybackDueWakeSamples m_playbackDueWakePostToAwakeMs;     // asleep cases: left the sleep - post
+    PlaybackDueWakeSamples m_playbackDueWakeAwakeToReceiveMs;  // receive - max( post, left the sleep )
     // HFR-NATIVE-60FPS-FULLRES-1 r24 (adversary A1 on 9b900412): whole frames a conformed drop-frame tick held back
     // (playback_frame_range::conformDropFrameDelta), repaid one presented frame per later tick. Cleared with the pace guard.
     double m_conformDropDebtFrames = 0.0;
@@ -1729,6 +1738,22 @@ private:
         MainWindow *m_window;
         gui_present_gap::OtherBusySpan m_span;
     };
+    // HFR-NATIVE-M16-1457-FULLSCREEN-S1S2-PRESENT-GAP-1: the due wake is now a SENT message, which a nested non-Qt PeekMessage
+    // (a driver, a modal helper) also dispatches. Across a present (drawFrameReady -> presentPlaybackPreparedFrame ->
+    // finishPresentedFrame -> armPlaybackDueWake) and an advance (timerFrameEvent) a wake does not advance: it is counted
+    // (reentrant_deferred) and the arm that follows re-arms it; when no arm followed, the outermost scope's end re-arms.
+    class PlaybackDueWakeDeferScope
+    {
+    public:
+        explicit PlaybackDueWakeDeferScope( MainWindow *window );
+        ~PlaybackDueWakeDeferScope();
+        PlaybackDueWakeDeferScope( const PlaybackDueWakeDeferScope & ) = delete;
+        PlaybackDueWakeDeferScope &operator=( const PlaybackDueWakeDeferScope & ) = delete;
+    private:
+        MainWindow *m_window;
+    };
+    int m_playbackDueWakeDeferDepth = 0;
+    bool m_playbackDueWakeDeferredSinceArm = false;   // a deferred wake that no arm has replaced yet
     double m_playbackSmokePrepWorkerTotalSumMs = 0.0;
     double m_playbackSmokePrepResultQueueSumMs = 0.0;
     double m_playbackSmokePrepTotalBeforeFinishSumMs = 0.0;

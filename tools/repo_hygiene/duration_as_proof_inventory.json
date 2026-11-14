@@ -2987,6 +2987,16 @@
     },
     {
       "path": "platform/qt/PlaybackDueWake.cpp",
+      "anchor": "if ( leftMs > 0 ) QThread :: msleep ( static_cast < unsigned long > ( leftMs ) ) ;",
+      "class": "value_fallback_select",
+      "clock": "other",
+      "justification": "HFR-NATIVE-M16-1457-FULLSCREEN-S1S2-PRESENT-GAP-1 r2 G3 (CoS PR 811): after the runner sleep's message wait returned WAIT_FAILED, leftMs is the part of the REQUESTED sleep still to go (requested ms minus the QElapsedTimer reading); the comparison only selects whether a plain msleep fills it, so the runner cadence never shortens to ~0 ms. A sleep length, not a proof that anything ran (runner_sleep_wait_failed counts the failure).",
+      "lines": [
+        806
+      ]
+    },
+    {
+      "path": "platform/qt/PlaybackDueWake.cpp",
       "anchor": "if ( settleWaitMs == 0 ) return d -> settleAck . load ( ) >= request ;",
       "class": "not_run_proof_structural",
       "clock": "other",

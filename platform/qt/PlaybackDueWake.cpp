@@ -5,6 +5,7 @@
 
 #include "PlaybackDueWake.h"
 
+#include <QAbstractEventDispatcher>
 #include <QAbstractNativeEventFilter>
 #include <QByteArray>
 #include <QCoreApplication>
@@ -12,9 +13,12 @@
 #include <QObject>
 #include <QTimer>
 
+#include <QThread>
+
 #include <algorithm>
 #include <atomic>
 #include <cmath>
+#include <vector>
 
 #ifdef Q_OS_WIN
 #include <QWinEventNotifier>
@@ -53,6 +57,8 @@ struct PlaybackDueWake::Impl
     // so a reader that sees the same first stamp before and after reading postReturnQpc read that post's return time.
     std::atomic<qint64> postReturnFor { 0 };
     std::atomic<qint64> postReturnQpc { 0 };
+    // FULLSCREEN-S1S2-PRESENT-GAP-1: the generation that post carried, written inside the same seqlock window
+    std::atomic<quint32> postReturnGeneration { 0 };
     QAbstractNativeEventFilter *filter = nullptr;
     // r7 (adversary passes 13/14 A1): a post the full queue refused past the retry budget leaves its generation here for the
     // GUI thread (deliverLostPost, 0: none); the counters are the wait thread's, read for the summary line
@@ -71,6 +77,66 @@ struct PlaybackDueWake::Impl
     // the summary line before deliverLostPost returns); rescuingLostPost marks the delivery deliverLostPost is making
     quint64 postRescued = 0;
     bool rescuingLostPost = false;
+
+    // FULLSCREEN-S1S2-PRESENT-GAP-1 (measurement, GUI thread): the delivery mode, the GUI thread's sleep trace and the
+    // stranded-post counts
+    PlaybackDueWakeDeliveryMode mode = PlaybackDueWakeDeliveryMode::Post;
+    PlaybackGuiSleepTrace guiTrace;
+    bool guiTraceActive = false;
+    QMetaObject::Connection traceBlock;
+    QMetaObject::Connection traceAwake;
+    PlaybackDueWake::StrandedCounts stranded;
+    quint64 runnerSleepsWokenBySent = 0;
+    // r2 G1 (GUI thread): sleepForSmokeRunner dispatches the sent messages that end its wait; inside that dispatch the window
+    // procedure HOLDS this wake's own message (heldWakes) instead of firing it, so the wake still runs after the sleep is
+    // accounted (dispatchSentMessages). A dispatch that held none was another sent message: counted, and the sleep goes on.
+    bool inRunnerSleepDispatch = false;
+    // r3 (r2 adversary pass 7 A3): the time the LAST sleepForSmokeRunner spent running sent messages (GUI work, traced as Running,
+    // not RunnerSleep); the caller takes it out of the sleep it accounts (lastRunnerSleepDispatchNs)
+    qint64 runnerSleepDispatchNs = 0;
+    quint64 runnerSleepsWokenOther = 0;
+    // r2 G3: runner sleeps whose message wait failed (WAIT_FAILED); the rest of the interval was a plain msleep
+    quint64 runnerSleepWaitFailed = 0;
+    bool failRunnerSleepWaitForTest = false;
+#ifdef Q_OS_WIN
+    std::vector<MSG> heldWakes;
+#endif
+    // r1 adversary pass 2 A3 (GUI thread only): the first stamp (lParam) of the last native message the GUI thread took, stale
+    // or not; a published post with this stamp is consumed, never stranded
+    qint64 consumedPostFor = 0;
+    double nowMs() const { return static_cast<double>( nowNs() ) / 1000000.0; }
+    PlaybackGuiSleepTrace::At guiStateAt( double ms ) const
+    {
+        if( !guiTraceActive ) return { PlaybackGuiSleepTrace::State::Unknown, false, 0.0 };
+        return guiTrace.at( ms );
+    }
+    // GUI thread, at arm() / cancel() BEFORE the gate moves on: the arm being replaced was never accepted, and the wait
+    // thread had already published the return stamp of a post carrying exactly its generation -- that message is in the
+    // GUI thread's queue (or was refused nothing: it returned) and will be dropped as stale. Seqlock reader as in
+    // handleNativeMessage: the same first stamp before and after the reads.
+    void noteStrandedIfPosted()
+    {
+#ifdef Q_OS_WIN
+        if( !gate.armed() || qpcFrequency <= 0 ) return;
+        const qint64 forBefore = postReturnFor.load();
+        const qint64 returnTicks = postReturnQpc.load();
+        const quint32 postedGeneration = postReturnGeneration.load();
+        const qint64 forAfter = postReturnFor.load();
+        if( forBefore <= 0 || forAfter != forBefore || returnTicks < forBefore ) return;
+        if( postedGeneration != gate.generation() ) return;
+        if( forBefore == consumedPostFor ) return;   // r1 adversary pass 2 A3: already taken (e.g. dropped as early), not in the queue
+        ++stranded.total;
+        const PlaybackGuiSleepTrace::State state =
+            guiStateAt( static_cast<double>( ticksToNs( returnTicks, qpcFrequency ) ) / 1000000.0 ).state;
+        switch( state )
+        {
+        case PlaybackGuiSleepTrace::State::DispatcherWait: ++stranded.dispatcherWait; break;
+        case PlaybackGuiSleepTrace::State::RunnerSleep: ++stranded.runnerSleep; break;
+        case PlaybackGuiSleepTrace::State::Running: ++stranded.running; break;
+        case PlaybackGuiSleepTrace::State::Unknown: ++stranded.unknown; break;
+        }
+#endif
+    }
 
     // r3 (adversary pass 7 A1): the gate's clock. On Windows it is QueryPerformanceCounter in ns, the clock the wait thread
     // stamps the post time on, so the gate can drop a delivery posted before the armed due time; elsewhere QElapsedTimer.
@@ -103,6 +169,12 @@ struct PlaybackDueWake::Impl
     // the native-message path: the message names its generation and (r3) its first post stamp in QPC ticks (<= 0: none);
     // r5: returnTicks is PostMessageW's return time for that stamp (<= 0: not published when the GUI thread took it). The gate
     // still judges "posted before the due time" on the first stamp, the earliest the post can have been.
+    // r2 adversary pass 5 A1: the gate's verdict on a native delivery without taking it (deliverGeneration's own test)
+    bool deliveryCurrent( quint32 generation, qint64 postTicks ) const
+    {
+        const qint64 postNs = ( postTicks > 0 && qpcFrequency > 0 ) ? ticksToNs( postTicks, qpcFrequency ) : -1;
+        return gate.wouldAccept( generation, nowNs(), postNs );
+    }
     void deliverGeneration( quint32 generation, qint64 postTicks = 0, qint64 returnTicks = 0 )
     {
         const qint64 postNs = ( postTicks > 0 && qpcFrequency > 0 ) ? ticksToNs( postTicks, qpcFrequency ) : -1;
@@ -132,7 +204,10 @@ LRESULT CALLBACK dueWakeWindowProc( HWND hwnd, UINT message, WPARAM wParam, LPAR
 {
     if( message == PlaybackDueWake::kNativeWakeMessage )
     {
-        // reached only when the Qt filter did not see it (a modal loop dispatching on its own)
+        // r5 (Grok G6): with SendNotify, the default delivery (postDueWake below), a sent wake never passes the Qt native
+        // event filter (DueWakeNativeFilter: it sees only messages the dispatcher peeks as posted), so every sent wake
+        // reaches this window procedure, and the runner-sleep hold happens here. Under the Post arm a posted wake reaches it
+        // only when the Qt filter did not see it (a modal loop dispatching on its own)
         PlaybackDueWake *wake = reinterpret_cast<PlaybackDueWake *>( GetWindowLongPtrW( hwnd, GWLP_USERDATA ) );
         if( wake )
         {
@@ -141,11 +216,20 @@ LRESULT CALLBACK dueWakeWindowProc( HWND hwnd, UINT message, WPARAM wParam, LPAR
             msg.message = message;
             msg.wParam = wParam;
             msg.lParam = lParam;
-            wake->handleNativeMessage( &msg );
+            // r2 G1: inside the runner sleep's dispatch the wake is held (and flagged), and fires after the sleep
+            if( !wake->holdWindowProcWake( &msg ) ) wake->handleNativeMessage( &msg );
         }
         return 0;
     }
     return DefWindowProcW( hwnd, message, wParam, lParam );
+}
+
+// GUI thread: PeekMessage dispatches every pending sent message before it looks at the queue; PM_QS_SENDMESSAGE with
+// PM_NOREMOVE leaves every posted message where it is
+void dispatchPendingSentMessages()
+{
+    MSG msg;
+    PeekMessageW( &msg, nullptr, 0, 0, PM_NOREMOVE | PM_QS_SENDMESSAGE );
 }
 
 bool registerDueWakeWindowClass()
@@ -181,13 +265,24 @@ struct WaitThreadArgs
     std::atomic<quint64> *settleRequest;
     std::atomic<quint64> *settleAck;
     std::atomic<int> *settleAnswerDelayMsForTest;   // r8 pass 18 A1: a pause between the settle wake and its request load
+    std::atomic<quint32> *postReturnGeneration;     // FULLSCREEN-S1S2-PRESENT-GAP-1: the generation the published post carried
+    bool sendNotify;                                // FULLSCREEN-S1S2-PRESENT-GAP-1: SendNotifyMessageW instead of PostMessageW
 };
 
 // One post of the wake message, carrying the generation stored now; false when the queue refused it. \a generation is the
 // generation it carried.
+// FULLSCREEN-S1S2-PRESENT-GAP-1: with sendNotify the same message, wParam and lParam go through SendNotifyMessageW. To a window
+// of another thread it queues a sent message and returns at once (it never waits for the GUI thread); the GUI thread's next
+// PeekMessage / GetMessage dispatches it to dueWakeWindowProc whatever their filter, and a message wait that names
+// QS_SENDMESSAGE returns for it. A 0 return takes the refused-post path below (retry within the budget, then a lost post).
 bool postDueWake( const WaitThreadArgs & args, qint64 postQpc, quint32 & generation )
 {
     generation = args.postGeneration->load( std::memory_order_acquire );
+    if( args.sendNotify )
+        return SendNotifyMessageW( args.window, PlaybackDueWake::kNativeWakeMessage,
+                                   static_cast<WPARAM>( playbackDueWakePackWParam(
+                                       generation, static_cast<quint32>( PlaybackDueWake::kNativeWakeTag ) ) ),
+                                   static_cast<LPARAM>( postQpc ) ) != 0;
     return PostMessageW( args.window, PlaybackDueWake::kNativeWakeMessage,
                          static_cast<WPARAM>( playbackDueWakePackWParam(
                              generation, static_cast<quint32>( PlaybackDueWake::kNativeWakeTag ) ) ),
@@ -284,6 +379,7 @@ DWORD WINAPI dueWakeWaitThread( LPVOID parameter )
         {
             args.postReturnFor->store( 0 );
             args.postReturnQpc->store( returnQpc.QuadPart );
+            args.postReturnGeneration->store( generation );   // FULLSCREEN-S1S2-PRESENT-GAP-1: inside the same window
             args.postReturnFor->store( postQpc.QuadPart );
         }
     }
@@ -315,8 +411,17 @@ private:
 #endif
 
 PlaybackDueWake::PlaybackDueWake( QObject *owner, std::function<void()> onFire, bool preferNativeMessage )
+    : PlaybackDueWake( owner, std::move( onFire ),
+                       preferNativeMessage ? PlaybackDueWakeDeliveryMode::Post : PlaybackDueWakeDeliveryMode::Notifier )
+{
+}
+
+PlaybackDueWake::PlaybackDueWake( QObject *owner, std::function<void()> onFire, PlaybackDueWakeDeliveryMode mode )
     : d( new Impl )
 {
+    // FULLSCREEN-S1S2-PRESENT-GAP-1: Notifier skips the wait thread (r1); Post and SendNotify take the native path
+    const bool preferNativeMessage = mode != PlaybackDueWakeDeliveryMode::Notifier;
+    d->mode = mode;
     d->onFire = std::move( onFire );
     d->clock.start();
 #ifdef Q_OS_WIN
@@ -345,7 +450,8 @@ PlaybackDueWake::PlaybackDueWake( QObject *owner, std::function<void()> onFire, 
                                                         &d->postReturnFor, &d->postReturnQpc, &d->lostGeneration,
                                                         &d->postRefusals, &d->postFailures, &d->postRetryBudgetMs,
                                                         d->settleEvent, d->settledEvent, &d->settleRequest, &d->settleAck,
-                                                        &d->settleAnswerDelayMsForTest };
+                                                        &d->settleAnswerDelayMsForTest, &d->postReturnGeneration,
+                                                        d->mode == PlaybackDueWakeDeliveryMode::SendNotify };
             d->thread = CreateThread( nullptr, 0, dueWakeWaitThread, args, 0, nullptr );
             if( d->thread )
                 SetThreadPriority( d->thread, THREAD_PRIORITY_HIGHEST );
@@ -398,6 +504,7 @@ PlaybackDueWake::~PlaybackDueWake()
     stop();
     cancel();
     endPlay();
+    setGuiTraceActive( false );   // FULLSCREEN-S1S2-PRESENT-GAP-1: the dispatcher connections capture this object
 #ifdef Q_OS_WIN
     if( d->filter )
     {
@@ -451,6 +558,7 @@ void PlaybackDueWake::arm( double dueMs )
     if( !( dueMs > 0.0 ) ) dueMs = 0.0;
     // r6 adversary pass 12 A1 (and pass 10 A4, +infinity): bounded before the ns, 100 ns and int conversions below
     if( dueMs > kMaxDueMs ) dueMs = kMaxDueMs;
+    d->noteStrandedIfPosted();   // FULLSCREEN-S1S2-PRESENT-GAP-1: before the replaced arm's generation is gone
     const quint32 generation = d->gate.arm( d->nowNs(), static_cast<qint64>( dueMs * 1000000.0 ) );
     d->lastArmQtTimer = d->delivery == Delivery::QtTimer;
 #ifdef Q_OS_WIN
@@ -496,6 +604,7 @@ void PlaybackDueWake::arm( double dueMs )
 
 void PlaybackDueWake::cancel()
 {
+    d->noteStrandedIfPosted();   // FULLSCREEN-S1S2-PRESENT-GAP-1
     d->gate.cancel();
 #ifdef Q_OS_WIN
     d->postGeneration.store( d->gate.generation(), std::memory_order_release );
@@ -525,6 +634,7 @@ bool PlaybackDueWake::handleNativeMessage( const void *msg )
     const qint64 returnTicks = d->postReturnQpc.load();
     const qint64 forAfter = d->postReturnFor.load();
     const bool published = postTicks > 0 && forBefore == postTicks && forAfter == postTicks;
+    d->consumedPostFor = postTicks;   // r1 adversary pass 2 A3: this post is out of the queue whatever the gate decides
     d->deliverGeneration( playbackDueWakeWParamGeneration( wParam ), postTicks, published ? returnTicks : 0 );
     return true;
 #else
@@ -673,6 +783,211 @@ const char *PlaybackDueWake::deliveryName( Delivery delivery )
     case Delivery::QtTimer: break;
     }
     return "qtimer";
+}
+
+bool PlaybackDueWake::sendsNotify() const
+{
+    return d->delivery == Delivery::NativeMessage && d->mode == PlaybackDueWakeDeliveryMode::SendNotify;
+}
+
+PlaybackDueWake::RunnerSleep PlaybackDueWake::sleepForSmokeRunner( unsigned long ms )
+{
+#ifdef Q_OS_WIN
+    d->runnerSleepDispatchNs = 0;
+    if( !sendsNotify() ) return RunnerSleep::NotHandled;
+    noteRunnerSleep( true );
+    // QS_SENDMESSAGE only: the sent wake ends the sleep; posted messages, timers and input leave the runner's cadence as it
+    // was. MWMO_INPUTAVAILABLE: a sent message already pending at the call returns at once (never a missed wake)
+    // r1 adversary pass 1 A5: always a finite wait (INFINITE is 0xFFFFFFFF; a larger unsigned long would truncate)
+    const DWORD waitMs = ms >= static_cast<unsigned long>( INFINITE ) ? INFINITE - 1 : static_cast<DWORD>( ms );
+    // r1 adversary pass 2 A2: the wait may also return for a system event with no sent message queued; only a queued sent
+    // message ends the sleep early (and is counted), anything else sleeps out the rest of the requested time
+    QElapsedTimer slept;
+    slept.start();
+    for( ;; )
+    {
+        const qint64 sleptMs = slept.elapsed();
+        const DWORD restMs = sleptMs >= static_cast<qint64>( waitMs ) ? 0 : static_cast<DWORD>( static_cast<qint64>( waitMs ) - sleptMs );
+        const DWORD result = d->failRunnerSleepWaitForTest
+            ? WAIT_FAILED : MsgWaitForMultipleObjectsEx( 0, nullptr, restMs, QS_SENDMESSAGE, MWMO_INPUTAVAILABLE );
+        if( result == WAIT_FAILED )
+        {
+            // r2 G3: a failed wait never ends the sleep at ~0 ms; the rest of the interval is the plain msleep every other
+            // delivery uses (no sent wake ends it), and the failure is counted (runner_sleep_wait_failed)
+            ++d->runnerSleepWaitFailed;
+            const qint64 leftMs = static_cast<qint64>( waitMs ) - slept.elapsed();
+            if( leftMs > 0 ) QThread::msleep( static_cast<unsigned long>( leftMs ) );
+            break;
+        }
+        if( result != WAIT_OBJECT_0 ) break;   // the timeout
+        if( HIWORD( GetQueueStatus( QS_SENDMESSAGE ) ) & QS_SENDMESSAGE )
+        {
+            // r2 G1: only the wake ends the sleep. The sent messages are dispatched here; the wake's window procedure holds
+            // this wake's own message (holdWindowProcWake) and it fires after the sleep (dispatchSentMessages). Any other sent
+            // message ran in this dispatch: counted runner_sleep_woken_other, and the sleep goes on to its full interval.
+            // r3 (r2 adversary pass 7 A3): the dispatch is GUI work, not the runner's sleep -- the trace says Running while it
+            // runs (a wake posted from a handler in it is not classed asleep), and its time is returned to the caller
+            // (lastRunnerSleepDispatchNs), which takes it out of the runner sleep it accounts
+            const size_t heldBefore = d->heldWakes.size();
+            noteRunnerSleep( false );
+            QElapsedTimer dispatchClock;
+            dispatchClock.start();
+            d->inRunnerSleepDispatch = true;
+            dispatchPendingSentMessages();
+            d->inRunnerSleepDispatch = false;
+            d->runnerSleepDispatchNs += dispatchClock.nsecsElapsed();
+            if( d->heldWakes.size() > heldBefore )
+            {
+                ++d->runnerSleepsWokenBySent;
+                return RunnerSleep::WokenBySent;
+            }
+            ++d->runnerSleepsWokenOther;
+            if( slept.hasExpired( static_cast<qint64>( waitMs ) ) ) break;
+            noteRunnerSleep( true );
+            continue;
+        }
+        if( slept.hasExpired( static_cast<qint64>( waitMs ) ) ) break;
+    }
+    noteRunnerSleep( false );
+    return RunnerSleep::Slept;
+#else
+    Q_UNUSED( ms );
+    return RunnerSleep::NotHandled;
+#endif
+}
+
+qint64 PlaybackDueWake::lastRunnerSleepDispatchNs() const
+{
+    return d->runnerSleepDispatchNs;
+}
+
+void PlaybackDueWake::dispatchSentMessages()
+{
+#ifdef Q_OS_WIN
+    // r2 G1: first the wakes the runner sleep held, in the order they were sent (each through the gate, as the window
+    // procedure would have), then every sent message still pending
+    std::vector<MSG> held;
+    held.swap( d->heldWakes );
+    for( const MSG &msg : held ) handleNativeMessage( &msg );
+    dispatchPendingSentMessages();
+#endif
+}
+
+bool PlaybackDueWake::holdWindowProcWake( const void *message )
+{
+#ifdef Q_OS_WIN
+    if( !d->inRunnerSleepDispatch || !message ) return false;
+    const MSG *m = static_cast<const MSG *>( message );
+    // r2 adversary pass 5 A1: only a wake the gate would accept now ends the runner sleep. A stale one (cancelled, replaced,
+    // stopped, or posted before the current arm's due time), or one not for this window / tag, is not held: the window
+    // procedure hands it to handleNativeMessage, which drops it as before, and the sleep goes on (runner_sleep_woken_other).
+    if( m->message != kNativeWakeMessage || !d->window || m->hwnd != d->window ) return false;
+    const quint64 wParam = static_cast<quint64>( m->wParam );
+    if( playbackDueWakeWParamTag( wParam ) != static_cast<quint32>( kNativeWakeTag ) ) return false;
+    if( !d->deliveryCurrent( playbackDueWakeWParamGeneration( wParam ), static_cast<qint64>( m->lParam ) ) ) return false;
+    d->heldWakes.push_back( *m );
+    return true;
+#else
+    Q_UNUSED( message );
+    return false;
+#endif
+}
+
+quint64 PlaybackDueWake::runnerSleepsWokenBySent() const
+{
+    return d->runnerSleepsWokenBySent;
+}
+
+quint64 PlaybackDueWake::runnerSleepsWokenOther() const
+{
+    return d->runnerSleepsWokenOther;
+}
+
+quint64 PlaybackDueWake::runnerSleepWaitFailures() const
+{
+    return d->runnerSleepWaitFailed;
+}
+
+void PlaybackDueWake::setRunnerSleepWaitFailsForTest( bool fails )
+{
+    d->failRunnerSleepWaitForTest = fails;
+}
+
+const char *PlaybackDueWake::deliveryKindName() const
+{
+    switch( d->delivery )
+    {
+    case Delivery::NativeMessage: return d->mode == PlaybackDueWakeDeliveryMode::SendNotify ? "send" : "post";
+    case Delivery::Notifier: return "notifier";
+    case Delivery::QtTimer: break;
+    }
+    return "qtimer";
+}
+
+void PlaybackDueWake::setGuiTraceActive( bool active )
+{
+    if( active == d->guiTraceActive ) return;
+    if( !active )
+    {
+        QObject::disconnect( d->traceBlock );
+        QObject::disconnect( d->traceAwake );
+        d->guiTraceActive = false;
+        d->guiTrace.reset();
+        return;
+    }
+    // the calling (GUI) thread's dispatcher; none (a thread without an event loop): no trace, every state reads Unknown
+    QAbstractEventDispatcher *dispatcher = QAbstractEventDispatcher::instance();
+    if( !dispatcher ) return;
+    Impl *impl = d.get();
+    d->guiTrace.reset();
+    d->traceBlock = QObject::connect( dispatcher, &QAbstractEventDispatcher::aboutToBlock, [impl]() {
+        impl->guiTrace.note( PlaybackGuiSleepTrace::State::DispatcherWait, impl->nowMs() );
+    } );
+    d->traceAwake = QObject::connect( dispatcher, &QAbstractEventDispatcher::awake, [impl]() {
+        impl->guiTrace.note( PlaybackGuiSleepTrace::State::Running, impl->nowMs() );
+    } );
+    d->guiTraceActive = true;
+}
+
+bool PlaybackDueWake::guiTraceActive() const
+{
+    return d->guiTraceActive;
+}
+
+void PlaybackDueWake::noteRunnerSleep( bool sleeping )
+{
+    if( !d->guiTraceActive ) return;
+    d->guiTrace.note( sleeping ? PlaybackGuiSleepTrace::State::RunnerSleep : PlaybackGuiSleepTrace::State::Running, d->nowMs() );
+}
+
+PlaybackGuiSleepTrace::At PlaybackDueWake::guiStateAt( double ms ) const
+{
+    return d->guiStateAt( ms );
+}
+
+PlaybackDueWake::StrandedCounts PlaybackDueWake::strandedCounts() const
+{
+    return d->stranded;
+}
+
+void PlaybackDueWake::resetStrandedCounts()
+{
+    d->stranded = StrandedCounts();
+    d->runnerSleepsWokenBySent = 0;
+    d->runnerSleepsWokenOther = 0;
+    d->runnerSleepWaitFailed = 0;
+}
+
+bool PlaybackDueWake::armPostPublished() const
+{
+#ifdef Q_OS_WIN
+    const qint64 forBefore = d->postReturnFor.load();
+    const quint32 postedGeneration = d->postReturnGeneration.load();
+    const qint64 forAfter = d->postReturnFor.load();
+    return forBefore > 0 && forAfter == forBefore && postedGeneration == d->gate.generation();
+#else
+    return false;
+#endif
 }
 
 bool PlaybackDueWake::enabledByEnvironment()

@@ -32,13 +32,125 @@
 #ifndef PLAYBACKDUEWAKE_H
 #define PLAYBACKDUEWAKE_H
 
+#include <QString>
 #include <QtGlobal>
 
+#include <array>
+#include <cstddef>
 #include <functional>
 #include <limits>
 #include <memory>
 
 class QObject;
+
+/*! HFR-NATIVE-M16-1457-FULLSCREEN-S1S2-PRESENT-GAP-1: what the GUI thread was doing at a given instant, read back from a
+ *  bounded trace of its own transitions (GUI thread only; one clock, QueryPerformanceCounter ms, the clock the wake's post
+ *  stamps use). A transition names the state ENTERED:
+ *  - DispatcherWait: QAbstractEventDispatcher::aboutToBlock (the dispatcher is about to wait for messages);
+ *  - RunnerSleep:    the --gui-smoke-playback runner's own sleep on the GUI thread begins (MainWindow::sleepGuiThreadForSmokeRunner);
+ *  - Running:        QAbstractEventDispatcher::awake, or the runner's sleep ended.
+ *  at( t ) is the state the latest transition at or before t entered, and (for the two sleeping states) when the GUI thread
+ *  next left it. Memory is a fixed ring of kCapacity transitions; consecutive Running transitions are folded into the first
+ *  (the dispatcher emits awake at the start of every processEvents too), and an instant older than the ring's oldest kept
+ *  transition is Unknown, never guessed. */
+class PlaybackGuiSleepTrace
+{
+public:
+    enum class State { Running, DispatcherWait, RunnerSleep, Unknown };
+    static constexpr std::size_t kCapacity = 256;
+
+    struct At
+    {
+        State state;
+        bool hasLeft;    // a sleeping state the GUI thread has left since (a later transition is kept)
+        double leftMs;   // ...when it left it (the first later transition); meaningless unless hasLeft
+    };
+
+    void note( State entered, double ms )
+    {
+        if( entered == State::Unknown ) return;
+        if( m_count > 0 && entered == State::Running && m_ring[slot( m_count - 1 )].state == State::Running ) return;
+        m_ring[slot( m_count )] = Entry { ms, entered };
+        ++m_count;
+    }
+
+    At at( double ms ) const
+    {
+        const std::size_t kept = m_count < kCapacity ? m_count : kCapacity;
+        const std::size_t first = m_count - kept;
+        // the latest transition at or before ms (newest first); the one after it is when that state was left
+        for( std::size_t i = m_count; i > first; --i )
+        {
+            const Entry &entry = m_ring[slot( i - 1 )];
+            if( entry.ms > ms ) continue;
+            if( entry.state == State::Running ) return { State::Running, false, 0.0 };
+            if( i < m_count ) return { entry.state, true, m_ring[slot( i )].ms };
+            return { entry.state, false, 0.0 };
+        }
+        return { State::Unknown, false, 0.0 };   // nothing kept that old (or nothing traced yet)
+    }
+
+    void reset() { m_count = 0; }
+    std::size_t transitions() const { return m_count; }
+
+    static bool sleeping( State state ) { return state == State::DispatcherWait || state == State::RunnerSleep; }
+
+private:
+    struct Entry
+    {
+        double ms;
+        State state;
+    };
+    static std::size_t slot( std::size_t index ) { return index % kCapacity; }
+    std::array<Entry, kCapacity> m_ring {};
+    std::size_t m_count = 0;
+};
+
+/*! FULLSCREEN-S1S2-PRESENT-GAP-1: one fired wake's post, classified by what the GUI thread was doing when it was posted.
+ *  - Asleep: in the dispatcher's wait or the smoke runner's sleep (runnerSleep says which). postToAwakeMs = when it left
+ *    that sleep - the post; awakeToReceiveMs = the receive - when it left.
+ *  - Awake: running (occupancy). awakeToReceiveMs = the receive - the post; there is no post-to-awake part.
+ *  - Unknown: the trace was off or did not reach back that far, or a sleep that had not ended by the receive. */
+struct PlaybackDueWakePostClass
+{
+    enum class Kind { Asleep, Awake, Unknown };
+    Kind kind;
+    bool runnerSleep;
+    double postToAwakeMs;
+    double awakeToReceiveMs;
+};
+
+inline PlaybackDueWakePostClass playbackDueWakeClassifyPost( const PlaybackGuiSleepTrace::At &at, double postMs, double receiveMs )
+{
+    if( PlaybackGuiSleepTrace::sleeping( at.state ) )
+    {
+        if( !at.hasLeft || at.leftMs > receiveMs || at.leftMs < postMs )
+            return { PlaybackDueWakePostClass::Kind::Unknown, false, 0.0, 0.0 };
+        return { PlaybackDueWakePostClass::Kind::Asleep, at.state == PlaybackGuiSleepTrace::State::RunnerSleep,
+                 at.leftMs - postMs, receiveMs - at.leftMs };
+    }
+    if( at.state == PlaybackGuiSleepTrace::State::Running )
+        return { PlaybackDueWakePostClass::Kind::Awake, false, 0.0, receiveMs - postMs };
+    return { PlaybackDueWakePostClass::Kind::Unknown, false, 0.0, 0.0 };
+}
+
+/*! HFR-NATIVE-M16-1457-FULLSCREEN-S1S2-PRESENT-GAP-1: how the wait thread hands the wake to the GUI thread.
+ *  - SendNotify (default): SendNotifyMessageW. A cross-thread sent message sets QS_SENDMESSAGE, which a message wait that
+ *    names it returns for, and it is dispatched to the window procedure inside the thread's next PeekMessage / GetMessage
+ *    whatever their filter (dueWakeWindowProc -> handleNativeMessage).
+ *  - Post: PostMessageW, the r2..r8 path byte for byte (MLVAPP_PLAYBACK_DUE_WAKE_DELIVERY=post, the isolation arm).
+ *  - Notifier: r1's QWinEventNotifier, no wait thread (MLVAPP_PLAYBACK_DUE_WAKE_DELIVERY=notifier). */
+enum class PlaybackDueWakeDeliveryMode { SendNotify, Post, Notifier };
+
+/*! The MLVAPP_PLAYBACK_DUE_WAKE_DELIVERY parse: "post" / "notifier" (trimmed, any case); anything else, or unset, is
+ *  SendNotify. Pure: MainWindow reads the variable once and hands the text here. */
+inline PlaybackDueWakeDeliveryMode playbackDueWakeDeliveryModeFromText( const QString &text )
+{
+    const QString value = text.trimmed();
+    if( value.compare( QStringLiteral( "post" ), Qt::CaseInsensitive ) == 0 ) return PlaybackDueWakeDeliveryMode::Post;
+    if( value.compare( QStringLiteral( "notifier" ), Qt::CaseInsensitive ) == 0 ) return PlaybackDueWakeDeliveryMode::Notifier;
+    return PlaybackDueWakeDeliveryMode::SendNotify;
+}
 
 /*! The stale-delivery gate, pure (GUI thread only). Every arm() and cancel() starts a new generation; a delivery is
  *  taken only when it carries the current generation, the wake is armed, and it is not early for the armed due time. */
@@ -80,10 +192,16 @@ public:
      *  split. \a postNs < 0 (the notifier / qtimer paths carry none) keeps the r2 rule. */
     bool accept( quint32 generation, qint64 nowNs, qint64 postNs = -1 )
     {
+        if( !wouldAccept( generation, nowNs, postNs ) ) return false;
+        m_armed = false;
+        return true;
+    }
+    /*! r2 adversary pass 5 A1: accept()'s verdict without disarming -- the runner sleep holds only a wake this would accept. */
+    bool wouldAccept( quint32 generation, qint64 nowNs, qint64 postNs = -1 ) const
+    {
         if( !m_armed || generation != m_generation ) return false;
         if( nowNs < m_dueNs - kStaleDeliveryNs ) return false;
         if( postNs >= 0 && postNs < m_dueNs - kStaleDeliveryNs ) return false;
-        m_armed = false;
         return true;
     }
     bool armed() const { return m_armed; }
@@ -204,6 +322,9 @@ public:
     /*! \a owner parents the notifier / timer (the GUI thread's object); \a onFire runs on that thread.
      *  \a preferNativeMessage false skips the wait thread and uses the notifier (r1) path. */
     PlaybackDueWake( QObject *owner, std::function<void()> onFire, bool preferNativeMessage = true );
+    /*! FULLSCREEN-S1S2-PRESENT-GAP-1: the delivery chosen by mode (MainWindow passes the parsed environment). The bool
+     *  constructor is this one with Post (true) or Notifier (false), so its callers keep the r2 PostMessageW path. */
+    PlaybackDueWake( QObject *owner, std::function<void()> onFire, PlaybackDueWakeDeliveryMode mode );
     ~PlaybackDueWake();
     PlaybackDueWake( const PlaybackDueWake & ) = delete;
     PlaybackDueWake & operator=( const PlaybackDueWake & ) = delete;
@@ -300,6 +421,75 @@ public:
 
     /*! MLVAPP_PLAYBACK_DUE_WAKE=0 turns the due wake off; anything else (or unset) leaves it on. Read on every call. */
     static bool enabledByEnvironment();
+
+    /*! FULLSCREEN-S1S2-PRESENT-GAP-1: true when the wait thread hands the wake over with SendNotifyMessageW (the native path
+     *  was taken and the mode is SendNotify). */
+    bool sendsNotify() const;
+    /*! "send" | "post" (the native-message path, by mode) | "notifier" | "qtimer" (the path chosen at construction) */
+    const char *deliveryKindName() const;
+
+    /*! FULLSCREEN-S1S2-PRESENT-GAP-1, measurement. GUI thread. While on, the GUI thread's event dispatcher's aboutToBlock /
+     *  awake are traced (PlaybackGuiSleepTrace), and noteRunnerSleep() is recorded; off disconnects and forgets the trace.
+     *  Idempotent. MainWindow turns it on only inside a playback_smoke session. */
+    void setGuiTraceActive( bool active );
+    bool guiTraceActive() const;
+    /*! The smoke runner's own sleep on the GUI thread begins (\a sleeping true) or ends, stamped now on the wake's own (QPC)
+     *  clock. A no-op while the trace is off. */
+    void noteRunnerSleep( bool sleeping );
+    /*! What the GUI thread was doing at \a ms (QPC ms), from the trace. Unknown while the trace is off. */
+    PlaybackGuiSleepTrace::At guiStateAt( double ms ) const;
+    /*! A posted (or sent) wake whose arm was replaced or cancelled before the GUI thread took it: the wait thread had
+     *  published its post-return stamp for the replaced generation, and the gate never accepted it. Counted at arm() /
+     *  cancel() on the GUI thread, split by what the GUI thread was doing at that post (guiStateAt of the return stamp). */
+    struct StrandedCounts
+    {
+        quint64 total = 0;
+        quint64 dispatcherWait = 0;
+        quint64 runnerSleep = 0;
+        quint64 running = 0;
+        quint64 unknown = 0;
+    };
+    StrandedCounts strandedCounts() const;
+    void resetStrandedCounts();
+    /*! GUI thread (diagnostic): the wait thread has published the return stamp of a post carrying the current generation,
+     *  i.e. the current arm's message has been handed over. */
+    bool armPostPublished() const;
+
+    /*! FULLSCREEN-S1S2-PRESENT-GAP-1, the lever's second half. The --gui-smoke-playback runner sleeps on the GUI thread
+     *  between its processEvents calls (MainWindow::sleepGuiThreadForSmokeRunner) with QThread::msleep, which pumps nothing:
+     *  a wake handed over during it waited for its end, posted or sent (Bachelor 4adc11c9 fullscreen: post_to_receive p50
+     *  7.9 / 9.2 ms against a 10 ms sleep). The application's own loop waits with QS_ALLINPUT, so a wake reaches it at once.
+     *  GUI thread. With SendNotify delivery this sleeps \a ms as a message wait for QS_SENDMESSAGE ONLY (traced as the runner
+     *  sleep): the sent wake ends it early; posted messages, timers and input do not, so the runner's cadence is otherwise
+     *  unchanged. Returns RunnerSleep::NotHandled for every other delivery (the caller sleeps exactly as before),
+     *  Slept when the whole \a ms passed, WokenBySent when THIS wake's sent message arrived: the caller then accounts its
+     *  sleep and calls dispatchSentMessages().
+     *  r2 G1 (CoS PR 811): a sent message ends the wait, and the sleep dispatches the pending sent messages at once. This
+     *  wake's window procedure holds its own message there (holdWindowProcWake) instead of firing it; only a dispatch that
+     *  held one ends the sleep (WokenBySent). Any other sent message runs in that dispatch, is counted
+     *  (runnerSleepsWokenOther, once per interruption) and the sleep goes on for the rest of \a ms, so the cadence never shortens.
+     *  r2 G3: a failed wait (WAIT_FAILED) sleeps the rest of \a ms with QThread::msleep (counted runnerSleepWaitFailures). */
+    enum class RunnerSleep { NotHandled, Slept, WokenBySent };
+    RunnerSleep sleepForSmokeRunner( unsigned long ms );
+    /*! r3 (r2 adversary pass 7 A3): the nanoseconds the LAST sleepForSmokeRunner spent dispatching sent messages (0 when it
+     *  dispatched none, or returned NotHandled). That dispatch is GUI work: the trace says Running while it runs, and the caller
+     *  takes this time out of the runner sleep it accounts (MainWindow::sleepGuiThreadForSmokeRunner). */
+    qint64 lastRunnerSleepDispatchNs() const;
+    /*! GUI thread: fire the wakes the runner sleep held (through the gate), then dispatch the pending SENT messages (the
+     *  wake's window procedure runs here), and nothing else -- posted messages stay queued for the caller's next processEvents. */
+    void dispatchSentMessages();
+    /*! GUI thread, called by the wake's window procedure with a kNativeWakeMessage MSG*: inside sleepForSmokeRunner's own
+     *  dispatch the message is held for dispatchSentMessages() and this returns true (the window procedure does not fire
+     *  it); anywhere else false. */
+    bool holdWindowProcWake( const void *message );
+    /*! Runner sleeps this wake's sent message ended early, since construction or resetStrandedCounts(). */
+    quint64 runnerSleepsWokenBySent() const;
+    /*! r2 G1: runner-sleep interruptions by a sent message that was not this wake (the sleep went on), same span. */
+    quint64 runnerSleepsWokenOther() const;
+    /*! r2 G3: runner sleeps whose message wait failed and fell back to QThread::msleep, same span. */
+    quint64 runnerSleepWaitFailures() const;
+    /*! Test hook: make the runner sleep's message wait return WAIT_FAILED (the OS failure cannot be injected otherwise). */
+    void setRunnerSleepWaitFailsForTest( bool fails );
 
 private:
     struct Impl;
