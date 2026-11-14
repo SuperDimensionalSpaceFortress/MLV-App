@@ -363,8 +363,9 @@ if (Test-Path -LiteralPath $manifestCachePath) {
             $cachePathByName = @{}
             foreach ($item in $sideFiles) { $cachePathByName[[string]$item.name] = [string]$item.cachePath }
             foreach ($check in @(@('packageZip', $derived.packageZipName), @('exe', $derived.exeName), @('dll', $derived.reconName))) {
-                $claimProperty = $staged.PSObject.Properties[$check[0]]
-                $claimSha = if ($null -ne $claimProperty -and $null -ne $claimProperty.Value -and $null -ne $claimProperty.Value.PSObject.Properties['sha256']) { [string]$claimProperty.Value.sha256 } else { '' }
+                # Read exactly as the leg job reads it ($buildManifest.exe.sha256, member access), so a claim shape the leg accepts
+                # (a one-element array, through member enumeration) counts here too (adversary A1 on 72577e87).
+                $claimSha = [string]$staged.($check[0]).sha256
                 $cachedPath = $cachePathByName[[string]$check[1]]
                 if ([string]::IsNullOrWhiteSpace($claimSha)) { $unsound = "it carries no sha256 for $($check[0])"; break }
                 if (-not (Test-Path -LiteralPath $cachedPath -PathType Leaf)) { $unsound = "$($check[1]) is not in the cache"; break }

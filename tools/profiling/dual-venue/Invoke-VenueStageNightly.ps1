@@ -404,28 +404,21 @@ $runnerJob = $sm.Groups[2].Value
 $runnerId = [IO.Path]::GetFileName($runnerJob) -replace '\.job\.ps1$', ''
 $script:Row.smokeRunnerCacheDir = $runnerDirName
 
-# The ONE reading of "this sha is staged" (VENUE-STAGE-SAME-SHA-RESTAGE-GUARD-1): made here and again right before the stage submission (step 8),
-# because another stager can stage this sha while this call assembles it.
-function Read-CachedBuild {
-    $c = Read-Share $cacheBuildJson $HashByName @($cacheBuildJson)
-    $wf = $false
-    if ($c.present) {
-        $cj = try { $c.text | ConvertFrom-Json } catch { $null }
-        $wf = ($null -ne $cj) -and ([string]$cj.sourceCommit -ceq $commit)
-    }
-    $miss = @(foreach ($n in @($names.exeName, $names.reconName, $names.packageZipName)) { if (-not (Read-Share "$cache\$n" $PathByName @((Join-Path $cache $n), 'file'))) { $n } })
-    if ($wf -and $miss.Count -gt 0) {
-        Stop-Nightly 'STAGE_FAILED' "the $Venue cache holds $($names.buildManifestName) for $commit but not $($miss -join ', '); not re-assembled (a re-assemble makes a new manifest); the hub inspects the cache"
-    }
-    [pscustomobject]@{ cached = $c; inCache = ($wf -and $miss.Count -eq 0) }
+$cached = Read-Share $cacheBuildJson $HashByName @($cacheBuildJson)
+$cachedWellFormed = $false
+if ($cached.present) {
+    $cj = try { $cached.text | ConvertFrom-Json } catch { $null }
+    $cachedWellFormed = ($null -ne $cj) -and ([string]$cj.sourceCommit -ceq $commit)
 }
-$cb = Read-CachedBuild
-$cached = $cb.cached
+$missingArtifacts = @(foreach ($n in @($names.exeName, $names.reconName, $names.packageZipName)) { if (-not (Read-Share "$cache\$n" $PathByName @((Join-Path $cache $n), 'file'))) { $n } })
 $runnerPresent = [bool](Read-Share "$cache\$runnerDirName" $PathByName @((Join-Path $cache $runnerDirName), 'dir'))
-$buildInCache = $cb.inCache
+$buildInCache = $cachedWellFormed -and $missingArtifacts.Count -eq 0
 if ($buildInCache -and $runnerPresent) {
     $script:Row.steps.dllPair = 'skipped'; $script:Row.steps.assemble = 'skipped'; $script:Row.steps.stage = 'in-cache'; $script:Row.steps.smokeRunner = 'in-cache'
     Stop-Nightly 'STAGE_SKIP_ALREADY' "$cacheBuildJson (sourceCommit $commit) and its three artifacts and $runnerDirName are already in the $Venue cache; nothing was built or submitted" -Manifest $cached.hash
+}
+if ($cachedWellFormed -and $missingArtifacts.Count -gt 0) {
+    Stop-Nightly 'STAGE_FAILED' "the $Venue cache holds $($names.buildManifestName) for $commit but not $($missingArtifacts -join ', '); not re-assembled (a re-assemble makes a new manifest); the hub inspects the cache"
 }
 
 # ------------------------------------------------------------------ 5. the floors (the shared board gate scripts, never copied) ---------------------------------------------
@@ -614,20 +607,22 @@ if ($buildInCache) {
     # lane's stage of 23a07757 replaced the manifest a running lease batch had pinned). A staged build is reused, never replaced: this call's own
     # assemble is left unstaged and the staged manifest is the one recorded. (The stage job refuses a replacement on the host as well.)
     # Reused only when SOUND: Get-VenueStagedBuildManifest -VerifyArtifacts, the read the lease batch guards with, finds no content or artifact problem
-    # and the same manifest bytes. Anything else (unsound, changed, or a read that did not answer) goes to the stage job, which replaces only an
-    # unsound build and refuses to replace a sound one (exit 7, STAGE_FAILED here, nothing written).
-    $again = Read-CachedBuild
+    # and the same manifest bytes. It is asked whenever a build.json is there (not only when step 4's stricter test holds: its case-sensitive commit
+    # compare and its missing-artifact stop are not what a leg accepts; adversary A2/A3 on 72577e87), and it is bounded by -ProbeTimeoutSec like
+    # every other share probe here (A4). Anything else (unsound, changed, or a read that did not answer) goes to the stage job, which replaces
+    # only an unsound build and refuses to replace a sound one (exit 7, STAGE_FAILED here, nothing written).
+    $again = Read-Share $cacheBuildJson $HashByName @($cacheBuildJson)
     $sound = $null
-    if ($again.inCache) {
-        $sound = Get-VenueStagedBuildManifest -AgentShare $share -SourceCommit $commit -VerifyArtifacts -TimeoutSec ([double][Math]::Min(600, [Math]::Max(1, (Get-RemainingSec) - 60)))
-        if (-not ($sound.state -ceq 'STAGED' -and $sound.contentProblem -ceq '' -and $sound.artifactProblem -ceq '' -and $sound.sha256 -ceq $again.cached.hash)) {
+    if ($again.present) {
+        $sound = try { Get-VenueStagedBuildManifest -AgentShare $share -SourceCommit $commit -VerifyArtifacts -TimeoutSec ([double]$ProbeTimeoutSec) } catch { [pscustomobject]@{ state = 'UNREACHABLE'; error = ($_.Exception.Message -replace '\s+', ' ') } }
+        if (-not ($sound.state -ceq 'STAGED' -and $sound.contentProblem -ceq '' -and $sound.artifactProblem -ceq '' -and $sound.sha256 -ceq $again.hash)) {
             Say "the $Venue cache holds a build of $commit that is not reused: state=$($sound.state) manifest=$($sound.sha256) content=[$($sound.contentProblem)] artifacts=[$($sound.artifactProblem)] error=[$($sound.error)]; staging this call's build (the stage job replaces only an unsound build)"
             $sound = $null
         }
     }
     if ($null -ne $sound) {
         $submit = $false
-        $expected = $again.cached.hash
+        $expected = $sound.sha256
         $script:Row.steps.stage = 'reused-existing'
         $script:Row.jobIds.stage = $null
         Out-Line "STAGE_REUSED_EXISTING sha=$s12 manifest=$($expected.Substring(0, 8)) manifestSha256=$expected (staged by another stager while this call assembled; its own build $buildDir is not staged)"

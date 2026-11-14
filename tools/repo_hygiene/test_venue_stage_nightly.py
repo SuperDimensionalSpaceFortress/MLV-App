@@ -124,7 +124,9 @@ if ($env:FAKE_ASSEMBLE -like 'racestage*') {
         $claims[$pair[0]] = [ordered]@{ name = $pair[1]; sha256 = (Get-FileHash -LiteralPath $p -Algorithm SHA256).Hash.ToLowerInvariant() }
     }
     if ($env:FAKE_ASSEMBLE -eq 'racestage-corrupt') { [IO.File]::WriteAllText((Join-Path $env:FAKE_RACE_CACHE "MLVApp-playback-attr-3-cuda-$s.exe"), 'corrupt') }
-    $rm = [ordered]@{ sourceCommit = $SourceCommit; assembledAtUtc = 'racer'; dllPairManifestSha256 = ('b' * 64); pendingSymbolPresence = $true; packageZip = $claims.packageZip; exe = $claims.exe; dll = $claims.dll }
+    # racestage-missing: the racer's cached exe is gone afterwards; racestage-upper: the racer's manifest spells the commit in upper case (the leg accepts it)
+    if ($env:FAKE_ASSEMBLE -eq 'racestage-missing') { Remove-Item -LiteralPath (Join-Path $env:FAKE_RACE_CACHE "MLVApp-playback-attr-3-cuda-$s.exe") }
+    $rm = [ordered]@{ sourceCommit = $(if ($env:FAKE_ASSEMBLE -eq 'racestage-upper') { $SourceCommit.ToUpperInvariant() } else { $SourceCommit }); assembledAtUtc = 'racer'; dllPairManifestSha256 = ('b' * 64); pendingSymbolPresence = $true; packageZip = $claims.packageZip; exe = $claims.exe; dll = $claims.dll }
     [IO.File]::WriteAllText((Join-Path $env:FAKE_RACE_CACHE "playback-attr-3-cuda-$s-build.json"), ($rm | ConvertTo-Json -Compress -Depth 4))
 }
 "RESULT=ASSEMBLE_OK SOURCE=$SourceCommit EXE=x DLL=x PKG=x MANIFEST=playback-attr-3-cuda-$s-build.json MANIFEST_SHA256=$h OUT=$OutDir"
@@ -656,10 +658,8 @@ class VenueStageNightlyTests(unittest.TestCase):
         self.assert_restaged_under_a_suffix(self.run_driver())
 
     # ---------------------------------------------------------------- VENUE-STAGE-SAME-SHA-RESTAGE-GUARD-1 (RED first)
-    def test_a_build_another_stager_staged_during_the_assemble_is_reused_never_replaced(self) -> None:
-        # 2026-11-13: two stagers both found 23a07757 NOT_STAGED and both assembled; the later one's stage replaced the first one's
-        # manifest under a running lease batch. The cache is read again right before the stage submission, and a staged build is reused.
-        p = self.run_driver(env={"FAKE_ASSEMBLE": "racestage", "FAKE_RACE_CACHE": str(self.share / "cache")})
+    def assert_racer_reused(self, mode: str) -> None:
+        p = self.run_driver(env={"FAKE_ASSEMBLE": mode, "FAKE_RACE_CACHE": str(self.share / "cache")})
         self.assert_exit(p, "STAGE_OK")
         bj = self.share / "cache" / names()["build"]
         self.assertEqual(json.loads(bj.read_text(encoding="utf-8"))["assembledAtUtc"], "racer", "the racer's staged manifest was replaced")
@@ -669,6 +669,34 @@ class VenueStageNightlyTests(unittest.TestCase):
         self.assertRegex(p.stdout, rf"(?m)STAGE_REUSED_EXISTING sha={S12} manifest={racer[:8]} ")
         r = self.rows()[-1]
         self.assertEqual((r["outcome"], r["buildManifestSha256"], r["steps"]["stage"]), ("STAGE_OK", racer, "reused-existing"))
+
+    def test_a_build_another_stager_staged_during_the_assemble_is_reused_never_replaced(self) -> None:
+        # 2026-11-13: two stagers both found 23a07757 NOT_STAGED and both assembled; the later one's stage replaced the first one's
+        # manifest under a running lease batch. The cache is read again right before the stage submission, and a staged build is reused.
+        self.assert_racer_reused("racestage")
+
+    def test_a_raced_in_build_with_an_upper_case_commit_is_reused(self) -> None:
+        # adversary A2 (72577e87): the leg (and the batch's reader) compare sourceCommit case-insensitively, so this is a sound build; a
+        # case-sensitive re-check sent it to the stage job, which refuses to replace a sound build (STAGE_FAILED).
+        self.assert_racer_reused("racestage-upper")
+
+    def test_a_raced_in_build_missing_an_artifact_is_restaged_not_refused(self) -> None:
+        # adversary A3 (72577e87): a build.json whose exe is gone is not a build a leg can run; this call already assembled one, so it stages it
+        # (the stage job replaces an unsound build) instead of stopping STAGE_FAILED for the hub.
+        p = self.run_driver(env={"FAKE_ASSEMBLE": "racestage-missing", "FAKE_RACE_CACHE": str(self.share / "cache")})
+        self.assert_exit(p, "STAGE_OK")
+        self.assertEqual(len([c for c in self.submissions() if "job=playback-attr-3-cuda-stage-" in c]), 1, self.submissions())
+        self.assertEqual(sha256(self.share / "cache" / names()["build"]), self.assembled_manifest_sha())
+        self.assertIn("BUILD_ARTIFACT_MISSING", p.stdout)
+
+    def test_the_pre_submission_soundness_read_is_bounded_by_the_probe_timeout(self) -> None:
+        # adversary A4 (72577e87): every share probe of this driver is bounded by -ProbeTimeoutSec; the soundness read too (a read that does not
+        # answer in time is not a reuse, and the stage job decides on the host).
+        text = DRIVER.read_text(encoding="utf-8")
+        calls = re.findall(r"Get-VenueStagedBuildManifest -AgentShare [^\r\n}]*", text)
+        self.assertEqual(len(calls), 1, calls)
+        self.assertIn("-TimeoutSec ([double]$ProbeTimeoutSec)", calls[0])
+        self.assertNotIn("-ArtifactTimeoutSec", calls[0])
 
     def test_a_raced_in_build_the_leg_job_would_refuse_is_not_reused(self) -> None:
         # adversary A2 (b47fcfbc): the staged build.json names the sha and every artifact name is there, but the cached exe does not hash to its digest.

@@ -1126,6 +1126,19 @@ class StagedBuildNeverReplacedTests(_PwshCase):
         self.assertIn("STAGE_REFUSED_STAGED_OTHER_MANIFEST", second.stdout)
         self.assertEqual(self.snapshot(), before)
 
+    def test_a_claim_the_leg_job_reads_through_member_enumeration_is_sound(self) -> None:
+        # adversary A1 (72577e87): the leg job reads $buildManifest.exe.sha256, so an exe claim held in a one-element array is accepted there
+        # (and by the generator and the job's own binding); the guard reads it the same way and protects that build.
+        first = self.stage("ad005766", mutate=lambda m: m.update(exe=[m["exe"]]))
+        self.assertEqual(first.returncode, 0, f"{first.stdout}\n{first.stderr}")
+        before = self.snapshot()
+
+        second = self.stage("f8fc75a2", suffix="again")
+
+        self.assertEqual(second.returncode, 7, f"{second.stdout}\n{second.stderr}")
+        self.assertIn("STAGE_REFUSED_STAGED_OTHER_MANIFEST", second.stdout)
+        self.assertEqual(self.snapshot(), before)
+
     def test_a_staged_build_the_leg_job_refuses_for_its_dll_pair_binding_is_replaced(self) -> None:
         # adversary A3 (b47fcfbc): Assert-AttrCudaBuildManifest refuses a build.json with no dllPairManifestSha256 (DLLPAIR_UNBOUND), so no leg can
         # run it; a corrected stage must be able to replace it, not be refused.
