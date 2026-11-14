@@ -1133,6 +1133,63 @@ class StagedBuildNeverReplacedTests(_PwshCase):
         self.assertIn("STATE=STAGED CONTENT=[] ARTIFACT=[]", proc.stdout, proc.stdout + proc.stderr)
         self.assertEqual(list(self.inbox.iterdir()), [], "inputs were left in the inbox")
 
+    def test_r8_an_unsound_staged_manifest_is_gone_before_the_repair_renames_an_artifact_in(self) -> None:
+        # r8 (adversary A1 on 0c0eafd7): a cached manifest with its artifacts absent is unsound and is replaced. Left standing until the new manifest's publish,
+        # a reader that hashed the REPAIRED artifacts against it found it sound and pinned it, and the publish then replaced it (BUILD_MANIFEST_MISMATCH later).
+        # Held after the partials (before any rename), the old manifest is already gone and the share-side read says NOT_STAGED.
+        first = self.stage("ad005766", suffix="first")
+        self.assertEqual(first.returncode, 0, f"{first.stdout}\n{first.stderr}")
+        for e in list(self.cache.iterdir()):
+            if e.name != self.manifest_name and e.is_file():
+                e.unlink()
+        job = self.emit("f8fc75a2", suffix="repair")
+        hold = self.tmp / "hold-repair"
+        cmd = [PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", str(job), "-TestHoldAfterPartialsPath", str(hold)]
+        a = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        try:
+            t0 = time.monotonic()
+            while not Path(f"{hold}.reached").exists() and a.poll() is None and time.monotonic() - t0 < 90:
+                time.sleep(0.1)
+            self.assertTrue(Path(f"{hold}.reached").exists(), "the stager never reached its publication")
+            present_while_held = (self.cache / self.manifest_name).exists()
+            proc = self.run_with_module(
+                f"Import-Module '{self.VENUE_CHAIN}' -Force -DisableNameChecking\n"
+                f"$s = Get-VenueStagedBuildManifest -AgentShare '{self.agent}' -SourceCommit '{SHA_FIXTURE}' -VerifyArtifacts\n"
+                "Write-Output ('STATE=' + $s.state)\n",
+                name="while-held.ps1",
+            )
+        finally:
+            hold.write_text("", encoding="utf-8")
+            out, err = a.communicate(timeout=180)
+        self.assertFalse(present_while_held, f"the unsound manifest stood while the repair was being published:\n{out}")
+        self.assertIn("STATE=NOT_STAGED", proc.stdout, proc.stdout + proc.stderr)
+        self.assertEqual(a.returncode, 0, f"{out}\n{err}")
+        self.assertEqual(self.manifest_sha(), hashlib.sha256((self.tmp / "build-f8fc75a2" / self.manifest_name).read_bytes()).hexdigest())
+
+    def test_r8_a_manifest_replaced_or_retired_while_its_artifacts_are_hashed_is_never_sound(self) -> None:
+        # r8 (adversary A1 on 0c0eafd7, reader side, VenueChain.psm1 Get-VenueStagedBuildManifest): the manifest read answered for M0's bytes, then a stager retired or
+        # replaced M0 before the artifact hash. The default hash reads the manifest again last: gone -> BUILD_ARTIFACT_MISSING, other bytes -> BUILD_ARTIFACT_MISMATCH.
+        first = self.stage("ad005766", suffix="first")
+        self.assertEqual(first.returncode, 0, f"{first.stdout}\n{first.stderr}")
+        m0 = (self.cache / self.manifest_name).read_bytes()
+        m = json.loads(m0)
+        facts = [hashlib.sha256(m0).hexdigest(), "C:" + SHA_FIXTURE, "D:" + m["dllPairManifestSha256"], "S:bool"]
+        for k in ("packageZip", "exe", "dll"):
+            facts += [f"A:{k}=ok", f"H:{k}=" + m[k]["sha256"]]
+        probe = "; ".join(f"'{f}'" for f in facts)
+        for case, change, code in (("retired", lambda p: p.unlink(), "BUILD_ARTIFACT_MISSING"),
+                                   ("replaced", lambda p: p.write_bytes(m0 + b"\n"), "BUILD_ARTIFACT_MISMATCH")):
+            with self.subTest(case=case):
+                (self.cache / self.manifest_name).write_bytes(m0)
+                change(self.cache / self.manifest_name)
+                proc = self.run_with_module(
+                    f"Import-Module '{self.VENUE_CHAIN}' -Force -DisableNameChecking\n"
+                    f"$s = Get-VenueStagedBuildManifest -AgentShare '{self.agent}' -SourceCommit '{SHA_FIXTURE}' -VerifyArtifacts -ProbeScript {{ param($p) {probe} }}\n"
+                    "Write-Output ('STATE=' + $s.state + ' ARTIFACT=[' + $s.artifactProblem + ']')\n",
+                    name=f"swapped-{case}.ps1",
+                )
+                self.assertRegex(proc.stdout, rf"STATE=STAGED ARTIFACT=\[{code} [^\]]*{re.escape(self.manifest_name)}", proc.stdout + proc.stderr)
+
     def test_the_stage_lock_is_the_caches_and_the_shas_never_a_callers_name(self) -> None:
         # A3 siblings: the lock is taken before the never-replace guard and held through publishRename (:442), the manifest slot (:451) and its publish (:454)
         text = STAGE_GENERATOR.read_text(encoding="utf-8")
