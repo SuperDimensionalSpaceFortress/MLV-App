@@ -514,19 +514,25 @@ class GeneratorByteIdentityAndVariantTests(unittest.TestCase):
     # comparison: any other change to the baseline side still fails it.
     CLAIM_SHAPE_OPEN = "VENUE-STAGE-CLAIM-SHAPE-1 >>>"
     CLAIM_SHAPE_CLOSE = "VENUE-STAGE-CLAIM-SHAPE-1 <<<"
-    CLAIM_SHAPE_REGIONS = 2
-    CLAIM_SHAPE_REPLACED_BASELINE = ("$manifestChecks = @(\n"
-                                     "    @{ label = 'packageZip'; path = (Join-Path $Cache $BasePackageZip); expectedSha = $buildManifest.packageZip.sha256 },\n"
-                                     "    @{ label = 'exe'; path = (Join-Path $Cache $ExeName); expectedSha = $buildManifest.exe.sha256 },\n"
-                                     "    @{ label = 'dll'; path = (Join-Path $Cache $ReconName); expectedSha = $buildManifest.dll.sha256 }\n"
-                                     ")\n")
+    # r7 (adversary A1 on ef28cd37): a third region, in the embedded Assert-AttrCudaBuildManifest, types every parse failure ATTRCUDA_BUILD_MANIFEST_UNPARSEABLE; it
+    # replaces the baseline's bare parse and null check (the second pinned block).
+    CLAIM_SHAPE_REGIONS = 3
+    CLAIM_SHAPE_REPLACED_BASELINE = (("$manifestChecks = @(\n"
+                                      "    @{ label = 'packageZip'; path = (Join-Path $Cache $BasePackageZip); expectedSha = $buildManifest.packageZip.sha256 },\n"
+                                      "    @{ label = 'exe'; path = (Join-Path $Cache $ExeName); expectedSha = $buildManifest.exe.sha256 },\n"
+                                      "    @{ label = 'dll'; path = (Join-Path $Cache $ReconName); expectedSha = $buildManifest.dll.sha256 }\n"
+                                      ")\n"),
+                                     ("    $manifest = [IO.File]::ReadAllText($Path) | ConvertFrom-Json\n"
+                                      "    if ($null -eq $manifest) { throw \"ATTRCUDA_BUILD_MANIFEST_UNPARSEABLE $Path\" }\n"))
 
     @classmethod
     def without_claim_shape_replaced_baseline(cls, text: str) -> str:
-        """The baseline job with the one block VENUE-STAGE-CLAIM-SHAPE-1's second region replaces taken out (it must be there exactly once)."""
+        """The baseline job with each block a VENUE-STAGE-CLAIM-SHAPE-1 region replaces taken out (each must be there exactly once)."""
         text = lf(text)
-        assert text.count(cls.CLAIM_SHAPE_REPLACED_BASELINE) == 1, "the baseline's $manifestChecks block moved: update CLAIM_SHAPE_REPLACED_BASELINE"
-        return text.replace(cls.CLAIM_SHAPE_REPLACED_BASELINE, "", 1)
+        for block in cls.CLAIM_SHAPE_REPLACED_BASELINE:
+            assert text.count(block) == 1, f"a baseline block VENUE-STAGE-CLAIM-SHAPE-1 replaces moved: update CLAIM_SHAPE_REPLACED_BASELINE ({block.splitlines()[0]!r})"
+            text = text.replace(block, "", 1)
+        return text
 
     @classmethod
     def strip_regions(cls, text: str) -> tuple[str, dict[str, int]]:

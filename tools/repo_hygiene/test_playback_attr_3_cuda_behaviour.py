@@ -736,6 +736,16 @@ class BuildManifestAuthenticationTests(_PwshCase):
         )
         self.assert_throws(self.call("a" * 64), "ATTRCUDA_BUILD_MANIFEST_SHA_MISMATCH")
 
+    def test_every_parse_failure_is_the_unparseable_content_refusal(self) -> None:
+        # VENUE-STAGE-SAME-SHA-RESTAGE-GUARD-1 r7 (adversary A1 on ef28cd37): ConvertFrom-Json throws InvalidOperationException on keys that differ
+        # only by case, ArgumentException on malformed text; both are a content verdict on readable bytes, so both carry the one token.
+        import hashlib
+
+        for payload in (b'{"x":1,"X":2}', b"{ this is not json"):
+            with self.subTest(payload=payload):
+                self.manifest_path.write_bytes(payload)
+                self.assert_throws(self.call(hashlib.sha256(payload).hexdigest()), "ATTRCUDA_BUILD_MANIFEST_UNPARSEABLE")
+
 
 # --------------------------------------------------------------------------------------------
 # (d) the smoke-runner log contract
@@ -1197,6 +1207,27 @@ class StagedBuildNeverReplacedTests(_PwshCase):
 
         self.assertEqual(second.returncode, 0, f"{second.stdout}\n{second.stderr}")
         self.assertEqual(self.manifest_sha(), hashlib.sha256((self.tmp / "build-f8fc75a2" / self.manifest_name).read_bytes()).hexdigest())
+
+    def test_a_readable_staged_build_json_no_parser_accepts_is_replaced(self) -> None:
+        # r7 (adversary A1 on ef28cd37): ConvertFrom-Json throws InvalidOperationException (not ArgumentException) on keys that differ only by case,
+        # which the guard's content allowlist did not name, so a readable but unparseable cached build.json was STAGE_REFUSED_STAGED_UNREADABLE
+        # (exit 7) and wedged the sha. Every parse failure is the leg job's content refusal (ATTRCUDA_BUILD_MANIFEST_UNPARSEABLE): replaced.
+        # (A key repeated exactly parses, last value wins, so it reaches the content checks: COMMIT_MISMATCH, already replaced.)
+        cases = (("keys differing only by case", b'{"x":1,"X":2}'), ("not JSON", b"{ this is not json"))
+        for i, (label, payload) in enumerate(cases):
+            with self.subTest(case=label):
+                for e in list(self.cache.iterdir()):
+                    shutil.rmtree(e) if e.is_dir() else e.unlink()
+                first = self.stage("ad005766", suffix=f"first{i}")
+                self.assertEqual(first.returncode, 0, f"{first.stdout}\n{first.stderr}")
+                (self.cache / self.manifest_name).write_bytes(payload)
+
+                second = self.stage("f8fc75a2", suffix=f"repair{i}")
+
+                self.assertEqual(second.returncode, 0, f"{second.stdout}\n{second.stderr}")
+                self.assertNotIn("STAGE_REFUSED_STAGED_UNREADABLE", second.stdout)
+                self.assertIn("ATTRCUDA_BUILD_MANIFEST_UNPARSEABLE", second.stdout)
+                self.assertEqual(self.manifest_sha(), hashlib.sha256((self.tmp / "build-f8fc75a2" / self.manifest_name).read_bytes()).hexdigest())
 
     def test_a_staged_build_the_leg_job_accepts_is_sound_whatever_the_case_of_its_commit(self) -> None:
         # adversary A1 (b47fcfbc): the stage and leg jobs compare sourceCommit case-insensitively, so an upper-case one is a build legs run
