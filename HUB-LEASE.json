@@ -1,0 +1,9 @@
+{
+  "schema": "mlv-app/hub-lease/v1",
+  "holder": "PC-MINI3",
+  "previousHolder": "",
+  "setBy": "layib@PC-MINI3",
+  "setUtc": "2026-11-14T12:43:19.5116677Z",
+  "reason": "cut-over from VIRTUAL-TEN (owner 2026-11-14)",
+  "rule": "Only the holder runs board-driving tasks (MLV-HubAutopilot, FleetHeartbeatPublish, QualityLift, Fleet-HealthDaily). Release on the holder before acquiring elsewhere."
+}
