@@ -1137,9 +1137,12 @@ $wmiTypes = '(^|\.)(wmiclass|wmi|ManagementClass)$'
 $quoteChars = '["' + "'" + [char]0x2018 + [char]0x2019 + [char]0x201A + [char]0x201B + [char]0x201C + [char]0x201D + [char]0x201E + ']'
 $quoteOrEscape = '[#`' + $quoteChars.Substring(1)
 
-# The literal method name of an Invoke-CimMethod / Invoke-WmiMethod call, or $null when it is positional, built at run time or splatted.
+# The literal method name(s) of an Invoke-CimMethod / Invoke-WmiMethod call, joined by a space, or $null when there is none (positional or splatted) or ANY
+# method-name operand is built at run time. -Name is an alias of -MethodName, so a call can carry more than one operand (PowerShell rejects that at bind time, but
+# the scan must not read a different binding than the one it refuses on): EVERY operand is read, not the first one.
 function Get-MethodName($Command) {
     $elements = @($Command.CommandElements)
+    $names = New-Object System.Collections.Generic.List[string]
     for ($i = 1; $i -lt $elements.Count; $i++) {
         $e = $elements[$i]
         if ($e -isnot [CommandParameterAst]) { continue }
@@ -1147,9 +1150,10 @@ function Get-MethodName($Command) {
         $isName = ($n.Length -ge 2 -and 'MethodName'.StartsWith($n, [StringComparison]::OrdinalIgnoreCase)) -or ($n -ieq 'Name')
         if (-not $isName) { continue }
         $v = if ($null -ne $e.Argument) { $e.Argument } elseif ($i + 1 -lt $elements.Count) { $elements[$i + 1] } else { $null }
-        if ($v -is [StringConstantExpressionAst]) { return [string]$v.Value }
+        if ($v -is [StringConstantExpressionAst]) { $names.Add([string]$v.Value) } else { return $null }
     }
-    return $null
+    if ($names.Count -eq 0) { return $null }
+    return ($names -join ' ')
 }
 
 # A variable's name as PowerShell resolves it here: lowercased, with scope prefixes and the variable: drive removed ($local:c, $script:c, $global:c, $private:c,
@@ -1963,6 +1967,15 @@ def test_wmi_create_scan_refuses_each_direct_create_spelling(tmp_path):
         "alias-numeric-name": "Set-Alias -Name 7 -Value Invoke-CimMethod\n& '7' -ClassName Win32_Process -MethodName Create",
         "alias-numeric-positional-name": "Set-Alias 7 Invoke-CimMethod\n& '7' -ClassName Win32_Process -MethodName Create",
         "alias-numeric-hop-in-a-chain": "Set-Alias 7 Invoke-CimMethod\nSet-Alias spawn 7\nspawn -ClassName Win32_Process -MethodName Create",
+        # adversary pass 11 A1: -Name is an alias of -MethodName, so a call can carry two method-name operands; the scan reads EVERY one and refuses when any is
+        # Create or not a literal (PowerShell itself rejects a doubled parameter at bind time, so this is a scan that must not read a different binding than it)
+        "cim-method-name-given-twice-name-first": "Invoke-CimMethod -Name root/cimv2 -ClassName Win32_Process -MethodName Create -Arguments @{ CommandLine = 'x' }",
+        "cim-method-name-given-twice-methodname-first": "Invoke-CimMethod -ClassName Win32_Process -MethodName GetOwner -Name Create",
+        "cim-method-name-given-twice-by-abbreviation": "Invoke-CimMethod -ClassName Win32_Process -Meth GetOwner -MethodName Create",
+        "cim-method-name-given-twice-literal-then-create-colon-form": "Invoke-CimMethod -ClassName Win32_Process -Name:Terminate -MethodName:Create",
+        "cim-method-name-non-literal-then-safe-literal": "Invoke-CimMethod -ClassName Win32_Process -Name $m -MethodName GetOwner",
+        "cim-method-name-safe-literal-then-non-literal": "Invoke-CimMethod -ClassName Win32_Process -MethodName GetOwner -Name $m",
+        "wmi-method-name-given-twice": "Invoke-WmiMethod -Class Win32_Process -Name GetOwner -Name Create",
         # adversary pass 10 A3: a write through `$(...)` or an `-as` cast is a write to the table
         "splat-subexpression-keyed-write": "$h = @{}\n$($h)['PipelineVariable'] = 'w'\nGet-WmiObject -List Win32_Process @h | ForEach-Object { $w.Create('x') }",
         "splat-subexpression-member-write": "$h = @{}\n$($h).PipelineVariable = 'w'\nGet-WmiObject -List Win32_Process @h | ForEach-Object { $w.Create('x') }",
