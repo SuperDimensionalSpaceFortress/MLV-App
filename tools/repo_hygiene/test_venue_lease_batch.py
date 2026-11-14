@@ -190,6 +190,11 @@ if ($JobId -like 'lease-batch-open-*') {
         $iv = [string]$env:FAKE_IDLE_SEC
         $adm['leaseBatch']['idleSec'] = $(if ($iv -like 'str:*') { $iv.Substring(4) } elseif ($iv -like 'dbl:*') { [double]$iv.Substring(4) } elseif ($iv -eq 'null') { $null } else { [int]$iv })
     }
+    # r5 (adversary r4 pass 3 A1): FAKE_OPEN_LB_WRAP publishes the leaseBatch inside an array: array ([{..}]) | nullplus ([null, {..}]) | nested ([[{..}]])
+    if ($mode -ne 'nobatch' -and $env:FAKE_OPEN_LB_WRAP) {
+        $lb0 = $adm['leaseBatch']; $w = [string]$env:FAKE_OPEN_LB_WRAP
+        if ($w -eq 'array') { $adm['leaseBatch'] = @($lb0) } elseif ($w -eq 'nullplus') { $adm['leaseBatch'] = @($null, $lb0) } elseif ($w -eq 'nested') { $adm['leaseBatch'] = @(,@($lb0)) }
+    }
     [pscustomobject]@{ opens = $n + 1; leaseId = $lid; token = $token } | ConvertTo-Json | Set-Content -LiteralPath $stateFile
     # r5: FAKE_OPEN_SLEEP per open: um-run blocks this long first, as it does while the agent re-asks a refused (exit 75) request for the open
     $sleep = [int](Pick $env:FAKE_OPEN_SLEEP $n '0')
@@ -216,6 +221,14 @@ if ($JobId -like 'lease-batch-open-*') {
         New-Item -ItemType Directory -Force -Path $outbox | Out-Null
         $res | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath (Join-Path $outbox "$JobId.result.json")
         throw "UNRESOLVED: $JobId was held unlaunched in the agent's heavy-slot admission gate (fake) for the full -MaxAdmissionWaitSec"
+    }
+    if ($mode -eq 'errlanded') {
+        # r5 (adversary r4 pass 3 A1 sibling): the agent ran the open and its result landed by name, but um-run itself failed (outcome ERROR): the batch's finally cancels the open
+        # and reconciles it by name (RAN_BEFORE_CANCEL when its admission names the lease)
+        $outbox = Join-Path $AgentShare 'outbox'
+        New-Item -ItemType Directory -Force -Path $outbox | Out-Null
+        $res | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath (Join-Path $outbox "$JobId.result.json")
+        throw "fake um-run failure after $JobId's result landed"
     }
     if ($env:FAKE_OPEN_VIA_REAL_UMRUN -eq '1') {
         # r14 (adversary r13 A1): the open's result reaches the runner through the REAL um-run.ps1 reader, the way it does in production: the agent's result file is staged in the outbox
@@ -304,6 +317,8 @@ $nRef = [int](Pick $env:FAKE_LEG_REFUSALS $k '0')
 if ($nRef -gt 0) { $res.admission['leaseRefusals'] = @(1..$nRef | ForEach-Object { [ordered]@{ reason = 'refused'; rc = 75; why = 'quiet lease cooldown' } }) }
 $stop = Pick $env:FAKE_LEG_STOPS $k 'none'
 if ($stop -ne 'none') { $res.exitCode = 124; $res.admission['slotContinuity'] = 'lost'; $res.admission['leaseStop'] = [ordered]@{ reason = $stop; why = 'fake' } }
+# r5 (adversary r4 pass 3 A1 sibling): FAKE_LEG_LB_WRAP per call: array publishes the leg's leaseBatch (this batch's lease) inside a one-element array | none
+if ((Pick $env:FAKE_LEG_LB_WRAP $k 'none') -eq 'array') { $res.admission['leaseBatch'] = @($res.admission['leaseBatch']) }
 # r5b: FAKE_LEG_MODES 'unresolved' = um-run said UNRESOLVED for the leg's job (um-run.ps1:480-501): no agent result lands by name, and Invoke-VenueLeg still
 # writes its receipt (DVE_OUTCOME=UNRESOLVED) and exits 0
 if ($legMode -ne 'unresolved') { $res | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath (Join-Path $outbox "$jobId.result.json") }
@@ -1067,6 +1082,79 @@ class VenueLeaseBatchRunnerTests(unittest.TestCase):
                 self.assertEqual((b["endReason"], b["legsAttempted"]), ("AGENT_IDLE_BOUND_UNKNOWN", 0), b)
                 self.assertIn("published admission.leaseBatch.idleSec=", b["endDetail"])
                 self.assertEqual(self.kinds(), [f"OPEN:{b['token']}", f"CLOSE:{b['token']}"])
+
+    # ---------------------------------------------------------------- r5 (adversary r4 pass 3 A1): a leaseBatch that is not ONE object names no lease and no idle bound
+    def test_lease_batch_idle_end_r5_adv_a1_an_array_wrapped_lease_batch_is_not_batch_capable(self) -> None:
+        # adversary-493c4fff.json A1: admission.leaseBatch published as [{..}] (and [null, {..}], [[{..}]]) passed the capability check through member enumeration (.token and
+        # .leaseId answered from inside the array) while Get-PublishedIdleBound read the array's own properties: idleSec ABSENT, the script default 300, and the legs ran although the
+        # agent published idleSec 0. Now nothing runs (AGENT_NOT_BATCH_CAPABLE, exit 10), the close releases the token, and the lease it may hold is charged open to close, unnamed.
+        real = str(RUNNER.parent.parent / "um-run.ps1")
+        cases = [("array", {}), ("nullplus", {}), ("nested", {}), ("array", {"FAKE_OPEN_VIA_REAL_UMRUN": "1", "FAKE_REAL_UMRUN": real})]
+        for wrap, extra in cases:
+            with self.subTest(wrap=wrap, realUmRun=bool(extra)):
+                self.setUp()
+                r = self.run_batch(self.specs[:2], FAKE_IDLE_SEC="0", FAKE_OPEN_LB_WRAP=wrap, **extra)
+                self.assertEqual(r.returncode, 10, r.stdout + r.stderr)
+                [b] = self.batches()
+                self.assertEqual((b["endReason"], b["legsAttempted"], b["leaseId"]), ("AGENT_NOT_BATCH_CAPABLE", 0, None), b)
+                self.assertIn("not one admission.leaseBatch object", b["endDetail"])
+                self.assertEqual(self.kinds(), [f"OPEN:{b['token']}", f"CLOSE:{b['token']}"])
+                self.assertEqual((b["ledger"]["basis"], b["ledger"]["leaseId"]), ("open-lease-unnamed", None), b["ledger"])
+                res = batch_result(r.stdout)
+                self.assertEqual((res["stopReason"], res["notRun"]), ("AGENT_NOT_BATCH_CAPABLE", 2))
+
+    def test_lease_batch_idle_end_r5_adv_a1_a_leg_whose_lease_batch_is_array_wrapped_is_not_on_the_lease(self) -> None:
+        # the :2526 sibling: a leg result whose leaseBatch is [{.. this batch's lease ..}] gave jobLease through member enumeration, so the leg counted on the lease. It names no
+        # lease now: not on this batch's lease (LEASE_LOST, never counted), as a leg on another lease is (the FAKE_LEG_LOSE case).
+        r = self.run_batch(self.specs[:2], FAKE_LEG_LB_WRAP="array,none")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        b1, b2 = self.batches()
+        self.assertEqual((b1["endReason"], b1["legsRan"], b1["legsCounted"]), ("LEASE_LOST", 1, 0), b1)
+        self.assertEqual((b1["legs"][0]["class"], b1["legs"][0]["counted"], b1["legs"][0]["onLease"], b1["legs"][0]["jobLease"]), ("LEASE_LOST", False, False, None), b1["legs"][0])
+        self.assertEqual((b2["legsRan"], b2["legsCounted"]), (1, 1))
+        res = batch_result(r.stdout)
+        self.assertEqual((res["ran"], res["counted"]), (2, 1))
+
+    def test_lease_batch_idle_end_r5_adv_a1_an_open_reconciled_by_name_with_an_array_wrapped_lease_batch_is_charged_unnamed(self) -> None:
+        # the :2646 sibling: the open's um-run failed after the agent ran it (its result landed by name), so the finally reconciles it. Its leaseBatch [{..}] read as
+        # RAN_BEFORE_CANCEL with the lease id enumerated out of the array; it is RAN_LEASE_UNNAMED now, charged open to close with no lease id. Control: one object is still
+        # RAN_BEFORE_CANCEL on its own lease.
+        for wrap, want_state, want_lease, want_basis in (("array", "RAN_LEASE_UNNAMED", None, "open-lease-unnamed"), ("", "RAN_BEFORE_CANCEL", "lease-1", "open-to-close")):
+            with self.subTest(wrap=wrap or "object"):
+                self.setUp()
+                r = self.run_batch(self.specs[:1], "-CancelReconcileSec", "3", FAKE_OPEN_MODES="errlanded", **({"FAKE_OPEN_LB_WRAP": wrap} if wrap else {}))
+                self.assertEqual(r.returncode, 9, r.stdout + r.stderr)
+                [b] = self.batches()
+                self.assertEqual((b["endReason"], b["openOutcome"], b["legsAttempted"]), ("OPEN_FAILED", "ERROR", 0), b)
+                self.assertEqual((b["openCancel"]["state"], b["leaseId"]), (want_state, want_lease), b["openCancel"])
+                self.assertEqual((b["ledger"]["basis"], b["ledger"]["leaseId"]), (want_basis, want_lease), b["ledger"])
+
+    def test_lease_batch_idle_end_r5_adv_a1_the_lease_batch_reader_takes_one_object_or_none(self) -> None:
+        # the class: Get-AdmissionLeaseBatch reads admission.leaseBatch as ONE object (OBJECT), none (ABSENT) or something else that is there (MALFORMED); Get-PublishedIdleBound
+        # reads a non-object leaseBatch INVALID (never ABSENT), and Get-LeaseEndUtc places no lease end from one. An admission that is itself an array is MALFORMED too.
+        script = (
+            f"$ast = [System.Management.Automation.Language.Parser]::ParseFile('{psq(RUNNER)}', [ref]$null, [ref]$null)\n"
+            "foreach ($n in 'Test-JsonObject', 'Get-AdmissionLeaseBatch', 'Get-PublishedIdleBound', 'Get-LeaseEndUtc') { . ([scriptblock]::Create($ast.Find({ param($x) $x -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $x.Name -eq $n }, $true).Extent.Text)) }\n"
+            "$lb = '{\"token\":\"0123456789ab\",\"leaseId\":\"L1\",\"untilEpoch\":1794681900,\"remainingSec\":2700,\"idleSec\":0}'\n"
+            "$out = [ordered]@{}\n"
+            "foreach ($c in @(@('object', $lb), @('array', \"[$lb]\"), @('nullplus', \"[null,$lb]\"), @('nested', \"[[$lb]]\"), @('string', '\"x\"'), @('null', 'null'))) {\n"
+            "  $r = ('{\"exitCode\":0,\"endedUtc\":\"2026-11-14T18:00:00Z\",\"admission\":{\"label\":\"clear\",\"leaseBatch\":' + $c[1] + '}}') | ConvertFrom-Json\n"
+            "  $out[$c[0]] = @((Get-AdmissionLeaseBatch $r.admission).state, (Get-PublishedIdleBound $r.admission.leaseBatch).state, ($null -ne (Get-LeaseEndUtc $r))) -join '|'\n"
+            "}\n"
+            "$out['admissionArray'] = (Get-AdmissionLeaseBatch (('[{\"label\":\"clear\",\"leaseBatch\":' + $lb + '}]') | ConvertFrom-Json -NoEnumerate)).state\n"
+            "$out['absent'] = (Get-AdmissionLeaseBatch ('{\"label\":\"clear\"}' | ConvertFrom-Json)).state\n"
+            "$out['dict'] = (Get-AdmissionLeaseBatch ([pscustomobject]@{ leaseBatch = [ordered]@{ token = 't'; leaseId = 'L1' } })).state\n"
+            "$out | ConvertTo-Json -Compress\n"
+        )
+        out = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, timeout=120)
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        self.assertEqual(json.loads(out.stdout), {
+            "object": "OBJECT|INVALID|True", "array": "MALFORMED|INVALID|False", "nullplus": "MALFORMED|INVALID|False", "nested": "MALFORMED|INVALID|False",
+            "string": "MALFORMED|INVALID|False", "null": "ABSENT|ABSENT|False", "admissionArray": "MALFORMED", "absent": "ABSENT", "dict": "OBJECT"})
+        # and no reader in the runner reads a leaseBatch by member access (which enumerates a collection): every one goes through Get-AdmissionLeaseBatch
+        src = RUNNER.read_text(encoding="utf-8")
+        self.assertEqual(re.findall(r"\$\w+(?:\.\w+)*\.leaseBatch\b", src), [])
+        self.assertEqual(src.count("Get-AdmissionLeaseBatch $"), 4)
 
     # ---------------------------------------------------------------- r4 (adversary r4 A1): the idle anchor is the agent job's end, not when this runner got round to it
     def test_lease_batch_idle_end_r4_adv_a1_the_idle_allowance_starts_before_the_opens_liveness_cleanup(self) -> None:

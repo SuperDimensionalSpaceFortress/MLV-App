@@ -1636,7 +1636,7 @@ function Get-LeaseEndUtc($Result) {
     # When the batch lease ends, on THIS clock: the agent's own until= minus its own endedUtc (one clock, no skew), added to now (when the result was read,
     # which is no earlier than when the job ended). $null when the result carries no batch lease.
     try {
-        $lb = $Result.admission.leaseBatch
+        $lb = (Get-AdmissionLeaseBatch $Result.admission).value   # r5 (adversary r4 pass 3 A1): one object or none, never an array's enumerated until=
         if ($null -eq $lb -or $null -eq $lb.untilEpoch -or -not $Result.endedUtc) { return $null }
         # PowerShell 7 ConvertFrom-Json hands a "...Z" string back as a DateTime of Kind Utc; [string] drops the Kind and Parse then assumes THIS host's offset
         # (a Central host put every lease end 5 h early). A DateTime converts by its Kind (Unspecified is read as UTC, like the string with no zone); a string
@@ -1698,11 +1698,34 @@ function Get-LeaseIdleEnd([string]$Token, [string]$LeaseId) {
     $null
 }
 
+function Test-JsonObject($Value) {
+    # r5 (adversary r4 pass 3 A1): ONE JSON object, as ConvertFrom-Json (a PSCustomObject) or an in-process um-run (a dictionary) hands it back. Never a collection: PowerShell's
+    # member access ENUMERATES one, so `.token` on [{token:..}] answers from inside it.
+    $Value -is [System.Collections.IDictionary] -or $Value -is [System.Management.Automation.PSCustomObject]
+}
+
+function Get-AdmissionLeaseBatch($Admission) {
+    # r5 (adversary r4 pass 3 A1): admission.leaseBatch read as ONE object or not at all, for every reader in this runner (the open's capability check, its idle bound, the lease
+    # end, a leg's lease, the open's cancel reconcile). A leaseBatch published as an array ([{..}], [null, {..}], [[{..}]]) passed the capability check through member enumeration
+    # while its own idleSec read ABSENT, so the run fell back to the script default. state: OBJECT (value is it), ABSENT (no admission, no leaseBatch, or JSON null), or MALFORMED
+    # (a leaseBatch that is there but is not one object, or an admission that is not one object: value $null, type names what was there). VenueThermalGate.psm1 reads it the same way.
+    if ($null -eq $Admission) { return [pscustomobject]@{ state = 'ABSENT'; value = $null; type = $null } }
+    if (-not (Test-JsonObject $Admission)) { return [pscustomobject]@{ state = 'MALFORMED'; value = $null; type = "admission $($Admission.GetType().Name)" } }
+    $lb = $null
+    if ($Admission -is [System.Collections.IDictionary]) { if ($Admission.Contains('leaseBatch')) { $lb = $Admission['leaseBatch'] } }
+    else { $p = $Admission.PSObject.Properties['leaseBatch']; if ($null -ne $p) { $lb = $p.Value } }
+    if ($null -eq $lb) { return [pscustomobject]@{ state = 'ABSENT'; value = $null; type = $null } }
+    if (Test-JsonObject $lb) { return [pscustomobject]@{ state = 'OBJECT'; value = $lb; type = $null } }
+    [pscustomobject]@{ state = 'MALFORMED'; value = $null; type = "leaseBatch $($lb.GetType().Name)" }
+}
+
 function Get-PublishedIdleBound($LeaseBatch) {
     # r4 (Grok G7 on #817): admission.leaseBatch.idleSec as the running agent published it. ABSENT (an agent that predates the field) is the only case the caller may answer from
     # the agent script's default; a key that is THERE but is not a whole number of seconds in 1..86400 (0, negative, too large, a string, a double, null) is INVALID: the running
     # agent's bound is then unknown, and the caller fails closed (AGENT_IDLE_BOUND_UNKNOWN), never the repo copy's default.
+    # r5 (adversary r4 pass 3 A1): a leaseBatch that is not ONE object (an array whose own properties hold no idleSec) is INVALID too, never ABSENT (Get-AdmissionLeaseBatch).
     $present = $false; $v = $null
+    if ($null -ne $LeaseBatch -and -not (Test-JsonObject $LeaseBatch)) { return [pscustomobject]@{ state = 'INVALID'; sec = $null; text = "leaseBatch $($LeaseBatch.GetType().Name)" } }
     if ($LeaseBatch -is [System.Collections.IDictionary]) { if ($LeaseBatch.Contains('idleSec')) { $present = $true; $v = $LeaseBatch['idleSec'] } }
     elseif ($null -ne $LeaseBatch -and $null -ne $LeaseBatch.PSObject.Properties['idleSec']) { $present = $true; $v = $LeaseBatch.idleSec }
     if (-not $present) { return [pscustomobject]@{ state = 'ABSENT'; sec = $null; text = 'absent' } }
@@ -1970,6 +1993,7 @@ while ($pending.Count -gt 0 -and $null -eq $stopReason) {
         thermalWaits = 0; thermalSkips = 0
     }
     foreach ($ck in $capsReceipt.Keys) { $b[$ck] = $capsReceipt[$ck] }
+    $openLeaseUnnamed = $false   # r5 (adversary r4 pass 3 A1): this batch's open carried a leaseBatch that is not one object (the finally charges it open-lease-unnamed)
     # (0) CAPS b and c: wait out the cooldown after the last lease and the 3 h budget BEFORE the claim, so the venue is never held through either.
     $bw = Get-VenueLeaseBudgetWait -Leases @($leases) -NowUtc ([DateTime]::UtcNow) -CapSec $LeaseCapSec -CooldownSec $LeaseCooldownSec -WindowSec $LeaseBudgetWindowSec -BudgetSec $LeaseBudgetSec
     $b.preOpenWait = [ordered]@{ reason = $bw.reason; waitSec = $bw.waitSec; usedSec = $bw.usedSec; budgetRoomSec = $bw.budgetRoomSec; openUtc = $bw.openUtc.ToString('o'); lastLeaseEndUtc = $(if ($bw.lastEndUtc) { $bw.lastEndUtc.ToString('o') }) }
@@ -2177,6 +2201,7 @@ while ($pending.Count -gt 0 -and $null -eq $stopReason) {
             }
         }
         $adm = $(if ($null -ne $op.result) { $op.result.admission } else { $null })
+        $openLb = Get-AdmissionLeaseBatch $adm   # r5 (adversary r4 pass 3 A1): every read of the open's leaseBatch below goes through this one object (or none)
         # r5: the open's result is in hand (or it was retracted before the agent saw it): this run no longer owns it, so its sidecar goes. Otherwise it is kept
         # renewed until the end of the batch cancels and reconciles the open.
         # r16: and an open whose job file was never written was never anyone's (JOB_WRITE_FAILED)
@@ -2223,21 +2248,27 @@ while ($pending.Count -gt 0 -and $null -eq $stopReason) {
         } elseif (($op.outcome -cne 'RECEIPT' -and $op.outcome -cne 'RECEIPT_BY_NAME') -or $null -eq $op.result -or [int]$op.result.exitCode -ne 0 -or $null -eq $adm -or [string]$adm.label -cne 'clear') {
             $b.endReason = 'OPEN_FAILED'; $b.endDetail = "outcome=$($op.outcome) exit=$(if ($op.result) { $op.result.exitCode }) label=$(if ($adm) { $adm.label }) $($op.message)".Trim()
             Set-Stop 'OPEN_FAILED' 9
-        } elseif ($null -eq $adm.leaseBatch -or -not [string]::Equals([string]$adm.leaseBatch.token, $token, [StringComparison]::Ordinal) -or -not $adm.leaseBatch.leaseId) {
+        } elseif ($openLb.state -ceq 'MALFORMED') {
+            # r5 (adversary r4 pass 3 A1): a leaseBatch (or admission) that is there but is not ONE object names no lease and no idle bound: nothing runs. The agent may still hold a
+            # lease under the token (the close releases it by token), so the finally charges the ledger from the open's submit to the close, with no lease id (open-lease-unnamed).
+            $openLeaseUnnamed = $true
+            $b.endReason = 'AGENT_NOT_BATCH_CAPABLE'; $b.endDetail = "the open's result carries a $($openLb.type), not one admission.leaseBatch object: no lease or idle bound is named for token ${token}, so no probe or leg runs (the lease the agent may hold under the token is closed and charged)"
+            Set-Stop 'AGENT_NOT_BATCH_CAPABLE' 10; LogBest "AGENT_NOT_BATCH_CAPABLE batch=$batchNo token=$token shape=$($openLb.type) (no probe or leg runs; the close releases the token)"
+        } elseif ($openLb.state -cne 'OBJECT' -or -not [string]::Equals([string]$openLb.value.token, $token, [StringComparison]::Ordinal) -or -not $openLb.value.leaseId) {
             $b.endReason = 'AGENT_NOT_BATCH_CAPABLE'; $b.endDetail = "admission.mode=$($adm.mode) gate=$($adm.gate) (no admission.leaseBatch for token ${token}: the lease-batch agent is not deployed)"
             Set-Stop 'AGENT_NOT_BATCH_CAPABLE' 10
         } elseif ($openHit) {
             $hr = Get-HitRefusal $openHit
             # the lease is held: the finally closes it and charges the ledger from the open's submit (no earlier start is known without reading its end)
-            $b.leaseId = [string]$adm.leaseBatch.leaseId; $leaseStartUtc = $openSubmitUtc; $b.endReason = $hr[0]
+            $b.leaseId = [string]$openLb.value.leaseId; $leaseStartUtc = $openSubmitUtc; $b.endReason = $hr[0]
             # r13 pass 2 (adversary A1): a location hit means a runner output IS the input, so from here nothing is written into -RunDir or the claim dir's outputs (the ledger may be
             # that input). r14: Test-OpenOutputAlias above already turned that suppression on, for this branch and every other.
             $b.endDetail = "after the open, before any probe or leg: $($hr[2])"
             [Console]::Error.WriteLine("BATCH_USAGE $(if ($legPlanMode) { "LEG_PLAN_REFUSED reason=$($hr[0])$(if ($hr[1] -gt 0) { " item=$($hr[1])" })" } else { $hr[0] }) $($hr[2]) (found after the open: no probe or leg ran; the lease is closed)")
             Set-Stop $hr[0] 2
         } else {
-            $b.leaseId = [string]$adm.leaseBatch.leaseId; $b.held = [string]$adm.heavySlotHeld; $b.slot = $adm.slot; $b.leaseMinutes = $adm.leaseMinutes
-            $b.leaseUntilEpoch = $adm.leaseBatch.untilEpoch; $b.openWaitedSec = $adm.waitedSec; $b.openRequests = $adm.leaseRequests; $b.refusals = @($adm.leaseRefusals)
+            $b.leaseId = [string]$openLb.value.leaseId; $b.held = [string]$adm.heavySlotHeld; $b.slot = $adm.slot; $b.leaseMinutes = $adm.leaseMinutes
+            $b.leaseUntilEpoch = $openLb.value.untilEpoch; $b.openWaitedSec = $adm.waitedSec; $b.openRequests = $adm.leaseRequests; $b.refusals = @($adm.leaseRefusals)
             if ($null -eq $leaseEnd) { $leaseEnd = $openReadUtc }   # cannot place the lease's end: no leg fits
             # Where the lease began, for the ledger: its end less the minutes it asked for, never before the open was submitted.
             $leaseStartUtc = $(if ($b.leaseMinutes) { $leaseEnd.AddMinutes(-[double]$b.leaseMinutes) } else { $openSubmitUtc })
@@ -2253,7 +2284,7 @@ while ($pending.Count -gt 0 -and $null -eq $stopReason) {
             # bound less -ProbeIdleMarginSec, counted from the last agent job this runner saw end under the lease (Get-IdleAllowanceSec). r3 pass 2 (adversary A2): the bound is
             # the RUNNING agent's own, published in admission.leaseBatch.idleSec; an agent that predates the field gives the agent script's param default. Neither: nothing runs.
             # r4 (Grok G7): only an ABSENT field falls back to the script default; a field that is there but invalid fails closed below (the running agent's bound is unknown)
-            $pubIdle = Get-PublishedIdleBound $adm.leaseBatch
+            $pubIdle = Get-PublishedIdleBound $openLb.value
             $batchIdleSec = $(if ($pubIdle.state -ceq 'VALID') { $pubIdle.sec } elseif ($pubIdle.state -ceq 'ABSENT') {
                 if ($null -eq $agentIdleSec) { $agentIdleSec = Get-AgentLeaseBatchIdleSec (Join-Path $here '..\bachelor\ultra-magnus-agent.ps1') }; $agentIdleSec } else { $null })
             if ($null -eq $batchIdleSec) {
@@ -2523,7 +2554,9 @@ while ($pending.Count -gt 0 -and $null -eq $stopReason) {
                 # r4 (adversary r4 A1): the agent's idle clock restarted when the leg's JOB ended, before the leg child wrote its receipt and exited
                 if ($jr.state -ceq 'FOUND' -and $null -ne $jr.result) { $idleAnchorTs = Get-AgentJobEndTs $idleAnchorTs $tLegTs $jr.result.endedUtc }
                 $ja = $(if ($jr.state -ceq 'FOUND') { $jr.result.admission } else { $null })
-                $jobLease = $(if ($null -ne $ja -and $null -ne $ja.leaseBatch) { [string]$ja.leaseBatch.leaseId } else { $null })
+                # r5 (adversary r4 pass 3 A1 sibling): one leaseBatch object or none; an array-wrapped one names no lease, so the leg is not on this batch's lease (never counted)
+                $jaLb = (Get-AdmissionLeaseBatch $ja).value
+                $jobLease = $(if ($null -ne $jaLb) { [string]$jaLb.leaseId } else { $null })
                 # r12 (adversary r11 A2): the lease id is compared ORDINALLY (-ceq is case-sensitive but culture-aware: a soft hyphen made another lease the batch's own); blank is no lease
                 $onLease = ($null -ne $jobLease -and -not [string]::IsNullOrWhiteSpace([string]$b.leaseId) -and [string]::Equals($jobLease, [string]$b.leaseId, [StringComparison]::Ordinal) -and [string]$ja.slotContinuity -cne 'lost')
                 if ($onLease) { $e2 = Get-LeaseEndUtc $jr.result; if ($null -ne $e2 -and $e2 -lt $leaseEnd) { $leaseEnd = $e2; $b.leaseEndUtc = $leaseEnd.ToString('o') } }
@@ -2642,9 +2675,13 @@ while ($pending.Count -gt 0 -and $null -eq $stopReason) {
             $ca = $(if ($cr.state -ceq 'FOUND') { $cr.result.admission } else { $null })
             # CANCELLED: it left the gate with no lease. RAN_BEFORE_CANCEL: its lease turned active first, so it is this batch's lease and the close below releases it.
             # ENDED: it ended some other way, with no lease. UNRECONCILED: no answer in time (exit 11): its cancel file stays, and the ledger counts a full lease.
-            $cState = $(if ($cr.state -cne 'FOUND') { 'UNRECONCILED' } elseif ($null -ne $ca -and [string]$ca.label -ceq 'cancelled-in-gate') { 'CANCELLED' }
-                elseif ($null -ne $ca -and $null -ne $ca.leaseBatch -and $ca.leaseBatch.leaseId) { 'RAN_BEFORE_CANCEL' } else { 'ENDED' })
-            if ($cState -ceq 'RAN_BEFORE_CANCEL' -and -not $b.leaseId) { $b.leaseId = [string]$ca.leaseBatch.leaseId; $leaseStartUtc = $openSubmitUtc }
+            # r5 (adversary r4 pass 3 A1 sibling): RAN_LEASE_UNNAMED: its admission or leaseBatch is there but is not ONE object (member access would enumerate it), so it may have
+            # taken a lease this run cannot name: charged from the open's submit to the close with no lease id, never read as CANCELLED or ENDED from inside an array.
+            $cLb = Get-AdmissionLeaseBatch $ca
+            $cState = $(if ($cr.state -cne 'FOUND') { 'UNRECONCILED' } elseif ($cLb.state -ceq 'MALFORMED') { 'RAN_LEASE_UNNAMED' } elseif ($null -ne $ca -and [string]$ca.label -ceq 'cancelled-in-gate') { 'CANCELLED' }
+                elseif ($cLb.state -ceq 'OBJECT' -and $cLb.value.leaseId) { 'RAN_BEFORE_CANCEL' } else { 'ENDED' })
+            if ($cState -ceq 'RAN_BEFORE_CANCEL' -and -not $b.leaseId) { $b.leaseId = [string]$cLb.value.leaseId; $leaseStartUtc = $openSubmitUtc }
+            if ($cState -ceq 'RAN_LEASE_UNNAMED') { $openLeaseUnnamed = $true }
             $b.openCancel = [ordered]@{ requested = $cx.state; state = $cState; resultState = $cr.state; resultLabel = $(if ($null -ne $ca) { [string]$ca.label } else { $null }); waitedSec = [int]([DateTime]::UtcNow - $tc).TotalSeconds; error = $(if ($cx.error) { $cx.error } else { $cr.error }) }
             LogBest "BATCH_OPEN_RECONCILED batch=$batchNo state=$cState result=$($cr.state) label=$($b.openCancel.resultLabel) requested=$($cx.state) waitedSec=$($b.openCancel.waitedSec)"
             if ($cState -ceq 'UNRECONCILED') { $stopReason = 'OPEN_CANCEL_UNRECONCILED'; $exitCode = 11 }
@@ -2668,6 +2705,8 @@ while ($pending.Count -gt 0 -and $null -eq $stopReason) {
             $row = $null
             if ($b.leaseId) { $row = [ordered]@{ venue = $Venue; token = $token; leaseId = $b.leaseId; startUtc = $leaseStartUtc.ToString('o'); endUtc = [DateTime]::UtcNow.ToString('o'); runDir = $RunDir; basis = 'open-to-close' } }
             elseif ($null -ne $b.openCancel -and $b.openCancel.state -ceq 'UNRECONCILED') { $n0 = [DateTime]::UtcNow; $row = [ordered]@{ venue = $Venue; token = $token; leaseId = $null; startUtc = $n0.ToString('o'); endUtc = $n0.AddSeconds($LeaseCapSec).ToString('o'); runDir = $RunDir; basis = 'open-unreconciled' } }
+            # r5 (adversary r4 pass 3 A1): an open whose leaseBatch was not one object may hold a lease this run cannot name: charged open to close, with no lease id
+            elseif ($openLeaseUnnamed) { $row = [ordered]@{ venue = $Venue; token = $token; leaseId = $null; startUtc = $openSubmitUtc.ToString('o'); endUtc = [DateTime]::UtcNow.ToString('o'); runDir = $RunDir; basis = 'open-lease-unnamed' } }
             if ($null -ne $row) {
                 $b.ledger = $row
                 # r7: the ledger (the claim dir's output) is asked about right before the append, like every -RunDir writer
