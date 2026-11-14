@@ -1099,11 +1099,14 @@ def test_invoke_lane_error_mode_pin_catches_each_launch_ahead_of_the_block(tmp_p
 # element), a ternary (either branch), `??`, `+` and the statements of $( ) / @( ) (any branch of an `if`; its condition is not a receiver): `(,$c)[0].Create(...)`,
 # `($t ? $c : $n).Create(...)`. A ForEach-Object member name with a wildcard (`*`, `?`, `[`) is refused (`-MemberName 'Cr?ate'`). A splatted argument on a command
 # that reads WMI (it names a class, its input is WMI, or the splatted table is WMI-tainted) is refused unless the table is bound only to hashtable literals with
-# literal keys, none a -PipelineVariable / -pv / -InputObject / -MemberName (or an abbreviation) and none a script block; in a file that reads WMI a write to
-# $PSDefaultParameterValues is refused unless its keys are such literals (`Disabled` and a restore from a saved copy stay accepted). The tracked listing reads
-# .ps1 / .psm1 in any letter case (`:(icase)` pathspecs).
+# literal keys, none a -PipelineVariable / -pv / -InputObject (down to `-i`) / -MemberName / -Process / -Begin / -End / -RemainingScripts / -FilterScript (or an abbreviation,
+# with or without a leading dash) and none a script block (also when written by a keyed write, a member write, Add or set_Item, through parentheses or a cast); in a file
+# that reads WMI a write to $PSDefaultParameterValues is refused unless its keys are such literals (`Disabled` and a restore from a saved copy stay accepted). A receiver
+# is read through `-as` (the left operand), and a WMI read in the condition of an `if` / ternary receiver does not make it WMI. The tracked listing reads .ps1 / .psm1 in any
+# letter case (`:(icase)` pathspecs).
 # NOT covered, stated plainly: a splatted table or $PSDefaultParameterValues that crosses a file or a scope, is written through an alias (`$m = $PSDefaultParameterValues;
-# $m['x'] = ...`) or through a method other than Add / set_Item / TryAdd; lane scripts under the gitignored .claude-state (a worktree never holds them) are guarded board-side by the wmi-create-offenders
+# $m['x'] = ...`) or through a method other than Add / set_Item / TryAdd; a script block held in a variable and handed under a -Filter abbreviation of -FilterScript or inside
+# a calculated-property table value; lane scripts under the gitignored .claude-state (a worktree never holds them) are guarded board-side by the wmi-create-offenders
 # scan and the hidden-launch guard; files that are not .ps1/.psm1 (.py, .cmd, .js); a command whose name is a variable (`& $cmd`); a receiver that comes
 # from a call rather than a variable; a method name built at run time on a Create call or on a receiver that is not followed as WMI; the
 # `.ForEach({ $_.Create() })` / `.Where()` intrinsic methods (their script block is not a pipeline); a variable that crosses a scope or a file (dot-sourcing,
@@ -1212,12 +1215,25 @@ function Get-ReceiverRoots($Expression) {
         elseif ($e -is [PipelineAst] -and @($e.PipelineElements).Count -eq 1 -and @($e.PipelineElements)[0] -is [CommandExpressionAst]) { $work.Push(@($e.PipelineElements)[0].Expression) }
         elseif ($e -is [IndexExpressionAst]) { $work.Push($e.Target) }
         elseif ($e -is [MemberExpressionAst]) { $work.Push($e.Expression) }
-        elseif ($e -is [ConvertExpressionAst] -or $e -is [UnaryExpressionAst]) { $work.Push($e.Child) }
+        elseif ($e -is [ConvertExpressionAst]) {
+            if ($wmiWord.IsMatch((Get-CleanText $e.Type))) { $roots.Add('#wmi') }
+            $work.Push($e.Child)
+        }
+        elseif ($e -is [UnaryExpressionAst]) { $work.Push($e.Child) }
         elseif ($e -is [ArrayLiteralAst]) { foreach ($x in @($e.Elements)) { $work.Push($x) } }
         elseif ($e -is [TernaryExpressionAst]) { $work.Push($e.IfTrue); $work.Push($e.IfFalse) }
-        elseif ($e -is [BinaryExpressionAst] -and ($e.Operator -eq [TokenKind]::QuestionQuestion -or $e.Operator -eq [TokenKind]::Plus)) { $work.Push($e.Left); $work.Push($e.Right) }
-        elseif ($e -is [StatementAst]) {
-            foreach ($v in $e.FindAll({ param($x) $x -is [VariableExpressionAst] }, $true)) { $roots.Add((Get-VarName $v)) }
+        elseif ($e -is [BinaryExpressionAst]) {
+            # The left operand is the value of a cast (`-as`) and of `??` and `+`; the right one is a value only of the last two.
+            $work.Push($e.Left)
+            if ($e.Operator -eq [TokenKind]::QuestionQuestion -or $e.Operator -eq [TokenKind]::Plus) { $work.Push($e.Right) }
+        }
+        else {
+            # A command, a longer pipeline, a statement that is not a lone expression, a call, a type or a constant: it contributes every variable in it, and the
+            # WMI class it names. The condition of an if or a ternary never reaches here, so a read of the process table there does not make the receiver WMI.
+            if ($wmiWord.IsMatch((Get-CleanText $e))) { $roots.Add('#wmi') }
+            if ($e -is [StatementAst]) {
+                foreach ($v in $e.FindAll({ param($x) $x -is [VariableExpressionAst] }, $true)) { $roots.Add((Get-VarName $v)) }
+            }
         }
     }
     return $roots.ToArray()
@@ -1256,7 +1272,7 @@ function Test-InWmiPipeline($Node) {
         # The first element receives no pipeline input, but -InputObject still hands it a value (ForEach-Object -InputObject $c -Process { $_ ... }); an explicit
         # -InputObject that is not WMI is this block's $_, so the search does not go on outward.
         if (Test-WmiPipelineInput $cmd) { return $true }
-        if ([object]::ReferenceEquals(@($cmd.Parent.PipelineElements)[0], $cmd) -and $null -eq (Get-ParameterValue $cmd 'InputObject' 3)) { continue }
+        if ([object]::ReferenceEquals(@($cmd.Parent.PipelineElements)[0], $cmd) -and $null -eq (Get-ParameterValue $cmd 'InputObject' 1)) { continue }
         return $false
     }
     return $false
@@ -1264,9 +1280,8 @@ function Test-InWmiPipeline($Node) {
 
 # True when the receiver names a WMI class, starts from a WMI variable, or is $_ / $PSItem inside a pipeline that read a WMI class.
 function Test-WmiReceiver($Expression) {
-    if ($wmiWord.IsMatch((Get-CleanText $Expression))) { return $true }
     foreach ($root in @(Get-ReceiverRoots $Expression)) {
-        if ($wmiVars.ContainsKey($root)) { return $true }
+        if ($root -eq '#wmi' -or $wmiVars.ContainsKey($root)) { return $true }
         if (($root -eq '_' -or $root -eq 'psitem') -and (Test-InWmiPipeline $Expression)) { return $true }
     }
     return $false
@@ -1312,10 +1327,24 @@ function Get-ValueExpression($Node) {
     return $null
 }
 
+# The name of the variable a table target is, through parentheses and casts (`($h)['k'] = ...`, `([hashtable]$h).Add(...)`); $null when it is not a plain variable.
+function Get-TargetName($Node) {
+    $v = Get-ValueExpression $Node
+    if ($v -is [VariableExpressionAst]) { return (Get-VarName $v) }
+    return $null
+}
+
+function Test-NoScriptBlock($Node) {
+    return (@($Node.FindAll({ param($x) $x -is [ScriptBlockExpressionAst] }, $true)).Count -eq 0)
+}
+
 # The parameters that move WMI objects or a method name between commands: -PipelineVariable / -pv (two letters or more), -InputObject (two or more) and
-# -MemberName (any abbreviation). A table that carries one of them, or a name with a wildcard, onto a command that reads WMI is refused.
-$dangerousParameters = @(@('PipelineVariable', 2), @('pv', 2), @('InputObject', 2), @('MemberName', 1))
+# -MemberName (any abbreviation of either), and the parameters that hand a script block its $_: -Process, -Begin, -End, -RemainingScripts and -FilterScript (written
+# out far enough that -Filter, a different parameter of other cmdlets, is not caught). A table that carries one of them, or a name with a wildcard, onto a command
+# that reads WMI is refused. A leading dash (or an en / em dash) is the parameter's own spelling and is dropped first.
+$dangerousParameters = @(@('PipelineVariable', 2), @('pv', 2), @('InputObject', 1), @('MemberName', 1), @('Process', 2), @('Begin', 2), @('End', 2), @('RemainingScripts', 2), @('FilterScript', 7))
 function Test-DangerousParameterName([string]$Name) {
+    $Name = $Name.TrimStart([char[]]@('-', [char]0x2013, [char]0x2014, [char]0x2015))
     if ($Name.Length -eq 0 -or $Name -match '[*?\[]') { return $true }
     foreach ($p in $dangerousParameters) {
         if ($Name.Length -ge $p[1] -and $p[0].StartsWith($Name, [StringComparison]::OrdinalIgnoreCase)) { return $true }
@@ -1369,19 +1398,22 @@ function Test-SafeTableVariable([string]$Name, [bool]$Defaults, $Seen, [bool]$Ne
             }
             else { return $false }
         }
-        elseif ($left -is [IndexExpressionAst] -and $left.Target -is [VariableExpressionAst] -and (Get-VarName $left.Target) -eq $Name) {
+        elseif ($left -is [IndexExpressionAst] -and (Get-TargetName $left.Target) -eq $Name) {
             if (-not (Test-SafeKey $left.Index $Defaults)) { return $false }
+            if (-not $Defaults -and -not (Test-NoScriptBlock $a.Right)) { return $false }
         }
-        elseif ($left -is [MemberExpressionAst] -and $left.Expression -is [VariableExpressionAst] -and (Get-VarName $left.Expression) -eq $Name) {
+        elseif ($left -is [MemberExpressionAst] -and (Get-TargetName $left.Expression) -eq $Name) {
             if ($left.Member -isnot [StringConstantExpressionAst] -or -not (Test-SafeKey $left.Member $Defaults)) { return $false }
+            if (-not $Defaults -and -not (Test-NoScriptBlock $a.Right)) { return $false }
         }
     }
     foreach ($i in $invokeAsts) {
-        if ($i.Expression -isnot [VariableExpressionAst] -or (Get-VarName $i.Expression) -ne $Name) { continue }
+        if ((Get-TargetName $i.Expression) -ne $Name) { continue }
         if ($i.Member -isnot [StringConstantExpressionAst]) { return $false }
         if ([string]$i.Member.Value -match '(?i)^(add|set_item|tryadd)$') {
             $first = @($i.Arguments) | Select-Object -First 1
             if (-not (Test-SafeKey $first $Defaults)) { return $false }
+            if (-not $Defaults) { foreach ($rest in @($i.Arguments | Select-Object -Skip 1)) { if (-not (Test-NoScriptBlock $rest)) { return $false } } }
         }
     }
     return ($bound -or -not $NeedBinding)
@@ -1414,15 +1446,15 @@ function Get-DefaultParameterValuesSites {
             }
             if (-not $ok) { $bad.Add($a) }
         }
-        elseif ($left -is [IndexExpressionAst] -and $left.Target -is [VariableExpressionAst] -and (Get-VarName $left.Target) -eq $name) {
+        elseif ($left -is [IndexExpressionAst] -and (Get-TargetName $left.Target) -eq $name) {
             if (-not (Test-SafeKey $left.Index $true)) { $bad.Add($a) }
         }
-        elseif ($left -is [MemberExpressionAst] -and $left.Expression -is [VariableExpressionAst] -and (Get-VarName $left.Expression) -eq $name) {
+        elseif ($left -is [MemberExpressionAst] -and (Get-TargetName $left.Expression) -eq $name) {
             if ($left.Member -isnot [StringConstantExpressionAst] -or -not (Test-SafeKey $left.Member $true)) { $bad.Add($a) }
         }
     }
     foreach ($i in $invokeAsts) {
-        if ($i.Expression -isnot [VariableExpressionAst] -or (Get-VarName $i.Expression) -ne $name) { continue }
+        if ((Get-TargetName $i.Expression) -ne $name) { continue }
         if ($i.Member -isnot [StringConstantExpressionAst]) { $bad.Add($i); continue }
         if ([string]$i.Member.Value -match '(?i)^(add|set_item|tryadd)$') {
             $first = @($i.Arguments) | Select-Object -First 1
@@ -1455,7 +1487,7 @@ function Test-WmiPipelineInput($Command) {
             if (Test-WmiNode $element) { return $true }
         }
     }
-    $inputObject = Get-ParameterValue $Command 'InputObject' 3
+    $inputObject = Get-ParameterValue $Command 'InputObject' 1
     return ($null -ne $inputObject -and (Test-WmiNode $inputObject))
 }
 
