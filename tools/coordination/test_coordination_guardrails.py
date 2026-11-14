@@ -1077,6 +1077,186 @@ def test_invoke_lane_error_mode_pin_catches_each_launch_ahead_of_the_block(tmp_p
     assert false_alarms == {}, "a comment, a string or a function definition is not a launch"
 
 
+# --- DOCTRINE-OUTBOX-WMI-CHILD-ERRORMODE-1: no tracked PowerShell script calls the WMI process create itself ----------
+# A process made by WMI Win32_Process Create is not a child of the caller: its parent is WmiPrvSE, so it inherits none of the error mode Invoke-Lane sets
+# and a crash in it can raise a modal box on the owner's desktop (trap card doctrine-outbox/20261114-wmi-create-child-inherits-gpfault-error-box.md).
+# The rule: every detached launch goes through ONE launcher (a stub that sets the error mode first); a script never calls the create itself.
+# This pins the rule over the TRACKED tree. Covered: *.ps1 and *.psm1 that `git ls-files` lists, read by PowerShell's own AST, so a comment, a string and a
+# here-string are not calls. Refused: Invoke-CimMethod / Invoke-WmiMethod (and the icim / iwmi aliases) whose -MethodName / -Name is Create or is not a
+# literal; a `.Create(...)` or `.InvokeMethod(... Create ...)` on an expression that names Win32_Process, wmiclass or ManagementClass, or on a variable
+# assigned from one; a [wmiclass] / [wmi] / [ManagementClass] type literal or cast; `wmic ... create`.
+# NOT covered, stated plainly: lane scripts under the gitignored .claude-state (a worktree never holds them) are guarded board-side by the wmi-create-offenders
+# scan and the hidden-launch guard; files that are not .ps1/.psm1 (.py, .cmd, .js); a method name built at run time on a call that does not name the class;
+# reflection; text run through Invoke-Expression or a script block built at run time. A file that does not parse is scanned as far as its AST goes.
+# The ONE sanctioned launcher lives under .claude-state and is not tracked, so today the allow list is empty. An entry is {repo-relative posix path: reason},
+# added only in review for a script that must call the create itself; an entry that stops matching a site fails the test, so the list cannot go stale.
+WMI_CREATE_ALLOW = {}
+_WMI_CREATE_SCANNER = r"""
+using namespace System.Management.Automation.Language
+param([Parameter(Mandatory = $true)][string]$ListFile)
+$ErrorActionPreference = 'Stop'
+$wmiWord = [regex]::new('(?i)win32_process|wmiclass|managementclass')
+$wmiCommands = @('invoke-cimmethod', 'invoke-wmimethod', 'icim', 'iwmi')
+$wmiTypes = '(^|\.)(wmiclass|wmi|ManagementClass)$'
+
+# The literal method name of an Invoke-CimMethod / Invoke-WmiMethod call, or $null when it is positional, built at run time or splatted.
+function Get-MethodName($Command) {
+    $elements = @($Command.CommandElements)
+    for ($i = 1; $i -lt $elements.Count; $i++) {
+        $e = $elements[$i]
+        if ($e -isnot [CommandParameterAst]) { continue }
+        $n = $e.ParameterName
+        $isName = ($n.Length -ge 2 -and 'MethodName'.StartsWith($n, [StringComparison]::OrdinalIgnoreCase)) -or ($n -ieq 'Name')
+        if (-not $isName) { continue }
+        $v = if ($null -ne $e.Argument) { $e.Argument } elseif ($i + 1 -lt $elements.Count) { $elements[$i + 1] } else { $null }
+        if ($v -is [StringConstantExpressionAst]) { return [string]$v.Value }
+    }
+    return $null
+}
+
+$out = [ordered]@{}
+foreach ($path in @(Get-Content -LiteralPath $ListFile -Encoding UTF8 | Where-Object { $_ })) {
+    $tokens = $null; $errors = $null
+    $ast = [Parser]::ParseFile($path, [ref]$tokens, [ref]$errors)
+    $sites = New-Object System.Collections.Generic.List[object]
+    $wmiVars = @{}
+    foreach ($a in $ast.FindAll({ param($x) $x -is [AssignmentStatementAst] }, $true)) {
+        if ($a.Left -is [VariableExpressionAst] -and $wmiWord.IsMatch($a.Right.Extent.Text)) { $wmiVars[$a.Left.VariablePath.UserPath.ToLowerInvariant()] = $true }
+    }
+    foreach ($n in $ast.FindAll({ param($x) $true }, $true)) {
+        $kind = $null
+        if ($n -is [CommandAst]) {
+            $name = $n.GetCommandName()
+            if ($null -eq $name) { continue }
+            $lname = $name.ToLowerInvariant()
+            if ($wmiCommands -contains $lname) {
+                $method = Get-MethodName $n
+                if ($null -eq $method) { $kind = 'wmi-method-name-not-literal' }
+                elseif ($method -match '(?i)create') { $kind = 'wmi-create' }
+            }
+            elseif ($lname -eq 'wmic' -or $lname -eq 'wmic.exe') {
+                if ($n.Extent.Text -match '(?i)\bcreate\b') { $kind = 'wmic-create' }
+            }
+        }
+        elseif ($n -is [InvokeMemberExpressionAst]) {
+            if ($n.Member -isnot [StringConstantExpressionAst]) { continue }
+            $member = [string]$n.Member.Value
+            if ($member -ieq 'Create') {
+                $viaWmi = $wmiWord.IsMatch($n.Expression.Extent.Text) -or ($n.Expression -is [VariableExpressionAst] -and $wmiVars.ContainsKey($n.Expression.VariablePath.UserPath.ToLowerInvariant()))
+                if ($viaWmi) { $kind = 'wmi-create-member' }
+            }
+            elseif ($member -ieq 'InvokeMethod' -and $wmiWord.IsMatch($n.Extent.Text) -and $n.Extent.Text -match '(?i)\bcreate\b') { $kind = 'wmi-invoke-method-create' }
+        }
+        elseif ($n -is [TypeExpressionAst] -or $n -is [TypeConstraintAst]) {
+            if ($n.TypeName.FullName -match $wmiTypes) { $kind = 'wmi-type' }
+        }
+        if ($null -ne $kind) {
+            $text = ($n.Extent.Text -replace '\s+', ' ')
+            $sites.Add([ordered]@{ kind = $kind; line = $n.Extent.StartLineNumber; text = $text.Substring(0, [Math]::Min(120, $text.Length)) })
+        }
+    }
+    $out[$path] = [ordered]@{ parseErrors = $(if ($errors) { @($errors).Count } else { 0 }); sites = $sites.ToArray() }
+}
+$out | ConvertTo-Json -Depth 5 -Compress
+"""
+
+
+def _wmi_create_scan(tmp_path, paths):
+    """Scan the given files in one pwsh process. {str(path): {"parseErrors": n, "sites": [{kind, line, text}]}}."""
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    scanner, listing = tmp_path / "wmi-scan.ps1", tmp_path / "wmi-scan-list.txt"
+    scanner.write_text(_WMI_CREATE_SCANNER, encoding="ascii", newline="\n")
+    listing.write_text("\n".join(str(p) for p in paths) + "\n", encoding="utf-8", newline="\n")
+    done = subprocess.run(
+        [_LANE_ERROR_MODE_PWSH, "-NoProfile", "-NonInteractive", "-File", str(scanner), "-ListFile", str(listing)],
+        text=True, capture_output=True, timeout=300,
+    )
+    assert done.returncode == 0, f"the WMI create scanner failed: {done.stdout!r} {done.stderr!r}"
+    return json.loads(done.stdout)
+
+
+def _tracked_powershell_files():
+    listing = subprocess.run(
+        ["git", "-C", str(ROOT), "ls-files", "-z", "--", "*.ps1", "*.psm1"], text=True, capture_output=True, check=True,
+    ).stdout
+    return sorted(p for p in listing.split("\0") if p)
+
+
+@_lane_scanner_only
+def test_tracked_powershell_has_no_direct_wmi_create_outside_the_allow_list(tmp_path):
+    tracked = _tracked_powershell_files()
+    # A floor, so an empty `git ls-files` cannot pass with nothing scanned.
+    assert len(tracked) > 100 and "tools/coordination/Invoke-Lane.ps1" in tracked, tracked[:5]
+    scan = _wmi_create_scan(tmp_path, [ROOT / p for p in tracked])
+    assert scan.keys() == {str(ROOT / p) for p in tracked}, "the scanner did not report every tracked file"
+    by_file = {p: scan[str(ROOT / p)]["sites"] for p in tracked}
+    offenders = {p: sites for p, sites in by_file.items() if sites and p not in WMI_CREATE_ALLOW}
+    assert offenders == {}, (
+        "a tracked PowerShell script creates a process through WMI itself; that child inherits no error mode from the lane and can raise a crash box on the "
+        "owner's desktop. Start it through the one launcher (hub-tools\\Start-HiddenDetached.ps1), or add the file to WMI_CREATE_ALLOW with a reason in review"
+    )
+    stale = sorted(p for p in WMI_CREATE_ALLOW if not by_file.get(p))
+    assert stale == [], f"WMI_CREATE_ALLOW entries that no longer match a site (delete them): {stale}"
+    assert all(WMI_CREATE_ALLOW[p].strip() for p in WMI_CREATE_ALLOW), "every WMI_CREATE_ALLOW entry needs a reason"
+
+
+@_lane_scanner_only
+def test_wmi_create_scan_refuses_each_direct_create_spelling(tmp_path):
+    """RED proof: each spelling is a mutant script on a temp copy (the tracked tree is never edited); each must be refused, and each non-call accepted."""
+    mutants = {
+        # the `wmi` mutant of the lane launch-order pin above
+        "cim-create": "Invoke-CimMethod -ClassName Win32_Process -MethodName Create",
+        "cim-create-with-arguments": "Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{ CommandLine = 'git --version' }",
+        "cim-method-prefix": "Invoke-CimMethod -ClassName Win32_Process -Method Create",
+        "cim-colon-form": "Invoke-CimMethod -ClassName Win32_Process -MethodName:Create",
+        "cim-quoted-name": "Invoke-CimMethod -ClassName Win32_Process -MethodName 'create'",
+        "cim-alias": "icim -ClassName Win32_Process -MethodName Create",
+        "cim-positional-name": "Invoke-CimMethod Win32_Process Create",
+        "cim-name-from-a-variable": "$m = 'Create'\nInvoke-CimMethod -ClassName Win32_Process -MethodName $m",
+        "cim-splatted": "$h = @{ ClassName = 'Win32_Process'; MethodName = 'Create' }\nInvoke-CimMethod @h",
+        "cim-in-a-pipeline": "Get-CimClass -ClassName Win32_Process | Invoke-CimMethod -MethodName Create",
+        "cim-in-a-function": "function Start-Quietly { Invoke-CimMethod -ClassName Win32_Process -MethodName Create }",
+        "cim-in-a-script-block": "$sb = { Invoke-CimMethod -ClassName Win32_Process -MethodName Create }",
+        "wmi-method": "Invoke-WmiMethod -Class Win32_Process -Name Create -ArgumentList 'git --version'",
+        "wmi-method-alias": "iwmi -Class Win32_Process -Name Create",
+        "wmiclass-cast": "([wmiclass]'Win32_Process').Create('git --version')",
+        "wmiclass-variable": "$c = [wmiclass]'Win32_Process'\n$c.Create('git --version')",
+        "wmi-type-literal": "$c = [System.Management.ManagementClass]::new('Win32_Process')",
+        "wmi-accelerator": "$c = [wmi]'Win32_Process'",
+        "create-on-a-get-wmiobject-variable": "$c = Get-WmiObject -List Win32_Process\n$c.Create('git --version')",
+        "create-on-the-class-expression": "(Get-WmiObject -List Win32_Process).Create('git --version')",
+        "invoke-method": "$session.InvokeMethod('root/cimv2', 'Win32_Process', 'Create', $null)",
+        "wmic": "wmic process call create 'git --version'",
+    }
+    not_sites = {
+        "line-comment": "# Invoke-CimMethod -ClassName Win32_Process -MethodName Create; [wmiclass]'Win32_Process'",
+        "block-comment": "<# Invoke-WmiMethod -Class Win32_Process -Name Create #>",
+        "string": "$note = 'Invoke-CimMethod -ClassName Win32_Process -MethodName Create'",
+        "here-string": "$note = @'\nInvoke-CimMethod -ClassName Win32_Process -MethodName Create\n'@",
+        "read-the-process-table": "Get-CimInstance -ClassName Win32_Process -Filter 'ProcessId=4'",
+        "read-the-process-table-positional": "Get-CimInstance Win32_Process | Select-Object ProcessId",
+        "get-owner": "Invoke-CimMethod -InputObject $proc -MethodName GetOwner",
+        "terminate": "Invoke-CimMethod -InputObject $proc -MethodName Terminate",
+        "scriptblock-create": "$sb = [scriptblock]::Create('1')",
+        "file-create": "$f = [System.IO.File]::Create('x')",
+        "unrelated-method": "Invoke-WmiMethod -Class Win32_OperatingSystem -Name Win32Shutdown",
+    }
+    files = {}
+    for name, text in {**mutants, **not_sites}.items():
+        path = tmp_path / "cases" / f"{name}.ps1"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text + "\n", encoding="utf-8", newline="\n")
+        files[name] = path
+    scan = _wmi_create_scan(tmp_path / "scan", list(files.values()))
+    # A case that does not parse proves nothing: it would be refused (or accepted) for the parse error, not for the spelling it names.
+    unparsed = {name: scan[str(path)]["parseErrors"] for name, path in files.items() if scan[str(path)]["parseErrors"]}
+    assert unparsed == {}, "a case must still be valid PowerShell"
+    survivors = [name for name in mutants if not scan[str(files[name])]["sites"]]
+    assert survivors == [], f"these direct WMI creates were not refused: {survivors}"
+    false_alarms = {name: scan[str(files[name])]["sites"] for name in not_sites if scan[str(files[name])]["sites"]}
+    assert false_alarms == {}, "a comment, a string, a read of the process table, GetOwner, Terminate and [scriptblock]::Create are not a WMI process create"
+
+
 # --- LANE-CHILD-LOADER-DIALOG-CODEX-SANDBOX-1: the codex lane's children must find the MinGW runtime DLLs ----------
 # MEASURED 2026-11-06 (System log, source 'Application Popup'): green2.exe 09:56:51Z and red.exe 09:57:28Z raised "libstdc++-6.dll / libgcc_s_seh-1.dll was
 # not found" on the owner's desktop AFTER the error-mode fix above merged. The codex sandbox's spawn does not carry that mode to the commands it runs, so the
