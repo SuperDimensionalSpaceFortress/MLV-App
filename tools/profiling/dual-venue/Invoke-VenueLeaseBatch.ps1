@@ -1545,6 +1545,9 @@ function Invoke-QuietProbe([string]$Name, [string]$Phase, [int]$MaxWaitSec, $The
     }
     # r5 pass 1 A2: the probe's output is CAPTURED, not redirected to the file: a `*>` file redirect opens (creates) the file after the admission above, and that open can stall on a share (a
     # UNC RunDir), buying a probe past the deadline. Nothing but the process start follows the admission; the file is written (still the probe's evidence) after it returns.
+    # r5 pass 3 (adversary r5 pass 2 A2): the wait's END is fixed HERE, on this clock, at the dispatch: the child counts -MaxWaitSec from its own start, after the process start,
+    # so the allowance passed as a duration was overrun by that startup. Wait-VenueQuiet ends every wait (the queue gate's included) by -WaitUntilUtc too.
+    $qArgs += @('-WaitUntilUtc', [DateTime]::UtcNow.AddSeconds($wait).ToString('o'))
     $startTs = [Diagnostics.Stopwatch]::GetTimestamp()   # r4 pass 2 (adversary A1): the probe's dispatch, the latest instant provably before its agent jobs (the idle anchor)
     $captured = @(& $pwshExe @qArgs *>&1 | ForEach-Object { [string]$_ })
     # r6 (adversary r5 A2): the child's result is observed HERE: this is the instant of its reading, taken before the evidence write and the parse below (either can stall on a share,
@@ -1636,7 +1639,7 @@ function Get-LeaseEndUtc($Result) {
     # When the batch lease ends, on THIS clock: the agent's own until= minus its own endedUtc (one clock, no skew), added to now (when the result was read,
     # which is no earlier than when the job ended). $null when the result carries no batch lease.
     try {
-        $lb = (Get-AdmissionLeaseBatch $Result.admission).value   # r5 (adversary r4 pass 3 A1): one object or none, never an array's enumerated until=
+        $lb = (Get-AdmissionLeaseBatch $Result).value   # r5 (adversary r4 pass 3 A1): one object or none, never an array's enumerated until=
         if ($null -eq $lb -or $null -eq $lb.untilEpoch -or -not $Result.endedUtc) { return $null }
         # PowerShell 7 ConvertFrom-Json hands a "...Z" string back as a DateTime of Kind Utc; [string] drops the Kind and Parse then assumes THIS host's offset
         # (a Central host put every lease end 5 h early). A DateTime converts by its Kind (Unspecified is read as UTC, like the string with no zone); a string
@@ -1704,7 +1707,15 @@ function Test-JsonObject($Value) {
     $Value -is [System.Collections.IDictionary] -or $Value -is [System.Management.Automation.PSCustomObject]
 }
 
-function Get-AdmissionLeaseBatch($Admission) {
+function Get-AdmissionLeaseBatch($Result) {
+    # r5 pass 3 (adversary r5 pass 2 A1): from the agent RESULT, never from an admission a caller already read: `$(...)` and a function's return UNROLL a one-element array, so
+    # [{label:..,leaseBatch:..}] reached the old reader as the object inside it. The admission is read here by property, which keeps an array an array (MALFORMED below).
+    $Admission = $null
+    if ($null -ne $Result) {
+        if (-not (Test-JsonObject $Result)) { return [pscustomobject]@{ state = 'MALFORMED'; value = $null; type = "result $($Result.GetType().Name)" } }
+        if ($Result -is [System.Collections.IDictionary]) { if ($Result.Contains('admission')) { $Admission = $Result['admission'] } }
+        else { $ap = $Result.PSObject.Properties['admission']; if ($null -ne $ap) { $Admission = $ap.Value } }
+    }
     # r5 (adversary r4 pass 3 A1): admission.leaseBatch read as ONE object or not at all, for every reader in this runner (the open's capability check, its idle bound, the lease
     # end, a leg's lease, the open's cancel reconcile). A leaseBatch published as an array ([{..}], [null, {..}], [[{..}]]) passed the capability check through member enumeration
     # while its own idleSec read ABSENT, so the run fell back to the script default. state: OBJECT (value is it), ABSENT (no admission, no leaseBatch, or JSON null), or MALFORMED
@@ -2201,7 +2212,7 @@ while ($pending.Count -gt 0 -and $null -eq $stopReason) {
             }
         }
         $adm = $(if ($null -ne $op.result) { $op.result.admission } else { $null })
-        $openLb = Get-AdmissionLeaseBatch $adm   # r5 (adversary r4 pass 3 A1): every read of the open's leaseBatch below goes through this one object (or none)
+        $openLb = Get-AdmissionLeaseBatch $op.result   # r5 (adversary r4 pass 3 A1): every read of the open's leaseBatch below goes through this one object (or none)
         # r5: the open's result is in hand (or it was retracted before the agent saw it): this run no longer owns it, so its sidecar goes. Otherwise it is kept
         # renewed until the end of the batch cancels and reconciles the open.
         # r16: and an open whose job file was never written was never anyone's (JOB_WRITE_FAILED)
@@ -2563,7 +2574,7 @@ while ($pending.Count -gt 0 -and $null -eq $stopReason) {
                 if ($jr.state -ceq 'FOUND' -and $null -ne $jr.result) { $idleAnchorTs = Get-AgentJobEndTs $idleAnchorTs $tLegTs $jr.result.endedUtc }
                 $ja = $(if ($jr.state -ceq 'FOUND') { $jr.result.admission } else { $null })
                 # r5 (adversary r4 pass 3 A1 sibling): one leaseBatch object or none; an array-wrapped one names no lease, so the leg is not on this batch's lease (never counted)
-                $jaLb = (Get-AdmissionLeaseBatch $ja).value
+                $jaLb = $(if ($jr.state -ceq 'FOUND') { (Get-AdmissionLeaseBatch $jr.result).value } else { $null })   # r5 pass 3: from the result ($ja above is unrolled)
                 $jobLease = $(if ($null -ne $jaLb) { [string]$jaLb.leaseId } else { $null })
                 # r12 (adversary r11 A2): the lease id is compared ORDINALLY (-ceq is case-sensitive but culture-aware: a soft hyphen made another lease the batch's own); blank is no lease
                 $onLease = ($null -ne $jobLease -and -not [string]::IsNullOrWhiteSpace([string]$b.leaseId) -and [string]::Equals($jobLease, [string]$b.leaseId, [StringComparison]::Ordinal) -and [string]$ja.slotContinuity -cne 'lost')
@@ -2692,7 +2703,7 @@ while ($pending.Count -gt 0 -and $null -eq $stopReason) {
             # ENDED: it ended some other way, with no lease. UNRECONCILED: no answer in time (exit 11): its cancel file stays, and the ledger counts a full lease.
             # r5 (adversary r4 pass 3 A1 sibling): RAN_LEASE_UNNAMED: its admission or leaseBatch is there but is not ONE object (member access would enumerate it), so it may have
             # taken a lease this run cannot name: charged from the open's submit to the close with no lease id, never read as CANCELLED or ENDED from inside an array.
-            $cLb = Get-AdmissionLeaseBatch $ca
+            $cLb = $(if ($cr.state -ceq 'FOUND') { Get-AdmissionLeaseBatch $cr.result } else { Get-AdmissionLeaseBatch $null })   # r5 pass 3: from the result ($ca above is unrolled)
             $cState = $(if ($cr.state -cne 'FOUND') { 'UNRECONCILED' } elseif ($cLb.state -ceq 'MALFORMED') { 'RAN_LEASE_UNNAMED' } elseif ($null -ne $ca -and [string]$ca.label -ceq 'cancelled-in-gate') { 'CANCELLED' }
                 elseif ($cLb.state -ceq 'OBJECT' -and $cLb.value.leaseId) { 'RAN_BEFORE_CANCEL' } elseif ($cLb.state -ceq 'OBJECT') { 'RAN_LEASE_UNNAMED' } else { 'ENDED' })   # r5 pass 2 (adversary r5 A1): a leaseBatch with no usable lease id
             if ($cState -ceq 'RAN_BEFORE_CANCEL' -and -not $b.leaseId) { $b.leaseId = [string]$cLb.value.leaseId; $leaseStartUtc = $openSubmitUtc }

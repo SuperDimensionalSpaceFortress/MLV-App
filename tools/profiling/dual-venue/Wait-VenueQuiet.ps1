@@ -143,6 +143,10 @@ param(
     [Parameter(ParameterSetName = 'Live')][switch]$AllowShareOverride,
     [Parameter(ParameterSetName = 'Live')][int]$RecheckSec = 90,
     [Parameter(ParameterSetName = 'Live')][int]$MaxWaitSec = 1800,
+    # LEASE-BATCH-IDLE-END-UNSEEN-1 r5 pass 3 (adversary r5 pass 2 A2): an absolute end (UTC, ISO 8601) for every wait below, as the CALLER's clock placed it at the dispatch.
+    # -MaxWaitSec runs from this script's own start, which comes after the process started: an in-lease probe given the agent's remaining idle allowance as -MaxWaitSec
+    # waited that long past the dispatch plus the startup. Unset: -MaxWaitSec alone, as before. Unreadable: refused (exit 2), never ignored.
+    [Parameter(ParameterSetName = 'Live')][string]$WaitUntilUtc = '',
     [Parameter(ParameterSetName = 'Live')][int]$MaxGateSec = 2400,
     [Parameter(ParameterSetName = 'Live')][int]$GatePollSec = 30,
     [Parameter(ParameterSetName = 'Live')][int]$ReadAttempts = 3,
@@ -263,6 +267,16 @@ function Get-GateCount([string]$Dir, [string]$Filter, [bool]$MustExist, [string]
 # queue busy again cannot stretch the whole wait past -MaxWaitSec. The share is read up to -ReadAttempts times (see Read-GateCounts) before it is unreadable.
 $deadline = $t0.AddSeconds($MaxWaitSec)
 $gateEnd = $t0.AddSeconds([Math]::Min($MaxGateSec, $MaxWaitSec))
+# LEASE-BATCH-IDLE-END-UNSEEN-1 r5 pass 3 (adversary r5 pass 2 A2): and never past the caller's -WaitUntilUtc (read on THIS clock, as $t0 is: local DateTimes compare by ticks only)
+if ($WaitUntilUtc) {
+    $wuo = [DateTimeOffset]::MinValue
+    if (-not [DateTimeOffset]::TryParse($WaitUntilUtc, [Globalization.CultureInfo]::InvariantCulture, ([Globalization.DateTimeStyles]::AssumeUniversal -bor [Globalization.DateTimeStyles]::AdjustToUniversal), [ref]$wuo)) {
+        Write-Output "USAGE -WaitUntilUtc '$WaitUntilUtc' is not an ISO 8601 instant"; exit 2
+    }
+    $wu = $wuo.LocalDateTime
+    if ($wu -lt $deadline) { $deadline = $wu }
+    if ($wu -lt $gateEnd) { $gateEnd = $wu }
+}
 
 # Both directory counts, retried on a read error. Results go to $script:GateQueued / $script:GateRunning ($null = still unreadable after the last attempt):
 # like GateState they are not the function's output, because its GATE_READ_RETRY lines are written to the pipeline.

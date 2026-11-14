@@ -76,7 +76,7 @@ DEVICE_MATRIX_NAMES = (
 
 # Wait-VenueQuiet stand-in: mode per call from FAKE_QUIET_MODES (comma list, the last repeats), counted in the run dir; each call is logged with UTC ticks.
 FAKE_QUIET = r"""
-param([string]$Venue, [string]$WorkDir, [string]$GateLog, [double]$ThresholdPercent = 20, [int]$MaxWaitSec = 1800, [int]$RecheckSec = 90, [int]$MaxAdmissionWaitSec = 0)
+param([string]$Venue, [string]$WorkDir, [string]$GateLog, [double]$ThresholdPercent = 20, [int]$MaxWaitSec = 1800, [int]$RecheckSec = 90, [int]$MaxAdmissionWaitSec = 0, [string]$WaitUntilUtc = '')
 $runDir = Split-Path -Parent $WorkDir
 New-Item -ItemType Directory -Force -Path $WorkDir | Out-Null
 $countFile = Join-Path $runDir 'fake-quiet-count.txt'
@@ -85,7 +85,8 @@ Set-Content -LiteralPath $countFile -Value ($n + 1)
 $modes = @(([string]$env:FAKE_QUIET_MODES) -split ',' | Where-Object { $_ })
 if ($modes.Count -eq 0) { $modes = @('QUIET') }
 $mode = $modes[[Math]::Min($n, $modes.Count - 1)]
-Add-Content -LiteralPath $env:FAKE_EVENTS -Value ("{0} QUIET {1} maxWait={2}" -f [DateTime]::UtcNow.Ticks, $mode, $MaxWaitSec)
+# r5 pass 3: until= is -WaitUntilUtc as passed ('-' when absent), before maxWait= (which _in_lease_waits reads as the line's last field)
+Add-Content -LiteralPath $env:FAKE_EVENTS -Value ("{0} QUIET {1} until={3} maxWait={2}" -f [DateTime]::UtcNow.Ticks, $mode, $MaxWaitSec, $(if ($WaitUntilUtc) { $WaitUntilUtc } else { '-' }))
 # r4 pass 2 (adversary A1): FAKE_QUIET_SLOW_SEC = the probe child's own time around its agent jobs (a slow gate-log append), which the runner cannot see
 if ($env:FAKE_QUIET_SLOW_SEC) { Start-Sleep -Seconds ([int]$env:FAKE_QUIET_SLOW_SEC) }
 switch ($mode) {
@@ -212,6 +213,8 @@ if ($JobId -like 'lease-batch-open-*') {
     }
     if ($ro) { Set-ItemProperty -LiteralPath $env:FAKE_CLAIM_PATH -Name IsReadOnly -Value $false }
     $res = [pscustomobject]@{ jobId = $JobId; exitCode = 0; endedUtc = $now.ToString('o'); admission = [pscustomobject]$adm; stdout = 'LEASE_BATCH_OPEN' }
+    # r5 pass 3 (adversary r5 pass 2 A1): FAKE_OPEN_ADM_WRAP=array publishes the whole admission inside a one-element array
+    if ($env:FAKE_OPEN_ADM_WRAP -eq 'array') { $res.admission = @($res.admission) }
     if ($mode -eq 'exit1') { $res.exitCode = 1 }   # r14: the open job's receipt says it failed (OPEN_FAILED)
     if ($mode -eq 'gatehold') {
         # r3: um-run gave up while the agent still holds the open in its gate, and NO result lands: the agent keeps re-asking until it is cancelled.
@@ -321,6 +324,8 @@ $stop = Pick $env:FAKE_LEG_STOPS $k 'none'
 if ($stop -ne 'none') { $res.exitCode = 124; $res.admission['slotContinuity'] = 'lost'; $res.admission['leaseStop'] = [ordered]@{ reason = $stop; why = 'fake' } }
 # r5 (adversary r4 pass 3 A1 sibling): FAKE_LEG_LB_WRAP per call: array publishes the leg's leaseBatch (this batch's lease) inside a one-element array | none
 if ((Pick $env:FAKE_LEG_LB_WRAP $k 'none') -eq 'array') { $res.admission['leaseBatch'] = @($res.admission['leaseBatch']) }
+# r5 pass 3 (adversary r5 pass 2 A1): FAKE_LEG_ADM_WRAP per call: array publishes the leg's whole admission inside a one-element array | none
+if ((Pick $env:FAKE_LEG_ADM_WRAP $k 'none') -eq 'array') { $res['admission'] = @($res['admission']) }
 # r5b: FAKE_LEG_MODES 'unresolved' = um-run said UNRESOLVED for the leg's job (um-run.ps1:480-501): no agent result lands by name, and Invoke-VenueLeg still
 # writes its receipt (DVE_OUTCOME=UNRESOLVED) and exits 0
 if ($legMode -ne 'unresolved') { $res | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath (Join-Path $outbox "$jobId.result.json") }
@@ -1091,11 +1096,13 @@ class VenueLeaseBatchRunnerTests(unittest.TestCase):
         # .leaseId answered from inside the array) while Get-PublishedIdleBound read the array's own properties: idleSec ABSENT, the script default 300, and the legs ran although the
         # agent published idleSec 0. Now nothing runs (AGENT_NOT_BATCH_CAPABLE, exit 10), the close releases the token, and the lease it may hold is charged open to close, unnamed.
         real = str(RUNNER.parent.parent / "um-run.ps1")
-        cases = [("array", {}), ("nullplus", {}), ("nested", {}), ("array", {"FAKE_OPEN_VIA_REAL_UMRUN": "1", "FAKE_REAL_UMRUN": real})]
+        # r5 pass 3 (adversary r5 pass 2 A1): and the whole ADMISSION in a one-element array, which `$(...)` unrolled to the object inside before the reader saw it
+        cases = [("array", {"FAKE_OPEN_LB_WRAP": "array"}), ("nullplus", {"FAKE_OPEN_LB_WRAP": "nullplus"}), ("nested", {"FAKE_OPEN_LB_WRAP": "nested"}),
+                 ("array-real-umrun", {"FAKE_OPEN_LB_WRAP": "array", "FAKE_OPEN_VIA_REAL_UMRUN": "1", "FAKE_REAL_UMRUN": real}), ("admission-array", {"FAKE_OPEN_ADM_WRAP": "array"})]
         for wrap, extra in cases:
-            with self.subTest(wrap=wrap, realUmRun=bool(extra)):
+            with self.subTest(wrap=wrap):
                 self.setUp()
-                r = self.run_batch(self.specs[:2], FAKE_IDLE_SEC="0", FAKE_OPEN_LB_WRAP=wrap, **extra)
+                r = self.run_batch(self.specs[:2], FAKE_IDLE_SEC="0", **extra)
                 self.assertEqual(r.returncode, 10, r.stdout + r.stderr)
                 [b] = self.batches()
                 self.assertEqual((b["endReason"], b["legsAttempted"], b["leaseId"]), ("AGENT_NOT_BATCH_CAPABLE", 0, None), b)
@@ -1138,17 +1145,44 @@ class VenueLeaseBatchRunnerTests(unittest.TestCase):
         src = RUNNER.read_text(encoding="utf-8")
         self.assertNotIn('Start-Sleep -Seconds $CooldownSec', src)
 
+    def test_lease_batch_idle_end_r5_adv_p3_a2_an_in_lease_probes_wait_ends_at_an_instant_fixed_at_its_dispatch(self) -> None:
+        # adversary-6e3937c6.json A2: the runner passed the idle allowance as -MaxWaitSec, which Wait-VenueQuiet counts from its OWN start, after the process start, so the
+        # queue-gate wait (no agent job) outlived the allowance by the startup. Every probe now also gets -WaitUntilUtc, the dispatch instant plus that wait on the runner's
+        # clock, and Wait-VenueQuiet ends every wait (the gate's included) by it. Agent bound 70, margin 60 (10 s): the in-lease probe's end lies inside the allowance.
+        self._tree_with_agent_idle(b"70")
+        r = self.run_batch(self.specs[:1], "-ProbeMaxWaitSec", "600")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        rows = [l for l in self.events_raw() if " QUIET " in l]
+        self.assertGreaterEqual(len(rows), 1, self.events_raw())
+        for l in rows:
+            ticks, until, wait = int(l.split(" ", 1)[0]), l.split(" until=", 1)[1].split(" ", 1)[0], int(l.rsplit("maxWait=", 1)[1])
+            self.assertNotEqual(until, "-", f"no -WaitUntilUtc was passed: {l}")
+            end = datetime.fromisoformat(until.replace("Z", "+00:00"))
+            seen = datetime(1, 1, 1, tzinfo=timezone.utc) + timedelta(microseconds=ticks // 10)
+            self.assertLessEqual(wait, 10, l)
+            self.assertLessEqual((end - seen).total_seconds(), wait + 0.5, f"the probe's end is past its dispatch plus its wait: {l}")
+        # the probe script ends every wait, the queue gate's included, by -WaitUntilUtc
+        wvq = (RUNNER.parent / "Wait-VenueQuiet.ps1").read_text(encoding="utf-8")
+        for line in ("[Parameter(ParameterSetName = 'Live')][string]$WaitUntilUtc = '',", "    if ($wu -lt $deadline) { $deadline = $wu }", "    if ($wu -lt $gateEnd) { $gateEnd = $wu }"):
+            self.assertEqual(wvq.count(line), 1, line)
+        self.assertLess(wvq.index("$gateEnd = $t0.AddSeconds("), wvq.index("    if ($wu -lt $gateEnd) { $gateEnd = $wu }"))
+        self.assertLess(wvq.index("    if ($wu -lt $gateEnd) { $gateEnd = $wu }"), wvq.index("function Wait-QueueGate"))
+
     def test_lease_batch_idle_end_r5_adv_a1_a_leg_whose_lease_batch_is_array_wrapped_is_not_on_the_lease(self) -> None:
         # the :2526 sibling: a leg result whose leaseBatch is [{.. this batch's lease ..}] gave jobLease through member enumeration, so the leg counted on the lease. It names no
         # lease now: not on this batch's lease (LEASE_LOST, never counted), as a leg on another lease is (the FAKE_LEG_LOSE case).
-        r = self.run_batch(self.specs[:2], FAKE_LEG_LB_WRAP="array,none")
-        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
-        b1, b2 = self.batches()
-        self.assertEqual((b1["endReason"], b1["legsRan"], b1["legsCounted"]), ("LEASE_LOST", 1, 0), b1)
-        self.assertEqual((b1["legs"][0]["class"], b1["legs"][0]["counted"], b1["legs"][0]["onLease"], b1["legs"][0]["jobLease"]), ("LEASE_LOST", False, False, None), b1["legs"][0])
-        self.assertEqual((b2["legsRan"], b2["legsCounted"]), (1, 1))
-        res = batch_result(r.stdout)
-        self.assertEqual((res["ran"], res["counted"]), (2, 1))
+        # r5 pass 3 (adversary r5 pass 2 A1): the leg's whole admission in a one-element array ($ja was unrolled to the object inside it): the same
+        for knob in ("FAKE_LEG_LB_WRAP", "FAKE_LEG_ADM_WRAP"):
+            with self.subTest(knob=knob):
+                self.setUp()
+                r = self.run_batch(self.specs[:2], **{knob: "array,none"})
+                self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+                b1, b2 = self.batches()
+                self.assertEqual((b1["endReason"], b1["legsRan"], b1["legsCounted"]), ("LEASE_LOST", 1, 0), b1)
+                self.assertEqual((b1["legs"][0]["counted"], b1["legs"][0]["onLease"], b1["legs"][0]["jobLease"]), (False, False, None), b1["legs"][0])
+                self.assertEqual((b2["legsRan"], b2["legsCounted"]), (1, 1))
+                res = batch_result(r.stdout)
+                self.assertEqual((res["ran"], res["counted"]), (2, 1))
 
     def test_lease_batch_idle_end_r5_adv_a1_an_open_reconciled_by_name_with_an_array_wrapped_lease_batch_is_charged_unnamed(self) -> None:
         # the :2646 sibling: the open's um-run failed after the agent ran it (its result landed by name), so the finally reconciles it. Its leaseBatch [{..}] read as
@@ -1157,6 +1191,7 @@ class VenueLeaseBatchRunnerTests(unittest.TestCase):
         # r5 pass 2 (adversary r5 A1): a numeric lease id (VenueRawJson clears every identity of that reading) leaves an OBJECT with no lease id: RAN_LEASE_UNNAMED too, never ENDED
         for shape, env, want_state, want_lease, want_basis in (("array", {"FAKE_OPEN_LB_WRAP": "array"}, "RAN_LEASE_UNNAMED", None, "open-lease-unnamed"),
                                                                ("numericLeaseId", {"FAKE_OPEN_LEASE_ID_NUM": "1"}, "RAN_LEASE_UNNAMED", None, "open-lease-unnamed"),
+                                                               ("admissionArray", {"FAKE_OPEN_ADM_WRAP": "array"}, "RAN_LEASE_UNNAMED", None, "open-lease-unnamed"),
                                                                ("object", {}, "RAN_BEFORE_CANCEL", "lease-1", "open-to-close")):
             with self.subTest(shape=shape):
                 self.setUp()
@@ -1177,11 +1212,12 @@ class VenueLeaseBatchRunnerTests(unittest.TestCase):
             "$out = [ordered]@{}\n"
             "foreach ($c in @(@('object', $lb), @('array', \"[$lb]\"), @('nullplus', \"[null,$lb]\"), @('nested', \"[[$lb]]\"), @('string', '\"x\"'), @('null', 'null'))) {\n"
             "  $r = ('{\"exitCode\":0,\"endedUtc\":\"2026-11-14T18:00:00Z\",\"admission\":{\"label\":\"clear\",\"leaseBatch\":' + $c[1] + '}}') | ConvertFrom-Json\n"
-            "  $out[$c[0]] = @((Get-AdmissionLeaseBatch $r.admission).state, (Get-PublishedIdleBound $r.admission.leaseBatch).state, ($null -ne (Get-LeaseEndUtc $r))) -join '|'\n"
+            "  $out[$c[0]] = @((Get-AdmissionLeaseBatch $r).state, (Get-PublishedIdleBound $r.admission.leaseBatch).state, ($null -ne (Get-LeaseEndUtc $r))) -join '|'\n"
             "}\n"
-            "$out['admissionArray'] = (Get-AdmissionLeaseBatch (('[{\"label\":\"clear\",\"leaseBatch\":' + $lb + '}]') | ConvertFrom-Json -NoEnumerate)).state\n"
-            "$out['absent'] = (Get-AdmissionLeaseBatch ('{\"label\":\"clear\"}' | ConvertFrom-Json)).state\n"
-            "$out['dict'] = (Get-AdmissionLeaseBatch ([pscustomobject]@{ leaseBatch = [ordered]@{ token = 't'; leaseId = 'L1' } })).state\n"
+            # r5 pass 3 (adversary r5 pass 2 A1): an admission that is itself a one-element array, read from the RESULT (never unrolled to the object inside it first)
+            "$out['admissionArray'] = (Get-AdmissionLeaseBatch ('{\"exitCode\":0,\"admission\":[{\"label\":\"clear\",\"leaseBatch\":' + $lb + '}]}' | ConvertFrom-Json)).state\n"
+            "$out['absent'] = (Get-AdmissionLeaseBatch ('{\"admission\":{\"label\":\"clear\"}}' | ConvertFrom-Json)).state\n"
+            "$out['dict'] = (Get-AdmissionLeaseBatch ([pscustomobject]@{ admission = [pscustomobject]@{ leaseBatch = [ordered]@{ token = 't'; leaseId = 'L1' } } })).state\n"
             "$out | ConvertTo-Json -Compress\n"
         )
         out = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, timeout=120)
@@ -1192,7 +1228,10 @@ class VenueLeaseBatchRunnerTests(unittest.TestCase):
         # and no reader in the runner reads a leaseBatch by member access (which enumerates a collection): every one goes through Get-AdmissionLeaseBatch
         src = RUNNER.read_text(encoding="utf-8")
         self.assertEqual(re.findall(r"\$\w+(?:\.\w+)*\.leaseBatch\b", src), [])
-        self.assertEqual(src.count("Get-AdmissionLeaseBatch $"), 4)
+        self.assertEqual(src.count("Get-AdmissionLeaseBatch $"), 5)
+        # r5 pass 3: every caller hands it the RESULT, never an admission already read (unrolled) out of it
+        for call in ("Get-AdmissionLeaseBatch $Result)", "Get-AdmissionLeaseBatch $op.result", "Get-AdmissionLeaseBatch $jr.result)", "Get-AdmissionLeaseBatch $cr.result }", "Get-AdmissionLeaseBatch $null"):
+            self.assertEqual(src.count(call), 1, call)
 
     # ---------------------------------------------------------------- r4 (adversary r4 A1): the idle anchor is the agent job's end, not when this runner got round to it
     def test_lease_batch_idle_end_r4_adv_a1_the_idle_allowance_starts_before_the_opens_liveness_cleanup(self) -> None:
