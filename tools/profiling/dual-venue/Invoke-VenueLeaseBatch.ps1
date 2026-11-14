@@ -1545,6 +1545,7 @@ function Invoke-QuietProbe([string]$Name, [string]$Phase, [int]$MaxWaitSec, $The
     }
     # r5 pass 1 A2: the probe's output is CAPTURED, not redirected to the file: a `*>` file redirect opens (creates) the file after the admission above, and that open can stall on a share (a
     # UNC RunDir), buying a probe past the deadline. Nothing but the process start follows the admission; the file is written (still the probe's evidence) after it returns.
+    $startTs = [Diagnostics.Stopwatch]::GetTimestamp()   # r4 pass 2 (adversary A1): the probe's dispatch, the latest instant provably before its agent jobs (the idle anchor)
     $captured = @(& $pwshExe @qArgs *>&1 | ForEach-Object { [string]$_ })
     # r6 (adversary r5 A2): the child's result is observed HERE: this is the instant of its reading, taken before the evidence write and the parse below (either can stall on a share,
     # and that time is part of the thermal wait, never left out of it)
@@ -1570,7 +1571,7 @@ function Invoke-QuietProbe([string]$Name, [string]$Phase, [int]$MaxWaitSec, $The
     $ht = ConvertFrom-VenueProbeHeatLine -Lines $lines
     [pscustomobject]@{ verdict = $verdict; code = $code; mean = $mean; reason = $reason; foreignFloor = [bool]$ff; foreignFloorLine = [string]$ff; heat = $ht.heat; heatText = $ht.text
         thresholdsSource = $ht.thresholdsSource; heatReason = $ht.reason
-        endTs = $endTs; endUtc = $endUtc; maxWaitSec = $wait }
+        endTs = $endTs; endUtc = $endUtc; startTs = $startTs; maxWaitSec = $wait }
 }
 
 function Get-OpenDispatchRefusal([string]$NotAfterUtc) {
@@ -2318,11 +2319,12 @@ while ($pending.Count -gt 0 -and $null -eq $stopReason) {
                 $probeEndTs = $q.endTs; $probeEndUtc = $q.endUtc
                 # r3 pass 2 (adversary A1): a probe that MEASURED ran agent jobs, which restart the agent's idle clock: QUIET just after its last sample, COOLDOWN_UNMET within one
                 # -RecheckSec of its end (it re-probes every -RecheckSec). A busy gate (GATE_BUSY) ran none: the anchor stays where it was.
-                if ($q.verdict -ceq 'QUIET') { $idleAnchorTs = $q.endTs }
-                elseif ($q.verdict -ceq 'COOLDOWN_UNMET') { $idleAnchorTs = [Math]::Max($idleAnchorTs, $q.endTs - [long]$RecheckSec * [Diagnostics.Stopwatch]::Frequency) }
+                # r4 pass 2 (adversary A1): the probe's return is AFTER its last agent job ended by however long the child took to finish (a gate-log append, its exit), which the
+                # runner cannot see. The only instant provably no later than that job's end is the probe's dispatch: a measuring probe moves the anchor there, never past it.
+                if ($q.verdict -ceq 'QUIET' -or $q.verdict -ceq 'COOLDOWN_UNMET') { $idleAnchorTs = [Math]::Max($idleAnchorTs, $q.startTs) }
                 if ($null -ne $q.maxWaitSec) { $probeWait = $q.maxWaitSec }   # the wait the probe was given (cut at its dispatch), for the QUIET line
                 if ($q.foreignFloor -and -not $legForeign.ContainsKey($leg.name)) { $legForeign[$leg.name] = $q.foreignFloorLine }
-                L "QUIET leg=$($leg.name) batch=$batchNo phase=in-lease exit=$($q.code) verdict=$($q.verdict) mean=$(Format-Mean $q.mean) maxWaitSec=$probeWait roomSec=$room$(if ($q.reason) { " reason=$($q.reason)" })$(if ($q.foreignFloor) { ' foreignFloor=1' })"
+                LogBest "QUIET leg=$($leg.name) batch=$batchNo phase=in-lease exit=$($q.code) verdict=$($q.verdict) mean=$(Format-Mean $q.mean) maxWaitSec=$probeWait roomSec=$room$(if ($q.reason) { " reason=$($q.reason)" })$(if ($q.foreignFloor) { ' foreignFloor=1' })"
                 }
                 }
                 if ($q.verdict -ceq 'USAGE') { $b.endReason = 'PROBE_USAGE'; Set-Stop 'USAGE' 2; break }
@@ -2544,7 +2546,7 @@ while ($pending.Count -gt 0 -and $null -eq $stopReason) {
                     $b.retries++; $b.legRetries++
                     $b.legs.Add([pscustomobject][ordered]@{ batch = $batchNo; attempt = $attempt; status = 'RETRY'; outcome = $outcome; thermalWaitSec = $th.doneWaitSec; receipt = $receipt; jobId = $legJobId; jobLease = $jobLease; onLease = $onLease; renewOkMaxGapSec = $gap; counted = $false; legSec = $legSec; exit75Refusals = $legRef; withdraw = $withdraw; heatAtProbe = $th.firstHeat; heatAtProbeText = $th.firstHeatText })   # r6 (adversary r6 A2)
                     Add-PlanIdentity $b.legs[$b.legs.Count - 1] $leg
-                    L "RETRY_IN_LEASE leg=$($leg.name) batch=$batchNo reason=LEG_NOT_QUIESCENT receipt=$receipt onLease=$onLease $leaseWhy"
+                    LogBest "RETRY_IN_LEASE leg=$($leg.name) batch=$batchNo reason=LEG_NOT_QUIESCENT receipt=$receipt onLease=$onLease $leaseWhy"
                     if ($leaseClass -ceq 'LEASE_IDLE_ENDED') { $b.endDetail = $leaseWhy; Set-BatchLeaseIdleEnded $b $legIe $leg.name "before leg $($leg.name)'s job was admitted: it ran off the lease, uncounted" 'a leg ran off the lease: uncounted' -AppendDetail; break }
                     if ($leaseClass) { $b.endReason = $leaseClass; $b.endDetail = $leaseWhy; break }
                     continue
@@ -2571,7 +2573,7 @@ while ($pending.Count -gt 0 -and $null -eq $stopReason) {
                 $b.legs.Add([pscustomobject]$row); Add-Result $leg 'RAN' $row; $pending.RemoveAt(0)
                 Add-PlanIdentity $b.legs[$b.legs.Count - 1] $leg
                 $b.legsRan++; if ($counted) { $b.legsCounted++ }
-                L "LEG $($leg.name) RAN batch=$batchNo exit=$legCode outcome=$outcome class=$class counted=$counted quietMean=$(Format-Mean $q.mean) preLoadMean=$(Format-Mean $preLoad) legSec=$legSec receipt=$receipt $leaseWhy$(if ($legFF) { ' foreignFloor=1' })"
+                LogBest "LEG $($leg.name) RAN batch=$batchNo exit=$legCode outcome=$outcome class=$class counted=$counted quietMean=$(Format-Mean $q.mean) preLoadMean=$(Format-Mean $preLoad) legSec=$legSec receipt=$receipt $leaseWhy$(if ($legFF) { ' foreignFloor=1' })"
                 if ($leaseClass -ceq 'LEASE_IDLE_ENDED') { $b.endDetail = $leaseWhy; Set-BatchLeaseIdleEnded $b $legIe $leg.name "before leg $($leg.name)'s job was admitted: it ran off the lease, uncounted" 'a leg ran off the lease: uncounted' -AppendDetail; break }
                 if ($leaseClass) { $b.endReason = $leaseClass; $b.endDetail = $leaseWhy; break }
                 if ($pending.Count -gt 0 -and $CooldownSec -gt 0) { L "COOLDOWN ${CooldownSec} s (inside the lease)"; Start-Sleep -Seconds $CooldownSec }

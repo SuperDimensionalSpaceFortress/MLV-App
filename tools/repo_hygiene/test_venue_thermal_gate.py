@@ -1176,7 +1176,7 @@ class ThermalDeadlineAdmissionTests(unittest.TestCase):
     def test_adversary_r4_a2_a_stalled_quiet_log_after_the_first_hot_reading_counts_against_the_cap(self) -> None:
         # the first hot reading is when its probe RETURNED, not when the runner got around to stamping it after the QUIET log line: a 6 s stall there (cap 4) used to be
         # left out of the wait (waitSec 0), so another sleep and another probe were allowed; now the cap is already spent and the leg is skipped with that one probe
-        r, b = self._expired_wait_run(('L "QUIET leg=$($leg.name) batch=$batchNo phase=in-lease', 'Start-Sleep -Seconds 3; L "QUIET leg=$($leg.name) batch=$batchNo phase=in-lease'), FAKE_HEAT="9")
+        r, b = self._expired_wait_run(('LogBest "QUIET leg=$($leg.name) batch=$batchNo phase=in-lease', 'Start-Sleep -Seconds 3; LogBest "QUIET leg=$($leg.name) batch=$batchNo phase=in-lease'), FAKE_HEAT="9")
         self._assert_typed_skip_without_another_probe(r, b, marker=False)
 
     def test_adversary_r4p2_a2_a_stall_inside_the_probe_function_before_its_dispatch_starts_no_further_probe(self) -> None:
@@ -1198,7 +1198,7 @@ class ThermalDeadlineAdmissionTests(unittest.TestCase):
         # hot twice (a wait of 1-2 s), then clear: the leg launches, which ends the thermal wait, and returns VENUE_NOT_QUIESCENT; the retry log stalls past the old deadline.
         # A1: the retry's probe used to inherit the finished wait (firstHotUtc kept): dispatched with no admission and a quiet wait clamped to 0 (maxWaitSec=0).
         # A5: the retry's fresh gate used to overwrite the leg's thermalWaitSec with 0, so the final receipt lost the wait it had come after.
-        self._mirror_with_bad_sidecar(runner_patches=(('L "RETRY_IN_LEASE leg=$($leg.name) batch=$batchNo reason=LEG_NOT_QUIESCENT', 'Start-Sleep -Seconds 6; L "RETRY_IN_LEASE leg=$($leg.name) batch=$batchNo reason=LEG_NOT_QUIESCENT'),))
+        self._mirror_with_bad_sidecar(runner_patches=(('LogBest "RETRY_IN_LEASE leg=$($leg.name) batch=$batchNo reason=LEG_NOT_QUIESCENT', 'Start-Sleep -Seconds 6; LogBest "RETRY_IN_LEASE leg=$($leg.name) batch=$batchNo reason=LEG_NOT_QUIESCENT'),))
         r = self.run_batch([self.specs[0]], "-ThermalWaitCapSec", "4", "-ThermalPollSec", "1", "-ThermalRequeueMax", "0", FAKE_HEAT="9,9,0", FAKE_LEG_OUTCOMES="VENUE_NOT_QUIESCENT,PASS")
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
         quiet = [l for l in self.log().splitlines() if " QUIET leg=" in l]

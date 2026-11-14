@@ -86,6 +86,8 @@ $modes = @(([string]$env:FAKE_QUIET_MODES) -split ',' | Where-Object { $_ })
 if ($modes.Count -eq 0) { $modes = @('QUIET') }
 $mode = $modes[[Math]::Min($n, $modes.Count - 1)]
 Add-Content -LiteralPath $env:FAKE_EVENTS -Value ("{0} QUIET {1} maxWait={2}" -f [DateTime]::UtcNow.Ticks, $mode, $MaxWaitSec)
+# r4 pass 2 (adversary A1): FAKE_QUIET_SLOW_SEC = the probe child's own time around its agent jobs (a slow gate-log append), which the runner cannot see
+if ($env:FAKE_QUIET_SLOW_SEC) { Start-Sleep -Seconds ([int]$env:FAKE_QUIET_SLOW_SEC) }
 switch ($mode) {
     'QUIET' { "QUIET mean=5.0% threshold=$ThresholdPercent% waitedSec=1"; exit 0 }
     'COOLDOWN' { "COOLDOWN_UNMET mean=32.0% threshold=$ThresholdPercent% waitedSec=1"; exit 0 }
@@ -1078,6 +1080,28 @@ class VenueLeaseBatchRunnerTests(unittest.TestCase):
         waits = self._in_lease_waits()
         self.assertEqual(len(waits), 1, self.events_raw())
         self.assertLessEqual(waits[0], 4, f"the open's liveness cleanup was not spent from the idle allowance: {waits}")
+
+    def test_lease_batch_idle_end_r4_adv_p2_a1_a_measuring_probe_moves_the_idle_anchor_only_to_its_dispatch(self) -> None:
+        # adversary-d23711a7.json A1: a measuring probe set the anchor at its RETURN (QUIET) or one -RecheckSec before it (COOLDOWN_UNMET), so the child's own time after its last
+        # agent job (a slow gate-log append) was not spent. Agent bound 70, margin 60 (10 s); the first probe's child takes 6 s and reads COOLDOWN_UNMET: the retry may wait at
+        # most about 10 - 6 = 4 s (anchored at the dispatch), not about 8 (anchored one second before the return).
+        self._tree_with_agent_idle(b"70")
+        r = self.run_batch(self.specs[:1], "-ProbeMaxWaitSec", "600", FAKE_QUIET_MODES="COOLDOWN,QUIET", FAKE_QUIET_SLOW_SEC="6")
+        waits = self._in_lease_waits()
+        self.assertGreaterEqual(len(waits), 2, self.events_raw() + [r.stdout, r.stderr])
+        self.assertLessEqual(waits[1], 4, f"the probe child's time after its dispatch was not spent from the idle allowance: {waits}")
+        src = RUNNER.read_text(encoding="utf-8")
+        self.assertIn("{ $idleAnchorTs = [Math]::Max($idleAnchorTs, $q.startTs) }", src)
+        self.assertNotIn("$idleAnchorTs = $q.endTs", src)
+
+    def test_lease_batch_idle_end_r4_adv_p2_a2_the_log_lines_before_an_idle_typing_are_best_effort(self) -> None:
+        # adversary-d23711a7.json A2: a throwing L just before Set-BatchLeaseIdleEnded (the LEG RAN and RETRY_IN_LEASE lines) or before the probe's receipt read (the QUIET line)
+        # turned a typed idle end into BATCH_ERROR (exit 12). Those three lines are LogBest: a log failure is counted, the typed end stands.
+        src = RUNNER.read_text(encoding="utf-8")
+        for line in ('LogBest "QUIET leg=$($leg.name) batch=$batchNo phase=in-lease', 'LogBest "RETRY_IN_LEASE leg=$($leg.name) batch=$batchNo reason=LEG_NOT_QUIESCENT',
+                     'LogBest "LEG $($leg.name) RAN batch=$batchNo'):
+            self.assertEqual(src.count(line), 1, line)
+            self.assertNotIn(" L " + line[len("LogBest "):], src)
 
     def test_lease_batch_idle_end_r4_adv_a1_the_idle_allowance_after_a_leg_starts_at_its_jobs_end(self) -> None:
         # the sibling at the leg: the anchor was the leg child's return, after its own receipt work. Agent bound 70, margin 60, the child works 6 s after its job ended: the
