@@ -106,6 +106,14 @@ switch ($mode) {
         Add-Content -LiteralPath (Join-Path $lg "lease-batch-$($stq.token).jsonl") -Value (([ordered]@{ schema = 'mlv-agent-lease-batch.v1'; token = $stq.token; leaseId = $stq.leaseId; endedUtc = [DateTimeOffset]::UtcNow.ToString('o'); heldSec = 301; endReason = 'idle'; why = 'no job for 301s > 300s'; jobsRun = 1 }) | ConvertTo-Json -Compress)
         "QUIET mean=5.0% threshold=$ThresholdPercent% waitedSec=301"; exit 0
     }
+    'IDLEBUSY' {
+        # r3 adversary pass 2 A2: the agent released the lease idle while the gate stayed busy (no job ran): the idle line, and a GATE_BUSY probe
+        $stq = Get-Content -LiteralPath (Join-Path $env:FAKE_SHARE 'fake-agent-state.json') -Raw | ConvertFrom-Json
+        $lg = Join-Path $env:FAKE_SHARE 'logs'
+        New-Item -ItemType Directory -Force -Path $lg | Out-Null
+        Add-Content -LiteralPath (Join-Path $lg "lease-batch-$($stq.token).jsonl") -Value (([ordered]@{ schema = 'mlv-agent-lease-batch.v1'; token = $stq.token; leaseId = $stq.leaseId; endedUtc = [DateTimeOffset]::UtcNow.ToString('o'); heldSec = 301; endReason = 'idle'; why = 'no job for 301s > 300s'; jobsRun = 1 }) | ConvertTo-Json -Compress)
+        'GATE_BUSY quiet-probe waitedSec=1'; exit 3
+    }
     { $_ -in 'IDLEFOREIGN', 'FOREIGNIDLE', 'NOTOKENIDLE', 'FOREIGNEND' } {
         # r2 (sol key r1 BLOCKER, receipt token binding): lines in THIS batch's receipt file for THIS lease that another token wrote, or no token at all. IDLEFOREIGN: a foreign
         # closed line, then the agent's own idle line. FOREIGNIDLE / NOTOKENIDLE: a lone idle line under another token / under none. FOREIGNEND: a lone foreign non-idle line.
@@ -940,6 +948,35 @@ class VenueLeaseBatchRunnerTests(unittest.TestCase):
         self.assertTrue(all(b <= a for a, b in zip(waits[:4], waits[1:5])), f"a busy retry got a fresh allowance: {waits}")
         self.assertLessEqual(waits[4], 10 - 6, f"three 2 s busy sleeps spent at least 6 s of the allowance: {waits}")
         self.assertGreaterEqual(waits[5], 5, f"a leg's job restarts the allowance: {waits}")
+
+    def _patch_tree_runner(self, old: str, new: str) -> None:
+        text = self.runner.read_text(encoding="utf-8")
+        self.assertEqual(text.count(old), 1, "the runner line moved: update this fixture")
+        self.runner.write_text(text.replace(old, new), encoding="utf-8")
+
+    def test_lease_batch_idle_end_r3_adv_p2_a1_the_idle_allowance_starts_at_the_opens_read_not_after_its_log(self) -> None:
+        # adversary r3 pass 2 A1 (adversary-4c198b23.json): the anchor was taken after the BATCH_OPEN log append, so a stalled append was not spent from the allowance. Agent bound
+        # 70, margin 60 (a 10 s allowance), a 6 s stall before BATCH_OPEN: the first probe may wait at most about 4 s, never the full 10.
+        self._tree_with_agent_idle(b"70")
+        self._patch_tree_runner('            L "BATCH_OPEN batch=$batchNo', '            Start-Sleep -Seconds 6; L "BATCH_OPEN batch=$batchNo')
+        r = self.run_batch(self.specs[:1], "-ProbeMaxWaitSec", "600")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        waits = self._in_lease_waits()
+        self.assertEqual(len(waits), 1, self.events_raw())
+        self.assertLessEqual(waits[0], 4, f"the stalled open log was not spent from the idle allowance: {waits}")
+
+    def test_lease_batch_idle_end_r3_adv_p2_a2_a_room_short_end_after_an_idle_release_is_typed_idle_ended(self) -> None:
+        # adversary r3 pass 2 A2: the idle release landed while a busy probe's sleep ran (the post-probe read missed it: simulated by a first read that finds nothing), the loop top
+        # then ended the batch LEASE_REMAINING_SHORT and the churn count was reset. The batch end now reads the agent's receipt first: LEASE_IDLE_ENDED, the leg runs in batch 2.
+        self._tree_with_agent_idle(b"300")
+        self._patch_tree_runner("    if ([string]::IsNullOrWhiteSpace($LeaseId)) { return $null }\n    $ar = Read-VenueLeaseBatchReceipt",
+                                "    if ([string]::IsNullOrWhiteSpace($LeaseId)) { return $null }\n    $script:ieReads++; if ($script:ieReads -eq 1) { return $null }\n    $ar = Read-VenueLeaseBatchReceipt")
+        r = self.run_batch(self.specs[:1], "-ClaimPollSec", "20", FAKE_QUIET_MODES="IDLEBUSY,QUIET", FAKE_LEASE_REMAIN="75,2700")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        b1, b2 = self.batches()
+        self.assertEqual((b1["endReason"], b1["legsAttempted"]), ("LEASE_IDLE_ENDED", 0), b1)
+        self.assertIn("as idle", b1["endDetail"])
+        self.assertEqual((b2["endReason"], b2["legsRan"]), ("ALL_LEGS_DONE", 1), b2)
 
     def test_lease_batch_idle_end_r3_adv_a1_a_long_claim_poll_sleep_stops_just_past_the_agents_idle_bound(self) -> None:
         # adversary r3 A1: the busy sleep used the loop top's room and -ClaimPollSec only, so a long poll slept far past the idle release (into a room-short end that hid it).

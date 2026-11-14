@@ -2128,6 +2128,7 @@ while ($pending.Count -gt 0 -and $null -eq $stopReason) {
         # and the run ends in the same typed refusal (exit 2). A link made after this check is a race no re-check closes (an instant later), and is not claimed here.
         # r13 pass 2 (adversary A3): the lease's end is placed from the moment the result was read, BEFORE the guard's reads (which can take a while), never after them
         $openReadUtc = [DateTime]::UtcNow
+        $openReadTs = [Diagnostics.Stopwatch]::GetTimestamp()   # r3 adversary pass 2 A1: the idle clock's anchor for the batch (the same instant, monotonic)
         $openGuard = New-GuardBudget 0 '' 'LEG_BUDGET_EXCEEDS_LEASE' $false 'open'   # its clock starts with the read time every bound below is measured from
         $leaseEnd = Get-LeaseEndUtc $op.result
         # r3 (Dot 780783c4): the guard's content reads run on the lease's time, so they are bounded by what the lease can spare: its end (clamped as the legs' is below, from the same
@@ -2197,7 +2198,8 @@ while ($pending.Count -gt 0 -and $null -eq $stopReason) {
                 Set-Stop 'AGENT_IDLE_BOUND_UNKNOWN' 10; LogBest "AGENT_IDLE_BOUND_UNKNOWN batch=$batchNo lease=$($b.leaseId) (no probe or leg runs on it; the lease is closed)"
             }
             $probeIdleCap = $(if ($null -ne $batchIdleSec) { [int]$batchIdleSec - $ProbeIdleMarginSec } else { 0 })
-            $idleAnchorTs = [Diagnostics.Stopwatch]::GetTimestamp()   # the open's job ended no later than its result was read
+            # the open's job ended no later than its result was read; r3 adversary pass 2 A1: from THAT instant, so the guard and the BATCH_OPEN log append since are spent too
+            $idleAnchorTs = $openReadTs
             $attempt = 0
             $launchShort = $false
             while ($pending.Count -gt 0 -and $null -eq $b.endReason) {
@@ -2500,6 +2502,12 @@ while ($pending.Count -gt 0 -and $null -eq $stopReason) {
                 if ($pending.Count -gt 0 -and $CooldownSec -gt 0) { L "COOLDOWN ${CooldownSec} s (inside the lease)"; Start-Sleep -Seconds $CooldownSec }
             }
             if ($null -eq $b.endReason -and $pending.Count -eq 0) { $b.endReason = 'ALL_LEGS_DONE' }
+            # r3 adversary pass 2 A2: a room-short end can come before the next probe's receipt read (a busy sleep that woke past the idle release). If the agent released this
+            # lease as idle, that is the end (LEASE_IDLE_ENDED, and it counts toward -IdleEndedZeroLegMax), never a room-short one that hides it.
+            if ($b.endReason -ceq 'LEASE_REMAINING_SHORT') {
+                $ieS = Get-LeaseIdleEnd $token ([string]$b.leaseId)
+                if ($null -ne $ieS) { $b.endReason = 'LEASE_IDLE_ENDED'; $b.endDetail = "$($b.endDetail); the agent had released lease $($b.leaseId) as idle (endedUtc=$($ieS.endedUtc) heldSec=$($ieS.heldSec) why=$($ieS.why))" }
+            }
             # A FRESH lease with no room for even one leg can never run it: stop rather than open lease after lease.
             # adversary r1 A1: a batch that ran out of room WAITING FOR HEAT (or skipping hot legs) had room for a leg: not a leg budget no lease can hold
             # r8 pass 3 (#704): nor is room the guards ate at the launch
