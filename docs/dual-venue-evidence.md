@@ -531,8 +531,9 @@ and is ready for one scheduled call (UM-REGULAR-BASELINE-SCHEDULE-1: fetch fork,
 pwsh -NoProfile -File tools\profiling\dual-venue\Invoke-VenueStageNightly.ps1 [-Venue ultra-magnus] [-SourceCommit <40-hex>] [-WhatIf]
 ```
 
-- The cache is the truth, read by name. A sha whose `<agentShare>\cache\playback-attr-3-cuda-<sha12>-build.json`, three artifacts and smoke-runner
-  dir are already there is `STAGE_SKIP_ALREADY` and is never re-assembled. A re-assemble makes a new manifest (`assembledAtUtc`), so a spent default
+- The cache is the truth, read by name. A sha whose `<agentShare>\cache\playback-attr-3-cuda-<sha12>-build.json` is a sound staged build and whose
+  smoke-runner dir is there is `STAGE_SKIP_ALREADY` and is never re-assembled. Sound is decided by the same read the stage reuse and the lease batch
+  take (`Get-VenueStagedBuildManifest -VerifyArtifacts`; r4): a build.json with a claim the leg refuses is not "already staged". A re-assemble makes a new manifest (`assembledAtUtc`), so a spent default
   stage JobId whose cache does not hold the assembled manifest is re-staged under `-JobIdSuffix n<yyyyMMddHHmm>` (#508). Every `STAGE_OK` is
   re-hashed by name, and a mismatch is `STAGE_VERIFY_MISMATCH`.
 - A staged build is never replaced (VENUE-STAGE-SAME-SHA-RESTAGE-GUARD-1). The driver reads the cache again just before the stage submission; a
