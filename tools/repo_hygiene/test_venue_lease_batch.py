@@ -971,7 +971,8 @@ class VenueLeaseBatchRunnerTests(unittest.TestCase):
         self._tree_with_agent_idle(b"300")
         self._patch_tree_runner("    if ([string]::IsNullOrWhiteSpace($LeaseId)) { return $null }\n    $ar = Read-VenueLeaseBatchReceipt",
                                 "    if ([string]::IsNullOrWhiteSpace($LeaseId)) { return $null }\n    $script:ieReads++; if ($script:ieReads -eq 1) { return $null }\n    $ar = Read-VenueLeaseBatchReceipt")
-        r = self.run_batch(self.specs[:1], "-ClaimPollSec", "20", FAKE_QUIET_MODES="IDLEBUSY,QUIET", FAKE_LEASE_REMAIN="75,2700")
+        # -RecheckSec 30 with 75 s of lease: the busy probe leaves under one recheck of room after the leg budget, so the batch ends room-short right there (no further probe)
+        r = self.run_batch(self.specs[:1], "-ClaimPollSec", "20", "-RecheckSec", "30", FAKE_QUIET_MODES="IDLEBUSY,QUIET", FAKE_LEASE_REMAIN="75,2700")
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
         b1, b2 = self.batches()
         self.assertEqual((b1["endReason"], b1["legsAttempted"]), ("LEASE_IDLE_ENDED", 0), b1)
