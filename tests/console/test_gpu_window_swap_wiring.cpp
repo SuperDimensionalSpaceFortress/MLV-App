@@ -1019,11 +1019,26 @@ TEST(GpuPresentTailTiming, RefusalsAbandonTheWindowAndRunnerSleepsReachIt)
     ASSERT_TRUE(helperAt >= 0);
     const int helperEnd = main.indexOf(QStringLiteral("\n}"), helperAt);
     const QString helper = main.mid(helperAt, helperEnd - helperAt);
+    // HFR-NATIVE-M16-1457-FULLSCREEN-S1S2-PRESENT-GAP-1 r4: the sleep is the due wake's sent wait (sleepForSmokeRunner) with
+    // the msleep kept as the fallback, and since r3 (r2 adversary pass 7 A3) a sent message dispatched inside the sleep is GUI
+    // work, so its time (lastRunnerSleepDispatchNs) is taken out of BOTH sleep accounts. In source order: the stopwatch starts,
+    // both sleeps run, the dispatch time is read, the one elapsed read subtracts it, and that read reaches the tail window.
     const int startAt = helper.indexOf(QStringLiteral("slept.start();"));
+    const int sentSleepAt = helper.indexOf(QStringLiteral("m_playbackDueWake->sleepForSmokeRunner( ms )"));
     const int sleepAt = helper.indexOf(QStringLiteral("QThread::msleep( ms );"));
-    const int readAt = helper.indexOf(QStringLiteral("const qint64 sleptNs = slept.nsecsElapsed();"));
+    const int dispatchAt = helper.indexOf(QStringLiteral("m_playbackDueWake->lastRunnerSleepDispatchNs()"));
+    const int readAt = helper.indexOf(QStringLiteral(
+        "const qint64 sleptNs = std::max<qint64>( 0, slept.nsecsElapsed() - dispatchNs );"));
+    const int gapAt = helper.indexOf(QStringLiteral(
+        "m_guiPresentGapRunnerSleepNs += std::max<qint64>( 0, m_guiPresentGapClock.nsecsElapsed() - startNs - dispatchNs );"));
     const int noteAt = helper.indexOf(QStringLiteral("GpuDisplayWindow::noteSmokeRunnerSleepIfActive( sleptNs );"));
-    ASSERT_TRUE(startAt >= 0 && sleepAt > startAt && readAt > sleepAt && noteAt > readAt);
+    ASSERT_TRUE(startAt >= 0 && sentSleepAt > startAt && sleepAt > sentSleepAt && dispatchAt > sleepAt
+                && readAt > dispatchAt && noteAt > readAt);
+    ASSERT_TRUE(gapAt > sleepAt);
+    // one elapsed read and one gap update, each subtracting the dispatch: no second, unsubtracted account
+    ASSERT_EQ(1, countOccurrences(helper, QStringLiteral("slept.nsecsElapsed()")));
+    ASSERT_EQ(1, countOccurrences(helper, QStringLiteral("m_guiPresentGapRunnerSleepNs +=")));
+    ASSERT_EQ(1, countOccurrences(helper, QStringLiteral("noteSmokeRunnerSleepIfActive(")));
 }
 
 // PLAYBACK-PRESENT-TAIL-TIMING-1 (W1): slip_summary appends the max-setup tail keys after present_setup_first_ms (the
