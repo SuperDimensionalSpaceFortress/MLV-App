@@ -1269,7 +1269,9 @@ function Get-ReceiverRoots($Expression) {
             # WMI class it names. The condition of an if or a ternary never reaches here, so a read of the process table there does not make the receiver WMI.
             if (Test-WmiWord $e $true) { $roots.Add('#wmi') }
             if ($e -is [StatementAst]) {
-                foreach ($v in $e.FindAll({ param($x) $x -is [VariableExpressionAst] }, $true)) { $roots.Add((Get-VarName $v)) }
+                # A variable only in the condition of an if or a ternary inside it is not its value either (r15, adversary pass 20 A1:
+                # `(Write-Output $(if ($c) { $x })).Create()` with a WMI $c).
+                foreach ($v in $e.FindAll({ param($x) $x -is [VariableExpressionAst] }, $true)) { if (-not (Test-InConditionOf $v $e)) { $roots.Add((Get-VarName $v)) } }
             }
         }
     }
@@ -1611,9 +1613,13 @@ function Test-OneLetterValueParameter([string]$Letter) {
 
 # True when this one command reads WMI by a class operand that is tainted (see above).
 function Test-WmiClassOperandCommand($Command) {
-    $watched = $false
-    foreach ($meaning in @(Get-CommandMeanings $Command)) { if ($wmiReadCommands -contains $meaning) { $watched = $true } }
-    if (-not $watched) { return $false }
+    $watched = @(@(Get-CommandMeanings $Command) | Where-Object { $wmiReadCommands -contains $_ })
+    if ($watched.Count -eq 0) { return $false }
+    # The CIM reads (Get-CimInstance / gcim / Get-CimClass) take their parameters from the cmdlet's own metadata (r15, adversary pass 20 A2: `-infa`, `-CN`, `-OT`,
+    # `-SelectProperties`, `-proga` were read as class operands). When the name may also mean Get-WmiObject / gwmi (no metadata under pwsh 7), or the CIM meanings
+    # disagree, the hand list below is used, with every common parameter and alias the metadata names.
+    $cimTables = @($watched | ForEach-Object { if ($_ -eq 'get-cimclass') { 'get-cimclass' } elseif ($_ -eq 'get-ciminstance' -or $_ -eq 'gcim') { 'get-ciminstance' } else { '#none' } } | Sort-Object -Unique)
+    $cimTable = if ($cimTables.Count -eq 1 -and $cimTables[0] -ne '#none') { $cimTables[0] } else { $null }
     $elements = @($Command.CommandElements)
     $examined = 0
     for ($i = 1; $i -lt $elements.Count; $i++) {
@@ -1623,9 +1629,15 @@ function Test-WmiClassOperandCommand($Command) {
             $isClass = $false
             foreach ($cp in $wmiClassParameters) { if ($cp.StartsWith($n, [StringComparison]::OrdinalIgnoreCase)) { $isClass = $true } }
             $isOther = $false
-            if (-not $isClass -and $n.Length -ge 2) {
-                foreach ($op in $wmiOtherValueParameters) { if ($op.StartsWith($n, [StringComparison]::OrdinalIgnoreCase)) { $isOther = $true } }
-                if (@('ea', 'wa', 'ia', 'ev', 'wv', 'iv', 'ov', 'ob', 'pv') -contains $n.ToLowerInvariant()) { $isOther = $true }
+            if ($null -ne $cimTable -and -not $isClass) {
+                # A spelling that binds to no parameter or to several takes no value (fail closed: the element after it is read as an operand).
+                $r = Resolve-CmdletParameter $cimTable $n
+                if ($null -ne $r -and @('ClassName', 'Query') -contains $r.Name) { $isClass = $true }
+                elseif ($null -ne $r -and -not $r.Switch) { $isOther = $true }
+            }
+            elseif (-not $isClass -and $n.Length -ge 2) {
+                foreach ($op in @($wmiOtherValueParameters + $commonValueNames)) { if ($op.StartsWith($n, [StringComparison]::OrdinalIgnoreCase)) { $isOther = $true } }
+                if ($commonValueSpellings -contains $n.ToLowerInvariant()) { $isOther = $true }
             }
             elseif (-not $isClass -and $n.Length -eq 1) { $isOther = Test-OneLetterValueParameter $n }
             if ($null -ne $e.Argument) {
@@ -1668,6 +1680,22 @@ function Get-ConstantText($Node) {
 function Test-DataArgument($Arguments, [int]$Index) {
     $slot = (($Index -eq 1 -and $Arguments.Count -le 3 -and $Arguments[0] -is [StringConstantExpressionAst]) -or ($Index -eq 3 -and $Arguments.Count -eq 4))
     if (-not $slot) { return $false }
+    # A cast to an ARRAY type is an array whatever it wraps (r15, adversary pass 20 A3: `[object[]]'create'` is a one-element array, not the verb). Every wrapper
+    # Get-ValueExpression would strip is looked at for one.
+    for ($w = $Arguments[$Index]; $null -ne $w -and $w -isnot [ArrayLiteralAst]; ) {
+        if ($w -is [ConvertExpressionAst] -and $w.Type.TypeName.IsArray) { return $true }
+        $next = $null
+        if ($w -is [CommandExpressionAst]) { $next = $w.Expression }
+        elseif ($w -is [PipelineAst] -and @($w.PipelineElements).Count -eq 1) { $next = @($w.PipelineElements)[0] }
+        elseif ($w -is [ParenExpressionAst]) { $next = $w.Pipeline }
+        elseif ($w -is [ConvertExpressionAst]) { $next = $w.Child }
+        elseif ($w -is [SubExpressionAst] -and @($w.SubExpression.Statements).Count -eq 1) { $next = @($w.SubExpression.Statements)[0] }
+        elseif ($w -is [BinaryExpressionAst] -and $w.Operator -eq [TokenKind]::As) {
+            if ($w.Right -is [TypeExpressionAst] -and $w.Right.TypeName.IsArray) { return $true }
+            $next = $w.Left
+        }
+        $w = $next
+    }
     # Through a cast, parentheses and `$( )` of one expression (adversary pass 15 A1: `$(@('create'))` is the same array).
     $v = Get-ValueExpression $Arguments[$Index]
     return ($v -is [ArrayLiteralAst] -or $v -is [ArrayExpressionAst] -or $v -is [HashtableAst])
@@ -1695,7 +1723,7 @@ function Test-ClassParameterName([string]$Name) {
 # read ONCE from each cmdlet's own metadata (r15, Grok G17): `(Get-Command <cmdlet>).Parameters` holds its own parameters and the common ones, each with its aliases and
 # whether it is a switch. A hand-written list is what missed `-vb` / `-db`. Key: the cmdlet, then a spelling (name or alias), lowercased.
 $parameterTables = @{}
-foreach ($cmdlet in @('New-Object', 'ForEach-Object', 'Set-Alias', 'New-Alias')) {
+foreach ($cmdlet in @('New-Object', 'ForEach-Object', 'Set-Alias', 'New-Alias', 'Get-CimInstance', 'Get-CimClass')) {
     $table = @{}
     foreach ($p in (Get-Command -Name $cmdlet -CommandType Cmdlet).Parameters.Values) {
         $entry = [pscustomobject]@{ Name = [string]$p.Name; Switch = [bool]$p.SwitchParameter }
@@ -1705,6 +1733,9 @@ foreach ($cmdlet in @('New-Object', 'ForEach-Object', 'Set-Alias', 'New-Alias'))
 }
 # The aliases of the common SWITCHES (vb, db), from the same metadata: on any other command they take no value either.
 $commonSwitchAliases = @(foreach ($p in (Get-Command -Name New-Object -CommandType Cmdlet).Parameters.Values) { if ($p.SwitchParameter -and [System.Management.Automation.Cmdlet]::CommonParameters.Contains($p.Name)) { foreach ($a in @($p.Aliases)) { ([string]$a).ToLowerInvariant() } } })
+# The common parameters that take a VALUE, their names and aliases (ea, wa, infa, proga, ev, wv, iv, ov, ob, pv), from the same metadata (r15, adversary pass 20 A2).
+$commonValueNames = @(foreach ($p in (Get-Command -Name New-Object -CommandType Cmdlet).Parameters.Values) { if (-not $p.SwitchParameter -and [System.Management.Automation.Cmdlet]::CommonParameters.Contains($p.Name)) { [string]$p.Name } })
+$commonValueSpellings = @(foreach ($p in (Get-Command -Name New-Object -CommandType Cmdlet).Parameters.Values) { if (-not $p.SwitchParameter -and [System.Management.Automation.Cmdlet]::CommonParameters.Contains($p.Name)) { foreach ($a in @($p.Aliases)) { ([string]$a).ToLowerInvariant() } } })
 
 # The parameter of $Cmdlet a spelling binds to, as PowerShell resolves it: an exact name or alias, else the one parameter every name or alias it is a prefix of belongs
 # to. $null when it binds to none or to more than one: the caller then reads it as a SWITCH (fail closed), so the element after it is still read as an operand.
@@ -2375,6 +2406,13 @@ def test_wmi_create_scan_refuses_each_direct_create_spelling(tmp_path):
         "a2-wmi-value-in-an-if-branch-with-a-variable-pipeline-variable": "$n = 'w'\nWrite-Output $(if ($true) { Get-CimInstance Win32_Process }) -PipelineVariable $n",
         "a2-wmi-value-in-an-if-branch-with-a-pipeline-variable-splat": "$h = @{ PipelineVariable = 'w' }\nWrite-Output $(if ($true) { Get-CimInstance Win32_Process }) @h | ForEach-Object { $w.Create('x') }",
         "a2-wmi-value-in-a-ternary-branch-with-a-variable-pipeline-variable": "$n = 'w'\nWrite-Output ($true ? (Get-CimInstance Win32_Process) : $null) -pv $n",
+        # r15, adversary pass 20 on fcd90090: the companions of its three over-refusals stay refused (a WMI variable in the BRANCH of the receiver's if, a common
+        # value alias in front of the real process class, an array cast at the NAME position or in a slot that is not the arguments slot)
+        "p20-a1-wmi-variable-in-an-if-branch-of-a-command-receiver": "$c = Get-CimInstance Win32_Process\n(Write-Output $(if ($true) { $c } else { $c })).Create('x')",
+        "p20-a2-information-action-alias-before-the-process-class": "$action = 'Continue'\n$c = Get-CimInstance -infa $action Win32_Process\n$c.Create('x')",
+        "p20-a2-computer-name-alias-before-the-process-class": "$h = '.'\n$c = Get-CimInstance -CN $h Win32_Process\n$c.Create('x')",
+        "p20-a3-array-cast-at-the-name-position": "$c = Get-WmiObject -List Win32_Process\n$c.InvokeMethod([object[]]'Create', [object[]]@('x', $null, $null))",
+        "p20-a3-array-cast-in-a-cim-session-name-slot": "$session.InvokeMethod('root/cimv2', 'Win32_Process', [string[]]'Create', $null)",
     }
     not_sites = {
         "line-comment": "# Invoke-CimMethod -ClassName Win32_Process -MethodName Create; [wmiclass]'Win32_Process'",
@@ -2535,6 +2573,15 @@ def test_wmi_create_scan_refuses_each_direct_create_spelling(tmp_path):
         "a2-wmi-read-only-in-an-if-condition-with-a-pipeline-variable-splat": "$h = @{ PipelineVariable = 'plain' }\nWrite-Output $(if (Get-CimInstance Win32_Process) { 'ok' }) @h",
         "a2-wmi-read-only-in-a-ternary-condition-with-a-variable-pipeline-variable": "$n = 'plain'\nWrite-Output ((Get-CimInstance Win32_Process) ? 'ok' : 'no') -pv $n",
         "a2-wmi-read-only-in-a-ternary-condition-with-a-pipeline-variable-splat": "$h = @{ PipelineVariable = 'plain' }\nWrite-Output ((Get-CimInstance Win32_Process) ? 'ok' : 'no') @h",
+        # r15, adversary pass 20 on fcd90090, verbatim inputs first: A1 a WMI variable only in the CONDITION of an if inside a command receiver; A2 a common value
+        # alias and the CIM aliases (CN, ServerName, OT, SelectProperties, proga) take their value, which is not a class operand; A3 a cast to an array type in the
+        # arguments slot of InvokeMethod is data, not the verb
+        "p20-a1-wmi-variable-only-in-an-if-condition-of-a-command-receiver": "$c = Get-CimInstance Win32_Process\n(Write-Output $(if ($c) { [System.IO.FileInfo]'scratch.txt' } else { [System.IO.FileInfo]'scratch.txt' })).Create()",
+        "p20-a2-information-action-alias-value": "$action = 'Continue'\n$svc = Get-CimInstance Win32_Service -infa $action\n$createService = $svc.Create",
+        "p20-a2-cim-computer-name-aliases": "$h = '.'\n$svc = Get-CimInstance Win32_Service -CN $h\n$s2 = Get-CimInstance Win32_Service -ServerName $h\n$createService = $svc.Create\n$c2 = $s2.Create",
+        "p20-a2-cim-timeout-select-and-progress-aliases": "$t = 5\n$p = 'Name'\n$a = 'SilentlyContinue'\n$svc = Get-CimInstance Win32_Service -OT $t -SelectProperties $p -proga $a\n$createService = $svc.Create",
+        "p20-a3-object-array-cast-in-the-arguments-slot": "$p = Get-WmiObject Win32_Process -Filter 'ProcessId=4'\n$p.InvokeMethod('GetOwnerSid', [object[]]'create')",
+        "p20-a3-string-array-cast-in-the-arguments-slot": "$p = Get-WmiObject Win32_Process -Filter 'ProcessId=4'\n$p.InvokeMethod('GetOwnerSid', ([string[]]'create'))",
     }
     files = {}
     for name, text in {**mutants, **not_sites}.items():
@@ -2605,9 +2652,10 @@ def _new_object_spellings(metadata, skip=("TypeName",)):
         if name in skip:
             continue  # the parameter that IS the slot (-TypeName, -MemberName) or decides the input (-InputObject); their creates are mutants above
         spellings = {name, *entry["aliases"]}
+        # every unambiguous prefix, of a switch AND of a value parameter (adversary pass 20 A4: `-ErrorA Stop` binds to ErrorAction too)
+        for full in sorted({name, *entry["aliases"]}):
+            spellings.update(full[:k] for k in range(1, len(full)) if resolves_to(full[:k]) == {name})
         if entry["switch"]:
-            for full in sorted({name, *entry["aliases"]}):
-                spellings.update(full[:k] for k in range(1, len(full)) if resolves_to(full[:k]) == {name})
             out += [(f"{s}", f"-{s}") for s in sorted(spellings)]
             out += [(f"{s}-colon", f"-{s}:$true") for s in sorted({name, *entry["aliases"]})]
             out += [(f"property-then-{s}", f"-Property @{{}} -{s}") for s in sorted(spellings)]
@@ -2671,6 +2719,29 @@ def test_wmi_create_scan_refuses_every_foreach_object_parameter_spelling_before_
     assert unparsed == {}, "a generated case must still be valid PowerShell"
     survivors = sorted(name for name, path in files.items() if not scan[str(path)]["sites"])
     assert survivors == [], f"these ForEach-Object parameter spellings in front of the member name hid a WMI create: {survivors}"
+
+
+@_lane_scanner_only
+@pytest.mark.parametrize("cmdlet", ["Get-CimInstance", "Get-CimClass"])
+def test_wmi_create_scan_refuses_every_cim_read_parameter_spelling_before_the_class(tmp_path, cmdlet):
+    """r15, adversary pass 20 A2 NARROWED the class operand of the CIM reads (a spelling the cmdlet's metadata names as a value parameter now takes its value), so,
+    by the prevention card of this round, every spelling the metadata names is put in front of the positional process class of a real create."""
+    metadata = _new_object_parameter_metadata(tmp_path / "probe", cmdlet)
+    assert {"ClassName", "ComputerName", "OperationTimeoutSec", "InformationAction"} <= set(metadata), sorted(metadata)
+    spellings = _new_object_spellings(metadata, skip=("ClassName", "Query"))
+    template = "$c = " + cmdlet + " {p} Win32_Process\n$c.Create('cmd.exe /c exit 0')"
+    files = {}
+    for index, (label, text) in enumerate(spellings):
+        path = tmp_path / "cases" / f"cim-{index:03d}.ps1"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(template.replace("{p}", text) + "\n", encoding="utf-8", newline="\n")
+        files[f"{cmdlet}-{label}"] = path
+    assert len(spellings) >= 60, len(spellings)
+    scan = _wmi_create_scan(tmp_path / "scan", list(files.values()))
+    unparsed = {name: scan[str(path)]["parseErrors"] for name, path in files.items() if scan[str(path)]["parseErrors"]}
+    assert unparsed == {}, "a generated case must still be valid PowerShell"
+    survivors = sorted(name for name, path in files.items() if not scan[str(path)]["sites"])
+    assert survivors == [], f"these {cmdlet} parameter spellings in front of the class hid a WMI create: {survivors}"
 
 
 # --- LANE-CHILD-LOADER-DIALOG-CODEX-SANDBOX-1: the codex lane's children must find the MinGW runtime DLLs ----------
