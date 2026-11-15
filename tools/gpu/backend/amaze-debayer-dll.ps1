@@ -75,7 +75,7 @@ $cmdFile = Join-Path $env:TEMP 'amaze_debayer_dll.cmd'
     # UM-DLLPAIR-VCVARS-PATH-OVERFLOW-1: an INCLUDE without the SDK's corecrt.h (an overgrown PATH broke winsdk.bat on 2026-11-15) is exit 9, typed,
     # before nvcc -- never a bare C1083 at compile time.
     'set "MLV_UCRT_OK=" & if not defined INCLUDE set "INCLUDE=;"',
-    'for %%I in ("%INCLUDE:;=" "%") do if exist "%%~I\corecrt.h" set "MLV_UCRT_OK=1"',
+    'for %%I in ("%INCLUDE:;=" "%") do if exist "%%~I\corecrt.h" if not exist "%%~I\corecrt.h\" set "MLV_UCRT_OK=1"',
     'if not defined MLV_UCRT_OK (echo FAIL step=msvcEnvironment reason=INCLUDE_LACKS_UCRT no INCLUDE entry holds corecrt.h after vcvars64& exit /b 9)',
     'echo === building igpu_amaze_debayer_cuda.dll (nvcc -shared --fmad=false, exports via .def) ===',
     "`"$nvcc`" $archArgLine -O3 --fmad=false -shared -allow-unsupported-compiler -Xcompiler `"/MD`" -Xlinker `"/DEF:$def`" -I `"$Dir`" -I `"$gpuRoot`" `"$src`" -o `"$dll`"",

@@ -273,6 +273,12 @@ function Publish-JobLog([string]$Path, $Value) {
     }
 }
 
+# A backend script's OWN msvcEnvironment refusal (its .cmd prints FAIL step=msvcEnvironment and exits 9 when no INCLUDE entry holds corecrt.h, e.g.
+# the SDK changed after this job's own check passed) stays exit 9 at msvcEnvironment, never the generic exit 11 / 12 (adversary pass 2 A2).
+function Test-BackendMsvcRefusal([int]$Rc, $Output) {
+    ($Rc -eq 9) -and (@($Output | Where-Object { ([string]$_) -match 'FAIL step=msvcEnvironment reason=' }).Count -gt 0)
+}
+
 Say "START source=$SourceCommit arch=$($CudaArchitectures -join ',')"
 if (-not (Test-Path -LiteralPath $Archive)) { Complete-Failed 3 'sourceArchive' "missing: $Archive" }
 $StepLog['sourceArchive'] = 0
@@ -432,6 +438,7 @@ Say "BUILD recon backend arch=$archLabel"
 $reconOutput = @(& $psExe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command $reconCommand 2>&1 | ForEach-Object { [string]$_ })
 $reconRc = $LASTEXITCODE
 Publish-JobLog $reconLog $reconOutput
+if (Test-BackendMsvcRefusal $reconRc $reconOutput) { Complete-Failed 9 'msvcEnvironment' "reason=BACKEND_REFUSED build-backend-dll.ps1 refused its post-vcvars INCLUDE (exit 9; see recon-backend-build.log)" }
 $reconDll = Join-Path $Backend $ReconDllName
 if (-not (Test-Path -LiteralPath $reconDll)) { Complete-Failed 11 'reconBackendBuild' "$ReconDllName not produced (script exit=$reconRc)" }
 # The script's tail runs the LoadLibrary parity harness and exits with ITS code; see the
@@ -449,6 +456,7 @@ $amazeCommand = "& $(ConvertTo-PsSingleQuoted $AmazeScript) -Dir $(ConvertTo-PsS
 $amazeOutput = @(& $psExe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command $amazeCommand 2>&1 | ForEach-Object { [string]$_ })
 $amazeRc = $LASTEXITCODE
 Publish-JobLog $amazeLog $amazeOutput
+if (Test-BackendMsvcRefusal $amazeRc $amazeOutput) { Complete-Failed 9 'msvcEnvironment' "reason=BACKEND_REFUSED amaze-debayer-dll.ps1 refused its post-vcvars INCLUDE (exit 9; see amaze-backend-build.log)" }
 $amazeDll = Join-Path $Backend $AmazeDllName
 # amaze-debayer-dll.ps1 exits 0 only after its own export verification passes, so a nonzero
 # code here is a real failure, never a harness artefact.

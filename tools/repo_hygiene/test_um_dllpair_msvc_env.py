@@ -228,6 +228,17 @@ class BackendCmdUcrtCheckTests(_Pwsh):
                     self.assertIn("FAIL step=msvcEnvironment reason=INCLUDE_LACKS_UCRT", p.stdout)
                     self.assertNotIn("REACHED_NVCC", p.stdout)
 
+    def test_adversary_pass2_a1_a_directory_named_corecrt_h_is_not_the_header(self) -> None:
+        # adversary pass 2 A1 (a5bfd431): cmd's `if exist` is true for a DIRECTORY, so ucrt\corecrt.h as a dir passed and nvcc ran without the header.
+        root = self.tmp / "Kits-dir" / "ucrt"
+        (root / "corecrt.h").mkdir(parents=True)
+        for script in BACKEND_SCRIPTS:
+            with self.subTest(script=script.name):
+                p = self.run_check(script, INCLUDE_NO_SDK + ";" + str(root))
+                self.assertEqual(p.returncode, 9, p.stdout + p.stderr)
+                self.assertIn("FAIL step=msvcEnvironment reason=INCLUDE_LACKS_UCRT", p.stdout)
+                self.assertNotIn("REACHED_NVCC", p.stdout)
+
     def test_the_check_admits_an_include_whose_ucrt_holds_corecrt(self) -> None:
         root = self.tmp / "Windows Kits (x86)" / "10" / "include" / "10.0.22621.0" / "ucrt"
         root.mkdir(parents=True)
@@ -308,6 +319,15 @@ class EmittedJobWiringTests(unittest.TestCase):
                         text.index("Complete-Failed 9 'msvcEnvironment' \"reason=$($msvcVerdict.Reason)"))
         # and the probe's own file write / cmd run are typed too
         self.assertIn("Complete-Failed 9 'msvcEnvironment' \"reason=PROBE_FAILED", text)
+        # adversary pass 2 A2 (advisory): a backend script's OWN msvcEnvironment refusal (exit 9 + its FAIL line) stays exit 9 at msvcEnvironment,
+        # for recon AND amaze, checked before the generic exit 11 / 12 mapping
+        for rc, out, dll, generic in (("$reconRc", "$reconOutput", "$reconDll", "Complete-Failed 11 'reconBackendBuild'"),
+                                      ("$amazeRc", "$amazeOutput", "$amazeDll", "Complete-Failed 12 'amazeBackendBuild'")):
+            typed = f"Test-BackendMsvcRefusal {rc} {out}"
+            self.assertIn(typed, text)
+            self.assertLess(text.index(typed), text.index(generic))
+        fn2 = re.search(r"(?ms)^function Test-BackendMsvcRefusal\b.*?^\}", text)
+        self.assertIsNotNone(fn2)
         # Publish-JobLog itself, run from the EMITTED text against a publisher that throws: no throw out, one LOG_NOT_WRITTEN line
         fn = re.search(r"(?ms)^function Publish-JobLog\b.*?^\}", text)
         self.assertIsNotNone(fn)
