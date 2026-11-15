@@ -4247,12 +4247,11 @@ def _decoy_repository(tmp_path: Path) -> Path:
 
 
 def _decoy_digest(decoy: Path) -> dict[str, str]:
-    """sha256 of the decoy's HEAD, config, index and every file under refs/ (and packed-refs), keyed by relative path."""
+    """sha256 of EVERY file under the decoy's gitdir (HEAD, config, index, refs/, hooks/, info/, objects/, logs/ ...), keyed by its relative posix path,
+    from one sorted walk (Grok G18, r15: the former fixed list missed hooks/ and info/, which this module's `install-hooks` writes)."""
     gitdir = decoy / ".git"
-    names = ["HEAD", "config", "index", "packed-refs"]
-    names += sorted(p.relative_to(gitdir).as_posix() for p in (gitdir / "refs").rglob("*") if p.is_file())
     import hashlib
-    return {n: hashlib.sha256((gitdir / n).read_bytes()).hexdigest() for n in names if (gitdir / n).is_file()}
+    return {p.relative_to(gitdir).as_posix(): hashlib.sha256(p.read_bytes()).hexdigest() for p in sorted(gitdir.rglob("*")) if p.is_file()}
 
 
 def _run_subset_under_decoy_git_variables(tmp_path: Path, only_git_dir: bool = False) -> tuple[subprocess.CompletedProcess, dict[str, str], dict[str, str]]:
@@ -4292,6 +4291,28 @@ def test_hermetic_collecting_this_file_does_not_change_the_environment_for_anoth
                            f"--rootdir={tmp_path}", f"--basetemp={tmp_path / 'inner-basetemp'}"], capture_output=True, text=True, env=env,
                           cwd=str(tmp_path), timeout=300)
     assert proc.returncode == 0 and re.search(r"1 passed", proc.stdout), proc.stdout[-2000:] + proc.stderr[-1000:]
+
+
+def test_hermetic_the_decoy_digest_sees_a_hook_written_through_a_leaked_git_dir(tmp_path):
+    """Grok G18 (r15): a fixture that leaks the decoy's GIT_DIR and writes hooks/ (this module has `install-hooks`) must change the digest, or the
+    byte-identical test above proves less than its name says. The write goes where git itself resolves `hooks/x` under that GIT_DIR: a decoy, never this repo."""
+    decoy = _decoy_repository(tmp_path)
+    before = _decoy_digest(decoy)
+    leaked = {**os.environ, "GIT_DIR": str(decoy / ".git")}
+    hook = Path(subprocess.run(["git", "rev-parse", "--git-path", "hooks/x"], capture_output=True, text=True, check=True, env=leaked, cwd=str(tmp_path)).stdout.strip())
+    if not hook.is_absolute():
+        hook = tmp_path / hook
+    assert hook.resolve().is_relative_to((decoy / ".git").resolve()), hook
+    hook.parent.mkdir(exist_ok=True)
+    hook.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    after = _decoy_digest(decoy)
+    assert after != before and set(after) - set(before) == {"hooks/x"}, sorted(set(after) ^ set(before))
+    # info/ and a new loose object are under the same walk
+    (decoy / ".git" / "info").mkdir(exist_ok=True)
+    (decoy / ".git" / "info" / "exclude").write_text("leaked\n", encoding="utf-8")
+    assert _decoy_digest(decoy)["info/exclude"] != after.get("info/exclude")
+    subprocess.run(["git", "hash-object", "-w", "--stdin"], input="leaked object\n", capture_output=True, text=True, check=True, env=leaked, cwd=str(tmp_path))
+    assert len([k for k in _decoy_digest(decoy) if k.startswith("objects/")]) > len([k for k in after if k.startswith("objects/")])
 
 
 def test_hermetic_the_dropped_names_are_exactly_what_git_reports_as_repository_local():
