@@ -134,6 +134,16 @@ class MsvcIncludeTests(_Pwsh):
             env={"FIXTURE_INCLUDE": include},
         ))
 
+    def kits(self, headers: bool = True, omit: str = "") -> str:
+        """A FRESH fixture Windows Kits include root per call: ucrt / um / shared dirs, each holding its sentinel header unless headers=False
+        (or it is `omit`)."""
+        root = Path(tempfile.mkdtemp(prefix="kits-", dir=self.tmp)) / "Windows Kits" / "10" / "include" / "10.0.22621.0"
+        for leaf, header in (("ucrt", "corecrt.h"), ("um", "windows.h"), ("shared", "sdkddkver.h")):
+            (root / leaf).mkdir(parents=True, exist_ok=True)
+            if headers and leaf != omit:
+                (root / leaf / header).write_text("/* fixture */\n", encoding="ascii")
+        return str(root)
+
     def test_the_incident_include_is_refused_as_lacking_ucrt(self) -> None:
         v = self.verdict(INCLUDE_NO_SDK)
         self.assertFalse(v["Ok"])
@@ -141,13 +151,15 @@ class MsvcIncludeTests(_Pwsh):
         self.assertIn("entries=2", v["Detail"])
 
     def test_a_full_include_passes(self) -> None:
-        v = self.verdict(INCLUDE_FULL)
+        k = self.kits()
+        v = self.verdict(INCLUDE_NO_SDK + f";{k}\\ucrt;{k}\\um;{k}\\shared;{k}\\winrt")
         self.assertTrue(v["Ok"], v)
         self.assertEqual(v["Reason"], "")
 
     def test_ucrt_without_um_or_shared_is_refused_by_name(self) -> None:
-        self.assertEqual(self.verdict(INCLUDE_NO_SDK + f";{KITS}\\ucrt")["Reason"], "INCLUDE_LACKS_UM")
-        self.assertEqual(self.verdict(INCLUDE_NO_SDK + f";{KITS}\\ucrt;{KITS}\\um")["Reason"], "INCLUDE_LACKS_SHARED")
+        k = self.kits()
+        self.assertEqual(self.verdict(INCLUDE_NO_SDK + f";{k}\\ucrt")["Reason"], "INCLUDE_LACKS_UM")
+        self.assertEqual(self.verdict(INCLUDE_NO_SDK + f";{k}\\ucrt;{k}\\um")["Reason"], "INCLUDE_LACKS_SHARED")
 
     def test_an_empty_include_is_refused(self) -> None:
         self.assertEqual(self.verdict("")["Reason"], "INCLUDE_EMPTY")
@@ -155,8 +167,76 @@ class MsvcIncludeTests(_Pwsh):
 
     def test_ucrt_must_be_a_whole_path_segment(self) -> None:
         # a dir merely CONTAINING the letters (\ucrtx, \myucrt) is not the SDK's ucrt include dir
-        v = self.verdict(INCLUDE_NO_SDK + r";C:\x\notucrt;C:\x\ucrtx;" + f"{KITS}\\um;{KITS}\\shared")
+        k = self.kits()
+        v = self.verdict(INCLUDE_NO_SDK + r";C:\x\notucrt;C:\x\ucrtx;" + f"{k}\\um;{k}\\shared")
         self.assertEqual(v["Reason"], "INCLUDE_LACKS_UCRT")
+
+    def test_adversary_a1_named_sdk_dirs_without_their_headers_are_refused(self) -> None:
+        # adversary A1 (r1): 'C:\missing\ucrt;C:\missing\um;C:\missing\shared' was Ok=true. A name is not a header: each leaf must hold its sentinel.
+        v = self.verdict(r"C:\missing\ucrt;C:\missing\um;C:\missing\shared")
+        self.assertFalse(v["Ok"], v)
+        self.assertEqual(v["Reason"], "INCLUDE_UCRT_HEADER_MISSING")
+        k = self.kits(headers=False)
+        self.assertEqual(self.verdict(f"{k}\\ucrt;{k}\\um;{k}\\shared")["Reason"], "INCLUDE_UCRT_HEADER_MISSING")
+        for leaf in ("um", "shared"):
+            with self.subTest(leaf=leaf):
+                k = self.kits(omit=leaf)
+                self.assertEqual(self.verdict(f"{k}\\ucrt;{k}\\um;{k}\\shared")["Reason"], f"INCLUDE_{leaf.upper()}_HEADER_MISSING")
+                (Path(k) / leaf / {"um": "windows.h", "shared": "sdkddkver.h"}[leaf]).write_text("/* fixture */\n", encoding="ascii")
+
+    def test_a_header_in_any_matching_entry_suffices_and_a_missing_drive_does_not_throw(self) -> None:
+        k = self.kits()
+        v = self.verdict(rf"Q:\no-such-drive\ucrt;{k}\ucrt;{k}\um;{k}\shared")
+        self.assertTrue(v["Ok"], v)
+
+
+BACKEND_SCRIPTS = (ROOT / "tools" / "gpu" / "backend" / "build-backend-dll.ps1", ROOT / "tools" / "gpu" / "backend" / "amaze-debayer-dll.ps1")
+
+
+@requires_windows_pwsh
+class BackendCmdUcrtCheckTests(_Pwsh):
+    """Adversary A1 siblings: the tracked backend scripts' own .cmd files refuse a post-vcvars INCLUDE without corecrt.h at exit 9 BEFORE nvcc,
+    so a standalone run (over SSH, no job around it) also never meets C1083 first. The cmd lines are taken from each script's text and run in cmd.exe."""
+
+    def check_lines(self, script: Path) -> list[str]:
+        lines = re.findall(r"^\s*'((?:[^']|'')*MLV_UCRT_OK(?:[^']|'')*)',?\s*$", script.read_text(encoding="utf-8"), re.M)
+        return [l.replace("''", "'") for l in lines]
+
+    def run_check(self, script: Path, include: str | None) -> subprocess.CompletedProcess:
+        cmd = self.tmp / "check.cmd"
+        body = ["@echo off"] + ([f'set "INCLUDE={include}"'] if include is not None else ['set "INCLUDE="']) + self.check_lines(script) + ["echo REACHED_NVCC", "exit /b 0"]
+        cmd.write_text("\r\n".join(body) + "\r\n", encoding="ascii")
+        return subprocess.run(["cmd.exe", "/d", "/c", str(cmd)], capture_output=True, text=True, timeout=60, stdin=subprocess.DEVNULL)
+
+    def test_each_script_checks_after_vcvars_and_before_nvcc(self) -> None:
+        for script in BACKEND_SCRIPTS:
+            with self.subTest(script=script.name):
+                text = script.read_text(encoding="utf-8")
+                self.assertEqual(len(self.check_lines(script)), 3, script.name)
+                vcvars = text.index('"call `"$vcvars`" >nul"')
+                check = text.index("MLV_UCRT_OK")
+                nvcc = text.index('"`"$nvcc`" $archArgLine')
+                self.assertLess(vcvars, check)
+                self.assertLess(check, nvcc)
+
+    def test_the_check_refuses_the_incident_include_and_an_empty_one(self) -> None:
+        for script in BACKEND_SCRIPTS:
+            for include in (INCLUDE_NO_SDK, r"C:\missing\ucrt;C:\missing\um", "", None):
+                with self.subTest(script=script.name, include=include):
+                    p = self.run_check(script, include)
+                    self.assertEqual(p.returncode, 9, p.stdout + p.stderr)
+                    self.assertIn("FAIL step=msvcEnvironment reason=INCLUDE_LACKS_UCRT", p.stdout)
+                    self.assertNotIn("REACHED_NVCC", p.stdout)
+
+    def test_the_check_admits_an_include_whose_ucrt_holds_corecrt(self) -> None:
+        root = self.tmp / "Windows Kits (x86)" / "10" / "include" / "10.0.22621.0" / "ucrt"
+        root.mkdir(parents=True)
+        (root / "corecrt.h").write_text("/* fixture */\n", encoding="ascii")
+        for script in BACKEND_SCRIPTS:
+            with self.subTest(script=script.name):
+                p = self.run_check(script, INCLUDE_NO_SDK + ";" + str(root) + ";")
+                self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+                self.assertIn("REACHED_NVCC", p.stdout)
 
 
 def _head() -> str:
@@ -213,6 +293,33 @@ class EmittedJobWiringTests(unittest.TestCase):
         for var in ("INCLUDE", "LIB", "LIBPATH"):
             self.assertIn(f"$env:{var} = $null", text)
         self.assertRegex(text, r"Complete-Failed 9 'msvcEnvironment' \"reason=")
+
+    def test_adversary_a2_a_log_write_never_preempts_the_typed_exit(self) -> None:
+        # adversary A2 (r1): a refused msvc-environment.log write threw before Complete-Failed 9, so the job ended untyped. Every build/probe LOG
+        # publish (msvc, recon, amaze: the class) goes through Publish-JobLog, which reports a failed write and returns.
+        text, _ = self.job_text()
+        for raw in ("[void](Publish-AttrCudaText -Path (Join-Path $Pub 'msvc-environment.log')", "[void](Publish-AttrCudaText -Path $reconLog",
+                    "[void](Publish-AttrCudaText -Path $amazeLog"):
+            self.assertNotIn(raw, text)
+        for logged in ("Publish-JobLog (Join-Path $Pub 'msvc-environment.log') $msvcLog", "Publish-JobLog $reconLog $reconOutput",
+                       "Publish-JobLog $amazeLog $amazeOutput"):
+            self.assertIn(logged, text)
+        self.assertLess(text.index("Publish-JobLog (Join-Path $Pub 'msvc-environment.log')"),
+                        text.index("Complete-Failed 9 'msvcEnvironment' \"reason=$($msvcVerdict.Reason)"))
+        # and the probe's own file write / cmd run are typed too
+        self.assertIn("Complete-Failed 9 'msvcEnvironment' \"reason=PROBE_FAILED", text)
+        # Publish-JobLog itself, run from the EMITTED text against a publisher that throws: no throw out, one LOG_NOT_WRITTEN line
+        fn = re.search(r"(?ms)^function Publish-JobLog\b.*?^\}", text)
+        self.assertIsNotNone(fn)
+        tmp = Path(tempfile.mkdtemp(prefix="um-joblog-", dir=self.tmp))
+        probe = tmp / "p.ps1"
+        probe.write_text("$ErrorActionPreference = 'Stop'\nfunction Say([string]$m) { Write-Output \"SAY $m\" }\n"
+                         "function Publish-AttrCudaText { param($Path, $Value) throw 'ATTRCUDA_SLOT_NOT_WRITABLE fixture lock' }\n"
+                         + fn.group(0) + "\nPublish-JobLog 'G:\\x\\outbox\\j.artifacts\\msvc-environment.log' @('a', 'b')\n'AFTER'\n", encoding="utf-8")
+        p = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-File", str(probe)], capture_output=True, text=True, timeout=120, stdin=subprocess.DEVNULL)
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assertIn("SAY LOG_NOT_WRITTEN msvc-environment.log ATTRCUDA_SLOT_NOT_WRITABLE fixture lock", p.stdout)
+        self.assertIn("AFTER", p.stdout)
 
     def test_the_minimal_path_entries_are_derived_never_a_hosts_user_dirs(self) -> None:
         text, _ = self.job_text()
@@ -274,9 +381,20 @@ class DllPairJobIdTests(_Pwsh):
         self.assertEqual(self.ids("r2")["id"], f"playback-attr-3-cuda-dllpair-{S12}-r2")
 
     def test_a_bad_suffix_is_refused(self) -> None:
-        for bad in ("r2;x", "r 2", "../r2", "r" * 33, "-r2"):
+        # adversary A3 (r1, advisory): 'r--' and a trailing '-' made an id ending in '--' / '-'; a hyphen now only joins alphanumeric runs.
+        for bad in ("r2;x", "r 2", "../r2", "r" * 33, "-r2", "r--", "r-", "a--b"):
             with self.subTest(bad=bad):
                 self.assertIn("DLLPAIR_JOBID_SUFFIX_INVALID", self.ids(bad).get("threw", ""), bad)
+        self.assertEqual(self.ids("r2-b")["id"], f"playback-attr-3-cuda-dllpair-{S12}-r2-b")
+        self.assertEqual(self.ids("r" * 32)["id"], f"playback-attr-3-cuda-dllpair-{S12}-" + "r" * 32)
+
+    def test_the_nightly_refuses_the_same_bad_suffixes_at_binding(self) -> None:
+        for bad in ("r--", "r-", "-r2"):
+            with self.subTest(bad=bad):
+                p = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-File", str(NIGHTLY), "-SourceCommit", SHA, "-WhatIf",
+                                    "-DllJobIdSuffix", bad], capture_output=True, text=True, timeout=120, stdin=subprocess.DEVNULL)
+                self.assertNotEqual(p.returncode, 0, p.stdout)
+                self.assertIn("DllJobIdSuffix", p.stdout + p.stderr)
 
     def test_generator_emits_the_suffixed_job_and_zip(self) -> None:
         if GIT is None:
@@ -394,7 +512,9 @@ class DllPairReuseSuffixTests(_Pwsh):
 
     def test_a_bad_suffix_is_refused(self) -> None:
         base = f"playback-attr-3-cuda-dllpair-{S12}"
-        self.assertIn("DLLPAIR_JOBID_SUFFIX_INVALID", self.reuse(base, "..\\x").get("threw", ""))
+        for bad in ("..\\x", "r--", "r-"):
+            with self.subTest(bad=bad):
+                self.assertIn("DLLPAIR_JOBID_SUFFIX_INVALID", self.reuse(base, bad).get("threw", ""))
 
 
 if __name__ == "__main__":

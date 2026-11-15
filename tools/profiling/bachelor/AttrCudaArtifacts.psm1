@@ -7759,9 +7759,10 @@ function Get-AttrCudaDllPairJobId {
     .DESCRIPTION
     A um-run JobId is single-use, and a FAILED result under the default id makes Get-DllPairReuse
     refuse that sha for good. The suffix is opt-in and the default is byte-for-byte the old id.
-    The suffix rule is the stage generator's (playback-attr-3-cuda-stage-job.ps1 -JobIdSuffix) with
-    a leading alphanumeric, so the id never ends in '--' and stays inside UmRunDrop's JobId pattern.
-    VenueStageReuse.psm1 Get-DllPairReuse applies the same rule to the id it looks up.
+    The suffix is 1-32 characters: alphanumeric runs joined by single hyphens (adversary A3, r1), so
+    the id never holds '--' or ends in '-' and stays inside UmRunDrop's JobId pattern.
+    VenueStageReuse.psm1 Get-DllPairReuse and Invoke-VenueStageNightly.ps1 -DllJobIdSuffix apply the
+    same pattern.
     #>
     [CmdletBinding()]
     param(
@@ -7770,8 +7771,8 @@ function Get-AttrCudaDllPairJobId {
     )
     $id = 'playback-attr-3-cuda-dllpair-' + $SourceCommit.Substring(0, 12)
     if ([string]::IsNullOrEmpty($JobIdSuffix)) { return $id }
-    if ($JobIdSuffix -cnotmatch '^[A-Za-z0-9][A-Za-z0-9-]{0,31}\z') {
-        throw "DLLPAIR_JOBID_SUFFIX_INVALID -JobIdSuffix must match [A-Za-z0-9][A-Za-z0-9-]{0,31}; got '$JobIdSuffix'"
+    if ($JobIdSuffix -cnotmatch '^(?=.{1,32}\z)[A-Za-z0-9]+(?:-[A-Za-z0-9]+)*\z') {
+        throw "DLLPAIR_JOBID_SUFFIX_INVALID -JobIdSuffix must be 1-32 characters of alphanumeric runs joined by single hyphens; got '$JobIdSuffix'"
     }
     $id + '-' + $JobIdSuffix
 }
@@ -7832,6 +7833,10 @@ function Test-AttrCudaMsvcInclude {
     any compile, so an environment without the SDK is the typed step msvcEnvironment and never a
     bare `C1083 corecrt.h` at compile time. ucrt is judged first (corecrt.h is the first header a
     compile needs). A dir matches only as a whole trailing path segment (\ucrt, not \notucrt).
+    A NAME IS NOT A HEADER (adversary A1, r1): at least one matching entry per leaf must hold that
+    leaf's sentinel header (ucrt\corecrt.h, um\windows.h, shared\sdkddkver.h), else the reason is
+    INCLUDE_<LEAF>_HEADER_MISSING. The probe is Test-Path -LiteralPath on a concatenated string, so
+    an entry on a drive that does not exist reads as absent instead of throwing (Join-Path would).
     #>
     [CmdletBinding()]
     param([AllowEmptyString()][AllowNull()][string]$Include)
@@ -7840,13 +7845,23 @@ function Test-AttrCudaMsvcInclude {
     if ($entries.Count -eq 0) {
         return [pscustomobject]@{ Ok = $false; Reason = 'INCLUDE_EMPTY'; Detail = "$detail INCLUDE is empty after vcvars64" }
     }
-    foreach ($leaf in @('ucrt', 'um', 'shared')) {
+    foreach ($pair in @(@('ucrt', 'corecrt.h'), @('um', 'windows.h'), @('shared', 'sdkddkver.h'))) {
+        $leaf = $pair[0]
+        $header = $pair[1]
         $hit = @($entries | Where-Object { $_ -match ('(?i)\\' + $leaf + '\\*$') })
         if ($hit.Count -eq 0) {
             return [pscustomobject]@{
                 Ok = $false
                 Reason = 'INCLUDE_LACKS_' + $leaf.ToUpperInvariant()
                 Detail = "$detail no INCLUDE entry ends in \$leaf (vcvars64 did not add the Windows SDK include dirs)"
+            }
+        }
+        $held = @($hit | Where-Object { Test-Path -LiteralPath (($_ -replace '\\+$', '') + '\' + $header) -PathType Leaf })
+        if ($held.Count -eq 0) {
+            return [pscustomobject]@{
+                Ok = $false
+                Reason = 'INCLUDE_' + $leaf.ToUpperInvariant() + '_HEADER_MISSING'
+                Detail = "$detail no \$leaf INCLUDE entry holds $header (looked in: $($hit -join ', '))"
             }
         }
     }

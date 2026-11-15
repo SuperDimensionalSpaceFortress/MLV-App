@@ -102,7 +102,7 @@ param(
     # UM-DLLPAIR-VCVARS-PATH-OVERFLOW-1: an explicit, opt-in retry suffix for the single-use DLL-pair JobId. A FAILED result under the default id
     # (playback-attr-3-cuda-dllpair-<sha12>) refuses that sha's DLL pair for good; -DllJobIdSuffix r2 harvests or builds <that>-r2 instead, through the
     # generator's -JobIdSuffix and Get-DllPairReuse -JobIdSuffix. Absent: the default id, exactly as before.
-    [ValidatePattern('^([A-Za-z0-9][A-Za-z0-9-]{0,31})?\z')][string]$DllJobIdSuffix = ''
+    [ValidatePattern('^(?:(?=.{1,32}\z)[A-Za-z0-9]+(?:-[A-Za-z0-9]+)*)?\z')][string]$DllJobIdSuffix = ''
 )
 $ErrorActionPreference = 'Stop'
 $here = $PSScriptRoot

@@ -263,6 +263,16 @@ function Complete-Failed([int]$Code, [string]$Step, [string]$Message) {
     exit $Code
 }
 
+# A build or probe LOG is evidence, never a gate (adversary A2, UM-DLLPAIR-VCVARS-PATH-OVERFLOW-1 r1): a refused or failed log write is reported on
+# one line and the job goes on to its own typed outcome, so a held log slot can never pre-empt Complete-Failed's exit code and result.json.
+function Publish-JobLog([string]$Path, $Value) {
+    try {
+        [void](Publish-AttrCudaText -Path $Path -Value $Value)
+    } catch {
+        Say "LOG_NOT_WRITTEN $(Split-Path -Leaf $Path) $($_.Exception.Message)"
+    }
+}
+
 Say "START source=$SourceCommit arch=$($CudaArchitectures -join ',')"
 if (-not (Test-Path -LiteralPath $Archive)) { Complete-Failed 3 'sourceArchive' "missing: $Archive" }
 $StepLog['sourceArchive'] = 0
@@ -375,9 +385,13 @@ $env:LIBPATH = $null
 # so nothing reaches this process's error stream.
 $msvcProbe = Join-Path $Scratch 'msvc-environment-probe.cmd'
 $msvcProbeLines = @('@echo off', ('call "' + $vcvars + '" 2>&1 1>nul'), 'echo MLV_VCVARS_EXIT=%ERRORLEVEL%', 'set INCLUDE 2>nul', 'set WindowsSdkDir 2>nul', 'set UCRTVersion 2>nul', 'exit /b 0')
-New-Item -ItemType File -Path $msvcProbe -Value (($msvcProbeLines -join "`r`n") + "`r`n") -Force | Out-Null
-$msvcOutput = @(& 'cmd.exe' /d /c $msvcProbe | ForEach-Object { [string]$_ })
-$msvcRc = $LASTEXITCODE
+try {
+    New-Item -ItemType File -Path $msvcProbe -Value (($msvcProbeLines -join "`r`n") + "`r`n") -Force | Out-Null
+    $msvcOutput = @(& 'cmd.exe' /d /c $msvcProbe | ForEach-Object { [string]$_ })
+    $msvcRc = $LASTEXITCODE
+} catch {
+    Complete-Failed 9 'msvcEnvironment' "reason=PROBE_FAILED the vcvars64 probe did not run: $($_.Exception.Message)"
+}
 $includeLine = @($msvcOutput | Where-Object { $_ -match '^INCLUDE=' }) | Select-Object -First 1
 $msvcInclude = $(if ($includeLine) { ([string]$includeLine).Substring(8) } else { '' })
 $msvcVerdict = Test-AttrCudaMsvcInclude -Include $msvcInclude
@@ -391,7 +405,7 @@ $Evidence['msvcEnvironment'] = [ordered]@{
     reason = $msvcVerdict.Reason
 }
 $msvcLog = @("inheritedPathLength=$($inheritedPath.Length) inheritedPathEntries=$inheritedPathEntries", "buildPath=$([string]$env:PATH)", "probeExit=$msvcRc") + $msvcOutput
-[void](Publish-AttrCudaText -Path (Join-Path $Pub 'msvc-environment.log') -Value $msvcLog)
+Publish-JobLog (Join-Path $Pub 'msvc-environment.log') $msvcLog
 if (-not $msvcVerdict.Ok) {
     Complete-Failed 9 'msvcEnvironment' "reason=$($msvcVerdict.Reason) $($msvcVerdict.Detail) inheritedPathLength=$($inheritedPath.Length) inheritedPathEntries=$inheritedPathEntries (see msvc-environment.log)"
 }
@@ -417,7 +431,7 @@ if (-not [string]::IsNullOrWhiteSpace($ParityVectors)) {
 Say "BUILD recon backend arch=$archLabel"
 $reconOutput = @(& $psExe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command $reconCommand 2>&1 | ForEach-Object { [string]$_ })
 $reconRc = $LASTEXITCODE
-[void](Publish-AttrCudaText -Path $reconLog -Value $reconOutput)
+Publish-JobLog $reconLog $reconOutput
 $reconDll = Join-Path $Backend $ReconDllName
 if (-not (Test-Path -LiteralPath $reconDll)) { Complete-Failed 11 'reconBackendBuild' "$ReconDllName not produced (script exit=$reconRc)" }
 # The script's tail runs the LoadLibrary parity harness and exits with ITS code; see the
@@ -434,7 +448,7 @@ Say "BUILD amaze backend arch=$archLabel"
 $amazeCommand = "& $(ConvertTo-PsSingleQuoted $AmazeScript) -Dir $(ConvertTo-PsSingleQuoted $Backend) -Arch $(ConvertTo-PsSingleQuoted $archLabel)"
 $amazeOutput = @(& $psExe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command $amazeCommand 2>&1 | ForEach-Object { [string]$_ })
 $amazeRc = $LASTEXITCODE
-[void](Publish-AttrCudaText -Path $amazeLog -Value $amazeOutput)
+Publish-JobLog $amazeLog $amazeOutput
 $amazeDll = Join-Path $Backend $AmazeDllName
 # amaze-debayer-dll.ps1 exits 0 only after its own export verification passes, so a nonzero
 # code here is a real failure, never a harness artefact.

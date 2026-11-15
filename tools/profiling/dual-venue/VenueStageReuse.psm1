@@ -67,7 +67,7 @@ function Get-DllPairReuse {
         [AllowEmptyString()][string]$JobIdSuffix = ''
     )
     if ($JobIdSuffix -ne '') {
-        if ($JobIdSuffix -cnotmatch '^[A-Za-z0-9][A-Za-z0-9-]{0,31}\z') { throw "DLLPAIR_JOBID_SUFFIX_INVALID -JobIdSuffix must match [A-Za-z0-9][A-Za-z0-9-]{0,31}; got '$JobIdSuffix'" }
+        if ($JobIdSuffix -cnotmatch '^(?=.{1,32}\z)[A-Za-z0-9]+(?:-[A-Za-z0-9]+)*\z') { throw "DLLPAIR_JOBID_SUFFIX_INVALID -JobIdSuffix must be 1-32 characters of alphanumeric runs joined by single hyphens; got '$JobIdSuffix'" }
         $JobId = "$JobId-$JobIdSuffix"
     }
     $no = { param($why) [pscustomobject]@{ Reusable = $false; Reason = $why; EndedUtc = $null; Line = $null; ArtifactsDir = $null; JobId = $JobId } }
